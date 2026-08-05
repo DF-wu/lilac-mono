@@ -268,6 +268,7 @@ logger.warn("Configuration load failed", {
 
 ### Event bus delivery
 
+- `LILAC_EVENTS` in `packages/event-bus/lilac-spec.ts` is the single event declaration. Its type, family, topic/key descriptors, payload schema, codec, request scope, and typed projections must remain derived rather than repeated in the architecture manifest or decoder dispatch.
 - `LilacBus.publish` provides compile-time producer typing only; it does not establish trust at a receiver in another process or reading persisted data.
 - The external Redis/SuperJSON boundary yields `Message<unknown>`. `createLilacBus` must decode the complete message with `decodeLilacMessageForTopic`, which dispatches through `lilacEventCodecRegistry`, before a typed handler runs. Do not replace this receiver validation with an assertion.
 - A `subscribeTopic` handler returns `Promise<Result<void, OwnedErrorUnion>>`. It does not commit, acknowledge, or choose transport behavior; `Ok` commits and the exhaustive delivery policy handles every owned error.

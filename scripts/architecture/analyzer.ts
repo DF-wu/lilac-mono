@@ -3558,19 +3558,6 @@ function canonicalToolValues(
     : undefined;
 }
 
-function canonicalEventValues(declaration: ts.VariableDeclaration): readonly string[] | undefined {
-  const object = objectLiteralInitializer(declaration);
-  if (!object) return undefined;
-  const values: string[] = [];
-  for (const property of object.properties) {
-    if (!ts.isPropertyAssignment(property)) return undefined;
-    const initializer = unwrapExpression(property.initializer);
-    if (!ts.isStringLiteralLike(initializer)) return undefined;
-    values.push(initializer.text);
-  }
-  return values;
-}
-
 function codecRegistryValues(
   declaration: ts.VariableDeclaration,
   checker: ts.TypeChecker,
@@ -3595,6 +3582,138 @@ function registeredIdentityKey(identity: SymbolIdentity): string {
   return `${identity.module}#${identity.exportName}`;
 }
 
+function callTargetsDeclaredHelper(
+  call: ts.CallExpression,
+  declaration: ts.FunctionDeclaration,
+  checker: ts.TypeChecker,
+): boolean {
+  const target = expressionSymbol(call.expression, checker);
+  const declared = declaration.name && checker.getSymbolAtLocation(declaration.name);
+  return Boolean(target && declared && target === canonicalSymbol(declared, checker));
+}
+
+function explicitPropertyName(property: ts.ObjectLiteralElementLike): string | undefined {
+  const name = property.name;
+  if (!name || ts.isComputedPropertyName(name)) return undefined;
+  if (ts.isIdentifier(name) || ts.isStringLiteralLike(name)) return name.text;
+  return undefined;
+}
+
+function eventCatalogDslProblems(
+  declaration: ts.VariableDeclaration,
+  helper: ts.FunctionDeclaration,
+  checker: ts.TypeChecker,
+): readonly string[] {
+  const initializer = declaration.initializer && unwrapExpression(declaration.initializer);
+  if (!initializer || !ts.isCallExpression(initializer)) {
+    return ["catalog must be a defineLilacEvents({ ... }) call"];
+  }
+  const problems: string[] = [];
+  if (!callTargetsDeclaredHelper(initializer, helper, checker)) {
+    problems.push("catalog must call its registered defineLilacEvents symbol");
+  }
+  if (initializer.arguments.length !== 1) {
+    problems.push("defineLilacEvents must receive exactly one argument");
+    return problems;
+  }
+  const catalog = unwrapExpression(initializer.arguments[0]!);
+  if (!ts.isObjectLiteralExpression(catalog)) {
+    problems.push("defineLilacEvents input must be an explicit object literal");
+    return problems;
+  }
+  if (catalog.properties.length === 0) {
+    problems.push("event catalog must contain at least one event");
+  }
+  const wireTypes = new Set<string>();
+  for (const property of catalog.properties) {
+    if (!ts.isPropertyAssignment(property) || explicitPropertyName(property) === undefined) {
+      problems.push("catalog entries must be explicit non-computed property assignments");
+      continue;
+    }
+    const entryName = explicitPropertyName(property)!;
+    if (entryName === "__proto__") {
+      problems.push("catalog entry name __proto__ is reserved by object literal semantics");
+      continue;
+    }
+    const entry = unwrapExpression(property.initializer);
+    if (!ts.isObjectLiteralExpression(entry)) {
+      problems.push(`catalog entry ${entryName} must be an explicit object literal`);
+      continue;
+    }
+    let wireType: string | undefined;
+    let family: string | undefined;
+    let malformedEntry = false;
+    for (const metadata of entry.properties) {
+      if (ts.isSpreadAssignment(metadata) || explicitPropertyName(metadata) === undefined) {
+        malformedEntry = true;
+        continue;
+      }
+      const metadataName = explicitPropertyName(metadata)!;
+      if (metadataName !== "type" && metadataName !== "family") continue;
+      if (!ts.isPropertyAssignment(metadata)) {
+        malformedEntry = true;
+        continue;
+      }
+      const value = unwrapExpression(metadata.initializer);
+      if (!ts.isStringLiteralLike(value)) {
+        problems.push(`catalog entry ${entryName} ${metadataName} must be a string literal`);
+        continue;
+      }
+      if (metadataName === "type") {
+        if (wireType !== undefined) malformedEntry = true;
+        wireType = value.text;
+      } else {
+        if (family !== undefined) malformedEntry = true;
+        family = value.text;
+      }
+    }
+    if (malformedEntry) {
+      problems.push(`catalog entry ${entryName} must not use spreads or computed metadata`);
+    }
+    if (!wireType) {
+      problems.push(`catalog entry ${entryName} must declare a nonempty literal type`);
+    } else if (wireTypes.has(wireType)) {
+      problems.push(`catalog contains duplicate wire type ${wireType}`);
+    } else {
+      wireTypes.add(wireType);
+    }
+    if (!family) {
+      problems.push(`catalog entry ${entryName} must declare a nonempty literal family`);
+    }
+  }
+  return problems;
+}
+
+function eventRegistryProjectionProblems(
+  registry: ts.VariableDeclaration,
+  catalog: ts.VariableDeclaration,
+  helper: ts.FunctionDeclaration,
+  checker: ts.TypeChecker,
+): readonly string[] {
+  const initializer = registry.initializer && unwrapExpression(registry.initializer);
+  if (!initializer || !ts.isCallExpression(initializer)) {
+    return ["registry must be a createLilacEventCodecRegistry(catalog) call"];
+  }
+  const problems: string[] = [];
+  if (!callTargetsDeclaredHelper(initializer, helper, checker)) {
+    problems.push("registry must call its registered createLilacEventCodecRegistry symbol");
+  }
+  if (initializer.arguments.length !== 1) {
+    problems.push("createLilacEventCodecRegistry must receive exactly one catalog");
+    return problems;
+  }
+  const registeredCatalogSymbol = checker.getSymbolAtLocation(catalog.name);
+  const projectedCatalogSymbol = expressionSymbol(initializer.arguments[0]!, checker);
+  if (
+    !registeredCatalogSymbol ||
+    !projectedCatalogSymbol ||
+    canonicalSymbol(registeredCatalogSymbol, checker) !== projectedCatalogSymbol
+  ) {
+    problems.push("registry must be projected from its registered catalog symbol");
+  }
+  return problems;
+}
+
 function analyzeEventCodecRegistry(
   registration: EventCodecRegistryRegistration,
   checker: ts.TypeChecker,
@@ -3611,54 +3730,45 @@ function analyzeEventCodecRegistry(
     program,
     isObjectRegistryDeclaration,
   );
-  const canonical = requireOneRegisteredNode(
-    "Canonical event catalog",
-    registration.canonicalEvents,
+  const catalog = requireOneRegisteredNode(
+    "Lilac event catalog",
+    registration.catalog,
     workspace,
     workspaceRoot,
     program,
     isObjectRegistryDeclaration,
   );
-  const declaredCanonical = new Set(registration.canonicalMembers);
-  const sourceCanonicalValues = canonicalEventValues(canonical);
-  const registryValues = codecRegistryValues(registry, checker);
-  const sourceCanonical = new Set(sourceCanonicalValues ?? []);
-  const sourceRegistry = new Set(registryValues ?? []);
-  const malformed = sourceCanonicalValues === undefined || registryValues === undefined;
-  const catalogMissing = setDifference(declaredCanonical, sourceCanonical);
-  const catalogExtra = setDifference(sourceCanonical, declaredCanonical);
-  const codecMissing = setDifference(declaredCanonical, sourceRegistry);
-  const codecExtra = setDifference(sourceRegistry, declaredCanonical);
-  if (
-    !malformed &&
-    catalogMissing.length === 0 &&
-    catalogExtra.length === 0 &&
-    codecMissing.length === 0 &&
-    codecExtra.length === 0 &&
-    sourceRegistry.size === registryValues?.length
-  ) {
-    return;
-  }
+  const catalogHelper = requireOneRegisteredNode(
+    "Lilac event catalog helper",
+    registration.catalogHelper,
+    workspace,
+    workspaceRoot,
+    program,
+    (node): node is ts.FunctionDeclaration =>
+      ts.isFunctionDeclaration(node) && node.body !== undefined,
+  );
+  const registryHelper = requireOneRegisteredNode(
+    "Lilac event codec registry helper",
+    registration.registryHelper,
+    workspace,
+    workspaceRoot,
+    program,
+    (node): node is ts.FunctionDeclaration =>
+      ts.isFunctionDeclaration(node) && node.body !== undefined,
+  );
   const details = [
-    malformed
-      ? "catalog and registry must be explicit object literals with statically named members"
-      : undefined,
-    catalogMissing.length ? `catalog missing ${catalogMissing.join(", ")}` : undefined,
-    catalogExtra.length ? `catalog has undeclared ${catalogExtra.join(", ")}` : undefined,
-    codecMissing.length ? `codecs missing ${codecMissing.join(", ")}` : undefined,
-    codecExtra.length ? `codecs contain noncanonical ${codecExtra.join(", ")}` : undefined,
-    registryValues && sourceRegistry.size !== registryValues.length
-      ? "codec registry contains duplicate canonical keys"
-      : undefined,
-  ].filter((detail): detail is string => detail !== undefined);
+    ...eventCatalogDslProblems(catalog, catalogHelper, checker),
+    ...eventRegistryProjectionProblems(registry, catalog, registryHelper, checker),
+  ];
+  if (details.length === 0) return;
   diagnostics.push(
     makeDiagnostic(
       workspace,
       workspaceRoot,
       "architecture/complete-event-codec-registry",
       registry,
-      `Registered event codec registry is incomplete: ${details.join("; ")}.`,
-      "Keep the canonical event catalog and codec registry as exact, exhaustive one-to-one maps.",
+      `Registered Lilac event infrastructure is invalid: ${details.join("; ")}.`,
+      "Define every event with literal type and family metadata in defineLilacEvents({ ... }), then derive the registry with createLilacEventCodecRegistry(catalog).",
     ),
   );
 }

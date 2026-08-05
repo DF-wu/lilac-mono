@@ -87,7 +87,6 @@ const BASE_WORKSPACE = {
   rawEventMessageBoundaries: [],
   eventDeliveryApis: [],
   eventDeliveryConsumers: [],
-  eventFamilies: [],
 } as const satisfies WorkspaceArchitecture;
 
 const fixtureProgram = createWorkspaceProgram(REPOSITORY_ROOT, BASE_WORKSPACE).program;
@@ -196,17 +195,15 @@ function openProtocolAdapter(
   };
 }
 
-const FIXTURE_EVENT_MEMBERS = ["fixture.alpha", "fixture.beta", "fixture.gamma"] as const;
-
-function fixtureCodecRegistry(exportName: string) {
+function fixtureCodecRegistry(exportName: string, catalogExportName = "validFixtureEvents") {
   return {
     identity: { module: "stage4-events.ts", exportName },
-    canonicalEvents: {
+    catalog: { module: "stage4-events.ts", exportName: catalogExportName },
+    catalogHelper: { module: "stage4-events.ts", exportName: "defineLilacEvents" },
+    registryHelper: {
       module: "stage4-events.ts",
-      exportName: "canonicalFixtureEvents",
+      exportName: "createLilacEventCodecRegistry",
     },
-    canonicalMembers: FIXTURE_EVENT_MEMBERS,
-    codecMembers: FIXTURE_EVENT_MEMBERS,
   };
 }
 
@@ -1755,7 +1752,7 @@ describe("Stage 2 union rules", () => {
 });
 
 describe("Stage 4 event architecture rules", () => {
-  test("registers enforced production foundations and a migrated exhaustive family partition", () => {
+  test("registers enforced production foundations and the single event catalog", () => {
     const eventBus = architectureManifest.workspaces.find(
       (workspace) => workspace.name === "packages/event-bus",
     );
@@ -1764,7 +1761,12 @@ describe("Stage 4 event architecture rules", () => {
     expect(eventBus.eventCodecRegistries).toHaveLength(1);
     expect(eventBus.eventCodecRegistries[0]).toMatchObject({
       identity: { module: "lilac-codecs.ts", exportName: "lilacEventCodecRegistry" },
-      canonicalEvents: { module: "lilac-spec.ts", exportName: "lilacEventTypes" },
+      catalog: { module: "lilac-spec.ts", exportName: "LILAC_EVENTS" },
+      catalogHelper: { module: "define-lilac-events.ts", exportName: "defineLilacEvents" },
+      registryHelper: {
+        module: "define-lilac-events.ts",
+        exportName: "createLilacEventCodecRegistry",
+      },
     });
     expect(eventBus.rawEventMessageBoundaries).toContainEqual(
       expect.objectContaining({
@@ -1781,15 +1783,6 @@ describe("Stage 4 event architecture rules", () => {
         handlerContextParameter: 1,
       }),
     );
-    expect(eventBus.eventFamilies.map((family) => family.family)).toEqual([
-      "command-request",
-      "workflow-control",
-      "lifecycle",
-      "adapter",
-      "surface",
-      "agent-output",
-    ]);
-    expect(eventBus.eventCodecRegistries[0]?.canonicalMembers).toHaveLength(25);
     expect(eventBus.boundaryDecoders).toContainEqual({
       identity: {
         module: "core-primary-lineage.ts",
@@ -1898,8 +1891,8 @@ describe("Stage 4 event architecture rules", () => {
     expect(() => assertArchitectureManifestIntegrity(architectureManifest)).not.toThrow();
   });
 
-  test("checks family exhaustiveness, overlap, codec coverage, and parameter indexes", () => {
-    const registry = fixtureCodecRegistry("completeFixtureEventCodecs");
+  test("checks event infrastructure identities and parameter indexes", () => {
+    const registry = fixtureCodecRegistry("validFixtureEventCodecs");
     const validWorkspace = {
       ...BASE_WORKSPACE,
       ruleZones: {
@@ -1915,65 +1908,10 @@ describe("Stage 4 event architecture rules", () => {
       operationalResultApis: [
         { module: "stage4-events.ts", exportName: "FixtureDeliveryApi.good" },
       ],
-      eventFamilies: [
-        {
-          family: "alpha",
-          codecRegistry: registry.identity,
-          members: ["fixture.alpha"],
-        },
-        {
-          family: "remaining",
-          codecRegistry: registry.identity,
-          members: ["fixture.beta", "fixture.gamma"],
-        },
-      ],
     } satisfies WorkspaceArchitecture;
     expect(() =>
       assertArchitectureManifestIntegrity({ version: 1, workspaces: [validWorkspace] }),
     ).not.toThrow();
-
-    expect(() =>
-      assertArchitectureManifestIntegrity({
-        version: 1,
-        workspaces: [
-          {
-            ...validWorkspace,
-            eventFamilies: [
-              ...validWorkspace.eventFamilies,
-              {
-                family: "overlap",
-                codecRegistry: registry.identity,
-                members: ["fixture.alpha"],
-              },
-            ],
-          },
-        ],
-      }),
-    ).toThrow("must not overlap");
-
-    expect(() =>
-      assertArchitectureManifestIntegrity({
-        version: 1,
-        workspaces: [
-          {
-            ...validWorkspace,
-            eventFamilies: validWorkspace.eventFamilies.slice(0, 1),
-          },
-        ],
-      }),
-    ).toThrow("not exhaustive");
-
-    expect(() =>
-      assertArchitectureManifestIntegrity({
-        version: 1,
-        workspaces: [
-          {
-            ...validWorkspace,
-            eventCodecRegistries: [{ ...registry, codecMembers: [] }],
-          },
-        ],
-      }),
-    ).toThrow("must declare codec coverage for every canonical member");
 
     expect(() =>
       assertArchitectureManifestIntegrity({
@@ -1994,19 +1932,115 @@ describe("Stage 4 event architecture rules", () => {
     ).toThrow("handlerParameter must be a nonnegative integer");
   });
 
-  test("requires the exact canonical codec registry to be complete", () => {
+  test("accepts an exact event catalog and derived codec registry", () => {
     const complete = findingsFor("architecture/complete-event-codec-registry", "stage4-events.ts", {
-      eventCodecRegistries: [fixtureCodecRegistry("completeFixtureEventCodecs")],
+      eventCodecRegistries: [fixtureCodecRegistry("validFixtureEventCodecs")],
     });
-    const incomplete = findingsFor(
-      "architecture/complete-event-codec-registry",
-      "stage4-events.ts",
-      { eventCodecRegistries: [fixtureCodecRegistry("incompleteFixtureEventCodecs")] },
-    );
 
     expect(complete).toEqual([]);
-    expect(incomplete).toHaveLength(1);
-    expect(incomplete[0]?.message).toContain("fixture.gamma");
+  });
+
+  test("rejects event catalog entries with missing metadata", () => {
+    const findings = findingsFor("architecture/complete-event-codec-registry", "stage4-events.ts", {
+      eventCodecRegistries: [
+        fixtureCodecRegistry("missingMetadataFixtureEventCodecs", "missingMetadataFixtureEvents"),
+      ],
+    });
+
+    expect(findings).toHaveLength(1);
+    expect(findings[0]?.message).toContain("nonempty literal family");
+  });
+
+  test("rejects duplicate event wire types", () => {
+    const findings = findingsFor("architecture/complete-event-codec-registry", "stage4-events.ts", {
+      eventCodecRegistries: [
+        fixtureCodecRegistry(
+          "duplicateWireTypeFixtureEventCodecs",
+          "duplicateWireTypeFixtureEvents",
+        ),
+      ],
+    });
+
+    expect(findings).toHaveLength(1);
+    expect(findings[0]?.message).toContain("duplicate wire type fixture.duplicate");
+  });
+
+  test("rejects spread, computed, and nonliteral event catalog input", () => {
+    for (const [registry, catalog] of [
+      ["spreadFixtureEventCodecs", "spreadFixtureEvents"],
+      ["computedFixtureEventCodecs", "computedFixtureEvents"],
+      ["nonliteralFixtureEventCodecs", "nonliteralFixtureEvents"],
+      ["nonliteralMetadataFixtureEventCodecs", "nonliteralMetadataFixtureEvents"],
+    ] as const) {
+      const findings = findingsFor(
+        "architecture/complete-event-codec-registry",
+        "stage4-events.ts",
+        { eventCodecRegistries: [fixtureCodecRegistry(registry, catalog)] },
+      );
+      expect(findings).toHaveLength(1);
+    }
+  });
+
+  test("rejects the reserved __proto__ catalog entry name", () => {
+    const findings = findingsFor("architecture/complete-event-codec-registry", "stage4-events.ts", {
+      eventCodecRegistries: [
+        fixtureCodecRegistry("reservedNameFixtureEventCodecs", "reservedNameFixtureEvents"),
+      ],
+    });
+
+    expect(findings).toHaveLength(1);
+    expect(findings[0]?.message).toContain("catalog entry name __proto__ is reserved");
+  });
+
+  test("rejects a catalog built by the wrong helper symbol", () => {
+    const findings = findingsFor("architecture/complete-event-codec-registry", "stage4-events.ts", {
+      eventCodecRegistries: [
+        fixtureCodecRegistry("wrongHelperFixtureEventCodecs", "wrongHelperFixtureEvents"),
+      ],
+    });
+
+    expect(findings).toHaveLength(1);
+    expect(findings[0]?.message).toContain("defineLilacEvents symbol");
+  });
+
+  test("rejects a catalog built by a same-named unregistered helper", () => {
+    const findings = findingsFor("architecture/complete-event-codec-registry", "stage4-events.ts", {
+      eventCodecRegistries: [
+        fixtureCodecRegistry("sameNameImpostorFixtureEventCodecs", "sameNameImpostorFixtureEvents"),
+      ],
+    });
+
+    expect(findings).toHaveLength(1);
+    expect(findings[0]?.message).toContain("registered defineLilacEvents symbol");
+  });
+
+  test("rejects a registry projected from a different catalog symbol", () => {
+    const findings = findingsFor("architecture/complete-event-codec-registry", "stage4-events.ts", {
+      eventCodecRegistries: [
+        fixtureCodecRegistry("mismatchedFixtureEventCodecs", "validFixtureEvents"),
+      ],
+    });
+
+    expect(findings).toHaveLength(1);
+    expect(findings[0]?.message).toContain("registered catalog symbol");
+  });
+
+  test("rejects a registry built by the wrong projection helper symbol", () => {
+    const findings = findingsFor("architecture/complete-event-codec-registry", "stage4-events.ts", {
+      eventCodecRegistries: [fixtureCodecRegistry("wrongProjectionHelperFixtureEventCodecs")],
+    });
+
+    expect(findings).toHaveLength(1);
+    expect(findings[0]?.message).toContain("createLilacEventCodecRegistry symbol");
+  });
+
+  test("rejects a registry built by a same-named unregistered projection helper", () => {
+    const findings = findingsFor("architecture/complete-event-codec-registry", "stage4-events.ts", {
+      eventCodecRegistries: [fixtureCodecRegistry("sameNameImpostorProjectionFixtureEventCodecs")],
+    });
+
+    expect(findings).toHaveLength(1);
+    expect(findings[0]?.message).toContain("registered createLilacEventCodecRegistry symbol");
   });
 
   test("requires raw receive handlers to expose Message<unknown> without specialization assertions", () => {

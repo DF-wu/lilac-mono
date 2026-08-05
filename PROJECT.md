@@ -58,7 +58,7 @@ Workspace roots are Bun workspaces (`apps/*`, `packages/*`). `ref/` contains ven
 
 - `packages/event-bus/`
   - The bus implementation and the canonical event spec.
-  - Typed event contract: `packages/event-bus/lilac-spec.ts`.
+  - Single event catalog and payload schemas: `packages/event-bus/lilac-spec.ts`.
   - Typed bus wrapper: `packages/event-bus/lilac-bus.ts`.
   - Redis Streams transport: `packages/event-bus/redis-streams-bus.ts`.
   - Low-level types: `packages/event-bus/types.ts`.
@@ -114,7 +114,7 @@ Implementation note: subscriptions use a small Redis connection pool because Red
   - Output topics are request-scoped: `out.req.<request_id>`.
 
 - Event type: a string like `cmd.request.message`.
-  - All canonical event types and payloads live in `packages/event-bus/lilac-spec.ts`.
+  - `LILAC_EVENTS` in `packages/event-bus/lilac-spec.ts` is the single source for event types, families, routing, keys, payload contracts, and codecs.
 
 - Subscription `mode` (delivery semantics):
   - `work`: consumer-group queue semantics (competing consumers).
@@ -529,7 +529,7 @@ Shutdown happens in reverse (best-effort).
 
 ## Common “Where Do I Change X?” Pointers
 
-- Add/modify bus event types: `packages/event-bus/lilac-spec.ts` and routing/key logic in `packages/event-bus/lilac-bus.ts`.
+- Add/modify bus event types: add one `LILAC_EVENTS` entry in `packages/event-bus/lilac-spec.ts`, add its wire compatibility fixture, then publish and subscribe with an explicit delivery policy.
 - Change request routing behavior: `apps/core/src/surface/bridge/bus-request-router.ts` and config schema in `packages/utils/core-config.ts`.
 - Change agent execution behavior (steer/follow-up/interrupt semantics): `packages/agent/ai-sdk-pi-agent.ts`.
 - Change which local tools the LLM can call: `apps/core/src/surface/bridge/bus-agent-runner.ts`.

@@ -103,7 +103,7 @@ function getTopicForType<TType extends LilacEventType>(
   headers: LilacEnvelopeHeaders | undefined,
 ): ResultType<LilacTopicForType<TType>, EventPublishContractInvalid> {
   const codec = lilacEventCodecRegistry[type];
-  if (!codec.requiresRequestId) return Result.ok(codec.resolveTopic());
+  if (!codec.requiresRequestId) return Result.ok(codec.resolveTopic(""));
   const requestId = requireRequestId(headers, type);
   if (requestId.status === "error") return Result.err(requestId.error);
   return Result.ok(codec.resolveTopic(requestId.value));
@@ -114,31 +114,14 @@ function getKeyForType<TType extends LilacEventType>(
   headers: LilacEnvelopeHeaders | undefined,
   data: LilacDataForType<TType>,
 ): ResultType<string | undefined, EventPublishContractInvalid> {
-  switch (lilacEventCodecRegistry[type].keySource) {
-    case "request_id": {
-      const requestId = requireRequestId(headers, type);
-      if (requestId.status === "error") return Result.err(requestId.error);
-      return Result.ok(requestId.value);
-    }
-    case "messageId":
-      return Result.ok(
-        "messageId" in data && typeof data.messageId === "string" ? data.messageId : undefined,
-      );
-    case "actionId":
-      return Result.ok(
-        "actionId" in data && typeof data.actionId === "string" ? data.actionId : undefined,
-      );
-    case "barrierId":
-      return Result.ok(
-        "barrierId" in data && typeof data.barrierId === "string" ? data.barrierId : undefined,
-      );
-    case "runId":
-      return Result.ok("runId" in data && typeof data.runId === "string" ? data.runId : undefined);
-    case "agentId":
-      return Result.ok(
-        "agentId" in data && typeof data.agentId === "string" ? data.agentId : undefined,
-      );
+  const keySource = lilacEventCodecRegistry[type].keySource;
+  if (keySource === "request_id") {
+    const requestId = requireRequestId(headers, type);
+    if (requestId.status === "error") return Result.err(requestId.error);
+    return Result.ok(requestId.value);
   }
+  const key: unknown = Reflect.get(data, keySource);
+  return Result.ok(typeof key === "string" ? key : undefined);
 }
 
 function normalizeTransportInvalid(failure: RedisMessageDecodeFailure): EventContractInvalid {

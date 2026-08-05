@@ -9,47 +9,16 @@ import { modelMessageSchema } from "ai";
 import { z } from "zod";
 
 import { corePrimaryLineageV1Schema, decodeCorePrimaryLineageV1 } from "./core-primary-lineage";
-
-/**
- * Event type string constants (use for autocomplete).
- */
-export const lilacEventTypes = {
-  CmdRequestMessage: "cmd.request.message",
-
-  CmdSurfaceOutputReanchor: "cmd.surface.output.reanchor",
-
-  EvtAdapterMessageCreated: "evt.adapter.message.created",
-  EvtAdapterMessageUpdated: "evt.adapter.message.updated",
-  EvtAdapterMessageDeleted: "evt.adapter.message.deleted",
-  EvtAdapterReactionAdded: "evt.adapter.reaction.added",
-  EvtAdapterReactionRemoved: "evt.adapter.reaction.removed",
-  EvtAdapterActionInvoked: "evt.adapter.action.invoked",
-  EvtWorkflowWaitResolverBarrier: "evt.adapter.workflow-wait-resolver.barrier",
-
-  EvtRequestLifecycleChanged: "evt.request.lifecycle.changed",
-  EvtRequestReply: "evt.request.reply",
-
-  EvtSurfaceOutputMessageCreated: "evt.surface.output.message.created",
-
-  EvtWorkflowRunChanged: "evt.workflow.run.changed",
-  EvtWorkflowOperationChanged: "evt.workflow.operation.changed",
-  EvtWorkflowProgressRequested: "evt.workflow.progress.requested",
-  EvtWorkflowUsageChanged: "evt.workflow.usage.changed",
-  EvtWorkflowResultReady: "evt.workflow.result.ready",
-
-  CmdAgentCreate: "cmd.agent.create",
-
-  EvtAgentOutputDeltaReasoning: "evt.agent.output.delta.reasoning",
-  EvtAgentOutputDeltaText: "evt.agent.output.delta.text",
-  EvtAgentOutputTextReset: "evt.agent.output.text.reset",
-  EvtAgentOutputResponseText: "evt.agent.output.response.text",
-  EvtAgentOutputResponseBinary: "evt.agent.output.response.binary",
-  EvtAgentOutputToolCall: "evt.agent.output.toolcall",
-  EvtAgentOutputActivity: "evt.agent.output.activity",
-} as const;
-
-/** Union of all supported Lilac event types. */
-export type LilacEventType = (typeof lilacEventTypes)[keyof typeof lilacEventTypes];
+import {
+  createLilacEventTypes,
+  dataKey,
+  defineLilacEvents,
+  fixedTopic,
+  headerKey,
+  requestOutputTopic,
+  type LilacEventSpecFromCatalog,
+  type LilacEventTypeFromCatalog,
+} from "./define-lilac-events";
 
 /** Output stream topic for a single request (agent output deltas/responses). */
 export type OutReqTopic = `out.req.${string}`;
@@ -398,166 +367,200 @@ export const evtAgentOutputActivityDataSchema = z.strictObject({
 });
 export type EvtAgentOutputActivityData = z.output<typeof evtAgentOutputActivityDataSchema>;
 
-/**
- * Type-level map: event type -> topic + payload.
- */
-export type LilacEventSpec = {
-  [lilacEventTypes.CmdRequestMessage]: {
-    topic: "cmd.request";
-    key: string;
-    data: CmdRequestMessageData;
-  };
+/** The single authoring source for Lilac event contracts and routing metadata. */
+export const LILAC_EVENTS = defineLilacEvents({
+  CmdRequestMessage: {
+    type: "cmd.request.message",
+    family: "command-request",
+    topic: fixedTopic("cmd.request"),
+    key: headerKey("request_id"),
+    data: cmdRequestMessageDataSchema,
+  },
+  CmdSurfaceOutputReanchor: {
+    type: "cmd.surface.output.reanchor",
+    family: "command-request",
+    topic: fixedTopic("cmd.surface"),
+    key: headerKey("request_id"),
+    data: cmdSurfaceOutputReanchorDataSchema,
+  },
+  EvtAdapterMessageCreated: {
+    type: "evt.adapter.message.created",
+    family: "adapter",
+    topic: fixedTopic("evt.adapter"),
+    key: dataKey("messageId"),
+    data: evtAdapterMessageCreatedDataSchema,
+  },
+  EvtAdapterMessageUpdated: {
+    type: "evt.adapter.message.updated",
+    family: "adapter",
+    topic: fixedTopic("evt.adapter"),
+    key: dataKey("messageId"),
+    data: evtAdapterMessageUpdatedDataSchema,
+  },
+  EvtAdapterMessageDeleted: {
+    type: "evt.adapter.message.deleted",
+    family: "adapter",
+    topic: fixedTopic("evt.adapter"),
+    key: dataKey("messageId"),
+    data: evtAdapterMessageDeletedDataSchema,
+  },
+  EvtAdapterReactionAdded: {
+    type: "evt.adapter.reaction.added",
+    family: "adapter",
+    topic: fixedTopic("evt.adapter"),
+    key: dataKey("messageId"),
+    data: evtAdapterReactionAddedDataSchema,
+  },
+  EvtAdapterReactionRemoved: {
+    type: "evt.adapter.reaction.removed",
+    family: "adapter",
+    topic: fixedTopic("evt.adapter"),
+    key: dataKey("messageId"),
+    data: evtAdapterReactionRemovedDataSchema,
+  },
+  EvtAdapterActionInvoked: {
+    type: "evt.adapter.action.invoked",
+    family: "adapter",
+    topic: fixedTopic("evt.adapter"),
+    key: dataKey("actionId"),
+    data: evtAdapterActionInvokedDataSchema,
+  },
+  EvtWorkflowWaitResolverBarrier: {
+    type: "evt.adapter.workflow-wait-resolver.barrier",
+    family: "workflow-control",
+    topic: fixedTopic("evt.adapter"),
+    key: dataKey("barrierId"),
+    data: evtWorkflowWaitResolverBarrierDataSchema,
+  },
+  EvtRequestLifecycleChanged: {
+    type: "evt.request.lifecycle.changed",
+    family: "lifecycle",
+    topic: fixedTopic("evt.request"),
+    key: headerKey("request_id"),
+    data: evtRequestLifecycleChangedDataSchema,
+  },
+  EvtRequestReply: {
+    type: "evt.request.reply",
+    family: "lifecycle",
+    topic: fixedTopic("evt.request"),
+    key: headerKey("request_id"),
+    data: evtRequestReplyDataSchema,
+  },
+  EvtSurfaceOutputMessageCreated: {
+    type: "evt.surface.output.message.created",
+    family: "surface",
+    topic: fixedTopic("evt.surface"),
+    key: headerKey("request_id"),
+    data: evtSurfaceOutputMessageCreatedDataSchema,
+  },
+  EvtWorkflowRunChanged: {
+    type: "evt.workflow.run.changed",
+    family: "workflow-control",
+    topic: fixedTopic("evt.workflow"),
+    key: dataKey("runId"),
+    data: evtWorkflowRunChangedDataSchema,
+  },
+  EvtWorkflowOperationChanged: {
+    type: "evt.workflow.operation.changed",
+    family: "workflow-control",
+    topic: fixedTopic("evt.workflow"),
+    key: dataKey("runId"),
+    data: evtWorkflowOperationChangedDataSchema,
+  },
+  EvtWorkflowProgressRequested: {
+    type: "evt.workflow.progress.requested",
+    family: "workflow-control",
+    topic: fixedTopic("evt.workflow"),
+    key: dataKey("runId"),
+    data: evtWorkflowProgressRequestedDataSchema,
+  },
+  EvtWorkflowUsageChanged: {
+    type: "evt.workflow.usage.changed",
+    family: "workflow-control",
+    topic: fixedTopic("evt.workflow"),
+    key: dataKey("runId"),
+    data: evtWorkflowUsageChangedDataSchema,
+  },
+  EvtWorkflowResultReady: {
+    type: "evt.workflow.result.ready",
+    family: "workflow-control",
+    topic: fixedTopic("evt.workflow"),
+    key: dataKey("runId"),
+    data: evtWorkflowResultReadyDataSchema,
+  },
+  CmdAgentCreate: {
+    type: "cmd.agent.create",
+    family: "command-request",
+    topic: fixedTopic("cmd.agent"),
+    key: dataKey("agentId"),
+    data: cmdAgentCreateDataSchema,
+  },
+  EvtAgentOutputDeltaReasoning: {
+    type: "evt.agent.output.delta.reasoning",
+    family: "agent-output",
+    topic: requestOutputTopic({ schema: outReqTopicSchema, resolve: outReqTopic }),
+    key: headerKey("request_id"),
+    data: evtAgentOutputDeltaReasoningDataSchema,
+  },
+  EvtAgentOutputDeltaText: {
+    type: "evt.agent.output.delta.text",
+    family: "agent-output",
+    topic: requestOutputTopic({ schema: outReqTopicSchema, resolve: outReqTopic }),
+    key: headerKey("request_id"),
+    data: evtAgentOutputDeltaTextDataSchema,
+  },
+  EvtAgentOutputTextReset: {
+    type: "evt.agent.output.text.reset",
+    family: "agent-output",
+    topic: requestOutputTopic({ schema: outReqTopicSchema, resolve: outReqTopic }),
+    key: headerKey("request_id"),
+    data: evtAgentOutputTextResetDataSchema,
+  },
+  EvtAgentOutputResponseText: {
+    type: "evt.agent.output.response.text",
+    family: "agent-output",
+    topic: requestOutputTopic({ schema: outReqTopicSchema, resolve: outReqTopic }),
+    key: headerKey("request_id"),
+    data: evtAgentOutputResponseTextDataSchema,
+  },
+  EvtAgentOutputResponseBinary: {
+    type: "evt.agent.output.response.binary",
+    family: "agent-output",
+    topic: requestOutputTopic({ schema: outReqTopicSchema, resolve: outReqTopic }),
+    key: headerKey("request_id"),
+    data: evtAgentOutputResponseBinaryDataSchema,
+  },
+  EvtAgentOutputToolCall: {
+    type: "evt.agent.output.toolcall",
+    family: "agent-output",
+    topic: requestOutputTopic({ schema: outReqTopicSchema, resolve: outReqTopic }),
+    key: headerKey("request_id"),
+    data: evtAgentOutputToolCallDataSchema,
+  },
+  EvtAgentOutputActivity: {
+    type: "evt.agent.output.activity",
+    family: "agent-output",
+    topic: requestOutputTopic({ schema: outReqTopicSchema, resolve: outReqTopic }),
+    key: headerKey("request_id"),
+    data: evtAgentOutputActivityDataSchema,
+  },
+});
 
-  [lilacEventTypes.CmdSurfaceOutputReanchor]: {
-    topic: "cmd.surface";
-    key: string;
-    data: CmdSurfaceOutputReanchorData;
-  };
+/** Event type string constants retained for autocomplete and compatibility. */
+export const lilacEventTypes = createLilacEventTypes(LILAC_EVENTS);
 
-  [lilacEventTypes.EvtAdapterMessageCreated]: {
-    topic: "evt.adapter";
-    key: string;
-    data: EvtAdapterMessageCreatedData;
-  };
+/** Union of all supported Lilac event types. */
+export type LilacEventType = LilacEventTypeFromCatalog<typeof LILAC_EVENTS>;
 
-  [lilacEventTypes.EvtAdapterMessageUpdated]: {
-    topic: "evt.adapter";
-    key: string;
-    data: EvtAdapterMessageUpdatedData;
-  };
-
-  [lilacEventTypes.EvtAdapterMessageDeleted]: {
-    topic: "evt.adapter";
-    key: string;
-    data: EvtAdapterMessageDeletedData;
-  };
-
-  [lilacEventTypes.EvtAdapterReactionAdded]: {
-    topic: "evt.adapter";
-    key: string;
-    data: EvtAdapterReactionAddedData;
-  };
-
-  [lilacEventTypes.EvtAdapterReactionRemoved]: {
-    topic: "evt.adapter";
-    key: string;
-    data: EvtAdapterReactionRemovedData;
-  };
-
-  [lilacEventTypes.EvtAdapterActionInvoked]: {
-    topic: "evt.adapter";
-    key: string;
-    data: EvtAdapterActionInvokedData;
-  };
-
-  [lilacEventTypes.EvtWorkflowWaitResolverBarrier]: {
-    topic: "evt.adapter";
-    key: string;
-    data: EvtWorkflowWaitResolverBarrierData;
-  };
-
-  [lilacEventTypes.EvtRequestLifecycleChanged]: {
-    topic: "evt.request";
-    key: string;
-    data: EvtRequestLifecycleChangedData;
-  };
-
-  [lilacEventTypes.EvtRequestReply]: {
-    topic: "evt.request";
-    key: string;
-    data: EvtRequestReplyData;
-  };
-
-  [lilacEventTypes.EvtSurfaceOutputMessageCreated]: {
-    topic: "evt.surface";
-    key: string;
-    data: EvtSurfaceOutputMessageCreatedData;
-  };
-
-  [lilacEventTypes.EvtWorkflowRunChanged]: {
-    topic: "evt.workflow";
-    key: string;
-    data: EvtWorkflowRunChangedData;
-  };
-
-  [lilacEventTypes.EvtWorkflowOperationChanged]: {
-    topic: "evt.workflow";
-    key: string;
-    data: EvtWorkflowOperationChangedData;
-  };
-
-  [lilacEventTypes.EvtWorkflowProgressRequested]: {
-    topic: "evt.workflow";
-    key: string;
-    data: EvtWorkflowProgressRequestedData;
-  };
-
-  [lilacEventTypes.EvtWorkflowUsageChanged]: {
-    topic: "evt.workflow";
-    key: string;
-    data: EvtWorkflowUsageChangedData;
-  };
-
-  [lilacEventTypes.EvtWorkflowResultReady]: {
-    topic: "evt.workflow";
-    key: string;
-    data: EvtWorkflowResultReadyData;
-  };
-
-  [lilacEventTypes.CmdAgentCreate]: {
-    topic: "cmd.agent";
-    key: string;
-    data: CmdAgentCreateData;
-  };
-
-  [lilacEventTypes.EvtAgentOutputDeltaReasoning]: {
-    topic: OutReqTopic;
-    key: string;
-    data: EvtAgentOutputDeltaReasoningData;
-  };
-
-  [lilacEventTypes.EvtAgentOutputDeltaText]: {
-    topic: OutReqTopic;
-    key: string;
-    data: EvtAgentOutputDeltaTextData;
-  };
-
-  [lilacEventTypes.EvtAgentOutputTextReset]: {
-    topic: OutReqTopic;
-    key: string;
-    data: EvtAgentOutputTextResetData;
-  };
-
-  [lilacEventTypes.EvtAgentOutputResponseText]: {
-    topic: OutReqTopic;
-    key: string;
-    data: EvtAgentOutputResponseTextData;
-  };
-
-  [lilacEventTypes.EvtAgentOutputResponseBinary]: {
-    topic: OutReqTopic;
-    key: string;
-    data: EvtAgentOutputResponseBinaryData;
-  };
-
-  [lilacEventTypes.EvtAgentOutputToolCall]: {
-    topic: OutReqTopic;
-    key: string;
-    data: EvtAgentOutputToolCallData;
-  };
-  [lilacEventTypes.EvtAgentOutputActivity]: {
-    topic: OutReqTopic;
-    key: string;
-    data: EvtAgentOutputActivityData;
-  };
-};
+/** Type-level map from event type to its topic, key, and payload contract. */
+export type LilacEventSpec = LilacEventSpecFromCatalog<typeof LILAC_EVENTS>;
 
 /** Union of all topics used by the Lilac bus. */
 export type LilacTopic = LilacEventSpec[LilacEventType]["topic"];
 
 /** Event types that may appear on a given topic. */
 export type LilacEventTypesForTopic<TTopic extends LilacTopic> = {
-  [TType in LilacEventType]: LilacEventSpec[TType]["topic"] extends TTopic ? TType : never;
+  [TType in LilacEventType]: TTopic extends LilacEventSpec[TType]["topic"] ? TType : never;
 }[LilacEventType];
 
 /** Payload type for a given event type. */

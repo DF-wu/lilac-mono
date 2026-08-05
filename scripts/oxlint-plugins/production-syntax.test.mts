@@ -123,7 +123,6 @@ function manifestWithAdapters(adapters: readonly ExceptionAdapter[]): FixtureArc
         rawEventMessageBoundaries: [],
         eventDeliveryApis: [],
         eventDeliveryConsumers: [],
-        eventFamilies: [],
       },
     ],
   };

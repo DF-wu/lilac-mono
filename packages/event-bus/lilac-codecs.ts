@@ -2,35 +2,12 @@ import { Panic, Result, TaggedError, type Result as ResultType } from "better-re
 import { z } from "zod";
 
 import {
+  createLilacEventCodecRegistry,
+  type LilacEventDefinitionForType,
+} from "./define-lilac-events";
+import {
   adapterPlatformSchema,
-  cmdAgentCreateDataSchema,
-  cmdRequestMessageDataSchema,
-  cmdSurfaceOutputReanchorDataSchema,
-  evtAdapterActionInvokedDataSchema,
-  evtAdapterMessageCreatedDataSchema,
-  evtAdapterMessageDeletedDataSchema,
-  evtAdapterMessageUpdatedDataSchema,
-  evtAdapterReactionAddedDataSchema,
-  evtAdapterReactionRemovedDataSchema,
-  evtAgentOutputActivityDataSchema,
-  evtAgentOutputDeltaReasoningDataSchema,
-  evtAgentOutputDeltaTextDataSchema,
-  evtAgentOutputResponseBinaryDataSchema,
-  evtAgentOutputResponseTextDataSchema,
-  evtAgentOutputTextResetDataSchema,
-  evtAgentOutputToolCallDataSchema,
-  evtRequestLifecycleChangedDataSchema,
-  evtRequestReplyDataSchema,
-  evtSurfaceOutputMessageCreatedDataSchema,
-  evtWorkflowOperationChangedDataSchema,
-  evtWorkflowProgressRequestedDataSchema,
-  evtWorkflowResultReadyDataSchema,
-  evtWorkflowRunChangedDataSchema,
-  evtWorkflowUsageChangedDataSchema,
-  evtWorkflowWaitResolverBarrierDataSchema,
-  lilacEventTypes,
-  outReqTopic,
-  outReqTopicSchema,
+  LILAC_EVENTS,
   type AdapterPlatform,
   type LilacDataForType,
   type LilacEventTypesForTopic,
@@ -43,56 +20,25 @@ import type { DecodedMessage, Message } from "./types";
 const nonemptyStringSchema = z.string().min(1);
 const finiteNumberSchema = z.number().finite();
 
-type LilacKeySource = "request_id" | "messageId" | "actionId" | "barrierId" | "runId" | "agentId";
+type CatalogDefinitionForType<TType extends LilacEventType> = LilacEventDefinitionForType<
+  typeof LILAC_EVENTS,
+  TType
+>;
 
-type OutputEventType =
-  | typeof lilacEventTypes.EvtAgentOutputDeltaReasoning
-  | typeof lilacEventTypes.EvtAgentOutputDeltaText
-  | typeof lilacEventTypes.EvtAgentOutputTextReset
-  | typeof lilacEventTypes.EvtAgentOutputResponseText
-  | typeof lilacEventTypes.EvtAgentOutputResponseBinary
-  | typeof lilacEventTypes.EvtAgentOutputToolCall
-  | typeof lilacEventTypes.EvtAgentOutputActivity;
-type RequestScopedEventType =
-  | typeof lilacEventTypes.CmdRequestMessage
-  | typeof lilacEventTypes.CmdSurfaceOutputReanchor
-  | typeof lilacEventTypes.EvtRequestLifecycleChanged
-  | typeof lilacEventTypes.EvtRequestReply
-  | typeof lilacEventTypes.EvtSurfaceOutputMessageCreated
-  | OutputEventType;
-type AdapterMessageKeyEventType =
-  | typeof lilacEventTypes.EvtAdapterMessageCreated
-  | typeof lilacEventTypes.EvtAdapterMessageUpdated
-  | typeof lilacEventTypes.EvtAdapterMessageDeleted
-  | typeof lilacEventTypes.EvtAdapterReactionAdded
-  | typeof lilacEventTypes.EvtAdapterReactionRemoved;
-type WorkflowEventType =
-  | typeof lilacEventTypes.EvtWorkflowRunChanged
-  | typeof lilacEventTypes.EvtWorkflowOperationChanged
-  | typeof lilacEventTypes.EvtWorkflowProgressRequested
-  | typeof lilacEventTypes.EvtWorkflowUsageChanged
-  | typeof lilacEventTypes.EvtWorkflowResultReady;
-type LilacKeySourceForType<TType extends LilacEventType> = TType extends RequestScopedEventType
-  ? "request_id"
-  : TType extends AdapterMessageKeyEventType
-    ? "messageId"
-    : TType extends typeof lilacEventTypes.EvtAdapterActionInvoked
-      ? "actionId"
-      : TType extends typeof lilacEventTypes.EvtWorkflowWaitResolverBarrier
-        ? "barrierId"
-        : TType extends WorkflowEventType
-          ? "runId"
-          : TType extends typeof lilacEventTypes.CmdAgentCreate
-            ? "agentId"
-            : never;
+type RequiresRequestId<TType extends LilacEventType> =
+  CatalogDefinitionForType<TType>["topic"] extends { readonly kind: "request-output" }
+    ? true
+    : CatalogDefinitionForType<TType>["key"] extends { readonly kind: "header" }
+      ? true
+      : false;
 
 export type LilacEventCodec<TType extends LilacEventType> = {
   readonly type: TType;
-  readonly topic: TType extends OutputEventType ? "out.req" : LilacTopicForType<TType>;
+  readonly topic: CatalogDefinitionForType<TType>["topic"]["topic"];
   readonly topicSchema: z.ZodType<LilacTopicForType<TType>>;
   readonly resolveTopic: (requestId: string) => LilacTopicForType<TType>;
-  readonly requiresRequestId: TType extends RequestScopedEventType ? true : false;
-  readonly keySource: LilacKeySourceForType<TType> & LilacKeySource;
+  readonly requiresRequestId: RequiresRequestId<TType>;
+  readonly keySource: CatalogDefinitionForType<TType>["key"]["source"];
   readonly dataSchema: z.ZodType<LilacDataForType<TType>>;
 };
 
@@ -118,237 +64,15 @@ export type LilacEventCodecRegistry = {
   readonly [TType in LilacEventType]: LilacEventCodec<TType>;
 };
 
-function staticTopic<TTopic extends LilacTopic>(topic: TTopic): () => TTopic {
-  return () => topic;
-}
+export const lilacEventCodecRegistry: LilacEventCodecRegistry =
+  createLilacEventCodecRegistry(LILAC_EVENTS);
 
-export const lilacEventCodecRegistry = {
-  [lilacEventTypes.CmdRequestMessage]: {
-    type: lilacEventTypes.CmdRequestMessage,
-    topic: "cmd.request",
-    topicSchema: z.literal("cmd.request"),
-    resolveTopic: staticTopic("cmd.request"),
-    requiresRequestId: true,
-    keySource: "request_id",
-    dataSchema: cmdRequestMessageDataSchema,
-  },
-  [lilacEventTypes.CmdSurfaceOutputReanchor]: {
-    type: lilacEventTypes.CmdSurfaceOutputReanchor,
-    topic: "cmd.surface",
-    topicSchema: z.literal("cmd.surface"),
-    resolveTopic: staticTopic("cmd.surface"),
-    requiresRequestId: true,
-    keySource: "request_id",
-    dataSchema: cmdSurfaceOutputReanchorDataSchema,
-  },
-  [lilacEventTypes.EvtAdapterMessageCreated]: {
-    type: lilacEventTypes.EvtAdapterMessageCreated,
-    topic: "evt.adapter",
-    topicSchema: z.literal("evt.adapter"),
-    resolveTopic: staticTopic("evt.adapter"),
-    requiresRequestId: false,
-    keySource: "messageId",
-    dataSchema: evtAdapterMessageCreatedDataSchema,
-  },
-  [lilacEventTypes.EvtAdapterMessageUpdated]: {
-    type: lilacEventTypes.EvtAdapterMessageUpdated,
-    topic: "evt.adapter",
-    topicSchema: z.literal("evt.adapter"),
-    resolveTopic: staticTopic("evt.adapter"),
-    requiresRequestId: false,
-    keySource: "messageId",
-    dataSchema: evtAdapterMessageUpdatedDataSchema,
-  },
-  [lilacEventTypes.EvtAdapterMessageDeleted]: {
-    type: lilacEventTypes.EvtAdapterMessageDeleted,
-    topic: "evt.adapter",
-    topicSchema: z.literal("evt.adapter"),
-    resolveTopic: staticTopic("evt.adapter"),
-    requiresRequestId: false,
-    keySource: "messageId",
-    dataSchema: evtAdapterMessageDeletedDataSchema,
-  },
-  [lilacEventTypes.EvtAdapterReactionAdded]: {
-    type: lilacEventTypes.EvtAdapterReactionAdded,
-    topic: "evt.adapter",
-    topicSchema: z.literal("evt.adapter"),
-    resolveTopic: staticTopic("evt.adapter"),
-    requiresRequestId: false,
-    keySource: "messageId",
-    dataSchema: evtAdapterReactionAddedDataSchema,
-  },
-  [lilacEventTypes.EvtAdapterReactionRemoved]: {
-    type: lilacEventTypes.EvtAdapterReactionRemoved,
-    topic: "evt.adapter",
-    topicSchema: z.literal("evt.adapter"),
-    resolveTopic: staticTopic("evt.adapter"),
-    requiresRequestId: false,
-    keySource: "messageId",
-    dataSchema: evtAdapterReactionRemovedDataSchema,
-  },
-  [lilacEventTypes.EvtAdapterActionInvoked]: {
-    type: lilacEventTypes.EvtAdapterActionInvoked,
-    topic: "evt.adapter",
-    topicSchema: z.literal("evt.adapter"),
-    resolveTopic: staticTopic("evt.adapter"),
-    requiresRequestId: false,
-    keySource: "actionId",
-    dataSchema: evtAdapterActionInvokedDataSchema,
-  },
-  [lilacEventTypes.EvtWorkflowWaitResolverBarrier]: {
-    type: lilacEventTypes.EvtWorkflowWaitResolverBarrier,
-    topic: "evt.adapter",
-    topicSchema: z.literal("evt.adapter"),
-    resolveTopic: staticTopic("evt.adapter"),
-    requiresRequestId: false,
-    keySource: "barrierId",
-    dataSchema: evtWorkflowWaitResolverBarrierDataSchema,
-  },
-  [lilacEventTypes.EvtRequestLifecycleChanged]: {
-    type: lilacEventTypes.EvtRequestLifecycleChanged,
-    topic: "evt.request",
-    topicSchema: z.literal("evt.request"),
-    resolveTopic: staticTopic("evt.request"),
-    requiresRequestId: true,
-    keySource: "request_id",
-    dataSchema: evtRequestLifecycleChangedDataSchema,
-  },
-  [lilacEventTypes.EvtRequestReply]: {
-    type: lilacEventTypes.EvtRequestReply,
-    topic: "evt.request",
-    topicSchema: z.literal("evt.request"),
-    resolveTopic: staticTopic("evt.request"),
-    requiresRequestId: true,
-    keySource: "request_id",
-    dataSchema: evtRequestReplyDataSchema,
-  },
-  [lilacEventTypes.EvtSurfaceOutputMessageCreated]: {
-    type: lilacEventTypes.EvtSurfaceOutputMessageCreated,
-    topic: "evt.surface",
-    topicSchema: z.literal("evt.surface"),
-    resolveTopic: staticTopic("evt.surface"),
-    requiresRequestId: true,
-    keySource: "request_id",
-    dataSchema: evtSurfaceOutputMessageCreatedDataSchema,
-  },
-  [lilacEventTypes.EvtWorkflowRunChanged]: {
-    type: lilacEventTypes.EvtWorkflowRunChanged,
-    topic: "evt.workflow",
-    topicSchema: z.literal("evt.workflow"),
-    resolveTopic: staticTopic("evt.workflow"),
-    requiresRequestId: false,
-    keySource: "runId",
-    dataSchema: evtWorkflowRunChangedDataSchema,
-  },
-  [lilacEventTypes.EvtWorkflowOperationChanged]: {
-    type: lilacEventTypes.EvtWorkflowOperationChanged,
-    topic: "evt.workflow",
-    topicSchema: z.literal("evt.workflow"),
-    resolveTopic: staticTopic("evt.workflow"),
-    requiresRequestId: false,
-    keySource: "runId",
-    dataSchema: evtWorkflowOperationChangedDataSchema,
-  },
-  [lilacEventTypes.EvtWorkflowProgressRequested]: {
-    type: lilacEventTypes.EvtWorkflowProgressRequested,
-    topic: "evt.workflow",
-    topicSchema: z.literal("evt.workflow"),
-    resolveTopic: staticTopic("evt.workflow"),
-    requiresRequestId: false,
-    keySource: "runId",
-    dataSchema: evtWorkflowProgressRequestedDataSchema,
-  },
-  [lilacEventTypes.EvtWorkflowUsageChanged]: {
-    type: lilacEventTypes.EvtWorkflowUsageChanged,
-    topic: "evt.workflow",
-    topicSchema: z.literal("evt.workflow"),
-    resolveTopic: staticTopic("evt.workflow"),
-    requiresRequestId: false,
-    keySource: "runId",
-    dataSchema: evtWorkflowUsageChangedDataSchema,
-  },
-  [lilacEventTypes.EvtWorkflowResultReady]: {
-    type: lilacEventTypes.EvtWorkflowResultReady,
-    topic: "evt.workflow",
-    topicSchema: z.literal("evt.workflow"),
-    resolveTopic: staticTopic("evt.workflow"),
-    requiresRequestId: false,
-    keySource: "runId",
-    dataSchema: evtWorkflowResultReadyDataSchema,
-  },
-  [lilacEventTypes.CmdAgentCreate]: {
-    type: lilacEventTypes.CmdAgentCreate,
-    topic: "cmd.agent",
-    topicSchema: z.literal("cmd.agent"),
-    resolveTopic: staticTopic("cmd.agent"),
-    requiresRequestId: false,
-    keySource: "agentId",
-    dataSchema: cmdAgentCreateDataSchema,
-  },
-  [lilacEventTypes.EvtAgentOutputDeltaReasoning]: {
-    type: lilacEventTypes.EvtAgentOutputDeltaReasoning,
-    topic: "out.req",
-    topicSchema: outReqTopicSchema,
-    resolveTopic: outReqTopic,
-    requiresRequestId: true,
-    keySource: "request_id",
-    dataSchema: evtAgentOutputDeltaReasoningDataSchema,
-  },
-  [lilacEventTypes.EvtAgentOutputDeltaText]: {
-    type: lilacEventTypes.EvtAgentOutputDeltaText,
-    topic: "out.req",
-    topicSchema: outReqTopicSchema,
-    resolveTopic: outReqTopic,
-    requiresRequestId: true,
-    keySource: "request_id",
-    dataSchema: evtAgentOutputDeltaTextDataSchema,
-  },
-  [lilacEventTypes.EvtAgentOutputTextReset]: {
-    type: lilacEventTypes.EvtAgentOutputTextReset,
-    topic: "out.req",
-    topicSchema: outReqTopicSchema,
-    resolveTopic: outReqTopic,
-    requiresRequestId: true,
-    keySource: "request_id",
-    dataSchema: evtAgentOutputTextResetDataSchema,
-  },
-  [lilacEventTypes.EvtAgentOutputResponseText]: {
-    type: lilacEventTypes.EvtAgentOutputResponseText,
-    topic: "out.req",
-    topicSchema: outReqTopicSchema,
-    resolveTopic: outReqTopic,
-    requiresRequestId: true,
-    keySource: "request_id",
-    dataSchema: evtAgentOutputResponseTextDataSchema,
-  },
-  [lilacEventTypes.EvtAgentOutputResponseBinary]: {
-    type: lilacEventTypes.EvtAgentOutputResponseBinary,
-    topic: "out.req",
-    topicSchema: outReqTopicSchema,
-    resolveTopic: outReqTopic,
-    requiresRequestId: true,
-    keySource: "request_id",
-    dataSchema: evtAgentOutputResponseBinaryDataSchema,
-  },
-  [lilacEventTypes.EvtAgentOutputToolCall]: {
-    type: lilacEventTypes.EvtAgentOutputToolCall,
-    topic: "out.req",
-    topicSchema: outReqTopicSchema,
-    resolveTopic: outReqTopic,
-    requiresRequestId: true,
-    keySource: "request_id",
-    dataSchema: evtAgentOutputToolCallDataSchema,
-  },
-  [lilacEventTypes.EvtAgentOutputActivity]: {
-    type: lilacEventTypes.EvtAgentOutputActivity,
-    topic: "out.req",
-    topicSchema: outReqTopicSchema,
-    resolveTopic: outReqTopic,
-    requiresRequestId: true,
-    keySource: "request_id",
-    dataSchema: evtAgentOutputActivityDataSchema,
-  },
-} satisfies LilacEventCodecRegistry;
+type AnyLilacEventCodec = LilacEventCodecRegistry[LilacEventType];
+
+const lilacEventCodecsByType = new Map<string, AnyLilacEventCodec>();
+for (const codec of Object.values(lilacEventCodecRegistry)) {
+  lilacEventCodecsByType.set(codec.type, codec);
+}
 
 const envelopeSchema = z
   .strictObject({
@@ -420,10 +144,10 @@ function decodeSchema<T>(options: {
   );
 }
 
-function decodeKnownMessage<TType extends LilacEventType>(
-  codec: LilacEventCodec<TType>,
+function decodeKnownMessage(
+  codec: AnyLilacEventCodec,
   envelope: z.output<typeof envelopeSchema>,
-): ResultType<DecodedLilacMessageOf<TType>, LilacEventDecodeError> {
+): ResultType<DecodedLilacMessage, LilacEventDecodeError> {
   const eventType = codec.type;
   const headersResult = decodeSchema({
     schema: headersSchema,
@@ -478,7 +202,7 @@ function decodeKnownMessage<TType extends LilacEventType>(
   }
 
   const topicResult = decodeSchema({
-    schema: codec.topicSchema,
+    schema: codec.topicSchema as z.ZodType<LilacTopic>,
     value: envelope.topic,
     stage: "topic",
     eventType,
@@ -486,7 +210,7 @@ function decodeKnownMessage<TType extends LilacEventType>(
   if (topicResult.status === "error") return Result.err(topicResult.error);
 
   const dataResult = decodeSchema({
-    schema: codec.dataSchema,
+    schema: codec.dataSchema as z.ZodType<LilacDataForType<LilacEventType>>,
     value: envelope.data,
     stage: "payload",
     eventType,
@@ -500,7 +224,7 @@ function decodeKnownMessage<TType extends LilacEventType>(
   });
   if (keyResult.status === "error") return Result.err(keyResult.error);
 
-  const decoded: DecodedLilacMessageOf<TType> = {
+  const decoded = {
     topic: topicResult.value,
     id: envelope.id,
     type: eventType,
@@ -509,7 +233,10 @@ function decodeKnownMessage<TType extends LilacEventType>(
     ...(envelope.headers === undefined ? {} : { headers }),
     data: dataResult.value,
   };
-  return Result.ok(decoded);
+
+  // The Map key, type, topic schema, and data schema all come from one catalog entry.
+  // TypeScript cannot retain that correlation after a runtime Map lookup.
+  return Result.ok(decoded as DecodedLilacMessage);
 }
 
 /** Decode and validate a complete Lilac message received from a raw bus boundary. */
@@ -524,67 +251,17 @@ export function decodeLilacMessage(
   if (envelopeResult.status === "error") return Result.err(envelopeResult.error);
   const envelope = envelopeResult.value;
 
-  switch (envelope.type) {
-    case lilacEventTypes.CmdRequestMessage:
-      return decodeKnownMessage(lilacEventCodecRegistry[envelope.type], envelope);
-    case lilacEventTypes.CmdSurfaceOutputReanchor:
-      return decodeKnownMessage(lilacEventCodecRegistry[envelope.type], envelope);
-    case lilacEventTypes.EvtAdapterMessageCreated:
-      return decodeKnownMessage(lilacEventCodecRegistry[envelope.type], envelope);
-    case lilacEventTypes.EvtAdapterMessageUpdated:
-      return decodeKnownMessage(lilacEventCodecRegistry[envelope.type], envelope);
-    case lilacEventTypes.EvtAdapterMessageDeleted:
-      return decodeKnownMessage(lilacEventCodecRegistry[envelope.type], envelope);
-    case lilacEventTypes.EvtAdapterReactionAdded:
-      return decodeKnownMessage(lilacEventCodecRegistry[envelope.type], envelope);
-    case lilacEventTypes.EvtAdapterReactionRemoved:
-      return decodeKnownMessage(lilacEventCodecRegistry[envelope.type], envelope);
-    case lilacEventTypes.EvtAdapterActionInvoked:
-      return decodeKnownMessage(lilacEventCodecRegistry[envelope.type], envelope);
-    case lilacEventTypes.EvtWorkflowWaitResolverBarrier:
-      return decodeKnownMessage(lilacEventCodecRegistry[envelope.type], envelope);
-    case lilacEventTypes.EvtRequestLifecycleChanged:
-      return decodeKnownMessage(lilacEventCodecRegistry[envelope.type], envelope);
-    case lilacEventTypes.EvtRequestReply:
-      return decodeKnownMessage(lilacEventCodecRegistry[envelope.type], envelope);
-    case lilacEventTypes.EvtSurfaceOutputMessageCreated:
-      return decodeKnownMessage(lilacEventCodecRegistry[envelope.type], envelope);
-    case lilacEventTypes.EvtWorkflowRunChanged:
-      return decodeKnownMessage(lilacEventCodecRegistry[envelope.type], envelope);
-    case lilacEventTypes.EvtWorkflowOperationChanged:
-      return decodeKnownMessage(lilacEventCodecRegistry[envelope.type], envelope);
-    case lilacEventTypes.EvtWorkflowProgressRequested:
-      return decodeKnownMessage(lilacEventCodecRegistry[envelope.type], envelope);
-    case lilacEventTypes.EvtWorkflowUsageChanged:
-      return decodeKnownMessage(lilacEventCodecRegistry[envelope.type], envelope);
-    case lilacEventTypes.EvtWorkflowResultReady:
-      return decodeKnownMessage(lilacEventCodecRegistry[envelope.type], envelope);
-    case lilacEventTypes.CmdAgentCreate:
-      return decodeKnownMessage(lilacEventCodecRegistry[envelope.type], envelope);
-    case lilacEventTypes.EvtAgentOutputDeltaReasoning:
-      return decodeKnownMessage(lilacEventCodecRegistry[envelope.type], envelope);
-    case lilacEventTypes.EvtAgentOutputDeltaText:
-      return decodeKnownMessage(lilacEventCodecRegistry[envelope.type], envelope);
-    case lilacEventTypes.EvtAgentOutputTextReset:
-      return decodeKnownMessage(lilacEventCodecRegistry[envelope.type], envelope);
-    case lilacEventTypes.EvtAgentOutputResponseText:
-      return decodeKnownMessage(lilacEventCodecRegistry[envelope.type], envelope);
-    case lilacEventTypes.EvtAgentOutputResponseBinary:
-      return decodeKnownMessage(lilacEventCodecRegistry[envelope.type], envelope);
-    case lilacEventTypes.EvtAgentOutputToolCall:
-      return decodeKnownMessage(lilacEventCodecRegistry[envelope.type], envelope);
-    case lilacEventTypes.EvtAgentOutputActivity:
-      return decodeKnownMessage(lilacEventCodecRegistry[envelope.type], envelope);
-    default:
-      return Result.err(
-        new LilacEventDecodeError({
-          stage: "event_type",
-          eventType: envelope.type,
-          issues: [`type: Unknown Lilac event type ${JSON.stringify(envelope.type)}`],
-          message: "Unknown Lilac event type",
-        }),
-      );
-  }
+  const codec = lilacEventCodecsByType.get(envelope.type);
+  if (codec !== undefined) return decodeKnownMessage(codec, envelope);
+
+  return Result.err(
+    new LilacEventDecodeError({
+      stage: "event_type",
+      eventType: envelope.type,
+      issues: [`type: Unknown Lilac event type ${JSON.stringify(envelope.type)}`],
+      message: "Unknown Lilac event type",
+    }),
+  );
 }
 
 /** Decode a message and prove that it belongs to the requested topic contract. */

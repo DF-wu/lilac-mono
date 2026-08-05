@@ -44,8 +44,9 @@ set from the registrations and rejects missing, stale, wildcard, or extra zones.
 - exception adapters and defect supervisors.
 
 Registrations name exact modules and symbols. Specialized Result-bearing registrations must also appear
-in `operationalResultApis`. Event family declarations partition every canonical event exactly once, and
-event codec coverage must be complete.
+in `operationalResultApis`. Event codec registrations point to one strict `defineLilacEvents` catalog;
+the analyzer derives canonical and family membership and verifies that the codec registry is projected
+from that exact catalog.
 
 `APPROVED_EXCEPTION_ADAPTER_CATALOG` is derived from the exact exception-adapter registrations. Manifest
 integrity validates callable identity, direction, syntax kinds, provenance, external/host relationship,

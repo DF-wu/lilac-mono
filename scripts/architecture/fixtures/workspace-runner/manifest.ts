@@ -25,7 +25,6 @@ const EMPTY_POLICY = {
   rawEventMessageBoundaries: [],
   eventDeliveryApis: [],
   eventDeliveryConsumers: [],
-  eventFamilies: [],
 } as const;
 
 const workspaces = [

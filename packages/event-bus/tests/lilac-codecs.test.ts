@@ -5,6 +5,7 @@ import SuperJSON from "superjson";
 import {
   createLilacBus,
   decodeLilacMessage,
+  LILAC_EVENTS,
   lilacEventCodecRegistry,
   lilacEventTypes,
   type DecodedMessage,
@@ -45,7 +46,7 @@ const requestHeaders = {
 };
 
 type EventFamily =
-  | "command/request"
+  | "command-request"
   | "workflow-control"
   | "lifecycle"
   | "adapter"
@@ -117,8 +118,8 @@ const opaqueAgentContext = { callbackUrl: opaqueWireUrl, createdAt: opaqueWireDa
 
 const compatibilityFixtures = [
   compatibilityFixture({
-    family: "command/request",
-    type: lilacEventTypes.CmdRequestMessage,
+    family: "command-request",
+    type: "cmd.request.message",
     topic: "cmd.request",
     key: "request-1",
     headers: requestHeaders,
@@ -131,8 +132,8 @@ const compatibilityFixtures = [
     },
   }),
   compatibilityFixture({
-    family: "command/request",
-    type: lilacEventTypes.CmdSurfaceOutputReanchor,
+    family: "command-request",
+    type: "cmd.surface.output.reanchor",
     topic: "cmd.surface",
     key: "request-1",
     headers: requestHeaders,
@@ -144,7 +145,7 @@ const compatibilityFixtures = [
   }),
   compatibilityFixture({
     family: "adapter",
-    type: lilacEventTypes.EvtAdapterMessageCreated,
+    type: "evt.adapter.message.created",
     topic: "evt.adapter",
     key: "message-1",
     data: {
@@ -161,7 +162,7 @@ const compatibilityFixtures = [
   }),
   compatibilityFixture({
     family: "adapter",
-    type: lilacEventTypes.EvtAdapterMessageUpdated,
+    type: "evt.adapter.message.updated",
     topic: "evt.adapter",
     key: "message-2",
     data: {
@@ -175,7 +176,7 @@ const compatibilityFixtures = [
   }),
   compatibilityFixture({
     family: "adapter",
-    type: lilacEventTypes.EvtAdapterMessageDeleted,
+    type: "evt.adapter.message.deleted",
     topic: "evt.adapter",
     key: "message-3",
     data: {
@@ -187,7 +188,7 @@ const compatibilityFixtures = [
   }),
   compatibilityFixture({
     family: "adapter",
-    type: lilacEventTypes.EvtAdapterReactionAdded,
+    type: "evt.adapter.reaction.added",
     topic: "evt.adapter",
     key: "message-4",
     data: {
@@ -201,7 +202,7 @@ const compatibilityFixtures = [
   }),
   compatibilityFixture({
     family: "adapter",
-    type: lilacEventTypes.EvtAdapterReactionRemoved,
+    type: "evt.adapter.reaction.removed",
     topic: "evt.adapter",
     key: "message-5",
     data: {
@@ -214,7 +215,7 @@ const compatibilityFixtures = [
   }),
   compatibilityFixture({
     family: "adapter",
-    type: lilacEventTypes.EvtAdapterActionInvoked,
+    type: "evt.adapter.action.invoked",
     topic: "evt.adapter",
     key: "action-1",
     data: {
@@ -228,14 +229,14 @@ const compatibilityFixtures = [
   }),
   compatibilityFixture({
     family: "workflow-control",
-    type: lilacEventTypes.EvtWorkflowWaitResolverBarrier,
+    type: "evt.adapter.workflow-wait-resolver.barrier",
     topic: "evt.adapter",
     key: "barrier-1",
     data: { barrierId: "barrier-1", ts: 16 },
   }),
   compatibilityFixture({
     family: "lifecycle",
-    type: lilacEventTypes.EvtRequestLifecycleChanged,
+    type: "evt.request.lifecycle.changed",
     topic: "evt.request",
     key: "request-1",
     headers: requestHeaders,
@@ -243,7 +244,7 @@ const compatibilityFixtures = [
   }),
   compatibilityFixture({
     family: "lifecycle",
-    type: lilacEventTypes.EvtRequestReply,
+    type: "evt.request.reply",
     topic: "evt.request",
     key: "request-1",
     headers: { request_id: "request-1" },
@@ -251,7 +252,7 @@ const compatibilityFixtures = [
   }),
   compatibilityFixture({
     family: "surface",
-    type: lilacEventTypes.EvtSurfaceOutputMessageCreated,
+    type: "evt.surface.output.message.created",
     topic: "evt.surface",
     key: "request-1",
     headers: requestHeaders,
@@ -261,7 +262,7 @@ const compatibilityFixtures = [
   }),
   compatibilityFixture({
     family: "workflow-control",
-    type: lilacEventTypes.EvtWorkflowRunChanged,
+    type: "evt.workflow.run.changed",
     topic: "evt.workflow",
     key: "run-1",
     headers: { workflow_outbox_id: "outbox-1" },
@@ -276,7 +277,7 @@ const compatibilityFixtures = [
   }),
   compatibilityFixture({
     family: "workflow-control",
-    type: lilacEventTypes.EvtWorkflowOperationChanged,
+    type: "evt.workflow.operation.changed",
     topic: "evt.workflow",
     key: "run-1",
     data: {
@@ -292,7 +293,7 @@ const compatibilityFixtures = [
   }),
   compatibilityFixture({
     family: "workflow-control",
-    type: lilacEventTypes.EvtWorkflowProgressRequested,
+    type: "evt.workflow.progress.requested",
     topic: "evt.workflow",
     key: "run-1",
     data: {
@@ -304,7 +305,7 @@ const compatibilityFixtures = [
   }),
   compatibilityFixture({
     family: "workflow-control",
-    type: lilacEventTypes.EvtWorkflowUsageChanged,
+    type: "evt.workflow.usage.changed",
     topic: "evt.workflow",
     key: "run-1",
     data: {
@@ -323,7 +324,7 @@ const compatibilityFixtures = [
   }),
   compatibilityFixture({
     family: "workflow-control",
-    type: lilacEventTypes.EvtWorkflowResultReady,
+    type: "evt.workflow.result.ready",
     topic: "evt.workflow",
     key: "run-1",
     data: {
@@ -336,15 +337,15 @@ const compatibilityFixtures = [
     },
   }),
   compatibilityFixture({
-    family: "command/request",
-    type: lilacEventTypes.CmdAgentCreate,
+    family: "command-request",
+    type: "cmd.agent.create",
     topic: "cmd.agent",
     key: "agent-1",
     data: { agentId: "agent-1", context: opaqueAgentContext },
   }),
   compatibilityFixture({
     family: "agent-output",
-    type: lilacEventTypes.EvtAgentOutputDeltaReasoning,
+    type: "evt.agent.output.delta.reasoning",
     topic: "out.req.request-1",
     overrideTopic: "out.req.override-request-1",
     key: "request-1",
@@ -353,7 +354,7 @@ const compatibilityFixtures = [
   }),
   compatibilityFixture({
     family: "agent-output",
-    type: lilacEventTypes.EvtAgentOutputDeltaText,
+    type: "evt.agent.output.delta.text",
     topic: "out.req.request-1",
     overrideTopic: "out.req.override-request-1",
     key: "request-1",
@@ -362,7 +363,7 @@ const compatibilityFixtures = [
   }),
   compatibilityFixture({
     family: "agent-output",
-    type: lilacEventTypes.EvtAgentOutputTextReset,
+    type: "evt.agent.output.text.reset",
     topic: "out.req.request-1",
     overrideTopic: "out.req.override-request-1",
     key: "request-1",
@@ -371,7 +372,7 @@ const compatibilityFixtures = [
   }),
   compatibilityFixture({
     family: "agent-output",
-    type: lilacEventTypes.EvtAgentOutputResponseText,
+    type: "evt.agent.output.response.text",
     topic: "out.req.request-1",
     overrideTopic: "out.req.override-request-1",
     key: "request-1",
@@ -385,7 +386,7 @@ const compatibilityFixtures = [
   }),
   compatibilityFixture({
     family: "agent-output",
-    type: lilacEventTypes.EvtAgentOutputResponseBinary,
+    type: "evt.agent.output.response.binary",
     topic: "out.req.request-1",
     overrideTopic: "out.req.override-request-1",
     key: "request-1",
@@ -394,7 +395,7 @@ const compatibilityFixtures = [
   }),
   compatibilityFixture({
     family: "agent-output",
-    type: lilacEventTypes.EvtAgentOutputToolCall,
+    type: "evt.agent.output.toolcall",
     topic: "out.req.request-1",
     overrideTopic: "out.req.override-request-1",
     key: "request-1",
@@ -403,7 +404,7 @@ const compatibilityFixtures = [
   }),
   compatibilityFixture({
     family: "agent-output",
-    type: lilacEventTypes.EvtAgentOutputActivity,
+    type: "evt.agent.output.activity",
     topic: "out.req.request-1",
     overrideTopic: "out.req.override-request-1",
     key: "request-1",
@@ -411,6 +412,12 @@ const compatibilityFixtures = [
     data: { source: "subagent" },
   }),
 ] satisfies readonly CompatibilityFixture[];
+
+function compatibilityFixtureFor(type: LilacEventType): CompatibilityFixture {
+  const fixture = compatibilityFixtures.find((candidate) => candidate.type === type);
+  if (fixture === undefined) throw new Error(`Missing compatibility fixture for ${type}`);
+  return fixture;
+}
 
 class CapturingRawBus implements RawBus {
   readonly messages: PublishMessage<unknown>[] = [];
@@ -462,7 +469,7 @@ describe("canonical Lilac event codecs", () => {
     );
     expect(compatibilityFixtures.map(({ family }) => family)).toEqual(
       expect.arrayContaining<EventFamily>([
-        "command/request",
+        "command-request",
         "workflow-control",
         "lifecycle",
         "adapter",
@@ -470,7 +477,7 @@ describe("canonical Lilac event codecs", () => {
         "agent-output",
       ]),
     );
-    expect(compatibilityFixtures.filter(({ family }) => family === "command/request")).toHaveLength(
+    expect(compatibilityFixtures.filter(({ family }) => family === "command-request")).toHaveLength(
       3,
     );
     expect(
@@ -480,8 +487,20 @@ describe("canonical Lilac event codecs", () => {
     expect(compatibilityFixtures.filter(({ family }) => family === "adapter")).toHaveLength(6);
     expect(compatibilityFixtures.filter(({ family }) => family === "surface")).toHaveLength(1);
     expect(compatibilityFixtures.filter(({ family }) => family === "agent-output")).toHaveLength(7);
+    expect(new Set(Object.values(LILAC_EVENTS).map(({ family }) => family))).toEqual(
+      new Set<EventFamily>([
+        "command-request",
+        "workflow-control",
+        "lifecycle",
+        "adapter",
+        "surface",
+        "agent-output",
+      ]),
+    );
 
     for (const fixture of compatibilityFixtures) {
+      const definition = Object.values(LILAC_EVENTS).find(({ type }) => type === fixture.type);
+      expect(definition?.family, fixture.type).toBe(fixture.family);
       const result = decodeLilacMessage(fixture.message);
       expect(result.status, fixture.type).toBe("ok");
       if (result.status === "ok") expect<unknown>(result.value).toEqual(fixture.message);
@@ -547,19 +566,22 @@ describe("canonical Lilac event codecs", () => {
   });
 
   it("rejects malformed envelopes and unknown event types", () => {
+    for (const type of ["evt.future.created", "constructor", "toString", "__proto__"]) {
+      expectDecodeError(
+        envelope({ type, topic: "evt.future", key: "future-1", data: {} }),
+        "event_type",
+      );
+    }
+    const requestFixture = compatibilityFixtureFor(lilacEventTypes.CmdRequestMessage);
     expectDecodeError(
-      envelope({ type: "evt.future.created", topic: "evt.future", key: "future-1", data: {} }),
-      "event_type",
-    );
-    expectDecodeError(
-      { ...compatibilityFixtures[0]!.message, id: "", ts: Number.POSITIVE_INFINITY },
+      { ...requestFixture.message, id: "", ts: Number.POSITIVE_INFINITY },
       "envelope",
     );
-    const missingData = { ...compatibilityFixtures[0]!.message };
+    const missingData = { ...requestFixture.message };
     Reflect.deleteProperty(missingData, "data");
     expectDecodeError(missingData, "envelope");
 
-    const hostileEnvelope = new Proxy(compatibilityFixtures[0]!.message, {
+    const hostileEnvelope = new Proxy(requestFixture.message, {
       get(target, property, receiver) {
         if (property === "topic") throw new Error("hostile envelope getter");
         return Reflect.get(target, property, receiver);
@@ -569,23 +591,26 @@ describe("canonical Lilac event codecs", () => {
   });
 
   it("rejects non-string extension headers and invalid canonical headers", () => {
-    const nonStringExtension = { ...compatibilityFixtures[0]!.message };
+    const requestFixture = compatibilityFixtureFor(lilacEventTypes.CmdRequestMessage);
+    const nonStringExtension = { ...requestFixture.message };
     Reflect.set(nonStringExtension, "headers", { request_id: "request-1", attempt: 2 });
     expectDecodeError(nonStringExtension, "headers");
 
-    const invalidClient = { ...compatibilityFixtures[0]!.message };
+    const invalidClient = { ...requestFixture.message };
     Reflect.set(invalidClient, "headers", {
       request_id: "request-1",
       request_client: "carrier-pigeon",
     });
     expectDecodeError(invalidClient, "headers");
 
-    const missingRequestId = { ...compatibilityFixtures[0]!.message };
+    const missingRequestId = { ...requestFixture.message };
     Reflect.set(missingRequestId, "headers", { session_id: "session-1" });
     expectDecodeError(missingRequestId, "headers");
 
-    for (const index of [0, 1, 9, 10, 11, 18, 19, 20, 21, 22, 23, 24]) {
-      const requestScopedMessage = { ...compatibilityFixtures[index]!.message };
+    for (const fixture of compatibilityFixtures.filter(
+      ({ type }) => lilacEventCodecRegistry[type].requiresRequestId,
+    )) {
+      const requestScopedMessage = { ...fixture.message };
       Reflect.set(requestScopedMessage, "headers", {});
       expectDecodeError(requestScopedMessage, "headers");
     }
@@ -596,7 +621,9 @@ describe("canonical Lilac event codecs", () => {
       expectDecodeError({ ...fixture.message, data: fixture.malformedData }, "payload");
     }
 
-    const malformed = { ...compatibilityFixtures[12]!.message };
+    const malformed = {
+      ...compatibilityFixtureFor(lilacEventTypes.EvtWorkflowRunChanged).message,
+    };
     Reflect.set(malformed, "data", {
       runId: "run-1",
       revisionId: "revision-1",
@@ -614,7 +641,10 @@ describe("canonical Lilac event codecs", () => {
     expectDecodeError(missingContext, "payload");
 
     expectDecodeError(
-      { ...compatibilityFixtures[10]!.message, data: { unexpected: true } },
+      {
+        ...compatibilityFixtureFor(lilacEventTypes.EvtRequestReply).message,
+        data: { unexpected: true },
+      },
       "payload",
     );
 
@@ -626,27 +656,40 @@ describe("canonical Lilac event codecs", () => {
         },
       },
     );
-    expectDecodeError({ ...compatibilityFixtures[0]!.message, data: hostilePayload }, "payload");
+    expectDecodeError(
+      {
+        ...compatibilityFixtureFor(lilacEventTypes.CmdRequestMessage).message,
+        data: hostilePayload,
+      },
+      "payload",
+    );
   });
 
   it("enforces static and request-output topic coherence", () => {
-    expectDecodeError({ ...compatibilityFixtures[12]!.message, topic: "evt.request" }, "topic");
-    expectDecodeError({ ...compatibilityFixtures[19]!.message, topic: "evt.request" }, "topic");
-    expectDecodeError({ ...compatibilityFixtures[19]!.message, topic: "out.req." }, "topic");
+    const workflowFixture = compatibilityFixtureFor(lilacEventTypes.EvtWorkflowRunChanged);
+    const outputFixture = compatibilityFixtureFor(lilacEventTypes.EvtAgentOutputDeltaText);
+    expectDecodeError({ ...workflowFixture.message, topic: "evt.request" }, "topic");
+    expectDecodeError({ ...outputFixture.message, topic: "evt.request" }, "topic");
+    expectDecodeError({ ...outputFixture.message, topic: "out.req." }, "topic");
   });
 
   it("accepts override keys and requires a non-empty string key", () => {
     const overridden = decodeLilacMessage({
-      ...compatibilityFixtures[0]!.message,
+      ...compatibilityFixtureFor(lilacEventTypes.CmdRequestMessage).message,
       key: "request-2",
     });
     expect(overridden.status).toBe("ok");
 
-    expectDecodeError({ ...compatibilityFixtures[2]!.message, key: "" }, "key");
-    const nonStringKey = { ...compatibilityFixtures[7]!.message };
+    expectDecodeError(
+      { ...compatibilityFixtureFor(lilacEventTypes.EvtAdapterMessageCreated).message, key: "" },
+      "key",
+    );
+    const nonStringKey = {
+      ...compatibilityFixtureFor(lilacEventTypes.EvtAdapterActionInvoked).message,
+    };
     Reflect.set(nonStringKey, "key", 2);
     expectDecodeError(nonStringKey, "key");
-    const missingKey = { ...compatibilityFixtures[17]!.message };
+    const missingKey = { ...compatibilityFixtureFor(lilacEventTypes.CmdAgentCreate).message };
     delete missingKey.key;
     expectDecodeError(missingKey, "key");
   });

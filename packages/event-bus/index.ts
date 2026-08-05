@@ -7,6 +7,7 @@ export * from "./event-dead-letter";
 export * from "./event-delivery";
 
 export * from "./core-primary-lineage";
+export * from "./define-lilac-events";
 export * from "./lilac-spec";
 export * from "./lilac-codecs";
 export * from "./lilac-bus";

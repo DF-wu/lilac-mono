@@ -1,23 +1,104 @@
 import type { Result } from "better-result";
 
-export const canonicalFixtureEvents = {
-  Alpha: "fixture.alpha",
-  Beta: "fixture.beta",
-  Gamma: "fixture.gamma",
-} as const;
+import * as sameNameImpostors from "./stage4-event-helper-impostors";
 
 declare const codec: { readonly decode: (value: unknown) => unknown };
 
-export const completeFixtureEventCodecs = {
-  [canonicalFixtureEvents.Alpha]: codec,
-  [canonicalFixtureEvents.Beta]: codec,
-  [canonicalFixtureEvents.Gamma]: codec,
-} as const;
+function defineLilacEvents<const TEvents>(events: TEvents): TEvents {
+  return events;
+}
 
-export const incompleteFixtureEventCodecs = {
-  [canonicalFixtureEvents.Alpha]: codec,
-  [canonicalFixtureEvents.Beta]: codec,
-} as const;
+function createLilacEventCodecRegistry<const TEvents>(events: TEvents): TEvents {
+  return events;
+}
+
+function wrongEventCatalogHelper<const TEvents>(events: TEvents): TEvents {
+  return events;
+}
+
+const wrongEventHelpers = {
+  defineLilacEvents: wrongEventCatalogHelper,
+  createLilacEventCodecRegistry: wrongEventCatalogHelper,
+};
+
+export const validFixtureEvents = defineLilacEvents({
+  Alpha: { type: "fixture.alpha", family: "alpha", codec },
+  Beta: { type: "fixture.beta", family: "remaining", codec },
+  Gamma: { type: "fixture.gamma", family: "remaining", codec },
+});
+export const validFixtureEventCodecs = createLilacEventCodecRegistry(validFixtureEvents);
+
+export const missingMetadataFixtureEvents = defineLilacEvents({
+  Alpha: { type: "fixture.alpha", codec },
+});
+export const missingMetadataFixtureEventCodecs = createLilacEventCodecRegistry(
+  missingMetadataFixtureEvents,
+);
+
+export const duplicateWireTypeFixtureEvents = defineLilacEvents({
+  Alpha: { type: "fixture.duplicate", family: "alpha", codec },
+  Beta: { type: "fixture.duplicate", family: "beta", codec },
+});
+export const duplicateWireTypeFixtureEventCodecs = createLilacEventCodecRegistry(
+  duplicateWireTypeFixtureEvents,
+);
+
+const spreadFixtureEntry = {
+  Alpha: { type: "fixture.alpha", family: "alpha", codec },
+};
+export const spreadFixtureEvents = defineLilacEvents({
+  ...spreadFixtureEntry,
+});
+export const spreadFixtureEventCodecs = createLilacEventCodecRegistry(spreadFixtureEvents);
+
+const computedFixtureName = "Alpha";
+export const computedFixtureEvents = defineLilacEvents({
+  [computedFixtureName]: { type: "fixture.alpha", family: "alpha", codec },
+});
+export const computedFixtureEventCodecs = createLilacEventCodecRegistry(computedFixtureEvents);
+
+export const reservedNameFixtureEvents = defineLilacEvents({
+  __proto__: { type: "fixture.reserved", family: "fixture", codec },
+});
+export const reservedNameFixtureEventCodecs =
+  createLilacEventCodecRegistry(reservedNameFixtureEvents);
+
+const nonliteralFixtureInput = {
+  Alpha: { type: "fixture.alpha", family: "alpha", codec },
+};
+export const nonliteralFixtureEvents = defineLilacEvents(nonliteralFixtureInput);
+export const nonliteralFixtureEventCodecs = createLilacEventCodecRegistry(nonliteralFixtureEvents);
+
+const nonliteralWireType: string = "fixture.alpha";
+const nonliteralFamily: string = "alpha";
+export const nonliteralMetadataFixtureEvents = defineLilacEvents({
+  Alpha: { type: nonliteralWireType, family: nonliteralFamily, codec },
+});
+export const nonliteralMetadataFixtureEventCodecs = createLilacEventCodecRegistry(
+  nonliteralMetadataFixtureEvents,
+);
+
+export const wrongHelperFixtureEvents = wrongEventHelpers.defineLilacEvents({
+  Alpha: { type: "fixture.alpha", family: "alpha", codec },
+});
+export const wrongHelperFixtureEventCodecs =
+  createLilacEventCodecRegistry(wrongHelperFixtureEvents);
+
+export const sameNameImpostorFixtureEvents = sameNameImpostors.defineLilacEvents({
+  Alpha: { type: "fixture.alpha", family: "alpha", codec },
+});
+export const sameNameImpostorFixtureEventCodecs = createLilacEventCodecRegistry(
+  sameNameImpostorFixtureEvents,
+);
+
+export const alternateFixtureEvents = defineLilacEvents({
+  Alternate: { type: "fixture.alternate", family: "alternate", codec },
+});
+export const mismatchedFixtureEventCodecs = createLilacEventCodecRegistry(alternateFixtureEvents);
+export const wrongProjectionHelperFixtureEventCodecs =
+  wrongEventHelpers.createLilacEventCodecRegistry(validFixtureEvents);
+export const sameNameImpostorProjectionFixtureEventCodecs =
+  sameNameImpostors.createLilacEventCodecRegistry(validFixtureEvents);
 
 export type Message<TData = unknown> = {
   readonly type: string;

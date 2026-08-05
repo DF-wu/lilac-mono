@@ -134,9 +134,9 @@ export interface RuleZone {
 
 export interface EventCodecRegistryRegistration {
   readonly identity: SymbolIdentity;
-  readonly canonicalEvents: SymbolIdentity;
-  readonly canonicalMembers: readonly string[];
-  readonly codecMembers: readonly string[];
+  readonly catalog: SymbolIdentity;
+  readonly catalogHelper: SymbolIdentity;
+  readonly registryHelper: SymbolIdentity;
 }
 
 export interface ToolCodecRegistryRegistration {
@@ -220,12 +220,6 @@ export interface EventDeliveryConsumerRegistration {
   readonly operations: readonly EventDeliveryOperation[];
 }
 
-export interface EventFamilyRegistration {
-  readonly family: string;
-  readonly codecRegistry: SymbolIdentity;
-  readonly members: readonly string[];
-}
-
 export interface WorkspaceArchitecture {
   readonly name: string;
   readonly packageName: string;
@@ -253,7 +247,6 @@ export interface WorkspaceArchitecture {
   readonly rawEventMessageBoundaries: readonly RawEventMessageBoundaryRegistration[];
   readonly eventDeliveryApis: readonly EventDeliveryApiRegistration[];
   readonly eventDeliveryConsumers: readonly EventDeliveryConsumerRegistration[];
-  readonly eventFamilies: readonly EventFamilyRegistration[];
 }
 
 type WorkspaceArchitectureWithoutExceptionAdapters = Omit<
@@ -341,7 +334,6 @@ const EMPTY_POLICY = {
   rawEventMessageBoundaries: [],
   eventDeliveryApis: [],
   eventDeliveryConsumers: [],
-  eventFamilies: [],
 } as const;
 
 export const ACTIVE_WORKSPACES = [
@@ -5744,39 +5736,14 @@ export const LEGACY_UNENFORCED_EXCEPTION_ADAPTERS = new Map<string, readonly Exc
   ],
 ]);
 
-const CANONICAL_LILAC_EVENT_MEMBERS = [
-  "cmd.request.message",
-  "cmd.surface.output.reanchor",
-  "evt.adapter.message.created",
-  "evt.adapter.message.updated",
-  "evt.adapter.message.deleted",
-  "evt.adapter.reaction.added",
-  "evt.adapter.reaction.removed",
-  "evt.adapter.action.invoked",
-  "evt.adapter.workflow-wait-resolver.barrier",
-  "evt.request.lifecycle.changed",
-  "evt.request.reply",
-  "evt.surface.output.message.created",
-  "evt.workflow.run.changed",
-  "evt.workflow.operation.changed",
-  "evt.workflow.progress.requested",
-  "evt.workflow.usage.changed",
-  "evt.workflow.result.ready",
-  "cmd.agent.create",
-  "evt.agent.output.delta.reasoning",
-  "evt.agent.output.delta.text",
-  "evt.agent.output.text.reset",
-  "evt.agent.output.response.text",
-  "evt.agent.output.response.binary",
-  "evt.agent.output.toolcall",
-  "evt.agent.output.activity",
-] as const;
-
 const EVENT_BUS_CODEC_REGISTRY: EventCodecRegistryRegistration = {
   identity: { module: "lilac-codecs.ts", exportName: "lilacEventCodecRegistry" },
-  canonicalEvents: { module: "lilac-spec.ts", exportName: "lilacEventTypes" },
-  canonicalMembers: CANONICAL_LILAC_EVENT_MEMBERS,
-  codecMembers: CANONICAL_LILAC_EVENT_MEMBERS,
+  catalog: { module: "lilac-spec.ts", exportName: "LILAC_EVENTS" },
+  catalogHelper: { module: "define-lilac-events.ts", exportName: "defineLilacEvents" },
+  registryHelper: {
+    module: "define-lilac-events.ts",
+    exportName: "createLilacEventCodecRegistry",
+  },
 };
 
 const TUI_TOOL_CODEC_REGISTRY: ToolCodecRegistryRegistration = {
@@ -6616,61 +6583,6 @@ const MINI_SQLITE_TRANSACTION_CONSUMERS = [
   },
 ] as const satisfies readonly SqliteTransactionConsumerRegistration[];
 
-const EVENT_BUS_FAMILIES = [
-  {
-    family: "command-request",
-    members: ["cmd.request.message", "cmd.surface.output.reanchor", "cmd.agent.create"],
-  },
-  {
-    family: "workflow-control",
-    members: [
-      "evt.adapter.workflow-wait-resolver.barrier",
-      "evt.workflow.run.changed",
-      "evt.workflow.operation.changed",
-      "evt.workflow.progress.requested",
-      "evt.workflow.usage.changed",
-      "evt.workflow.result.ready",
-    ],
-  },
-  {
-    family: "lifecycle",
-    members: ["evt.request.lifecycle.changed", "evt.request.reply"],
-  },
-  {
-    family: "adapter",
-    members: [
-      "evt.adapter.message.created",
-      "evt.adapter.message.updated",
-      "evt.adapter.message.deleted",
-      "evt.adapter.reaction.added",
-      "evt.adapter.reaction.removed",
-      "evt.adapter.action.invoked",
-    ],
-  },
-  {
-    family: "surface",
-    members: ["evt.surface.output.message.created"],
-  },
-  {
-    family: "agent-output",
-    members: [
-      "evt.agent.output.delta.reasoning",
-      "evt.agent.output.delta.text",
-      "evt.agent.output.text.reset",
-      "evt.agent.output.response.text",
-      "evt.agent.output.response.binary",
-      "evt.agent.output.toolcall",
-      "evt.agent.output.activity",
-    ],
-  },
-].map(
-  ({ family, members }): EventFamilyRegistration => ({
-    family,
-    codecRegistry: EVENT_BUS_CODEC_REGISTRY.identity,
-    members,
-  }),
-);
-
 const CORE_EVENT_DELIVERY_CONSUMERS = [
   {
     identity: {
@@ -7037,7 +6949,6 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
           ]
         : [],
     eventDeliveryConsumers: root === "apps/core" ? CORE_EVENT_DELIVERY_CONSUMERS : [],
-    eventFamilies: root === "packages/event-bus" ? EVENT_BUS_FAMILIES : [],
     boundaryDecoders: [
       ...(root === "packages/plugin-runtime"
         ? ([
@@ -9190,10 +9101,12 @@ export function assertArchitectureManifestIntegrity(manifest: ArchitectureManife
     for (const api of workspace.operationalResultApis) {
       requireExactIdentity(api, "operational Result API");
     }
-    const codecRegistries = new Map<string, EventCodecRegistryRegistration>();
+    const codecRegistries = new Set<string>();
     for (const registry of workspace.eventCodecRegistries) {
       requireExactIdentity(registry.identity, "event codec registry");
-      requireExactIdentity(registry.canonicalEvents, "canonical event catalog");
+      requireExactIdentity(registry.catalog, "canonical event catalog");
+      requireExactIdentity(registry.catalogHelper, "event catalog helper");
+      requireExactIdentity(registry.registryHelper, "event codec registry helper");
       const key = identityKey(registry.identity);
       if (unknownFreeModules.has(registry.identity.module)) {
         throw new Error(
@@ -9205,30 +9118,7 @@ export function assertArchitectureManifestIntegrity(manifest: ArchitectureManife
           `Duplicate event codec registry registration in ${workspace.name}: ${key}.`,
         );
       }
-      codecRegistries.set(key, registry);
-      const canonical = requireUniqueValues(
-        registry.canonicalMembers,
-        `event codec registry ${key} canonicalMembers`,
-      );
-      if (canonical.size === 0) {
-        throw new Error(`Architecture manifest event codec registry ${key} must declare members.`);
-      }
-      const codecs = requireUniqueValues(
-        registry.codecMembers,
-        `event codec registry ${key} codecMembers`,
-      );
-      for (const member of codecs) {
-        if (!canonical.has(member)) {
-          throw new Error(
-            `Architecture manifest event codec registry ${key} covers noncanonical member '${member}'.`,
-          );
-        }
-      }
-      if (codecs.size !== canonical.size) {
-        throw new Error(
-          `Event codec registry ${key} must declare codec coverage for every canonical member.`,
-        );
-      }
+      codecRegistries.add(key);
     }
     const toolCodecRegistries = new Set<string>();
     for (const registry of workspace.toolCodecRegistries) {
@@ -9334,58 +9224,6 @@ export function assertArchitectureManifestIntegrity(manifest: ArchitectureManife
       if (operations.size === 0) {
         throw new Error(
           `Architecture manifest event delivery consumer ${key} must declare operations.`,
-        );
-      }
-    }
-    const familyNames = new Set<string>();
-    const claimedMembers = new Map<string, string>();
-    for (const family of workspace.eventFamilies) {
-      requireNonempty(family.family, "event family name");
-      if (familyNames.has(family.family)) {
-        throw new Error(
-          `Duplicate event family registration in ${workspace.name}: ${family.family}.`,
-        );
-      }
-      familyNames.add(family.family);
-      const registryKey = identityKey(family.codecRegistry);
-      requireExactIdentity(family.codecRegistry, "event family codec registry");
-      const registry = codecRegistries.get(registryKey);
-      if (!registry) {
-        throw new Error(
-          `Event family ${family.family} in ${workspace.name} references unregistered codec registry ${registryKey}.`,
-        );
-      }
-      const members = requireUniqueValues(family.members, `event family ${family.family} members`);
-      if (members.size === 0) {
-        throw new Error(
-          `Architecture manifest event family ${family.family} must declare members.`,
-        );
-      }
-      for (const member of members) {
-        const previous = claimedMembers.get(`${registryKey}\0${member}`);
-        if (previous) {
-          throw new Error(
-            `Event family members must not overlap in ${workspace.name}: '${member}' is claimed by ${previous} and ${family.family}.`,
-          );
-        }
-        claimedMembers.set(`${registryKey}\0${member}`, family.family);
-        if (!registry.canonicalMembers.includes(member)) {
-          throw new Error(
-            `Event family ${family.family} in ${workspace.name} contains noncanonical member '${member}'.`,
-          );
-        }
-        if (!registry.codecMembers.includes(member)) {
-          throw new Error(`Event family ${family.family} lacks codec coverage for '${member}'.`);
-        }
-      }
-    }
-    for (const [registryKey, registry] of codecRegistries) {
-      const unclaimed = registry.canonicalMembers.filter(
-        (member) => !claimedMembers.has(`${registryKey}\0${member}`),
-      );
-      if (unclaimed.length > 0) {
-        throw new Error(
-          `Event family declarations for ${registryKey} are not exhaustive; missing ${unclaimed.join(", ")}.`,
         );
       }
     }
