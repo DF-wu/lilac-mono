@@ -16,6 +16,7 @@
     "test": "bun test"
   },
   "dependencies": {
+    "better-result": "catalog:",
     "just-bash": "^3.0.1"
   },
   "devDependencies": {

@@ -1,3 +1,5 @@
+import { z } from "zod";
+
 export type DiscordEmbedTextMode = "inbound" | "surface";
 
 export type DiscordEmbedTextField = {
@@ -13,73 +15,79 @@ export type DiscordEmbedTextMeta = {
   footer?: string;
 };
 
-function asNonEmptyString(value: unknown): string | undefined {
-  if (typeof value !== "string") return undefined;
-  return value.trim().length > 0 ? value : undefined;
-}
+const optionalNonEmptyStringSchema = z
+  .union([z.string(), z.undefined(), z.unknown().transform(() => undefined)])
+  .transform((value) => (value?.trim().length ? value : undefined));
 
-function normalizeDiscordEmbedFields(input: unknown): DiscordEmbedTextField[] {
-  if (!Array.isArray(input)) return [];
+const discordEmbedFieldSchema = z
+  .object({
+    name: optionalNonEmptyStringSchema,
+    value: optionalNonEmptyStringSchema,
+  })
+  .passthrough()
+  .transform((field): DiscordEmbedTextField | null => {
+    if (!field.name && !field.value) return null;
+    return {
+      ...(field.name ? { name: field.name } : {}),
+      ...(field.value ? { value: field.value } : {}),
+    };
+  });
 
-  const out: DiscordEmbedTextField[] = [];
+const discordEmbedImageSchema = z.object({ url: optionalNonEmptyStringSchema }).passthrough();
+const discordEmbedFooterSchema = z.object({ text: optionalNonEmptyStringSchema }).passthrough();
 
-  for (const item of input) {
-    if (!item || typeof item !== "object") continue;
-    const o = item as Record<string, unknown>;
-    const name = asNonEmptyString(o.name);
-    const value = asNonEmptyString(o.value);
-    if (!name && !value) continue;
-    out.push({ ...(name ? { name } : {}), ...(value ? { value } : {}) });
-  }
+const discordEmbedSchema = z
+  .object({
+    title: optionalNonEmptyStringSchema,
+    description: optionalNonEmptyStringSchema,
+    fields: z.union([
+      z.array(z.union([discordEmbedFieldSchema, z.unknown().transform(() => null)])),
+      z.unknown().transform(() => [] as null[]),
+    ]),
+    image: z.union([discordEmbedImageSchema, z.unknown().transform(() => ({ url: undefined }))]),
+    footer: z.union([discordEmbedFooterSchema, z.unknown().transform(() => ({ text: undefined }))]),
+  })
+  .passthrough()
+  .transform((embed): DiscordEmbedTextMeta | null => {
+    const fields: DiscordEmbedTextField[] = [];
+    for (const field of embed.fields) {
+      if (field !== null) fields.push(field);
+    }
+    const imageUrl = embed.image.url;
+    const footer = embed.footer.text;
+    if (!embed.title && !embed.description && fields.length === 0 && !imageUrl && !footer) {
+      return null;
+    }
+    return {
+      ...(embed.title ? { title: embed.title } : {}),
+      ...(embed.description ? { description: embed.description } : {}),
+      ...(fields.length > 0 ? { fields } : {}),
+      ...(imageUrl ? { imageUrl } : {}),
+      ...(footer ? { footer } : {}),
+    };
+  });
 
-  return out;
-}
-
-function normalizeDiscordEmbed(input: unknown): DiscordEmbedTextMeta | null {
-  if (typeof input === "string") {
-    const description = asNonEmptyString(input);
-    return description ? { description } : null;
-  }
-
-  if (!input || typeof input !== "object") return null;
-  const o = input as Record<string, unknown>;
-
-  const title = asNonEmptyString(o.title);
-  const description = asNonEmptyString(o.description);
-  const fields = normalizeDiscordEmbedFields(o.fields);
-
-  const imageObj =
-    o.image && typeof o.image === "object" ? (o.image as Record<string, unknown>) : undefined;
-  const imageUrl = asNonEmptyString(imageObj?.url);
-
-  const footerObj =
-    o.footer && typeof o.footer === "object" ? (o.footer as Record<string, unknown>) : undefined;
-  const footer = asNonEmptyString(footerObj?.text);
-
-  if (!title && !description && fields.length === 0 && !imageUrl && !footer) {
-    return null;
-  }
-
-  return {
-    ...(title ? { title } : {}),
-    ...(description ? { description } : {}),
-    ...(fields.length > 0 ? { fields } : {}),
-    ...(imageUrl ? { imageUrl } : {}),
-    ...(footer ? { footer } : {}),
-  };
-}
+const discordEmbedInputSchema = z.union([
+  z
+    .string()
+    .transform((description): DiscordEmbedTextMeta | null =>
+      description.trim().length > 0 ? { description } : null,
+    ),
+  discordEmbedSchema,
+]);
+const discordEmbedsSchema = z.array(
+  z.union([discordEmbedInputSchema, z.unknown().transform(() => null)]),
+);
 
 export function normalizeDiscordEmbeds(input: unknown): DiscordEmbedTextMeta[] {
-  if (!Array.isArray(input)) return [];
+  const parsed = discordEmbedsSchema.safeParse(input);
+  return parsed.success
+    ? parsed.data.filter((embed): embed is DiscordEmbedTextMeta => embed !== null)
+    : [];
+}
 
-  const out: DiscordEmbedTextMeta[] = [];
-
-  for (const item of input) {
-    const normalized = normalizeDiscordEmbed(item);
-    if (normalized) out.push(normalized);
-  }
-
-  return out;
+function asNonEmptyString(value: string | undefined): string | undefined {
+  return value?.trim().length ? value : undefined;
 }
 
 function formatEmbedFields(fields: readonly DiscordEmbedTextField[]): string | undefined {

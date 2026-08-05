@@ -1,6 +1,11 @@
 import { RuleTester } from "oxlint/plugins-dev";
 
 import { noFixedTestWaitRule } from "./test-waits.mts";
+import {
+  noExceptionFlowRule,
+  noInlineAsyncResultCallbackRule,
+  noLocalIsRecordRule,
+} from "./production-syntax.mts";
 
 const ruleTester = new RuleTester({
   languageOptions: { sourceType: "module" },
@@ -15,6 +20,93 @@ ruleTester.run("lilac/no-fixed-test-wait", noFixedTestWaitRule, {
     {
       code: "await Bun.sleep(5);",
       errors: [{ message: /fixed Bun\.sleep progression delay/u, line: 1, column: 6 }],
+    },
+  ],
+});
+
+const productionFile = "apps/example/src/example.ts";
+
+ruleTester.run("lilac/no-exception-flow", noExceptionFlowRule, {
+  valid: [
+    { code: "new Promise((resolve, reject) => resolve(1));", filename: productionFile },
+    { code: "try { operation(); } finally { cleanup(); }", filename: productionFile },
+    { code: "throw new Error('test invariant');", filename: "apps/example/tests/example.test.ts" },
+  ],
+  invalid: [
+    {
+      code: "function run() { throw new Error('bad'); }",
+      filename: productionFile,
+      errors: [{ message: /Return a typed Result error/u, line: 1, column: 17 }],
+    },
+    {
+      code: "Promise.resolve(1).catch(handleError);",
+      filename: productionFile,
+      errors: [{ message: /external-to-result adapter/u, line: 1, column: 0 }],
+    },
+    {
+      code: "cache.catch(handleMiss);",
+      filename: productionFile,
+      errors: [{ message: /external-to-result adapter/u, line: 1, column: 0 }],
+    },
+    {
+      code: "task.then(...callbacks);",
+      filename: productionFile,
+      errors: [{ message: /named Result-returning adapter/u, line: 1 }],
+    },
+    {
+      code: "task.then(onFulfilled, ...callbacks);",
+      filename: productionFile,
+      errors: [{ message: /named Result-returning adapter/u, line: 1 }],
+    },
+    {
+      code: 'import { TaggedError } from "better-result"; class Failure extends TaggedError("Failure") {} function run() { throw new Failure(); }',
+      filename: productionFile,
+      errors: [{ message: /Return a typed Result error/u, line: 1 }],
+    },
+    {
+      code: "function run() { try { operation(); } catch (cause) { return mapCause(cause); } }",
+      filename: productionFile,
+      errors: [{ message: /exactly registered adapter/u, line: 1 }],
+    },
+    {
+      code: 'import type { Result } from "better-result"; function run(): Promise<Result<string, Error>> { return Promise.reject(new Error("bad")); }',
+      filename: productionFile,
+      errors: [{ message: /Return Result\.err instead of Promise\.reject/u, line: 1 }],
+    },
+  ],
+});
+
+ruleTester.run("lilac/no-local-is-record", noLocalIsRecordRule, {
+  valid: [
+    {
+      code: 'export function isRecord(value: unknown) { return typeof value === "object" && value !== null && !Array.isArray(value); }',
+      filename: "packages/utils/runtime-utils.ts",
+    },
+  ],
+  invalid: [
+    {
+      code: 'function asRecord(value: unknown) { return typeof value === "object" && value !== null && !Array.isArray(value); }',
+      filename: productionFile,
+      errors: [{ message: /Import the canonical isRecord utility/u, line: 1, column: 0 }],
+    },
+    {
+      code: 'const guards = { asRecord: (value: unknown) => { if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined; return value as Record<string, unknown>; } };',
+      filename: productionFile,
+      errors: [{ message: /Import the canonical isRecord utility/u, line: 1 }],
+    },
+  ],
+});
+
+ruleTester.run("lilac/no-inline-async-result-callback", noInlineAsyncResultCallbackRule, {
+  valid: [
+    { code: "values.map(async (value) => value);", filename: productionFile },
+    { code: "userResult.andThen(async (value) => value);", filename: productionFile },
+  ],
+  invalid: [
+    {
+      code: 'import { Result } from "better-result"; Result.andThenAsync(async (value) => Result.ok(value));',
+      filename: productionFile,
+      errors: [{ message: /named Result-returning adapter/u, line: 1, column: 60 }],
     },
   ],
 });

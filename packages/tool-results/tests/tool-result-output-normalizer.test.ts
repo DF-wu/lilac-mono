@@ -2,8 +2,13 @@ import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { mkdtemp, readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { Panic, Result } from "better-result";
 
-import { createToolResultArtifactStore } from "../src/tool-result-artifact-store";
+import {
+  adaptToolResultArtifactReadToAvailability,
+  createToolResultArtifactStore,
+  ToolResultArtifactStorageFailure,
+} from "../src/tool-result-artifact-store";
 import { createToolResultOutputNormalizer } from "../src/tool-result-output-normalizer";
 
 describe("tool result output normalizer", () => {
@@ -56,7 +61,9 @@ describe("tool result output normalizer", () => {
     expect(normalized.value).not.toContain("fghij");
     const uri = normalized.value.match(/tool-result:\/\/[0-9a-f-]+/u)?.[0];
     expect(uri).toBeDefined();
-    expect((await artifacts.read(uri!, "session-a")).ok).toBe(true);
+    expect(
+      adaptToolResultArtifactReadToAvailability(await artifacts.read(uri!, "session-a")).ok,
+    ).toBe(true);
 
     expect(await normalize(normalized, { toolCallId: "b", toolName: "plugin" })).toEqual(
       normalized,
@@ -243,18 +250,13 @@ describe("tool result output normalizer", () => {
     const normalize = createToolResultOutputNormalizer({
       artifacts: {
         rootDir: baseDir,
-        init: async () => undefined,
-        create: async () => {
-          throw new Error("disk full");
-        },
-        createFromFile: async () => {
-          throw new Error("disk full");
-        },
-        createFromStream: async () => {
-          throw new Error("disk full");
-        },
-        read: async () => ({ ok: false }),
-        readWindow: async () => ({ ok: false }),
+        init: async () => Result.ok(undefined),
+        create: async () => Result.err(storageFailure()),
+        createFromFile: async () => Result.err(storageFailure()),
+        createFromStream: async () => Result.err(storageFailure()),
+        read: async () => Result.err(storageFailure()),
+        readWindow: async () => Result.err(storageFailure()),
+        maintain: async () => Result.ok({ removedInvalid: 0, removedExpired: 0 }),
       },
       owner: { requestId: "request-a", scopeId: "scope-a" },
       getOutputConfig: () => ({ ...outputConfig(), maxInlineBytes: 60 }),
@@ -324,7 +326,9 @@ describe("tool result output normalizer", () => {
     expect(normalized.value).not.toContain("\u0000");
     const uri = normalized.value.match(/tool-result:\/\/[0-9a-f-]+/u)?.[0];
     if (!uri) throw new Error("expected artifact URI");
-    const artifact = await artifacts.read(uri, "session-a");
+    const artifact = adaptToolResultArtifactReadToAvailability(
+      await artifacts.read(uri, "session-a"),
+    );
     expect(artifact.ok).toBe(true);
     if (artifact.ok) {
       expect(artifact.content).toContain("TOKEN=<redacted>");
@@ -366,6 +370,12 @@ describe("tool result output normalizer", () => {
     });
     const cyclic: Record<string, unknown> = {};
     cyclic["self"] = cyclic;
+    const hostileToJson: Record<string, string> = {};
+    Object.defineProperty(hostileToJson, "toJSON", {
+      value: () => {
+        throw new Error("ordinary serialization failure");
+      },
+    });
 
     for (const value of [cyclic, 1n, undefined]) {
       expect(
@@ -381,6 +391,33 @@ describe("tool result output normalizer", () => {
         }),
       ).toEqual({ type: "error-text", value: "[tool result is not JSON-serializable]" });
     }
+    expect(
+      await normalize(
+        { type: "json", value: hostileToJson },
+        { toolCallId: "hostile", toolName: "plugin" },
+      ),
+    ).toEqual({ type: "text", value: "[tool result is not JSON-serializable]" });
+  });
+
+  it("preserves exact Panic identity from hostile JSON serialization", async () => {
+    const normalize = createToolResultOutputNormalizer({
+      owner: { requestId: "request-a", scopeId: "scope-a" },
+      getOutputConfig: outputConfig,
+    });
+    const panic = new Panic({ message: "hostile toJSON invariant failed" });
+    const hostileToJson: Record<string, string> = {};
+    Object.defineProperty(hostileToJson, "toJSON", {
+      value: () => {
+        throw panic;
+      },
+    });
+
+    await expect(
+      normalize(
+        { type: "json", value: hostileToJson },
+        { toolCallId: "panic", toolName: "plugin" },
+      ),
+    ).rejects.toBe(panic);
   });
 
   it("does not let a public built-in tool name bypass overflow handling", async () => {
@@ -403,18 +440,13 @@ describe("tool result output normalizer", () => {
     const normalize = createToolResultOutputNormalizer({
       artifacts: {
         rootDir: baseDir,
-        init: async () => undefined,
-        create: async () => {
-          throw new Error("disk full");
-        },
-        createFromFile: async () => {
-          throw new Error("disk full");
-        },
-        createFromStream: async () => {
-          throw new Error("disk full");
-        },
-        read: async () => ({ ok: false }),
-        readWindow: async () => ({ ok: false }),
+        init: async () => Result.ok(undefined),
+        create: async () => Result.err(storageFailure()),
+        createFromFile: async () => Result.err(storageFailure()),
+        createFromStream: async () => Result.err(storageFailure()),
+        read: async () => Result.err(storageFailure()),
+        readWindow: async () => Result.err(storageFailure()),
+        maintain: async () => Result.ok({ removedInvalid: 0, removedExpired: 0 }),
       },
       owner: { requestId: "request-a", sessionId: "session-a" },
       getOutputConfig: outputConfig,
@@ -609,7 +641,9 @@ describe("tool result output normalizer", () => {
 
     const uri = content.value[0].text.match(/tool-result:\/\/[0-9a-f-]+/u)?.[0];
     if (!uri) throw new Error("expected content text artifact URI");
-    const artifact = await artifacts.read(uri, "session-a");
+    const artifact = adaptToolResultArtifactReadToAvailability(
+      await artifacts.read(uri, "session-a"),
+    );
     expect(artifact).toMatchObject({ ok: true, content: "0123456789" });
     if (artifact.ok) expect(artifact.content).not.toContain("MEDIA-BASE64-DATA");
 
@@ -624,4 +658,65 @@ describe("tool result output normalizer", () => {
     expect(error.type).toBe("error-text");
     if (error.type === "error-text") expect(error.value).toContain("tool-result://");
   });
+
+  it("does not hide a store implementation that violates its Result contract", async () => {
+    const normalize = createToolResultOutputNormalizer({
+      artifacts: {
+        rootDir: baseDir,
+        init: async () => Result.ok(undefined),
+        create: async () => {
+          throw new Error("adapter rejected");
+        },
+        createFromFile: async () => Result.err(storageFailure()),
+        createFromStream: async () => Result.err(storageFailure()),
+        read: async () => Result.err(storageFailure()),
+        readWindow: async () => Result.err(storageFailure()),
+        maintain: async () => Result.ok({ removedInvalid: 0, removedExpired: 0 }),
+      },
+      owner: { requestId: "request-a", scopeId: "scope-a" },
+      getOutputConfig: outputConfig,
+    });
+
+    await expect(
+      normalize(
+        { type: "text", value: "0123456789abcdefghij" },
+        { toolCallId: "rejected", toolName: "plugin" },
+      ),
+    ).rejects.toThrow("adapter rejected");
+  });
+
+  it("preserves artifact Panic identity through overflow normalization", async () => {
+    const panic = new Panic({ message: "artifact invariant failed" });
+    const normalize = createToolResultOutputNormalizer({
+      artifacts: {
+        rootDir: baseDir,
+        init: async () => Result.ok(undefined),
+        create: async () => {
+          throw panic;
+        },
+        createFromFile: async () => Result.err(storageFailure()),
+        createFromStream: async () => Result.err(storageFailure()),
+        read: async () => Result.err(storageFailure()),
+        readWindow: async () => Result.err(storageFailure()),
+        maintain: async () => Result.ok({ removedInvalid: 0, removedExpired: 0 }),
+      },
+      owner: { requestId: "request-a", scopeId: "scope-a" },
+      getOutputConfig: outputConfig,
+    });
+
+    await expect(
+      normalize(
+        { type: "text", value: "0123456789abcdefghij" },
+        { toolCallId: "panic", toolName: "plugin" },
+      ),
+    ).rejects.toBe(panic);
+  });
 });
+
+function storageFailure(): ToolResultArtifactStorageFailure {
+  return new ToolResultArtifactStorageFailure({
+    operation: "write-content",
+    code: "ENOSPC",
+    message: "Tool result artifact write-content failed",
+  });
+}

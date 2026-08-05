@@ -8,6 +8,7 @@ import {
 } from "@stanley2058/lilac-utils";
 import fs from "node:fs/promises";
 import path from "node:path";
+import { Panic } from "better-result";
 
 import {
   BASH_NO_OUTPUT_TIMEOUT_MS,
@@ -357,14 +358,14 @@ rmdir "$media_dir"`,
       const uri = res.truncation?.artifactUri;
       if (!uri) throw new Error("expected truncated output artifact URI");
       const artifact = await artifacts.read(uri, sessionId);
-      expect(artifact.ok).toBe(true);
-      if (artifact.ok) {
-        expect(artifact.content).toContain("<bash_tool_full_output>");
-        expect(artifact.content).toContain("--- stdout ---");
-        expect(artifact.content).toContain("--- stderr ---");
-        expect(artifact.content).toContain("API_TOKEN=<redacted>");
-        expect(artifact.content).not.toContain("secret-value");
-        expect(artifact.content).toContain("END");
+      expect(artifact.status).toBe("ok");
+      if (artifact.status === "ok") {
+        expect(artifact.value.content).toContain("<bash_tool_full_output>");
+        expect(artifact.value.content).toContain("--- stdout ---");
+        expect(artifact.value.content).toContain("--- stderr ---");
+        expect(artifact.value.content).toContain("API_TOKEN=<redacted>");
+        expect(artifact.value.content).not.toContain("secret-value");
+        expect(artifact.value.content).toContain("END");
       }
     } finally {
       await fs.rm(artifactDir, { recursive: true, force: true });
@@ -386,6 +387,95 @@ rmdir "$media_dir"`,
     expect(res.truncation?.message).toContain("could not be retained");
     const tmpEntries = await fs.readdir(await fs.realpath("/tmp"));
     expect(tmpEntries.some((entry) => entry.startsWith(`${requestId}-${toolCallId}-`))).toBe(false);
+  });
+
+  it("surfaces spill cleanup failure without exposing injected raw output or paths", async () => {
+    const rawSecret = "RAW_TOKEN=spill-secret";
+    const removed: string[] = [];
+    try {
+      const result = await executeBash(
+        { command: "head -c 100000 /dev/zero | tr '\\0' x" },
+        {
+          context: {
+            requestId: "bash-cleanup-only",
+            sessionId: "bash-cleanup-only",
+            requestClient: "test",
+          },
+          toolCallId: "bash-cleanup-only",
+          outputConfig: {
+            maxPreviewBytes: 64,
+            artifactTtlMs: 60_000,
+            artifactMaxBytesPerSession: 1024 * 1024,
+          },
+          spillFileOperations: {
+            async remove(target) {
+              removed.push(target);
+              throw new Error(`${rawSecret} ${target}`);
+            },
+          },
+        },
+      );
+
+      expect(removed).toHaveLength(2);
+      expect(result.executionError).toEqual({
+        type: "exception",
+        phase: "unknown",
+        message: "Bash temporary output cleanup failed",
+      });
+      expect(result.exitCode).toBe(-1);
+      const wire = JSON.stringify(result);
+      expect(wire).not.toContain(rawSecret);
+      for (const target of removed) expect(wire).not.toContain(target);
+    } finally {
+      await Promise.all(removed.map((target) => fs.rm(target, { force: true })));
+    }
+  });
+
+  it("surfaces operation and spill cleanup failure without leaking either cause", async () => {
+    const invalidCwd = "/private/workspace-secret/does-not-exist";
+    const result = await executeBash(
+      { command: "printf unreachable", cwd: invalidCwd },
+      {
+        spillFileOperations: {
+          async remove(target) {
+            throw new Error(`RAW_TOKEN=cleanup-secret ${target}`);
+          },
+        },
+      },
+    );
+
+    expect(result.executionError).toEqual({
+      type: "exception",
+      phase: "spawn",
+      message: "Bash execution failed and temporary output cleanup also failed",
+    });
+    const wire = JSON.stringify(result);
+    expect(wire).not.toContain("cleanup-secret");
+    expect(wire).not.toContain(invalidCwd);
+  });
+
+  it("attempts all spill cleanup before propagating the exact cleanup Panic", async () => {
+    const panic = new Panic({ message: "spill cleanup invariant" });
+    const attempted: string[] = [];
+    let caught: unknown;
+    try {
+      await executeBash(
+        { command: "printf unreachable", cwd: "/does/not/exist" },
+        {
+          spillFileOperations: {
+            async remove(target) {
+              attempted.push(target);
+              if (attempted.length === 1) throw panic;
+            },
+          },
+        },
+      );
+    } catch (error) {
+      caught = error;
+    }
+
+    expect(attempted).toHaveLength(2);
+    expect(caught).toBe(panic);
   });
 
   it("reports incomplete retention after bounded pre-cap ANSI output", async () => {
@@ -556,11 +646,11 @@ describe("executeRestrictedBash", () => {
         result.truncation?.artifactUri ?? "",
         "restricted-sanitize-session",
       );
-      expect(stored.ok).toBe(true);
-      if (stored.ok) {
-        expect(stored.content).not.toContain("\u001b");
-        expect(stored.content).not.toContain("abcdefghijklmnopqrstuvwxyz1234567890");
-        expect(stored.content).toContain("<redacted>");
+      expect(stored.status).toBe("ok");
+      if (stored.status === "ok") {
+        expect(stored.value.content).not.toContain("\u001b");
+        expect(stored.value.content).not.toContain("abcdefghijklmnopqrstuvwxyz1234567890");
+        expect(stored.value.content).toContain("<redacted>");
       }
     } finally {
       await fs.rm(workspace, { recursive: true, force: true });

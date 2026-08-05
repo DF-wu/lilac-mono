@@ -3,6 +3,7 @@ import type { CoreConfig } from "@stanley2058/lilac-utils";
 import {
   getDiscordSessionAliasValue,
   getDiscordUserAliasValue,
+  opaqueErrorMessage,
   RESPONSE_COMMENTARY_INSTRUCTIONS,
 } from "@stanley2058/lilac-utils";
 
@@ -163,7 +164,7 @@ export async function resolveSessionAdditionalPrompts(params: {
       params.onWarn?.({
         reason: "invalid_file_url",
         value,
-        error: e instanceof Error ? e.message : String(e),
+        error: opaqueErrorMessage(e, "Unknown prompt file failure"),
       });
       continue;
     }
@@ -177,7 +178,7 @@ export async function resolveSessionAdditionalPrompts(params: {
         reason: "read_failed",
         value,
         filePath,
-        error: e instanceof Error ? e.message : String(e),
+        error: opaqueErrorMessage(e, "Unknown prompt path failure"),
       });
     }
   }

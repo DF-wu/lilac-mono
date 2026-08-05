@@ -39,6 +39,12 @@ export type ServerToolHelpEntry = {
 
 export type ServerToolListResult = ServerToolHelpEntry[];
 
+export type ServerToolCallOptions = {
+  signal?: AbortSignal;
+  context?: RequestContext;
+  messages?: readonly unknown[];
+};
+
 export interface ServerTool {
   id: string;
 
@@ -48,11 +54,7 @@ export interface ServerTool {
   call(
     callableId: string,
     input: Record<string, unknown>,
-    opts?: {
-      signal?: AbortSignal;
-      context?: RequestContext;
-      messages?: readonly unknown[];
-    },
+    opts?: ServerToolCallOptions,
   ): Promise<unknown>;
 }
 
@@ -95,6 +97,11 @@ export type Level1ToolRunContext<TRuntimeContext> = {
 export type Level1ToolBuildContext<TRuntimeContext> = Level1ToolRunContext<TRuntimeContext> & {
   getTools(): ToolSet;
   getLevel1ToolSpecs(): ReadonlyMap<string, Level1ToolSpec<TRuntimeContext>>;
+  resolveEditTargets(
+    spec: Level1ToolSpec<TRuntimeContext>,
+    args: unknown,
+    context: { cwd: string },
+  ): Promise<readonly string[]>;
   reportToolStatus?: (update: {
     toolCallId: string;
     status: "start" | "update" | "end";

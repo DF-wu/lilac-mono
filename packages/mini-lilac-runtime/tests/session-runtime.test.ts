@@ -1,10 +1,11 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, spyOn } from "bun:test";
 import { Database } from "bun:sqlite";
 import {
   chmod,
   copyFile,
   mkdir,
   mkdtemp as mkdtempFs,
+  readFile,
   readdir,
   rm,
   stat,
@@ -37,6 +38,7 @@ import {
 } from "ai";
 import { MockLanguageModelV4, simulateReadableStream } from "ai/test";
 import { getCodexAuthStoragePath, ModelCapability } from "@stanley2058/lilac-utils";
+import { Panic, Result } from "better-result";
 import { z } from "zod";
 
 import type { RuntimeConfig } from "../src/config";
@@ -47,12 +49,17 @@ import {
   type ProviderConfig,
 } from "../src/providers";
 import {
+  MiniLilacSessionOperationRejected,
   SessionService,
   type MiniLilacRuntimeChunk,
   type SessionServiceOptions,
 } from "../src/session-service";
 import { MiniLilacSkillCatalog } from "../src/skills";
-import { MiniLilacDatabaseVersionError, MiniLilacSqliteStore } from "../src/sqlite-store";
+import {
+  MiniLilacDatabaseVersionError,
+  MiniLilacSqliteStore,
+  MiniLilacStoreOperationRejected,
+} from "../src/sqlite-store";
 import {
   WorkspaceHistoryStore,
   type LockedWorkspaceHistoryStore,
@@ -636,6 +643,11 @@ class ScriptedWorkspaceHistoryStore extends WorkspaceHistoryStore {
         this.captureCall += 1;
         return await this.captureScript(this.captureCall, this.workspaceId);
       },
+      captureResult: async () => {
+        this.captureCall += 1;
+        return Result.ok(await this.captureScript(this.captureCall, this.workspaceId));
+      },
+      invalidateCaptureCacheResult: async () => Result.ok(undefined),
       prepareRestore: async () => ({ status: "skipped", reason: "git-unavailable" }),
     });
   }
@@ -662,6 +674,11 @@ class InterceptedWorkspaceHistoryStore extends WorkspaceHistoryStore {
     return await super.withWorkspaceLock(async (lockedStore) => {
       const resumePreparedRestore = lockedStore.resumePreparedRestore;
       return await callback({
+        captureResult: async () => {
+          this.hooks.onCapture?.();
+          return await lockedStore.captureResult();
+        },
+        invalidateCaptureCacheResult: async () => await lockedStore.invalidateCaptureCacheResult(),
         capture: async () => {
           this.hooks.onCapture?.();
           return await lockedStore.capture();
@@ -1178,6 +1195,55 @@ describe("MiniLilacSqliteStore", () => {
 });
 
 describe("SessionService", () => {
+  it("explicitly invalidates an incompatible cache with a redacted diagnostic before recomputing", async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), "mini-lilac-cache-policy-"));
+    temporaryDirectories.push(directory);
+    const diagnostics: object[] = [];
+    let historyStore: WorkspaceHistoryStore | undefined;
+    const model = new MockLanguageModelV4({
+      doStream: async () => textResult("cache-policy-answer", "done"),
+    });
+    const service = new SessionService({
+      config: config(),
+      databasePath: path.join(directory, "runtime.sqlite"),
+      modelResolver: () => model,
+      workspaceHistoryStoreFactory: (options) => {
+        historyStore = new WorkspaceHistoryStore(options);
+        return historyStore;
+      },
+      onWorkspaceHistoryPersistenceDiagnostic: (diagnostic) => diagnostics.push(diagnostic),
+    });
+    const session = await service.createSession({ cwd: directory, model: "test/mock" });
+    await collect(
+      (await service.startPrompt(session.id, userMessage("first"), "cache-policy-first")).stream,
+    );
+    if (historyStore === undefined) throw new Error("workspace history store was not created");
+    const cachePath = path.join(historyStore.storeDirectory, "capture-cache.json");
+    const current = JSON.parse(await readFile(cachePath, "utf8"));
+    const incompatible = JSON.stringify({
+      ...current,
+      implementationVersion: "secret-implementation-version",
+    });
+    await writeFile(cachePath, incompatible);
+
+    await collect(
+      (await service.startPrompt(session.id, userMessage("second"), "cache-policy-second")).stream,
+    );
+
+    expect(diagnostics).toEqual([
+      {
+        operation: "invalidate-capture-cache",
+        recordKind: "capture-cache",
+        issueCode: "unsupported-version",
+        versionCategory: "implementation",
+      },
+    ]);
+    expect(JSON.stringify(diagnostics)).not.toContain("secret-implementation-version");
+    expect(await readFile(cachePath, "utf8")).not.toBe(incompatible);
+    expect(await readFile(cachePath, "utf8")).not.toContain("secret-implementation-version");
+    service.close();
+  });
+
   it("keeps transcript history without workspace snapshots outside Git", async () => {
     const directory = await mkdtempFs(path.join(tmpdir(), "mini-lilac-non-git-history-"));
     temporaryDirectories.push(directory);
@@ -2719,8 +2785,8 @@ describe("SessionService", () => {
     if (uri === undefined) throw new Error("overflow artifact URI was not persisted");
     expect(serializedTranscript).not.toContain("x".repeat(1_000));
     const artifact = await artifacts.read(uri, session.id);
-    expect(artifact.ok).toBe(true);
-    if (artifact.ok) expect(artifact.content).toContain(longLine.trim());
+    expect(artifact.status).toBe("ok");
+    if (artifact.status === "ok") expect(artifact.value.content).toContain(longLine.trim());
     service.close();
   });
 
@@ -2772,8 +2838,8 @@ describe("SessionService", () => {
     const childTranscript = JSON.stringify(service.store.getModelMessages(child.id));
     const uri = /tool-result:\/\/[0-9a-f-]{36}/u.exec(childTranscript)?.[0];
     if (uri === undefined) throw new Error("child overflow artifact URI was not persisted");
-    expect((await artifacts.read(uri, root.id)).ok).toBe(true);
-    expect((await artifacts.read(uri, child.id)).ok).toBe(false);
+    expect((await artifacts.read(uri, root.id)).status).toBe("ok");
+    expect((await artifacts.read(uri, child.id)).status).toBe("error");
     service.close();
   });
 
@@ -2788,6 +2854,63 @@ describe("SessionService", () => {
       attachCompaction: async () => () => {},
     });
 
+    service.close();
+  });
+
+  it("returns owned session failures without misclassifying them as SQLite failures", async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), "mini-lilac-session-result-"));
+    temporaryDirectories.push(directory);
+    const service = new SessionService({
+      config: config(),
+      databasePath: path.join(directory, "sessions.sqlite"),
+      modelResolver: () => new MockLanguageModelV4({}),
+      attachCompaction: async () => () => {},
+    });
+
+    const created = await service.createSessionResult({
+      id: "sub:reserved",
+      cwd: directory,
+      model: "test/mock",
+    });
+
+    expect(created.status).toBe("error");
+    if (created.status === "error") {
+      expect(created.error).toBeInstanceOf(MiniLilacSessionOperationRejected);
+      expect(created.error).toMatchObject({
+        _tag: "MiniLilacSessionOperationRejected",
+        operation: "createSession",
+      });
+    }
+    const externalFailure = await service.createSessionResult({
+      cwd: path.join(directory, "missing"),
+      model: "test/mock",
+    });
+    expect(externalFailure).toMatchObject({
+      status: "error",
+      error: {
+        _tag: "MiniLilacSessionExternalFailure",
+        operation: "createSession",
+      },
+    });
+    expect(service.closeResult()).toMatchObject({ status: "ok" });
+  });
+
+  it("preserves Panic through the session Result boundary", async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), "mini-lilac-session-panic-"));
+    temporaryDirectories.push(directory);
+    const panic = new Panic({ message: "model resolver invariant" });
+    const service = new SessionService({
+      config: config(),
+      databasePath: path.join(directory, "sessions.sqlite"),
+      modelResolver: () => {
+        throw panic;
+      },
+      attachCompaction: async () => () => {},
+    });
+
+    await expect(service.createSessionResult({ cwd: directory, model: "test/mock" })).rejects.toBe(
+      panic,
+    );
     service.close();
   });
 
@@ -2826,6 +2949,17 @@ describe("SessionService", () => {
     expect(() => service.startPrompt(session.id, userMessage("too late"))).toThrow(
       "not accepting admissions",
     );
+    const rejectedAdmission = await service.startPromptResult(
+      session.id,
+      userMessage("still too late"),
+    );
+    expect(rejectedAdmission).toMatchObject({
+      status: "error",
+      error: {
+        _tag: "MiniLilacSessionOperationRejected",
+        operation: "admission",
+      },
+    });
     await shutdown;
     await completion;
 
@@ -3780,6 +3914,68 @@ describe("SessionService", () => {
 
     expect(titleModel.doStreamCalls).toHaveLength(1);
     expect(settledTitle).toBe("Keep this useful fallback");
+  });
+
+  it("reports an exact title-generation Panic to the fatal supervisor", async () => {
+    const runtimeConfig = config();
+    runtimeConfig.agent.titleModel = "test/title";
+    const rootModel = new MockLanguageModelV4({ doStream: textResult("answer", "done") });
+    const panic = new Panic({ message: "title model invariant" });
+    const reported: Panic[] = [];
+    const directory = await mkdtemp(path.join(tmpdir(), "mini-lilac-title-panic-"));
+    temporaryDirectories.push(directory);
+    const service = new SessionService({
+      config: runtimeConfig,
+      databasePath: path.join(directory, "runtime.sqlite"),
+      modelResolver: (specifier) => {
+        if (specifier === "test/title") throw panic;
+        return rootModel;
+      },
+      reportFatalPanic: (reportedPanic) => reported.push(reportedPanic),
+    });
+    const session = await service.createSession({ cwd: directory, model: "test/mock" });
+
+    await collect((await service.startPrompt(session.id, userMessage("Keep the fallback"))).stream);
+    await service.waitForTrackedTasks();
+    const settledTitle = service.getSnapshot(session.id).title;
+    service.close();
+
+    expect(reported).toEqual([panic]);
+    expect(settledTitle).toBe("Keep the fallback");
+  });
+
+  it("keeps ordinary title-generation failure best-effort", async () => {
+    const warning = spyOn(console, "warn").mockImplementation(() => undefined);
+    const runtimeConfig = config();
+    runtimeConfig.agent.titleModel = "test/title";
+    const rootModel = new MockLanguageModelV4({ doStream: textResult("answer", "done") });
+    const reported: Panic[] = [];
+    const directory = await mkdtemp(path.join(tmpdir(), "mini-lilac-title-failure-"));
+    temporaryDirectories.push(directory);
+    const service = new SessionService({
+      config: runtimeConfig,
+      databasePath: path.join(directory, "runtime.sqlite"),
+      modelResolver: (specifier) => {
+        if (specifier === "test/title") throw new Error("title provider unavailable");
+        return rootModel;
+      },
+      reportFatalPanic: (panic) => reported.push(panic),
+    });
+
+    try {
+      const session = await service.createSession({ cwd: directory, model: "test/mock" });
+      await collect(
+        (await service.startPrompt(session.id, userMessage("Keep ordinary fallback"))).stream,
+      );
+      await service.waitForTrackedTasks();
+
+      expect(reported).toEqual([]);
+      expect(service.getSnapshot(session.id).title).toBe("Keep ordinary fallback");
+      expect(warning).toHaveBeenCalledTimes(1);
+    } finally {
+      warning.mockRestore();
+      service.close();
+    }
   });
 
   it("bounds generated titles by protocol-safe UTF-16 length", async () => {
@@ -6716,10 +6912,14 @@ describe("SessionService", () => {
     const started = await service.startPrompt(session.id, userMessage("wait"));
     // test-wait-justification: fault injection must occur after the gated run has entered its asynchronous model turn.
     await Bun.sleep(0);
-    const saveCommandResult = service.store.saveCommandResult.bind(service.store);
-    service.store.saveCommandResult = () => {
-      throw new Error("command result write failed");
-    };
+    const saveCommandResult = service.store.saveCommandResultResult.bind(service.store);
+    service.store.saveCommandResultResult = () =>
+      Result.err(
+        new MiniLilacStoreOperationRejected({
+          operation: "saveCommandResult",
+          message: "command result write failed",
+        }),
+      );
 
     const request = {
       sessionId: session.id,
@@ -6732,7 +6932,7 @@ describe("SessionService", () => {
     await expect(service.steer(request)).rejects.toThrow("is pending");
     expect(service.getSnapshot(session.id).queuedSteeringCount).toBe(1);
 
-    service.store.saveCommandResult = saveCommandResult;
+    service.store.saveCommandResultResult = saveCommandResult;
     await service.cancel({
       sessionId: session.id,
       runId: started.runId,
@@ -6758,12 +6958,16 @@ describe("SessionService", () => {
     const started = await service.startPrompt(session.id, userMessage("wait"));
     // test-wait-justification: fault injection must occur after the gated run has entered its asynchronous model turn.
     await Bun.sleep(0);
-    const markCommandSideEffectStarted = service.store.markCommandSideEffectStarted.bind(
+    const markCommandSideEffectStarted = service.store.markCommandSideEffectStartedResult.bind(
       service.store,
     );
-    service.store.markCommandSideEffectStarted = () => {
-      throw new Error("side-effect marker failed");
-    };
+    service.store.markCommandSideEffectStartedResult = () =>
+      Result.err(
+        new MiniLilacStoreOperationRejected({
+          operation: "markCommandSideEffectStarted",
+          message: "side-effect marker failed",
+        }),
+      );
 
     await expect(
       service.steer({
@@ -6779,7 +6983,7 @@ describe("SessionService", () => {
         .get(),
     ).toEqual({ count: 0 });
 
-    service.store.markCommandSideEffectStarted = markCommandSideEffectStarted;
+    service.store.markCommandSideEffectStartedResult = markCommandSideEffectStarted;
     await service.cancel({
       sessionId: session.id,
       runId: started.runId,
@@ -6804,7 +7008,7 @@ describe("SessionService", () => {
     for (let attempt = 0; attempt < 3; attempt += 1) {
       await expect(
         service.startPrompt(session.id, userMessage("must roll back"), "atomic-prompt"),
-      ).rejects.toThrow("prompt command fault");
+      ).rejects.toThrow("Mini Lilac SQLite operation failed");
       expect(
         service.store.database.query("SELECT COUNT(*) AS count FROM workspace_snapshots").get(),
       ).toEqual({ count: 0 });
@@ -7267,11 +7471,11 @@ describe("SessionService", () => {
     expect(secondPrompt).toContain("middle output omitted");
     expect(secondPrompt).toContain('"completeOutputRetained":true');
     const artifact = await artifacts.read(uri, session.id);
-    expect(artifact.ok).toBe(true);
-    if (artifact.ok) {
-      expect(artifact.content).toContain("start-");
-      expect(artifact.content).toContain("-end");
-      expect(artifact.content).toContain("z".repeat(40_000));
+    expect(artifact.status).toBe("ok");
+    if (artifact.status === "ok") {
+      expect(artifact.value.content).toContain("start-");
+      expect(artifact.value.content).toContain("-end");
+      expect(artifact.value.content).toContain("z".repeat(40_000));
     }
     service.close();
   });
@@ -8389,7 +8593,9 @@ describe("SessionService", () => {
     expect(model.doStreamCalls).toHaveLength(0);
     expect(service.store.getRun(started.runId)).toMatchObject({
       status: "error",
-      error: "Cannot append an ephemeral overlay after an assistant message",
+      error: expect.stringContaining(
+        "Cannot append an ephemeral overlay after an assistant message",
+      ),
     });
     service.close();
   });

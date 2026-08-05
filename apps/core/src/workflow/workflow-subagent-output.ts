@@ -13,7 +13,7 @@ export async function resolveWorkflowSubagentToolResult(input: {
   if (!uri) return input.finalText;
   if (input.artifacts) {
     const artifact = await input.artifacts.read(uri, input.childSessionId);
-    if (artifact.ok) return artifact.content;
+    if (artifact.status === "ok") return artifact.value.content;
   }
   return [
     match.groups?.["head"] ?? "",

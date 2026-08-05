@@ -1,9 +1,14 @@
 import {
+  type DeliveryDisposition,
+  type EventDeliveryDoneError,
+  type EventDeliveryStartFailed,
+  type EventDeliveryStopFailed,
   lilacEventTypes,
   type LilacBus,
   type LilacMessageForTopic,
 } from "@stanley2058/lilac-event-bus";
-import { createLogger } from "@stanley2058/lilac-utils";
+import { createLogger, isRecord } from "@stanley2058/lilac-utils";
+import { Result, TaggedError, type Result as ResultType } from "better-result";
 import { z } from "zod";
 
 import { parseRequestId } from "../surface/bridge/request-ids";
@@ -40,6 +45,54 @@ export type RequestMessageCache = {
   stop(): Promise<void>;
 };
 
+type RequestMessageCacheSubscription = {
+  readonly done: Promise<ResultType<void, EventDeliveryDoneError>>;
+  stop(): Promise<ResultType<void, EventDeliveryStopFailed>>;
+};
+
+export class RequestMessageCacheRequestIdMissing extends TaggedError(
+  "RequestMessageCacheRequestIdMissing",
+)<{
+  readonly messageType: string;
+  readonly message: string;
+}> {}
+
+export class RequestMessageCacheProjectionInvalid extends TaggedError(
+  "RequestMessageCacheProjectionInvalid",
+)<{
+  readonly messageType: string;
+  readonly message: string;
+}> {}
+
+type RequestMessageCacheHandlerError =
+  | RequestMessageCacheRequestIdMissing
+  | RequestMessageCacheProjectionInvalid;
+
+export function requestMessageCacheDeliveryDisposition(
+  error: RequestMessageCacheHandlerError,
+): DeliveryDisposition {
+  switch (error._tag) {
+    case "RequestMessageCacheRequestIdMissing":
+      return "park-pending";
+    case "RequestMessageCacheProjectionInvalid":
+      return "dead-letter";
+  }
+}
+
+function adaptRequestMessageCacheStartResultToHost(
+  started: ResultType<RequestMessageCacheSubscription, EventDeliveryStartFailed>,
+): RequestMessageCacheSubscription {
+  if (started.status === "ok") return started.value;
+  throw started.error;
+}
+
+function adaptRequestMessageCacheStopResultToHost(
+  stopped: ResultType<void, EventDeliveryStopFailed | EventDeliveryDoneError>,
+): void {
+  if (stopped.status === "ok") return;
+  throw stopped.error;
+}
+
 const requestRawSchema = z
   .object({
     authenticatedActor: z
@@ -69,25 +122,39 @@ const requestRawSchema = z
 
 function resolveAuthenticatedOrigin(
   msg: Extract<LilacMessageForTopic<"cmd.request">, { type: "cmd.request.message" }>,
-): AuthenticatedRequestOrigin | undefined {
+): ResultType<AuthenticatedRequestOrigin | undefined, RequestMessageCacheProjectionInvalid> {
   const requestId = msg.headers?.request_id;
   const sessionId = msg.headers?.session_id;
   const platform = msg.headers?.request_client;
   if (!requestId || !sessionId || (platform !== "discord" && platform !== "github")) {
-    return undefined;
+    return Result.ok(undefined);
   }
 
-  const raw = requestRawSchema.safeParse(msg.data.raw);
+  const rawData = msg.data.raw;
+  const raw = requestRawSchema.safeParse(rawData);
+  const hasCacheProjection =
+    isRecord(rawData) &&
+    (Object.hasOwn(rawData, "authenticatedActor") ||
+      Object.hasOwn(rawData, "authenticatedOrigin") ||
+      Object.hasOwn(rawData, "github"));
+  if (!raw.success && hasCacheProjection) {
+    return Result.err(
+      new RequestMessageCacheProjectionInvalid({
+        messageType: msg.type,
+        message: "cmd.request.message contains invalid request cache authentication metadata",
+      }),
+    );
+  }
   const actor = raw.success ? raw.data.authenticatedActor : undefined;
   const authenticatedOrigin = raw.success ? raw.data.authenticatedOrigin : undefined;
-  if (actor && actor.platform !== platform) return undefined;
+  if (actor && actor.platform !== platform) return Result.ok(undefined);
   if (
     authenticatedOrigin &&
     (authenticatedOrigin.platform !== platform ||
       authenticatedOrigin.messageRef.platform !== platform ||
       authenticatedOrigin.messageRef.channelId !== sessionId)
   ) {
-    return undefined;
+    return Result.ok(undefined);
   }
 
   if (authenticatedOrigin) {
@@ -103,13 +170,13 @@ function resolveAuthenticatedOrigin(
             channelId: authenticatedOrigin.messageRef.channelId,
             messageId: authenticatedOrigin.messageRef.messageId,
           };
-    return {
+    return Result.ok({
       requestId,
       sessionId,
       platform,
       messageRef,
       actorUserId: authenticatedOrigin.userId,
-    };
+    });
   }
 
   if (platform === "discord") {
@@ -119,21 +186,21 @@ function resolveAuthenticatedOrigin(
         ? ({ platform, channelId: sessionId, messageId: parsed.messageId } satisfies MsgRef)
         : null;
     const actorUserId = actor?.userId ?? null;
-    if (!messageRef && !actorUserId) return undefined;
-    return { requestId, sessionId, platform, messageRef, actorUserId };
+    if (!messageRef && !actorUserId) return Result.ok(undefined);
+    return Result.ok({ requestId, sessionId, platform, messageRef, actorUserId });
   }
 
   const trigger = raw.success ? raw.data.github?.trigger : undefined;
-  if (!trigger) return undefined;
+  if (!trigger) return Result.ok(undefined);
   const messageId =
     trigger.kind === "comment" ? String(trigger.commentId) : String(trigger.issueNumber);
-  return {
+  return Result.ok({
     requestId,
     sessionId,
     platform,
     messageRef: { platform, channelId: sessionId, messageId },
     actorUserId: actor?.userId ?? null,
-  };
+  });
 }
 
 function consumerId(prefix: string): string {
@@ -229,38 +296,61 @@ export async function createRequestMessageCache(
     pruneMax();
   }
 
-  const sub = await bus.subscribeTopic(
-    "cmd.request",
-    {
-      mode: "fanout",
-      subscriptionId,
-      consumerId: consumerId(subscriptionId),
-      offset: { type: "now" },
-      batch: { maxWaitMs: 1000 },
-    },
-    async (msg: LilacMessageForTopic<"cmd.request">, ctx) => {
-      if (msg.type !== lilacEventTypes.CmdRequestMessage) {
-        await ctx.commit();
-        return;
-      }
+  function handleMessage(
+    msg: LilacMessageForTopic<"cmd.request">,
+  ): ResultType<void, RequestMessageCacheHandlerError> {
+    if (msg.type !== lilacEventTypes.CmdRequestMessage) return Result.ok(undefined);
 
-      const requestId = msg.headers?.request_id;
-      if (!requestId) {
-        // keep unacked to surface the bug
-        logger.error("request_message_cache.missing_request_id", {
+    const requestId = msg.headers?.request_id;
+    if (!requestId) {
+      logger.error("request_message_cache.missing_request_id", {
+        messageType: msg.type,
+      });
+      return Result.err(
+        new RequestMessageCacheRequestIdMissing({
           messageType: msg.type,
-        });
-        throw new Error("cmd.request.message missing headers.request_id");
-      }
+          message: "cmd.request.message missing headers.request_id",
+        }),
+      );
+    }
 
-      // Append new message batches for this request.
-      // cmd.request messages are often incremental (e.g. follow-ups), so overwrite semantics
-      // can hide earlier user attachments.
-      set(requestId, msg.data.messages, resolveAuthenticatedOrigin(msg));
+    // Append new message batches for this request. These messages are often incremental
+    // (for example, follow-ups), so overwrite semantics can hide earlier attachments.
+    const origin = resolveAuthenticatedOrigin(msg);
+    if (origin.status === "error") return Result.err(origin.error);
+    set(requestId, msg.data.messages, origin.value);
+    return Result.ok(undefined);
+  }
 
-      await ctx.commit();
-    },
-  );
+  async function startRequestMessageCacheResult(): Promise<
+    ResultType<RequestMessageCacheSubscription, EventDeliveryStartFailed>
+  > {
+    return bus.subscribeTopic(
+      "cmd.request",
+      {
+        mode: "fanout",
+        subscriptionId,
+        consumerId: consumerId(subscriptionId),
+        offset: { type: "now" },
+        batch: { maxWaitMs: 1000 },
+      },
+      async (msg): Promise<ResultType<void, RequestMessageCacheHandlerError>> => handleMessage(msg),
+      requestMessageCacheDeliveryDisposition,
+    );
+  }
+
+  const sub = adaptRequestMessageCacheStartResultToHost(await startRequestMessageCacheResult());
+
+  async function stopRequestMessageCacheResult(): Promise<
+    ResultType<void, EventDeliveryStopFailed | EventDeliveryDoneError>
+  > {
+    const stopped = await sub.stop();
+    if (stopped.status === "error") return Result.err(stopped.error);
+
+    const done = await sub.done;
+    if (done.status === "error") return Result.err(done.error);
+    return Result.ok(undefined);
+  }
 
   return {
     get: (requestId: string) => {
@@ -296,7 +386,7 @@ export async function createRequestMessageCache(
       return entry.origin;
     },
     stop: async () => {
-      await sub.stop();
+      adaptRequestMessageCacheStopResultToHost(await stopRequestMessageCacheResult());
       map.clear();
     },
   };

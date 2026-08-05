@@ -1,3 +1,4 @@
+import { Result, TaggedError, type Result as ResultType } from "better-result";
 import { z } from "zod";
 
 import { cloneDefaultWorkingIndicators } from "../working-indicators";
@@ -644,15 +645,34 @@ export const coreConfigInputSchemaV2 = z.object({
 
 export type ParsedCoreConfigV2 = z.infer<typeof coreConfigInputSchemaV2>;
 
+export class CoreConfigV2Invalid extends TaggedError("CoreConfigV2Invalid")<{
+  readonly cause: z.ZodError;
+  readonly message: string;
+}> {}
+
+export function decodeCoreConfigV2(
+  raw: unknown,
+): ResultType<ParsedCoreConfigV2, CoreConfigV2Invalid> {
+  const parsed = coreConfigInputSchemaV2.safeParse(raw);
+  return parsed.success
+    ? Result.ok(parsed.data)
+    : Result.err(
+        new CoreConfigV2Invalid({
+          cause: parsed.error,
+          message: parsed.error.issues.map((issue) => issue.message).join("; "),
+        }),
+      );
+}
+
 export function parseCoreConfigV2(raw: unknown): ParsedCoreConfigV2 {
   return coreConfigInputSchemaV2.parse(raw);
 }
 
-export function parseCoreConfigV2ToUniversal(
+function coreConfigV2ToUniversal(
+  parsed: ParsedCoreConfigV2,
   raw: unknown,
   options?: CoreConfigParseOptions,
 ): UniversalCoreConfig {
-  const parsed = parseCoreConfigV2(raw);
   if (options?.onUnknownKey) {
     for (const path of collectUnknownConfigKeyPaths(raw, parsed)) {
       options.onUnknownKey(path);
@@ -674,6 +694,24 @@ export function parseCoreConfigV2ToUniversal(
       systemPrompt: "",
     },
   };
+}
+
+export function decodeCoreConfigV2ToUniversal(
+  raw: unknown,
+  options?: CoreConfigParseOptions,
+): ResultType<UniversalCoreConfig, CoreConfigV2Invalid> {
+  const parsed = decodeCoreConfigV2(raw);
+  if (parsed.status === "error") return Result.err(parsed.error);
+  return Result.ok(coreConfigV2ToUniversal(parsed.value, raw, options));
+}
+
+export function parseCoreConfigV2ToUniversal(
+  raw: unknown,
+  options?: CoreConfigParseOptions,
+): UniversalCoreConfig {
+  const result = decodeCoreConfigV2ToUniversal(raw, options);
+  if (result.status === "error") throw result.error.cause;
+  return result.value;
 }
 
 export class V2CoreConfigParser implements ConfigParser {

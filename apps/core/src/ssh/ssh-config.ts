@@ -1,6 +1,9 @@
 import { homedir } from "node:os";
 import path from "node:path";
 
+import { isPanic, opaqueErrorCause, opaqueErrorMessage } from "@stanley2058/lilac-utils";
+import { Result, TaggedError, type Result as ResultType } from "better-result";
+
 /**
  * Shared SSH config helpers used by both:
  * - Level 2 tool server SSH tools (ssh.run/ssh.probe)
@@ -12,6 +15,45 @@ function stripComment(line: string): string {
   if (idx === -1) return line;
   return line.slice(0, idx);
 }
+
+export type ConfiguredSshHosts = {
+  readonly configPath: string;
+  readonly hosts: string[];
+  readonly exists: boolean;
+};
+
+export type SshConfigReadDependencies = {
+  readonly exists: (configPath: string) => Promise<boolean>;
+  readonly readText: (configPath: string) => Promise<string>;
+};
+
+const DEFAULT_SSH_CONFIG_READ_DEPENDENCIES: SshConfigReadDependencies = {
+  exists: (configPath) => Bun.file(configPath).exists(),
+  readText: (configPath) => Bun.file(configPath).text(),
+};
+
+export class SshConfigReadError extends TaggedError("SshConfigReadError")<{
+  readonly configPath: string;
+  readonly exists: boolean;
+  readonly cause: unknown;
+  readonly message: string;
+}> {}
+
+export class SshHostsMissingError extends TaggedError("SshHostsMissingError")<{
+  readonly configPath: string;
+  readonly message: string;
+}> {}
+
+export class SshHostUnknownError extends TaggedError("SshHostUnknownError")<{
+  readonly configPath: string;
+  readonly host: string;
+  readonly message: string;
+}> {}
+
+export type SshHostRequirementError =
+  | SshConfigReadError
+  | SshHostsMissingError
+  | SshHostUnknownError;
 
 export function resolveSshConfigPath(): string {
   const fromEnv = process.env.LILAC_SSH_CONFIG_PATH;
@@ -48,44 +90,81 @@ export function parseSshHostsFromConfigText(text: string): string[] {
   return hosts;
 }
 
-export async function readConfiguredSshHosts(): Promise<{
+export async function readConfiguredSshHostsResult(
+  dependencies: SshConfigReadDependencies = DEFAULT_SSH_CONFIG_READ_DEPENDENCIES,
+): Promise<ResultType<ConfiguredSshHosts, SshConfigReadError>> {
+  const configPath = resolveSshConfigPath();
+  let exists = false;
+  try {
+    exists = await dependencies.exists(configPath);
+    if (!exists) return Result.ok({ configPath, hosts: [], exists: false });
+    const text = await dependencies.readText(configPath);
+    return Result.ok({ configPath, hosts: parseSshHostsFromConfigText(text), exists: true });
+  } catch (caught) {
+    if (isPanic(caught)) throw caught;
+    const cause = opaqueErrorCause(caught, "Opaque SSH config read failure");
+    return Result.err(
+      new SshConfigReadError({
+        configPath,
+        exists,
+        cause,
+        message: opaqueErrorMessage(cause, "Failed to read SSH config"),
+      }),
+    );
+  }
+}
+
+export async function readConfiguredSshHosts(
+  dependencies: SshConfigReadDependencies = DEFAULT_SSH_CONFIG_READ_DEPENDENCIES,
+): Promise<{
   configPath: string;
   hosts: string[];
   exists: boolean;
   readError?: string;
 }> {
-  const configPath = resolveSshConfigPath();
-  const file = Bun.file(configPath);
-  const exists = await file.exists();
-  if (!exists) return { configPath, hosts: [], exists: false };
-
-  try {
-    const text = await file.text();
-    const hosts = parseSshHostsFromConfigText(text);
-    return { configPath, hosts, exists: true };
-  } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e);
-    return { configPath, hosts: [], exists: true, readError: msg };
-  }
+  const read = await readConfiguredSshHostsResult(dependencies);
+  if (read.status === "ok") return read.value;
+  return {
+    configPath: read.error.configPath,
+    hosts: [],
+    exists: read.error.exists,
+    readError: read.error.message,
+  };
 }
 
-export async function requireConfiguredSshHost(host: string): Promise<void> {
-  const configured = await readConfiguredSshHosts();
-  if (configured.readError) {
-    throw new Error(
-      `Failed to read SSH config at ${configured.configPath}: ${configured.readError}`,
+export async function requireConfiguredSshHostResult(
+  host: string,
+  dependencies: SshConfigReadDependencies = DEFAULT_SSH_CONFIG_READ_DEPENDENCIES,
+): Promise<ResultType<void, SshHostRequirementError>> {
+  const configured = await readConfiguredSshHostsResult(dependencies);
+  if (configured.status === "error") return configured;
+
+  if (configured.value.hosts.length === 0) {
+    return Result.err(
+      new SshHostsMissingError({
+        configPath: configured.value.configPath,
+        message: `No SSH hosts are configured. Add host aliases to ${configured.value.configPath} (and ensure known_hosts + keys are configured), then retry.`,
+      }),
     );
   }
 
-  if (configured.hosts.length === 0) {
-    throw new Error(
-      `No SSH hosts are configured. Add host aliases to ${configured.configPath} (and ensure known_hosts + keys are configured), then retry.`,
+  if (!configured.value.hosts.includes(host)) {
+    return Result.err(
+      new SshHostUnknownError({
+        configPath: configured.value.configPath,
+        host,
+        message: `Unknown SSH host alias '${host}'. Add a Host entry to ${configured.value.configPath} or use ssh.hosts to see configured aliases.`,
+      }),
     );
   }
+  return Result.ok(undefined);
+}
 
-  if (!configured.hosts.includes(host)) {
-    throw new Error(
-      `Unknown SSH host alias '${host}'. Add a Host entry to ${configured.configPath} or use ssh.hosts to see configured aliases.`,
-    );
-  }
+export async function requireConfiguredSshHost(
+  host: string,
+  dependencies: SshConfigReadDependencies = DEFAULT_SSH_CONFIG_READ_DEPENDENCIES,
+): Promise<void> {
+  const required = await requireConfiguredSshHostResult(host, dependencies);
+  if (required.status === "ok") return;
+  throw required.error;
 }

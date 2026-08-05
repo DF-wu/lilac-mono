@@ -1,7 +1,8 @@
 import path from "node:path";
 
-import { FileSystem, type FsBackend } from "@stanley2058/lilac-fs";
+import { expandTilde, FileSystem, type FsBackend } from "@stanley2058/lilac-fs";
 import {
+  adaptToolResultArtifactReadToUnavailablePolicy,
   TOOL_RESULT_URI_PREFIX,
   TOOL_RESULT_UNAVAILABLE_MESSAGE,
 } from "@stanley2058/lilac-tool-results";
@@ -9,7 +10,7 @@ import { tool, type ToolSet } from "ai";
 import { z } from "zod";
 
 import type { CodingToolArtifactIntegration } from "./artifact-integration";
-import { assertGuardrailBypassAllowed, assertLocalCwd } from "./guardrails";
+import { canonicalPathAllowed, assertGuardrailBypassAllowed, assertLocalCwd } from "./guardrails";
 import {
   createReadFileInstructionClaims,
   loadReadFileInstructions,
@@ -34,31 +35,82 @@ const ATTACHMENT_MIME_TYPES: ReadonlyMap<string, string> = new Map([
   [".webp", "image/webp"],
   [".pdf", "application/pdf"],
 ] as const);
-const readFileFailureSchema = z.object({ success: z.literal(false) }).passthrough();
 const searchFailureSchema = z.object({ error: z.string() }).passthrough();
 
-type ReadFileAttachmentOutput = {
-  success: true;
-  kind: "attachment";
-  resolvedPath: string;
-  fileHash: string;
-  filename: string;
-  mimeType: string;
-  bytes: number;
-  loadedInstructions?: readonly string[];
-  instructionsText?: string;
+const readFileStartSchema = z.discriminatedUnion("type", [
+  z.strictObject({ type: z.literal("offset"), offset: z.number() }),
+  z.strictObject({ type: z.literal("line"), line: z.number(), column: z.number().optional() }),
+]);
+const readFileInstructionsShape = {
+  loadedInstructions: z.array(z.string()).optional(),
+  instructionsText: z.string().optional(),
 };
-
-function isReadFileAttachmentOutput(output: unknown): output is ReadFileAttachmentOutput {
-  return (
-    typeof output === "object" &&
-    output !== null &&
-    "success" in output &&
-    output.success === true &&
-    "kind" in output &&
-    output.kind === "attachment"
-  );
-}
+const readFileSuccessShape = {
+  success: z.literal(true),
+  resolvedPath: z.string(),
+  fileHash: z.string(),
+  startLine: z.number(),
+  endLine: z.number(),
+  totalLines: z.number(),
+  hasMoreLines: z.boolean(),
+  truncatedByChars: z.boolean(),
+  nextStart: readFileStartSchema.optional(),
+  warnings: z
+    .array(
+      z.strictObject({
+        code: z.literal("LINE_TOO_LONG_FOR_HASHLINE"),
+        message: z.string(),
+        line: z.number(),
+        maxLength: z.number(),
+        actualLength: z.number(),
+      }),
+    )
+    .optional(),
+  degradedFromHashline: z.boolean().optional(),
+  ...readFileInstructionsShape,
+};
+const readFileCallbackOutputSchema = z.union([
+  z.strictObject({
+    success: z.literal(false),
+    resolvedPath: z.string(),
+    error: z.strictObject({
+      code: z.enum(["NOT_FOUND", "PERMISSION", "UNKNOWN"]),
+      message: z.string(),
+    }),
+  }),
+  z.strictObject({ ...readFileSuccessShape, format: z.literal("raw"), content: z.string() }),
+  z.strictObject({
+    ...readFileSuccessShape,
+    format: z.literal("numbered"),
+    numberedContent: z.string(),
+  }),
+  z.strictObject({
+    ...readFileSuccessShape,
+    format: z.literal("hashline"),
+    hashlineContent: z.string(),
+  }),
+  z.strictObject({
+    success: z.literal(true),
+    kind: z.literal("artifact"),
+    resolvedPath: z.string(),
+    content: z.string(),
+    startOffset: z.number(),
+    endOffset: z.number(),
+    totalCharacters: z.number(),
+    nextStart: readFileStartSchema.optional(),
+    hasMore: z.boolean(),
+  }),
+  z.strictObject({
+    success: z.literal(true),
+    kind: z.literal("attachment"),
+    resolvedPath: z.string(),
+    fileHash: z.string(),
+    filename: z.string(),
+    mimeType: z.enum(["image/png", "image/jpeg", "image/gif", "image/webp", "application/pdf"]),
+    bytes: z.number(),
+    ...readFileInstructionsShape,
+  }),
+]);
 
 function inlineMediaLimitMessage(filename: string, mimeType: string, maxBytes: number): string {
   const guidance = mimeType.startsWith("image/")
@@ -84,6 +136,30 @@ function detectAttachmentMimeType(bytes: Uint8Array): string | undefined {
     return "image/webp";
   if (startsWith([0x25, 0x50, 0x44, 0x46, 0x2d])) return "application/pdf";
   return undefined;
+}
+
+function resolveLocalOperationPath(inputPath: string, cwd: string): string {
+  const expanded = expandTilde(inputPath);
+  return path.isAbsolute(expanded)
+    ? path.resolve(expanded)
+    : path.resolve(expandTilde(cwd), expanded);
+}
+
+async function localFilesystemPathAllowed(params: {
+  inputPath: string;
+  cwd: string;
+  denyPaths: readonly string[];
+  operation: string;
+  dangerouslyAllow?: boolean;
+}) {
+  const resolvedPath = resolveLocalOperationPath(params.inputPath, params.cwd);
+  const allowed = await canonicalPathAllowed({
+    targetPath: resolvedPath,
+    denyPaths: params.denyPaths,
+    operation: params.operation,
+    dangerouslyAllow: params.dangerouslyAllow,
+  });
+  return { allowed, resolvedPath };
 }
 
 export function createFilesystemTools(params: {
@@ -124,15 +200,18 @@ export function createFilesystemTools(params: {
       execute: async ({ cwd: operationCwd, ...input }, options) => {
         if (input.path.startsWith(TOOL_RESULT_URI_PREFIX)) {
           const artifact = artifactIntegration
-            ? await artifactIntegration.artifacts.readWindow(
-                input.path,
-                artifactIntegration.scopeId,
-                {
-                  start: input.start ?? { type: "offset", offset: 0 },
-                  maxCharacters: Math.max(1, input.maxCharacters ?? 10_000),
-                  maxLines: Math.max(1, input.maxLines ?? 2_000),
-                  maxOutputBytes,
-                },
+            ? await adaptToolResultArtifactReadToUnavailablePolicy(
+                artifactIntegration.artifacts,
+                await artifactIntegration.artifacts.readWindow(
+                  input.path,
+                  artifactIntegration.scopeId,
+                  {
+                    start: input.start ?? { type: "offset", offset: 0 },
+                    maxCharacters: Math.max(1, input.maxCharacters ?? 10_000),
+                    maxLines: Math.max(1, input.maxLines ?? 2_000),
+                    maxOutputBytes,
+                  },
+                ),
               )
             : { ok: false as const };
           if (!artifact.ok) {
@@ -160,6 +239,23 @@ export function createFilesystemTools(params: {
         if (operationCwd) assertLocalCwd(operationCwd);
         assertGuardrailBypassAllowed(input.dangerouslyAllow, allowGuardrailBypass);
         const effectiveCwd = operationCwd ?? cwd;
+        const guardedPath = await localFilesystemPathAllowed({
+          inputPath: input.path,
+          cwd: effectiveCwd,
+          denyPaths: denyPaths ?? [],
+          operation: "read_file",
+          dangerouslyAllow: input.dangerouslyAllow,
+        });
+        if (guardedPath.allowed.status === "error") {
+          return {
+            success: false as const,
+            resolvedPath: guardedPath.resolvedPath,
+            error: {
+              code: "PERMISSION" as const,
+              message: guardedPath.allowed.error.message,
+            },
+          };
+        }
         const expectedMimeType = readFileDirectAttachmentSupported
           ? ATTACHMENT_MIME_TYPES.get(path.extname(input.path).toLowerCase())
           : undefined;
@@ -255,33 +351,37 @@ export function createFilesystemTools(params: {
         };
       },
       toModelOutput: ({ toolCallId, output }) => {
-        if (readFileFailureSchema.safeParse(output).success) {
+        const decoded = readFileCallbackOutputSchema.safeParse(output);
+        if (!decoded.success) return { type: "json", value: output };
+        if (!decoded.data.success) {
           return { type: "error-json", value: output };
         }
-        if (!isReadFileAttachmentOutput(output)) return { type: "json", value: output };
+        if (!("kind" in decoded.data) || decoded.data.kind !== "attachment") {
+          return { type: "json", value: output };
+        }
 
         const bytes = binaryCacheByToolCallId.get(toolCallId);
         binaryCacheByToolCallId.delete(toolCallId);
         if (bytes === undefined) {
           return {
             type: "error-text",
-            value: `Failed to read attachment bytes for '${output.filename}'.`,
+            value: `Failed to read attachment bytes for '${decoded.data.filename}'.`,
           };
         }
 
-        const instructions = output.instructionsText?.trim();
+        const instructions = decoded.data.instructionsText?.trim();
         return {
           type: "content",
           value: [
             {
               type: "text",
-              text: `Attached file from read_file: ${output.filename} (${output.mimeType}, ${output.bytes} bytes).`,
+              text: `Attached file from read_file: ${decoded.data.filename} (${decoded.data.mimeType}, ${decoded.data.bytes} bytes).`,
             },
             ...(instructions ? [{ type: "text" as const, text: instructions }] : []),
             {
               type: "file",
-              mediaType: output.mimeType,
-              filename: output.filename,
+              mediaType: decoded.data.mimeType,
+              filename: decoded.data.filename,
               data: { type: "data", data: bytes.toString("base64") },
             },
           ],
@@ -291,9 +391,32 @@ export function createFilesystemTools(params: {
     glob: tool({
       description: "Match local filesystem paths with include and negated glob patterns.",
       inputSchema: globInputSchema,
-      execute: ({ cwd: operationCwd, ...input }) => {
+      execute: async ({ cwd: operationCwd, ...input }) => {
         if (operationCwd) assertLocalCwd(operationCwd);
         assertGuardrailBypassAllowed(input.dangerouslyAllow, allowGuardrailBypass);
+        const effectiveCwd = operationCwd ?? cwd;
+        const guardedPath = await localFilesystemPathAllowed({
+          inputPath: effectiveCwd,
+          cwd: effectiveCwd,
+          denyPaths: denyPaths ?? [],
+          operation: "glob",
+          dangerouslyAllow: input.dangerouslyAllow,
+        });
+        if (guardedPath.allowed.status === "error") {
+          return input.mode === "detailed"
+            ? {
+                mode: "detailed" as const,
+                truncated: false,
+                entries: [],
+                error: guardedPath.allowed.error.message,
+              }
+            : {
+                mode: "default" as const,
+                truncated: false,
+                paths: [],
+                error: guardedPath.allowed.error.message,
+              };
+        }
         return fileSystem.glob({ ...input, baseDir: operationCwd ?? cwd });
       },
       toModelOutput: ({ output }) =>
@@ -304,9 +427,25 @@ export function createFilesystemTools(params: {
     grep: tool({
       description: "Search local file contents, using literal matching unless regex=true.",
       inputSchema: grepInputSchema,
-      execute: ({ cwd: operationCwd, ...input }) => {
+      execute: async ({ cwd: operationCwd, ...input }) => {
         if (operationCwd) assertLocalCwd(operationCwd);
         assertGuardrailBypassAllowed(input.dangerouslyAllow, allowGuardrailBypass);
+        const effectiveCwd = operationCwd ?? cwd;
+        const guardedPath = await localFilesystemPathAllowed({
+          inputPath: effectiveCwd,
+          cwd: effectiveCwd,
+          denyPaths: denyPaths ?? [],
+          operation: "grep",
+          dangerouslyAllow: input.dangerouslyAllow,
+        });
+        if (guardedPath.allowed.status === "error") {
+          return {
+            mode: input.mode ?? "default",
+            truncated: false,
+            results: [],
+            error: guardedPath.allowed.error.message,
+          };
+        }
         return fileSystem.grep({ ...input, baseDir: operationCwd ?? cwd });
       },
       toModelOutput: ({ output }) =>
@@ -318,9 +457,27 @@ export function createFilesystemTools(params: {
       description:
         "Replace a snippet in an existing local file. The file must first be read with read_file; by default oldText must match exactly once.",
       inputSchema: editFileInputSchema,
-      execute: ({ cwd: operationCwd, ...input }) => {
+      execute: async ({ cwd: operationCwd, ...input }) => {
         if (operationCwd) assertLocalCwd(operationCwd);
         assertGuardrailBypassAllowed(input.dangerouslyAllow, allowGuardrailBypass);
+        const effectiveCwd = operationCwd ?? cwd;
+        const guardedPath = await localFilesystemPathAllowed({
+          inputPath: input.path,
+          cwd: effectiveCwd,
+          denyPaths: denyPaths ?? [],
+          operation: "edit_file",
+          dangerouslyAllow: input.dangerouslyAllow,
+        });
+        if (guardedPath.allowed.status === "error") {
+          return {
+            success: false as const,
+            resolvedPath: guardedPath.resolvedPath,
+            error: {
+              code: "PERMISSION" as const,
+              message: guardedPath.allowed.error.message,
+            },
+          };
+        }
         const occurrence = input.replaceAll ? "all" : "first";
         const expectedMatches = input.expectedMatches ?? (input.replaceAll ? "any" : 1);
         return fileSystem.editFile(
@@ -349,9 +506,26 @@ export function createFilesystemTools(params: {
     tools.fuzzy_search = tool({
       description: "Fuzzy-ranked local filename and path search powered by FFF.",
       inputSchema: fuzzySearchInputSchema,
-      execute: ({ cwd: operationCwd, ...input }) => {
+      execute: async ({ cwd: operationCwd, ...input }) => {
         if (operationCwd) assertLocalCwd(operationCwd);
         assertGuardrailBypassAllowed(input.dangerouslyAllow, allowGuardrailBypass);
+        const effectiveCwd = operationCwd ?? cwd;
+        const guardedPath = await localFilesystemPathAllowed({
+          inputPath: effectiveCwd,
+          cwd: effectiveCwd,
+          denyPaths: denyPaths ?? [],
+          operation: "fuzzy_search",
+          dangerouslyAllow: input.dangerouslyAllow,
+        });
+        if (guardedPath.allowed.status === "error") {
+          return {
+            results: [],
+            totalMatched: 0,
+            totalFiles: 0,
+            truncated: false as const,
+            error: guardedPath.allowed.error.message,
+          };
+        }
         return fileSystem.fuzzySearchFiles({ ...input, baseDir: operationCwd ?? cwd });
       },
       toModelOutput: ({ output }) =>

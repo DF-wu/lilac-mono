@@ -1,10 +1,14 @@
 import { Buffer } from "node:buffer";
 
 import type { UserContent } from "ai";
+import type { Result as ResultType } from "better-result";
 import { fileTypeFromBuffer } from "file-type";
 
 import { inferMimeTypeFromFilename } from "../../../shared/attachment-utils";
-import type { CoreOwnedBlobReference } from "../../../transcript/transcript-store";
+import type {
+  CoreOwnedBlobIntegrityError,
+  CoreOwnedBlobReference,
+} from "../../../transcript/transcript-store";
 
 import type { DiscordAttachmentMeta } from "./types";
 
@@ -21,7 +25,8 @@ type DiscordAttachmentState = {
     bytes: Uint8Array;
     mediaType: string;
     filename: string;
-  }) => CoreOwnedBlobReference;
+  }) => ResultType<CoreOwnedBlobReference, CoreOwnedBlobIntegrityError>;
+  ownershipError: CoreOwnedBlobIntegrityError | null;
   ownedBlobs: Map<string, CoreOwnedBlobReference>;
   currentBlobs: Map<string, CoreOwnedBlobReference>;
 };
@@ -33,6 +38,7 @@ export function createDiscordAttachmentState(input?: {
     downloadedTotalBytes: 0,
     cache: new Map(),
     ownBlob: input?.ownBlob,
+    ownershipError: null,
     ownedBlobs: new Map(),
     currentBlobs: new Map(),
   };
@@ -50,6 +56,12 @@ export function takeDiscordCurrentBlobReferences(
   const references = [...state.currentBlobs.values()];
   state.currentBlobs.clear();
   return references;
+}
+
+export function getDiscordAttachmentOwnershipError(
+  state: DiscordAttachmentState,
+): CoreOwnedBlobIntegrityError | null {
+  return state.ownershipError;
 }
 
 function normalizeMimeType(mimeType: string | undefined): string | undefined {
@@ -182,8 +194,12 @@ function ownAttachmentBytes(input: {
     mediaType: input.mediaType,
     filename: input.filename ?? input.url.pathname.split("/").pop() ?? "attachment",
   });
-  input.state.ownedBlobs.set(reference.sha256, reference);
-  input.state.currentBlobs.set(reference.sha256, reference);
+  if (reference.status === "error") {
+    input.state.ownershipError ??= reference.error;
+    return;
+  }
+  input.state.ownedBlobs.set(reference.value.sha256, reference.value);
+  input.state.currentBlobs.set(reference.value.sha256, reference.value);
 }
 
 async function resolveOwnedFileData(input: {

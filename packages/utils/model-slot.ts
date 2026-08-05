@@ -1,4 +1,5 @@
 import type { LanguageModel } from "ai";
+import { Result, TaggedError, type Result as ResultType } from "better-result";
 
 import { providers, type Providers } from "./model-provider";
 import { CODEX_BASE_INSTRUCTIONS } from "./codex-instructions";
@@ -11,7 +12,7 @@ import type {
   ModelReasoningEffort,
 } from "./core-config";
 import { createLogger } from "./logging";
-import { parseModelSpecifier } from "./model-capability";
+import { parseModelSpecifierResult } from "./model-capability";
 import {
   formatModelProviderOptionWarning,
   normalizeConfiguredModelProviderOptions,
@@ -53,6 +54,20 @@ export type ResolvedModelPlan = {
   head: ResolvedModelRef;
   fallbacks: readonly ResolvedModelRef[];
 };
+
+export class ModelResolutionFailed extends TaggedError("ModelResolutionFailed")<{
+  readonly issue:
+    | "invalid-spec"
+    | "durable-mismatch"
+    | "unsupported-compaction-provider"
+    | "unknown-alias"
+    | "invalid-alias-target"
+    | "unknown-provider"
+    | "provider-not-configured"
+    | "invalid-server-compaction-option";
+  readonly source: string;
+  readonly message: string;
+}> {}
 
 export type DurableJsonValue =
   | null
@@ -133,27 +148,52 @@ export function toDurableResolvedModelPlan(
   };
 }
 
-export function fromDurableResolvedModelRequest(
+export function fromDurableResolvedModelRequestResult(
   request: DurableResolvedModelRequest,
-): ResolvedModelRef {
-  const parsed = parseModelSpecifier(request.spec);
-  if (parsed.provider !== request.provider || parsed.model !== request.modelId) {
-    throw new Error("Durable model request does not match its canonical model spec");
+): ResultType<ResolvedModelRef, ModelResolutionFailed> {
+  const parsed = parseModelSpecifierResult(request.spec);
+  if (parsed.status === "error") {
+    return Result.err(
+      new ModelResolutionFailed({
+        issue: "invalid-spec",
+        source: "durable model request",
+        message: parsed.error.message,
+      }),
+    );
+  }
+  if (parsed.value.provider !== request.provider || parsed.value.model !== request.modelId) {
+    return Result.err(
+      new ModelResolutionFailed({
+        issue: "durable-mismatch",
+        source: "durable model request",
+        message: "Durable model request does not match its canonical model spec",
+      }),
+    );
   }
   if (
     request.openaiServerCompaction &&
     request.provider !== "openai" &&
     request.provider !== "codex"
   ) {
-    throw new Error(
-      "Durable OpenAI server compaction is supported only by openai and codex providers",
+    return Result.err(
+      new ModelResolutionFailed({
+        issue: "unsupported-compaction-provider",
+        source: "durable model request",
+        message: "Durable OpenAI server compaction is supported only by openai and codex providers",
+      }),
     );
   }
   const provider = providers[request.provider as Providers];
   if (typeof provider !== "function") {
-    throw new Error(`Provider '${request.provider}' is not configured for durable dispatch`);
+    return Result.err(
+      new ModelResolutionFailed({
+        issue: "provider-not-configured",
+        source: "durable model request",
+        message: `Provider '${request.provider}' is not configured for durable dispatch`,
+      }),
+    );
   }
-  return {
+  return Result.ok({
     ...(request.alias ? { alias: request.alias } : {}),
     spec: request.spec,
     provider: request.provider,
@@ -165,16 +205,37 @@ export function fromDurableResolvedModelRequest(
     ...(request.openaiServerCompaction ? { openaiServerCompaction: true } : {}),
     ...(request.anthropicPromptCache ? { anthropicPromptCache: true } : {}),
     reasoningDisplay: request.reasoningDisplay,
-  };
+  });
+}
+
+export function fromDurableResolvedModelRequest(
+  request: DurableResolvedModelRequest,
+): ResolvedModelRef {
+  const result = fromDurableResolvedModelRequestResult(request);
+  if (result.status === "error") throw new Error(result.error.message);
+  return result.value;
 }
 
 export function fromDurableResolvedModelPlan(
   request: DurableResolvedModelRequest,
 ): ResolvedModelPlan {
-  return {
-    head: fromDurableResolvedModelRequest(request),
-    fallbacks: (request.fallbacks ?? []).map(fromDurableResolvedModelRequest),
-  };
+  const result = fromDurableResolvedModelPlanResult(request);
+  if (result.status === "error") throw new Error(result.error.message);
+  return result.value;
+}
+
+export function fromDurableResolvedModelPlanResult(
+  request: DurableResolvedModelRequest,
+): ResultType<ResolvedModelPlan, ModelResolutionFailed> {
+  const head = fromDurableResolvedModelRequestResult(request);
+  if (head.status === "error") return Result.err(head.error);
+  const fallbacks: ResolvedModelRef[] = [];
+  for (const fallback of request.fallbacks ?? []) {
+    const resolved = fromDurableResolvedModelRequestResult(fallback);
+    if (resolved.status === "error") return Result.err(resolved.error);
+    fallbacks.push(resolved.value);
+  }
+  return Result.ok({ head: head.value, fallbacks });
 }
 
 function cloneJson(value: JSONValue): JSONValue {
@@ -265,12 +326,15 @@ function withOpenAIParallelToolCallsDefault(
   };
 }
 
-function buildProviderOptions(params: { provider: string; options?: JSONObject }): {
-  providerOptions?: { [x: string]: JSONObject };
-  responseCommentary?: boolean;
-  openaiServerCompaction?: true;
-  anthropicPromptCache?: boolean;
-} {
+function buildProviderOptionsResult(params: { provider: string; options?: JSONObject }): ResultType<
+  {
+    providerOptions?: { [x: string]: JSONObject };
+    responseCommentary?: boolean;
+    openaiServerCompaction?: true;
+    anthropicPromptCache?: boolean;
+  },
+  ModelResolutionFailed
+> {
   const options = params.options ?? {};
 
   const {
@@ -297,11 +361,22 @@ function buildProviderOptions(params: { provider: string; options?: JSONObject }
   let openaiServerCompaction: true | undefined;
   if (Object.hasOwn(options, "openai_server_compaction")) {
     if (openai_server_compaction !== true) {
-      throw new Error("Model option 'openai_server_compaction' must be literal boolean true");
+      return Result.err(
+        new ModelResolutionFailed({
+          issue: "invalid-server-compaction-option",
+          source: "model options",
+          message: "Model option 'openai_server_compaction' must be literal boolean true",
+        }),
+      );
     }
     if (params.provider !== "openai" && params.provider !== "codex") {
-      throw new Error(
-        "Model option 'openai_server_compaction' is supported only by openai and codex providers",
+      return Result.err(
+        new ModelResolutionFailed({
+          issue: "unsupported-compaction-provider",
+          source: "model options",
+          message:
+            "Model option 'openai_server_compaction' is supported only by openai and codex providers",
+        }),
       );
     }
     openaiServerCompaction = true;
@@ -314,12 +389,12 @@ function buildProviderOptions(params: { provider: string; options?: JSONObject }
 
   if (provider !== "codex") {
     // Non-codex: codex_instructions is ignored; also not forwarded.
-    return {
+    return Result.ok({
       providerOptions: withOpenAIParallelToolCallsDefault(provider, providerOptions),
       responseCommentary,
       openaiServerCompaction,
       anthropicPromptCache,
-    };
+    });
   }
 
   // Codex: ensure OpenAI namespace exists + has instructions.
@@ -339,7 +414,7 @@ function buildProviderOptions(params: { provider: string; options?: JSONObject }
     store: false,
   } satisfies JSONObject;
 
-  return {
+  return Result.ok({
     providerOptions: withOpenAIParallelToolCallsDefault(provider, {
       ...providerOptions,
       [openaiKey]: nextOpenAI,
@@ -347,21 +422,24 @@ function buildProviderOptions(params: { provider: string; options?: JSONObject }
     responseCommentary,
     openaiServerCompaction,
     anthropicPromptCache,
-  };
+  });
 }
 
-function resolveModelSpecFromRaw(
+function resolveModelSpecFromRawResult(
   cfg: CoreConfig,
   raw: string,
   source: string,
-): {
-  spec: string;
-  alias?: string;
-  presetOptions?: JSONObject;
-  presetReasoning?: ModelReasoningEffort;
-} {
+): ResultType<
+  {
+    spec: string;
+    alias?: string;
+    presetOptions?: JSONObject;
+    presetReasoning?: ModelReasoningEffort;
+  },
+  ModelResolutionFailed
+> {
   if (raw.includes("/")) {
-    return { spec: raw };
+    return Result.ok({ spec: raw });
   }
 
   const alias = raw;
@@ -372,73 +450,107 @@ function resolveModelSpecFromRaw(
       available.length > 0
         ? ` Available aliases (sample): ${available.join(", ")}`
         : " No aliases are configured under models.def.";
-    throw new Error(`Unknown model alias '${alias}' (${source}).${hint}`);
-  }
-
-  if (!preset.model.includes("/")) {
-    throw new Error(
-      `Invalid models.def.${alias}.model: expected provider/model format (got '${preset.model}')`,
+    return Result.err(
+      new ModelResolutionFailed({
+        issue: "unknown-alias",
+        source,
+        message: `Unknown model alias '${alias}' (${source}).${hint}`,
+      }),
     );
   }
 
-  return {
+  if (!preset.model.includes("/")) {
+    return Result.err(
+      new ModelResolutionFailed({
+        issue: "invalid-alias-target",
+        source,
+        message: `Invalid models.def.${alias}.model: expected provider/model format (got '${preset.model}')`,
+      }),
+    );
+  }
+
+  return Result.ok({
     spec: preset.model,
     alias,
     presetOptions: preset.options,
     presetReasoning: preset.reasoning,
-  };
+  });
 }
 
-function resolveSlotSpec(
+function resolveSlotSpecResult(
   cfg: CoreConfig,
   slot: ModelSlot,
-): {
-  spec: string;
-  alias?: string;
-  presetOptions?: JSONObject;
-  presetReasoning?: ModelReasoningEffort;
-  slotOptions?: JSONObject;
-  slotReasoning?: ModelReasoningEffort;
-} {
+): ResultType<
+  {
+    spec: string;
+    alias?: string;
+    presetOptions?: JSONObject;
+    presetReasoning?: ModelReasoningEffort;
+    slotOptions?: JSONObject;
+    slotReasoning?: ModelReasoningEffort;
+  },
+  ModelResolutionFailed
+> {
   const slotCfg = cfg.models[slot];
-  const base = resolveModelSpecFromRaw(cfg, slotCfg.model, `models.${slot}.model`);
+  const baseResult = resolveModelSpecFromRawResult(cfg, slotCfg.model, `models.${slot}.model`);
+  if (baseResult.status === "error") return Result.err(baseResult.error);
+  const base = baseResult.value;
 
-  return {
+  return Result.ok({
     spec: base.spec,
     alias: base.alias,
     presetOptions: base.presetOptions,
     presetReasoning: base.presetReasoning,
     slotOptions: slotCfg.options,
     slotReasoning: slotCfg.reasoning,
-  };
+  });
 }
 
-function resolveModel(params: {
+function resolveModelResult(params: {
   source: string;
   spec: string;
   alias?: string;
   options?: JSONObject;
   reasoning?: ModelReasoningEffort;
-}): ResolvedModelRef {
-  const parsed = parseModelSpecifier(params.spec);
-  const provider = parsed.provider;
-  const modelId = parsed.model;
+}): ResultType<ResolvedModelRef, ModelResolutionFailed> {
+  const parsed = parseModelSpecifierResult(params.spec);
+  if (parsed.status === "error") {
+    return Result.err(
+      new ModelResolutionFailed({
+        issue: "invalid-spec",
+        source: params.source,
+        message: parsed.error.message,
+      }),
+    );
+  }
+  const provider = parsed.value.provider;
+  const modelId = parsed.value.model;
+  const builtOptions = buildProviderOptionsResult({
+    provider,
+    options: params.options,
+  });
+  if (builtOptions.status === "error") return Result.err(builtOptions.error);
   const { providerOptions, responseCommentary, openaiServerCompaction, anthropicPromptCache } =
-    buildProviderOptions({
-      provider,
-      options: params.options,
-    });
+    builtOptions.value;
 
   const p = providers[provider as Providers];
   const hasProvider = Object.prototype.hasOwnProperty.call(providers, provider);
   if (!hasProvider) {
-    throw new Error(
-      `Unknown provider '${provider}' (${params.source}='${params.alias ?? params.spec}')`,
+    return Result.err(
+      new ModelResolutionFailed({
+        issue: "unknown-provider",
+        source: params.source,
+        message: `Unknown provider '${provider}' (${params.source}='${params.alias ?? params.spec}')`,
+      }),
     );
   }
   if (typeof p !== "function") {
-    throw new Error(
-      `Provider '${provider}' is not configured (${params.source}='${params.alias ?? params.spec}')`,
+    return Result.err(
+      new ModelResolutionFailed({
+        issue: "provider-not-configured",
+        source: params.source,
+        message: `Provider '${provider}' is not configured (${params.source}='${params.alias ?? params.spec}')`,
+      }),
     );
   }
 
@@ -450,7 +562,7 @@ function resolveModel(params: {
     logger.warn(formatModelProviderOptionWarning(warning, params.source));
   }
 
-  return {
+  return Result.ok({
     alias: params.alias,
     spec: params.spec,
     provider,
@@ -461,7 +573,25 @@ function resolveModel(params: {
     responseCommentary,
     openaiServerCompaction,
     anthropicPromptCache,
-  };
+  });
+}
+
+export function resolveModelRefResult(
+  cfg: CoreConfig,
+  ref: ConfiguredModelRef,
+  source: string,
+): ResultType<ResolvedModelRef, ModelResolutionFailed> {
+  const base = resolveModelSpecFromRawResult(cfg, ref.model, source);
+  if (base.status === "error") return Result.err(base.error);
+  const mergedOptions = deepMergeObjects(base.value.presetOptions, ref.options);
+  const reasoning = ref.reasoning ?? base.value.presetReasoning;
+  return resolveModelResult({
+    source,
+    spec: base.value.spec,
+    alias: base.value.alias,
+    options: mergedOptions,
+    reasoning,
+  });
 }
 
 export function resolveModelRef(
@@ -469,16 +599,9 @@ export function resolveModelRef(
   ref: ConfiguredModelRef,
   source: string,
 ): ResolvedModelRef {
-  const base = resolveModelSpecFromRaw(cfg, ref.model, source);
-  const mergedOptions = deepMergeObjects(base.presetOptions, ref.options);
-  const reasoning = ref.reasoning ?? base.presetReasoning;
-  return resolveModel({
-    source,
-    spec: base.spec,
-    alias: base.alias,
-    options: mergedOptions,
-    reasoning,
-  });
+  const result = resolveModelRefResult(cfg, ref, source);
+  if (result.status === "error") throw new Error(result.error.message);
+  return result.value;
 }
 
 export function resolveModelChain(
@@ -487,14 +610,66 @@ export function resolveModelChain(
   source: string,
   reasoningOverride?: ModelReasoningEffort,
 ): ResolvedModelRef[] {
-  return entries.map((entry, index) => {
+  const result = resolveModelChainResult(cfg, entries, source, reasoningOverride);
+  if (result.status === "error") throw new Error(result.error.message);
+  return result.value;
+}
+
+export function resolveModelChainResult(
+  cfg: CoreConfig,
+  entries: readonly ConfiguredModelChainEntry[],
+  source: string,
+  reasoningOverride?: ModelReasoningEffort,
+): ResultType<ResolvedModelRef[], ModelResolutionFailed> {
+  const resolved: ResolvedModelRef[] = [];
+  for (const [index, entry] of entries.entries()) {
     const ref = typeof entry === "string" ? { model: entry } : entry;
-    return resolveModelRef(
+    const model = resolveModelRefResult(
       cfg,
       reasoningOverride === undefined ? ref : { ...ref, reasoning: reasoningOverride },
       `${source}[${index}]`,
     );
-  });
+    if (model.status === "error") return Result.err(model.error);
+    resolved.push(model.value);
+  }
+  return Result.ok(resolved);
+}
+
+export function resolveModelPlanResult(
+  cfg: CoreConfig,
+  params: {
+    head: ConfiguredModelRef;
+    fallback?: readonly ConfiguredModelChainEntry[];
+    headSource: string;
+    fallbackSource: string;
+    reasoningOverride?: ModelReasoningEffort;
+  },
+): ResultType<ResolvedModelPlan, ModelResolutionFailed> {
+  const aliasFallback = params.head.model.includes("/")
+    ? undefined
+    : cfg.models.def[params.head.model]?.fallback;
+  const fallback = params.fallback ?? aliasFallback ?? [];
+  const fallbackSource =
+    params.fallback === undefined && aliasFallback !== undefined
+      ? `models.def.${params.head.model}.fallback`
+      : params.fallbackSource;
+  const head = resolveModelRefResult(
+    cfg,
+    params.reasoningOverride === undefined
+      ? params.head
+      : { ...params.head, reasoning: params.reasoningOverride },
+    params.headSource,
+  );
+  if (head.status === "error") return Result.err(head.error);
+  const fallbacks = resolveModelChainResult(
+    cfg,
+    fallback,
+    fallbackSource,
+    params.reasoningOverride,
+  );
+  if (fallbacks.status === "error") return Result.err(fallbacks.error);
+
+  return Result.ok({ head: head.value, fallbacks: fallbacks.value });
 }
 
 export function resolveModelPlan(
@@ -507,26 +682,9 @@ export function resolveModelPlan(
     reasoningOverride?: ModelReasoningEffort;
   },
 ): ResolvedModelPlan {
-  const aliasFallback = params.head.model.includes("/")
-    ? undefined
-    : cfg.models.def[params.head.model]?.fallback;
-  const fallback = params.fallback ?? aliasFallback ?? [];
-  const fallbackSource =
-    params.fallback === undefined && aliasFallback !== undefined
-      ? `models.def.${params.head.model}.fallback`
-      : params.fallbackSource;
-  const head = resolveModelRef(
-    cfg,
-    params.reasoningOverride === undefined
-      ? params.head
-      : { ...params.head, reasoning: params.reasoningOverride },
-    params.headSource,
-  );
-
-  return {
-    head,
-    fallbacks: resolveModelChain(cfg, fallback, fallbackSource, params.reasoningOverride),
-  };
+  const result = resolveModelPlanResult(cfg, params);
+  if (result.status === "error") throw new Error(result.error.message);
+  return result.value;
 }
 
 export function withModelPlanReasoning(
@@ -539,23 +697,50 @@ export function withModelPlanReasoning(
   };
 }
 
-export function resolveModelSlot(cfg: CoreConfig, slot: ModelSlot): ResolvedModelSlot {
+export function resolveModelSlotResult(
+  cfg: CoreConfig,
+  slot: ModelSlot,
+): ResultType<ResolvedModelSlot, ModelResolutionFailed> {
+  const slotSpec = resolveSlotSpecResult(cfg, slot);
+  if (slotSpec.status === "error") return Result.err(slotSpec.error);
   const { spec, alias, presetOptions, presetReasoning, slotOptions, slotReasoning } =
-    resolveSlotSpec(cfg, slot);
+    slotSpec.value;
   const mergedOptions = deepMergeObjects(presetOptions, slotOptions);
   const reasoning = slotReasoning ?? presetReasoning;
-  const resolved = resolveModel({
+  const resolved = resolveModelResult({
     source: `models.${slot}.model`,
     spec,
     alias,
     options: mergedOptions,
     reasoning,
   });
+  if (resolved.status === "error") return Result.err(resolved.error);
 
-  return {
+  return Result.ok({
     slot,
-    ...resolved,
-  };
+    ...resolved.value,
+  });
+}
+
+export function resolveModelSlot(cfg: CoreConfig, slot: ModelSlot): ResolvedModelSlot {
+  const result = resolveModelSlotResult(cfg, slot);
+  if (result.status === "error") throw new Error(result.error.message);
+  return result.value;
+}
+
+export function resolveModelSlotPlanResult(
+  cfg: CoreConfig,
+  slot: ModelSlot,
+  reasoningOverride?: ModelReasoningEffort,
+): ResultType<ResolvedModelPlan, ModelResolutionFailed> {
+  const slotConfig = cfg.models[slot];
+  return resolveModelPlanResult(cfg, {
+    head: slotConfig,
+    fallback: slotConfig.fallback,
+    headSource: `models.${slot}.model`,
+    fallbackSource: `models.${slot}.fallback`,
+    reasoningOverride,
+  });
 }
 
 export function resolveModelSlotPlan(

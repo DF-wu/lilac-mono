@@ -1,6 +1,7 @@
 import path from "node:path";
 
 import { z } from "zod";
+import { Result, TaggedError, type Result as ResultType } from "better-result";
 
 import { workflowAgentProfileSchema, workflowReasoningSchema } from "./workflow-domain";
 
@@ -60,10 +61,16 @@ export const workflowWaitForReplyOptionsSchema = z.strictObject({
     .optional(),
 });
 
-export async function resolveWorkflowAgentOperationInput(input: {
+export class WorkflowAgentOperationInputInvalid extends TaggedError(
+  "WorkflowAgentOperationInputInvalid",
+)<{
+  readonly message: string;
+}> {}
+
+export function resolveWorkflowAgentOperationInputResult(input: {
   value: unknown;
   canonicalWorkspaceRoot: string;
-}): Promise<ResolvedWorkflowAgentInput> {
+}): ResultType<ResolvedWorkflowAgentInput, WorkflowAgentOperationInputInvalid> {
   const rawInput = z.record(z.string(), z.unknown()).safeParse(input.value);
   const rawOptions = rawInput.success
     ? z.record(z.string(), z.unknown()).safeParse(rawInput.data["options"])
@@ -71,24 +78,43 @@ export async function resolveWorkflowAgentOperationInput(input: {
   if (rawOptions?.success) {
     const removed = REMOVED_AGENT_OPTIONS.find((field) => field in rawOptions.data);
     if (removed) {
-      throw new Error(
-        `Workflow agent option '${removed}' was removed; migrate to profile-native agent() options`,
+      return Result.err(
+        new WorkflowAgentOperationInputInvalid({
+          message: `Workflow agent option '${removed}' was removed; migrate to profile-native agent() options`,
+        }),
       );
     }
   }
-  const parsed = requestedAgentInputSchema.parse(input.value);
-  const requestedCwd = parsed.options.cwd ?? input.canonicalWorkspaceRoot;
+  const parsed = requestedAgentInputSchema.safeParse(input.value);
+  if (!parsed.success) {
+    const issue = parsed.error.issues[0];
+    const location = issue?.path.length ? `${issue.path.join(".")}: ` : "";
+    return Result.err(
+      new WorkflowAgentOperationInputInvalid({
+        message: `${location}${issue?.message ?? "Workflow agent operation input is invalid"}`,
+      }),
+    );
+  }
+  const requestedCwd = parsed.data.options.cwd ?? input.canonicalWorkspaceRoot;
   const cwd = path.isAbsolute(requestedCwd)
     ? path.resolve(requestedCwd)
     : path.resolve(input.canonicalWorkspaceRoot, requestedCwd);
-  return resolvedWorkflowAgentInputSchema.parse({
-    prompt: parsed.prompt,
+  const resolved = resolvedWorkflowAgentInputSchema.safeParse({
+    prompt: parsed.data.prompt,
     options: {
-      profile: parsed.options.profile,
-      ...(parsed.options.model ? { model: parsed.options.model } : {}),
-      ...(parsed.options.reasoning ? { reasoning: parsed.options.reasoning } : {}),
+      profile: parsed.data.options.profile,
+      ...(parsed.data.options.model ? { model: parsed.data.options.model } : {}),
+      ...(parsed.data.options.reasoning ? { reasoning: parsed.data.options.reasoning } : {}),
       cwd,
-      ...(parsed.options.label ? { label: parsed.options.label } : {}),
+      ...(parsed.data.options.label ? { label: parsed.data.options.label } : {}),
     },
   });
+  if (!resolved.success) {
+    return Result.err(
+      new WorkflowAgentOperationInputInvalid({
+        message: resolved.error.issues[0]?.message ?? "Workflow agent operation input is invalid",
+      }),
+    );
+  }
+  return Result.ok(resolved.data);
 }

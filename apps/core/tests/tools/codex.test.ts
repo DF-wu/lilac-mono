@@ -1,9 +1,10 @@
 import { describe, expect, it } from "bun:test";
+import { Result } from "better-result";
 
 import {
   startCodexOAuthLogin,
   type CodexOAuthFetch,
-  type CodexOAuthLogin,
+  type CodexOAuthLoginWithResult,
   type CodexOAuthTokens,
 } from "@stanley2058/lilac-utils";
 
@@ -25,7 +26,7 @@ function jwt(claims: Record<string, unknown>): string {
 }
 
 async function deferredLogin(): Promise<{
-  login: CodexOAuthLogin;
+  login: CodexOAuthLoginWithResult;
   started: Promise<void>;
   release: () => void;
   writes: CodexOAuthTokens[];
@@ -61,11 +62,11 @@ async function deferredLogin(): Promise<{
 
 function dependencies(
   startLogin: CodexDependencies["startLogin"],
-  clearTokens: CodexDependencies["clearTokens"] = async () => {},
+  clearTokens: CodexDependencies["clearTokens"] = async () => Result.ok(undefined),
 ): CodexDependencies {
   return {
     startLogin,
-    readTokens: async () => null,
+    readTokens: async () => Result.ok({ value: null, provenance: "missing-defaulted" as const }),
     clearTokens,
     storagePath: () => "/test/codex.json",
   };
@@ -113,6 +114,7 @@ describe("Codex Core tool OAuth lifecycle", () => {
         async () => {
           cleared = true;
           storedAccess = null;
+          return Result.ok(undefined);
         },
       ),
     );

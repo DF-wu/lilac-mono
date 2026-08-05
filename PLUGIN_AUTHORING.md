@@ -36,6 +36,7 @@ Entrypoints default-export a `LilacToolPlugin` from `@stanley2058/lilac-plugin-r
 ```ts
 import { z } from "zod";
 import { tool } from "ai";
+import { defineServerTool } from "@stanley2058/lilac-plugin-runtime";
 import type {
   Level1ToolSpec,
   LilacToolPlugin,
@@ -57,31 +58,20 @@ const level1Tool: Level1ToolSpec<unknown> = {
     }),
 };
 
-const level2Tool: ServerTool = {
+const level2Tool = defineServerTool({
   id: "example",
-  async init() {},
-  async destroy() {},
-  async list() {
-    return [
-      {
-        callableId: "example.echo",
+  callables: ({ callable }) => ({
+    "example.echo": callable({
         name: "Example Echo",
         description: "Echo text back to the caller.",
-        shortInput: ["text=<string>"],
-        input: ["text: string"],
-        primaryPositional: {
-          field: "text",
-        },
-      },
-    ];
-  },
-  async call(callableId, input) {
-    if (callableId !== "example.echo") {
-      throw new Error(`Unknown callable '${callableId}'`);
-    }
-    return input;
-  },
-};
+        inputSchema: z.object({
+          text: z.string().describe("Text to echo"),
+        }),
+        primaryPositional: "text",
+        run: ({ text }) => ({ text }),
+      }),
+  }),
+});
 
 const plugin: LilacToolPlugin<unknown, Level1ToolSpec<unknown>, ServerTool> = {
   meta: {
@@ -105,6 +95,14 @@ export default plugin;
 Native subagent availability is deployment-owned under `agent.subagents.profiles`. Level-1 tools are selected by both plugin id and tool name; Level-2 tools are selected by both plugin id and callable id. The same resolved profile is used for direct, generated-delegation, and user-authored workflow launches. A `"*"` entry includes every globally enabled contribution at that level.
 
 Plugins should keep `isEnabled` for runtime prerequisites, not caller classification.
+
+`defineServerTool` derives Level 2 lifecycle defaults, callable listing, CLI help, input
+decoding, and dispatch. Callable-map keys are the exact externally visible callable IDs; keep
+them stable. Each `run` callback receives the decoded `z.output` of its `inputSchema` plus the
+request options (`signal`, `context`, and `messages`). Use `validation: "zod"` only when a
+callable must preserve a raw `ZodError`; the default produces guided `ToolInputValidationError`
+messages. Static or dynamic catalog overrides can hide a callable or adjust its current
+description without changing its callable ID.
 
 ## Lifecycle
 
@@ -134,7 +132,8 @@ plugins:
 ## Runtime Notes
 
 - Plugins run in-process and have the same privileges as core code.
-- Level 1 tool names must be globally unique.
+- Built-in Level 1 names are reserved. External Level 1 names are qualified by plugin ID in the
+  model-facing catalog, so different plugins may use the same raw name.
 - Level 2 callable ids must be globally unique.
 - Level 2 tools can opt into a single string positional shortcut via `primaryPositional`, e.g. `tools fetch <url>`.
 - Built-in and external plugins share the same loading path and validation rules.

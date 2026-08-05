@@ -3,8 +3,16 @@ import { createHash } from "node:crypto";
 import { join, relative, sep } from "node:path";
 
 import type { FileFinderApi } from "@ff-labs/fff-node";
+import { Panic, Result, TaggedError, type Result as ResultType } from "better-result";
 
-import { ripgrep, type GrepMatch, type GrepOptions, type RipgrepResult } from "./ripgrep";
+import { captureFilesystemOperation } from "./filesystem-operation";
+import {
+  ripgrep,
+  type GrepMatch,
+  type GrepOptions,
+  type RipgrepError,
+  type RipgrepResult,
+} from "./ripgrep";
 
 export const FS_BACKENDS = ["fff", "node-rg"] as const;
 export type FsBackend = (typeof FS_BACKENDS)[number];
@@ -38,7 +46,7 @@ export type FffPrewarmResult = {
 };
 
 export type SearchBackend = {
-  grep(options: GrepOptions): Promise<RipgrepResult>;
+  grep(options: GrepOptions): Promise<ResultType<RipgrepResult, SearchBackendError>>;
   glob(options: {
     cwd: string;
     patterns: readonly string[];
@@ -49,10 +57,47 @@ export type SearchBackend = {
   }): Promise<GlobSearchResult | null>;
 };
 
+export type SearchBackendError = SearchBackendUnavailable | RipgrepError;
+
+export class SearchBackendUnavailable extends TaggedError("SearchBackendUnavailable")<{
+  readonly backend: FsBackend;
+  readonly message: string;
+}> {}
+
+async function captureFffOperation<T>(
+  effect: () => Promise<T>,
+): Promise<ResultType<T, SearchBackendUnavailable>> {
+  try {
+    return Result.ok(await effect());
+  } catch (cause) {
+    if (Panic.is(cause)) throw cause;
+    return Result.err(
+      new SearchBackendUnavailable({
+        backend: "fff",
+        message: cause instanceof Error ? cause.message : "FFF search backend is unavailable",
+      }),
+    );
+  }
+}
+
+function captureFffSyncOperation<T>(effect: () => T): ResultType<T, SearchBackendUnavailable> {
+  try {
+    return Result.ok(effect());
+  } catch (cause) {
+    if (Panic.is(cause)) throw cause;
+    return Result.err(
+      new SearchBackendUnavailable({
+        backend: "fff",
+        message: cause instanceof Error ? cause.message : "FFF search backend is unavailable",
+      }),
+    );
+  }
+}
+
 const nodeRgBackend: SearchBackend = {
   grep: ripgrep,
   async glob() {
-    throw new Error("node-rg backend does not implement glob");
+    return null;
   },
 };
 
@@ -75,11 +120,7 @@ function fffFinderCacheKey(basePath: string, cacheDir?: string): string {
 }
 
 function destroyFffFinder(entry: FffFinderEntry): void {
-  try {
-    entry.finder.destroy();
-  } catch {
-    // Best effort: eviction should not break the caller's fallback path.
-  }
+  captureFffSyncOperation(() => entry.finder.destroy());
 }
 
 function cacheFffFinder(cacheKey: string, entry: FffFinderEntry): void {
@@ -107,8 +148,14 @@ async function resolveFffStoragePaths(
   const rootDir = join(cacheDir, "roots", rootStorageKey(basePath));
   const frecencyDbPath = join(rootDir, "frecency");
   const historyDbPath = join(rootDir, "history");
-  await fs.mkdir(frecencyDbPath, { recursive: true });
-  await fs.mkdir(historyDbPath, { recursive: true });
+  const frecencyCreated = await captureFilesystemOperation("create FFF frecency directory", () =>
+    fs.mkdir(frecencyDbPath, { recursive: true }),
+  );
+  if (frecencyCreated.status === "error") return {};
+  const historyCreated = await captureFilesystemOperation("create FFF history directory", () =>
+    fs.mkdir(historyDbPath, { recursive: true }),
+  );
+  if (historyCreated.status === "error") return {};
   return { frecencyDbPath, historyDbPath };
 }
 
@@ -135,11 +182,11 @@ async function getFffFinder(basePath: string, cacheDir?: string): Promise<FileFi
   if (cached) {
     fffFindersByBasePath.delete(cacheKey);
     fffFindersByBasePath.set(cacheKey, cached);
-    await cached.ready.catch(() => false);
+    await cached.ready;
     return cached.finder;
   }
 
-  try {
+  const loaded = await captureFffOperation(async () => {
     const fff = (await import(FFF_NODE_PACKAGE)) as typeof import("@ff-labs/fff-node");
     if (!fff.FileFinder.isAvailable()) return null;
 
@@ -155,22 +202,20 @@ async function getFffFinder(basePath: string, cacheDir?: string): Promise<FileFi
     if (!created.ok) return null;
 
     const finder = created.value;
-    const ready = finder
-      .waitForIndexReady(10_000)
-      .then((result) => result.ok && result.value)
-      .catch(() => false);
+    const ready = captureFffOperation(() => finder.waitForIndexReady(10_000)).then(
+      (result) => result.status === "ok" && result.value.ok && result.value.value,
+    );
     cacheFffFinder(cacheKey, { finder, ready });
 
     await ready;
     return finder;
-  } catch {
-    return null;
-  }
+  });
+  return loaded.status === "ok" ? loaded.value : null;
 }
 
 async function isDirectory(path: string): Promise<boolean> {
-  const stat = await fs.stat(path).catch(() => null);
-  return stat?.isDirectory() === true;
+  const stat = await captureFilesystemOperation("stat FFF search root", () => fs.stat(path));
+  return stat.status === "ok" && stat.value.isDirectory();
 }
 
 export async function prewarmFffFinders(params: {
@@ -180,14 +225,21 @@ export async function prewarmFffFinders(params: {
 }): Promise<FffPrewarmResult[]> {
   const results: FffPrewarmResult[] = [];
   const seen = new Set<string>();
-  const canonicalDenyPaths = await Promise.all(
-    params.denyPaths.map(async (denyPath) => await fs.realpath(denyPath).catch(() => denyPath)),
-  );
+  const canonicalDenyPaths: string[] = [];
+  for (const denyPath of params.denyPaths) {
+    const canonical = await captureFilesystemOperation("resolve FFF deny path", () =>
+      fs.realpath(denyPath),
+    );
+    canonicalDenyPaths.push(canonical.status === "ok" ? canonical.value : denyPath);
+  }
 
   for (const basePath of params.basePaths) {
     if (seen.has(basePath)) continue;
     seen.add(basePath);
-    const canonicalBasePath = await fs.realpath(basePath).catch(() => basePath);
+    const canonical = await captureFilesystemOperation("resolve FFF search root", () =>
+      fs.realpath(basePath),
+    );
+    const canonicalBasePath = canonical.status === "ok" ? canonical.value : basePath;
 
     if (!(await isDirectory(canonicalBasePath))) {
       results.push({ basePath, ok: false, skipped: "not-directory" });
@@ -234,7 +286,11 @@ export async function fuzzyFileSearch(params: {
   if (!finder) return null;
 
   const limit = Math.max(1, params.maxResults);
-  const result = finder.fileSearch(params.query, { pageSize: limit + 1 });
+  const searched = captureFffSyncOperation(() =>
+    finder.fileSearch(params.query, { pageSize: limit + 1 }),
+  );
+  if (searched.status === "error") return null;
+  const result = searched.value;
   if (!result.ok) return null;
 
   const items = result.value.items.slice(0, limit);
@@ -324,24 +380,28 @@ const fffBackend: SearchBackend = {
     if (!finder) return await nodeRgBackend.grep(options);
 
     const limit = Math.max(1, options.maxMatches ?? 200);
-    const result = finder.grep(buildFffGrepQuery(options.pattern, options.globs), {
-      mode: options.regex ? "regex" : "plain",
-      smartCase: false,
-      pageSize: limit + 1,
-      beforeContext: options.contextLines ?? 0,
-      afterContext: options.contextLines ?? 0,
-    });
+    const captured = captureFffSyncOperation(() =>
+      finder.grep(buildFffGrepQuery(options.pattern, options.globs), {
+        mode: options.regex ? "regex" : "plain",
+        smartCase: false,
+        pageSize: limit + 1,
+        beforeContext: options.contextLines ?? 0,
+        afterContext: options.contextLines ?? 0,
+      }),
+    );
+    if (captured.status === "error") return await nodeRgBackend.grep(options);
+    const result = captured.value;
 
     if (!result.ok) return await nodeRgBackend.grep(options);
     if (options.regex && result.value.regexFallbackError) return await nodeRgBackend.grep(options);
 
     const matches = result.value.items.map(mapFffGrepMatch);
     const truncated = matches.length > limit;
-    return {
+    return Result.ok({
       matches: truncated ? matches.slice(0, limit) : matches,
       truncated,
       effectiveBackend: "fff",
-    };
+    });
   },
 
   async glob(options) {
@@ -368,41 +428,41 @@ const fffBackend: SearchBackend = {
     if (!includes.every(isFileLikeGlobPattern)) return null;
     if (includes.some(targetsNodeModules)) return null;
 
-    try {
-      const finder = await getFffFinder(options.cwd, options.cacheDir);
-      if (!finder) return null;
+    const finder = await getFffFinder(options.cwd, options.cacheDir);
+    if (!finder) return null;
 
-      const paths: string[] = [];
-      const seen = new Set<string>();
-      let truncated = false;
+    const paths: string[] = [];
+    const seen = new Set<string>();
+    let truncated = false;
 
-      for (const pattern of includes) {
-        const result = finder.glob(pattern, { pageSize: options.maxEntries + 1 });
-        if (!result.ok) return null;
+    for (const pattern of includes) {
+      const captured = captureFffSyncOperation(() =>
+        finder.glob(pattern, { pageSize: options.maxEntries + 1 }),
+      );
+      if (captured.status === "error") return null;
+      const result = captured.value;
+      if (!result.ok) return null;
 
-        for (const item of result.value.items) {
-          const relPath = item.relativePath;
-          if (seen.has(relPath)) continue;
+      for (const item of result.value.items) {
+        const relPath = item.relativePath;
+        if (seen.has(relPath)) continue;
 
-          const abs = join(options.cwd, relPath);
-          const stat = await fs.stat(abs).catch(() => null);
-          if (!stat?.isFile()) continue;
+        const abs = join(options.cwd, relPath);
+        const stat = await captureFilesystemOperation("stat FFF glob match", () => fs.stat(abs));
+        if (stat.status === "error" || !stat.value.isFile()) continue;
 
-          seen.add(relPath);
-          if (paths.length >= options.maxEntries) {
-            truncated = true;
-            break;
-          }
-          paths.push(relPath);
+        seen.add(relPath);
+        if (paths.length >= options.maxEntries) {
+          truncated = true;
+          break;
         }
-
-        if (truncated) break;
+        paths.push(relPath);
       }
 
-      return { paths, truncated, effectiveBackend: "fff" };
-    } catch {
-      return null;
+      if (truncated) break;
     }
+
+    return { paths, truncated, effectiveBackend: "fff" };
   },
 };
 

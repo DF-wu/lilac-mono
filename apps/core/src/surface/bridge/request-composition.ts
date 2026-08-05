@@ -1,6 +1,7 @@
 import { isDeepStrictEqual } from "node:util";
 
 import type { ModelMessage, UserContent } from "ai";
+import { Result, type Result as ResultType } from "better-result";
 import { hashCanonicalMessagesV1 } from "@stanley2058/lilac-agent";
 import {
   buildCoreLineageManifestV1,
@@ -24,6 +25,7 @@ import {
 
 import {
   CORE_SURFACE_PROJECTION_FORMAT_VERSION,
+  type CoreOwnedBlobIntegrityError,
   type CoreOwnedBlobReference,
   type CoreSurfaceProjection,
   type TranscriptSnapshot,
@@ -32,6 +34,7 @@ import {
 import {
   appendDiscordAttachmentsToUserContent,
   createDiscordAttachmentState,
+  getDiscordAttachmentOwnershipError,
   getDiscordOwnedBlobReferences,
   takeDiscordCurrentBlobReferences,
 } from "./request-composition/attachments";
@@ -69,6 +72,17 @@ export type {
 
 const DISCORD_REFERENCE_TYPE_FORWARD = 1;
 const DISCORD_SURFACE_ID_PREFIX = "discord:";
+
+function createFreshOnlyLineage(reason: string, currentCanonicalStart = 0): CorePrimaryLineageV1 {
+  const created = createCorePrimaryLineageFreshOnlyV1(reason, currentCanonicalStart);
+  if (created.status === "ok") return created.value;
+  return {
+    state: "fresh-only",
+    lineageVersion: 1,
+    currentCanonicalStart: 0,
+    reason: "lineage-fallback-construction-failed",
+  };
+}
 
 type ProjectionCapableStore = TranscriptStore &
   Required<
@@ -184,7 +198,9 @@ function collectStoredBoundaryBreaks(input: {
     const stored = input.transcriptStore?.getLatestCoreSurfaceSegment?.(
       surfaceProjectionKey(input.sessionId, message.messageId),
     );
-    if (stored) return `${stored.requestId}:${stored.segmentIndex}`;
+    if (stored?.status === "ok" && stored.value) {
+      return `${stored.value.requestId}:${stored.value.segmentIndex}`;
+    }
     const admittedIds = storedProjectionSegmentIds(
       input.projections.get(message.messageId) ?? null,
     );
@@ -209,13 +225,19 @@ function appendPersistedSyntheticSuffix(input: {
   const manifest = input.transcriptStore?.getCorePrimaryLineageManifest?.({
     requestId: input.requestId,
   });
-  if (!manifest || !manifest.segments.some((segment) => segment.atoms[0]?.kind === "synthetic")) {
+  if (
+    !manifest ||
+    manifest.status === "error" ||
+    !manifest.value ||
+    !manifest.value.segments.some((segment) => segment.atoms[0]?.kind === "synthetic")
+  ) {
     return true;
   }
-  if (input.segmentInputs.length > manifest.segments.length) return false;
+  const manifestValue = manifest.value;
+  if (input.segmentInputs.length > manifestValue.segments.length) return false;
 
   const prefixMatches = input.segmentInputs.every((segment, index) => {
-    const stored = manifest.segments[index];
+    const stored = manifestValue.segments[index];
     return (
       stored !== undefined &&
       isDeepStrictEqual(segment.atoms, stored.atoms) &&
@@ -223,7 +245,7 @@ function appendPersistedSyntheticSuffix(input: {
       isDeepStrictEqual(segment.requestSource, stored.requestSource)
     );
   });
-  const suffix = manifest.segments.slice(input.segmentInputs.length);
+  const suffix = manifestValue.segments.slice(input.segmentInputs.length);
   if (!prefixMatches || suffix.some((segment) => segment.atoms[0]?.kind !== "synthetic")) {
     return false;
   }
@@ -292,29 +314,33 @@ async function composeSelectedDiscordChain(input: {
   currentMessageIds: readonly string[];
   transcriptStore?: TranscriptStore;
   discordUserAliasById?: ReadonlyMap<string, string>;
-}): Promise<{
-  messages: ModelMessage[];
-  mergedGroups: Array<{ authorId: string; messageIds: string[] }>;
-  corePrimaryLineage: CorePrimaryLineageV1;
-}> {
+}): Promise<
+  ResultType<
+    {
+      messages: ModelMessage[];
+      mergedGroups: Array<{ authorId: string; messageIds: string[] }>;
+      corePrimaryLineage: CorePrimaryLineageV1;
+    },
+    CoreOwnedBlobIntegrityError
+  >
+> {
   const projectionStore = isProjectionCapableStore(input.transcriptStore)
     ? input.transcriptStore
     : undefined;
   const attachmentState = createDiscordAttachmentState({
     ownBlob: projectionStore
-      ? ({ bytes, mediaType, filename }) =>
-          projectionStore.putCoreOwnedBlob({ bytes, mediaType, filename })
+      ? ({ bytes, mediaType, filename }) => {
+          return projectionStore.putCoreOwnedBlob({ bytes, mediaType, filename });
+        }
       : undefined,
   });
   try {
     const projections = new Map<string, CoreSurfaceProjection | null>();
     for (const message of input.chain) {
-      projections.set(
-        message.messageId,
-        projectionStore?.getCoreSurfaceProjection(
-          surfaceProjectionKey(input.sessionId, message.messageId),
-        ) ?? null,
+      const stored = projectionStore?.getCoreSurfaceProjection(
+        surfaceProjectionKey(input.sessionId, message.messageId),
       );
+      projections.set(message.messageId, stored?.status === "ok" ? stored.value : null);
     }
     const immutableChain = input.chain.map((message) => {
       const projection = projections.get(message.messageId) ?? null;
@@ -390,8 +416,8 @@ async function composeSelectedDiscordChain(input: {
           projectedByMessageId.set(messageId, stored.canonicalMessages);
           continue;
         }
-        const source = messageById.get(messageId);
-        if (!source) throw new Error(`Selected Discord message '${messageId}' was not found`);
+        // `merged` is derived from `immutableChain`, so every selected ID has this source entry.
+        const source = messageById.get(messageId)!;
         const candidate = await renderSurfaceProjectionCandidate({
           message: source,
           isBot: source.authorId === input.botUserId,
@@ -433,8 +459,7 @@ async function composeSelectedDiscordChain(input: {
       }
       for (const messageId of chunk.messageIds) {
         if (projections.get(messageId) || !projectionStore) continue;
-        const source = messageById.get(messageId);
-        if (!source) throw new Error(`Selected Discord message '${messageId}' was not found`);
+        const source = messageById.get(messageId)!;
         const segmentMessageIds = projectionSegmentIdsByMessageId.get(messageId) ?? [messageId];
         const segmentMessages = mergeProjectedSurfaceMessages(
           segmentMessageIds.flatMap((id) => projectedByMessageId.get(id) ?? []),
@@ -453,7 +478,11 @@ async function composeSelectedDiscordChain(input: {
           },
           ownedBlobs: candidateOwnedBlobsByMessageId.get(messageId) ?? [],
         });
-        projectedByMessageId.set(messageId, admitted.canonicalMessages);
+        if (admitted.status === "error") {
+          lineageComplete = false;
+          continue;
+        }
+        projectedByMessageId.set(messageId, admitted.value.canonicalMessages);
       }
     }
 
@@ -513,18 +542,19 @@ async function composeSelectedDiscordChain(input: {
         const metadata = input.transcriptStore?.getCoreRequestAtomMetadata?.({
           requestId: snapshot.requestId,
         });
-        if (!metadata) lineageComplete = false;
+        const metadataValue = metadata?.status === "ok" ? metadata.value : null;
+        if (!metadataValue) lineageComplete = false;
         const requestAtom: CoreLineageAtomV1 = {
           kind: "request",
           requestId: snapshot.requestId,
           transcriptDigest:
-            metadata?.transcriptDigest ??
+            metadataValue?.transcriptDigest ??
             snapshot.transcriptDigest ??
             hashCanonicalMessagesV1(snapshot.messages).hash,
           providerFamily:
-            metadata?.providerFamily ?? snapshot.providerState?.lastFamily ?? "ai-sdk",
+            metadataValue?.providerFamily ?? snapshot.providerState?.lastFamily ?? "ai-sdk",
           containsCrossFamilyTurns:
-            metadata?.containsCrossFamilyTurns ??
+            metadataValue?.containsCrossFamilyTurns ??
             snapshot.providerState?.containsCrossFamilyTurns ??
             true,
         };
@@ -564,27 +594,36 @@ async function composeSelectedDiscordChain(input: {
     const hasEmptyLineageSegment = segmentInputs.some(
       (segment) => segment.canonicalMessages.length === 0,
     );
-    const corePrimaryLineage =
-      lineageComplete && segmentInputs.length > 0 && !hasEmptyLineageSegment
-        ? buildCoreLineageManifestV1(segmentInputs, { currentSegmentIndex })
-        : createCorePrimaryLineageFreshOnlyV1(
-            hasEmptyLineageSegment
-              ? "empty-lineage-segment"
-              : currentSegmentIndex < 0
-                ? "current-input-boundary-unreachable"
-                : projectionStore
-                  ? "incomplete-request-metadata"
-                  : "projection-store-unavailable",
-            currentCanonicalStart,
-          );
-    return {
+    let corePrimaryLineage: CorePrimaryLineageV1;
+    if (lineageComplete && segmentInputs.length > 0 && !hasEmptyLineageSegment) {
+      const built = buildCoreLineageManifestV1(segmentInputs, { currentSegmentIndex });
+      corePrimaryLineage =
+        built.status === "ok"
+          ? built.value
+          : createFreshOnlyLineage("lineage-manifest-build-failed", currentCanonicalStart);
+    } else {
+      let reason: Parameters<typeof createCorePrimaryLineageFreshOnlyV1>[0];
+      if (hasEmptyLineageSegment) {
+        reason = "empty-lineage-segment";
+      } else if (currentSegmentIndex < 0) {
+        reason = "current-input-boundary-unreachable";
+      } else if (projectionStore) {
+        reason = "incomplete-request-metadata";
+      } else {
+        reason = "projection-store-unavailable";
+      }
+      corePrimaryLineage = createFreshOnlyLineage(reason, currentCanonicalStart);
+    }
+    const ownershipError = getDiscordAttachmentOwnershipError(attachmentState);
+    if (ownershipError) return Result.err(ownershipError);
+    return Result.ok({
       messages,
       mergedGroups: merged.map((chunk) => ({
         authorId: chunk.authorId,
         messageIds: [...chunk.messageIds],
       })),
       corePrimaryLineage,
-    };
+    });
   } finally {
     if (projectionStore) {
       for (const reference of getDiscordOwnedBlobReferences(attachmentState)) {
@@ -605,11 +644,12 @@ function resolveTranscriptSnapshot(input: {
     return input.resolvedSnapshotsBySurfaceMessageId.get(input.messageId) ?? null;
   }
 
-  return input.transcriptStore.getTranscriptBySurfaceMessage({
+  const transcript = input.transcriptStore.getTranscriptBySurfaceMessage({
     platform: input.platform,
     channelId: input.channelId,
     messageId: input.messageId,
   });
+  return transcript.status === "ok" ? transcript.value : null;
 }
 
 function getDiscordIsChatFromRaw(raw: unknown): boolean | undefined {
@@ -1220,21 +1260,17 @@ async function getReactionsByMessageId(input: {
 export async function composeRequestMessages(
   adapter: SurfaceAdapter,
   opts: ComposeRequestOpts,
-): Promise<RequestCompositionResult> {
-  if (opts.platform !== "discord") {
-    throw new Error(`Unsupported platform '${opts.platform}'`);
-  }
-
+): Promise<ResultType<RequestCompositionResult, CoreOwnedBlobIntegrityError>> {
   // Step 1: fetch reply chain from the adapter store / platform.
   // Mention triggers get merge-window parity even if messages are not linked via reply references.
   const triggerMsg = await adapter.readMsg(opts.trigger.msgRef);
   if (!triggerMsg) {
-    return {
+    return Result.ok({
       messages: [],
       chainMessageIds: [],
       mergedGroups: [],
-      corePrimaryLineage: createCorePrimaryLineageFreshOnlyV1("empty-selection"),
-    };
+      corePrimaryLineage: createFreshOnlyLineage("empty-selection"),
+    });
   }
 
   const chain =
@@ -1256,7 +1292,7 @@ export async function composeRequestMessages(
         });
 
   const filteredChain = chain.filter((m) => {
-    const isChat = getDiscordIsChatFromRaw(m.raw);
+    const isChat = m.isChat;
     if (!(isChat ?? true)) return false;
     return !isDiscordSessionDividerText(m.text);
   });
@@ -1303,22 +1339,19 @@ export async function composeRequestMessages(
     discordUserAliasById: opts.discordUserAliasById,
   });
 
-  return {
-    messages: composed.messages,
+  if (composed.status === "error") return Result.err(composed.error);
+  return Result.ok({
+    messages: composed.value.messages,
     chainMessageIds: transformedChain.map((m) => m.messageId),
-    mergedGroups: composed.mergedGroups,
-    corePrimaryLineage: composed.corePrimaryLineage,
-  };
+    mergedGroups: composed.value.mergedGroups,
+    corePrimaryLineage: composed.value.corePrimaryLineage,
+  });
 }
 
 export async function composeRecentChannelMessages(
   adapter: SurfaceAdapter,
   opts: ComposeRecentChannelMessagesOpts,
-): Promise<RequestCompositionResult> {
-  if (opts.platform !== "discord") {
-    throw new Error(`Unsupported platform '${opts.platform}'`);
-  }
-
+): Promise<ResultType<RequestCompositionResult, CoreOwnedBlobIntegrityError>> {
   // Reply precedence: if the trigger is a Discord reply (even when the router
   // classified it as a "mention" trigger because it wasn't a reply-to-bot),
   // treat it as an explicit reply-chain continuation.
@@ -1404,12 +1437,13 @@ export async function composeRecentChannelMessages(
           discordUserAliasById: opts.discordUserAliasById,
         });
 
-        return {
-          messages: composed.messages,
+        if (composed.status === "error") return Result.err(composed.error);
+        return Result.ok({
+          messages: composed.value.messages,
           chainMessageIds: transformedAnchored.map((m) => m.messageId),
-          mergedGroups: composed.mergedGroups,
-          corePrimaryLineage: composed.corePrimaryLineage,
-        };
+          mergedGroups: composed.value.mergedGroups,
+          corePrimaryLineage: composed.value.corePrimaryLineage,
+        });
       }
     }
   }
@@ -1490,9 +1524,13 @@ export async function composeRecentChannelMessages(
     ? (contextList.find((m) => m.ref.messageId === opts.triggerMsgRef!.messageId) ?? null)
     : null;
 
-  const activeAnchor = shouldApplyActiveBurstRules
-    ? (triggerMsg ?? (contextList.length > 0 ? contextList[contextList.length - 1]! : null))
-    : null;
+  let activeAnchor: SurfaceMessage | null = null;
+  if (shouldApplyActiveBurstRules) {
+    activeAnchor = triggerMsg;
+    if (activeAnchor === null && contextList.length > 0) {
+      activeAnchor = contextList[contextList.length - 1]!;
+    }
+  }
 
   const dividerCutContextList =
     shouldApplyActiveBurstRules && activeAnchor
@@ -1554,54 +1592,56 @@ export async function composeRecentChannelMessages(
     getAuthorId: (message) => message.authorId,
     getMessageId: (message) => message.messageId,
   });
+  let currentMessageIds = opts.currentMessageIds;
+  if (currentMessageIds === undefined) {
+    if (opts.triggerMsgRef) {
+      currentMessageIds = [opts.triggerMsgRef.messageId];
+    } else if (selectedNoDivider.length > 0) {
+      currentMessageIds = [selectedNoDivider[selectedNoDivider.length - 1]!.ref.messageId];
+    } else {
+      currentMessageIds = [];
+    }
+  }
   const composed = await composeSelectedDiscordChain({
     adapter,
     sessionId: opts.sessionId,
     botUserId: opts.botUserId,
     chain: checkpointSelection.descendants,
     checkpointSelection,
-    currentMessageIds:
-      opts.currentMessageIds ??
-      (opts.triggerMsgRef
-        ? [opts.triggerMsgRef.messageId]
-        : selectedNoDivider.length > 0
-          ? [selectedNoDivider[selectedNoDivider.length - 1]!.ref.messageId]
-          : []),
+    currentMessageIds,
     transcriptStore: opts.transcriptStore,
     discordUserAliasById: opts.discordUserAliasById,
   });
 
-  return {
-    messages: composed.messages,
+  if (composed.status === "error") return Result.err(composed.error);
+  return Result.ok({
+    messages: composed.value.messages,
     chainMessageIds: chain.map((m) => m.messageId),
-    mergedGroups: composed.mergedGroups,
-    corePrimaryLineage: composed.corePrimaryLineage,
-  };
+    mergedGroups: composed.value.mergedGroups,
+    corePrimaryLineage: composed.value.corePrimaryLineage,
+  });
 }
 
 export async function composeSingleMessage(
   adapter: SurfaceAdapter,
   opts: ComposeSingleMessageOpts,
-): Promise<ModelMessage | null> {
+): Promise<ResultType<ModelMessage | null, CoreOwnedBlobIntegrityError>> {
   const composed = await composeSingleMessageWithLineage(adapter, opts);
-  return composed?.messages[0] ?? null;
+  if (composed.status === "error") return Result.err(composed.error);
+  return Result.ok(composed.value?.messages[0] ?? null);
 }
 
 export async function composeSingleMessageWithLineage(
   adapter: SurfaceAdapter,
   opts: ComposeSingleMessageOpts,
-): Promise<RequestCompositionResult | null> {
-  if (opts.platform !== "discord") {
-    throw new Error(`Unsupported platform '${opts.platform}'`);
-  }
-
+): Promise<ResultType<RequestCompositionResult | null, CoreOwnedBlobIntegrityError>> {
   const m = await adapter.readMsg(opts.msgRef);
-  if (!m) return null;
+  if (!m) return Result.ok(null);
 
-  if (!shouldIncludeInModelContext(m)) return null;
+  if (!shouldIncludeInModelContext(m)) return Result.ok(null);
 
   // Never include session divider markers in model context.
-  if (isDiscordSessionDividerSurfaceMessageAnyAuthor(m)) return null;
+  if (isDiscordSessionDividerSurfaceMessageAnyAuthor(m)) return Result.ok(null);
 
   let text = m.text.trim().length > 0 ? m.text : (getForwardSnapshotTextFromRaw(m.raw) ?? m.text);
   const contentTransform = m.userId !== opts.botUserId ? opts.transformUserText : undefined;
@@ -1635,10 +1675,11 @@ export async function composeSingleMessageWithLineage(
     transcriptStore: opts.transcriptStore,
     discordUserAliasById: opts.discordUserAliasById,
   });
-  return {
-    messages: composed.messages,
+  if (composed.status === "error") return Result.err(composed.error);
+  return Result.ok({
+    messages: composed.value.messages,
     chainMessageIds: [m.ref.messageId],
-    mergedGroups: composed.mergedGroups,
-    corePrimaryLineage: composed.corePrimaryLineage,
-  };
+    mergedGroups: composed.value.mergedGroups,
+    corePrimaryLineage: composed.value.corePrimaryLineage,
+  });
 }

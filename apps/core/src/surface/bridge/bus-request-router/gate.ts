@@ -1,13 +1,15 @@
 import { Output, streamText, type ModelMessage } from "ai";
+import { TaggedError } from "better-result";
 import { z } from "zod";
 
 import {
   extractAiErrorLogDetails,
-  resolveModelSlot,
+  resolveModelSlotResult,
   type CoreConfig,
 } from "@stanley2058/lilac-utils";
 import type { Logger } from "@stanley2058/simple-module-logger";
 import type { MsgRef } from "../../types";
+import { formatBridgeTaggedErrorForLog } from "../bridge-log";
 import { escapeSurfaceMetadataTags, formatSurfaceMetadataLine } from "../surface-metadata";
 
 export type RouterGateContextMode = "active-batch" | "direct-reply-mention-disambiguation";
@@ -46,6 +48,11 @@ const gateSchema = z.object({
   reason: z.string().nullable(),
 });
 
+class RouterGateExecutionFailed extends TaggedError("RouterGateExecutionFailed")<{
+  readonly cause: unknown;
+  readonly message: string;
+}> {}
+
 export function formatBufferedMessageForGateTranscript(message: BufferedMessage): string {
   const header = formatSurfaceMetadataLine({
     platform: message.msgRef.platform,
@@ -70,7 +77,27 @@ export async function shouldForwardByGate(params: {
   const timeout = setTimeout(() => abort.abort(), timeoutMs);
 
   try {
-    const resolved = resolveModelSlot(params.cfg, "fast");
+    const resolution = resolveModelSlotResult(params.cfg, "fast");
+    if (resolution.status === "error") {
+      switch (resolution.error._tag) {
+        case "ModelResolutionFailed": {
+          const failOpen = params.input.context?.mode === "direct-reply-mention-disambiguation";
+          params.logger.error(
+            "router gate model resolution failed",
+            formatBridgeTaggedErrorForLog(resolution.error, {
+              sessionId: params.input.sessionId,
+              mode: params.input.context?.mode ?? "active-batch",
+              failOpen,
+            }),
+          );
+          return {
+            forward: failOpen,
+            reason: failOpen ? "error-fail-open" : "error",
+          };
+        }
+      }
+    }
+    const resolved = resolution.value;
 
     const prompt = (() => {
       if (params.input.context?.mode === "direct-reply-mention-disambiguation") {
@@ -166,15 +193,18 @@ export async function shouldForwardByGate(params: {
     return await res.output;
   } catch (e) {
     const failOpen = params.input.context?.mode === "direct-reply-mention-disambiguation";
+    const failure = new RouterGateExecutionFailed({
+      cause: e,
+      message: "Router gate execution failed",
+    });
     params.logger.error(
       "router gate error",
-      {
+      formatBridgeTaggedErrorForLog(failure, {
         sessionId: params.input.sessionId,
         mode: params.input.context?.mode ?? "active-batch",
         failOpen,
         ...extractAiErrorLogDetails(e),
-      },
-      e,
+      }),
     );
     return {
       forward: failOpen,

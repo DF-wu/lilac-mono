@@ -6,10 +6,17 @@ import { CallToolResultSchema } from "@modelcontextprotocol/sdk/types.js";
 import { AiSdkPiAgent, ToolExpansion } from "@stanley2058/lilac-agent";
 import { tool, type ToolSet } from "ai";
 import { MockLanguageModelV4 } from "ai/test";
+import { Panic } from "better-result";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
 
-import { createClaudeCodeToolBridge, displayClaudeCodeToolName } from "../claude-code-tools";
+import {
+  createClaudeCodeToolBridge,
+  createClaudeCodeToolBridgeResult,
+  displayClaudeCodeToolName,
+  mapToolResultOutputToMcpResult,
+  validateClaudeCodeBuiltInToolsResult,
+} from "../claude-code-tools";
 
 const closeCallbacks: Array<() => Promise<void>> = [];
 
@@ -348,6 +355,54 @@ describe("Claude Code tool bridge", () => {
         builtInTools: ["Bash"] as unknown as ["WebSearch"],
       }),
     ).rejects.toThrow("Claude built-in tool 'Bash' is not supported");
+  });
+
+  it("returns owned configuration and output-mapping failures from Result APIs", async () => {
+    const builtIns = validateClaudeCodeBuiltInToolsResult(["Bash"]);
+    expect(builtIns.status).toBe("error");
+    if (builtIns.status === "error") {
+      expect(builtIns.error._tag).toBe("ClaudeCodeBuiltInToolUnsupported");
+    }
+
+    const bridge = await createClaudeCodeToolBridgeResult({
+      tools: { broken: tool({ inputSchema: z.object({}) }) },
+      execute: async () => {
+        throw new Error("unreachable");
+      },
+    });
+    expect(bridge.status).toBe("error");
+    if (bridge.status === "error") {
+      expect(bridge.error._tag).toBe("ClaudeCodeToolBridgeConfigurationFailed");
+    }
+
+    const mapped = mapToolResultOutputToMcpResult(
+      {
+        type: "json",
+        value: {
+          get value(): null {
+            throw new Error("serialization failed");
+          },
+        },
+      },
+      false,
+    );
+    expect(mapped.status).toBe("error");
+    if (mapped.status === "error") {
+      expect(mapped.error._tag).toBe("ClaudeCodeToolOutputMappingFailed");
+    }
+  });
+
+  it("preserves Panic identity across JSON serialization", () => {
+    const panic = new Panic({ message: "serialization invariant" });
+    const hostile = {
+      get value(): null {
+        throw panic;
+      },
+    };
+
+    expect(() => mapToolResultOutputToMcpResult({ type: "json", value: hostile }, false)).toThrow(
+      panic,
+    );
   });
 
   it("allows only exactly allowlisted built-ins and denies every other Claude tool", async () => {

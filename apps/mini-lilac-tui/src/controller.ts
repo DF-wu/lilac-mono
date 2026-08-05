@@ -1,15 +1,17 @@
 import type { UIMessageChunk } from "ai";
+import type { Result as ResultType } from "better-result";
 
 import {
-  miniLilacSteeringCommittedChunkSchema,
-  miniLilacSteeringChunkSchema,
-  miniLilacStreamCursorChunkSchema,
   type MiniLilacCompactResult,
+  type MiniLilacCompactError,
   type MiniLilacControlResult,
   type MiniLilacHistoryFilesystemResult,
   type MiniLilacOutputRollback,
   type MiniLilacReasoning,
+  type MiniLilacRequestError,
+  type MiniLilacResultStream,
   type MiniLilacSessionSnapshot,
+  type MiniLilacStreamError,
   type MiniLilacTodoState,
   type MiniLilacTranscriptReset,
   type MiniLilacTransport,
@@ -28,13 +30,20 @@ import {
   type InputEvent,
   type InputState,
 } from "./input-state";
-import {
-  ChunkRenderer,
-  compactionEntry,
-  renderInitialMessages,
-  type TranscriptEntry,
-} from "./render";
+import { compactionEntry, type TranscriptEntry } from "./render";
+import { ChunkRenderer, renderInitialMessages } from "./render-boundary";
 import { sessionPresentation, type SessionPresentation } from "./presentation";
+import {
+  cancelTerminalStream,
+  readTerminalStream,
+  releaseTerminalStreamLock,
+  type TerminalStreamCleanupFailed,
+  type TerminalStreamReadFailed,
+} from "./terminal-stream-adapter";
+import {
+  projectMiniLilacStreamChunk,
+  UIMessageChunkProjectionState,
+} from "./ui-message-chunk-projection";
 
 export interface ControllerUISink {
   onState(state: InputState): void;
@@ -83,6 +92,13 @@ const COMPACTION_WATCH_INTERVAL_MS = 1_500;
 
 type StreamOutcome = "completed" | "disconnected" | "disposed" | "superseded";
 
+type ControllerFailure =
+  | MiniLilacRequestError
+  | MiniLilacCompactError
+  | MiniLilacStreamError
+  | TerminalStreamReadFailed
+  | TerminalStreamCleanupFailed;
+
 type DraftSnapshot = Pick<InputState, "editor" | "files" | "pastedTexts">;
 
 interface DraftProvenance {
@@ -90,8 +106,8 @@ interface DraftProvenance {
   readonly after: DraftSnapshot;
 }
 
-function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+function errorMessage(error: ControllerFailure): string {
+  return error.message;
 }
 
 /**
@@ -101,6 +117,7 @@ function errorMessage(error: unknown): string {
 export class Controller {
   private state: InputState = initialInputState();
   private readonly renderer: ChunkRenderer;
+  private readonly streamProjection: UIMessageChunkProjectionState;
   private messages: MiniLilacUIMessage[];
   private output: TranscriptEntry[];
   private steering: MiniLilacUserUIMessage[] = [];
@@ -109,7 +126,9 @@ export class Controller {
   private promptAdmission: Promise<string | undefined>;
   private resolvePromptAdmission: ((runId: string | undefined) => void) | undefined;
   private activeRunId: string | undefined;
-  private activeReader: ReadableStreamDefaultReader<UIMessageChunk> | undefined;
+  private activeReader:
+    | ReadableStreamDefaultReader<ResultType<UIMessageChunk, MiniLilacStreamError>>
+    | undefined;
   private pendingUndoCommandId: string | undefined;
   private pendingRedoCommandId: string | undefined;
   private undoDraftProvenance: DraftProvenance[] = [];
@@ -152,6 +171,9 @@ export class Controller {
   private disposed = false;
 
   constructor(private readonly options: ControllerOptions) {
+    this.streamProjection = new UIMessageChunkProjectionState({
+      cwd: options.cwd ?? options.initialSnapshot?.cwd,
+    });
     this.activeRunId = options.initialSnapshot?.activeRunId ?? undefined;
     this.sessionExists =
       options.initialSnapshot !== undefined || (options.initialMessages?.length ?? 0) > 0;
@@ -255,59 +277,53 @@ export class Controller {
   async updateSessionBindings(update: SessionBindingUpdate): Promise<boolean> {
     if (this.state.phase !== "idle") return false;
     this.dispatch({ type: "operation-started" });
-    try {
-      if (!this.sessionExists) {
-        this.options.transport.setSessionBindings(update);
-        this.bindings = { ...this.bindings, ...update };
-        this.options.ui.onBindings?.(this.bindings);
-      } else {
-        const clientCommandId = crypto.randomUUID();
-        let snapshot: MiniLilacSessionSnapshot;
-        try {
-          snapshot = await this.options.transport.updateSessionBindings(
-            { sessionId: this.sessionId, clientCommandId, ...update },
-            { signal: this.abortController.signal },
-          );
-        } catch {
-          snapshot = await this.options.transport.updateSessionBindings(
-            { sessionId: this.sessionId, clientCommandId, ...update },
-            { signal: this.abortController.signal },
-          );
-        }
-        if (this.disposed) return false;
-        this.acceptSnapshot(snapshot);
-      }
+    if (!this.sessionExists) {
+      this.options.transport.setSessionBindings(update);
+      this.bindings = { ...this.bindings, ...update };
+      this.options.ui.onBindings?.(this.bindings);
       this.dispatch({ type: "operation-completed" });
       return true;
-    } catch (error) {
-      if (this.disposed) return false;
-      const recovered = await this.reconcileSessionBindings();
-      if (recovered !== undefined && sessionBindingUpdateMatches(recovered, update)) {
-        this.dispatch({ type: "operation-completed" });
-        return true;
-      }
-      this.dispatch({ type: "operation-failed" });
-      this.commitError(error);
-      return false;
     }
+
+    const clientCommandId = crypto.randomUUID();
+    const request = { sessionId: this.sessionId, clientCommandId, ...update };
+    let updated = await this.options.transport.updateSessionBindingsResult(request, {
+      signal: this.abortController.signal,
+    });
+    if (updated.status === "error") {
+      updated = await this.options.transport.updateSessionBindingsResult(request, {
+        signal: this.abortController.signal,
+      });
+    }
+    if (this.disposed) return false;
+    if (updated.status === "ok") {
+      this.acceptSnapshot(updated.value);
+      this.dispatch({ type: "operation-completed" });
+      return true;
+    }
+    const recovered = await this.reconcileSessionBindings();
+    if (recovered !== undefined && sessionBindingUpdateMatches(recovered, update)) {
+      this.dispatch({ type: "operation-completed" });
+      return true;
+    }
+    this.dispatch({ type: "operation-failed" });
+    this.commitError(updated.error);
+    return false;
   }
 
   private async reconcileSessionBindings(): Promise<MiniLilacSessionSnapshot | undefined> {
-    try {
-      const snapshot = await this.options.transport.getSession(this.sessionId, {
-        signal: this.abortController.signal,
-      });
-      if (this.disposed) return undefined;
-      this.options.transport.setSessionBindings({
-        model: snapshot.model ?? undefined,
-        profile: snapshot.profile ?? undefined,
-        reasoning: snapshot.reasoning ?? undefined,
-      });
-      this.acceptSnapshot(snapshot);
-      return snapshot;
-    } catch {
-      return undefined;
-    }
+    const loaded = await this.options.transport.getSessionResult(this.sessionId, {
+      signal: this.abortController.signal,
+    });
+    if (loaded.status === "error" || this.disposed) return undefined;
+    const snapshot = loaded.value;
+    this.options.transport.setSessionBindings({
+      model: snapshot.model ?? undefined,
+      profile: snapshot.profile ?? undefined,
+      reasoning: snapshot.reasoning ?? undefined,
+    });
+    this.acceptSnapshot(snapshot);
+    return snapshot;
   }
 
   /** Esc interrupts server work and never exits the program. */
@@ -355,7 +371,7 @@ export class Controller {
     this.controlAbortController.abort();
     const reader = this.activeReader;
     this.activeReader = undefined;
-    if (reader !== undefined) void reader.cancel().catch(() => undefined);
+    if (reader !== undefined) void cancelTerminalStream(reader);
   }
 
   /** Current state exposed for focused integration tests and status adapters. */
@@ -445,16 +461,15 @@ export class Controller {
     // the rapid-submit race; steering still waits on promptAdmission below.
     this.dispatch({ type: "agent-started" });
 
-    let stream: ReadableStream<UIMessageChunk>;
-    try {
-      stream = await this.options.transport.sendMessages({
-        trigger: "submit-message",
-        chatId: this.sessionId,
-        messageId: undefined,
-        messages: [...this.messages],
-        abortSignal: this.abortController.signal,
-      });
-    } catch (error) {
+    const admitted = await this.options.transport.sendMessagesResult({
+      trigger: "submit-message",
+      chatId: this.sessionId,
+      messageId: undefined,
+      messages: [...this.messages],
+      abortSignal: this.abortController.signal,
+    });
+    if (admitted.status === "error") {
+      const error = admitted.error;
       const recovery = await this.recoverSessionAfterAmbiguousAdmission();
       if (!this.isCurrentRun(generation)) return;
 
@@ -540,10 +555,11 @@ export class Controller {
       this.commitError(error);
       return;
     }
+    const stream = admitted.value;
 
     if (!this.isCurrentRun(generation)) {
       resolveAdmission(undefined);
-      await stream.cancel().catch(() => undefined);
+      await cancelTerminalStream(stream);
       return;
     }
     this.onPromptAdmitted();
@@ -564,17 +580,16 @@ export class Controller {
     | { kind: "unknown" }
   > {
     if (this.disposed) return { kind: "unknown" };
-    let snapshot: MiniLilacSessionSnapshot;
-    try {
-      snapshot = await this.options.transport.getSession(this.sessionId, {
-        signal: this.abortController.signal,
-      });
-    } catch (error) {
-      const message = errorMessage(error);
+    const loaded = await this.options.transport.getSessionResult(this.sessionId, {
+      signal: this.abortController.signal,
+    });
+    if (loaded.status === "error") {
+      const message = errorMessage(loaded.error);
       return message.includes("(404)") || message.includes("not_found")
         ? { kind: "not-created" }
         : { kind: "unknown" };
     }
+    const snapshot = loaded.value;
     if (this.disposed) return { kind: "unknown" };
     this.sessionExists = true;
     this.options.transport.setSessionBindings({
@@ -583,9 +598,10 @@ export class Controller {
       reasoning: snapshot.reasoning ?? undefined,
     });
     this.acceptSnapshot(snapshot);
-    const messages = await this.options.transport
-      .getMessages(this.sessionId, { signal: this.abortController.signal })
-      .catch(() => undefined);
+    const loadedMessages = await this.options.transport.getMessagesResult(this.sessionId, {
+      signal: this.abortController.signal,
+    });
+    const messages = loadedMessages.status === "ok" ? loadedMessages.value : undefined;
     return { kind: "session", snapshot, ...(messages === undefined ? {} : { messages }) };
   }
 
@@ -607,14 +623,14 @@ export class Controller {
   }
 
   private async driveStream(
-    initial: ReadableStream<UIMessageChunk> | undefined,
+    initial: MiniLilacResultStream | undefined,
     generation: number,
   ): Promise<StreamOutcome> {
     if (!this.isCurrentRun(generation) && initial !== undefined) {
-      await initial.cancel().catch(() => undefined);
+      await cancelTerminalStream(initial);
       return this.disposed ? "disposed" : "superseded";
     }
-    let stream = initial;
+    let stream: MiniLilacResultStream | undefined = initial;
     const hadInitialStream = initial !== undefined;
     let reconnectAttempt = 0;
     let reconnectEntryId: string | undefined;
@@ -648,24 +664,25 @@ export class Controller {
         return this.disposed ? "disposed" : "superseded";
       }
 
-      let reconnected: ReadableStream<UIMessageChunk> | null;
-      try {
-        reconnected = await this.options.transport.reconnectToStream({ chatId: this.sessionId });
-      } catch (error) {
+      const reconnect = await this.options.transport.reconnectToStreamResult({
+        chatId: this.sessionId,
+      });
+      if (reconnect.status === "error") {
         if (!this.isCurrentRun(generation)) {
           return this.disposed ? "disposed" : "superseded";
         }
         const unavailable = {
           kind: "status",
           tone: "warning",
-          text: `connection unavailable; retrying (${reconnectAttempt}): ${errorMessage(error)}`,
+          text: `connection unavailable; retrying (${reconnectAttempt}): ${errorMessage(reconnect.error)}`,
         } as const;
         if (reconnectEntryId === undefined) reconnectEntryId = this.appendOutput(unavailable);
         else this.updateOutput(reconnectEntryId, unavailable);
         continue;
       }
+      const reconnected = reconnect.value;
       if (!this.isCurrentRun(generation)) {
-        if (reconnected !== null) await reconnected.cancel().catch(() => undefined);
+        if (reconnected !== null) await cancelTerminalStream(reconnected);
         return this.disposed ? "disposed" : "superseded";
       }
       // `null` means the run already finished server-side; treat as completion.
@@ -683,54 +700,65 @@ export class Controller {
     await Bun.sleep(Math.min(5_000, 250 * 2 ** Math.min(attempt - 2, 5)));
   }
 
-  private async consume(
-    stream: ReadableStream<UIMessageChunk>,
-    generation: number,
-  ): Promise<StreamOutcome> {
+  private async consume(stream: MiniLilacResultStream, generation: number): Promise<StreamOutcome> {
     if (!this.isCurrentRun(generation)) {
-      await stream.cancel().catch(() => undefined);
+      await cancelTerminalStream(stream);
       return this.disposed ? "disposed" : "superseded";
     }
     const reader = stream.getReader();
     this.activeReader = reader;
     let terminalFinish = false;
-    try {
-      for (;;) {
-        const { done, value } = await reader.read();
-        if (this.disposed) return "disposed";
-        if (generation !== this.runGeneration) {
-          await reader.cancel().catch(() => undefined);
-          return "superseded";
-        }
-        if (done) return terminalFinish ? "completed" : "disconnected";
-        if (value.type === "finish") terminalFinish = true;
-        if (value.type === "data-streamCursor") {
-          const cursor = miniLilacStreamCursorChunkSchema.safeParse(value);
-          if (cursor.success) this.admitRun(cursor.data.data.runId);
-        } else if (value.type === "data-steering") {
-          const steering = miniLilacSteeringChunkSchema.safeParse(value);
-          if (steering.success) {
-            this.appendReplayedSteering(steering.data.data);
-            continue;
-          }
-        } else if (value.type === "data-steeringCommitted") {
-          const steering = miniLilacSteeringCommittedChunkSchema.safeParse(value);
-          if (steering.success) {
-            this.commitSteering(steering.data.data);
-            continue;
-          }
-        }
-        this.renderer.handle(value);
+    let outcome: StreamOutcome | undefined;
+    for (;;) {
+      const read = await readTerminalStream(reader);
+      if (read.status === "error") {
+        if (this.disposed) outcome = "disposed";
+        else if (generation !== this.runGeneration) outcome = "superseded";
+        else outcome = terminalFinish ? "completed" : "disconnected";
+        break;
       }
-    } catch {
-      // A read failure is a transport disconnect, not a cancellation.
-      if (this.disposed) return "disposed";
-      if (generation !== this.runGeneration) return "superseded";
-      return terminalFinish ? "completed" : "disconnected";
-    } finally {
-      if (this.activeReader === reader) this.activeReader = undefined;
-      reader.releaseLock();
+      const { done, value } = read.value;
+      if (this.disposed) {
+        outcome = "disposed";
+        break;
+      }
+      if (generation !== this.runGeneration) {
+        await cancelTerminalStream(reader);
+        outcome = "superseded";
+        break;
+      }
+      if (done) {
+        outcome = terminalFinish ? "completed" : "disconnected";
+        break;
+      }
+      if (value.status === "error") {
+        outcome = terminalFinish ? "completed" : "disconnected";
+        break;
+      }
+      const projected = projectMiniLilacStreamChunk(value.value, this.streamProjection);
+      switch (projected.kind) {
+        case "finish":
+          terminalFinish = true;
+          this.renderer.handleProjected({ kind: "rendered", chunk: projected.chunk });
+          continue;
+        case "cursor":
+          this.admitRun(projected.cursor.runId);
+          continue;
+        case "steering":
+          this.appendReplayedSteering(projected.message);
+          continue;
+        case "steering-committed":
+          this.commitSteering(projected.message);
+          continue;
+        case "renderer":
+          this.renderer.handleProjected(projected.chunk);
+          continue;
+      }
     }
+    if (this.activeReader === reader) this.activeReader = undefined;
+    const released = releaseTerminalStreamLock(reader);
+    if (released.status === "error" && outcome === "completed") return "disconnected";
+    return outcome;
   }
 
   private enqueueSteer(
@@ -763,30 +791,35 @@ export class Controller {
       remove: removeOptimistic,
     });
     this.steerChain = this.steerChain.then(async () => {
-      try {
-        const runId = await admission;
-        if (runId === undefined || !this.isCurrentControl(generation, controlGeneration)) {
-          rollback();
-          this.pendingSteerOptimistic.delete(clientCommandId);
+      const runId = await admission;
+      if (runId === undefined || !this.isCurrentControl(generation, controlGeneration)) {
+        rollback();
+        this.pendingSteerOptimistic.delete(clientCommandId);
+        this.pendingSteerCommandIds.delete(clientCommandId);
+        return;
+      }
+      const request = { sessionId: this.sessionId, runId, message, clientCommandId };
+      let steered = await this.options.transport.steerResult(request, { signal });
+      if (
+        steered.status === "error" &&
+        this.isCurrentControl(generation, controlGeneration) &&
+        !signal.aborted
+      ) {
+        steered = await this.options.transport.steerResult(request, { signal });
+      }
+      if (steered.status === "error") {
+        if (!this.isCurrentControl(generation, controlGeneration)) {
+          this.pendingSteerCommandIds.delete(clientCommandId);
           return;
         }
-        const request = { sessionId: this.sessionId, runId, message, clientCommandId };
-        try {
-          await this.options.transport.steer(request, { signal });
-        } catch {
-          if (!this.isCurrentControl(generation, controlGeneration) || signal.aborted) return;
-          await this.options.transport.steer(request, { signal });
-        }
-        this.pendingSteerOptimistic.delete(clientCommandId);
-      } catch (error) {
-        if (!this.isCurrentControl(generation, controlGeneration)) return;
         rollback();
         this.pendingSteerOptimistic.delete(clientCommandId);
         this.dispatch({ type: "steer-failed" });
-        this.commitError(error);
-      } finally {
-        this.pendingSteerCommandIds.delete(clientCommandId);
+        this.commitError(steered.error);
+      } else {
+        this.pendingSteerOptimistic.delete(clientCommandId);
       }
+      this.pendingSteerCommandIds.delete(clientCommandId);
     });
   }
 
@@ -800,23 +833,23 @@ export class Controller {
     void (async () => {
       const runId = await admission;
       if (runId === undefined || !this.isCurrentRun(generation)) return;
-      try {
-        await this.options.transport.interruptQueuedSteering(
-          { sessionId: this.sessionId, runId, clientCommandId, pendingSteerCommandIds },
-          { signal },
-        );
+      const interrupted = await this.options.transport.interruptQueuedSteeringResult(
+        { sessionId: this.sessionId, runId, clientCommandId, pendingSteerCommandIds },
+        { signal },
+      );
+      if (interrupted.status === "ok") {
         this.confirmInterrupt(clientCommandId);
-      } catch (error) {
-        if (!this.isCurrentRun(generation)) return;
-        const commandIds = this.interruptSteerCommandIds.get(clientCommandId) ?? [];
-        this.interruptSteerCommandIds.delete(clientCommandId);
-        commandIds.forEach((commandId) => {
-          if (this.pendingSteerOptimistic.has(commandId)) {
-            this.pendingSteerCommandIds.add(commandId);
-          }
-        });
-        this.commitError(error);
+        return;
       }
+      if (!this.isCurrentRun(generation)) return;
+      const commandIds = this.interruptSteerCommandIds.get(clientCommandId) ?? [];
+      this.interruptSteerCommandIds.delete(clientCommandId);
+      commandIds.forEach((commandId) => {
+        if (this.pendingSteerOptimistic.has(commandId)) {
+          this.pendingSteerCommandIds.add(commandId);
+        }
+      });
+      this.commitError(interrupted.error);
     })();
   }
 
@@ -829,16 +862,15 @@ export class Controller {
       let runId = await admission;
       if (!this.isCurrentRun(generation)) return;
       if (runId === undefined && this.state.phase === "disconnected") {
-        try {
-          const snapshot = await this.options.transport.getSession(this.sessionId, {
-            signal: this.abortController.signal,
-          });
-          this.onSnapshot(snapshot);
-          runId = snapshot.activeRunId ?? undefined;
-        } catch (error) {
-          if (this.isCurrentRun(generation)) this.commitError(error);
+        const loaded = await this.options.transport.getSessionResult(this.sessionId, {
+          signal: this.abortController.signal,
+        });
+        if (loaded.status === "error") {
+          if (this.isCurrentRun(generation)) this.commitError(loaded.error);
           return;
         }
+        this.onSnapshot(loaded.value);
+        runId = loaded.value.activeRunId ?? undefined;
       }
       if (runId === undefined) return;
       // Let already-queued steers dispatch, but do not wait for their HTTP responses.
@@ -846,18 +878,17 @@ export class Controller {
       if (!this.isCurrentRun(generation)) return;
       // A fresh control generation aborts pending controls without touching the SSE stream.
       const signal = this.abortPendingControls();
-      try {
-        await this.options.transport.cancel(
-          { sessionId: this.sessionId, runId, clientCommandId },
-          { signal },
-        );
-        if (!this.isCurrentRun(generation)) return;
-        if (this.state.phase === "disconnected") {
-          await this.reconnectRun(generation);
-        }
-      } catch (error) {
-        if (!this.isCurrentRun(generation)) return;
-        this.commitError(error);
+      const cancelled = await this.options.transport.cancelResult(
+        { sessionId: this.sessionId, runId, clientCommandId },
+        { signal },
+      );
+      if (!this.isCurrentRun(generation)) return;
+      if (cancelled.status === "error") {
+        this.commitError(cancelled.error);
+        return;
+      }
+      if (this.state.phase === "disconnected") {
+        await this.reconnectRun(generation);
       }
     })();
   }
@@ -940,25 +971,22 @@ export class Controller {
     const draftBefore = draftSnapshot(this.state);
     const draftGeneration = this.draftMutationGeneration;
     const clientCommandId = (this.pendingUndoCommandId ??= crypto.randomUUID());
-    let result: Awaited<ReturnType<MiniLilacTransport["undo"]>>;
-    try {
-      try {
-        result = await this.options.transport.undo(
-          { sessionId: this.sessionId, clientCommandId },
-          { signal: this.abortController.signal },
-        );
-      } catch {
-        result = await this.options.transport.undo(
-          { sessionId: this.sessionId, clientCommandId },
-          { signal: this.abortController.signal },
-        );
-      }
-    } catch (error) {
+    const request = { sessionId: this.sessionId, clientCommandId };
+    let undone = await this.options.transport.undoResult(request, {
+      signal: this.abortController.signal,
+    });
+    if (undone.status === "error") {
+      undone = await this.options.transport.undoResult(request, {
+        signal: this.abortController.signal,
+      });
+    }
+    if (undone.status === "error") {
       if (this.disposed) return;
       this.dispatch({ type: "operation-failed" });
-      this.commitError(error);
+      this.commitError(undone.error);
       return;
     }
+    const result = undone.value;
 
     if (this.disposed) return;
     if (result.status === "empty") {
@@ -969,6 +997,7 @@ export class Controller {
     }
     const refresh = await this.refreshHistoryState(result.historyStateId);
     if (this.disposed) return;
+    if (refresh.kind === "disposed") return;
     if (refresh.kind === "failed") {
       this.historyStateId = result.historyStateId;
       this.canUndo = undefined;
@@ -1007,25 +1036,22 @@ export class Controller {
       return;
     }
     const clientCommandId = (this.pendingRedoCommandId ??= crypto.randomUUID());
-    let result: Awaited<ReturnType<MiniLilacTransport["redo"]>>;
-    try {
-      try {
-        result = await this.options.transport.redo(
-          { sessionId: this.sessionId, clientCommandId },
-          { signal: this.abortController.signal },
-        );
-      } catch {
-        result = await this.options.transport.redo(
-          { sessionId: this.sessionId, clientCommandId },
-          { signal: this.abortController.signal },
-        );
-      }
-    } catch (error) {
+    const request = { sessionId: this.sessionId, clientCommandId };
+    let redone = await this.options.transport.redoResult(request, {
+      signal: this.abortController.signal,
+    });
+    if (redone.status === "error") {
+      redone = await this.options.transport.redoResult(request, {
+        signal: this.abortController.signal,
+      });
+    }
+    if (redone.status === "error") {
       if (this.disposed) return;
       this.dispatch({ type: "operation-failed" });
-      this.commitError(error);
+      this.commitError(redone.error);
       return;
     }
+    const result = redone.value;
 
     if (this.disposed) return;
     if (result.status === "empty") {
@@ -1036,6 +1062,7 @@ export class Controller {
     }
     const refresh = await this.refreshHistoryState(result.historyStateId);
     if (this.disposed) return;
+    if (refresh.kind === "disposed") return;
     if (refresh.kind === "failed") {
       this.historyStateId = result.historyStateId;
       this.canUndo = true;
@@ -1080,27 +1107,26 @@ export class Controller {
   ): Promise<
     | { readonly kind: "matched"; readonly snapshot: MiniLilacSessionSnapshot }
     | { readonly kind: "moved"; readonly snapshot: MiniLilacSessionSnapshot }
-    | { readonly kind: "failed"; readonly error: unknown }
+    | { readonly kind: "failed"; readonly error: MiniLilacRequestError }
+    | { readonly kind: "disposed" }
   > {
-    try {
-      const resume = await this.options.transport.getSessionResume(this.sessionId, {
-        signal: this.abortController.signal,
-      });
-      if (this.disposed) return { kind: "failed", error: new Error("controller disposed") };
-      this.sessionExists = true;
-      this.acceptSnapshot(resume.snapshot);
-      this.replaceMessages(resume.messages);
-      this.options.transport.setReconnectCursor(this.sessionId, resume.replayCursor);
-      this.onTodos(resume.todos);
-      const quiescent =
-        resume.snapshot.activeRunId === null &&
-        (resume.snapshot.status === "idle" || resume.snapshot.status === "error");
-      return resume.snapshot.historyStateId === expectedHistoryStateId && quiescent
-        ? { kind: "matched", snapshot: resume.snapshot }
-        : { kind: "moved", snapshot: resume.snapshot };
-    } catch (error) {
-      return { kind: "failed", error };
-    }
+    const loaded = await this.options.transport.getSessionResumeResult(this.sessionId, {
+      signal: this.abortController.signal,
+    });
+    if (loaded.status === "error") return { kind: "failed", error: loaded.error };
+    if (this.disposed) return { kind: "disposed" };
+    const resume = loaded.value;
+    this.sessionExists = true;
+    this.acceptSnapshot(resume.snapshot);
+    this.replaceMessages(resume.messages);
+    this.options.transport.setReconnectCursor(this.sessionId, resume.replayCursor);
+    this.onTodos(resume.todos);
+    const quiescent =
+      resume.snapshot.activeRunId === null &&
+      (resume.snapshot.status === "idle" || resume.snapshot.status === "error");
+    return resume.snapshot.historyStateId === expectedHistoryStateId && quiescent
+      ? { kind: "matched", snapshot: resume.snapshot }
+      : { kind: "moved", snapshot: resume.snapshot };
   }
 
   private finishHistoryRefresh(snapshot: MiniLilacSessionSnapshot): void {
@@ -1135,7 +1161,6 @@ export class Controller {
     // Whether the server already told us how this ended. If it did, the promise
     // rejection that follows is that same event, not a second thing to report.
     let terminated = false;
-    let result: MiniLilacCompactResult;
     // Cancellation must wait for the server to acknowledge the operation, so
     // the admission gate opens on the first lifecycle event (or on failure).
     this.compactionAdmission = new Promise((resolve) => {
@@ -1143,26 +1168,27 @@ export class Controller {
     });
     const clientCommandId = crypto.randomUUID();
     this.compactionCommandId = clientCommandId;
-    try {
-      result = await this.options.transport.compact(
-        { sessionId: this.sessionId, clientCommandId },
-        {
-          // Only unsubscribes on teardown. Detaching does not cancel: the
-          // compaction keeps running and commits server-side either way.
-          signal: this.abortController.signal,
-          onEvent: (event) => {
-            this.openCompactionAdmissionGate();
-            if (this.disposed) return;
-            if (event.phase !== "started" && event.phase !== "progress") terminated = true;
-            if (entryId === undefined) entryId = this.appendOutput(compactionEntry(event));
-            else this.updateOutput(entryId, compactionEntry(event));
-          },
-          onSession: (snapshot) => {
-            if (!this.disposed) this.acceptSnapshot(snapshot);
-          },
+    const compacted = await this.options.transport.compactResult(
+      { sessionId: this.sessionId, clientCommandId },
+      {
+        // Only unsubscribes on teardown. Detaching does not cancel: the
+        // compaction keeps running and commits server-side either way.
+        signal: this.abortController.signal,
+        onEvent: (event) => {
+          this.openCompactionAdmissionGate();
+          if (this.disposed) return;
+          if (event.phase !== "started" && event.phase !== "progress") terminated = true;
+          if (entryId === undefined) entryId = this.appendOutput(compactionEntry(event));
+          else this.updateOutput(entryId, compactionEntry(event));
         },
-      );
-    } catch (error) {
+        onSession: (snapshot) => {
+          if (!this.disposed) this.acceptSnapshot(snapshot);
+        },
+      },
+    );
+    this.openCompactionAdmissionGate();
+    if (compacted.status === "error") {
+      const error = compacted.error;
       this.openCompactionAdmissionGate();
       if (this.disposed) return;
       if (terminated) {
@@ -1196,9 +1222,8 @@ export class Controller {
       });
       await this.watchDetachedCompaction();
       return;
-    } finally {
-      this.openCompactionAdmissionGate();
     }
+    const result: MiniLilacCompactResult = compacted.value;
 
     if (this.disposed) return;
     this.compactionCommandId = undefined;
@@ -1212,36 +1237,43 @@ export class Controller {
     // Compaction is committed from here on. A failure below is a failure to
     // refresh the local view, not a failed compaction, and must not be reported
     // as one.
-    try {
-      const messages = await this.options.transport.getMessages(this.sessionId, {
-        signal: this.abortController.signal,
-      });
-      if (this.disposed) return;
-      // The server persists its own compaction entry, so the live one would
-      // otherwise be shown twice after the transcript is replaced.
-      const liveEntryId = entryId;
-      entryId = undefined;
-      this.replaceMessages(messages);
-      if (liveEntryId !== undefined) this.removeOutput(liveEntryId);
-      const snapshot = await this.options.transport.getSession(this.sessionId, {
-        signal: this.abortController.signal,
-      });
-      if (this.disposed) return;
-      this.acceptSnapshot(snapshot);
-      if (!this.followSnapshotActivity(snapshot)) {
+    const loadedMessages = await this.options.transport.getMessagesResult(this.sessionId, {
+      signal: this.abortController.signal,
+    });
+    if (this.disposed) return;
+    if (loadedMessages.status === "error") {
+      if (!(await this.followLatestSessionActivity()))
         this.dispatch({ type: "operation-completed" });
-      }
-    } catch (error) {
-      if (this.disposed) return;
-      if (!(await this.followLatestSessionActivity())) {
-        this.dispatch({ type: "operation-completed" });
-      }
-      const message = error instanceof Error ? error.message : String(error);
       this.appendOutput({
         kind: "status",
         tone: "warning",
-        text: `context compacted, but refreshing the transcript failed: ${message}`,
+        text: `context compacted, but refreshing the transcript failed: ${errorMessage(loadedMessages.error)}`,
       });
+      return;
+    }
+    // The server persists its own compaction entry, so the live one would
+    // otherwise be shown twice after the transcript is replaced.
+    const liveEntryId = entryId;
+    entryId = undefined;
+    this.replaceMessages(loadedMessages.value);
+    if (liveEntryId !== undefined) this.removeOutput(liveEntryId);
+    const loadedSnapshot = await this.options.transport.getSessionResult(this.sessionId, {
+      signal: this.abortController.signal,
+    });
+    if (this.disposed) return;
+    if (loadedSnapshot.status === "error") {
+      if (!(await this.followLatestSessionActivity()))
+        this.dispatch({ type: "operation-completed" });
+      this.appendOutput({
+        kind: "status",
+        tone: "warning",
+        text: `context compacted, but refreshing the transcript failed: ${errorMessage(loadedSnapshot.error)}`,
+      });
+      return;
+    }
+    this.acceptSnapshot(loadedSnapshot.value);
+    if (!this.followSnapshotActivity(loadedSnapshot.value)) {
+      this.dispatch({ type: "operation-completed" });
     }
   }
 
@@ -1265,24 +1297,32 @@ export class Controller {
       if (this.disposed) return;
       let clientCommandId = observedCommandId;
       if (clientCommandId === undefined) {
-        const snapshot = await this.options.transport.getSession(this.sessionId, {
+        const loaded = await this.options.transport.getSessionResult(this.sessionId, {
           signal: this.abortController.signal,
         });
         if (this.disposed) return;
+        if (loaded.status === "error") {
+          this.commitError(loaded.error);
+          return;
+        }
+        const snapshot = loaded.value;
         this.acceptSnapshot(snapshot);
         if (snapshot.status !== "compacting" || snapshot.activeCompactionCommandId == null) return;
         clientCommandId = snapshot.activeCompactionCommandId;
       }
-      const result = await this.options.transport.cancelCompaction(
+      const cancelled = await this.options.transport.cancelCompactionResult(
         { sessionId: this.sessionId, clientCommandId },
         { signal: this.abortController.signal },
       );
+      if (cancelled.status === "error") {
+        if (!this.disposed) this.commitError(cancelled.error);
+        return;
+      }
+      const result = cancelled.value;
       if (result.status === "inactive" && this.state.phase === "compacting") {
         await this.followLatestSessionActivity();
       }
-    })().catch((error: unknown) => {
-      if (!this.disposed) this.commitError(error);
-    });
+    })();
   }
 
   /** Open the gate that `esc` cancellation waits behind. */
@@ -1312,10 +1352,14 @@ export class Controller {
         // Follow one compaction generation to a non-compacting snapshot.
         for (;;) {
           if (this.disposed) return;
-          try {
-            const snapshot = await this.options.transport.getSession(this.sessionId, {
-              signal: this.abortController.signal,
-            });
+          const loaded = await this.options.transport.getSessionResult(this.sessionId, {
+            signal: this.abortController.signal,
+          });
+          if (loaded.status === "error") {
+            // Transient: the outcome is still unknown, so keep watching.
+            if (this.disposed) return;
+          } else {
+            const snapshot = loaded.value;
             if (this.disposed) return;
             this.acceptSnapshot(snapshot);
             if (snapshot.status !== "compacting") {
@@ -1323,37 +1367,33 @@ export class Controller {
               terminal = snapshot;
               break;
             }
-          } catch {
-            // Transient: the outcome is still unknown, so keep watching.
-            if (this.disposed) return;
           }
           await wait();
         }
 
-        try {
-          const messages = await this.options.transport.getMessages(this.sessionId, {
-            signal: this.abortController.signal,
-          });
-          if (this.disposed) return;
-          this.replaceMessages(messages);
-        } catch (error) {
+        const loadedMessages = await this.options.transport.getMessagesResult(this.sessionId, {
+          signal: this.abortController.signal,
+        });
+        if (loadedMessages.status === "error") {
           if (this.disposed) return;
           this.appendOutput({
             kind: "status",
             tone: "warning",
-            text: `compaction ended, but refreshing the transcript failed: ${errorMessage(error)}`,
+            text: `compaction ended, but refreshing the transcript failed: ${errorMessage(loadedMessages.error)}`,
           });
+        } else {
+          if (this.disposed) return;
+          this.replaceMessages(loadedMessages.value);
         }
 
         if (terminal !== undefined) {
-          try {
-            terminal = await this.options.transport.getSession(this.sessionId, {
-              signal: this.abortController.signal,
-            });
+          const refreshed = await this.options.transport.getSessionResult(this.sessionId, {
+            signal: this.abortController.signal,
+          });
+          if (refreshed.status === "ok") {
+            terminal = refreshed.value;
             if (this.disposed) return;
             this.acceptSnapshot(terminal);
-          } catch {
-            // The terminal poll is still authoritative if this refresh fails.
           }
         }
         // A successor compaction may begin while its predecessor's transcript is
@@ -1398,16 +1438,12 @@ export class Controller {
 
   /** Refresh server activity after a terminal/refused operation before idling. */
   private async followLatestSessionActivity(): Promise<boolean> {
-    try {
-      const snapshot = await this.options.transport.getSession(this.sessionId, {
-        signal: this.abortController.signal,
-      });
-      if (this.disposed) return false;
-      this.acceptSnapshot(snapshot);
-      return this.followSnapshotActivity(snapshot);
-    } catch {
-      return false;
-    }
+    const loaded = await this.options.transport.getSessionResult(this.sessionId, {
+      signal: this.abortController.signal,
+    });
+    if (loaded.status === "error" || this.disposed) return false;
+    this.acceptSnapshot(loaded.value);
+    return this.followSnapshotActivity(loaded.value);
   }
 
   private async completeRun(generation: number): Promise<void> {
@@ -1416,10 +1452,11 @@ export class Controller {
     this.clearSteering();
     const completedRunId = this.activeRunId;
     this.activeRunId = undefined;
-    try {
-      const snapshot = await this.options.transport.getSession(this.sessionId, {
-        signal: this.abortController.signal,
-      });
+    const loaded = await this.options.transport.getSessionResult(this.sessionId, {
+      signal: this.abortController.signal,
+    });
+    if (loaded.status === "ok") {
+      const snapshot = loaded.value;
       if (!this.isCurrentRun(generation)) return;
       this.acceptSnapshot(snapshot);
       if (snapshot.status === "compacting") {
@@ -1433,23 +1470,17 @@ export class Controller {
         (snapshot.status === "streaming" || snapshot.status === "cancelling") &&
         snapshot.activeRunId === completedRunId;
       if (!stillReportsCompletedRun && this.followSnapshotActivity(snapshot)) return;
-    } catch {
-      // Message reconciliation is still sufficient to finish the known run.
     }
     this.dispatch({ type: "agent-stopped" });
   }
 
   private async reconcile(generation: number): Promise<void> {
     if (!this.isCurrentRun(generation)) return;
-    try {
-      const messages = await this.options.transport.getMessages(this.sessionId, {
-        signal: this.abortController.signal,
-      });
-      if (!this.isCurrentRun(generation)) return;
-      this.replaceMessages(messages);
-    } catch {
-      // Keep the local transcript; the server copy is temporarily unavailable.
-    }
+    const loaded = await this.options.transport.getMessagesResult(this.sessionId, {
+      signal: this.abortController.signal,
+    });
+    if (loaded.status === "error" || !this.isCurrentRun(generation)) return;
+    this.replaceMessages(loaded.value);
   }
 
   private replaceMessages(messages: readonly MiniLilacUIMessage[]): void {
@@ -1613,7 +1644,8 @@ export class Controller {
         }),
       )
       .map((file) => {
-        const separator = restoredEditor.length > 0 ? (restoredText.length > 0 ? "\n" : " ") : "";
+        let separator = "";
+        if (restoredEditor.length > 0) separator = restoredText.length > 0 ? "\n" : " ";
         restoredEditor += separator;
         const start = editorOffsetWidth(restoredEditor);
         restoredEditor += file.placeholder;
@@ -1694,12 +1726,17 @@ export class Controller {
     });
   }
 
-  private commitError(error: unknown): void {
-    this.appendOutput({ kind: "error", tone: "danger", text: errorMessage(error) });
+  private commitError(error: ControllerFailure | string): void {
+    this.appendOutput({
+      kind: "error",
+      tone: "danger",
+      text: typeof error === "string" ? error : errorMessage(error),
+    });
   }
 
   private beginRun(): void {
     this.renderer.startRun();
+    this.streamProjection.reset();
   }
 
   private onPromptAdmitted(): void {
@@ -1753,8 +1790,7 @@ function userParts(text: string, files: readonly DraftFile[]): MiniLilacUserUIMe
   const fileParts = files.map((file) => file.file);
   if (text.length > 0) return [{ type: "text", text }, ...fileParts];
   const [first, ...rest] = fileParts;
-  if (first === undefined) throw new Error("A user prompt requires text or an attachment");
-  return [first, ...rest];
+  return first === undefined ? [] : [first, ...rest];
 }
 
 export function expandDraftText(

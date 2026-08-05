@@ -3,9 +3,11 @@ import { describe, expect, it } from "bun:test";
 import { CODEX_BASE_INSTRUCTIONS } from "../codex-instructions";
 import type { CodexOAuthTokens } from "../codex-oauth";
 import {
+  CodexRequestInvalid,
   createCodexResponsesEventNormalizer,
   getModelProviders,
   normalizeCodexResponsesRequestRecord,
+  normalizeCodexResponsesRequestRecordResult,
   refreshCodexOAuthTokens,
   shouldRefreshCodexOAuthTokens,
 } from "../model-provider";
@@ -144,6 +146,13 @@ describe("normalizeCodexResponsesRequestRecord", () => {
     expect(() => normalizeCodexResponsesRequestRecord({ stream: false, input: [] })).toThrow(
       "requires streaming",
     );
+
+    const result = normalizeCodexResponsesRequestRecordResult({ input: [] });
+    expect(result.status).toBe("error");
+    if (result.status === "error") {
+      expect(result.error).toBeInstanceOf(CodexRequestInvalid);
+      expect(result.error.issue).toBe("streaming-required");
+    }
   });
 
   it("keeps compaction triggers while stripping replay item IDs from the wire", () => {

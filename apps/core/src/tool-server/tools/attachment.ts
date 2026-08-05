@@ -4,9 +4,15 @@ import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
 import { basename, extname, join, resolve } from "node:path";
 import type { ModelMessage } from "ai";
-import type { RequestContext, ServerTool } from "../types";
 import { lilacEventTypes, type LilacBus } from "@stanley2058/lilac-event-bus";
-import { parseToolInput } from "../validation-error-message";
+import {
+  defineServerTool,
+  type ServerTool,
+  type ServerToolCallOptions,
+} from "@stanley2058/lilac-plugin-runtime";
+import { Result, TaggedError, type Result as ResultType } from "better-result";
+
+import type { RequestContext } from "../types";
 import {
   requireToolServerHeaders,
   type RequiredToolServerHeaders,
@@ -22,6 +28,23 @@ import {
   sanitizeExtension,
 } from "../../shared/attachment-utils";
 import { expandTilde } from "@stanley2058/lilac-fs";
+
+import { adaptEventPublishResultToHost } from "../../shared/event-bus-result";
+
+class AttachmentToolFailure extends TaggedError("AttachmentToolFailure")<{
+  readonly message: string;
+}> {}
+
+function adaptAttachmentResultToToolHost<TValue>(
+  result: ResultType<TValue, AttachmentToolFailure>,
+): TValue {
+  if (result.status === "ok") return result.value;
+  throw new Error(result.error.message);
+}
+
+function signalAttachmentFailureToToolHost(message: string): never {
+  return adaptAttachmentResultToToolHost(Result.err(new AttachmentToolFailure({ message })));
+}
 
 const DEFAULT_OUTBOUND_MAX_FILE_BYTES = 8 * 1024 * 1024;
 const DEFAULT_OUTBOUND_MAX_TOTAL_BYTES = 16 * 1024 * 1024;
@@ -77,7 +100,7 @@ function asBuffer(data: unknown): Buffer {
     return Buffer.from(data, "base64");
   }
 
-  throw new Error("Unsupported data content");
+  return signalAttachmentFailureToToolHost("Unsupported data content");
 }
 
 async function downloadToBuffer(input: unknown): Promise<{
@@ -87,14 +110,14 @@ async function downloadToBuffer(input: unknown): Promise<{
 }> {
   if (input instanceof URL) {
     if (!DISCORD_CDN_HOSTS.has(input.hostname)) {
-      throw new Error(
+      signalAttachmentFailureToToolHost(
         `Blocked attachment host '${input.hostname}'. Allowed: ${[...DISCORD_CDN_HOSTS].join(", ")}`,
       );
     }
 
     const res = await fetch(input.toString(), { redirect: "follow" });
     if (!res.ok) {
-      throw new Error(`Failed to download attachment (${res.status}): ${input}`);
+      signalAttachmentFailureToToolHost(`Failed to download attachment (${res.status}): ${input}`);
     }
     const ab = await res.arrayBuffer();
     return {
@@ -208,72 +231,77 @@ function collectUserAttachments(messages: readonly ModelMessage[]): DetectedAtta
 
 export class Attachment implements ServerTool {
   id = "attachment";
+  private readonly tool: ServerTool;
 
-  constructor(private readonly params: { bus: LilacBus }) {}
+  constructor(private readonly params: { bus: LilacBus }) {
+    this.tool = defineServerTool({
+      id: this.id,
+      callables: ({ callable }) => ({
+        "attachment.add_files": callable({
+          name: "Attachment Add Files",
+          description: "Reads local files and attaches them to the current reply.",
+          inputSchema: attachmentAddFilesInputSchema,
+          primaryPositional: {
+            field: "paths",
+            variadic: true,
+          },
+          cli: {
+            shortInput: ["--paths=<string | string[]>"],
+            input: [
+              "--paths=<string | string[]> | Local file paths (preferred; alias: files)",
+              "--filenames=<string | string[]> | Optional filenames (same length as paths)",
+              "--mimeTypes=<string | string[]> | Optional mime types (same length as paths)",
+            ],
+          },
+          run: (input, opts) => this.callAddFiles(input, opts?.context),
+        }),
+        "attachment.download": callable({
+          name: "Attachment Download",
+          description:
+            "Download inbound user message attachments into the sandbox (from the current request prompt).",
+          inputSchema: attachmentDownloadInputSchema,
+          cli: {
+            shortInput: [],
+            input: ["--downloadDir=<string>"],
+          },
+          run: (input, opts) => {
+            const messages = opts?.messages as readonly ModelMessage[] | undefined;
+            if (!messages) {
+              signalAttachmentFailureToToolHost(
+                "attachment.download requires request messages, but none were available for this request. (Tool server caches cmd.request messages; ensure the tool server is connected to the bus and started before the request.)",
+              );
+            }
+            return this.callDownload(input, messages, opts?.context);
+          },
+        }),
+      }),
+    });
+  }
 
-  async init(): Promise<void> {}
-  async destroy(): Promise<void> {}
+  async init(): Promise<void> {
+    await this.tool.init();
+  }
+
+  async destroy(): Promise<void> {
+    await this.tool.destroy();
+  }
 
   async list() {
-    return [
-      {
-        callableId: "attachment.add_files",
-        name: "Attachment Add Files",
-        description: "Reads local files and attaches them to the current reply.",
-        shortInput: ["--paths=<string | string[]>"],
-        input: [
-          "--paths=<string | string[]> | Local file paths (preferred; alias: files)",
-          "--filenames=<string | string[]> | Optional filenames (same length as paths)",
-          "--mimeTypes=<string | string[]> | Optional mime types (same length as paths)",
-        ],
-        primaryPositional: {
-          field: "paths",
-          variadic: true,
-        },
-      },
-      {
-        callableId: "attachment.download",
-        name: "Attachment Download",
-        description:
-          "Download inbound user message attachments into the sandbox (from the current request prompt).",
-        shortInput: [],
-        input: ["--downloadDir=<string>"],
-      },
-    ];
+    return await this.tool.list();
   }
 
   async call(
     callableId: string,
     input: Record<string, unknown>,
-    opts?: {
-      signal?: AbortSignal;
-      context?: RequestContext;
-      messages?: readonly unknown[];
-    },
+    opts?: ServerToolCallOptions,
   ): Promise<unknown> {
-    if (callableId === "attachment.add_files") {
-      return await this.callAddFiles(input, opts?.context);
-    }
-
-    if (callableId === "attachment.download") {
-      const messages = opts?.messages as readonly ModelMessage[] | undefined;
-      if (!messages) {
-        throw new Error(
-          "attachment.download requires request messages, but none were available for this request. (Tool server caches cmd.request messages; ensure the tool server is connected to the bus and started before the request.)",
-        );
-      }
-      return await this.callDownload(input, messages, opts?.context);
-    }
-
-    throw new Error(`Invalid callable ID '${callableId}'`);
+    return await this.tool.call(callableId, input, opts);
   }
 
-  private async callAddFiles(rawInput: Record<string, unknown>, ctx: RequestContext | undefined) {
-    const input = parseToolInput({
-      callableId: "attachment.add_files",
-      input: rawInput,
-      schema: attachmentAddFilesInputSchema,
-    });
+  private async callAddFiles(
+    input: z.output<typeof attachmentAddFilesInputSchema>,
+    ctx: RequestContext | undefined,
+  ) {
     const headers = toHeaders(ctx);
 
     const cwd = ctx?.cwd ?? process.cwd();
@@ -292,20 +320,20 @@ export class Attachment implements ServerTool {
 
       const st = await fs.stat(resolvedPath);
       if (!st.isFile()) {
-        throw new Error(
+        signalAttachmentFailureToToolHost(
           `Not a file: ${formatToolPathForRequestContext({ path: resolvedPath, context: ctx })}`,
         );
       }
 
       if (st.size > DEFAULT_OUTBOUND_MAX_FILE_BYTES) {
-        throw new Error(
+        signalAttachmentFailureToToolHost(
           `Attachment too large (${st.size} bytes). Max is ${DEFAULT_OUTBOUND_MAX_FILE_BYTES} bytes: ${formatToolPathForRequestContext({ path: resolvedPath, context: ctx })}`,
         );
       }
 
       totalBytes += st.size;
       if (totalBytes > DEFAULT_OUTBOUND_MAX_TOTAL_BYTES) {
-        throw new Error(
+        signalAttachmentFailureToToolHost(
           `Total attachment bytes too large (${totalBytes} bytes). Max is ${DEFAULT_OUTBOUND_MAX_TOTAL_BYTES} bytes.`,
         );
       }
@@ -323,10 +351,12 @@ export class Attachment implements ServerTool {
 
       const dataBase64 = Buffer.from(bytes).toString("base64");
 
-      await this.params.bus.publish(
-        lilacEventTypes.EvtAgentOutputResponseBinary,
-        { mimeType, dataBase64, filename },
-        { headers },
+      adaptEventPublishResultToHost(
+        await this.params.bus.publish(
+          lilacEventTypes.EvtAgentOutputResponseBinary,
+          { mimeType, dataBase64, filename },
+          { headers },
+        ),
       );
 
       out.push({ filename, mimeType, bytes: bytes.byteLength });
@@ -336,16 +366,10 @@ export class Attachment implements ServerTool {
   }
 
   private async callDownload(
-    rawInput: Record<string, unknown>,
+    input: z.output<typeof attachmentDownloadInputSchema>,
     messages: readonly ModelMessage[],
     ctx: RequestContext | undefined,
   ) {
-    const input = parseToolInput({
-      callableId: "attachment.download",
-      input: rawInput,
-      schema: attachmentDownloadInputSchema,
-    });
-
     const downloadDir =
       ctx?.safetyMode === "restricted"
         ? resolveToolPathForRequestContext({
@@ -379,14 +403,14 @@ export class Attachment implements ServerTool {
       const downloaded = await downloadToBuffer(att.data);
 
       if (downloaded.bytes.byteLength > DEFAULT_INBOUND_MAX_FILE_BYTES) {
-        throw new Error(
+        signalAttachmentFailureToToolHost(
           `Attachment too large (${downloaded.bytes.byteLength} bytes). Max is ${DEFAULT_INBOUND_MAX_FILE_BYTES} bytes.`,
         );
       }
 
       totalBytes += downloaded.bytes.byteLength;
       if (totalBytes > DEFAULT_INBOUND_MAX_TOTAL_BYTES) {
-        throw new Error(
+        signalAttachmentFailureToToolHost(
           `Total attachment bytes too large (${totalBytes} bytes). Max is ${DEFAULT_INBOUND_MAX_TOTAL_BYTES} bytes.`,
         );
       }

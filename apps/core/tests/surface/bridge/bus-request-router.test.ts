@@ -1,14 +1,26 @@
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, spyOn } from "bun:test";
+import { Panic, Result, TaggedError, type Result as ResultType } from "better-result";
 
 import {
   createLilacBus,
+  EventDeliveryStartFailed,
+  EventDeliveryStopFailed,
+  EventDeliveryTransportFailed,
   lilacEventTypes,
-  type HandleContext,
+  type EventDeliveryDoneError,
+  type DecodedLilacMessageForTopic,
+  type FetchOptions,
+  type LilacBus,
+  type LilacTopic,
   type Message,
   type PublishOptions,
   type RawBus,
+  type RawDeliveryAction,
+  type RawDeliveryHandler,
   type SubscriptionOptions,
 } from "@stanley2058/lilac-event-bus";
+import { parseCoreConfigV1ToUniversal } from "@stanley2058/lilac-utils";
+import { Logger } from "@stanley2058/simple-module-logger";
 
 import { startBusRequestRouter } from "../../../src/surface/bridge/bus-request-router";
 import { formatBufferedMessageForGateTranscript } from "../../../src/surface/bridge/bus-request-router/gate";
@@ -29,16 +41,84 @@ import type {
 import type { TranscriptStore } from "../../../src/transcript/transcript-store";
 import type { ModelMessage } from "ai";
 
-function createInMemoryRawBus(): RawBus {
+type TestRawBus = RawBus & {
+  readonly deliveryActions: Array<{ readonly topic: string; readonly action: RawDeliveryAction }>;
+  failPublicationsTo(topic: string, cause: unknown): void;
+  failStartsFor(topic: string, cause: unknown): void;
+  failStopsFor(topic: string, cause: unknown): void;
+  finishDelivery(topic: string, error: EventDeliveryDoneError): void;
+};
+
+class RouterTestHookFailure extends TaggedError("RouterTestHookFailure")<{
+  readonly cause: unknown;
+  readonly message: string;
+}> {}
+
+function expectStarted<T>(started: ResultType<T, EventDeliveryStartFailed>): T {
+  if (started.status === "ok") return started.value;
+  if (Panic.is(started.error)) throw started.error;
+  throw new Error(
+    `Test delivery failed to start [${started.error._tag}]: ${started.error.message}`,
+    {
+      cause: started.error,
+    },
+  );
+}
+
+async function subscribeTopicForTest<TTopic extends LilacTopic>(
+  bus: LilacBus,
+  topic: TTopic,
+  options: SubscriptionOptions,
+  handler: (message: DecodedLilacMessageForTopic<TTopic>) => Promise<ResultType<void, never>>,
+) {
+  return expectStarted(await bus.subscribeTopic(topic, options, handler, () => "park-pending"));
+}
+
+function createInMemoryRawBus(): TestRawBus {
   const topics = new Map<string, Array<Message<unknown>>>();
-  const subs = new Set<{
+  const deliveryActions: TestRawBus["deliveryActions"] = [];
+  const publicationFailures = new Map<string, unknown>();
+  const startFailures = new Map<string, unknown>();
+  const stopFailures = new Map<string, unknown>();
+  const deliverySubs = new Set<{
     topic: string;
     opts: SubscriptionOptions;
-    handler: (msg: Message<unknown>, ctx: HandleContext) => Promise<void>;
+    handler: RawDeliveryHandler;
+    done: PromiseWithResolvers<ResultType<void, EventDeliveryDoneError>>;
   }>();
 
+  const deliveryContext = (topic: string, id: string, opts: SubscriptionOptions) => ({
+    cursor: id,
+    mode: opts.mode,
+    evidence: {
+      source: {
+        transport: "redis-streams" as const,
+        streamKey: topic,
+        topic,
+        messageId: id,
+      },
+      wire: { kind: "bounded-complete" as const, fields: [] },
+    },
+  });
+
   return {
+    deliveryActions,
+    failPublicationsTo: (topic, cause) => {
+      publicationFailures.set(topic, cause);
+    },
+    failStartsFor: (topic, cause) => {
+      startFailures.set(topic, cause);
+    },
+    failStopsFor: (topic, cause) => {
+      stopFailures.set(topic, cause);
+    },
+    finishDelivery: (topic, error) => {
+      for (const subscription of deliverySubs) {
+        if (subscription.topic === topic) subscription.done.resolve(Result.err(error));
+      }
+    },
     publish: async <TData>(msg: Omit<Message<TData>, "id" | "ts">, opts: PublishOptions) => {
+      if (publicationFailures.has(opts.topic)) throw publicationFailures.get(opts.topic);
       const id = String(Date.now()) + "-0";
       const stored: Message<unknown> = {
         topic: opts.topic,
@@ -47,55 +127,66 @@ function createInMemoryRawBus(): RawBus {
         ts: Date.now(),
         key: opts.key,
         headers: opts.headers,
-        data: msg.data as unknown,
+        data: msg.data,
       };
 
       const list = topics.get(opts.topic) ?? [];
       list.push(stored);
       topics.set(opts.topic, list);
 
-      for (const s of subs) {
+      for (const s of deliverySubs) {
         if (s.topic !== opts.topic) continue;
-        await s.handler(stored, { cursor: id, commit: async () => {} });
+        const action = await s.handler(stored, deliveryContext(s.topic, id, s.opts));
+        deliveryActions.push({ topic: s.topic, action });
       }
 
       return { id, cursor: id };
     },
 
-    subscribe: async <TData>(
-      topic: string,
-      opts: SubscriptionOptions,
-      handler: (msg: Message<TData>, ctx: HandleContext) => Promise<void>,
-    ) => {
-      const entry = {
-        topic,
-        opts,
-        handler: handler as unknown as (msg: Message<unknown>, ctx: HandleContext) => Promise<void>,
-      };
-      subs.add(entry);
+    subscribe: async (topic, opts, handler) => {
+      if (startFailures.has(topic)) {
+        return Result.err(
+          new EventDeliveryStartFailed({
+            topic,
+            cause: startFailures.get(topic),
+            message: "forced start failure",
+          }),
+        );
+      }
+      const done = Promise.withResolvers<ResultType<void, EventDeliveryDoneError>>();
+      const entry = { topic, opts, handler, done };
+      deliverySubs.add(entry);
 
-      if (opts.mode === "tail" && opts.offset?.type === "begin") {
-        const existing = topics.get(topic) ?? [];
-        for (const m of existing) {
-          await handler(m as unknown as Message<TData>, {
-            cursor: m.id,
-            commit: async () => {},
-          });
+      if (opts.offset?.type === "begin") {
+        for (const message of topics.get(topic) ?? []) {
+          await handler(message, deliveryContext(topic, message.id, opts));
         }
       }
 
-      return {
+      return Result.ok({
+        done: done.promise,
         stop: async () => {
-          subs.delete(entry);
+          deliverySubs.delete(entry);
+          done.resolve(Result.ok(undefined));
+          if (stopFailures.has(topic)) {
+            return Result.err(
+              new EventDeliveryStopFailed({
+                topic,
+                cause: stopFailures.get(topic),
+                message: "forced stop failure",
+              }),
+            );
+          }
+          return Result.ok(undefined);
         },
-      };
+      });
     },
 
-    fetch: async <TData>(topic: string, _opts: any) => {
+    fetch: async (topic: string, _opts: FetchOptions) => {
       const existing = topics.get(topic) ?? [];
       return {
         messages: existing.map((m) => ({
-          msg: m as unknown as Message<TData>,
+          msg: m,
           cursor: m.id,
         })),
         next: existing.length > 0 ? existing[existing.length - 1]!.id : undefined,
@@ -253,6 +344,199 @@ describe("formatBufferedMessageForGateTranscript", () => {
 });
 
 describe("startBusRequestRouter", () => {
+  it("parks malformed lifecycle deliveries and commits ignored and successful lifecycle branches", async () => {
+    const raw = createInMemoryRawBus();
+    const bus = createLilacBus(raw);
+    const router = await startBusRequestRouter({
+      adapter: new FakeAdapter({}),
+      bus,
+      subscriptionId: "router-lifecycle-delivery",
+      config: parseCoreConfigV1ToUniversal({}),
+    });
+
+    await bus.publish(
+      lilacEventTypes.EvtRequestReply,
+      {},
+      {
+        headers: { request_id: "ignored", session_id: "session" },
+      },
+    );
+    await bus.publish(
+      lilacEventTypes.EvtRequestLifecycleChanged,
+      { state: "running" },
+      { headers: { request_id: "missing-session" } },
+    );
+    await bus.publish(
+      lilacEventTypes.EvtRequestLifecycleChanged,
+      { state: "running" },
+      { headers: { request_id: "request", session_id: "session" } },
+    );
+
+    expect(raw.deliveryActions.map(({ action }) => action.disposition)).toEqual([
+      "commit",
+      "park-pending",
+      "commit",
+    ]);
+    await router.stop();
+    await router.done;
+  });
+
+  it("parks malformed surface deliveries and commits stale and successful surface branches", async () => {
+    const raw = createInMemoryRawBus();
+    const bus = createLilacBus(raw);
+    const router = await startBusRequestRouter({
+      adapter: new FakeAdapter({}),
+      bus,
+      subscriptionId: "router-surface-delivery",
+      config: parseCoreConfigV1ToUniversal({}),
+    });
+
+    const msgRef = { platform: "discord" as const, channelId: "session", messageId: "output" };
+    await bus.publish(
+      lilacEventTypes.EvtSurfaceOutputMessageCreated,
+      { msgRef },
+      { headers: { request_id: "missing-session" } },
+    );
+    await bus.publish(
+      lilacEventTypes.EvtSurfaceOutputMessageCreated,
+      { msgRef },
+      { headers: { request_id: "stale", session_id: "session" } },
+    );
+    await bus.publish(
+      lilacEventTypes.EvtRequestLifecycleChanged,
+      { state: "running" },
+      { headers: { request_id: "active", session_id: "session" } },
+    );
+    await bus.publish(
+      lilacEventTypes.EvtSurfaceOutputMessageCreated,
+      { msgRef },
+      { headers: { request_id: "active", session_id: "session" } },
+    );
+
+    expect(
+      raw.deliveryActions
+        .filter(({ topic }) => topic === "evt.surface")
+        .map(({ action }) => action.disposition),
+    ).toEqual(["park-pending", "commit", "commit"]);
+    await router.stop();
+  });
+
+  it("commits ignored, suppressed, and successful adapter routes and parks publication failure", async () => {
+    const sessionId = "adapter-delivery";
+    const messages: Record<string, SurfaceMessage> = {
+      [`${sessionId}:success`]: {
+        ref: { platform: "discord", channelId: sessionId, messageId: "success" },
+        session: { platform: "discord", channelId: sessionId },
+        userId: "user",
+        text: "hello",
+        ts: 1,
+        raw: { reference: {} },
+      },
+      [`${sessionId}:failure`]: {
+        ref: { platform: "discord", channelId: sessionId, messageId: "failure" },
+        session: { platform: "discord", channelId: sessionId },
+        userId: "user",
+        text: "again",
+        ts: 2,
+        raw: { reference: {} },
+      },
+    };
+    const raw = createInMemoryRawBus();
+    const bus = createLilacBus(raw);
+    const router = await startBusRequestRouter({
+      adapter: new FakeAdapter(messages),
+      bus,
+      subscriptionId: "router-adapter-delivery",
+      config: parseCoreConfigV1ToUniversal({}),
+      shouldSuppressAdapterEvent: async ({ evt }) => ({ suppress: evt.messageId === "suppressed" }),
+    });
+    const adapterEvent = (messageId: string) => ({
+      platform: "discord" as const,
+      channelId: sessionId,
+      messageId,
+      userId: "user",
+      text: messageId,
+      ts: Date.now(),
+      raw: {
+        discord: { isDMBased: true, mentionsBot: false, replyToBot: false, botUserId: "bot" },
+      },
+    });
+
+    await bus.publish(lilacEventTypes.EvtAdapterMessageUpdated, adapterEvent("ignored"));
+    await bus.publish(lilacEventTypes.EvtAdapterMessageCreated, adapterEvent("suppressed"));
+    await bus.publish(lilacEventTypes.EvtAdapterMessageCreated, adapterEvent("success"));
+    raw.failPublicationsTo("cmd.request", new Error("request publication failed"));
+    await bus.publish(lilacEventTypes.EvtAdapterMessageCreated, adapterEvent("failure"));
+
+    expect(
+      raw.deliveryActions
+        .filter(({ topic }) => topic === "evt.adapter")
+        .map(({ action }) => action.disposition),
+    ).toEqual(["commit", "commit", "commit", "park-pending"]);
+    await router.stop();
+  });
+
+  it("preserves Panic and adapts subscription start, done, and stop failures at router boundaries", async () => {
+    const startRaw = createInMemoryRawBus();
+    startRaw.failStartsFor("evt.request", new Error("start failed"));
+    await expect(
+      startBusRequestRouter({
+        adapter: new FakeAdapter({}),
+        bus: createLilacBus(startRaw),
+        subscriptionId: "router-start-failure",
+        config: parseCoreConfigV1ToUniversal({}),
+      }),
+    ).rejects.toBeInstanceOf(EventDeliveryStartFailed);
+
+    const raw = createInMemoryRawBus();
+    const bus = createLilacBus(raw);
+    const sessionId = "panic-delivery";
+    const router = await startBusRequestRouter({
+      adapter: new FakeAdapter({
+        [`${sessionId}:panic`]: {
+          ref: { platform: "discord", channelId: sessionId, messageId: "panic" },
+          session: { platform: "discord", channelId: sessionId },
+          userId: "user",
+          text: "panic",
+          ts: 1,
+          raw: { reference: {} },
+        },
+      }),
+      bus,
+      subscriptionId: "router-host-boundaries",
+      config: parseCoreConfigV1ToUniversal({}),
+    });
+    const panic = new Panic({ message: "publication invariant failed" });
+    raw.failPublicationsTo("cmd.request", panic);
+    await expect(
+      bus.publish(lilacEventTypes.EvtAdapterMessageCreated, {
+        platform: "discord",
+        channelId: sessionId,
+        messageId: "panic",
+        userId: "user",
+        text: "panic",
+        ts: Date.now(),
+        raw: {
+          discord: { isDMBased: true, mentionsBot: false, replyToBot: false, botUserId: "bot" },
+        },
+      }),
+    ).rejects.toBe(panic);
+
+    const doneError = new EventDeliveryTransportFailed({
+      topic: "evt.request",
+      operation: "read",
+      cause: new Error("read failed"),
+      message: "forced done failure",
+    });
+    raw.finishDelivery("evt.request", doneError);
+    const done = await router.done;
+    expect(done.status).toBe("error");
+    if (done.status === "error") expect(done.error).toBe(doneError);
+
+    raw.failStopsFor("evt.surface", new Error("cleanup failed"));
+    await expect(router.stop()).rejects.toBeInstanceOf(EventDeliveryStopFailed);
+  });
+
   it("includes reply-thread root when mention is part of a mergeable reply burst (active channel)", async () => {
     const raw = createInMemoryRawBus();
     const bus = createLilacBus(raw);
@@ -354,7 +638,8 @@ describe("startBusRequestRouter", () => {
     });
 
     const received: any[] = [];
-    const sub = await bus.subscribeTopic(
+    const sub = await subscribeTopicForTest(
+      bus,
       "cmd.request",
       {
         mode: "fanout",
@@ -362,11 +647,11 @@ describe("startBusRequestRouter", () => {
         consumerId: "c1",
         offset: { type: "begin" },
       },
-      async (m, ctx) => {
+      async (m) => {
         if (m.type === lilacEventTypes.CmdRequestMessage) {
           received.push(m);
         }
-        await ctx.commit();
+        return Result.ok(undefined);
       },
     );
 
@@ -456,18 +741,18 @@ describe("startBusRequestRouter", () => {
     ];
 
     const transcriptStore: TranscriptStore = {
-      saveRequestTranscript: () => {},
+      saveRequestTranscript: () => Result.ok(undefined),
       linkSurfaceMessagesToRequest: () => {},
       getTranscriptBySurfaceMessage: ({ messageId }) => {
-        if (messageId !== replyToMessageId) return null;
-        return {
+        if (messageId !== replyToMessageId) return Result.ok(null);
+        return Result.ok({
           requestId: "r1",
           sessionId,
           requestClient: "discord",
           createdTs: Date.now(),
           updatedTs: Date.now(),
           messages: baseTranscript,
-        };
+        });
       },
       close: () => {},
     };
@@ -504,7 +789,8 @@ describe("startBusRequestRouter", () => {
     });
 
     const received: any[] = [];
-    const sub = await bus.subscribeTopic(
+    const sub = await subscribeTopicForTest(
+      bus,
       "cmd.request",
       {
         mode: "fanout",
@@ -512,11 +798,11 @@ describe("startBusRequestRouter", () => {
         consumerId: "c1",
         offset: { type: "begin" },
       },
-      async (m, ctx) => {
+      async (m) => {
         if (m.type === lilacEventTypes.CmdRequestMessage) {
           received.push(m);
         }
-        await ctx.commit();
+        return Result.ok(undefined);
       },
     );
 
@@ -608,7 +894,8 @@ describe("startBusRequestRouter", () => {
 
     // capture cmd.request.message
     const received: any[] = [];
-    const sub = await bus.subscribeTopic(
+    const sub = await subscribeTopicForTest(
+      bus,
       "cmd.request",
       {
         mode: "fanout",
@@ -616,11 +903,11 @@ describe("startBusRequestRouter", () => {
         consumerId: "c1",
         offset: { type: "begin" },
       },
-      async (m, ctx) => {
+      async (m) => {
         if (m.type === lilacEventTypes.CmdRequestMessage) {
           received.push(m);
         }
-        await ctx.commit();
+        return Result.ok(undefined);
       },
     );
 
@@ -704,7 +991,8 @@ describe("startBusRequestRouter", () => {
 
     // capture cmd.request.message
     const received: any[] = [];
-    const sub = await bus.subscribeTopic(
+    const sub = await subscribeTopicForTest(
+      bus,
       "cmd.request",
       {
         mode: "fanout",
@@ -712,11 +1000,11 @@ describe("startBusRequestRouter", () => {
         consumerId: "c1",
         offset: { type: "begin" },
       },
-      async (m, ctx) => {
+      async (m) => {
         if (m.type === lilacEventTypes.CmdRequestMessage) {
           received.push(m);
         }
-        await ctx.commit();
+        return Result.ok(undefined);
       },
     );
 
@@ -741,6 +1029,67 @@ describe("startBusRequestRouter", () => {
 
     await sub.stop();
     await router.stop();
+  });
+
+  it("logs suppression TaggedErrors through the redacted bridge projection", async () => {
+    const raw = createInMemoryRawBus();
+    const bus = createLilacBus(raw);
+    const logger = new Logger({ module: "bus-request-router-test" });
+    const sessionId = "suppression-log";
+    const messageId = "message";
+    const router = await startBusRequestRouter({
+      adapter: new FakeAdapter({
+        [`${sessionId}:${messageId}`]: {
+          ref: { platform: "discord", channelId: sessionId, messageId },
+          session: { platform: "discord", channelId: sessionId },
+          userId: "user",
+          text: "hello",
+          ts: Date.now(),
+          raw: { reference: {} },
+        },
+      }),
+      bus,
+      subscriptionId: "router-suppression-log",
+      config: parseCoreConfigV1ToUniversal({}),
+      logger,
+      shouldSuppressAdapterEvent: async () => {
+        throw new RouterTestHookFailure({
+          cause: { authorization: "Bearer cause-secret" },
+          message: "hook failed token=sk-super-secret",
+        });
+      },
+    });
+    const logged = spyOn(logger, "error").mockImplementation(() => undefined);
+
+    try {
+      await bus.publish(lilacEventTypes.EvtAdapterMessageCreated, {
+        platform: "discord",
+        channelId: sessionId,
+        messageId,
+        userId: "user",
+        text: "hello",
+        ts: Date.now(),
+        raw: {
+          discord: { isDMBased: true, mentionsBot: false, replyToBot: false, botUserId: "bot" },
+        },
+      });
+
+      const call = logged.mock.calls.find(
+        ([message]) => message === "router suppression hook failed; proceeding",
+      );
+      expect(call).toBeDefined();
+      expect(call?.[1]).toMatchObject({
+        errorTag: "BusRequestRouterSuppressionFailed",
+        errorMessage: "Router suppression hook failed",
+      });
+      expect(call?.[1]).not.toHaveProperty("cause");
+      expect(call?.[2]).toBeUndefined();
+      expect(JSON.stringify(call?.[1])).not.toContain("cause-secret");
+      expect(JSON.stringify(call?.[1])).not.toContain("sk-super-secret");
+    } finally {
+      await router.stop();
+      logged.mockRestore();
+    }
   });
 
   it("skips active channel batch when gate returns forward=false", async () => {
@@ -796,7 +1145,8 @@ describe("startBusRequestRouter", () => {
     });
 
     const received: any[] = [];
-    const sub = await bus.subscribeTopic(
+    const sub = await subscribeTopicForTest(
+      bus,
       "cmd.request",
       {
         mode: "fanout",
@@ -804,11 +1154,11 @@ describe("startBusRequestRouter", () => {
         consumerId: "c1",
         offset: { type: "begin" },
       },
-      async (m, ctx) => {
+      async (m) => {
         if (m.type === lilacEventTypes.CmdRequestMessage) {
           received.push(m);
         }
-        await ctx.commit();
+        return Result.ok(undefined);
       },
     );
 
@@ -889,7 +1239,8 @@ describe("startBusRequestRouter", () => {
     });
 
     const received: any[] = [];
-    const sub = await bus.subscribeTopic(
+    const sub = await subscribeTopicForTest(
+      bus,
       "cmd.request",
       {
         mode: "fanout",
@@ -897,11 +1248,11 @@ describe("startBusRequestRouter", () => {
         consumerId: "c1",
         offset: { type: "begin" },
       },
-      async (m, ctx) => {
+      async (m) => {
         if (m.type === lilacEventTypes.CmdRequestMessage) {
           received.push(m);
         }
-        await ctx.commit();
+        return Result.ok(undefined);
       },
     );
 
@@ -986,7 +1337,8 @@ describe("startBusRequestRouter", () => {
     });
 
     const received: any[] = [];
-    const sub = await bus.subscribeTopic(
+    const sub = await subscribeTopicForTest(
+      bus,
       "cmd.request",
       {
         mode: "fanout",
@@ -994,11 +1346,11 @@ describe("startBusRequestRouter", () => {
         consumerId: "c1",
         offset: { type: "begin" },
       },
-      async (m, ctx) => {
+      async (m) => {
         if (m.type === lilacEventTypes.CmdRequestMessage) {
           received.push(m);
         }
-        await ctx.commit();
+        return Result.ok(undefined);
       },
     );
 
@@ -1084,7 +1436,8 @@ describe("startBusRequestRouter", () => {
     });
 
     const received: any[] = [];
-    const sub = await bus.subscribeTopic(
+    const sub = await subscribeTopicForTest(
+      bus,
       "cmd.request",
       {
         mode: "fanout",
@@ -1092,11 +1445,11 @@ describe("startBusRequestRouter", () => {
         consumerId: "c1",
         offset: { type: "begin" },
       },
-      async (m, ctx) => {
+      async (m) => {
         if (m.type === lilacEventTypes.CmdRequestMessage) {
           received.push(m);
         }
-        await ctx.commit();
+        return Result.ok(undefined);
       },
     );
 
@@ -1180,7 +1533,8 @@ describe("startBusRequestRouter", () => {
     });
 
     const received: any[] = [];
-    const sub = await bus.subscribeTopic(
+    const sub = await subscribeTopicForTest(
+      bus,
       "cmd.request",
       {
         mode: "fanout",
@@ -1188,11 +1542,11 @@ describe("startBusRequestRouter", () => {
         consumerId: "c1",
         offset: { type: "begin" },
       },
-      async (m, ctx) => {
+      async (m) => {
         if (m.type === lilacEventTypes.CmdRequestMessage) {
           received.push(m);
         }
-        await ctx.commit();
+        return Result.ok(undefined);
       },
     );
 
@@ -1287,7 +1641,8 @@ describe("startBusRequestRouter", () => {
     });
 
     const received: any[] = [];
-    const sub = await bus.subscribeTopic(
+    const sub = await subscribeTopicForTest(
+      bus,
       "cmd.request",
       {
         mode: "fanout",
@@ -1295,11 +1650,11 @@ describe("startBusRequestRouter", () => {
         consumerId: "c1",
         offset: { type: "begin" },
       },
-      async (m, ctx) => {
+      async (m) => {
         if (m.type === lilacEventTypes.CmdRequestMessage) {
           received.push(m);
         }
-        await ctx.commit();
+        return Result.ok(undefined);
       },
     );
 
@@ -1388,7 +1743,8 @@ describe("startBusRequestRouter", () => {
     });
 
     const received: any[] = [];
-    const sub = await bus.subscribeTopic(
+    const sub = await subscribeTopicForTest(
+      bus,
       "cmd.request",
       {
         mode: "fanout",
@@ -1396,11 +1752,11 @@ describe("startBusRequestRouter", () => {
         consumerId: "c1",
         offset: { type: "begin" },
       },
-      async (m, ctx) => {
+      async (m) => {
         if (m.type === lilacEventTypes.CmdRequestMessage) {
           received.push(m);
         }
-        await ctx.commit();
+        return Result.ok(undefined);
       },
     );
 
@@ -1489,7 +1845,8 @@ describe("startBusRequestRouter", () => {
     });
 
     const received: any[] = [];
-    const sub = await bus.subscribeTopic(
+    const sub = await subscribeTopicForTest(
+      bus,
       "cmd.request",
       {
         mode: "fanout",
@@ -1497,11 +1854,11 @@ describe("startBusRequestRouter", () => {
         consumerId: "c1",
         offset: { type: "begin" },
       },
-      async (m, ctx) => {
+      async (m) => {
         if (m.type === lilacEventTypes.CmdRequestMessage) {
           received.push(m);
         }
-        await ctx.commit();
+        return Result.ok(undefined);
       },
     );
 
@@ -1586,7 +1943,8 @@ describe("startBusRequestRouter", () => {
     });
 
     const received: any[] = [];
-    const sub = await bus.subscribeTopic(
+    const sub = await subscribeTopicForTest(
+      bus,
       "cmd.request",
       {
         mode: "fanout",
@@ -1594,11 +1952,11 @@ describe("startBusRequestRouter", () => {
         consumerId: "c1",
         offset: { type: "begin" },
       },
-      async (m, ctx) => {
+      async (m) => {
         if (m.type === lilacEventTypes.CmdRequestMessage) {
           received.push(m);
         }
-        await ctx.commit();
+        return Result.ok(undefined);
       },
     );
 
@@ -1681,7 +2039,8 @@ describe("startBusRequestRouter", () => {
     });
 
     const received: any[] = [];
-    const sub = await bus.subscribeTopic(
+    const sub = await subscribeTopicForTest(
+      bus,
       "cmd.request",
       {
         mode: "fanout",
@@ -1689,11 +2048,11 @@ describe("startBusRequestRouter", () => {
         consumerId: "c1",
         offset: { type: "begin" },
       },
-      async (m, ctx) => {
+      async (m) => {
         if (m.type === lilacEventTypes.CmdRequestMessage) {
           received.push(m);
         }
-        await ctx.commit();
+        return Result.ok(undefined);
       },
     );
 
@@ -1793,7 +2152,8 @@ describe("startBusRequestRouter", () => {
     });
 
     const received: any[] = [];
-    const sub = await bus.subscribeTopic(
+    const sub = await subscribeTopicForTest(
+      bus,
       "cmd.request",
       {
         mode: "fanout",
@@ -1801,11 +2161,11 @@ describe("startBusRequestRouter", () => {
         consumerId: "c1",
         offset: { type: "begin" },
       },
-      async (m, ctx) => {
+      async (m) => {
         if (m.type === lilacEventTypes.CmdRequestMessage) {
           received.push(m);
         }
-        await ctx.commit();
+        return Result.ok(undefined);
       },
     );
 
@@ -1900,7 +2260,8 @@ describe("startBusRequestRouter", () => {
     });
 
     const received: any[] = [];
-    const sub = await bus.subscribeTopic(
+    const sub = await subscribeTopicForTest(
+      bus,
       "cmd.request",
       {
         mode: "fanout",
@@ -1908,11 +2269,11 @@ describe("startBusRequestRouter", () => {
         consumerId: "c1",
         offset: { type: "begin" },
       },
-      async (m, ctx) => {
+      async (m) => {
         if (m.type === lilacEventTypes.CmdRequestMessage) {
           received.push(m);
         }
-        await ctx.commit();
+        return Result.ok(undefined);
       },
     );
 
@@ -2009,7 +2370,8 @@ describe("startBusRequestRouter", () => {
     });
 
     const received: any[] = [];
-    const sub = await bus.subscribeTopic(
+    const sub = await subscribeTopicForTest(
+      bus,
       "cmd.request",
       {
         mode: "fanout",
@@ -2017,11 +2379,11 @@ describe("startBusRequestRouter", () => {
         consumerId: "c1",
         offset: { type: "begin" },
       },
-      async (m, ctx) => {
+      async (m) => {
         if (m.type === lilacEventTypes.CmdRequestMessage) {
           received.push(m);
         }
-        await ctx.commit();
+        return Result.ok(undefined);
       },
     );
 
@@ -2118,7 +2480,8 @@ describe("startBusRequestRouter", () => {
     });
 
     const received: any[] = [];
-    const sub = await bus.subscribeTopic(
+    const sub = await subscribeTopicForTest(
+      bus,
       "cmd.request",
       {
         mode: "fanout",
@@ -2126,11 +2489,11 @@ describe("startBusRequestRouter", () => {
         consumerId: "c1",
         offset: { type: "begin" },
       },
-      async (m, ctx) => {
+      async (m) => {
         if (m.type === lilacEventTypes.CmdRequestMessage) {
           received.push(m);
         }
-        await ctx.commit();
+        return Result.ok(undefined);
       },
     );
 
@@ -2217,7 +2580,8 @@ describe("startBusRequestRouter", () => {
     });
 
     const received: any[] = [];
-    const sub = await bus.subscribeTopic(
+    const sub = await subscribeTopicForTest(
+      bus,
       "cmd.request",
       {
         mode: "fanout",
@@ -2225,11 +2589,11 @@ describe("startBusRequestRouter", () => {
         consumerId: "c1",
         offset: { type: "begin" },
       },
-      async (m, ctx) => {
+      async (m) => {
         if (m.type === lilacEventTypes.CmdRequestMessage) {
           received.push(m);
         }
-        await ctx.commit();
+        return Result.ok(undefined);
       },
     );
 
@@ -2335,7 +2699,8 @@ describe("startBusRequestRouter", () => {
     });
 
     const received: any[] = [];
-    const sub = await bus.subscribeTopic(
+    const sub = await subscribeTopicForTest(
+      bus,
       "cmd.request",
       {
         mode: "fanout",
@@ -2343,11 +2708,11 @@ describe("startBusRequestRouter", () => {
         consumerId: "c1",
         offset: { type: "begin" },
       },
-      async (m, ctx) => {
+      async (m) => {
         if (m.type === lilacEventTypes.CmdRequestMessage) {
           received.push(m);
         }
-        await ctx.commit();
+        return Result.ok(undefined);
       },
     );
 
@@ -2498,7 +2863,8 @@ describe("startBusRequestRouter", () => {
     });
 
     const received: any[] = [];
-    const sub = await bus.subscribeTopic(
+    const sub = await subscribeTopicForTest(
+      bus,
       "cmd.request",
       {
         mode: "fanout",
@@ -2506,11 +2872,11 @@ describe("startBusRequestRouter", () => {
         consumerId: "c1",
         offset: { type: "begin" },
       },
-      async (m, ctx) => {
+      async (m) => {
         if (m.type === lilacEventTypes.CmdRequestMessage) {
           received.push(m);
         }
-        await ctx.commit();
+        return Result.ok(undefined);
       },
     );
 
@@ -2600,7 +2966,8 @@ describe("startBusRequestRouter", () => {
     });
 
     const received: any[] = [];
-    const sub = await bus.subscribeTopic(
+    const sub = await subscribeTopicForTest(
+      bus,
       "cmd.request",
       {
         mode: "fanout",
@@ -2608,11 +2975,11 @@ describe("startBusRequestRouter", () => {
         consumerId: "c1",
         offset: { type: "begin" },
       },
-      async (m, ctx) => {
+      async (m) => {
         if (m.type === lilacEventTypes.CmdRequestMessage) {
           received.push(m);
         }
-        await ctx.commit();
+        return Result.ok(undefined);
       },
     );
 
@@ -2712,7 +3079,8 @@ describe("startBusRequestRouter", () => {
     });
 
     const received: any[] = [];
-    const sub = await bus.subscribeTopic(
+    const sub = await subscribeTopicForTest(
+      bus,
       "cmd.request",
       {
         mode: "fanout",
@@ -2720,11 +3088,11 @@ describe("startBusRequestRouter", () => {
         consumerId: "c1",
         offset: { type: "begin" },
       },
-      async (m, ctx) => {
+      async (m) => {
         if (m.type === lilacEventTypes.CmdRequestMessage) {
           received.push(m);
         }
-        await ctx.commit();
+        return Result.ok(undefined);
       },
     );
 
@@ -2839,7 +3207,8 @@ describe("startBusRequestRouter", () => {
     const received: any[] = [];
     const surfaceCmd: any[] = [];
 
-    const sub = await bus.subscribeTopic(
+    const sub = await subscribeTopicForTest(
+      bus,
       "cmd.request",
       {
         mode: "fanout",
@@ -2847,15 +3216,16 @@ describe("startBusRequestRouter", () => {
         consumerId: "c1",
         offset: { type: "begin" },
       },
-      async (m, ctx) => {
+      async (m) => {
         if (m.type === lilacEventTypes.CmdRequestMessage) {
           received.push(m);
         }
-        await ctx.commit();
+        return Result.ok(undefined);
       },
     );
 
-    const subSurface = await bus.subscribeTopic(
+    const subSurface = await subscribeTopicForTest(
+      bus,
       "cmd.surface",
       {
         mode: "fanout",
@@ -2863,11 +3233,11 @@ describe("startBusRequestRouter", () => {
         consumerId: "c2",
         offset: { type: "begin" },
       },
-      async (m, ctx) => {
+      async (m) => {
         if (m.type === lilacEventTypes.CmdSurfaceOutputReanchor) {
           surfaceCmd.push(m);
         }
-        await ctx.commit();
+        return Result.ok(undefined);
       },
     );
 
@@ -3007,7 +3377,8 @@ describe("startBusRequestRouter", () => {
     const received: any[] = [];
     const surfaceCmd: any[] = [];
 
-    const sub = await bus.subscribeTopic(
+    const sub = await subscribeTopicForTest(
+      bus,
       "cmd.request",
       {
         mode: "fanout",
@@ -3015,15 +3386,16 @@ describe("startBusRequestRouter", () => {
         consumerId: "c1",
         offset: { type: "begin" },
       },
-      async (m, ctx) => {
+      async (m) => {
         if (m.type === lilacEventTypes.CmdRequestMessage) {
           received.push(m);
         }
-        await ctx.commit();
+        return Result.ok(undefined);
       },
     );
 
-    const subSurface = await bus.subscribeTopic(
+    const subSurface = await subscribeTopicForTest(
+      bus,
       "cmd.surface",
       {
         mode: "fanout",
@@ -3031,11 +3403,11 @@ describe("startBusRequestRouter", () => {
         consumerId: "c2",
         offset: { type: "begin" },
       },
-      async (m, ctx) => {
+      async (m) => {
         if (m.type === lilacEventTypes.CmdSurfaceOutputReanchor) {
           surfaceCmd.push(m);
         }
-        await ctx.commit();
+        return Result.ok(undefined);
       },
     );
 
@@ -3175,7 +3547,8 @@ describe("startBusRequestRouter", () => {
 
     const received: any[] = [];
     const surfaceCmd: any[] = [];
-    const sub = await bus.subscribeTopic(
+    const sub = await subscribeTopicForTest(
+      bus,
       "cmd.request",
       {
         mode: "fanout",
@@ -3183,15 +3556,16 @@ describe("startBusRequestRouter", () => {
         consumerId: "c1",
         offset: { type: "begin" },
       },
-      async (m, ctx) => {
+      async (m) => {
         if (m.type === lilacEventTypes.CmdRequestMessage) {
           received.push(m);
         }
-        await ctx.commit();
+        return Result.ok(undefined);
       },
     );
 
-    const subSurface = await bus.subscribeTopic(
+    const subSurface = await subscribeTopicForTest(
+      bus,
       "cmd.surface",
       {
         mode: "fanout",
@@ -3199,11 +3573,11 @@ describe("startBusRequestRouter", () => {
         consumerId: "c2",
         offset: { type: "begin" },
       },
-      async (m, ctx) => {
+      async (m) => {
         if (m.type === lilacEventTypes.CmdSurfaceOutputReanchor) {
           surfaceCmd.push(m);
         }
-        await ctx.commit();
+        return Result.ok(undefined);
       },
     );
 
@@ -3333,7 +3707,8 @@ describe("startBusRequestRouter", () => {
     const received: any[] = [];
     const surfaceCmd: any[] = [];
 
-    const sub = await bus.subscribeTopic(
+    const sub = await subscribeTopicForTest(
+      bus,
       "cmd.request",
       {
         mode: "fanout",
@@ -3341,15 +3716,16 @@ describe("startBusRequestRouter", () => {
         consumerId: "c1",
         offset: { type: "begin" },
       },
-      async (m, ctx) => {
+      async (m) => {
         if (m.type === lilacEventTypes.CmdRequestMessage) {
           received.push(m);
         }
-        await ctx.commit();
+        return Result.ok(undefined);
       },
     );
 
-    const subSurface = await bus.subscribeTopic(
+    const subSurface = await subscribeTopicForTest(
+      bus,
       "cmd.surface",
       {
         mode: "fanout",
@@ -3357,11 +3733,11 @@ describe("startBusRequestRouter", () => {
         consumerId: "c2",
         offset: { type: "begin" },
       },
-      async (m, ctx) => {
+      async (m) => {
         if (m.type === lilacEventTypes.CmdSurfaceOutputReanchor) {
           surfaceCmd.push(m);
         }
-        await ctx.commit();
+        return Result.ok(undefined);
       },
     );
 
@@ -3516,7 +3892,8 @@ describe("startBusRequestRouter", () => {
 
     const received: any[] = [];
     const surfaceCmd: any[] = [];
-    const sub = await bus.subscribeTopic(
+    const sub = await subscribeTopicForTest(
+      bus,
       "cmd.request",
       {
         mode: "fanout",
@@ -3524,15 +3901,16 @@ describe("startBusRequestRouter", () => {
         consumerId: "c1",
         offset: { type: "begin" },
       },
-      async (m, ctx) => {
+      async (m) => {
         if (m.type === lilacEventTypes.CmdRequestMessage) {
           received.push(m);
         }
-        await ctx.commit();
+        return Result.ok(undefined);
       },
     );
 
-    const subSurface = await bus.subscribeTopic(
+    const subSurface = await subscribeTopicForTest(
+      bus,
       "cmd.surface",
       {
         mode: "fanout",
@@ -3540,11 +3918,11 @@ describe("startBusRequestRouter", () => {
         consumerId: "c2",
         offset: { type: "begin" },
       },
-      async (m, ctx) => {
+      async (m) => {
         if (m.type === lilacEventTypes.CmdSurfaceOutputReanchor) {
           surfaceCmd.push(m);
         }
-        await ctx.commit();
+        return Result.ok(undefined);
       },
     );
 
@@ -3651,7 +4029,8 @@ describe("startBusRequestRouter", () => {
     const received: any[] = [];
     const surfaceCmd: any[] = [];
 
-    const sub = await bus.subscribeTopic(
+    const sub = await subscribeTopicForTest(
+      bus,
       "cmd.request",
       {
         mode: "fanout",
@@ -3659,15 +4038,16 @@ describe("startBusRequestRouter", () => {
         consumerId: "c1",
         offset: { type: "begin" },
       },
-      async (m, ctx) => {
+      async (m) => {
         if (m.type === lilacEventTypes.CmdRequestMessage) {
           received.push(m);
         }
-        await ctx.commit();
+        return Result.ok(undefined);
       },
     );
 
-    const subSurface = await bus.subscribeTopic(
+    const subSurface = await subscribeTopicForTest(
+      bus,
       "cmd.surface",
       {
         mode: "fanout",
@@ -3675,11 +4055,11 @@ describe("startBusRequestRouter", () => {
         consumerId: "c2",
         offset: { type: "begin" },
       },
-      async (m, ctx) => {
+      async (m) => {
         if (m.type === lilacEventTypes.CmdSurfaceOutputReanchor) {
           surfaceCmd.push(m);
         }
-        await ctx.commit();
+        return Result.ok(undefined);
       },
     );
 
@@ -3817,7 +4197,8 @@ describe("startBusRequestRouter", () => {
     const received: any[] = [];
     const surfaceCmd: any[] = [];
 
-    const sub = await bus.subscribeTopic(
+    const sub = await subscribeTopicForTest(
+      bus,
       "cmd.request",
       {
         mode: "fanout",
@@ -3825,15 +4206,16 @@ describe("startBusRequestRouter", () => {
         consumerId: "c1",
         offset: { type: "begin" },
       },
-      async (m, ctx) => {
+      async (m) => {
         if (m.type === lilacEventTypes.CmdRequestMessage) {
           received.push(m);
         }
-        await ctx.commit();
+        return Result.ok(undefined);
       },
     );
 
-    const subSurface = await bus.subscribeTopic(
+    const subSurface = await subscribeTopicForTest(
+      bus,
       "cmd.surface",
       {
         mode: "fanout",
@@ -3841,11 +4223,11 @@ describe("startBusRequestRouter", () => {
         consumerId: "c2",
         offset: { type: "begin" },
       },
-      async (m, ctx) => {
+      async (m) => {
         if (m.type === lilacEventTypes.CmdSurfaceOutputReanchor) {
           surfaceCmd.push(m);
         }
-        await ctx.commit();
+        return Result.ok(undefined);
       },
     );
 
@@ -3985,7 +4367,8 @@ describe("startBusRequestRouter", () => {
     });
 
     const received: any[] = [];
-    const sub = await bus.subscribeTopic(
+    const sub = await subscribeTopicForTest(
+      bus,
       "cmd.request",
       {
         mode: "fanout",
@@ -3993,11 +4376,11 @@ describe("startBusRequestRouter", () => {
         consumerId: "c1",
         offset: { type: "begin" },
       },
-      async (m, ctx) => {
+      async (m) => {
         if (m.type === lilacEventTypes.CmdRequestMessage) {
           received.push(m);
         }
-        await ctx.commit();
+        return Result.ok(undefined);
       },
     );
 
@@ -4116,7 +4499,8 @@ describe("startBusRequestRouter", () => {
     });
 
     const received: any[] = [];
-    const sub = await bus.subscribeTopic(
+    const sub = await subscribeTopicForTest(
+      bus,
       "cmd.request",
       {
         mode: "fanout",
@@ -4124,11 +4508,11 @@ describe("startBusRequestRouter", () => {
         consumerId: "c1",
         offset: { type: "begin" },
       },
-      async (m, ctx) => {
+      async (m) => {
         if (m.type === lilacEventTypes.CmdRequestMessage) {
           received.push(m);
         }
-        await ctx.commit();
+        return Result.ok(undefined);
       },
     );
 
@@ -4282,7 +4666,8 @@ describe("startBusRequestRouter", () => {
     });
 
     const received: any[] = [];
-    const sub = await bus.subscribeTopic(
+    const sub = await subscribeTopicForTest(
+      bus,
       "cmd.request",
       {
         mode: "fanout",
@@ -4290,11 +4675,11 @@ describe("startBusRequestRouter", () => {
         consumerId: "c1",
         offset: { type: "begin" },
       },
-      async (m, ctx) => {
+      async (m) => {
         if (m.type === lilacEventTypes.CmdRequestMessage) {
           received.push(m);
         }
-        await ctx.commit();
+        return Result.ok(undefined);
       },
     );
 
@@ -4482,7 +4867,8 @@ describe("startBusRequestRouter", () => {
     const received: any[] = [];
     const surfaceCmd: any[] = [];
 
-    const sub = await bus.subscribeTopic(
+    const sub = await subscribeTopicForTest(
+      bus,
       "cmd.request",
       {
         mode: "fanout",
@@ -4490,15 +4876,16 @@ describe("startBusRequestRouter", () => {
         consumerId: "c1",
         offset: { type: "begin" },
       },
-      async (m, ctx) => {
+      async (m) => {
         if (m.type === lilacEventTypes.CmdRequestMessage) {
           received.push(m);
         }
-        await ctx.commit();
+        return Result.ok(undefined);
       },
     );
 
-    const subSurface = await bus.subscribeTopic(
+    const subSurface = await subscribeTopicForTest(
+      bus,
       "cmd.surface",
       {
         mode: "fanout",
@@ -4506,11 +4893,11 @@ describe("startBusRequestRouter", () => {
         consumerId: "c2",
         offset: { type: "begin" },
       },
-      async (m, ctx) => {
+      async (m) => {
         if (m.type === lilacEventTypes.CmdSurfaceOutputReanchor) {
           surfaceCmd.push(m);
         }
-        await ctx.commit();
+        return Result.ok(undefined);
       },
     );
 
@@ -4715,7 +5102,8 @@ describe("startBusRequestRouter", () => {
     const received: any[] = [];
     const surfaceCmd: any[] = [];
 
-    const sub = await bus.subscribeTopic(
+    const sub = await subscribeTopicForTest(
+      bus,
       "cmd.request",
       {
         mode: "fanout",
@@ -4723,15 +5111,16 @@ describe("startBusRequestRouter", () => {
         consumerId: "c1",
         offset: { type: "begin" },
       },
-      async (m, ctx) => {
+      async (m) => {
         if (m.type === lilacEventTypes.CmdRequestMessage) {
           received.push(m);
         }
-        await ctx.commit();
+        return Result.ok(undefined);
       },
     );
 
-    const subSurface = await bus.subscribeTopic(
+    const subSurface = await subscribeTopicForTest(
+      bus,
       "cmd.surface",
       {
         mode: "fanout",
@@ -4739,11 +5128,11 @@ describe("startBusRequestRouter", () => {
         consumerId: "c2",
         offset: { type: "begin" },
       },
-      async (m, ctx) => {
+      async (m) => {
         if (m.type === lilacEventTypes.CmdSurfaceOutputReanchor) {
           surfaceCmd.push(m);
         }
-        await ctx.commit();
+        return Result.ok(undefined);
       },
     );
 
@@ -4901,7 +5290,8 @@ describe("startBusRequestRouter", () => {
     });
 
     const received: any[] = [];
-    const sub = await bus.subscribeTopic(
+    const sub = await subscribeTopicForTest(
+      bus,
       "cmd.request",
       {
         mode: "fanout",
@@ -4909,11 +5299,11 @@ describe("startBusRequestRouter", () => {
         consumerId: "c1",
         offset: { type: "begin" },
       },
-      async (m, ctx) => {
+      async (m) => {
         if (m.type === lilacEventTypes.CmdRequestMessage) {
           received.push(m);
         }
-        await ctx.commit();
+        return Result.ok(undefined);
       },
     );
 
@@ -4997,7 +5387,8 @@ describe("startBusRequestRouter", () => {
     });
 
     const received: any[] = [];
-    const sub = await bus.subscribeTopic(
+    const sub = await subscribeTopicForTest(
+      bus,
       "cmd.request",
       {
         mode: "fanout",
@@ -5005,11 +5396,11 @@ describe("startBusRequestRouter", () => {
         consumerId: "c1",
         offset: { type: "begin" },
       },
-      async (m, ctx) => {
+      async (m) => {
         if (m.type === lilacEventTypes.CmdRequestMessage) {
           received.push(m);
         }
-        await ctx.commit();
+        return Result.ok(undefined);
       },
     );
 
@@ -5098,7 +5489,8 @@ describe("startBusRequestRouter", () => {
     });
 
     const received: any[] = [];
-    const sub = await bus.subscribeTopic(
+    const sub = await subscribeTopicForTest(
+      bus,
       "cmd.request",
       {
         mode: "fanout",
@@ -5106,11 +5498,11 @@ describe("startBusRequestRouter", () => {
         consumerId: "c1",
         offset: { type: "begin" },
       },
-      async (m, ctx) => {
+      async (m) => {
         if (m.type === lilacEventTypes.CmdRequestMessage) {
           received.push(m);
         }
-        await ctx.commit();
+        return Result.ok(undefined);
       },
     );
 
@@ -5200,7 +5592,8 @@ describe("startBusRequestRouter", () => {
     });
 
     const received: any[] = [];
-    const sub = await bus.subscribeTopic(
+    const sub = await subscribeTopicForTest(
+      bus,
       "cmd.request",
       {
         mode: "fanout",
@@ -5208,11 +5601,11 @@ describe("startBusRequestRouter", () => {
         consumerId: "c1",
         offset: { type: "begin" },
       },
-      async (m, ctx) => {
+      async (m) => {
         if (m.type === lilacEventTypes.CmdRequestMessage) {
           received.push(m);
         }
-        await ctx.commit();
+        return Result.ok(undefined);
       },
     );
 
@@ -5298,7 +5691,8 @@ describe("startBusRequestRouter", () => {
     });
 
     const received: any[] = [];
-    const sub = await bus.subscribeTopic(
+    const sub = await subscribeTopicForTest(
+      bus,
       "cmd.request",
       {
         mode: "fanout",
@@ -5306,11 +5700,11 @@ describe("startBusRequestRouter", () => {
         consumerId: "c1",
         offset: { type: "begin" },
       },
-      async (m, ctx) => {
+      async (m) => {
         if (m.type === lilacEventTypes.CmdRequestMessage) {
           received.push(m);
         }
-        await ctx.commit();
+        return Result.ok(undefined);
       },
     );
 
@@ -5428,7 +5822,8 @@ describe("startBusRequestRouter", () => {
     });
 
     const received: any[] = [];
-    const sub = await bus.subscribeTopic(
+    const sub = await subscribeTopicForTest(
+      bus,
       "cmd.request",
       {
         mode: "fanout",
@@ -5436,11 +5831,11 @@ describe("startBusRequestRouter", () => {
         consumerId: "c1",
         offset: { type: "begin" },
       },
-      async (m, ctx) => {
+      async (m) => {
         if (m.type === lilacEventTypes.CmdRequestMessage) {
           received.push(m);
         }
-        await ctx.commit();
+        return Result.ok(undefined);
       },
     );
 
@@ -5587,7 +5982,8 @@ describe("startBusRequestRouter", () => {
     });
 
     const received: any[] = [];
-    const sub = await bus.subscribeTopic(
+    const sub = await subscribeTopicForTest(
+      bus,
       "cmd.request",
       {
         mode: "fanout",
@@ -5595,11 +5991,11 @@ describe("startBusRequestRouter", () => {
         consumerId: "c1",
         offset: { type: "begin" },
       },
-      async (m, ctx) => {
+      async (m) => {
         if (m.type === lilacEventTypes.CmdRequestMessage) {
           received.push(m);
         }
-        await ctx.commit();
+        return Result.ok(undefined);
       },
     );
 
@@ -5712,7 +6108,8 @@ describe("startBusRequestRouter", () => {
     });
 
     const received: any[] = [];
-    const sub = await bus.subscribeTopic(
+    const sub = await subscribeTopicForTest(
+      bus,
       "cmd.request",
       {
         mode: "fanout",
@@ -5720,11 +6117,11 @@ describe("startBusRequestRouter", () => {
         consumerId: "c1",
         offset: { type: "begin" },
       },
-      async (m, ctx) => {
+      async (m) => {
         if (m.type === lilacEventTypes.CmdRequestMessage) {
           received.push(m);
         }
-        await ctx.commit();
+        return Result.ok(undefined);
       },
     );
 
@@ -5843,7 +6240,8 @@ describe("startBusRequestRouter", () => {
     });
 
     const received: any[] = [];
-    const sub = await bus.subscribeTopic(
+    const sub = await subscribeTopicForTest(
+      bus,
       "cmd.request",
       {
         mode: "fanout",
@@ -5851,11 +6249,11 @@ describe("startBusRequestRouter", () => {
         consumerId: "c1",
         offset: { type: "begin" },
       },
-      async (m, ctx) => {
+      async (m) => {
         if (m.type === lilacEventTypes.CmdRequestMessage) {
           received.push(m);
         }
-        await ctx.commit();
+        return Result.ok(undefined);
       },
     );
 
@@ -5943,7 +6341,8 @@ describe("startBusRequestRouter", () => {
     });
 
     const received: any[] = [];
-    const sub = await bus.subscribeTopic(
+    const sub = await subscribeTopicForTest(
+      bus,
       "cmd.request",
       {
         mode: "fanout",
@@ -5951,11 +6350,11 @@ describe("startBusRequestRouter", () => {
         consumerId: "c1",
         offset: { type: "begin" },
       },
-      async (m, ctx) => {
+      async (m) => {
         if (m.type === lilacEventTypes.CmdRequestMessage) {
           received.push(m);
         }
-        await ctx.commit();
+        return Result.ok(undefined);
       },
     );
 
@@ -5978,6 +6377,76 @@ describe("startBusRequestRouter", () => {
     expect(received.length).toBe(0);
 
     await sub.stop();
+    await router.stop();
+  });
+
+  it("reports Panic from a detached debounce publication through router.done", async () => {
+    const raw = createInMemoryRawBus();
+    const bus = createLilacBus(raw);
+    const sessionId = "chan-debounce-panic";
+    const msgId = "m1";
+    const now = Date.now();
+    const panic = new Panic({ message: "debounce publication invariant failed" });
+    const adapter = new FakeAdapter({
+      [`${sessionId}:${msgId}`]: {
+        ref: { platform: "discord", channelId: sessionId, messageId: msgId },
+        session: { platform: "discord", channelId: sessionId },
+        userId: "u1",
+        userName: "user1",
+        text: "hello there",
+        ts: now,
+        raw: { reference: {} },
+      },
+    });
+    const router = await startBusRequestRouter({
+      adapter,
+      bus,
+      subscriptionId: "router-test-debounce-panic",
+      config: {
+        surface: {
+          discord: {
+            tokenEnv: "DISCORD_TOKEN",
+            allowedChannelIds: [],
+            allowedGuildIds: [],
+            botName: "lilac",
+            outputMode: "inline",
+            previewFinalOutputStyle: "embed",
+          },
+          router: {
+            defaultMode: "active",
+            sessionModes: {},
+            activeDebounceMs: 1,
+            activeGate: { enabled: false, timeoutMs: 2500 },
+          },
+        },
+        agent: { systemPrompt: "(unused in tests; compiled at runtime)" },
+        models: {
+          def: {},
+          main: { model: "openrouter/openai/gpt-4o" },
+          fast: { model: "openrouter/openai/gpt-4o-mini" },
+        },
+      },
+    });
+    raw.failPublicationsTo("cmd.request", panic);
+    const supervised = router.done.then(
+      () => new Error("router.done resolved before reporting debounce Panic"),
+      (cause: unknown) => cause,
+    );
+
+    await bus.publish(lilacEventTypes.EvtAdapterMessageCreated, {
+      platform: "discord",
+      channelId: sessionId,
+      messageId: msgId,
+      userId: "u1",
+      userName: "user1",
+      text: "hello there",
+      ts: now,
+      raw: {
+        discord: { isDMBased: false, mentionsBot: false, replyToBot: false },
+      },
+    });
+
+    expect(await supervised).toBe(panic);
     await router.stop();
   });
 });

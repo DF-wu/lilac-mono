@@ -129,12 +129,15 @@ describe("OpenTUI Markdown completion patch", () => {
       content: "Paragraph\n\n| A | B |\n| - | - |\n| 1 | 2 |",
       syntaxStyle,
       streaming: true,
-      renderNode: (token) =>
-        token.type === "paragraph"
-          ? new TextRenderable(app.renderer, { content: "CUSTOM PARAGRAPH" })
-          : token.type === "table"
-            ? new TextRenderable(app.renderer, { content: "CUSTOM TABLE" })
-            : undefined,
+      renderNode: (token) => {
+        if (token.type === "paragraph") {
+          return new TextRenderable(app.renderer, { content: "CUSTOM PARAGRAPH" });
+        }
+        if (token.type === "table") {
+          return new TextRenderable(app.renderer, { content: "CUSTOM TABLE" });
+        }
+        return undefined;
+      },
     });
     app.renderer.root.add(markdown);
     try {

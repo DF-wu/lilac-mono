@@ -1,5 +1,6 @@
 import path from "node:path";
 import fs from "node:fs/promises";
+import { Panic, Result, TaggedError, type Result as ResultType } from "better-result";
 import { z } from "zod";
 
 const githubAppSecretSchema = z.object({
@@ -15,6 +16,39 @@ const githubAppSecretSchema = z.object({
 });
 
 export type GithubAppSecret = z.infer<typeof githubAppSecretSchema>;
+
+export class GithubAppSecretReadError extends TaggedError("GithubAppSecretReadError")<{
+  readonly secretPath: string;
+  readonly cause: unknown;
+  readonly message: string;
+}> {}
+
+async function captureGithubAppFs<T, E>(
+  run: () => Promise<T>,
+  mapError: (cause: unknown) => E,
+): Promise<ResultType<T, E>> {
+  try {
+    return Result.ok(await run());
+  } catch (cause) {
+    if (Panic.is(cause)) throw cause;
+    return Result.err(mapError(cause));
+  }
+}
+
+export function decodeGithubAppSecret(
+  secretPath: string,
+  value: unknown,
+): ResultType<GithubAppSecret, GithubAppSecretReadError> {
+  const decoded = githubAppSecretSchema.safeParse(value);
+  if (decoded.success) return Result.ok(decoded.data);
+  return Result.err(
+    new GithubAppSecretReadError({
+      secretPath,
+      cause: decoded.error,
+      message: `Invalid GitHub App secret at ${secretPath}`,
+    }),
+  );
+}
 
 export function resolveGithubAppSecretPaths(dataDir: string): {
   jsonPath: string;
@@ -32,11 +66,10 @@ async function ensureSecretDir(dataDir: string): Promise<void> {
 }
 
 async function chmod0600(p: string): Promise<void> {
-  try {
-    await fs.chmod(p, 0o600);
-  } catch {
-    // Best-effort.
-  }
+  await captureGithubAppFs(
+    () => fs.chmod(p, 0o600),
+    (cause) => cause,
+  );
 }
 
 export function deriveApiBaseUrl(input: { host?: string; apiBaseUrl?: string }): string {
@@ -46,15 +79,31 @@ export function deriveApiBaseUrl(input: { host?: string; apiBaseUrl?: string }):
   return `https://${host.replace(/^https?:\/\//, "")}/api/v3`;
 }
 
-export async function readGithubAppSecret(dataDir: string): Promise<GithubAppSecret | null> {
+export async function readGithubAppSecretResult(
+  dataDir: string,
+): Promise<ResultType<GithubAppSecret | null, GithubAppSecretReadError>> {
   const { jsonPath } = resolveGithubAppSecretPaths(dataDir);
   const file = Bun.file(jsonPath);
-  if (!(await file.exists())) return null;
+  const loaded = await captureGithubAppFs(
+    async (): Promise<unknown | null> => {
+      if (!(await file.exists())) return null;
+      return JSON.parse(await file.text()) as unknown;
+    },
+    (cause) =>
+      new GithubAppSecretReadError({
+        secretPath: jsonPath,
+        cause,
+        message: `Invalid GitHub App secret at ${jsonPath}`,
+      }),
+  );
+  if (loaded.status === "error") return Result.err(loaded.error);
+  return loaded.value === null ? Result.ok(null) : decodeGithubAppSecret(jsonPath, loaded.value);
+}
 
-  const raw: unknown = await file.json().catch(() => null as unknown);
-  if (!raw || typeof raw !== "object") return null;
-
-  return githubAppSecretSchema.parse(raw);
+export async function readGithubAppSecret(dataDir: string): Promise<GithubAppSecret | null> {
+  const read = await readGithubAppSecretResult(dataDir);
+  if (read.status === "error") throw read.error;
+  return read.value;
 }
 
 export async function writeGithubAppSecret(params: {
@@ -90,14 +139,48 @@ export async function writeGithubAppSecret(params: {
 
 export async function clearGithubAppSecret(dataDir: string): Promise<void> {
   const { jsonPath, pemPath } = resolveGithubAppSecretPaths(dataDir);
-  await fs.rm(jsonPath, { force: true }).catch(() => undefined);
-  await fs.rm(pemPath, { force: true }).catch(() => undefined);
+  for (const secretPath of [jsonPath, pemPath]) {
+    await captureGithubAppFs(
+      () => fs.rm(secretPath, { force: true }),
+      (cause) => cause,
+    );
+  }
+}
+
+export class GithubAppPrivateKeyReadError extends TaggedError("GithubAppPrivateKeyReadError")<{
+  readonly privateKeyPath: string;
+  readonly cause: unknown;
+  readonly message: string;
+}> {}
+
+export async function readGithubAppPrivateKeyPemResult(
+  secret: GithubAppSecret,
+): Promise<ResultType<string, GithubAppPrivateKeyReadError>> {
+  const loaded = await captureGithubAppFs(
+    () => Bun.file(secret.privateKeyPath).text(),
+    (cause) =>
+      new GithubAppPrivateKeyReadError({
+        privateKeyPath: secret.privateKeyPath,
+        cause,
+        message: `Failed to read GitHub App private key: ${secret.privateKeyPath}`,
+      }),
+  );
+  if (loaded.status === "error") return Result.err(loaded.error);
+  const raw = loaded.value;
+  if (!raw.trim()) {
+    return Result.err(
+      new GithubAppPrivateKeyReadError({
+        privateKeyPath: secret.privateKeyPath,
+        cause: new Error("GitHub App private key is empty"),
+        message: `GitHub App private key is empty: ${secret.privateKeyPath}`,
+      }),
+    );
+  }
+  return Result.ok(raw);
 }
 
 export async function readGithubAppPrivateKeyPem(secret: GithubAppSecret): Promise<string> {
-  const raw = await Bun.file(secret.privateKeyPath).text();
-  if (!raw.trim()) {
-    throw new Error(`GitHub App private key is empty: ${secret.privateKeyPath}`);
-  }
-  return raw;
+  const loaded = await readGithubAppPrivateKeyPemResult(secret);
+  if (loaded.status === "error") throw loaded.error;
+  return loaded.value;
 }

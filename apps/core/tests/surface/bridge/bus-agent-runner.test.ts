@@ -1,18 +1,19 @@
 import { describe, expect, it } from "bun:test";
 import path from "node:path";
-import { mkdtemp, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { pathToFileURL } from "node:url";
 import {
-  buildCoreLineageManifestV1,
+  buildCoreLineageManifestV1 as buildCoreLineageManifestResultV1,
   createLilacBus,
+  decodeCorePrimaryLineageV1,
+  EventPublishTransportFailed,
   lilacEventTypes,
   outReqTopic,
-  parseCorePrimaryLineageV1,
   type CmdRequestMessageData,
   type CoreLineageManifestV1,
   type CorePrimaryLineageV1,
-  type HandleContext,
+  type EventDeliveryStopFailed,
   type Message,
   type PublishOptions,
   type RawBus,
@@ -27,15 +28,18 @@ import {
 } from "@stanley2058/lilac-utils";
 import { jsonSchema, tool, type ModelMessage, type ToolSet } from "ai";
 import { MockLanguageModelV4, simulateReadableStream } from "ai/test";
+import { Panic, Result, TaggedError, type Result as ResultType } from "better-result";
 import {
   AiSdkPiAgent,
   attachAutoCompaction,
   ToolExpansion,
   buildSyntheticToolCallId,
   hashCanonicalMessagesV1,
+  RetryBackoffAborted,
   type AiSdkPiAgentOptions,
 } from "@stanley2058/lilac-agent";
 import {
+  ClaudeCodeRunExternalFailure,
   materializeClaudeCodeRun,
   type ClaudeNativeAttemptObservation,
   type ClaudeNativeSessionStart,
@@ -50,17 +54,26 @@ import {
   appendConfiguredAliasPromptBlock,
   appendAdditionalSessionMemoBlock,
   buildAutoInjectedThreadSearchOverlay,
+  BusAgentRunnerIntakeFailed,
+  BusAgentRunnerRequestHeadersInvalid,
+  busAgentRunnerDeliveryDisposition,
   buildCustomCommandFailureFinalText,
+  BusAgentRunnerOperationFailed,
+  customCommandExecutionErrorText,
   consumeAssistantTextDelta,
   consumeReasoningChunkEvent,
   completeLevel1ToolMapping,
   computeTransientRetryDelayMs,
   createAssistantTextPartBoundaryState,
   createAgentRunIdleWatchdog,
+  captureBusAgentRunnerOperation,
   createTransientModelRetryController,
   degradeCorePrimaryLineageForMutation,
+  formatBusAgentRunnerDrainFailureForLog,
+  formatClaudeLifecycleLogFields,
   formatAutoCompactionToolDisplay,
   formatUnknownErrorForDisplay,
+  resolveCoreClaudeCompactionSummaryModel,
   buildHeartbeatOverlayForRequest,
   buildAutoInjectedThreadSearchMessages,
   buildDeferredSubagentResultMessages,
@@ -90,20 +103,42 @@ import {
   shouldCancelIdleOnlyGlobalRequest,
   shouldUsePersistentCoreClaudeRuntime,
   startBusAgentRunner,
+  startBusAgentRunnerTerminalCleanup,
   shouldEnableAnthropicPromptCache,
   selectPersistedTranscriptMessages,
   selectedLevel1ToolNames,
   resolveCompactionCheckpointMeta,
   resolveCorePrimaryTranscriptProviderState,
   resolveCoreStableNamedContinuation,
+  rethrowBusAgentRunnerPanic,
+  signalBusAgentRunnerHostFailure,
+  toIdleRetryDecision,
   toOpenAIPromptCacheKey,
   withReasoningDisplayDefaultForAnthropicModels,
   withBlankLineBetweenTextParts,
   withReasoningSummaryDefaultForOpenAIModels,
   WORKFLOW_REQUEST_CLAIM_HEARTBEAT_MS,
   validateCorePrimaryLineageAtRunnerIntake,
+  type BusAgentRunnerTerminalCleanup,
 } from "../../../src/surface/bridge/bus-agent-runner";
-import { createCorePrimaryClaudeRuntime } from "../../../src/surface/bridge/bus-agent-runner/core-primary-continuation";
+import {
+  CustomCommandExecuteMissingError,
+  CustomCommandExecuteRejectedError,
+  CustomCommandExecuteThrownError,
+  CustomCommandImportError,
+  CustomCommandResultInvalidError,
+  CustomCommandManager,
+  type CustomCommandExecutionError,
+} from "../../../src/custom-commands/manager";
+import { createCorePrimaryClaudeRuntime as createCorePrimaryClaudeRuntimeResult } from "../../../src/surface/bridge/bus-agent-runner/core-primary-continuation";
+
+function createCorePrimaryClaudeRuntime(
+  input: Parameters<typeof createCorePrimaryClaudeRuntimeResult>[0],
+) {
+  const created = createCorePrimaryClaudeRuntimeResult(input);
+  if (created.status === "error") throw created.error;
+  return created.value;
+}
 import {
   createCoreToolPluginManager,
   type BuiltLevel1Toolset,
@@ -111,7 +146,9 @@ import {
 } from "../../../src/plugins";
 import {
   CORE_SURFACE_PROJECTION_FORMAT_VERSION,
-  computeCorePrimaryClaudeTerminalHead,
+  computeCorePrimaryClaudeTerminalHead as computeCorePrimaryClaudeTerminalHeadResult,
+  type CoreClaudeAttemptMutationError,
+  type CoreClaudeBindingReadError,
   SqliteTranscriptStore,
 } from "../../../src/transcript/transcript-store";
 import { createAgentOutputActivityPublisher } from "../../../src/shared/agent-output-activity";
@@ -147,6 +184,87 @@ import {
   shouldForceUrlDownloadForAnthropicFallback,
   withStableAnthropicUpstreamOrder,
 } from "../../../src/surface/bridge/bus-agent-runner/anthropic-fallback-media";
+import {
+  subscribeForTest,
+  type TestRawMessageHandler,
+  type TestRawSubscriptionHost,
+} from "../../helpers/result-raw-bus";
+
+function transcriptResultValue<T, E>(result: ResultType<T, E>): T {
+  if (result.status === "error") throw result.error;
+  return result.value;
+}
+
+function computeCorePrimaryClaudeTerminalHead(
+  input: Parameters<typeof computeCorePrimaryClaudeTerminalHeadResult>[0],
+) {
+  return transcriptResultValue(computeCorePrimaryClaudeTerminalHeadResult(input));
+}
+
+function attemptMutationValue<T>(result: ResultType<T, CoreClaudeAttemptMutationError>): T {
+  if (result.status === "ok") return result.value;
+  switch (result.error._tag) {
+    case "CoreClaudeBindingCorrupt":
+    case "TranscriptTransactionConflict":
+    case "TranscriptStoreSqliteDriverFailure":
+      throw result.error;
+  }
+}
+
+function bindingValue<T>(result: ResultType<T, CoreClaudeBindingReadError>): T {
+  if (result.status === "ok") return result.value;
+  switch (result.error._tag) {
+    case "CoreClaudeBindingCorrupt":
+    case "TranscriptStoreSqliteDriverFailure":
+      throw result.error;
+  }
+}
+
+function getPrimaryBinding(
+  store: SqliteTranscriptStore,
+  input: Parameters<SqliteTranscriptStore["getCorePrimaryClaudeSessionBinding"]>[0],
+) {
+  return bindingValue(store.getCorePrimaryClaudeSessionBinding(input));
+}
+
+function promotePrimaryBinding(
+  store: SqliteTranscriptStore,
+  input: Parameters<SqliteTranscriptStore["promoteCorePrimaryClaudeSessionBinding"]>[0],
+) {
+  return attemptMutationValue(store.promoteCorePrimaryClaudeSessionBinding(input));
+}
+
+function buildCoreLineageManifestV1(...args: Parameters<typeof buildCoreLineageManifestResultV1>) {
+  return transcriptResultValue(buildCoreLineageManifestResultV1(...args));
+}
+
+function getRequestTranscript(
+  store: SqliteTranscriptStore,
+  input: Parameters<SqliteTranscriptStore["getRequestTranscript"]>[0],
+) {
+  return transcriptResultValue(store.getRequestTranscript(input));
+}
+
+function getCorePrimaryLineageManifest(
+  store: SqliteTranscriptStore,
+  input: Parameters<SqliteTranscriptStore["getCorePrimaryLineageManifest"]>[0],
+) {
+  return transcriptResultValue(store.getCorePrimaryLineageManifest(input));
+}
+
+function getCoreRequestAtomMetadata(
+  store: SqliteTranscriptStore,
+  input: Parameters<SqliteTranscriptStore["getCoreRequestAtomMetadata"]>[0],
+) {
+  return transcriptResultValue(store.getCoreRequestAtomMetadata(input));
+}
+
+function getTranscriptBySurfaceMessage(
+  store: SqliteTranscriptStore,
+  input: Parameters<SqliteTranscriptStore["getTranscriptBySurfaceMessage"]>[0],
+) {
+  return transcriptResultValue(store.getTranscriptBySurfaceMessage(input));
+}
 
 function level1TestTool(execute: () => unknown) {
   return tool({
@@ -175,6 +293,7 @@ function level1TestToolset(params?: {
   return {
     tools,
     specs: new Map(),
+    contributionInfo: new Map(),
     directToolNames: new Set(["builtin", "tool_search"]),
     catalog: [
       {
@@ -298,6 +417,74 @@ function level1OfferedToolNames(options: { tools?: ReadonlyArray<{ name: string 
   return (options.tools ?? []).map((entry) => entry.name);
 }
 
+describe("Claude lifecycle logging", () => {
+  it("redacts lifecycle detail and formats TaggedErrors without exposing causes", () => {
+    class LifecycleFailure extends TaggedError("LifecycleFailure")<{
+      readonly cause: unknown;
+      readonly message: string;
+    }> {}
+
+    const projected = formatClaudeLifecycleLogFields(
+      "candidate-finalization-failed",
+      {
+        requestId: "request-1",
+        detail: "token=sk-detail-secret",
+      },
+      new LifecycleFailure({
+        cause: { authorization: "Bearer cause-secret" },
+        message: "finalization failed token=sk-message-secret",
+      }),
+    );
+
+    expect(projected).toMatchObject({
+      lifecycle: "candidate-finalization-failed",
+      requestId: "request-1",
+      detail: "token=<redacted>",
+      errorTag: "LifecycleFailure",
+      errorMessage: "finalization failed token=<redacted>",
+    });
+    expect(projected).not.toHaveProperty("cause");
+    expect(JSON.stringify(projected)).not.toContain("cause-secret");
+    expect(JSON.stringify(projected)).not.toContain("sk-detail-secret");
+    expect(JSON.stringify(projected)).not.toContain("sk-message-secret");
+  });
+
+  it("serializes drain publication failures to JSONL without raw causes or stacks", () => {
+    const secret = "sk-drain-cause-secret";
+    const cause = new Error(`transport cause ${secret}`);
+    const failure = new EventPublishTransportFailed({
+      cause,
+      eventType: "evt.request.lifecycle.changed",
+      topic: "evt.request",
+      message: `publish failed token=${secret}`,
+    });
+    const chunks: string[] = [];
+    const output = { write: (chunk: string) => chunks.push(chunk) };
+    const logger = createLogger({
+      module: "bus-agent-runner-drain-test",
+      outputFormat: "jsonl",
+      stdout: output,
+      stderr: output,
+    });
+
+    logger.error(
+      "drainSessionQueue failed",
+      formatBusAgentRunnerDrainFailureForLog(failure, {
+        sessionId: "session-1",
+        requestId: "request-1",
+      }),
+    );
+
+    const serialized = chunks.join("");
+    expect(serialized).toContain('"errorTag":"EventPublishTransportFailed"');
+    expect(serialized).toContain('"errorMessage":"publish failed token=<redacted>"');
+    expect(serialized).not.toContain(secret);
+    expect(serialized).not.toContain("transport cause");
+    expect(serialized).not.toContain('"cause"');
+    expect(serialized).not.toContain('"stack"');
+  });
+});
+
 describe("runner Level 1 catalog selection", () => {
   it("applies persisted initial selection by stable ID and omits unavailable selected rows", () => {
     const toolset = level1TestToolset();
@@ -404,6 +591,7 @@ describe("runner Level 1 catalog selection", () => {
     const toolset: BuiltLevel1Toolset = {
       tools,
       specs: new Map(),
+      contributionInfo: new Map(),
       directToolNames: new Set(["batch"]),
       catalog: [
         {
@@ -768,23 +956,25 @@ describe("subagent model selection", () => {
       },
     ]);
     const staleStore = {
-      saveRequestTranscript() {},
+      saveRequestTranscript() {
+        return Result.ok(undefined);
+      },
       linkSurfaceMessagesToRequest() {},
       getCoreSurfaceProjection() {
-        return null;
+        return Result.ok(null);
       },
       getTranscriptBySurfaceMessage() {
-        return null;
+        return Result.ok(null);
       },
       validateCorePrimaryLineageReferences() {
-        return "stale-surface-lineage";
+        return Result.ok("stale-surface-lineage");
       },
       close() {},
     };
     const validStore = {
       ...staleStore,
       getCoreSurfaceProjection() {
-        return {
+        return Result.ok({
           requestClient: "discord" as const,
           surfaceId: "discord:channel",
           sessionId: "channel",
@@ -797,12 +987,14 @@ describe("subagent model selection", () => {
           },
           ownedBlobs: [],
           createdAt: 1,
-        };
+        });
       },
       validateCorePrimaryLineageReferences(input: { manifest: CoreLineageManifestV1 }) {
-        return input.manifest.segments[0]?.canonicalMessages[0]?.content === "hello"
-          ? null
-          : "transformed-surface-lineage";
+        return Result.ok(
+          input.manifest.segments[0]?.canonicalMessages[0]?.content === "hello"
+            ? null
+            : "transformed-surface-lineage",
+        );
       },
     };
 
@@ -1460,15 +1652,19 @@ describe("subagent model selection", () => {
       },
     };
 
-    expect(() =>
-      assertWorkflowDispatchPolicy(policy, { profile: "general", depth: 1 }),
-    ).not.toThrow();
-    expect(() =>
-      assertWorkflowDispatchPolicy(
-        { ...policy, reasoning: "medium" },
-        { profile: "general", depth: 1, reasoning: "low" },
-      ),
-    ).toThrow("reasoning does not match the approved operation policy");
+    expect(assertWorkflowDispatchPolicy(policy, { profile: "general", depth: 1 }).status).toBe(
+      "ok",
+    );
+    const mismatch = assertWorkflowDispatchPolicy(
+      { ...policy, reasoning: "medium" },
+      { profile: "general", depth: 1, reasoning: "low" },
+    );
+    expect(mismatch.status).toBe("error");
+    if (mismatch.status === "error") {
+      expect(mismatch.error.message).toContain(
+        "reasoning does not match the approved operation policy",
+      );
+    }
   });
 
   it("accepts only the exact durable stable-named identity", () => {
@@ -1498,38 +1694,62 @@ describe("subagent model selection", () => {
       },
     };
 
-    expect(
-      resolveCoreStableNamedContinuation({
-        runProfile: "general",
-        sessionId: "sub:channel:named:audit",
-        workflowPolicy: policy,
-      }),
-    ).toEqual(policy.stableNamedContinuation);
-    expect(
-      resolveCoreStableNamedContinuation({
-        runProfile: "general",
-        sessionId: "sub:channel:named:generated",
-        workflowPolicy: { ...policy, stableNamedContinuation: undefined },
-      }),
-    ).toBeNull();
-    expect(() =>
-      resolveCoreStableNamedContinuation({
-        runProfile: "general",
-        sessionId: "sub:channel:named:other",
-        workflowPolicy: policy,
-      }),
-    ).toThrow("does not match the child session");
-    expect(() =>
-      resolveCoreStableNamedContinuation({
-        runProfile: "primary",
-        sessionId: "sub:channel:named:audit",
-        workflowPolicy: policy,
-      }),
-    ).toThrow("cannot authorize a primary run");
+    const exact = resolveCoreStableNamedContinuation({
+      runProfile: "general",
+      sessionId: "sub:channel:named:audit",
+      workflowPolicy: policy,
+    });
+    expect(exact.status).toBe("ok");
+    if (exact.status === "ok") expect(exact.value).toEqual(policy.stableNamedContinuation);
+    const absent = resolveCoreStableNamedContinuation({
+      runProfile: "general",
+      sessionId: "sub:channel:named:generated",
+      workflowPolicy: { ...policy, stableNamedContinuation: undefined },
+    });
+    expect(absent.status).toBe("ok");
+    if (absent.status === "ok") expect(absent.value).toBeNull();
+    const mismatchedSession = resolveCoreStableNamedContinuation({
+      runProfile: "general",
+      sessionId: "sub:channel:named:other",
+      workflowPolicy: policy,
+    });
+    expect(mismatchedSession.status).toBe("error");
+    if (mismatchedSession.status === "error") {
+      expect(mismatchedSession.error.message).toContain("does not match the child session");
+    }
+    const primary = resolveCoreStableNamedContinuation({
+      runProfile: "primary",
+      sessionId: "sub:channel:named:audit",
+      workflowPolicy: policy,
+    });
+    expect(primary.status).toBe("error");
+    if (primary.status === "error") {
+      expect(primary.error.message).toContain("cannot authorize a primary run");
+    }
   });
 });
 
 describe("agent run activity", () => {
+  it("fails idle retry when the inner backoff Result is aborted", () => {
+    expect(
+      toIdleRetryDecision(
+        Result.err(
+          new RetryBackoffAborted({
+            cause: new Error("aborted"),
+            message: "Retry backoff was aborted",
+          }),
+        ),
+      ),
+    ).toEqual({ status: "fail", reason: "aborted" });
+  });
+
+  it("fails idle retry when the inner backoff Result exhausts its budget", () => {
+    expect(toIdleRetryDecision(Result.ok(null))).toEqual({
+      status: "fail",
+      reason: "exhausted",
+    });
+  });
+
   it("fails a wait after the configured idle interval", async () => {
     const timedOut: Error[] = [];
     const watchdog = createAgentRunIdleWatchdog({
@@ -1604,16 +1824,19 @@ describe("agent run activity", () => {
     const bus = createLilacBus(createInMemoryRawBus());
     const requestId = "activity-request";
     const sources: string[] = [];
-    const sub = await bus.subscribeTopic(
+    const subResult = await bus.subscribeTopic(
       outReqTopic(requestId),
       { mode: "tail", offset: { type: "begin" } },
-      async (msg, ctx) => {
+      async (msg) => {
         if (msg.type === lilacEventTypes.EvtAgentOutputActivity) {
           sources.push(msg.data.source);
         }
-        await ctx.commit();
+        return Result.ok(undefined);
       },
+      () => "dead-letter",
     );
+    if (subResult.status === "error") throw subResult.error;
+    const sub = subResult.value;
     const publishActivity = createAgentOutputActivityPublisher({
       publish: async (source) => {
         await bus.publish(
@@ -1634,7 +1857,8 @@ describe("agent run activity", () => {
     await Bun.sleep(0);
 
     expect(sources).toEqual(["model", "subagent"]);
-    await sub.stop();
+    const stopped = await sub.stop();
+    if (stopped.status === "error") throw stopped.error;
   });
 });
 
@@ -1777,15 +2001,82 @@ function autoInjectPlanForQuery(query: string, intentSummary: string) {
   };
 }
 
-function createInMemoryRawBus(): RawBus {
+describe("bus agent runner delivery policy", () => {
+  it("dead-letters missing required request headers", () => {
+    const error = new BusAgentRunnerRequestHeadersInvalid({
+      missing: ["session_id"],
+      message: "missing session id",
+    });
+
+    expect(busAgentRunnerDeliveryDisposition(error)).toBe("dead-letter");
+  });
+
+  it("parks expected intake failures", () => {
+    const error = new BusAgentRunnerIntakeFailed({
+      cause: new Error("lifecycle publish unavailable"),
+      message: "request intake failed",
+    });
+
+    expect(busAgentRunnerDeliveryDisposition(error)).toBe("park-pending");
+  });
+
+  it("reports and rethrows Panic without creating a delivery error", () => {
+    const panic = new Panic({ message: "runner invariant failed" });
+    const reported: Panic[] = [];
+
+    expect(() => rethrowBusAgentRunnerPanic(panic, (cause) => reported.push(cause))).toThrow(panic);
+    expect(reported).toEqual([panic]);
+  });
+
+  it("captures ordinary dependency rejection as an owned operation failure", async () => {
+    const cause = new Error("provider unavailable");
+
+    const result = await captureBusAgentRunnerOperation("provider resolution", () =>
+      Promise.reject(cause),
+    );
+
+    expect(result.status).toBe("error");
+    if (result.status === "ok") throw new Error("expected operation failure");
+    expect(result.error).toBeInstanceOf(BusAgentRunnerOperationFailed);
+    expect(result.error.operation).toBe("provider resolution");
+    expect(result.error.cause).toBe(cause);
+    expect(result.error.message).toBe("provider unavailable");
+  });
+
+  it("preserves Panic identity through capture and the exact host adapter", async () => {
+    const panic = new Panic({ message: "provider invariant failed" });
+    const reported: Panic[] = [];
+
+    await expect(
+      captureBusAgentRunnerOperation(
+        "provider resolution",
+        () => Promise.reject(panic),
+        (cause) => reported.push(cause),
+      ),
+    ).rejects.toBe(panic);
+    expect(reported).toEqual([panic]);
+
+    const ordinaryCause = new Error("model callback failed");
+    const failure = new BusAgentRunnerOperationFailed({
+      operation: "model callback",
+      cause: ordinaryCause,
+      failureKind: "other",
+      displayMessage: ordinaryCause.message,
+      message: ordinaryCause.message,
+    });
+    expect(() => signalBusAgentRunnerHostFailure(failure)).toThrow(ordinaryCause);
+  });
+});
+
+function createInMemoryRawBus(): RawBus & TestRawSubscriptionHost {
   const topics = new Map<string, Array<Message<unknown>>>();
   const subs = new Set<{
     topic: string;
     opts: SubscriptionOptions;
-    handler: (msg: Message<unknown>, ctx: HandleContext) => Promise<void>;
+    handler: TestRawMessageHandler;
   }>();
-
-  return {
+  const raw: RawBus & TestRawSubscriptionHost = {
+    subscribe: subscribeForTest,
     publish: async <TData>(msg: Omit<Message<TData>, "id" | "ts">, opts: PublishOptions) => {
       const id = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
       const stored: Message<unknown> = {
@@ -1795,7 +2086,7 @@ function createInMemoryRawBus(): RawBus {
         ts: Date.now(),
         key: opts.key,
         headers: opts.headers,
-        data: msg.data as unknown,
+        data: msg.data,
       };
 
       const list = topics.get(opts.topic) ?? [];
@@ -1804,22 +2095,17 @@ function createInMemoryRawBus(): RawBus {
 
       for (const s of subs) {
         if (s.topic !== opts.topic) continue;
-        await s.handler(stored, { cursor: id, commit: async () => {} });
+        await s.handler(stored, id);
       }
-
       return { id, cursor: id };
     },
 
-    subscribe: async <TData>(
+    openTestSubscription: async (
       topic: string,
       opts: SubscriptionOptions,
-      handler: (msg: Message<TData>, ctx: HandleContext) => Promise<void>,
+      handler: TestRawMessageHandler,
     ) => {
-      const entry = {
-        topic,
-        opts,
-        handler: handler as unknown as (msg: Message<unknown>, ctx: HandleContext) => Promise<void>,
-      };
+      const entry = { topic, opts, handler };
       subs.add(entry);
 
       const offset = opts.offset;
@@ -1833,10 +2119,7 @@ function createInMemoryRawBus(): RawBus {
               })()
             : existing;
         for (const m of replay) {
-          await handler(m as unknown as Message<TData>, {
-            cursor: m.id,
-            commit: async () => {},
-          });
+          await handler(m, m.id);
         }
       }
 
@@ -1847,11 +2130,11 @@ function createInMemoryRawBus(): RawBus {
       };
     },
 
-    fetch: async <TData>(topic: string) => {
+    fetch: async (topic: string) => {
       const existing = topics.get(topic) ?? [];
       return {
         messages: existing.map((m) => ({
-          msg: m as unknown as Message<TData>,
+          msg: m,
           cursor: m.id,
         })),
         next: existing.length > 0 ? existing[existing.length - 1]?.id : undefined,
@@ -1860,16 +2143,22 @@ function createInMemoryRawBus(): RawBus {
 
     close: async () => {},
   };
+
+  return raw;
 }
 
 function deferred<T>() {
   let resolvePromise: (value: T) => void = () => {
     throw new Error("deferred promise was not initialized");
   };
-  const promise = new Promise<T>((resolve) => {
+  let rejectPromise: (reason?: unknown) => void = () => {
+    throw new Error("deferred promise was not initialized");
+  };
+  const promise = new Promise<T>((resolve, reject) => {
     resolvePromise = resolve;
+    rejectPromise = reject;
   });
-  return { promise, resolve: resolvePromise };
+  return { promise, resolve: resolvePromise, reject: rejectPromise };
 }
 
 type ProductionPathOutput = {
@@ -2026,10 +2315,10 @@ async function observeRequestLifecycle(bus: ReturnType<typeof createLilacBus>, r
   const terminal = deferred<"resolved" | "cancelled" | "failed">();
   const states: string[] = [];
   const details: Array<string | undefined> = [];
-  const subscription = await bus.subscribeTopic(
+  const subscriptionResult = await bus.subscribeTopic(
     "evt.request",
     { mode: "tail", offset: { type: "begin" } },
-    async (message, context) => {
+    async (message) => {
       if (
         message.type === lilacEventTypes.EvtRequestLifecycleChanged &&
         message.headers?.request_id === requestId
@@ -2044,10 +2333,21 @@ async function observeRequestLifecycle(bus: ReturnType<typeof createLilacBus>, r
           terminal.resolve(message.data.state);
         }
       }
-      await context.commit();
+      return Result.ok(undefined);
     },
+    () => "dead-letter",
   );
-  return { states, details, terminal: terminal.promise, stop: subscription.stop };
+  if (subscriptionResult.status === "error") throw subscriptionResult.error;
+  const subscription = subscriptionResult.value;
+  return {
+    states,
+    details,
+    terminal: terminal.promise,
+    stop: async () => {
+      const stopped = await subscription.stop();
+      if (stopped.status === "error") throw stopped.error;
+    },
+  };
 }
 
 async function observeResponseAfterOutputRelay(
@@ -2055,36 +2355,47 @@ async function observeResponseAfterOutputRelay(
   requestId: string,
 ) {
   const relayed = deferred<void>();
-  let outputSubscription: { stop(): Promise<void> } | null = null;
-  const lifecycleSubscription = await bus.subscribeTopic(
+  let outputSubscription: { stop(): Promise<ResultType<void, EventDeliveryStopFailed>> } | null =
+    null;
+  const lifecycleSubscriptionResult = await bus.subscribeTopic(
     "evt.request",
     { mode: "tail", offset: { type: "now" } },
-    async (message, context) => {
+    async (message) => {
       if (
         message.type === lilacEventTypes.EvtRequestLifecycleChanged &&
         message.headers?.request_id === requestId &&
         message.data.state === "resolved" &&
         outputSubscription === null
       ) {
-        outputSubscription = await bus.subscribeTopic(
+        const outputSubscriptionResult = await bus.subscribeTopic(
           outReqTopic(requestId),
           { mode: "tail", offset: { type: "now" } },
-          async (outputMessage, outputContext) => {
+          async (outputMessage) => {
             if (outputMessage.type === lilacEventTypes.EvtAgentOutputResponseText) {
               relayed.resolve(undefined);
             }
-            await outputContext.commit();
+            return Result.ok(undefined);
           },
+          () => "dead-letter",
         );
+        if (outputSubscriptionResult.status === "error") throw outputSubscriptionResult.error;
+        outputSubscription = outputSubscriptionResult.value;
       }
-      await context.commit();
+      return Result.ok(undefined);
     },
+    () => "dead-letter",
   );
+  if (lifecycleSubscriptionResult.status === "error") throw lifecycleSubscriptionResult.error;
+  const lifecycleSubscription = lifecycleSubscriptionResult.value;
   return {
     relayed: relayed.promise,
     stop: async () => {
-      await lifecycleSubscription.stop();
-      await outputSubscription?.stop();
+      const lifecycleStopped = await lifecycleSubscription.stop();
+      if (lifecycleStopped.status === "error") throw lifecycleStopped.error;
+      if (outputSubscription) {
+        const outputStopped = await outputSubscription.stop();
+        if (outputStopped.status === "error") throw outputStopped.error;
+      }
     },
   };
 }
@@ -2120,7 +2431,246 @@ async function publishRunnerRequest(input: {
   );
 }
 
+describe("bus agent runner terminal cleanup", () => {
+  const synchronousLabels = [
+    "workflow-claim-timer-clear",
+    "control-capability-expire",
+    "workflow-request-expire",
+    "run-idle-watchdog-stop",
+    "agent-unsubscribe",
+    "compaction-unsubscribe",
+    "output-publisher-drain",
+  ] as const satisfies readonly BusAgentRunnerTerminalCleanup["label"][];
+
+  for (const failingLabel of synchronousLabels) {
+    it.each([
+      ["an ordinary Error", () => new Error(`${failingLabel} failed`)],
+      ["a Panic", () => new Panic({ message: `${failingLabel} invariant failed` })],
+    ] as const)(
+      `captures ${failingLabel} throwing %s without preventing cleanup`,
+      async (_, cause) => {
+        const failure = cause();
+        const originalPanic = new Panic({ message: "custom command invariant failed" });
+        const started: BusAgentRunnerTerminalCleanup["label"][] = [];
+        let nextQueueStarts = 0;
+        let operations: ReturnType<typeof startBusAgentRunnerTerminalCleanup>["operations"] = [];
+        const terminalOperation = (async () => {
+          try {
+            throw originalPanic;
+          } finally {
+            operations = startBusAgentRunnerTerminalCleanup(
+              synchronousLabels.map((label) => ({
+                label,
+                run: () => {
+                  started.push(label);
+                  if (label === failingLabel) throw failure;
+                },
+              })),
+            ).operations;
+          }
+        })();
+        const drainOperation = terminalOperation.then(() => {
+          nextQueueStarts += 1;
+        });
+        const drainRejection = drainOperation.then(
+          () => null,
+          (error: unknown) => error,
+        );
+        const observed = operations.map(({ operation }) =>
+          operation.then(
+            () => null,
+            (error: unknown) => error,
+          ),
+        );
+
+        expect(started).toEqual([...synchronousLabels]);
+        expect(await drainRejection).toBe(originalPanic);
+        expect(await Promise.all(observed)).toEqual(
+          synchronousLabels.map((label) => (label === failingLabel ? failure : null)),
+        );
+        expect(nextQueueStarts).toBe(0);
+      },
+    );
+  }
+
+  it.each([
+    ["ordinary errors", () => new Error("cleanup failed")],
+    ["Panics", () => new Panic({ message: "cleanup invariant failed" })],
+  ] as const)("supervises retire, dispose, and live-close %s independently", async (_, cause) => {
+    const labels = [
+      "core-named-retire",
+      "core-primary-retire",
+      "claude-dispose",
+      "live-close",
+    ] as const;
+    const started: BusAgentRunnerTerminalCleanup["label"][] = [];
+    const failures = labels.map(cause);
+    const cleanupGates = labels.map(() => deferred<void>());
+    const cleanupBatch = startBusAgentRunnerTerminalCleanup(
+      labels.map((label, index) => ({
+        label,
+        run: () => {
+          started.push(label);
+          return cleanupGates[index]?.promise;
+        },
+      })),
+    );
+    const operations = cleanupBatch.operations;
+    const observed = operations.map(({ operation }) =>
+      operation.then(
+        () => null,
+        (error: unknown) => error,
+      ),
+    );
+
+    expect(operations.map(({ label }) => label)).toEqual([...labels]);
+    expect(started).toEqual([...labels]);
+    for (const [index, gate] of cleanupGates.entries()) gate.reject(failures[index]);
+    expect(await Promise.all(observed)).toEqual(failures);
+    await expect(cleanupBatch.completion).resolves.toBeUndefined();
+  });
+});
+
 describe("startBusAgentRunner production path", () => {
+  it.each([
+    ["an ordinary Error", () => new Error("capability expiration failed")],
+    ["a Panic", () => new Panic({ message: "capability expiration invariant failed" })],
+  ] as const)(
+    "propagates custom command Panic when terminal cleanup throws %s",
+    async (_, cause) => {
+      const config = parseCoreConfigV1ToUniversal({});
+      const dataDir = await mkdtemp(path.join(tmpdir(), "lilac-runner-custom-panic-"));
+      const commandDir = path.join(dataDir, "cmds", "panic");
+      const commandStarted = deferred<void>();
+      const releaseCommand = deferred<void>();
+      await mkdir(commandDir, { recursive: true });
+      await writeFile(
+        path.join(commandDir, "def.json"),
+        JSON.stringify({ name: "panic", description: "Raise a test Panic" }),
+        "utf8",
+      );
+      await writeFile(
+        path.join(commandDir, "index.ts"),
+        "export async function execute() { return { type: 'json', value: null }; }\n",
+        "utf8",
+      );
+      const customCommands = new CustomCommandManager(dataDir);
+      const customCommandsInit = await customCommands.init();
+      if (customCommandsInit.status === "error") throw customCommandsInit.error;
+      customCommands.execute = async (input) => {
+        commandStarted.resolve(undefined);
+        await releaseCommand.promise;
+        throw input.args[0];
+      };
+      const pluginManager = corePrimaryTestPluginManager();
+      const bus = createLilacBus(createInMemoryRawBus());
+      let nextWorkStarts = 0;
+      const cleanupFailure = cause();
+      const fatalPanicReported = deferred<Panic>();
+      const runner = await startBusAgentRunner({
+        bus,
+        subscriptionId: "production-custom-command-panic",
+        reportFatalPanic: fatalPanicReported.resolve,
+        config,
+        pluginManager,
+        customCommands,
+        issueControlCapability: () => ({ capability: "test-capability", principal: null }),
+        expireControlCapability: () => {
+          throw cleanupFailure;
+        },
+        createAgent: () => {
+          nextWorkStarts += 1;
+          throw new Error("custom command Panic must stop before agent creation");
+        },
+      });
+      const requestId = "github:custom-panic:request";
+      const queuedRequestId = "github:custom-panic:queued";
+      const lifecycle = await observeRequestLifecycle(bus, requestId);
+      const queuedLifecycle = await observeRequestLifecycle(bus, queuedRequestId);
+      const panic = new Panic({ message: "custom command invariant failed" });
+
+      try {
+        await publishRunnerRequest({
+          bus,
+          requestId,
+          sessionId: "custom-panic",
+          text: "/lilac:panic",
+          raw: {
+            customCommand: {
+              name: "panic",
+              args: [panic],
+              text: "/lilac:panic",
+              source: "text",
+            },
+          },
+        });
+        const startedDrainOperation = runner.getActiveDrainOperation();
+        if (!startedDrainOperation) throw new Error("Expected the request to start a queue drain");
+        expect(
+          await Promise.race([
+            commandStarted.promise.then(() => "command-started" as const),
+            lifecycle.terminal,
+          ]),
+        ).toBe("command-started");
+        await publishRunnerRequest({
+          bus,
+          requestId: queuedRequestId,
+          sessionId: "custom-panic",
+          text: "must not start",
+        });
+        expect(queuedLifecycle.states).toEqual(["queued"]);
+
+        const activeDrainOperation = runner.getActiveDrainOperation();
+        if (!activeDrainOperation) throw new Error("Expected an active detached drain operation");
+        const rejectionObserved = activeDrainOperation.then(
+          () => null,
+          (error: unknown) => error,
+        );
+        releaseCommand.resolve(undefined);
+        expect(await rejectionObserved).toBe(panic);
+        expect(await fatalPanicReported.promise).toBe(panic);
+        const cleanupOperations = runner.getTerminalCleanupOperations();
+        const cleanupResults = await Promise.all(
+          cleanupOperations.map(({ operation }) =>
+            operation.then(
+              () => null,
+              (error: unknown) => error,
+            ),
+          ),
+        );
+        expect(cleanupOperations.map(({ label }) => label)).toEqual([
+          "control-capability-expire",
+          "run-idle-watchdog-stop",
+          "agent-unsubscribe",
+          "compaction-unsubscribe",
+          "output-publisher-drain",
+        ]);
+        expect(cleanupResults).toEqual([cleanupFailure, null, null, null, null]);
+        expect(lifecycle.states).toEqual(["running"]);
+        expect(queuedLifecycle.states).toEqual(["queued"]);
+        expect(nextWorkStarts).toBe(0);
+        await expect(
+          publishRunnerRequest({
+            bus,
+            requestId: "github:custom-panic:after-defect",
+            sessionId: "custom-panic",
+            text: "must be rejected",
+          }),
+        ).rejects.toBe(panic);
+      } finally {
+        releaseCommand.resolve(undefined);
+        await lifecycle.stop();
+        await queuedLifecycle.stop();
+        await runner.stop().catch((cause: unknown) => {
+          expect(cause).toBe(panic);
+        });
+        await pluginManager.destroy();
+        await bus.close();
+        await rm(dataDir, { recursive: true, force: true });
+      }
+    },
+  );
+
   it("latches the active model, applies an unqualified follow-up, and queues an explicit change", async () => {
     const config = parseCoreConfigV1ToUniversal({});
     config.models.main = { model: "openai/initial" };
@@ -2138,6 +2688,7 @@ describe("startBusAgentRunner production path", () => {
     const runner = await startBusAgentRunner({
       bus,
       subscriptionId: "production-model-latch",
+      reportFatalPanic: () => undefined,
       config,
       pluginManager,
       issueControlCapability: () => ({ capability: "test-capability", principal: null }),
@@ -2222,6 +2773,7 @@ describe("startBusAgentRunner production path", () => {
     const runner = await startBusAgentRunner({
       bus,
       subscriptionId: "production-cancel",
+      reportFatalPanic: () => undefined,
       config,
       pluginManager,
       issueControlCapability: () => ({ capability: "test-capability", principal: null }),
@@ -2285,6 +2837,7 @@ describe("startBusAgentRunner production path", () => {
     const runner = await startBusAgentRunner({
       bus,
       subscriptionId: "production-fallback",
+      reportFatalPanic: () => undefined,
       config,
       pluginManager,
       issueControlCapability: () => ({ capability: "test-capability", principal: null }),
@@ -2334,6 +2887,7 @@ describe("startBusAgentRunner production path", () => {
     const runner = await startBusAgentRunner({
       bus,
       subscriptionId: "production-phased-output",
+      reportFatalPanic: () => undefined,
       config,
       pluginManager,
       issueControlCapability: () => ({ capability: "test-capability", principal: null }),
@@ -2356,19 +2910,22 @@ describe("startBusAgentRunner production path", () => {
       phase?: "commentary" | "final_answer";
       phaseBoundaryPrefixChars?: number;
     }> = [];
-    const outputSubscription = await bus.subscribeTopic(
+    const outputSubscriptionResult = await bus.subscribeTopic(
       outReqTopic(requestId),
       { mode: "tail", offset: { type: "now" } },
-      async (message, context) => {
+      async (message) => {
         if (message.type === lilacEventTypes.EvtAgentOutputDeltaText) {
           textDeltas.push(message.data);
         }
         if (message.type === lilacEventTypes.EvtAgentOutputResponseText) {
           responsePublished.resolve(undefined);
         }
-        await context.commit();
+        return Result.ok(undefined);
       },
+      () => "dead-letter",
     );
+    if (outputSubscriptionResult.status === "error") throw outputSubscriptionResult.error;
+    const outputSubscription = outputSubscriptionResult.value;
 
     await publishRunnerRequest({
       bus,
@@ -2396,10 +2953,10 @@ describe("startBusAgentRunner production path", () => {
       finalText: string;
       delivery?: "reply" | "skip";
     }>();
-    const skippedOutputSubscription = await bus.subscribeTopic(
+    const skippedOutputSubscriptionResult = await bus.subscribeTopic(
       outReqTopic(skippedRequestId),
       { mode: "tail", offset: { type: "now" } },
-      async (message, context) => {
+      async (message) => {
         if (message.type === lilacEventTypes.EvtAgentOutputDeltaText) {
           skippedDeltas.push(message.data);
         }
@@ -2409,9 +2966,14 @@ describe("startBusAgentRunner production path", () => {
         if (message.type === lilacEventTypes.EvtAgentOutputResponseText) {
           skippedResponse.resolve(message.data);
         }
-        await context.commit();
+        return Result.ok(undefined);
       },
+      () => "dead-letter",
     );
+    if (skippedOutputSubscriptionResult.status === "error") {
+      throw skippedOutputSubscriptionResult.error;
+    }
+    const skippedOutputSubscription = skippedOutputSubscriptionResult.value;
     await publishRunnerRequest({
       bus,
       requestId: skippedRequestId,
@@ -2427,9 +2989,11 @@ describe("startBusAgentRunner production path", () => {
     expect(skippedDeltas).toEqual([{ delta: "Commentary.", phase: "commentary" }]);
     expect(skippedResets).toEqual([""]);
 
-    await skippedOutputSubscription.stop();
+    const skippedOutputStopped = await skippedOutputSubscription.stop();
+    if (skippedOutputStopped.status === "error") throw skippedOutputStopped.error;
     await skippedLifecycle.stop();
-    await outputSubscription.stop();
+    const outputStopped = await outputSubscription.stop();
+    if (outputStopped.status === "error") throw outputStopped.error;
     await lifecycle.stop();
     await runner.stop();
     await pluginManager.destroy();
@@ -2450,6 +3014,7 @@ describe("startBusAgentRunner production path", () => {
     const runner = await startBusAgentRunner({
       bus,
       subscriptionId: "production-silent-turn",
+      reportFatalPanic: () => undefined,
       config,
       pluginManager,
       transcriptStore: store,
@@ -2476,17 +3041,20 @@ describe("startBusAgentRunner production path", () => {
     const lifecycle = await observeRequestLifecycle(bus, requestId);
     const responsePublished = deferred<void>();
     const outputEvents: Array<Message<unknown>> = [];
-    const outputSubscription = await bus.subscribeTopic(
+    const outputSubscriptionResult = await bus.subscribeTopic(
       outReqTopic(requestId),
       { mode: "tail", offset: { type: "now" } },
-      async (message, context) => {
+      async (message) => {
         outputEvents.push(message);
         if (message.type === lilacEventTypes.EvtAgentOutputResponseText) {
           responsePublished.resolve(undefined);
         }
-        await context.commit();
+        return Result.ok(undefined);
       },
+      () => "dead-letter",
     );
+    if (outputSubscriptionResult.status === "error") throw outputSubscriptionResult.error;
+    const outputSubscription = outputSubscriptionResult.value;
 
     await publishRunnerRequest({
       bus,
@@ -2508,12 +3076,13 @@ describe("startBusAgentRunner production path", () => {
     );
     expect(JSON.stringify(secondTurnAssistantMessages)).not.toContain("NO_REPLY");
     expect(JSON.stringify(secondTurnAssistantMessages)).toContain("call-silent");
-    const transcript = store.getRequestTranscript({ requestId });
+    const transcript = getRequestTranscript(store, { requestId });
     expect(transcript?.finalText).toBe("final answer");
     expect(JSON.stringify(transcript?.messages)).not.toContain("NO_REPLY");
     expect(JSON.stringify(transcript?.messages)).toContain("call-silent");
 
-    await outputSubscription.stop();
+    const outputStopped = await outputSubscription.stop();
+    if (outputStopped.status === "error") throw outputStopped.error;
     await lifecycle.stop();
     await runner.stop();
     await pluginManager.destroy();
@@ -2526,14 +3095,14 @@ describe("startBusAgentRunner production path", () => {
 function corePrimaryTestPluginManager(): CoreToolPluginManager {
   const toolset = level1TestToolset();
   return {
-    init: async () => {},
-    destroy: async () => {},
-    reload: async () => {},
-    ensureFresh: async () => {},
+    init: async () => Result.ok(),
+    destroy: async () => Result.ok(),
+    reload: async () => Result.ok(),
+    ensureFresh: async () => Result.ok(),
     getStatuses: () => [],
     getLevel2Tools: () => [],
     getLevel2ContributionInfo: () => new Map(),
-    buildLevel1Toolset: async () => toolset,
+    buildLevel1ToolsetResult: async () => Result.ok(toolset),
   };
 }
 
@@ -2579,8 +3148,8 @@ function extendPrimaryManifest(input: {
   currentMessageId: string;
   currentMessages: readonly ModelMessage[];
 }): CoreLineageManifestV1 {
-  const transcript = input.store.getRequestTranscript({ requestId: input.completedRequestId });
-  const metadata = input.store.getCoreRequestAtomMetadata({ requestId: input.completedRequestId });
+  const transcript = getRequestTranscript(input.store, { requestId: input.completedRequestId });
+  const metadata = getCoreRequestAtomMetadata(input.store, { requestId: input.completedRequestId });
   if (!transcript || !metadata) throw new Error("completed primary request metadata is missing");
   input.store.admitCoreSurfaceProjection({
     requestClient: "discord",
@@ -2659,21 +3228,24 @@ describe("startBusAgentRunner Core-primary Claude production path", () => {
       readonly headers?: Readonly<Record<string, string>>;
       readonly data: CmdRequestMessageData;
     }> = [];
-    const routedSub = await bus.subscribeTopic(
+    const routedSubResult = await bus.subscribeTopic(
       "cmd.request",
       { mode: "tail", offset: { type: "now" } },
-      async (message, context) => {
+      async (message) => {
         if (message.type === lilacEventTypes.CmdRequestMessage) {
           routedRequests.push(message);
         }
-        await context.commit();
+        return Result.ok(undefined);
       },
+      () => "dead-letter",
     );
+    if (routedSubResult.status === "error") throw routedSubResult.error;
+    const routedSub = routedSubResult.value;
     const outputCreated = deferred<MsgRef>();
-    const outputCreatedSub = await bus.subscribeTopic(
+    const outputCreatedSubResult = await bus.subscribeTopic(
       "evt.surface",
       { mode: "tail", offset: { type: "now" } },
-      async (message, context) => {
+      async (message) => {
         if (
           message.type === lilacEventTypes.EvtSurfaceOutputMessageCreated &&
           message.headers?.request_id === `discord:${sessionId}:input-1`
@@ -2687,23 +3259,29 @@ describe("startBusAgentRunner Core-primary Claude production path", () => {
             });
           }
         }
-        await context.commit();
+        return Result.ok(undefined);
       },
+      () => "dead-letter",
     );
+    if (outputCreatedSubResult.status === "error") throw outputCreatedSubResult.error;
+    const outputCreatedSub = outputCreatedSubResult.value;
     const routedOutputUpdates: string[] = [];
-    const outputUpdatedSub = await bus.subscribeTopic(
+    const outputUpdatedSubResult = await bus.subscribeTopic(
       "evt.adapter",
       { mode: "tail", offset: { type: "now" } },
-      async (message, context) => {
+      async (message) => {
         if (
           message.type === lilacEventTypes.EvtAdapterMessageUpdated &&
           message.data.platform === "discord"
         ) {
           routedOutputUpdates.push(message.data.messageId);
         }
-        await context.commit();
+        return Result.ok(undefined);
       },
+      () => "dead-letter",
     );
+    if (outputUpdatedSubResult.status === "error") throw outputUpdatedSubResult.error;
+    const outputUpdatedSub = outputUpdatedSubResult.value;
     const adapterIngress = await bridgeAdapterToBus({
       adapter,
       bus,
@@ -2728,6 +3306,7 @@ describe("startBusAgentRunner Core-primary Claude production path", () => {
     const runner = await startBusAgentRunner({
       bus,
       subscriptionId: "production-primary-auto-inject",
+      reportFatalPanic: () => undefined,
       config,
       pluginManager: corePrimaryTestPluginManager(),
       cwd: dataDir,
@@ -2797,8 +3376,20 @@ describe("startBusAgentRunner Core-primary Claude production path", () => {
         return {
           agentModel: model,
           continuationModel: model,
+          createUtilityModelResult: () => Result.ok(model),
           createUtilityModel: () => model,
-          control: { inject: () => false, interrupt: async () => false, clear: () => {} },
+          control: {
+            inject: () => false,
+            interrupt: async () => false,
+            async interruptResult() {
+              return Result.ok(await this.interrupt());
+            },
+            clear: () => {},
+            clearResult() {
+              this.clear();
+              return Result.ok();
+            },
+          },
           nativeSession: {
             getObservation: observation,
             waitForObservation: async () => observation(),
@@ -2829,8 +3420,12 @@ describe("startBusAgentRunner Core-primary Claude production path", () => {
                     }
                   : null,
             }),
+            async finalizeResult() {
+              return Result.ok(await this.finalize());
+            },
           },
           dispose: async () => {},
+          disposeResult: async () => Result.ok(),
         };
       },
     });
@@ -2872,7 +3467,7 @@ describe("startBusAgentRunner Core-primary Claude production path", () => {
       throw new Error("first request did not route with complete Stage 6 lineage");
     }
     const firstInputManifest = firstRouted.data.corePrimaryLineage;
-    const persistedFirstManifest = store.getCorePrimaryLineageManifest({
+    const persistedFirstManifest = getCorePrimaryLineageManifest(store, {
       requestId: firstRequestId,
     });
     if (!persistedFirstManifest) throw new Error("auto-injected manifest was not persisted");
@@ -2905,18 +3500,18 @@ describe("startBusAgentRunner Core-primary Claude production path", () => {
     );
     expect(adapter.messages.get(firstOutput.messageId)?.text).toBe("auto-inject response 1");
     expect(
-      store.getTranscriptBySurfaceMessage({
+      getTranscriptBySurfaceMessage(store, {
         platform: "discord",
         channelId: sessionId,
         messageId: firstOutput.messageId,
       })?.requestId,
     ).toBe(firstRequestId);
-    const firstBinding = store.getCorePrimaryClaudeSessionBinding({
+    const firstBinding = getPrimaryBinding(store, {
       providerId: "claude-code",
       requestClient: "discord",
       lilacSessionId: sessionId,
     });
-    const firstTranscript = store.getRequestTranscript({ requestId: firstRequestId });
+    const firstTranscript = getRequestTranscript(store, { requestId: firstRequestId });
     if (!firstBinding || !firstTranscript?.transcriptDigest || !firstTranscript.providerState) {
       throw new Error("auto-injected first turn did not promote");
     }
@@ -2994,7 +3589,7 @@ describe("startBusAgentRunner Core-primary Claude production path", () => {
     expect(JSON.stringify(modelPrompts[1])).not.toContain("detail-0");
     expect(JSON.stringify(modelPrompts[1])).not.toContain("related-thread");
     expect(
-      store.getCorePrimaryClaudeSessionBinding({
+      getPrimaryBinding(store, {
         providerId: "claude-code",
         requestClient: "discord",
         lilacSessionId: sessionId,
@@ -3011,9 +3606,12 @@ describe("startBusAgentRunner Core-primary Claude production path", () => {
     await outputRelay.stop();
     await router.stop();
     await adapterIngress.stop();
-    await routedSub.stop();
-    await outputCreatedSub.stop();
-    await outputUpdatedSub.stop();
+    const routedStopped = await routedSub.stop();
+    if (routedStopped.status === "error") throw routedStopped.error;
+    const outputCreatedStopped = await outputCreatedSub.stop();
+    if (outputCreatedStopped.status === "error") throw outputCreatedStopped.error;
+    const outputUpdatedStopped = await outputUpdatedSub.stop();
+    if (outputUpdatedStopped.status === "error") throw outputUpdatedStopped.error;
     store.close();
     await bus.close();
     await rm(dataDir, { recursive: true, force: true });
@@ -3074,8 +3672,20 @@ describe("startBusAgentRunner Core-primary Claude production path", () => {
       return {
         agentModel: model,
         continuationModel: model,
+        createUtilityModelResult: () => Result.ok(model),
         createUtilityModel: () => model,
-        control: { inject: () => false, interrupt: async () => false, clear: () => {} },
+        control: {
+          inject: () => false,
+          interrupt: async () => false,
+          async interruptResult() {
+            return Result.ok(await this.interrupt());
+          },
+          clear: () => {},
+          clearResult() {
+            this.clear();
+            return Result.ok();
+          },
+        },
         nativeSession: {
           getObservation: observation,
           waitForObservation: async () => {
@@ -3116,13 +3726,18 @@ describe("startBusAgentRunner Core-primary Claude production path", () => {
                   : null,
             };
           },
+          async finalizeResult() {
+            return Result.ok(await this.finalize());
+          },
         },
         dispose: async () => {},
+        disposeResult: async () => Result.ok(),
       };
     };
     const runner = await startBusAgentRunner({
       bus,
       subscriptionId: "production-primary-claude",
+      reportFatalPanic: () => undefined,
       config,
       pluginManager: corePrimaryTestPluginManager(),
       cwd: dataDir,
@@ -3155,13 +3770,13 @@ describe("startBusAgentRunner Core-primary Claude production path", () => {
       corePrimaryLineage: firstManifest,
     });
     await expect(firstLifecycle.terminal).resolves.toBe("resolved");
-    const firstBinding = store.getCorePrimaryClaudeSessionBinding({
+    const firstBinding = getPrimaryBinding(store, {
       providerId: "claude-code",
       requestClient: "discord",
       lilacSessionId: sessionId,
     });
     if (!firstBinding) throw new Error("first binding was not promoted");
-    const firstTranscript = store.getRequestTranscript({ requestId: firstRequestId });
+    const firstTranscript = getRequestTranscript(store, { requestId: firstRequestId });
     if (!firstTranscript?.transcriptDigest) throw new Error("first transcript digest is missing");
     const firstHead = computeCorePrimaryClaudeTerminalHead({
       manifest: firstManifest,
@@ -3198,13 +3813,13 @@ describe("startBusAgentRunner Core-primary Claude production path", () => {
       terminal: "resolved",
       details: [undefined, undefined],
     });
-    const secondBinding = store.getCorePrimaryClaudeSessionBinding({
+    const secondBinding = getPrimaryBinding(store, {
       providerId: "claude-code",
       requestClient: "discord",
       lilacSessionId: sessionId,
     });
     if (!secondBinding) throw new Error("second binding was not promoted");
-    const secondTranscript = store.getRequestTranscript({ requestId: secondRequestId });
+    const secondTranscript = getRequestTranscript(store, { requestId: secondRequestId });
     if (!secondTranscript?.transcriptDigest) throw new Error("second transcript digest is missing");
     const secondHead = computeCorePrimaryClaudeTerminalHead({
       manifest: secondManifest,
@@ -3225,11 +3840,11 @@ describe("startBusAgentRunner Core-primary Claude production path", () => {
       "Continue after the completed tool call.",
     );
     expect(
-      JSON.stringify(store.getRequestTranscript({ requestId: secondRequestId })?.messages),
+      JSON.stringify(getRequestTranscript(store, { requestId: secondRequestId })?.messages),
     ).toContain("native-tool");
     expect(secondBinding.canonicalMessageCount).toBe(
       secondManifest.segments.at(-1)!.canonicalEnd +
-        store.getRequestTranscript({ requestId: secondRequestId })!.messages.length,
+        getRequestTranscript(store, { requestId: secondRequestId })!.messages.length,
     );
     expect(secondBinding).toMatchObject(secondHead);
     expect(secondBinding.nativeContextTokens).toBeGreaterThan(firstBinding.nativeContextTokens);
@@ -3288,7 +3903,7 @@ describe("startBusAgentRunner Core-primary Claude production path", () => {
       state: "cancelled",
     });
     expect(
-      store.getCorePrimaryClaudeSessionBinding({
+      getPrimaryBinding(store, {
         providerId: "claude-code",
         requestClient: "discord",
         lilacSessionId: sessionId,
@@ -3324,18 +3939,20 @@ describe("startBusAgentRunner Core-primary Claude production path", () => {
 
     const competitorRequestId = "primary-competitor";
     const competitorSessionId = crypto.randomUUID();
-    store.reserveCorePrimaryClaudeSessionAttempt({
-      providerId: "claude-code",
-      requestClient: "discord",
-      lilacSessionId: sessionId,
-      executionScopeHashVersion: 1,
-      executionScopeHash: secondBinding.executionScopeHash,
-      requestId: competitorRequestId,
-      attemptIndex: 0,
-      candidateSessionId: competitorSessionId,
-      sourceSessionId: secondBinding.claudeSessionId,
-      expectedBindingRevision: secondBinding.revision,
-    });
+    attemptMutationValue(
+      store.reserveCorePrimaryClaudeSessionAttempt({
+        providerId: "claude-code",
+        requestClient: "discord",
+        lilacSessionId: sessionId,
+        executionScopeHashVersion: 1,
+        executionScopeHash: secondBinding.executionScopeHash,
+        requestId: competitorRequestId,
+        attemptIndex: 0,
+        candidateSessionId: competitorSessionId,
+        sourceSessionId: secondBinding.claudeSessionId,
+        expectedBindingRevision: secondBinding.revision,
+      }),
+    );
     store.saveRequestTranscript({
       requestId: competitorRequestId,
       sessionId,
@@ -3343,7 +3960,7 @@ describe("startBusAgentRunner Core-primary Claude production path", () => {
       messages: [{ role: "assistant", content: "competitor response" }],
       corePrimaryLineage: raceManifest,
     });
-    const competitorTranscript = store.getRequestTranscript({ requestId: competitorRequestId });
+    const competitorTranscript = getRequestTranscript(store, { requestId: competitorRequestId });
     if (!competitorTranscript?.transcriptDigest)
       throw new Error("competitor transcript is missing");
     const competitorHead = computeCorePrimaryClaudeTerminalHead({
@@ -3373,7 +3990,7 @@ describe("startBusAgentRunner Core-primary Claude production path", () => {
       lastReasoning: "provider-default",
     });
     expect(
-      store.promoteCorePrimaryClaudeSessionBinding({
+      promotePrimaryBinding(store, {
         providerId: "claude-code",
         requestClient: "discord",
         lilacSessionId: sessionId,
@@ -3384,7 +4001,7 @@ describe("startBusAgentRunner Core-primary Claude production path", () => {
     releaseFinalization[1]!.resolve(undefined);
     await expect(raceLifecycle.terminal).resolves.toBe("resolved");
     expect(
-      store.getCorePrimaryClaudeSessionBinding({
+      getPrimaryBinding(store, {
         providerId: "claude-code",
         requestClient: "discord",
         lilacSessionId: sessionId,
@@ -3447,6 +4064,7 @@ describe("startBusAgentRunner Core-primary Claude production path", () => {
     const runner = await startBusAgentRunner({
       bus,
       subscriptionId: "production-primary-no-fallback",
+      reportFatalPanic: () => undefined,
       config,
       pluginManager: corePrimaryTestPluginManager(),
       cwd: dataDir,
@@ -3481,8 +4099,20 @@ describe("startBusAgentRunner Core-primary Claude production path", () => {
         return {
           agentModel: failingModel,
           continuationModel: failingModel,
+          createUtilityModelResult: () => Result.ok(failingModel),
           createUtilityModel: () => failingModel,
-          control: { inject: () => false, interrupt: async () => false, clear: () => {} },
+          control: {
+            inject: () => false,
+            interrupt: async () => false,
+            async interruptResult() {
+              return Result.ok(await this.interrupt());
+            },
+            clear: () => {},
+            clearResult() {
+              this.clear();
+              return Result.ok();
+            },
+          },
           nativeSession: {
             getObservation: () => observation,
             waitForObservation: async () => observation,
@@ -3495,8 +4125,12 @@ describe("startBusAgentRunner Core-primary Claude production path", () => {
               sourcePreflight: null,
               sourceFinal: null,
             }),
+            async finalizeResult() {
+              return Result.ok(await this.finalize());
+            },
           },
           dispose: async () => {},
+          disposeResult: async () => Result.ok(),
         };
       },
       createAgent: (options) => {
@@ -3529,7 +4163,7 @@ describe("startBusAgentRunner Core-primary Claude production path", () => {
     expect(materializations).toBe(1);
     expect(switchedModels).toEqual([]);
     expect(
-      store.getCorePrimaryClaudeSessionBinding({
+      getPrimaryBinding(store, {
         providerId: "claude-code",
         requestClient: "discord",
         lilacSessionId: sessionId,
@@ -3545,6 +4179,34 @@ describe("startBusAgentRunner Core-primary Claude production path", () => {
 });
 
 describe("Core-primary local compaction replacement", () => {
+  it("falls back from an owned utility-model failure without calling the throwing adapter", () => {
+    const fallbackModel = new MockLanguageModelV4({ modelId: "fallback" });
+    let compatibilityCalls = 0;
+    const reported: ClaudeCodeRunExternalFailure[] = [];
+    const failure = new ClaudeCodeRunExternalFailure({
+      operation: "Claude utility model construction",
+      cause: new Error("construction failed"),
+      message: "Claude utility model construction failed",
+    });
+    const run = {
+      createUtilityModelResult: () => Result.err(failure),
+      createUtilityModel: () => {
+        compatibilityCalls += 1;
+        throw failure;
+      },
+    };
+
+    const model = resolveCoreClaudeCompactionSummaryModel({
+      run,
+      fallback: () => fallbackModel,
+      onFailure: (error) => reported.push(error),
+    });
+
+    expect(model).toBe(fallbackModel);
+    expect(reported).toEqual([failure]);
+    expect(compatibilityCalls).toBe(0);
+  });
+
   it("maps the current boundary and text-lowers retained mixed history in the fresh payload", async () => {
     const dataDir = await mkdtemp(path.join(tmpdir(), "lilac-primary-compaction-"));
     const store = new SqliteTranscriptStore(path.join(dataDir, "transcripts.db"));
@@ -3660,8 +4322,20 @@ describe("Core-primary local compaction replacement", () => {
         return {
           agentModel: mainModel,
           continuationModel: mainModel,
+          createUtilityModelResult: () => Result.ok(summaryModel),
           createUtilityModel: () => summaryModel,
-          control: { inject: () => false, interrupt: async () => false, clear: () => {} },
+          control: {
+            inject: () => false,
+            interrupt: async () => false,
+            async interruptResult() {
+              return Result.ok(await this.interrupt());
+            },
+            clear: () => {},
+            clearResult() {
+              this.clear();
+              return Result.ok();
+            },
+          },
           nativeSession: {
             getObservation: () => ({
               ...observation,
@@ -3682,9 +4356,16 @@ describe("Core-primary local compaction replacement", () => {
               sourcePreflight: null,
               sourceFinal: null,
             }),
+            async finalizeResult() {
+              return Result.ok(await this.finalize());
+            },
           },
           dispose: async () => {
             if (start.mode !== "ephemeral") disposedSessionIds.push(start.sessionId);
+          },
+          async disposeResult() {
+            if (start.mode !== "ephemeral") disposedSessionIds.push(start.sessionId);
+            return Result.ok();
           },
         };
       },
@@ -3951,7 +4632,7 @@ describe("buildAutoInjectedThreadSearchMessages", () => {
     expect(synthetic.canonicalMessages).toHaveLength(2);
     expect(synthetic.atoms).toHaveLength(1);
     expect(synthetic.atoms[0]?.kind).toBe("synthetic");
-    expect(() => parseCorePrimaryLineageV1(first, [...sourceMessages, ...injected])).not.toThrow();
+    expect(decodeCorePrimaryLineageV1(first, [...sourceMessages, ...injected]).status).toBe("ok");
   });
 
   it("fails closed for missing, fresh-only, malformed, or unaligned source lineage", () => {
@@ -6782,6 +7463,42 @@ describe("mergeToSingleUserMessage", () => {
 });
 
 describe("custom command failures", () => {
+  it.each([
+    new CustomCommandImportError({
+      commandName: "fixture",
+      entrypointPath: "/fixture/index.ts",
+      cause: new Error("import cause"),
+      message: "safe import failure",
+    }),
+    new CustomCommandExecuteMissingError({
+      commandName: "fixture",
+      entrypointPath: "/fixture/index.ts",
+      message: "safe missing execute failure",
+    }),
+    new CustomCommandExecuteThrownError({
+      commandName: "fixture",
+      entrypointPath: "/fixture/index.ts",
+      cause: new Error("throw cause"),
+      message: "safe synchronous failure",
+    }),
+    new CustomCommandExecuteRejectedError({
+      commandName: "fixture",
+      entrypointPath: "/fixture/index.ts",
+      cause: new Error("rejection cause"),
+      message: "safe rejection failure",
+    }),
+    new CustomCommandResultInvalidError({
+      commandName: "fixture",
+      entrypointPath: "/fixture/index.ts",
+      message: "safe malformed result failure",
+    }),
+  ] satisfies readonly CustomCommandExecutionError[])(
+    "maps $._tag to its compatibility error text",
+    (error) => {
+      expect(customCommandExecutionErrorText(error)).toBe(error.message);
+    },
+  );
+
   it("builds persisted finalText from the bounded normalized error", () => {
     const finalText = buildCustomCommandFailureFinalText({
       commandText: "/fixture",

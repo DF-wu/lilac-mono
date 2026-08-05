@@ -8,6 +8,7 @@ import { Readable } from "node:stream";
 import { analyzeBashCommand } from "@stanley2058/lilac-bash-safety";
 import { expandTilde } from "@stanley2058/lilac-fs";
 import { tool, type ToolSet } from "ai";
+import { Panic, Result } from "better-result";
 
 import {
   DEFAULT_ARTIFACT_MAX_BYTES_PER_SCOPE,
@@ -17,11 +18,8 @@ import {
 } from "./artifact-integration";
 import { createBashOutputSanitizer, sanitizeBashOutputText } from "./bash-output-sanitizer";
 import { BufferedFileSink } from "./buffered-file-sink";
-import {
-  assertCanonicalPathAllowed,
-  assertGuardrailBypassAllowed,
-  assertLocalCwd,
-} from "./guardrails";
+import { canonicalPathAllowed, assertGuardrailBypassAllowed, assertLocalCwd } from "./guardrails";
+import { adaptCodingToolResultToHost } from "./host-compatibility";
 import { bashInputSchema, type BashInput } from "./schemas";
 
 export const BASH_NO_OUTPUT_TIMEOUT_MS = 3 * 60 * 1000;
@@ -77,6 +75,11 @@ const STREAM_FLUSH_BYTES = 4 * 1024;
 
 type BoundedStreamCapture = { head: Buffer; tail: Buffer; totalBytes: number };
 
+type CapturedBashPromise<T> =
+  | { readonly kind: "ok"; readonly value: T }
+  | { readonly kind: "error"; readonly error: Error }
+  | { readonly kind: "panic"; readonly panic: Panic };
+
 type BashSpool = {
   stdoutPath?: string;
   stderrPath?: string;
@@ -91,6 +94,70 @@ const BASH_SPOOL_DIRECTORY_PREFIX = "lilac-coding-bash-";
 const MIDDLE_OMISSION_MARKER = "\n...[middle output omitted]...\n";
 const SENSITIVE_ENV_NAME_PATTERN = /(?:TOKEN|SECRET|PASSWORD|PASS|KEY|CREDENTIALS)/iu;
 
+async function ignoreBashFailure(effect: () => Promise<unknown>): Promise<void> {
+  try {
+    await effect();
+  } catch (cause) {
+    if (Panic.is(cause)) throw cause;
+  }
+}
+
+function captureBashPromise<T>(promise: Promise<T>): Promise<CapturedBashPromise<T>> {
+  return promise.then(
+    (value) => ({ kind: "ok", value }),
+    (cause) => {
+      try {
+        if (Panic.is(cause)) return { kind: "panic", panic: cause };
+      } catch {
+        return {
+          kind: "error",
+          error: new Error("Opaque Bash operation failure"),
+        };
+      }
+      return {
+        kind: "error",
+        error: new Error(bashFailureMessage(cause)),
+      };
+    },
+  );
+}
+
+function bashExceptionOutput(error: Error): BashOutput {
+  return {
+    stdout: "",
+    stderr: "",
+    exitCode: -1,
+    stdoutTruncated: false,
+    stderrTruncated: false,
+    executionError: { type: "exception", message: error.message },
+  };
+}
+
+function bashFailureMessage(cause: unknown): string {
+  switch (typeof cause) {
+    case "string":
+      return cause;
+    case "bigint":
+    case "boolean":
+    case "number":
+    case "symbol":
+    case "undefined":
+      return String(cause);
+    case "function":
+    case "object":
+      try {
+        if (cause instanceof Error && typeof cause.message === "string") return cause.message;
+      } catch {
+        return "Opaque Bash operation failure";
+      }
+      return "Opaque Bash operation failure";
+  }
+}
+
+function signalCodingToolHost(error: Error): never {
+  return adaptCodingToolResultToHost(Result.err<never, Error>(error));
+}
+
 function normalizedNonnegativeInteger(
   value: number | undefined,
   fallback: number,
@@ -98,7 +165,7 @@ function normalizedNonnegativeInteger(
 ): number {
   const resolved = value ?? fallback;
   if (!Number.isFinite(resolved) || resolved < 0) {
-    throw new RangeError(`${name} must be a non-negative finite number`);
+    return signalCodingToolHost(new RangeError(`${name} must be a non-negative finite number`));
   }
   return Math.floor(resolved);
 }
@@ -115,10 +182,13 @@ function createBashSpool(maxBytes: number, outputCapBytes: number): BashSpool {
   const removeStorage = async () => {
     const currentSinks = sinks;
     sinks = undefined;
-    await Promise.all([currentSinks?.stdout.abort(), currentSinks?.stderr.abort()]).catch(
-      () => undefined,
+    await ignoreBashFailure(() =>
+      Promise.all([currentSinks?.stdout.abort(), currentSinks?.stderr.abort()]),
     );
-    if (directory) await fs.rm(directory, { recursive: true, force: true }).catch(() => undefined);
+    const directoryToRemove = directory;
+    if (directoryToRemove) {
+      await ignoreBashFailure(() => fs.rm(directoryToRemove, { recursive: true, force: true }));
+    }
     directory = undefined;
     spool.stdoutPath = undefined;
     spool.stderrPath = undefined;
@@ -142,8 +212,9 @@ function createBashSpool(maxBytes: number, outputCapBytes: number): BashSpool {
         for (const chunk of buffered[kind]) await sinks[kind].write(chunk);
         buffered[kind].length = 0;
       }
-    } catch {
-      await Promise.all([stdoutSink?.abort(), stderrSink?.abort()]).catch(() => undefined);
+    } catch (cause) {
+      if (Panic.is(cause)) throw cause;
+      await ignoreBashFailure(() => Promise.all([stdoutSink?.abort(), stderrSink?.abort()]));
       spool.complete = false;
       await removeStorage();
     }
@@ -174,7 +245,8 @@ function createBashSpool(maxBytes: number, outputCapBytes: number): BashSpool {
           if (sinks) await sinks[kind].write(retained);
           else buffered[kind].push(retained);
           if (totalBytes > outputCapBytes) await activate();
-        } catch {
+        } catch (cause) {
+          if (Panic.is(cause)) throw cause;
           spool.complete = false;
           await removeStorage();
         }
@@ -187,6 +259,9 @@ function createBashSpool(maxBytes: number, outputCapBytes: number): BashSpool {
       closed = true;
       if (!sinks || !spool.complete) return;
       const results = await Promise.allSettled([sinks.stdout.close(), sinks.stderr.close()]);
+      for (const result of results) {
+        if (result.status === "rejected" && Panic.is(result.reason)) throw result.reason;
+      }
       if (results.some((result) => result.status === "rejected")) {
         spool.complete = false;
         await removeStorage();
@@ -316,9 +391,12 @@ function sensitiveEnvironmentValues(
     .filter((value): value is string => value !== undefined);
 }
 
-function createBashArtifactSource(spool: BashSpool, literalSecrets: readonly string[]): Readable {
+function createBashArtifactSource(
+  spool: BashSpool,
+  literalSecrets: readonly string[],
+): Readable | undefined {
   if (!spool.stdoutPath || !spool.stderrPath) {
-    throw new Error("Bash spool was not activated");
+    return undefined;
   }
   const stdoutPath = spool.stdoutPath;
   const stderrPath = spool.stderrPath;
@@ -344,10 +422,12 @@ function createBashArtifactSource(spool: BashSpool, literalSecrets: readonly str
 function killProcessGroup(pid: number, signal: "SIGTERM" | "SIGKILL"): void {
   try {
     process.kill(-pid, signal);
-  } catch {
+  } catch (cause) {
+    if (Panic.is(cause)) throw cause;
     try {
       process.kill(pid, signal);
-    } catch {
+    } catch (fallbackCause) {
+      if (Panic.is(fallbackCause)) throw fallbackCause;
       // The process may already have exited.
     }
   }
@@ -376,34 +456,51 @@ async function persistBashArtifact(params: {
   toolCallId: string;
   spool: BashSpool;
   literalSecrets: readonly string[];
-}): Promise<{ uri: string; bytes: number }> {
-  const artifact = await params.integration.artifacts.createFromStream({
-    scopeId: params.integration.scopeId,
-    requestId: params.integration.requestId,
-    toolCallId: params.toolCallId,
-    toolName: "bash",
-    source: createBashArtifactSource(params.spool, params.literalSecrets),
-    ttlMs: normalizedNonnegativeInteger(
-      params.integration.ttlMs,
-      DEFAULT_ARTIFACT_TTL_MS,
-      "artifactIntegration.ttlMs",
-    ),
-    maxBytesPerScope: normalizedNonnegativeInteger(
-      params.integration.maxBytesPerScope,
-      DEFAULT_ARTIFACT_MAX_BYTES_PER_SCOPE,
-      "artifactIntegration.maxBytesPerScope",
-    ),
-    ...(params.integration.maxArtifactBytes === undefined
-      ? {}
-      : {
-          maxArtifactBytes: normalizedNonnegativeInteger(
-            params.integration.maxArtifactBytes,
-            0,
-            "artifactIntegration.maxArtifactBytes",
-          ),
-        }),
-  });
-  return { uri: artifact.uri, bytes: artifact.bytes };
+}): Promise<{ uri: string; bytes: number } | undefined> {
+  const source = createBashArtifactSource(params.spool, params.literalSecrets);
+  if (!source) return undefined;
+  const captured = await captureBashPromise(
+    params.integration.artifacts.createFromStream({
+      scopeId: params.integration.scopeId,
+      requestId: params.integration.requestId,
+      toolCallId: params.toolCallId,
+      toolName: "bash",
+      source,
+      ttlMs: normalizedNonnegativeInteger(
+        params.integration.ttlMs,
+        DEFAULT_ARTIFACT_TTL_MS,
+        "artifactIntegration.ttlMs",
+      ),
+      maxBytesPerScope: normalizedNonnegativeInteger(
+        params.integration.maxBytesPerScope,
+        DEFAULT_ARTIFACT_MAX_BYTES_PER_SCOPE,
+        "artifactIntegration.maxBytesPerScope",
+      ),
+      ...(params.integration.maxArtifactBytes === undefined
+        ? {}
+        : {
+            maxArtifactBytes: normalizedNonnegativeInteger(
+              params.integration.maxArtifactBytes,
+              0,
+              "artifactIntegration.maxArtifactBytes",
+            ),
+          }),
+    }),
+  );
+  if (captured.kind === "panic") return signalCodingToolHost(captured.panic);
+  if (captured.kind === "error" || captured.value.status === "error") return undefined;
+  return { uri: captured.value.value.uri, bytes: captured.value.value.bytes };
+}
+
+async function cleanupBashSpoolAfterExecution(
+  spool: BashSpool | undefined,
+  operationPanic: Panic | undefined,
+): Promise<Error | Panic | undefined> {
+  if (!spool) return operationPanic;
+  const cleanup = await captureBashPromise(spool.cleanup());
+  if (operationPanic) return operationPanic;
+  if (cleanup.kind === "panic") return cleanup.panic;
+  return cleanup.kind === "error" ? cleanup.error : undefined;
 }
 
 export async function executeLocalBash(
@@ -436,11 +533,12 @@ export async function executeLocalBash(
     : protectedPathInCommand(input.command, options.denyPaths);
   let cwdBlockReason: string | undefined;
   if (!input.dangerouslyAllow) {
-    try {
-      await assertCanonicalPathAllowed(cwd, options.denyPaths, "bash cwd");
-    } catch (error: unknown) {
-      cwdBlockReason = error instanceof Error ? error.message : String(error);
-    }
+    const allowedCwd = await canonicalPathAllowed({
+      targetPath: cwd,
+      denyPaths: options.denyPaths,
+      operation: "bash cwd",
+    });
+    if (allowedCwd.status === "error") cwdBlockReason = allowedCwd.error.message;
   }
 
   if (analysis || blockedPath || cwdBlockReason) {
@@ -498,6 +596,7 @@ export async function executeLocalBash(
       env: { ...environment, NO_COLOR: "1", FORCE_COLOR: undefined },
     });
   } catch (error: unknown) {
+    if (Panic.is(error)) return signalCodingToolHost(error);
     await spool?.cleanup();
     return {
       stdout: "",
@@ -507,7 +606,7 @@ export async function executeLocalBash(
       stderrTruncated: false,
       executionError: {
         type: "exception",
-        message: error instanceof Error ? error.message : String(error),
+        message: bashFailureMessage(error),
       },
     };
   }
@@ -519,6 +618,7 @@ export async function executeLocalBash(
   let hardKillTimer: ReturnType<typeof setTimeout> | undefined;
   let noOutputTimer: ReturnType<typeof setTimeout> | undefined;
   let wallClockTimer: ReturnType<typeof setTimeout> | undefined;
+  let operationPanic: Panic | undefined;
   const terminate = (
     reason:
       | { type: "aborted" }
@@ -575,7 +675,17 @@ export async function executeLocalBash(
       !stderrStream ||
       typeof stderrStream === "number"
     ) {
-      throw new Error("Bun.spawn did not provide piped output streams");
+      return {
+        stdout: "",
+        stderr: "",
+        exitCode: -1,
+        stdoutTruncated: false,
+        stderrTruncated: false,
+        executionError: {
+          type: "exception",
+          message: "Bun.spawn did not provide piped output streams",
+        },
+      };
     }
     let streamedOutputBytes = 0;
     const publishOutput = (delta: string) => {
@@ -586,27 +696,34 @@ export async function executeLocalBash(
       streamedOutputBytes += Buffer.byteLength(bounded);
       options.onOutput?.({ type: "output-delta", delta: bounded });
     };
-    const [stdoutSettled, stderrSettled, exitSettled] = await Promise.allSettled([
-      readBoundedStream(
-        stdoutStream,
-        maxOutputBytes,
-        publishOutput,
-        (chunk) => spool?.write("stdout", chunk) ?? Promise.resolve(),
-        resetNoOutputTimer,
+    const [stdoutSettled, stderrSettled, exitSettled] = await Promise.all([
+      captureBashPromise(
+        readBoundedStream(
+          stdoutStream,
+          maxOutputBytes,
+          publishOutput,
+          (chunk) => spool?.write("stdout", chunk) ?? Promise.resolve(),
+          resetNoOutputTimer,
+        ),
       ),
-      readBoundedStream(
-        stderrStream,
-        maxOutputBytes,
-        publishOutput,
-        (chunk) => spool?.write("stderr", chunk) ?? Promise.resolve(),
-        resetNoOutputTimer,
+      captureBashPromise(
+        readBoundedStream(
+          stderrStream,
+          maxOutputBytes,
+          publishOutput,
+          (chunk) => spool?.write("stderr", chunk) ?? Promise.resolve(),
+          resetNoOutputTimer,
+        ),
       ),
-      child.exited,
+      captureBashPromise(child.exited),
     ]);
     stopWatchingExecution();
-    if (stdoutSettled.status === "rejected") throw stdoutSettled.reason;
-    if (stderrSettled.status === "rejected") throw stderrSettled.reason;
-    if (exitSettled.status === "rejected") throw exitSettled.reason;
+    if (stdoutSettled.kind === "panic") signalCodingToolHost(stdoutSettled.panic);
+    if (stderrSettled.kind === "panic") signalCodingToolHost(stderrSettled.panic);
+    if (exitSettled.kind === "panic") signalCodingToolHost(exitSettled.panic);
+    if (stdoutSettled.kind === "error") return bashExceptionOutput(stdoutSettled.error);
+    if (stderrSettled.kind === "error") return bashExceptionOutput(stderrSettled.error);
+    if (exitSettled.kind === "error") return bashExceptionOutput(exitSettled.error);
     const stdoutStreamResult = stdoutSettled.value;
     const stderrStreamResult = stderrSettled.value;
     const exitCode = exitSettled.value;
@@ -630,12 +747,12 @@ export async function executeLocalBash(
     const stderrTruncated = options.mergeOutput
       ? false
       : stderrStreamResult.totalBytes > budgets.stderr;
-    const executionError: BashExecutionError | undefined =
-      termination?.type === "timeout"
-        ? { ...termination, signal: "SIGTERM" }
-        : termination?.type === "aborted"
-          ? { type: "aborted", signal: "SIGTERM" }
-          : undefined;
+    let executionError: BashExecutionError | undefined;
+    if (termination?.type === "timeout") {
+      executionError = { ...termination, signal: "SIGTERM" };
+    } else if (termination?.type === "aborted") {
+      executionError = { type: "aborted", signal: "SIGTERM" };
+    }
     let truncation: BashTruncation | undefined;
     if (options.artifactIntegration && (stdoutTruncated || stderrTruncated)) {
       let retentionStatus: BashTruncationRetentionStatus;
@@ -648,17 +765,17 @@ export async function executeLocalBash(
       } else if (!options.toolCallId) {
         retentionStatus = "identity-unavailable";
       } else {
-        try {
-          const artifact = await persistBashArtifact({
-            integration: options.artifactIntegration,
-            toolCallId: options.toolCallId,
-            spool,
-            literalSecrets,
-          });
+        const artifact = await persistBashArtifact({
+          integration: options.artifactIntegration,
+          toolCallId: options.toolCallId,
+          spool,
+          literalSecrets,
+        });
+        if (artifact) {
           artifactUri = artifact.uri;
           artifactBytes = artifact.bytes;
           retentionStatus = "retained";
-        } catch {
+        } else {
           retentionStatus = "artifact-write-failed";
         }
       }
@@ -686,9 +803,13 @@ export async function executeLocalBash(
       ...(truncation ? { truncation } : {}),
     };
   } catch (error: unknown) {
+    if (Panic.is(error)) {
+      operationPanic = error;
+      signalCodingToolHost(error);
+    }
     killProcessGroup(child.pid, "SIGTERM");
     const forceKill = setTimeout(() => killProcessGroup(child.pid, "SIGKILL"), HARD_KILL_DELAY_MS);
-    await child.exited.catch(() => undefined);
+    await ignoreBashFailure(() => child.exited);
     clearTimeout(forceKill);
     return {
       stdout: "",
@@ -698,12 +819,14 @@ export async function executeLocalBash(
       stderrTruncated: false,
       executionError: {
         type: "exception",
-        message: error instanceof Error ? error.message : String(error),
+        message: bashFailureMessage(error),
       },
     };
   } finally {
     stopWatchingExecution();
-    await spool?.cleanup();
+    const cleanupFailure = await cleanupBashSpoolAfterExecution(spool, operationPanic);
+    // Cleanup failure must override successful work; an operation Panic remains primary.
+    if (cleanupFailure) signalCodingToolHost(cleanupFailure);
   }
 }
 
@@ -715,7 +838,11 @@ async function* streamLocalBash(
   let bufferedBytes = 0;
   let outputReady = false;
   let flushTimer: ReturnType<typeof setTimeout> | undefined;
-  let completed: { ok: true; output: BashOutput } | { ok: false; error: unknown } | undefined;
+  let completed:
+    | { readonly kind: "output"; readonly output: BashOutput }
+    | { readonly kind: "error"; readonly error: Error }
+    | { readonly kind: "panic"; readonly panic: Panic }
+    | undefined;
   let wake: (() => void) | undefined;
   const notify = () => {
     wake?.();
@@ -727,27 +854,24 @@ async function* streamLocalBash(
     outputReady = bufferedOutput.length > 0;
     notify();
   };
-  void executeLocalBash(input, {
-    ...options,
-    onOutput: (update) => {
-      bufferedOutput += update.delta;
-      bufferedBytes += Buffer.byteLength(update.delta);
-      if (bufferedBytes >= STREAM_FLUSH_BYTES) {
-        markOutputReady();
-      } else if (flushTimer === undefined) {
-        flushTimer = setTimeout(markOutputReady, STREAM_FLUSH_INTERVAL_MS);
-      }
-    },
-  }).then(
-    (output) => {
-      completed = { ok: true, output };
-      markOutputReady();
-    },
-    (error: unknown) => {
-      completed = { ok: false, error };
-      markOutputReady();
-    },
+  const execution = captureStreamingBash(
+    executeLocalBash(input, {
+      ...options,
+      onOutput: (update) => {
+        bufferedOutput += update.delta;
+        bufferedBytes += Buffer.byteLength(update.delta);
+        if (bufferedBytes >= STREAM_FLUSH_BYTES) {
+          markOutputReady();
+        } else if (flushTimer === undefined) {
+          flushTimer = setTimeout(markOutputReady, STREAM_FLUSH_INTERVAL_MS);
+        }
+      },
+    }),
   );
+  void execution.then((result) => {
+    completed = result;
+    markOutputReady();
+  });
 
   while (completed === undefined || outputReady || bufferedOutput.length > 0) {
     if (outputReady || (completed !== undefined && bufferedOutput.length > 0)) {
@@ -765,9 +889,40 @@ async function* streamLocalBash(
     });
   }
   if (flushTimer !== undefined) clearTimeout(flushTimer);
-  if (completed === undefined) throw new Error("Bash output stream ended without a result");
-  if (!completed.ok) throw completed.error;
+  if (completed === undefined) {
+    return signalCodingToolHost(
+      new Panic({ message: "Bash output stream ended without a result" }),
+    );
+  }
+  if (completed.kind === "panic") return signalCodingToolHost(completed.panic);
+  if (completed.kind === "error") return signalCodingToolHost(completed.error);
   return completed.output;
+}
+
+function captureStreamingBash(
+  execution: Promise<BashOutput>,
+): Promise<
+  | { readonly kind: "output"; readonly output: BashOutput }
+  | { readonly kind: "error"; readonly error: Error }
+  | { readonly kind: "panic"; readonly panic: Panic }
+> {
+  return execution.then(
+    (output) => ({ kind: "output", output }),
+    (cause) => {
+      try {
+        if (Panic.is(cause)) return { kind: "panic", panic: cause };
+      } catch {
+        return {
+          kind: "error",
+          error: new Error("Opaque Bash streaming failure"),
+        };
+      }
+      return {
+        kind: "error",
+        error: new Error(bashFailureMessage(cause)),
+      };
+    },
+  );
 }
 
 export function createBashTool(params: {

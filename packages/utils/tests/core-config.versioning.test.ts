@@ -1,10 +1,14 @@
 import { describe, expect, it } from "bun:test";
 
+import { ZodError } from "zod";
+
 import {
   parseCoreConfig,
+  parseCoreConfigResult,
   parseCoreConfigV1ToUniversal,
   parseCoreConfigV2ToUniversal,
   readCoreConfigVersion,
+  readCoreConfigVersionResult,
 } from "../core-config";
 import { deriveSubagentIdleTimeoutMs } from "../subagent-idle-timeout";
 
@@ -17,6 +21,33 @@ describe("core config versioning", () => {
     expect(parsed.models.main.model).toBe("openrouter/openai/gpt-4o");
     expect(parsed.models.main.reasoning).toBeUndefined();
     expect(parsed.agent.systemPrompt).toBe("");
+  });
+
+  it("returns typed version and schema failures", () => {
+    const unsupported = readCoreConfigVersionResult({ configVersion: 99 });
+    expect(unsupported.status).toBe("error");
+    if (unsupported.status === "error") {
+      expect(unsupported.error._tag).toBe("CoreConfigVersionInvalid");
+    }
+
+    const invalid = parseCoreConfigResult({ configVersion: 2, tools: { output: null } });
+    expect(invalid.status).toBe("error");
+    if (invalid.status === "error") expect(invalid.error._tag).toBe("CoreConfigV2Invalid");
+  });
+
+  it("keeps legacy config exceptions as Error and ZodError", async () => {
+    let versionError: unknown;
+    try {
+      readCoreConfigVersion({ configVersion: 99 });
+    } catch (cause) {
+      versionError = cause;
+    }
+    expect(versionError).toBeInstanceOf(Error);
+    if (versionError instanceof Error) expect(versionError.constructor).toBe(Error);
+
+    await expect(
+      parseCoreConfig({ configVersion: 2, tools: { output: null } }),
+    ).rejects.toBeInstanceOf(ZodError);
   });
 
   it("parses explicit v1 configs with current defaults", async () => {

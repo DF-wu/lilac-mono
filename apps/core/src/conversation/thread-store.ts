@@ -1,20 +1,38 @@
 import { Database } from "bun:sqlite";
 import { createHash } from "node:crypto";
 import * as sqliteVec from "sqlite-vec";
-import type { CoreConfig } from "@stanley2058/lilac-utils";
+import {
+  classifyBunSqliteError,
+  createLogger,
+  runBunSqliteTransaction,
+  type CoreConfig,
+  type PersistedDataError,
+  type PersistedDataIssueCode,
+} from "@stanley2058/lilac-utils";
+import { Panic, Result, TaggedError, type Result as ResultType } from "better-result";
 
 import type {
   ConversationThreadEmbeddingFacet,
   ConversationThreadFacetInput,
 } from "./thread-embedding";
+import {
+  CONVERSATION_THREAD_SUMMARY_FORMAT_VERSION,
+  decodeConversationThreadSummaryRow,
+  type ConversationThreadAboutness,
+  type ConversationThreadImportance,
+  type DecodedConversationThreadSummaryRow,
+  type PersistedConversationThreadSummaryRow,
+} from "./thread-summary-persistence-codec";
 import { isDiscordSessionDividerText } from "../surface/discord/discord-session-divider";
 import { splitByDiscordWindowOldestToNewest } from "../surface/discord/merge-window";
 import { parseLeadingContinueDirective } from "../surface/bridge/bus-request-router/common";
 import { configureSqliteConnection } from "../shared/sqlite";
 import type { DiscordSearchIndexedMessage } from "../surface/store/discord-search-store";
+import { adaptToolResultToHost } from "../tools/tool-result-adapters";
 
 const SEARCH_LIMIT_MAX = 50;
 const THREAD_DISCOVERY_GAP_MS = 60 * 60 * 1000;
+const threadStoreLogger = createLogger({ module: "conversation-thread-store" });
 
 export const CONVERSATION_THREAD_SUMMARY_VERSION = 5;
 export const CONVERSATION_THREAD_EMBEDDING_VERSION = 1;
@@ -76,18 +94,7 @@ export type ConversationThreadSummarizationEligibility = {
   embeddingIsStale: boolean;
 };
 
-export type ConversationThreadSummaryRow = {
-  thread_id: string;
-  title: string;
-  brief: string;
-  topics_json: string;
-  retrieval_hints_json: string;
-  aboutness_json: string;
-  importance: ConversationThreadImportance;
-  importance_reasons_json: string;
-  created_at: number;
-  updated_at: number;
-};
+export type ConversationThreadSummaryRow = PersistedConversationThreadSummaryRow;
 
 export type ConversationThreadMessage = {
   channelId: string;
@@ -99,7 +106,7 @@ export type ConversationThreadMessage = {
   ts: number;
 };
 
-export type ConversationThreadImportance = "low" | "medium" | "high";
+export type { ConversationThreadAboutness, ConversationThreadImportance };
 
 export type ConversationThreadAboutnessInput = {
   domains?: string[];
@@ -107,14 +114,6 @@ export type ConversationThreadAboutnessInput = {
   complaintTargets?: string[];
   entities?: string[];
   userWouldAskForThisAs?: string[];
-};
-
-export type ConversationThreadAboutness = {
-  domains: string[];
-  situations: string[];
-  complaintTargets: string[];
-  entities: string[];
-  userWouldAskForThisAs: string[];
 };
 
 export type ConversationThreadSummaryInput = {
@@ -199,27 +198,15 @@ type IndexedMessageRow = {
   reply_to_message_id: string | null;
 };
 
-type ThreadSearchRow = ConversationThreadRow & {
-  title: string;
-  brief: string;
-  topics_json: string;
-  retrieval_hints_json: string;
-  aboutness_json: string;
-  importance: ConversationThreadImportance;
-  importance_reasons_json: string;
-  lexical_score: number;
-};
+type ThreadSearchRow = ConversationThreadRow &
+  PersistedConversationThreadSummaryRow & {
+    lexical_score: number;
+  };
 
-type ThreadSemanticSearchRow = ConversationThreadRow & {
-  title: string;
-  brief: string;
-  topics_json: string;
-  retrieval_hints_json: string;
-  aboutness_json: string;
-  importance: ConversationThreadImportance;
-  importance_reasons_json: string;
-  semantic_score: number;
-};
+type ThreadSemanticSearchRow = ConversationThreadRow &
+  PersistedConversationThreadSummaryRow & {
+    semantic_score: number;
+  };
 
 type FacetRow = {
   facet: ConversationThreadEmbeddingFacet;
@@ -244,7 +231,48 @@ const SEMANTIC_SIMILARITY_FLOOR = 0.15;
 export type ConversationThreadStoreOptions = {
   surfaceDbPath?: string;
   mainAgentUserNames?: readonly string[];
+  onPersistenceDiagnostic?: (diagnostic: ConversationThreadPersistenceDiagnostic) => void;
 };
+
+export type ConversationThreadPersistenceDiagnostic = {
+  readonly table: "conversation_thread_summaries";
+  readonly field: string;
+  readonly version: number;
+  readonly issueCode: PersistedDataIssueCode;
+  readonly recordId: string;
+};
+
+export class ConversationThreadSqliteDriverFailure extends TaggedError(
+  "ConversationThreadSqliteDriverFailure",
+)<{
+  readonly operation:
+    | "attach-surface-db"
+    | "inspect-surface-db"
+    | "load-vector-extension"
+    | "upsert-summary";
+  readonly code: string;
+  readonly message: string;
+}> {}
+
+function classifyConversationThreadSqliteDriverFailure(
+  cause: Error,
+  operation: ConversationThreadSqliteDriverFailure["operation"] = "upsert-summary",
+): ConversationThreadSqliteDriverFailure | undefined {
+  const sqliteError = classifyBunSqliteError(cause);
+  if (sqliteError === undefined) return undefined;
+  return new ConversationThreadSqliteDriverFailure({
+    operation,
+    code: sqliteError.code,
+    message: "Conversation thread summary SQLite write failed",
+  });
+}
+
+function signalConversationThreadStoreDefect(cause: unknown): never {
+  if (cause instanceof Error) return adaptToolResultToHost(Result.err(cause));
+  return adaptToolResultToHost(
+    Result.err(new Panic({ message: "Conversation thread store defect", cause })),
+  );
+}
 
 function stableHash(input: string): string {
   return createHash("sha256").update(input).digest("hex");
@@ -252,67 +280,6 @@ function stableHash(input: string): string {
 
 function sqlString(input: string): string {
   return `'${input.replaceAll("'", "''")}'`;
-}
-
-function safeStringArrayFromJson(raw: string): string[] {
-  try {
-    const parsed = JSON.parse(raw) as unknown;
-    if (!Array.isArray(parsed)) return [];
-    return parsed.filter((item): item is string => typeof item === "string" && item.length > 0);
-  } catch {
-    return [];
-  }
-}
-
-function safeImportance(input: unknown): ConversationThreadImportance {
-  return input === "low" || input === "high" || input === "medium" ? input : "medium";
-}
-
-function emptyAboutness(): ConversationThreadAboutness {
-  return {
-    domains: [],
-    situations: [],
-    complaintTargets: [],
-    entities: [],
-    userWouldAskForThisAs: [],
-  };
-}
-
-function safeAboutnessFromJson(raw: string): ConversationThreadAboutness {
-  try {
-    const parsed = JSON.parse(raw) as unknown;
-    if (!parsed || typeof parsed !== "object") return emptyAboutness();
-    const record = parsed as Record<string, unknown>;
-    return {
-      domains: Array.isArray(record.domains)
-        ? record.domains.filter(
-            (item): item is string => typeof item === "string" && item.length > 0,
-          )
-        : [],
-      situations: Array.isArray(record.situations)
-        ? record.situations.filter(
-            (item): item is string => typeof item === "string" && item.length > 0,
-          )
-        : [],
-      complaintTargets: Array.isArray(record.complaintTargets)
-        ? record.complaintTargets.filter(
-            (item): item is string => typeof item === "string" && item.length > 0,
-          )
-        : [],
-      entities: Array.isArray(record.entities)
-        ? record.entities.filter(
-            (item): item is string => typeof item === "string" && item.length > 0,
-          )
-        : [],
-      userWouldAskForThisAs: Array.isArray(record.userWouldAskForThisAs)
-        ? record.userWouldAskForThisAs.filter(
-            (item): item is string => typeof item === "string" && item.length > 0,
-          )
-        : [],
-    };
-  } catch {
-    return emptyAboutness();
-  }
 }
 
 function truncate(input: string, maxLength: number): string {
@@ -350,7 +317,7 @@ function normalizeSummary(summary: ConversationThreadSummaryInput): Conversation
     topics: normalizeStringList(summary.topics, 12, 80),
     retrievalHints: normalizeStringList(summary.retrievalHints, 8, 160),
     aboutness: normalizeAboutness(summary.aboutness),
-    importance: safeImportance(summary.importance),
+    importance: summary.importance ?? "medium",
     importanceReasons: normalizeStringList(summary.importanceReasons, 5, 180),
   };
 }
@@ -639,11 +606,28 @@ export type ConversationThreadSummaryWriteResult = {
   embeddingInputHash: string;
 };
 
+function summaryFromDecodedRow(
+  row: DecodedConversationThreadSummaryRow,
+): ConversationThreadSummary {
+  return {
+    title: row.title,
+    brief: row.brief,
+    topics: row.topics,
+    retrievalHints: row.retrievalHints,
+    aboutness: row.aboutness,
+    importance: row.importance,
+    importanceReasons: row.importanceReasons,
+  };
+}
+
 export class ConversationThreadStore {
   private readonly db: Database;
   private readonly searchDbPath: string;
   private readonly surfaceDbPath?: string;
   private readonly mainAgentUserNames: ReadonlySet<string>;
+  private readonly onPersistenceDiagnostic: (
+    diagnostic: ConversationThreadPersistenceDiagnostic,
+  ) => void;
   private hasSurfaceDb: boolean;
   private vectorLoadError: string | null = null;
   private vectorLoaded = false;
@@ -653,6 +637,11 @@ export class ConversationThreadStore {
     configureSqliteConnection(this.db);
     this.searchDbPath = dbPath;
     this.surfaceDbPath = options.surfaceDbPath;
+    this.onPersistenceDiagnostic =
+      options.onPersistenceDiagnostic ??
+      ((diagnostic) => {
+        threadStoreLogger.warn("conversation thread persisted summary decode failed", diagnostic);
+      });
     this.mainAgentUserNames = new Set(
       (options.mainAgentUserNames ?? [])
         .map((name) => name.trim().toLowerCase())
@@ -676,47 +665,73 @@ export class ConversationThreadStore {
   }
 
   private loadVectorExtension(): void {
-    try {
-      sqliteVec.load(this.db);
+    const loaded = Result.try({
+      try: () => sqliteVec.load(this.db),
+      catch: (cause) => cause,
+    });
+    if (loaded.status === "ok") {
       this.vectorLoaded = true;
       this.vectorLoadError = null;
-    } catch (e) {
+    } else {
+      if (!(loaded.error instanceof Error))
+        return signalConversationThreadStoreDefect(loaded.error);
+      const sqliteFailure = classifyConversationThreadSqliteDriverFailure(
+        loaded.error,
+        "load-vector-extension",
+      );
+      if (!sqliteFailure) return signalConversationThreadStoreDefect(loaded.error);
       this.vectorLoaded = false;
-      this.vectorLoadError = e instanceof Error ? e.message : String(e);
+      this.vectorLoadError = sqliteFailure.message;
     }
   }
 
   private attachSurfaceDb(): boolean {
     const surfaceDbPath = this.surfaceDbPath;
     if (!surfaceDbPath || surfaceDbPath === this.searchDbPath) return false;
-    try {
-      this.db.run(`ATTACH DATABASE ${sqlString(surfaceDbPath)} AS surface`);
-      if (!this.hasRequiredSurfaceTables()) {
-        this.db.run("DETACH DATABASE surface");
-        return false;
-      }
-      return true;
-    } catch {
-      return false;
+    const attached = Result.try({
+      try: () => {
+        this.db.run(`ATTACH DATABASE ${sqlString(surfaceDbPath)} AS surface`);
+        if (!this.hasRequiredSurfaceTables()) {
+          this.db.run("DETACH DATABASE surface");
+          return false;
+        }
+        return true;
+      },
+      catch: (cause) => cause,
+    });
+    if (attached.status === "ok") return attached.value;
+    if (!(attached.error instanceof Error))
+      return signalConversationThreadStoreDefect(attached.error);
+    if (!classifyConversationThreadSqliteDriverFailure(attached.error, "attach-surface-db")) {
+      return signalConversationThreadStoreDefect(attached.error);
     }
+    return false;
   }
 
   private hasRequiredSurfaceTables(): boolean {
-    try {
-      const rows = this.db
-        .query(
-          `
+    const checked = Result.try({
+      try: () => {
+        const rows = this.db
+          .query(
+            `
           SELECT name
           FROM surface.sqlite_master
           WHERE type = 'table'
             AND name IN ('discord_sessions', 'discord_message_relations')
           `,
-        )
-        .all() as Array<{ name: string }>;
-      return rows.length === 2;
-    } catch {
-      return false;
+          )
+          .all() as Array<{ name: string }>;
+        return rows.length === 2;
+      },
+      catch: (cause) => cause,
+    });
+    if (checked.status === "ok") return checked.value;
+    if (!(checked.error instanceof Error))
+      return signalConversationThreadStoreDefect(checked.error);
+    if (!classifyConversationThreadSqliteDriverFailure(checked.error, "inspect-surface-db")) {
+      return signalConversationThreadStoreDefect(checked.error);
     }
+    return false;
   }
 
   private ensureSurfaceDb(): boolean {
@@ -734,6 +749,16 @@ export class ConversationThreadStore {
   ): boolean {
     const rows = this.db.query(`PRAGMA table_info(${tableName})`).all() as Array<{ name: string }>;
     return rows.some((row) => row.name === columnName);
+  }
+
+  private reportPersistenceError(error: PersistedDataError): void {
+    this.onPersistenceDiagnostic({
+      table: "conversation_thread_summaries",
+      field: error.field,
+      version: error.version,
+      issueCode: error.issueCode,
+      recordId: error.recordId,
+    });
   }
 
   private migrate(): void {
@@ -825,9 +850,17 @@ export class ConversationThreadStore {
         importance TEXT NOT NULL DEFAULT 'medium',
         importance_reasons_json TEXT NOT NULL DEFAULT '[]',
         created_at INTEGER NOT NULL,
-        updated_at INTEGER NOT NULL
+        updated_at INTEGER NOT NULL,
+        summary_format_version INTEGER
       );
     `);
+
+    if (!this.tableHasColumn("conversation_thread_summaries", "summary_format_version")) {
+      this.db.run(`
+        ALTER TABLE conversation_thread_summaries
+        ADD COLUMN summary_format_version INTEGER;
+      `);
+    }
 
     if (!this.tableHasColumn("conversation_thread_summaries", "importance")) {
       this.db.run(`
@@ -1035,6 +1068,7 @@ export class ConversationThreadStore {
         })) {
           if (!this.hasMainAgentMessage(group)) continue;
           const threadId = this.upsertInferredThread(group);
+          if (!threadId) continue;
           activeThreadIds.add(threadId);
           threadCount += 1;
         }
@@ -1107,9 +1141,9 @@ export class ConversationThreadStore {
     return messages.some((message) => isMainAgentMessageRow(message, this.mainAgentUserNames));
   }
 
-  private upsertInferredThread(messages: readonly IndexedMessageRow[]): string {
+  private upsertInferredThread(messages: readonly IndexedMessageRow[]): string | null {
     const first = messages[0];
-    if (!first) throw new Error("cannot upsert empty thread");
+    if (!first) return null;
     return this.upsertThread({
       threadId: `discord:channel:${first.channel_id}:${first.message_id}`,
       kind: "inferred_channel_thread",
@@ -1123,10 +1157,10 @@ export class ConversationThreadStore {
     kind: ConversationThreadKind;
     parentChannelId: string | null;
     messages: readonly IndexedMessageRow[];
-  }): string {
+  }): string | null {
     const first = input.messages[0];
     const last = input.messages.at(-1);
-    if (!first || !last) throw new Error("cannot upsert empty thread");
+    if (!first || !last) return null;
 
     const now = Date.now();
     const updatedAt = Math.max(...input.messages.map((message) => message.updated_ts));
@@ -1241,24 +1275,25 @@ export class ConversationThreadStore {
 
   getThread(threadId: string): ConversationThreadRow | null {
     return this.db
-      .query("SELECT * FROM conversation_threads WHERE thread_id = ?")
-      .get(threadId) as ConversationThreadRow | null;
+      .query<ConversationThreadRow, [string]>(
+        "SELECT * FROM conversation_threads WHERE thread_id = ?",
+      )
+      .get(threadId);
   }
 
-  getSummary(threadId: string): ConversationThreadSummary | null {
+  getSummary(threadId: string): ResultType<ConversationThreadSummary | null, PersistedDataError> {
     const row = this.db
-      .query("SELECT * FROM conversation_thread_summaries WHERE thread_id = ?")
-      .get(threadId) as ConversationThreadSummaryRow | null;
-    if (!row) return null;
-    return {
-      title: row.title,
-      brief: row.brief,
-      topics: safeStringArrayFromJson(row.topics_json),
-      retrievalHints: safeStringArrayFromJson(row.retrieval_hints_json),
-      aboutness: safeAboutnessFromJson(row.aboutness_json),
-      importance: safeImportance(row.importance),
-      importanceReasons: safeStringArrayFromJson(row.importance_reasons_json),
-    };
+      .query<ConversationThreadSummaryRow, [string]>(
+        "SELECT * FROM conversation_thread_summaries WHERE thread_id = ?",
+      )
+      .get(threadId);
+    if (!row) return Result.ok(null);
+    const decoded = decodeConversationThreadSummaryRow(row);
+    if (decoded.status === "error") {
+      this.reportPersistenceError(decoded.error);
+      return Result.err(decoded.error);
+    }
+    return Result.ok(summaryFromDecodedRow(decoded.value.value));
   }
 
   listMessages(threadId: string, offset = 0, limit = 50): ConversationThreadMessage[] {
@@ -1308,7 +1343,7 @@ export class ConversationThreadStore {
 
   countThreadMessages(threadId: string): number {
     const row = this.db
-      .query(
+      .query<{ c: number }, [string]>(
         `
         SELECT COUNT(1) AS c
         FROM conversation_thread_messages tm
@@ -1319,7 +1354,7 @@ export class ConversationThreadStore {
           AND m.deleted = 0
         `,
       )
-      .get(threadId) as { c: number };
+      .get(threadId);
     return typeof row?.c === "number" ? row.c : 0;
   }
 
@@ -1327,15 +1362,17 @@ export class ConversationThreadStore {
     threadId: string,
     offset?: number,
     limit?: number,
-  ): ConversationThreadReadResult | null {
+  ): ResultType<ConversationThreadReadResult | null, PersistedDataError> {
     const thread = this.getThread(threadId);
-    if (!thread) return null;
-    return {
+    if (!thread) return Result.ok(null);
+    const summary = this.getSummary(threadId);
+    if (summary.status === "error") return Result.err(summary.error);
+    return Result.ok({
       thread,
-      summary: this.getSummary(threadId),
+      summary: summary.value,
       messages: this.listMessages(threadId, offset, limit),
       totalMessages: this.countThreadMessages(threadId),
-    };
+    });
   }
 
   listThreadsForSummarizationClear(input?: {
@@ -1621,7 +1658,10 @@ export class ConversationThreadStore {
     summary: ConversationThreadSummaryInput,
     promptContextHash: string | null = null,
     options?: { ifCurrent?: boolean },
-  ): ConversationThreadSummaryWriteResult | null {
+  ): ResultType<
+    ConversationThreadSummaryWriteResult | null,
+    ConversationThreadSqliteDriverFailure
+  > {
     const normalized = normalizeSummary(summary);
     const now = Date.now();
     const topicsJson = JSON.stringify(normalized.topics);
@@ -1661,19 +1701,23 @@ export class ConversationThreadStore {
       { facet: "topics", text: normalized.topics.join("\n") },
     ];
 
-    const tx = this.db.transaction((): boolean => {
-      if (options?.ifCurrent) {
-        const current = this.db
-          .query("SELECT summary_input_hash FROM conversation_threads WHERE thread_id = ?")
-          .get(threadId) as { summary_input_hash: string | null } | null;
-        if (current?.summary_input_hash !== summaryInputHash) return false;
-      }
+    const transaction = runBunSqliteTransaction(
+      this.db,
+      () => {
+        if (options?.ifCurrent) {
+          const current = this.db
+            .query<{ summary_input_hash: string | null }, [string]>(
+              "SELECT summary_input_hash FROM conversation_threads WHERE thread_id = ?",
+            )
+            .get(threadId);
+          if (current?.summary_input_hash !== summaryInputHash) return Result.ok(false);
+        }
 
-      this.db.run(
-        `
+        this.db.run(
+          `
         INSERT INTO conversation_thread_summaries (
-          thread_id, title, brief, topics_json, retrieval_hints_json, aboutness_json, importance, importance_reasons_json, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            thread_id, title, brief, topics_json, retrieval_hints_json, aboutness_json, importance, importance_reasons_json, created_at, updated_at, summary_format_version
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(thread_id) DO UPDATE SET
           title=excluded.title,
           brief=excluded.brief,
@@ -1682,37 +1726,39 @@ export class ConversationThreadStore {
           aboutness_json=excluded.aboutness_json,
           importance=excluded.importance,
           importance_reasons_json=excluded.importance_reasons_json,
+            summary_format_version=excluded.summary_format_version,
           updated_at=excluded.updated_at
         `,
-        [
-          threadId,
-          normalized.title,
-          normalized.brief,
-          topicsJson,
-          retrievalHintsJson,
-          aboutnessJson,
-          normalized.importance,
-          importanceReasonsJson,
-          now,
-          now,
-        ],
-      );
+          [
+            threadId,
+            normalized.title,
+            normalized.brief,
+            topicsJson,
+            retrievalHintsJson,
+            aboutnessJson,
+            normalized.importance,
+            importanceReasonsJson,
+            now,
+            now,
+            CONVERSATION_THREAD_SUMMARY_FORMAT_VERSION,
+          ],
+        );
 
-      this.db.run("DELETE FROM conversation_thread_facets WHERE thread_id = ?", [threadId]);
-      this.db.run("DELETE FROM conversation_thread_embeddings WHERE thread_id = ?", [threadId]);
-      for (const facet of facets) {
-        if (facet.text.trim().length === 0) continue;
-        this.db.run(
-          `
+        this.db.run("DELETE FROM conversation_thread_facets WHERE thread_id = ?", [threadId]);
+        this.db.run("DELETE FROM conversation_thread_embeddings WHERE thread_id = ?", [threadId]);
+        for (const facet of facets) {
+          if (facet.text.trim().length === 0) continue;
+          this.db.run(
+            `
           INSERT INTO conversation_thread_facets (thread_id, facet, text, updated_at)
           VALUES (?, ?, ?, ?)
           `,
-          [threadId, facet.facet, facet.text, now],
-        );
-      }
+            [threadId, facet.facet, facet.text, now],
+          );
+        }
 
-      this.db.run(
-        `
+        this.db.run(
+          `
         UPDATE conversation_threads
         SET last_summarized_at = ?,
             last_embedded_at = NULL,
@@ -1723,24 +1769,27 @@ export class ConversationThreadStore {
             embedding_version = ?
         WHERE thread_id = ?
         `,
-        [
-          now,
-          summaryInputHash,
-          promptContextHash,
-          CONVERSATION_THREAD_SUMMARY_VERSION,
-          CONVERSATION_THREAD_EMBEDDING_VERSION,
-          threadId,
-        ],
-      );
-      return true;
-    });
+          [
+            now,
+            summaryInputHash,
+            promptContextHash,
+            CONVERSATION_THREAD_SUMMARY_VERSION,
+            CONVERSATION_THREAD_EMBEDDING_VERSION,
+            threadId,
+          ],
+        );
+        return Result.ok(true);
+      },
+      classifyConversationThreadSqliteDriverFailure,
+    );
 
-    if (!tx()) return null;
+    if (transaction.status === "error") return Result.err(transaction.error);
+    if (!transaction.value) return Result.ok(null);
     const filteredFacets = facets.filter((facet) => facet.text.trim().length > 0);
-    return {
+    return Result.ok({
       facets: filteredFacets,
       embeddingInputHash: computeFacetHash(filteredFacets) || embeddingHash,
-    };
+    });
   }
 
   listFacets(threadId: string): ConversationThreadFacetInput[] {
@@ -1811,9 +1860,9 @@ export class ConversationThreadStore {
     limit?: number;
     filters?: ConversationThreadSearchFilters;
     allowlist?: ConversationThreadSearchAllowlist;
-  }): ConversationThreadSearchHit[] {
+  }): ResultType<ConversationThreadSearchHit[], PersistedDataError> {
     const ftsQuery = normalizeFtsQuery(input.query);
-    if (!ftsQuery) return [];
+    if (!ftsQuery) return Result.ok([]);
 
     const limit = Math.min(SEARCH_LIMIT_MAX, Math.max(1, Math.floor(input.limit ?? 5)));
     const filter = buildSearchFilterClause(input.filters, input.allowlist);
@@ -1829,6 +1878,9 @@ export class ConversationThreadStore {
           s.aboutness_json,
           s.importance,
           s.importance_reasons_json,
+          s.created_at,
+          s.updated_at,
+          s.summary_format_version,
           max(fm.facet_score) AS lexical_score
         FROM (
           SELECT
@@ -1848,25 +1900,32 @@ export class ConversationThreadStore {
       )
       .all(ftsQuery, ...filter.values, limit) as ThreadSearchRow[];
 
-    return rows.map((row) => {
+    const hits: ConversationThreadSearchHit[] = [];
+    for (const row of rows) {
+      const decoded = decodeConversationThreadSummaryRow(row);
+      if (decoded.status === "error") {
+        this.reportPersistenceError(decoded.error);
+        return Result.err(decoded.error);
+      }
+      const summary = decoded.value.value;
       const summarized =
         row.last_summarized_at !== null &&
         row.last_summarized_at >= row.updated_at &&
         row.summary_version === CONVERSATION_THREAD_SUMMARY_VERSION;
       const lexicalScore = row.lexical_score ?? 0;
-      return {
+      hits.push({
         threadId: row.thread_id,
         channelId: row.channel_id,
         guildId: row.guild_id ?? undefined,
         parentChannelId: row.parent_channel_id ?? undefined,
         kind: row.kind,
-        title: row.title,
-        brief: row.brief,
-        topics: safeStringArrayFromJson(row.topics_json),
-        retrievalHints: safeStringArrayFromJson(row.retrieval_hints_json),
-        aboutness: safeAboutnessFromJson(row.aboutness_json),
-        importance: safeImportance(row.importance),
-        importanceReasons: safeStringArrayFromJson(row.importance_reasons_json),
+        title: summary.title,
+        brief: summary.brief,
+        topics: summary.topics,
+        retrievalHints: summary.retrievalHints,
+        aboutness: summary.aboutness,
+        importance: summary.importance,
+        importanceReasons: summary.importanceReasons,
         startTs: row.start_ts,
         endTs: row.end_ts,
         messageCount: row.message_count,
@@ -1877,8 +1936,9 @@ export class ConversationThreadStore {
         endMessageId: row.end_message_id,
         summarized,
         stale: !summarized,
-      };
-    });
+      });
+    }
+    return Result.ok(hits);
   }
 
   searchSemantic(input: {
@@ -1888,8 +1948,8 @@ export class ConversationThreadStore {
     limit?: number;
     filters?: ConversationThreadSearchFilters;
     allowlist?: ConversationThreadSearchAllowlist;
-  }): ConversationThreadSearchHit[] {
-    if (!this.vectorLoaded) return [];
+  }): ResultType<ConversationThreadSearchHit[], PersistedDataError> {
+    if (!this.vectorLoaded) return Result.ok([]);
 
     const limit = Math.min(SEARCH_LIMIT_MAX, Math.max(1, Math.floor(input.limit ?? 5)));
     const filter = buildSearchFilterClause(input.filters, input.allowlist);
@@ -1905,6 +1965,9 @@ export class ConversationThreadStore {
           s.aboutness_json,
           s.importance,
           s.importance_reasons_json,
+          s.created_at,
+          s.updated_at,
+          s.summary_format_version,
           sum(
             max(
               0.0,
@@ -1934,25 +1997,32 @@ export class ConversationThreadStore {
         limit,
       ) as ThreadSemanticSearchRow[];
 
-    return rows.map((row) => {
+    const hits: ConversationThreadSearchHit[] = [];
+    for (const row of rows) {
+      const decoded = decodeConversationThreadSummaryRow(row);
+      if (decoded.status === "error") {
+        this.reportPersistenceError(decoded.error);
+        return Result.err(decoded.error);
+      }
+      const summary = decoded.value.value;
       const summarized =
         row.last_summarized_at !== null &&
         row.last_summarized_at >= row.updated_at &&
         row.summary_version === CONVERSATION_THREAD_SUMMARY_VERSION;
       const semanticScore = row.semantic_score ?? 0;
-      return {
+      hits.push({
         threadId: row.thread_id,
         channelId: row.channel_id,
         guildId: row.guild_id ?? undefined,
         parentChannelId: row.parent_channel_id ?? undefined,
         kind: row.kind,
-        title: row.title,
-        brief: row.brief,
-        topics: safeStringArrayFromJson(row.topics_json),
-        retrievalHints: safeStringArrayFromJson(row.retrieval_hints_json),
-        aboutness: safeAboutnessFromJson(row.aboutness_json),
-        importance: safeImportance(row.importance),
-        importanceReasons: safeStringArrayFromJson(row.importance_reasons_json),
+        title: summary.title,
+        brief: summary.brief,
+        topics: summary.topics,
+        retrievalHints: summary.retrievalHints,
+        aboutness: summary.aboutness,
+        importance: summary.importance,
+        importanceReasons: summary.importanceReasons,
         startTs: row.start_ts,
         endTs: row.end_ts,
         messageCount: row.message_count,
@@ -1963,8 +2033,9 @@ export class ConversationThreadStore {
         endMessageId: row.end_message_id,
         summarized,
         stale: !summarized,
-      };
-    });
+      });
+    }
+    return Result.ok(hits);
   }
 }
 

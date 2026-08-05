@@ -9,10 +9,8 @@ import {
   miniLilacMessagesSchema,
   miniLilacReconnectQuerySchema,
   miniLilacRedoRequestSchema,
-  miniLilacRedoResultSchema,
   miniLilacSteerRequestSchema,
   miniLilacUndoRequestSchema,
-  miniLilacUndoResultSchema,
   miniLilacUpdateSessionBindingsRequestSchema,
   type MiniLilacModelSummary,
   type MiniLilacProfileSummary,
@@ -22,12 +20,16 @@ import {
 } from "@stanley2058/mini-lilac-client";
 import {
   HistoryRecoveryAbandonedError,
+  MiniLilacSessionExternalFailure,
+  type MiniLilacSessionServiceError,
   type ModelCatalogSnapshot,
   type RuntimeConfig,
   type SessionService,
   WorkspaceHistoryStoreError,
 } from "@stanley2058/mini-lilac-runtime";
+import { isRecord, opaqueErrorMessage } from "@stanley2058/lilac-utils";
 import { createUIMessageStreamResponse, safeValidateUIMessages } from "ai";
+import { Panic, Result, TaggedError, type Result as ResultType } from "better-result";
 import Elysia from "elysia";
 import { z } from "zod";
 
@@ -69,27 +71,326 @@ export type CreateMiniLilacServerOptions = {
   sessionService: SessionService;
   modelCatalog: MiniLilacModelCatalog;
   authToken?: string;
+  reportFatalPanic?: (panic: Panic) => void;
 };
 
-class ApiError extends Error {
-  constructor(
-    readonly status: number,
-    readonly code: string,
-    message: string,
-  ) {
-    super(message);
+export function signalMiniLilacServerPanicToProcess(panic: Panic): void {
+  queueMicrotask(() => {
+    throw panic;
+  });
+}
+
+export class MiniLilacHttpFailure extends TaggedError("MiniLilacHttpFailure")<{
+  readonly status: number;
+  readonly code: string;
+  readonly message: string;
+  readonly issues?: z.core.$ZodIssue[];
+}> {}
+
+export class MiniLilacServerConfigurationInvalid extends TaggedError(
+  "MiniLilacServerConfigurationInvalid",
+)<{
+  readonly message: string;
+}> {}
+
+type HttpResult<T> = ResultType<T, MiniLilacHttpFailure>;
+
+function httpFailure(status: number, code: string, message: string): MiniLilacHttpFailure {
+  return new MiniLilacHttpFailure({ status, code, message });
+}
+
+function workspaceHistoryHttpFailure(error: WorkspaceHistoryStoreError): MiniLilacHttpFailure {
+  switch (error.code) {
+    case "restore-conflict":
+      return httpFailure(409, "conflict", "Workspace history changed during the request");
+    case "filesystem-error":
+    case "git-unavailable":
+    case "git-command-failed":
+    case "malformed-git-output":
+    case "ownership-mismatch":
+    case "snapshot-invalid":
+    case "platform-unsupported":
+    case "workspace-invalid":
+      return httpFailure(500, "internal_error", "The request could not be completed");
   }
 }
 
-function jsonResponse(value: unknown, status = 200, headers?: HeadersInit): Response {
+export function decodeMiniLilacHttpRequest<T>(
+  schema: z.ZodType<T>,
+  input: unknown,
+  member?: "body",
+): HttpResult<T> {
+  let value = input;
+  if (member !== undefined) value = isRecord(input) ? input[member] : undefined;
+  const decoded = schema.safeParse(value);
+  if (decoded.success) return Result.ok(decoded.data);
+  return Result.err(
+    new MiniLilacHttpFailure({
+      status: 400,
+      code: "invalid_request",
+      message: "Request validation failed",
+      issues: decoded.error.issues,
+    }),
+  );
+}
+
+export function decodeMiniLilacUiMessages(input: unknown): HttpResult<MiniLilacUIMessage[]> {
+  const decoded = miniLilacMessagesSchema.safeParse(input);
+  if (decoded.success) return Result.ok(decoded.data);
+  return Result.err(
+    httpFailure(
+      400,
+      "invalid_ui_messages",
+      `UI message validation failed: ${z.prettifyError(decoded.error)}`,
+    ),
+  );
+}
+
+export function adaptMiniLilacPersistenceResult<T>(
+  result: ResultType<T, MiniLilacSessionServiceError>,
+): HttpResult<T> {
+  if (result.status === "ok") return Result.ok(result.value);
+  if (result.error instanceof HistoryRecoveryAbandonedError) {
+    return Result.err(httpFailure(409, "history-recovery-abandoned", result.error.message));
+  }
+  if (result.error instanceof WorkspaceHistoryStoreError) {
+    return Result.err(workspaceHistoryHttpFailure(result.error));
+  }
+  switch (result.error._tag) {
+    case "UnsupportedVersion":
+    case "MalformedSerialization":
+    case "CorruptPersistedFields":
+    case "MiniLilacSqliteDriverFailure":
+    case "WorkspaceHistoryPersistenceUnsupportedVersion":
+    case "WorkspaceHistoryPersistenceMalformed":
+    case "WorkspaceHistoryPersistenceCorrupt":
+      return Result.err(
+        httpFailure(
+          500,
+          "persistence_failure",
+          "The persisted Mini Lilac session could not be read",
+        ),
+      );
+    case "MiniLilacHistoryRecordMissing":
+      return result.error.recordKind === "session"
+        ? Result.err(
+            httpFailure(404, "not_found", `Session '${result.error.recordId}' was not found`),
+          )
+        : Result.err(
+            httpFailure(
+              500,
+              "persistence_failure",
+              "The persisted Mini Lilac session could not be read",
+            ),
+          );
+    case "MiniLilacStoreOperationRejected":
+    case "MiniLilacSessionOperationRejected":
+      return Result.err(
+        classifySessionOperationMessage(result.error.message) ??
+          httpFailure(500, "internal_error", "The request could not be completed"),
+      );
+    case "MiniLilacSessionOperationAndCleanupFailed":
+      return Result.err(httpFailure(500, "internal_error", "The request could not be completed"));
+    case "MiniLilacSessionExternalFailure":
+      return Result.err(classifyHttpOperationFailure(result.error));
+  }
+}
+
+export function adaptMiniLilacPersistenceResultToHost<T>(
+  result: ResultType<T, MiniLilacSessionServiceError>,
+): T {
+  const adapted = adaptMiniLilacPersistenceResult(result);
+  if (adapted.status === "ok") return adapted.value;
+  throw adapted.error;
+}
+
+function classifySessionOperationMessage(message: string): MiniLilacHttpFailure | undefined {
+  if (message.includes("was not found")) return httpFailure(404, "not_found", message);
+  if (message.includes("already has an active run")) {
+    return httpFailure(409, "session_active", message);
+  }
+  if (
+    message.startsWith("Invalid model reference") ||
+    message.startsWith("Provider '") ||
+    message.startsWith("Unknown profile '") ||
+    message.includes("is subagent-only")
+  ) {
+    return httpFailure(400, "invalid_session_bindings", message);
+  }
+  if (
+    message.includes("has no active run") ||
+    message.includes("is not active for session") ||
+    message.includes("is not accepting") ||
+    message.includes("is pending") ||
+    message.includes("was already used") ||
+    message.includes("must be quiescent to undo") ||
+    message.includes("must be quiescent to redo") ||
+    message.includes("must be quiescent for history navigation") ||
+    message.includes("must be quiescent to compact") ||
+    message.includes("cannot accept a prompt") ||
+    message.includes("must be quiescent to update bindings") ||
+    message.includes("has no durable checkpoint") ||
+    message.includes("has no exact UI prefix") ||
+    message.includes("has an invalid checkpoint") ||
+    message.includes("has a retained history operation") ||
+    message.includes("Retained history operation") ||
+    message.includes("pending run finalization") ||
+    message.includes("requires Git for recovery") ||
+    message.includes("requires Git for verification") ||
+    message.includes("UNIQUE constraint failed")
+  ) {
+    return httpFailure(409, "conflict", message);
+  }
+  return undefined;
+}
+
+function jsonResponse<T>(value: T, status = 200, headers?: HeadersInit): Response {
   return Response.json(value, { status, headers });
+}
+
+function failureResponse(error: MiniLilacHttpFailure): Response {
+  const envelope = error.issues
+    ? { error: { code: error.code, message: error.message, issues: error.issues } }
+    : { error: { code: error.code, message: error.message } };
+  return jsonResponse(envelope, error.status);
+}
+
+function classifyHttpOperationFailure(
+  cause: unknown,
+  fallbackCode?: "invalid_session_configuration",
+): MiniLilacHttpFailure {
+  const failureCause = cause instanceof MiniLilacSessionExternalFailure ? cause.cause : cause;
+  if (Panic.is(failureCause)) throw failureCause;
+  if (failureCause instanceof HistoryRecoveryAbandonedError) {
+    return httpFailure(409, "history-recovery-abandoned", failureCause.message);
+  }
+  if (failureCause instanceof WorkspaceHistoryStoreError) {
+    return workspaceHistoryHttpFailure(failureCause);
+  }
+  const message = opaqueErrorMessage(failureCause, "The request could not be completed");
+  const sessionFailure = classifySessionOperationMessage(message);
+  if (sessionFailure !== undefined) return sessionFailure;
+  if (fallbackCode !== undefined) return httpFailure(400, fallbackCode, message);
+  return httpFailure(500, "internal_error", "The request could not be completed");
+}
+
+async function captureHttpOperation(
+  operation: () => HttpResult<Response> | Promise<HttpResult<Response>>,
+): Promise<HttpResult<Response>> {
+  try {
+    return await operation();
+  } catch (cause) {
+    return Result.err(classifyHttpOperationFailure(cause));
+  }
+}
+
+async function handleHttpOperation(
+  operation: () => HttpResult<Response> | Promise<HttpResult<Response>>,
+): Promise<Response> {
+  const result = await captureHttpOperation(operation);
+  return result.status === "ok" ? result.value : failureResponse(result.error);
+}
+
+async function captureSessionCreation(
+  operation: () => Promise<ResultType<MiniLilacSessionSnapshot, MiniLilacSessionServiceError>>,
+): Promise<HttpResult<MiniLilacSessionSnapshot>> {
+  const result = await operation();
+  if (result.status === "ok") return Result.ok(result.value);
+  if (result.error instanceof HistoryRecoveryAbandonedError) {
+    return Result.err(httpFailure(409, "history-recovery-abandoned", result.error.message));
+  }
+  if (result.error instanceof WorkspaceHistoryStoreError) {
+    return Result.err(workspaceHistoryHttpFailure(result.error));
+  }
+  switch (result.error._tag) {
+    case "MiniLilacSessionOperationRejected":
+      return Result.err(httpFailure(400, "invalid_session_configuration", result.error.message));
+    case "MiniLilacSessionExternalFailure":
+      return Result.err(
+        classifyHttpOperationFailure(result.error, "invalid_session_configuration"),
+      );
+    case "MiniLilacSessionOperationAndCleanupFailed":
+    case "MiniLilacStoreOperationRejected":
+    case "UnsupportedVersion":
+    case "MalformedSerialization":
+    case "CorruptPersistedFields":
+    case "MiniLilacSqliteDriverFailure":
+    case "MiniLilacHistoryRecordMissing":
+    case "WorkspaceHistoryPersistenceUnsupportedVersion":
+    case "WorkspaceHistoryPersistenceMalformed":
+    case "WorkspaceHistoryPersistenceCorrupt":
+      return adaptMiniLilacPersistenceResult(result);
+  }
+}
+
+async function canonicalDirectory(
+  supplied: string,
+  subject: "Session" | "Skill",
+): Promise<HttpResult<string>> {
+  try {
+    return Result.ok(await realpath(supplied));
+  } catch (cause) {
+    if (Panic.is(cause)) throw cause;
+    return Result.err(
+      httpFailure(400, "invalid_cwd", `${subject} cwd '${supplied}' does not exist`),
+    );
+  }
 }
 
 function requireClientCommandId<T extends { clientCommandId?: string }>(
   request: T,
-): asserts request is T & { clientCommandId: string } {
+): HttpResult<T & { clientCommandId: string }> {
   if (request.clientCommandId === undefined) {
-    throw new ApiError(400, "client_command_id_required", "clientCommandId is required");
+    return Result.err(
+      httpFailure(400, "client_command_id_required", "clientCommandId is required"),
+    );
+  }
+  return Result.ok({ ...request, clientCommandId: request.clientCommandId });
+}
+
+function requireMatchingSessionId<T extends { sessionId: string }>(
+  request: T,
+  sessionId: string,
+): HttpResult<T> {
+  if (request.sessionId === sessionId) return Result.ok(request);
+  return Result.err(
+    httpFailure(409, "session_id_mismatch", "Body sessionId does not match the path"),
+  );
+}
+
+function pumpSseBody(
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+  controller: ReadableStreamDefaultController<Uint8Array>,
+  close: () => void,
+): void {
+  void (async () => {
+    try {
+      for (;;) {
+        const result = await reader.read();
+        if (result.done) {
+          close();
+          controller.close();
+          return;
+        }
+        controller.enqueue(result.value);
+      }
+    } catch (cause) {
+      close();
+      controller.error(cause);
+    }
+  })();
+}
+
+function enqueueSseKeepAlive(
+  controller: ReadableStreamDefaultController<Uint8Array>,
+  value: Uint8Array,
+  close: () => void,
+): void {
+  try {
+    controller.enqueue(value);
+  } catch (cause) {
+    if (Panic.is(cause)) throw cause;
+    close();
   }
 }
 
@@ -99,7 +400,7 @@ export function withSseKeepAlive(
 ): Response {
   if (response.body === null) return response;
   const reader = response.body.getReader();
-  const encoder = new TextEncoder();
+  const keepAlive = new TextEncoder().encode(": keepalive\n\n");
   let closed = false;
   let timer: ReturnType<typeof setInterval> | undefined;
   const close = () => {
@@ -110,33 +411,13 @@ export function withSseKeepAlive(
   const body = new ReadableStream<Uint8Array>({
     start(controller) {
       timer = setInterval(() => {
-        if (closed) return;
-        try {
-          controller.enqueue(encoder.encode(": keepalive\n\n"));
-        } catch {
-          close();
-        }
+        if (!closed) enqueueSseKeepAlive(controller, keepAlive, close);
       }, intervalMs);
-      void (async () => {
-        try {
-          for (;;) {
-            const result = await reader.read();
-            if (result.done) {
-              close();
-              controller.close();
-              return;
-            }
-            controller.enqueue(result.value);
-          }
-        } catch (error) {
-          close();
-          controller.error(error);
-        }
-      })();
+      pumpSseBody(reader, controller, close);
     },
     async cancel(reason) {
       close();
-      await reader.cancel(reason).catch(() => undefined);
+      await reader.cancel(reason);
     },
   });
   return new Response(body, {
@@ -150,90 +431,6 @@ function uiMessageStreamResponse(
   stream: Parameters<typeof createUIMessageStreamResponse>[0]["stream"],
 ): Response {
   return withSseKeepAlive(createUIMessageStreamResponse({ stream }));
-}
-
-function errorResponse(error: unknown): Response {
-  if (error instanceof ApiError) {
-    return jsonResponse({ error: { code: error.code, message: error.message } }, error.status);
-  }
-  if (error instanceof z.ZodError) {
-    return jsonResponse(
-      {
-        error: {
-          code: "invalid_request",
-          message: "Request validation failed",
-          issues: error.issues,
-        },
-      },
-      400,
-    );
-  }
-
-  const message = error instanceof Error ? error.message : String(error);
-  if (error instanceof HistoryRecoveryAbandonedError) {
-    return jsonResponse({ error: { code: "history-recovery-abandoned", message } }, 409);
-  }
-  if (error instanceof WorkspaceHistoryStoreError && error.code === "restore-conflict") {
-    return jsonResponse({ error: { code: "conflict", message } }, 409);
-  }
-  if (message.includes("was not found")) {
-    return jsonResponse({ error: { code: "not_found", message } }, 404);
-  }
-  if (message.includes("already has an active run")) {
-    return jsonResponse({ error: { code: "session_active", message } }, 409);
-  }
-  if (
-    message.startsWith("Invalid model reference") ||
-    message.startsWith("Provider '") ||
-    message.startsWith("Unknown profile '") ||
-    message.includes("is subagent-only")
-  ) {
-    return jsonResponse({ error: { code: "invalid_session_bindings", message } }, 400);
-  }
-  if (
-    message.includes("has no active run") ||
-    message.includes("is not active for session") ||
-    message.includes("is not accepting") ||
-    message.includes("is pending") ||
-    message.includes("was already used") ||
-    message.includes("must be quiescent to undo") ||
-    message.includes("must be quiescent to redo") ||
-    message.includes("must be quiescent for history navigation") ||
-    message.includes("must be quiescent to compact") ||
-    // A prompt refused because the session is compacting is an admission
-    // conflict, not a server fault.
-    message.includes("cannot accept a prompt") ||
-    message.includes("must be quiescent to update bindings") ||
-    message.includes("has no durable checkpoint") ||
-    message.includes("has no exact UI prefix") ||
-    message.includes("has an invalid checkpoint") ||
-    message.includes("has a retained history operation") ||
-    message.includes("Retained history operation") ||
-    message.includes("pending run finalization") ||
-    message.includes("requires Git for recovery") ||
-    message.includes("requires Git for verification") ||
-    message.includes("UNIQUE constraint failed")
-  ) {
-    return jsonResponse({ error: { code: "conflict", message } }, 409);
-  }
-  if (error instanceof WorkspaceHistoryStoreError) {
-    return jsonResponse(
-      { error: { code: "internal_error", message: "The request could not be completed" } },
-      500,
-    );
-  }
-  return jsonResponse(
-    { error: { code: "internal_error", message: "The request could not be completed" } },
-    500,
-  );
-}
-
-async function safely(operation: () => Response | Promise<Response>): Promise<Response> {
-  try {
-    return await operation();
-  } catch (error) {
-    return errorResponse(error);
-  }
 }
 
 function modelSummaries(snapshot: ModelCatalogSnapshot): MiniLilacModelSummary[] {
@@ -261,57 +458,75 @@ function profileSummaries(config: RuntimeConfig): MiniLilacProfileSummary[] {
 function existingSession(
   sessionService: SessionService,
   sessionId: string,
-): MiniLilacSessionSnapshot | undefined {
-  return sessionService.store.listSessions().find((session) => session.id === sessionId);
+): HttpResult<MiniLilacSessionSnapshot | undefined> {
+  const sessions = adaptMiniLilacPersistenceResult(sessionService.listSessionsResult());
+  if (sessions.status === "error") return Result.err(sessions.error);
+  return Result.ok(sessions.value.find((session) => session.id === sessionId));
 }
 
 async function validateSessionBinding(
   snapshot: MiniLilacSessionSnapshot,
-  supplied: {
-    cwd?: string;
-    model?: string;
-    profile?: string;
-    reasoning?: string;
-  },
-): Promise<void> {
+  supplied: { cwd?: string; model?: string; profile?: string; reasoning?: string },
+): Promise<HttpResult<void>> {
   if (supplied.cwd !== undefined) {
-    let canonicalCwd: string;
-    try {
-      canonicalCwd = await realpath(supplied.cwd);
-    } catch {
-      throw new ApiError(400, "invalid_cwd", `Session cwd '${supplied.cwd}' does not exist`);
-    }
-    if (canonicalCwd !== snapshot.cwd) {
-      throw new ApiError(409, "session_binding_mismatch", "cwd does not match the session");
+    const canonicalCwd = await canonicalDirectory(supplied.cwd, "Session");
+    if (canonicalCwd.status === "error") return Result.err(canonicalCwd.error);
+    if (canonicalCwd.value !== snapshot.cwd) {
+      return Result.err(
+        httpFailure(409, "session_binding_mismatch", "cwd does not match the session"),
+      );
     }
   }
-
   const immutable = ["model", "profile", "reasoning"] as const;
   for (const field of immutable) {
     const value = supplied[field];
     if (value !== undefined && value !== snapshot[field]) {
-      throw new ApiError(409, "session_binding_mismatch", `${field} does not match the session`);
+      return Result.err(
+        httpFailure(409, "session_binding_mismatch", `${field} does not match the session`),
+      );
     }
   }
+  return Result.ok(undefined);
+}
+
+export function validateMiniLilacServerConfiguration(
+  options: Pick<CreateMiniLilacServerOptions, "config" | "authToken">,
+): ResultType<string | undefined, MiniLilacServerConfigurationInvalid> {
+  if (options.config.server.authTokenEnv && options.authToken === undefined) {
+    return Result.err(
+      new MiniLilacServerConfigurationInvalid({
+        message: `An auth token is required by '${options.config.server.authTokenEnv}'`,
+      }),
+    );
+  }
+  if (options.authToken !== undefined && !options.authToken.trim()) {
+    return Result.err(
+      new MiniLilacServerConfigurationInvalid({ message: "The auth token cannot be blank" }),
+    );
+  }
+  return Result.ok(options.config.server.authTokenEnv ? options.authToken : undefined);
+}
+
+function signalMiniLilacServerConfigurationFailure(
+  error: MiniLilacServerConfigurationInvalid,
+): never {
+  throw error;
 }
 
 export function createMiniLilacServer(options: CreateMiniLilacServerOptions) {
   const { config, modelCatalog, sessionService } = options;
-  if (config.server.authTokenEnv && options.authToken === undefined) {
-    throw new Error(`An auth token is required by '${config.server.authTokenEnv}'`);
+  const reportFatalPanic = options.reportFatalPanic ?? signalMiniLilacServerPanicToProcess;
+  const validatedConfiguration = validateMiniLilacServerConfiguration(options);
+  if (validatedConfiguration.status === "error") {
+    signalMiniLilacServerConfigurationFailure(validatedConfiguration.error);
   }
-  if (options.authToken !== undefined && !options.authToken.trim()) {
-    throw new Error("The auth token cannot be blank");
-  }
-  const authToken = config.server.authTokenEnv ? options.authToken : undefined;
+  const authToken = validatedConfiguration.value;
 
   const sessionLocks = new Map<string, Promise<void>>();
   async function withSessionLock<T>(sessionId: string, operation: () => Promise<T>): Promise<T> {
     const previous = sessionLocks.get(sessionId) ?? Promise.resolve();
     let release = () => {};
-    const current = new Promise<void>((resolve) => {
-      release = resolve;
-    });
+    const current = new Promise<void>((resolve) => void (release = resolve));
     sessionLocks.set(sessionId, current);
     await previous;
     try {
@@ -340,7 +555,11 @@ export function createMiniLilacServer(options: CreateMiniLilacServerOptions) {
     }
   });
 
-  app.onError(({ code }) => {
+  app.onError(({ code, error }) => {
+    if (Panic.is(error)) {
+      reportFatalPanic(error);
+      return new Response(null, { status: 500 });
+    }
     if (code === "PARSE") {
       return jsonResponse(
         { error: { code: "invalid_json", message: "Request body must be valid JSON" } },
@@ -355,277 +574,390 @@ export function createMiniLilacServer(options: CreateMiniLilacServerOptions) {
 
   app.get(`${MINI_LILAC_API_PREFIX}/healthz`, () => ({ ok: true }));
 
-  app.post(`${MINI_LILAC_API_PREFIX}/chat`, ({ body }) =>
-    safely(async () => {
-      const request = chatRequestSchema.parse(body);
+  app.post(`${MINI_LILAC_API_PREFIX}/chat`, (context) =>
+    handleHttpOperation(async () => {
+      const decoded = decodeMiniLilacHttpRequest(chatRequestSchema, context, "body");
+      if (decoded.status === "error") return Result.err(decoded.error);
+      const request = decoded.value;
       if (request.trigger !== "submit-message") {
-        throw new ApiError(400, "regenerate_unsupported", "Regenerate requests are not supported");
-      }
-      const strictMessages = miniLilacMessagesSchema.safeParse(request.messages);
-      if (!strictMessages.success) {
-        throw new ApiError(
-          400,
-          "invalid_ui_messages",
-          `UI message validation failed: ${z.prettifyError(strictMessages.error)}`,
+        return Result.err(
+          httpFailure(400, "regenerate_unsupported", "Regenerate requests are not supported"),
         );
       }
+      const strictMessages = decodeMiniLilacUiMessages(request.messages);
+      if (strictMessages.status === "error") return Result.err(strictMessages.error);
       const validatedMessages = await safeValidateUIMessages<MiniLilacUIMessage>({
-        messages: strictMessages.data,
+        messages: strictMessages.value,
       });
       if (!validatedMessages.success) {
-        throw new ApiError(
-          400,
-          "invalid_ui_messages",
-          `UI message validation failed: ${validatedMessages.error.message}`,
+        return Result.err(
+          httpFailure(
+            400,
+            "invalid_ui_messages",
+            `UI message validation failed: ${validatedMessages.error.message}`,
+          ),
         );
       }
       const userMessage = validatedMessages.data.findLast((message) => message.role === "user");
       if (!userMessage) {
-        throw new ApiError(400, "user_message_required", "A user UI message is required");
+        return Result.err(
+          httpFailure(400, "user_message_required", "A user UI message is required"),
+        );
       }
 
       return withSessionLock(request.id, async () => {
-        let snapshot = existingSession(sessionService, request.id);
-        if (!snapshot) {
-          if (request.cwd === undefined || request.model === undefined) {
-            throw new ApiError(
-              400,
-              "session_configuration_required",
-              "New sessions require cwd and model",
+        const found = existingSession(sessionService, request.id);
+        if (found.status === "error") return Result.err(found.error);
+        let snapshot = found.value;
+        if (snapshot === undefined) {
+          const cwd = request.cwd;
+          const model = request.model;
+          if (cwd === undefined || model === undefined) {
+            return Result.err(
+              httpFailure(
+                400,
+                "session_configuration_required",
+                "New sessions require cwd and model",
+              ),
             );
           }
-          try {
-            snapshot = await sessionService.createSession({
+          const created = await captureSessionCreation(() =>
+            sessionService.createSessionResult({
               id: request.id,
-              cwd: request.cwd,
-              model: request.model,
+              cwd,
+              model,
               profile: request.profile,
               reasoning: request.reasoning,
-            });
-          } catch (error) {
-            const message = error instanceof Error ? error.message : String(error);
-            throw new ApiError(400, "invalid_session_configuration", message);
-          }
+            }),
+          );
+          if (created.status === "error") return Result.err(created.error);
+          snapshot = created.value;
         } else {
-          await validateSessionBinding(snapshot, request);
+          const binding = await validateSessionBinding(snapshot, request);
+          if (binding.status === "error") return Result.err(binding.error);
         }
-
-        const commandId = request.clientCommandId ?? crypto.randomUUID();
-        const started = await sessionService.startPrompt(snapshot.id, userMessage, commandId);
-        return uiMessageStreamResponse(started.stream);
+        const started = adaptMiniLilacPersistenceResult(
+          await sessionService.startPromptResult(
+            snapshot.id,
+            userMessage,
+            request.clientCommandId ?? crypto.randomUUID(),
+          ),
+        );
+        if (started.status === "error") return Result.err(started.error);
+        return Result.ok(uiMessageStreamResponse(started.value.stream));
       });
     }),
   );
 
   app.get(`${MINI_LILAC_API_PREFIX}/chat/:sessionId/stream`, ({ params, query }) =>
-    safely(() => {
-      const { sessionId } = sessionParamsSchema.parse(params);
-      const reconnect = miniLilacReconnectQuerySchema.parse(query);
-      const snapshot = existingSession(sessionService, sessionId);
-      if (!snapshot) throw new ApiError(404, "not_found", `Session '${sessionId}' was not found`);
-      const runId = "runId" in reconnect ? reconnect.runId : snapshot.activeRunId;
-      if (runId === null) return new Response(null, { status: 204 });
-      const run = sessionService.store.getRun(runId);
-      if (run.sessionId !== sessionId) {
-        throw new ApiError(
-          409,
-          "run_session_mismatch",
-          `Run '${runId}' does not belong to session '${sessionId}'`,
+    handleHttpOperation(() => {
+      const decodedParams = decodeMiniLilacHttpRequest(sessionParamsSchema, params);
+      if (decodedParams.status === "error") return Result.err(decodedParams.error);
+      const decodedQuery = decodeMiniLilacHttpRequest(miniLilacReconnectQuerySchema, query);
+      if (decodedQuery.status === "error") return Result.err(decodedQuery.error);
+      const { sessionId } = decodedParams.value;
+      const found = existingSession(sessionService, sessionId);
+      if (found.status === "error") return Result.err(found.error);
+      if (found.value === undefined) {
+        return Result.err(httpFailure(404, "not_found", `Session '${sessionId}' was not found`));
+      }
+      const runId =
+        "runId" in decodedQuery.value ? decodedQuery.value.runId : found.value.activeRunId;
+      if (runId === null) return Result.ok(new Response(null, { status: 204 }));
+      const run = adaptMiniLilacPersistenceResult(sessionService.getRunResult(runId));
+      if (run.status === "error") return Result.err(run.error);
+      if (run.value.sessionId !== sessionId) {
+        return Result.err(
+          httpFailure(
+            409,
+            "run_session_mismatch",
+            `Run '${runId}' does not belong to session '${sessionId}'`,
+          ),
         );
       }
-      if (run.status !== "active") return new Response(null, { status: 204 });
-      const afterSeq = "after" in reconnect ? reconnect.after : 0;
-      return uiMessageStreamResponse(sessionService.replayRun(run.id, { afterSeq }));
+      if (run.value.status !== "active") return Result.ok(new Response(null, { status: 204 }));
+      const afterSeq = "after" in decodedQuery.value ? decodedQuery.value.after : 0;
+      const replay = adaptMiniLilacPersistenceResult(
+        sessionService.replayRunResult(run.value.id, { afterSeq }),
+      );
+      return replay.status === "ok"
+        ? Result.ok(uiMessageStreamResponse(replay.value))
+        : Result.err(replay.error);
     }),
   );
 
   app.get(`${MINI_LILAC_API_PREFIX}/sessions/:sessionId`, ({ params }) =>
-    safely(() => {
-      const { sessionId } = sessionParamsSchema.parse(params);
-      return jsonResponse(sessionService.getSnapshot(sessionId));
+    handleHttpOperation(() => {
+      const decoded = decodeMiniLilacHttpRequest(sessionParamsSchema, params);
+      if (decoded.status === "error") return Result.err(decoded.error);
+      const snapshot = adaptMiniLilacPersistenceResult(
+        sessionService.getSnapshotResult(decoded.value.sessionId),
+      );
+      return snapshot.status === "ok"
+        ? Result.ok(jsonResponse(snapshot.value))
+        : Result.err(snapshot.error);
     }),
   );
 
   app.get(`${MINI_LILAC_API_PREFIX}/sessions/:sessionId/resume`, ({ params }) =>
-    safely(async () => {
-      const { sessionId } = sessionParamsSchema.parse(params);
-      const resume = await sessionService.getSessionResume(sessionId);
-      return jsonResponse({ ...resume, todos: sessionService.getTodos(sessionId) });
+    handleHttpOperation(async () => {
+      const decoded = decodeMiniLilacHttpRequest(sessionParamsSchema, params);
+      if (decoded.status === "error") return Result.err(decoded.error);
+      const resume = adaptMiniLilacPersistenceResult(
+        await sessionService.getSessionResumeResult(decoded.value.sessionId),
+      );
+      if (resume.status === "error") return Result.err(resume.error);
+      const todos = adaptMiniLilacPersistenceResult(
+        sessionService.getTodosResult(decoded.value.sessionId),
+      );
+      return todos.status === "ok"
+        ? Result.ok(jsonResponse({ ...resume.value, todos: todos.value }))
+        : Result.err(todos.error);
     }),
   );
 
   app.get(`${MINI_LILAC_API_PREFIX}/sessions`, ({ query }) =>
-    safely(async () => {
-      const { cwd } = sessionsQuerySchema.parse(query);
-      let canonicalCwd: string;
-      try {
-        canonicalCwd = await realpath(cwd);
-      } catch {
-        throw new ApiError(400, "invalid_cwd", `Session cwd '${cwd}' does not exist`);
-      }
-      const sessions = sessionService.store
-        .listSessions()
-        .filter((session) => session.cwd === canonicalCwd && !session.id.startsWith("sub:"))
+    handleHttpOperation(async () => {
+      const decoded = decodeMiniLilacHttpRequest(sessionsQuerySchema, query);
+      if (decoded.status === "error") return Result.err(decoded.error);
+      const canonicalCwd = await canonicalDirectory(decoded.value.cwd, "Session");
+      if (canonicalCwd.status === "error") return Result.err(canonicalCwd.error);
+      const listed = adaptMiniLilacPersistenceResult(sessionService.listSessionsResult());
+      if (listed.status === "error") return Result.err(listed.error);
+      const sessions = listed.value
+        .filter((session) => session.cwd === canonicalCwd.value && !session.id.startsWith("sub:"))
         .toSorted((left, right) => {
           const timestamp = (right.updatedAt ?? right.createdAt ?? "").localeCompare(
             left.updatedAt ?? left.createdAt ?? "",
           );
           return timestamp === 0 ? left.id.localeCompare(right.id) : timestamp;
         });
-      return jsonResponse(sessions.map((session) => sessionService.describeSession(session)));
+      return Result.ok(
+        jsonResponse(sessions.map((session) => sessionService.describeSession(session))),
+      );
     }),
   );
 
   app.get(`${MINI_LILAC_API_PREFIX}/sessions/:sessionId/messages`, ({ params }) =>
-    safely(() => {
-      const { sessionId } = sessionParamsSchema.parse(params);
-      return jsonResponse(sessionService.getMessages(sessionId));
+    handleHttpOperation(() => {
+      const decoded = decodeMiniLilacHttpRequest(sessionParamsSchema, params);
+      if (decoded.status === "error") return Result.err(decoded.error);
+      const messages = adaptMiniLilacPersistenceResult(
+        sessionService.getMessagesResult(decoded.value.sessionId),
+      );
+      return messages.status === "ok"
+        ? Result.ok(jsonResponse(messages.value))
+        : Result.err(messages.error);
     }),
   );
 
   app.get(`${MINI_LILAC_API_PREFIX}/sessions/:sessionId/todos`, ({ params }) =>
-    safely(() => {
-      const { sessionId } = sessionParamsSchema.parse(params);
-      const todos: MiniLilacTodoState = sessionService.getTodos(sessionId);
-      return jsonResponse(todos);
+    handleHttpOperation(() => {
+      const decoded = decodeMiniLilacHttpRequest(sessionParamsSchema, params);
+      if (decoded.status === "error") return Result.err(decoded.error);
+      const todos: HttpResult<MiniLilacTodoState> = adaptMiniLilacPersistenceResult(
+        sessionService.getTodosResult(decoded.value.sessionId),
+      );
+      return todos.status === "ok" ? Result.ok(jsonResponse(todos.value)) : Result.err(todos.error);
     }),
   );
 
   app.get(`${MINI_LILAC_API_PREFIX}/skills`, ({ query }) =>
-    safely(async () => {
-      const { cwd, profile } = skillsQuerySchema.parse(query);
-      let canonicalCwd: string;
-      try {
-        canonicalCwd = await realpath(cwd);
-      } catch {
-        throw new ApiError(400, "invalid_cwd", `Skill cwd '${cwd}' does not exist`);
+    handleHttpOperation(async () => {
+      const decoded = decodeMiniLilacHttpRequest(skillsQuerySchema, query);
+      if (decoded.status === "error") return Result.err(decoded.error);
+      const canonicalCwd = await canonicalDirectory(decoded.value.cwd, "Skill");
+      if (canonicalCwd.status === "error") return Result.err(canonicalCwd.error);
+      if (!(await stat(canonicalCwd.value)).isDirectory()) {
+        return Result.err(
+          httpFailure(400, "invalid_cwd", `Skill cwd '${decoded.value.cwd}' is not a directory`),
+        );
       }
-      if (!(await stat(canonicalCwd)).isDirectory()) {
-        throw new ApiError(400, "invalid_cwd", `Skill cwd '${cwd}' is not a directory`);
-      }
-      return jsonResponse(await sessionService.listSkills(cwd, profile));
-    }),
-  );
-
-  app.post(`${MINI_LILAC_API_PREFIX}/sessions/:sessionId/bindings`, ({ body, params }) =>
-    safely(async () => {
-      const { sessionId } = sessionParamsSchema.parse(params);
-      const request = miniLilacUpdateSessionBindingsRequestSchema.parse(body);
-      if (request.sessionId !== sessionId) {
-        throw new ApiError(409, "session_id_mismatch", "Body sessionId does not match the path");
-      }
-      return withSessionLock(sessionId, async () =>
-        jsonResponse(await sessionService.updateSessionBindings(request)),
+      return Result.ok(
+        jsonResponse(await sessionService.listSkills(decoded.value.cwd, decoded.value.profile)),
       );
     }),
   );
 
-  app.post(`${MINI_LILAC_API_PREFIX}/sessions/:sessionId/steer`, ({ body, params }) =>
-    safely(async () => {
-      const { sessionId } = sessionParamsSchema.parse(params);
-      const request = miniLilacSteerRequestSchema.parse(body);
-      requireClientCommandId(request);
-      if (request.sessionId !== sessionId) {
-        throw new ApiError(409, "session_id_mismatch", "Body sessionId does not match the path");
-      }
-      return jsonResponse(await sessionService.steer(request));
-    }),
-  );
-
-  app.post(
-    `${MINI_LILAC_API_PREFIX}/sessions/:sessionId/interrupt-queued-steering`,
-    ({ body, params }) =>
-      safely(async () => {
-        const { sessionId } = sessionParamsSchema.parse(params);
-        const request = miniLilacInterruptQueuedSteeringRequestSchema.parse(body);
-        requireClientCommandId(request);
-        if (request.sessionId !== sessionId) {
-          throw new ApiError(409, "session_id_mismatch", "Body sessionId does not match the path");
-        }
-        return jsonResponse(await sessionService.interruptQueuedSteering(request));
-      }),
-  );
-
-  app.post(`${MINI_LILAC_API_PREFIX}/sessions/:sessionId/cancel`, ({ body, params }) =>
-    safely(async () => {
-      const { sessionId } = sessionParamsSchema.parse(params);
-      const request = miniLilacCancelRequestSchema.parse(body);
-      requireClientCommandId(request);
-      if (request.sessionId !== sessionId) {
-        throw new ApiError(409, "session_id_mismatch", "Body sessionId does not match the path");
-      }
-      return jsonResponse(await sessionService.cancel(request));
-    }),
-  );
-
-  app.post(`${MINI_LILAC_API_PREFIX}/sessions/:sessionId/undo`, ({ body, params }) =>
-    safely(async () => {
-      const { sessionId } = sessionParamsSchema.parse(params);
-      const request = miniLilacUndoRequestSchema.parse(body);
-      requireClientCommandId(request);
-      if (request.sessionId !== sessionId) {
-        throw new ApiError(409, "session_id_mismatch", "Body sessionId does not match the path");
-      }
-      return withSessionLock(sessionId, async () =>
-        jsonResponse(miniLilacUndoResultSchema.parse(await sessionService.undo(request))),
+  app.post(`${MINI_LILAC_API_PREFIX}/sessions/:sessionId/bindings`, (context) =>
+    handleHttpOperation(async () => {
+      const decodedParams = decodeMiniLilacHttpRequest(sessionParamsSchema, context.params);
+      if (decodedParams.status === "error") return Result.err(decodedParams.error);
+      const decoded = decodeMiniLilacHttpRequest(
+        miniLilacUpdateSessionBindingsRequestSchema,
+        context,
+        "body",
       );
-    }),
-  );
-
-  app.post(`${MINI_LILAC_API_PREFIX}/sessions/:sessionId/redo`, ({ body, params }) =>
-    safely(async () => {
-      const { sessionId } = sessionParamsSchema.parse(params);
-      const request = miniLilacRedoRequestSchema.parse(body);
-      requireClientCommandId(request);
-      if (request.sessionId !== sessionId) {
-        throw new ApiError(409, "session_id_mismatch", "Body sessionId does not match the path");
-      }
-      return withSessionLock(sessionId, async () =>
-        jsonResponse(miniLilacRedoResultSchema.parse(await sessionService.redo(request))),
+      if (decoded.status === "error") return Result.err(decoded.error);
+      const matched = requireMatchingSessionId(decoded.value, decodedParams.value.sessionId);
+      if (matched.status === "error") return Result.err(matched.error);
+      const updated = adaptMiniLilacPersistenceResult(
+        await withSessionLock(decodedParams.value.sessionId, () =>
+          sessionService.updateSessionBindingsResult(matched.value),
+        ),
       );
+      return updated.status === "ok"
+        ? Result.ok(jsonResponse(updated.value))
+        : Result.err(updated.error);
     }),
   );
 
-  app.post(`${MINI_LILAC_API_PREFIX}/sessions/:sessionId/compact`, ({ body, params }) =>
-    safely(async () => {
-      const { sessionId } = sessionParamsSchema.parse(params);
-      const request = miniLilacCompactRequestSchema.parse(body);
-      if (request.sessionId !== sessionId) {
-        throw new ApiError(409, "session_id_mismatch", "Body sessionId does not match the path");
-      }
-      // Compaction answers with an event stream, not a JSON body: it is
-      // long-running, and progress plus the generated summary have to reach the
-      // client while it runs. Admission still happens before the stream opens,
-      // so a non-quiescent session is still a 409 rather than a stream error.
-      //
-      // The request signal is deliberately not forwarded: the response stream is
-      // a view of the compaction, not its owner. Disconnecting detaches the
-      // client and compaction still commits; stopping it is an explicit call to
-      // the cancel endpoint below.
-      const started = await withSessionLock(sessionId, () => sessionService.compact(request));
-      return uiMessageStreamResponse(started.stream);
+  app.post(`${MINI_LILAC_API_PREFIX}/sessions/:sessionId/steer`, (context) =>
+    handleHttpOperation(async () => {
+      const decodedParams = decodeMiniLilacHttpRequest(sessionParamsSchema, context.params);
+      if (decodedParams.status === "error") return Result.err(decodedParams.error);
+      const decoded = decodeMiniLilacHttpRequest(miniLilacSteerRequestSchema, context, "body");
+      if (decoded.status === "error") return Result.err(decoded.error);
+      const command = requireClientCommandId(decoded.value);
+      if (command.status === "error") return Result.err(command.error);
+      const matched = requireMatchingSessionId(command.value, decodedParams.value.sessionId);
+      if (matched.status === "error") return Result.err(matched.error);
+      const steered = adaptMiniLilacPersistenceResult(
+        await sessionService.steerResult(matched.value),
+      );
+      return steered.status === "ok"
+        ? Result.ok(jsonResponse(steered.value))
+        : Result.err(steered.error);
     }),
   );
 
-  app.post(`${MINI_LILAC_API_PREFIX}/sessions/:sessionId/compact/cancel`, ({ body, params }) =>
-    safely(async () => {
-      const { sessionId } = sessionParamsSchema.parse(params);
-      const request = miniLilacCancelCompactionRequestSchema.parse(body);
-      if (request.sessionId !== sessionId) {
-        throw new ApiError(409, "session_id_mismatch", "Body sessionId does not match the path");
-      }
-      return jsonResponse(await sessionService.cancelCompaction(request));
+  app.post(`${MINI_LILAC_API_PREFIX}/sessions/:sessionId/interrupt-queued-steering`, (context) =>
+    handleHttpOperation(async () => {
+      const decodedParams = decodeMiniLilacHttpRequest(sessionParamsSchema, context.params);
+      if (decodedParams.status === "error") return Result.err(decodedParams.error);
+      const decoded = decodeMiniLilacHttpRequest(
+        miniLilacInterruptQueuedSteeringRequestSchema,
+        context,
+        "body",
+      );
+      if (decoded.status === "error") return Result.err(decoded.error);
+      const command = requireClientCommandId(decoded.value);
+      if (command.status === "error") return Result.err(command.error);
+      const matched = requireMatchingSessionId(command.value, decodedParams.value.sessionId);
+      if (matched.status === "error") return Result.err(matched.error);
+      const interrupted = adaptMiniLilacPersistenceResult(
+        await sessionService.interruptQueuedSteeringResult(matched.value),
+      );
+      return interrupted.status === "ok"
+        ? Result.ok(jsonResponse(interrupted.value))
+        : Result.err(interrupted.error);
+    }),
+  );
+
+  app.post(`${MINI_LILAC_API_PREFIX}/sessions/:sessionId/cancel`, (context) =>
+    handleHttpOperation(async () => {
+      const decodedParams = decodeMiniLilacHttpRequest(sessionParamsSchema, context.params);
+      if (decodedParams.status === "error") return Result.err(decodedParams.error);
+      const decoded = decodeMiniLilacHttpRequest(miniLilacCancelRequestSchema, context, "body");
+      if (decoded.status === "error") return Result.err(decoded.error);
+      const command = requireClientCommandId(decoded.value);
+      if (command.status === "error") return Result.err(command.error);
+      const matched = requireMatchingSessionId(command.value, decodedParams.value.sessionId);
+      if (matched.status === "error") return Result.err(matched.error);
+      const cancelled = adaptMiniLilacPersistenceResult(
+        await sessionService.cancelResult(matched.value),
+      );
+      return cancelled.status === "ok"
+        ? Result.ok(jsonResponse(cancelled.value))
+        : Result.err(cancelled.error);
+    }),
+  );
+
+  app.post(`${MINI_LILAC_API_PREFIX}/sessions/:sessionId/undo`, (context) =>
+    handleHttpOperation(async () => {
+      const decodedParams = decodeMiniLilacHttpRequest(sessionParamsSchema, context.params);
+      if (decodedParams.status === "error") return Result.err(decodedParams.error);
+      const decoded = decodeMiniLilacHttpRequest(miniLilacUndoRequestSchema, context, "body");
+      if (decoded.status === "error") return Result.err(decoded.error);
+      const command = requireClientCommandId(decoded.value);
+      if (command.status === "error") return Result.err(command.error);
+      const matched = requireMatchingSessionId(command.value, decodedParams.value.sessionId);
+      if (matched.status === "error") return Result.err(matched.error);
+      const undone = adaptMiniLilacPersistenceResult(
+        await withSessionLock(decodedParams.value.sessionId, () =>
+          sessionService.undoResult(matched.value),
+        ),
+      );
+      return undone.status === "ok"
+        ? Result.ok(jsonResponse(undone.value))
+        : Result.err(undone.error);
+    }),
+  );
+
+  app.post(`${MINI_LILAC_API_PREFIX}/sessions/:sessionId/redo`, (context) =>
+    handleHttpOperation(async () => {
+      const decodedParams = decodeMiniLilacHttpRequest(sessionParamsSchema, context.params);
+      if (decodedParams.status === "error") return Result.err(decodedParams.error);
+      const decoded = decodeMiniLilacHttpRequest(miniLilacRedoRequestSchema, context, "body");
+      if (decoded.status === "error") return Result.err(decoded.error);
+      const command = requireClientCommandId(decoded.value);
+      if (command.status === "error") return Result.err(command.error);
+      const matched = requireMatchingSessionId(command.value, decodedParams.value.sessionId);
+      if (matched.status === "error") return Result.err(matched.error);
+      const redone = adaptMiniLilacPersistenceResult(
+        await withSessionLock(decodedParams.value.sessionId, () =>
+          sessionService.redoResult(matched.value),
+        ),
+      );
+      return redone.status === "ok"
+        ? Result.ok(jsonResponse(redone.value))
+        : Result.err(redone.error);
+    }),
+  );
+
+  app.post(`${MINI_LILAC_API_PREFIX}/sessions/:sessionId/compact`, (context) =>
+    handleHttpOperation(async () => {
+      const decodedParams = decodeMiniLilacHttpRequest(sessionParamsSchema, context.params);
+      if (decodedParams.status === "error") return Result.err(decodedParams.error);
+      const decoded = decodeMiniLilacHttpRequest(miniLilacCompactRequestSchema, context, "body");
+      if (decoded.status === "error") return Result.err(decoded.error);
+      const matched = requireMatchingSessionId(decoded.value, decodedParams.value.sessionId);
+      if (matched.status === "error") return Result.err(matched.error);
+      const started = adaptMiniLilacPersistenceResult(
+        await withSessionLock(decodedParams.value.sessionId, () =>
+          sessionService.compactResult(matched.value),
+        ),
+      );
+      return started.status === "ok"
+        ? Result.ok(uiMessageStreamResponse(started.value.stream))
+        : Result.err(started.error);
+    }),
+  );
+
+  app.post(`${MINI_LILAC_API_PREFIX}/sessions/:sessionId/compact/cancel`, (context) =>
+    handleHttpOperation(async () => {
+      const decodedParams = decodeMiniLilacHttpRequest(sessionParamsSchema, context.params);
+      if (decodedParams.status === "error") return Result.err(decodedParams.error);
+      const decoded = decodeMiniLilacHttpRequest(
+        miniLilacCancelCompactionRequestSchema,
+        context,
+        "body",
+      );
+      if (decoded.status === "error") return Result.err(decoded.error);
+      const matched = requireMatchingSessionId(decoded.value, decodedParams.value.sessionId);
+      if (matched.status === "error") return Result.err(matched.error);
+      const cancelled = adaptMiniLilacPersistenceResult(
+        await sessionService.cancelCompactionResult(matched.value),
+      );
+      return cancelled.status === "ok"
+        ? Result.ok(jsonResponse(cancelled.value))
+        : Result.err(cancelled.error);
     }),
   );
 
   app.get(`${MINI_LILAC_API_PREFIX}/models`, () =>
-    safely(async () => jsonResponse(modelSummaries(await modelCatalog.get()))),
+    handleHttpOperation(async () =>
+      Result.ok(jsonResponse(modelSummaries(await modelCatalog.get()))),
+    ),
   );
 
-  app.post(`${MINI_LILAC_API_PREFIX}/models/refresh`, ({ body }) =>
-    safely(async () => {
-      emptyBodySchema.parse(body);
-      return jsonResponse(modelSummaries(await modelCatalog.get({ forceRefresh: true })));
+  app.post(`${MINI_LILAC_API_PREFIX}/models/refresh`, (context) =>
+    handleHttpOperation(async () => {
+      const decoded = decodeMiniLilacHttpRequest(emptyBodySchema, context, "body");
+      if (decoded.status === "error") return Result.err(decoded.error);
+      return Result.ok(
+        jsonResponse(modelSummaries(await modelCatalog.get({ forceRefresh: true }))),
+      );
     }),
   );
 

@@ -1,6 +1,11 @@
-import { tool, type ModelMessage } from "ai";
+import { tool, type FilePart, type ImagePart, type ModelMessage } from "ai";
 import { lilacEventTypes, type LilacBus } from "@stanley2058/lilac-event-bus";
-import { createLogger } from "@stanley2058/lilac-utils";
+import {
+  createLogger,
+  formatTaggedErrorForLog,
+  opaqueErrorMessage,
+  isRecord,
+} from "@stanley2058/lilac-utils";
 import { fileTypeFromBuffer } from "file-type";
 import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
@@ -17,6 +22,10 @@ import {
   sanitizeExtension,
 } from "../shared/attachment-utils";
 import { requireRequestContext } from "../shared/req-context";
+import { adaptEventPublishResultToHost } from "../shared/event-bus-result";
+import { projectRuntimeError } from "../runtime/error-format";
+import { Result, TaggedError, type Result as ResultType } from "better-result";
+import { adaptToolResultToHost, preserveToolPanic } from "./tool-result-adapters";
 
 const DEFAULT_OUTBOUND_MAX_FILE_BYTES = 8 * 1024 * 1024;
 const DEFAULT_OUTBOUND_MAX_TOTAL_BYTES = 16 * 1024 * 1024;
@@ -25,6 +34,39 @@ const DEFAULT_INBOUND_MAX_FILE_BYTES = 25 * 1024 * 1024;
 const DEFAULT_INBOUND_MAX_TOTAL_BYTES = 50 * 1024 * 1024;
 
 const DISCORD_CDN_HOSTS = new Set(["cdn.discordapp.com", "media.discordapp.net"]);
+
+class AttachmentOperationError extends TaggedError("AttachmentOperationError")<{
+  readonly operation: string;
+  readonly cause: unknown;
+  readonly message: string;
+}> {}
+
+async function captureAttachmentOperation<T>(params: {
+  readonly operation: string;
+  readonly run: () => Promise<T>;
+}): Promise<ResultType<T, AttachmentOperationError>> {
+  const captured = await Result.tryPromise({
+    try: params.run,
+    catch: projectRuntimeError(`Opaque attachment ${params.operation} failure`),
+  });
+  if (captured.status === "error") {
+    const cause = preserveToolPanic(captured.error);
+    return Result.err(
+      new AttachmentOperationError({
+        operation: params.operation,
+        cause,
+        message: opaqueErrorMessage(cause, `Attachment ${params.operation} failed`),
+      }),
+    );
+  }
+  return Result.ok(captured.value);
+}
+
+function signalAttachmentFailure(operation: string, message: string): never {
+  return adaptToolResultToHost(
+    Result.err(new AttachmentOperationError({ operation, cause: new Error(message), message })),
+  );
+}
 
 const nonEmptyStringListInputSchema = z
   .union([z.string().min(1), z.array(z.string().min(1)).min(1)])
@@ -39,9 +81,9 @@ const optionalNonEmptyStringListInputSchema = z
   });
 
 function normalizeAttachmentAddFilesInput(raw: unknown): unknown {
-  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return raw;
+  if (!isRecord(raw)) return raw;
 
-  const input = raw as Record<string, unknown>;
+  const input = raw;
   if (input["paths"] !== undefined || input["files"] === undefined) {
     return raw;
   }
@@ -52,7 +94,9 @@ function normalizeAttachmentAddFilesInput(raw: unknown): unknown {
   };
 }
 
-function asBuffer(data: unknown): Buffer {
+type AttachmentData = ImagePart["image"] | FilePart["data"];
+
+function asBuffer(data: AttachmentData): Buffer {
   if (Buffer.isBuffer(data)) return data;
   if (data instanceof Uint8Array) return Buffer.from(data);
   if (data instanceof ArrayBuffer) return Buffer.from(new Uint8Array(data));
@@ -67,7 +111,7 @@ function asBuffer(data: unknown): Buffer {
   }
 
   // URL is handled separately.
-  throw new Error("Unsupported data content");
+  signalAttachmentFailure("decode_data", "Unsupported data content");
 }
 
 const attachmentAddFilesInputSchema = z
@@ -104,14 +148,14 @@ type DetectedAttachment =
       source: string;
       mediaTypeHint?: string;
       filenameHint?: string;
-      data: unknown;
+      data: ImagePart["image"];
     }
   | {
       kind: "file";
       source: string;
       mediaTypeHint: string;
       filenameHint?: string;
-      data: unknown;
+      data: FilePart["data"];
     };
 
 const attachmentDownloadInputSchema = z.object({
@@ -133,6 +177,12 @@ const attachmentDownloadOutputSchema = z.object({
       mimeType: z.string().optional(),
     }),
   ),
+});
+
+const optionalAttachmentContextSchema = z.object({
+  requestId: z.string().optional(),
+  sessionId: z.string().optional(),
+  requestClient: z.string().optional(),
 });
 
 type AttachmentDownloadOutput = z.infer<typeof attachmentDownloadOutputSchema>;
@@ -190,21 +240,25 @@ function collectUserAttachments(messages: readonly ModelMessage[]): DetectedAtta
   return out;
 }
 
-async function downloadToBuffer(input: unknown): Promise<{
+async function downloadToBuffer(input: AttachmentData): Promise<{
   bytes: Buffer;
   sourceUrl?: string;
   contentType?: string;
 }> {
   if (input instanceof URL) {
     if (!DISCORD_CDN_HOSTS.has(input.hostname)) {
-      throw new Error(
+      signalAttachmentFailure(
+        "authorize_download",
         `Blocked attachment host '${input.hostname}'. Allowed: ${[...DISCORD_CDN_HOSTS].join(", ")}`,
       );
     }
 
     const res = await fetch(input.toString(), { redirect: "follow" });
     if (!res.ok) {
-      throw new Error(`Failed to download attachment (${res.status}): ${input}`);
+      signalAttachmentFailure(
+        "download",
+        `Failed to download attachment (${res.status}): ${input}`,
+      );
     }
     const ab = await res.arrayBuffer();
     return {
@@ -251,7 +305,7 @@ export function attachmentTools(params: { bus: LilacBus; cwd: string }) {
           mimeTypeCount: input.mimeTypes?.length,
         });
 
-        try {
+        const runAddFiles = async () => {
           let totalBytes = 0;
 
           const out: Array<{
@@ -266,18 +320,20 @@ export function attachmentTools(params: { bus: LilacBus; cwd: string }) {
 
             const st = await fs.stat(resolvedPath);
             if (!st.isFile()) {
-              throw new Error(`Not a file: ${resolvedPath}`);
+              signalAttachmentFailure("validate_outbound_file", `Not a file: ${resolvedPath}`);
             }
 
             if (st.size > DEFAULT_OUTBOUND_MAX_FILE_BYTES) {
-              throw new Error(
+              signalAttachmentFailure(
+                "validate_outbound_file",
                 `Attachment too large (${st.size} bytes). Max is ${DEFAULT_OUTBOUND_MAX_FILE_BYTES} bytes: ${resolvedPath}`,
               );
             }
 
             totalBytes += st.size;
             if (totalBytes > DEFAULT_OUTBOUND_MAX_TOTAL_BYTES) {
-              throw new Error(
+              signalAttachmentFailure(
+                "validate_outbound_total",
                 `Total attachment bytes too large (${totalBytes} bytes). Max is ${DEFAULT_OUTBOUND_MAX_TOTAL_BYTES} bytes.`,
               );
             }
@@ -295,16 +351,18 @@ export function attachmentTools(params: { bus: LilacBus; cwd: string }) {
 
             const dataBase64 = Buffer.from(bytes).toString("base64");
 
-            await bus.publish(
-              lilacEventTypes.EvtAgentOutputResponseBinary,
-              { mimeType, dataBase64, filename },
-              {
-                headers: {
-                  request_id: ctx.requestId,
-                  session_id: ctx.sessionId,
-                  request_client: ctx.requestClient,
+            adaptEventPublishResultToHost(
+              await bus.publish(
+                lilacEventTypes.EvtAgentOutputResponseBinary,
+                { mimeType, dataBase64, filename },
+                {
+                  headers: {
+                    request_id: ctx.requestId,
+                    session_id: ctx.sessionId,
+                    request_client: ctx.requestClient,
+                  },
                 },
-              },
+              ),
             );
 
             out.push({ filename, mimeType, bytes: bytes.byteLength });
@@ -322,20 +380,23 @@ export function attachmentTools(params: { bus: LilacBus; cwd: string }) {
           });
 
           return result;
-        } catch (e) {
-          logger.error(
-            "attachment.add_files failed",
-            {
-              requestId: ctx.requestId,
-              sessionId: ctx.sessionId,
-              requestClient: ctx.requestClient,
-              durationMs: Date.now() - startedAt,
-              pathCount: input.paths.length,
-            },
-            e,
-          );
-          throw e;
+        };
+        const added = await captureAttachmentOperation({
+          operation: "add_files",
+          run: runAddFiles,
+        });
+        if (added.status === "error") {
+          logger.error("attachment.add_files failed", {
+            requestId: ctx.requestId,
+            sessionId: ctx.sessionId,
+            requestClient: ctx.requestClient,
+            durationMs: Date.now() - startedAt,
+            pathCount: input.paths.length,
+            ...formatTaggedErrorForLog(added.error),
+          });
+          return adaptToolResultToHost(added);
         }
+        return added.value;
       },
     }),
 
@@ -349,16 +410,11 @@ export function attachmentTools(params: { bus: LilacBus; cwd: string }) {
       execute: async (input, options) => {
         const startedAt = Date.now();
         const downloadDir = resolve(expandTilde(input.downloadDir ?? "~/Downloads"));
-        const context =
-          options.context && typeof options.context === "object"
-            ? (options.context as Record<string, unknown>)
-            : undefined;
-        const requestId =
-          typeof context?.["requestId"] === "string" ? context["requestId"] : undefined;
-        const sessionId =
-          typeof context?.["sessionId"] === "string" ? context["sessionId"] : undefined;
-        const requestClient =
-          typeof context?.["requestClient"] === "string" ? context["requestClient"] : undefined;
+        const decodedContext = optionalAttachmentContextSchema.safeParse(options.context);
+        const context = decodedContext.success ? decodedContext.data : undefined;
+        const requestId = context?.requestId;
+        const sessionId = context?.sessionId;
+        const requestClient = context?.requestClient;
 
         logger.info("attachment.download", {
           requestId,
@@ -367,7 +423,7 @@ export function attachmentTools(params: { bus: LilacBus; cwd: string }) {
           downloadDir,
         });
 
-        try {
+        const runDownload = async (): Promise<AttachmentDownloadOutput> => {
           const attachments = collectUserAttachments(options.messages);
           if (attachments.length === 0) {
             const emptyResult = { ok: true as const, downloadDir, files: [] };
@@ -394,14 +450,16 @@ export function attachmentTools(params: { bus: LilacBus; cwd: string }) {
             const downloaded = await downloadToBuffer(att.data);
 
             if (downloaded.bytes.byteLength > DEFAULT_INBOUND_MAX_FILE_BYTES) {
-              throw new Error(
+              signalAttachmentFailure(
+                "validate_inbound_file",
                 `Attachment too large (${downloaded.bytes.byteLength} bytes). Max is ${DEFAULT_INBOUND_MAX_FILE_BYTES} bytes.`,
               );
             }
 
             totalBytes += downloaded.bytes.byteLength;
             if (totalBytes > DEFAULT_INBOUND_MAX_TOTAL_BYTES) {
-              throw new Error(
+              signalAttachmentFailure(
+                "validate_inbound_total",
                 `Total attachment bytes too large (${totalBytes} bytes). Max is ${DEFAULT_INBOUND_MAX_TOTAL_BYTES} bytes.`,
               );
             }
@@ -430,10 +488,11 @@ export function attachmentTools(params: { bus: LilacBus; cwd: string }) {
             const target = join(downloadDir, `${sha10}${ext}`);
 
             // Only write missing.
-            const exists = await fs
-              .access(target)
-              .then(() => true)
-              .catch(() => false);
+            const accessed = await captureAttachmentOperation({
+              operation: "inspect_download_target",
+              run: () => fs.access(target),
+            });
+            const exists = accessed.status === "ok";
 
             if (!exists) {
               await fs.writeFile(target, downloaded.bytes);
@@ -461,20 +520,23 @@ export function attachmentTools(params: { bus: LilacBus; cwd: string }) {
           });
 
           return result;
-        } catch (e) {
-          logger.error(
-            "attachment.download failed",
-            {
-              requestId,
-              sessionId,
-              requestClient,
-              durationMs: Date.now() - startedAt,
-              downloadDir,
-            },
-            e,
-          );
-          throw e;
+        };
+        const downloaded = await captureAttachmentOperation({
+          operation: "download",
+          run: runDownload,
+        });
+        if (downloaded.status === "error") {
+          logger.error("attachment.download failed", {
+            requestId,
+            sessionId,
+            requestClient,
+            durationMs: Date.now() - startedAt,
+            downloadDir,
+            ...formatTaggedErrorForLog(downloaded.error),
+          });
+          return adaptToolResultToHost(downloaded);
         }
+        return downloaded.value;
       },
     }),
   };

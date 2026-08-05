@@ -1,3 +1,5 @@
+import { decodeRemoteApplyPatchResponseJson } from "@stanley2058/lilac-fs";
+
 import { sshExecScriptJson } from "../../ssh/ssh-exec";
 import { getRemoteRunnerJsText } from "../../ssh/remote-js";
 
@@ -13,21 +15,25 @@ export async function remoteApplyPatch(params: {
   signal?: AbortSignal;
   dangerouslyAllow?: boolean;
 }): Promise<{ ok: true; output: string } | { ok: false; error: string }> {
-  const js = await getRemoteRunnerJsText();
-  const res = await sshExecScriptJson<string>({
+  const source = await getRemoteRunnerJsText();
+  if (source.status === "error") return { ok: false, error: source.error.message };
+  const res = await sshExecScriptJson({
     host: params.host,
     cwd: params.cwd,
-    js,
+    js: source.value,
     input: {
       op: "apply_patch",
-      denyPaths: params.dangerouslyAllow === true ? REMOTE_ALLOW_ALL_PATHS : REMOTE_DENY_PATHS,
+      denyPaths: [
+        ...(params.dangerouslyAllow === true ? REMOTE_ALLOW_ALL_PATHS : REMOTE_DENY_PATHS),
+      ],
       input: { patchText: params.patchText },
     },
     timeoutMs: params.timeoutMs ?? DEFAULT_TIMEOUT_MS,
     signal: params.signal,
     maxOutputChars: 1_000_000,
+    decodeResponse: decodeRemoteApplyPatchResponseJson,
   });
 
-  if (!res.ok) return { ok: false, error: res.error };
+  if (res.status === "error") return { ok: false, error: res.error.message };
   return { ok: true, output: res.value };
 }

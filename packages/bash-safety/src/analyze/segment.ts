@@ -814,12 +814,14 @@ export function analyzeProtectedPathTokens(
       options.inspectAttachedDirectoryOption && staticToken.startsWith("-C")
         ? staticToken.slice(2).replace(/^=/u, "")
         : undefined;
-    const candidates =
-      equalsIndex > 0
-        ? [staticToken, staticToken.slice(equalsIndex + 1)]
-        : attachedDirectory
-          ? [attachedDirectory]
-          : [staticToken];
+    let candidates: string[];
+    if (equalsIndex > 0) {
+      candidates = [staticToken, staticToken.slice(equalsIndex + 1)];
+    } else if (attachedDirectory) {
+      candidates = [attachedDirectory];
+    } else {
+      candidates = [staticToken];
+    }
 
     for (const candidate of candidates) {
       if (!candidate || candidate === "-" || candidate.startsWith("-")) continue;

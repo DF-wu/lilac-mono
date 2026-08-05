@@ -14,6 +14,7 @@ const arrayIsArray = Array.isArray.bind(Array);
 const objectCreate = Object.create.bind(Object);
 const objectDefineProperty = Object.defineProperty.bind(Object);
 const objectFreeze = Object.freeze.bind(Object);
+const objectKeys = Object.keys.bind(Object);
 const reflectOwnKeys = Reflect.ownKeys.bind(Reflect);
 const mapGet = Function.call.bind(Map.prototype.get);
 const mapSet = Function.call.bind(Map.prototype.set);
@@ -77,6 +78,48 @@ function parseCallSiteManifest(source) {
     mapSet(manifest, entry.callSiteId, entry.kind);
   }
   return manifest;
+}
+
+function decodeInputMessage(value) {
+  if (!value || typeof value !== "object" || arrayIsArray(value)) {
+    throw new Error("Sandbox protocol input is invalid");
+  }
+  const keys = objectKeys(value);
+  if (
+    value.type === "start" &&
+    keys.length === 3 &&
+    keys.includes("source") &&
+    keys.includes("args") &&
+    typeof value.source === "string" &&
+    value.args &&
+    typeof value.args === "object" &&
+    !arrayIsArray(value.args)
+  ) {
+    return value;
+  }
+  if (
+    value.type === "resolve" &&
+    keys.length === 3 &&
+    keys.includes("id") &&
+    keys.includes("value") &&
+    Number.isSafeInteger(value.id) &&
+    value.id > 0
+  ) {
+    return value;
+  }
+  if (
+    value.type === "reject" &&
+    keys.length === 3 &&
+    keys.includes("id") &&
+    keys.includes("error") &&
+    Number.isSafeInteger(value.id) &&
+    value.id > 0 &&
+    typeof value.error === "string" &&
+    value.error.length <= 16_384
+  ) {
+    return value;
+  }
+  throw new Error("Sandbox protocol input is invalid");
 }
 
 function operationIdentity(callSiteId) {
@@ -343,13 +386,15 @@ function handle(message) {
 for await (const chunk of bunRuntime.stdin.stream()) {
   buffered += decoder.decode(chunk, { stream: true });
   if (buffered.length > MAX_PROTOCOL_BYTES) {
-    throw new Error("Sandbox protocol input exceeded limit");
+    send({ type: "error", error: "Sandbox protocol input exceeded limit" });
+    setExitCode(1);
+    break;
   }
   while (true) {
     const newline = stringIndexOf(buffered, "\n");
     if (newline < 0) break;
     const line = stringSlice(buffered, 0, newline);
     buffered = stringSlice(buffered, newline + 1);
-    if (line) handle(jsonParse(line));
+    if (line) handle(decodeInputMessage(jsonParse(line)));
   }
 }

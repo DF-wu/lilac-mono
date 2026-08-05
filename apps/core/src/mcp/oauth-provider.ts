@@ -9,6 +9,7 @@ import {
   type OAuthClientProvider,
   type OAuthTokens,
 } from "@ai-sdk/mcp";
+import { Result, TaggedError, type Result as ResultType } from "better-result";
 
 import {
   readMcpOAuthCredentialFile,
@@ -18,8 +19,10 @@ import {
 import {
   type McpAuthorizationCodeAuth,
   type McpServerDefinition,
+  type McpValueSource,
   type UniversalMcpConfig,
 } from "./config-types";
+import { rethrowPanic } from "./error-format";
 import { resolveMcpValueSource, type McpValueResolutionContext } from "./value-source";
 
 export const MCP_OAUTH_CALLBACK_URL = "http://localhost:1456/mcp/oauth/callback";
@@ -44,21 +47,65 @@ export type McpOAuthStartResult =
       readonly callbackUrl: string;
     };
 
-export class McpOAuthProviderError extends Error {
-  constructor(
-    readonly serverId: string,
-    operation: "start" | "complete" | "credentials",
-  ) {
-    const action =
-      operation === "start"
-        ? "start MCP OAuth authorization"
-        : operation === "complete"
-          ? "complete MCP OAuth authorization"
-          : "load MCP OAuth client credentials";
-    super(`Could not ${action} for server ${JSON.stringify(serverId)}`);
-    this.name = "McpOAuthProviderError";
+export class McpOAuthProviderError extends TaggedError("McpOAuthProviderError")<{
+  readonly serverId: string;
+  readonly operation: "start" | "complete" | "credentials";
+  readonly cause?: unknown;
+  readonly message: string;
+}> {
+  constructor(options: {
+    readonly serverId: string;
+    readonly operation: "start" | "complete" | "credentials";
+    readonly cause?: unknown;
+  }) {
+    let action: string;
+    switch (options.operation) {
+      case "start":
+        action = "start MCP OAuth authorization";
+        break;
+      case "complete":
+        action = "complete MCP OAuth authorization";
+        break;
+      case "credentials":
+        action = "load MCP OAuth client credentials";
+        break;
+    }
+    super({
+      ...options,
+      message: `Could not ${action} for server ${JSON.stringify(options.serverId)}`,
+    });
   }
 }
+
+function oauthProviderError(
+  serverId: string,
+  operation: McpOAuthProviderError["operation"],
+  cause?: unknown,
+): McpOAuthProviderError {
+  return new McpOAuthProviderError({ serverId, operation, cause });
+}
+
+async function captureOAuthAttempt<T>(options: {
+  readonly serverId: string;
+  readonly operation: "start" | "complete";
+  readonly run: () => Promise<T>;
+}): Promise<ResultType<T, McpOAuthProviderError>> {
+  try {
+    return Result.ok(await options.run());
+  } catch (cause) {
+    rethrowPanic(cause);
+    return Result.err(oauthProviderError(options.serverId, options.operation, cause));
+  }
+}
+
+export class McpOAuthCredentialResolutionError extends TaggedError(
+  "McpOAuthCredentialResolutionError",
+)<{
+  readonly serverId: string;
+  readonly field: "client_id" | "client_secret";
+  readonly cause: Error;
+  readonly message: string;
+}> {}
 
 export class McpOAuthProvider implements OAuthClientProvider {
   readonly serverId: string;
@@ -131,7 +178,7 @@ export class McpOAuthProvider implements OAuthClientProvider {
   }
 
   async clientInformation(): Promise<OAuthClientInformation | undefined> {
-    const information = await this.clientInformationForAuthorization();
+    const information = await this.clientInformationForSdkAttempt();
     if (this.authConfig.client.type === "dynamic" && information === undefined) {
       throw new UnauthorizedError("Interactive MCP authorization requires explicit mcp.auth");
     }
@@ -142,7 +189,9 @@ export class McpOAuthProvider implements OAuthClientProvider {
     this.rejectImplicitAuthorization();
   }
 
-  private async clientInformationForAuthorization(): Promise<OAuthClientInformation | undefined> {
+  private async clientInformationForAuthorization(): Promise<
+    ResultType<OAuthClientInformation | undefined, McpOAuthCredentialResolutionError>
+  > {
     if (this.authConfig.client.type === "dynamic") {
       const information = (await this.readCredential())?.clientInformation;
       if (
@@ -150,24 +199,46 @@ export class McpOAuthProvider implements OAuthClientProvider {
         information.client_secret_expires_at !== 0 &&
         information.client_secret_expires_at <= this.now() / 1000
       ) {
-        return undefined;
+        return Result.ok(undefined);
       }
-      return information;
+      return Result.ok(information);
     }
 
-    const clientId = await resolveMcpValueSource(
-      this.authConfig.client.clientId,
-      this.valueContext,
-    );
-    if (!clientId.ok) throw new McpOAuthProviderError(this.serverId, "credentials");
-    if (this.authConfig.client.clientSecret === undefined) return { client_id: clientId.value };
+    const client = this.authConfig.client;
+    const resolveStaticCredential = this.resolveStaticCredential.bind(this);
+    return Result.gen(async function* () {
+      const clientId = yield* Result.await(resolveStaticCredential(client.clientId, "client_id"));
+      if (client.clientSecret === undefined) return Result.ok({ client_id: clientId });
 
-    const clientSecret = await resolveMcpValueSource(
-      this.authConfig.client.clientSecret,
-      this.valueContext,
+      const clientSecret = yield* Result.await(
+        resolveStaticCredential(client.clientSecret, "client_secret"),
+      );
+      return Result.ok({ client_id: clientId, client_secret: clientSecret });
+    });
+  }
+
+  private async clientInformationForSdkAttempt(): Promise<OAuthClientInformation | undefined> {
+    const result = await this.clientInformationForAuthorization();
+    if (result.status === "error") {
+      throw oauthProviderError(this.serverId, "credentials", result.error);
+    }
+    return result.value;
+  }
+
+  private async resolveStaticCredential(
+    source: McpValueSource,
+    field: "client_id" | "client_secret",
+  ): Promise<ResultType<string, McpOAuthCredentialResolutionError>> {
+    const resolved = await resolveMcpValueSource(source, this.valueContext);
+    if (resolved.status === "ok") return Result.ok(resolved.value);
+    return Result.err(
+      new McpOAuthCredentialResolutionError({
+        serverId: this.serverId,
+        field,
+        cause: resolved.error,
+        message: `Could not resolve OAuth ${field === "client_id" ? "client ID" : "client secret"} for MCP server ${JSON.stringify(this.serverId)}`,
+      }),
     );
-    if (!clientSecret.ok) throw new McpOAuthProviderError(this.serverId, "credentials");
-    return { client_id: clientId.value, client_secret: clientSecret.value };
   }
 
   async authorizationServerInformation(): Promise<OAuthAuthorizationServerInformation | undefined> {
@@ -204,61 +275,90 @@ export class McpOAuthProvider implements OAuthClientProvider {
     this.pending.clear();
   }
 
-  async startAuthorization(): Promise<McpOAuthStartResult> {
-    const pending = this.createPendingAuthorization();
-    try {
-      const result = await auth(this.providerForAttempt(pending), {
-        serverUrl: this.serverUrl,
-        ...(this.authConfig.scopes?.length ? { scope: this.authConfig.scopes.join(" ") } : {}),
-        ...(this.fetchFn ? { fetchFn: this.fetchFn } : {}),
-      });
-      if (result === "AUTHORIZED") {
-        this.deletePending(pending);
-        return { status: "authorized" };
-      }
-
-      const authorizationUrl = pending.authorizationUrl;
-      if (!authorizationUrl || !pending.codeVerifier || !this.isActive(pending)) {
-        throw new McpOAuthProviderError(this.serverId, "start");
-      }
-      pending.authorizationUrl = undefined;
-      pending.status = "pending";
-      return {
-        status: "authorization_required",
-        authorizationUrl,
-        callbackUrl: this.redirectUrl,
-      };
-    } catch {
+  async startAuthorizationResult(): Promise<
+    ResultType<McpOAuthStartResult, McpOAuthProviderError>
+  > {
+    const pendingResult = this.createPendingAuthorization();
+    if (pendingResult.status === "error") return pendingResult;
+    const pending = pendingResult.value;
+    const authorized = await captureOAuthAttempt({
+      serverId: this.serverId,
+      operation: "start",
+      run: () =>
+        auth(this.providerForAttempt(pending), {
+          serverUrl: this.serverUrl,
+          ...(this.authConfig.scopes?.length ? { scope: this.authConfig.scopes.join(" ") } : {}),
+          ...(this.fetchFn ? { fetchFn: this.fetchFn } : {}),
+        }),
+    });
+    if (authorized.status === "error") {
       this.deletePending(pending);
-      throw new McpOAuthProviderError(this.serverId, "start");
+      return authorized;
     }
+    if (authorized.value === "AUTHORIZED") {
+      this.deletePending(pending);
+      return Result.ok({ status: "authorized" });
+    }
+
+    const authorizationUrl = pending.authorizationUrl;
+    if (!authorizationUrl || !pending.codeVerifier || !this.isActive(pending)) {
+      this.deletePending(pending);
+      return Result.err(oauthProviderError(this.serverId, "start"));
+    }
+    pending.authorizationUrl = undefined;
+    pending.status = "pending";
+    return Result.ok({
+      status: "authorization_required",
+      authorizationUrl,
+      callbackUrl: this.redirectUrl,
+    });
   }
 
-  async completeAuthorization(authorizationCode: string, callbackState: string): Promise<void> {
+  async startAuthorization(): Promise<McpOAuthStartResult> {
+    const started = await this.startAuthorizationResult();
+    if (started.status === "error") throw started.error;
+    return started.value;
+  }
+
+  async completeAuthorizationResult(
+    authorizationCode: string,
+    callbackState: string,
+  ): Promise<ResultType<void, McpOAuthProviderError>> {
     this.pruneExpiredPending();
     const pending = this.pending.get(callbackState);
     if (!pending || pending.status !== "pending" || authorizationCode.length === 0) {
-      throw new McpOAuthProviderError(this.serverId, "complete");
+      return Result.err(oauthProviderError(this.serverId, "complete"));
     }
 
     pending.status = "completing";
-    try {
-      const result = await auth(this.providerForAttempt(pending), {
-        serverUrl: this.serverUrl,
-        authorizationCode,
-        callbackState,
-        ...(this.authConfig.scopes?.length ? { scope: this.authConfig.scopes.join(" ") } : {}),
-        ...(this.fetchFn ? { fetchFn: this.fetchFn } : {}),
-      });
-      if (result !== "AUTHORIZED") throw new McpOAuthProviderError(this.serverId, "complete");
-      this.deletePending(pending);
-    } catch {
+    const completed = await captureOAuthAttempt({
+      serverId: this.serverId,
+      operation: "complete",
+      run: () =>
+        auth(this.providerForAttempt(pending), {
+          serverUrl: this.serverUrl,
+          authorizationCode,
+          callbackState,
+          ...(this.authConfig.scopes?.length ? { scope: this.authConfig.scopes.join(" ") } : {}),
+          ...(this.fetchFn ? { fetchFn: this.fetchFn } : {}),
+        }),
+    });
+    if (completed.status === "error" || completed.value !== "AUTHORIZED") {
       if (this.isActive(pending)) pending.status = "pending";
-      throw new McpOAuthProviderError(this.serverId, "complete");
+      return completed.status === "error"
+        ? completed
+        : Result.err(oauthProviderError(this.serverId, "complete"));
     }
+    this.deletePending(pending);
+    return Result.ok();
   }
 
-  private createPendingAuthorization(): PendingAuthorization {
+  async completeAuthorization(authorizationCode: string, callbackState: string): Promise<void> {
+    const completed = await this.completeAuthorizationResult(authorizationCode, callbackState);
+    if (completed.status === "error") throw completed.error;
+  }
+
+  private createPendingAuthorization(): ResultType<PendingAuthorization, McpOAuthProviderError> {
     this.pruneExpiredPending();
     if (this.pending.size >= MAX_PENDING_AUTHORIZATIONS) {
       for (const [state, pending] of this.pending) {
@@ -268,7 +368,7 @@ export class McpOAuthProvider implements OAuthClientProvider {
       }
     }
     if (this.pending.size >= MAX_PENDING_AUTHORIZATIONS) {
-      throw new McpOAuthProviderError(this.serverId, "start");
+      return Result.err(oauthProviderError(this.serverId, "start"));
     }
 
     let state: string;
@@ -277,7 +377,7 @@ export class McpOAuthProvider implements OAuthClientProvider {
     } while (this.pending.has(state));
     const pending: PendingAuthorization = { state, createdAt: this.now(), status: "starting" };
     this.pending.set(state, pending);
-    return pending;
+    return Result.ok(pending);
   }
 
   private providerForAttempt(pending: PendingAuthorization): OAuthClientProvider {
@@ -305,7 +405,7 @@ export class McpOAuthProvider implements OAuthClientProvider {
           pending.authorizationUrl !== undefined ||
           authorizationUrl.searchParams.get("state") !== pending.state
         ) {
-          throw new McpOAuthProviderError(this.serverId, "start");
+          throw oauthProviderError(this.serverId, "start");
         }
         pending.authorizationUrl = authorizationUrl.href;
       },
@@ -316,11 +416,11 @@ export class McpOAuthProvider implements OAuthClientProvider {
       codeVerifier: () => {
         this.assertActive(pending, "complete");
         if (!pending.codeVerifier) {
-          throw new McpOAuthProviderError(this.serverId, "complete");
+          throw oauthProviderError(this.serverId, "complete");
         }
         return pending.codeVerifier;
       },
-      clientInformation: () => this.clientInformationForAuthorization(),
+      clientInformation: () => this.clientInformationForSdkAttempt(),
       saveClientInformation: async (clientInformation: OAuthClientInformation) => {
         this.assertActive(pending, "start");
         await this.updateCredentialForAttempt(pending, "start", (credential) => ({
@@ -342,7 +442,7 @@ export class McpOAuthProvider implements OAuthClientProvider {
       saveState: (state: string) => {
         this.assertActive(pending, "start");
         if (state !== pending.state) {
-          throw new McpOAuthProviderError(this.serverId, "start");
+          throw oauthProviderError(this.serverId, "start");
         }
       },
       storedState: () => pending.state,
@@ -358,7 +458,7 @@ export class McpOAuthProvider implements OAuthClientProvider {
   }
 
   private assertActive(pending: PendingAuthorization, operation: "start" | "complete"): void {
-    if (!this.isActive(pending)) throw new McpOAuthProviderError(this.serverId, operation);
+    if (!this.isActive(pending)) throw oauthProviderError(this.serverId, operation);
   }
 
   private deletePending(pending: PendingAuthorization): void {
@@ -484,7 +584,7 @@ export class McpOAuthProviderService {
     }
   }
 
-  getProvider(serverId: string): OAuthClientProvider | undefined {
+  getProvider(serverId: string): McpOAuthProvider | undefined {
     return this.providers.get(serverId)?.provider;
   }
 
@@ -496,9 +596,17 @@ export class McpOAuthProviderService {
   }
 
   async startAuthorization(serverId: string): Promise<McpOAuthStartResult> {
+    const started = await this.startAuthorizationResult(serverId);
+    if (started.status === "error") throw started.error;
+    return started.value;
+  }
+
+  async startAuthorizationResult(
+    serverId: string,
+  ): Promise<ResultType<McpOAuthStartResult, McpOAuthProviderError>> {
     const provider = this.providers.get(serverId)?.provider;
-    if (!provider) throw new McpOAuthProviderError(serverId, "start");
-    return await provider.startAuthorization();
+    if (!provider) return Result.err(oauthProviderError(serverId, "start"));
+    return await provider.startAuthorizationResult();
   }
 }
 

@@ -1,7 +1,10 @@
 import { describe, expect, it } from "bun:test";
 
+import { Panic } from "better-result";
+
 import {
   createThreadMaterializer,
+  ThreadMaterializerOperationFailed,
   type ThreadMaterializerScheduler,
 } from "../../src/conversation/thread-materializer";
 import type { ConversationThreadRepairKind } from "../../src/conversation/thread-store";
@@ -200,12 +203,16 @@ describe("conversation thread materializer coalescer", () => {
   it("continues draining after a repair error", async () => {
     const failures: unknown[] = [];
     const repairs: string[] = [];
+    const failure = new ThreadMaterializerOperationFailed({
+      operation: "repair-channel",
+      message: "failed a",
+    });
     const materializer = createThreadMaterializer({
       schedule: manualScheduler().schedule,
       listChannelIds: async () => [],
       async repairChannel({ channelId }) {
         repairs.push(channelId);
-        if (channelId === "a") throw new Error("failed a");
+        if (channelId === "a") throw failure;
       },
       onError(error) {
         failures.push(error);
@@ -217,6 +224,48 @@ describe("conversation thread materializer coalescer", () => {
     await materializer.flush();
 
     expect(repairs).toEqual(["a", "b"]);
-    expect(failures).toHaveLength(1);
+    expect(failures).toEqual([failure]);
+  });
+
+  it("preserves repair Panic identity", async () => {
+    const panic = new Panic({ message: "repair invariant failed" });
+    const materializer = createThreadMaterializer({
+      schedule: manualScheduler().schedule,
+      listChannelIds: async () => [],
+      async repairChannel() {
+        throw panic;
+      },
+    });
+
+    materializer.markDirty({ channelId: "a", kind: "topology" });
+    await expect(materializer.flush()).rejects.toBe(panic);
+  });
+
+  it("propagates an unowned repair defect with exact identity", async () => {
+    const defect = new Error("repair callback defect");
+    const materializer = createThreadMaterializer({
+      schedule: manualScheduler().schedule,
+      listChannelIds: async () => [],
+      async repairChannel() {
+        throw defect;
+      },
+    });
+
+    materializer.markDirty({ channelId: "a", kind: "topology" });
+    await expect(materializer.flush()).rejects.toBe(defect);
+  });
+
+  it("preserves channel listing Panic identity", async () => {
+    const panic = new Panic({ message: "channel listing invariant failed" });
+    const materializer = createThreadMaterializer({
+      schedule: manualScheduler().schedule,
+      listChannelIds: async () => {
+        throw panic;
+      },
+      async repairChannel() {},
+    });
+
+    materializer.markAllDirty();
+    await expect(materializer.flush()).rejects.toBe(panic);
   });
 });

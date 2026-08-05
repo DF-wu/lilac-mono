@@ -1,7 +1,9 @@
 import { afterEach, describe, expect, it } from "bun:test";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
+
+import { Result, TaggedError } from "better-result";
 
 import {
   McpOAuthCallbackService,
@@ -22,6 +24,12 @@ import { McpManagement } from "../../src/tool-server/tools/mcp";
 import { ToolInputValidationError } from "../../src/tool-server/validation-error-message";
 
 const temporaryDirectories: string[] = [];
+
+async function readConfigValue(configPath: string) {
+  const result = await readMcpConfigFile(configPath);
+  if (result.status === "error") throw new Error(result.error.message);
+  return result.value;
+}
 
 function deferred<T>(): {
   readonly promise: Promise<T>;
@@ -57,21 +65,24 @@ class RecordingRegistry implements McpRegistryApi {
 
   async init(): Promise<void> {}
 
-  waitUntilInitialized(): Promise<void> {
-    return this.waitUntilInitializedImpl();
+  async waitUntilInitialized() {
+    await this.waitUntilInitializedImpl();
+    return Result.ok(undefined);
   }
 
-  async reload(serverId?: string): Promise<readonly McpReloadOutcome[]> {
+  async reload(serverId?: string) {
     this.reloadCalls.push(serverId);
-    return this.reloadOutcomes.length > 0
-      ? this.reloadOutcomes
-      : [
-          {
-            serverId: serverId ?? "all",
-            reconciliation: "unchanged",
-            result: "retained",
-          },
-        ];
+    const outcomes =
+      this.reloadOutcomes.length > 0
+        ? this.reloadOutcomes
+        : [
+            {
+              serverId: serverId ?? "all",
+              reconciliation: "unchanged" as const,
+              result: "retained" as const,
+            },
+          ];
+    return Result.ok(outcomes);
   }
 
   list(): readonly McpServerStatus[] {
@@ -210,9 +221,7 @@ describe("MCP management calls", () => {
         },
       ],
     });
-    expect(
-      (await readMcpConfigFile(setup.configPath)).config.servers.docs?.transportConfig,
-    ).toEqual({
+    expect((await readConfigValue(setup.configPath)).config.servers.docs?.transportConfig).toEqual({
       transport: "http",
       url: "https://mcp.example.test/service",
       headers: {},
@@ -253,7 +262,7 @@ describe("MCP management calls", () => {
         },
       ],
     });
-    expect((await readMcpConfigFile(setup.configPath)).config.servers).toEqual({});
+    expect((await readConfigValue(setup.configPath)).config.servers).toEqual({});
 
     expect(setup.providers.reconciledConfigs).toHaveLength(3);
     expect(setup.registry.reloadCalls).toEqual(["docs", undefined, "docs"]);
@@ -275,15 +284,15 @@ describe("MCP management calls", () => {
     expect(unchanged).toMatchObject({
       mutation: { changed: false, result: "unchanged" },
     });
-    expect(
-      (await readMcpConfigFile(setup.configPath)).config.servers.local?.transportConfig,
-    ).toEqual({
-      transport: "stdio",
-      command: "bun",
-      args: ["run", "server.ts"],
-      cwd: "/workspace",
-      env: { TOKEN: { env: "MCP_TOKEN" } },
-    });
+    expect((await readConfigValue(setup.configPath)).config.servers.local?.transportConfig).toEqual(
+      {
+        transport: "stdio",
+        command: "bun",
+        args: ["run", "server.ts"],
+        cwd: "/workspace",
+        env: { TOKEN: { env: "MCP_TOKEN" } },
+      },
+    );
 
     await setup.tool.call("mcp.remove", { serverId: "missing" });
     expect(setup.providers.reconciledConfigs).toHaveLength(3);
@@ -329,7 +338,7 @@ describe("MCP management calls", () => {
     });
     await waitStarted.promise;
 
-    expect(Object.keys((await readMcpConfigFile(setup.configPath)).config.servers)).toEqual([
+    expect(Object.keys((await readConfigValue(setup.configPath)).config.servers)).toEqual([
       "deferred",
     ]);
     expect(setup.providers.reconciledConfigs).toHaveLength(0);
@@ -461,6 +470,33 @@ describe("MCP management calls", () => {
     );
     expect(setup.providers.reconciledConfigs).toHaveLength(0);
     expect(setup.registry.reloadCalls).toHaveLength(0);
+  });
+
+  it("maps config Results to an ordinary tool failure without leaking internals", async () => {
+    const setup = await createTool();
+    await writeFile(
+      setup.configPath,
+      "configVersion: 1\nservers:\n  bad:\n    transport: websocket\n",
+      "utf8",
+    );
+
+    let failure: unknown;
+    try {
+      await setup.tool.call("mcp.list", {});
+    } catch (error) {
+      failure = error;
+    }
+
+    expect(failure).toBeInstanceOf(Error);
+    expect(TaggedError.is(failure)).toBe(false);
+    expect(failure).not.toHaveProperty("status");
+    expect(failure).not.toHaveProperty("_tag");
+    expect(failure).not.toHaveProperty("cause");
+    expect(JSON.stringify(failure)).toBe("{}");
+    if (failure instanceof Error) {
+      expect(failure.message).toContain("Invalid MCP configuration");
+      expect(failure.message).not.toContain("cause");
+    }
   });
 
   it("retains the OAuth credential file when removing its server", async () => {

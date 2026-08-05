@@ -1,95 +1,186 @@
-import { createLogger, getCoreConfig } from "@stanley2058/lilac-utils";
+import {
+  createLogger,
+  formatTaggedErrorForLog,
+  getCoreConfig,
+  isPanic,
+} from "@stanley2058/lilac-utils";
+import { Panic, Result, TaggedError, type Result as ResultType } from "better-result";
 
 import { createConversationThreadEmbeddingAdapterResolver } from "./thread-embedding";
 import { createSerialJobQueue } from "./thread-job-queue";
+import {
+  decodeThreadSummarizationWorkerRequest,
+  type ThreadSummarizationWorkerRequest,
+  type ThreadSummarizationWorkerResponse,
+} from "./thread-summarization-worker-protocol";
 import { ConversationThreadService } from "./thread-service";
-import type { ConversationThreadRunSummarizationInput } from "./thread-service";
 import { ConversationThreadStore } from "./thread-store";
 import { createDiscordEntityMapper } from "../entity/entity-mapper";
 import { DiscordSurfaceStore } from "../surface/store/discord-surface-store";
 
-type WorkerRequest = {
-  id: string;
-  input: ConversationThreadRunSummarizationInput;
-  searchDbPath: string;
-  surfaceDbPath?: string;
-};
-
 const logger = createLogger({ module: "conversation-thread-worker-isolate" });
 logger.debug("conversation thread summarization worker isolate booted");
 
-function isWorkerRequest(input: unknown): input is WorkerRequest {
-  if (!input || typeof input !== "object") return false;
-  const record = input as Record<string, unknown>;
-  return (
-    typeof record.id === "string" &&
-    typeof record.searchDbPath === "string" &&
-    (!record.surfaceDbPath || typeof record.surfaceDbPath === "string") &&
-    (!record.input || typeof record.input === "object")
-  );
+export type ThreadSummarizationWorkerCleanup = {
+  readonly label: "thread-store" | "surface-store";
+  readonly close: () => void;
+};
+
+export type ThreadSummarizationWorkerCleanupFailure =
+  | {
+      readonly cleanup: ThreadSummarizationWorkerCleanup;
+      readonly kind: "ordinary";
+      readonly message: string;
+    }
+  | {
+      readonly cleanup: ThreadSummarizationWorkerCleanup;
+      readonly kind: "panic";
+      readonly panic: Panic;
+    };
+
+export class ThreadSummarizationWorkerOperationFailed extends TaggedError(
+  "ThreadSummarizationWorkerOperationFailed",
+)<{ readonly message: string }> {}
+
+export function captureThreadSummarizationWorkerOperationFailure(
+  cause: unknown,
+): ThreadSummarizationWorkerOperationFailed | Panic {
+  if (isPanic(cause)) return cause;
+  if (ThreadSummarizationWorkerOperationFailed.is(cause)) return cause;
+  return new Panic({
+    message: "Conversation thread summarization worker defect",
+    cause,
+  });
 }
 
-async function runJob(request: WorkerRequest): Promise<void> {
+export function captureThreadSummarizationWorkerCleanupFailure(
+  cause: unknown,
+): ThreadSummarizationWorkerOperationFailed | Panic {
+  if (isPanic(cause)) return cause;
+  return new ThreadSummarizationWorkerOperationFailed({
+    message: "Conversation thread summarization worker cleanup failed",
+  });
+}
+
+export async function runThreadSummarizationWorkerOperation(params: {
+  readonly run: () => Promise<void>;
+  readonly cleanups: readonly ThreadSummarizationWorkerCleanup[];
+  readonly onCleanupFailure: (failure: ThreadSummarizationWorkerCleanupFailure) => void;
+}): Promise<ResultType<void, ThreadSummarizationWorkerOperationFailed | Panic>> {
+  const operation = await Result.tryPromise({
+    try: params.run,
+    catch: captureThreadSummarizationWorkerOperationFailure,
+  });
+  let cleanupPanic: Panic | null = null;
+
+  for (const cleanup of params.cleanups) {
+    const closed = Result.try({
+      try: cleanup.close,
+      catch: captureThreadSummarizationWorkerCleanupFailure,
+    });
+    if (closed.status === "error") {
+      if (Panic.is(closed.error)) {
+        cleanupPanic ??= closed.error;
+        params.onCleanupFailure({ cleanup, kind: "panic", panic: closed.error });
+      } else {
+        params.onCleanupFailure({
+          cleanup,
+          kind: "ordinary",
+          message: closed.error.message,
+        });
+      }
+    }
+  }
+
+  if (operation.status === "error") return Result.err(operation.error);
+  if (cleanupPanic) return Result.err(cleanupPanic);
+  return Result.ok(undefined);
+}
+
+function respond(response: ThreadSummarizationWorkerResponse): void {
+  postMessage(response);
+}
+
+async function runJob(request: ThreadSummarizationWorkerRequest): Promise<void> {
   const startedAt = Date.now();
   let store: ConversationThreadStore | null = null;
   let surfaceStore: DiscordSurfaceStore | null = null;
-  try {
-    logger.debug("conversation thread summarization worker job started", {
-      jobId: request.id,
-      dryRun: request.input.dryRun === true,
-      force: request.input.force === true,
-      clear: request.input.clear === true,
-      threadId: request.input.threadId,
-      beforeTs: request.input.beforeTs,
-      afterTs: request.input.afterTs,
-      queuedJobs: jobQueue.depth,
-    });
-    const cfg = await getCoreConfig({ forceReload: true });
-    const getEmbeddingAdapter = createConversationThreadEmbeddingAdapterResolver(() =>
-      getCoreConfig(),
-    );
+  const operation = await runThreadSummarizationWorkerOperation({
+    async run() {
+      logger.debug("conversation thread summarization worker job started", {
+        jobId: request.id,
+        dryRun: request.input.dryRun === true,
+        force: request.input.force === true,
+        clear: request.input.clear === true,
+        threadId: request.input.threadId,
+        beforeTs: request.input.beforeTs,
+        afterTs: request.input.afterTs,
+        queuedJobs: jobQueue.depth,
+      });
+      const cfg = await getCoreConfig({ forceReload: true });
+      const getEmbeddingAdapter = createConversationThreadEmbeddingAdapterResolver(() =>
+        getCoreConfig(),
+      );
 
-    store = new ConversationThreadStore(request.searchDbPath, {
-      surfaceDbPath: request.surfaceDbPath,
-      mainAgentUserNames: [cfg.surface.discord.botName],
-    });
-    const entityMapper = request.surfaceDbPath
-      ? (() => {
-          surfaceStore = new DiscordSurfaceStore(request.surfaceDbPath);
-          return createDiscordEntityMapper({ cfg, store: surfaceStore });
-        })()
-      : undefined;
-    const service = new ConversationThreadService({
-      store,
-      getConfig: () => getCoreConfig(),
-      getEmbeddingAdapter,
-      entityMapper,
-    });
-    const result = await service.runSummarization({ ...request.input, jobId: request.id });
-    logger.debug("conversation thread summarization worker job completed", {
+      store = new ConversationThreadStore(request.searchDbPath, {
+        surfaceDbPath: request.surfaceDbPath,
+        mainAgentUserNames: [cfg.surface.discord.botName],
+      });
+      const entityMapper = request.surfaceDbPath
+        ? (() => {
+            surfaceStore = new DiscordSurfaceStore(request.surfaceDbPath);
+            return createDiscordEntityMapper({ cfg, store: surfaceStore });
+          })()
+        : undefined;
+      const service = new ConversationThreadService({
+        store,
+        getConfig: () => getCoreConfig(),
+        getEmbeddingAdapter,
+        entityMapper,
+      });
+      const result = await service.runSummarization({ ...request.input, jobId: request.id });
+      logger.debug("conversation thread summarization worker job completed", {
+        jobId: request.id,
+        durationMs: Date.now() - startedAt,
+        eligible: result.eligible,
+        cleared: result.cleared,
+        summarized: result.summarized,
+        failed: result.failed,
+      });
+      respond({ id: request.id, ok: true, result });
+    },
+    cleanups: [
+      { label: "thread-store", close: () => store?.close() },
+      { label: "surface-store", close: () => surfaceStore?.close() },
+    ],
+    onCleanupFailure(failure) {
+      if (failure.kind === "panic") {
+        logger.error("conversation thread summarization worker cleanup panicked", {
+          jobId: request.id,
+          cleanup: failure.cleanup.label,
+          ...formatTaggedErrorForLog(failure.panic),
+        });
+        return;
+      }
+      logger.error("conversation thread summarization worker cleanup failed", {
+        jobId: request.id,
+        cleanup: failure.cleanup.label,
+        errorMessage: failure.message,
+      });
+    },
+  });
+  if (operation.status === "error") {
+    if (Panic.is(operation.error)) throw operation.error;
+    logger.error("conversation thread summarization worker job failed", {
       jobId: request.id,
       durationMs: Date.now() - startedAt,
-      eligible: result.eligible,
-      cleared: result.cleared,
-      summarized: result.summarized,
-      failed: result.failed,
+      ...formatTaggedErrorForLog(operation.error),
     });
-    postMessage({ id: request.id, ok: true, result });
-  } catch (e) {
-    const error = e instanceof Error ? e.message : String(e);
-    logger.error(
-      "conversation thread summarization worker job failed",
-      { jobId: request.id, durationMs: Date.now() - startedAt },
-      e,
-    );
-    postMessage({ id: request.id, ok: false, error });
-  } finally {
-    store?.close();
-    surfaceStore?.close();
+    respond({ id: request.id, ok: false, error: operation.error.message });
   }
 }
 
-const jobQueue = createSerialJobQueue<WorkerRequest>({
+const jobQueue = createSerialJobQueue<ThreadSummarizationWorkerRequest>({
   run: runJob,
   onIdle() {
     logger.debug("conversation thread summarization worker queue idle");
@@ -97,12 +188,13 @@ const jobQueue = createSerialJobQueue<WorkerRequest>({
 });
 
 self.addEventListener("message", (event: MessageEvent<unknown>) => {
-  const request = event.data;
-  if (!isWorkerRequest(request)) {
-    postMessage({ id: "unknown", ok: false, error: "invalid worker request" });
+  const decoded = decodeThreadSummarizationWorkerRequest(event.data);
+  if (decoded.status === "error") {
+    respond({ id: "unknown", ok: false, error: "invalid worker request" });
     return;
   }
 
+  const request = decoded.value;
   jobQueue.enqueue(request);
   logger.debug("conversation thread summarization worker job enqueued", {
     jobId: request.id,

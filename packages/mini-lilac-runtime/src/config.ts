@@ -1,16 +1,13 @@
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 
-import { LEVEL1_TOOL_NAMES } from "@stanley2058/lilac-coding-tools";
+import { Result, TaggedError, type Panic, type Result as ResultType } from "better-result";
 import { z } from "zod";
 
-const KNOWN_TOOL_NAMES: ReadonlySet<string> = new Set([
-  ...LEVEL1_TOOL_NAMES,
-  "skill",
-  "todowrite",
-  "webfetch",
-  "websearch",
-]);
+import { MINI_LILAC_EXECUTABLE_TOOL_NAMES } from "@stanley2058/mini-lilac-client";
+import { isPanic } from "@stanley2058/lilac-utils";
+
+const KNOWN_TOOL_NAMES: ReadonlySet<string> = new Set(MINI_LILAC_EXECUTABLE_TOOL_NAMES);
 
 export const slugSchema = z
   .string()
@@ -141,38 +138,144 @@ export type LoadRuntimeConfigOptions = {
   env?: Readonly<Record<string, string | undefined>>;
 };
 
-function parseYaml(source: string, file: string): unknown {
+export class RuntimeConfigReadFailed extends TaggedError("RuntimeConfigReadFailed")<{
+  readonly configFile: string;
+  readonly message: string;
+}> {}
+
+export class RuntimeConfigYamlInvalid extends TaggedError("RuntimeConfigYamlInvalid")<{
+  readonly configFile: string;
+  readonly message: string;
+}> {}
+
+export class RuntimeConfigInvalid extends TaggedError("RuntimeConfigInvalid")<{
+  readonly configFile: string;
+  readonly issues: readonly string[];
+  readonly message: string;
+}> {}
+
+export class RuntimeConfigAuthTokenMissing extends TaggedError("RuntimeConfigAuthTokenMissing")<{
+  readonly environmentVariable: string;
+  readonly message: string;
+}> {}
+
+export type LoadRuntimeConfigError =
+  | RuntimeConfigReadFailed
+  | RuntimeConfigYamlInvalid
+  | RuntimeConfigInvalid
+  | RuntimeConfigAuthTokenMissing;
+
+type RuntimeConfigCapture<T, E> =
+  | { readonly status: "ok"; readonly value: T }
+  | { readonly status: "error"; readonly error: E }
+  | { readonly status: "panic"; readonly panic: Panic };
+
+function throwRuntimeConfigPanic(panic: Panic): never {
+  throw panic;
+}
+
+function captureRuntimeConfigYaml(
+  source: string,
+  configFile: string,
+): RuntimeConfigCapture<RuntimeConfig, RuntimeConfigYamlInvalid | RuntimeConfigInvalid> {
   try {
-    return Bun.YAML.parse(source) as unknown;
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    throw new Error(`Failed to parse YAML file '${file}': ${message}`, { cause: error });
+    const decoded = decodeRuntimeConfig(Bun.YAML.parse(source), configFile);
+    if (decoded.status === "error") return { status: "error", error: decoded.error };
+    return { status: "ok", value: decoded.value };
+  } catch (cause) {
+    if (isPanic(cause)) return { status: "panic", panic: cause };
+    return {
+      status: "error",
+      error: new RuntimeConfigYamlInvalid({
+        configFile,
+        message: `Failed to parse YAML file '${configFile}'`,
+      }),
+    };
   }
 }
 
-export async function loadRuntimeConfig(
+async function captureRuntimeConfigRead(
+  configFile: string,
+): Promise<RuntimeConfigCapture<string, RuntimeConfigReadFailed>> {
+  try {
+    return { status: "ok", value: await readFile(configFile, "utf8") };
+  } catch (cause) {
+    if (isPanic(cause)) return { status: "panic", panic: cause };
+    return {
+      status: "error",
+      error: new RuntimeConfigReadFailed({
+        configFile,
+        message: `Failed to read runtime config '${configFile}'`,
+      }),
+    };
+  }
+}
+
+export function decodeRuntimeConfig(
+  input: unknown,
+  configFile: string,
+): ResultType<RuntimeConfig, RuntimeConfigInvalid> {
+  const decoded = runtimeConfigSchema.safeParse(input);
+  if (decoded.success) return Result.ok(decoded.data);
+  return Result.err(
+    new RuntimeConfigInvalid({
+      configFile,
+      issues: decoded.error.issues.map((issue) => issue.message),
+      message: `Runtime config '${configFile}' is invalid: ${z.prettifyError(decoded.error)}`,
+    }),
+  );
+}
+
+export function decodeRuntimeConfigYaml(
+  source: string,
+  configFile: string,
+): ResultType<RuntimeConfig, RuntimeConfigYamlInvalid | RuntimeConfigInvalid> {
+  const captured = captureRuntimeConfigYaml(source, configFile);
+  if (captured.status === "panic") return throwRuntimeConfigPanic(captured.panic);
+  if (captured.status === "error") return Result.err(captured.error);
+  return Result.ok(captured.value);
+}
+
+export async function loadRuntimeConfigResult(
   configFile: string,
   options: LoadRuntimeConfigOptions = {},
-): Promise<LoadedRuntimeConfig> {
+): Promise<ResultType<LoadedRuntimeConfig, LoadRuntimeConfigError>> {
   const absoluteConfigFile = path.resolve(configFile);
-  const source = await readFile(absoluteConfigFile, "utf8");
-  const config = runtimeConfigSchema.parse(parseYaml(source, absoluteConfigFile));
+  const source = await captureRuntimeConfigRead(absoluteConfigFile);
+  if (source.status === "panic") return throwRuntimeConfigPanic(source.panic);
+  if (source.status === "error") return Result.err(source.error);
+  const decoded = decodeRuntimeConfigYaml(source.value, absoluteConfigFile);
+  if (decoded.status === "error") return Result.err(decoded.error);
+  const config = decoded.value;
   const env = options.env ?? process.env;
 
   if (config.server.authTokenEnv) {
     const token = env[config.server.authTokenEnv];
     if (!token?.trim()) {
-      throw new Error(
-        `Server auth token environment variable '${config.server.authTokenEnv}' is missing or empty`,
+      return Result.err(
+        new RuntimeConfigAuthTokenMissing({
+          environmentVariable: config.server.authTokenEnv,
+          message: `Server auth token environment variable '${config.server.authTokenEnv}' is missing or empty`,
+        }),
       );
     }
   }
 
   const configDirectory = path.dirname(absoluteConfigFile);
-  return {
+  return Result.ok({
     ...config,
     configFile: absoluteConfigFile,
     providerConfigFile: path.resolve(configDirectory, config.providerConfigFile),
     providerAuthFile: path.resolve(configDirectory, config.providerAuthFile),
-  };
+  });
+}
+
+/** Compatibility adapter for callers that consume startup failures as rejections. */
+export async function loadRuntimeConfig(
+  configFile: string,
+  options: LoadRuntimeConfigOptions = {},
+): Promise<LoadedRuntimeConfig> {
+  const loaded = await loadRuntimeConfigResult(configFile, options);
+  if (loaded.status === "error") throw loaded.error;
+  return loaded.value;
 }

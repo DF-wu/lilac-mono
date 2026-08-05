@@ -1,6 +1,7 @@
 export * from "./catalog-identity";
 export * from "./catalog";
 export * from "./config-file";
+export * from "./error-format";
 export * from "./config-types";
 export * from "./config";
 export * from "./credential-file";

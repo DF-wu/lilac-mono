@@ -1,8 +1,6 @@
 import type { ModelMessage } from "ai";
 
-function isPlainObject(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
+import { isRecord } from "./runtime-utils";
 
 function stripTrailingJsonSeparator(text: string): string {
   return text.replace(/[,:]\s*$/u, "");
@@ -95,7 +93,7 @@ function repairTruncatedJson(text: string): string | null {
 function parsePlainObjectJson(text: string): Record<string, unknown> | null {
   try {
     const parsed = globalThis.JSON.parse(text) as unknown;
-    return isPlainObject(parsed) ? parsed : null;
+    return isRecord(parsed) ? parsed : null;
   } catch {
     return null;
   }

@@ -10,16 +10,34 @@ import { z } from "zod";
 import { fileTypeFromBuffer } from "file-type";
 import { google, type GoogleLanguageModelOptions } from "@ai-sdk/google";
 import {
+  defineServerTool,
+  type ServerTool,
+  type ServerToolCallOptions,
+} from "@stanley2058/lilac-plugin-runtime";
+import {
   createLogger,
+  errorMessage,
   extractAiErrorLogDetails,
   providers,
   type CoreConfig,
 } from "@stanley2058/lilac-utils";
 import { extname } from "node:path";
+import { Result, TaggedError, type Result as ResultType } from "better-result";
 
-import type { ServerTool } from "../types";
-import type { RequestContext } from "../types";
-import { zodObjectToCliLines } from "./zod-cli";
+class ContentInspectFailure extends TaggedError("ContentInspectFailure")<{
+  readonly message: string;
+}> {}
+
+function adaptContentInspectResultToToolHost<TValue>(
+  result: ResultType<TValue, ContentInspectFailure>,
+): TValue {
+  if (result.status === "ok") return result.value;
+  throw new Error(result.error.message);
+}
+
+function signalContentInspectFailureToToolHost(message: string): never {
+  return adaptContentInspectResultToToolHost(Result.err(new ContentInspectFailure({ message })));
+}
 
 const V2_CONTENT_INSPECT_DEFAULT_MODEL = "google/gemini-3.5-flash";
 export const CONTENT_INSPECT_MAX_SOURCE_BYTES = 25 * 1024 * 1024;
@@ -99,46 +117,58 @@ export type LoadedInspectSource =
     };
 
 export class ContentInspect implements ServerTool {
-  id = "content.inspect";
+  private readonly tool: ServerTool;
 
-  constructor(private readonly options: ContentInspectOptions = {}) {}
+  constructor(private readonly options: ContentInspectOptions = {}) {
+    this.tool = defineServerTool({
+      id: "content.inspect",
+      callables: ({ callable }) => ({
+        "content.inspect": callable({
+          name: "Inspect Content",
+          description:
+            "Inspect, transcribe, and summarize text, URLs, files, images, and videos using Gemini AI. Use --help to see all options.",
+          inputSchema: contentInspectInputSchema,
+          validation: "zod",
+          primaryPositional: "text",
+          cli: {
+            shortInput: [
+              "--text=<string> OR --url=<string> OR --path=<string> OR --base64=<base64>",
+            ],
+          },
+          run: (payload, opts) => this.inspect(payload, opts),
+        }),
+      }),
+    });
+  }
+
+  get id(): string {
+    return this.tool.id;
+  }
 
   init(): Promise<void> {
-    return Promise.resolve();
+    return this.tool.init();
   }
 
   destroy(): Promise<void> {
-    return Promise.resolve();
+    return this.tool.destroy();
   }
 
-  async list() {
-    return [
-      {
-        callableId: "content.inspect",
-        name: "Inspect Content",
-        description:
-          "Inspect, transcribe, and summarize text, URLs, files, images, and videos using Gemini AI. Use --help to see all options.",
-        shortInput: ["--text=<string> OR --url=<string> OR --path=<string> OR --base64=<base64>"],
-        primaryPositional: {
-          field: "text",
-        },
-        input: zodObjectToCliLines(contentInspectInputSchema),
-      },
-    ];
+  list() {
+    return this.tool.list();
   }
 
-  async call(
+  call(
     callableId: string,
     input: Record<string, unknown>,
-    opts?: {
-      signal?: AbortSignal;
-      context?: RequestContext;
-      messages?: readonly unknown[];
-    },
+    opts?: ServerToolCallOptions,
   ): Promise<unknown> {
-    if (callableId !== "content.inspect") throw new Error("Invalid callable ID");
+    return this.tool.call(callableId, input, opts);
+  }
 
-    const payload = contentInspectInputSchema.parse(input);
+  private async inspect(
+    payload: z.output<typeof contentInspectInputSchema>,
+    opts: ServerToolCallOptions | undefined,
+  ) {
     try {
       const model = await resolveContentInspectModel(this.options.getConfig);
       const text = await inspectContent(payload, {
@@ -153,7 +183,7 @@ export class ContentInspect implements ServerTool {
       logger.error("content.inspect failed", { ...extractAiErrorLogDetails(e) }, e);
       return {
         isError: true,
-        error: e instanceof Error ? e.message : String(e),
+        error: errorMessage(e),
       } as const;
     }
   }
@@ -372,7 +402,7 @@ export async function inspectContent(
   }
 
   const gateway = providers.vercel;
-  if (!gateway) throw new Error("AI-GATEWAY not configured");
+  if (!gateway) signalContentInspectFailureToToolHost("AI-GATEWAY not configured");
 
   const res = await generateText({
     model: gateway(model ?? V2_CONTENT_INSPECT_DEFAULT_MODEL),
@@ -417,7 +447,9 @@ export async function loadInspectSource(
 
     const res = await fetch(input.url, { signal: abortSignal });
     if (!res.ok) {
-      throw new Error(`Failed to fetch ${input.url}: ${res.status} ${res.statusText}`.trim());
+      signalContentInspectFailureToToolHost(
+        `Failed to fetch ${input.url}: ${res.status} ${res.statusText}`.trim(),
+      );
     }
 
     const bytes = await readInspectResponseBytes(res);
@@ -440,7 +472,7 @@ export async function loadInspectSource(
   if (typeof input.path === "string") {
     const file = Bun.file(input.path);
     if (file.size > CONTENT_INSPECT_MAX_SOURCE_BYTES) {
-      throw new Error(
+      signalContentInspectFailureToToolHost(
         `Content inspect source exceeds ${CONTENT_INSPECT_MAX_SOURCE_BYTES} bytes: ${input.path}`,
       );
     }
@@ -463,12 +495,14 @@ export async function loadInspectSource(
   }
 
   if (typeof input.base64 !== "string") {
-    throw new Error("Invalid binary input; expected base64 string");
+    signalContentInspectFailureToToolHost("Invalid binary input; expected base64 string");
   }
 
   const buf = Buffer.from(input.base64, "base64");
   if (buf.byteLength > CONTENT_INSPECT_MAX_SOURCE_BYTES) {
-    throw new Error(`Content inspect source exceeds ${CONTENT_INSPECT_MAX_SOURCE_BYTES} bytes`);
+    signalContentInspectFailureToToolHost(
+      `Content inspect source exceeds ${CONTENT_INSPECT_MAX_SOURCE_BYTES} bytes`,
+    );
   }
   const meta = await fileTypeFromBuffer(buf);
   const mediaType = resolveInspectMediaType({
@@ -485,7 +519,9 @@ async function readInspectResponseBytes(response: Response): Promise<Uint8Array>
     const parsed = Number(declaredLength);
     if (Number.isFinite(parsed) && parsed > CONTENT_INSPECT_MAX_SOURCE_BYTES) {
       await response.body?.cancel().catch(() => undefined);
-      throw new Error(`Content inspect source exceeds ${CONTENT_INSPECT_MAX_SOURCE_BYTES} bytes`);
+      signalContentInspectFailureToToolHost(
+        `Content inspect source exceeds ${CONTENT_INSPECT_MAX_SOURCE_BYTES} bytes`,
+      );
     }
   }
   if (!response.body) return new Uint8Array();
@@ -500,7 +536,9 @@ async function readInspectResponseBytes(response: Response): Promise<Uint8Array>
       total += chunk.value.byteLength;
       if (total > CONTENT_INSPECT_MAX_SOURCE_BYTES) {
         await reader.cancel();
-        throw new Error(`Content inspect source exceeds ${CONTENT_INSPECT_MAX_SOURCE_BYTES} bytes`);
+        signalContentInspectFailureToToolHost(
+          `Content inspect source exceeds ${CONTENT_INSPECT_MAX_SOURCE_BYTES} bytes`,
+        );
       }
       chunks.push(chunk.value);
     }
@@ -534,7 +572,7 @@ function sourceFromBytes(input: {
   }
 
   if (input.mediaType === "application/octet-stream") {
-    throw new Error(
+    signalContentInspectFailureToToolHost(
       `Unsupported or unknown file media type for ${input.source}; pass text via --text or use a supported image/PDF/video file.`,
     );
   }
@@ -638,17 +676,15 @@ function decodeInspectText(bytes: Uint8Array, charset: string | undefined): stri
   try {
     return new TextDecoder(encoding, { fatal: true }).decode(bytes);
   } catch (e) {
-    const message = e instanceof Error ? e.message : String(e);
-    throw new Error(`Failed to decode text content as ${encoding}: ${message}`);
+    const message = errorMessage(e);
+    return signalContentInspectFailureToToolHost(
+      `Failed to decode text content as ${encoding}: ${message}`,
+    );
   }
 }
 
 function urlSafePath(source: string): string {
-  try {
-    return new URL(source).pathname;
-  } catch {
-    return source;
-  }
+  return URL.canParse(source) ? new URL(source).pathname : source;
 }
 
 function isYouTubeURL(url: string) {

@@ -1,5 +1,6 @@
 import { Colors, EmbedBuilder, type Message, type MessageEditOptions } from "discord.js";
 import { setTimeout } from "node:timers/promises";
+import { Result, TaggedError, type Result as ResultType } from "better-result";
 
 import { chunkMarkdownForEmbeds } from "./markdown-chunker";
 
@@ -17,6 +18,10 @@ const EMBED_COLOR_INCOMPLETE = Colors.Yellow;
 const PROGRESS_FIELD_MAX_CHARS = 1024;
 const PROGRESS_FIELD_TITLE_MAX_CHARS = 256;
 const PROGRESS_ACTION_MAX_LINES = 5;
+
+export class DiscordEmbedPusherInvariant extends TaggedError("DiscordEmbedPusherInvariant")<{
+  readonly message: string;
+}> {}
 
 function clampWithEllipsis(text: string, maxChars: number): string {
   if (maxChars <= 0) return "";
@@ -39,12 +44,10 @@ export function buildProgressFieldValue(input: {
     : [];
   const reasoningRows = input.reasoningValue ? input.reasoningValue.split("\n") : [];
   // Detailed reasoning is a separate product lane and must not consume action-row capacity.
-  const rows =
-    reasoningRows.length > 0 && actionRows.length > 0
-      ? [...reasoningRows, "", ...actionRows]
-      : reasoningRows.length > 0
-        ? reasoningRows
-        : actionRows;
+  let rows = actionRows;
+  if (reasoningRows.length > 0) {
+    rows = actionRows.length > 0 ? [...reasoningRows, "", ...actionRows] : reasoningRows;
+  }
   return rows.length > 0 ? clampWithEllipsis(rows.join("\n"), PROGRESS_FIELD_MAX_CHARS) : "\u200b";
 }
 
@@ -126,11 +129,16 @@ export async function startEmbedPusher(params: {
    * Used for surface controls (e.g. Cancel buttons) that must persist across edits.
    */
   getFirstMessageEditExtras?: (isStreaming: boolean) => Partial<MessageEditOptions>;
-}): Promise<{
-  lastMsg: Message;
-  responseQueue: string[];
-  discordMessageCreated: string[];
-}> {
+}): Promise<
+  ResultType<
+    {
+      lastMsg: Message;
+      responseQueue: string[];
+      discordMessageCreated: string[];
+    },
+    DiscordEmbedPusherInvariant
+  >
+> {
   let streaming = true;
   params.streamDone.then(() => {
     streaming = false;
@@ -293,14 +301,16 @@ export async function startEmbedPusher(params: {
 
   const lastMsg = chunkMessages.at(-1);
   if (!lastMsg) {
-    throw new Error("startEmbedPusher produced no messages");
+    return Result.err(
+      new DiscordEmbedPusherInvariant({ message: "startEmbedPusher produced no messages" }),
+    );
   }
 
-  return {
+  return Result.ok({
     lastMsg,
     responseQueue,
     discordMessageCreated,
-  };
+  });
 }
 
 export function getEmbedPusherConstants() {

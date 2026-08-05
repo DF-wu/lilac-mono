@@ -17,6 +17,7 @@ const pluginManager = createCoreToolPluginManager({
 const server = createToolServer({
   pluginManager,
   logger,
+  reportFatalToolCallDefect: (defect) => handlers.reportFatalError(defect),
   onUnhealthy: async (snapshot) => {
     logger.error("Tool bridge unhealthy; exiting", {
       checks: snapshot.checks.filter((check) => !check.ok),
@@ -25,14 +26,16 @@ const server = createToolServer({
   },
 });
 
+function recordUnhandledRejection(reason: unknown): void {
+  server.recordUnhandledRejection(reason);
+}
+
 const handlers = createProcessHandlers({
   logger,
   stop: async () => {
     await server.stop();
   },
-  recordUnhandledRejection: (reason) => {
-    server.recordUnhandledRejection(reason);
-  },
+  recordUnhandledRejection,
 });
 
 await server.init();
@@ -46,9 +49,7 @@ process.on("SIGTERM", async () => {
   await handlers.handleSignal("SIGTERM");
 });
 
-process.on("unhandledRejection", (reason, promise) => {
-  handlers.handleUnhandledRejection(reason, promise);
-});
+process.on("unhandledRejection", handlers.handleUnhandledRejection);
 
 process.on("uncaughtException", (error) => {
   handlers.handleUncaughtException(error);

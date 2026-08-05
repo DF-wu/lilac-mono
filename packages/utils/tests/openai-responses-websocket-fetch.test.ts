@@ -198,6 +198,34 @@ describe("createOpenAIResponsesWebSocketFetch", () => {
     wsFetch.close();
   });
 
+  it("ignores null, array, and scalar websocket JSON before normalization", async () => {
+    let normalizedEvents = 0;
+    const wsFetch = createOpenAIResponsesWebSocketFetch({
+      mode: "websocket",
+      normalizeEvent: (event) => {
+        normalizedEvents += 1;
+        return event;
+      },
+    });
+    const response = await wsFetch("https://api.openai.com/v1/responses", {
+      method: "POST",
+      body: JSON.stringify({ stream: true, input: "hi" }),
+    });
+    const textPromise = response.text();
+    const socket = FakeWebSocket.instances[0];
+    socket?.emitMessage("null");
+    socket?.emitMessage("[]");
+    socket?.emitMessage('"scalar"');
+    socket?.emitMessage("1");
+    socket?.emitMessage(JSON.stringify({ type: "response.completed" }));
+
+    const text = await textPromise;
+    expect(normalizedEvents).toBe(1);
+    expect(text).toContain('"type":"response.completed"');
+    expect(text).toContain("[DONE]");
+    wsFetch.close();
+  });
+
   it("falls back to HTTP when mode=auto and websocket transport is unavailable", async () => {
     const fallbackCalls: unknown[] = [];
     let fallbackDetails:

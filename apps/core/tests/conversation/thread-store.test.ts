@@ -4,12 +4,16 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { parseCoreConfigV1ToUniversal, type CoreConfig } from "@stanley2058/lilac-utils";
+import { Panic, Result, type Result as ResultType } from "better-result";
 
 import {
   buildThreadSummaryInstructions,
+  createConversationThreadToolService,
+  ConversationThreadOperationFailed,
   ConversationThreadService as RuntimeConversationThreadService,
   ConversationThreadSummaryParseError,
 } from "../../src/conversation/thread-service";
+import { ConversationThreadSummarizationRemoteError } from "../../src/conversation/thread-worker";
 import type { ConversationThreadEmbeddingAdapter } from "../../src/conversation/thread-embedding";
 import {
   classifyConversationThreadMessageUpdate,
@@ -22,7 +26,10 @@ import {
 } from "../../src/surface/store/discord-search-store";
 import { DiscordSurfaceStore } from "../../src/surface/store/discord-surface-store";
 import type { SurfaceMessage } from "../../src/surface/types";
-import { ConversationThread } from "../../src/tool-server/tools/conversation-thread";
+import {
+  ConversationThread,
+  resolveConversationThreadSummarizationToolOperation,
+} from "../../src/tool-server/tools/conversation-thread";
 
 const tmpDirs: string[] = [];
 
@@ -42,6 +49,54 @@ function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void } {
     resolve = done;
   });
   return { promise, resolve };
+}
+
+function okValue<T, E>(result: ResultType<T, E>): T {
+  expect(result.status).toBe("ok");
+  if (result.status === "error") throw new Error("Expected persistence operation to succeed");
+  return result.value;
+}
+
+function readThreadResult(
+  store: ConversationThreadStore,
+  ...args: Parameters<ConversationThreadStore["readThread"]>
+) {
+  return okValue(store.readThread(...args));
+}
+
+function getSummaryResult(
+  store: ConversationThreadStore,
+  ...args: Parameters<ConversationThreadStore["getSummary"]>
+) {
+  return okValue(store.getSummary(...args));
+}
+
+function searchSemanticResult(
+  store: ConversationThreadStore,
+  ...args: Parameters<ConversationThreadStore["searchSemantic"]>
+) {
+  return okValue(store.searchSemantic(...args));
+}
+
+async function serviceSearch(
+  service: RuntimeConversationThreadService,
+  ...args: Parameters<RuntimeConversationThreadService["search"]>
+) {
+  return okValue(await service.search(...args));
+}
+
+async function serviceRead(
+  service: RuntimeConversationThreadService,
+  ...args: Parameters<RuntimeConversationThreadService["read"]>
+) {
+  return okValue(await service.read(...args));
+}
+
+async function serviceMetadata(
+  service: RuntimeConversationThreadService,
+  ...args: Parameters<RuntimeConversationThreadService["metadata"]>
+) {
+  return okValue(await service.metadata(...args));
 }
 
 function testConfig(): CoreConfig {
@@ -307,10 +362,10 @@ describe("conversation thread store", () => {
     const refreshed = threadStore.refreshInferredThreads();
     expect(refreshed.threads).toBe(2);
 
-    const first = threadStore.readThread("discord:channel:c1:m1", 0, 10);
+    const first = readThreadResult(threadStore, "discord:channel:c1:m1", 0, 10);
     expect(first?.messages.map((item) => item.messageId)).toEqual(["m1", "m2"]);
 
-    const second = threadStore.readThread("discord:channel:c1:m3", 0, 10);
+    const second = readThreadResult(threadStore, "discord:channel:c1:m3", 0, 10);
     expect(second?.messages.map((item) => item.messageId)).toEqual(["m3"]);
 
     searchStore.close();
@@ -340,9 +395,9 @@ describe("conversation thread store", () => {
     });
     expect(threadStore.getThread("discord:channel:c1:c1-1")).toBeNull();
     expect(
-      threadStore
-        .readThread("discord:channel:c2:c2-1")
-        ?.messages.map((message) => message.messageId),
+      readThreadResult(threadStore, "discord:channel:c2:c2-1")?.messages.map(
+        (message) => message.messageId,
+      ),
     ).toEqual(["c2-1"]);
 
     searchStore.close();
@@ -376,9 +431,9 @@ describe("conversation thread store", () => {
       embeddings: [{ facet: "title", embedding: new Float32Array([1, 0]) }],
     });
     const summarized = threadStore.getThread(threadId)!;
-    const membershipBefore = threadStore
-      .readThread(threadId)!
-      .messages.map((message) => message.messageId);
+    const membershipBefore = readThreadResult(threadStore, threadId)!.messages.map(
+      (message) => message.messageId,
+    );
 
     searchStore.upsertMessages([
       msg({
@@ -407,10 +462,10 @@ describe("conversation thread store", () => {
       embedding_input_hash: summarized.embedding_input_hash,
     });
     expect(after?.summary_input_hash).toStartWith("dirty:");
-    expect(threadStore.readThread(threadId)!.messages.map((message) => message.messageId)).toEqual(
-      membershipBefore,
-    );
-    expect(threadStore.getSummary(threadId)?.title).toBe("Current summary");
+    expect(
+      readThreadResult(threadStore, threadId)!.messages.map((message) => message.messageId),
+    ).toEqual(membershipBefore);
+    expect(getSummaryResult(threadStore, threadId)?.title).toBe("Current summary");
     expect(
       threadStore.listEligibleForSummarization({
         now: after!.updated_at + 60 * 60 * 1000 - 1,
@@ -492,9 +547,9 @@ describe("conversation thread store", () => {
       msg({ channelId: "c1", messageId: "m3", userId: "u1", text: "not materialized", ts: 3 }),
     ]);
 
-    const read = await service.read({ threadId });
+    const read = await serviceRead(service, { threadId });
     expect(read.messages.map((message) => message.messageId)).toEqual(["m1", "m2"]);
-    const metadata = await service.metadata({ threadIds: [threadId] });
+    const metadata = await serviceMetadata(service, { threadIds: [threadId] });
     expect(metadata.threads[0]?.messageCount).toBe(2);
     expect(threadStore.getThread(threadId)?.message_count).toBe(2);
 
@@ -543,7 +598,7 @@ describe("conversation thread store", () => {
     const result = await running;
     expect(result.summarized).toBe(0);
     expect(result.failed).toBe(0);
-    expect(threadStore.getSummary(threadId)).toBeNull();
+    expect(getSummaryResult(threadStore, threadId)).toBeNull();
     expect(threadStore.getThread(threadId)?.summary_input_hash).toStartWith("dirty:");
 
     searchStore.close();
@@ -572,7 +627,9 @@ describe("conversation thread store", () => {
     const refreshed = threadStore.refreshInferredThreads({ cfg: testConfig() });
     expect(refreshed.threads).toBe(1);
     expect(
-      threadStore.readThread("discord:channel:c1:a", 0, 10)?.messages.map((item) => item.messageId),
+      readThreadResult(threadStore, "discord:channel:c1:a", 0, 10)?.messages.map(
+        (item) => item.messageId,
+      ),
     ).toEqual(["a", "b", "d", "e"]);
 
     searchStore.close();
@@ -596,7 +653,9 @@ describe("conversation thread store", () => {
     const refreshed = threadStore.refreshInferredThreads({ cfg: testConfig() });
     expect(refreshed.threads).toBe(1);
     expect(
-      threadStore.readThread("discord:channel:c1:a", 0, 10)?.messages.map((item) => item.messageId),
+      readThreadResult(threadStore, "discord:channel:c1:a", 0, 10)?.messages.map(
+        (item) => item.messageId,
+      ),
     ).toEqual(["a", "b", "c", "d", "e"]);
 
     searchStore.close();
@@ -620,13 +679,19 @@ describe("conversation thread store", () => {
     const refreshed = threadStore.refreshInferredThreads({ cfg: testConfig() });
     expect(refreshed.threads).toBe(3);
     expect(
-      threadStore.readThread("discord:channel:c1:a", 0, 10)?.messages.map((item) => item.messageId),
+      readThreadResult(threadStore, "discord:channel:c1:a", 0, 10)?.messages.map(
+        (item) => item.messageId,
+      ),
     ).toEqual(["a", "b"]);
     expect(
-      threadStore.readThread("discord:channel:c1:c", 0, 10)?.messages.map((item) => item.messageId),
+      readThreadResult(threadStore, "discord:channel:c1:c", 0, 10)?.messages.map(
+        (item) => item.messageId,
+      ),
     ).toEqual(["c", "d"]);
     expect(
-      threadStore.readThread("discord:channel:c1:e", 0, 10)?.messages.map((item) => item.messageId),
+      readThreadResult(threadStore, "discord:channel:c1:e", 0, 10)?.messages.map(
+        (item) => item.messageId,
+      ),
     ).toEqual(["e"]);
 
     searchStore.close();
@@ -666,10 +731,14 @@ describe("conversation thread store", () => {
     const refreshed = threadStore.refreshInferredThreads({ cfg: testConfig() });
     expect(refreshed.threads).toBe(2);
     expect(
-      threadStore.readThread("discord:channel:c1:a", 0, 10)?.messages.map((item) => item.messageId),
+      readThreadResult(threadStore, "discord:channel:c1:a", 0, 10)?.messages.map(
+        (item) => item.messageId,
+      ),
     ).toEqual(["a", "b"]);
     expect(
-      threadStore.readThread("discord:channel:c1:d", 0, 10)?.messages.map((item) => item.messageId),
+      readThreadResult(threadStore, "discord:channel:c1:d", 0, 10)?.messages.map(
+        (item) => item.messageId,
+      ),
     ).toEqual(["d", "e"]);
 
     searchStore.close();
@@ -703,10 +772,14 @@ describe("conversation thread store", () => {
     const refreshed = threadStore.refreshInferredThreads({ cfg: testConfig() });
     expect(refreshed.threads).toBe(2);
     expect(
-      threadStore.readThread("discord:channel:c1:a", 0, 10)?.messages.map((item) => item.messageId),
+      readThreadResult(threadStore, "discord:channel:c1:a", 0, 10)?.messages.map(
+        (item) => item.messageId,
+      ),
     ).toEqual(["a", "b"]);
     expect(
-      threadStore.readThread("discord:channel:c1:c", 0, 10)?.messages.map((item) => item.messageId),
+      readThreadResult(threadStore, "discord:channel:c1:c", 0, 10)?.messages.map(
+        (item) => item.messageId,
+      ),
     ).toEqual(["c", "d", "e"]);
 
     searchStore.close();
@@ -753,10 +826,14 @@ describe("conversation thread store", () => {
     const refreshed = threadStore.refreshInferredThreads({ cfg: testConfig() });
     expect(refreshed.threads).toBe(2);
     expect(
-      threadStore.readThread("discord:channel:c1:a", 0, 10)?.messages.map((item) => item.messageId),
+      readThreadResult(threadStore, "discord:channel:c1:a", 0, 10)?.messages.map(
+        (item) => item.messageId,
+      ),
     ).toEqual(["a", "b"]);
     expect(
-      threadStore.readThread("discord:channel:c1:c", 0, 10)?.messages.map((item) => item.messageId),
+      readThreadResult(threadStore, "discord:channel:c1:c", 0, 10)?.messages.map(
+        (item) => item.messageId,
+      ),
     ).toEqual(["c"]);
 
     searchStore.close();
@@ -797,7 +874,7 @@ describe("conversation thread store", () => {
     });
 
     await service.runSummarization({ now: Date.now() + 2 * 60 * 60 * 1000 });
-    const read = await service.read({ threadId: "discord:channel:c1:a" });
+    const read = await serviceRead(service, { threadId: "discord:channel:c1:a" });
 
     expect(summarizedTexts).toEqual(["A", "@lilac resume", "!cont=2 literal example"]);
     expect(read.messages.map((message) => message.content)).toEqual([
@@ -875,12 +952,12 @@ describe("conversation thread store", () => {
     const refreshed = threadStore.refreshInferredThreads();
     expect(refreshed.threads).toBe(2);
 
-    const before = threadStore.readThread("discord:channel:c1:m1", 0, 10);
+    const before = readThreadResult(threadStore, "discord:channel:c1:m1", 0, 10);
     expect(before?.messages.map((item) => item.messageId)).toEqual(["m1", "m2"]);
 
-    const after = threadStore.readThread("discord:channel:c1:m3", 0, 10);
+    const after = readThreadResult(threadStore, "discord:channel:c1:m3", 0, 10);
     expect(after?.messages.map((item) => item.messageId)).toEqual(["m3", "m4"]);
-    expect(threadStore.readThread("discord:channel:c1:divider", 0, 10)).toBeNull();
+    expect(readThreadResult(threadStore, "discord:channel:c1:divider", 0, 10)).toBeNull();
 
     searchStore.close();
     surfaceStore.close();
@@ -946,7 +1023,7 @@ describe("conversation thread store", () => {
 
       const eligible = threadStore.listEligibleForSummarization({ now: eligibleNow });
       expect(eligible.map((item) => item.thread.thread_id)).toEqual(["discord:channel:c1:new-1"]);
-      expect(threadStore.readThread("discord:channel:c1:old-1")?.summary?.title).toBe(
+      expect(readThreadResult(threadStore, "discord:channel:c1:old-1")?.summary?.title).toBe(
         "discord:channel:c1:old-1",
       );
     } finally {
@@ -982,8 +1059,8 @@ describe("conversation thread store", () => {
 
     const refreshed = threadStore.refreshInferredThreads();
     expect(refreshed.threads).toBe(1);
-    expect(threadStore.readThread("discord:channel:c1:h1", 0, 10)).toBeNull();
-    expect(threadStore.readThread("discord:channel:c2:a1", 0, 10)?.messages).toHaveLength(2);
+    expect(readThreadResult(threadStore, "discord:channel:c1:h1", 0, 10)).toBeNull();
+    expect(readThreadResult(threadStore, "discord:channel:c2:a1", 0, 10)?.messages).toHaveLength(2);
 
     searchStore.close();
     threadStore.close();
@@ -1153,20 +1230,20 @@ describe("conversation thread store", () => {
     const refreshed = threadStore.refreshInferredThreads();
     expect(refreshed.threads).toBe(4);
 
-    const nativeFirst = threadStore.readThread("discord:channel:th1:t1", 0, 10);
+    const nativeFirst = readThreadResult(threadStore, "discord:channel:th1:t1", 0, 10);
     expect(nativeFirst?.thread.kind).toBe("inferred_channel_thread");
     expect(nativeFirst?.thread.parent_channel_id).toBe("c1");
     expect(nativeFirst?.messages.map((item) => item.messageId)).toEqual(["t1", "t2"]);
 
-    const nativeSecond = threadStore.readThread("discord:channel:th1:t3", 0, 10);
+    const nativeSecond = readThreadResult(threadStore, "discord:channel:th1:t3", 0, 10);
     expect(nativeSecond?.thread.kind).toBe("inferred_channel_thread");
     expect(nativeSecond?.thread.parent_channel_id).toBe("c1");
     expect(nativeSecond?.messages.map((item) => item.messageId)).toEqual(["t3", "t4"]);
 
-    const replied = threadStore.readThread("discord:channel:c1:m1", 0, 10);
+    const replied = readThreadResult(threadStore, "discord:channel:c1:m1", 0, 10);
     expect(replied?.messages.map((item) => item.messageId)).toEqual(["m1", "m2"]);
 
-    const unrelated = threadStore.readThread("discord:channel:c1:m3", 0, 10);
+    const unrelated = readThreadResult(threadStore, "discord:channel:c1:m3", 0, 10);
     expect(unrelated?.messages.map((item) => item.messageId)).toEqual(["m3"]);
 
     const service = new ConversationThreadService({
@@ -1179,7 +1256,7 @@ describe("conversation thread store", () => {
       }),
     });
     await service.runSummarization({ now: Date.now() + 7 * 60 * 60 * 1000 });
-    const allowedByParent = await service.read({ threadId: "discord:channel:th1:t1" });
+    const allowedByParent = await serviceRead(service, { threadId: "discord:channel:th1:t1" });
     expect(allowedByParent.thread.session.parentChannelId).toBe("c1");
 
     searchStore.close();
@@ -1294,11 +1371,11 @@ describe("conversation thread store", () => {
     const refreshed = threadStore.refreshInferredThreads({ cfg });
     expect(refreshed.threads).toBe(2);
 
-    const first = threadStore.readThread("discord:channel:thread-channel:a0", 0, 10);
+    const first = readThreadResult(threadStore, "discord:channel:thread-channel:a0", 0, 10);
     expect(first?.thread.parent_channel_id).toBe("parent-channel");
     expect(first?.messages.map((item) => item.messageId)).toEqual(["a0", "a1", "a2"]);
 
-    const second = threadStore.readThread("discord:channel:thread-channel:b1", 0, 10);
+    const second = readThreadResult(threadStore, "discord:channel:thread-channel:b1", 0, 10);
     expect(second?.thread.parent_channel_id).toBe("parent-channel");
     expect(second?.messages.map((item) => item.messageId)).toEqual(["b1", "b2"]);
 
@@ -1348,12 +1425,31 @@ describe("conversation thread store", () => {
         importanceReasons: ["Captures reusable architecture decisions for conversation retrieval."],
       }),
     });
-    const tool = new ConversationThread({ service });
+    const tool = new ConversationThread({ service: createConversationThreadToolService(service) });
 
     const eligibleNow = Date.now() + 2 * 60 * 60 * 1000;
     const dryRun = await service.runSummarization({ dryRun: true, now: eligibleNow });
     expect(dryRun.eligible).toBe(1);
     expect(dryRun.summarized).toBe(0);
+    expect(
+      await resolveConversationThreadSummarizationToolOperation(Promise.resolve(Result.ok(dryRun))),
+    ).toBe(dryRun);
+
+    const remoteFailure = new ConversationThreadSummarizationRemoteError({
+      jobId: "job-failed",
+      remoteMessage: "provider unavailable",
+      message: "provider unavailable",
+    });
+    const failedToolOperation = resolveConversationThreadSummarizationToolOperation(
+      Promise.resolve(Result.err(remoteFailure)),
+    );
+    await expect(failedToolOperation).rejects.toThrow("provider unavailable");
+    await expect(failedToolOperation).rejects.not.toBe(remoteFailure);
+
+    const panic = new Panic({ message: "summarization invariant failed" });
+    await expect(
+      resolveConversationThreadSummarizationToolOperation(Promise.reject(panic)),
+    ).rejects.toBe(panic);
 
     const run = await service.runSummarization({ now: eligibleNow });
     expect(run.summarized).toBe(1);
@@ -1523,7 +1619,10 @@ describe("conversation thread store", () => {
       getConfig: async () => testConfig(),
       summarizer: async ({ threadId }) => {
         attemptedThreadIds.push(threadId);
-        throw new Error("model rejected request");
+        throw new ConversationThreadOperationFailed({
+          operation: "summarize-thread",
+          message: "model rejected request",
+        });
       },
     });
 
@@ -1564,7 +1663,10 @@ describe("conversation thread store", () => {
       summarizer: async () => {
         started.resolve();
         await release.promise;
-        throw new Error("stale attempt failed");
+        throw new ConversationThreadOperationFailed({
+          operation: "summarize-thread",
+          message: "stale attempt failed",
+        });
       },
     });
     const run = service.runSummarization({ now: Date.now() + 2 * 60 * 60 * 1000 });
@@ -1581,7 +1683,7 @@ describe("conversation thread store", () => {
     threadStore.close();
   });
 
-  it("continues summarization after sqlite busy failures", async () => {
+  it("does not classify SQLite-looking Error text as a driver failure", async () => {
     const dbPath = await createDbPath();
     const searchStore = new DiscordSearchStore(dbPath);
     const threadStore = new ConversationThreadStore(dbPath);
@@ -1617,13 +1719,14 @@ describe("conversation thread store", () => {
     ]);
 
     const attemptedThreadIds: string[] = [];
+    const busyDefect = new Error("SQLITE_BUSY: database is locked");
     const service = new ConversationThreadService({
       store: threadStore,
       getConfig: async () => testConfig(),
       summarizer: async ({ threadId }) => {
         attemptedThreadIds.push(threadId);
         if (threadId === "discord:channel:c1:busy-a1") {
-          throw new Error("SQLITE_BUSY: database is locked");
+          throw busyDefect;
         }
         return {
           title: threadId,
@@ -1634,17 +1737,25 @@ describe("conversation thread store", () => {
       },
     });
 
-    const run = await service.runSummarization({ now: Date.now() + 3 * 60 * 60 * 1000 });
-    expect(run.failed).toBe(1);
-    expect(run.summarized).toBe(1);
-    expect(run.failures[0]?.threadId).toBe("discord:channel:c1:busy-a1");
-    expect(attemptedThreadIds).toEqual([
-      "discord:channel:c1:busy-a1",
-      "discord:channel:c1:busy-b1",
-    ]);
-    expect(threadStore.readThread("discord:channel:c1:busy-b1")?.summary?.title).toBe(
-      "discord:channel:c1:busy-b1",
+    await expect(service.runSummarization({ now: Date.now() + 3 * 60 * 60 * 1000 })).rejects.toBe(
+      busyDefect,
     );
+    expect(attemptedThreadIds).toEqual(["discord:channel:c1:busy-a1"]);
+
+    const panic = new Panic({ message: "thread summarization invariant failed" });
+    const panicService = new ConversationThreadService({
+      store: threadStore,
+      getConfig: async () => testConfig(),
+      summarizer: async () => {
+        throw panic;
+      },
+    });
+    await expect(
+      panicService.runSummarization({
+        threadId: "discord:channel:c1:busy-b1",
+        now: Date.now() + 3 * 60 * 60 * 1000,
+      }),
+    ).rejects.toBe(panic);
 
     searchStore.close();
     threadStore.close();
@@ -1811,6 +1922,7 @@ describe("conversation thread store", () => {
     expect(first.eligibleTotal).toBe(3);
     expect(first.eligibility.summary).toBe(3);
     expect(first.eligibility.embeddingOnly).toBe(0);
+    expect(first.eligibility.reasons).toEqual({ "never-summarized": 3 });
     expect(first.summarized).toBe(2);
 
     const second = await service.runSummarization({ now, limit: 2, trigger: "periodic" });
@@ -1871,7 +1983,9 @@ describe("conversation thread store", () => {
     expect(run.summarized).toBe(threadCount);
     for (let index = 0; index < threadCount; index++) {
       const threadId = `discord:channel:c1:scheduled-${index}-1`;
-      expect(threadStore.readThread(threadId)?.summary?.title).toBe(`Summary for ${threadId}`);
+      expect(readThreadResult(threadStore, threadId)?.summary?.title).toBe(
+        `Summary for ${threadId}`,
+      );
     }
 
     searchStore.close();
@@ -2041,7 +2155,7 @@ describe("conversation thread store", () => {
       getConfig: async () => testConfig(),
     });
 
-    const result = await service.search({ query: "needle", limit: 2, mode: "lexical" });
+    const result = await serviceSearch(service, { query: "needle", limit: 2, mode: "lexical" });
     expect(result.results.map((item) => item.threadId)).toEqual([
       "discord:channel:c1:high",
       "discord:channel:c1:low",
@@ -2092,10 +2206,10 @@ describe("conversation thread store", () => {
       getConfig: async () => testConfig(),
     });
 
-    const result = await service.search({ query: "job rant", mode: "lexical" });
+    const result = await serviceSearch(service, { query: "job rant", mode: "lexical" });
     expect(result.results[0]?.threadId).toBe("discord:channel:c1:r1");
 
-    const aboutnessResult = await service.search({
+    const aboutnessResult = await serviceSearch(service, {
       query: "day job",
       mode: "lexical",
       verbose: true,
@@ -2150,14 +2264,18 @@ describe("conversation thread store", () => {
       getConfig: async () => testConfig(),
     });
 
-    const compact = await service.search({ query: ["alpha", "beta"], mode: "lexical", limit: 2 });
+    const compact = await serviceSearch(service, {
+      query: ["alpha", "beta"],
+      mode: "lexical",
+      limit: 2,
+    });
     expect(compact.results.map((item) => item.title)).toEqual([
       "Two query match",
       "One query match",
     ]);
     expect(compact.results[0]).not.toHaveProperty("queryAttribution");
 
-    const verbose = await service.search({
+    const verbose = await serviceSearch(service, {
       query: ["alpha", "beta"],
       mode: "lexical",
       limit: 2,
@@ -2195,7 +2313,7 @@ describe("conversation thread store", () => {
       },
     ]);
 
-    const thresholded = await service.search({
+    const thresholded = await serviceSearch(service, {
       query: ["alpha", "beta"],
       mode: "lexical",
       limit: 2,
@@ -2288,7 +2406,7 @@ describe("conversation thread store", () => {
     });
 
     await service.runSummarization({ now: Date.now() + 2 * 60 * 60 * 1000 });
-    const result = await service.search({
+    const result = await serviceSearch(service, {
       query: ["employee complaining about their day job", "employee venting about work stress"],
       mode: "hybrid",
       limit: 2,
@@ -2351,7 +2469,7 @@ describe("conversation thread store", () => {
     });
 
     await service.runSummarization({ now: Date.now() + 2 * 60 * 60 * 1000 });
-    const u1OrU2 = await service.search({
+    const u1OrU2 = await serviceSearch(service, {
       query: "shared topic",
       mode: "lexical",
       limit: 10,
@@ -2359,7 +2477,7 @@ describe("conversation thread store", () => {
     });
     expect(u1OrU2.results.map((item) => item.title)).toEqual(["Thread with u1 and u2"]);
 
-    const u2OrU3 = await service.search({
+    const u2OrU3 = await serviceSearch(service, {
       query: "shared topic",
       mode: "lexical",
       limit: 10,
@@ -2370,7 +2488,7 @@ describe("conversation thread store", () => {
       "Thread with u3 and u4",
     ]);
 
-    const unrelated = await service.search({
+    const unrelated = await serviceSearch(service, {
       query: "shared topic",
       mode: "lexical",
       limit: 10,
@@ -2423,10 +2541,12 @@ describe("conversation thread store", () => {
     });
 
     await service.runSummarization({ now: Date.now() + 2 * 60 * 60 * 1000 });
-    const plan = await service.planAutoInjectSearch({
-      text: "Long message about precomputed topic",
-    });
-    const result = await service.search({
+    const plan = okValue(
+      await service.planAutoInjectSearch({
+        text: "Long message about precomputed topic",
+      }),
+    );
+    const result = await serviceSearch(service, {
       query: plan.searches[0]!.queries,
       queryAboutness: plan.searches[0]!.aboutness,
       verbose: true,
@@ -2467,7 +2587,9 @@ describe("conversation thread store", () => {
       }),
     });
 
-    const plan = await service.planAutoInjectSearch({ text: "Long message with many facets" });
+    const plan = okValue(
+      await service.planAutoInjectSearch({ text: "Long message with many facets" }),
+    );
 
     expect(plan.searches).toHaveLength(3);
     expect(plan.searches[0]?.queries).toEqual(["one", "one alias", "one exact"]);
@@ -2515,7 +2637,10 @@ describe("conversation thread store", () => {
       getConfig: async () => testConfig(),
       getEmbeddingAdapter: async () => equalEmbeddingAdapter,
       queryAboutnessSummarizer: async () => {
-        throw new Error("query capture unavailable");
+        throw new ConversationThreadOperationFailed({
+          operation: "capture-query-aboutness",
+          message: "query capture unavailable",
+        });
       },
       summarizer: async ({ threadId }) => ({
         title: threadId.endsWith(":fb-3") ? "Newer fallback" : "Older fallback",
@@ -2525,7 +2650,7 @@ describe("conversation thread store", () => {
     });
 
     await service.runSummarization({ now: Date.now() + 2 * 60 * 60 * 1000 });
-    const result = await service.search({
+    const result = await serviceSearch(service, {
       query: ["fallback topic", "fallback later"],
       verbose: true,
     });
@@ -2582,7 +2707,7 @@ describe("conversation thread store", () => {
 
     const now = Date.now() + 2 * 60 * 60 * 1000;
     expect((await service.runSummarization({ now })).summarized).toBe(2);
-    expect(threadStore.readThread("discord:channel:c1:clear-1")?.summary?.title).toBe(
+    expect(readThreadResult(threadStore, "discord:channel:c1:clear-1")?.summary?.title).toBe(
       "Clear summary 1",
     );
 
@@ -2594,7 +2719,7 @@ describe("conversation thread store", () => {
     });
     expect(dryRun.cleared).toBe(0);
     expect(dryRun.threadIds).toEqual(["discord:channel:c1:clear-1"]);
-    expect(threadStore.readThread("discord:channel:c1:clear-1")?.summary?.title).toBe(
+    expect(readThreadResult(threadStore, "discord:channel:c1:clear-1")?.summary?.title).toBe(
       "Clear summary 1",
     );
 
@@ -2605,10 +2730,10 @@ describe("conversation thread store", () => {
     });
     expect(rerun.cleared).toBe(1);
     expect(rerun.summarized).toBe(1);
-    expect(threadStore.readThread("discord:channel:c1:clear-1")?.summary?.title).toBe(
+    expect(readThreadResult(threadStore, "discord:channel:c1:clear-1")?.summary?.title).toBe(
       "Clear summary 3",
     );
-    expect(threadStore.readThread("discord:channel:c1:clear-other-1")?.summary?.title).toBe(
+    expect(readThreadResult(threadStore, "discord:channel:c1:clear-other-1")?.summary?.title).toBe(
       "Clear summary 2",
     );
 
@@ -2826,7 +2951,7 @@ describe("conversation thread store", () => {
       getConfig: async () => testConfig(),
     });
 
-    const result = await service.search({ query: "needle", limit: 1, mode: "lexical" });
+    const result = await serviceSearch(service, { query: "needle", limit: 1, mode: "lexical" });
     expect(result.results.map((item) => item.threadId)).toEqual(["discord:channel:c1:allowed"]);
 
     searchStore.close();
@@ -3009,19 +3134,23 @@ describe("conversation thread store", () => {
     expect(run.summarized).toBe(2);
     expect(threadStore.isVectorSearchAvailable()).toBe(true);
 
-    const result = await service.search({ query: "yellow fruit", mode: "semantic", verbose: true });
+    const result = await serviceSearch(service, {
+      query: "yellow fruit",
+      mode: "semantic",
+      verbose: true,
+    });
     expect(result.meta.vectorAvailable).toBe(true);
     expect(result.results[0]?.title).toBe("Dessert planning");
     expect(result.results[0]?.semanticScore).toBeGreaterThan(0);
 
-    const participantFiltered = await service.search({
+    const participantFiltered = await serviceSearch(service, {
       query: "conversation",
       mode: "lexical",
       participantId: "u2",
     });
     expect(participantFiltered.results.map((item) => item.title)).toEqual(["Database storage"]);
 
-    const timeFiltered = await service.search({
+    const timeFiltered = await serviceSearch(service, {
       query: "conversation",
       mode: "lexical",
       afterTs: 60 * 60 * 1000,
@@ -3090,7 +3219,7 @@ describe("conversation thread store", () => {
 
     const now = Date.now() + 2 * 60 * 60 * 1000;
     expect((await service.runSummarization({ now })).summarized).toBe(2);
-    const disabled = await service.search({
+    const disabled = await serviceSearch(service, {
       query: "yellow fruit",
       mode: "semantic",
       verbose: true,
@@ -3099,7 +3228,7 @@ describe("conversation thread store", () => {
 
     currentAdapter = fakeEmbeddingAdapter;
     expect((await service.runSummarization({ now: now + 1, force: true })).summarized).toBe(2);
-    const enabled = await service.search({
+    const enabled = await serviceSearch(service, {
       query: "yellow fruit",
       mode: "semantic",
       verbose: true,
@@ -3108,7 +3237,7 @@ describe("conversation thread store", () => {
     expect(enabled.results[0]?.title).toBe("Dessert planning");
 
     currentAdapter = { ...fakeEmbeddingAdapter, modelId: "fake-2d-v2" };
-    const beforeReembed = await service.search({
+    const beforeReembed = await serviceSearch(service, {
       query: "yellow fruit",
       mode: "semantic",
       verbose: true,
@@ -3123,7 +3252,7 @@ describe("conversation thread store", () => {
     expect(reembedded.eligibility.embeddingOnly).toBe(2);
     expect(reembedded.eligibility.reasons["embedding-model"]).toBe(2);
     expect(reembedded.summarized).toBe(0);
-    const afterReembed = await service.search({
+    const afterReembed = await serviceSearch(service, {
       query: "yellow fruit",
       mode: "semantic",
       verbose: true,
@@ -3212,7 +3341,7 @@ describe("conversation thread store", () => {
       { facet: "topics", text: "designer workflow" },
     ]);
 
-    await service.search({ query: "design handoff complaint", mode: "semantic" });
+    await serviceSearch(service, { query: "design handoff complaint", mode: "semantic" });
     expect(embedded.at(-1)).toEqual({ facet: "query", text: "design handoff complaint" });
 
     searchStore.close();
@@ -3273,7 +3402,7 @@ describe("conversation thread store", () => {
       ],
     });
 
-    const results = threadStore.searchSemantic({
+    const results = searchSemanticResult(threadStore, {
       embedding: match,
       modelId: "test-2d",
       dimensions: 2,

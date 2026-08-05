@@ -1,4 +1,8 @@
 import type { LanguageModelUsage } from "ai";
+import { Result, TaggedError, type Result as ResultType } from "better-result";
+import { z } from "zod";
+
+import { isPanic } from "./runtime-utils";
 
 export type ModelSpecifier = string;
 
@@ -93,60 +97,110 @@ const DEFAULT_PROVIDER_ALIASES = {
   "claude-code": "anthropic",
 } as const satisfies Record<string, string>;
 
-type ModelsDevRegistry = Record<string, ModelsDevProvider>;
+const modelModalitySchema = z.enum(["text", "image", "audio", "video", "pdf"]);
+const modelCostSchema = z.object({
+  input: z.number(),
+  output: z.number(),
+  cache_read: z.number().optional(),
+  cache_write: z.number().optional(),
+  input_audio: z.number().optional(),
+  output_audio: z.number().optional(),
+  context_over_200k: z
+    .object({
+      input: z.number(),
+      output: z.number(),
+      cache_read: z.number().optional(),
+      cache_write: z.number().optional(),
+    })
+    .optional(),
+});
+const modelLimitsSchema = z.object({ context: z.number(), output: z.number() });
+const modelsDevModelSchema = z.object({
+  id: z.string(),
+  name: z.string(),
+  family: z.string().optional(),
+  attachment: z.boolean().optional(),
+  reasoning: z.boolean().optional(),
+  tool_call: z.boolean().optional(),
+  temperature: z.boolean().optional(),
+  knowledge: z.string().optional(),
+  release_date: z.string().optional(),
+  last_updated: z.string().optional(),
+  modalities: z.object({
+    input: z.array(modelModalitySchema),
+    output: z.array(modelModalitySchema),
+  }),
+  open_weights: z.boolean().optional(),
+  cost: modelCostSchema.optional(),
+  limit: modelLimitsSchema,
+});
+const modelsDevProviderSchema = z.object({
+  id: z.string(),
+  env: z.array(z.string()).optional(),
+  npm: z.string(),
+  name: z.string(),
+  doc: z.string().optional(),
+  models: z.record(z.string(), modelsDevModelSchema),
+});
+const modelsDevRegistrySchema = z.record(z.string(), modelsDevProviderSchema);
 
-type ModelsDevProvider = {
-  id: string;
-  env?: string[];
-  npm: string;
-  name: string;
-  doc?: string;
-  models: Record<string, ModelsDevModel>;
-};
+type ModelsDevRegistry = z.output<typeof modelsDevRegistrySchema>;
+type ModelsDevProvider = z.output<typeof modelsDevProviderSchema>;
+type ModelsDevModel = z.output<typeof modelsDevModelSchema>;
 
-type ModelsDevModel = {
-  id: string;
-  name: string;
-  family: string;
-  attachment?: boolean;
-  reasoning?: boolean;
-  tool_call?: boolean;
-  temperature?: boolean;
-  knowledge?: string;
-  release_date?: string;
-  last_updated?: string;
-  modalities: {
-    input: ModelModality[];
-    output: ModelModality[];
-  };
-  open_weights?: boolean;
-  cost?: ModelCost;
-  limit: ModelLimits;
-};
+export function decodeModelsDevRegistry(value: unknown): ModelsDevRegistry | undefined {
+  const parsed = modelsDevRegistrySchema.safeParse(value);
+  return parsed.success ? parsed.data : undefined;
+}
 
 type RegistryLookupResult = {
   providerEntry: ModelsDevProvider;
   modelEntry: ModelsDevModel;
 };
 
-export function parseModelSpecifier(spec: string): {
+export type ParsedModelSpecifier = {
   provider: string;
   model: string;
-} {
+};
+
+export class ModelSpecifierInvalid extends TaggedError("ModelSpecifierInvalid")<{
+  readonly spec: string;
+  readonly message: string;
+}> {}
+
+export class ModelCapabilityResolutionFailed extends TaggedError(
+  "ModelCapabilityResolutionFailed",
+)<{
+  readonly spec: string;
+  readonly cause?: unknown;
+  readonly message: string;
+}> {}
+
+export type ModelCapabilityError = ModelSpecifierInvalid | ModelCapabilityResolutionFailed;
+
+export function parseModelSpecifierResult(
+  spec: string,
+): ResultType<ParsedModelSpecifier, ModelSpecifierInvalid> {
   const slashIndex = spec.indexOf("/");
   if (slashIndex <= 0 || slashIndex === spec.length - 1) {
-    throw new Error(`Invalid model specifier '${spec}'. Expected format provider/modelstring.`);
+    return Result.err(
+      new ModelSpecifierInvalid({
+        spec,
+        message: `Invalid model specifier '${spec}'. Expected format provider/modelstring.`,
+      }),
+    );
   }
 
-  return {
+  return Result.ok({
     provider: spec.slice(0, slashIndex),
     model: spec.slice(slashIndex + 1),
-  };
+  });
 }
 
-function asRecord(value: unknown): Record<string, unknown> | null {
-  if (!value || typeof value !== "object") return null;
-  return value as Record<string, unknown>;
+export function parseModelSpecifier(spec: string): ParsedModelSpecifier {
+  const result = parseModelSpecifierResult(spec);
+  if (result.status === "error") throw new Error(result.error.message);
+  return result.value;
 }
 
 function listSomeKeys(input: Record<string, unknown>, max: number): string[] {
@@ -160,7 +214,9 @@ export class ModelCapability {
   private readonly apiUrl: string;
   private readonly fetchFn: typeof fetch;
 
-  private registryPromise: Promise<ModelsDevRegistry> | null = null;
+  private registryPromise: Promise<
+    ResultType<ModelsDevRegistry, ModelCapabilityResolutionFailed>
+  > | null = null;
 
   constructor(options?: ModelCapabilityOptions) {
     this.overrides = options?.overrides ?? {};
@@ -180,11 +236,8 @@ export class ModelCapability {
   }
 
   private parseNestedModelSpecifier(model: string): { provider: string; model: string } | null {
-    try {
-      return parseModelSpecifier(model);
-    } catch {
-      return null;
-    }
+    const parsed = parseModelSpecifierResult(model);
+    return parsed.status === "ok" ? parsed.value : null;
   }
 
   private modelLookupCandidates(model: string): string[] {
@@ -316,21 +369,55 @@ export class ModelCapability {
     return inputTokens;
   }
 
-  private async loadRegistry(signal?: AbortSignal): Promise<ModelsDevRegistry> {
+  private async loadRegistryResult(
+    signal?: AbortSignal,
+  ): Promise<ResultType<ModelsDevRegistry, ModelCapabilityResolutionFailed>> {
     if (!this.registryPromise) {
       this.registryPromise = (async () => {
-        const res = await this.fetchFn(this.apiUrl, { signal });
-        if (!res.ok) {
-          throw new Error(`Failed to fetch models.dev registry (${res.status} ${res.statusText})`);
+        let response: Response;
+        try {
+          response = await this.fetchFn(this.apiUrl, { signal });
+        } catch (cause) {
+          if (isPanic(cause)) throw cause;
+          return Result.err(
+            new ModelCapabilityResolutionFailed({
+              spec: this.apiUrl,
+              cause,
+              message: "Failed to fetch models.dev registry",
+            }),
+          );
+        }
+        if (!response.ok) {
+          return Result.err(
+            new ModelCapabilityResolutionFailed({
+              spec: this.apiUrl,
+              message: `Failed to fetch models.dev registry (${response.status} ${response.statusText})`,
+            }),
+          );
         }
 
-        const json = (await res.json()) as unknown;
-        const record = asRecord(json);
-        if (!record) {
-          throw new Error("models.dev registry JSON is not an object");
+        let payload: unknown;
+        try {
+          payload = await response.json();
+        } catch (cause) {
+          if (isPanic(cause)) throw cause;
+          return Result.err(
+            new ModelCapabilityResolutionFailed({
+              spec: this.apiUrl,
+              cause,
+              message: "models.dev registry response was not valid JSON",
+            }),
+          );
         }
-
-        return record as ModelsDevRegistry;
+        const registry = decodeModelsDevRegistry(payload);
+        return registry
+          ? Result.ok(registry)
+          : Result.err(
+              new ModelCapabilityResolutionFailed({
+                spec: this.apiUrl,
+                message: "models.dev registry JSON has an invalid shape",
+              }),
+            );
       })();
     }
 
@@ -367,125 +454,145 @@ export class ModelCapability {
     };
   }
 
-  private mergeCostPatch(params: {
+  private mergeCostPatchResult(params: {
     spec: string;
     baseCost: ModelCost | undefined;
     patch: Partial<ModelCost> | undefined;
-  }): ModelCost | undefined {
+  }): ResultType<ModelCost | undefined, ModelCapabilityResolutionFailed> {
     if (!params.patch) {
-      return this.cloneCost(params.baseCost);
+      return Result.ok(this.cloneCost(params.baseCost));
     }
 
     const mergedInput = params.patch.input ?? params.baseCost?.input;
     const mergedOutput = params.patch.output ?? params.baseCost?.output;
     if (mergedInput === undefined || mergedOutput === undefined) {
-      throw new Error(
-        `Invalid capability override '${params.spec}': cost patch requires cost.input and cost.output (directly or via inherit).`,
+      return Result.err(
+        new ModelCapabilityResolutionFailed({
+          spec: params.spec,
+          message: `Invalid capability override '${params.spec}': cost patch requires cost.input and cost.output (directly or via inherit).`,
+        }),
       );
     }
 
-    return {
+    let contextOver200k: ModelCost["context_over_200k"];
+    if (params.patch.context_over_200k !== undefined) {
+      contextOver200k = {
+        input: params.patch.context_over_200k.input,
+        output: params.patch.context_over_200k.output,
+        cache_read: params.patch.context_over_200k.cache_read,
+        cache_write: params.patch.context_over_200k.cache_write,
+      };
+    } else if (params.baseCost?.context_over_200k) {
+      contextOver200k = {
+        input: params.baseCost.context_over_200k.input,
+        output: params.baseCost.context_over_200k.output,
+        cache_read: params.baseCost.context_over_200k.cache_read,
+        cache_write: params.baseCost.context_over_200k.cache_write,
+      };
+    }
+
+    return Result.ok({
       input: mergedInput,
       output: mergedOutput,
       cache_read: params.patch.cache_read ?? params.baseCost?.cache_read,
       cache_write: params.patch.cache_write ?? params.baseCost?.cache_write,
       input_audio: params.patch.input_audio ?? params.baseCost?.input_audio,
       output_audio: params.patch.output_audio ?? params.baseCost?.output_audio,
-      context_over_200k:
-        params.patch.context_over_200k !== undefined
-          ? {
-              input: params.patch.context_over_200k.input,
-              output: params.patch.context_over_200k.output,
-              cache_read: params.patch.context_over_200k.cache_read,
-              cache_write: params.patch.context_over_200k.cache_write,
-            }
-          : params.baseCost?.context_over_200k
-            ? {
-                input: params.baseCost.context_over_200k.input,
-                output: params.baseCost.context_over_200k.output,
-                cache_read: params.baseCost.context_over_200k.cache_read,
-                cache_write: params.baseCost.context_over_200k.cache_write,
-              }
-            : undefined,
-    };
+      context_over_200k: contextOver200k,
+    });
   }
 
-  private mergeModalitiesPatch(params: {
+  private mergeModalitiesPatchResult(params: {
     spec: string;
     baseModalities: ModelCapabilityInfo["modalities"];
     patch: ModelCapabilityOverride["modalities"] | undefined;
-  }): ModelCapabilityInfo["modalities"] {
+  }): ResultType<ModelCapabilityInfo["modalities"], ModelCapabilityResolutionFailed> {
     if (!params.patch) {
-      return this.cloneModalities(params.baseModalities);
+      return Result.ok(this.cloneModalities(params.baseModalities));
     }
 
     const mergedInput = params.patch.input ?? params.baseModalities?.input;
     const mergedOutput = params.patch.output ?? params.baseModalities?.output;
 
     if (!mergedInput) {
-      throw new Error(
-        `Invalid capability override '${params.spec}': modalities.input is required when overriding modalities without inherit/base modalities.`,
+      return Result.err(
+        new ModelCapabilityResolutionFailed({
+          spec: params.spec,
+          message: `Invalid capability override '${params.spec}': modalities.input is required when overriding modalities without inherit/base modalities.`,
+        }),
       );
     }
 
-    return {
+    return Result.ok({
       input: [...mergedInput],
       output: mergedOutput ? [...mergedOutput] : undefined,
-    };
+    });
   }
 
-  private async resolveFromRegistry(
+  private async resolveFromRegistryResult(
     spec: ModelSpecifier,
     options?: {
       signal?: AbortSignal;
       bypassForceUnknown?: boolean;
     },
-  ): Promise<ModelCapabilityInfo> {
-    const parsed = parseModelSpecifier(spec);
-    const provider = this.normalizeProvider(parsed.provider);
+  ): Promise<ResultType<ModelCapabilityInfo, ModelCapabilityError>> {
+    const parsed = parseModelSpecifierResult(spec);
+    if (parsed.status === "error") return Result.err(parsed.error);
+    const provider = this.normalizeProvider(parsed.value.provider);
     if (
       !options?.bypassForceUnknown &&
-      (this.forceUnknownProviders.has(parsed.provider.trim().toLowerCase()) ||
+      (this.forceUnknownProviders.has(parsed.value.provider.trim().toLowerCase()) ||
         this.forceUnknownProviders.has(provider.toLowerCase()))
     ) {
-      throw new Error(
-        `Model capability lookup intentionally disabled for provider '${parsed.provider}' (spec '${spec}').`,
+      return Result.err(
+        new ModelCapabilityResolutionFailed({
+          spec,
+          message: `Model capability lookup intentionally disabled for provider '${parsed.value.provider}' (spec '${spec}').`,
+        }),
       );
     }
 
-    const registry = await this.loadRegistry(options?.signal);
+    const registryResult = await this.loadRegistryResult(options?.signal);
+    if (registryResult.status === "error") return Result.err(registryResult.error);
+    const registry = registryResult.value;
     const lookedUp = this.lookupWithFallback({
       registry,
       provider,
-      model: parsed.model,
+      model: parsed.value.model,
     });
 
     if (!lookedUp) {
       const providerEntry = registry[provider];
       if (!providerEntry) {
         const available = listSomeKeys(registry, 10);
-        throw new Error(
-          `Unknown provider '${provider}' for spec '${spec}'. Add an override, or ensure models.dev contains it. Available providers (sample): ${available.join(", ")}`,
+        return Result.err(
+          new ModelCapabilityResolutionFailed({
+            spec,
+            message: `Unknown provider '${provider}' for spec '${spec}'. Add an override, or ensure models.dev contains it. Available providers (sample): ${available.join(", ")}`,
+          }),
         );
       }
 
       const available = listSomeKeys(providerEntry.models, 10);
-      throw new Error(
-        `Unknown model '${parsed.model}' for provider '${provider}' (spec '${spec}'). Add an override, or ensure models.dev contains it. Available models (sample): ${available.join(", ")}`,
+      return Result.err(
+        new ModelCapabilityResolutionFailed({
+          spec,
+          message: `Unknown model '${parsed.value.model}' for provider '${provider}' (spec '${spec}'). Add an override, or ensure models.dev contains it. Available models (sample): ${available.join(", ")}`,
+        }),
       );
     }
 
     const { providerEntry, modelEntry } = lookedUp;
     const cost = this.resolveModelCost({
       registry,
-      provider: parsed.provider,
-      model: parsed.model,
+      provider: parsed.value.provider,
+      model: parsed.value.model,
       modelEntry,
     });
 
-    return {
-      provider: parsed.provider,
-      model: parsed.model,
+    return Result.ok({
+      provider: parsed.value.provider,
+      model: parsed.value.model,
       name: modelEntry.name ?? providerEntry.name,
       family: modelEntry.family,
       env: providerEntry.env,
@@ -495,76 +602,106 @@ export class ModelCapability {
       cost,
       limit: modelEntry.limit,
       modalities: modelEntry.modalities,
-    };
+    });
   }
 
-  private async resolveWithOverrides(
+  private async resolveWithOverridesResult(
     spec: ModelSpecifier,
     options: { signal?: AbortSignal; stack: readonly string[] },
-  ): Promise<ModelCapabilityInfo> {
-    const parsed = parseModelSpecifier(spec);
+  ): Promise<ResultType<ModelCapabilityInfo, ModelCapabilityError>> {
+    const parsed = parseModelSpecifierResult(spec);
+    if (parsed.status === "error") return Result.err(parsed.error);
     const override = this.overrides[spec];
     if (!override) {
-      return this.resolveFromRegistry(spec, { signal: options.signal });
+      return this.resolveFromRegistryResult(spec, { signal: options.signal });
     }
 
     if (options.stack.includes(spec)) {
       const chain = [...options.stack, spec].join(" -> ");
-      throw new Error(`Model capability override cycle detected: ${chain}`);
+      return Result.err(
+        new ModelCapabilityResolutionFailed({
+          spec,
+          message: `Model capability override cycle detected: ${chain}`,
+        }),
+      );
     }
 
     let base: ModelCapabilityInfo | null = null;
     if (override.inherit) {
-      base = await this.resolveWithOverrides(override.inherit, {
+      const inherited = await this.resolveWithOverridesResult(override.inherit, {
         signal: options.signal,
         stack: [...options.stack, spec],
       });
+      if (inherited.status === "error") return Result.err(inherited.error);
+      base = inherited.value;
     }
 
     const mergedContext = override.limit?.context ?? base?.limit.context;
     if (mergedContext === undefined) {
-      throw new Error(
-        `Invalid capability override '${spec}': limit.context is required (directly or via inherit).`,
+      return Result.err(
+        new ModelCapabilityResolutionFailed({
+          spec,
+          message: `Invalid capability override '${spec}': limit.context is required (directly or via inherit).`,
+        }),
       );
     }
 
-    const mergedCost = this.mergeCostPatch({
+    const mergedCost = this.mergeCostPatchResult({
       spec,
       baseCost: base?.cost,
       patch: override.cost,
     });
-    const mergedModalities = this.mergeModalitiesPatch({
+    if (mergedCost.status === "error") return Result.err(mergedCost.error);
+    const mergedModalities = this.mergeModalitiesPatchResult({
       spec,
       baseModalities: base?.modalities,
       patch: override.modalities,
     });
+    if (mergedModalities.status === "error") return Result.err(mergedModalities.error);
 
-    return {
-      provider: parsed.provider,
-      model: parsed.model,
+    return Result.ok({
+      provider: parsed.value.provider,
+      model: parsed.value.model,
       name: base?.name,
       family: base?.family,
       env: base?.env,
       npm: base?.npm,
       doc: base?.doc,
       attachment: override.attachment ?? base?.attachment,
-      cost: mergedCost,
+      cost: mergedCost.value,
       limit: {
         context: mergedContext,
         output: override.limit?.output ?? base?.limit.output ?? 0,
       },
-      modalities: mergedModalities,
-    };
+      modalities: mergedModalities.value,
+    });
+  }
+
+  async resolveResult(
+    spec: ModelSpecifier,
+    options?: { signal?: AbortSignal },
+  ): Promise<ResultType<ModelCapabilityInfo, ModelCapabilityError>> {
+    return await this.resolveWithOverridesResult(spec, {
+      signal: options?.signal,
+      stack: [],
+    });
   }
 
   async resolve(
     spec: ModelSpecifier,
     options?: { signal?: AbortSignal },
   ): Promise<ModelCapabilityInfo> {
-    return await this.resolveWithOverrides(spec, {
-      signal: options?.signal,
-      stack: [],
-    });
+    const result = await this.resolveResult(spec, options);
+    if (result.status === "error") {
+      if (
+        result.error._tag === "ModelCapabilityResolutionFailed" &&
+        Object.hasOwn(result.error, "cause")
+      ) {
+        throw result.error.cause;
+      }
+      throw new Error(result.error.message);
+    }
+    return result.value;
   }
 
   estimateCostUsd(

@@ -1,4 +1,14 @@
-import { lilacEventTypes, outReqTopic, type LilacBus } from "@stanley2058/lilac-event-bus";
+import {
+  lilacEventTypes,
+  outReqTopic,
+  type DeliveryDisposition,
+  type EventDeliveryDoneError,
+  type EventDeliveryStartFailed,
+  type EventDeliveryStopFailed,
+  type LilacBus,
+  type SurfaceMsgRef,
+} from "@stanley2058/lilac-event-bus";
+import { Panic, Result, TaggedError, type Result as ResultType } from "better-result";
 
 import { createLogger, env, errorMessage } from "@stanley2058/lilac-utils";
 import type { Logger } from "@stanley2058/simple-module-logger";
@@ -7,6 +17,7 @@ import type {
   SurfaceFinalTextMode,
   SurfaceAdapter,
   SurfaceOutputPart,
+  SurfaceOutputResult,
   StartOutputOpts,
   SurfaceToolStatusUpdate,
   TypingIndicatorProvider,
@@ -18,6 +29,7 @@ import { mergeSubagentToolStatus } from "../subagent-tool-status";
 import { deleteIssueCommentReactionById, deleteIssueReactionById } from "../../github/github-api";
 import { parseGithubRequestId, parseGithubSessionId } from "../../github/github-ids";
 import { parseRequestId } from "./request-ids";
+import { parseRequestControlFromRaw } from "./bus-agent-runner/raw";
 import {
   clearGithubAck,
   getGithubAck,
@@ -27,6 +39,199 @@ import {
 import { isPossibleNoReplyPrefix, resolveReplyDeliveryFromFinalText } from "./reply-directive";
 
 import type { TranscriptStore } from "../../transcript/transcript-store";
+import { adaptEventPublishResultToHost } from "../../shared/event-bus-result";
+import { formatBridgeTaggedErrorForLog } from "./bridge-log";
+
+class CmdRequestRequiredHeadersMissing extends TaggedError("CmdRequestRequiredHeadersMissing")<{
+  readonly message: string;
+}> {}
+
+class CmdRequestCancelFailed extends TaggedError("CmdRequestCancelFailed")<{
+  readonly cause: BusToAdapterEffectFailed;
+  readonly message: string;
+}> {}
+
+type CmdRequestDeliveryError = CmdRequestRequiredHeadersMissing | CmdRequestCancelFailed;
+
+function applyCmdRequestDeliveryPolicy(error: CmdRequestDeliveryError): DeliveryDisposition {
+  switch (error._tag) {
+    case "CmdRequestRequiredHeadersMissing":
+      return "park-pending";
+    case "CmdRequestCancelFailed":
+      return "commit";
+  }
+}
+
+class CmdSurfaceRequiredHeadersMissing extends TaggedError("CmdSurfaceRequiredHeadersMissing")<{
+  readonly message: string;
+}> {}
+
+class CmdSurfaceReanchorFailed extends TaggedError("CmdSurfaceReanchorFailed")<{
+  readonly cause: BusToAdapterEffectFailed;
+  readonly message: string;
+}> {}
+
+type CmdSurfaceDeliveryError = CmdSurfaceRequiredHeadersMissing | CmdSurfaceReanchorFailed;
+
+function applyCmdSurfaceDeliveryPolicy(error: CmdSurfaceDeliveryError): DeliveryDisposition {
+  switch (error._tag) {
+    case "CmdSurfaceRequiredHeadersMissing":
+      return "park-pending";
+    case "CmdSurfaceReanchorFailed":
+      return "commit";
+  }
+}
+
+class EvtRequestRequiredHeadersMissing extends TaggedError("EvtRequestRequiredHeadersMissing")<{
+  readonly message: string;
+}> {}
+
+class EvtRequestStopTypingFailed extends TaggedError("EvtRequestStopTypingFailed")<{
+  readonly cause: BusToAdapterEffectFailed;
+  readonly message: string;
+}> {}
+
+type EvtRequestDeliveryError = EvtRequestRequiredHeadersMissing | EvtRequestStopTypingFailed;
+
+function applyEvtRequestDeliveryPolicy(error: EvtRequestDeliveryError): DeliveryDisposition {
+  switch (error._tag) {
+    case "EvtRequestRequiredHeadersMissing":
+      return "park-pending";
+    case "EvtRequestStopTypingFailed":
+      return "commit";
+  }
+}
+
+class OutReqPushFailed extends TaggedError("OutReqPushFailed")<{
+  readonly cause: BusToAdapterEffectFailed;
+  readonly message: string;
+}> {}
+
+class OutReqFinishFailed extends TaggedError("OutReqFinishFailed")<{
+  readonly cause: BusToAdapterEffectFailed;
+  readonly message: string;
+}> {}
+
+type OutReqDeliveryError = OutReqPushFailed | OutReqFinishFailed;
+
+type BusToAdapterEffect =
+  | "abort-output"
+  | "cancel-active-relay"
+  | "cleanup-github-ack"
+  | "delete-output-message"
+  | "delete-transcript-checkpoint"
+  | "finish-output"
+  | "link-transcript"
+  | "publish-output-created"
+  | "push-output"
+  | "reanchor-output"
+  | "start-typing"
+  | "stop-output-subscription"
+  | "stop-relay"
+  | "stop-typing";
+
+class BusToAdapterEffectFailed extends TaggedError("BusToAdapterEffectFailed")<{
+  readonly operation: BusToAdapterEffect;
+  readonly cause: unknown;
+  readonly message: string;
+}> {}
+
+function applyOutReqDeliveryPolicy(error: OutReqDeliveryError): DeliveryDisposition {
+  switch (error._tag) {
+    case "OutReqPushFailed":
+    case "OutReqFinishFailed":
+      return "stop";
+  }
+}
+
+type ResultSubscription = {
+  readonly done: Promise<ResultType<void, EventDeliveryDoneError>>;
+  stop(): Promise<ResultType<void, EventDeliveryStopFailed>>;
+};
+
+export function rethrowBusToAdapterPanic(cause: unknown): void {
+  if (Panic.is(cause)) throw cause;
+}
+
+export async function captureBusToAdapterEffect<T>(
+  operation: BusToAdapterEffect,
+  effect: () => Promise<T>,
+): Promise<ResultType<T, BusToAdapterEffectFailed>> {
+  try {
+    return Result.ok(await effect());
+  } catch (cause) {
+    rethrowBusToAdapterPanic(cause);
+    return Result.err(
+      new BusToAdapterEffectFailed({
+        operation,
+        cause,
+        message: `Bus-to-adapter effect failed: ${operation}`,
+      }),
+    );
+  }
+}
+
+export function adaptBusToAdapterSubscriptionStart(
+  started: ResultType<ResultSubscription, EventDeliveryStartFailed>,
+): ResultSubscription {
+  if (started.status === "error") throw started.error;
+  return started.value;
+}
+
+export function adaptBusToAdapterSubscriptionStop(
+  stopped: ResultType<void, EventDeliveryStopFailed>,
+): void {
+  if (stopped.status === "error") throw stopped.error;
+}
+
+export async function superviseBusToAdapterCleanup(
+  effects: readonly (() => Promise<void>)[],
+): Promise<void> {
+  let failure: { readonly cause: unknown; readonly panic: boolean } | null = null;
+  for (const effect of effects) {
+    try {
+      await effect();
+    } catch (cause) {
+      const panic = Panic.is(cause);
+      if (failure === null || (panic && !failure.panic)) failure = { cause, panic };
+    }
+  }
+  if (failure !== null) throw failure.cause;
+}
+
+async function runBusToAdapterBestEffort(input: {
+  operation: BusToAdapterEffect;
+  effect: () => Promise<void>;
+  logger?: Logger;
+  logLevel?: "debug" | "warn" | "error";
+  logMessage?: string;
+  context?: Readonly<Record<string, string | number | boolean | undefined>>;
+}): Promise<void> {
+  const result = await captureBusToAdapterEffect(input.operation, input.effect);
+  if (result.status === "ok" || !input.logger || !input.logLevel || !input.logMessage) return;
+  input.logger[input.logLevel](
+    input.logMessage,
+    formatBridgeTaggedErrorForLog(result.error, input.context),
+  );
+}
+
+function observeSubscriptionDone(
+  subscription: ResultSubscription,
+  topic: string,
+  logger: Logger,
+): void {
+  void subscription.done.then((done) => {
+    if (done.status === "ok") return;
+    logger.error(
+      "event subscription stopped",
+      formatBridgeTaggedErrorForLog(done.error, { topic }),
+    );
+  });
+}
+
+async function stopResultSubscription(subscription: ResultSubscription): Promise<void> {
+  adaptBusToAdapterSubscriptionStop(await subscription.stop());
+}
 
 function getConsumerId(prefix: string): string {
   return `${prefix}:${process.pid}:${Math.random().toString(16).slice(2)}`;
@@ -131,30 +336,34 @@ async function cleanupGithubAck(input: { logger: Logger; requestId: string; sess
     };
   })();
 
+  let deleted: ResultType<void, BusToAdapterEffectFailed>;
   try {
-    if (ack.target.kind === "issue") {
-      await deleteIssueReactionById({
-        owner: thread.owner,
-        repo: thread.repo,
-        issueNumber: ack.target.issueNumber,
-        reactionId: ack.reactionId,
-      });
-    } else {
-      await deleteIssueCommentReactionById({
-        owner: thread.owner,
-        repo: thread.repo,
-        commentId: ack.target.commentId,
-        reactionId: ack.reactionId,
-      });
-    }
-  } catch (e: unknown) {
-    const msg = errorMessage(e);
-    // Best-effort: ignore if already removed.
-    if (!msg.includes("404")) {
-      input.logger.warn("failed to delete github ack reaction", { requestId: input.requestId }, e);
-    }
+    deleted = await captureBusToAdapterEffect("cleanup-github-ack", async () => {
+      if (ack.target.kind === "issue") {
+        await deleteIssueReactionById({
+          owner: thread.owner,
+          repo: thread.repo,
+          issueNumber: ack.target.issueNumber,
+          reactionId: ack.reactionId,
+        });
+      } else {
+        await deleteIssueCommentReactionById({
+          owner: thread.owner,
+          repo: thread.repo,
+          commentId: ack.target.commentId,
+          reactionId: ack.reactionId,
+        });
+      }
+    });
   } finally {
     clearGithubAck(input.requestId);
+  }
+
+  if (deleted.status === "error" && !errorMessage(deleted.error.cause).includes("404")) {
+    input.logger.warn(
+      "failed to delete github ack reaction",
+      formatBridgeTaggedErrorForLog(deleted.error, { requestId: input.requestId }),
+    );
   }
 }
 
@@ -205,14 +414,9 @@ export type BusToAdapterRelaySnapshot = {
   outCursor?: string;
 };
 
-function toMsgRefFromSurfaceMsgRef(raw: unknown): MsgRef | null {
-  if (!raw || typeof raw !== "object") return null;
-  const o = raw as Record<string, unknown>;
-  const platform = o["platform"];
-  const channelId = o["channelId"];
-  const messageId = o["messageId"];
+function toMsgRefFromSurfaceMsgRef(value: SurfaceMsgRef): MsgRef | null {
+  const { platform, channelId, messageId } = value;
   if (platform !== "discord" && platform !== "github") return null;
-  if (typeof channelId !== "string" || typeof messageId !== "string") return null;
   return {
     platform,
     channelId,
@@ -273,13 +477,7 @@ export async function bridgeBusToAdapter(params: {
   let draining = false;
   let ingressStopped = false;
 
-  const stopIngress = async () => {
-    if (ingressStopped) return;
-    ingressStopped = true;
-    await Promise.all([sub.stop(), cmdSurfaceSub.stop(), cmdRequestSub.stop()]);
-  };
-
-  const cmdRequestSub = await bus.subscribeTopic(
+  const cmdRequestStarted = await bus.subscribeTopic(
     "cmd.request",
     {
       mode: "fanout",
@@ -288,10 +486,9 @@ export async function bridgeBusToAdapter(params: {
       offset: { type: "now" },
       batch: { maxWaitMs: 1000 },
     },
-    async (msg, ctx) => {
+    async (msg): Promise<ResultType<void, CmdRequestDeliveryError>> => {
       if (msg.type !== lilacEventTypes.CmdRequestMessage) {
-        await ctx.commit();
-        return;
+        return Result.ok(undefined);
       }
 
       const requestId = msg.headers?.request_id;
@@ -306,77 +503,10 @@ export async function bridgeBusToAdapter(params: {
           reason: "missing_headers",
           messageType: msg.type,
         });
-        await ctx.commit();
-        return;
-      }
-
-      if (requestClient && requestClient !== platform) {
-        logger.info("relay.event.ignored", {
-          requestId,
-          sessionId,
-          platform,
-          requestClient,
-          reason: "platform_mismatch",
-          messageType: msg.type,
-        });
-        await ctx.commit();
-        return;
-      }
-
-      const cancel = (() => {
-        const raw = msg.data.raw;
-        if (!raw || typeof raw !== "object") return false;
-        const v = (raw as Record<string, unknown>)["cancel"];
-        return v === true;
-      })();
-
-      if (!cancel) {
-        await ctx.commit();
-        return;
-      }
-
-      const relay = activeRelays.get(requestId);
-      if (!relay) {
-        logger.info("relay.event.ignored", {
-          requestId,
-          sessionId,
-          platform,
-          reason: "no_active_relay",
-          messageType: msg.type,
-        });
-        await ctx.commit();
-        return;
-      }
-
-      await relay.cancel().catch((e: unknown) => {
-        logger.error("failed to cancel active relay", { requestId, sessionId }, e);
-      });
-
-      await ctx.commit();
-    },
-  );
-
-  const cmdSurfaceSub = await bus.subscribeTopic(
-    "cmd.surface",
-    {
-      mode: "fanout",
-      subscriptionId: `${subscriptionId}:cmd_surface`,
-      consumerId: getConsumerId(`${subscriptionId}:cmd_surface`),
-      offset: { type: "now" },
-      batch: { maxWaitMs: 1000 },
-    },
-    async (msg, ctx) => {
-      if (msg.type !== lilacEventTypes.CmdSurfaceOutputReanchor) {
-        await ctx.commit();
-        return;
-      }
-
-      const requestId = msg.headers?.request_id;
-      const sessionId = msg.headers?.session_id;
-      const requestClient = msg.headers?.request_client;
-      if (!requestId || !sessionId) {
-        throw new Error(
-          "cmd.surface.output.reanchor missing required headers.request_id/session_id",
+        return Result.err(
+          new CmdRequestRequiredHeadersMissing({
+            message: "cmd.request.message missing required headers.request_id/session_id",
+          }),
         );
       }
 
@@ -389,8 +519,13 @@ export async function bridgeBusToAdapter(params: {
           reason: "platform_mismatch",
           messageType: msg.type,
         });
-        await ctx.commit();
-        return;
+        return Result.ok(undefined);
+      }
+
+      const cancel = parseRequestControlFromRaw(msg.data.raw).cancel;
+
+      if (!cancel) {
+        return Result.ok(undefined);
       }
 
       const relay = activeRelays.get(requestId);
@@ -402,27 +537,111 @@ export async function bridgeBusToAdapter(params: {
           reason: "no_active_relay",
           messageType: msg.type,
         });
-        await ctx.commit();
-        return;
+        return Result.ok(undefined);
+      }
+
+      const cancelled = await captureBusToAdapterEffect("cancel-active-relay", () =>
+        relay.cancel(),
+      );
+      if (cancelled.status === "ok") return Result.ok(undefined);
+      logger.error(
+        "failed to cancel active relay",
+        formatBridgeTaggedErrorForLog(cancelled.error, { requestId, sessionId }),
+      );
+      return Result.err(
+        new CmdRequestCancelFailed({
+          cause: cancelled.error,
+          message: "Failed to cancel active relay",
+        }),
+      );
+    },
+    applyCmdRequestDeliveryPolicy,
+  );
+  const cmdRequestSub = adaptBusToAdapterSubscriptionStart(cmdRequestStarted);
+  observeSubscriptionDone(cmdRequestSub, "cmd.request", logger);
+
+  const cmdSurfaceStarted = await bus.subscribeTopic(
+    "cmd.surface",
+    {
+      mode: "fanout",
+      subscriptionId: `${subscriptionId}:cmd_surface`,
+      consumerId: getConsumerId(`${subscriptionId}:cmd_surface`),
+      offset: { type: "now" },
+      batch: { maxWaitMs: 1000 },
+    },
+    async (msg): Promise<ResultType<void, CmdSurfaceDeliveryError>> => {
+      if (msg.type !== lilacEventTypes.CmdSurfaceOutputReanchor) {
+        return Result.ok(undefined);
+      }
+
+      const requestId = msg.headers?.request_id;
+      const sessionId = msg.headers?.session_id;
+      const requestClient = msg.headers?.request_client;
+      if (!requestId || !sessionId) {
+        return Result.err(
+          new CmdSurfaceRequiredHeadersMissing({
+            message: "cmd.surface.output.reanchor missing required headers.request_id/session_id",
+          }),
+        );
+      }
+
+      if (requestClient && requestClient !== platform) {
+        logger.info("relay.event.ignored", {
+          requestId,
+          sessionId,
+          platform,
+          requestClient,
+          reason: "platform_mismatch",
+          messageType: msg.type,
+        });
+        return Result.ok(undefined);
+      }
+
+      const relay = activeRelays.get(requestId);
+      if (!relay) {
+        logger.info("relay.event.ignored", {
+          requestId,
+          sessionId,
+          platform,
+          reason: "no_active_relay",
+          messageType: msg.type,
+        });
+        return Result.ok(undefined);
       }
 
       const replyTo = msg.data.replyTo ? toMsgRefFromSurfaceMsgRef(msg.data.replyTo) : null;
 
-      await relay
-        .reanchor({
+      const reanchored = await captureBusToAdapterEffect("reanchor-output", () =>
+        relay.reanchor({
           inheritReplyTo: msg.data.inheritReplyTo,
           mode: msg.data.mode,
           replyTo: replyTo ?? undefined,
-        })
-        .catch((e: unknown) => {
-          logger.error("reanchor failed", { requestId, sessionId }, e);
-        });
-
-      await ctx.commit();
+        }),
+      );
+      if (reanchored.status === "ok") return Result.ok(undefined);
+      logger.error(
+        "reanchor failed",
+        formatBridgeTaggedErrorForLog(reanchored.error, { requestId, sessionId }),
+      );
+      return Result.err(
+        new CmdSurfaceReanchorFailed({
+          cause: reanchored.error,
+          message: "Output reanchor failed",
+        }),
+      );
     },
+    applyCmdSurfaceDeliveryPolicy,
   );
+  if (cmdSurfaceStarted.status === "error") {
+    await runBusToAdapterBestEffort({
+      operation: "stop-output-subscription",
+      effect: () => stopResultSubscription(cmdRequestSub),
+    });
+  }
+  const cmdSurfaceSub = adaptBusToAdapterSubscriptionStart(cmdSurfaceStarted);
+  observeSubscriptionDone(cmdSurfaceSub, "cmd.surface", logger);
 
-  const sub = await bus.subscribeTopic(
+  const subStarted = await bus.subscribeTopic(
     "evt.request",
     {
       mode: "fanout",
@@ -431,13 +650,12 @@ export async function bridgeBusToAdapter(params: {
       offset: { type: "now" },
       batch: { maxWaitMs: 1000 },
     },
-    async (msg, ctx) => {
+    async (msg): Promise<ResultType<void, EvtRequestDeliveryError>> => {
       if (
         msg.type !== lilacEventTypes.EvtRequestReply &&
         msg.type !== lilacEventTypes.EvtRequestLifecycleChanged
       ) {
-        await ctx.commit();
-        return;
+        return Result.ok(undefined);
       }
 
       const requestId = msg.headers?.request_id;
@@ -454,7 +672,11 @@ export async function bridgeBusToAdapter(params: {
           reason: "missing_headers",
           messageType: msg.type,
         });
-        throw new Error("evt.request.reply missing required headers.request_id/session_id");
+        return Result.err(
+          new EvtRequestRequiredHeadersMissing({
+            message: "evt.request event missing required headers.request_id/session_id",
+          }),
+        );
       }
 
       if (requestClient && requestClient !== platform) {
@@ -466,8 +688,7 @@ export async function bridgeBusToAdapter(params: {
           reason: "platform_mismatch",
           messageType: msg.type,
         });
-        await ctx.commit();
-        return;
+        return Result.ok(undefined);
       }
 
       pruneTerminalLifecycleCache(Date.now());
@@ -482,23 +703,30 @@ export async function bridgeBusToAdapter(params: {
 
           const relay = activeRelays.get(requestId);
           if (relay) {
-            await relay.stopTyping().catch((e: unknown) => {
+            const stoppedTyping = await captureBusToAdapterEffect("stop-typing", () =>
+              relay.stopTyping(),
+            );
+            if (stoppedTyping.status === "error") {
               logger.debug(
                 "failed to stop relay typing from lifecycle event",
-                {
+                formatBridgeTaggedErrorForLog(stoppedTyping.error, {
                   requestId,
                   sessionId,
                   lifecycleState: msg.data.state,
-                },
-                e,
+                }),
               );
-            });
+              return Result.err(
+                new EvtRequestStopTypingFailed({
+                  cause: stoppedTyping.error,
+                  message: "Failed to stop relay typing from lifecycle event",
+                }),
+              );
+            }
             terminalLifecycleByRequestId.delete(requestId);
           }
         }
 
-        await ctx.commit();
-        return;
+        return Result.ok(undefined);
       }
 
       if (activeRelays.has(requestId)) {
@@ -510,8 +738,7 @@ export async function bridgeBusToAdapter(params: {
           reason: "already_active",
           messageType: msg.type,
         });
-        await ctx.commit();
-        return;
+        return Result.ok(undefined);
       }
 
       if (env.perf.log) {
@@ -560,19 +787,54 @@ export async function bridgeBusToAdapter(params: {
       activeRelays.set(requestId, relay);
 
       if (terminalLifecycleByRequestId.has(requestId)) {
-        await relay.stopTyping().catch((e: unknown) => {
+        const stoppedTyping = await captureBusToAdapterEffect("stop-typing", () =>
+          relay.stopTyping(),
+        );
+        if (stoppedTyping.status === "error") {
           logger.debug(
             "failed to stop relay typing after delayed terminal lifecycle",
-            { requestId, sessionId },
-            e,
+            formatBridgeTaggedErrorForLog(stoppedTyping.error, { requestId, sessionId }),
           );
-        });
+          return Result.err(
+            new EvtRequestStopTypingFailed({
+              cause: stoppedTyping.error,
+              message: "Failed to stop relay typing after delayed terminal lifecycle",
+            }),
+          );
+        }
         terminalLifecycleByRequestId.delete(requestId);
       }
 
-      await ctx.commit();
+      return Result.ok(undefined);
     },
+    applyEvtRequestDeliveryPolicy,
   );
+  if (subStarted.status === "error") {
+    await superviseBusToAdapterCleanup([
+      () =>
+        runBusToAdapterBestEffort({
+          operation: "stop-output-subscription",
+          effect: () => stopResultSubscription(cmdRequestSub),
+        }),
+      () =>
+        runBusToAdapterBestEffort({
+          operation: "stop-output-subscription",
+          effect: () => stopResultSubscription(cmdSurfaceSub),
+        }),
+    ]);
+  }
+  const sub = adaptBusToAdapterSubscriptionStart(subStarted);
+  observeSubscriptionDone(sub, "evt.request", logger);
+
+  const stopIngress = async () => {
+    if (ingressStopped) return;
+    ingressStopped = true;
+    await superviseBusToAdapterCleanup([
+      () => stopResultSubscription(sub),
+      () => stopResultSubscription(cmdSurfaceSub),
+      () => stopResultSubscription(cmdRequestSub),
+    ]);
+  };
 
   async function startRelay(input: {
     adapter: SurfaceAdapter;
@@ -700,27 +962,34 @@ export async function bridgeBusToAdapter(params: {
         activeOutputRefs.push(msgRef);
       }
 
-      bus
-        .publish(
-          lilacEventTypes.EvtSurfaceOutputMessageCreated,
-          {
-            msgRef: {
-              platform: msgRef.platform,
-              channelId: msgRef.channelId,
-              messageId: msgRef.messageId,
-            },
-          },
-          {
-            headers: {
-              request_id: requestId,
-              session_id: sessionId,
-              request_client: input.platform,
-            },
-          },
-        )
-        .catch((e: unknown) => {
-          logger.debug("failed to publish output message created", { requestId }, e);
-        });
+      void runBusToAdapterBestEffort({
+        operation: "publish-output-created",
+        effect: async () => {
+          adaptEventPublishResultToHost(
+            await bus.publish(
+              lilacEventTypes.EvtSurfaceOutputMessageCreated,
+              {
+                msgRef: {
+                  platform: msgRef.platform,
+                  channelId: msgRef.channelId,
+                  messageId: msgRef.messageId,
+                },
+              },
+              {
+                headers: {
+                  request_id: requestId,
+                  session_id: sessionId,
+                  request_client: input.platform,
+                },
+              },
+            ),
+          );
+        },
+        logger,
+        logLevel: "debug",
+        logMessage: "failed to publish output message created",
+        context: { requestId },
+      });
     };
 
     let useResumeOpts = Boolean(input.restore);
@@ -756,31 +1025,34 @@ export async function bridgeBusToAdapter(params: {
     if (input.restore) {
       // Re-publish existing output refs so router active-output tracking can recover.
       for (const ref of createdOutputRefs) {
-        bus
-          .publish(
-            lilacEventTypes.EvtSurfaceOutputMessageCreated,
-            {
-              msgRef: {
-                platform: ref.platform,
-                channelId: ref.channelId,
-                messageId: ref.messageId,
-              },
-            },
-            {
-              headers: {
-                request_id: requestId,
-                session_id: sessionId,
-                request_client: input.platform,
-              },
-            },
-          )
-          .catch((e: unknown) => {
-            logger.debug(
-              "failed to publish restored output message created",
-              { requestId, sessionId, messageId: ref.messageId },
-              e,
+        void runBusToAdapterBestEffort({
+          operation: "publish-output-created",
+          effect: async () => {
+            adaptEventPublishResultToHost(
+              await bus.publish(
+                lilacEventTypes.EvtSurfaceOutputMessageCreated,
+                {
+                  msgRef: {
+                    platform: ref.platform,
+                    channelId: ref.channelId,
+                    messageId: ref.messageId,
+                  },
+                },
+                {
+                  headers: {
+                    request_id: requestId,
+                    session_id: sessionId,
+                    request_client: input.platform,
+                  },
+                },
+              ),
             );
-          });
+          },
+          logger,
+          logLevel: "debug",
+          logMessage: "failed to publish restored output message created",
+          context: { requestId, sessionId, messageId: ref.messageId },
+        });
       }
 
       if (visibleTextAcc.trim().length > 0) {
@@ -820,7 +1092,10 @@ export async function bridgeBusToAdapter(params: {
       streamToken += 1;
       activeOutputRefs = [];
       activeOutputRefKeys = new Set();
-      await out.abort(lane.abortReason).catch(() => undefined);
+      await runBusToAdapterBestEffort({
+        operation: "abort-output",
+        effect: () => out.abort(lane.abortReason),
+      });
 
       const nextReplyTo = lane.resolveReplyToAfterAbort?.() ?? lane.replyTo;
       currentReplyTo = nextReplyTo;
@@ -862,11 +1137,10 @@ export async function bridgeBusToAdapter(params: {
       const currentTyping = typing;
       typing = null;
       if (!currentTyping) return;
-      try {
-        await currentTyping.stop();
-      } catch {
-        // ignore
-      }
+      await runBusToAdapterBestEffort({
+        operation: "stop-typing",
+        effect: () => currentTyping.stop(),
+      });
     };
 
     let cancelTimeout: (() => void) | null = null;
@@ -879,58 +1153,68 @@ export async function bridgeBusToAdapter(params: {
           idleTimeoutMs,
         });
 
-        out.abort("timeout").catch((e: unknown) => {
-          logger.error("failed to abort output stream", { requestId }, e);
+        const abortOutput = runBusToAdapterBestEffort({
+          operation: "abort-output",
+          effect: () => out.abort("timeout"),
+          logger,
+          logLevel: "error",
+          logMessage: "failed to abort output stream",
+          context: { requestId },
         });
-        relayStop().catch((e: unknown) => {
-          logger.error("failed to stop relay", { requestId }, e);
+        const stopRelay = runBusToAdapterBestEffort({
+          operation: "stop-relay",
+          effect: relayStop,
+          logger,
+          logLevel: "error",
+          logMessage: "failed to stop relay",
+          context: { requestId },
         });
+        void superviseBusToAdapterCleanup([() => abortOutput, () => stopRelay]);
       }, idleTimeoutMs);
     };
 
     let stopped = false;
-    let outputSub: { stop(): Promise<void> } | null = null;
+    let outputSub: ResultSubscription | null = null;
     let firstOutLogged = false;
     let handlingOutputEvent = false;
 
     const deleteCreatedOutputMessages = async () => {
       if (platform !== "discord") return;
 
+      const deletions: Array<() => Promise<void>> = [];
       for (let i = createdOutputRefs.length - 1; i >= 0; i--) {
         const ref = createdOutputRefs[i];
         if (!ref) continue;
-
-        await adapter.deleteMsg(ref).catch((e: unknown) => {
-          logger.debug(
-            "failed to delete skipped output message",
-            { requestId, sessionId, messageId: ref.messageId },
-            e,
-          );
-        });
+        deletions.push(() =>
+          runBusToAdapterBestEffort({
+            operation: "delete-output-message",
+            effect: () => adapter.deleteMsg(ref),
+            logger,
+            logLevel: "debug",
+            logMessage: "failed to delete skipped output message",
+            context: { requestId, sessionId, messageId: ref.messageId },
+          }),
+        );
       }
+      await superviseBusToAdapterCleanup(deletions);
     };
 
-    const deleteUnlinkedCheckpointCandidate = () => {
-      try {
-        const candidateDeleted =
-          params.transcriptStore?.deleteUnlinkedCheckpointCandidate?.({ requestId }) ?? false;
-        if (!candidateDeleted) return;
+    const deleteUnlinkedCheckpointCandidate = async () => {
+      const deleted = params.transcriptStore?.deleteUnlinkedCheckpointCandidate?.({ requestId });
+      if (!deleted) return;
+      if (deleted.status === "ok") {
+        if (!deleted.value) return;
         logger.info("compaction checkpoint deleted", {
           requestId,
           sessionId,
           reason: "unlinked_candidate_cleanup",
         });
-      } catch (e) {
-        logger.warn(
-          "failed to delete unlinked compaction checkpoint candidate",
-          {
-            requestId,
-            sessionId,
-            errorClass: e instanceof Error ? e.name : "unknown",
-          },
-          e,
-        );
+        return;
       }
+      logger.warn(
+        "failed to delete unlinked transcript checkpoint",
+        formatBridgeTaggedErrorForLog(deleted.error, { requestId, sessionId }),
+      );
     };
 
     const relayStop = async () => {
@@ -944,19 +1228,26 @@ export async function bridgeBusToAdapter(params: {
 
       cancelTimeout?.();
       cancelTimeout = null;
-      await stopTyping();
 
       const subToStop = outputSub;
-      if (subToStop) {
-        if (handlingOutputEvent) {
-          void subToStop.stop().catch(() => undefined);
-        } else {
-          try {
-            await subToStop.stop();
-          } catch {
-            // ignore
-          }
-        }
+      if (!subToStop) {
+        await stopTyping();
+      } else if (handlingOutputEvent) {
+        const stopOutputSubscription = () => stopResultSubscription(subToStop);
+        void runBusToAdapterBestEffort({
+          operation: "stop-output-subscription",
+          effect: stopOutputSubscription,
+        });
+        await stopTyping();
+      } else {
+        await superviseBusToAdapterCleanup([
+          stopTyping,
+          () =>
+            runBusToAdapterBestEffort({
+              operation: "stop-output-subscription",
+              effect: () => stopResultSubscription(subToStop),
+            }),
+        ]);
       }
 
       logger.info("reply relay stopped", {
@@ -967,18 +1258,50 @@ export async function bridgeBusToAdapter(params: {
 
     bumpTimeout();
 
+    const pushOutputPart = async (
+      part: SurfaceOutputPart,
+    ): Promise<ResultType<void, OutReqPushFailed>> => {
+      const pushed = await captureBusToAdapterEffect("push-output", () => out.push(part));
+      if (pushed.status === "ok") return Result.ok(undefined);
+      logger.error(
+        "failed to push relay output",
+        formatBridgeTaggedErrorForLog(pushed.error, { requestId, sessionId }),
+      );
+      return Result.err(
+        new OutReqPushFailed({
+          cause: pushed.error,
+          message: "Failed to push relay output",
+        }),
+      );
+    };
+
+    const finishOutput = async (): Promise<ResultType<SurfaceOutputResult, OutReqFinishFailed>> => {
+      const finished = await captureBusToAdapterEffect("finish-output", () => out.finish());
+      if (finished.status === "ok") return Result.ok(finished.value);
+      logger.error(
+        "failed to finish relay output",
+        formatBridgeTaggedErrorForLog(finished.error, { requestId, sessionId }),
+      );
+      return Result.err(
+        new OutReqFinishFailed({
+          cause: finished.error,
+          message: "Failed to finish relay output",
+        }),
+      );
+    };
+
     const subStart = Date.now();
-    outputSub = await bus.subscribeTopic(
+    const outputStarted = await bus.subscribeTopic(
       outReqTopic(requestId),
       {
         mode: "tail",
         offset: lastOutCursor ? { type: "cursor", cursor: lastOutCursor } : { type: "begin" },
         batch: { maxWaitMs: 250 },
       },
-      async (outMsg, outCtx) => {
+      async (outMsg, outCtx): Promise<ResultType<void, OutReqDeliveryError>> => {
         if (stopped) {
           lastOutCursor = outCtx.cursor;
-          return;
+          return Result.ok(undefined);
         }
 
         if (env.perf.log && !firstOutLogged) {
@@ -1012,9 +1335,9 @@ export async function bridgeBusToAdapter(params: {
 
         bumpTimeout();
 
+        let processingError: OutReqDeliveryError | undefined;
         await enqueue(async () => {
           if (stopped) {
-            lastOutCursor = outCtx.cursor;
             return;
           }
 
@@ -1024,7 +1347,6 @@ export async function bridgeBusToAdapter(params: {
 
             switch (outMsg.type) {
               case lilacEventTypes.EvtAgentOutputActivity: {
-                lastOutCursor = outCtx.cursor;
                 break;
               }
 
@@ -1055,7 +1377,6 @@ export async function bridgeBusToAdapter(params: {
                     },
                   };
                 }
-                lastOutCursor = outCtx.cursor;
                 break;
               }
 
@@ -1117,7 +1438,6 @@ export async function bridgeBusToAdapter(params: {
 
                 pendingNoReplyPrefix += visibleDelta;
                 if (isPossibleNoReplyPrefix(pendingNoReplyPrefix)) {
-                  lastOutCursor = outCtx.cursor;
                   break;
                 }
 
@@ -1125,7 +1445,6 @@ export async function bridgeBusToAdapter(params: {
                 part = { type: "text.delta", delta: pendingNoReplyPrefix };
                 visibleTextAcc += pendingNoReplyPrefix;
                 pendingNoReplyPrefix = "";
-                lastOutCursor = outCtx.cursor;
                 break;
               }
 
@@ -1166,7 +1485,6 @@ export async function bridgeBusToAdapter(params: {
                 }
                 awaitingFinalPhaseBoundaryPrefix = false;
                 part = { type: "text.set", text: laneText };
-                lastOutCursor = outCtx.cursor;
                 break;
               }
 
@@ -1190,7 +1508,6 @@ export async function bridgeBusToAdapter(params: {
                   type: "tool.status",
                   update,
                 };
-                lastOutCursor = outCtx.cursor;
                 break;
               }
 
@@ -1199,7 +1516,6 @@ export async function bridgeBusToAdapter(params: {
                   type: "attachment.add",
                   attachment: toAttachment(outMsg.data),
                 };
-                lastOutCursor = outCtx.cursor;
                 break;
               }
 
@@ -1208,22 +1524,24 @@ export async function bridgeBusToAdapter(params: {
                   outMsg.data.delivery ?? resolveReplyDeliveryFromFinalText(outMsg.data.finalText);
 
                 if (delivery === "skip") {
-                  await out.abort("skip").catch(() => undefined);
-                  await deleteCreatedOutputMessages();
-                  deleteUnlinkedCheckpointCandidate();
-                  await relayStop();
-
-                  if (platform === "github") {
-                    await cleanupGithubAck({ logger, requestId, sessionId }).catch((e: unknown) => {
-                      logger.warn("github ack cleanup failed", { requestId, sessionId }, e);
-                    });
-                  }
+                  await superviseBusToAdapterCleanup([
+                    () =>
+                      runBusToAdapterBestEffort({
+                        operation: "abort-output",
+                        effect: () => out.abort("skip"),
+                      }),
+                    deleteCreatedOutputMessages,
+                    deleteUnlinkedCheckpointCandidate,
+                    relayStop,
+                    ...(platform === "github"
+                      ? [() => cleanupGithubAck({ logger, requestId, sessionId })]
+                      : []),
+                  ]);
 
                   logger.info("reply relay skipped final surface reply", {
                     requestId,
                     sessionId,
                   });
-                  lastOutCursor = outCtx.cursor;
                   return;
                 }
 
@@ -1235,9 +1553,14 @@ export async function bridgeBusToAdapter(params: {
                       sessionId,
                       latest,
                     });
-                    await out.abort("superseded").catch(() => undefined);
-                    await relayStop();
-                    lastOutCursor = outCtx.cursor;
+                    await superviseBusToAdapterCleanup([
+                      () =>
+                        runBusToAdapterBestEffort({
+                          operation: "abort-output",
+                          effect: () => out.abort("superseded"),
+                        }),
+                      relayStop,
+                    ]);
                     return;
                   }
                 }
@@ -1254,11 +1577,10 @@ export async function bridgeBusToAdapter(params: {
                 const isContinuationOnlyFinal = finalText.length < totalTextChars;
                 const hasPriorLanePrefix = clampedStreamPrefixChars > 0;
                 const shouldUseFullLaneFinal = finalTextMode === "full" && !hasPriorLanePrefix;
-                let streamFinalText = shouldUseFullLaneFinal
-                  ? finalText
-                  : isContinuationOnlyFinal
-                    ? finalText
-                    : finalText.slice(clampedStreamPrefixChars);
+                let streamFinalText = finalText;
+                if (!shouldUseFullLaneFinal && !isContinuationOnlyFinal) {
+                  streamFinalText = finalText.slice(clampedStreamPrefixChars);
+                }
 
                 const hasTrackedPhasedText =
                   commentaryText.trim().length > 0 && finalAnswerText.trim().length > 0;
@@ -1274,27 +1596,36 @@ export async function bridgeBusToAdapter(params: {
                 }
 
                 if (streamFinalText.length === 0 && !streamHasVisibleOutput) {
-                  await out.abort("skip").catch(() => undefined);
-                  await deleteCreatedOutputMessages();
-                  deleteUnlinkedCheckpointCandidate();
-                  await relayStop();
-
-                  if (platform === "github") {
-                    await cleanupGithubAck({ logger, requestId, sessionId }).catch((e: unknown) => {
-                      logger.warn("github ack cleanup failed", { requestId, sessionId }, e);
-                    });
-                  }
+                  await superviseBusToAdapterCleanup([
+                    () =>
+                      runBusToAdapterBestEffort({
+                        operation: "abort-output",
+                        effect: () => out.abort("skip"),
+                      }),
+                    deleteCreatedOutputMessages,
+                    deleteUnlinkedCheckpointCandidate,
+                    relayStop,
+                    ...(platform === "github"
+                      ? [() => cleanupGithubAck({ logger, requestId, sessionId })]
+                      : []),
+                  ]);
 
                   logger.info("reply relay skipped empty post-reanchor stream", {
                     requestId,
                     sessionId,
                   });
-                  lastOutCursor = outCtx.cursor;
                   return;
                 }
 
                 if (statsLine.length > 0) {
-                  await out.push({ type: "meta.stats", line: statsLine });
+                  const pushedStats = await pushOutputPart({
+                    type: "meta.stats",
+                    line: statsLine,
+                  });
+                  if (pushedStats.status === "error") {
+                    processingError = pushedStats.error;
+                    return;
+                  }
                 }
 
                 totalTextChars = Math.max(
@@ -1327,43 +1658,55 @@ export async function bridgeBusToAdapter(params: {
                   authoritativeFinalAnswer.trim().length > 0
                     ? [commentaryText, authoritativeFinalAnswer]
                     : undefined;
-                await out.push({
+                const pushedFinal = await pushOutputPart({
                   type: "text.set",
                   text: streamFinalText,
                   ...(finalSegments === undefined ? {} : { finalSegments }),
                 });
+                if (pushedFinal.status === "error") {
+                  processingError = pushedFinal.error;
+                  return;
+                }
                 streamHasVisibleOutput = true;
-                const res = await out.finish();
-
-                if (params.transcriptStore) {
-                  try {
-                    params.transcriptStore.linkSurfaceMessagesToRequest({
-                      requestId,
-                      created: res.created,
-                      last: res.last,
-                    });
-                  } catch (e: unknown) {
-                    logger.error(
-                      "failed to link transcript to surface messages",
-                      { requestId, sessionId },
-                      e,
-                    );
-                  }
+                const finished = await finishOutput();
+                if (finished.status === "error") {
+                  processingError = finished.error;
+                  return;
                 }
-                await relayStop();
+                const res = finished.value;
 
-                if (platform === "github") {
-                  await cleanupGithubAck({ logger, requestId, sessionId }).catch((e: unknown) => {
-                    logger.warn("github ack cleanup failed", { requestId, sessionId }, e);
-                  });
-                }
+                const transcriptStore = params.transcriptStore;
+                await superviseBusToAdapterCleanup([
+                  ...(transcriptStore
+                    ? [
+                        () =>
+                          runBusToAdapterBestEffort({
+                            operation: "link-transcript",
+                            effect: async () => {
+                              transcriptStore.linkSurfaceMessagesToRequest({
+                                requestId,
+                                created: res.created,
+                                last: res.last,
+                              });
+                            },
+                            logger,
+                            logLevel: "error",
+                            logMessage: "failed to link transcript to surface messages",
+                            context: { requestId, sessionId },
+                          }),
+                      ]
+                    : []),
+                  relayStop,
+                  ...(platform === "github"
+                    ? [() => cleanupGithubAck({ logger, requestId, sessionId })]
+                    : []),
+                ]);
 
                 logger.info("reply relay finished", {
                   requestId,
                   sessionId,
                   finalTextChars: streamFinalText.length,
                 });
-                lastOutCursor = outCtx.cursor;
                 return;
               }
 
@@ -1372,20 +1715,32 @@ export async function bridgeBusToAdapter(params: {
             }
 
             if (part) {
+              const pushed = await pushOutputPart(part);
+              if (pushed.status === "error") {
+                processingError = pushed.error;
+                return;
+              }
               streamHasVisibleOutput = true;
-              await out.push(part);
             }
-
-            lastOutCursor = outCtx.cursor;
           } finally {
             handlingOutputEvent = false;
           }
         });
+
+        if (processingError) return Result.err(processingError);
+        lastOutCursor = outCtx.cursor;
+        return Result.ok(undefined);
       },
+      applyOutReqDeliveryPolicy,
     );
+    outputSub = adaptBusToAdapterSubscriptionStart(outputStarted);
+    observeSubscriptionDone(outputSub, outReqTopic(requestId), logger);
 
     if (isTypingIndicatorProvider(adapter)) {
-      typing = await adapter.startTyping(sessionRef).catch(() => null);
+      const startedTyping = await captureBusToAdapterEffect("start-typing", () =>
+        adapter.startTyping(sessionRef),
+      );
+      typing = startedTyping.status === "ok" ? startedTyping.value : null;
     }
 
     if (env.perf.log) {
@@ -1419,10 +1774,18 @@ export async function bridgeBusToAdapter(params: {
       stop: relayStop,
       cancel: async () => {
         await enqueue(async () => {
-          await out.abort("cancel").catch((e: unknown) => {
-            logger.error("failed to abort output stream on cancel", { requestId }, e);
-          });
-          await relayStop();
+          await superviseBusToAdapterCleanup([
+            () =>
+              runBusToAdapterBestEffort({
+                operation: "abort-output",
+                effect: () => out.abort("cancel"),
+                logger,
+                logLevel: "error",
+                logMessage: "failed to abort output stream on cancel",
+                context: { requestId },
+              }),
+            relayStop,
+          ]);
         });
       },
       startedAt: relayStartedAt,
@@ -1513,7 +1876,9 @@ export async function bridgeBusToAdapter(params: {
     },
     stop: async () => {
       await stopIngress();
-      await Promise.all([...activeRelays.values()].map((r) => r.stop()));
+      await superviseBusToAdapterCleanup(
+        [...activeRelays.values()].map((relay) => () => relay.stop()),
+      );
     },
   };
 }

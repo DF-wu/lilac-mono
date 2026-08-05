@@ -1,33 +1,72 @@
 import fs from "node:fs";
 import path from "node:path";
 
-export function hasWorkspacesField(pkgJsonPath: string): boolean {
+import { Panic, Result, TaggedError, type Result as ResultType } from "better-result";
+
+export class WorkspaceRootAccessFailed extends TaggedError("WorkspaceRootAccessFailed")<{
+  readonly path: string;
+  readonly cause: unknown;
+  readonly message: string;
+}> {}
+
+export class WorkspaceRootNotFound extends TaggedError("WorkspaceRootNotFound")<{
+  readonly startDir: string;
+  readonly message: string;
+}> {}
+
+export function hasWorkspacesFieldResult(
+  pkgJsonPath: string,
+): ResultType<boolean, WorkspaceRootAccessFailed> {
   try {
-    const raw = fs.readFileSync(pkgJsonPath, "utf8");
-    const pkg = JSON.parse(raw) as { workspaces?: unknown };
-    return pkg.workspaces != null;
-  } catch {
-    return false;
+    const raw: unknown = JSON.parse(fs.readFileSync(pkgJsonPath, "utf8"));
+    if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return Result.ok(false);
+    return Result.ok(Reflect.get(raw, "workspaces") != null);
+  } catch (cause) {
+    if (Panic.is(cause)) throw cause;
+    return Result.err(
+      new WorkspaceRootAccessFailed({
+        path: pkgJsonPath,
+        cause,
+        message: `Failed to inspect workspace manifest at ${pkgJsonPath}`,
+      }),
+    );
   }
 }
 
-export function findWorkspaceRoot(startDir = process.cwd()): string {
+export function hasWorkspacesField(pkgJsonPath: string): boolean {
+  const result = hasWorkspacesFieldResult(pkgJsonPath);
+  return result.status === "ok" && result.value;
+}
+
+export function findWorkspaceRootResult(
+  startDir = process.cwd(),
+): ResultType<string, WorkspaceRootNotFound> {
   let dir = path.resolve(startDir);
 
   while (true) {
     const pkgJsonPath = path.join(dir, "package.json");
 
-    if (fs.existsSync(pkgJsonPath) && hasWorkspacesField(pkgJsonPath)) {
-      return dir;
+    if (fs.existsSync(pkgJsonPath)) {
+      const inspected = hasWorkspacesFieldResult(pkgJsonPath);
+      if (inspected.status === "ok" && inspected.value) return Result.ok(dir);
     }
 
     const parent = path.dirname(dir);
     if (parent === dir) {
-      throw new Error(
-        `Workspace root not found from: ${startDir} (no package.json with workspaces)`,
+      return Result.err(
+        new WorkspaceRootNotFound({
+          startDir,
+          message: `Workspace root not found from: ${startDir} (no package.json with workspaces)`,
+        }),
       );
     }
 
     dir = parent;
   }
+}
+
+export function findWorkspaceRoot(startDir = process.cwd()): string {
+  const result = findWorkspaceRootResult(startDir);
+  if (result.status === "error") throw new Error(result.error.message);
+  return result.value;
 }

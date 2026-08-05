@@ -1,4 +1,5 @@
 import { describe, expect, it } from "bun:test";
+import { Panic, Result, type Result as ResultType } from "better-result";
 
 import { bridgeBusToAdapter } from "../../../src/surface/bridge/subscribe-from-bus";
 import type {
@@ -25,21 +26,92 @@ import {
   lilacEventTypes,
   type Message,
   type SubscriptionOptions,
-  type HandleContext,
   type FetchOptions,
   type PublishOptions,
+  EventDeliveryStopped,
+  type EventDeliveryContext,
+  type EventDeliveryDoneError,
+  type RawDeliveryAction,
+  type RawDeliveryHandler,
 } from "@stanley2058/lilac-event-bus";
 import { setGithubLatestRequestForSession } from "../../../src/github/github-state";
-import type { TranscriptStore } from "../../../src/transcript/transcript-store";
+import {
+  TranscriptStoreSqliteDriverFailure,
+  type TranscriptStore,
+} from "../../../src/transcript/transcript-store";
 
-function createInMemoryRawBus(): RawBus {
+type DeliveryObservation = {
+  readonly topic: string;
+  readonly cursor: string;
+  readonly disposition: RawDeliveryAction["disposition"];
+  readonly contextHasCommit: boolean;
+};
+
+type InMemoryDeliverySubscription = {
+  readonly topic: string;
+  readonly opts: SubscriptionOptions;
+  readonly handler: RawDeliveryHandler;
+  readonly done: PromiseWithResolvers<ResultType<void, EventDeliveryDoneError>>;
+};
+
+function createDeliveryContext(
+  topic: string,
+  cursor: string,
+  mode: SubscriptionOptions["mode"],
+): EventDeliveryContext {
+  return {
+    cursor,
+    mode,
+    evidence: {
+      source: {
+        transport: "redis-streams",
+        streamKey: topic,
+        topic,
+        messageId: cursor,
+      },
+      wire: { kind: "bounded-complete", fields: [] },
+    },
+  };
+}
+
+function createInMemoryRawBus(
+  onDelivery?: (observation: DeliveryObservation) => void,
+  waitForTailStop?: () => Promise<void>,
+): RawBus {
   const topics = new Map<string, Array<Message<unknown>>>();
   let sequence = 0;
-  const subs = new Set<{
-    topic: string;
-    opts: SubscriptionOptions;
-    handler: (msg: Message<unknown>, ctx: HandleContext) => Promise<void>;
-  }>();
+  const deliverySubs = new Set<InMemoryDeliverySubscription>();
+
+  const deliver = async (
+    subscription: InMemoryDeliverySubscription,
+    message: Message<unknown>,
+  ): Promise<RawDeliveryAction> => {
+    const context = createDeliveryContext(subscription.topic, message.id, subscription.opts.mode);
+    const action = await subscription.handler(message, context);
+    onDelivery?.({
+      topic: subscription.topic,
+      cursor: message.id,
+      disposition: action.disposition,
+      contextHasCommit: Object.hasOwn(context, "commit"),
+    });
+    if (
+      action.disposition === "stop" ||
+      (action.disposition === "park-pending" && subscription.opts.mode === "tail")
+    ) {
+      deliverySubs.delete(subscription);
+      subscription.done.resolve(
+        Result.err(
+          new EventDeliveryStopped({
+            reason: action.disposition === "stop" ? "requested" : "tail-cannot-park",
+            topic: subscription.topic,
+            cursor: message.id,
+            message: "In-memory delivery stopped",
+          }),
+        ),
+      );
+    }
+    return action;
+  };
 
   return {
     publish: async <TData>(msg: Omit<Message<TData>, "id" | "ts">, opts: PublishOptions) => {
@@ -52,74 +124,58 @@ function createInMemoryRawBus(): RawBus {
         ts: Date.now(),
         key: opts.key,
         headers: opts.headers,
-        data: msg.data as unknown,
+        data: msg.data,
       };
 
       const list = topics.get(opts.topic) ?? [];
       list.push(stored);
       topics.set(opts.topic, list);
 
-      for (const s of subs) {
+      for (const s of deliverySubs) {
         if (s.topic !== opts.topic) continue;
-        if (s.opts.mode === "tail" && s.opts.offset?.type === "now") {
-          // For our tests we always use begin/now explicitly; ignore edge.
-        }
-        await s.handler(stored, { cursor: id, commit: async () => {} });
+        await deliver(s, stored);
       }
 
       return { id, cursor: id };
     },
 
-    subscribe: async <TData>(
-      topic: string,
-      opts: SubscriptionOptions,
-      handler: (msg: Message<TData>, ctx: HandleContext) => Promise<void>,
-    ) => {
-      const entry = {
-        topic,
-        opts,
-        handler: handler as unknown as (msg: Message<unknown>, ctx: HandleContext) => Promise<void>,
-      };
-      subs.add(entry);
+    subscribe: async (topic, opts, handler) => {
+      const done = Promise.withResolvers<ResultType<void, EventDeliveryDoneError>>();
+      const entry = { topic, opts, handler, done };
+      deliverySubs.add(entry);
 
       if (opts.mode === "tail") {
         const existing = topics.get(topic) ?? [];
-        if (opts.offset?.type === "begin") {
-          for (const m of existing) {
-            await handler(m as unknown as Message<TData>, {
-              cursor: m.id,
-              commit: async () => {},
-            });
-          }
-        } else if (opts.offset?.type === "cursor") {
-          let seenCursor = false;
-          for (const m of existing) {
-            if (!seenCursor) {
-              if (m.id === opts.offset.cursor) {
-                seenCursor = true;
-              }
-              continue;
-            }
-            await handler(m as unknown as Message<TData>, {
-              cursor: m.id,
-              commit: async () => {},
-            });
-          }
+        let replay = existing;
+        const offset = opts.offset;
+        if (offset?.type === "cursor") {
+          const cursorIndex = existing.findIndex((message) => message.id === offset.cursor);
+          replay = cursorIndex >= 0 ? existing.slice(cursorIndex + 1) : existing;
+        } else if (opts.offset?.type === "now") {
+          replay = [];
+        }
+        for (const message of replay) {
+          const action = await deliver(entry, message);
+          if (action.disposition === "stop" || action.disposition === "park-pending") break;
         }
       }
 
-      return {
+      return Result.ok({
+        done: done.promise,
         stop: async () => {
-          subs.delete(entry);
+          deliverySubs.delete(entry);
+          done.resolve(Result.ok(undefined));
+          if (opts.mode === "tail") await waitForTailStop?.();
+          return Result.ok(undefined);
         },
-      };
+      });
     },
 
-    fetch: async <TData>(topic: string, _opts: FetchOptions) => {
+    fetch: async (topic: string, _opts: FetchOptions) => {
       const existing = topics.get(topic) ?? [];
       return {
         messages: existing.map((m) => ({
-          msg: m as unknown as Message<TData>,
+          msg: m,
           cursor: m.id,
         })),
         next: existing.length > 0 ? existing[existing.length - 1]!.id : undefined,
@@ -134,13 +190,6 @@ function createInMemoryRawBusWithBlockingTailStop(): {
   raw: RawBus;
   releaseTailStops(): void;
 } {
-  const topics = new Map<string, Array<Message<unknown>>>();
-  const subs = new Set<{
-    topic: string;
-    opts: SubscriptionOptions;
-    handler: (msg: Message<unknown>, ctx: HandleContext) => Promise<void>;
-  }>();
-
   let tailStopGatePromise: Promise<void> | null = null;
   let tailStopGateResolve: (() => void) | null = null;
 
@@ -152,95 +201,8 @@ function createInMemoryRawBusWithBlockingTailStop(): {
     return tailStopGatePromise;
   };
 
-  const raw: RawBus = {
-    publish: async <TData>(msg: Omit<Message<TData>, "id" | "ts">, opts: PublishOptions) => {
-      const id = String(Date.now()) + "-0";
-      const stored: Message<unknown> = {
-        topic: opts.topic,
-        id,
-        type: opts.type,
-        ts: Date.now(),
-        key: opts.key,
-        headers: opts.headers,
-        data: msg.data as unknown,
-      };
-
-      const list = topics.get(opts.topic) ?? [];
-      list.push(stored);
-      topics.set(opts.topic, list);
-
-      for (const s of subs) {
-        if (s.topic !== opts.topic) continue;
-        await s.handler(stored, { cursor: id, commit: async () => {} });
-      }
-
-      return { id, cursor: id };
-    },
-
-    subscribe: async <TData>(
-      topic: string,
-      opts: SubscriptionOptions,
-      handler: (msg: Message<TData>, ctx: HandleContext) => Promise<void>,
-    ) => {
-      const entry = {
-        topic,
-        opts,
-        handler: handler as unknown as (msg: Message<unknown>, ctx: HandleContext) => Promise<void>,
-      };
-      subs.add(entry);
-
-      if (opts.mode === "tail") {
-        const existing = topics.get(topic) ?? [];
-        if (opts.offset?.type === "begin") {
-          for (const m of existing) {
-            await handler(m as unknown as Message<TData>, {
-              cursor: m.id,
-              commit: async () => {},
-            });
-          }
-        } else if (opts.offset?.type === "cursor") {
-          let seenCursor = false;
-          for (const m of existing) {
-            if (!seenCursor) {
-              if (m.id === opts.offset.cursor) {
-                seenCursor = true;
-              }
-              continue;
-            }
-            await handler(m as unknown as Message<TData>, {
-              cursor: m.id,
-              commit: async () => {},
-            });
-          }
-        }
-      }
-
-      return {
-        stop: async () => {
-          subs.delete(entry);
-          if (opts.mode === "tail") {
-            await ensureTailStopGate();
-          }
-        },
-      };
-    },
-
-    fetch: async <TData>(topic: string, _opts: FetchOptions) => {
-      const existing = topics.get(topic) ?? [];
-      return {
-        messages: existing.map((m) => ({
-          msg: m as unknown as Message<TData>,
-          cursor: m.id,
-        })),
-        next: existing.length > 0 ? existing[existing.length - 1]!.id : undefined,
-      };
-    },
-
-    close: async () => {},
-  };
-
   return {
-    raw,
+    raw: createInMemoryRawBus(undefined, ensureTailStopGate),
     releaseTailStops: () => {
       tailStopGateResolve?.();
       tailStopGateResolve = null;
@@ -253,6 +215,8 @@ class FakeOutputStream {
   public readonly parts: SurfaceOutputPart[] = [];
   public finished = false;
   public aborted: string | undefined;
+  public nextPushFailure: Error | null = null;
+  public nextAbortFailure: Error | null = null;
   private created = false;
 
   constructor(
@@ -261,6 +225,11 @@ class FakeOutputStream {
   ) {}
 
   async push(part: SurfaceOutputPart): Promise<void> {
+    if (this.nextPushFailure) {
+      const failure = this.nextPushFailure;
+      this.nextPushFailure = null;
+      throw failure;
+    }
     if (!this.created) {
       this.created = true;
       this.onFirstPush?.();
@@ -275,6 +244,11 @@ class FakeOutputStream {
   }
 
   async abort(reason?: string): Promise<void> {
+    if (this.nextAbortFailure) {
+      const failure = this.nextAbortFailure;
+      this.nextAbortFailure = null;
+      throw failure;
+    }
     this.aborted = reason;
   }
 
@@ -293,6 +267,7 @@ class FakeAdapter implements SurfaceAdapter {
   public deletedMsgs: MsgRef[] = [];
   public outputFinalTextMode: SurfaceFinalTextMode = "continuation";
   public outputFinalTextModesByStart: SurfaceFinalTextMode[] = [];
+  public failNextStart = false;
   private nextOutputMessageId = 1;
 
   async connect(): Promise<void> {
@@ -312,6 +287,10 @@ class FakeAdapter implements SurfaceAdapter {
   }
 
   async startOutput(sessionRef: SessionRef, opts?: StartOutputOpts) {
+    if (this.failNextStart) {
+      this.failNextStart = false;
+      throw new Error("forced output start failure");
+    }
     this.lastStart = { sessionRef, opts };
     this.starts.push({ sessionRef, opts });
     const outputMessageId = `m_out_${this.nextOutputMessageId++}`;
@@ -1723,6 +1702,60 @@ describe("bridgeBusToAdapter", () => {
     await bridge.stop();
   });
 
+  it("does not cancel an active relay for inherited or accessor raw controls", async () => {
+    const bus = createLilacBus(createInMemoryRawBus());
+    const adapter = new FakeAdapter();
+    const requestId = "discord:chan:msg_hostile_cancel";
+    const bridge = await bridgeBusToAdapter({
+      adapter,
+      bus,
+      platform: "discord",
+      subscriptionId: "discord-adapter",
+      idleTimeoutMs: 10_000,
+    });
+    await bus.publish(
+      lilacEventTypes.EvtRequestReply,
+      {},
+      {
+        headers: {
+          request_id: requestId,
+          session_id: "chan",
+          request_client: "discord",
+        },
+      },
+    );
+
+    let getterCalls = 0;
+    const hostileRaw = Object.setPrototypeOf({}, { cancel: true });
+    Object.defineProperty(hostileRaw, "cancel", {
+      enumerable: true,
+      get() {
+        getterCalls += 1;
+        throw new Error("hostile cancel getter must not run");
+      },
+    });
+    await bus.publish(
+      lilacEventTypes.CmdRequestMessage,
+      {
+        queue: "interrupt",
+        messages: [],
+        raw: hostileRaw,
+      },
+      {
+        headers: {
+          request_id: requestId,
+          session_id: "chan",
+          request_client: "discord",
+        },
+      },
+    );
+
+    expect(adapter.stream?.aborted).toBeUndefined();
+    expect(adapter.typingStops).toBe(0);
+    expect(getterCalls).toBe(0);
+    await bridge.stop();
+  });
+
   it("stops typing on failed lifecycle and still delivers final output", async () => {
     const raw = createInMemoryRawBus();
     const bus = createLilacBus(raw);
@@ -1848,13 +1881,21 @@ describe("bridgeBusToAdapter", () => {
     const adapter = new FakeAdapter();
     const requestId = "discord:chan:msg_skip_cleanup_failure";
     const transcriptStore: TranscriptStore = {
-      saveRequestTranscript() {},
+      saveRequestTranscript() {
+        return Result.ok(undefined);
+      },
       linkSurfaceMessagesToRequest() {},
       getTranscriptBySurfaceMessage() {
-        return null;
+        return Result.ok(null);
       },
       deleteUnlinkedCheckpointCandidate() {
-        throw new Error("cleanup failed");
+        return Result.err(
+          new TranscriptStoreSqliteDriverFailure({
+            operation: "delete-unlinked-checkpoint-candidate",
+            code: "SQLITE_IOERR",
+            message: "cleanup failed",
+          }),
+        );
       },
       close() {},
     };
@@ -3031,6 +3072,225 @@ describe("bridgeBusToAdapter", () => {
     await new Promise((r) => setTimeout(r, 0));
 
     expect(adapter.streams[0]?.aborted).toBeUndefined();
+
+    await bridge.stop();
+  });
+
+  it("parks required-header failures and gives handlers no ack capability", async () => {
+    const deliveries: DeliveryObservation[] = [];
+    const bus = createLilacBus(createInMemoryRawBus((delivery) => deliveries.push(delivery)));
+    const bridge = await bridgeBusToAdapter({
+      adapter: new FakeAdapter(),
+      bus,
+      platform: "discord",
+      subscriptionId: "discord-adapter",
+      idleTimeoutMs: 10_000,
+    });
+
+    await bus.publish(
+      lilacEventTypes.CmdRequestMessage,
+      { queue: "prompt", messages: [] },
+      { headers: { request_id: "missing-session-cmd" } },
+    );
+    await bus.publish(
+      lilacEventTypes.CmdSurfaceOutputReanchor,
+      { inheritReplyTo: true },
+      { headers: { request_id: "missing-session-surface" } },
+    );
+    await bus.publish(
+      lilacEventTypes.EvtRequestReply,
+      {},
+      { headers: { request_id: "missing-session-event" } },
+    );
+
+    expect(deliveries.map(({ topic, disposition }) => ({ topic, disposition }))).toEqual([
+      { topic: "cmd.request", disposition: "park-pending" },
+      { topic: "cmd.surface", disposition: "park-pending" },
+      { topic: "evt.request", disposition: "park-pending" },
+    ]);
+    expect(deliveries.every((delivery) => !delivery.contextHasCommit)).toBe(true);
+
+    await bridge.stop();
+  });
+
+  it("commits a previously swallowed reanchor side-effect failure", async () => {
+    const deliveries: DeliveryObservation[] = [];
+    const bus = createLilacBus(createInMemoryRawBus((delivery) => deliveries.push(delivery)));
+    const adapter = new FakeAdapter();
+    const requestId = "discord:chan:reanchor_failure";
+    const bridge = await bridgeBusToAdapter({
+      adapter,
+      bus,
+      platform: "discord",
+      subscriptionId: "discord-adapter",
+      idleTimeoutMs: 10_000,
+    });
+
+    await bus.publish(
+      lilacEventTypes.EvtRequestReply,
+      {},
+      {
+        headers: {
+          request_id: requestId,
+          session_id: "chan",
+          request_client: "discord",
+        },
+      },
+    );
+    adapter.failNextStart = true;
+    await bus.publish(
+      lilacEventTypes.CmdSurfaceOutputReanchor,
+      { inheritReplyTo: true },
+      {
+        headers: {
+          request_id: requestId,
+          session_id: "chan",
+          request_client: "discord",
+        },
+      },
+    );
+
+    expect(deliveries.at(-1)).toMatchObject({
+      topic: "cmd.surface",
+      disposition: "commit",
+      contextHasCommit: false,
+    });
+
+    await bridge.stop();
+  });
+
+  it("stops failed tail processing without advancing the relay cursor", async () => {
+    const deliveries: DeliveryObservation[] = [];
+    const bus = createLilacBus(createInMemoryRawBus((delivery) => deliveries.push(delivery)));
+    const adapter = new FakeAdapter();
+    const requestId = "discord:chan:tail_failure";
+    const bridge = await bridgeBusToAdapter({
+      adapter,
+      bus,
+      platform: "discord",
+      subscriptionId: "discord-adapter",
+      idleTimeoutMs: 10_000,
+    });
+
+    await bus.publish(
+      lilacEventTypes.EvtRequestReply,
+      {},
+      {
+        headers: {
+          request_id: requestId,
+          session_id: "chan",
+          request_client: "discord",
+        },
+      },
+    );
+    const acceptedResult = await bus.publish(
+      lilacEventTypes.EvtAgentOutputDeltaText,
+      { delta: "accepted" },
+      { headers: { request_id: requestId } },
+    );
+    if (acceptedResult.status === "error") throw acceptedResult.error;
+    const accepted = acceptedResult.value;
+    expect(bridge.snapshotRelays()[0]?.outCursor).toBe(accepted.cursor);
+
+    if (!adapter.stream) throw new Error("relay output stream was not started");
+    adapter.stream.nextPushFailure = new Error("forced output push failure");
+    const failedResult = await bus.publish(
+      lilacEventTypes.EvtAgentOutputDeltaText,
+      { delta: " rejected" },
+      { headers: { request_id: requestId } },
+    );
+    if (failedResult.status === "error") throw failedResult.error;
+    const failed = failedResult.value;
+
+    expect(deliveries.find((delivery) => delivery.cursor === failed.cursor)).toMatchObject({
+      disposition: "stop",
+      contextHasCommit: false,
+    });
+    expect(bridge.snapshotRelays()[0]?.outCursor).toBe(accepted.cursor);
+
+    await bridge.stop();
+  });
+
+  it("propagates a tail Panic instead of applying a delivery policy", async () => {
+    const bus = createLilacBus(createInMemoryRawBus());
+    const adapter = new FakeAdapter();
+    const requestId = "discord:chan:tail_panic";
+    const bridge = await bridgeBusToAdapter({
+      adapter,
+      bus,
+      platform: "discord",
+      subscriptionId: "discord-adapter",
+      idleTimeoutMs: 10_000,
+    });
+
+    await bus.publish(
+      lilacEventTypes.EvtRequestReply,
+      {},
+      {
+        headers: {
+          request_id: requestId,
+          session_id: "chan",
+          request_client: "discord",
+        },
+      },
+    );
+    if (!adapter.stream) throw new Error("relay output stream was not started");
+    const panic = new Panic({ message: "forced output invariant failure" });
+    adapter.stream.nextPushFailure = panic;
+
+    await expect(
+      bus.publish(
+        lilacEventTypes.EvtAgentOutputDeltaText,
+        { delta: "panic" },
+        { headers: { request_id: requestId } },
+      ),
+    ).rejects.toBe(panic);
+
+    await bridge.stop();
+  });
+
+  it("finishes terminal relay cleanup before rethrowing the original Panic", async () => {
+    const bus = createLilacBus(createInMemoryRawBus());
+    const adapter = new FakeAdapter();
+    const requestId = "discord:chan:terminal_cleanup_panic";
+    const bridge = await bridgeBusToAdapter({
+      adapter,
+      bus,
+      platform: "discord",
+      subscriptionId: "discord-adapter",
+      idleTimeoutMs: 10_000,
+    });
+
+    await bus.publish(
+      lilacEventTypes.EvtRequestReply,
+      {},
+      {
+        headers: {
+          request_id: requestId,
+          session_id: "chan",
+          request_client: "discord",
+        },
+      },
+    );
+    await bus.publish(
+      lilacEventTypes.EvtAgentOutputDeltaText,
+      { delta: "preview" },
+      { headers: { request_id: requestId } },
+    );
+    if (!adapter.stream) throw new Error("relay output stream was not started");
+    const panic = new Panic({ message: "forced abort invariant failure" });
+    adapter.stream.nextAbortFailure = panic;
+
+    await expect(
+      bus.publish(
+        lilacEventTypes.EvtAgentOutputResponseText,
+        { finalText: "ignored", delivery: "skip" },
+        { headers: { request_id: requestId } },
+      ),
+    ).rejects.toBe(panic);
+
+    expect(bridge.snapshotRelays()).toHaveLength(0);
+    expect(adapter.deletedMsgs.map((message) => message.messageId)).toEqual(["m_out_1"]);
 
     await bridge.stop();
   });

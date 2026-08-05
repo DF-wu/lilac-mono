@@ -2,12 +2,19 @@ import { afterEach, describe, expect, it } from "bun:test";
 import { chmod, mkdtemp, readFile, readdir, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { Panic } from "better-result";
 
 import {
   McpOAuthCredentialError,
+  McpOAuthCredentialWriteAndCleanupError,
   readMcpOAuthCredentialFile,
+  readMcpOAuthCredentialFileResult,
   resolveMcpOAuthCredentialPath,
+  resolveMcpOAuthCredentialPathResult,
   updateMcpOAuthCredentialFile,
+  updateMcpOAuthCredentialFileResult,
+  writeMcpOAuthCredentialFileAtomicResult,
+  type McpOAuthCredentialFileDependencies,
 } from "../../src/mcp";
 
 const temporaryDirectories: string[] = [];
@@ -124,5 +131,175 @@ describe("MCP OAuth credential files", () => {
       serverUrl: "https://new.example.test/mcp",
       clientInformation: { client_id: "new-client" },
     });
+  });
+
+  it("returns owned Results for malformed persisted credentials and invalid server IDs", async () => {
+    const dataDir = await createDataDir();
+    await updateMcpOAuthCredentialFile({
+      dataDir,
+      serverId: "docs",
+      serverUrl: "https://mcp.example.test/service",
+      update: (credential) => credential,
+    });
+    const credentialPath = resolveMcpOAuthCredentialPath({ dataDir, serverId: "docs" });
+    await Bun.write(credentialPath, '{"version":1,"serverUrl":"secret-value"}\n');
+
+    const malformed = await readMcpOAuthCredentialFileResult({ dataDir, serverId: "docs" });
+    expect(malformed.status).toBe("error");
+    if (malformed.status === "error") {
+      expect(malformed.error).toBeInstanceOf(McpOAuthCredentialError);
+      expect(malformed.error.operation).toBe("read");
+      expect(malformed.error.message).not.toContain("secret-value");
+    }
+
+    const invalidPath = resolveMcpOAuthCredentialPathResult({ dataDir, serverId: "../escape" });
+    expect(invalidPath.status).toBe("error");
+    if (invalidPath.status === "error") {
+      expect(invalidPath.error.operation).toBe("resolve");
+      expect(invalidPath.error.credentialPath).not.toContain("escape.json");
+    }
+  });
+
+  it("preserves primary and cleanup failures from atomic writes", async () => {
+    const calls: string[] = [];
+    let writeFailure: Error | undefined;
+    let closeFailure: Error | undefined;
+    let removeFailure: Error | undefined;
+    const dependencies = {
+      mkdir: async () => undefined,
+      chmod: async () => undefined,
+      open: async () => ({
+        writeFile: async () => {
+          calls.push("write");
+          if (writeFailure) throw writeFailure;
+        },
+        chmod: async () => {
+          calls.push("chmod-file");
+        },
+        sync: async () => {
+          calls.push("sync");
+        },
+        close: async () => {
+          calls.push("close");
+          if (closeFailure) throw closeFailure;
+        },
+      }),
+      rename: async () => {
+        calls.push("rename");
+      },
+      rm: async () => {
+        calls.push("remove");
+        if (removeFailure) throw removeFailure;
+      },
+      randomUUID: () => "fixed",
+    } satisfies McpOAuthCredentialFileDependencies;
+    const input = {
+      dataDir: "/data",
+      serverId: "docs",
+      credential: {
+        version: 1 as const,
+        serverUrl: "https://mcp.example.test/service",
+      },
+      dependencies,
+    };
+
+    closeFailure = new Error("close failed");
+    const cleanupOnly = await writeMcpOAuthCredentialFileAtomicResult(input);
+    expect(cleanupOnly.status).toBe("error");
+    if (cleanupOnly.status === "error") {
+      expect(cleanupOnly.error).toBeInstanceOf(McpOAuthCredentialError);
+      expect(cleanupOnly.error).toMatchObject({ operation: "cleanup", cause: closeFailure });
+    }
+    expect(calls).toEqual(["write", "chmod-file", "sync", "close", "remove"]);
+
+    calls.length = 0;
+    writeFailure = new Error("write failed");
+    removeFailure = new Error("remove failed");
+    const combined = await writeMcpOAuthCredentialFileAtomicResult(input);
+    expect(combined.status).toBe("error");
+    if (combined.status === "error") {
+      expect(combined.error).toBeInstanceOf(McpOAuthCredentialWriteAndCleanupError);
+      expect(combined.error).toMatchObject({
+        primary: {
+          primary: { operation: "write", cause: writeFailure },
+          cleanup: { operation: "cleanup", cause: closeFailure },
+        },
+        cleanup: { operation: "cleanup", cause: removeFailure },
+      });
+    }
+    expect(calls).toEqual(["write", "close", "remove"]);
+  });
+
+  it("preserves the original write Panic through cleanup failures", async () => {
+    const primaryPanic = new Panic({ message: "write invariant failed" });
+    const cleanupPanic = new Panic({ message: "close invariant failed" });
+    const calls: string[] = [];
+    const dependencies = {
+      mkdir: async () => undefined,
+      chmod: async () => undefined,
+      open: async () => ({
+        writeFile: async () => {
+          calls.push("write");
+          throw primaryPanic;
+        },
+        chmod: async () => {
+          calls.push("chmod-file");
+        },
+        sync: async () => {
+          calls.push("sync");
+        },
+        close: async () => {
+          calls.push("close");
+          throw cleanupPanic;
+        },
+      }),
+      rename: async () => {
+        calls.push("rename");
+      },
+      rm: async () => {
+        calls.push("remove");
+        throw new Error("remove failed");
+      },
+      randomUUID: () => "fixed",
+    } satisfies McpOAuthCredentialFileDependencies;
+
+    await expect(
+      writeMcpOAuthCredentialFileAtomicResult({
+        dataDir: "/data",
+        serverId: "docs",
+        credential: { version: 1, serverUrl: "https://mcp.example.test/service" },
+        dependencies,
+      }),
+    ).rejects.toBe(primaryPanic);
+    expect(calls).toEqual(["write", "close", "remove"]);
+  });
+
+  it("captures update callback failures and preserves callback Panic", async () => {
+    const dataDir = await createDataDir();
+    const callbackFailure = new Error("callback failed");
+    const failed = await updateMcpOAuthCredentialFileResult({
+      dataDir,
+      serverId: "docs",
+      serverUrl: "https://mcp.example.test/service",
+      update: () => {
+        throw callbackFailure;
+      },
+    });
+    expect(failed.status).toBe("error");
+    if (failed.status === "error") {
+      expect(failed.error).toMatchObject({ operation: "update", cause: callbackFailure });
+    }
+
+    const panic = new Panic({ message: "callback invariant failed" });
+    await expect(
+      updateMcpOAuthCredentialFileResult({
+        dataDir,
+        serverId: "docs",
+        serverUrl: "https://mcp.example.test/service",
+        update: () => {
+          throw panic;
+        },
+      }),
+    ).rejects.toBe(panic);
   });
 });

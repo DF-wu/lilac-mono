@@ -5,7 +5,7 @@ import {
   canTransitionWorkflowRun,
   canTransitionWorkflowTrigger,
   canTransitionWorkflowWait,
-  normalizeWorkflowResourcePolicy,
+  normalizeWorkflowResourcePolicyResult,
   workflowOperationSchema,
   workflowRevisionSchema,
   workflowRunSchema,
@@ -14,6 +14,12 @@ import {
   workflowTriggerSchema,
   workflowWaitSchema,
 } from "../../src/workflow/workflow-domain";
+
+function normalizeWorkflowResourcePolicy(input: unknown) {
+  const result = normalizeWorkflowResourcePolicyResult(input);
+  if (result.status === "error") throw result.error;
+  return result.value;
+}
 
 const HASH = "a".repeat(64);
 

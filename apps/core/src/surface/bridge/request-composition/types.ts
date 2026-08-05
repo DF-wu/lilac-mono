@@ -74,7 +74,11 @@ export type ReplyChainMessage = {
   ts: number;
   text: string;
   attachments: DiscordAttachmentMeta[];
-  raw?: unknown;
+  isChat?: boolean;
+  replyReference: {
+    messageId?: string;
+    channelId?: string;
+  };
 };
 
 export type MergedChunk = {

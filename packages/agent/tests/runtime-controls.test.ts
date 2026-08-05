@@ -147,10 +147,16 @@ describe("retry backoff budget", () => {
       maxDelayMs: 0,
     });
 
-    await expect(budget.next()).resolves.toEqual({ attempt: 1, delayMs: 0 });
+    await expect(budget.next()).resolves.toMatchObject({
+      status: "ok",
+      value: { attempt: 1, delayMs: 0 },
+    });
     expect(budget.attempts).toBe(1);
-    await expect(budget.next()).resolves.toEqual({ attempt: 2, delayMs: 0 });
-    await expect(budget.next()).resolves.toBeNull();
+    await expect(budget.next()).resolves.toMatchObject({
+      status: "ok",
+      value: { attempt: 2, delayMs: 0 },
+    });
+    await expect(budget.next()).resolves.toMatchObject({ status: "ok", value: null });
     expect(budget.attempts).toBe(2);
   });
 
@@ -162,7 +168,7 @@ describe("retry backoff budget", () => {
       maxDelayMs: 0,
     });
 
-    await expect(budget.next()).resolves.toBeNull();
+    await expect(budget.next()).resolves.toMatchObject({ status: "ok", value: null });
     expect(budget.attempts).toBe(0);
   });
 
@@ -176,8 +182,14 @@ describe("retry backoff budget", () => {
     const controller = new AbortController();
     controller.abort();
 
-    await expect(budget.next(controller.signal)).rejects.toThrow();
+    await expect(budget.next(controller.signal)).resolves.toMatchObject({
+      status: "error",
+      error: { _tag: "RetryBackoffAborted" },
+    });
     expect(budget.attempts).toBe(0);
-    await expect(budget.next()).resolves.toEqual({ attempt: 1, delayMs: 0 });
+    await expect(budget.next()).resolves.toMatchObject({
+      status: "ok",
+      value: { attempt: 1, delayMs: 0 },
+    });
   });
 });

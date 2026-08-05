@@ -1,4 +1,5 @@
 import { streamText, type LanguageModel, type ModelMessage, type ToolSet } from "ai";
+import { Result, TaggedError, type Result as ResultType } from "better-result";
 
 import type {
   AiSdkPiAgentEvent,
@@ -12,6 +13,7 @@ import type {
 } from "./ai-sdk-pi-agent";
 import { AiSdkPiAgent } from "./ai-sdk-pi-agent";
 import { isLikelyContextOverflowError } from "./context-overflow";
+import { rethrowAgentPanic, type OpaqueAgentValue } from "./failure-adapters";
 import {
   readOpenAIServerCompactionArtifact,
   type OpenAIServerCompactionArtifact,
@@ -31,7 +33,8 @@ function stringifyUnknown(value: unknown): string {
   if (typeof value === "string") return value;
   try {
     return JSON.stringify(value, null, 2);
-  } catch {
+  } catch (cause) {
+    rethrowAgentPanic(cause);
     return String(value);
   }
 }
@@ -49,12 +52,25 @@ function truncateText(text: string, maxChars: number): string {
   return `${text.slice(0, maxChars - suffix.length)}${suffix}`;
 }
 
+export class AutoCompactionFailed extends TaggedError("AutoCompactionFailed")<{
+  readonly cause: OpaqueAgentValue;
+  readonly message: string;
+}> {}
+
+function autoCompactionFailure(cause: OpaqueAgentValue, message = stringifyUnknown(cause)) {
+  return new AutoCompactionFailed({ cause, message });
+}
+
+function signalAutoCompactionHost(error: AutoCompactionFailed): never {
+  throw error.cause;
+}
+
 function cloneMessage(message: ModelMessage): ModelMessage {
   if (message.role === "assistant") {
     return {
       ...message,
       content: Array.isArray(message.content)
-        ? message.content.map((p) => ({ ...p }))
+        ? message.content.map((part) => Object.assign({}, part))
         : message.content,
     };
   }
@@ -210,7 +226,8 @@ function stringifyTextOnly(value: unknown, space?: number): string {
       space,
     );
     return serialized ?? String(value);
-  } catch {
+  } catch (cause) {
+    rethrowAgentPanic(cause);
     return "[unserializable text content omitted]";
   }
 }
@@ -424,22 +441,28 @@ function repairTranscriptForCompaction(messages: readonly ModelMessage[]): Repai
   };
 }
 
-function shrinkCompactedMessagesToBudget(params: {
+function shrinkCompactedMessagesToBudgetResult(params: {
   messages: readonly ModelMessage[];
   inputBudget: number;
   summary: string;
-}): { messages: ModelMessage[]; summary: string } {
+}): ResultType<{ messages: ModelMessage[]; summary: string }, AutoCompactionFailed> {
   const budget = Math.max(1, params.inputBudget);
   const working = repairTranscriptForCompaction(params.messages).messages;
   const estimatedTokens = estimateMessagesTokens(working);
-  if (estimatedTokens <= budget) return { messages: working, summary: params.summary };
+  if (estimatedTokens <= budget) {
+    return Result.ok({ messages: working, summary: params.summary });
+  }
 
   const summaryMessage = working[0];
   const retainedSuffix = working.slice(1);
   const retainedSuffixTokens = estimateMessagesTokens(retainedSuffix);
   if (retainedSuffixTokens >= budget) {
-    throw new Error(
-      `Compaction could not fit retained bounded context within the input budget (${retainedSuffixTokens} >= ${budget} estimated tokens); no retained suffix messages were discarded.`,
+    return Result.err(
+      autoCompactionFailure(
+        new Error(
+          `Compaction could not fit retained bounded context within the input budget (${retainedSuffixTokens} >= ${budget} estimated tokens); no retained suffix messages were discarded.`,
+        ),
+      ),
     );
   }
 
@@ -448,8 +471,12 @@ function shrinkCompactedMessagesToBudget(params: {
     (summaryMessage.role !== "user" && summaryMessage.role !== "assistant") ||
     typeof summaryMessage.content !== "string"
   ) {
-    throw new Error(
-      `Compaction could not fit bounded context within the input budget (${estimatedTokens} > ${budget} estimated tokens).`,
+    return Result.err(
+      autoCompactionFailure(
+        new Error(
+          `Compaction could not fit bounded context within the input budget (${estimatedTokens} > ${budget} estimated tokens).`,
+        ),
+      ),
     );
   }
 
@@ -465,11 +492,24 @@ function shrinkCompactedMessagesToBudget(params: {
   const compacted = [buildCompactionSummaryMessage(shrunkSummary), ...retainedSuffix];
   const compactedTokens = estimateMessagesTokens(compacted);
   if (compactedTokens > budget) {
-    throw new Error(
-      `Compaction could not fit bounded context within the input budget (${compactedTokens} > ${budget} estimated tokens).`,
+    return Result.err(
+      autoCompactionFailure(
+        new Error(
+          `Compaction could not fit bounded context within the input budget (${compactedTokens} > ${budget} estimated tokens).`,
+        ),
+      ),
     );
   }
-  return { messages: compacted, summary: shrunkSummary };
+  return Result.ok({ messages: compacted, summary: shrunkSummary });
+}
+
+function shrinkCompactedMessagesToBudget(params: {
+  messages: readonly ModelMessage[];
+  inputBudget: number;
+  summary: string;
+}): { messages: ModelMessage[]; summary: string } {
+  const result = shrinkCompactedMessagesToBudgetResult(params);
+  return result.status === "ok" ? result.value : signalAutoCompactionHost(result.error);
 }
 
 type CompactionBoundary = {
@@ -774,7 +814,11 @@ export type ServerCompactionFn = (params: {
   readonly abortSignal?: AbortSignal;
 }) => Promise<OpenAIServerCompactionArtifact>;
 
-async function summarizeMessagesHierarchical(options: {
+export interface ServerCompactionErrorHandler {
+  (error: OpaqueAgentValue): void;
+}
+
+type SummarizeMessagesHierarchicalOptions = {
   messages: readonly ModelMessage[];
   initialChunkTokenBudget: number;
   maxReductionPasses: number;
@@ -789,13 +833,17 @@ async function summarizeMessagesHierarchical(options: {
   ) => Promise<string>;
   onProgress?: (progress: CompactionProgress) => void;
   abortSignal?: AbortSignal;
-}): Promise<string> {
+};
+
+async function summarizeMessagesHierarchicalResult(
+  options: SummarizeMessagesHierarchicalOptions,
+): Promise<ResultType<string, AutoCompactionFailed>> {
   let budget = Math.max(1, options.initialChunkTokenBudget);
   let maxCharsPerMessage = Math.max(200, options.initialMaxCharsPerMessage);
   let maxCharsTotal = Math.max(500, options.initialMaxCharsTotal);
 
   const maxPasses = Math.max(1, options.maxReductionPasses);
-  let lastError: unknown;
+  let lastError: OpaqueAgentValue;
 
   for (let pass = 0; pass < maxPasses; pass++) {
     try {
@@ -827,11 +875,12 @@ async function summarizeMessagesHierarchical(options: {
         );
       }
 
-      return (summary ?? "").trim();
+      return Result.ok((summary ?? "").trim());
     } catch (error) {
+      rethrowAgentPanic(error);
       lastError = error;
       if (!isLikelyContextOverflowError(error)) {
-        throw error;
+        return Result.err(autoCompactionFailure(error));
       }
       // Keep token and character budgets in lockstep.
       budget = Math.max(1, Math.floor(budget * SUMMARY_OVERFLOW_RETRY_SCALE));
@@ -843,9 +892,18 @@ async function summarizeMessagesHierarchical(options: {
     }
   }
 
-  throw lastError instanceof Error
-    ? lastError
-    : new Error("Compaction summarization failed after recursive chunk retries.");
+  return Result.err(
+    autoCompactionFailure(
+      lastError ?? new Error("Compaction summarization failed after recursive chunk retries."),
+    ),
+  );
+}
+
+async function summarizeMessagesHierarchical(
+  options: SummarizeMessagesHierarchicalOptions,
+): Promise<string> {
+  const result = await summarizeMessagesHierarchicalResult(options);
+  return result.status === "ok" ? result.value : signalAutoCompactionHost(result.error);
 }
 
 const DEFAULT_THRESHOLD_FRACTION = 0.8;
@@ -906,6 +964,15 @@ type CompactionScheduleReason = "threshold" | "overflow";
 type PendingCompactionReason = CompactionScheduleReason;
 
 export type CompactionSummaryModel = "current" | LanguageModel | (() => LanguageModel);
+
+function resolveSummaryModel(
+  summaryModel: CompactionSummaryModel,
+  currentModel: LanguageModel,
+): LanguageModel {
+  if (summaryModel === "current") return currentModel;
+  if (typeof summaryModel === "function") return summaryModel();
+  return summaryModel;
+}
 
 type AutoCompactionObservedBudget = {
   inputBudget: number;
@@ -1299,7 +1366,7 @@ export type AutoCompactionOptions = {
   serverCompactionEnabled?: () => boolean;
 
   /** Reports native-lane failure before the local compaction result is used. */
-  onServerCompactionError?: (error: unknown) => void;
+  onServerCompactionError?: ServerCompactionErrorHandler;
 
   /** Optional base turn error handler to chain before overflow recovery logic. */
   baseTurnErrorHandler?: TurnErrorHandler;
@@ -1376,7 +1443,7 @@ export type ManualCompactionOptions = {
   serverCompactionContext?: TransformMessagesContext;
 
   /** Reports native-lane failure before the local compaction result is used. */
-  onServerCompactionError?: (error: unknown) => void;
+  onServerCompactionError?: ServerCompactionErrorHandler;
 
   /** Override summary system prompt. */
   summarySystem?: string;
@@ -1425,7 +1492,7 @@ type CompactRepairedMessagesOptions = {
   serverCompaction?: ServerCompactionFn;
   serverCompactionEnabled?: () => boolean;
   serverCompactionContext?: TransformMessagesContext;
-  onServerCompactionError?: (error: unknown) => void;
+  onServerCompactionError?: ServerCompactionErrorHandler;
   abortSignal?: AbortSignal;
 } & CompactionStreamHooks;
 
@@ -1437,7 +1504,7 @@ type CompactRepairedMessagesResult = {
 
 async function compactRepairedMessages(
   options: CompactRepairedMessagesOptions,
-): Promise<CompactRepairedMessagesResult | null> {
+): Promise<ResultType<CompactRepairedMessagesResult | null, AutoCompactionFailed>> {
   const maxCompactionPasses = DEFAULT_COMPACTION_MAX_PASSES;
   let passKeepRecentTokens = resolveRetainedTailTokenCap(
     options.budget.inputBudget,
@@ -1480,35 +1547,39 @@ async function compactRepairedMessages(
       Math.floor(options.budget.inputBudget * 4 * passScale),
     );
 
-    let finalSummary = (
-      await summarizeMessagesHierarchical({
-        messages: historyMessages,
-        initialChunkTokenBudget: chunkTokenBudget,
-        maxReductionPasses: DEFAULT_SUMMARY_REDUCTION_PASSES,
-        initialMaxCharsPerMessage: Math.max(2_000, chunkTokenBudget * 4),
-        initialMaxCharsTotal: Math.max(4_000, chunkTokenBudget * 6),
-        stage: "history",
-        summarizeChunk: async (transcriptText, previousSummary, abortSignal, progress) => {
-          const prompt = previousSummary
-            ? options.buildSummaryUpdatePrompt(previousSummary, transcriptText)
-            : options.buildSummaryPrompt(transcriptText);
-          return await summarizePrompt({
-            model: options.resolveModel(),
-            system: options.summarySystem,
-            prompt,
-            providerOptions: options.providerOptions,
-            abortSignal,
-            onDelta: options.onSummaryDelta
-              ? (delta) => options.onSummaryDelta?.(delta, progress)
-              : undefined,
-          });
-        },
-        onProgress: options.onProgress,
-        abortSignal: options.abortSignal,
-      })
-    ).trim();
+    const summarized = await summarizeMessagesHierarchicalResult({
+      messages: historyMessages,
+      initialChunkTokenBudget: chunkTokenBudget,
+      maxReductionPasses: DEFAULT_SUMMARY_REDUCTION_PASSES,
+      initialMaxCharsPerMessage: Math.max(2_000, chunkTokenBudget * 4),
+      initialMaxCharsTotal: Math.max(4_000, chunkTokenBudget * 6),
+      stage: "history",
+      summarizeChunk: async (transcriptText, previousSummary, abortSignal, progress) => {
+        const prompt = previousSummary
+          ? options.buildSummaryUpdatePrompt(previousSummary, transcriptText)
+          : options.buildSummaryPrompt(transcriptText);
+        return await summarizePrompt({
+          model: options.resolveModel(),
+          system: options.summarySystem,
+          prompt,
+          providerOptions: options.providerOptions,
+          abortSignal,
+          onDelta: options.onSummaryDelta
+            ? (delta) => options.onSummaryDelta?.(delta, progress)
+            : undefined,
+        });
+      },
+      onProgress: options.onProgress,
+      abortSignal: options.abortSignal,
+    });
+    if (summarized.status === "error") return Result.err(summarized.error);
+    let finalSummary = summarized.value.trim();
     if (!finalSummary) {
-      throw new Error("Compaction summarization returned no summary for selected transcript.");
+      return Result.err(
+        autoCompactionFailure(
+          new Error("Compaction summarization returned no summary for selected transcript."),
+        ),
+      );
     }
 
     finalSummary = truncateText(finalSummary, summaryMaxChars);
@@ -1528,22 +1599,24 @@ async function compactRepairedMessages(
     passKeepRecentTokens = Math.max(1, Math.floor(passKeepRecentTokens * 0.6));
   }
 
-  if (!compactedCandidate) return null;
+  if (!compactedCandidate) return Result.ok(null);
 
   // Final shrinking can truncate the summary; report the post-shrink text so
   // the persisted summary never diverges from the committed model context.
-  const localCompaction = shrinkCompactedMessagesToBudget({
+  const localCompactionResult = shrinkCompactedMessagesToBudgetResult({
     messages: compactedCandidate,
     inputBudget: options.budget.inputBudget,
     summary: persistedSummary,
   });
+  if (localCompactionResult.status === "error") return Result.err(localCompactionResult.error);
+  const localCompaction = localCompactionResult.value;
 
   if (
     !options.serverCompaction ||
     !serverCompactionMessages ||
     options.serverCompactionEnabled?.() === false
   ) {
-    return localCompaction;
+    return Result.ok(localCompaction);
   }
 
   try {
@@ -1578,13 +1651,18 @@ async function compactRepairedMessages(
         ...suffix,
       ];
     }
-    return estimateMessagesTokens(nativeMessages) <= options.budget.inputBudget
-      ? { ...localCompaction, serverMessages: nativeMessages }
-      : localCompaction;
+    return Result.ok(
+      estimateMessagesTokens(nativeMessages) <= options.budget.inputBudget
+        ? { ...localCompaction, serverMessages: nativeMessages }
+        : localCompaction,
+    );
   } catch (error) {
-    if (options.abortSignal?.aborted === true || isAbortError(error)) throw error;
+    rethrowAgentPanic(error);
+    if (options.abortSignal?.aborted === true) {
+      return Result.err(autoCompactionFailure(error));
+    }
     options.onServerCompactionError?.(error);
-    return localCompaction;
+    return Result.ok(localCompaction);
   }
 }
 
@@ -1667,19 +1745,14 @@ export async function compactMessages(
   if (compactableMessages.length === 0) return noop("no-compactable-messages");
 
   const summaryModel = options.summaryModel ?? "current";
-  const compacted = await compactRepairedMessages({
+  const compactedResult = await compactRepairedMessages({
     messages: compactableMessages,
     budget,
     summaryContextLimit: pickSummaryContextLimit({
       summaryContextLimit: options.summaryContextLimit,
       fallbackContextLimit: options.contextLimit,
     }),
-    resolveModel: () =>
-      summaryModel === "current"
-        ? options.currentModel
-        : typeof summaryModel === "function"
-          ? summaryModel()
-          : summaryModel,
+    resolveModel: () => resolveSummaryModel(summaryModel, options.currentModel),
     providerOptions: buildSummaryProviderOptions(options.providerOptions),
     serverCompaction: options.serverCompaction,
     serverCompactionContext: options.serverCompactionContext,
@@ -1693,6 +1766,8 @@ export async function compactMessages(
     onProgress: options.onProgress,
     onSummaryDelta: options.onSummaryDelta,
   });
+  if (compactedResult.status === "error") return signalAutoCompactionHost(compactedResult.error);
+  const compacted = compactedResult.value;
   if (!compacted) return noop("already-minimal");
 
   const messages = cloneMessages(compacted.messages);
@@ -1762,6 +1837,7 @@ async function resolveContextLimit(params: {
       signal: params.abortSignal,
     });
   } catch (error) {
+    rethrowAgentPanic(error);
     modelInfo = undefined;
     modelResolveError = error;
   }
@@ -1859,10 +1935,12 @@ async function compactCanonicalMessages(options: {
   onProgress?: CompactionStreamHooks["onProgress"];
   onSummaryDelta?: CompactionStreamHooks["onSummaryDelta"];
   maximumCanonicalSuffixStart?: number;
-}): Promise<CompactCanonicalMessagesResult | null> {
+}): Promise<ResultType<CompactCanonicalMessagesResult | null, AutoCompactionFailed>> {
   const overlayTokens = estimateMessagesTokens(options.overlay);
   if (overlayTokens >= options.budget.inputBudget) {
-    throw new Error("Ephemeral overlay exceeds the compaction input budget.");
+    return Result.err(
+      autoCompactionFailure(new Error("Ephemeral overlay exceeds the compaction input budget.")),
+    );
   }
 
   let retainedTokenCap = Math.min(
@@ -1894,7 +1972,7 @@ async function compactCanonicalMessages(options: {
     ) {
       suffixStart = options.maximumCanonicalSuffixStart;
     }
-    if (suffixStart === 0) return null;
+    if (suffixStart === 0) return Result.ok(null);
 
     const canonicalPrefix = options.canonicalMessages.slice(0, suffixStart);
     const canonicalSuffix = options.canonicalMessages.slice(suffixStart);
@@ -1904,7 +1982,7 @@ async function compactCanonicalMessages(options: {
         canonicalStartIndex: 0,
       }),
     ).messages;
-    if (transformedPrefix.length === 0) return null;
+    if (transformedPrefix.length === 0) return Result.ok(null);
     const transformedSuffix = await options.prepareFullModelView(canonicalSuffix, {
       ...options.context,
       canonicalStartIndex: suffixStart,
@@ -1922,7 +2000,7 @@ async function compactCanonicalMessages(options: {
       ...options.budget,
       inputBudget: options.budget.inputBudget - suffixAndOverlayTokens,
     };
-    const compactedPrefix = await compactRepairedMessages({
+    const compactedPrefixResult = await compactRepairedMessages({
       messages: transformedPrefix,
       budget: prefixBudget,
       summaryContextLimit: options.summaryContextLimit,
@@ -1942,7 +2020,9 @@ async function compactCanonicalMessages(options: {
       onProgress: options.onProgress,
       onSummaryDelta: options.onSummaryDelta,
     });
-    if (!compactedPrefix) return null;
+    if (compactedPrefixResult.status === "error") return Result.err(compactedPrefixResult.error);
+    const compactedPrefix = compactedPrefixResult.value;
+    if (!compactedPrefix) return Result.ok(null);
 
     const summaryMessage = buildCompactionSummaryMessage(compactedPrefix.summary);
     const canonicalMessages = [summaryMessage, ...cloneMessages(canonicalSuffix)];
@@ -1955,18 +2035,22 @@ async function compactCanonicalMessages(options: {
       context: options.context,
     });
     if (estimate <= options.budget.inputBudget) {
-      return {
+      return Result.ok({
         canonicalMessages,
         preparedMessages,
         summary: compactedPrefix.summary,
         usesServerCompaction: compactedPrefix.serverMessages !== undefined,
         originalCanonicalSuffixStart: suffixStart,
-      };
+      });
     }
     retainedTokenCap = Math.max(0, Math.floor(retainedTokenCap * 0.6));
   }
 
-  throw new Error("Compaction could not fit the canonical summary and untouched suffix.");
+  return Result.err(
+    autoCompactionFailure(
+      new Error("Compaction could not fit the canonical summary and untouched suffix."),
+    ),
+  );
 }
 
 export async function attachAutoCompaction(
@@ -2106,7 +2190,7 @@ export async function attachAutoCompaction(
           attempts: overflowRecoveryAttempts,
           maxAttempts: overflowRecoveryMaxAttempts,
         });
-        throw decision.terminalError;
+        return signalAutoCompactionHost(autoCompactionFailure(decision.terminalError));
       }
       return "fail";
     }
@@ -2195,28 +2279,39 @@ export async function attachAutoCompaction(
     readonly preparedFullView: readonly ModelMessage[];
     readonly overlay: readonly ModelMessage[];
     readonly context: TransformMessagesContext;
-  }): Promise<{
-    readonly ordinary: number;
-    readonly floor: number | null;
-    readonly effective: number;
-  }> => {
+  }): Promise<
+    ResultType<
+      {
+        readonly ordinary: number;
+        readonly floor: number | null;
+        readonly effective: number;
+      },
+      AutoCompactionFailed
+    >
+  > => {
     const ordinary = estimateModelInputTokens({
       messages: [...input.preparedFullView, ...input.overlay],
       context: input.context,
     });
-    if (!options.inputEstimateFloor) return { ordinary, floor: null, effective: ordinary };
+    if (!options.inputEstimateFloor) {
+      return Result.ok({ ordinary, floor: null, effective: ordinary });
+    }
     const floor = await options.inputEstimateFloor({
       ...input,
       ordinaryModelInputEstimate: ordinary,
       estimateMessagesTokens,
     });
-    if (floor === null) return { ordinary, floor: null, effective: ordinary };
+    if (floor === null) return Result.ok({ ordinary, floor: null, effective: ordinary });
     if (typeof floor !== "number" || !Number.isFinite(floor) || floor < 0) {
-      throw new TypeError(
-        "Auto-compaction input estimate floor must return null or a finite non-negative number",
+      return Result.err(
+        autoCompactionFailure(
+          new TypeError(
+            "Auto-compaction input estimate floor must return null or a finite non-negative number",
+          ),
+        ),
       );
     }
-    return { ordinary, floor, effective: Math.max(ordinary, floor) };
+    return Result.ok({ ordinary, floor, effective: Math.max(ordinary, floor) });
   };
 
   const canonicalModelCallPreflight: CanonicalModelCallPreflight = async (messages, context) => {
@@ -2241,21 +2336,26 @@ export async function attachAutoCompaction(
     // Model-view transforms may omit media for transport safety. That is not
     // evidence of token pressure: only provider usage, text fallback estimates,
     // or an actual context overflow may schedule transcript compaction.
-    const inputEstimate = await resolveInputEstimate({
+    const inputEstimateResult = await resolveInputEstimate({
       canonicalMessages,
       preparedFullView: maybeTransformed,
       overlay,
       context,
     });
+    if (inputEstimateResult.status === "error") {
+      return signalAutoCompactionHost(inputEstimateResult.error);
+    }
+    const inputEstimate = inputEstimateResult.value;
     const modelInputEstimate = inputEstimate.effective;
     lastModelInputEstimate = modelInputEstimate;
     const providerInputTokens = thresholdInputSource === "usage" ? lastTurnInputTokens : null;
-    const observedInputTokens =
-      providerInputTokens === null
-        ? modelInputEstimate
-        : inputEstimate.floor === null
+    let observedInputTokens = modelInputEstimate;
+    if (providerInputTokens !== null) {
+      observedInputTokens =
+        inputEstimate.floor === null
           ? providerInputTokens
           : Math.max(providerInputTokens, inputEstimate.effective);
+    }
     const inputTokenSource =
       providerInputTokens === null ||
       (inputEstimate.floor !== null && inputEstimate.effective > providerInputTokens)
@@ -2359,7 +2459,11 @@ export async function attachAutoCompaction(
       });
       const trailerTokens = estimateMessagesTokens(preparedTrailer);
       if (trailerTokens >= activeBudget.inputBudget) {
-        throw new Error("Compaction continuation trailer exceeds the input budget.");
+        return signalAutoCompactionHost(
+          autoCompactionFailure(
+            new Error("Compaction continuation trailer exceeds the input budget."),
+          ),
+        );
       }
       const contentBudget = {
         ...activeBudget,
@@ -2374,19 +2478,14 @@ export async function attachAutoCompaction(
           ? latestCapability.contextLimit
           : Math.max(2_048, Math.floor(activeBudget.inputBudget * 1.5)),
       });
-      const compactionOutcome = await compactCanonicalMessages({
+      const compactionResult = await compactCanonicalMessages({
         canonicalMessages: compactableMessages,
         prepareFullModelView: prepareBudgetBase,
         overlay,
         context,
         budget: contentBudget,
         summaryContextLimit,
-        resolveModel: () =>
-          summaryModel === "current"
-            ? agent.state.model
-            : typeof summaryModel === "function"
-              ? summaryModel()
-              : summaryModel,
+        resolveModel: () => resolveSummaryModel(summaryModel, agent.state.model),
         providerOptions: buildSummaryProviderOptions(agent.state.providerOptions),
         serverCompaction: options.serverCompaction,
         serverCompactionEnabled: options.serverCompactionEnabled,
@@ -2408,17 +2507,28 @@ export async function attachAutoCompaction(
             currentStart < 0 ||
             currentStart > canonicalMessages.length
           ) {
-            throw new RangeError(
-              "Current-input canonical start is outside the compaction transcript",
+            return signalAutoCompactionHost(
+              autoCompactionFailure(
+                new RangeError(
+                  "Current-input canonical start is outside the compaction transcript",
+                ),
+              ),
             );
           }
           return Math.min(currentStart, compactableMessages.length);
         })(),
       });
-
-      if (!compactionOutcome) {
-        throw new Error("Compaction could not select transcript content for summarization.");
+      if (compactionResult.status === "error") {
+        return signalAutoCompactionHost(compactionResult.error);
       }
+      const compactionOutcome = compactionResult.value;
+
+      if (!compactionOutcome)
+        return signalAutoCompactionHost(
+          autoCompactionFailure(
+            new Error("Compaction could not select transcript content for summarization."),
+          ),
+        );
       const compacted = [...compactionOutcome.canonicalMessages, ...separated.trailer];
       const preparedCompacted = [...compactionOutcome.preparedMessages, ...preparedTrailer];
       nativeCompactionView = compactionOutcome.usesServerCompaction
@@ -2434,12 +2544,16 @@ export async function attachAutoCompaction(
         ? await options.buildEphemeralOverlay(context)
         : [];
       const refreshedFullView = [...preparedCompacted, ...refreshedOverlay];
-      const refreshedInputEstimate = await resolveInputEstimate({
+      const refreshedInputEstimateResult = await resolveInputEstimate({
         canonicalMessages: compacted,
         preparedFullView: preparedCompacted,
         overlay: refreshedOverlay,
         context,
       });
+      if (refreshedInputEstimateResult.status === "error") {
+        return signalAutoCompactionHost(refreshedInputEstimateResult.error);
+      }
+      const refreshedInputEstimate = refreshedInputEstimateResult.value;
       lastModelInputEstimate = refreshedInputEstimate.effective;
       if (latestCapability.known) {
         pendingCompactionReason =
@@ -2470,15 +2584,25 @@ export async function attachAutoCompaction(
       });
       return;
     } catch (error) {
+      rethrowAgentPanic(error);
       // An aborted turn is a deliberate stop, not a compaction defect; reporting
       // it as `failed` would surface a scary error line for an ordinary cancel.
-      const cancelled = context.abortSignal?.aborted === true || isAbortError(error);
-      options.onCompactionEnd?.({
-        ...compactionEventBase,
-        durationMs: Math.max(0, Date.now() - compactionStart),
-        status: cancelled ? "cancelled" : "failed",
-        ...(cancelled ? {} : { error }),
-      });
+      const cancelled = context.abortSignal?.aborted === true;
+      const durationMs = Math.max(0, Date.now() - compactionStart);
+      if (cancelled) {
+        options.onCompactionEnd?.({
+          ...compactionEventBase,
+          durationMs,
+          status: "cancelled",
+        });
+      } else {
+        options.onCompactionEnd?.({
+          ...compactionEventBase,
+          durationMs,
+          status: "failed",
+          error,
+        });
+      }
       throw error;
     } finally {
       inCompaction = false;

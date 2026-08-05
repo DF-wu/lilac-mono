@@ -3,8 +3,6 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
-import type { GrepResult } from "@stanley2058/lilac-fs";
-
 import { handleRequest } from "../src/cli";
 
 describe("remote fs runner grep", () => {
@@ -22,7 +20,7 @@ describe("remote fs runner grep", () => {
   });
 
   it("uses the logical file baseDir while launched from its parent", async () => {
-    const output = (await handleRequest({
+    const output = await handleRequest({
       op: "fs.grep",
       input: {
         pattern: "needle",
@@ -32,7 +30,7 @@ describe("remote fs runner grep", () => {
       },
       denyPaths: [],
       cwd: path.join(root, "nested"),
-    })) as GrepResult;
+    });
 
     expect(output.mode).toBe("hashline");
     expect(output.effectiveBackend).toBe("node-rg");

@@ -1,7 +1,9 @@
 import { createHash } from "node:crypto";
 import { isAbsolute, resolve, extname, relative, sep } from "node:path";
 import { posix as posixPath } from "node:path";
+
 import { expandTilde } from "@stanley2058/lilac-fs";
+import { Result, TaggedError, type Result as ResultType } from "better-result";
 
 const RESTRICTED_TMP_ROOT = "/tmp/lilac-restricted";
 const RESTRICTED_TMP_MOUNT = "/tmp";
@@ -10,6 +12,15 @@ type ToolPathRequestContext = {
   sessionId?: string;
   safetyMode?: "trusted" | "restricted";
 };
+
+export class RestrictedToolPathError extends TaggedError("RestrictedToolPathError")<{
+  readonly reason: "session-required" | "outside-tmp";
+  readonly message: string;
+}> {}
+
+export class DataUrlInvalidError extends TaggedError("DataUrlInvalidError")<{
+  readonly message: string;
+}> {}
 
 export function resolveToolPath(toolRoot: string, inputPath: string): string {
   const expanded = expandTilde(inputPath);
@@ -32,21 +43,31 @@ export function resolveRestrictedSessionTmpDir(sessionId: string | undefined): s
   return resolve(RESTRICTED_TMP_ROOT, restrictedSessionPathToken(sessionId));
 }
 
-export function resolveToolPathForRequestContext(params: {
+export function resolveToolPathForRequestContextResult(params: {
   cwd: string;
   inputPath: string;
   context?: ToolPathRequestContext | undefined;
-}): string {
+}): ResultType<string, RestrictedToolPathError> {
   if (params.context?.safetyMode !== "restricted") {
-    return resolveToolPath(params.cwd, params.inputPath);
+    return Result.ok(resolveToolPath(params.cwd, params.inputPath));
   }
 
   if (!params.context.sessionId) {
-    throw new Error("Restricted mode file paths require a session id.");
+    return Result.err(
+      new RestrictedToolPathError({
+        reason: "session-required",
+        message: "Restricted mode file paths require a session id.",
+      }),
+    );
   }
 
   if (params.inputPath.startsWith("~")) {
-    throw new Error("Restricted mode only allows file paths under /tmp.");
+    return Result.err(
+      new RestrictedToolPathError({
+        reason: "outside-tmp",
+        message: "Restricted mode only allows file paths under /tmp.",
+      }),
+    );
   }
 
   const cwd = params.cwd.startsWith("/") ? params.cwd : `/${params.cwd}`;
@@ -57,17 +78,35 @@ export function resolveToolPathForRequestContext(params: {
   const virtualPath = posixPath.normalize(input);
 
   if (virtualPath !== RESTRICTED_TMP_MOUNT && !virtualPath.startsWith(`${RESTRICTED_TMP_MOUNT}/`)) {
-    throw new Error("Restricted mode only allows file paths under /tmp.");
+    return Result.err(
+      new RestrictedToolPathError({
+        reason: "outside-tmp",
+        message: "Restricted mode only allows file paths under /tmp.",
+      }),
+    );
   }
 
   const relativeToTmp = virtualPath === RESTRICTED_TMP_MOUNT ? "" : virtualPath.slice(5);
   const tmpRoot = resolveRestrictedSessionTmpDir(params.context.sessionId);
   const resolved = resolve(tmpRoot, relativeToTmp.split("/").join(sep));
   if (!isPathInside(tmpRoot, resolved)) {
-    throw new Error("Restricted mode only allows file paths under /tmp.");
+    return Result.err(
+      new RestrictedToolPathError({
+        reason: "outside-tmp",
+        message: "Restricted mode only allows file paths under /tmp.",
+      }),
+    );
   }
 
-  return resolved;
+  return Result.ok(resolved);
+}
+
+export function resolveToolPathForRequestContext(
+  params: Parameters<typeof resolveToolPathForRequestContextResult>[0],
+): string {
+  const resolved = resolveToolPathForRequestContextResult(params);
+  if (resolved.status === "ok") return resolved.value;
+  throw resolved.error;
 }
 
 export function formatToolPathForRequestContext(params: {
@@ -184,13 +223,12 @@ export function looksLikeDataUrl(s: string): boolean {
   return s.startsWith("data:");
 }
 
-export function decodeDataUrl(s: string): {
-  bytes: Buffer;
-  mimeType?: string;
-} {
+export function decodeDataUrlResult(
+  s: string,
+): ResultType<{ bytes: Buffer; mimeType?: string }, DataUrlInvalidError> {
   const comma = s.indexOf(",");
   if (comma < 0) {
-    throw new Error("Invalid data URL");
+    return Result.err(new DataUrlInvalidError({ message: "Invalid data URL" }));
   }
 
   const meta = s.slice(5, comma);
@@ -201,7 +239,13 @@ export function decodeDataUrl(s: string): {
   const isBase64 = metaParts.includes("base64");
 
   const bytes = isBase64 ? Buffer.from(data, "base64") : Buffer.from(data, "utf8");
-  return { bytes, mimeType };
+  return Result.ok({ bytes, mimeType });
+}
+
+export function decodeDataUrl(s: string): { bytes: Buffer; mimeType?: string } {
+  const decoded = decodeDataUrlResult(s);
+  if (decoded.status === "ok") return decoded.value;
+  throw decoded.error;
 }
 
 export function sanitizeExtension(ext: string): string {

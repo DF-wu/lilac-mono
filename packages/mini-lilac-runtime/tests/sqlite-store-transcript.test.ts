@@ -5,11 +5,13 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 
 import type { MiniLilacUIMessage } from "@stanley2058/mini-lilac-client";
+import { CorruptPersistedFields } from "@stanley2058/lilac-utils";
 import type { ModelMessage } from "ai";
 import superjson from "superjson";
 import { z } from "zod";
 
 import { MINI_LILAC_DATABASE_SCHEMA_VERSION, MiniLilacSqliteStore } from "../src/sqlite-store";
+import { validateMiniLilacPersistedSuperJsonValue } from "../src/sqlite-transcript-projection";
 
 const temporaryDirectories: string[] = [];
 
@@ -231,6 +233,16 @@ function seedLegacyTranscripts(
 }
 
 describe("MiniLilacSqliteStore transcript schema", () => {
+  it("returns an owned Result for invalid SuperJSON projection values", () => {
+    expect(validateMiniLilacPersistedSuperJsonValue({ nested: new Date("invalid") })).toMatchObject(
+      {
+        status: "error",
+        error: { _tag: "MiniLilacPersistedSuperJsonValueInvalid" },
+      },
+    );
+    expect(validateMiniLilacPersistedSuperJsonValue({ nested: new Date(0) }).status).toBe("ok");
+  });
+
   it("migrates v2 chains and divergent checkpoints while preserving durable state", async () => {
     const { databasePath } = await createV2Database();
     seedLegacyTranscripts(databasePath);
@@ -358,9 +370,7 @@ describe("MiniLilacSqliteStore transcript schema", () => {
       .run(serialize({ invalid: true }));
     database.close();
 
-    expect(() => new MiniLilacSqliteStore(databasePath)).toThrow(
-      "Invalid canonical model transcript",
-    );
+    expect(() => new MiniLilacSqliteStore(databasePath)).toThrow(CorruptPersistedFields);
 
     const unchanged = new Database(databasePath, { strict: true });
     expect(unchanged.query("PRAGMA user_version").get()).toEqual({ user_version: 2 });

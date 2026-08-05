@@ -1,4 +1,4 @@
-import type { MsgRef, SessionRef, SurfaceAttachment } from "../../types";
+import type { GithubSessionRef, MsgRef, SurfaceAttachment } from "../../types";
 import type { SurfaceOutputPart, SurfaceOutputResult, SurfaceOutputStream } from "../../adapter";
 
 import { createIssueComment } from "../../../github/github-api";
@@ -11,13 +11,9 @@ export class GithubOutputStream implements SurfaceOutputStream {
   private created: MsgRef[] = [];
 
   constructor(
-    private readonly sessionRef: SessionRef,
+    private readonly sessionRef: GithubSessionRef,
     private readonly opts?: { replyTo?: MsgRef },
-  ) {
-    if (sessionRef.platform !== "github") {
-      throw new Error("GithubOutputStream requires a github sessionRef");
-    }
-  }
+  ) {}
 
   async push(part: SurfaceOutputPart): Promise<void> {
     switch (part.type) {
@@ -55,10 +51,6 @@ export class GithubOutputStream implements SurfaceOutputStream {
   }
 
   async finish(): Promise<SurfaceOutputResult> {
-    if (this.sessionRef.platform !== "github") {
-      throw new Error("GithubOutputStream.finish requires a github sessionRef");
-    }
-
     const thread = parseGithubSessionId(this.sessionRef.channelId);
 
     const replyPrefix = (() => {

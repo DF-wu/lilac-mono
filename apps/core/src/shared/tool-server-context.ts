@@ -1,4 +1,6 @@
 import type { AdapterPlatform } from "@stanley2058/lilac-event-bus";
+import { Result, TaggedError, type Result as ResultType } from "better-result";
+
 import type { RequestContext } from "../tool-server/types";
 import { isAdapterPlatform } from "./is-adapter-platform";
 
@@ -8,25 +10,49 @@ export type RequiredToolServerHeaders = {
   request_client: AdapterPlatform;
 };
 
-export function requireToolServerHeaders(
+export class ToolServerContextInvalidError extends TaggedError("ToolServerContextInvalidError")<{
+  readonly label: string;
+  readonly message: string;
+}> {}
+
+export function decodeToolServerHeaders(
   ctx: RequestContext | undefined,
   label: string,
-): RequiredToolServerHeaders {
+): ResultType<RequiredToolServerHeaders, ToolServerContextInvalidError> {
   const requestId = ctx?.requestId;
   const sessionId = ctx?.sessionId;
   const requestClient = ctx?.requestClient;
 
   if (!requestId || !sessionId || !requestClient) {
-    throw new Error(`${label} tool requires request context (requestId/sessionId/requestClient)`);
+    return Result.err(
+      new ToolServerContextInvalidError({
+        label,
+        message: `${label} tool requires request context (requestId/sessionId/requestClient)`,
+      }),
+    );
   }
 
   if (!isAdapterPlatform(requestClient)) {
-    throw new Error(`Invalid requestClient '${requestClient}'`);
+    return Result.err(
+      new ToolServerContextInvalidError({
+        label,
+        message: `Invalid requestClient '${requestClient}'`,
+      }),
+    );
   }
 
-  return {
+  return Result.ok({
     request_id: requestId,
     session_id: sessionId,
     request_client: requestClient,
-  };
+  });
+}
+
+export function requireToolServerHeaders(
+  ctx: RequestContext | undefined,
+  label: string,
+): RequiredToolServerHeaders {
+  const decoded = decodeToolServerHeaders(ctx, label);
+  if (decoded.status === "ok") return decoded.value;
+  throw decoded.error;
 }

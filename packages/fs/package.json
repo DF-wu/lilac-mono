@@ -23,6 +23,7 @@
   },
   "dependencies": {
     "@ff-labs/fff-node": "^0.9.4",
+    "better-result": "catalog:",
     "zod": "^4.3.6"
   }
 }

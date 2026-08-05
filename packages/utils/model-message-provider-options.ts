@@ -23,8 +23,14 @@ export function openAIMessagePhase(value: unknown): OpenAIMessagePhase | undefin
   return parsed.success ? parsed.data.openai.phase : undefined;
 }
 
+export function decodeOpenAICompactionPart(value: unknown): OpenAICompactionPart | undefined {
+  const parsed = openAICompactionPartSchema.safeParse(value);
+  return parsed.success ? parsed.data : undefined;
+}
+
+/** Compatibility predicate for consumers that narrow AI SDK message parts. */
 export function isOpenAICompactionPart(value: unknown): value is OpenAICompactionPart {
-  return openAICompactionPartSchema.safeParse(value).success;
+  return decodeOpenAICompactionPart(value) !== undefined;
 }
 
 function withoutOpenAIItemId(
@@ -48,13 +54,12 @@ export function withoutOpenAIItemIds(messages: readonly ModelMessage[]): ModelMe
         ...message,
         content: message.content.map((part) =>
           "providerOptions" in part
-            ? {
-                ...part,
+            ? Object.assign(structuredClone(part), {
                 providerOptions: isOpenAICompactionPart(part)
                   ? part.providerOptions
                   : withoutOpenAIItemId(part.providerOptions),
-              }
-            : { ...part },
+              })
+            : structuredClone(part),
         ),
       };
     }
@@ -64,8 +69,10 @@ export function withoutOpenAIItemIds(messages: readonly ModelMessage[]): ModelMe
         ...message,
         content: message.content.map((part) =>
           "providerOptions" in part
-            ? { ...part, providerOptions: withoutOpenAIItemId(part.providerOptions) }
-            : { ...part },
+            ? Object.assign(structuredClone(part), {
+                providerOptions: withoutOpenAIItemId(part.providerOptions),
+              })
+            : structuredClone(part),
         ),
       };
     }
@@ -73,10 +80,11 @@ export function withoutOpenAIItemIds(messages: readonly ModelMessage[]): ModelMe
     if (message.role === "user" && Array.isArray(message.content)) {
       return {
         ...message,
-        content: message.content.map((part) => ({
-          ...part,
-          providerOptions: withoutOpenAIItemId(part.providerOptions),
-        })),
+        content: message.content.map((part) =>
+          Object.assign(structuredClone(part), {
+            providerOptions: withoutOpenAIItemId(part.providerOptions),
+          }),
+        ),
       };
     }
 

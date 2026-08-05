@@ -1,5 +1,5 @@
 import ts from "typescript-codegen";
-import { z } from "zod";
+import { Result, TaggedError, type Result as ResultType } from "better-result";
 
 import { sha256 } from "./workflow-definition";
 import { compareCodeUnits } from "./workflow-domain";
@@ -10,49 +10,84 @@ const CONTEXT_NAMES = new Set(["args", ...HOST_CALLS]);
 type SourceEdit = { start: number; end: number; text: string };
 
 const MANIFEST_PREFIX = "/*lilac-workflow-call-sites:";
-const manifestEntrySchema = z.strictObject({
-  kind: z.enum(["agent", "parallel", "pipeline", "phase", "waitForReply", "sleep"]),
-  callSiteId: z.string().regex(/^wfcs:[a-f0-9]{32}$/u),
-});
-const manifestSchema = z.array(manifestEntrySchema).max(100_000);
-export type WorkflowCallSiteManifestEntry = z.infer<typeof manifestEntrySchema>;
+const MANIFEST_ENTRY_SOURCE = String.raw`\{"kind":"(?:agent|parallel|pipeline|phase|waitForReply|sleep)","callSiteId":"wfcs:[a-f0-9]{32}"\}`;
+const MANIFEST_PATTERN = new RegExp(
+  String.raw`^\[(?:${MANIFEST_ENTRY_SOURCE}(?:,${MANIFEST_ENTRY_SOURCE})*)?\]$`,
+  "u",
+);
+const MANIFEST_ENTRY_PATTERN =
+  /\{"kind":"(?<kind>agent|parallel|pipeline|phase|waitForReply|sleep)","callSiteId":"(?<callSiteId>wfcs:[a-f0-9]{32})"\}/gu;
+
+export type WorkflowCallSiteManifestEntry = {
+  readonly kind: "agent" | "parallel" | "pipeline" | "phase" | "waitForReply" | "sleep";
+  readonly callSiteId: string;
+};
+
+export class WorkflowCallSiteManifestInvalid extends TaggedError(
+  "WorkflowCallSiteManifestInvalid",
+)<{ readonly message: string }> {}
+
+export class WorkflowSourceCompileFailed extends TaggedError("WorkflowSourceCompileFailed")<{
+  readonly message: string;
+}> {}
 
 function isHostCallKind(value: string): value is WorkflowCallSiteManifestEntry["kind"] {
   return HOST_CALLS.has(value);
 }
 
-export function parseWorkflowCallSiteManifest(
+export function parseWorkflowCallSiteManifestUnchecked(
   source: string,
-): readonly WorkflowCallSiteManifestEntry[] {
-  if (!source.startsWith(MANIFEST_PREFIX)) return [];
+): ResultType<readonly WorkflowCallSiteManifestEntry[], WorkflowCallSiteManifestInvalid> {
+  const invalid = (message: string): ResultType<never, WorkflowCallSiteManifestInvalid> =>
+    Result.err(new WorkflowCallSiteManifestInvalid({ message }));
+  if (!source.startsWith(MANIFEST_PREFIX)) return Result.ok([]);
   const end = source.indexOf("*/");
-  if (end < 0) throw new Error("Compiled workflow call-site manifest is malformed");
+  if (end < 0) return invalid("Compiled workflow call-site manifest is malformed");
   const encoded = source.slice(MANIFEST_PREFIX.length, end);
-  let decoded: unknown;
-  try {
-    decoded = JSON.parse(Buffer.from(encoded, "base64url").toString("utf8"));
-  } catch {
-    throw new Error("Compiled workflow call-site manifest is malformed");
+  const decodedBytes = Buffer.from(encoded, "base64url");
+  if (
+    decodedBytes.toString("base64url") !== encoded ||
+    decodedBytes.byteLength > 16 * 1024 * 1024
+  ) {
+    return invalid("Compiled workflow call-site manifest is malformed");
   }
-  const entries = manifestSchema.parse(decoded);
+  const decoded = decodedBytes.toString("utf8");
+  if (!MANIFEST_PATTERN.test(decoded)) {
+    return invalid("Compiled workflow call-site manifest is malformed");
+  }
+  const entries: WorkflowCallSiteManifestEntry[] = [];
+  for (const match of decoded.matchAll(MANIFEST_ENTRY_PATTERN)) {
+    const kind = match.groups?.["kind"];
+    const callSiteId = match.groups?.["callSiteId"];
+    if (!kind || !callSiteId || !isHostCallKind(kind)) {
+      return invalid("Compiled workflow call-site manifest is malformed");
+    }
+    entries.push({ kind, callSiteId });
+  }
+  if (entries.length > 100_000) return invalid("Compiled workflow call-site manifest is malformed");
   const seen = new Set<string>();
   for (const entry of entries) {
     if (seen.has(entry.callSiteId)) {
-      throw new Error(
+      return invalid(
         `Compiled workflow call-site manifest contains duplicate ID: ${entry.callSiteId}`,
       );
     }
     seen.add(entry.callSiteId);
   }
-  return entries;
+  return Result.ok(entries);
 }
 
 function propertyName(name: ts.PropertyName): string | null {
   return ts.isIdentifier(name) || ts.isStringLiteral(name) ? name.text : null;
 }
 
-export function compileWorkflowSource(source: string, sourceSha256: string): string {
-  if (sha256(source) !== sourceSha256) throw new Error("Workflow compiler source hash mismatch");
+export function compileWorkflowSourceResult(
+  source: string,
+  sourceSha256: string,
+): ResultType<string, WorkflowSourceCompileFailed> {
+  const invalid = (message: string): ResultType<never, WorkflowSourceCompileFailed> =>
+    Result.err(new WorkflowSourceCompileFailed({ message }));
+  if (sha256(source) !== sourceSha256) return invalid("Workflow compiler source hash mismatch");
   const sourceFile = ts.createSourceFile(
     "workflow.js",
     source,
@@ -63,16 +98,16 @@ export function compileWorkflowSource(source: string, sourceSha256: string): str
   const importStatement = sourceFile.statements[0];
   const exportStatement = sourceFile.statements[sourceFile.statements.length - 1];
   if (!importStatement || !ts.isImportDeclaration(importStatement)) {
-    throw new Error("Workflow compiler expected the validated virtual import");
+    return invalid("Workflow compiler expected the validated virtual import");
   }
   if (!exportStatement || !ts.isExportAssignment(exportStatement)) {
-    throw new Error("Workflow compiler expected the validated default export");
+    return invalid("Workflow compiler expected the validated default export");
   }
   const definitionCall = exportStatement.expression;
-  if (!ts.isCallExpression(definitionCall)) throw new Error("Workflow definition call is missing");
+  if (!ts.isCallExpression(definitionCall)) return invalid("Workflow definition call is missing");
   const definition = definitionCall.arguments[0];
   if (!definition || !ts.isObjectLiteralExpression(definition)) {
-    throw new Error("Workflow definition object is missing");
+    return invalid("Workflow definition object is missing");
   }
   const run = definition.properties.find(
     (property): property is ts.MethodDeclaration =>
@@ -82,7 +117,7 @@ export function compileWorkflowSource(source: string, sourceSha256: string): str
   );
   const parameter = run?.parameters[0];
   if (!run?.body || !parameter || !ts.isObjectBindingPattern(parameter.name)) {
-    throw new Error("Workflow run context must use object destructuring");
+    return invalid("Workflow run context must use object destructuring");
   }
   for (const element of parameter.name.elements) {
     if (
@@ -93,7 +128,7 @@ export function compileWorkflowSource(source: string, sourceSha256: string): str
         propertyName(element.propertyName) !== element.name.text) ||
       !CONTEXT_NAMES.has(element.name.text)
     ) {
-      throw new Error("Workflow run context may destructure only unaliased declared workflow APIs");
+      return invalid("Workflow run context may destructure only unaliased declared workflow APIs");
     }
   }
 
@@ -134,5 +169,5 @@ export function compileWorkflowSource(source: string, sourceSha256: string): str
   }
   manifest.sort((left, right) => compareCodeUnits(left.callSiteId, right.callSiteId));
   const encodedManifest = Buffer.from(JSON.stringify(manifest), "utf8").toString("base64url");
-  return `${MANIFEST_PREFIX}${encodedManifest}*/\n${compiled}`;
+  return Result.ok(`${MANIFEST_PREFIX}${encodedManifest}*/\n${compiled}`);
 }

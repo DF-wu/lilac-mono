@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it } from "bun:test";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { ZodError } from "zod";
 
 import {
   CONTENT_INSPECT_MAX_SOURCE_BYTES,
@@ -46,6 +47,10 @@ describe("content.inspect", () => {
     const [entry] = await new ContentInspect().list();
 
     expect(entry?.primaryPositional).toEqual({ field: "text" });
+  });
+
+  it("retains raw Zod input validation", async () => {
+    await expect(new ContentInspect().call("content.inspect", {})).rejects.toBeInstanceOf(ZodError);
   });
 
   it("recognizes text-like media types", () => {

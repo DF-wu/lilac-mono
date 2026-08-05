@@ -1,13 +1,15 @@
 import { z } from "zod";
+import {
+  defineServerTool,
+  type ServerTool,
+  type ServerToolCallOptions,
+} from "@stanley2058/lilac-plugin-runtime";
 
-import type { ServerTool } from "../types";
 import {
   DISCOVERY_LIMIT_MAX,
   DISCOVERY_SURROUNDING_MAX,
   type DiscoveryService,
 } from "../../discovery/discovery-service";
-import { parseToolInput } from "../validation-error-message";
-import { zodObjectToCliLines } from "./zod-cli";
 
 const discoverySourceSchema = z.enum(["conversation", "prompt", "heartbeat"]);
 
@@ -91,43 +93,49 @@ const discoverySearchInputSchema = z.object({
 });
 
 export class Discovery implements ServerTool {
-  id = "discovery";
+  private readonly tool: ServerTool;
 
   constructor(
     private readonly params: {
       discovery: DiscoveryService;
     },
-  ) {}
-
-  async init(): Promise<void> {}
-  async destroy(): Promise<void> {}
-
-  async list() {
-    return [
-      {
-        callableId: "discovery.search",
-        name: "Discovery Search",
-        description:
-          "Search unified agent memory across conversations, prompts, and heartbeat files. Output is { meta, groups }, where groups[].entries[][] contains matched message/file entries plus surrounding context windows.",
-        shortInput: zodObjectToCliLines(discoverySearchInputSchema, { mode: "required" }),
-        input: zodObjectToCliLines(discoverySearchInputSchema),
-        primaryPositional: {
-          field: "query",
-        },
-      },
-    ];
+  ) {
+    this.tool = defineServerTool({
+      id: "discovery",
+      callables: ({ callable }) => ({
+        "discovery.search": callable({
+          name: "Discovery Search",
+          description:
+            "Search unified agent memory across conversations, prompts, and heartbeat files. Output is { meta, groups }, where groups[].entries[][] contains matched message/file entries plus surrounding context windows.",
+          inputSchema: discoverySearchInputSchema,
+          primaryPositional: "query",
+          run: (input) => this.params.discovery.search(input),
+        }),
+      }),
+    });
   }
 
-  async call(callableId: string, rawInput: Record<string, unknown>): Promise<unknown> {
-    if (callableId !== "discovery.search") {
-      throw new Error(`Invalid callable ID '${callableId}'`);
-    }
+  get id(): string {
+    return this.tool.id;
+  }
 
-    const input = parseToolInput({
-      callableId,
-      input: rawInput,
-      schema: discoverySearchInputSchema,
-    });
-    return await this.params.discovery.search(input);
+  init(): Promise<void> {
+    return this.tool.init();
+  }
+
+  destroy(): Promise<void> {
+    return this.tool.destroy();
+  }
+
+  list() {
+    return this.tool.list();
+  }
+
+  call(
+    callableId: string,
+    input: Record<string, unknown>,
+    opts?: ServerToolCallOptions,
+  ): Promise<unknown> {
+    return this.tool.call(callableId, input, opts);
   }
 }

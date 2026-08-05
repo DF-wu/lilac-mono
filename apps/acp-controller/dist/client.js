@@ -17,10 +17,447 @@ var __export = (target, all) => {
 import { spawn as spawn2 } from "node:child_process";
 import { randomUUID as randomUUID2 } from "node:crypto";
 
+// ../../node_modules/.bun/better-result@3.0.0/node_modules/better-result/dist/index.mjs
+function e(e2, t) {
+  return e2 === 2 ? (...e3) => e3.length >= 2 ? t(e3[0], e3[1]) : (n) => t(n, e3[0]) : e2 === 3 ? (...e3) => e3.length >= 3 ? t(e3[0], e3[1], e3[2]) : (n) => t(n, e3[0], e3[1]) : e2 === 4 ? (...e3) => e3.length >= 4 ? t(e3[0], e3[1], e3[2], e3[3]) : (n) => t(n, e3[0], e3[1], e3[2]) : (...n) => n.length >= e2 ? t(...n) : (e3) => t(e3, ...n);
+}
+var t = (e2) => e2 instanceof Error ? { name: e2.name, message: e2.message, stack: e2.stack } : e2;
+var n = class e2 extends Error {
+  _tag = `Panic`;
+  static is(t2) {
+    return t2 instanceof e2;
+  }
+  constructor(e3) {
+    if (super(e3.message, e3.cause === undefined ? undefined : { cause: e3.cause }), Object.assign(this, e3), Object.setPrototypeOf(this, new.target.prototype), this.name = `Panic`, e3.cause instanceof Error && e3.cause.stack) {
+      let t2 = e3.cause.stack.replace(/\n/g, `
+  `);
+      this.stack = `${this.stack}
+Caused by: ${t2}`;
+    }
+  }
+  toJSON() {
+    return { ...this, _tag: this._tag, name: this.name, message: this.message, cause: t(this.cause), stack: this.stack };
+  }
+  *[Symbol.iterator]() {
+    return yield* d(this), i(`Unreachable: Err yielded in Panic but generator continued`, this);
+  }
+};
+var i = (e3, t2) => {
+  throw new n({ message: e3, cause: t2 });
+};
+var a = (e3, t2) => {
+  try {
+    return e3();
+  } catch (e4) {
+    throw i(t2, e4);
+  }
+};
+var o = async (e3, t2) => {
+  try {
+    return await e3();
+  } catch (e4) {
+    throw i(t2, e4);
+  }
+};
+var s = class e3 {
+  status = `ok`;
+  constructor(e4) {
+    this.value = e4;
+  }
+  isOk() {
+    return true;
+  }
+  isErr() {
+    return false;
+  }
+  map(t2) {
+    return a(() => new e3(t2(this.value)), `map callback threw`);
+  }
+  mapError(e4) {
+    return this;
+  }
+  tryRecover(e4) {
+    return this;
+  }
+  tryRecoverAsync(e4) {
+    return Promise.resolve(this);
+  }
+  andThen(e4) {
+    return a(() => e4(this.value), `andThen callback threw`);
+  }
+  andThenAsync(e4) {
+    return o(() => e4(this.value), `andThenAsync callback threw`);
+  }
+  match(e4) {
+    return a(() => e4.ok(this.value), `match ok handler threw`);
+  }
+  unwrap(e4) {
+    return this.value;
+  }
+  unwrapOr(e4) {
+    return this.value;
+  }
+  tap(e4) {
+    return a(() => (e4(this.value), this), `tap callback threw`);
+  }
+  tapAsync(e4) {
+    return o(async () => (await e4(this.value), this), `tapAsync callback threw`);
+  }
+  tapError(e4) {
+    return this;
+  }
+  tapErrorAsync(e4) {
+    return Promise.resolve(this);
+  }
+  tapBoth(e4) {
+    return a(() => (e4.ok(this.value), this), `tapBoth ok callback threw`);
+  }
+  tapBothAsync(e4) {
+    return o(async () => (await e4.ok(this.value), this), `tapBothAsync ok callback threw`);
+  }
+  *[Symbol.iterator]() {
+    return this.value;
+  }
+};
+var c = class e4 {
+  status = `error`;
+  constructor(e5) {
+    this.error = e5;
+  }
+  isOk() {
+    return false;
+  }
+  isErr() {
+    return true;
+  }
+  map(e5) {
+    return this;
+  }
+  mapError(t2) {
+    return a(() => new e4(t2(this.error)), `mapError callback threw`);
+  }
+  tryRecover(e5) {
+    return a(() => e5(this.error), `tryRecover callback threw`);
+  }
+  tryRecoverAsync(e5) {
+    return o(() => e5(this.error), `tryRecoverAsync callback threw`);
+  }
+  andThen(e5) {
+    return this;
+  }
+  andThenAsync(e5) {
+    return Promise.resolve(this);
+  }
+  match(e5) {
+    return a(() => e5.err(this.error), `match err handler threw`);
+  }
+  unwrap(e5) {
+    return i(e5 ?? `Unwrap called on Err: ${String(this.error)}`, this.error);
+  }
+  unwrapOr(e5) {
+    return e5;
+  }
+  tap(e5) {
+    return this;
+  }
+  tapError(e5) {
+    return a(() => (e5(this.error), this), `tapError callback threw`);
+  }
+  tapAsync(e5) {
+    return Promise.resolve(this);
+  }
+  tapErrorAsync(e5) {
+    return o(async () => (await e5(this.error), this), `tapErrorAsync callback threw`);
+  }
+  tapBoth(e5) {
+    return a(() => (e5.err(this.error), this), `tapBoth err callback threw`);
+  }
+  tapBothAsync(e5) {
+    return o(async () => (await e5.err(this.error), this), `tapBothAsync err callback threw`);
+  }
+  *[Symbol.iterator]() {
+    return yield this, i(`Unreachable: Err yielded in Result.gen but generator continued`, this.error);
+  }
+};
+function l(e5) {
+  return new s(e5);
+}
+var u = (e5) => e5.status === `ok`;
+var d = (e5) => new c(e5);
+var f = (e5) => e5.status === `error`;
+var p = (e5) => e5 instanceof Error ? { name: e5.name, message: e5.message, stack: e5.stack } : e5;
+var m = (e5) => e5 instanceof Error && (`_tag` in e5) && typeof e5._tag == `string` && (`toJSON` in e5) && typeof e5.toJSON == `function`;
+var h = (e5) => {
+
+  class t2 extends Error {
+    _tag = e5;
+    constructor(t3) {
+      let n2 = t3 && `message` in t3 && typeof t3.message == `string` ? t3.message : undefined, r = t3 && `cause` in t3 ? t3.cause : undefined;
+      if (super(n2, r === undefined ? undefined : { cause: r }), t3 && Object.assign(this, t3), Object.setPrototypeOf(this, new.target.prototype), this.name = e5, r instanceof Error && r.stack) {
+        let e6 = r.stack.replace(/\n/g, `
+  `);
+        this.stack = `${this.stack}
+Caused by: ${e6}`;
+      }
+    }
+    toJSON() {
+      return { ...this, _tag: this._tag, name: this.name, message: this.message, cause: p(this.cause), stack: this.stack };
+    }
+    match(e6) {
+      return g(this, e6);
+    }
+    *[Symbol.iterator]() {
+      return yield* d(this), i(`Unreachable: Err yielded in TaggedError but generator continued`, this);
+    }
+    static is(e6) {
+      return e6 instanceof this;
+    }
+  }
+  return t2;
+};
+h.is = m;
+var g = e(2, (e5, t2) => {
+  let n2 = t2[e5._tag];
+  try {
+    return n2(e5);
+  } catch (e6) {
+    return i(`matchError handler threw`, e6);
+  }
+});
+var x = class extends h(`UnhandledException`) {
+  constructor(e5) {
+    let t2 = e5.cause instanceof Error ? `Unhandled exception: ${e5.cause.message}` : `Unhandled exception: ${String(e5.cause)}`;
+    super({ message: t2, cause: e5.cause });
+  }
+};
+var S = class extends h(`ResultDeserializationError`) {
+  constructor(e5) {
+    super({ message: e5.issues ? `Failed to deserialize Result payload` : `Failed to deserialize value as Result: expected { status: "ok", value } or { status: "error", error }`, value: e5.value, issues: e5.issues });
+  }
+};
+var C = class extends h(`ResultSerializationError`) {
+  constructor(e5) {
+    super({ message: `Failed to serialize Result payload`, value: e5.value, issues: e5.issues });
+  }
+};
+var w = (e5, t2) => {
+  try {
+    return e5();
+  } catch (e6) {
+    throw i(t2, e6);
+  }
+};
+var T = (e5, t2) => {
+  let n2 = (t3) => {
+    if (typeof e5 == `function`)
+      try {
+        return l(e5(t3));
+      } catch (e6) {
+        return d(new x({ cause: e6 }));
+      }
+    try {
+      return l(e5.try(t3));
+    } catch (t4) {
+      try {
+        return d(e5.catch(t4));
+      } catch (e6) {
+        throw i(`Result.try catch handler threw`, e6);
+      }
+    }
+  }, r = t2?.retry?.times ?? 0, a2 = 1, o2 = n2({ attempt: a2 });
+  for (let e6 = 0;e6 < r && o2.status === `error`; e6++)
+    a2++, o2 = n2({ attempt: a2 });
+  return o2;
+};
+var E = async (e5, t2) => {
+  let n2 = async (t3) => {
+    if (typeof e5 == `function`)
+      try {
+        return l(await e5(t3));
+      } catch (e6) {
+        return d(new x({ cause: e6 }));
+      }
+    try {
+      return l(await e5.try(t3));
+    } catch (t4) {
+      try {
+        return d(await e5.catch(t4));
+      } catch (e6) {
+        throw i(`Result.tryPromise catch handler threw`, e6);
+      }
+    }
+  }, r = t2?.retry;
+  if (!r)
+    return n2({ attempt: 1, signal: t2?.signal });
+  let a2 = (e6, t3, n3) => {
+    switch (t3) {
+      case `constant`:
+        return e6;
+      case `linear`:
+        return e6 * (n3 + 1);
+      case `exponential`:
+        return e6 * 2 ** n3;
+    }
+  }, o2 = r.jitter ?? false;
+  if (typeof o2 == `number` && (!Number.isFinite(o2) || o2 < 0 || o2 > 1))
+    throw i(`Result.tryPromise retry jitter must be a finite number between 0 and 1`);
+  let s2 = o2 === true ? 1 : o2 === false ? 0 : o2, c2 = (e6) => s2 === 0 ? e6 : e6 * (1 - s2 + Math.random() * s2), u2 = (e6, t3) => new Promise((n3) => {
+    if (t3?.aborted) {
+      n3(false);
+      return;
+    }
+    let r2 = () => {
+      clearTimeout(i2), n3(false);
+    }, i2 = setTimeout(() => {
+      t3?.removeEventListener(`abort`, r2), n3(true);
+    }, e6);
+    t3?.addEventListener(`abort`, r2, { once: true });
+  }), f2 = { attempt: 1, signal: t2.signal }, p2 = await n2(f2), m2 = r.shouldRetry ?? (() => true);
+  for (let e6 = 0;e6 < r.times && !(p2.status !== `error` || f2.signal?.aborted); e6++) {
+    let o3 = p2.error;
+    if (!w(() => m2(o3, f2), `shouldRetry predicate threw`))
+      break;
+    let s3;
+    if (typeof r.delayMs == `function`) {
+      let e7 = r.delayMs;
+      s3 = w(() => e7(o3, f2), `Result.tryPromise delayMs callback threw`);
+    } else {
+      if (r.backoff === undefined)
+        throw i(`Result.tryPromise static retry delay requires backoff`);
+      s3 = c2(a2(r.delayMs, r.backoff, e6));
+    }
+    if (!await u2(s3, f2.signal) || f2.signal?.aborted)
+      break;
+    f2 = { attempt: f2.attempt + 1, signal: t2.signal }, p2 = await n2(f2);
+  }
+  return p2;
+};
+var D = e(2, (e5, t2) => e5.map(t2));
+var O = e(2, (e5, t2) => e5.mapError(t2));
+var k = e(2, (e5, t2) => e5.tryRecover(t2));
+var A = e(2, (e5, t2) => e5.andThen(t2));
+var ee = e(2, (e5, t2) => e5.tryRecoverAsync(t2));
+var te = e(2, (e5, t2) => e5.andThenAsync(t2));
+var ne = e(2, (e5, t2) => e5.match(t2));
+var j = e(2, (e5, t2) => e5.tap(t2));
+var M = e(2, (e5, t2) => e5.tapAsync(t2));
+var N = e(2, (e5, t2) => e5.tapError(t2));
+var P = e(2, (e5, t2) => e5.tapErrorAsync(t2));
+var F = e(2, (e5, t2) => e5.tapBoth(t2));
+var I = e(2, (e5, t2) => e5.tapBothAsync(t2));
+var L = (e5, t2) => e5.unwrap(t2);
+function R(e5) {
+  if (!(typeof e5 == `object` && e5 && (`status` in e5) && (e5.status === `ok` || e5.status === `error`)))
+    return i(`Result.gen body must return Result.ok() or Result.err(), got: ` + (e5 === null ? `null` : typeof e5 == `object` ? JSON.stringify(e5) : String(e5)));
+}
+var z = e(2, (e5, t2) => e5.unwrapOr(t2));
+var B = (e5, t2) => {
+  let n2 = e5.call(t2);
+  if (Symbol.asyncIterator in n2)
+    return (async () => {
+      let e6 = n2, t3;
+      try {
+        t3 = await e6.next();
+      } catch (e7) {
+        throw i(`generator body threw`, e7);
+      }
+      if (R(t3.value), !t3.done)
+        try {
+          await e6.return?.(undefined);
+        } catch (e7) {
+          throw i(`generator cleanup threw`, e7);
+        }
+      return t3.value;
+    })();
+  let r = n2, a2;
+  try {
+    a2 = r.next();
+  } catch (e6) {
+    throw i(`generator body threw`, e6);
+  }
+  if (R(a2.value), !a2.done)
+    try {
+      r.return?.(undefined);
+    } catch (e6) {
+      throw i(`generator cleanup threw`, e6);
+    }
+  return a2.value;
+};
+async function* V(e5) {
+  return yield* await e5;
+}
+function H(e5) {
+  return typeof e5 == `object` && !!e5 && `status` in e5 && (e5.status === `ok` || e5.status === `error`);
+}
+var U = (e5) => typeof e5 == `object` && !!e5 && (`then` in e5) && typeof e5.then == `function`;
+var W = (e5, t2) => w(e5, t2);
+var G = (e5, t2, n2) => U(e5) ? Promise.resolve(e5).catch((e6) => {
+  throw i(t2, e6);
+}).then(n2) : n2(e5);
+var K = (e5, t2) => (`issues` in e5) && e5.issues ? d(t2(e5.issues)) : l(e5.value);
+var q = (e5, t2) => G(W(() => e5[`~standard`].validate(t2), `Result.codec serialize schema threw`), `Result.codec serialize schema threw`, (e6) => K(e6, (e7) => new C({ value: t2, issues: e7 })));
+var J = (e5, t2) => G(W(() => e5[`~standard`].validate(t2), `Result.codec deserialize schema threw`), `Result.codec deserialize schema threw`, (e6) => K(e6, (e7) => new S({ value: t2, issues: e7 })));
+var Y = (e5, t2) => U(e5) ? Promise.resolve(e5).then((e6) => e6.unwrap(t2)) : e5.unwrap(t2);
+var X = (e5) => {
+  let t2 = (e6) => e6.status === `ok` ? l(e6.value) : S.is(e6.error) ? e6.unwrap(`Result.codec deserializeUnsafe failed`) : d(e6.error);
+  return U(e5) ? Promise.resolve(e5).then(t2) : t2(e5);
+};
+var re = (e5) => {
+  let t2 = (e6) => e6.status === `error` ? d(e6.error) : l({ status: `ok`, value: e6.value }), n2 = (e6) => e6.status === `error` ? d(e6.error) : l({ status: `error`, error: e6.value });
+  function r(r2) {
+    if (r2.status === `ok`) {
+      let n3 = q(e5.serialize.ok, r2.value);
+      return U(n3) ? Promise.resolve(n3).then(t2) : t2(n3);
+    }
+    let i3 = q(e5.serialize.err, r2.error);
+    return U(i3) ? Promise.resolve(i3).then(n2) : n2(i3);
+  }
+  let i2 = (e6) => e6.status === `error` ? d(e6.error) : l(e6.value), a2 = (e6) => e6.status === `error` ? d(e6.error) : d(e6.value);
+  function o2(t3) {
+    if (!H(t3))
+      return d(new S({ value: t3 }));
+    if (t3.status === `ok`) {
+      let n4 = J(e5.deserialize.ok, t3.value);
+      return U(n4) ? Promise.resolve(n4).then(i2) : i2(n4);
+    }
+    let n3 = J(e5.deserialize.err, t3.error);
+    return U(n3) ? Promise.resolve(n3).then(a2) : a2(n3);
+  }
+  function s2(e6) {
+    return Y(r(e6), `Result.codec serializeUnsafe failed`);
+  }
+  function c2(e6) {
+    return X(o2(e6));
+  }
+  return { serialize: r, serializeUnsafe: s2, deserialize: o2, deserializeUnsafe: c2 };
+};
+var Z = async (e5, t2) => {
+  try {
+    return await Promise.all(e5);
+  } catch (e6) {
+    return i(t2, e6);
+  }
+};
+var Q = (e5) => {
+  let t2 = [];
+  for (let n2 of e5) {
+    if (n2.status === `error`)
+      return n2;
+    t2.push(n2.value);
+  }
+  return l(t2);
+};
+var ie = async (e5) => Q(await Z(e5, `Result.allAsync input promise rejected`));
+var $ = (e5) => {
+  let t2 = [], n2 = [];
+  for (let r of e5)
+    r.status === `ok` ? t2.push(r.value) : n2.push(r.error);
+  return [t2, n2];
+};
+var ae = { ok: l, isOk: u, err: d, isError: f, try: T, tryPromise: E, map: D, mapError: O, tryRecover: k, andThen: A, tryRecoverAsync: ee, andThenAsync: te, match: ne, tap: j, tapAsync: M, tapError: N, tapErrorAsync: P, tapBoth: F, tapBothAsync: I, unwrap: L, unwrapOr: z, gen: B, await: V, codec: re, all: Q, allAsync: ie, partition: $, partitionAsync: async (e5) => $(await Z(e5, `Result.partitionAsync input promise rejected`)), flatten: (e5) => e5.status === `ok` ? e5.value : e5 };
+
 // cli-flags.ts
 function toInt(value) {
-  if (typeof value === "number" && Number.isFinite(value))
-    return Math.trunc(value);
   if (typeof value === "string" && value.trim().length > 0) {
     const parsed = Number(value);
     return Number.isFinite(parsed) ? Math.trunc(parsed) : null;
@@ -98,7 +535,7 @@ async function readStdinText() {
 
 // acp-harness-client.ts
 import { spawn } from "node:child_process";
-import { Readable, Writable } from "node:stream";
+import { Writable } from "node:stream";
 
 // ../../node_modules/.bun/zod@4.3.6/node_modules/zod/v4/classic/external.js
 var exports_external = {};
@@ -642,10 +1079,10 @@ function $constructor(name, initializer, params) {
     initializer(inst, def);
     const proto = _.prototype;
     const keys = Object.keys(proto);
-    for (let i = 0;i < keys.length; i++) {
-      const k = keys[i];
-      if (!(k in inst)) {
-        inst[k] = proto[k].bind(inst);
+    for (let i2 = 0;i2 < keys.length; i2++) {
+      const k2 = keys[i2];
+      if (!(k2 in inst)) {
+        inst[k2] = proto[k2].bind(inst);
       }
     }
   }
@@ -774,7 +1211,7 @@ function assertNever(_x) {
 function assert(_) {}
 function getEnumValues(entries) {
   const numericValues = Object.values(entries).filter((v) => typeof v === "number");
-  const values = Object.entries(entries).filter(([k, _]) => numericValues.indexOf(+k) === -1).map(([_, v]) => v);
+  const values = Object.entries(entries).filter(([k2, _]) => numericValues.indexOf(+k2) === -1).map(([_, v]) => v);
   return values;
 }
 function joinValues(array, separator = "|") {
@@ -875,8 +1312,8 @@ function promiseAllObject(promisesObj) {
   const promises = keys.map((key) => promisesObj[key]);
   return Promise.all(promises).then((results) => {
     const resolvedObj = {};
-    for (let i = 0;i < keys.length; i++) {
-      resolvedObj[keys[i]] = results[i];
+    for (let i2 = 0;i2 < keys.length; i2++) {
+      resolvedObj[keys[i2]] = results[i2];
     }
     return resolvedObj;
   });
@@ -884,7 +1321,7 @@ function promiseAllObject(promisesObj) {
 function randomString(length = 10) {
   const chars = "abcdefghijklmnopqrstuvwxyz";
   let str = "";
-  for (let i = 0;i < length; i++) {
+  for (let i2 = 0;i2 < length; i2++) {
     str += chars[Math.floor(Math.random() * chars.length)];
   }
   return str;
@@ -904,17 +1341,17 @@ var allowsEval = cached(() => {
     return false;
   }
   try {
-    const F = Function;
-    new F("");
+    const F2 = Function;
+    new F2("");
     return true;
   } catch (_) {
     return false;
   }
 });
-function isPlainObject(o) {
-  if (isObject(o) === false)
+function isPlainObject(o2) {
+  if (isObject(o2) === false)
     return false;
-  const ctor = o.constructor;
+  const ctor = o2.constructor;
   if (ctor === undefined)
     return true;
   if (typeof ctor !== "function")
@@ -927,12 +1364,12 @@ function isPlainObject(o) {
   }
   return true;
 }
-function shallowClone(o) {
-  if (isPlainObject(o))
-    return { ...o };
-  if (Array.isArray(o))
-    return [...o];
-  return o;
+function shallowClone(o2) {
+  if (isPlainObject(o2))
+    return { ...o2 };
+  if (Array.isArray(o2))
+    return [...o2];
+  return o2;
 }
 function numKeys(data) {
   let keyCount = 0;
@@ -944,8 +1381,8 @@ function numKeys(data) {
   return keyCount;
 }
 var getParsedType = (data) => {
-  const t = typeof data;
-  switch (t) {
+  const t2 = typeof data;
+  switch (t2) {
     case "undefined":
       return "undefined";
     case "string":
@@ -984,7 +1421,7 @@ var getParsedType = (data) => {
       }
       return "object";
     default:
-      throw new Error(`Unknown data type: ${t}`);
+      throw new Error(`Unknown data type: ${t2}`);
   }
 };
 var propertyKeyTypes = new Set(["string", "number", "symbol"]);
@@ -1055,8 +1492,8 @@ function stringifyPrimitive(value) {
   return `${value}`;
 }
 function optionalKeys(shape) {
-  return Object.keys(shape).filter((k) => {
-    return shape[k]._zod.optin === "optional" && shape[k]._zod.optout === "optional";
+  return Object.keys(shape).filter((k2) => {
+    return shape[k2]._zod.optin === "optional" && shape[k2]._zod.optout === "optional";
   });
 }
 var NUMBER_FORMAT_RANGES = {
@@ -1156,10 +1593,10 @@ function safeExtend(schema, shape) {
   });
   return clone(schema, def);
 }
-function merge(a, b) {
-  const def = mergeDefs(a._zod.def, {
+function merge(a2, b) {
+  const def = mergeDefs(a2._zod.def, {
     get shape() {
-      const _shape = { ...a._zod.def.shape, ...b._zod.def.shape };
+      const _shape = { ...a2._zod.def.shape, ...b._zod.def.shape };
       assignProp(this, "shape", _shape);
       return _shape;
     },
@@ -1168,7 +1605,7 @@ function merge(a, b) {
     },
     checks: []
   });
-  return clone(a, def);
+  return clone(a2, def);
 }
 function partial(Class, schema, mask) {
   const currDef = schema._zod.def;
@@ -1239,11 +1676,11 @@ function required(Class, schema, mask) {
   });
   return clone(schema, def);
 }
-function aborted(x, startIndex = 0) {
-  if (x.aborted === true)
+function aborted(x2, startIndex = 0) {
+  if (x2.aborted === true)
     return true;
-  for (let i = startIndex;i < x.issues.length; i++) {
-    if (x.issues[i]?.continue !== true) {
+  for (let i2 = startIndex;i2 < x2.issues.length; i2++) {
+    if (x2.issues[i2]?.continue !== true) {
       return true;
     }
   }
@@ -1290,8 +1727,8 @@ function getLengthableOrigin(input) {
   return "unknown";
 }
 function parsedType(data) {
-  const t = typeof data;
-  switch (t) {
+  const t2 = typeof data;
+  switch (t2) {
     case "number": {
       return Number.isNaN(data) ? "nan" : "number";
     }
@@ -1308,7 +1745,7 @@ function parsedType(data) {
       }
     }
   }
-  return t;
+  return t2;
 }
 function issue(...args) {
   const [iss, input, inst] = args;
@@ -1323,22 +1760,22 @@ function issue(...args) {
   return { ...iss };
 }
 function cleanEnum(obj) {
-  return Object.entries(obj).filter(([k, _]) => {
-    return Number.isNaN(Number.parseInt(k, 10));
+  return Object.entries(obj).filter(([k2, _]) => {
+    return Number.isNaN(Number.parseInt(k2, 10));
   }).map((el) => el[1]);
 }
 function base64ToUint8Array(base64) {
   const binaryString = atob(base64);
   const bytes = new Uint8Array(binaryString.length);
-  for (let i = 0;i < binaryString.length; i++) {
-    bytes[i] = binaryString.charCodeAt(i);
+  for (let i2 = 0;i2 < binaryString.length; i2++) {
+    bytes[i2] = binaryString.charCodeAt(i2);
   }
   return bytes;
 }
 function uint8ArrayToBase64(bytes) {
   let binaryString = "";
-  for (let i = 0;i < bytes.length; i++) {
-    binaryString += String.fromCharCode(bytes[i]);
+  for (let i2 = 0;i2 < bytes.length; i2++) {
+    binaryString += String.fromCharCode(bytes[i2]);
   }
   return btoa(binaryString);
 }
@@ -1356,8 +1793,8 @@ function hexToUint8Array(hex) {
     throw new Error("Invalid hex string length");
   }
   const bytes = new Uint8Array(cleanHex.length / 2);
-  for (let i = 0;i < cleanHex.length; i += 2) {
-    bytes[i / 2] = Number.parseInt(cleanHex.slice(i, i + 2), 16);
+  for (let i2 = 0;i2 < cleanHex.length; i2 += 2) {
+    bytes[i2 / 2] = Number.parseInt(cleanHex.slice(i2, i2 + 2), 16);
   }
   return bytes;
 }
@@ -1415,10 +1852,10 @@ function formatError(error, mapper = (issue2) => issue2.message) {
         fieldErrors._errors.push(mapper(issue2));
       } else {
         let curr = fieldErrors;
-        let i = 0;
-        while (i < issue2.path.length) {
-          const el = issue2.path[i];
-          const terminal = i === issue2.path.length - 1;
+        let i2 = 0;
+        while (i2 < issue2.path.length) {
+          const el = issue2.path[i2];
+          const terminal = i2 === issue2.path.length - 1;
           if (!terminal) {
             curr[el] = curr[el] || { _errors: [] };
           } else {
@@ -1426,7 +1863,7 @@ function formatError(error, mapper = (issue2) => issue2.message) {
             curr[el]._errors.push(mapper(issue2));
           }
           curr = curr[el];
-          i++;
+          i2++;
         }
       }
     }
@@ -1452,10 +1889,10 @@ function treeifyError(error, mapper = (issue2) => issue2.message) {
           continue;
         }
         let curr = result;
-        let i = 0;
-        while (i < fullpath.length) {
-          const el = fullpath[i];
-          const terminal = i === fullpath.length - 1;
+        let i2 = 0;
+        while (i2 < fullpath.length) {
+          const el = fullpath[i2];
+          const terminal = i2 === fullpath.length - 1;
           if (typeof el === "string") {
             curr.properties ?? (curr.properties = {});
             (_a = curr.properties)[el] ?? (_a[el] = { errors: [] });
@@ -1468,7 +1905,7 @@ function treeifyError(error, mapper = (issue2) => issue2.message) {
           if (terminal) {
             curr.errors.push(mapper(issue2));
           }
-          i++;
+          i2++;
         }
       }
     }
@@ -1496,7 +1933,7 @@ function toDotPath(_path) {
 }
 function prettifyError(error) {
   const lines = [];
-  const issues = [...error.issues].sort((a, b) => (a.path ?? []).length - (b.path ?? []).length);
+  const issues = [...error.issues].sort((a2, b) => (a2.path ?? []).length - (b.path ?? []).length);
   for (const issue2 of issues) {
     lines.push(`✖ ${issue2.message}`);
     if (issue2.path?.length)
@@ -1514,9 +1951,9 @@ var _parse = (_Err) => (schema, value, _ctx, _params) => {
     throw new $ZodAsyncError;
   }
   if (result.issues.length) {
-    const e = new (_params?.Err ?? _Err)(result.issues.map((iss) => finalizeIssue(iss, ctx, config())));
-    captureStackTrace(e, _params?.callee);
-    throw e;
+    const e5 = new (_params?.Err ?? _Err)(result.issues.map((iss) => finalizeIssue(iss, ctx, config())));
+    captureStackTrace(e5, _params?.callee);
+    throw e5;
   }
   return result.value;
 };
@@ -1527,9 +1964,9 @@ var _parseAsync = (_Err) => async (schema, value, _ctx, params) => {
   if (result instanceof Promise)
     result = await result;
   if (result.issues.length) {
-    const e = new (params?.Err ?? _Err)(result.issues.map((iss) => finalizeIssue(iss, ctx, config())));
-    captureStackTrace(e, params?.callee);
-    throw e;
+    const e5 = new (params?.Err ?? _Err)(result.issues.map((iss) => finalizeIssue(iss, ctx, config())));
+    captureStackTrace(e5, params?.callee);
+    throw e5;
   }
   return result.value;
 };
@@ -2318,19 +2755,19 @@ class Doc {
     }
     const content = arg;
     const lines = content.split(`
-`).filter((x) => x);
-    const minIndent = Math.min(...lines.map((x) => x.length - x.trimStart().length));
-    const dedented = lines.map((x) => x.slice(minIndent)).map((x) => " ".repeat(this.indent * 2) + x);
+`).filter((x2) => x2);
+    const minIndent = Math.min(...lines.map((x2) => x2.length - x2.trimStart().length));
+    const dedented = lines.map((x2) => x2.slice(minIndent)).map((x2) => " ".repeat(this.indent * 2) + x2);
     for (const line of dedented) {
       this.content.push(line);
     }
   }
   compile() {
-    const F = Function;
+    const F2 = Function;
     const args = this?.args;
     const content = this?.content ?? [``];
-    const lines = [...content.map((x) => `  ${x}`)];
-    return new F(...args, lines.join(`
+    const lines = [...content.map((x2) => `  ${x2}`)];
+    return new F2(...args, lines.join(`
 `));
   }
 }
@@ -2689,7 +3126,7 @@ var $ZodBase64 = /* @__PURE__ */ $constructor("$ZodBase64", (inst, def) => {
 function isValidBase64URL(data) {
   if (!base64url.test(data))
     return false;
-  const base642 = data.replace(/[-_]/g, (c) => c === "-" ? "+" : "/");
+  const base642 = data.replace(/[-_]/g, (c2) => c2 === "-" ? "+" : "/");
   const padded = base642.padEnd(Math.ceil(base642.length / 4) * 4, "=");
   return isValidBase64(padded);
 }
@@ -2961,16 +3398,16 @@ var $ZodArray = /* @__PURE__ */ $constructor("$ZodArray", (inst, def) => {
     }
     payload.value = Array(input.length);
     const proms = [];
-    for (let i = 0;i < input.length; i++) {
-      const item = input[i];
+    for (let i2 = 0;i2 < input.length; i2++) {
+      const item = input[i2];
       const result = def.element._zod.run({
         value: item,
         issues: []
       }, ctx);
       if (result instanceof Promise) {
-        proms.push(result.then((result2) => handleArrayResult(result2, payload, i)));
+        proms.push(result.then((result2) => handleArrayResult(result2, payload, i2)));
       } else {
-        handleArrayResult(result, payload, i);
+        handleArrayResult(result, payload, i2);
       }
     }
     if (proms.length) {
@@ -2996,9 +3433,9 @@ function handlePropertyResult(result, final, key, input, isOptionalOut) {
 }
 function normalizeDef(def) {
   const keys = Object.keys(def.shape);
-  for (const k of keys) {
-    if (!def.shape?.[k]?._zod?.traits?.has("$ZodType")) {
-      throw new Error(`Invalid element at key "${k}": expected a Zod schema`);
+  for (const k2 of keys) {
+    if (!def.shape?.[k2]?._zod?.traits?.has("$ZodType")) {
+      throw new Error(`Invalid element at key "${k2}": expected a Zod schema`);
     }
   }
   const okeys = optionalKeys(def.shape);
@@ -3014,12 +3451,12 @@ function handleCatchall(proms, input, payload, ctx, def, inst) {
   const unrecognized = [];
   const keySet = def.keySet;
   const _catchall = def.catchall._zod;
-  const t = _catchall.def.type;
+  const t2 = _catchall.def.type;
   const isOptionalOut = _catchall.optout === "optional";
   for (const key in input) {
     if (keySet.has(key))
       continue;
-    if (t === "never") {
+    if (t2 === "never") {
       unrecognized.push(key);
       continue;
     }
@@ -3115,8 +3552,8 @@ var $ZodObjectJIT = /* @__PURE__ */ $constructor("$ZodObjectJIT", (inst, def) =>
     const doc = new Doc(["shape", "payload", "ctx"]);
     const normalized = _normalized.value;
     const parseStr = (key) => {
-      const k = esc(key);
-      return `shape[${k}]._zod.run({ value: input[${k}], issues: [] }, ctx)`;
+      const k2 = esc(key);
+      return `shape[${k2}]._zod.run({ value: input[${k2}], issues: [] }, ctx)`;
     };
     doc.write(`const input = payload.value;`);
     const ids = Object.create(null);
@@ -3127,27 +3564,27 @@ var $ZodObjectJIT = /* @__PURE__ */ $constructor("$ZodObjectJIT", (inst, def) =>
     doc.write(`const newResult = {};`);
     for (const key of normalized.keys) {
       const id = ids[key];
-      const k = esc(key);
+      const k2 = esc(key);
       const schema = shape[key];
       const isOptionalOut = schema?._zod?.optout === "optional";
       doc.write(`const ${id} = ${parseStr(key)};`);
       if (isOptionalOut) {
         doc.write(`
         if (${id}.issues.length) {
-          if (${k} in input) {
+          if (${k2} in input) {
             payload.issues = payload.issues.concat(${id}.issues.map(iss => ({
               ...iss,
-              path: iss.path ? [${k}, ...iss.path] : [${k}]
+              path: iss.path ? [${k2}, ...iss.path] : [${k2}]
             })));
           }
         }
         
         if (${id}.value === undefined) {
-          if (${k} in input) {
-            newResult[${k}] = undefined;
+          if (${k2} in input) {
+            newResult[${k2}] = undefined;
           }
         } else {
-          newResult[${k}] = ${id}.value;
+          newResult[${k2}] = ${id}.value;
         }
         
       `);
@@ -3156,16 +3593,16 @@ var $ZodObjectJIT = /* @__PURE__ */ $constructor("$ZodObjectJIT", (inst, def) =>
         if (${id}.issues.length) {
           payload.issues = payload.issues.concat(${id}.issues.map(iss => ({
             ...iss,
-            path: iss.path ? [${k}, ...iss.path] : [${k}]
+            path: iss.path ? [${k2}, ...iss.path] : [${k2}]
           })));
         }
         
         if (${id}.value === undefined) {
-          if (${k} in input) {
-            newResult[${k}] = undefined;
+          if (${k2} in input) {
+            newResult[${k2}] = undefined;
           }
         } else {
-          newResult[${k}] = ${id}.value;
+          newResult[${k2}] = ${id}.value;
         }
         
       `);
@@ -3228,18 +3665,18 @@ function handleUnionResults(results, final, inst, ctx) {
 }
 var $ZodUnion = /* @__PURE__ */ $constructor("$ZodUnion", (inst, def) => {
   $ZodType.init(inst, def);
-  defineLazy(inst._zod, "optin", () => def.options.some((o) => o._zod.optin === "optional") ? "optional" : undefined);
-  defineLazy(inst._zod, "optout", () => def.options.some((o) => o._zod.optout === "optional") ? "optional" : undefined);
+  defineLazy(inst._zod, "optin", () => def.options.some((o2) => o2._zod.optin === "optional") ? "optional" : undefined);
+  defineLazy(inst._zod, "optout", () => def.options.some((o2) => o2._zod.optout === "optional") ? "optional" : undefined);
   defineLazy(inst._zod, "values", () => {
-    if (def.options.every((o) => o._zod.values)) {
+    if (def.options.every((o2) => o2._zod.values)) {
       return new Set(def.options.flatMap((option) => Array.from(option._zod.values)));
     }
     return;
   });
   defineLazy(inst._zod, "pattern", () => {
-    if (def.options.every((o) => o._zod.pattern)) {
-      const patterns = def.options.map((o) => o._zod.pattern);
-      return new RegExp(`^(${patterns.map((p) => cleanRegex(p.source)).join("|")})$`);
+    if (def.options.every((o2) => o2._zod.pattern)) {
+      const patterns = def.options.map((o2) => o2._zod.pattern);
+      return new RegExp(`^(${patterns.map((p2) => cleanRegex(p2.source)).join("|")})$`);
     }
     return;
   });
@@ -3336,11 +3773,11 @@ var $ZodDiscriminatedUnion = /* @__PURE__ */ $constructor("$ZodDiscriminatedUnio
       const pv = option._zod.propValues;
       if (!pv || Object.keys(pv).length === 0)
         throw new Error(`Invalid discriminated union option at index "${def.options.indexOf(option)}"`);
-      for (const [k, v] of Object.entries(pv)) {
-        if (!propValues[k])
-          propValues[k] = new Set;
+      for (const [k2, v] of Object.entries(pv)) {
+        if (!propValues[k2])
+          propValues[k2] = new Set;
         for (const val of v) {
-          propValues[k].add(val);
+          propValues[k2].add(val);
         }
       }
     }
@@ -3349,15 +3786,15 @@ var $ZodDiscriminatedUnion = /* @__PURE__ */ $constructor("$ZodDiscriminatedUnio
   const disc = cached(() => {
     const opts = def.options;
     const map = new Map;
-    for (const o of opts) {
-      const values = o._zod.propValues?.[def.discriminator];
+    for (const o2 of opts) {
+      const values = o2._zod.propValues?.[def.discriminator];
       if (!values || values.size === 0)
-        throw new Error(`Invalid discriminated union option at index "${def.options.indexOf(o)}"`);
+        throw new Error(`Invalid discriminated union option at index "${def.options.indexOf(o2)}"`);
       for (const v of values) {
         if (map.has(v)) {
           throw new Error(`Duplicate discriminator value "${String(v)}"`);
         }
-        map.set(v, o);
+        map.set(v, o2);
       }
     }
     return map;
@@ -3407,19 +3844,19 @@ var $ZodIntersection = /* @__PURE__ */ $constructor("$ZodIntersection", (inst, d
     return handleIntersectionResults(payload, left, right);
   };
 });
-function mergeValues(a, b) {
-  if (a === b) {
-    return { valid: true, data: a };
+function mergeValues(a2, b) {
+  if (a2 === b) {
+    return { valid: true, data: a2 };
   }
-  if (a instanceof Date && b instanceof Date && +a === +b) {
-    return { valid: true, data: a };
+  if (a2 instanceof Date && b instanceof Date && +a2 === +b) {
+    return { valid: true, data: a2 };
   }
-  if (isPlainObject(a) && isPlainObject(b)) {
+  if (isPlainObject(a2) && isPlainObject(b)) {
     const bKeys = Object.keys(b);
-    const sharedKeys = Object.keys(a).filter((key) => bKeys.indexOf(key) !== -1);
-    const newObj = { ...a, ...b };
+    const sharedKeys = Object.keys(a2).filter((key) => bKeys.indexOf(key) !== -1);
+    const newObj = { ...a2, ...b };
     for (const key of sharedKeys) {
-      const sharedValue = mergeValues(a[key], b[key]);
+      const sharedValue = mergeValues(a2[key], b[key]);
       if (!sharedValue.valid) {
         return {
           valid: false,
@@ -3430,13 +3867,13 @@ function mergeValues(a, b) {
     }
     return { valid: true, data: newObj };
   }
-  if (Array.isArray(a) && Array.isArray(b)) {
-    if (a.length !== b.length) {
+  if (Array.isArray(a2) && Array.isArray(b)) {
+    if (a2.length !== b.length) {
       return { valid: false, mergeErrorPath: [] };
     }
     const newArray = [];
-    for (let index = 0;index < a.length; index++) {
-      const itemA = a[index];
+    for (let index = 0;index < a2.length; index++) {
+      const itemA = a2[index];
       const itemB = b[index];
       const sharedValue = mergeValues(itemA, itemB);
       if (!sharedValue.valid) {
@@ -3457,10 +3894,10 @@ function handleIntersectionResults(result, left, right) {
   for (const iss of left.issues) {
     if (iss.code === "unrecognized_keys") {
       unrecIssue ?? (unrecIssue = iss);
-      for (const k of iss.keys) {
-        if (!unrecKeys.has(k))
-          unrecKeys.set(k, {});
-        unrecKeys.get(k).l = true;
+      for (const k2 of iss.keys) {
+        if (!unrecKeys.has(k2))
+          unrecKeys.set(k2, {});
+        unrecKeys.get(k2).l = true;
       }
     } else {
       result.issues.push(iss);
@@ -3468,16 +3905,16 @@ function handleIntersectionResults(result, left, right) {
   }
   for (const iss of right.issues) {
     if (iss.code === "unrecognized_keys") {
-      for (const k of iss.keys) {
-        if (!unrecKeys.has(k))
-          unrecKeys.set(k, {});
-        unrecKeys.get(k).r = true;
+      for (const k2 of iss.keys) {
+        if (!unrecKeys.has(k2))
+          unrecKeys.set(k2, {});
+        unrecKeys.get(k2).r = true;
       }
     } else {
       result.issues.push(iss);
     }
   }
-  const bothKeys = [...unrecKeys].filter(([, f]) => f.l && f.r).map(([k]) => k);
+  const bothKeys = [...unrecKeys].filter(([, f2]) => f2.l && f2.r).map(([k2]) => k2);
   if (bothKeys.length && unrecIssue) {
     result.issues.push({ ...unrecIssue, keys: bothKeys });
   }
@@ -3521,35 +3958,35 @@ var $ZodTuple = /* @__PURE__ */ $constructor("$ZodTuple", (inst, def) => {
         return payload;
       }
     }
-    let i = -1;
+    let i2 = -1;
     for (const item of items) {
-      i++;
-      if (i >= input.length) {
-        if (i >= optStart)
+      i2++;
+      if (i2 >= input.length) {
+        if (i2 >= optStart)
           continue;
       }
       const result = item._zod.run({
-        value: input[i],
+        value: input[i2],
         issues: []
       }, ctx);
       if (result instanceof Promise) {
-        proms.push(result.then((result2) => handleTupleResult(result2, payload, i)));
+        proms.push(result.then((result2) => handleTupleResult(result2, payload, i2)));
       } else {
-        handleTupleResult(result, payload, i);
+        handleTupleResult(result, payload, i2);
       }
     }
     if (def.rest) {
       const rest = input.slice(items.length);
       for (const el of rest) {
-        i++;
+        i2++;
         const result = def.rest._zod.run({
           value: el,
           issues: []
         }, ctx);
         if (result instanceof Promise) {
-          proms.push(result.then((result2) => handleTupleResult(result2, payload, i)));
+          proms.push(result.then((result2) => handleTupleResult(result2, payload, i2)));
         } else {
-          handleTupleResult(result, payload, i);
+          handleTupleResult(result, payload, i2);
         }
       }
     }
@@ -3771,7 +4208,7 @@ var $ZodEnum = /* @__PURE__ */ $constructor("$ZodEnum", (inst, def) => {
   const values = getEnumValues(def.entries);
   const valuesSet = new Set(values);
   inst._zod.values = valuesSet;
-  inst._zod.pattern = new RegExp(`^(${values.filter((k) => propertyKeyTypes.has(typeof k)).map((o) => typeof o === "string" ? escapeRegex(o) : o.toString()).join("|")})$`);
+  inst._zod.pattern = new RegExp(`^(${values.filter((k2) => propertyKeyTypes.has(typeof k2)).map((o2) => typeof o2 === "string" ? escapeRegex(o2) : o2.toString()).join("|")})$`);
   inst._zod.parse = (payload, _ctx) => {
     const input = payload.value;
     if (valuesSet.has(input)) {
@@ -3793,7 +4230,7 @@ var $ZodLiteral = /* @__PURE__ */ $constructor("$ZodLiteral", (inst, def) => {
   }
   const values = new Set(def.values);
   inst._zod.values = values;
-  inst._zod.pattern = new RegExp(`^(${def.values.map((o) => typeof o === "string" ? escapeRegex(o) : o ? escapeRegex(o.toString()) : String(o)).join("|")})$`);
+  inst._zod.pattern = new RegExp(`^(${def.values.map((o2) => typeof o2 === "string" ? escapeRegex(o2) : o2 ? escapeRegex(o2.toString()) : String(o2)).join("|")})$`);
   inst._zod.parse = (payload, _ctx) => {
     const input = payload.value;
     if (values.has(input)) {
@@ -3942,7 +4379,7 @@ var $ZodNonOptional = /* @__PURE__ */ $constructor("$ZodNonOptional", (inst, def
   $ZodType.init(inst, def);
   defineLazy(inst._zod, "values", () => {
     const v = def.innerType._zod.values;
-    return v ? new Set([...v].filter((x) => x !== undefined)) : undefined;
+    return v ? new Set([...v].filter((x2) => x2 !== undefined)) : undefined;
   });
   inst._zod.parse = (payload, ctx) => {
     const result = def.innerType._zod.run(payload, ctx);
@@ -4228,9 +4665,9 @@ var $ZodFunction = /* @__PURE__ */ $constructor("$ZodFunction", (inst, def) => {
     return payload;
   };
   inst.input = (...args) => {
-    const F = inst.constructor;
+    const F2 = inst.constructor;
     if (Array.isArray(args[0])) {
-      return new F({
+      return new F2({
         type: "function",
         input: new $ZodTuple({
           type: "tuple",
@@ -4240,15 +4677,15 @@ var $ZodFunction = /* @__PURE__ */ $constructor("$ZodFunction", (inst, def) => {
         output: inst._def.output
       });
     }
-    return new F({
+    return new F2({
       type: "function",
       input: args[0],
       output: inst._def.output
     });
   };
   inst.output = (output) => {
-    const F = inst.constructor;
-    return new F({
+    const F2 = inst.constructor;
+    return new F2({
       type: "function",
       input: inst._def.input,
       output
@@ -6103,17 +6540,17 @@ var error16 = () => {
     set: { unit: "פריטים", shortLabel: "קטן", longLabel: "גדול" },
     number: { unit: "", shortLabel: "קטן", longLabel: "גדול" }
   };
-  const typeEntry = (t) => t ? TypeNames[t] : undefined;
-  const typeLabel = (t) => {
-    const e = typeEntry(t);
-    if (e)
-      return e.label;
-    return t ?? TypeNames.unknown.label;
+  const typeEntry = (t2) => t2 ? TypeNames[t2] : undefined;
+  const typeLabel = (t2) => {
+    const e5 = typeEntry(t2);
+    if (e5)
+      return e5.label;
+    return t2 ?? TypeNames.unknown.label;
   };
-  const withDefinite = (t) => `ה${typeLabel(t)}`;
-  const verbFor = (t) => {
-    const e = typeEntry(t);
-    const gender = e?.gender ?? "m";
+  const withDefinite = (t2) => `ה${typeLabel(t2)}`;
+  const verbFor = (t2) => {
+    const e5 = typeEntry(t2);
+    const gender = e5?.gender ?? "m";
     return gender === "f" ? "צריכה להיות" : "צריך להיות";
   };
   const getSizing = (origin) => {
@@ -9862,12 +10299,12 @@ class $ZodRegistry {
     return this;
   }
   get(schema) {
-    const p = schema._zod.parent;
-    if (p) {
-      const pm = { ...this.get(p) ?? {} };
+    const p2 = schema._zod.parent;
+    if (p2) {
+      const pm = { ...this.get(p2) ?? {} };
       delete pm.id;
-      const f = { ...pm, ...this._map.get(schema) };
-      return Object.keys(f).length ? f : undefined;
+      const f2 = { ...pm, ...this._map.get(schema) };
+      return Object.keys(f2).length ? f2 : undefined;
     }
     return this._map.get(schema);
   }
@@ -11039,7 +11476,7 @@ function finalize(ctx, schema) {
     result.$schema = "http://json-schema.org/draft-07/schema#";
   } else if (ctx.target === "draft-04") {
     result.$schema = "http://json-schema.org/draft-04/schema#";
-  } else if (ctx.target === "openapi-3.0") {} else {}
+  } else if (ctx.target === "openapi-3.0") {}
   if (ctx.external?.uri) {
     const id = ctx.external.registry.get(schema)?.id;
     if (!id)
@@ -11287,7 +11724,7 @@ var literalProcessor = (schema, ctx, json, _params) => {
     if (val === undefined) {
       if (ctx.unrepresentable === "throw") {
         throw new Error("Literal `undefined` cannot be represented in JSON Schema");
-      } else {}
+      }
     } else if (typeof val === "bigint") {
       if (ctx.unrepresentable === "throw") {
         throw new Error("BigInt literals cannot be represented in JSON Schema");
@@ -11349,7 +11786,7 @@ var fileProcessor = (schema, _ctx, json, _params) => {
       Object.assign(_json, file);
     } else {
       Object.assign(_json, file);
-      _json.anyOf = mime.map((m) => ({ contentMediaType: m }));
+      _json.anyOf = mime.map((m2) => ({ contentMediaType: m2 }));
     }
   } else {
     Object.assign(_json, file);
@@ -11433,9 +11870,9 @@ var objectProcessor = (schema, ctx, _json, params) => {
 var unionProcessor = (schema, ctx, json, params) => {
   const def = schema._zod.def;
   const isExclusive = def.inclusive === false;
-  const options = def.options.map((x, i) => process2(x, ctx, {
+  const options = def.options.map((x2, i2) => process2(x2, ctx, {
     ...params,
-    path: [...params.path, isExclusive ? "oneOf" : "anyOf", i]
+    path: [...params.path, isExclusive ? "oneOf" : "anyOf", i2]
   }));
   if (isExclusive) {
     json.oneOf = options;
@@ -11445,7 +11882,7 @@ var unionProcessor = (schema, ctx, json, params) => {
 };
 var intersectionProcessor = (schema, ctx, json, params) => {
   const def = schema._zod.def;
-  const a = process2(def.left, ctx, {
+  const a2 = process2(def.left, ctx, {
     ...params,
     path: [...params.path, "allOf", 0]
   });
@@ -11455,7 +11892,7 @@ var intersectionProcessor = (schema, ctx, json, params) => {
   });
   const isSimpleIntersection = (val) => ("allOf" in val) && Object.keys(val).length === 1;
   const allOf = [
-    ...isSimpleIntersection(a) ? a.allOf : [a],
+    ...isSimpleIntersection(a2) ? a2.allOf : [a2],
     ...isSimpleIntersection(b) ? b.allOf : [b]
   ];
   json.allOf = allOf;
@@ -11466,9 +11903,9 @@ var tupleProcessor = (schema, ctx, _json, params) => {
   json.type = "array";
   const prefixPath = ctx.target === "draft-2020-12" ? "prefixItems" : "items";
   const restPath = ctx.target === "draft-2020-12" ? "items" : ctx.target === "openapi-3.0" ? "items" : "additionalItems";
-  const prefixItems = def.items.map((x, i) => process2(x, ctx, {
+  const prefixItems = def.items.map((x2, i2) => process2(x2, ctx, {
     ...params,
-    path: [...params.path, prefixPath, i]
+    path: [...params.path, prefixPath, i2]
   }));
   const rest = def.rest ? process2(def.rest, ctx, {
     ...params,
@@ -12520,9 +12957,9 @@ var ZodDate = /* @__PURE__ */ $constructor("ZodDate", (inst, def) => {
   inst._zod.processJSONSchema = (ctx, json, params) => dateProcessor(inst, ctx, json, params);
   inst.min = (value, params) => inst.check(_gte(value, params));
   inst.max = (value, params) => inst.check(_lte(value, params));
-  const c = inst._zod.bag;
-  inst.minDate = c.minimum ? new Date(c.minimum) : null;
-  inst.maxDate = c.maximum ? new Date(c.maximum) : null;
+  const c2 = inst._zod.bag;
+  inst.minDate = c2.minimum ? new Date(c2.minimum) : null;
+  inst.maxDate = c2.maximum ? new Date(c2.maximum) : null;
 });
 function date3(params) {
   return _date(ZodDate, params);
@@ -12681,11 +13118,11 @@ function record(keyType, valueType, params) {
   });
 }
 function partialRecord(keyType, valueType, params) {
-  const k = clone(keyType);
-  k._zod.values = undefined;
+  const k2 = clone(keyType);
+  k2._zod.values = undefined;
   return new ZodRecord({
     type: "record",
-    keyType: k,
+    keyType: k2,
     valueType,
     ...exports_util.normalizeParams(params)
   });
@@ -13145,7 +13582,7 @@ function getErrorMap() {
 var ZodFirstPartyTypeKind;
 (function(ZodFirstPartyTypeKind2) {})(ZodFirstPartyTypeKind || (ZodFirstPartyTypeKind = {}));
 // ../../node_modules/.bun/zod@4.3.6/node_modules/zod/v4/classic/from-json-schema.js
-var z = {
+var z2 = {
   ...exports_schemas2,
   ...exports_checks2,
   iso: exports_iso
@@ -13243,7 +13680,7 @@ function resolveRef(ref, ctx) {
 function convertBaseSchema(schema, ctx) {
   if (schema.not !== undefined) {
     if (typeof schema.not === "object" && Object.keys(schema.not).length === 0) {
-      return z.never();
+      return z2.never();
     }
     throw new Error("not is not supported in Zod (except { not: {} } for never)");
   }
@@ -13265,7 +13702,7 @@ function convertBaseSchema(schema, ctx) {
       return ctx.refs.get(refPath);
     }
     if (ctx.processing.has(refPath)) {
-      return z.lazy(() => {
+      return z2.lazy(() => {
         if (!ctx.refs.has(refPath)) {
           throw new Error(`Circular reference not resolved: ${refPath}`);
         }
@@ -13282,95 +13719,95 @@ function convertBaseSchema(schema, ctx) {
   if (schema.enum !== undefined) {
     const enumValues = schema.enum;
     if (ctx.version === "openapi-3.0" && schema.nullable === true && enumValues.length === 1 && enumValues[0] === null) {
-      return z.null();
+      return z2.null();
     }
     if (enumValues.length === 0) {
-      return z.never();
+      return z2.never();
     }
     if (enumValues.length === 1) {
-      return z.literal(enumValues[0]);
+      return z2.literal(enumValues[0]);
     }
     if (enumValues.every((v) => typeof v === "string")) {
-      return z.enum(enumValues);
+      return z2.enum(enumValues);
     }
-    const literalSchemas = enumValues.map((v) => z.literal(v));
+    const literalSchemas = enumValues.map((v) => z2.literal(v));
     if (literalSchemas.length < 2) {
       return literalSchemas[0];
     }
-    return z.union([literalSchemas[0], literalSchemas[1], ...literalSchemas.slice(2)]);
+    return z2.union([literalSchemas[0], literalSchemas[1], ...literalSchemas.slice(2)]);
   }
   if (schema.const !== undefined) {
-    return z.literal(schema.const);
+    return z2.literal(schema.const);
   }
   const type = schema.type;
   if (Array.isArray(type)) {
-    const typeSchemas = type.map((t) => {
-      const typeSchema = { ...schema, type: t };
+    const typeSchemas = type.map((t2) => {
+      const typeSchema = { ...schema, type: t2 };
       return convertBaseSchema(typeSchema, ctx);
     });
     if (typeSchemas.length === 0) {
-      return z.never();
+      return z2.never();
     }
     if (typeSchemas.length === 1) {
       return typeSchemas[0];
     }
-    return z.union(typeSchemas);
+    return z2.union(typeSchemas);
   }
   if (!type) {
-    return z.any();
+    return z2.any();
   }
   let zodSchema;
   switch (type) {
     case "string": {
-      let stringSchema = z.string();
+      let stringSchema = z2.string();
       if (schema.format) {
         const format = schema.format;
         if (format === "email") {
-          stringSchema = stringSchema.check(z.email());
+          stringSchema = stringSchema.check(z2.email());
         } else if (format === "uri" || format === "uri-reference") {
-          stringSchema = stringSchema.check(z.url());
+          stringSchema = stringSchema.check(z2.url());
         } else if (format === "uuid" || format === "guid") {
-          stringSchema = stringSchema.check(z.uuid());
+          stringSchema = stringSchema.check(z2.uuid());
         } else if (format === "date-time") {
-          stringSchema = stringSchema.check(z.iso.datetime());
+          stringSchema = stringSchema.check(z2.iso.datetime());
         } else if (format === "date") {
-          stringSchema = stringSchema.check(z.iso.date());
+          stringSchema = stringSchema.check(z2.iso.date());
         } else if (format === "time") {
-          stringSchema = stringSchema.check(z.iso.time());
+          stringSchema = stringSchema.check(z2.iso.time());
         } else if (format === "duration") {
-          stringSchema = stringSchema.check(z.iso.duration());
+          stringSchema = stringSchema.check(z2.iso.duration());
         } else if (format === "ipv4") {
-          stringSchema = stringSchema.check(z.ipv4());
+          stringSchema = stringSchema.check(z2.ipv4());
         } else if (format === "ipv6") {
-          stringSchema = stringSchema.check(z.ipv6());
+          stringSchema = stringSchema.check(z2.ipv6());
         } else if (format === "mac") {
-          stringSchema = stringSchema.check(z.mac());
+          stringSchema = stringSchema.check(z2.mac());
         } else if (format === "cidr") {
-          stringSchema = stringSchema.check(z.cidrv4());
+          stringSchema = stringSchema.check(z2.cidrv4());
         } else if (format === "cidr-v6") {
-          stringSchema = stringSchema.check(z.cidrv6());
+          stringSchema = stringSchema.check(z2.cidrv6());
         } else if (format === "base64") {
-          stringSchema = stringSchema.check(z.base64());
+          stringSchema = stringSchema.check(z2.base64());
         } else if (format === "base64url") {
-          stringSchema = stringSchema.check(z.base64url());
+          stringSchema = stringSchema.check(z2.base64url());
         } else if (format === "e164") {
-          stringSchema = stringSchema.check(z.e164());
+          stringSchema = stringSchema.check(z2.e164());
         } else if (format === "jwt") {
-          stringSchema = stringSchema.check(z.jwt());
+          stringSchema = stringSchema.check(z2.jwt());
         } else if (format === "emoji") {
-          stringSchema = stringSchema.check(z.emoji());
+          stringSchema = stringSchema.check(z2.emoji());
         } else if (format === "nanoid") {
-          stringSchema = stringSchema.check(z.nanoid());
+          stringSchema = stringSchema.check(z2.nanoid());
         } else if (format === "cuid") {
-          stringSchema = stringSchema.check(z.cuid());
+          stringSchema = stringSchema.check(z2.cuid());
         } else if (format === "cuid2") {
-          stringSchema = stringSchema.check(z.cuid2());
+          stringSchema = stringSchema.check(z2.cuid2());
         } else if (format === "ulid") {
-          stringSchema = stringSchema.check(z.ulid());
+          stringSchema = stringSchema.check(z2.ulid());
         } else if (format === "xid") {
-          stringSchema = stringSchema.check(z.xid());
+          stringSchema = stringSchema.check(z2.xid());
         } else if (format === "ksuid") {
-          stringSchema = stringSchema.check(z.ksuid());
+          stringSchema = stringSchema.check(z2.ksuid());
         }
       }
       if (typeof schema.minLength === "number") {
@@ -13387,7 +13824,7 @@ function convertBaseSchema(schema, ctx) {
     }
     case "number":
     case "integer": {
-      let numberSchema = type === "integer" ? z.number().int() : z.number();
+      let numberSchema = type === "integer" ? z2.number().int() : z2.number();
       if (typeof schema.minimum === "number") {
         numberSchema = numberSchema.min(schema.minimum);
       }
@@ -13411,11 +13848,11 @@ function convertBaseSchema(schema, ctx) {
       break;
     }
     case "boolean": {
-      zodSchema = z.boolean();
+      zodSchema = z2.boolean();
       break;
     }
     case "null": {
-      zodSchema = z.null();
+      zodSchema = z2.null();
       break;
     }
     case "object": {
@@ -13428,14 +13865,14 @@ function convertBaseSchema(schema, ctx) {
       }
       if (schema.propertyNames) {
         const keySchema = convertSchema(schema.propertyNames, ctx);
-        const valueSchema = schema.additionalProperties && typeof schema.additionalProperties === "object" ? convertSchema(schema.additionalProperties, ctx) : z.any();
+        const valueSchema = schema.additionalProperties && typeof schema.additionalProperties === "object" ? convertSchema(schema.additionalProperties, ctx) : z2.any();
         if (Object.keys(shape).length === 0) {
-          zodSchema = z.record(keySchema, valueSchema);
+          zodSchema = z2.record(keySchema, valueSchema);
           break;
         }
-        const objectSchema2 = z.object(shape).passthrough();
-        const recordSchema = z.looseRecord(keySchema, valueSchema);
-        zodSchema = z.intersection(objectSchema2, recordSchema);
+        const objectSchema2 = z2.object(shape).passthrough();
+        const recordSchema = z2.looseRecord(keySchema, valueSchema);
+        zodSchema = z2.intersection(objectSchema2, recordSchema);
         break;
       }
       if (schema.patternProperties) {
@@ -13444,28 +13881,28 @@ function convertBaseSchema(schema, ctx) {
         const looseRecords = [];
         for (const pattern of patternKeys) {
           const patternValue = convertSchema(patternProps[pattern], ctx);
-          const keySchema = z.string().regex(new RegExp(pattern));
-          looseRecords.push(z.looseRecord(keySchema, patternValue));
+          const keySchema = z2.string().regex(new RegExp(pattern));
+          looseRecords.push(z2.looseRecord(keySchema, patternValue));
         }
         const schemasToIntersect = [];
         if (Object.keys(shape).length > 0) {
-          schemasToIntersect.push(z.object(shape).passthrough());
+          schemasToIntersect.push(z2.object(shape).passthrough());
         }
         schemasToIntersect.push(...looseRecords);
         if (schemasToIntersect.length === 0) {
-          zodSchema = z.object({}).passthrough();
+          zodSchema = z2.object({}).passthrough();
         } else if (schemasToIntersect.length === 1) {
           zodSchema = schemasToIntersect[0];
         } else {
-          let result = z.intersection(schemasToIntersect[0], schemasToIntersect[1]);
-          for (let i = 2;i < schemasToIntersect.length; i++) {
-            result = z.intersection(result, schemasToIntersect[i]);
+          let result = z2.intersection(schemasToIntersect[0], schemasToIntersect[1]);
+          for (let i2 = 2;i2 < schemasToIntersect.length; i2++) {
+            result = z2.intersection(result, schemasToIntersect[i2]);
           }
           zodSchema = result;
         }
         break;
       }
-      const objectSchema = z.object(shape);
+      const objectSchema = z2.object(shape);
       if (schema.additionalProperties === false) {
         zodSchema = objectSchema.strict();
       } else if (typeof schema.additionalProperties === "object") {
@@ -13482,33 +13919,33 @@ function convertBaseSchema(schema, ctx) {
         const tupleItems = prefixItems.map((item) => convertSchema(item, ctx));
         const rest = items && typeof items === "object" && !Array.isArray(items) ? convertSchema(items, ctx) : undefined;
         if (rest) {
-          zodSchema = z.tuple(tupleItems).rest(rest);
+          zodSchema = z2.tuple(tupleItems).rest(rest);
         } else {
-          zodSchema = z.tuple(tupleItems);
+          zodSchema = z2.tuple(tupleItems);
         }
         if (typeof schema.minItems === "number") {
-          zodSchema = zodSchema.check(z.minLength(schema.minItems));
+          zodSchema = zodSchema.check(z2.minLength(schema.minItems));
         }
         if (typeof schema.maxItems === "number") {
-          zodSchema = zodSchema.check(z.maxLength(schema.maxItems));
+          zodSchema = zodSchema.check(z2.maxLength(schema.maxItems));
         }
       } else if (Array.isArray(items)) {
         const tupleItems = items.map((item) => convertSchema(item, ctx));
         const rest = schema.additionalItems && typeof schema.additionalItems === "object" ? convertSchema(schema.additionalItems, ctx) : undefined;
         if (rest) {
-          zodSchema = z.tuple(tupleItems).rest(rest);
+          zodSchema = z2.tuple(tupleItems).rest(rest);
         } else {
-          zodSchema = z.tuple(tupleItems);
+          zodSchema = z2.tuple(tupleItems);
         }
         if (typeof schema.minItems === "number") {
-          zodSchema = zodSchema.check(z.minLength(schema.minItems));
+          zodSchema = zodSchema.check(z2.minLength(schema.minItems));
         }
         if (typeof schema.maxItems === "number") {
-          zodSchema = zodSchema.check(z.maxLength(schema.maxItems));
+          zodSchema = zodSchema.check(z2.maxLength(schema.maxItems));
         }
       } else if (items !== undefined) {
         const element = convertSchema(items, ctx);
-        let arraySchema = z.array(element);
+        let arraySchema = z2.array(element);
         if (typeof schema.minItems === "number") {
           arraySchema = arraySchema.min(schema.minItems);
         }
@@ -13517,7 +13954,7 @@ function convertBaseSchema(schema, ctx) {
         }
         zodSchema = arraySchema;
       } else {
-        zodSchema = z.array(z.any());
+        zodSchema = z2.array(z2.any());
       }
       break;
     }
@@ -13534,37 +13971,37 @@ function convertBaseSchema(schema, ctx) {
 }
 function convertSchema(schema, ctx) {
   if (typeof schema === "boolean") {
-    return schema ? z.any() : z.never();
+    return schema ? z2.any() : z2.never();
   }
   let baseSchema = convertBaseSchema(schema, ctx);
   const hasExplicitType = schema.type || schema.enum !== undefined || schema.const !== undefined;
   if (schema.anyOf && Array.isArray(schema.anyOf)) {
-    const options = schema.anyOf.map((s) => convertSchema(s, ctx));
-    const anyOfUnion = z.union(options);
-    baseSchema = hasExplicitType ? z.intersection(baseSchema, anyOfUnion) : anyOfUnion;
+    const options = schema.anyOf.map((s2) => convertSchema(s2, ctx));
+    const anyOfUnion = z2.union(options);
+    baseSchema = hasExplicitType ? z2.intersection(baseSchema, anyOfUnion) : anyOfUnion;
   }
   if (schema.oneOf && Array.isArray(schema.oneOf)) {
-    const options = schema.oneOf.map((s) => convertSchema(s, ctx));
-    const oneOfUnion = z.xor(options);
-    baseSchema = hasExplicitType ? z.intersection(baseSchema, oneOfUnion) : oneOfUnion;
+    const options = schema.oneOf.map((s2) => convertSchema(s2, ctx));
+    const oneOfUnion = z2.xor(options);
+    baseSchema = hasExplicitType ? z2.intersection(baseSchema, oneOfUnion) : oneOfUnion;
   }
   if (schema.allOf && Array.isArray(schema.allOf)) {
     if (schema.allOf.length === 0) {
-      baseSchema = hasExplicitType ? baseSchema : z.any();
+      baseSchema = hasExplicitType ? baseSchema : z2.any();
     } else {
       let result = hasExplicitType ? baseSchema : convertSchema(schema.allOf[0], ctx);
       const startIdx = hasExplicitType ? 0 : 1;
-      for (let i = startIdx;i < schema.allOf.length; i++) {
-        result = z.intersection(result, convertSchema(schema.allOf[i], ctx));
+      for (let i2 = startIdx;i2 < schema.allOf.length; i2++) {
+        result = z2.intersection(result, convertSchema(schema.allOf[i2], ctx));
       }
       baseSchema = result;
     }
   }
   if (schema.nullable === true && ctx.version === "openapi-3.0") {
-    baseSchema = z.nullable(baseSchema);
+    baseSchema = z2.nullable(baseSchema);
   }
   if (schema.readOnly === true) {
-    baseSchema = z.readonly(baseSchema);
+    baseSchema = z2.readonly(baseSchema);
   }
   const extraMeta = {};
   const coreMetadataKeys = ["$id", "id", "$comment", "$anchor", "$vocabulary", "$dynamicRef", "$dynamicAnchor"];
@@ -13591,7 +14028,7 @@ function convertSchema(schema, ctx) {
 }
 function fromJSONSchema(schema, params) {
   if (typeof schema === "boolean") {
-    return schema ? z.any() : z.never();
+    return schema ? z2.any() : z2.never();
   }
   const version2 = detectVersion(schema, params?.defaultTarget);
   const defs = schema.$defs || schema.definitions || {};
@@ -13632,10 +14069,21 @@ function date4(params) {
 
 // ../../node_modules/.bun/zod@4.3.6/node_modules/zod/v4/classic/external.js
 config(en_default());
-// ../../node_modules/.bun/@agentclientprotocol+sdk@0.16.0+3c5d820c62823f0b/node_modules/@agentclientprotocol/sdk/dist/schema/index.js
+// ../../node_modules/.bun/@agentclientprotocol+sdk@0.18.2+3c5d820c62823f0b/node_modules/@agentclientprotocol/sdk/dist/schema/index.js
 var AGENT_METHODS = {
   authenticate: "authenticate",
+  document_did_change: "document/didChange",
+  document_did_close: "document/didClose",
+  document_did_focus: "document/didFocus",
+  document_did_open: "document/didOpen",
+  document_did_save: "document/didSave",
   initialize: "initialize",
+  logout: "logout",
+  nes_accept: "nes/accept",
+  nes_close: "nes/close",
+  nes_reject: "nes/reject",
+  nes_start: "nes/start",
+  nes_suggest: "nes/suggest",
   session_cancel: "session/cancel",
   session_close: "session/close",
   session_fork: "session/fork",
@@ -13651,6 +14099,8 @@ var AGENT_METHODS = {
 var CLIENT_METHODS = {
   fs_read_text_file: "fs/read_text_file",
   fs_write_text_file: "fs/write_text_file",
+  session_elicitation: "session/elicitation",
+  session_elicitation_complete: "session/elicitation/complete",
   session_request_permission: "session/request_permission",
   session_update: "session/update",
   terminal_create: "terminal/create",
@@ -13660,25 +14110,26 @@ var CLIENT_METHODS = {
   terminal_wait_for_exit: "terminal/wait_for_exit"
 };
 var PROTOCOL_VERSION = 1;
-// ../../node_modules/.bun/@agentclientprotocol+sdk@0.16.0+3c5d820c62823f0b/node_modules/@agentclientprotocol/sdk/dist/schema/zod.gen.js
-var zAuthCapabilities = exports_external.object({
+
+// ../../node_modules/.bun/@agentclientprotocol+sdk@0.18.2+3c5d820c62823f0b/node_modules/@agentclientprotocol/sdk/dist/schema/zod.gen.js
+var zAuthCapabilities = exports_external.looseObject({
   _meta: exports_external.record(exports_external.string(), exports_external.unknown()).nullish(),
   terminal: exports_external.boolean().optional().default(false)
 });
-var zAuthEnvVar = exports_external.object({
+var zAuthEnvVar = exports_external.looseObject({
   _meta: exports_external.record(exports_external.string(), exports_external.unknown()).nullish(),
   label: exports_external.string().nullish(),
   name: exports_external.string(),
   optional: exports_external.boolean().optional().default(false),
   secret: exports_external.boolean().optional().default(true)
 });
-var zAuthMethodAgent = exports_external.object({
+var zAuthMethodAgent = exports_external.looseObject({
   _meta: exports_external.record(exports_external.string(), exports_external.unknown()).nullish(),
   description: exports_external.string().nullish(),
   id: exports_external.string(),
   name: exports_external.string()
 });
-var zAuthMethodEnvVar = exports_external.object({
+var zAuthMethodEnvVar = exports_external.looseObject({
   _meta: exports_external.record(exports_external.string(), exports_external.unknown()).nullish(),
   description: exports_external.string().nullish(),
   id: exports_external.string(),
@@ -13686,7 +14137,7 @@ var zAuthMethodEnvVar = exports_external.object({
   name: exports_external.string(),
   vars: exports_external.array(zAuthEnvVar)
 });
-var zAuthMethodTerminal = exports_external.object({
+var zAuthMethodTerminal = exports_external.looseObject({
   _meta: exports_external.record(exports_external.string(), exports_external.unknown()).nullish(),
   args: exports_external.array(exports_external.string()).optional(),
   description: exports_external.string().nullish(),
@@ -13695,45 +14146,104 @@ var zAuthMethodTerminal = exports_external.object({
   name: exports_external.string()
 });
 var zAuthMethod = exports_external.union([
-  zAuthMethodEnvVar.and(exports_external.object({
+  zAuthMethodEnvVar.and(exports_external.looseObject({
     type: exports_external.literal("env_var")
   })),
-  zAuthMethodTerminal.and(exports_external.object({
+  zAuthMethodTerminal.and(exports_external.looseObject({
     type: exports_external.literal("terminal")
   })),
   zAuthMethodAgent
 ]);
-var zAuthenticateRequest = exports_external.object({
+var zAuthenticateRequest = exports_external.looseObject({
   _meta: exports_external.record(exports_external.string(), exports_external.unknown()).nullish(),
   methodId: exports_external.string()
 });
-var zAuthenticateResponse = exports_external.object({
+var zAuthenticateResponse = exports_external.looseObject({
   _meta: exports_external.record(exports_external.string(), exports_external.unknown()).nullish()
 });
-var zBlobResourceContents = exports_external.object({
+var zBlobResourceContents = exports_external.looseObject({
   _meta: exports_external.record(exports_external.string(), exports_external.unknown()).nullish(),
   blob: exports_external.string(),
   mimeType: exports_external.string().nullish(),
   uri: exports_external.string()
 });
-var zCloseSessionResponse = exports_external.object({
+var zBooleanPropertySchema = exports_external.looseObject({
+  default: exports_external.boolean().nullish(),
+  description: exports_external.string().nullish(),
+  title: exports_external.string().nullish()
+});
+var zCloseNesResponse = exports_external.looseObject({
   _meta: exports_external.record(exports_external.string(), exports_external.unknown()).nullish()
 });
-var zCost = exports_external.object({
+var zCloseSessionResponse = exports_external.looseObject({
+  _meta: exports_external.record(exports_external.string(), exports_external.unknown()).nullish()
+});
+var zCost = exports_external.looseObject({
   amount: exports_external.number(),
   currency: exports_external.string()
 });
-var zCreateTerminalResponse = exports_external.object({
+var zCreateTerminalResponse = exports_external.looseObject({
   _meta: exports_external.record(exports_external.string(), exports_external.unknown()).nullish(),
   terminalId: exports_external.string()
 });
-var zDiff = exports_external.object({
+var zDiff = exports_external.looseObject({
   _meta: exports_external.record(exports_external.string(), exports_external.unknown()).nullish(),
   newText: exports_external.string(),
   oldText: exports_external.string().nullish(),
   path: exports_external.string()
 });
-var zEnvVariable = exports_external.object({
+var zElicitationContentValue = exports_external.union([
+  exports_external.string(),
+  exports_external.number(),
+  exports_external.number(),
+  exports_external.boolean(),
+  exports_external.array(exports_external.string())
+]);
+var zElicitationAcceptAction = exports_external.looseObject({
+  content: exports_external.record(exports_external.string(), zElicitationContentValue).nullish()
+});
+var zElicitationAction = exports_external.union([
+  zElicitationAcceptAction.and(exports_external.looseObject({
+    action: exports_external.literal("accept")
+  })),
+  exports_external.looseObject({
+    action: exports_external.literal("decline")
+  }),
+  exports_external.looseObject({
+    action: exports_external.literal("cancel")
+  })
+]);
+var zElicitationFormCapabilities = exports_external.looseObject({
+  _meta: exports_external.record(exports_external.string(), exports_external.unknown()).nullish()
+});
+var zElicitationId = exports_external.string();
+var zElicitationCompleteNotification = exports_external.looseObject({
+  _meta: exports_external.record(exports_external.string(), exports_external.unknown()).nullish(),
+  elicitationId: zElicitationId
+});
+var zElicitationResponse = exports_external.looseObject({
+  _meta: exports_external.record(exports_external.string(), exports_external.unknown()).nullish(),
+  action: zElicitationAction
+});
+var zElicitationSchemaType = exports_external.literal("object");
+var zElicitationStringType = exports_external.literal("string");
+var zElicitationUrlCapabilities = exports_external.looseObject({
+  _meta: exports_external.record(exports_external.string(), exports_external.unknown()).nullish()
+});
+var zElicitationCapabilities = exports_external.looseObject({
+  _meta: exports_external.record(exports_external.string(), exports_external.unknown()).nullish(),
+  form: zElicitationFormCapabilities.nullish(),
+  url: zElicitationUrlCapabilities.nullish()
+});
+var zElicitationUrlMode = exports_external.looseObject({
+  elicitationId: zElicitationId,
+  url: exports_external.string().url()
+});
+var zEnumOption = exports_external.looseObject({
+  const: exports_external.string(),
+  title: exports_external.string()
+});
+var zEnvVariable = exports_external.looseObject({
   _meta: exports_external.record(exports_external.string(), exports_external.unknown()).nullish(),
   name: exports_external.string(),
   value: exports_external.string()
@@ -13747,13 +14257,14 @@ var zErrorCode = exports_external.union([
   exports_external.literal(-32800),
   exports_external.literal(-32000),
   exports_external.literal(-32002),
+  exports_external.literal(-32042),
   exports_external.number().int().min(-2147483648, {
     message: "Invalid value: Expected int32 to be >= -2147483648"
   }).max(2147483647, {
     message: "Invalid value: Expected int32 to be <= 2147483647"
   })
 ]);
-var zError = exports_external.object({
+var zError = exports_external.looseObject({
   code: zErrorCode,
   data: exports_external.unknown().optional(),
   message: exports_external.string()
@@ -13761,54 +14272,69 @@ var zError = exports_external.object({
 var zExtNotification = exports_external.unknown();
 var zExtRequest = exports_external.unknown();
 var zExtResponse = exports_external.unknown();
-var zFileSystemCapabilities = exports_external.object({
+var zFileSystemCapabilities = exports_external.looseObject({
   _meta: exports_external.record(exports_external.string(), exports_external.unknown()).nullish(),
   readTextFile: exports_external.boolean().optional().default(false),
   writeTextFile: exports_external.boolean().optional().default(false)
 });
-var zClientCapabilities = exports_external.object({
-  _meta: exports_external.record(exports_external.string(), exports_external.unknown()).nullish(),
-  auth: zAuthCapabilities.optional().default({ terminal: false }),
-  fs: zFileSystemCapabilities.optional().default({ readTextFile: false, writeTextFile: false }),
-  terminal: exports_external.boolean().optional().default(false)
-});
-var zHttpHeader = exports_external.object({
+var zHttpHeader = exports_external.looseObject({
   _meta: exports_external.record(exports_external.string(), exports_external.unknown()).nullish(),
   name: exports_external.string(),
   value: exports_external.string()
 });
-var zImplementation = exports_external.object({
+var zImplementation = exports_external.looseObject({
   _meta: exports_external.record(exports_external.string(), exports_external.unknown()).nullish(),
   name: exports_external.string(),
   title: exports_external.string().nullish(),
   version: exports_external.string()
 });
-var zKillTerminalResponse = exports_external.object({
+var zIntegerPropertySchema = exports_external.looseObject({
+  default: exports_external.number().nullish(),
+  description: exports_external.string().nullish(),
+  maximum: exports_external.number().nullish(),
+  minimum: exports_external.number().nullish(),
+  title: exports_external.string().nullish()
+});
+var zKillTerminalResponse = exports_external.looseObject({
   _meta: exports_external.record(exports_external.string(), exports_external.unknown()).nullish()
 });
-var zListSessionsRequest = exports_external.object({
+var zListSessionsRequest = exports_external.looseObject({
   _meta: exports_external.record(exports_external.string(), exports_external.unknown()).nullish(),
+  additionalDirectories: exports_external.array(exports_external.string()).optional(),
   cursor: exports_external.string().nullish(),
   cwd: exports_external.string().nullish()
 });
-var zMcpCapabilities = exports_external.object({
+var zLogoutCapabilities = exports_external.looseObject({
+  _meta: exports_external.record(exports_external.string(), exports_external.unknown()).nullish()
+});
+var zAgentAuthCapabilities = exports_external.looseObject({
+  _meta: exports_external.record(exports_external.string(), exports_external.unknown()).nullish(),
+  logout: zLogoutCapabilities.nullish()
+});
+var zLogoutRequest = exports_external.looseObject({
+  _meta: exports_external.record(exports_external.string(), exports_external.unknown()).nullish()
+});
+var zLogoutResponse = exports_external.looseObject({
+  _meta: exports_external.record(exports_external.string(), exports_external.unknown()).nullish()
+});
+var zMcpCapabilities = exports_external.looseObject({
   _meta: exports_external.record(exports_external.string(), exports_external.unknown()).nullish(),
   http: exports_external.boolean().optional().default(false),
   sse: exports_external.boolean().optional().default(false)
 });
-var zMcpServerHttp = exports_external.object({
+var zMcpServerHttp = exports_external.looseObject({
   _meta: exports_external.record(exports_external.string(), exports_external.unknown()).nullish(),
   headers: exports_external.array(zHttpHeader),
   name: exports_external.string(),
   url: exports_external.string()
 });
-var zMcpServerSse = exports_external.object({
+var zMcpServerSse = exports_external.looseObject({
   _meta: exports_external.record(exports_external.string(), exports_external.unknown()).nullish(),
   headers: exports_external.array(zHttpHeader),
   name: exports_external.string(),
   url: exports_external.string()
 });
-var zMcpServerStdio = exports_external.object({
+var zMcpServerStdio = exports_external.looseObject({
   _meta: exports_external.record(exports_external.string(), exports_external.unknown()).nullish(),
   args: exports_external.array(exports_external.string()),
   command: exports_external.string(),
@@ -13816,25 +14342,147 @@ var zMcpServerStdio = exports_external.object({
   name: exports_external.string()
 });
 var zMcpServer = exports_external.union([
-  zMcpServerHttp.and(exports_external.object({
+  zMcpServerHttp.and(exports_external.looseObject({
     type: exports_external.literal("http")
   })),
-  zMcpServerSse.and(exports_external.object({
+  zMcpServerSse.and(exports_external.looseObject({
     type: exports_external.literal("sse")
   })),
   zMcpServerStdio
 ]);
 var zModelId = exports_external.string();
-var zModelInfo = exports_external.object({
+var zModelInfo = exports_external.looseObject({
   _meta: exports_external.record(exports_external.string(), exports_external.unknown()).nullish(),
   description: exports_external.string().nullish(),
   modelId: zModelId,
   name: exports_external.string()
 });
-var zNewSessionRequest = exports_external.object({
+var zNesDiagnosticSeverity = exports_external.union([
+  exports_external.literal("error"),
+  exports_external.literal("warning"),
+  exports_external.literal("information"),
+  exports_external.literal("hint")
+]);
+var zNesDiagnosticsCapabilities = exports_external.looseObject({
+  _meta: exports_external.record(exports_external.string(), exports_external.unknown()).nullish()
+});
+var zNesDocumentDidCloseCapabilities = exports_external.looseObject({
+  _meta: exports_external.record(exports_external.string(), exports_external.unknown()).nullish()
+});
+var zNesDocumentDidFocusCapabilities = exports_external.looseObject({
+  _meta: exports_external.record(exports_external.string(), exports_external.unknown()).nullish()
+});
+var zNesDocumentDidOpenCapabilities = exports_external.looseObject({
+  _meta: exports_external.record(exports_external.string(), exports_external.unknown()).nullish()
+});
+var zNesDocumentDidSaveCapabilities = exports_external.looseObject({
+  _meta: exports_external.record(exports_external.string(), exports_external.unknown()).nullish()
+});
+var zNesEditHistoryCapabilities = exports_external.looseObject({
   _meta: exports_external.record(exports_external.string(), exports_external.unknown()).nullish(),
+  maxCount: exports_external.number().int().gte(0).max(4294967295, {
+    message: "Invalid value: Expected uint32 to be <= 4294967295"
+  }).nullish()
+});
+var zNesEditHistoryEntry = exports_external.looseObject({
+  diff: exports_external.string(),
+  uri: exports_external.string()
+});
+var zNesExcerpt = exports_external.looseObject({
+  endLine: exports_external.number().int().gte(0).max(4294967295, {
+    message: "Invalid value: Expected uint32 to be <= 4294967295"
+  }),
+  startLine: exports_external.number().int().gte(0).max(4294967295, {
+    message: "Invalid value: Expected uint32 to be <= 4294967295"
+  }),
+  text: exports_external.string()
+});
+var zNesJumpCapabilities = exports_external.looseObject({
+  _meta: exports_external.record(exports_external.string(), exports_external.unknown()).nullish()
+});
+var zNesOpenFilesCapabilities = exports_external.looseObject({
+  _meta: exports_external.record(exports_external.string(), exports_external.unknown()).nullish()
+});
+var zNesRecentFile = exports_external.looseObject({
+  languageId: exports_external.string(),
+  text: exports_external.string(),
+  uri: exports_external.string()
+});
+var zNesRecentFilesCapabilities = exports_external.looseObject({
+  _meta: exports_external.record(exports_external.string(), exports_external.unknown()).nullish(),
+  maxCount: exports_external.number().int().gte(0).max(4294967295, {
+    message: "Invalid value: Expected uint32 to be <= 4294967295"
+  }).nullish()
+});
+var zNesRejectReason = exports_external.union([
+  exports_external.literal("rejected"),
+  exports_external.literal("ignored"),
+  exports_external.literal("replaced"),
+  exports_external.literal("cancelled")
+]);
+var zNesRelatedSnippet = exports_external.looseObject({
+  excerpts: exports_external.array(zNesExcerpt),
+  uri: exports_external.string()
+});
+var zNesRelatedSnippetsCapabilities = exports_external.looseObject({
+  _meta: exports_external.record(exports_external.string(), exports_external.unknown()).nullish()
+});
+var zNesRenameCapabilities = exports_external.looseObject({
+  _meta: exports_external.record(exports_external.string(), exports_external.unknown()).nullish()
+});
+var zNesRepository = exports_external.looseObject({
+  name: exports_external.string(),
+  owner: exports_external.string(),
+  remoteUrl: exports_external.string()
+});
+var zNesSearchAndReplaceCapabilities = exports_external.looseObject({
+  _meta: exports_external.record(exports_external.string(), exports_external.unknown()).nullish()
+});
+var zClientNesCapabilities = exports_external.looseObject({
+  _meta: exports_external.record(exports_external.string(), exports_external.unknown()).nullish(),
+  jump: zNesJumpCapabilities.nullish(),
+  rename: zNesRenameCapabilities.nullish(),
+  searchAndReplace: zNesSearchAndReplaceCapabilities.nullish()
+});
+var zNesSearchAndReplaceSuggestion = exports_external.looseObject({
+  id: exports_external.string(),
+  isRegex: exports_external.boolean().nullish(),
+  replace: exports_external.string(),
+  search: exports_external.string(),
+  uri: exports_external.string()
+});
+var zNesTriggerKind = exports_external.union([
+  exports_external.literal("automatic"),
+  exports_external.literal("diagnostic"),
+  exports_external.literal("manual")
+]);
+var zNesUserActionsCapabilities = exports_external.looseObject({
+  _meta: exports_external.record(exports_external.string(), exports_external.unknown()).nullish(),
+  maxCount: exports_external.number().int().gte(0).max(4294967295, {
+    message: "Invalid value: Expected uint32 to be <= 4294967295"
+  }).nullish()
+});
+var zNesContextCapabilities = exports_external.looseObject({
+  _meta: exports_external.record(exports_external.string(), exports_external.unknown()).nullish(),
+  diagnostics: zNesDiagnosticsCapabilities.nullish(),
+  editHistory: zNesEditHistoryCapabilities.nullish(),
+  openFiles: zNesOpenFilesCapabilities.nullish(),
+  recentFiles: zNesRecentFilesCapabilities.nullish(),
+  relatedSnippets: zNesRelatedSnippetsCapabilities.nullish(),
+  userActions: zNesUserActionsCapabilities.nullish()
+});
+var zNewSessionRequest = exports_external.looseObject({
+  _meta: exports_external.record(exports_external.string(), exports_external.unknown()).nullish(),
+  additionalDirectories: exports_external.array(exports_external.string()).optional(),
   cwd: exports_external.string(),
   mcpServers: exports_external.array(zMcpServer)
+});
+var zNumberPropertySchema = exports_external.looseObject({
+  default: exports_external.number().nullish(),
+  description: exports_external.string().nullish(),
+  maximum: exports_external.number().nullish(),
+  minimum: exports_external.number().nullish(),
+  title: exports_external.string().nullish()
 });
 var zPermissionOptionId = exports_external.string();
 var zPermissionOptionKind = exports_external.union([
@@ -13843,7 +14491,7 @@ var zPermissionOptionKind = exports_external.union([
   exports_external.literal("reject_once"),
   exports_external.literal("reject_always")
 ]);
-var zPermissionOption = exports_external.object({
+var zPermissionOption = exports_external.looseObject({
   _meta: exports_external.record(exports_external.string(), exports_external.unknown()).nullish(),
   kind: zPermissionOptionKind,
   name: exports_external.string(),
@@ -13859,24 +14507,63 @@ var zPlanEntryStatus = exports_external.union([
   exports_external.literal("in_progress"),
   exports_external.literal("completed")
 ]);
-var zPlanEntry = exports_external.object({
+var zPlanEntry = exports_external.looseObject({
   _meta: exports_external.record(exports_external.string(), exports_external.unknown()).nullish(),
   content: exports_external.string(),
   priority: zPlanEntryPriority,
   status: zPlanEntryStatus
 });
-var zPlan = exports_external.object({
+var zPlan = exports_external.looseObject({
   _meta: exports_external.record(exports_external.string(), exports_external.unknown()).nullish(),
   entries: exports_external.array(zPlanEntry)
 });
-var zPromptCapabilities = exports_external.object({
+var zPosition = exports_external.looseObject({
+  character: exports_external.number().int().gte(0).max(4294967295, {
+    message: "Invalid value: Expected uint32 to be <= 4294967295"
+  }),
+  line: exports_external.number().int().gte(0).max(4294967295, {
+    message: "Invalid value: Expected uint32 to be <= 4294967295"
+  })
+});
+var zNesJumpSuggestion = exports_external.looseObject({
+  id: exports_external.string(),
+  position: zPosition,
+  uri: exports_external.string()
+});
+var zNesRenameSuggestion = exports_external.looseObject({
+  id: exports_external.string(),
+  newName: exports_external.string(),
+  position: zPosition,
+  uri: exports_external.string()
+});
+var zNesUserAction = exports_external.looseObject({
+  action: exports_external.string(),
+  position: zPosition,
+  timestampMs: exports_external.number(),
+  uri: exports_external.string()
+});
+var zPositionEncodingKind = exports_external.union([
+  exports_external.literal("utf-16"),
+  exports_external.literal("utf-32"),
+  exports_external.literal("utf-8")
+]);
+var zClientCapabilities = exports_external.looseObject({
+  _meta: exports_external.record(exports_external.string(), exports_external.unknown()).nullish(),
+  auth: zAuthCapabilities.optional().default({ terminal: false }),
+  elicitation: zElicitationCapabilities.nullish(),
+  fs: zFileSystemCapabilities.optional().default({ readTextFile: false, writeTextFile: false }),
+  nes: zClientNesCapabilities.nullish(),
+  positionEncodings: exports_external.array(zPositionEncodingKind).optional(),
+  terminal: exports_external.boolean().optional().default(false)
+});
+var zPromptCapabilities = exports_external.looseObject({
   _meta: exports_external.record(exports_external.string(), exports_external.unknown()).nullish(),
   audio: exports_external.boolean().optional().default(false),
   embeddedContext: exports_external.boolean().optional().default(false),
   image: exports_external.boolean().optional().default(false)
 });
 var zProtocolVersion = exports_external.number().int().gte(0).lte(65535);
-var zInitializeRequest = exports_external.object({
+var zInitializeRequest = exports_external.looseObject({
   _meta: exports_external.record(exports_external.string(), exports_external.unknown()).nullish(),
   clientCapabilities: zClientCapabilities.optional().default({
     auth: { terminal: false },
@@ -13886,39 +14573,88 @@ var zInitializeRequest = exports_external.object({
   clientInfo: zImplementation.nullish(),
   protocolVersion: zProtocolVersion
 });
-var zReadTextFileResponse = exports_external.object({
+var zRange = exports_external.looseObject({
+  end: zPosition,
+  start: zPosition
+});
+var zNesDiagnostic = exports_external.looseObject({
+  message: exports_external.string(),
+  range: zRange,
+  severity: zNesDiagnosticSeverity,
+  uri: exports_external.string()
+});
+var zNesOpenFile = exports_external.looseObject({
+  languageId: exports_external.string(),
+  lastFocusedMs: exports_external.number().nullish(),
+  uri: exports_external.string(),
+  visibleRange: zRange.nullish()
+});
+var zNesSuggestContext = exports_external.looseObject({
+  _meta: exports_external.record(exports_external.string(), exports_external.unknown()).nullish(),
+  diagnostics: exports_external.array(zNesDiagnostic).nullish(),
+  editHistory: exports_external.array(zNesEditHistoryEntry).nullish(),
+  openFiles: exports_external.array(zNesOpenFile).nullish(),
+  recentFiles: exports_external.array(zNesRecentFile).nullish(),
+  relatedSnippets: exports_external.array(zNesRelatedSnippet).nullish(),
+  userActions: exports_external.array(zNesUserAction).nullish()
+});
+var zNesTextEdit = exports_external.looseObject({
+  newText: exports_external.string(),
+  range: zRange
+});
+var zNesEditSuggestion = exports_external.looseObject({
+  cursorPosition: zPosition.nullish(),
+  edits: exports_external.array(zNesTextEdit),
+  id: exports_external.string(),
+  uri: exports_external.string()
+});
+var zNesSuggestion = exports_external.union([
+  zNesEditSuggestion.and(exports_external.looseObject({
+    kind: exports_external.literal("edit")
+  })),
+  zNesJumpSuggestion.and(exports_external.looseObject({
+    kind: exports_external.literal("jump")
+  })),
+  zNesRenameSuggestion.and(exports_external.looseObject({
+    kind: exports_external.literal("rename")
+  })),
+  zNesSearchAndReplaceSuggestion.and(exports_external.looseObject({
+    kind: exports_external.literal("searchAndReplace")
+  }))
+]);
+var zReadTextFileResponse = exports_external.looseObject({
   _meta: exports_external.record(exports_external.string(), exports_external.unknown()).nullish(),
   content: exports_external.string()
 });
-var zReleaseTerminalResponse = exports_external.object({
+var zReleaseTerminalResponse = exports_external.looseObject({
   _meta: exports_external.record(exports_external.string(), exports_external.unknown()).nullish()
 });
 var zRequestId = exports_external.union([exports_external.number(), exports_external.string()]).nullable();
-var zCancelRequestNotification = exports_external.object({
+var zCancelRequestNotification = exports_external.looseObject({
   _meta: exports_external.record(exports_external.string(), exports_external.unknown()).nullish(),
   requestId: zRequestId
 });
 var zRole = exports_external.enum(["assistant", "user"]);
-var zAnnotations = exports_external.object({
+var zAnnotations = exports_external.looseObject({
   _meta: exports_external.record(exports_external.string(), exports_external.unknown()).nullish(),
   audience: exports_external.array(zRole).nullish(),
   lastModified: exports_external.string().nullish(),
   priority: exports_external.number().nullish()
 });
-var zAudioContent = exports_external.object({
+var zAudioContent = exports_external.looseObject({
   _meta: exports_external.record(exports_external.string(), exports_external.unknown()).nullish(),
   annotations: zAnnotations.nullish(),
   data: exports_external.string(),
   mimeType: exports_external.string()
 });
-var zImageContent = exports_external.object({
+var zImageContent = exports_external.looseObject({
   _meta: exports_external.record(exports_external.string(), exports_external.unknown()).nullish(),
   annotations: zAnnotations.nullish(),
   data: exports_external.string(),
   mimeType: exports_external.string(),
   uri: exports_external.string().nullish()
 });
-var zResourceLink = exports_external.object({
+var zResourceLink = exports_external.looseObject({
   _meta: exports_external.record(exports_external.string(), exports_external.unknown()).nullish(),
   annotations: zAnnotations.nullish(),
   description: exports_external.string().nullish(),
@@ -13928,26 +14664,29 @@ var zResourceLink = exports_external.object({
   title: exports_external.string().nullish(),
   uri: exports_external.string()
 });
-var zSelectedPermissionOutcome = exports_external.object({
+var zSelectedPermissionOutcome = exports_external.looseObject({
   _meta: exports_external.record(exports_external.string(), exports_external.unknown()).nullish(),
   optionId: zPermissionOptionId
 });
 var zRequestPermissionOutcome = exports_external.union([
-  exports_external.object({
+  exports_external.looseObject({
     outcome: exports_external.literal("cancelled")
   }),
-  zSelectedPermissionOutcome.and(exports_external.object({
+  zSelectedPermissionOutcome.and(exports_external.looseObject({
     outcome: exports_external.literal("selected")
   }))
 ]);
-var zRequestPermissionResponse = exports_external.object({
+var zRequestPermissionResponse = exports_external.looseObject({
   _meta: exports_external.record(exports_external.string(), exports_external.unknown()).nullish(),
   outcome: zRequestPermissionOutcome
 });
-var zSessionCloseCapabilities = exports_external.object({
+var zSessionAdditionalDirectoriesCapabilities = exports_external.looseObject({
   _meta: exports_external.record(exports_external.string(), exports_external.unknown()).nullish()
 });
-var zSessionConfigBoolean = exports_external.object({
+var zSessionCloseCapabilities = exports_external.looseObject({
+  _meta: exports_external.record(exports_external.string(), exports_external.unknown()).nullish()
+});
+var zSessionConfigBoolean = exports_external.looseObject({
   currentValue: exports_external.boolean()
 });
 var zSessionConfigGroupId = exports_external.string();
@@ -13959,13 +14698,13 @@ var zSessionConfigOptionCategory = exports_external.union([
   exports_external.string()
 ]);
 var zSessionConfigValueId = exports_external.string();
-var zSessionConfigSelectOption = exports_external.object({
+var zSessionConfigSelectOption = exports_external.looseObject({
   _meta: exports_external.record(exports_external.string(), exports_external.unknown()).nullish(),
   description: exports_external.string().nullish(),
   name: exports_external.string(),
   value: zSessionConfigValueId
 });
-var zSessionConfigSelectGroup = exports_external.object({
+var zSessionConfigSelectGroup = exports_external.looseObject({
   _meta: exports_external.record(exports_external.string(), exports_external.unknown()).nullish(),
   group: zSessionConfigGroupId,
   name: exports_external.string(),
@@ -13975,45 +14714,50 @@ var zSessionConfigSelectOptions = exports_external.union([
   exports_external.array(zSessionConfigSelectOption),
   exports_external.array(zSessionConfigSelectGroup)
 ]);
-var zSessionConfigSelect = exports_external.object({
+var zSessionConfigSelect = exports_external.looseObject({
   currentValue: zSessionConfigValueId,
   options: zSessionConfigSelectOptions
 });
 var zSessionConfigOption = exports_external.intersection(exports_external.union([
-  zSessionConfigSelect.and(exports_external.object({
+  zSessionConfigSelect.and(exports_external.looseObject({
     type: exports_external.literal("select")
   })),
-  zSessionConfigBoolean.and(exports_external.object({
+  zSessionConfigBoolean.and(exports_external.looseObject({
     type: exports_external.literal("boolean")
   }))
-]), exports_external.object({
+]), exports_external.looseObject({
   _meta: exports_external.record(exports_external.string(), exports_external.unknown()).nullish(),
   category: zSessionConfigOptionCategory.nullish(),
   description: exports_external.string().nullish(),
   id: zSessionConfigId,
   name: exports_external.string()
 }));
-var zConfigOptionUpdate = exports_external.object({
+var zConfigOptionUpdate = exports_external.looseObject({
   _meta: exports_external.record(exports_external.string(), exports_external.unknown()).nullish(),
   configOptions: exports_external.array(zSessionConfigOption)
 });
-var zSessionForkCapabilities = exports_external.object({
+var zSessionForkCapabilities = exports_external.looseObject({
   _meta: exports_external.record(exports_external.string(), exports_external.unknown()).nullish()
 });
 var zSessionId = exports_external.string();
-var zCancelNotification = exports_external.object({
+var zAcceptNesNotification = exports_external.looseObject({
+  _meta: exports_external.record(exports_external.string(), exports_external.unknown()).nullish(),
+  id: exports_external.string(),
+  sessionId: zSessionId
+});
+var zCancelNotification = exports_external.looseObject({
   _meta: exports_external.record(exports_external.string(), exports_external.unknown()).nullish(),
   sessionId: zSessionId
 });
-var zClientNotification = exports_external.object({
-  method: exports_external.string(),
-  params: exports_external.union([zCancelNotification, zExtNotification]).nullish()
-});
-var zCloseSessionRequest = exports_external.object({
+var zCloseNesRequest = exports_external.looseObject({
   _meta: exports_external.record(exports_external.string(), exports_external.unknown()).nullish(),
   sessionId: zSessionId
 });
-var zCreateTerminalRequest = exports_external.object({
+var zCloseSessionRequest = exports_external.looseObject({
+  _meta: exports_external.record(exports_external.string(), exports_external.unknown()).nullish(),
+  sessionId: zSessionId
+});
+var zCreateTerminalRequest = exports_external.looseObject({
   _meta: exports_external.record(exports_external.string(), exports_external.unknown()).nullish(),
   args: exports_external.array(exports_external.string()).optional(),
   command: exports_external.string(),
@@ -14022,24 +14766,52 @@ var zCreateTerminalRequest = exports_external.object({
   outputByteLimit: exports_external.number().nullish(),
   sessionId: zSessionId
 });
-var zForkSessionRequest = exports_external.object({
+var zDidCloseDocumentNotification = exports_external.looseObject({
   _meta: exports_external.record(exports_external.string(), exports_external.unknown()).nullish(),
+  sessionId: zSessionId,
+  uri: exports_external.string()
+});
+var zDidFocusDocumentNotification = exports_external.looseObject({
+  _meta: exports_external.record(exports_external.string(), exports_external.unknown()).nullish(),
+  position: zPosition,
+  sessionId: zSessionId,
+  uri: exports_external.string(),
+  version: exports_external.number(),
+  visibleRange: zRange
+});
+var zDidOpenDocumentNotification = exports_external.looseObject({
+  _meta: exports_external.record(exports_external.string(), exports_external.unknown()).nullish(),
+  languageId: exports_external.string(),
+  sessionId: zSessionId,
+  text: exports_external.string(),
+  uri: exports_external.string(),
+  version: exports_external.number()
+});
+var zDidSaveDocumentNotification = exports_external.looseObject({
+  _meta: exports_external.record(exports_external.string(), exports_external.unknown()).nullish(),
+  sessionId: zSessionId,
+  uri: exports_external.string()
+});
+var zForkSessionRequest = exports_external.looseObject({
+  _meta: exports_external.record(exports_external.string(), exports_external.unknown()).nullish(),
+  additionalDirectories: exports_external.array(exports_external.string()).optional(),
   cwd: exports_external.string(),
   mcpServers: exports_external.array(zMcpServer).optional(),
   sessionId: zSessionId
 });
-var zKillTerminalRequest = exports_external.object({
+var zKillTerminalRequest = exports_external.looseObject({
   _meta: exports_external.record(exports_external.string(), exports_external.unknown()).nullish(),
   sessionId: zSessionId,
   terminalId: exports_external.string()
 });
-var zLoadSessionRequest = exports_external.object({
+var zLoadSessionRequest = exports_external.looseObject({
   _meta: exports_external.record(exports_external.string(), exports_external.unknown()).nullish(),
+  additionalDirectories: exports_external.array(exports_external.string()).optional(),
   cwd: exports_external.string(),
   mcpServers: exports_external.array(zMcpServer),
   sessionId: zSessionId
 });
-var zReadTextFileRequest = exports_external.object({
+var zReadTextFileRequest = exports_external.looseObject({
   _meta: exports_external.record(exports_external.string(), exports_external.unknown()).nullish(),
   limit: exports_external.number().int().gte(0).max(4294967295, {
     message: "Invalid value: Expected uint32 to be <= 4294967295"
@@ -14050,98 +14822,266 @@ var zReadTextFileRequest = exports_external.object({
   path: exports_external.string(),
   sessionId: zSessionId
 });
-var zReleaseTerminalRequest = exports_external.object({
+var zRejectNesNotification = exports_external.looseObject({
+  _meta: exports_external.record(exports_external.string(), exports_external.unknown()).nullish(),
+  id: exports_external.string(),
+  reason: zNesRejectReason.nullish(),
+  sessionId: zSessionId
+});
+var zReleaseTerminalRequest = exports_external.looseObject({
   _meta: exports_external.record(exports_external.string(), exports_external.unknown()).nullish(),
   sessionId: zSessionId,
   terminalId: exports_external.string()
 });
-var zResumeSessionRequest = exports_external.object({
+var zResumeSessionRequest = exports_external.looseObject({
   _meta: exports_external.record(exports_external.string(), exports_external.unknown()).nullish(),
+  additionalDirectories: exports_external.array(exports_external.string()).optional(),
   cwd: exports_external.string(),
   mcpServers: exports_external.array(zMcpServer).optional(),
   sessionId: zSessionId
 });
-var zSessionInfo = exports_external.object({
+var zSessionInfo = exports_external.looseObject({
   _meta: exports_external.record(exports_external.string(), exports_external.unknown()).nullish(),
+  additionalDirectories: exports_external.array(exports_external.string()).optional(),
   cwd: exports_external.string(),
   sessionId: zSessionId,
   title: exports_external.string().nullish(),
   updatedAt: exports_external.string().nullish()
 });
-var zListSessionsResponse = exports_external.object({
+var zListSessionsResponse = exports_external.looseObject({
   _meta: exports_external.record(exports_external.string(), exports_external.unknown()).nullish(),
   nextCursor: exports_external.string().nullish(),
   sessions: exports_external.array(zSessionInfo)
 });
-var zSessionInfoUpdate = exports_external.object({
+var zSessionInfoUpdate = exports_external.looseObject({
   _meta: exports_external.record(exports_external.string(), exports_external.unknown()).nullish(),
   title: exports_external.string().nullish(),
   updatedAt: exports_external.string().nullish()
 });
-var zSessionListCapabilities = exports_external.object({
+var zSessionListCapabilities = exports_external.looseObject({
   _meta: exports_external.record(exports_external.string(), exports_external.unknown()).nullish()
 });
 var zSessionModeId = exports_external.string();
-var zCurrentModeUpdate = exports_external.object({
+var zCurrentModeUpdate = exports_external.looseObject({
   _meta: exports_external.record(exports_external.string(), exports_external.unknown()).nullish(),
   currentModeId: zSessionModeId
 });
-var zSessionMode = exports_external.object({
+var zSessionMode = exports_external.looseObject({
   _meta: exports_external.record(exports_external.string(), exports_external.unknown()).nullish(),
   description: exports_external.string().nullish(),
   id: zSessionModeId,
   name: exports_external.string()
 });
-var zSessionModeState = exports_external.object({
+var zSessionModeState = exports_external.looseObject({
   _meta: exports_external.record(exports_external.string(), exports_external.unknown()).nullish(),
   availableModes: exports_external.array(zSessionMode),
   currentModeId: zSessionModeId
 });
-var zSessionModelState = exports_external.object({
+var zSessionModelState = exports_external.looseObject({
   _meta: exports_external.record(exports_external.string(), exports_external.unknown()).nullish(),
   availableModels: exports_external.array(zModelInfo),
   currentModelId: zModelId
 });
-var zForkSessionResponse = exports_external.object({
+var zForkSessionResponse = exports_external.looseObject({
   _meta: exports_external.record(exports_external.string(), exports_external.unknown()).nullish(),
   configOptions: exports_external.array(zSessionConfigOption).nullish(),
   models: zSessionModelState.nullish(),
   modes: zSessionModeState.nullish(),
   sessionId: zSessionId
 });
-var zLoadSessionResponse = exports_external.object({
+var zLoadSessionResponse = exports_external.looseObject({
   _meta: exports_external.record(exports_external.string(), exports_external.unknown()).nullish(),
   configOptions: exports_external.array(zSessionConfigOption).nullish(),
   models: zSessionModelState.nullish(),
   modes: zSessionModeState.nullish()
 });
-var zNewSessionResponse = exports_external.object({
+var zNewSessionResponse = exports_external.looseObject({
   _meta: exports_external.record(exports_external.string(), exports_external.unknown()).nullish(),
   configOptions: exports_external.array(zSessionConfigOption).nullish(),
   models: zSessionModelState.nullish(),
   modes: zSessionModeState.nullish(),
   sessionId: zSessionId
 });
-var zResumeSessionResponse = exports_external.object({
+var zResumeSessionResponse = exports_external.looseObject({
   _meta: exports_external.record(exports_external.string(), exports_external.unknown()).nullish(),
   configOptions: exports_external.array(zSessionConfigOption).nullish(),
   models: zSessionModelState.nullish(),
   modes: zSessionModeState.nullish()
 });
-var zSessionResumeCapabilities = exports_external.object({
+var zSessionResumeCapabilities = exports_external.looseObject({
   _meta: exports_external.record(exports_external.string(), exports_external.unknown()).nullish()
 });
-var zSessionCapabilities = exports_external.object({
+var zSessionCapabilities = exports_external.looseObject({
   _meta: exports_external.record(exports_external.string(), exports_external.unknown()).nullish(),
+  additionalDirectories: zSessionAdditionalDirectoriesCapabilities.nullish(),
+  close: zSessionCloseCapabilities.nullish(),
   fork: zSessionForkCapabilities.nullish(),
   list: zSessionListCapabilities.nullish(),
-  resume: zSessionResumeCapabilities.nullish(),
-  stop: zSessionCloseCapabilities.nullish()
+  resume: zSessionResumeCapabilities.nullish()
 });
-var zAgentCapabilities = exports_external.object({
+var zSetSessionConfigOptionRequest = exports_external.intersection(exports_external.union([
+  exports_external.looseObject({
+    type: exports_external.literal("boolean"),
+    value: exports_external.boolean()
+  }),
+  exports_external.looseObject({
+    value: zSessionConfigValueId
+  })
+]), exports_external.looseObject({
   _meta: exports_external.record(exports_external.string(), exports_external.unknown()).nullish(),
+  configId: zSessionConfigId,
+  sessionId: zSessionId
+}));
+var zSetSessionConfigOptionResponse = exports_external.looseObject({
+  _meta: exports_external.record(exports_external.string(), exports_external.unknown()).nullish(),
+  configOptions: exports_external.array(zSessionConfigOption)
+});
+var zSetSessionModeRequest = exports_external.looseObject({
+  _meta: exports_external.record(exports_external.string(), exports_external.unknown()).nullish(),
+  modeId: zSessionModeId,
+  sessionId: zSessionId
+});
+var zSetSessionModeResponse = exports_external.looseObject({
+  _meta: exports_external.record(exports_external.string(), exports_external.unknown()).nullish()
+});
+var zSetSessionModelRequest = exports_external.looseObject({
+  _meta: exports_external.record(exports_external.string(), exports_external.unknown()).nullish(),
+  modelId: zModelId,
+  sessionId: zSessionId
+});
+var zSetSessionModelResponse = exports_external.looseObject({
+  _meta: exports_external.record(exports_external.string(), exports_external.unknown()).nullish()
+});
+var zStartNesResponse = exports_external.looseObject({
+  _meta: exports_external.record(exports_external.string(), exports_external.unknown()).nullish(),
+  sessionId: zSessionId
+});
+var zStopReason = exports_external.union([
+  exports_external.literal("end_turn"),
+  exports_external.literal("max_tokens"),
+  exports_external.literal("max_turn_requests"),
+  exports_external.literal("refusal"),
+  exports_external.literal("cancelled")
+]);
+var zStringFormat = exports_external.union([
+  exports_external.literal("email"),
+  exports_external.literal("uri"),
+  exports_external.literal("date"),
+  exports_external.literal("date-time")
+]);
+var zStringPropertySchema = exports_external.looseObject({
+  default: exports_external.string().nullish(),
+  description: exports_external.string().nullish(),
+  enum: exports_external.array(exports_external.string()).nullish(),
+  format: zStringFormat.nullish(),
+  maxLength: exports_external.number().int().gte(0).max(4294967295, {
+    message: "Invalid value: Expected uint32 to be <= 4294967295"
+  }).nullish(),
+  minLength: exports_external.number().int().gte(0).max(4294967295, {
+    message: "Invalid value: Expected uint32 to be <= 4294967295"
+  }).nullish(),
+  oneOf: exports_external.array(zEnumOption).nullish(),
+  pattern: exports_external.string().nullish(),
+  title: exports_external.string().nullish()
+});
+var zSuggestNesRequest = exports_external.looseObject({
+  _meta: exports_external.record(exports_external.string(), exports_external.unknown()).nullish(),
+  context: zNesSuggestContext.nullish(),
+  position: zPosition,
+  selection: zRange.nullish(),
+  sessionId: zSessionId,
+  triggerKind: zNesTriggerKind,
+  uri: exports_external.string(),
+  version: exports_external.number()
+});
+var zSuggestNesResponse = exports_external.looseObject({
+  _meta: exports_external.record(exports_external.string(), exports_external.unknown()).nullish(),
+  suggestions: exports_external.array(zNesSuggestion)
+});
+var zTerminal = exports_external.looseObject({
+  _meta: exports_external.record(exports_external.string(), exports_external.unknown()).nullish(),
+  terminalId: exports_external.string()
+});
+var zTerminalExitStatus = exports_external.looseObject({
+  _meta: exports_external.record(exports_external.string(), exports_external.unknown()).nullish(),
+  exitCode: exports_external.number().int().gte(0).max(4294967295, {
+    message: "Invalid value: Expected uint32 to be <= 4294967295"
+  }).nullish(),
+  signal: exports_external.string().nullish()
+});
+var zTerminalOutputRequest = exports_external.looseObject({
+  _meta: exports_external.record(exports_external.string(), exports_external.unknown()).nullish(),
+  sessionId: zSessionId,
+  terminalId: exports_external.string()
+});
+var zTerminalOutputResponse = exports_external.looseObject({
+  _meta: exports_external.record(exports_external.string(), exports_external.unknown()).nullish(),
+  exitStatus: zTerminalExitStatus.nullish(),
+  output: exports_external.string(),
+  truncated: exports_external.boolean()
+});
+var zTextContent = exports_external.looseObject({
+  _meta: exports_external.record(exports_external.string(), exports_external.unknown()).nullish(),
+  annotations: zAnnotations.nullish(),
+  text: exports_external.string()
+});
+var zTextDocumentContentChangeEvent = exports_external.looseObject({
+  range: zRange.nullish(),
+  text: exports_external.string()
+});
+var zDidChangeDocumentNotification = exports_external.looseObject({
+  _meta: exports_external.record(exports_external.string(), exports_external.unknown()).nullish(),
+  contentChanges: exports_external.array(zTextDocumentContentChangeEvent),
+  sessionId: zSessionId,
+  uri: exports_external.string(),
+  version: exports_external.number()
+});
+var zClientNotification = exports_external.looseObject({
+  method: exports_external.string(),
+  params: exports_external.union([
+    zCancelNotification,
+    zDidOpenDocumentNotification,
+    zDidChangeDocumentNotification,
+    zDidCloseDocumentNotification,
+    zDidSaveDocumentNotification,
+    zDidFocusDocumentNotification,
+    zAcceptNesNotification,
+    zRejectNesNotification,
+    zExtNotification
+  ]).nullish()
+});
+var zTextDocumentSyncKind = exports_external.union([
+  exports_external.literal("full"),
+  exports_external.literal("incremental")
+]);
+var zNesDocumentDidChangeCapabilities = exports_external.looseObject({
+  _meta: exports_external.record(exports_external.string(), exports_external.unknown()).nullish(),
+  syncKind: zTextDocumentSyncKind
+});
+var zNesDocumentEventCapabilities = exports_external.looseObject({
+  _meta: exports_external.record(exports_external.string(), exports_external.unknown()).nullish(),
+  didChange: zNesDocumentDidChangeCapabilities.nullish(),
+  didClose: zNesDocumentDidCloseCapabilities.nullish(),
+  didFocus: zNesDocumentDidFocusCapabilities.nullish(),
+  didOpen: zNesDocumentDidOpenCapabilities.nullish(),
+  didSave: zNesDocumentDidSaveCapabilities.nullish()
+});
+var zNesEventCapabilities = exports_external.looseObject({
+  _meta: exports_external.record(exports_external.string(), exports_external.unknown()).nullish(),
+  document: zNesDocumentEventCapabilities.nullish()
+});
+var zNesCapabilities = exports_external.looseObject({
+  _meta: exports_external.record(exports_external.string(), exports_external.unknown()).nullish(),
+  context: zNesContextCapabilities.nullish(),
+  events: zNesEventCapabilities.nullish()
+});
+var zAgentCapabilities = exports_external.looseObject({
+  _meta: exports_external.record(exports_external.string(), exports_external.unknown()).nullish(),
+  auth: zAgentAuthCapabilities.optional().default({}),
   loadSession: exports_external.boolean().optional().default(false),
   mcpCapabilities: zMcpCapabilities.optional().default({ http: false, sse: false }),
+  nes: zNesCapabilities.nullish(),
+  positionEncoding: zPositionEncodingKind.nullish(),
   promptCapabilities: zPromptCapabilities.optional().default({
     audio: false,
     embeddedContext: false,
@@ -14149,9 +15089,10 @@ var zAgentCapabilities = exports_external.object({
   }),
   sessionCapabilities: zSessionCapabilities.optional().default({})
 });
-var zInitializeResponse = exports_external.object({
+var zInitializeResponse = exports_external.looseObject({
   _meta: exports_external.record(exports_external.string(), exports_external.unknown()).nullish(),
   agentCapabilities: zAgentCapabilities.optional().default({
+    auth: {},
     loadSession: false,
     mcpCapabilities: { http: false, sse: false },
     promptCapabilities: {
@@ -14165,74 +15106,7 @@ var zInitializeResponse = exports_external.object({
   authMethods: exports_external.array(zAuthMethod).optional().default([]),
   protocolVersion: zProtocolVersion
 });
-var zSetSessionConfigOptionRequest = exports_external.intersection(exports_external.union([
-  exports_external.object({
-    type: exports_external.literal("boolean"),
-    value: exports_external.boolean()
-  }),
-  exports_external.object({
-    value: zSessionConfigValueId
-  })
-]), exports_external.object({
-  _meta: exports_external.record(exports_external.string(), exports_external.unknown()).nullish(),
-  configId: zSessionConfigId,
-  sessionId: zSessionId
-}));
-var zSetSessionConfigOptionResponse = exports_external.object({
-  _meta: exports_external.record(exports_external.string(), exports_external.unknown()).nullish(),
-  configOptions: exports_external.array(zSessionConfigOption)
-});
-var zSetSessionModeRequest = exports_external.object({
-  _meta: exports_external.record(exports_external.string(), exports_external.unknown()).nullish(),
-  modeId: zSessionModeId,
-  sessionId: zSessionId
-});
-var zSetSessionModeResponse = exports_external.object({
-  _meta: exports_external.record(exports_external.string(), exports_external.unknown()).nullish()
-});
-var zSetSessionModelRequest = exports_external.object({
-  _meta: exports_external.record(exports_external.string(), exports_external.unknown()).nullish(),
-  modelId: zModelId,
-  sessionId: zSessionId
-});
-var zSetSessionModelResponse = exports_external.object({
-  _meta: exports_external.record(exports_external.string(), exports_external.unknown()).nullish()
-});
-var zStopReason = exports_external.union([
-  exports_external.literal("end_turn"),
-  exports_external.literal("max_tokens"),
-  exports_external.literal("max_turn_requests"),
-  exports_external.literal("refusal"),
-  exports_external.literal("cancelled")
-]);
-var zTerminal = exports_external.object({
-  _meta: exports_external.record(exports_external.string(), exports_external.unknown()).nullish(),
-  terminalId: exports_external.string()
-});
-var zTerminalExitStatus = exports_external.object({
-  _meta: exports_external.record(exports_external.string(), exports_external.unknown()).nullish(),
-  exitCode: exports_external.number().int().gte(0).max(4294967295, {
-    message: "Invalid value: Expected uint32 to be <= 4294967295"
-  }).nullish(),
-  signal: exports_external.string().nullish()
-});
-var zTerminalOutputRequest = exports_external.object({
-  _meta: exports_external.record(exports_external.string(), exports_external.unknown()).nullish(),
-  sessionId: zSessionId,
-  terminalId: exports_external.string()
-});
-var zTerminalOutputResponse = exports_external.object({
-  _meta: exports_external.record(exports_external.string(), exports_external.unknown()).nullish(),
-  exitStatus: zTerminalExitStatus.nullish(),
-  output: exports_external.string(),
-  truncated: exports_external.boolean()
-});
-var zTextContent = exports_external.object({
-  _meta: exports_external.record(exports_external.string(), exports_external.unknown()).nullish(),
-  annotations: zAnnotations.nullish(),
-  text: exports_external.string()
-});
-var zTextResourceContents = exports_external.object({
+var zTextResourceContents = exports_external.looseObject({
   _meta: exports_external.record(exports_external.string(), exports_external.unknown()).nullish(),
   mimeType: exports_external.string().nullish(),
   text: exports_external.string(),
@@ -14242,75 +15116,59 @@ var zEmbeddedResourceResource = exports_external.union([
   zTextResourceContents,
   zBlobResourceContents
 ]);
-var zEmbeddedResource = exports_external.object({
+var zEmbeddedResource = exports_external.looseObject({
   _meta: exports_external.record(exports_external.string(), exports_external.unknown()).nullish(),
   annotations: zAnnotations.nullish(),
   resource: zEmbeddedResourceResource
 });
 var zContentBlock = exports_external.union([
-  zTextContent.and(exports_external.object({
+  zTextContent.and(exports_external.looseObject({
     type: exports_external.literal("text")
   })),
-  zImageContent.and(exports_external.object({
+  zImageContent.and(exports_external.looseObject({
     type: exports_external.literal("image")
   })),
-  zAudioContent.and(exports_external.object({
+  zAudioContent.and(exports_external.looseObject({
     type: exports_external.literal("audio")
   })),
-  zResourceLink.and(exports_external.object({
+  zResourceLink.and(exports_external.looseObject({
     type: exports_external.literal("resource_link")
   })),
-  zEmbeddedResource.and(exports_external.object({
+  zEmbeddedResource.and(exports_external.looseObject({
     type: exports_external.literal("resource")
   }))
 ]);
-var zContent = exports_external.object({
+var zContent = exports_external.looseObject({
   _meta: exports_external.record(exports_external.string(), exports_external.unknown()).nullish(),
   content: zContentBlock
 });
-var zContentChunk = exports_external.object({
+var zContentChunk = exports_external.looseObject({
   _meta: exports_external.record(exports_external.string(), exports_external.unknown()).nullish(),
   content: zContentBlock,
   messageId: exports_external.string().nullish()
 });
-var zPromptRequest = exports_external.object({
+var zPromptRequest = exports_external.looseObject({
   _meta: exports_external.record(exports_external.string(), exports_external.unknown()).nullish(),
   messageId: exports_external.string().nullish(),
   prompt: exports_external.array(zContentBlock),
   sessionId: zSessionId
 });
-var zClientRequest = exports_external.object({
-  id: zRequestId,
-  method: exports_external.string(),
-  params: exports_external.union([
-    zInitializeRequest,
-    zAuthenticateRequest,
-    zNewSessionRequest,
-    zLoadSessionRequest,
-    zListSessionsRequest,
-    zForkSessionRequest,
-    zResumeSessionRequest,
-    zCloseSessionRequest,
-    zSetSessionModeRequest,
-    zSetSessionConfigOptionRequest,
-    zPromptRequest,
-    zSetSessionModelRequest,
-    zExtRequest
-  ]).nullish()
+var zTitledMultiSelectItems = exports_external.looseObject({
+  anyOf: exports_external.array(zEnumOption)
 });
 var zToolCallContent = exports_external.union([
-  zContent.and(exports_external.object({
+  zContent.and(exports_external.looseObject({
     type: exports_external.literal("content")
   })),
-  zDiff.and(exports_external.object({
+  zDiff.and(exports_external.looseObject({
     type: exports_external.literal("diff")
   })),
-  zTerminal.and(exports_external.object({
+  zTerminal.and(exports_external.looseObject({
     type: exports_external.literal("terminal")
   }))
 ]);
 var zToolCallId = exports_external.string();
-var zToolCallLocation = exports_external.object({
+var zToolCallLocation = exports_external.looseObject({
   _meta: exports_external.record(exports_external.string(), exports_external.unknown()).nullish(),
   line: exports_external.number().int().gte(0).max(4294967295, {
     message: "Invalid value: Expected uint32 to be <= 4294967295"
@@ -14335,7 +15193,7 @@ var zToolKind = exports_external.union([
   exports_external.literal("switch_mode"),
   exports_external.literal("other")
 ]);
-var zToolCall = exports_external.object({
+var zToolCall = exports_external.looseObject({
   _meta: exports_external.record(exports_external.string(), exports_external.unknown()).nullish(),
   content: exports_external.array(zToolCallContent).optional(),
   kind: zToolKind.optional(),
@@ -14346,7 +15204,7 @@ var zToolCall = exports_external.object({
   title: exports_external.string(),
   toolCallId: zToolCallId
 });
-var zToolCallUpdate = exports_external.object({
+var zToolCallUpdate = exports_external.looseObject({
   _meta: exports_external.record(exports_external.string(), exports_external.unknown()).nullish(),
   content: exports_external.array(zToolCallContent).nullish(),
   kind: zToolKind.nullish(),
@@ -14357,28 +15215,83 @@ var zToolCallUpdate = exports_external.object({
   title: exports_external.string().nullish(),
   toolCallId: zToolCallId
 });
-var zRequestPermissionRequest = exports_external.object({
+var zRequestPermissionRequest = exports_external.looseObject({
   _meta: exports_external.record(exports_external.string(), exports_external.unknown()).nullish(),
   options: exports_external.array(zPermissionOption),
   sessionId: zSessionId,
   toolCall: zToolCallUpdate
 });
-var zUnstructuredCommandInput = exports_external.object({
+var zUnstructuredCommandInput = exports_external.looseObject({
   _meta: exports_external.record(exports_external.string(), exports_external.unknown()).nullish(),
   hint: exports_external.string()
 });
 var zAvailableCommandInput = zUnstructuredCommandInput;
-var zAvailableCommand = exports_external.object({
+var zAvailableCommand = exports_external.looseObject({
   _meta: exports_external.record(exports_external.string(), exports_external.unknown()).nullish(),
   description: exports_external.string(),
   input: zAvailableCommandInput.nullish(),
   name: exports_external.string()
 });
-var zAvailableCommandsUpdate = exports_external.object({
+var zAvailableCommandsUpdate = exports_external.looseObject({
   _meta: exports_external.record(exports_external.string(), exports_external.unknown()).nullish(),
   availableCommands: exports_external.array(zAvailableCommand)
 });
-var zUsage = exports_external.object({
+var zUntitledMultiSelectItems = exports_external.looseObject({
+  enum: exports_external.array(exports_external.string()),
+  type: zElicitationStringType
+});
+var zMultiSelectItems = exports_external.union([
+  zUntitledMultiSelectItems,
+  zTitledMultiSelectItems
+]);
+var zMultiSelectPropertySchema = exports_external.looseObject({
+  default: exports_external.array(exports_external.string()).nullish(),
+  description: exports_external.string().nullish(),
+  items: zMultiSelectItems,
+  maxItems: exports_external.number().nullish(),
+  minItems: exports_external.number().nullish(),
+  title: exports_external.string().nullish()
+});
+var zElicitationPropertySchema = exports_external.union([
+  zStringPropertySchema.and(exports_external.looseObject({
+    type: exports_external.literal("string")
+  })),
+  zNumberPropertySchema.and(exports_external.looseObject({
+    type: exports_external.literal("number")
+  })),
+  zIntegerPropertySchema.and(exports_external.looseObject({
+    type: exports_external.literal("integer")
+  })),
+  zBooleanPropertySchema.and(exports_external.looseObject({
+    type: exports_external.literal("boolean")
+  })),
+  zMultiSelectPropertySchema.and(exports_external.looseObject({
+    type: exports_external.literal("array")
+  }))
+]);
+var zElicitationSchema = exports_external.looseObject({
+  description: exports_external.string().nullish(),
+  properties: exports_external.record(exports_external.string(), zElicitationPropertySchema).optional().default({}),
+  required: exports_external.array(exports_external.string()).nullish(),
+  title: exports_external.string().nullish(),
+  type: zElicitationSchemaType.optional().default("object")
+});
+var zElicitationFormMode = exports_external.looseObject({
+  requestedSchema: zElicitationSchema
+});
+var zElicitationRequest = exports_external.intersection(exports_external.union([
+  zElicitationFormMode.and(exports_external.looseObject({
+    mode: exports_external.literal("form")
+  })),
+  zElicitationUrlMode.and(exports_external.looseObject({
+    mode: exports_external.literal("url")
+  }))
+]), exports_external.looseObject({
+  _meta: exports_external.record(exports_external.string(), exports_external.unknown()).nullish(),
+  message: exports_external.string(),
+  sessionId: zSessionId
+}));
+var zUsage = exports_external.looseObject({
   cachedReadTokens: exports_external.number().nullish(),
   cachedWriteTokens: exports_external.number().nullish(),
   inputTokens: exports_external.number(),
@@ -14386,18 +15299,19 @@ var zUsage = exports_external.object({
   thoughtTokens: exports_external.number().nullish(),
   totalTokens: exports_external.number()
 });
-var zPromptResponse = exports_external.object({
+var zPromptResponse = exports_external.looseObject({
   _meta: exports_external.record(exports_external.string(), exports_external.unknown()).nullish(),
   stopReason: zStopReason,
   usage: zUsage.nullish(),
   userMessageId: exports_external.string().nullish()
 });
 var zAgentResponse = exports_external.union([
-  exports_external.object({
+  exports_external.looseObject({
     id: zRequestId,
     result: exports_external.union([
       zInitializeResponse,
       zAuthenticateResponse,
+      zLogoutResponse,
       zNewSessionResponse,
       zLoadSessionResponse,
       zListSessionsResponse,
@@ -14408,83 +15322,123 @@ var zAgentResponse = exports_external.union([
       zSetSessionConfigOptionResponse,
       zPromptResponse,
       zSetSessionModelResponse,
+      zStartNesResponse,
+      zSuggestNesResponse,
+      zCloseNesResponse,
       zExtResponse
     ])
   }),
-  exports_external.object({
+  exports_external.looseObject({
     error: zError,
     id: zRequestId
   })
 ]);
-var zUsageUpdate = exports_external.object({
+var zUsageUpdate = exports_external.looseObject({
   _meta: exports_external.record(exports_external.string(), exports_external.unknown()).nullish(),
   cost: zCost.nullish(),
   size: exports_external.number(),
   used: exports_external.number()
 });
 var zSessionUpdate = exports_external.union([
-  zContentChunk.and(exports_external.object({
+  zContentChunk.and(exports_external.looseObject({
     sessionUpdate: exports_external.literal("user_message_chunk")
   })),
-  zContentChunk.and(exports_external.object({
+  zContentChunk.and(exports_external.looseObject({
     sessionUpdate: exports_external.literal("agent_message_chunk")
   })),
-  zContentChunk.and(exports_external.object({
+  zContentChunk.and(exports_external.looseObject({
     sessionUpdate: exports_external.literal("agent_thought_chunk")
   })),
-  zToolCall.and(exports_external.object({
+  zToolCall.and(exports_external.looseObject({
     sessionUpdate: exports_external.literal("tool_call")
   })),
-  zToolCallUpdate.and(exports_external.object({
+  zToolCallUpdate.and(exports_external.looseObject({
     sessionUpdate: exports_external.literal("tool_call_update")
   })),
-  zPlan.and(exports_external.object({
+  zPlan.and(exports_external.looseObject({
     sessionUpdate: exports_external.literal("plan")
   })),
-  zAvailableCommandsUpdate.and(exports_external.object({
+  zAvailableCommandsUpdate.and(exports_external.looseObject({
     sessionUpdate: exports_external.literal("available_commands_update")
   })),
-  zCurrentModeUpdate.and(exports_external.object({
+  zCurrentModeUpdate.and(exports_external.looseObject({
     sessionUpdate: exports_external.literal("current_mode_update")
   })),
-  zConfigOptionUpdate.and(exports_external.object({
+  zConfigOptionUpdate.and(exports_external.looseObject({
     sessionUpdate: exports_external.literal("config_option_update")
   })),
-  zSessionInfoUpdate.and(exports_external.object({
+  zSessionInfoUpdate.and(exports_external.looseObject({
     sessionUpdate: exports_external.literal("session_info_update")
   })),
-  zUsageUpdate.and(exports_external.object({
+  zUsageUpdate.and(exports_external.looseObject({
     sessionUpdate: exports_external.literal("usage_update")
   }))
 ]);
-var zSessionNotification = exports_external.object({
+var zSessionNotification = exports_external.looseObject({
   _meta: exports_external.record(exports_external.string(), exports_external.unknown()).nullish(),
   sessionId: zSessionId,
   update: zSessionUpdate
 });
-var zAgentNotification = exports_external.object({
+var zAgentNotification = exports_external.looseObject({
   method: exports_external.string(),
-  params: exports_external.union([zSessionNotification, zExtNotification]).nullish()
+  params: exports_external.union([
+    zSessionNotification,
+    zElicitationCompleteNotification,
+    zExtNotification
+  ]).nullish()
 });
-var zWaitForTerminalExitRequest = exports_external.object({
+var zWaitForTerminalExitRequest = exports_external.looseObject({
   _meta: exports_external.record(exports_external.string(), exports_external.unknown()).nullish(),
   sessionId: zSessionId,
   terminalId: exports_external.string()
 });
-var zWaitForTerminalExitResponse = exports_external.object({
+var zWaitForTerminalExitResponse = exports_external.looseObject({
   _meta: exports_external.record(exports_external.string(), exports_external.unknown()).nullish(),
   exitCode: exports_external.number().int().gte(0).max(4294967295, {
     message: "Invalid value: Expected uint32 to be <= 4294967295"
   }).nullish(),
   signal: exports_external.string().nullish()
 });
-var zWriteTextFileRequest = exports_external.object({
+var zWorkspaceFolder = exports_external.looseObject({
+  name: exports_external.string(),
+  uri: exports_external.string()
+});
+var zStartNesRequest = exports_external.looseObject({
+  _meta: exports_external.record(exports_external.string(), exports_external.unknown()).nullish(),
+  repository: zNesRepository.nullish(),
+  workspaceFolders: exports_external.array(zWorkspaceFolder).nullish(),
+  workspaceUri: exports_external.string().nullish()
+});
+var zClientRequest = exports_external.looseObject({
+  id: zRequestId,
+  method: exports_external.string(),
+  params: exports_external.union([
+    zInitializeRequest,
+    zAuthenticateRequest,
+    zLogoutRequest,
+    zNewSessionRequest,
+    zLoadSessionRequest,
+    zListSessionsRequest,
+    zForkSessionRequest,
+    zResumeSessionRequest,
+    zCloseSessionRequest,
+    zSetSessionModeRequest,
+    zSetSessionConfigOptionRequest,
+    zPromptRequest,
+    zSetSessionModelRequest,
+    zStartNesRequest,
+    zSuggestNesRequest,
+    zCloseNesRequest,
+    zExtRequest
+  ]).nullish()
+});
+var zWriteTextFileRequest = exports_external.looseObject({
   _meta: exports_external.record(exports_external.string(), exports_external.unknown()).nullish(),
   content: exports_external.string(),
   path: exports_external.string(),
   sessionId: zSessionId
 });
-var zAgentRequest = exports_external.object({
+var zAgentRequest = exports_external.looseObject({
   id: zRequestId,
   method: exports_external.string(),
   params: exports_external.union([
@@ -14496,14 +15450,15 @@ var zAgentRequest = exports_external.object({
     zReleaseTerminalRequest,
     zWaitForTerminalExitRequest,
     zKillTerminalRequest,
+    zElicitationRequest,
     zExtRequest
   ]).nullish()
 });
-var zWriteTextFileResponse = exports_external.object({
+var zWriteTextFileResponse = exports_external.looseObject({
   _meta: exports_external.record(exports_external.string(), exports_external.unknown()).nullish()
 });
 var zClientResponse = exports_external.union([
-  exports_external.object({
+  exports_external.looseObject({
     id: zRequestId,
     result: exports_external.union([
       zWriteTextFileResponse,
@@ -14514,15 +15469,16 @@ var zClientResponse = exports_external.union([
       zReleaseTerminalResponse,
       zWaitForTerminalExitResponse,
       zKillTerminalResponse,
+      zElicitationResponse,
       zExtResponse
     ])
   }),
-  exports_external.object({
+  exports_external.looseObject({
     error: zError,
     id: zRequestId
   })
 ]);
-// ../../node_modules/.bun/@agentclientprotocol+sdk@0.16.0+3c5d820c62823f0b/node_modules/@agentclientprotocol/sdk/dist/stream.js
+// ../../node_modules/.bun/@agentclientprotocol+sdk@0.18.2+3c5d820c62823f0b/node_modules/@agentclientprotocol/sdk/dist/stream.js
 function ndJsonStream(output, input) {
   const textEncoder = new TextEncoder;
   const textDecoder = new TextDecoder;
@@ -14555,10 +15511,13 @@ function ndJsonStream(output, input) {
             }
           }
         }
+      } catch (err) {
+        controller.error(err);
+        return;
       } finally {
         reader.releaseLock();
-        controller.close();
       }
+      controller.close();
     }
   });
   const writable = new WritableStream({
@@ -14576,7 +15535,7 @@ function ndJsonStream(output, input) {
   return { readable, writable };
 }
 
-// ../../node_modules/.bun/@agentclientprotocol+sdk@0.16.0+3c5d820c62823f0b/node_modules/@agentclientprotocol/sdk/dist/acp.js
+// ../../node_modules/.bun/@agentclientprotocol+sdk@0.18.2+3c5d820c62823f0b/node_modules/@agentclientprotocol/sdk/dist/acp.js
 class AgentSideConnection {
   #connection;
   constructor(toAgent, stream2) {
@@ -14639,6 +15598,14 @@ class AgentSideConnection {
           const result = await agent.authenticate(validatedParams);
           return result ?? {};
         }
+        case AGENT_METHODS.logout: {
+          if (!agent.unstable_logout) {
+            throw RequestError.methodNotFound(method);
+          }
+          const validatedParams = zLogoutRequest.parse(params);
+          const result = await agent.unstable_logout(validatedParams);
+          return result ?? {};
+        }
         case AGENT_METHODS.session_prompt: {
           const validatedParams = zPromptRequest.parse(params);
           return agent.prompt(validatedParams);
@@ -14658,6 +15625,28 @@ class AgentSideConnection {
           const validatedParams = zSetSessionConfigOptionRequest.parse(params);
           return agent.setSessionConfigOption(validatedParams);
         }
+        case AGENT_METHODS.nes_start: {
+          if (!agent.unstable_startNes) {
+            throw RequestError.methodNotFound(method);
+          }
+          const validatedParams = zStartNesRequest.parse(params);
+          return agent.unstable_startNes(validatedParams);
+        }
+        case AGENT_METHODS.nes_suggest: {
+          if (!agent.unstable_suggestNes) {
+            throw RequestError.methodNotFound(method);
+          }
+          const validatedParams = zSuggestNesRequest.parse(params);
+          return agent.unstable_suggestNes(validatedParams);
+        }
+        case AGENT_METHODS.nes_close: {
+          if (!agent.unstable_closeNes) {
+            throw RequestError.methodNotFound(method);
+          }
+          const validatedParams = zCloseNesRequest.parse(params);
+          const result = await agent.unstable_closeNes(validatedParams);
+          return result ?? {};
+        }
         default:
           if (agent.extMethod) {
             return agent.extMethod(method, params);
@@ -14670,6 +15659,48 @@ class AgentSideConnection {
         case AGENT_METHODS.session_cancel: {
           const validatedParams = zCancelNotification.parse(params);
           return agent.cancel(validatedParams);
+        }
+        case AGENT_METHODS.document_did_open: {
+          if (!agent.unstable_didOpenDocument)
+            return;
+          const validatedParams = zDidOpenDocumentNotification.parse(params);
+          return agent.unstable_didOpenDocument(validatedParams);
+        }
+        case AGENT_METHODS.document_did_change: {
+          if (!agent.unstable_didChangeDocument)
+            return;
+          const validatedParams = zDidChangeDocumentNotification.parse(params);
+          return agent.unstable_didChangeDocument(validatedParams);
+        }
+        case AGENT_METHODS.document_did_close: {
+          if (!agent.unstable_didCloseDocument)
+            return;
+          const validatedParams = zDidCloseDocumentNotification.parse(params);
+          return agent.unstable_didCloseDocument(validatedParams);
+        }
+        case AGENT_METHODS.document_did_save: {
+          if (!agent.unstable_didSaveDocument)
+            return;
+          const validatedParams = zDidSaveDocumentNotification.parse(params);
+          return agent.unstable_didSaveDocument(validatedParams);
+        }
+        case AGENT_METHODS.document_did_focus: {
+          if (!agent.unstable_didFocusDocument)
+            return;
+          const validatedParams = zDidFocusDocumentNotification.parse(params);
+          return agent.unstable_didFocusDocument(validatedParams);
+        }
+        case AGENT_METHODS.nes_accept: {
+          if (!agent.unstable_acceptNes)
+            return;
+          const validatedParams = zAcceptNesNotification.parse(params);
+          return agent.unstable_acceptNes(validatedParams);
+        }
+        case AGENT_METHODS.nes_reject: {
+          if (!agent.unstable_rejectNes)
+            return;
+          const validatedParams = zRejectNesNotification.parse(params);
+          return agent.unstable_rejectNes(validatedParams);
         }
         default:
           if (agent.extNotification) {
@@ -14843,11 +15874,44 @@ class ClientSideConnection {
   async authenticate(params) {
     return await this.#connection.sendRequest(AGENT_METHODS.authenticate, params) ?? {};
   }
+  async unstable_logout(params) {
+    return await this.#connection.sendRequest(AGENT_METHODS.logout, params) ?? {};
+  }
   async prompt(params) {
     return await this.#connection.sendRequest(AGENT_METHODS.session_prompt, params);
   }
   async cancel(params) {
     return await this.#connection.sendNotification(AGENT_METHODS.session_cancel, params);
+  }
+  async unstable_startNes(params) {
+    return await this.#connection.sendRequest(AGENT_METHODS.nes_start, params);
+  }
+  async unstable_suggestNes(params) {
+    return await this.#connection.sendRequest(AGENT_METHODS.nes_suggest, params);
+  }
+  async unstable_closeNes(params) {
+    return await this.#connection.sendRequest(AGENT_METHODS.nes_close, params) ?? {};
+  }
+  async unstable_didOpenDocument(params) {
+    return await this.#connection.sendNotification(AGENT_METHODS.document_did_open, params);
+  }
+  async unstable_didChangeDocument(params) {
+    return await this.#connection.sendNotification(AGENT_METHODS.document_did_change, params);
+  }
+  async unstable_didCloseDocument(params) {
+    return await this.#connection.sendNotification(AGENT_METHODS.document_did_close, params);
+  }
+  async unstable_didSaveDocument(params) {
+    return await this.#connection.sendNotification(AGENT_METHODS.document_did_save, params);
+  }
+  async unstable_didFocusDocument(params) {
+    return await this.#connection.sendNotification(AGENT_METHODS.document_did_focus, params);
+  }
+  async unstable_acceptNes(params) {
+    return await this.#connection.sendNotification(AGENT_METHODS.nes_accept, params);
+  }
+  async unstable_rejectNes(params) {
+    return await this.#connection.sendNotification(AGENT_METHODS.nes_reject, params);
   }
   async extMethod(method, params) {
     return await this.#connection.sendRequest(method, params);
@@ -14888,36 +15952,53 @@ class Connection {
     return this.#closedPromise;
   }
   async#receive() {
-    const reader = this.#stream.readable.getReader();
+    let closeError = undefined;
     try {
-      while (true) {
-        const { value: message, done } = await reader.read();
-        if (done) {
-          break;
-        }
-        if (!message) {
-          continue;
-        }
-        try {
-          this.#processMessage(message);
-        } catch (err) {
-          console.error("Unexpected error during message processing:", message, err);
-          if ("id" in message && message.id !== undefined) {
-            this.#sendMessage({
-              jsonrpc: "2.0",
-              id: message.id,
-              error: {
-                code: -32700,
-                message: "Parse error"
-              }
-            });
+      const reader = this.#stream.readable.getReader();
+      try {
+        while (!this.#abortController.signal.aborted) {
+          const { value: message, done } = await reader.read();
+          if (done) {
+            break;
+          }
+          if (!message) {
+            continue;
+          }
+          try {
+            this.#processMessage(message);
+          } catch (err) {
+            console.error("Unexpected error during message processing:", message, err);
+            if ("id" in message && message.id !== undefined) {
+              this.#sendMessage({
+                jsonrpc: "2.0",
+                id: message.id,
+                error: {
+                  code: -32700,
+                  message: "Parse error"
+                }
+              });
+            }
           }
         }
+      } finally {
+        reader.releaseLock();
       }
+    } catch (error48) {
+      closeError = error48;
     } finally {
-      reader.releaseLock();
-      this.#abortController.abort();
+      this.#close(closeError);
     }
+  }
+  #close(error48) {
+    if (this.#abortController.signal.aborted) {
+      return;
+    }
+    const closeError = error48 ?? new Error("ACP connection closed");
+    for (const pendingResponse of this.#pendingResponses.values()) {
+      pendingResponse.reject(closeError);
+    }
+    this.#pendingResponses.clear();
+    this.#abortController.abort(closeError);
   }
   async#processMessage(message) {
     if ("method" in message && "id" in message) {
@@ -14995,7 +16076,8 @@ class Connection {
       if ("result" in response) {
         pendingResponse.resolve(response.result);
       } else if ("error" in response) {
-        pendingResponse.reject(response.error);
+        const { code, message, data } = response.error;
+        pendingResponse.reject(new RequestError(code, message, data));
       }
       this.#pendingResponses.delete(response.id);
     } else {
@@ -15003,6 +16085,7 @@ class Connection {
     }
   }
   async sendRequest(method, params) {
+    this.#throwIfClosed();
     const id = this.#nextRequestId++;
     const responsePromise = new Promise((resolve, reject) => {
       this.#pendingResponses.set(id, { resolve, reject });
@@ -15011,7 +16094,13 @@ class Connection {
     return responsePromise;
   }
   async sendNotification(method, params) {
+    this.#throwIfClosed();
     await this.#sendMessage({ jsonrpc: "2.0", method, params });
+  }
+  #throwIfClosed() {
+    if (this.#abortController.signal.aborted) {
+      throw this.#abortController.signal.reason ?? new Error("ACP connection closed");
+    }
   }
   async#sendMessage(message) {
     this.#writeQueue = this.#writeQueue.then(async () => {
@@ -15022,7 +16111,7 @@ class Connection {
         writer.releaseLock();
       }
     }).catch((error48) => {
-      console.error("ACP write error:", error48);
+      this.#close(error48);
     });
     return this.#writeQueue;
   }
@@ -15078,22 +16167,159 @@ class RequestError extends Error {
   }
 }
 
-// acp-harness-client.ts
-function errorMessage(error48) {
-  if (error48 instanceof Error)
-    return error48.message;
-  return String(error48);
+// failures.ts
+class ExternalOperationFailed extends h("ExternalOperationFailed") {
 }
+
+class InvalidRunId extends h("InvalidRunId") {
+}
+
+class RunRecordMalformedSerialization extends h("RunRecordMalformedSerialization") {
+}
+
+class RunRecordCorruptFields extends h("RunRecordCorruptFields") {
+}
+
+class RunCancellationMalformedSerialization extends h("RunCancellationMalformedSerialization") {
+}
+
+class RunCancellationUnsupportedVersion extends h("RunCancellationUnsupportedVersion") {
+}
+
+class RunCancellationCorruptFields extends h("RunCancellationCorruptFields") {
+}
+
+class RunCancellationMarkerInvalidType extends h("RunCancellationMarkerInvalidType") {
+}
+
+class SessionIndexMalformedSerialization extends h("SessionIndexMalformedSerialization") {
+}
+
+class SessionIndexUnsupportedVersion extends h("SessionIndexUnsupportedVersion") {
+}
+
+class SessionIndexCorruptFields extends h("SessionIndexCorruptFields") {
+}
+
+class SessionIndexLockTimedOut extends h("SessionIndexLockTimedOut") {
+}
+
+class WorkAndCleanupFailed extends h("WorkAndCleanupFailed") {
+}
+
+class WorkAndMonitorFailed extends h("WorkAndMonitorFailed") {
+}
+
+class MonitorTerminationFailed extends h("MonitorTerminationFailed") {
+}
+
+class WorkerLifecycleCleanupFailed extends h("WorkerLifecycleCleanupFailed") {
+}
+
+class HarnessUnavailable extends h("HarnessUnavailable") {
+}
+
+class SessionSelectionFailed extends h("SessionSelectionFailed") {
+}
+
+class RunInvariantFailed extends h("RunInvariantFailed") {
+}
+
+// external-adapters.ts
+var cleanupFailuresByPanic = new WeakMap;
+function signalAcpDefect(defect) {
+  throw defect;
+}
+function recordAcpCleanupFailure(panic, cleanup) {
+  cleanupFailuresByPanic.set(panic, [...cleanupFailuresByPanic.get(panic) ?? [], cleanup]);
+}
+function captureAcpFailure(cause) {
+  const panic = ae.try({
+    try: () => n.is(cause) ? cause : null,
+    catch: () => null
+  });
+  if (panic.status === "ok" && panic.value)
+    return { kind: "panic", panic: panic.value };
+  const projection = projectExternalFailure(cause);
+  return {
+    kind: "ordinary",
+    cause: new Error(projection.message, { cause }),
+    projection
+  };
+}
+function projectExternalFailure(cause) {
+  const errorProjection = ae.try({
+    try: () => {
+      if (!(cause instanceof Error))
+        return null;
+      const code = "code" in cause && typeof cause.code === "string" ? cause.code : undefined;
+      return {
+        ...code ? { code } : {},
+        message: cause.message
+      };
+    },
+    catch: () => null
+  });
+  if (errorProjection.status === "ok" && errorProjection.value)
+    return errorProjection.value;
+  switch (typeof cause) {
+    case "string":
+      return { message: cause };
+    case "number":
+    case "boolean":
+    case "bigint":
+      return { message: String(cause) };
+    case "symbol":
+      return { message: cause.description ?? "Opaque ACP external failure" };
+    case "undefined":
+    case "object":
+    case "function":
+      return { message: "Opaque ACP external failure" };
+  }
+}
+function replaceExternalFailureMessage(failure, message) {
+  return new ExternalOperationFailed({
+    operation: failure.operation,
+    cause: failure.cause,
+    ...failure.code ? { code: failure.code } : {},
+    message
+  });
+}
+async function captureExternal(operation, run, message) {
+  const captured = await ae.tryPromise({
+    try: run,
+    catch: captureAcpFailure
+  });
+  if (captured.status === "ok")
+    return ae.ok(captured.value);
+  if (captured.error.kind === "panic")
+    return signalAcpDefect(captured.error.panic);
+  return ae.err(new ExternalOperationFailed({
+    operation,
+    cause: captured.error.cause,
+    ...captured.error.projection.code ? { code: captured.error.projection.code } : {},
+    message: message ?? captured.error.projection.message
+  }));
+}
+
+// acp-harness-client.ts
 function choosePermissionOutcome(behavior, request) {
   const pick2 = (...kinds) => request.options.find((option) => kinds.includes(option.kind));
-  const preferred = behavior === "reject" ? pick2("reject_once", "reject_always") : behavior === "once" ? pick2("allow_once", "allow_always", "reject_once", "reject_always") : pick2("allow_always", "allow_once", "reject_once", "reject_always");
-  if (!preferred) {
-    return { outcome: "cancelled" };
+  let preferred;
+  switch (behavior) {
+    case "reject":
+      preferred = pick2("reject_once", "reject_always");
+      break;
+    case "once":
+      preferred = pick2("allow_once", "allow_always", "reject_once", "reject_always");
+      break;
+    case "always":
+      preferred = pick2("allow_always", "allow_once", "reject_once", "reject_always");
+      break;
   }
-  return {
-    outcome: "selected",
-    optionId: preferred.optionId
-  };
+  if (!preferred)
+    return { outcome: "cancelled" };
+  return { outcome: "selected", optionId: preferred.optionId };
 }
 
 class ControllerClient {
@@ -15135,21 +16361,42 @@ class AcpHarnessClient {
     this.stderrBuffer = stderrBuffer;
   }
   static async connect(params) {
-    const child = spawn(params.harness.command, [...params.harness.args], {
+    const spawned = await captureExternal("initialize-harness", async () => spawn(params.harness.command, [...params.harness.args], {
       stdio: ["pipe", "pipe", "pipe"],
       env: process.env
-    });
+    }));
+    if (spawned.status === "error")
+      return ae.err(spawned.error);
+    const child = spawned.value;
     const stderrBuffer = { value: "" };
-    child.stderr?.on("data", (chunk) => {
+    child.stderr.on("data", (chunk) => {
       const text = typeof chunk === "string" ? chunk : chunk.toString("utf8");
       stderrBuffer.value = `${stderrBuffer.value}${text}`.slice(-4000);
     });
-    const input = Writable.toWeb(child.stdin);
-    const output = Readable.toWeb(child.stdout);
-    const stream2 = ndJsonStream(input, output);
-    const client = new ControllerClient(params.permissionBehavior, params.counters, params.onUpdate);
-    const connection = new ClientSideConnection(() => client, stream2);
-    try {
+    const initialized = await captureExternal("initialize-harness", async () => {
+      const input = Writable.toWeb(child.stdin);
+      const output = new ReadableStream({
+        async start(controller) {
+          try {
+            for await (const rawChunk of child.stdout) {
+              const chunk = rawChunk;
+              if (!(chunk instanceof Uint8Array)) {
+                throw new TypeError("ACP harness stdout emitted a non-byte chunk");
+              }
+              controller.enqueue(chunk);
+            }
+            controller.close();
+          } catch (cause) {
+            controller.error(cause);
+          }
+        },
+        cancel(reason) {
+          child.stdout.destroy(reason instanceof Error ? reason : undefined);
+        }
+      });
+      const stream2 = ndJsonStream(input, output);
+      const client = new ControllerClient(params.permissionBehavior, params.counters, params.onUpdate);
+      const connection = new ClientSideConnection(() => client, stream2);
       const initializeResponse = await connection.initialize({
         protocolVersion: PROTOCOL_VERSION,
         clientCapabilities: {},
@@ -15159,13 +16406,24 @@ class AcpHarnessClient {
           version: params.version
         }
       });
-      return new AcpHarnessClient(params.harness, initializeResponse, child, connection, stderrBuffer);
-    } catch (error48) {
-      child.kill();
-      const stderr = stderrBuffer.value.trim();
-      const details = stderr.length > 0 ? ` stderr=${stderr}` : "";
-      throw new Error(`Failed to initialize harness '${params.harness.descriptor.id}': ${errorMessage(error48)}.${details}`);
+      return { connection, initializeResponse };
+    }, `Failed to initialize harness '${params.harness.descriptor.id}'.`);
+    if (initialized.status === "ok") {
+      return ae.ok(new AcpHarnessClient(params.harness, initialized.value.initializeResponse, child, initialized.value.connection, stderrBuffer));
     }
+    const cleanup = await captureExternal("close-harness", async () => {
+      child.kill();
+    });
+    const stderr = stderrBuffer.value.trim();
+    const details = stderr.length > 0 ? ` stderr=${stderr}` : "";
+    const primary = replaceExternalFailureMessage(initialized.error, `${initialized.error.message}${details}`);
+    if (cleanup.status === "ok")
+      return ae.err(primary);
+    return ae.err(new WorkAndCleanupFailed({
+      primary,
+      cleanup: cleanup.error,
+      message: `${primary.message} Harness process cleanup also failed.`
+    }));
   }
   capabilities() {
     const agentCapabilities = this.initializeResponse.agentCapabilities;
@@ -15187,66 +16445,73 @@ class AcpHarnessClient {
   }
   async listSessions(cwd) {
     if (!this.initializeResponse.agentCapabilities?.sessionCapabilities?.list) {
-      throw new Error(`Harness '${this.harness.descriptor.id}' does not support session listing.`);
+      return ae.err(new HarnessUnavailable({
+        harnessId: this.harness.descriptor.id,
+        message: `Harness '${this.harness.descriptor.id}' does not support session listing.`
+      }));
     }
     const sessions = [];
     let cursor;
     do {
-      const response = await this.connection.listSessions({
-        cwd,
-        ...cursor ? { cursor } : {}
-      });
-      sessions.push(...response.sessions);
-      cursor = response.nextCursor;
+      const response = await captureExternal("list-sessions", () => this.connection.listSessions({ cwd, ...cursor ? { cursor } : {} }));
+      if (response.status === "error")
+        return ae.err(response.error);
+      sessions.push(...response.value.sessions);
+      cursor = response.value.nextCursor;
     } while (cursor);
-    return sessions;
+    return ae.ok(sessions);
   }
   async createSession(cwd) {
-    return this.connection.newSession({ cwd, mcpServers: [] });
+    return captureExternal("create-session", () => this.connection.newSession({ cwd, mcpServers: [] }));
   }
   async loadSession(sessionId, cwd) {
     if (this.initializeResponse.agentCapabilities?.loadSession) {
-      await this.connection.loadSession({ sessionId, cwd, mcpServers: [] });
-      return;
+      const loaded = await captureExternal("load-session", () => this.connection.loadSession({ sessionId, cwd, mcpServers: [] }));
+      return loaded.status === "ok" ? ae.ok(undefined) : ae.err(loaded.error);
     }
     if (this.initializeResponse.agentCapabilities?.sessionCapabilities?.resume) {
-      await this.connection.unstable_resumeSession({ sessionId, cwd });
-      return;
+      const resumed = await captureExternal("load-session", () => this.connection.unstable_resumeSession({ sessionId, cwd }));
+      return resumed.status === "ok" ? ae.ok(undefined) : ae.err(resumed.error);
     }
-    throw new Error(`Harness '${this.harness.descriptor.id}' does not support loading sessions.`);
+    return ae.err(new HarnessUnavailable({
+      harnessId: this.harness.descriptor.id,
+      message: `Harness '${this.harness.descriptor.id}' does not support loading sessions.`
+    }));
   }
   async setMode(sessionId, modeId) {
-    await this.connection.setSessionMode({ sessionId, modeId });
+    const updated = await captureExternal("set-session-mode", () => this.connection.setSessionMode({ sessionId, modeId }));
+    return updated.status === "ok" ? ae.ok(undefined) : ae.err(updated.error);
   }
   async setModel(sessionId, modelId) {
-    await this.connection.unstable_setSessionModel({ sessionId, modelId });
+    const updated = await captureExternal("set-session-model", () => this.connection.unstable_setSessionModel({ sessionId, modelId }));
+    return updated.status === "ok" ? ae.ok(undefined) : ae.err(updated.error);
   }
   async prompt(sessionId, text, messageId) {
-    return this.connection.prompt({
+    return captureExternal("prompt-session", () => this.connection.prompt({
       sessionId,
       messageId,
       prompt: [{ type: "text", text }]
-    });
+    }));
   }
   async cancel(sessionId) {
-    await this.connection.cancel({ sessionId });
+    const cancelled = await captureExternal("cancel-session", () => this.connection.cancel({ sessionId }));
+    return cancelled.status === "ok" ? ae.ok(undefined) : ae.err(cancelled.error);
   }
   async close() {
-    try {
-      if (this.initializeResponse.agentCapabilities?.sessionCapabilities?.stop) {}
+    return captureExternal("close-harness", async () => {
       this.child.kill();
       await Promise.race([
         this.connection.closed,
         new Promise((resolve) => setTimeout(resolve, 200))
       ]);
-    } catch {}
+    });
   }
   stderr() {
     return this.stderrBuffer.value.trim();
   }
 }
 function isAuthRequiredError(error48) {
-  return error48 instanceof RequestError && error48.code === -32004;
+  return error48.cause instanceof RequestError && error48.cause.code === -32004;
 }
 function isCancelledStopReason(stopReason) {
   return stopReason === "cancelled";
@@ -15291,26 +16556,31 @@ function pathEntries() {
   return raw.split(path.delimiter).filter((entry) => entry.length > 0);
 }
 async function isExecutable(filePath) {
-  try {
-    await fs.access(filePath, constants.X_OK);
-    return true;
-  } catch {
-    return false;
-  }
+  const accessed = await captureExternal("access-harness", () => fs.access(filePath, constants.X_OK));
+  return accessed.status === "ok" ? ae.ok(true) : ae.err(accessed.error);
 }
 async function resolveCommand(command) {
   if (command.includes(path.sep)) {
-    return await isExecutable(command) ? command : null;
+    const executable = await isExecutable(command);
+    if (executable.status === "error")
+      return ae.err(executable.error);
+    return ae.ok(executable.value ? command : null);
   }
   const extensions = process.platform === "win32" ? (process.env.PATHEXT ?? ".EXE;.CMD;.BAT;.COM").split(";").filter((entry) => entry.length > 0) : [""];
   for (const entry of pathEntries()) {
     for (const extension of extensions) {
       const fullPath = path.join(entry, process.platform === "win32" ? `${command}${extension}` : command);
-      if (await isExecutable(fullPath))
-        return fullPath;
+      const executable = await isExecutable(fullPath);
+      if (executable.status === "error") {
+        if (executable.error.code === "ENOENT" || executable.error.code === "EACCES")
+          continue;
+        return ae.err(executable.error);
+      }
+      if (executable.value)
+        return ae.ok(fullPath);
     }
   }
-  return null;
+  return ae.ok(null);
 }
 function getHarnessDescriptor(harnessId) {
   return BUILTIN_HARNESSES.find((entry) => entry.id === harnessId) ?? null;
@@ -15318,45 +16588,49 @@ function getHarnessDescriptor(harnessId) {
 async function resolveHarness(harnessId) {
   const descriptor = getHarnessDescriptor(harnessId);
   if (!descriptor)
-    return null;
+    return ae.ok(null);
   for (const candidate of descriptor.launchCandidates) {
     const resolvedCommand = await resolveCommand(candidate.command);
-    if (!resolvedCommand)
+    if (resolvedCommand.status === "error")
+      return ae.err(resolvedCommand.error);
+    if (!resolvedCommand.value)
       continue;
-    return {
+    return ae.ok({
       descriptor,
-      command: resolvedCommand,
+      command: resolvedCommand.value,
       args: candidate.args,
       source: candidate.source
-    };
+    });
   }
-  return null;
+  return ae.ok(null);
 }
 async function listResolvedHarnesses() {
   const results = [];
   for (const descriptor of BUILTIN_HARNESSES) {
     const resolved = await resolveHarness(descriptor.id);
-    if (resolved) {
+    if (resolved.status === "error")
+      return ae.err(resolved.error);
+    if (resolved.value) {
       results.push({
         descriptor,
         launchable: true,
-        command: resolved.command,
-        args: resolved.args,
-        source: resolved.source
+        command: resolved.value.command,
+        args: resolved.value.args,
+        source: resolved.value.source
       });
       continue;
     }
     results.push({ descriptor, launchable: false });
   }
-  return results;
+  return ae.ok(results);
 }
 
 // run-store.ts
+import { randomUUID } from "node:crypto";
+import { watch } from "node:fs";
 import fs2 from "node:fs/promises";
 import os from "node:os";
 import path2 from "node:path";
-import { randomUUID } from "node:crypto";
-
 // types.ts
 var runStatusSchema = exports_external.enum(["submitted", "running", "completed", "failed", "cancelled"]);
 var sessionPlanEntrySchema = exports_external.object({
@@ -15448,6 +16722,18 @@ function createEmptyPermissionCounters() {
 }
 
 // run-store.ts
+var persistedVersionSchema = exports_external.object({ version: exports_external.number() });
+var runCancellationSchema = exports_external.object({
+  version: exports_external.literal(1),
+  runCreatedAt: exports_external.number().int().nonnegative(),
+  requestedAt: exports_external.number().int().nonnegative()
+});
+var legacyRunCancellationSchema = runCancellationSchema.extend({ version: exports_external.literal(0) });
+var legacyRunRecordSchema = promptRunRecordSchema.omit({ permissions: true }).extend({ permissions: exports_external.never().optional() });
+var legacySessionIndexSchema = exports_external.object({
+  version: exports_external.literal(0),
+  sessions: exports_external.array(sessionIndexEntrySchema)
+});
 function stateBaseDir() {
   const xdgStateHome = process.env.XDG_STATE_HOME;
   const base = xdgStateHome && xdgStateHome.trim().length > 0 ? xdgStateHome : path2.join(os.homedir(), ".local", "state");
@@ -15468,85 +16754,545 @@ function sessionIndexLockPath() {
 function runFilePath(runId) {
   return path2.join(runsDir(), `${runId}.json`);
 }
-function assertValidRunId(runId) {
-  const trimmed = runId.trim();
-  if (!/^run_[a-f0-9-]+$/.test(trimmed)) {
-    throw new Error(`Invalid run ID '${runId}'.`);
-  }
-  return trimmed;
+function runCancellationPath(runId) {
+  return path2.join(runsDir(), `${runId}.cancel.json`);
 }
-async function atomicWriteFile(filePath, content) {
+function validateRunId(runId) {
+  const trimmed = runId.trim();
+  if (/^run_[a-f0-9-]+$/.test(trimmed))
+    return ae.ok(trimmed);
+  return ae.err(new InvalidRunId({ runId, message: `Invalid run ID '${runId}'.` }));
+}
+function parseJson(content) {
+  const parsed = ae.try({
+    try: () => JSON.parse(content),
+    catch: captureAcpFailure
+  });
+  if (parsed.status === "ok")
+    return ae.ok(parsed.value);
+  if (parsed.error.kind === "panic")
+    return signalAcpDefect(parsed.error.panic);
+  return ae.err({ cause: parsed.error.cause });
+}
+function decodeRunRecord(input) {
+  const decoded = parseJson(input.content);
+  if (decoded.status === "error") {
+    return ae.err(new RunRecordMalformedSerialization({
+      runId: input.runId,
+      message: decoded.error.cause instanceof Error ? decoded.error.cause.message : `Run record '${input.runId}' contains malformed JSON.`
+    }));
+  }
+  const parsed = promptRunRecordSchema.safeParse(decoded.value);
+  if (parsed.success)
+    return ae.ok({ provenance: "current", value: parsed.data });
+  const legacy = legacyRunRecordSchema.safeParse(decoded.value);
+  if (legacy.success) {
+    return ae.ok({
+      provenance: "migrated",
+      value: {
+        ...legacy.data,
+        permissions: {
+          permissionsApproved: 0,
+          permissionsRejected: 0,
+          permissionsCancelled: 0
+        }
+      }
+    });
+  }
+  return ae.err(new RunRecordCorruptFields({
+    runId: input.runId,
+    message: `Run record '${input.runId}' is malformed.`
+  }));
+}
+function decodeRunCancellation(input) {
+  const decoded = parseJson(input.content);
+  if (decoded.status === "error") {
+    return ae.err(new RunCancellationMalformedSerialization({
+      runId: input.runId,
+      message: `Run cancellation marker '${input.runId}' contains malformed JSON.`
+    }));
+  }
+  const parsed = runCancellationSchema.safeParse(decoded.value);
+  if (parsed.success)
+    return ae.ok({ provenance: "current", value: parsed.data });
+  const legacy = legacyRunCancellationSchema.safeParse(decoded.value);
+  if (legacy.success) {
+    return ae.ok({
+      provenance: "migrated",
+      value: { ...legacy.data, version: 1 }
+    });
+  }
+  const version2 = persistedVersionSchema.safeParse(decoded.value);
+  if (version2.success && version2.data.version !== 1) {
+    return ae.err(new RunCancellationUnsupportedVersion({
+      runId: input.runId,
+      version: version2.data.version,
+      message: `Run cancellation marker '${input.runId}' has unsupported version ${version2.data.version}.`
+    }));
+  }
+  return ae.err(new RunCancellationCorruptFields({
+    runId: input.runId,
+    message: `Run cancellation marker '${input.runId}' contains corrupt fields.`
+  }));
+}
+function decodeSessionIndex(content) {
+  if (content === undefined) {
+    return ae.ok({
+      provenance: "missing-defaulted",
+      value: { version: 1, sessions: [] }
+    });
+  }
+  const decoded = parseJson(content);
+  if (decoded.status === "error") {
+    return ae.err(new SessionIndexMalformedSerialization({
+      message: decoded.error.cause instanceof Error ? decoded.error.cause.message : "Session index contains malformed JSON."
+    }));
+  }
+  const parsed = sessionIndexSchema.safeParse(decoded.value);
+  if (parsed.success)
+    return ae.ok({ provenance: "current", value: parsed.data });
+  const legacy = legacySessionIndexSchema.safeParse(decoded.value);
+  if (legacy.success) {
+    return ae.ok({
+      provenance: "migrated",
+      value: { version: 1, sessions: legacy.data.sessions }
+    });
+  }
+  const version2 = persistedVersionSchema.safeParse(decoded.value);
+  if (version2.success && version2.data.version !== 1) {
+    return ae.err(new SessionIndexUnsupportedVersion({
+      version: version2.data.version,
+      message: `Session index version ${version2.data.version} is unsupported.`
+    }));
+  }
+  return ae.err(new SessionIndexCorruptFields({ message: "Session index contains corrupt fields." }));
+}
+async function atomicWriteFile(filePath, content, operation) {
   const dirPath = path2.dirname(filePath);
   const tempPath = path2.join(dirPath, `.${path2.basename(filePath)}.${process.pid}.${Date.now()}.${randomUUID()}.tmp`);
-  await fs2.writeFile(tempPath, content, "utf8");
-  await fs2.rename(tempPath, filePath);
+  const written = await captureExternal(operation, () => fs2.writeFile(tempPath, content, "utf8"));
+  if (written.status === "error")
+    return ae.err(written.error);
+  return captureExternal(operation, () => fs2.rename(tempPath, filePath));
 }
 async function sleep(ms) {
   await new Promise((resolve) => setTimeout(resolve, ms));
 }
-async function withSessionIndexLock(fn) {
-  await fs2.mkdir(sessionsDir(), { recursive: true });
+async function acquireSessionIndexLock() {
+  const directory = await captureExternal("acquire-session-lock", () => fs2.mkdir(sessionsDir(), { recursive: true }));
+  if (directory.status === "error")
+    return ae.err(directory.error);
   const lockPath = sessionIndexLockPath();
   const deadline = Date.now() + 5000;
   while (true) {
-    try {
-      await fs2.mkdir(lockPath);
-      break;
-    } catch (error48) {
-      const err = error48;
-      if (err.code !== "EEXIST")
-        throw error48;
-      if (Date.now() >= deadline) {
-        throw new Error("Timed out waiting for the session index lock.");
+    const acquired = await captureExternal("acquire-session-lock", () => fs2.mkdir(lockPath));
+    if (acquired.status === "ok")
+      return ae.ok(undefined);
+    if (acquired.error.code !== "EEXIST")
+      return ae.err(acquired.error);
+    if (Date.now() >= deadline) {
+      return ae.err(new SessionIndexLockTimedOut({
+        message: "Timed out waiting for the session index lock."
+      }));
+    }
+    await sleep(25);
+  }
+}
+async function withSessionIndexLock(work) {
+  const acquired = await acquireSessionIndexLock();
+  if (acquired.status === "error")
+    return ae.err(acquired.error);
+  const attempted = await ae.tryPromise({
+    try: work,
+    catch: captureAcpFailure
+  });
+  const cleanupAttempted = await ae.tryPromise({
+    try: () => captureExternal("remove-session-lock", () => fs2.rm(sessionIndexLockPath(), { recursive: true, force: true })),
+    catch: captureAcpFailure
+  });
+  function ordinaryCaptureToExternal(operation, captured) {
+    return new ExternalOperationFailed({
+      operation,
+      cause: captured.cause,
+      ...captured.projection.code ? { code: captured.projection.code } : {},
+      message: captured.projection.message
+    });
+  }
+  if (attempted.status === "error" && attempted.error.kind === "panic") {
+    if (cleanupAttempted.status === "ok") {
+      if (cleanupAttempted.value.status === "error") {
+        recordAcpCleanupFailure(attempted.error.panic, cleanupAttempted.value.error);
       }
-      await sleep(25);
+    } else {
+      const cleanupFailure = cleanupAttempted.error.kind === "panic" ? cleanupAttempted.error.panic : ordinaryCaptureToExternal("remove-session-lock", cleanupAttempted.error);
+      recordAcpCleanupFailure(attempted.error.panic, cleanupFailure);
+    }
+    return signalAcpDefect(attempted.error.panic);
+  }
+  let result;
+  if (attempted.status === "ok") {
+    result = attempted.value;
+  } else {
+    switch (attempted.error.kind) {
+      case "panic":
+        return signalAcpDefect(attempted.error.panic);
+      case "ordinary":
+        result = ae.err(ordinaryCaptureToExternal("session-index-work", attempted.error));
+        break;
     }
   }
-  try {
-    return await fn();
-  } finally {
-    await fs2.rm(lockPath, { recursive: true, force: true });
+  let cleanup;
+  if (cleanupAttempted.status === "ok") {
+    cleanup = cleanupAttempted.value;
+  } else {
+    switch (cleanupAttempted.error.kind) {
+      case "panic":
+        return signalAcpDefect(cleanupAttempted.error.panic);
+      case "ordinary":
+        cleanup = ae.err(ordinaryCaptureToExternal("remove-session-lock", cleanupAttempted.error));
+        break;
+    }
   }
+  if (cleanup.status === "ok")
+    return result;
+  if (result.status === "ok")
+    return ae.err(cleanup.error);
+  return ae.err(new WorkAndCleanupFailed({
+    primary: result.error,
+    cleanup: cleanup.error,
+    message: `${result.error.message} Session index lock cleanup also failed.`
+  }));
 }
 async function saveRunRecord(run) {
-  await fs2.mkdir(runsDir(), { recursive: true });
-  await atomicWriteFile(runFilePath(run.id), `${JSON.stringify(run)}
-`);
+  const directory = await captureExternal("write-run", () => fs2.mkdir(runsDir(), { recursive: true }));
+  if (directory.status === "error")
+    return ae.err(directory.error);
+  return atomicWriteFile(runFilePath(run.id), `${JSON.stringify(run)}
+`, "write-run");
+}
+async function loadRunCancellation(run) {
+  const markerPath = runCancellationPath(run.id);
+  const marker = await captureExternal("read-run", () => fs2.lstat(markerPath));
+  if (marker.status === "error") {
+    return marker.error.code === "ENOENT" ? ae.ok(undefined) : ae.err(marker.error);
+  }
+  if (marker.value.isSymbolicLink() || !marker.value.isFile()) {
+    return ae.err(new RunCancellationMarkerInvalidType({
+      runId: run.id,
+      message: `Run cancellation marker '${run.id}' must be a regular file.`
+    }));
+  }
+  const content = await captureExternal("read-run", () => fs2.readFile(markerPath, "utf8"));
+  if (content.status === "error")
+    return ae.err(content.error);
+  const decoded = decodeRunCancellation({ runId: run.id, content: content.value });
+  if (decoded.status === "error")
+    return ae.err(decoded.error);
+  if (decoded.value.value.runCreatedAt !== run.createdAt || decoded.value.value.requestedAt < run.createdAt) {
+    return ae.ok(undefined);
+  }
+  return ae.ok(decoded.value.value.requestedAt);
+}
+function applyRunCancellation(run, requestedAt) {
+  if (requestedAt === undefined)
+    return run;
+  const cancelRequestedAt = Math.min(run.cancelRequestedAt ?? requestedAt, requestedAt);
+  if (isTerminalRunStatus(run.status) && run.updatedAt <= cancelRequestedAt) {
+    return { ...run, cancelRequestedAt };
+  }
+  if (!isTerminalRunStatus(run.status))
+    return { ...run, cancelRequestedAt };
+  if (run.status === "cancelled")
+    return { ...run, cancelRequestedAt };
+  return {
+    ...run,
+    status: "cancelled",
+    cancelRequestedAt,
+    error: run.error ?? "Prompt cancelled."
+  };
+}
+function isTerminalRunStatus(status) {
+  return status === "completed" || status === "failed" || status === "cancelled";
+}
+async function saveWorkerRunRecord(run) {
+  const cancellationBefore = await loadRunCancellation(run);
+  if (cancellationBefore.status === "error")
+    return ae.err(cancellationBefore.error);
+  let next = applyRunCancellation(run, cancellationBefore.value);
+  const saved = await saveRunRecord(next);
+  if (saved.status === "error")
+    return ae.err(saved.error);
+  const cancellationAfter = await loadRunCancellation(run);
+  if (cancellationAfter.status === "error")
+    return ae.err(cancellationAfter.error);
+  const merged = applyRunCancellation(next, cancellationAfter.value);
+  if (merged !== next) {
+    const cancellationSaved = await saveRunRecord(merged);
+    if (cancellationSaved.status === "error")
+      return ae.err(cancellationSaved.error);
+    next = merged;
+  }
+  return ae.ok(next);
+}
+async function commitRunCancellationRequest(run) {
+  const directory = await captureExternal("write-run", () => fs2.mkdir(runsDir(), { recursive: true }));
+  if (directory.status === "error")
+    return ae.err(directory.error);
+  const requestedAt = run.cancelRequestedAt ?? Math.max(Date.now(), run.createdAt);
+  const marked = await atomicWriteFile(runCancellationPath(run.id), `${JSON.stringify({
+    version: 1,
+    runCreatedAt: run.createdAt,
+    requestedAt
+  })}
+`, "write-run");
+  if (marked.status === "error")
+    return ae.err(marked.error);
+  const current = await loadRunRecord(run.id);
+  if (current.status === "error")
+    return ae.err(current.error);
+  return ae.ok({ kind: "requested", run: current.value });
+}
+async function requestRunCancellation(runId) {
+  const safeRunId = validateRunId(runId);
+  if (safeRunId.status === "error")
+    return ae.err(safeRunId.error);
+  const loaded = await loadRunRecord(safeRunId.value);
+  if (loaded.status === "error")
+    return ae.err(loaded.error);
+  if (isTerminalRunStatus(loaded.value.status)) {
+    return ae.ok({ kind: "already-terminal", run: loaded.value });
+  }
+  return commitRunCancellationRequest(loaded.value);
+}
+async function observeRunCancellation(run, inspect = loadRunCancellation) {
+  const watched = await captureExternal("watch-run-cancellation", async () => watch(runsDir()));
+  if (watched.status === "error")
+    return ae.err(watched.error);
+  const watcher = watched.value;
+  let accepting = true;
+  let settled = false;
+  let resolveResult = () => {
+    return;
+  };
+  let rejectResult = () => {
+    return;
+  };
+  const result = new Promise((resolve, reject) => {
+    resolveResult = resolve;
+    rejectResult = reject;
+  });
+  let stopFallbackCheck = () => {
+    return;
+  };
+  const settle = (resolution) => {
+    if (settled)
+      return;
+    settled = true;
+    stopFallbackCheck();
+    resolveResult(resolution);
+  };
+  const settlePanic = (panic) => {
+    if (settled)
+      return;
+    settled = true;
+    stopFallbackCheck();
+    rejectResult(panic.panic);
+  };
+  let pendingCheck = Promise.resolve();
+  const scheduleCheck = () => {
+    if (!accepting || settled)
+      return;
+    pendingCheck = pendingCheck.then(async () => {
+      if (settled)
+        return;
+      const inspected = await ae.tryPromise({
+        try: () => inspect(run),
+        catch: captureAcpFailure
+      });
+      if (inspected.status === "error") {
+        switch (inspected.error.kind) {
+          case "panic":
+            settlePanic(inspected.error);
+            return;
+          case "ordinary":
+            settle(ae.err(new ExternalOperationFailed({
+              operation: "watch-run-cancellation",
+              cause: inspected.error.cause,
+              ...inspected.error.projection.code ? { code: inspected.error.projection.code } : {},
+              message: inspected.error.projection.message
+            })));
+            return;
+        }
+      }
+      if (inspected.value.status === "error") {
+        settle(ae.err(inspected.value.error));
+      } else if (inspected.value.value !== undefined) {
+        settle(ae.ok("requested"));
+      }
+    });
+  };
+  watcher.on("change", scheduleCheck);
+  watcher.on("error", (cause) => {
+    settle(ae.err(new ExternalOperationFailed({
+      operation: "watch-run-cancellation",
+      cause,
+      message: cause.message
+    })));
+  });
+  scheduleCheck();
+  const fallbackCheck = setInterval(scheduleCheck, 100);
+  fallbackCheck.unref();
+  stopFallbackCheck = () => clearInterval(fallbackCheck);
+  if (settled)
+    stopFallbackCheck();
+  let closeResult;
+  const close = () => {
+    if (closeResult)
+      return closeResult;
+    closeResult = (async () => {
+      accepting = false;
+      stopFallbackCheck();
+      const closed = await captureExternal("close-run-cancellation-watch", async () => watcher.close());
+      await pendingCheck;
+      if (!settled)
+        settle(ae.ok("stopped"));
+      return closed.status === "error" ? ae.err(closed.error) : ae.ok(undefined);
+    })();
+    return closeResult;
+  };
+  return ae.ok({
+    result,
+    close
+  });
 }
 async function loadRunRecord(runId) {
-  const safeRunId = assertValidRunId(runId);
-  const content = await fs2.readFile(runFilePath(safeRunId), "utf8");
-  const parsed = promptRunRecordSchema.safeParse(JSON.parse(content));
-  if (!parsed.success) {
-    throw new Error(`Run record '${safeRunId}' is malformed.`);
-  }
-  return parsed.data;
+  const safeRunId = validateRunId(runId);
+  if (safeRunId.status === "error")
+    return ae.err(safeRunId.error);
+  const content = await captureExternal("read-run", () => fs2.readFile(runFilePath(safeRunId.value), "utf8"));
+  if (content.status === "error")
+    return ae.err(content.error);
+  const decoded = decodeRunRecord({ runId: safeRunId.value, content: content.value });
+  if (decoded.status === "error")
+    return ae.err(decoded.error);
+  const cancellation = await loadRunCancellation(decoded.value.value);
+  if (cancellation.status === "error")
+    return ae.err(cancellation.error);
+  return ae.ok(applyRunCancellation(decoded.value.value, cancellation.value));
 }
 async function saveSessionIndex(entries) {
-  await fs2.mkdir(sessionsDir(), { recursive: true });
+  const directory = await captureExternal("write-session-index", () => fs2.mkdir(sessionsDir(), { recursive: true }));
+  if (directory.status === "error")
+    return ae.err(directory.error);
   const payload = { version: 1, sessions: [...entries] };
-  await atomicWriteFile(sessionIndexPath(), `${JSON.stringify(payload)}
-`);
+  return atomicWriteFile(sessionIndexPath(), `${JSON.stringify(payload)}
+`, "write-session-index");
 }
 async function loadSessionIndex() {
-  try {
-    const content = await fs2.readFile(sessionIndexPath(), "utf8");
-    const parsed = sessionIndexSchema.safeParse(JSON.parse(content));
-    if (!parsed.success) {
-      return { version: 1, sessions: [] };
+  const content = await captureExternal("read-session-index", () => fs2.readFile(sessionIndexPath(), "utf8"));
+  if (content.status === "error") {
+    if (content.error.code === "ENOENT") {
+      return ae.ok({
+        provenance: "missing-defaulted",
+        value: { version: 1, sessions: [] }
+      });
     }
-    return parsed.data;
-  } catch (error48) {
-    if (error48.code === "ENOENT") {
-      return { version: 1, sessions: [] };
-    }
-    throw error48;
+    return ae.err(content.error);
   }
+  const decoded = decodeSessionIndex(content.value);
+  return decoded.status === "ok" ? ae.ok(decoded.value) : ae.err(decoded.error);
 }
+var fixtureRunId = "run_11111111-1111-4111-8111-111111111111";
+var fixtureRunRecord = {
+  id: fixtureRunId,
+  status: "submitted",
+  createdAt: 1,
+  updatedAt: 1,
+  directory: "/repo",
+  harnessId: "opencode",
+  targetKind: "new",
+  promptText: "fixture",
+  textPreview: "fixture",
+  permissions: {
+    permissionsApproved: 0,
+    permissionsRejected: 0,
+    permissionsCancelled: 0
+  }
+};
+var runRecordCodecCases = {
+  current: {
+    input: { runId: fixtureRunId, content: JSON.stringify(fixtureRunRecord) },
+    outcome: "ok",
+    provenance: "current"
+  },
+  legacy: {
+    input: {
+      runId: fixtureRunId,
+      content: JSON.stringify({ ...fixtureRunRecord, permissions: undefined })
+    },
+    outcome: "ok",
+    provenance: "migrated"
+  },
+  "missing-defaulted": {
+    input: { runId: fixtureRunId, content: "" },
+    outcome: "error"
+  },
+  "unsupported-version": {
+    input: { runId: fixtureRunId, content: '{"version":2}' },
+    outcome: "error"
+  },
+  "malformed-serialization": {
+    input: { runId: fixtureRunId, content: "{" },
+    outcome: "error"
+  },
+  "corrupt-fields": {
+    input: {
+      runId: fixtureRunId,
+      content: JSON.stringify({ ...fixtureRunRecord, permissions: {} })
+    },
+    outcome: "error"
+  }
+};
+var runCancellationCodecCases = {
+  current: {
+    input: {
+      runId: fixtureRunId,
+      content: JSON.stringify({ version: 1, runCreatedAt: 1, requestedAt: 2 })
+    },
+    outcome: "ok",
+    provenance: "current"
+  },
+  legacy: {
+    input: {
+      runId: fixtureRunId,
+      content: JSON.stringify({ version: 0, runCreatedAt: 1, requestedAt: 2 })
+    },
+    outcome: "ok",
+    provenance: "migrated"
+  },
+  "missing-defaulted": {
+    input: { runId: fixtureRunId, content: "" },
+    outcome: "error"
+  },
+  "unsupported-version": {
+    input: { runId: fixtureRunId, content: '{"version":2}' },
+    outcome: "error"
+  },
+  "malformed-serialization": {
+    input: { runId: fixtureRunId, content: "{" },
+    outcome: "error"
+  },
+  "corrupt-fields": {
+    input: { runId: fixtureRunId, content: '{"version":1,"runCreatedAt":"bad"}' },
+    outcome: "error"
+  }
+};
 async function upsertSessionIndexEntries(entries) {
   return withSessionIndexLock(async () => {
-    const current = await loadSessionIndex();
-    const merged = new Map(current.sessions.map((entry) => [entry.sessionRef, entry]));
+    const loaded = await loadSessionIndex();
+    if (loaded.status === "error")
+      return ae.err(loaded.error);
+    const merged = new Map(loaded.value.value.sessions.map((entry) => [entry.sessionRef, entry]));
     for (const entry of entries) {
       const previous = merged.get(entry.sessionRef);
       merged.set(entry.sessionRef, {
@@ -15556,17 +17302,19 @@ async function upsertSessionIndexEntries(entries) {
       });
     }
     const next = { version: 1, sessions: [...merged.values()] };
-    await saveSessionIndex(next.sessions);
-    return next;
+    const saved = await saveSessionIndex(next.sessions);
+    return saved.status === "ok" ? ae.ok(next) : ae.err(saved.error);
   });
 }
 async function setLocalSessionTitle(sessionRef, localTitle) {
   return withSessionIndexLock(async () => {
-    const current = await loadSessionIndex();
-    const nextSessions = current.sessions.map((entry) => entry.sessionRef === sessionRef ? { ...entry, localTitle, title: localTitle } : entry);
+    const loaded = await loadSessionIndex();
+    if (loaded.status === "error")
+      return ae.err(loaded.error);
+    const nextSessions = loaded.value.value.sessions.map((entry) => entry.sessionRef === sessionRef ? { ...entry, localTitle, title: localTitle } : entry);
     const next = { version: 1, sessions: nextSessions };
-    await saveSessionIndex(next.sessions);
-    return next;
+    const saved = await saveSessionIndex(next.sessions);
+    return saved.status === "ok" ? ae.ok(next) : ae.err(saved.error);
   });
 }
 
@@ -15578,6 +17326,43 @@ function contentToText(update) {
     return update.content.uri;
   }
   return `[${update.content.type}]`;
+}
+function projectUnsupportedSessionUpdate(sessionUpdate) {
+  return { type: "unsupported", sessionUpdate };
+}
+function projectSessionUpdate(update) {
+  const sessionUpdate = update.sessionUpdate;
+  switch (update.sessionUpdate) {
+    case "user_message_chunk":
+      return { type: "append-message", role: "user", text: contentToText(update) };
+    case "agent_message_chunk":
+      return { type: "append-message", role: "assistant", text: contentToText(update) };
+    case "plan":
+      return {
+        type: "replace-plan",
+        entries: update.entries.map((entry) => ({
+          content: entry.content,
+          priority: entry.priority,
+          status: entry.status
+        }))
+      };
+    case "session_info_update":
+      return {
+        type: "session-info",
+        title: update.title,
+        updatedAt: update.updatedAt
+      };
+    case "current_mode_update":
+      return { type: "mode", currentModeId: update.currentModeId };
+    case "usage_update":
+    case "available_commands_update":
+    case "agent_thought_chunk":
+    case "tool_call":
+    case "tool_call_update":
+    case "config_option_update":
+      return { type: "ignored", sessionUpdate: update.sessionUpdate };
+  }
+  return projectUnsupportedSessionUpdate(sessionUpdate);
 }
 function appendMessage(messages, role, text) {
   if (text.length === 0)
@@ -15600,40 +17385,29 @@ class SessionHistoryCollector {
   availableModels;
   currentModelId;
   add(notification) {
-    const { update } = notification;
-    switch (update.sessionUpdate) {
-      case "user_message_chunk":
-        appendMessage(this.history, "user", contentToText(update));
+    const update = projectSessionUpdate(notification.update);
+    switch (update.type) {
+      case "append-message":
+        appendMessage(this.history, update.role, update.text);
         return;
-      case "agent_message_chunk":
-        appendMessage(this.history, "assistant", contentToText(update));
+      case "replace-plan":
+        this.plan = update.entries;
         return;
-      case "plan":
-        this.plan = update.entries.map((entry) => ({
-          content: entry.content,
-          priority: entry.priority,
-          status: entry.status
-        }));
-        return;
-      case "session_info_update":
+      case "session-info":
         if (typeof update.title === "string")
           this.title = update.title;
         if (typeof update.updatedAt === "string")
           this.updatedAt = update.updatedAt;
         return;
-      case "current_mode_update":
+      case "mode":
         this.currentModeId = update.currentModeId;
         return;
-      case "usage_update":
-      case "available_commands_update":
-      case "agent_thought_chunk":
-      case "tool_call":
-      case "tool_call_update":
-      case "config_option_update":
-        return;
-      default:
+      case "ignored":
+      case "unsupported":
         return;
     }
+    const exhaustive = update;
+    return exhaustive;
   }
   latestAssistantText() {
     for (let index = this.history.length - 1;index >= 0; index--) {
@@ -15674,47 +17448,10 @@ function printText(text) {
 `) ? text : `${text}
 `);
 }
-function isRecord(value) {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-function getString(value) {
-  return typeof value === "string" ? value : undefined;
-}
-function getNumber(value) {
-  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
-}
-function getBoolean(value) {
-  return typeof value === "boolean" ? value : undefined;
-}
-function getRecordArray(value) {
-  return Array.isArray(value) ? value.filter(isRecord) : [];
-}
-function getStringArray(value) {
-  return Array.isArray(value) ? value.filter((entry) => typeof entry === "string") : [];
-}
 function formatCommand(command, args) {
   if (!command)
     return;
   return [command, ...args].join(" ");
-}
-function toListedSession(value) {
-  if (!isRecord(value))
-    return null;
-  const harnessId = getString(value.harnessId);
-  const sessionId = getString(value.sessionId);
-  const sessionRef = getString(value.sessionRef);
-  const cwd = getString(value.cwd);
-  if (!harnessId || !sessionId || !sessionRef || !cwd)
-    return null;
-  return {
-    harnessId,
-    sessionId,
-    sessionRef,
-    cwd,
-    title: getString(value.title),
-    updatedAt: getString(value.updatedAt),
-    capabilities: getStringArray(value.capabilities)
-  };
 }
 function formatSessionEntries(sessions) {
   if (sessions.length === 0)
@@ -15738,43 +17475,36 @@ function formatWarnings(warnings) {
     return [];
   return ["Warnings:", ...warnings.map((warning) => `- ${warning}`)];
 }
-function formatCandidates(value) {
-  const candidates = getRecordArray(value).map((entry) => toListedSession(entry)).filter((entry) => entry !== null);
+function formatCandidates(candidates) {
+  if (!candidates)
+    return [];
   if (candidates.length === 0)
     return [];
   return ["Candidates:", ...formatSessionEntries(candidates)];
 }
-function formatHarnessesOutput(value) {
-  const harnesses = getRecordArray(value.harnesses);
+function formatHarnessesOutput(harnesses) {
   if (harnesses.length === 0)
     return "No harnesses found.";
   const lines = [`Harnesses (${harnesses.length})`];
   for (const harness of harnesses) {
-    const id = getString(harness.id) ?? "unknown";
-    const title = getString(harness.title) ?? id;
-    const launchable = getBoolean(harness.launchable) ?? false;
-    lines.push(`- ${title} (${id}) ${launchable ? "[available]" : "[unavailable]"}`);
-    const description = getString(harness.description);
-    if (description)
-      lines.push(`  ${description}`);
-    const command = formatCommand(getString(harness.command), getStringArray(harness.args));
+    lines.push(`- ${harness.title} (${harness.id}) ${harness.launchable ? "[available]" : "[unavailable]"}`);
+    if (harness.description)
+      lines.push(`  ${harness.description}`);
+    const command = formatCommand(harness.command, harness.args ?? []);
     if (command)
       lines.push(`  command: ${command}`);
-    const installHint = getString(harness.installHint);
-    if (installHint && !launchable)
-      lines.push(`  install: ${installHint}`);
+    if (harness.installHint && !harness.launchable)
+      lines.push(`  install: ${harness.installHint}`);
   }
   return lines.join(`
 `);
 }
 function formatSessionsOutput(value) {
-  const ok = getBoolean(value.ok);
-  const error48 = getString(value.error);
-  const sessions = getRecordArray(value.sessions).map((entry) => toListedSession(entry)).filter((entry) => entry !== null);
-  const warnings = getStringArray(value.warnings);
+  const sessions = value.sessions;
+  const warnings = value.warnings ?? [];
   const lines = [];
-  if (ok === false && error48)
-    lines.push(`Error: ${error48}`, "");
+  if (!value.ok && value.error)
+    lines.push(`Error: ${value.error}`, "");
   lines.push(`Sessions (${sessions.length})`, ...formatSessionEntries(sessions));
   const candidateLines = formatCandidates(value.candidates);
   if (candidateLines.length > 0)
@@ -15785,67 +17515,54 @@ function formatSessionsOutput(value) {
   return lines.join(`
 `);
 }
-function formatSnapshotPlan(value) {
-  const entries = getRecordArray(value);
+function formatSnapshotPlan(entries) {
+  if (!entries)
+    return ["Plan: none"];
   if (entries.length === 0)
     return ["Plan: none"];
   return [
     "Plan:",
-    ...entries.map((entry) => {
-      const content = getString(entry.content) ?? "(missing content)";
-      const status = getString(entry.status) ?? "unknown";
-      const priority = getString(entry.priority) ?? "unknown";
-      return `- [${status}/${priority}] ${content}`;
-    })
+    ...entries.map((entry) => `- [${entry.status}/${entry.priority}] ${entry.content}`)
   ];
 }
-function formatRecentRuns(value) {
-  if (!isRecord(value))
+function formatRecentRuns(recent) {
+  if (!recent)
     return ["Recent turns: none"];
-  const runs = getRecordArray(value.runs);
+  const runs = recent.runs;
   if (runs.length === 0)
     return ["Recent turns: none"];
   const lines = ["Recent turns:"];
   for (const run of runs) {
-    const user = isRecord(run.user) ? getString(run.user.text) : undefined;
-    const assistant = isRecord(run.assistant) ? getString(run.assistant.text) : undefined;
-    lines.push(`- User: ${user ?? ""}`);
-    lines.push(`  Assistant: ${assistant ?? "(no assistant reply)"}`);
+    lines.push(`- User: ${run.user.text}`);
+    lines.push(`  Assistant: ${run.assistant?.text ?? "(no assistant reply)"}`);
   }
   return lines;
 }
 function formatSnapshotOutput(value) {
-  const ok = getBoolean(value.ok);
-  const error48 = getString(value.error);
-  const session = isRecord(value.session) ? value.session : undefined;
-  const meta3 = isRecord(value.meta) ? value.meta : undefined;
+  const session = value.session;
+  const meta3 = value.meta;
   const lines = [];
-  if (ok === false && error48) {
-    lines.push(`Error: ${error48}`);
-    const sessionRef2 = getString(value.sessionRef);
-    if (sessionRef2)
-      lines.push(`Session: ${sessionRef2}`);
+  if (!value.ok && value.error) {
+    lines.push(`Error: ${value.error}`);
+    if (value.sessionRef)
+      lines.push(`Session: ${value.sessionRef}`);
     return lines.join(`
 `);
   }
-  const title = session ? getString(session.title) : undefined;
-  const sessionRef = getString(value.sessionRef);
-  const sessionId = getString(value.sessionId);
+  const title = session?.title;
   lines.push(title ? `Session snapshot: ${title}` : "Session snapshot");
-  if (sessionRef)
-    lines.push(`Session: ${sessionRef}`);
-  else if (sessionId)
-    lines.push(`Session ID: ${sessionId}`);
-  const harnessId = getString(value.harnessId) ?? (meta3 ? getString(meta3.harnessId) : undefined);
+  if (value.sessionRef)
+    lines.push(`Session: ${value.sessionRef}`);
+  else if (value.sessionId)
+    lines.push(`Session ID: ${value.sessionId}`);
+  const harnessId = value.harnessId ?? meta3?.harnessId;
   if (harnessId)
     lines.push(`Harness: ${harnessId}`);
-  const cwd = session ? getString(session.cwd) : undefined;
-  if (cwd)
-    lines.push(`Directory: ${cwd}`);
-  const updatedAt = session ? getString(session.updatedAt) : undefined;
-  if (updatedAt)
-    lines.push(`Updated: ${updatedAt}`);
-  const capabilities = meta3 ? getStringArray(meta3.capabilities) : [];
+  if (session?.cwd)
+    lines.push(`Directory: ${session.cwd}`);
+  if (session?.updatedAt)
+    lines.push(`Updated: ${session.updatedAt}`);
+  const capabilities = meta3?.capabilities ?? [];
   if (capabilities.length > 0)
     lines.push(`Capabilities: ${capabilities.join(", ")}`);
   lines.push("", ...formatSnapshotPlan(value.plan), "", ...formatRecentRuns(value.recent));
@@ -15853,32 +17570,26 @@ function formatSnapshotOutput(value) {
 `);
 }
 function formatRunOutput(value) {
-  const runId = getString(value.runId) ?? "unknown";
-  const status = getString(value.status);
-  const error48 = getString(value.error);
-  const resultText = getString(value.resultText);
-  const harnessId = getString(value.harnessId);
-  const sessionRef = getString(value.sessionRef);
-  const workerPid = getNumber(value.workerPid) ?? (isRecord(value.run) ? getNumber(value.run.workerPid) : undefined);
-  const signalled = getBoolean(value.signalled);
+  const runId = value.runId;
+  const workerPid = value.workerPid ?? value.run?.workerPid;
   const lines = [];
-  if (status) {
-    lines.push(`Run ${runId}: ${status}`);
+  if (value.status) {
+    lines.push(`Run ${runId}: ${value.status}`);
   } else {
     lines.push(`Run ${runId}`);
   }
-  if (harnessId)
-    lines.push(`Harness: ${harnessId}`);
-  if (sessionRef)
-    lines.push(`Session: ${sessionRef}`);
+  if (value.harnessId)
+    lines.push(`Harness: ${value.harnessId}`);
+  if (value.sessionRef)
+    lines.push(`Session: ${value.sessionRef}`);
   if (workerPid !== undefined)
     lines.push(`Worker PID: ${workerPid}`);
-  if (signalled !== undefined)
-    lines.push(`Signal sent: ${signalled ? "yes" : "no"}`);
-  if (error48)
-    lines.push(`Error: ${error48}`);
-  if (resultText)
-    lines.push("", resultText);
+  if (value.signalled !== undefined)
+    lines.push(`Signal sent: ${value.signalled ? "yes" : "no"}`);
+  if (value.error)
+    lines.push(`Error: ${value.error}`);
+  if (value.resultText)
+    lines.push("", value.resultText);
   const candidateLines = formatCandidates(value.candidates);
   if (candidateLines.length > 0)
     lines.push("", ...candidateLines);
@@ -15886,39 +17597,31 @@ function formatRunOutput(value) {
 `).trim();
 }
 function formatHelpOutput(value) {
-  const helpText = getString(value.help) ?? "";
-  const error48 = getString(value.error);
-  const version2 = getString(value.version);
   const lines = [];
-  if (error48)
-    lines.push(`Error: ${error48}`, "");
-  lines.push(helpText);
-  if (version2)
-    lines.push("", `Version: ${version2}`);
+  if (value.error)
+    lines.push(`Error: ${value.error}`, "");
+  lines.push(value.help);
+  if (value.version)
+    lines.push("", `Version: ${value.version}`);
   return lines.join(`
 `);
 }
 function formatHumanOutput(value, commandName) {
-  if (!isRecord(value)) {
-    return typeof value === "string" ? value : JSON.stringify(value, null, 2);
-  }
-  if (typeof value.help === "string")
-    return formatHelpOutput(value);
-  if (Array.isArray(value.harnesses))
-    return formatHarnessesOutput(value);
-  if (Array.isArray(value.sessions))
-    return formatSessionsOutput(value);
-  if (isRecord(value.session) && isRecord(value.recent))
+  if (value.help !== undefined)
+    return formatHelpOutput({ ...value, help: value.help });
+  if (value.harnesses !== undefined)
+    return formatHarnessesOutput(value.harnesses);
+  if (value.sessions !== undefined)
+    return formatSessionsOutput({ ...value, sessions: value.sessions });
+  if (value.session !== undefined && value.recent !== undefined)
     return formatSnapshotOutput(value);
-  if (typeof value.runId === "string")
-    return formatRunOutput(value);
-  const version2 = getString(value.version);
-  if (version2 && Object.keys(value).every((key) => key === "ok" || key === "version")) {
-    return `${commandName} ${version2}`;
+  if (value.runId !== undefined)
+    return formatRunOutput({ ...value, runId: value.runId });
+  if (value.version && Object.keys(value).every((key) => key === "ok" || key === "version")) {
+    return `${commandName} ${value.version}`;
   }
-  const error48 = getString(value.error);
-  if (error48) {
-    const lines = [`Error: ${error48}`];
+  if (value.error) {
+    const lines = [`Error: ${value.error}`];
     const candidateLines = formatCandidates(value.candidates);
     if (candidateLines.length > 0)
       lines.push("", ...candidateLines);
@@ -15948,11 +17651,6 @@ function stripGlobalFlags(args) {
     stripped.push(arg);
   }
   return stripped;
-}
-function errorMessage2(error48) {
-  if (error48 instanceof Error)
-    return error48.message;
-  return String(error48);
 }
 function compareUpdatedAtDesc(left, right) {
   const leftValue = left ? Date.parse(left) : 0;
@@ -16011,72 +17709,79 @@ function capabilitiesFromSummary(summary) {
 function isTerminalStatus(status) {
   return status === "completed" || status === "failed" || status === "cancelled";
 }
-function isProcessAlive(pid) {
+async function isProcessAlive(pid) {
   if (!pid)
-    return false;
-  try {
+    return ae.ok(false);
+  const probed = await captureExternal("probe-worker", async () => {
     process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
-  }
+  });
+  return ae.ok(probed.status === "ok");
 }
 async function refreshRunStatus(run) {
   if (isTerminalStatus(run.status))
-    return run;
-  if (run.status === "submitted" && !run.cancelRequestedAt && !isProcessAlive(run.workerPid)) {
-    const workerPid = await spawnWorker(run.id);
-    if (workerPid) {
-      const restarted = {
-        ...run,
-        workerPid,
-        updatedAt: Date.now()
-      };
-      await saveRunRecord(restarted);
-      return restarted;
-    }
+    return ae.ok(run);
+  const alive = await isProcessAlive(run.workerPid);
+  if (alive.status === "error")
+    return ae.err(alive.error);
+  if (run.status === "submitted" && !run.cancelRequestedAt && !alive.value) {
+    const worker = await spawnWorker(run.id);
+    if (worker.status === "error")
+      return ae.err(worker.error);
+    return persistSpawnedWorkerAdmission(run, worker.value);
   }
-  if (run.workerPid && isProcessAlive(run.workerPid))
-    return run;
+  if (run.workerPid && alive.value)
+    return ae.ok(run);
   const next = {
     ...run,
     status: run.cancelRequestedAt ? "cancelled" : "failed",
     updatedAt: Date.now(),
     error: run.error ?? (run.cancelRequestedAt ? "Prompt cancelled before the worker produced a terminal result." : "Background worker exited before producing a terminal result.")
   };
-  await saveRunRecord(next);
-  return next;
+  const saved = await saveRunRecord(next);
+  return saved.status === "ok" ? ae.ok(next) : ae.err(saved.error);
 }
 async function collectSessionsForHarness(params) {
   const indexed = await loadSessionIndex();
+  if (indexed.status === "error")
+    return ae.err(indexed.error);
   const descriptor = getHarnessDescriptor(params.harnessId);
   if (!descriptor) {
-    throw new Error(`Unknown harness '${params.harnessId}'.`);
+    return ae.err(new HarnessUnavailable({
+      harnessId: params.harnessId,
+      message: `Unknown harness '${params.harnessId}'.`
+    }));
   }
   const resolved = await resolveHarness(params.harnessId);
-  const cachedSessions = indexed.sessions.filter((entry) => entry.harnessId === params.harnessId && entry.cwd === params.directory).map(listedSessionFromIndex);
-  if (!resolved) {
-    return {
+  if (resolved.status === "error")
+    return ae.err(resolved.error);
+  const cachedSessions = indexed.value.value.sessions.filter((entry) => entry.harnessId === params.harnessId && entry.cwd === params.directory).map(listedSessionFromIndex);
+  if (!resolved.value) {
+    return ae.ok({
       sessions: sortSessions(cachedSessions.filter((entry) => sessionMatchesSearch(entry, params.search))),
       warning: descriptor.installHint
-    };
+    });
   }
-  const client = await AcpHarnessClient.connect({
-    harness: resolved,
+  const connected = await AcpHarnessClient.connect({
+    harness: resolved.value,
     version: params.version,
     permissionBehavior: "reject",
     counters: createEmptyPermissionCounters()
   });
-  try {
-    const listed = await client.listSessions(params.directory).catch((error48) => {
-      if (isAuthRequiredError(error48)) {
-        throw new Error(client.authHint() ?? errorMessage2(error48));
-      }
-      throw error48;
-    });
-    const liveSessions = listed.map((session) => {
+  if (connected.status === "error")
+    return ae.err(connected.error);
+  const client = connected.value;
+  const listed = await client.listSessions(params.directory);
+  let work;
+  if (listed.status === "error") {
+    if (listed.error._tag === "ExternalOperationFailed" && isAuthRequiredError(listed.error)) {
+      work = ae.err(replaceExternalFailureMessage(listed.error, client.authHint() ?? listed.error.message));
+    } else {
+      work = ae.err(listed.error);
+    }
+  } else {
+    const liveSessions = listed.value.map((session) => {
       const sessionRef = formatSessionRef(params.harnessId, session.sessionId);
-      const cached2 = indexed.sessions.find((entry) => entry.sessionRef === sessionRef);
+      const cached2 = indexed.value.value.sessions.find((entry) => entry.sessionRef === sessionRef);
       return mergeSessionWithIndex({
         harnessId: params.harnessId,
         sessionId: session.sessionId,
@@ -16087,32 +17792,50 @@ async function collectSessionsForHarness(params) {
         capabilities: client.capabilities()
       }, cached2);
     });
-    await upsertSessionIndexEntries(liveSessions.map((session) => buildIndexEntry(session)));
-    return {
+    const saved = await upsertSessionIndexEntries(liveSessions.map((session) => buildIndexEntry(session)));
+    work = saved.status === "error" ? ae.err(saved.error) : ae.ok({
       sessions: sortSessions(liveSessions.filter((entry) => sessionMatchesSearch(entry, params.search))),
       ...client.authHint() ? { warning: client.authHint() } : {}
-    };
-  } finally {
-    await client.close();
+    });
   }
+  const cleanup = await client.close();
+  if (cleanup.status === "ok")
+    return work;
+  if (work.status === "ok")
+    return ae.err(cleanup.error);
+  return ae.err(new WorkAndCleanupFailed({
+    primary: work.error,
+    cleanup: cleanup.error,
+    message: `${work.error.message} Harness cleanup also failed.`
+  }));
 }
 async function collectSessions(params) {
-  const harnessIds = params.harnessId && params.harnessId !== "any" ? [params.harnessId] : (await listResolvedHarnesses()).map((entry) => entry.descriptor.id);
   const warnings = [];
   const sessions = [];
+  let harnessIds;
+  if (params.harnessId && params.harnessId !== "any") {
+    harnessIds = [params.harnessId];
+  } else {
+    const resolved = await listResolvedHarnesses();
+    if (resolved.status === "error") {
+      return { sessions, warnings: [resolved.error.message] };
+    }
+    harnessIds = resolved.value.map((entry) => entry.descriptor.id);
+  }
   for (const harnessId of harnessIds) {
     const collected = await collectSessionsForHarness({
       harnessId,
       directory: params.directory,
       version: params.version,
       search: params.search
-    }).catch((error48) => ({
-      sessions: [],
-      warning: `Harness '${harnessId}': ${errorMessage2(error48)}`
-    }));
-    sessions.push(...collected.sessions);
-    if (collected.warning)
-      warnings.push(collected.warning);
+    });
+    if (collected.status === "error") {
+      warnings.push(`Harness '${harnessId}': ${collected.error.message}`);
+      continue;
+    }
+    sessions.push(...collected.value.sessions);
+    if (collected.value.warning)
+      warnings.push(collected.value.warning);
   }
   return { sessions: sortSessions(sessions), warnings };
 }
@@ -16121,28 +17844,30 @@ async function resolveExistingSessionTarget(params) {
     const parsed = parseSessionRef(params.sessionIdFlag);
     if (parsed) {
       if (params.harnessId && params.harnessId !== "any" && params.harnessId !== parsed.harnessId) {
-        throw new Error(`--session-id points to harness '${parsed.harnessId}', not '${params.harnessId}'.`);
+        return ae.err(new SessionSelectionFailed({
+          message: `--session-id points to harness '${parsed.harnessId}', not '${params.harnessId}'.`
+        }));
       }
-      return {
+      return ae.ok({
         harnessId: parsed.harnessId,
         remoteSessionId: parsed.remoteSessionId,
         sessionRef: params.sessionIdFlag,
         targetKind: "existing"
-      };
+      });
     }
     if (!params.harnessId || params.harnessId === "any") {
-      throw new Error("Raw --session-id values require --harness.");
+      return ae.err(new SessionSelectionFailed({ message: "Raw --session-id values require --harness." }));
     }
-    return {
+    return ae.ok({
       harnessId: params.harnessId,
       remoteSessionId: params.sessionIdFlag,
       sessionRef: formatSessionRef(params.harnessId, params.sessionIdFlag),
       targetKind: "existing"
-    };
+    });
   }
   if (params.latest) {
     if (!params.harnessId || params.harnessId === "any") {
-      throw new Error("--latest requires --harness.");
+      return ae.err(new SessionSelectionFailed({ message: "--latest requires --harness." }));
     }
     const collected = await collectSessions({
       harnessId: params.harnessId,
@@ -16151,14 +17876,16 @@ async function resolveExistingSessionTarget(params) {
     });
     const latest = collected.sessions[0];
     if (!latest) {
-      throw new Error(`No sessions found for harness '${params.harnessId}'.`);
+      return ae.err(new SessionSelectionFailed({
+        message: `No sessions found for harness '${params.harnessId}'.`
+      }));
     }
-    return {
+    return ae.ok({
       harnessId: latest.harnessId,
       remoteSessionId: latest.sessionId,
       sessionRef: latest.sessionRef,
       targetKind: "existing"
-    };
+    });
   }
   if (params.title) {
     if (params.harnessId && params.harnessId !== "any") {
@@ -16170,19 +17897,19 @@ async function resolveExistingSessionTarget(params) {
       });
       const exactMatch = collected2.sessions.find((session) => session.title === params.title);
       if (exactMatch) {
-        return {
+        return ae.ok({
           harnessId: exactMatch.harnessId,
           remoteSessionId: exactMatch.sessionId,
           sessionRef: exactMatch.sessionRef,
           targetKind: "existing"
-        };
+        });
       }
-      return {
+      return ae.ok({
         harnessId: params.harnessId,
         targetKind: "new",
         requestedTitle: params.title,
         candidates: collected2.sessions
-      };
+      });
     }
     const collected = await collectSessions({
       directory: params.directory,
@@ -16192,51 +17919,185 @@ async function resolveExistingSessionTarget(params) {
     const exactMatches = collected.sessions.filter((session) => session.title === params.title);
     if (exactMatches.length === 1) {
       const [match] = exactMatches;
-      if (!match)
-        throw new Error("Expected an exact match.");
-      return {
+      if (!match) {
+        return ae.err(new SessionSelectionFailed({ message: "Expected an exact match." }));
+      }
+      return ae.ok({
         harnessId: match.harnessId,
         remoteSessionId: match.sessionId,
         sessionRef: match.sessionRef,
         targetKind: "existing"
-      };
+      });
     }
     if (exactMatches.length > 1) {
-      return {
+      return ae.ok({
         harnessId: "",
         targetKind: "existing",
         candidates: exactMatches
-      };
+      });
     }
-    return {
+    return ae.ok({
       harnessId: "",
       targetKind: "existing",
       candidates: collected.sessions
-    };
+    });
   }
   if (params.harnessId && params.harnessId !== "any") {
-    return {
+    return ae.ok({
       harnessId: params.harnessId,
       targetKind: "new"
-    };
+    });
   }
-  throw new Error("No session selector matched. Use --harness to create a new session.");
+  return ae.err(new SessionSelectionFailed({
+    message: "No session selector matched. Use --harness to create a new session."
+  }));
+}
+async function terminateChildProcess(child) {
+  if (child.exitCode !== null || child.signalCode !== null)
+    return ae.ok(undefined);
+  let resolveExit;
+  let rejectExit;
+  const exited = new Promise((resolve, reject) => {
+    resolveExit = resolve;
+    rejectExit = reject;
+  });
+  const onExit = () => resolveExit?.();
+  const onError = (cause) => rejectExit?.(cause);
+  child.once("exit", onExit);
+  child.once("error", onError);
+  const signalled = await captureExternal("terminate-worker", async () => child.kill("SIGKILL"));
+  if (signalled.status === "error") {
+    child.off("exit", onExit);
+    child.off("error", onError);
+    return ae.err(signalled.error);
+  }
+  if (!signalled.value && child.exitCode === null && child.signalCode === null) {
+    child.off("exit", onExit);
+    child.off("error", onError);
+    const cause = new Error("Failed to terminate uncommitted prompt worker.");
+    return ae.err(new ExternalOperationFailed({
+      operation: "terminate-worker",
+      cause,
+      message: cause.message
+    }));
+  }
+  const settled = await captureExternal("terminate-worker", () => exited);
+  child.off("exit", onExit);
+  child.off("error", onError);
+  return settled.status === "ok" ? ae.ok(undefined) : ae.err(settled.error);
 }
 async function spawnWorker(runId) {
   const entryPoint = process.env.LILAC_ACP_ENTRYPOINT ?? process.argv[1];
   if (!entryPoint) {
-    throw new Error("Cannot determine the CLI entrypoint for worker spawning.");
+    return ae.err(new RunInvariantFailed({
+      runId,
+      message: "Cannot determine the CLI entrypoint for worker spawning."
+    }));
   }
-  const child = spawn2(process.execPath, [entryPoint, "_worker", "run", "--run-id", runId], {
-    detached: true,
-    stdio: "ignore",
-    env: {
-      ...process.env,
-      LILAC_ACP_ENTRYPOINT: entryPoint
-    }
+  const spawned = await captureExternal("spawn-worker", async () => {
+    return spawn2(process.execPath, [entryPoint, "_worker", "run", "--run-id", runId], {
+      detached: true,
+      stdio: "ignore",
+      env: {
+        ...process.env,
+        LILAC_ACP_ENTRYPOINT: entryPoint
+      }
+    });
   });
-  child.unref();
-  return child.pid;
+  if (spawned.status === "error")
+    return ae.err(spawned.error);
+  const child = spawned.value;
+  if (child.pid === undefined) {
+    const terminated = await terminateChildProcess(child);
+    if (terminated.status === "error")
+      return ae.err(terminated.error);
+    return ae.err(new RunInvariantFailed({
+      runId,
+      message: "Prompt worker started without a process ID."
+    }));
+  }
+  return ae.ok({
+    pid: child.pid,
+    detach: () => child.unref(),
+    terminate: () => terminateChildProcess(child)
+  });
+}
+async function persistSpawnedWorkerAdmission(run, worker, persist = saveRunRecord) {
+  const admitted = {
+    ...run,
+    workerPid: worker.pid,
+    updatedAt: Date.now()
+  };
+  const persistence = await ae.tryPromise({
+    try: () => persist(admitted),
+    catch: captureAcpFailure
+  });
+  if (persistence.status === "ok" && persistence.value.status === "ok") {
+    worker.detach();
+    return ae.ok(admitted);
+  }
+  const termination = await ae.tryPromise({
+    try: worker.terminate,
+    catch: captureAcpFailure
+  });
+  let primary;
+  if (persistence.status === "ok") {
+    if (persistence.value.status === "ok") {
+      worker.detach();
+      return ae.ok(admitted);
+    }
+    primary = persistence.value.error;
+  } else {
+    switch (persistence.error.kind) {
+      case "panic": {
+        if (termination.status === "ok") {
+          if (termination.value.status === "error") {
+            recordAcpCleanupFailure(persistence.error.panic, termination.value.error);
+          }
+        } else {
+          const cleanupFailure = termination.error.kind === "panic" ? termination.error.panic : capturedWorkerFailure("terminate-worker", termination.error);
+          recordAcpCleanupFailure(persistence.error.panic, cleanupFailure);
+        }
+        return signalAcpDefect(persistence.error.panic);
+      }
+      case "ordinary":
+        primary = capturedWorkerFailure("write-run", persistence.error);
+        break;
+    }
+  }
+  let cleanup;
+  if (termination.status === "ok") {
+    cleanup = termination.value;
+  } else {
+    switch (termination.error.kind) {
+      case "panic":
+        return signalAcpDefect(termination.error.panic);
+      case "ordinary":
+        cleanup = ae.err(capturedWorkerFailure("terminate-worker", termination.error));
+        break;
+    }
+  }
+  if (cleanup.status === "ok")
+    return ae.err(primary);
+  return ae.err(new WorkAndCleanupFailed({
+    primary,
+    cleanup: cleanup.error,
+    message: `${primary.message} Prompt worker termination also failed.`
+  }));
+}
+function capturedWorkerFailure(operation, captured) {
+  return new ExternalOperationFailed({
+    operation,
+    cause: captured.cause,
+    ...captured.projection.code ? { code: captured.projection.code } : {},
+    message: captured.projection.message
+  });
+}
+function capturedCleanupResult(attempted, operation) {
+  if (attempted.status === "ok") {
+    return attempted.value.status === "error" ? attempted.value.error : undefined;
+  }
+  return attempted.error.kind === "panic" ? attempted.error.panic : capturedWorkerFailure(operation, attempted.error);
 }
 function help(commandName) {
   return [
@@ -16264,9 +18125,13 @@ function help(commandName) {
 }
 async function runHarnessesList(version2, write) {
   const harnesses = await listResolvedHarnesses();
+  if (harnesses.status === "error") {
+    write({ ok: false, error: harnesses.error.message });
+    return 1;
+  }
   write({
     ok: true,
-    harnesses: harnesses.map((entry) => ({
+    harnesses: harnesses.value.map((entry) => ({
       id: entry.descriptor.id,
       title: entry.descriptor.title,
       description: entry.descriptor.description,
@@ -16296,7 +18161,7 @@ async function runSessionsList(params) {
   return 0;
 }
 async function runSessionsSnapshot(params) {
-  const target = await resolveExistingSessionTarget({
+  const selected = await resolveExistingSessionTarget({
     sessionIdFlag: params.sessionIdFlag,
     title: params.title,
     latest: params.latest,
@@ -16304,6 +18169,11 @@ async function runSessionsSnapshot(params) {
     directory: params.directory,
     version: params.version
   });
+  if (selected.status === "error") {
+    params.write({ ok: false, error: selected.error.message });
+    return 1;
+  }
+  const target = selected.value;
   if (!target.remoteSessionId || !target.sessionRef) {
     params.write({
       ok: false,
@@ -16313,7 +18183,11 @@ async function runSessionsSnapshot(params) {
     return 1;
   }
   const resolvedHarness = await resolveHarness(target.harnessId);
-  if (!resolvedHarness) {
+  if (resolvedHarness.status === "error") {
+    params.write({ ok: false, error: resolvedHarness.error.message });
+    return 1;
+  }
+  if (!resolvedHarness.value) {
     const descriptor = getHarnessDescriptor(target.harnessId);
     params.write({
       ok: false,
@@ -16322,52 +18196,65 @@ async function runSessionsSnapshot(params) {
     return 1;
   }
   const collector = new SessionHistoryCollector;
-  const client = await AcpHarnessClient.connect({
-    harness: resolvedHarness,
+  const connected = await AcpHarnessClient.connect({
+    harness: resolvedHarness.value,
     version: params.version,
     permissionBehavior: "reject",
     counters: createEmptyPermissionCounters(),
     onUpdate: (notification) => collector.add(notification)
   });
-  try {
-    await client.loadSession(target.remoteSessionId, params.directory);
-    params.write({
-      ok: true,
-      harnessId: target.harnessId,
-      sessionId: target.remoteSessionId,
-      sessionRef: target.sessionRef,
-      session: {
-        id: target.remoteSessionId,
-        title: collector.title,
-        cwd: params.directory,
-        updatedAt: collector.updatedAt
-      },
-      ...collector.plan ? { plan: collector.plan } : {},
-      recent: {
-        runs: buildSnapshotRuns(collector.history, params.maxRuns, params.maxChars)
-      },
-      ...collector.history.length > 0 ? { history: collector.history } : {},
-      meta: {
-        directory: params.directory,
-        harnessId: target.harnessId,
-        capabilities: client.capabilities()
-      }
-    });
-    return 0;
-  } catch (error48) {
+  if (connected.status === "error") {
     params.write({
       ok: false,
-      error: errorMessage2(error48),
+      error: connected.error.message,
       harnessId: target.harnessId,
       sessionRef: target.sessionRef
     });
     return 1;
-  } finally {
-    await client.close();
   }
+  const client = connected.value;
+  const loaded = await client.loadSession(target.remoteSessionId, params.directory);
+  const cleanup = await client.close();
+  if (loaded.status === "error" || cleanup.status === "error") {
+    let failureMessage = "Harness operation failed.";
+    if (loaded.status === "error")
+      failureMessage = loaded.error.message;
+    else if (cleanup.status === "error")
+      failureMessage = cleanup.error.message;
+    params.write({
+      ok: false,
+      error: failureMessage,
+      harnessId: target.harnessId,
+      sessionRef: target.sessionRef
+    });
+    return 1;
+  }
+  params.write({
+    ok: true,
+    harnessId: target.harnessId,
+    sessionId: target.remoteSessionId,
+    sessionRef: target.sessionRef,
+    session: {
+      id: target.remoteSessionId,
+      title: collector.title,
+      cwd: params.directory,
+      updatedAt: collector.updatedAt
+    },
+    ...collector.plan ? { plan: collector.plan } : {},
+    recent: {
+      runs: buildSnapshotRuns(collector.history, params.maxRuns, params.maxChars)
+    },
+    ...collector.history.length > 0 ? { history: collector.history } : {},
+    meta: {
+      directory: params.directory,
+      harnessId: target.harnessId,
+      capabilities: client.capabilities()
+    }
+  });
+  return 0;
 }
 async function runPromptSubmit(params) {
-  const target = await resolveExistingSessionTarget({
+  const selected = await resolveExistingSessionTarget({
     sessionIdFlag: params.sessionIdFlag,
     title: params.title,
     latest: params.latest,
@@ -16375,6 +18262,11 @@ async function runPromptSubmit(params) {
     directory: params.directory,
     version: params.version
   });
+  if (selected.status === "error") {
+    params.write({ ok: false, error: selected.error.message });
+    return 1;
+  }
+  const target = selected.value;
   if (!target.harnessId) {
     params.write({
       ok: false,
@@ -16384,7 +18276,11 @@ async function runPromptSubmit(params) {
     return 1;
   }
   const resolvedHarness = await resolveHarness(target.harnessId);
-  if (!resolvedHarness) {
+  if (resolvedHarness.status === "error") {
+    params.write({ ok: false, error: resolvedHarness.error.message });
+    return 1;
+  }
+  if (!resolvedHarness.value) {
     const descriptor = getHarnessDescriptor(target.harnessId);
     params.write({
       ok: false,
@@ -16410,14 +18306,22 @@ async function runPromptSubmit(params) {
     ...params.requestedModel ? { requestedModel: params.requestedModel } : {},
     permissions: createEmptyPermissionCounters()
   };
-  await saveRunRecord(run);
-  const workerPid = await spawnWorker(runId);
-  const withWorker = {
-    ...run,
-    ...workerPid ? { workerPid } : {},
-    updatedAt: Date.now()
-  };
-  await saveRunRecord(withWorker);
+  const initialSave = await saveRunRecord(run);
+  if (initialSave.status === "error") {
+    params.write({ ok: false, error: initialSave.error.message, runId });
+    return 1;
+  }
+  const worker = await spawnWorker(runId);
+  if (worker.status === "error") {
+    params.write({ ok: false, error: worker.error.message, runId });
+    return 1;
+  }
+  const admitted = await persistSpawnedWorkerAdmission(run, worker.value);
+  if (admitted.status === "error") {
+    params.write({ ok: false, error: admitted.error.message, runId });
+    return 1;
+  }
+  const withWorker = admitted.value;
   if (params.wait) {
     return runPromptWait({
       runId,
@@ -16438,54 +18342,74 @@ async function runPromptSubmit(params) {
   return 0;
 }
 async function runPromptInspect(params) {
-  try {
-    const run = await refreshRunStatus(await loadRunRecord(params.runId));
-    params.write({
-      ok: true,
-      runId: run.id,
-      status: run.status,
-      harnessId: run.harnessId,
-      ...run.sessionRef ? { sessionRef: run.sessionRef } : {},
-      run
-    });
-    return 0;
-  } catch (error48) {
-    params.write({ ok: false, error: errorMessage2(error48), runId: params.runId });
+  const loaded = await loadRunRecord(params.runId);
+  if (loaded.status === "error") {
+    params.write({ ok: false, error: loaded.error.message, runId: params.runId });
     return 1;
   }
+  const refreshed = await refreshRunStatus(loaded.value);
+  if (refreshed.status === "error") {
+    params.write({ ok: false, error: refreshed.error.message, runId: params.runId });
+    return 1;
+  }
+  const run = refreshed.value;
+  params.write({
+    ok: true,
+    runId: run.id,
+    status: run.status,
+    harnessId: run.harnessId,
+    ...run.sessionRef ? { sessionRef: run.sessionRef } : {},
+    run
+  });
+  return 0;
 }
 async function runPromptResult(params) {
-  try {
-    const run = await refreshRunStatus(await loadRunRecord(params.runId));
-    if (!isTerminalStatus(run.status)) {
-      params.write({
-        ok: false,
-        error: `Run '${params.runId}' is not finished yet (status=${run.status}).`,
-        runId: params.runId,
-        status: run.status
-      });
-      return 1;
-    }
-    params.write({
-      ok: run.status === "completed",
-      runId: run.id,
-      status: run.status,
-      harnessId: run.harnessId,
-      ...run.sessionRef ? { sessionRef: run.sessionRef } : {},
-      ...run.resultText ? { resultText: run.resultText } : {},
-      ...run.error ? { error: run.error } : {},
-      run
-    });
-    return run.status === "completed" ? 0 : 1;
-  } catch (error48) {
-    params.write({ ok: false, error: errorMessage2(error48), runId: params.runId });
+  const loaded = await loadRunRecord(params.runId);
+  if (loaded.status === "error") {
+    params.write({ ok: false, error: loaded.error.message, runId: params.runId });
     return 1;
   }
+  const refreshed = await refreshRunStatus(loaded.value);
+  if (refreshed.status === "error") {
+    params.write({ ok: false, error: refreshed.error.message, runId: params.runId });
+    return 1;
+  }
+  const run = refreshed.value;
+  if (!isTerminalStatus(run.status)) {
+    params.write({
+      ok: false,
+      error: `Run '${params.runId}' is not finished yet (status=${run.status}).`,
+      runId: params.runId,
+      status: run.status
+    });
+    return 1;
+  }
+  params.write({
+    ok: run.status === "completed",
+    runId: run.id,
+    status: run.status,
+    harnessId: run.harnessId,
+    ...run.sessionRef ? { sessionRef: run.sessionRef } : {},
+    ...run.resultText ? { resultText: run.resultText } : {},
+    ...run.error ? { error: run.error } : {},
+    run
+  });
+  return run.status === "completed" ? 0 : 1;
 }
 async function runPromptWait(params) {
   const startedAt = Date.now();
   while (true) {
-    const run = await refreshRunStatus(await loadRunRecord(params.runId));
+    const loaded = await loadRunRecord(params.runId);
+    if (loaded.status === "error") {
+      params.write({ ok: false, error: loaded.error.message, runId: params.runId });
+      return 1;
+    }
+    const refreshed = await refreshRunStatus(loaded.value);
+    if (refreshed.status === "error") {
+      params.write({ ok: false, error: refreshed.error.message, runId: params.runId });
+      return 1;
+    }
+    const run = refreshed.value;
     if (isTerminalStatus(run.status)) {
       params.write({
         ok: run.status === "completed",
@@ -16511,203 +18435,620 @@ async function runPromptWait(params) {
   }
 }
 async function runPromptCancel(params) {
-  try {
-    const run = await loadRunRecord(params.runId);
-    if (isTerminalStatus(run.status)) {
-      params.write({
-        ok: false,
-        runId: params.runId,
-        error: `Run '${params.runId}' already finished with status '${run.status}'.`
-      });
-      return 1;
-    }
-    const next = {
-      ...run,
-      cancelRequestedAt: Date.now(),
-      updatedAt: Date.now()
-    };
-    await saveRunRecord(next);
-    if (!run.workerPid || !isProcessAlive(run.workerPid)) {
-      params.write({
-        ok: true,
-        runId: params.runId,
-        signalled: false
-      });
-      return 0;
-    }
-    process.kill(run.workerPid, "SIGTERM");
-    params.write({
-      ok: true,
-      runId: params.runId,
-      signalled: true,
-      workerPid: run.workerPid
-    });
-    return 0;
-  } catch (error48) {
-    params.write({ ok: false, error: errorMessage2(error48), runId: params.runId });
+  const cancellation = await requestRunCancellation(params.runId);
+  if (cancellation.status === "error") {
+    params.write({ ok: false, error: cancellation.error.message, runId: params.runId });
     return 1;
   }
+  if (cancellation.value.kind === "already-terminal") {
+    params.write({
+      ok: false,
+      runId: params.runId,
+      error: `Run '${params.runId}' already finished with status '${cancellation.value.run.status}'.`
+    });
+    return 1;
+  }
+  const run = cancellation.value.run;
+  const alive = await isProcessAlive(run.workerPid);
+  if (alive.status === "error") {
+    params.write({ ok: false, error: alive.error.message, runId: params.runId });
+    return 1;
+  }
+  if (!run.workerPid || !alive.value) {
+    params.write({ ok: true, runId: params.runId, signalled: false });
+    return 0;
+  }
+  const workerPid = run.workerPid;
+  const signalled = await captureExternal("signal-worker", async () => {
+    process.kill(workerPid, "SIGTERM");
+  });
+  if (signalled.status === "error") {
+    params.write({ ok: false, error: signalled.error.message, runId: params.runId });
+    return 1;
+  }
+  params.write({
+    ok: true,
+    runId: params.runId,
+    signalled: true,
+    workerPid
+  });
+  return 0;
 }
-async function persistRunFromCollector(run, collector) {
-  const next = {
-    ...run,
-    updatedAt: Date.now(),
-    ...run.session ? {
+async function persistRunFromCollector(run, collector, persist = async (record2) => {
+  const saved = await saveWorkerRunRecord(record2);
+  if (saved.status === "error")
+    return ae.err(saved.error);
+  Object.assign(record2, saved.value);
+  return ae.ok(undefined);
+}) {
+  let sessionUpdate = {};
+  if (run.session) {
+    sessionUpdate = {
       session: {
         ...run.session,
         title: collector.title ?? run.session.title,
         updatedAt: collector.updatedAt ?? run.session.updatedAt
       }
-    } : run.sessionRef ? {
+    };
+  } else if (run.sessionRef) {
+    sessionUpdate = {
       session: {
         title: collector.title ?? run.requestedTitle,
         cwd: run.directory,
         updatedAt: collector.updatedAt,
         capabilities: capabilitiesFromSummary(run.session)
       }
-    } : {},
-    ...collector.plan ? { plan: collector.plan } : {},
-    ...collector.history.length > 0 ? { history: collector.history } : {},
+    };
+  }
+  const next = {
+    ...run,
+    updatedAt: Date.now(),
+    ...sessionUpdate,
+    ...collector.plan ? { plan: collector.plan.map((entry) => ({ ...entry })) } : {},
+    ...collector.history.length > 0 ? { history: collector.history.map((message) => ({ ...message })) } : {},
     ...collector.latestAssistantText() ? { resultText: collector.latestAssistantText() } : {}
   };
+  const saved = await persist(next);
+  if (saved.status === "error")
+    return ae.err(saved.error);
   Object.assign(run, next);
-  await saveRunRecord(run);
+  return ae.ok(undefined);
+}
+function createSessionUpdatePersistence(run, collector, persist = persistRunFromCollector) {
+  let closed = false;
+  let pending = Promise.resolve();
+  let persistenceError;
+  let finalized;
+  const enqueuePersistence = (record2) => {
+    const persisted = pending.then(async () => {
+      const result = await persist(record2, collector);
+      if (result.status === "error") {
+        persistenceError ??= result.error;
+      } else {
+        Object.assign(run, record2);
+      }
+      return result;
+    });
+    pending = persisted.then(() => {
+      return;
+    });
+    return persisted;
+  };
+  return {
+    onUpdate: (notification) => {
+      if (closed)
+        return Promise.resolve();
+      const update = pending.then(async () => {
+        collector.add(notification);
+        const persisted = await persist(run, collector);
+        if (persisted.status === "error")
+          persistenceError ??= persisted.error;
+      });
+      pending = update;
+      return update;
+    },
+    persist: enqueuePersistence,
+    finalize: () => {
+      if (finalized)
+        return finalized;
+      closed = true;
+      finalized = pending.then(() => persistenceError ? ae.err(persistenceError) : ae.ok(undefined));
+      return finalized;
+    }
+  };
+}
+async function runAcpWorkerLifecycle(work, cleanup, removeSignals) {
+  const attempted = await ae.tryPromise({ try: work, catch: captureAcpFailure });
+  const removalAttempted = ae.try({ try: removeSignals, catch: captureAcpFailure });
+  const cleanupAttempted = await ae.tryPromise({ try: cleanup, catch: captureAcpFailure });
+  if (attempted.status === "error" && attempted.error.kind === "panic") {
+    if (removalAttempted.status === "error") {
+      const removalFailure2 = removalAttempted.error.kind === "panic" ? removalAttempted.error.panic : capturedWorkerFailure("remove-worker-signals", removalAttempted.error);
+      recordAcpCleanupFailure(attempted.error.panic, removalFailure2);
+    }
+    if (cleanupAttempted.status === "ok") {
+      if (cleanupAttempted.value.status === "error") {
+        recordAcpCleanupFailure(attempted.error.panic, cleanupAttempted.value.error);
+      }
+    } else {
+      const cleanupFailure = cleanupAttempted.error.kind === "panic" ? cleanupAttempted.error.panic : capturedWorkerFailure("close-harness", cleanupAttempted.error);
+      recordAcpCleanupFailure(attempted.error.panic, cleanupFailure);
+    }
+    return signalAcpDefect(attempted.error.panic);
+  }
+  if (removalAttempted.status === "error" && removalAttempted.error.kind === "panic") {
+    if (cleanupAttempted.status === "ok") {
+      if (cleanupAttempted.value.status === "error") {
+        recordAcpCleanupFailure(removalAttempted.error.panic, cleanupAttempted.value.error);
+      }
+    } else {
+      const cleanupFailure = cleanupAttempted.error.kind === "panic" ? cleanupAttempted.error.panic : capturedWorkerFailure("close-harness", cleanupAttempted.error);
+      recordAcpCleanupFailure(removalAttempted.error.panic, cleanupFailure);
+    }
+    return signalAcpDefect(removalAttempted.error.panic);
+  }
+  if (cleanupAttempted.status === "error" && cleanupAttempted.error.kind === "panic") {
+    if (removalAttempted.status === "error" && removalAttempted.error.kind === "ordinary") {
+      recordAcpCleanupFailure(cleanupAttempted.error.panic, capturedWorkerFailure("remove-worker-signals", removalAttempted.error));
+    }
+    return signalAcpDefect(cleanupAttempted.error.panic);
+  }
+  let result;
+  if (attempted.status === "ok") {
+    result = attempted.value;
+  } else {
+    switch (attempted.error.kind) {
+      case "panic":
+        return signalAcpDefect(attempted.error.panic);
+      case "ordinary":
+        result = ae.err(capturedWorkerFailure("worker-process", attempted.error));
+        break;
+    }
+  }
+  let removalFailure;
+  if (removalAttempted.status === "error") {
+    switch (removalAttempted.error.kind) {
+      case "panic":
+        return signalAcpDefect(removalAttempted.error.panic);
+      case "ordinary":
+        removalFailure = capturedWorkerFailure("remove-worker-signals", removalAttempted.error);
+        break;
+    }
+  }
+  let cleaned;
+  if (cleanupAttempted.status === "ok") {
+    cleaned = cleanupAttempted.value;
+  } else {
+    switch (cleanupAttempted.error.kind) {
+      case "panic":
+        return signalAcpDefect(cleanupAttempted.error.panic);
+      case "ordinary":
+        cleaned = ae.err(capturedWorkerFailure("close-harness", cleanupAttempted.error));
+        break;
+    }
+  }
+  const harnessCleanup = cleaned.status === "error" ? cleaned.error : undefined;
+  if (!removalFailure && !harnessCleanup)
+    return result;
+  if (result.status === "ok" && removalFailure && !harnessCleanup) {
+    return ae.err(removalFailure);
+  }
+  if (result.status === "ok" && harnessCleanup && !removalFailure) {
+    return ae.err(harnessCleanup);
+  }
+  return ae.err(new WorkerLifecycleCleanupFailed({
+    ...result.status === "error" ? { primary: result.error } : {},
+    ...removalFailure ? { signalCleanup: removalFailure } : {},
+    ...harnessCleanup ? { harnessCleanup } : {},
+    message: result.status === "error" ? `${result.error.message} Worker lifecycle cleanup also failed.` : "Worker lifecycle cleanup failed."
+  }));
+}
+async function runPromptWithCancellationMonitor(params) {
+  const observed = await params.observe();
+  if (observed.status === "error")
+    return ae.err(observed.error);
+  const observation = observed.value;
+  let promptActive = false;
+  let signalPromptStarted = () => {
+    return;
+  };
+  const promptStarted = new Promise((resolve) => {
+    signalPromptStarted = resolve;
+  });
+  const monitored = (async () => {
+    const cancellation = await observation.result;
+    if (cancellation.status === "error")
+      return ae.err(cancellation.error);
+    if (cancellation.value === "stopped")
+      return ae.ok(undefined);
+    await promptStarted;
+    if (!promptActive)
+      return ae.ok(undefined);
+    return params.cancel();
+  })();
+  const promptedAttemptedPromise = ae.tryPromise({
+    try: () => runAcpWorkerLifecycle(async () => {
+      promptActive = true;
+      signalPromptStarted();
+      const prompt = params.prompt();
+      const result = await prompt;
+      promptActive = false;
+      return result;
+    }, observation.close, () => {
+      return;
+    }),
+    catch: captureAcpFailure
+  });
+  const monitorAttemptedPromise = ae.tryPromise({
+    try: () => monitored,
+    catch: captureAcpFailure
+  });
+  const first = await Promise.race([
+    promptedAttemptedPromise.then((attempted) => ({ kind: "prompt", attempted })),
+    monitorAttemptedPromise.then((attempted) => ({ kind: "monitor", attempted }))
+  ]);
+  if (first.kind === "monitor" && (first.attempted.status === "error" || first.attempted.value.status === "error")) {
+    promptActive = false;
+    const watcherCleanupPromise = ae.tryPromise({
+      try: observation.close,
+      catch: captureAcpFailure
+    });
+    const terminationPromise = ae.tryPromise({
+      try: params.terminate,
+      catch: captureAcpFailure
+    });
+    const [watcherCleanup, termination] = await Promise.all([
+      watcherCleanupPromise,
+      terminationPromise
+    ]);
+    promptedAttemptedPromise.then(() => {
+      return;
+    });
+    let monitorPanic;
+    let monitorError;
+    if (first.attempted.status === "ok") {
+      if (first.attempted.value.status === "ok") {
+        return ae.err(new ExternalOperationFailed({
+          operation: "watch-run-cancellation",
+          cause: new Error("Cancellation monitor unexpectedly succeeded on its failure path."),
+          message: "Cancellation monitor unexpectedly succeeded on its failure path."
+        }));
+      }
+      monitorError = first.attempted.value.error;
+    } else {
+      switch (first.attempted.error.kind) {
+        case "panic":
+          monitorPanic = first.attempted.error.panic;
+          monitorError = new ExternalOperationFailed({
+            operation: "watch-run-cancellation",
+            cause: monitorPanic,
+            message: monitorPanic.message
+          });
+          break;
+        case "ordinary":
+          monitorError = capturedWorkerFailure("watch-run-cancellation", first.attempted.error);
+          break;
+      }
+    }
+    const watcherFailure = capturedCleanupResult(watcherCleanup, "close-run-cancellation-watch");
+    const terminationFailure = capturedCleanupResult(termination, "close-harness");
+    if (monitorPanic) {
+      if (watcherFailure)
+        recordAcpCleanupFailure(monitorPanic, watcherFailure);
+      if (terminationFailure)
+        recordAcpCleanupFailure(monitorPanic, terminationFailure);
+      return signalAcpDefect(monitorPanic);
+    }
+    let cleanupPanic;
+    if (n.is(watcherFailure))
+      cleanupPanic = watcherFailure;
+    else if (n.is(terminationFailure))
+      cleanupPanic = terminationFailure;
+    if (cleanupPanic) {
+      const secondary = cleanupPanic === watcherFailure ? terminationFailure : watcherFailure;
+      if (secondary)
+        recordAcpCleanupFailure(cleanupPanic, secondary);
+      return signalAcpDefect(cleanupPanic);
+    }
+    const watcherError = watcherFailure instanceof ExternalOperationFailed ? watcherFailure : undefined;
+    const terminationError = terminationFailure instanceof ExternalOperationFailed ? terminationFailure : undefined;
+    if (!watcherError && !terminationError)
+      return ae.err(monitorError);
+    return ae.err(new MonitorTerminationFailed({
+      primary: monitorError,
+      ...watcherError ? { watcherCleanup: watcherError } : {},
+      ...terminationError ? { termination: terminationError } : {},
+      message: `${monitorError.message} In-flight prompt termination also failed.`
+    }));
+  }
+  const promptedAttempted = first.kind === "prompt" ? first.attempted : await promptedAttemptedPromise;
+  const monitorAttempted = first.kind === "monitor" ? first.attempted : await monitorAttemptedPromise;
+  if (promptedAttempted.status === "error" && promptedAttempted.error.kind === "panic") {
+    if (monitorAttempted.status === "error") {
+      const secondary = monitorAttempted.error.kind === "panic" ? monitorAttempted.error.panic : capturedWorkerFailure("watch-run-cancellation", monitorAttempted.error);
+      recordAcpCleanupFailure(promptedAttempted.error.panic, secondary);
+    } else if (monitorAttempted.value.status === "error") {
+      const secondary = monitorAttempted.value.error._tag === "ExternalOperationFailed" ? monitorAttempted.value.error : new ExternalOperationFailed({
+        operation: "watch-run-cancellation",
+        cause: monitorAttempted.value.error,
+        message: monitorAttempted.value.error.message
+      });
+      recordAcpCleanupFailure(promptedAttempted.error.panic, secondary);
+    }
+    return signalAcpDefect(promptedAttempted.error.panic);
+  }
+  if (monitorAttempted.status === "error" && monitorAttempted.error.kind === "panic") {
+    return signalAcpDefect(monitorAttempted.error.panic);
+  }
+  let prompted;
+  if (promptedAttempted.status === "ok") {
+    prompted = promptedAttempted.value;
+  } else {
+    switch (promptedAttempted.error.kind) {
+      case "panic":
+        return signalAcpDefect(promptedAttempted.error.panic);
+      case "ordinary":
+        prompted = ae.err(capturedWorkerFailure("worker-process", promptedAttempted.error));
+        break;
+    }
+  }
+  let monitor;
+  if (monitorAttempted.status === "ok") {
+    monitor = monitorAttempted.value;
+  } else {
+    switch (monitorAttempted.error.kind) {
+      case "panic":
+        return signalAcpDefect(monitorAttempted.error.panic);
+      case "ordinary":
+        monitor = ae.err(capturedWorkerFailure("watch-run-cancellation", monitorAttempted.error));
+        break;
+    }
+  }
+  if (monitor.status === "ok")
+    return prompted;
+  if (prompted.status === "ok")
+    return ae.err(monitor.error);
+  return ae.err(new WorkAndMonitorFailed({
+    primary: prompted.error,
+    monitor: monitor.error,
+    message: `${prompted.error.message} Cancellation monitoring also failed.`
+  }));
 }
 async function runWorkerProcess(runId, version2) {
-  const run = await loadRunRecord(runId);
+  const loaded = await loadRunRecord(runId);
+  if (loaded.status === "error")
+    return ae.err(loaded.error);
+  const run = loaded.value;
   const resolvedHarness = await resolveHarness(run.harnessId);
-  if (!resolvedHarness) {
+  if (resolvedHarness.status === "error" || !resolvedHarness.value) {
     const failed = {
       ...run,
       status: "failed",
       updatedAt: Date.now(),
-      error: getHarnessDescriptor(run.harnessId)?.installHint ?? `Harness '${run.harnessId}' is not launchable.`
+      error: resolvedHarness.status === "error" ? resolvedHarness.error.message : getHarnessDescriptor(run.harnessId)?.installHint ?? `Harness '${run.harnessId}' is not launchable.`
     };
-    await saveRunRecord(failed);
-    return 1;
+    const saved = await saveRunRecord(failed);
+    return saved.status === "error" ? ae.err(saved.error) : ae.ok(1);
   }
   const collector = new SessionHistoryCollector;
-  const client = await AcpHarnessClient.connect({
-    harness: resolvedHarness,
+  const sessionUpdates = createSessionUpdatePersistence(run, collector);
+  const connected = await AcpHarnessClient.connect({
+    harness: resolvedHarness.value,
     version: version2,
     permissionBehavior: "always",
     counters: run.permissions,
-    onUpdate: async (notification) => {
-      collector.add(notification);
-      await persistRunFromCollector(run, collector);
-    }
-  }).catch(async (error48) => {
+    onUpdate: sessionUpdates.onUpdate
+  });
+  if (connected.status === "error") {
+    const updatesFinalized = await sessionUpdates.finalize();
     const failed = {
       ...run,
       status: "failed",
       updatedAt: Date.now(),
-      error: errorMessage2(error48)
+      error: connected.error.message
     };
-    await saveRunRecord(failed);
-    throw error48;
-  });
-  let signalCleanup;
+    const saved = await sessionUpdates.persist(failed);
+    if (saved.status === "error")
+      return ae.err(saved.error);
+    return updatesFinalized.status === "error" ? ae.err(updatesFinalized.error) : ae.ok(1);
+  }
+  const client = connected.value;
+  let clientCloseAttempted = false;
+  const closeClient = async () => {
+    if (clientCloseAttempted)
+      return ae.ok(undefined);
+    clientCloseAttempted = true;
+    return client.close();
+  };
   let remoteSessionId = run.remoteSessionId;
   let cancellationRequested = false;
-  try {
-    const onTerminate = () => {
-      cancellationRequested = true;
-      if (remoteSessionId) {
-        client.cancel(remoteSessionId).catch(() => {});
-      }
-    };
-    process.on("SIGTERM", onTerminate);
-    process.on("SIGINT", onTerminate);
-    signalCleanup = () => {
-      process.off("SIGTERM", onTerminate);
-      process.off("SIGINT", onTerminate);
-    };
+  const onTerminate = () => {
+    cancellationRequested = true;
+    if (remoteSessionId)
+      client.cancel(remoteSessionId);
+  };
+  process.on("SIGTERM", onTerminate);
+  process.on("SIGINT", onTerminate);
+  const lifecycle = await runAcpWorkerLifecycle(async () => {
+    let workError2;
     if (run.targetKind === "existing") {
       if (!remoteSessionId) {
-        throw new Error(`Run '${run.id}' is missing its remote session ID.`);
+        workError2 = new RunInvariantFailed({
+          runId: run.id,
+          message: `Run '${run.id}' is missing its remote session ID.`
+        });
+      } else {
+        const sessionLoaded = await client.loadSession(remoteSessionId, run.directory);
+        if (sessionLoaded.status === "error")
+          workError2 = sessionLoaded.error;
       }
-      await client.loadSession(remoteSessionId, run.directory);
     } else {
       const created = await client.createSession(run.directory);
-      remoteSessionId = created.sessionId;
-      run.remoteSessionId = remoteSessionId;
-      run.sessionRef = formatSessionRef(run.harnessId, remoteSessionId);
-      await upsertSessionIndexEntries([
-        {
-          sessionRef: run.sessionRef,
-          harnessId: run.harnessId,
-          remoteSessionId,
-          cwd: run.directory,
-          title: run.requestedTitle,
-          updatedAt: undefined,
-          capabilities: client.capabilities(),
-          lastSeenAt: Date.now(),
-          ...run.requestedTitle ? { localTitle: run.requestedTitle } : {}
+      if (created.status === "error") {
+        workError2 = created.error;
+      } else {
+        remoteSessionId = created.value.sessionId;
+        run.remoteSessionId = remoteSessionId;
+        run.sessionRef = formatSessionRef(run.harnessId, remoteSessionId);
+        const indexed = await upsertSessionIndexEntries([
+          {
+            sessionRef: run.sessionRef,
+            harnessId: run.harnessId,
+            remoteSessionId,
+            cwd: run.directory,
+            title: run.requestedTitle,
+            updatedAt: undefined,
+            capabilities: client.capabilities(),
+            lastSeenAt: Date.now(),
+            ...run.requestedTitle ? { localTitle: run.requestedTitle } : {}
+          }
+        ]);
+        if (indexed.status === "error")
+          workError2 = indexed.error;
+        if (!workError2 && run.requestedTitle) {
+          const titled = await setLocalSessionTitle(run.sessionRef, run.requestedTitle);
+          if (titled.status === "error")
+            workError2 = titled.error;
         }
-      ]);
-      if (run.requestedTitle) {
-        await setLocalSessionTitle(run.sessionRef, run.requestedTitle);
       }
     }
-    if (!remoteSessionId || !run.sessionRef) {
-      throw new Error(`Run '${run.id}' could not resolve a session target.`);
+    if (!workError2) {
+      if (!remoteSessionId || !run.sessionRef) {
+        workError2 = new RunInvariantFailed({
+          runId: run.id,
+          message: `Run '${run.id}' could not resolve a session target.`
+        });
+      }
     }
-    const activeSessionId = remoteSessionId;
-    run.session = {
-      title: run.requestedTitle,
-      cwd: run.directory,
-      updatedAt: collector.updatedAt,
-      capabilities: client.capabilities()
-    };
-    run.status = "running";
-    run.userMessageId = randomUUID2();
-    run.updatedAt = Date.now();
-    await saveRunRecord(run);
-    const refreshedRun = await loadRunRecord(run.id);
-    if (cancellationRequested || refreshedRun.cancelRequestedAt) {
-      run.status = "cancelled";
-      run.updatedAt = Date.now();
-      run.error = "Cancelled before prompt submission completed.";
-      await saveRunRecord(run);
-      return 1;
+    if (!workError2 && remoteSessionId && run.sessionRef) {
+      const activeSessionId = remoteSessionId;
+      const userMessageId = randomUUID2();
+      const running = {
+        ...run,
+        session: {
+          title: run.requestedTitle,
+          cwd: run.directory,
+          updatedAt: collector.updatedAt,
+          capabilities: client.capabilities()
+        },
+        status: "running",
+        userMessageId,
+        updatedAt: Date.now()
+      };
+      const runningSaved = await sessionUpdates.persist(running);
+      if (runningSaved.status === "error") {
+        workError2 = runningSaved.error;
+      } else {
+        Object.assign(run, running);
+      }
+      if (!workError2) {
+        const refreshedRun = await loadRunRecord(run.id);
+        if (refreshedRun.status === "error") {
+          workError2 = refreshedRun.error;
+        } else if (cancellationRequested || refreshedRun.value.cancelRequestedAt) {
+          cancellationRequested = true;
+          const updatesFinalized2 = await sessionUpdates.finalize();
+          if (updatesFinalized2.status === "error") {
+            workError2 = updatesFinalized2.error;
+          } else {
+            const cancelled = {
+              ...run,
+              status: "cancelled",
+              updatedAt: Date.now(),
+              error: "Cancelled before prompt submission completed."
+            };
+            const cancelledSaved = await sessionUpdates.persist(cancelled);
+            if (cancelledSaved.status === "error") {
+              workError2 = cancelledSaved.error;
+            } else {
+              Object.assign(run, cancelled);
+            }
+          }
+        }
+      }
+      if (!workError2 && run.status !== "cancelled" && run.requestedMode) {
+        const mode = await client.setMode(activeSessionId, run.requestedMode);
+        if (mode.status === "error")
+          workError2 = mode.error;
+      }
+      if (!workError2 && run.status !== "cancelled" && run.requestedModel) {
+        const model = await client.setModel(activeSessionId, run.requestedModel);
+        if (model.status === "error")
+          workError2 = model.error;
+      }
+      if (!workError2 && run.status !== "cancelled") {
+        const prompted = await runPromptWithCancellationMonitor({
+          observe: () => observeRunCancellation(run),
+          prompt: () => client.prompt(activeSessionId, run.promptText, userMessageId),
+          cancel: () => client.cancel(activeSessionId),
+          terminate: closeClient
+        });
+        if (prompted.status === "error") {
+          workError2 = prompted.error;
+        } else {
+          const updatesFinalized2 = await sessionUpdates.finalize();
+          if (updatesFinalized2.status === "error") {
+            workError2 = updatesFinalized2.error;
+          } else {
+            const promptResponse = prompted.value;
+            const terminal = {
+              ...run,
+              stopReason: promptResponse.stopReason,
+              status: cancellationRequested || isCancelledStopReason(promptResponse.stopReason) ? "cancelled" : "completed",
+              updatedAt: Date.now()
+            };
+            const persisted = await sessionUpdates.persist(terminal);
+            if (persisted.status === "error") {
+              workError2 = persisted.error;
+            } else {
+              Object.assign(run, terminal);
+              const indexed = await upsertSessionIndexEntries([
+                buildIndexEntry({
+                  harnessId: run.harnessId,
+                  sessionId: activeSessionId,
+                  sessionRef: run.sessionRef,
+                  title: collector.title ?? run.requestedTitle,
+                  cwd: run.directory,
+                  updatedAt: collector.updatedAt,
+                  capabilities: client.capabilities()
+                }, run.requestedTitle)
+              ]);
+              if (indexed.status === "error")
+                workError2 = indexed.error;
+            }
+          }
+        }
+      }
     }
-    if (run.requestedMode) {
-      await client.setMode(activeSessionId, run.requestedMode);
-    }
-    if (run.requestedModel) {
-      await client.setModel(activeSessionId, run.requestedModel);
-    }
-    const promptResponse = await client.prompt(activeSessionId, run.promptText, run.userMessageId);
-    run.stopReason = promptResponse.stopReason;
-    run.status = cancellationRequested || isCancelledStopReason(promptResponse.stopReason) ? "cancelled" : "completed";
-    run.updatedAt = Date.now();
-    await persistRunFromCollector(run, collector);
-    await upsertSessionIndexEntries([
-      buildIndexEntry({
-        harnessId: run.harnessId,
-        sessionId: activeSessionId,
-        sessionRef: run.sessionRef,
-        title: collector.title ?? run.requestedTitle,
-        cwd: run.directory,
-        updatedAt: collector.updatedAt,
-        capabilities: client.capabilities()
-      }, run.requestedTitle)
-    ]);
-    return run.status === "completed" ? 0 : 1;
-  } catch (error48) {
+    const updatesFinalized = await sessionUpdates.finalize();
+    if (!workError2 && updatesFinalized.status === "error")
+      workError2 = updatesFinalized.error;
+    return workError2 ? ae.err(workError2) : ae.ok(undefined);
+  }, closeClient, () => {
+    process.off("SIGTERM", onTerminate);
+    process.off("SIGINT", onTerminate);
+  });
+  let workError = lifecycle.status === "error" ? lifecycle.error : undefined;
+  if (workError) {
     const authHint = client.authHint();
+    const cancelled = run.status === "cancelled" || cancellationRequested;
+    let runError = workError.message;
+    if (cancelled) {
+      runError = run.error ?? "Prompt cancelled.";
+    } else if (authHint && workError instanceof ExternalOperationFailed) {
+      if (isAuthRequiredError(workError))
+        runError = authHint;
+    }
     const next = {
       ...run,
-      status: run.status === "cancelled" || cancellationRequested ? "cancelled" : "failed",
+      status: cancelled ? "cancelled" : "failed",
       updatedAt: Date.now(),
-      error: run.status === "cancelled" || cancellationRequested ? run.error ?? "Prompt cancelled." : authHint && isAuthRequiredError(error48) ? authHint : errorMessage2(error48)
+      error: runError
     };
-    await saveRunRecord(next);
-    return 1;
-  } finally {
-    signalCleanup?.();
-    await client.close();
+    const saved = await sessionUpdates.persist(next);
+    return saved.status === "error" ? ae.err(saved.error) : ae.ok(1);
   }
+  return ae.ok(run.status === "completed" ? 0 : 1);
 }
 async function main(argv, options) {
   const commandName = "lilac-acp";
@@ -16743,7 +19084,12 @@ async function main(argv, options) {
       write({ ok: false, error: "Missing --run-id for worker." });
       return 1;
     }
-    return runWorkerProcess(runId, packageVersion);
+    const worker = await runWorkerProcess(runId, packageVersion);
+    if (worker.status === "error") {
+      write({ ok: false, error: worker.error.message, runId });
+      return 1;
+    }
+    return worker.value;
   }
   const command = cleanArgv[0] ?? "";
   if (command === "harnesses") {

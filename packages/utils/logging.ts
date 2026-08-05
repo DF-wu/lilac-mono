@@ -9,13 +9,11 @@ import {
   type WriteStream,
 } from "@stanley2058/simple-module-logger";
 
-import { isRecord } from "./runtime-utils";
-
-const LOG_LEVEL_VALUES: readonly LogLevel[] = ["debug", "info", "warn", "error", "fatal"];
+import { isPanic, isRecord, opaqueErrorMessage } from "./runtime-utils";
+import { redactErrorTextForLog } from "./tagged-error-log";
 
 function hasTestGlobals(): boolean {
-  const g = globalThis as unknown as Record<string, unknown>;
-  return typeof g.describe === "function" && typeof g.it === "function";
+  return "describe" in globalThis && "it" in globalThis;
 }
 
 export function isTestEnv(): boolean {
@@ -48,7 +46,16 @@ function parseBoolean(value: string | undefined): boolean {
 function parseLogLevel(value: string | undefined): LogLevel | undefined {
   if (!value) return undefined;
   const normalized = value.trim().toLowerCase();
-  return LOG_LEVEL_VALUES.includes(normalized as LogLevel) ? (normalized as LogLevel) : undefined;
+  switch (normalized) {
+    case "debug":
+    case "info":
+    case "warn":
+    case "error":
+    case "fatal":
+      return normalized;
+    default:
+      return undefined;
+  }
 }
 
 function resolveOutputFormat(override?: "text" | "jsonl"): "text" | "jsonl" {
@@ -112,8 +119,9 @@ function resolveOpenObserveLogLevel(fallback: LogLevel): LogLevel {
 
 function reportOpenObserveFailure(message: string): void {
   try {
-    process.stderr.write(`[openobserve] ${message}\n`);
-  } catch {
+    process.stderr.write(`[openobserve] ${redactErrorTextForLog(message)}\n`);
+  } catch (cause) {
+    if (isPanic(cause)) throw cause;
     // Ignore stderr write failures.
   }
 }
@@ -123,6 +131,9 @@ function toSingleLine(text: string): string {
 }
 
 const MAX_OBJECT_FIELDS_PER_ARG = 40;
+
+type OpenObserveFieldValue = string | number | boolean | null;
+type OpenObserveRecord = Record<string, OpenObserveFieldValue>;
 
 function isPrimitive(value: unknown): value is string | number | boolean | null {
   return (
@@ -140,17 +151,14 @@ function sanitizeFieldSegment(value: string): string {
 
 function safeJsonStringify(value: unknown): string {
   try {
-    return JSON.stringify(value);
-  } catch {
+    return JSON.stringify(value) ?? "[unsupported]";
+  } catch (cause) {
+    if (isPanic(cause)) throw cause;
     return "[unserializable]";
   }
 }
 
-function addNormalizedArgFields(
-  target: Record<string, unknown>,
-  index: number,
-  value: unknown,
-): void {
+function addNormalizedArgFields(target: OpenObserveRecord, index: number, value: unknown): void {
   const prefix = `arg${index}`;
 
   if (isPrimitive(value)) {
@@ -187,13 +195,17 @@ function addNormalizedArgFields(
     return;
   }
 
-  target[prefix] = String(value);
+  target[prefix] = "[unsupported]";
 }
 
-function normalizeRecordForOpenObserve(record: unknown): Record<string, unknown> | null {
+function normalizeRecordForOpenObserve(record: unknown): OpenObserveRecord | null {
   if (!isRecord(record)) return null;
 
-  const normalized: Record<string, unknown> = { ...record };
+  const normalized: OpenObserveRecord = {};
+  for (const [key, value] of Object.entries(record)) {
+    if (key === "args") continue;
+    normalized[key] = isPrimitive(value) ? value : safeJsonStringify(value);
+  }
   const args = record["args"];
   if (!Array.isArray(args)) {
     return normalized;
@@ -210,7 +222,7 @@ function normalizeRecordForOpenObserve(record: unknown): Record<string, unknown>
 }
 
 class OpenObserveJsonlStream implements WriteStream {
-  private readonly queue: unknown[] = [];
+  private readonly queue: OpenObserveRecord[] = [];
   private flushScheduled = false;
   private flushing = false;
 
@@ -227,7 +239,8 @@ class OpenObserveJsonlStream implements WriteStream {
         if (normalized) {
           this.queue.push(normalized);
         }
-      } catch {
+      } catch (cause) {
+        if (isPanic(cause)) throw cause;
         // Ignore malformed lines; logger output should be valid JSONL.
       }
     }
@@ -262,7 +275,7 @@ class OpenObserveJsonlStream implements WriteStream {
     }
   }
 
-  private async postBatch(batch: readonly unknown[]): Promise<void> {
+  private async postBatch(batch: readonly OpenObserveRecord[]): Promise<void> {
     if (batch.length === 0) return;
 
     const headers: Record<string, string> = {
@@ -286,7 +299,10 @@ class OpenObserveJsonlStream implements WriteStream {
         );
       }
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
+      if (isPanic(error)) throw error;
+      const message = redactErrorTextForLog(
+        opaqueErrorMessage(error, "Unknown OpenObserve request failure"),
+      );
       reportOpenObserveFailure(`log ingest request failed to ${this.config.endpoint}: ${message}`);
     }
   }
@@ -297,7 +313,8 @@ class OpenObserveJsonlStream implements WriteStream {
       if (!text) return undefined;
       const singleLine = toSingleLine(text);
       return singleLine.slice(0, 300);
-    } catch {
+    } catch (cause) {
+      if (isPanic(cause)) throw cause;
       return undefined;
     }
   }

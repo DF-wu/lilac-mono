@@ -1,16 +1,27 @@
 import { ActionRowBuilder, ButtonBuilder, ButtonStyle } from "discord.js";
+import { Result, TaggedError, type Result as ResultType } from "better-result";
 
 import type { SurfaceAction } from "../types";
 
 const ACTION_PREFIX = "lilac_action:v1:";
 const CUSTOM_ID_MAX_LENGTH = 100;
 
-export function buildDiscordActionCustomId(actionId: string): string {
+export class DiscordActionCustomIdInvalid extends TaggedError("DiscordActionCustomIdInvalid")<{
+  readonly message: string;
+}> {}
+
+export function buildDiscordActionCustomIdResult(
+  actionId: string,
+): ResultType<string, DiscordActionCustomIdInvalid> {
   const customId = `${ACTION_PREFIX}${actionId}`;
   if (!actionId || customId.length > CUSTOM_ID_MAX_LENGTH) {
-    throw new Error("Discord surface action ID is empty or exceeds the custom_id limit");
+    return Result.err(
+      new DiscordActionCustomIdInvalid({
+        message: "Discord surface action ID is empty or exceeds the custom_id limit",
+      }),
+    );
   }
-  return customId;
+  return Result.ok(customId);
 }
 
 export function parseDiscordActionCustomId(customId: string): string | null {
@@ -32,20 +43,23 @@ function buttonStyle(style: SurfaceAction["style"]): ButtonStyle {
   }
 }
 
-export function buildDiscordActionComponents(
+export function buildDiscordActionComponentsResult(
   actions: readonly SurfaceAction[],
-): ActionRowBuilder<ButtonBuilder>[] {
+): ResultType<ActionRowBuilder<ButtonBuilder>[], DiscordActionCustomIdInvalid> {
   const rows: ActionRowBuilder<ButtonBuilder>[] = [];
   for (let index = 0; index < actions.length; index += 5) {
-    const buttons = actions
-      .slice(index, index + 5)
-      .map((action) =>
+    const buttons: ButtonBuilder[] = [];
+    for (const action of actions.slice(index, index + 5)) {
+      const customId = buildDiscordActionCustomIdResult(action.actionId);
+      if (customId.status === "error") return Result.err(customId.error);
+      buttons.push(
         new ButtonBuilder()
-          .setCustomId(buildDiscordActionCustomId(action.actionId))
+          .setCustomId(customId.value)
           .setLabel(action.label)
           .setStyle(buttonStyle(action.style)),
       );
+    }
     rows.push(new ActionRowBuilder<ButtonBuilder>().addComponents(buttons));
   }
-  return rows;
+  return Result.ok(rows);
 }

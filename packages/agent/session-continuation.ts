@@ -1,9 +1,12 @@
 import { createHash } from "node:crypto";
 
 import type { ModelMessage } from "ai";
+import { Result, TaggedError, type Result as ResultType } from "better-result";
 import { z } from "zod";
 
 import { isRecord } from "@stanley2058/lilac-utils";
+
+import { rethrowAgentPanic, type OpaqueAgentValue } from "./failure-adapters";
 
 export const CANONICAL_HEAD_HASH_VERSION = 1 as const;
 export const CANONICAL_HEAD_HASH_DOMAIN = "lilac:canonical-head:v1" as const;
@@ -214,7 +217,9 @@ function domainHash(domain: string, serialized: string): string {
 }
 
 function utf16Compare(left: string, right: string): number {
-  return left < right ? -1 : left > right ? 1 : 0;
+  if (left < right) return -1;
+  if (left > right) return 1;
+  return 0;
 }
 
 const strictJsonPrimitiveSchema = z.union([z.null(), z.boolean(), z.number().finite(), z.string()]);
@@ -223,34 +228,76 @@ type StrictJsonValue =
   | StrictJsonValue[]
   | { readonly [key: string]: StrictJsonValue };
 
-function parseStrictJsonValue(value: unknown, ancestors = new WeakSet<object>()): StrictJsonValue {
+class CanonicalJsonInvalid extends TaggedError("CanonicalJsonInvalid")<{
+  readonly message: string;
+}> {}
+
+function signalCanonicalJsonInvalid(error: CanonicalJsonInvalid): never {
+  throw new TypeError(error.message);
+}
+
+function parseStrictJsonValue(
+  value: unknown,
+  ancestors = new WeakSet<object>(),
+): ResultType<StrictJsonValue, CanonicalJsonInvalid> {
   const primitive = strictJsonPrimitiveSchema.safeParse(value);
   if (primitive.success) {
-    return typeof primitive.data === "number" && Object.is(primitive.data, -0) ? 0 : primitive.data;
+    return Result.ok(
+      typeof primitive.data === "number" && Object.is(primitive.data, -0) ? 0 : primitive.data,
+    );
   }
   if (!Array.isArray(value) && !isRecord(value)) {
-    throw new TypeError("Canonical values must be strict JSON");
+    return Result.err(
+      new CanonicalJsonInvalid({ message: "Canonical values must be strict JSON" }),
+    );
   }
-  if (ancestors.has(value)) throw new TypeError("Canonical JSON values must not contain cycles");
+  if (ancestors.has(value)) {
+    return Result.err(
+      new CanonicalJsonInvalid({ message: "Canonical JSON values must not contain cycles" }),
+    );
+  }
   ancestors.add(value);
   if (Array.isArray(value)) {
-    const result = value.map((item) => parseStrictJsonValue(item, ancestors));
+    const result: StrictJsonValue[] = [];
+    for (const item of value) {
+      const parsed = parseStrictJsonValue(item, ancestors);
+      if (parsed.status === "error") {
+        ancestors.delete(value);
+        return Result.err(parsed.error);
+      }
+      result.push(parsed.value);
+    }
     ancestors.delete(value);
-    return result;
+    return Result.ok(result);
   }
   const prototype = Object.getPrototypeOf(value);
   if (
     (prototype !== Object.prototype && prototype !== null) ||
     typeof value["toJSON"] === "function"
   ) {
-    throw new TypeError("Canonical JSON objects must be plain data objects");
+    ancestors.delete(value);
+    return Result.err(
+      new CanonicalJsonInvalid({
+        message: "Canonical JSON objects must be plain data objects",
+      }),
+    );
   }
-  const entries = Object.keys(value).map((key): [string, StrictJsonValue] => [
-    key,
-    parseStrictJsonValue(value[key], ancestors),
-  ]);
+  const entries: Array<[string, StrictJsonValue]> = [];
+  for (const key of Object.keys(value)) {
+    const parsed = parseStrictJsonValue(value[key], ancestors);
+    if (parsed.status === "error") {
+      ancestors.delete(value);
+      return Result.err(parsed.error);
+    }
+    entries.push([key, parsed.value]);
+  }
   ancestors.delete(value);
-  return Object.fromEntries(entries);
+  return Result.ok(Object.fromEntries(entries));
+}
+
+function requireStrictJsonValue(value: OpaqueAgentValue): StrictJsonValue {
+  const parsed = parseStrictJsonValue(value);
+  return parsed.status === "ok" ? parsed.value : signalCanonicalJsonInvalid(parsed.error);
 }
 
 function sortCanonicalJsonValue(value: StrictJsonValue): StrictJsonValue {
@@ -259,13 +306,9 @@ function sortCanonicalJsonValue(value: StrictJsonValue): StrictJsonValue {
   }
   if (Array.isArray(value)) return value.map(sortCanonicalJsonValue);
   return Object.fromEntries(
-    Object.keys(value)
-      .sort(utf16Compare)
-      .map((key): [string, StrictJsonValue] => {
-        const item = value[key];
-        if (item === undefined) throw new TypeError("Canonical JSON object values must be defined");
-        return [key, sortCanonicalJsonValue(item)];
-      }),
+    Object.entries(value)
+      .sort(([left], [right]) => utf16Compare(left, right))
+      .map(([key, item]): [string, StrictJsonValue] => [key, sortCanonicalJsonValue(item)]),
   );
 }
 
@@ -281,22 +324,18 @@ function wrapCanonicalJsonValue(value: StrictJsonValue): CanonicalJsonValue {
   }
   return {
     type: "object",
-    entries: Object.keys(value)
-      .sort(utf16Compare)
-      .map((key) => {
-        const item = value[key];
-        if (item === undefined) throw new TypeError("Canonical JSON object values must be defined");
-        return { key, value: wrapCanonicalJsonValue(item) };
-      }),
+    entries: Object.entries(value)
+      .sort(([left], [right]) => utf16Compare(left, right))
+      .map(([key, item]) => ({ key, value: wrapCanonicalJsonValue(item) })),
   };
 }
 
 function normalizeCanonicalValue(value: unknown): CanonicalJsonValue {
-  return wrapCanonicalJsonValue(parseStrictJsonValue(value));
+  return wrapCanonicalJsonValue(requireStrictJsonValue(value));
 }
 
 export function canonicalJsonStringify(value: unknown): string {
-  return JSON.stringify(sortCanonicalJsonValue(parseStrictJsonValue(value)));
+  return JSON.stringify(sortCanonicalJsonValue(requireStrictJsonValue(value)));
 }
 
 function fileIdentity(data: unknown): CanonicalFileIdentityV1 {
@@ -354,7 +393,8 @@ function fileStringContentDigest(value: string): string {
     if (/^data:[^,]*;base64,/i.test(value)) return sha256(Buffer.from(payload, "base64"));
     try {
       return sha256(decodeURIComponent(payload));
-    } catch {
+    } catch (cause) {
+      rethrowAgentPanic(cause);
       return sha256(payload);
     }
   }
@@ -363,7 +403,7 @@ function fileStringContentDigest(value: string): string {
 
 function projectResultContentItem(item: unknown): StrictJsonValue | null {
   if (!isRecord(item) || typeof item["type"] !== "string") {
-    return parseStrictJsonValue(item);
+    return requireStrictJsonValue(item);
   }
   const type = item["type"];
   if (type === "custom") return null;
@@ -371,14 +411,16 @@ function projectResultContentItem(item: unknown): StrictJsonValue | null {
     return { type: "text", text: item["text"] };
   }
   if (type.includes("file") || type.startsWith("image")) {
-    const data =
-      item["fileId"] !== undefined
-        ? { type: "reference", reference: item["fileId"] }
-        : item["providerReference"] !== undefined
-          ? { type: "reference", reference: item["providerReference"] }
-          : item["reference"] !== undefined
-            ? { type: "reference", reference: item["reference"] }
-            : (item["url"] ?? item["data"]);
+    let data: unknown;
+    if (item["fileId"] !== undefined) {
+      data = { type: "reference", reference: item["fileId"] };
+    } else if (item["providerReference"] !== undefined) {
+      data = { type: "reference", reference: item["providerReference"] };
+    } else if (item["reference"] !== undefined) {
+      data = { type: "reference", reference: item["reference"] };
+    } else {
+      data = item["url"] ?? item["data"];
+    }
     const projected: Record<string, StrictJsonValue> = {
       type: "file",
       mediaType:
@@ -386,12 +428,12 @@ function projectResultContentItem(item: unknown): StrictJsonValue | null {
       identity: fileIdentity(data),
     };
     if (typeof item["filename"] === "string") projected["filename"] = item["filename"];
-    return parseStrictJsonValue(projected);
+    return requireStrictJsonValue(projected);
   }
   const projected: Array<[string, StrictJsonValue]> = [];
   for (const key of Object.keys(item).sort(utf16Compare)) {
     if (key === "providerOptions" || key === "providerMetadata") continue;
-    projected.push([key, parseStrictJsonValue(item[key])]);
+    projected.push([key, requireStrictJsonValue(item[key])]);
   }
   return Object.fromEntries(projected);
 }
@@ -421,7 +463,7 @@ function toolOutputProjection(output: unknown): {
             const projected = projectResultContentItem(item);
             return projected === null ? [] : [projected];
           })
-        : parseStrictJsonValue(output["value"]);
+        : requireStrictJsonValue(output["value"]);
       return { outcome: "success", output: normalizeCanonicalValue(value) };
     }
     default:
@@ -540,9 +582,15 @@ export function hashCanonicalMessagesV1(
 }
 
 export function hashExecutionScopeV1(input: ExecutionScopeHashInputV1): ExecutionScopeHashV1Result {
+  const decodedInput = executionScopeHashInputV1Schema.safeParse(input);
+  if (!decodedInput.success) {
+    return signalCanonicalJsonInvalid(
+      new CanonicalJsonInvalid({ message: "Execution scope input is invalid" }),
+    );
+  }
   const projection: ExecutionScopeProjectionV1 = {
     version: EXECUTION_SCOPE_HASH_VERSION,
-    scope: executionScopeHashInputV1Schema.parse(input),
+    scope: decodedInput.data,
   };
   const serialized = canonicalJsonStringify(projection);
   return {
@@ -558,9 +606,6 @@ function clip(
   value: string,
   maxChars: number,
 ): { readonly text: string; readonly truncated: boolean } {
-  if (!Number.isFinite(maxChars) || !Number.isInteger(maxChars) || maxChars < 0) {
-    throw new RangeError("Text replay character bounds must be finite non-negative integers");
-  }
   const characters = [...sanitizeXmlCharacters(value)];
   return {
     text: characters.slice(0, maxChars).join(""),
@@ -643,7 +688,8 @@ function sanitizeReplayValue(
 ): StrictJsonValue {
   if (value === null || typeof value === "string" || typeof value === "boolean") return value;
   if (typeof value === "number") {
-    return Number.isFinite(value) ? (Object.is(value, -0) ? 0 : value) : `[${String(value)}]`;
+    if (!Number.isFinite(value)) return `[${String(value)}]`;
+    return Object.is(value, -0) ? 0 : value;
   }
   if (typeof value === "bigint") return `[BigInt ${value.toString()}]`;
   if (typeof value === "undefined") return "[Unavailable value]";
@@ -663,7 +709,8 @@ function sanitizeReplayValue(
     for (let index = 0; index < value.length; index += 1) {
       try {
         result.push(sanitizeReplayValue(value[index], options, ancestors));
-      } catch {
+      } catch (cause) {
+        rethrowAgentPanic(cause);
         result.push("[Unreadable value]");
       }
     }
@@ -691,7 +738,8 @@ function sanitizeReplayValue(
     }
     try {
       entries.push([key, sanitizeReplayValue(value[key], options, ancestors)]);
-    } catch {
+    } catch (cause) {
+      rethrowAgentPanic(cause);
       entries.push([key, "[Unreadable value]"]);
     }
   }
@@ -712,7 +760,8 @@ function safeReplayJsonStringify(
 function toolInputText(input: unknown): string {
   try {
     return canonicalJsonStringify(input);
-  } catch {
+  } catch (cause) {
+    rethrowAgentPanic(cause);
     return safeReplayJsonStringify(input, { stripMetadata: true, stripPayloads: true });
   }
 }
@@ -1045,18 +1094,18 @@ export function preparePlainTextReplayForTarget(
     const message = canonicalPrefix[index]!;
     if (message.role === "system") continue;
     if (message.role === "user") {
-      const content =
-        typeof message.content === "string"
-          ? message.content
-          : message.content
-              .flatMap((part) =>
-                part.type === "text"
-                  ? part.text.length === 0
-                    ? []
-                    : [part.text]
-                  : [fileDescription(part)],
-              )
-              .join("\n\n");
+      let content: string;
+      if (typeof message.content === "string") {
+        content = message.content;
+      } else {
+        content = message.content
+          .flatMap((part) => {
+            if (part.type !== "text") return [fileDescription(part)];
+            if (part.text.length === 0) return [];
+            return [part.text];
+          })
+          .join("\n\n");
+      }
       appendReplayMessage(output, "user", content);
       continue;
     }

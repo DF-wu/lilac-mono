@@ -3,17 +3,29 @@ import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
+import { Panic, type Result } from "better-result";
+
 import {
+  McpConfigFileOperationAndCleanupError,
+  McpConfigFileOperationError,
   McpConfigError,
   mutateMcpConfigFile,
   parseMcpConfigYaml,
   readMcpConfigFile,
   resolveMcpConfigPath,
   serializeMcpConfigYaml,
+  serializeMcpConfigYamlResult,
+  writeMcpConfigFileAtomic,
+  type McpConfigFileDependencies,
   type McpServerDefinition,
 } from "../../src/mcp";
 
 const temporaryDirectories: string[] = [];
+
+function expectOk<T, E extends Error>(result: Result<T, E>): T {
+  if (result.status === "error") throw new Error(result.error.message);
+  return result.value;
+}
 
 async function createDataDir(): Promise<string> {
   const dataDir = await mkdtemp(path.join(tmpdir(), "lilac-mcp-config-"));
@@ -180,6 +192,35 @@ servers:
 `);
     expect(configurableRedirect.ok).toBe(false);
   });
+
+  it("rejects invalid emitted shapes while preserving earlier serialization errors", () => {
+    const unsupported = serializeMcpConfigYamlResult({
+      configVersion: 2,
+      servers: { expected: stdioServer("different") },
+    });
+    expect(unsupported.status).toBe("error");
+    if (unsupported.status === "error") {
+      expect(unsupported.error).toMatchObject({ reason: "unsupported-version" });
+    }
+
+    const invalid = serializeMcpConfigYamlResult({
+      configVersion: 1,
+      servers: { "../invalid": stdioServer("../invalid") },
+    });
+    expect(invalid.status).toBe("error");
+    if (invalid.status === "error") {
+      expect(invalid.error).toMatchObject({ reason: "invalid-output" });
+    }
+
+    const mismatched = serializeMcpConfigYamlResult({
+      configVersion: 1,
+      servers: { expected: stdioServer("different") },
+    });
+    expect(mismatched.status).toBe("error");
+    if (mismatched.status === "error") {
+      expect(mismatched.error).toMatchObject({ reason: "id-mismatch" });
+    }
+  });
 });
 
 describe("MCP config file mutations", () => {
@@ -187,7 +228,7 @@ describe("MCP config file mutations", () => {
     const dataDir = await createDataDir();
     const configPath = resolveMcpConfigPath({ dataDir });
 
-    const [first, second] = await Promise.all([
+    const [firstResult, secondResult] = await Promise.all([
       mutateMcpConfigFile({
         configPath,
         mutation: { type: "upsert", server: stdioServer("alpha") },
@@ -197,24 +238,30 @@ describe("MCP config file mutations", () => {
         mutation: { type: "upsert", server: stdioServer("beta", "node") },
       }),
     ]);
+    const first = expectOk(firstResult);
+    const second = expectOk(secondResult);
     expect(first.changed).toBe(true);
     expect(second.changed).toBe(true);
 
-    const loaded = await readMcpConfigFile(configPath);
+    const loaded = expectOk(await readMcpConfigFile(configPath));
     expect(Object.keys(loaded.config.servers)).toEqual(["alpha", "beta"]);
     expect((await stat(configPath)).mode & 0o777).toBe(0o600);
 
-    const removed = await mutateMcpConfigFile({
-      configPath,
-      mutation: { type: "remove", serverId: "alpha" },
-    });
+    const removed = expectOk(
+      await mutateMcpConfigFile({
+        configPath,
+        mutation: { type: "remove", serverId: "alpha" },
+      }),
+    );
     expect(removed.changed).toBe(true);
     expect(Object.keys(removed.config.servers)).toEqual(["beta"]);
 
-    const noOp = await mutateMcpConfigFile({
-      configPath,
-      mutation: { type: "remove", serverId: "alpha" },
-    });
+    const noOp = expectOk(
+      await mutateMcpConfigFile({
+        configPath,
+        mutation: { type: "remove", serverId: "alpha" },
+      }),
+    );
     expect(noOp.changed).toBe(false);
   });
 
@@ -224,12 +271,289 @@ describe("MCP config file mutations", () => {
     const invalid = "configVersion: 1\nservers:\n  bad:\n    transport: websocket\n";
     await writeFile(configPath, invalid, "utf8");
 
-    await expect(
-      mutateMcpConfigFile({
-        configPath,
-        mutation: { type: "upsert", server: stdioServer("good") },
-      }),
-    ).rejects.toBeInstanceOf(McpConfigError);
+    const mutation = await mutateMcpConfigFile({
+      configPath,
+      mutation: { type: "upsert", server: stdioServer("good") },
+    });
+    expect(mutation.status).toBe("error");
+    if (mutation.status === "error") expect(mutation.error).toBeInstanceOf(McpConfigError);
     expect(await readFile(configPath, "utf8")).toBe(invalid);
+  });
+
+  it("uses deterministic cleanup precedence for atomic writes", async () => {
+    const configPath = "/data/mcp-config.yaml";
+    const calls: string[] = [];
+    let writeFailure: Error | undefined;
+    let closeFailure: Error | undefined;
+    const dependencies = {
+      mkdir: async () => undefined,
+      open: async () => ({
+        writeFile: async () => {
+          calls.push("write");
+          if (writeFailure) throw writeFailure;
+        },
+        sync: async () => {
+          calls.push("sync");
+        },
+        close: async () => {
+          calls.push("close");
+          if (closeFailure) throw closeFailure;
+        },
+      }),
+      rename: async () => {
+        calls.push("rename");
+      },
+      rm: async () => {
+        calls.push("remove");
+      },
+      randomUUID: () => "fixed",
+    } satisfies McpConfigFileDependencies;
+
+    closeFailure = new Error("close failed");
+    const cleanupOnly = await writeMcpConfigFileAtomic(
+      configPath,
+      { configVersion: 1, servers: {} },
+      dependencies,
+    );
+    expect(cleanupOnly.status).toBe("error");
+    if (cleanupOnly.status === "error") {
+      expect(cleanupOnly.error).toBeInstanceOf(McpConfigFileOperationError);
+      expect(cleanupOnly.error).toMatchObject({ operation: "close_temporary" });
+    }
+    expect(calls).toEqual(["write", "sync", "close", "remove"]);
+
+    calls.length = 0;
+    writeFailure = new Error("write failed");
+    const primaryAndCleanup = await writeMcpConfigFileAtomic(
+      configPath,
+      { configVersion: 1, servers: {} },
+      dependencies,
+    );
+    expect(primaryAndCleanup.status).toBe("error");
+    if (primaryAndCleanup.status === "error") {
+      expect(primaryAndCleanup.error).toBeInstanceOf(McpConfigFileOperationAndCleanupError);
+      expect(primaryAndCleanup.error).toMatchObject({
+        primary: { operation: "write_temporary" },
+        cleanup: { operation: "close_temporary" },
+      });
+    }
+    expect(calls).toEqual(["write", "close", "remove"]);
+
+    for (const panicOperation of ["write", "sync"] as const) {
+      calls.length = 0;
+      writeFailure = undefined;
+      closeFailure = new Error("cleanup failed after Panic");
+      const panic = new Panic({ message: `${panicOperation} invariant failed` });
+      const panicDependencies = {
+        ...dependencies,
+        open: async () => ({
+          writeFile: async () => {
+            calls.push("write");
+            if (panicOperation === "write") throw panic;
+          },
+          sync: async () => {
+            calls.push("sync");
+            if (panicOperation === "sync") throw panic;
+          },
+          close: async () => {
+            calls.push("close");
+            if (closeFailure) throw closeFailure;
+          },
+        }),
+      } satisfies McpConfigFileDependencies;
+      await expect(
+        writeMcpConfigFileAtomic(configPath, { configVersion: 1, servers: {} }, panicDependencies),
+      ).rejects.toBe(panic);
+      expect(calls).toEqual(
+        panicOperation === "write"
+          ? ["write", "close", "remove"]
+          : ["write", "sync", "close", "remove"],
+      );
+      if (panicOperation === "write") {
+        calls.length = 0;
+        await expect(
+          mutateMcpConfigFile({
+            configPath,
+            mutation: { type: "upsert", server: stdioServer("panic") },
+            fileDependencies: panicDependencies,
+          }),
+        ).rejects.toBe(panic);
+        expect(calls).toEqual(["write", "close", "remove"]);
+      }
+    }
+
+    for (const panicOperation of ["close", "rename"] as const) {
+      calls.length = 0;
+      const panic = new Panic({ message: `${panicOperation} invariant failed` });
+      const panicDependencies = {
+        ...dependencies,
+        open: async () => ({
+          writeFile: async () => {
+            calls.push("write");
+          },
+          sync: async () => {
+            calls.push("sync");
+          },
+          close: async () => {
+            calls.push("close");
+            if (panicOperation === "close") throw panic;
+          },
+        }),
+        rename: async () => {
+          calls.push("rename");
+          if (panicOperation === "rename") throw panic;
+        },
+      } satisfies McpConfigFileDependencies;
+      await expect(
+        writeMcpConfigFileAtomic(configPath, { configVersion: 1, servers: {} }, panicDependencies),
+      ).rejects.toBe(panic);
+      expect(calls).toEqual(
+        panicOperation === "close"
+          ? ["write", "sync", "close", "remove"]
+          : ["write", "sync", "close", "rename", "remove"],
+      );
+    }
+
+    calls.length = 0;
+    const hostileCause = {
+      toString: () => {
+        throw new Error("must not coerce rejection");
+      },
+      [Symbol.toPrimitive]: () => {
+        throw new Error("must not coerce rejection");
+      },
+    };
+    const hostileResult = await writeMcpConfigFileAtomic(
+      configPath,
+      { configVersion: 1, servers: {} },
+      {
+        ...dependencies,
+        open: async () => ({
+          writeFile: () => Promise.reject(hostileCause),
+          sync: async () => undefined,
+          close: async () => {
+            calls.push("close");
+          },
+        }),
+      },
+    );
+    expect(hostileResult.status).toBe("error");
+    if (hostileResult.status === "error") {
+      expect(hostileResult.error).toMatchObject({
+        operation: "write_temporary",
+        cause: hostileCause,
+      });
+      expect(hostileResult.error.message).toEndWith("Unknown error");
+    }
+    expect(calls).toEqual(["close", "remove"]);
+  });
+
+  it("preserves operation Panic identity across atomic-write cleanup Panics", async () => {
+    const configPath = "/data/mcp-config.yaml";
+    const expectedCalls = {
+      open: ["open", "remove"],
+      write: ["open", "write", "close", "remove"],
+      sync: ["open", "write", "sync", "close", "remove"],
+      close: ["open", "write", "sync", "close", "remove"],
+      rename: ["open", "write", "sync", "close", "rename", "remove"],
+    } satisfies Record<string, readonly string[]>;
+
+    for (const operation of ["open", "write", "sync", "close", "rename"] as const) {
+      const calls: string[] = [];
+      const primaryPanic = new Panic({ message: `${operation} invariant failed` });
+      const cleanupPanic = new Panic({ message: `${operation} cleanup invariant failed` });
+      const removePanic = new Panic({ message: `${operation} remove invariant failed` });
+      const dependencies = {
+        mkdir: async () => undefined,
+        open: async () => {
+          calls.push("open");
+          if (operation === "open") throw primaryPanic;
+          return {
+            writeFile: async () => {
+              calls.push("write");
+              if (operation === "write") throw primaryPanic;
+            },
+            sync: async () => {
+              calls.push("sync");
+              if (operation === "sync") throw primaryPanic;
+            },
+            close: async () => {
+              calls.push("close");
+              if (operation === "close") throw primaryPanic;
+              if (operation === "write" || operation === "sync") throw cleanupPanic;
+            },
+          };
+        },
+        rename: async () => {
+          calls.push("rename");
+          if (operation === "rename") throw primaryPanic;
+        },
+        rm: async () => {
+          calls.push("remove");
+          throw removePanic;
+        },
+        randomUUID: () => "fixed",
+      } satisfies McpConfigFileDependencies;
+
+      await expect(
+        writeMcpConfigFileAtomic(configPath, { configVersion: 1, servers: {} }, dependencies),
+      ).rejects.toBe(primaryPanic);
+      expect(calls).toEqual(expectedCalls[operation]);
+    }
+  });
+
+  it("preserves cleanup Panic identity when no operation Panic exists", async () => {
+    const configPath = "/data/mcp-config.yaml";
+    const calls: string[] = [];
+    const removePanic = new Panic({ message: "remove invariant failed" });
+    const openFailure = new Error("open failed");
+    const openDependencies = {
+      mkdir: async () => undefined,
+      open: async () => {
+        calls.push("open");
+        throw openFailure;
+      },
+      rename: async () => undefined,
+      rm: async () => {
+        calls.push("remove");
+        throw removePanic;
+      },
+      randomUUID: () => "fixed",
+    } satisfies McpConfigFileDependencies;
+
+    await expect(
+      writeMcpConfigFileAtomic(configPath, { configVersion: 1, servers: {} }, openDependencies),
+    ).rejects.toBe(removePanic);
+    expect(calls).toEqual(["open", "remove"]);
+
+    calls.length = 0;
+    const closePanic = new Panic({ message: "close invariant failed" });
+    const laterRemovePanic = new Panic({ message: "later remove invariant failed" });
+    const writeFailure = new Error("write failed");
+    const closeDependencies = {
+      ...openDependencies,
+      open: async () => ({
+        writeFile: async () => {
+          calls.push("write");
+          throw writeFailure;
+        },
+        sync: async () => {
+          calls.push("sync");
+        },
+        close: async () => {
+          calls.push("close");
+          throw closePanic;
+        },
+      }),
+      rm: async () => {
+        calls.push("remove");
+        throw laterRemovePanic;
+      },
+    } satisfies McpConfigFileDependencies;
+
+    await expect(
+      writeMcpConfigFileAtomic(configPath, { configVersion: 1, servers: {} }, closeDependencies),
+    ).rejects.toBe(closePanic);
+    expect(calls).toEqual(["write", "close", "remove"]);
   });
 });

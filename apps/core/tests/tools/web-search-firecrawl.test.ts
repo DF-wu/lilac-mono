@@ -111,4 +111,28 @@ describe("web-search (firecrawl)", () => {
       },
     ]);
   });
+
+  it("does not expose provider response payloads in HTTP failures", async () => {
+    const server = Bun.serve({
+      port: 0,
+      hostname: "127.0.0.1",
+      fetch() {
+        return new Response(JSON.stringify({ success: false, error: "provider-secret-value" }), {
+          status: 429,
+          statusText: "Too Many Requests",
+          headers: { "content-type": "application/json" },
+        });
+      },
+    });
+    servers.push(server);
+
+    const provider = new FirecrawlWebSearchProvider({
+      apiKey: "firecrawl-test-key",
+      apiBaseUrl: `http://127.0.0.1:${server.port}`,
+    });
+
+    const failed = provider.search(webSearchInputSchema.parse({ query: "example" }));
+    await expect(failed).rejects.toThrow("Firecrawl search failed (429): Too Many Requests");
+    await expect(failed).rejects.not.toThrow("provider-secret-value");
+  });
 });

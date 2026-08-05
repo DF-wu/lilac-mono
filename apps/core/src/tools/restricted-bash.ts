@@ -1,9 +1,17 @@
 import { expandTilde } from "@stanley2058/lilac-fs";
-import { createLogger, type CoreConfig } from "@stanley2058/lilac-utils";
+import {
+  createLogger,
+  errorCode,
+  formatTaggedErrorForLog,
+  opaqueErrorMessage,
+  type CoreConfig,
+} from "@stanley2058/lilac-utils";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { posix as posixPath } from "node:path";
 import { Readable } from "node:stream";
+import { z } from "zod";
+import { Result, TaggedError, type Panic, type Result as ResultType } from "better-result";
 
 import {
   Bash,
@@ -21,10 +29,17 @@ import {
 } from "just-bash";
 
 import type { ToolResultArtifactStore } from "../artifacts/tool-result-artifact-store";
+import { projectRuntimeError } from "../runtime/error-format";
 import { resolveRestrictedSessionTmpDir } from "../shared/attachment-utils";
 import { parseSshCwdTarget } from "../ssh/ssh-cwd";
-import { withLimitedBashOutput, type BashToolInput, type BashToolOutput } from "./bash-impl";
+import {
+  withLimitedBashOutput,
+  type BashExecutionError,
+  type BashToolInput,
+  type BashToolOutput,
+} from "./bash-impl";
 import { sanitizeBashOutputText } from "./bash-output-sanitizer";
+import { adaptToolResultToHost, preserveToolPanic } from "./tool-result-adapters";
 
 const WORKSPACE_MOUNT = "/workspace";
 const TMP_MOUNT = "/tmp";
@@ -32,6 +47,103 @@ export const RESTRICTED_BASH_WALL_TIMEOUT_MS = 3 * 60 * 1000;
 const MAX_RESTRICTED_FILE_READ_BYTES = 10 * 1024 * 1024;
 const TOOL_SERVER_BACKEND_URL = process.env.TOOL_SERVER_BACKEND_URL || "http://localhost:8080";
 const logger = createLogger({ module: "restricted-bash" });
+
+class RestrictedBashOperationError extends TaggedError("RestrictedBashOperationError")<{
+  readonly operation: string;
+  readonly cause: unknown;
+  readonly message: string;
+}> {}
+
+async function captureRestrictedBashOperation<T>(params: {
+  readonly operation: string;
+  readonly run: () => Promise<T>;
+}): Promise<ResultType<T, RestrictedBashOperationError>> {
+  const captured = await Result.tryPromise({
+    try: params.run,
+    catch: projectRuntimeError(`Opaque restricted Bash ${params.operation} failure`),
+  });
+  if (captured.status === "error") {
+    const cause = preserveToolPanic(captured.error);
+    return Result.err(
+      new RestrictedBashOperationError({
+        operation: params.operation,
+        cause,
+        message: opaqueErrorMessage(cause, `Restricted Bash failed while ${params.operation}`),
+      }),
+    );
+  }
+  return Result.ok(captured.value);
+}
+
+function captureRestrictedBashSync<T>(params: {
+  readonly operation: string;
+  readonly run: () => Awaited<T>;
+}): ResultType<T, RestrictedBashOperationError> {
+  const captured = Result.try({
+    try: params.run,
+    catch: projectRuntimeError(`Opaque restricted Bash ${params.operation} failure`),
+  });
+  if (captured.status === "error") {
+    const cause = preserveToolPanic(captured.error);
+    return Result.err(
+      new RestrictedBashOperationError({
+        operation: params.operation,
+        cause,
+        message: opaqueErrorMessage(cause, `Restricted Bash failed while ${params.operation}`),
+      }),
+    );
+  }
+  return Result.ok(captured.value);
+}
+
+function signalRestrictedBashFailure(operation: string, message: string): never {
+  return adaptToolResultToHost(
+    Result.err(
+      new RestrictedBashOperationError({
+        operation,
+        cause: new Error(message),
+        message,
+      }),
+    ),
+  );
+}
+
+function captureRestrictedHostPromise<T>(
+  run: () => Promise<T>,
+): Promise<ResultType<T, Error | Panic>> {
+  return Result.tryPromise({
+    try: run,
+    catch: projectRuntimeError("Opaque restricted host operation failure"),
+  });
+}
+
+function restrictedHostErrorCode(cause: Error): string | undefined {
+  return errorCode(cause);
+}
+
+type RestrictedBashTermination = "wall_clock" | "aborted";
+
+function toRestrictedTerminationError(
+  termination: RestrictedBashTermination | undefined,
+  timeoutMs: number,
+): BashExecutionError | undefined {
+  switch (termination) {
+    case "wall_clock":
+      return {
+        type: "timeout",
+        timeoutMs,
+        timeoutKind: "wall_clock",
+        signal: "ABORT",
+      };
+    case "aborted":
+      return {
+        type: "aborted",
+        signal: "ABORT",
+      };
+    case undefined:
+      return undefined;
+  }
+}
 
 type RestrictedBashContext = {
   requestId?: string;
@@ -78,7 +190,7 @@ class RestrictedReadFs implements IFileSystem {
 
   private async assertReadable(pathName: string): Promise<void> {
     if (this.denyOutsideMount && normalizeVirtualPath(pathName) !== "/") {
-      throw accessDenied(pathName);
+      signalRestrictedBashFailure("authorize_read", accessDenied(pathName).message);
     }
     if (!this.hostRoot) return;
     const virtual = normalizeVirtualPath(pathName);
@@ -87,18 +199,25 @@ class RestrictedReadFs implements IFileSystem {
       : virtual.slice(1);
     const candidate = path.resolve(this.hostRoot, relative);
     if (candidate !== this.hostRoot && !candidate.startsWith(`${this.hostRoot}${path.sep}`)) {
-      throw accessDenied(pathName);
+      signalRestrictedBashFailure("authorize_read", accessDenied(pathName).message);
     }
-    const stat = await fs.lstat(candidate).catch((error: unknown) => {
-      if (error instanceof Error && "code" in error && error.code === "ENOENT") return null;
-      throw error;
-    });
-    if (stat?.isFile() && stat.nlink > 1) throw accessDenied(pathName);
+    const inspected = await captureRestrictedHostPromise(() => fs.lstat(candidate));
+    if (inspected.status === "error") {
+      const cause = preserveToolPanic(inspected.error);
+      if (restrictedHostErrorCode(cause) === "ENOENT") return;
+      signalRestrictedBashFailure(
+        "inspect_read_target",
+        opaqueErrorMessage(cause, "Failed to inspect restricted read target"),
+      );
+    }
+    if (inspected.value.isFile() && inspected.value.nlink > 1) {
+      signalRestrictedBashFailure("authorize_read", accessDenied(pathName).message);
+    }
   }
 
   private async assertWritable(pathName: string): Promise<void> {
     if (this.denyOutsideMount || normalizeVirtualPath(pathName) === "/") {
-      throw accessDenied(pathName);
+      signalRestrictedBashFailure("authorize_write", accessDenied(pathName).message);
     }
     if (!this.hostRoot) return;
     const virtual = normalizeVirtualPath(pathName);
@@ -107,13 +226,20 @@ class RestrictedReadFs implements IFileSystem {
       : virtual.slice(1);
     const candidate = path.resolve(this.hostRoot, relative);
     if (candidate !== this.hostRoot && !candidate.startsWith(`${this.hostRoot}${path.sep}`)) {
-      throw accessDenied(pathName);
+      signalRestrictedBashFailure("authorize_write", accessDenied(pathName).message);
     }
-    const stat = await fs.lstat(candidate).catch((error: unknown) => {
-      if (error instanceof Error && "code" in error && error.code === "ENOENT") return null;
-      throw error;
-    });
-    if (stat?.isFile() && stat.nlink > 1) throw accessDenied(pathName);
+    const inspected = await captureRestrictedHostPromise(() => fs.lstat(candidate));
+    if (inspected.status === "error") {
+      const cause = preserveToolPanic(inspected.error);
+      if (restrictedHostErrorCode(cause) === "ENOENT") return;
+      signalRestrictedBashFailure(
+        "inspect_write_target",
+        opaqueErrorMessage(cause, "Failed to inspect restricted write target"),
+      );
+    }
+    if (inspected.value.isFile() && inspected.value.nlink > 1) {
+      signalRestrictedBashFailure("authorize_write", accessDenied(pathName).message);
+    }
   }
 
   async readFile(pathName: string, options?: Parameters<IFileSystem["readFile"]>[1]) {
@@ -153,11 +279,12 @@ class RestrictedReadFs implements IFileSystem {
 
   async exists(pathName: string) {
     if (this.denyOutsideMount && normalizeVirtualPath(pathName) !== "/") return false;
-    try {
-      await this.assertReadable(pathName);
-    } catch (error) {
-      if (error instanceof Error && "code" in error && error.code === "EACCES") return false;
-      throw error;
+    const readable = await captureRestrictedHostPromise(() => this.assertReadable(pathName));
+    if (readable.status === "error") {
+      const cause = preserveToolPanic(readable.error);
+      const message = opaqueErrorMessage(cause, "Restricted path is unavailable");
+      if (message.startsWith("Access denied in restricted mode:")) return false;
+      signalRestrictedBashFailure("authorize_exists", message);
     }
     return await this.inner.exists(pathName);
   }
@@ -217,13 +344,16 @@ class RestrictedReadFs implements IFileSystem {
 
   async symlink(target: string, linkPath: string) {
     await this.assertWritable(linkPath);
-    throw accessDenied(`${linkPath} -> ${target}`);
+    signalRestrictedBashFailure("create_symlink", accessDenied(`${linkPath} -> ${target}`).message);
   }
 
   async link(existingPath: string, newPath: string) {
     await this.assertReadable(existingPath);
     await this.assertWritable(newPath);
-    throw accessDenied(`${newPath} -> ${existingPath}`);
+    signalRestrictedBashFailure(
+      "create_hard_link",
+      accessDenied(`${newPath} -> ${existingPath}`).message,
+    );
   }
 
   async readlink(pathName: string) {
@@ -259,13 +389,47 @@ function parseBooleanLike(value: string): boolean | undefined {
 }
 
 async function readJsonSource(source: string, ctx: CommandContext): Promise<unknown> {
-  if (source === "@-") return JSON.parse(decodeBytesToUtf8(ctx.stdin));
+  if (source === "@-") {
+    return adaptToolResultToHost(decodeRestrictedJson(decodeBytesToUtf8(ctx.stdin)));
+  }
   if (source.startsWith("@")) {
     const rawPath = source.slice(1);
     const resolved = ctx.fs.resolvePath(ctx.cwd, rawPath);
-    return JSON.parse(await ctx.fs.readFile(resolved));
+    return adaptToolResultToHost(decodeRestrictedJson(await ctx.fs.readFile(resolved)));
   }
-  return JSON.parse(source);
+  return adaptToolResultToHost(decodeRestrictedJson(source));
+}
+
+function decodeRestrictedJson(source: string): ResultType<unknown, RestrictedBashOperationError> {
+  const decoded = Result.try({
+    try: () => JSON.parse(source),
+    catch: projectRuntimeError("Opaque restricted Bash JSON parse failure"),
+  });
+  if (decoded.status === "error") {
+    const cause = preserveToolPanic(decoded.error);
+    return Result.err(
+      new RestrictedBashOperationError({
+        operation: "parse_json",
+        cause,
+        message: opaqueErrorMessage(cause, "Invalid JSON input"),
+      }),
+    );
+  }
+  return Result.ok(decoded.value);
+}
+
+function decodeNestedToolInput(
+  value: unknown,
+): ResultType<Record<string, unknown>, RestrictedBashOperationError> {
+  const decoded = z.record(z.string(), z.unknown()).safeParse(value);
+  if (decoded.success) return Result.ok(decoded.data);
+  return Result.err(
+    new RestrictedBashOperationError({
+      operation: "decode_tool_input",
+      cause: decoded.error,
+      message: "Tool input must be a JSON object",
+    }),
+  );
 }
 
 function formatToolOutput(value: unknown): string {
@@ -294,32 +458,45 @@ function buildToolServerHeaders(
 }
 
 async function readHttpErrorMessage(res: Response): Promise<string> {
-  const body = await res.text().catch(() => "");
+  const read = await captureRestrictedBashOperation({
+    operation: "read_http_error",
+    run: () => res.text(),
+  });
+  const body = read.status === "ok" ? read.value : "";
   if (body.trim().length === 0) return `${res.status} ${res.statusText}`.trim();
-  try {
-    const parsed = JSON.parse(body) as unknown;
-    if (parsed && typeof parsed === "object") {
-      const record = parsed as Record<string, unknown>;
-      if (typeof record["message"] === "string") return record["message"];
-      if (typeof record["output"] === "string") return record["output"];
+  const parsed = decodeRestrictedJson(body);
+  if (parsed.status === "ok") {
+    const decoded = z
+      .object({ message: z.string().optional(), output: z.string().optional() })
+      .passthrough()
+      .safeParse(parsed.value);
+    if (decoded.success) {
+      if (decoded.data.message) return decoded.data.message;
+      if (decoded.data.output) return decoded.data.output;
     }
-  } catch {
-    // Keep raw body below.
   }
   return body;
 }
-
-type PrimaryPositional = {
-  field: string;
-  variadic?: boolean;
-};
 
 async function fetchToolHelp(callableId: string, headers: Record<string, string>) {
   const res = await fetch(`${TOOL_SERVER_BACKEND_URL}/help/${encodeURIComponent(callableId)}`, {
     headers,
   });
-  if (!res.ok) throw new Error(await readHttpErrorMessage(res));
-  return (await res.json()) as { primaryPositional?: PrimaryPositional };
+  if (!res.ok) {
+    signalRestrictedBashFailure("fetch_tool_help", await readHttpErrorMessage(res));
+  }
+  const body = await res.json();
+  const decoded = z
+    .object({
+      primaryPositional: z
+        .object({ field: z.string(), variadic: z.boolean().optional() })
+        .optional(),
+    })
+    .safeParse(body);
+  if (!decoded.success) {
+    signalRestrictedBashFailure("decode_tool_help", "Tool help response is invalid");
+  }
+  return decoded.data;
 }
 
 async function buildNestedToolInput(params: {
@@ -337,17 +514,22 @@ async function buildNestedToolInput(params: {
     if (arg === "--stdin" || arg.startsWith("--stdin=")) {
       const value = arg === "--stdin" ? true : parseBooleanLike(arg.slice("--stdin=".length));
       if (value === false) continue;
-      input = JSON.parse(decodeBytesToUtf8(params.ctx.stdin)) as Record<string, unknown>;
+      input = adaptToolResultToHost(
+        decodeNestedToolInput(
+          adaptToolResultToHost(decodeRestrictedJson(decodeBytesToUtf8(params.ctx.stdin))),
+        ),
+      );
       continue;
     }
     if (arg === "--input") {
-      throw new Error(
+      signalRestrictedBashFailure(
+        "parse_tool_input",
         "--input requires a value: --input=@file.json, --input=@-, or --input='<json>'",
       );
     }
     if (arg.startsWith("--input=")) {
       const value = arg.slice("--input=".length);
-      input = (await readJsonSource(value, params.ctx)) as Record<string, unknown>;
+      input = adaptToolResultToHost(decodeNestedToolInput(await readJsonSource(value, params.ctx)));
       continue;
     }
     if (arg === "--") {
@@ -368,7 +550,7 @@ async function buildNestedToolInput(params: {
     const field = kebabToCamelCase(isJson ? rawKey.slice(0, -":json".length) : rawKey);
     if (isJson) {
       if (eq === -1) {
-        throw new Error(`--${field}:json requires a value`);
+        signalRestrictedBashFailure("parse_tool_input", `--${field}:json requires a value`);
       }
       input[field] = await readJsonSource(rawValue, params.ctx);
       continue;
@@ -390,12 +572,14 @@ async function buildNestedToolInput(params: {
       const flagHint = bareFlag
         ? ` Bare --${bareFlag} was parsed as boolean true; if you meant to pass a value, use --${bareFlag}=<value>.`
         : " If you meant to pass a flag value, use --field=<value>.";
-      throw new Error(
+      signalRestrictedBashFailure(
+        "parse_tool_input",
         `Tool '${params.callableId}' does not support positional input.${flagHint} Space-separated flag values are not supported; use --input JSON or stdin for structured input.`,
       );
     }
     if (Object.hasOwn(input, primaryPositional.field)) {
-      throw new Error(
+      signalRestrictedBashFailure(
+        "parse_tool_input",
         `Primary positional conflicts with an existing '${primaryPositional.field}' value from flags or JSON input`,
       );
     }
@@ -405,7 +589,10 @@ async function buildNestedToolInput(params: {
     }
 
     if (positionals.length > 1) {
-      throw new Error(`Tool '${params.callableId}' accepts at most one positional argument`);
+      signalRestrictedBashFailure(
+        "parse_tool_input",
+        `Tool '${params.callableId}' accepts at most one positional argument`,
+      );
     }
     input[primaryPositional.field] = positionals[0] ?? "";
   }
@@ -418,10 +605,12 @@ function createToolsCommand(context: RestrictedBashContext) {
     const headers = buildToolServerHeaders(context, ctx.cwd);
     const [first, ...rest] = args;
 
-    try {
+    const runToolsCommand = async (): Promise<ExecResult> => {
       if (!first || first === "--list") {
         const res = await fetch(`${TOOL_SERVER_BACKEND_URL}/list`, { headers });
-        if (!res.ok) throw new Error(await readHttpErrorMessage(res));
+        if (!res.ok) {
+          signalRestrictedBashFailure("list_tools", await readHttpErrorMessage(res));
+        }
         return { stdout: formatToolOutput(await res.json()), stderr: "", exitCode: 0 };
       }
 
@@ -445,16 +634,27 @@ function createToolsCommand(context: RestrictedBashContext) {
         headers,
         body: JSON.stringify({ callableId, input }),
       });
-      if (!res.ok) throw new Error(await readHttpErrorMessage(res));
-      const payload = (await res.json()) as { isError: boolean; output: unknown };
+      if (!res.ok) {
+        signalRestrictedBashFailure("call_tool", await readHttpErrorMessage(res));
+      }
+      const decoded = z
+        .object({ isError: z.boolean(), output: z.unknown() })
+        .safeParse(await res.json());
+      if (!decoded.success) {
+        signalRestrictedBashFailure("decode_tool_result", "Tool call response is invalid");
+      }
+      const payload = decoded.data;
       if (payload.isError) {
         return { stdout: "", stderr: formatToolOutput(payload.output), exitCode: 1 };
       }
       return { stdout: formatToolOutput(payload.output), stderr: "", exitCode: 0 };
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      return { stdout: "", stderr: `${message}\n`, exitCode: 1 };
-    }
+    };
+    const executed = await captureRestrictedBashOperation({
+      operation: "run_tools_command",
+      run: runToolsCommand,
+    });
+    if (executed.status === "ok") return executed.value;
+    return { stdout: "", stderr: `${executed.error.message}\n`, exitCode: 1 };
   });
 }
 
@@ -466,7 +666,7 @@ function resolveRestrictedCwd(input: {
   if (!input.cwd) return WORKSPACE_MOUNT;
   const parsed = parseSshCwdTarget(input.cwd);
   if (parsed.kind === "ssh") {
-    throw new Error("Restricted bash does not allow SSH cwd targets");
+    signalRestrictedBashFailure("resolve_cwd", "Restricted bash does not allow SSH cwd targets");
   }
 
   const expanded = path.resolve(expandTilde(parsed.cwd ?? input.cwd));
@@ -491,7 +691,10 @@ function resolveRestrictedCwd(input: {
   if (input.cwd === WORKSPACE_MOUNT || input.cwd.startsWith(`${WORKSPACE_MOUNT}/`))
     return input.cwd;
 
-  throw new Error("Restricted bash cwd is outside the approved workspace and session temp roots");
+  signalRestrictedBashFailure(
+    "resolve_cwd",
+    "Restricted bash cwd is outside the approved workspace and session temp roots",
+  );
 }
 
 async function createRestrictedBash(params: {
@@ -507,7 +710,10 @@ async function createRestrictedBash(params: {
       !workspaceStats.isDirectory() ||
       (await fs.realpath(params.workspaceRoot)) !== params.workspaceRoot
     ) {
-      throw new Error("Restricted writable workspace must be a canonical real directory");
+      signalRestrictedBashFailure(
+        "create_runtime",
+        "Restricted writable workspace must be a canonical real directory",
+      );
     }
   }
 
@@ -624,13 +830,14 @@ export async function executeRestrictedBash(
   const workspaceRoot = path.resolve(expandTilde(options.workspaceRoot ?? process.cwd()));
   const sessionTmpDir = resolveRestrictedSessionTmpDir(context.sessionId);
 
-  let restrictedCwd: string;
-  try {
-    restrictedCwd = resolveRestrictedCwd({ cwd, workspaceRoot, sessionTmpDir });
-  } catch (error) {
+  const resolvedCwd = captureRestrictedBashSync({
+    operation: "resolve_cwd",
+    run: () => resolveRestrictedCwd({ cwd, workspaceRoot, sessionTmpDir }),
+  });
+  if (resolvedCwd.status === "error") {
     return {
       stdout: "",
-      stderr: error instanceof Error ? error.message : String(error),
+      stderr: resolvedCwd.error.message,
       exitCode: -1,
       executionError: {
         type: "blocked",
@@ -638,14 +845,15 @@ export async function executeRestrictedBash(
       },
     };
   }
+  const restrictedCwd = resolvedCwd.value;
 
   const wallClockTimeoutMs = Math.min(
     timeoutMs ?? RESTRICTED_BASH_WALL_TIMEOUT_MS,
     RESTRICTED_BASH_WALL_TIMEOUT_MS,
   );
   const controller = new AbortController();
-  let termination: "wall_clock" | "aborted" | undefined;
-  const terminate = (reason: "wall_clock" | "aborted") => {
+  let termination: RestrictedBashTermination | undefined;
+  const terminate = (reason: RestrictedBashTermination) => {
     if (termination) return;
     termination = reason;
     controller.abort();
@@ -661,7 +869,13 @@ export async function executeRestrictedBash(
     else options.abortSignal.addEventListener("abort", abortListener, { once: true });
   }
 
-  try {
+  const runRestrictedExecution = async (): Promise<BashToolOutput> => {
+    // just-bash temporarily locks down dynamic constructors while executing a script.
+    // Initialize the Result adapter before entering that host-controlled section.
+    await captureRestrictedBashOperation({
+      operation: "initialize_result_adapter",
+      run: () => Promise.resolve(),
+    });
     const bash = await getRestrictedBash({
       requestId: context.requestId,
       workspaceRoot,
@@ -675,27 +889,12 @@ export async function executeRestrictedBash(
     });
     clearTimeout(timeout);
     options.abortSignal?.removeEventListener("abort", abortListener);
+    const executionError = toRestrictedTerminationError(termination, wallClockTimeoutMs);
     const output: BashToolOutput = {
       stdout: sanitizeBashOutputText(result.stdout),
       stderr: sanitizeBashOutputText(result.stderr),
       exitCode: result.exitCode,
-      ...(termination === "wall_clock"
-        ? {
-            executionError: {
-              type: "timeout",
-              timeoutMs: wallClockTimeoutMs,
-              timeoutKind: "wall_clock",
-              signal: "ABORT",
-            },
-          }
-        : termination === "aborted"
-          ? {
-              executionError: {
-                type: "aborted",
-                signal: "ABORT",
-              },
-            }
-          : {}),
+      ...(executionError ? { executionError } : {}),
     };
     const outputConfig = options.outputConfig ?? {
       maxPreviewBytes: 40 * 1024,
@@ -713,12 +912,17 @@ export async function executeRestrictedBash(
       context.requestId &&
       options.toolCallId
     ) {
-      try {
-        artifactUri = (
-          await options.artifacts.createFromStream({
-            sessionId: context.sessionId,
-            requestId: context.requestId,
-            toolCallId: options.toolCallId,
+      const artifacts = options.artifacts;
+      const sessionId = context.sessionId;
+      const requestId = context.requestId;
+      const toolCallId = options.toolCallId;
+      const created = await captureRestrictedBashOperation({
+        operation: "persist_artifact",
+        run: () =>
+          artifacts.createFromStream({
+            sessionId,
+            requestId,
+            toolCallId,
             toolName: "bash",
             source: Readable.from([
               "--- stdout ---\n",
@@ -729,14 +933,22 @@ export async function executeRestrictedBash(
             ]),
             ttlMs: outputConfig.artifactTtlMs,
             maxBytesPerSession: outputConfig.artifactMaxBytesPerSession,
-          })
-        ).uri;
-      } catch (error) {
+          }),
+      });
+      if (created.status === "error") {
         logger.warn("tool.artifact.write_failed", {
           toolName: "bash",
-          error: error instanceof Error ? error.message : String(error),
+          ...formatTaggedErrorForLog(created.error),
         });
-        artifactUri = undefined;
+      } else {
+        const artifact = created.value;
+        if (artifact.status === "ok") artifactUri = artifact.value.uri;
+        else {
+          logger.warn("tool.artifact.write_failed", {
+            toolName: "bash",
+            ...formatTaggedErrorForLog(artifact.error),
+          });
+        }
       }
     }
     return withLimitedBashOutput(output, {
@@ -746,32 +958,29 @@ export async function executeRestrictedBash(
       originalStdoutBytes: Buffer.byteLength(output.stdout, "utf8"),
       originalStderrBytes: Buffer.byteLength(output.stderr, "utf8"),
     });
-  } catch (error) {
-    return {
-      stdout: "",
-      stderr: error instanceof Error ? error.message : String(error),
-      exitCode: -1,
-      executionError:
-        termination === "wall_clock"
-          ? {
-              type: "timeout",
-              timeoutMs: wallClockTimeoutMs,
-              timeoutKind: "wall_clock",
-              signal: "ABORT",
-            }
-          : termination === "aborted"
-            ? {
-                type: "aborted",
-                signal: "ABORT",
-              }
-            : {
-                type: "exception",
-                phase: "unknown",
-                message: error instanceof Error ? error.message : String(error),
-              },
-    };
+  };
+  let executed: ResultType<BashToolOutput, RestrictedBashOperationError>;
+  try {
+    executed = await captureRestrictedBashOperation({
+      operation: "execute",
+      run: runRestrictedExecution,
+    });
   } finally {
     clearTimeout(timeout);
     options.abortSignal?.removeEventListener("abort", abortListener);
   }
+  if (executed.status === "error") {
+    const executionError = toRestrictedTerminationError(termination, wallClockTimeoutMs) ?? {
+      type: "exception" as const,
+      phase: "unknown" as const,
+      message: executed.error.message,
+    };
+    return {
+      stdout: "",
+      stderr: executed.error.message,
+      exitCode: -1,
+      executionError,
+    };
+  }
+  return executed.value;
 }

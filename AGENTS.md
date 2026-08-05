@@ -7,7 +7,7 @@
 - Markdown plans/todos in `plan/*`.
 - Project mental model / terminology: search `PROJECT.md`.
 - `ref/` contains vendored/reference projects. Treat as read-only references.
-- Treat project as greenfield, breaking changes are usually ok. Consult with user whether to include backwards compatibility when introducing breaking changes.
+- Treat private internal APIs as greenfield and generally free to break. Preserve existing wire, persisted-data, filesystem-tool, and plugin contracts unless a separate compatibility change is explicitly approved.
 
 ## Finding Type Definitions (Bun + symlinks)
 
@@ -73,24 +73,91 @@ Before wrapping up any task that changes code/config/docs, run lint + format che
 - `bun run lint:fix`
 - `bun run fmt`
 
+### Architecture enforcement
+
+- `scripts/architecture/manifest.ts` is the catalog of registered boundary decoders, projections, persistence codecs, compatibility outputs, Panic sites, and exception adapters. Use exact `module#exportName` identities for symbol-owned registrations and exact module paths for module registries. Add a reason only when that registration schema requires one; broad module or path exemptions are not accepted.
+- Add or change exception mechanics in the owning workspace's `exceptionAdapters`. The global approval catalog is derived from those registrations; review the derived callable, external API, direction, syntax, provenance, relationship, and reason, then update `APPROVED_EXCEPTION_ADAPTER_CATALOG_SHA256` and focused tests. Do not hand-maintain a second approval entry, and do not treat catalog membership as review of the adapter or external contract.
+- `bun run lint:architecture` runs the semantic checker and production syntax gate. `bun run test:architecture`, `bun run test:lint-rules`, and `bun run typecheck:architecture` cover their fixtures and typechecking. Root `lint`, `test:all`, and `typecheck` include these checks. The permanent gate has no baseline, advisory, inventory-expansion, or migration-status path; fix every finding or add the exact reviewed registration the manifest schema calls for.
+
 ## Code Style Guidelines (TypeScript)
 
 ### Types (important)
 
-- ALWAYS prefer `zod` over manual type assertions/narrowing.
 - **No `any`** and **no `as any`**.
-  - If you must bridge unknown data, use `unknown` + narrowing.
-  - Prefer using `zod` schemas to parse/validate `unknown` at boundaries (tool inputs, JSON/YAML, external APIs) when possible.
-  - Prefer user-defined type guards:
-    - `function isFoo(x: unknown): x is Foo { ... }`
-- Prefer type narrowing over casting (`as Foo`) when possible.
 - Prefer unions and discriminated unions for error/results.
-- Avoid erasing discriminated unions by narrowing to generic shapes on values that are already strongly typed; prefer checking the discriminant (`part.type === "tool-result"`) or use a type guard that returns the precise union member.
-- Never introduce new `isRecord` helpers, use centralized utils instead.
-- Avoid `as unknown as SomeType` casts that effectively act like `as any` (they hide concrete types and break narrowing). Prefer proper narrowing, precise type guards, or compiler-assisted inspection (e.g. typehint) to find the real type.
 - Prefer `Record<string, T>` to `{ [k: string]: T }`.
 - Prefer `readonly T[]` when you don’t mutate.
 - Use `satisfies` when validating object shapes without widening.
+
+### Trust boundaries and runtime validation
+
+- Keep `unknown` at real trust boundaries. Decode it immediately and return a typed value.
+- Do not accept `unknown` in an internal function merely because its caller received external data. Decode in the caller's boundary adapter and type the internal parameter.
+- Decode again across each process, wire, persistence, plugin, or SDK boundary.
+- Use Zod for rich external structures. Validate the complete envelope and every payload field used after parsing.
+- Do not call `parse` or `safeParse` in ordinary service, domain, orchestration, or render functions. Use a registered boundary decoder, projection, or persistence codec; domain constructors accept typed values.
+- Keep boundary schemas and `z.output` types together. Use `z.input` explicitly when input and output differ.
+- Do not write generic `parseJson<T>` helpers that establish `T` only through an assertion.
+- Persisted-data codecs must explicitly handle valid current data, supported legacy data, unsupported versions, malformed serialization, and corrupt fields.
+
+### Persistence and SQLite
+
+- A persisted codec returns explicit provenance for successful reads: `current`, `migrated`, or `missing-defaulted`. Keep unsupported versions, malformed serialization, and corrupt fields as distinct owned errors; do not collapse these outcomes into absence or a generic parse failure.
+- Reads must not rewrite persisted data as a side effect of decoding or migration. Perform upgrades only through an explicit write or migration operation with its own failure contract.
+- Route Result-returning SQLite transactions through the registered adapter. The raw driver callback returns only the success value and uses the adapter's private rollback sentinel to escape an `Err`; the sentinel must never cross the adapter boundary.
+- In SQLite adapters, preserve `Panic` by exact `Panic.is` classification, map only recognized driver failures through the exact registered classifier, and rethrow every unrecognized exception unchanged.
+- Cleanup failures are expected values: cleanup `Err` wins after successful work, and a domain-owned combined error preserves both failures when work and cleanup fail. A rollback failure that leaves atomicity unknown is a `Panic`.
+- Persist state transitions and their outbox records in the same transaction. Never expose committed state without its corresponding durable publication intent, or publish an outbox record for state that did not commit.
+
+### Presentation boundaries
+
+- Keep third-party and otherwise open protocol values inside one registered adapter. The adapter validates or inspects the external value and returns a closed local projection; renderers and transcript builders accept only that projection.
+- Projection lifecycle unions must represent every supported state explicitly, including pending, active, approval, success, error, denied, and cancelled. Renderers exhaustively switch over those local states without a default arm.
+- Normalize unknown future protocol variants to an explicit bounded fallback such as `unsupported` or `unknown-tool` in the adapter. Do not pass raw payloads, parser functions, decoder functions, or `unknown` into presentation modules.
+- Type-only imports of closed projection contracts are allowed in renderers. Runtime imports or calls of projection/decoder boundaries are not; orchestration invokes the adapter before crossing the renderer API.
+
+```ts
+// Open external protocol edge: raw SDK variants are handled only here.
+function projectExternalChunk(chunk: ExternalUiChunk): ProjectedChunk {
+  switch (chunk.type) {
+    case "text-delta":
+      return { kind: "text", text: chunk.delta };
+    case "tool-output":
+      return { kind: "tool", projection: projectToolObservation(chunk.observation) };
+    default:
+      return { kind: "unsupported", chunkType: boundedChunkType(chunk) };
+  }
+}
+
+// Closed presentation edge: no SDK value, parser, decoder, or unknown payload is reachable.
+function renderProjectedChunk(chunk: ProjectedChunk): RenderEntry | undefined {
+  switch (chunk.kind) {
+    case "text":
+      return { kind: "text", text: chunk.text };
+    case "tool":
+      return renderToolProjection(chunk.projection);
+    case "unsupported":
+      return undefined;
+  }
+}
+```
+
+### Predicates and unions
+
+- Use `isX` for semantic predicates over typed values or exact capability checks.
+- Do not use a partial `isX(value: unknown): value is RichType` guard. Use a complete schema-backed decoder when downstream code relies on a rich structure.
+- For project-owned discriminated unions, prefer direct discriminant checks, exhaustive switches, or precise `Extract`-based predicates.
+- Never add a local `isRecord`; use the centralized utility only for small boundary inspections.
+- Do not write nested ternaries. Extract the decision or use a switch.
+- Treat project-owned unions as closed and handle every member with an exhaustive switch or exhaustive typed map. Do not hide an unhandled member behind a silent `default`, generic fallback, or final ternary arm.
+- Treat third-party/open protocols as open only in their adapter. Normalize unknown variants to an explicit local fallback before internal use.
+
+### Assertions
+
+- Never cast `unknown` to a structured domain type and never use `as unknown as T`.
+- A cast is not a substitute for boundary validation or a typed function signature.
+- Assertions are allowed only for documented representation-preserving bridges where the source is already typed and TypeScript cannot express the relationship.
+- Prefer fixing producer and consumer signatures over adding a cast or guard.
 
 ### Imports
 
@@ -106,16 +173,144 @@ Before wrapping up any task that changes code/config/docs, run lint + format che
 - Types/interfaces/classes: `PascalCase`.
 - Constants: `UPPER_SNAKE_CASE`.
 
-### Error handling
+### Errors as values
 
-- Convert unknown caught values safely:
-  - e.g., `const msg = e instanceof Error ? e.message : String(e)`
-  - For known error shapes, ensure logged error message is informative and traceable.
-- Avoid swallowing errors silently.
-- For library-like code:
-  - Throw for programmer/configuration errors.
-  - For runtime/IO failures, either throw with context or return a typed error object.
-- Avoid leaking secrets in logs; redact tokens/keys when printing command/env data.
+- Return expected failures as `Result<T, E>` or `Promise<Result<T, E>>`; do not throw or reject them.
+- Use `better-result` directly. The root catalog pins the exact version and every importing workspace declares `"better-result": "catalog:"`.
+- Define expected error variants in the owning domain's vocabulary. Prefer `TaggedError` variants with stable `_tag` discriminants over strings or generic `Error`.
+- Instantiate a `TaggedError` and return it with `Result.err`; never throw it.
+- Catch an external exception only in the smallest immediate adapter and map it to a specific typed error. Do not pass `unknown`, `UnhandledException`, SDK errors, or driver errors to consumers.
+- Use `Result.gen` and `Result.await` for multi-step linear workflows. Keep effects in named Result-returning functions and generator bodies declarative.
+- Use direct `result.status` branching for one or two steps. Handle or translate the complete error union at the next policy boundary.
+- Do not use `unwrap`, unsafe Result codecs, or generic `Result.try`/`tryPromise` in production flow.
+- Keep Result callbacks total. Capture throwing or rejecting operations before passing values into combinators, collection helpers, or a Result generator.
+- For a stream that can fail after yielding data, use `AsyncIterable<Result<TChunk, TTerminalError>>`; yield one terminal Err and close rather than rejecting for an expected failure.
+- Use Panic only for an individually registered unrecoverable defect or hard invariant. Never convert a Panic to an ordinary Err.
+- Do not wrap total helpers in Result or flatten meaningful state-machine outcomes such as cancelled, stale, expired, or skipped into generic success/error.
+- Do not serialize `better-result` objects or TaggedErrors onto existing contracts. Map them to the existing wire, storage, tool, or plugin representation at its compatibility adapter.
+- Never pass a TaggedError to implicit `JSON.stringify` or generic structured logging because `toJSON()` includes `cause`. Use `formatTaggedErrorForLog(error)` and log only its redacted projection plus explicitly safe context fields.
+- Avoid leaking secrets in logs; redact tokens and keys when printing command or environment data.
+
+Compact positive patterns:
+
+```ts
+class ConfigMissing extends TaggedError("ConfigMissing")<{
+  readonly configPath: string;
+  readonly message: string;
+}> {}
+
+class ConfigReadFailed extends TaggedError("ConfigReadFailed")<{
+  readonly configPath: string;
+  readonly cause: unknown;
+  readonly message: string;
+}> {}
+
+class ConfigInvalid extends TaggedError("ConfigInvalid")<{
+  readonly message: string;
+}> {}
+
+// Domain failure: construct the owned variant and return it as a value.
+return Result.err(
+  new ConfigMissing({ configPath, message: `Configuration not found at ${configPath}` }),
+);
+
+// Immediate external adapter: preserve Panic and map every other thrown value.
+return Result.tryPromise({
+  try: () => readTextFile(configPath),
+  catch: (cause) => {
+    if (Panic.is(cause)) throw cause;
+    return new ConfigReadFailed({ configPath, cause, message: "Configuration read failed" });
+  },
+});
+
+// One-step flow: better-result 3.0 statuses are "ok" and "error".
+const loaded = await loadConfig(configPath);
+if (loaded.status === "error") return Result.err(loaded.error);
+return Result.ok(loaded.value.endpoint);
+
+// Linear flow: keep effects named and await Result-returning promises explicitly.
+return Result.gen(async function* () {
+  const text = yield* Result.await(readConfigText(configPath));
+  const config = yield* Result.await(decodeConfigText(text));
+  return Result.ok(config.endpoint);
+});
+
+// Policy boundary: map success and every member of the closed error union.
+function toDeliveryDisposition(
+  result: ResultType<Config, ConfigMissing | ConfigReadFailed | ConfigInvalid>,
+): "commit" | "park-pending" | "dead-letter" {
+  if (result.status === "ok") return "commit";
+  switch (result.error._tag) {
+    case "ConfigMissing":
+    case "ConfigReadFailed":
+      return "park-pending";
+    case "ConfigInvalid":
+      return "dead-letter";
+  }
+}
+
+// Logging boundary: pass only the redacted projection and approved context.
+logger.warn("Configuration load failed", {
+  configPath,
+  ...formatTaggedErrorForLog(configError),
+});
+```
+
+### Framework edges
+
+- `try/finally` is allowed for cleanup; catch clauses are restricted to registered adapters and defect supervisors.
+- A result-to-framework adapter may signal an exception only when the host contract requires rollback, delivery parking, stream termination, or callback failure.
+- SQLite transaction bodies must not return Err after partial writes unless a transaction adapter turns that Err into a private rollback sentinel and converts it back immediately outside.
+- Event handlers return typed delivery Results. Subscription policy maps each error to commit, park-pending, dead-letter, or stop; handlers do not acknowledge messages directly.
+- Cancellation is a typed expected result. Capture external abort rejections using the exact owned `AbortSignal`; do not classify arbitrary errors solely by an `AbortError` name.
+- If `Result.tryPromise` stops an aborted retry delay, return its latest Err rather than synthesizing cancellation. When cancellation must remain distinct, use a cancellation-aware adapter that checks the owned signal around every attempt and delay, or do not use built-in retry.
+- Expected cleanup returns Result explicitly: cleanup Err wins after a successful main operation; if both fail, return a domain-owned combined failure preserving both. A rollback failure that leaves atomicity unknown is a Panic. Do not put expected throwing cleanup in a Result generator's `finally` block.
+
+### Event bus delivery
+
+- `LILAC_EVENTS` in `packages/event-bus/lilac-spec.ts` is the single event declaration. Its type, family, topic/key descriptors, payload schema, codec, request scope, and typed projections must remain derived rather than repeated in the architecture manifest or decoder dispatch.
+- `LilacBus.publish` provides compile-time producer typing only; it does not establish trust at a receiver in another process or reading persisted data.
+- The external Redis/SuperJSON boundary yields `Message<unknown>`. `createLilacBus` must decode the complete message with `decodeLilacMessageForTopic`, which dispatches through `lilacEventCodecRegistry`, before a typed handler runs. Do not replace this receiver validation with an assertion.
+- A `subscribeTopic` handler returns `Promise<Result<void, OwnedErrorUnion>>`. It does not commit, acknowledge, or choose transport behavior; `Ok` commits and the exhaustive delivery policy handles every owned error.
+- `park-pending` leaves a durable work-mode entry in the Redis PEL for manual recovery. It is not retry and does not schedule reclamation or redelivery.
+- `dead-letter` durably accepts the dead-letter record before acknowledging the source entry. Failed acceptance leaves work-mode delivery pending or stops tail delivery.
+- `Panic`, thrown/rejected defects, invalid handler Results, and invalid policy outputs bypass ordinary delivery policy and go to defect supervision.
+
+```ts
+// Producer typing does not validate data later read from Redis.
+await producerBus.publish(lilacEventTypes.CmdRequestMessage, requestData, publishOptions);
+
+// createLilacBus decodes raw Message<unknown> before typed delivery.
+const consumerBus = createLilacBus(rawBus, deliveryOptions);
+
+type RequestDeliveryError =
+  | RequestAlreadyHandled
+  | RequestDependencyUnavailable
+  | RequestInvalid
+  | RequestConsumerStopping;
+
+async function handleRequest(
+  message: DecodedLilacMessageForTopic<"cmd.request">,
+): Promise<ResultType<void, RequestDeliveryError>> {
+  // Expected failures return an owned Err; subscribeTopic owns acknowledgement.
+  return Result.ok(undefined);
+}
+
+function requestDeliveryPolicy(error: RequestDeliveryError): DeliveryDisposition {
+  switch (error._tag) {
+    case "RequestAlreadyHandled":
+      return "commit";
+    case "RequestDependencyUnavailable":
+      return "park-pending";
+    case "RequestInvalid":
+      return "dead-letter";
+    case "RequestConsumerStopping":
+      return "stop";
+  }
+}
+
+await consumerBus.subscribeTopic("cmd.request", options, handleRequest, requestDeliveryPolicy);
+```
 
 ## Core Config
 

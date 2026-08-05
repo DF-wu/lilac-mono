@@ -5,11 +5,13 @@ import path from "node:path";
 import { asSchema, jsonSchema, tool } from "ai";
 import type { LilacBus } from "@stanley2058/lilac-event-bus";
 import { parseCoreConfigV1ToUniversal, type CoreConfig } from "@stanley2058/lilac-utils";
+import { Panic, Result } from "better-result";
 
-import { createCoreToolPluginManager } from "../../src/plugins";
+import { createCoreToolPluginManager as createCoreToolPluginManagerResult } from "../../src/plugins";
+import { decodeCoreToolRequestMetadata } from "../../src/plugins/builtin/local-tools";
 import { McpRegistry } from "../../src/mcp";
 import { catalogToolStableId } from "../../src/mcp/catalog-identity";
-import type { ConversationThreadService } from "../../src/conversation/thread-service";
+import type { ConversationThreadToolService } from "../../src/conversation/thread-service";
 import type { DiscoveryService } from "../../src/discovery/discovery-service";
 import type { SurfaceAdapter } from "../../src/surface/adapter";
 import {
@@ -20,6 +22,20 @@ import {
   mcpToolDefinition,
   stdioDefinition,
 } from "../mcp/fixtures/registry-fixture";
+
+function createCoreToolPluginManager(
+  params: Parameters<typeof createCoreToolPluginManagerResult>[0],
+) {
+  const manager = createCoreToolPluginManagerResult(params);
+  return {
+    ...manager,
+    async buildLevel1Toolset(buildParams: Parameters<typeof manager.buildLevel1ToolsetResult>[0]) {
+      const built = await manager.buildLevel1ToolsetResult(buildParams);
+      if (built.status === "error") throw new Error(built.error.message, { cause: built.error });
+      return built.value;
+    },
+  };
+}
 
 function isAsyncIterable(value: unknown): value is AsyncIterable<unknown> {
   return (
@@ -182,6 +198,27 @@ describe("core tool plugin manager", () => {
     tmpRoot = null;
   });
 
+  it("preserves request metadata when direct attachment support is false", () => {
+    const onSubagentDelegate = async () => ({
+      runId: "run:metadata-decode",
+      completion: Promise.resolve({ status: "resolved" as const, finalText: "" }),
+      cancel: async () => {},
+    });
+    const onActivity = () => {};
+
+    const decoded = decodeCoreToolRequestMetadata({
+      readFileDirectAttachmentSupported: false,
+      controlCapability: "level-2-control-capability",
+      onSubagentDelegate,
+      onActivity,
+    });
+
+    expect(decoded.readFileDirectAttachmentSupported).toBe(false);
+    expect(decoded.controlCapability).toBe("level-2-control-capability");
+    expect(decoded.onSubagentDelegate).toBe(onSubagentDelegate);
+    expect(decoded.onActivity).toBe(onActivity);
+  });
+
   it("preserves built-in Level 1 tool exposure across profiles and edit modes", async () => {
     tmpRoot = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-core-plugin-manager-"));
     const dataDir = path.join(tmpRoot, "data");
@@ -192,7 +229,7 @@ describe("core tool plugin manager", () => {
         bus: {} as LilacBus,
         adapter: {} as SurfaceAdapter,
         discovery: {} as DiscoveryService,
-        conversationThreads: {} as ConversationThreadService,
+        conversationThreads: {} as ConversationThreadToolService,
         config: cfg,
       },
       dataDir,
@@ -305,7 +342,7 @@ describe("core tool plugin manager", () => {
         bus: {} as LilacBus,
         adapter: {} as SurfaceAdapter,
         discovery: {} as DiscoveryService,
-        conversationThreads: {} as ConversationThreadService,
+        conversationThreads: {} as ConversationThreadToolService,
         config: cfg,
       },
       dataDir,
@@ -368,6 +405,86 @@ describe("core tool plugin manager", () => {
     });
 
     expect(getToolDescription(toolset.tools, "read_file")).toContain(
+      "calling read_file attaches the original file to your context for native visual or document analysis",
+    );
+  });
+
+  it("retains delegation and Level 2 metadata when direct attachment support is false", async () => {
+    tmpRoot = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-core-plugin-manager-"));
+    const dataDir = path.join(tmpRoot, "data");
+    const cfg = testConfig({});
+    let delegationCount = 0;
+    const activitySources: string[] = [];
+    const requestContext = {
+      requestId: "req:false-attachment-metadata",
+      sessionId: "test-session",
+      requestClient: "test",
+      subagentDepth: 0,
+      subagentProfile: "primary" as const,
+      metadata: {
+        readFileDirectAttachmentSupported: false,
+        controlCapability: "level-2-control-capability",
+        onSubagentDelegate: async () => {
+          delegationCount += 1;
+          return {
+            runId: "run:false-attachment-metadata",
+            completion: Promise.resolve({ status: "resolved" as const, finalText: "" }),
+            cancel: async () => {},
+          };
+        },
+        onActivity: (source: "tool" | "subagent") => {
+          activitySources.push(source);
+        },
+      },
+    };
+    const manager = createCoreToolPluginManager({
+      runtime: {
+        bus: {} as LilacBus,
+        config: cfg,
+      },
+      dataDir,
+    });
+
+    await manager.init();
+    await fs.mkdir(dataDir, { recursive: true });
+    const toolset = await manager.buildLevel1Toolset({
+      cwd: dataDir,
+      runProfile: "primary",
+      editingToolMode: "none",
+      subagentDepth: 0,
+      subagentConfig: cfg.agent.subagents!,
+      requestContext,
+    });
+    const executableTools = toolset.tools as Record<
+      string,
+      { execute?: (...args: readonly unknown[]) => unknown }
+    >;
+
+    const bashResult = await resolveExecuteResult(
+      getExecutableTool(executableTools, "bash").execute(
+        { command: 'printf "%s" "$LILAC_CONTROL_CAPABILITY"' },
+        { context: requestContext, toolCallId: "bash-metadata", messages: [] },
+      ),
+    );
+    expect(bashResult).toMatchObject({
+      stdout: "level-2-control-capability",
+      exitCode: 0,
+    });
+    expect(activitySources).toContain("tool");
+
+    const delegationResult = await resolveExecuteResult(
+      getExecutableTool(executableTools, "subagent_delegate").execute(
+        { profile: "explore", task: "Check metadata", mode: "deferred" },
+        { context: requestContext, toolCallId: "delegate-metadata", messages: [] },
+      ),
+    );
+    expect(delegationResult).toMatchObject({
+      ok: true,
+      status: "accepted",
+      workflowRunId: "run:false-attachment-metadata",
+    });
+    expect(delegationCount).toBe(1);
+    expect(getToolDescription(toolset.tools, "read_file")).not.toContain(
       "calling read_file attaches the original file to your context for native visual or document analysis",
     );
   });
@@ -560,7 +677,7 @@ describe("core tool plugin manager", () => {
         bus: {} as LilacBus,
         adapter: {} as SurfaceAdapter,
         discovery: {} as DiscoveryService,
-        conversationThreads: {} as ConversationThreadService,
+        conversationThreads: {} as ConversationThreadToolService,
         config: cfg,
       },
       dataDir,
@@ -625,24 +742,30 @@ describe("core tool plugin manager", () => {
     await writeExternalPlugin({
       dataDir,
       pluginId: "fixture-plugin",
-      entryBody: `import { markBoundedBuiltinOutput } from ${JSON.stringify(new URL("../../src/plugins/types.ts", import.meta.url).href)};
+      entryBody: `import { z } from ${JSON.stringify(import.meta.resolve("zod"))};
+import { defineServerTool } from ${JSON.stringify(new URL("../../../../packages/plugin-runtime/index.ts", import.meta.url).href)};
+import { markAggregateOutputBudgetExempt, markBoundedBuiltinOutput } from ${JSON.stringify(new URL("../../src/plugins/types.ts", import.meta.url).href)};
 export default {
   meta: { id: "fixture-plugin" },
   create() {
     return {
-      level1: [markBoundedBuiltinOutput({
+      level1: [markAggregateOutputBudgetExempt(markBoundedBuiltinOutput({
         name: "fixture_level1",
         createTool() { return { title: "Fixture Level 1", description: "Complete external fixture description", execute() { return { ok: true }; } }; },
         isEnabled() { return true; },
         formatArgs() { return " fixture"; },
-      })],
-      level2: [{
+      }))],
+      level2: [defineServerTool({
         id: "fixture",
-        async init() {},
-        async destroy() {},
-        async list() { return [{ callableId: "fixture.echo", name: "Fixture Echo", description: "Fixture", shortInput: [], input: [] }]; },
-        async call(_callableId, input) { return { echo: input }; },
-      }],
+        callables: ({ callable }) => ({
+          "fixture.echo": callable({
+            name: "Fixture Echo",
+            description: "Fixture",
+            inputSchema: z.object({ text: z.string() }),
+            run: ({ text }) => ({ echo: text }),
+          }),
+        }),
+      })],
     };
   },
 };`,
@@ -687,10 +810,13 @@ export default {
       title: "Fixture Level 1",
       description: "Complete external fixture description",
     });
-    expect(level1.genericOutputNormalizerBypassTools).toContain(
+    expect(level1.genericOutputNormalizerBypassTools).not.toContain(
       "plugin_fixture_plugin_fixture_level1",
     );
     expect(level1.genericOutputNormalizerBypassTools.has("fixture_level1")).toBe(false);
+    expect(level1.aggregateOutputBudgetExemptTools).not.toContain(
+      "plugin_fixture_plugin_fixture_level1",
+    );
     expect(getBatchToolNames(level1.tools)).not.toContain("plugin_fixture_plugin_fixture_level1");
     expect(getBatchToolNames(level1.tools)).not.toContain("batch");
 
@@ -702,6 +828,59 @@ export default {
       )
     ).flat();
     expect(callableIds).toContain("fixture.echo");
+    const fixtureTool = manager.getLevel2Tools().find((tool) => tool.id === "fixture");
+    if (!fixtureTool) throw new Error("missing fixture Level 2 tool");
+    expect(await fixtureTool.call("fixture.echo", { text: "hello" })).toEqual({ echo: "hello" });
+    await expect(fixtureTool.call("fixture.echo", { text: 42 })).rejects.toThrow(
+      "fixture.echo has invalid input.",
+    );
+  });
+
+  it("captures hostile executable metadata getters at the plugin boundary", async () => {
+    tmpRoot = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-core-plugin-manager-"));
+    const dataDir = path.join(tmpRoot, "data");
+    const cfg = testConfig({});
+    await writeExternalPlugin({
+      dataDir,
+      pluginId: "hostile-metadata",
+      entryBody: `const hostile = new Proxy({}, {
+  getPrototypeOf() { throw new Error("hostile prototype trap"); },
+  get() { throw new Error("hostile property trap"); },
+});
+export default {
+  meta: { id: "hostile-metadata" },
+  create() {
+    return { level1: [{
+      name: "hostile_metadata",
+      createTool() {
+        const executable = { execute() {} };
+        Object.defineProperty(executable, "title", { get() { throw hostile; } });
+        return executable;
+      },
+      isEnabled() { return true; },
+    }] };
+  },
+};`,
+    });
+    const manager = createCoreToolPluginManager({ runtime: { config: cfg }, dataDir });
+    const initialized = await manager.init();
+    expect(initialized.status).toBe("ok");
+
+    const built = await manager.buildLevel1ToolsetResult({
+      cwd: dataDir,
+      runProfile: "primary",
+      editingToolMode: "none",
+      subagentDepth: 0,
+      subagentConfig: cfg.agent.subagents!,
+    });
+    expect(built.status).toBe("error");
+    if (built.status === "error") {
+      expect(built.error._tag).toBe("Level1ToolsetBuildFailed");
+      if (built.error._tag === "Level1ToolsetBuildFailed") {
+        expect(built.error.operation).toBe("level1.executableMetadata");
+        expect(built.error.message).toContain("level1.executableMetadata");
+      }
+    }
   });
 
   it("qualifies external registration keys by plugin while preserving raw status names", async () => {
@@ -829,7 +1008,7 @@ export default {
         mcpRegistry: {
           async init() {},
           async reload() {
-            return [];
+            return Result.ok([]);
           },
           getConfigStatus: () => ({ status: "valid" }),
           list: () => [],
@@ -876,6 +1055,9 @@ export default {
     factory.enqueue("shared", client);
     const registry = new McpRegistry({
       configPath: path.join(dataDir, "mcp-config.yaml"),
+      reportFatalError: (error) => {
+        throw error;
+      },
       dependencies: {
         readConfig: async () => configSnapshot(mcpConfig([stdioDefinition("shared")])),
         createClient: factory.create,
@@ -945,7 +1127,7 @@ export default {
         mcpRegistry: {
           async init() {},
           async reload() {
-            return [];
+            return Result.ok([]);
           },
           getConfigStatus: () => ({ status: "valid" }),
           list: () => [],
@@ -1085,5 +1267,71 @@ export default {
     });
     expect(direct.specs.has("plugin_profile_fixture_fixture_write")).toBe(true);
     await enabled.destroy();
+  });
+
+  it("turns malformed Level 1 hook results into a plain Core boundary failure", async () => {
+    tmpRoot = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-core-plugin-manager-"));
+    const dataDir = path.join(tmpRoot, "data");
+    await writeExternalPlugin({
+      dataDir,
+      pluginId: "malformed-level1",
+      entryBody: `export default {
+  meta: { id: "malformed-level1" },
+  create() { return { level1: [{
+    name: "malformed",
+    createTool() { return {}; },
+    isEnabled() { return "yes"; },
+  }] }; },
+};`,
+    });
+    const cfg = testConfig({});
+    const manager = createCoreToolPluginManager({ runtime: { config: cfg }, dataDir });
+    const initialized = await manager.init();
+    expect(initialized.status).toBe("ok");
+
+    await expect(
+      manager.buildLevel1Toolset({
+        cwd: dataDir,
+        runProfile: "primary",
+        editingToolMode: "none",
+        subagentDepth: 0,
+        subagentConfig: cfg.agent.subagents,
+      }),
+    ).rejects.toThrow("Invalid hook result for plugin 'malformed-level1'");
+  });
+
+  it("propagates Panic from a Level 1 hook", async () => {
+    tmpRoot = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-core-plugin-manager-"));
+    const dataDir = path.join(tmpRoot, "data");
+    await writeExternalPlugin({
+      dataDir,
+      pluginId: "panic-level1",
+      entryBody: `import { Panic } from ${JSON.stringify(import.meta.resolve("better-result"))};
+export default {
+  meta: { id: "panic-level1" },
+  create() { return { level1: [{
+    name: "panic",
+    createTool() { return {}; },
+    isEnabled() { throw new Panic({ message: "level1 invariant" }); },
+  }] }; },
+};`,
+    });
+    const cfg = testConfig({});
+    const manager = createCoreToolPluginManager({ runtime: { config: cfg }, dataDir });
+    const initialized = await manager.init();
+    expect(initialized.status).toBe("ok");
+
+    try {
+      await manager.buildLevel1Toolset({
+        cwd: dataDir,
+        runProfile: "primary",
+        editingToolMode: "none",
+        subagentDepth: 0,
+        subagentConfig: cfg.agent.subagents,
+      });
+      throw new Error("expected Panic");
+    } catch (cause) {
+      expect(Panic.is(cause)).toBe(true);
+    }
   });
 });

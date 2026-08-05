@@ -1,3 +1,5 @@
+import { isRecord } from "@stanley2058/lilac-utils";
+
 import type { MsgRef, SurfaceMessage } from "../../types";
 
 import { hasReplyChainPlannerProvider, type SurfaceAdapter } from "../../adapter";
@@ -50,10 +52,6 @@ function getReferenceFromRaw(raw: unknown): {
   return replyReference ?? {};
 }
 
-function hasReplyTargetInRaw(raw: unknown): boolean {
-  return typeof getReferenceFromRaw(raw).messageId === "string";
-}
-
 export function toReplyChainMessage(
   msg: SurfaceMessage,
   opts?: {
@@ -61,12 +59,14 @@ export function toReplyChainMessage(
     authorNameFallback?: string;
   },
 ): ReplyChainMessage {
-  const text =
-    opts?.overrideText !== undefined
-      ? opts.overrideText
-      : msg.text.trim().length > 0
-        ? msg.text
-        : (getForwardSnapshotTextFromRaw(msg.raw) ?? msg.text);
+  const discordRaw = isRecord(msg.raw) && isRecord(msg.raw.discord) ? msg.raw.discord : null;
+  const isChat =
+    discordRaw && typeof discordRaw.isChat === "boolean" ? discordRaw.isChat : undefined;
+  let text = opts?.overrideText;
+  if (text === undefined) {
+    text =
+      msg.text.trim().length > 0 ? msg.text : (getForwardSnapshotTextFromRaw(msg.raw) ?? msg.text);
+  }
 
   return {
     messageId: msg.ref.messageId,
@@ -75,7 +75,8 @@ export function toReplyChainMessage(
     ts: msg.ts,
     text,
     attachments: extractDiscordAttachmentsFromRaw(msg.raw),
-    raw: msg.raw,
+    ...(isChat === undefined ? {} : { isChat }),
+    replyReference: getReferenceFromRaw(msg.raw),
   };
 }
 
@@ -220,7 +221,7 @@ export async function resolveMergeBlockEndingAt(
       message: m,
       authorId: m.userId,
       ts: m.ts,
-      hardBreakBefore: hasReplyTargetInRaw(m.raw),
+      hardBreakBefore: typeof toReplyChainMessage(m).replyReference.messageId === "string",
     })),
   );
   const groupEndingAtTrigger = groups[groups.length - 1] ?? [];
@@ -332,8 +333,7 @@ export async function fetchReplyChainFrom(
 
     groupsNewestToOldest.push(group.map((m) => toReplyChainMessage(m)));
 
-    const first = group[0]!;
-    const ref = getReferenceFromRaw(first.raw);
+    const ref = toReplyChainMessage(group[0]!).replyReference;
     if (!ref.messageId) break;
 
     // Stop if the reference crosses sessions.
@@ -399,7 +399,9 @@ export function mergeChainByDiscordWindow(
       message: m,
       authorId: m.authorId,
       ts: m.ts,
-      hardBreakBefore: hasReplyTargetInRaw(m.raw) || hardBreakBeforeMessageIds.has(m.messageId),
+      hardBreakBefore:
+        typeof m.replyReference.messageId === "string" ||
+        hardBreakBeforeMessageIds.has(m.messageId),
     })),
   );
 

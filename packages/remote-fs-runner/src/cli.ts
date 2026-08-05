@@ -6,11 +6,29 @@ import path from "node:path";
 import { spawn } from "node:child_process";
 
 import {
+  decodeRemoteFsDaemonRequestJson,
+  decodeRemoteFsRequestJson,
+  decodeRemoteRunnerResponseJson,
   FileSystem,
-  type FileEdit,
-  type HashlineEdit,
-  type ReadFileStart,
+  remoteEditResponseSchema,
+  remoteFuzzySearchResponseSchema,
+  remoteGlobResponseSchema,
+  remoteGrepResponseSchema,
+  remoteHealthResponseSchema,
+  remoteReadBytesResponseSchema,
+  remoteReadTextResponseSchema,
+  type RemoteEditResponse,
+  type RemoteFsDaemonRequest,
+  type RemoteFuzzySearchResponse,
+  type RemoteGlobResponse,
+  type RemoteGrepResponse,
+  type RemoteHealthResponse,
+  type RemoteReadBytesResponse,
+  type RemoteReadTextResponse,
+  type RemoteRunnerRequestDecodeError,
+  type RemoteRunnerResponseDecodeError,
 } from "@stanley2058/lilac-fs";
+import { Panic, Result, TaggedError, type Result as ResultType } from "better-result";
 
 declare const PACKAGE_VERSION: string;
 
@@ -18,68 +36,132 @@ const RUNNER_PACKAGE_VERSION = typeof PACKAGE_VERSION === "string" ? PACKAGE_VER
 const DEFAULT_IDLE_MS = 5 * 60 * 1000;
 const STARTUP_TIMEOUT_MS = 15_000;
 const CONNECT_RETRY_MS = 100;
+const SOCKET_RESPONSE_TIMEOUT_MS = 15_000;
 
-type JsonObject = Record<string, unknown>;
+type RemoteFsResponse =
+  | RemoteReadTextResponse
+  | RemoteReadBytesResponse
+  | RemoteGlobResponse
+  | RemoteGrepResponse
+  | RemoteFuzzySearchResponse
+  | RemoteEditResponse
+  | RemoteHealthResponse;
+type ResponseEnvelope = { ok: true; value: RemoteFsResponse } | { ok: false; error: string };
+type ReadTextRequest = Extract<RemoteFsDaemonRequest, { op: "fs.read_text" }>;
+type ReadBytesRequest = Extract<RemoteFsDaemonRequest, { op: "fs.read_bytes" }>;
+type GlobRequest = Extract<RemoteFsDaemonRequest, { op: "fs.glob" }>;
+type GrepRequest = Extract<RemoteFsDaemonRequest, { op: "fs.grep" }>;
+type FuzzySearchRequest = Extract<RemoteFsDaemonRequest, { op: "fs.fuzzy_search" }>;
+type EditRequest = Extract<RemoteFsDaemonRequest, { op: "fs.edit" }>;
+type HealthRequest = Extract<RemoteFsDaemonRequest, { op: "health" }>;
 
-type RequestEnvelope = {
-  op: string;
-  input: JsonObject;
-  denyPaths: string[];
-  cwd: string;
-};
+export class RemoteFsSocketTransportError extends TaggedError("RemoteFsSocketTransportError")<{
+  readonly cause: unknown;
+  readonly message: string;
+}> {}
 
-type ResponseEnvelope = { ok: true; value: unknown } | { ok: false; error: string };
+class RemoteFsStdinReadError extends TaggedError("RemoteFsStdinReadError")<{
+  readonly cause: unknown;
+  readonly message: string;
+}> {}
 
-function isRecord(value: unknown): value is JsonObject {
-  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+export class RemoteFsDaemonSpawnError extends TaggedError("RemoteFsDaemonSpawnError")<{
+  readonly cause: unknown;
+  readonly message: string;
+}> {}
+
+export class RemoteFsRuntimeSetupError extends TaggedError("RemoteFsRuntimeSetupError")<{
+  readonly cause: unknown;
+  readonly code?: string;
+  readonly message: string;
+}> {}
+
+export class RemoteFsDaemonStartupError extends TaggedError("RemoteFsDaemonStartupError")<{
+  readonly message: string;
+}> {}
+
+export class RemoteFsStartupLockCleanupError extends TaggedError(
+  "RemoteFsStartupLockCleanupError",
+)<{
+  readonly lockPath: string;
+  readonly cause: unknown;
+  readonly message: string;
+}> {}
+
+type RemoteFsRequestOperationError =
+  | RemoteFsStdinReadError
+  | RemoteRunnerRequestDecodeError
+  | RemoteFsRuntimeSetupError
+  | RemoteFsSocketTransportError
+  | RemoteRunnerResponseDecodeError
+  | RemoteFsDaemonSpawnError
+  | RemoteFsDaemonStartupError;
+
+export class RemoteFsRequestCleanupCombinedError extends TaggedError(
+  "RemoteFsRequestCleanupCombinedError",
+)<{
+  readonly operationError: RemoteFsRequestOperationError;
+  readonly cleanupError: RemoteFsStartupLockCleanupError;
+  readonly message: string;
+}> {}
+
+type RemoteFsRunRequestError =
+  | RemoteFsRequestOperationError
+  | RemoteFsStartupLockCleanupError
+  | RemoteFsRequestCleanupCombinedError;
+
+function preservePanic(error: Panic): never {
+  Panic.is(error);
+  throw error;
 }
 
-function numberOrUndefined(value: unknown): number | undefined {
-  if (typeof value === "number" && Number.isFinite(value)) return value;
-  if (typeof value === "string" && value.trim().length > 0) {
+function opaqueErrorMessage(error: Error): string {
+  try {
+    return error.message;
+  } catch {
+    return "Opaque remote fs runner failure";
+  }
+}
+
+type ExternalErrorProjection =
+  | { readonly kind: "panic"; readonly panic: Panic }
+  | { readonly kind: "error"; readonly error: Error; readonly code?: string };
+
+function opaqueErrorCause(error: unknown): ExternalErrorProjection {
+  try {
+    if (Panic.is(error)) return { kind: "panic", panic: error };
+    if (error instanceof Error) {
+      const code = "code" in error && typeof error.code === "string" ? error.code : undefined;
+      return { kind: "error", error, code };
+    }
+  } catch (inspectionCause) {
+    if (Panic.is(inspectionCause)) return { kind: "panic", panic: inspectionCause };
+    return { kind: "error", error: new Error("Opaque remote fs runner failure") };
+  }
+  return { kind: "error", error: new Error("Opaque remote fs runner failure") };
+}
+
+async function captureRuntimeOperation<T>(
+  message: string,
+  operation: () => Promise<T>,
+): Promise<ResultType<T, RemoteFsRuntimeSetupError>> {
+  try {
+    return Result.ok(await operation());
+  } catch (caught) {
+    const cause = opaqueErrorCause(caught);
+    if (cause.kind === "panic") preservePanic(cause.panic);
+    return Result.err(
+      new RemoteFsRuntimeSetupError({ cause: cause.error, code: cause.code, message }),
+    );
+  }
+}
+
+function numberOrUndefined(value: string | undefined): number | undefined {
+  if (value && value.trim().length > 0) {
     const parsed = Number(value);
     return Number.isFinite(parsed) ? parsed : undefined;
   }
   return undefined;
-}
-
-function stringArray(value: unknown): string[] {
-  return Array.isArray(value) ? value.map((item) => String(item)) : [];
-}
-
-function ordinaryFileStartOrUndefined(value: unknown): ReadFileStart | undefined {
-  if (!isRecord(value)) return undefined;
-
-  if (value["type"] === "offset") {
-    const offset = value["offset"];
-    return typeof offset === "number" && Number.isFinite(offset)
-      ? { type: "offset", offset }
-      : undefined;
-  }
-  if (value["type"] !== "line") return undefined;
-
-  const line = value["line"];
-  const column = value["column"];
-  if (typeof line !== "number" || !Number.isFinite(line)) return undefined;
-  if (column !== undefined && (typeof column !== "number" || !Number.isFinite(column))) {
-    return undefined;
-  }
-
-  return column === undefined ? { type: "line", line } : { type: "line", line, column };
-}
-
-function parseEnvelope(value: unknown): RequestEnvelope {
-  if (!isRecord(value)) {
-    throw new Error("request must be a JSON object");
-  }
-
-  const input = value["input"];
-  return {
-    op: String(value["op"] ?? ""),
-    input: isRecord(input) ? input : {},
-    denyPaths: stringArray(value["denyPaths"]),
-    cwd: typeof value["cwd"] === "string" ? value["cwd"] : process.cwd(),
-  };
 }
 
 function runtimeBaseDir(): string {
@@ -105,25 +187,38 @@ function fffCacheDir(baseDir = runtimeBaseDir()): string {
   return path.join(baseDir, "fff-cache");
 }
 
-async function ensureRuntimeDir(baseDir = runtimeBaseDir()): Promise<void> {
-  await fs.mkdir(baseDir, { recursive: true, mode: 0o700 });
-  if (process.platform !== "win32") {
-    await fs.chmod(baseDir, 0o700).catch(() => undefined);
+export async function ensureRuntimeDir(
+  baseDir = runtimeBaseDir(),
+): Promise<ResultType<void, RemoteFsRuntimeSetupError>> {
+  return captureRuntimeOperation(
+    `failed to prepare remote fs runtime directory: ${baseDir}`,
+    async () => {
+      await fs.mkdir(baseDir, { recursive: true, mode: 0o700 });
+      if (process.platform !== "win32") await fs.chmod(baseDir, 0o700);
+    },
+  );
+}
+
+async function readStdinText(): Promise<ResultType<string, RemoteFsStdinReadError>> {
+  try {
+    const chunks: Buffer[] = [];
+    for await (const chunk of process.stdin) {
+      chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+    }
+    return Result.ok(Buffer.concat(chunks).toString("utf8"));
+  } catch (caught) {
+    const projected = opaqueErrorCause(caught);
+    if (projected.kind === "panic") preservePanic(projected.panic);
+    return Result.err(
+      new RemoteFsStdinReadError({
+        cause: projected.error,
+        message: "failed to read remote fs CLI stdin",
+      }),
+    );
   }
 }
 
-async function readStdinJson(): Promise<unknown> {
-  const chunks: Buffer[] = [];
-  for await (const chunk of process.stdin) {
-    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
-  }
-
-  const raw = Buffer.concat(chunks).toString("utf8");
-  if (raw.trim().length === 0) return {};
-  return JSON.parse(raw) as unknown;
-}
-
-function writeJson(value: unknown): void {
+function writeJson(value: ResponseEnvelope): void {
   process.stdout.write(JSON.stringify(value));
 }
 
@@ -131,159 +226,163 @@ function writeLine(value: string): void {
   process.stdout.write(`${value}\n`);
 }
 
-function responseError(error: unknown): ResponseEnvelope {
-  return { ok: false, error: error instanceof Error ? error.message : String(error) };
+function responseError(error: { readonly message: string }): ResponseEnvelope {
+  return { ok: false, error: error.message };
 }
 
-function normalizeEditOutput(result: unknown): unknown {
-  if (!isRecord(result)) return result;
-  if (result["success"] === true) {
+function responseSuccess(value: RemoteFsResponse): ResponseEnvelope {
+  return { ok: true, value };
+}
+
+type EditResult =
+  | Awaited<ReturnType<FileSystem["editFile"]>>
+  | Awaited<ReturnType<FileSystem["hashlineEditFile"]>>;
+
+function normalizeEditOutput(result: EditResult): RemoteEditResponse {
+  if (result.success) {
     return {
       success: true,
-      resolvedPath: result["resolvedPath"],
-      oldHash: result["oldHash"],
-      newHash: result["newHash"],
-      changesMade: result["changesMade"],
-      replacementsMade: result["replacementsMade"],
+      resolvedPath: result.resolvedPath,
+      oldHash: result.oldHash,
+      newHash: result.newHash,
+      changesMade: result.changesMade,
+      replacementsMade: result.replacementsMade,
     };
   }
 
   return {
     success: false,
-    resolvedPath: result["resolvedPath"],
-    currentHash: result["currentHash"],
-    error: result["error"],
+    resolvedPath: result.resolvedPath,
+    currentHash: result.currentHash,
+    error: result.error,
   };
 }
 
-export async function handleRequest(envelope: RequestEnvelope): Promise<unknown> {
+export function handleRequest(envelope: ReadTextRequest): Promise<RemoteReadTextResponse>;
+export function handleRequest(envelope: ReadBytesRequest): Promise<RemoteReadBytesResponse>;
+export function handleRequest(envelope: GlobRequest): Promise<RemoteGlobResponse>;
+export function handleRequest(envelope: GrepRequest): Promise<RemoteGrepResponse>;
+export function handleRequest(envelope: FuzzySearchRequest): Promise<RemoteFuzzySearchResponse>;
+export function handleRequest(envelope: EditRequest): Promise<RemoteEditResponse>;
+export function handleRequest(envelope: HealthRequest): Promise<RemoteHealthResponse>;
+export function handleRequest(envelope: RemoteFsDaemonRequest): Promise<RemoteFsResponse>;
+export async function handleRequest(envelope: RemoteFsDaemonRequest): Promise<RemoteFsResponse> {
   const fsTool = new FileSystem(envelope.cwd, {
     denyPaths: envelope.denyPaths,
     fsBackend: "fff",
     fffCacheDir: fffCacheDir(),
   });
-  const input = envelope.input;
 
-  if (envelope.op === "fs.read_text") {
-    const start = ordinaryFileStartOrUndefined(input["start"]);
-    return await fsTool.readFile({
-      path: String(input["path"] ?? ""),
-      start,
-      maxLines: numberOrUndefined(input["maxLines"]),
-      maxCharacters: numberOrUndefined(input["maxCharacters"]),
-      maxBytes: numberOrUndefined(input["maxBytes"]),
-      format:
-        input["format"] === "numbered"
-          ? "numbered"
-          : input["format"] === "hashline"
-            ? "hashline"
-            : "raw",
-    });
-  }
-
-  if (envelope.op === "fs.read_bytes") {
-    const maxBytes = numberOrUndefined(input["maxBytes"]);
-    const result = await fsTool.readFileBytes({
-      path: String(input["path"] ?? ""),
-      maxBytes,
-    });
-    if (!result.success) {
+  switch (envelope.op) {
+    case "fs.read_text":
+      return await fsTool.readFile({
+        path: envelope.input.path,
+        start: envelope.input.start,
+        maxLines: envelope.input.maxLines,
+        maxCharacters: envelope.input.maxCharacters,
+        maxBytes: envelope.input.maxBytes,
+        format: envelope.input.format ?? "raw",
+      });
+    case "fs.read_bytes": {
+      const result = await fsTool.readFileBytes({
+        path: envelope.input.path,
+        maxBytes: envelope.input.maxBytes,
+      });
+      if (!result.success) {
+        return {
+          ok: false,
+          resolvedPath: result.resolvedPath,
+          error: result.error.message,
+        };
+      }
       return {
-        ok: false,
+        ok: true,
         resolvedPath: result.resolvedPath,
-        error: result.error.message,
+        fileHash: result.fileHash,
+        bytesLength: result.bytesLength,
+        base64: Buffer.from(result.bytes).toString("base64"),
       };
     }
-
-    return {
-      ok: true,
-      resolvedPath: result.resolvedPath,
-      fileHash: result.fileHash,
-      bytesLength: result.bytesLength,
-      base64: Buffer.from(result.bytes).toString("base64"),
-    };
-  }
-
-  if (envelope.op === "fs.glob") {
-    return await fsTool.glob({
-      patterns: stringArray(input["patterns"]),
-      maxEntries: numberOrUndefined(input["maxEntries"]),
-      mode: input["mode"] === "detailed" ? "detailed" : "default",
-    });
-  }
-
-  if (envelope.op === "fs.grep") {
-    return await fsTool.grep({
-      pattern: String(input["pattern"] ?? ""),
-      baseDir: typeof input["baseDir"] === "string" ? input["baseDir"] : undefined,
-      reportedFilePath:
-        typeof input["reportedFilePath"] === "string" ? input["reportedFilePath"] : undefined,
-      regex: Boolean(input["regex"]),
-      maxResults: numberOrUndefined(input["maxResults"]),
-      fileExtensions: stringArray(input["fileExtensions"]).map((ext) => ext.replace(/^\./, "")),
-      includeContextLines: numberOrUndefined(input["includeContextLines"]),
-      mode:
-        input["mode"] === "detailed"
-          ? "detailed"
-          : input["mode"] === "hashline"
-            ? "hashline"
-            : "default",
-    });
-  }
-
-  if (envelope.op === "fs.fuzzy_search") {
-    return await fsTool.fuzzySearchFiles({
-      query: String(input["query"] ?? ""),
-      maxResults: numberOrUndefined(input["maxResults"]),
-    });
-  }
-
-  if (envelope.op === "fs.edit") {
-    const pathInput = String(input["path"] ?? "");
-    const edits = Array.isArray(input["edits"]) ? input["edits"] : [];
-    const expectedHashRaw = input["expectedHash"];
-    const expectedHash =
-      typeof expectedHashRaw === "string" && expectedHashRaw.length > 0
-        ? expectedHashRaw
-        : undefined;
-
-    if (input["mode"] === "hashline") {
+    case "fs.glob":
+      return await fsTool.glob({
+        patterns: envelope.input.patterns,
+        maxEntries: envelope.input.maxEntries,
+        mode: envelope.input.mode ?? "default",
+      });
+    case "fs.grep":
+      return await fsTool.grep({
+        pattern: envelope.input.pattern,
+        baseDir: envelope.input.baseDir,
+        reportedFilePath: envelope.input.reportedFilePath,
+        regex: envelope.input.regex,
+        maxResults: envelope.input.maxResults,
+        fileExtensions: envelope.input.fileExtensions?.map((ext) => ext.replace(/^\./, "")),
+        includeContextLines: envelope.input.includeContextLines,
+        mode: envelope.input.mode ?? "default",
+      });
+    case "fs.fuzzy_search":
+      return await fsTool.fuzzySearchFiles({
+        query: envelope.input.query,
+        maxResults: envelope.input.maxResults,
+      });
+    case "fs.edit": {
+      const expectedHash =
+        envelope.input.expectedHash && envelope.input.expectedHash.length > 0
+          ? envelope.input.expectedHash
+          : undefined;
+      if (envelope.input.mode === "hashline") {
+        return normalizeEditOutput(
+          await fsTool.hashlineEditFile({
+            path: envelope.input.path,
+            edits: envelope.input.edits,
+            expectedHash,
+          }),
+        );
+      }
       return normalizeEditOutput(
-        await fsTool.hashlineEditFile({
-          path: pathInput,
-          edits: edits as HashlineEdit[],
+        await fsTool.editFile({
+          path: envelope.input.path,
+          edits: envelope.input.edits,
           expectedHash,
         }),
       );
     }
-
-    return normalizeEditOutput(
-      await fsTool.editFile({
-        path: pathInput,
-        edits: edits as FileEdit[],
-        expectedHash,
-      }),
-    );
+    case "health":
+      return { pid: process.pid };
   }
-
-  if (envelope.op === "health") {
-    return { pid: process.pid };
-  }
-
-  throw new Error(`Unknown op: ${envelope.op}`);
 }
 
-function connectOnce(payload: unknown): Promise<ResponseEnvelope> {
-  return new Promise((resolve, reject) => {
+function readSocketResponse(
+  payload: RemoteFsDaemonRequest,
+  timeoutMs: number,
+): Promise<ResultType<string, RemoteFsSocketTransportError>> {
+  return new Promise((resolve) => {
     const client = net.createConnection(socketPath());
     let response = "";
     let settled = false;
+    const timeout = setTimeout(() => {
+      settleError(new Error(`remote fs daemon socket response timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
+    timeout.unref?.();
 
-    const settleReject = (error: unknown) => {
+    const settle = (result: ResultType<string, RemoteFsSocketTransportError>) => {
       if (settled) return;
       settled = true;
+      clearTimeout(timeout);
+      resolve(result);
+    };
+
+    const settleError = (cause: Error) => {
+      if (settled) return;
       client.destroy();
-      reject(error);
+      settle(
+        Result.err(
+          new RemoteFsSocketTransportError({
+            cause,
+            message: "remote fs daemon socket transport failed",
+          }),
+        ),
+      );
     };
 
     client.setEncoding("utf8");
@@ -293,96 +392,338 @@ function connectOnce(payload: unknown): Promise<ResponseEnvelope> {
     client.on("data", (chunk) => {
       response += chunk;
     });
-    client.on("error", settleReject);
+    client.on("error", settleError);
     client.on("end", () => {
       if (settled) return;
-      settled = true;
-      try {
-        const parsed = JSON.parse(response) as unknown;
-        if (!isRecord(parsed) || typeof parsed["ok"] !== "boolean") {
-          resolve({ ok: false, error: "daemon returned invalid response" });
-          return;
-        }
-        resolve(parsed as ResponseEnvelope);
-      } catch (error) {
-        reject(error);
-      }
+      settle(Result.ok(response));
     });
   });
+}
+
+function decodeSocketResponse(
+  request: RemoteFsDaemonRequest,
+  text: string,
+): ResultType<RemoteFsResponse, RemoteRunnerResponseDecodeError> {
+  switch (request.op) {
+    case "fs.read_text":
+      return decodeRemoteRunnerResponseJson(request.op, text, remoteReadTextResponseSchema);
+    case "fs.read_bytes":
+      return decodeRemoteRunnerResponseJson(request.op, text, remoteReadBytesResponseSchema);
+    case "fs.glob":
+      return decodeRemoteRunnerResponseJson(request.op, text, remoteGlobResponseSchema);
+    case "fs.grep":
+      return decodeRemoteRunnerResponseJson(request.op, text, remoteGrepResponseSchema);
+    case "fs.fuzzy_search":
+      return decodeRemoteRunnerResponseJson(request.op, text, remoteFuzzySearchResponseSchema);
+    case "fs.edit":
+      return decodeRemoteRunnerResponseJson(request.op, text, remoteEditResponseSchema);
+    case "health":
+      return decodeRemoteRunnerResponseJson(request.op, text, remoteHealthResponseSchema);
+  }
+}
+
+export async function connectOnce(
+  payload: RemoteFsDaemonRequest,
+  timeoutMs = SOCKET_RESPONSE_TIMEOUT_MS,
+): Promise<
+  ResultType<RemoteFsResponse, RemoteFsSocketTransportError | RemoteRunnerResponseDecodeError>
+> {
+  const response = await readSocketResponse(payload, timeoutMs);
+  if (response.status === "error") return response;
+  return decodeSocketResponse(payload, response.value);
 }
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function spawnDaemon(): void {
-  const child = spawn(process.execPath, [process.argv[1] ?? "", "daemon"], {
-    detached: true,
-    stdio: "ignore",
-    env: process.env,
+export async function spawnDaemon(
+  executable = process.execPath,
+  launchDaemon: () => ReturnType<typeof spawn> = () =>
+    spawn(executable, [process.argv[1] ?? "", "daemon"], {
+      detached: true,
+      stdio: "ignore",
+      env: process.env,
+    }),
+): Promise<ResultType<void, RemoteFsDaemonSpawnError>> {
+  let child;
+  try {
+    child = launchDaemon();
+  } catch (caught) {
+    const projected = opaqueErrorCause(caught);
+    if (projected.kind === "panic") preservePanic(projected.panic);
+    return Result.err(
+      new RemoteFsDaemonSpawnError({
+        cause: projected.error,
+        message: "failed to spawn remote fs daemon",
+      }),
+    );
+  }
+
+  return await new Promise((resolve) => {
+    let settled = false;
+    child.once("spawn", () => {
+      if (settled) return;
+      settled = true;
+      child.unref();
+      resolve(Result.ok(undefined));
+    });
+    child.once("error", (cause) => {
+      if (settled) return;
+      settled = true;
+      resolve(
+        Result.err(
+          new RemoteFsDaemonSpawnError({
+            cause,
+            message: "failed to spawn remote fs daemon",
+          }),
+        ),
+      );
+    });
   });
-  child.unref();
 }
 
 async function tryConnectUntil(
   deadline: number,
-  payload: unknown,
-): Promise<ResponseEnvelope | null> {
+  payload: RemoteFsDaemonRequest,
+): Promise<
+  ResultType<RemoteFsResponse, RemoteFsSocketTransportError | RemoteRunnerResponseDecodeError>
+> {
+  let latestError: RemoteFsSocketTransportError | RemoteRunnerResponseDecodeError =
+    new RemoteFsSocketTransportError({
+      cause: undefined,
+      message: "remote fs daemon socket was unavailable",
+    });
   while (Date.now() < deadline) {
-    try {
-      return await connectOnce(payload);
-    } catch {
-      await sleep(CONNECT_RETRY_MS);
-    }
+    const response = await connectOnce(payload, Math.max(1, deadline - Date.now()));
+    if (response.status === "ok") return response;
+    if (!RemoteFsSocketTransportError.is(response.error)) return response;
+    latestError = response.error;
+    const remainingMs = deadline - Date.now();
+    if (remainingMs > 0) await sleep(Math.min(CONNECT_RETRY_MS, remainingMs));
   }
-  return null;
+  return Result.err(latestError);
 }
 
-async function tryAcquireStartupLock(): Promise<boolean> {
+export async function tryAcquireStartupLock(
+  createLock: (target: string) => Promise<void> = async (target) => {
+    await fs.mkdir(target);
+  },
+): Promise<ResultType<boolean, RemoteFsRuntimeSetupError>> {
+  const target = lockPath();
+  const created = await captureRuntimeOperation(
+    `failed to create remote fs startup lock: ${target}`,
+    () => createLock(target),
+  );
+  if (created.status === "ok") return Result.ok(true);
+  if (created.error.code !== "EEXIST") {
+    return Result.err(created.error);
+  }
+
+  const statResult = await captureRuntimeOperation(
+    `failed to inspect remote fs startup lock: ${target}`,
+    () => fs.stat(target),
+  );
+  if (statResult.status === "error") {
+    if (statResult.error.code === "ENOENT") {
+      return Result.ok(false);
+    }
+    return Result.err(statResult.error);
+  }
+
+  const lockAgeMs = Date.now() - statResult.value.mtimeMs;
+  if (lockAgeMs <= STARTUP_TIMEOUT_MS) return Result.ok(false);
+
+  const removed = await captureRuntimeOperation(
+    `failed to remove stale remote fs startup lock: ${target}`,
+    () => fs.rm(target, { recursive: true, force: true }),
+  );
+  if (removed.status === "error") return Result.err(removed.error);
+
+  const recreated = await captureRuntimeOperation(
+    `failed to recreate remote fs startup lock: ${target}`,
+    () => createLock(target),
+  );
+  if (recreated.status === "ok") return Result.ok(true);
+  if (recreated.error.code === "EEXIST") {
+    return Result.ok(false);
+  }
+  return Result.err(recreated.error);
+}
+
+export async function releaseStartupLock(
+  removeLock: (target: string) => Promise<void> = async (target) => {
+    await fs.rm(target, { recursive: true, force: true });
+  },
+): Promise<ResultType<void, RemoteFsStartupLockCleanupError>> {
   const target = lockPath();
   try {
-    await fs.mkdir(target);
-    return true;
-  } catch {
-    const stat = await fs.stat(target).catch(() => null);
-    if (!stat) return false;
-
-    const lockAgeMs = Date.now() - stat.mtimeMs;
-    if (lockAgeMs <= STARTUP_TIMEOUT_MS) return false;
-
-    await fs.rm(target, { recursive: true, force: true }).catch(() => undefined);
-    try {
-      await fs.mkdir(target);
-      return true;
-    } catch {
-      return false;
-    }
+    await removeLock(target);
+    return Result.ok(undefined);
+  } catch (caught) {
+    const projected = opaqueErrorCause(caught);
+    if (projected.kind === "panic") preservePanic(projected.panic);
+    return Result.err(
+      new RemoteFsStartupLockCleanupError({
+        lockPath: target,
+        cause: projected.error,
+        message: `failed to release remote fs startup lock: ${target}`,
+      }),
+    );
   }
 }
 
-async function runRequest(): Promise<void> {
-  const payload = { ...parseEnvelope(await readStdinJson()), cwd: process.cwd() };
-  await ensureRuntimeDir();
+export function applyStartupLockCleanup(
+  operation: ResultType<ResponseEnvelope, RemoteFsRequestOperationError>,
+  cleanup: ResultType<void, RemoteFsStartupLockCleanupError>,
+): ResultType<ResponseEnvelope, RemoteFsRunRequestError> {
+  if (cleanup.status === "ok") return operation;
+  if (operation.status === "ok") return Result.err(cleanup.error);
+  return Result.err(
+    new RemoteFsRequestCleanupCombinedError({
+      operationError: operation.error,
+      cleanupError: cleanup.error,
+      message: `${operation.error.message}; additionally, ${cleanup.error.message}`,
+    }),
+  );
+}
 
-  const direct = await tryConnectUntil(Date.now() + CONNECT_RETRY_MS, payload);
-  if (direct) {
-    writeJson(direct);
-    return;
-  }
+type StartupLockOperationOutcome =
+  | {
+      readonly kind: "result";
+      readonly result: ResultType<ResponseEnvelope, RemoteFsRequestOperationError>;
+    }
+  | { readonly kind: "rejection"; readonly cause: Error };
 
-  let acquiredLock = false;
-  acquiredLock = await tryAcquireStartupLock();
-  if (acquiredLock) {
-    spawnDaemon();
+async function captureStartupLockOperation(
+  operation: () => Promise<ResultType<ResponseEnvelope, RemoteFsRequestOperationError>>,
+): Promise<StartupLockOperationOutcome> {
+  try {
+    return { kind: "result", result: await operation() };
+  } catch (cause) {
+    const projected = opaqueErrorCause(cause);
+    return {
+      kind: "rejection",
+      cause: projected.kind === "panic" ? projected.panic : projected.error,
+    };
   }
+}
+
+type CleanupFailureReporter = (failure: { readonly message: string }) => void;
+
+function reportCleanupFailureWithoutMaskingOperation(
+  report: CleanupFailureReporter,
+  failure: { readonly message: string },
+): void {
+  try {
+    report(failure);
+  } catch {
+    // The original operation defect retains precedence over secondary reporting failure.
+  }
+}
+
+function reportStartupLockCleanupAfterOperationDefect(failure: { readonly message: string }): void {
+  process.stderr.write(
+    `remote fs startup-lock cleanup after operation defect: ${failure.message}\n`,
+  );
+}
+
+async function superviseStartupLockCleanupAfterOperationDefect(
+  cleanup: () => Promise<ResultType<void, RemoteFsStartupLockCleanupError>>,
+  report: CleanupFailureReporter,
+): Promise<void> {
+  try {
+    const cleanupResult = await cleanup();
+    if (cleanupResult.status === "error") {
+      reportCleanupFailureWithoutMaskingOperation(report, cleanupResult.error);
+    }
+  } catch (cause) {
+    const failure =
+      cause instanceof Error ? cause : new Error("unknown startup-lock cleanup defect");
+    reportCleanupFailureWithoutMaskingOperation(report, failure);
+  }
+}
+
+export async function runWithStartupLockCleanup(
+  operation: () => Promise<ResultType<ResponseEnvelope, RemoteFsRequestOperationError>>,
+  cleanup: () => Promise<ResultType<void, RemoteFsStartupLockCleanupError>> = releaseStartupLock,
+  report: CleanupFailureReporter = reportStartupLockCleanupAfterOperationDefect,
+): Promise<ResultType<ResponseEnvelope, RemoteFsRunRequestError>> {
+  const outcome = await captureStartupLockOperation(operation);
+  let cleanupResult: ResultType<void, RemoteFsStartupLockCleanupError> = Result.ok(undefined);
 
   try {
-    const response = await tryConnectUntil(Date.now() + STARTUP_TIMEOUT_MS, payload);
-    writeJson(response ?? { ok: false, error: "remote fs daemon did not start" });
+    if (outcome.kind === "rejection") throw outcome.cause;
   } finally {
-    if (acquiredLock) {
-      await fs.rm(lockPath(), { recursive: true, force: true }).catch(() => undefined);
+    if (outcome.kind === "rejection") {
+      await superviseStartupLockCleanupAfterOperationDefect(cleanup, report);
+    } else {
+      cleanupResult = await cleanup();
     }
+  }
+
+  return applyStartupLockCleanup(outcome.result, cleanupResult);
+}
+
+async function waitForDaemon(
+  payload: RemoteFsDaemonRequest,
+): Promise<
+  ResultType<
+    ResponseEnvelope,
+    RemoteFsSocketTransportError | RemoteRunnerResponseDecodeError | RemoteFsDaemonStartupError
+  >
+> {
+  const response = await tryConnectUntil(Date.now() + STARTUP_TIMEOUT_MS, payload);
+  if (response.status === "ok") return Result.ok(responseSuccess(response.value));
+  if (!RemoteFsSocketTransportError.is(response.error)) return Result.err(response.error);
+  return Result.err(new RemoteFsDaemonStartupError({ message: "remote fs daemon did not start" }));
+}
+
+export async function runRequest(): Promise<ResultType<ResponseEnvelope, RemoteFsRunRequestError>> {
+  const stdin = await readStdinText();
+  if (stdin.status === "error") return Result.err(stdin.error);
+  const request = decodeRemoteFsRequestJson(stdin.value);
+  if (request.status === "error") return Result.err(request.error);
+  const payload: RemoteFsDaemonRequest = { ...request.value, cwd: process.cwd() };
+  const runtimeDir = await ensureRuntimeDir();
+  if (runtimeDir.status === "error") return Result.err(runtimeDir.error);
+
+  const direct = await tryConnectUntil(Date.now() + CONNECT_RETRY_MS, payload);
+  if (direct.status === "ok") return Result.ok(responseSuccess(direct.value));
+  if (!RemoteFsSocketTransportError.is(direct.error)) return Result.err(direct.error);
+
+  const lockResult = await tryAcquireStartupLock();
+  if (lockResult.status === "error") return Result.err(lockResult.error);
+  const acquiredLock = lockResult.value;
+
+  const operation = async (): Promise<
+    ResultType<ResponseEnvelope, RemoteFsRequestOperationError>
+  > => {
+    if (!acquiredLock) return await waitForDaemon(payload);
+    const spawned = await spawnDaemon();
+    if (spawned.status === "error") return Result.err(spawned.error);
+    return await waitForDaemon(payload);
+  };
+
+  if (!acquiredLock) return await operation();
+  return await runWithStartupLockCleanup(operation);
+}
+
+export async function executeDaemonRequest(
+  request: RemoteFsDaemonRequest,
+  execute: (request: RemoteFsDaemonRequest) => Promise<RemoteFsResponse> = handleRequest,
+): Promise<ResultType<RemoteFsResponse, RemoteFsSocketTransportError>> {
+  try {
+    return Result.ok(await execute(request));
+  } catch (caught) {
+    const projected = opaqueErrorCause(caught);
+    if (projected.kind === "panic") preservePanic(projected.panic);
+    return Result.err(
+      new RemoteFsSocketTransportError({
+        cause: projected.error,
+        message: `remote fs daemon failed to execute ${request.op}`,
+      }),
+    );
   }
 }
 
@@ -410,16 +751,22 @@ function createServer(idleMs: number): net.Server {
     });
     socket.on("end", () => {
       void (async () => {
-        try {
-          const envelope = parseEnvelope(JSON.parse(requestText) as unknown);
-          const value = await handleRequest(envelope);
-          socket.end(JSON.stringify({ ok: true, value } satisfies ResponseEnvelope));
-        } catch (error) {
-          socket.end(JSON.stringify(responseError(error)));
-        } finally {
+        const request = decodeRemoteFsDaemonRequestJson(requestText);
+        if (request.status === "error") {
+          socket.end(JSON.stringify(responseError(request.error)));
           inFlight -= 1;
           scheduleIdleExit();
+          return;
         }
+
+        const handled = await executeDaemonRequest(request.value);
+        if (handled.status === "ok") {
+          socket.end(JSON.stringify(responseSuccess(handled.value)));
+        } else {
+          socket.end(JSON.stringify(responseError(handled.error)));
+        }
+        inFlight -= 1;
+        scheduleIdleExit();
       })();
     });
   });
@@ -432,11 +779,16 @@ function createServer(idleMs: number): net.Server {
   return server;
 }
 
-async function runDaemon(): Promise<void> {
-  await ensureRuntimeDir();
+async function runDaemon(): Promise<ResultType<void, RemoteFsRuntimeSetupError>> {
+  const runtimeDir = await ensureRuntimeDir();
+  if (runtimeDir.status === "error") return Result.err(runtimeDir.error);
   const sock = socketPath();
   if (process.platform !== "win32" && fsSync.existsSync(sock)) {
-    await fs.unlink(sock).catch(() => undefined);
+    const unlinked = await captureRuntimeOperation(
+      `failed to remove stale remote fs socket: ${sock}`,
+      () => fs.unlink(sock),
+    );
+    if (unlinked.status === "error") return Result.err(unlinked.error);
   }
 
   const idleMs = numberOrUndefined(process.env.LILAC_REMOTE_FS_IDLE_MS) ?? DEFAULT_IDLE_MS;
@@ -448,13 +800,38 @@ async function runDaemon(): Promise<void> {
   process.once("SIGTERM", shutdown);
   process.once("SIGINT", shutdown);
 
-  await new Promise<void>((resolve, reject) => {
-    server.once("error", reject);
+  return await new Promise((resolve) => {
+    let settled = false;
+    server.once("error", (cause) => {
+      if (settled) return;
+      settled = true;
+      resolve(
+        Result.err(
+          new RemoteFsRuntimeSetupError({
+            cause,
+            message: `failed to listen on remote fs socket: ${sock}`,
+          }),
+        ),
+      );
+    });
     server.listen(sock, () => {
-      if (process.platform !== "win32") {
-        void fs.chmod(sock, 0o600).catch(() => undefined);
-      }
-      resolve();
+      void (async () => {
+        if (settled) return;
+        if (process.platform !== "win32") {
+          const secured = await captureRuntimeOperation(
+            `failed to secure remote fs socket: ${sock}`,
+            () => fs.chmod(sock, 0o600),
+          );
+          if (secured.status === "error") {
+            settled = true;
+            server.close();
+            resolve(Result.err(secured.error));
+            return;
+          }
+        }
+        settled = true;
+        resolve(Result.ok(undefined));
+      })();
     });
   });
 }
@@ -466,25 +843,50 @@ async function main(): Promise<void> {
     return;
   }
   if (command === "daemon") {
-    await runDaemon();
+    const daemon = await runDaemon();
+    if (daemon.status === "error") {
+      writeJson(responseError(daemon.error));
+      process.exitCode = 1;
+    }
     return;
   }
   if (command === "request") {
-    await runRequest();
+    const request = await runRequest();
+    writeJson(request.status === "ok" ? request.value : responseError(request.error));
     return;
   }
   if (command === "health") {
-    await ensureRuntimeDir();
-    writeJson(await connectOnce({ op: "health", input: {}, denyPaths: [] }).catch(responseError));
+    const runtimeDir = await ensureRuntimeDir();
+    if (runtimeDir.status === "error") {
+      writeJson(responseError(runtimeDir.error));
+      return;
+    }
+    const response = await connectOnce({
+      op: "health",
+      input: {},
+      denyPaths: [],
+      cwd: process.cwd(),
+    });
+    writeJson(
+      response.status === "ok"
+        ? ({ ok: true, value: response.value } satisfies ResponseEnvelope)
+        : responseError(response.error),
+    );
     return;
   }
 
   writeJson({ ok: false, error: `Unknown command: ${command}` } satisfies ResponseEnvelope);
 }
 
-if (import.meta.main) {
-  main().catch((error) => {
-    writeJson(responseError(error));
-    process.exitCode = 1;
-  });
+export function reportMainFailure(error: unknown): void {
+  const projected = opaqueErrorCause(error);
+  if (projected.kind === "panic") preservePanic(projected.panic);
+  writeJson({ ok: false, error: opaqueErrorMessage(projected.error) } satisfies ResponseEnvelope);
+  process.exitCode = 1;
 }
+
+function startMain(): void {
+  void main().catch(reportMainFailure);
+}
+
+if (import.meta.main) startMain();

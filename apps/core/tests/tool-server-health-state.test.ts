@@ -224,6 +224,16 @@ describe("tool server health state", () => {
     });
   });
 
+  it("preserves the optional pressure kind output shape", () => {
+    expect(parsePressureMetrics("some avg10=1 avg60=2 avg300=3 total=4")).toEqual({
+      some: { avg10: 1, avg60: 2, avg300: 3, totalMicros: 4 },
+    });
+    expect(parsePressureMetrics("full avg10=5 avg60=6 avg300=7 total=8")).toEqual({
+      full: { avg10: 5, avg60: 6, avg300: 7, totalMicros: 8 },
+    });
+    expect(parsePressureMetrics("not pressure metrics")).toBeUndefined();
+  });
+
   it("marks unavailable event-loop utilization instead of reporting misleading zeros", async () => {
     const sampler = createRuntimeDiagnosticSampler();
     sampler.start();

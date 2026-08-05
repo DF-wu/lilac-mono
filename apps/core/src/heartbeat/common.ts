@@ -1,6 +1,5 @@
 import type { ModelMessage } from "ai";
-import type { CoreConfig } from "@stanley2058/lilac-utils";
-import { resolveHeartbeatPromptPaths } from "@stanley2058/lilac-utils";
+import { isPanic, resolveHeartbeatPromptPaths, type CoreConfig } from "@stanley2058/lilac-utils";
 
 import { matchesMagicToken } from "../shared/magic-token";
 
@@ -59,12 +58,14 @@ export function getHeartbeatQuietState(params: {
   const end = parseHourMinute(quietHours.end);
   const current = local.hour * 60 + local.minute;
 
-  const inside =
-    start === end
-      ? true
-      : start < end
-        ? current >= start && current < end
-        : current >= start || current < end;
+  let inside: boolean;
+  if (start === end) {
+    inside = true;
+  } else if (start < end) {
+    inside = current >= start && current < end;
+  } else {
+    inside = current >= start || current < end;
+  }
 
   return {
     inside,
@@ -230,7 +231,8 @@ function createQuietHoursFormatter(timezone: string | undefined): Intl.DateTimeF
       hour12: false,
       ...(timezone ? { timeZone: timezone } : {}),
     });
-  } catch {
+  } catch (cause) {
+    if (isPanic(cause)) throw cause;
     return new Intl.DateTimeFormat("en-GB", {
       hour: "2-digit",
       minute: "2-digit",

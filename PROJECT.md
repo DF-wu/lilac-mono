@@ -26,6 +26,8 @@ This document explains where things live, the words used in code, and the projec
 
 Workspace roots are Bun workspaces (`apps/*`, `packages/*`). `ref/` contains vendored upstreams as git submodules and is treated as read-only.
 
+`scripts/architecture/` contains the architecture manifest and semantic checker; syntax-only rules live under `scripts/oxlint-plugins/`.
+
 - `apps/core/`
   - The core runtime process (Discord + optional GitHub surfaces, event bus, router, agent runner, unified workflow engine, tool server, and runtime recovery/search services).
   - Entry: `apps/core/src/runtime/main.ts` (starts/stops `createCoreRuntime()`).
@@ -56,7 +58,7 @@ Workspace roots are Bun workspaces (`apps/*`, `packages/*`). `ref/` contains ven
 
 - `packages/event-bus/`
   - The bus implementation and the canonical event spec.
-  - Typed event contract: `packages/event-bus/lilac-spec.ts`.
+  - Single event catalog and payload schemas: `packages/event-bus/lilac-spec.ts`.
   - Typed bus wrapper: `packages/event-bus/lilac-bus.ts`.
   - Redis Streams transport: `packages/event-bus/redis-streams-bus.ts`.
   - Low-level types: `packages/event-bus/types.ts`.
@@ -112,7 +114,7 @@ Implementation note: subscriptions use a small Redis connection pool because Red
   - Output topics are request-scoped: `out.req.<request_id>`.
 
 - Event type: a string like `cmd.request.message`.
-  - All canonical event types and payloads live in `packages/event-bus/lilac-spec.ts`.
+  - `LILAC_EVENTS` in `packages/event-bus/lilac-spec.ts` is the single source for event types, families, routing, keys, payload contracts, and codecs.
 
 - Subscription `mode` (delivery semantics):
   - `work`: consumer-group queue semantics (competing consumers).
@@ -403,7 +405,9 @@ Expected contents over time:
 - `graceful-restart.db` (in-flight relay/agent recovery snapshots)
 - `skills/` (skill bundles installed/seeded for discovery)
 - `plugins/` (external Level 1 / Level 2 tool plugins)
-- `secret/` (persisted secrets, e.g. GitHub App credentials, GPG home, and `mcp-oauth/<server-id>.json`)
+- `secret/` (persisted secrets, e.g. GitHub App credentials, GPG home,
+  `mcp-oauth/<server-id>.json`, and the mode-`0600` `event-dead-letter.key` required to recover encrypted
+  Redis dead-letter records)
 - `workspace/` (default working directory for bash/fs tools in the core runtime)
 
 Native Claude continuation is separate from `DATA_DIR`. Claude stores its own conversation
@@ -511,9 +515,21 @@ Shutdown happens in reverse (best-effort).
 
 ---
 
+## Boundary Architecture
+
+- Trust boundaries decode complete external envelopes into typed local values. Open SDK and protocol values instead pass through registered projections that produce closed local unions with explicit bounded fallbacks; internal services do not carry domain-bearing `unknown`.
+- Expected failures use domain-owned `Result` error unions, including typed terminal errors for fallible streams. `Panic` is reserved for registered hard invariants and defects, is classified with `Panic.is`, and is never converted to an ordinary Err.
+- Exception capture, host signaling, rollback sentinels, compatibility mappings, and defect supervision are allowed only at exact registered adapters. Add exception registrations to the owning workspace in `scripts/architecture/manifest.ts`; the global approval catalog is derived from them, and its reviewed digest must be updated. Other manifest entries use exact symbol identities or exact modules according to their schema, with reasons only where required. Broad allowlists are not an approval mechanism.
+- Persisted codecs report successful provenance as `current`, `migrated`, or contractually valid `missing-defaulted`, while unsupported versions, malformed serialization, and corrupt fields remain distinct errors. Reads do not rewrite data. SQLite Result transactions use the registered private-sentinel adapter, preserve exact Panic and driver classification, and commit state transitions with their outbox records atomically.
+- Redis/SuperJSON receive paths begin with `Message<unknown>` and decode the complete event through the canonical codec registry before typed delivery. Handlers return Results; subscription policy owns commit, `park-pending`, dead-letter, or stop. Parked work entries are durable pending entries, not automatic retries.
+- Presentation code consumes closed render-ready projections, never raw tool or SDK payloads or runtime parsers. Lifecycle states are exhaustive, and unknown future variants normalize at the projection adapter.
+- `bun run lint:architecture` runs the semantic checker and production syntax gate; every finding is an error, with no baseline or migration-status path. Focused checks are `bun run test:architecture`, `bun run test:lint-rules`, and `bun run typecheck:architecture`. Root `bun run lint`, `bun run test:all`, `bun run typecheck`, `bun run fmt:check`, and `bun run ci` compose the repository gates.
+
+---
+
 ## Common “Where Do I Change X?” Pointers
 
-- Add/modify bus event types: `packages/event-bus/lilac-spec.ts` and routing/key logic in `packages/event-bus/lilac-bus.ts`.
+- Add/modify bus event types: add one `LILAC_EVENTS` entry in `packages/event-bus/lilac-spec.ts`, add its wire compatibility fixture, then publish and subscribe with an explicit delivery policy.
 - Change request routing behavior: `apps/core/src/surface/bridge/bus-request-router.ts` and config schema in `packages/utils/core-config.ts`.
 - Change agent execution behavior (steer/follow-up/interrupt semantics): `packages/agent/ai-sdk-pi-agent.ts`.
 - Change which local tools the LLM can call: `apps/core/src/surface/bridge/bus-agent-runner.ts`.
@@ -567,4 +583,3 @@ Shutdown happens in reverse (best-effort).
 - The tool server is not the AI SDK tool runner; it’s a separate HTTP API that can be used by humans and by the agent (typically via the `tools` CLI).
 - The deterministic workflow program child is a plain Bun subprocess (`bun --smol workflow-sandbox-child.js`); the child keeps its determinism lockdown and NDJSON protocol, and the host enforces cancellation, operation-idle, output-size, and protocol limits. Workflows have no wall-time or runtime memory-limit contract. Workflow execution no longer requires Linux user namespaces, Bubblewrap, cgroup v2, or a user systemd manager.
 - Prompts/config are designed to be editable without code changes (seeded into `DATA_DIR`).
-- The bus spec is compile-time only (no runtime validation), so producers/consumers must be disciplined about payload shapes.

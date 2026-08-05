@@ -1,4 +1,4 @@
-import type { AgentRunProfile, SubagentProfile } from "./raw";
+import type { SubagentProfile } from "./raw";
 import type { SubagentProfileConfig } from "@stanley2058/lilac-utils";
 
 function buildExploreOverlay(config: SubagentProfileConfig, extra?: string): string {
@@ -80,16 +80,19 @@ function subagentModeTitle(profile: SubagentProfile): string {
   return "Explore";
 }
 
-export function buildSystemPromptForProfile(params: {
+type SystemPromptProfileParams = {
   baseSystemPrompt: string;
-  profile: AgentRunProfile;
   exploreOverlay?: string;
   generalOverlay?: string;
   selfOverlay?: string;
   skillsSection?: string | null;
   activeEditingTool?: "apply_patch" | "edit_file" | null;
-  profileConfig?: SubagentProfileConfig;
-}): string {
+} & (
+  | { readonly profile: "primary"; readonly profileConfig?: never }
+  | { readonly profile: SubagentProfile; readonly profileConfig: SubagentProfileConfig }
+);
+
+export function buildSystemPromptForProfile(params: SystemPromptProfileParams): string {
   if (params.profile === "primary") {
     const parts = [params.baseSystemPrompt];
     if (params.skillsSection && params.skillsSection.trim().length > 0) {
@@ -103,9 +106,6 @@ export function buildSystemPromptForProfile(params: {
     baseParts.push(params.skillsSection.trim());
   }
 
-  if (!params.profileConfig) {
-    throw new Error(`Missing native profile configuration for ${params.profile}`);
-  }
   const overlay = buildOverlayForProfile({
     profile: params.profile,
     config: params.profileConfig,

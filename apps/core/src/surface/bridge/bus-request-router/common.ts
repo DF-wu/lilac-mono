@@ -1,9 +1,13 @@
 import type { EvtAdapterMessageCreatedData } from "@stanley2058/lilac-event-bus";
 import {
   getDiscordUserAliasValue,
-  parseCoreConfig,
+  isPanic,
+  isRecord,
+  parseCoreConfigResult,
   type CoreConfig,
 } from "@stanley2058/lilac-utils";
+import { Result } from "better-result";
+import { z } from "zod";
 
 import type { MsgRef } from "../../types";
 import { formatGenericRequestId, formatQueuedRequestId } from "../request-ids";
@@ -237,13 +241,9 @@ export function bufferedPromptRequestIdForActiveRequest(activeRequestId: string)
 }
 
 export function parseDiscordMsgRefFromAdapterEvent(data: {
-  platform: string;
   channelId: string;
   messageId: string;
 }): MsgRef {
-  if (data.platform !== "discord") {
-    throw new Error(`Unsupported platform '${data.platform}'`);
-  }
   return {
     platform: "discord",
     channelId: data.channelId,
@@ -365,51 +365,66 @@ export function buildDiscordUserAliasById(cfg: CoreConfig): Map<string, string> 
   return out;
 }
 
-export function getDiscordFlags(raw: unknown): {
-  isDMBased?: boolean;
-  mentionsBot?: boolean;
-  replyToBot?: boolean;
-  replyToMessageId?: string;
-  parentChannelId?: string;
-  sessionModelOverride?: string;
-  botUserId?: string;
-} {
-  if (!raw || typeof raw !== "object") return {};
-  const discord = (raw as { discord?: unknown }).discord;
-  if (!discord || typeof discord !== "object") return {};
+const discordFlagsSchema = z.strictObject({
+  isDMBased: z.boolean().optional(),
+  mentionsBot: z.boolean().optional(),
+  replyToBot: z.boolean().optional(),
+  replyToMessageId: z.string().optional(),
+  parentChannelId: z.string().optional(),
+  sessionModelOverride: z.string().optional(),
+  botUserId: z.string().optional(),
+});
 
-  const o = discord as Record<string, unknown>;
+export type DiscordFlags = z.output<typeof discordFlagsSchema>;
 
-  return {
-    isDMBased: typeof o.isDMBased === "boolean" ? o.isDMBased : undefined,
-    mentionsBot: typeof o.mentionsBot === "boolean" ? o.mentionsBot : undefined,
-    replyToBot: typeof o.replyToBot === "boolean" ? o.replyToBot : undefined,
-    replyToMessageId: typeof o.replyToMessageId === "string" ? o.replyToMessageId : undefined,
-    parentChannelId: typeof o.parentChannelId === "string" ? o.parentChannelId : undefined,
-    sessionModelOverride:
-      typeof o.sessionModelOverride === "string" ? o.sessionModelOverride : undefined,
-    botUserId: typeof o.botUserId === "string" ? o.botUserId : undefined,
-  };
+export function getDiscordFlags(raw: unknown): DiscordFlags {
+  try {
+    if (raw === null || typeof raw !== "object" || Array.isArray(raw)) return {};
+
+    const discordDescriptor = Object.getOwnPropertyDescriptor(raw, "discord");
+    if (!discordDescriptor || !("value" in discordDescriptor)) return {};
+
+    const discord = discordDescriptor.value;
+    if (discord === null || typeof discord !== "object" || Array.isArray(discord)) return {};
+
+    const ownDataProperty = (key: keyof DiscordFlags): unknown => {
+      const descriptor = Object.getOwnPropertyDescriptor(discord, key);
+      return descriptor && "value" in descriptor ? descriptor.value : undefined;
+    };
+    const parsed = discordFlagsSchema.safeParse({
+      isDMBased: ownDataProperty("isDMBased"),
+      mentionsBot: ownDataProperty("mentionsBot"),
+      replyToBot: ownDataProperty("replyToBot"),
+      replyToMessageId: ownDataProperty("replyToMessageId"),
+      parentChannelId: ownDataProperty("parentChannelId"),
+      sessionModelOverride: ownDataProperty("sessionModelOverride"),
+      botUserId: ownDataProperty("botUserId"),
+    });
+    return parsed.success ? parsed.data : {};
+  } catch (cause) {
+    if (isPanic(cause)) throw cause;
+    return {};
+  }
 }
 
 export type RouterConfigOverride = Record<string, unknown>;
 
-function isConfigRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-export async function withDefaultToolsConfig(config: RouterConfigOverride): Promise<CoreConfig> {
-  const parsed = await parseCoreConfig(config);
-  const agent = isConfigRecord(config.agent) ? config.agent : {};
+export function withDefaultToolsConfig(
+  config: RouterConfigOverride,
+): ReturnType<typeof parseCoreConfigResult> {
+  const parsedResult = parseCoreConfigResult(config);
+  if (parsedResult.status === "error") return parsedResult;
+  const parsed = parsedResult.value;
+  const agent = isRecord(config.agent) ? config.agent : {};
   const systemPrompt = typeof agent.systemPrompt === "string" ? agent.systemPrompt : "";
 
-  return {
+  return Result.ok({
     ...parsed,
     agent: {
       ...parsed.agent,
       systemPrompt,
     },
-  };
+  });
 }
 
 export type RouterAdapterMessage = EvtAdapterMessageCreatedData;

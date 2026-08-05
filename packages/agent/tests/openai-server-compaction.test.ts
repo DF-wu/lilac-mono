@@ -10,6 +10,7 @@ import {
 
 import {
   compactWithOpenAIResponses,
+  compactWithOpenAIResponsesResult,
   declarationOnlyServerCompactionTools,
   materializeOpenAIServerCompaction,
   readOpenAIServerCompactionArtifact,
@@ -132,6 +133,109 @@ describe("OpenAI server compaction artifacts", () => {
         store: false,
         include: ["file_search_call.results", "reasoning.encrypted_content"],
       },
+    });
+  });
+
+  it("returns an owned error when the provider omits its compaction part", async () => {
+    const model = new MockLanguageModelV4({
+      doStream: {
+        stream: simulateReadableStream({
+          chunks: [
+            {
+              type: "finish",
+              finishReason: { unified: "stop", raw: "stop" },
+              usage: {
+                inputTokens: { total: 1, noCache: 1, cacheRead: 0, cacheWrite: 0 },
+                outputTokens: { total: 0, text: 0, reasoning: 0 },
+              },
+            },
+          ],
+        }),
+      },
+    });
+
+    const result = await compactWithOpenAIResponsesResult({
+      model,
+      replayKey: "openai:openai/gpt-test",
+      portableSummary: "Portable summary.",
+      messages: [{ role: "user", content: "history" }],
+      system: "system",
+    });
+
+    expect(result).toMatchObject({
+      status: "error",
+      error: { _tag: "OpenAIServerCompactionOutputInvalid", outputCount: 0 },
+    });
+  });
+
+  it("rejects invalid generated metadata before activating the native artifact", async () => {
+    const model = new MockLanguageModelV4({
+      doStream: {
+        stream: simulateReadableStream({
+          chunks: [
+            {
+              type: "custom",
+              kind: "openai.compaction",
+              providerMetadata: {
+                openai: {
+                  type: "compaction",
+                  itemId: "cmp_invalid_metadata",
+                  encryptedContent: "encrypted-native-state",
+                },
+              },
+            },
+            {
+              type: "finish",
+              finishReason: { unified: "stop", raw: "stop" },
+              usage: {
+                inputTokens: { total: 1, noCache: 1, cacheRead: 0, cacheWrite: 0 },
+                outputTokens: { total: 1, text: 1, reasoning: 0 },
+              },
+            },
+          ],
+        }),
+      },
+    });
+
+    const result = await compactWithOpenAIResponsesResult({
+      model,
+      replayKey: "",
+      portableSummary: "Portable summary remains available for local fallback.",
+      messages: [{ role: "user", content: "history" }],
+      system: "system",
+    });
+
+    expect(result).toMatchObject({
+      status: "error",
+      error: {
+        _tag: "OpenAIServerCompactionOutputInvalid",
+        reason: "generated-artifact",
+        outputCount: 1,
+      },
+    });
+  });
+
+  it("returns owned cancellation only for its exact aborted signal", async () => {
+    const controller = new AbortController();
+    controller.abort(new Error("cancelled by caller"));
+    const model = new MockLanguageModelV4({
+      doStream: {
+        stream: simulateReadableStream({ chunks: [] }),
+      },
+    });
+
+    const result = await compactWithOpenAIResponsesResult({
+      model,
+      replayKey: "openai:openai/gpt-test",
+      portableSummary: "Portable summary.",
+      messages: [{ role: "user", content: "history" }],
+      system: "system",
+      abortSignal: controller.signal,
+    });
+
+    expect(result).toMatchObject({
+      status: "error",
+      error: { _tag: "OpenAIServerCompactionAborted" },
     });
   });
 

@@ -1,13 +1,21 @@
 import type {
-  BusSubscription,
   Cursor,
   FetchOptions,
-  HandleContext,
-  Message,
+  PublishMessage,
   PublishOptions,
+  RawMessageDecodeOutcome,
   SubscriptionOptions,
   Topic,
 } from "./types";
+import type { Result as ResultType } from "better-result";
+
+import type {
+  EventDeliveryDoneError,
+  EventDeliveryStartFailed,
+  EventDeliveryStopFailed,
+  RawDeliveryDependencies,
+  RawDeliveryHandler,
+} from "./event-delivery";
 
 /**
  * Low-level bus interface.
@@ -18,23 +26,41 @@ import type {
 export interface RawBus {
   /** Append a message to a topic/stream. */
   publish<TData>(
-    msg: Omit<Message<TData>, "id" | "ts">,
+    msg: PublishMessage<TData>,
     opts: PublishOptions,
   ): Promise<{ id: string; cursor: Cursor }>;
 
-  /** Subscribe to a topic with the requested delivery mode. */
-  subscribe<TData>(
+  /**
+   * Subscribe to a topic. The transport owns acknowledgement and applies the
+   * handler's disposition. `park-pending` leaves durable entries in the PEL; it
+   * does not schedule or imply automatic retry/reclamation.
+   */
+  subscribe(
     topic: Topic,
     opts: SubscriptionOptions,
-    handler: (msg: Message<TData>, ctx: HandleContext) => Promise<void>,
-  ): Promise<BusSubscription>;
+    handler: RawDeliveryHandler,
+    dependencies?: RawDeliveryDependencies,
+  ): Promise<
+    ResultType<
+      {
+        readonly done: Promise<ResultType<void, EventDeliveryDoneError>>;
+        stop(): Promise<ResultType<void, EventDeliveryStopFailed>>;
+      },
+      EventDeliveryStartFailed
+    >
+  >;
 
   /** Fetch messages without creating a subscription. */
-  fetch<TData>(
+  fetch(
     topic: Topic,
     opts: FetchOptions,
   ): Promise<{
-    messages: Array<{ msg: Message<TData>; cursor: Cursor }>;
+    messages: Array<{
+      msg: RawMessageDecodeOutcome;
+      cursor: Cursor;
+      /** Present on transports that expose controlled delivery evidence. */
+      evidence?: import("./event-dead-letter").EventTransportEvidence;
+    }>;
     next?: Cursor;
   }>;
 

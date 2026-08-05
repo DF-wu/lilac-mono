@@ -3,20 +3,31 @@ import {
   extractAiErrorLogDetails,
   getCoreConfig,
   env,
-  errorMessage,
+  isPanic,
   type CoreConfig,
 } from "@stanley2058/lilac-utils";
 import {
   buildCoreLineageManifestV1,
   createCorePrimaryLineageFreshOnlyV1,
   lilacEventTypes,
+  type DeliveryDisposition,
+  type EventDeliveryDoneError,
+  type EventDeliveryStartFailed,
+  type EventDeliveryStopFailed,
   type EvtAdapterMessageCreatedData,
   type LilacBus,
+  type CorePrimaryLineageV1,
 } from "@stanley2058/lilac-event-bus";
+import { Result, TaggedError, type Panic, type Result as ResultType } from "better-result";
+import type { Logger } from "@stanley2058/simple-module-logger";
 import type { SurfaceAdapter } from "../adapter";
 import type { MsgRef } from "../types";
 import type { TranscriptStore } from "../../transcript/transcript-store";
-import { composeRequestMessages, composeSingleMessageWithLineage } from "./request-composition";
+import {
+  composeRequestMessages,
+  composeSingleMessageWithLineage,
+  type RequestCompositionResult,
+} from "./request-composition";
 import { formatDiscordMessageRequestId } from "./request-ids";
 
 import {
@@ -44,6 +55,7 @@ import {
   getDiscordFlags,
   withDefaultToolsConfig,
 } from "./bus-request-router/common";
+
 import {
   type BufferedMessage,
   type RouterGateInput,
@@ -72,13 +84,212 @@ import {
   resolveRepliedToMessageText as resolveRepliedToMessageTextImpl,
 } from "./bus-request-router/context";
 import { decideActiveRequestRoute } from "./bus-request-router/decisions";
-import type { CustomCommandManager } from "../../custom-commands/manager";
+import {
+  customCommandInvocationErrorText,
+  type CustomCommandManager,
+} from "../../custom-commands/manager";
+import { formatBridgeTaggedErrorForLog } from "./bridge-log";
+
+function createFreshOnlyLineage(
+  reason: string,
+  currentCanonicalStart: number,
+): CorePrimaryLineageV1 {
+  const created = createCorePrimaryLineageFreshOnlyV1(reason, currentCanonicalStart);
+  if (created.status === "ok") return created.value;
+  return {
+    state: "fresh-only",
+    lineageVersion: 1,
+    currentCanonicalStart: 0,
+    reason: "lineage-fallback-construction-failed",
+  };
+}
 
 type ActiveSessionState = {
   requestId: string;
   /** IDs of bot output messages in the current active output chain. */
   activeOutputMessageIds: Set<string>;
 };
+
+export class BusRequestRouterMissingHeadersError extends TaggedError(
+  "BusRequestRouterMissingHeadersError",
+)<{
+  readonly topic: "evt.request" | "evt.surface";
+  readonly messageType: string;
+  readonly message: string;
+}> {}
+
+export class BusRequestRouterRoutingError extends TaggedError("BusRequestRouterRoutingError")<{
+  readonly topic: "evt.request" | "evt.adapter";
+  readonly cause: unknown;
+  readonly message: string;
+}> {}
+
+export class BusRequestRouterActiveBatchGateFailed extends TaggedError(
+  "BusRequestRouterActiveBatchGateFailed",
+)<{
+  readonly sessionId: string;
+  readonly cause: unknown;
+  readonly message: string;
+}> {}
+
+export class BusRequestRouterDebounceFlushFailed extends TaggedError(
+  "BusRequestRouterDebounceFlushFailed",
+)<{
+  readonly sessionId: string;
+  readonly cause: unknown;
+  readonly message: string;
+}> {}
+
+class BusRequestRouterConfigReloadFailed extends TaggedError("BusRequestRouterConfigReloadFailed")<{
+  readonly cause: unknown;
+  readonly message: string;
+}> {}
+
+class BusRequestRouterSuppressionFailed extends TaggedError("BusRequestRouterSuppressionFailed")<{
+  readonly cause: unknown;
+  readonly message: string;
+}> {}
+
+type RouterDeliverySubscription = {
+  readonly done: Promise<ResultType<void, EventDeliveryDoneError>>;
+  stop(): Promise<ResultType<void, EventDeliveryStopFailed>>;
+};
+
+export type BusRequestRouter = {
+  readonly done: Promise<ResultType<void, EventDeliveryDoneError>>;
+  stop(): Promise<void>;
+};
+
+function lifecycleDeliveryPolicy(
+  error: BusRequestRouterMissingHeadersError | BusRequestRouterRoutingError,
+): DeliveryDisposition {
+  switch (error._tag) {
+    case "BusRequestRouterMissingHeadersError":
+    case "BusRequestRouterRoutingError":
+      return "park-pending";
+  }
+}
+
+function surfaceDeliveryPolicy(error: BusRequestRouterMissingHeadersError): DeliveryDisposition {
+  switch (error._tag) {
+    case "BusRequestRouterMissingHeadersError":
+      return "park-pending";
+  }
+}
+
+function adapterDeliveryPolicy(error: BusRequestRouterRoutingError): DeliveryDisposition {
+  switch (error._tag) {
+    case "BusRequestRouterRoutingError":
+      return "park-pending";
+  }
+}
+
+async function captureRouterRouting(
+  topic: "evt.request" | "evt.adapter",
+  operation: () => Promise<void>,
+): Promise<ResultType<void, BusRequestRouterRoutingError>> {
+  try {
+    await operation();
+    return Result.ok(undefined);
+  } catch (cause) {
+    if (isPanic(cause)) throw cause;
+    return Result.err(
+      new BusRequestRouterRoutingError({
+        topic,
+        cause,
+        message: `Bus request router failed while handling ${topic}`,
+      }),
+    );
+  }
+}
+
+async function captureRouterActiveBatchGate(
+  sessionId: string,
+  operation: () => Promise<RouterGateDecision>,
+): Promise<ResultType<RouterGateDecision, BusRequestRouterActiveBatchGateFailed>> {
+  try {
+    return Result.ok(await operation());
+  } catch (cause) {
+    if (isPanic(cause)) throw cause;
+    return Result.err(
+      new BusRequestRouterActiveBatchGateFailed({
+        sessionId,
+        cause,
+        message: "Active-batch router gate failed",
+      }),
+    );
+  }
+}
+
+async function captureRouterDebounceFlush(input: {
+  readonly sessionId: string;
+  readonly operation: () => Promise<void>;
+  readonly reportFatalPanic: (panic: Panic) => void;
+}): Promise<ResultType<void, BusRequestRouterDebounceFlushFailed>> {
+  try {
+    await input.operation();
+    return Result.ok(undefined);
+  } catch (cause) {
+    if (isPanic(cause)) {
+      input.reportFatalPanic(cause);
+      return Result.ok(undefined);
+    }
+    return Result.err(
+      new BusRequestRouterDebounceFlushFailed({
+        sessionId: input.sessionId,
+        cause,
+        message: "Bus request router debounce flush failed",
+      }),
+    );
+  }
+}
+
+function adaptRouterSubscriptionStart(
+  result: ResultType<RouterDeliverySubscription, EventDeliveryStartFailed>,
+): RouterDeliverySubscription {
+  if (result.status === "error") throw result.error;
+  return result.value;
+}
+
+function adaptRouterConfigResult(result: ReturnType<typeof withDefaultToolsConfig>): CoreConfig {
+  if (result.status === "ok") return result.value;
+  let failure: unknown;
+  switch (result.error._tag) {
+    case "CoreConfigV1Invalid":
+    case "CoreConfigV2Invalid":
+      failure = result.error.cause;
+      break;
+    case "CoreConfigVersionInvalid":
+    case "CoreConfigMustBeObject":
+      failure = new Error(result.error.message);
+      break;
+  }
+  throw failure;
+}
+
+function superviseRouterSubscriptionsDone(
+  subscriptions: readonly RouterDeliverySubscription[],
+): Promise<ResultType<void, EventDeliveryDoneError>> {
+  return Promise.race(subscriptions.map((subscription) => subscription.done));
+}
+
+async function adaptRouterSubscriptionsStop(
+  subscriptions: readonly RouterDeliverySubscription[],
+): Promise<void> {
+  const results = await Promise.all(subscriptions.map((subscription) => subscription.stop()));
+  for (const result of results) {
+    if (result.status === "error") throw result.error;
+  }
+}
+
+function resolveTriggerType(input: {
+  replyToBot: boolean | undefined;
+  mentionsBot: boolean | undefined;
+}): "reply" | "mention" | undefined {
+  if (input.replyToBot) return "reply";
+  if (input.mentionsBot) return "mention";
+  return undefined;
+}
 
 function uniqueParticipantUserIds(input: {
   values: readonly (string | undefined)[];
@@ -119,14 +330,20 @@ export async function startBusRequestRouter(params: {
   }) => Promise<{ suppress: boolean; reason?: string }>;
   /** Optional injection for unit tests (bypasses real model call). */
   routerGate?: (input: RouterGateInput) => Promise<RouterGateDecision>;
-}) {
+  /** Optional structured logger injection for embedding and tests. */
+  logger?: Logger;
+}): Promise<BusRequestRouter> {
   const { adapter, bus, subscriptionId, customCommands } = params;
 
-  const logger = createLogger({
-    module: "bus-request-router",
-  });
+  const logger =
+    params.logger ??
+    createLogger({
+      module: "bus-request-router",
+    });
 
-  let cfg = params.config ? await withDefaultToolsConfig(params.config) : await getCoreConfig();
+  let cfg = params.config
+    ? adaptRouterConfigResult(withDefaultToolsConfig(params.config))
+    : await getCoreConfig();
   let coreConfigReloadHadError = false;
   let lastCoreConfigReloadError: string | null = null;
 
@@ -145,12 +362,17 @@ export async function startBusRequestRouter(params: {
       coreConfigReloadHadError = false;
       lastCoreConfigReloadError = null;
     } catch (e) {
-      const msg = errorMessage(e);
+      if (isPanic(e)) throw e;
+      const failure = new BusRequestRouterConfigReloadFailed({
+        cause: e,
+        message: "Core config reload failed",
+      });
+      const logContext = formatBridgeTaggedErrorForLog(failure, {
+        path: "core-config.yaml",
+      });
+      const msg = logContext.errorMessage;
       if (!coreConfigReloadHadError || lastCoreConfigReloadError !== msg) {
-        logger.warn("core-config reload failed; using last known config", {
-          path: "core-config.yaml",
-          error: msg,
-        });
+        logger.warn("core-config reload failed; using last known config", logContext);
       }
 
       coreConfigReloadHadError = true;
@@ -161,6 +383,7 @@ export async function startBusRequestRouter(params: {
   const activeBySession = new Map<string, ActiveSessionState>();
   const buffers = new Map<string, DebounceBuffer>();
   const pendingMentionReplyBatchBySession = new Map<string, PendingMentionReplyBatch>();
+  const debounceDefect = Promise.withResolvers<ResultType<void, EventDeliveryDoneError>>();
   const evaluateRouterGate = (input: RouterGateInput): Promise<RouterGateDecision> => {
     return params.routerGate
       ? params.routerGate(input)
@@ -210,441 +433,515 @@ export async function startBusRequestRouter(params: {
       });
   }
 
-  const lifecycleSub = await bus.subscribeTopic(
-    "evt.request",
-    {
-      mode: "fanout",
-      subscriptionId: `${subscriptionId}:lifecycle`,
-      consumerId: consumerId(`${subscriptionId}:lifecycle`),
-      offset: { type: "now" },
-      batch: { maxWaitMs: 1000 },
-    },
-    async (msg, ctx) => {
-      if (msg.type !== lilacEventTypes.EvtRequestLifecycleChanged) {
-        await ctx.commit();
-        return;
-      }
+  async function evaluateAdapterSuppression(
+    evt: EvtAdapterMessageCreatedData,
+  ): Promise<{ suppress: boolean; reason?: string }> {
+    if (!params.shouldSuppressAdapterEvent) return { suppress: false };
+    try {
+      return await params.shouldSuppressAdapterEvent({ evt });
+    } catch (cause) {
+      if (isPanic(cause)) throw cause;
+      logger.error(
+        "router suppression hook failed; proceeding",
+        formatBridgeTaggedErrorForLog(
+          new BusRequestRouterSuppressionFailed({
+            cause,
+            message: "Router suppression hook failed",
+          }),
+        ),
+      );
+      return { suppress: false };
+    }
+  }
 
-      const requestId = msg.headers?.request_id;
-      const sessionId = msg.headers?.session_id;
-      if (!requestId || !sessionId) {
-        // Don't ack: malformed.
-        logger.error("router.message.invalid_headers", {
-          topic: "evt.request",
-          messageType: msg.type,
-          hasRequestId: Boolean(requestId),
-          hasSessionId: Boolean(sessionId),
-          cursor: ctx.cursor,
-          rawHeadersKeys: msg.headers ? Object.keys(msg.headers) : [],
-          action: "throw_unacked",
-        });
-        throw new Error(
-          "evt.request.lifecycle.changed missing required headers.request_id/session_id",
-        );
-      }
+  async function evaluateDirectReplyRouterGate(input: {
+    readonly sessionId: string;
+    readonly gateInput: RouterGateInput;
+  }): Promise<RouterGateDecision> {
+    try {
+      return await evaluateRouterGate(input.gateInput);
+    } catch (cause) {
+      if (isPanic(cause)) throw cause;
+      const failure = new BusRequestRouterActiveBatchGateFailed({
+        sessionId: input.sessionId,
+        cause,
+        message: "Direct-reply router gate failed",
+      });
+      logger.error(
+        "router direct-reply gate failed; forwarding",
+        formatBridgeTaggedErrorForLog(failure, {
+          sessionId: input.sessionId,
+          ...extractAiErrorLogDetails(cause),
+        }),
+      );
+      return { forward: true, reason: "error-fail-open" };
+    }
+  }
 
-      if (msg.data.state === "running") {
-        activeBySession.set(sessionId, {
-          requestId,
-          activeOutputMessageIds: new Set(),
-        });
-      }
-
-      if (
-        msg.data.state === "resolved" ||
-        msg.data.state === "failed" ||
-        msg.data.state === "cancelled"
-      ) {
-        const cur = activeBySession.get(sessionId);
-        if (cur?.requestId === requestId) {
-          await flushPendingMentionReplyBatchAsPrompt({
-            sessionId,
-            sourceRequestId: requestId,
-          });
-          activeBySession.delete(sessionId);
+  const lifecycleSub = adaptRouterSubscriptionStart(
+    await bus.subscribeTopic(
+      "evt.request",
+      {
+        mode: "fanout",
+        subscriptionId: `${subscriptionId}:lifecycle`,
+        consumerId: consumerId(`${subscriptionId}:lifecycle`),
+        offset: { type: "now" },
+        batch: { maxWaitMs: 1000 },
+      },
+      async (msg, ctx) => {
+        if (msg.type !== lilacEventTypes.EvtRequestLifecycleChanged) {
+          return Result.ok(undefined);
         }
-      }
 
-      await ctx.commit();
-    },
-  );
+        const requestId = msg.headers?.request_id;
+        const sessionId = msg.headers?.session_id;
+        if (!requestId || !sessionId) {
+          logger.error("router.message.invalid_headers", {
+            topic: "evt.request",
+            messageType: msg.type,
+            hasRequestId: Boolean(requestId),
+            hasSessionId: Boolean(sessionId),
+            cursor: ctx.cursor,
+            rawHeadersKeys: msg.headers ? Object.keys(msg.headers) : [],
+            action: "park_pending",
+          });
+          return Result.err(
+            new BusRequestRouterMissingHeadersError({
+              topic: "evt.request",
+              messageType: msg.type,
+              message:
+                "evt.request.lifecycle.changed missing required headers.request_id/session_id",
+            }),
+          );
+        }
 
-  const surfaceSub = await bus.subscribeTopic(
-    "evt.surface",
-    {
-      mode: "fanout",
-      subscriptionId: `${subscriptionId}:surface`,
-      consumerId: consumerId(`${subscriptionId}:surface`),
-      offset: { type: "now" },
-      batch: { maxWaitMs: 1000 },
-    },
-    async (msg, ctx) => {
-      if (msg.type !== lilacEventTypes.EvtSurfaceOutputMessageCreated) {
-        await ctx.commit();
-        return;
-      }
-
-      const requestId = msg.headers?.request_id;
-      const sessionId = msg.headers?.session_id;
-      if (!requestId || !sessionId) {
-        logger.error("router.message.invalid_headers", {
-          topic: "evt.surface",
-          messageType: msg.type,
-          hasRequestId: Boolean(requestId),
-          hasSessionId: Boolean(sessionId),
-          cursor: ctx.cursor,
-          rawHeadersKeys: msg.headers ? Object.keys(msg.headers) : [],
-          action: "throw_unacked",
-        });
-        throw new Error(
-          "evt.surface.output.message.created missing required headers.request_id/session_id",
-        );
-      }
-
-      const cur = activeBySession.get(sessionId);
-      if (!cur || cur.requestId !== requestId) {
-        await ctx.commit();
-        return;
-      }
-
-      const msgRef = msg.data.msgRef;
-      if (
-        msgRef?.platform === "discord" &&
-        typeof msgRef.messageId === "string" &&
-        msgRef.messageId
-      ) {
-        cur.activeOutputMessageIds.add(msgRef.messageId);
-      }
-
-      await ctx.commit();
-    },
-  );
-
-  const adapterSub = await bus.subscribeTopic(
-    "evt.adapter",
-    {
-      mode: "fanout",
-      subscriptionId: `${subscriptionId}:adapter`,
-      consumerId: consumerId(`${subscriptionId}:adapter`),
-      offset: { type: "now" },
-      batch: { maxWaitMs: 1000 },
-    },
-    async (msg, ctx) => {
-      if (msg.type !== lilacEventTypes.EvtAdapterMessageCreated) {
-        await ctx.commit();
-        return;
-      }
-      if (msg.data.platform !== "discord") {
-        await ctx.commit();
-        return;
-      }
-
-      if (env.perf.log) {
-        const lagMs = Date.now() - msg.ts;
-        const shouldWarn = lagMs >= env.perf.lagWarnMs;
-        const shouldSample = env.perf.sampleRate > 0 && Math.random() < env.perf.sampleRate;
-        if (shouldWarn || shouldSample) {
-          if (shouldWarn) {
-            logger.warn("perf.bus_lag", {
-              stage: "evt.adapter->router",
-              lagMs,
-              sessionId: msg.data.channelId,
-              messageId: msg.data.messageId,
-              userId: msg.data.userId,
-            });
-          } else {
-            logger.info("perf.bus_lag", {
-              stage: "evt.adapter->router",
-              lagMs,
-              sessionId: msg.data.channelId,
-              messageId: msg.data.messageId,
-              userId: msg.data.userId,
+        return captureRouterRouting("evt.request", async () => {
+          if (msg.data.state === "running") {
+            activeBySession.set(sessionId, {
+              requestId,
+              activeOutputMessageIds: new Set(),
             });
           }
+
+          if (
+            msg.data.state === "resolved" ||
+            msg.data.state === "failed" ||
+            msg.data.state === "cancelled"
+          ) {
+            const cur = activeBySession.get(sessionId);
+            if (cur?.requestId === requestId) {
+              await flushPendingMentionReplyBatchAsPrompt({
+                sessionId,
+                sourceRequestId: requestId,
+              });
+              activeBySession.delete(sessionId);
+            }
+          }
+        });
+      },
+      lifecycleDeliveryPolicy,
+    ),
+  );
+
+  const surfaceSub = adaptRouterSubscriptionStart(
+    await bus.subscribeTopic(
+      "evt.surface",
+      {
+        mode: "fanout",
+        subscriptionId: `${subscriptionId}:surface`,
+        consumerId: consumerId(`${subscriptionId}:surface`),
+        offset: { type: "now" },
+        batch: { maxWaitMs: 1000 },
+      },
+      async (msg, ctx) => {
+        if (msg.type !== lilacEventTypes.EvtSurfaceOutputMessageCreated) {
+          return Result.ok(undefined);
         }
-      }
 
-      if (params.shouldSuppressAdapterEvent) {
-        const decision = await params
-          .shouldSuppressAdapterEvent({ evt: msg.data })
-          .catch((e: unknown) => {
-            logger.error("router suppression hook failed; proceeding", e);
-            return { suppress: false as const };
+        const requestId = msg.headers?.request_id;
+        const sessionId = msg.headers?.session_id;
+        if (!requestId || !sessionId) {
+          logger.error("router.message.invalid_headers", {
+            topic: "evt.surface",
+            messageType: msg.type,
+            hasRequestId: Boolean(requestId),
+            hasSessionId: Boolean(sessionId),
+            cursor: ctx.cursor,
+            rawHeadersKeys: msg.headers ? Object.keys(msg.headers) : [],
+            action: "park_pending",
           });
-
-        if (decision.suppress) {
-          logger.info("router suppressed adapter message", {
-            sessionId: msg.data.channelId,
-            messageId: msg.data.messageId,
-            userId: msg.data.userId,
-            reason: decision.reason,
-          });
-          await ctx.commit();
-          return;
+          return Result.err(
+            new BusRequestRouterMissingHeadersError({
+              topic: "evt.surface",
+              messageType: msg.type,
+              message:
+                "evt.surface.output.message.created missing required headers.request_id/session_id",
+            }),
+          );
         }
-      }
 
-      // reload config opportunistically (mtime cached in getCoreConfig).
-      // If reload fails, keep using the last known good config.
-      await reloadCoreConfigIfNeeded();
+        const cur = activeBySession.get(sessionId);
+        if (!cur || cur.requestId !== requestId) {
+          return Result.ok(undefined);
+        }
 
-      const sessionId = msg.data.channelId;
-      const msgRef = parseDiscordMsgRefFromAdapterEvent(msg.data);
+        const msgRef = msg.data.msgRef;
+        if (
+          msgRef?.platform === "discord" &&
+          typeof msgRef.messageId === "string" &&
+          msgRef.messageId
+        ) {
+          cur.activeOutputMessageIds.add(msgRef.messageId);
+        }
 
-      const flags = getDiscordFlags(msg.data.raw);
-      const isDm = flags.isDMBased === true;
-      const parentChannelId = flags.parentChannelId;
-      const botMentionNames = resolveBotMentionNames({
-        cfg,
-        botUserId: flags.botUserId ?? (await adapter.getSelf()).userId,
-      });
-      const requestModelOverride = parseLeadingModelOverride({
-        text: msg.data.text,
-        botNames: botMentionNames,
-      });
-      const continueCount = parseLeadingContinueDirective({
-        text: msg.data.text,
-        botNames: botMentionNames,
-      });
-      const configuredSessionModelOverride = resolveSessionModelOverride(
-        cfg,
-        sessionId,
-        parentChannelId,
-      );
-      const modelOverride =
-        requestModelOverride ?? flags.sessionModelOverride ?? configuredSessionModelOverride;
-      const sessionConfigId = isDm
-        ? sessionId
-        : resolveSessionConfigId({
+        return Result.ok(undefined);
+      },
+      surfaceDeliveryPolicy,
+    ),
+  );
+
+  const adapterSub = adaptRouterSubscriptionStart(
+    await bus.subscribeTopic(
+      "evt.adapter",
+      {
+        mode: "fanout",
+        subscriptionId: `${subscriptionId}:adapter`,
+        consumerId: consumerId(`${subscriptionId}:adapter`),
+        offset: { type: "now" },
+        batch: { maxWaitMs: 1000 },
+      },
+      async (msg) => {
+        if (msg.type !== lilacEventTypes.EvtAdapterMessageCreated) {
+          return Result.ok(undefined);
+        }
+        if (msg.data.platform !== "discord") {
+          return Result.ok(undefined);
+        }
+
+        return captureRouterRouting("evt.adapter", async () => {
+          if (env.perf.log) {
+            const lagMs = Date.now() - msg.ts;
+            const shouldWarn = lagMs >= env.perf.lagWarnMs;
+            const shouldSample = env.perf.sampleRate > 0 && Math.random() < env.perf.sampleRate;
+            if (shouldWarn || shouldSample) {
+              if (shouldWarn) {
+                logger.warn("perf.bus_lag", {
+                  stage: "evt.adapter->router",
+                  lagMs,
+                  sessionId: msg.data.channelId,
+                  messageId: msg.data.messageId,
+                  userId: msg.data.userId,
+                });
+              } else {
+                logger.info("perf.bus_lag", {
+                  stage: "evt.adapter->router",
+                  lagMs,
+                  sessionId: msg.data.channelId,
+                  messageId: msg.data.messageId,
+                  userId: msg.data.userId,
+                });
+              }
+            }
+          }
+
+          const suppression = await evaluateAdapterSuppression(msg.data);
+          if (suppression.suppress) {
+            logger.info("router suppressed adapter message", {
+              sessionId: msg.data.channelId,
+              messageId: msg.data.messageId,
+              userId: msg.data.userId,
+              reason: suppression.reason,
+            });
+            return;
+          }
+
+          // reload config opportunistically (mtime cached in getCoreConfig).
+          // If reload fails, keep using the last known good config.
+          await reloadCoreConfigIfNeeded();
+
+          const sessionId = msg.data.channelId;
+          const msgRef = parseDiscordMsgRefFromAdapterEvent(msg.data);
+
+          const flags = getDiscordFlags(msg.data.raw);
+          const isDm = flags.isDMBased === true;
+          const parentChannelId = flags.parentChannelId;
+          const botMentionNames = resolveBotMentionNames({
+            cfg,
+            botUserId: flags.botUserId ?? (await adapter.getSelf()).userId,
+          });
+          const requestModelOverride = parseLeadingModelOverride({
+            text: msg.data.text,
+            botNames: botMentionNames,
+          });
+          const continueCount = parseLeadingContinueDirective({
+            text: msg.data.text,
+            botNames: botMentionNames,
+          });
+          const configuredSessionModelOverride = resolveSessionModelOverride(
             cfg,
             sessionId,
             parentChannelId,
+          );
+          const modelOverride =
+            requestModelOverride ?? flags.sessionModelOverride ?? configuredSessionModelOverride;
+          const sessionConfigId = isDm
+            ? sessionId
+            : resolveSessionConfigId({
+                cfg,
+                sessionId,
+                parentChannelId,
+              });
+
+          const mode: SessionMode = isDm
+            ? "active"
+            : getSessionMode(cfg, sessionId, parentChannelId);
+          const gateEnabled = resolveSessionGateEnabled(cfg, sessionId, parentChannelId);
+
+          const active = activeBySession.get(sessionId);
+
+          const logRouteDecision = (input: {
+            decision:
+              | "forward"
+              | "skip"
+              | "queue_followup"
+              | "queue_prompt"
+              | "steer"
+              | "interrupt";
+            reason: string;
+          }) => {
+            logger.info("router.route.decision", {
+              sessionId,
+              messageId: msgRef.messageId,
+              userId: msg.data.userId,
+              mode,
+              gateEnabled,
+              decision: input.decision,
+              reason: input.reason,
+              activeRequestId: active?.requestId,
+              sessionConfigId,
+              modelOverride,
+              requestModelOverride,
+              continueCount,
+            });
+          };
+
+          logger.debug("adapter.message.created", {
+            sessionId,
+            messageId: msgRef.messageId,
+            userId: msg.data.userId,
+            mode,
+            isDm,
+            mentionsBot: flags.mentionsBot === true,
+            replyToBot: flags.replyToBot === true,
+            activeRequestId: active?.requestId,
+            sessionConfigId,
+            modelOverride,
+            requestModelOverride,
+            continueCount,
+            textPreview:
+              typeof msg.data.text === "string" && msg.data.text.trim().length > 0
+                ? previewText(msg.data.text)
+                : undefined,
           });
 
-      const mode: SessionMode = isDm ? "active" : getSessionMode(cfg, sessionId, parentChannelId);
-      const gateEnabled = resolveSessionGateEnabled(cfg, sessionId, parentChannelId);
+          const customName = customCommands?.peekTextName(msg.data.text) ?? null;
+          if (customName) {
+            const requestId = formatDiscordMessageRequestId({
+              channelId: sessionId,
+              messageId: msgRef.messageId,
+            });
+            const raw = (() => {
+              const known = customCommands?.get(customName);
+              if (!known) {
+                return {
+                  customCommand: {
+                    name: customName,
+                    args: [],
+                    text: msg.data.text,
+                    source: "text",
+                    error: `Unknown custom command '${customName}'.`,
+                  },
+                };
+              }
 
-      const active = activeBySession.get(sessionId);
+              const parsed = customCommands?.parseText(msg.data.text);
+              if (!parsed || parsed.status === "error") {
+                return {
+                  customCommand: {
+                    name: customName,
+                    args: [],
+                    text: msg.data.text,
+                    source: "text",
+                    error: parsed
+                      ? customCommandInvocationErrorText(parsed.error)
+                      : `Unknown custom command '${customName}'.`,
+                  },
+                };
+              }
+              if (!parsed.value) {
+                return {
+                  customCommand: {
+                    name: customName,
+                    args: [],
+                    text: msg.data.text,
+                    source: "text",
+                    error: `Unknown custom command '${customName}'.`,
+                  },
+                };
+              }
 
-      const logRouteDecision = (input: {
-        decision: "forward" | "skip" | "queue_followup" | "queue_prompt" | "steer" | "interrupt";
-        reason: string;
-      }) => {
-        logger.info("router.route.decision", {
-          sessionId,
-          messageId: msgRef.messageId,
-          userId: msg.data.userId,
-          mode,
-          gateEnabled,
-          decision: input.decision,
-          reason: input.reason,
-          activeRequestId: active?.requestId,
-          sessionConfigId,
-          modelOverride,
-          requestModelOverride,
-          continueCount,
-        });
-      };
-
-      logger.debug("adapter.message.created", {
-        sessionId,
-        messageId: msgRef.messageId,
-        userId: msg.data.userId,
-        mode,
-        isDm,
-        mentionsBot: flags.mentionsBot === true,
-        replyToBot: flags.replyToBot === true,
-        activeRequestId: active?.requestId,
-        sessionConfigId,
-        modelOverride,
-        requestModelOverride,
-        continueCount,
-        textPreview:
-          typeof msg.data.text === "string" && msg.data.text.trim().length > 0
-            ? previewText(msg.data.text)
-            : undefined,
-      });
-
-      const customName = customCommands?.peekTextName(msg.data.text) ?? null;
-      if (customName) {
-        const requestId = formatDiscordMessageRequestId({
-          channelId: sessionId,
-          messageId: msgRef.messageId,
-        });
-        const raw = (() => {
-          const known = customCommands?.get(customName);
-          if (!known) {
-            return {
-              customCommand: {
-                name: customName,
-                args: [],
-                text: msg.data.text,
-                source: "text",
-                error: `Unknown custom command '${customName}'.`,
-              },
-            };
-          }
-
-          try {
-            const parsed = customCommands?.parseText(msg.data.text);
-            if (!parsed) {
               return {
                 customCommand: {
-                  name: customName,
-                  args: [],
-                  text: msg.data.text,
-                  source: "text",
-                  error: `Unknown custom command '${customName}'.`,
+                  name: parsed.value.command.def.name,
+                  args: parsed.value.args,
+                  ...(parsed.value.prompt ? { prompt: parsed.value.prompt } : {}),
+                  text: parsed.value.text,
+                  source: parsed.value.source,
                 },
               };
+            })();
+
+            await publishSingleMessagePrompt({
+              adapter,
+              bus,
+              cfg,
+              requestId,
+              sessionId,
+              sessionConfigId,
+              parentChannelId,
+              msgRef,
+              sessionMode: mode,
+              modelOverride,
+              raw,
+            });
+
+            logRouteDecision({
+              decision: "forward",
+              reason: `custom_command:${customName}`,
+            });
+            return;
+          }
+
+          if (
+            !isDm &&
+            gateEnabled &&
+            shouldRunDirectReplyMentionGate({
+              replyToBot: flags.replyToBot === true,
+              mentionsBot: flags.mentionsBot === true,
+              text: msg.data.text,
+              botNames: botMentionNames,
+            })
+          ) {
+            const [previousMessageText, repliedToMessageText] = await Promise.all([
+              resolvePreviousMessageText({ msgRef, triggerTs: msg.data.ts }),
+              resolveRepliedToMessageText({
+                sessionId,
+                replyToMessageId: flags.replyToMessageId,
+              }),
+            ]);
+
+            const decision = await evaluateDirectReplyRouterGate({
+              sessionId,
+              gateInput: {
+                sessionId,
+                botName: cfg.surface.discord.botName,
+                messages: [
+                  {
+                    msgRef,
+                    userId: msg.data.userId,
+                    text: msg.data.text,
+                    ts: msg.data.ts,
+                    mentionsBot: flags.mentionsBot === true,
+                    replyToBot: flags.replyToBot === true,
+                  },
+                ],
+                context: {
+                  mode: "direct-reply-mention-disambiguation",
+                  triggerMessageText: normalizeGateText(msg.data.text),
+                  previousMessageText,
+                  repliedToMessageText,
+                },
+              },
+            });
+
+            if (!decision.forward) {
+              logRouteDecision({
+                decision: "skip",
+                reason: `direct_reply_gate:${decision.reason ?? "skip"}`,
+              });
+              return;
             }
 
-            return {
-              customCommand: {
-                name: parsed.command.def.name,
-                args: parsed.args,
-                ...(parsed.prompt ? { prompt: parsed.prompt } : {}),
-                text: parsed.text,
-                source: parsed.source,
-              },
-            };
-          } catch (error) {
-            return {
-              customCommand: {
-                name: customName,
-                args: [],
-                text: msg.data.text,
-                source: "text",
-                error: error instanceof Error ? error.message : String(error),
-              },
-            };
+            logRouteDecision({
+              decision: "forward",
+              reason: `direct_reply_gate:${decision.reason ?? "forward"}`,
+            });
           }
-        })();
 
-        await publishSingleMessagePrompt({
-          adapter,
-          bus,
-          cfg,
-          requestId,
-          sessionId,
-          sessionConfigId,
-          parentChannelId,
-          msgRef,
-          sessionMode: mode,
-          modelOverride,
-          raw,
-        });
+          if (mode === "active") {
+            if (isDm) {
+              await handleActiveDmMode({
+                adapter,
+                bus,
+                cfg,
+                sessionId,
+                msgRef,
+                userId: msg.data.userId,
+                userText: msg.data.text,
+                mentionsBot: flags.mentionsBot === true,
+                replyToBot: flags.replyToBot === true,
+                replyToMessageId: flags.replyToMessageId,
+                active,
+                sessionMode: mode,
+                sessionConfigId,
+                modelOverride,
+                requestModelOverride,
+                continueCount,
+                botMentionNames,
+              });
+            } else {
+              await handleActiveChannelMode({
+                adapter,
+                bus,
+                cfg,
+                buffers,
+                sessionId,
+                msgRef,
+                userId: msg.data.userId,
+                userText: msg.data.text,
+                messageTs: msg.data.ts,
+                mentionsBot: flags.mentionsBot === true,
+                replyToBot: flags.replyToBot === true,
+                replyToMessageId: flags.replyToMessageId,
+                botUserId: flags.botUserId,
+                parentChannelId,
+                active,
+                sessionMode: mode,
+                sessionConfigId,
+                modelOverride,
+                requestModelOverride,
+                continueCount,
+                botMentionNames,
+              });
+            }
 
-        logRouteDecision({
-          decision: "forward",
-          reason: `custom_command:${customName}`,
-        });
-        await ctx.commit();
-        return;
-      }
+            return;
+          }
 
-      if (
-        !isDm &&
-        gateEnabled &&
-        shouldRunDirectReplyMentionGate({
-          replyToBot: flags.replyToBot === true,
-          mentionsBot: flags.mentionsBot === true,
-          text: msg.data.text,
-          botNames: botMentionNames,
-        })
-      ) {
-        const [previousMessageText, repliedToMessageText] = await Promise.all([
-          resolvePreviousMessageText({ msgRef, triggerTs: msg.data.ts }),
-          resolveRepliedToMessageText({
-            sessionId,
-            replyToMessageId: flags.replyToMessageId,
-          }),
-        ]);
-
-        const decision = await evaluateRouterGate({
-          sessionId,
-          botName: cfg.surface.discord.botName,
-          messages: [
-            {
-              msgRef,
-              userId: msg.data.userId,
-              text: msg.data.text,
-              ts: msg.data.ts,
-              mentionsBot: flags.mentionsBot === true,
-              replyToBot: flags.replyToBot === true,
-            },
-          ],
-          context: {
-            mode: "direct-reply-mention-disambiguation",
-            triggerMessageText: normalizeGateText(msg.data.text),
-            previousMessageText,
-            repliedToMessageText,
-          },
-        }).catch((e: unknown) => {
-          logger.error(
-            "router direct-reply gate failed; forwarding",
-            { sessionId, ...extractAiErrorLogDetails(e) },
-            e,
-          );
-          return {
-            forward: true,
-            reason: "error-fail-open",
-          } satisfies RouterGateDecision;
-        });
-
-        if (!decision.forward) {
-          logRouteDecision({
-            decision: "skip",
-            reason: `direct_reply_gate:${decision.reason ?? "skip"}`,
-          });
-          await ctx.commit();
-          return;
-        }
-
-        logRouteDecision({
-          decision: "forward",
-          reason: `direct_reply_gate:${decision.reason ?? "forward"}`,
-        });
-      }
-
-      if (mode === "active") {
-        if (isDm) {
-          await handleActiveDmMode({
+          await handleMentionMode({
             adapter,
             bus,
             cfg,
+            activeBySession,
             sessionId,
             msgRef,
             userId: msg.data.userId,
             userText: msg.data.text,
-            mentionsBot: flags.mentionsBot === true,
-            replyToBot: flags.replyToBot === true,
+            mentionsBot: flags.mentionsBot,
+            replyToBot: flags.replyToBot,
             replyToMessageId: flags.replyToMessageId,
             active,
-            sessionMode: mode,
-            sessionConfigId,
-            modelOverride,
-            requestModelOverride,
-            continueCount,
-            botMentionNames,
-          });
-        } else {
-          await handleActiveChannelMode({
-            adapter,
-            bus,
-            cfg,
-            buffers,
-            sessionId,
-            msgRef,
-            userId: msg.data.userId,
-            userText: msg.data.text,
-            messageTs: msg.data.ts,
-            mentionsBot: flags.mentionsBot === true,
-            replyToBot: flags.replyToBot === true,
-            replyToMessageId: flags.replyToMessageId,
-            botUserId: flags.botUserId,
             parentChannelId,
-            active,
             sessionMode: mode,
             sessionConfigId,
             modelOverride,
@@ -652,36 +949,10 @@ export async function startBusRequestRouter(params: {
             continueCount,
             botMentionNames,
           });
-        }
-
-        await ctx.commit();
-        return;
-      }
-
-      await handleMentionMode({
-        adapter,
-        bus,
-        cfg,
-        activeBySession,
-        sessionId,
-        msgRef,
-        userId: msg.data.userId,
-        userText: msg.data.text,
-        mentionsBot: flags.mentionsBot,
-        replyToBot: flags.replyToBot,
-        replyToMessageId: flags.replyToMessageId,
-        active,
-        parentChannelId,
-        sessionMode: mode,
-        sessionConfigId,
-        modelOverride,
-        requestModelOverride,
-        continueCount,
-        botMentionNames,
-      });
-
-      await ctx.commit();
-    },
+        });
+      },
+      adapterDeliveryPolicy,
+    ),
   );
 
   function clearDebounceBuffer(sessionId: string) {
@@ -781,11 +1052,18 @@ export async function startBusRequestRouter(params: {
         msgRef: last.msgRef,
       },
     });
+    if (composed.status === "error") {
+      logger.error("request composition failed", {
+        requestId,
+        sessionId: input.sessionId,
+        error: "Core owned blob integrity check failed",
+      });
+      return;
+    }
+    const composition = composed.value;
 
-    const chainMessageIds = new Set(composed.chainMessageIds);
-    const extraCompositions: Array<
-      NonNullable<Awaited<ReturnType<typeof composeSingleMessageWithLineage>>>
-    > = [];
+    const chainMessageIds = new Set(composition.chainMessageIds);
+    const extraCompositions: RequestCompositionResult[] = [];
     const batchParticipantUserIds: string[] = [];
 
     for (const item of batch.items) {
@@ -802,53 +1080,61 @@ export async function startBusRequestRouter(params: {
         transformUserText: transformPendingUserText(item),
       });
 
-      if (!extra) continue;
-      extraCompositions.push(extra);
+      if (extra.status === "error") {
+        logger.error("request composition failed", {
+          requestId,
+          sessionId: input.sessionId,
+          error: "Core owned blob integrity check failed",
+        });
+        return;
+      }
+      if (!extra.value) continue;
+      extraCompositions.push(extra.value);
       chainMessageIds.add(item.msgRef.messageId);
     }
 
-    let baseInsertAt = composed.messages.length;
+    let baseInsertAt = composition.messages.length;
     const finalMessages = (() => {
       const extraMessages = extraCompositions.flatMap((extra) => extra.messages);
-      if (extraMessages.length === 0) return composed.messages;
+      if (extraMessages.length === 0) return composition.messages;
 
-      for (let i = composed.messages.length - 1; i >= 0; i--) {
-        if (composed.messages[i]?.role === "user") {
+      for (let i = composition.messages.length - 1; i >= 0; i--) {
+        if (composition.messages[i]?.role === "user") {
           baseInsertAt = i;
           break;
         }
       }
 
-      if (baseInsertAt === composed.messages.length) {
-        return [...composed.messages, ...extraMessages];
+      if (baseInsertAt === composition.messages.length) {
+        return [...composition.messages, ...extraMessages];
       }
 
       return [
-        ...composed.messages.slice(0, baseInsertAt),
+        ...composition.messages.slice(0, baseInsertAt),
         ...extraMessages,
-        ...composed.messages.slice(baseInsertAt),
+        ...composition.messages.slice(baseInsertAt),
       ];
     })();
     const finalLineage = (() => {
-      if (extraCompositions.length === 0) return composed.corePrimaryLineage;
+      if (extraCompositions.length === 0) return composition.corePrimaryLineage;
       if (
-        composed.corePrimaryLineage.state !== "complete" ||
+        composition.corePrimaryLineage.state !== "complete" ||
         extraCompositions.some((extra) => extra.corePrimaryLineage.state !== "complete")
       ) {
-        return createCorePrimaryLineageFreshOnlyV1(
+        return createFreshOnlyLineage(
           "deferred-batch-incomplete-lineage",
-          Math.min(baseInsertAt, composed.corePrimaryLineage.currentCanonicalStart),
+          Math.min(baseInsertAt, composition.corePrimaryLineage.currentCanonicalStart),
         );
       }
-      const baseSegments = composed.corePrimaryLineage.segments;
+      const baseSegments = composition.corePrimaryLineage.segments;
       const insertSegmentIndex =
-        baseInsertAt === composed.messages.length
+        baseInsertAt === composition.messages.length
           ? baseSegments.length
           : baseSegments.findIndex((segment) => segment.canonicalStart === baseInsertAt);
       if (insertSegmentIndex < 0) {
-        return createCorePrimaryLineageFreshOnlyV1(
+        return createFreshOnlyLineage(
           "deferred-batch-unaligned-insertion",
-          composed.corePrimaryLineage.currentCanonicalStart,
+          composition.corePrimaryLineage.currentCanonicalStart,
         );
       }
       const extraSegments = extraCompositions.flatMap((extra) =>
@@ -860,7 +1146,8 @@ export async function startBusRequestRouter(params: {
         ...baseSegments.slice(insertSegmentIndex),
       ];
       const baseCurrentSegment = baseSegments.findIndex(
-        (segment) => segment.canonicalStart === composed.corePrimaryLineage.currentCanonicalStart,
+        (segment) =>
+          segment.canonicalStart === composition.corePrimaryLineage.currentCanonicalStart,
       );
       const currentSegmentIndex = Math.min(
         insertSegmentIndex,
@@ -869,7 +1156,7 @@ export async function startBusRequestRouter(params: {
           : baseCurrentSegment +
               (insertSegmentIndex <= baseCurrentSegment ? extraSegments.length : 0),
       );
-      return buildCoreLineageManifestV1(
+      const built = buildCoreLineageManifestV1(
         combinedSegments.map((segment) => ({
           atoms: segment.atoms,
           canonicalMessages: segment.canonicalMessages,
@@ -877,6 +1164,12 @@ export async function startBusRequestRouter(params: {
         })),
         { currentSegmentIndex },
       );
+      return built.status === "ok"
+        ? built.value
+        : createFreshOnlyLineage(
+            "deferred-batch-lineage-build-failed",
+            composition.corePrimaryLineage.currentCanonicalStart,
+          );
     })();
 
     await publishBusRequest({
@@ -893,10 +1186,10 @@ export async function startBusRequestRouter(params: {
       raw: {
         triggerType: "reply",
         chainMessageIds: [...chainMessageIds],
-        mergedGroups: composed.mergedGroups,
+        mergedGroups: composition.mergedGroups,
         participantUserIds: uniqueParticipantUserIds({
           values: [
-            ...composed.mergedGroups.map((group) => group.authorId),
+            ...composition.mergedGroups.map((group) => group.authorId),
             ...batchParticipantUserIds,
           ],
           exclude: self.userId,
@@ -971,7 +1264,7 @@ export async function startBusRequestRouter(params: {
         }),
         sessionId,
         triggerMsgRef: msgRef,
-        triggerType: replyToBot ? "reply" : mentionsBot ? "mention" : undefined,
+        triggerType: resolveTriggerType({ replyToBot, mentionsBot }),
         sessionMode,
         sessionConfigId,
         modelOverride: requestModelOverride,
@@ -1109,11 +1402,7 @@ export async function startBusRequestRouter(params: {
       messageId: msgRef.messageId,
     });
 
-    const triggerType: "mention" | "reply" | undefined = replyToBot
-      ? "reply"
-      : mentionsBot
-        ? "mention"
-        : undefined;
+    const triggerType = resolveTriggerType({ replyToBot, mentionsBot });
 
     // DMs are ungated: start a new request immediately.
     await publishActiveChannelPrompt({
@@ -1209,7 +1498,7 @@ export async function startBusRequestRouter(params: {
         }),
         sessionId,
         triggerMsgRef: msgRef,
-        triggerType: replyToBot ? "reply" : mentionsBot ? "mention" : undefined,
+        triggerType: resolveTriggerType({ replyToBot, mentionsBot }),
         sessionMode,
         sessionConfigId,
         parentChannelId,
@@ -1464,9 +1753,7 @@ export async function startBusRequestRouter(params: {
       };
 
       buffer.timer = setTimeout(() => {
-        flushDebounce(sessionId).catch((e: unknown) => {
-          logger.error("router flushDebounce failed", { sessionId }, e);
-        });
+        void runDebounceTimer(sessionId);
       }, cfg.surface.router.activeDebounceMs);
 
       buffers.set(sessionId, buffer);
@@ -1476,7 +1763,21 @@ export async function startBusRequestRouter(params: {
     existing.messages.push(message);
   }
 
-  async function flushDebounce(sessionId: string) {
+  async function runDebounceTimer(sessionId: string): Promise<void> {
+    const flushed = await captureRouterDebounceFlush({
+      sessionId,
+      operation: () => flushDebounce(sessionId),
+      reportFatalPanic: debounceDefect.reject,
+    });
+    if (flushed.status === "error") {
+      logger.error(
+        "router flushDebounce failed",
+        formatBridgeTaggedErrorForLog(flushed.error, { sessionId }),
+      );
+    }
+  }
+
+  async function flushDebounce(sessionId: string): Promise<void> {
     const b = buffers.get(sessionId);
     if (!b) return;
     clearDebounceBuffer(sessionId);
@@ -1487,8 +1788,10 @@ export async function startBusRequestRouter(params: {
       ? await resolvePreviousBatchMessageText(b.messages)
       : undefined;
 
-    const decision = gateEnabled
-      ? await evaluateRouterGate({
+    let decision: RouterGateDecision = { forward: true, reason: "disabled" };
+    if (gateEnabled) {
+      const evaluated = await captureRouterActiveBatchGate(sessionId, () =>
+        evaluateRouterGate({
           sessionId,
           botName: cfg.surface.discord.botName,
           messages: b.messages,
@@ -1496,18 +1799,21 @@ export async function startBusRequestRouter(params: {
             mode: "active-batch",
             previousMessageText,
           },
-        }).catch((e: unknown) => {
-          logger.error(
-            "router gate failed; skipping",
-            { sessionId, ...extractAiErrorLogDetails(e) },
-            e,
-          );
-          return { forward: false, reason: "error" };
-        })
-      : ({ forward: true as const, reason: "disabled" } satisfies {
-          forward: boolean;
-          reason?: string;
-        });
+        }),
+      );
+      if (evaluated.status === "error") {
+        logger.error(
+          "router gate failed; skipping",
+          formatBridgeTaggedErrorForLog(evaluated.error, {
+            sessionId,
+            ...extractAiErrorLogDetails(evaluated.error.cause),
+          }),
+        );
+        decision = { forward: false, reason: "error" };
+      } else {
+        decision = evaluated.value;
+      }
+    }
 
     if (!decision.forward) {
       logger.info("router.route.decision", {
@@ -1640,7 +1946,7 @@ export async function startBusRequestRouter(params: {
       continueCount,
     });
 
-    const triggerType = replyToBot ? "reply" : mentionsBot ? "mention" : null;
+    const triggerType = resolveTriggerType({ replyToBot, mentionsBot }) ?? null;
 
     if (!triggerType) {
       // Mention-only channels: ignore non-triggers (even if a request is active).
@@ -1800,7 +2106,7 @@ export async function startBusRequestRouter(params: {
 
   async function publishComposedRequest(input: PublishComposedLocalInput) {
     const { adapter, bus, cfg, ...requestInput } = input;
-    await publishComposedRequestImpl({
+    const published = await publishComposedRequestImpl({
       adapter,
       bus,
       cfg,
@@ -1808,6 +2114,13 @@ export async function startBusRequestRouter(params: {
       logger,
       input: requestInput,
     });
+    if (published.status === "error") {
+      logger.error("request composition failed", {
+        requestId: input.requestId,
+        sessionId: input.sessionId,
+        error: "Core owned blob integrity check failed",
+      });
+    }
   }
 
   type PublishActiveChannelPromptLocalInput = Parameters<
@@ -1821,7 +2134,7 @@ export async function startBusRequestRouter(params: {
 
   async function publishActiveChannelPrompt(input: PublishActiveChannelPromptLocalInput) {
     const { adapter, bus, cfg, markActive, ...requestInput } = input;
-    await publishActiveChannelPromptImpl({
+    const published = await publishActiveChannelPromptImpl({
       adapter,
       bus,
       cfg,
@@ -1829,6 +2142,14 @@ export async function startBusRequestRouter(params: {
       logger,
       input: requestInput,
     });
+    if (published.status === "error") {
+      logger.error("request composition failed", {
+        requestId: input.requestId,
+        sessionId: input.sessionId,
+        error: "Core owned blob integrity check failed",
+      });
+      return;
+    }
 
     if (markActive) {
       activeBySession.set(input.sessionId, {
@@ -1850,7 +2171,7 @@ export async function startBusRequestRouter(params: {
     input: PublishSingleMessageToActiveRequestLocalInput,
   ) {
     const { adapter, bus, cfg, ...requestInput } = input;
-    await publishSingleMessageToActiveRequestImpl({
+    const published = await publishSingleMessageToActiveRequestImpl({
       adapter,
       bus,
       cfg,
@@ -1858,6 +2179,13 @@ export async function startBusRequestRouter(params: {
       logger,
       input: requestInput,
     });
+    if (published.status === "error") {
+      logger.error("request composition failed", {
+        requestId: input.requestId,
+        sessionId: input.sessionId,
+        error: "Core owned blob integrity check failed",
+      });
+    }
   }
 
   type PublishSingleMessagePromptLocalInput = Parameters<
@@ -1870,7 +2198,7 @@ export async function startBusRequestRouter(params: {
 
   async function publishSingleMessagePrompt(input: PublishSingleMessagePromptLocalInput) {
     const { adapter, bus, cfg, ...requestInput } = input;
-    await publishSingleMessagePromptImpl({
+    const published = await publishSingleMessagePromptImpl({
       adapter,
       bus,
       cfg,
@@ -1878,6 +2206,13 @@ export async function startBusRequestRouter(params: {
       logger,
       input: requestInput,
     });
+    if (published.status === "error") {
+      logger.error("request composition failed", {
+        requestId: input.requestId,
+        sessionId: input.sessionId,
+        error: "Core owned blob integrity check failed",
+      });
+    }
   }
 
   async function publishSurfaceOutputReanchor(
@@ -1886,16 +2221,24 @@ export async function startBusRequestRouter(params: {
     await publishSurfaceOutputReanchorImpl(input);
   }
 
+  const subscriptions = [adapterSub, lifecycleSub, surfaceSub] as const;
+  const done = Promise.race([
+    superviseRouterSubscriptionsDone(subscriptions),
+    debounceDefect.promise,
+  ]);
+
   return {
+    done,
     stop: async () => {
-      await adapterSub.stop();
-      await lifecycleSub.stop();
-      await surfaceSub.stop();
-      for (const b of buffers.values()) {
-        if (b.timer) clearTimeout(b.timer);
+      try {
+        await adaptRouterSubscriptionsStop(subscriptions);
+      } finally {
+        for (const b of buffers.values()) {
+          if (b.timer) clearTimeout(b.timer);
+        }
+        buffers.clear();
+        pendingMentionReplyBatchBySession.clear();
       }
-      buffers.clear();
-      pendingMentionReplyBatchBySession.clear();
     },
   };
 }

@@ -1,15 +1,23 @@
 import type { ToolSet } from "ai";
-import { z } from "zod";
 import type { ClaudeCodeToolCatalogMetadataMap } from "@stanley2058/lilac-claude-code-bridge";
 import {
   ToolPluginManager,
+  decodeLevel1ExecutableMetadata,
+  invokeLevel1CreateTool,
+  invokeLevel1EditTargets,
+  invokeLevel1IsEnabled,
+  type Level1ContributionInfo,
   type Level1ExecutionRequestContext,
   type Level1RunProfile,
+  type Level1ToolSpecCapabilitySnapshot,
   type ServerTool,
 } from "@stanley2058/lilac-plugin-runtime";
+import { Result, TaggedError, type Result as ResultType } from "better-result";
+
 import {
   createLogger,
   deriveSubagentIdleTimeoutMs,
+  formatTaggedErrorForLog,
   getCoreConfig,
   profileIncludes,
   resolveCoreConfigPath,
@@ -19,8 +27,11 @@ import {
 
 import { createBuiltinCoreToolPlugins } from "./builtin";
 import {
-  buildUnifiedToolCatalog,
-  createPortableToolSearch,
+  buildUnifiedToolCatalogResult,
+  catalogCandidateExecutable,
+  createPortableToolSearchResult,
+  type PortableToolSearchInvalid,
+  type UnifiedToolCatalogInvalid,
   type CatalogToolCandidate,
   type CatalogToolEntry,
 } from "../mcp/catalog";
@@ -37,7 +48,7 @@ import {
 } from "./types";
 
 function isStructurallyAllowed(
-  spec: CoreLevel1ToolSpec,
+  specName: string,
   contribution: import("@stanley2058/lilac-plugin-runtime").Level1ContributionInfo | undefined,
   params: Pick<BuildLevel1ToolsetParams, "runProfile">,
   config: CoreConfig,
@@ -46,10 +57,10 @@ function isStructurallyAllowed(
   if (!contribution) return false;
   const profile = resolveNativeSubagentProfile(config, params.runProfile);
   if (!profileIncludes(profile.level1.plugins, contribution.pluginId)) return false;
-  if (!profileIncludes(profile.level1.tools, spec.name)) return false;
-  if (spec.name === "bash" && !profile.execution) return false;
-  if (["edit_file", "apply_patch"].includes(spec.name) && !profile.workspaceWrites) return false;
-  if (spec.name === "subagent_delegate" && !profile.delegation) return false;
+  if (!profileIncludes(profile.level1.tools, specName)) return false;
+  if (specName === "bash" && !profile.execution) return false;
+  if (["edit_file", "apply_patch"].includes(specName) && !profile.workspaceWrites) return false;
+  if (specName === "subagent_delegate" && !profile.delegation) return false;
   return true;
 }
 
@@ -70,11 +81,6 @@ function isMcpStructurallyAllowed(params: {
     profileIncludes(profile.level1.tools, params.modelName) ||
     profileIncludes(profile.level1.tools, params.rawName)
   );
-}
-
-async function listServerToolCallableIds(tool: ServerTool): Promise<readonly string[]> {
-  const entries = await tool.list();
-  return entries.map((entry: Awaited<ReturnType<ServerTool["list"]>>[number]) => entry.callableId);
 }
 
 export type BuildLevel1ToolsetParams = {
@@ -109,11 +115,47 @@ export type BuiltLevel1Toolset = {
   catalogMetadata: ClaudeCodeToolCatalogMetadataMap;
   /** Refresh the run-scoped batch child mapping before freezing step authority. */
   updateActiveBatchTools(activeToolNames: ReadonlySet<string>): void;
+  contributionInfo: ReadonlyMap<CoreLevel1ToolSpec, Level1ContributionInfo>;
   genericOutputNormalizerBypassTools: ReadonlySet<string>;
   aggregateOutputBudgetExemptTools: ReadonlySet<string>;
 };
 
-export type CoreToolPluginManager = ReturnType<typeof createCoreToolPluginManager>;
+export class Level1ToolsetBuildFailed extends TaggedError("Level1ToolsetBuildFailed")<{
+  readonly operation: string;
+  readonly cause: import("@stanley2058/lilac-plugin-runtime").ToolPluginManagerError;
+  readonly message: string;
+}> {}
+
+export class Level1ToolsetInvariantViolation extends TaggedError(
+  "Level1ToolsetInvariantViolation",
+)<{
+  readonly message: string;
+}> {}
+
+export class Level1ToolsetAssemblyFailed extends TaggedError("Level1ToolsetAssemblyFailed")<{
+  readonly cause: UnifiedToolCatalogInvalid | PortableToolSearchInvalid;
+  readonly message: string;
+}> {}
+
+type CreatedCoreToolPluginManager = ReturnType<typeof createCoreToolPluginManager>;
+export type CoreToolPluginManager = Omit<CreatedCoreToolPluginManager, "getLevel2Capabilities"> &
+  Partial<Pick<CreatedCoreToolPluginManager, "getLevel2Capabilities">>;
+
+export function resolveOpaquePluginConfig(config: CoreConfig, pluginId: string): unknown {
+  return config.plugins?.config?.[pluginId];
+}
+
+export function assignOpaqueTool(target: ToolSet, name: string, executable: unknown): void {
+  (target as Record<string, unknown>)[name] = executable;
+}
+
+export function readOpaqueTool(target: ToolSet, name: string): unknown {
+  return (target as Record<string, unknown>)[name];
+}
+
+function successfulResultValue<T>(result: { readonly status: "ok"; readonly value: T }): T {
+  return result.value;
+}
 
 export function createCoreToolPluginManager(params: {
   runtime: CoreToolPluginRuntime;
@@ -126,6 +168,392 @@ export function createCoreToolPluginManager(params: {
   const resolveConfig = async () =>
     params.runtime.config ?? params.runtime.getConfig?.() ?? (await getCoreConfig());
 
+  const logPluginOperation = (
+    operation: string,
+    error: import("@stanley2058/lilac-plugin-runtime").ToolPluginManagerError,
+  ): string => {
+    const formatted = formatTaggedErrorForLog(error);
+    logger.error("tool plugin operation failed", { operation, ...formatted });
+    return `Tool plugin ${operation} failed: ${formatted.errorMessage}`;
+  };
+
+  const adaptPluginResultToHost = <T>(
+    operation: string,
+    result: ResultType<T, import("@stanley2058/lilac-plugin-runtime").ToolPluginManagerError>,
+  ): T => {
+    if (result.status === "ok") return result.value;
+    throw new Error(logPluginOperation(operation, result.error));
+  };
+
+  const pluginOperationFailure = (
+    operation: string,
+    error: import("@stanley2058/lilac-plugin-runtime").ToolPluginManagerError,
+  ): Level1ToolsetBuildFailed =>
+    new Level1ToolsetBuildFailed({
+      operation,
+      cause: error,
+      message: logPluginOperation(operation, error),
+    });
+
+  async function buildLevel1ToolsetResult(
+    buildParams: BuildLevel1ToolsetParams,
+  ): Promise<
+    ResultType<
+      BuiltLevel1Toolset,
+      Level1ToolsetBuildFailed | Level1ToolsetInvariantViolation | Level1ToolsetAssemblyFailed
+    >
+  > {
+    const fresh = await manager.ensureFresh();
+    if (fresh.status === "error") {
+      if (fresh.error._tag !== "ToolPluginReloadCommittedCleanupError") {
+        return Result.err(pluginOperationFailure("ensureFresh", fresh.error));
+      }
+      logger.error("tool plugin refresh committed with cleanup failure", {
+        operation: "ensureFresh",
+        ...formatTaggedErrorForLog(fresh.error),
+      });
+    }
+    const resolvedConfig = await resolveConfig();
+
+    const tools: ToolSet = {} as ToolSet;
+    const batchTools: ToolSet = {} as ToolSet;
+    const specs = new Map<string, CoreLevel1ToolSpec>();
+    const directSpecs = new Map<string, CoreLevel1ToolSpec>();
+    const contributionInfo = manager.getLevel1ContributionInfo();
+    const level1Capabilities = manager.getLevel1Capabilities();
+    const level1Specs = manager.getLevel1Items();
+    for (const spec of level1Specs) {
+      if (!level1Capabilities.has(spec)) {
+        return Result.err(
+          new Level1ToolsetInvariantViolation({
+            message: "Missing captured Level 1 plugin capability",
+          }),
+        );
+      }
+      if (!contributionInfo.has(spec)) {
+        return Result.err(
+          new Level1ToolsetInvariantViolation({
+            message: "Missing captured Level 1 contribution identity",
+          }),
+        );
+      }
+    }
+    const capabilityForSpec = (
+      spec: CoreLevel1ToolSpec,
+    ): Level1ToolSpecCapabilitySnapshot<CoreToolPluginRuntime> => level1Capabilities.get(spec)!;
+    const contributionForSpec = (spec: CoreLevel1ToolSpec): Level1ContributionInfo =>
+      contributionInfo.get(spec)!;
+    const nameForSpec = (spec: CoreLevel1ToolSpec): string => capabilityForSpec(spec).name;
+    const runContext = {
+      runtime: {
+        ...params.runtime,
+        dataDir: params.dataDir,
+        config: resolvedConfig,
+      },
+      cwd: buildParams.cwd,
+      runProfile: buildParams.runProfile,
+      editingToolMode: buildParams.editingToolMode,
+      subagentDepth: buildParams.subagentDepth,
+      subagentConfig: {
+        ...buildParams.subagentConfig,
+        idleTimeoutMs:
+          buildParams.subagentConfig.idleTimeoutMs ??
+          deriveSubagentIdleTimeoutMs(resolvedConfig.agent.idleTimeoutMs),
+      },
+      requestContext: buildParams.requestContext,
+    };
+
+    const enabledSpecs: CoreLevel1ToolSpec[] = [];
+    for (const spec of level1Specs) {
+      const contribution = contributionForSpec(spec);
+      const specName = nameForSpec(spec);
+      const enabled = invokeLevel1IsEnabled({
+        pluginId: contribution.pluginId,
+        source: contribution.source,
+        spec,
+        capability: capabilityForSpec(spec),
+        context: runContext,
+      });
+      if (enabled.status === "error") {
+        return Result.err(pluginOperationFailure("level1.isEnabled", enabled.error));
+      }
+      if (
+        enabled.value &&
+        isStructurallyAllowed(specName, contribution, buildParams, resolvedConfig)
+      ) {
+        enabledSpecs.push(spec);
+      }
+    }
+
+    const builtinSpecs = enabledSpecs.filter(
+      (spec) => contributionInfo.get(spec)?.source === "builtin",
+    );
+    const externalSpecs = enabledSpecs.filter(
+      (spec) => contributionInfo.get(spec)?.source === "external",
+    );
+    const allMcpTools = params.runtime.mcpRegistry?.getTools() ?? [];
+    const identities = [
+      ...externalSpecs.map((spec) => {
+        const contribution = contributionForSpec(spec);
+        const specName = nameForSpec(spec);
+        return {
+          source: "plugin",
+          sourceId: contribution.pluginId,
+          rawToolName: specName,
+        } as const;
+      }),
+      ...allMcpTools.map((entry) => entry.identity),
+    ];
+    const directToolNames = new Set(builtinSpecs.map(nameForSpec));
+    const reservedNames = new Set(
+      manager
+        .getLevel1Items()
+        .filter((spec) => contributionForSpec(spec).source === "builtin")
+        .map(nameForSpec),
+    );
+    reservedNames.add("tool_search");
+    const nameAssignment = assignCatalogToolNames(identities, reservedNames);
+    if (nameAssignment.collisions.length > 0) {
+      return Result.err(
+        new Level1ToolsetInvariantViolation({
+          message: `Unable to assign unique deferred catalog tool names: ${nameAssignment.collisions
+            .map(
+              (collision) =>
+                `${collision.modelName}: ${collision.identities
+                  .map((identity) => catalogToolStableId(identity))
+                  .join(", ")}`,
+            )
+            .join("; ")}`,
+        }),
+      );
+    }
+    const mcpTools: Array<(typeof allMcpTools)[number]> = [];
+    for (const entry of allMcpTools) {
+      const modelName = nameAssignment.byStableId.get(entry.stableId);
+      if (!modelName) {
+        return Result.err(
+          new Level1ToolsetInvariantViolation({
+            message: `MCP tool did not receive a model name: ${entry.stableId}`,
+          }),
+        );
+      }
+      if (
+        isMcpStructurallyAllowed({
+          serverId: entry.serverId,
+          rawName: entry.rawName,
+          modelName,
+          runProfile: buildParams.runProfile,
+          config: resolvedConfig,
+        })
+      ) {
+        mcpTools.push(entry);
+      }
+    }
+
+    for (const spec of builtinSpecs) {
+      const specName = nameForSpec(spec);
+      specs.set(specName, spec);
+      directSpecs.set(specName, spec);
+    }
+    for (const spec of externalSpecs) {
+      const contribution = contributionForSpec(spec);
+      const specName = nameForSpec(spec);
+      const stableId = catalogToolStableId({
+        source: "plugin",
+        sourceId: contribution.pluginId,
+        rawToolName: specName,
+      });
+      const modelName = nameAssignment.byStableId.get(stableId);
+      if (!modelName) {
+        return Result.err(
+          new Level1ToolsetInvariantViolation({
+            message: `External plugin tool did not receive a model name: ${stableId}`,
+          }),
+        );
+      }
+      specs.set(modelName, spec);
+    }
+
+    const buildContext = {
+      ...runContext,
+      getTools: () => batchTools,
+      getLevel1ToolSpecs: () => directSpecs,
+      resolveEditTargets: async <TArgs>(
+        spec: CoreLevel1ToolSpec,
+        args: TArgs,
+        context: { cwd: string },
+      ) => {
+        const contribution = contributionForSpec(spec);
+        const resolved = await invokeLevel1EditTargets({
+          pluginId: contribution.pluginId,
+          source: contribution.source,
+          spec,
+          capability: capabilityForSpec(spec),
+          args,
+          cwd: context.cwd,
+        });
+        return adaptPluginResultToHost("level1.editTargets", resolved) ?? [];
+      },
+      reportToolStatus: buildParams.reportToolStatus,
+    };
+
+    for (const spec of builtinSpecs) {
+      const contribution = contributionForSpec(spec);
+      const specName = nameForSpec(spec);
+      const executable = invokeLevel1CreateTool({
+        pluginId: contribution.pluginId,
+        source: contribution.source,
+        spec,
+        capability: capabilityForSpec(spec),
+        context: buildContext,
+      });
+      if (executable.status === "error") {
+        return Result.err(pluginOperationFailure("level1.createTool", executable.error));
+      }
+      const executableValue = successfulResultValue(executable);
+      assignOpaqueTool(tools, specName, executableValue);
+      assignOpaqueTool(batchTools, specName, executableValue);
+    }
+
+    const candidates: CatalogToolCandidate[] = [];
+    for (const spec of externalSpecs) {
+      const contribution = contributionForSpec(spec);
+      const specName = nameForSpec(spec);
+      const identity = {
+        source: "plugin",
+        sourceId: contribution.pluginId,
+        rawToolName: specName,
+      } as const;
+      const executable = invokeLevel1CreateTool({
+        pluginId: contribution.pluginId,
+        source: contribution.source,
+        spec,
+        capability: capabilityForSpec(spec),
+        context: buildContext,
+      });
+      if (executable.status === "error") {
+        return Result.err(pluginOperationFailure("level1.createTool", executable.error));
+      }
+      const executableValue = successfulResultValue(executable);
+      const metadata = decodeLevel1ExecutableMetadata(contribution.pluginId, executableValue);
+      if (metadata.status === "error") {
+        return Result.err(pluginOperationFailure("level1.executableMetadata", metadata.error));
+      }
+      candidates.push({
+        identity,
+        ...(metadata.value.title === undefined ? {} : { title: metadata.value.title }),
+        ...(metadata.value.description === undefined
+          ? {}
+          : { description: metadata.value.description }),
+        tool: executableValue,
+      });
+    }
+    for (const entry of mcpTools) {
+      candidates.push({
+        identity: entry.identity,
+        ...(entry.title === undefined ? {} : { title: entry.title }),
+        ...(entry.description === undefined ? {} : { description: entry.description }),
+        tool: entry.tool,
+      });
+    }
+
+    const catalogReservedNames = new Set(reservedNames);
+    for (const candidate of candidates) {
+      const assignedName = nameAssignment.byStableId.get(catalogToolStableId(candidate.identity));
+      const baseName = baseCatalogToolName(candidate.identity);
+      if (assignedName !== baseName) catalogReservedNames.add(baseName);
+    }
+    const catalogResult = buildUnifiedToolCatalogResult({
+      candidates,
+      reservedNames: catalogReservedNames,
+    });
+    if (catalogResult.status === "error") {
+      return Result.err(
+        new Level1ToolsetAssemblyFailed({
+          cause: catalogResult.error,
+          message: catalogResult.error.message,
+        }),
+      );
+    }
+    const catalog = catalogResult.value;
+    for (const entry of catalog.entries) {
+      assignOpaqueTool(tools, entry.modelName, catalogCandidateExecutable(entry));
+    }
+    if (catalog.entries.length > 0) {
+      directToolNames.add("tool_search");
+      const search = createPortableToolSearchResult({
+        catalog: catalog.entries,
+        transcriptStore: params.runtime.transcriptStore,
+        requestContext: buildParams.requestContext,
+      });
+      if (search.status === "error") {
+        return Result.err(
+          new Level1ToolsetAssemblyFailed({ cause: search.error, message: search.error.message }),
+        );
+      }
+      assignOpaqueTool(tools, "tool_search", search.value);
+    }
+
+    let batchAuthorityKey = [...directSpecs.keys()].sort().join("\0");
+    const updateActiveBatchTools = (activeToolNames: ReadonlySet<string>) => {
+      for (const name of Object.keys(batchTools)) delete batchTools[name];
+      directSpecs.clear();
+      for (const name of activeToolNames) {
+        const executable = readOpaqueTool(tools, name);
+        const spec = specs.get(name);
+        if (executable && spec) {
+          assignOpaqueTool(batchTools, name, executable);
+          directSpecs.set(name, spec);
+        }
+      }
+
+      const batchSpec = specs.get("batch");
+      if (!activeToolNames.has("batch") || !batchSpec) return;
+      const nextBatchAuthorityKey = [...directSpecs.keys()].sort().join("\0");
+      if (nextBatchAuthorityKey === batchAuthorityKey) return;
+      batchAuthorityKey = nextBatchAuthorityKey;
+      const contribution = contributionForSpec(batchSpec);
+      const executable = adaptPluginResultToHost(
+        "level1.createTool",
+        invokeLevel1CreateTool({
+          pluginId: contribution.pluginId,
+          source: contribution.source,
+          spec: batchSpec,
+          capability: capabilityForSpec(batchSpec),
+          context: buildContext,
+        }),
+      );
+      assignOpaqueTool(tools, "batch", executable);
+      assignOpaqueTool(batchTools, "batch", executable);
+    };
+
+    return Result.ok({
+      tools,
+      specs,
+      directToolNames,
+      catalog: catalog.entries,
+      catalogMetadata: catalog.catalogMetadata,
+      updateActiveBatchTools,
+      contributionInfo,
+      genericOutputNormalizerBypassTools: new Set(
+        [...specs.entries()]
+          .filter(
+            ([, spec]) =>
+              contributionForSpec(spec).source === "builtin" && hasBoundedBuiltinOutput(spec),
+          )
+          .map(([modelName]) => modelName),
+      ),
+      aggregateOutputBudgetExemptTools: new Set(
+        [...specs.entries()]
+          .filter(
+            ([, spec]) =>
+              contributionForSpec(spec).source === "builtin" && isAggregateOutputBudgetExempt(spec),
+          )
+          .map(([modelName]) => modelName),
+      ),
+    });
+  }
+
   const manager = new ToolPluginManager<CoreToolPluginRuntime, CoreLevel1ToolSpec, ServerTool>({
     runtime: params.runtime,
     dataDir: params.dataDir,
@@ -134,19 +562,13 @@ export function createCoreToolPluginManager(params: {
     builtinPlugins: createBuiltinCoreToolPlugins(),
     getDisabledPluginIds: async () => (await resolveConfig()).plugins?.disabled ?? [],
     getPluginConfig: async (pluginId: string) =>
-      (await resolveConfig()).plugins?.config?.[pluginId],
-    getLevel1RegistrationKey: (spec, contribution) =>
+      resolveOpaquePluginConfig(await resolveConfig(), pluginId),
+    getLevel1RegistrationKey: (_spec, contribution, capturedName) =>
       contribution.source === "builtin"
-        ? spec.name
-        : JSON.stringify([contribution.pluginId, spec.name]),
-    getLevel1Name: (spec) => spec.name,
-    getLevel2CallableIds: listServerToolCallableIds,
-    initLevel2Item: async (tool) => {
-      await tool.init();
-    },
-    destroyLevel2Item: async (tool) => {
-      await tool.destroy();
-    },
+        ? capturedName
+        : JSON.stringify([contribution.pluginId, capturedName]),
+    adaptLevel1Item: (spec) => spec,
+    adaptLevel2Item: (tool) => tool,
   });
 
   return {
@@ -157,224 +579,7 @@ export function createCoreToolPluginManager(params: {
     getStatuses: () => manager.getStatuses(),
     getLevel2Tools: () => manager.getLevel2Items(),
     getLevel2ContributionInfo: () => manager.getLevel2ContributionInfo(),
-    async buildLevel1Toolset(buildParams: BuildLevel1ToolsetParams): Promise<BuiltLevel1Toolset> {
-      await manager.ensureFresh();
-      const resolvedConfig = await resolveConfig();
-
-      const tools: ToolSet = {} as ToolSet;
-      const batchTools: ToolSet = {} as ToolSet;
-      const specs = new Map<string, CoreLevel1ToolSpec>();
-      const directSpecs = new Map<string, CoreLevel1ToolSpec>();
-      const contributionInfo = manager.getLevel1ContributionInfo();
-      const runContext = {
-        runtime: {
-          ...params.runtime,
-          dataDir: params.dataDir,
-          config: resolvedConfig,
-        },
-        cwd: buildParams.cwd,
-        runProfile: buildParams.runProfile,
-        editingToolMode: buildParams.editingToolMode,
-        subagentDepth: buildParams.subagentDepth,
-        subagentConfig: {
-          ...buildParams.subagentConfig,
-          idleTimeoutMs:
-            buildParams.subagentConfig.idleTimeoutMs ??
-            deriveSubagentIdleTimeoutMs(resolvedConfig.agent.idleTimeoutMs),
-        },
-        requestContext: buildParams.requestContext,
-      };
-
-      const enabledSpecs = manager
-        .getLevel1Items()
-        .filter(
-          (spec) =>
-            spec.isEnabled(runContext) &&
-            isStructurallyAllowed(spec, contributionInfo.get(spec), buildParams, resolvedConfig),
-        );
-
-      const builtinSpecs = enabledSpecs.filter(
-        (spec) => contributionInfo.get(spec)?.source === "builtin",
-      );
-      const externalSpecs = enabledSpecs.filter(
-        (spec) => contributionInfo.get(spec)?.source === "external",
-      );
-      const allMcpTools = params.runtime.mcpRegistry?.getTools() ?? [];
-      const identities = [
-        ...externalSpecs.map((spec) => {
-          const contribution = contributionInfo.get(spec);
-          if (!contribution) throw new Error(`Missing contribution identity for '${spec.name}'`);
-          return {
-            source: "plugin",
-            sourceId: contribution.pluginId,
-            rawToolName: spec.name,
-          } as const;
-        }),
-        ...allMcpTools.map((entry) => entry.identity),
-      ];
-      const directToolNames = new Set(builtinSpecs.map((spec) => spec.name));
-      const reservedNames = new Set(
-        manager
-          .getLevel1Items()
-          .filter((spec) => contributionInfo.get(spec)?.source === "builtin")
-          .map((spec) => spec.name),
-      );
-      reservedNames.add("tool_search");
-      const nameAssignment = assignCatalogToolNames(identities, reservedNames);
-      if (nameAssignment.collisions.length > 0) {
-        throw new Error(
-          `Unable to assign unique deferred catalog tool names: ${nameAssignment.collisions
-            .map(
-              (collision) =>
-                `${collision.modelName}: ${collision.identities
-                  .map((identity) => catalogToolStableId(identity))
-                  .join(", ")}`,
-            )
-            .join("; ")}`,
-        );
-      }
-      const mcpTools = allMcpTools.filter((entry) => {
-        const modelName = nameAssignment.byStableId.get(entry.stableId);
-        if (!modelName) throw new Error(`MCP tool did not receive a model name: ${entry.stableId}`);
-        return isMcpStructurallyAllowed({
-          serverId: entry.serverId,
-          rawName: entry.rawName,
-          modelName,
-          runProfile: buildParams.runProfile,
-          config: resolvedConfig,
-        });
-      });
-
-      for (const spec of builtinSpecs) {
-        specs.set(spec.name, spec);
-        directSpecs.set(spec.name, spec);
-      }
-      for (const spec of externalSpecs) {
-        const contribution = contributionInfo.get(spec);
-        if (!contribution) throw new Error(`Missing contribution identity for '${spec.name}'`);
-        const stableId = catalogToolStableId({
-          source: "plugin",
-          sourceId: contribution.pluginId,
-          rawToolName: spec.name,
-        });
-        const modelName = nameAssignment.byStableId.get(stableId);
-        if (!modelName)
-          throw new Error(`External plugin tool did not receive a model name: ${stableId}`);
-        specs.set(modelName, { ...spec, name: modelName });
-      }
-
-      const buildContext = {
-        ...runContext,
-        getTools: () => batchTools,
-        getLevel1ToolSpecs: () => directSpecs,
-        reportToolStatus: buildParams.reportToolStatus,
-      };
-
-      for (const spec of builtinSpecs) {
-        const executable = spec.createTool(buildContext);
-        (tools as Record<string, unknown>)[spec.name] = executable;
-        (batchTools as Record<string, unknown>)[spec.name] = executable;
-      }
-
-      const candidateMetadataSchema = z.object({
-        title: z.string().optional(),
-        description: z.string().optional(),
-      });
-      const candidates: CatalogToolCandidate[] = [];
-      for (const spec of externalSpecs) {
-        const contribution = contributionInfo.get(spec);
-        if (!contribution) throw new Error(`Missing contribution identity for '${spec.name}'`);
-        const identity = {
-          source: "plugin",
-          sourceId: contribution.pluginId,
-          rawToolName: spec.name,
-        } as const;
-        const executable = spec.createTool(buildContext);
-        const metadata = candidateMetadataSchema.safeParse(executable);
-        candidates.push({
-          identity,
-          ...(metadata.success && metadata.data.title !== undefined
-            ? { title: metadata.data.title }
-            : {}),
-          ...(metadata.success && metadata.data.description !== undefined
-            ? { description: metadata.data.description }
-            : {}),
-          tool: executable,
-        });
-      }
-      for (const entry of mcpTools) {
-        candidates.push({
-          identity: entry.identity,
-          ...(entry.title === undefined ? {} : { title: entry.title }),
-          ...(entry.description === undefined ? {} : { description: entry.description }),
-          tool: entry.tool,
-        });
-      }
-
-      const catalogReservedNames = new Set(reservedNames);
-      for (const candidate of candidates) {
-        const assignedName = nameAssignment.byStableId.get(catalogToolStableId(candidate.identity));
-        const baseName = baseCatalogToolName(candidate.identity);
-        if (assignedName !== baseName) catalogReservedNames.add(baseName);
-      }
-      const catalog = buildUnifiedToolCatalog({
-        candidates,
-        reservedNames: catalogReservedNames,
-      });
-      for (const entry of catalog.entries) {
-        (tools as Record<string, unknown>)[entry.modelName] = entry.tool;
-      }
-      if (catalog.entries.length > 0) {
-        directToolNames.add("tool_search");
-        (tools as Record<string, unknown>).tool_search = createPortableToolSearch({
-          catalog: catalog.entries,
-          transcriptStore: params.runtime.transcriptStore,
-          requestContext: buildParams.requestContext,
-        });
-      }
-
-      let batchAuthorityKey = [...directSpecs.keys()].sort().join("\0");
-      const updateActiveBatchTools = (activeToolNames: ReadonlySet<string>) => {
-        for (const name of Object.keys(batchTools)) delete batchTools[name];
-        directSpecs.clear();
-        for (const name of activeToolNames) {
-          const executable = tools[name];
-          const spec = specs.get(name);
-          // MCP tools deliberately have no Level 1 spec and are never batch children.
-          if (executable && spec) {
-            (batchTools as Record<string, unknown>)[name] = executable;
-            directSpecs.set(name, spec);
-          }
-        }
-
-        const batchSpec = specs.get("batch");
-        if (!activeToolNames.has("batch") || !batchSpec) return;
-        const nextBatchAuthorityKey = [...directSpecs.keys()].sort().join("\0");
-        if (nextBatchAuthorityKey === batchAuthorityKey) return;
-        batchAuthorityKey = nextBatchAuthorityKey;
-        const executable = batchSpec.createTool(buildContext);
-        (tools as Record<string, unknown>).batch = executable;
-        (batchTools as Record<string, unknown>).batch = executable;
-      };
-
-      return {
-        tools,
-        specs,
-        directToolNames,
-        catalog: catalog.entries,
-        catalogMetadata: catalog.catalogMetadata,
-        updateActiveBatchTools,
-        genericOutputNormalizerBypassTools: new Set(
-          [...specs.entries()]
-            .filter(([, spec]) => hasBoundedBuiltinOutput(spec))
-            .map(([modelName]) => modelName),
-        ),
-        aggregateOutputBudgetExemptTools: new Set(
-          [...specs.entries()]
-            .filter(([, spec]) => isAggregateOutputBudgetExempt(spec))
-            .map(([modelName]) => modelName),
-        ),
-      };
-    },
+    getLevel2Capabilities: () => manager.getLevel2Capabilities(),
+    buildLevel1ToolsetResult,
   };
 }

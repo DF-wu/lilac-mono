@@ -23,6 +23,8 @@ import {
 } from "@stanley2058/mini-lilac-client";
 import {
   HistoryRecoveryAbandonedError,
+  MiniLilacSessionExternalFailure,
+  MiniLilacSessionOperationAndCleanupFailed,
   MiniLilacSkillCatalog,
   SessionService,
   WorkspaceHistoryStoreError,
@@ -37,9 +39,18 @@ import {
   type LanguageModel,
 } from "ai";
 import { MockLanguageModelV4, simulateReadableStream } from "ai/test";
+import { Panic, Result } from "better-result";
 import { z } from "zod";
 
-import { createMiniLilacServer, MINI_LILAC_API_PREFIX, withSseKeepAlive } from "../src/server";
+import {
+  adaptMiniLilacPersistenceResult,
+  createMiniLilacServer,
+  decodeMiniLilacHttpRequest,
+  decodeMiniLilacUiMessages,
+  MINI_LILAC_API_PREFIX,
+  validateMiniLilacServerConfiguration,
+  withSseKeepAlive,
+} from "../src/server";
 
 const temporaryDirectories: string[] = [];
 
@@ -434,6 +445,140 @@ async function readStreamPrefix(
 }
 
 describe("createMiniLilacServer", () => {
+  it("exhaustively adapts expanded session failures without downgrading Panic", () => {
+    const conflict = adaptMiniLilacPersistenceResult(
+      Result.err(
+        new MiniLilacSessionExternalFailure({
+          operation: "redo",
+          cause: new Error("Session 'session-1' must be quiescent to redo"),
+          message: "redo failed",
+        }),
+      ),
+    );
+    expect(conflict.status).toBe("error");
+    if (conflict.status === "error") expect(conflict.error.code).toBe("conflict");
+
+    const combined = adaptMiniLilacPersistenceResult(
+      Result.err(
+        new MiniLilacSessionOperationAndCleanupFailed({
+          operation: "redo",
+          operationError: new Error("restore failed"),
+          cleanupError: new Error("cleanup failed"),
+          message: "redo and cleanup failed",
+        }),
+      ),
+    );
+    expect(combined.status).toBe("error");
+    if (combined.status === "error") {
+      expect(combined.error).toMatchObject({ status: 500, code: "internal_error" });
+    }
+
+    const privatePath = "/private/workspaces/customer-a";
+    const workspaceConflict = adaptMiniLilacPersistenceResult(
+      Result.err(
+        new WorkspaceHistoryStoreError({
+          code: "restore-conflict",
+          operation: `restore ${privatePath}`,
+          message: `Workspace changed at ${privatePath}`,
+          detail: `private detail for ${privatePath}`,
+          cause: new Error(`private cause for ${privatePath}`),
+        }),
+      ),
+    );
+    expect(workspaceConflict.status).toBe("error");
+    if (workspaceConflict.status === "error") {
+      expect(workspaceConflict.error).toMatchObject({
+        status: 409,
+        code: "conflict",
+        message: "Workspace history changed during the request",
+      });
+      expect(JSON.stringify(workspaceConflict.error)).not.toContain(privatePath);
+    }
+
+    const workspaceFailure = adaptMiniLilacPersistenceResult(
+      Result.err(
+        new WorkspaceHistoryStoreError({
+          code: "filesystem-error",
+          operation: `capture ${privatePath}`,
+          message: `Unable to capture ${privatePath}`,
+          cause: new Error(`private cause for ${privatePath}`),
+        }),
+      ),
+    );
+    expect(workspaceFailure.status).toBe("error");
+    if (workspaceFailure.status === "error") {
+      expect(workspaceFailure.error).toMatchObject({
+        status: 500,
+        code: "internal_error",
+        message: "The request could not be completed",
+      });
+      expect(JSON.stringify(workspaceFailure.error)).not.toContain(privatePath);
+    }
+
+    const panic = new Panic({ message: "session invariant failed" });
+    expect(() =>
+      adaptMiniLilacPersistenceResult(
+        Result.err(
+          new MiniLilacSessionExternalFailure({
+            operation: "redo",
+            cause: panic,
+            message: "redo failed",
+          }),
+        ),
+      ),
+    ).toThrow(panic);
+  });
+
+  it("decodes UI-message protocol data into a closed Result at the HTTP boundary", () => {
+    const body = decodeMiniLilacHttpRequest(
+      z.object({ command: z.string() }),
+      { body: { command: "decoded" } },
+      "body",
+    );
+    expect(body).toMatchObject({ status: "ok", value: { command: "decoded" } });
+    const valid = decodeMiniLilacUiMessages([userMessage("boundary-user", "decoded")]);
+    expect(valid.status).toBe("ok");
+    const invalid = decodeMiniLilacUiMessages([
+      { id: "boundary-user", role: "user", parts: [{ type: "text", text: 42 }] },
+    ]);
+    expect(invalid.status).toBe("error");
+    if (invalid.status === "error") {
+      expect(invalid.error._tag).toBe("MiniLilacHttpFailure");
+      expect(invalid.error.code).toBe("invalid_ui_messages");
+    }
+  });
+
+  it("maps session-creation workspace capture failures without exposing private context", async () => {
+    const model = new MockLanguageModelV4({ doStream: textResult("unused", "unused") });
+    const { app, directory, service } = await testServer(model);
+    const privatePath = "/private/workspaces/customer-a";
+    service.createSessionResult = async () =>
+      Result.err(
+        new WorkspaceHistoryStoreError({
+          code: "filesystem-error",
+          operation: `capture ${privatePath}`,
+          message: `Unable to capture ${privatePath}`,
+          detail: `private detail for ${privatePath}`,
+          cause: new Error(`private cause for ${privatePath}`),
+        }),
+      );
+
+    const response = await app.handle(
+      jsonRequest(
+        "POST",
+        `${MINI_LILAC_API_PREFIX}/chat`,
+        chatBody(directory, { id: "capture-failure-session" }),
+      ),
+    );
+    const body = await responseJson(response);
+    expect(response.status).toBe(500);
+    expect(body).toEqual({
+      error: { code: "internal_error", message: "The request could not be completed" },
+    });
+    expect(JSON.stringify(body)).not.toContain(privatePath);
+    service.close();
+  });
+
   it("emits SSE keepalive comments while a stream is quiet", async () => {
     let cancelled = false;
     const source = new ReadableStream<Uint8Array>({
@@ -673,7 +818,52 @@ describe("createMiniLilacServer", () => {
     const unknownResume = await app.handle(
       jsonRequest("GET", `${MINI_LILAC_API_PREFIX}/sessions/unknown/resume`),
     );
+    expect(await responseJson(unknownResume)).toEqual({
+      error: { code: "not_found", message: "Session 'unknown' was not found" },
+    });
     expect(unknownResume.status).toBe(404);
+    service.close();
+  });
+
+  it("maps persistence decode and driver Results only at the HTTP host adapter", async () => {
+    const model = new MockLanguageModelV4({ doStream: textResult("unused", "unused") });
+    const { app, directory, service } = await testServer(model);
+    const session = await service.createSession({
+      id: "corrupt-todo-session",
+      cwd: directory,
+      model: "test/plain",
+    });
+    service.store.database
+      .query(
+        "INSERT INTO session_todos (session_id, revision, todos_json, updated_at) VALUES (?, 1, ?, ?)",
+      )
+      .run(session.id, "[", new Date().toISOString());
+
+    const decoded = service.getTodosResult(session.id);
+    expect(decoded.status).toBe("error");
+    if (decoded.status === "error")
+      expect(decoded.error).toMatchObject({ _tag: "MalformedSerialization" });
+    const corruptResponse = await app.handle(
+      jsonRequest("GET", `${MINI_LILAC_API_PREFIX}/sessions/${session.id}/todos`),
+    );
+    expect(corruptResponse.status).toBe(500);
+    expect(await responseJson(corruptResponse)).toEqual({
+      error: {
+        code: "persistence_failure",
+        message: "The persisted Mini Lilac session could not be read",
+      },
+    });
+
+    service.store.database.exec("DROP TABLE session_todos");
+    const driver = service.getTodosResult(session.id);
+    expect(driver.status).toBe("error");
+    if (driver.status === "error") {
+      expect(driver.error).toMatchObject({ _tag: "MiniLilacSqliteDriverFailure" });
+    }
+    const driverResponse = await app.handle(
+      jsonRequest("GET", `${MINI_LILAC_API_PREFIX}/sessions/${session.id}/todos`),
+    );
+    expect(driverResponse.status).toBe(500);
     service.close();
   });
 
@@ -1046,7 +1236,7 @@ describe("createMiniLilacServer", () => {
       expect(body).toMatchObject({ error: { code: testCase.code } });
       if (testCase.id === "restore-conflict") {
         expect(body).toMatchObject({
-          error: { message: "workspace changed during restore preparation" },
+          error: { message: "Workspace history changed during the request" },
         });
       }
     }
@@ -1364,6 +1554,17 @@ describe("createMiniLilacServer", () => {
       testServer(model, { authTokenEnv: "MINI_LILAC_TOKEN", authToken: "   " }),
     ).rejects.toThrow("cannot be blank");
     await expect(testServer(model, { authToken: "" })).rejects.toThrow("cannot be blank");
+  });
+
+  it("returns server configuration failures as values before the compatibility signal", () => {
+    const invalid = validateMiniLilacServerConfiguration({
+      config: runtimeConfig("MINI_LILAC_TOKEN"),
+    });
+    expect(invalid.status).toBe("error");
+    if (invalid.status === "error") {
+      expect(invalid.error._tag).toBe("MiniLilacServerConfigurationInvalid");
+      expect(invalid.error.message).toContain("MINI_LILAC_TOKEN");
+    }
   });
 
   it("rejects malformed standard UI parts before creating a session", async () => {
@@ -1951,6 +2152,26 @@ describe("createMiniLilacServer", () => {
         workspaceWrites: false,
       },
     ]);
+    service.close();
+  });
+
+  it("routes an exact Elysia-boundary Panic to the fatal supervisor", async () => {
+    const model = new MockLanguageModelV4({ doStream: textResult("unused", "unused") });
+    const { config, service } = await testServer(model);
+    const panic = new Panic({ message: "model catalog invariant" });
+    const reported: Panic[] = [];
+    const panicApp = createMiniLilacServer({
+      config,
+      sessionService: service,
+      modelCatalog: { get: () => Promise.reject(panic) },
+      reportFatalPanic: (reportedPanic) => reported.push(reportedPanic),
+    });
+
+    const response = await panicApp.handle(jsonRequest("GET", `${MINI_LILAC_API_PREFIX}/models`));
+
+    expect(reported).toEqual([panic]);
+    expect(response.status).toBe(500);
+    expect(await response.text()).toBe("");
     service.close();
   });
 

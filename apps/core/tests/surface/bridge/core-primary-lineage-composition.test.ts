@@ -5,16 +5,17 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 
 import type { ModelMessage } from "ai";
+import type { Result as ResultType } from "better-result";
 import { hashCanonicalMessagesV1 } from "@stanley2058/lilac-agent";
 import {
-  buildCoreLineageManifestV1,
-  parseCorePrimaryLineageV1,
+  buildCoreLineageManifestV1 as buildCoreLineageManifestResultV1,
+  decodeCorePrimaryLineageV1,
 } from "@stanley2058/lilac-event-bus";
 
 import {
-  composeRecentChannelMessages,
-  composeRequestMessages,
-  composeSingleMessageWithLineage,
+  composeRecentChannelMessages as composeRecentChannelMessagesResult,
+  composeRequestMessages as composeRequestMessagesResult,
+  composeSingleMessageWithLineage as composeSingleMessageWithLineageResult,
 } from "../../../src/surface/bridge/request-composition";
 import type { SurfaceAdapter, SurfaceOutputStream } from "../../../src/surface/adapter";
 import type {
@@ -32,6 +33,31 @@ import { SqliteTranscriptStore } from "../../../src/transcript/transcript-store"
 
 const tempDirs: string[] = [];
 const originalFetch = globalThis.fetch;
+
+function resultValue<T, E>(result: ResultType<T, E>): T {
+  if (result.status === "error") throw result.error;
+  return result.value;
+}
+
+async function composeRecentChannelMessages(
+  ...args: Parameters<typeof composeRecentChannelMessagesResult>
+) {
+  return resultValue(await composeRecentChannelMessagesResult(...args));
+}
+
+async function composeRequestMessages(...args: Parameters<typeof composeRequestMessagesResult>) {
+  return resultValue(await composeRequestMessagesResult(...args));
+}
+
+async function composeSingleMessageWithLineage(
+  ...args: Parameters<typeof composeSingleMessageWithLineageResult>
+) {
+  return resultValue(await composeSingleMessageWithLineageResult(...args));
+}
+
+function buildCoreLineageManifestV1(...args: Parameters<typeof buildCoreLineageManifestResultV1>) {
+  return resultValue(buildCoreLineageManifestResultV1(...args));
+}
 
 afterEach(async () => {
   globalThis.fetch = originalFetch;
@@ -468,9 +494,9 @@ describe("Core primary lineage composition", () => {
         segment.atoms.filter((atom) => atom.kind === "request"),
       ),
     ).toEqual([]);
-    expect(() =>
-      parseCorePrimaryLineageV1(composed.corePrimaryLineage, composed.messages),
-    ).not.toThrow();
+    expect(decodeCorePrimaryLineageV1(composed.corePrimaryLineage, composed.messages).status).toBe(
+      "ok",
+    );
     store.close();
   });
 
@@ -575,9 +601,9 @@ describe("Core primary lineage composition", () => {
     expect(composed.corePrimaryLineage.currentCanonicalStart).toBe(
       first.messages.length + injected.length + response.length,
     );
-    expect(() =>
-      parseCorePrimaryLineageV1(composed.corePrimaryLineage, composed.messages),
-    ).not.toThrow();
+    expect(decodeCorePrimaryLineageV1(composed.corePrimaryLineage, composed.messages).status).toBe(
+      "ok",
+    );
     store.close();
   });
 
@@ -727,9 +753,9 @@ describe("Core primary lineage composition", () => {
     });
     for (const composition of [replyComposition, mentionComposition, windowComposition]) {
       expect(composition.corePrimaryLineage.state).toBe("complete");
-      expect(() =>
-        parseCorePrimaryLineageV1(composition.corePrimaryLineage, composition.messages),
-      ).not.toThrow();
+      expect(
+        decodeCorePrimaryLineageV1(composition.corePrimaryLineage, composition.messages).status,
+      ).toBe("ok");
     }
     expect(windowComposition.chainMessageIds).toEqual(["after"]);
 
@@ -776,12 +802,12 @@ describe("Core primary lineage composition", () => {
         checkpointMessages,
       );
     }
-    expect(() =>
-      parseCorePrimaryLineageV1(
+    expect(
+      decodeCorePrimaryLineageV1(
         checkpointComposition.corePrimaryLineage,
         checkpointComposition.messages,
-      ),
-    ).not.toThrow();
+      ).status,
+    ).toBe("ok");
     store.close();
   });
 });

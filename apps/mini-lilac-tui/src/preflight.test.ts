@@ -65,24 +65,28 @@ describe("selectChoice", () => {
   it("returns a preselected choice without prompting", async () => {
     const io = stubIo([]);
     const choice = await selectChoice(io, "Model", CHOICES, "c");
-    expect(choice.id).toBe("c");
+    expect(choice.status).toBe("ok");
+    if (choice.status === "ok") expect(choice.value.id).toBe("c");
     expect(io.writes).toEqual([]);
   });
 
-  it("throws when a preselected id is unknown", async () => {
+  it("returns an owned failure when a preselected id is unknown", async () => {
     const io = stubIo([]);
-    await expect(selectChoice(io, "Model", CHOICES, "zzz")).rejects.toThrow();
+    const choice = await selectChoice(io, "Model", CHOICES, "zzz");
+    expect(choice.status).toBe("error");
   });
 
   it("prompts and retries until a valid selection is entered", async () => {
     const io = stubIo(["9", "1"]);
     const choice = await selectChoice(io, "Model", CHOICES, undefined);
-    expect(choice.id).toBe("a");
+    expect(choice.status).toBe("ok");
+    if (choice.status === "ok") expect(choice.value.id).toBe("a");
   });
 
   it("uses the default choice on empty input", async () => {
     const io = stubIo([""]);
     const choice = await selectChoice(io, "Model", CHOICES, undefined);
-    expect(choice.id).toBe("b");
+    expect(choice.status).toBe("ok");
+    if (choice.status === "ok") expect(choice.value.id).toBe("b");
   });
 });

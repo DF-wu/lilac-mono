@@ -129,18 +129,17 @@ export class McpOAuthCallbackService {
     const provider = this.providers.getProviderForState(states[0]);
     if (!provider) return invalidCallbackResponse();
 
-    try {
-      await provider.completeAuthorization(codes[0], states[0]);
+    const completed = await provider.completeAuthorizationResult(codes[0], states[0]);
+    if (completed.status === "ok") {
       return new Response("OAuth authorization completed.\n", {
         status: 200,
         headers: { "Content-Type": "text/plain; charset=utf-8" },
       });
-    } catch {
-      return new Response("OAuth authorization failed.\n", {
-        status: 400,
-        headers: { "Content-Type": "text/plain; charset=utf-8" },
-      });
     }
+    return new Response("OAuth authorization failed.\n", {
+      status: 400,
+      headers: { "Content-Type": "text/plain; charset=utf-8" },
+    });
   }
 }
 

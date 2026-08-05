@@ -1,5 +1,6 @@
 import {
   type CacheType,
+  type Channel,
   Client,
   MessageFlags,
   MessageType,
@@ -7,6 +8,9 @@ import {
   type RepliableInteraction,
 } from "discord.js";
 import type { CoreConfig } from "@stanley2058/lilac-utils";
+import { Result } from "better-result";
+
+import { surfaceExternalFallback } from "../adapter";
 
 export function shouldAllowMessage(params: {
   cfg: CoreConfig;
@@ -27,21 +31,22 @@ export function shouldAllowMessage(params: {
 }
 
 export type SendableDiscordChannel = {
-  send(options: unknown): Promise<unknown>;
+  send: Extract<Channel, { send: (...args: never[]) => unknown }>["send"];
 };
 
-export function isTextSendableChannel(ch: unknown): ch is SendableDiscordChannel {
-  if (!ch || typeof ch !== "object") return false;
-  if (!("send" in ch)) return false;
-  const send = (ch as Record<string, unknown>)["send"];
-  return typeof send === "function";
+export function isTextSendableChannel(ch: Channel | null): ch is Channel & SendableDiscordChannel {
+  return ch !== null && "send" in ch && typeof ch.send === "function";
 }
 
 export async function resolveTextSendableChannel(
   client: Client,
   channelId: string,
 ): Promise<SendableDiscordChannel | null> {
-  const channel = await client.channels.fetch(channelId).catch(() => null);
+  const fetched = await Result.tryPromise({
+    try: () => client.channels.fetch(channelId),
+    catch: surfaceExternalFallback(null),
+  });
+  const channel = fetched.status === "ok" ? fetched.value : null;
   return isTextSendableChannel(channel) ? channel : null;
 }
 
@@ -82,22 +87,20 @@ export async function tryReplyEphemeral(
   interaction: RepliableInteraction<CacheType>,
   content: string,
 ): Promise<void> {
-  try {
-    await replyEphemeral(interaction, content);
-  } catch {
-    // Best-effort interaction acknowledgements should not fail event handling.
-  }
+  await Result.tryPromise({
+    try: () => replyEphemeral(interaction, content),
+    catch: surfaceExternalFallback(undefined),
+  });
 }
 
 export async function tryEditOrReplyEphemeral(
   interaction: RepliableInteraction<CacheType>,
   content: string,
 ): Promise<void> {
-  try {
-    await editOrReplyEphemeral(interaction, content);
-  } catch {
-    // Best-effort interaction acknowledgements should not fail event handling.
-  }
+  await Result.tryPromise({
+    try: () => editOrReplyEphemeral(interaction, content),
+    catch: surfaceExternalFallback(undefined),
+  });
 }
 
 export function isRoutableDiscordUserMessage(msg: Message): boolean {

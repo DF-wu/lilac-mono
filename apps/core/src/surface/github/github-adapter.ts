@@ -1,8 +1,11 @@
 import { z } from "zod";
+import { Result, TaggedError, type Result as ResultType } from "better-result";
 
 import type {
   AdapterCapabilities,
   ContentOpts,
+  GithubMsgRef,
+  GithubSessionRef,
   LimitOpts,
   MsgRef,
   SendOpts,
@@ -18,6 +21,7 @@ import type {
   SurfaceAdapter,
   SurfaceOutputStream,
 } from "../adapter";
+import { preserveSurfacePanic, signalSurfaceFailure } from "../adapter";
 import {
   createIssueComment,
   editIssueComment,
@@ -33,16 +37,38 @@ import { isGithubIssueTriggerId, parseGithubSessionId } from "../../github/githu
 import { GithubOutputStream } from "./output/github-output-stream";
 import { renderGithubActionContent } from "./github-actions";
 
-function assertGithubSessionRef(sessionRef: SessionRef) {
-  if (sessionRef.platform !== "github") {
-    throw new Error(`Expected github sessionRef (got '${sessionRef.platform}')`);
-  }
+class GithubAdapterContractFailed extends TaggedError("GithubAdapterContractFailed")<{
+  readonly reason:
+    | "wrong-session-platform"
+    | "wrong-message-platform"
+    | "empty-message"
+    | "invalid-comment-id"
+    | "unsupported-operation";
+  readonly message: string;
+}> {}
+
+function resolveGithubSessionRef(
+  sessionRef: SessionRef,
+): ResultType<GithubSessionRef, GithubAdapterContractFailed> {
+  if (sessionRef.platform === "github") return Result.ok(sessionRef);
+  return Result.err(
+    new GithubAdapterContractFailed({
+      reason: "wrong-session-platform",
+      message: `Expected github sessionRef (got '${sessionRef.platform}')`,
+    }),
+  );
 }
 
-function assertGithubMsgRef(msgRef: MsgRef) {
-  if (msgRef.platform !== "github") {
-    throw new Error(`Expected github msgRef (got '${msgRef.platform}')`);
-  }
+function resolveGithubMsgRef(
+  msgRef: MsgRef,
+): ResultType<GithubMsgRef, GithubAdapterContractFailed> {
+  if (msgRef.platform === "github") return Result.ok(msgRef);
+  return Result.err(
+    new GithubAdapterContractFailed({
+      reason: "wrong-message-platform",
+      message: `Expected github msgRef (got '${msgRef.platform}')`,
+    }),
+  );
 }
 
 export function isGithubCommentAuthoredByActor(
@@ -111,17 +137,28 @@ export class GithubAdapter implements SurfaceAdapter {
   }
 
   async startOutput(sessionRef: SessionRef, opts?: StartOutputOpts): Promise<SurfaceOutputStream> {
-    assertGithubSessionRef(sessionRef);
+    const githubSessionRef = resolveGithubSessionRef(sessionRef);
+    if (githubSessionRef.status === "error") {
+      return signalSurfaceFailure(githubSessionRef.error);
+    }
     const replyTo = opts?.replyTo;
-    return new GithubOutputStream(sessionRef, replyTo ? { replyTo } : undefined);
+    return new GithubOutputStream(githubSessionRef.value, replyTo ? { replyTo } : undefined);
   }
 
   async sendMsg(sessionRef: SessionRef, content: ContentOpts, _opts?: SendOpts): Promise<MsgRef> {
-    assertGithubSessionRef(sessionRef);
-    const thread = parseGithubSessionId(sessionRef.channelId);
+    const githubSessionRef = resolveGithubSessionRef(sessionRef);
+    if (githubSessionRef.status === "error") {
+      return signalSurfaceFailure(githubSessionRef.error);
+    }
+    const thread = parseGithubSessionId(githubSessionRef.value.channelId);
     const text = content.text ?? "";
     if (!text.trim()) {
-      throw new Error("github adapter: sendMsg requires non-empty text");
+      return signalSurfaceFailure(
+        new GithubAdapterContractFailed({
+          reason: "empty-message",
+          message: "github adapter: sendMsg requires non-empty text",
+        }),
+      );
     }
     const res = await createIssueComment({
       owner: thread.owner,
@@ -144,32 +181,37 @@ export class GithubAdapter implements SurfaceAdapter {
           ),
         });
       } catch (error) {
-        throw new GithubMessageCreatedError(
-          {
-            platform: "github",
-            channelId: sessionRef.channelId,
-            messageId: String(res.id),
-          },
-          error,
+        preserveSurfacePanic(error);
+        return signalSurfaceFailure(
+          new GithubMessageCreatedError(
+            {
+              platform: "github",
+              channelId: githubSessionRef.value.channelId,
+              messageId: String(res.id),
+            },
+            error,
+          ),
         );
       }
     }
     return {
       platform: "github",
-      channelId: sessionRef.channelId,
+      channelId: githubSessionRef.value.channelId,
       messageId: String(res.id),
     };
   }
 
   async readMsg(msgRef: MsgRef): Promise<SurfaceMessage | null> {
-    assertGithubMsgRef(msgRef);
-    const thread = parseGithubSessionId(msgRef.channelId);
+    const githubMsgRef = resolveGithubMsgRef(msgRef);
+    if (githubMsgRef.status === "error") return signalSurfaceFailure(githubMsgRef.error);
+    const resolvedMsgRef = githubMsgRef.value;
+    const thread = parseGithubSessionId(resolvedMsgRef.channelId);
 
     // If messageId matches issue number, treat it as the PR/issue description.
     if (
       isGithubIssueTriggerId({
-        sessionId: msgRef.channelId,
-        triggerId: msgRef.messageId,
+        sessionId: resolvedMsgRef.channelId,
+        triggerId: resolvedMsgRef.messageId,
       })
     ) {
       const issue = await getIssue({
@@ -182,8 +224,8 @@ export class GithubAdapter implements SurfaceAdapter {
       });
       if (!issue) return null;
       return {
-        ref: msgRef,
-        session: { platform: "github", channelId: msgRef.channelId },
+        ref: resolvedMsgRef,
+        session: { platform: "github", channelId: resolvedMsgRef.channelId },
         userId: typeof issue.user?.login === "string" ? issue.user.login : "unknown",
         userName: typeof issue.user?.login === "string" ? issue.user.login : undefined,
         text: issue.body ?? "",
@@ -192,7 +234,7 @@ export class GithubAdapter implements SurfaceAdapter {
       };
     }
 
-    const id = Number(msgRef.messageId);
+    const id = Number(resolvedMsgRef.messageId);
     if (!Number.isSafeInteger(id) || id <= 0) return null;
     const match = await getIssueComment({
       owner: thread.owner,
@@ -204,8 +246,8 @@ export class GithubAdapter implements SurfaceAdapter {
     });
     if (!match) return null;
     return {
-      ref: msgRef,
-      session: { platform: "github", channelId: msgRef.channelId },
+      ref: resolvedMsgRef,
+      session: { platform: "github", channelId: resolvedMsgRef.channelId },
       userId: typeof match.user?.login === "string" ? match.user.login : "unknown",
       userName: typeof match.user?.login === "string" ? match.user.login : undefined,
       text: typeof match.body === "string" ? match.body : "",
@@ -215,8 +257,10 @@ export class GithubAdapter implements SurfaceAdapter {
   }
 
   async listMsg(sessionRef: SessionRef, opts?: LimitOpts): Promise<SurfaceMessage[]> {
-    assertGithubSessionRef(sessionRef);
-    const thread = parseGithubSessionId(sessionRef.channelId);
+    const githubSessionRef = resolveGithubSessionRef(sessionRef);
+    if (githubSessionRef.status === "error") return signalSurfaceFailure(githubSessionRef.error);
+    const resolvedSessionRef = githubSessionRef.value;
+    const thread = parseGithubSessionId(resolvedSessionRef.channelId);
     const limit = Math.min(Math.max(opts?.limit ?? 50, 1), 100);
     const comments = await listIssueComments({
       owner: thread.owner,
@@ -228,10 +272,10 @@ export class GithubAdapter implements SurfaceAdapter {
     return comments.map((c) => ({
       ref: {
         platform: "github",
-        channelId: sessionRef.channelId,
+        channelId: resolvedSessionRef.channelId,
         messageId: String(c.id),
       },
-      session: sessionRef,
+      session: resolvedSessionRef,
       userId: typeof c.user?.login === "string" ? c.user.login : "unknown",
       userName: typeof c.user?.login === "string" ? c.user.login : undefined,
       text: typeof c.body === "string" ? c.body : "",
@@ -241,20 +285,32 @@ export class GithubAdapter implements SurfaceAdapter {
   }
 
   async editMsg(msgRef: MsgRef, content: ContentOpts): Promise<void> {
-    assertGithubMsgRef(msgRef);
-    const thread = parseGithubSessionId(msgRef.channelId);
+    const githubMsgRef = resolveGithubMsgRef(msgRef);
+    if (githubMsgRef.status === "error") return signalSurfaceFailure(githubMsgRef.error);
+    const resolvedMsgRef = githubMsgRef.value;
+    const thread = parseGithubSessionId(resolvedMsgRef.channelId);
     const body = content.text ?? "";
     if (!body.trim()) {
-      throw new Error("github adapter: editMsg requires non-empty text");
+      return signalSurfaceFailure(
+        new GithubAdapterContractFailed({
+          reason: "empty-message",
+          message: "github adapter: editMsg requires non-empty text",
+        }),
+      );
     }
-    const commentId = Number(msgRef.messageId);
+    const commentId = Number(resolvedMsgRef.messageId);
     if (!Number.isFinite(commentId) || commentId <= 0) {
-      throw new Error(`github adapter: invalid comment id '${msgRef.messageId}'`);
+      return signalSurfaceFailure(
+        new GithubAdapterContractFailed({
+          reason: "invalid-comment-id",
+          message: `github adapter: invalid comment id '${resolvedMsgRef.messageId}'`,
+        }),
+      );
     }
     const rendered = content.actions
       ? renderGithubActionContent({
           text: body,
-          messageId: msgRef.messageId,
+          messageId: resolvedMsgRef.messageId,
           actions: content.actions,
         })
       : body;
@@ -267,27 +323,41 @@ export class GithubAdapter implements SurfaceAdapter {
   }
 
   async deleteMsg(_msgRef: MsgRef): Promise<void> {
-    throw new Error("github adapter: deleteMsg not supported");
+    return signalSurfaceFailure(
+      new GithubAdapterContractFailed({
+        reason: "unsupported-operation",
+        message: "github adapter: deleteMsg not supported",
+      }),
+    );
   }
 
   async getReplyContext(sessionMsgRef: MsgRef, opts?: LimitOpts): Promise<SurfaceMessage[]> {
-    assertGithubMsgRef(sessionMsgRef);
+    const githubMsgRef = resolveGithubMsgRef(sessionMsgRef);
+    if (githubMsgRef.status === "error") return signalSurfaceFailure(githubMsgRef.error);
     const sessionRef: SessionRef = {
       platform: "github",
-      channelId: sessionMsgRef.channelId,
+      channelId: githubMsgRef.value.channelId,
     };
     return await this.listMsg(sessionRef, opts);
   }
 
   async addReaction(_msgRef: MsgRef, _reaction: string): Promise<void> {
-    throw new Error(
-      "github adapter: reactions should be handled via github-api helpers (needs reaction id for safe removal)",
+    return signalSurfaceFailure(
+      new GithubAdapterContractFailed({
+        reason: "unsupported-operation",
+        message:
+          "github adapter: reactions should be handled via github-api helpers (needs reaction id for safe removal)",
+      }),
     );
   }
 
   async removeReaction(_msgRef: MsgRef, _reaction: string): Promise<void> {
-    throw new Error(
-      "github adapter: reactions should be handled via github-api helpers (needs reaction id for safe removal)",
+    return signalSurfaceFailure(
+      new GithubAdapterContractFailed({
+        reason: "unsupported-operation",
+        message:
+          "github adapter: reactions should be handled via github-api helpers (needs reaction id for safe removal)",
+      }),
     );
   }
 
