@@ -2483,6 +2483,7 @@ export class DiscordAdapter implements SurfaceAdapter {
       cfg,
       sessionId: channelId,
       parentChannelId,
+      guildId: guildId ?? undefined,
     });
     const modelOverride = this.getSessionModelRef({
       cfg,

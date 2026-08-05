@@ -1476,11 +1476,12 @@ describe("startBusRequestRouter", () => {
     await router.stop();
   });
 
-  it("inherits parent channel session mode for Discord threads when thread has no override", async () => {
+  it("inherits parent mode and guild additionalPrompts for Discord threads", async () => {
     const raw = createInMemoryRawBus();
     const bus = createLilacBus(raw);
 
     const parentChannelId = "parent-chan";
+    const guildId = "guild-1";
     const threadId = "thread-1";
     const msgId = "m1";
     const now = Date.now();
@@ -1518,6 +1519,7 @@ describe("startBusRequestRouter", () => {
             defaultMode: "mention",
             sessionModes: {
               [parentChannelId]: { mode: "active", gate: false },
+              [guildId]: { additionalPrompts: ["guild memo"] },
             },
             activeDebounceMs: 5,
             activeGate: { enabled: true, timeoutMs: 2500 },
@@ -1564,6 +1566,7 @@ describe("startBusRequestRouter", () => {
           mentionsBot: false,
           replyToBot: false,
           parentChannelId,
+          guildId,
         },
       },
     });
@@ -1574,7 +1577,7 @@ describe("startBusRequestRouter", () => {
     expect(received.length).toBe(1);
     expect(received[0].data.queue).toBe("prompt");
     expect(received[0].data.raw?.sessionMode).toBe("active");
-    expect(received[0].data.raw?.sessionConfigId).toBe(threadId);
+    expect(received[0].data.raw?.sessionConfigId).toBe(guildId);
 
     await sub.stop();
     await router.stop();
@@ -1585,6 +1588,7 @@ describe("startBusRequestRouter", () => {
     const bus = createLilacBus(raw);
 
     const parentChannelId = "parent-chan";
+    const guildId = "guild-1";
     const threadId = "thread-1";
     const msgId = "m1";
     const now = Date.now();
@@ -1626,6 +1630,7 @@ describe("startBusRequestRouter", () => {
                 gate: false,
                 additionalPrompts: ["parent memo"],
               },
+              [guildId]: { additionalPrompts: ["guild memo"] },
             },
             activeDebounceMs: 5,
             activeGate: { enabled: true, timeoutMs: 2500 },
@@ -1672,6 +1677,7 @@ describe("startBusRequestRouter", () => {
           mentionsBot: false,
           replyToBot: false,
           parentChannelId,
+          guildId,
         },
       },
     });

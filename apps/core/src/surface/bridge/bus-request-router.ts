@@ -690,6 +690,7 @@ export async function startBusRequestRouter(params: {
                 cfg,
                 sessionId,
                 parentChannelId,
+                guildId: flags.guildId,
               });
 
           const mode: SessionMode = isDm

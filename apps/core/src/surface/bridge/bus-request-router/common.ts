@@ -255,26 +255,16 @@ export function resolveSessionConfigId(input: {
   cfg: CoreConfig;
   sessionId: string;
   parentChannelId?: string;
+  guildId?: string;
 }): string {
-  const entry = input.cfg.surface.router.sessionModes[input.sessionId];
-  if (
-    entry &&
-    (Object.prototype.hasOwnProperty.call(entry, "additionalPrompts") ||
-      Object.prototype.hasOwnProperty.call(entry, "safetyMode"))
-  ) {
-    return input.sessionId;
-  }
+  for (const candidate of [input.sessionId, input.parentChannelId, input.guildId]) {
+    const configId = candidate?.trim();
+    if (!configId) continue;
 
-  const parentChannelId = input.parentChannelId?.trim();
-  if (!parentChannelId) return input.sessionId;
-
-  const parentEntry = input.cfg.surface.router.sessionModes[parentChannelId];
-  if (
-    parentEntry &&
-    (Object.prototype.hasOwnProperty.call(parentEntry, "additionalPrompts") ||
-      Object.prototype.hasOwnProperty.call(parentEntry, "safetyMode"))
-  ) {
-    return parentChannelId;
+    const entry = input.cfg.surface.router.sessionModes[configId];
+    if (entry && Object.prototype.hasOwnProperty.call(entry, "additionalPrompts")) {
+      return configId;
+    }
   }
 
   return input.sessionId;
@@ -371,6 +361,7 @@ const discordFlagsSchema = z.strictObject({
   replyToBot: z.boolean().optional(),
   replyToMessageId: z.string().optional(),
   parentChannelId: z.string().optional(),
+  guildId: z.string().optional(),
   sessionModelOverride: z.string().optional(),
   botUserId: z.string().optional(),
 });
@@ -397,6 +388,7 @@ export function getDiscordFlags(raw: unknown): DiscordFlags {
       replyToBot: ownDataProperty("replyToBot"),
       replyToMessageId: ownDataProperty("replyToMessageId"),
       parentChannelId: ownDataProperty("parentChannelId"),
+      guildId: ownDataProperty("guildId"),
       sessionModelOverride: ownDataProperty("sessionModelOverride"),
       botUserId: ownDataProperty("botUserId"),
     });

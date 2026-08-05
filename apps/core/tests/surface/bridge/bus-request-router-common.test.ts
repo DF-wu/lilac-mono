@@ -4,6 +4,7 @@ import { Panic } from "better-result";
 import {
   getDiscordFlags,
   parseLeadingContinueDirective,
+  resolveSessionConfigId,
   resolveSessionSafetyMode,
   stripLeadingContinueDirective,
   withDefaultToolsConfig,
@@ -21,6 +22,7 @@ describe("Discord raw flags", () => {
           replyToBot: true,
           replyToMessageId: "message-1",
           parentChannelId: "channel-1",
+          guildId: "guild-1",
           sessionModelOverride: "model-1",
           botUserId: "bot-1",
           ignored: "not projected",
@@ -32,6 +34,7 @@ describe("Discord raw flags", () => {
       replyToBot: true,
       replyToMessageId: "message-1",
       parentChannelId: "channel-1",
+      guildId: "guild-1",
       sessionModelOverride: "model-1",
       botUserId: "bot-1",
     });
@@ -107,6 +110,71 @@ describe("Discord raw flags", () => {
     );
 
     expect(() => getDiscordFlags(hostile)).toThrow(panic);
+  });
+});
+
+describe("additional prompt config resolution", () => {
+  it("selects the most specific explicit additionalPrompts entry", () => {
+    const parsed = withDefaultToolsConfig({
+      surface: {
+        router: {
+          sessionModes: {
+            guild: { additionalPrompts: ["guild memo"] },
+            parent: { additionalPrompts: ["parent memo"] },
+            thread: { additionalPrompts: ["thread memo"] },
+            empty: { additionalPrompts: [] },
+            "safety-child": { safetyMode: "restricted" },
+            "safety-parent": { safetyMode: "restricted" },
+          },
+        },
+      },
+    });
+    expect(parsed.status).toBe("ok");
+    if (parsed.status === "error") return;
+
+    const cfg = parsed.value;
+    expect(resolveSessionConfigId({ cfg, sessionId: "channel", guildId: "guild" })).toBe("guild");
+    expect(
+      resolveSessionConfigId({
+        cfg,
+        sessionId: "child",
+        parentChannelId: "parent",
+        guildId: "guild",
+      }),
+    ).toBe("parent");
+    expect(
+      resolveSessionConfigId({
+        cfg,
+        sessionId: "thread",
+        parentChannelId: "parent",
+        guildId: "guild",
+      }),
+    ).toBe("thread");
+    expect(
+      resolveSessionConfigId({
+        cfg,
+        sessionId: "empty",
+        parentChannelId: "parent",
+        guildId: "guild",
+      }),
+    ).toBe("empty");
+    expect(
+      resolveSessionConfigId({
+        cfg,
+        sessionId: "safety-child",
+        parentChannelId: "parent",
+        guildId: "guild",
+      }),
+    ).toBe("parent");
+    expect(
+      resolveSessionConfigId({
+        cfg,
+        sessionId: "child",
+        parentChannelId: "safety-parent",
+        guildId: "guild",
+      }),
+    ).toBe("guild");
+    expect(resolveSessionConfigId({ cfg, sessionId: "unconfigured" })).toBe("unconfigured");
   });
 });
 
