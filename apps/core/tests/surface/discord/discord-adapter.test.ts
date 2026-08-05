@@ -1,10 +1,21 @@
 import { describe, expect, it } from "bun:test";
-import { ActivityType, ApplicationCommandOptionType, MessageType, type Message } from "discord.js";
+import {
+  ActivityType,
+  ApplicationCommandOptionType,
+  Collection,
+  type GuildMember,
+  MessageType,
+  type Message,
+  Options,
+  type ThreadMember,
+} from "discord.js";
 import { parseCoreConfigV1ToUniversal, type CoreConfig } from "@stanley2058/lilac-utils";
 import { Panic } from "better-result";
 
 import {
   DiscordAdapter,
+  DISCORD_CACHE_LIMITS,
+  DISCORD_CACHE_SETTINGS,
   classifyDiscordSurfaceNotFound,
   buildDiscordSlashOption,
   hasExplicitDiscordUserMentionInContent,
@@ -329,19 +340,58 @@ describe("resolveDiscordSurfaceEditTargetResult", () => {
   });
 });
 
+describe("Discord cache policy", () => {
+  it("preserves defaults and applies the bounded manager limits", () => {
+    expect(DISCORD_CACHE_SETTINGS.MessageManager).toBe(
+      Options.DefaultMakeCacheSettings.MessageManager,
+    );
+    expect(DISCORD_CACHE_SETTINGS.GuildMemberManager.maxSize).toBe(256);
+    expect(DISCORD_CACHE_SETTINGS.PresenceManager).toBe(256);
+    expect(DISCORD_CACHE_SETTINGS.ThreadMemberManager).toBe(256);
+    expect(DISCORD_CACHE_SETTINGS.UserManager).toBe(2_048);
+    expect(DISCORD_CACHE_SETTINGS.ReactionManager).toBe(25);
+    expect(DISCORD_CACHE_SETTINGS.ReactionUserManager).toBe(0);
+
+    const botMember = {
+      id: "bot",
+      client: { user: { id: "bot" } },
+    } as unknown as GuildMember;
+    const otherMember = {
+      id: "other",
+      client: { user: { id: "bot" } },
+    } as unknown as GuildMember;
+
+    expect(DISCORD_CACHE_SETTINGS.GuildMemberManager.keepOverLimit(botMember)).toBe(true);
+    expect(DISCORD_CACHE_SETTINGS.GuildMemberManager.keepOverLimit(otherMember)).toBe(false);
+  });
+});
+
 describe("DiscordAdapter.getHealthSnapshot", () => {
-  it("samples current gateway ping state from discord.js shards", () => {
+  it("samples gateway state and reports aggregate cache diagnostics", () => {
     const adapter = createTestDiscordAdapter();
     const adapterWithClient = adapter as unknown as {
       client: {
+        token: string;
         ws: {
           ping: number;
           shards: Map<number, { lastPingTimestamp: number }>;
         };
+        guilds: {
+          cache: Map<
+            string,
+            {
+              members: { cache: Map<string, unknown> };
+              presences: { cache: Map<string, unknown> };
+            }
+          >;
+        };
+        users: { cache: Map<string, unknown> };
+        channels: { cache: Map<string, unknown> };
       } | null;
     };
 
     adapterWithClient.client = {
+      token: "discord-secret-token",
       ws: {
         ping: 123,
         shards: new Map<number, { lastPingTimestamp: number }>([
@@ -349,12 +399,213 @@ describe("DiscordAdapter.getHealthSnapshot", () => {
           [1, { lastPingTimestamp: 2_000 }],
         ]),
       },
+      guilds: {
+        cache: new Map([
+          [
+            "g1",
+            {
+              members: {
+                cache: new Map([
+                  ["u1", {}],
+                  ["u2", {}],
+                ]),
+              },
+              presences: { cache: new Map([["u1", {}]]) },
+            },
+          ],
+        ]),
+      },
+      users: {
+        cache: new Map([
+          ["u1", {}],
+          ["u2", {}],
+          ["u3", {}],
+        ]),
+      },
+      channels: {
+        cache: new Map([
+          [
+            "c1",
+            {
+              isThread: () => false,
+              messages: {
+                cache: new Map([
+                  [
+                    "m1",
+                    {
+                      reactions: {
+                        cache: new Map([
+                          [
+                            "r1",
+                            {
+                              users: {
+                                cache: new Map([
+                                  ["u1", {}],
+                                  ["u2", {}],
+                                ]),
+                              },
+                            },
+                          ],
+                        ]),
+                      },
+                    },
+                  ],
+                ]),
+              },
+            },
+          ],
+          [
+            "t1",
+            {
+              isThread: () => true,
+              members: {
+                cache: new Map([
+                  ["u1", {}],
+                  ["u2", {}],
+                ]),
+              },
+              messages: { cache: new Map() },
+            },
+          ],
+        ]),
+      },
     };
 
-    const snapshot = adapter.getHealthSnapshot();
+    expect(adapter.getHealthSnapshot().cache).toBeUndefined();
+    const snapshot = adapter.getHealthSnapshot({ includeCache: true });
 
     expect(snapshot.gatewayPingMs).toBe(123);
     expect(snapshot.lastGatewayPingAt).toBe(2_000);
+    expect(snapshot.cache).toEqual({
+      perManagerLimits: DISCORD_CACHE_LIMITS,
+      aggregateSizes: {
+        MessageManager: 1,
+        GuildMemberManager: 2,
+        PresenceManager: 1,
+        ThreadMemberManager: 2,
+        UserManager: 3,
+      },
+    });
+    expect(JSON.stringify(snapshot)).not.toContain("discord-secret-token");
+  });
+});
+
+describe("DiscordAdapter.listSessionParticipants", () => {
+  it("lists guild members without populating the member cache", async () => {
+    const listCalls: unknown[] = [];
+    const user = { id: "u1", username: "alice", globalName: "Alice" };
+    const member = {
+      id: "u1",
+      user,
+      displayName: "Alice",
+      presence: null,
+    } as unknown as GuildMember;
+    const guild = {
+      members: {
+        list: async (options: unknown) => {
+          listCalls.push(options);
+          return new Collection([[member.id, member]]);
+        },
+        cache: new Collection<string, GuildMember>(),
+      },
+      presences: { cache: new Collection() },
+    };
+    const adapter = createTestDiscordAdapter();
+    const state = adapter as unknown as {
+      cfg: CoreConfig | null;
+      client: { channels: { fetch(): Promise<unknown> } } | null;
+      store: { upsertUserName(input: unknown): void } | null;
+    };
+    state.cfg = testConfigWithStatusMessage();
+    state.client = {
+      channels: {
+        fetch: async () => ({ guildId: "g1", isThread: () => false, guild }),
+      },
+    };
+    state.store = { upsertUserName: () => {} };
+
+    const result = await adapter.listSessionParticipants(
+      { platform: "discord", channelId: "c1", guildId: "g1" },
+      { limit: 1 },
+    );
+
+    expect(listCalls).toEqual([{ limit: 1, cache: false }]);
+    expect(result).toMatchObject({
+      source: "guild_members",
+      participants: [{ userId: "u1", userName: "alice", displayName: "Alice" }],
+    });
+  });
+
+  it("uses thread member payloads without per-participant member or user fetches", async () => {
+    const threadFetchCalls: unknown[] = [];
+    let guildMemberFetches = 0;
+    let userFetches = 0;
+    const user = { id: "u1", username: "alice", globalName: "Alice" };
+    const member = {
+      id: "u1",
+      user,
+      displayName: "Alice",
+      presence: null,
+    } as unknown as GuildMember;
+    const threadMember = {
+      id: "u1",
+      guildMember: member,
+      user,
+    } as unknown as ThreadMember<true>;
+    const adapter = createTestDiscordAdapter();
+    const state = adapter as unknown as {
+      cfg: CoreConfig | null;
+      client: {
+        channels: { fetch(): Promise<unknown> };
+        users: { fetch(userId: string): Promise<unknown> };
+      } | null;
+      store: { upsertUserName(input: unknown): void } | null;
+    };
+    state.cfg = testConfigWithStatusMessage();
+    state.client = {
+      channels: {
+        fetch: async () => ({
+          guildId: "g1",
+          isThread: () => true,
+          members: {
+            fetch: async (options: unknown) => {
+              threadFetchCalls.push(options);
+              return new Collection([[threadMember.id, threadMember]]);
+            },
+          },
+          guild: {
+            members: {
+              cache: new Collection<string, GuildMember>(),
+              fetch: async () => {
+                guildMemberFetches += 1;
+                return member;
+              },
+            },
+            presences: { cache: new Collection() },
+          },
+        }),
+      },
+      users: {
+        fetch: async () => {
+          userFetches += 1;
+          return user;
+        },
+      },
+    };
+    state.store = { upsertUserName: () => {} };
+
+    const result = await adapter.listSessionParticipants(
+      { platform: "discord", channelId: "c1", guildId: "g1" },
+      { limit: 200 },
+    );
+
+    expect(threadFetchCalls).toEqual([{ withMember: true, limit: 100, cache: false }]);
+    expect(guildMemberFetches).toBe(0);
+    expect(userFetches).toBe(0);
+    expect(result).toMatchObject({
+      source: "thread_members",
+      participants: [{ userId: "u1", userName: "alice", displayName: "Alice" }],
+    });
   });
 });
 
@@ -488,6 +739,7 @@ describe("DiscordAdapter.refreshCoreConfig", () => {
 describe("DiscordAdapter.editMsg", () => {
   it("replaces only the embed description for single-embed bot messages", async () => {
     const editCalls: Array<Record<string, unknown>> = [];
+    const fetchCalls: unknown[] = [];
     const message = {
       author: { id: "bot" },
       embeds: [
@@ -511,7 +763,10 @@ describe("DiscordAdapter.editMsg", () => {
       channels: {
         fetch: async () => ({
           messages: {
-            fetch: async () => message,
+            fetch: async (options: unknown) => {
+              fetchCalls.push(options);
+              return message;
+            },
           },
         }),
       },
@@ -523,6 +778,7 @@ describe("DiscordAdapter.editMsg", () => {
     );
 
     expect(editCalls).toHaveLength(1);
+    expect(fetchCalls).toEqual([{ message: "m1", cache: false, force: true }]);
     expect(editCalls[0]?.content).toBeUndefined();
 
     const embeds = editCalls[0]?.embeds as Array<{ toJSON(): Record<string, unknown> }> | undefined;

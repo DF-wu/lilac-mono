@@ -3,6 +3,7 @@ import {
   ApplicationCommandType,
   ApplicationCommandOptionType,
   type AutocompleteInteraction,
+  type CacheWithLimitsOptions,
   type CacheType,
   Client,
   EmbedBuilder,
@@ -11,6 +12,7 @@ import {
   GatewayIntentBits,
   MessageFlags,
   type MessageContextMenuCommandInteraction,
+  Options,
   PermissionFlagsBits,
   Partials,
   type Presence,
@@ -147,6 +149,39 @@ export type DiscordAdapterOptions = {
   reportFatalPanic: (panic: Panic) => void;
 };
 
+export const DISCORD_CACHE_LIMITS = {
+  MessageManager: 200,
+  GuildMemberManager: 256,
+  PresenceManager: 256,
+  ThreadMemberManager: 256,
+  UserManager: 2_048,
+  ReactionManager: 25,
+  ReactionUserManager: 0,
+} as const;
+
+export const DISCORD_CACHE_SETTINGS = {
+  ...Options.DefaultMakeCacheSettings,
+  GuildMemberManager: {
+    maxSize: DISCORD_CACHE_LIMITS.GuildMemberManager,
+    keepOverLimit: (member) => member.id === member.client.user?.id,
+  },
+  PresenceManager: DISCORD_CACHE_LIMITS.PresenceManager,
+  ThreadMemberManager: DISCORD_CACHE_LIMITS.ThreadMemberManager,
+  UserManager: DISCORD_CACHE_LIMITS.UserManager,
+  ReactionManager: DISCORD_CACHE_LIMITS.ReactionManager,
+  ReactionUserManager: DISCORD_CACHE_LIMITS.ReactionUserManager,
+} satisfies CacheWithLimitsOptions;
+
+type DiscordAggregateCacheSizeKey = Exclude<
+  keyof typeof DISCORD_CACHE_LIMITS,
+  "ReactionManager" | "ReactionUserManager"
+>;
+
+export type DiscordAdapterCacheSnapshot = {
+  perManagerLimits: typeof DISCORD_CACHE_LIMITS;
+  aggregateSizes: Record<DiscordAggregateCacheSizeKey, number>;
+};
+
 export type DiscordAdapterHealthSnapshot = {
   connectionState: "idle" | "connecting" | "ready" | "disconnected";
   isReady: boolean;
@@ -159,6 +194,7 @@ export type DiscordAdapterHealthSnapshot = {
   lastGatewayEventAt?: number;
   gatewayPingMs?: number;
   lastGatewayPingAt?: number;
+  cache?: DiscordAdapterCacheSnapshot;
 };
 
 export class DiscordAdapterUnavailable extends TaggedError("DiscordAdapterUnavailable")<{
@@ -270,6 +306,36 @@ function getLatestGatewayPingAt(client: Client): number | undefined {
   return latestGatewayPingAt;
 }
 
+function getDiscordCacheSnapshot(client: Client | null): DiscordAdapterCacheSnapshot {
+  const aggregateSizes: DiscordAdapterCacheSnapshot["aggregateSizes"] = {
+    MessageManager: 0,
+    GuildMemberManager: 0,
+    PresenceManager: 0,
+    ThreadMemberManager: 0,
+    UserManager: client?.users.cache.size ?? 0,
+  };
+
+  if (client) {
+    for (const guild of client.guilds.cache.values()) {
+      aggregateSizes.GuildMemberManager += guild.members.cache.size;
+      aggregateSizes.PresenceManager += guild.presences.cache.size;
+    }
+
+    for (const channel of client.channels.cache.values()) {
+      if ("isThread" in channel && channel.isThread()) {
+        aggregateSizes.ThreadMemberManager += channel.members.cache.size;
+      }
+      if (!("messages" in channel)) continue;
+      aggregateSizes.MessageManager += channel.messages.cache.size;
+    }
+  }
+
+  return {
+    perManagerLimits: { ...DISCORD_CACHE_LIMITS },
+    aggregateSizes,
+  };
+}
+
 function compareDiscordSnowflake(a: string, b: string): number {
   // Prefer numeric comparison (snowflakes are numeric strings).
   // Fall back to localeCompare if parsing fails.
@@ -377,7 +443,7 @@ export class DiscordAdapter implements SurfaceAdapter {
   private self: SurfaceSelf | null = null;
   private presenceTimer: ReturnType<typeof setInterval> | null = null;
   private appliedStatusMessage: string | null | undefined;
-  private healthState: DiscordAdapterHealthSnapshot = {
+  private healthState: Omit<DiscordAdapterHealthSnapshot, "cache"> = {
     connectionState: "idle",
     isReady: false,
   };
@@ -430,7 +496,15 @@ export class DiscordAdapter implements SurfaceAdapter {
 
     const client = new Client({
       intents,
-      partials: [Partials.Message, Partials.Channel, Partials.Reaction],
+      partials: [
+        Partials.User,
+        Partials.GuildMember,
+        Partials.Message,
+        Partials.Channel,
+        Partials.Reaction,
+        Partials.ThreadMember,
+      ],
+      makeCache: Options.cacheWithLimits(DISCORD_CACHE_SETTINGS),
     });
 
     client.on("clientReady", () => {
@@ -692,11 +766,14 @@ export class DiscordAdapter implements SurfaceAdapter {
     }
   }
 
-  getHealthSnapshot(): DiscordAdapterHealthSnapshot {
+  getHealthSnapshot(options: { includeCache?: boolean } = {}): DiscordAdapterHealthSnapshot {
     if (this.client) {
       this.refreshGatewayPing(this.client);
     }
-    return { ...this.healthState };
+    return {
+      ...this.healthState,
+      ...(options.includeCache ? { cache: getDiscordCacheSnapshot(this.client) } : {}),
+    };
   }
 
   async refreshCoreConfig(): Promise<void> {
@@ -1125,7 +1202,7 @@ export class DiscordAdapter implements SurfaceAdapter {
     }
 
     const messageResult = await channel.messages
-      .fetch(discordRef.messageId)
+      .fetch({ message: discordRef.messageId, cache: false, force: true })
       .then((message) => Result.ok(message))
       .catch((error: unknown) => {
         if (Panic.is(error)) return Promise.reject(error);
@@ -1218,7 +1295,8 @@ export class DiscordAdapter implements SurfaceAdapter {
     }
 
     const message = await Result.tryPromise({
-      try: () => channel.messages.fetch(discordRef.messageId),
+      try: () =>
+        channel.messages.fetch({ message: discordRef.messageId, cache: false, force: true }),
       catch: surfaceExternalFallback(externalCallFailure("channel.messages.fetch")),
     });
     if (message.status === "error") return signalSurfaceFailure(message.error);
@@ -1579,43 +1657,43 @@ export class DiscordAdapter implements SurfaceAdapter {
     const limit = Math.min(2000, Math.max(1, Math.floor(opts?.limit ?? 200)));
 
     if ("isThread" in ch && typeof ch.isThread === "function" && ch.isThread()) {
-      const fetchedMembers = await Result.tryPromise({
-        try: () => ch.members.fetch(),
-        catch: surfaceExternalFallback(null),
-      });
-      const members = fetchedMembers.status === "ok" ? fetchedMembers.value : null;
-      if (!members) {
-        return { source: "thread_members", participants: [] };
-      }
-
       const out: SurfaceSessionParticipant[] = [];
-      for (const threadMember of members.values()) {
-        if (out.length >= limit) break;
-
-        const userId = threadMember.id;
-        if (!userId) continue;
-
-        const fetchedMember = await Result.tryPromise({
-          try: () => ch.guild.members.fetch(userId),
+      let after: string | undefined;
+      while (out.length < limit) {
+        const pageLimit = Math.min(100, limit - out.length);
+        const fetchedMembers = await Result.tryPromise({
+          try: () =>
+            ch.members.fetch({
+              withMember: true,
+              limit: pageLimit,
+              ...(after ? { after } : {}),
+              cache: false,
+            }),
           catch: surfaceExternalFallback(null),
         });
-        const member =
-          ch.guild.members.cache.get(userId) ??
-          (fetchedMember.status === "ok" ? fetchedMember.value : null);
-        const fetchedUser = await Result.tryPromise({
-          try: () => client.users.fetch(userId),
-          catch: surfaceExternalFallback(null),
-        });
-        const user = member?.user ?? (fetchedUser.status === "ok" ? fetchedUser.value : null);
-        out.push(
-          this.toSurfaceSessionParticipant({
-            store,
-            userId,
-            member,
-            user,
-            presence: member?.presence ?? ch.guild.presences.cache.get(userId) ?? null,
-          }),
-        );
+        const members = fetchedMembers.status === "ok" ? fetchedMembers.value : null;
+        if (!members || members.size === 0) break;
+
+        for (const threadMember of members.values()) {
+          if (out.length >= limit) break;
+          const userId = threadMember.id;
+          if (!userId) continue;
+
+          const member = threadMember.guildMember;
+          const user = threadMember.user ?? member.user;
+          out.push(
+            this.toSurfaceSessionParticipant({
+              store,
+              userId,
+              member,
+              user,
+              presence: member?.presence ?? ch.guild.presences.cache.get(userId) ?? null,
+            }),
+          );
+        }
+
+        after = members.lastKey() ?? undefined;
+        if (!after || members.size < pageLimit) break;
       }
 
       return {
@@ -1638,7 +1716,8 @@ export class DiscordAdapter implements SurfaceAdapter {
     while (out.length < limit) {
       const pageLimit = Math.min(1000, Math.max(1, limit - out.length));
       const listed = await Result.tryPromise({
-        try: () => guild.members.list({ limit: pageLimit, ...(after ? { after } : {}) }),
+        try: () =>
+          guild.members.list({ limit: pageLimit, ...(after ? { after } : {}), cache: false }),
         catch: surfaceExternalFallback(null),
       });
       const page = listed.status === "ok" ? listed.value : null;
@@ -2611,7 +2690,7 @@ export class DiscordAdapter implements SurfaceAdapter {
     if (!ch || !("messages" in ch) || !ch.messages?.fetch) return null;
 
     const fetchedMessage = await ch.messages
-      .fetch(input.messageId)
+      .fetch({ message: input.messageId, cache: false, force: true })
       .then((message) => Result.ok(message))
       .catch((error: unknown) => {
         if (Panic.is(error)) return Promise.reject(error);
@@ -2677,6 +2756,7 @@ export class DiscordAdapter implements SurfaceAdapter {
           ch.messages.fetch({
             limit: Math.min(100, limit),
             around: input.aroundMessageId,
+            cache: false,
           }),
         catch: surfaceExternalFallback(null),
       });
@@ -2690,6 +2770,7 @@ export class DiscordAdapter implements SurfaceAdapter {
           ch.messages.fetch({
             limit: Math.min(100, limit),
             after: input.afterMessageId,
+            cache: false,
           }),
         catch: surfaceExternalFallback(null),
       });
@@ -2708,6 +2789,7 @@ export class DiscordAdapter implements SurfaceAdapter {
           ch.messages.fetch({
             limit: pageSize,
             before,
+            cache: false,
           }),
         catch: surfaceExternalFallback(null),
       });
@@ -3056,8 +3138,10 @@ export class DiscordAdapter implements SurfaceAdapter {
 
     const channel = msg.channel;
     if (!channel?.messages?.fetch) return false;
+    const cached = channel.messages.cache.get(replyRef.messageId);
+    if (cached) return cached.author?.id === botUserId;
     const fetched = await Result.tryPromise({
-      try: () => channel.messages.fetch(replyRef.messageId),
+      try: () => channel.messages.fetch({ message: replyRef.messageId, cache: false, force: true }),
       catch: surfaceExternalFallback(null),
     });
     return fetched.status === "ok" && fetched.value?.author?.id === botUserId;
