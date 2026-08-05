@@ -101,7 +101,7 @@ function defaultErrorFromResult(result: unknown): string {
   return oneLine(toSerializablePreview(result, 500));
 }
 
-function summarizeBashFailure(result: unknown): ToolFailureSummary {
+export function summarizeBashFailure(result: unknown): ToolFailureSummary {
   const executionError = isRecord(result) ? result["executionError"] : undefined;
   const exitCode = getNumberField(result, "exitCode");
 
@@ -124,7 +124,7 @@ function summarizeBashFailure(result: unknown): ToolFailureSummary {
   return { ok: true };
 }
 
-function summarizeReadOrEditFailure(result: unknown, toolName: string): ToolFailureSummary {
+export function summarizeReadOrEditFailure(result: unknown, toolName: string): ToolFailureSummary {
   const success = getBooleanField(result, "success");
   if (success === false) {
     const error = isRecord(result) ? result["error"] : undefined;
@@ -138,7 +138,7 @@ function summarizeReadOrEditFailure(result: unknown, toolName: string): ToolFail
   return { ok: true };
 }
 
-function summarizeSearchFailure(result: unknown, toolName: string): ToolFailureSummary {
+export function summarizeSearchFailure(result: unknown, toolName: string): ToolFailureSummary {
   const error = getStringField(result, "error");
   if (error) {
     return {
@@ -150,7 +150,7 @@ function summarizeSearchFailure(result: unknown, toolName: string): ToolFailureS
   return { ok: true };
 }
 
-function summarizeApplyPatchFailure(result: unknown): ToolFailureSummary {
+export function summarizeApplyPatchFailure(result: unknown): ToolFailureSummary {
   const status = getStringField(result, "status");
   if (status === "failed") {
     const output = getStringField(result, "output");
@@ -163,7 +163,7 @@ function summarizeApplyPatchFailure(result: unknown): ToolFailureSummary {
   return { ok: true };
 }
 
-function summarizeBatchFailure(result: unknown): ToolFailureSummary {
+export function summarizeBatchFailure(result: unknown): ToolFailureSummary {
   const ok = getBooleanField(result, "ok");
   if (ok === false) {
     const failed = getNumberField(result, "failed");
@@ -179,7 +179,7 @@ function summarizeBatchFailure(result: unknown): ToolFailureSummary {
   return { ok: true };
 }
 
-function summarizeSubagentFailure(result: unknown): ToolFailureSummary {
+export function summarizeSubagentFailure(result: unknown): ToolFailureSummary {
   const ok = getBooleanField(result, "ok");
   if (ok === false) {
     const detail = getStringField(result, "detail");
@@ -192,19 +192,6 @@ function summarizeSubagentFailure(result: unknown): ToolFailureSummary {
   }
   return { ok: true };
 }
-
-export type ToolFailureSummarizer = (result: unknown) => ToolFailureSummary;
-
-export const BUILTIN_LEVEL1_TOOL_FAILURE_SUMMARIZERS: Record<string, ToolFailureSummarizer> = {
-  bash: summarizeBashFailure,
-  read_file: (result) => summarizeReadOrEditFailure(result, "read_file"),
-  edit_file: (result) => summarizeReadOrEditFailure(result, "edit_file"),
-  glob: (result) => summarizeSearchFailure(result, "glob"),
-  grep: (result) => summarizeSearchFailure(result, "grep"),
-  apply_patch: summarizeApplyPatchFailure,
-  batch: summarizeBatchFailure,
-  subagent_delegate: summarizeSubagentFailure,
-};
 
 export function summarizeToolFailure(params: {
   toolName: string;
@@ -239,8 +226,7 @@ export function summarizeToolFailure(params: {
     if (summary.status === "ok" && summary.value) return summary.value;
   }
 
-  const builtin = BUILTIN_LEVEL1_TOOL_FAILURE_SUMMARIZERS[toolName];
-  return builtin ? builtin(result) : { ok: true };
+  return { ok: true };
 }
 
 export function formatToolLogPreview(params: {

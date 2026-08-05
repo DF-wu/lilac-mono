@@ -10,6 +10,11 @@ import { z } from "zod";
 import { fileTypeFromBuffer } from "file-type";
 import { google, type GoogleLanguageModelOptions } from "@ai-sdk/google";
 import {
+  defineServerTool,
+  type ServerTool,
+  type ServerToolCallOptions,
+} from "@stanley2058/lilac-plugin-runtime";
+import {
   createLogger,
   errorMessage,
   extractAiErrorLogDetails,
@@ -18,11 +23,6 @@ import {
 } from "@stanley2058/lilac-utils";
 import { extname } from "node:path";
 import { Result, TaggedError, type Result as ResultType } from "better-result";
-
-import type { ServerTool } from "../types";
-import type { RequestContext } from "../types";
-import { parseToolInputPreservingZodError as parseToolInput } from "../validation-error-message";
-import { zodObjectToCliLines } from "./zod-cli";
 
 class ContentInspectFailure extends TaggedError("ContentInspectFailure")<{
   readonly message: string;
@@ -117,47 +117,58 @@ export type LoadedInspectSource =
     };
 
 export class ContentInspect implements ServerTool {
-  id = "content.inspect";
+  private readonly tool: ServerTool;
 
-  constructor(private readonly options: ContentInspectOptions = {}) {}
+  constructor(private readonly options: ContentInspectOptions = {}) {
+    this.tool = defineServerTool({
+      id: "content.inspect",
+      callables: ({ callable }) => ({
+        "content.inspect": callable({
+          name: "Inspect Content",
+          description:
+            "Inspect, transcribe, and summarize text, URLs, files, images, and videos using Gemini AI. Use --help to see all options.",
+          inputSchema: contentInspectInputSchema,
+          validation: "zod",
+          primaryPositional: "text",
+          cli: {
+            shortInput: [
+              "--text=<string> OR --url=<string> OR --path=<string> OR --base64=<base64>",
+            ],
+          },
+          run: (payload, opts) => this.inspect(payload, opts),
+        }),
+      }),
+    });
+  }
+
+  get id(): string {
+    return this.tool.id;
+  }
 
   init(): Promise<void> {
-    return Promise.resolve();
+    return this.tool.init();
   }
 
   destroy(): Promise<void> {
-    return Promise.resolve();
+    return this.tool.destroy();
   }
 
-  async list() {
-    return [
-      {
-        callableId: "content.inspect",
-        name: "Inspect Content",
-        description:
-          "Inspect, transcribe, and summarize text, URLs, files, images, and videos using Gemini AI. Use --help to see all options.",
-        shortInput: ["--text=<string> OR --url=<string> OR --path=<string> OR --base64=<base64>"],
-        primaryPositional: {
-          field: "text",
-        },
-        input: zodObjectToCliLines(contentInspectInputSchema),
-      },
-    ];
+  list() {
+    return this.tool.list();
   }
 
-  async call(
+  call(
     callableId: string,
     input: Record<string, unknown>,
-    opts?: {
-      signal?: AbortSignal;
-      context?: RequestContext;
-      messages?: readonly unknown[];
-    },
+    opts?: ServerToolCallOptions,
   ): Promise<unknown> {
-    if (callableId !== "content.inspect")
-      return signalContentInspectFailureToToolHost("Invalid callable ID");
+    return this.tool.call(callableId, input, opts);
+  }
 
-    const payload = parseToolInput({ callableId, input, schema: contentInspectInputSchema });
+  private async inspect(
+    payload: z.output<typeof contentInspectInputSchema>,
+    opts: ServerToolCallOptions | undefined,
+  ) {
     try {
       const model = await resolveContentInspectModel(this.options.getConfig);
       const text = await inspectContent(payload, {

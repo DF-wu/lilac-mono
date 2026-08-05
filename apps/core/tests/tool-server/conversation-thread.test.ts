@@ -134,6 +134,16 @@ describe("ConversationThread.call", () => {
     expect(invocations).toEqual([]);
   });
 
+  it("retains guided input validation", async () => {
+    const invocations: Invocation[] = [];
+    const tool = new ConversationThread({ service: createService(invocations) });
+
+    await expect(tool.call("conversation.thread.search", { query: "" })).rejects.toThrow(
+      "conversation.thread.search has invalid input.",
+    );
+    expect(invocations).toEqual([]);
+  });
+
   it("preserves Panic from the selected service operation", async () => {
     const panic = new Panic({ message: "conversation thread invariant failed" });
     const service: ConversationThreadToolService = {

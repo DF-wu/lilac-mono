@@ -45,7 +45,7 @@ export type CoreLevel1ToolSpec = Level1ToolSpec<CoreToolPluginRuntime> & {
   [AGGREGATE_OUTPUT_BUDGET_EXEMPT]?: true;
 };
 
-export function markBoundedBuiltinOutput(spec: CoreLevel1ToolSpec): CoreLevel1ToolSpec {
+export function markBoundedBuiltinOutput<Spec extends CoreLevel1ToolSpec>(spec: Spec): Spec {
   return { ...spec, [BOUNDED_BUILTIN_OUTPUT]: true };
 }
 
@@ -53,7 +53,7 @@ export function hasBoundedBuiltinOutput(spec: CoreLevel1ToolSpec): boolean {
   return spec[BOUNDED_BUILTIN_OUTPUT] === true;
 }
 
-export function markAggregateOutputBudgetExempt(spec: CoreLevel1ToolSpec): CoreLevel1ToolSpec {
+export function markAggregateOutputBudgetExempt<Spec extends CoreLevel1ToolSpec>(spec: Spec): Spec {
   return { ...spec, [AGGREGATE_OUTPUT_BUDGET_EXEMPT]: true };
 }
 

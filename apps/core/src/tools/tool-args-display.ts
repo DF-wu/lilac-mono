@@ -155,7 +155,7 @@ function getFuzzySearchArgs(value: unknown): { query: string; cwd?: string } | n
   };
 }
 
-const readFileToolArgsFormatter: ToolArgsFormatter = (args) => {
+export const formatReadFileToolArgs: ToolArgsFormatter = (args) => {
   const parsedPath = getPathArg(args);
   if (!parsedPath) return "";
 
@@ -164,117 +164,110 @@ const readFileToolArgsFormatter: ToolArgsFormatter = (args) => {
   return " " + truncateMiddle(p, PATH_HEAD_LEN, PATH_TAIL_LEN, DISPLAY_MAX_LEN);
 };
 
-export const BUILTIN_LEVEL1_TOOL_ARGS_FORMATTERS: Record<string, ToolArgsFormatter> = {
-  bash: (args) => {
-    const parsed = safeValidateSync(bashInputSchema, args);
-    if (!isRecord(parsed) || typeof parsed["command"] !== "string") return "";
+export const formatBashToolArgs: ToolArgsFormatter = (args) => {
+  const parsed = safeValidateSync(bashInputSchema, args);
+  if (!isRecord(parsed) || typeof parsed["command"] !== "string") return "";
 
-    const cmd = parsed["command"].replace(/\s+/g, " ").trim();
-    if (!cmd) return "";
+  const cmd = parsed["command"].replace(/\s+/g, " ").trim();
+  if (!cmd) return "";
 
-    const cwd = (typeof parsed["cwd"] === "string" ? parsed["cwd"] : "").trim();
-    const cwdTarget = parseSshCwdTarget(cwd);
-    const display =
-      cwdTarget.kind === "ssh"
-        ? `${formatRemoteDisplayPath(cwdTarget.host, cwdTarget.cwd)} ${cmd}`
-        : cmd;
+  const cwd = (typeof parsed["cwd"] === "string" ? parsed["cwd"] : "").trim();
+  const cwdTarget = parseSshCwdTarget(cwd);
+  const display =
+    cwdTarget.kind === "ssh"
+      ? `${formatRemoteDisplayPath(cwdTarget.host, cwdTarget.cwd)} ${cmd}`
+      : cmd;
 
-    return " " + truncateEnd(display, DISPLAY_MAX_LEN);
-  },
+  return " " + truncateEnd(display, DISPLAY_MAX_LEN);
+};
 
-  read_file: readFileToolArgsFormatter,
+export const formatGlobToolArgs: ToolArgsFormatter = (args) => {
+  const parsed = getGlobArgs(args);
+  if (!parsed) return "";
 
-  // Back-compat for older transcripts / callers.
-  readFile: readFileToolArgsFormatter,
+  const joinedPatterns = parsed.patterns
+    .map((p) => p.trim())
+    .filter(Boolean)
+    .join(",");
+  if (!joinedPatterns) return "";
 
-  glob: (args) => {
-    const parsed = getGlobArgs(args);
-    if (!parsed) return "";
+  const cwd = normalizeRemoteCwdDisplay(parsed.cwd ?? "");
+  const raw = cwd ? `${joinedPatterns} ${cwd}` : joinedPatterns;
+  const display = raw.replace(/\s+/g, " ").trim();
+  return " " + truncateEnd(display, DISPLAY_MAX_LEN);
+};
 
-    const joinedPatterns = parsed.patterns
-      .map((p) => p.trim())
-      .filter(Boolean)
-      .join(",");
-    if (!joinedPatterns) return "";
+export const formatGrepToolArgs: ToolArgsFormatter = (args) => {
+  const parsed = getGrepArgs(args);
+  if (!parsed) return "";
 
-    const cwd = normalizeRemoteCwdDisplay(parsed.cwd ?? "");
-    const raw = cwd ? `${joinedPatterns} ${cwd}` : joinedPatterns;
-    const display = raw.replace(/\s+/g, " ").trim();
-    return " " + truncateEnd(display, DISPLAY_MAX_LEN);
-  },
+  const pattern = parsed.pattern.replace(/\s+/g, " ").trim();
+  if (!pattern) return "";
 
-  grep: (args) => {
-    const parsed = getGrepArgs(args);
-    if (!parsed) return "";
+  const cwd = normalizeRemoteCwdDisplay(parsed.cwd ?? "")
+    .replace(/\s+/g, " ")
+    .trim();
+  const raw = cwd ? `${pattern} ${cwd}` : pattern;
+  return " " + truncateEnd(raw, DISPLAY_MAX_LEN);
+};
 
-    const pattern = parsed.pattern.replace(/\s+/g, " ").trim();
-    if (!pattern) return "";
+export const formatFuzzySearchToolArgs: ToolArgsFormatter = (args) => {
+  const parsed = getFuzzySearchArgs(args);
+  if (!parsed) return "";
 
-    const cwd = normalizeRemoteCwdDisplay(parsed.cwd ?? "")
-      .replace(/\s+/g, " ")
-      .trim();
-    const raw = cwd ? `${pattern} ${cwd}` : pattern;
-    return " " + truncateEnd(raw, DISPLAY_MAX_LEN);
-  },
+  const query = parsed.query.replace(/\s+/g, " ").trim();
+  if (!query) return "";
 
-  fuzzy_search: (args) => {
-    const parsed = getFuzzySearchArgs(args);
-    if (!parsed) return "";
+  const cwd = normalizeRemoteCwdDisplay(parsed.cwd ?? "")
+    .replace(/\s+/g, " ")
+    .trim();
+  const raw = cwd ? `${query} ${cwd}` : query;
+  return " " + truncateEnd(raw, DISPLAY_MAX_LEN);
+};
 
-    const query = parsed.query.replace(/\s+/g, " ").trim();
-    if (!query) return "";
+export const formatSubagentDelegateToolArgs: ToolArgsFormatter = (args) => {
+  const parsed = safeValidateSync(subagentDelegateArgsSchema, args);
+  if (!isRecord(parsed) || typeof parsed["task"] !== "string") return "";
+  const task = parsed["task"].replace(/\s+/g, " ").trim();
+  if (!task) return "";
+  const profile = typeof parsed["profile"] === "string" ? parsed["profile"] : "explore";
+  return " " + truncateEnd(`(${profile}) ${task}`, DISPLAY_MAX_LEN);
+};
 
-    const cwd = normalizeRemoteCwdDisplay(parsed.cwd ?? "")
-      .replace(/\s+/g, " ")
-      .trim();
-    const raw = cwd ? `${query} ${cwd}` : query;
-    return " " + truncateEnd(raw, DISPLAY_MAX_LEN);
-  },
+export const formatApplyPatchToolArgs: ToolArgsFormatter = (args) => {
+  const localParsed = safeValidateSync(localApplyPatchArgsSchema, args);
+  if (!isRecord(localParsed) || typeof localParsed["patchText"] !== "string") return "";
 
-  subagent_delegate: (args) => {
-    const parsed = safeValidateSync(subagentDelegateArgsSchema, args);
-    if (!isRecord(parsed) || typeof parsed["task"] !== "string") return "";
-    const task = parsed["task"].replace(/\s+/g, " ").trim();
-    if (!task) return "";
-    const profile = typeof parsed["profile"] === "string" ? parsed["profile"] : "explore";
-    return " " + truncateEnd(`(${profile}) ${task}`, DISPLAY_MAX_LEN);
-  },
+  const paths = parseApplyPatchPathsFromPatchText(localParsed["patchText"]);
+  const first = (paths[0] ?? "").trim();
+  if (!first) return "";
 
-  apply_patch: (args) => {
-    const localParsed = safeValidateSync(localApplyPatchArgsSchema, args);
-    if (!isRecord(localParsed) || typeof localParsed["patchText"] !== "string") return "";
+  const remaining = Math.max(0, paths.length - 1);
+  const suffix = remaining > 0 ? ` (+${remaining})` : "";
+  return " " + truncateMiddle(first, PATH_HEAD_LEN, PATH_TAIL_LEN, DISPLAY_MAX_LEN) + suffix;
+};
 
-    const paths = parseApplyPatchPathsFromPatchText(localParsed["patchText"]);
-    const first = (paths[0] ?? "").trim();
-    if (!first) return "";
+export const formatEditFileToolArgs: ToolArgsFormatter = (args) => {
+  const parsedPath = getPathArg(args);
+  if (!parsedPath) return "";
 
-    const remaining = Math.max(0, paths.length - 1);
-    const suffix = remaining > 0 ? ` (+${remaining})` : "";
-    return " " + truncateMiddle(first, PATH_HEAD_LEN, PATH_TAIL_LEN, DISPLAY_MAX_LEN) + suffix;
-  },
+  const p = normalizeRemoteDisplay(parsedPath);
+  if (!p) return "";
+  return " " + truncateMiddle(p, PATH_HEAD_LEN, PATH_TAIL_LEN, DISPLAY_MAX_LEN);
+};
 
-  edit_file: (args) => {
-    const parsedPath = getPathArg(args);
-    if (!parsedPath) return "";
+export const formatBatchToolArgs: ToolArgsFormatter = (args) => {
+  const parsed = safeValidateSync(batchArgsSchema, args);
+  if (!isRecord(parsed) || !Array.isArray(parsed["tool_calls"])) return "";
 
-    const p = normalizeRemoteDisplay(parsedPath);
-    if (!p) return "";
-    return " " + truncateMiddle(p, PATH_HEAD_LEN, PATH_TAIL_LEN, DISPLAY_MAX_LEN);
-  },
-
-  batch: (args) => {
-    const parsed = safeValidateSync(batchArgsSchema, args);
-    if (!isRecord(parsed) || !Array.isArray(parsed["tool_calls"])) return "";
-
-    const n = parsed["tool_calls"].length;
-    if (!Number.isFinite(n) || n <= 0) return "";
-    return ` (${n} tools)`;
-  },
+  const n = parsed["tool_calls"].length;
+  if (!Number.isFinite(n) || n <= 0) return "";
+  return ` (${n} tools)`;
 };
 
 export function formatToolArgsForDisplay(toolName: string, args: unknown): string {
-  const f = BUILTIN_LEVEL1_TOOL_ARGS_FORMATTERS[toolName];
-  return f ? f(args) : "";
+  // Back-compat for older transcripts and callers that used the pre-Level-1 name.
+  return toolName === "readFile" ? formatReadFileToolArgs(args) : "";
 }
 
 export function formatToolArgsForDisplayWithSpecs(
@@ -299,7 +292,5 @@ export function formatToolArgsForDisplayWithSpecs(
     return formatted.status === "ok" ? (formatted.value ?? "") : "";
   }
 
-  const f = BUILTIN_LEVEL1_TOOL_ARGS_FORMATTERS[toolName];
-  if (!f) return "";
-  return f(args);
+  return formatToolArgsForDisplay(toolName, args);
 }

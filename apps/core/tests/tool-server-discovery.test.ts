@@ -639,7 +639,7 @@ describe("tool-server discovery", () => {
       const entry = (await fixture.tool.list()).find(
         (item) => item.callableId === "discovery.search",
       );
-      expect(entry?.input.find((line) => line.startsWith("--sources="))).toContain(
+      expect(entry?.input?.find((line) => line.startsWith("--sources="))).toContain(
         '("conversation" | "prompt" | "heartbeat")[]',
       );
     } finally {

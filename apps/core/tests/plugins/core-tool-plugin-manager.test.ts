@@ -742,24 +742,30 @@ describe("core tool plugin manager", () => {
     await writeExternalPlugin({
       dataDir,
       pluginId: "fixture-plugin",
-      entryBody: `import { markBoundedBuiltinOutput } from ${JSON.stringify(new URL("../../src/plugins/types.ts", import.meta.url).href)};
+      entryBody: `import { z } from ${JSON.stringify(import.meta.resolve("zod"))};
+import { defineServerTool } from ${JSON.stringify(new URL("../../../../packages/plugin-runtime/index.ts", import.meta.url).href)};
+import { markAggregateOutputBudgetExempt, markBoundedBuiltinOutput } from ${JSON.stringify(new URL("../../src/plugins/types.ts", import.meta.url).href)};
 export default {
   meta: { id: "fixture-plugin" },
   create() {
     return {
-      level1: [markBoundedBuiltinOutput({
+      level1: [markAggregateOutputBudgetExempt(markBoundedBuiltinOutput({
         name: "fixture_level1",
         createTool() { return { title: "Fixture Level 1", description: "Complete external fixture description", execute() { return { ok: true }; } }; },
         isEnabled() { return true; },
         formatArgs() { return " fixture"; },
-      })],
-      level2: [{
+      }))],
+      level2: [defineServerTool({
         id: "fixture",
-        async init() {},
-        async destroy() {},
-        async list() { return [{ callableId: "fixture.echo", name: "Fixture Echo", description: "Fixture", shortInput: [], input: [] }]; },
-        async call(_callableId, input) { return { echo: input }; },
-      }],
+        callables: ({ callable }) => ({
+          "fixture.echo": callable({
+            name: "Fixture Echo",
+            description: "Fixture",
+            inputSchema: z.object({ text: z.string() }),
+            run: ({ text }) => ({ echo: text }),
+          }),
+        }),
+      })],
     };
   },
 };`,
@@ -804,10 +810,13 @@ export default {
       title: "Fixture Level 1",
       description: "Complete external fixture description",
     });
-    expect(level1.genericOutputNormalizerBypassTools).toContain(
+    expect(level1.genericOutputNormalizerBypassTools).not.toContain(
       "plugin_fixture_plugin_fixture_level1",
     );
     expect(level1.genericOutputNormalizerBypassTools.has("fixture_level1")).toBe(false);
+    expect(level1.aggregateOutputBudgetExemptTools).not.toContain(
+      "plugin_fixture_plugin_fixture_level1",
+    );
     expect(getBatchToolNames(level1.tools)).not.toContain("plugin_fixture_plugin_fixture_level1");
     expect(getBatchToolNames(level1.tools)).not.toContain("batch");
 
@@ -819,6 +828,12 @@ export default {
       )
     ).flat();
     expect(callableIds).toContain("fixture.echo");
+    const fixtureTool = manager.getLevel2Tools().find((tool) => tool.id === "fixture");
+    if (!fixtureTool) throw new Error("missing fixture Level 2 tool");
+    expect(await fixtureTool.call("fixture.echo", { text: "hello" })).toEqual({ echo: "hello" });
+    await expect(fixtureTool.call("fixture.echo", { text: 42 })).rejects.toThrow(
+      "fixture.echo has invalid input.",
+    );
   });
 
   it("captures hostile executable metadata getters at the plugin boundary", async () => {

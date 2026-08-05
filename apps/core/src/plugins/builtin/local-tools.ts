@@ -1,9 +1,9 @@
 import type { ServerTool } from "@stanley2058/lilac-plugin-runtime";
 import {
   applyPatchInputSchema,
-  editFileInputSchema,
   LEVEL1_TOOL_NAMES,
   type ApplyPatchInput,
+  type Level1ToolName,
 } from "@stanley2058/lilac-coding-tools/schemas";
 import { expandTilde } from "@stanley2058/lilac-fs";
 import {
@@ -31,14 +31,27 @@ import {
   type SubagentDelegationHandle,
   type SubagentDelegationRegistration,
 } from "../../tools/subagent";
-import { BUILTIN_LEVEL1_TOOL_FAILURE_SUMMARIZERS } from "../../surface/bridge/bus-agent-runner/tool-failure-logging";
-import { BUILTIN_LEVEL1_TOOL_ARGS_FORMATTERS } from "../../tools/tool-args-display";
 import {
-  markAggregateOutputBudgetExempt,
-  markBoundedBuiltinOutput,
-  type CoreLevel1ToolSpec,
-  type CoreToolPlugin,
-} from "../types";
+  summarizeApplyPatchFailure,
+  summarizeBashFailure,
+  summarizeBatchFailure,
+  summarizeReadOrEditFailure,
+  summarizeSearchFailure,
+  summarizeSubagentFailure,
+} from "../../surface/bridge/bus-agent-runner/tool-failure-logging";
+import {
+  formatApplyPatchToolArgs,
+  formatBashToolArgs,
+  formatBatchToolArgs,
+  formatEditFileToolArgs,
+  formatFuzzySearchToolArgs,
+  formatGlobToolArgs,
+  formatGrepToolArgs,
+  formatReadFileToolArgs,
+  formatSubagentDelegateToolArgs,
+} from "../../tools/tool-args-display";
+import { defineLevel1Tool } from "./define-level1-tool";
+import { type CoreLevel1ToolSpec, type CoreToolPlugin } from "../types";
 
 type CoreToolBuildContext = Parameters<CoreLevel1ToolSpec["createTool"]>[0];
 
@@ -65,6 +78,11 @@ const coreToolRequestMetadataSchema = z
     onActivity: z.custom<AgentActivityHandler>(isAgentActivityHandler).optional(),
   })
   .passthrough();
+
+const editTargetInputSchema = z.object({
+  path: z.string(),
+  cwd: z.string().optional(),
+});
 
 export function decodeCoreToolRequestMetadata(
   metadata: Readonly<Record<string, unknown>> | undefined,
@@ -275,21 +293,6 @@ function getApplyPatchTool(context: CoreToolBuildContext) {
   };
 }
 
-function withBuiltinMetadata(spec: CoreLevel1ToolSpec): CoreLevel1ToolSpec {
-  const failureSummarizer = BUILTIN_LEVEL1_TOOL_FAILURE_SUMMARIZERS[spec.name];
-  return {
-    ...spec,
-    formatArgs: spec.formatArgs ?? BUILTIN_LEVEL1_TOOL_ARGS_FORMATTERS[spec.name],
-    summarizeFailure:
-      spec.summarizeFailure ??
-      (failureSummarizer ? (params) => failureSummarizer(params.result) : undefined),
-  };
-}
-
-function withBoundedOutput(spec: CoreLevel1ToolSpec): CoreLevel1ToolSpec {
-  return markBoundedBuiltinOutput(withBuiltinMetadata(spec));
-}
-
 function getDelegateHandler(requestContext: {
   metadata?: Readonly<Record<string, unknown>>;
 }): DelegateHandler | undefined {
@@ -302,139 +305,152 @@ function getAgentActivityHandler(requestContext: {
   return decodeCoreToolRequestMetadata(requestContext.metadata).onActivity;
 }
 
-export function createLocalToolSpecs(): CoreLevel1ToolSpec[] {
-  const specs = [
-    withBoundedOutput({
-      name: "bash",
-      isEnabled: () => true,
-      createTool: (context) => {
-        const { cwd, runtime, requestContext, runProfile } = context;
-        const onActivity = requestContext ? getAgentActivityHandler(requestContext) : undefined;
-        const controlCapability = decodeCoreToolRequestMetadata(
-          requestContext?.metadata,
-        ).controlCapability;
-        return bashToolWithCwd(cwd, {
-          artifacts: runtime.toolResultArtifacts,
-          outputConfig: runtime.config?.tools.output,
-          onActivity: onActivity ? () => onActivity("tool") : undefined,
-          controlCapability: typeof controlCapability === "string" ? controlCapability : undefined,
-          nativeProfile:
-            runProfile === "primary" || !runtime.config
-              ? undefined
-              : resolveNativeSubagentProfile(runtime.config, runProfile),
-        }).bash;
-      },
-    }),
-    markAggregateOutputBudgetExempt(
-      withBoundedOutput({
-        name: "read_file",
-        isEnabled: () => true,
-        createTool: (context) => getFsReadOnlyTool("read_file", context),
-      }),
-    ),
-    withBuiltinMetadata({
-      name: "glob",
-      isEnabled: (context) => context.requestContext?.safetyMode !== "restricted",
-      createTool: (context) => getFsReadOnlyTool("glob", context),
-    }),
-    withBuiltinMetadata({
-      name: "grep",
-      isEnabled: (context) => context.requestContext?.safetyMode !== "restricted",
-      createTool: (context) => getFsReadOnlyTool("grep", context),
-    }),
-    withBuiltinMetadata({
-      name: "fuzzy_search",
-      isEnabled: (context) =>
-        context.runtime.config?.tools.fsBackend === "fff" &&
-        context.requestContext?.safetyMode !== "restricted",
-      createTool: (context) => getFsReadOnlyTool("fuzzy_search", context),
-    }),
-    withBoundedOutput({
-      name: "edit_file",
-      isEnabled: (context) =>
-        context.editingToolMode === "edit_file" &&
-        context.requestContext?.safetyMode !== "restricted",
-      createTool: (context) => getEditFileTool(context),
-      editTargets: (args, context) => {
-        const decoded = editFileInputSchema.safeParse(args);
-        if (!decoded.success) {
-          return signalBuiltinToolHostError("edit_file batch preflight requires valid input");
-        }
-        return collectEditFileTouchedPaths({ path: decoded.data.path, cwd: context.cwd });
-      },
-    }),
-    withBoundedOutput({
-      name: "apply_patch",
-      isEnabled: (context) =>
-        context.editingToolMode === "apply_patch" &&
-        context.requestContext?.safetyMode !== "restricted",
-      createTool: (context) => getApplyPatchTool(context),
-      editTargets: (args, context) => {
-        const decoded = applyPatchInputSchema.safeParse(args);
-        if (!decoded.success) {
-          return signalBuiltinToolHostError("apply_patch batch preflight requires valid input");
-        }
-        return collectApplyPatchTouchedPaths({
-          patchText: decoded.data.patchText,
-          cwd: context.cwd,
-        });
-      },
-    }),
-    withBoundedOutput({
-      name: "subagent_delegate",
-      isEnabled: ({ runtime, subagentConfig, subagentDepth, requestContext }) =>
-        Boolean(runtime.bus) &&
-        subagentConfig.enabled &&
-        subagentDepth < subagentConfig.maxDepth &&
-        requestContext?.safetyMode !== "restricted",
-      createTool: ({ runtime, subagentConfig, requestContext }) => {
-        if (!runtime.bus) {
-          return signalBuiltinToolHostError("subagent_delegate requires bus");
-        }
-        const onActivity = requestContext ? getAgentActivityHandler(requestContext) : undefined;
-        return subagentTools({
-          bus: runtime.bus,
-          idleTimeoutMs: subagentConfig.idleTimeoutMs,
-          maxDepth: subagentConfig.maxDepth,
-          modelPresets: runtime.config?.models.def,
-          delegatePromptOverlay: runtime.config?.agent.subagents.delegatePromptOverlay,
-          onDelegate: requestContext ? getDelegateHandler(requestContext) : undefined,
-          onActivity: onActivity ? () => onActivity("subagent") : undefined,
-        }).subagent_delegate;
-      },
-    }),
-    withBoundedOutput({
-      name: "batch",
-      supportsBatch: false,
-      isEnabled: () => true,
-      createTool: ({
-        cwd,
-        editingToolMode,
+export const BUILTIN_LEVEL1_TOOLS = {
+  bash: defineLevel1Tool("bounded", {
+    name: "bash",
+    isEnabled: () => true,
+    formatArgs: formatBashToolArgs,
+    summarizeFailure: ({ result }) => summarizeBashFailure(result),
+    createTool: (context) => {
+      const { cwd, runtime, requestContext, runProfile } = context;
+      const onActivity = requestContext ? getAgentActivityHandler(requestContext) : undefined;
+      const controlCapability = decodeCoreToolRequestMetadata(
+        requestContext?.metadata,
+      ).controlCapability;
+      return bashToolWithCwd(cwd, {
+        artifacts: runtime.toolResultArtifacts,
+        outputConfig: runtime.config?.tools.output,
+        onActivity: onActivity ? () => onActivity("tool") : undefined,
+        controlCapability: typeof controlCapability === "string" ? controlCapability : undefined,
+        nativeProfile:
+          runProfile === "primary" || !runtime.config
+            ? undefined
+            : resolveNativeSubagentProfile(runtime.config, runProfile),
+      }).bash;
+    },
+  }),
+  read_file: defineLevel1Tool("bounded-and-aggregate-exempt", {
+    name: "read_file",
+    isEnabled: () => true,
+    formatArgs: formatReadFileToolArgs,
+    summarizeFailure: ({ result }) => summarizeReadOrEditFailure(result, "read_file"),
+    createTool: (context) => getFsReadOnlyTool("read_file", context),
+  }),
+  glob: defineLevel1Tool("generic", {
+    name: "glob",
+    isEnabled: (context) => context.requestContext?.safetyMode !== "restricted",
+    formatArgs: formatGlobToolArgs,
+    summarizeFailure: ({ result }) => summarizeSearchFailure(result, "glob"),
+    createTool: (context) => getFsReadOnlyTool("glob", context),
+  }),
+  grep: defineLevel1Tool("generic", {
+    name: "grep",
+    isEnabled: (context) => context.requestContext?.safetyMode !== "restricted",
+    formatArgs: formatGrepToolArgs,
+    summarizeFailure: ({ result }) => summarizeSearchFailure(result, "grep"),
+    createTool: (context) => getFsReadOnlyTool("grep", context),
+  }),
+  fuzzy_search: defineLevel1Tool("generic", {
+    name: "fuzzy_search",
+    isEnabled: (context) =>
+      context.runtime.config?.tools.fsBackend === "fff" &&
+      context.requestContext?.safetyMode !== "restricted",
+    formatArgs: formatFuzzySearchToolArgs,
+    summarizeFailure: ({ result }) => summarizeSearchFailure(result, "fuzzy_search"),
+    createTool: (context) => getFsReadOnlyTool("fuzzy_search", context),
+  }),
+  edit_file: defineLevel1Tool("bounded", {
+    name: "edit_file",
+    isEnabled: (context) =>
+      context.editingToolMode === "edit_file" &&
+      context.requestContext?.safetyMode !== "restricted",
+    formatArgs: formatEditFileToolArgs,
+    summarizeFailure: ({ result }) => summarizeReadOrEditFailure(result, "edit_file"),
+    createTool: (context) => getEditFileTool(context),
+    editTargets: (args, context) => {
+      const decoded = editTargetInputSchema.safeParse(args);
+      if (!decoded.success) {
+        return signalBuiltinToolHostError("edit_file batch preflight requires valid input");
+      }
+      return collectEditFileTouchedPaths({
+        path: decoded.data.path,
+        cwd: decoded.data.cwd ?? context.cwd,
+      });
+    },
+  }),
+  apply_patch: defineLevel1Tool("bounded", {
+    name: "apply_patch",
+    isEnabled: (context) =>
+      context.editingToolMode === "apply_patch" &&
+      context.requestContext?.safetyMode !== "restricted",
+    formatArgs: formatApplyPatchToolArgs,
+    summarizeFailure: ({ result }) => summarizeApplyPatchFailure(result),
+    createTool: (context) => getApplyPatchTool(context),
+    editTargets: (args, context) => {
+      const decoded = applyPatchInputSchema.safeParse(args);
+      if (!decoded.success) {
+        return signalBuiltinToolHostError("apply_patch batch preflight requires valid input");
+      }
+      return collectApplyPatchTouchedPaths({
+        patchText: decoded.data.patchText,
+        cwd: decoded.data.cwd ?? context.cwd,
+      });
+    },
+  }),
+  subagent_delegate: defineLevel1Tool("bounded", {
+    name: "subagent_delegate",
+    isEnabled: ({ runtime, subagentConfig, subagentDepth, requestContext }) =>
+      Boolean(runtime.bus) &&
+      subagentConfig.enabled &&
+      subagentDepth < subagentConfig.maxDepth &&
+      requestContext?.safetyMode !== "restricted",
+    formatArgs: formatSubagentDelegateToolArgs,
+    summarizeFailure: ({ result }) => summarizeSubagentFailure(result),
+    createTool: ({ runtime, subagentConfig, requestContext }) => {
+      if (!runtime.bus) {
+        return signalBuiltinToolHostError("subagent_delegate requires bus");
+      }
+      const onActivity = requestContext ? getAgentActivityHandler(requestContext) : undefined;
+      return subagentTools({
+        bus: runtime.bus,
+        idleTimeoutMs: subagentConfig.idleTimeoutMs,
+        maxDepth: subagentConfig.maxDepth,
+        modelPresets: runtime.config?.models.def,
+        delegatePromptOverlay: runtime.config?.agent.subagents.delegatePromptOverlay,
+        onDelegate: requestContext ? getDelegateHandler(requestContext) : undefined,
+        onActivity: onActivity ? () => onActivity("subagent") : undefined,
+      }).subagent_delegate;
+    },
+  }),
+  batch: defineLevel1Tool("bounded", {
+    name: "batch",
+    supportsBatch: false,
+    isEnabled: () => true,
+    formatArgs: formatBatchToolArgs,
+    summarizeFailure: ({ result }) => summarizeBatchFailure(result),
+    createTool: ({
+      cwd,
+      editingToolMode,
+      getTools,
+      getLevel1ToolSpecs,
+      resolveEditTargets,
+      runtime,
+    }) =>
+      batchTool({
+        defaultCwd: cwd,
         getTools,
-        getLevel1ToolSpecs,
+        getToolSpecs: getLevel1ToolSpecs,
         resolveEditTargets,
-        runtime,
-      }) =>
-        batchTool({
-          defaultCwd: cwd,
-          getTools,
-          getToolSpecs: getLevel1ToolSpecs,
-          resolveEditTargets,
-          editingMode: editingToolMode,
-          maxCalls: runtime.config?.tools.batch.maxCalls ?? 8,
-        }).batch,
-    }),
-  ];
-  const names = specs.map((spec) => spec.name);
-  if (
-    names.length !== LEVEL1_TOOL_NAMES.length ||
-    names.some((name, index) => name !== LEVEL1_TOOL_NAMES[index])
-  ) {
-    return signalBuiltinToolHostError(
-      `Built-in Level-1 registry does not match coding-tools: ${names.join(", ")}`,
-    );
-  }
-  return specs;
+        editingMode: editingToolMode,
+        maxCalls: runtime.config?.tools.batch.maxCalls ?? 8,
+      }).batch,
+  }),
+} satisfies {
+  readonly [Name in Level1ToolName]: CoreLevel1ToolSpec & { readonly name: Name };
+};
+
+export function createLocalToolSpecs(): CoreLevel1ToolSpec[] {
+  return LEVEL1_TOOL_NAMES.map((name) => BUILTIN_LEVEL1_TOOLS[name]);
 }
 
 export function createBuiltinLocalToolsPlugin(): CoreToolPlugin {

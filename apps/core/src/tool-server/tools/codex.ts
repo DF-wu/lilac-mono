@@ -5,12 +5,15 @@ import {
   startCodexOAuthLogin,
   type CodexOAuthLogin,
 } from "@stanley2058/lilac-utils";
+import {
+  defineServerTool,
+  type ServerTool,
+  type ServerToolCallOptions,
+} from "@stanley2058/lilac-plugin-runtime";
 import { z } from "zod";
 import { Result, TaggedError, type Result as ResultType } from "better-result";
 
-import type { ServerTool } from "../types";
 import { parseToolInputPreservingZodError as parseToolInput } from "../validation-error-message";
-import { zodObjectToCliLines } from "./zod-cli";
 
 class CodexToolFailure extends TaggedError("CodexToolFailure")<{
   readonly message: string;
@@ -104,52 +107,80 @@ const defaultDependencies: CodexDependencies = {
 export class Codex implements ServerTool {
   id = "codex";
 
-  constructor(private readonly dependencies: CodexDependencies = defaultDependencies) {}
-
-  async init(): Promise<void> {}
-
-  async destroy(): Promise<void> {
-    pendingGeneration += 1;
-    await runPendingTransition(async () => {
-      const login = pending;
-      pending = null;
-      await login?.close();
-    });
-  }
-
-  async list() {
-    return [
-      {
-        callableId: "codex.login",
+  private readonly tool = defineServerTool({
+    id: this.id,
+    destroy: async () => {
+      pendingGeneration += 1;
+      await runPendingTransition(async () => {
+        const login = pending;
+        pending = null;
+        await login?.close();
+      });
+    },
+    callables: ({ callable }) => ({
+      "codex.login": callable({
         name: "Codex Login",
         description: [
           "Authenticate to OpenAI Codex via ChatGPT OAuth.",
           "Use mode=start to get a browser URL. If the localhost callback doesn't work, use mode=exchange and paste the callback URL.",
         ].join("\n"),
-        shortInput: zodObjectToCliLines(loginInputSchema, { mode: "required" }),
-        input: zodObjectToCliLines(loginInputSchema),
+        inputSchema: loginInputSchema,
+        validation: "zod",
         hidden: true,
-      },
-      {
-        callableId: "codex.status",
+        run: (input) => this.runCallable("codex.login", input),
+      }),
+      "codex.status": callable({
         name: "Codex Status",
         description: "Show whether Codex OAuth tokens are configured.",
-        shortInput: [],
-        input: zodObjectToCliLines(statusInputSchema),
+        inputSchema: statusInputSchema,
+        validation: "zod",
         hidden: true,
-      },
-      {
-        callableId: "codex.logout",
+        run: (input) => this.runCallable("codex.status", input),
+      }),
+      "codex.logout": callable({
         name: "Codex Logout",
         description: "Clear stored Codex OAuth tokens.",
-        shortInput: [],
-        input: zodObjectToCliLines(logoutInputSchema),
+        inputSchema: logoutInputSchema,
+        validation: "zod",
         hidden: true,
-      },
-    ];
+        run: (input) => this.runCallable("codex.logout", input),
+      }),
+    }),
+  });
+
+  constructor(private readonly dependencies: CodexDependencies = defaultDependencies) {}
+
+  async init(): Promise<void> {
+    await this.tool.init();
   }
 
-  async call(callableId: string, input: Record<string, unknown>): Promise<unknown> {
+  async destroy(): Promise<void> {
+    await this.tool.destroy();
+  }
+
+  async list() {
+    return this.tool.list();
+  }
+
+  async call(
+    callableId: string,
+    input: Record<string, unknown>,
+    opts?: ServerToolCallOptions,
+  ): Promise<unknown> {
+    if (
+      callableId !== "codex.login" &&
+      callableId !== "codex.status" &&
+      callableId !== "codex.logout"
+    ) {
+      return signalCodexFailureToToolHost("Invalid callable ID");
+    }
+    return this.tool.call(callableId, input, opts);
+  }
+
+  private async runCallable(
+    callableId: "codex.login" | "codex.status" | "codex.logout",
+    input: Record<string, unknown>,
+  ): Promise<unknown> {
     if (callableId === "codex.login") {
       const payload = parseToolInput({ callableId, input, schema: loginInputSchema });
       if (payload.mode === "start") {
@@ -254,7 +285,5 @@ export class Codex implements ServerTool {
         return { ok: true as const, storagePath: this.dependencies.storagePath() };
       });
     }
-
-    return signalCodexFailureToToolHost("Invalid callable ID");
   }
 }

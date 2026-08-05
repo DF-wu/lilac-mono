@@ -5,7 +5,6 @@ import { Readability } from "@mozilla/readability";
 import { chromium, type Browser, type BrowserContext, type Page } from "playwright";
 import Exa from "exa-js";
 import type { ServerTool } from "../types";
-import { zodObjectToCliLines } from "./zod-cli";
 import { tavily, type TavilyClient } from "@tavily/core";
 import TurndownService from "turndown";
 import {
@@ -18,6 +17,7 @@ import {
 import fs from "node:fs/promises";
 import { constants as fsConstants } from "node:fs";
 import { Result, TaggedError, type Result as ResultType } from "better-result";
+import { defineServerTool } from "@stanley2058/lilac-plugin-runtime";
 
 import {
   createDefaultWebSearchProviders,
@@ -27,7 +27,6 @@ import {
   type WebSearchProvider,
 } from "./web-search";
 import type { RequestContext } from "../types";
-import { parseToolInputPreservingZodError as parseToolInput } from "../validation-error-message";
 
 const getPageModeSchema = z.enum(["auto", "fetch", "browser", "extract", "provider-only"]);
 
@@ -542,6 +541,7 @@ function buildSimpleHtmlContent(html: string, url: string) {
 
 export class Web implements ServerTool {
   id = "web";
+  private readonly serverTool: ServerTool;
 
   private tavily: TavilyClient | null = null;
   private exa: Exa | null = null;
@@ -560,6 +560,29 @@ export class Web implements ServerTool {
   constructor() {
     this.logger = createLogger({
       module: "server-tool:web",
+    });
+    this.serverTool = defineServerTool({
+      id: this.id,
+      init: () => this.initialize(),
+      destroy: () => this.destroyResources(),
+      callables: ({ callable }) => ({
+        fetch: callable({
+          name: "Fetch",
+          description: "Fetch a web page",
+          inputSchema: getPageSchema,
+          validation: "zod",
+          primaryPositional: "url",
+          run: (input, opts) => this.callFetch(input, opts),
+        }),
+        search: callable({
+          name: "Web Search",
+          description: "Search the web",
+          inputSchema: webSearchInputSchema,
+          validation: "zod",
+          primaryPositional: "query",
+          run: (input, opts) => this.callSearch(input, opts),
+        }),
+      }),
     });
   }
 
@@ -680,43 +703,28 @@ export class Web implements ServerTool {
     return this.exa;
   }
 
-  async init() {
+  private async initialize() {
     await this.refreshWebConfig();
 
     this.logger.logInfo("Web extension initialized");
   }
 
-  async destroy() {
+  private async destroyResources() {
     await this.browserContext?.browser.close();
     this.browserContext = null;
     this.browserInit = null;
   }
 
+  async init() {
+    await this.serverTool.init();
+  }
+
+  async destroy() {
+    await this.serverTool.destroy();
+  }
+
   async list() {
-    return [
-      {
-        callableId: "fetch",
-        name: "Fetch",
-        description: "Fetch a web page",
-        shortInput: zodObjectToCliLines(getPageSchema, { mode: "required" }),
-        input: zodObjectToCliLines(getPageSchema),
-        primaryPositional: {
-          field: "url",
-        },
-      },
-      {
-        callableId: "search",
-        name: "Web Search",
-        description: "Search the web",
-        shortInput: zodObjectToCliLines(webSearchInputSchema, {
-          mode: "required",
-        }),
-        input: zodObjectToCliLines(webSearchInputSchema),
-        primaryPositional: {
-          field: "query",
-        },
-      },
-    ];
+    return this.serverTool.list();
   }
 
   async call(
@@ -728,19 +736,16 @@ export class Web implements ServerTool {
       messages?: readonly unknown[];
     },
   ): Promise<unknown> {
-    if (callableId === "fetch") return this.callFetch(rawInput, opts);
-    if (callableId === "search") return this.callSearch(rawInput, opts);
-    return signalWebFailureToToolHost("Invalid callable ID");
+    return this.serverTool.call(callableId, rawInput, opts);
   }
 
   private async callFetch(
-    rawInput: Record<string, unknown>,
+    input: GetPageInput,
     opts?: {
       signal?: AbortSignal;
       context?: RequestContext;
     },
   ) {
-    const input = parseToolInput({ callableId: "fetch", input: rawInput, schema: getPageSchema });
     await this.refreshWebConfig();
 
     const mode = input.mode ?? this.webFetchDefaultMode;
@@ -771,17 +776,11 @@ export class Web implements ServerTool {
   }
 
   private async callSearch(
-    rawInput: Record<string, unknown>,
+    input: z.output<typeof webSearchInputSchema>,
     opts?: {
       signal?: AbortSignal;
     },
   ) {
-    const input = parseToolInput({
-      callableId: "search",
-      input: rawInput,
-      schema: webSearchInputSchema,
-    });
-
     await this.refreshWebConfig();
 
     if (this.webSearchProviders.length === 0) {

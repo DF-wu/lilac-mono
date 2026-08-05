@@ -4,10 +4,15 @@ import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
 import { basename, extname, join, resolve } from "node:path";
 import type { ModelMessage } from "ai";
-import type { RequestContext, ServerTool } from "../types";
 import { lilacEventTypes, type LilacBus } from "@stanley2058/lilac-event-bus";
+import {
+  defineServerTool,
+  type ServerTool,
+  type ServerToolCallOptions,
+} from "@stanley2058/lilac-plugin-runtime";
 import { Result, TaggedError, type Result as ResultType } from "better-result";
-import { parseToolInput } from "../validation-error-message";
+
+import type { RequestContext } from "../types";
 import {
   requireToolServerHeaders,
   type RequiredToolServerHeaders,
@@ -226,72 +231,77 @@ function collectUserAttachments(messages: readonly ModelMessage[]): DetectedAtta
 
 export class Attachment implements ServerTool {
   id = "attachment";
+  private readonly tool: ServerTool;
 
-  constructor(private readonly params: { bus: LilacBus }) {}
+  constructor(private readonly params: { bus: LilacBus }) {
+    this.tool = defineServerTool({
+      id: this.id,
+      callables: ({ callable }) => ({
+        "attachment.add_files": callable({
+          name: "Attachment Add Files",
+          description: "Reads local files and attaches them to the current reply.",
+          inputSchema: attachmentAddFilesInputSchema,
+          primaryPositional: {
+            field: "paths",
+            variadic: true,
+          },
+          cli: {
+            shortInput: ["--paths=<string | string[]>"],
+            input: [
+              "--paths=<string | string[]> | Local file paths (preferred; alias: files)",
+              "--filenames=<string | string[]> | Optional filenames (same length as paths)",
+              "--mimeTypes=<string | string[]> | Optional mime types (same length as paths)",
+            ],
+          },
+          run: (input, opts) => this.callAddFiles(input, opts?.context),
+        }),
+        "attachment.download": callable({
+          name: "Attachment Download",
+          description:
+            "Download inbound user message attachments into the sandbox (from the current request prompt).",
+          inputSchema: attachmentDownloadInputSchema,
+          cli: {
+            shortInput: [],
+            input: ["--downloadDir=<string>"],
+          },
+          run: (input, opts) => {
+            const messages = opts?.messages as readonly ModelMessage[] | undefined;
+            if (!messages) {
+              signalAttachmentFailureToToolHost(
+                "attachment.download requires request messages, but none were available for this request. (Tool server caches cmd.request messages; ensure the tool server is connected to the bus and started before the request.)",
+              );
+            }
+            return this.callDownload(input, messages, opts?.context);
+          },
+        }),
+      }),
+    });
+  }
 
-  async init(): Promise<void> {}
-  async destroy(): Promise<void> {}
+  async init(): Promise<void> {
+    await this.tool.init();
+  }
+
+  async destroy(): Promise<void> {
+    await this.tool.destroy();
+  }
 
   async list() {
-    return [
-      {
-        callableId: "attachment.add_files",
-        name: "Attachment Add Files",
-        description: "Reads local files and attaches them to the current reply.",
-        shortInput: ["--paths=<string | string[]>"],
-        input: [
-          "--paths=<string | string[]> | Local file paths (preferred; alias: files)",
-          "--filenames=<string | string[]> | Optional filenames (same length as paths)",
-          "--mimeTypes=<string | string[]> | Optional mime types (same length as paths)",
-        ],
-        primaryPositional: {
-          field: "paths",
-          variadic: true,
-        },
-      },
-      {
-        callableId: "attachment.download",
-        name: "Attachment Download",
-        description:
-          "Download inbound user message attachments into the sandbox (from the current request prompt).",
-        shortInput: [],
-        input: ["--downloadDir=<string>"],
-      },
-    ];
+    return await this.tool.list();
   }
 
   async call(
     callableId: string,
     input: Record<string, unknown>,
-    opts?: {
-      signal?: AbortSignal;
-      context?: RequestContext;
-      messages?: readonly unknown[];
-    },
+    opts?: ServerToolCallOptions,
   ): Promise<unknown> {
-    if (callableId === "attachment.add_files") {
-      return await this.callAddFiles(input, opts?.context);
-    }
-
-    if (callableId === "attachment.download") {
-      const messages = opts?.messages as readonly ModelMessage[] | undefined;
-      if (!messages) {
-        signalAttachmentFailureToToolHost(
-          "attachment.download requires request messages, but none were available for this request. (Tool server caches cmd.request messages; ensure the tool server is connected to the bus and started before the request.)",
-        );
-      }
-      return await this.callDownload(input, messages, opts?.context);
-    }
-
-    return signalAttachmentFailureToToolHost(`Invalid callable ID '${callableId}'`);
+    return await this.tool.call(callableId, input, opts);
   }
 
-  private async callAddFiles(rawInput: Record<string, unknown>, ctx: RequestContext | undefined) {
-    const input = parseToolInput({
-      callableId: "attachment.add_files",
-      input: rawInput,
-      schema: attachmentAddFilesInputSchema,
-    });
+  private async callAddFiles(
+    input: z.output<typeof attachmentAddFilesInputSchema>,
+    ctx: RequestContext | undefined,
+  ) {
     const headers = toHeaders(ctx);
 
     const cwd = ctx?.cwd ?? process.cwd();
@@ -356,16 +366,10 @@ export class Attachment implements ServerTool {
   }
 
   private async callDownload(
-    rawInput: Record<string, unknown>,
+    input: z.output<typeof attachmentDownloadInputSchema>,
     messages: readonly ModelMessage[],
     ctx: RequestContext | undefined,
   ) {
-    const input = parseToolInput({
-      callableId: "attachment.download",
-      input: rawInput,
-      schema: attachmentDownloadInputSchema,
-    });
-
     const downloadDir =
       ctx?.safetyMode === "restricted"
         ? resolveToolPathForRequestContext({

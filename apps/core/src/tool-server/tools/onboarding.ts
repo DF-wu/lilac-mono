@@ -16,10 +16,13 @@ import {
   resolvePromptDir,
   seedCoreConfig,
 } from "@stanley2058/lilac-utils";
+import {
+  defineServerTool,
+  type ServerTool,
+  type ServerToolCallOptions,
+} from "@stanley2058/lilac-plugin-runtime";
 
-import type { ServerTool } from "../types";
 import { parseToolInputPreservingZodError as parseToolInput } from "../validation-error-message";
-import { zodObjectToCliLines } from "./zod-cli";
 import { chromium } from "playwright";
 
 import {
@@ -711,135 +714,133 @@ async function hasAnySkillMdUnder(dir: string): Promise<boolean> {
 export class Onboarding implements ServerTool {
   id = "onboarding";
 
-  async init(): Promise<void> {}
-  async destroy(): Promise<void> {}
-
-  async list() {
-    return [
-      {
-        callableId: "onboarding.bootstrap",
+  private readonly tool = defineServerTool({
+    id: this.id,
+    callables: ({ callable }) => ({
+      "onboarding.bootstrap": callable({
         name: "Onboarding Bootstrap",
         description: "Bootstrap DATA_DIR (core-config.yaml + prompts/*). Hidden by default.",
-        shortInput: zodObjectToCliLines(bootstrapInputSchema, {
-          mode: "required",
-        }),
-        input: zodObjectToCliLines(bootstrapInputSchema),
+        inputSchema: bootstrapInputSchema,
+        validation: "zod",
         hidden: true,
-      },
-      {
-        callableId: "onboarding.playwright",
+        run: (input) => this.runCallable("onboarding.bootstrap", input),
+      }),
+      "onboarding.playwright": callable({
         name: "Onboarding Playwright",
         description:
           "Ensure Chromium is available for Playwright (prefer system chromium; fallback to Playwright install). Hidden by default.",
-        shortInput: zodObjectToCliLines(playwrightInputSchema, {
-          mode: "required",
-        }),
-        input: zodObjectToCliLines(playwrightInputSchema),
+        inputSchema: playwrightInputSchema,
+        validation: "zod",
         hidden: true,
-      },
-      {
-        callableId: "onboarding.defaults",
+        run: (input) => this.runCallable("onboarding.playwright", input),
+      }),
+      "onboarding.defaults": callable({
         name: "Onboarding Defaults",
         description: "Install default CLIs + skills into DATA_DIR (persisted). Hidden by default.",
-        shortInput: zodObjectToCliLines(defaultsInputSchema, {
-          mode: "required",
-        }),
-        input: zodObjectToCliLines(defaultsInputSchema),
+        inputSchema: defaultsInputSchema,
+        validation: "zod",
         hidden: true,
-      },
-      {
-        callableId: "onboarding.github_app",
+        run: (input) => this.runCallable("onboarding.defaults", input),
+      }),
+      "onboarding.github_app": callable({
         name: "Onboarding GitHub App",
         description:
           "Configure GitHub App credentials for the agent (installs GH_TOKEN/GITHUB_TOKEN in bash env). Hidden by default.",
-        shortInput: zodObjectToCliLines(githubAppInputSchema, {
-          mode: "required",
-        }),
-        input: zodObjectToCliLines(githubAppInputSchema),
+        inputSchema: githubAppInputSchema,
+        validation: "zod",
         hidden: true,
-      },
-      {
-        callableId: "onboarding.github_user_token",
+        run: (input) => this.runCallable("onboarding.github_app", input),
+      }),
+      "onboarding.github_user_token": callable({
         name: "Onboarding GitHub User Token",
         description:
           "Configure GitHub user outbound auth via PAT/fine-grained PAT (preferred for GH_TOKEN/GITHUB_TOKEN in bash env). Hidden by default.",
-        shortInput: zodObjectToCliLines(githubUserTokenInputSchema, {
-          mode: "required",
-        }),
-        input: zodObjectToCliLines(githubUserTokenInputSchema),
+        inputSchema: githubUserTokenInputSchema,
+        validation: "zod",
         hidden: true,
-      },
-      {
-        callableId: "onboarding.vcs_env",
+        run: (input) => this.runCallable("onboarding.github_user_token", input),
+      }),
+      "onboarding.vcs_env": callable({
         name: "Onboarding VCS Env",
         description:
           "Show effective GIT_CONFIG_GLOBAL and GNUPGHOME paths under DATA_DIR. Hidden by default.",
-        shortInput: zodObjectToCliLines(vcsEnvInputSchema, { mode: "required" }),
-        input: zodObjectToCliLines(vcsEnvInputSchema),
+        inputSchema: vcsEnvInputSchema,
+        validation: "zod",
         hidden: true,
-      },
-      {
-        callableId: "onboarding.git_identity",
+        run: (input) => this.runCallable("onboarding.vcs_env", input),
+      }),
+      "onboarding.git_identity": callable({
         name: "Onboarding Git Identity",
         description:
           "Configure agent git identity (name/email) and optional GPG signing, persisted under DATA_DIR. Hidden by default.",
-        shortInput: zodObjectToCliLines(gitIdentityInputSchema, {
-          mode: "required",
-        }),
-        input: zodObjectToCliLines(gitIdentityInputSchema),
+        inputSchema: gitIdentityInputSchema,
+        validation: "zod",
         hidden: true,
-      },
-      {
-        callableId: "onboarding.gnupg",
+        run: (input) => this.runCallable("onboarding.git_identity", input),
+      }),
+      "onboarding.gnupg": callable({
         name: "Onboarding GnuPG",
         description:
           "Generate/export a no-passphrase GPG key for commit signing (stored under DATA_DIR/secret). Hidden by default.",
-        shortInput: zodObjectToCliLines(gnupgInputSchema, {
-          mode: "required",
-        }),
-        input: zodObjectToCliLines(gnupgInputSchema),
+        inputSchema: gnupgInputSchema,
+        validation: "zod",
         hidden: true,
-      },
-      {
-        callableId: "onboarding.reload_tools",
+        run: (input) => this.runCallable("onboarding.gnupg", input),
+      }),
+      "onboarding.reload_tools": callable({
         name: "Onboarding Reload Tools",
         description:
           "Reload tool instances (calls POST /reload on the local tool server). Hidden by default.",
-        shortInput: [],
-        input: [],
+        inputSchema: z.object({}),
+        validation: "zod",
         hidden: true,
-      },
-      {
-        callableId: "onboarding.reload_config",
+        run: (input) => this.runCallable("onboarding.reload_tools", input),
+      }),
+      "onboarding.reload_config": callable({
         name: "Onboarding Reload Config",
         description: "Reload core config cache (or restart process). Hidden by default.",
-        shortInput: zodObjectToCliLines(reloadConfigInputSchema, {
-          mode: "required",
-        }),
-        input: zodObjectToCliLines(reloadConfigInputSchema),
+        inputSchema: reloadConfigInputSchema,
+        validation: "zod",
         hidden: true,
-      },
-      {
-        callableId: "onboarding.restart",
+        run: (input) => this.runCallable("onboarding.reload_config", input),
+      }),
+      "onboarding.restart": callable({
         name: "Onboarding Restart",
         description: "Exit the process (docker/systemd should restart it). Hidden by default.",
-        shortInput: [],
-        input: [],
+        inputSchema: z.object({}),
+        validation: "zod",
         hidden: true,
-      },
-      {
-        callableId: "onboarding.all",
+        run: (input) => this.runCallable("onboarding.restart", input),
+      }),
+      "onboarding.all": callable({
         name: "Onboarding All",
         description:
           "Run bootstrap + playwright check/install + defaults + config reload (and optional restart). Hidden by default.",
-        shortInput: zodObjectToCliLines(allInputSchema, { mode: "required" }),
-        input: zodObjectToCliLines(allInputSchema),
+        inputSchema: allInputSchema,
+        validation: "zod",
         hidden: true,
-      },
-    ];
+        run: (input) => this.runCallable("onboarding.all", input),
+      }),
+    }),
+  });
+
+  async init(): Promise<void> {
+    await this.tool.init();
   }
 
-  async call(callableId: string, rawInput: Record<string, unknown>) {
+  async destroy(): Promise<void> {
+    await this.tool.destroy();
+  }
+
+  async list() {
+    return this.tool.list();
+  }
+
+  async call(callableId: string, rawInput: Record<string, unknown>, opts?: ServerToolCallOptions) {
+    return this.tool.call(callableId, rawInput, opts);
+  }
+
+  private async runCallable(callableId: string, rawInput: Record<string, unknown>) {
     if (callableId === "onboarding.vcs_env") {
       const input = parseToolInput({ callableId, input: rawInput, schema: vcsEnvInputSchema });
       const dataDir = input.dataDir ?? env.dataDir;
@@ -1680,24 +1681,24 @@ export class Onboarding implements ServerTool {
       const input = parseToolInput({ callableId, input: rawInput, schema: allInputSchema });
       const dataDir = input.dataDir ?? env.dataDir;
 
-      const bootstrap = (await this.call("onboarding.bootstrap", {
+      const bootstrap = (await this.runCallable("onboarding.bootstrap", {
         dataDir,
         overwriteConfig: input.overwriteConfig,
         overwritePrompts: input.overwritePrompts,
       })) as unknown;
 
-      const playwright = (await this.call("onboarding.playwright", {
+      const playwright = (await this.runCallable("onboarding.playwright", {
         withDeps: input.playwrightWithDeps,
       })) as unknown;
 
-      const defaults = (await this.call("onboarding.defaults", {
+      const defaults = (await this.runCallable("onboarding.defaults", {
         dataDir,
         overwriteSkills: input.overwriteSkills,
         network: true,
         strict: false,
       })) as unknown;
 
-      const reloadConfig = (await this.call("onboarding.reload_config", {
+      const reloadConfig = (await this.runCallable("onboarding.reload_config", {
         mode: "cache",
       })) as unknown;
 

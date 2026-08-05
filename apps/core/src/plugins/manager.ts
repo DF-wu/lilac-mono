@@ -537,12 +537,18 @@ export function createCoreToolPluginManager(params: {
       contributionInfo,
       genericOutputNormalizerBypassTools: new Set(
         [...specs.entries()]
-          .filter(([, spec]) => hasBoundedBuiltinOutput(spec))
+          .filter(
+            ([, spec]) =>
+              contributionForSpec(spec).source === "builtin" && hasBoundedBuiltinOutput(spec),
+          )
           .map(([modelName]) => modelName),
       ),
       aggregateOutputBudgetExemptTools: new Set(
         [...specs.entries()]
-          .filter(([, spec]) => isAggregateOutputBudgetExempt(spec))
+          .filter(
+            ([, spec]) =>
+              contributionForSpec(spec).source === "builtin" && isAggregateOutputBudgetExempt(spec),
+          )
           .map(([modelName]) => modelName),
       ),
     });

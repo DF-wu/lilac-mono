@@ -1,10 +1,11 @@
 import { z } from "zod";
 import path from "node:path";
 import { Result, TaggedError, type Result as ResultType } from "better-result";
-
-import type { ServerTool } from "../types";
-import { parseToolInputPreservingZodError as parseToolInput } from "../validation-error-message";
-import { zodObjectToCliLines } from "./zod-cli";
+import {
+  defineServerTool,
+  type ServerTool,
+  type ServerToolCallOptions,
+} from "@stanley2058/lilac-plugin-runtime";
 
 export { parseSshHostsFromConfigText } from "../../ssh/ssh-config";
 import { readConfiguredSshHosts, requireConfiguredSshHost } from "../../ssh/ssh-config";
@@ -43,19 +44,6 @@ export type SshProbeOutput = z.output<typeof sshProbeOutputSchema>;
 export class SshProbeOutputInvalid extends TaggedError("SshProbeOutputInvalid")<{
   readonly message: string;
 }> {}
-
-class SshToolFailure extends TaggedError("SshToolFailure")<{
-  readonly message: string;
-}> {}
-
-function adaptSshResultToToolHost<TValue>(result: ResultType<TValue, SshToolFailure>): TValue {
-  if (result.status === "ok") return result.value;
-  throw new Error(result.error.message);
-}
-
-function signalSshFailureToToolHost(message: string): never {
-  return adaptSshResultToToolHost(Result.err(new SshToolFailure({ message })));
-}
 
 export function decodeSshProbeOutput(
   text: string,
@@ -212,288 +200,293 @@ async function buildProbeScript(input: ProbeInput): Promise<string> {
 
 export class SSH implements ServerTool {
   id = "ssh";
+  private readonly tool: ServerTool;
 
-  async init(): Promise<void> {}
-  async destroy(): Promise<void> {}
+  constructor() {
+    const catalog = async () => {
+      const { hosts, readError } = await readConfiguredSshHosts();
+      return { hidden: hosts.length === 0 && readError === undefined };
+    };
+
+    this.tool = defineServerTool({
+      id: this.id,
+      callables: ({ callable }) => ({
+        "ssh.hosts": callable({
+          name: "SSH Hosts",
+          description: "List SSH host aliases discovered from ~/.ssh/config on this server.",
+          inputSchema: emptyInputSchema,
+          validation: "zod",
+          catalog,
+          run: async () => {
+            const { configPath, hosts, exists, readError } = await readConfiguredSshHosts();
+            return {
+              configPath,
+              exists,
+              hosts,
+              readError,
+            };
+          },
+        }),
+        "ssh.run": callable({
+          name: "SSH Run",
+          description:
+            "Run a command on a remote host over SSH (StrictHostKeyChecking=yes, BatchMode=yes, bash --noprofile --norc).",
+          inputSchema: runInputSchema,
+          validation: "zod",
+          catalog,
+          run: (input, opts) => this.callRun(input, opts?.signal),
+        }),
+        "ssh.probe": callable({
+          name: "SSH Probe",
+          description:
+            "Probe remote host capabilities (expected tools + basic system and git context).",
+          inputSchema: probeInputSchema,
+          validation: "zod",
+          primaryPositional: "host",
+          catalog,
+          run: (input, opts) => this.callProbe(input, opts?.signal),
+        }),
+      }),
+    });
+  }
+
+  async init(): Promise<void> {
+    await this.tool.init();
+  }
+
+  async destroy(): Promise<void> {
+    await this.tool.destroy();
+  }
 
   async list() {
-    const { hosts, readError } = await readConfiguredSshHosts();
-    const hidden = hosts.length === 0 && readError === undefined;
-
-    return [
-      {
-        callableId: "ssh.hosts",
-        name: "SSH Hosts",
-        description: "List SSH host aliases discovered from ~/.ssh/config on this server.",
-        shortInput: zodObjectToCliLines(emptyInputSchema, { mode: "required" }),
-        input: zodObjectToCliLines(emptyInputSchema),
-        hidden,
-      },
-      {
-        callableId: "ssh.run",
-        name: "SSH Run",
-        description:
-          "Run a command on a remote host over SSH (StrictHostKeyChecking=yes, BatchMode=yes, bash --noprofile --norc).",
-        shortInput: zodObjectToCliLines(runInputSchema, { mode: "required" }),
-        input: zodObjectToCliLines(runInputSchema),
-        hidden,
-      },
-      {
-        callableId: "ssh.probe",
-        name: "SSH Probe",
-        description:
-          "Probe remote host capabilities (expected tools + basic system and git context).",
-        shortInput: zodObjectToCliLines(probeInputSchema, { mode: "required" }),
-        input: zodObjectToCliLines(probeInputSchema),
-        primaryPositional: {
-          field: "host",
-        },
-        hidden,
-      },
-    ];
+    return await this.tool.list();
   }
 
   async call(
     callableId: string,
-    rawInput: Record<string, unknown>,
-    opts?: { signal?: AbortSignal },
+    input: Record<string, unknown>,
+    opts?: ServerToolCallOptions,
   ): Promise<unknown> {
-    if (callableId === "ssh.hosts") {
-      const { configPath, hosts, exists, readError } = await readConfiguredSshHosts();
+    return await this.tool.call(callableId, input, opts);
+  }
+
+  private async callRun(input: RunInput, signal: AbortSignal | undefined): Promise<unknown> {
+    await requireConfiguredSshHost(input.host);
+
+    const effectiveTimeoutMs = input.timeoutMs ?? DEFAULT_SSH_TIMEOUT_MS;
+    const controller = new AbortController();
+    let timedOut = false;
+
+    const onAbort = () => controller.abort();
+    if (signal) {
+      if (signal.aborted) controller.abort();
+      else signal.addEventListener("abort", onAbort, { once: true });
+    }
+
+    const timeout = setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+    }, effectiveTimeoutMs);
+
+    const startedAt = Date.now();
+    try {
+      const sshArgs = [
+        "-T",
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "StrictHostKeyChecking=yes",
+        "-o",
+        "ClearAllForwardings=yes",
+        "-o",
+        "ForwardAgent=no",
+        "-o",
+        `ConnectTimeout=${DEFAULT_CONNECT_TIMEOUT_SECS}`,
+        "-o",
+        "LogLevel=ERROR",
+        input.host,
+        "bash",
+        "--noprofile",
+        "--norc",
+        "-s",
+      ];
+
+      const script = buildRemoteScript(input);
+
+      // Important: provide stdin as a finite blob so the remote `bash -s`
+      // reliably receives EOF and exits. In some environments, streaming
+      // stdin can leave the channel open and hang after producing output.
+      const child = Bun.spawn(["ssh", ...sshArgs], {
+        stdout: "pipe",
+        stderr: "pipe",
+        stdin: new Blob([script]),
+        signal: controller.signal,
+        killSignal: "SIGTERM",
+        env: {
+          ...process.env,
+          // Ensure we don't implicitly change caller state.
+          // Users should configure their SSH environment explicitly.
+        },
+      });
+
+      const [stdoutResult, stderrResult, exitResult] = await Promise.allSettled([
+        readStreamText(child.stdout),
+        readStreamText(child.stderr),
+        child.exited,
+      ]);
+
+      const stdout = stdoutResult.status === "fulfilled" ? stdoutResult.value : "";
+      const stderr = stderrResult.status === "fulfilled" ? stderrResult.value : "";
+      const exitCode = exitResult.status === "fulfilled" ? exitResult.value : -1;
+
+      const durationMs = Date.now() - startedAt;
+
+      const outTrunc = truncateText(stdout, MAX_OUTPUT_CHARS);
+      const errTrunc = truncateText(stderr, MAX_OUTPUT_CHARS);
+
+      const transportError = exitCode === 255 ? inferTransportError(stderr) : undefined;
+
       return {
-        configPath,
-        exists,
-        hosts,
-        readError,
+        ok: exitCode === 0 && !timedOut,
+        exitCode,
+        durationMs,
+        timedOut,
+        target: {
+          host: input.host,
+          cwd: input.cwd,
+          strictHostKeyChecking: true,
+          batchMode: true,
+        },
+        stdout: outTrunc.text,
+        stderr: errTrunc.text,
+        truncated: {
+          stdout: outTrunc.truncated,
+          stderr: errTrunc.truncated,
+        },
+        transportError,
+        errors: {
+          stdoutRead: stdoutResult.status === "rejected" ? "stdout read failed" : undefined,
+          stderrRead: stderrResult.status === "rejected" ? "stderr read failed" : undefined,
+          exitRead: exitResult.status === "rejected" ? "exit status read failed" : undefined,
+          stdinWrite: undefined,
+        },
       };
+    } finally {
+      clearTimeout(timeout);
+      if (signal) signal.removeEventListener("abort", onAbort);
+    }
+  }
+
+  private async callProbe(input: ProbeInput, signal: AbortSignal | undefined): Promise<unknown> {
+    await requireConfiguredSshHost(input.host);
+
+    const effectiveTimeoutMs = input.timeoutMs ?? DEFAULT_SSH_TIMEOUT_MS;
+    const controller = new AbortController();
+    let timedOut = false;
+
+    const onAbort = () => controller.abort();
+    if (signal) {
+      if (signal.aborted) controller.abort();
+      else signal.addEventListener("abort", onAbort, { once: true });
     }
 
-    if (callableId === "ssh.run") {
-      const input = parseToolInput({ callableId, input: rawInput, schema: runInputSchema });
+    const timeout = setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+    }, effectiveTimeoutMs);
 
-      await requireConfiguredSshHost(input.host);
+    const startedAt = Date.now();
+    try {
+      const sshArgs = [
+        "-T",
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "StrictHostKeyChecking=yes",
+        "-o",
+        "ClearAllForwardings=yes",
+        "-o",
+        "ForwardAgent=no",
+        "-o",
+        `ConnectTimeout=${DEFAULT_CONNECT_TIMEOUT_SECS}`,
+        "-o",
+        "LogLevel=ERROR",
+        input.host,
+        "bash",
+        "--noprofile",
+        "--norc",
+        "-s",
+      ];
 
-      const effectiveTimeoutMs = input.timeoutMs ?? DEFAULT_SSH_TIMEOUT_MS;
-      const controller = new AbortController();
-      let timedOut = false;
+      const script = await buildProbeScript(input);
 
-      const onAbort = () => controller.abort();
-      if (opts?.signal) {
-        if (opts.signal.aborted) controller.abort();
-        else opts.signal.addEventListener("abort", onAbort, { once: true });
+      const child = Bun.spawn(["ssh", ...sshArgs], {
+        stdout: "pipe",
+        stderr: "pipe",
+        stdin: new Blob([script]),
+        signal: controller.signal,
+        killSignal: "SIGTERM",
+        env: {
+          ...process.env,
+        },
+      });
+
+      const [stdoutResult, stderrResult, exitResult] = await Promise.allSettled([
+        readStreamText(child.stdout),
+        readStreamText(child.stderr),
+        child.exited,
+      ]);
+
+      const stdout = stdoutResult.status === "fulfilled" ? stdoutResult.value : "";
+      const stderr = stderrResult.status === "fulfilled" ? stderrResult.value : "";
+      const exitCode = exitResult.status === "fulfilled" ? exitResult.value : -1;
+
+      const durationMs = Date.now() - startedAt;
+
+      const outTrunc = truncateText(stdout, MAX_OUTPUT_CHARS);
+      const errTrunc = truncateText(stderr, MAX_OUTPUT_CHARS);
+
+      const transportError = exitCode === 255 ? inferTransportError(stderr) : undefined;
+
+      let probe: SshProbeOutput | undefined;
+      let parseError: string | undefined;
+
+      if (exitCode === 0 && !timedOut) {
+        const decodedProbe = decodeSshProbeOutput(stdout.trim());
+        if (decodedProbe.status === "ok") probe = decodedProbe.value;
+        else parseError = decodedProbe.error.message;
       }
 
-      const timeout = setTimeout(() => {
-        timedOut = true;
-        controller.abort();
-      }, effectiveTimeoutMs);
-
-      const startedAt = Date.now();
-      try {
-        const sshArgs = [
-          "-T",
-          "-o",
-          "BatchMode=yes",
-          "-o",
-          "StrictHostKeyChecking=yes",
-          "-o",
-          "ClearAllForwardings=yes",
-          "-o",
-          "ForwardAgent=no",
-          "-o",
-          `ConnectTimeout=${DEFAULT_CONNECT_TIMEOUT_SECS}`,
-          "-o",
-          "LogLevel=ERROR",
-          input.host,
-          "bash",
-          "--noprofile",
-          "--norc",
-          "-s",
-        ];
-
-        const script = buildRemoteScript(input);
-
-        // Important: provide stdin as a finite blob so the remote `bash -s`
-        // reliably receives EOF and exits. In some environments, streaming
-        // stdin can leave the channel open and hang after producing output.
-        const child = Bun.spawn(["ssh", ...sshArgs], {
-          stdout: "pipe",
-          stderr: "pipe",
-          stdin: new Blob([script]),
-          signal: controller.signal,
-          killSignal: "SIGTERM",
-          env: {
-            ...process.env,
-            // Ensure we don't implicitly change caller state.
-            // Users should configure their SSH environment explicitly.
-          },
-        });
-
-        const [stdoutResult, stderrResult, exitResult] = await Promise.allSettled([
-          readStreamText(child.stdout),
-          readStreamText(child.stderr),
-          child.exited,
-        ]);
-
-        const stdout = stdoutResult.status === "fulfilled" ? stdoutResult.value : "";
-        const stderr = stderrResult.status === "fulfilled" ? stderrResult.value : "";
-        const exitCode = exitResult.status === "fulfilled" ? exitResult.value : -1;
-
-        const durationMs = Date.now() - startedAt;
-
-        const outTrunc = truncateText(stdout, MAX_OUTPUT_CHARS);
-        const errTrunc = truncateText(stderr, MAX_OUTPUT_CHARS);
-
-        const transportError = exitCode === 255 ? inferTransportError(stderr) : undefined;
-
-        return {
-          ok: exitCode === 0 && !timedOut,
-          exitCode,
-          durationMs,
-          timedOut,
-          target: {
-            host: input.host,
-            cwd: input.cwd,
-            strictHostKeyChecking: true,
-            batchMode: true,
-          },
-          stdout: outTrunc.text,
-          stderr: errTrunc.text,
-          truncated: {
-            stdout: outTrunc.truncated,
-            stderr: errTrunc.truncated,
-          },
-          transportError,
-          errors: {
-            stdoutRead: stdoutResult.status === "rejected" ? "stdout read failed" : undefined,
-            stderrRead: stderrResult.status === "rejected" ? "stderr read failed" : undefined,
-            exitRead: exitResult.status === "rejected" ? "exit status read failed" : undefined,
-            stdinWrite: undefined,
-          },
-        };
-      } finally {
-        clearTimeout(timeout);
-        if (opts?.signal) opts.signal.removeEventListener("abort", onAbort);
-      }
+      return {
+        ok: exitCode === 0 && !timedOut,
+        exitCode,
+        durationMs,
+        timedOut,
+        target: {
+          host: input.host,
+          cwd: input.cwd,
+          strictHostKeyChecking: true,
+          batchMode: true,
+        },
+        probe,
+        parseError,
+        stdout: probe ? undefined : outTrunc.text,
+        stderr: errTrunc.text,
+        truncated: {
+          stdout: outTrunc.truncated,
+          stderr: errTrunc.truncated,
+        },
+        transportError,
+        errors: {
+          stdoutRead: stdoutResult.status === "rejected" ? String(stdoutResult.reason) : undefined,
+          stderrRead: stderrResult.status === "rejected" ? String(stderrResult.reason) : undefined,
+          exitRead: exitResult.status === "rejected" ? String(exitResult.reason) : undefined,
+          stdinWrite: undefined,
+        },
+      };
+    } finally {
+      clearTimeout(timeout);
+      if (signal) signal.removeEventListener("abort", onAbort);
     }
-
-    if (callableId === "ssh.probe") {
-      const input = parseToolInput({ callableId, input: rawInput, schema: probeInputSchema });
-
-      await requireConfiguredSshHost(input.host);
-
-      const effectiveTimeoutMs = input.timeoutMs ?? DEFAULT_SSH_TIMEOUT_MS;
-      const controller = new AbortController();
-      let timedOut = false;
-
-      const onAbort = () => controller.abort();
-      if (opts?.signal) {
-        if (opts.signal.aborted) controller.abort();
-        else opts.signal.addEventListener("abort", onAbort, { once: true });
-      }
-
-      const timeout = setTimeout(() => {
-        timedOut = true;
-        controller.abort();
-      }, effectiveTimeoutMs);
-
-      const startedAt = Date.now();
-      try {
-        const sshArgs = [
-          "-T",
-          "-o",
-          "BatchMode=yes",
-          "-o",
-          "StrictHostKeyChecking=yes",
-          "-o",
-          "ClearAllForwardings=yes",
-          "-o",
-          "ForwardAgent=no",
-          "-o",
-          `ConnectTimeout=${DEFAULT_CONNECT_TIMEOUT_SECS}`,
-          "-o",
-          "LogLevel=ERROR",
-          input.host,
-          "bash",
-          "--noprofile",
-          "--norc",
-          "-s",
-        ];
-
-        const script = await buildProbeScript(input);
-
-        const child = Bun.spawn(["ssh", ...sshArgs], {
-          stdout: "pipe",
-          stderr: "pipe",
-          stdin: new Blob([script]),
-          signal: controller.signal,
-          killSignal: "SIGTERM",
-          env: {
-            ...process.env,
-          },
-        });
-
-        const [stdoutResult, stderrResult, exitResult] = await Promise.allSettled([
-          readStreamText(child.stdout),
-          readStreamText(child.stderr),
-          child.exited,
-        ]);
-
-        const stdout = stdoutResult.status === "fulfilled" ? stdoutResult.value : "";
-        const stderr = stderrResult.status === "fulfilled" ? stderrResult.value : "";
-        const exitCode = exitResult.status === "fulfilled" ? exitResult.value : -1;
-
-        const durationMs = Date.now() - startedAt;
-
-        const outTrunc = truncateText(stdout, MAX_OUTPUT_CHARS);
-        const errTrunc = truncateText(stderr, MAX_OUTPUT_CHARS);
-
-        const transportError = exitCode === 255 ? inferTransportError(stderr) : undefined;
-
-        let probe: SshProbeOutput | undefined;
-        let parseError: string | undefined;
-
-        if (exitCode === 0 && !timedOut) {
-          const decodedProbe = decodeSshProbeOutput(stdout.trim());
-          if (decodedProbe.status === "ok") probe = decodedProbe.value;
-          else parseError = decodedProbe.error.message;
-        }
-
-        return {
-          ok: exitCode === 0 && !timedOut,
-          exitCode,
-          durationMs,
-          timedOut,
-          target: {
-            host: input.host,
-            cwd: input.cwd,
-            strictHostKeyChecking: true,
-            batchMode: true,
-          },
-          probe,
-          parseError,
-          stdout: probe ? undefined : outTrunc.text,
-          stderr: errTrunc.text,
-          truncated: {
-            stdout: outTrunc.truncated,
-            stderr: errTrunc.truncated,
-          },
-          transportError,
-          errors: {
-            stdoutRead:
-              stdoutResult.status === "rejected" ? String(stdoutResult.reason) : undefined,
-            stderrRead:
-              stderrResult.status === "rejected" ? String(stderrResult.reason) : undefined,
-            exitRead: exitResult.status === "rejected" ? String(exitResult.reason) : undefined,
-            stdinWrite: undefined,
-          },
-        };
-      } finally {
-        clearTimeout(timeout);
-        if (opts?.signal) opts.signal.removeEventListener("abort", onAbort);
-      }
-    }
-
-    return signalSshFailureToToolHost(`Invalid callable ID '${callableId}'`);
   }
 }

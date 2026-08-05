@@ -3,6 +3,11 @@ import fs from "node:fs/promises";
 import { basename } from "node:path";
 import { fileTypeFromBuffer } from "file-type";
 import { getDiscordUserAliasValue, type CoreConfig } from "@stanley2058/lilac-utils";
+import {
+  defineServerTool,
+  type ServerTool,
+  type ServerToolCallOptions,
+} from "@stanley2058/lilac-plugin-runtime";
 import { Result, TaggedError, type Result as ResultType } from "better-result";
 
 import { isAdapterPlatform } from "../../shared/is-adapter-platform";
@@ -18,8 +23,7 @@ import type {
   SurfaceSession,
 } from "../../surface/types";
 import type { DiscordSearchService } from "../../surface/store/discord-search-store";
-import type { RequestContext, ServerTool } from "../types";
-import { parseToolInputPreservingZodError as parseToolInput } from "../validation-error-message";
+import type { RequestContext } from "../types";
 import type { RecentAgentWriteSnapshot, TranscriptStore } from "../../transcript/transcript-store";
 import { isHeartbeatSessionId } from "../../transcript/heartbeat-handoff";
 
@@ -27,7 +31,6 @@ import {
   bestEffortAliasForDiscordChannelId,
   resolveDiscordSessionId,
 } from "./resolve-discord-session-id";
-import { zodObjectToCliLines } from "./zod-cli";
 import {
   formatToolPathForRequestContext,
   inferMimeTypeFromFilename,
@@ -498,15 +501,11 @@ const sessionsListLimitSchema = z
   })
   .describe("Max sessions to return (default: all).");
 
-function withDefaultSessionId(
-  rawInput: Record<string, unknown>,
+function withDefaultSessionId<TInput extends { readonly sessionId?: string }>(
+  input: TInput,
   ctx: RequestContext | undefined,
-): Record<string, unknown> {
-  const hasOwn = Object.prototype.hasOwnProperty.call(rawInput, "sessionId");
-  const value = rawInput["sessionId"];
-
-  // If explicitly provided (even null/empty), defer to schema validation.
-  if (hasOwn && value !== undefined) return rawInput;
+): TInput {
+  if (input.sessionId !== undefined) return input;
 
   const ctxSessionId =
     typeof ctx?.sessionId === "string" && ctx.sessionId.length > 0
@@ -515,7 +514,7 @@ function withDefaultSessionId(
         inferGithubOriginFromRequestId(ctx?.requestId)?.sessionId);
 
   if (ctxSessionId) {
-    return { ...rawInput, sessionId: ctxSessionId };
+    return { ...input, sessionId: ctxSessionId };
   }
 
   signalSurfaceFailureToToolHost(
@@ -523,21 +522,17 @@ function withDefaultSessionId(
   );
 }
 
-function withDefaultMessageId(
-  rawInput: Record<string, unknown>,
+function withDefaultMessageId<TInput extends { readonly messageId?: string }>(
+  input: TInput,
   ctx: RequestContext | undefined,
-): Record<string, unknown> {
-  const hasOwn = Object.prototype.hasOwnProperty.call(rawInput, "messageId");
-  const value = rawInput["messageId"];
-
-  // If explicitly provided (even null/empty), defer to schema validation.
-  if (hasOwn && value !== undefined) return rawInput;
+): TInput {
+  if (input.messageId !== undefined) return input;
 
   const inferred = inferDiscordOriginFromRequestId(ctx?.requestId);
-  if (inferred?.messageId) return { ...rawInput, messageId: inferred.messageId };
+  if (inferred?.messageId) return { ...input, messageId: inferred.messageId };
 
   const inferredGh = inferGithubOriginFromRequestId(ctx?.requestId);
-  if (inferredGh?.messageId) return { ...rawInput, messageId: inferredGh.messageId };
+  if (inferredGh?.messageId) return { ...input, messageId: inferredGh.messageId };
 
   const rid = typeof ctx?.requestId === "string" ? ctx.requestId : undefined;
   const hint = rid ? ` (requestId='${rid}')` : " (no requestId in context)";
@@ -1352,26 +1347,9 @@ export type GithubSurfaceApi = Omit<
   getPreferredGithubActorLoginOrNull?: typeof getPreferredGithubActorLoginOrNull;
 };
 
-type SurfaceCallOptions = {
-  signal?: AbortSignal;
-  context?: RequestContext;
-  messages?: readonly unknown[];
-};
-
-type SurfaceCallableEntry = {
-  callableId: string;
-  name: string;
-  description: string;
-  inputSchema: z.ZodTypeAny;
-  primaryPositional?: {
-    field: string;
-  };
-  hidden?: boolean;
-  handler: (input: Record<string, unknown>, opts: SurfaceCallOptions) => Promise<unknown>;
-};
-
 export class Surface implements ServerTool {
   id = "surface";
+  private readonly tool: ServerTool;
 
   constructor(
     private readonly params: {
@@ -1382,156 +1360,140 @@ export class Surface implements ServerTool {
       discordSearch?: DiscordSearchService;
       transcriptStore?: TranscriptStore;
     },
-  ) {}
-
-  async init(): Promise<void> {}
-  async destroy(): Promise<void> {}
-
-  async list() {
-    return this.surfaceCallableEntries().map((entry) => ({
-      callableId: entry.callableId,
-      name: entry.name,
-      description: entry.description,
-      shortInput: zodObjectToCliLines(entry.inputSchema, {
-        mode: "required",
+  ) {
+    this.tool = defineServerTool({
+      id: this.id,
+      callables: ({ callable }) => ({
+        "surface.help": callable({
+          name: "Surface Help",
+          description:
+            "Explain surface terminology (client/platform/sessionId/messageId) and common sessionId formats.",
+          inputSchema: helpInputSchema,
+          validation: "zod",
+          run: (input, opts) => this.callHelp(input, opts?.context),
+        }),
+        "surface.activities.recentAgentWrites": callable({
+          name: "Surface Activities Recent Agent Writes",
+          description:
+            "List recent visible writes produced by the agent, with session ids, message ids, and thin previews.",
+          inputSchema: activitiesRecentAgentWritesInputSchema,
+          validation: "zod",
+          run: (input) => this.callActivitiesRecentAgentWrites(input),
+        }),
+        "surface.sessions.list": callable({
+          name: "Surface Sessions List",
+          description: "List cached sessions. Provide --client if request client is unknown.",
+          inputSchema: sessionsListInputSchema,
+          validation: "zod",
+          run: (input, opts) => this.callSessionsList(input, opts?.context),
+        }),
+        "surface.sessions.listParticipants": callable({
+          name: "Surface Sessions List Participants",
+          description:
+            "List current Discord session participants (thread members when available; otherwise guild members).",
+          inputSchema: sessionsListParticipantsInputSchema,
+          validation: "zod",
+          run: (input, opts) => this.callSessionsListParticipants(input, opts?.context),
+        }),
+        "surface.messages.list": callable({
+          name: "Surface Messages List",
+          description: "List messages for a session.",
+          inputSchema: messagesListInputSchema,
+          validation: "zod",
+          run: (input, opts) => this.callMessagesList(input, opts?.context),
+        }),
+        "surface.messages.read": callable({
+          name: "Surface Messages Read",
+          description: "Read a message by id.",
+          inputSchema: messagesReadInputSchema,
+          validation: "zod",
+          run: (input, opts) => this.callMessagesRead(input, opts?.context),
+        }),
+        "surface.messages.search": callable({
+          name: "Surface Messages Search",
+          description:
+            "Deprecated: search indexed messages in a single Discord session. Prefer discovery.search for memory retrieval.",
+          inputSchema: messagesSearchInputSchema,
+          validation: "zod",
+          primaryPositional: "query",
+          hidden: true,
+          run: (input, opts) => this.callMessagesSearch(input, opts?.context),
+        }),
+        "surface.messages.send": callable({
+          name: "Surface Messages Send",
+          description: "Send a message to a session.",
+          inputSchema: messagesSendInputSchema,
+          validation: "zod",
+          primaryPositional: "text",
+          run: (input, opts) => this.callMessagesSend(input, opts?.context),
+        }),
+        "surface.messages.edit": callable({
+          name: "Surface Messages Edit",
+          description: "Edit a message.",
+          inputSchema: messagesEditInputSchema,
+          validation: "zod",
+          run: (input, opts) => this.callMessagesEdit(input, opts?.context),
+        }),
+        "surface.messages.delete": callable({
+          name: "Surface Messages Delete",
+          description: "Delete a message.",
+          inputSchema: messagesDeleteInputSchema,
+          validation: "zod",
+          run: (input, opts) => this.callMessagesDelete(input, opts?.context),
+        }),
+        "surface.reactions.list": callable({
+          name: "Surface Reactions List",
+          description: "List reactions for a message (emoji + count).",
+          inputSchema: reactionsListInputSchema,
+          validation: "zod",
+          run: (input, opts) => this.callReactionsList(input, opts?.context),
+        }),
+        "surface.reactions.listDetailed": callable({
+          name: "Surface Reactions List Detailed",
+          description: "List reactions for a message with per-user details.",
+          inputSchema: reactionsListDetailedInputSchema,
+          validation: "zod",
+          run: (input, opts) => this.callReactionsListDetailed(input, opts?.context),
+        }),
+        "surface.reactions.add": callable({
+          name: "Surface Reactions Add",
+          description: "Add a reaction to a message.",
+          inputSchema: reactionsAddInputSchema,
+          validation: "zod",
+          run: (input, opts) => this.callReactionsAdd(input, opts?.context),
+        }),
+        "surface.reactions.remove": callable({
+          name: "Surface Reactions Remove",
+          description: "Remove a reaction from a message.",
+          inputSchema: reactionsRemoveInputSchema,
+          validation: "zod",
+          run: (input, opts) => this.callReactionsRemove(input, opts?.context),
+        }),
       }),
-      input: zodObjectToCliLines(entry.inputSchema),
-      ...(entry.primaryPositional ? { primaryPositional: entry.primaryPositional } : {}),
-      ...(entry.hidden !== undefined ? { hidden: entry.hidden } : {}),
-    }));
+    });
   }
 
-  private surfaceCallableEntries(): SurfaceCallableEntry[] {
-    return [
-      {
-        callableId: "surface.help",
-        name: "Surface Help",
-        description:
-          "Explain surface terminology (client/platform/sessionId/messageId) and common sessionId formats.",
-        inputSchema: helpInputSchema,
-        handler: (input, opts) => this.callHelp(input, opts.context),
-      },
-      {
-        callableId: "surface.activities.recentAgentWrites",
-        name: "Surface Activities Recent Agent Writes",
-        description:
-          "List recent visible writes produced by the agent, with session ids, message ids, and thin previews.",
-        inputSchema: activitiesRecentAgentWritesInputSchema,
-        handler: (input) => this.callActivitiesRecentAgentWrites(input),
-      },
-      {
-        callableId: "surface.sessions.list",
-        name: "Surface Sessions List",
-        description: "List cached sessions. Provide --client if request client is unknown.",
-        inputSchema: sessionsListInputSchema,
-        handler: (input, opts) => this.callSessionsList(input, opts.context),
-      },
-      {
-        callableId: "surface.sessions.listParticipants",
-        name: "Surface Sessions List Participants",
-        description:
-          "List current Discord session participants (thread members when available; otherwise guild members).",
-        inputSchema: sessionsListParticipantsInputSchema,
-        handler: (input, opts) => this.callSessionsListParticipants(input, opts.context),
-      },
-      {
-        callableId: "surface.messages.list",
-        name: "Surface Messages List",
-        description: "List messages for a session.",
-        inputSchema: messagesListInputSchema,
-        handler: (input, opts) => this.callMessagesList(input, opts.context),
-      },
-      {
-        callableId: "surface.messages.read",
-        name: "Surface Messages Read",
-        description: "Read a message by id.",
-        inputSchema: messagesReadInputSchema,
-        handler: (input, opts) => this.callMessagesRead(input, opts.context),
-      },
-      {
-        callableId: "surface.messages.search",
-        name: "Surface Messages Search",
-        description:
-          "Deprecated: search indexed messages in a single Discord session. Prefer discovery.search for memory retrieval.",
-        inputSchema: messagesSearchInputSchema,
-        primaryPositional: {
-          field: "query",
-        },
-        hidden: true,
-        handler: (input, opts) => this.callMessagesSearch(input, opts.context),
-      },
-      {
-        callableId: "surface.messages.send",
-        name: "Surface Messages Send",
-        description: "Send a message to a session.",
-        inputSchema: messagesSendInputSchema,
-        primaryPositional: {
-          field: "text",
-        },
-        handler: (input, opts) => this.callMessagesSend(input, opts.context),
-      },
-      {
-        callableId: "surface.messages.edit",
-        name: "Surface Messages Edit",
-        description: "Edit a message.",
-        inputSchema: messagesEditInputSchema,
-        handler: (input, opts) => this.callMessagesEdit(input, opts.context),
-      },
-      {
-        callableId: "surface.messages.delete",
-        name: "Surface Messages Delete",
-        description: "Delete a message.",
-        inputSchema: messagesDeleteInputSchema,
-        handler: (input, opts) => this.callMessagesDelete(input, opts.context),
-      },
-      {
-        callableId: "surface.reactions.list",
-        name: "Surface Reactions List",
-        description: "List reactions for a message (emoji + count).",
-        inputSchema: reactionsListInputSchema,
-        handler: (input, opts) => this.callReactionsList(input, opts.context),
-      },
-      {
-        callableId: "surface.reactions.listDetailed",
-        name: "Surface Reactions List Detailed",
-        description: "List reactions for a message with per-user details.",
-        inputSchema: reactionsListDetailedInputSchema,
-        handler: (input, opts) => this.callReactionsListDetailed(input, opts.context),
-      },
-      {
-        callableId: "surface.reactions.add",
-        name: "Surface Reactions Add",
-        description: "Add a reaction to a message.",
-        inputSchema: reactionsAddInputSchema,
-        handler: (input, opts) => this.callReactionsAdd(input, opts.context),
-      },
-      {
-        callableId: "surface.reactions.remove",
-        name: "Surface Reactions Remove",
-        description: "Remove a reaction from a message.",
-        inputSchema: reactionsRemoveInputSchema,
-        handler: (input, opts) => this.callReactionsRemove(input, opts.context),
-      },
-    ];
+  async init(): Promise<void> {
+    await this.tool.init();
+  }
+
+  async destroy(): Promise<void> {
+    await this.tool.destroy();
+  }
+
+  async list() {
+    return await this.tool.list();
   }
 
   async call(
     callableId: string,
     input: Record<string, unknown>,
-    opts?: SurfaceCallOptions,
+    opts?: ServerToolCallOptions,
   ): Promise<unknown> {
-    const entry = this.surfaceCallableEntries().find((item) => item.callableId === callableId);
-    if (!entry) signalSurfaceFailureToToolHost(`Invalid callable ID '${callableId}'`);
-    return await entry.handler(input, opts ?? {});
+    return await this.tool.call(callableId, input, opts);
   }
 
-  private async callHelp(rawInput: Record<string, unknown>, ctx: RequestContext | undefined) {
-    const input = parseToolInput({
-      callableId: "surface.help",
-      input: rawInput,
-      schema: helpInputSchema,
-    });
-
+  private async callHelp(input: z.output<typeof helpInputSchema>, ctx: RequestContext | undefined) {
     const ctxClientRaw = ctx?.requestClient;
     const ctxClient = isAdapterPlatform(ctxClientRaw) ? ctxClientRaw : "unknown";
     const effectiveClient = input.client ?? (ctxClient !== "unknown" ? ctxClient : undefined);
@@ -1706,12 +1668,9 @@ export class Surface implements ServerTool {
     }
   }
 
-  private async callActivitiesRecentAgentWrites(rawInput: Record<string, unknown>) {
-    const input = parseToolInput({
-      callableId: "surface.activities.recentAgentWrites",
-      input: rawInput,
-      schema: activitiesRecentAgentWritesInputSchema,
-    });
+  private async callActivitiesRecentAgentWrites(
+    input: z.output<typeof activitiesRecentAgentWritesInputSchema>,
+  ) {
     const transcriptStore = this.params.transcriptStore;
 
     if (!transcriptStore?.listRecentAgentWrites) {
@@ -1833,14 +1792,9 @@ export class Surface implements ServerTool {
   }
 
   private async callSessionsList(
-    rawInput: Record<string, unknown>,
+    input: z.output<typeof sessionsListInputSchema>,
     ctx: RequestContext | undefined,
   ) {
-    const input = parseToolInput({
-      callableId: "surface.sessions.list",
-      input: rawInput,
-      schema: sessionsListInputSchema,
-    });
     const client = resolveClient({ inputClient: input.client, ctx });
     if (client === "github") {
       signalSurfaceFailureToToolHost(
@@ -1898,14 +1852,10 @@ export class Surface implements ServerTool {
   }
 
   private async callSessionsListParticipants(
-    rawInput: Record<string, unknown>,
+    decodedInput: z.output<typeof sessionsListParticipantsInputSchema>,
     ctx: RequestContext | undefined,
   ) {
-    const input = parseToolInput({
-      callableId: "surface.sessions.listParticipants",
-      input: withDefaultSessionId(rawInput, ctx),
-      schema: sessionsListParticipantsInputSchema,
-    });
+    const input = withDefaultSessionId(decodedInput, ctx);
     const client = resolveClient({ inputClient: input.client, ctx });
     if (client === "github") {
       signalSurfaceFailureToToolHost(
@@ -1958,14 +1908,10 @@ export class Surface implements ServerTool {
   }
 
   private async callMessagesList(
-    rawInput: Record<string, unknown>,
+    decodedInput: z.output<typeof messagesListInputSchema>,
     ctx: RequestContext | undefined,
   ) {
-    const input = parseToolInput({
-      callableId: "surface.messages.list",
-      input: withDefaultSessionId(rawInput, ctx),
-      schema: messagesListInputSchema,
-    });
+    const input = withDefaultSessionId(decodedInput, ctx);
     const client = resolveClient({ inputClient: input.client, ctx });
     const order: MessageListOrder = input.order ?? "ts_desc";
     const includeRaw = input.includeRaw ?? false;
@@ -2083,14 +2029,10 @@ export class Surface implements ServerTool {
   }
 
   private async callMessagesRead(
-    rawInput: Record<string, unknown>,
+    decodedInput: z.output<typeof messagesReadInputSchema>,
     ctx: RequestContext | undefined,
   ) {
-    const input = parseToolInput({
-      callableId: "surface.messages.read",
-      input: withDefaultMessageId(withDefaultSessionId(rawInput, ctx), ctx),
-      schema: messagesReadInputSchema,
-    });
+    const input = withDefaultMessageId(withDefaultSessionId(decodedInput, ctx), ctx);
     const client = resolveClient({ inputClient: input.client, ctx });
     const includeRaw = input.includeRaw ?? false;
 
@@ -2243,14 +2185,10 @@ export class Surface implements ServerTool {
   }
 
   private async callMessagesSearch(
-    rawInput: Record<string, unknown>,
+    decodedInput: z.output<typeof messagesSearchInputSchema>,
     ctx: RequestContext | undefined,
   ) {
-    const input = parseToolInput({
-      callableId: "surface.messages.search",
-      input: withDefaultSessionId(rawInput, ctx),
-      schema: messagesSearchInputSchema,
-    });
+    const input = withDefaultSessionId(decodedInput, ctx);
     const client = resolveClient({ inputClient: input.client, ctx });
 
     if (client === "github") {
@@ -2350,14 +2288,10 @@ export class Surface implements ServerTool {
   }
 
   private async callMessagesSend(
-    rawInput: Record<string, unknown>,
+    decodedInput: z.output<typeof messagesSendInputSchema>,
     ctx: RequestContext | undefined,
   ) {
-    const input = parseToolInput({
-      callableId: "surface.messages.send",
-      input: withDefaultSessionId(rawInput, ctx),
-      schema: messagesSendInputSchema,
-    });
+    const input = withDefaultSessionId(decodedInput, ctx);
     const client = resolveClient({ inputClient: input.client, ctx });
 
     if (client === "github") {
@@ -2461,14 +2395,10 @@ export class Surface implements ServerTool {
   }
 
   private async callMessagesEdit(
-    rawInput: Record<string, unknown>,
+    decodedInput: z.output<typeof messagesEditInputSchema>,
     ctx: RequestContext | undefined,
   ) {
-    const input = parseToolInput({
-      callableId: "surface.messages.edit",
-      input: withDefaultSessionId(rawInput, ctx),
-      schema: messagesEditInputSchema,
-    });
+    const input = withDefaultSessionId(decodedInput, ctx);
     const client = resolveClient({ inputClient: input.client, ctx });
 
     if (client === "github") {
@@ -2527,14 +2457,10 @@ export class Surface implements ServerTool {
   }
 
   private async callMessagesDelete(
-    rawInput: Record<string, unknown>,
+    decodedInput: z.output<typeof messagesDeleteInputSchema>,
     ctx: RequestContext | undefined,
   ) {
-    const input = parseToolInput({
-      callableId: "surface.messages.delete",
-      input: withDefaultSessionId(rawInput, ctx),
-      schema: messagesDeleteInputSchema,
-    });
+    const input = withDefaultSessionId(decodedInput, ctx);
     const client = resolveClient({ inputClient: input.client, ctx });
 
     if (client === "github") {
@@ -2589,14 +2515,10 @@ export class Surface implements ServerTool {
   }
 
   private async callReactionsList(
-    rawInput: Record<string, unknown>,
+    decodedInput: z.output<typeof reactionsListInputSchema>,
     ctx: RequestContext | undefined,
   ) {
-    const input = parseToolInput({
-      callableId: "surface.reactions.list",
-      input: withDefaultMessageId(withDefaultSessionId(rawInput, ctx), ctx),
-      schema: reactionsListInputSchema,
-    });
+    const input = withDefaultMessageId(withDefaultSessionId(decodedInput, ctx), ctx);
     const client = resolveClient({ inputClient: input.client, ctx });
 
     if (client === "github") {
@@ -2671,14 +2593,10 @@ export class Surface implements ServerTool {
   }
 
   private async callReactionsListDetailed(
-    rawInput: Record<string, unknown>,
+    decodedInput: z.output<typeof reactionsListDetailedInputSchema>,
     ctx: RequestContext | undefined,
   ) {
-    const input = parseToolInput({
-      callableId: "surface.reactions.listDetailed",
-      input: withDefaultMessageId(withDefaultSessionId(rawInput, ctx), ctx),
-      schema: reactionsListDetailedInputSchema,
-    });
+    const input = withDefaultMessageId(withDefaultSessionId(decodedInput, ctx), ctx);
     const client = resolveClient({ inputClient: input.client, ctx });
 
     if (client === "github") {
@@ -2766,14 +2684,10 @@ export class Surface implements ServerTool {
   }
 
   private async callReactionsAdd(
-    rawInput: Record<string, unknown>,
+    decodedInput: z.output<typeof reactionsAddInputSchema>,
     ctx: RequestContext | undefined,
   ) {
-    const input = parseToolInput({
-      callableId: "surface.reactions.add",
-      input: withDefaultMessageId(withDefaultSessionId(rawInput, ctx), ctx),
-      schema: reactionsAddInputSchema,
-    });
+    const input = withDefaultMessageId(withDefaultSessionId(decodedInput, ctx), ctx);
     const client = resolveClient({ inputClient: input.client, ctx });
 
     if (client === "github") {
@@ -2837,14 +2751,10 @@ export class Surface implements ServerTool {
   }
 
   private async callReactionsRemove(
-    rawInput: Record<string, unknown>,
+    decodedInput: z.output<typeof reactionsRemoveInputSchema>,
     ctx: RequestContext | undefined,
   ) {
-    const input = parseToolInput({
-      callableId: "surface.reactions.remove",
-      input: withDefaultMessageId(withDefaultSessionId(rawInput, ctx), ctx),
-      schema: reactionsRemoveInputSchema,
-    });
+    const input = withDefaultMessageId(withDefaultSessionId(decodedInput, ctx), ctx);
     const client = resolveClient({ inputClient: input.client, ctx });
 
     if (client === "github") {

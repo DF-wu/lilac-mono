@@ -6,10 +6,17 @@ import {
   formatToolLogPreview,
   summarizeToolFailure,
 } from "../../../src/surface/bridge/bus-agent-runner/tool-failure-logging";
+import { createLocalToolSpecs } from "../../../src/plugins/builtin/local-tools";
+
+const BUILTIN_TOOL_SPECS = new Map(createLocalToolSpecs().map((spec) => [spec.name, spec]));
+
+function summarizeBuiltinFailure(params: { toolName: string; isError: boolean; result: unknown }) {
+  return summarizeToolFailure({ ...params, toolSpecs: BUILTIN_TOOL_SPECS });
+}
 
 describe("summarizeToolFailure", () => {
   it("marks bash non-zero exit as soft failure", () => {
-    const res = summarizeToolFailure({
+    const res = summarizeBuiltinFailure({
       toolName: "bash",
       isError: false,
       result: {
@@ -25,7 +32,7 @@ describe("summarizeToolFailure", () => {
   });
 
   it("marks read_file success=false as soft failure", () => {
-    const res = summarizeToolFailure({
+    const res = summarizeBuiltinFailure({
       toolName: "read_file",
       isError: false,
       result: {
@@ -43,8 +50,22 @@ describe("summarizeToolFailure", () => {
     expect(res.error).toBe("No such file");
   });
 
+  it("marks fuzzy_search errors as soft failures", () => {
+    const res = summarizeBuiltinFailure({
+      toolName: "fuzzy_search",
+      isError: false,
+      result: { error: "index unavailable" },
+    });
+
+    expect(res).toEqual({
+      ok: false,
+      failureKind: "soft",
+      error: "fuzzy_search failed: index unavailable",
+    });
+  });
+
   it("marks execution errors as hard failure", () => {
-    const res = summarizeToolFailure({
+    const res = summarizeBuiltinFailure({
       toolName: "glob",
       isError: true,
       result: "validation failed",

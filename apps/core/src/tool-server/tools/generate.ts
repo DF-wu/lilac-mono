@@ -1,4 +1,10 @@
 import { env, errorMessage, getModelProviders } from "@stanley2058/lilac-utils";
+import {
+  defineServerTool,
+  type RequestContext,
+  type ServerTool,
+  type ServerToolCallOptions,
+} from "@stanley2058/lilac-plugin-runtime";
 import { Result, TaggedError, type Result as ResultType } from "better-result";
 import {
   experimental_generateVideo as generateVideo,
@@ -17,9 +23,6 @@ import {
   inferMimeTypeFromFilename,
   resolveToolPathForRequestContext,
 } from "../../shared/attachment-utils";
-import type { RequestContext, ServerTool } from "../types";
-import { parseToolInputPreservingZodError as parseToolInput } from "../validation-error-message";
-import { zodObjectToCliLines } from "./zod-cli";
 
 class GenerateToolFailure extends TaggedError("GenerateToolFailure")<{
   readonly message: string;
@@ -878,81 +881,72 @@ export function generateVideoWithModel(
 export class Generate implements ServerTool {
   id = "generate";
 
-  async init(): Promise<void> {}
-  async destroy(): Promise<void> {}
-
-  async list() {
-    const imageModels = orderImageModelIds(getAvailableImageModels().ids);
-    const videoModels = getAvailableVideoModels().ids;
-    const tools = [];
-
-    if (imageModels.length > 0) {
-      tools.push({
-        callableId: "generate.image",
+  private readonly tool = defineServerTool({
+    id: this.id,
+    callables: ({ callable }) => ({
+      "generate.image": callable({
         name: "Generate Image",
         description:
           "Generate or edit an image with a configured provider and write it to a local file in outputDir (or cwd). Returns absolute output path + MIME type. " +
-          "Recommended/default: gpt-image-2 when available. " +
-          `Available models: ${imageModels.join(", ")}`,
-        shortInput: zodObjectToCliLines(imageGenerateInputSchema, {
-          mode: "required",
-        }),
-        input: zodObjectToCliLines(imageGenerateInputSchema),
-        primaryPositional: {
-          field: "prompt",
+          "Recommended/default: gpt-image-2 when available.",
+        inputSchema: imageGenerateInputSchema,
+        validation: "zod",
+        primaryPositional: "prompt",
+        catalog: () => {
+          const imageModels = orderImageModelIds(getAvailableImageModels().ids);
+          if (imageModels.length === 0) return false;
+          return {
+            description:
+              "Generate or edit an image with a configured provider and write it to a local file in outputDir (or cwd). Returns absolute output path + MIME type. " +
+              "Recommended/default: gpt-image-2 when available. " +
+              `Available models: ${imageModels.join(", ")}`,
+          };
         },
-      });
-    }
-
-    if (videoModels.length > 0) {
-      tools.push({
-        callableId: "generate.video",
+        run: (input, opts) => this.callGenerateImage(input, opts),
+      }),
+      "generate.video": callable({
         name: "Generate Video",
-        description:
-          "Generate a video with a configured provider and write it to a local file. " +
-          `Available models: ${videoModels.join(", ")}`,
-        shortInput: zodObjectToCliLines(videoGenerateInputSchema, {
-          mode: "required",
-        }),
-        input: zodObjectToCliLines(videoGenerateInputSchema),
-      });
-    }
+        description: "Generate a video with a configured provider and write it to a local file.",
+        inputSchema: videoGenerateInputSchema,
+        validation: "zod",
+        catalog: () => {
+          const videoModels = getAvailableVideoModels().ids;
+          if (videoModels.length === 0) return false;
+          return {
+            description:
+              "Generate a video with a configured provider and write it to a local file. " +
+              `Available models: ${videoModels.join(", ")}`,
+          };
+        },
+        run: (input, opts) => this.callGenerateVideo(input, opts),
+      }),
+    }),
+  });
 
-    return tools;
+  async init(): Promise<void> {
+    await this.tool.init();
+  }
+
+  async destroy(): Promise<void> {
+    await this.tool.destroy();
+  }
+
+  async list() {
+    return this.tool.list();
   }
 
   async call(
     callableId: string,
     input: Record<string, unknown>,
-    opts?: {
-      signal?: AbortSignal;
-      context?: RequestContext;
-      messages?: readonly unknown[];
-    },
+    opts?: ServerToolCallOptions,
   ): Promise<unknown> {
-    if (callableId === "generate.image") {
-      return await this.callGenerateImage(input, opts);
-    }
-
-    if (callableId === "generate.video") {
-      return await this.callGenerateVideo(input, opts);
-    }
-
-    return signalGenerateFailureToToolHost(`Invalid callable ID '${callableId}'`);
+    return this.tool.call(callableId, input, opts);
   }
 
   private async callGenerateImage(
-    input: Record<string, unknown>,
-    opts?: {
-      signal?: AbortSignal;
-      context?: RequestContext;
-    },
+    payload: ImageGenerateInput,
+    opts?: ServerToolCallOptions,
   ): Promise<unknown> {
-    const payload = parseToolInput({
-      callableId: "generate.image",
-      input,
-      schema: imageGenerateInputSchema,
-    });
     const availableModels = getAvailableImageModels();
     const picked = pickModel(
       availableModels.available,
@@ -1001,17 +995,9 @@ export class Generate implements ServerTool {
   }
 
   private async callGenerateVideo(
-    input: Record<string, unknown>,
-    opts?: {
-      signal?: AbortSignal;
-      context?: RequestContext;
-    },
+    payload: VideoGenerateInput,
+    opts?: ServerToolCallOptions,
   ): Promise<unknown> {
-    const payload = parseToolInput({
-      callableId: "generate.video",
-      input,
-      schema: videoGenerateInputSchema,
-    });
     const availableModels = getAvailableVideoModels();
     const picked = pickModel(
       availableModels.available,

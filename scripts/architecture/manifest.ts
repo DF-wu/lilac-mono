@@ -897,18 +897,6 @@ const CORE_TOOL_SERVER_BOUNDARY_DECODERS = [
     category: "request" as const,
   })),
   ...[
-    "ToolInputValidationError.constructor",
-    "summarizeProvidedKeys",
-    "isEmptyObjectInput",
-    "formatToolValidationError",
-    "decodeToolInput",
-    "parseToolInput",
-    "parseToolInputPreservingZodError",
-  ].map((exportName) => ({
-    identity: { module: "src/tool-server/validation-error-message.ts", exportName },
-    category: "request" as const,
-  })),
-  ...[
     "normalizeAttachmentAddFilesInput",
     "asBuffer",
     "downloadToBuffer",
@@ -1006,15 +994,6 @@ const CORE_TOOL_SERVER_BOUNDARY_DECODERS = [
     },
     category: "wire",
   },
-  ...[
-    "collectVariants",
-    "conditionToText",
-    "getObjectShape",
-    "formatAggregatedFieldLine.<callback>",
-  ].map((exportName) => ({
-    identity: { module: "src/tool-server/tools/zod-cli.ts", exportName },
-    category: "plugin" as const,
-  })),
   ...["previewReason", "createToolServerHealthState.recordUnhandledRejection"].map(
     (exportName) => ({
       identity: { module: "src/tool-server/health-state.ts", exportName },
@@ -2097,10 +2076,6 @@ const INTEGRATED_OPAQUE_UNKNOWN = new Map<string, readonly ReasonedSymbolExcepti
           "Carries settled plugin tool output opaquely through the established HTTP wire contract.",
       },
       {
-        identity: { module: "src/tool-server/tools/zod-cli.ts", exportName: "formatValue" },
-        reason: "Formats generic Zod literal and default values without interpreting domain data.",
-      },
-      {
         identity: { module: "src/tools/batch.ts", exportName: "batchTool" },
         reason: "Carries an AI SDK tool-call payload opaquely to the selected child tool boundary.",
       },
@@ -2151,6 +2126,10 @@ const INTEGRATED_OPAQUE_UNKNOWN = new Map<string, readonly ReasonedSymbolExcepti
   [
     "packages/plugin-runtime",
     [
+      {
+        identity: { module: "zod-cli.ts", exportName: "formatValue" },
+        reason: "Formats generic Zod literal and default values without interpreting domain data.",
+      },
       {
         identity: { module: "capabilities.ts", exportName: "opaquePluginExceptionMessage" },
         reason: "Formats an opaque plugin exception without treating it as domain data.",
@@ -2437,16 +2416,6 @@ const OPEN_PROTOCOL_RULE_ZONES = new Map<string, readonly RuleZone[]>([
 
 const CORE_TOOL_SERVER_EXCEPTION_ADAPTERS = [
   ...[
-    [
-      "src/tool-server/validation-error-message.ts",
-      "adaptToolInputResultToServerToolHost",
-      "ServerTool.call input validation",
-    ],
-    [
-      "src/tool-server/validation-error-message.ts",
-      "adaptToolInputResultToZodHost",
-      "legacy ServerTool.call Zod validation",
-    ],
     [
       "src/tool-server/tools/programmatic-workflow.ts",
       "adaptWorkflowJsonProjectionResultToToolHost",
@@ -7070,6 +7039,34 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
     eventDeliveryConsumers: root === "apps/core" ? CORE_EVENT_DELIVERY_CONSUMERS : [],
     eventFamilies: root === "packages/event-bus" ? EVENT_BUS_FAMILIES : [],
     boundaryDecoders: [
+      ...(root === "packages/plugin-runtime"
+        ? ([
+            ...[
+              "ToolInputValidationError.constructor",
+              "summarizeProvidedKeys",
+              "isEmptyObjectInput",
+              "formatToolValidationError",
+              "decodeToolInput",
+              "parseToolInput",
+              "parseToolInputPreservingZodError",
+            ].map((exportName) => ({
+              identity: { module: "validation-error-message.ts", exportName },
+              category: "request" as const,
+            })),
+            ...[
+              "collectVariants",
+              "conditionToText",
+              "getObjectShape",
+              "formatAggregatedFieldLine.<callback>",
+              "mergeConditions",
+              "extractLiteralValues",
+              "renderType",
+            ].map((exportName) => ({
+              identity: { module: "zod-cli.ts", exportName },
+              category: "plugin" as const,
+            })),
+          ] satisfies readonly BoundaryDecoder[])
+        : []),
       ...(root === "packages/event-bus"
         ? ([
             ...[
@@ -8091,6 +8088,49 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
       ...(root === "apps/core" ? CORE_PARTITION_8_EXCEPTION_ADAPTERS : []),
       ...(root === "apps/core" ? CORE_REVIEWED_PANIC_ADAPTERS : []),
       ...(root === "apps/core" ? CORE_FATAL_SIGNAL_ADAPTERS : []),
+      ...(root === "packages/plugin-runtime"
+        ? ([
+            ...[
+              ["adaptToolInputResultToServerToolHost", "ServerTool.call input validation"],
+              ["adaptToolInputResultToZodHost", "legacy ServerTool.call Zod validation"],
+            ].map(([exportName, externalExportName]) => ({
+              identity: { module: "validation-error-message.ts", exportName },
+              category: "result-to-framework" as const,
+              externalApi: {
+                package: "@stanley2058/lilac-plugin-runtime",
+                exportName: externalExportName,
+              },
+              direction: "signal-host" as const,
+              reason:
+                "Adapts one typed tool boundary Result to the established rejecting tool host contract.",
+            })),
+            {
+              identity: { module: "zod-cli.ts", exportName: "adaptZodCliResultToToolHost" },
+              category: "result-to-framework" as const,
+              externalApi: {
+                package: "@stanley2058/lilac-plugin-runtime",
+                exportName: "ServerTool.list CLI projection",
+              },
+              direction: "signal-host" as const,
+              reason:
+                "Adapts invalid Zod CLI projection state to the established rejecting ServerTool list contract.",
+            },
+            {
+              identity: {
+                module: "define-server-tool.ts",
+                exportName: "adaptServerToolDispatchResultToHost",
+              },
+              category: "result-to-framework" as const,
+              externalApi: {
+                package: "@stanley2058/lilac-plugin-runtime",
+                exportName: "ServerTool.call callable dispatch",
+              },
+              direction: "signal-host" as const,
+              reason:
+                "Adapts an unknown callable Result to the established rejecting ServerTool call contract.",
+            },
+          ] satisfies readonly ExceptionAdapter[])
+        : []),
       ...(root === "packages/mini-lilac-runtime" ? MINI_WORKSPACE_HISTORY_EXCEPTION_ADAPTERS : []),
       ...preciseExceptionAdapters(PRECISE_EXCEPTION_IDENTITIES[root] ?? []),
     ],
@@ -8164,10 +8204,6 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
             ...["readConfiguredSshHostsResult", "requireConfiguredSshHostResult"].map(
               (exportName) => ({ module: "src/ssh/ssh-config.ts", exportName }),
             ),
-            {
-              module: "src/tool-server/validation-error-message.ts",
-              exportName: "decodeToolInput",
-            },
             {
               module: "src/tool-server/tools/programmatic-workflow.ts",
               exportName: "decodeWorkflowJsonObject",
@@ -8255,6 +8291,9 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
               exportName: "startBusAgentRunner.handleCmdRequestMessage",
             },
           ]
+        : []),
+      ...(root === "packages/plugin-runtime"
+        ? [{ module: "validation-error-message.ts", exportName: "decodeToolInput" }]
         : []),
       ...(root === "packages/tool-results"
         ? [
@@ -8636,7 +8675,7 @@ function approvedExceptionAdapterCatalogSha256(
 }
 
 export const APPROVED_EXCEPTION_ADAPTER_CATALOG_SHA256 =
-  "72483b25560f5d882a2b5a8079b1703586b7813ae9e1009156bf31dda076cd42";
+  "ee2e7c40f84d7ca4d51e61faae587528c709dd1855cddea3ec66b68487933c2a";
 
 export const architectureManifest = {
   version: 1,
