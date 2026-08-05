@@ -392,7 +392,7 @@ export async function startGithubWebhookServer(options: GithubWebhookOptions): P
   }
 
   const botLogins = await resolveBotMentions();
-  logger.info("GitHub webhook server init", {
+  logger.debug("GitHub webhook server init", {
     port,
     path,
     botLogins,

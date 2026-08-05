@@ -496,7 +496,7 @@ export async function bridgeBusToAdapter(params: {
       const requestClient = msg.headers?.request_client;
 
       if (!requestId || !sessionId) {
-        logger.warn("relay.event.ignored", {
+        logger.warn("relay.event.rejected", {
           requestId,
           sessionId,
           platform,
@@ -511,7 +511,7 @@ export async function bridgeBusToAdapter(params: {
       }
 
       if (requestClient && requestClient !== platform) {
-        logger.info("relay.event.ignored", {
+        logger.debug("relay.event.ignored", {
           requestId,
           sessionId,
           platform,
@@ -530,7 +530,7 @@ export async function bridgeBusToAdapter(params: {
 
       const relay = activeRelays.get(requestId);
       if (!relay) {
-        logger.info("relay.event.ignored", {
+        logger.debug("relay.event.ignored", {
           requestId,
           sessionId,
           platform,
@@ -586,7 +586,7 @@ export async function bridgeBusToAdapter(params: {
       }
 
       if (requestClient && requestClient !== platform) {
-        logger.info("relay.event.ignored", {
+        logger.debug("relay.event.ignored", {
           requestId,
           sessionId,
           platform,
@@ -599,7 +599,7 @@ export async function bridgeBusToAdapter(params: {
 
       const relay = activeRelays.get(requestId);
       if (!relay) {
-        logger.info("relay.event.ignored", {
+        logger.debug("relay.event.ignored", {
           requestId,
           sessionId,
           platform,
@@ -665,7 +665,7 @@ export async function bridgeBusToAdapter(params: {
 
       if (!requestId || !sessionId) {
         // Do not ack malformed messages: they need investigation.
-        logger.error("relay.event.ignored", {
+        logger.error("relay.event.rejected", {
           requestId,
           sessionId,
           platform,
@@ -680,7 +680,7 @@ export async function bridgeBusToAdapter(params: {
       }
 
       if (requestClient && requestClient !== platform) {
-        logger.info("relay.event.ignored", {
+        logger.debug("relay.event.ignored", {
           requestId,
           sessionId,
           platform,
@@ -730,7 +730,7 @@ export async function bridgeBusToAdapter(params: {
       }
 
       if (activeRelays.has(requestId)) {
-        logger.info("relay.event.ignored", {
+        logger.debug("relay.event.ignored", {
           requestId,
           sessionId,
           platform,
@@ -766,7 +766,7 @@ export async function bridgeBusToAdapter(params: {
         }
       }
 
-      logger.info("starting reply relay", {
+      logger.debug("starting reply relay", {
         requestId,
         sessionId,
         requestClient,
@@ -1249,11 +1249,6 @@ export async function bridgeBusToAdapter(params: {
             }),
         ]);
       }
-
-      logger.info("reply relay stopped", {
-        requestId,
-        sessionId,
-      });
     };
 
     bumpTimeout();

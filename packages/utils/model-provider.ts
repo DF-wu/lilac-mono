@@ -316,7 +316,7 @@ export function createCodexOAuthProvider(options: CreateCodexOAuthProviderOption
     createEventNormalizer: createCodexResponsesEventNormalizer,
     turnStateHeaderName: "x-codex-turn-state",
     onTransportSelected: (details) => {
-      logger.info("responses transport selected", { provider: "codex", ...details });
+      logger.debug("responses transport selected", { provider: "codex", ...details });
     },
     onAutoFallback: (details) => {
       logger.warn("responses transport fallback to sse", { provider: "codex", ...details });
@@ -434,7 +434,7 @@ export function getModelProviders() {
   const openaiResponsesFetch = createOpenAIResponsesWebSocketFetch({
     mode: env.providers.openai.responsesTransport,
     onTransportSelected: (details) => {
-      logger.info("responses transport selected", {
+      logger.debug("responses transport selected", {
         provider: "openai",
         ...details,
       });

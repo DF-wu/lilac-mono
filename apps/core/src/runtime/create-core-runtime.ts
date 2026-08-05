@@ -900,7 +900,7 @@ export async function createCoreRuntime(
   const customCommands = customCommandManager;
   const loadedCustomCommands = customCommands.list();
   const customCommandWarnings = customCommands.listWarnings();
-  logger.info("custom commands initialized", {
+  logger.debug("custom commands initialized", {
     dataDir: env.dataDir,
     commandsDir: resolveCustomCommandsDir(env.dataDir),
     discoveredCount: loadedCustomCommands.length + customCommandWarnings.length,
@@ -1265,7 +1265,7 @@ export async function createCoreRuntime(
           });
         });
 
-        logger.info("Core config hot-reload validator started", {
+        logger.debug("Core config hot-reload validator started", {
           path: configPath,
           parserVersion: await readCoreConfigParserVersion(configPath),
         });
@@ -1330,8 +1330,6 @@ export async function createCoreRuntime(
 
     const startup = await Result.tryPromise({
       try: async (): Promise<CoreRuntimeStartOutcome> => {
-        logger.info("Core runtime starting...");
-
         // Ensure data dir exists before creating sqlite-backed stores.
         await fs.mkdir(env.dataDir, { recursive: true });
         const artifactStoreInit = await toolResultArtifacts.init();
@@ -1356,7 +1354,7 @@ export async function createCoreRuntime(
             denyPaths: runtimeFsDenyPaths(),
             cacheDir: fffCacheDir(),
           }).then((results) => {
-            logger.info("fff finder prewarm completed", {
+            logger.debug("fff finder prewarm completed", {
               results,
             });
           });
@@ -1437,12 +1435,6 @@ export async function createCoreRuntime(
               );
             }
             const trigger = input?.trigger ?? "manual";
-            const flushStartedAt = Date.now();
-            if (trigger === "periodic") {
-              logger.info("conversation thread periodic summarization dispatch started", {
-                limit: input?.limit,
-              });
-            }
             const flushed = await captureSummarizationRuntimeOperation(
               "materializer-flush",
               async () => {
@@ -1450,11 +1442,6 @@ export async function createCoreRuntime(
               },
             );
             if (flushed.status === "error") return Result.err(flushed.error);
-            if (trigger === "periodic") {
-              logger.info("conversation thread periodic summarization materialization flushed", {
-                durationMs: Date.now() - flushStartedAt,
-              });
-            }
             if (conversationThreadSummarizationStopping) {
               return Result.err(
                 new ConversationThreadSummarizationTransportError({
@@ -1469,7 +1456,6 @@ export async function createCoreRuntime(
               );
               if (config.status === "error") return Result.err(config.error);
               if (config.value.conversation.thread.summarization.enabled !== true) {
-                logger.info("conversation thread periodic summarization cancelled after flush");
                 return Result.ok({
                   dryRun: false,
                   refreshed: { channels: 0, threads: 0, messages: 0 },
@@ -1505,7 +1491,7 @@ export async function createCoreRuntime(
           materializer: conversationThreadMaterializer,
         });
 
-        logger.info("Discord search indexer started", {
+        logger.debug("Discord search indexer started", {
           dbPath: discordSearchDbPath,
         });
 
@@ -1517,7 +1503,7 @@ export async function createCoreRuntime(
           transcriptStore: transcriptStore ?? undefined,
         });
 
-        logger.info("bridgeAdapterToBus started", {
+        logger.debug("bridgeAdapterToBus started", {
           subscriptionId: subId(subscriptionPrefix, "adapter-to-bus"),
         });
 
@@ -1526,7 +1512,7 @@ export async function createCoreRuntime(
           subscriptionId: subId(subscriptionPrefix, "tool-request-cache"),
         });
 
-        logger.info("Request message cache started", {
+        logger.debug("Request message cache started", {
           subscriptionId: subId(subscriptionPrefix, "tool-request-cache"),
         });
 
@@ -1549,7 +1535,7 @@ export async function createCoreRuntime(
         await adapter.connect();
         await githubAdapter.connect();
 
-        logger.info("Surface adapter connected", {
+        logger.debug("Surface adapter connected", {
           platform: "discord",
         });
 
@@ -1641,7 +1627,7 @@ export async function createCoreRuntime(
           reportFatalError,
         });
 
-        logger.info("Bus request router started", {
+        logger.debug("Bus request router started", {
           subscriptionId: subId(subscriptionPrefix, "router"),
         });
 
@@ -1721,10 +1707,6 @@ export async function createCoreRuntime(
         await toolServer.init();
         await toolServer.start(toolServerPort);
 
-        logger.info("Tool server started", {
-          port: toolServerPort,
-        });
-
         stopBusToAdapter = await bridgeBusToAdapter({
           adapter,
           bus,
@@ -1733,7 +1715,7 @@ export async function createCoreRuntime(
           transcriptStore: transcriptStore ?? undefined,
         });
 
-        logger.info("bridgeBusToAdapter started", {
+        logger.debug("bridgeBusToAdapter started", {
           subscriptionId: subId(subscriptionPrefix, "bus-to-adapter"),
         });
 
@@ -1754,7 +1736,7 @@ export async function createCoreRuntime(
             transcriptStore: transcriptStore ?? undefined,
           });
 
-          logger.info("GitHub surface started", {
+          logger.debug("GitHub surface started", {
             webhookPath: env.github.webhookPath,
             webhookPort: env.github.webhookPort,
             subscriptionId: subId(subscriptionPrefix, "bus-to-github"),
@@ -1874,7 +1856,7 @@ export async function createCoreRuntime(
           },
         });
 
-        logger.info("Bus agent runner started", {
+        logger.debug("Bus agent runner started", {
           subscriptionId: subId(subscriptionPrefix, "agent-runner"),
           cwd: canonicalWorkspaceRoot,
         });
@@ -1926,7 +1908,7 @@ export async function createCoreRuntime(
         });
         await workflowEngine.start();
 
-        logger.info("Unified workflow engine started", {
+        logger.debug("Unified workflow engine started", {
           subscriptionId: subId(subscriptionPrefix, "workflow-engine"),
         });
 
@@ -1949,7 +1931,7 @@ export async function createCoreRuntime(
         }
         stopHeartbeat = heartbeatStarted.value;
 
-        logger.info("Heartbeat service started", {
+        logger.debug("Heartbeat service started", {
           subscriptionId: subId(subscriptionPrefix, "heartbeat"),
         });
 
@@ -1958,7 +1940,7 @@ export async function createCoreRuntime(
             runner: conversationThreadSummarizationRunner,
             getConfig: () => getCoreConfig(),
           });
-          logger.info("Conversation thread worker started");
+          logger.debug("Conversation thread worker started");
         }
 
         runtimeFullyStarted = routerSubscriptionHealthy;

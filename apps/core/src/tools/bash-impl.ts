@@ -883,14 +883,10 @@ export async function executeBash(
     });
     if (blocked) {
       logger.warn("bash blocked", {
-        command: redactedCommand,
-        cwd: displayCwd,
-        ...remoteLogMeta,
         reason: blocked.reason,
         segment: blocked.segment,
         requestId: context?.requestId,
-        sessionId: context?.sessionId,
-        requestClient: context?.requestClient,
+        toolCallId,
       });
 
       return {
@@ -1103,9 +1099,6 @@ export async function executeBash(
 
       if (termination?.type === "timeout") {
         logBashWarn("bash timeout", {
-          command: redactedCommand,
-          cwd: displayCwd,
-          ...remoteLogMeta,
           timeoutMs: termination.timeoutMs,
           timeoutKind: termination.timeoutKind,
           signal: DEFAULT_KILL_SIGNAL,
@@ -1114,8 +1107,7 @@ export async function executeBash(
           stdoutBytes: stdout.length,
           stderrBytes: stderr.length,
           requestId: context?.requestId,
-          sessionId: context?.sessionId,
-          requestClient: context?.requestClient,
+          toolCallId,
         });
 
         return withLimitedBashOutput(
@@ -1136,9 +1128,6 @@ export async function executeBash(
 
       if (termination?.type === "aborted" || execResult.aborted) {
         logBashWarn("bash aborted", {
-          command: redactedCommand,
-          cwd: displayCwd,
-          ...remoteLogMeta,
           timeoutMs,
           signal: DEFAULT_KILL_SIGNAL,
           exitCode,
@@ -1146,8 +1135,7 @@ export async function executeBash(
           stdoutBytes: stdout.length,
           stderrBytes: stderr.length,
           requestId: context?.requestId,
-          sessionId: context?.sessionId,
-          requestClient: context?.requestClient,
+          toolCallId,
         });
 
         return withLimitedBashOutput(
@@ -1166,9 +1154,6 @@ export async function executeBash(
 
       if (execResult.timedOut) {
         logBashWarn("bash timeout", {
-          command: redactedCommand,
-          cwd: displayCwd,
-          ...remoteLogMeta,
           timeoutMs,
           timeoutKind: "wall_clock",
           signal: DEFAULT_KILL_SIGNAL,
@@ -1177,8 +1162,7 @@ export async function executeBash(
           stdoutBytes: stdout.length,
           stderrBytes: stderr.length,
           requestId: context?.requestId,
-          sessionId: context?.sessionId,
-          requestClient: context?.requestClient,
+          toolCallId,
         });
 
         return withLimitedBashOutput(
@@ -1199,9 +1183,6 @@ export async function executeBash(
 
       if (outputTruncated) {
         logBashWarn("bash output truncated", {
-          command: redactedCommand,
-          cwd: displayCwd,
-          ...remoteLogMeta,
           exitCode,
           durationMs,
           stdoutChars: stdout.length,
@@ -1212,37 +1193,28 @@ export async function executeBash(
           stderrCapped: execResult.capped.stderr,
           artifactUri,
           requestId: context?.requestId,
-          sessionId: context?.sessionId,
-          requestClient: context?.requestClient,
+          toolCallId,
         });
       }
 
       const ok = exitCode === 0;
       if (ok) {
         logBashInfo("bash done", {
-          command: redactedCommand,
-          cwd: displayCwd,
-          ...remoteLogMeta,
           exitCode,
           durationMs,
           stdoutBytes: stdout.length,
           stderrBytes: stderr.length,
           requestId: context?.requestId,
-          sessionId: context?.sessionId,
-          requestClient: context?.requestClient,
+          toolCallId,
         });
       } else {
         logBashWarn("bash done (non-zero exit)", {
-          command: redactedCommand,
-          cwd: displayCwd,
-          ...remoteLogMeta,
           exitCode,
           durationMs,
           stdoutBytes: stdout.length,
           stderrBytes: stderr.length,
           requestId: context?.requestId,
-          sessionId: context?.sessionId,
-          requestClient: context?.requestClient,
+          toolCallId,
         });
       }
 
@@ -1392,9 +1364,6 @@ export async function executeBash(
 
     if (termination?.type === "aborted") {
       logBashWarn("bash aborted", {
-        command: redactedCommand,
-        cwd: displayCwd,
-        ...remoteLogMeta,
         timeoutMs,
         signal: child.signalCode ?? DEFAULT_KILL_SIGNAL,
         exitCode,
@@ -1402,8 +1371,7 @@ export async function executeBash(
         stdoutBytes: stdout.length,
         stderrBytes: stderr.length,
         requestId: context?.requestId,
-        sessionId: context?.sessionId,
-        requestClient: context?.requestClient,
+        toolCallId,
       });
 
       return withLimitedBashOutput(
@@ -1422,9 +1390,6 @@ export async function executeBash(
 
     if (termination?.type === "timeout") {
       logBashWarn("bash timeout", {
-        command: redactedCommand,
-        cwd: displayCwd,
-        ...remoteLogMeta,
         timeoutMs: termination.timeoutMs,
         timeoutKind: termination.timeoutKind,
         signal: child.signalCode ?? DEFAULT_KILL_SIGNAL,
@@ -1433,8 +1398,7 @@ export async function executeBash(
         stdoutBytes: stdout.length,
         stderrBytes: stderr.length,
         requestId: context?.requestId,
-        sessionId: context?.sessionId,
-        requestClient: context?.requestClient,
+        toolCallId,
       });
 
       return withLimitedBashOutput(
@@ -1455,13 +1419,9 @@ export async function executeBash(
 
     if (stdoutResult.status === "rejected") {
       logBashError("bash stdout read failed", {
-        command: redactedCommand,
-        cwd: displayCwd,
-        ...remoteLogMeta,
         durationMs,
         requestId: context?.requestId,
-        sessionId: context?.sessionId,
-        requestClient: context?.requestClient,
+        toolCallId,
         ...formatBashStreamFailureForLog(stdoutResult.reason),
       });
 
@@ -1482,13 +1442,9 @@ export async function executeBash(
 
     if (stderrResult.status === "rejected") {
       logBashError("bash stderr read failed", {
-        command: redactedCommand,
-        cwd: displayCwd,
-        ...remoteLogMeta,
         durationMs,
         requestId: context?.requestId,
-        sessionId: context?.sessionId,
-        requestClient: context?.requestClient,
+        toolCallId,
         ...formatBashStreamFailureForLog(stderrResult.reason),
       });
 
@@ -1509,13 +1465,9 @@ export async function executeBash(
 
     if (exitResult.status === "rejected") {
       logBashError("bash exit status read failed", {
-        command: redactedCommand,
-        cwd: displayCwd,
-        ...remoteLogMeta,
         durationMs,
         requestId: context?.requestId,
-        sessionId: context?.sessionId,
-        requestClient: context?.requestClient,
+        toolCallId,
         failureMessage: "Bash exit status operation failed",
       });
 
@@ -1536,9 +1488,6 @@ export async function executeBash(
 
     if (outputTruncated) {
       logBashWarn("bash output truncated", {
-        command: redactedCommand,
-        cwd: displayCwd,
-        ...remoteLogMeta,
         exitCode,
         durationMs,
         stdoutChars: stdout.length,
@@ -1549,8 +1498,7 @@ export async function executeBash(
         stderrCapped: stderrResult.status === "fulfilled" ? stderrResult.value.capped : false,
         artifactUri,
         requestId: context?.requestId,
-        sessionId: context?.sessionId,
-        requestClient: context?.requestClient,
+        toolCallId,
       });
     }
 
@@ -1558,29 +1506,21 @@ export async function executeBash(
     const ok = exitCode === 0;
     if (ok) {
       logBashInfo("bash done", {
-        command: redactedCommand,
-        cwd: displayCwd,
-        ...remoteLogMeta,
         exitCode,
         durationMs,
         stdoutBytes: stdout.length,
         stderrBytes: stderr.length,
         requestId: context?.requestId,
-        sessionId: context?.sessionId,
-        requestClient: context?.requestClient,
+        toolCallId,
       });
     } else {
       logBashWarn("bash done (non-zero exit)", {
-        command: redactedCommand,
-        cwd: displayCwd,
-        ...remoteLogMeta,
         exitCode,
         durationMs,
         stdoutBytes: stdout.length,
         stderrBytes: stderr.length,
         requestId: context?.requestId,
-        sessionId: context?.sessionId,
-        requestClient: context?.requestClient,
+        toolCallId,
       });
     }
 
@@ -1612,8 +1552,7 @@ export async function executeBash(
       logger.error("bash spawn and cleanup failed", {
         durationMs,
         requestId: context?.requestId,
-        sessionId: context?.sessionId,
-        requestClient: context?.requestClient,
+        toolCallId,
         ...formatTaggedErrorForLog(combined),
       });
       return {
@@ -1629,13 +1568,9 @@ export async function executeBash(
     }
 
     logger.error("bash spawn failed", {
-      command: redactedCommand,
-      cwd: displayCwd,
-      ...remoteLogMeta,
       durationMs,
       requestId: context?.requestId,
-      sessionId: context?.sessionId,
-      requestClient: context?.requestClient,
+      toolCallId,
       ...formatTaggedErrorForLog(executed.error),
     });
 

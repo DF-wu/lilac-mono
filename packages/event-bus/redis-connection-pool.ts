@@ -160,7 +160,7 @@ export class RedisConnectionPool {
     this.lastResizeAt = now;
 
     const s = this.stats();
-    this.logger?.info("redis connection pool scaled up", {
+    this.logger?.debug("redis connection pool scaled up", {
       label: this.label,
       fromMax,
       toMax,

@@ -461,7 +461,7 @@ export class DiscordAdapter implements SurfaceAdapter {
     const cfg = this.opts?.config ?? (await this.resolveCoreConfig());
     this.cfg = cfg;
 
-    this.logger.info("connecting", {
+    this.logger.debug("connecting", {
       botName: cfg.surface.discord.botName,
       tokenEnv: cfg.surface.discord.tokenEnv,
       allowedChannelIds: cfg.surface.discord.allowedChannelIds.length,
@@ -472,7 +472,7 @@ export class DiscordAdapter implements SurfaceAdapter {
     this.store = new DiscordSurfaceStore(dbPath);
     this.entityMapper = createDiscordEntityMapper({ cfg, store: this.store });
 
-    this.logger.info("discord store initialized", { dbPath });
+    this.logger.debug("discord store initialized", { dbPath });
 
     const tokenResult = resolveDiscordTokenResult(cfg);
     if (tokenResult.status === "error") {
@@ -727,7 +727,7 @@ export class DiscordAdapter implements SurfaceAdapter {
     });
     if (loggedIn.status === "error") return signalSurfaceFailure(loggedIn.error);
 
-    this.logger.info("login ok");
+    this.logger.debug("login ok");
 
     this.client = client;
   }
@@ -2310,49 +2310,77 @@ export class DiscordAdapter implements SurfaceAdapter {
     // This is intentional: we treat the current code's command list as the
     // source of truth for this application.
     const desired = [slashDefinition, modelSlashDefinition, cancelContextMenuDefinition];
+    let syncFailed = false;
     const globalSync = await Result.tryPromise({
       try: () => app.commands.set(desired),
       catch: surfaceExternalFallback(externalCallFailure("application.commands.set")),
     });
     if (globalSync.status === "error") {
+      syncFailed = true;
       this.logger.error("slash command sync failed", {
         ...formatTaggedErrorForLog(globalSync.error),
       });
+    } else {
+      this.logger.debug("slash command scope synced", {
+        scope: "global",
+        count: desired.length,
+      });
     }
-    this.logger.info("slash commands synced", {
-      scope: "global",
-      count: desired.length,
-    });
 
     // Global-only strategy: clear guild-scoped commands to avoid duplicate
     // entries in Discord command pickers.
     const fetchedGuilds = await Result.tryPromise({
       try: () => client.guilds.fetch(),
-      catch: surfaceExternalFallback(null),
+      catch: surfaceExternalFallback(externalCallFailure("client.guilds.fetch")),
     });
+    if (fetchedGuilds.status === "error") {
+      syncFailed = true;
+      this.logger.error("guild slash command discovery failed", {
+        ...formatTaggedErrorForLog(fetchedGuilds.error),
+      });
+    }
     const guilds = fetchedGuilds.status === "ok" ? fetchedGuilds.value : null;
     const guildIds = guilds ? [...guilds.keys()] : [];
     for (const guildId of guildIds) {
       const fetchedGuild = await Result.tryPromise({
         try: () => client.guilds.fetch(guildId),
-        catch: surfaceExternalFallback(null),
+        catch: surfaceExternalFallback(externalCallFailure("client.guilds.fetch")),
       });
-      const guild = fetchedGuild.status === "ok" ? fetchedGuild.value : null;
-      if (!guild) continue;
+      if (fetchedGuild.status === "error") {
+        syncFailed = true;
+        this.logger.error("guild slash command sync failed", {
+          guildId,
+          ...formatTaggedErrorForLog(fetchedGuild.error),
+        });
+        continue;
+      }
+      const guild = fetchedGuild.value;
 
       const guildSync = await Result.tryPromise({
         try: () => guild.commands.set([]),
         catch: surfaceExternalFallback(externalCallFailure("guild.commands.set")),
       });
       if (guildSync.status === "error") {
-        this.logger.error("guild slash command sync failed", { guildId });
+        syncFailed = true;
+        this.logger.error("guild slash command sync failed", {
+          guildId,
+          ...formatTaggedErrorForLog(guildSync.error),
+        });
+      } else {
+        this.logger.debug("slash command scope synced", {
+          scope: "guild",
+          guildId,
+          count: 0,
+        });
       }
-      this.logger.info("slash commands synced", {
-        scope: "guild",
-        guildId,
-        count: 0,
-      });
     }
+    if (!syncFailed) {
+      this.logSlashCommandSyncSuccess(desired.length, guildIds.length);
+    }
+  }
+
+  private logSlashCommandSyncSuccess(globalCount: number, guildCount: number): void {
+    this.logger.info("slash commands synced", { globalCount, guildCount });
   }
 
   private async onChatInputCommand(

@@ -2598,7 +2598,7 @@ export async function startBusAgentRunner(params: {
           reason?: string;
           activeRequestId?: string | null;
         }) => {
-          logger.info("agent.queue.transition", {
+          logger.debug("agent.queue.transition", {
             requestId,
             sessionId,
             requestClient,
@@ -2610,6 +2610,13 @@ export async function startBusAgentRunner(params: {
             reason: input.reason,
             activeRequestId: input.activeRequestId ?? state.activeRequestId,
             draining,
+          });
+        };
+        const logQueuedBehindActiveRun = (queuedRequestId: string) => {
+          logger.info("request queued behind active run", {
+            requestId: queuedRequestId,
+            activeRequestId: state.activeRequestId,
+            queueDepth: state.queue.length,
           });
         };
 
@@ -2643,7 +2650,7 @@ export async function startBusAgentRunner(params: {
         }
 
         if (draining) {
-          logger.info("dropping request message while draining", {
+          logger.debug("dropping request message while draining", {
             requestId,
             sessionId,
             queue: msg.data.queue,
@@ -2658,7 +2665,7 @@ export async function startBusAgentRunner(params: {
         }
 
         const dropCancelNoTarget = async (reason: string) => {
-          logger.info("dropping cancel request with no target", {
+          logger.debug("dropping cancel request with no target", {
             requestId,
             sessionId,
             queue: entry.queue,
@@ -2708,7 +2715,7 @@ export async function startBusAgentRunner(params: {
               });
             }
 
-            logger.info("queued request cancelled", {
+            logger.debug("queued request cancelled", {
               requestId,
               sessionId,
               cancelledRequestIds: [...removed.keys()],
@@ -2781,7 +2788,7 @@ export async function startBusAgentRunner(params: {
 
           // Some messages only make sense when a run is already active.
           if (requestControl.requiresActive && entry.queue !== "prompt") {
-            logger.info("dropping request message (requires active run)", {
+            logger.debug("dropping request message (requires active run)", {
               requestId,
               sessionId,
               queue: entry.queue,
@@ -2878,6 +2885,7 @@ export async function startBusAgentRunner(params: {
                 queueDepthAfter: state.queue.length,
                 reason: "incompatible_active_model",
               });
+              logQueuedBehindActiveRun(queuedEntry.requestId);
               return;
             }
           }
@@ -2943,7 +2951,7 @@ export async function startBusAgentRunner(params: {
             // Prevent stale surface controls (e.g. Cancel button) from enqueueing behind
             // an unrelated active request.
             if (requestControl.requiresActive || requestControl.cancel) {
-              logger.info("dropping request message (requires active request id)", {
+              logger.debug("dropping request message (requires active request id)", {
                 requestId,
                 sessionId,
                 activeRequestId: state.activeRequestId,
@@ -2973,12 +2981,7 @@ export async function startBusAgentRunner(params: {
               detail: "queued behind active request",
             });
 
-            logger.info("request queued behind active run", {
-              requestId,
-              sessionId,
-              activeRequestId: state.activeRequestId,
-              queueDepth: state.queue.length,
-            });
+            logQueuedBehindActiveRun(requestId);
             logQueueTransition({
               action: "enqueue",
               queueDepthBefore,
@@ -3223,7 +3226,7 @@ export async function startBusAgentRunner(params: {
     const next = state.queue.shift();
     if (!next) return;
 
-    logger.info("agent.queue.transition", {
+    logger.debug("agent.queue.transition", {
       requestId: next.requestId,
       sessionId,
       requestClient: next.requestClient,
@@ -4267,21 +4270,10 @@ export async function startBusAgentRunner(params: {
             "agent run starting",
             formatBridgeLogContext({
               requestId: next.requestId,
-              sessionId: next.sessionId,
-              requestClient: next.requestClient,
               runProfile,
-              subagentDepth: subagentMeta.depth,
-              sessionConfigId,
               safetyMode,
-              requestModelOverride,
               model: activeBinding.resolved.spec,
-              responseCommentary: activeBinding.resolved.responseCommentary === true,
-              editingToolMode: runProfile === "explore" ? "none" : activeBinding.editingToolMode,
-              fallbackCount: modelPlan.fallbacks.length,
               isRecoveryResume: Boolean(next.recovery),
-              messageCount: next.messages.length,
-              recoveryCheckpointMessageCount: next.recovery?.checkpointMessages.length ?? 0,
-              queuedForSession: state.queue.length,
             }),
           );
 
@@ -5520,7 +5512,7 @@ export async function startBusAgentRunner(params: {
                 roundEstimatedCostCount += 1;
               }
 
-              logger.info(
+              logger.debug(
                 "agent.round.stats",
                 formatBridgeLogContext({
                   requestId: headers.request_id,
@@ -6336,14 +6328,6 @@ export async function startBusAgentRunner(params: {
           });
 
           const modelLabel = activeBinding.resolved.modelId;
-          const statsLine = buildStatsLine({
-            modelLabel,
-            usage: runStats.totalUsage,
-            ttftMs,
-            tps,
-            icLine,
-          });
-
           const statsForNerds = getStatsForNerdsOptions(cfg.agent.statsForNerds);
           const statsForNerdsLine = statsForNerds.enabled
             ? buildStatsLine({
@@ -6392,32 +6376,29 @@ export async function startBusAgentRunner(params: {
           });
 
           logger.info(
-            "agent run stats",
+            "agent run resolved",
             formatBridgeLogContext({
               requestId: headers.request_id,
-              sessionId: headers.session_id,
-              statsLine,
+              model: activeBinding.resolved.spec,
+              durationMs: Date.now() - runStartedAt,
               turns: turnEndCount,
+              finalTextChars: finalText.length,
+              ttftMs,
+              tokensPerSecond: tps,
+              inputComposition: icLine,
+              inputTokens: runStats.totalUsage?.inputTokens,
+              outputTokens: runStats.totalUsage?.outputTokens,
+              totalTokens: runStats.totalUsage?.totalTokens,
+              noCacheTokens: runStats.totalUsage?.inputTokenDetails.noCacheTokens,
+              cacheReadTokens: runStats.totalUsage?.inputTokenDetails.cacheReadTokens,
+              cacheWriteTokens: runStats.totalUsage?.inputTokenDetails.cacheWriteTokens,
+              textTokens: runStats.totalUsage?.outputTokenDetails.textTokens,
+              reasoningTokens: runStats.totalUsage?.outputTokenDetails.reasoningTokens,
               estimatedCostUsd: estimatedCostUsdTotal,
               costEstimateStatus: resolvedCostEstimateStatus,
               costEstimateReason: resolvedCostEstimateReason,
               estimatedCostTurnCoverage:
                 turnEndCount > 0 ? roundEstimatedCostCount / turnEndCount : undefined,
-            }),
-          );
-
-          logger.info(
-            "agent run resolved",
-            formatBridgeLogContext({
-              requestId: headers.request_id,
-              sessionId: headers.session_id,
-              model: activeBinding.resolved.spec,
-              durationMs: Date.now() - runStartedAt,
-              finalTextChars: finalText.length,
-              turns: turnEndCount,
-              estimatedCostUsd: estimatedCostUsdTotal,
-              costEstimateStatus: resolvedCostEstimateStatus,
-              costEstimateReason: resolvedCostEstimateReason,
             }),
           );
         },

@@ -664,10 +664,10 @@ export class Web implements ServerTool {
       this.logger.logInfo(resolved.warning);
     }
     if (nextIds && nextIds !== prevIds) {
-      this.logger.logInfo(`web.extract providers: ${nextIds}`);
+      this.logger.logDebug(`web.extract providers: ${nextIds}`);
     }
     if (prevFetchMode !== this.webFetchDefaultMode) {
-      this.logger.logInfo(`web.fetch mode: ${this.webFetchDefaultMode}`);
+      this.logger.logDebug(`web.fetch mode: ${this.webFetchDefaultMode}`);
     }
     if (!nextIds && this.webSearchProviderError) {
       this.logger.logError(this.webSearchProviderError);
@@ -706,7 +706,7 @@ export class Web implements ServerTool {
   private async initialize() {
     await this.refreshWebConfig();
 
-    this.logger.logInfo("Web extension initialized");
+    this.logger.logDebug("Web extension initialized");
   }
 
   private async destroyResources() {
