@@ -587,14 +587,14 @@ export const PRECISE_EXCEPTION_IDENTITIES: Readonly<
     [
       "src/tool-server/health-state.ts",
       "createToolServerHealthState.captureActiveLevel1Work",
-      "capture",
+      "both",
     ],
     [
       "src/tool-server/health-state.ts",
       "createToolServerHealthState.captureRuntimeDiagnostics",
-      "capture",
+      "both",
     ],
-    ["src/tool-server/health-state.ts", "createToolServerHealthState.getSnapshot", "capture"],
+    ["src/tool-server/health-state.ts", "createToolServerHealthState.getSnapshot", "both"],
     ["src/tool-server/health-state.ts", "previewReason", "capture"],
     [
       "src/tool-server/request-message-cache.ts",
@@ -704,8 +704,13 @@ export const PRECISE_EXCEPTION_IDENTITIES: Readonly<
     ],
     [
       "src/tool-server/health-state.ts",
-      "createToolServerHealthState.startMonitoring.setInterval.<callback@1>@2.catch.<callback@1>",
+      "createToolServerHealthState.reportWatchdogDefect",
       "capture",
+    ],
+    [
+      "src/tool-server/health-state.ts",
+      "createToolServerHealthState.signalWatchdogDefect.queueMicrotask.<callback@1>",
+      "signal",
     ],
     [
       "src/tool-server/tools/codex.ts",
@@ -1289,11 +1294,12 @@ export const PRECISE_EXCEPTION_IDENTITIES: Readonly<
     ["llm-wire-debug.ts", "decodeRequestBody", "both"],
     ["llm-wire-debug.ts", "safeParseJson", "both"],
     ["llm-wire-debug.ts", "withLlmWireDebugFetch.<callback>", "both"],
-    ["logging.ts", "OpenObserveJsonlStream.postBatch", "both"],
-    ["logging.ts", "OpenObserveJsonlStream.readResponseDetails", "both"],
     ["logging.ts", "OpenObserveJsonlStream.write", "both"],
-    ["logging.ts", "reportOpenObserveFailure", "both"],
+    ["logging.ts", "projectOpenObserveRequestFailure", "both"],
+    ["logging.ts", "reportOpenObserveDiagnostics", "both"],
     ["logging.ts", "safeJsonStringify", "both"],
+    ["logging.ts", "signalOpenObservePanic", "capture"],
+    ["logging.ts", "signalOpenObservePanic.queueMicrotask.<callback@1>", "signal"],
     ["model-capability.ts", "ModelCapability.loadRegistryResult.<callback>", "both"],
     ["model-capability.ts", "ModelCapability.resolve", "signal"],
     ["model-capability.ts", "parseModelSpecifier", "signal"],

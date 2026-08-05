@@ -6,6 +6,7 @@ import {
   errorMessage,
   formatTaggedErrorForLog,
   getCoreConfig,
+  getOpenObserveDiagnostics,
   isPanic,
   readCoreConfigVersionResult,
   resolveDiscordDbPath,
@@ -1057,7 +1058,9 @@ export async function createCoreRuntime(
     };
   }
 
-  async function getRuntimeHealthReport(): Promise<ToolServerHealthProviderResult> {
+  async function getRuntimeHealthReport(
+    options: { includeMemoryDiagnostics?: boolean } = {},
+  ): Promise<ToolServerHealthProviderResult> {
     const now = Date.now();
     const checks: ToolServerHealthCheck[] = [
       {
@@ -1077,7 +1080,9 @@ export async function createCoreRuntime(
       },
     ];
 
-    const discord = adapter.getHealthSnapshot();
+    const discord = adapter.getHealthSnapshot({
+      includeCache: options.includeMemoryDiagnostics,
+    });
     const disconnectedForMs = discord.lastDisconnectAt ? now - discord.lastDisconnectAt : 0;
     checks.push({
       name: "discord.ready",
@@ -1143,6 +1148,14 @@ export async function createCoreRuntime(
 
     return {
       checks,
+      ...(options.includeMemoryDiagnostics
+        ? {
+            memoryDiagnostics: {
+              discord: discord.cache,
+              openObserve: getOpenObserveDiagnostics(),
+            },
+          }
+        : {}),
       info: {
         runtime: {
           started,

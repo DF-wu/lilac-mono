@@ -992,6 +992,15 @@ const CORE_TOOL_SERVER_BOUNDARY_DECODERS = [
       category: "projection" as const,
     }),
   ),
+  ...[
+    "parseCgroupByteLimit",
+    "parseProcStatusMemory",
+    "parsePressureMetrics",
+    "parseSmapsRollupMemory",
+  ].map((exportName) => ({
+    identity: { module: "src/tool-server/runtime-diagnostics.ts", exportName },
+    category: "projection" as const,
+  })),
 ] as const satisfies readonly BoundaryDecoder[];
 
 const INTEGRATED_BOUNDARY_DECODERS = new Map<string, readonly BoundaryDecoder[]>([
@@ -1867,7 +1876,12 @@ const INTEGRATED_BOUNDARY_DECODERS = new Map<string, readonly BoundaryDecoder[]>
         identity: { module: "friendly-units.ts", exportName },
         category: "request" as const,
       })),
-      ...["addNormalizedArgFields", "normalizeRecordForOpenObserve"].map((exportName) => ({
+      ...[
+        "addNormalizedArgFields",
+        "normalizeRecordForOpenObserve",
+        "projectOpenObserveRequestFailure",
+        "signalOpenObservePanic",
+      ].map((exportName) => ({
         identity: { module: "logging.ts", exportName },
         category: "projection" as const,
       })),
@@ -5390,11 +5404,9 @@ export const LEGACY_UNENFORCED_EXCEPTION_ADAPTERS = new Map<string, readonly Exc
         ["llm-wire-debug.ts", "consumeSseDebugStream"],
         ["llm-wire-debug.ts", "safeParseJson"],
         ["llm-wire-debug.ts", "decodeRequestBody"],
-        ["logging.ts", "reportOpenObserveFailure"],
+        ["logging.ts", "reportOpenObserveDiagnostics"],
         ["logging.ts", "safeJsonStringify"],
         ["logging.ts", "OpenObserveJsonlStream.write"],
-        ["logging.ts", "OpenObserveJsonlStream.postBatch"],
-        ["logging.ts", "OpenObserveJsonlStream.readResponseDetails"],
         ["model-provider.ts", "decodeCodexResponsesRequestBody.catch"],
         ["openai-responses-websocket-fetch.ts", "createOpenAIResponsesWebSocketFetch.closeSocket"],
         [
@@ -5461,11 +5473,9 @@ export const LEGACY_UNENFORCED_EXCEPTION_ADAPTERS = new Map<string, readonly Exc
         ["llm-wire-debug.ts", "consumeSseDebugStream", "SSE debug stream"],
         ["llm-wire-debug.ts", "safeParseJson", "JSON.parse"],
         ["llm-wire-debug.ts", "decodeRequestBody", "request body decode"],
-        ["logging.ts", "reportOpenObserveFailure", "OpenObserve reporting"],
+        ["logging.ts", "reportOpenObserveDiagnostics", "OpenObserve reporting"],
         ["logging.ts", "safeJsonStringify", "JSON.stringify"],
         ["logging.ts", "OpenObserveJsonlStream.write", "OpenObserve stream write"],
-        ["logging.ts", "OpenObserveJsonlStream.postBatch", "OpenObserve batch post"],
-        ["logging.ts", "OpenObserveJsonlStream.readResponseDetails", "OpenObserve response read"],
         [
           "openai-responses-websocket-fetch.ts",
           "createOpenAIResponsesWebSocketFetch.closeSocket",
@@ -8586,7 +8596,7 @@ function approvedExceptionAdapterCatalogSha256(
 }
 
 export const APPROVED_EXCEPTION_ADAPTER_CATALOG_SHA256 =
-  "ee2e7c40f84d7ca4d51e61faae587528c709dd1855cddea3ec66b68487933c2a";
+  "cca9f77935a9d6b83fb1e1f4c42c31d084240657953772daa294d22d69021499";
 
 export const architectureManifest = {
   version: 1,

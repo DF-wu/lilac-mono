@@ -18,6 +18,21 @@ export type PressureMetrics = {
 };
 
 export type LinuxRuntimeDiagnostics = {
+  processMemory?: {
+    vmRssBytes?: number;
+    rssAnonBytes?: number;
+    rssFileBytes?: number;
+    rssShmemBytes?: number;
+    vmSwapBytes?: number;
+    threads?: number;
+    pssBytes?: number;
+    privateCleanBytes?: number;
+    privateDirtyBytes?: number;
+    sharedCleanBytes?: number;
+    sharedDirtyBytes?: number;
+    anonymousBytes?: number;
+    swapBytes?: number;
+  };
   hostPressure?: {
     cpu?: PressureMetrics;
     io?: PressureMetrics;
@@ -29,6 +44,11 @@ export type LinuxRuntimeDiagnostics = {
     cpuPressure?: PressureMetrics;
     ioPressure?: PressureMetrics;
     memoryPressure?: PressureMetrics;
+    memoryCurrentBytes?: number;
+    memoryPeakBytes?: number;
+    memoryHighBytes?: number | "max";
+    memoryMaxBytes?: number | "max";
+    memoryEvents?: Record<string, number>;
   };
 };
 
@@ -137,8 +157,103 @@ function parseNumericStats(input: string): Record<string, number> | undefined {
     const [key, rawValue, ...rest] = line.trim().split(/\s+/u);
     if (!key || !rawValue || rest.length > 0) continue;
     const value = Number(rawValue);
-    if (!Number.isFinite(value)) continue;
+    if (!Number.isSafeInteger(value) || value < 0) continue;
     result[key] = value;
+  }
+  return Object.keys(result).length > 0 ? result : undefined;
+}
+
+export function parseCgroupByteLimit(input: string): number | "max" | undefined {
+  const normalized = input.trim();
+  if (normalized === "max") return "max";
+  const value = Number(normalized);
+  if (!Number.isSafeInteger(value) || value < 0) return undefined;
+  return value;
+}
+
+function parseCgroupByteCount(input: string): number | undefined {
+  const value = parseCgroupByteLimit(input);
+  return typeof value === "number" ? value : undefined;
+}
+
+function parseKilobyteValue(input: string): number | undefined {
+  const match = /^(\d+)\s+kB$/u.exec(input.trim());
+  if (!match) return undefined;
+  const kilobytes = Number(match[1]);
+  if (!Number.isSafeInteger(kilobytes)) return undefined;
+  const bytes = kilobytes * 1024;
+  return Number.isSafeInteger(bytes) ? bytes : undefined;
+}
+
+export function parseProcStatusMemory(
+  input: string,
+): NonNullable<LinuxRuntimeDiagnostics["processMemory"]> | undefined {
+  const result: NonNullable<LinuxRuntimeDiagnostics["processMemory"]> = {};
+  for (const line of input.split("\n")) {
+    const separator = line.indexOf(":");
+    if (separator < 0) continue;
+    const key = line.slice(0, separator).trim();
+    const rawValue = line.slice(separator + 1).trim();
+    const bytes = parseKilobyteValue(rawValue);
+    switch (key) {
+      case "VmRSS":
+        if (bytes !== undefined) result.vmRssBytes = bytes;
+        break;
+      case "RssAnon":
+        if (bytes !== undefined) result.rssAnonBytes = bytes;
+        break;
+      case "RssFile":
+        if (bytes !== undefined) result.rssFileBytes = bytes;
+        break;
+      case "RssShmem":
+        if (bytes !== undefined) result.rssShmemBytes = bytes;
+        break;
+      case "VmSwap":
+        if (bytes !== undefined) result.vmSwapBytes = bytes;
+        break;
+      case "Threads": {
+        const threads = Number(rawValue);
+        if (Number.isSafeInteger(threads) && threads >= 0) result.threads = threads;
+        break;
+      }
+    }
+  }
+  return Object.keys(result).length > 0 ? result : undefined;
+}
+
+export function parseSmapsRollupMemory(
+  input: string,
+): NonNullable<LinuxRuntimeDiagnostics["processMemory"]> | undefined {
+  const result: NonNullable<LinuxRuntimeDiagnostics["processMemory"]> = {};
+  for (const line of input.split("\n")) {
+    const separator = line.indexOf(":");
+    if (separator < 0) continue;
+    const key = line.slice(0, separator).trim();
+    const bytes = parseKilobyteValue(line.slice(separator + 1));
+    if (bytes === undefined) continue;
+    switch (key) {
+      case "Pss":
+        result.pssBytes = bytes;
+        break;
+      case "Private_Clean":
+        result.privateCleanBytes = bytes;
+        break;
+      case "Private_Dirty":
+        result.privateDirtyBytes = bytes;
+        break;
+      case "Shared_Clean":
+        result.sharedCleanBytes = bytes;
+        break;
+      case "Shared_Dirty":
+        result.sharedDirtyBytes = bytes;
+        break;
+      case "Anonymous":
+        result.anonymousBytes = bytes;
+        break;
+      case "Swap":
+        result.swapBytes = bytes;
+        break;
+    }
   }
   return Object.keys(result).length > 0 ? result : undefined;
 }
@@ -174,6 +289,13 @@ function resolveCgroupV2Path(): string | undefined {
 export function collectLinuxRuntimeDiagnostics(): LinuxRuntimeDiagnostics | undefined {
   if (process.platform !== "linux") return undefined;
 
+  const processStatus = readOptional("/proc/self/status");
+  const smapsRollup = readOptional("/proc/self/smaps_rollup");
+  const processMemory = {
+    ...(processStatus ? parseProcStatusMemory(processStatus) : {}),
+    ...(smapsRollup ? parseSmapsRollupMemory(smapsRollup) : {}),
+  };
+
   const hostPressure = {
     cpu: readPressure("/proc/pressure/cpu"),
     io: readPressure("/proc/pressure/io"),
@@ -182,6 +304,15 @@ export function collectLinuxRuntimeDiagnostics(): LinuxRuntimeDiagnostics | unde
 
   const cgroupPath = resolveCgroupV2Path();
   const cpuStat = cgroupPath ? readOptional(path.join(cgroupPath, "cpu.stat")) : undefined;
+  const memoryCurrent = cgroupPath
+    ? readOptional(path.join(cgroupPath, "memory.current"))
+    : undefined;
+  const memoryPeak = cgroupPath ? readOptional(path.join(cgroupPath, "memory.peak")) : undefined;
+  const memoryHigh = cgroupPath ? readOptional(path.join(cgroupPath, "memory.high")) : undefined;
+  const memoryMax = cgroupPath ? readOptional(path.join(cgroupPath, "memory.max")) : undefined;
+  const memoryEvents = cgroupPath
+    ? readOptional(path.join(cgroupPath, "memory.events"))
+    : undefined;
   const cgroupV2 = cgroupPath
     ? {
         cpuMax: readOptional(path.join(cgroupPath, "cpu.max")),
@@ -189,6 +320,11 @@ export function collectLinuxRuntimeDiagnostics(): LinuxRuntimeDiagnostics | unde
         cpuPressure: readPressure(path.join(cgroupPath, "cpu.pressure")),
         ioPressure: readPressure(path.join(cgroupPath, "io.pressure")),
         memoryPressure: readPressure(path.join(cgroupPath, "memory.pressure")),
+        memoryCurrentBytes: memoryCurrent ? parseCgroupByteCount(memoryCurrent) : undefined,
+        memoryPeakBytes: memoryPeak ? parseCgroupByteCount(memoryPeak) : undefined,
+        memoryHighBytes: memoryHigh ? parseCgroupByteLimit(memoryHigh) : undefined,
+        memoryMaxBytes: memoryMax ? parseCgroupByteLimit(memoryMax) : undefined,
+        memoryEvents: memoryEvents ? parseNumericStats(memoryEvents) : undefined,
       }
     : undefined;
 
@@ -199,10 +335,17 @@ export function collectLinuxRuntimeDiagnostics(): LinuxRuntimeDiagnostics | unde
       cgroupV2.cpuStat ||
       cgroupV2.cpuPressure ||
       cgroupV2.ioPressure ||
-      cgroupV2.memoryPressure);
-  if (!hasHostPressure && !hasCgroup) return undefined;
+      cgroupV2.memoryPressure ||
+      cgroupV2.memoryCurrentBytes !== undefined ||
+      cgroupV2.memoryPeakBytes !== undefined ||
+      cgroupV2.memoryHighBytes !== undefined ||
+      cgroupV2.memoryMaxBytes !== undefined ||
+      cgroupV2.memoryEvents);
+  const hasProcessMemory = Object.keys(processMemory).length > 0;
+  if (!hasProcessMemory && !hasHostPressure && !hasCgroup) return undefined;
 
   return {
+    ...(hasProcessMemory ? { processMemory } : {}),
     ...(hasHostPressure ? { hostPressure } : {}),
     ...(hasCgroup ? { cgroupV2 } : {}),
   };

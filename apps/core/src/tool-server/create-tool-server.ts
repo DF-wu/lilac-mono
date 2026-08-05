@@ -366,7 +366,9 @@ export type ToolServerOptions = {
   logger?: Logger;
   toolCallTimeouts?: ToolCallTimeoutOptions;
   healthConfig?: ToolServerHealthConfig;
-  healthProvider?: () => ToolServerHealthProviderResult | Promise<ToolServerHealthProviderResult>;
+  healthProvider?: (options?: {
+    includeMemoryDiagnostics?: boolean;
+  }) => ToolServerHealthProviderResult | Promise<ToolServerHealthProviderResult>;
   activeLevel1WorkProvider?: () => readonly ToolServerActiveLevel1Work[];
   onUnhealthy?: (snapshot: ToolServerHealthSnapshot) => void | Promise<void>;
   getConfig?: () => Promise<CoreConfig>;
@@ -574,6 +576,7 @@ export function createToolServer(options: ToolServerOptions) {
     externalHealthProvider: options.healthProvider,
     activeLevel1WorkProvider: options.activeLevel1WorkProvider,
     onUnhealthy: options.onUnhealthy,
+    reportFatalDefect: options.reportFatalToolCallDefect ?? signalFatalToolCallDefectToProcess,
     ...options.healthConfig,
   });
 

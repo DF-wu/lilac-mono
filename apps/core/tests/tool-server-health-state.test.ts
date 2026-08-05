@@ -1,11 +1,15 @@
 import { describe, expect, it } from "bun:test";
+import { Panic } from "better-result";
 
 import { createLogger } from "@stanley2058/lilac-utils";
 
 import { createToolServerHealthState } from "../src/tool-server/health-state";
 import {
   createRuntimeDiagnosticSampler,
+  parseCgroupByteLimit,
+  parseProcStatusMemory,
   parsePressureMetrics,
+  parseSmapsRollupMemory,
   type RuntimeDiagnosticSample,
 } from "../src/tool-server/runtime-diagnostics";
 import { createToolServer } from "../src/tool-server/create-tool-server";
@@ -64,6 +68,151 @@ const RUNTIME_SAMPLE: RuntimeDiagnosticSample = {
 };
 
 describe("tool server health state", () => {
+  it("tracks fatal streaks independently by check name", async () => {
+    let failedCheck = "dependency.a";
+    const unhealthySnapshots: unknown[] = [];
+    const health = createToolServerHealthState({
+      logger: createLogger({ module: "health-state-test" }),
+      watchdogFailureThreshold: 2,
+      maxRssBytes: Number.MAX_SAFE_INTEGER,
+      externalHealthProvider: () => ({
+        checks: [{ name: failedCheck, ok: false, impact: "live" }],
+      }),
+      onUnhealthy: (snapshot) => {
+        unhealthySnapshots.push(snapshot);
+      },
+    });
+
+    await health.runWatchdog();
+    failedCheck = "dependency.b";
+    await health.runWatchdog();
+    failedCheck = "dependency.a";
+    await health.runWatchdog();
+    expect(unhealthySnapshots).toEqual([]);
+
+    await health.runWatchdog();
+    expect(unhealthySnapshots).toHaveLength(1);
+  });
+
+  it("shares one in-flight watchdog evaluation", async () => {
+    const provider = Promise.withResolvers<{ checks: [] }>();
+    let providerCalls = 0;
+    const health = createToolServerHealthState({
+      logger: createLogger({ module: "health-state-test" }),
+      maxRssBytes: Number.MAX_SAFE_INTEGER,
+      externalHealthProvider: () => {
+        providerCalls += 1;
+        return provider.promise;
+      },
+      onUnhealthy: () => {},
+    });
+
+    const first = health.runWatchdog();
+    const second = health.runWatchdog();
+    expect(second).toBe(first);
+    expect(providerCalls).toBe(1);
+    provider.resolve({ checks: [] });
+    await first;
+  });
+
+  it("invalidates a watchdog evaluation completed after monitoring stops", async () => {
+    const provider = Promise.withResolvers<{
+      checks: Array<{ name: string; ok: boolean; impact: "live" }>;
+    }>();
+    const unhealthySnapshots: unknown[] = [];
+    let providerCalls = 0;
+    const health = createToolServerHealthState({
+      logger: createLogger({ module: "health-state-test" }),
+      watchdogFailureThreshold: 1,
+      maxRssBytes: Number.MAX_SAFE_INTEGER,
+      externalHealthProvider: () => {
+        providerCalls += 1;
+        if (providerCalls === 1) return provider.promise;
+        return { checks: [{ name: "dependency", ok: false, impact: "live" as const }] };
+      },
+      onUnhealthy: (snapshot) => {
+        unhealthySnapshots.push(snapshot);
+      },
+    });
+
+    const evaluation = health.runWatchdog();
+    health.stopMonitoring();
+    await health.runWatchdog();
+    expect(providerCalls).toBe(2);
+    expect(unhealthySnapshots).toHaveLength(1);
+
+    provider.resolve({ checks: [{ name: "dependency", ok: false, impact: "live" }] });
+    await evaluation;
+    expect(unhealthySnapshots).toHaveLength(1);
+  });
+
+  it("preserves Panic from external health providers", async () => {
+    const panic = new Panic({ message: "health provider invariant" });
+    const health = createToolServerHealthState({
+      logger: createLogger({ module: "health-state-test" }),
+      maxRssBytes: Number.MAX_SAFE_INTEGER,
+      externalHealthProvider: () => {
+        throw panic;
+      },
+      onUnhealthy: () => {},
+    });
+
+    await expect(health.runWatchdog()).rejects.toBe(panic);
+  });
+
+  it("records bounded memory history and component diagnostics", async () => {
+    const unhealthySnapshots: unknown[] = [];
+    const health = createToolServerHealthState({
+      logger: createLogger({ module: "health-state-test" }),
+      watchdogFailureThreshold: 2,
+      maxRssBytes: 0,
+      runtimeDiagnosticSampler: () => RUNTIME_SAMPLE,
+      externalHealthProvider: () => ({
+        memoryDiagnostics: { discord: { members: 12 }, openObserve: { retainedBytes: 34 } },
+      }),
+      onUnhealthy: (snapshot) => {
+        unhealthySnapshots.push(snapshot);
+      },
+    });
+
+    for (let index = 0; index < 65; index += 1) await health.getSnapshot();
+    await health.runWatchdog();
+    await health.runWatchdog();
+
+    expect(unhealthySnapshots).toHaveLength(1);
+    const snapshot = unhealthySnapshots[0] as Awaited<ReturnType<typeof health.getSnapshot>>;
+    expect(snapshot.info.process.memoryHistory).toHaveLength(60);
+    expect(snapshot.info.process.memory.external).toBeNumber();
+    expect(snapshot.info.process.memory.arrayBuffers).toBeNumber();
+    expect(snapshot.info.process.lastMemoryIncident?.trigger).toMatchObject({
+      streak: 2,
+      components: {
+        discord: { members: 12 },
+        openObserve: { retainedBytes: 34 },
+      },
+    });
+  });
+
+  it("records the entry as the trigger when the memory threshold is one", async () => {
+    let unhealthySnapshot:
+      | Awaited<ReturnType<ReturnType<typeof createToolServerHealthState>["getSnapshot"]>>
+      | undefined;
+    const health = createToolServerHealthState({
+      logger: createLogger({ module: "health-state-test" }),
+      watchdogFailureThreshold: 1,
+      maxRssBytes: 0,
+      runtimeDiagnosticSampler: () => RUNTIME_SAMPLE,
+      onUnhealthy: (snapshot) => {
+        unhealthySnapshot = snapshot;
+      },
+    });
+
+    await health.runWatchdog();
+    expect(unhealthySnapshot?.info.process.lastMemoryIncident?.trigger).toMatchObject({
+      streak: 1,
+    });
+  });
+
   it("treats sustained event-loop lag as non-fatal readiness degradation", async () => {
     const unhealthySnapshots: unknown[] = [];
     const server = createToolServer({
@@ -221,6 +370,37 @@ describe("tool server health state", () => {
     ).toEqual({
       some: { avg10: 35.15, avg60: 10.2, avg300: 4, totalMicros: 123456 },
       full: { avg10: 30.27, avg60: 8, avg300: 2, totalMicros: 654321 },
+    });
+  });
+
+  it("parses Linux process and cgroup memory diagnostics", () => {
+    expect(parseCgroupByteLimit("max")).toBe("max");
+    expect(parseCgroupByteLimit("4096")).toBe(4096);
+    expect(parseCgroupByteLimit("invalid")).toBeUndefined();
+    expect(
+      parseProcStatusMemory(
+        "VmRSS:\t100 kB\nRssAnon:\t40 kB\nRssFile:\t50 kB\nRssShmem:\t10 kB\nVmSwap:\t2 kB\nThreads:\t7\n",
+      ),
+    ).toEqual({
+      vmRssBytes: 102_400,
+      rssAnonBytes: 40_960,
+      rssFileBytes: 51_200,
+      rssShmemBytes: 10_240,
+      vmSwapBytes: 2_048,
+      threads: 7,
+    });
+    expect(
+      parseSmapsRollupMemory(
+        "Pss: 90 kB\nPrivate_Clean: 3 kB\nPrivate_Dirty: 70 kB\nShared_Clean: 4 kB\nShared_Dirty: 5 kB\nAnonymous: 60 kB\nSwap: 1 kB\n",
+      ),
+    ).toEqual({
+      pssBytes: 92_160,
+      privateCleanBytes: 3_072,
+      privateDirtyBytes: 71_680,
+      sharedCleanBytes: 4_096,
+      sharedDirtyBytes: 5_120,
+      anonymousBytes: 61_440,
+      swapBytes: 1_024,
     });
   });
 
