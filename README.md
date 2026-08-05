@@ -183,7 +183,7 @@ Core requires `REDIS_URL`, `DISCORD_TOKEN`, and a valid model configuration. Tel
 | Surface | Minimum configuration | Default protection | Documentation |
 | --- | --- | --- | --- |
 | Discord | `DISCORD_TOKEN`; configure `allowedChannelIds` or `allowedGuildIds` | Ignores all Discord traffic when both allowlists are empty | [`core-config.example.yaml`](./packages/utils/config-templates/core-config.example.yaml) |
-| Telegram | `configVersion: 2`, `enabled: true`, `TELEGRAM_BOT_TOKEN`, `allowedChatIds` | Disabled by default; ignores all chats when the chat allowlist is empty | [`docs/telegram-surface.md`](./docs/telegram-surface.md) |
+| Telegram | `configVersion: 2`, `enabled: true`, `token`, `allowedChatIds` | Disabled by default; ignores all chats when the chat allowlist is empty | [`docs/telegram-surface.md`](./docs/telegram-surface.md) |
 | GitHub | GitHub App auth, `GITHUB_WEBHOOK_SECRET`, and an HTTPS/reverse proxy reachable by GitHub; a user token is an optional preferred outbound identity | The surface does not start without the GitHub App secret; returns `401` for an invalid signature | [`docs/github-reply-permalinks.md`](./docs/github-reply-permalinks.md) |
 
 The GitHub webhook listens on port `8787` and path `/github/webhook` by default. Stock Compose does not forward or expose the GitHub webhook environment and port, so production deployments must provide the reverse proxy, environment, and network wiring themselves.
@@ -232,15 +232,15 @@ configVersion: 2
 surface:
   telegram:
     enabled: true
-    tokenEnv: TELEGRAM_BOT_TOKEN
+    token: replace-with-botfather-token
     allowedChatIds:
       - "1001"
 ```
 
-Set the token in `.env` to avoid leaving the credential in shell history:
+Keep `data/core-config.yaml` private because it contains the bot token:
 
-```dotenv
-TELEGRAM_BOT_TOKEN=replace-with-botfather-token
+```bash
+chmod 600 data/core-config.yaml
 ```
 
 ```bash

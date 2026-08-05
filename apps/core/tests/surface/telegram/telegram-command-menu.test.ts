@@ -20,7 +20,6 @@ import { BOT_USER_ID, BOT_USERNAME } from "./telegram-fixtures";
  * `setMyCommands` payload rather than trusting the registry alone.
  */
 const ALLOWED_CHAT = 1001;
-const TOKEN_ENV = "TELEGRAM_BOT_TOKEN";
 
 const menuPayloadSchema = z.object({
   commands: z.array(z.object({ command: z.string(), description: z.string() })),
@@ -29,7 +28,6 @@ const menuPayloadSchema = z.object({
 let server: FakeBotApiServer;
 let adapter: TelegramAdapter | null = null;
 let scratchDir = "";
-let previousToken: string | undefined;
 
 function testConfig(telegram: Record<string, unknown> = {}): CoreConfig {
   const cfg = parseCoreConfigV2ToUniversal({
@@ -37,6 +35,7 @@ function testConfig(telegram: Record<string, unknown> = {}): CoreConfig {
     surface: {
       telegram: {
         enabled: true,
+        token: "000000:fake-token",
         botName: "lilac",
         allowedChatIds: [String(ALLOWED_CHAT)],
         ...telegram,
@@ -97,8 +96,6 @@ function registeredMenu(): { command: string; description: string }[] {
 }
 
 beforeEach(async () => {
-  previousToken = process.env[TOKEN_ENV];
-  process.env[TOKEN_ENV] = "000000:fake-token";
   scratchDir = await mkdtemp(path.join(tmpdir(), "lilac-telegram-menu-"));
   server = new FakeBotApiServer(BOT_USER_ID, BOT_USERNAME);
 });
@@ -108,9 +105,6 @@ afterEach(async () => {
   adapter = null;
   await server.close();
   await rm(scratchDir, { recursive: true, force: true });
-
-  if (previousToken === undefined) delete process.env[TOKEN_ENV];
-  else process.env[TOKEN_ENV] = previousToken;
 });
 
 describe("telegram command menu", () => {

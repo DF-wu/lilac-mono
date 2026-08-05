@@ -233,6 +233,16 @@ export async function parseCoreConfig(
     throw new Error("Core config must be an object");
   }
 
+  if (version === 2) {
+    const surface = raw.surface;
+    const telegram = isRecord(surface) ? surface.telegram : undefined;
+    if (isRecord(telegram) && Object.hasOwn(telegram, "tokenEnv")) {
+      throw new Error(
+        "surface.telegram.tokenEnv was removed; copy the token to surface.telegram.token and remove tokenEnv",
+      );
+    }
+  }
+
   const onUnknownKey =
     options?.onUnknownKey ??
     ((path) => {
@@ -375,12 +385,9 @@ export function resolveTelegramDbPath(cfg: CoreConfig): string {
 }
 
 export function resolveTelegramToken(cfg: CoreConfig): string {
-  const key = cfg.surface.telegram.tokenEnv;
-  const value = process.env[key];
+  const value = cfg.surface.telegram.token;
   if (!value) {
-    throw new Error(
-      `Telegram token missing: env var ${key} is not set (set it or change surface.telegram.tokenEnv in core-config.yaml)`,
-    );
+    throw new Error("Telegram token missing: set surface.telegram.token in core-config.yaml");
   }
   return value;
 }
@@ -392,5 +399,5 @@ export function resolveTelegramToken(cfg: CoreConfig): string {
  */
 export function isTelegramSurfaceUsable(cfg: CoreConfig): boolean {
   if (!cfg.surface.telegram.enabled) return false;
-  return Boolean(process.env[cfg.surface.telegram.tokenEnv]);
+  return Boolean(cfg.surface.telegram.token);
 }

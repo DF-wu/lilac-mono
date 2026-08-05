@@ -10,8 +10,10 @@
 #     (see apps/core/src/surface/discord/discord-channel-guards.ts: both lists
 #     empty means every message is rejected)
 #
-# Secrets are read out of the running reference container and passed straight
-# into the new process environment. They are never written to disk.
+# The Telegram token is copied into the derived verification config. Start is
+# refused when Telegram is already enabled in the reference config, because two
+# long-polling runtimes cannot safely share one bot token. The temporary named
+# volume contains secret material and must be removed after verification.
 #
 # Usage:
 #   docker/telegram-verify-stack.sh start
@@ -40,7 +42,7 @@ MINIMAL_KEYS=(
 # Everything else the reference container carries, minus the runtime-specific
 # values this script sets itself.
 EXCLUDED_KEYS=(
-  PATH HOME HOSTNAME REDIS_URL DATA_DIR TELEGRAM_BOT_TOKEN
+  PATH HOME HOSTNAME REDIS_URL DATA_DIR
   LL_TOOL_SERVER_PORT GITHUB_WEBHOOK_PORT
 )
 
@@ -105,8 +107,13 @@ seed_config() {
 cmd_start() {
   require_ref
   [ -n "${TELEGRAM_CHAT_ID:-}" ] || die "set TELEGRAM_CHAT_ID to the chat you want to allowlist"
-  [ -n "${TELEGRAM_BOT_TOKEN:-}" ] || die "set TELEGRAM_BOT_TOKEN"
   docker image inspect "${IMAGE}" >/dev/null 2>&1 || die "image '${IMAGE}' not built"
+
+  # Derive and validate before creating anything. In particular, refuse a live
+  # Telegram-enabled reference before a second poller can contend for its token.
+  local derived_config
+  derived_config="$(seed_config "${TELEGRAM_CHAT_ID}")" ||
+    die "could not derive a safe Telegram verification config"
 
   docker rm -f "${NAME}" >/dev/null 2>&1 || true
   docker volume create "${VOLUME}" >/dev/null
@@ -136,12 +143,12 @@ cmd_start() {
     "${env_args[@]}" \
     -e "REDIS_URL=redis://${redis_host}/${REDIS_DB}" \
     -e "DATA_DIR=/data" \
-    -e "TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}" \
     -v "${VOLUME}:/data" \
     "${IMAGE}" >/dev/null
 
   # Seed the config, then restart so the runtime reads it on boot.
-  seed_config "${TELEGRAM_CHAT_ID}" | docker exec -i "${NAME}" sh -c 'cat > /data/core-config.yaml'
+  printf '%s\n' "${derived_config}" |
+    docker exec -i "${NAME}" sh -c 'umask 077; cat > /data/core-config.yaml'
   docker restart "${NAME}" >/dev/null
 
   echo "==> started. follow with: docker/telegram-verify-stack.sh logs"

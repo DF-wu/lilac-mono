@@ -113,6 +113,24 @@ export type TelegramAdapterOptions = {
   customCommands?: CustomCommandManager;
 };
 
+export type TelegramConfigRefreshResult = {
+  restartRequiredFor: string[];
+};
+
+const TELEGRAM_RESTART_REQUIRED_FIELDS = [
+  "enabled",
+  "token",
+  "apiRoot",
+  "dbPath",
+  "commandMenu",
+] as const;
+
+function sanitizeTelegramErrorMessage(message: string, token?: string): string {
+  let sanitized = message;
+  if (token) sanitized = sanitized.split(token).join("<redacted>");
+  return sanitized.replace(/\/bot[^\s/]+/gu, "/bot<redacted>");
+}
+
 const TELEGRAM_CALLBACK_DATA_MAX_BYTES = 64;
 
 export function buildTelegramActionKeyboard(
@@ -276,11 +294,12 @@ export class TelegramAdapter implements SurfaceAdapter {
             : cause instanceof Error
               ? cause.message
               : String(cause);
+      const safeMessage = sanitizeTelegramErrorMessage(message, this.cfg?.surface.telegram.token);
 
       this.healthState = {
         ...this.healthState,
         lastErrorAt: Date.now(),
-        lastError: message,
+        lastError: safeMessage,
       };
       this.logger.error("telegram update handler failed", { updateId: err.ctx.update.update_id });
     });
@@ -356,8 +375,11 @@ export class TelegramAdapter implements SurfaceAdapter {
         : error instanceof Error
           ? error
           : new Error(String(error));
+    const safeFailure = new Error(
+      sanitizeTelegramErrorMessage(failure.message, this.cfg?.surface.telegram.token),
+    );
 
-    this.pollingFailure = failure;
+    this.pollingFailure = safeFailure;
     this.healthState = {
       ...this.healthState,
       connectionState: "failed",
@@ -365,13 +387,13 @@ export class TelegramAdapter implements SurfaceAdapter {
       pollingExitedAt: Date.now(),
       pollingExitFatal: fatal,
       lastErrorAt: Date.now(),
-      lastError: failure.message,
+      lastError: safeFailure.message,
     };
 
     this.logger.error(
       "telegram long polling exited; surface is no longer receiving updates",
       { fatal, willRecoverOnRestart: !fatal },
-      failure,
+      safeFailure,
     );
 
     // Unblock anyone waiting on readiness; whenReady() surfaces the failure.
@@ -463,8 +485,37 @@ export class TelegramAdapter implements SurfaceAdapter {
     return { ...this.healthState };
   }
 
-  async refreshCoreConfig(): Promise<void> {
-    this.cfg = await this.resolveCoreConfig();
+  async refreshCoreConfig(): Promise<TelegramConfigRefreshResult> {
+    const next = await this.resolveCoreConfig();
+    const current = this.cfg;
+    if (!current || !this.bot) {
+      this.cfg = next;
+      return { restartRequiredFor: [] };
+    }
+
+    const restartRequiredFor = TELEGRAM_RESTART_REQUIRED_FIELDS.filter(
+      (field) => next.surface.telegram[field] !== current.surface.telegram[field],
+    );
+
+    // Authorization and rendering settings are safe to reload immediately.
+    // Connection-lifecycle settings remain pinned to the active bot/store so a
+    // config edit cannot claim to rotate or disable a poller that is still live.
+    this.cfg = {
+      ...next,
+      surface: {
+        ...next.surface,
+        telegram: {
+          ...next.surface.telegram,
+          enabled: current.surface.telegram.enabled,
+          token: current.surface.telegram.token,
+          apiRoot: current.surface.telegram.apiRoot,
+          dbPath: current.surface.telegram.dbPath,
+          commandMenu: current.surface.telegram.commandMenu,
+        },
+      },
+    };
+
+    return { restartRequiredFor };
   }
 
   async getSelf(): Promise<SurfaceSelf> {

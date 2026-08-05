@@ -32,7 +32,6 @@ docker run --rm \
   --tmpfs /tmp:exec \
   --tmpfs /home/bun:exec \
   --env HOME=/home/bun \
-  --env TELEGRAM_BOT_TOKEN=000000:test-token-not-used-against-real-api \
   --env DATA_DIR=/tmp/lilac-data \
   "${BUN_IMAGE}" \
   bun test "${TEST_PATH}"

@@ -108,7 +108,6 @@ export type ModelCapabilityOverride = {
 
 export const TELEGRAM_SURFACE_DEFAULTS = {
   enabled: false,
-  tokenEnv: "TELEGRAM_BOT_TOKEN",
   botName: "lilac",
   outputMode: "preview",
   parseMode: "html",
@@ -259,7 +258,8 @@ export type UniversalCoreConfig = {
     telegram: {
       /** Telegram surface is opt-in; when false the adapter is never constructed. */
       enabled: boolean;
-      tokenEnv: string;
+      /** Bot API token. Keep core-config.yaml private because this is a secret. */
+      token?: string;
       /** Identity used for mention detection and prompt attribution. */
       botName: string;
       /** Resolved from getMe at connect time when omitted. */

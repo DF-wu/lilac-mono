@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { describe, expect, it } from "bun:test";
 
 import { isTelegramSurfaceUsable, parseCoreConfig, resolveTelegramToken } from "../core-config";
 
@@ -7,7 +7,7 @@ describe("core config surface.telegram", () => {
     const cfg = await parseCoreConfig({ configVersion: 2 });
 
     expect(cfg.surface.telegram.enabled).toBe(false);
-    expect(cfg.surface.telegram.tokenEnv).toBe("TELEGRAM_BOT_TOKEN");
+    expect(cfg.surface.telegram.token).toBeUndefined();
     expect(cfg.surface.telegram.parseMode).toBe("html");
     expect(cfg.surface.telegram.outputMode).toBe("preview");
     expect(cfg.surface.telegram.streamEditIntervalMs).toBe(1500);
@@ -27,6 +27,7 @@ describe("core config surface.telegram", () => {
       surface: {
         telegram: {
           enabled: true,
+          token: "123:abc",
           botName: "catalina",
           botUsername: "Catalina_agentbot",
           allowedChatIds: ["12345", "-1009876543210"],
@@ -40,6 +41,7 @@ describe("core config surface.telegram", () => {
     });
 
     expect(cfg.surface.telegram.enabled).toBe(true);
+    expect(cfg.surface.telegram.token).toBe("123:abc");
     expect(cfg.surface.telegram.botName).toBe("catalina");
     expect(cfg.surface.telegram.botUsername).toBe("Catalina_agentbot");
     expect(cfg.surface.telegram.allowedChatIds).toEqual(["12345", "-1009876543210"]);
@@ -68,6 +70,15 @@ describe("core config surface.telegram", () => {
     ).rejects.toThrow();
   });
 
+  it("rejects the removed tokenEnv configuration", async () => {
+    await expect(
+      parseCoreConfig({
+        configVersion: 2,
+        surface: { telegram: { enabled: true, tokenEnv: "TELEGRAM_BOT_TOKEN" } },
+      }),
+    ).rejects.toThrow("copy the token to surface.telegram.token");
+  });
+
   it("rejects a streamEditIntervalMs below the Bot API edit rate limit", async () => {
     await expect(
       parseCoreConfig({
@@ -81,7 +92,7 @@ describe("core config surface.telegram", () => {
     const cfg = await parseCoreConfig({ configVersion: 1 });
 
     expect(cfg.surface.telegram.enabled).toBe(false);
-    expect(cfg.surface.telegram.tokenEnv).toBe("TELEGRAM_BOT_TOKEN");
+    expect(cfg.surface.telegram.token).toBeUndefined();
     expect(cfg.surface.telegram.allowedChatIds).toEqual([]);
   });
 
@@ -141,21 +152,7 @@ describe("core config surface.telegram", () => {
 });
 
 describe("telegram surface gating", () => {
-  const ENV_KEY = "TELEGRAM_BOT_TOKEN";
-  let previous: string | undefined;
-
-  beforeEach(() => {
-    previous = process.env[ENV_KEY];
-    delete process.env[ENV_KEY];
-  });
-
-  afterEach(() => {
-    if (previous === undefined) delete process.env[ENV_KEY];
-    else process.env[ENV_KEY] = previous;
-  });
-
   it("is unusable while disabled, even with a token present", async () => {
-    process.env[ENV_KEY] = "123:abc";
     const cfg = await parseCoreConfig({ configVersion: 2 });
 
     expect(isTelegramSurfaceUsable(cfg)).toBe(false);
@@ -173,36 +170,30 @@ describe("telegram surface gating", () => {
   });
 
   it("is usable once enabled and a token is present", async () => {
-    process.env[ENV_KEY] = "123:abc";
     const cfg = await parseCoreConfig({
       configVersion: 2,
-      surface: { telegram: { enabled: true } },
+      surface: { telegram: { enabled: true, token: "123:abc" } },
     });
 
     expect(isTelegramSurfaceUsable(cfg)).toBe(true);
   });
 
-  it("honours a custom tokenEnv", async () => {
-    process.env.MY_TELEGRAM_TOKEN = "123:abc";
-    try {
-      const cfg = await parseCoreConfig({
-        configVersion: 2,
-        surface: { telegram: { enabled: true, tokenEnv: "MY_TELEGRAM_TOKEN" } },
-      });
-
-      expect(isTelegramSurfaceUsable(cfg)).toBe(true);
-      expect(resolveTelegramToken(cfg)).toBe("123:abc");
-    } finally {
-      delete process.env.MY_TELEGRAM_TOKEN;
-    }
-  });
-
-  it("names the missing env var when resolving a token that is not set", async () => {
+  it("reads the token directly from core-config", async () => {
     const cfg = await parseCoreConfig({
       configVersion: 2,
-      surface: { telegram: { enabled: true, tokenEnv: "ABSENT_TELEGRAM_TOKEN" } },
+      surface: { telegram: { enabled: true, token: "123:abc" } },
     });
 
-    expect(() => resolveTelegramToken(cfg)).toThrow("ABSENT_TELEGRAM_TOKEN");
+    expect(isTelegramSurfaceUsable(cfg)).toBe(true);
+    expect(resolveTelegramToken(cfg)).toBe("123:abc");
+  });
+
+  it("names the config key when resolving a token that is not set", async () => {
+    const cfg = await parseCoreConfig({
+      configVersion: 2,
+      surface: { telegram: { enabled: true } },
+    });
+
+    expect(() => resolveTelegramToken(cfg)).toThrow("surface.telegram.token");
   });
 });

@@ -35,14 +35,12 @@ import { BOT_USER_ID, BOT_USERNAME, makeMessage, makeSupergroupChat } from "./te
  * router and got it silently skipped.
  */
 const CHAT = 1001;
-const TOKEN_ENV = "TELEGRAM_BOT_TOKEN";
 
 let server: FakeBotApiServer;
 let adapter: TelegramAdapter | null = null;
 let stopBridge: { stop(): Promise<void> } | null = null;
 let stopRouter: { stop(): Promise<void> } | null = null;
 let scratchDir = "";
-let previousToken: string | undefined;
 
 function createInMemoryRawBus(): RawBus {
   const topics = new Map<string, Array<Message<unknown>>>();
@@ -102,6 +100,7 @@ function testConfig(telegram: Record<string, unknown> = {}): CoreConfig {
       discord: { botName: "lilac" },
       telegram: {
         enabled: true,
+        token: "000000:fake-token",
         botName: "catalina",
         botUsername: BOT_USERNAME,
         allowedChatIds: [String(CHAT)],
@@ -216,8 +215,6 @@ function privateMessage(overrides: Partial<TelegramMessage> = {}): NonNullable<U
 }
 
 beforeEach(async () => {
-  previousToken = process.env[TOKEN_ENV];
-  process.env[TOKEN_ENV] = "000000:fake-token";
   scratchDir = await mkdtemp(path.join(tmpdir(), "lilac-telegram-e2e-"));
   server = new FakeBotApiServer(BOT_USER_ID, BOT_USERNAME);
 });
@@ -231,9 +228,6 @@ afterEach(async () => {
   adapter = null;
   await server.close();
   await rm(scratchDir, { recursive: true, force: true });
-
-  if (previousToken === undefined) delete process.env[TOKEN_ENV];
-  else process.env[TOKEN_ENV] = previousToken;
 });
 
 describe("a telegram message reaches the router as a telegram message", () => {

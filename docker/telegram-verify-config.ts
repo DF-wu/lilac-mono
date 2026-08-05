@@ -16,7 +16,7 @@
 const chatId = process.argv[2];
 const apiRoot = process.argv[3];
 if (!chatId) {
-  console.error("usage: telegram-verify-config.ts <chatId>");
+  console.error("usage: telegram-verify-config.ts <chatId> <apiRoot>");
   process.exit(2);
 }
 
@@ -39,6 +39,25 @@ const config = parsed;
 const surface = isRecord(config.surface) ? config.surface : {};
 const discord = isRecord(surface.discord) ? surface.discord : {};
 const telegram = isRecord(surface.telegram) ? surface.telegram : {};
+
+if (Object.hasOwn(telegram, "tokenEnv")) {
+  console.error(
+    "surface.telegram.tokenEnv was removed; copy the token to surface.telegram.token and remove tokenEnv",
+  );
+  process.exit(1);
+}
+
+if (telegram.enabled === true) {
+  console.error(
+    "the reference runtime already has Telegram enabled; stop it or use a reference config with a different bot token before starting verification",
+  );
+  process.exit(1);
+}
+
+if (typeof telegram.token !== "string" || telegram.token.trim().length === 0) {
+  console.error("set surface.telegram.token in the reference core-config before verification");
+  process.exit(1);
+}
 
 const derived = {
   ...config,

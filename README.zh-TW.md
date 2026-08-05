@@ -183,7 +183,7 @@ Core 必須有 `REDIS_URL`、`DISCORD_TOKEN` 與有效的 model 設定。Telegra
 | Surface | 最低設定 | 預設保護 | 詳細文件 |
 | --- | --- | --- | --- |
 | Discord | `DISCORD_TOKEN`；設定 `allowedChannelIds` 或 `allowedGuildIds` | 兩個 allowlist 都空時忽略所有 Discord traffic | [`core-config.example.yaml`](./packages/utils/config-templates/core-config.example.yaml) |
-| Telegram | `configVersion: 2`、`enabled: true`、`TELEGRAM_BOT_TOKEN`、`allowedChatIds` | 預設停用；空 chat allowlist 時忽略所有 chats | [`docs/telegram-surface.md`](./docs/telegram-surface.md) |
+| Telegram | `configVersion: 2`、`enabled: true`、`token`、`allowedChatIds` | 預設停用；空 chat allowlist 時忽略所有 chats | [`docs/telegram-surface.md`](./docs/telegram-surface.md) |
 | GitHub | GitHub App auth、`GITHUB_WEBHOOK_SECRET`、可被 GitHub 連到的 HTTPS/reverse proxy；user token 是可選的 preferred outbound identity | 沒有 GitHub App secret 時整個 surface 不啟動；signature 不符回傳 `401` | [`docs/github-reply-permalinks.md`](./docs/github-reply-permalinks.md) |
 
 GitHub webhook 預設監聽 port `8787`、path `/github/webhook`。Stock Compose 沒有轉送或公開 GitHub webhook 的環境與 port，因此 production deployment 必須自行補上 reverse proxy、environment 與 network wiring。
@@ -232,15 +232,15 @@ configVersion: 2
 surface:
   telegram:
     enabled: true
-    tokenEnv: TELEGRAM_BOT_TOKEN
+    token: replace-with-botfather-token
     allowedChatIds:
       - "1001"
 ```
 
-在 `.env` 設定 token，避免把 credential 留在 shell history：
+請妥善限制 `data/core-config.yaml` 的權限，因為 bot token 會直接儲存在其中：
 
-```dotenv
-TELEGRAM_BOT_TOKEN=replace-with-botfather-token
+```bash
+chmod 600 data/core-config.yaml
 ```
 
 ```bash
