@@ -12,8 +12,8 @@ Source: `plan/surface-runtime-descriptor-extraction.md`
 
 ## Stage 1: Lifecycle Characterization
 
-- [ ] Add registry and runtime lifecycle parity tests.
-- [ ] Characterize and fix request-router rollback after later subscription startup failures.
+- [x] Add registry and runtime lifecycle parity tests.
+- [x] Characterize and fix request-router rollback after later subscription startup failures.
 
 ## Stage 2: Generic Event Projection
 

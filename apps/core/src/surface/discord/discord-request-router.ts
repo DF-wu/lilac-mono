@@ -244,11 +244,42 @@ async function captureRouterDebounceFlush(input: {
   }
 }
 
-function adaptRouterSubscriptionStart(
-  result: ResultType<RouterDeliverySubscription, EventDeliveryStartFailed>,
-): RouterDeliverySubscription {
-  if (result.status === "error") throw result.error;
-  return result.value;
+async function rollbackRouterSubscriptionStartup(
+  startedSubscriptions: readonly RouterDeliverySubscription[],
+  logger: Logger,
+): Promise<void> {
+  for (const subscription of startedSubscriptions.toReversed()) {
+    const [stopped] = await Promise.allSettled([Promise.resolve().then(() => subscription.stop())]);
+    if (stopped.status === "rejected") {
+      logger.error("router subscription startup rollback rejected", {
+        panic: isPanic(stopped.reason),
+      });
+      continue;
+    }
+    if (stopped.value.status === "error") {
+      logger.error(
+        "router subscription startup rollback failed",
+        formatBridgeTaggedErrorForLog(stopped.value.error),
+      );
+    }
+  }
+}
+
+async function adaptRouterSubscriptionStart(
+  started: Promise<ResultType<RouterDeliverySubscription, EventDeliveryStartFailed>>,
+  startedSubscriptions: readonly RouterDeliverySubscription[],
+  logger: Logger,
+): Promise<RouterDeliverySubscription> {
+  const [settled] = await Promise.allSettled([started]);
+  if (settled.status === "rejected") {
+    await rollbackRouterSubscriptionStartup(startedSubscriptions, logger);
+    throw settled.reason;
+  }
+  if (settled.value.status === "error") {
+    await rollbackRouterSubscriptionStartup(startedSubscriptions, logger);
+    throw settled.value.error;
+  }
+  return settled.value.value;
 }
 
 function adaptRouterConfigResult(result: ReturnType<typeof withDefaultToolsConfig>): CoreConfig {
@@ -492,8 +523,9 @@ export async function startDiscordRequestRouter(
     }
   }
 
-  const lifecycleSub = adaptRouterSubscriptionStart(
-    await bus.subscribeTopic(
+  const startedSubscriptions: RouterDeliverySubscription[] = [];
+  const lifecycleSub = await adaptRouterSubscriptionStart(
+    bus.subscribeTopic(
       "evt.request",
       {
         mode: "fanout",
@@ -555,10 +587,13 @@ export async function startDiscordRequestRouter(
       },
       lifecycleDeliveryPolicy,
     ),
+    startedSubscriptions,
+    logger,
   );
+  startedSubscriptions.push(lifecycleSub);
 
-  const surfaceSub = adaptRouterSubscriptionStart(
-    await bus.subscribeTopic(
+  const surfaceSub = await adaptRouterSubscriptionStart(
+    bus.subscribeTopic(
       "evt.surface",
       {
         mode: "fanout",
@@ -612,10 +647,13 @@ export async function startDiscordRequestRouter(
       },
       surfaceDeliveryPolicy,
     ),
+    startedSubscriptions,
+    logger,
   );
+  startedSubscriptions.push(surfaceSub);
 
-  const adapterSub = adaptRouterSubscriptionStart(
-    await bus.subscribeTopic(
+  const adapterSub = await adaptRouterSubscriptionStart(
+    bus.subscribeTopic(
       "evt.adapter",
       {
         mode: "fanout",
@@ -968,6 +1006,8 @@ export async function startDiscordRequestRouter(
       },
       adapterDeliveryPolicy,
     ),
+    startedSubscriptions,
+    logger,
   );
 
   function clearDebounceBuffer(sessionId: string) {

@@ -42,10 +42,14 @@ import type { ModelMessage } from "ai";
 
 type TestRawBus = RawBus & {
   readonly deliveryActions: Array<{ readonly topic: string; readonly action: RawDeliveryAction }>;
+  readonly stoppedTopics: string[];
   activeSubscriptionCount(): number;
   failPublicationsTo(topic: string, cause: unknown): void;
   failStartsFor(topic: string, cause: unknown): void;
+  rejectStartsFor(topic: string, cause: unknown): void;
   failStopsFor(topic: string, cause: unknown): void;
+  rejectStopsFor(topic: string, cause: unknown): void;
+  throwStopsFor(topic: string, cause: unknown): void;
   finishDelivery(topic: string, error: EventDeliveryDoneError): void;
 };
 
@@ -77,9 +81,13 @@ async function subscribeTopicForTest<TTopic extends LilacTopic>(
 function createInMemoryRawBus(): TestRawBus {
   const topics = new Map<string, Array<Message<unknown>>>();
   const deliveryActions: TestRawBus["deliveryActions"] = [];
+  const stoppedTopics: string[] = [];
   const publicationFailures = new Map<string, unknown>();
   const startFailures = new Map<string, unknown>();
+  const startRejections = new Map<string, unknown>();
   const stopFailures = new Map<string, unknown>();
+  const stopRejections = new Map<string, unknown>();
+  const stopThrows = new Map<string, unknown>();
   const deliverySubs = new Set<{
     topic: string;
     opts: SubscriptionOptions;
@@ -103,6 +111,7 @@ function createInMemoryRawBus(): TestRawBus {
 
   return {
     deliveryActions,
+    stoppedTopics,
     activeSubscriptionCount: () => deliverySubs.size,
     failPublicationsTo: (topic, cause) => {
       publicationFailures.set(topic, cause);
@@ -110,8 +119,17 @@ function createInMemoryRawBus(): TestRawBus {
     failStartsFor: (topic, cause) => {
       startFailures.set(topic, cause);
     },
+    rejectStartsFor: (topic, cause) => {
+      startRejections.set(topic, cause);
+    },
     failStopsFor: (topic, cause) => {
       stopFailures.set(topic, cause);
+    },
+    rejectStopsFor: (topic, cause) => {
+      stopRejections.set(topic, cause);
+    },
+    throwStopsFor: (topic, cause) => {
+      stopThrows.set(topic, cause);
     },
     finishDelivery: (topic, error) => {
       for (const subscription of deliverySubs) {
@@ -145,6 +163,7 @@ function createInMemoryRawBus(): TestRawBus {
     },
 
     subscribe: async (topic, opts, handler) => {
+      if (startRejections.has(topic)) throw startRejections.get(topic);
       if (startFailures.has(topic)) {
         return Result.err(
           new EventDeliveryStartFailed({
@@ -166,19 +185,24 @@ function createInMemoryRawBus(): TestRawBus {
 
       return Result.ok({
         done: done.promise,
-        stop: async () => {
+        stop: () => {
+          stoppedTopics.push(topic);
           deliverySubs.delete(entry);
           done.resolve(Result.ok(undefined));
+          if (stopThrows.has(topic)) throw stopThrows.get(topic);
+          if (stopRejections.has(topic)) return Promise.reject(stopRejections.get(topic));
           if (stopFailures.has(topic)) {
-            return Result.err(
-              new EventDeliveryStopFailed({
-                topic,
-                cause: stopFailures.get(topic),
-                message: "forced stop failure",
-              }),
+            return Promise.resolve(
+              Result.err(
+                new EventDeliveryStopFailed({
+                  topic,
+                  cause: stopFailures.get(topic),
+                  message: "forced stop failure",
+                }),
+              ),
             );
           }
-          return Result.ok(undefined);
+          return Promise.resolve(Result.ok(undefined));
         },
       });
     },
@@ -550,6 +574,85 @@ describe("startBusRequestRouter", () => {
 
     raw.failStopsFor("evt.surface", new Error("cleanup failed"));
     await expect(router.stop()).rejects.toBeInstanceOf(EventDeliveryStopFailed);
+  });
+
+  it.each([
+    ["evt.surface", ["evt.request"]],
+    ["evt.adapter", ["evt.surface", "evt.request"]],
+  ] as const)(
+    "rolls back earlier subscriptions in reverse order when %s startup fails",
+    async (failedTopic, expectedStops) => {
+      const raw = createInMemoryRawBus();
+      raw.failStartsFor(failedTopic, new Error("later subscription start failed"));
+
+      await expect(
+        startBusRequestRouter({
+          adapter: new FakeAdapter({}),
+          bus: createLilacBus(raw),
+          subscriptionId: `router-partial-start-${failedTopic}`,
+          config: parseCoreConfigV1ToUniversal({}),
+        }),
+      ).rejects.toBeInstanceOf(EventDeliveryStartFailed);
+
+      expect(raw.stoppedTopics).toEqual([...expectedStops]);
+      expect(raw.activeSubscriptionCount()).toBe(0);
+    },
+  );
+
+  it("preserves a subscription startup Panic while rolling back earlier subscriptions", async () => {
+    const raw = createInMemoryRawBus();
+    const panic = new Panic({ message: "router subscription startup invariant failed" });
+    const logger = new Logger({ module: "router-startup-panic-rollback-test" });
+    const errorLog = spyOn(logger, "error").mockImplementation(() => {});
+    raw.rejectStartsFor("evt.adapter", panic);
+    raw.throwStopsFor("evt.surface", new Error("surface cleanup threw"));
+    raw.failStopsFor("evt.request", new Error("lifecycle cleanup failed"));
+
+    try {
+      await expect(
+        startBusRequestRouter({
+          adapter: new FakeAdapter({}),
+          bus: createLilacBus(raw),
+          subscriptionId: "router-start-panic",
+          config: parseCoreConfigV1ToUniversal({}),
+          logger,
+        }),
+      ).rejects.toBe(panic);
+
+      expect(raw.stoppedTopics).toEqual(["evt.surface", "evt.request"]);
+      expect(raw.activeSubscriptionCount()).toBe(0);
+      expect(errorLog).toHaveBeenCalledTimes(2);
+    } finally {
+      errorLog.mockRestore();
+    }
+  });
+
+  it("continues rollback across rejected and failed cleanup without replacing startup rejection", async () => {
+    const raw = createInMemoryRawBus();
+    const startupFailure = new Error("router subscription startup rejected");
+    const logger = new Logger({ module: "router-startup-rollback-test" });
+    const errorLog = spyOn(logger, "error").mockImplementation(() => {});
+    raw.rejectStartsFor("evt.adapter", startupFailure);
+    raw.rejectStopsFor("evt.surface", new Error("surface cleanup rejected"));
+    raw.failStopsFor("evt.request", new Error("lifecycle cleanup failed"));
+
+    try {
+      await expect(
+        startBusRequestRouter({
+          adapter: new FakeAdapter({}),
+          bus: createLilacBus(raw),
+          subscriptionId: "router-startup-cleanup-failures",
+          config: parseCoreConfigV1ToUniversal({}),
+          logger,
+        }),
+      ).rejects.toBe(startupFailure);
+
+      expect(raw.stoppedTopics).toEqual(["evt.surface", "evt.request"]);
+      expect(raw.activeSubscriptionCount()).toBe(0);
+      expect(errorLog).toHaveBeenCalledTimes(2);
+    } finally {
+      errorLog.mockRestore();
+    }
   });
 
   it("includes reply-thread root when mention is part of a mergeable reply burst (active channel)", async () => {
