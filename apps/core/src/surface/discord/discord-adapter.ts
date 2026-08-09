@@ -24,13 +24,6 @@ import {
 } from "discord.js";
 import { z } from "zod";
 import { Panic, Result, TaggedError, type Result as ResultType } from "better-result";
-import type {
-  EvtAdapterMessageCreatedData,
-  EvtAdapterMessageDeletedData,
-  EvtAdapterMessageUpdatedData,
-  EvtAdapterReactionAddedData,
-  EvtAdapterReactionRemovedData,
-} from "@stanley2058/lilac-event-bus";
 import type { CoreConfig, CustomCommandArgDef } from "@stanley2058/lilac-utils";
 import {
   CUSTOM_COMMAND_PROMPT_ARG_KEY,
@@ -3443,103 +3436,4 @@ export class DiscordAdapter implements SurfaceAdapter {
       raw: { discord: { reaction } },
     });
   }
-}
-
-// --- Bus mapping helpers (used by bridge) ---
-
-export function toBusEvtAdapterMessageCreated(evt: {
-  message: SurfaceMessage;
-  channelName?: string;
-}): EvtAdapterMessageCreatedData {
-  return {
-    platform: "discord",
-    channelId: evt.message.session.channelId,
-    channelName: evt.channelName,
-    messageId: evt.message.ref.messageId,
-    userId: evt.message.userId,
-    userName: evt.message.userName,
-    text: evt.message.text,
-    ts: evt.message.ts,
-    raw: evt.message.raw,
-  };
-}
-
-export function toBusEvtAdapterMessageUpdated(evt: {
-  message: SurfaceMessage;
-  channelName?: string;
-}): EvtAdapterMessageUpdatedData {
-  return {
-    platform: "discord",
-    channelId: evt.message.session.channelId,
-    channelName: evt.channelName,
-    messageId: evt.message.ref.messageId,
-    userId: evt.message.userId,
-    userName: evt.message.userName,
-    text: evt.message.text,
-    ts: evt.message.ts,
-    raw: evt.message.raw,
-  };
-}
-
-export function toBusEvtAdapterMessageDeleted(evt: {
-  messageRef: MsgRef;
-  session: SessionRef;
-  channelName?: string;
-  ts: number;
-  raw?: unknown;
-}): EvtAdapterMessageDeletedData {
-  return {
-    platform: "discord",
-    channelId: evt.session.channelId,
-    channelName: evt.channelName,
-    messageId: evt.messageRef.messageId,
-    ts: evt.ts,
-    raw: evt.raw,
-  };
-}
-
-export function toBusEvtAdapterReactionAdded(evt: {
-  messageRef: MsgRef;
-  session: SessionRef;
-  channelName?: string;
-  reaction: string;
-  userId?: string;
-  userName?: string;
-  ts: number;
-  raw?: unknown;
-}): EvtAdapterReactionAddedData {
-  return {
-    platform: "discord",
-    channelId: evt.session.channelId,
-    channelName: evt.channelName,
-    messageId: evt.messageRef.messageId,
-    reaction: evt.reaction,
-    userId: evt.userId,
-    userName: evt.userName,
-    ts: evt.ts,
-    raw: evt.raw,
-  };
-}
-
-export function toBusEvtAdapterReactionRemoved(evt: {
-  messageRef: MsgRef;
-  session: SessionRef;
-  channelName?: string;
-  reaction: string;
-  userId?: string;
-  userName?: string;
-  ts: number;
-  raw?: unknown;
-}): EvtAdapterReactionRemovedData {
-  return {
-    platform: "discord",
-    channelId: evt.session.channelId,
-    channelName: evt.channelName,
-    messageId: evt.messageRef.messageId,
-    reaction: evt.reaction,
-    userId: evt.userId,
-    userName: evt.userName,
-    ts: evt.ts,
-    raw: evt.raw,
-  };
 }

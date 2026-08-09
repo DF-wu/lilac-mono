@@ -351,6 +351,13 @@ describe("bridgeAdapterToBus cancel mapping", () => {
       lilacEventTypes.EvtAdapterReactionAdded,
       lilacEventTypes.EvtAdapterReactionRemoved,
     ]);
+    expect(published.map((message) => message.headers)).toEqual([
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+    ]);
 
     const created = published[0]!;
     expect(created.data).toMatchObject({
@@ -534,6 +541,11 @@ describe("bridgeAdapterToBus cancel mapping", () => {
     expect(published.length).toBe(1);
     const msg = published[0]!;
     expect(msg.type).toBe(lilacEventTypes.CmdRequestMessage);
+    expect(msg.headers).toEqual({
+      request_id: "discord:chan:slash:i1",
+      session_id: "chan",
+      request_client: "discord",
+    });
     expect(msg.data).toEqual({
       queue: "prompt",
       messages: [

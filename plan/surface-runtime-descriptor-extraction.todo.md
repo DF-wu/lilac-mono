@@ -17,7 +17,7 @@ Source: `plan/surface-runtime-descriptor-extraction.md`
 
 ## Stage 2: Generic Event Projection
 
-- [ ] Extract generic adapter-event projections and add compatibility/consistency tests.
+- [x] Extract generic adapter-event projections and add compatibility/consistency tests.
 
 ## Stage 3: Descriptor Types And Existing Registrations
 

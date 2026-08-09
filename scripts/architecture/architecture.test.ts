@@ -3561,6 +3561,45 @@ describe("real declaration integration", () => {
     expect(runtime.ruleZones["architecture/fallible-api-result"]).toEqual([{ include: "**" }]);
   });
 
+  test("registers surface event projections and platform mismatch Panic provenance", () => {
+    const core = architectureManifest.workspaces.find(
+      (workspace) => workspace.root === "apps/core",
+    );
+    if (!core) throw new Error("core workspace missing");
+    const platformMismatchIdentity = {
+      module: "src/surface/bridge/adapter-event-projection.ts",
+      exportName: "signalAdapterEventPlatformMismatch",
+    } as const;
+    const platformMismatchReason =
+      "Signals a hard invariant when a normalized adapter event contains mixed platforms.";
+
+    expect(core.exceptionAdapters).toContainEqual({
+      identity: platformMismatchIdentity,
+      category: "defect-supervisor",
+      externalApi: { package: "better-result", exportName: "Panic" },
+      direction: "signal-host",
+      reason: platformMismatchReason,
+    });
+    expect(architectureManifest.approvedExceptionAdapters).toContainEqual({
+      workspace: "apps/core",
+      callable: platformMismatchIdentity,
+      category: "defect-supervisor",
+      externalApi: { package: "better-result", exportName: "Panic" },
+      mode: "signal-host",
+      syntaxKinds: ["throw-statement", "host-rejection-call", "registered-host-signal-call"],
+      relationship: "host-contract",
+      provenance: "workspace-reviewed-manifest",
+      reason: platformMismatchReason,
+    });
+    expect(core.boundaryDecoders).toContainEqual({
+      identity: {
+        module: "src/surface/discord/discord-command-projection.ts",
+        exportName: "toBusDiscordCommandInvokedData",
+      },
+      category: "projection",
+    });
+  });
+
   test("resolves Bun-realpathed cross-workspace declarations to package identities", () => {
     const core = architectureManifest.workspaces.find(
       (workspace) => workspace.root === "apps/core",

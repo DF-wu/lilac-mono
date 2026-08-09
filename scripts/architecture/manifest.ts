@@ -877,6 +877,19 @@ const CORE_FATAL_SIGNAL_ADAPTERS = CORE_FATAL_SIGNAL_IDENTITIES.map(
   }),
 );
 
+const CORE_ADAPTER_EVENT_EXCEPTION_ADAPTERS = [
+  {
+    identity: {
+      module: "src/surface/bridge/adapter-event-projection.ts",
+      exportName: "signalAdapterEventPlatformMismatch",
+    },
+    category: "defect-supervisor",
+    externalApi: { package: "better-result", exportName: "Panic" },
+    direction: "signal-host",
+    reason: "Signals a hard invariant when a normalized adapter event contains mixed platforms.",
+  },
+] as const satisfies readonly ExceptionAdapter[];
+
 const CORE_TOOL_SERVER_BOUNDARY_DECODERS = [
   ...[
     "isCurrentSessionScopedSurfaceCall",
@@ -8020,6 +8033,7 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
       ...(root === "apps/core" ? CORE_PARTITION_8_EXCEPTION_ADAPTERS : []),
       ...(root === "apps/core" ? CORE_REVIEWED_PANIC_ADAPTERS : []),
       ...(root === "apps/core" ? CORE_FATAL_SIGNAL_ADAPTERS : []),
+      ...(root === "apps/core" ? CORE_ADAPTER_EVENT_EXCEPTION_ADAPTERS : []),
       ...(root === "packages/plugin-runtime"
         ? ([
             ...[
@@ -8607,7 +8621,7 @@ function approvedExceptionAdapterCatalogSha256(
 }
 
 export const APPROVED_EXCEPTION_ADAPTER_CATALOG_SHA256 =
-  "2684c364ca341bd0ffd55f32b2b0b0f603a48958a75719c83302098ecbc2280d";
+  "5504dcb6936d5d11f8a6f23dd47f34fc2069097c1ffe4ddb98dec19dfe286627";
 
 export const architectureManifest = {
   version: 1,

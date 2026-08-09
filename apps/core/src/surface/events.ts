@@ -63,8 +63,9 @@ export type AdapterRequestCancelEvent = AdapterEventBase & {
   messageId?: string;
 };
 
-export type AdapterCommandInvokedEvent = AdapterEventBase & {
+export type AdapterCommandInvokedEvent = Omit<AdapterEventBase, "platform"> & {
   type: "adapter.command.invoked";
+  platform: "discord";
   requestId: string;
   sessionId: string;
   commandName: string;
