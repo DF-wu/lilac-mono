@@ -49,6 +49,10 @@ import {
 import { bridgeAdapterToBus } from "../surface/bridge/publish-to-bus";
 import { bridgeBusToAdapter } from "../surface/bridge/subscribe-from-bus";
 import {
+  createDescriptorBoundSurfaceAdapter,
+  createDescriptorBoundSurfaceEventSource,
+} from "../surface/produced-ref-guard";
+import {
   adaptDiscordRequestRouterStartOutcomeToHost,
   startDiscordRequestRouter,
   type DiscordRequestRouter,
@@ -1114,6 +1118,9 @@ export async function createCoreRuntime(
 
   const adapter = new DiscordAdapter({ customCommands, reportFatalPanic: reportFatalError });
   const githubAdapter = new GithubAdapter();
+  const surfaceAdapter = createDescriptorBoundSurfaceAdapter("discord", adapter);
+  const githubSurfaceAdapter = createDescriptorBoundSurfaceAdapter("github", githubAdapter);
+  const discordEventSource = createDescriptorBoundSurfaceEventSource("discord", adapter);
   const durableWorkflowStore = new DurableWorkflowStore();
 
   let transcriptStore: SqliteTranscriptStore | null = null;
@@ -1189,15 +1196,16 @@ export async function createCoreRuntime(
   }
   const mcpRegistry = mcpRegistryCreated.value;
   function composeSurfaceRuntimeRegistry(appCredentialsAvailable: boolean) {
-    const discordRelayPolicy = createDiscordRelayPolicy(adapter);
+    const discordRelayPolicy = createDiscordRelayPolicy(surfaceAdapter);
     const githubRelayPolicy = createGithubRelayPolicy();
     return SurfaceRuntimeRegistry.create([
       createDiscordSurfaceRuntimeDescriptor({
-        adapter,
+        adapter: surfaceAdapter,
         adapterIngress: {
           start: async () => {
             const handle = await bridgeAdapterToBus({
-              eventSource: adapter,
+              eventSource: discordEventSource,
+              platform: "discord",
               bus,
               subscriptionId: subId(subscriptionPrefix, "adapter-to-bus"),
               transcriptStore: transcriptStore ?? undefined,
@@ -1214,7 +1222,7 @@ export async function createCoreRuntime(
             platform: "discord",
             start: async () => {
               const relay = await bridgeBusToAdapter({
-                adapter,
+                adapter: surfaceAdapter,
                 bus,
                 platform: "discord",
                 policy: discordRelayPolicy,
@@ -1230,7 +1238,7 @@ export async function createCoreRuntime(
         },
       }),
       createConfiguredGithubSurfaceRuntimeDescriptor({
-        adapter: githubAdapter,
+        adapter: githubSurfaceAdapter,
         webhookSecret: env.github.webhookSecret,
         appCredentialsAvailable,
         logger,
@@ -1249,7 +1257,7 @@ export async function createCoreRuntime(
             platform: "github",
             start: async () => {
               const relay = await bridgeBusToAdapter({
-                adapter: githubAdapter,
+                adapter: githubSurfaceAdapter,
                 bus,
                 platform: "github",
                 policy: githubRelayPolicy,
@@ -1699,7 +1707,7 @@ export async function createCoreRuntime(
           surfaceDbPath: discordSurfaceDbPath,
         });
         discordSearchService = new DiscordSearchService({
-          adapter,
+          adapter: surfaceAdapter,
           store: discordSearchStore,
           onMessagesIndexed(channelId) {
             conversationThreadMaterializer?.markDirty({ channelId, kind: "topology" });
@@ -1798,7 +1806,7 @@ export async function createCoreRuntime(
         });
 
         stopDiscordSearchIndexer = await startDiscordSearchIndexer({
-          eventSource: adapter,
+          eventSource: discordEventSource,
           search: discordSearchService,
           getConfig: () => getCoreConfig(),
           materializer: conversationThreadMaterializer,
@@ -1915,7 +1923,7 @@ export async function createCoreRuntime(
 
         stopRouter = adaptDiscordRequestRouterStartOutcomeToHost(
           await startDiscordRequestRouter({
-            adapter,
+            adapter: surfaceAdapter,
             bus,
             subscriptionId: subId(subscriptionPrefix, "router"),
             customCommands,
@@ -1989,7 +1997,8 @@ export async function createCoreRuntime(
         pluginManager = createCoreToolPluginManager({
           runtime: {
             bus,
-            adapter,
+            adapter: surfaceAdapter,
+            githubAdapter: githubSurfaceAdapter,
             getConfig: () => getCoreConfig(),
             discovery: discoveryService ?? undefined,
             conversationThreads: conversationThreadToolService,

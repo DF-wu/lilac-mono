@@ -1,9 +1,13 @@
 import type { SurfaceMsgRef } from "@stanley2058/lilac-event-bus";
-import { Panic, Result, TaggedError, type Result as ResultType } from "better-result";
+import { Result, TaggedError, type Result as ResultType } from "better-result";
 
 import type { SurfaceAdapter } from "./adapter";
 import type { ContentOpts, MsgRefFor, RegisteredSurfacePlatform, SessionRefFor } from "./types";
 import type { BusToAdapterRelaySnapshot } from "./bridge/subscribe-from-bus";
+import {
+  createDescriptorBoundSurfaceAdapter,
+  createDescriptorBoundWorkflowProgressPort,
+} from "./produced-ref-guard";
 
 export type { MsgRefFor, RegisteredSurfacePlatform, SessionRefFor } from "./types";
 
@@ -180,13 +184,41 @@ export class SurfaceRuntimeRegistrationDuplicate extends TaggedError(
   readonly message: string;
 }> {}
 
-export function signalSurfaceRuntimeAdapterPlatformMismatch(input: {
-  readonly descriptorPlatform: RegisteredSurfacePlatform;
-  readonly adapterPlatform: string;
-}): never {
-  throw new Panic({
-    message: `Surface adapter platform mismatch: descriptor=${input.descriptorPlatform}, adapter=${input.adapterPlatform}`,
-  });
+function guardRuntimeDescriptor(
+  descriptor: RegisteredSurfaceRuntimeDescriptor,
+): RegisteredSurfaceRuntimeDescriptor {
+  switch (descriptor.platform) {
+    case "discord": {
+      const adapter = createDescriptorBoundSurfaceAdapter("discord", descriptor.adapter);
+      return {
+        ...descriptor,
+        adapter,
+        ...(descriptor.workflowProgress
+          ? {
+              workflowProgress: createDescriptorBoundWorkflowProgressPort(
+                "discord",
+                descriptor.workflowProgress,
+              ),
+            }
+          : {}),
+      };
+    }
+    case "github": {
+      const adapter = createDescriptorBoundSurfaceAdapter("github", descriptor.adapter);
+      return {
+        ...descriptor,
+        adapter,
+        ...(descriptor.workflowProgress
+          ? {
+              workflowProgress: createDescriptorBoundWorkflowProgressPort(
+                "github",
+                descriptor.workflowProgress,
+              ),
+            }
+          : {}),
+      };
+    }
+  }
 }
 
 export class SurfaceRuntimeRegistry {
@@ -211,7 +243,7 @@ export class SurfaceRuntimeRegistry {
       }
       platforms.add(descriptor.platform);
     }
-    return Result.ok(new SurfaceRuntimeRegistry([...descriptors]));
+    return Result.ok(new SurfaceRuntimeRegistry(descriptors.map(guardRuntimeDescriptor)));
   }
 
   entries(): readonly RegisteredSurfaceRuntimeDescriptor[] {
@@ -220,13 +252,7 @@ export class SurfaceRuntimeRegistry {
 
   async validateAdapterPlatforms(): Promise<void> {
     for (const descriptor of this.#descriptors) {
-      const self = await descriptor.adapter.getSelf();
-      if (self.platform !== descriptor.platform) {
-        signalSurfaceRuntimeAdapterPlatformMismatch({
-          descriptorPlatform: descriptor.platform,
-          adapterPlatform: self.platform,
-        });
-      }
+      await descriptor.adapter.getSelf();
     }
   }
 }

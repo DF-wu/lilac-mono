@@ -679,6 +679,84 @@ describe("surface runtime lifecycle", () => {
     ]);
   });
 
+  it("rejects a faulty relay snapshot before it can be persisted", async () => {
+    const calls: string[] = [];
+    const registry = createRegistry({ calls });
+    const handles = maps();
+    const invalid = {
+      ...relaySnapshot("discord", "discord-request"),
+      createdOutputRefs: [
+        { platform: "discord" as const, channelId: "other", messageId: "invalid" },
+      ],
+    };
+    handles.relays.set("discord", {
+      ...emptyRelayHandle("discord"),
+      snapshotRelays: () => [invalid],
+    });
+    let persisted = false;
+
+    const collected = stopIngressAndDrainSurfaceRecovery({
+      registry,
+      stopAdapterIngress: async () => undefined,
+      stopRouterIngress: async () => undefined,
+      stopWorkflowRequestProducers: async () => undefined,
+      stopRequestIngress: async () => undefined,
+      stopRemainingRequestProducers: async () => undefined,
+      deadlineMs: 3_000,
+      runCleanup: async (_label, cleanup) => cleanup?.(),
+      agentRunner: {
+        beginDrain: async () => undefined,
+        snapshotRecoverables: () => [],
+        restoreRecoverables: () => undefined,
+      },
+      relays: handles.relays,
+    }).then(() => {
+      persisted = true;
+    });
+
+    const [settled] = await Promise.allSettled([collected]);
+    expect(settled?.status).toBe("rejected");
+    if (settled?.status !== "rejected") return;
+    expect(Panic.is(settled.reason)).toBe(true);
+    expect(persisted).toBe(false);
+  });
+
+  it("rejects faulty direct restore refs before relay or agent restoration", async () => {
+    const calls: string[] = [];
+    const registry = createRegistry({ calls });
+    const handles = maps();
+    handles.relays.set("discord", {
+      ...emptyRelayHandle("discord"),
+      restoreRelays: async () => {
+        calls.push("relay-restored");
+      },
+    });
+    const invalid = {
+      ...relaySnapshot("discord", "discord-request"),
+      activeOutputRefs: [
+        { platform: "github" as const, channelId: "session", messageId: "invalid" },
+      ],
+    };
+
+    const restored = restoreSurfaceRecovery({
+      registry,
+      snapshot: { agent: [agentEntry], relays: [invalid] },
+      relays: handles.relays,
+      agentRunner: {
+        restoreRecoverables: () => {
+          calls.push("agent-restored");
+        },
+      },
+    });
+
+    const [settled] = await Promise.allSettled([restored]);
+    expect(settled?.status).toBe("rejected");
+    if (settled?.status !== "rejected") return;
+    expect(Panic.is(settled.reason)).toBe(true);
+    expect(calls).not.toContain("relay-restored");
+    expect(calls).not.toContain("agent-restored");
+  });
+
   it("stops surface resources and disconnects adapters in reverse ownership order", async () => {
     const calls: string[] = [];
     const registry = createRegistry({ calls });

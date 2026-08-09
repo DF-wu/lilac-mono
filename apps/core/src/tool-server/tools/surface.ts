@@ -13,6 +13,7 @@ import { Result, TaggedError, type Result as ResultType } from "better-result";
 import { isAdapterPlatform } from "../../shared/is-adapter-platform";
 import {
   hasCacheBurstProvider,
+  hasSurfaceGuildIdResolver,
   type SurfaceAdapter,
   type SurfaceOperationError,
 } from "../../surface/adapter";
@@ -46,8 +47,6 @@ import {
 } from "../../surface/discord/discord-raw-normalizer";
 
 import { isGithubIssueTriggerId, parseGithubRequestId } from "../../github/github-ids";
-import { GithubAdapter, type GithubAdapterApi } from "../../surface/github/github-adapter";
-
 class SurfaceToolFailure extends TaggedError("SurfaceToolFailure")<{
   readonly message: string;
 }> {}
@@ -266,16 +265,6 @@ export async function loadLocalAttachments(params: {
   return out;
 }
 
-type GuildIdResolver = {
-  fetchGuildIdForChannel(channelId: string): Promise<string | null>;
-};
-
-function hasGuildIdResolver(adapter: SurfaceAdapter): adapter is SurfaceAdapter & GuildIdResolver {
-  return (
-    "fetchGuildIdForChannel" in adapter && typeof adapter.fetchGuildIdForChannel === "function"
-  );
-}
-
 async function tryGetCachedSession(
   adapter: SurfaceAdapter,
   channelId: string,
@@ -298,12 +287,8 @@ async function resolveGuildIdForChannel(params: {
     return sess.ref.guildId ?? null;
   }
 
-  if (hasGuildIdResolver(params.adapter)) {
-    try {
-      return await params.adapter.fetchGuildIdForChannel(params.channelId);
-    } catch {
-      return null;
-    }
+  if (hasSurfaceGuildIdResolver(params.adapter)) {
+    return await params.adapter.fetchGuildIdForChannel(params.channelId);
   }
 
   return null;
@@ -1174,8 +1159,6 @@ const reactionsRemoveInputSchema = baseInputSchema.extend({
   reaction: z.string().min(1).describe("Reaction emoji (e.g. 👍, ✅, :custom_emoji:)"),
 });
 
-export type GithubSurfaceApi = GithubAdapterApi;
-
 export class Surface implements ServerTool {
   id = "surface";
   private readonly tool: ServerTool;
@@ -1184,15 +1167,14 @@ export class Surface implements ServerTool {
   constructor(
     private readonly params: {
       adapter: SurfaceAdapter;
-      githubAdapter?: SurfaceAdapter;
-      githubApi?: GithubSurfaceApi;
+      githubAdapter: SurfaceAdapter;
       config?: CoreConfig;
       getConfig?: () => Promise<CoreConfig>;
       discordSearch?: DiscordSearchService;
       transcriptStore?: TranscriptStore;
     },
   ) {
-    this.github = params.githubAdapter ?? new GithubAdapter({ api: params.githubApi });
+    this.github = params.githubAdapter;
     this.tool = defineServerTool({
       id: this.id,
       callables: ({ callable }) => ({

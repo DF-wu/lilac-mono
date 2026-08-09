@@ -3308,6 +3308,7 @@ describe("startBusAgentRunner Core-primary Claude production path", () => {
     const outputUpdatedSub = outputUpdatedSubResult.value;
     const adapterIngress = await bridgeAdapterToBus({
       eventSource: adapter,
+      platform: "discord",
       bus,
       subscriptionId: "production-primary-auto-inject-ingress",
       transcriptStore: store,

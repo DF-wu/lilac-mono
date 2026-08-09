@@ -1,8 +1,12 @@
 import { describe, expect, it } from "bun:test";
-import { Result } from "better-result";
+import { Panic, Result } from "better-result";
 import { parseCoreConfigV1ToUniversal, type CoreConfig } from "@stanley2058/lilac-utils";
-import { Surface } from "../src/tool-server/tools/surface";
-import type { GithubSurfaceApi } from "../src/tool-server/tools/surface";
+import { Surface as ProductionSurface } from "../src/tool-server/tools/surface";
+import {
+  GithubAdapter,
+  type GithubAdapterApi as GithubSurfaceApi,
+} from "../src/surface/github/github-adapter";
+import { createDescriptorBoundSurfaceAdapter } from "../src/surface/produced-ref-guard";
 import { GITHUB_AGENT_COMMENT_MARKER } from "../src/github/github-comment-marker";
 import {
   DiscordSearchService,
@@ -29,6 +33,31 @@ import { SurfaceAdapterTestBase } from "./helpers/surface-adapter-test-base";
 function testConfig(input: unknown): CoreConfig {
   const cfg = parseCoreConfigV1ToUniversal(input);
   return { ...cfg, agent: { ...cfg.agent, systemPrompt: "(test)" } };
+}
+
+function createGithubTestAdapter(api: GithubSurfaceApi) {
+  return createDescriptorBoundSurfaceAdapter("github", new GithubAdapter({ api }));
+}
+
+const DEFAULT_GITHUB_TEST_ADAPTER = createDescriptorBoundSurfaceAdapter(
+  "github",
+  new GithubAdapter(),
+);
+
+type TestSurfaceParams = Omit<
+  ConstructorParameters<typeof ProductionSurface>[0],
+  "githubAdapter"
+> & {
+  readonly githubAdapter?: ConstructorParameters<typeof ProductionSurface>[0]["githubAdapter"];
+};
+
+class Surface extends ProductionSurface {
+  constructor(params: TestSurfaceParams) {
+    super({
+      ...params,
+      githubAdapter: params.githubAdapter ?? DEFAULT_GITHUB_TEST_ADAPTER,
+    });
+  }
 }
 
 class FakeAdapter extends SurfaceAdapterTestBase {
@@ -2189,6 +2218,36 @@ describe("tool-server surface", () => {
     }
   });
 
+  it("preserves Panic from guild resolution instead of degrading it to a cache miss", async () => {
+    const cfg = testConfig({
+      surface: {
+        discord: {
+          tokenEnv: "DISCORD_TOKEN",
+          allowedChannelIds: [],
+          allowedGuildIds: ["g1"],
+          botName: "lilac",
+        },
+      },
+      entity: { sessions: { discord: { ops: "c1" } } },
+    });
+    const panic = new Panic({ message: "guild resolver invariant" });
+    const rawAdapter = new FakeAdapter([], {});
+    rawAdapter.fetchGuildIdForChannel = async () => {
+      throw panic;
+    };
+    const adapter = createDescriptorBoundSurfaceAdapter("discord", rawAdapter);
+    const tool = new Surface({ adapter, config: cfg });
+
+    await expect(
+      tool.call("surface.messages.send", {
+        sessionId: "ops",
+        text: "hi",
+        client: "discord",
+      }),
+    ).rejects.toBe(panic);
+    expect(rawAdapter.sendCalls).toEqual([]);
+  });
+
   it("adds reaction", async () => {
     const cfg = testConfig({
       surface: {
@@ -2300,7 +2359,11 @@ describe("tool-server surface", () => {
     };
 
     const adapter = new FakeAdapter([], {});
-    const tool = new Surface({ adapter, config: cfg, githubApi });
+    const tool = new Surface({
+      adapter,
+      config: cfg,
+      githubAdapter: createGithubTestAdapter(githubApi),
+    });
 
     const res = (await tool.call("surface.messages.send", {
       client: "github",
@@ -2362,7 +2425,11 @@ describe("tool-server surface", () => {
     };
 
     const adapter = new FakeAdapter([], {});
-    const tool = new Surface({ adapter, config: cfg, githubApi });
+    const tool = new Surface({
+      adapter,
+      config: cfg,
+      githubAdapter: createGithubTestAdapter(githubApi),
+    });
     const ctx: RequestContext = {
       requestId: "github:octo/repo#12:345",
       requestClient: "github",
@@ -2416,7 +2483,11 @@ describe("tool-server surface", () => {
     };
 
     const adapter = new FakeAdapter([], {});
-    const tool = new Surface({ adapter, config: cfg, githubApi });
+    const tool = new Surface({
+      adapter,
+      config: cfg,
+      githubAdapter: createGithubTestAdapter(githubApi),
+    });
     const ctx: RequestContext = {
       requestId: "github:octo/repo#12:12:deadbeef",
       requestClient: "github",
@@ -2468,7 +2539,11 @@ describe("tool-server surface", () => {
     };
 
     const adapter = new FakeAdapter([], {});
-    const tool = new Surface({ adapter, config: cfg, githubApi });
+    const tool = new Surface({
+      adapter,
+      config: cfg,
+      githubAdapter: createGithubTestAdapter(githubApi),
+    });
 
     const res = await tool.call("surface.reactions.add", {
       client: "github",
@@ -2525,7 +2600,11 @@ describe("tool-server surface", () => {
     };
 
     const adapter = new FakeAdapter([], {});
-    const tool = new Surface({ adapter, config: cfg, githubApi });
+    const tool = new Surface({
+      adapter,
+      config: cfg,
+      githubAdapter: createGithubTestAdapter(githubApi),
+    });
 
     const res = await tool.call("surface.reactions.remove", {
       client: "github",
@@ -2577,7 +2656,11 @@ describe("tool-server surface", () => {
     };
 
     const adapter = new FakeAdapter([], {});
-    const tool = new Surface({ adapter, config: cfg, githubApi });
+    const tool = new Surface({
+      adapter,
+      config: cfg,
+      githubAdapter: createGithubTestAdapter(githubApi),
+    });
 
     const res = await tool.call("surface.reactions.remove", {
       client: "github",
@@ -2630,7 +2713,11 @@ describe("tool-server surface", () => {
     };
 
     const adapter = new FakeAdapter([], {});
-    const tool = new Surface({ adapter, config: cfg, githubApi });
+    const tool = new Surface({
+      adapter,
+      config: cfg,
+      githubAdapter: createGithubTestAdapter(githubApi),
+    });
 
     await expect(
       tool.call("surface.reactions.remove", {

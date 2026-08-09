@@ -579,13 +579,18 @@ fixtures remain compatible.
 - Add the mapped internal authenticated-origin union.
 - Preserve and decode current Discord/GitHub raw wire forms.
 - Dead-letter malformed and conflicting actor/origin/header identities.
+- Correlate active-relay events and terminal lifecycle cache entries by exact
+  `(requestId, platform, sessionId)`, including terminal-before-relay ordering; cancellation,
+  reanchor, lifecycle, and typing-stop mismatches dead-letter before any relay or cache mutation.
 - Compare cache origins with request-control capabilities before assigning principals.
 - Propagate the validated identity through tool, Level 1, plugin, workflow, and subagent contexts.
 - Implement the explicit operator, capability, GitHub ingress, Discord config, and restricted-default safety
   precedence.
 
 Exit criteria: every principal-bearing context preserves one Discord/GitHub platform, user, and session
-identity; legacy successful fixtures still project correctly.
+identity; active-relay events and terminal lifecycle cache entries preserve exact request, platform, and
+session correlation even when terminal lifecycle arrives before relay creation; legacy successful fixtures
+still project correctly.
 
 ### Stage 6: Workflow Port And Durable Correlation
 

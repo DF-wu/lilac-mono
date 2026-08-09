@@ -278,8 +278,20 @@ export interface SurfaceCacheBurstProvider {
   burstCache(input: SurfaceBurstCacheInput): Promise<void>;
 }
 
+export interface SurfaceGuildIdResolver {
+  fetchGuildIdForChannel(channelId: string): Promise<string | null>;
+}
+
 export function hasCacheBurstProvider(
   adapter: SurfaceAdapter,
 ): adapter is SurfaceAdapter & SurfaceCacheBurstProvider {
   return "burstCache" in adapter && typeof adapter.burstCache === "function";
+}
+
+export function hasSurfaceGuildIdResolver(
+  adapter: SurfaceAdapter,
+): adapter is SurfaceAdapter & SurfaceGuildIdResolver {
+  return (
+    "fetchGuildIdForChannel" in adapter && typeof adapter.fetchGuildIdForChannel === "function"
+  );
 }

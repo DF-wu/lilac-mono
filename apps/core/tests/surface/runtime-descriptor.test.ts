@@ -43,6 +43,7 @@ import type {
   SessionRef,
   SurfacePlatform,
   SurfaceSelf,
+  SurfaceSession,
 } from "../../src/surface/types";
 
 class TestAdapter implements SurfaceAdapter {
@@ -60,7 +61,7 @@ class TestAdapter implements SurfaceAdapter {
     return { platform: this.selfPlatform, userId: "bot", userName: "bot" };
   }
 
-  async listSessions() {
+  async listSessions(): Promise<SurfaceOperationResult<SurfaceSession[]>> {
     return Result.ok([]);
   }
 
@@ -265,11 +266,12 @@ describe("surface runtime descriptor factories", () => {
 
     expect(descriptor).toEqual({
       platform: "discord",
-      adapter,
+      adapter: descriptor.adapter,
       adapterIngress,
       relay,
       workflowProgress: descriptor.workflowProgress,
     });
+    expect(descriptor.adapter).not.toBe(adapter);
     expect("requestIngress" in descriptor).toBe(false);
     expect("health" in descriptor).toBe(false);
     expect("surfaceStore" in descriptor).toBe(false);
@@ -319,7 +321,7 @@ describe("surface runtime descriptor factories", () => {
       });
 
       const requestIngressAvailable = webhookConfigured && appCredentialsAvailable;
-      expect(descriptor.adapter).toBe(adapter);
+      expect(descriptor.adapter).not.toBe(adapter);
       expect(descriptor.requestIngress).toBe(requestIngressAvailable ? ingress : undefined);
       expect(descriptor.relay).toBe(appCredentialsAvailable ? relay : undefined);
       expect(descriptor.workflowProgress).toBeDefined();
@@ -529,6 +531,28 @@ describe("surface relay policies", () => {
 });
 
 describe("surface runtime registry", () => {
+  it("exposes only a descriptor-bound adapter facade from direct registrations", async () => {
+    const adapter = new TestAdapter("discord");
+    spyOn(adapter, "listSessions").mockResolvedValue(
+      Result.ok([
+        {
+          ref: { platform: "github", channelId: "octo/repo#1" },
+          kind: "thread",
+        },
+      ]),
+    );
+    const created = SurfaceRuntimeRegistry.create([{ platform: "discord", adapter }]);
+    if (created.status === "error") throw created.error;
+    const [descriptor] = created.value.entries();
+    if (!descriptor) throw new Error("missing descriptor");
+
+    expect(descriptor.adapter).not.toBe(adapter);
+    const [settled] = await Promise.allSettled([descriptor.adapter.listSessions()]);
+    expect(settled?.status).toBe("rejected");
+    if (settled?.status !== "rejected") return;
+    expect(Panic.is(settled.reason)).toBe(true);
+  });
+
   it("preserves registration order", () => {
     const discord = discordDescriptor();
     const github = githubDescriptor();
@@ -579,8 +603,8 @@ describe("surface runtime registry", () => {
       expect(settled?.status).toBe("rejected");
       if (settled?.status !== "rejected") return;
       expect(Panic.is(settled.reason)).toBe(true);
-      expect(String(settled.reason)).toContain(`descriptor=${descriptorPlatform}`);
-      expect(String(settled.reason)).toContain(`adapter=${adapterPlatform}`);
+      expect(String(settled.reason)).toContain(`for '${descriptorPlatform}'`);
+      expect(String(settled.reason)).toContain(`received '${adapterPlatform}'`);
     },
   );
 

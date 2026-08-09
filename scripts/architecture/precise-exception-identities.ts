@@ -650,7 +650,6 @@ export const PRECISE_EXCEPTION_IDENTITIES: Readonly<
     ["src/tool-server/tools/surface.ts", "adaptSurfaceResultToToolHost", "signal"],
     ["src/tool-server/tools/surface.ts", "Surface.callActivitiesRecentAgentWrites", "capture"],
     ["src/tool-server/tools/surface.ts", "Surface.linkSentMessageToTranscript", "capture"],
-    ["src/tool-server/tools/surface.ts", "resolveGuildIdForChannel", "capture"],
     ["src/tool-server/tools/web.ts", "adaptWebResultToToolHost", "signal"],
     ["src/tool-server/tools/web.ts", "Web.callFetch", "capture"],
     ["src/tool-server/tools/web.ts", "Web.callSearch", "capture"],

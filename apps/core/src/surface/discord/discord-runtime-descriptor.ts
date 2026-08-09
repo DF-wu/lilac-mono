@@ -12,6 +12,10 @@ import type {
   SurfaceWorkflowProgressPort,
 } from "../runtime-descriptor";
 import {
+  createDescriptorBoundSurfaceAdapter,
+  createDescriptorBoundWorkflowProgressPort,
+} from "../produced-ref-guard";
+import {
   SurfaceReplyTargetInvalid as ReplyTargetInvalid,
   SurfaceRefInvalid as RefInvalid,
   WorkflowProgressOperationFailed,
@@ -42,9 +46,10 @@ function discordWorkflowError(
 export function createDiscordWorkflowProgressPort(
   adapter: SurfaceAdapter,
 ): SurfaceWorkflowProgressPort<"discord"> {
+  const guardedAdapter = createDescriptorBoundSurfaceAdapter("discord", adapter);
   return {
     checkMessage: async (target) => {
-      const checked = await adapter.readMsg({
+      const checked = await guardedAdapter.readMsg({
         platform: "discord",
         channelId: target.channelId,
         messageId: target.messageId,
@@ -58,7 +63,7 @@ export function createDiscordWorkflowProgressPort(
       return Result.ok(checked.value ? "found" : "missing");
     },
     send: async (input) => {
-      const sent = await adapter.sendMsg(
+      const sent = await guardedAdapter.sendMsg(
         { platform: "discord", channelId: input.channelId },
         input.content,
         input.replyToMessageId
@@ -75,16 +80,14 @@ export function createDiscordWorkflowProgressPort(
       if (sent.status === "error") {
         return Result.err(discordWorkflowError("send", sent.error));
       }
-      if (sent.value.platform === "discord") return Result.ok(sent.value);
-      return Result.err(
-        discordWorkflowProgressFailure(
-          "send",
-          "Discord workflow progress send returned a 'github' message",
-        ),
-      );
+      return Result.ok({
+        platform: "discord",
+        channelId: sent.value.channelId,
+        messageId: sent.value.messageId,
+      });
     },
     edit: async (target, content) => {
-      const edited = await adapter.editMsg(
+      const edited = await guardedAdapter.editMsg(
         {
           platform: "discord",
           channelId: target.channelId,
@@ -210,11 +213,15 @@ export function createDiscordSurfaceRuntimeDescriptor(input: {
   readonly adapterIngress: SurfaceAdapterIngress<"discord">;
   readonly relay: SurfaceRelayDescriptor<"discord">;
 }): SurfaceRuntimeDescriptor<"discord"> {
+  const adapter = createDescriptorBoundSurfaceAdapter("discord", input.adapter);
   return {
     platform: "discord",
-    adapter: input.adapter,
+    adapter,
     adapterIngress: input.adapterIngress,
     relay: input.relay,
-    workflowProgress: createDiscordWorkflowProgressPort(input.adapter),
+    workflowProgress: createDescriptorBoundWorkflowProgressPort(
+      "discord",
+      createDiscordWorkflowProgressPort(adapter),
+    ),
   };
 }

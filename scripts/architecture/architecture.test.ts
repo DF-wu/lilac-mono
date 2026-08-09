@@ -3593,11 +3593,11 @@ describe("real declaration integration", () => {
       reason: platformMismatchReason,
     });
     const descriptorMismatchIdentity = {
-      module: "src/surface/runtime-descriptor.ts",
-      exportName: "signalSurfaceRuntimeAdapterPlatformMismatch",
+      module: "src/surface/produced-ref-guard.ts",
+      exportName: "signalSurfaceAdapterContractViolation",
     } as const;
     const descriptorMismatchReason =
-      "Signals a hard adapter contract invariant when getSelf reports a platform different from its descriptor registration.";
+      "Signals a hard descriptor-bound contract defect before an adapter-produced ref crosses a shared publication or persistence seam.";
     expect(core.exceptionAdapters).toContainEqual({
       identity: descriptorMismatchIdentity,
       category: "defect-supervisor",

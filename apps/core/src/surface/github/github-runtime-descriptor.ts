@@ -18,6 +18,10 @@ import {
   type GithubAckState,
 } from "../../github/github-state";
 import type { SurfaceAdapter, SurfaceOperationError } from "../adapter";
+import {
+  createDescriptorBoundSurfaceAdapter,
+  createDescriptorBoundWorkflowProgressPort,
+} from "../produced-ref-guard";
 import type {
   SurfaceRelayDescriptor,
   SurfaceRelayPolicy,
@@ -58,9 +62,10 @@ function githubWorkflowError(
 export function createGithubWorkflowProgressPort(
   adapter: SurfaceAdapter,
 ): SurfaceWorkflowProgressPort<"github"> {
+  const guardedAdapter = createDescriptorBoundSurfaceAdapter("github", adapter);
   return {
     checkMessage: async (target) => {
-      const checked = await adapter.readMsg({
+      const checked = await guardedAdapter.readMsg({
         platform: "github",
         channelId: target.channelId,
         messageId: target.messageId,
@@ -80,30 +85,32 @@ export function createGithubWorkflowProgressPort(
             text: `In reply to ${input.replyToMessageId}:\n\n${input.content.text ?? ""}`,
           }
         : input.content;
-      const sent = await adapter.sendMsg(
+      const sent = await guardedAdapter.sendMsg(
         { platform: "github", channelId: input.channelId },
         content,
         { silent: input.silent },
       );
       if (sent.status === "error") {
-        if (
-          sent.error._tag === "SurfaceOperationPartiallyCompleted" &&
-          sent.error.created.platform === "github"
-        ) {
-          return Result.err({ kind: "created", ref: sent.error.created });
+        if (sent.error._tag === "SurfaceOperationPartiallyCompleted") {
+          return Result.err({
+            kind: "created",
+            ref: {
+              platform: "github",
+              channelId: sent.error.created.channelId,
+              messageId: sent.error.created.messageId,
+            },
+          });
         }
         return Result.err(githubWorkflowError("send", sent.error));
       }
-      if (sent.value.platform === "github") return Result.ok(sent.value);
-      return Result.err(
-        githubWorkflowProgressFailure(
-          "send",
-          "GitHub workflow progress send returned a 'discord' message",
-        ),
-      );
+      return Result.ok({
+        platform: "github",
+        channelId: sent.value.channelId,
+        messageId: sent.value.messageId,
+      });
     },
     edit: async (target, content) => {
-      const edited = await adapter.editMsg(
+      const edited = await guardedAdapter.editMsg(
         {
           platform: "github",
           channelId: target.channelId,
@@ -330,12 +337,16 @@ export function createGithubSurfaceRuntimeDescriptor(input: {
   readonly requestIngress?: SurfaceRequestIngress;
   readonly relay?: SurfaceRelayDescriptor<"github">;
 }): SurfaceRuntimeDescriptor<"github"> {
+  const adapter = createDescriptorBoundSurfaceAdapter("github", input.adapter);
   return {
     platform: "github",
-    adapter: input.adapter,
+    adapter,
     ...(input.requestIngress ? { requestIngress: input.requestIngress } : {}),
     ...(input.relay ? { relay: input.relay } : {}),
-    workflowProgress: createGithubWorkflowProgressPort(input.adapter),
+    workflowProgress: createDescriptorBoundWorkflowProgressPort(
+      "github",
+      createGithubWorkflowProgressPort(adapter),
+    ),
   };
 }
 

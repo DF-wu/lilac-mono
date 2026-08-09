@@ -14,6 +14,7 @@ import { catalogToolStableId } from "../../src/mcp/catalog-identity";
 import type { ConversationThreadToolService } from "../../src/conversation/thread-service";
 import type { DiscoveryService } from "../../src/discovery/discovery-service";
 import type { SurfaceAdapter } from "../../src/surface/adapter";
+import { createDescriptorBoundSurfaceAdapter } from "../../src/surface/produced-ref-guard";
 import {
   configSnapshot,
   FakeClientFactory,
@@ -36,6 +37,8 @@ function createCoreToolPluginManager(
     },
   };
 }
+
+const TEST_GITHUB_ADAPTER = createDescriptorBoundSurfaceAdapter("github", {} as SurfaceAdapter);
 
 function isAsyncIterable(value: unknown): value is AsyncIterable<unknown> {
   return (
@@ -228,6 +231,7 @@ describe("core tool plugin manager", () => {
       runtime: {
         bus: {} as LilacBus,
         adapter: {} as SurfaceAdapter,
+        githubAdapter: TEST_GITHUB_ADAPTER,
         discovery: {} as DiscoveryService,
         conversationThreads: {} as ConversationThreadToolService,
         config: cfg,
@@ -341,6 +345,7 @@ describe("core tool plugin manager", () => {
       runtime: {
         bus: {} as LilacBus,
         adapter: {} as SurfaceAdapter,
+        githubAdapter: TEST_GITHUB_ADAPTER,
         discovery: {} as DiscoveryService,
         conversationThreads: {} as ConversationThreadToolService,
         config: cfg,
@@ -378,6 +383,7 @@ describe("core tool plugin manager", () => {
       runtime: {
         bus: {} as LilacBus,
         adapter: {} as SurfaceAdapter,
+        githubAdapter: TEST_GITHUB_ADAPTER,
         discovery: {} as DiscoveryService,
         config: cfg,
       },
@@ -498,6 +504,7 @@ describe("core tool plugin manager", () => {
       runtime: {
         bus: {} as LilacBus,
         adapter: {} as SurfaceAdapter,
+        githubAdapter: TEST_GITHUB_ADAPTER,
         discovery: {} as DiscoveryService,
         config: cfg,
       },
@@ -553,6 +560,7 @@ describe("core tool plugin manager", () => {
       runtime: {
         bus: {} as LilacBus,
         adapter: {} as SurfaceAdapter,
+        githubAdapter: TEST_GITHUB_ADAPTER,
         discovery: {} as DiscoveryService,
         config: cfg,
       },
@@ -615,6 +623,7 @@ describe("core tool plugin manager", () => {
       runtime: {
         bus: {} as LilacBus,
         adapter: {} as SurfaceAdapter,
+        githubAdapter: TEST_GITHUB_ADAPTER,
         discovery: {} as DiscoveryService,
         config: cfg,
       },
@@ -676,6 +685,7 @@ describe("core tool plugin manager", () => {
       runtime: {
         bus: {} as LilacBus,
         adapter: {} as SurfaceAdapter,
+        githubAdapter: TEST_GITHUB_ADAPTER,
         discovery: {} as DiscoveryService,
         conversationThreads: {} as ConversationThreadToolService,
         config: cfg,
@@ -775,6 +785,7 @@ export default {
       runtime: {
         bus: {} as LilacBus,
         adapter: {} as SurfaceAdapter,
+        githubAdapter: TEST_GITHUB_ADAPTER,
         discovery: {} as DiscoveryService,
         config: cfg,
       },

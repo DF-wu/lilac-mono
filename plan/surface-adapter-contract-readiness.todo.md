@@ -23,12 +23,12 @@ Source: `plan/surface-adapter-contract-readiness.md`
 
 ## Stage 3: Descriptor-Bound Produced-Ref Guards
 
-- [ ] Add the descriptor-bound guarded facade for all shared production callers.
-- [ ] Guard session lists, reads, lists, reply contexts/chains, partial completion, outputs, and tool refs.
-- [ ] Guard workflow send results, snapshot collection, and relay restore refs.
-- [ ] Register and test exact adapter contract-defect Panic sites.
-- [ ] Remove duplicated protocol-specific produced-platform checks.
-- [ ] Run focused tests, Core typecheck, architecture checks, lint/fmt, and independent review.
+- [x] Add the descriptor-bound guarded facade for all shared production callers.
+- [x] Guard session lists, reads, lists, reply contexts/chains, partial completion, outputs, and tool refs.
+- [x] Guard workflow send results, snapshot collection, and relay restore refs.
+- [x] Register and test exact adapter contract-defect Panic sites.
+- [x] Remove duplicated protocol-specific produced-platform checks.
+- [x] Run focused tests, Core typecheck, architecture checks, lint/fmt, and independent review.
 
 ## Stage 4: Registry-Selected Surface Tools
 
@@ -45,6 +45,7 @@ Source: `plan/surface-adapter-contract-readiness.md`
 - [ ] Add the mapped internal authenticated-origin union.
 - [ ] Preserve current Discord/GitHub raw wire inputs and fixtures.
 - [ ] Dead-letter malformed or conflicting actor/origin/header identities.
+- [ ] Correlate active-relay events and terminal lifecycle cache entries by exact `(requestId, platform, sessionId)`, including terminal-before-relay ordering; dead-letter mismatches before relay or cache mutation.
 - [ ] Bind request-cache origin and request-control capability identity.
 - [ ] Propagate the validated identity through tool, plugin, workflow, and subagent contexts.
 - [ ] Implement the explicit safety-mode precedence without changing current Discord/GitHub behavior.

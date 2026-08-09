@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { Result } from "better-result";
+import { Panic, Result } from "better-result";
 
 import {
   createLilacBus,
@@ -111,6 +111,10 @@ class FakeAdapter extends SurfaceAdapterTestBase {
     }
   }
 
+  async emitAndWait(evt: AdapterEvent): Promise<void> {
+    await Promise.all([...this.handlers].map((handler) => handler(evt)));
+  }
+
   async connect(): Promise<void> {}
 
   async disconnect(): Promise<void> {}
@@ -201,6 +205,54 @@ class FakeAdapter extends SurfaceAdapterTestBase {
 }
 
 describe("bridgeAdapterToBus cancel mapping", () => {
+  it("rejects a descriptor-mismatched adapter event before bus publication", async () => {
+    const bus = createLilacBus(createInMemoryRawBus());
+    const adapter = new FakeAdapter();
+    const published: Array<Message<unknown>> = [];
+    const evtSubResult = await bus.subscribeTopic(
+      "evt.adapter",
+      {
+        mode: "fanout",
+        subscriptionId: "test:invalid-event",
+        consumerId: "invalid-event-consumer",
+        offset: { type: "now" },
+      },
+      async (message) => {
+        published.push(message);
+        return Result.ok(undefined);
+      },
+      () => "dead-letter",
+    );
+    if (evtSubResult.status === "error") throw evtSubResult.error;
+    await bridgeAdapterToBus({
+      eventSource: adapter,
+      platform: "discord",
+      bus,
+      subscriptionId: "test",
+    });
+
+    const emitted = adapter.emitAndWait({
+      type: "adapter.message.created",
+      platform: "discord",
+      ts: Date.now(),
+      message: {
+        ref: { platform: "github", channelId: "chan", messageId: "invalid" },
+        session: { platform: "discord", channelId: "chan" },
+        userId: "user",
+        text: "invalid",
+        ts: Date.now(),
+      },
+    });
+
+    const [settled] = await Promise.allSettled([emitted]);
+    expect(settled?.status).toBe("rejected");
+    if (settled?.status !== "rejected") return;
+    expect(Panic.is(settled.reason)).toBe(true);
+    expect(published).toEqual([]);
+    const stopped = await evtSubResult.value.stop();
+    if (stopped.status === "error") throw stopped.error;
+  });
+
   it("unlinks transcript mappings when adapter deletion events arrive", async () => {
     const bus = createLilacBus(createInMemoryRawBus());
     const adapter = new FakeAdapter();
@@ -221,6 +273,7 @@ describe("bridgeAdapterToBus cancel mapping", () => {
     };
     await bridgeAdapterToBus({
       eventSource: adapter,
+      platform: "discord",
       bus,
       subscriptionId: "test",
       transcriptStore,
@@ -274,6 +327,7 @@ describe("bridgeAdapterToBus cancel mapping", () => {
     const evtSub = evtSubResult.value;
     await bridgeAdapterToBus({
       eventSource: adapter,
+      platform: "discord",
       bus,
       subscriptionId: "test",
       transcriptStore,
@@ -298,7 +352,12 @@ describe("bridgeAdapterToBus cancel mapping", () => {
     const bus = createLilacBus(createInMemoryRawBus());
     const adapter = new FakeAdapter();
 
-    await bridgeAdapterToBus({ eventSource: adapter, bus, subscriptionId: "test" });
+    await bridgeAdapterToBus({
+      eventSource: adapter,
+      platform: "discord",
+      bus,
+      subscriptionId: "test",
+    });
 
     const published: Array<Message<unknown>> = [];
     const evtSubResult = await bus.subscribeTopic(
@@ -421,7 +480,12 @@ describe("bridgeAdapterToBus cancel mapping", () => {
     const bus = createLilacBus(createInMemoryRawBus());
     const adapter = new FakeAdapter();
 
-    await bridgeAdapterToBus({ eventSource: adapter, bus, subscriptionId: "test" });
+    await bridgeAdapterToBus({
+      eventSource: adapter,
+      platform: "discord",
+      bus,
+      subscriptionId: "test",
+    });
 
     const published: Array<Message<unknown>> = [];
     const subResult = await bus.subscribeTopic(
@@ -476,7 +540,12 @@ describe("bridgeAdapterToBus cancel mapping", () => {
     const bus = createLilacBus(createInMemoryRawBus());
     const adapter = new FakeAdapter();
 
-    await bridgeAdapterToBus({ eventSource: adapter, bus, subscriptionId: "test" });
+    await bridgeAdapterToBus({
+      eventSource: adapter,
+      platform: "discord",
+      bus,
+      subscriptionId: "test",
+    });
 
     const published: Array<Message<unknown>> = [];
     const subResult = await bus.subscribeTopic(
@@ -535,7 +604,12 @@ describe("bridgeAdapterToBus cancel mapping", () => {
     const bus = createLilacBus(createInMemoryRawBus());
     const adapter = new FakeAdapter();
 
-    await bridgeAdapterToBus({ eventSource: adapter, bus, subscriptionId: "test" });
+    await bridgeAdapterToBus({
+      eventSource: adapter,
+      platform: "discord",
+      bus,
+      subscriptionId: "test",
+    });
 
     const published: Array<Message<unknown>> = [];
     const subResult = await bus.subscribeTopic(

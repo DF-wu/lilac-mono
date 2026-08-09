@@ -184,13 +184,16 @@ export function createBuiltinSurfacePlugin(): CoreToolPlugin {
       id: "surface",
     },
     create({ runtime }) {
-      if (!runtime.adapter || !(runtime.config || runtime.getConfig)) {
-        return signalBuiltinPluginSkip("surface requires adapter and config access");
+      if (!runtime.adapter || !runtime.githubAdapter || !(runtime.config || runtime.getConfig)) {
+        return signalBuiltinPluginSkip(
+          "surface requires Discord/GitHub adapters and config access",
+        );
       }
       return {
         level2: [
           new Surface({
             adapter: runtime.adapter,
+            githubAdapter: runtime.githubAdapter,
             config: runtime.config,
             getConfig: runtime.getConfig,
             discordSearch: runtime.discordSearch,

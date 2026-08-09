@@ -22,6 +22,7 @@ export type CoreToolPluginRuntime = {
   dataDir?: string;
   bus?: LilacBus;
   adapter?: SurfaceAdapter;
+  githubAdapter?: SurfaceAdapter;
   config?: CoreConfig;
   getConfig?: () => Promise<CoreConfig>;
   discovery?: DiscoveryService;

@@ -890,14 +890,14 @@ const CORE_ADAPTER_EVENT_EXCEPTION_ADAPTERS = [
   },
   {
     identity: {
-      module: "src/surface/runtime-descriptor.ts",
-      exportName: "signalSurfaceRuntimeAdapterPlatformMismatch",
+      module: "src/surface/produced-ref-guard.ts",
+      exportName: "signalSurfaceAdapterContractViolation",
     },
     category: "defect-supervisor",
     externalApi: { package: "better-result", exportName: "Panic" },
     direction: "signal-host",
     reason:
-      "Signals a hard adapter contract invariant when getSelf reports a platform different from its descriptor registration.",
+      "Signals a hard descriptor-bound contract defect before an adapter-produced ref crosses a shared publication or persistence seam.",
   },
   {
     identity: {
@@ -7473,6 +7473,14 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
             },
             {
               identity: {
+                module: "src/surface/adapter.ts",
+                exportName: "hasSurfaceGuildIdResolver",
+              },
+              reason:
+                "Checks the exact optional Discord guild lookup capability preserved by the descriptor-bound facade.",
+            },
+            {
+              identity: {
                 module: "src/ssh/remote-js/remote-runner-utils.ts",
                 exportName: "isPanic",
               },
@@ -8716,7 +8724,7 @@ function approvedExceptionAdapterCatalogSha256(
 }
 
 export const APPROVED_EXCEPTION_ADAPTER_CATALOG_SHA256 =
-  "1d84580396bc62f07c31fb4867d7cabe85dede6a7c003cf44a7f002467e9e82c";
+  "971270ad6806dbf23c854486ba9d3d43236f2390b5df4a2ee17cd5041dd73cb3";
 
 export const architectureManifest = {
   version: 1,

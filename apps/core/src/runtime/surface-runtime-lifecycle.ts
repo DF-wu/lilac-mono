@@ -9,6 +9,10 @@ import type {
   SurfaceRequestIngressHandle,
   SurfaceRuntimeRegistry,
 } from "../surface/runtime-descriptor";
+import {
+  requireDescriptorPlatform,
+  requireSurfaceRelaySnapshot,
+} from "../surface/produced-ref-guard";
 
 type AgentRecovery = {
   beginDrain(options: { readonly deadlineMs: number }): Promise<void>;
@@ -91,6 +95,11 @@ export async function startSurfaceOutputs(input: {
     }
     if (descriptor.relay) {
       const handle = await descriptor.relay.lifecycle.start();
+      requireDescriptorPlatform(
+        descriptor.platform,
+        handle.platform,
+        "surfaceRelay.lifecycle.start",
+      );
       input.relays.set(descriptor.platform, handle);
     }
   }
@@ -112,8 +121,19 @@ export async function restoreSurfaceRecovery(input: {
 }> {
   let relayEntriesMatched = 0;
   for (const descriptor of input.registry.entries()) {
+    for (const snapshot of input.snapshot.relays) {
+      if (snapshot.platform !== descriptor.platform) continue;
+      requireSurfaceRelaySnapshot(descriptor.platform, snapshot, "gracefulRestart.restoreRelays");
+    }
+  }
+  for (const descriptor of input.registry.entries()) {
     const relay = input.relays.get(descriptor.platform);
     if (!relay) continue;
+    requireDescriptorPlatform(
+      descriptor.platform,
+      relay.platform,
+      "gracefulRestart.restoreRelayHandle",
+    );
     const snapshots = input.snapshot.relays.filter(
       (snapshot) => snapshot.platform === descriptor.platform,
     );
@@ -201,6 +221,11 @@ export async function stopIngressAndDrainSurfaceRecovery(input: {
   for (const descriptor of input.registry.entries()) {
     const relay = input.relays.get(descriptor.platform);
     if (!relay) continue;
+    requireDescriptorPlatform(
+      descriptor.platform,
+      relay.platform,
+      "gracefulRestart.drainRelayHandle",
+    );
     await input.runCleanup(
       surfaceCleanupLabel({
         platform: descriptor.platform,
@@ -228,8 +253,20 @@ export async function stopIngressAndDrainSurfaceRecovery(input: {
         graceful: true,
       }),
       async () => {
+        requireDescriptorPlatform(
+          descriptor.platform,
+          relay.platform,
+          "gracefulRestart.snapshotRelayHandle",
+        );
         const snapshots = await relay.snapshotRelays();
-        relays.push(...snapshots);
+        for (const snapshot of snapshots) {
+          requireSurfaceRelaySnapshot(
+            descriptor.platform,
+            snapshot,
+            "gracefulRestart.snapshotRelays",
+          );
+          relays.push(snapshot);
+        }
       },
     );
   }

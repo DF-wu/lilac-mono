@@ -9,6 +9,8 @@ import { Panic, type Result as ResultType } from "better-result";
 
 import type { SurfaceAdapterEventSource } from "../adapter";
 import type { AdapterEvent } from "../events";
+import { requireDescriptorBoundAdapterEvent } from "../produced-ref-guard";
+import type { RegisteredSurfacePlatform } from "../types";
 import {
   toBusEvtAdapterMessageCreated,
   toBusEvtAdapterMessageDeleted,
@@ -23,6 +25,7 @@ import { formatBridgeLogContext } from "./bridge-log";
 
 export async function bridgeAdapterToBus(params: {
   eventSource: SurfaceAdapterEventSource;
+  platform: RegisteredSurfacePlatform;
   bus: LilacBus;
   subscriptionId: string;
   transcriptStore?: TranscriptStore;
@@ -72,6 +75,7 @@ export async function bridgeAdapterToBus(params: {
   };
 
   return await eventSource.subscribe(async (evt: AdapterEvent) => {
+    requireDescriptorBoundAdapterEvent(params.platform, evt);
     const startedAt = Date.now();
 
     switch (evt.type) {

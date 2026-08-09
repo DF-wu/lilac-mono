@@ -33,6 +33,7 @@ import type {
   SurfaceReplyTargetInvalid,
   SurfaceRefInvalid,
 } from "../runtime-descriptor";
+import { requireSurfaceRelayPolicyRefs, requireSurfaceRelaySnapshot } from "../produced-ref-guard";
 import { mergeSubagentToolStatus } from "../subagent-tool-status";
 
 import { parseRequestControlFromRaw } from "./bus-agent-runner/raw";
@@ -465,11 +466,11 @@ export async function bridgeBusToAdapter<P extends RegisteredSurfacePlatform>(pa
     adapter,
     bus,
     platform,
-    policy,
     subscriptionId,
     idleTimeoutMs = 60 * 60 * 1000,
     scheduleIdleTimeout = scheduleTimeout,
   } = params;
+  const policy = requireSurfaceRelayPolicyRefs(platform, params.policy);
 
   const activeRelays = new Map<string, ActiveRelay>();
   const terminalLifecycleByRequestId = new Map<string, number>();
@@ -1957,13 +1958,20 @@ export async function bridgeBusToAdapter<P extends RegisteredSurfacePlatform>(pa
       }
     },
     snapshotRelays: (): SurfaceRelaySnapshotFor<P>[] => {
-      return [...activeRelays.values()].map((relay) => ({ ...relay.snapshot(), platform }));
+      return [...activeRelays.values()].map((relay) => {
+        const snapshot = { ...relay.snapshot(), platform };
+        requireSurfaceRelaySnapshot(platform, snapshot, "relay.snapshotRelays");
+        return snapshot;
+      });
     },
     restoreRelays: async (snapshots: readonly BusToAdapterRelaySnapshot[]) => {
       if (draining) return;
 
       for (const snapshot of snapshots) {
-        if (snapshot.platform !== platform) continue;
+        requireSurfaceRelaySnapshot(platform, snapshot, "relay.restoreRelays");
+      }
+
+      for (const snapshot of snapshots) {
         if (activeRelays.has(snapshot.requestId)) continue;
 
         let initialReplyTo: MsgRef | undefined;
