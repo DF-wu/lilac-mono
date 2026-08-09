@@ -10,7 +10,6 @@ import type {
   StartOutputOpts,
 } from "../../../src/surface/adapter";
 import type {
-  AdapterCapabilities,
   ContentOpts,
   LimitOpts,
   SendOpts,
@@ -277,9 +276,6 @@ class FakeAdapter implements SurfaceAdapter {
     throw new Error("not implemented");
   }
   async getSelf(): Promise<SurfaceSelf> {
-    throw new Error("not implemented");
-  }
-  async getCapabilities(): Promise<AdapterCapabilities> {
     throw new Error("not implemented");
   }
   async listSessions(): Promise<SurfaceSession[]> {
@@ -3007,7 +3003,7 @@ describe("bridgeBusToAdapter", () => {
     await bridge.stop();
   });
 
-  it("ignores cmd.request and cmd.surface events when request_client mismatches platform", async () => {
+  it("requires an exact request_client match across relay-consumed event paths", async () => {
     const raw = createInMemoryRawBus();
     const bus = createLilacBus(raw);
     const adapter = new FakeAdapter();
@@ -3021,6 +3017,20 @@ describe("bridgeBusToAdapter", () => {
       subscriptionId: "discord-adapter",
       idleTimeoutMs: 10_000,
     });
+
+    await bus.publish(
+      lilacEventTypes.EvtRequestReply,
+      {},
+      {
+        headers: {
+          request_id: requestId,
+          session_id: "chan",
+          request_client: "github",
+        },
+      },
+    );
+
+    expect(adapter.streams).toHaveLength(0);
 
     await bus.publish(
       lilacEventTypes.EvtRequestReply,
@@ -3073,10 +3083,40 @@ describe("bridgeBusToAdapter", () => {
 
     expect(adapter.streams[0]?.aborted).toBeUndefined();
 
+    await bus.publish(
+      lilacEventTypes.CmdSurfaceOutputReanchor,
+      { inheritReplyTo: true },
+      {
+        headers: {
+          request_id: requestId,
+          session_id: "chan",
+          request_client: "discord",
+        },
+      },
+    );
+    expect(adapter.streams).toHaveLength(2);
+
+    await bus.publish(
+      lilacEventTypes.CmdRequestMessage,
+      {
+        queue: "interrupt",
+        messages: [],
+        raw: { cancel: true, requiresActive: true },
+      },
+      {
+        headers: {
+          request_id: requestId,
+          session_id: "chan",
+          request_client: "discord",
+        },
+      },
+    );
+    expect(adapter.streams[1]?.aborted).toBe("cancel");
+
     await bridge.stop();
   });
 
-  it("parks required-header failures and gives handlers no ack capability", async () => {
+  it("parks missing request_client headers in every relay consumer", async () => {
     const deliveries: DeliveryObservation[] = [];
     const bus = createLilacBus(createInMemoryRawBus((delivery) => deliveries.push(delivery)));
     const bridge = await bridgeBusToAdapter({
@@ -3090,17 +3130,17 @@ describe("bridgeBusToAdapter", () => {
     await bus.publish(
       lilacEventTypes.CmdRequestMessage,
       { queue: "prompt", messages: [] },
-      { headers: { request_id: "missing-session-cmd" } },
+      { headers: { request_id: "missing-client-cmd", session_id: "chan" } },
     );
     await bus.publish(
       lilacEventTypes.CmdSurfaceOutputReanchor,
       { inheritReplyTo: true },
-      { headers: { request_id: "missing-session-surface" } },
+      { headers: { request_id: "missing-client-surface", session_id: "chan" } },
     );
     await bus.publish(
       lilacEventTypes.EvtRequestReply,
       {},
-      { headers: { request_id: "missing-session-event" } },
+      { headers: { request_id: "missing-client-event", session_id: "chan" } },
     );
 
     expect(deliveries.map(({ topic, disposition }) => ({ topic, disposition }))).toEqual([

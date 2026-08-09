@@ -495,7 +495,7 @@ export async function bridgeBusToAdapter(params: {
       const sessionId = msg.headers?.session_id;
       const requestClient = msg.headers?.request_client;
 
-      if (!requestId || !sessionId) {
+      if (!requestId || !sessionId || !requestClient) {
         logger.warn("relay.event.rejected", {
           requestId,
           sessionId,
@@ -505,12 +505,13 @@ export async function bridgeBusToAdapter(params: {
         });
         return Result.err(
           new CmdRequestRequiredHeadersMissing({
-            message: "cmd.request.message missing required headers.request_id/session_id",
+            message:
+              "cmd.request.message missing required headers.request_id/session_id/request_client",
           }),
         );
       }
 
-      if (requestClient && requestClient !== platform) {
+      if (requestClient !== platform) {
         logger.debug("relay.event.ignored", {
           requestId,
           sessionId,
@@ -577,15 +578,16 @@ export async function bridgeBusToAdapter(params: {
       const requestId = msg.headers?.request_id;
       const sessionId = msg.headers?.session_id;
       const requestClient = msg.headers?.request_client;
-      if (!requestId || !sessionId) {
+      if (!requestId || !sessionId || !requestClient) {
         return Result.err(
           new CmdSurfaceRequiredHeadersMissing({
-            message: "cmd.surface.output.reanchor missing required headers.request_id/session_id",
+            message:
+              "cmd.surface.output.reanchor missing required headers.request_id/session_id/request_client",
           }),
         );
       }
 
-      if (requestClient && requestClient !== platform) {
+      if (requestClient !== platform) {
         logger.debug("relay.event.ignored", {
           requestId,
           sessionId,
@@ -663,7 +665,7 @@ export async function bridgeBusToAdapter(params: {
       const requestClient = msg.headers?.request_client;
       const routerSessionMode = parseRouterSessionMode(msg.headers?.router_session_mode);
 
-      if (!requestId || !sessionId) {
+      if (!requestId || !sessionId || !requestClient) {
         // Do not ack malformed messages: they need investigation.
         logger.error("relay.event.rejected", {
           requestId,
@@ -674,12 +676,13 @@ export async function bridgeBusToAdapter(params: {
         });
         return Result.err(
           new EvtRequestRequiredHeadersMissing({
-            message: "evt.request event missing required headers.request_id/session_id",
+            message:
+              "evt.request event missing required headers.request_id/session_id/request_client",
           }),
         );
       }
 
-      if (requestClient && requestClient !== platform) {
+      if (requestClient !== platform) {
         logger.debug("relay.event.ignored", {
           requestId,
           sessionId,
