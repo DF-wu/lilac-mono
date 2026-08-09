@@ -3495,6 +3495,7 @@ describe("real declaration integration", () => {
       "src/conversation/thread-materializer-worker-protocol.ts#decodeThreadMaterializerWorkerResponse",
       "src/github/github-app.ts#decodeGithubAppSecret",
       "src/github/github-app.ts#readGithubAppSecretResult",
+      "src/github/github-api.ts#decodeGithubApiErrorResponse",
       "src/github/github-user-token.ts#decodeGithubUserTokenSecret",
       "src/github/github-user-token.ts#readGithubUserTokenSecretResult",
       "src/github/webhook/github-webhook-server.ts#captureGithubWebhookOperation",

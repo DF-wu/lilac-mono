@@ -2,23 +2,24 @@ import { describe, expect, expectTypeOf, it } from "bun:test";
 import { Result, type Result as ResultType } from "better-result";
 
 import {
-  type AdapterEventHandler,
-  type AdapterSubscription,
   type StartOutputOpts,
   type SurfaceAdapter,
   SurfaceInvalidInput,
   SurfaceMessageNotFound,
   type SurfaceOperation,
   type SurfaceOperationError,
+  type SurfaceMergeBlockPlanOptions,
   SurfaceOperationPartiallyCompleted,
   type SurfaceOperationResult,
   SurfaceOperationUnsupported,
   type SurfaceOutputStream,
+  type SurfaceReplyChainPlanOptions,
   SurfacePermissionDenied,
   SurfacePlatformMismatch,
   SurfaceRateLimited,
   SurfaceSessionMismatch,
   SurfaceUnavailable,
+  type TypingIndicatorSubscription,
 } from "../../src/surface/adapter";
 import type {
   ContentOpts,
@@ -34,9 +35,11 @@ import type {
   SessionRef,
   SessionRefFor,
   SurfaceMessage,
+  SurfaceReactionDetail,
   SurfaceRefPlatformSetsExactlyEqual,
   SurfaceSelf,
   SurfaceSession,
+  SurfaceSessionParticipantsResult,
 } from "../../src/surface/types";
 
 const SESSION_REF_FIXTURES = {
@@ -163,20 +166,46 @@ interface SurfaceAdapterSignatureFixture {
   connect(): Promise<void>;
   disconnect(): Promise<void>;
   getSelf(): Promise<SurfaceSelf>;
-  listSessions(): Promise<SurfaceSession[]>;
-  startOutput(sessionRef: SessionRef, opts?: StartOutputOpts): Promise<SurfaceOutputStream>;
-  sendMsg(sessionRef: SessionRef, content: ContentOpts, opts?: SendOpts): Promise<MsgRef>;
-  readMsg(msgRef: MsgRef): Promise<SurfaceMessage | null>;
-  listMsg(sessionRef: SessionRef, opts?: LimitOpts): Promise<SurfaceMessage[]>;
-  editMsg(msgRef: MsgRef, content: ContentOpts): Promise<void>;
-  deleteMsg(msgRef: MsgRef): Promise<void>;
-  getReplyContext(msgRef: MsgRef, opts?: LimitOpts): Promise<SurfaceMessage[]>;
-  addReaction(msgRef: MsgRef, reaction: string): Promise<void>;
-  removeReaction(msgRef: MsgRef, reaction: string): Promise<void>;
-  listReactions(msgRef: MsgRef): Promise<string[]>;
-  subscribe(handler: AdapterEventHandler): Promise<AdapterSubscription>;
-  getUnRead(sessionRef: SessionRef): Promise<SurfaceMessage[]>;
-  markRead(sessionRef: SessionRef, upToMsgRef?: MsgRef): Promise<void>;
+  listSessions(): Promise<SurfaceOperationResult<SurfaceSession[]>>;
+  listSessionParticipants(
+    sessionRef: SessionRef,
+    opts?: { limit?: number },
+  ): Promise<SurfaceOperationResult<SurfaceSessionParticipantsResult>>;
+  startOutput(
+    sessionRef: SessionRef,
+    opts?: StartOutputOpts,
+  ): Promise<SurfaceOperationResult<SurfaceOutputStream>>;
+  startTyping(sessionRef: SessionRef): Promise<SurfaceOperationResult<TypingIndicatorSubscription>>;
+  sendMsg(
+    sessionRef: SessionRef,
+    content: ContentOpts,
+    opts?: SendOpts,
+  ): Promise<SurfaceOperationResult<MsgRef>>;
+  readMsg(msgRef: MsgRef): Promise<SurfaceOperationResult<SurfaceMessage | null>>;
+  listMsg(
+    sessionRef: SessionRef,
+    opts?: LimitOpts,
+  ): Promise<SurfaceOperationResult<SurfaceMessage[]>>;
+  editMsg(msgRef: MsgRef, content: ContentOpts): Promise<SurfaceOperationResult<void>>;
+  deleteMsg(msgRef: MsgRef): Promise<SurfaceOperationResult<void>>;
+  getReplyContext(
+    msgRef: MsgRef,
+    opts?: LimitOpts,
+  ): Promise<SurfaceOperationResult<SurfaceMessage[]>>;
+  planReplyChain(
+    msgRef: MsgRef,
+    opts?: SurfaceReplyChainPlanOptions,
+  ): Promise<SurfaceOperationResult<readonly MsgRef[]>>;
+  planMergeBlockEndingAt(
+    msgRef: MsgRef,
+    opts?: SurfaceMergeBlockPlanOptions,
+  ): Promise<SurfaceOperationResult<readonly MsgRef[]>>;
+  addReaction(msgRef: MsgRef, reaction: string): Promise<SurfaceOperationResult<void>>;
+  removeReaction(msgRef: MsgRef, reaction: string): Promise<SurfaceOperationResult<void>>;
+  listReactions(msgRef: MsgRef): Promise<SurfaceOperationResult<string[]>>;
+  listReactionDetails(msgRef: MsgRef): Promise<SurfaceOperationResult<SurfaceReactionDetail[]>>;
+  getUnRead(sessionRef: SessionRef): Promise<SurfaceOperationResult<SurfaceMessage[]>>;
+  markRead(sessionRef: SessionRef, upToMsgRef?: MsgRef): Promise<SurfaceOperationResult<void>>;
 }
 
 describe("surface operation contract", () => {
@@ -206,7 +235,7 @@ describe("surface operation contract", () => {
     >();
   });
 
-  it("leaves the production adapter signatures unchanged", () => {
+  it("matches the normalized production adapter signatures", () => {
     expectTypeOf<SurfaceAdapter>().toEqualTypeOf<SurfaceAdapterSignatureFixture>();
   });
 

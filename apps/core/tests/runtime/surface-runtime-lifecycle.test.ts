@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { Panic } from "better-result";
+import { Panic, Result } from "better-result";
 
 import {
   connectAndValidateSurfaceAdapters,
@@ -18,7 +18,6 @@ import {
   type SurfaceRequestIngressHandles,
 } from "../../src/runtime/surface-runtime-lifecycle";
 import type {
-  AdapterEventHandler,
   StartOutputOpts,
   SurfaceAdapter,
   SurfaceOutputStream,
@@ -43,10 +42,8 @@ import type {
   MsgRef,
   SendOpts,
   SessionRef,
-  SurfaceMessage,
   SurfacePlatform,
   SurfaceSelf,
-  SurfaceSession,
 } from "../../src/surface/types";
 
 const agentEntry: AgentRunnerRecoveryEntry = {
@@ -79,61 +76,84 @@ class TestAdapter implements SurfaceAdapter {
     return { platform: this.platform, userId: "bot", userName: "bot" };
   }
 
-  async listSessions(): Promise<SurfaceSession[]> {
-    return [];
+  async listSessions() {
+    return Result.ok([]);
+  }
+  async listSessionParticipants() {
+    return Result.ok({ source: "guild_members" as const, participants: [] });
   }
 
-  async startOutput(
-    _sessionRef: SessionRef,
-    _opts?: StartOutputOpts,
-  ): Promise<SurfaceOutputStream> {
-    return {
-      push: async () => "visible",
-      finish: async () => ({
-        created: [{ platform: "discord", channelId: "channel", messageId: "message" }],
-        last: { platform: "discord", channelId: "channel", messageId: "message" },
-      }),
-      abort: async () => undefined,
-    };
+  async startOutput(_sessionRef: SessionRef, _opts?: StartOutputOpts) {
+    return Result.ok({
+      push: async () => Result.ok("visible" as const),
+      finish: async () =>
+        Result.ok({
+          created: [{ platform: "discord", channelId: "channel", messageId: "message" }],
+          last: { platform: "discord", channelId: "channel", messageId: "message" },
+        }),
+      abort: async () => Result.ok(undefined),
+    } satisfies SurfaceOutputStream);
+  }
+  async startTyping() {
+    return Result.ok({ stop: async () => Result.ok(undefined) });
   }
 
-  async sendMsg(sessionRef: SessionRef, _content: ContentOpts, _opts?: SendOpts): Promise<MsgRef> {
-    return { platform: "discord", channelId: sessionRef.channelId, messageId: "message" };
+  async sendMsg(sessionRef: SessionRef, _content: ContentOpts, _opts?: SendOpts) {
+    return Result.ok({
+      platform: "discord" as const,
+      channelId: sessionRef.channelId,
+      messageId: "message",
+    });
   }
 
-  async readMsg(_msgRef: MsgRef): Promise<SurfaceMessage | null> {
-    return null;
+  async readMsg(_msgRef: MsgRef) {
+    return Result.ok(null);
   }
 
-  async listMsg(_sessionRef: SessionRef, _opts?: LimitOpts): Promise<SurfaceMessage[]> {
-    return [];
+  async listMsg(_sessionRef: SessionRef, _opts?: LimitOpts) {
+    return Result.ok([]);
   }
 
-  async editMsg(_msgRef: MsgRef, _content: ContentOpts): Promise<void> {}
-
-  async deleteMsg(_msgRef: MsgRef): Promise<void> {}
-
-  async getReplyContext(_msgRef: MsgRef, _opts?: LimitOpts): Promise<SurfaceMessage[]> {
-    return [];
+  async editMsg(_msgRef: MsgRef, _content: ContentOpts) {
+    return Result.ok(undefined);
   }
 
-  async addReaction(_msgRef: MsgRef, _reaction: string): Promise<void> {}
-
-  async removeReaction(_msgRef: MsgRef, _reaction: string): Promise<void> {}
-
-  async listReactions(_msgRef: MsgRef): Promise<string[]> {
-    return [];
+  async deleteMsg(_msgRef: MsgRef) {
+    return Result.ok(undefined);
   }
 
-  async subscribe(_handler: AdapterEventHandler) {
-    return { stop: async () => undefined };
+  async getReplyContext(_msgRef: MsgRef, _opts?: LimitOpts) {
+    return Result.ok([]);
+  }
+  async planReplyChain(msgRef: MsgRef) {
+    return Result.ok([msgRef]);
+  }
+  async planMergeBlockEndingAt(msgRef: MsgRef) {
+    return Result.ok([msgRef]);
   }
 
-  async getUnRead(_sessionRef: SessionRef): Promise<SurfaceMessage[]> {
-    return [];
+  async addReaction(_msgRef: MsgRef, _reaction: string) {
+    return Result.ok(undefined);
   }
 
-  async markRead(_sessionRef: SessionRef, _upToMsgRef?: MsgRef): Promise<void> {}
+  async removeReaction(_msgRef: MsgRef, _reaction: string) {
+    return Result.ok(undefined);
+  }
+
+  async listReactions(_msgRef: MsgRef) {
+    return Result.ok([]);
+  }
+  async listReactionDetails(_msgRef: MsgRef) {
+    return Result.ok([]);
+  }
+
+  async getUnRead(_sessionRef: SessionRef) {
+    return Result.ok([]);
+  }
+
+  async markRead(_sessionRef: SessionRef, _upToMsgRef?: MsgRef) {
+    return Result.ok(undefined);
+  }
 }
 
 function relaySnapshot(

@@ -9,7 +9,6 @@ import {
   DiscordSearchStore,
 } from "../src/surface/store/discord-search-store";
 import type { RequestContext } from "../src/tool-server/types";
-import type { SurfaceAdapter } from "../src/surface/adapter";
 import { SqliteTranscriptStore, type TranscriptStore } from "../src/transcript/transcript-store";
 import fs from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -21,18 +20,18 @@ import type {
   SendOpts,
   SessionRef,
   SurfaceMessage,
-  SurfaceReactionDetail,
   SurfaceSelf,
   SurfaceSessionParticipantsResult,
   SurfaceSession,
 } from "../src/surface/types";
+import { SurfaceAdapterTestBase } from "./helpers/surface-adapter-test-base";
 
 function testConfig(input: unknown): CoreConfig {
   const cfg = parseCoreConfigV1ToUniversal(input);
   return { ...cfg, agent: { ...cfg.agent, systemPrompt: "(test)" } };
 }
 
-class FakeAdapter implements SurfaceAdapter {
+class FakeAdapter extends SurfaceAdapterTestBase {
   public sendCalls: Array<{
     sessionRef: SessionRef;
     content: ContentOpts;
@@ -48,7 +47,9 @@ class FakeAdapter implements SurfaceAdapter {
     private readonly messagesByChannelId: Record<string, SurfaceMessage[]>,
     private readonly guildIdByChannelId: Record<string, string> = {},
     private readonly participantsByChannelId: Record<string, SurfaceSessionParticipantsResult> = {},
-  ) {}
+  ) {
+    super();
+  }
 
   async fetchGuildIdForChannel(channelId: string): Promise<string | null> {
     return this.guildIdByChannelId[channelId] ?? null;
@@ -65,30 +66,41 @@ class FakeAdapter implements SurfaceAdapter {
     return { platform: "discord", userId: "bot", userName: "lilac" };
   }
 
-  async listSessions(): Promise<SurfaceSession[]> {
-    return this.sessions;
+  async listSessions() {
+    return Result.ok(this.sessions);
   }
 
-  async startOutput(): Promise<any> {
-    throw new Error("not implemented");
+  async startOutput() {
+    return Result.ok({
+      push: async () => Result.ok("visible" as const),
+      finish: async () => {
+        const ref = { platform: "discord" as const, channelId: "channel", messageId: "message" };
+        return Result.ok({ created: [ref], last: ref });
+      },
+      abort: async () => Result.ok(undefined),
+    });
   }
 
-  async sendMsg(sessionRef: SessionRef, content: ContentOpts, opts?: SendOpts): Promise<MsgRef> {
+  override async startTyping() {
+    return Result.ok({ stop: async () => Result.ok(undefined) });
+  }
+
+  async sendMsg(sessionRef: SessionRef, content: ContentOpts, opts?: SendOpts) {
     this.sendCalls.push({ sessionRef, content, opts });
-    return {
+    return Result.ok({
       platform: "discord",
       channelId: sessionRef.channelId,
       messageId: "sent",
-    };
+    } as const);
   }
 
-  async readMsg(msgRef: MsgRef): Promise<SurfaceMessage | null> {
+  async readMsg(msgRef: MsgRef) {
     this.readCalls.push(msgRef);
     const msgs = this.messagesByChannelId[msgRef.channelId] ?? [];
-    return msgs.find((m) => m.ref.messageId === msgRef.messageId) ?? null;
+    return Result.ok(msgs.find((m) => m.ref.messageId === msgRef.messageId) ?? null);
   }
 
-  async listMsg(sessionRef: SessionRef, opts?: LimitOpts): Promise<SurfaceMessage[]> {
+  async listMsg(sessionRef: SessionRef, opts?: LimitOpts) {
     this.listCalls.push({ sessionRef, opts });
 
     const msgs = this.messagesByChannelId[sessionRef.channelId] ?? [];
@@ -98,35 +110,45 @@ class FakeAdapter implements SurfaceAdapter {
     void opts?.beforeMessageId;
     void opts?.afterMessageId;
 
-    return msgs.slice(0, limit);
+    return Result.ok(msgs.slice(0, limit));
   }
 
-  async editMsg(): Promise<void> {
-    throw new Error("not implemented");
+  async editMsg() {
+    return Result.ok(undefined);
   }
 
-  async deleteMsg(): Promise<void> {
-    throw new Error("not implemented");
+  async deleteMsg() {
+    return Result.ok(undefined);
   }
 
-  async getReplyContext(): Promise<SurfaceMessage[]> {
-    throw new Error("not implemented");
+  async getReplyContext() {
+    return Result.ok([]);
   }
 
-  async addReaction(msgRef: MsgRef, reaction: string): Promise<void> {
+  override async planReplyChain() {
+    return Result.ok([]);
+  }
+
+  override async planMergeBlockEndingAt() {
+    return Result.ok([]);
+  }
+
+  async addReaction(msgRef: MsgRef, reaction: string) {
     this.addReactionCalls.push({ msgRef, reaction });
+    return Result.ok(undefined);
   }
 
-  async removeReaction(msgRef: MsgRef, reaction: string): Promise<void> {
+  async removeReaction(msgRef: MsgRef, reaction: string) {
     this.removeReactionCalls.push({ msgRef, reaction });
+    return Result.ok(undefined);
   }
 
-  async listReactions(_msgRef: MsgRef): Promise<string[]> {
-    return ["👍"];
+  async listReactions(_msgRef: MsgRef) {
+    return Result.ok(["👍"]);
   }
 
-  async listReactionDetails(_msgRef: MsgRef): Promise<SurfaceReactionDetail[]> {
-    return [
+  override async listReactionDetails(_msgRef: MsgRef) {
+    return Result.ok([
       {
         emoji: "👍",
         count: 2,
@@ -135,13 +157,10 @@ class FakeAdapter implements SurfaceAdapter {
           { userId: "u2", userName: "bob" },
         ],
       },
-    ];
+    ]);
   }
 
-  async listSessionParticipants(
-    sessionRef: SessionRef,
-    opts?: { limit?: number },
-  ): Promise<SurfaceSessionParticipantsResult> {
+  override async listSessionParticipants(sessionRef: SessionRef, opts?: { limit?: number }) {
     const row = this.participantsByChannelId[sessionRef.channelId];
     const base: SurfaceSessionParticipantsResult = row ?? {
       source: "guild_members",
@@ -150,22 +169,18 @@ class FakeAdapter implements SurfaceAdapter {
 
     const limit = Math.min(2000, Math.max(1, Math.floor(opts?.limit ?? 200)));
 
-    return {
+    return Result.ok({
       source: base.source,
       participants: base.participants.slice(0, limit),
-    };
+    });
   }
 
-  async subscribe(): Promise<any> {
-    throw new Error("not implemented");
+  async getUnRead() {
+    return Result.ok([]);
   }
 
-  async getUnRead(): Promise<SurfaceMessage[]> {
-    throw new Error("not implemented");
-  }
-
-  async markRead(): Promise<void> {
-    throw new Error("not implemented");
+  async markRead() {
+    return Result.ok(undefined);
   }
 }
 

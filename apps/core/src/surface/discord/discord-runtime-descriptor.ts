@@ -1,9 +1,7 @@
 import type { SurfaceMsgRef } from "@stanley2058/lilac-event-bus";
-import { Result, type Result as ResultType } from "better-result";
+import { Result } from "better-result";
 
-import { opaqueErrorMessage } from "@stanley2058/lilac-utils";
-
-import { preserveSurfacePanic, SurfaceMessageNotFoundError, type SurfaceAdapter } from "../adapter";
+import type { SurfaceAdapter, SurfaceOperationError } from "../adapter";
 import { parseRequestId } from "../bridge/request-ids";
 import type {
   SurfaceAdapterIngress,
@@ -12,9 +10,6 @@ import type {
   SurfaceReplyTargetInvalid,
   SurfaceRuntimeDescriptor,
   SurfaceWorkflowProgressPort,
-  WorkflowProgressCheckFailure,
-  WorkflowProgressEditFailure,
-  WorkflowProgressSendFailure,
 } from "../runtime-descriptor";
 import {
   SurfaceReplyTargetInvalid as ReplyTargetInvalid,
@@ -37,49 +32,11 @@ function discordWorkflowProgressFailure(
   };
 }
 
-export function captureDiscordWorkflowProgressCall<T>(input: {
-  readonly operation: "check-message";
-  readonly effect: () => Promise<T>;
-}): Promise<ResultType<T, WorkflowProgressCheckFailure>>;
-export function captureDiscordWorkflowProgressCall<T>(input: {
-  readonly operation: "send";
-  readonly effect: () => Promise<T>;
-}): Promise<ResultType<T, WorkflowProgressSendFailure<"discord">>>;
-export function captureDiscordWorkflowProgressCall<T>(input: {
-  readonly operation: "edit";
-  readonly effect: () => Promise<T>;
-}): Promise<ResultType<T, WorkflowProgressEditFailure>>;
-export async function captureDiscordWorkflowProgressCall<T>(input: {
-  readonly operation: DiscordWorkflowProgressOperation;
-  readonly effect: () => Promise<T>;
-}): Promise<
-  ResultType<
-    T,
-    | WorkflowProgressCheckFailure
-    | WorkflowProgressSendFailure<"discord">
-    | WorkflowProgressEditFailure
-  >
-> {
-  try {
-    return Result.ok(await input.effect());
-  } catch (cause) {
-    preserveSurfacePanic(cause);
-    const failureMessage =
-      cause instanceof Error
-        ? opaqueErrorMessage(cause, "Workflow progress surface call failed")
-        : "Opaque workflow progress surface failure";
-    const failed = discordWorkflowProgressFailure(input.operation, failureMessage);
-    if (cause instanceof SurfaceMessageNotFoundError) {
-      switch (input.operation) {
-        case "check-message":
-        case "send":
-          return Result.err(failed);
-        case "edit":
-          return Result.err({ kind: "not-found" });
-      }
-    }
-    return Result.err(failed);
-  }
+function discordWorkflowError(
+  operation: DiscordWorkflowProgressOperation,
+  error: SurfaceOperationError,
+): { readonly kind: "failed"; readonly error: WorkflowProgressOperationFailed } {
+  return discordWorkflowProgressFailure(operation, error.message);
 }
 
 export function createDiscordWorkflowProgressPort(
@@ -87,88 +44,59 @@ export function createDiscordWorkflowProgressPort(
 ): SurfaceWorkflowProgressPort<"discord"> {
   return {
     checkMessage: async (target) => {
-      const checked = await captureDiscordWorkflowProgressCall({
-        operation: "check-message",
-        effect: () =>
-          adapter.readMsg({
-            platform: "discord",
-            channelId: target.channelId,
-            messageId: target.messageId,
-          }),
+      const checked = await adapter.readMsg({
+        platform: "discord",
+        channelId: target.channelId,
+        messageId: target.messageId,
       });
-      switch (checked.status) {
-        case "ok":
-          return Result.ok(checked.value ? "found" : "missing");
-        case "error":
-          switch (checked.error.kind) {
-            case "failed":
-              return Result.err(checked.error);
-          }
+      if (checked.status === "error") {
+        if (checked.error._tag === "SurfaceMessageNotFound") {
+          return Result.ok("missing");
+        }
+        return Result.err(discordWorkflowError("check-message", checked.error));
       }
+      return Result.ok(checked.value ? "found" : "missing");
     },
     send: async (input) => {
-      const sent = await captureDiscordWorkflowProgressCall({
-        operation: "send",
-        effect: () =>
-          adapter.sendMsg(
-            { platform: "discord", channelId: input.channelId },
-            input.content,
-            input.replyToMessageId
-              ? {
-                  replyTo: {
-                    platform: "discord",
-                    channelId: input.channelId,
-                    messageId: input.replyToMessageId,
-                  },
-                  silent: input.silent,
-                }
-              : { silent: input.silent },
-          ),
-      });
-      switch (sent.status) {
-        case "ok":
-          switch (sent.value.platform) {
-            case "discord":
-              return Result.ok(sent.value);
-            case "github":
-              return Result.err({
-                kind: "failed",
-                error: new WorkflowProgressOperationFailed({
-                  operation: "send",
-                  message: "Discord workflow progress send returned a 'github' message",
-                }),
-              });
-          }
-        case "error":
-          switch (sent.error.kind) {
-            case "failed":
-              return Result.err(sent.error);
-          }
+      const sent = await adapter.sendMsg(
+        { platform: "discord", channelId: input.channelId },
+        input.content,
+        input.replyToMessageId
+          ? {
+              replyTo: {
+                platform: "discord",
+                channelId: input.channelId,
+                messageId: input.replyToMessageId,
+              },
+              silent: input.silent,
+            }
+          : { silent: input.silent },
+      );
+      if (sent.status === "error") {
+        return Result.err(discordWorkflowError("send", sent.error));
       }
+      if (sent.value.platform === "discord") return Result.ok(sent.value);
+      return Result.err(
+        discordWorkflowProgressFailure(
+          "send",
+          "Discord workflow progress send returned a 'github' message",
+        ),
+      );
     },
     edit: async (target, content) => {
-      const edited = await captureDiscordWorkflowProgressCall({
-        operation: "edit",
-        effect: () =>
-          adapter.editMsg(
-            {
-              platform: "discord",
-              channelId: target.channelId,
-              messageId: target.messageId,
-            },
-            content,
-          ),
-      });
-      switch (edited.status) {
-        case "ok":
-          return Result.ok(undefined);
-        case "error":
-          switch (edited.error.kind) {
-            case "not-found":
-            case "failed":
-              return Result.err(edited.error);
-          }
+      const edited = await adapter.editMsg(
+        {
+          platform: "discord",
+          channelId: target.channelId,
+          messageId: target.messageId,
+        },
+        content,
+      );
+      if (edited.status === "ok") return Result.ok(undefined);
+      if (edited.error._tag === "SurfaceMessageNotFound") {
+        return Result.err({ kind: "not-found" });
       }
+      return Result.err(discordWorkflowError("edit", edited.error));
     },
   };
 }
@@ -220,6 +148,14 @@ function decodeDiscordRef(input: {
   });
 }
 
+async function adaptDiscordSkippedOutputCleanupResultToHost(
+  adapter: SurfaceAdapter,
+  ref: Parameters<SurfaceAdapter["deleteMsg"]>[0],
+): Promise<void> {
+  const deleted = await adapter.deleteMsg(ref);
+  if (deleted.status === "error") throw deleted.error;
+}
+
 export function createDiscordRelayPolicy(adapter: SurfaceAdapter): SurfaceRelayPolicy<"discord"> {
   return {
     refs: {
@@ -263,7 +199,8 @@ export function createDiscordRelayPolicy(adapter: SurfaceAdapter): SurfaceRelayP
       decodeReanchorTarget: decodeDiscordRef,
     },
     finalization: {
-      cleanupSkippedOutput: ({ ref }) => adapter.deleteMsg(ref),
+      cleanupSkippedOutput: async ({ ref }) =>
+        adaptDiscordSkippedOutputCleanupResultToHost(adapter, ref),
     },
   };
 }

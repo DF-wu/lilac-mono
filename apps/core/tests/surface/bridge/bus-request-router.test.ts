@@ -27,6 +27,7 @@ import {
   DiscordRequestRouterAdapterSelfLookupRejected,
   DiscordRequestRouterStartupAndCleanupFailed,
   DiscordRequestRouterSubscriptionStopRejected,
+  discordRequestCompositionFailurePolicy,
   startDiscordRequestRouter,
   type StartDiscordRequestRouterInput,
 } from "../../../src/surface/discord/discord-request-router";
@@ -35,8 +36,15 @@ import {
   resolveRepliedToMessageText,
 } from "../../../src/surface/discord/discord-request-router/context";
 import { formatBufferedMessageForGateTranscript } from "../../../src/surface/discord/discord-request-router/gate";
+import { publishSingleMessagePrompt } from "../../../src/surface/discord/discord-request-router/publish";
+import {
+  SurfaceInvalidInput,
+  SurfacePermissionDenied,
+  SurfaceRateLimited,
+  SurfaceUnavailable,
+  type SurfaceOperationResult,
+} from "../../../src/surface/adapter";
 
-import type { SurfaceAdapter, SurfaceOutputStream } from "../../../src/surface/adapter";
 import type {
   ContentOpts,
   LimitOpts,
@@ -45,7 +53,6 @@ import type {
   SessionRef,
   SurfaceMessage,
   SurfaceSelf,
-  SurfaceSession,
 } from "../../../src/surface/types";
 
 import {
@@ -54,6 +61,7 @@ import {
   type TranscriptStore,
 } from "../../../src/transcript/transcript-store";
 import type { ModelMessage } from "ai";
+import { SurfaceAdapterTestBase } from "../../helpers/surface-adapter-test-base";
 
 type TestRawBus = RawBus & {
   readonly deliveryActions: Array<{ readonly topic: string; readonly action: RawDeliveryAction }>;
@@ -292,11 +300,13 @@ function createInMemoryRawBus(): TestRawBus {
   };
 }
 
-class FakeAdapter implements SurfaceAdapter {
+class FakeAdapter extends SurfaceAdapterTestBase {
   constructor(
     private readonly messages: Record<string, SurfaceMessage>,
     private readonly platform: "discord" | "github" = "discord",
-  ) {}
+  ) {
+    super();
+  }
 
   async connect(): Promise<void> {
     throw new Error("not implemented");
@@ -308,24 +318,31 @@ class FakeAdapter implements SurfaceAdapter {
   async getSelf(): Promise<SurfaceSelf> {
     return { platform: this.platform, userId: "bot", userName: "lilac" };
   }
-  async listSessions(): Promise<SurfaceSession[]> {
-    throw new Error("not implemented");
+  async listSessions() {
+    return Result.ok([]);
   }
 
-  async startOutput(_sessionRef: SessionRef): Promise<SurfaceOutputStream> {
-    throw new Error("not implemented");
+  async startOutput(_sessionRef: SessionRef) {
+    return Result.ok({
+      push: async () => Result.ok("visible" as const),
+      finish: async () => {
+        const ref = { platform: "discord" as const, channelId: "unused", messageId: "unused" };
+        return Result.ok({ created: [ref], last: ref });
+      },
+      abort: async () => Result.ok(undefined),
+    });
   }
 
-  async sendMsg(_sessionRef: SessionRef, _content: ContentOpts, _opts?: SendOpts): Promise<MsgRef> {
-    throw new Error("not implemented");
+  async sendMsg(_sessionRef: SessionRef, _content: ContentOpts, _opts?: SendOpts) {
+    return Result.ok({ platform: "discord", channelId: "unused", messageId: "unused" } as const);
   }
 
-  async readMsg(msgRef: MsgRef): Promise<SurfaceMessage | null> {
+  async readMsg(msgRef: MsgRef): Promise<SurfaceOperationResult<SurfaceMessage | null>> {
     const key = `${msgRef.channelId}:${msgRef.messageId}`;
-    return this.messages[key] ?? null;
+    return Result.ok(this.messages[key] ?? null);
   }
 
-  async listMsg(sessionRef: SessionRef, opts?: LimitOpts): Promise<SurfaceMessage[]> {
+  async listMsg(sessionRef: SessionRef, opts?: LimitOpts) {
     const limit = opts?.limit ?? 50;
     const before = opts?.beforeMessageId;
 
@@ -346,21 +363,21 @@ class FakeAdapter implements SurfaceAdapter {
         })
       : list;
 
-    return eligible.slice(Math.max(0, eligible.length - limit));
+    return Result.ok(eligible.slice(Math.max(0, eligible.length - limit)));
   }
 
-  async editMsg(_msgRef: MsgRef, _content: ContentOpts): Promise<void> {
-    throw new Error("not implemented");
+  async editMsg(_msgRef: MsgRef, _content: ContentOpts) {
+    return Result.ok(undefined);
   }
 
-  async deleteMsg(_msgRef: MsgRef): Promise<void> {
-    throw new Error("not implemented");
+  async deleteMsg(_msgRef: MsgRef) {
+    return Result.ok(undefined);
   }
 
-  async getReplyContext(msgRef: MsgRef, opts?: LimitOpts): Promise<SurfaceMessage[]> {
+  async getReplyContext(msgRef: MsgRef, opts?: LimitOpts) {
     const key = `${msgRef.channelId}:${msgRef.messageId}`;
     const base = this.messages[key];
-    if (!base) return [];
+    if (!base) return Result.ok([]);
 
     const limit = opts?.limit ?? 20;
     const half = Math.max(1, Math.floor(limit / 2));
@@ -375,31 +392,31 @@ class FakeAdapter implements SurfaceAdapter {
 
     const after = all.filter((m) => m.ts > base.ts).slice(0, half);
 
-    return before.concat(after);
+    return Result.ok(before.concat(after));
   }
 
-  async addReaction(_msgRef: MsgRef, _reaction: string): Promise<void> {
-    throw new Error("not implemented");
+  async addReaction(_msgRef: MsgRef, _reaction: string) {
+    return Result.ok(undefined);
   }
 
-  async removeReaction(_msgRef: MsgRef, _reaction: string): Promise<void> {
-    throw new Error("not implemented");
+  async removeReaction(_msgRef: MsgRef, _reaction: string) {
+    return Result.ok(undefined);
   }
 
-  async listReactions(_msgRef: MsgRef): Promise<string[]> {
-    return [];
+  async listReactions(_msgRef: MsgRef) {
+    return Result.ok([]);
   }
 
   async subscribe(): Promise<{ stop(): Promise<void> }> {
     throw new Error("not implemented");
   }
 
-  async getUnRead(_sessionRef: SessionRef): Promise<SurfaceMessage[]> {
-    throw new Error("not implemented");
+  async getUnRead(_sessionRef: SessionRef) {
+    return Result.ok([]);
   }
 
-  async markRead(_sessionRef: SessionRef): Promise<void> {
-    throw new Error("not implemented");
+  async markRead(_sessionRef: SessionRef) {
+    return Result.ok(undefined);
   }
 }
 
@@ -419,6 +436,107 @@ function collectUserText(messages: readonly ModelMessage[]): string {
 
   return parts.join("\n\n");
 }
+
+describe("Discord request composition failure policy", () => {
+  it.each([
+    new SurfaceRateLimited({
+      platform: "discord",
+      operation: "read-message",
+      message: "rate limited",
+    }),
+    new SurfaceUnavailable({
+      platform: "discord",
+      operation: "read-message",
+      message: "unavailable",
+    }),
+  ])("classifies $error._tag as a transient gateway drop", (error) => {
+    expect(discordRequestCompositionFailurePolicy(error)).toEqual({
+      disposition: "drop-transient-gateway-event",
+      level: "warn",
+      retryable: true,
+    });
+  });
+
+  it.each([
+    new SurfaceInvalidInput({
+      platform: "discord",
+      operation: "read-message",
+      field: "messageId",
+      message: "invalid",
+    }),
+    new SurfacePermissionDenied({
+      platform: "discord",
+      operation: "read-message",
+      message: "forbidden",
+    }),
+  ])("classifies $error._tag as a permanent gateway drop", (error) => {
+    expect(discordRequestCompositionFailurePolicy(error)).toEqual({
+      disposition: "drop-permanent-gateway-event",
+      level: "warn",
+      retryable: false,
+    });
+  });
+
+  it("keeps owned blob integrity failures distinct", () => {
+    expect(
+      discordRequestCompositionFailurePolicy(new CoreOwnedBlobIntegrityError("corrupt blob")),
+    ).toEqual({
+      disposition: "drop-integrity-failure",
+      level: "error",
+      retryable: false,
+    });
+  });
+});
+
+describe("Discord authenticated-origin publication", () => {
+  it("does not publish when the authenticated-origin re-read fails", async () => {
+    const raw = createInMemoryRawBus();
+    const bus = createLilacBus(raw);
+    const logger = new Logger({ module: "discord-origin-reread-test" });
+    const msgRef = { platform: "discord" as const, channelId: "channel", messageId: "message" };
+    const message: SurfaceMessage = {
+      ref: msgRef,
+      session: { platform: "discord", channelId: "channel" },
+      userId: "authenticated-user",
+      text: "hello",
+      ts: 1,
+    };
+    const adapter = new FakeAdapter({ "channel:message": message });
+    const failure = new SurfaceUnavailable({
+      platform: "discord",
+      operation: "read-message",
+      message: "origin re-read unavailable",
+    });
+    let reads = 0;
+    spyOn(adapter, "readMsg").mockImplementation(async () => {
+      reads += 1;
+      return reads === 1 ? Result.ok(message) : Result.err(failure);
+    });
+    const publish = spyOn(raw, "publish");
+
+    try {
+      const result = await publishSingleMessagePrompt({
+        adapter,
+        bus,
+        cfg: parseCoreConfigV1ToUniversal({}),
+        logger,
+        input: {
+          requestId: "discord:channel:message",
+          sessionId: "channel",
+          sessionConfigId: "channel",
+          msgRef,
+          sessionMode: "mention",
+        },
+      });
+
+      expect(result).toEqual(Result.err(failure));
+      expect(reads).toBe(2);
+      expect(publish).not.toHaveBeenCalled();
+    } finally {
+      await bus.close();
+    }
+  });
+});
 
 describe("formatBufferedMessageForGateTranscript", () => {
   it("escapes metadata tags anywhere in the buffered message text", () => {

@@ -923,27 +923,6 @@ const CORE_ADAPTER_EVENT_EXCEPTION_ADAPTERS = [
     direction: "observe-panic",
     reason: "Preserves exact Panic identity at the GitHub acknowledgement deletion boundary.",
   },
-  ...[
-    [
-      "src/surface/discord/discord-runtime-descriptor.ts",
-      "captureDiscordWorkflowProgressCall",
-      "Discord",
-    ],
-    [
-      "src/surface/github/github-runtime-descriptor.ts",
-      "captureGithubWorkflowProgressCall",
-      "GitHub",
-    ],
-  ].map(([module, exportName, platform]) => ({
-    identity: { module, exportName },
-    category: "external-to-result" as const,
-    externalApi: {
-      package: "@stanley2058/lilac-core",
-      exportName: "SurfaceAdapter workflow progress operation",
-    },
-    direction: "capture-external" as const,
-    reason: `Captures a ${platform} surface adapter rejection into the protocol-owned workflow progress Result contract.`,
-  })),
 ] as const satisfies readonly ExceptionAdapter[];
 
 const CORE_TOOL_SERVER_BOUNDARY_DECODERS = [
@@ -1393,6 +1372,7 @@ const INTEGRATED_BOUNDARY_DECODERS = new Map<string, readonly BoundaryDecoder[]>
         category: "projection" as const,
       })),
       ...[
+        ["src/github/github-api.ts", "decodeGithubApiErrorResponse", "wire"],
         ["src/github/github-api.ts", "githubFetchJsonResult", "wire"],
         ["src/github/github-app.ts", "readGithubAppSecretResult", "persistence"],
         ["src/github/github-user-token.ts", "readGithubUserTokenSecretResult", "persistence"],
@@ -8286,6 +8266,10 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
               module: "src/github/github-app.ts",
               exportName,
             })),
+            {
+              module: "src/github/github-api.ts",
+              exportName: "decodeGithubApiErrorResponse",
+            },
             ...["decodeGithubUserTokenSecret", "readGithubUserTokenSecretResult"].map(
               (exportName) => ({ module: "src/github/github-user-token.ts", exportName }),
             ),
@@ -8592,18 +8576,6 @@ const REVIEWED_INJECTED_EXTERNAL_EFFECT_KEYS = new Set([
     "deleteGithubAcknowledgement",
     "capture-external",
   ),
-  preciseExceptionAdapterKey(
-    "apps/core",
-    "src/surface/discord/discord-runtime-descriptor.ts",
-    "captureDiscordWorkflowProgressCall",
-    "capture-external",
-  ),
-  preciseExceptionAdapterKey(
-    "apps/core",
-    "src/surface/github/github-runtime-descriptor.ts",
-    "captureGithubWorkflowProgressCall",
-    "capture-external",
-  ),
 ]);
 
 function exceptionAdapterSyntaxKinds(
@@ -8744,7 +8716,7 @@ function approvedExceptionAdapterCatalogSha256(
 }
 
 export const APPROVED_EXCEPTION_ADAPTER_CATALOG_SHA256 =
-  "c0205b48349be6083b4bb6c9caf252311c442ac72a2a65e932f7b6c728f65cfc";
+  "1d84580396bc62f07c31fb4867d7cabe85dede6a7c003cf44a7f002467e9e82c";
 
 export const architectureManifest = {
   version: 1,

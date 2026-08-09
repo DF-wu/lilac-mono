@@ -244,9 +244,11 @@ export async function publishActiveChannelPrompt(params: {
   if (composed.status === "error") return Result.err(composed.error);
   const composition = composed.value;
 
-  const originMessage = params.input.triggerMsgRef
-    ? await params.adapter.readMsg(params.input.triggerMsgRef).catch(() => null)
+  const originMessageResult = params.input.triggerMsgRef
+    ? await params.adapter.readMsg(params.input.triggerMsgRef)
     : null;
+  if (originMessageResult?.status === "error") return Result.err(originMessageResult.error);
+  const originMessage = originMessageResult?.status === "ok" ? originMessageResult.value : null;
 
   await publishBusRequest({
     logger: params.logger,
@@ -320,7 +322,9 @@ export async function publishSingleMessageToActiveRequest(params: {
   if (!composed.value) return Result.ok(undefined);
   const composition = composed.value;
 
-  const surfaceMessage = await params.adapter.readMsg(params.input.msgRef);
+  const surfaceMessageResult = await params.adapter.readMsg(params.input.msgRef);
+  if (surfaceMessageResult.status === "error") return Result.err(surfaceMessageResult.error);
+  const surfaceMessage = surfaceMessageResult.status === "ok" ? surfaceMessageResult.value : null;
 
   await publishBusRequest({
     logger: params.logger,
@@ -391,7 +395,9 @@ export async function publishSingleMessagePrompt(params: {
   if (!composed.value) return Result.ok(undefined);
   const composition = composed.value;
 
-  const surfaceMessage = await params.adapter.readMsg(params.input.msgRef);
+  const surfaceMessageResult = await params.adapter.readMsg(params.input.msgRef);
+  if (surfaceMessageResult.status === "error") return Result.err(surfaceMessageResult.error);
+  const surfaceMessage = surfaceMessageResult.status === "ok" ? surfaceMessageResult.value : null;
 
   await publishBusRequest({
     logger: params.logger,

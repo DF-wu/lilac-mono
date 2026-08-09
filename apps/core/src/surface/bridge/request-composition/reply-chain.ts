@@ -1,8 +1,9 @@
 import { isRecord } from "@stanley2058/lilac-utils";
+import { Result } from "better-result";
 
 import type { MsgRef, SurfaceMessage } from "../../types";
 
-import { hasReplyChainPlannerProvider, type SurfaceAdapter } from "../../adapter";
+import type { SurfaceAdapter, SurfaceOperationResult } from "../../adapter";
 import { buildDiscordRichTextFromContentAndEmbeds } from "../../discord/discord-embed-text";
 import { normalizeDiscordRaw } from "../../discord/discord-raw-normalizer";
 
@@ -120,24 +121,24 @@ async function readMessagesByRefs(input: {
   adapter: SurfaceAdapter;
   refs: readonly MsgRef[];
   concurrency?: number;
-}): Promise<SurfaceMessage[]> {
+}): Promise<SurfaceOperationResult<SurfaceMessage[]>> {
   const { adapter, refs } = input;
-  if (refs.length === 0) return [];
+  if (refs.length === 0) return Result.ok([]);
 
   const pairs = await mapWithConcurrency({
     items: refs,
     concurrency: input.concurrency ?? 8,
     run: async (ref) => {
-      const msg = await adapter.readMsg(ref);
-      return { ref, msg };
+      return { ref, msg: await adapter.readMsg(ref) };
     },
   });
 
   const byKey = new Map<string, SurfaceMessage>();
   for (const pair of pairs) {
-    if (!pair.msg) continue;
-    const key = `${pair.msg.ref.channelId}:${pair.msg.ref.messageId}`;
-    byKey.set(key, pair.msg);
+    if (pair.msg.status === "error") return Result.err(pair.msg.error);
+    if (!pair.msg.value) continue;
+    const key = `${pair.msg.value.ref.channelId}:${pair.msg.value.ref.messageId}`;
+    byKey.set(key, pair.msg.value);
   }
 
   const out: SurfaceMessage[] = [];
@@ -147,28 +148,29 @@ async function readMessagesByRefs(input: {
     if (msg) out.push(msg);
   }
 
-  return out;
+  return Result.ok(out);
 }
 
 export async function resolveMergeBlockEndingAt(
   adapter: SurfaceAdapter,
   triggerMsg: SurfaceMessage,
   opts?: { limit?: number },
-): Promise<SurfaceMessage[]> {
+): Promise<SurfaceOperationResult<SurfaceMessage[]>> {
   const limit = opts?.limit ?? DEFAULT_MENTION_BLOCK_LIMIT;
 
-  if (hasReplyChainPlannerProvider(adapter)) {
-    const plannedRefs = await adapter
-      .planMergeBlockEndingAt(triggerMsg.ref, { lookbackLimit: limit })
-      .catch(() => [] as readonly MsgRef[]);
+  const planned = await adapter.planMergeBlockEndingAt(triggerMsg.ref, { lookbackLimit: limit });
+  if (planned.status === "ok") {
+    const plannedRefs = planned.value;
 
     const refs = plannedRefs.filter((r) => r.channelId === triggerMsg.ref.channelId);
     if (refs.length > 0) {
-      const list = await readMessagesByRefs({
+      const listed = await readMessagesByRefs({
         adapter,
         refs,
         concurrency: 8,
       });
+      if (listed.status === "error") return listed;
+      const list = listed.value;
 
       const plannedRefKeys = new Set(refs.map((r) => `${r.channelId}:${r.messageId}`));
       const resolvedRefKeys = new Set(list.map((m) => `${m.ref.channelId}:${m.ref.messageId}`));
@@ -186,14 +188,16 @@ export async function resolveMergeBlockEndingAt(
       });
 
       if (allResolved && list.length > 0) {
-        return list;
+        return Result.ok(list);
       }
     }
+  } else if (planned.error._tag !== "SurfaceOperationUnsupported") {
+    return Result.err(planned.error);
   }
 
-  const ctx = await adapter
-    .getReplyContext(triggerMsg.ref, { limit })
-    .catch(() => [] as SurfaceMessage[]);
+  const context = await adapter.getReplyContext(triggerMsg.ref, { limit });
+  if (context.status === "error") return Result.err(context.error);
+  const ctx = context.value;
 
   const list = ctx.length > 0 ? ctx.slice() : [triggerMsg];
 
@@ -204,7 +208,7 @@ export async function resolveMergeBlockEndingAt(
   list.sort((a, b) => a.ts - b.ts);
 
   const triggerIndex = list.findIndex((m) => m.ref.messageId === triggerMsg.ref.messageId);
-  if (triggerIndex < 0) return [triggerMsg];
+  if (triggerIndex < 0) return Result.ok([triggerMsg]);
 
   const authorId = triggerMsg.userId;
 
@@ -225,7 +229,7 @@ export async function resolveMergeBlockEndingAt(
     })),
   );
   const groupEndingAtTrigger = groups[groups.length - 1] ?? [];
-  return groupEndingAtTrigger.map((m) => m.message);
+  return Result.ok(groupEndingAtTrigger.map((m) => m.message));
 }
 
 export function findEarliestReplyAnchor(block: readonly SurfaceMessage[]): SurfaceMessage | null {
@@ -247,13 +251,12 @@ export async function fetchReplyChainFrom(
     /** Maximum number of merged Discord UI groups to traverse. */
     maxDepth?: number;
   },
-): Promise<ReplyChainMessage[]> {
+): Promise<SurfaceOperationResult<ReplyChainMessage[]>> {
   const maxGroupCount = opts.maxDepth ?? 20;
 
-  if (hasReplyChainPlannerProvider(adapter)) {
-    const plannedRefs = await adapter
-      .planReplyChain(opts.startMsgRef, { maxDepth: maxGroupCount })
-      .catch(() => [] as readonly MsgRef[]);
+  const planned = await adapter.planReplyChain(opts.startMsgRef, { maxDepth: maxGroupCount });
+  if (planned.status === "ok") {
+    const plannedRefs = planned.value;
 
     const inSessionRefs: MsgRef[] = [];
     for (const ref of plannedRefs) {
@@ -266,11 +269,16 @@ export async function fetchReplyChainFrom(
         items: inSessionRefs,
         concurrency: 4,
         run: async (cursorRef) => {
-          const blockRefs = await adapter
-            .planMergeBlockEndingAt(cursorRef, {
-              lookbackLimit: DEFAULT_MENTION_BLOCK_LIMIT,
-            })
-            .catch(() => [cursorRef] as readonly MsgRef[]);
+          const plannedBlock = await adapter.planMergeBlockEndingAt(cursorRef, {
+            lookbackLimit: DEFAULT_MENTION_BLOCK_LIMIT,
+          });
+          if (
+            plannedBlock.status === "error" &&
+            plannedBlock.error._tag !== "SurfaceOperationUnsupported"
+          ) {
+            return Result.err(plannedBlock.error);
+          }
+          const blockRefs = plannedBlock.status === "ok" ? plannedBlock.value : [cursorRef];
 
           const inChannelBlockRefs = blockRefs.filter(
             (ref) => ref.channelId === opts.trigger.msgRef.channelId,
@@ -283,48 +291,59 @@ export async function fetchReplyChainFrom(
             refs: refsToRead,
             concurrency: 8,
           });
+          if (messages.status === "error") return messages;
 
           const plannedRefKeys = new Set(refsToRead.map((r) => `${r.channelId}:${r.messageId}`));
           const resolvedRefKeys = new Set(
-            messages.map((m) => `${m.ref.channelId}:${m.ref.messageId}`),
+            messages.value.map((m) => `${m.ref.channelId}:${m.ref.messageId}`),
           );
           const allResolved =
             plannedRefKeys.size === resolvedRefKeys.size &&
             [...plannedRefKeys].every((key) => resolvedRefKeys.has(key));
 
-          if (allResolved && messages.length > 0) return messages;
+          if (allResolved && messages.value.length > 0) return messages;
 
           const cursor = await adapter.readMsg(cursorRef);
-          if (!cursor) return [];
+          if (cursor.status === "error") return Result.err(cursor.error);
+          if (!cursor.value) return Result.ok([]);
 
-          return await resolveMergeBlockEndingAt(adapter, cursor).catch(() => [cursor]);
+          return await resolveMergeBlockEndingAt(adapter, cursor.value);
         },
       });
 
-      const flattened = groups.flat();
+      for (const group of groups) {
+        if (group.status === "error") return Result.err(group.error);
+      }
+      const flattened = groups.flatMap((group) => (group.status === "ok" ? group.value : []));
       if (flattened.length > 0) {
         flattened.sort((a, b) => {
           if (a.ts !== b.ts) return a.ts - b.ts;
           return compareDiscordSnowflakeLike(a.ref.messageId, b.ref.messageId);
         });
 
-        return dedupeByMessageId(flattened.map((m) => toReplyChainMessage(m)));
+        return Result.ok(dedupeByMessageId(flattened.map((m) => toReplyChainMessage(m))));
       }
     }
+  } else if (planned.error._tag !== "SurfaceOperationUnsupported") {
+    return Result.err(planned.error);
   }
 
   const groupsNewestToOldest: ReplyChainMessage[][] = [];
   const seenMessageIds = new Set<string>();
 
-  let cur = await adapter.readMsg(opts.startMsgRef);
-  if (!cur) return [];
+  const initial = await adapter.readMsg(opts.startMsgRef);
+  if (initial.status === "error") return Result.err(initial.error);
+  let cur = initial.value;
+  if (!cur) return Result.ok([]);
 
   for (let depth = 0; depth < maxGroupCount && cur; depth++) {
     const cursor = cur;
 
     if (seenMessageIds.has(cursor.ref.messageId)) break;
 
-    const group = await resolveMergeBlockEndingAt(adapter, cursor).catch(() => [cursor]);
+    const groupResult = await resolveMergeBlockEndingAt(adapter, cursor);
+    if (groupResult.status === "error") return Result.err(groupResult.error);
+    const group = groupResult.value;
     if (group.length === 0) break;
 
     for (const m of group) {
@@ -339,14 +358,16 @@ export async function fetchReplyChainFrom(
     // Stop if the reference crosses sessions.
     if (ref.channelId && ref.channelId !== opts.trigger.msgRef.channelId) break;
 
-    cur = await adapter.readMsg({
+    const next = await adapter.readMsg({
       platform: opts.platform,
       channelId: opts.trigger.msgRef.channelId,
       messageId: ref.messageId,
     });
+    if (next.status === "error") return Result.err(next.error);
+    cur = next.value;
   }
 
-  return dedupeByMessageId(groupsNewestToOldest.slice().reverse().flat());
+  return Result.ok(dedupeByMessageId(groupsNewestToOldest.slice().reverse().flat()));
 }
 
 export async function fetchMentionThreadContext(
@@ -358,8 +379,10 @@ export async function fetchMentionThreadContext(
     triggerMsg: SurfaceMessage;
     maxDepth?: number;
   },
-): Promise<ReplyChainMessage[]> {
-  const block = await resolveMergeBlockEndingAt(adapter, params.triggerMsg);
+): Promise<SurfaceOperationResult<ReplyChainMessage[]>> {
+  const blockResult = await resolveMergeBlockEndingAt(adapter, params.triggerMsg);
+  if (blockResult.status === "error") return Result.err(blockResult.error);
+  const block = blockResult.value;
   const anchor = findEarliestReplyAnchor(block);
 
   const startMsgRef = anchor?.ref ?? params.triggerMsg.ref;
@@ -372,12 +395,13 @@ export async function fetchMentionThreadContext(
     startMsgRef,
     maxDepth: params.maxDepth,
   });
+  if (chain.status === "error") return Result.err(chain.error);
 
   const blockMessages = block.map((m) => {
     return toReplyChainMessage(m);
   });
 
-  const combined = dedupeByMessageId([...chain, ...blockMessages]);
+  const combined = dedupeByMessageId([...chain.value, ...blockMessages]);
 
   combined.sort((a, b) => {
     if (a.ts !== b.ts) return a.ts - b.ts;
@@ -385,7 +409,7 @@ export async function fetchMentionThreadContext(
     return a.messageId.localeCompare(b.messageId);
   });
 
-  return combined;
+  return Result.ok(combined);
 }
 
 export function mergeChainByDiscordWindow(

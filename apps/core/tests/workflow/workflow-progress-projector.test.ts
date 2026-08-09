@@ -17,12 +17,7 @@ import {
 import { Panic, Result } from "better-result";
 import { formatTaggedErrorForLog } from "@stanley2058/lilac-utils";
 import { subscribeForTest, type TestRawMessageHandler } from "../helpers/result-raw-bus";
-import type {
-  AdapterEventHandler,
-  SurfaceAdapter,
-  SurfaceOutputStream,
-} from "../../src/surface/adapter";
-import { SurfaceMessageNotFoundError } from "../../src/surface/adapter";
+import { SurfaceMessageNotFound, SurfaceUnavailable } from "../../src/surface/adapter";
 import { createDiscordWorkflowProgressPort } from "../../src/surface/discord/discord-runtime-descriptor";
 import { createGithubWorkflowProgressPort } from "../../src/surface/github/github-runtime-descriptor";
 import type {
@@ -38,6 +33,7 @@ import type {
   SessionRef,
   SurfaceMessage,
 } from "../../src/surface/types";
+import { SurfaceAdapterTestBase } from "../helpers/surface-adapter-test-base";
 import { DurableWorkflowStore } from "../../src/workflow/durable-workflow-store";
 import { startWorkflowActionResolver } from "../../src/workflow/workflow-action-resolver";
 import { sha256 } from "../../src/workflow/workflow-definition";
@@ -113,7 +109,7 @@ class CapturingRawBus implements RawBus {
   }
   async close() {}
 }
-class ProjectionAdapter implements SurfaceAdapter {
+class ProjectionAdapter extends SurfaceAdapterTestBase {
   readonly contents: ContentOpts[] = [];
   readonly messages = new Map<string, SurfaceMessage>();
   sends = 0;
@@ -124,19 +120,32 @@ class ProjectionAdapter implements SurfaceAdapter {
   failNextEditNotFound = false;
   sendRejection: { readonly value: unknown } | null = null;
   editFailure: Error | null = null;
-  constructor(readonly platform: "discord" | "github" = "discord") {}
+  constructor(readonly platform: "discord" | "github" = "discord") {
+    super();
+  }
   async connect() {}
   async disconnect() {}
   async getSelf() {
     return { platform: this.platform, userId: "bot", userName: "bot" };
   }
   async listSessions() {
-    return [];
+    return Result.ok([]);
   }
-  async startOutput(): Promise<SurfaceOutputStream> {
-    throw new Error("not used");
+  async startOutput() {
+    return Result.ok({
+      push: async () => Result.ok("visible" as const),
+      finish: async () => {
+        const ref: MsgRef = {
+          platform: this.platform,
+          channelId: "unused",
+          messageId: "unused",
+        };
+        return Result.ok({ created: [ref], last: ref });
+      },
+      abort: async () => Result.ok(undefined),
+    });
   }
-  async sendMsg(session: SessionRef, content: ContentOpts, _opts?: SendOpts): Promise<MsgRef> {
+  async sendMsg(session: SessionRef, content: ContentOpts, _opts?: SendOpts) {
     if (this.sendRejection) {
       const rejection = this.sendRejection.value;
       this.sendRejection = null;
@@ -144,7 +153,13 @@ class ProjectionAdapter implements SurfaceAdapter {
     }
     if (this.failNextSend) {
       this.failNextSend = false;
-      throw new Error("transient surface failure");
+      return Result.err(
+        new SurfaceUnavailable({
+          platform: this.platform,
+          operation: "send-message",
+          message: "transient surface failure",
+        }),
+      );
     }
     this.sends += 1;
     this.contents.push(content);
@@ -159,50 +174,83 @@ class ProjectionAdapter implements SurfaceAdapter {
       text: content.text ?? "",
       ts: Date.now(),
     });
-    return ref;
+    return Result.ok(ref);
   }
   async readMsg(ref: MsgRef) {
     this.reads += 1;
     if (this.failNextRead) {
       this.failNextRead = false;
-      throw new Error("transient lookup failure");
+      return Result.err(
+        new SurfaceUnavailable({
+          platform: this.platform,
+          operation: "read-message",
+          message: "transient lookup failure",
+        }),
+      );
     }
-    return this.messages.get(ref.messageId) ?? null;
+    return Result.ok(this.messages.get(ref.messageId) ?? null);
   }
   async listMsg(_session: SessionRef, _opts?: LimitOpts) {
-    return [...this.messages.values()];
+    return Result.ok([...this.messages.values()]);
   }
   async editMsg(ref: MsgRef, content: ContentOpts) {
-    if (this.editFailure) throw this.editFailure;
+    if (this.editFailure) {
+      if (Panic.is(this.editFailure)) throw this.editFailure;
+      return Result.err(
+        new SurfaceUnavailable({
+          platform: this.platform,
+          operation: "edit-message",
+          message: this.editFailure.message,
+        }),
+      );
+    }
     if (this.failNextEditNotFound) {
       this.failNextEditNotFound = false;
       this.messages.delete(ref.messageId);
-      throw new SurfaceMessageNotFoundError(this.platform, 10008, "missing");
+      return Result.err(
+        new SurfaceMessageNotFound({
+          platform: this.platform,
+          operation: "edit-message",
+          message: "missing",
+        }),
+      );
     }
     const current = this.messages.get(ref.messageId);
-    if (!current) throw new SurfaceMessageNotFoundError(this.platform, 10008, "missing");
+    if (!current)
+      return Result.err(
+        new SurfaceMessageNotFound({
+          platform: this.platform,
+          operation: "edit-message",
+          message: "missing",
+        }),
+      );
     this.edits += 1;
     this.contents.push(content);
     this.messages.set(ref.messageId, { ...current, text: content.text ?? "" });
+    return Result.ok(undefined);
   }
   async deleteMsg(ref: MsgRef) {
     this.messages.delete(ref.messageId);
+    return Result.ok(undefined);
   }
   async getReplyContext() {
-    return [];
+    return Result.ok([]);
   }
-  async addReaction() {}
-  async removeReaction() {}
+  async addReaction() {
+    return Result.ok(undefined);
+  }
+  async removeReaction() {
+    return Result.ok(undefined);
+  }
   async listReactions() {
-    return [];
-  }
-  async subscribe(_handler: AdapterEventHandler) {
-    return { stop: async () => {} };
+    return Result.ok([]);
   }
   async getUnRead() {
-    return [];
+    return Result.ok([]);
   }
-  async markRead() {}
+  async markRead() {
+    return Result.ok(undefined);
+  }
 }
 class BlockingProjectionAdapter extends ProjectionAdapter {
   private releaseSend: (() => void) | null = null;
@@ -213,11 +261,7 @@ class BlockingProjectionAdapter extends ProjectionAdapter {
   release(): void {
     this.releaseSend?.();
   }
-  override async sendMsg(
-    session: SessionRef,
-    content: ContentOpts,
-    options?: SendOpts,
-  ): Promise<MsgRef> {
+  override async sendMsg(session: SessionRef, content: ContentOpts, options?: SendOpts) {
     this.resolveSendStarted();
     await new Promise<void>((resolve) => {
       this.releaseSend = resolve;
@@ -753,7 +797,7 @@ describe("WorkflowProgressProjector", () => {
       rmSync(dbPath, { force: true });
     }
   });
-  it("keeps opaque non-Error surface rejections out of durable failures", async () => {
+  it("preserves unrecognized non-Error surface rejections as defects", async () => {
     const dbPath = tempDbPath("workflow-projector-opaque-rejection");
     const store = new DurableWorkflowStore(dbPath);
     const adapter = new ProjectionAdapter();
@@ -767,14 +811,12 @@ describe("WorkflowProgressProjector", () => {
     });
     try {
       createInvocation(store);
-      adapter.sendRejection = { value: "provider-secret-rejection" };
+      const rejection = "provider-secret-rejection";
+      adapter.sendRejection = { value: rejection };
 
-      await expect(projector.ensureInitialCard("run-1")).rejects.toThrow(
-        "Opaque workflow progress surface failure",
-      );
+      await expect(projector.ensureInitialCard("run-1")).rejects.toBe(rejection);
       const binding = workflowStoreValue(store.getSurfaceBinding("run-1"));
-      expect(binding?.lastError).toBe("Opaque workflow progress surface failure");
-      expect(binding?.lastError).not.toContain("provider-secret-rejection");
+      expect(binding?.lastError).toBeNull();
     } finally {
       await projector.stop();
       await bus.close();

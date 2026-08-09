@@ -52,7 +52,11 @@ class WorkflowProgressProjectionFailed extends TaggedError("WorkflowProgressProj
 type WorkflowProgressSurfaceCallFailureFields =
   | { readonly failureKind: "created"; readonly createdRef: MsgRef; readonly message: string }
   | { readonly failureKind: "not-found"; readonly createdRef: null; readonly message: string }
-  | { readonly failureKind: "failed"; readonly createdRef: null; readonly message: string };
+  | {
+      readonly failureKind: "failed";
+      readonly createdRef: null;
+      readonly message: string;
+    };
 
 export class WorkflowProgressSurfaceCreated extends TaggedError("WorkflowProgressSurfaceCreated")<
   Extract<WorkflowProgressSurfaceCallFailureFields, { failureKind: "created" }>
@@ -643,18 +647,17 @@ export class WorkflowProgressProjector implements WorkflowProgressCardService {
       let found: boolean;
       switch (checked.status) {
         case "error": {
-          let error: WorkflowProgressSurfaceFailure;
           switch (checked.error.kind) {
-            case "failed":
-              error = workflowProgressSurfaceCallFailure({
+            case "failed": {
+              const error = workflowProgressSurfaceCallFailure({
                 failureKind: "failed",
                 createdRef: null,
                 message: checked.error.error.message,
               });
-              break;
+              this.writeFailure(existing, error.message, now);
+              return Result.err(error);
+            }
           }
-          this.writeFailure(existing, error.message, now);
-          return Result.err(error);
         }
         case "ok":
           switch (checked.value) {

@@ -1,20 +1,22 @@
 import { describe, expect, expectTypeOf, it, spyOn } from "bun:test";
 import { Panic, Result } from "better-result";
 
-import { GithubApiError } from "../../src/github/github-api";
 import type {
-  AdapterEventHandler,
   StartOutputOpts,
   SurfaceAdapter,
+  SurfaceOperationResult,
   SurfaceOutputStream,
 } from "../../src/surface/adapter";
-import { SurfaceMessageNotFoundError } from "../../src/surface/adapter";
+import {
+  SurfaceMessageNotFound,
+  SurfaceOperationPartiallyCompleted,
+  SurfaceUnavailable,
+} from "../../src/surface/adapter";
 import {
   createDiscordRelayPolicy,
   createDiscordSurfaceRuntimeDescriptor,
   createDiscordWorkflowProgressPort,
 } from "../../src/surface/discord/discord-runtime-descriptor";
-import { GithubMessageCreatedError } from "../../src/surface/github/github-adapter";
 import {
   createConfiguredGithubSurfaceRuntimeDescriptor,
   createGithubRelayPolicy,
@@ -39,10 +41,8 @@ import type {
   MsgRef,
   SendOpts,
   SessionRef,
-  SurfaceMessage,
   SurfacePlatform,
   SurfaceSelf,
-  SurfaceSession,
 } from "../../src/surface/types";
 
 class TestAdapter implements SurfaceAdapter {
@@ -60,63 +60,93 @@ class TestAdapter implements SurfaceAdapter {
     return { platform: this.selfPlatform, userId: "bot", userName: "bot" };
   }
 
-  async listSessions(): Promise<SurfaceSession[]> {
-    return [];
+  async listSessions() {
+    return Result.ok([]);
   }
 
-  async startOutput(
-    _sessionRef: SessionRef,
-    _opts?: StartOutputOpts,
-  ): Promise<SurfaceOutputStream> {
-    return {
-      push: async () => "visible",
-      finish: async () => ({
-        created: [{ platform: "discord", channelId: "channel", messageId: "message" }],
-        last: { platform: "discord", channelId: "channel", messageId: "message" },
-      }),
-      abort: async () => undefined,
-    };
+  async listSessionParticipants() {
+    return Result.ok({ source: "guild_members" as const, participants: [] });
   }
 
-  async sendMsg(sessionRef: SessionRef, _content: ContentOpts, _opts?: SendOpts): Promise<MsgRef> {
-    return sessionRef.platform === "discord"
-      ? { platform: "discord", channelId: sessionRef.channelId, messageId: "message" }
-      : { platform: "github", channelId: sessionRef.channelId, messageId: "message" };
+  async startOutput(_sessionRef: SessionRef, _opts?: StartOutputOpts) {
+    return Result.ok({
+      push: async () => Result.ok("visible" as const),
+      finish: async () =>
+        Result.ok({
+          created: [{ platform: "discord", channelId: "channel", messageId: "message" }],
+          last: { platform: "discord", channelId: "channel", messageId: "message" },
+        }),
+      abort: async () => Result.ok(undefined),
+    } satisfies SurfaceOutputStream);
   }
 
-  async readMsg(_msgRef: MsgRef): Promise<SurfaceMessage | null> {
-    return null;
+  async startTyping() {
+    return Result.ok({ stop: async () => Result.ok(undefined) });
   }
 
-  async listMsg(_sessionRef: SessionRef, _opts?: LimitOpts): Promise<SurfaceMessage[]> {
-    return [];
+  async sendMsg(
+    sessionRef: SessionRef,
+    _content: ContentOpts,
+    _opts?: SendOpts,
+  ): Promise<SurfaceOperationResult<MsgRef>> {
+    return Result.ok(
+      (sessionRef.platform === "discord"
+        ? { platform: "discord", channelId: sessionRef.channelId, messageId: "message" }
+        : { platform: "github", channelId: sessionRef.channelId, messageId: "message" }) as MsgRef,
+    );
   }
 
-  async editMsg(_msgRef: MsgRef, _content: ContentOpts): Promise<void> {}
-
-  async deleteMsg(_msgRef: MsgRef): Promise<void> {}
-
-  async getReplyContext(_msgRef: MsgRef, _opts?: LimitOpts): Promise<SurfaceMessage[]> {
-    return [];
+  async readMsg(_msgRef: MsgRef) {
+    return Result.ok(null);
   }
 
-  async addReaction(_msgRef: MsgRef, _reaction: string): Promise<void> {}
-
-  async removeReaction(_msgRef: MsgRef, _reaction: string): Promise<void> {}
-
-  async listReactions(_msgRef: MsgRef): Promise<string[]> {
-    return [];
+  async listMsg(_sessionRef: SessionRef, _opts?: LimitOpts) {
+    return Result.ok([]);
   }
 
-  async subscribe(_handler: AdapterEventHandler) {
-    return { stop: async () => undefined };
+  async editMsg(_msgRef: MsgRef, _content: ContentOpts): Promise<SurfaceOperationResult<void>> {
+    return Result.ok(undefined);
   }
 
-  async getUnRead(_sessionRef: SessionRef): Promise<SurfaceMessage[]> {
-    return [];
+  async deleteMsg(_msgRef: MsgRef): Promise<SurfaceOperationResult<void>> {
+    return Result.ok(undefined);
   }
 
-  async markRead(_sessionRef: SessionRef, _upToMsgRef?: MsgRef): Promise<void> {}
+  async getReplyContext(_msgRef: MsgRef, _opts?: LimitOpts) {
+    return Result.ok([]);
+  }
+
+  async planReplyChain(msgRef: MsgRef) {
+    return Result.ok([msgRef]);
+  }
+
+  async planMergeBlockEndingAt(msgRef: MsgRef) {
+    return Result.ok([msgRef]);
+  }
+
+  async addReaction(_msgRef: MsgRef, _reaction: string) {
+    return Result.ok(undefined);
+  }
+
+  async removeReaction(_msgRef: MsgRef, _reaction: string) {
+    return Result.ok(undefined);
+  }
+
+  async listReactions(_msgRef: MsgRef) {
+    return Result.ok([]);
+  }
+
+  async listReactionDetails(_msgRef: MsgRef) {
+    return Result.ok([]);
+  }
+
+  async getUnRead(_sessionRef: SessionRef) {
+    return Result.ok([]);
+  }
+
+  async markRead(_sessionRef: SessionRef, _upToMsgRef?: MsgRef) {
+    return Result.ok(undefined);
+  }
 }
 
 function discordAdapterIngress(): SurfaceAdapterIngress<"discord"> {
@@ -354,8 +384,14 @@ describe("surface workflow progress ports", () => {
   it("returns closed Discord and GitHub failure outcomes and preserves Panic", async () => {
     const discordAdapter = new TestAdapter("discord");
     const discordPort = createDiscordWorkflowProgressPort(discordAdapter);
-    spyOn(discordAdapter, "editMsg").mockRejectedValue(
-      new SurfaceMessageNotFoundError("discord", 10008, "missing"),
+    spyOn(discordAdapter, "editMsg").mockResolvedValue(
+      Result.err(
+        new SurfaceMessageNotFound({
+          platform: "discord",
+          operation: "edit-message",
+          message: "missing",
+        }),
+      ),
     );
     expect(
       await discordPort.edit({ channelId: "channel", messageId: "missing" }, { text: "edit" }),
@@ -364,15 +400,28 @@ describe("surface workflow progress ports", () => {
     const githubAdapter = new TestAdapter("github");
     const githubPort = createGithubWorkflowProgressPort(githubAdapter);
     const createdRef = { platform: "github" as const, channelId: "octo/repo#1", messageId: "42" };
-    spyOn(githubAdapter, "sendMsg").mockRejectedValue(
-      new GithubMessageCreatedError(createdRef, new Error("action edit failed")),
+    spyOn(githubAdapter, "sendMsg").mockResolvedValue(
+      Result.err(
+        new SurfaceOperationPartiallyCompleted({
+          platform: "github",
+          operation: "send-message",
+          created: createdRef,
+          message: "action edit failed",
+        }),
+      ),
     );
     expect(
       await githubPort.send({ channelId: "octo/repo#1", content: { text: "Queued" } }),
     ).toEqual(Result.err({ kind: "created", ref: createdRef }));
 
-    spyOn(githubAdapter, "editMsg").mockRejectedValue(
-      new GithubApiError(404, "/repos/octo/repo/issues/comments/42", "missing"),
+    spyOn(githubAdapter, "editMsg").mockResolvedValue(
+      Result.err(
+        new SurfaceMessageNotFound({
+          platform: "github",
+          operation: "edit-message",
+          message: "missing",
+        }),
+      ),
     );
     expect(
       await githubPort.edit({ channelId: "octo/repo#1", messageId: "42" }, { text: "edit" }),
@@ -385,26 +434,38 @@ describe("surface workflow progress ports", () => {
     ).rejects.toBe(panic);
   });
 
-  it("maps non-Error rejections to an opaque local failure", async () => {
+  it("preserves unrecognized non-Error rejections as defects", async () => {
     const adapter = new TestAdapter("discord");
     const port = createDiscordWorkflowProgressPort(adapter);
-    spyOn(adapter, "sendMsg").mockRejectedValue("provider-secret-rejection");
+    const rejection = "provider-secret-rejection";
+    spyOn(adapter, "sendMsg").mockRejectedValue(rejection);
 
-    const sent = await port.send({ channelId: "channel", content: { text: "Queued" } });
-
-    expect(sent.status).toBe("error");
-    if (sent.status === "error") {
-      switch (sent.error.kind) {
-        case "failed":
-          expect(sent.error.error.message).toBe("Opaque workflow progress surface failure");
-          expect(sent.error.error.message).not.toContain("provider-secret-rejection");
-          break;
-      }
-    }
+    await expect(port.send({ channelId: "channel", content: { text: "Queued" } })).rejects.toBe(
+      rejection,
+    );
   });
 });
 
 describe("surface relay policies", () => {
+  it("signals Discord skipped-output cleanup failures to the relay host", async () => {
+    const adapter = new TestAdapter("discord");
+    const failure = new SurfaceUnavailable({
+      platform: "discord",
+      operation: "delete-message",
+      message: "cleanup failed",
+    });
+    spyOn(adapter, "deleteMsg").mockResolvedValue(Result.err(failure));
+    const policy = createDiscordRelayPolicy(adapter);
+    const cleanupSkippedOutput = policy.finalization?.cleanupSkippedOutput;
+    if (!cleanupSkippedOutput) throw new Error("missing Discord skipped-output cleanup");
+
+    await expect(
+      cleanupSkippedOutput({
+        ref: { platform: "discord", channelId: "channel", messageId: "message" },
+      }),
+    ).rejects.toBe(failure);
+  });
+
   it.each([
     ["discord", "req:generic", "channel", "none", undefined],
     ["discord", "discord:channel:message", "channel", "target", undefined],

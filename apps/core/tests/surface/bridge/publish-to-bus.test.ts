@@ -14,7 +14,7 @@ import {
 import type {
   AdapterSubscription,
   AdapterEventHandler,
-  SurfaceAdapter,
+  SurfaceOperationResult,
   SurfaceOutputStream,
   TypingIndicatorSubscription,
 } from "../../../src/surface/adapter";
@@ -30,6 +30,7 @@ import type {
   SurfaceSelf,
   SurfaceSession,
 } from "../../../src/surface/types";
+import { SurfaceAdapterTestBase } from "../../helpers/surface-adapter-test-base";
 import { formatSurfaceMetadataLine } from "../../../src/surface/bridge/surface-metadata";
 import type { TranscriptStore } from "../../../src/transcript/transcript-store";
 import {
@@ -101,7 +102,7 @@ function createInMemoryRawBus(): RawBus & TestRawSubscriptionHost {
   };
 }
 
-class FakeAdapter implements SurfaceAdapter {
+class FakeAdapter extends SurfaceAdapterTestBase {
   private readonly handlers = new Set<AdapterEventHandler>();
 
   emit(evt: AdapterEvent) {
@@ -118,40 +119,58 @@ class FakeAdapter implements SurfaceAdapter {
     return { platform: "discord", userId: "bot", userName: "lilac" };
   }
 
-  async listSessions(): Promise<SurfaceSession[]> {
-    return [];
+  async listSessions(): Promise<SurfaceOperationResult<SurfaceSession[]>> {
+    return Result.ok([]);
   }
 
-  async startOutput(_sessionRef: SessionRef): Promise<SurfaceOutputStream> {
+  async startOutput(_sessionRef: SessionRef): Promise<SurfaceOperationResult<SurfaceOutputStream>> {
     throw new Error("unused");
   }
 
-  async sendMsg(_sessionRef: SessionRef, _content: ContentOpts, _opts?: SendOpts): Promise<MsgRef> {
+  async sendMsg(
+    _sessionRef: SessionRef,
+    _content: ContentOpts,
+    _opts?: SendOpts,
+  ): Promise<SurfaceOperationResult<MsgRef>> {
     throw new Error("unused");
   }
 
-  async readMsg(_msgRef: MsgRef): Promise<SurfaceMessage | null> {
-    return null;
+  async readMsg(_msgRef: MsgRef): Promise<SurfaceOperationResult<SurfaceMessage | null>> {
+    return Result.ok(null);
   }
 
-  async listMsg(_sessionRef: SessionRef, _opts?: LimitOpts): Promise<SurfaceMessage[]> {
-    return [];
+  async listMsg(
+    _sessionRef: SessionRef,
+    _opts?: LimitOpts,
+  ): Promise<SurfaceOperationResult<SurfaceMessage[]>> {
+    return Result.ok([]);
   }
 
-  async editMsg(_msgRef: MsgRef, _content: ContentOpts): Promise<void> {}
-
-  async deleteMsg(_msgRef: MsgRef): Promise<void> {}
-
-  async getReplyContext(_msgRef: MsgRef, _opts?: LimitOpts): Promise<SurfaceMessage[]> {
-    return [];
+  async editMsg(_msgRef: MsgRef, _content: ContentOpts): Promise<SurfaceOperationResult<void>> {
+    return Result.ok(undefined);
   }
 
-  async addReaction(_msgRef: MsgRef, _reaction: string): Promise<void> {}
+  async deleteMsg(_msgRef: MsgRef): Promise<SurfaceOperationResult<void>> {
+    return Result.ok(undefined);
+  }
 
-  async removeReaction(_msgRef: MsgRef, _reaction: string): Promise<void> {}
+  async getReplyContext(
+    _msgRef: MsgRef,
+    _opts?: LimitOpts,
+  ): Promise<SurfaceOperationResult<SurfaceMessage[]>> {
+    return Result.ok([]);
+  }
 
-  async listReactions(_msgRef: MsgRef): Promise<string[]> {
-    return [];
+  async addReaction(_msgRef: MsgRef, _reaction: string): Promise<SurfaceOperationResult<void>> {
+    return Result.ok(undefined);
+  }
+
+  async removeReaction(_msgRef: MsgRef, _reaction: string): Promise<SurfaceOperationResult<void>> {
+    return Result.ok(undefined);
+  }
+
+  async listReactions(_msgRef: MsgRef): Promise<SurfaceOperationResult<string[]>> {
+    return Result.ok([]);
   }
 
   async subscribe(handler: AdapterEventHandler): Promise<AdapterSubscription> {
@@ -163,14 +182,21 @@ class FakeAdapter implements SurfaceAdapter {
     };
   }
 
-  async getUnRead(_sessionRef: SessionRef): Promise<SurfaceMessage[]> {
-    return [];
+  async getUnRead(_sessionRef: SessionRef): Promise<SurfaceOperationResult<SurfaceMessage[]>> {
+    return Result.ok([]);
   }
 
-  async markRead(_sessionRef: SessionRef, _upToMsgRef?: MsgRef): Promise<void> {}
+  async markRead(
+    _sessionRef: SessionRef,
+    _upToMsgRef?: MsgRef,
+  ): Promise<SurfaceOperationResult<void>> {
+    return Result.ok(undefined);
+  }
 
-  async startTyping(_sessionRef: SessionRef): Promise<TypingIndicatorSubscription> {
-    return { stop: async () => {} };
+  override async startTyping(
+    _sessionRef: SessionRef,
+  ): Promise<SurfaceOperationResult<TypingIndicatorSubscription>> {
+    return Result.ok({ stop: async () => Result.ok(undefined) });
   }
 }
 
@@ -193,7 +219,12 @@ describe("bridgeAdapterToBus cancel mapping", () => {
       },
       close() {},
     };
-    await bridgeAdapterToBus({ adapter, bus, subscriptionId: "test", transcriptStore });
+    await bridgeAdapterToBus({
+      eventSource: adapter,
+      bus,
+      subscriptionId: "test",
+      transcriptStore,
+    });
 
     adapter.emit({
       type: "adapter.message.deleted",
@@ -241,7 +272,12 @@ describe("bridgeAdapterToBus cancel mapping", () => {
     );
     if (evtSubResult.status === "error") throw evtSubResult.error;
     const evtSub = evtSubResult.value;
-    await bridgeAdapterToBus({ adapter, bus, subscriptionId: "test", transcriptStore });
+    await bridgeAdapterToBus({
+      eventSource: adapter,
+      bus,
+      subscriptionId: "test",
+      transcriptStore,
+    });
 
     adapter.emit({
       type: "adapter.message.deleted",
@@ -262,7 +298,7 @@ describe("bridgeAdapterToBus cancel mapping", () => {
     const bus = createLilacBus(createInMemoryRawBus());
     const adapter = new FakeAdapter();
 
-    await bridgeAdapterToBus({ adapter, bus, subscriptionId: "test" });
+    await bridgeAdapterToBus({ eventSource: adapter, bus, subscriptionId: "test" });
 
     const published: Array<Message<unknown>> = [];
     const evtSubResult = await bus.subscribeTopic(
@@ -385,7 +421,7 @@ describe("bridgeAdapterToBus cancel mapping", () => {
     const bus = createLilacBus(createInMemoryRawBus());
     const adapter = new FakeAdapter();
 
-    await bridgeAdapterToBus({ adapter, bus, subscriptionId: "test" });
+    await bridgeAdapterToBus({ eventSource: adapter, bus, subscriptionId: "test" });
 
     const published: Array<Message<unknown>> = [];
     const subResult = await bus.subscribeTopic(
@@ -440,7 +476,7 @@ describe("bridgeAdapterToBus cancel mapping", () => {
     const bus = createLilacBus(createInMemoryRawBus());
     const adapter = new FakeAdapter();
 
-    await bridgeAdapterToBus({ adapter, bus, subscriptionId: "test" });
+    await bridgeAdapterToBus({ eventSource: adapter, bus, subscriptionId: "test" });
 
     const published: Array<Message<unknown>> = [];
     const subResult = await bus.subscribeTopic(
@@ -499,7 +535,7 @@ describe("bridgeAdapterToBus cancel mapping", () => {
     const bus = createLilacBus(createInMemoryRawBus());
     const adapter = new FakeAdapter();
 
-    await bridgeAdapterToBus({ adapter, bus, subscriptionId: "test" });
+    await bridgeAdapterToBus({ eventSource: adapter, bus, subscriptionId: "test" });
 
     const published: Array<Message<unknown>> = [];
     const subResult = await bus.subscribeTopic(

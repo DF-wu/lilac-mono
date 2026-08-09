@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, spyOn } from "bun:test";
 
 import {
   composeRecentChannelMessages as composeRecentChannelMessagesResult,
@@ -11,9 +11,10 @@ import type {
   AdapterEventHandler,
   AdapterSubscription,
   StartOutputOpts,
-  SurfaceAdapter,
+  SurfaceOperationResult,
   SurfaceOutputStream,
 } from "../../../src/surface/adapter";
+import { SurfacePermissionDenied, SurfaceUnavailable } from "../../../src/surface/adapter";
 import type { TranscriptSnapshot, TranscriptStore } from "../../../src/transcript/transcript-store";
 import type {
   ContentOpts,
@@ -25,6 +26,7 @@ import type {
   SurfaceSelf,
   SurfaceSession,
 } from "../../../src/surface/types";
+import { SurfaceAdapterTestBase } from "../../helpers/surface-adapter-test-base";
 
 async function composeRecentChannelMessages(
   ...args: Parameters<typeof composeRecentChannelMessagesResult>
@@ -63,11 +65,13 @@ function transcriptStoreFor(
   };
 }
 
-class FakeAdapter implements SurfaceAdapter {
+class FakeAdapter extends SurfaceAdapterTestBase {
   constructor(
     private readonly message: SurfaceMessage,
     private readonly reactions: readonly string[] = [],
-  ) {}
+  ) {
+    super();
+  }
 
   async connect(): Promise<void> {
     throw new Error("not implemented");
@@ -79,63 +83,67 @@ class FakeAdapter implements SurfaceAdapter {
   async getSelf(): Promise<SurfaceSelf> {
     throw new Error("not implemented");
   }
-  async listSessions(): Promise<SurfaceSession[]> {
-    throw new Error("not implemented");
+  async listSessions() {
+    return Result.ok([]);
   }
 
-  async startOutput(
-    _sessionRef: SessionRef,
-    _opts?: StartOutputOpts,
-  ): Promise<SurfaceOutputStream> {
-    throw new Error("not implemented");
+  async startOutput(_sessionRef: SessionRef, _opts?: StartOutputOpts) {
+    return Result.ok({
+      push: async () => Result.ok("visible" as const),
+      finish: async () => {
+        const ref = { platform: "discord" as const, channelId: "unused", messageId: "unused" };
+        return Result.ok({ created: [ref], last: ref });
+      },
+      abort: async () => Result.ok(undefined),
+    });
   }
 
-  async sendMsg(_sessionRef: SessionRef, _content: ContentOpts, _opts?: SendOpts): Promise<MsgRef> {
-    throw new Error("not implemented");
+  async sendMsg(_sessionRef: SessionRef, _content: ContentOpts, _opts?: SendOpts) {
+    return Result.ok({ platform: "discord", channelId: "unused", messageId: "unused" } as const);
   }
 
-  async readMsg(_msgRef: MsgRef): Promise<SurfaceMessage | null> {
-    return this.message;
+  async readMsg(_msgRef: MsgRef): Promise<SurfaceOperationResult<SurfaceMessage | null>> {
+    return Result.ok(this.message);
   }
 
-  async listMsg(_sessionRef: SessionRef, _opts?: LimitOpts): Promise<SurfaceMessage[]> {
-    throw new Error("not implemented");
+  async listMsg(_sessionRef: SessionRef, _opts?: LimitOpts) {
+    return Result.ok([]);
   }
 
-  async editMsg(_msgRef: MsgRef, _content: ContentOpts): Promise<void> {
-    throw new Error("not implemented");
+  async editMsg(_msgRef: MsgRef, _content: ContentOpts) {
+    return Result.ok(undefined);
   }
 
-  async deleteMsg(_msgRef: MsgRef): Promise<void> {
-    throw new Error("not implemented");
+  async deleteMsg(_msgRef: MsgRef) {
+    return Result.ok(undefined);
   }
 
-  async getReplyContext(_msgRef: MsgRef, _opts?: LimitOpts): Promise<SurfaceMessage[]> {
-    throw new Error("not implemented");
+  async getReplyContext(_msgRef: MsgRef, _opts?: LimitOpts) {
+    return Result.ok([]);
   }
 
-  async addReaction(_msgRef: MsgRef, _reaction: string): Promise<void> {
-    throw new Error("not implemented");
+  async addReaction(_msgRef: MsgRef, _reaction: string) {
+    return Result.ok(undefined);
   }
 
-  async removeReaction(_msgRef: MsgRef, _reaction: string): Promise<void> {
-    throw new Error("not implemented");
+  async removeReaction(_msgRef: MsgRef, _reaction: string) {
+    return Result.ok(undefined);
   }
 
-  async listReactions(_msgRef: MsgRef): Promise<string[]> {
-    return [...this.reactions];
+  async listReactions(_msgRef: MsgRef): Promise<SurfaceOperationResult<string[]>> {
+    return Result.ok([...this.reactions]);
   }
 
   async subscribe(_handler: AdapterEventHandler): Promise<AdapterSubscription> {
     throw new Error("not implemented");
   }
 
-  async getUnRead(_sessionRef: SessionRef): Promise<SurfaceMessage[]> {
-    throw new Error("not implemented");
+  async getUnRead(_sessionRef: SessionRef) {
+    return Result.ok([]);
   }
 
-  async markRead(_sessionRef: SessionRef, _upToMsgRef?: MsgRef): Promise<void> {
-    throw new Error("not implemented");
+  async markRead(_sessionRef: SessionRef, _upToMsgRef?: MsgRef) {
+    return Result.ok(undefined);
   }
 }
 
@@ -149,6 +157,66 @@ afterEach(() => {
 });
 
 describe("request-composition attachments", () => {
+  it("propagates message read failures instead of composing empty context", async () => {
+    const msg: SurfaceMessage = {
+      ref: { platform: "discord", channelId: "c", messageId: "m" },
+      session: { platform: "discord", channelId: "c" },
+      userId: "u",
+      text: "hi",
+      ts: 0,
+    };
+    const adapter = new FakeAdapter(msg);
+    const failure = new SurfaceUnavailable({
+      platform: "discord",
+      operation: "read-message",
+      message: "provider unavailable",
+    });
+    spyOn(adapter, "readMsg").mockResolvedValue(Result.err(failure));
+
+    const composed = await composeSingleMessageResult(adapter, {
+      platform: "discord",
+      botUserId: "bot",
+      botName: "lilac",
+      msgRef: msg.ref,
+    });
+
+    expect(composed).toEqual(Result.err(failure));
+  });
+
+  it.each([
+    new SurfaceUnavailable({
+      platform: "discord",
+      operation: "list-reactions",
+      message: "provider unavailable",
+    }),
+    new SurfacePermissionDenied({
+      platform: "discord",
+      operation: "list-reactions",
+      message: "reaction list forbidden",
+    }),
+  ])("degrades optional reaction enrichment for $error._tag", async (failure) => {
+    const msg: SurfaceMessage = {
+      ref: { platform: "discord", channelId: "c", messageId: "m" },
+      session: { platform: "discord", channelId: "c" },
+      userId: "u",
+      text: "hi",
+      ts: 0,
+    };
+    const adapter = new FakeAdapter(msg);
+    spyOn(adapter, "listReactions").mockResolvedValue(Result.err(failure));
+
+    const composed = await composeSingleMessageResult(adapter, {
+      platform: "discord",
+      botUserId: "bot",
+      botName: "lilac",
+      msgRef: msg.ref,
+    });
+
+    expect(composed.status).toBe("ok");
+    if (composed.status === "error") throw composed.error;
+    expect(JSON.stringify(composed.value)).not.toContain("Reactions:");
+  });
+
   it("includes reaction hint in attribution header", async () => {
     const msg: SurfaceMessage = {
       ref: { platform: "discord", channelId: "c", messageId: "m" },
@@ -1012,8 +1080,10 @@ describe("request-composition attachments", () => {
 });
 
 describe("request-composition mention thread context", () => {
-  class MultiFakeAdapter implements SurfaceAdapter {
-    constructor(private readonly messages: Record<string, SurfaceMessage>) {}
+  class MultiFakeAdapter extends SurfaceAdapterTestBase {
+    constructor(private readonly messages: Record<string, SurfaceMessage>) {
+      super();
+    }
 
     async connect(): Promise<void> {
       throw new Error("not implemented");
@@ -1025,14 +1095,14 @@ describe("request-composition mention thread context", () => {
     async getSelf(): Promise<SurfaceSelf> {
       throw new Error("not implemented");
     }
-    async listSessions(): Promise<SurfaceSession[]> {
+    async listSessions(): Promise<SurfaceOperationResult<SurfaceSession[]>> {
       throw new Error("not implemented");
     }
 
     async startOutput(
       _sessionRef: SessionRef,
       _opts?: StartOutputOpts,
-    ): Promise<SurfaceOutputStream> {
+    ): Promise<SurfaceOperationResult<SurfaceOutputStream>> {
       throw new Error("not implemented");
     }
 
@@ -1040,31 +1110,37 @@ describe("request-composition mention thread context", () => {
       _sessionRef: SessionRef,
       _content: ContentOpts,
       _opts?: SendOpts,
-    ): Promise<MsgRef> {
+    ): Promise<SurfaceOperationResult<MsgRef>> {
       throw new Error("not implemented");
     }
 
-    async readMsg(msgRef: MsgRef): Promise<SurfaceMessage | null> {
+    async readMsg(msgRef: MsgRef): Promise<SurfaceOperationResult<SurfaceMessage | null>> {
       const key = `${msgRef.channelId}:${msgRef.messageId}`;
-      return this.messages[key] ?? null;
+      return Result.ok(this.messages[key] ?? null);
     }
 
-    async listMsg(_sessionRef: SessionRef, _opts?: LimitOpts): Promise<SurfaceMessage[]> {
+    async listMsg(
+      _sessionRef: SessionRef,
+      _opts?: LimitOpts,
+    ): Promise<SurfaceOperationResult<SurfaceMessage[]>> {
       throw new Error("not implemented");
     }
 
-    async editMsg(_msgRef: MsgRef, _content: ContentOpts): Promise<void> {
+    async editMsg(_msgRef: MsgRef, _content: ContentOpts): Promise<SurfaceOperationResult<void>> {
       throw new Error("not implemented");
     }
 
-    async deleteMsg(_msgRef: MsgRef): Promise<void> {
+    async deleteMsg(_msgRef: MsgRef): Promise<SurfaceOperationResult<void>> {
       throw new Error("not implemented");
     }
 
-    async getReplyContext(msgRef: MsgRef, opts?: LimitOpts): Promise<SurfaceMessage[]> {
+    async getReplyContext(
+      msgRef: MsgRef,
+      opts?: LimitOpts,
+    ): Promise<SurfaceOperationResult<SurfaceMessage[]>> {
       const key = `${msgRef.channelId}:${msgRef.messageId}`;
       const base = this.messages[key];
-      if (!base) return [];
+      if (!base) return Result.ok([]);
 
       const limit = opts?.limit ?? 20;
       const half = Math.max(1, Math.floor(limit / 2));
@@ -1078,30 +1154,36 @@ describe("request-composition mention thread context", () => {
       const before = beforeAll.slice(Math.max(0, beforeAll.length - half));
 
       const after = all.filter((m) => m.ts > base.ts).slice(0, half);
-      return before.concat(after);
+      return Result.ok(before.concat(after));
     }
 
-    async addReaction(_msgRef: MsgRef, _reaction: string): Promise<void> {
+    async addReaction(_msgRef: MsgRef, _reaction: string): Promise<SurfaceOperationResult<void>> {
       throw new Error("not implemented");
     }
 
-    async removeReaction(_msgRef: MsgRef, _reaction: string): Promise<void> {
+    async removeReaction(
+      _msgRef: MsgRef,
+      _reaction: string,
+    ): Promise<SurfaceOperationResult<void>> {
       throw new Error("not implemented");
     }
 
-    async listReactions(_msgRef: MsgRef): Promise<string[]> {
-      return [];
+    async listReactions(_msgRef: MsgRef): Promise<SurfaceOperationResult<string[]>> {
+      return Result.ok([]);
     }
 
     async subscribe(_handler: AdapterEventHandler): Promise<AdapterSubscription> {
       throw new Error("not implemented");
     }
 
-    async getUnRead(_sessionRef: SessionRef): Promise<SurfaceMessage[]> {
+    async getUnRead(_sessionRef: SessionRef): Promise<SurfaceOperationResult<SurfaceMessage[]>> {
       throw new Error("not implemented");
     }
 
-    async markRead(_sessionRef: SessionRef, _upToMsgRef?: MsgRef): Promise<void> {
+    async markRead(
+      _sessionRef: SessionRef,
+      _upToMsgRef?: MsgRef,
+    ): Promise<SurfaceOperationResult<void>> {
       throw new Error("not implemented");
     }
   }
@@ -1638,10 +1720,12 @@ describe("request-composition mention thread context", () => {
 });
 
 describe("request-composition active channel burst rules", () => {
-  class ListFakeAdapter implements SurfaceAdapter {
+  class ListFakeAdapter extends SurfaceAdapterTestBase {
     readonly listMsgCalls: Array<{ limit: number; beforeMessageId?: string }> = [];
 
-    constructor(private readonly messages: SurfaceMessage[]) {}
+    constructor(private readonly messages: SurfaceMessage[]) {
+      super();
+    }
 
     async connect(): Promise<void> {
       throw new Error("not implemented");
@@ -1653,14 +1737,14 @@ describe("request-composition active channel burst rules", () => {
     async getSelf(): Promise<SurfaceSelf> {
       throw new Error("not implemented");
     }
-    async listSessions(): Promise<SurfaceSession[]> {
+    async listSessions(): Promise<SurfaceOperationResult<SurfaceSession[]>> {
       throw new Error("not implemented");
     }
 
     async startOutput(
       _sessionRef: SessionRef,
       _opts?: StartOutputOpts,
-    ): Promise<SurfaceOutputStream> {
+    ): Promise<SurfaceOperationResult<SurfaceOutputStream>> {
       throw new Error("not implemented");
     }
 
@@ -1668,18 +1752,21 @@ describe("request-composition active channel burst rules", () => {
       _sessionRef: SessionRef,
       _content: ContentOpts,
       _opts?: SendOpts,
-    ): Promise<MsgRef> {
+    ): Promise<SurfaceOperationResult<MsgRef>> {
       throw new Error("not implemented");
     }
 
-    async readMsg(msgRef: MsgRef): Promise<SurfaceMessage | null> {
+    async readMsg(msgRef: MsgRef): Promise<SurfaceOperationResult<SurfaceMessage | null>> {
       const m = this.messages.find(
         (x) => x.session.channelId === msgRef.channelId && x.ref.messageId === msgRef.messageId,
       );
-      return m ?? null;
+      return Result.ok(m ?? null);
     }
 
-    async listMsg(sessionRef: SessionRef, opts?: LimitOpts): Promise<SurfaceMessage[]> {
+    async listMsg(
+      sessionRef: SessionRef,
+      opts?: LimitOpts,
+    ): Promise<SurfaceOperationResult<SurfaceMessage[]>> {
       const limit = Math.max(1, opts?.limit ?? 50);
       this.listMsgCalls.push({ limit, beforeMessageId: opts?.beforeMessageId });
       const before = opts?.beforeMessageId;
@@ -1696,42 +1783,51 @@ describe("request-composition active channel burst rules", () => {
         return m.ref.messageId < beforeMessage.ref.messageId;
       });
       // Return a recent-ish slice (ordering doesn't matter; composeRecentChannelMessages sorts).
-      return inChannel.slice(Math.max(0, inChannel.length - limit));
+      return Result.ok(inChannel.slice(Math.max(0, inChannel.length - limit)));
     }
 
-    async editMsg(_msgRef: MsgRef, _content: ContentOpts): Promise<void> {
+    async editMsg(_msgRef: MsgRef, _content: ContentOpts): Promise<SurfaceOperationResult<void>> {
       throw new Error("not implemented");
     }
 
-    async deleteMsg(_msgRef: MsgRef): Promise<void> {
+    async deleteMsg(_msgRef: MsgRef): Promise<SurfaceOperationResult<void>> {
       throw new Error("not implemented");
     }
 
-    async getReplyContext(_msgRef: MsgRef, _opts?: LimitOpts): Promise<SurfaceMessage[]> {
-      return [];
+    async getReplyContext(
+      _msgRef: MsgRef,
+      _opts?: LimitOpts,
+    ): Promise<SurfaceOperationResult<SurfaceMessage[]>> {
+      return Result.ok([]);
     }
 
-    async addReaction(_msgRef: MsgRef, _reaction: string): Promise<void> {
+    async addReaction(_msgRef: MsgRef, _reaction: string): Promise<SurfaceOperationResult<void>> {
       throw new Error("not implemented");
     }
 
-    async removeReaction(_msgRef: MsgRef, _reaction: string): Promise<void> {
+    async removeReaction(
+      _msgRef: MsgRef,
+      _reaction: string,
+    ): Promise<SurfaceOperationResult<void>> {
       throw new Error("not implemented");
     }
 
-    async listReactions(_msgRef: MsgRef): Promise<string[]> {
-      return [];
+    async listReactions(_msgRef: MsgRef): Promise<SurfaceOperationResult<string[]>> {
+      return Result.ok([]);
     }
 
     async subscribe(_handler: AdapterEventHandler): Promise<AdapterSubscription> {
       throw new Error("not implemented");
     }
 
-    async getUnRead(_sessionRef: SessionRef): Promise<SurfaceMessage[]> {
+    async getUnRead(_sessionRef: SessionRef): Promise<SurfaceOperationResult<SurfaceMessage[]>> {
       throw new Error("not implemented");
     }
 
-    async markRead(_sessionRef: SessionRef, _upToMsgRef?: MsgRef): Promise<void> {
+    async markRead(
+      _sessionRef: SessionRef,
+      _upToMsgRef?: MsgRef,
+    ): Promise<SurfaceOperationResult<void>> {
       throw new Error("not implemented");
     }
   }
@@ -2809,8 +2905,10 @@ describe("request-composition active channel burst rules", () => {
       raw: { reference: { messageId: "root", channelId: sessionId } },
     };
 
-    class ReplyChainAdapter implements SurfaceAdapter {
-      constructor(private readonly messages: Record<string, SurfaceMessage>) {}
+    class ReplyChainAdapter extends SurfaceAdapterTestBase {
+      constructor(private readonly messages: Record<string, SurfaceMessage>) {
+        super();
+      }
 
       async connect(): Promise<void> {
         throw new Error("not implemented");
@@ -2822,14 +2920,14 @@ describe("request-composition active channel burst rules", () => {
       async getSelf(): Promise<SurfaceSelf> {
         throw new Error("not implemented");
       }
-      async listSessions(): Promise<SurfaceSession[]> {
+      async listSessions(): Promise<SurfaceOperationResult<SurfaceSession[]>> {
         throw new Error("not implemented");
       }
 
       async startOutput(
         _sessionRef: SessionRef,
         _opts?: StartOutputOpts,
-      ): Promise<SurfaceOutputStream> {
+      ): Promise<SurfaceOperationResult<SurfaceOutputStream>> {
         throw new Error("not implemented");
       }
 
@@ -2837,52 +2935,64 @@ describe("request-composition active channel burst rules", () => {
         _sessionRef: SessionRef,
         _content: ContentOpts,
         _opts?: SendOpts,
-      ): Promise<MsgRef> {
+      ): Promise<SurfaceOperationResult<MsgRef>> {
         throw new Error("not implemented");
       }
 
-      async readMsg(msgRef: MsgRef): Promise<SurfaceMessage | null> {
+      async readMsg(msgRef: MsgRef): Promise<SurfaceOperationResult<SurfaceMessage | null>> {
         const key = `${msgRef.channelId}:${msgRef.messageId}`;
-        return this.messages[key] ?? null;
+        return Result.ok(this.messages[key] ?? null);
       }
 
-      async listMsg(_sessionRef: SessionRef, _opts?: LimitOpts): Promise<SurfaceMessage[]> {
+      async listMsg(
+        _sessionRef: SessionRef,
+        _opts?: LimitOpts,
+      ): Promise<SurfaceOperationResult<SurfaceMessage[]>> {
         throw new Error("listMsg should not be called");
       }
 
-      async editMsg(_msgRef: MsgRef, _content: ContentOpts): Promise<void> {
+      async editMsg(_msgRef: MsgRef, _content: ContentOpts): Promise<SurfaceOperationResult<void>> {
         throw new Error("not implemented");
       }
 
-      async deleteMsg(_msgRef: MsgRef): Promise<void> {
+      async deleteMsg(_msgRef: MsgRef): Promise<SurfaceOperationResult<void>> {
         throw new Error("not implemented");
       }
 
-      async getReplyContext(_msgRef: MsgRef, _opts?: LimitOpts): Promise<SurfaceMessage[]> {
-        return [];
+      async getReplyContext(
+        _msgRef: MsgRef,
+        _opts?: LimitOpts,
+      ): Promise<SurfaceOperationResult<SurfaceMessage[]>> {
+        return Result.ok([]);
       }
 
-      async addReaction(_msgRef: MsgRef, _reaction: string): Promise<void> {
+      async addReaction(_msgRef: MsgRef, _reaction: string): Promise<SurfaceOperationResult<void>> {
         throw new Error("not implemented");
       }
 
-      async removeReaction(_msgRef: MsgRef, _reaction: string): Promise<void> {
+      async removeReaction(
+        _msgRef: MsgRef,
+        _reaction: string,
+      ): Promise<SurfaceOperationResult<void>> {
         throw new Error("not implemented");
       }
 
-      async listReactions(_msgRef: MsgRef): Promise<string[]> {
-        return [];
+      async listReactions(_msgRef: MsgRef): Promise<SurfaceOperationResult<string[]>> {
+        return Result.ok([]);
       }
 
       async subscribe(_handler: AdapterEventHandler): Promise<AdapterSubscription> {
         throw new Error("not implemented");
       }
 
-      async getUnRead(_sessionRef: SessionRef): Promise<SurfaceMessage[]> {
+      async getUnRead(_sessionRef: SessionRef): Promise<SurfaceOperationResult<SurfaceMessage[]>> {
         throw new Error("not implemented");
       }
 
-      async markRead(_sessionRef: SessionRef, _upToMsgRef?: MsgRef): Promise<void> {
+      async markRead(
+        _sessionRef: SessionRef,
+        _upToMsgRef?: MsgRef,
+      ): Promise<SurfaceOperationResult<void>> {
         throw new Error("not implemented");
       }
     }
@@ -2939,8 +3049,10 @@ describe("request-composition active channel burst rules", () => {
 });
 
 describe("request-composition system message filtering", () => {
-  class RawListAdapter implements SurfaceAdapter {
-    constructor(private readonly messages: SurfaceMessage[]) {}
+  class RawListAdapter extends SurfaceAdapterTestBase {
+    constructor(private readonly messages: SurfaceMessage[]) {
+      super();
+    }
 
     async connect(): Promise<void> {
       throw new Error("not implemented");
@@ -2951,59 +3063,71 @@ describe("request-composition system message filtering", () => {
     async getSelf(): Promise<SurfaceSelf> {
       throw new Error("not implemented");
     }
-    async listSessions(): Promise<SurfaceSession[]> {
+    async listSessions(): Promise<SurfaceOperationResult<SurfaceSession[]>> {
       throw new Error("not implemented");
     }
     async startOutput(
       _sessionRef: SessionRef,
       _opts?: StartOutputOpts,
-    ): Promise<SurfaceOutputStream> {
+    ): Promise<SurfaceOperationResult<SurfaceOutputStream>> {
       throw new Error("not implemented");
     }
     async sendMsg(
       _sessionRef: SessionRef,
       _content: ContentOpts,
       _opts?: SendOpts,
-    ): Promise<MsgRef> {
+    ): Promise<SurfaceOperationResult<MsgRef>> {
       throw new Error("not implemented");
     }
 
-    async readMsg(msgRef: MsgRef): Promise<SurfaceMessage | null> {
+    async readMsg(msgRef: MsgRef): Promise<SurfaceOperationResult<SurfaceMessage | null>> {
       const m = this.messages.find(
         (x) => x.session.channelId === msgRef.channelId && x.ref.messageId === msgRef.messageId,
       );
-      return m ?? null;
+      return Result.ok(m ?? null);
     }
 
-    async listMsg(sessionRef: SessionRef, _opts?: LimitOpts): Promise<SurfaceMessage[]> {
-      return this.messages.filter((m) => m.session.channelId === sessionRef.channelId);
+    async listMsg(
+      sessionRef: SessionRef,
+      _opts?: LimitOpts,
+    ): Promise<SurfaceOperationResult<SurfaceMessage[]>> {
+      return Result.ok(this.messages.filter((m) => m.session.channelId === sessionRef.channelId));
     }
 
-    async editMsg(_msgRef: MsgRef, _content: ContentOpts): Promise<void> {
+    async editMsg(_msgRef: MsgRef, _content: ContentOpts): Promise<SurfaceOperationResult<void>> {
       throw new Error("not implemented");
     }
-    async deleteMsg(_msgRef: MsgRef): Promise<void> {
+    async deleteMsg(_msgRef: MsgRef): Promise<SurfaceOperationResult<void>> {
       throw new Error("not implemented");
     }
-    async getReplyContext(_msgRef: MsgRef, _opts?: LimitOpts): Promise<SurfaceMessage[]> {
-      return [];
+    async getReplyContext(
+      _msgRef: MsgRef,
+      _opts?: LimitOpts,
+    ): Promise<SurfaceOperationResult<SurfaceMessage[]>> {
+      return Result.ok([]);
     }
-    async addReaction(_msgRef: MsgRef, _reaction: string): Promise<void> {
+    async addReaction(_msgRef: MsgRef, _reaction: string): Promise<SurfaceOperationResult<void>> {
       throw new Error("not implemented");
     }
-    async removeReaction(_msgRef: MsgRef, _reaction: string): Promise<void> {
+    async removeReaction(
+      _msgRef: MsgRef,
+      _reaction: string,
+    ): Promise<SurfaceOperationResult<void>> {
       throw new Error("not implemented");
     }
-    async listReactions(_msgRef: MsgRef): Promise<string[]> {
-      return [];
+    async listReactions(_msgRef: MsgRef): Promise<SurfaceOperationResult<string[]>> {
+      return Result.ok([]);
     }
     async subscribe(_handler: AdapterEventHandler): Promise<AdapterSubscription> {
       throw new Error("not implemented");
     }
-    async getUnRead(_sessionRef: SessionRef): Promise<SurfaceMessage[]> {
+    async getUnRead(_sessionRef: SessionRef): Promise<SurfaceOperationResult<SurfaceMessage[]>> {
       throw new Error("not implemented");
     }
-    async markRead(_sessionRef: SessionRef, _upToMsgRef?: MsgRef): Promise<void> {
+    async markRead(
+      _sessionRef: SessionRef,
+      _upToMsgRef?: MsgRef,
+    ): Promise<SurfaceOperationResult<void>> {
       throw new Error("not implemented");
     }
   }
@@ -3075,8 +3199,10 @@ describe("request-composition system message filtering", () => {
 });
 
 describe("request-composition session divider", () => {
-  class DividerAdapter implements SurfaceAdapter {
-    constructor(private readonly messages: SurfaceMessage[]) {}
+  class DividerAdapter extends SurfaceAdapterTestBase {
+    constructor(private readonly messages: SurfaceMessage[]) {
+      super();
+    }
 
     async connect(): Promise<void> {
       throw new Error("not implemented");
@@ -3088,14 +3214,14 @@ describe("request-composition session divider", () => {
     async getSelf(): Promise<SurfaceSelf> {
       return { platform: "discord", userId: "bot", userName: "lilac" };
     }
-    async listSessions(): Promise<SurfaceSession[]> {
+    async listSessions(): Promise<SurfaceOperationResult<SurfaceSession[]>> {
       throw new Error("not implemented");
     }
 
     async startOutput(
       _sessionRef: SessionRef,
       _opts?: StartOutputOpts,
-    ): Promise<SurfaceOutputStream> {
+    ): Promise<SurfaceOperationResult<SurfaceOutputStream>> {
       throw new Error("not implemented");
     }
 
@@ -3103,19 +3229,22 @@ describe("request-composition session divider", () => {
       _sessionRef: SessionRef,
       _content: ContentOpts,
       _opts?: SendOpts,
-    ): Promise<MsgRef> {
+    ): Promise<SurfaceOperationResult<MsgRef>> {
       throw new Error("not implemented");
     }
 
-    async readMsg(msgRef: MsgRef): Promise<SurfaceMessage | null> {
-      return (
+    async readMsg(msgRef: MsgRef): Promise<SurfaceOperationResult<SurfaceMessage | null>> {
+      return Result.ok(
         this.messages.find(
           (m) => m.session.channelId === msgRef.channelId && m.ref.messageId === msgRef.messageId,
-        ) ?? null
+        ) ?? null,
       );
     }
 
-    async listMsg(sessionRef: SessionRef, opts?: LimitOpts): Promise<SurfaceMessage[]> {
+    async listMsg(
+      sessionRef: SessionRef,
+      opts?: LimitOpts,
+    ): Promise<SurfaceOperationResult<SurfaceMessage[]>> {
       const inChannel = this.messages
         .filter((m) => m.session.channelId === sessionRef.channelId)
         .slice()
@@ -3137,40 +3266,49 @@ describe("request-composition session divider", () => {
       }
 
       const limit = Math.max(1, opts?.limit ?? 50);
-      return filtered.slice(Math.max(0, filtered.length - limit));
+      return Result.ok(filtered.slice(Math.max(0, filtered.length - limit)));
     }
 
-    async editMsg(_msgRef: MsgRef, _content: ContentOpts): Promise<void> {
+    async editMsg(_msgRef: MsgRef, _content: ContentOpts): Promise<SurfaceOperationResult<void>> {
       throw new Error("not implemented");
     }
-    async deleteMsg(_msgRef: MsgRef): Promise<void> {
-      throw new Error("not implemented");
-    }
-
-    async getReplyContext(_msgRef: MsgRef, _opts?: LimitOpts): Promise<SurfaceMessage[]> {
-      return [];
-    }
-
-    async addReaction(_msgRef: MsgRef, _reaction: string): Promise<void> {
-      throw new Error("not implemented");
-    }
-    async removeReaction(_msgRef: MsgRef, _reaction: string): Promise<void> {
+    async deleteMsg(_msgRef: MsgRef): Promise<SurfaceOperationResult<void>> {
       throw new Error("not implemented");
     }
 
-    async listReactions(_msgRef: MsgRef): Promise<string[]> {
-      return [];
+    async getReplyContext(
+      _msgRef: MsgRef,
+      _opts?: LimitOpts,
+    ): Promise<SurfaceOperationResult<SurfaceMessage[]>> {
+      return Result.ok([]);
+    }
+
+    async addReaction(_msgRef: MsgRef, _reaction: string): Promise<SurfaceOperationResult<void>> {
+      throw new Error("not implemented");
+    }
+    async removeReaction(
+      _msgRef: MsgRef,
+      _reaction: string,
+    ): Promise<SurfaceOperationResult<void>> {
+      throw new Error("not implemented");
+    }
+
+    async listReactions(_msgRef: MsgRef): Promise<SurfaceOperationResult<string[]>> {
+      return Result.ok([]);
     }
 
     async subscribe(_handler: AdapterEventHandler): Promise<AdapterSubscription> {
       throw new Error("not implemented");
     }
 
-    async getUnRead(_sessionRef: SessionRef): Promise<SurfaceMessage[]> {
+    async getUnRead(_sessionRef: SessionRef): Promise<SurfaceOperationResult<SurfaceMessage[]>> {
       throw new Error("not implemented");
     }
 
-    async markRead(_sessionRef: SessionRef, _upToMsgRef?: MsgRef): Promise<void> {
+    async markRead(
+      _sessionRef: SessionRef,
+      _upToMsgRef?: MsgRef,
+    ): Promise<SurfaceOperationResult<void>> {
       throw new Error("not implemented");
     }
   }
@@ -3466,9 +3604,14 @@ describe("request-composition session divider", () => {
     };
 
     class MentionDividerAdapter extends DividerAdapter {
-      override async getReplyContext(msgRef: MsgRef, opts?: LimitOpts): Promise<SurfaceMessage[]> {
-        const base = await this.readMsg(msgRef);
-        if (!base) return [];
+      override async getReplyContext(
+        msgRef: MsgRef,
+        opts?: LimitOpts,
+      ): Promise<SurfaceOperationResult<SurfaceMessage[]>> {
+        const baseResult = await this.readMsg(msgRef);
+        if (baseResult.status === "error") return Result.err(baseResult.error);
+        const base = baseResult.value;
+        if (!base) return Result.ok([]);
 
         const limit = opts?.limit ?? 50;
         const all = [root, divider, m1, m2, m3].slice().sort((a, b) => a.ts - b.ts);
@@ -3476,7 +3619,7 @@ describe("request-composition session divider", () => {
         const beforeAll = all.filter((m) => m.ts <= base.ts);
         const before = beforeAll.slice(Math.max(0, beforeAll.length - half));
         const after = all.filter((m) => m.ts > base.ts).slice(0, half);
-        return before.concat(after);
+        return Result.ok(before.concat(after));
       }
     }
 

@@ -65,6 +65,7 @@ export class GithubApiError extends Error {
     readonly status: number,
     readonly path: string,
     message: string,
+    readonly rateLimit?: { readonly retryAfterMs?: number },
   ) {
     super(message);
     this.name = "GithubApiError";
@@ -76,11 +77,45 @@ function githubApiError(input: {
   statusText: string;
   path: string;
   body: string;
+  headers: Headers;
 }): GithubApiError {
+  const retryAfterHeader = input.headers.get("retry-after");
+  const retryAfterSeconds = retryAfterHeader === null ? undefined : Number(retryAfterHeader);
+  const retryAfterMs =
+    retryAfterSeconds !== undefined && Number.isFinite(retryAfterSeconds)
+      ? Math.max(0, Math.ceil(retryAfterSeconds * 1000))
+      : undefined;
+  const rateLimited =
+    input.status === 429 ||
+    (input.status === 403 &&
+      (input.headers.get("x-ratelimit-remaining") === "0" ||
+        retryAfterMs !== undefined ||
+        input.body.toLowerCase().includes("secondary rate limit")));
+  let rateLimit: { readonly retryAfterMs?: number } | undefined;
+  if (rateLimited) {
+    rateLimit = retryAfterMs === undefined ? {} : { retryAfterMs };
+  }
   return new GithubApiError(
     input.status,
     input.path,
     `GitHub API error (${input.status} ${input.statusText}) at ${input.path}${input.body ? `: ${input.body}` : ""}`,
+    rateLimit,
+  );
+}
+
+export async function decodeGithubApiErrorResponse(
+  response: Response,
+  path: string,
+): Promise<ResultType<never, GithubApiError>> {
+  const body = await captureGithubResponseText(response);
+  return Result.err(
+    githubApiError({
+      status: response.status,
+      statusText: response.statusText,
+      path,
+      body: body.status === "ok" ? body.value : "",
+      headers: response.headers,
+    }),
   );
 }
 
@@ -156,15 +191,7 @@ async function githubFetchJsonResult<T>(input: {
   if (fetched.status === "error") return Result.err(fetched.error);
   const res = fetched.value;
   if (!res.ok) {
-    const body = await captureGithubResponseText(res);
-    return Result.err(
-      githubApiError({
-        status: res.status,
-        statusText: res.statusText,
-        path: input.path,
-        body: body.status === "ok" ? body.value : "",
-      }),
-    );
+    return await decodeGithubApiErrorResponse(res, input.path);
   }
   const body = await captureGithubApiExternal(
     async (): Promise<unknown> => await res.json(),
@@ -215,15 +242,7 @@ async function githubFetchNoBodyResult(input: {
   if (fetched.status === "error") return Result.err(fetched.error);
   const res = fetched.value;
   if (!res.ok) {
-    const body = await captureGithubResponseText(res);
-    return Result.err(
-      githubApiError({
-        status: res.status,
-        statusText: res.statusText,
-        path: input.path,
-        body: body.status === "ok" ? body.value : "",
-      }),
-    );
+    return await decodeGithubApiErrorResponse(res, input.path);
   }
   return Result.ok(undefined);
 }

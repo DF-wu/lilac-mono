@@ -1,7 +1,7 @@
 import type { SurfaceMsgRef } from "@stanley2058/lilac-event-bus";
 import { Panic, Result, TaggedError, type Result as ResultType } from "better-result";
 
-import { formatTaggedErrorForLog, opaqueErrorMessage } from "@stanley2058/lilac-utils";
+import { formatTaggedErrorForLog } from "@stanley2058/lilac-utils";
 
 import {
   deleteIssueCommentReactionById,
@@ -9,6 +9,7 @@ import {
   GithubApiError,
 } from "../../github/github-api";
 import { parseGithubRequestId, parseGithubSessionId } from "../../github/github-ids";
+import { markGithubAgentComment } from "../../github/github-comment-marker";
 import {
   clearGithubAck,
   getGithubAck,
@@ -16,7 +17,7 @@ import {
   getGithubRequestMeta,
   type GithubAckState,
 } from "../../github/github-state";
-import { preserveSurfacePanic, SurfaceMessageNotFoundError, type SurfaceAdapter } from "../adapter";
+import type { SurfaceAdapter, SurfaceOperationError } from "../adapter";
 import type {
   SurfaceRelayDescriptor,
   SurfaceRelayPolicy,
@@ -24,9 +25,6 @@ import type {
   SurfaceRequestIngress,
   SurfaceRuntimeDescriptor,
   SurfaceWorkflowProgressPort,
-  WorkflowProgressCheckFailure,
-  WorkflowProgressEditFailure,
-  WorkflowProgressSendFailure,
 } from "../runtime-descriptor";
 import {
   SurfaceIngressAcknowledgementCleanupFailed,
@@ -34,7 +32,6 @@ import {
   SurfaceRefInvalid as RefInvalid,
   WorkflowProgressOperationFailed,
 } from "../runtime-descriptor";
-import { GithubMessageCreatedError } from "./github-adapter";
 
 type GithubWorkflowProgressOperation = "check-message" | "send" | "edit";
 
@@ -51,61 +48,11 @@ function githubWorkflowProgressFailure(
   };
 }
 
-export function captureGithubWorkflowProgressCall<T>(input: {
-  readonly operation: "check-message";
-  readonly effect: () => Promise<T>;
-}): Promise<ResultType<T, WorkflowProgressCheckFailure>>;
-export function captureGithubWorkflowProgressCall<T>(input: {
-  readonly operation: "send";
-  readonly effect: () => Promise<T>;
-}): Promise<ResultType<T, WorkflowProgressSendFailure<"github">>>;
-export function captureGithubWorkflowProgressCall<T>(input: {
-  readonly operation: "edit";
-  readonly effect: () => Promise<T>;
-}): Promise<ResultType<T, WorkflowProgressEditFailure>>;
-export async function captureGithubWorkflowProgressCall<T>(input: {
-  readonly operation: GithubWorkflowProgressOperation;
-  readonly effect: () => Promise<T>;
-}): Promise<
-  ResultType<
-    T,
-    | WorkflowProgressCheckFailure
-    | WorkflowProgressSendFailure<"github">
-    | WorkflowProgressEditFailure
-  >
-> {
-  try {
-    return Result.ok(await input.effect());
-  } catch (cause) {
-    preserveSurfacePanic(cause);
-    const failureMessage =
-      cause instanceof Error
-        ? opaqueErrorMessage(cause, "Workflow progress surface call failed")
-        : "Opaque workflow progress surface failure";
-    const failed = githubWorkflowProgressFailure(input.operation, failureMessage);
-    if (cause instanceof GithubMessageCreatedError && cause.messageRef.platform === "github") {
-      switch (input.operation) {
-        case "check-message":
-        case "edit":
-          return Result.err(failed);
-        case "send":
-          return Result.err({ kind: "created", ref: cause.messageRef });
-      }
-    }
-    if (
-      cause instanceof SurfaceMessageNotFoundError ||
-      (cause instanceof GithubApiError && cause.status === 404)
-    ) {
-      switch (input.operation) {
-        case "check-message":
-        case "send":
-          return Result.err(failed);
-        case "edit":
-          return Result.err({ kind: "not-found" });
-      }
-    }
-    return Result.err(failed);
-  }
+function githubWorkflowError(
+  operation: GithubWorkflowProgressOperation,
+  error: SurfaceOperationError,
+): { readonly kind: "failed"; readonly error: WorkflowProgressOperationFailed } {
+  return githubWorkflowProgressFailure(operation, error.message);
 }
 
 export function createGithubWorkflowProgressPort(
@@ -113,89 +60,65 @@ export function createGithubWorkflowProgressPort(
 ): SurfaceWorkflowProgressPort<"github"> {
   return {
     checkMessage: async (target) => {
-      const checked = await captureGithubWorkflowProgressCall({
-        operation: "check-message",
-        effect: () =>
-          adapter.readMsg({
-            platform: "github",
-            channelId: target.channelId,
-            messageId: target.messageId,
-          }),
+      const checked = await adapter.readMsg({
+        platform: "github",
+        channelId: target.channelId,
+        messageId: target.messageId,
       });
-      switch (checked.status) {
-        case "ok":
-          return Result.ok(checked.value ? "found" : "missing");
-        case "error":
-          switch (checked.error.kind) {
-            case "failed":
-              return Result.err(checked.error);
-          }
+      if (checked.status === "error") {
+        if (checked.error._tag === "SurfaceMessageNotFound") {
+          return Result.ok("missing");
+        }
+        return Result.err(githubWorkflowError("check-message", checked.error));
       }
+      return Result.ok(checked.value ? "found" : "missing");
     },
     send: async (input) => {
-      const sent = await captureGithubWorkflowProgressCall({
-        operation: "send",
-        effect: () =>
-          adapter.sendMsg(
-            { platform: "github", channelId: input.channelId },
-            input.content,
-            input.replyToMessageId
-              ? {
-                  replyTo: {
-                    platform: "github",
-                    channelId: input.channelId,
-                    messageId: input.replyToMessageId,
-                  },
-                  silent: input.silent,
-                }
-              : { silent: input.silent },
-          ),
-      });
-      switch (sent.status) {
-        case "ok":
-          switch (sent.value.platform) {
-            case "discord":
-              return Result.err({
-                kind: "failed",
-                error: new WorkflowProgressOperationFailed({
-                  operation: "send",
-                  message: "GitHub workflow progress send returned a 'discord' message",
-                }),
-              });
-            case "github":
-              return Result.ok(sent.value);
+      const content = input.replyToMessageId
+        ? {
+            ...input.content,
+            text: `In reply to ${input.replyToMessageId}:\n\n${input.content.text ?? ""}`,
           }
-        case "error":
-          switch (sent.error.kind) {
-            case "created":
-            case "failed":
-              return Result.err(sent.error);
-          }
+        : input.content;
+      const sent = await adapter.sendMsg(
+        { platform: "github", channelId: input.channelId },
+        content,
+        { silent: input.silent },
+      );
+      if (sent.status === "error") {
+        if (
+          sent.error._tag === "SurfaceOperationPartiallyCompleted" &&
+          sent.error.created.platform === "github"
+        ) {
+          return Result.err({ kind: "created", ref: sent.error.created });
+        }
+        return Result.err(githubWorkflowError("send", sent.error));
       }
+      if (sent.value.platform === "github") return Result.ok(sent.value);
+      return Result.err(
+        githubWorkflowProgressFailure(
+          "send",
+          "GitHub workflow progress send returned a 'discord' message",
+        ),
+      );
     },
     edit: async (target, content) => {
-      const edited = await captureGithubWorkflowProgressCall({
-        operation: "edit",
-        effect: () =>
-          adapter.editMsg(
-            {
-              platform: "github",
-              channelId: target.channelId,
-              messageId: target.messageId,
-            },
-            content,
-          ),
-      });
-      switch (edited.status) {
-        case "ok":
-          return Result.ok(undefined);
-        case "error":
-          switch (edited.error.kind) {
-            case "not-found":
-            case "failed":
-              return Result.err(edited.error);
-          }
+      const edited = await adapter.editMsg(
+        {
+          platform: "github",
+          channelId: target.channelId,
+          messageId: target.messageId,
+        },
+        {
+          ...content,
+          text: markGithubAgentComment(content.text ?? ""),
+        },
+      );
+      if (edited.status === "ok") return Result.ok(undefined);
+      if (edited.error._tag === "SurfaceMessageNotFound") {
+        return Result.err({ kind: "not-found" });
       }
+      return Result.err(githubWorkflowError("edit", edited.error));
     },
   };
 }

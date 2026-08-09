@@ -5,18 +5,14 @@ export const CORE_FINAL_BOUNDARY_IDENTITIES = [
   ["src/surface/discord/discord-message-meta.ts", "normalizeFlagsNumber"],
   ["src/surface/discord/discord-request-router/common.ts", "withDefaultToolsConfig"],
   ["src/surface/discord/discord-adapter.ts", "discordNotFoundCode"],
+  ["src/surface/discord/discord-adapter.ts", "classifyDiscordSurfaceError"],
   [
     "src/surface/discord/discord-adapter.ts",
     "DiscordAdapter.connect.on.<callback@2>.catch.<callback@1>",
   ],
-  ["src/surface/discord/discord-adapter.ts", "DiscordAdapter.editMsg.catch.<callback@1>"],
   [
     "src/surface/discord/discord-adapter.ts",
     "DiscordAdapter.registerSlashCommands.catch.<callback@1>",
-  ],
-  [
-    "src/surface/discord/discord-adapter.ts",
-    "DiscordAdapter.fetchDiscordMessage.catch.<callback@1>",
   ],
   ["src/surface/bridge/adapter-event-projection.ts", "toBusEvtAdapterMessageCreated"],
   ["src/surface/bridge/adapter-event-projection.ts", "toBusEvtAdapterMessageUpdated"],
@@ -30,6 +26,8 @@ export const CORE_FINAL_BOUNDARY_IDENTITIES = [
   ["src/github/github-auth.ts", "fetchViewerLoginFromGithub"],
   ["src/github/github-api.ts", "githubFetchJson"],
   ["src/github/github-api.ts", "captureGithubAppResponse"],
+  ["src/surface/github/github-adapter.ts", "classifyGithubSurfaceError"],
+  ["src/surface/github/github-adapter.ts", "toGithubMessage"],
   ["src/surface/bridge/bus-agent-runner/raw.ts", "normalizeOptionalNonEmptyString"],
   ["src/surface/bridge/bus-agent-runner/raw.ts", "normalizeSessionMode"],
   ["src/surface/bridge/bus-agent-runner/raw.ts", "normalizeStringArray"],
@@ -106,7 +104,6 @@ export const CORE_FINAL_BOUNDARY_IDENTITIES = [
     "src/workflow/durable-workflow-store.ts",
     "DurableWorkflowStore.summarizeMeaningfulOperations.map.<callback@1>",
   ],
-  ["src/surface/github/github-adapter.ts", "GithubAdapter.readMsg.catch.<callback@1>"],
   [
     "src/workflow/workflow-progress-projector.ts",
     "WorkflowProgressProjector.requestProjection.setTimeout.<callback@1>.catch.<callback@1>",
@@ -314,7 +311,6 @@ export const CORE_FINAL_BOUNDARY_IDENTITIES = [
     "src/workflow/durable-workflow-store.ts",
     "DurableWorkflowStore.recordLiveParentCompletionMaterializationFailure.runWorkflowTransactionForStoreHost.<callback@3>",
   ],
-  ["src/surface/github/github-adapter.ts", "GithubMessageCreatedError.constructor"],
   ["src/workflow/workflow-progress-projector.ts", "WorkflowProgressProjector.writeFailure"],
   ["src/mcp/registry.ts", "safeErrorText"],
   ["src/mcp/registry.ts", "McpRegistry.failureStatus"],
@@ -413,13 +409,11 @@ export const CORE_FINAL_BOUNDARY_IDENTITIES = [
   ["src/ssh/remote-js/remote-runner-utils.ts", "opaqueErrorCause"],
 ] as const;
 export const CORE_FINAL_CAPABILITY_IDENTITIES = [
-  ["src/surface/adapter.ts", "hasReplyChainPlannerProvider"],
   ["src/surface/adapter.ts", "hasCacheBurstProvider"],
   ["src/surface/discord/discord-adapter.ts", "classifyDiscordSurfaceNotFound"],
   ["src/surface/bridge/bus-agent-runner/raw.ts", "isModelReasoningEffort"],
   ["src/surface/bridge/bus-agent-runner/raw.ts", "requestRawReferencesMessage"],
   ["src/surface/bridge/bus-agent-runner/raw.ts", "isSubagentProfile"],
-  ["src/surface/bridge/subscribe-from-bus.ts", "isTypingIndicatorProvider"],
   ["src/mcp/registry.ts", "isOptionalHttpInboundSseError"],
   ["src/tools/tool-env.ts", "isMissingToolEnvFile"],
   ["src/plugins/builtin/local-tools.ts", "isDelegateHandler"],

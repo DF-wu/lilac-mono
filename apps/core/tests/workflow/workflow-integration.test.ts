@@ -4,6 +4,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { z } from "zod";
+import { Result } from "better-result";
 import {
   createLilacBus,
   lilacEventTypes,
@@ -21,11 +22,6 @@ import {
   type TestRawMessageHandler,
 } from "../helpers/result-raw-bus";
 import type {
-  AdapterEventHandler,
-  SurfaceAdapter,
-  SurfaceOutputStream,
-} from "../../src/surface/adapter";
-import type {
   ContentOpts,
   LimitOpts,
   MsgRef,
@@ -39,6 +35,7 @@ import { DurableWorkflowStore } from "../../src/workflow/durable-workflow-store"
 import { startWorkflowActionResolver } from "../../src/workflow/workflow-action-resolver";
 import { WorkflowEngine } from "../../src/workflow/workflow-engine";
 import { WorkflowProgressProjector } from "../../src/workflow/workflow-progress-projector";
+import { SurfaceAdapterTestBase } from "../helpers/surface-adapter-test-base";
 
 function createWorkflowProgressProjectorForTest(
   input: Omit<ConstructorParameters<typeof WorkflowProgressProjector>[0], "reportFatalPanic">,
@@ -84,7 +81,7 @@ class LiveRawBus implements RawBus {
     this.subscriptions.clear();
   }
 }
-class WorkflowCardAdapter implements SurfaceAdapter {
+class WorkflowCardAdapter extends SurfaceAdapterTestBase {
   readonly contents: ContentOpts[] = [];
   readonly messages = new Map<string, SurfaceMessage>();
   sends = 0;
@@ -95,12 +92,19 @@ class WorkflowCardAdapter implements SurfaceAdapter {
     return { platform: "discord" as const, userId: "bot", userName: "bot" };
   }
   async listSessions() {
-    return [];
+    return Result.ok([]);
   }
-  async startOutput(): Promise<SurfaceOutputStream> {
-    throw new Error("not used");
+  async startOutput() {
+    return Result.ok({
+      push: async () => Result.ok("visible" as const),
+      finish: async () => {
+        const ref = { platform: "discord" as const, channelId: "unused", messageId: "unused" };
+        return Result.ok({ created: [ref], last: ref });
+      },
+      abort: async () => Result.ok(undefined),
+    });
   }
-  async sendMsg(session: SessionRef, content: ContentOpts, _opts?: SendOpts): Promise<MsgRef> {
+  async sendMsg(session: SessionRef, content: ContentOpts, _opts?: SendOpts) {
     this.sends += 1;
     this.contents.push(content);
     const ref = {
@@ -115,37 +119,43 @@ class WorkflowCardAdapter implements SurfaceAdapter {
       text: content.text ?? "",
       ts: Date.now(),
     });
-    return ref;
+    return Result.ok(ref);
   }
   async readMsg(ref: MsgRef) {
-    return this.messages.get(ref.messageId) ?? null;
+    return Result.ok(this.messages.get(ref.messageId) ?? null);
   }
   async listMsg(_session: SessionRef, _opts?: LimitOpts) {
-    return [...this.messages.values()];
+    return Result.ok([...this.messages.values()]);
   }
   async editMsg(ref: MsgRef, content: ContentOpts) {
     const current = this.messages.get(ref.messageId);
-    if (!current) throw new Error("workflow card is missing");
+    if (!current) return Result.ok(undefined);
     this.edits += 1;
     this.contents.push(content);
     this.messages.set(ref.messageId, { ...current, text: content.text ?? "" });
+    return Result.ok(undefined);
   }
-  async deleteMsg() {}
+  async deleteMsg() {
+    return Result.ok(undefined);
+  }
   async getReplyContext() {
-    return [];
+    return Result.ok([]);
   }
-  async addReaction() {}
-  async removeReaction() {}
+  async addReaction() {
+    return Result.ok(undefined);
+  }
+  async removeReaction() {
+    return Result.ok(undefined);
+  }
   async listReactions() {
-    return [];
-  }
-  async subscribe(_handler: AdapterEventHandler) {
-    return { stop: async () => {} };
+    return Result.ok([]);
   }
   async getUnRead() {
-    return [];
+    return Result.ok([]);
   }
-  async markRead() {}
+  async markRead() {
+    return Result.ok(undefined);
+  }
 }
 function source(): string {
   return `import { defineWorkflow } from "@lilac/workflow";

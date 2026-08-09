@@ -1197,7 +1197,7 @@ export async function createCoreRuntime(
         adapterIngress: {
           start: async () => {
             const handle = await bridgeAdapterToBus({
-              adapter,
+              eventSource: adapter,
               bus,
               subscriptionId: subId(subscriptionPrefix, "adapter-to-bus"),
               transcriptStore: transcriptStore ?? undefined,
@@ -1798,7 +1798,7 @@ export async function createCoreRuntime(
         });
 
         stopDiscordSearchIndexer = await startDiscordSearchIndexer({
-          adapter,
+          eventSource: adapter,
           search: discordSearchService,
           getConfig: () => getCoreConfig(),
           materializer: conversationThreadMaterializer,

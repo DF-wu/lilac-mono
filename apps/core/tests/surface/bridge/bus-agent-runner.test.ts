@@ -164,7 +164,7 @@ import { formatSurfaceMetadataLine } from "../../../src/surface/bridge/surface-m
 import type {
   AdapterEventHandler,
   StartOutputOpts,
-  SurfaceAdapter,
+  SurfaceOperationResult,
   SurfaceOutputPart,
   SurfaceOutputStream,
 } from "../../../src/surface/adapter";
@@ -178,6 +178,7 @@ import type {
   SurfaceSelf,
   SurfaceSession,
 } from "../../../src/surface/types";
+import { SurfaceAdapterTestBase } from "../../helpers/surface-adapter-test-base";
 import {
   parseSubagentMetaFromRaw,
   parseWorkflowRequestHintFromRaw,
@@ -2170,7 +2171,7 @@ type ProductionPathOutput = {
   readonly finished: Promise<void>;
 };
 
-class ProductionPathDiscordAdapter implements SurfaceAdapter {
+class ProductionPathDiscordAdapter extends SurfaceAdapterTestBase {
   readonly messages = new Map<string, SurfaceMessage>();
   readonly outputs: ProductionPathOutput[] = [];
   readonly updatedOutputMessageIds: string[] = [];
@@ -2213,11 +2214,14 @@ class ProductionPathDiscordAdapter implements SurfaceAdapter {
     return { platform: "discord", userId: "bot", userName: "lilac" };
   }
 
-  async listSessions(): Promise<SurfaceSession[]> {
+  async listSessions(): Promise<SurfaceOperationResult<SurfaceSession[]>> {
     throw new Error("not used");
   }
 
-  async startOutput(sessionRef: SessionRef, opts?: StartOutputOpts): Promise<SurfaceOutputStream> {
+  async startOutput(
+    sessionRef: SessionRef,
+    opts?: StartOutputOpts,
+  ): Promise<SurfaceOperationResult<SurfaceOutputStream>> {
     this.outputSequence += 1;
     const messageId = `output-${this.outputSequence}`;
     const parts: SurfaceOutputPart[] = [];
@@ -2246,7 +2250,7 @@ class ProductionPathDiscordAdapter implements SurfaceAdapter {
     };
     this.outputs.push({ messageId, parts, finished: finished.promise });
 
-    return {
+    return Result.ok({
       push: async (part) => {
         parts.push(part);
         const message = ensureOutputMessage();
@@ -2254,46 +2258,64 @@ class ProductionPathDiscordAdapter implements SurfaceAdapter {
         if (part.type === "text.set") visibleText = part.text;
         message.text = visibleText;
         await this.emitOutputUpdated(message);
-        return "visible";
+        return Result.ok("visible");
       },
       finish: async () => {
         const message = ensureOutputMessage();
         finished.resolve(undefined);
-        return { created: [message.ref], last: message.ref };
+        return Result.ok({ created: [message.ref], last: message.ref });
       },
       abort: async () => {
         finished.resolve(undefined);
+        return Result.ok(undefined);
       },
       getFinalTextMode: () => "continuation",
-    };
+    });
   }
 
-  async sendMsg(_sessionRef: SessionRef, _content: ContentOpts, _opts?: SendOpts): Promise<MsgRef> {
+  async sendMsg(
+    _sessionRef: SessionRef,
+    _content: ContentOpts,
+    _opts?: SendOpts,
+  ): Promise<SurfaceOperationResult<MsgRef>> {
     throw new Error("not used");
   }
 
-  async readMsg(msgRef: MsgRef): Promise<SurfaceMessage | null> {
-    return this.messages.get(msgRef.messageId) ?? null;
+  async readMsg(msgRef: MsgRef): Promise<SurfaceOperationResult<SurfaceMessage | null>> {
+    return Result.ok(this.messages.get(msgRef.messageId) ?? null);
   }
 
-  async listMsg(sessionRef: SessionRef, opts?: LimitOpts): Promise<SurfaceMessage[]> {
+  async listMsg(
+    sessionRef: SessionRef,
+    opts?: LimitOpts,
+  ): Promise<SurfaceOperationResult<SurfaceMessage[]>> {
     const before = opts?.beforeMessageId ? this.messages.get(opts.beforeMessageId)?.ts : undefined;
-    return [...this.messages.values()]
-      .filter((message) => message.session.channelId === sessionRef.channelId)
-      .filter((message) => before === undefined || message.ts < before)
-      .toSorted((left, right) => left.ts - right.ts)
-      .slice(-(opts?.limit ?? 50));
+    return Result.ok(
+      [...this.messages.values()]
+        .filter((message) => message.session.channelId === sessionRef.channelId)
+        .filter((message) => before === undefined || message.ts < before)
+        .toSorted((left, right) => left.ts - right.ts)
+        .slice(-(opts?.limit ?? 50)),
+    );
   }
 
-  async editMsg(): Promise<void> {}
-  async deleteMsg(): Promise<void> {}
-  async getReplyContext(): Promise<SurfaceMessage[]> {
-    return [];
+  async editMsg(): Promise<SurfaceOperationResult<void>> {
+    return Result.ok(undefined);
   }
-  async addReaction(): Promise<void> {}
-  async removeReaction(): Promise<void> {}
-  async listReactions(): Promise<string[]> {
-    return [];
+  async deleteMsg(): Promise<SurfaceOperationResult<void>> {
+    return Result.ok(undefined);
+  }
+  async getReplyContext(): Promise<SurfaceOperationResult<SurfaceMessage[]>> {
+    return Result.ok([]);
+  }
+  async addReaction(): Promise<SurfaceOperationResult<void>> {
+    return Result.ok(undefined);
+  }
+  async removeReaction(): Promise<SurfaceOperationResult<void>> {
+    return Result.ok(undefined);
+  }
+  async listReactions(): Promise<SurfaceOperationResult<string[]>> {
+    return Result.ok([]);
   }
 
   async subscribe(handler: AdapterEventHandler): Promise<{ stop(): Promise<void> }> {
@@ -2305,10 +2327,12 @@ class ProductionPathDiscordAdapter implements SurfaceAdapter {
     };
   }
 
-  async getUnRead(): Promise<SurfaceMessage[]> {
-    return [];
+  async getUnRead(): Promise<SurfaceOperationResult<SurfaceMessage[]>> {
+    return Result.ok([]);
   }
-  async markRead(): Promise<void> {}
+  async markRead(): Promise<SurfaceOperationResult<void>> {
+    return Result.ok(undefined);
+  }
 }
 
 async function observeRequestLifecycle(bus: ReturnType<typeof createLilacBus>, requestId: string) {
@@ -3283,7 +3307,7 @@ describe("startBusAgentRunner Core-primary Claude production path", () => {
     if (outputUpdatedSubResult.status === "error") throw outputUpdatedSubResult.error;
     const outputUpdatedSub = outputUpdatedSubResult.value;
     const adapterIngress = await bridgeAdapterToBus({
-      adapter,
+      eventSource: adapter,
       bus,
       subscriptionId: "production-primary-auto-inject-ingress",
       transcriptStore: store,

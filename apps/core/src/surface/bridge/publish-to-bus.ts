@@ -7,7 +7,7 @@ import { lilacEventTypes } from "@stanley2058/lilac-event-bus";
 import { createLogger } from "@stanley2058/lilac-utils";
 import { Panic, type Result as ResultType } from "better-result";
 
-import type { SurfaceAdapter } from "../adapter";
+import type { SurfaceAdapterEventSource } from "../adapter";
 import type { AdapterEvent } from "../events";
 import {
   toBusEvtAdapterMessageCreated,
@@ -22,12 +22,12 @@ import { adaptEventPublishResultToHost } from "../../shared/event-bus-result";
 import { formatBridgeLogContext } from "./bridge-log";
 
 export async function bridgeAdapterToBus(params: {
-  adapter: SurfaceAdapter;
+  eventSource: SurfaceAdapterEventSource;
   bus: LilacBus;
   subscriptionId: string;
   transcriptStore?: TranscriptStore;
 }) {
-  const { adapter, bus } = params;
+  const { eventSource, bus } = params;
   const logger = createLogger({
     module: "bridge:adapter-to-bus",
   });
@@ -71,7 +71,7 @@ export async function bridgeAdapterToBus(params: {
     logPublish({ ...context, ok: true });
   };
 
-  return await adapter.subscribe(async (evt: AdapterEvent) => {
+  return await eventSource.subscribe(async (evt: AdapterEvent) => {
     const startedAt = Date.now();
 
     switch (evt.type) {

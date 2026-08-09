@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 
 import type { ModelMessage } from "ai";
-import type { Result as ResultType } from "better-result";
+import { Result, type Result as ResultType } from "better-result";
 import { hashCanonicalMessagesV1 } from "@stanley2058/lilac-agent";
 import {
   buildCoreLineageManifestV1 as buildCoreLineageManifestResultV1,
@@ -17,7 +17,7 @@ import {
   composeRequestMessages as composeRequestMessagesResult,
   composeSingleMessageWithLineage as composeSingleMessageWithLineageResult,
 } from "../../../src/surface/bridge/request-composition";
-import type { SurfaceAdapter, SurfaceOutputStream } from "../../../src/surface/adapter";
+import type { SurfaceOperationResult, SurfaceOutputStream } from "../../../src/surface/adapter";
 import type {
   ContentOpts,
   LimitOpts,
@@ -29,6 +29,7 @@ import type {
   SurfaceSession,
 } from "../../../src/surface/types";
 import { SqliteTranscriptStore } from "../../../src/transcript/transcript-store";
+import { SurfaceAdapterTestBase } from "../../helpers/surface-adapter-test-base";
 
 const tempDirs: string[] = [];
 const originalFetch = globalThis.fetch;
@@ -73,25 +74,30 @@ async function createStore(): Promise<{ dbPath: string; store: SqliteTranscriptS
   return { dbPath, store: new SqliteTranscriptStore(dbPath) };
 }
 
-class MutableAdapter implements SurfaceAdapter {
+class MutableAdapter extends SurfaceAdapterTestBase {
   readonly reactions = new Map<string, string[]>();
 
-  constructor(readonly messages: SurfaceMessage[]) {}
+  constructor(readonly messages: SurfaceMessage[]) {
+    super();
+  }
 
   async getSelf(): Promise<SurfaceSelf> {
     return { platform: "discord", userId: "bot", userName: "lilac" };
   }
 
-  async readMsg(ref: MsgRef): Promise<SurfaceMessage | null> {
-    return (
+  async readMsg(ref: MsgRef): Promise<SurfaceOperationResult<SurfaceMessage | null>> {
+    return Result.ok(
       this.messages.find(
         (message) =>
           message.session.channelId === ref.channelId && message.ref.messageId === ref.messageId,
-      ) ?? null
+      ) ?? null,
     );
   }
 
-  async listMsg(session: SessionRef, opts?: LimitOpts): Promise<SurfaceMessage[]> {
+  async listMsg(
+    session: SessionRef,
+    opts?: LimitOpts,
+  ): Promise<SurfaceOperationResult<SurfaceMessage[]>> {
     const before = opts?.beforeMessageId;
     const beforeMessage = before
       ? this.messages.find((message) => message.ref.messageId === before)
@@ -100,40 +106,55 @@ class MutableAdapter implements SurfaceAdapter {
       .filter((message) => message.session.channelId === session.channelId)
       .filter((message) => !beforeMessage || message.ts < beforeMessage.ts)
       .toSorted((left, right) => left.ts - right.ts);
-    return messages.slice(-Math.max(1, opts?.limit ?? 50));
+    return Result.ok(messages.slice(-Math.max(1, opts?.limit ?? 50)));
   }
 
-  async getReplyContext(ref: MsgRef): Promise<SurfaceMessage[]> {
-    const message = await this.readMsg(ref);
-    return message ? [message] : [];
+  async getReplyContext(ref: MsgRef): Promise<SurfaceOperationResult<SurfaceMessage[]>> {
+    const messageResult = await this.readMsg(ref);
+    if (messageResult.status === "error") return Result.err(messageResult.error);
+    return Result.ok(messageResult.value ? [messageResult.value] : []);
   }
 
-  async listReactions(ref: MsgRef): Promise<string[]> {
-    return [...(this.reactions.get(ref.messageId) ?? [])];
+  async listReactions(ref: MsgRef): Promise<SurfaceOperationResult<string[]>> {
+    return Result.ok([...(this.reactions.get(ref.messageId) ?? [])]);
   }
 
   async connect(): Promise<void> {}
   async disconnect(): Promise<void> {}
-  async listSessions(): Promise<SurfaceSession[]> {
+  async listSessions(): Promise<SurfaceOperationResult<SurfaceSession[]>> {
     throw new Error("not used");
   }
-  async startOutput(): Promise<SurfaceOutputStream> {
+  async startOutput(): Promise<SurfaceOperationResult<SurfaceOutputStream>> {
     throw new Error("not used");
   }
-  async sendMsg(_sessionRef: SessionRef, _content: ContentOpts, _opts?: SendOpts): Promise<MsgRef> {
+  async sendMsg(
+    _sessionRef: SessionRef,
+    _content: ContentOpts,
+    _opts?: SendOpts,
+  ): Promise<SurfaceOperationResult<MsgRef>> {
     throw new Error("not used");
   }
-  async editMsg(): Promise<void> {}
-  async deleteMsg(): Promise<void> {}
-  async addReaction(): Promise<void> {}
-  async removeReaction(): Promise<void> {}
+  async editMsg(): Promise<SurfaceOperationResult<void>> {
+    return Result.ok(undefined);
+  }
+  async deleteMsg(): Promise<SurfaceOperationResult<void>> {
+    return Result.ok(undefined);
+  }
+  async addReaction(): Promise<SurfaceOperationResult<void>> {
+    return Result.ok(undefined);
+  }
+  async removeReaction(): Promise<SurfaceOperationResult<void>> {
+    return Result.ok(undefined);
+  }
   async subscribe(): Promise<{ stop(): Promise<void> }> {
     throw new Error("not used");
   }
-  async getUnRead(): Promise<SurfaceMessage[]> {
-    return [];
+  async getUnRead(): Promise<SurfaceOperationResult<SurfaceMessage[]>> {
+    return Result.ok([]);
   }
-  async markRead(): Promise<void> {}
+  async markRead(): Promise<SurfaceOperationResult<void>> {
+    return Result.ok(undefined);
+  }
 }
 
 function surfaceMessage(input: {

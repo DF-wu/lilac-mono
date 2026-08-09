@@ -5,12 +5,27 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import {
+  adaptSurfaceOperationToRelay,
   bridgeBusToAdapter as bridgeBusToAdapterImpl,
+  BusToAdapterEffectFailed,
+  captureBusToAdapterEffect,
   logIngressAcknowledgementCleanupFailure,
 } from "../../../src/surface/bridge/subscribe-from-bus";
+import {
+  SurfaceInvalidInput,
+  SurfaceMessageNotFound,
+  SurfaceOperationPartiallyCompleted,
+  SurfaceOperationUnsupported,
+  SurfacePermissionDenied,
+  SurfacePlatformMismatch,
+  SurfaceRateLimited,
+  SurfaceSessionMismatch,
+  SurfaceUnavailable,
+  type SurfaceOperationError,
+} from "../../../src/surface/adapter";
 import type {
   SurfaceFinalTextMode,
-  SurfaceAdapter,
+  SurfaceOperationResult,
   SurfaceOutputPart,
   SurfaceOutputPartDisposition,
   SurfaceOutputResult,
@@ -58,6 +73,7 @@ import {
   TranscriptStoreSqliteDriverFailure,
   type TranscriptStore,
 } from "../../../src/transcript/transcript-store";
+import { SurfaceAdapterTestBase } from "../../helpers/surface-adapter-test-base";
 
 type DeliveryObservation = {
   readonly topic: string;
@@ -245,38 +261,57 @@ class FakeOutputStream {
     private readonly terminalPartTypes: ReadonlySet<SurfaceOutputPart["type"]> = new Set(),
   ) {}
 
-  async push(part: SurfaceOutputPart): Promise<SurfaceOutputPartDisposition> {
+  async push(
+    part: SurfaceOutputPart,
+  ): Promise<SurfaceOperationResult<SurfaceOutputPartDisposition>> {
     if (this.nextPushFailure) {
       const failure = this.nextPushFailure;
       this.nextPushFailure = null;
-      throw failure;
+      if (Panic.is(failure)) throw failure;
+      return Result.err(
+        new SurfaceUnavailable({
+          platform: this.platform,
+          operation: "push-output",
+          message: failure.message,
+        }),
+      );
     }
     if (!this.created) {
       this.created = true;
       this.onFirstPush?.();
     }
     this.parts.push(part);
-    if (this.terminalPartTypes.has(part.type)) return "terminal";
+    if (this.terminalPartTypes.has(part.type)) return Result.ok("terminal");
     if (this.platform === "github" && part.type !== "text.delta" && part.type !== "text.set") {
-      if (part.type === "tool.status" || part.type === "attachment.add") return "terminal";
-      return "ignored";
+      if (part.type === "tool.status" || part.type === "attachment.add") {
+        return Result.ok("terminal");
+      }
+      return Result.ok("ignored");
     }
-    return "visible";
+    return Result.ok("visible");
   }
 
-  async finish(): Promise<SurfaceOutputResult> {
+  async finish(): Promise<SurfaceOperationResult<SurfaceOutputResult>> {
     this.finished = true;
     const last: MsgRef = { platform: "discord", channelId: "chan", messageId: "m_out" };
-    return { created: [last], last };
+    return Result.ok({ created: [last], last });
   }
 
-  async abort(reason?: string): Promise<void> {
+  async abort(reason?: string): Promise<SurfaceOperationResult<void>> {
     if (this.nextAbortFailure) {
       const failure = this.nextAbortFailure;
       this.nextAbortFailure = null;
-      throw failure;
+      if (Panic.is(failure)) throw failure;
+      return Result.err(
+        new SurfaceUnavailable({
+          platform: this.platform,
+          operation: "abort-output",
+          message: failure.message,
+        }),
+      );
     }
     this.aborted = reason;
+    return Result.ok(undefined);
   }
 
   getFinalTextMode(): SurfaceFinalTextMode {
@@ -284,7 +319,7 @@ class FakeOutputStream {
   }
 }
 
-class FakeAdapter implements SurfaceAdapter {
+class FakeAdapter extends SurfaceAdapterTestBase {
   public lastStart: { sessionRef: SessionRef; opts?: StartOutputOpts } | null = null;
   public stream: FakeOutputStream | null = null;
   public starts: Array<{ sessionRef: SessionRef; opts?: StartOutputOpts }> = [];
@@ -307,14 +342,20 @@ class FakeAdapter implements SurfaceAdapter {
   async getSelf(): Promise<SurfaceSelf> {
     throw new Error("not implemented");
   }
-  async listSessions(): Promise<SurfaceSession[]> {
+  async listSessions(): Promise<SurfaceOperationResult<SurfaceSession[]>> {
     throw new Error("not implemented");
   }
 
   async startOutput(sessionRef: SessionRef, opts?: StartOutputOpts) {
     if (this.failNextStart) {
       this.failNextStart = false;
-      throw new Error("forced output start failure");
+      return Result.err(
+        new SurfaceUnavailable({
+          platform: sessionRef.platform,
+          operation: "start-output",
+          message: "forced output start failure",
+        }),
+      );
     }
     this.lastStart = { sessionRef, opts };
     this.starts.push({ sessionRef, opts });
@@ -335,44 +376,56 @@ class FakeAdapter implements SurfaceAdapter {
     );
     this.stream = s;
     this.streams.push(s);
-    return s;
+    return Result.ok(s);
   }
 
-  async startTyping(sessionRef: SessionRef): Promise<{ stop(): Promise<void> }> {
+  override async startTyping(sessionRef: SessionRef) {
     this.typingStarts.push(sessionRef);
-    return {
+    return Result.ok({
       stop: async () => {
         this.typingStops += 1;
+        return Result.ok(undefined);
       },
-    };
+    });
   }
 
-  async sendMsg(_sessionRef: SessionRef, _content: ContentOpts, _opts?: SendOpts): Promise<MsgRef> {
+  async sendMsg(
+    _sessionRef: SessionRef,
+    _content: ContentOpts,
+    _opts?: SendOpts,
+  ): Promise<SurfaceOperationResult<MsgRef>> {
     throw new Error("not implemented");
   }
-  async readMsg(_msgRef: MsgRef): Promise<SurfaceMessage | null> {
+  async readMsg(_msgRef: MsgRef): Promise<SurfaceOperationResult<SurfaceMessage | null>> {
     throw new Error("not implemented");
   }
-  async listMsg(_sessionRef: SessionRef, _opts?: LimitOpts): Promise<SurfaceMessage[]> {
+  async listMsg(
+    _sessionRef: SessionRef,
+    _opts?: LimitOpts,
+  ): Promise<SurfaceOperationResult<SurfaceMessage[]>> {
     throw new Error("not implemented");
   }
-  async editMsg(_msgRef: MsgRef, _content: ContentOpts): Promise<void> {
+  async editMsg(_msgRef: MsgRef, _content: ContentOpts): Promise<SurfaceOperationResult<void>> {
     throw new Error("not implemented");
   }
-  async deleteMsg(msgRef: MsgRef): Promise<void> {
+  async deleteMsg(msgRef: MsgRef): Promise<SurfaceOperationResult<void>> {
     this.deletedMsgs.push(msgRef);
+    return Result.ok(undefined);
   }
-  async getReplyContext(_msgRef: MsgRef, _opts?: LimitOpts): Promise<SurfaceMessage[]> {
+  async getReplyContext(
+    _msgRef: MsgRef,
+    _opts?: LimitOpts,
+  ): Promise<SurfaceOperationResult<SurfaceMessage[]>> {
     throw new Error("not implemented");
   }
 
-  async addReaction(_msgRef: MsgRef, _reaction: string): Promise<void> {
+  async addReaction(_msgRef: MsgRef, _reaction: string): Promise<SurfaceOperationResult<void>> {
     throw new Error("not implemented");
   }
-  async removeReaction(_msgRef: MsgRef, _reaction: string): Promise<void> {
+  async removeReaction(_msgRef: MsgRef, _reaction: string): Promise<SurfaceOperationResult<void>> {
     throw new Error("not implemented");
   }
-  async listReactions(_msgRef: MsgRef): Promise<string[]> {
+  async listReactions(_msgRef: MsgRef): Promise<SurfaceOperationResult<string[]>> {
     throw new Error("not implemented");
   }
 
@@ -380,10 +433,13 @@ class FakeAdapter implements SurfaceAdapter {
     throw new Error("not implemented");
   }
 
-  async getUnRead(_sessionRef: SessionRef): Promise<SurfaceMessage[]> {
+  async getUnRead(_sessionRef: SessionRef): Promise<SurfaceOperationResult<SurfaceMessage[]>> {
     throw new Error("not implemented");
   }
-  async markRead(_sessionRef: SessionRef, _upToMsgRef?: MsgRef): Promise<void> {
+  async markRead(
+    _sessionRef: SessionRef,
+    _upToMsgRef?: MsgRef,
+  ): Promise<SurfaceOperationResult<void>> {
     throw new Error("not implemented");
   }
 }
@@ -404,6 +460,123 @@ async function bridgeBusToAdapter(
     policy: createGithubRelayPolicy(),
   });
 }
+
+function relayFailure(error: SurfaceOperationError): BusToAdapterEffectFailed {
+  try {
+    adaptSurfaceOperationToRelay("push-output", Result.err(error));
+    throw new Error("expected relay adaptation failure");
+  } catch (cause) {
+    expect(cause).toBeInstanceOf(BusToAdapterEffectFailed);
+    if (!(cause instanceof BusToAdapterEffectFailed)) throw cause;
+    return cause;
+  }
+}
+
+describe("surface operation relay adaptation", () => {
+  it.each([
+    new SurfaceOperationUnsupported({
+      platform: "discord",
+      operation: "push-output",
+      message: "unsupported secret=hidden",
+    }),
+    new SurfacePlatformMismatch({
+      operation: "push-output",
+      refRole: "sessionRef",
+      expectedPlatform: "discord",
+      receivedPlatform: "github",
+      message: "platform mismatch secret=hidden",
+    }),
+    new SurfaceSessionMismatch({
+      operation: "push-output",
+      refRole: "replyTo",
+      expectedSessionId: "expected",
+      receivedSessionId: "received",
+      message: "session mismatch secret=hidden",
+    }),
+    new SurfaceInvalidInput({
+      platform: "discord",
+      operation: "push-output",
+      field: "content",
+      message: "invalid secret=hidden",
+    }),
+    new SurfaceMessageNotFound({
+      platform: "discord",
+      operation: "push-output",
+      message: "missing secret=hidden",
+    }),
+    new SurfacePermissionDenied({
+      platform: "discord",
+      operation: "push-output",
+      message: "forbidden secret=hidden",
+    }),
+  ])("classifies $error._tag as a safe permanent failure", (error) => {
+    const failure = relayFailure(error);
+
+    expect(failure).toMatchObject({
+      operation: "push-output",
+      failureKind: "permanent",
+      surfaceErrorTag: error._tag,
+      created: null,
+      cause: { errorTag: error._tag },
+    });
+    expect(JSON.stringify(failure)).not.toContain("secret=hidden");
+  });
+
+  it.each([
+    new SurfaceRateLimited({
+      platform: "discord",
+      operation: "push-output",
+      retryAfterMs: 2500,
+      message: "rate limited secret=hidden",
+    }),
+    new SurfaceUnavailable({
+      platform: "discord",
+      operation: "push-output",
+      message: "unavailable secret=hidden",
+    }),
+  ])("classifies $error._tag as a safe transient failure", (error) => {
+    const failure = relayFailure(error);
+
+    expect(failure).toMatchObject({
+      operation: "push-output",
+      failureKind: "transient",
+      surfaceErrorTag: error._tag,
+      created: null,
+      cause: { errorTag: error._tag },
+    });
+    expect(JSON.stringify(failure)).not.toContain("secret=hidden");
+  });
+
+  it("preserves partial-completion context without exposing the provider message", () => {
+    const created = { platform: "discord" as const, channelId: "channel", messageId: "message" };
+    const failure = relayFailure(
+      new SurfaceOperationPartiallyCompleted({
+        platform: "discord",
+        operation: "push-output",
+        created,
+        message: "partial secret=hidden",
+      }),
+    );
+
+    expect(failure).toMatchObject({
+      operation: "push-output",
+      failureKind: "partial-completion",
+      surfaceErrorTag: "SurfaceOperationPartiallyCompleted",
+      created,
+      cause: { errorTag: "SurfaceOperationPartiallyCompleted" },
+    });
+    expect(JSON.stringify(failure)).not.toContain("secret=hidden");
+  });
+
+  it("does not wrap Panic from relay effects", async () => {
+    const panic = new Panic({ message: "relay invariant" });
+    await expect(
+      captureBusToAdapterEffect("push-output", async () => {
+        throw panic;
+      }),
+    ).rejects.toBe(panic);
+  });
+});
 
 describe("bridgeBusToAdapter", () => {
   it("keeps an idle relay alive with invisible agent activity", async () => {

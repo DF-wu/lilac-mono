@@ -12,14 +12,14 @@ Source: `plan/surface-adapter-contract-readiness.md`
 
 ## Stage 2: Discord And GitHub Adapter Normalization
 
-- [ ] Migrate all Discord operations and nested refs to the canonical contract.
-- [ ] Migrate all GitHub operations to the canonical contract.
-- [ ] Atomically migrate the base interface, both adapters, callers, and test fakes.
-- [ ] Separate adapter-event ingress subscription from the base adapter contract.
-- [ ] Move supported GitHub CRUD and detailed reaction behavior behind GitHub adapter operations.
-- [ ] Replace unsupported no-ops, empty successes, and private rejection errors.
-- [ ] Add deterministic Discord/GitHub SDK failure-classification tests.
-- [ ] Run focused tests, Core typecheck, lint/fmt, and independent review.
+- [x] Migrate all Discord operations and nested refs to the canonical contract.
+- [x] Migrate all GitHub operations to the canonical contract.
+- [x] Atomically migrate the base interface, both adapters, callers, and test fakes.
+- [x] Separate adapter-event ingress subscription from the base adapter contract.
+- [x] Move supported GitHub CRUD and detailed reaction behavior behind GitHub adapter operations.
+- [x] Replace unsupported no-ops, empty successes, and private rejection errors.
+- [x] Add deterministic Discord/GitHub SDK failure-classification tests.
+- [x] Run focused tests, Core typecheck, lint/fmt, and independent review.
 
 ## Stage 3: Descriptor-Bound Produced-Ref Guards
 

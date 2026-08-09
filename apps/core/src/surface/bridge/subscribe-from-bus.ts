@@ -9,7 +9,7 @@ import {
 } from "@stanley2058/lilac-event-bus";
 import { Panic, Result, TaggedError, type Result as ResultType } from "better-result";
 
-import { createLogger, env } from "@stanley2058/lilac-utils";
+import { createLogger, env, formatTaggedErrorForLog } from "@stanley2058/lilac-utils";
 import type { Logger } from "@stanley2058/simple-module-logger";
 
 import type {
@@ -18,9 +18,10 @@ import type {
   SurfaceOutputPart,
   SurfaceOutputPartDisposition,
   SurfaceOutputResult,
+  SurfaceOperationError,
+  SurfaceOperationResult,
   StartOutputOpts,
   SurfaceToolStatusUpdate,
-  TypingIndicatorProvider,
   TypingIndicatorSubscription,
 } from "../adapter";
 import type { MsgRef, SessionRef, SurfaceAttachment } from "../types";
@@ -143,13 +144,17 @@ type BusToAdapterEffect =
   | "publish-output-created"
   | "push-output"
   | "reanchor-output"
+  | "start-output"
   | "start-typing"
   | "stop-output-subscription"
   | "stop-relay"
   | "stop-typing";
 
-class BusToAdapterEffectFailed extends TaggedError("BusToAdapterEffectFailed")<{
+export class BusToAdapterEffectFailed extends TaggedError("BusToAdapterEffectFailed")<{
   readonly operation: BusToAdapterEffect;
+  readonly failureKind: "external-effect" | "partial-completion" | "permanent" | "transient";
+  readonly surfaceErrorTag: SurfaceOperationError["_tag"] | null;
+  readonly created: MsgRef | null;
   readonly cause: unknown;
   readonly message: string;
 }> {}
@@ -179,14 +184,70 @@ export async function captureBusToAdapterEffect<T>(
     return Result.ok(await effect());
   } catch (cause) {
     rethrowBusToAdapterPanic(cause);
+    if (cause instanceof BusToAdapterEffectFailed) return Result.err(cause);
     return Result.err(
       new BusToAdapterEffectFailed({
         operation,
+        failureKind: "external-effect",
+        surfaceErrorTag: null,
+        created: null,
         cause,
         message: `Bus-to-adapter effect failed: ${operation}`,
       }),
     );
   }
+}
+
+function classifySurfaceOperationForRelay(
+  operation: BusToAdapterEffect,
+  error: SurfaceOperationError,
+): BusToAdapterEffectFailed {
+  switch (error._tag) {
+    case "SurfaceOperationUnsupported":
+    case "SurfacePlatformMismatch":
+    case "SurfaceSessionMismatch":
+    case "SurfaceInvalidInput":
+    case "SurfaceMessageNotFound":
+    case "SurfacePermissionDenied":
+      return new BusToAdapterEffectFailed({
+        operation,
+        failureKind: "permanent",
+        surfaceErrorTag: error._tag,
+        created: null,
+        cause: { errorTag: error._tag },
+        message: `Surface relay operation '${operation}' was rejected permanently (${error._tag})`,
+      });
+    case "SurfaceRateLimited":
+    case "SurfaceUnavailable":
+      return new BusToAdapterEffectFailed({
+        operation,
+        failureKind: "transient",
+        surfaceErrorTag: error._tag,
+        created: null,
+        cause:
+          error._tag === "SurfaceRateLimited"
+            ? { errorTag: error._tag, retryAfterMs: error.retryAfterMs }
+            : { errorTag: error._tag },
+        message: `Surface relay operation '${operation}' failed transiently (${error._tag})`,
+      });
+    case "SurfaceOperationPartiallyCompleted":
+      return new BusToAdapterEffectFailed({
+        operation,
+        failureKind: "partial-completion",
+        surfaceErrorTag: error._tag,
+        created: error.created,
+        cause: { errorTag: error._tag },
+        message: `Surface relay operation '${operation}' partially completed`,
+      });
+  }
+}
+
+export function adaptSurfaceOperationToRelay<T>(
+  operation: BusToAdapterEffect,
+  result: SurfaceOperationResult<T>,
+): T {
+  if (result.status === "ok") return result.value;
+  throw classifySurfaceOperationForRelay(operation, result.error);
 }
 
 export function adaptBusToAdapterSubscriptionStart(
@@ -275,12 +336,6 @@ function getConsumerId(prefix: string): string {
 function scheduleTimeout(callback: () => void, delayMs: number): () => void {
   const timeout = setTimeout(callback, delayMs);
   return () => clearTimeout(timeout);
-}
-
-function isTypingIndicatorProvider(
-  adapter: SurfaceAdapter,
-): adapter is SurfaceAdapter & TypingIndicatorProvider {
-  return "startTyping" in adapter && typeof adapter.startTyping === "function";
 }
 
 function parseRouterSessionMode(raw: string | undefined): "mention" | "active" | undefined {
@@ -1004,7 +1059,10 @@ export async function bridgeBusToAdapter<P extends RegisteredSurfacePlatform>(pa
     };
 
     streamToken += 1;
-    let out = await adapter.startOutput(sessionRef, buildStartOpts(baseReplyTo, streamToken));
+    let out = adaptSurfaceOperationToRelay(
+      "start-output",
+      await adapter.startOutput(sessionRef, buildStartOpts(baseReplyTo, streamToken)),
+    );
     let finalTextMode: SurfaceFinalTextMode = out.getFinalTextMode?.() ?? "continuation";
     useResumeOpts = false;
     const recordOutputPartDisposition = (disposition: SurfaceOutputPartDisposition): void => {
@@ -1047,23 +1105,36 @@ export async function bridgeBusToAdapter<P extends RegisteredSurfacePlatform>(pa
       }
 
       if (visibleTextAcc.trim().length > 0) {
-        recordOutputPartDisposition(await out.push({ type: "text.set", text: visibleTextAcc }));
+        recordOutputPartDisposition(
+          adaptSurfaceOperationToRelay(
+            "push-output",
+            await out.push({ type: "text.set", text: visibleTextAcc }),
+          ),
+        );
       }
       if (textPhase !== "final_answer" && typeof reasoningStartedAtMs === "number") {
         recordOutputPartDisposition(
-          await out.push({
-            type: "reasoning.status",
-            update: {
-              startedAtMs: reasoningStartedAtMs,
-              frozenAtMs: reasoningFrozenAtMs,
-              detailText: reasoningDetailText,
-            },
-          }),
+          adaptSurfaceOperationToRelay(
+            "push-output",
+            await out.push({
+              type: "reasoning.status",
+              update: {
+                startedAtMs: reasoningStartedAtMs,
+                frozenAtMs: reasoningFrozenAtMs,
+                detailText: reasoningDetailText,
+              },
+            }),
+          ),
         );
       }
       if (textPhase !== "final_answer") {
         for (const update of toolStatusById.values()) {
-          recordOutputPartDisposition(await out.push({ type: "tool.status", update }));
+          recordOutputPartDisposition(
+            adaptSurfaceOperationToRelay(
+              "push-output",
+              await out.push({ type: "tool.status", update }),
+            ),
+          );
         }
       }
     }
@@ -1080,7 +1151,9 @@ export async function bridgeBusToAdapter<P extends RegisteredSurfacePlatform>(pa
       activeOutputRefKeys = new Set();
       await runBusToAdapterBestEffort({
         operation: "abort-output",
-        effect: () => out.abort(lane.abortReason),
+        effect: async () => {
+          adaptSurfaceOperationToRelay("abort-output", await out.abort(lane.abortReason));
+        },
       });
 
       const nextReplyTo = lane.resolveReplyToAfterAbort?.() ?? lane.replyTo;
@@ -1096,24 +1169,35 @@ export async function bridgeBusToAdapter<P extends RegisteredSurfacePlatform>(pa
       phaseSegmentsValid = true;
       visibleTextAcc = "";
       streamShouldFinish = false;
-      out = await adapter.startOutput(sessionRef, buildStartOpts(nextReplyTo, streamToken));
+      out = adaptSurfaceOperationToRelay(
+        "start-output",
+        await adapter.startOutput(sessionRef, buildStartOpts(nextReplyTo, streamToken)),
+      );
       finalTextMode = out.getFinalTextMode?.() ?? "continuation";
 
       if (!lane.replayStatus) return;
       if (typeof reasoningStartedAtMs === "number") {
         recordOutputPartDisposition(
-          await out.push({
-            type: "reasoning.status",
-            update: {
-              startedAtMs: reasoningStartedAtMs,
-              frozenAtMs: reasoningFrozenAtMs,
-              detailText: reasoningDetailText,
-            },
-          }),
+          adaptSurfaceOperationToRelay(
+            "push-output",
+            await out.push({
+              type: "reasoning.status",
+              update: {
+                startedAtMs: reasoningStartedAtMs,
+                frozenAtMs: reasoningFrozenAtMs,
+                detailText: reasoningDetailText,
+              },
+            }),
+          ),
         );
       }
       for (const update of toolStatusById.values()) {
-        recordOutputPartDisposition(await out.push({ type: "tool.status", update }));
+        recordOutputPartDisposition(
+          adaptSurfaceOperationToRelay(
+            "push-output",
+            await out.push({ type: "tool.status", update }),
+          ),
+        );
       }
     };
 
@@ -1125,7 +1209,9 @@ export async function bridgeBusToAdapter<P extends RegisteredSurfacePlatform>(pa
       if (!currentTyping) return;
       await runBusToAdapterBestEffort({
         operation: "stop-typing",
-        effect: () => currentTyping.stop(),
+        effect: async () => {
+          adaptSurfaceOperationToRelay("stop-typing", await currentTyping.stop());
+        },
       });
     };
 
@@ -1141,7 +1227,9 @@ export async function bridgeBusToAdapter<P extends RegisteredSurfacePlatform>(pa
 
         const abortOutput = runBusToAdapterBestEffort({
           operation: "abort-output",
-          effect: () => out.abort("timeout"),
+          effect: async () => {
+            adaptSurfaceOperationToRelay("abort-output", await out.abort("timeout"));
+          },
           logger,
           logLevel: "error",
           logMessage: "failed to abort output stream",
@@ -1276,7 +1364,7 @@ export async function bridgeBusToAdapter<P extends RegisteredSurfacePlatform>(pa
     const pushOutputPart = async (
       part: SurfaceOutputPart,
     ): Promise<ResultType<SurfaceOutputPartDisposition, OutReqPushFailed>> => {
-      const pushed = await captureBusToAdapterEffect("push-output", () => out.push(part));
+      const pushed = await out.push(part);
       if (pushed.status === "ok") return Result.ok(pushed.value);
       logger.error(
         "failed to push relay output",
@@ -1284,14 +1372,14 @@ export async function bridgeBusToAdapter<P extends RegisteredSurfacePlatform>(pa
       );
       return Result.err(
         new OutReqPushFailed({
-          cause: pushed.error,
+          cause: classifySurfaceOperationForRelay("push-output", pushed.error),
           message: "Failed to push relay output",
         }),
       );
     };
 
     const finishOutput = async (): Promise<ResultType<SurfaceOutputResult, OutReqFinishFailed>> => {
-      const finished = await captureBusToAdapterEffect("finish-output", () => out.finish());
+      const finished = await out.finish();
       if (finished.status === "ok") return Result.ok(finished.value);
       logger.error(
         "failed to finish relay output",
@@ -1299,7 +1387,7 @@ export async function bridgeBusToAdapter<P extends RegisteredSurfacePlatform>(pa
       );
       return Result.err(
         new OutReqFinishFailed({
-          cause: finished.error,
+          cause: classifySurfaceOperationForRelay("finish-output", finished.error),
           message: "Failed to finish relay output",
         }),
       );
@@ -1537,7 +1625,9 @@ export async function bridgeBusToAdapter<P extends RegisteredSurfacePlatform>(pa
                     () =>
                       runBusToAdapterBestEffort({
                         operation: "abort-output",
-                        effect: () => out.abort("skip"),
+                        effect: async () => {
+                          adaptSurfaceOperationToRelay("abort-output", await out.abort("skip"));
+                        },
                       }),
                     cleanupSkippedOutput,
                     deleteUnlinkedCheckpointCandidate,
@@ -1565,7 +1655,12 @@ export async function bridgeBusToAdapter<P extends RegisteredSurfacePlatform>(pa
                     () =>
                       runBusToAdapterBestEffort({
                         operation: "abort-output",
-                        effect: () => out.abort("superseded"),
+                        effect: async () => {
+                          adaptSurfaceOperationToRelay(
+                            "abort-output",
+                            await out.abort("superseded"),
+                          );
+                        },
                       }),
                     relayStop,
                   ]);
@@ -1607,7 +1702,9 @@ export async function bridgeBusToAdapter<P extends RegisteredSurfacePlatform>(pa
                     () =>
                       runBusToAdapterBestEffort({
                         operation: "abort-output",
-                        effect: () => out.abort("skip"),
+                        effect: async () => {
+                          adaptSurfaceOperationToRelay("abort-output", await out.abort("skip"));
+                        },
                       }),
                     cleanupSkippedOutput,
                     deleteUnlinkedCheckpointCandidate,
@@ -1738,11 +1835,16 @@ export async function bridgeBusToAdapter<P extends RegisteredSurfacePlatform>(pa
     outputSub = adaptBusToAdapterSubscriptionStart(outputStarted);
     observeSubscriptionDone(outputSub, outReqTopic(requestId), logger);
 
-    if (isTypingIndicatorProvider(adapter)) {
-      const startedTyping = await captureBusToAdapterEffect("start-typing", () =>
-        adapter.startTyping(sessionRef),
-      );
-      typing = startedTyping.status === "ok" ? startedTyping.value : null;
+    const startedTyping = await adapter.startTyping(sessionRef);
+    if (startedTyping.status === "ok") {
+      typing = startedTyping.value;
+    } else {
+      typing = null;
+      logger.warn("surface typing indicator unavailable", {
+        requestId,
+        sessionId,
+        ...formatTaggedErrorForLog(startedTyping.error),
+      });
     }
 
     if (env.perf.log) {
@@ -1780,7 +1882,9 @@ export async function bridgeBusToAdapter<P extends RegisteredSurfacePlatform>(pa
             () =>
               runBusToAdapterBestEffort({
                 operation: "abort-output",
-                effect: () => out.abort("cancel"),
+                effect: async () => {
+                  adaptSurfaceOperationToRelay("abort-output", await out.abort("cancel"));
+                },
                 logger,
                 logLevel: "error",
                 logMessage: "failed to abort output stream on cancel",

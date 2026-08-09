@@ -1,14 +1,15 @@
+import { Result } from "better-result";
+
 import type { GithubSessionRef, MsgRef } from "../../types";
 import type {
+  SurfaceOperationResult,
   SurfaceOutputPart,
   SurfaceOutputPartDisposition,
   SurfaceOutputResult,
   SurfaceOutputStream,
 } from "../../adapter";
 
-import { createIssueComment } from "../../../github/github-api";
 import { markGithubAgentComment } from "../../../github/github-comment-marker";
-import { parseGithubSessionId } from "../../../github/github-ids";
 
 export class GithubOutputStream implements SurfaceOutputStream {
   private text = "";
@@ -16,35 +17,40 @@ export class GithubOutputStream implements SurfaceOutputStream {
 
   constructor(
     private readonly sessionRef: GithubSessionRef,
+    private readonly api: {
+      createComment(body: string): Promise<SurfaceOperationResult<{ readonly id: number }>>;
+    },
     private readonly opts?: { replyTo?: MsgRef },
   ) {}
 
-  async push(part: SurfaceOutputPart): Promise<SurfaceOutputPartDisposition> {
+  async push(
+    part: SurfaceOutputPart,
+  ): Promise<SurfaceOperationResult<SurfaceOutputPartDisposition>> {
     switch (part.type) {
       case "text.delta": {
         // Buffer deltas; GitHub surface posts once at finish.
         this.text += part.delta;
-        return "visible";
+        return Result.ok("visible");
       }
       case "text.set": {
         this.text = part.text;
-        return "visible";
+        return Result.ok("visible");
       }
       case "attachment.add": {
         // GitHub omits binary attachments, but attachment-only replies still complete at finish.
-        return "terminal";
+        return Result.ok("terminal");
       }
       case "reasoning.status": {
         // Ignore (no streaming UI for GitHub).
-        return "ignored";
+        return Result.ok("ignored");
       }
       case "tool.status": {
         // GitHub has no tool UI, but tool-only replies still complete at finish.
-        return "terminal";
+        return Result.ok("terminal");
       }
       case "meta.stats": {
         // Ignore (no dedicated stats UI for GitHub).
-        return "ignored";
+        return Result.ok("ignored");
       }
       default: {
         const _exhaustive: never = part;
@@ -53,9 +59,7 @@ export class GithubOutputStream implements SurfaceOutputStream {
     }
   }
 
-  async finish(): Promise<SurfaceOutputResult> {
-    const thread = parseGithubSessionId(this.sessionRef.channelId);
-
+  async finish(): Promise<SurfaceOperationResult<SurfaceOutputResult>> {
     const replyPrefix = (() => {
       const replyTo = this.opts?.replyTo;
       if (!replyTo || replyTo.platform !== "github") return "";
@@ -63,27 +67,23 @@ export class GithubOutputStream implements SurfaceOutputStream {
     })();
 
     const body = markGithubAgentComment(`${replyPrefix}${this.text}`);
-    const res = await createIssueComment({
-      owner: thread.owner,
-      repo: thread.repo,
-      issueNumber: thread.number,
-      body,
-    });
+    const res = await this.api.createComment(body);
+    if (res.status === "error") return res;
 
     const ref: MsgRef = {
       platform: "github",
       channelId: this.sessionRef.channelId,
-      messageId: String(res.id),
+      messageId: String(res.value.id),
     };
     this.created.push(ref);
 
-    return {
+    return Result.ok({
       created: this.created,
       last: ref,
-    };
+    });
   }
 
-  async abort(_reason?: string): Promise<void> {
-    // No-op: we do not create placeholder comments.
+  async abort(_reason?: string): Promise<SurfaceOperationResult<void>> {
+    return Result.ok(undefined);
   }
 }

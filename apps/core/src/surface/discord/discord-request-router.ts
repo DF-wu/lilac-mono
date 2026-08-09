@@ -1,6 +1,7 @@
 import {
   createLogger,
   extractAiErrorLogDetails,
+  formatTaggedErrorForLog,
   getCoreConfig,
   env,
   isPanic,
@@ -20,13 +21,17 @@ import {
 } from "@stanley2058/lilac-event-bus";
 import { Panic, Result, TaggedError, type Result as ResultType } from "better-result";
 import type { Logger } from "@stanley2058/simple-module-logger";
-import type { SurfaceAdapter } from "../adapter";
+import type { SurfaceAdapter, SurfaceOperationError } from "../adapter";
 import type { MsgRefFor } from "../runtime-descriptor";
 import type { MsgRef, SurfaceSelf } from "../types";
-import type { TranscriptStore } from "../../transcript/transcript-store";
+import {
+  CoreOwnedBlobIntegrityError,
+  type TranscriptStore,
+} from "../../transcript/transcript-store";
 import {
   composeRequestMessages,
   composeSingleMessageWithLineage,
+  type RequestCompositionError,
   type RequestCompositionResult,
 } from "../bridge/request-composition";
 import { formatDiscordMessageRequestId } from "../bridge/request-ids";
@@ -103,6 +108,96 @@ function createFreshOnlyLineage(
     currentCanonicalStart: 0,
     reason: "lineage-fallback-construction-failed",
   };
+}
+
+export type DiscordRequestCompositionFailurePolicy = {
+  readonly disposition:
+    | "drop-integrity-failure"
+    | "drop-permanent-gateway-event"
+    | "drop-transient-gateway-event";
+  readonly level: "error" | "warn";
+  readonly retryable: boolean;
+};
+
+export function discordRequestCompositionFailurePolicy(
+  error: RequestCompositionError,
+): DiscordRequestCompositionFailurePolicy {
+  if (error instanceof CoreOwnedBlobIntegrityError) {
+    return { disposition: "drop-integrity-failure", level: "error", retryable: false };
+  }
+  return discordSurfaceCompositionFailurePolicy(error);
+}
+
+function discordSurfaceCompositionFailurePolicy(
+  error: SurfaceOperationError,
+): DiscordRequestCompositionFailurePolicy {
+  switch (error._tag) {
+    case "SurfaceRateLimited":
+    case "SurfaceUnavailable":
+      return {
+        disposition: "drop-transient-gateway-event",
+        level: "warn",
+        retryable: true,
+      };
+    case "SurfaceOperationUnsupported":
+    case "SurfacePlatformMismatch":
+    case "SurfaceSessionMismatch":
+    case "SurfaceInvalidInput":
+    case "SurfaceOperationPartiallyCompleted":
+    case "SurfaceMessageNotFound":
+    case "SurfacePermissionDenied":
+      return {
+        disposition: "drop-permanent-gateway-event",
+        level: "warn",
+        retryable: false,
+      };
+  }
+}
+
+function logDiscordRequestCompositionFailure(
+  logger: Logger,
+  requestId: string,
+  sessionId: string,
+  error: RequestCompositionError,
+): void {
+  if (error instanceof CoreOwnedBlobIntegrityError) {
+    logger.error("request composition failed", {
+      requestId,
+      sessionId,
+      disposition: "drop-integrity-failure",
+      retryable: false,
+      errorType: "CoreOwnedBlobIntegrityError",
+      errorMessage: "Core owned blob integrity check failed",
+    });
+    return;
+  }
+  switch (error._tag) {
+    case "SurfaceRateLimited":
+    case "SurfaceUnavailable":
+      logger.warn("request composition failed", {
+        requestId,
+        sessionId,
+        disposition: "drop-transient-gateway-event",
+        retryable: true,
+        ...formatTaggedErrorForLog(error),
+      });
+      return;
+    case "SurfaceOperationUnsupported":
+    case "SurfacePlatformMismatch":
+    case "SurfaceSessionMismatch":
+    case "SurfaceInvalidInput":
+    case "SurfaceOperationPartiallyCompleted":
+    case "SurfaceMessageNotFound":
+    case "SurfacePermissionDenied":
+      logger.warn("request composition failed", {
+        requestId,
+        sessionId,
+        disposition: "drop-permanent-gateway-event",
+        retryable: false,
+        ...formatTaggedErrorForLog(error),
+      });
+      return;
+  }
 }
 
 type ActiveSessionState = {
@@ -1409,11 +1504,7 @@ export async function startDiscordRequestRouter(
       },
     });
     if (composed.status === "error") {
-      logger.error("request composition failed", {
-        requestId,
-        sessionId: input.sessionId,
-        error: "Core owned blob integrity check failed",
-      });
+      logDiscordRequestCompositionFailure(logger, requestId, input.sessionId, composed.error);
       return;
     }
     const composition = composed.value;
@@ -1424,7 +1515,9 @@ export async function startDiscordRequestRouter(
 
     for (const item of batch.items) {
       const surfaceMessage = await adapter.readMsg(item.msgRef);
-      if (surfaceMessage?.userId) batchParticipantUserIds.push(surfaceMessage.userId);
+      if (surfaceMessage.status === "ok" && surfaceMessage.value?.userId) {
+        batchParticipantUserIds.push(surfaceMessage.value.userId);
+      }
       if (chainMessageIds.has(item.msgRef.messageId)) continue;
       const extra = await composeSingleMessageWithLineage(adapter, {
         platform: "discord",
@@ -1437,11 +1530,7 @@ export async function startDiscordRequestRouter(
       });
 
       if (extra.status === "error") {
-        logger.error("request composition failed", {
-          requestId,
-          sessionId: input.sessionId,
-          error: "Core owned blob integrity check failed",
-        });
+        logDiscordRequestCompositionFailure(logger, requestId, input.sessionId, extra.error);
         return;
       }
       if (!extra.value) continue;
@@ -2472,11 +2561,12 @@ export async function startDiscordRequestRouter(
       input: requestInput,
     });
     if (published.status === "error") {
-      logger.error("request composition failed", {
-        requestId: input.requestId,
-        sessionId: input.sessionId,
-        error: "Core owned blob integrity check failed",
-      });
+      logDiscordRequestCompositionFailure(
+        logger,
+        input.requestId,
+        input.sessionId,
+        published.error,
+      );
     }
   }
 
@@ -2500,11 +2590,12 @@ export async function startDiscordRequestRouter(
       input: requestInput,
     });
     if (published.status === "error") {
-      logger.error("request composition failed", {
-        requestId: input.requestId,
-        sessionId: input.sessionId,
-        error: "Core owned blob integrity check failed",
-      });
+      logDiscordRequestCompositionFailure(
+        logger,
+        input.requestId,
+        input.sessionId,
+        published.error,
+      );
       return;
     }
 
@@ -2537,11 +2628,12 @@ export async function startDiscordRequestRouter(
       input: requestInput,
     });
     if (published.status === "error") {
-      logger.error("request composition failed", {
-        requestId: input.requestId,
-        sessionId: input.sessionId,
-        error: "Core owned blob integrity check failed",
-      });
+      logDiscordRequestCompositionFailure(
+        logger,
+        input.requestId,
+        input.sessionId,
+        published.error,
+      );
     }
     return published;
   }
@@ -2565,11 +2657,12 @@ export async function startDiscordRequestRouter(
       input: requestInput,
     });
     if (published.status === "error") {
-      logger.error("request composition failed", {
-        requestId: input.requestId,
-        sessionId: input.sessionId,
-        error: "Core owned blob integrity check failed",
-      });
+      logDiscordRequestCompositionFailure(
+        logger,
+        input.requestId,
+        input.sessionId,
+        published.error,
+      );
     }
   }
 

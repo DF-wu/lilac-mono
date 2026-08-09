@@ -10,8 +10,10 @@ import type {
   SessionRef,
   SurfaceAttachment,
   SurfaceMessage,
+  SurfaceReactionDetail,
   SurfaceSelf,
   SurfaceSession,
+  SurfaceSessionParticipantsResult,
 } from "./types";
 import type { AdapterEvent } from "./events";
 
@@ -24,13 +26,6 @@ export function surfaceExternalFallback<T>(fallback: T): (cause: unknown) => T {
     preserveSurfacePanic(cause);
     return fallback;
   };
-}
-
-/** Compatibility edge for the legacy Promise-based surface contract. */
-export function signalSurfaceFailure<T>(error: Error): Promise<T> {
-  const deferred = Promise.withResolvers<T>();
-  deferred.reject(error);
-  return deferred.promise;
 }
 
 export type SurfaceOperation =
@@ -141,17 +136,6 @@ export type SurfaceToolStatusUpdate = {
   error?: string;
 };
 
-export class SurfaceMessageNotFoundError extends Error {
-  constructor(
-    readonly platform: "discord" | "github",
-    readonly code: number | string,
-    message: string,
-  ) {
-    super(message);
-    this.name = "SurfaceMessageNotFoundError";
-  }
-}
-
 export type SurfaceReasoningStatusUpdate = {
   startedAtMs: number;
   /** Freeze timer at this timestamp once text starts streaming. */
@@ -185,9 +169,9 @@ export type SurfaceMergeBlockPlanOptions = {
 };
 
 export interface SurfaceOutputStream {
-  push(part: SurfaceOutputPart): Promise<SurfaceOutputPartDisposition>;
-  finish(): Promise<SurfaceOutputResult>;
-  abort(reason?: string): Promise<void>;
+  push(part: SurfaceOutputPart): Promise<SurfaceOperationResult<SurfaceOutputPartDisposition>>;
+  finish(): Promise<SurfaceOperationResult<SurfaceOutputResult>>;
+  abort(reason?: string): Promise<SurfaceOperationResult<void>>;
   /**
    * Optional final-text policy for bridge slicing behavior.
    * - continuation: treat finalText as current-lane continuation after reanchor
@@ -220,60 +204,64 @@ export type AdapterSubscription = {
 };
 
 export type TypingIndicatorSubscription = {
-  stop(): Promise<void>;
+  stop(): Promise<SurfaceOperationResult<void>>;
 };
 
-/** Optional capability: start/stop a typing indicator for a session. */
-export interface TypingIndicatorProvider {
-  startTyping(sessionRef: SessionRef): Promise<TypingIndicatorSubscription>;
-}
-
 export type AdapterEventHandler = (evt: AdapterEvent) => Promise<void> | void;
+
+export interface SurfaceAdapterEventSource {
+  subscribe(handler: AdapterEventHandler): Promise<AdapterSubscription>;
+}
 
 export interface SurfaceAdapter {
   connect(): Promise<void>;
   disconnect(): Promise<void>;
   getSelf(): Promise<SurfaceSelf>;
 
-  listSessions(): Promise<SurfaceSession[]>;
+  listSessions(): Promise<SurfaceOperationResult<SurfaceSession[]>>;
+  listSessionParticipants(
+    sessionRef: SessionRef,
+    opts?: { limit?: number },
+  ): Promise<SurfaceOperationResult<SurfaceSessionParticipantsResult>>;
 
-  startOutput(sessionRef: SessionRef, opts?: StartOutputOpts): Promise<SurfaceOutputStream>;
+  startOutput(
+    sessionRef: SessionRef,
+    opts?: StartOutputOpts,
+  ): Promise<SurfaceOperationResult<SurfaceOutputStream>>;
+  startTyping(sessionRef: SessionRef): Promise<SurfaceOperationResult<TypingIndicatorSubscription>>;
 
-  sendMsg(sessionRef: SessionRef, content: ContentOpts, opts?: SendOpts): Promise<MsgRef>;
-  readMsg(msgRef: MsgRef): Promise<SurfaceMessage | null>;
-  listMsg(sessionRef: SessionRef, opts?: LimitOpts): Promise<SurfaceMessage[]>;
-  editMsg(msgRef: MsgRef, content: ContentOpts): Promise<void>;
-  deleteMsg(msgRef: MsgRef): Promise<void>;
-  getReplyContext(msgRef: MsgRef, opts?: LimitOpts): Promise<SurfaceMessage[]>;
-
-  addReaction(msgRef: MsgRef, reaction: string): Promise<void>;
-  removeReaction(msgRef: MsgRef, reaction: string): Promise<void>;
-  listReactions(msgRef: MsgRef): Promise<string[]>;
-
-  subscribe(handler: AdapterEventHandler): Promise<AdapterSubscription>;
-
-  getUnRead(sessionRef: SessionRef): Promise<SurfaceMessage[]>;
-  markRead(sessionRef: SessionRef, upToMsgRef?: MsgRef): Promise<void>;
-}
-
-/** Optional capability: plan reply-chain traversal using local metadata/indexes. */
-export interface SurfaceReplyChainPlannerProvider {
-  planReplyChain(msgRef: MsgRef, opts?: SurfaceReplyChainPlanOptions): Promise<readonly MsgRef[]>;
+  sendMsg(
+    sessionRef: SessionRef,
+    content: ContentOpts,
+    opts?: SendOpts,
+  ): Promise<SurfaceOperationResult<MsgRef>>;
+  readMsg(msgRef: MsgRef): Promise<SurfaceOperationResult<SurfaceMessage | null>>;
+  listMsg(
+    sessionRef: SessionRef,
+    opts?: LimitOpts,
+  ): Promise<SurfaceOperationResult<SurfaceMessage[]>>;
+  editMsg(msgRef: MsgRef, content: ContentOpts): Promise<SurfaceOperationResult<void>>;
+  deleteMsg(msgRef: MsgRef): Promise<SurfaceOperationResult<void>>;
+  getReplyContext(
+    msgRef: MsgRef,
+    opts?: LimitOpts,
+  ): Promise<SurfaceOperationResult<SurfaceMessage[]>>;
+  planReplyChain(
+    msgRef: MsgRef,
+    opts?: SurfaceReplyChainPlanOptions,
+  ): Promise<SurfaceOperationResult<readonly MsgRef[]>>;
   planMergeBlockEndingAt(
     msgRef: MsgRef,
     opts?: SurfaceMergeBlockPlanOptions,
-  ): Promise<readonly MsgRef[]>;
-}
+  ): Promise<SurfaceOperationResult<readonly MsgRef[]>>;
 
-export function hasReplyChainPlannerProvider(
-  adapter: SurfaceAdapter,
-): adapter is SurfaceAdapter & SurfaceReplyChainPlannerProvider {
-  return (
-    "planReplyChain" in adapter &&
-    typeof adapter.planReplyChain === "function" &&
-    "planMergeBlockEndingAt" in adapter &&
-    typeof adapter.planMergeBlockEndingAt === "function"
-  );
+  addReaction(msgRef: MsgRef, reaction: string): Promise<SurfaceOperationResult<void>>;
+  removeReaction(msgRef: MsgRef, reaction: string): Promise<SurfaceOperationResult<void>>;
+  listReactions(msgRef: MsgRef): Promise<SurfaceOperationResult<string[]>>;
+  listReactionDetails(msgRef: MsgRef): Promise<SurfaceOperationResult<SurfaceReactionDetail[]>>;
+
+  getUnRead(sessionRef: SessionRef): Promise<SurfaceOperationResult<SurfaceMessage[]>>;
+  markRead(sessionRef: SessionRef, upToMsgRef?: MsgRef): Promise<SurfaceOperationResult<void>>;
 }
 
 export type SurfaceBurstCacheInput = {
