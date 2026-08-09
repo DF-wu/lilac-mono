@@ -13,6 +13,15 @@
 
 This repo uses Bun's install layout. Many packages in `apps/*/node_modules` are symlinks into Bun's cache under `node_modules/.bun/...`. If you can't find a type definition by searching the workspace `node_modules`, follow the symlink and then follow `package.json` `exports`/`types`. Always use `ls -al` because the `grep`, `glob` don't work on ignored files and dot-dirs.
 
+## Operating Rules (apply only when operating on multi-stage plan files; skip this when change is simple and straightforward)
+
+- Use subagents for edits and review; parallelize work when it is independent.
+- Maintain a todo file alongside the plan.
+- Complete the plan stage by stage, in order, until every stage is complete.
+- Commit each stage separately after its exit criteria, validation, and review are complete.
+- Keep changes scoped to the agreed plan. Document residual review findings here and defer them unless
+  they block the current stage.
+
 ## Build / Test / Typecheck
 
 ### Build
