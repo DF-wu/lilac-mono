@@ -108,7 +108,7 @@ export type SurfaceRelayPolicy<P extends RegisteredSurfacePlatform> = {
   readonly finalization?: SurfaceRelayFinalization<P>;
 };
 
-export type SurfaceRelayDescriptor<P extends RegisteredSurfacePlatform> = SurfaceRelayPolicy<P> & {
+export type SurfaceRelayDescriptor<P extends RegisteredSurfacePlatform> = {
   readonly lifecycle: SurfaceRelayLifecyclePort<P>;
 };
 

@@ -10,13 +10,13 @@ export function createDiscordSurfaceRuntimeDescriptor(input: {
   readonly adapter: SurfaceAdapter;
   readonly adapterIngress: SurfaceAdapterIngress<"discord">;
   readonly relay: SurfaceRelayDescriptor<"discord">;
-  readonly workflowProgress: SurfaceWorkflowProgressPort<"discord">;
+  readonly workflowProgress?: SurfaceWorkflowProgressPort<"discord">;
 }): SurfaceRuntimeDescriptor<"discord"> {
   return {
     platform: "discord",
     adapter: input.adapter,
     adapterIngress: input.adapterIngress,
     relay: input.relay,
-    workflowProgress: input.workflowProgress,
+    ...(input.workflowProgress ? { workflowProgress: input.workflowProgress } : {}),
   };
 }

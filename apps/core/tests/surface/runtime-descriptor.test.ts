@@ -8,7 +8,10 @@ import type {
   SurfaceOutputStream,
 } from "../../src/surface/adapter";
 import { createDiscordSurfaceRuntimeDescriptor } from "../../src/surface/discord/discord-runtime-descriptor";
-import { createGithubSurfaceRuntimeDescriptor } from "../../src/surface/github/github-runtime-descriptor";
+import {
+  createConfiguredGithubSurfaceRuntimeDescriptor,
+  createGithubSurfaceRuntimeDescriptor,
+} from "../../src/surface/github/github-runtime-descriptor";
 import {
   type RegisteredSurfacePlatform,
   type SurfaceAdapterIngress,
@@ -116,16 +119,6 @@ function requestIngress(): SurfaceRequestIngress {
 
 function discordRelay(): SurfaceRelayDescriptor<"discord"> {
   return {
-    refs: {
-      createSessionRef: (sessionId) => ({ platform: "discord", channelId: sessionId }),
-      resolveInitialReplyTarget: () => ({ kind: "none" }),
-      decodeReanchorTarget: (input) =>
-        Result.ok({
-          platform: "discord",
-          channelId: input.expectedSessionId,
-          messageId: input.ref.messageId,
-        }),
-    },
     lifecycle: {
       platform: "discord",
       start: async () => ({
@@ -141,16 +134,6 @@ function discordRelay(): SurfaceRelayDescriptor<"discord"> {
 
 function githubRelay(): SurfaceRelayDescriptor<"github"> {
   return {
-    refs: {
-      createSessionRef: (sessionId) => ({ platform: "github", channelId: sessionId }),
-      resolveInitialReplyTarget: () => ({ kind: "none" }),
-      decodeReanchorTarget: (input) =>
-        Result.ok({
-          platform: "github",
-          channelId: input.expectedSessionId,
-          messageId: input.ref.messageId,
-        }),
-    },
     lifecycle: {
       platform: "github",
       start: async () => ({
@@ -248,6 +231,7 @@ describe("surface runtime descriptor factories", () => {
     expect("requestIngress" in descriptor).toBe(false);
     expect("health" in descriptor).toBe(false);
     expect("surfaceStore" in descriptor).toBe(false);
+    expect("refs" in descriptor.relay!).toBe(false);
   });
 
   it("keeps GitHub request ingress, relay, and workflow progress independently optional", () => {
@@ -269,6 +253,67 @@ describe("surface runtime descriptor factories", () => {
       }
     }
   });
+
+  it.each([
+    [false, false],
+    [false, true],
+    [true, false],
+    [true, true],
+  ] as const)(
+    "composes production GitHub webhook=%s and App credentials=%s independently",
+    (webhookConfigured, appCredentialsAvailable) => {
+      const logs: Array<{ level: "info" | "warn"; message: string; context: unknown }> = [];
+      const adapter = new TestAdapter("github");
+      const ingress = requestIngress();
+      const relay = githubRelay();
+      const workflowProgress = githubWorkflowProgress();
+      const descriptor = createConfiguredGithubSurfaceRuntimeDescriptor({
+        adapter,
+        webhookSecret: webhookConfigured ? "webhook-secret" : undefined,
+        appCredentialsAvailable,
+        requestIngress: ingress,
+        relay,
+        workflowProgress,
+        logger: {
+          info: (message, context) => logs.push({ level: "info", message, context }),
+          warn: (message, context) => logs.push({ level: "warn", message, context }),
+        },
+      });
+
+      const requestIngressAvailable = webhookConfigured && appCredentialsAvailable;
+      expect(descriptor.adapter).toBe(adapter);
+      expect(descriptor.requestIngress).toBe(requestIngressAvailable ? ingress : undefined);
+      expect(descriptor.relay).toBe(appCredentialsAvailable ? relay : undefined);
+      expect(descriptor.workflowProgress).toBe(workflowProgress);
+      if (descriptor.relay) expect("refs" in descriptor.relay).toBe(false);
+      expect(logs).toEqual([
+        ...(requestIngressAvailable
+          ? []
+          : [
+              {
+                level: "warn" as const,
+                message: "GitHub webhook ingress unavailable",
+                context: {
+                  subsystem: "request-ingress",
+                  reason: webhookConfigured ? "app-credentials-missing" : "webhook-secret-missing",
+                },
+              },
+            ]),
+        ...(appCredentialsAvailable
+          ? []
+          : [
+              {
+                level: "info" as const,
+                message: "GitHub output relay unavailable",
+                context: {
+                  subsystem: "output-relay",
+                  reason: "app-credentials-missing",
+                },
+              },
+            ]),
+      ]);
+    },
+  );
 });
 
 describe("surface runtime registry", () => {

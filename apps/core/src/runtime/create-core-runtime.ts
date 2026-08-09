@@ -37,8 +37,9 @@ import {
 } from "@stanley2058/lilac-event-bus";
 
 import { DiscordAdapter } from "../surface/discord/discord-adapter";
+import { createDiscordSurfaceRuntimeDescriptor } from "../surface/discord/discord-runtime-descriptor";
 import { GithubAdapter } from "../surface/github/github-adapter";
-import type { SurfaceAdapter } from "../surface/adapter";
+import { createConfiguredGithubSurfaceRuntimeDescriptor } from "../surface/github/github-runtime-descriptor";
 import { bridgeAdapterToBus } from "../surface/bridge/publish-to-bus";
 import { bridgeBusToAdapter } from "../surface/bridge/subscribe-from-bus";
 import {
@@ -78,7 +79,7 @@ import {
   type ConversationThreadSummarizationRunner,
 } from "../conversation/thread-worker";
 
-import { readGithubAppSecret } from "../github/github-app";
+import { readGithubAppSecretResult } from "../github/github-app";
 import { startGithubWebhookServer } from "../github/webhook/github-webhook-server";
 
 import { SqliteTranscriptStore } from "../transcript/transcript-store";
@@ -117,14 +118,26 @@ import { loadOrCreateCoreDeadLetterKey, type CoreDeadLetterKeyError } from "./co
 import { projectRuntimeError, safeRuntimeErrorText } from "./error-format";
 import { SqliteGracefulRestartStore, type GracefulRestartSnapshot } from "./graceful-restart-store";
 import {
-  connectCurrentSurfaceAdapters,
-  createCurrentWorkflowAdapterMap,
-  disconnectCurrentSurfaceAdapters,
-  restoreCurrentSurfaceRecovery,
-  startCurrentSurfaceOutputs,
-  stopIngressAndDrainCurrentSurfaceRecovery,
-  stopCurrentSurfaceOutputs,
-} from "./current-surface-runtime-lifecycle";
+  connectAndValidateSurfaceAdapters,
+  createSurfaceAdapterMap,
+  disconnectSurfaceAdapters,
+  restoreSurfaceRecovery,
+  startSurfaceAdapterIngress,
+  startSurfaceOutputs,
+  stopIngressAndDrainSurfaceRecovery,
+  stopSurfaceAdapterIngress,
+  stopSurfaceOutputs,
+  stopSurfaceRequestIngress,
+  type ConnectedSurfaceAdapters,
+  type SurfaceAdapterIngressHandles,
+  type SurfaceRelayHandles,
+  type SurfaceRequestIngressHandles,
+} from "./surface-runtime-lifecycle";
+import {
+  SurfaceRuntimeRegistry,
+  type RegisteredSurfacePlatform,
+  type SurfaceRelayHandle,
+} from "../surface/runtime-descriptor";
 import { prewarmFffFinders } from "@stanley2058/lilac-fs";
 import {
   adaptToolResultArtifactStoreInitToHost,
@@ -821,6 +834,19 @@ function subId(prefix: string, name: string): string {
   return `${prefix}:${name}`;
 }
 
+function surfaceRelayHandle<P extends RegisteredSurfacePlatform>(
+  platform: P,
+  relay: Awaited<ReturnType<typeof bridgeBusToAdapter>>,
+): SurfaceRelayHandle<P> {
+  return {
+    platform,
+    beginDrain: (options) => relay.beginDrain(options),
+    snapshotRelays: () => relay.snapshotRelays().map((snapshot) => ({ ...snapshot, platform })),
+    restoreRelays: (snapshots) => relay.restoreRelays(snapshots),
+    stop: () => relay.stop(),
+  };
+}
+
 function runtimeFsDenyPaths(): readonly string[] {
   const home = process.env.HOME;
   return [
@@ -939,7 +965,10 @@ export async function createCoreRuntime(
 
   let started = false;
 
-  let stopAdapterToBus: { stop(): Promise<void> } | null = null;
+  const connectedSurfaceAdapters: ConnectedSurfaceAdapters = new Map();
+  const surfaceAdapterIngressHandles: SurfaceAdapterIngressHandles = new Map();
+  const surfaceRequestIngressHandles: SurfaceRequestIngressHandles = new Map();
+  const surfaceRelayHandles: SurfaceRelayHandles = new Map();
   let stopDiscordSearchIndexer: { stop(): Promise<void> } | null = null;
   let stopRouter: DiscordRequestRouter | null = null;
   let routerSupervision: Promise<void> | null = null;
@@ -950,8 +979,6 @@ export async function createCoreRuntime(
   let workflowTriggerScheduler: WorkflowTriggerScheduler | null = null;
   let workflowLiveParentBridge: WorkflowLiveParentBridge | null = null;
   let workflowSubagentDispatcher: WorkflowSubagentDispatcher | null = null;
-  let stopBusToAdapter: Awaited<ReturnType<typeof bridgeBusToAdapter>> | null = null;
-  let stopGithubBusToAdapter: Awaited<ReturnType<typeof bridgeBusToAdapter>> | null = null;
   let stopAgentRunner: Awaited<ReturnType<typeof startBusAgentRunner>> | null = null;
   let stopHeartbeat: HeartbeatService | null = null;
   let stopConversationThreadWorker: Awaited<
@@ -962,8 +989,6 @@ export async function createCoreRuntime(
   > | null = null;
   let conversationThreadSummarizationRunner: ConversationThreadSummarizationRunner | null = null;
   let conversationThreadSummarizationStopping = false;
-
-  let stopGithubWebhook: { stop(): Promise<void> } | null = null;
 
   let requestMessageCache: RequestMessageCache | null = null;
   const requestControlAuthority = new RequestControlAuthority();
@@ -996,6 +1021,79 @@ export async function createCoreRuntime(
     };
   }
   const mcpRegistry = mcpRegistryCreated.value;
+  function composeSurfaceRuntimeRegistry(appCredentialsAvailable: boolean) {
+    return SurfaceRuntimeRegistry.create([
+      createDiscordSurfaceRuntimeDescriptor({
+        adapter,
+        adapterIngress: {
+          start: async () => {
+            const handle = await bridgeAdapterToBus({
+              adapter,
+              bus,
+              subscriptionId: subId(subscriptionPrefix, "adapter-to-bus"),
+              transcriptStore: transcriptStore ?? undefined,
+            });
+            logger.debug("bridgeAdapterToBus started", {
+              subscriptionId: subId(subscriptionPrefix, "adapter-to-bus"),
+            });
+            return { platform: "discord", stop: () => handle.stop() };
+          },
+        },
+        relay: {
+          lifecycle: {
+            platform: "discord",
+            start: async () => {
+              const relay = await bridgeBusToAdapter({
+                adapter,
+                bus,
+                platform: "discord",
+                subscriptionId: subId(subscriptionPrefix, "bus-to-adapter"),
+                transcriptStore: transcriptStore ?? undefined,
+              });
+              logger.debug("bridgeBusToAdapter started", {
+                subscriptionId: subId(subscriptionPrefix, "bus-to-adapter"),
+              });
+              return surfaceRelayHandle("discord", relay);
+            },
+          },
+        },
+      }),
+      createConfiguredGithubSurfaceRuntimeDescriptor({
+        adapter: githubAdapter,
+        webhookSecret: env.github.webhookSecret,
+        appCredentialsAvailable,
+        logger,
+        requestIngress: {
+          start: async () => {
+            return await startGithubWebhookServer({
+              bus,
+              subscriptionId: subId(subscriptionPrefix, "github-webhook"),
+              reportFatalError,
+            });
+          },
+        },
+        relay: {
+          lifecycle: {
+            platform: "github",
+            start: async () => {
+              const relay = await bridgeBusToAdapter({
+                adapter: githubAdapter,
+                bus,
+                platform: "github",
+                subscriptionId: subId(subscriptionPrefix, "bus-to-github"),
+                transcriptStore: transcriptStore ?? undefined,
+              });
+              logger.debug("GitHub output relay started", {
+                subscriptionId: subId(subscriptionPrefix, "bus-to-github"),
+              });
+              return surfaceRelayHandle("github", relay);
+            },
+          },
+        },
+      }),
+    ]);
+  }
+  let surfaceRuntimeRegistry: SurfaceRuntimeRegistry | null = null;
   let runtimeFullyStarted = false;
   let routerSubscriptionHealthy = true;
   let mcpRegistryInitPromise: Promise<void> | null = null;
@@ -1309,17 +1407,20 @@ export async function createCoreRuntime(
     coreConfigWatcher = null;
   }
 
-  async function restoreGracefulSnapshot(snapshot: GracefulRestartSnapshot) {
+  async function restoreGracefulSnapshot(
+    snapshot: GracefulRestartSnapshot,
+    registry: SurfaceRuntimeRegistry,
+  ) {
     logger.info("Restoring graceful restart snapshot", {
       createdAt: snapshot.createdAt,
       agentEntries: snapshot.agent.length,
       relayEntries: snapshot.relays.length,
     });
 
-    await restoreCurrentSurfaceRecovery({
+    await restoreSurfaceRecovery({
+      registry,
       snapshot,
-      discordRelay: stopBusToAdapter,
-      githubRelay: stopGithubBusToAdapter,
+      relays: surfaceRelayHandles,
       agentRunner: stopAgentRunner,
     });
 
@@ -1355,6 +1456,35 @@ export async function createCoreRuntime(
         mcpRegistryInitPromise = registryInitPromise;
 
         const startupConfig = await getCoreConfig();
+        const githubAppSecret = await readGithubAppSecretResult(env.dataDir);
+        if (githubAppSecret.status === "error") {
+          return {
+            kind: "result",
+            result: Result.err(
+              new CoreRuntimeStartFailed({
+                operation: "startup",
+                cause: githubAppSecret.error,
+                message: githubAppSecret.error.message,
+              }),
+            ),
+          };
+        }
+        const registryCreated = composeSurfaceRuntimeRegistry(githubAppSecret.value !== null);
+        if (registryCreated.status === "error") {
+          return {
+            kind: "result",
+            result: Result.err(
+              new CoreRuntimeStartFailed({
+                operation: "startup",
+                cause: registryCreated.error,
+                message: registryCreated.error.message,
+              }),
+            ),
+          };
+        }
+        const registry = registryCreated.value;
+        surfaceRuntimeRegistry = registry;
+        const workflowAdapters = createSurfaceAdapterMap(registry);
         if (startupConfig.tools.fsBackend === "fff") {
           void prewarmFffFinders({
             basePaths: ["/data", "/data/workspace", "/app", cwd],
@@ -1503,15 +1633,9 @@ export async function createCoreRuntime(
         });
 
         // Subscribe to adapter events before connecting, so we don't miss early messages.
-        stopAdapterToBus = await bridgeAdapterToBus({
-          adapter,
-          bus,
-          subscriptionId: subId(subscriptionPrefix, "adapter-to-bus"),
-          transcriptStore: transcriptStore ?? undefined,
-        });
-
-        logger.debug("bridgeAdapterToBus started", {
-          subscriptionId: subId(subscriptionPrefix, "adapter-to-bus"),
+        await startSurfaceAdapterIngress({
+          registry,
+          handles: surfaceAdapterIngressHandles,
         });
 
         requestMessageCache = await createRequestMessageCache({
@@ -1539,19 +1663,15 @@ export async function createCoreRuntime(
         });
         await workflowWaitResolver.start();
 
-        await connectCurrentSurfaceAdapters({
-          discordAdapter: adapter,
-          githubAdapter,
+        await connectAndValidateSurfaceAdapters({
+          registry,
+          connected: connectedSurfaceAdapters,
         });
 
         logger.debug("Surface adapter connected", {
           platform: "discord",
         });
 
-        const workflowAdapters = createCurrentWorkflowAdapterMap<SurfaceAdapter>({
-          discordAdapter: adapter,
-          githubAdapter,
-        });
         workflowProgressProjector = new WorkflowProgressProjector({
           bus,
           store: durableWorkflowStore,
@@ -1716,51 +1836,10 @@ export async function createCoreRuntime(
         await toolServer.init();
         await toolServer.start(toolServerPort);
 
-        await startCurrentSurfaceOutputs({
-          startDiscordRelay: async () => {
-            stopBusToAdapter = await bridgeBusToAdapter({
-              adapter,
-              bus,
-              platform: "discord",
-              subscriptionId: subId(subscriptionPrefix, "bus-to-adapter"),
-              transcriptStore: transcriptStore ?? undefined,
-            });
-
-            logger.debug("bridgeBusToAdapter started", {
-              subscriptionId: subId(subscriptionPrefix, "bus-to-adapter"),
-            });
-          },
-          resolveGithubOperations: async () => {
-            const ghSecret = await readGithubAppSecret(env.dataDir);
-            if (!ghSecret) {
-              logger.info("GitHub App secret missing; skipping GitHub surface");
-              return {};
-            }
-            return {
-              startRequestIngress: async () => {
-                stopGithubWebhook = await startGithubWebhookServer({
-                  bus,
-                  subscriptionId: subId(subscriptionPrefix, "github-webhook"),
-                  reportFatalError,
-                });
-              },
-              startRelay: async () => {
-                stopGithubBusToAdapter = await bridgeBusToAdapter({
-                  adapter: githubAdapter,
-                  bus,
-                  platform: "github",
-                  subscriptionId: subId(subscriptionPrefix, "bus-to-github"),
-                  transcriptStore: transcriptStore ?? undefined,
-                });
-
-                logger.debug("GitHub surface started", {
-                  webhookPath: env.github.webhookPath,
-                  webhookPort: env.github.webhookPort,
-                  subscriptionId: subId(subscriptionPrefix, "bus-to-github"),
-                });
-              },
-            };
-          },
+        await startSurfaceOutputs({
+          registry,
+          requestIngress: surfaceRequestIngressHandles,
+          relays: surfaceRelayHandles,
         });
 
         const restartLoadResult = gracefulRestartStore?.loadAndConsumeCompletedSnapshot();
@@ -1881,7 +1960,7 @@ export async function createCoreRuntime(
 
         if (restartSnapshot) {
           const restored = await Result.tryPromise({
-            try: () => restoreGracefulSnapshot(restartSnapshot),
+            try: () => restoreGracefulSnapshot(restartSnapshot, registry),
             catch: projectRuntimeError("Graceful restart snapshot restore failed"),
           });
           if (restored.status === "error") {
@@ -2008,16 +2087,19 @@ export async function createCoreRuntime(
     const cleanup = createCoreRuntimeCleanupSupervisor(priorPanic);
     const safe = cleanup.run;
 
-    if (runtimeFullyStarted && stopAgentRunner && gracefulRestartStore) {
+    if (runtimeFullyStarted && stopAgentRunner && gracefulRestartStore && surfaceRuntimeRegistry) {
       const agentRunner = stopAgentRunner;
+      const registry = surfaceRuntimeRegistry;
 
-      const recoverables = await stopIngressAndDrainCurrentSurfaceRecovery({
+      const recoverables = await stopIngressAndDrainSurfaceRecovery({
+        registry,
         stopAdapterIngress: async () => {
-          await safe(
-            "graceful.ingress.bridgeAdapterToBus.stop",
-            () => stopAdapterToBus?.stop() ?? Promise.resolve(),
-          );
-          stopAdapterToBus = null;
+          await stopSurfaceAdapterIngress({
+            registry,
+            handles: surfaceAdapterIngressHandles,
+            runCleanup: safe,
+            graceful: true,
+          });
         },
         stopRouterIngress: async () => {
           await safe("graceful.ingress.router.stop", () => stopRouter?.stop() ?? Promise.resolve());
@@ -2050,12 +2132,13 @@ export async function createCoreRuntime(
           );
           workflowEngine = null;
         },
-        stopGithubRequestIngress: async () => {
-          await safe(
-            "graceful.ingress.githubWebhook.stop",
-            () => stopGithubWebhook?.stop() ?? Promise.resolve(),
-          );
-          stopGithubWebhook = null;
+        stopRequestIngress: async () => {
+          await stopSurfaceRequestIngress({
+            registry,
+            handles: surfaceRequestIngressHandles,
+            runCleanup: safe,
+            graceful: true,
+          });
         },
         stopRemainingRequestProducers: async () => {
           const gracefulHeartbeat = stopHeartbeat;
@@ -2081,8 +2164,7 @@ export async function createCoreRuntime(
         deadlineMs: GRACEFUL_DRAIN_DEADLINE_MS,
         runCleanup: safe,
         agentRunner,
-        discordRelay: stopBusToAdapter,
-        githubRelay: stopGithubBusToAdapter,
+        relays: surfaceRelayHandles,
       });
       const agentRecoverables = recoverables.agent;
       const relayRecoverables = recoverables.relays;
@@ -2168,12 +2250,15 @@ export async function createCoreRuntime(
       () => stopDiscordSearchIndexer?.stop() ?? Promise.resolve(),
     );
     stopDiscordSearchIndexer = null;
-    await stopCurrentSurfaceOutputs({
-      runCleanup: safe,
-      discordRelay: stopBusToAdapter,
-      githubRelay: stopGithubBusToAdapter,
-      githubRequestIngress: stopGithubWebhook,
-    });
+    const registry = surfaceRuntimeRegistry;
+    if (registry) {
+      await stopSurfaceOutputs({
+        registry,
+        runCleanup: safe,
+        relays: surfaceRelayHandles,
+        requestIngress: surfaceRequestIngressHandles,
+      });
+    }
 
     await safe("toolServer.stop", () => toolServer?.stop() ?? Promise.resolve());
     await safe(
@@ -2194,13 +2279,21 @@ export async function createCoreRuntime(
       () => stopWorkflowActionResolver?.stop() ?? Promise.resolve(),
     );
     stopWorkflowActionResolver = null;
-    await safe("bridgeAdapterToBus.stop", () => stopAdapterToBus?.stop() ?? Promise.resolve());
+    if (registry) {
+      await stopSurfaceAdapterIngress({
+        registry,
+        handles: surfaceAdapterIngressHandles,
+        runCleanup: safe,
+        graceful: false,
+      });
 
-    await disconnectCurrentSurfaceAdapters({
-      runCleanup: safe,
-      discordAdapter: adapter,
-      githubAdapter,
-    });
+      await disconnectSurfaceAdapters({
+        registry,
+        runCleanup: safe,
+        connected: connectedSurfaceAdapters,
+      });
+      surfaceRuntimeRegistry = null;
+    }
     await safe("durableWorkflowStore.close", async () => durableWorkflowStore.close());
     await safe("discoveryService.close", async () => {
       discoveryService?.close();

@@ -25,7 +25,7 @@ Source: `plan/surface-runtime-descriptor-extraction.md`
 
 ## Stage 4: Runtime Lifecycle Migration
 
-- [ ] Drive surface lifecycle and recovery through the descriptor registry.
+- [x] Drive surface lifecycle and recovery through the descriptor registry.
 
 ## Stage 5: Relay Policy Extraction
 
