@@ -14,7 +14,7 @@ import { catalogToolStableId } from "../../src/mcp/catalog-identity";
 import type { ConversationThreadToolService } from "../../src/conversation/thread-service";
 import type { DiscoveryService } from "../../src/discovery/discovery-service";
 import type { SurfaceAdapter } from "../../src/surface/adapter";
-import { createDescriptorBoundSurfaceAdapter } from "../../src/surface/produced-ref-guard";
+import { SurfaceRuntimeRegistry } from "../../src/surface/runtime-descriptor";
 import {
   configSnapshot,
   FakeClientFactory,
@@ -38,7 +38,12 @@ function createCoreToolPluginManager(
   };
 }
 
-const TEST_GITHUB_ADAPTER = createDescriptorBoundSurfaceAdapter("github", {} as SurfaceAdapter);
+const TEST_SURFACE_REGISTRY = SurfaceRuntimeRegistry.create([
+  { platform: "discord", adapter: {} as SurfaceAdapter },
+  { platform: "github", adapter: {} as SurfaceAdapter },
+]);
+if (TEST_SURFACE_REGISTRY.status === "error") throw TEST_SURFACE_REGISTRY.error;
+const TEST_SURFACE_ADAPTER_RESOLVER = TEST_SURFACE_REGISTRY.value.adapterResolver();
 
 function isAsyncIterable(value: unknown): value is AsyncIterable<unknown> {
   return (
@@ -230,8 +235,7 @@ describe("core tool plugin manager", () => {
     const manager = createCoreToolPluginManager({
       runtime: {
         bus: {} as LilacBus,
-        adapter: {} as SurfaceAdapter,
-        githubAdapter: TEST_GITHUB_ADAPTER,
+        surfaceAdapterResolver: TEST_SURFACE_ADAPTER_RESOLVER,
         discovery: {} as DiscoveryService,
         conversationThreads: {} as ConversationThreadToolService,
         config: cfg,
@@ -344,8 +348,7 @@ describe("core tool plugin manager", () => {
     const manager = createCoreToolPluginManager({
       runtime: {
         bus: {} as LilacBus,
-        adapter: {} as SurfaceAdapter,
-        githubAdapter: TEST_GITHUB_ADAPTER,
+        surfaceAdapterResolver: TEST_SURFACE_ADAPTER_RESOLVER,
         discovery: {} as DiscoveryService,
         conversationThreads: {} as ConversationThreadToolService,
         config: cfg,
@@ -382,8 +385,7 @@ describe("core tool plugin manager", () => {
     const manager = createCoreToolPluginManager({
       runtime: {
         bus: {} as LilacBus,
-        adapter: {} as SurfaceAdapter,
-        githubAdapter: TEST_GITHUB_ADAPTER,
+        surfaceAdapterResolver: TEST_SURFACE_ADAPTER_RESOLVER,
         discovery: {} as DiscoveryService,
         config: cfg,
       },
@@ -503,8 +505,7 @@ describe("core tool plugin manager", () => {
     const manager = createCoreToolPluginManager({
       runtime: {
         bus: {} as LilacBus,
-        adapter: {} as SurfaceAdapter,
-        githubAdapter: TEST_GITHUB_ADAPTER,
+        surfaceAdapterResolver: TEST_SURFACE_ADAPTER_RESOLVER,
         discovery: {} as DiscoveryService,
         config: cfg,
       },
@@ -559,8 +560,7 @@ describe("core tool plugin manager", () => {
     const manager = createCoreToolPluginManager({
       runtime: {
         bus: {} as LilacBus,
-        adapter: {} as SurfaceAdapter,
-        githubAdapter: TEST_GITHUB_ADAPTER,
+        surfaceAdapterResolver: TEST_SURFACE_ADAPTER_RESOLVER,
         discovery: {} as DiscoveryService,
         config: cfg,
       },
@@ -622,8 +622,7 @@ describe("core tool plugin manager", () => {
     const manager = createCoreToolPluginManager({
       runtime: {
         bus: {} as LilacBus,
-        adapter: {} as SurfaceAdapter,
-        githubAdapter: TEST_GITHUB_ADAPTER,
+        surfaceAdapterResolver: TEST_SURFACE_ADAPTER_RESOLVER,
         discovery: {} as DiscoveryService,
         config: cfg,
       },
@@ -676,7 +675,7 @@ describe("core tool plugin manager", () => {
     expect((editRes as { error?: { code?: string } }).error?.code).toBe("HASH_MISMATCH");
   });
 
-  it("preserves built-in Level 2 callable ids", async () => {
+  it("preserves built-in Level 2, discovery, and conversation-thread callables", async () => {
     tmpRoot = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-core-plugin-manager-"));
     const dataDir = path.join(tmpRoot, "data");
     const cfg = testConfig({});
@@ -684,8 +683,7 @@ describe("core tool plugin manager", () => {
     const manager = createCoreToolPluginManager({
       runtime: {
         bus: {} as LilacBus,
-        adapter: {} as SurfaceAdapter,
-        githubAdapter: TEST_GITHUB_ADAPTER,
+        surfaceAdapterResolver: TEST_SURFACE_ADAPTER_RESOLVER,
         discovery: {} as DiscoveryService,
         conversationThreads: {} as ConversationThreadToolService,
         config: cfg,
@@ -713,6 +711,13 @@ describe("core tool plugin manager", () => {
         .filter((id) => OPTIONAL_DYNAMIC_LEVEL2_CALLABLE_IDS.has(id))
         .every((id) => OPTIONAL_DYNAMIC_LEVEL2_CALLABLE_IDS.has(id)),
     ).toBe(true);
+    expect(callableIds.filter((id) => id.startsWith("discovery."))).toEqual(["discovery.search"]);
+    expect(callableIds.filter((id) => id.startsWith("conversation.thread."))).toEqual([
+      "conversation.thread.metadata",
+      "conversation.thread.read",
+      "conversation.thread.runSummarization",
+      "conversation.thread.search",
+    ]);
 
     const contributionByTool = manager.getLevel2ContributionInfo();
     const webTool = manager.getLevel2Tools().find((tool) => tool.id === "web");
@@ -784,8 +789,7 @@ export default {
     const manager = createCoreToolPluginManager({
       runtime: {
         bus: {} as LilacBus,
-        adapter: {} as SurfaceAdapter,
-        githubAdapter: TEST_GITHUB_ADAPTER,
+        surfaceAdapterResolver: TEST_SURFACE_ADAPTER_RESOLVER,
         discovery: {} as DiscoveryService,
         config: cfg,
       },

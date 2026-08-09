@@ -5,6 +5,7 @@ import type {
   SurfaceMergeBlockPlanOptions,
   SurfaceOperationResult,
   SurfaceReplyChainPlanOptions,
+  SurfaceSendPreparationInput,
   TypingIndicatorSubscription,
 } from "../../src/surface/adapter";
 import type {
@@ -15,6 +16,13 @@ import type {
 } from "../../src/surface/types";
 
 export class SurfaceAdapterTestBase {
+  async prepareSendMsg(
+    _sessionRef: SessionRef,
+    _input: SurfaceSendPreparationInput,
+  ): Promise<SurfaceOperationResult<void>> {
+    return Result.ok(undefined);
+  }
+
   async listSessionParticipants(
     _sessionRef: SessionRef,
     _opts?: { limit?: number },

@@ -128,6 +128,12 @@ export type SurfaceOperationError =
 
 export type SurfaceOperationResult<T> = ResultType<T, SurfaceOperationError>;
 
+export type SurfaceSendPreparationInput = {
+  readonly text?: string;
+  readonly attachmentCount: number;
+  readonly actionCount: number;
+};
+
 export type SurfaceToolStatusUpdate = {
   toolCallId: string;
   display: string;
@@ -230,6 +236,11 @@ export interface SurfaceAdapter {
   ): Promise<SurfaceOperationResult<SurfaceOutputStream>>;
   startTyping(sessionRef: SessionRef): Promise<SurfaceOperationResult<TypingIndicatorSubscription>>;
 
+  prepareSendMsg(
+    sessionRef: SessionRef,
+    input: SurfaceSendPreparationInput,
+    opts?: SendOpts,
+  ): Promise<SurfaceOperationResult<void>>;
   sendMsg(
     sessionRef: SessionRef,
     content: ContentOpts,

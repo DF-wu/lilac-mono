@@ -340,6 +340,21 @@ class DescriptorBoundSurfaceAdapter implements SurfaceAdapter {
     });
   }
 
+  async prepareSendMsg(
+    sessionRef: SessionRef,
+    input: Parameters<SurfaceAdapter["prepareSendMsg"]>[1],
+    opts?: Parameters<SurfaceAdapter["prepareSendMsg"]>[2],
+  ) {
+    const prepared = await this.adapter.prepareSendMsg(sessionRef, input, opts);
+    requireOperationResult(
+      this.descriptorPlatform,
+      prepared,
+      "prepareSendMsg",
+      sessionRef.channelId,
+    );
+    return prepared;
+  }
+
   async sendMsg(
     sessionRef: SessionRef,
     content: Parameters<SurfaceAdapter["sendMsg"]>[1],

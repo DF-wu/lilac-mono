@@ -14,6 +14,7 @@ import {
   SurfaceOperationUnsupported,
   type SurfaceOutputStream,
   type SurfaceReplyChainPlanOptions,
+  type SurfaceSendPreparationInput,
   SurfacePermissionDenied,
   SurfacePlatformMismatch,
   SurfaceRateLimited,
@@ -176,6 +177,11 @@ interface SurfaceAdapterSignatureFixture {
     opts?: StartOutputOpts,
   ): Promise<SurfaceOperationResult<SurfaceOutputStream>>;
   startTyping(sessionRef: SessionRef): Promise<SurfaceOperationResult<TypingIndicatorSubscription>>;
+  prepareSendMsg(
+    sessionRef: SessionRef,
+    input: SurfaceSendPreparationInput,
+    opts?: SendOpts,
+  ): Promise<SurfaceOperationResult<void>>;
   sendMsg(
     sessionRef: SessionRef,
     content: ContentOpts,

@@ -65,6 +65,7 @@ import {
   type AdapterSubscription,
   type SurfaceMergeBlockPlanOptions,
   type SurfaceReplyChainPlanOptions,
+  type SurfaceSendPreparationInput,
   type StartOutputOpts,
   type SurfaceAdapter,
 } from "../adapter";
@@ -322,6 +323,37 @@ function discordNestedMsgRefResult(input: {
       message: `Discord ${input.refRole} belongs to session '${ref.value.channelId}'`,
     }),
   );
+}
+
+function prepareDiscordSendResult(
+  sessionRef: SessionRef,
+  input: SurfaceSendPreparationInput,
+  opts?: SendOpts,
+): SurfaceOperationResult<DiscordSessionRef> {
+  const refResult = discordSessionRefResult("send-message", sessionRef);
+  if (refResult.status === "error") return refResult;
+  const discordRef = refResult.value;
+  if (opts?.replyTo) {
+    const reply = discordNestedMsgRefResult({
+      operation: "send-message",
+      sessionRef: discordRef,
+      msgRef: opts.replyTo,
+      refRole: "replyTo",
+    });
+    if (reply.status === "error") return reply;
+  }
+  const hasText = Boolean(input.text?.trim());
+  if (!hasText && input.attachmentCount === 0 && input.actionCount === 0) {
+    return Result.err(
+      new SurfaceInvalidInput({
+        platform: "discord",
+        operation: "send-message",
+        field: "content",
+        message: "Discord message content must include text, an attachment, or an action",
+      }),
+    );
+  }
+  return Result.ok(discordRef);
 }
 
 async function captureDiscordOperation<T>(
@@ -1197,36 +1229,31 @@ export class DiscordAdapter implements SurfaceAdapter {
     });
   }
 
+  async prepareSendMsg(
+    sessionRef: SessionRef,
+    input: SurfaceSendPreparationInput,
+    opts?: SendOpts,
+  ): Promise<SurfaceOperationResult<void>> {
+    const prepared = prepareDiscordSendResult(sessionRef, input, opts);
+    return prepared.status === "error" ? prepared : Result.ok(undefined);
+  }
+
   async sendMsg(
     sessionRef: SessionRef,
     content: ContentOpts,
     opts?: SendOpts,
   ): Promise<SurfaceOperationResult<MsgRef>> {
-    const refResult = discordSessionRefResult("send-message", sessionRef);
-    if (refResult.status === "error") return refResult;
-    const discordRef = refResult.value;
-    if (opts?.replyTo) {
-      const reply = discordNestedMsgRefResult({
-        operation: "send-message",
-        sessionRef: discordRef,
-        msgRef: opts.replyTo,
-        refRole: "replyTo",
-      });
-      if (reply.status === "error") return reply;
-    }
-    const hasText = Boolean(content.text?.trim());
-    const hasAttachments = (content.attachments?.length ?? 0) > 0;
-    const hasActions = (content.actions?.length ?? 0) > 0;
-    if (!hasText && !hasAttachments && !hasActions) {
-      return Result.err(
-        new SurfaceInvalidInput({
-          platform: "discord",
-          operation: "send-message",
-          field: "content",
-          message: "Discord message content must include text, an attachment, or an action",
-        }),
-      );
-    }
+    const prepared = prepareDiscordSendResult(
+      sessionRef,
+      {
+        text: content.text,
+        attachmentCount: content.attachments?.length ?? 0,
+        actionCount: content.actions?.length ?? 0,
+      },
+      opts,
+    );
+    if (prepared.status === "error") return prepared;
+    const discordRef = prepared.value;
     await this.reloadCoreConfigIfNeeded();
 
     const cfg = this.cfg;

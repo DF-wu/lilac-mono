@@ -21,6 +21,7 @@ import type {
   StartOutputOpts,
   SurfaceAdapter,
   SurfaceOutputStream,
+  SurfaceSendPreparationInput,
 } from "../../src/surface/adapter";
 import type { AgentRunnerRecoveryEntry } from "../../src/surface/bridge/bus-agent-runner";
 import type { BusToAdapterRelaySnapshot } from "../../src/surface/bridge/subscribe-from-bus";
@@ -96,6 +97,14 @@ class TestAdapter implements SurfaceAdapter {
   }
   async startTyping() {
     return Result.ok({ stop: async () => Result.ok(undefined) });
+  }
+
+  async prepareSendMsg(
+    _sessionRef: SessionRef,
+    _input: SurfaceSendPreparationInput,
+    _opts?: SendOpts,
+  ) {
+    return Result.ok(undefined);
   }
 
   async sendMsg(sessionRef: SessionRef, _content: ContentOpts, _opts?: SendOpts) {

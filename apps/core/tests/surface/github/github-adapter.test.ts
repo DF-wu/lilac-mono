@@ -105,6 +105,36 @@ describe("GitHub adapter contract failures", () => {
 });
 
 describe("GitHub adapter CRUD compatibility", () => {
+  it("prepares sends without invoking the GitHub API", async () => {
+    let providerCalls = 0;
+    const adapter = new GithubAdapter({
+      api: createGithubApi({
+        createIssueComment: async () => {
+          providerCalls += 1;
+          return { id: 1 };
+        },
+      }),
+    });
+    const sessionRef = { platform: "github" as const, channelId: "octo/repo#12" };
+
+    expect(
+      await adapter.prepareSendMsg(sessionRef, {
+        text: "prepared",
+        attachmentCount: 0,
+        actionCount: 0,
+      }),
+    ).toEqual(Result.ok(undefined));
+    const unsupported = await adapter.prepareSendMsg(sessionRef, {
+      text: "attachment",
+      attachmentCount: 1,
+      actionCount: 0,
+    });
+    expect(unsupported.status).toBe("error");
+    if (unsupported.status === "ok") throw new Error("expected unsupported attachment");
+    expect(unsupported.error).toBeInstanceOf(SurfaceOperationUnsupported);
+    expect(providerCalls).toBe(0);
+  });
+
   it("preserves generic edit text verbatim and rejects attachment edits", async () => {
     const edits: Array<Parameters<GithubAdapterApi["editIssueComment"]>[0]> = [];
     const adapter = new GithubAdapter({

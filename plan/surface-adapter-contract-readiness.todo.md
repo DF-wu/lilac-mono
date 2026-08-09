@@ -32,13 +32,13 @@ Source: `plan/surface-adapter-contract-readiness.md`
 
 ## Stage 4: Registry-Selected Surface Tools
 
-- [ ] Inject a registry-derived adapter resolver into the surface tool.
-- [ ] Route generic session, message, and reaction operations through adapters.
-- [ ] Remove GitHub REST operation imports and branches from the generic tool.
-- [ ] Preserve Discord authorization, aliases, and sidecars as protocol-owned adapters.
-- [ ] Preserve shared discovery queries while keeping Discord indexing/storage outside the descriptor.
-- [ ] Narrow help and executable adapter resolution without narrowing compatible persistence readers.
-- [ ] Run focused tool/MCP tests, Core typecheck, lint/fmt, and independent review.
+- [x] Inject a registry-derived adapter resolver into the surface tool.
+- [x] Route generic session, message, and reaction operations through adapters.
+- [x] Remove GitHub REST operation imports and branches from the generic tool.
+- [x] Preserve Discord authorization, aliases, and sidecars as protocol-owned adapters.
+- [x] Preserve shared discovery queries while keeping Discord indexing/storage outside the descriptor.
+- [x] Narrow help and executable adapter resolution without narrowing compatible persistence readers.
+- [x] Run focused tool/MCP tests, Core typecheck, architecture checks, and lint/fmt. Parent review remains independent.
 
 ## Stage 5: Authenticated Origin And Principal Consistency
 

@@ -1,4 +1,4 @@
-import type { SurfaceMsgRef } from "@stanley2058/lilac-event-bus";
+import type { AdapterPlatform, SurfaceMsgRef } from "@stanley2058/lilac-event-bus";
 import { Result, TaggedError, type Result as ResultType } from "better-result";
 
 import type { SurfaceAdapter } from "./adapter";
@@ -177,6 +177,18 @@ export type RegisteredSurfaceRuntimeDescriptor = {
   [P in RegisteredSurfacePlatform]: SurfaceRuntimeDescriptor<P>;
 }[RegisteredSurfacePlatform];
 
+export type ResolvedSurfaceAdapter = {
+  [P in RegisteredSurfacePlatform]: {
+    readonly platform: P;
+    readonly adapter: SurfaceAdapter;
+  };
+}[RegisteredSurfacePlatform];
+
+export type SurfaceAdapterResolver = {
+  registeredPlatforms(): readonly RegisteredSurfacePlatform[];
+  resolve(platform: AdapterPlatform): ResolvedSurfaceAdapter | null;
+};
+
 export class SurfaceRuntimeRegistrationDuplicate extends TaggedError(
   "SurfaceRuntimeRegistrationDuplicate",
 )<{
@@ -248,6 +260,21 @@ export class SurfaceRuntimeRegistry {
 
   entries(): readonly RegisteredSurfaceRuntimeDescriptor[] {
     return this.#descriptors;
+  }
+
+  adapterResolver(): SurfaceAdapterResolver {
+    const adapters = new Map(
+      this.#descriptors.map((descriptor) => [descriptor.platform, descriptor.adapter] as const),
+    );
+    const registeredPlatforms = this.#descriptors.map((descriptor) => descriptor.platform);
+    return {
+      registeredPlatforms: () => registeredPlatforms,
+      resolve: (platform) => {
+        if (platform !== "discord" && platform !== "github") return null;
+        const adapter = adapters.get(platform);
+        return adapter ? { platform, adapter } : null;
+      },
+    };
   }
 
   async validateAdapterPlatforms(): Promise<void> {

@@ -75,6 +75,7 @@ const DEFAULT_ADAPTER = {
   startOutput: async (_sessionRef: SessionRef, _opts?: StartOutputOpts) =>
     Result.ok(outputStream()),
   startTyping: async () => Result.ok({ stop: async () => Result.ok(undefined) }),
+  prepareSendMsg: async () => Result.ok(undefined),
   sendMsg: async (sessionRef: SessionRef, _content: ContentOpts, _opts?: SendOpts) =>
     Result.ok({
       platform: sessionRef.platform,

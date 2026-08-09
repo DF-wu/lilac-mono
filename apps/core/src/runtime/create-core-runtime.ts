@@ -1997,8 +1997,7 @@ export async function createCoreRuntime(
         pluginManager = createCoreToolPluginManager({
           runtime: {
             bus,
-            adapter: surfaceAdapter,
-            githubAdapter: githubSurfaceAdapter,
+            surfaceAdapterResolver: registry.adapterResolver(),
             getConfig: () => getCoreConfig(),
             discovery: discoveryService ?? undefined,
             conversationThreads: conversationThreadToolService,

@@ -199,6 +199,18 @@ describe("unified deferred tool catalog", () => {
     });
   });
 
+  it.each(["discord", "github", "slack", "telegram", "unknown", "web", "whatsapp"] as const)(
+    "keeps the broad portable MCP request-client reader for %s",
+    (requestClient) => {
+      const created = createPortableToolSearchResult({
+        catalog: [],
+        requestContext: { requestClient, sessionId: "session-1" },
+      });
+
+      expect(created.status).toBe("ok");
+    },
+  );
+
   it("ranks name matches above metadata-only matches and supports fuzzy keywords", async () => {
     const catalog = buildUnifiedToolCatalog({
       candidates: [

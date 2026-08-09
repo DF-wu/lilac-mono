@@ -6,6 +6,7 @@ import type {
   SurfaceAdapter,
   SurfaceOperationResult,
   SurfaceOutputStream,
+  SurfaceSendPreparationInput,
 } from "../../src/surface/adapter";
 import {
   SurfaceMessageNotFound,
@@ -83,6 +84,14 @@ class TestAdapter implements SurfaceAdapter {
 
   async startTyping() {
     return Result.ok({ stop: async () => Result.ok(undefined) });
+  }
+
+  async prepareSendMsg(
+    _sessionRef: SessionRef,
+    _input: SurfaceSendPreparationInput,
+    _opts?: SendOpts,
+  ) {
+    return Result.ok(undefined);
   }
 
   async sendMsg(
@@ -531,6 +540,32 @@ describe("surface relay policies", () => {
 });
 
 describe("surface runtime registry", () => {
+  it("resolves only registered adapters through descriptor-bound facades", async () => {
+    const discordAdapter = new TestAdapter("discord");
+    const githubAdapter = new TestAdapter("github");
+    const created = SurfaceRuntimeRegistry.create([
+      { platform: "discord", adapter: discordAdapter },
+      { platform: "github", adapter: githubAdapter },
+    ]);
+    if (created.status === "error") throw created.error;
+
+    const resolver = created.value.adapterResolver();
+    expect(resolver.registeredPlatforms()).toEqual(["discord", "github"]);
+    expect(resolver.resolve("discord")).toMatchObject({ platform: "discord" });
+    expect(resolver.resolve("github")).toMatchObject({ platform: "github" });
+    expect(resolver.resolve("slack")).toBeNull();
+    expect(resolver.resolve("unknown")).toBeNull();
+    expect(resolver.resolve("discord")?.adapter).not.toBe(discordAdapter);
+    expect(resolver.resolve("github")?.adapter).not.toBe(githubAdapter);
+  });
+
+  it("does not resolve an implemented wire platform unless its descriptor is registered", () => {
+    const created = SurfaceRuntimeRegistry.create([discordDescriptor()]);
+    if (created.status === "error") throw created.error;
+
+    expect(created.value.adapterResolver().resolve("github")).toBeNull();
+  });
+
   it("exposes only a descriptor-bound adapter facade from direct registrations", async () => {
     const adapter = new TestAdapter("discord");
     spyOn(adapter, "listSessions").mockResolvedValue(

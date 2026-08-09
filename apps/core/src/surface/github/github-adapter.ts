@@ -37,6 +37,7 @@ import {
   type SurfaceOperationError,
   type SurfaceOperationResult,
   type SurfaceOutputStream,
+  type SurfaceSendPreparationInput,
   type TypingIndicatorSubscription,
 } from "../adapter";
 import type {
@@ -174,6 +175,43 @@ function parseGithubThreadResult(
       ),
     );
   }
+}
+
+type PreparedGithubSend = {
+  readonly ref: GithubSessionRef;
+  readonly text: string;
+  readonly thread: ReturnType<typeof parseGithubSessionId>;
+};
+
+function prepareGithubSendResult(
+  sessionRef: SessionRef,
+  input: SurfaceSendPreparationInput,
+  opts?: SendOpts,
+): SurfaceOperationResult<PreparedGithubSend> {
+  const ref = githubSessionRefResult("send-message", sessionRef);
+  if (ref.status === "error") return ref;
+  if (opts?.replyTo) {
+    const reply = githubNestedMsgRefResult({
+      operation: "send-message",
+      sessionRef: ref.value,
+      msgRef: opts.replyTo,
+      refRole: "replyTo",
+    });
+    if (reply.status === "error") return reply;
+    return Result.err(
+      unsupported("send-message", "GitHub message replies are not supported by sendMsg"),
+    );
+  }
+  if (input.attachmentCount > 0) {
+    return Result.err(unsupported("send-message", "GitHub message attachments are not supported"));
+  }
+  const text = input.text ?? "";
+  if (!text.trim()) {
+    return Result.err(invalidInput("send-message", "content.text", "Message text is required"));
+  }
+  const thread = parseGithubThreadResult("send-message", ref.value);
+  if (thread.status === "error") return thread;
+  return Result.ok({ ref: ref.value, text, thread: thread.value });
 }
 
 function githubCommentIdResult(
@@ -435,59 +473,53 @@ export class GithubAdapter implements SurfaceAdapter {
     return Result.err(unsupported("start-typing", "GitHub typing indicators are not supported"));
   }
 
+  async prepareSendMsg(
+    sessionRef: SessionRef,
+    input: SurfaceSendPreparationInput,
+    opts?: SendOpts,
+  ): Promise<SurfaceOperationResult<void>> {
+    const prepared = prepareGithubSendResult(sessionRef, input, opts);
+    return prepared.status === "error" ? prepared : Result.ok(undefined);
+  }
+
   async sendMsg(
     sessionRef: SessionRef,
     content: ContentOpts,
     opts?: SendOpts,
   ): Promise<SurfaceOperationResult<MsgRef>> {
-    const ref = githubSessionRefResult("send-message", sessionRef);
-    if (ref.status === "error") return ref;
-    if (opts?.replyTo) {
-      const reply = githubNestedMsgRefResult({
-        operation: "send-message",
-        sessionRef: ref.value,
-        msgRef: opts.replyTo,
-        refRole: "replyTo",
-      });
-      if (reply.status === "error") return reply;
-      return Result.err(
-        unsupported("send-message", "GitHub message replies are not supported by sendMsg"),
-      );
-    }
-    if ((content.attachments?.length ?? 0) > 0) {
-      return Result.err(
-        unsupported("send-message", "GitHub message attachments are not supported"),
-      );
-    }
-    const text = content.text ?? "";
-    if (!text.trim()) {
-      return Result.err(invalidInput("send-message", "content.text", "Message text is required"));
-    }
-    const thread = parseGithubThreadResult("send-message", ref.value);
-    if (thread.status === "error") return thread;
+    const prepared = prepareGithubSendResult(
+      sessionRef,
+      {
+        text: content.text,
+        attachmentCount: content.attachments?.length ?? 0,
+        actionCount: content.actions?.length ?? 0,
+      },
+      opts,
+    );
+    if (prepared.status === "error") return prepared;
     const created = await captureGithubOperation("send-message", () =>
       this.api.createIssueComment({
-        owner: thread.value.owner,
-        repo: thread.value.repo,
-        issueNumber: thread.value.number,
-        body: markGithubAgentComment(text),
+        owner: prepared.value.thread.owner,
+        repo: prepared.value.thread.repo,
+        issueNumber: prepared.value.thread.number,
+        body: markGithubAgentComment(prepared.value.text),
       }),
     );
     if (created.status === "error") return created;
     const createdRef: GithubMsgRef = {
       platform: "github",
-      channelId: ref.value.channelId,
+      channelId: prepared.value.ref.channelId,
       messageId: String(created.value.id),
     };
     if (content.actions && content.actions.length > 0) {
       const edited = await captureGithubOperation("send-message", () =>
         this.api.editIssueComment({
-          owner: thread.value.owner,
-          repo: thread.value.repo,
+          owner: prepared.value.thread.owner,
+          repo: prepared.value.thread.repo,
           commentId: created.value.id,
           body: markGithubAgentComment(
             renderGithubActionContent({
-              text,
+              text: prepared.value.text,
               messageId: createdRef.messageId,
               actions: content.actions ?? [],
             }),

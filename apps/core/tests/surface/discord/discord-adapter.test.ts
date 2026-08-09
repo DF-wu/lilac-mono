@@ -10,7 +10,7 @@ import {
   type ThreadMember,
 } from "discord.js";
 import { parseCoreConfigV1ToUniversal, type CoreConfig } from "@stanley2058/lilac-utils";
-import { Panic } from "better-result";
+import { Panic, Result } from "better-result";
 
 import {
   DiscordAdapter,
@@ -170,6 +170,27 @@ describe("DiscordAdapter nested refs", () => {
 });
 
 describe("DiscordAdapter.sendMsg content validation", () => {
+  it("prepares sends without invoking the Discord provider", async () => {
+    let providerCalls = 0;
+    const adapter = createTestDiscordAdapter();
+    (adapter as unknown as { client: unknown }).client = {
+      channels: {
+        fetch: async () => {
+          providerCalls += 1;
+          return null;
+        },
+      },
+    };
+
+    expect(
+      await adapter.prepareSendMsg(
+        { platform: "discord", channelId: "c1" },
+        { text: "prepared", attachmentCount: 1, actionCount: 0 },
+      ),
+    ).toEqual(Result.ok(undefined));
+    expect(providerCalls).toBe(0);
+  });
+
   it.each(EMPTY_DISCORD_CONTENT_CASES)("rejects a truly empty payload %#", async (content) => {
     const result = await createTestDiscordAdapter().sendMsg(
       { platform: "discord", channelId: "c1" },
