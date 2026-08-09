@@ -7,18 +7,14 @@ import {
   type LilacBus,
 } from "@stanley2058/lilac-event-bus";
 import { Result, TaggedError, type Panic, type Result as ResultType } from "better-result";
-import {
-  createLogger,
-  formatTaggedErrorForLog,
-  isPanic,
-  opaqueErrorMessage,
-} from "@stanley2058/lilac-utils";
+import { createLogger, formatTaggedErrorForLog, isPanic } from "@stanley2058/lilac-utils";
 
-import { GithubApiError } from "../github/github-api";
-import { SurfaceMessageNotFoundError, type SurfaceAdapter } from "../surface/adapter";
-import { GithubMessageCreatedError } from "../surface/github/github-adapter";
-import type { ContentOpts, MsgRef, SessionRef } from "../surface/types";
-import { adaptToolResultToHost, preserveToolPanic } from "../tools/tool-result-adapters";
+import type { ContentOpts, MsgRef } from "../surface/types";
+import type {
+  RegisteredSurfacePlatform,
+  RegisteredSurfaceWorkflowProgressPort,
+} from "../surface/runtime-descriptor";
+import { adaptToolResultToHost } from "../tools/tool-result-adapters";
 import {
   DurableWorkflowStore,
   signalDurableWorkflowReadErrorToHost,
@@ -53,15 +49,31 @@ class WorkflowProgressProjectionFailed extends TaggedError("WorkflowProgressProj
   readonly message: string;
 }> {}
 
-class WorkflowProgressSurfaceCallFailed extends TaggedError("WorkflowProgressSurfaceCallFailed")<{
-  readonly failureKind: "created" | "not-found" | "failed";
-  readonly createdRef: MsgRef | null;
-  readonly message: string;
-}> {}
+type WorkflowProgressSurfaceCallFailureFields =
+  | { readonly failureKind: "created"; readonly createdRef: MsgRef; readonly message: string }
+  | { readonly failureKind: "not-found"; readonly createdRef: null; readonly message: string }
+  | { readonly failureKind: "failed"; readonly createdRef: null; readonly message: string };
+
+class WorkflowProgressSurfaceCreated extends TaggedError("WorkflowProgressSurfaceCallFailed")<
+  Extract<WorkflowProgressSurfaceCallFailureFields, { failureKind: "created" }>
+> {}
+
+class WorkflowProgressSurfaceNotFound extends TaggedError("WorkflowProgressSurfaceCallFailed")<
+  Extract<WorkflowProgressSurfaceCallFailureFields, { failureKind: "not-found" }>
+> {}
+
+class WorkflowProgressSurfaceCallFailed extends TaggedError("WorkflowProgressSurfaceCallFailed")<
+  Extract<WorkflowProgressSurfaceCallFailureFields, { failureKind: "failed" }>
+> {}
+
+type WorkflowProgressSurfaceFailure =
+  | WorkflowProgressSurfaceCreated
+  | WorkflowProgressSurfaceNotFound
+  | WorkflowProgressSurfaceCallFailed;
 
 type WorkflowProgressProjectionError =
   | WorkflowProgressProjectionFailed
-  | WorkflowProgressSurfaceCallFailed;
+  | WorkflowProgressSurfaceFailure;
 
 type WorkflowProgressProjectionResult<T> = ResultType<T, WorkflowProgressProjectionError>;
 
@@ -69,35 +81,17 @@ function workflowProgressProjectionFailure(message: string): WorkflowProgressPro
   return new WorkflowProgressProjectionFailed({ message });
 }
 
-async function captureWorkflowProgressSurfaceCall<T>(
-  effect: () => Promise<T>,
-): Promise<ResultType<T, WorkflowProgressSurfaceCallFailed>> {
-  const [settled] = await Promise.allSettled([effect()]);
-  if (settled.status === "rejected") {
-    if (isPanic(settled.reason)) preserveToolPanic(settled.reason);
-    const cause =
-      settled.reason instanceof Error
-        ? settled.reason
-        : new Error("Opaque workflow progress surface failure");
-    const createdRef = cause instanceof GithubMessageCreatedError ? cause.messageRef : null;
-    let failureKind: "created" | "not-found" | "failed" = "failed";
-    if (createdRef !== null) {
-      failureKind = "created";
-    } else if (
-      cause instanceof SurfaceMessageNotFoundError ||
-      (cause instanceof GithubApiError && cause.status === 404)
-    ) {
-      failureKind = "not-found";
-    }
-    return Result.err(
-      new WorkflowProgressSurfaceCallFailed({
-        failureKind,
-        createdRef,
-        message: opaqueErrorMessage(cause, "Workflow progress surface call failed"),
-      }),
-    );
+function workflowProgressSurfaceCallFailure(
+  input: WorkflowProgressSurfaceCallFailureFields,
+): WorkflowProgressSurfaceFailure {
+  switch (input.failureKind) {
+    case "created":
+      return new WorkflowProgressSurfaceCreated(input);
+    case "not-found":
+      return new WorkflowProgressSurfaceNotFound(input);
+    case "failed":
+      return new WorkflowProgressSurfaceCallFailed(input);
   }
-  return Result.ok(settled.value);
 }
 
 function adaptWorkflowProgressProjectionResultToHost<T>(
@@ -135,32 +129,43 @@ function adaptWorkflowProgressSubscriptionStopResultToHost(
 
 const WORKFLOW_CARD_TEXT_LIMIT = 4_000;
 
-function asSessionRef(platform: "discord" | "github", channelId: string): SessionRef {
-  return { platform, channelId };
-}
-
-function asSupportedMsgRef(
-  platform: "discord" | "github",
-  channelId: string,
-  messageId: string,
-): MsgRef {
-  return platform === "discord"
-    ? { platform, channelId, messageId }
-    : { platform, channelId, messageId };
-}
-
-function asMsgRef(input: {
-  platform: string;
-  channelId: string;
-  messageId: string;
-}): MsgRef | null {
-  if (input.platform === "discord") {
-    return { platform: "discord", channelId: input.channelId, messageId: input.messageId };
+function correlateWorkflowProgressMessageRef(input: {
+  readonly runTargetPlatform: RegisteredSurfacePlatform;
+  readonly bindingTargetPlatform: string;
+  readonly messageRef: {
+    readonly platform: string;
+    readonly channelId: string;
+    readonly messageId: string;
+  };
+}): ResultType<MsgRef, WorkflowProgressProjectionFailed> {
+  if (input.bindingTargetPlatform !== input.runTargetPlatform) {
+    return Result.err(
+      workflowProgressProjectionFailure(
+        `Workflow progress binding target platform '${input.bindingTargetPlatform}' does not match run target platform '${input.runTargetPlatform}'`,
+      ),
+    );
   }
-  if (input.platform === "github") {
-    return { platform: "github", channelId: input.channelId, messageId: input.messageId };
+  if (input.messageRef.platform !== input.runTargetPlatform) {
+    return Result.err(
+      workflowProgressProjectionFailure(
+        `Workflow progress binding message platform '${input.messageRef.platform}' does not match target platform '${input.runTargetPlatform}'`,
+      ),
+    );
   }
-  return null;
+  switch (input.runTargetPlatform) {
+    case "discord":
+      return Result.ok({
+        platform: "discord",
+        channelId: input.messageRef.channelId,
+        messageId: input.messageRef.messageId,
+      });
+    case "github":
+      return Result.ok({
+        platform: "github",
+        channelId: input.messageRef.channelId,
+        messageId: input.messageRef.messageId,
+      });
+  }
 }
 
 function limitContentText(content: ContentOpts): ContentOpts {
@@ -193,7 +198,7 @@ export class WorkflowProgressProjector implements WorkflowProgressCardService {
     private readonly input: {
       bus: LilacBus;
       store: DurableWorkflowStore;
-      adapters: ReadonlyMap<"discord" | "github", SurfaceAdapter>;
+      ports: ReadonlyMap<RegisteredSurfacePlatform, RegisteredSurfaceWorkflowProgressPort>;
       subscriptionId: string;
       now?: () => number;
       coalesceMs?: number;
@@ -505,7 +510,7 @@ export class WorkflowProgressProjector implements WorkflowProgressCardService {
 
   private writeFailure(
     binding: WorkflowSurfaceBinding,
-    error: unknown,
+    message: string,
     now: number,
     overrides?: Partial<Pick<typeof binding, "messageRef" | "lastRenderedSha256">>,
   ): void {
@@ -513,7 +518,7 @@ export class WorkflowProgressProjector implements WorkflowProgressCardService {
     this.input.store.upsertSurfaceBinding({
       ...binding,
       ...overrides,
-      lastError: error instanceof Error ? error.message : String(error),
+      lastError: message,
       retryCount,
       nextAttemptAt: retryAt(now, retryCount),
       updatedAt: now,
@@ -585,18 +590,33 @@ export class WorkflowProgressProjector implements WorkflowProgressCardService {
         ),
       );
     }
-    const adapter = this.input.adapters.get(platform);
-    if (!adapter) {
-      return Result.err(
-        workflowProgressProjectionFailure(`Workflow progress adapter is unavailable: ${platform}`),
-      );
-    }
-
     const existingResult = this.input.store.getSurfaceBinding(runId);
     if (existingResult.status === "error") {
       return Result.err(workflowProgressProjectionFailure(existingResult.error.message));
     }
     let existing: WorkflowSurfaceBinding | null = existingResult.value;
+    let messageRef: MsgRef | null = null;
+    if (existing?.messageRef) {
+      const correlated = correlateWorkflowProgressMessageRef({
+        runTargetPlatform: platform,
+        bindingTargetPlatform: existing.target.platform,
+        messageRef: existing.messageRef,
+      });
+      switch (correlated.status) {
+        case "ok":
+          messageRef = correlated.value;
+          break;
+        case "error":
+          this.writeFailure(existing, correlated.error.message, now);
+          return Result.err(correlated.error);
+      }
+    }
+    const port = this.input.ports.get(platform);
+    if (!port) {
+      return Result.err(
+        workflowProgressProjectionFailure(`Workflow progress port is unavailable: ${platform}`),
+      );
+    }
     if (!existing) {
       existing = {
         runId,
@@ -611,19 +631,41 @@ export class WorkflowProgressProjector implements WorkflowProgressCardService {
       };
       this.input.store.upsertSurfaceBinding(existing);
     }
-
-    let messageRef = existing.messageRef ? asMsgRef(existing.messageRef) : null;
     if (
       messageRef &&
       (verifyExisting || (existing.nextAttemptAt !== null && existing.nextAttemptAt <= now))
     ) {
-      const readRef = messageRef;
-      const foundResult = await captureWorkflowProgressSurfaceCall(() => adapter.readMsg(readRef));
-      if (foundResult.status === "error") {
-        this.writeFailure(existing, foundResult.error, now);
-        return Result.err(foundResult.error);
+      const checked = await port.checkMessage({
+        channelId: messageRef.channelId,
+        messageId: messageRef.messageId,
+      });
+      let found: boolean;
+      switch (checked.status) {
+        case "error": {
+          let error: WorkflowProgressSurfaceFailure;
+          switch (checked.error.kind) {
+            case "failed":
+              error = workflowProgressSurfaceCallFailure({
+                failureKind: "failed",
+                createdRef: null,
+                message: checked.error.error.message,
+              });
+              break;
+          }
+          this.writeFailure(existing, error.message, now);
+          return Result.err(error);
+        }
+        case "ok":
+          switch (checked.value) {
+            case "found":
+              found = true;
+              break;
+            case "missing":
+              found = false;
+              break;
+          }
+          break;
       }
-      const found = foundResult.value;
       existing = {
         ...existing,
         messageRef: found ? existing.messageRef : null,
@@ -656,55 +698,126 @@ export class WorkflowProgressProjector implements WorkflowProgressCardService {
       return Result.ok(messageRef);
     }
 
-    const projected = await captureWorkflowProgressSurfaceCall(async () => {
-      if (messageRef) {
-        await adapter.editMsg(messageRef, content);
-        return messageRef;
-      }
-      return await adapter.sendMsg(
-        asSessionRef(platform, target.channelId),
+    let projected: ResultType<MsgRef, WorkflowProgressSurfaceFailure>;
+    if (messageRef) {
+      const edited = await port.edit(
+        { channelId: messageRef.channelId, messageId: messageRef.messageId },
         content,
-        target.replyToMessageId
-          ? {
-              replyTo: asSupportedMsgRef(platform, target.channelId, target.replyToMessageId),
-              silent: true,
-            }
-          : { silent: true },
       );
-    });
-    if (projected.status === "ok") {
-      const projectedRef = projected.value;
-      this.input.store.commitSurfaceProjection({
-        binding: {
-          ...existing,
-          target,
-          messageRef: projectedRef,
-          lastRenderedSha256: renderedSha256,
-          lastError: null,
-          retryCount: 0,
-          nextAttemptAt: null,
-          updatedAt: now,
-        },
-        actionIds: issued.recordIds,
+      switch (edited.status) {
+        case "ok":
+          projected = Result.ok(messageRef);
+          break;
+        case "error":
+          switch (edited.error.kind) {
+            case "not-found":
+              projected = Result.err(
+                workflowProgressSurfaceCallFailure({
+                  failureKind: "not-found",
+                  createdRef: null,
+                  message: "Workflow progress message was not found",
+                }),
+              );
+              break;
+            case "failed":
+              projected = Result.err(
+                workflowProgressSurfaceCallFailure({
+                  failureKind: "failed",
+                  createdRef: null,
+                  message: edited.error.error.message,
+                }),
+              );
+              break;
+          }
+          break;
+      }
+    } else {
+      const sent = await port.send({
+        channelId: target.channelId,
+        content,
+        ...(target.replyToMessageId ? { replyToMessageId: target.replyToMessageId } : {}),
+        silent: true,
       });
-      this.lastEditAt.set(runId, now);
-      this.scheduleActionRotation(runId, issued, now);
-      return Result.ok(projectedRef);
+      switch (sent.status) {
+        case "ok":
+          projected = Result.ok(sent.value);
+          break;
+        case "error":
+          switch (sent.error.kind) {
+            case "created":
+              projected = Result.err(
+                workflowProgressSurfaceCallFailure({
+                  failureKind: "created",
+                  createdRef: sent.error.ref,
+                  message: "Workflow progress message was created but could not be fully rendered",
+                }),
+              );
+              break;
+            case "failed":
+              projected = Result.err(
+                workflowProgressSurfaceCallFailure({
+                  failureKind: "failed",
+                  createdRef: null,
+                  message: sent.error.error.message,
+                }),
+              );
+              break;
+          }
+          break;
+      }
     }
-    const error = projected.error;
-    const editTargetMissing = messageRef !== null && error.failureKind === "not-found";
-    this.writeFailure(existing, error, now, {
-      messageRef: editTargetMissing ? null : (error.createdRef ?? messageRef),
-      lastRenderedSha256: editTargetMissing ? null : existing.lastRenderedSha256,
-    });
-    if (requireMessage && error.createdRef) return Result.ok(error.createdRef);
-    if (requireMessage) {
+    let error: WorkflowProgressSurfaceFailure;
+    switch (projected.status) {
+      case "ok": {
+        const projectedRef = projected.value;
+        this.input.store.commitSurfaceProjection({
+          binding: {
+            ...existing,
+            target,
+            messageRef: projectedRef,
+            lastRenderedSha256: renderedSha256,
+            lastError: null,
+            retryCount: 0,
+            nextAttemptAt: null,
+            updatedAt: now,
+          },
+          actionIds: issued.recordIds,
+        });
+        this.lastEditAt.set(runId, now);
+        this.scheduleActionRotation(runId, issued, now);
+        return Result.ok(projectedRef);
+      }
+      case "error":
+        error = projected.error;
+        break;
+    }
+    switch (error.failureKind) {
+      case "created":
+        this.writeFailure(existing, error.message, now, {
+          messageRef: error.createdRef,
+          lastRenderedSha256: existing.lastRenderedSha256,
+        });
+        if (requireMessage) return Result.ok(error.createdRef);
+        return Result.err(error);
+      case "not-found":
+        this.writeFailure(existing, error.message, now, {
+          messageRef: null,
+          lastRenderedSha256: null,
+        });
+        break;
+      case "failed":
+        this.writeFailure(existing, error.message, now, {
+          messageRef,
+          lastRenderedSha256: existing.lastRenderedSha256,
+        });
+        break;
+    }
+    if (requireMessage)
       return Result.err(
         workflowProgressProjectionFailure(
           `Workflow run ${runId} was persisted, but its initial progress card could not be created: ${error.message}`,
         ),
       );
-    }
     return Result.err(error);
   }
 }

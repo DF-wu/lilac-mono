@@ -128,32 +128,40 @@ export type WorkflowProgressCheckFailure = {
 };
 
 export type WorkflowProgressSendFailure<P extends RegisteredSurfacePlatform> =
-  | { readonly kind: "created"; readonly ref: MsgRefFor<P> }
+  | (P extends "github" ? { readonly kind: "created"; readonly ref: MsgRefFor<P> } : never)
   | { readonly kind: "failed"; readonly error: WorkflowProgressOperationFailed };
 
 export type WorkflowProgressEditFailure =
   | { readonly kind: "not-found" }
   | { readonly kind: "failed"; readonly error: WorkflowProgressOperationFailed };
 
-export type WorkflowProgressSendOptions<P extends RegisteredSurfacePlatform> = {
-  readonly replyTo?: MsgRefFor<P>;
+export type WorkflowProgressMessageTarget = {
+  readonly channelId: string;
+  readonly messageId: string;
+};
+
+export type WorkflowProgressSendInput = {
+  readonly channelId: string;
+  readonly content: ContentOpts;
+  readonly replyToMessageId?: string;
   readonly silent?: boolean;
 };
 
 export type SurfaceWorkflowProgressPort<P extends RegisteredSurfacePlatform> = {
   checkMessage(
-    ref: MsgRefFor<P>,
+    target: WorkflowProgressMessageTarget,
   ): Promise<ResultType<"found" | "missing", WorkflowProgressCheckFailure>>;
   send(
-    session: SessionRefFor<P>,
-    content: ContentOpts,
-    options?: WorkflowProgressSendOptions<P>,
+    input: WorkflowProgressSendInput,
   ): Promise<ResultType<MsgRefFor<P>, WorkflowProgressSendFailure<P>>>;
   edit(
-    ref: MsgRefFor<P>,
+    target: WorkflowProgressMessageTarget,
     content: ContentOpts,
   ): Promise<ResultType<void, WorkflowProgressEditFailure>>;
 };
+
+export type RegisteredSurfaceWorkflowProgressPort =
+  SurfaceWorkflowProgressPort<RegisteredSurfacePlatform>;
 
 export type SurfaceRuntimeDescriptor<P extends RegisteredSurfacePlatform> = {
   readonly platform: P;

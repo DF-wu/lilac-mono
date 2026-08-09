@@ -14,7 +14,7 @@ import {
   type RawDeliveryAction,
   type SubscriptionOptions,
 } from "@stanley2058/lilac-event-bus";
-import { Panic } from "better-result";
+import { Panic, Result } from "better-result";
 import { subscribeForTest, type TestRawMessageHandler } from "../helpers/result-raw-bus";
 import type {
   AdapterEventHandler,
@@ -22,6 +22,13 @@ import type {
   SurfaceOutputStream,
 } from "../../src/surface/adapter";
 import { SurfaceMessageNotFoundError } from "../../src/surface/adapter";
+import { createDiscordWorkflowProgressPort } from "../../src/surface/discord/discord-runtime-descriptor";
+import { createGithubWorkflowProgressPort } from "../../src/surface/github/github-runtime-descriptor";
+import type {
+  RegisteredSurfacePlatform,
+  RegisteredSurfaceWorkflowProgressPort,
+  SurfaceWorkflowProgressPort,
+} from "../../src/surface/runtime-descriptor";
 import type {
   ContentOpts,
   LimitOpts,
@@ -109,6 +116,7 @@ class ProjectionAdapter implements SurfaceAdapter {
   failNextSend = false;
   failNextRead = false;
   failNextEditNotFound = false;
+  sendRejection: { readonly value: unknown } | null = null;
   editFailure: Error | null = null;
   constructor(readonly platform: "discord" | "github" = "discord") {}
   async connect() {}
@@ -123,6 +131,11 @@ class ProjectionAdapter implements SurfaceAdapter {
     throw new Error("not used");
   }
   async sendMsg(session: SessionRef, content: ContentOpts, _opts?: SendOpts): Promise<MsgRef> {
+    if (this.sendRejection) {
+      const rejection = this.sendRejection.value;
+      this.sendRejection = null;
+      throw rejection;
+    }
     if (this.failNextSend) {
       this.failNextSend = false;
       throw new Error("transient surface failure");
@@ -206,6 +219,26 @@ class BlockingProjectionAdapter extends ProjectionAdapter {
     return await super.sendMsg(session, content, options);
   }
 }
+function projectionPorts(
+  adapter: ProjectionAdapter,
+): Map<RegisteredSurfacePlatform, RegisteredSurfaceWorkflowProgressPort> {
+  const ports = new Map<RegisteredSurfacePlatform, RegisteredSurfaceWorkflowProgressPort>();
+  if (adapter.platform === "discord") {
+    ports.set("discord", createDiscordWorkflowProgressPort(adapter));
+  } else {
+    ports.set("github", createGithubWorkflowProgressPort(adapter));
+  }
+  return ports;
+}
+function combinedProjectionPorts(
+  ...adapters: readonly ProjectionAdapter[]
+): Map<RegisteredSurfacePlatform, RegisteredSurfaceWorkflowProgressPort> {
+  const ports = new Map<RegisteredSurfacePlatform, RegisteredSurfaceWorkflowProgressPort>();
+  for (const adapter of adapters) {
+    for (const [platform, port] of projectionPorts(adapter)) ports.set(platform, port);
+  }
+  return ports;
+}
 function createInvocation(
   store: DurableWorkflowStore,
   hasProgressTarget = true,
@@ -278,12 +311,13 @@ function createInvocation(
     },
   });
 }
-function actionToken(adapter: ProjectionAdapter, label: string): string {
-  const token = adapter.contents
-    .at(-1)
-    ?.actions?.find((action) => action.label === label)?.actionId;
+function contentActionToken(content: ContentOpts | undefined, label: string): string {
+  const token = content?.actions?.find((action) => action.label === label)?.actionId;
   if (!token) throw new Error(`Missing ${label} action`);
   return token;
+}
+function actionToken(adapter: ProjectionAdapter, label: string): string {
+  return contentActionToken(adapter.contents.at(-1), label);
 }
 function appliedSurfaceActionStatus(
   result: ReturnType<DurableWorkflowStore["applySurfaceAction"]>,
@@ -304,7 +338,7 @@ describe("WorkflowProgressProjector", () => {
     const projector = createWorkflowProgressProjectorForTest({
       bus,
       store,
-      adapters: new Map([["discord", adapter]]),
+      ports: projectionPorts(adapter),
       subscriptionId: "null-target",
       coalesceMs: 0,
       minEditIntervalMs: 0,
@@ -334,7 +368,7 @@ describe("WorkflowProgressProjector", () => {
     const projector = createWorkflowProgressProjectorForTest({
       bus,
       store,
-      adapters: new Map([["discord", adapter]]),
+      ports: projectionPorts(adapter),
       subscriptionId: "one-binding",
       now: () => 20,
     });
@@ -381,7 +415,7 @@ describe("WorkflowProgressProjector", () => {
     const projector = createWorkflowProgressProjectorForTest({
       bus,
       store,
-      adapters: new Map([["discord", adapter]]),
+      ports: projectionPorts(adapter),
       subscriptionId: "coalescing",
       now: () => 100,
       coalesceMs: 5,
@@ -415,7 +449,7 @@ describe("WorkflowProgressProjector", () => {
     const projector = createWorkflowProgressProjectorForTest({
       bus,
       store,
-      adapters: new Map([["discord", adapter]]),
+      ports: projectionPorts(adapter),
       subscriptionId: "schedule-before-commit",
       coalesceMs: 1000000,
     });
@@ -453,7 +487,7 @@ describe("WorkflowProgressProjector", () => {
     let projector = createWorkflowProgressProjectorForTest({
       bus,
       store,
-      adapters: new Map([["discord", adapter]]),
+      ports: projectionPorts(adapter),
       subscriptionId: "startup-first",
       now: () => 20,
     });
@@ -470,7 +504,7 @@ describe("WorkflowProgressProjector", () => {
       projector = createWorkflowProgressProjectorForTest({
         bus,
         store,
-        adapters: new Map([["discord", adapter]]),
+        ports: projectionPorts(adapter),
         subscriptionId: "startup-second",
         now: () => 30,
       });
@@ -487,6 +521,136 @@ describe("WorkflowProgressProjector", () => {
       rmSync(dbPath, { force: true });
     }
   });
+  it("rejects a due persisted ref platform mismatch before checking either protocol", async () => {
+    const dbPath = tempDbPath("workflow-binding-platform-mismatch-check");
+    const store = new DurableWorkflowStore(dbPath);
+    const discordAdapter = new ProjectionAdapter("discord");
+    const githubAdapter = new ProjectionAdapter("github");
+    const bus = createLilacBus(new CapturingRawBus());
+    const projector = createWorkflowProgressProjectorForTest({
+      bus,
+      store,
+      ports: combinedProjectionPorts(discordAdapter, githubAdapter),
+      subscriptionId: "binding-platform-mismatch-check",
+      now: () => 20,
+    });
+    const mismatchedRef = {
+      platform: "github" as const,
+      channelId: "octo/repo#1",
+      messageId: "42",
+    };
+    try {
+      createInvocation(store);
+      store.upsertSurfaceBinding({
+        runId: "run-1",
+        target: { platform: "discord", channelId: "channel-1", replyToMessageId: "origin-1" },
+        messageRef: mismatchedRef,
+        lastRenderedSha256: HASH_A,
+        lastError: "retry due",
+        retryCount: 0,
+        nextAttemptAt: 20,
+        createdAt: 10,
+        updatedAt: 10,
+      });
+
+      await expect(projector.ensureInitialCard("run-1")).rejects.toThrow(
+        "binding message platform 'github' does not match target platform 'discord'",
+      );
+      expect({
+        discord: {
+          reads: discordAdapter.reads,
+          edits: discordAdapter.edits,
+          sends: discordAdapter.sends,
+        },
+        github: {
+          reads: githubAdapter.reads,
+          edits: githubAdapter.edits,
+          sends: githubAdapter.sends,
+        },
+      }).toEqual({
+        discord: { reads: 0, edits: 0, sends: 0 },
+        github: { reads: 0, edits: 0, sends: 0 },
+      });
+      expect(workflowStoreValue(store.getSurfaceBinding("run-1"))).toMatchObject({
+        messageRef: mismatchedRef,
+        lastRenderedSha256: HASH_A,
+        retryCount: 1,
+        nextAttemptAt: 1_020,
+        lastError:
+          "Workflow progress binding message platform 'github' does not match target platform 'discord'",
+      });
+    } finally {
+      await projector.stop();
+      await bus.close();
+      store.close();
+      rmSync(dbPath, { force: true });
+    }
+  });
+  it("rejects a persisted ref platform mismatch before editing either protocol", async () => {
+    const dbPath = tempDbPath("workflow-binding-platform-mismatch-edit");
+    const store = new DurableWorkflowStore(dbPath);
+    const discordAdapter = new ProjectionAdapter("discord");
+    const githubAdapter = new ProjectionAdapter("github");
+    const bus = createLilacBus(new CapturingRawBus());
+    const projector = createWorkflowProgressProjectorForTest({
+      bus,
+      store,
+      ports: combinedProjectionPorts(discordAdapter, githubAdapter),
+      subscriptionId: "binding-platform-mismatch-edit",
+      now: () => 30,
+    });
+    const mismatchedRef = {
+      platform: "discord" as const,
+      channelId: "channel-1",
+      messageId: "message-1",
+    };
+    try {
+      createInvocation(store, true, "github");
+      store.upsertSurfaceBinding({
+        runId: "run-1",
+        target: { platform: "github", channelId: "channel-1", replyToMessageId: "origin-1" },
+        messageRef: mismatchedRef,
+        lastRenderedSha256: null,
+        lastError: null,
+        retryCount: 0,
+        nextAttemptAt: null,
+        createdAt: 10,
+        updatedAt: 10,
+      });
+
+      await expect(projector.ensureInitialCard("run-1")).rejects.toThrow(
+        "binding message platform 'discord' does not match target platform 'github'",
+      );
+      expect({
+        discord: {
+          reads: discordAdapter.reads,
+          edits: discordAdapter.edits,
+          sends: discordAdapter.sends,
+        },
+        github: {
+          reads: githubAdapter.reads,
+          edits: githubAdapter.edits,
+          sends: githubAdapter.sends,
+        },
+      }).toEqual({
+        discord: { reads: 0, edits: 0, sends: 0 },
+        github: { reads: 0, edits: 0, sends: 0 },
+      });
+      expect(workflowStoreValue(store.getSurfaceBinding("run-1"))).toMatchObject({
+        messageRef: mismatchedRef,
+        lastRenderedSha256: null,
+        retryCount: 1,
+        nextAttemptAt: 1_030,
+        lastError:
+          "Workflow progress binding message platform 'discord' does not match target platform 'github'",
+      });
+    } finally {
+      await projector.stop();
+      await bus.close();
+      store.close();
+      rmSync(dbPath, { force: true });
+    }
+  });
   it("repairs stale terminal cards, skips clean history, and retries failed bindings", async () => {
     const dbPath = tempDbPath("workflow-terminal-reconcile");
     const store = new DurableWorkflowStore(dbPath);
@@ -496,7 +660,7 @@ describe("WorkflowProgressProjector", () => {
     const projector = createWorkflowProgressProjectorForTest({
       bus,
       store,
-      adapters: new Map([["discord", adapter]]),
+      ports: projectionPorts(adapter),
       subscriptionId: "terminal-reconcile",
       now: () => now,
       coalesceMs: 0,
@@ -561,7 +725,7 @@ describe("WorkflowProgressProjector", () => {
     const projector = createWorkflowProgressProjectorForTest({
       bus,
       store,
-      adapters: new Map([["discord", adapter]]),
+      ports: projectionPorts(adapter),
       subscriptionId: "retry",
       now: () => now,
       coalesceMs: 0,
@@ -599,6 +763,202 @@ describe("WorkflowProgressProjector", () => {
       rmSync(dbPath, { force: true });
     }
   });
+  it("keeps opaque non-Error surface rejections out of durable failures", async () => {
+    const dbPath = tempDbPath("workflow-projector-opaque-rejection");
+    const store = new DurableWorkflowStore(dbPath);
+    const adapter = new ProjectionAdapter();
+    const bus = createLilacBus(new CapturingRawBus());
+    const projector = createWorkflowProgressProjectorForTest({
+      bus,
+      store,
+      ports: projectionPorts(adapter),
+      subscriptionId: "opaque-rejection",
+      now: () => 100,
+    });
+    try {
+      createInvocation(store);
+      adapter.sendRejection = { value: "provider-secret-rejection" };
+
+      await expect(projector.ensureInitialCard("run-1")).rejects.toThrow(
+        "Opaque workflow progress surface failure",
+      );
+      const binding = workflowStoreValue(store.getSurfaceBinding("run-1"));
+      expect(binding?.lastError).toBe("Opaque workflow progress surface failure");
+      expect(binding?.lastError).not.toContain("provider-secret-rejection");
+    } finally {
+      await projector.stop();
+      await bus.close();
+      store.close();
+      rmSync(dbPath, { force: true });
+    }
+  });
+  it("clears a missing edit target and recreates the card on the next projection", async () => {
+    const dbPath = tempDbPath("workflow-projector-missing-edit");
+    const store = new DurableWorkflowStore(dbPath);
+    const adapter = new ProjectionAdapter();
+    const bus = createLilacBus(new CapturingRawBus());
+    let now = 20;
+    const projector = createWorkflowProgressProjectorForTest({
+      bus,
+      store,
+      ports: projectionPorts(adapter),
+      subscriptionId: "missing-edit",
+      now: () => now,
+    });
+    try {
+      createInvocation(store);
+      const firstRef = await projector.ensureInitialCard("run-1");
+      expect(store.tryClaimRun({ runId: "run-1", claimerId: "engine", now: 21 })?.state).toBe(
+        "running",
+      );
+      adapter.failNextEditNotFound = true;
+      now = 30;
+      await expect(projector.ensureInitialCard("run-1")).rejects.toThrow(
+        "initial progress card could not be created",
+      );
+      expect(workflowStoreValue(store.getSurfaceBinding("run-1"))).toMatchObject({
+        messageRef: null,
+        lastRenderedSha256: null,
+        retryCount: 1,
+        lastError: "Workflow progress message was not found",
+      });
+
+      now = 40;
+      const recreated = await projector.ensureInitialCard("run-1");
+      expect(recreated.messageId).not.toBe(firstRef.messageId);
+      expect(adapter.sends).toBe(2);
+    } finally {
+      await projector.stop();
+      await bus.close();
+      store.close();
+      rmSync(dbPath, { force: true });
+    }
+  });
+  it("recovers persisted partial GitHub creation immediately after hard restart", async () => {
+    const dbPath = tempDbPath("workflow-projector-created-outcome");
+    let store = new DurableWorkflowStore(dbPath);
+    const bus = createLilacBus(new CapturingRawBus());
+    let now = 20;
+    let sends = 0;
+    let edits = 0;
+    const sentContents: ContentOpts[] = [];
+    const editedContents: ContentOpts[] = [];
+    const createdRef = {
+      platform: "github" as const,
+      channelId: "channel-1",
+      messageId: "created-card",
+    };
+    const port: SurfaceWorkflowProgressPort<"github"> = {
+      checkMessage: async () => Result.ok("found"),
+      send: async (input) => {
+        sends += 1;
+        sentContents.push(input.content);
+        return sends === 1
+          ? Result.err({ kind: "created", ref: createdRef })
+          : Result.ok(createdRef);
+      },
+      edit: async (_target, content) => {
+        edits += 1;
+        editedContents.push(content);
+        return Result.ok(undefined);
+      },
+    };
+    let projector = createWorkflowProgressProjectorForTest({
+      bus,
+      store,
+      ports: new Map([["github", port]]),
+      subscriptionId: "created-outcome",
+      now: () => now,
+    });
+    try {
+      createInvocation(store, true, "github");
+      await expect(projector.ensureInitialCard("run-1")).resolves.toEqual(createdRef);
+      expect(workflowStoreValue(store.getSurfaceBinding("run-1"))).toMatchObject({
+        messageRef: createdRef,
+        lastRenderedSha256: null,
+        retryCount: 1,
+        lastError: "Workflow progress message was created but could not be fully rendered",
+      });
+      expect(sends).toBe(1);
+      expect(edits).toBe(0);
+      const initialToken = contentActionToken(sentContents.at(-1), "Pause");
+      expect(
+        workflowStoreValue(store.getSurfaceActionByTokenSha256(sha256(initialToken)))
+          ?.expectedMessageRef,
+      ).toBeNull();
+
+      await projector.stop();
+      store.close();
+      store = new DurableWorkflowStore(dbPath);
+      expect(workflowStoreValue(store.getSurfaceBinding("run-1"))).toMatchObject({
+        messageRef: createdRef,
+        lastRenderedSha256: null,
+        retryCount: 1,
+        nextAttemptAt: 1_020,
+        lastError: "Workflow progress message was created but could not be fully rendered",
+      });
+
+      now = 21;
+      projector = createWorkflowProgressProjectorForTest({
+        bus,
+        store,
+        ports: new Map([["github", port]]),
+        subscriptionId: "created-outcome-restarted",
+        now: () => now,
+      });
+      await projector.start();
+      expect(sends).toBe(1);
+      expect(edits).toBe(1);
+      const restartedContent = editedContents.at(-1);
+      const restartedToken = contentActionToken(restartedContent, "Pause");
+      expect(restartedToken).not.toBe(initialToken);
+      const restartedHash = sha256(
+        JSON.stringify({
+          text: restartedContent?.text,
+          actions: restartedContent?.actions,
+          revision: HASH_A,
+        }),
+      );
+      expect(workflowStoreValue(store.getSurfaceBinding("run-1"))).toMatchObject({
+        messageRef: createdRef,
+        lastRenderedSha256: restartedHash,
+        retryCount: 0,
+        nextAttemptAt: null,
+        lastError: null,
+      });
+      expect(
+        workflowStoreValue(store.getSurfaceActionByTokenSha256(sha256(restartedToken)))
+          ?.expectedMessageRef,
+      ).toEqual(createdRef);
+      expect(
+        appliedSurfaceActionStatus(
+          store.applySurfaceAction({
+            tokenSha256: sha256(restartedToken),
+            platform: "github",
+            userId: "user-1",
+            messageRef: { ...createdRef, messageId: "different-card" },
+            now: 22,
+          }),
+        ),
+      ).toBe("unauthorized");
+      expect(
+        appliedSurfaceActionStatus(
+          store.applySurfaceAction({
+            tokenSha256: sha256(restartedToken),
+            platform: "github",
+            userId: "user-1",
+            messageRef: createdRef,
+            now: 23,
+          }),
+        ),
+      ).toBe("applied");
+    } finally {
+      await projector.stop();
+      await bus.close();
+      store.close();
+      rmSync(dbPath, { force: true });
+    }
+  });
   it("renders pause, resume, cancel, and terminal card states", async () => {
     const dbPath = tempDbPath("workflow-controls");
     const store = new DurableWorkflowStore(dbPath);
@@ -608,7 +968,7 @@ describe("WorkflowProgressProjector", () => {
     const projector = createWorkflowProgressProjectorForTest({
       bus,
       store,
-      adapters: new Map([["discord", adapter]]),
+      ports: projectionPorts(adapter),
       subscriptionId: "controls",
       now: () => now,
     });
@@ -675,7 +1035,7 @@ describe("WorkflowProgressProjector", () => {
     const projector = createWorkflowProgressProjectorForTest({
       bus,
       store,
-      adapters: new Map([["github", adapter]]),
+      ports: projectionPorts(adapter),
       subscriptionId: "github-controls",
       now: () => 20,
     });
@@ -713,7 +1073,7 @@ describe("WorkflowProgressProjector", () => {
     const initialProjector = createWorkflowProgressProjectorForTest({
       bus,
       store,
-      adapters: new Map([["discord", adapter]]),
+      ports: projectionPorts(adapter),
       subscriptionId: "outbox-initial",
       now: () => 20,
     });
@@ -744,7 +1104,7 @@ describe("WorkflowProgressProjector", () => {
       const projecting = createWorkflowProgressProjectorForTest({
         bus,
         store,
-        adapters: new Map([["discord", adapter]]),
+        ports: projectionPorts(adapter),
         subscriptionId: "outbox-projector-first",
         now: () => 30,
       });
@@ -764,7 +1124,7 @@ describe("WorkflowProgressProjector", () => {
       const restartedProjector = createWorkflowProgressProjectorForTest({
         bus,
         store,
-        adapters: new Map([["discord", adapter]]),
+        ports: projectionPorts(adapter),
         subscriptionId: "outbox-projector-second",
         now: () => 40,
       });
@@ -789,7 +1149,7 @@ describe("WorkflowProgressProjector", () => {
     const projector = createWorkflowProgressProjectorForTest({
       bus,
       store,
-      adapters: new Map([["discord", adapter]]),
+      ports: projectionPorts(adapter),
       subscriptionId: "outbox-atomic-driver-failure",
       now: () => 20,
     });
@@ -843,7 +1203,7 @@ describe("WorkflowProgressProjector", () => {
     const projector = createWorkflowProgressProjectorForTest({
       bus,
       store,
-      adapters: new Map([["discord", adapter]]),
+      ports: projectionPorts(adapter),
       subscriptionId: "outbox-atomic-panic",
       now: () => 20,
     });
@@ -881,7 +1241,7 @@ describe("WorkflowProgressProjector", () => {
     const projector = createWorkflowProgressProjectorForTest({
       bus,
       store,
-      adapters: new Map([["discord", adapter]]),
+      ports: projectionPorts(adapter),
       subscriptionId: "outbox-publication-failure-projector",
       now: () => 20,
     });
@@ -937,7 +1297,7 @@ describe("WorkflowProgressProjector", () => {
     const projector = createWorkflowProgressProjectorForTest({
       bus,
       store,
-      adapters: new Map([["discord", adapter]]),
+      ports: projectionPorts(adapter),
       subscriptionId: "outbox-panic-projector",
       now: () => 20,
     });
@@ -989,7 +1349,7 @@ describe("WorkflowProgressProjector", () => {
     const projector = createWorkflowProgressProjectorForTest({
       bus,
       store,
-      adapters: new Map(),
+      ports: new Map(),
       subscriptionId: "projection-timer-panic",
       coalesceMs: 0,
       minEditIntervalMs: 0,
@@ -1023,7 +1383,7 @@ describe("WorkflowProgressProjector", () => {
     const projector = createWorkflowProgressProjectorForTest({
       bus,
       store,
-      adapters: new Map([["discord", adapter]]),
+      ports: projectionPorts(adapter),
       subscriptionId: "projection-outbox-panic",
       now: () => 20,
       retryIntervalMs: 1,
@@ -1063,7 +1423,7 @@ describe("WorkflowProgressProjector", () => {
     const projector = createWorkflowProgressProjectorForTest({
       bus: startFailureBus,
       store,
-      adapters: new Map(),
+      ports: new Map(),
       subscriptionId: "projector-start-result-failure",
     });
     try {
@@ -1085,7 +1445,7 @@ describe("WorkflowProgressProjector", () => {
       const stoppingProjector = createWorkflowProgressProjectorForTest({
         bus: stopFailureBus,
         store,
-        adapters: new Map(),
+        ports: new Map(),
         subscriptionId: "projector-stop-result-failure",
       });
       await stoppingProjector.start();
@@ -1144,7 +1504,7 @@ describe("WorkflowProgressProjector", () => {
     const projector = createWorkflowProgressProjectorForTest({
       bus,
       store,
-      adapters: new Map([["discord", adapter]]),
+      ports: projectionPorts(adapter),
       subscriptionId: "shutdown",
     });
     try {

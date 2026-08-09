@@ -2,7 +2,7 @@ import { describe, expect, it } from "bun:test";
 
 import {
   connectAndValidateSurfaceAdapters,
-  createSurfaceAdapterMap,
+  createSurfaceWorkflowProgressPortMap,
   disconnectSurfaceAdapters,
   restoreSurfaceRecovery,
   startSurfaceAdapterIngress,
@@ -222,15 +222,18 @@ function maps() {
 }
 
 describe("surface runtime lifecycle", () => {
-  it("derives the workflow adapter map from unique registry entries", () => {
+  it("derives workflow progress ports from unique registry entries", () => {
     const calls: string[] = [];
-    const registry = createRegistry({ calls });
-    const adapters = createSurfaceAdapterMap(registry);
+    const registry = createRegistry({
+      calls,
+      githubRequestIngressStart: async () => ({ stop: async () => undefined }),
+    });
+    const ports = createSurfaceWorkflowProgressPortMap(registry);
 
-    expect([...adapters.keys()]).toEqual(["discord", "github"]);
-    expect(new Set(adapters.keys()).size).toBe(adapters.size);
-    expect(adapters.get("discord")).toBe(registry.get("discord")?.adapter);
-    expect(adapters.get("github")).toBe(registry.get("github")?.adapter);
+    expect([...ports.keys()]).toEqual(["discord", "github"]);
+    expect(new Set(ports.keys()).size).toBe(ports.size);
+    expect(ports.get("discord")).toBe(registry.get("discord")?.workflowProgress);
+    expect(ports.get("github")).toBe(registry.get("github")?.workflowProgress);
   });
 
   it("preserves adapter ingress, connection, validation, and output activation phases", async () => {

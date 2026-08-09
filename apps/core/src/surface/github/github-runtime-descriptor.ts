@@ -1,9 +1,13 @@
 import type { SurfaceMsgRef } from "@stanley2058/lilac-event-bus";
 import { Panic, Result, TaggedError, type Result as ResultType } from "better-result";
 
-import { errorMessage } from "@stanley2058/lilac-utils";
+import { errorMessage, opaqueErrorMessage } from "@stanley2058/lilac-utils";
 
-import { deleteIssueCommentReactionById, deleteIssueReactionById } from "../../github/github-api";
+import {
+  deleteIssueCommentReactionById,
+  deleteIssueReactionById,
+  GithubApiError,
+} from "../../github/github-api";
 import { parseGithubRequestId, parseGithubSessionId } from "../../github/github-ids";
 import {
   clearGithubAck,
@@ -12,7 +16,7 @@ import {
   getGithubRequestMeta,
   type GithubAckState,
 } from "../../github/github-state";
-import type { SurfaceAdapter } from "../adapter";
+import { preserveSurfacePanic, SurfaceMessageNotFoundError, type SurfaceAdapter } from "../adapter";
 import type {
   SurfaceRelayDescriptor,
   SurfaceRelayPolicy,
@@ -20,12 +24,181 @@ import type {
   SurfaceRequestIngress,
   SurfaceRuntimeDescriptor,
   SurfaceWorkflowProgressPort,
+  WorkflowProgressCheckFailure,
+  WorkflowProgressEditFailure,
+  WorkflowProgressSendFailure,
 } from "../runtime-descriptor";
 import {
   SurfaceIngressAcknowledgementCleanupFailed,
   SurfaceReplyTargetInvalid as ReplyTargetInvalid,
+  SurfaceRefInvalid as RefInvalid,
+  WorkflowProgressOperationFailed,
 } from "../runtime-descriptor";
-import { SurfaceRefInvalid as RefInvalid } from "../runtime-descriptor";
+import { GithubMessageCreatedError } from "./github-adapter";
+
+type GithubWorkflowProgressOperation = "check-message" | "send" | "edit";
+
+function githubWorkflowProgressFailure(
+  operation: GithubWorkflowProgressOperation,
+  message: string,
+): { readonly kind: "failed"; readonly error: WorkflowProgressOperationFailed } {
+  return {
+    kind: "failed",
+    error: new WorkflowProgressOperationFailed({
+      operation,
+      message,
+    }),
+  };
+}
+
+export function captureGithubWorkflowProgressCall<T>(input: {
+  readonly operation: "check-message";
+  readonly effect: () => Promise<T>;
+}): Promise<ResultType<T, WorkflowProgressCheckFailure>>;
+export function captureGithubWorkflowProgressCall<T>(input: {
+  readonly operation: "send";
+  readonly effect: () => Promise<T>;
+}): Promise<ResultType<T, WorkflowProgressSendFailure<"github">>>;
+export function captureGithubWorkflowProgressCall<T>(input: {
+  readonly operation: "edit";
+  readonly effect: () => Promise<T>;
+}): Promise<ResultType<T, WorkflowProgressEditFailure>>;
+export async function captureGithubWorkflowProgressCall<T>(input: {
+  readonly operation: GithubWorkflowProgressOperation;
+  readonly effect: () => Promise<T>;
+}): Promise<
+  ResultType<
+    T,
+    | WorkflowProgressCheckFailure
+    | WorkflowProgressSendFailure<"github">
+    | WorkflowProgressEditFailure
+  >
+> {
+  try {
+    return Result.ok(await input.effect());
+  } catch (cause) {
+    preserveSurfacePanic(cause);
+    const failureMessage =
+      cause instanceof Error
+        ? opaqueErrorMessage(cause, "Workflow progress surface call failed")
+        : "Opaque workflow progress surface failure";
+    const failed = githubWorkflowProgressFailure(input.operation, failureMessage);
+    if (cause instanceof GithubMessageCreatedError && cause.messageRef.platform === "github") {
+      switch (input.operation) {
+        case "check-message":
+        case "edit":
+          return Result.err(failed);
+        case "send":
+          return Result.err({ kind: "created", ref: cause.messageRef });
+      }
+    }
+    if (
+      cause instanceof SurfaceMessageNotFoundError ||
+      (cause instanceof GithubApiError && cause.status === 404)
+    ) {
+      switch (input.operation) {
+        case "check-message":
+        case "send":
+          return Result.err(failed);
+        case "edit":
+          return Result.err({ kind: "not-found" });
+      }
+    }
+    return Result.err(failed);
+  }
+}
+
+export function createGithubWorkflowProgressPort(
+  adapter: SurfaceAdapter,
+): SurfaceWorkflowProgressPort<"github"> {
+  return {
+    checkMessage: async (target) => {
+      const checked = await captureGithubWorkflowProgressCall({
+        operation: "check-message",
+        effect: () =>
+          adapter.readMsg({
+            platform: "github",
+            channelId: target.channelId,
+            messageId: target.messageId,
+          }),
+      });
+      switch (checked.status) {
+        case "ok":
+          return Result.ok(checked.value ? "found" : "missing");
+        case "error":
+          switch (checked.error.kind) {
+            case "failed":
+              return Result.err(checked.error);
+          }
+      }
+    },
+    send: async (input) => {
+      const sent = await captureGithubWorkflowProgressCall({
+        operation: "send",
+        effect: () =>
+          adapter.sendMsg(
+            { platform: "github", channelId: input.channelId },
+            input.content,
+            input.replyToMessageId
+              ? {
+                  replyTo: {
+                    platform: "github",
+                    channelId: input.channelId,
+                    messageId: input.replyToMessageId,
+                  },
+                  silent: input.silent,
+                }
+              : { silent: input.silent },
+          ),
+      });
+      switch (sent.status) {
+        case "ok":
+          switch (sent.value.platform) {
+            case "discord":
+              return Result.err({
+                kind: "failed",
+                error: new WorkflowProgressOperationFailed({
+                  operation: "send",
+                  message: "GitHub workflow progress send returned a 'discord' message",
+                }),
+              });
+            case "github":
+              return Result.ok(sent.value);
+          }
+        case "error":
+          switch (sent.error.kind) {
+            case "created":
+            case "failed":
+              return Result.err(sent.error);
+          }
+      }
+    },
+    edit: async (target, content) => {
+      const edited = await captureGithubWorkflowProgressCall({
+        operation: "edit",
+        effect: () =>
+          adapter.editMsg(
+            {
+              platform: "github",
+              channelId: target.channelId,
+              messageId: target.messageId,
+            },
+            content,
+          ),
+      });
+      switch (edited.status) {
+        case "ok":
+          return Result.ok(undefined);
+        case "error":
+          switch (edited.error.kind) {
+            case "not-found":
+            case "failed":
+              return Result.err(edited.error);
+          }
+      }
+    },
+  };
+}
 
 export type GithubAcknowledgementApi = {
   readonly deleteIssueReactionById: typeof deleteIssueReactionById;
@@ -233,14 +406,15 @@ export function createGithubSurfaceRuntimeDescriptor(input: {
   readonly adapter: SurfaceAdapter;
   readonly requestIngress?: SurfaceRequestIngress;
   readonly relay?: SurfaceRelayDescriptor<"github">;
-  readonly workflowProgress?: SurfaceWorkflowProgressPort<"github">;
 }): SurfaceRuntimeDescriptor<"github"> {
   return {
     platform: "github",
     adapter: input.adapter,
     ...(input.requestIngress ? { requestIngress: input.requestIngress } : {}),
     ...(input.relay ? { relay: input.relay } : {}),
-    ...(input.workflowProgress ? { workflowProgress: input.workflowProgress } : {}),
+    ...(input.requestIngress
+      ? { workflowProgress: createGithubWorkflowProgressPort(input.adapter) }
+      : {}),
   };
 }
 
@@ -255,7 +429,6 @@ export function createConfiguredGithubSurfaceRuntimeDescriptor(input: {
   readonly appCredentialsAvailable: boolean;
   readonly requestIngress: SurfaceRequestIngress;
   readonly relay: SurfaceRelayDescriptor<"github">;
-  readonly workflowProgress?: SurfaceWorkflowProgressPort<"github">;
   readonly logger: GithubSurfaceRuntimeCompositionLogger;
 }): SurfaceRuntimeDescriptor<"github"> {
   const requestIngressAvailable = Boolean(input.webhookSecret) && input.appCredentialsAvailable;
@@ -275,6 +448,5 @@ export function createConfiguredGithubSurfaceRuntimeDescriptor(input: {
     adapter: input.adapter,
     ...(requestIngressAvailable ? { requestIngress: input.requestIngress } : {}),
     ...(input.appCredentialsAvailable ? { relay: input.relay } : {}),
-    ...(input.workflowProgress ? { workflowProgress: input.workflowProgress } : {}),
   });
 }

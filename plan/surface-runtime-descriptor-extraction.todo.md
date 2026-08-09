@@ -33,7 +33,7 @@ Source: `plan/surface-runtime-descriptor-extraction.md`
 
 ## Stage 6: Workflow Migration
 
-- [ ] Move workflow progress behavior behind descriptor ports.
+- [x] Move workflow progress behavior behind descriptor ports.
 
 ## Stage 7: Verification And Documentation
 

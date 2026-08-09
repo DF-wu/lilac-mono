@@ -33,6 +33,7 @@ import type {
   SessionRef,
   SurfaceMessage,
 } from "../../src/surface/types";
+import { createDiscordWorkflowProgressPort } from "../../src/surface/discord/discord-runtime-descriptor";
 import { ProgrammaticWorkflow } from "../../src/tool-server/tools/programmatic-workflow";
 import { DurableWorkflowStore } from "../../src/workflow/durable-workflow-store";
 import { startWorkflowActionResolver } from "../../src/workflow/workflow-action-resolver";
@@ -194,7 +195,7 @@ describe("unified workflow integration", () => {
     const projector = createWorkflowProgressProjectorForTest({
       bus,
       store,
-      adapters: new Map([["discord", adapter]]),
+      ports: new Map([["discord", createDiscordWorkflowProgressPort(adapter)]]),
       subscriptionId: "integration-projector",
       coalesceMs: 5,
       minEditIntervalMs: 0,
@@ -401,7 +402,7 @@ describe("unified workflow integration", () => {
     const firstProjector = createWorkflowProgressProjectorForTest({
       bus,
       store,
-      adapters: new Map([["discord", adapter]]),
+      ports: new Map([["discord", createDiscordWorkflowProgressPort(adapter)]]),
       subscriptionId: "restart-projector-first",
       coalesceMs: 5,
       minEditIntervalMs: 0,
@@ -466,7 +467,7 @@ describe("unified workflow integration", () => {
       restartedProjector = createWorkflowProgressProjectorForTest({
         bus,
         store,
-        adapters: new Map([["discord", adapter]]),
+        ports: new Map([["discord", createDiscordWorkflowProgressPort(adapter)]]),
         subscriptionId: "restart-projector-second",
         coalesceMs: 5,
         minEditIntervalMs: 0,

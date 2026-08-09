@@ -1,7 +1,9 @@
 import type { SurfaceMsgRef } from "@stanley2058/lilac-event-bus";
-import { Result } from "better-result";
+import { Result, type Result as ResultType } from "better-result";
 
-import type { SurfaceAdapter } from "../adapter";
+import { opaqueErrorMessage } from "@stanley2058/lilac-utils";
+
+import { preserveSurfacePanic, SurfaceMessageNotFoundError, type SurfaceAdapter } from "../adapter";
 import { parseRequestId } from "../bridge/request-ids";
 import type {
   SurfaceAdapterIngress,
@@ -10,9 +12,166 @@ import type {
   SurfaceReplyTargetInvalid,
   SurfaceRuntimeDescriptor,
   SurfaceWorkflowProgressPort,
+  WorkflowProgressCheckFailure,
+  WorkflowProgressEditFailure,
+  WorkflowProgressSendFailure,
 } from "../runtime-descriptor";
-import { SurfaceReplyTargetInvalid as ReplyTargetInvalid } from "../runtime-descriptor";
-import { SurfaceRefInvalid as RefInvalid } from "../runtime-descriptor";
+import {
+  SurfaceReplyTargetInvalid as ReplyTargetInvalid,
+  SurfaceRefInvalid as RefInvalid,
+  WorkflowProgressOperationFailed,
+} from "../runtime-descriptor";
+
+type DiscordWorkflowProgressOperation = "check-message" | "send" | "edit";
+
+function discordWorkflowProgressFailure(
+  operation: DiscordWorkflowProgressOperation,
+  message: string,
+): { readonly kind: "failed"; readonly error: WorkflowProgressOperationFailed } {
+  return {
+    kind: "failed",
+    error: new WorkflowProgressOperationFailed({
+      operation,
+      message,
+    }),
+  };
+}
+
+export function captureDiscordWorkflowProgressCall<T>(input: {
+  readonly operation: "check-message";
+  readonly effect: () => Promise<T>;
+}): Promise<ResultType<T, WorkflowProgressCheckFailure>>;
+export function captureDiscordWorkflowProgressCall<T>(input: {
+  readonly operation: "send";
+  readonly effect: () => Promise<T>;
+}): Promise<ResultType<T, WorkflowProgressSendFailure<"discord">>>;
+export function captureDiscordWorkflowProgressCall<T>(input: {
+  readonly operation: "edit";
+  readonly effect: () => Promise<T>;
+}): Promise<ResultType<T, WorkflowProgressEditFailure>>;
+export async function captureDiscordWorkflowProgressCall<T>(input: {
+  readonly operation: DiscordWorkflowProgressOperation;
+  readonly effect: () => Promise<T>;
+}): Promise<
+  ResultType<
+    T,
+    | WorkflowProgressCheckFailure
+    | WorkflowProgressSendFailure<"discord">
+    | WorkflowProgressEditFailure
+  >
+> {
+  try {
+    return Result.ok(await input.effect());
+  } catch (cause) {
+    preserveSurfacePanic(cause);
+    const failureMessage =
+      cause instanceof Error
+        ? opaqueErrorMessage(cause, "Workflow progress surface call failed")
+        : "Opaque workflow progress surface failure";
+    const failed = discordWorkflowProgressFailure(input.operation, failureMessage);
+    if (cause instanceof SurfaceMessageNotFoundError) {
+      switch (input.operation) {
+        case "check-message":
+        case "send":
+          return Result.err(failed);
+        case "edit":
+          return Result.err({ kind: "not-found" });
+      }
+    }
+    return Result.err(failed);
+  }
+}
+
+export function createDiscordWorkflowProgressPort(
+  adapter: SurfaceAdapter,
+): SurfaceWorkflowProgressPort<"discord"> {
+  return {
+    checkMessage: async (target) => {
+      const checked = await captureDiscordWorkflowProgressCall({
+        operation: "check-message",
+        effect: () =>
+          adapter.readMsg({
+            platform: "discord",
+            channelId: target.channelId,
+            messageId: target.messageId,
+          }),
+      });
+      switch (checked.status) {
+        case "ok":
+          return Result.ok(checked.value ? "found" : "missing");
+        case "error":
+          switch (checked.error.kind) {
+            case "failed":
+              return Result.err(checked.error);
+          }
+      }
+    },
+    send: async (input) => {
+      const sent = await captureDiscordWorkflowProgressCall({
+        operation: "send",
+        effect: () =>
+          adapter.sendMsg(
+            { platform: "discord", channelId: input.channelId },
+            input.content,
+            input.replyToMessageId
+              ? {
+                  replyTo: {
+                    platform: "discord",
+                    channelId: input.channelId,
+                    messageId: input.replyToMessageId,
+                  },
+                  silent: input.silent,
+                }
+              : { silent: input.silent },
+          ),
+      });
+      switch (sent.status) {
+        case "ok":
+          switch (sent.value.platform) {
+            case "discord":
+              return Result.ok(sent.value);
+            case "github":
+              return Result.err({
+                kind: "failed",
+                error: new WorkflowProgressOperationFailed({
+                  operation: "send",
+                  message: "Discord workflow progress send returned a 'github' message",
+                }),
+              });
+          }
+        case "error":
+          switch (sent.error.kind) {
+            case "failed":
+              return Result.err(sent.error);
+          }
+      }
+    },
+    edit: async (target, content) => {
+      const edited = await captureDiscordWorkflowProgressCall({
+        operation: "edit",
+        effect: () =>
+          adapter.editMsg(
+            {
+              platform: "discord",
+              channelId: target.channelId,
+              messageId: target.messageId,
+            },
+            content,
+          ),
+      });
+      switch (edited.status) {
+        case "ok":
+          return Result.ok(undefined);
+        case "error":
+          switch (edited.error.kind) {
+            case "not-found":
+            case "failed":
+              return Result.err(edited.error);
+          }
+      }
+    },
+  };
+}
 
 function invalidInitialTarget(input: {
   readonly reason: SurfaceReplyTargetInvalid["reason"];
@@ -113,13 +272,12 @@ export function createDiscordSurfaceRuntimeDescriptor(input: {
   readonly adapter: SurfaceAdapter;
   readonly adapterIngress: SurfaceAdapterIngress<"discord">;
   readonly relay: SurfaceRelayDescriptor<"discord">;
-  readonly workflowProgress?: SurfaceWorkflowProgressPort<"discord">;
 }): SurfaceRuntimeDescriptor<"discord"> {
   return {
     platform: "discord",
     adapter: input.adapter,
     adapterIngress: input.adapterIngress,
     relay: input.relay,
-    ...(input.workflowProgress ? { workflowProgress: input.workflowProgress } : {}),
+    workflowProgress: createDiscordWorkflowProgressPort(input.adapter),
   };
 }

@@ -142,6 +142,16 @@ export const CORE_FINAL_EXCEPTION_IDENTITIES = [
   ["src/runtime/process-handlers.ts", "createProcessHandlers.handleSignal", "capture"],
   ["src/runtime/process-handlers.ts", "createProcessHandlers.handleFatal", "capture"],
   ["src/surface/adapter.ts", "preserveSurfacePanic", "signal"],
+  [
+    "src/surface/discord/discord-runtime-descriptor.ts",
+    "captureDiscordWorkflowProgressCall",
+    "capture",
+  ],
+  [
+    "src/surface/github/github-runtime-descriptor.ts",
+    "captureGithubWorkflowProgressCall",
+    "capture",
+  ],
   ["src/surface/bridge/bus-agent-runner.ts", "resolveCoreStableNamedContinuation", "signal"],
   [
     "src/surface/bridge/bus-agent-runner.ts",

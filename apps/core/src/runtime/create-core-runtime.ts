@@ -125,7 +125,7 @@ import { projectRuntimeError, safeRuntimeErrorText } from "./error-format";
 import { SqliteGracefulRestartStore, type GracefulRestartSnapshot } from "./graceful-restart-store";
 import {
   connectAndValidateSurfaceAdapters,
-  createSurfaceAdapterMap,
+  createSurfaceWorkflowProgressPortMap,
   disconnectSurfaceAdapters,
   restoreSurfaceRecovery,
   startSurfaceAdapterIngress,
@@ -1496,7 +1496,7 @@ export async function createCoreRuntime(
         }
         const registry = registryCreated.value;
         surfaceRuntimeRegistry = registry;
-        const workflowAdapters = createSurfaceAdapterMap(registry);
+        const workflowProgressPorts = createSurfaceWorkflowProgressPortMap(registry);
         if (startupConfig.tools.fsBackend === "fff") {
           void prewarmFffFinders({
             basePaths: ["/data", "/data/workspace", "/app", cwd],
@@ -1687,7 +1687,7 @@ export async function createCoreRuntime(
         workflowProgressProjector = new WorkflowProgressProjector({
           bus,
           store: durableWorkflowStore,
-          adapters: workflowAdapters,
+          ports: workflowProgressPorts,
           subscriptionId: subId(subscriptionPrefix, "workflow-progress"),
           reportFatalPanic: reportFatalError,
         });

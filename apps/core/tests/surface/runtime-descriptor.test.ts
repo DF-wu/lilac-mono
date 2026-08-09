@@ -1,20 +1,25 @@
-import { describe, expect, expectTypeOf, it } from "bun:test";
+import { describe, expect, expectTypeOf, it, spyOn } from "bun:test";
 import { Panic, Result } from "better-result";
 
+import { GithubApiError } from "../../src/github/github-api";
 import type {
   AdapterEventHandler,
   StartOutputOpts,
   SurfaceAdapter,
   SurfaceOutputStream,
 } from "../../src/surface/adapter";
+import { SurfaceMessageNotFoundError } from "../../src/surface/adapter";
 import {
   createDiscordRelayPolicy,
   createDiscordSurfaceRuntimeDescriptor,
+  createDiscordWorkflowProgressPort,
 } from "../../src/surface/discord/discord-runtime-descriptor";
+import { GithubMessageCreatedError } from "../../src/surface/github/github-adapter";
 import {
   createConfiguredGithubSurfaceRuntimeDescriptor,
   createGithubRelayPolicy,
   createGithubSurfaceRuntimeDescriptor,
+  createGithubWorkflowProgressPort,
 } from "../../src/surface/github/github-runtime-descriptor";
 import {
   type RegisteredSurfacePlatform,
@@ -25,7 +30,8 @@ import {
   type SurfaceRequestIngress,
   type SurfaceRuntimeDescriptor,
   SurfaceRuntimeRegistry,
-  type SurfaceWorkflowProgressPort,
+  type WorkflowProgressCheckFailure,
+  type WorkflowProgressSendFailure,
 } from "../../src/surface/runtime-descriptor";
 import type {
   ContentOpts,
@@ -73,7 +79,9 @@ class TestAdapter implements SurfaceAdapter {
   }
 
   async sendMsg(sessionRef: SessionRef, _content: ContentOpts, _opts?: SendOpts): Promise<MsgRef> {
-    return { platform: "discord", channelId: sessionRef.channelId, messageId: "message" };
+    return sessionRef.platform === "discord"
+      ? { platform: "discord", channelId: sessionRef.channelId, messageId: "message" }
+      : { platform: "github", channelId: sessionRef.channelId, messageId: "message" };
   }
 
   async readMsg(_msgRef: MsgRef): Promise<SurfaceMessage | null> {
@@ -154,24 +162,6 @@ function githubRelay(): SurfaceRelayDescriptor<"github"> {
   };
 }
 
-function discordWorkflowProgress(): SurfaceWorkflowProgressPort<"discord"> {
-  return {
-    checkMessage: async () => Result.ok("found"),
-    send: async (session) =>
-      Result.ok({ platform: "discord", channelId: session.channelId, messageId: "message" }),
-    edit: async () => Result.ok(undefined),
-  };
-}
-
-function githubWorkflowProgress(): SurfaceWorkflowProgressPort<"github"> {
-  return {
-    checkMessage: async () => Result.ok("found"),
-    send: async (session) =>
-      Result.ok({ platform: "github", channelId: session.channelId, messageId: "message" }),
-    edit: async () => Result.ok(undefined),
-  };
-}
-
 function discordDescriptor(
   adapter: SurfaceAdapter = new TestAdapter("discord"),
 ): SurfaceRuntimeDescriptor<"discord"> {
@@ -179,7 +169,6 @@ function discordDescriptor(
     adapter,
     adapterIngress: discordAdapterIngress(),
     relay: discordRelay(),
-    workflowProgress: discordWorkflowProgress(),
   });
 }
 
@@ -190,7 +179,6 @@ function githubDescriptor(
     adapter,
     requestIngress: requestIngress(),
     relay: githubRelay(),
-    workflowProgress: githubWorkflowProgress(),
   });
 }
 
@@ -216,16 +204,33 @@ describe("surface runtime descriptor factories", () => {
     >().toEqualTypeOf<false>();
   });
 
+  it("excludes operation outcomes that protocol ports cannot produce", () => {
+    type Created = {
+      readonly kind: "created";
+      readonly ref: {
+        readonly platform: "github";
+        readonly channelId: string;
+        readonly messageId: string;
+      };
+    };
+
+    expectTypeOf<IsAssignable<Created, WorkflowProgressCheckFailure>>().toEqualTypeOf<false>();
+    expectTypeOf<
+      IsAssignable<Created, WorkflowProgressSendFailure<"discord">>
+    >().toEqualTypeOf<false>();
+    expectTypeOf<
+      IsAssignable<Created, WorkflowProgressSendFailure<"github">>
+    >().toEqualTypeOf<true>();
+  });
+
   it("assembles every existing Discord subsystem without adding generic sidecars", () => {
     const adapter = new TestAdapter("discord");
     const adapterIngress = discordAdapterIngress();
     const relay = discordRelay();
-    const workflowProgress = discordWorkflowProgress();
     const descriptor = createDiscordSurfaceRuntimeDescriptor({
       adapter,
       adapterIngress,
       relay,
-      workflowProgress,
     });
 
     expect(descriptor).toEqual({
@@ -233,7 +238,7 @@ describe("surface runtime descriptor factories", () => {
       adapter,
       adapterIngress,
       relay,
-      workflowProgress,
+      workflowProgress: descriptor.workflowProgress,
     });
     expect("requestIngress" in descriptor).toBe(false);
     expect("health" in descriptor).toBe(false);
@@ -241,22 +246,20 @@ describe("surface runtime descriptor factories", () => {
     expect("refs" in descriptor.relay!).toBe(true);
   });
 
-  it("keeps GitHub request ingress, relay, and workflow progress independently optional", () => {
+  it("exposes GitHub workflow progress only with authenticated request ingress", () => {
     for (const requestIngressEnabled of [false, true]) {
       for (const relayEnabled of [false, true]) {
-        for (const workflowProgressEnabled of [false, true]) {
-          const descriptor = createGithubSurfaceRuntimeDescriptor({
-            adapter: new TestAdapter("github"),
-            ...(requestIngressEnabled ? { requestIngress: requestIngress() } : {}),
-            ...(relayEnabled ? { relay: githubRelay() } : {}),
-            ...(workflowProgressEnabled ? { workflowProgress: githubWorkflowProgress() } : {}),
-          });
+        const descriptor = createGithubSurfaceRuntimeDescriptor({
+          adapter: new TestAdapter("github"),
+          ...(requestIngressEnabled ? { requestIngress: requestIngress() } : {}),
+          ...(relayEnabled ? { relay: githubRelay() } : {}),
+        });
 
-          expect("requestIngress" in descriptor).toBe(requestIngressEnabled);
-          expect("relay" in descriptor).toBe(relayEnabled);
-          expect("workflowProgress" in descriptor).toBe(workflowProgressEnabled);
-          expect("adapterIngress" in descriptor).toBe(false);
-        }
+        expect("requestIngress" in descriptor).toBe(requestIngressEnabled);
+        expect("relay" in descriptor).toBe(relayEnabled);
+        expect(descriptor.workflowProgress === undefined).toBe(!requestIngressEnabled);
+        expect("workflowProgress" in descriptor).toBe(requestIngressEnabled);
+        expect("adapterIngress" in descriptor).toBe(false);
       }
     }
   });
@@ -273,14 +276,12 @@ describe("surface runtime descriptor factories", () => {
       const adapter = new TestAdapter("github");
       const ingress = requestIngress();
       const relay = githubRelay();
-      const workflowProgress = githubWorkflowProgress();
       const descriptor = createConfiguredGithubSurfaceRuntimeDescriptor({
         adapter,
         webhookSecret: webhookConfigured ? "webhook-secret" : undefined,
         appCredentialsAvailable,
         requestIngress: ingress,
         relay,
-        workflowProgress,
         logger: {
           info: (message, context) => logs.push({ level: "info", message, context }),
           warn: (message, context) => logs.push({ level: "warn", message, context }),
@@ -291,7 +292,7 @@ describe("surface runtime descriptor factories", () => {
       expect(descriptor.adapter).toBe(adapter);
       expect(descriptor.requestIngress).toBe(requestIngressAvailable ? ingress : undefined);
       expect(descriptor.relay).toBe(appCredentialsAvailable ? relay : undefined);
-      expect(descriptor.workflowProgress).toBe(workflowProgress);
+      expect("workflowProgress" in descriptor).toBe(requestIngressAvailable);
       if (descriptor.relay) expect("refs" in descriptor.relay).toBe(true);
       expect(logs).toEqual([
         ...(requestIngressAvailable
@@ -321,6 +322,85 @@ describe("surface runtime descriptor factories", () => {
       ]);
     },
   );
+});
+
+describe("surface workflow progress ports", () => {
+  it("constructs protocol refs and preserves action content and silent reply options", async () => {
+    const adapter = new TestAdapter("discord");
+    const send = spyOn(adapter, "sendMsg");
+    const port = createDiscordWorkflowProgressPort(adapter);
+    const content = {
+      text: "Queued",
+      actions: [{ actionId: "action-token", label: "Cancel", style: "danger" as const }],
+    };
+
+    const sent = await port.send({
+      channelId: "channel",
+      content,
+      replyToMessageId: "origin",
+      silent: true,
+    });
+
+    expect(sent).toEqual(
+      Result.ok({ platform: "discord", channelId: "channel", messageId: "message" }),
+    );
+    expect(send).toHaveBeenCalledWith({ platform: "discord", channelId: "channel" }, content, {
+      replyTo: { platform: "discord", channelId: "channel", messageId: "origin" },
+      silent: true,
+    });
+  });
+
+  it("returns closed Discord and GitHub failure outcomes and preserves Panic", async () => {
+    const discordAdapter = new TestAdapter("discord");
+    const discordPort = createDiscordWorkflowProgressPort(discordAdapter);
+    spyOn(discordAdapter, "editMsg").mockRejectedValue(
+      new SurfaceMessageNotFoundError("discord", 10008, "missing"),
+    );
+    expect(
+      await discordPort.edit({ channelId: "channel", messageId: "missing" }, { text: "edit" }),
+    ).toEqual(Result.err({ kind: "not-found" }));
+
+    const githubAdapter = new TestAdapter("github");
+    const githubPort = createGithubWorkflowProgressPort(githubAdapter);
+    const createdRef = { platform: "github" as const, channelId: "octo/repo#1", messageId: "42" };
+    spyOn(githubAdapter, "sendMsg").mockRejectedValue(
+      new GithubMessageCreatedError(createdRef, new Error("action edit failed")),
+    );
+    expect(
+      await githubPort.send({ channelId: "octo/repo#1", content: { text: "Queued" } }),
+    ).toEqual(Result.err({ kind: "created", ref: createdRef }));
+
+    spyOn(githubAdapter, "editMsg").mockRejectedValue(
+      new GithubApiError(404, "/repos/octo/repo/issues/comments/42", "missing"),
+    );
+    expect(
+      await githubPort.edit({ channelId: "octo/repo#1", messageId: "42" }, { text: "edit" }),
+    ).toEqual(Result.err({ kind: "not-found" }));
+
+    const panic = new Panic({ message: "workflow progress defect" });
+    spyOn(githubAdapter, "readMsg").mockRejectedValue(panic);
+    await expect(
+      githubPort.checkMessage({ channelId: "octo/repo#1", messageId: "42" }),
+    ).rejects.toBe(panic);
+  });
+
+  it("maps non-Error rejections to an opaque local failure", async () => {
+    const adapter = new TestAdapter("discord");
+    const port = createDiscordWorkflowProgressPort(adapter);
+    spyOn(adapter, "sendMsg").mockRejectedValue("provider-secret-rejection");
+
+    const sent = await port.send({ channelId: "channel", content: { text: "Queued" } });
+
+    expect(sent.status).toBe("error");
+    if (sent.status === "error") {
+      switch (sent.error.kind) {
+        case "failed":
+          expect(sent.error.error.message).toBe("Opaque workflow progress surface failure");
+          expect(sent.error.error.message).not.toContain("provider-secret-rejection");
+          break;
+      }
+    }
+  });
 });
 
 describe("surface relay policies", () => {

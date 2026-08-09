@@ -923,6 +923,27 @@ const CORE_ADAPTER_EVENT_EXCEPTION_ADAPTERS = [
     direction: "observe-panic",
     reason: "Preserves exact Panic identity at the GitHub acknowledgement deletion boundary.",
   },
+  ...[
+    [
+      "src/surface/discord/discord-runtime-descriptor.ts",
+      "captureDiscordWorkflowProgressCall",
+      "Discord",
+    ],
+    [
+      "src/surface/github/github-runtime-descriptor.ts",
+      "captureGithubWorkflowProgressCall",
+      "GitHub",
+    ],
+  ].map(([module, exportName, platform]) => ({
+    identity: { module, exportName },
+    category: "external-to-result" as const,
+    externalApi: {
+      package: "@stanley2058/lilac-core",
+      exportName: "SurfaceAdapter workflow progress operation",
+    },
+    direction: "capture-external" as const,
+    reason: `Captures a ${platform} surface adapter rejection into the protocol-owned workflow progress Result contract.`,
+  })),
 ] as const satisfies readonly ExceptionAdapter[];
 
 const CORE_TOOL_SERVER_BOUNDARY_DECODERS = [
@@ -8522,6 +8543,18 @@ const REVIEWED_INJECTED_EXTERNAL_EFFECT_KEYS = new Set([
     "deleteGithubAcknowledgement",
     "capture-external",
   ),
+  preciseExceptionAdapterKey(
+    "apps/core",
+    "src/surface/discord/discord-runtime-descriptor.ts",
+    "captureDiscordWorkflowProgressCall",
+    "capture-external",
+  ),
+  preciseExceptionAdapterKey(
+    "apps/core",
+    "src/surface/github/github-runtime-descriptor.ts",
+    "captureGithubWorkflowProgressCall",
+    "capture-external",
+  ),
 ]);
 
 function exceptionAdapterSyntaxKinds(
@@ -8662,7 +8695,7 @@ function approvedExceptionAdapterCatalogSha256(
 }
 
 export const APPROVED_EXCEPTION_ADAPTER_CATALOG_SHA256 =
-  "d6e97203a7f0f916f3c30677c53ec268b58cf628903dbcbec5713b9011f8786c";
+  "d2563db6d6b358459218f7651a077e7d2d32bb324787d4395388109bc2e8beae";
 
 export const architectureManifest = {
   version: 1,

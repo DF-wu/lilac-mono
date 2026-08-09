@@ -3,6 +3,7 @@ import type { AgentRunnerRecoveryEntry } from "../surface/bridge/bus-agent-runne
 import type { BusToAdapterRelaySnapshot } from "../surface/bridge/subscribe-from-bus";
 import type {
   RegisteredSurfacePlatform,
+  RegisteredSurfaceWorkflowProgressPort,
   SurfaceAdapterIngressHandle,
   SurfaceRelayHandle,
   SurfaceRequestIngressHandle,
@@ -82,10 +83,16 @@ function adapterIngressStopLabel(platform: RegisteredSurfacePlatform, graceful: 
   }
 }
 
-export function createSurfaceAdapterMap(
+export function createSurfaceWorkflowProgressPortMap(
   registry: SurfaceRuntimeRegistry,
-): Map<RegisteredSurfacePlatform, SurfaceAdapter> {
-  return new Map(registry.entries().map((descriptor) => [descriptor.platform, descriptor.adapter]));
+): Map<RegisteredSurfacePlatform, RegisteredSurfaceWorkflowProgressPort> {
+  const ports = new Map<RegisteredSurfacePlatform, RegisteredSurfaceWorkflowProgressPort>();
+  for (const descriptor of registry.entries()) {
+    if (descriptor.workflowProgress) {
+      ports.set(descriptor.platform, descriptor.workflowProgress);
+    }
+  }
+  return ports;
 }
 
 export async function startSurfaceAdapterIngress(input: {
