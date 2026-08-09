@@ -162,9 +162,10 @@ A wire-valid platform is not therefore an implemented or registered Core surface
 
 The registry is internal runtime composition, not a dynamic plugin or capability API. Discord health,
 search/storage, request routing and sidecars remain protocol-owned; GitHub webhook verification remains
-protocol-owned; workflow reply waits remain Discord-only. Before registering a third platform, complete
-Part 2 in `plan/third-platform-surface-readiness.md` so refs, persistence, workflow authorization,
-authenticated principals, plugin contracts, and recovery codecs are widened deliberately.
+protocol-owned; workflow reply waits remain Discord-only. Before planning another platform, complete
+Part 2 in `plan/surface-adapter-contract-readiness.md` so Discord and GitHub establish the canonical
+operation, ref-correlation, persistence, workflow, authenticated-principal, plugin, and recovery contracts
+that a future adapter must follow.
 
 ### Router
 

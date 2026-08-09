@@ -3,7 +3,7 @@
 Status: completed production-behavior-preserving refactor with malformed-header hardening.
 
 This is Part 1 of the surface extension work. Part 2 is
-`plan/third-platform-surface-readiness.md`.
+`plan/surface-adapter-contract-readiness.md`.
 
 Part 1 centralizes the runtime composition of the existing Discord and GitHub surfaces without claiming
 that another `AdapterPlatform` is supported. It preserves current wire formats, persisted data, external
@@ -186,7 +186,8 @@ There is no capability-advice layer. Remove `SurfaceAdapter.getCapabilities()` a
 fine-grained operations will succeed.
 
 The adapter call is authoritative. Part 1 preserves the existing operation result contract while Part 2
-introduces a typed `SurfaceOperationUnsupported` result for optional user/tool operations.
+migrates Discord and GitHub to typed operation Results, including `SurfaceOperationUnsupported` for
+optional user/tool operations.
 
 Prefer making `SurfaceOutputStream.push()` total over all `SurfaceOutputPart` members. An adapter may
 render or intentionally ignore reasoning, tool status, stats, attachments, or another optional
@@ -304,7 +305,7 @@ Descriptors own only protocol decisions:
 
 The relay pushes normalized output parts to the selected output stream. The output stream renders or
 intentionally ignores optional presentation parts. Unsupported generic CRUD/tool operations are outside
-the relay and become typed runtime operation results in Part 2.
+the relay. Part 2 migrates both existing adapters and their callers to typed runtime operation Results.
 
 `request_client` is required alongside `request_id` and `session_id` for the three relay-consumed event
 paths. Missing values use the existing required-header error category and `park-pending`; explicit
@@ -337,7 +338,7 @@ port until a second surface has a real, comparable health signal.
 The request router is another protocol-owned subsystem. Part 1 gives it a Discord-specific public input
 type and Discord-owned module/name, with a runtime invariant as additional defense. It does not thread a
 generic platform only through publish headers while request composition remains Discord-specific. A
-future platform that needs message routing requires a separate routing design in Part 2.
+future platform that needs message routing requires a separate platform-addition design.
 
 ## Implementation Sequence
 
@@ -408,7 +409,8 @@ headers, and relay-finalization characterization. It is not a separate architect
 - Run `bun run test:all`, `bun run typecheck`, `bun run lint:fix`, and `bun run fmt`.
 - Update `PROJECT.md` with the descriptor registry and the distinction between registered Core surfaces
   and wire-level `AdapterPlatform` values.
-- Document that Part 2 is required before registering a third platform.
+- Document that Part 2 makes Discord and GitHub the reference contracts required before a separate
+  platform-addition plan can register another surface.
 
 ## Blast Radius
 
