@@ -94,6 +94,11 @@ describe("GitHub relay acknowledgement finalization", () => {
       expect(cleaned.status).toBe("error");
       if (cleaned.status === "error") {
         expect(cleaned.error._tag).toBe("SurfaceIngressAcknowledgementCleanupFailed");
+        expect(cleaned.error.cause).toMatchObject({
+          errorTag: "GithubAcknowledgementDeleteFailed",
+          errorMessage: "Failed to delete GitHub acknowledgement reaction",
+        });
+        expect(JSON.stringify(cleaned.error.cause)).not.toContain("GitHub API unavailable");
       }
       expect(getGithubAck(requestId)).toBeUndefined();
       expect(warning).not.toHaveBeenCalled();

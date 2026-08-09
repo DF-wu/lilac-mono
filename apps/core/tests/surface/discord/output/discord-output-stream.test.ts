@@ -716,7 +716,7 @@ describe("Discord compact progress integration", () => {
 });
 
 describe("preview reanchor behavior", () => {
-  it("reports reasoning as ignored when reasoning display is disabled", async () => {
+  it("reports hidden reasoning as terminal without rendering it", async () => {
     const { client, operations } = createFakeDiscordClient();
     const out = new DiscordOutputStream({
       client,
@@ -732,7 +732,7 @@ describe("preview reanchor behavior", () => {
         type: "reasoning.status",
         update: { startedAtMs: 1, detailText: "hidden" },
       }),
-    ).resolves.toBe("ignored");
+    ).resolves.toBe("terminal");
     expect(operations).toEqual([]);
   });
 

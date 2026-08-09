@@ -91,6 +91,10 @@ export type SurfaceRelayRefs<P extends RegisteredSurfacePlatform> = {
 export class SurfaceIngressAcknowledgementCleanupFailed extends TaggedError(
   "SurfaceIngressAcknowledgementCleanupFailed",
 )<{
+  readonly cause: {
+    readonly errorTag: string;
+    readonly errorMessage: string;
+  };
   readonly message: string;
 }> {}
 

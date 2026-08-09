@@ -21,12 +21,14 @@ import {
   CoreEventBusCleanupFailed,
   CoreEventBusSetupFailed,
   type CoreResidualDiscordRequestRouterDoneOutcome,
+  type CoreRuntimeCleanupFailure,
   createCoreEventBusDeliveryOptions,
   createCoreEventBusFatalReporter,
   createCoreEventBusLogger,
   createCoreRuntimeCleanupSupervisor,
   createCoreRuntimeFatalReporter,
   retainCoreResidualDiscordRequestRouter,
+  selectCoreRuntimeStopPass,
   settleCoreResidualDiscordRequestRouterDone,
   stopCoreResidualDiscordRequestRouter,
   superviseDetachedCoreConfigValidation,
@@ -381,6 +383,136 @@ describe("Core runtime startup", () => {
     if (!supervision) throw new Error("expected replacement done supervision");
     await settleCoreResidualDiscordRequestRouterDone({ supervision, cleanup });
     expect(cleanup.panics).toEqual([donePanic]);
+  });
+
+  it("runs full cleanup once across residual-router stop re-entry and eventual release", async () => {
+    const fullCleanupOperations = [
+      "agentRunner.stop",
+      "mcpOAuthCallback.stop",
+      "mcpRegistry.shutdown",
+      "durableWorkflowStore.close",
+      "transcriptStore.close",
+      "bus.close",
+    ] as const;
+    const fullCleanupCounts = new Map(fullCleanupOperations.map((operation) => [operation, 0]));
+    const failures = [
+      new ResidualDiscordRequestRouterStopFailed({
+        failures: [
+          new EventDeliveryStopFailed({
+            topic: "evt.request",
+            cause: new Error("initial residual stop failed"),
+            message: "initial residual stop failed",
+          }),
+        ],
+        message: "Initial residual router cleanup failed",
+      }),
+      new ResidualDiscordRequestRouterStopFailed({
+        failures: [
+          new EventDeliveryStopFailed({
+            topic: "evt.request",
+            cause: new Error("residual retry failed"),
+            message: "residual retry failed",
+          }),
+        ],
+        message: "Residual router cleanup retry failed",
+      }),
+    ] as const;
+    const stopPasses: string[] = [];
+    const cleanupFailures: Array<readonly CoreRuntimeCleanupFailure[]> = [];
+    let fullCleanupPending = true;
+    let residualStopAttempts = 0;
+    let residualDoneSettlements = 0;
+    let residualRouter: ResidualDiscordRequestRouter | null = null;
+    const residualDoneSupervisions: Array<Promise<CoreResidualDiscordRequestRouterDoneOutcome>> =
+      [];
+
+    const retainResidualRouter = (router: ResidualDiscordRequestRouter): void => {
+      retainCoreResidualDiscordRequestRouter({
+        router,
+        retainRouter: (retained) => {
+          residualRouter = retained;
+        },
+        retainDoneSupervision: (supervision) => {
+          residualDoneSupervisions.push(
+            supervision.then((outcome) => {
+              residualDoneSettlements += 1;
+              return outcome;
+            }),
+          );
+        },
+      });
+    };
+    const createResidualRouter = (): ResidualDiscordRequestRouter => ({
+      done: Promise.resolve(Result.ok(undefined)),
+      stop: async () => {
+        const failure = failures[residualStopAttempts];
+        residualStopAttempts += 1;
+        if (!failure) {
+          return { kind: "result", result: Result.ok(undefined), residualRouter: null };
+        }
+        const replacement = createResidualRouter();
+        return { kind: "result", result: Result.err(failure), residualRouter: replacement };
+      },
+    });
+    retainResidualRouter(createResidualRouter());
+
+    const stopRuntime = async (): Promise<void> => {
+      const stopPass = selectCoreRuntimeStopPass({
+        fullCleanupPending,
+        hasResidualRouter: residualRouter !== null,
+      });
+      if (stopPass === "none") return;
+      stopPasses.push(stopPass);
+      const cleanup = createCoreRuntimeCleanupSupervisor(null);
+
+      if (stopPass === "full") {
+        for (const operation of fullCleanupOperations) {
+          await cleanup.run(operation, async () => {
+            fullCleanupCounts.set(operation, (fullCleanupCounts.get(operation) ?? 0) + 1);
+          });
+        }
+      }
+
+      if (residualRouter) {
+        const replacement = await stopCoreResidualDiscordRequestRouter({
+          router: residualRouter,
+          cleanup,
+        });
+        residualRouter = null;
+        if (replacement) retainResidualRouter(replacement);
+      }
+
+      if (stopPass === "full") fullCleanupPending = false;
+      for (const supervision of residualDoneSupervisions) {
+        await settleCoreResidualDiscordRequestRouterDone({ supervision, cleanup });
+      }
+      residualDoneSupervisions.length = 0;
+      cleanupFailures.push(cleanup.failures);
+      cleanup.finish();
+    };
+
+    await stopRuntime();
+    await stopRuntime();
+    await stopRuntime();
+    await stopRuntime();
+
+    expect(stopPasses).toEqual(["full", "residual-router", "residual-router"]);
+    expect(Object.fromEntries(fullCleanupCounts)).toEqual({
+      "agentRunner.stop": 1,
+      "mcpOAuthCallback.stop": 1,
+      "mcpRegistry.shutdown": 1,
+      "durableWorkflowStore.close": 1,
+      "transcriptStore.close": 1,
+      "bus.close": 1,
+    });
+    expect(residualStopAttempts).toBe(3);
+    expect(residualDoneSettlements).toBe(3);
+    expect(residualRouter).toBeNull();
+    expect(cleanupFailures).toEqual([
+      [{ label: "residualRouter.stop", error: failures[0].message, panic: false }],
+      [{ label: "residualRouter.stop", error: failures[1].message, panic: false }],
+      [],
+    ]);
   });
 });
 

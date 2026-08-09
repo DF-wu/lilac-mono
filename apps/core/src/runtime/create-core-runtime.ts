@@ -454,6 +454,17 @@ export function settleCoreResidualDiscordRequestRouterDone(params: {
   }
 }
 
+export type CoreRuntimeStopPass = "none" | "full" | "residual-router";
+
+export function selectCoreRuntimeStopPass(params: {
+  readonly fullCleanupPending: boolean;
+  readonly hasResidualRouter: boolean;
+}): CoreRuntimeStopPass {
+  if (params.fullCleanupPending) return "full";
+  if (params.hasResidualRouter) return "residual-router";
+  return "none";
+}
+
 export function createCoreEventBusDeliveryOptions(params: {
   readonly redis: Redis;
   readonly deadLetterEncryptionKey: Uint8Array;
@@ -1078,6 +1089,7 @@ export async function createCoreRuntime(
   let conversationThreadMaterializer: ConversationThreadMaterializer | null = null;
 
   let started = false;
+  let fullCleanupPending = false;
 
   const connectedSurfaceAdapters: ConnectedSurfaceAdapters = new Map();
   const surfaceAdapterIngressHandles: SurfaceAdapterIngressHandles = new Map();
@@ -1557,6 +1569,7 @@ export async function createCoreRuntime(
   async function start(): Promise<CoreRuntimeStartOutcome> {
     if (started) return { kind: "result", result: Result.ok(undefined) };
     started = true;
+    fullCleanupPending = true;
     routerSubscriptionHealthy = true;
     conversationThreadSummarizationStopping = false;
 
@@ -2234,14 +2247,24 @@ export async function createCoreRuntime(
   }
 
   async function stop(priorPanic: Panic | null = null): Promise<void> {
-    if (!started && !residualRouter) return;
+    const stopPass = selectCoreRuntimeStopPass({
+      fullCleanupPending,
+      hasResidualRouter: residualRouter !== null,
+    });
+    if (stopPass === "none") return;
     started = false;
     conversationThreadSummarizationStopping = true;
 
     const cleanup = createCoreRuntimeCleanupSupervisor(priorPanic);
     const safe = cleanup.run;
 
-    if (runtimeFullyStarted && stopAgentRunner && gracefulRestartStore && surfaceRuntimeRegistry) {
+    if (
+      stopPass === "full" &&
+      runtimeFullyStarted &&
+      stopAgentRunner &&
+      gracefulRestartStore &&
+      surfaceRuntimeRegistry
+    ) {
       const agentRunner = stopAgentRunner;
       const registry = surfaceRuntimeRegistry;
 
@@ -2360,69 +2383,74 @@ export async function createCoreRuntime(
       }
     }
 
-    // Stop in reverse order (best-effort).
-    await safe("agentRunner.stop", () => stopAgentRunner?.stop() ?? Promise.resolve());
-    await safe(
-      "workflowLiveParentBridge.stop",
-      () => workflowLiveParentBridge?.stop() ?? Promise.resolve(),
-    );
-    workflowLiveParentBridge = null;
-    workflowSubagentDispatcher = null;
-    await safe(
-      "conversationThreadWorker.stop",
-      () => stopConversationThreadWorker?.stop() ?? Promise.resolve(),
-    );
-    await safe(
-      "conversationThreadSummarizationWorker.stop",
-      () => stopConversationThreadSummarizationWorker?.stop() ?? Promise.resolve(),
-    );
-    conversationThreadSummarizationRunner = null;
-    const heartbeat = stopHeartbeat;
-    await cleanup.runOutcome(
-      "heartbeat.stop",
-      heartbeat ? () => heartbeat.stopOutcome() : undefined,
-    );
-    await safe(
-      "workflowTriggerScheduler.stop",
-      () => workflowTriggerScheduler?.stop() ?? Promise.resolve(),
-    );
-    workflowTriggerScheduler = null;
-    await safe(
-      "workflowWaitResolver.stop",
-      () => workflowWaitResolver?.stop() ?? Promise.resolve(),
-    );
-    workflowWaitResolver = null;
-    await safe("workflowEngine.stop", () => workflowEngine?.stop() ?? Promise.resolve());
-    workflowEngine = null;
-    await safe(
-      "workflowProgressProjector.stop",
-      () => workflowProgressProjector?.stop() ?? Promise.resolve(),
-    );
-    workflowProgressProjector = null;
-    await safe(
-      "discordSearchIndexer.stop",
-      () => stopDiscordSearchIndexer?.stop() ?? Promise.resolve(),
-    );
-    stopDiscordSearchIndexer = null;
     const registry = surfaceRuntimeRegistry;
-    if (registry) {
-      await stopSurfaceOutputs({
-        registry,
-        runCleanup: safe,
-        relays: surfaceRelayHandles,
-        requestIngress: surfaceRequestIngressHandles,
-      });
-    }
+    if (stopPass === "full") {
+      // Stop in reverse order (best-effort).
+      await safe("agentRunner.stop", () => stopAgentRunner?.stop() ?? Promise.resolve());
+      await safe(
+        "workflowLiveParentBridge.stop",
+        () => workflowLiveParentBridge?.stop() ?? Promise.resolve(),
+      );
+      workflowLiveParentBridge = null;
+      workflowSubagentDispatcher = null;
+      await safe(
+        "conversationThreadWorker.stop",
+        () => stopConversationThreadWorker?.stop() ?? Promise.resolve(),
+      );
+      await safe(
+        "conversationThreadSummarizationWorker.stop",
+        () => stopConversationThreadSummarizationWorker?.stop() ?? Promise.resolve(),
+      );
+      conversationThreadSummarizationRunner = null;
+      const heartbeat = stopHeartbeat;
+      await cleanup.runOutcome(
+        "heartbeat.stop",
+        heartbeat ? () => heartbeat.stopOutcome() : undefined,
+      );
+      await safe(
+        "workflowTriggerScheduler.stop",
+        () => workflowTriggerScheduler?.stop() ?? Promise.resolve(),
+      );
+      workflowTriggerScheduler = null;
+      await safe(
+        "workflowWaitResolver.stop",
+        () => workflowWaitResolver?.stop() ?? Promise.resolve(),
+      );
+      workflowWaitResolver = null;
+      await safe("workflowEngine.stop", () => workflowEngine?.stop() ?? Promise.resolve());
+      workflowEngine = null;
+      await safe(
+        "workflowProgressProjector.stop",
+        () => workflowProgressProjector?.stop() ?? Promise.resolve(),
+      );
+      workflowProgressProjector = null;
+      await safe(
+        "discordSearchIndexer.stop",
+        () => stopDiscordSearchIndexer?.stop() ?? Promise.resolve(),
+      );
+      stopDiscordSearchIndexer = null;
+      if (registry) {
+        await stopSurfaceOutputs({
+          registry,
+          runCleanup: safe,
+          relays: surfaceRelayHandles,
+          requestIngress: surfaceRequestIngressHandles,
+        });
+      }
 
-    await safe("toolServer.stop", () => toolServer?.stop() ?? Promise.resolve());
-    await safe(
-      "conversationThreadMaterializer.stop",
-      () => conversationThreadMaterializer?.stop() ?? Promise.resolve(),
-    );
-    conversationThreadMaterializer = null;
-    await safe("mcpOAuthCallback.stop", () => mcpOAuthCallback.stop());
-    await safe("mcpRegistry.shutdown", () => mcpRegistry.shutdown());
-    await safe("requestMessageCache.stop", () => requestMessageCache?.stop() ?? Promise.resolve());
+      await safe("toolServer.stop", () => toolServer?.stop() ?? Promise.resolve());
+      await safe(
+        "conversationThreadMaterializer.stop",
+        () => conversationThreadMaterializer?.stop() ?? Promise.resolve(),
+      );
+      conversationThreadMaterializer = null;
+      await safe("mcpOAuthCallback.stop", () => mcpOAuthCallback.stop());
+      await safe("mcpRegistry.shutdown", () => mcpRegistry.shutdown());
+      await safe(
+        "requestMessageCache.stop",
+        () => requestMessageCache?.stop() ?? Promise.resolve(),
+      );
+    }
 
     if (residualRouter) {
       const replacementRouter = await stopCoreResidualDiscordRequestRouter({
@@ -2443,63 +2471,66 @@ export async function createCoreRuntime(
       }
     }
 
-    await safe("router.stop", () => stopRouter?.stop() ?? Promise.resolve());
-    stopRouter = null;
-    await safe("router.done", () => routerSupervision ?? Promise.resolve());
-    routerSupervision = null;
-    await safe(
-      "workflowActions.stop",
-      () => stopWorkflowActionResolver?.stop() ?? Promise.resolve(),
-    );
-    stopWorkflowActionResolver = null;
-    if (registry) {
-      await stopSurfaceAdapterIngress({
-        registry,
-        handles: surfaceAdapterIngressHandles,
-        runCleanup: safe,
-        graceful: false,
-      });
+    if (stopPass === "full") {
+      await safe("router.stop", () => stopRouter?.stop() ?? Promise.resolve());
+      stopRouter = null;
+      await safe("router.done", () => routerSupervision ?? Promise.resolve());
+      routerSupervision = null;
+      await safe(
+        "workflowActions.stop",
+        () => stopWorkflowActionResolver?.stop() ?? Promise.resolve(),
+      );
+      stopWorkflowActionResolver = null;
+      if (registry) {
+        await stopSurfaceAdapterIngress({
+          registry,
+          handles: surfaceAdapterIngressHandles,
+          runCleanup: safe,
+          graceful: false,
+        });
 
-      await disconnectSurfaceAdapters({
-        registry,
-        runCleanup: safe,
-        connected: connectedSurfaceAdapters,
+        await disconnectSurfaceAdapters({
+          registry,
+          runCleanup: safe,
+          connected: connectedSurfaceAdapters,
+        });
+        surfaceRuntimeRegistry = null;
+      }
+      await safe("durableWorkflowStore.close", async () => durableWorkflowStore.close());
+      await safe("discoveryService.close", async () => {
+        discoveryService?.close();
+        discoveryService = null;
       });
-      surfaceRuntimeRegistry = null;
+      await safe("transcriptStore.close", async () => {
+        transcriptStore?.close();
+        transcriptStore = null;
+      });
+      await safe("discordSearchStore.close", async () => {
+        discordSearchStore?.close();
+        discordSearchStore = null;
+        discordSearchService = null;
+      });
+      await safe("discordSurfaceStore.close", async () => {
+        discordSurfaceStore?.close();
+        discordSurfaceStore = null;
+      });
+      await safe("conversationThreadStore.close", async () => {
+        conversationThreadStore?.close();
+        conversationThreadStore = null;
+        conversationThreadService = null;
+      });
+      await safe("gracefulRestartStore.close", async () => {
+        gracefulRestartStore?.close();
+        gracefulRestartStore = null;
+      });
+      await safe("coreConfigWatcher.stop", async () => {
+        stopCoreConfigWatcher();
+      });
+      await safe("bus.close", async () => {
+        adaptCoreEventBusCleanupResultToHost(await captureCoreEventBusCleanup({ redis, raw, bus }));
+      });
+      fullCleanupPending = false;
     }
-    await safe("durableWorkflowStore.close", async () => durableWorkflowStore.close());
-    await safe("discoveryService.close", async () => {
-      discoveryService?.close();
-      discoveryService = null;
-    });
-    await safe("transcriptStore.close", async () => {
-      transcriptStore?.close();
-      transcriptStore = null;
-    });
-    await safe("discordSearchStore.close", async () => {
-      discordSearchStore?.close();
-      discordSearchStore = null;
-      discordSearchService = null;
-    });
-    await safe("discordSurfaceStore.close", async () => {
-      discordSurfaceStore?.close();
-      discordSurfaceStore = null;
-    });
-    await safe("conversationThreadStore.close", async () => {
-      conversationThreadStore?.close();
-      conversationThreadStore = null;
-      conversationThreadService = null;
-    });
-    await safe("gracefulRestartStore.close", async () => {
-      gracefulRestartStore?.close();
-      gracefulRestartStore = null;
-    });
-    await safe("coreConfigWatcher.stop", async () => {
-      stopCoreConfigWatcher();
-    });
-    await safe("bus.close", async () => {
-      adaptCoreEventBusCleanupResultToHost(await captureCoreEventBusCleanup({ redis, raw, bus }));
-    });
     for (const supervision of residualRouterDoneSupervisions) {
       await settleCoreResidualDiscordRequestRouterDone({
         supervision,

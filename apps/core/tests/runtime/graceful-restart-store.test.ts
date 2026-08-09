@@ -287,7 +287,7 @@ describe("graceful restart persisted codec", () => {
     }
   });
 
-  it("rejects unrecognized nested agent and relay fields", () => {
+  it("rejects unrecognized nested and relay-envelope fields", () => {
     const snapshot = buildSnapshot();
     const nestedAgent = {
       ...snapshot,
@@ -302,8 +302,15 @@ describe("graceful restart persisted codec", () => {
         toolStatus: relay.toolStatus.map((status) => ({ ...status, silentlyTrusted: true })),
       })),
     };
+    const changedRelayEnvelope = {
+      ...snapshot,
+      relays: snapshot.relays.map((relay) => ({
+        ...relay,
+        streamHasTerminalOutput: true,
+      })),
+    };
 
-    for (const value of [nestedAgent, nestedRelay]) {
+    for (const value of [nestedAgent, nestedRelay, changedRelayEnvelope]) {
       const decoded = decodeGracefulRestartSnapshot({
         status: "completed",
         payload_json: SuperJSON.stringify(value),

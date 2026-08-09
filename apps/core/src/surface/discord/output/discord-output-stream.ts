@@ -1030,7 +1030,7 @@ export class DiscordOutputStream implements SurfaceOutputStream {
         return "visible";
       case "reasoning.status": {
         if (this.deps.reasoningDisplayMode === "none") {
-          return "ignored";
+          return "terminal";
         }
         if (!this.hasReasoningStatus) {
           this.markTaskProgress("reasoning");

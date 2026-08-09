@@ -1,7 +1,11 @@
 import type { SurfaceMsgRef } from "@stanley2058/lilac-event-bus";
 import { Panic, Result, TaggedError, type Result as ResultType } from "better-result";
 
-import { errorMessage, opaqueErrorMessage } from "@stanley2058/lilac-utils";
+import {
+  errorMessage,
+  formatTaggedErrorForLog,
+  opaqueErrorMessage,
+} from "@stanley2058/lilac-utils";
 
 import {
   deleteIssueCommentReactionById,
@@ -293,6 +297,7 @@ async function clearGithubIngressAcknowledgement(
   if (deleted.status === "ok" || deleted.error.isNotFound) return Result.ok(undefined);
   return Result.err(
     new SurfaceIngressAcknowledgementCleanupFailed({
+      cause: formatTaggedErrorForLog(deleted.error),
       message: "Failed to clear surface ingress acknowledgement",
     }),
   );
@@ -412,9 +417,7 @@ export function createGithubSurfaceRuntimeDescriptor(input: {
     adapter: input.adapter,
     ...(input.requestIngress ? { requestIngress: input.requestIngress } : {}),
     ...(input.relay ? { relay: input.relay } : {}),
-    ...(input.requestIngress
-      ? { workflowProgress: createGithubWorkflowProgressPort(input.adapter) }
-      : {}),
+    workflowProgress: createGithubWorkflowProgressPort(input.adapter),
   };
 }
 

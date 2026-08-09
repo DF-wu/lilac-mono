@@ -15,6 +15,7 @@ import {
   type SubscriptionOptions,
 } from "@stanley2058/lilac-event-bus";
 import { Panic, Result } from "better-result";
+import { formatTaggedErrorForLog } from "@stanley2058/lilac-utils";
 import { subscribeForTest, type TestRawMessageHandler } from "../helpers/result-raw-bus";
 import type {
   AdapterEventHandler,
@@ -40,7 +41,12 @@ import type {
 import { DurableWorkflowStore } from "../../src/workflow/durable-workflow-store";
 import { startWorkflowActionResolver } from "../../src/workflow/workflow-action-resolver";
 import { sha256 } from "../../src/workflow/workflow-definition";
-import { WorkflowProgressProjector } from "../../src/workflow/workflow-progress-projector";
+import {
+  WorkflowProgressProjector,
+  WorkflowProgressSurfaceCallFailed,
+  WorkflowProgressSurfaceCreated,
+  WorkflowProgressSurfaceNotFound,
+} from "../../src/workflow/workflow-progress-projector";
 const HASH_A = "a".repeat(64);
 const HASH_B = "b".repeat(64);
 
@@ -330,6 +336,41 @@ function tempDbPath(label: string): string {
   return join(tmpdir(), `${label}-${crypto.randomUUID()}.sqlite`);
 }
 describe("WorkflowProgressProjector", () => {
+  it("uses unique stable tags for each workflow progress surface outcome", () => {
+    const createdRef: MsgRef = {
+      platform: "github",
+      channelId: "octo/repo#1",
+      messageId: "42",
+    };
+    const errors = [
+      new WorkflowProgressSurfaceCreated({
+        failureKind: "created",
+        createdRef,
+        message: "created",
+      }),
+      new WorkflowProgressSurfaceNotFound({
+        failureKind: "not-found",
+        createdRef: null,
+        message: "not found",
+      }),
+      new WorkflowProgressSurfaceCallFailed({
+        failureKind: "failed",
+        createdRef: null,
+        message: "failed",
+      }),
+    ];
+    expect(errors.map((error) => error._tag)).toEqual([
+      "WorkflowProgressSurfaceCreated",
+      "WorkflowProgressSurfaceNotFound",
+      "WorkflowProgressSurfaceCallFailed",
+    ]);
+    expect(errors.map((error) => formatTaggedErrorForLog(error).errorTag)).toEqual([
+      "WorkflowProgressSurfaceCreated",
+      "WorkflowProgressSurfaceNotFound",
+      "WorkflowProgressSurfaceCallFailed",
+    ]);
+  });
+
   it("ignores event projection for a null target and rejects explicit card creation", async () => {
     const dbPath = tempDbPath("workflow-null-target");
     const store = new DurableWorkflowStore(dbPath);
@@ -521,136 +562,80 @@ describe("WorkflowProgressProjector", () => {
       rmSync(dbPath, { force: true });
     }
   });
-  it("rejects a due persisted ref platform mismatch before checking either protocol", async () => {
-    const dbPath = tempDbPath("workflow-binding-platform-mismatch-check");
-    const store = new DurableWorkflowStore(dbPath);
-    const discordAdapter = new ProjectionAdapter("discord");
-    const githubAdapter = new ProjectionAdapter("github");
-    const bus = createLilacBus(new CapturingRawBus());
-    const projector = createWorkflowProgressProjectorForTest({
-      bus,
-      store,
-      ports: combinedProjectionPorts(discordAdapter, githubAdapter),
-      subscriptionId: "binding-platform-mismatch-check",
-      now: () => 20,
-    });
-    const mismatchedRef = {
-      platform: "github" as const,
-      channelId: "octo/repo#1",
-      messageId: "42",
-    };
-    try {
-      createInvocation(store);
-      store.upsertSurfaceBinding({
-        runId: "run-1",
-        target: { platform: "discord", channelId: "channel-1", replyToMessageId: "origin-1" },
-        messageRef: mismatchedRef,
-        lastRenderedSha256: HASH_A,
-        lastError: "retry due",
-        retryCount: 0,
-        nextAttemptAt: 20,
-        createdAt: 10,
-        updatedAt: 10,
+  it.each(["discord", "github"] as const)(
+    "repairs a persisted %s binding ref platform mismatch and does not duplicate after restart",
+    async (platform) => {
+      const dbPath = tempDbPath(`workflow-binding-platform-mismatch-${platform}`);
+      let store = new DurableWorkflowStore(dbPath);
+      const discordAdapter = new ProjectionAdapter("discord");
+      const githubAdapter = new ProjectionAdapter("github");
+      const targetAdapter = platform === "discord" ? discordAdapter : githubAdapter;
+      const otherAdapter = platform === "discord" ? githubAdapter : discordAdapter;
+      const bus = createLilacBus(new CapturingRawBus());
+      let projector = createWorkflowProgressProjectorForTest({
+        bus,
+        store,
+        ports: combinedProjectionPorts(discordAdapter, githubAdapter),
+        subscriptionId: `binding-platform-mismatch-${platform}`,
+        now: () => 20,
       });
+      const mismatchedRef: MsgRef =
+        platform === "discord"
+          ? { platform: "github", channelId: "octo/repo#1", messageId: "42" }
+          : { platform: "discord", channelId: "channel-1", messageId: "message-1" };
+      try {
+        createInvocation(store, true, platform);
+        store.upsertSurfaceBinding({
+          runId: "run-1",
+          target: { platform, channelId: "channel-1", replyToMessageId: "origin-1" },
+          messageRef: mismatchedRef,
+          lastRenderedSha256: HASH_A,
+          lastError: "retry due",
+          retryCount: 2,
+          nextAttemptAt: 20,
+          createdAt: 10,
+          updatedAt: 10,
+        });
 
-      await expect(projector.ensureInitialCard("run-1")).rejects.toThrow(
-        "binding message platform 'github' does not match target platform 'discord'",
-      );
-      expect({
-        discord: {
-          reads: discordAdapter.reads,
-          edits: discordAdapter.edits,
-          sends: discordAdapter.sends,
-        },
-        github: {
-          reads: githubAdapter.reads,
-          edits: githubAdapter.edits,
-          sends: githubAdapter.sends,
-        },
-      }).toEqual({
-        discord: { reads: 0, edits: 0, sends: 0 },
-        github: { reads: 0, edits: 0, sends: 0 },
-      });
-      expect(workflowStoreValue(store.getSurfaceBinding("run-1"))).toMatchObject({
-        messageRef: mismatchedRef,
-        lastRenderedSha256: HASH_A,
-        retryCount: 1,
-        nextAttemptAt: 1_020,
-        lastError:
-          "Workflow progress binding message platform 'github' does not match target platform 'discord'",
-      });
-    } finally {
-      await projector.stop();
-      await bus.close();
-      store.close();
-      rmSync(dbPath, { force: true });
-    }
-  });
-  it("rejects a persisted ref platform mismatch before editing either protocol", async () => {
-    const dbPath = tempDbPath("workflow-binding-platform-mismatch-edit");
-    const store = new DurableWorkflowStore(dbPath);
-    const discordAdapter = new ProjectionAdapter("discord");
-    const githubAdapter = new ProjectionAdapter("github");
-    const bus = createLilacBus(new CapturingRawBus());
-    const projector = createWorkflowProgressProjectorForTest({
-      bus,
-      store,
-      ports: combinedProjectionPorts(discordAdapter, githubAdapter),
-      subscriptionId: "binding-platform-mismatch-edit",
-      now: () => 30,
-    });
-    const mismatchedRef = {
-      platform: "discord" as const,
-      channelId: "channel-1",
-      messageId: "message-1",
-    };
-    try {
-      createInvocation(store, true, "github");
-      store.upsertSurfaceBinding({
-        runId: "run-1",
-        target: { platform: "github", channelId: "channel-1", replyToMessageId: "origin-1" },
-        messageRef: mismatchedRef,
-        lastRenderedSha256: null,
-        lastError: null,
-        retryCount: 0,
-        nextAttemptAt: null,
-        createdAt: 10,
-        updatedAt: 10,
-      });
+        const recreated = await projector.ensureInitialCard("run-1");
+        expect(recreated.platform).toBe(platform);
+        expect(targetAdapter.sends).toBe(1);
+        expect(otherAdapter.sends).toBe(0);
+        expect(otherAdapter.reads).toBe(0);
+        expect(otherAdapter.edits).toBe(0);
+        expect(workflowStoreValue(store.getSurfaceBinding("run-1"))).toMatchObject({
+          messageRef: recreated,
+          lastError: null,
+          retryCount: 0,
+          nextAttemptAt: null,
+        });
+        expect(workflowStoreValue(store.getSurfaceBinding("run-1"))?.lastRenderedSha256).not.toBe(
+          HASH_A,
+        );
 
-      await expect(projector.ensureInitialCard("run-1")).rejects.toThrow(
-        "binding message platform 'discord' does not match target platform 'github'",
-      );
-      expect({
-        discord: {
-          reads: discordAdapter.reads,
-          edits: discordAdapter.edits,
-          sends: discordAdapter.sends,
-        },
-        github: {
-          reads: githubAdapter.reads,
-          edits: githubAdapter.edits,
-          sends: githubAdapter.sends,
-        },
-      }).toEqual({
-        discord: { reads: 0, edits: 0, sends: 0 },
-        github: { reads: 0, edits: 0, sends: 0 },
-      });
-      expect(workflowStoreValue(store.getSurfaceBinding("run-1"))).toMatchObject({
-        messageRef: mismatchedRef,
-        lastRenderedSha256: null,
-        retryCount: 1,
-        nextAttemptAt: 1_030,
-        lastError:
-          "Workflow progress binding message platform 'discord' does not match target platform 'github'",
-      });
-    } finally {
-      await projector.stop();
-      await bus.close();
-      store.close();
-      rmSync(dbPath, { force: true });
-    }
-  });
+        await projector.stop();
+        store.close();
+        store = new DurableWorkflowStore(dbPath);
+        projector = createWorkflowProgressProjectorForTest({
+          bus,
+          store,
+          ports: combinedProjectionPorts(discordAdapter, githubAdapter),
+          subscriptionId: `binding-platform-mismatch-${platform}-restarted`,
+          now: () => 30,
+        });
+        await projector.start();
+
+        expect(targetAdapter.sends).toBe(1);
+        expect(otherAdapter.sends).toBe(0);
+        expect(workflowStoreValue(store.getSurfaceBinding("run-1"))?.messageRef).toEqual(recreated);
+      } finally {
+        await projector.stop();
+        await bus.close();
+        store.close();
+        rmSync(dbPath, { force: true });
+      }
+    },
+  );
   it("repairs stale terminal cards, skips clean history, and retries failed bindings", async () => {
     const dbPath = tempDbPath("workflow-terminal-reconcile");
     const store = new DurableWorkflowStore(dbPath);

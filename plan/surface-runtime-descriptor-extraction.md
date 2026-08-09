@@ -243,6 +243,8 @@ Required startup invariants:
 2. Install adapter-event ingress before connecting an adapter that can immediately emit events.
 3. Preserve existing request-cache, workflow-consumer, router, and adapter ordering during the first
    extraction. Any correction to observed ordering is a separate behavior change with dedicated tests.
+   Reverse-registry stop/disconnect ordering is the approved, plan-required ordering correction; it is
+   intentionally not accidental parity and remains covered by dedicated lifecycle-order tests.
 4. Start each enabled bus-to-adapter relay before the agent runner can publish output for that surface.
 5. Start independently hosted request ingress only at its declared phase after required downstream
    consumers exist.

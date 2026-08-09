@@ -243,6 +243,8 @@ export function logIngressAcknowledgementCleanupFailure(input: {
     formatBridgeTaggedErrorForLog(input.error, {
       requestId: input.requestId,
       sessionId: input.sessionId,
+      causeErrorTag: input.error.cause.errorTag,
+      causeErrorMessage: input.error.cause.errorMessage,
     }),
   );
 }
@@ -868,7 +870,7 @@ export async function bridgeBusToAdapter<P extends RegisteredSurfacePlatform>(pa
     let reasoningDetailText = input.restore?.reasoning?.detailText ?? "";
     let pendingNoReplyPrefix = "";
     let bufferNoReplyPrefix = true;
-    let streamHasVisibleOutput = false;
+    let streamShouldFinish = false;
     const withoutStreamPhaseBoundary = (text: string, textOffsetChars = 0): string => {
       if (streamPhaseBoundaryPrefixChars === 0) return text;
       const boundaryStart = Math.min(
@@ -1005,7 +1007,9 @@ export async function bridgeBusToAdapter<P extends RegisteredSurfacePlatform>(pa
     let finalTextMode: SurfaceFinalTextMode = out.getFinalTextMode?.() ?? "continuation";
     useResumeOpts = false;
     const recordOutputPartDisposition = (disposition: SurfaceOutputPartDisposition): void => {
-      if (disposition === "visible") streamHasVisibleOutput = true;
+      if (disposition === "visible" || disposition === "terminal") {
+        streamShouldFinish = true;
+      }
     };
 
     if (input.restore) {
@@ -1090,7 +1094,7 @@ export async function bridgeBusToAdapter<P extends RegisteredSurfacePlatform>(pa
       finalAnswerText = "";
       phaseSegmentsValid = true;
       visibleTextAcc = "";
-      streamHasVisibleOutput = false;
+      streamShouldFinish = false;
       out = await adapter.startOutput(sessionRef, buildStartOpts(nextReplyTo, streamToken));
       finalTextMode = out.getFinalTextMode?.() ?? "continuation";
 
@@ -1597,7 +1601,7 @@ export async function bridgeBusToAdapter<P extends RegisteredSurfacePlatform>(pa
                   streamFinalText = mergeContinuationText(previousVisibleText, streamFinalText);
                 }
 
-                if (streamFinalText.length === 0 && !streamHasVisibleOutput) {
+                if (streamFinalText.length === 0 && !streamShouldFinish) {
                   await superviseBusToAdapterCleanup([
                     () =>
                       runBusToAdapterBestEffort({

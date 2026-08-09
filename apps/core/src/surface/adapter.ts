@@ -72,7 +72,7 @@ export type SurfaceOutputResult = {
 };
 
 export type SurfaceFinalTextMode = "continuation" | "full";
-export type SurfaceOutputPartDisposition = "visible" | "ignored";
+export type SurfaceOutputPartDisposition = "visible" | "terminal" | "ignored";
 
 export type SurfaceReplyChainPlanOptions = {
   maxDepth?: number;

@@ -246,7 +246,7 @@ describe("surface runtime descriptor factories", () => {
     expect("refs" in descriptor.relay!).toBe(true);
   });
 
-  it("exposes GitHub workflow progress only with authenticated request ingress", () => {
+  it("exposes GitHub workflow progress independently of ingress and relay", () => {
     for (const requestIngressEnabled of [false, true]) {
       for (const relayEnabled of [false, true]) {
         const descriptor = createGithubSurfaceRuntimeDescriptor({
@@ -257,8 +257,8 @@ describe("surface runtime descriptor factories", () => {
 
         expect("requestIngress" in descriptor).toBe(requestIngressEnabled);
         expect("relay" in descriptor).toBe(relayEnabled);
-        expect(descriptor.workflowProgress === undefined).toBe(!requestIngressEnabled);
-        expect("workflowProgress" in descriptor).toBe(requestIngressEnabled);
+        expect(descriptor.workflowProgress).toBeDefined();
+        expect("workflowProgress" in descriptor).toBe(true);
         expect("adapterIngress" in descriptor).toBe(false);
       }
     }
@@ -292,7 +292,8 @@ describe("surface runtime descriptor factories", () => {
       expect(descriptor.adapter).toBe(adapter);
       expect(descriptor.requestIngress).toBe(requestIngressAvailable ? ingress : undefined);
       expect(descriptor.relay).toBe(appCredentialsAvailable ? relay : undefined);
-      expect("workflowProgress" in descriptor).toBe(requestIngressAvailable);
+      expect(descriptor.workflowProgress).toBeDefined();
+      expect("workflowProgress" in descriptor).toBe(true);
       if (descriptor.relay) expect("refs" in descriptor.relay).toBe(true);
       expect(logs).toEqual([
         ...(requestIngressAvailable

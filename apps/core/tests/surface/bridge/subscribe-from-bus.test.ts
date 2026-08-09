@@ -1,5 +1,8 @@
 import { describe, expect, it, spyOn } from "bun:test";
 import { Panic, Result, type Result as ResultType } from "better-result";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import {
   bridgeBusToAdapter as bridgeBusToAdapterImpl,
@@ -9,6 +12,7 @@ import type {
   SurfaceFinalTextMode,
   SurfaceAdapter,
   SurfaceOutputPart,
+  SurfaceOutputPartDisposition,
   SurfaceOutputResult,
   StartOutputOpts,
 } from "../../../src/surface/adapter";
@@ -24,6 +28,10 @@ import type { MsgRef, SessionRef } from "../../../src/surface/types";
 import { createDiscordRelayPolicy } from "../../../src/surface/discord/discord-runtime-descriptor";
 import { createGithubRelayPolicy } from "../../../src/surface/github/github-runtime-descriptor";
 import { SurfaceIngressAcknowledgementCleanupFailed } from "../../../src/surface/runtime-descriptor";
+import {
+  GRACEFUL_RESTART_SNAPSHOT_VERSION,
+  SqliteGracefulRestartStore,
+} from "../../../src/runtime/graceful-restart-store";
 
 import {
   createLilacBus,
@@ -234,10 +242,10 @@ class FakeOutputStream {
     private readonly onFirstPush?: () => void,
     private readonly finalTextMode: SurfaceFinalTextMode = "continuation",
     private readonly platform: "discord" | "github" = "discord",
-    private readonly ignoredPartTypes: ReadonlySet<SurfaceOutputPart["type"]> = new Set(),
+    private readonly terminalPartTypes: ReadonlySet<SurfaceOutputPart["type"]> = new Set(),
   ) {}
 
-  async push(part: SurfaceOutputPart): Promise<"visible" | "ignored"> {
+  async push(part: SurfaceOutputPart): Promise<SurfaceOutputPartDisposition> {
     if (this.nextPushFailure) {
       const failure = this.nextPushFailure;
       this.nextPushFailure = null;
@@ -248,8 +256,9 @@ class FakeOutputStream {
       this.onFirstPush?.();
     }
     this.parts.push(part);
-    if (this.ignoredPartTypes.has(part.type)) return "ignored";
+    if (this.terminalPartTypes.has(part.type)) return "terminal";
     if (this.platform === "github" && part.type !== "text.delta" && part.type !== "text.set") {
+      if (part.type === "tool.status" || part.type === "attachment.add") return "terminal";
       return "ignored";
     }
     return "visible";
@@ -285,7 +294,7 @@ class FakeAdapter implements SurfaceAdapter {
   public deletedMsgs: MsgRef[] = [];
   public outputFinalTextMode: SurfaceFinalTextMode = "continuation";
   public outputFinalTextModesByStart: SurfaceFinalTextMode[] = [];
-  public ignoredPartTypes = new Set<SurfaceOutputPart["type"]>();
+  public terminalPartTypes = new Set<SurfaceOutputPart["type"]>();
   public failNextStart = false;
   private nextOutputMessageId = 1;
 
@@ -322,7 +331,7 @@ class FakeAdapter implements SurfaceAdapter {
       },
       mode,
       sessionRef.platform,
-      this.ignoredPartTypes,
+      this.terminalPartTypes,
     );
     this.stream = s;
     this.streams.push(s);
@@ -2452,14 +2461,14 @@ describe("bridgeBusToAdapter", () => {
 
   it.each([
     ["discord", "discord", true, false],
-    ["discord reasoningDisplayMode none", "discord", false, true],
+    ["discord reasoningDisplayMode none", "discord", true, true],
     ["github", "github", false, false],
   ] as const)(
-    "uses %s live reasoning visibility when final output is empty",
-    async (_case, platform, reasoningIsVisible, ignoreReasoning) => {
+    "uses %s live reasoning completion disposition when final output is empty",
+    async (_case, platform, shouldFinish, terminalReasoning) => {
       const bus = createLilacBus(createInMemoryRawBus());
       const adapter = new FakeAdapter();
-      if (ignoreReasoning) adapter.ignoredPartTypes.add("reasoning.status");
+      if (terminalReasoning) adapter.terminalPartTypes.add("reasoning.status");
       const sessionId = platform === "discord" ? "chan" : `octo/live-${crypto.randomUUID()}#1`;
       const requestId =
         platform === "discord"
@@ -2495,8 +2504,64 @@ describe("bridgeBusToAdapter", () => {
         { headers: { request_id: requestId } },
       );
 
-      expect(adapter.stream?.finished).toBe(reasoningIsVisible);
-      expect(adapter.stream?.aborted).toBe(reasoningIsVisible ? undefined : "skip");
+      expect(adapter.stream?.finished).toBe(shouldFinish);
+      expect(adapter.stream?.aborted).toBe(shouldFinish ? undefined : "skip");
+      expect(bridge.snapshotRelays()).toEqual([]);
+      await bridge.stop();
+    },
+  );
+
+  it.each(["tool.status", "attachment.add"] as const)(
+    "finishes live GitHub %s-only output when final text is empty",
+    async (partType) => {
+      const bus = createLilacBus(createInMemoryRawBus());
+      const adapter = new FakeAdapter();
+      const sessionId = `octo/live-terminal-${crypto.randomUUID()}#1`;
+      const requestId = `github:${sessionId}:terminal-only`;
+      const bridge = await bridgeBusToAdapter({
+        adapter,
+        bus,
+        platform: "github",
+        subscriptionId: `github-live-terminal-${crypto.randomUUID()}`,
+        idleTimeoutMs: 10_000,
+      });
+
+      await bus.publish(
+        lilacEventTypes.EvtRequestReply,
+        {},
+        {
+          headers: {
+            request_id: requestId,
+            session_id: sessionId,
+            request_client: "github",
+          },
+        },
+      );
+      if (partType === "tool.status") {
+        await bus.publish(
+          lilacEventTypes.EvtAgentOutputToolCall,
+          { toolCallId: "tool-1", display: "bash pwd", status: "end", ok: true },
+          { headers: { request_id: requestId } },
+        );
+      } else {
+        await bus.publish(
+          lilacEventTypes.EvtAgentOutputResponseBinary,
+          {
+            mimeType: "text/plain",
+            dataBase64: Buffer.from("result").toString("base64"),
+            filename: "result.txt",
+          },
+          { headers: { request_id: requestId } },
+        );
+      }
+      await bus.publish(
+        lilacEventTypes.EvtAgentOutputResponseText,
+        { finalText: "" },
+        { headers: { request_id: requestId } },
+      );
+
+      expect(adapter.stream?.finished).toBe(true);
+      expect(adapter.stream?.aborted).toBeUndefined();
       expect(bridge.snapshotRelays()).toEqual([]);
       await bridge.stop();
     },
@@ -2504,14 +2569,14 @@ describe("bridgeBusToAdapter", () => {
 
   it.each([
     ["discord", "discord", true, false],
-    ["discord reasoningDisplayMode none", "discord", false, true],
+    ["discord reasoningDisplayMode none", "discord", true, true],
     ["github", "github", false, false],
   ] as const)(
-    "uses %s restored reasoning visibility when final output is empty",
-    async (_case, platform, reasoningIsVisible, ignoreReasoning) => {
+    "uses %s restored reasoning completion disposition when final output is empty",
+    async (_case, platform, shouldFinish, terminalReasoning) => {
       const bus = createLilacBus(createInMemoryRawBus());
       const adapter = new FakeAdapter();
-      if (ignoreReasoning) adapter.ignoredPartTypes.add("reasoning.status");
+      if (terminalReasoning) adapter.terminalPartTypes.add("reasoning.status");
       const sessionId = platform === "discord" ? "chan" : `octo/restore-${crypto.randomUUID()}#1`;
       const requestId =
         platform === "discord"
@@ -2549,10 +2614,148 @@ describe("bridgeBusToAdapter", () => {
         { headers: { request_id: requestId } },
       );
 
-      expect(adapter.stream?.finished).toBe(reasoningIsVisible);
-      expect(adapter.stream?.aborted).toBe(reasoningIsVisible ? undefined : "skip");
+      expect(adapter.stream?.finished).toBe(shouldFinish);
+      expect(adapter.stream?.aborted).toBe(shouldFinish ? undefined : "skip");
       expect(bridge.snapshotRelays()).toEqual([]);
       await bridge.stop();
+    },
+  );
+
+  it("finishes restored GitHub tool-only output when final text is empty", async () => {
+    const bus = createLilacBus(createInMemoryRawBus());
+    const adapter = new FakeAdapter();
+    const sessionId = `octo/restored-terminal-${crypto.randomUUID()}#1`;
+    const requestId = `github:${sessionId}:terminal-only`;
+    const bridge = await bridgeBusToAdapter({
+      adapter,
+      bus,
+      platform: "github",
+      subscriptionId: `github-restored-terminal-${crypto.randomUUID()}`,
+      idleTimeoutMs: 10_000,
+    });
+
+    await bridge.restoreRelays([
+      {
+        requestId,
+        sessionId,
+        requestClient: "github",
+        platform: "github",
+        createdOutputRefs: [],
+        visibleText: "",
+        toolStatus: [{ toolCallId: "tool-1", display: "bash pwd", status: "end", ok: true }],
+      },
+    ]);
+    await bus.publish(
+      lilacEventTypes.EvtAgentOutputResponseText,
+      { finalText: "" },
+      { headers: { request_id: requestId } },
+    );
+
+    expect(adapter.stream?.finished).toBe(true);
+    expect(adapter.stream?.aborted).toBeUndefined();
+    expect(bridge.snapshotRelays()).toEqual([]);
+    await bridge.stop();
+  });
+
+  it.each([
+    ["GitHub tool status", "github"],
+    ["Discord hidden reasoning", "discord"],
+  ] as const)(
+    "roundtrips a real %s terminal-only relay snapshot through the restart store",
+    async (_case, platform) => {
+      const raw = createInMemoryRawBus();
+      const bus = createLilacBus(raw);
+      const sourceAdapter = new FakeAdapter();
+      const restoredAdapter = new FakeAdapter();
+      if (platform === "discord") {
+        sourceAdapter.terminalPartTypes.add("reasoning.status");
+        restoredAdapter.terminalPartTypes.add("reasoning.status");
+      }
+      const sessionId = platform === "github" ? `octo/codec-${crypto.randomUUID()}#1` : "chan";
+      const requestId = `${platform}:${sessionId}:terminal-only`;
+      const tempDir = mkdtempSync(join(tmpdir(), "lilac-relay-restart-codec-"));
+      const store = new SqliteGracefulRestartStore(join(tempDir, "graceful-restart.db"));
+      const sourceBridge = await bridgeBusToAdapter({
+        adapter: sourceAdapter,
+        bus,
+        platform,
+        subscriptionId: `${platform}-terminal-source-${crypto.randomUUID()}`,
+        idleTimeoutMs: 10_000,
+      });
+      let restoredBridge: Awaited<ReturnType<typeof bridgeBusToAdapter>> | null = null;
+
+      try {
+        await bus.publish(
+          lilacEventTypes.EvtRequestReply,
+          {},
+          {
+            headers: {
+              request_id: requestId,
+              session_id: sessionId,
+              request_client: platform,
+            },
+          },
+        );
+        if (platform === "github") {
+          await bus.publish(
+            lilacEventTypes.EvtAgentOutputToolCall,
+            { toolCallId: "tool-1", display: "bash pwd", status: "end", ok: true },
+            { headers: { request_id: requestId } },
+          );
+        } else {
+          await bus.publish(
+            lilacEventTypes.EvtAgentOutputDeltaReasoning,
+            { delta: "thinking", seq: 1 },
+            { headers: { request_id: requestId } },
+          );
+        }
+
+        const relaySnapshot = sourceBridge.snapshotRelays()[0];
+        if (!relaySnapshot) throw new Error("Expected a terminal-only relay snapshot");
+        expect(Object.keys(relaySnapshot)).not.toContain("streamHasTerminalOutput");
+        const saved = store.saveCompletedSnapshot({
+          version: GRACEFUL_RESTART_SNAPSHOT_VERSION,
+          createdAt: Date.now(),
+          deadlineMs: 10_000,
+          agent: [],
+          relays: [relaySnapshot],
+        });
+        expect(saved.status).toBe("ok");
+
+        const loaded = store.loadAndConsumeCompletedSnapshot();
+        expect(loaded.status).toBe("ok");
+        if (loaded.status !== "ok" || loaded.value.state !== "loaded") {
+          throw new Error("Expected the restart store to load the terminal-only relay snapshot");
+        }
+        expect(Object.keys(loaded.value.snapshot.relays[0] ?? {})).not.toContain(
+          "streamHasTerminalOutput",
+        );
+
+        await sourceBridge.stop();
+        restoredBridge = await bridgeBusToAdapter({
+          adapter: restoredAdapter,
+          bus,
+          platform,
+          subscriptionId: `${platform}-terminal-restored-${crypto.randomUUID()}`,
+          idleTimeoutMs: 10_000,
+        });
+        await restoredBridge.restoreRelays(loaded.value.snapshot.relays);
+        await bus.publish(
+          lilacEventTypes.EvtAgentOutputResponseText,
+          { finalText: "" },
+          { headers: { request_id: requestId } },
+        );
+
+        expect(restoredAdapter.stream?.finished).toBe(true);
+        expect(restoredAdapter.stream?.aborted).toBeUndefined();
+        expect(restoredBridge.snapshotRelays()).toEqual([]);
+      } finally {
+        await sourceBridge.stop();
+        await restoredBridge?.stop();
+        await bus.close();
+        store.close();
+        rmSync(tempDir, { recursive: true, force: true });
+      }
     },
   );
 
@@ -3681,6 +3884,10 @@ describe("bridgeBusToAdapter", () => {
         warn: (message, context) => calls.push({ message, context }),
       },
       error: new SurfaceIngressAcknowledgementCleanupFailed({
+        cause: {
+          errorTag: "GithubAcknowledgementDeleteFailed",
+          errorMessage: "Failed to delete GitHub acknowledgement reaction",
+        },
         message: "Failed to clear surface ingress acknowledgement",
       }),
       requestId,
@@ -3695,6 +3902,8 @@ describe("bridgeBusToAdapter", () => {
           sessionId: "octo/repo#12",
           errorTag: "SurfaceIngressAcknowledgementCleanupFailed",
           errorMessage: "Failed to clear surface ingress acknowledgement",
+          causeErrorTag: "GithubAcknowledgementDeleteFailed",
+          causeErrorMessage: "Failed to delete GitHub acknowledgement reaction",
         },
       },
     ]);

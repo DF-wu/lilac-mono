@@ -87,7 +87,6 @@ export const PRECISE_EXCEPTION_IDENTITIES: Readonly<
     ["src/github/github-auth.ts", "captureGithubAuthExternal", "both"],
     ["src/github/github-auth.ts", "getGithubViewerLoginOrThrow", "signal"],
     ["src/github/github-auth.ts", "getPreferredGithubAuthOrThrow", "signal"],
-    ["src/github/github-auth.ts", "resolveGithubViewerLoginOrThrow", "signal"],
     ["src/github/github-ids.ts", "parseGithubSessionId", "signal"],
     ["src/github/github-user-token.ts", "captureGithubUserTokenFs", "both"],
     ["src/github/github-user-token.ts", "readGithubUserTokenSecret", "signal"],

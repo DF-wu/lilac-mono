@@ -31,16 +31,16 @@ export class GithubOutputStream implements SurfaceOutputStream {
         return "visible";
       }
       case "attachment.add": {
-        // GitHub output intentionally omits binary attachments until it has a native renderer.
-        return "ignored";
+        // GitHub omits binary attachments, but attachment-only replies still complete at finish.
+        return "terminal";
       }
       case "reasoning.status": {
         // Ignore (no streaming UI for GitHub).
         return "ignored";
       }
       case "tool.status": {
-        // Ignore (no streaming UI for GitHub).
-        return "ignored";
+        // GitHub has no tool UI, but tool-only replies still complete at finish.
+        return "terminal";
       }
       case "meta.stats": {
         // Ignore (no dedicated stats UI for GitHub).

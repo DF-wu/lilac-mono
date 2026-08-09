@@ -13,7 +13,6 @@ import type { MsgRef } from "../../types";
 import { formatGenericRequestId, formatQueuedRequestId } from "../../bridge/request-ids";
 
 export type SessionMode = "mention" | "active";
-export type SessionSafetyMode = "trusted" | "restricted";
 
 export function previewText(text: string, max = 200): string {
   const trimmed = text.trim();
@@ -300,23 +299,6 @@ export function resolveSessionGateEnabled(
   if (typeof parentGate === "boolean") return parentGate;
 
   return cfg.surface.router.activeGate.enabled;
-}
-
-export function resolveSessionSafetyMode(
-  cfg: CoreConfig,
-  sessionId: string,
-  parentChannelId?: string,
-): SessionSafetyMode {
-  const threadSafetyMode = cfg.surface.router.sessionModes[sessionId]?.safetyMode;
-  if (threadSafetyMode) return threadSafetyMode;
-
-  const parentId = parentChannelId?.trim();
-  if (parentId) {
-    const parentSafetyMode = cfg.surface.router.sessionModes[parentId]?.safetyMode;
-    if (parentSafetyMode) return parentSafetyMode;
-  }
-
-  return "trusted";
 }
 
 export function resolveSessionModelOverride(

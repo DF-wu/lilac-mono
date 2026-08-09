@@ -4,7 +4,7 @@ import type { SurfaceOutputPart } from "../../../src/surface/adapter";
 import { GithubOutputStream } from "../../../src/surface/github/output/github-output-stream";
 
 describe("GithubOutputStream", () => {
-  it("intentionally accepts every optional presentation part without creating output", async () => {
+  it("distinguishes terminal-only parts from ignored presentation parts", async () => {
     const stream = new GithubOutputStream({
       platform: "github",
       channelId: "octo/repo#1",
@@ -30,7 +30,9 @@ describe("GithubOutputStream", () => {
       },
     ] satisfies readonly SurfaceOutputPart[];
 
-    for (const part of optionalParts) await expect(stream.push(part)).resolves.toBe("ignored");
+    const dispositions = [];
+    for (const part of optionalParts) dispositions.push(await stream.push(part));
+    expect(dispositions).toEqual(["ignored", "terminal", "ignored", "terminal"]);
     await expect(stream.abort("test")).resolves.toBeUndefined();
   });
 });

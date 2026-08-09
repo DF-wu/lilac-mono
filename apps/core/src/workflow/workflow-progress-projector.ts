@@ -54,17 +54,17 @@ type WorkflowProgressSurfaceCallFailureFields =
   | { readonly failureKind: "not-found"; readonly createdRef: null; readonly message: string }
   | { readonly failureKind: "failed"; readonly createdRef: null; readonly message: string };
 
-class WorkflowProgressSurfaceCreated extends TaggedError("WorkflowProgressSurfaceCallFailed")<
+export class WorkflowProgressSurfaceCreated extends TaggedError("WorkflowProgressSurfaceCreated")<
   Extract<WorkflowProgressSurfaceCallFailureFields, { failureKind: "created" }>
 > {}
 
-class WorkflowProgressSurfaceNotFound extends TaggedError("WorkflowProgressSurfaceCallFailed")<
+export class WorkflowProgressSurfaceNotFound extends TaggedError("WorkflowProgressSurfaceNotFound")<
   Extract<WorkflowProgressSurfaceCallFailureFields, { failureKind: "not-found" }>
 > {}
 
-class WorkflowProgressSurfaceCallFailed extends TaggedError("WorkflowProgressSurfaceCallFailed")<
-  Extract<WorkflowProgressSurfaceCallFailureFields, { failureKind: "failed" }>
-> {}
+export class WorkflowProgressSurfaceCallFailed extends TaggedError(
+  "WorkflowProgressSurfaceCallFailed",
+)<Extract<WorkflowProgressSurfaceCallFailureFields, { failureKind: "failed" }>> {}
 
 type WorkflowProgressSurfaceFailure =
   | WorkflowProgressSurfaceCreated
@@ -152,23 +152,15 @@ function correlateWorkflowProgressMessageRef(input: {
     readonly channelId: string;
     readonly messageId: string;
   };
-}): ResultType<MsgRef, WorkflowProgressProjectionFailed> {
+}): { readonly kind: "correlated"; readonly ref: MsgRef } | { readonly kind: "mismatch" } {
   if (input.bindingTargetPlatform !== input.runTargetPlatform) {
-    return Result.err(
-      workflowProgressProjectionFailure(
-        `Workflow progress binding target platform '${input.bindingTargetPlatform}' does not match run target platform '${input.runTargetPlatform}'`,
-      ),
-    );
+    return { kind: "mismatch" };
   }
   if (input.messageRef.platform !== input.runTargetPlatform) {
-    return Result.err(
-      workflowProgressProjectionFailure(
-        `Workflow progress binding message platform '${input.messageRef.platform}' does not match target platform '${input.runTargetPlatform}'`,
-      ),
-    );
+    return { kind: "mismatch" };
   }
   // The equality checks establish the discriminant correlation that TypeScript cannot infer.
-  return Result.ok(input.messageRef as MsgRef);
+  return { kind: "correlated", ref: input.messageRef as MsgRef };
 }
 
 function limitContentText(content: ContentOpts): ContentOpts {
@@ -607,13 +599,23 @@ export class WorkflowProgressProjector implements WorkflowProgressCardService {
         bindingTargetPlatform: existing.target.platform,
         messageRef: existing.messageRef,
       });
-      switch (correlated.status) {
-        case "ok":
-          messageRef = correlated.value;
+      switch (correlated.kind) {
+        case "correlated":
+          messageRef = correlated.ref;
           break;
-        case "error":
-          this.writeFailure(existing, correlated.error.message, now);
-          return Result.err(correlated.error);
+        case "mismatch":
+          existing = {
+            ...existing,
+            target,
+            messageRef: null,
+            lastRenderedSha256: null,
+            lastError: null,
+            retryCount: 0,
+            nextAttemptAt: null,
+            updatedAt: now,
+          };
+          this.input.store.upsertSurfaceBinding(existing);
+          break;
       }
     }
     if (!existing) {
@@ -790,21 +792,21 @@ export class WorkflowProgressProjector implements WorkflowProgressCardService {
         error = projected.error;
         break;
     }
-    switch (error.failureKind) {
-      case "created":
+    switch (error._tag) {
+      case "WorkflowProgressSurfaceCreated":
         this.writeFailure(existing, error.message, now, {
           messageRef: error.createdRef,
           lastRenderedSha256: existing.lastRenderedSha256,
         });
         if (requireMessage) return Result.ok(error.createdRef);
         return Result.err(error);
-      case "not-found":
+      case "WorkflowProgressSurfaceNotFound":
         this.writeFailure(existing, error.message, now, {
           messageRef: null,
           lastRenderedSha256: null,
         });
         break;
-      case "failed":
+      case "WorkflowProgressSurfaceCallFailed":
         this.writeFailure(existing, error.message, now, {
           messageRef,
           lastRenderedSha256: existing.lastRenderedSha256,
