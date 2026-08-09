@@ -3561,7 +3561,7 @@ describe("real declaration integration", () => {
     expect(runtime.ruleZones["architecture/fallible-api-result"]).toEqual([{ include: "**" }]);
   });
 
-  test("registers surface event projections and platform mismatch Panic provenance", () => {
+  test("registers surface projections and platform mismatch Panic provenance", () => {
     const core = architectureManifest.workspaces.find(
       (workspace) => workspace.root === "apps/core",
     );
@@ -3590,6 +3590,30 @@ describe("real declaration integration", () => {
       relationship: "host-contract",
       provenance: "workspace-reviewed-manifest",
       reason: platformMismatchReason,
+    });
+    const descriptorMismatchIdentity = {
+      module: "src/surface/runtime-descriptor.ts",
+      exportName: "signalSurfaceRuntimeAdapterPlatformMismatch",
+    } as const;
+    const descriptorMismatchReason =
+      "Signals a hard adapter contract invariant when getSelf reports a platform different from its descriptor registration.";
+    expect(core.exceptionAdapters).toContainEqual({
+      identity: descriptorMismatchIdentity,
+      category: "defect-supervisor",
+      externalApi: { package: "better-result", exportName: "Panic" },
+      direction: "signal-host",
+      reason: descriptorMismatchReason,
+    });
+    expect(architectureManifest.approvedExceptionAdapters).toContainEqual({
+      workspace: "apps/core",
+      callable: descriptorMismatchIdentity,
+      category: "defect-supervisor",
+      externalApi: { package: "better-result", exportName: "Panic" },
+      mode: "signal-host",
+      syntaxKinds: ["throw-statement", "host-rejection-call", "registered-host-signal-call"],
+      relationship: "host-contract",
+      provenance: "workspace-reviewed-manifest",
+      reason: descriptorMismatchReason,
     });
     expect(core.boundaryDecoders).toContainEqual({
       identity: {

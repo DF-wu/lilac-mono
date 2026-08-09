@@ -888,6 +888,17 @@ const CORE_ADAPTER_EVENT_EXCEPTION_ADAPTERS = [
     direction: "signal-host",
     reason: "Signals a hard invariant when a normalized adapter event contains mixed platforms.",
   },
+  {
+    identity: {
+      module: "src/surface/runtime-descriptor.ts",
+      exportName: "signalSurfaceRuntimeAdapterPlatformMismatch",
+    },
+    category: "defect-supervisor",
+    externalApi: { package: "better-result", exportName: "Panic" },
+    direction: "signal-host",
+    reason:
+      "Signals a hard adapter contract invariant when getSelf reports a platform different from its descriptor registration.",
+  },
 ] as const satisfies readonly ExceptionAdapter[];
 
 const CORE_TOOL_SERVER_BOUNDARY_DECODERS = [
@@ -8621,7 +8632,7 @@ function approvedExceptionAdapterCatalogSha256(
 }
 
 export const APPROVED_EXCEPTION_ADAPTER_CATALOG_SHA256 =
-  "5504dcb6936d5d11f8a6f23dd47f34fc2069097c1ffe4ddb98dec19dfe286627";
+  "b8a999b526f5c15531e3c40d4c2b2224bd10d4a9fa3b0952b0e2692a0f729b02";
 
 export const architectureManifest = {
   version: 1,

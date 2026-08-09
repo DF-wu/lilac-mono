@@ -21,7 +21,7 @@ Source: `plan/surface-runtime-descriptor-extraction.md`
 
 ## Stage 3: Descriptor Types And Existing Registrations
 
-- [ ] Add the closed descriptor registry and Discord/GitHub factories.
+- [x] Add the closed descriptor registry and Discord/GitHub factories.
 
 ## Stage 4: Runtime Lifecycle Migration
 
