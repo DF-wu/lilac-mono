@@ -35,7 +35,6 @@ Core lifecycle:
 - `connect()`
 - `disconnect()`
 - `getSelf()`
-- `getCapabilities()`
 
 Session/message APIs:
 - `listSessions()`

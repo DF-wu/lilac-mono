@@ -42,7 +42,6 @@ import {
   resolveDiscordTokenResult,
 } from "@stanley2058/lilac-utils";
 import type {
-  AdapterCapabilities,
   ContentOpts,
   DiscordMsgRef,
   DiscordSessionRef,
@@ -128,7 +127,7 @@ import {
   customCommandInvocationErrorText,
   type CustomCommandManager,
 } from "../../custom-commands/manager";
-import { getSessionMode, resolveSessionConfigId } from "../bridge/bus-request-router/common";
+import { getSessionMode, resolveSessionConfigId } from "./discord-request-router/common";
 
 export {
   hasExplicitDiscordUserMentionInContent,
@@ -791,19 +790,6 @@ export class DiscordAdapter implements SurfaceAdapter {
       platform: "discord",
       userId: this.client.user.id,
       userName: this.cfg.surface.discord.botName,
-    };
-  }
-
-  async getCapabilities(): Promise<AdapterCapabilities> {
-    return {
-      platform: "discord",
-      send: true,
-      edit: true,
-      delete: true,
-      reactions: true,
-      readHistory: true,
-      threads: true,
-      markRead: true,
     };
   }
 

@@ -22,12 +22,11 @@ import {
 import { parseCoreConfigV1ToUniversal } from "@stanley2058/lilac-utils";
 import { Logger } from "@stanley2058/simple-module-logger";
 
-import { startBusRequestRouter } from "../../../src/surface/bridge/bus-request-router";
-import { formatBufferedMessageForGateTranscript } from "../../../src/surface/bridge/bus-request-router/gate";
+import { startDiscordRequestRouter as startBusRequestRouter } from "../../../src/surface/discord/discord-request-router";
+import { formatBufferedMessageForGateTranscript } from "../../../src/surface/discord/discord-request-router/gate";
 
 import type { SurfaceAdapter, SurfaceOutputStream } from "../../../src/surface/adapter";
 import type {
-  AdapterCapabilities,
   ContentOpts,
   LimitOpts,
   MsgRef,
@@ -43,6 +42,7 @@ import type { ModelMessage } from "ai";
 
 type TestRawBus = RawBus & {
   readonly deliveryActions: Array<{ readonly topic: string; readonly action: RawDeliveryAction }>;
+  activeSubscriptionCount(): number;
   failPublicationsTo(topic: string, cause: unknown): void;
   failStartsFor(topic: string, cause: unknown): void;
   failStopsFor(topic: string, cause: unknown): void;
@@ -103,6 +103,7 @@ function createInMemoryRawBus(): TestRawBus {
 
   return {
     deliveryActions,
+    activeSubscriptionCount: () => deliverySubs.size,
     failPublicationsTo: (topic, cause) => {
       publicationFailures.set(topic, cause);
     },
@@ -198,7 +199,10 @@ function createInMemoryRawBus(): TestRawBus {
 }
 
 class FakeAdapter implements SurfaceAdapter {
-  constructor(private readonly messages: Record<string, SurfaceMessage>) {}
+  constructor(
+    private readonly messages: Record<string, SurfaceMessage>,
+    private readonly platform: "discord" | "github" = "discord",
+  ) {}
 
   async connect(): Promise<void> {
     throw new Error("not implemented");
@@ -208,12 +212,8 @@ class FakeAdapter implements SurfaceAdapter {
   }
 
   async getSelf(): Promise<SurfaceSelf> {
-    return { platform: "discord", userId: "bot", userName: "lilac" };
+    return { platform: this.platform, userId: "bot", userName: "lilac" };
   }
-  async getCapabilities(): Promise<AdapterCapabilities> {
-    throw new Error("not implemented");
-  }
-
   async listSessions(): Promise<SurfaceSession[]> {
     throw new Error("not implemented");
   }
@@ -344,6 +344,21 @@ describe("formatBufferedMessageForGateTranscript", () => {
 });
 
 describe("startBusRequestRouter", () => {
+  it("rejects a non-Discord adapter before starting subscriptions", async () => {
+    const raw = createInMemoryRawBus();
+
+    await expect(
+      startBusRequestRouter({
+        adapter: new FakeAdapter({}, "github"),
+        bus: createLilacBus(raw),
+        subscriptionId: "discord-router-platform-invariant",
+        config: parseCoreConfigV1ToUniversal({}),
+      }),
+    ).rejects.toBeInstanceOf(Panic);
+    expect(raw.activeSubscriptionCount()).toBe(0);
+    expect(raw.deliveryActions).toEqual([]);
+  });
+
   it("parks malformed lifecycle deliveries and commits ignored and successful lifecycle branches", async () => {
     const raw = createInMemoryRawBus();
     const bus = createLilacBus(raw);

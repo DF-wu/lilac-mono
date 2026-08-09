@@ -16,7 +16,6 @@ import type {
 } from "../../../src/surface/adapter";
 import type { TranscriptSnapshot, TranscriptStore } from "../../../src/transcript/transcript-store";
 import type {
-  AdapterCapabilities,
   ContentOpts,
   LimitOpts,
   MsgRef,
@@ -80,10 +79,6 @@ class FakeAdapter implements SurfaceAdapter {
   async getSelf(): Promise<SurfaceSelf> {
     throw new Error("not implemented");
   }
-  async getCapabilities(): Promise<AdapterCapabilities> {
-    throw new Error("not implemented");
-  }
-
   async listSessions(): Promise<SurfaceSession[]> {
     throw new Error("not implemented");
   }
@@ -1030,10 +1025,6 @@ describe("request-composition mention thread context", () => {
     async getSelf(): Promise<SurfaceSelf> {
       throw new Error("not implemented");
     }
-    async getCapabilities(): Promise<AdapterCapabilities> {
-      throw new Error("not implemented");
-    }
-
     async listSessions(): Promise<SurfaceSession[]> {
       throw new Error("not implemented");
     }
@@ -1662,10 +1653,6 @@ describe("request-composition active channel burst rules", () => {
     async getSelf(): Promise<SurfaceSelf> {
       throw new Error("not implemented");
     }
-    async getCapabilities(): Promise<AdapterCapabilities> {
-      throw new Error("not implemented");
-    }
-
     async listSessions(): Promise<SurfaceSession[]> {
       throw new Error("not implemented");
     }
@@ -2835,10 +2822,6 @@ describe("request-composition active channel burst rules", () => {
       async getSelf(): Promise<SurfaceSelf> {
         throw new Error("not implemented");
       }
-      async getCapabilities(): Promise<AdapterCapabilities> {
-        throw new Error("not implemented");
-      }
-
       async listSessions(): Promise<SurfaceSession[]> {
         throw new Error("not implemented");
       }
@@ -2966,9 +2949,6 @@ describe("request-composition system message filtering", () => {
       throw new Error("not implemented");
     }
     async getSelf(): Promise<SurfaceSelf> {
-      throw new Error("not implemented");
-    }
-    async getCapabilities(): Promise<AdapterCapabilities> {
       throw new Error("not implemented");
     }
     async listSessions(): Promise<SurfaceSession[]> {
@@ -3108,10 +3088,6 @@ describe("request-composition session divider", () => {
     async getSelf(): Promise<SurfaceSelf> {
       return { platform: "discord", userId: "bot", userName: "lilac" };
     }
-    async getCapabilities(): Promise<AdapterCapabilities> {
-      throw new Error("not implemented");
-    }
-
     async listSessions(): Promise<SurfaceSession[]> {
       throw new Error("not implemented");
     }

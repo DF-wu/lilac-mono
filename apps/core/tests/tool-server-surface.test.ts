@@ -15,7 +15,6 @@ import fs from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type {
-  AdapterCapabilities,
   ContentOpts,
   LimitOpts,
   MsgRef,
@@ -64,19 +63,6 @@ class FakeAdapter implements SurfaceAdapter {
 
   async getSelf(): Promise<SurfaceSelf> {
     return { platform: "discord", userId: "bot", userName: "lilac" };
-  }
-
-  async getCapabilities(): Promise<AdapterCapabilities> {
-    return {
-      platform: "discord",
-      send: true,
-      edit: true,
-      delete: true,
-      reactions: true,
-      readHistory: true,
-      threads: true,
-      markRead: true,
-    };
   }
 
   async listSessions(): Promise<SurfaceSession[]> {

@@ -150,7 +150,7 @@ The Discord adapter also maintains a local SQLite cache (`discord-surface.db`) f
 
 The router subscribes to `evt.adapter` and decides whether to create/append to an agent request for Discord events.
 
-- Implementation: `apps/core/src/surface/bridge/bus-request-router.ts`.
+- Implementation: `apps/core/src/surface/discord/discord-request-router.ts`.
 - Routing modes:
   - `mention`: only start a new request when the bot is mentioned or replied-to.
   - `active`: treat the session like a group chat and respond more aggressively.
@@ -530,7 +530,7 @@ Shutdown happens in reverse (best-effort).
 ## Common “Where Do I Change X?” Pointers
 
 - Add/modify bus event types: add one `LILAC_EVENTS` entry in `packages/event-bus/lilac-spec.ts`, add its wire compatibility fixture, then publish and subscribe with an explicit delivery policy.
-- Change request routing behavior: `apps/core/src/surface/bridge/bus-request-router.ts` and config schema in `packages/utils/core-config.ts`.
+- Change request routing behavior: `apps/core/src/surface/discord/discord-request-router.ts` and config schema in `packages/utils/core-config.ts`.
 - Change agent execution behavior (steer/follow-up/interrupt semantics): `packages/agent/ai-sdk-pi-agent.ts`.
 - Change which local tools the LLM can call: `apps/core/src/surface/bridge/bus-agent-runner.ts`.
 - Add a new HTTP tool: implement `ServerTool` in `apps/core/src/tool-server/tools/*` and expose it from a built-in plugin in `apps/core/src/plugins/builtin/*`.

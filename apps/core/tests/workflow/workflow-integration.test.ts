@@ -93,18 +93,6 @@ class WorkflowCardAdapter implements SurfaceAdapter {
   async getSelf() {
     return { platform: "discord" as const, userId: "bot", userName: "bot" };
   }
-  async getCapabilities() {
-    return {
-      platform: "discord" as const,
-      send: true,
-      edit: true,
-      delete: false,
-      reactions: false,
-      readHistory: true,
-      threads: false,
-      markRead: false,
-    };
-  }
   async listSessions() {
     return [];
   }

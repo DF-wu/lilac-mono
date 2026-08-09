@@ -212,7 +212,10 @@ import {
   maybeAppendResponseCommentaryPrompt,
   resolveSessionAdditionalPrompts,
 } from "./bus-agent-runner/prompt-overlays";
-import { resolveSessionSafetyMode, type SessionSafetyMode } from "./bus-request-router/common";
+import {
+  resolveSessionSafetyMode,
+  type SessionSafetyMode,
+} from "../discord/discord-request-router/common";
 import type {
   CustomCommandExecutionError,
   CustomCommandManager,

@@ -1,36 +1,6 @@
 import { describe, expect, it } from "bun:test";
 
-import {
-  GithubAdapter,
-  isGithubCommentAuthoredByActor,
-} from "../../../src/surface/github/github-adapter";
-
-describe("GitHub authoritative actor projection", () => {
-  it("matches user and app identities without exposing raw protocol data", () => {
-    expect(
-      isGithubCommentAuthoredByActor(
-        { user: { login: "Lilac-Bot", id: 12 } },
-        { source: "user", login: "lilac-bot" },
-      ),
-    ).toBe(true);
-    expect(
-      isGithubCommentAuthoredByActor(
-        { performed_via_github_app: { id: 91 } },
-        { source: "app", appId: 91 },
-      ),
-    ).toBe(true);
-  });
-
-  it("uses the closed false fallback for malformed and future wire variants", () => {
-    expect(
-      isGithubCommentAuthoredByActor(
-        { user: { login: ["future"], id: "12" }, extra: { hostile: true } },
-        { source: "user", login: "lilac-bot" },
-      ),
-    ).toBe(false);
-    expect(isGithubCommentAuthoredByActor(null, { source: "app", appId: 91 })).toBe(false);
-  });
-});
+import { GithubAdapter } from "../../../src/surface/github/github-adapter";
 
 describe("GitHub adapter contract failures", () => {
   it("signals a typed host failure for a mismatched session platform", async () => {

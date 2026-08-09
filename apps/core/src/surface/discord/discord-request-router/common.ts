@@ -10,7 +10,7 @@ import { Result } from "better-result";
 import { z } from "zod";
 
 import type { MsgRef } from "../../types";
-import { formatGenericRequestId, formatQueuedRequestId } from "../request-ids";
+import { formatGenericRequestId, formatQueuedRequestId } from "../../bridge/request-ids";
 
 export type SessionMode = "mention" | "active";
 export type SessionSafetyMode = "trusted" | "restricted";

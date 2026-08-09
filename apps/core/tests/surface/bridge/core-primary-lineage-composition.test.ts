@@ -19,7 +19,6 @@ import {
 } from "../../../src/surface/bridge/request-composition";
 import type { SurfaceAdapter, SurfaceOutputStream } from "../../../src/surface/adapter";
 import type {
-  AdapterCapabilities,
   ContentOpts,
   LimitOpts,
   MsgRef,
@@ -115,9 +114,6 @@ class MutableAdapter implements SurfaceAdapter {
 
   async connect(): Promise<void> {}
   async disconnect(): Promise<void> {}
-  async getCapabilities(): Promise<AdapterCapabilities> {
-    throw new Error("not used");
-  }
   async listSessions(): Promise<SurfaceSession[]> {
     throw new Error("not used");
   }

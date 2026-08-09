@@ -12,8 +12,6 @@ import {
 import {
   getGithubUserLoginOrNull as getGithubUserLoginFromAuth,
   getGithubViewerLoginOrNull as getGithubViewerLoginByTokenOrNull,
-  resolveGithubViewerLoginOrThrow,
-  getGithubUserAuthOrNull,
   getPreferredGithubAuthOrNull,
   getPreferredGithubAuthResult,
   type GithubAuthFailed,
@@ -498,25 +496,6 @@ export async function getGithubUserLoginOrNull(): Promise<string | null> {
 
 export async function getConfiguredGithubAppIdOrNull(): Promise<number | null> {
   return (await readGithubAppSecret(env.dataDir))?.appId ?? null;
-}
-
-export type GithubAuthoritativeActor =
-  | { source: "app"; appId: number }
-  | { source: "user"; login: string };
-
-export async function getPreferredGithubAuthoritativeActorOrNull(
-  params: { dataDir: string } = { dataDir: env.dataDir },
-): Promise<GithubAuthoritativeActor | null> {
-  const user = await getGithubUserAuthOrNull(params);
-  if (user) {
-    const login = await resolveGithubViewerLoginOrThrow({
-      apiBaseUrl: user.apiBaseUrl,
-      token: user.token,
-    });
-    return { source: "user", login: login.toLowerCase() };
-  }
-  const app = await readGithubAppSecret(params.dataDir);
-  return app ? { source: "app", appId: app.appId } : null;
 }
 
 export async function getPreferredGithubActorLoginOrNull(): Promise<string | null> {

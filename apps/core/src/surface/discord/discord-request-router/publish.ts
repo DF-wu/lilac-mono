@@ -18,7 +18,7 @@ import {
   composeRecentChannelMessages,
   composeRequestMessages,
   composeSingleMessageWithLineage,
-} from "../request-composition";
+} from "../../bridge/request-composition";
 import { buildDiscordUserAliasById, previewText, type SessionMode } from "./common";
 
 export type PublishBusRequestInput = {

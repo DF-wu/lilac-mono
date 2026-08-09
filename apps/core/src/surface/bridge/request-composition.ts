@@ -16,7 +16,7 @@ import type { MsgRef, SurfaceMessage } from "../types";
 import {
   parseLeadingContinueDirective,
   stripLeadingContinueDirective,
-} from "./bus-request-router/common";
+} from "../discord/discord-request-router/common";
 import {
   isDiscordSessionDividerSurfaceMessageAnyAuthor,
   isDiscordSessionDividerSurfaceMessage,

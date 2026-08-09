@@ -9,8 +9,11 @@ import {
 } from "@stanley2058/lilac-utils";
 import type { Logger } from "@stanley2058/simple-module-logger";
 import type { MsgRef } from "../../types";
-import { formatBridgeTaggedErrorForLog } from "../bridge-log";
-import { escapeSurfaceMetadataTags, formatSurfaceMetadataLine } from "../surface-metadata";
+import { formatBridgeTaggedErrorForLog } from "../../bridge/bridge-log";
+import {
+  escapeSurfaceMetadataTags,
+  formatSurfaceMetadataLine,
+} from "../../bridge/surface-metadata";
 
 export type RouterGateContextMode = "active-batch" | "direct-reply-mention-disambiguation";
 

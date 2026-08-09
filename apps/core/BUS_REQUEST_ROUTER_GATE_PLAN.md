@@ -14,7 +14,7 @@ Non-scope:
 
 ## Repo Touch Points
 
-- Router: `apps/core/src/surface/bridge/bus-request-router.ts`
+- Router: `apps/core/src/surface/discord/discord-request-router.ts`
 - Prompt composition: `apps/core/src/surface/bridge/request-composition.ts`
 - Config schema: `packages/utils/core-config.ts`
 - Config template (seeded into `DATA_DIR/core-config.yaml` on first run): `packages/utils/config-templates/core-config.example.yaml`
@@ -29,7 +29,7 @@ Non-scope:
 
 ## Current Behavior
 
-Router implementation: `apps/core/src/surface/bridge/bus-request-router.ts`
+Router implementation: `apps/core/src/surface/discord/discord-request-router.ts`
 
 - In active mode:
   - If no active request exists: debounce, optionally run the gate, then publish a new `cmd.request.message` (`queue: "prompt"`).

@@ -18,17 +18,17 @@ import {
   type LilacBus,
   type CorePrimaryLineageV1,
 } from "@stanley2058/lilac-event-bus";
-import { Result, TaggedError, type Panic, type Result as ResultType } from "better-result";
+import { Panic, Result, TaggedError, type Result as ResultType } from "better-result";
 import type { Logger } from "@stanley2058/simple-module-logger";
 import type { SurfaceAdapter } from "../adapter";
-import type { MsgRef } from "../types";
+import type { MsgRef, SurfaceSelf } from "../types";
 import type { TranscriptStore } from "../../transcript/transcript-store";
 import {
   composeRequestMessages,
   composeSingleMessageWithLineage,
   type RequestCompositionResult,
-} from "./request-composition";
-import { formatDiscordMessageRequestId } from "./request-ids";
+} from "../bridge/request-composition";
+import { formatDiscordMessageRequestId } from "../bridge/request-ids";
 
 import {
   type SessionMode,
@@ -54,21 +54,21 @@ import {
   buildDiscordUserAliasById,
   getDiscordFlags,
   withDefaultToolsConfig,
-} from "./bus-request-router/common";
+} from "./discord-request-router/common";
 
 import {
   type BufferedMessage,
   type RouterGateInput,
   type RouterGateDecision,
   shouldForwardByGate,
-} from "./bus-request-router/gate";
+} from "./discord-request-router/gate";
 import {
   type PendingMentionReplyBatch,
   type PendingMentionReplyBatchItem,
   enqueuePendingMentionReplyBatch as enqueuePendingMentionReplyBatchImpl,
   takePendingMentionReplyBatch as takePendingMentionReplyBatchImpl,
   transformPendingUserText as transformPendingUserTextImpl,
-} from "./bus-request-router/pending-batch";
+} from "./discord-request-router/pending-batch";
 import {
   type PublishBusRequestInput,
   publishActiveChannelPrompt as publishActiveChannelPromptImpl,
@@ -77,18 +77,18 @@ import {
   publishSingleMessagePrompt as publishSingleMessagePromptImpl,
   publishSingleMessageToActiveRequest as publishSingleMessageToActiveRequestImpl,
   publishSurfaceOutputReanchor as publishSurfaceOutputReanchorImpl,
-} from "./bus-request-router/publish";
+} from "./discord-request-router/publish";
 import {
   resolvePreviousBatchMessageText as resolvePreviousBatchMessageTextImpl,
   resolvePreviousMessageText as resolvePreviousMessageTextImpl,
   resolveRepliedToMessageText as resolveRepliedToMessageTextImpl,
-} from "./bus-request-router/context";
-import { decideActiveRequestRoute } from "./bus-request-router/decisions";
+} from "./discord-request-router/context";
+import { decideActiveRequestRoute } from "./discord-request-router/decisions";
 import {
   customCommandInvocationErrorText,
   type CustomCommandManager,
 } from "../../custom-commands/manager";
-import { formatBridgeTaggedErrorForLog } from "./bridge-log";
+import { formatBridgeTaggedErrorForLog } from "../bridge/bridge-log";
 
 function createFreshOnlyLineage(
   reason: string,
@@ -155,7 +155,7 @@ type RouterDeliverySubscription = {
   stop(): Promise<ResultType<void, EventDeliveryStopFailed>>;
 };
 
-export type BusRequestRouter = {
+export type DiscordRequestRouter = {
   readonly done: Promise<ResultType<void, EventDeliveryDoneError>>;
   stop(): Promise<void>;
 };
@@ -313,7 +313,7 @@ type DebounceBuffer = {
   timer: ReturnType<typeof setTimeout> | null;
 };
 
-export async function startBusRequestRouter(params: {
+export type StartDiscordRequestRouterInput = {
   adapter: SurfaceAdapter;
   bus: LilacBus;
   subscriptionId: string;
@@ -332,13 +332,27 @@ export async function startBusRequestRouter(params: {
   routerGate?: (input: RouterGateInput) => Promise<RouterGateDecision>;
   /** Optional structured logger injection for embedding and tests. */
   logger?: Logger;
-}): Promise<BusRequestRouter> {
+};
+
+export function signalDiscordRequestRouterPlatformMismatch(
+  platform: SurfaceSelf["platform"],
+): never {
+  throw new Panic({
+    message: `Discord request router requires a Discord adapter (got '${platform}')`,
+  });
+}
+
+export async function startDiscordRequestRouter(
+  params: StartDiscordRequestRouterInput,
+): Promise<DiscordRequestRouter> {
   const { adapter, bus, subscriptionId, customCommands } = params;
+  const self = await adapter.getSelf();
+  if (self.platform !== "discord") signalDiscordRequestRouterPlatformMismatch(self.platform);
 
   const logger =
     params.logger ??
     createLogger({
-      module: "bus-request-router",
+      module: "discord-request-router",
     });
 
   let cfg = params.config

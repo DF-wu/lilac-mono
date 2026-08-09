@@ -8,7 +8,7 @@ import {
   resolveSessionSafetyMode,
   stripLeadingContinueDirective,
   withDefaultToolsConfig,
-} from "../../../src/surface/bridge/bus-request-router/common";
+} from "../../../src/surface/discord/discord-request-router/common";
 
 const EMPTY_DISCORD_FLAGS = {};
 

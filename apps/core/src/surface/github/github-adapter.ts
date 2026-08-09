@@ -1,8 +1,6 @@
-import { z } from "zod";
 import { Result, TaggedError, type Result as ResultType } from "better-result";
 
 import type {
-  AdapterCapabilities,
   ContentOpts,
   GithubMsgRef,
   GithubSessionRef,
@@ -27,10 +25,8 @@ import {
   editIssueComment,
   getIssue,
   getIssueComment,
-  getPreferredGithubAuthoritativeActorOrNull,
   GithubApiError,
   listIssueComments,
-  type GithubAuthoritativeActor,
 } from "../../github/github-api";
 import { markGithubAgentComment } from "../../github/github-comment-marker";
 import { isGithubIssueTriggerId, parseGithubSessionId } from "../../github/github-ids";
@@ -71,27 +67,7 @@ function resolveGithubMsgRef(
   );
 }
 
-export function isGithubCommentAuthoredByActor(
-  raw: unknown,
-  actor: GithubAuthoritativeActor,
-): boolean {
-  const parsed = z
-    .object({
-      user: z.object({ login: z.string().min(1), id: z.number().int().positive() }).optional(),
-      performed_via_github_app: z.object({ id: z.number().int().positive() }).nullable().optional(),
-    })
-    .safeParse(raw);
-  if (!parsed.success) return false;
-  return actor.source === "app"
-    ? parsed.data.performed_via_github_app?.id === actor.appId
-    : parsed.data.user?.login.toLowerCase() === actor.login;
-}
-
 export class GithubAdapter implements SurfaceAdapter {
-  constructor(
-    private readonly resolveAuthoritativeActor: typeof getPreferredGithubAuthoritativeActorOrNull = getPreferredGithubAuthoritativeActorOrNull,
-  ) {}
-
   async connect(): Promise<void> {
     // No persistent connection.
   }
@@ -104,32 +80,6 @@ export class GithubAdapter implements SurfaceAdapter {
     // We don't have a stable user id for GitHub App installation tokens.
     // Best-effort: return a placeholder; webhook matching uses gh/app slug.
     return { platform: "github", userId: "github", userName: "github" };
-  }
-
-  async isAuthoritativelySelfAuthored(message: SurfaceMessage): Promise<boolean> {
-    const verify = await this.resolveAuthoritativeSelfMessageVerifier();
-    return verify(message);
-  }
-
-  async resolveAuthoritativeSelfMessageVerifier(): Promise<(message: SurfaceMessage) => boolean> {
-    const actor = await this.resolveAuthoritativeActor();
-    return (message) =>
-      message.ref.platform === "github" &&
-      actor !== null &&
-      isGithubCommentAuthoredByActor(message.raw, actor);
-  }
-
-  async getCapabilities(): Promise<AdapterCapabilities> {
-    return {
-      platform: "github",
-      send: true,
-      edit: true,
-      delete: false,
-      reactions: true,
-      readHistory: true,
-      threads: false,
-      markRead: false,
-    };
   }
 
   async listSessions(): Promise<SurfaceSession[]> {

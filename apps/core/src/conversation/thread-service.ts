@@ -43,7 +43,7 @@ import type {
   ConversationThreadEmbeddingUsageEvent,
 } from "./thread-embedding";
 import type { EntityMapper } from "../entity/entity-mapper";
-import { stripLeadingContinueDirective } from "../surface/bridge/bus-request-router/common";
+import { stripLeadingContinueDirective } from "../surface/discord/discord-request-router/common";
 import { isSqliteBusyError } from "../shared/sqlite";
 import { adaptToolResultToHost } from "../tools/tool-result-adapters";
 import { projectRuntimeError } from "../runtime/error-format";

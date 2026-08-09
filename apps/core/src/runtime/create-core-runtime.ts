@@ -41,7 +41,10 @@ import { GithubAdapter } from "../surface/github/github-adapter";
 import type { SurfaceAdapter } from "../surface/adapter";
 import { bridgeAdapterToBus } from "../surface/bridge/publish-to-bus";
 import { bridgeBusToAdapter } from "../surface/bridge/subscribe-from-bus";
-import { startBusRequestRouter, type BusRequestRouter } from "../surface/bridge/bus-request-router";
+import {
+  startDiscordRequestRouter,
+  type DiscordRequestRouter,
+} from "../surface/discord/discord-request-router";
 import {
   resolveAgentRunModel,
   resolveAgentRunModelFallbacks,
@@ -280,7 +283,7 @@ export async function superviseDetachedCoreConfigValidation(params: {
 function normalizeRouterDoneDefect(cause: unknown): Error {
   if (isPanic(cause)) return cause;
   if (cause instanceof Error) return cause;
-  return new Panic({ message: "Bus request router subscription rejected" });
+  return new Panic({ message: "Discord request router subscription rejected" });
 }
 
 export function superviseCoreRouterDone(params: {
@@ -304,7 +307,7 @@ export function superviseCoreRouterDone(params: {
       return;
     }
     params.reportFatalError(
-      new Panic({ message: "Bus request router subscriptions completed unexpectedly" }),
+      new Panic({ message: "Discord request router subscriptions completed unexpectedly" }),
     );
   }
 }
@@ -929,7 +932,7 @@ export async function createCoreRuntime(
 
   let stopAdapterToBus: { stop(): Promise<void> } | null = null;
   let stopDiscordSearchIndexer: { stop(): Promise<void> } | null = null;
-  let stopRouter: BusRequestRouter | null = null;
+  let stopRouter: DiscordRequestRouter | null = null;
   let routerSupervision: Promise<void> | null = null;
   let stopWorkflowActionResolver: { stop(): Promise<void> } | null = null;
   let workflowProgressProjector: WorkflowProgressProjector | null = null;
@@ -1076,7 +1079,7 @@ export async function createCoreRuntime(
         reason:
           !started || routerSubscriptionHealthy
             ? undefined
-            : "bus request router subscriptions terminated unexpectedly",
+            : "Discord request router subscriptions terminated unexpectedly",
       },
     ];
 
@@ -1608,7 +1611,7 @@ export async function createCoreRuntime(
           },
         });
 
-        stopRouter = await startBusRequestRouter({
+        stopRouter = await startDiscordRequestRouter({
           adapter,
           bus,
           subscriptionId: subId(subscriptionPrefix, "router"),
@@ -1627,7 +1630,7 @@ export async function createCoreRuntime(
           reportFatalError,
         });
 
-        logger.debug("Bus request router started", {
+        logger.debug("Discord request router started", {
           subscriptionId: subId(subscriptionPrefix, "router"),
         });
 

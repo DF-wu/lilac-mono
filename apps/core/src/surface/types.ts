@@ -142,14 +142,3 @@ export type SendOpts = {
   /** Disable all Discord notifications for this send (mentions + reply ping). */
   silent?: boolean;
 };
-
-export type AdapterCapabilities = {
-  platform: SurfacePlatform;
-  send: boolean;
-  edit: boolean;
-  delete: boolean;
-  reactions: boolean;
-  readHistory: boolean;
-  threads: boolean;
-  markRead: boolean;
-};

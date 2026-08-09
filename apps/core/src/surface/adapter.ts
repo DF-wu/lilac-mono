@@ -1,7 +1,6 @@
 import { Panic } from "better-result";
 
 import type {
-  AdapterCapabilities,
   ContentOpts,
   LimitOpts,
   MsgRef,
@@ -132,7 +131,6 @@ export interface SurfaceAdapter {
   connect(): Promise<void>;
   disconnect(): Promise<void>;
   getSelf(): Promise<SurfaceSelf>;
-  getCapabilities(): Promise<AdapterCapabilities>;
 
   listSessions(): Promise<SurfaceSession[]>;
 
@@ -153,22 +151,6 @@ export interface SurfaceAdapter {
 
   getUnRead(sessionRef: SessionRef): Promise<SurfaceMessage[]>;
   markRead(sessionRef: SessionRef, upToMsgRef?: MsgRef): Promise<void>;
-}
-
-export interface SurfaceAuthoritativeSelfMessageProvider {
-  resolveAuthoritativeSelfMessageVerifier(): Promise<(message: SurfaceMessage) => boolean>;
-  isAuthoritativelySelfAuthored(message: SurfaceMessage): Promise<boolean>;
-}
-
-export function hasAuthoritativeSelfMessageProvider(
-  adapter: SurfaceAdapter,
-): adapter is SurfaceAdapter & SurfaceAuthoritativeSelfMessageProvider {
-  return (
-    "resolveAuthoritativeSelfMessageVerifier" in adapter &&
-    typeof adapter.resolveAuthoritativeSelfMessageVerifier === "function" &&
-    "isAuthoritativelySelfAuthored" in adapter &&
-    typeof adapter.isAuthoritativelySelfAuthored === "function"
-  );
 }
 
 /** Optional capability: plan reply-chain traversal using local metadata/indexes. */

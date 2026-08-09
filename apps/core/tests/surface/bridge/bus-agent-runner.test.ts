@@ -153,7 +153,7 @@ import {
 } from "../../../src/transcript/transcript-store";
 import { createAgentOutputActivityPublisher } from "../../../src/shared/agent-output-activity";
 import { createIdleTimer } from "../../../src/shared/idle-timer";
-import { startBusRequestRouter } from "../../../src/surface/bridge/bus-request-router";
+import { startDiscordRequestRouter as startBusRequestRouter } from "../../../src/surface/discord/discord-request-router";
 import { bridgeAdapterToBus } from "../../../src/surface/bridge/publish-to-bus";
 import { bridgeBusToAdapter } from "../../../src/surface/bridge/subscribe-from-bus";
 import { formatSurfaceMetadataLine } from "../../../src/surface/bridge/surface-metadata";
@@ -165,7 +165,6 @@ import type {
   SurfaceOutputStream,
 } from "../../../src/surface/adapter";
 import type {
-  AdapterCapabilities,
   ContentOpts,
   LimitOpts,
   MsgRef,
@@ -2208,10 +2207,6 @@ class ProductionPathDiscordAdapter implements SurfaceAdapter {
 
   async getSelf(): Promise<SurfaceSelf> {
     return { platform: "discord", userId: "bot", userName: "lilac" };
-  }
-
-  async getCapabilities(): Promise<AdapterCapabilities> {
-    throw new Error("not used");
   }
 
   async listSessions(): Promise<SurfaceSession[]> {

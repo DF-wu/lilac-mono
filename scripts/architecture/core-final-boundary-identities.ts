@@ -3,7 +3,7 @@ export const CORE_FINAL_BOUNDARY_IDENTITIES = [
   ["src/surface/adapter.ts", "surfaceExternalFallback.<callback>"],
   ["src/surface/discord/discord-embed-text.ts", "normalizeDiscordEmbeds"],
   ["src/surface/discord/discord-message-meta.ts", "normalizeFlagsNumber"],
-  ["src/surface/bridge/bus-request-router/common.ts", "withDefaultToolsConfig"],
+  ["src/surface/discord/discord-request-router/common.ts", "withDefaultToolsConfig"],
   ["src/surface/discord/discord-adapter.ts", "discordNotFoundCode"],
   [
     "src/surface/discord/discord-adapter.ts",
@@ -105,10 +105,6 @@ export const CORE_FINAL_BOUNDARY_IDENTITIES = [
   [
     "src/workflow/durable-workflow-store.ts",
     "DurableWorkflowStore.summarizeMeaningfulOperations.map.<callback@1>",
-  ],
-  [
-    "src/surface/github/github-adapter.ts",
-    "GithubAdapter.resolveAuthoritativeSelfMessageVerifier.<callback>",
   ],
   ["src/surface/github/github-adapter.ts", "GithubAdapter.readMsg.catch.<callback@1>"],
   [
@@ -222,12 +218,12 @@ export const CORE_FINAL_BOUNDARY_IDENTITIES = [
   ["src/surface/bridge/request-composition.ts", "getSurfaceMessageReplyTargetId"],
   ["src/surface/bridge/request-composition.ts", "composeRequestMessages.filter.<callback@1>"],
   ["src/surface/bridge/request-composition.ts", "composeSingleMessageWithLineage"],
-  ["src/surface/bridge/bus-request-router/publish.ts", "publishBusRequest"],
+  ["src/surface/discord/discord-request-router/publish.ts", "publishBusRequest"],
   [
-    "src/surface/bridge/bus-request-router.ts",
-    "startBusRequestRouter.subscribeTopic.<callback@3>@3.captureRouterRouting.<callback@2>@2",
+    "src/surface/discord/discord-request-router.ts",
+    "startDiscordRequestRouter.subscribeTopic.<callback@3>@3.captureRouterRouting.<callback@2>@2",
   ],
-  ["src/surface/bridge/bus-request-router.ts", "startBusRequestRouter.flushDebounce"],
+  ["src/surface/discord/discord-request-router.ts", "startDiscordRequestRouter.flushDebounce"],
   [
     "src/workflow/workflow-live-parent-bridge.ts",
     "WorkflowLiveParentBridge.enableOrphanHandling.setTimeout.<callback@1>.catch.<callback@1>",
@@ -343,7 +339,6 @@ export const CORE_FINAL_BOUNDARY_IDENTITIES = [
   ["src/runtime/main.ts", "projectProcessFailure"],
   ["src/tools/tool-env.ts", "isMissingToolEnvFile"],
   ["src/mcp/registry.ts", "isOptionalHttpInboundSseError"],
-  ["src/surface/github/github-adapter.ts", "isGithubCommentAuthoredByActor"],
   ["src/mcp/config-file.ts", "McpConfigError.constructor"],
   ["src/mcp/oauth-provider.ts", "McpOAuthProviderError.constructor"],
   ["src/surface/bridge/bus-agent-runner.ts", "signalBusAgentRunnerHostFailure"],
@@ -367,7 +362,7 @@ export const CORE_FINAL_BOUNDARY_IDENTITIES = [
     "src/surface/bridge/bus-agent-runner/core-primary-continuation.ts",
     "createCorePrimaryClaudeRuntime.diagnostic",
   ],
-  ["src/surface/bridge/bus-request-router/publish.ts", "publishSingleMessagePrompt"],
+  ["src/surface/discord/discord-request-router/publish.ts", "publishSingleMessagePrompt"],
   ["src/surface/bridge/request-composition.ts", "applyUserTextTransformToReplyChainMessage"],
   ["src/surface/bridge/request-composition.ts", "composeSelectedDiscordChain.map.<callback@1>"],
   ["src/surface/bridge/request-composition.ts", "stripContinueDirectiveFromReplyChainMessage"],
@@ -418,7 +413,6 @@ export const CORE_FINAL_BOUNDARY_IDENTITIES = [
   ["src/ssh/remote-js/remote-runner-utils.ts", "opaqueErrorCause"],
 ] as const;
 export const CORE_FINAL_CAPABILITY_IDENTITIES = [
-  ["src/surface/adapter.ts", "hasAuthoritativeSelfMessageProvider"],
   ["src/surface/adapter.ts", "hasReplyChainPlannerProvider"],
   ["src/surface/adapter.ts", "hasCacheBurstProvider"],
   ["src/surface/discord/discord-adapter.ts", "classifyDiscordSurfaceNotFound"],
@@ -426,7 +420,6 @@ export const CORE_FINAL_CAPABILITY_IDENTITIES = [
   ["src/surface/bridge/bus-agent-runner/raw.ts", "requestRawReferencesMessage"],
   ["src/surface/bridge/bus-agent-runner/raw.ts", "isSubagentProfile"],
   ["src/surface/bridge/subscribe-from-bus.ts", "isTypingIndicatorProvider"],
-  ["src/surface/github/github-adapter.ts", "isGithubCommentAuthoredByActor"],
   ["src/mcp/registry.ts", "isOptionalHttpInboundSseError"],
   ["src/tools/tool-env.ts", "isMissingToolEnvFile"],
   ["src/plugins/builtin/local-tools.ts", "isDelegateHandler"],

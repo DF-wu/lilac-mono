@@ -3477,12 +3477,12 @@ export const LEGACY_UNENFORCED_EXCEPTION_ADAPTERS = new Map<string, readonly Exc
       })),
       ...[
         "captureRouterRouting",
-        "startBusRequestRouter.reloadCoreConfigIfNeeded",
-        "startBusRequestRouter.evaluateAdapterSuppression",
-        "startBusRequestRouter.evaluateDirectReplyRouterGate",
+        "startDiscordRequestRouter.reloadCoreConfigIfNeeded",
+        "startDiscordRequestRouter.evaluateAdapterSuppression",
+        "startDiscordRequestRouter.evaluateDirectReplyRouterGate",
       ].flatMap((exportName) => [
         {
-          identity: { module: "src/surface/bridge/bus-request-router.ts", exportName },
+          identity: { module: "src/surface/discord/discord-request-router.ts", exportName },
           category: (exportName.startsWith("captureRouter")
             ? "external-to-result"
             : "compatibility") as "external-to-result" | "compatibility",
@@ -3495,7 +3495,7 @@ export const LEGACY_UNENFORCED_EXCEPTION_ADAPTERS = new Map<string, readonly Exc
             "Captures an immediate router dependency rejection using its established typed Result or fail-open policy.",
         },
         {
-          identity: { module: "src/surface/bridge/bus-request-router.ts", exportName },
+          identity: { module: "src/surface/discord/discord-request-router.ts", exportName },
           category: "defect-supervisor" as const,
           externalApi: { package: "better-result", exportName: "Panic.is" },
           direction: "observe-panic" as const,
@@ -3518,7 +3518,7 @@ export const LEGACY_UNENFORCED_EXCEPTION_ADAPTERS = new Map<string, readonly Exc
         },
       ].map(({ category, externalApi, direction, reason }) => ({
         identity: {
-          module: "src/surface/bridge/bus-request-router/common.ts",
+          module: "src/surface/discord/discord-request-router/common.ts",
           exportName: "getDiscordFlags",
         },
         category,
@@ -3546,14 +3546,14 @@ export const LEGACY_UNENFORCED_EXCEPTION_ADAPTERS = new Map<string, readonly Exc
         },
       ].flatMap(({ exportName, externalApi, reason }) => [
         {
-          identity: { module: "src/surface/bridge/bus-request-router.ts", exportName },
+          identity: { module: "src/surface/discord/discord-request-router.ts", exportName },
           category: "external-to-result" as const,
           externalApi,
           direction: "capture-external" as const,
           reason,
         },
         {
-          identity: { module: "src/surface/bridge/bus-request-router.ts", exportName },
+          identity: { module: "src/surface/discord/discord-request-router.ts", exportName },
           category: "defect-supervisor" as const,
           externalApi: { package: "better-result", exportName: "Panic.is" },
           direction: "observe-panic" as const,
@@ -3561,13 +3561,24 @@ export const LEGACY_UNENFORCED_EXCEPTION_ADAPTERS = new Map<string, readonly Exc
         },
       ]),
       ...["adaptRouterSubscriptionStart", "adaptRouterSubscriptionsStop"].map((exportName) => ({
-        identity: { module: "src/surface/bridge/bus-request-router.ts", exportName },
+        identity: { module: "src/surface/discord/discord-request-router.ts", exportName },
         category: "result-to-framework" as const,
         externalApi: { package: "@stanley2058/lilac-core", exportName: "request router lifecycle" },
         direction: "signal-host" as const,
         reason:
           "Adapts the event-delivery lifecycle Result at the existing request-router host boundary.",
       })),
+      {
+        identity: {
+          module: "src/surface/discord/discord-request-router.ts",
+          exportName: "signalDiscordRequestRouterPlatformMismatch",
+        },
+        category: "defect-supervisor",
+        externalApi: { package: "better-result", exportName: "Panic" },
+        direction: "signal-host",
+        reason:
+          "Signals a hard startup invariant when the Discord router receives another platform's adapter.",
+      },
       {
         identity: {
           module: "src/surface/bridge/subscribe-from-bus.ts",
@@ -6620,8 +6631,8 @@ const CORE_EVENT_DELIVERY_CONSUMERS = [
   },
   {
     identity: {
-      module: "src/surface/bridge/bus-request-router.ts",
-      exportName: "startBusRequestRouter",
+      module: "src/surface/discord/discord-request-router.ts",
+      exportName: "startDiscordRequestRouter",
     },
     apiPackage: "@stanley2058/lilac-event-bus",
     operations: ["subscribeTopic"],
@@ -7209,7 +7220,7 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
             },
             {
               identity: {
-                module: "src/surface/bridge/bus-request-router/common.ts",
+                module: "src/surface/discord/discord-request-router/common.ts",
                 exportName: "getDiscordFlags",
               },
               category: "projection",
@@ -8596,7 +8607,7 @@ function approvedExceptionAdapterCatalogSha256(
 }
 
 export const APPROVED_EXCEPTION_ADAPTER_CATALOG_SHA256 =
-  "cca9f77935a9d6b83fb1e1f4c42c31d084240657953772daa294d22d69021499";
+  "2684c364ca341bd0ffd55f32b2b0b0f603a48958a75719c83302098ecbc2280d";
 
 export const architectureManifest = {
   version: 1,
