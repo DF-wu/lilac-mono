@@ -1,4 +1,4 @@
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, spyOn } from "bun:test";
 import { Panic, Result, type Result as ResultType } from "better-result";
 
 import { bridgeBusToAdapter } from "../../../src/surface/bridge/subscribe-from-bus";
@@ -33,7 +33,13 @@ import {
   type RawDeliveryAction,
   type RawDeliveryHandler,
 } from "@stanley2058/lilac-event-bus";
-import { setGithubLatestRequestForSession } from "../../../src/github/github-state";
+import {
+  clearGithubAck,
+  getGithubAck,
+  setGithubAck,
+  setGithubLatestRequestForSession,
+  type GithubAckState,
+} from "../../../src/github/github-state";
 import {
   TranscriptStoreSqliteDriverFailure,
   type TranscriptStore,
@@ -3153,6 +3159,64 @@ describe("bridgeBusToAdapter", () => {
     await bridge.stop();
   });
 
+  it.each([
+    [
+      "skip",
+      { finalText: "ignored", delivery: "skip" as const },
+      { kind: "issue", issueNumber: 12 },
+    ],
+    ["empty output", { finalText: "" }, { kind: "issue", issueNumber: 12 }],
+    ["finish", { finalText: "finished" }, { kind: "issue", issueNumber: 12 }],
+    [
+      "finish for a comment reaction",
+      { finalText: "finished" },
+      { kind: "comment", commentId: 55, issueNumber: 12 },
+    ],
+  ] satisfies ReadonlyArray<
+    readonly [string, { finalText: string; delivery?: "skip" }, GithubAckState["target"]]
+  >)("clears the GitHub acknowledgement on %s", async (_terminal, response, target) => {
+    const warning = spyOn(console, "warn").mockImplementation(() => {});
+    const bus = createLilacBus(createInMemoryRawBus());
+    const adapter = new FakeAdapter();
+    const sessionId = `octo/relay-ack-${crypto.randomUUID()}#12`;
+    const requestId = `github:${sessionId}:12`;
+    setGithubAck(requestId, {
+      target,
+      reactionId: 42,
+    });
+    const bridge = await bridgeBusToAdapter({
+      adapter,
+      bus,
+      platform: "github",
+      subscriptionId: `github-ack-${crypto.randomUUID()}`,
+      idleTimeoutMs: 10_000,
+    });
+
+    try {
+      await bus.publish(
+        lilacEventTypes.EvtRequestReply,
+        {},
+        {
+          headers: {
+            request_id: requestId,
+            session_id: sessionId,
+            request_client: "github",
+          },
+        },
+      );
+      await bus.publish(lilacEventTypes.EvtAgentOutputResponseText, response, {
+        headers: { request_id: requestId },
+      });
+
+      expect(getGithubAck(requestId)).toBeUndefined();
+    } finally {
+      clearGithubAck(requestId);
+      await bridge.stop();
+      await bus.close();
+      warning.mockRestore();
+    }
+  });
+
   it("commits a previously swallowed reanchor side-effect failure", async () => {
     const deliveries: DeliveryObservation[] = [];
     const bus = createLilacBus(createInMemoryRawBus((delivery) => deliveries.push(delivery)));
@@ -3344,6 +3408,10 @@ describe("bridgeBusToAdapter", () => {
     const staleRequestId = `github:${sessionId}:old`;
     const latestRequestId = `github:${sessionId}:new`;
     setGithubLatestRequestForSession(sessionId, latestRequestId);
+    setGithubAck(staleRequestId, {
+      target: { kind: "issue", issueNumber: 12 },
+      reactionId: 43,
+    });
 
     const bridge = await bridgeBusToAdapter({
       adapter,
@@ -3385,7 +3453,12 @@ describe("bridgeBusToAdapter", () => {
 
     expect(adapter.streams[0]?.aborted).toBe("superseded");
     expect(adapter.streams[0]?.finished).toBe(false);
+    expect(getGithubAck(staleRequestId)).toEqual({
+      target: { kind: "issue", issueNumber: 12 },
+      reactionId: 43,
+    });
 
+    clearGithubAck(staleRequestId);
     await bridge.stop();
   });
 });

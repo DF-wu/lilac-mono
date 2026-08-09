@@ -116,18 +116,6 @@ class ProjectionAdapter implements SurfaceAdapter {
   async getSelf() {
     return { platform: this.platform, userId: "bot", userName: "bot" };
   }
-  async getCapabilities() {
-    return {
-      platform: this.platform,
-      send: true,
-      edit: true,
-      delete: true,
-      reactions: false,
-      readHistory: true,
-      threads: false,
-      markRead: false,
-    };
-  }
   async listSessions() {
     return [];
   }
@@ -218,7 +206,11 @@ class BlockingProjectionAdapter extends ProjectionAdapter {
     return await super.sendMsg(session, content, options);
   }
 }
-function createInvocation(store: DurableWorkflowStore, hasProgressTarget = true): void {
+function createInvocation(
+  store: DurableWorkflowStore,
+  hasProgressTarget = true,
+  platform: "discord" | "github" = "discord",
+): void {
   store.createInvocation({
     revision: {
       revisionId: "revision-1",
@@ -264,15 +256,15 @@ function createInvocation(store: DurableWorkflowStore, hasProgressTarget = true)
       args: { directory: "src", token: "secret" },
       argsSha256: "d".repeat(64),
       origin: {
-        requestId: "discord:channel-1:origin-1",
+        requestId: `${platform}:channel-1:origin-1`,
         sessionId: "channel-1",
-        client: "discord",
+        client: platform,
         userId: "user-1",
         projectCwd: "/workspace",
       },
       completionTarget: { kind: "durable_surface" },
       progressTarget: hasProgressTarget
-        ? { platform: "discord", channelId: "channel-1", replyToMessageId: "origin-1" }
+        ? { platform, channelId: "channel-1", replyToMessageId: "origin-1" }
         : null,
       terminalDetail: null,
       result: null,
@@ -668,6 +660,43 @@ describe("WorkflowProgressProjector", () => {
       await projector.ensureInitialCard("run-1");
       expect(adapter.contents.at(-1)?.actions).toEqual([]);
       expect(adapter.contents.at(-1)?.text).toContain("**Cancelled**");
+    } finally {
+      await projector.stop();
+      await bus.close();
+      store.close();
+      rmSync(dbPath, { force: true });
+    }
+  });
+  it("preserves workflow progress actions for GitHub cards", async () => {
+    const dbPath = tempDbPath("workflow-github-controls");
+    const store = new DurableWorkflowStore(dbPath);
+    const adapter = new ProjectionAdapter("github");
+    const bus = createLilacBus(new CapturingRawBus());
+    const projector = createWorkflowProgressProjectorForTest({
+      bus,
+      store,
+      adapters: new Map([["github", adapter]]),
+      subscriptionId: "github-controls",
+      now: () => 20,
+    });
+    try {
+      createInvocation(store, true, "github");
+      const messageRef = await projector.ensureInitialCard("run-1");
+      expect(adapter.contents.at(-1)?.actions?.map((action) => action.label)).toEqual([
+        "Pause",
+        "Cancel",
+      ]);
+      expect(
+        appliedSurfaceActionStatus(
+          store.applySurfaceAction({
+            tokenSha256: sha256(actionToken(adapter, "Pause")),
+            platform: "github",
+            userId: "user-1",
+            messageRef,
+            now: 21,
+          }),
+        ),
+      ).toBe("applied");
     } finally {
       await projector.stop();
       await bus.close();
