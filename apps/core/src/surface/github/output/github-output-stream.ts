@@ -1,5 +1,10 @@
-import type { GithubSessionRef, MsgRef, SurfaceAttachment } from "../../types";
-import type { SurfaceOutputPart, SurfaceOutputResult, SurfaceOutputStream } from "../../adapter";
+import type { GithubSessionRef, MsgRef } from "../../types";
+import type {
+  SurfaceOutputPart,
+  SurfaceOutputPartDisposition,
+  SurfaceOutputResult,
+  SurfaceOutputStream,
+} from "../../adapter";
 
 import { createIssueComment } from "../../../github/github-api";
 import { markGithubAgentComment } from "../../../github/github-comment-marker";
@@ -7,7 +12,6 @@ import { parseGithubSessionId } from "../../../github/github-ids";
 
 export class GithubOutputStream implements SurfaceOutputStream {
   private text = "";
-  private attachments: SurfaceAttachment[] = [];
   private created: MsgRef[] = [];
 
   constructor(
@@ -15,33 +19,32 @@ export class GithubOutputStream implements SurfaceOutputStream {
     private readonly opts?: { replyTo?: MsgRef },
   ) {}
 
-  async push(part: SurfaceOutputPart): Promise<void> {
+  async push(part: SurfaceOutputPart): Promise<SurfaceOutputPartDisposition> {
     switch (part.type) {
       case "text.delta": {
         // Buffer deltas; GitHub surface posts once at finish.
         this.text += part.delta;
-        return;
+        return "visible";
       }
       case "text.set": {
         this.text = part.text;
-        return;
+        return "visible";
       }
       case "attachment.add": {
-        // Not supported yet; keep for parity.
-        this.attachments.push(part.attachment);
-        return;
+        // GitHub output intentionally omits binary attachments until it has a native renderer.
+        return "ignored";
       }
       case "reasoning.status": {
         // Ignore (no streaming UI for GitHub).
-        return;
+        return "ignored";
       }
       case "tool.status": {
         // Ignore (no streaming UI for GitHub).
-        return;
+        return "ignored";
       }
       case "meta.stats": {
         // Ignore (no dedicated stats UI for GitHub).
-        return;
+        return "ignored";
       }
       default: {
         const _exhaustive: never = part;

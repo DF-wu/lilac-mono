@@ -156,6 +156,7 @@ import { createIdleTimer } from "../../../src/shared/idle-timer";
 import { startDiscordRequestRouter as startBusRequestRouter } from "../../../src/surface/discord/discord-request-router";
 import { bridgeAdapterToBus } from "../../../src/surface/bridge/publish-to-bus";
 import { bridgeBusToAdapter } from "../../../src/surface/bridge/subscribe-from-bus";
+import { createDiscordRelayPolicy } from "../../../src/surface/discord/discord-runtime-descriptor";
 import { formatSurfaceMetadataLine } from "../../../src/surface/bridge/surface-metadata";
 import type {
   AdapterEventHandler,
@@ -2250,6 +2251,7 @@ class ProductionPathDiscordAdapter implements SurfaceAdapter {
         if (part.type === "text.set") visibleText = part.text;
         message.text = visibleText;
         await this.emitOutputUpdated(message);
+        return "visible";
       },
       finish: async () => {
         const message = ensureOutputMessage();
@@ -3295,6 +3297,7 @@ describe("startBusAgentRunner Core-primary Claude production path", () => {
       adapter,
       bus,
       platform: "discord",
+      policy: createDiscordRelayPolicy(adapter),
       subscriptionId: "production-primary-auto-inject-relay",
       transcriptStore: store,
     });

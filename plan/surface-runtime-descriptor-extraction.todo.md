@@ -29,7 +29,7 @@ Source: `plan/surface-runtime-descriptor-extraction.md`
 
 ## Stage 5: Relay Policy Extraction
 
-- [ ] Move protocol-specific relay policy behind descriptor ports.
+- [x] Move protocol-specific relay policy behind descriptor ports.
 
 ## Stage 6: Workflow Migration
 

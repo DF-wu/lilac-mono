@@ -899,6 +899,30 @@ const CORE_ADAPTER_EVENT_EXCEPTION_ADAPTERS = [
     reason:
       "Signals a hard adapter contract invariant when getSelf reports a platform different from its descriptor registration.",
   },
+  {
+    identity: {
+      module: "src/surface/github/github-runtime-descriptor.ts",
+      exportName: "deleteGithubAcknowledgement",
+    },
+    category: "external-to-result",
+    externalApi: {
+      package: "@stanley2058/lilac-core",
+      exportName: "GitHub reaction deletion compatibility operation",
+    },
+    direction: "capture-external",
+    reason:
+      "Captures GitHub acknowledgement reaction deletion rejection before the descriptor finalization policy clears process-local acknowledgement state.",
+  },
+  {
+    identity: {
+      module: "src/surface/github/github-runtime-descriptor.ts",
+      exportName: "preserveGithubRelayPolicyPanic",
+    },
+    category: "defect-supervisor",
+    externalApi: { package: "better-result", exportName: "Panic.is" },
+    direction: "observe-panic",
+    reason: "Preserves exact Panic identity at the GitHub acknowledgement deletion boundary.",
+  },
 ] as const satisfies readonly ExceptionAdapter[];
 
 const CORE_TOOL_SERVER_BOUNDARY_DECODERS = [
@@ -8492,6 +8516,12 @@ const REVIEWED_INJECTED_EXTERNAL_EFFECT_KEYS = new Set([
     "readConfiguredSshHostsResult",
     "capture-external",
   ),
+  preciseExceptionAdapterKey(
+    "apps/core",
+    "src/surface/github/github-runtime-descriptor.ts",
+    "deleteGithubAcknowledgement",
+    "capture-external",
+  ),
 ]);
 
 function exceptionAdapterSyntaxKinds(
@@ -8632,7 +8662,7 @@ function approvedExceptionAdapterCatalogSha256(
 }
 
 export const APPROVED_EXCEPTION_ADAPTER_CATALOG_SHA256 =
-  "b8a999b526f5c15531e3c40d4c2b2224bd10d4a9fa3b0952b0e2692a0f729b02";
+  "d6e97203a7f0f916f3c30677c53ec268b58cf628903dbcbec5713b9011f8786c";
 
 export const architectureManifest = {
   version: 1,

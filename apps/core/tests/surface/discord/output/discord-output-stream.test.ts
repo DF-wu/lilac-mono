@@ -716,6 +716,26 @@ describe("Discord compact progress integration", () => {
 });
 
 describe("preview reanchor behavior", () => {
+  it("reports reasoning as ignored when reasoning display is disabled", async () => {
+    const { client, operations } = createFakeDiscordClient();
+    const out = new DiscordOutputStream({
+      client,
+      sessionRef: { platform: "discord", channelId: "chan" },
+      useSmartSplitting: false,
+      outputMode: "inline",
+      reasoningDisplayMode: "none",
+      workingIndicators: ["Working"],
+    });
+
+    await expect(
+      out.push({
+        type: "reasoning.status",
+        update: { startedAtMs: 1, detailText: "hidden" },
+      }),
+    ).resolves.toBe("ignored");
+    expect(operations).toEqual([]);
+  });
+
   it("keeps frozen placeholder lane messages on reanchor", async () => {
     const { client, createdMessageIds, deletedMessageIds } = createFakeDiscordClient();
 

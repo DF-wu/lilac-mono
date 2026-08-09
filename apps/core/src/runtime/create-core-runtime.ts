@@ -37,9 +37,15 @@ import {
 } from "@stanley2058/lilac-event-bus";
 
 import { DiscordAdapter } from "../surface/discord/discord-adapter";
-import { createDiscordSurfaceRuntimeDescriptor } from "../surface/discord/discord-runtime-descriptor";
+import {
+  createDiscordRelayPolicy,
+  createDiscordSurfaceRuntimeDescriptor,
+} from "../surface/discord/discord-runtime-descriptor";
 import { GithubAdapter } from "../surface/github/github-adapter";
-import { createConfiguredGithubSurfaceRuntimeDescriptor } from "../surface/github/github-runtime-descriptor";
+import {
+  createConfiguredGithubSurfaceRuntimeDescriptor,
+  createGithubRelayPolicy,
+} from "../surface/github/github-runtime-descriptor";
 import { bridgeAdapterToBus } from "../surface/bridge/publish-to-bus";
 import { bridgeBusToAdapter } from "../surface/bridge/subscribe-from-bus";
 import {
@@ -1022,6 +1028,8 @@ export async function createCoreRuntime(
   }
   const mcpRegistry = mcpRegistryCreated.value;
   function composeSurfaceRuntimeRegistry(appCredentialsAvailable: boolean) {
+    const discordRelayPolicy = createDiscordRelayPolicy(adapter);
+    const githubRelayPolicy = createGithubRelayPolicy();
     return SurfaceRuntimeRegistry.create([
       createDiscordSurfaceRuntimeDescriptor({
         adapter,
@@ -1040,6 +1048,7 @@ export async function createCoreRuntime(
           },
         },
         relay: {
+          ...discordRelayPolicy,
           lifecycle: {
             platform: "discord",
             start: async () => {
@@ -1047,6 +1056,7 @@ export async function createCoreRuntime(
                 adapter,
                 bus,
                 platform: "discord",
+                policy: discordRelayPolicy,
                 subscriptionId: subId(subscriptionPrefix, "bus-to-adapter"),
                 transcriptStore: transcriptStore ?? undefined,
               });
@@ -1073,6 +1083,7 @@ export async function createCoreRuntime(
           },
         },
         relay: {
+          ...githubRelayPolicy,
           lifecycle: {
             platform: "github",
             start: async () => {
@@ -1080,6 +1091,7 @@ export async function createCoreRuntime(
                 adapter: githubAdapter,
                 bus,
                 platform: "github",
+                policy: githubRelayPolicy,
                 subscriptionId: subId(subscriptionPrefix, "bus-to-github"),
                 transcriptStore: transcriptStore ?? undefined,
               });

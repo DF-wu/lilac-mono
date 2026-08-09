@@ -72,6 +72,7 @@ export type SurfaceOutputResult = {
 };
 
 export type SurfaceFinalTextMode = "continuation" | "full";
+export type SurfaceOutputPartDisposition = "visible" | "ignored";
 
 export type SurfaceReplyChainPlanOptions = {
   maxDepth?: number;
@@ -82,7 +83,7 @@ export type SurfaceMergeBlockPlanOptions = {
 };
 
 export interface SurfaceOutputStream {
-  push(part: SurfaceOutputPart): Promise<void>;
+  push(part: SurfaceOutputPart): Promise<SurfaceOutputPartDisposition>;
   finish(): Promise<SurfaceOutputResult>;
   abort(reason?: string): Promise<void>;
   /**

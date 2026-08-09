@@ -88,6 +88,12 @@ export type SurfaceRelayRefs<P extends RegisteredSurfacePlatform> = {
   }): ResultType<MsgRefFor<P>, SurfaceRefInvalid>;
 };
 
+export class SurfaceIngressAcknowledgementCleanupFailed extends TaggedError(
+  "SurfaceIngressAcknowledgementCleanupFailed",
+)<{
+  readonly message: string;
+}> {}
+
 export type SurfaceRelayFinalization<P extends RegisteredSurfacePlatform> = {
   isFinalResponseSuperseded?(input: {
     readonly requestId: string;
@@ -96,11 +102,8 @@ export type SurfaceRelayFinalization<P extends RegisteredSurfacePlatform> = {
   clearIngressAcknowledgement?(input: {
     readonly requestId: string;
     readonly sessionId: string;
-  }): Promise<void>;
-  cleanupSkippedOutput?(input: {
-    readonly session: SessionRefFor<P>;
-    readonly created: readonly MsgRefFor<P>[];
-  }): Promise<void>;
+  }): Promise<ResultType<void, SurfaceIngressAcknowledgementCleanupFailed>>;
+  cleanupSkippedOutput?(input: { readonly ref: MsgRefFor<P> }): Promise<void>;
 };
 
 export type SurfaceRelayPolicy<P extends RegisteredSurfacePlatform> = {
@@ -110,7 +113,7 @@ export type SurfaceRelayPolicy<P extends RegisteredSurfacePlatform> = {
 
 export type SurfaceRelayDescriptor<P extends RegisteredSurfacePlatform> = {
   readonly lifecycle: SurfaceRelayLifecyclePort<P>;
-};
+} & SurfaceRelayPolicy<P>;
 
 export class WorkflowProgressOperationFailed extends TaggedError(
   "WorkflowProgressOperationFailed",

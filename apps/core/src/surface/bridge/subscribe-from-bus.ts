@@ -6,17 +6,17 @@ import {
   type EventDeliveryStartFailed,
   type EventDeliveryStopFailed,
   type LilacBus,
-  type SurfaceMsgRef,
 } from "@stanley2058/lilac-event-bus";
 import { Panic, Result, TaggedError, type Result as ResultType } from "better-result";
 
-import { createLogger, env, errorMessage } from "@stanley2058/lilac-utils";
+import { createLogger, env } from "@stanley2058/lilac-utils";
 import type { Logger } from "@stanley2058/simple-module-logger";
 
 import type {
   SurfaceFinalTextMode,
   SurfaceAdapter,
   SurfaceOutputPart,
+  SurfaceOutputPartDisposition,
   SurfaceOutputResult,
   StartOutputOpts,
   SurfaceToolStatusUpdate,
@@ -24,18 +24,16 @@ import type {
   TypingIndicatorSubscription,
 } from "../adapter";
 import type { MsgRef, SessionRef, SurfaceAttachment } from "../types";
+import type {
+  RegisteredSurfacePlatform,
+  SurfaceIngressAcknowledgementCleanupFailed,
+  SurfaceRelayPolicy,
+  SurfaceReplyTargetInvalid,
+  SurfaceRefInvalid,
+} from "../runtime-descriptor";
 import { mergeSubagentToolStatus } from "../subagent-tool-status";
 
-import { deleteIssueCommentReactionById, deleteIssueReactionById } from "../../github/github-api";
-import { parseGithubRequestId, parseGithubSessionId } from "../../github/github-ids";
-import { parseRequestId } from "./request-ids";
 import { parseRequestControlFromRaw } from "./bus-agent-runner/raw";
-import {
-  clearGithubAck,
-  getGithubAck,
-  getGithubLatestRequestForSession,
-  getGithubRequestMeta,
-} from "../../github/github-state";
 import { isPossibleNoReplyPrefix, resolveReplyDeliveryFromFinalText } from "./reply-directive";
 
 import type { TranscriptStore } from "../../transcript/transcript-store";
@@ -71,13 +69,22 @@ class CmdSurfaceReanchorFailed extends TaggedError("CmdSurfaceReanchorFailed")<{
   readonly message: string;
 }> {}
 
-type CmdSurfaceDeliveryError = CmdSurfaceRequiredHeadersMissing | CmdSurfaceReanchorFailed;
+class CmdSurfaceReplyTargetInvalid extends TaggedError("CmdSurfaceReplyTargetInvalid")<{
+  readonly cause: SurfaceRefInvalid;
+  readonly message: string;
+}> {}
+
+type CmdSurfaceDeliveryError =
+  | CmdSurfaceRequiredHeadersMissing
+  | CmdSurfaceReanchorFailed
+  | CmdSurfaceReplyTargetInvalid;
 
 function applyCmdSurfaceDeliveryPolicy(error: CmdSurfaceDeliveryError): DeliveryDisposition {
   switch (error._tag) {
     case "CmdSurfaceRequiredHeadersMissing":
       return "park-pending";
     case "CmdSurfaceReanchorFailed":
+    case "CmdSurfaceReplyTargetInvalid":
       return "commit";
   }
 }
@@ -91,11 +98,20 @@ class EvtRequestStopTypingFailed extends TaggedError("EvtRequestStopTypingFailed
   readonly message: string;
 }> {}
 
-type EvtRequestDeliveryError = EvtRequestRequiredHeadersMissing | EvtRequestStopTypingFailed;
+class EvtRequestReplyTargetInvalid extends TaggedError("EvtRequestReplyTargetInvalid")<{
+  readonly cause: SurfaceReplyTargetInvalid;
+  readonly message: string;
+}> {}
+
+type EvtRequestDeliveryError =
+  | EvtRequestRequiredHeadersMissing
+  | EvtRequestStopTypingFailed
+  | EvtRequestReplyTargetInvalid;
 
 function applyEvtRequestDeliveryPolicy(error: EvtRequestDeliveryError): DeliveryDisposition {
   switch (error._tag) {
     case "EvtRequestRequiredHeadersMissing":
+    case "EvtRequestReplyTargetInvalid":
       return "park-pending";
     case "EvtRequestStopTypingFailed":
       return "commit";
@@ -117,8 +133,8 @@ type OutReqDeliveryError = OutReqPushFailed | OutReqFinishFailed;
 type BusToAdapterEffect =
   | "abort-output"
   | "cancel-active-relay"
-  | "cleanup-github-ack"
-  | "delete-output-message"
+  | "cleanup-skipped-output"
+  | "clear-ingress-acknowledgement"
   | "delete-transcript-checkpoint"
   | "finish-output"
   | "link-transcript"
@@ -215,6 +231,21 @@ async function runBusToAdapterBestEffort(input: {
   );
 }
 
+export function logIngressAcknowledgementCleanupFailure(input: {
+  readonly logger: Pick<Logger, "warn">;
+  readonly error: SurfaceIngressAcknowledgementCleanupFailed;
+  readonly requestId: string;
+  readonly sessionId: string;
+}): void {
+  input.logger.warn(
+    "failed to clear ingress acknowledgement",
+    formatBridgeTaggedErrorForLog(input.error, {
+      requestId: input.requestId,
+      sessionId: input.sessionId,
+    }),
+  );
+}
+
 function observeSubscriptionDone(
   subscription: ResultSubscription,
   topic: string,
@@ -246,29 +277,6 @@ function isTypingIndicatorProvider(
   adapter: SurfaceAdapter,
 ): adapter is SurfaceAdapter & TypingIndicatorProvider {
   return "startTyping" in adapter && typeof adapter.startTyping === "function";
-}
-
-function parseDiscordReplyTo(params: { requestId: string; sessionId: string }): MsgRef | null {
-  const parsed = parseRequestId(params.requestId);
-  if (parsed?.kind !== "discord_message") return null;
-  if (parsed.channelId !== params.sessionId) return null;
-
-  return {
-    platform: "discord",
-    channelId: params.sessionId,
-    messageId: parsed.messageId,
-  };
-}
-
-function parseGithubReplyTo(params: { requestId: string; sessionId: string }): MsgRef | null {
-  const parsed = parseGithubRequestId({ requestId: params.requestId });
-  if (!parsed) return null;
-  if (parsed.sessionId !== params.sessionId) return null;
-  return {
-    platform: "github",
-    channelId: params.sessionId,
-    messageId: parsed.triggerId,
-  };
 }
 
 function parseRouterSessionMode(raw: string | undefined): "mention" | "active" | undefined {
@@ -314,57 +322,6 @@ function appendReasoningDetail(base: string, delta: string): string {
     /[\p{L}\p{N}.!?]$/u.test(baseTrimmedEnd) && /^[\p{L}\p{N}]/u.test(deltaTrimmedStart);
   const merged = needsSpacer ? `${baseTrimmedEnd} ${deltaTrimmedStart}` : `${base}${delta}`;
   return clampReasoningDetail(merged);
-}
-
-async function cleanupGithubAck(input: { logger: Logger; requestId: string; sessionId: string }) {
-  const ack = getGithubAck(input.requestId);
-  if (!ack) return;
-
-  const meta = getGithubRequestMeta(input.requestId);
-  const thread = (() => {
-    if (meta?.repoFullName) {
-      const [owner, repo] = meta.repoFullName.split("/");
-      if (owner && repo) {
-        return { owner, repo, issueNumber: meta.issueNumber };
-      }
-    }
-    const parsed = parseGithubSessionId(input.sessionId);
-    return {
-      owner: parsed.owner,
-      repo: parsed.repo,
-      issueNumber: parsed.number,
-    };
-  })();
-
-  let deleted: ResultType<void, BusToAdapterEffectFailed>;
-  try {
-    deleted = await captureBusToAdapterEffect("cleanup-github-ack", async () => {
-      if (ack.target.kind === "issue") {
-        await deleteIssueReactionById({
-          owner: thread.owner,
-          repo: thread.repo,
-          issueNumber: ack.target.issueNumber,
-          reactionId: ack.reactionId,
-        });
-      } else {
-        await deleteIssueCommentReactionById({
-          owner: thread.owner,
-          repo: thread.repo,
-          commentId: ack.target.commentId,
-          reactionId: ack.reactionId,
-        });
-      }
-    });
-  } finally {
-    clearGithubAck(input.requestId);
-  }
-
-  if (deleted.status === "error" && !errorMessage(deleted.error.cause).includes("404")) {
-    input.logger.warn(
-      "failed to delete github ack reaction",
-      formatBridgeTaggedErrorForLog(deleted.error, { requestId: input.requestId }),
-    );
-  }
 }
 
 type ActiveRelay = {
@@ -414,16 +371,6 @@ export type BusToAdapterRelaySnapshot = {
   outCursor?: string;
 };
 
-function toMsgRefFromSurfaceMsgRef(value: SurfaceMsgRef): MsgRef | null {
-  const { platform, channelId, messageId } = value;
-  if (platform !== "discord" && platform !== "github") return null;
-  return {
-    platform,
-    channelId,
-    messageId,
-  };
-}
-
 function mergeContinuationText(existing: string, continuation: string): string {
   if (existing.length === 0) return continuation;
   if (continuation.length === 0) return existing;
@@ -441,10 +388,11 @@ function mergeContinuationText(existing: string, continuation: string): string {
   return `${existing}${continuation}`;
 }
 
-export async function bridgeBusToAdapter(params: {
+export async function bridgeBusToAdapter<P extends RegisteredSurfacePlatform>(params: {
   adapter: SurfaceAdapter;
   bus: LilacBus;
-  platform: "discord" | "github";
+  platform: P;
+  policy: SurfaceRelayPolicy<P>;
   subscriptionId: string;
   idleTimeoutMs?: number;
   scheduleIdleTimeout?: (callback: () => void, delayMs: number) => () => void;
@@ -458,6 +406,7 @@ export async function bridgeBusToAdapter(params: {
     adapter,
     bus,
     platform,
+    policy,
     subscriptionId,
     idleTimeoutMs = 60 * 60 * 1000,
     scheduleIdleTimeout = scheduleTimeout,
@@ -611,13 +560,32 @@ export async function bridgeBusToAdapter(params: {
         return Result.ok(undefined);
       }
 
-      const replyTo = msg.data.replyTo ? toMsgRefFromSurfaceMsgRef(msg.data.replyTo) : null;
+      let replyTo: MsgRef | undefined;
+      if (msg.data.replyTo) {
+        const decoded = policy.refs.decodeReanchorTarget({
+          ref: msg.data.replyTo,
+          expectedSessionId: sessionId,
+        });
+        if (decoded.status === "error") {
+          logger.warn(
+            "relay reanchor target rejected",
+            formatBridgeTaggedErrorForLog(decoded.error, { requestId, sessionId, platform }),
+          );
+          return Result.err(
+            new CmdSurfaceReplyTargetInvalid({
+              cause: decoded.error,
+              message: "Output reanchor target is invalid",
+            }),
+          );
+        }
+        replyTo = decoded.value;
+      }
 
       const reanchored = await captureBusToAdapterEffect("reanchor-output", () =>
         relay.reanchor({
           inheritReplyTo: msg.data.inheritReplyTo,
           mode: msg.data.mode,
-          replyTo: replyTo ?? undefined,
+          replyTo,
         }),
       );
       if (reanchored.status === "ok") return Result.ok(undefined);
@@ -775,6 +743,24 @@ export async function bridgeBusToAdapter(params: {
         requestClient,
       });
 
+      const initialReplyTarget = policy.refs.resolveInitialReplyTarget({ requestId, sessionId });
+      if (initialReplyTarget.kind === "invalid") {
+        logger.error(
+          "relay initial reply target rejected",
+          formatBridgeTaggedErrorForLog(initialReplyTarget.error, {
+            requestId,
+            sessionId,
+            platform,
+          }),
+        );
+        return Result.err(
+          new EvtRequestReplyTargetInvalid({
+            cause: initialReplyTarget.error,
+            message: "Initial output reply target is invalid",
+          }),
+        );
+      }
+
       const relay = await startRelay({
         adapter,
         bus,
@@ -785,6 +771,7 @@ export async function bridgeBusToAdapter(params: {
         routerSessionMode,
         requestClient,
         idleTimeoutMs,
+        initialReplyTo: initialReplyTarget.kind === "target" ? initialReplyTarget.ref : undefined,
       });
 
       activeRelays.set(requestId, relay);
@@ -842,13 +829,14 @@ export async function bridgeBusToAdapter(params: {
   async function startRelay(input: {
     adapter: SurfaceAdapter;
     bus: LilacBus;
-    platform: "discord" | "github";
+    platform: P;
     requestId: string;
     sessionId: string;
     requestStartedAtMs?: number;
     routerSessionMode?: "mention" | "active";
     requestClient?: string;
     idleTimeoutMs: number;
+    initialReplyTo?: MsgRef;
     restore?: BusToAdapterRelaySnapshot;
   }): Promise<ActiveRelay> {
     const { requestId, sessionId, idleTimeoutMs } = input;
@@ -859,17 +847,8 @@ export async function bridgeBusToAdapter(params: {
       input.restore?.requestStartedAtMs ?? input.requestStartedAtMs ?? relayStartedAt,
     );
 
-    const sessionRef: SessionRef =
-      platform === "discord"
-        ? { platform, channelId: sessionId }
-        : { platform: "github", channelId: sessionId };
-
-    const replyTo =
-      platform === "discord"
-        ? parseDiscordReplyTo({ requestId, sessionId })
-        : parseGithubReplyTo({ requestId, sessionId });
-
-    const baseReplyTo = input.restore?.replyTo ?? replyTo ?? undefined;
+    const sessionRef: SessionRef = policy.refs.createSessionRef(sessionId);
+    const baseReplyTo = input.initialReplyTo;
     let currentReplyTo: MsgRef | undefined = baseReplyTo;
 
     let totalTextChars = input.restore?.totalTextChars ?? input.restore?.visibleText.length ?? 0;
@@ -1024,6 +1003,9 @@ export async function bridgeBusToAdapter(params: {
     let out = await adapter.startOutput(sessionRef, buildStartOpts(baseReplyTo, streamToken));
     let finalTextMode: SurfaceFinalTextMode = out.getFinalTextMode?.() ?? "continuation";
     useResumeOpts = false;
+    const recordOutputPartDisposition = (disposition: SurfaceOutputPartDisposition): void => {
+      if (disposition === "visible") streamHasVisibleOutput = true;
+    };
 
     if (input.restore) {
       // Re-publish existing output refs so router active-output tracking can recover.
@@ -1059,28 +1041,23 @@ export async function bridgeBusToAdapter(params: {
       }
 
       if (visibleTextAcc.trim().length > 0) {
-        await out.push({ type: "text.set", text: visibleTextAcc });
-        streamHasVisibleOutput = true;
+        recordOutputPartDisposition(await out.push({ type: "text.set", text: visibleTextAcc }));
       }
-      if (
-        textPhase !== "final_answer" &&
-        platform === "discord" &&
-        typeof reasoningStartedAtMs === "number"
-      ) {
-        await out.push({
-          type: "reasoning.status",
-          update: {
-            startedAtMs: reasoningStartedAtMs,
-            frozenAtMs: reasoningFrozenAtMs,
-            detailText: reasoningDetailText,
-          },
-        });
-        streamHasVisibleOutput = true;
+      if (textPhase !== "final_answer" && typeof reasoningStartedAtMs === "number") {
+        recordOutputPartDisposition(
+          await out.push({
+            type: "reasoning.status",
+            update: {
+              startedAtMs: reasoningStartedAtMs,
+              frozenAtMs: reasoningFrozenAtMs,
+              detailText: reasoningDetailText,
+            },
+          }),
+        );
       }
       if (textPhase !== "final_answer") {
         for (const update of toolStatusById.values()) {
-          await out.push({ type: "tool.status", update });
-          streamHasVisibleOutput = true;
+          recordOutputPartDisposition(await out.push({ type: "tool.status", update }));
         }
       }
     }
@@ -1117,20 +1094,20 @@ export async function bridgeBusToAdapter(params: {
       finalTextMode = out.getFinalTextMode?.() ?? "continuation";
 
       if (!lane.replayStatus) return;
-      if (platform === "discord" && typeof reasoningStartedAtMs === "number") {
-        await out.push({
-          type: "reasoning.status",
-          update: {
-            startedAtMs: reasoningStartedAtMs,
-            frozenAtMs: reasoningFrozenAtMs,
-            detailText: reasoningDetailText,
-          },
-        });
-        streamHasVisibleOutput = true;
+      if (typeof reasoningStartedAtMs === "number") {
+        recordOutputPartDisposition(
+          await out.push({
+            type: "reasoning.status",
+            update: {
+              startedAtMs: reasoningStartedAtMs,
+              frozenAtMs: reasoningFrozenAtMs,
+              detailText: reasoningDetailText,
+            },
+          }),
+        );
       }
       for (const update of toolStatusById.values()) {
-        await out.push({ type: "tool.status", update });
-        streamHasVisibleOutput = true;
+        recordOutputPartDisposition(await out.push({ type: "tool.status", update }));
       }
     };
 
@@ -1181,17 +1158,28 @@ export async function bridgeBusToAdapter(params: {
     let firstOutLogged = false;
     let handlingOutputEvent = false;
 
-    const deleteCreatedOutputMessages = async () => {
-      if (platform !== "discord") return;
-
+    const cleanupSkippedOutput = async () => {
+      const cleanup = policy.finalization?.cleanupSkippedOutput;
+      if (!cleanup) return;
       const deletions: Array<() => Promise<void>> = [];
       for (let i = createdOutputRefs.length - 1; i >= 0; i--) {
         const ref = createdOutputRefs[i];
         if (!ref) continue;
+        const decoded = policy.refs.decodeReanchorTarget({
+          ref,
+          expectedSessionId: sessionId,
+        });
+        if (decoded.status === "error") {
+          logger.warn(
+            "skipped output cleanup ref rejected",
+            formatBridgeTaggedErrorForLog(decoded.error, { requestId, sessionId, platform }),
+          );
+          continue;
+        }
         deletions.push(() =>
           runBusToAdapterBestEffort({
-            operation: "delete-output-message",
-            effect: () => adapter.deleteMsg(ref),
+            operation: "cleanup-skipped-output",
+            effect: () => cleanup({ ref: decoded.value }),
             logger,
             logLevel: "debug",
             logMessage: "failed to delete skipped output message",
@@ -1200,6 +1188,29 @@ export async function bridgeBusToAdapter(params: {
         );
       }
       await superviseBusToAdapterCleanup(deletions);
+    };
+
+    const clearIngressAcknowledgement = async () => {
+      const clear = policy.finalization?.clearIngressAcknowledgement;
+      if (!clear) return;
+      const cleared = await captureBusToAdapterEffect("clear-ingress-acknowledgement", () =>
+        clear({ requestId, sessionId }),
+      );
+      if (cleared.status === "error") {
+        logger.warn(
+          "failed to clear ingress acknowledgement",
+          formatBridgeTaggedErrorForLog(cleared.error, { requestId, sessionId }),
+        );
+        return;
+      }
+      if (cleared.value.status === "error") {
+        logIngressAcknowledgementCleanupFailure({
+          logger,
+          error: cleared.value.error,
+          requestId,
+          sessionId,
+        });
+      }
     };
 
     const deleteUnlinkedCheckpointCandidate = async () => {
@@ -1258,9 +1269,9 @@ export async function bridgeBusToAdapter(params: {
 
     const pushOutputPart = async (
       part: SurfaceOutputPart,
-    ): Promise<ResultType<void, OutReqPushFailed>> => {
+    ): Promise<ResultType<SurfaceOutputPartDisposition, OutReqPushFailed>> => {
       const pushed = await captureBusToAdapterEffect("push-output", () => out.push(part));
-      if (pushed.status === "ok") return Result.ok(undefined);
+      if (pushed.status === "ok") return Result.ok(pushed.value);
       logger.error(
         "failed to push relay output",
         formatBridgeTaggedErrorForLog(pushed.error, { requestId, sessionId }),
@@ -1349,32 +1360,27 @@ export async function bridgeBusToAdapter(params: {
               }
 
               case lilacEventTypes.EvtAgentOutputDeltaReasoning: {
-                if (platform === "discord") {
-                  const startedAtMs = reasoningStartedAtMs ?? outMsg.ts;
-                  reasoningStartedAtMs = startedAtMs;
+                const startedAtMs = reasoningStartedAtMs ?? outMsg.ts;
+                reasoningStartedAtMs = startedAtMs;
 
-                  const seq = outMsg.data.seq;
-                  if (typeof seq === "number" && Number.isFinite(seq)) {
-                    // New behavior: each sequenced event carries one fully completed
-                    // reasoning chunk and should replace the previous visible chunk.
-                    reasoningDetailText = clampReasoningDetail(outMsg.data.delta);
-                  } else {
-                    // Back-compat for legacy publishers that stream incremental deltas.
-                    reasoningDetailText = appendReasoningDetail(
-                      reasoningDetailText,
-                      outMsg.data.delta,
-                    );
-                  }
-
-                  part = {
-                    type: "reasoning.status",
-                    update: {
-                      startedAtMs,
-                      frozenAtMs: reasoningFrozenAtMs,
-                      detailText: reasoningDetailText,
-                    },
-                  };
+                const seq = outMsg.data.seq;
+                if (typeof seq === "number" && Number.isFinite(seq)) {
+                  reasoningDetailText = clampReasoningDetail(outMsg.data.delta);
+                } else {
+                  reasoningDetailText = appendReasoningDetail(
+                    reasoningDetailText,
+                    outMsg.data.delta,
+                  );
                 }
+
+                part = {
+                  type: "reasoning.status",
+                  update: {
+                    startedAtMs,
+                    frozenAtMs: reasoningFrozenAtMs,
+                    detailText: reasoningDetailText,
+                  },
+                };
                 break;
               }
 
@@ -1421,7 +1427,6 @@ export async function bridgeBusToAdapter(params: {
                 totalTextChars += outMsg.data.delta.length;
 
                 if (
-                  platform === "discord" &&
                   typeof reasoningStartedAtMs === "number" &&
                   typeof reasoningFrozenAtMs !== "number"
                 ) {
@@ -1528,12 +1533,10 @@ export async function bridgeBusToAdapter(params: {
                         operation: "abort-output",
                         effect: () => out.abort("skip"),
                       }),
-                    deleteCreatedOutputMessages,
+                    cleanupSkippedOutput,
                     deleteUnlinkedCheckpointCandidate,
                     relayStop,
-                    ...(platform === "github"
-                      ? [() => cleanupGithubAck({ logger, requestId, sessionId })]
-                      : []),
+                    clearIngressAcknowledgement,
                   ]);
 
                   logger.info("reply relay skipped final surface reply", {
@@ -1543,24 +1546,24 @@ export async function bridgeBusToAdapter(params: {
                   return;
                 }
 
-                if (platform === "github") {
-                  const latest = getGithubLatestRequestForSession(sessionId);
-                  if (latest && latest !== requestId) {
-                    logger.info("github reply suppressed (superseded)", {
-                      requestId,
-                      sessionId,
-                      latest,
-                    });
-                    await superviseBusToAdapterCleanup([
-                      () =>
-                        runBusToAdapterBestEffort({
-                          operation: "abort-output",
-                          effect: () => out.abort("superseded"),
-                        }),
-                      relayStop,
-                    ]);
-                    return;
-                  }
+                if (
+                  policy.finalization?.isFinalResponseSuperseded?.({ requestId, sessionId }) ===
+                  true
+                ) {
+                  logger.info("surface reply suppressed (superseded)", {
+                    requestId,
+                    sessionId,
+                    platform,
+                  });
+                  await superviseBusToAdapterCleanup([
+                    () =>
+                      runBusToAdapterBestEffort({
+                        operation: "abort-output",
+                        effect: () => out.abort("superseded"),
+                      }),
+                    relayStop,
+                  ]);
+                  return;
                 }
 
                 const statsLineRaw = outMsg.data.statsForNerdsLine;
@@ -1600,12 +1603,10 @@ export async function bridgeBusToAdapter(params: {
                         operation: "abort-output",
                         effect: () => out.abort("skip"),
                       }),
-                    deleteCreatedOutputMessages,
+                    cleanupSkippedOutput,
                     deleteUnlinkedCheckpointCandidate,
                     relayStop,
-                    ...(platform === "github"
-                      ? [() => cleanupGithubAck({ logger, requestId, sessionId })]
-                      : []),
+                    clearIngressAcknowledgement,
                   ]);
 
                   logger.info("reply relay skipped empty post-reanchor stream", {
@@ -1635,7 +1636,6 @@ export async function bridgeBusToAdapter(params: {
                 pendingNoReplyPrefix = "";
                 bufferNoReplyPrefix = false;
                 if (
-                  platform === "discord" &&
                   typeof reasoningStartedAtMs === "number" &&
                   typeof reasoningFrozenAtMs !== "number"
                 ) {
@@ -1665,7 +1665,7 @@ export async function bridgeBusToAdapter(params: {
                   processingError = pushedFinal.error;
                   return;
                 }
-                streamHasVisibleOutput = true;
+                recordOutputPartDisposition(pushedFinal.value);
                 const finished = await finishOutput();
                 if (finished.status === "error") {
                   processingError = finished.error;
@@ -1695,9 +1695,7 @@ export async function bridgeBusToAdapter(params: {
                       ]
                     : []),
                   relayStop,
-                  ...(platform === "github"
-                    ? [() => cleanupGithubAck({ logger, requestId, sessionId })]
-                    : []),
+                  clearIngressAcknowledgement,
                 ]);
 
                 logger.info("reply relay finished", {
@@ -1718,7 +1716,7 @@ export async function bridgeBusToAdapter(params: {
                 processingError = pushed.error;
                 return;
               }
-              streamHasVisibleOutput = true;
+              recordOutputPartDisposition(pushed.value);
             }
           } finally {
             handlingOutputEvent = false;
@@ -1857,6 +1855,43 @@ export async function bridgeBusToAdapter(params: {
         if (snapshot.platform !== platform) continue;
         if (activeRelays.has(snapshot.requestId)) continue;
 
+        let initialReplyTo: MsgRef | undefined;
+        if (snapshot.replyTo) {
+          const decoded = policy.refs.decodeReanchorTarget({
+            ref: snapshot.replyTo,
+            expectedSessionId: snapshot.sessionId,
+          });
+          if (decoded.status === "error") {
+            logger.error(
+              "relay restore reply target rejected",
+              formatBridgeTaggedErrorForLog(decoded.error, {
+                requestId: snapshot.requestId,
+                sessionId: snapshot.sessionId,
+                platform,
+              }),
+            );
+            continue;
+          }
+          initialReplyTo = decoded.value;
+        } else {
+          const resolved = policy.refs.resolveInitialReplyTarget({
+            requestId: snapshot.requestId,
+            sessionId: snapshot.sessionId,
+          });
+          if (resolved.kind === "invalid") {
+            logger.error(
+              "relay restore initial reply target rejected",
+              formatBridgeTaggedErrorForLog(resolved.error, {
+                requestId: snapshot.requestId,
+                sessionId: snapshot.sessionId,
+                platform,
+              }),
+            );
+            continue;
+          }
+          if (resolved.kind === "target") initialReplyTo = resolved.ref;
+        }
+
         const relay = await startRelay({
           adapter,
           bus,
@@ -1866,6 +1901,7 @@ export async function bridgeBusToAdapter(params: {
           routerSessionMode: snapshot.routerSessionMode,
           requestClient: snapshot.requestClient,
           idleTimeoutMs,
+          initialReplyTo,
           restore: snapshot,
         });
 

@@ -49,7 +49,6 @@ export const CORE_FINAL_BOUNDARY_IDENTITIES = [
   ["src/surface/bridge/bus-agent-runner/raw.ts", "getParticipantUserIdsFromRaw"],
   ["src/surface/bridge/bus-agent-runner/raw.ts", "parseSubagentMetaFromRaw"],
   ["src/surface/bridge/bus-agent-runner/raw.ts", "parseCustomCommandFromRaw"],
-  ["src/surface/bridge/subscribe-from-bus.ts", "cleanupGithubAck"],
   ["src/surface/bridge/subscribe-from-bus.ts", "bridgeBusToAdapter.subscribeTopic.<callback@3>@1"],
   ["src/surface/bridge/publish-to-bus.ts", "bridgeAdapterToBus.subscribe.<callback@1>"],
   ["src/surface/bridge/subscribe-from-bus.ts", "bridgeBusToAdapter.startRelay.pushOutputPart"],

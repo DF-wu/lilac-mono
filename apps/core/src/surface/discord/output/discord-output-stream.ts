@@ -18,6 +18,7 @@ import { Panic, Result, TaggedError, type Result as ResultType } from "better-re
 import type {
   StartOutputOpts,
   SurfaceOutputPart,
+  SurfaceOutputPartDisposition,
   SurfaceOutputResult,
   SurfaceOutputStream,
   SurfaceToolStatusUpdate,
@@ -1007,7 +1008,7 @@ export class DiscordOutputStream implements SurfaceOutputStream {
     })();
   }
 
-  async push(part: SurfaceOutputPart): Promise<void> {
+  async push(part: SurfaceOutputPart): Promise<SurfaceOutputPartDisposition> {
     // Ensure started on first push so attachments can be part of the first send.
     // If the first push is a delta, we start immediately.
     // If the first push is an attachment, we buffer it until we start.
@@ -1017,19 +1018,19 @@ export class DiscordOutputStream implements SurfaceOutputStream {
         this.finalTextSegments = null;
         this.textAcc += part.delta;
         await this.ensureStarted();
-        return;
+        return "visible";
       case "text.set":
         this.textAcc = part.text;
         this.finalTextSegments = part.finalSegments?.slice() ?? null;
         await this.ensureStarted();
-        return;
+        return "visible";
       case "meta.stats":
         this.statsForNerdsLine = part.line.trim().length > 0 ? part.line : null;
         await this.ensureStarted();
-        return;
+        return "visible";
       case "reasoning.status": {
         if (this.deps.reasoningDisplayMode === "none") {
-          return;
+          return "ignored";
         }
         if (!this.hasReasoningStatus) {
           this.markTaskProgress("reasoning");
@@ -1037,7 +1038,7 @@ export class DiscordOutputStream implements SurfaceOutputStream {
         this.hasReasoningStatus = true;
         this.reasoningDetailText = part.update.detailText ?? "";
         await this.ensureStarted();
-        return;
+        return "visible";
       }
       case "tool.status": {
         if (part.update.status === "start" || part.update.status === "update") {
@@ -1069,12 +1070,12 @@ export class DiscordOutputStream implements SurfaceOutputStream {
         }
         // Only start once we have something to show.
         await this.ensureStarted();
-        return;
+        return "visible";
       }
       case "attachment.add": {
         // Buffer during stream; attach at terminal phase so files land on final message.
         this.pendingAttachments.push(part.attachment);
-        return;
+        return "visible";
       }
       default: {
         const _exhaustive: never = part;

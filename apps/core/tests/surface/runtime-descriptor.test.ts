@@ -7,9 +7,13 @@ import type {
   SurfaceAdapter,
   SurfaceOutputStream,
 } from "../../src/surface/adapter";
-import { createDiscordSurfaceRuntimeDescriptor } from "../../src/surface/discord/discord-runtime-descriptor";
+import {
+  createDiscordRelayPolicy,
+  createDiscordSurfaceRuntimeDescriptor,
+} from "../../src/surface/discord/discord-runtime-descriptor";
 import {
   createConfiguredGithubSurfaceRuntimeDescriptor,
+  createGithubRelayPolicy,
   createGithubSurfaceRuntimeDescriptor,
 } from "../../src/surface/github/github-runtime-descriptor";
 import {
@@ -59,7 +63,7 @@ class TestAdapter implements SurfaceAdapter {
     _opts?: StartOutputOpts,
   ): Promise<SurfaceOutputStream> {
     return {
-      push: async () => undefined,
+      push: async () => "visible",
       finish: async () => ({
         created: [{ platform: "discord", channelId: "channel", messageId: "message" }],
         last: { platform: "discord", channelId: "channel", messageId: "message" },
@@ -118,7 +122,9 @@ function requestIngress(): SurfaceRequestIngress {
 }
 
 function discordRelay(): SurfaceRelayDescriptor<"discord"> {
+  const adapter = new TestAdapter("discord");
   return {
+    ...createDiscordRelayPolicy(adapter),
     lifecycle: {
       platform: "discord",
       start: async () => ({
@@ -134,6 +140,7 @@ function discordRelay(): SurfaceRelayDescriptor<"discord"> {
 
 function githubRelay(): SurfaceRelayDescriptor<"github"> {
   return {
+    ...createGithubRelayPolicy(),
     lifecycle: {
       platform: "github",
       start: async () => ({
@@ -231,7 +238,7 @@ describe("surface runtime descriptor factories", () => {
     expect("requestIngress" in descriptor).toBe(false);
     expect("health" in descriptor).toBe(false);
     expect("surfaceStore" in descriptor).toBe(false);
-    expect("refs" in descriptor.relay!).toBe(false);
+    expect("refs" in descriptor.relay!).toBe(true);
   });
 
   it("keeps GitHub request ingress, relay, and workflow progress independently optional", () => {
@@ -285,7 +292,7 @@ describe("surface runtime descriptor factories", () => {
       expect(descriptor.requestIngress).toBe(requestIngressAvailable ? ingress : undefined);
       expect(descriptor.relay).toBe(appCredentialsAvailable ? relay : undefined);
       expect(descriptor.workflowProgress).toBe(workflowProgress);
-      if (descriptor.relay) expect("refs" in descriptor.relay).toBe(false);
+      if (descriptor.relay) expect("refs" in descriptor.relay).toBe(true);
       expect(logs).toEqual([
         ...(requestIngressAvailable
           ? []
@@ -312,6 +319,69 @@ describe("surface runtime descriptor factories", () => {
               },
             ]),
       ]);
+    },
+  );
+});
+
+describe("surface relay policies", () => {
+  it.each([
+    ["discord", "req:generic", "channel", "none", undefined],
+    ["discord", "discord:channel:message", "channel", "target", undefined],
+    ["discord", "discord:channel", "channel", "invalid", "malformed"],
+    ["discord", "github:octo/repo#1:10", "channel", "invalid", "platform-mismatch"],
+    ["discord", "discord:other:message", "channel", "invalid", "session-mismatch"],
+    ["github", "req:generic", "octo/repo#1", "none", undefined],
+    ["github", "github:octo/repo#1:10", "octo/repo#1", "target", undefined],
+    ["github", "github:octo/repo#1", "octo/repo#1", "invalid", "malformed"],
+    ["github", "discord:channel:message", "octo/repo#1", "invalid", "platform-mismatch"],
+    ["github", "github:octo/other#2:10", "octo/repo#1", "invalid", "session-mismatch"],
+  ] as const)(
+    "classifies %s initial target %s as %s",
+    (platform, requestId, sessionId, expectedKind, expectedReason) => {
+      const adapter = new TestAdapter(platform);
+      const policy =
+        platform === "discord" ? createDiscordRelayPolicy(adapter) : createGithubRelayPolicy();
+      const resolved = policy.refs.resolveInitialReplyTarget({ requestId, sessionId });
+
+      expect(resolved.kind).toBe(expectedKind);
+      if (resolved.kind === "invalid") {
+        if (expectedReason === undefined) throw new Error("invalid case is missing its reason");
+        expect(resolved.error.reason).toBe(expectedReason);
+      }
+      if (resolved.kind === "target") {
+        expect(resolved.ref).toEqual({
+          platform,
+          channelId: sessionId,
+          messageId: platform === "discord" ? "message" : "10",
+        });
+      }
+    },
+  );
+
+  it.each(["discord", "github"] as const)(
+    "rejects cross-platform and cross-session %s reanchor refs",
+    (platform) => {
+      const adapter = new TestAdapter(platform);
+      const policy =
+        platform === "discord" ? createDiscordRelayPolicy(adapter) : createGithubRelayPolicy();
+      const otherPlatform = platform === "discord" ? "github" : "discord";
+      const crossPlatform = policy.refs.decodeReanchorTarget({
+        ref: { platform: otherPlatform, channelId: "session", messageId: "message" },
+        expectedSessionId: "session",
+      });
+      const crossSession = policy.refs.decodeReanchorTarget({
+        ref: { platform, channelId: "other", messageId: "message" },
+        expectedSessionId: "session",
+      });
+
+      expect(crossPlatform.status).toBe("error");
+      if (crossPlatform.status === "error") {
+        expect(crossPlatform.error.reason).toBe("platform-mismatch");
+      }
+      expect(crossSession.status).toBe("error");
+      if (crossSession.status === "error") {
+        expect(crossSession.error.reason).toBe("session-mismatch");
+      }
     },
   );
 });

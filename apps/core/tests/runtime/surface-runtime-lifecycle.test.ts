@@ -24,8 +24,14 @@ import type {
 } from "../../src/surface/adapter";
 import type { AgentRunnerRecoveryEntry } from "../../src/surface/bridge/bus-agent-runner";
 import type { BusToAdapterRelaySnapshot } from "../../src/surface/bridge/subscribe-from-bus";
-import { createDiscordSurfaceRuntimeDescriptor } from "../../src/surface/discord/discord-runtime-descriptor";
-import { createGithubSurfaceRuntimeDescriptor } from "../../src/surface/github/github-runtime-descriptor";
+import {
+  createDiscordRelayPolicy,
+  createDiscordSurfaceRuntimeDescriptor,
+} from "../../src/surface/discord/discord-runtime-descriptor";
+import {
+  createGithubRelayPolicy,
+  createGithubSurfaceRuntimeDescriptor,
+} from "../../src/surface/github/github-runtime-descriptor";
 import {
   SurfaceRuntimeRegistry,
   type SurfaceRelayHandle,
@@ -81,7 +87,7 @@ class TestAdapter implements SurfaceAdapter {
     _opts?: StartOutputOpts,
   ): Promise<SurfaceOutputStream> {
     return {
-      push: async () => undefined,
+      push: async () => "visible",
       finish: async () => ({
         created: [{ platform: "discord", channelId: "channel", messageId: "message" }],
         last: { platform: "discord", channelId: "channel", messageId: "message" },
@@ -180,6 +186,7 @@ function createRegistry(input: {
           (async () => ({ platform: "discord", stop: async () => undefined })),
       },
       relay: {
+        ...createDiscordRelayPolicy(discordAdapter),
         lifecycle: {
           platform: "discord",
           start: input.discordRelayStart ?? (async () => emptyRelayHandle("discord")),
@@ -194,6 +201,7 @@ function createRegistry(input: {
       ...(input.githubRelayStart
         ? {
             relay: {
+              ...createGithubRelayPolicy(),
               lifecycle: { platform: "github" as const, start: input.githubRelayStart },
             },
           }
