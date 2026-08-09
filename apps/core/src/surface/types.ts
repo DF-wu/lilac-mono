@@ -37,6 +37,24 @@ export type GithubMsgRef = {
 export type SessionRef = DiscordSessionRef | GithubSessionRef;
 export type MsgRef = DiscordMsgRef | GithubMsgRef;
 
+export type RegisteredSurfacePlatform = SessionRef["platform"];
+
+export type SessionRefFor<P extends RegisteredSurfacePlatform> = Extract<
+  SessionRef,
+  { platform: P }
+>;
+
+export type MsgRefFor<P extends RegisteredSurfacePlatform> = Extract<MsgRef, { platform: P }>;
+
+type SurfacePlatformSetsEqual = [SessionRef["platform"]] extends [MsgRef["platform"]]
+  ? [MsgRef["platform"]] extends [SessionRef["platform"]]
+    ? true
+    : false
+  : false;
+type AssertSurfacePlatformSetsEqual<T extends true> = T;
+export type SurfaceRefPlatformSetsExactlyEqual =
+  AssertSurfacePlatformSetsEqual<SurfacePlatformSetsEqual>;
+
 export type SurfaceSelf = {
   platform: SurfacePlatform;
   userId: string;

@@ -4,11 +4,11 @@ Source: `plan/surface-adapter-contract-readiness.md`
 
 ## Stage 1: Canonical Types And Operation Algebra
 
-- [ ] Add the session/message platform-set equality assertion and contract test.
-- [ ] Define the closed surface operation and error unions.
-- [ ] Include detailed reactions, session participants, invalid input, and partial completion.
-- [ ] Add compile-time contract fixtures without changing production adapter signatures.
-- [ ] Run focused tests, Core typecheck, lint/fmt, and independent review.
+- [x] Add the session/message platform-set equality assertion and contract test.
+- [x] Define the closed surface operation and error unions.
+- [x] Include detailed reactions, session participants, invalid input, and partial completion.
+- [x] Add compile-time contract fixtures without changing production adapter signatures.
+- [x] Run focused tests, Core typecheck, lint/fmt, and independent review.
 
 ## Stage 2: Discord And GitHub Adapter Normalization
 

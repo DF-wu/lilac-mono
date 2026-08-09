@@ -2,17 +2,10 @@ import type { SurfaceMsgRef } from "@stanley2058/lilac-event-bus";
 import { Panic, Result, TaggedError, type Result as ResultType } from "better-result";
 
 import type { SurfaceAdapter } from "./adapter";
-import type { ContentOpts, MsgRef, SessionRef } from "./types";
+import type { ContentOpts, MsgRefFor, RegisteredSurfacePlatform, SessionRefFor } from "./types";
 import type { BusToAdapterRelaySnapshot } from "./bridge/subscribe-from-bus";
 
-export type RegisteredSurfacePlatform = SessionRef["platform"];
-
-export type SessionRefFor<P extends RegisteredSurfacePlatform> = Extract<
-  SessionRef,
-  { platform: P }
->;
-
-export type MsgRefFor<P extends RegisteredSurfacePlatform> = Extract<MsgRef, { platform: P }>;
+export type { MsgRefFor, RegisteredSurfacePlatform, SessionRefFor } from "./types";
 
 export interface SurfaceLifecycleHandle {
   stop(): Promise<void>;

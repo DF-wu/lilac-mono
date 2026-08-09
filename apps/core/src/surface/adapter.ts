@@ -1,9 +1,11 @@
-import { Panic } from "better-result";
+import type { AdapterPlatform } from "@stanley2058/lilac-event-bus";
+import { Panic, TaggedError, type Result as ResultType } from "better-result";
 
 import type {
   ContentOpts,
   LimitOpts,
   MsgRef,
+  RegisteredSurfacePlatform,
   SendOpts,
   SessionRef,
   SurfaceAttachment,
@@ -30,6 +32,106 @@ export function signalSurfaceFailure<T>(error: Error): Promise<T> {
   deferred.reject(error);
   return deferred.promise;
 }
+
+export type SurfaceOperation =
+  | "list-sessions"
+  | "list-session-participants"
+  | "start-output"
+  | "push-output"
+  | "finish-output"
+  | "abort-output"
+  | "start-typing"
+  | "stop-typing"
+  | "send-message"
+  | "read-message"
+  | "list-messages"
+  | "edit-message"
+  | "delete-message"
+  | "get-reply-context"
+  | "plan-reply-chain"
+  | "plan-merge-block"
+  | "add-reaction"
+  | "remove-reaction"
+  | "list-reactions"
+  | "list-reaction-details"
+  | "get-unread"
+  | "mark-read";
+
+export class SurfaceOperationUnsupported extends TaggedError("SurfaceOperationUnsupported")<{
+  readonly platform: RegisteredSurfacePlatform;
+  readonly operation: SurfaceOperation;
+  readonly message: string;
+}> {}
+
+export class SurfacePlatformMismatch extends TaggedError("SurfacePlatformMismatch")<{
+  readonly operation: SurfaceOperation;
+  readonly refRole: string;
+  readonly expectedPlatform: RegisteredSurfacePlatform;
+  readonly receivedPlatform: AdapterPlatform;
+  readonly message: string;
+}> {}
+
+export class SurfaceSessionMismatch extends TaggedError("SurfaceSessionMismatch")<{
+  readonly operation: SurfaceOperation;
+  readonly refRole: string;
+  readonly expectedSessionId: string;
+  readonly receivedSessionId: string;
+  readonly message: string;
+}> {}
+
+export class SurfaceInvalidInput extends TaggedError("SurfaceInvalidInput")<{
+  readonly platform: RegisteredSurfacePlatform;
+  readonly operation: SurfaceOperation;
+  readonly field: string;
+  readonly message: string;
+}> {}
+
+export class SurfaceOperationPartiallyCompleted extends TaggedError(
+  "SurfaceOperationPartiallyCompleted",
+)<{
+  readonly platform: RegisteredSurfacePlatform;
+  readonly operation: SurfaceOperation;
+  readonly created: MsgRef;
+  readonly message: string;
+}> {}
+
+export class SurfaceMessageNotFound extends TaggedError("SurfaceMessageNotFound")<{
+  readonly platform: RegisteredSurfacePlatform;
+  readonly operation: SurfaceOperation;
+  readonly message: string;
+}> {}
+
+export class SurfacePermissionDenied extends TaggedError("SurfacePermissionDenied")<{
+  readonly platform: RegisteredSurfacePlatform;
+  readonly operation: SurfaceOperation;
+  readonly message: string;
+}> {}
+
+export class SurfaceRateLimited extends TaggedError("SurfaceRateLimited")<{
+  readonly platform: RegisteredSurfacePlatform;
+  readonly operation: SurfaceOperation;
+  readonly retryAfterMs?: number;
+  readonly message: string;
+}> {}
+
+export class SurfaceUnavailable extends TaggedError("SurfaceUnavailable")<{
+  readonly platform: RegisteredSurfacePlatform;
+  readonly operation: SurfaceOperation;
+  readonly message: string;
+}> {}
+
+export type SurfaceOperationError =
+  | SurfaceOperationUnsupported
+  | SurfacePlatformMismatch
+  | SurfaceSessionMismatch
+  | SurfaceInvalidInput
+  | SurfaceOperationPartiallyCompleted
+  | SurfaceMessageNotFound
+  | SurfacePermissionDenied
+  | SurfaceRateLimited
+  | SurfaceUnavailable;
+
+export type SurfaceOperationResult<T> = ResultType<T, SurfaceOperationError>;
 
 export type SurfaceToolStatusUpdate = {
   toolCallId: string;
