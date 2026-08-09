@@ -3234,6 +3234,18 @@ export const LEGACY_UNENFORCED_EXCEPTION_ADAPTERS = new Map<string, readonly Exc
             "Preserves startup Panic precedence while supervising every runtime cleanup operation.",
         }),
       ),
+      ...[
+        "createCoreRuntimeCleanupSupervisor.record",
+        "stopCoreResidualDiscordRequestRouter",
+        "superviseCoreResidualDiscordRequestRouterDone",
+      ].map((exportName) => ({
+        identity: { module: "src/runtime/create-core-runtime.ts", exportName },
+        category: "defect-supervisor" as const,
+        externalApi: { package: "better-result", exportName: "Panic.is" },
+        direction: "observe-panic" as const,
+        reason:
+          "Preserves every residual router cleanup Panic by exact identity while Core retains cleanup ownership.",
+      })),
       {
         identity: {
           module: "src/runtime/create-core-runtime.ts",
@@ -3629,13 +3641,30 @@ export const LEGACY_UNENFORCED_EXCEPTION_ADAPTERS = new Map<string, readonly Exc
           reason: "Preserves Panic identity at the exact gate or detached timer boundary.",
         },
       ]),
-      ...["adaptRouterSubscriptionStart", "adaptRouterSubscriptionsStop"].map((exportName) => ({
+      ...["adaptDiscordRequestRouterStartOutcomeToHost", "adaptRouterSubscriptionsStop"].map(
+        (exportName) => ({
+          identity: { module: "src/surface/discord/discord-request-router.ts", exportName },
+          category: "result-to-framework" as const,
+          externalApi: {
+            package: "@stanley2058/lilac-core",
+            exportName: "request router lifecycle",
+          },
+          direction: "signal-host" as const,
+          reason:
+            "Adapts the event-delivery lifecycle Result at the existing request-router host boundary.",
+        }),
+      ),
+      ...[
+        "adaptRouterSubscriptionStart",
+        "finishRouterSubscriptionStartFailure",
+        "stopRouterSubscriptionsAllSettled",
+      ].map((exportName) => ({
         identity: { module: "src/surface/discord/discord-request-router.ts", exportName },
-        category: "result-to-framework" as const,
-        externalApi: { package: "@stanley2058/lilac-core", exportName: "request router lifecycle" },
-        direction: "signal-host" as const,
+        category: "defect-supervisor" as const,
+        externalApi: { package: "better-result", exportName: "Panic.is" },
+        direction: "observe-panic" as const,
         reason:
-          "Adapts the event-delivery lifecycle Result at the existing request-router host boundary.",
+          "Preserves exact startup or rollback Panic identity while retaining residual router ownership.",
       })),
       {
         identity: {
@@ -8695,7 +8724,7 @@ function approvedExceptionAdapterCatalogSha256(
 }
 
 export const APPROVED_EXCEPTION_ADAPTER_CATALOG_SHA256 =
-  "d2563db6d6b358459218f7651a077e7d2d32bb324787d4395388109bc2e8beae";
+  "267131aa79728ac9559ab701b17908515ebd2d2f9298edaa6fadbfe665637a60";
 
 export const architectureManifest = {
   version: 1,

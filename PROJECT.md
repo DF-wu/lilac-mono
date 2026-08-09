@@ -146,6 +146,26 @@ Many flows treat missing `request_id` as an error (especially request lifecycle 
 
 The Discord adapter also maintains a local SQLite cache (`discord-surface.db`) for read-history operations.
 
+### Surface Runtime Registry
+
+Core composes its implemented surfaces through one closed `SurfaceRuntimeRegistry` in
+`apps/core/src/surface/runtime-descriptor.ts`. The Discord and GitHub descriptor factories own each
+protocol's adapter, ingress participation, output relay policy/lifecycle, and optional workflow-progress
+port. Registry iteration in `apps/core/src/runtime/surface-runtime-lifecycle.ts` drives connection,
+shutdown, relay drain, snapshot collection, restore dispatch, and reverse-order cleanup without
+platform-specific lifecycle branches.
+
+`RegisteredSurfacePlatform` is derived from the closed `SessionRef` union and currently contains only
+`discord` and `github`. It is intentionally narrower than the event-bus `AdapterPlatform` wire enum,
+which also recognizes placeholder values such as `slack`, `telegram`, `whatsapp`, `web`, and `unknown`.
+A wire-valid platform is not therefore an implemented or registered Core surface.
+
+The registry is internal runtime composition, not a dynamic plugin or capability API. Discord health,
+search/storage, request routing and sidecars remain protocol-owned; GitHub webhook verification remains
+protocol-owned; workflow reply waits remain Discord-only. Before registering a third platform, complete
+Part 2 in `plan/third-platform-surface-readiness.md` so refs, persistence, workflow authorization,
+authenticated principals, plugin contracts, and recovery codecs are widened deliberately.
+
 ### Router
 
 The router subscribes to `evt.adapter` and decides whether to create/append to an agent request for Discord events.
@@ -502,16 +522,17 @@ The Claude runtime integration and official SDK consume these directly rather th
 Startup order is intentional:
 
 1. Start Discord search indexer
-2. Bridge adapter -> bus (so early Discord events don’t get lost)
-3. Request-message cache, durable workflow action/wait resolvers, and surface adapters
+2. Start registered adapter-event ingress (so early Discord events don’t get lost)
+3. Request-message cache, durable workflow action/wait resolvers, and registered surface adapters
 4. Workflow progress projector, trigger scheduler, and live-parent completion bridge
 5. Router and privileged Level-2 tool server
-6. Surface output relays and optional GitHub webhook ingress
+6. Registered surface output relays and independently hosted request ingress such as the optional GitHub webhook
 7. Agent runner
 8. Restore graceful-restart request/relay snapshots
 9. Unified workflow engine, which reclaims active durable runs and replays their operation journals
 
-Shutdown happens in reverse (best-effort).
+Shutdown stops registered ingress before relay drain, combines relay recovery snapshots, then releases
+surface resources in deterministic reverse registry order (best-effort).
 
 ---
 

@@ -36,51 +36,13 @@ function reverseEntries(registry: SurfaceRuntimeRegistry) {
   return registry.entries().toReversed();
 }
 
-function relayDrainLabel(platform: RegisteredSurfacePlatform): string {
-  switch (platform) {
-    case "discord":
-      return "graceful.discordBridge.beginDrain";
-    case "github":
-      return "graceful.githubBridge.beginDrain";
-  }
-}
-
-function relayStopLabel(platform: RegisteredSurfacePlatform): string {
-  switch (platform) {
-    case "discord":
-      return "bridgeBusToAdapter.stop";
-    case "github":
-      return "bridgeGithubBusToAdapter.stop";
-  }
-}
-
-function requestIngressStopLabel(platform: RegisteredSurfacePlatform, graceful: boolean): string {
-  switch (platform) {
-    case "discord":
-      return graceful
-        ? "graceful.ingress.discordRequestIngress.stop"
-        : "discordRequestIngress.stop";
-    case "github":
-      return graceful ? "graceful.ingress.githubWebhook.stop" : "githubWebhook.stop";
-  }
-}
-
-function adapterDisconnectLabel(platform: RegisteredSurfacePlatform): string {
-  switch (platform) {
-    case "discord":
-      return "adapter.disconnect";
-    case "github":
-      return "githubAdapter.disconnect";
-  }
-}
-
-function adapterIngressStopLabel(platform: RegisteredSurfacePlatform, graceful: boolean): string {
-  switch (platform) {
-    case "discord":
-      return graceful ? "graceful.ingress.bridgeAdapterToBus.stop" : "bridgeAdapterToBus.stop";
-    case "github":
-      return graceful ? "graceful.ingress.githubAdapterToBus.stop" : "githubAdapterToBus.stop";
-  }
+function surfaceCleanupLabel(input: {
+  readonly platform: RegisteredSurfacePlatform;
+  readonly resource: "adapter" | "adapter-ingress" | "relay" | "request-ingress";
+  readonly operation: "beginDrain" | "disconnect" | "stop";
+  readonly graceful?: boolean;
+}): string {
+  return `${input.graceful ? "graceful." : ""}surface.${input.platform}.${input.resource}.${input.operation}`;
 }
 
 export function createSurfaceWorkflowProgressPortMap(
@@ -162,8 +124,14 @@ export async function stopSurfaceAdapterIngress(input: {
   for (const descriptor of reverseEntries(input.registry)) {
     const handle = input.handles.get(descriptor.platform);
     if (!handle) continue;
-    await input.runCleanup(adapterIngressStopLabel(descriptor.platform, input.graceful), () =>
-      handle.stop(),
+    await input.runCleanup(
+      surfaceCleanupLabel({
+        platform: descriptor.platform,
+        resource: "adapter-ingress",
+        operation: "stop",
+        graceful: input.graceful,
+      }),
+      () => handle.stop(),
     );
     input.handles.delete(descriptor.platform);
   }
@@ -178,8 +146,14 @@ export async function stopSurfaceRequestIngress(input: {
   for (const descriptor of reverseEntries(input.registry)) {
     const handle = input.handles.get(descriptor.platform);
     if (!handle) continue;
-    await input.runCleanup(requestIngressStopLabel(descriptor.platform, input.graceful), () =>
-      handle.stop(),
+    await input.runCleanup(
+      surfaceCleanupLabel({
+        platform: descriptor.platform,
+        resource: "request-ingress",
+        operation: "stop",
+        graceful: input.graceful,
+      }),
+      () => handle.stop(),
     );
     input.handles.delete(descriptor.platform);
   }
@@ -212,8 +186,14 @@ export async function stopIngressAndDrainSurfaceRecovery(input: {
   for (const descriptor of input.registry.entries()) {
     const relay = input.relays.get(descriptor.platform);
     if (!relay) continue;
-    await input.runCleanup(relayDrainLabel(descriptor.platform), () =>
-      relay.beginDrain({ deadlineMs: input.deadlineMs }),
+    await input.runCleanup(
+      surfaceCleanupLabel({
+        platform: descriptor.platform,
+        resource: "relay",
+        operation: "beginDrain",
+        graceful: true,
+      }),
+      () => relay.beginDrain({ deadlineMs: input.deadlineMs }),
     );
   }
 
@@ -237,13 +217,25 @@ export async function stopSurfaceOutputs(input: {
   for (const descriptor of reverseEntries(input.registry)) {
     const relay = input.relays.get(descriptor.platform);
     if (relay) {
-      await input.runCleanup(relayStopLabel(descriptor.platform), () => relay.stop());
+      await input.runCleanup(
+        surfaceCleanupLabel({
+          platform: descriptor.platform,
+          resource: "relay",
+          operation: "stop",
+        }),
+        () => relay.stop(),
+      );
       input.relays.delete(descriptor.platform);
     }
     const ingress = input.requestIngress.get(descriptor.platform);
     if (ingress) {
-      await input.runCleanup(requestIngressStopLabel(descriptor.platform, false), () =>
-        ingress.stop(),
+      await input.runCleanup(
+        surfaceCleanupLabel({
+          platform: descriptor.platform,
+          resource: "request-ingress",
+          operation: "stop",
+        }),
+        () => ingress.stop(),
       );
       input.requestIngress.delete(descriptor.platform);
     }
@@ -258,7 +250,14 @@ export async function disconnectSurfaceAdapters(input: {
   for (const descriptor of reverseEntries(input.registry)) {
     const adapter = input.connected.get(descriptor.platform);
     if (!adapter) continue;
-    await input.runCleanup(adapterDisconnectLabel(descriptor.platform), () => adapter.disconnect());
+    await input.runCleanup(
+      surfaceCleanupLabel({
+        platform: descriptor.platform,
+        resource: "adapter",
+        operation: "disconnect",
+      }),
+      () => adapter.disconnect(),
+    );
     input.connected.delete(descriptor.platform);
   }
 }

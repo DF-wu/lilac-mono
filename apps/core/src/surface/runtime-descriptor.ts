@@ -221,12 +221,6 @@ export class SurfaceRuntimeRegistry {
     return this.#descriptors;
   }
 
-  get(platform: "discord"): SurfaceRuntimeDescriptor<"discord"> | undefined;
-  get(platform: "github"): SurfaceRuntimeDescriptor<"github"> | undefined;
-  get(platform: RegisteredSurfacePlatform): RegisteredSurfaceRuntimeDescriptor | undefined {
-    return this.#descriptors.find((descriptor) => descriptor.platform === platform);
-  }
-
   async validateAdapterPlatforms(): Promise<void> {
     for (const descriptor of this.#descriptors) {
       const self = await descriptor.adapter.getSelf();

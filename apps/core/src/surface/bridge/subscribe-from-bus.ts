@@ -28,6 +28,7 @@ import type {
   RegisteredSurfacePlatform,
   SurfaceIngressAcknowledgementCleanupFailed,
   SurfaceRelayPolicy,
+  SurfaceRelaySnapshotFor,
   SurfaceReplyTargetInvalid,
   SurfaceRefInvalid,
 } from "../runtime-descriptor";
@@ -345,7 +346,7 @@ export type BusToAdapterRelaySnapshot = {
   requestId: string;
   sessionId: string;
   requestClient?: string;
-  platform: "discord" | "github";
+  platform: RegisteredSurfacePlatform;
   requestStartedAtMs?: number;
   routerSessionMode?: "mention" | "active";
   replyTo?: MsgRef;
@@ -1834,6 +1835,7 @@ export async function bridgeBusToAdapter<P extends RegisteredSurfacePlatform>(pa
   }
 
   return {
+    platform,
     beginDrain: async (opts?: { deadlineMs?: number }) => {
       draining = true;
       await stopIngress();
@@ -1845,8 +1847,8 @@ export async function bridgeBusToAdapter<P extends RegisteredSurfacePlatform>(pa
         await new Promise((r) => setTimeout(r, 50));
       }
     },
-    snapshotRelays: (): BusToAdapterRelaySnapshot[] => {
-      return [...activeRelays.values()].map((r) => r.snapshot());
+    snapshotRelays: (): SurfaceRelaySnapshotFor<P>[] => {
+      return [...activeRelays.values()].map((relay) => ({ ...relay.snapshot(), platform }));
     },
     restoreRelays: async (snapshots: readonly BusToAdapterRelaySnapshot[]) => {
       if (draining) return;

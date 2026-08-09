@@ -153,7 +153,10 @@ import {
 } from "../../../src/transcript/transcript-store";
 import { createAgentOutputActivityPublisher } from "../../../src/shared/agent-output-activity";
 import { createIdleTimer } from "../../../src/shared/idle-timer";
-import { startDiscordRequestRouter as startBusRequestRouter } from "../../../src/surface/discord/discord-request-router";
+import {
+  adaptDiscordRequestRouterStartOutcomeToHost,
+  startDiscordRequestRouter,
+} from "../../../src/surface/discord/discord-request-router";
 import { bridgeAdapterToBus } from "../../../src/surface/bridge/publish-to-bus";
 import { bridgeBusToAdapter } from "../../../src/surface/bridge/subscribe-from-bus";
 import { createDiscordRelayPolicy } from "../../../src/surface/discord/discord-runtime-descriptor";
@@ -3285,14 +3288,18 @@ describe("startBusAgentRunner Core-primary Claude production path", () => {
       subscriptionId: "production-primary-auto-inject-ingress",
       transcriptStore: store,
     });
-    const router = await startBusRequestRouter({
-      adapter,
-      bus,
-      subscriptionId: "production-primary-auto-inject-router",
-      config,
-      transcriptStore: store,
-      routerGate: async () => ({ forward: true, reason: "deterministic integration route" }),
-    });
+    const router = adaptDiscordRequestRouterStartOutcomeToHost(
+      await startDiscordRequestRouter({
+        adapter,
+        bus,
+        subscriptionId: "production-primary-auto-inject-router",
+        config,
+        transcriptStore: store,
+        routerGate: async () => ({ forward: true, reason: "deterministic integration route" }),
+      }),
+      () => {},
+      () => {},
+    );
     const outputRelay = await bridgeBusToAdapter({
       adapter,
       bus,

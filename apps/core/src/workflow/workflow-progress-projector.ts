@@ -77,6 +77,11 @@ type WorkflowProgressProjectionError =
 
 type WorkflowProgressProjectionResult<T> = ResultType<T, WorkflowProgressProjectionError>;
 
+type WorkflowProgressPortRegistration = {
+  readonly platform: RegisteredSurfacePlatform;
+  readonly port: RegisteredSurfaceWorkflowProgressPort;
+};
+
 function workflowProgressProjectionFailure(message: string): WorkflowProgressProjectionFailed {
   return new WorkflowProgressProjectionFailed({ message });
 }
@@ -92,6 +97,16 @@ function workflowProgressSurfaceCallFailure(
     case "failed":
       return new WorkflowProgressSurfaceCallFailed(input);
   }
+}
+
+function findWorkflowProgressPort(
+  ports: ReadonlyMap<RegisteredSurfacePlatform, RegisteredSurfaceWorkflowProgressPort>,
+  platform: string,
+): WorkflowProgressPortRegistration | undefined {
+  for (const [registeredPlatform, port] of ports) {
+    if (registeredPlatform === platform) return { platform: registeredPlatform, port };
+  }
+  return undefined;
 }
 
 function adaptWorkflowProgressProjectionResultToHost<T>(
@@ -152,20 +167,8 @@ function correlateWorkflowProgressMessageRef(input: {
       ),
     );
   }
-  switch (input.runTargetPlatform) {
-    case "discord":
-      return Result.ok({
-        platform: "discord",
-        channelId: input.messageRef.channelId,
-        messageId: input.messageRef.messageId,
-      });
-    case "github":
-      return Result.ok({
-        platform: "github",
-        channelId: input.messageRef.channelId,
-        messageId: input.messageRef.messageId,
-      });
-  }
+  // The equality checks establish the discriminant correlation that TypeScript cannot infer.
+  return Result.ok(input.messageRef as MsgRef);
 }
 
 function limitContentText(content: ContentOpts): ContentOpts {
@@ -475,7 +478,8 @@ export class WorkflowProgressProjector implements WorkflowProgressCardService {
     const expiresAt = now + 86_400_000;
     if (
       expectedUserId &&
-      (expectedPlatform === "discord" || expectedPlatform === "github") &&
+      expectedPlatform &&
+      findWorkflowProgressPort(this.input.ports, expectedPlatform) !== undefined &&
       expectedPlatform === view.run.progressTarget?.platform
     ) {
       for (const kind of view.availableActions) {
@@ -582,14 +586,15 @@ export class WorkflowProgressProjector implements WorkflowProgressCardService {
         ),
       );
     }
-    const platform = target.platform;
-    if (platform !== "discord" && platform !== "github") {
+    const registration = findWorkflowProgressPort(this.input.ports, target.platform);
+    if (!registration) {
       return Result.err(
         workflowProgressProjectionFailure(
           `Workflow run ${runId} has no supported durable progress target`,
         ),
       );
     }
+    const { platform, port } = registration;
     const existingResult = this.input.store.getSurfaceBinding(runId);
     if (existingResult.status === "error") {
       return Result.err(workflowProgressProjectionFailure(existingResult.error.message));
@@ -610,12 +615,6 @@ export class WorkflowProgressProjector implements WorkflowProgressCardService {
           this.writeFailure(existing, correlated.error.message, now);
           return Result.err(correlated.error);
       }
-    }
-    const port = this.input.ports.get(platform);
-    if (!port) {
-      return Result.err(
-        workflowProgressProjectionFailure(`Workflow progress port is unavailable: ${platform}`),
-      );
     }
     if (!existing) {
       existing = {

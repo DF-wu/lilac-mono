@@ -160,6 +160,81 @@ export type DiscordRequestRouter = {
   stop(): Promise<void>;
 };
 
+export type ResidualDiscordRequestRouter = {
+  readonly done: Promise<ResultType<void, EventDeliveryDoneError>>;
+  stop(): Promise<ResidualDiscordRequestRouterStopOutcome>;
+};
+
+export class DiscordRequestRouterSubscriptionStartRejected extends TaggedError(
+  "DiscordRequestRouterSubscriptionStartRejected",
+)<{
+  readonly cause: unknown;
+  readonly message: string;
+}> {}
+
+export class DiscordRequestRouterSubscriptionStopRejected extends TaggedError(
+  "DiscordRequestRouterSubscriptionStopRejected",
+)<{
+  readonly cause: unknown;
+  readonly message: string;
+}> {}
+
+export type DiscordRequestRouterStartupFailure =
+  | EventDeliveryStartFailed
+  | DiscordRequestRouterSubscriptionStartRejected;
+
+export type DiscordRequestRouterCleanupFailure =
+  | EventDeliveryStopFailed
+  | DiscordRequestRouterSubscriptionStopRejected;
+
+export class ResidualDiscordRequestRouterStopFailed extends TaggedError(
+  "ResidualDiscordRequestRouterStopFailed",
+)<{
+  readonly failures: readonly DiscordRequestRouterCleanupFailure[];
+  readonly message: string;
+}> {}
+
+export type ResidualDiscordRequestRouterStopOutcome =
+  | {
+      readonly kind: "result";
+      readonly result: ResultType<void, ResidualDiscordRequestRouterStopFailed>;
+      readonly residualRouter: ResidualDiscordRequestRouter | null;
+    }
+  | {
+      readonly kind: "panic";
+      readonly panic: Panic;
+      readonly additionalPanics: readonly Panic[];
+      readonly ordinaryFailure: ResidualDiscordRequestRouterStopFailed | null;
+      readonly residualRouter: ResidualDiscordRequestRouter;
+    };
+
+export class DiscordRequestRouterStartupAndCleanupFailed extends TaggedError(
+  "DiscordRequestRouterStartupAndCleanupFailed",
+)<{
+  readonly startup: DiscordRequestRouterStartupFailure;
+  readonly cleanup: readonly DiscordRequestRouterCleanupFailure[];
+  readonly message: string;
+}> {}
+
+type DiscordRequestRouterStartError =
+  | DiscordRequestRouterStartupFailure
+  | DiscordRequestRouterStartupAndCleanupFailed;
+
+export type DiscordRequestRouterStartOutcome =
+  | {
+      readonly kind: "result";
+      readonly result: ResultType<DiscordRequestRouter, DiscordRequestRouterStartError>;
+      readonly residualRouter: ResidualDiscordRequestRouter | null;
+    }
+  | {
+      readonly kind: "panic";
+      readonly panic: Panic;
+      readonly additionalPanics: readonly Panic[];
+      readonly startupFailure: DiscordRequestRouterStartupFailure | null;
+      readonly ordinaryCleanupFailure: ResidualDiscordRequestRouterStopFailed | null;
+      readonly residualRouter: ResidualDiscordRequestRouter | null;
+    };
+
 function lifecycleDeliveryPolicy(
   error: BusRequestRouterMissingHeadersError | BusRequestRouterRoutingError,
 ): DeliveryDisposition {
@@ -244,42 +319,78 @@ async function captureRouterDebounceFlush(input: {
   }
 }
 
-async function rollbackRouterSubscriptionStartup(
-  startedSubscriptions: readonly RouterDeliverySubscription[],
-  logger: Logger,
-): Promise<void> {
-  for (const subscription of startedSubscriptions.toReversed()) {
-    const [stopped] = await Promise.allSettled([Promise.resolve().then(() => subscription.stop())]);
+type RouterSubscriptionStartOutcome =
+  | { readonly kind: "started"; readonly subscription: RouterDeliverySubscription }
+  | { readonly kind: "failure"; readonly failure: DiscordRequestRouterStartupFailure }
+  | { readonly kind: "panic"; readonly panic: Panic };
+
+type RouterSubscriptionRollbackOutcome = {
+  readonly failures: readonly DiscordRequestRouterCleanupFailure[];
+  readonly panics: readonly Panic[];
+  readonly residualSubscriptions: readonly RouterDeliverySubscription[];
+};
+
+async function stopRouterSubscriptionsAllSettled(
+  subscriptions: readonly RouterDeliverySubscription[],
+): Promise<RouterSubscriptionRollbackOutcome> {
+  const failures: DiscordRequestRouterCleanupFailure[] = [];
+  const panics: Panic[] = [];
+  const residualSubscriptions: RouterDeliverySubscription[] = [];
+
+  const orderedSubscriptions = subscriptions.toReversed();
+  const stoppedSubscriptions = await Promise.allSettled(
+    orderedSubscriptions.map((subscription) => Promise.resolve().then(() => subscription.stop())),
+  );
+  for (const [index, stopped] of stoppedSubscriptions.entries()) {
+    const subscription = orderedSubscriptions[index];
+    if (!subscription) continue;
     if (stopped.status === "rejected") {
-      logger.error("router subscription startup rollback rejected", {
-        panic: isPanic(stopped.reason),
-      });
+      residualSubscriptions.push(subscription);
+      if (isPanic(stopped.reason)) {
+        panics.push(stopped.reason);
+      } else {
+        failures.push(
+          new DiscordRequestRouterSubscriptionStopRejected({
+            cause: stopped.reason,
+            message: "Discord request router subscription stop rejected during cleanup",
+          }),
+        );
+      }
       continue;
     }
     if (stopped.value.status === "error") {
-      logger.error(
-        "router subscription startup rollback failed",
-        formatBridgeTaggedErrorForLog(stopped.value.error),
-      );
+      residualSubscriptions.push(subscription);
+      failures.push(stopped.value.error);
     }
   }
+
+  return { failures, panics, residualSubscriptions };
+}
+
+async function rollbackRouterSubscriptionStartup(
+  startedSubscriptions: readonly RouterDeliverySubscription[],
+): Promise<RouterSubscriptionRollbackOutcome> {
+  return stopRouterSubscriptionsAllSettled(startedSubscriptions);
 }
 
 async function adaptRouterSubscriptionStart(
   started: Promise<ResultType<RouterDeliverySubscription, EventDeliveryStartFailed>>,
-  startedSubscriptions: readonly RouterDeliverySubscription[],
-  logger: Logger,
-): Promise<RouterDeliverySubscription> {
+): Promise<RouterSubscriptionStartOutcome> {
   const [settled] = await Promise.allSettled([started]);
   if (settled.status === "rejected") {
-    await rollbackRouterSubscriptionStartup(startedSubscriptions, logger);
-    throw settled.reason;
+    if (isPanic(settled.reason)) return { kind: "panic", panic: settled.reason };
+    return {
+      kind: "failure",
+      failure: new DiscordRequestRouterSubscriptionStartRejected({
+        cause: settled.reason,
+        message: "Discord request router subscription start rejected",
+      }),
+    };
   }
   if (settled.value.status === "error") {
-    await rollbackRouterSubscriptionStartup(startedSubscriptions, logger);
-    throw settled.value.error;
+    return { kind: "failure", failure: settled.value.error };
   }
-  return settled.value.value;
+  return { kind: "started", subscription: settled.value.value };
 }
 
 function adaptRouterConfigResult(result: ReturnType<typeof withDefaultToolsConfig>): CoreConfig {
@@ -311,6 +422,123 @@ async function adaptRouterSubscriptionsStop(
   for (const result of results) {
     if (result.status === "error") throw result.error;
   }
+}
+
+function createResidualDiscordRequestRouter(
+  subscriptions: readonly RouterDeliverySubscription[],
+): ResidualDiscordRequestRouter {
+  return {
+    done: superviseRouterSubscriptionsDone(subscriptions),
+    stop: async () => {
+      const stopped = await stopRouterSubscriptionsAllSettled(subscriptions);
+      const residualRouter =
+        stopped.residualSubscriptions.length > 0
+          ? createResidualDiscordRequestRouter(stopped.residualSubscriptions)
+          : null;
+      const ordinaryFailure =
+        stopped.failures.length > 0
+          ? new ResidualDiscordRequestRouterStopFailed({
+              failures: stopped.failures,
+              message: "Discord request router residual subscription cleanup failed",
+            })
+          : null;
+
+      const panic = stopped.panics[0];
+      if (panic) {
+        return {
+          kind: "panic",
+          panic,
+          additionalPanics: stopped.panics.slice(1),
+          ordinaryFailure,
+          residualRouter: createResidualDiscordRequestRouter(stopped.residualSubscriptions),
+        };
+      }
+      if (ordinaryFailure) {
+        return {
+          kind: "result",
+          result: Result.err(ordinaryFailure),
+          residualRouter,
+        };
+      }
+      return { kind: "result", result: Result.ok(undefined), residualRouter: null };
+    },
+  };
+}
+
+async function finishRouterSubscriptionStartFailure(
+  startup: DiscordRequestRouterStartupFailure | Panic,
+  startedSubscriptions: readonly RouterDeliverySubscription[],
+): Promise<DiscordRequestRouterStartOutcome> {
+  const rollback = await rollbackRouterSubscriptionStartup(startedSubscriptions);
+  const residualRouter =
+    rollback.residualSubscriptions.length > 0
+      ? createResidualDiscordRequestRouter(rollback.residualSubscriptions)
+      : null;
+  const ordinaryCleanupFailure =
+    rollback.failures.length > 0
+      ? new ResidualDiscordRequestRouterStopFailed({
+          failures: rollback.failures,
+          message: "Discord request router startup rollback cleanup failed",
+        })
+      : null;
+
+  if (isPanic(startup)) {
+    return {
+      kind: "panic",
+      panic: startup,
+      additionalPanics: rollback.panics,
+      startupFailure: null,
+      ordinaryCleanupFailure,
+      residualRouter,
+    };
+  }
+  const rollbackPanic = rollback.panics[0];
+  if (rollbackPanic) {
+    return {
+      kind: "panic",
+      panic: rollbackPanic,
+      additionalPanics: rollback.panics.slice(1),
+      startupFailure: startup,
+      ordinaryCleanupFailure,
+      residualRouter,
+    };
+  }
+  if (rollback.failures.length === 0) {
+    return { kind: "result", result: Result.err(startup), residualRouter: null };
+  }
+  return {
+    kind: "result",
+    result: Result.err(
+      new DiscordRequestRouterStartupAndCleanupFailed({
+        startup,
+        cleanup: rollback.failures,
+        message: `${startup.message}; startup rollback also failed`,
+      }),
+    ),
+    residualRouter,
+  };
+}
+
+export function adaptDiscordRequestRouterStartOutcomeToHost(
+  outcome: DiscordRequestRouterStartOutcome,
+  retainResidualRouter: (router: ResidualDiscordRequestRouter) => void,
+  recordPanicDiagnostics: (diagnostics: {
+    readonly additionalPanicCount: number;
+    readonly startupFailure: DiscordRequestRouterStartupFailure | null;
+    readonly ordinaryCleanupFailure: ResidualDiscordRequestRouterStopFailed | null;
+  }) => void,
+): DiscordRequestRouter {
+  if (outcome.residualRouter) retainResidualRouter(outcome.residualRouter);
+  if (outcome.kind === "panic") {
+    recordPanicDiagnostics({
+      additionalPanicCount: outcome.additionalPanics.length,
+      startupFailure: outcome.startupFailure,
+      ordinaryCleanupFailure: outcome.ordinaryCleanupFailure,
+    });
+    throw outcome.panic;
+  }
+  if (outcome.result.status === "error") throw outcome.result.error;
+  return outcome.result.value;
 }
 
 function resolveTriggerType(input: {
@@ -375,7 +603,7 @@ export function signalDiscordRequestRouterPlatformMismatch(
 
 export async function startDiscordRequestRouter(
   params: StartDiscordRequestRouterInput,
-): Promise<DiscordRequestRouter> {
+): Promise<DiscordRequestRouterStartOutcome> {
   const { adapter, bus, subscriptionId, customCommands } = params;
   const self = await adapter.getSelf();
   if (self.platform !== "discord") signalDiscordRequestRouterPlatformMismatch(self.platform);
@@ -524,7 +752,7 @@ export async function startDiscordRequestRouter(
   }
 
   const startedSubscriptions: RouterDeliverySubscription[] = [];
-  const lifecycleSub = await adaptRouterSubscriptionStart(
+  const lifecycleStarted = await adaptRouterSubscriptionStart(
     bus.subscribeTopic(
       "evt.request",
       {
@@ -587,12 +815,17 @@ export async function startDiscordRequestRouter(
       },
       lifecycleDeliveryPolicy,
     ),
-    startedSubscriptions,
-    logger,
   );
+  if (lifecycleStarted.kind !== "started") {
+    return finishRouterSubscriptionStartFailure(
+      lifecycleStarted.kind === "panic" ? lifecycleStarted.panic : lifecycleStarted.failure,
+      startedSubscriptions,
+    );
+  }
+  const lifecycleSub = lifecycleStarted.subscription;
   startedSubscriptions.push(lifecycleSub);
 
-  const surfaceSub = await adaptRouterSubscriptionStart(
+  const surfaceStarted = await adaptRouterSubscriptionStart(
     bus.subscribeTopic(
       "evt.surface",
       {
@@ -647,12 +880,17 @@ export async function startDiscordRequestRouter(
       },
       surfaceDeliveryPolicy,
     ),
-    startedSubscriptions,
-    logger,
   );
+  if (surfaceStarted.kind !== "started") {
+    return finishRouterSubscriptionStartFailure(
+      surfaceStarted.kind === "panic" ? surfaceStarted.panic : surfaceStarted.failure,
+      startedSubscriptions,
+    );
+  }
+  const surfaceSub = surfaceStarted.subscription;
   startedSubscriptions.push(surfaceSub);
 
-  const adapterSub = await adaptRouterSubscriptionStart(
+  const adapterStarted = await adaptRouterSubscriptionStart(
     bus.subscribeTopic(
       "evt.adapter",
       {
@@ -1006,9 +1244,14 @@ export async function startDiscordRequestRouter(
       },
       adapterDeliveryPolicy,
     ),
-    startedSubscriptions,
-    logger,
   );
+  if (adapterStarted.kind !== "started") {
+    return finishRouterSubscriptionStartFailure(
+      adapterStarted.kind === "panic" ? adapterStarted.panic : adapterStarted.failure,
+      startedSubscriptions,
+    );
+  }
+  const adapterSub = adapterStarted.subscription;
 
   function clearDebounceBuffer(sessionId: string) {
     const b = buffers.get(sessionId);
@@ -2283,17 +2526,21 @@ export async function startDiscordRequestRouter(
   ]);
 
   return {
-    done,
-    stop: async () => {
-      try {
-        await adaptRouterSubscriptionsStop(subscriptions);
-      } finally {
-        for (const b of buffers.values()) {
-          if (b.timer) clearTimeout(b.timer);
+    kind: "result",
+    residualRouter: null,
+    result: Result.ok({
+      done,
+      stop: async () => {
+        try {
+          await adaptRouterSubscriptionsStop(subscriptions);
+        } finally {
+          for (const b of buffers.values()) {
+            if (b.timer) clearTimeout(b.timer);
+          }
+          buffers.clear();
+          pendingMentionReplyBatchBySession.clear();
         }
-        buffers.clear();
-        pendingMentionReplyBatchBySession.clear();
-      }
-    },
+      },
+    }),
   };
 }

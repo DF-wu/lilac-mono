@@ -467,7 +467,7 @@ describe("surface relay policies", () => {
 });
 
 describe("surface runtime registry", () => {
-  it("preserves registration order and platform-correlated lookup", () => {
+  it("preserves registration order", () => {
     const discord = discordDescriptor();
     const github = githubDescriptor();
     const created = SurfaceRuntimeRegistry.create([discord, github]);
@@ -475,8 +475,6 @@ describe("surface runtime registry", () => {
     expect(created.status).toBe("ok");
     if (created.status === "error") return;
     expect(created.value.entries()).toEqual([discord, github]);
-    expect(created.value.get("discord")).toBe(discord);
-    expect(created.value.get("github")).toBe(github);
   });
 
   it.each(["discord", "github"] as const)(

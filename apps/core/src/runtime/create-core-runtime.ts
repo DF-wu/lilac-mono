@@ -49,8 +49,10 @@ import {
 import { bridgeAdapterToBus } from "../surface/bridge/publish-to-bus";
 import { bridgeBusToAdapter } from "../surface/bridge/subscribe-from-bus";
 import {
+  adaptDiscordRequestRouterStartOutcomeToHost,
   startDiscordRequestRouter,
   type DiscordRequestRouter,
+  type ResidualDiscordRequestRouter,
 } from "../surface/discord/discord-request-router";
 import {
   resolveAgentRunModel,
@@ -139,11 +141,7 @@ import {
   type SurfaceRelayHandles,
   type SurfaceRequestIngressHandles,
 } from "./surface-runtime-lifecycle";
-import {
-  SurfaceRuntimeRegistry,
-  type RegisteredSurfacePlatform,
-  type SurfaceRelayHandle,
-} from "../surface/runtime-descriptor";
+import { SurfaceRuntimeRegistry } from "../surface/runtime-descriptor";
 import { prewarmFffFinders } from "@stanley2058/lilac-fs";
 import {
   adaptToolResultArtifactStoreInitToHost,
@@ -337,6 +335,122 @@ export function superviseCoreRouterDone(params: {
     params.reportFatalError(
       new Panic({ message: "Discord request router subscriptions completed unexpectedly" }),
     );
+  }
+}
+
+export class CoreResidualDiscordRequestRouterStopRejected extends TaggedError(
+  "CoreResidualDiscordRequestRouterStopRejected",
+)<{
+  readonly cause: unknown;
+  readonly message: string;
+}> {}
+
+export class CoreResidualDiscordRequestRouterDoneRejected extends TaggedError(
+  "CoreResidualDiscordRequestRouterDoneRejected",
+)<{
+  readonly cause: unknown;
+  readonly message: string;
+}> {}
+
+export type CoreResidualDiscordRequestRouterDoneOutcome =
+  | {
+      readonly kind: "result";
+      readonly result: ResultType<
+        void,
+        EventDeliveryDoneError | CoreResidualDiscordRequestRouterDoneRejected
+      >;
+    }
+  | { readonly kind: "panic"; readonly panic: Panic };
+
+export function superviseCoreResidualDiscordRequestRouterDone(
+  done: Promise<ResultType<void, EventDeliveryDoneError>>,
+): Promise<CoreResidualDiscordRequestRouterDoneOutcome> {
+  return supervise();
+
+  async function supervise(): Promise<CoreResidualDiscordRequestRouterDoneOutcome> {
+    const [settled] = await Promise.allSettled([done]);
+    if (settled.status === "rejected") {
+      if (isPanic(settled.reason)) return { kind: "panic", panic: settled.reason };
+      return {
+        kind: "result",
+        result: Result.err(
+          new CoreResidualDiscordRequestRouterDoneRejected({
+            cause: settled.reason,
+            message: "Residual Discord request router done rejected",
+          }),
+        ),
+      };
+    }
+    return { kind: "result", result: settled.value };
+  }
+}
+
+export function retainCoreResidualDiscordRequestRouter(params: {
+  readonly router: ResidualDiscordRequestRouter;
+  readonly retainRouter: (router: ResidualDiscordRequestRouter) => void;
+  readonly retainDoneSupervision: (
+    supervision: Promise<CoreResidualDiscordRequestRouterDoneOutcome>,
+  ) => void;
+}): void {
+  params.retainRouter(params.router);
+  params.retainDoneSupervision(superviseCoreResidualDiscordRequestRouterDone(params.router.done));
+}
+
+type CoreResidualRouterCleanupRecorder = {
+  record(label: string, cause: Error): void;
+};
+
+export async function stopCoreResidualDiscordRequestRouter(params: {
+  readonly router: ResidualDiscordRequestRouter;
+  readonly cleanup: CoreResidualRouterCleanupRecorder;
+}): Promise<ResidualDiscordRequestRouter | null> {
+  const [settled] = await Promise.allSettled([Promise.resolve().then(() => params.router.stop())]);
+  if (settled.status === "rejected") {
+    params.cleanup.record(
+      "residualRouter.stop",
+      isPanic(settled.reason)
+        ? settled.reason
+        : new CoreResidualDiscordRequestRouterStopRejected({
+            cause: settled.reason,
+            message: "Residual Discord request router stop rejected",
+          }),
+    );
+    return params.router;
+  }
+
+  const outcome = settled.value;
+  if (outcome.kind === "panic") {
+    params.cleanup.record("residualRouter.stop.panic", outcome.panic);
+    for (const panic of outcome.additionalPanics) {
+      params.cleanup.record("residualRouter.stop.panic", panic);
+    }
+    if (outcome.ordinaryFailure) {
+      params.cleanup.record("residualRouter.stop", outcome.ordinaryFailure);
+    }
+    return outcome.residualRouter;
+  }
+  if (outcome.result.status === "error") {
+    params.cleanup.record("residualRouter.stop", outcome.result.error);
+    return outcome.residualRouter ?? params.router;
+  }
+  return outcome.residualRouter;
+}
+
+export function settleCoreResidualDiscordRequestRouterDone(params: {
+  readonly supervision: Promise<CoreResidualDiscordRequestRouterDoneOutcome>;
+  readonly cleanup: CoreResidualRouterCleanupRecorder;
+}): Promise<void> {
+  return settle();
+
+  async function settle(): Promise<void> {
+    const outcome = await params.supervision;
+    if (outcome.kind === "panic") {
+      params.cleanup.record("residualRouter.done", outcome.panic);
+      return;
+    }
+    if (outcome.result.status === "error") {
+      params.cleanup.record("residualRouter.done", outcome.result.error);
+    }
   }
 }
 
@@ -716,6 +830,8 @@ function logGracefulRestartSnapshotSaved(
 
 export type CoreRuntimeCleanupSupervisor = {
   readonly failures: readonly CoreRuntimeCleanupFailure[];
+  readonly panics: readonly Panic[];
+  record(label: string, cause: Error): void;
   run(label: string, cleanup: (() => Promise<void>) | undefined): Promise<void>;
   runOutcome(
     label: string,
@@ -733,20 +849,24 @@ export function createCoreRuntimeCleanupSupervisor(
   priorPanic: Panic | null,
 ): CoreRuntimeCleanupSupervisor {
   const failures: CoreRuntimeCleanupFailure[] = [];
-  let cleanupPanic: Panic | null = null;
+  const panics: Panic[] = [];
+
+  function record(label: string, cause: Error): void {
+    const panic = isPanic(cause);
+    if (panic) panics.push(cause);
+    failures.push({
+      label,
+      error: safeRuntimeErrorText(cause, "Opaque cleanup failure"),
+      panic,
+    });
+  }
 
   async function run(label: string, cleanup: (() => Promise<void>) | undefined): Promise<void> {
     if (!cleanup) return;
     try {
       await cleanup();
     } catch (cause) {
-      const panic = isPanic(cause);
-      if (panic && !cleanupPanic) cleanupPanic = cause;
-      failures.push({
-        label,
-        error: safeRuntimeErrorText(cause, "Opaque cleanup failure"),
-        panic,
-      });
+      record(label, projectRuntimeError(cause, "Opaque cleanup failure"));
     }
   }
 
@@ -762,7 +882,7 @@ export function createCoreRuntimeCleanupSupervisor(
     if (!cleanup) return;
     const outcome = await cleanup();
     if (outcome.kind === "panic") {
-      if (!cleanupPanic) cleanupPanic = outcome.panic;
+      panics.push(outcome.panic);
       failures.push({
         label,
         error: safeRuntimeErrorText(outcome.panic, "Opaque cleanup panic"),
@@ -780,10 +900,11 @@ export function createCoreRuntimeCleanupSupervisor(
   }
 
   function finish(): void {
+    const cleanupPanic = panics[0];
     if (!priorPanic && cleanupPanic) throw cleanupPanic;
   }
 
-  return { failures, run, runOutcome, finish };
+  return { failures, panics, record, run, runOutcome, finish };
 }
 
 type CoreMcpStartupLogger = {
@@ -838,19 +959,6 @@ export async function startCoreMcpServices(
 
 function subId(prefix: string, name: string): string {
   return `${prefix}:${name}`;
-}
-
-function surfaceRelayHandle<P extends RegisteredSurfacePlatform>(
-  platform: P,
-  relay: Awaited<ReturnType<typeof bridgeBusToAdapter>>,
-): SurfaceRelayHandle<P> {
-  return {
-    platform,
-    beginDrain: (options) => relay.beginDrain(options),
-    snapshotRelays: () => relay.snapshotRelays().map((snapshot) => ({ ...snapshot, platform })),
-    restoreRelays: (snapshots) => relay.restoreRelays(snapshots),
-    stop: () => relay.stop(),
-  };
 }
 
 function runtimeFsDenyPaths(): readonly string[] {
@@ -978,6 +1086,10 @@ export async function createCoreRuntime(
   let stopDiscordSearchIndexer: { stop(): Promise<void> } | null = null;
   let stopRouter: DiscordRequestRouter | null = null;
   let routerSupervision: Promise<void> | null = null;
+  let residualRouter: ResidualDiscordRequestRouter | null = null;
+  const residualRouterDoneSupervisions: Array<
+    Promise<CoreResidualDiscordRequestRouterDoneOutcome>
+  > = [];
   let stopWorkflowActionResolver: { stop(): Promise<void> } | null = null;
   let workflowProgressProjector: WorkflowProgressProjector | null = null;
   let workflowEngine: WorkflowEngine | null = null;
@@ -1063,7 +1175,7 @@ export async function createCoreRuntime(
               logger.debug("bridgeBusToAdapter started", {
                 subscriptionId: subId(subscriptionPrefix, "bus-to-adapter"),
               });
-              return surfaceRelayHandle("discord", relay);
+              return relay;
             },
           },
         },
@@ -1098,7 +1210,7 @@ export async function createCoreRuntime(
               logger.debug("GitHub output relay started", {
                 subscriptionId: subId(subscriptionPrefix, "bus-to-github"),
               });
-              return surfaceRelayHandle("github", relay);
+              return relay;
             },
           },
         },
@@ -1680,8 +1792,8 @@ export async function createCoreRuntime(
           connected: connectedSurfaceAdapters,
         });
 
-        logger.debug("Surface adapter connected", {
-          platform: "discord",
+        logger.debug("Surface adapters connected", {
+          platforms: registry.entries().map((descriptor) => descriptor.platform),
         });
 
         workflowProgressProjector = new WorkflowProgressProjector({
@@ -1749,15 +1861,45 @@ export async function createCoreRuntime(
           },
         });
 
-        stopRouter = await startDiscordRequestRouter({
-          adapter,
-          bus,
-          subscriptionId: subId(subscriptionPrefix, "router"),
-          customCommands,
-          shouldSuppressAdapterEvent: async ({ evt }) =>
-            shouldSuppressRouterForWorkflowReply({ store: durableWorkflowStore, event: evt }),
-          transcriptStore: transcriptStore ?? undefined,
-        });
+        stopRouter = adaptDiscordRequestRouterStartOutcomeToHost(
+          await startDiscordRequestRouter({
+            adapter,
+            bus,
+            subscriptionId: subId(subscriptionPrefix, "router"),
+            customCommands,
+            shouldSuppressAdapterEvent: async ({ evt }) =>
+              shouldSuppressRouterForWorkflowReply({ store: durableWorkflowStore, event: evt }),
+            transcriptStore: transcriptStore ?? undefined,
+          }),
+          (retainedRouter) => {
+            retainCoreResidualDiscordRequestRouter({
+              router: retainedRouter,
+              retainRouter: (router) => {
+                residualRouter = router;
+              },
+              retainDoneSupervision: (supervision) => {
+                residualRouterDoneSupervisions.push(supervision);
+              },
+            });
+          },
+          (diagnostics) => {
+            if (diagnostics.startupFailure) {
+              logger.error(
+                "Discord request router startup failed before cleanup Panic",
+                formatTaggedErrorForLog(diagnostics.startupFailure),
+              );
+            }
+            if (diagnostics.ordinaryCleanupFailure) {
+              logger.error(
+                "Discord request router startup rollback had ordinary cleanup failures",
+                formatTaggedErrorForLog(diagnostics.ordinaryCleanupFailure),
+              );
+            }
+            if (diagnostics.additionalPanicCount > 0) {
+              logger.error("Discord request router startup rollback had additional Panics");
+            }
+          },
+        );
         routerSupervision = superviseCoreRouterDone({
           done: stopRouter.done,
           isStopping: () => !started,
@@ -2092,7 +2234,7 @@ export async function createCoreRuntime(
   }
 
   async function stop(priorPanic: Panic | null = null): Promise<void> {
-    if (!started) return;
+    if (!started && !residualRouter) return;
     started = false;
     conversationThreadSummarizationStopping = true;
 
@@ -2282,6 +2424,25 @@ export async function createCoreRuntime(
     await safe("mcpRegistry.shutdown", () => mcpRegistry.shutdown());
     await safe("requestMessageCache.stop", () => requestMessageCache?.stop() ?? Promise.resolve());
 
+    if (residualRouter) {
+      const replacementRouter = await stopCoreResidualDiscordRequestRouter({
+        router: residualRouter,
+        cleanup,
+      });
+      residualRouter = null;
+      if (replacementRouter) {
+        retainCoreResidualDiscordRequestRouter({
+          router: replacementRouter,
+          retainRouter: (router) => {
+            residualRouter = router;
+          },
+          retainDoneSupervision: (supervision) => {
+            residualRouterDoneSupervisions.push(supervision);
+          },
+        });
+      }
+    }
+
     await safe("router.stop", () => stopRouter?.stop() ?? Promise.resolve());
     stopRouter = null;
     await safe("router.done", () => routerSupervision ?? Promise.resolve());
@@ -2339,6 +2500,13 @@ export async function createCoreRuntime(
     await safe("bus.close", async () => {
       adaptCoreEventBusCleanupResultToHost(await captureCoreEventBusCleanup({ redis, raw, bus }));
     });
+    for (const supervision of residualRouterDoneSupervisions) {
+      await settleCoreResidualDiscordRequestRouterDone({
+        supervision,
+        cleanup,
+      });
+    }
+    residualRouterDoneSupervisions.length = 0;
 
     runtimeFullyStarted = false;
 

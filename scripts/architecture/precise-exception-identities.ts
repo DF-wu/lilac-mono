@@ -444,7 +444,11 @@ export const PRECISE_EXCEPTION_IDENTITIES: Readonly<
       "capture",
     ],
     ["src/surface/discord/discord-request-router.ts", "adaptRouterConfigResult", "signal"],
-    ["src/surface/discord/discord-request-router.ts", "adaptRouterSubscriptionStart", "signal"],
+    [
+      "src/surface/discord/discord-request-router.ts",
+      "adaptDiscordRequestRouterStartOutcomeToHost",
+      "signal",
+    ],
     ["src/surface/discord/discord-request-router.ts", "adaptRouterSubscriptionsStop", "signal"],
     ["src/surface/discord/discord-request-router.ts", "captureRouterActiveBatchGate", "both"],
     ["src/surface/discord/discord-request-router.ts", "captureRouterDebounceFlush", "capture"],

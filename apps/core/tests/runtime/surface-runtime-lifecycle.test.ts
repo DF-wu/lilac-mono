@@ -232,8 +232,13 @@ describe("surface runtime lifecycle", () => {
 
     expect([...ports.keys()]).toEqual(["discord", "github"]);
     expect(new Set(ports.keys()).size).toBe(ports.size);
-    expect(ports.get("discord")).toBe(registry.get("discord")?.workflowProgress);
-    expect(ports.get("github")).toBe(registry.get("github")?.workflowProgress);
+    expect([...ports.values()]).toEqual(
+      registry
+        .entries()
+        .flatMap((descriptor) =>
+          descriptor.workflowProgress ? [descriptor.workflowProgress] : [],
+        ),
+    );
   });
 
   it("preserves adapter ingress, connection, validation, and output activation phases", async () => {
@@ -372,9 +377,9 @@ describe("surface runtime lifecycle", () => {
       "discord-relay-started",
       "github-ingress-started",
       "github-relay-failed",
-      "githubWebhook.stop",
+      "surface.github.request-ingress.stop",
       "github-ingress-stopped",
-      "bridgeBusToAdapter.stop",
+      "surface.discord.relay.stop",
       "discord-relay-stopped",
     ]);
   });
@@ -403,9 +408,9 @@ describe("surface runtime lifecycle", () => {
     expect(calls).toEqual([
       "discord-connect",
       "github-connect",
-      "githubAdapter.disconnect",
+      "surface.github.adapter.disconnect",
       "github-disconnected",
-      "adapter.disconnect",
+      "surface.discord.adapter.disconnect",
       "discord-disconnected",
     ]);
   });
@@ -477,9 +482,9 @@ describe("surface runtime lifecycle", () => {
       "remaining-producers-stop",
       "graceful.agentRunner.beginDrain",
       "agent-drain:3000",
-      "graceful.discordBridge.beginDrain",
+      "graceful.surface.discord.relay.beginDrain",
       "discord-drain:3000",
-      "graceful.githubBridge.beginDrain",
+      "graceful.surface.github.relay.beginDrain",
       "github-drain:3000",
       "agent-snapshot",
       "discord-snapshot",
@@ -583,17 +588,17 @@ describe("surface runtime lifecycle", () => {
     });
 
     expect(calls).toEqual([
-      "bridgeGithubBusToAdapter.stop",
+      "surface.github.relay.stop",
       "github-relay-stopped",
-      "githubWebhook.stop",
+      "surface.github.request-ingress.stop",
       "github-ingress-stopped",
-      "bridgeBusToAdapter.stop",
+      "surface.discord.relay.stop",
       "discord-relay-stopped",
-      "bridgeAdapterToBus.stop",
+      "surface.discord.adapter-ingress.stop",
       "discord-ingress-stopped",
-      "githubAdapter.disconnect",
+      "surface.github.adapter.disconnect",
       "github-disconnected",
-      "adapter.disconnect",
+      "surface.discord.adapter.disconnect",
       "discord-disconnected",
     ]);
   });
@@ -632,9 +637,9 @@ describe("surface runtime lifecycle", () => {
     });
 
     expect(calls).toEqual([
-      "graceful.ingress.bridgeAdapterToBus.stop",
+      "graceful.surface.discord.adapter-ingress.stop",
       "adapter-ingress-stopped",
-      "graceful.ingress.githubWebhook.stop",
+      "graceful.surface.github.request-ingress.stop",
       "request-ingress-stopped",
     ]);
     expect(handles.adapterIngress.size).toBe(0);

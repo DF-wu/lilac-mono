@@ -22,7 +22,13 @@ import {
 import { parseCoreConfigV1ToUniversal } from "@stanley2058/lilac-utils";
 import { Logger } from "@stanley2058/simple-module-logger";
 
-import { startDiscordRequestRouter as startBusRequestRouter } from "../../../src/surface/discord/discord-request-router";
+import {
+  adaptDiscordRequestRouterStartOutcomeToHost,
+  DiscordRequestRouterStartupAndCleanupFailed,
+  DiscordRequestRouterSubscriptionStopRejected,
+  startDiscordRequestRouter,
+  type StartDiscordRequestRouterInput,
+} from "../../../src/surface/discord/discord-request-router";
 import { formatBufferedMessageForGateTranscript } from "../../../src/surface/discord/discord-request-router/gate";
 
 import type { SurfaceAdapter, SurfaceOutputStream } from "../../../src/surface/adapter";
@@ -42,6 +48,7 @@ import type { ModelMessage } from "ai";
 
 type TestRawBus = RawBus & {
   readonly deliveryActions: Array<{ readonly topic: string; readonly action: RawDeliveryAction }>;
+  readonly returnedStartFailures: EventDeliveryStartFailed[];
   readonly stoppedTopics: string[];
   activeSubscriptionCount(): number;
   failPublicationsTo(topic: string, cause: unknown): void;
@@ -50,6 +57,7 @@ type TestRawBus = RawBus & {
   failStopsFor(topic: string, cause: unknown): void;
   rejectStopsFor(topic: string, cause: unknown): void;
   throwStopsFor(topic: string, cause: unknown): void;
+  clearStopFailuresFor(topic: string): void;
   finishDelivery(topic: string, error: EventDeliveryDoneError): void;
 };
 
@@ -57,6 +65,14 @@ class RouterTestHookFailure extends TaggedError("RouterTestHookFailure")<{
   readonly cause: unknown;
   readonly message: string;
 }> {}
+
+async function startBusRequestRouter(input: StartDiscordRequestRouterInput) {
+  return adaptDiscordRequestRouterStartOutcomeToHost(
+    await startDiscordRequestRouter(input),
+    () => {},
+    () => {},
+  );
+}
 
 function expectStarted<T>(started: ResultType<T, EventDeliveryStartFailed>): T {
   if (started.status === "ok") return started.value;
@@ -81,6 +97,7 @@ async function subscribeTopicForTest<TTopic extends LilacTopic>(
 function createInMemoryRawBus(): TestRawBus {
   const topics = new Map<string, Array<Message<unknown>>>();
   const deliveryActions: TestRawBus["deliveryActions"] = [];
+  const returnedStartFailures: EventDeliveryStartFailed[] = [];
   const stoppedTopics: string[] = [];
   const publicationFailures = new Map<string, unknown>();
   const startFailures = new Map<string, unknown>();
@@ -111,6 +128,7 @@ function createInMemoryRawBus(): TestRawBus {
 
   return {
     deliveryActions,
+    returnedStartFailures,
     stoppedTopics,
     activeSubscriptionCount: () => deliverySubs.size,
     failPublicationsTo: (topic, cause) => {
@@ -130,6 +148,11 @@ function createInMemoryRawBus(): TestRawBus {
     },
     throwStopsFor: (topic, cause) => {
       stopThrows.set(topic, cause);
+    },
+    clearStopFailuresFor: (topic) => {
+      stopFailures.delete(topic);
+      stopRejections.delete(topic);
+      stopThrows.delete(topic);
     },
     finishDelivery: (topic, error) => {
       for (const subscription of deliverySubs) {
@@ -165,13 +188,13 @@ function createInMemoryRawBus(): TestRawBus {
     subscribe: async (topic, opts, handler) => {
       if (startRejections.has(topic)) throw startRejections.get(topic);
       if (startFailures.has(topic)) {
-        return Result.err(
-          new EventDeliveryStartFailed({
-            topic,
-            cause: startFailures.get(topic),
-            message: "forced start failure",
-          }),
-        );
+        const failure = new EventDeliveryStartFailed({
+          topic,
+          cause: startFailures.get(topic),
+          message: "forced start failure",
+        });
+        returnedStartFailures.push(failure);
+        return Result.err(failure);
       }
       const done = Promise.withResolvers<ResultType<void, EventDeliveryDoneError>>();
       const entry = { topic, opts, handler, done };
@@ -599,60 +622,292 @@ describe("startBusRequestRouter", () => {
     },
   );
 
-  it("preserves a subscription startup Panic while rolling back earlier subscriptions", async () => {
+  it("preserves a subscription startup Panic while attempting every rollback", async () => {
     const raw = createInMemoryRawBus();
     const panic = new Panic({ message: "router subscription startup invariant failed" });
-    const logger = new Logger({ module: "router-startup-panic-rollback-test" });
-    const errorLog = spyOn(logger, "error").mockImplementation(() => {});
     raw.rejectStartsFor("evt.adapter", panic);
     raw.throwStopsFor("evt.surface", new Error("surface cleanup threw"));
     raw.failStopsFor("evt.request", new Error("lifecycle cleanup failed"));
 
-    try {
-      await expect(
-        startBusRequestRouter({
-          adapter: new FakeAdapter({}),
-          bus: createLilacBus(raw),
-          subscriptionId: "router-start-panic",
-          config: parseCoreConfigV1ToUniversal({}),
-          logger,
-        }),
-      ).rejects.toBe(panic);
+    const outcome = await startDiscordRequestRouter({
+      adapter: new FakeAdapter({}),
+      bus: createLilacBus(raw),
+      subscriptionId: "router-start-panic",
+      config: parseCoreConfigV1ToUniversal({}),
+    });
 
-      expect(raw.stoppedTopics).toEqual(["evt.surface", "evt.request"]);
-      expect(raw.activeSubscriptionCount()).toBe(0);
-      expect(errorLog).toHaveBeenCalledTimes(2);
-    } finally {
-      errorLog.mockRestore();
+    expect(outcome.kind).toBe("panic");
+    if (outcome.kind === "panic") {
+      expect(outcome.panic).toBe(panic);
+      expect(outcome.startupFailure).toBeNull();
+      expect(outcome.ordinaryCleanupFailure?.failures).toHaveLength(2);
+    }
+    expect(outcome.residualRouter).not.toBeNull();
+    expect(raw.stoppedTopics).toEqual(["evt.surface", "evt.request"]);
+
+    let loggedOrdinaryFailureCount = 0;
+    let thrown: unknown;
+    try {
+      adaptDiscordRequestRouterStartOutcomeToHost(
+        outcome,
+        () => {},
+        (diagnostics) => {
+          loggedOrdinaryFailureCount = diagnostics.ordinaryCleanupFailure?.failures.length ?? 0;
+        },
+      );
+    } catch (cause) {
+      thrown = cause;
+    }
+    expect(thrown).toBe(panic);
+    expect(loggedOrdinaryFailureCount).toBe(2);
+  });
+
+  it("combines a Result startup failure with a Result stop failure and exposes residual ownership", async () => {
+    const raw = createInMemoryRawBus();
+    raw.failStartsFor("evt.surface", new Error("surface start failed"));
+    raw.failStopsFor("evt.request", new Error("lifecycle cleanup failed"));
+
+    const outcome = await startDiscordRequestRouter({
+      adapter: new FakeAdapter({}),
+      bus: createLilacBus(raw),
+      subscriptionId: "router-result-cleanup-failure",
+      config: parseCoreConfigV1ToUniversal({}),
+    });
+
+    expect(outcome.kind).toBe("result");
+    expect(outcome.residualRouter).not.toBeNull();
+    if (outcome.kind === "result" && outcome.result.status === "error") {
+      expect(outcome.result.error).toBeInstanceOf(DiscordRequestRouterStartupAndCleanupFailed);
+      if (DiscordRequestRouterStartupAndCleanupFailed.is(outcome.result.error)) {
+        const startupFailure = raw.returnedStartFailures.at(0);
+        if (!startupFailure) throw new Error("expected a returned startup failure");
+        expect(outcome.result.error.startup).toBe(startupFailure);
+        expect(outcome.result.error.cleanup).toHaveLength(1);
+        expect(outcome.result.error.cleanup[0]).toBeInstanceOf(EventDeliveryStopFailed);
+      }
     }
   });
 
-  it("continues rollback across rejected and failed cleanup without replacing startup rejection", async () => {
+  it("maps an ordinary rejected rollback into the combined startup failure", async () => {
     const raw = createInMemoryRawBus();
-    const startupFailure = new Error("router subscription startup rejected");
-    const logger = new Logger({ module: "router-startup-rollback-test" });
-    const errorLog = spyOn(logger, "error").mockImplementation(() => {});
-    raw.rejectStartsFor("evt.adapter", startupFailure);
-    raw.rejectStopsFor("evt.surface", new Error("surface cleanup rejected"));
+    const cleanupRejection = new Error("surface cleanup rejected");
+    raw.failStartsFor("evt.adapter", new Error("adapter start failed"));
+    raw.rejectStopsFor("evt.surface", cleanupRejection);
+
+    const outcome = await startDiscordRequestRouter({
+      adapter: new FakeAdapter({}),
+      bus: createLilacBus(raw),
+      subscriptionId: "router-rejected-cleanup",
+      config: parseCoreConfigV1ToUniversal({}),
+    });
+
+    expect(outcome.kind).toBe("result");
+    if (outcome.kind === "result" && outcome.result.status === "error") {
+      expect(outcome.result.error).toBeInstanceOf(DiscordRequestRouterStartupAndCleanupFailed);
+      if (DiscordRequestRouterStartupAndCleanupFailed.is(outcome.result.error)) {
+        expect(outcome.result.error.cleanup[0]).toBeInstanceOf(
+          DiscordRequestRouterSubscriptionStopRejected,
+        );
+        expect(outcome.result.error.cleanup[0]?.cause).toBe(cleanupRejection);
+      }
+    }
+  });
+
+  it("returns a rejected rollback Panic with exact identity after continuing rollback", async () => {
+    const raw = createInMemoryRawBus();
+    const panic = new Panic({ message: "cleanup invariant failed" });
+    raw.failStartsFor("evt.adapter", new Error("adapter start failed"));
+    raw.rejectStopsFor("evt.surface", panic);
+
+    const outcome = await startDiscordRequestRouter({
+      adapter: new FakeAdapter({}),
+      bus: createLilacBus(raw),
+      subscriptionId: "router-cleanup-panic",
+      config: parseCoreConfigV1ToUniversal({}),
+    });
+
+    expect(outcome.kind).toBe("panic");
+    if (outcome.kind === "panic") {
+      expect(outcome.panic).toBe(panic);
+      const startupFailure = raw.returnedStartFailures.at(0);
+      if (!startupFailure) throw new Error("expected a returned startup failure");
+      expect(outcome.startupFailure).toBe(startupFailure);
+    }
+    expect(outcome.residualRouter).not.toBeNull();
+    expect(raw.stoppedTopics).toEqual(["evt.surface", "evt.request"]);
+
+    let loggedStartupFailure: unknown;
+    let thrown: unknown;
+    try {
+      adaptDiscordRequestRouterStartOutcomeToHost(
+        outcome,
+        () => {},
+        (diagnostics) => {
+          loggedStartupFailure = diagnostics.startupFailure;
+        },
+      );
+    } catch (cause) {
+      thrown = cause;
+    }
+    expect(thrown).toBe(panic);
+    expect(loggedStartupFailure).toBe(raw.returnedStartFailures.at(0));
+  });
+
+  it("preserves multiple rollback failures and retains ownership before signaling Core", async () => {
+    const raw = createInMemoryRawBus();
+    const surfaceCleanup = new Error("surface cleanup rejected");
+    raw.failStartsFor("evt.adapter", new Error("adapter start failed"));
+    raw.rejectStopsFor("evt.surface", surfaceCleanup);
     raw.failStopsFor("evt.request", new Error("lifecycle cleanup failed"));
 
+    const outcome = await startDiscordRequestRouter({
+      adapter: new FakeAdapter({}),
+      bus: createLilacBus(raw),
+      subscriptionId: "router-multiple-cleanup-failures",
+      config: parseCoreConfigV1ToUniversal({}),
+    });
+    let retainedRouter: unknown = null;
+    let thrown: unknown;
     try {
-      await expect(
-        startBusRequestRouter({
-          adapter: new FakeAdapter({}),
-          bus: createLilacBus(raw),
-          subscriptionId: "router-startup-cleanup-failures",
-          config: parseCoreConfigV1ToUniversal({}),
-          logger,
-        }),
-      ).rejects.toBe(startupFailure);
-
-      expect(raw.stoppedTopics).toEqual(["evt.surface", "evt.request"]);
-      expect(raw.activeSubscriptionCount()).toBe(0);
-      expect(errorLog).toHaveBeenCalledTimes(2);
-    } finally {
-      errorLog.mockRestore();
+      adaptDiscordRequestRouterStartOutcomeToHost(
+        outcome,
+        (router) => {
+          retainedRouter = router;
+        },
+        () => {},
+      );
+    } catch (cause) {
+      thrown = cause;
     }
+
+    expect(raw.stoppedTopics).toEqual(["evt.surface", "evt.request"]);
+    expect(retainedRouter).toBe(outcome.residualRouter);
+    expect(thrown).toBeInstanceOf(DiscordRequestRouterStartupAndCleanupFailed);
+    if (DiscordRequestRouterStartupAndCleanupFailed.is(thrown)) {
+      expect(thrown.cleanup).toHaveLength(2);
+      expect(thrown.cleanup[0]).toBeInstanceOf(DiscordRequestRouterSubscriptionStopRejected);
+      expect(thrown.cleanup[1]).toBeInstanceOf(EventDeliveryStopFailed);
+    }
+
+    const residualRouter = outcome.residualRouter;
+    if (!residualRouter) throw new Error("expected Core to retain a residual router");
+    raw.clearStopFailuresFor("evt.surface");
+    raw.clearStopFailuresFor("evt.request");
+    const retried = await residualRouter.stop();
+    expect(retried.kind).toBe("result");
+    if (retried.kind === "result") expect(retried.result.status).toBe("ok");
+    expect(raw.stoppedTopics).toEqual(["evt.surface", "evt.request", "evt.request", "evt.surface"]);
+  });
+
+  it("all-settles mixed ordinary and Panic residual stop rejections", async () => {
+    const raw = createInMemoryRawBus();
+    raw.failStartsFor("evt.adapter", new Error("adapter start failed"));
+    raw.failStopsFor("evt.surface", new Error("initial surface cleanup failed"));
+    raw.failStopsFor("evt.request", new Error("initial lifecycle cleanup failed"));
+    const started = await startDiscordRequestRouter({
+      adapter: new FakeAdapter({}),
+      bus: createLilacBus(raw),
+      subscriptionId: "router-mixed-residual-stop",
+      config: parseCoreConfigV1ToUniversal({}),
+    });
+    const residualRouter = started.residualRouter;
+    if (!residualRouter) throw new Error("expected a residual router");
+
+    raw.clearStopFailuresFor("evt.surface");
+    raw.clearStopFailuresFor("evt.request");
+    const ordinary = new Error("surface stop rejected");
+    const panic = new Panic({ message: "lifecycle stop invariant failed" });
+    raw.rejectStopsFor("evt.surface", ordinary);
+    raw.rejectStopsFor("evt.request", panic);
+    const stopped = await residualRouter.stop();
+
+    expect(stopped.kind).toBe("panic");
+    if (stopped.kind === "panic") {
+      expect(stopped.panic).toBe(panic);
+      expect(stopped.additionalPanics).toEqual([]);
+      expect(stopped.ordinaryFailure?.failures).toHaveLength(1);
+      expect(stopped.ordinaryFailure?.failures[0]?.cause).toBe(ordinary);
+    }
+    expect(raw.stoppedTopics.slice(-2)).toEqual(["evt.request", "evt.surface"]);
+  });
+
+  it("preserves every residual stop Panic by exact identity", async () => {
+    const raw = createInMemoryRawBus();
+    raw.failStartsFor("evt.adapter", new Error("adapter start failed"));
+    raw.failStopsFor("evt.surface", new Error("initial surface cleanup failed"));
+    raw.failStopsFor("evt.request", new Error("initial lifecycle cleanup failed"));
+    const started = await startDiscordRequestRouter({
+      adapter: new FakeAdapter({}),
+      bus: createLilacBus(raw),
+      subscriptionId: "router-multiple-residual-panics",
+      config: parseCoreConfigV1ToUniversal({}),
+    });
+    const residualRouter = started.residualRouter;
+    if (!residualRouter) throw new Error("expected a residual router");
+
+    raw.clearStopFailuresFor("evt.surface");
+    raw.clearStopFailuresFor("evt.request");
+    const lifecyclePanic = new Panic({ message: "lifecycle stop invariant failed" });
+    const surfacePanic = new Panic({ message: "surface stop invariant failed" });
+    raw.rejectStopsFor("evt.request", lifecyclePanic);
+    raw.rejectStopsFor("evt.surface", surfacePanic);
+    const stopped = await residualRouter.stop();
+
+    expect(stopped.kind).toBe("panic");
+    if (stopped.kind === "panic") {
+      expect(stopped.panic).toBe(lifecyclePanic);
+      expect(stopped.additionalPanics).toEqual([surfacePanic]);
+    }
+    expect(raw.stoppedTopics.slice(-2)).toEqual(["evt.request", "evt.surface"]);
+  });
+
+  it("captures a synchronous residual stop throw and continues every attempt", async () => {
+    const raw = createInMemoryRawBus();
+    raw.failStartsFor("evt.adapter", new Error("adapter start failed"));
+    raw.failStopsFor("evt.surface", new Error("initial surface cleanup failed"));
+    raw.failStopsFor("evt.request", new Error("initial lifecycle cleanup failed"));
+    const started = await startDiscordRequestRouter({
+      adapter: new FakeAdapter({}),
+      bus: createLilacBus(raw),
+      subscriptionId: "router-synchronous-residual-stop",
+      config: parseCoreConfigV1ToUniversal({}),
+    });
+    const residualRouter = started.residualRouter;
+    if (!residualRouter) throw new Error("expected a residual router");
+
+    raw.clearStopFailuresFor("evt.surface");
+    raw.clearStopFailuresFor("evt.request");
+    const synchronousFailure = new Error("lifecycle stop threw");
+    raw.throwStopsFor("evt.request", synchronousFailure);
+    const stopped = await residualRouter.stop();
+
+    expect(stopped.kind).toBe("result");
+    if (stopped.kind === "result" && stopped.result.status === "error") {
+      expect(stopped.result.error.failures).toHaveLength(1);
+      expect(stopped.result.error.failures[0]?.cause).toBe(synchronousFailure);
+    }
+    expect(raw.stoppedTopics.slice(-2)).toEqual(["evt.request", "evt.surface"]);
+  });
+
+  it("returns the original startup failure when rollback succeeds", async () => {
+    const raw = createInMemoryRawBus();
+    raw.failStartsFor("evt.surface", new Error("surface start failed"));
+
+    const outcome = await startDiscordRequestRouter({
+      adapter: new FakeAdapter({}),
+      bus: createLilacBus(raw),
+      subscriptionId: "router-clean-startup-rollback",
+      config: parseCoreConfigV1ToUniversal({}),
+    });
+
+    expect(outcome.kind).toBe("result");
+    expect(outcome.residualRouter).toBeNull();
+    if (outcome.kind === "result" && outcome.result.status === "error") {
+      const startupFailure = raw.returnedStartFailures.at(0);
+      if (!startupFailure) throw new Error("expected a returned startup failure");
+      expect(outcome.result.error).toBe(startupFailure);
+    }
+    expect(raw.stoppedTopics).toEqual(["evt.request"]);
   });
 
   it("includes reply-thread root when mention is part of a mergeable reply burst (active channel)", async () => {

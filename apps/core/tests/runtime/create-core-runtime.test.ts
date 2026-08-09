@@ -4,6 +4,7 @@ import { Panic, Result, type Result as ResultType } from "better-result";
 import { CustomCommandDirectoryReadError } from "@stanley2058/lilac-utils";
 import {
   createLilacBus,
+  EventDeliveryStopFailed,
   EventDeliveryTransportFailed,
   RedisEventDeadLetter,
   type EventDeliveryDoneError,
@@ -19,14 +20,23 @@ import {
   captureCoreEventBusCleanup,
   CoreEventBusCleanupFailed,
   CoreEventBusSetupFailed,
+  type CoreResidualDiscordRequestRouterDoneOutcome,
   createCoreEventBusDeliveryOptions,
   createCoreEventBusFatalReporter,
   createCoreEventBusLogger,
   createCoreRuntimeCleanupSupervisor,
   createCoreRuntimeFatalReporter,
+  retainCoreResidualDiscordRequestRouter,
+  settleCoreResidualDiscordRequestRouterDone,
+  stopCoreResidualDiscordRequestRouter,
   superviseDetachedCoreConfigValidation,
+  superviseCoreResidualDiscordRequestRouterDone,
   superviseCoreRouterDone,
 } from "../../src/runtime/create-core-runtime";
+import {
+  ResidualDiscordRequestRouterStopFailed,
+  type ResidualDiscordRequestRouter,
+} from "../../src/surface/discord/discord-request-router";
 
 describe("Core runtime startup", () => {
   it("returns the initialized custom command manager", () => {
@@ -173,6 +183,204 @@ describe("Core runtime startup", () => {
       cleanup.finish();
       throw startupPanic;
     }).toThrow(startupPanic);
+  });
+
+  it("retains and retries residual router ownership after an ordinary stop failure", async () => {
+    const stopFailure = new ResidualDiscordRequestRouterStopFailed({
+      failures: [
+        new EventDeliveryStopFailed({
+          topic: "evt.request",
+          cause: new Error("cleanup failed"),
+          message: "forced cleanup failure",
+        }),
+      ],
+      message: "Residual router cleanup failed",
+    });
+    const done = Promise.withResolvers<ResultType<void, EventDeliveryDoneError>>();
+    const calls: string[] = [];
+    let router: ResidualDiscordRequestRouter;
+    router = {
+      done: done.promise,
+      stop: async () => {
+        calls.push("stop");
+        if (calls.length === 1) {
+          return { kind: "result", result: Result.err(stopFailure), residualRouter: router };
+        }
+        done.resolve(Result.ok(undefined));
+        return { kind: "result", result: Result.ok(undefined), residualRouter: null };
+      },
+    };
+    const cleanup = createCoreRuntimeCleanupSupervisor(null);
+
+    const retained = await stopCoreResidualDiscordRequestRouter({
+      router,
+      cleanup,
+    });
+    expect(retained).toBe(router);
+    if (!retained) throw new Error("expected retained residual ownership");
+    const released = await stopCoreResidualDiscordRequestRouter({
+      router: retained,
+      cleanup,
+    });
+
+    expect(released).toBeNull();
+    expect(calls).toEqual(["stop", "stop"]);
+    expect(cleanup.failures).toEqual([
+      { label: "residualRouter.stop", error: stopFailure.message, panic: false },
+    ]);
+  });
+
+  it("retains ownership after a synchronous residual router stop throw", async () => {
+    const rejection = new Error("stop threw synchronously");
+    const cleanup = createCoreRuntimeCleanupSupervisor(null);
+    const router: ResidualDiscordRequestRouter = {
+      done: Promise.resolve(Result.ok(undefined)),
+      stop() {
+        throw rejection;
+      },
+    };
+
+    const retained = await stopCoreResidualDiscordRequestRouter({
+      router,
+      cleanup,
+    });
+
+    expect(retained).toBe(router);
+    expect(cleanup.failures).toHaveLength(1);
+    expect(cleanup.failures[0]).toMatchObject({
+      label: "residualRouter.stop",
+      panic: false,
+    });
+  });
+
+  it("supervises a residual done rejection immediately and preserves Panic identity", async () => {
+    const panic = new Panic({ message: "residual done invariant failed" });
+    const done = Promise.withResolvers<ResultType<void, EventDeliveryDoneError>>();
+    const supervision = superviseCoreResidualDiscordRequestRouterDone(done.promise);
+    done.reject(panic);
+    const cleanup = createCoreRuntimeCleanupSupervisor(null);
+
+    await settleCoreResidualDiscordRequestRouterDone({
+      supervision,
+      cleanup,
+    });
+
+    expect(cleanup.failures).toEqual([
+      { label: "residualRouter.done", error: panic.message, panic: true },
+    ]);
+    expect(() => cleanup.finish()).toThrow(panic);
+  });
+
+  it("records every residual stop Panic and keeps exact first-Panic precedence", async () => {
+    const firstPanic = new Panic({ message: "first residual stop panic" });
+    const secondPanic = new Panic({ message: "second residual stop panic" });
+    const ordinaryFailure = new ResidualDiscordRequestRouterStopFailed({
+      failures: [
+        new EventDeliveryStopFailed({
+          topic: "evt.surface",
+          cause: new Error("surface cleanup failed"),
+          message: "forced surface cleanup failure",
+        }),
+      ],
+      message: "Residual router ordinary cleanup failed",
+    });
+    let router: ResidualDiscordRequestRouter;
+    router = {
+      done: Promise.resolve(Result.ok(undefined)),
+      stop: async () => ({
+        kind: "panic",
+        panic: firstPanic,
+        additionalPanics: [secondPanic],
+        ordinaryFailure,
+        residualRouter: router,
+      }),
+    };
+    const cleanup = createCoreRuntimeCleanupSupervisor(null);
+    const fatalReports: Error[] = [];
+    const cleanupBoundary = {
+      record: cleanup.record,
+      reportFatalError: (error: Error) => fatalReports.push(error),
+    };
+
+    const retained = await stopCoreResidualDiscordRequestRouter({
+      router,
+      cleanup: cleanupBoundary,
+    });
+
+    expect(retained).toBe(router);
+    expect(fatalReports).toEqual([]);
+    expect(cleanup.panics).toEqual([firstPanic, secondPanic]);
+    expect(cleanup.failures).toEqual([
+      { label: "residualRouter.stop.panic", error: firstPanic.message, panic: true },
+      { label: "residualRouter.stop.panic", error: secondPanic.message, panic: true },
+      { label: "residualRouter.stop", error: ordinaryFailure.message, panic: false },
+    ]);
+    expect(() => cleanup.finish()).toThrow(firstPanic);
+  });
+
+  it("attaches done supervision immediately to a residual replacement", async () => {
+    const replacementDone = Promise.withResolvers<ResultType<void, EventDeliveryDoneError>>();
+    const donePanic = new Panic({ message: "replacement done invariant failed" });
+    const stopFailure = new ResidualDiscordRequestRouterStopFailed({
+      failures: [
+        new EventDeliveryStopFailed({
+          topic: "evt.request",
+          cause: new Error("replacement remained live"),
+          message: "forced replacement cleanup failure",
+        }),
+      ],
+      message: "Residual router cleanup retained a replacement",
+    });
+    const replacement: ResidualDiscordRequestRouter = {
+      done: replacementDone.promise,
+      stop: async () => ({
+        kind: "result",
+        result: Result.err(stopFailure),
+        residualRouter: replacement,
+      }),
+    };
+    const initial: ResidualDiscordRequestRouter = {
+      done: Promise.resolve(Result.ok(undefined)),
+      stop: async () => ({
+        kind: "result",
+        result: Result.err(stopFailure),
+        residualRouter: replacement,
+      }),
+    };
+    const cleanup = createCoreRuntimeCleanupSupervisor(null);
+    const supervisions: Array<Promise<CoreResidualDiscordRequestRouterDoneOutcome>> = [];
+    const ownership: { router: ResidualDiscordRequestRouter | null } = { router: null };
+
+    retainCoreResidualDiscordRequestRouter({
+      router: initial,
+      retainRouter: (router) => {
+        ownership.router = router;
+      },
+      retainDoneSupervision: (supervision) => supervisions.push(supervision),
+    });
+
+    const retainedInitial = ownership.router;
+    if (!retainedInitial) throw new Error("expected initial residual ownership");
+    const returnedReplacement = await stopCoreResidualDiscordRequestRouter({
+      router: retainedInitial,
+      cleanup,
+    });
+    if (!returnedReplacement) throw new Error("expected a residual replacement");
+    retainCoreResidualDiscordRequestRouter({
+      router: returnedReplacement,
+      retainRouter: (router) => {
+        ownership.router = router;
+      },
+      retainDoneSupervision: (supervision) => supervisions.push(supervision),
+    });
+    replacementDone.reject(donePanic);
+
+    expect(ownership.router).toBe(replacement);
+    expect(supervisions).toHaveLength(2);
+    const supervision = supervisions[1];
+    if (!supervision) throw new Error("expected replacement done supervision");
+    await settleCoreResidualDiscordRequestRouterDone({ supervision, cleanup });
+    expect(cleanup.panics).toEqual([donePanic]);
   });
 });
 
