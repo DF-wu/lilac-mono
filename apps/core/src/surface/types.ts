@@ -46,6 +46,15 @@ export type SessionRefFor<P extends RegisteredSurfacePlatform> = Extract<
 
 export type MsgRefFor<P extends RegisteredSurfacePlatform> = Extract<MsgRef, { platform: P }>;
 
+export type AuthenticatedSurfaceOrigin = {
+  [P in RegisteredSurfacePlatform]: {
+    readonly platform: P;
+    readonly userId: string;
+    readonly sessionRef: SessionRefFor<P>;
+    readonly messageRef?: MsgRefFor<P>;
+  };
+}[RegisteredSurfacePlatform];
+
 type SurfacePlatformSetsEqual = [SessionRef["platform"]] extends [MsgRef["platform"]]
   ? [MsgRef["platform"]] extends [SessionRef["platform"]]
     ? true

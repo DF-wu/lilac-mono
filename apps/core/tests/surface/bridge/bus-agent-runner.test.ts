@@ -152,6 +152,7 @@ import {
   SqliteTranscriptStore,
 } from "../../../src/transcript/transcript-store";
 import { createAgentOutputActivityPublisher } from "../../../src/shared/agent-output-activity";
+import { createRequestMessageCache } from "../../../src/tool-server/request-message-cache";
 import { createIdleTimer } from "../../../src/shared/idle-timer";
 import {
   adaptDiscordRequestRouterStartOutcomeToHost,
@@ -190,6 +191,7 @@ import {
 } from "../../../src/surface/bridge/bus-agent-runner/anthropic-fallback-media";
 import {
   subscribeForTest,
+  testDeliveriesRemainOpenOnPolicyStop,
   type TestRawMessageHandler,
   type TestRawSubscriptionHost,
 } from "../../helpers/result-raw-bus";
@@ -2072,16 +2074,50 @@ describe("bus agent runner delivery policy", () => {
   });
 });
 
-function createInMemoryRawBus(): RawBus & TestRawSubscriptionHost {
+type RunnerTestRawBus = RawBus &
+  TestRawSubscriptionHost & {
+    redeliverRequest(requestId: string): Promise<void>;
+    redeliverRequestEvent(eventId: string): Promise<void>;
+    requestEventIds(requestId: string): readonly string[];
+    failNextQueuedLifecycle(): void;
+    failCancelledLifecycleAfter(successfulPublications: number): void;
+  };
+
+function createInMemoryRawBus(): RunnerTestRawBus {
   const topics = new Map<string, Array<Message<unknown>>>();
   const subs = new Set<{
     topic: string;
     opts: SubscriptionOptions;
     handler: TestRawMessageHandler;
   }>();
-  const raw: RawBus & TestRawSubscriptionHost = {
+  let rejectNextQueuedLifecycle = false;
+  let cancelledLifecyclePublicationsBeforeFailure: number | null = null;
+  const raw: RunnerTestRawBus = {
     subscribe: subscribeForTest,
     publish: async <TData>(msg: Omit<Message<TData>, "id" | "ts">, opts: PublishOptions) => {
+      if (
+        rejectNextQueuedLifecycle &&
+        opts.type === lilacEventTypes.EvtRequestLifecycleChanged &&
+        typeof msg.data === "object" &&
+        msg.data !== null &&
+        Reflect.get(msg.data, "state") === "queued"
+      ) {
+        rejectNextQueuedLifecycle = false;
+        throw new Error("queued lifecycle publication failed");
+      }
+      if (
+        cancelledLifecyclePublicationsBeforeFailure !== null &&
+        opts.type === lilacEventTypes.EvtRequestLifecycleChanged &&
+        typeof msg.data === "object" &&
+        msg.data !== null &&
+        Reflect.get(msg.data, "state") === "cancelled"
+      ) {
+        if (cancelledLifecyclePublicationsBeforeFailure === 0) {
+          cancelledLifecyclePublicationsBeforeFailure = null;
+          throw new Error("cancelled lifecycle publication failed");
+        }
+        cancelledLifecyclePublicationsBeforeFailure -= 1;
+      }
       const id = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
       const stored: Message<unknown> = {
         topic: opts.topic,
@@ -2143,6 +2179,46 @@ function createInMemoryRawBus(): RawBus & TestRawSubscriptionHost {
         })),
         next: existing.length > 0 ? existing[existing.length - 1]?.id : undefined,
       };
+    },
+
+    redeliverRequest: async (requestId) => {
+      for (const [topic, messages] of topics) {
+        const message = messages.findLast(
+          (candidate) => candidate.headers?.request_id === requestId,
+        );
+        if (!message) continue;
+        for (const subscription of subs) {
+          if (subscription.topic === topic && subscription.opts.mode === "work") {
+            await subscription.handler(message, message.id);
+          }
+        }
+        return;
+      }
+      throw new Error(`Missing request for redelivery: ${requestId}`);
+    },
+
+    redeliverRequestEvent: async (eventId) => {
+      const messages = topics.get("cmd.request") ?? [];
+      const message = messages.find((candidate) => candidate.id === eventId);
+      if (!message) throw new Error(`Missing request event for redelivery: ${eventId}`);
+      for (const subscription of subs) {
+        if (subscription.topic === "cmd.request" && subscription.opts.mode === "work") {
+          await subscription.handler(message, message.id);
+        }
+      }
+    },
+
+    requestEventIds: (requestId) =>
+      (topics.get("cmd.request") ?? [])
+        .filter((message) => message.headers?.request_id === requestId)
+        .map((message) => message.id),
+
+    failNextQueuedLifecycle: () => {
+      rejectNextQueuedLifecycle = true;
+    },
+
+    failCancelledLifecycleAfter: (successfulPublications) => {
+      cancelledLifecyclePublicationsBeforeFailure = successfulPublications;
     },
 
     close: async () => {},
@@ -2556,6 +2632,814 @@ describe("bus agent runner terminal cleanup", () => {
 });
 
 describe("startBusAgentRunner production path", () => {
+  it("carries one projected origin through capability issuance and Level 1 context", async () => {
+    const config = parseCoreConfigV1ToUniversal({});
+    config.models.main = { model: "openai/identity-propagation" };
+    const bus = createLilacBus(createInMemoryRawBus());
+    const requestMessageCache = createRequestMessageCache();
+    let level1RequestContext:
+      | Parameters<CoreToolPluginManager["buildLevel1ToolsetResult"]>[0]["requestContext"]
+      | undefined;
+    const pluginManager = corePrimaryTestPluginManager((requestContext) => {
+      level1RequestContext = requestContext;
+    });
+    let issuedOrigin: Parameters<
+      NonNullable<Parameters<typeof startBusAgentRunner>[0]["issueControlCapability"]>
+    >[0]["authenticatedOrigin"];
+    const runner = await startBusAgentRunner({
+      bus,
+      subscriptionId: "identity-propagation",
+      reportFatalPanic: () => undefined,
+      config,
+      pluginManager,
+      requestMessageCache,
+      resolveParentChannelId: () => null,
+      issueControlCapability: (input) => {
+        issuedOrigin = input.authenticatedOrigin;
+        return {
+          capability: "identity-capability",
+          principal: input.authenticatedOrigin
+            ? {
+                platform: input.authenticatedOrigin.platform,
+                userId: input.authenticatedOrigin.userId,
+              }
+            : null,
+          authenticatedOrigin: input.authenticatedOrigin ?? null,
+          safetyMode: input.safetyMode,
+        };
+      },
+      createAgent: (options) =>
+        new AiSdkPiAgent({
+          ...options,
+          model: new MockLanguageModelV4({
+            modelId: "identity-propagation",
+            doStream: async () => level1TextStep("identity propagated"),
+          }),
+        }),
+    });
+    const requestId = "discord:identity-session:identity-message";
+    const lifecycle = await observeRequestLifecycle(bus, requestId);
+    try {
+      await publishRunnerRequest({
+        bus,
+        requestId,
+        sessionId: "identity-session",
+        requestClient: "discord",
+        text: "propagate identity",
+        raw: {
+          authenticatedOrigin: {
+            platform: "discord",
+            userId: "identity-user",
+            messageRef: {
+              platform: "discord",
+              channelId: "identity-session",
+              messageId: "identity-message",
+            },
+          },
+        },
+      });
+      await expect(lifecycle.terminal).resolves.toBe("resolved");
+      expect(issuedOrigin).toEqual({
+        platform: "discord",
+        userId: "identity-user",
+        sessionRef: { platform: "discord", channelId: "identity-session" },
+        messageRef: {
+          platform: "discord",
+          channelId: "identity-session",
+          messageId: "identity-message",
+        },
+      });
+      expect(level1RequestContext).toMatchObject({
+        requestId,
+        sessionId: "identity-session",
+        requestClient: "discord",
+        authenticatedPrincipal: { platform: "discord", userId: "identity-user" },
+        authenticatedPrincipalSessionId: "identity-session",
+      });
+      await runner.getActiveDrainOperation();
+      expect(requestMessageCache.getOrigin(requestId)).toBeUndefined();
+    } finally {
+      await lifecycle.stop();
+      await runner.stop();
+      await requestMessageCache.stop();
+      await pluginManager.destroy();
+      await bus.close();
+    }
+  });
+
+  it("retains identity and cache state across park-pending intake redelivery", async () => {
+    const config = parseCoreConfigV1ToUniversal({});
+    config.models.main = { model: "openai/park-redelivery" };
+    const rawBus = createInMemoryRawBus();
+    testDeliveriesRemainOpenOnPolicyStop.add(rawBus);
+    const bus = createLilacBus(rawBus);
+    const requestMessageCache = createRequestMessageCache();
+    const pluginManager = corePrimaryTestPluginManager();
+    let intakeAttempts = 0;
+    const runner = await startBusAgentRunner({
+      bus,
+      subscriptionId: "park-redelivery",
+      reportFatalPanic: () => undefined,
+      config,
+      pluginManager,
+      requestMessageCache,
+      issueControlCapability: () => ({ capability: "park-capability", principal: null }),
+      beforeRequestIntake: () => {
+        intakeAttempts += 1;
+        if (intakeAttempts === 1) throw new Error("transient intake failure");
+      },
+      createAgent: (options) =>
+        new AiSdkPiAgent({
+          ...options,
+          model: new MockLanguageModelV4({
+            modelId: "park-redelivery",
+            doStream: async () => level1TextStep("recovered"),
+          }),
+        }),
+    });
+    const requestId = "discord:park-session:park-message";
+    try {
+      await publishRunnerRequest({
+        bus,
+        requestId,
+        sessionId: "park-session",
+        requestClient: "discord",
+        text: "first attempt",
+      });
+      expect(requestMessageCache.snapshot(requestId)?.parkedEventIds).toHaveLength(1);
+      expect(requestMessageCache.get(requestId)).toHaveLength(1);
+
+      const lifecycle = await observeRequestLifecycle(bus, requestId);
+      try {
+        await rawBus.redeliverRequest(requestId);
+        await expect(lifecycle.terminal).resolves.toBe("resolved");
+        expect(intakeAttempts).toBe(2);
+        expect(requestMessageCache.getOrigin(requestId)).toBeUndefined();
+      } finally {
+        await lifecycle.stop();
+      }
+    } finally {
+      await runner.stop();
+      await requestMessageCache.stop();
+      await pluginManager.destroy();
+      await bus.close();
+      testDeliveriesRemainOpenOnPolicyStop.delete(rawBus);
+    }
+  });
+
+  it("rolls back an ordinary queued owner when lifecycle publication fails", async () => {
+    const config = parseCoreConfigV1ToUniversal({});
+    config.models.main = { model: "openai/queue-rollback" };
+    const rawBus = createInMemoryRawBus();
+    testDeliveriesRemainOpenOnPolicyStop.add(rawBus);
+    const bus = createLilacBus(rawBus);
+    const requestMessageCache = createRequestMessageCache();
+    const pluginManager = corePrimaryTestPluginManager();
+    const firstStarted = deferred<void>();
+    const releaseFirst = deferred<void>();
+    const secondStarted = deferred<void>();
+    let modelCalls = 0;
+    const runner = await startBusAgentRunner({
+      bus,
+      subscriptionId: "ordinary-queue-rollback",
+      reportFatalPanic: () => undefined,
+      config,
+      pluginManager,
+      requestMessageCache,
+      resolveParentChannelId: (sessionId) => sessionId,
+      issueControlCapability: () => ({ capability: "rollback-capability", principal: null }),
+      createAgent: (options) =>
+        new AiSdkPiAgent({
+          ...options,
+          model: new MockLanguageModelV4({
+            modelId: "queue-rollback",
+            doStream: async () => {
+              modelCalls += 1;
+              if (modelCalls === 1) {
+                firstStarted.resolve(undefined);
+                await releaseFirst.promise;
+              } else {
+                secondStarted.resolve(undefined);
+              }
+              return level1TextStep("rollback complete");
+            },
+          }),
+        }),
+    });
+    const firstRequestId = "discord:rollback-session:first";
+    const queuedRequestId = "discord:rollback-session:queued";
+    try {
+      await publishRunnerRequest({
+        bus,
+        requestId: firstRequestId,
+        sessionId: "rollback-session",
+        requestClient: "discord",
+        text: "first",
+      });
+      await firstStarted.promise;
+      rawBus.failNextQueuedLifecycle();
+      await publishRunnerRequest({
+        bus,
+        requestId: queuedRequestId,
+        sessionId: "rollback-session",
+        requestClient: "discord",
+        text: "queued",
+      });
+      expect(
+        runner.snapshotRecoverables().some((entry) => entry.requestId === queuedRequestId),
+      ).toBe(false);
+      expect(requestMessageCache.snapshot(queuedRequestId)).toMatchObject({
+        ownerCount: 0,
+        parkedEventIds: [expect.any(String)],
+      });
+
+      await rawBus.redeliverRequest(queuedRequestId);
+      expect(
+        runner.snapshotRecoverables().filter((entry) => entry.requestId === queuedRequestId),
+      ).toHaveLength(1);
+      expect(requestMessageCache.snapshot(queuedRequestId)?.ownerCount).toBe(1);
+      releaseFirst.resolve(undefined);
+      await secondStarted.promise;
+      await runner.getActiveDrainOperation();
+      expect(modelCalls).toBe(2);
+    } finally {
+      releaseFirst.resolve(undefined);
+      await runner.stop();
+      await requestMessageCache.stop();
+      await pluginManager.destroy();
+      await bus.close();
+      testDeliveriesRemainOpenOnPolicyStop.delete(rawBus);
+    }
+  });
+
+  it("releases every coalesced buffered-prompt owner", async () => {
+    const config = parseCoreConfigV1ToUniversal({});
+    config.models.main = { model: "openai/coalesced-owner" };
+    const bus = createLilacBus(createInMemoryRawBus());
+    const requestMessageCache = createRequestMessageCache();
+    const pluginManager = corePrimaryTestPluginManager();
+    const firstStarted = deferred<void>();
+    const releaseFirst = deferred<void>();
+    const runner = await startBusAgentRunner({
+      bus,
+      subscriptionId: "coalesced-owner-cleanup",
+      reportFatalPanic: () => undefined,
+      config,
+      pluginManager,
+      requestMessageCache,
+      resolveParentChannelId: (sessionId) => sessionId,
+      issueControlCapability: () => ({ capability: "coalesced-capability", principal: null }),
+      createAgent: (options) =>
+        new AiSdkPiAgent({
+          ...options,
+          model: new MockLanguageModelV4({
+            modelId: "coalesced-owner",
+            doStream: async () => {
+              firstStarted.resolve(undefined);
+              await releaseFirst.promise;
+              return level1TextStep("coalesced complete");
+            },
+          }),
+        }),
+    });
+    const activeRequestId = "discord:coalesce-session:active";
+    const bufferedRequestIds = [
+      "discord:coalesce-session:buffered-1",
+      "discord:coalesce-session:buffered-2",
+    ];
+    try {
+      await publishRunnerRequest({
+        bus,
+        requestId: activeRequestId,
+        sessionId: "coalesce-session",
+        requestClient: "discord",
+        text: "active",
+      });
+      await firstStarted.promise;
+      for (const requestId of bufferedRequestIds) {
+        await publishRunnerRequest({
+          bus,
+          requestId,
+          sessionId: "coalesce-session",
+          requestClient: "discord",
+          text: requestId,
+          raw: { bufferedForActiveRequestId: activeRequestId },
+        });
+        expect(requestMessageCache.snapshot(requestId)?.ownerCount).toBe(1);
+      }
+      await publishRunnerRequest({
+        bus,
+        requestId: activeRequestId,
+        sessionId: "coalesce-session",
+        requestClient: "discord",
+        queue: "steer",
+        text: "absorb buffered",
+      });
+      expect(
+        runner
+          .snapshotRecoverables()
+          .filter((entry) => bufferedRequestIds.includes(entry.requestId)),
+      ).toHaveLength(0);
+      for (const requestId of bufferedRequestIds) {
+        expect(requestMessageCache.get(requestId)).toBeUndefined();
+      }
+    } finally {
+      releaseFirst.resolve(undefined);
+      await runner.stop();
+      await requestMessageCache.stop();
+      await pluginManager.destroy();
+      await bus.close();
+    }
+  });
+
+  it("releases queue-drain coalescing owners after terminal completion", async () => {
+    const config = parseCoreConfigV1ToUniversal({});
+    config.models.main = { model: "openai/drain-coalescing" };
+    const bus = createLilacBus(createInMemoryRawBus());
+    const requestMessageCache = createRequestMessageCache();
+    const pluginManager = corePrimaryTestPluginManager();
+    const firstStarted = deferred<void>();
+    const releaseFirst = deferred<void>();
+    const coalescedStarted = deferred<void>();
+    const releaseCoalesced = deferred<void>();
+    const prompts: string[] = [];
+    let modelCalls = 0;
+    const runner = await startBusAgentRunner({
+      bus,
+      subscriptionId: "queue-drain-coalescing-owner-cleanup",
+      reportFatalPanic: () => undefined,
+      config,
+      pluginManager,
+      requestMessageCache,
+      issueControlCapability: () => ({ capability: "coalescing-capability", principal: null }),
+      createAgent: (options) =>
+        new AiSdkPiAgent({
+          ...options,
+          model: new MockLanguageModelV4({
+            modelId: "drain-coalescing",
+            doStream: async (modelInput) => {
+              modelCalls += 1;
+              prompts.push(JSON.stringify(modelInput.prompt));
+              if (modelCalls === 1) {
+                firstStarted.resolve(undefined);
+                await releaseFirst.promise;
+              } else {
+                coalescedStarted.resolve(undefined);
+                await releaseCoalesced.promise;
+              }
+              return level1TextStep("complete");
+            },
+          }),
+        }),
+    });
+    const activeRequestId = "github:drain-coalescing:active";
+    const coalescedRequestId = "github:drain-coalescing:queued";
+    const lifecycle = await observeRequestLifecycle(bus, coalescedRequestId);
+    try {
+      await publishRunnerRequest({
+        bus,
+        requestId: activeRequestId,
+        sessionId: "drain-coalescing",
+        text: "active",
+      });
+      await firstStarted.promise;
+      await publishRunnerRequest({
+        bus,
+        requestId: coalescedRequestId,
+        sessionId: "drain-coalescing",
+        text: "coalesced first",
+      });
+      await publishRunnerRequest({
+        bus,
+        requestId: coalescedRequestId,
+        sessionId: "drain-coalescing",
+        text: "coalesced second",
+      });
+      expect(requestMessageCache.snapshot(coalescedRequestId)?.ownerCount).toBe(2);
+
+      releaseFirst.resolve(undefined);
+      await coalescedStarted.promise;
+      expect(requestMessageCache.snapshot(coalescedRequestId)?.ownerCount).toBe(1);
+      expect(prompts[1]).toContain("coalesced first");
+      expect(prompts[1]).toContain("coalesced second");
+      releaseCoalesced.resolve(undefined);
+      await expect(lifecycle.terminal).resolves.toBe("resolved");
+      await runner.getActiveDrainOperation();
+      expect(requestMessageCache.get(coalescedRequestId)).toBeUndefined();
+    } finally {
+      releaseFirst.resolve(undefined);
+      releaseCoalesced.resolve(undefined);
+      await lifecycle.stop();
+      await runner.stop();
+      await requestMessageCache.stop();
+      await pluginManager.destroy();
+      await bus.close();
+    }
+  });
+
+  it.each([
+    ["before the first publication", 0],
+    ["after a partial publication", 1],
+  ] as const)(
+    "resumes queued cancellation %s without duplicate lifecycle effects",
+    async (_, failAfter) => {
+      const config = parseCoreConfigV1ToUniversal({});
+      config.models.main = { model: "openai/queued-cancellation-retry" };
+      const rawBus = createInMemoryRawBus();
+      testDeliveriesRemainOpenOnPolicyStop.add(rawBus);
+      const bus = createLilacBus(rawBus);
+      const requestMessageCache = createRequestMessageCache();
+      const pluginManager = corePrimaryTestPluginManager();
+      const activeStarted = deferred<void>();
+      const releaseActive = deferred<void>();
+      const runner = await startBusAgentRunner({
+        bus,
+        subscriptionId: `queued-cancellation-retry-${failAfter}`,
+        reportFatalPanic: () => undefined,
+        config,
+        pluginManager,
+        requestMessageCache,
+        issueControlCapability: () => ({ capability: "cancel-capability", principal: null }),
+        createAgent: (options) =>
+          new AiSdkPiAgent({
+            ...options,
+            model: new MockLanguageModelV4({
+              modelId: "queued-cancellation-retry",
+              doStream: async () => {
+                activeStarted.resolve(undefined);
+                await releaseActive.promise;
+                return level1TextStep("active complete");
+              },
+            }),
+          }),
+      });
+      const sessionId = `queued-cancellation-${failAfter}`;
+      const targetRequestIds = [`github:${sessionId}:target-a`, `github:${sessionId}:target-b`];
+      const cancellationRequestId = `github:${sessionId}:cancel`;
+      const lifecycles = await Promise.all(
+        targetRequestIds.map((requestId) => observeRequestLifecycle(bus, requestId)),
+      );
+      try {
+        await publishRunnerRequest({
+          bus,
+          requestId: `github:${sessionId}:active`,
+          sessionId,
+          text: "active",
+        });
+        await activeStarted.promise;
+        for (const requestId of targetRequestIds) {
+          await publishRunnerRequest({
+            bus,
+            requestId,
+            sessionId,
+            text: requestId,
+            raw: { chainMessageIds: ["cancel-target"] },
+          });
+        }
+        rawBus.failCancelledLifecycleAfter(failAfter);
+        await publishRunnerRequest({
+          bus,
+          requestId: cancellationRequestId,
+          sessionId,
+          queue: "interrupt",
+          text: "cancel queued",
+          raw: { cancel: true, cancelQueued: true, messageId: "cancel-target" },
+        });
+
+        expect(requestMessageCache.snapshot(cancellationRequestId)?.parkedEventIds).toHaveLength(1);
+        expect(
+          targetRequestIds.map(
+            (requestId) => requestMessageCache.snapshot(requestId)?.ownerCount ?? 0,
+          ),
+        ).toEqual(failAfter === 0 ? [1, 1] : [0, 1]);
+        expect(
+          runner
+            .snapshotRecoverables()
+            .filter((entry) => targetRequestIds.includes(entry.requestId)),
+        ).toHaveLength(2 - failAfter);
+
+        await rawBus.redeliverRequest(cancellationRequestId);
+        for (const requestId of targetRequestIds) {
+          expect(requestMessageCache.get(requestId)).toBeUndefined();
+        }
+        expect(requestMessageCache.get(cancellationRequestId)).toBeUndefined();
+        expect(
+          lifecycles.map((lifecycle) => lifecycle.states.filter((state) => state === "cancelled")),
+        ).toEqual([["cancelled"], ["cancelled"]]);
+        expect(
+          runner
+            .snapshotRecoverables()
+            .filter((entry) => targetRequestIds.includes(entry.requestId)),
+        ).toHaveLength(0);
+      } finally {
+        releaseActive.resolve(undefined);
+        for (const lifecycle of lifecycles) await lifecycle.stop();
+        await runner.stop();
+        await requestMessageCache.stop();
+        await pluginManager.destroy();
+        await bus.close();
+        testDeliveriesRemainOpenOnPolicyStop.delete(rawBus);
+      }
+    },
+  );
+
+  it.each([
+    ["before the first cancellation publication", 0],
+    ["after a partial cancellation publication", 1],
+  ] as const)("resumes buffered absorption %s without reapplying control", async (_, failAfter) => {
+    const config = parseCoreConfigV1ToUniversal({});
+    config.models.main = { model: "openai/buffered-absorption-retry" };
+    const rawBus = createInMemoryRawBus();
+    testDeliveriesRemainOpenOnPolicyStop.add(rawBus);
+    const bus = createLilacBus(rawBus);
+    const requestMessageCache = createRequestMessageCache();
+    const pluginManager = corePrimaryTestPluginManager();
+    const activeStarted = deferred<void>();
+    const releaseActive = deferred<void>();
+    let steerCalls = 0;
+    let modelCalls = 0;
+    const runner = await startBusAgentRunner({
+      bus,
+      subscriptionId: `buffered-absorption-retry-${failAfter}`,
+      reportFatalPanic: () => undefined,
+      config,
+      pluginManager,
+      requestMessageCache,
+      issueControlCapability: () => ({ capability: "absorb-capability", principal: null }),
+      createAgent: (options) => {
+        const agent = new AiSdkPiAgent({
+          ...options,
+          model: new MockLanguageModelV4({
+            modelId: "buffered-absorption-retry",
+            doStream: async () => {
+              modelCalls += 1;
+              if (modelCalls === 1) {
+                activeStarted.resolve(undefined);
+                await releaseActive.promise;
+              }
+              return level1TextStep("active complete");
+            },
+          }),
+        });
+        const steer = agent.steer.bind(agent);
+        agent.steer = (message) => {
+          steerCalls += 1;
+          return steer(message);
+        };
+        return agent;
+      },
+    });
+    const sessionId = `buffered-absorption-${failAfter}`;
+    const activeRequestId = `github:${sessionId}:active`;
+    const bufferedRequestIds = [`github:${sessionId}:buffer-a`, `github:${sessionId}:buffer-b`];
+    const activeLifecycle = await observeRequestLifecycle(bus, activeRequestId);
+    const bufferedLifecycles = await Promise.all(
+      bufferedRequestIds.map((requestId) => observeRequestLifecycle(bus, requestId)),
+    );
+    try {
+      await publishRunnerRequest({
+        bus,
+        requestId: activeRequestId,
+        sessionId,
+        text: "active",
+      });
+      await activeStarted.promise;
+      for (const requestId of bufferedRequestIds) {
+        await publishRunnerRequest({
+          bus,
+          requestId,
+          sessionId,
+          text: requestId,
+          raw: { bufferedForActiveRequestId: activeRequestId },
+        });
+      }
+      rawBus.failCancelledLifecycleAfter(failAfter);
+      await publishRunnerRequest({
+        bus,
+        requestId: activeRequestId,
+        sessionId,
+        queue: "steer",
+        text: "absorb",
+      });
+
+      expect(steerCalls).toBe(1);
+      expect(requestMessageCache.snapshot(activeRequestId)?.parkedEventIds).toHaveLength(1);
+      expect(
+        bufferedRequestIds.map(
+          (requestId) => requestMessageCache.snapshot(requestId)?.ownerCount ?? 0,
+        ),
+      ).toEqual(failAfter === 0 ? [1, 1] : [0, 1]);
+
+      await rawBus.redeliverRequest(activeRequestId);
+      expect(steerCalls).toBe(1);
+      for (const requestId of bufferedRequestIds) {
+        expect(requestMessageCache.get(requestId)).toBeUndefined();
+      }
+      expect(
+        bufferedLifecycles.map((lifecycle) =>
+          lifecycle.states.filter((state) => state === "cancelled"),
+        ),
+      ).toEqual([["cancelled"], ["cancelled"]]);
+
+      releaseActive.resolve(undefined);
+      await expect(activeLifecycle.terminal).resolves.toBe("resolved");
+      await runner.getActiveDrainOperation();
+      expect(requestMessageCache.get(activeRequestId)).toBeUndefined();
+    } finally {
+      releaseActive.resolve(undefined);
+      await activeLifecycle.stop();
+      for (const lifecycle of bufferedLifecycles) await lifecycle.stop();
+      await runner.stop();
+      await requestMessageCache.stop();
+      await pluginManager.destroy();
+      await bus.close();
+      testDeliveriesRemainOpenOnPolicyStop.delete(rawBus);
+    }
+  });
+
+  it("rolls back buffered reservations when control application fails before mutation", async () => {
+    const config = parseCoreConfigV1ToUniversal({});
+    config.models.main = { model: "openai/buffered-control-rollback" };
+    const rawBus = createInMemoryRawBus();
+    testDeliveriesRemainOpenOnPolicyStop.add(rawBus);
+    const bus = createLilacBus(rawBus);
+    const requestMessageCache = createRequestMessageCache();
+    const pluginManager = corePrimaryTestPluginManager();
+    const activeStarted = deferred<void>();
+    const releaseActive = deferred<void>();
+    let steerAttempts = 0;
+    let appliedSteers = 0;
+    let modelCalls = 0;
+    const runner = await startBusAgentRunner({
+      bus,
+      subscriptionId: "buffered-control-rollback",
+      reportFatalPanic: () => undefined,
+      config,
+      pluginManager,
+      requestMessageCache,
+      issueControlCapability: () => ({ capability: "rollback-capability", principal: null }),
+      createAgent: (options) => {
+        const agent = new AiSdkPiAgent({
+          ...options,
+          model: new MockLanguageModelV4({
+            modelId: "buffered-control-rollback",
+            doStream: async () => {
+              modelCalls += 1;
+              if (modelCalls === 1) {
+                activeStarted.resolve(undefined);
+                await releaseActive.promise;
+              }
+              return level1TextStep("complete");
+            },
+          }),
+        });
+        const steer = agent.steer.bind(agent);
+        agent.steer = (message) => {
+          steerAttempts += 1;
+          if (steerAttempts === 1) throw new Error("control rejected before mutation");
+          const steeringId = steer(message);
+          appliedSteers += 1;
+          return steeringId;
+        };
+        return agent;
+      },
+    });
+    const sessionId = "buffered-control-rollback";
+    const activeRequestId = `github:${sessionId}:active`;
+    const bufferedRequestId = `github:${sessionId}:buffered`;
+    const activeLifecycle = await observeRequestLifecycle(bus, activeRequestId);
+    const bufferedLifecycle = await observeRequestLifecycle(bus, bufferedRequestId);
+    try {
+      await publishRunnerRequest({ bus, requestId: activeRequestId, sessionId, text: "active" });
+      await activeStarted.promise;
+      await publishRunnerRequest({
+        bus,
+        requestId: bufferedRequestId,
+        sessionId,
+        text: "buffered",
+        raw: { bufferedForActiveRequestId: activeRequestId },
+      });
+      await publishRunnerRequest({
+        bus,
+        requestId: activeRequestId,
+        sessionId,
+        queue: "steer",
+        text: "absorb",
+      });
+
+      expect({ steerAttempts, appliedSteers }).toEqual({ steerAttempts: 1, appliedSteers: 0 });
+      expect(requestMessageCache.snapshot(bufferedRequestId)?.ownerCount).toBe(1);
+      expect(
+        runner.snapshotRecoverables().filter((entry) => entry.requestId === bufferedRequestId),
+      ).toHaveLength(1);
+
+      await rawBus.redeliverRequest(activeRequestId);
+      expect({ steerAttempts, appliedSteers }).toEqual({ steerAttempts: 2, appliedSteers: 1 });
+      expect(requestMessageCache.get(bufferedRequestId)).toBeUndefined();
+      expect(bufferedLifecycle.states.filter((state) => state === "cancelled")).toEqual([
+        "cancelled",
+      ]);
+
+      releaseActive.resolve(undefined);
+      await expect(activeLifecycle.terminal).resolves.toBe("resolved");
+    } finally {
+      releaseActive.resolve(undefined);
+      await activeLifecycle.stop();
+      await bufferedLifecycle.stop();
+      await runner.stop();
+      await requestMessageCache.stop();
+      await pluginManager.destroy();
+      await bus.close();
+      testDeliveriesRemainOpenOnPolicyStop.delete(rawBus);
+    }
+  });
+
+  it.each([
+    ["first then second", [0, 1]],
+    ["second then first", [1, 0]],
+  ] as const)("retains two same-request PEL entries when recovering %s", async (_, order) => {
+    const config = parseCoreConfigV1ToUniversal({});
+    config.models.main = { model: "openai/two-pel-recovery" };
+    const rawBus = createInMemoryRawBus();
+    testDeliveriesRemainOpenOnPolicyStop.add(rawBus);
+    const bus = createLilacBus(rawBus);
+    const requestMessageCache = createRequestMessageCache();
+    const pluginManager = corePrimaryTestPluginManager();
+    const activeStarted = deferred<void>();
+    const releaseActive = deferred<void>();
+    const seenEventIds = new Set<string>();
+    let modelCalls = 0;
+    const runner = await startBusAgentRunner({
+      bus,
+      subscriptionId: `two-pel-recovery-${order.join("-")}`,
+      reportFatalPanic: () => undefined,
+      config,
+      pluginManager,
+      requestMessageCache,
+      beforeRequestIntake: (message) => {
+        if (seenEventIds.has(message.id)) return;
+        seenEventIds.add(message.id);
+        throw new Error("park each initial delivery");
+      },
+      issueControlCapability: () => ({ capability: "two-pel-capability", principal: null }),
+      createAgent: (options) =>
+        new AiSdkPiAgent({
+          ...options,
+          model: new MockLanguageModelV4({
+            modelId: "two-pel-recovery",
+            doStream: async () => {
+              modelCalls += 1;
+              if (modelCalls === 1) {
+                activeStarted.resolve(undefined);
+                await releaseActive.promise;
+              }
+              return level1TextStep("recovered");
+            },
+          }),
+        }),
+    });
+    const sessionId = `two-pel-${order.join("-")}`;
+    const requestId = `github:${sessionId}:request`;
+    const lifecycle = await observeRequestLifecycle(bus, requestId);
+    try {
+      await publishRunnerRequest({ bus, requestId, sessionId, text: "first" });
+      await publishRunnerRequest({ bus, requestId, sessionId, text: "second" });
+      const eventIds = rawBus.requestEventIds(requestId);
+      expect(eventIds).toHaveLength(2);
+      expect(requestMessageCache.snapshot(requestId)).toMatchObject({
+        ownerCount: 0,
+        eventIdCount: 2,
+      });
+
+      await rawBus.redeliverRequestEvent(eventIds[order[0]]!);
+      await activeStarted.promise;
+      expect(requestMessageCache.snapshot(requestId)).toMatchObject({
+        ownerCount: 1,
+        eventIdCount: 1,
+        parkedEventIds: [eventIds[order[1]]],
+      });
+      await rawBus.redeliverRequestEvent(eventIds[order[1]]!);
+      expect(requestMessageCache.snapshot(requestId)).toMatchObject({
+        ownerCount: 1,
+        eventIdCount: 0,
+        parkedEventIds: [],
+      });
+
+      releaseActive.resolve(undefined);
+      await expect(lifecycle.terminal).resolves.toBe("resolved");
+      await runner.getActiveDrainOperation();
+      expect(requestMessageCache.get(requestId)).toBeUndefined();
+    } finally {
+      releaseActive.resolve(undefined);
+      await lifecycle.stop();
+      await runner.stop();
+      await requestMessageCache.stop();
+      await pluginManager.destroy();
+      await bus.close();
+      testDeliveriesRemainOpenOnPolicyStop.delete(rawBus);
+    }
+  });
+
   it.each([
     ["an ordinary Error", () => new Error("capability expiration failed")],
     ["a Panic", () => new Panic({ message: "capability expiration invariant failed" })],
@@ -2702,9 +3586,12 @@ describe("startBusAgentRunner production path", () => {
       active: { model: "openai/active", agentCanSelect: true },
       other: { model: "openai/other", agentCanSelect: true },
     };
-    const dataDir = await mkdtemp(path.join(tmpdir(), "lilac-runner-production-"));
-    const pluginManager = createCoreToolPluginManager({ runtime: { config }, dataDir });
     const bus = createLilacBus(createInMemoryRawBus());
+    const requestMessageCache = createRequestMessageCache();
+    const requestContexts: Array<
+      Parameters<CoreToolPluginManager["buildLevel1ToolsetResult"]>[0]["requestContext"]
+    > = [];
+    const pluginManager = corePrimaryTestPluginManager((context) => requestContexts.push(context));
     const firstCallStarted = deferred<void>();
     const releaseFirstCall = deferred<void>();
     const createdSpecs: string[] = [];
@@ -2715,7 +3602,19 @@ describe("startBusAgentRunner production path", () => {
       reportFatalPanic: () => undefined,
       config,
       pluginManager,
-      issueControlCapability: () => ({ capability: "test-capability", principal: null }),
+      requestMessageCache,
+      resolveParentChannelId: (sessionId) => sessionId,
+      issueControlCapability: (input) => ({
+        capability: "test-capability",
+        principal: input.authenticatedOrigin
+          ? {
+              platform: input.authenticatedOrigin.platform,
+              userId: input.authenticatedOrigin.userId,
+            }
+          : null,
+        authenticatedOrigin: input.authenticatedOrigin ?? null,
+        safetyMode: input.safetyMode,
+      }),
       createAgent: (options: AiSdkPiAgentOptions<ToolSet>) => {
         const spec = options.modelSpecifier ?? "unknown";
         createdSpecs.push(spec);
@@ -2746,6 +3645,17 @@ describe("startBusAgentRunner production path", () => {
       sessionId: "session",
       text: "first",
       modelOverride: "active",
+      raw: {
+        authenticatedOrigin: {
+          platform: "github",
+          userId: "user-1",
+          messageRef: {
+            platform: "github",
+            channelId: "session",
+            messageId: "changed-message",
+          },
+        },
+      },
     });
     expect(
       await Promise.race([
@@ -2768,7 +3678,15 @@ describe("startBusAgentRunner production path", () => {
       text: "change model",
       modelOverride: "other",
       raw: {
-        authenticatedOrigin: { messageRef: { messageId: "changed-message" } },
+        authenticatedOrigin: {
+          platform: "github",
+          userId: "user-1",
+          messageRef: {
+            platform: "github",
+            channelId: "session",
+            messageId: "changed-message",
+          },
+        },
       },
     });
     expect(changedLifecycle.states).toContain("queued");
@@ -2778,14 +3696,263 @@ describe("startBusAgentRunner production path", () => {
     await expect(changedLifecycle.terminal).resolves.toBe("resolved");
     expect(activeCalls).toBe(2);
     expect(createdSpecs).toEqual(["openai/active", "openai/other"]);
+    expect(requestContexts).toHaveLength(2);
+    expect(requestContexts[1]).toMatchObject({
+      requestId: changedRequestId,
+      safetyMode: "trusted",
+      authenticatedPrincipal: { platform: "github", userId: "user-1" },
+      authenticatedPrincipalSessionId: "session",
+    });
 
     await activeLifecycle.stop();
     await changedLifecycle.stop();
     await runner.stop();
+    await requestMessageCache.stop();
     await pluginManager.destroy();
     await bus.close();
-    await rm(dataDir, { recursive: true, force: true });
   });
+
+  it("rolls back a distinct model alias when queued lifecycle publication fails", async () => {
+    const config = parseCoreConfigV1ToUniversal({});
+    config.models.main = { model: "openai/initial" };
+    config.models.def = {
+      active: { model: "openai/active", agentCanSelect: true },
+      other: { model: "openai/other", agentCanSelect: true },
+    };
+    const rawBus = createInMemoryRawBus();
+    testDeliveriesRemainOpenOnPolicyStop.add(rawBus);
+    const bus = createLilacBus(rawBus);
+    const requestMessageCache = createRequestMessageCache();
+    const pluginManager = corePrimaryTestPluginManager();
+    const firstStarted = deferred<void>();
+    const releaseFirst = deferred<void>();
+    const secondStarted = deferred<void>();
+    let modelCalls = 0;
+    const runner = await startBusAgentRunner({
+      bus,
+      subscriptionId: "model-alias-rollback",
+      reportFatalPanic: () => undefined,
+      config,
+      pluginManager,
+      requestMessageCache,
+      issueControlCapability: () => ({ capability: "alias-rollback", principal: null }),
+      createAgent: (options) =>
+        new AiSdkPiAgent({
+          ...options,
+          model: new MockLanguageModelV4({
+            modelId: options.modelSpecifier ?? "unknown",
+            doStream: async () => {
+              modelCalls += 1;
+              if (modelCalls === 1) {
+                firstStarted.resolve(undefined);
+                await releaseFirst.promise;
+              } else {
+                secondStarted.resolve(undefined);
+              }
+              return level1TextStep("alias rollback complete");
+            },
+          }),
+        }),
+    });
+    const requestId = "github:rollback-session:source";
+    const aliasRequestId = "github:rollback-session:changed-message";
+    const raw = {
+      authenticatedOrigin: {
+        platform: "github" as const,
+        userId: "user-1",
+        messageRef: {
+          platform: "github" as const,
+          channelId: "rollback-session",
+          messageId: "changed-message",
+        },
+      },
+    };
+    try {
+      await publishRunnerRequest({
+        bus,
+        requestId,
+        sessionId: "rollback-session",
+        text: "first",
+        modelOverride: "active",
+        raw,
+      });
+      await firstStarted.promise;
+      rawBus.failNextQueuedLifecycle();
+      await publishRunnerRequest({
+        bus,
+        requestId,
+        sessionId: "rollback-session",
+        queue: "followUp",
+        text: "change",
+        modelOverride: "other",
+        raw,
+      });
+      expect(requestMessageCache.get(aliasRequestId)).toBeUndefined();
+      expect(
+        runner.snapshotRecoverables().some((entry) => entry.requestId === aliasRequestId),
+      ).toBe(false);
+      expect(requestMessageCache.snapshot(requestId)).toMatchObject({
+        ownerCount: 1,
+        parkedEventIds: [expect.any(String)],
+      });
+
+      await rawBus.redeliverRequest(requestId);
+      expect(requestMessageCache.snapshot(aliasRequestId)?.ownerCount).toBe(1);
+      expect(
+        runner.snapshotRecoverables().filter((entry) => entry.requestId === aliasRequestId),
+      ).toHaveLength(1);
+      releaseFirst.resolve(undefined);
+      await secondStarted.promise;
+      await runner.getActiveDrainOperation();
+      expect(modelCalls).toBe(2);
+    } finally {
+      releaseFirst.resolve(undefined);
+      await runner.stop();
+      await requestMessageCache.stop();
+      await pluginManager.destroy();
+      await bus.close();
+      testDeliveriesRemainOpenOnPolicyStop.delete(rawBus);
+    }
+  });
+
+  it.each([
+    {
+      platform: "discord" as const,
+      requestId: "discord:self-alias-channel:self-alias-message",
+      sessionId: "self-alias-channel",
+    },
+    {
+      platform: "github" as const,
+      requestId: "github:owner/repo#1:42",
+      sessionId: "owner/repo#1",
+    },
+  ])(
+    "retains canonical $platform self-alias ownership through the queued run",
+    async (testCase) => {
+      const config = parseCoreConfigV1ToUniversal({});
+      config.models.main = { model: "openai/initial" };
+      config.models.def = {
+        active: { model: "openai/active", agentCanSelect: true },
+        other: { model: "openai/other", agentCanSelect: true },
+      };
+      const bus = createLilacBus(createInMemoryRawBus());
+      const requestMessageCache = createRequestMessageCache();
+      const contexts: Array<
+        Parameters<CoreToolPluginManager["buildLevel1ToolsetResult"]>[0]["requestContext"]
+      > = [];
+      const pluginManager = corePrimaryTestPluginManager((context) => contexts.push(context));
+      const firstStarted = deferred<void>();
+      const releaseFirst = deferred<void>();
+      const secondStarted = deferred<void>();
+      const raw =
+        testCase.platform === "discord"
+          ? {
+              authenticatedOrigin: {
+                platform: "discord" as const,
+                userId: "self-alias-user",
+                messageRef: {
+                  platform: "discord" as const,
+                  channelId: testCase.sessionId,
+                  messageId: "self-alias-message",
+                },
+              },
+            }
+          : {
+              authenticatedActor: { platform: "github" as const, userId: "self-alias-user" },
+              authenticatedOrigin: {
+                platform: "github" as const,
+                userId: "self-alias-user",
+                messageRef: {
+                  platform: "github" as const,
+                  channelId: testCase.sessionId,
+                  messageId: "42",
+                },
+              },
+              github: {
+                repoFullName: "owner/repo",
+                issueNumber: 1,
+                trigger: { kind: "comment" as const, commentId: 42 },
+              },
+            };
+      const runner = await startBusAgentRunner({
+        bus,
+        subscriptionId: `self-alias-${testCase.platform}`,
+        reportFatalPanic: () => undefined,
+        config,
+        pluginManager,
+        requestMessageCache,
+        resolveParentChannelId: (sessionId) => sessionId,
+        issueControlCapability: (input) => ({
+          capability: `self-alias-${testCase.platform}`,
+          principal: input.authenticatedOrigin
+            ? {
+                platform: input.authenticatedOrigin.platform,
+                userId: input.authenticatedOrigin.userId,
+              }
+            : null,
+          authenticatedOrigin: input.authenticatedOrigin ?? null,
+          safetyMode: input.safetyMode,
+        }),
+        createAgent: (options) =>
+          new AiSdkPiAgent({
+            ...options,
+            model: new MockLanguageModelV4({
+              modelId: options.modelSpecifier ?? "unknown",
+              doStream: async () => {
+                if (options.modelSpecifier === "openai/active") {
+                  firstStarted.resolve(undefined);
+                  await releaseFirst.promise;
+                } else {
+                  secondStarted.resolve(undefined);
+                }
+                return level1TextStep("self alias complete");
+              },
+            }),
+          }),
+      });
+      try {
+        await publishRunnerRequest({
+          bus,
+          requestId: testCase.requestId,
+          sessionId: testCase.sessionId,
+          requestClient: testCase.platform,
+          text: "first",
+          modelOverride: "active",
+          raw,
+        });
+        await firstStarted.promise;
+        await publishRunnerRequest({
+          bus,
+          requestId: testCase.requestId,
+          sessionId: testCase.sessionId,
+          requestClient: testCase.platform,
+          queue: "followUp",
+          text: "change model",
+          modelOverride: "other",
+          raw,
+        });
+        expect(requestMessageCache.snapshot(testCase.requestId)?.ownerCount).toBe(2);
+        releaseFirst.resolve(undefined);
+        await secondStarted.promise;
+        expect(requestMessageCache.getOrigin(testCase.requestId)).toBeDefined();
+        expect(requestMessageCache.get(testCase.requestId)).toBeDefined();
+        await runner.getActiveDrainOperation();
+        expect(contexts).toHaveLength(2);
+        expect(contexts[1]).toMatchObject({
+          requestId: testCase.requestId,
+          safetyMode: "trusted",
+          authenticatedPrincipal: { platform: testCase.platform, userId: "self-alias-user" },
+          authenticatedPrincipalSessionId: testCase.sessionId,
+        });
+      } finally {
+        releaseFirst.resolve(undefined);
+        await runner.stop();
+        await requestMessageCache.stop();
+        await pluginManager.destroy();
+        await bus.close();
+      }
+    },
+  );
 
   it("cancels an active model call after the running lifecycle transition", async () => {
     const config = parseCoreConfigV1ToUniversal({});
@@ -3116,7 +4283,13 @@ describe("startBusAgentRunner production path", () => {
   });
 });
 
-function corePrimaryTestPluginManager(): CoreToolPluginManager {
+function corePrimaryTestPluginManager(
+  onBuild?: (
+    requestContext: Parameters<
+      CoreToolPluginManager["buildLevel1ToolsetResult"]
+    >[0]["requestContext"],
+  ) => void,
+): CoreToolPluginManager {
   const toolset = level1TestToolset();
   return {
     init: async () => Result.ok(),
@@ -3126,7 +4299,10 @@ function corePrimaryTestPluginManager(): CoreToolPluginManager {
     getStatuses: () => [],
     getLevel2Tools: () => [],
     getLevel2ContributionInfo: () => new Map(),
-    buildLevel1ToolsetResult: async () => Result.ok(toolset),
+    buildLevel1ToolsetResult: async (input) => {
+      onBuild?.(input.requestContext);
+      return Result.ok(toolset);
+    },
   };
 }
 

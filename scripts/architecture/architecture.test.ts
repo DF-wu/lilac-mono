@@ -1247,14 +1247,11 @@ describe("Stage 2 union rules", () => {
     ]);
   });
 
-  test("registers exact heartbeat and request-cache lifecycle Result boundaries", () => {
+  test("registers exact heartbeat lifecycle Result boundaries", () => {
     const core = architectureManifest.workspaces.find(
       (workspace) => workspace.root === "apps/core",
     );
-    const modules = new Set([
-      "src/heartbeat/heartbeat-service.ts",
-      "src/tool-server/request-message-cache.ts",
-    ]);
+    const modules = new Set(["src/heartbeat/heartbeat-service.ts"]);
 
     expect(core?.operationalResultApis.filter((api) => modules.has(api.module))).toEqual([
       {
@@ -1273,24 +1270,13 @@ describe("Stage 2 union rules", () => {
         module: "src/heartbeat/heartbeat-service.ts",
         exportName: "startHeartbeatServiceResult.stopHeartbeatLifecycleResult",
       },
-      {
-        module: "src/tool-server/request-message-cache.ts",
-        exportName: "createRequestMessageCache.startRequestMessageCacheResult",
-      },
-      {
-        module: "src/tool-server/request-message-cache.ts",
-        exportName: "createRequestMessageCache.stopRequestMessageCacheResult",
-      },
     ]);
     expect(
       core?.exceptionAdapters
         .filter((adapter) => modules.has(adapter.identity.module))
         .filter((adapter) => adapter.identity.exportName.startsWith("adapt"))
         .map((adapter) => [adapter.identity.exportName, adapter.direction]),
-    ).toEqual([
-      ["adaptRequestMessageCacheStartResultToHost", "signal-host"],
-      ["adaptRequestMessageCacheStopResultToHost", "signal-host"],
-    ]);
+    ).toEqual([]);
     expect(
       core?.exceptionAdapters
         .filter(
@@ -1822,7 +1808,7 @@ describe("Stage 4 event architecture rules", () => {
       (workspace) => workspace.name === "apps/core",
     );
     if (!core) throw new Error("core workspace missing");
-    expect(core.eventDeliveryConsumers).toHaveLength(13);
+    expect(core.eventDeliveryConsumers).toHaveLength(12);
     expect(core.boundaryDecoders).toContainEqual({
       identity: {
         module: "src/surface/bridge/bus-agent-runner/raw.ts",

@@ -65,6 +65,7 @@ describe("ProgrammaticWorkflow trusted auto-run", () => {
       safetyMode: "trusted" as const,
       serverOwnedRequest: true,
       authenticatedPrincipal: { platform: "discord" as const, userId: "user-1" },
+      authenticatedPrincipalSessionId: "channel-1",
       toolCallId: "tool-call-1",
     } satisfies RequestContext;
     await tool.init();
@@ -87,7 +88,13 @@ describe("ProgrammaticWorkflow trusted auto-run", () => {
       expect(first.state).toBe("queued");
       expect(cards).toEqual([first.runId]);
       const fetched = await tool.call("workflow.run.get", { runId: first.runId }, { context });
-      expect(fetched).toMatchObject({ run: { runId: first.runId, state: "queued" } });
+      expect(fetched).toMatchObject({
+        run: {
+          runId: first.runId,
+          state: "queued",
+          origin: { client: "discord", sessionId: "channel-1", userId: "user-1" },
+        },
+      });
       expect(JSON.stringify(fetched)).not.toContain("approval");
     } finally {
       await tool.destroy();
@@ -110,6 +117,7 @@ describe("ProgrammaticWorkflow trusted auto-run", () => {
       safetyMode: "trusted" as const,
       serverOwnedRequest: true,
       authenticatedPrincipal: { platform: "discord" as const, userId: "user-1" },
+      authenticatedPrincipalSessionId: "channel-1",
     } satisfies RequestContext;
     await tool.init();
     try {
@@ -156,6 +164,7 @@ describe("ProgrammaticWorkflow trusted auto-run", () => {
       safetyMode: "trusted" as const,
       serverOwnedRequest: true,
       authenticatedPrincipal: { platform: "discord" as const, userId: "user-1" },
+      authenticatedPrincipalSessionId: "channel-1",
     } satisfies RequestContext;
     const sensitiveSource = source()
       .replace('required: ["directory"]', 'required: ["directory", "token"]')
@@ -280,6 +289,7 @@ describe("ProgrammaticWorkflow trusted auto-run", () => {
       safetyMode: "trusted" as const,
       serverOwnedRequest: true,
       authenticatedPrincipal: { platform: "discord" as const, userId: "owner-1" },
+      authenticatedPrincipalSessionId: "channel-1",
       toolCallId: "trigger-call",
     } satisfies RequestContext;
     await tool.init();

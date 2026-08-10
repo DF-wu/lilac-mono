@@ -42,14 +42,16 @@ Source: `plan/surface-adapter-contract-readiness.md`
 
 ## Stage 5: Authenticated Origin And Principal Consistency
 
-- [ ] Add the mapped internal authenticated-origin union.
-- [ ] Preserve current Discord/GitHub raw wire inputs and fixtures.
-- [ ] Dead-letter malformed or conflicting actor/origin/header identities.
-- [ ] Correlate active-relay events and terminal lifecycle cache entries by exact `(requestId, platform, sessionId)`, including terminal-before-relay ordering; dead-letter mismatches before relay or cache mutation.
-- [ ] Bind request-cache origin and request-control capability identity.
-- [ ] Propagate the validated identity through tool, plugin, workflow, and subagent contexts.
-- [ ] Implement the explicit safety-mode precedence without changing current Discord/GitHub behavior.
-- [ ] Run focused cache/control/runner/plugin tests, typechecks, lint/fmt, and independent review.
+- [x] Add the mapped internal authenticated-origin union.
+- [x] Preserve current Discord/GitHub raw wire inputs and fixtures.
+- [x] Dead-letter malformed or conflicting actor/origin/header identities.
+- [x] Correlate active-relay events and terminal lifecycle cache entries by exact `(requestId, platform, sessionId)`, including terminal-before-relay ordering; dead-letter mismatches before relay or cache mutation.
+- [x] Bind request-cache origin and request-control capability identity.
+- [x] Propagate the validated identity through tool, plugin, workflow, and subagent contexts.
+- [x] Implement the explicit safety-mode precedence without changing current Discord/GitHub behavior.
+- [x] Run focused cache/control/runner/plugin tests, typechecks, architecture checks, and lint/fmt. Parent review remains independent.
+
+The runner is the sole request-cache writer. After all bus entries are acknowledged and all queue/run owners finish, request-ID reuse starts a new in-process lifecycle; this relies on globally unique request IDs and adds no persisted identity contract. Queue cancellation and buffered absorption retain delivery-keyed progress while parked, release each removed entry only after its cancellation publication succeeds, and resume without repeating accepted lifecycle or agent-control effects. The cache retains the complete set of parked event IDs, so resolving one PEL entry cannot release a lifecycle that still has another pending delivery.
 
 ## Stage 6: Workflow Port And Durable Correlation
 
@@ -68,10 +70,13 @@ Source: `plan/surface-adapter-contract-readiness.md`
 - [ ] Define explicit unavailable descriptor/relay restore behavior.
 - [ ] Preflight complete snapshots and add apply/rollback restore-attempt handles.
 - [ ] Roll back partial relay application before agent restore and supervise rollback failure.
+- [ ] Persist and restore parked queued-cancellation and buffered-absorption attempt state, PEL delivery identity, queue reservations, `controlApplied`, and partial lifecycle-publication progress; restore reservations before queue drain or fail-safe exclude affected entries until PEL recovery so process replacement cannot duplicate effects or run cancelled work.
+- [ ] Persist and restore normalized authenticated/delegated identity plus verified-ingress and safety correlation through versioned codecs; keep legacy snapshots without durable proof restricted and re-admit restored identity into the request cache/registry before Level-2 capability use.
 - [ ] Consume restorable snapshots only after success; consume empty/stale after classification.
 - [ ] Retain unavailable and failed-restoration snapshots.
 - [ ] Define row dispositions for every load, decode, staleness, and SQLite outcome.
 - [ ] Preserve transcript and Discord primary-continuation compatibility.
+- [ ] Add current-version and legacy snapshot/restore fixtures and process-replacement tests covering parked attempts, both `controlApplied` states, partial lifecycle publication, delegated/authenticated identity, verified ingress, restricted legacy fallback, cache/registry re-admission, and pre-Level-2 restore ordering.
 - [ ] Run focused restart/transcript tests, Core typecheck, architecture checks, lint/fmt, and independent review.
 
 ## Stage 8: Shared Contract Harness And Documentation

@@ -1,438 +1,289 @@
 import { describe, expect, it } from "bun:test";
-import {
-  createLilacBus,
-  EventDeliveryStartFailed,
-  EventDeliveryStopped,
-  EventDeliveryStopFailed,
-  lilacEventTypes,
-  type DeliveryDisposition,
-  type EventDeliveryDoneError,
-  type FetchOptions,
-  type Message,
-  type PublishOptions,
-  type RawBus,
-  type RawDeliveryHandler,
-  type SubscriptionOptions,
-} from "@stanley2058/lilac-event-bus";
-import { Panic, Result, type Result as ResultType } from "better-result";
+import { lilacEventTypes, type LilacMessageForTopic } from "@stanley2058/lilac-event-bus";
 
 import {
   createRequestMessageCache,
-  RequestMessageCacheProjectionInvalid,
-  RequestMessageCacheRequestIdMissing,
-  requestMessageCacheDeliveryDisposition,
+  type AuthenticatedRequestOrigin,
 } from "../../src/tool-server/request-message-cache";
 
-type InMemoryRawBusHarness = {
-  readonly raw: RawBus;
-  readonly dispositions: DeliveryDisposition[];
-  readonly transportCommitCount: () => number;
-};
-
-function createInMemoryRawBusHarness(options?: {
-  readonly startPanic?: Panic;
-  readonly startFailure?: EventDeliveryStartFailed;
-  readonly stopFailure?: EventDeliveryStopFailed;
-  readonly doneFailure?: EventDeliveryDoneError;
-  readonly stopPanic?: Panic;
-}): InMemoryRawBusHarness {
-  const topics = new Map<string, Array<Message<unknown>>>();
-  const deliverySubs = new Set<{
-    topic: string;
-    opts: SubscriptionOptions;
-    handler: RawDeliveryHandler;
-  }>();
-  const dispositions: DeliveryDisposition[] = [];
-  let transportCommitCount = 0;
-
-  const raw: RawBus = {
-    publish: async <TData>(msg: Omit<Message<TData>, "id" | "ts">, opts: PublishOptions) => {
-      const id = `${Date.now()}-0`;
-      const stored: Message<unknown> = {
-        topic: opts.topic,
-        id,
-        type: opts.type,
-        ts: Date.now(),
-        key: opts.key,
-        headers: opts.headers,
-        data: msg.data,
-      };
-
-      const list = topics.get(opts.topic) ?? [];
-      list.push(stored);
-      topics.set(opts.topic, list);
-
-      for (const s of deliverySubs) {
-        if (s.topic !== opts.topic) continue;
-        const context = {
-          cursor: id,
-          mode: s.opts.mode,
-          evidence: {
-            source: {
-              transport: "redis-streams" as const,
-              streamKey: opts.topic,
-              topic: opts.topic,
-              messageId: id,
-            },
-            wire: { kind: "bounded-complete" as const, fields: [] },
-          },
-        };
-        const action = await s.handler(stored, context);
-        dispositions.push(action.disposition);
-        if (action.disposition === "commit") transportCommitCount += 1;
-      }
-
-      return { id, cursor: id };
-    },
-
-    subscribe: async (topic, opts, handler) => {
-      if (options?.startPanic) throw options.startPanic;
-      if (options?.startFailure) return Result.err(options.startFailure);
-
-      const done = Promise.withResolvers<ResultType<void, EventDeliveryDoneError>>();
-      if (options?.doneFailure) done.resolve(Result.err(options.doneFailure));
-      const entry = { topic, opts, handler };
-      deliverySubs.add(entry);
-      return Result.ok({
-        done: done.promise,
-        stop: async () => {
-          deliverySubs.delete(entry);
-          if (!options?.doneFailure) done.resolve(Result.ok(undefined));
-          if (options?.stopPanic) throw options.stopPanic;
-          if (options?.stopFailure) return Result.err(options.stopFailure);
-          return Result.ok(undefined);
-        },
-      });
-    },
-
-    fetch: async (topic: string, _opts: FetchOptions) => {
-      const existing = topics.get(topic) ?? [];
-      return {
-        messages: existing.map((m) => ({
-          msg: m,
-          cursor: m.id,
-        })),
-        next: existing.length > 0 ? existing[existing.length - 1]!.id : undefined,
-      };
-    },
-
-    close: async () => {},
-  };
-
+function requestMessage(input: {
+  readonly eventId: string;
+  readonly requestId: string;
+  readonly sessionId?: string;
+  readonly requestClient?: "discord" | "github" | "unknown";
+  readonly text?: string;
+  readonly raw?: Record<string, unknown>;
+}): LilacMessageForTopic<"cmd.request"> {
   return {
-    raw,
-    dispositions,
-    transportCommitCount: () => transportCommitCount,
+    id: input.eventId,
+    topic: "cmd.request",
+    type: lilacEventTypes.CmdRequestMessage,
+    ts: 100,
+    key: input.requestId,
+    headers: {
+      request_id: input.requestId,
+      session_id: input.sessionId ?? "channel-1",
+      request_client: input.requestClient ?? "discord",
+    },
+    data: {
+      queue: "prompt",
+      messages: [{ role: "user", content: input.text ?? input.eventId }],
+      ...(input.raw ? { raw: input.raw } : {}),
+    },
   };
 }
 
-function createInMemoryRawBus(): RawBus {
-  return createInMemoryRawBusHarness().raw;
+function trustedUnknownProjection(input: {
+  readonly requestId: string;
+  readonly sessionId: string;
+}): AuthenticatedRequestOrigin {
+  return {
+    requestId: input.requestId,
+    requestClient: "unknown",
+    sessionId: input.sessionId,
+    source: "internal-delegated",
+    authenticatedOrigin: {
+      platform: "discord",
+      userId: "user-1",
+      sessionRef: { platform: "discord", channelId: "channel-1" },
+    },
+    authenticationMetadataKind: "origin",
+    verifiedIngress: false,
+  };
 }
 
-describe("request-message-cache", () => {
-  it("commits successful projections through the transport without handler acknowledgement", async () => {
-    const harness = createInMemoryRawBusHarness();
-    const bus = createLilacBus(harness.raw);
-    const cache = await createRequestMessageCache({ bus, ttlMs: 60_000, maxEntries: 32 });
-    const requestId = "req:cache-policy";
-
-    await bus.publish(
-      lilacEventTypes.CmdRequestMessage,
-      { queue: "prompt", messages: [{ role: "user", content: "one" }] },
-      { headers: { request_id: requestId } },
-    );
-
-    expect(cache.get(requestId)).toHaveLength(1);
-    expect(harness.dispositions).toEqual(["commit"]);
-    expect(harness.transportCommitCount()).toBe(1);
-    await cache.stop();
+describe("request message cache", () => {
+  it("has no independent bus subscription and accepts runner ingestion synchronously", () => {
+    const cache = createRequestMessageCache();
+    const message = requestMessage({ eventId: "1-0", requestId: "request-1" });
+    expect(cache.cacheMessage(message).status).toBe("ok");
+    expect(cache.get("request-1")).toHaveLength(1);
   });
 
-  it("adapts lifecycle failures with stop-before-done precedence and preserves Panic", async () => {
-    const startPanic = new Panic({ message: "request cache startup invariant failed" });
-    await expect(
-      createRequestMessageCache({
-        bus: createLilacBus(createInMemoryRawBusHarness({ startPanic }).raw),
-      }),
-    ).rejects.toBe(startPanic);
-
-    const startFailure = new EventDeliveryStartFailed({
-      cause: undefined,
-      topic: "cmd.request",
-      message: "start unavailable",
-    });
-    await expect(
-      createRequestMessageCache({
-        bus: createLilacBus(createInMemoryRawBusHarness({ startFailure }).raw),
-      }),
-    ).rejects.toBe(startFailure);
-
-    const stopFailure = new EventDeliveryStopFailed({
-      cause: undefined,
-      topic: "cmd.request",
-      message: "stop wins",
-    });
-    const doneFailure = new EventDeliveryStopped({
-      reason: "requested",
-      topic: "cmd.request",
-      cursor: "1-0",
-      message: "done loses",
-    });
-    const precedenceCache = await createRequestMessageCache({
-      bus: createLilacBus(createInMemoryRawBusHarness({ stopFailure, doneFailure }).raw),
-    });
-    await expect(precedenceCache.stop()).rejects.toBe(stopFailure);
-
-    const doneCache = await createRequestMessageCache({
-      bus: createLilacBus(createInMemoryRawBusHarness({ doneFailure }).raw),
-    });
-    await expect(doneCache.stop()).rejects.toBe(doneFailure);
-
-    const panic = new Panic({ message: "request cache cleanup invariant failed" });
-    const panicCache = await createRequestMessageCache({
-      bus: createLilacBus(createInMemoryRawBusHarness({ stopPanic: panic }).raw),
-    });
-    await expect(panicCache.stop()).rejects.toBe(panic);
+  it("keeps slow intake alive beyond TTL and releases it after committed handling", () => {
+    let now = 100;
+    const cache = createRequestMessageCache({ ttlMs: 5, now: () => now });
+    const message = requestMessage({ eventId: "1-0", requestId: "slow" });
+    expect(cache.cacheMessage(message).status).toBe("ok");
+    now = 1_000;
+    expect(cache.get("slow")).toBeDefined();
+    cache.finishDelivery({ requestId: "slow", eventId: message.id, disposition: "release" });
+    expect(cache.get("slow")).toBeUndefined();
   });
 
-  it("parks a request message missing its required request id", () => {
-    const error = new RequestMessageCacheRequestIdMissing({
-      messageType: lilacEventTypes.CmdRequestMessage,
-      message: "cmd.request.message missing headers.request_id",
+  it("retains a parked event and dedupes its redelivery", () => {
+    const cache = createRequestMessageCache();
+    const message = requestMessage({ eventId: "1-0", requestId: "parked" });
+    expect(cache.cacheMessage(message).status).toBe("ok");
+    cache.finishDelivery({ requestId: "parked", eventId: message.id, disposition: "park" });
+    expect(cache.snapshot("parked")).toMatchObject({
+      ownerCount: 0,
+      eventIdCount: 1,
+      parkedEventIds: [message.id],
     });
-
-    expect(requestMessageCacheDeliveryDisposition(error)).toBe("park-pending");
+    expect(cache.cacheMessage(message).status).toBe("ok");
+    expect(cache.get("parked")).toHaveLength(1);
+    cache.finishDelivery({ requestId: "parked", eventId: message.id, disposition: "release" });
+    expect(cache.get("parked")).toBeUndefined();
   });
 
-  it("dead-letters malformed cache-owned authentication projections", async () => {
-    const harness = createInMemoryRawBusHarness();
-    const bus = createLilacBus(harness.raw);
-    const cache = await createRequestMessageCache({ bus, ttlMs: 60_000, maxEntries: 32 });
-    const requestId = "req:cache-invalid-projection";
+  it("bounds messages and dedupe IDs during a long active request", () => {
+    const cache = createRequestMessageCache();
+    const first = requestMessage({ eventId: "0-0", requestId: "active" });
+    const admitted = cache.cacheMessage(first);
+    if (admitted.status === "error") throw admitted.error;
+    const owner = cache.acquireOwner("active");
+    if (owner.status === "error") throw owner.error;
+    cache.finishDelivery({ requestId: "active", eventId: first.id, disposition: "release" });
+    for (let index = 1; index < 700; index += 1) {
+      const message = requestMessage({ eventId: `${index}-0`, requestId: "active" });
+      expect(cache.cacheMessage(message).status).toBe("ok");
+      cache.finishDelivery({ requestId: "active", eventId: message.id, disposition: "release" });
+    }
+    expect(cache.get("active")).toHaveLength(512);
+    expect(cache.snapshot("active")?.eventIdCount).toBe(0);
+    expect(cache.releaseOwner(owner.value)).toBe(true);
+    expect(cache.get("active")).toBeUndefined();
+  });
 
-    await bus.publish(
-      lilacEventTypes.CmdRequestMessage,
-      {
-        queue: "prompt",
-        messages: [{ role: "user", content: "one" }],
-        raw: { authenticatedActor: { platform: "discord", userId: "" } },
-      },
-      {
-        headers: {
-          request_id: requestId,
-          session_id: "channel",
-          request_client: "discord",
+  it.each([
+    ["first then second", ["1-0", "2-0"]],
+    ["second then first", ["2-0", "1-0"]],
+  ] as const)("retains two parked deliveries when recovering %s", (_, recoveryOrder) => {
+    const cache = createRequestMessageCache();
+    const first = requestMessage({ eventId: "1-0", requestId: "two-parked" });
+    const second = requestMessage({ eventId: "2-0", requestId: "two-parked" });
+    expect(cache.cacheMessage(first).status).toBe("ok");
+    cache.finishDelivery({ requestId: "two-parked", eventId: first.id, disposition: "park" });
+    expect(cache.cacheMessage(second).status).toBe("ok");
+    cache.finishDelivery({ requestId: "two-parked", eventId: second.id, disposition: "park" });
+    expect(cache.snapshot("two-parked")).toMatchObject({
+      ownerCount: 0,
+      eventIdCount: 2,
+      parkedEventIds: ["1-0", "2-0"],
+    });
+
+    const messages = new Map([
+      [first.id, first],
+      [second.id, second],
+    ]);
+    const recoveredFirst = messages.get(recoveryOrder[0]);
+    if (!recoveredFirst) throw new Error("missing first recovery message");
+    expect(cache.cacheMessage(recoveredFirst).status).toBe("ok");
+    cache.finishDelivery({
+      requestId: "two-parked",
+      eventId: recoveredFirst.id,
+      disposition: "release",
+    });
+    expect(cache.snapshot("two-parked")).toMatchObject({
+      eventIdCount: 1,
+      parkedEventIds: [recoveryOrder[1]],
+    });
+
+    const recoveredSecond = messages.get(recoveryOrder[1]);
+    if (!recoveredSecond) throw new Error("missing second recovery message");
+    expect(cache.cacheMessage(recoveredSecond).status).toBe("ok");
+    cache.finishDelivery({
+      requestId: "two-parked",
+      eventId: recoveredSecond.id,
+      disposition: "release",
+    });
+    expect(cache.get("two-parked")).toBeUndefined();
+  });
+
+  it("refcounts canonical self aliases and releases each owner exactly once", () => {
+    const cache = createRequestMessageCache();
+    const message = requestMessage({
+      eventId: "1-0",
+      requestId: "discord:channel-1:message-1",
+      raw: {
+        authenticatedOrigin: {
+          platform: "discord",
+          userId: "user-1",
+          messageRef: { platform: "discord", channelId: "channel-1", messageId: "message-1" },
         },
       },
-    );
-
-    expect(harness.dispositions).toEqual(["dead-letter"]);
-    expect(harness.transportCommitCount()).toBe(0);
-    expect(cache.get(requestId)).toBeUndefined();
-    expect(
-      requestMessageCacheDeliveryDisposition(
-        new RequestMessageCacheProjectionInvalid({
-          messageType: lilacEventTypes.CmdRequestMessage,
-          message: "invalid projection",
-        }),
-      ),
-    ).toBe("dead-letter");
-    await cache.stop();
-  });
-
-  it("stores and appends cmd.request message batches per request id", async () => {
-    const bus = createLilacBus(createInMemoryRawBus());
-    const cache = await createRequestMessageCache({ bus, ttlMs: 60_000, maxEntries: 32 });
-
-    const requestId = "req:cache-1";
-
-    await bus.publish(
-      lilacEventTypes.CmdRequestMessage,
-      {
-        queue: "prompt",
-        messages: [{ role: "user", content: "one" }],
-      },
-      {
-        headers: {
-          request_id: requestId,
-          session_id: "chan",
-          request_client: "discord",
-        },
-      },
-    );
-
-    await bus.publish(
-      lilacEventTypes.CmdRequestMessage,
-      {
-        queue: "followUp",
-        messages: [{ role: "user", content: "two" }],
-      },
-      {
-        headers: {
-          request_id: requestId,
-          session_id: "chan",
-          request_client: "discord",
-        },
-      },
-    );
-
-    const cached = cache.get(requestId);
-    expect(Array.isArray(cached)).toBe(true);
-    expect(cached?.length).toBe(2);
-
-    await cache.stop();
-  });
-
-  it("expires cached entries after ttl", async () => {
-    const bus = createLilacBus(createInMemoryRawBus());
-    const cache = await createRequestMessageCache({ bus, ttlMs: 5, maxEntries: 32 });
-
-    const requestId = "req:cache-expire";
-
-    await bus.publish(
-      lilacEventTypes.CmdRequestMessage,
-      {
-        queue: "prompt",
-        messages: [{ role: "user", content: "one" }],
-      },
-      {
-        headers: {
-          request_id: requestId,
-          session_id: "chan",
-          request_client: "discord",
-        },
-      },
-    );
-
-    expect(cache.get(requestId)?.length).toBe(1);
-
-    // test-wait-justification: crosses the cache's real five-millisecond TTL before asserting eviction
-    await new Promise((r) => setTimeout(r, 10));
-    expect(cache.get(requestId)).toBeUndefined();
-
-    await cache.stop();
-  });
-
-  it("retains authenticated surface origins from server-published request state", async () => {
-    const bus = createLilacBus(createInMemoryRawBus());
-    const cache = await createRequestMessageCache({ bus, ttlMs: 60_000, maxEntries: 32 });
-    const requestId = "discord:channel-1:message-1";
-    await bus.publish(
-      lilacEventTypes.CmdRequestMessage,
-      { queue: "prompt", messages: [{ role: "user", content: "run" }] },
-      {
-        headers: {
-          request_id: requestId,
-          session_id: "channel-1",
-          request_client: "discord",
-        },
-      },
-    );
-    expect(cache.getOrigin(requestId)).toEqual({
-      requestId,
+    });
+    const admitted = cache.cacheMessage(message);
+    if (admitted.status === "error") throw admitted.error;
+    const current = cache.acquireOwner(message.key);
+    if (current.status === "error") throw current.error;
+    const queued = cache.createAliasOwner({
+      sourceRequestId: message.key,
+      aliasRequestId: message.key,
+      requestClient: "discord",
       sessionId: "channel-1",
-      platform: "discord",
-      messageRef: { platform: "discord", channelId: "channel-1", messageId: "message-1" },
-      actorUserId: null,
+    });
+    if (queued.status === "error") throw queued.error;
+    cache.finishDelivery({ requestId: message.key, eventId: message.id, disposition: "release" });
+    expect(cache.releaseOwner(current.value)).toBe(true);
+    expect(cache.releaseOwner(current.value)).toBe(false);
+    expect(cache.get(message.key)).toBeDefined();
+    expect(cache.releaseOwner(queued.value)).toBe(true);
+    expect(cache.get(message.key)).toBeUndefined();
+  });
+
+  it("requires an empty distinct alias target and clones message lineage", () => {
+    const cache = createRequestMessageCache();
+    const source = requestMessage({ eventId: "1-0", requestId: "source" });
+    const occupied = requestMessage({ eventId: "2-0", requestId: "occupied" });
+    expect(cache.cacheMessage(source).status).toBe("ok");
+    expect(cache.cacheMessage(occupied).status).toBe("ok");
+    expect(
+      cache.createAliasOwner({
+        sourceRequestId: "source",
+        aliasRequestId: "occupied",
+        requestClient: "discord",
+        sessionId: "channel-1",
+      }).status,
+    ).toBe("error");
+    const alias = cache.createAliasOwner({
+      sourceRequestId: "source",
+      aliasRequestId: "alias",
+      requestClient: "discord",
+      sessionId: "channel-1",
+    });
+    if (alias.status === "error") throw alias.error;
+    expect(cache.get("alias")).toEqual(cache.get("source"));
+    expect(cache.get("alias")).not.toBe(cache.get("source"));
+    expect(cache.releaseOwner(alias.value)).toBe(true);
+    expect(cache.get("alias")).toBeUndefined();
+  });
+
+  it("allows trusted workflow reconstruction but rejects a raw unknown-client trust upgrade", () => {
+    const cache = createRequestMessageCache();
+    const message = requestMessage({
+      eventId: "1-0",
+      requestId: "workflow-child",
+      sessionId: "workflow-session",
+      requestClient: "unknown",
+    });
+    expect(cache.cacheMessage(message).status).toBe("ok");
+    expect(
+      cache.cacheMessage(
+        message,
+        trustedUnknownProjection({ requestId: "workflow-child", sessionId: "workflow-session" }),
+      ).status,
+    ).toBe("ok");
+    expect(cache.getOrigin("workflow-child")).toMatchObject({
+      source: "internal-delegated",
+      authenticatedOrigin: { platform: "discord", userId: "user-1" },
     });
 
-    await bus.publish(
-      lilacEventTypes.CmdRequestMessage,
-      {
-        queue: "prompt",
-        messages: [{ role: "user", content: "active channel" }],
-        raw: {
-          authenticatedOrigin: {
-            platform: "discord",
-            userId: "user-2",
-            messageRef: { platform: "discord", channelId: "channel-1", messageId: "message-2" },
-          },
-        },
-      },
-      {
-        headers: {
-          request_id: "req:random-server-id",
-          session_id: "channel-1",
-          request_client: "discord",
-        },
-      },
-    );
-    expect(cache.getOrigin("req:random-server-id")).toMatchObject({
-      actorUserId: "user-2",
-      messageRef: { messageId: "message-2" },
+    const raw = requestMessage({
+      eventId: "2-0",
+      requestId: "raw-unknown",
+      sessionId: "workflow-session",
+      requestClient: "unknown",
+      raw: { authenticatedActor: { platform: "discord", userId: "user-1" } },
     });
+    expect(cache.cacheMessage(raw).status).toBe("error");
+  });
 
-    await bus.publish(
-      lilacEventTypes.CmdRequestMessage,
-      {
-        queue: "prompt",
-        messages: [{ role: "user", content: "review" }],
+  it("latches GitHub trigger identity while allowing raw-free follow-up", () => {
+    const cache = createRequestMessageCache();
+    const trigger = (eventId: string, commentId: number) =>
+      requestMessage({
+        eventId,
+        requestId: "github:owner/repo#1:41",
+        sessionId: "owner/repo#1",
+        requestClient: "github",
         raw: {
           authenticatedActor: { platform: "github", userId: "octocat" },
-          github: { trigger: { kind: "comment", commentId: 42 } },
-        },
-      },
-      {
-        headers: {
-          request_id: "github:owner/repo#7:42",
-          session_id: "owner/repo#7",
-          request_client: "github",
-        },
-      },
-    );
-    expect(cache.getOrigin("github:owner/repo#7:42")).toMatchObject({
-      platform: "github",
-      actorUserId: "octocat",
-      messageRef: { messageId: "42" },
-    });
-    expect(cache.getOrigin("forged-request")).toBeUndefined();
-    await cache.stop();
-  });
-
-  it("clamps large per-request message history and evicts oldest request ids", async () => {
-    const bus = createLilacBus(createInMemoryRawBus());
-    const cache = await createRequestMessageCache({ bus, ttlMs: 60_000, maxEntries: 2 });
-
-    const hotRequest = "req:cache-hot";
-
-    for (let i = 0; i < 520; i++) {
-      await bus.publish(
-        lilacEventTypes.CmdRequestMessage,
-        {
-          queue: "followUp",
-          messages: [{ role: "user", content: `m${i}` }],
-        },
-        {
-          headers: {
-            request_id: hotRequest,
-            session_id: "chan",
-            request_client: "discord",
+          github: {
+            repoFullName: "owner/repo",
+            issueNumber: 1,
+            trigger: { kind: "comment", commentId },
           },
         },
-      );
-    }
+      });
+    expect(cache.cacheMessage(trigger("1-0", 41)).status).toBe("ok");
+    expect(
+      cache.cacheMessage(
+        requestMessage({
+          eventId: "2-0",
+          requestId: "github:owner/repo#1:41",
+          sessionId: "owner/repo#1",
+          requestClient: "github",
+        }),
+      ).status,
+    ).toBe("ok");
+    expect(cache.cacheMessage(trigger("3-0", 42)).status).toBe("error");
+  });
 
-    const hot = cache.get(hotRequest);
-    expect(hot?.length).toBe(512);
-
-    await bus.publish(
-      lilacEventTypes.CmdRequestMessage,
-      { queue: "prompt", messages: [{ role: "user", content: "a" }] },
-      { headers: { request_id: "req:a", session_id: "chan", request_client: "discord" } },
-    );
-
-    await bus.publish(
-      lilacEventTypes.CmdRequestMessage,
-      { queue: "prompt", messages: [{ role: "user", content: "b" }] },
-      { headers: { request_id: "req:b", session_id: "chan", request_client: "discord" } },
-    );
-
-    // maxEntries=2 should evict least recently updated request ids.
-    expect(cache.get("req:a")).toBeDefined();
-    expect(cache.get("req:b")).toBeDefined();
-    expect(cache.get(hotRequest)).toBeUndefined();
-
-    await cache.stop();
+  it("treats request-ID reuse after committed release as a new lifecycle", () => {
+    const cache = createRequestMessageCache();
+    const first = requestMessage({ eventId: "1-0", requestId: "reused" });
+    expect(cache.cacheMessage(first).status).toBe("ok");
+    cache.finishDelivery({ requestId: "reused", eventId: first.id, disposition: "release" });
+    const second = requestMessage({
+      eventId: "2-0",
+      requestId: "reused",
+      raw: {
+        authenticatedActor: { platform: "discord", userId: "new-user" },
+      },
+    });
+    expect(cache.cacheMessage(second).status).toBe("ok");
+    expect(cache.getOrigin("reused")?.authenticatedOrigin?.userId).toBe("new-user");
   });
 });

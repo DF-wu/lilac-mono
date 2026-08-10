@@ -112,8 +112,13 @@ function createDeliveryContext(
 function createInMemoryRawBus(
   onDelivery?: (observation: DeliveryObservation) => void,
   waitForTailStop?: () => Promise<void>,
+  completeSurfaceOutputHeaders = true,
 ): RawBus {
   const topics = new Map<string, Array<Message<unknown>>>();
+  const correlationByRequestId = new Map<
+    string,
+    { readonly session_id: string; readonly request_client: string }
+  >();
   let sequence = 0;
   const deliverySubs = new Set<InMemoryDeliverySubscription>();
 
@@ -150,6 +155,20 @@ function createInMemoryRawBus(
 
   return {
     publish: async <TData>(msg: Omit<Message<TData>, "id" | "ts">, opts: PublishOptions) => {
+      const requestId = opts.headers?.request_id;
+      const sessionId = opts.headers?.session_id;
+      const requestClient = opts.headers?.request_client;
+      if (requestId && sessionId && requestClient) {
+        correlationByRequestId.set(requestId, {
+          session_id: sessionId,
+          request_client: requestClient,
+        });
+      }
+      const correlation = requestId ? correlationByRequestId.get(requestId) : undefined;
+      const headers =
+        completeSurfaceOutputHeaders && opts.topic.startsWith("out.req.") && correlation
+          ? { ...opts.headers, ...correlation }
+          : opts.headers;
       const id = `${Date.now()}-${sequence}`;
       sequence += 1;
       const stored: Message<unknown> = {
@@ -158,7 +177,7 @@ function createInMemoryRawBus(
         type: opts.type,
         ts: Date.now(),
         key: opts.key,
-        headers: opts.headers,
+        headers,
         data: msg.data,
       };
 
@@ -645,7 +664,13 @@ describe("bridgeBusToAdapter", () => {
     await bus.publish(
       lilacEventTypes.EvtAgentOutputDeltaText,
       { delta: "hello" },
-      { headers: { request_id: requestId } },
+      {
+        headers: {
+          request_id: requestId,
+          session_id: "chan",
+          request_client: "discord",
+        },
+      },
     );
 
     const bridge = await bridgeBusToAdapter({
@@ -2674,7 +2699,7 @@ describe("bridgeBusToAdapter", () => {
       await bus.publish(
         lilacEventTypes.EvtAgentOutputResponseText,
         { finalText: "" },
-        { headers: { request_id: requestId } },
+        { headers: { request_id: requestId, session_id: sessionId, request_client: platform } },
       );
 
       expect(adapter.stream?.finished).toBe(shouldFinish);
@@ -2730,7 +2755,7 @@ describe("bridgeBusToAdapter", () => {
       await bus.publish(
         lilacEventTypes.EvtAgentOutputResponseText,
         { finalText: "" },
-        { headers: { request_id: requestId } },
+        { headers: { request_id: requestId, session_id: sessionId, request_client: "github" } },
       );
 
       expect(adapter.stream?.finished).toBe(true);
@@ -2784,7 +2809,7 @@ describe("bridgeBusToAdapter", () => {
       await bus.publish(
         lilacEventTypes.EvtAgentOutputResponseText,
         { finalText: "" },
-        { headers: { request_id: requestId } },
+        { headers: { request_id: requestId, session_id: sessionId, request_client: platform } },
       );
 
       expect(adapter.stream?.finished).toBe(shouldFinish);
@@ -2821,7 +2846,7 @@ describe("bridgeBusToAdapter", () => {
     await bus.publish(
       lilacEventTypes.EvtAgentOutputResponseText,
       { finalText: "" },
-      { headers: { request_id: requestId } },
+      { headers: { request_id: requestId, session_id: sessionId, request_client: "github" } },
     );
 
     expect(adapter.stream?.finished).toBe(true);
@@ -3902,6 +3927,203 @@ describe("bridgeBusToAdapter", () => {
     );
     expect(adapter.streams[1]?.aborted).toBe("cancel");
 
+    await bridge.stop();
+  });
+
+  it("dead-letters relay mutations with conflicting active correlation", async () => {
+    const deliveries: DeliveryObservation[] = [];
+    const bus = createLilacBus(createInMemoryRawBus((delivery) => deliveries.push(delivery)));
+    const adapter = new FakeAdapter();
+    const requestId = "discord:chan:correlated";
+    const bridge = await bridgeBusToAdapter({
+      adapter,
+      bus,
+      platform: "discord",
+      subscriptionId: "active-correlation",
+      idleTimeoutMs: 10_000,
+    });
+    await bus.publish(
+      lilacEventTypes.EvtRequestReply,
+      {},
+      {
+        headers: {
+          request_id: requestId,
+          session_id: "chan",
+          request_client: "discord",
+        },
+      },
+    );
+    await bus.publish(
+      lilacEventTypes.CmdSurfaceOutputReanchor,
+      { inheritReplyTo: true },
+      {
+        headers: {
+          request_id: requestId,
+          session_id: "other",
+          request_client: "discord",
+        },
+      },
+    );
+    await bus.publish(
+      lilacEventTypes.CmdRequestMessage,
+      { queue: "interrupt", messages: [], raw: { cancel: true } },
+      {
+        headers: {
+          request_id: requestId,
+          session_id: "other",
+          request_client: "discord",
+        },
+      },
+    );
+    await bus.publish(
+      lilacEventTypes.EvtRequestLifecycleChanged,
+      { state: "failed" },
+      {
+        headers: {
+          request_id: requestId,
+          session_id: "chan",
+          request_client: "github",
+        },
+      },
+    );
+    await bus.publish(
+      lilacEventTypes.EvtAgentOutputDeltaText,
+      { delta: "must not render" },
+      {
+        headers: {
+          request_id: requestId,
+          session_id: "other",
+          request_client: "discord",
+        },
+      },
+    );
+    await bus.publish(
+      lilacEventTypes.CmdRequestMessage,
+      { queue: "interrupt", messages: [], raw: { cancel: true } },
+      { headers: { request_id: requestId, request_client: "discord" } },
+    );
+    await bus.publish(
+      lilacEventTypes.CmdSurfaceOutputReanchor,
+      { inheritReplyTo: true },
+      { headers: { request_id: requestId, session_id: "chan" } },
+    );
+    await bus.publish(
+      lilacEventTypes.EvtRequestLifecycleChanged,
+      { state: "failed" },
+      { headers: { request_id: requestId, request_client: "discord" } },
+    );
+
+    expect(deliveries.slice(-7).map((delivery) => delivery.disposition)).toEqual([
+      "dead-letter",
+      "dead-letter",
+      "dead-letter",
+      "dead-letter",
+      "dead-letter",
+      "dead-letter",
+      "dead-letter",
+    ]);
+    expect(adapter.streams).toHaveLength(1);
+    expect(adapter.stream?.aborted).toBeUndefined();
+    expect(adapter.stream?.parts).toEqual([]);
+    expect(adapter.typingStops).toBe(0);
+    await bridge.stop();
+  });
+
+  it("preserves terminal-before-relay platform and session correlation", async () => {
+    const deliveries: DeliveryObservation[] = [];
+    const bus = createLilacBus(createInMemoryRawBus((delivery) => deliveries.push(delivery)));
+    const adapter = new FakeAdapter();
+    const requestId = "discord:chan:terminal-first";
+    const bridge = await bridgeBusToAdapter({
+      adapter,
+      bus,
+      platform: "discord",
+      subscriptionId: "terminal-first-correlation",
+      idleTimeoutMs: 10_000,
+    });
+    await bus.publish(
+      lilacEventTypes.EvtRequestLifecycleChanged,
+      { state: "resolved" },
+      {
+        headers: {
+          request_id: requestId,
+          session_id: "chan",
+          request_client: "discord",
+        },
+      },
+    );
+    await bus.publish(
+      lilacEventTypes.EvtRequestReply,
+      {},
+      {
+        headers: {
+          request_id: requestId,
+          session_id: "other",
+          request_client: "discord",
+        },
+      },
+    );
+    expect(deliveries.at(-1)?.disposition).toBe("dead-letter");
+    expect(adapter.streams).toHaveLength(0);
+
+    await bus.publish(
+      lilacEventTypes.EvtRequestReply,
+      {},
+      {
+        headers: {
+          request_id: requestId,
+          session_id: "chan",
+          request_client: "discord",
+        },
+      },
+    );
+    expect(adapter.streams).toHaveLength(1);
+    expect(adapter.typingStarts).toHaveLength(1);
+    expect(adapter.typingStops).toBe(1);
+    await bridge.stop();
+  });
+
+  it("dead-letters incomplete headers only after an output becomes surface-bound", async () => {
+    const deliveries: DeliveryObservation[] = [];
+    const bus = createLilacBus(
+      createInMemoryRawBus((delivery) => deliveries.push(delivery), undefined, false),
+    );
+    const adapter = new FakeAdapter();
+    const requestId = "discord:chan:missing-output-correlation";
+    const bridge = await bridgeBusToAdapter({
+      adapter,
+      bus,
+      platform: "discord",
+      subscriptionId: "missing-output-correlation",
+      idleTimeoutMs: 10_000,
+    });
+    await bus.publish(
+      lilacEventTypes.EvtAgentOutputDeltaText,
+      { delta: "not surface-bound yet" },
+      { headers: { request_id: requestId } },
+    );
+    expect(deliveries).toEqual([]);
+
+    await bus.publish(
+      lilacEventTypes.EvtRequestReply,
+      {},
+      {
+        headers: {
+          request_id: requestId,
+          session_id: "chan",
+          request_client: "discord",
+        },
+      },
+    );
+    await bus.publish(
+      lilacEventTypes.EvtAgentOutputResponseText,
+      { finalText: "must not finalize" },
+      { headers: { request_id: requestId } },
+    );
+    expect(deliveries.at(-1)?.disposition).toBe("dead-letter");
+    expect(adapter.stream?.parts).toEqual([]);
+    expect(adapter.stream?.finished).toBe(false);
+    expect(adapter.typingStops).toBe(0);
     await bridge.stop();
   });
 

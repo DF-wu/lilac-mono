@@ -611,12 +611,27 @@ unsupported operation retries indefinitely.
 - Define unavailable descriptor/relay restoration as an explicit typed outcome.
 - Preflight complete snapshots and add apply/rollback restore-attempt handles.
 - Roll back partial relay application before agent restore; Panic if rollback leaves atomicity unknown.
+- Version the graceful snapshot codec to persist and restore parked queued-cancellation and
+  buffered-absorption attempts, including their PEL delivery identity, reserved queue entries,
+  `controlApplied` state, and per-entry lifecycle-publication progress. Restore those reservations before
+  any queue drain, or fail-safe exclude the affected entries until the corresponding PEL event recovers, so
+  process replacement cannot run cancelled work, repeat applied control, or duplicate an accepted partial
+  lifecycle publication.
+- Persist and restore the normalized authenticated or delegated identity plus verified-ingress and safety
+  correlation required by queued and restored agents. Decode it through a versioned codec, keep legacy
+  snapshots without sufficient proof restricted instead of synthesizing trust, and re-admit the restored
+  identity into the request cache/registry before any Level-2 capability use.
 - Consume snapshots explicitly only after successful restoration; retain unavailable snapshots.
 - Define explicit absent, empty, stale, malformed, corrupt, unsupported, and SQLite-failure dispositions.
 - Preserve transcript and Discord primary-continuation compatibility.
+- Add current-version and legacy snapshot/restore fixtures and process-replacement tests for parked queue
+  mutation attempts, `controlApplied`, partial lifecycle publication, normalized/delegated identity,
+  verified ingress, restricted legacy fallback, cache/registry re-admission, and pre-Level-2 restore order.
 
 Exit criteria: current, legacy, malformed, corrupt, unsupported-version, and unavailable-target cases have
-explicit Discord/GitHub fixtures and policies.
+explicit Discord/GitHub fixtures and policies; process replacement preserves parked queue-mutation progress
+without duplicate effects and restores only identity and safety authority established by decoded durable
+proof before Level-2 use.
 
 ### Stage 8: Shared Contract Harness And Documentation
 

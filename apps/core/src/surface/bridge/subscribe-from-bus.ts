@@ -52,7 +52,15 @@ class CmdRequestCancelFailed extends TaggedError("CmdRequestCancelFailed")<{
   readonly message: string;
 }> {}
 
-type CmdRequestDeliveryError = CmdRequestRequiredHeadersMissing | CmdRequestCancelFailed;
+class RelayEventCorrelationInvalid extends TaggedError("RelayEventCorrelationInvalid")<{
+  readonly messageType: string;
+  readonly message: string;
+}> {}
+
+type CmdRequestDeliveryError =
+  | CmdRequestRequiredHeadersMissing
+  | CmdRequestCancelFailed
+  | RelayEventCorrelationInvalid;
 
 function applyCmdRequestDeliveryPolicy(error: CmdRequestDeliveryError): DeliveryDisposition {
   switch (error._tag) {
@@ -60,6 +68,8 @@ function applyCmdRequestDeliveryPolicy(error: CmdRequestDeliveryError): Delivery
       return "park-pending";
     case "CmdRequestCancelFailed":
       return "commit";
+    case "RelayEventCorrelationInvalid":
+      return "dead-letter";
   }
 }
 
@@ -80,7 +90,8 @@ class CmdSurfaceReplyTargetInvalid extends TaggedError("CmdSurfaceReplyTargetInv
 type CmdSurfaceDeliveryError =
   | CmdSurfaceRequiredHeadersMissing
   | CmdSurfaceReanchorFailed
-  | CmdSurfaceReplyTargetInvalid;
+  | CmdSurfaceReplyTargetInvalid
+  | RelayEventCorrelationInvalid;
 
 function applyCmdSurfaceDeliveryPolicy(error: CmdSurfaceDeliveryError): DeliveryDisposition {
   switch (error._tag) {
@@ -89,6 +100,8 @@ function applyCmdSurfaceDeliveryPolicy(error: CmdSurfaceDeliveryError): Delivery
     case "CmdSurfaceReanchorFailed":
     case "CmdSurfaceReplyTargetInvalid":
       return "commit";
+    case "RelayEventCorrelationInvalid":
+      return "dead-letter";
   }
 }
 
@@ -109,7 +122,8 @@ class EvtRequestReplyTargetInvalid extends TaggedError("EvtRequestReplyTargetInv
 type EvtRequestDeliveryError =
   | EvtRequestRequiredHeadersMissing
   | EvtRequestStopTypingFailed
-  | EvtRequestReplyTargetInvalid;
+  | EvtRequestReplyTargetInvalid
+  | RelayEventCorrelationInvalid;
 
 function applyEvtRequestDeliveryPolicy(error: EvtRequestDeliveryError): DeliveryDisposition {
   switch (error._tag) {
@@ -119,6 +133,8 @@ function applyEvtRequestDeliveryPolicy(error: EvtRequestDeliveryError): Delivery
       return "dead-letter";
     case "EvtRequestStopTypingFailed":
       return "commit";
+    case "RelayEventCorrelationInvalid":
+      return "dead-letter";
   }
 }
 
@@ -132,7 +148,7 @@ class OutReqFinishFailed extends TaggedError("OutReqFinishFailed")<{
   readonly message: string;
 }> {}
 
-type OutReqDeliveryError = OutReqPushFailed | OutReqFinishFailed;
+type OutReqDeliveryError = OutReqPushFailed | OutReqFinishFailed | RelayEventCorrelationInvalid;
 
 type BusToAdapterEffect =
   | "abort-output"
@@ -165,6 +181,8 @@ function applyOutReqDeliveryPolicy(error: OutReqDeliveryError): DeliveryDisposit
     case "OutReqPushFailed":
     case "OutReqFinishFailed":
       return "stop";
+    case "RelayEventCorrelationInvalid":
+      return "dead-letter";
   }
 }
 
@@ -387,7 +405,7 @@ function appendReasoningDetail(base: string, delta: string): string {
 type ActiveRelay = {
   requestId: string;
   sessionId: string;
-  requestClient?: string;
+  platform: RegisteredSurfacePlatform;
   stopTyping(): Promise<void>;
   stop(): Promise<void>;
   cancel(): Promise<void>;
@@ -473,18 +491,34 @@ export async function bridgeBusToAdapter<P extends RegisteredSurfacePlatform>(pa
   const policy = requireSurfaceRelayPolicyRefs(platform, params.policy);
 
   const activeRelays = new Map<string, ActiveRelay>();
-  const terminalLifecycleByRequestId = new Map<string, number>();
+  const terminalLifecycleByRequestId = new Map<
+    string,
+    {
+      readonly platform: RegisteredSurfacePlatform;
+      readonly sessionId: string;
+      readonly at: number;
+    }
+  >();
   const TERMINAL_LIFECYCLE_TTL_MS = 5 * 60 * 1000;
 
   const pruneTerminalLifecycleCache = (nowMs: number) => {
-    for (const [rid, ts] of terminalLifecycleByRequestId) {
-      if (nowMs - ts > TERMINAL_LIFECYCLE_TTL_MS) {
+    for (const [rid, terminal] of terminalLifecycleByRequestId) {
+      if (nowMs - terminal.at > TERMINAL_LIFECYCLE_TTL_MS) {
         terminalLifecycleByRequestId.delete(rid);
       }
     }
   };
   let draining = false;
   let ingressStopped = false;
+  const correlationError = (messageType: string) =>
+    Result.err(
+      new RelayEventCorrelationInvalid({
+        messageType,
+        message: "Relay event platform or session does not match its request correlation",
+      }),
+    );
+  const matchesRelay = (relay: ActiveRelay, eventPlatform: string, eventSessionId: string) =>
+    relay.platform === eventPlatform && relay.sessionId === eventSessionId;
 
   const cmdRequestStarted = await bus.subscribeTopic(
     "cmd.request",
@@ -505,6 +539,7 @@ export async function bridgeBusToAdapter<P extends RegisteredSurfacePlatform>(pa
       const requestClient = msg.headers?.request_client;
 
       if (!requestId || !sessionId || !requestClient) {
+        if (requestId && activeRelays.has(requestId)) return correlationError(msg.type);
         logger.warn("relay.event.rejected", {
           requestId,
           sessionId,
@@ -521,6 +556,8 @@ export async function bridgeBusToAdapter<P extends RegisteredSurfacePlatform>(pa
       }
 
       if (requestClient !== platform) {
+        const relay = activeRelays.get(requestId);
+        if (relay) return correlationError(msg.type);
         logger.debug("relay.event.ignored", {
           requestId,
           sessionId,
@@ -549,6 +586,7 @@ export async function bridgeBusToAdapter<P extends RegisteredSurfacePlatform>(pa
         });
         return Result.ok(undefined);
       }
+      if (!matchesRelay(relay, requestClient, sessionId)) return correlationError(msg.type);
 
       const cancelled = await captureBusToAdapterEffect("cancel-active-relay", () =>
         relay.cancel(),
@@ -588,6 +626,7 @@ export async function bridgeBusToAdapter<P extends RegisteredSurfacePlatform>(pa
       const sessionId = msg.headers?.session_id;
       const requestClient = msg.headers?.request_client;
       if (!requestId || !sessionId || !requestClient) {
+        if (requestId && activeRelays.has(requestId)) return correlationError(msg.type);
         return Result.err(
           new CmdSurfaceRequiredHeadersMissing({
             message:
@@ -597,6 +636,8 @@ export async function bridgeBusToAdapter<P extends RegisteredSurfacePlatform>(pa
       }
 
       if (requestClient !== platform) {
+        const relay = activeRelays.get(requestId);
+        if (relay) return correlationError(msg.type);
         logger.debug("relay.event.ignored", {
           requestId,
           sessionId,
@@ -619,6 +660,7 @@ export async function bridgeBusToAdapter<P extends RegisteredSurfacePlatform>(pa
         });
         return Result.ok(undefined);
       }
+      if (!matchesRelay(relay, requestClient, sessionId)) return correlationError(msg.type);
 
       let replyTo: MsgRef | undefined;
       if (msg.data.replyTo) {
@@ -694,6 +736,12 @@ export async function bridgeBusToAdapter<P extends RegisteredSurfacePlatform>(pa
       const routerSessionMode = parseRouterSessionMode(msg.headers?.router_session_mode);
 
       if (!requestId || !sessionId || !requestClient) {
+        if (
+          requestId &&
+          (activeRelays.has(requestId) || terminalLifecycleByRequestId.has(requestId))
+        ) {
+          return correlationError(msg.type);
+        }
         // Do not ack malformed messages: they need investigation.
         logger.error("relay.event.rejected", {
           requestId,
@@ -711,6 +759,9 @@ export async function bridgeBusToAdapter<P extends RegisteredSurfacePlatform>(pa
       }
 
       if (requestClient !== platform) {
+        if (activeRelays.has(requestId) || terminalLifecycleByRequestId.has(requestId)) {
+          return correlationError(msg.type);
+        }
         logger.debug("relay.event.ignored", {
           requestId,
           sessionId,
@@ -724,13 +775,29 @@ export async function bridgeBusToAdapter<P extends RegisteredSurfacePlatform>(pa
 
       pruneTerminalLifecycleCache(Date.now());
 
+      const activeRelay = activeRelays.get(requestId);
+      if (activeRelay && !matchesRelay(activeRelay, requestClient, sessionId)) {
+        return correlationError(msg.type);
+      }
+      const terminalLifecycle = terminalLifecycleByRequestId.get(requestId);
+      if (
+        terminalLifecycle &&
+        (terminalLifecycle.platform !== requestClient || terminalLifecycle.sessionId !== sessionId)
+      ) {
+        return correlationError(msg.type);
+      }
+
       if (msg.type === lilacEventTypes.EvtRequestLifecycleChanged) {
         if (
           msg.data.state === "resolved" ||
           msg.data.state === "failed" ||
           msg.data.state === "cancelled"
         ) {
-          terminalLifecycleByRequestId.set(requestId, Date.now());
+          terminalLifecycleByRequestId.set(requestId, {
+            platform,
+            sessionId,
+            at: Date.now(),
+          });
 
           const relay = activeRelays.get(requestId);
           if (relay) {
@@ -1403,6 +1470,13 @@ export async function bridgeBusToAdapter<P extends RegisteredSurfacePlatform>(pa
         batch: { maxWaitMs: 250 },
       },
       async (outMsg, outCtx): Promise<ResultType<void, OutReqDeliveryError>> => {
+        if (
+          outMsg.headers?.request_id !== requestId ||
+          outMsg.headers?.session_id !== sessionId ||
+          outMsg.headers?.request_client !== input.platform
+        ) {
+          return correlationError(outMsg.type);
+        }
         if (stopped) {
           lastOutCursor = outCtx.cursor;
           return Result.ok(undefined);
@@ -1874,7 +1948,7 @@ export async function bridgeBusToAdapter<P extends RegisteredSurfacePlatform>(pa
     return {
       requestId,
       sessionId,
-      requestClient: input.requestClient,
+      platform: input.platform,
       stopTyping,
       stop: relayStop,
       cancel: async () => {

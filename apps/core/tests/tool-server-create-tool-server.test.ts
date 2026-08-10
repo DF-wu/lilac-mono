@@ -15,14 +15,71 @@ import { createLogger, parseCoreConfigV2ToUniversal } from "@stanley2058/lilac-u
 import { Panic, Result, TaggedError } from "better-result";
 
 import {
-  createToolServer,
+  createToolServer as createToolServerImpl,
+  type ToolServerOptions,
   type ToolServerHealthSnapshot,
 } from "../src/tool-server/create-tool-server";
 import type { ServerTool } from "../src/tool-server/types";
 import { RequestControlAuthority } from "../src/tool-server/request-control-authority";
 import { parseToolInput } from "../src/tool-server/validation-error-message";
+import type { AuthenticatedRequestProjection } from "../src/surface/authenticated-request";
 
 const originalMemoryUsage = process.memoryUsage;
+const TEST_OPERATOR_TOKEN = "tool-server-test-operator";
+
+function createToolServer(options: ToolServerOptions) {
+  const hasExplicitAuthority =
+    options.authorizeControlRequest !== undefined ||
+    options.requestMessageCache !== undefined ||
+    options.getConfig !== undefined ||
+    options.resolveServerSafetyMode !== undefined ||
+    options.operatorTokenSha256 !== undefined;
+  if (hasExplicitAuthority) return createToolServerImpl(options);
+  const server = createToolServerImpl({
+    ...options,
+    canonicalWorkspaceRoot: options.canonicalWorkspaceRoot ?? "/workspace",
+    operatorTokenSha256: createHash("sha256").update(TEST_OPERATOR_TOKEN).digest("hex"),
+  });
+  const handle = server.app.handle.bind(server.app);
+  server.app.handle = (request: Request) => {
+    const hasLilacHeader = Array.from(request.headers.keys()).some((key) =>
+      key.startsWith("x-lilac-"),
+    );
+    if (hasLilacHeader) return handle(request);
+    const headers = new Headers(request.headers);
+    headers.set("x-lilac-operator-token", TEST_OPERATOR_TOKEN);
+    return handle(new Request(request, { headers }));
+  };
+  return server;
+}
+
+function discordRequestProjection(input: {
+  readonly requestId: string;
+  readonly sessionId: string;
+  readonly userId?: string;
+  readonly verifiedIngress?: boolean;
+}): AuthenticatedRequestProjection {
+  const sessionRef = { platform: "discord" as const, channelId: input.sessionId };
+  return {
+    requestId: input.requestId,
+    requestClient: "discord",
+    sessionId: input.sessionId,
+    source: "external",
+    platform: "discord",
+    sessionRef,
+    ...(input.userId
+      ? {
+          authenticatedOrigin: {
+            platform: "discord" as const,
+            userId: input.userId,
+            sessionRef,
+          },
+        }
+      : {}),
+    authenticationMetadataKind: input.userId ? "origin" : "absent",
+    verifiedIngress: input.verifiedIngress ?? input.userId !== undefined,
+  };
+}
 
 type BuildEnvSnapshot = {
   LILAC_BUILD_VERSION: string | undefined;
@@ -187,14 +244,20 @@ describe("createToolServer", () => {
     const authority = new RequestControlAuthority();
     const capabilities = new Map<string, string>();
     for (const requestId of ["sub:direct", "wfr:workflow"] as const) {
+      const workflowChild = requestId === "wfr:workflow";
       capabilities.set(
         requestId,
         authority.issue({
           kind: "primary",
           requestId,
-          sessionId: `session:${requestId}`,
-          platform: "unknown",
+          sessionId: workflowChild ? "workflow-child-session" : "origin-session",
+          platform: workflowChild ? "unknown" : "discord",
           principal: { platform: "discord", userId: "user-1" },
+          authenticatedOrigin: {
+            platform: "discord",
+            userId: "user-1",
+            sessionRef: { platform: "discord", channelId: "origin-session" },
+          },
           allowedCallables: null,
           profile: "general",
           canonicalCwd: "/selected/child/cwd",
@@ -224,6 +287,29 @@ describe("createToolServer", () => {
     };
     const server = createToolServer({
       tools: [tool],
+      requestMessageCache: {
+        get: () => [{ role: "user", content: "cached" }],
+        getOrigin: (requestId) =>
+          requestId === "wfr:workflow"
+            ? {
+                requestId,
+                requestClient: "unknown",
+                sessionId: "workflow-child-session",
+                source: "internal-delegated",
+                authenticatedOrigin: {
+                  platform: "discord",
+                  userId: "user-1",
+                  sessionRef: { platform: "discord", channelId: "origin-session" },
+                },
+                authenticationMetadataKind: "origin",
+                verifiedIngress: false,
+              }
+            : discordRequestProjection({
+                requestId,
+                sessionId: "origin-session",
+                userId: "user-1",
+              }),
+      },
       authorizeControlRequest: (input) => authority.authorize(input),
     });
     await server.init();
@@ -231,10 +317,11 @@ describe("createToolServer", () => {
       for (const requestId of ["sub:direct", "wfr:workflow"] as const) {
         const capability = capabilities.get(requestId);
         if (!capability) throw new Error(`missing test capability for ${requestId}`);
+        const workflowChild = requestId === "wfr:workflow";
         const headers = {
           "x-lilac-request-id": requestId,
-          "x-lilac-session-id": `session:${requestId}`,
-          "x-lilac-request-client": "unknown",
+          "x-lilac-session-id": workflowChild ? "workflow-child-session" : "origin-session",
+          "x-lilac-request-client": workflowChild ? "unknown" : "discord",
           "x-lilac-cwd": "/selected/child/cwd",
           "x-lilac-control-capability": capability,
         };
@@ -254,21 +341,39 @@ describe("createToolServer", () => {
         expect(await call.json()).toMatchObject({ isError: false, output: { ok: true } });
       }
       expect(
-        contexts.map(({ cwd, subagentProfile, controlPolicy }) => ({
-          cwd,
-          subagentProfile,
-          controlPolicy,
-        })),
+        contexts.map(
+          ({
+            cwd,
+            subagentProfile,
+            controlPolicy,
+            authenticatedPrincipal,
+            authenticatedPrincipalSessionId,
+            safetyMode,
+          }) => ({
+            cwd,
+            subagentProfile,
+            controlPolicy,
+            authenticatedPrincipal,
+            authenticatedPrincipalSessionId,
+            safetyMode,
+          }),
+        ),
       ).toEqual([
         {
           cwd: "/selected/child/cwd",
           subagentProfile: "general",
           controlPolicy: { kind: "primary", allowedCallables: null },
+          authenticatedPrincipal: { platform: "discord", userId: "user-1" },
+          authenticatedPrincipalSessionId: "origin-session",
+          safetyMode: "trusted",
         },
         {
           cwd: "/selected/child/cwd",
           subagentProfile: "general",
           controlPolicy: { kind: "primary", allowedCallables: null },
+          authenticatedPrincipal: { platform: "discord", userId: "user-1" },
+          authenticatedPrincipalSessionId: "origin-session",
+          safetyMode: "trusted",
         },
       ]);
     } finally {
@@ -282,8 +387,9 @@ describe("createToolServer", () => {
       kind: "primary",
       requestId: "native-profile-capability",
       sessionId: "native-profile-session",
-      platform: "unknown",
+      platform: "discord",
       principal: null,
+      authenticatedOrigin: null,
       allowedCallables: null,
       profile: "general",
       canonicalCwd: "/workspace",
@@ -343,13 +449,18 @@ describe("createToolServer", () => {
     const server = createToolServer({
       pluginManager,
       getConfig: async () => config,
+      requestMessageCache: {
+        get: () => [{ role: "user", content: "cached" }],
+        getOrigin: (requestId) =>
+          discordRequestProjection({ requestId, sessionId: "native-profile-session" }),
+      },
       authorizeControlRequest: (input) => authority.authorize(input),
     });
     await server.init();
     const headers = {
       "x-lilac-request-id": "native-profile-capability",
       "x-lilac-session-id": "native-profile-session",
-      "x-lilac-request-client": "unknown",
+      "x-lilac-request-client": "discord",
       "x-lilac-cwd": "/workspace",
       "x-lilac-control-capability": capability,
     };
@@ -397,6 +508,11 @@ describe("createToolServer", () => {
     const server = createToolServer({
       tools: [tool],
       canonicalWorkspaceRoot: "/workspace",
+      requestMessageCache: {
+        get: () => [{ role: "user", content: "cached" }],
+        getOrigin: (requestId) =>
+          discordRequestProjection({ requestId, sessionId: "channel-1", userId: "user-1" }),
+      },
       authorizeControlRequest: (input) =>
         input.token === "unguessable-primary-token" &&
         input.requestId === "request-1" &&
@@ -405,6 +521,11 @@ describe("createToolServer", () => {
           ? {
               kind: "primary" as const,
               principal: { platform: "discord" as const, userId: "user-1" },
+              authenticatedOrigin: {
+                platform: "discord" as const,
+                userId: "user-1",
+                sessionRef: { platform: "discord" as const, channelId: "channel-1" },
+              },
               allowedCallables: null,
               profile: "primary" as const,
               canonicalCwd: "/workspace",
@@ -451,6 +572,291 @@ describe("createToolServer", () => {
           )
         ).status,
       ).toBe(500);
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it("rejects a control capability whose principal conflicts with the cached origin", async () => {
+    const server = createToolServer({
+      tools: [],
+      requestMessageCache: {
+        get: () => [{ role: "user", content: "cached" }],
+        getOrigin: (requestId) => ({
+          requestId,
+          requestClient: "discord",
+          sessionId: "channel-1",
+          source: "external",
+          platform: "discord",
+          sessionRef: { platform: "discord", channelId: "channel-1" },
+          authenticatedOrigin: {
+            platform: "discord",
+            userId: "user-1",
+            sessionRef: { platform: "discord", channelId: "channel-1" },
+          },
+          authenticationMetadataKind: "origin",
+          verifiedIngress: true,
+        }),
+      },
+      authorizeControlRequest: () => ({
+        kind: "primary",
+        principal: { platform: "discord", userId: "user-2" },
+        authenticatedOrigin: {
+          platform: "discord",
+          userId: "user-2",
+          sessionRef: { platform: "discord", channelId: "channel-1" },
+        },
+        allowedCallables: null,
+        profile: "primary",
+        canonicalCwd: "/workspace",
+        safetyMode: "trusted",
+      }),
+    });
+    await server.init();
+    try {
+      const response = await server.app.handle(
+        new Request("http://localhost/list", {
+          headers: {
+            "x-lilac-request-id": "request-1",
+            "x-lilac-session-id": "channel-1",
+            "x-lilac-request-client": "discord",
+            "x-lilac-cwd": "/workspace",
+            "x-lilac-control-capability": "capability",
+          },
+        }),
+      );
+      expect(response.status).toBe(500);
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it("rejects primary capabilities after their cached projection is missing or expired", async () => {
+    const authority = new RequestControlAuthority();
+    const capability = authority.issue({
+      kind: "primary",
+      requestId: "expired-cache-request",
+      sessionId: "channel-1",
+      platform: "discord",
+      principal: { platform: "discord", userId: "user-1" },
+      authenticatedOrigin: {
+        platform: "discord",
+        userId: "user-1",
+        sessionRef: { platform: "discord", channelId: "channel-1" },
+      },
+      allowedCallables: null,
+      profile: "primary",
+      canonicalCwd: "/workspace",
+      safetyMode: "trusted",
+      expiresAt: Date.now() + 60_000,
+    });
+    const server = createToolServer({
+      tools: [],
+      requestMessageCache: { get: () => undefined, getOrigin: () => undefined },
+      authorizeControlRequest: (input) => authority.authorize(input),
+    });
+    await server.init();
+    try {
+      const response = await server.app.handle(
+        new Request("http://localhost/list", {
+          headers: {
+            "x-lilac-request-id": "expired-cache-request",
+            "x-lilac-session-id": "channel-1",
+            "x-lilac-request-client": "discord",
+            "x-lilac-cwd": "/workspace",
+            "x-lilac-control-capability": capability,
+          },
+        }),
+      );
+      expect(response.status).toBe(500);
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it("keeps standalone non-operator requests restricted", async () => {
+    const tool: ServerTool = {
+      id: "standalone-restricted",
+      async init() {},
+      async destroy() {},
+      async list() {
+        return [
+          {
+            callableId: "workflow.standalone-restricted",
+            name: "restricted",
+            description: "restricted",
+            shortInput: [],
+          },
+        ];
+      },
+      async call() {
+        return { ok: true };
+      },
+    };
+    const server = createToolServerImpl({ tools: [tool] });
+    await server.init();
+    try {
+      const listed = await server.app.handle(new Request("http://localhost/list"));
+      expect(await listed.json()).toEqual({ tools: [] });
+      const called = await server.app.handle(
+        new Request("http://localhost/call", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ callableId: "workflow.standalone-restricted", input: {} }),
+        }),
+      );
+      expect(await called.json()).toMatchObject({
+        isError: true,
+        output: expect.stringContaining("restricted public-session mode"),
+      });
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it("applies verified GitHub and validated Discord safety precedence without inventing principals", async () => {
+    const contexts: RequestContext[] = [];
+    let discordPolicyCalls = 0;
+    const tool: ServerTool = {
+      id: "safety-precedence",
+      async init() {},
+      async destroy() {},
+      async list() {
+        return [
+          {
+            callableId: "workflow.safety-precedence",
+            name: "safety",
+            description: "safety",
+            shortInput: [],
+          },
+        ];
+      },
+      async call(_callableId, _input, options) {
+        if (options?.context) contexts.push(options.context);
+        return { ok: true };
+      },
+    };
+    const server = createToolServer({
+      tools: [tool],
+      requestMessageCache: {
+        get: () => [{ role: "user", content: "cached" }],
+        getOrigin: (requestId) => {
+          const github = requestId === "github-request";
+          if (github) {
+            return {
+              requestId,
+              requestClient: "github",
+              sessionId: "owner/repo#1",
+              source: "external",
+              platform: "github",
+              sessionRef: { platform: "github", channelId: "owner/repo#1" },
+              authenticationMetadataKind: "github-trigger",
+              verifiedIngress: true,
+            };
+          }
+          return {
+            requestId,
+            requestClient: "discord",
+            sessionId: "channel-1",
+            source: "external",
+            platform: "discord",
+            sessionRef: { platform: "discord", channelId: "channel-1" },
+            authenticationMetadataKind: "origin",
+            verifiedIngress: true,
+          };
+        },
+      },
+      resolveServerSafetyMode: async () => {
+        discordPolicyCalls += 1;
+        return "trusted";
+      },
+    });
+    await server.init();
+    try {
+      for (const [requestId, sessionId, requestClient] of [
+        ["github-request", "owner/repo#1", "github"],
+        ["discord-request", "channel-1", "discord"],
+      ] as const) {
+        const response = await server.app.handle(
+          new Request("http://localhost/call", {
+            method: "POST",
+            headers: {
+              "content-type": "application/json",
+              "x-lilac-request-id": requestId,
+              "x-lilac-session-id": sessionId,
+              "x-lilac-request-client": requestClient,
+            },
+            body: JSON.stringify({ callableId: "workflow.safety-precedence", input: {} }),
+          }),
+        );
+        expect(await response.json()).toMatchObject({ isError: false });
+      }
+      expect(discordPolicyCalls).toBe(1);
+      expect(contexts.map((context) => context.authenticatedPrincipal)).toEqual([
+        undefined,
+        undefined,
+      ]);
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it("keeps actor-only GitHub principals restricted without verified trigger metadata", async () => {
+    const contexts: RequestContext[] = [];
+    const tool: ServerTool = {
+      id: "github-actor-only",
+      async init() {},
+      async destroy() {},
+      async list() {
+        return [{ callableId: "fetch", name: "fetch", description: "fetch", shortInput: [] }];
+      },
+      async call(_callableId, _input, options) {
+        if (options?.context) contexts.push(options.context);
+        return { ok: true };
+      },
+    };
+    const server = createToolServer({
+      tools: [tool],
+      requestMessageCache: {
+        get: () => [{ role: "user", content: "cached" }],
+        getOrigin: (requestId) => ({
+          requestId,
+          requestClient: "github",
+          sessionId: "owner/repo#1",
+          source: "external",
+          platform: "github",
+          sessionRef: { platform: "github", channelId: "owner/repo#1" },
+          authenticatedOrigin: {
+            platform: "github",
+            userId: "octocat",
+            sessionRef: { platform: "github", channelId: "owner/repo#1" },
+          },
+          authenticationMetadataKind: "actor",
+          verifiedIngress: false,
+        }),
+      },
+    });
+    await server.init();
+    try {
+      const response = await server.app.handle(
+        new Request("http://localhost/call", {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            "x-lilac-request-id": "github-actor-only",
+            "x-lilac-session-id": "owner/repo#1",
+            "x-lilac-request-client": "github",
+          },
+          body: JSON.stringify({ callableId: "fetch", input: {} }),
+        }),
+      );
+      expect(await response.json()).toMatchObject({ isError: false });
+      expect(contexts[0]).toMatchObject({
+        safetyMode: "restricted",
+        serverOwnedRequest: false,
+        authenticatedPrincipal: { platform: "github", userId: "octocat" },
+        authenticatedPrincipalSessionId: "owner/repo#1",
+      });
     } finally {
       await server.stop();
     }
@@ -596,6 +1002,7 @@ describe("createToolServer", () => {
           ? {
               kind: "heartbeat" as const,
               principal: null,
+              authenticatedOrigin: null,
               allowedCallables: ["surface.messages.send"],
               profile: "primary" as const,
               canonicalCwd: "/canonical-workspace",
@@ -724,9 +1131,24 @@ describe("createToolServer", () => {
         },
         getOrigin: (requestId) =>
           requestId === "req:1"
-            ? { sessionId: "chan", platform: "discord", actorUserId: "user-1" }
+            ? {
+                requestId,
+                requestClient: "discord",
+                sessionId: "chan",
+                source: "external",
+                platform: "discord",
+                sessionRef: { platform: "discord", channelId: "chan" },
+                authenticatedOrigin: {
+                  platform: "discord",
+                  userId: "user-1",
+                  sessionRef: { platform: "discord", channelId: "chan" },
+                },
+                authenticationMetadataKind: "origin",
+                verifiedIngress: true,
+              }
             : undefined,
       },
+      resolveServerSafetyMode: async () => "trusted",
     });
 
     await server.init();
@@ -1145,7 +1567,21 @@ describe("createToolServer", () => {
           requestId === "request-1" ? [{ role: "user", content: "run workflow" }] : undefined,
         getOrigin: (requestId) =>
           requestId === "request-1"
-            ? { sessionId: "channel-1", platform: "discord", actorUserId: "user-1" }
+            ? {
+                requestId,
+                requestClient: "discord",
+                sessionId: "channel-1",
+                source: "external",
+                platform: "discord",
+                sessionRef: { platform: "discord", channelId: "channel-1" },
+                authenticatedOrigin: {
+                  platform: "discord",
+                  userId: "user-1",
+                  sessionRef: { platform: "discord", channelId: "channel-1" },
+                },
+                authenticationMetadataKind: "origin",
+                verifiedIngress: true,
+              }
             : undefined,
       },
       getConfig: async () => {

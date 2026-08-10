@@ -366,7 +366,6 @@ export const CORE_FINAL_BOUNDARY_IDENTITIES = [
   ["src/tool-server/create-tool-server.ts", "createToolServer.post.<callback@2>"],
   ["src/tool-server/create-tool-server.ts", "createToolServer.post.<callback@2>.then.<callback@1>"],
   ["src/tool-server/create-tool-server.ts", "toolServerTaggedErrorLogProjection"],
-  ["src/tool-server/request-message-cache.ts", "createRequestMessageCache.set"],
   ["src/tool-server/tools/surface.ts", "extractAttachmentMetaFromList"],
   ["src/tools/bash-impl.ts", "cleanupBashSpills"],
   ["src/tools/bash-impl.ts", "executeBash.runExecution"],

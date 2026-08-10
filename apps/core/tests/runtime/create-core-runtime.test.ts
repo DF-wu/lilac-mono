@@ -28,6 +28,7 @@ import {
   createCoreEventBusLogger,
   createCoreRuntimeCleanupSupervisor,
   createCoreRuntimeFatalReporter,
+  resolveRequestCapabilityIdentity,
   retainCoreResidualDiscordRequestRouter,
   selectCoreRuntimeStopPass,
   settleCoreResidualDiscordRequestRouterDone,
@@ -40,6 +41,56 @@ import {
   ResidualDiscordRequestRouterStopFailed,
   type ResidualDiscordRequestRouter,
 } from "../../src/surface/discord/discord-request-router";
+
+describe("delegated request capability identity", () => {
+  const authenticatedOrigin = {
+    platform: "discord" as const,
+    userId: "user-1",
+    sessionRef: { platform: "discord" as const, channelId: "channel-1" },
+  };
+
+  it("preserves resolved safety only for a matching internal unknown-client projection", () => {
+    expect(
+      resolveRequestCapabilityIdentity({
+        requestClient: "unknown",
+        sessionId: "workflow-child",
+        safetyMode: "trusted",
+        authenticatedOrigin,
+        cachedRequest: {
+          requestId: "child-1",
+          requestClient: "unknown",
+          sessionId: "workflow-child",
+          source: "internal-delegated",
+          authenticatedOrigin,
+          authenticationMetadataKind: "origin",
+          verifiedIngress: false,
+        },
+      }),
+    ).toEqual({
+      principal: { platform: "discord", userId: "user-1" },
+      authenticatedOrigin,
+      safetyMode: "trusted",
+    });
+  });
+
+  it("does not grant trust to a raw external unknown-client projection", () => {
+    expect(
+      resolveRequestCapabilityIdentity({
+        requestClient: "unknown",
+        sessionId: "workflow-child",
+        safetyMode: "trusted",
+        cachedRequest: {
+          requestId: "child-1",
+          requestClient: "unknown",
+          sessionId: "workflow-child",
+          source: "external",
+          authenticationMetadataKind: "absent",
+          verifiedIngress: false,
+        },
+      }),
+    ).toEqual({ principal: null, authenticatedOrigin: null, safetyMode: "restricted" });
+  });
+});
 
 describe("Core runtime startup", () => {
   it("returns the initialized custom command manager", () => {

@@ -1,54 +1,29 @@
-import {
-  type DeliveryDisposition,
-  type EventDeliveryDoneError,
-  type EventDeliveryStartFailed,
-  type EventDeliveryStopFailed,
-  lilacEventTypes,
-  type LilacBus,
-  type LilacMessageForTopic,
-} from "@stanley2058/lilac-event-bus";
-import { createLogger, isRecord } from "@stanley2058/lilac-utils";
+import { lilacEventTypes, type LilacMessageForTopic } from "@stanley2058/lilac-event-bus";
+import { createLogger } from "@stanley2058/lilac-utils";
 import { Result, TaggedError, type Result as ResultType } from "better-result";
-import { z } from "zod";
 
-import { parseRequestId } from "../surface/bridge/request-ids";
-import type { MsgRef } from "../surface/types";
+import {
+  AuthenticatedRequestIdentityConflict,
+  AuthenticatedRequestProjectionInvalid,
+  latchAuthenticatedRequest,
+  projectAuthenticatedRequest,
+  type AuthenticatedRequestProjection,
+} from "../surface/authenticated-request";
 
-export type AuthenticatedRequestOrigin = {
-  requestId: string;
-  sessionId: string;
-  platform: "discord" | "github";
-  messageRef: MsgRef | null;
-  actorUserId: string | null;
+export {
+  AuthenticatedRequestProjectionInvalid as RequestMessageCacheProjectionInvalid,
+  projectAuthenticatedRequest as resolveAuthenticatedOrigin,
 };
+export type AuthenticatedRequestOrigin = AuthenticatedRequestProjection;
 
-type CacheEntry = {
-  messages: readonly unknown[];
-  origin?: AuthenticatedRequestOrigin;
-  expiresAt: number;
-  updatedAt: number;
-};
-
-export type RequestMessageCacheOptions = {
-  bus: LilacBus;
-  /** Consumer group id for the subscription. */
-  subscriptionId?: string;
-  /** TTL for cached request messages. Default: 30 minutes. */
-  ttlMs?: number;
-  /** Max cached requests. Default: 256. */
-  maxEntries?: number;
-};
-
-export type RequestMessageCache = {
-  get(requestId: string): readonly unknown[] | undefined;
-  getOrigin(requestId: string): AuthenticatedRequestOrigin | undefined;
-  stop(): Promise<void>;
-};
-
-type RequestMessageCacheSubscription = {
-  readonly done: Promise<ResultType<void, EventDeliveryDoneError>>;
-  stop(): Promise<ResultType<void, EventDeliveryStopFailed>>;
-};
+export function projectCachedRequestMessageLineage(
+  existing: readonly unknown[],
+  incoming: readonly unknown[] = [],
+  maxMessages = Number.POSITIVE_INFINITY,
+): readonly unknown[] {
+  const merged = [...existing, ...incoming];
+  return merged.length > maxMessages ? merged.slice(merged.length - maxMessages) : merged;
+}
 
 export class RequestMessageCacheRequestIdMissing extends TaggedError(
   "RequestMessageCacheRequestIdMissing",
@@ -57,255 +32,140 @@ export class RequestMessageCacheRequestIdMissing extends TaggedError(
   readonly message: string;
 }> {}
 
-export class RequestMessageCacheProjectionInvalid extends TaggedError(
-  "RequestMessageCacheProjectionInvalid",
-)<{
-  readonly messageType: string;
+export class RequestIdentitySourceMissing extends TaggedError("RequestIdentitySourceMissing")<{
+  readonly requestId: string;
   readonly message: string;
 }> {}
 
-type RequestMessageCacheHandlerError =
+export class RequestIdentityAliasTargetOccupied extends TaggedError(
+  "RequestIdentityAliasTargetOccupied",
+)<{
+  readonly requestId: string;
+  readonly message: string;
+}> {}
+
+export type RequestMessageCacheAdmissionError =
   | RequestMessageCacheRequestIdMissing
-  | RequestMessageCacheProjectionInvalid;
+  | AuthenticatedRequestProjectionInvalid
+  | AuthenticatedRequestIdentityConflict;
 
-export function requestMessageCacheDeliveryDisposition(
-  error: RequestMessageCacheHandlerError,
-): DeliveryDisposition {
-  switch (error._tag) {
-    case "RequestMessageCacheRequestIdMissing":
-      return "park-pending";
-    case "RequestMessageCacheProjectionInvalid":
-      return "dead-letter";
-  }
-}
+export type RequestMessageCacheOwnerError =
+  | RequestIdentitySourceMissing
+  | RequestIdentityAliasTargetOccupied;
 
-function adaptRequestMessageCacheStartResultToHost(
-  started: ResultType<RequestMessageCacheSubscription, EventDeliveryStartFailed>,
-): RequestMessageCacheSubscription {
-  if (started.status === "ok") return started.value;
-  throw started.error;
-}
+export type RequestMessageCacheOwner = {
+  readonly requestId: string;
+  readonly ownerId: string;
+};
 
-function adaptRequestMessageCacheStopResultToHost(
-  stopped: ResultType<void, EventDeliveryStopFailed | EventDeliveryDoneError>,
-): void {
-  if (stopped.status === "ok") return;
-  throw stopped.error;
-}
+export type RequestMessageCacheAliasOwner = RequestMessageCacheOwner & {
+  readonly projection: AuthenticatedRequestProjection;
+  readonly selfAlias: boolean;
+};
 
-const requestRawSchema = z
-  .object({
-    authenticatedActor: z
-      .object({ platform: z.enum(["discord", "github"]), userId: z.string().min(1).optional() })
-      .optional(),
-    authenticatedOrigin: z
-      .object({
-        platform: z.enum(["discord", "github"]),
-        userId: z.string().min(1),
-        messageRef: z.object({
-          platform: z.enum(["discord", "github"]),
-          channelId: z.string().min(1),
-          messageId: z.string().min(1),
-        }),
-      })
-      .optional(),
-    github: z
-      .object({
-        trigger: z.union([
-          z.object({ kind: z.literal("comment"), commentId: z.number().int().positive() }),
-          z.object({ kind: z.literal("issue"), issueNumber: z.number().int().positive() }),
-        ]),
-      })
-      .optional(),
-  })
-  .passthrough();
+type CacheEntry = {
+  messages: readonly unknown[];
+  projection: AuthenticatedRequestProjection;
+  readonly intakeEventIds: Set<string>;
+  readonly parkedEventIds: Set<string>;
+  readonly owners: Set<string>;
+  expiresAt: number;
+  updatedAt: number;
+};
 
-function resolveAuthenticatedOrigin(
-  msg: Extract<LilacMessageForTopic<"cmd.request">, { type: "cmd.request.message" }>,
-): ResultType<AuthenticatedRequestOrigin | undefined, RequestMessageCacheProjectionInvalid> {
-  const requestId = msg.headers?.request_id;
-  const sessionId = msg.headers?.session_id;
-  const platform = msg.headers?.request_client;
-  if (!requestId || !sessionId || (platform !== "discord" && platform !== "github")) {
-    return Result.ok(undefined);
-  }
+export type RequestMessageCacheOptions = {
+  readonly ttlMs?: number;
+  readonly maxEntries?: number;
+  readonly now?: () => number;
+};
 
-  const rawData = msg.data.raw;
-  const raw = requestRawSchema.safeParse(rawData);
-  const hasCacheProjection =
-    isRecord(rawData) &&
-    (Object.hasOwn(rawData, "authenticatedActor") ||
-      Object.hasOwn(rawData, "authenticatedOrigin") ||
-      Object.hasOwn(rawData, "github"));
-  if (!raw.success && hasCacheProjection) {
-    return Result.err(
-      new RequestMessageCacheProjectionInvalid({
-        messageType: msg.type,
-        message: "cmd.request.message contains invalid request cache authentication metadata",
-      }),
-    );
-  }
-  const actor = raw.success ? raw.data.authenticatedActor : undefined;
-  const authenticatedOrigin = raw.success ? raw.data.authenticatedOrigin : undefined;
-  if (actor && actor.platform !== platform) return Result.ok(undefined);
-  if (
-    authenticatedOrigin &&
-    (authenticatedOrigin.platform !== platform ||
-      authenticatedOrigin.messageRef.platform !== platform ||
-      authenticatedOrigin.messageRef.channelId !== sessionId)
-  ) {
-    return Result.ok(undefined);
-  }
-
-  if (authenticatedOrigin) {
-    const messageRef: MsgRef =
-      platform === "discord"
-        ? {
-            platform,
-            channelId: authenticatedOrigin.messageRef.channelId,
-            messageId: authenticatedOrigin.messageRef.messageId,
-          }
-        : {
-            platform,
-            channelId: authenticatedOrigin.messageRef.channelId,
-            messageId: authenticatedOrigin.messageRef.messageId,
-          };
-    return Result.ok({
-      requestId,
-      sessionId,
-      platform,
-      messageRef,
-      actorUserId: authenticatedOrigin.userId,
-    });
-  }
-
-  if (platform === "discord") {
-    const parsed = parseRequestId(requestId);
-    const messageRef =
-      parsed?.kind === "discord_message" && parsed.channelId === sessionId
-        ? ({ platform, channelId: sessionId, messageId: parsed.messageId } satisfies MsgRef)
-        : null;
-    const actorUserId = actor?.userId ?? null;
-    if (!messageRef && !actorUserId) return Result.ok(undefined);
-    return Result.ok({ requestId, sessionId, platform, messageRef, actorUserId });
-  }
-
-  const trigger = raw.success ? raw.data.github?.trigger : undefined;
-  if (!trigger) return Result.ok(undefined);
-  const messageId =
-    trigger.kind === "comment" ? String(trigger.commentId) : String(trigger.issueNumber);
-  return Result.ok({
-    requestId,
-    sessionId,
-    platform,
-    messageRef: { platform, channelId: sessionId, messageId },
-    actorUserId: actor?.userId ?? null,
-  });
-}
-
-function consumerId(prefix: string): string {
-  return `${prefix}:${process.pid}:${Math.random().toString(16).slice(2)}`;
-}
-
-export async function createRequestMessageCache(
-  options: RequestMessageCacheOptions,
-): Promise<RequestMessageCache> {
-  const {
-    bus,
-    subscriptionId = "tool-server:request-cache",
-    ttlMs = 30 * 60 * 1000,
-    maxEntries = 256,
-  } = options;
-
-  // Prevent unbounded growth for a single requestId when follow-ups/steers
-  // arrive as incremental message batches.
-  const maxMessagesPerRequest = 512;
-  const logger = createLogger({
-    module: "tool-server:request-message-cache",
-  });
-
-  const map = new Map<string, CacheEntry>();
-
-  function pruneExpired(now = Date.now()) {
-    for (const [k, v] of map) {
-      if (v.expiresAt <= now) {
-        map.delete(k);
-        logger.debug("request_message_cache.expired", {
-          requestId: k,
-          expiresAt: v.expiresAt,
-        });
+export type RequestMessageCache = {
+  get(requestId: string): readonly unknown[] | undefined;
+  getOrigin(requestId: string): AuthenticatedRequestOrigin | undefined;
+  cacheMessage(
+    msg: LilacMessageForTopic<"cmd.request">,
+    projection?: AuthenticatedRequestProjection,
+  ): ResultType<AuthenticatedRequestOrigin | undefined, RequestMessageCacheAdmissionError>;
+  acquireOwner(
+    requestId: string,
+  ): ResultType<RequestMessageCacheOwner, RequestIdentitySourceMissing>;
+  createAliasOwner(input: {
+    readonly sourceRequestId: string;
+    readonly aliasRequestId: string;
+    readonly requestClient: AuthenticatedRequestProjection["requestClient"];
+    readonly sessionId: string;
+  }): ResultType<RequestMessageCacheAliasOwner, RequestMessageCacheOwnerError>;
+  releaseOwner(owner: RequestMessageCacheOwner): boolean;
+  finishDelivery(input: {
+    readonly requestId: string;
+    readonly eventId: string;
+    readonly disposition: "release" | "park";
+  }): void;
+  snapshot(requestId: string):
+    | {
+        readonly ownerCount: number;
+        readonly eventIdCount: number;
+        readonly intakeEventCount: number;
+        readonly parkedEventIds: readonly string[];
       }
+    | undefined;
+  stop(): Promise<void>;
+};
+
+export function createRequestMessageCache(
+  options: RequestMessageCacheOptions = {},
+): RequestMessageCache {
+  const { ttlMs = 30 * 60 * 1000, maxEntries = 256, now = Date.now } = options;
+  const maxMessagesPerRequest = 512;
+  const logger = createLogger({ module: "tool-server:request-message-cache" });
+  const entries = new Map<string, CacheEntry>();
+
+  function isRetained(entry: CacheEntry): boolean {
+    return entry.owners.size > 0 || entry.intakeEventIds.size > 0 || entry.parkedEventIds.size > 0;
+  }
+
+  function deleteIfUnowned(requestId: string, entry: CacheEntry): void {
+    if (!isRetained(entry)) entries.delete(requestId);
+  }
+
+  function pruneExpired(at = now()): void {
+    for (const [requestId, entry] of entries) {
+      if (entry.expiresAt > at || isRetained(entry)) continue;
+      entries.delete(requestId);
+      logger.debug("request_message_cache.expired", {
+        requestId,
+        expiresAt: entry.expiresAt,
+      });
     }
   }
 
-  function pruneMax() {
-    while (map.size > maxEntries) {
-      let oldestKey: string | null = null;
+  function pruneMax(): void {
+    while (entries.size > maxEntries) {
+      let oldestKey: string | undefined;
       let oldestUpdatedAt = Infinity;
-
-      for (const [k, v] of map) {
-        if (v.updatedAt < oldestUpdatedAt) {
-          oldestUpdatedAt = v.updatedAt;
-          oldestKey = k;
-        }
+      for (const [requestId, entry] of entries) {
+        if (isRetained(entry) || entry.updatedAt >= oldestUpdatedAt) continue;
+        oldestUpdatedAt = entry.updatedAt;
+        oldestKey = requestId;
       }
-
-      if (!oldestKey) break;
-      map.delete(oldestKey);
+      if (!oldestKey) return;
+      entries.delete(oldestKey);
       logger.info("request_message_cache.evicted", {
         requestId: oldestKey,
         reason: "max_entries",
         maxEntries,
-        sizeAfter: map.size,
+        sizeAfter: entries.size,
       });
     }
   }
 
-  function set(
-    requestId: string,
-    messages: readonly unknown[],
-    origin?: AuthenticatedRequestOrigin,
-  ) {
-    const now = Date.now();
-    pruneExpired(now);
-
-    const prev = map.get(requestId);
-    const merged = prev ? [...prev.messages, ...messages] : [...messages];
-
-    const clamped =
-      merged.length > maxMessagesPerRequest
-        ? merged.slice(merged.length - maxMessagesPerRequest)
-        : merged;
-
-    if (clamped.length < merged.length) {
-      logger.info("request_message_cache.clamped", {
-        requestId,
-        beforeCount: merged.length,
-        afterCount: clamped.length,
-        maxMessagesPerRequest,
-      });
-    }
-
-    map.set(requestId, {
-      messages: clamped,
-      origin: prev?.origin ?? origin,
-      expiresAt: now + ttlMs,
-      updatedAt: now,
-    });
-
-    pruneMax();
-  }
-
-  function handleMessage(
+  function cacheMessage(
     msg: LilacMessageForTopic<"cmd.request">,
-  ): ResultType<void, RequestMessageCacheHandlerError> {
+    trustedProjection?: AuthenticatedRequestProjection,
+  ): ResultType<AuthenticatedRequestOrigin | undefined, RequestMessageCacheAdmissionError> {
     if (msg.type !== lilacEventTypes.CmdRequestMessage) return Result.ok(undefined);
-
     const requestId = msg.headers?.request_id;
     if (!requestId) {
-      logger.error("request_message_cache.missing_request_id", {
-        messageType: msg.type,
-      });
       return Result.err(
         new RequestMessageCacheRequestIdMissing({
           messageType: msg.type,
@@ -313,81 +173,176 @@ export async function createRequestMessageCache(
         }),
       );
     }
+    if (
+      trustedProjection &&
+      (trustedProjection.requestId !== requestId ||
+        trustedProjection.requestClient !== (msg.headers?.request_client ?? "unknown") ||
+        trustedProjection.sessionId !== msg.headers?.session_id ||
+        (trustedProjection.source === "internal-delegated" &&
+          trustedProjection.requestClient !== "unknown"))
+    ) {
+      return Result.err(
+        new AuthenticatedRequestIdentityConflict({
+          messageType: msg.type,
+          message: "trusted request projection conflicts with the decoded request route",
+        }),
+      );
+    }
+    const projected = trustedProjection
+      ? Result.ok(trustedProjection)
+      : projectAuthenticatedRequest(msg);
+    if (projected.status === "error") return Result.err(projected.error);
+    if (!projected.value) return Result.ok(undefined);
 
-    // Append new message batches for this request. These messages are often incremental
-    // (for example, follow-ups), so overwrite semantics can hide earlier attachments.
-    const origin = resolveAuthenticatedOrigin(msg);
-    if (origin.status === "error") return Result.err(origin.error);
-    set(requestId, msg.data.messages, origin.value);
-    return Result.ok(undefined);
-  }
+    pruneExpired();
+    const at = now();
+    const existing = entries.get(requestId);
+    if (existing) {
+      const trustedDelegatedUpgrade =
+        trustedProjection?.source === "internal-delegated" &&
+        existing.projection.source === "external" &&
+        existing.projection.requestId === trustedProjection.requestId &&
+        existing.projection.requestClient === "unknown" &&
+        existing.projection.requestClient === trustedProjection.requestClient &&
+        existing.projection.sessionId === trustedProjection.sessionId;
+      if (trustedDelegatedUpgrade) {
+        existing.projection = trustedProjection;
+      } else {
+        const latched = latchAuthenticatedRequest(existing.projection, projected.value, msg.type);
+        if (latched.status === "error") return Result.err(latched.error);
+        existing.projection = latched.value;
+      }
+      const alreadyPending =
+        existing.intakeEventIds.has(msg.id) || existing.parkedEventIds.has(msg.id);
+      existing.intakeEventIds.add(msg.id);
+      if (!alreadyPending) {
+        existing.messages = projectCachedRequestMessageLineage(
+          existing.messages,
+          msg.data.messages,
+          maxMessagesPerRequest,
+        );
+      }
+      existing.expiresAt = at + ttlMs;
+      existing.updatedAt = at;
+      return Result.ok(existing.projection);
+    }
 
-  async function startRequestMessageCacheResult(): Promise<
-    ResultType<RequestMessageCacheSubscription, EventDeliveryStartFailed>
-  > {
-    return bus.subscribeTopic(
-      "cmd.request",
-      {
-        mode: "fanout",
-        subscriptionId,
-        consumerId: consumerId(subscriptionId),
-        offset: { type: "now" },
-        batch: { maxWaitMs: 1000 },
-      },
-      async (msg): Promise<ResultType<void, RequestMessageCacheHandlerError>> => handleMessage(msg),
-      requestMessageCacheDeliveryDisposition,
-    );
-  }
-
-  const sub = adaptRequestMessageCacheStartResultToHost(await startRequestMessageCacheResult());
-
-  async function stopRequestMessageCacheResult(): Promise<
-    ResultType<void, EventDeliveryStopFailed | EventDeliveryDoneError>
-  > {
-    const stopped = await sub.stop();
-    if (stopped.status === "error") return Result.err(stopped.error);
-
-    const done = await sub.done;
-    if (done.status === "error") return Result.err(done.error);
-    return Result.ok(undefined);
+    const entry: CacheEntry = {
+      messages: projectCachedRequestMessageLineage(msg.data.messages, [], maxMessagesPerRequest),
+      projection: projected.value,
+      intakeEventIds: new Set([msg.id]),
+      parkedEventIds: new Set(),
+      owners: new Set(),
+      expiresAt: at + ttlMs,
+      updatedAt: at,
+    };
+    entries.set(requestId, entry);
+    pruneMax();
+    return Result.ok(entry.projection);
   }
 
   return {
-    get: (requestId: string) => {
-      const now = Date.now();
-      const entry = map.get(requestId);
-      if (!entry) {
-        logger.debug("request_message_cache.get", {
-          requestId,
-          hit: false,
-          reason: "missing",
-        });
-        return undefined;
-      }
-      if (entry.expiresAt <= now) {
-        map.delete(requestId);
-        logger.debug("request_message_cache.get", {
-          requestId,
-          hit: false,
-          reason: "expired",
-        });
-        return undefined;
-      }
-      logger.debug("request_message_cache.get", {
-        requestId,
-        hit: true,
-        messageCount: entry.messages.length,
-      });
-      return entry.messages;
+    get: (requestId) => {
+      pruneExpired();
+      return entries.get(requestId)?.messages;
     },
-    getOrigin: (requestId: string) => {
-      const entry = map.get(requestId);
-      if (!entry || entry.expiresAt <= Date.now()) return undefined;
-      return entry.origin;
+    getOrigin: (requestId) => {
+      pruneExpired();
+      return entries.get(requestId)?.projection;
+    },
+    cacheMessage,
+    acquireOwner: (requestId) => {
+      const entry = entries.get(requestId);
+      if (!entry) {
+        return Result.err(
+          new RequestIdentitySourceMissing({
+            requestId,
+            message: "request cache owner source is not active",
+          }),
+        );
+      }
+      const ownerId = crypto.randomUUID();
+      entry.owners.add(ownerId);
+      return Result.ok({ requestId, ownerId });
+    },
+    createAliasOwner: (input) => {
+      const source = entries.get(input.sourceRequestId);
+      if (!source) {
+        return Result.err(
+          new RequestIdentitySourceMissing({
+            requestId: input.sourceRequestId,
+            message: "request cache alias source is not active",
+          }),
+        );
+      }
+      if (input.aliasRequestId === input.sourceRequestId) {
+        const ownerId = crypto.randomUUID();
+        source.owners.add(ownerId);
+        return Result.ok({
+          requestId: input.sourceRequestId,
+          ownerId,
+          projection: source.projection,
+          selfAlias: true,
+        });
+      }
+      if (entries.has(input.aliasRequestId)) {
+        return Result.err(
+          new RequestIdentityAliasTargetOccupied({
+            requestId: input.aliasRequestId,
+            message: "request cache alias target is already occupied",
+          }),
+        );
+      }
+      const projection: AuthenticatedRequestProjection = {
+        ...source.projection,
+        requestId: input.aliasRequestId,
+        requestClient: input.requestClient,
+        sessionId: input.sessionId,
+        source: "internal-delegated",
+      };
+      const ownerId = crypto.randomUUID();
+      entries.set(input.aliasRequestId, {
+        messages: projectCachedRequestMessageLineage(source.messages),
+        projection,
+        intakeEventIds: new Set(),
+        parkedEventIds: new Set(),
+        owners: new Set([ownerId]),
+        expiresAt: source.expiresAt,
+        updatedAt: source.updatedAt,
+      });
+      return Result.ok({
+        requestId: input.aliasRequestId,
+        ownerId,
+        projection,
+        selfAlias: false,
+      });
+    },
+    releaseOwner: (owner) => {
+      const entry = entries.get(owner.requestId);
+      if (!entry || !entry.owners.delete(owner.ownerId)) return false;
+      deleteIfUnowned(owner.requestId, entry);
+      return true;
+    },
+    finishDelivery: ({ requestId, eventId, disposition }) => {
+      const entry = entries.get(requestId);
+      if (!entry) return;
+      entry.intakeEventIds.delete(eventId);
+      if (disposition === "park") entry.parkedEventIds.add(eventId);
+      if (disposition === "release") entry.parkedEventIds.delete(eventId);
+      deleteIfUnowned(requestId, entry);
+    },
+    snapshot: (requestId) => {
+      const entry = entries.get(requestId);
+      if (!entry) return undefined;
+      return {
+        ownerCount: entry.owners.size,
+        eventIdCount: new Set([...entry.intakeEventIds, ...entry.parkedEventIds]).size,
+        intakeEventCount: entry.intakeEventIds.size,
+        parkedEventIds: [...entry.parkedEventIds],
+      };
     },
     stop: async () => {
-      adaptRequestMessageCacheStopResultToHost(await stopRequestMessageCacheResult());
-      map.clear();
+      entries.clear();
     },
   };
 }

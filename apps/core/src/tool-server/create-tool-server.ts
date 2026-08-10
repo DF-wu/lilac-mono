@@ -52,6 +52,8 @@ import {
   type ToolServerLagIncident,
 } from "./health-state";
 import type { RequestContext, ServerTool } from "./types";
+import type { AuthenticatedSurfaceOrigin } from "../surface/types";
+import type { AuthenticatedRequestOrigin } from "./request-message-cache";
 import { ToolInputValidationError } from "./validation-error-message";
 
 type ToolPluginManagerLike = {
@@ -278,13 +280,18 @@ function authenticateRequestContext(
   if (!context.requestId) return undefined;
   const messages = cache?.get(context.requestId);
   const origin = cache?.getOrigin?.(context.requestId);
-  context.serverOwnedRequest =
+  const routeMatches =
     messages !== undefined &&
     origin !== undefined &&
     origin.sessionId === context.sessionId &&
-    origin.platform === context.requestClient;
-  if (context.serverOwnedRequest && origin?.actorUserId) {
-    context.authenticatedPrincipal = { platform: origin.platform, userId: origin.actorUserId };
+    origin.requestClient === context.requestClient;
+  context.serverOwnedRequest = routeMatches && origin?.verifiedIngress === true;
+  if (routeMatches && origin?.authenticatedOrigin) {
+    context.authenticatedPrincipal = {
+      platform: origin.authenticatedOrigin.platform,
+      userId: origin.authenticatedOrigin.userId,
+    };
+    context.authenticatedPrincipalSessionId = origin.authenticatedOrigin.sessionRef.channelId;
   }
   return messages;
 }
@@ -375,13 +382,7 @@ export type ToolServerOptions = {
   /** Optional cache to provide request-scoped messages to tools. */
   requestMessageCache?: {
     get(requestId: string): readonly unknown[] | undefined;
-    getOrigin?(requestId: string):
-      | {
-          sessionId: string;
-          platform: "discord" | "github";
-          actorUserId: string | null;
-        }
-      | undefined;
+    getOrigin?(requestId: string): AuthenticatedRequestOrigin | undefined;
   };
   canonicalWorkspaceRoot?: string;
   operatorTokenSha256?: string;
@@ -394,6 +395,7 @@ export type ToolServerOptions = {
   }) => {
     kind: "primary" | "heartbeat";
     principal: { platform: "discord" | "github"; userId: string } | null;
+    authenticatedOrigin: AuthenticatedSurfaceOrigin | null;
     allowedCallables: readonly string[] | null;
     profile: "primary" | NativeSubagentProfile;
     canonicalCwd: string;
@@ -748,6 +750,9 @@ export function createToolServer(options: ToolServerOptions) {
     if (ctx.operator) return Result.ok("trusted");
     if (ctx.controlPolicy) return Result.ok(ctx.safetyMode ?? "restricted");
     if (ctx.safetyMode === "restricted") return Result.ok("restricted");
+    if (!ctx.serverOwnedRequest) return Result.ok("restricted");
+    if (ctx.requestClient === "github") return Result.ok("trusted");
+    if (ctx.requestClient !== "discord") return Result.ok("restricted");
     const serverSafetyModeProvider = options.resolveServerSafetyMode;
     if (serverSafetyModeProvider) {
       const resolved = await captureSafetyModeProvider(ctx, "server-provider", () =>
@@ -757,7 +762,7 @@ export function createToolServer(options: ToolServerOptions) {
       return Result.ok(resolved.value);
     }
     const sessionId = ctx.sessionId;
-    if (!sessionId || !options.getConfig) return Result.ok("trusted");
+    if (!sessionId || !options.getConfig) return Result.ok("restricted");
     const loaded = await captureSafetyModeProvider(ctx, "config", options.getConfig);
     if (loaded.status === "error") return loaded;
     return Result.ok(loaded.value.surface.router.sessionModes[sessionId]?.safetyMode ?? "trusted");
@@ -916,7 +921,67 @@ export function createToolServer(options: ToolServerOptions) {
           }),
         );
       }
-      context.serverOwnedRequest = true;
+      const cachedOrigin = options.requestMessageCache?.getOrigin?.(requestId);
+      if (authorized.kind === "heartbeat") {
+        if (authorized.authenticatedOrigin !== null || authorized.principal !== null) {
+          return Result.err(
+            new ToolRequestAuthenticationError({
+              message: "Heartbeat capability must remain principal-less",
+            }),
+          );
+        }
+        context.serverOwnedRequest = true;
+        context.cwd = authorized.canonicalCwd;
+        context.safetyMode = "trusted";
+        context.controlPolicy = {
+          kind: authorized.kind,
+          allowedCallables: authorized.allowedCallables,
+        };
+        context.subagentProfile = undefined;
+        delete context.authenticatedPrincipal;
+        delete context.authenticatedPrincipalSessionId;
+        return Result.ok({ context, messages });
+      }
+      if (!cachedOrigin) {
+        return Result.err(
+          new ToolRequestAuthenticationError({
+            message: "Request control capability requires a live cached request projection",
+          }),
+        );
+      }
+      if (cachedOrigin.requestClient !== requestClient || cachedOrigin.sessionId !== sessionId) {
+        return Result.err(
+          new ToolRequestAuthenticationError({
+            message: "Request control capability route conflicts with cached request projection",
+          }),
+        );
+      }
+      const cachedAuthenticatedOrigin = cachedOrigin?.authenticatedOrigin ?? null;
+      const authorizedOrigin = authorized.authenticatedOrigin;
+      const originsMatch =
+        cachedAuthenticatedOrigin === null
+          ? authorizedOrigin === null
+          : authorizedOrigin !== null &&
+            cachedAuthenticatedOrigin.platform === authorizedOrigin.platform &&
+            cachedAuthenticatedOrigin.userId === authorizedOrigin.userId &&
+            cachedAuthenticatedOrigin.sessionRef.platform ===
+              authorizedOrigin.sessionRef.platform &&
+            cachedAuthenticatedOrigin.sessionRef.channelId ===
+              authorizedOrigin.sessionRef.channelId;
+      const capabilityIdentityValid =
+        (authorizedOrigin === null && authorized.principal === null) ||
+        (authorizedOrigin !== null &&
+          authorized.principal !== null &&
+          authorizedOrigin.platform === authorized.principal.platform &&
+          authorizedOrigin.userId === authorized.principal.userId);
+      if (!originsMatch || !capabilityIdentityValid) {
+        return Result.err(
+          new ToolRequestAuthenticationError({
+            message: "Request control capability identity conflicts with cached request origin",
+          }),
+        );
+      }
+      context.serverOwnedRequest = cachedOrigin.verifiedIngress;
       context.cwd = authorized.canonicalCwd;
       context.safetyMode = authorized.safetyMode;
       context.controlPolicy = {
@@ -924,7 +989,12 @@ export function createToolServer(options: ToolServerOptions) {
         allowedCallables: authorized.allowedCallables,
       };
       context.subagentProfile = authorized.profile === "primary" ? undefined : authorized.profile;
-      if (authorized.principal) context.authenticatedPrincipal = authorized.principal;
+      delete context.authenticatedPrincipal;
+      delete context.authenticatedPrincipalSessionId;
+      if (authorizedOrigin && authorized.principal) {
+        context.authenticatedPrincipal = authorized.principal;
+        context.authenticatedPrincipalSessionId = authorizedOrigin.sessionRef.channelId;
+      }
     }
     return Result.ok({ context, messages });
   }

@@ -402,14 +402,6 @@ const STAGE_3_OPERATIONAL_RESULT_APIS = new Map<string, readonly SymbolIdentity[
         module: "src/heartbeat/heartbeat-service.ts",
         exportName: "startHeartbeatServiceResult.stopHeartbeatLifecycleResult",
       },
-      {
-        module: "src/tool-server/request-message-cache.ts",
-        exportName: "createRequestMessageCache.startRequestMessageCacheResult",
-      },
-      {
-        module: "src/tool-server/request-message-cache.ts",
-        exportName: "createRequestMessageCache.stopRequestMessageCacheResult",
-      },
       ...[
         "decodeRemoteFsRunnerPackageSpec",
         "buildRemoteFsRunnerCommand",
@@ -1417,8 +1409,15 @@ const INTEGRATED_BOUNDARY_DECODERS = new Map<string, readonly BoundaryDecoder[]>
       },
       {
         identity: {
+          module: "src/surface/authenticated-request.ts",
+          exportName: "projectAuthenticatedRequest",
+        },
+        category: "projection",
+      },
+      {
+        identity: {
           module: "src/tool-server/request-message-cache.ts",
-          exportName: "resolveAuthenticatedOrigin",
+          exportName: "projectCachedRequestMessageLineage",
         },
         category: "projection",
       },
@@ -3120,16 +3119,6 @@ export const LEGACY_UNENFORCED_EXCEPTION_ADAPTERS = new Map<string, readonly Exc
           "src/heartbeat/heartbeat-service.ts",
           "adaptHeartbeatLifecycleStopResultToHost",
           "HeartbeatService.stop",
-        ],
-        [
-          "src/tool-server/request-message-cache.ts",
-          "adaptRequestMessageCacheStartResultToHost",
-          "createRequestMessageCache",
-        ],
-        [
-          "src/tool-server/request-message-cache.ts",
-          "adaptRequestMessageCacheStopResultToHost",
-          "RequestMessageCache.stop",
         ],
       ].map(([module, exportName, externalExportName]) => ({
         identity: { module, exportName },
@@ -6713,14 +6702,6 @@ const CORE_EVENT_DELIVERY_CONSUMERS = [
   },
   {
     identity: {
-      module: "src/tool-server/request-message-cache.ts",
-      exportName: "createRequestMessageCache.startRequestMessageCacheResult",
-    },
-    apiPackage: "@stanley2058/lilac-event-bus",
-    operations: ["subscribeTopic"],
-  },
-  {
-    identity: {
       module: "src/surface/bridge/bus-agent-runner.ts",
       exportName: "startBusAgentRunner",
     },
@@ -8724,7 +8705,7 @@ function approvedExceptionAdapterCatalogSha256(
 }
 
 export const APPROVED_EXCEPTION_ADAPTER_CATALOG_SHA256 =
-  "971270ad6806dbf23c854486ba9d3d43236f2390b5df4a2ee17cd5041dd73cb3";
+  "355b442325d10ef50ce4cf5e1b5fcc42f4ae3699757622783adca773ee7690c5";
 
 export const architectureManifest = {
   version: 1,

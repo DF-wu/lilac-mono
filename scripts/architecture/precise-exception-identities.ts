@@ -580,16 +580,6 @@ export const PRECISE_EXCEPTION_IDENTITIES: Readonly<
     ],
     ["src/tool-server/health-state.ts", "createToolServerHealthState.getSnapshot", "both"],
     ["src/tool-server/health-state.ts", "previewReason", "capture"],
-    [
-      "src/tool-server/request-message-cache.ts",
-      "adaptRequestMessageCacheStartResultToHost",
-      "signal",
-    ],
-    [
-      "src/tool-server/request-message-cache.ts",
-      "adaptRequestMessageCacheStopResultToHost",
-      "signal",
-    ],
     ["src/tool-server/runtime-diagnostics.ts", "readOptional", "capture"],
     ["src/tool-server/tools/attachment.ts", "adaptAttachmentResultToToolHost", "signal"],
     [

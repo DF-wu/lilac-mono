@@ -221,9 +221,14 @@ function requestProgressTarget(context: RequestContext) {
   ) {
     return null;
   }
+  const principal = context.authenticatedPrincipal;
+  const principalMatchesRequest =
+    principal !== undefined &&
+    principal.platform === context.requestClient &&
+    context.authenticatedPrincipalSessionId === context.sessionId;
   return {
     platform: context.requestClient,
-    userId: context.authenticatedPrincipal?.userId ?? null,
+    userId: principalMatchesRequest ? principal.userId : null,
     sessionRef: { platform: context.requestClient, channelId: context.sessionId },
     originMessageRef: null,
   } as const;

@@ -123,6 +123,11 @@ import {
   createRequestMessageCache,
   type RequestMessageCache,
 } from "../tool-server/request-message-cache";
+import {
+  projectAuthenticatedRequest,
+  type AuthenticatedRequestProjection,
+} from "../surface/authenticated-request";
+import type { AuthenticatedSurfaceOrigin } from "../surface/types";
 import { createCoreToolPluginManager, type CoreToolPluginManager } from "../plugins";
 import { CustomCommandManager } from "../custom-commands/manager";
 import { handleCoreConfigWatchEvent } from "./core-config-watch";
@@ -145,6 +150,7 @@ import {
   type SurfaceRelayHandles,
   type SurfaceRequestIngressHandles,
 } from "./surface-runtime-lifecycle";
+
 import { SurfaceRuntimeRegistry } from "../surface/runtime-descriptor";
 import { prewarmFffFinders } from "@stanley2058/lilac-fs";
 import {
@@ -163,6 +169,52 @@ import {
   type McpRegistryOptionsInvalid,
   type UniversalMcpConfig,
 } from "../mcp";
+
+export function resolveRequestCapabilityIdentity(input: {
+  readonly requestClient: string;
+  readonly sessionId: string;
+  readonly safetyMode: "trusted" | "restricted";
+  readonly authenticatedOrigin?: AuthenticatedSurfaceOrigin;
+  readonly cachedRequest?: AuthenticatedRequestProjection;
+}): {
+  readonly principal: { readonly platform: "discord" | "github"; readonly userId: string } | null;
+  readonly authenticatedOrigin: AuthenticatedSurfaceOrigin | null;
+  readonly safetyMode: "trusted" | "restricted";
+} {
+  const proposedOrigin = input.authenticatedOrigin ?? null;
+  const cachedOrigin = input.cachedRequest?.authenticatedOrigin ?? null;
+  const cacheMatches =
+    input.cachedRequest !== undefined &&
+    input.cachedRequest.requestClient === input.requestClient &&
+    input.cachedRequest.sessionId === input.sessionId &&
+    ((cachedOrigin === null && proposedOrigin === null) ||
+      (cachedOrigin !== null &&
+        proposedOrigin !== null &&
+        cachedOrigin.platform === proposedOrigin.platform &&
+        cachedOrigin.userId === proposedOrigin.userId &&
+        cachedOrigin.sessionRef.channelId === proposedOrigin.sessionRef.channelId));
+  const authenticatedOrigin = cacheMatches ? proposedOrigin : null;
+  const principal = authenticatedOrigin
+    ? { platform: authenticatedOrigin.platform, userId: authenticatedOrigin.userId }
+    : null;
+  let safetyMode: "trusted" | "restricted" = "restricted";
+  if (cacheMatches && input.requestClient === "github") {
+    safetyMode = input.cachedRequest.verifiedIngress ? "trusted" : "restricted";
+  } else if (
+    cacheMatches &&
+    input.requestClient === "discord" &&
+    input.cachedRequest.verifiedIngress
+  ) {
+    safetyMode = input.safetyMode;
+  } else if (
+    cacheMatches &&
+    input.requestClient === "unknown" &&
+    input.cachedRequest.source === "internal-delegated"
+  ) {
+    safetyMode = input.safetyMode;
+  }
+  return { principal, authenticatedOrigin, safetyMode };
+}
 
 export type CoreRuntime = {
   start(): Promise<CoreRuntimeStartOutcome>;
@@ -1822,14 +1874,9 @@ export async function createCoreRuntime(
           handles: surfaceAdapterIngressHandles,
         });
 
-        requestMessageCache = await createRequestMessageCache({
-          bus,
-          subscriptionId: subId(subscriptionPrefix, "tool-request-cache"),
-        });
+        requestMessageCache = createRequestMessageCache();
 
-        logger.debug("Request message cache started", {
-          subscriptionId: subId(subscriptionPrefix, "tool-request-cache"),
-        });
+        logger.debug("Request message cache initialized");
 
         stopWorkflowActionResolver = await startWorkflowActionResolver({
           bus,
@@ -2118,33 +2165,37 @@ export async function createCoreRuntime(
           workflowLiveParentBridge,
           workflowSubagentDispatcher,
           durableWorkflowStore,
+          projectAuthenticatedRequest,
+          requestMessageCache: requestMessageCache ?? undefined,
           issueControlCapability: async (input) => {
-            let origin = requestMessageCache?.getOrigin(input.requestId);
-            for (let attempt = 0; !origin && attempt < 20; attempt += 1) {
-              await Bun.sleep(5);
-              origin = requestMessageCache?.getOrigin(input.requestId);
-            }
-            const originPrincipal =
-              origin?.actorUserId &&
-              origin.sessionId === input.sessionId &&
-              origin.platform === input.requestClient
-                ? { platform: origin.platform, userId: origin.actorUserId }
-                : null;
+            const cachedRequest = requestMessageCache?.getOrigin(input.requestId);
+            const identity = resolveRequestCapabilityIdentity({
+              requestClient: input.requestClient,
+              sessionId: input.sessionId,
+              safetyMode: input.safetyMode,
+              ...(input.authenticatedOrigin
+                ? { authenticatedOrigin: input.authenticatedOrigin }
+                : {}),
+              ...(cachedRequest ? { cachedRequest } : {}),
+            });
             const policy = {
               kind: "primary",
               requestId: input.requestId,
               sessionId: input.sessionId,
               platform: input.requestClient,
-              principal: input.principal ?? originPrincipal,
+              principal: identity.principal,
+              authenticatedOrigin: identity.authenticatedOrigin,
               allowedCallables: null,
               profile: input.profile,
               canonicalCwd: input.canonicalCwd,
-              safetyMode: input.safetyMode,
+              safetyMode: identity.safetyMode,
               expiresAt: input.expiresAt,
             } as const;
             return {
               capability: requestControlAuthority.issue(policy),
               principal: policy.principal,
+              authenticatedOrigin: policy.authenticatedOrigin,
+              safetyMode: policy.safetyMode,
             };
           },
           issueHeartbeatCapability: (input) =>
@@ -2154,6 +2205,7 @@ export async function createCoreRuntime(
               sessionId: input.sessionId,
               platform: input.requestClient,
               principal: null,
+              authenticatedOrigin: null,
               allowedCallables: HEARTBEAT_LEVEL2_CALLABLES,
               profile: "primary",
               canonicalCwd: input.canonicalCwd,
