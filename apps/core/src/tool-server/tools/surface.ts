@@ -8,7 +8,7 @@ import {
   type ServerTool,
   type ServerToolCallOptions,
 } from "@stanley2058/lilac-plugin-runtime";
-import { Result, TaggedError, type Result as ResultType } from "better-result";
+import { Panic, Result, TaggedError, type Result as ResultType } from "better-result";
 
 import { isAdapterPlatform } from "../../shared/is-adapter-platform";
 import {
@@ -85,7 +85,9 @@ function adaptSurfaceOperationToToolHost<T>(result: ResultType<T, SurfaceOperati
 
 const surfaceClientSchema = z
   .enum(["discord", "github", "whatsapp", "slack", "telegram", "web"])
-  .describe("Surface client/platform (required if request client is unknown / not provided)");
+  .describe(
+    "Recognized surface wire client/platform. Execution requires a registered adapter and is selected from request context unless --client is needed.",
+  );
 
 type SurfaceClient = z.infer<typeof surfaceClientSchema>;
 
@@ -1213,7 +1215,8 @@ export class Surface implements ServerTool {
         }),
         "surface.sessions.list": callable({
           name: "Surface Sessions List",
-          description: "List cached sessions. Provide --client if request client is unknown.",
+          description:
+            "List sessions through the selected registered adapter. The adapter may return an explicit unsupported result.",
           inputSchema: sessionsListInputSchema,
           validation: "zod",
           run: (input, opts) => this.callSessionsList(input, opts?.context),
@@ -1221,7 +1224,7 @@ export class Surface implements ServerTool {
         "surface.sessions.listParticipants": callable({
           name: "Surface Sessions List Participants",
           description:
-            "List current Discord session participants (thread members when available; otherwise guild members).",
+            "List current participants through the selected registered adapter. Discord uses thread members or guild members; other adapters may return unsupported.",
           inputSchema: sessionsListParticipantsInputSchema,
           validation: "zod",
           run: (input, opts) => this.callSessionsListParticipants(input, opts?.context),
@@ -1403,7 +1406,9 @@ export class Surface implements ServerTool {
       },
       terminology: {
         client:
-          "Surface client/platform. If the request context has a known client (LILAC_REQUEST_CLIENT), --client is optional; otherwise pass --client explicitly.",
+          "Surface client/platform. A registered request-context adapter is authoritative; an explicit conflicting --client fails closed. Otherwise pass --client to select a registered adapter.",
+        adapterResolution:
+          "supportedClients lists registered executable adapters only. It does not predict support for individual operations; each operation returns its declared runtime result.",
         session:
           "A conversation container. For Discord, a session maps to a channel; for GitHub, a session maps to an issue/PR thread.",
         sessionId:
@@ -1415,7 +1420,7 @@ export class Surface implements ServerTool {
         replyToMessageId: "When sending a message, optionally reply to an existing messageId.",
         silent: "When true, suppress all notifications for this send (mentions + reply ping).",
         attachments:
-          "Outbound: local files attached to a send (paths resolved relative to request cwd). Inbound: message attachment/media metadata is first-class on surface.messages.read and hinted on surface.messages.list.",
+          "Outbound: local files offered to the selected adapter (paths resolved relative to request cwd; unsupported adapters reject them explicitly). Inbound: message attachment/media metadata is first-class on surface.messages.read and hinted on surface.messages.list.",
       },
       sessionIdFormats,
       relatedConfigKeys: {
@@ -1593,7 +1598,8 @@ export class Surface implements ServerTool {
         let text = row.finalText ?? "";
         try {
           text = await this.readRecentAgentWriteText(row);
-        } catch {
+        } catch (cause) {
+          if (Panic.is(cause)) throw cause;
           // Fall back to persisted finalText when the backing message cannot be fetched.
         }
 
@@ -1852,7 +1858,9 @@ export class Surface implements ServerTool {
       target.sessionRef.platform !== "discord" ||
       !target.cfg
     ) {
-      signalSurfaceFailureToToolHost("surface.messages.search for GitHub is not supported yet.");
+      signalSurfaceFailureToToolHost(
+        "surface.messages.search is a Discord-owned sidecar and is unavailable for GitHub; use discovery.search for shared memory retrieval.",
+      );
     }
 
     const search = this.params.discordSearch;
@@ -1892,7 +1900,8 @@ export class Surface implements ServerTool {
           const msg = read.status === "ok" ? read.value : null;
           const attachments = msg ? getMessageAttachmentMeta(msg) : [];
           attachmentHintsByMessageId.set(hit.ref.messageId, buildAttachmentHints(attachments));
-        } catch {
+        } catch (cause) {
+          if (Panic.is(cause)) throw cause;
           attachmentHintsByMessageId.set(hit.ref.messageId, buildAttachmentHints([]));
         }
       }),

@@ -2,7 +2,7 @@ import { describe, expect, it } from "bun:test";
 import { Panic, Result } from "better-result";
 import { parseCoreConfigV1ToUniversal, type CoreConfig } from "@stanley2058/lilac-utils";
 import { Surface as ProductionSurface } from "../src/tool-server/tools/surface";
-import type { SurfaceAdapter } from "../src/surface/adapter";
+import { SurfaceUnavailable, type SurfaceAdapter } from "../src/surface/adapter";
 import {
   GithubAdapter,
   type GithubAdapterApi as GithubSurfaceApi,
@@ -822,6 +822,68 @@ describe("tool-server surface", () => {
     expect(adapter.listCalls.length).toBe(1);
 
     searchStore.close();
+  });
+
+  it("degrades ordinary search enrichment failures but preserves guarded produced-ref Panic", async () => {
+    const channelId = "c1";
+    const message: SurfaceMessage = {
+      ref: { platform: "discord", channelId, messageId: "m1" },
+      session: { platform: "discord", channelId },
+      userId: "user",
+      text: "deploy result",
+      ts: 1,
+    };
+    const adapter: SurfaceAdapter = new FakeAdapter([], { [channelId]: [message] });
+    adapter.readMsg = async () =>
+      Result.err(
+        new SurfaceUnavailable({
+          platform: "discord",
+          operation: "read-message",
+          message: "attachment enrichment unavailable",
+        }),
+      );
+    const searchStore = new DiscordSearchStore(":memory:");
+    const search = new DiscordSearchService({ adapter, store: searchStore });
+    const tool = new Surface({
+      adapter,
+      discordSearch: search,
+      config: testConfig({
+        surface: {
+          discord: {
+            tokenEnv: "DISCORD_TOKEN",
+            allowedChannelIds: [channelId],
+            allowedGuildIds: [],
+            botName: "lilac",
+          },
+        },
+        entity: { sessions: { discord: { ops: channelId } } },
+      }),
+    });
+    try {
+      const ordinary = (await tool.call("surface.messages.search", {
+        client: "discord",
+        sessionId: "#ops",
+        query: "deploy",
+      })) as { hits: Array<{ hasAttachments?: boolean }> };
+      expect(ordinary.hits[0]?.hasAttachments).toBe(false);
+
+      adapter.readMsg = async () =>
+        Result.ok({
+          ...message,
+          ref: { platform: "github", channelId, messageId: "m1" },
+        });
+      const [settled] = await Promise.allSettled([
+        tool.call("surface.messages.search", {
+          client: "discord",
+          sessionId: "#ops",
+          query: "deploy",
+        }),
+      ]);
+      expect(settled?.status).toBe("rejected");
+      if (settled?.status === "rejected") expect(Panic.is(settled.reason)).toBe(true);
+    } finally {
+      searchStore.close();
+    }
   });
 
   it("defaults sessionId and messageId from discord requestId", async () => {
@@ -2393,6 +2455,112 @@ describe("tool-server surface", () => {
     await expect(tool.call("surface.activities.recentAgentWrites", {})).rejects.toThrow(
       "transcript store is not initialized",
     );
+  });
+
+  it.each([
+    ["ordinary read rejection", "rejection"],
+    ["expected read Result", "result"],
+  ] as const)("falls back to persisted recent-write text after an %s", async (_label, mode) => {
+    const adapter: SurfaceAdapter = new FakeAdapter([], {});
+    adapter.readMsg = async () => {
+      if (mode === "rejection") throw new Error("message provider unavailable");
+      return Result.err(
+        new SurfaceUnavailable({
+          platform: "discord",
+          operation: "read-message",
+          message: "message provider unavailable",
+        }),
+      );
+    };
+    const tmp = await fs.mkdtemp(join(tmpdir(), "lilac-surface-fallback-"));
+    const transcriptStore = new SqliteTranscriptStore(join(tmp, "transcripts.sqlite"));
+    try {
+      transcriptStore.saveRequestTranscript({
+        requestId: "heartbeat:fallback",
+        sessionId: "__heartbeat__",
+        requestClient: "unknown",
+        messages: [],
+        finalText: "persisted fallback",
+      });
+      transcriptStore.linkSurfaceMessagesToRequest({
+        requestId: "heartbeat:fallback",
+        created: [{ platform: "discord", channelId: "c1", messageId: "m1" }],
+        last: { platform: "discord", channelId: "c1", messageId: "m1" },
+      });
+      const tool = new Surface({
+        adapter,
+        transcriptStore,
+        config: testConfig({
+          surface: {
+            discord: {
+              tokenEnv: "DISCORD_TOKEN",
+              allowedChannelIds: ["c1"],
+              allowedGuildIds: [],
+              botName: "lilac",
+            },
+          },
+        }),
+      });
+
+      const output = (await tool.call("surface.activities.recentAgentWrites", {})) as Array<{
+        preview: string;
+      }>;
+      expect(output[0]?.preview).toBe("persisted fallback");
+    } finally {
+      transcriptStore.close();
+      await fs.rm(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("preserves a guarded produced-ref Panic through recent-write fallback", async () => {
+    const adapter = new FakeAdapter([], {});
+    adapter.readMsg = async () =>
+      Result.ok({
+        ref: { platform: "github", channelId: "c1", messageId: "m1" },
+        session: { platform: "discord", channelId: "c1" },
+        userId: "bot",
+        text: "invalid",
+        ts: 1,
+      });
+    const tmp = await fs.mkdtemp(join(tmpdir(), "lilac-surface-panic-"));
+    const transcriptStore = new SqliteTranscriptStore(join(tmp, "transcripts.sqlite"));
+    try {
+      transcriptStore.saveRequestTranscript({
+        requestId: "heartbeat:panic",
+        sessionId: "__heartbeat__",
+        requestClient: "unknown",
+        messages: [],
+        finalText: "must not hide panic",
+      });
+      transcriptStore.linkSurfaceMessagesToRequest({
+        requestId: "heartbeat:panic",
+        created: [{ platform: "discord", channelId: "c1", messageId: "m1" }],
+        last: { platform: "discord", channelId: "c1", messageId: "m1" },
+      });
+      const tool = new Surface({
+        adapter,
+        transcriptStore,
+        config: testConfig({
+          surface: {
+            discord: {
+              tokenEnv: "DISCORD_TOKEN",
+              allowedChannelIds: ["c1"],
+              allowedGuildIds: [],
+              botName: "lilac",
+            },
+          },
+        }),
+      });
+
+      const [settled] = await Promise.allSettled([
+        tool.call("surface.activities.recentAgentWrites", {}),
+      ]);
+      expect(settled?.status).toBe("rejected");
+      if (settled?.status === "rejected") expect(Panic.is(settled.reason)).toBe(true);
+    } finally {
+      transcriptStore.close();
+      await fs.rm(tmp, { recursive: true, force: true });
+    }
   });
 
   it("allows guild allowlist when channel is not cached", async () => {

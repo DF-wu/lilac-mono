@@ -17,7 +17,7 @@ Source: `plan/surface-adapter-contract-readiness.md`
 - [x] Atomically migrate the base interface, both adapters, callers, and test fakes.
 - [x] Separate adapter-event ingress subscription from the base adapter contract.
 - [x] Move supported GitHub CRUD and detailed reaction behavior behind GitHub adapter operations.
-- [x] Replace unsupported no-ops, empty successes, and private rejection errors.
+- [x] Use typed unsupported Results instead of no-ops, empty successes, or private error channels.
 - [x] Add deterministic Discord/GitHub SDK failure-classification tests.
 - [x] Run focused tests, Core typecheck, lint/fmt, and independent review.
 
@@ -85,12 +85,17 @@ Snapshot v3 requires correlated relay clients, exact decoded authentication evid
 
 ## Stage 8: Shared Contract Harness And Documentation
 
-- [ ] Run one parameterized adapter/descriptor harness against Discord and GitHub.
-- [ ] Cover lifecycle, relay, operation, workflow, recovery, and cleanup contracts.
-- [ ] Keep protocol integration tests deterministic and credential-free.
-- [ ] Update project, architecture, and tool documentation.
-- [ ] Run `bun run test:all`.
-- [ ] Run `bun run typecheck`.
-- [ ] Run `bun run lint:fix`.
-- [ ] Run `bun run fmt`.
-- [ ] Complete independent final review.
+- [x] Run one parameterized adapter/descriptor harness against Discord and GitHub.
+- [x] Cover lifecycle, relay, operation, workflow, recovery, and cleanup contracts.
+- [x] Keep protocol integration tests deterministic and credential-free.
+- [x] Update project, architecture, and tool documentation.
+- [x] Run `bun run test:all`.
+- [x] Run `bun run typecheck`.
+- [x] Run `bun run lint:architecture`, `bun run test:architecture`, and `bun run typecheck:architecture`.
+- [x] Run `bun run lint:fix`.
+- [x] Run `bun run fmt` and `bun run fmt:check`.
+- [x] Run `git diff --check`.
+- [x] Complete independent final review.
+
+Stage 8 implementation, validation, and independent parent review are complete. No nested reviewer was
+used as the acceptance review.

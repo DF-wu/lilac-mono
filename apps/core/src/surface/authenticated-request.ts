@@ -192,16 +192,6 @@ export function isAuthenticatedRequestProjectionSemanticallyValid(
     if (projection.githubTrigger !== undefined || hasGithubTrigger) return false;
     const expectedVerified = hasOrigin || (hasActor && origin !== undefined);
     if (projection.verifiedIngress !== expectedVerified) return false;
-    if (projection.messageRef) {
-      const parsed = parseRequestId(projection.requestId);
-      if (
-        parsed?.kind !== "discord_message" ||
-        parsed.channelId !== projection.sessionId ||
-        parsed.messageId !== projection.messageRef.messageId
-      ) {
-        return false;
-      }
-    }
     return true;
   }
   const trigger = projection.githubTrigger;
@@ -230,6 +220,47 @@ export function isAuthenticatedRequestProjectionSemanticallyValid(
     }
   }
   return projection.verifiedIngress === completeTrigger;
+}
+
+export function isPersistedRecoveryAuthenticatedRequestProjectionSemanticallyValid(
+  projection: AuthenticatedRequestProjection,
+): boolean {
+  if (!isAuthenticatedRequestProjectionSemanticallyValid(projection)) return false;
+  if (projection.source !== "external") return true;
+
+  if (projection.requestClient === "discord") {
+    const messageRef = projection.messageRef;
+    const originMessageRef = projection.authenticatedOrigin?.messageRef;
+    if (!messageRef && !originMessageRef) return true;
+    if (!messageRef) return false;
+    const request = parseRequestId(projection.requestId);
+    if (
+      request?.kind !== "discord_message" ||
+      request.channelId !== projection.sessionId ||
+      request.channelId !== messageRef.channelId ||
+      request.messageId !== messageRef.messageId
+    ) {
+      return false;
+    }
+    return (
+      originMessageRef === undefined ||
+      (originMessageRef.channelId === request.channelId &&
+        originMessageRef.messageId === request.messageId)
+    );
+  }
+
+  if (projection.requestClient === "github" && projection.githubTrigger) {
+    const request = parseGithubRequestId({ requestId: projection.requestId });
+    return (
+      request?.sessionId === projection.sessionId &&
+      request.triggerId === projection.githubTrigger.messageId &&
+      request.triggerId === projection.messageRef?.messageId &&
+      (projection.authenticatedOrigin?.messageRef === undefined ||
+        projection.authenticatedOrigin.messageRef.messageId === request.triggerId)
+    );
+  }
+
+  return true;
 }
 
 export function projectAuthenticatedRequest(
@@ -454,6 +485,18 @@ function sameGithubTrigger(
   );
 }
 
+function hasUnprovenGithubOriginMessageReplacement(
+  previous: AuthenticatedRequestProjection,
+  next: AuthenticatedRequestProjection,
+): boolean {
+  if (previous.requestClient !== "github" || next.requestClient !== "github") return false;
+  const previousMessageRef = previous.authenticatedOrigin?.messageRef;
+  const nextMessageRef = next.authenticatedOrigin?.messageRef;
+  if (!previousMessageRef || !nextMessageRef) return false;
+  if (previousMessageRef.messageId === nextMessageRef.messageId) return false;
+  return next.githubTrigger?.messageId !== nextMessageRef.messageId;
+}
+
 export function latchAuthenticatedRequest(
   previous: AuthenticatedRequestProjection | undefined,
   next: AuthenticatedRequestProjection,
@@ -469,6 +512,7 @@ export function latchAuthenticatedRequest(
     (previous.authenticatedOrigin !== undefined &&
       next.authenticatedOrigin !== undefined &&
       !sameAuthenticatedOrigin(previous.authenticatedOrigin, next.authenticatedOrigin)) ||
+    hasUnprovenGithubOriginMessageReplacement(previous, next) ||
     (previous.verifiedIngress &&
       next.githubTrigger !== undefined &&
       !sameGithubTrigger(previous.githubTrigger, next.githubTrigger));

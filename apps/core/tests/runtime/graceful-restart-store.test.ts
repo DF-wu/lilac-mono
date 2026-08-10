@@ -911,6 +911,106 @@ describe("graceful restart persisted codec", () => {
     }
   });
 
+  it("accepts exact v3 Discord initial message proof", () => {
+    const decoded = decodeGracefulRestartSnapshot({
+      status: "completed",
+      payload_json: SuperJSON.stringify(buildSnapshot()),
+    });
+    expect(decoded.status).toBe("ok");
+    if (decoded.status === "error") throw decoded.error;
+    expect(decoded.value.provenance).toBe("current");
+    expect(decoded.value.value?.agent[0]?.identity).toMatchObject({
+      state: "durable",
+      projection: {
+        requestId: "discord:chan:msg_active",
+        messageRef: { platform: "discord", channelId: "chan", messageId: "msg_active" },
+        authenticatedOrigin: {
+          messageRef: { platform: "discord", channelId: "chan", messageId: "msg_active" },
+        },
+      },
+    });
+  });
+
+  it.each([
+    ["requestId and messageRef", "outer"],
+    ["messageRef and nested authenticatedOrigin", "nested"],
+  ] as const)(
+    "rejects v3 Discord %s mismatches as corrupt persisted fields",
+    (_label, mismatch) => {
+      const snapshot = buildSnapshot();
+      const active = snapshot.agent[0];
+      if (!active?.identity || active.identity.state !== "durable") {
+        throw new Error("Expected durable Discord identity fixture");
+      }
+      const projection = active.identity.projection;
+      const wrongMessageRef = {
+        platform: "discord" as const,
+        channelId: "chan",
+        messageId: "follow-up",
+      };
+      const authenticatedOrigin = projection.authenticatedOrigin
+        ? { ...projection.authenticatedOrigin, messageRef: wrongMessageRef }
+        : undefined;
+      const corruptProjection = {
+        ...projection,
+        ...(mismatch === "outer" ? { messageRef: wrongMessageRef } : {}),
+        authenticatedOrigin,
+      };
+      const decoded = decodeGracefulRestartSnapshot({
+        status: "completed",
+        payload_json: SuperJSON.stringify({
+          ...snapshot,
+          agent: [
+            {
+              ...active,
+              identity: { ...active.identity, projection: corruptProjection },
+            },
+          ],
+        }),
+      });
+      expect(decoded.status).toBe("error");
+      if (decoded.status === "error") expect(decoded.error).toBeInstanceOf(CorruptPersistedFields);
+    },
+  );
+
+  it("rejects v3 GitHub durable trigger evidence that does not match its parsed request ID", () => {
+    const snapshot = buildSnapshot();
+    const sessionId = "octo/repo#1";
+    const requestId = "github:octo/repo#1:999";
+    const github = {
+      queueEntryId: "github-incomplete-trigger",
+      kind: "queued" as const,
+      requestId,
+      sessionId,
+      requestClient: "github" as const,
+      queue: "prompt" as const,
+      messages: [],
+      identity: {
+        state: "durable" as const,
+        projection: {
+          requestId,
+          requestClient: "github" as const,
+          sessionId,
+          source: "external" as const,
+          platform: "github" as const,
+          sessionRef: { platform: "github" as const, channelId: sessionId },
+          messageRef: { platform: "github" as const, channelId: sessionId, messageId: "123" },
+          authenticationMetadataKind: "github-trigger" as const,
+          githubTrigger: { kind: "comment" as const, messageId: "123" },
+          verifiedIngress: false,
+        },
+        assertedSafetyMode: "restricted" as const,
+        parkedEventIds: [],
+      },
+    };
+    const decoded = decodeGracefulRestartSnapshot({
+      status: "completed",
+      payload_json: SuperJSON.stringify({ ...snapshot, agent: [github] }),
+    });
+    expect(decoded.status).toBe("error");
+    if (decoded.status === "error") expect(decoded.error).toBeInstanceOf(CorruptPersistedFields);
+  });
+
   it("distinguishes absent, malformed serialization, and corrupt nested fields", () => {
     const absent = decodeGracefulRestartSnapshot(null);
     expect(absent.status).toBe("ok");
@@ -1122,6 +1222,53 @@ describe("SqliteGracefulRestartStore", () => {
       const second = store.readCompletedSnapshot();
       expect(second.status).toBe("error");
       if (second.status === "error") expect(second.error).toBeInstanceOf(MalformedSerialization);
+    } finally {
+      store.close();
+    }
+  });
+
+  it("retains v3 Discord durable message-proof corruption for operator repair", async () => {
+    const { dbPath, store } = await makeStore();
+    try {
+      const snapshot = buildSnapshot();
+      const active = snapshot.agent[0];
+      if (!active?.identity || active.identity.state !== "durable") {
+        throw new Error("Expected durable Discord identity fixture");
+      }
+      const projection = active.identity.projection;
+      const wrongMessageRef = {
+        platform: "discord" as const,
+        channelId: "chan",
+        messageId: "follow-up",
+      };
+      writePersistedRow(
+        dbPath,
+        "completed",
+        SuperJSON.stringify({
+          ...snapshot,
+          agent: [
+            {
+              ...active,
+              identity: {
+                ...active.identity,
+                projection: {
+                  ...projection,
+                  messageRef: wrongMessageRef,
+                  authenticatedOrigin: projection.authenticatedOrigin
+                    ? { ...projection.authenticatedOrigin, messageRef: wrongMessageRef }
+                    : undefined,
+                },
+              },
+            },
+          ],
+        }),
+      );
+
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        const read = store.readCompletedSnapshot();
+        expect(read.status).toBe("error");
+        if (read.status === "error") expect(read.error).toBeInstanceOf(CorruptPersistedFields);
+      }
     } finally {
       store.close();
     }

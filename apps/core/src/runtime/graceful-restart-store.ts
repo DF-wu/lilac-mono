@@ -31,6 +31,7 @@ import type {
 import { parseBufferedForActiveRequestIdFromRaw } from "../surface/bridge/bus-agent-runner/raw";
 import {
   isAuthenticatedRequestProjectionSemanticallyValid,
+  isPersistedRecoveryAuthenticatedRequestProjectionSemanticallyValid,
   type AuthenticatedRequestProjection,
 } from "../surface/authenticated-request";
 import type { BusToAdapterRelaySnapshot } from "../surface/bridge/subscribe-from-bus";
@@ -735,11 +736,17 @@ function validateRelayCorrelation(relay: BusToAdapterRelaySnapshot): boolean {
 function validateAuthenticatedProjection(
   entry: Pick<GracefulRestartAgentRecoveryEntry, "requestId" | "requestClient" | "sessionId">,
   projection: AuthenticatedRequestProjection,
+  requireDurableProof: boolean,
 ): boolean {
-  return projection.requestId !== entry.requestId ||
+  if (
+    projection.requestId !== entry.requestId ||
     projection.requestClient !== entry.requestClient ||
     projection.sessionId !== entry.sessionId
-    ? false
+  ) {
+    return false;
+  }
+  return requireDurableProof
+    ? isPersistedRecoveryAuthenticatedRequestProjectionSemanticallyValid(projection)
     : isAuthenticatedRequestProjectionSemanticallyValid(projection);
 }
 
@@ -750,9 +757,11 @@ function validateRecoveryIdentity(
     readonly sessionId: string;
   },
   identity: AgentRunnerRecoveryIdentity,
+  requireDurableProof: boolean,
 ): boolean {
   if (identity.state === "restricted") return true;
-  if (!validateAuthenticatedProjection(route, identity.projection)) return false;
+  if (!validateAuthenticatedProjection(route, identity.projection, requireDurableProof))
+    return false;
   if (new Set(identity.parkedEventIds).size !== identity.parkedEventIds.length) return false;
   if (identity.projection.source === "internal-delegated") {
     return (
@@ -762,7 +771,10 @@ function validateRecoveryIdentity(
   return identity.delegationProof === undefined;
 }
 
-function validateSnapshotCorrelation(snapshot: GracefulRestartSnapshot): boolean {
+function validateSnapshotCorrelation(
+  snapshot: GracefulRestartSnapshot,
+  requireDurableProof: boolean,
+): boolean {
   const routeByRequestId = new Map<
     string,
     { readonly requestClient: z.output<typeof adapterPlatformSchema>; readonly sessionId: string }
@@ -825,7 +837,7 @@ function validateSnapshotCorrelation(snapshot: GracefulRestartSnapshot): boolean
     if (relay && (entry.requestClient !== relay.platform || entry.sessionId !== relay.sessionId)) {
       return false;
     }
-    if (!validateRecoveryIdentity(entry, entry.identity)) return false;
+    if (!validateRecoveryIdentity(entry, entry.identity, requireDurableProof)) return false;
     if (entry.corePrimaryLineage) {
       const lineage = decodeCorePrimaryLineageV1(entry.corePrimaryLineage, entry.messages);
       if (lineage.status === "error") return false;
@@ -851,6 +863,7 @@ function validateSnapshotCorrelation(snapshot: GracefulRestartSnapshot): boolean
           sessionId: attempt.sessionId,
         },
         attempt.controlIdentity,
+        requireDurableProof,
       )
     ) {
       return false;
@@ -909,7 +922,7 @@ function normalizeLegacySnapshot(
     queueAttempts: [],
     relays,
   };
-  if (!validateSnapshotCorrelation(snapshot)) {
+  if (!validateSnapshotCorrelation(snapshot, false)) {
     return Result.err(corruptSnapshot(decoded.version, "payload_json"));
   }
   return Result.ok(snapshot);
@@ -956,7 +969,7 @@ export function decodeGracefulRestartSnapshot(
 
   const decoded = currentSnapshotSchema.safeParse(parsed.value);
   if (!decoded.success) return Result.err(corruptSnapshot(version, "payload_json"));
-  if (!validateSnapshotCorrelation(decoded.data)) {
+  if (!validateSnapshotCorrelation(decoded.data, true)) {
     return Result.err(corruptSnapshot(version, "payload_json"));
   }
   return Result.ok({ value: decoded.data, provenance: "current" });

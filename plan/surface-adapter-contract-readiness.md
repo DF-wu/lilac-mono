@@ -1,6 +1,6 @@
 # Surface Adapter Contract Readiness
 
-Status: proposed Discord/GitHub contract hardening and compatibility refactor.
+Status: completed. Discord and GitHub are the canonical Core surface adapter references.
 
 This is Part 2 of the surface extension work. It starts after
 `plan/surface-runtime-descriptor-extraction.md` and its Discord/GitHub parity suite are stable.
@@ -259,8 +259,8 @@ collapsed into unavailable or unsupported.
 Callers switch exhaustively over `SurfaceOperationError`. Unsupported is permanent and non-retryable.
 Permission, rate-limit, unavailable, and not-found keep separate policies.
 
-Remove `signalSurfaceFailure` and private rejection-only adapter contract errors after every production
-caller has migrated.
+Production callers use the Result algebra; the former rejection-only adapter contract errors and
+`signalSurfaceFailure` path are removed from adapter operation flow.
 
 ## Existing Adapter Normalization
 
@@ -469,7 +469,7 @@ created by that attempt and retains the snapshot. A rollback failure leaves reco
 is a registered `Panic`. Restore operations are idempotent by request identity so an unconsumed snapshot can
 be retried safely.
 
-Replace the destructive load-and-consume read with a read-only load plus explicit disposition operations:
+Recovery uses a read-only load plus explicit disposition operations:
 
 - absent rows require no write;
 - empty and stale snapshots are explicitly consumed after classification;
@@ -543,7 +543,7 @@ ref map exists.
 - Atomically change the base adapter interface, both implementations, production callers, and test fakes.
 - Separate adapter-event subscription from the base adapter lifecycle contract.
 - Move currently supported GitHub CRUD and detailed reaction behavior behind GitHub adapter operations.
-- Replace unsupported no-ops, empty successes, and private rejected-Promise errors.
+- Use typed unsupported Results instead of no-ops, empty successes, or private error channels.
 - Add deterministic SDK/API classification tests for both protocols.
 
 Exit criteria: both adapters expose the same operation contract, preserve their existing supported
@@ -566,10 +566,10 @@ validated.
 
 - Inject a narrow registry-derived adapter resolver into the surface tool.
 - Route generic session, message, and reaction operations through the selected adapter.
-- Remove GitHub REST imports and protocol operation branches from the generic tool module.
+- Keep GitHub REST operations and protocol branches out of the generic tool module.
 - Preserve Discord authorization/alias adaptation and protocol-owned sidecars.
 - Narrow help and executable adapter resolution to registered platforms without narrowing compatible
-  persistence readers or adding a support matrix.
+  persistence readers or predeclaring per-operation support.
 
 Exit criteria: generic surface tools select an adapter and handle operation Results; existing tool wire
 fixtures remain compatible.
@@ -663,9 +663,9 @@ Expected production changes span:
 Test impact includes adapter, descriptor, relay, tool, request-cache, control, runner, workflow, restart,
 transcript compatibility, plugin, MCP, and architecture suites.
 
-This is expected to touch roughly 30 to 50 production and test files. Most churn comes from replacing the
-legacy Promise adapter contract and removing direct GitHub tool API dispatch, not from adding platform
-types or configuration.
+The completed work touched the adapter contract and its shared callers rather than adding platform types
+or configuration. Generic tools now use registry-selected adapters, and expected operations use typed
+Results.
 
 ## Risks
 
@@ -714,7 +714,7 @@ context.
 - Writing the future platform-addition plan in this scope.
 - Introducing `SurfaceRefMap` or parameterizing the entire adapter/event/message/output graph.
 - Loading surface descriptors dynamically.
-- Adding capability metadata or operation-support matrices.
+- Predeclaring optional operation support instead of using each operation's runtime Result.
 - Treating every `AdapterPlatform` value as implemented.
 - Signing messages inside trusted Redis or re-authenticating actors at every consumer.
 - Making descriptor membership redefine persisted codecs dynamically.

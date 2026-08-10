@@ -5,6 +5,10 @@ import {
   createRequestMessageCache,
   type AuthenticatedRequestOrigin,
 } from "../../src/tool-server/request-message-cache";
+import {
+  BusAgentRunnerAuthenticationProjectionInvalid,
+  busAgentRunnerDeliveryDisposition,
+} from "../../src/surface/bridge/bus-agent-runner";
 
 function requestMessage(input: {
   readonly eventId: string;
@@ -270,6 +274,73 @@ describe("request message cache", () => {
       ).status,
     ).toBe("ok");
     expect(cache.cacheMessage(trigger("3-0", 42)).status).toBe("error");
+  });
+
+  it("preserves a Discord origin across same-user follow-ups with new message refs and metadata forms", () => {
+    const cache = createRequestMessageCache();
+    const requestId = "discord:channel-1:message-1";
+    const first = requestMessage({
+      eventId: "1-0",
+      requestId,
+      raw: {
+        authenticatedOrigin: {
+          platform: "discord",
+          userId: "user-1",
+          messageRef: { platform: "discord", channelId: "channel-1", messageId: "message-1" },
+        },
+      },
+    });
+    const followUp = requestMessage({
+      eventId: "2-0",
+      requestId,
+      raw: {
+        authenticatedActor: { platform: "discord", userId: "user-1" },
+        authenticatedOrigin: {
+          platform: "discord",
+          userId: "user-1",
+          messageRef: { platform: "discord", channelId: "channel-1", messageId: "message-2" },
+        },
+      },
+    });
+
+    expect(cache.cacheMessage(first).status).toBe("ok");
+    expect(cache.cacheMessage(followUp).status).toBe("ok");
+    expect(cache.get(requestId)).toHaveLength(2);
+    expect(cache.getOrigin(requestId)?.authenticatedOrigin?.messageRef?.messageId).toBe(
+      "message-1",
+    );
+  });
+
+  it("dead-letters an unproven GitHub authenticated-origin message replacement", () => {
+    const cache = createRequestMessageCache();
+    const requestId = "github:owner/repo#1:41";
+    const origin = (eventId: string, messageId: string) =>
+      requestMessage({
+        eventId,
+        requestId,
+        sessionId: "owner/repo#1",
+        requestClient: "github",
+        raw: {
+          authenticatedOrigin: {
+            platform: "github",
+            userId: "octocat",
+            messageRef: { platform: "github", channelId: "owner/repo#1", messageId },
+          },
+        },
+      });
+    expect(cache.cacheMessage(origin("1-0", "41")).status).toBe("ok");
+    const replaced = cache.cacheMessage(origin("2-0", "42"));
+    expect(replaced.status).toBe("error");
+    if (replaced.status === "ok") throw new Error("Expected GitHub origin replacement conflict");
+    expect(
+      busAgentRunnerDeliveryDisposition(
+        new BusAgentRunnerAuthenticationProjectionInvalid({
+          cause: replaced.error,
+          message: "Request authentication projection is invalid",
+        }),
+      ),
+    ).toBe("dead-letter");
+    expect(cache.get(requestId)).toHaveLength(1);
   });
 
   it("keeps incomplete GitHub trigger evidence restricted and rejects actor metadata without a user", () => {

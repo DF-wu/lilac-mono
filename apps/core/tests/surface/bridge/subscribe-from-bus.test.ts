@@ -1,5 +1,5 @@
 import { describe, expect, it, spyOn } from "bun:test";
-import { Panic, Result, type Result as ResultType } from "better-result";
+import { Panic, Result } from "better-result";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -52,21 +52,7 @@ import {
   SqliteGracefulRestartStore,
 } from "../../../src/runtime/graceful-restart-store";
 
-import {
-  createLilacBus,
-  type RawBus,
-  lilacEventTypes,
-  type Message,
-  type SubscriptionOptions,
-  type FetchOptions,
-  type PublishOptions,
-  EventDeliveryStopped,
-  type EventDeliveryContext,
-  type EventDeliveryDoneError,
-  type RawDeliveryAction,
-  type RawDeliveryHandler,
-  EventDeliveryStartFailed,
-} from "@stanley2058/lilac-event-bus";
+import { createLilacBus, lilacEventTypes } from "@stanley2058/lilac-event-bus";
 import {
   clearGithubAck,
   getGithubAck,
@@ -79,206 +65,11 @@ import {
   type TranscriptStore,
 } from "../../../src/transcript/transcript-store";
 import { SurfaceAdapterTestBase } from "../../helpers/surface-adapter-test-base";
-
-type DeliveryObservation = {
-  readonly topic: string;
-  readonly cursor: string;
-  readonly disposition: RawDeliveryAction["disposition"];
-  readonly contextHasCommit: boolean;
-};
-
-type InMemoryDeliverySubscription = {
-  readonly topic: string;
-  readonly opts: SubscriptionOptions;
-  readonly handler: RawDeliveryHandler;
-  readonly done: PromiseWithResolvers<ResultType<void, EventDeliveryDoneError>>;
-};
-
-function createDeliveryContext(
-  topic: string,
-  cursor: string,
-  mode: SubscriptionOptions["mode"],
-): EventDeliveryContext {
-  return {
-    cursor,
-    mode,
-    evidence: {
-      source: {
-        transport: "redis-streams",
-        streamKey: topic,
-        topic,
-        messageId: cursor,
-      },
-      wire: { kind: "bounded-complete", fields: [] },
-    },
-  };
-}
-
-function createInMemoryRawBus(
-  onDelivery?: (observation: DeliveryObservation) => void,
-  waitForTailStop?: () => Promise<void>,
-  completeSurfaceOutputHeaders = true,
-  failStartForTopic?: (topic: string) => boolean,
-): RawBus {
-  const topics = new Map<string, Array<Message<unknown>>>();
-  const correlationByRequestId = new Map<
-    string,
-    { readonly session_id: string; readonly request_client: string }
-  >();
-  let sequence = 0;
-  const deliverySubs = new Set<InMemoryDeliverySubscription>();
-
-  const deliver = async (
-    subscription: InMemoryDeliverySubscription,
-    message: Message<unknown>,
-  ): Promise<RawDeliveryAction> => {
-    const context = createDeliveryContext(subscription.topic, message.id, subscription.opts.mode);
-    const action = await subscription.handler(message, context);
-    onDelivery?.({
-      topic: subscription.topic,
-      cursor: message.id,
-      disposition: action.disposition,
-      contextHasCommit: Object.hasOwn(context, "commit"),
-    });
-    if (
-      action.disposition === "stop" ||
-      (action.disposition === "park-pending" && subscription.opts.mode === "tail")
-    ) {
-      deliverySubs.delete(subscription);
-      subscription.done.resolve(
-        Result.err(
-          new EventDeliveryStopped({
-            reason: action.disposition === "stop" ? "requested" : "tail-cannot-park",
-            topic: subscription.topic,
-            cursor: message.id,
-            message: "In-memory delivery stopped",
-          }),
-        ),
-      );
-    }
-    return action;
-  };
-
-  return {
-    publish: async <TData>(msg: Omit<Message<TData>, "id" | "ts">, opts: PublishOptions) => {
-      const requestId = opts.headers?.request_id;
-      const sessionId = opts.headers?.session_id;
-      const requestClient = opts.headers?.request_client;
-      if (requestId && sessionId && requestClient) {
-        correlationByRequestId.set(requestId, {
-          session_id: sessionId,
-          request_client: requestClient,
-        });
-      }
-      const correlation = requestId ? correlationByRequestId.get(requestId) : undefined;
-      const headers =
-        completeSurfaceOutputHeaders && opts.topic.startsWith("out.req.") && correlation
-          ? { ...opts.headers, ...correlation }
-          : opts.headers;
-      const id = `${Date.now()}-${sequence}`;
-      sequence += 1;
-      const stored: Message<unknown> = {
-        topic: opts.topic,
-        id,
-        type: opts.type,
-        ts: Date.now(),
-        key: opts.key,
-        headers,
-        data: msg.data,
-      };
-
-      const list = topics.get(opts.topic) ?? [];
-      list.push(stored);
-      topics.set(opts.topic, list);
-
-      for (const s of deliverySubs) {
-        if (s.topic !== opts.topic) continue;
-        await deliver(s, stored);
-      }
-
-      return { id, cursor: id };
-    },
-
-    subscribe: async (topic, opts, handler) => {
-      if (failStartForTopic?.(topic)) {
-        return Result.err(
-          new EventDeliveryStartFailed({
-            topic,
-            cause: new Error("forced subscription start failure"),
-            message: "Forced subscription start failure",
-          }),
-        );
-      }
-      const done = Promise.withResolvers<ResultType<void, EventDeliveryDoneError>>();
-      const entry = { topic, opts, handler, done };
-      deliverySubs.add(entry);
-
-      if (opts.mode === "tail") {
-        const existing = topics.get(topic) ?? [];
-        let replay = existing;
-        const offset = opts.offset;
-        if (offset?.type === "cursor") {
-          const cursorIndex = existing.findIndex((message) => message.id === offset.cursor);
-          replay = cursorIndex >= 0 ? existing.slice(cursorIndex + 1) : existing;
-        } else if (opts.offset?.type === "now") {
-          replay = [];
-        }
-        for (const message of replay) {
-          const action = await deliver(entry, message);
-          if (action.disposition === "stop" || action.disposition === "park-pending") break;
-        }
-      }
-
-      return Result.ok({
-        done: done.promise,
-        stop: async () => {
-          deliverySubs.delete(entry);
-          done.resolve(Result.ok(undefined));
-          if (opts.mode === "tail") await waitForTailStop?.();
-          return Result.ok(undefined);
-        },
-      });
-    },
-
-    fetch: async (topic: string, _opts: FetchOptions) => {
-      const existing = topics.get(topic) ?? [];
-      return {
-        messages: existing.map((m) => ({
-          msg: m,
-          cursor: m.id,
-        })),
-        next: existing.length > 0 ? existing[existing.length - 1]!.id : undefined,
-      };
-    },
-
-    close: async () => {},
-  };
-}
-
-function createInMemoryRawBusWithBlockingTailStop(): {
-  raw: RawBus;
-  releaseTailStops(): void;
-} {
-  let tailStopGatePromise: Promise<void> | null = null;
-  let tailStopGateResolve: (() => void) | null = null;
-
-  const ensureTailStopGate = () => {
-    if (tailStopGatePromise) return tailStopGatePromise;
-    tailStopGatePromise = new Promise<void>((resolve) => {
-      tailStopGateResolve = resolve;
-    });
-    return tailStopGatePromise;
-  };
-
-  return {
-    raw: createInMemoryRawBus(undefined, ensureTailStopGate),
-    releaseTailStops: () => {
-      tailStopGateResolve?.();
-      tailStopGateResolve = null;
-      tailStopGatePromise = null;
-    },
-  };
-}
+import {
+  createInMemoryDeliveryBus as createInMemoryRawBus,
+  createInMemoryDeliveryBusWithBlockingTailStop as createInMemoryRawBusWithBlockingTailStop,
+  type DeliveryObservation,
+} from "../../helpers/in-memory-delivery-bus";
 
 class FakeOutputStream {
   public readonly parts: SurfaceOutputPart[] = [];

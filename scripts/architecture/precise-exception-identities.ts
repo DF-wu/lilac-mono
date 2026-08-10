@@ -16,6 +16,8 @@ export const CORE_REVIEWED_PANIC_IDENTITIES = [
   ["src/workflow/workflow-engine.ts", "WorkflowEngine.claimAndLaunch.catch.<callback@1>"],
   ["src/workflow/workflow-sandbox.ts", "startWorkflowSandbox.respondToHostCall"],
   ["src/workflow/workflow-sandbox.ts", "startWorkflowSandbox.result.<callback>"],
+  ["src/tool-server/tools/surface.ts", "Surface.callActivitiesRecentAgentWrites"],
+  ["src/tool-server/tools/surface.ts", "Surface.callMessagesSearch.map.<callback@1>@3"],
 ] as const;
 
 export const CORE_FATAL_SIGNAL_IDENTITIES = [

@@ -221,6 +221,12 @@ function guardOutputStream(
       return aborted;
     },
   };
+  if (stream.hydrateRecovery) {
+    const hydrateRecovery = stream.hydrateRecovery.bind(stream);
+    Object.defineProperty(guarded, "hydrateRecovery", {
+      value: hydrateRecovery,
+    });
+  }
   if (stream.getFinalTextMode) {
     const getFinalTextMode = stream.getFinalTextMode.bind(stream);
     Object.defineProperty(guarded, "getFinalTextMode", {
