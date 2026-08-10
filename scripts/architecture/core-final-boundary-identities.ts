@@ -311,7 +311,19 @@ export const CORE_FINAL_BOUNDARY_IDENTITIES = [
     "src/workflow/durable-workflow-store.ts",
     "DurableWorkflowStore.recordLiveParentCompletionMaterializationFailure.runWorkflowTransactionForStoreHost.<callback@3>",
   ],
-  ["src/workflow/workflow-progress-projector.ts", "WorkflowProgressProjector.writeFailure"],
+  [
+    "src/workflow/durable-workflow-store.ts",
+    "DurableWorkflowStore.commitSurfaceBindingWithActionRevocation",
+  ],
+  ["src/surface/runtime-descriptor.ts", "workflowProgressOperationFailure"],
+  [
+    "src/workflow/workflow-progress-projector.ts",
+    "WorkflowProgressProjector.writeRetryableFailure",
+  ],
+  [
+    "src/workflow/workflow-progress-projector.ts",
+    "WorkflowProgressProjector.writePermanentFailure",
+  ],
   ["src/mcp/registry.ts", "safeErrorText"],
   ["src/mcp/registry.ts", "McpRegistry.failureStatus"],
   ["src/tools/batch-error-message.ts", "formatBatchPreflightMissingFieldError"],

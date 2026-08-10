@@ -9,20 +9,28 @@ import type {
   SurfaceSendPreparationInput,
 } from "../../src/surface/adapter";
 import {
+  SurfaceInvalidInput,
   SurfaceMessageNotFound,
   SurfaceOperationPartiallyCompleted,
+  SurfaceOperationUnsupported,
+  SurfacePermissionDenied,
+  SurfacePlatformMismatch,
+  SurfaceRateLimited,
+  SurfaceSessionMismatch,
   SurfaceUnavailable,
 } from "../../src/surface/adapter";
 import {
   createDiscordRelayPolicy,
   createDiscordSurfaceRuntimeDescriptor,
   createDiscordWorkflowProgressPort,
+  DISCORD_WORKFLOW_PROGRESS_CONFIGURATION_REVISION,
 } from "../../src/surface/discord/discord-runtime-descriptor";
 import {
   createConfiguredGithubSurfaceRuntimeDescriptor,
   createGithubRelayPolicy,
   createGithubSurfaceRuntimeDescriptor,
   createGithubWorkflowProgressPort,
+  GITHUB_WORKFLOW_PROGRESS_CONFIGURATION_REVISION,
 } from "../../src/surface/github/github-runtime-descriptor";
 import {
   type RegisteredSurfacePlatform,
@@ -43,6 +51,7 @@ import type {
   SendOpts,
   SessionRef,
   SurfacePlatform,
+  SurfaceMessage,
   SurfaceSelf,
   SurfaceSession,
 } from "../../src/surface/types";
@@ -106,7 +115,7 @@ class TestAdapter implements SurfaceAdapter {
     );
   }
 
-  async readMsg(_msgRef: MsgRef) {
+  async readMsg(_msgRef: MsgRef): Promise<SurfaceOperationResult<SurfaceMessage | null>> {
     return Result.ok(null);
   }
 
@@ -245,7 +254,7 @@ describe("surface runtime descriptor factories", () => {
   });
 
   it("excludes operation outcomes that protocol ports cannot produce", () => {
-    type Created = {
+    type GithubCreated = {
       readonly kind: "created";
       readonly ref: {
         readonly platform: "github";
@@ -253,13 +262,23 @@ describe("surface runtime descriptor factories", () => {
         readonly messageId: string;
       };
     };
+    type DiscordCreated = {
+      readonly kind: "created";
+      readonly ref: {
+        readonly platform: "discord";
+        readonly channelId: string;
+        readonly messageId: string;
+      };
+    };
 
-    expectTypeOf<IsAssignable<Created, WorkflowProgressCheckFailure>>().toEqualTypeOf<false>();
     expectTypeOf<
-      IsAssignable<Created, WorkflowProgressSendFailure<"discord">>
+      IsAssignable<GithubCreated, WorkflowProgressCheckFailure>
     >().toEqualTypeOf<false>();
     expectTypeOf<
-      IsAssignable<Created, WorkflowProgressSendFailure<"github">>
+      IsAssignable<DiscordCreated, WorkflowProgressSendFailure<"discord">>
+    >().toEqualTypeOf<true>();
+    expectTypeOf<
+      IsAssignable<GithubCreated, WorkflowProgressSendFailure<"github">>
     >().toEqualTypeOf<true>();
   });
 
@@ -367,6 +386,218 @@ describe("surface runtime descriptor factories", () => {
 });
 
 describe("surface workflow progress ports", () => {
+  it("uses explicit adapter contract revisions rather than remote credential state", () => {
+    expect(
+      createDiscordWorkflowProgressPort(new TestAdapter("discord")).configurationRevision,
+    ).toBe(DISCORD_WORKFLOW_PROGRESS_CONFIGURATION_REVISION);
+    expect(createGithubWorkflowProgressPort(new TestAdapter("github")).configurationRevision).toBe(
+      GITHUB_WORKFLOW_PROGRESS_CONFIGURATION_REVISION,
+    );
+  });
+
+  it.each(["discord", "github"] as const)(
+    "applies the complete canonical failure policy for %s",
+    async (platform) => {
+      const createPort = (adapter: TestAdapter) =>
+        platform === "discord"
+          ? createDiscordWorkflowProgressPort(adapter)
+          : createGithubWorkflowProgressPort(adapter);
+      const errors = [
+        [
+          new SurfaceOperationUnsupported({
+            platform,
+            operation: "send-message",
+            message: "unsupported",
+          }),
+          "permanent",
+          "unsupported",
+        ],
+        [
+          new SurfaceInvalidInput({
+            platform,
+            operation: "send-message",
+            field: "channelId",
+            message: "invalid",
+          }),
+          "permanent",
+          "invalid-input",
+        ],
+        [
+          new SurfacePlatformMismatch({
+            operation: "send-message",
+            refRole: "session",
+            expectedPlatform: platform,
+            receivedPlatform: platform === "discord" ? "github" : "discord",
+            message: "platform mismatch",
+          }),
+          "permanent",
+          "platform-mismatch",
+        ],
+        [
+          new SurfaceSessionMismatch({
+            operation: "send-message",
+            refRole: "replyTo",
+            expectedSessionId: "channel",
+            receivedSessionId: "other",
+            message: "session mismatch",
+          }),
+          "permanent",
+          "session-mismatch",
+        ],
+        [
+          new SurfaceMessageNotFound({
+            platform,
+            operation: "send-message",
+            message: "not found",
+          }),
+          "permanent",
+          "not-found",
+        ],
+        [
+          new SurfacePermissionDenied({
+            platform,
+            operation: "send-message",
+            message: "denied",
+          }),
+          "retryable",
+          "permission-denied",
+        ],
+        [
+          new SurfaceRateLimited({
+            platform,
+            operation: "send-message",
+            retryAfterMs: 100,
+            message: "limited",
+          }),
+          "retryable",
+          "rate-limited",
+        ],
+        [
+          new SurfaceUnavailable({
+            platform,
+            operation: "send-message",
+            message: "unavailable",
+          }),
+          "retryable",
+          "unavailable",
+        ],
+      ] as const;
+      for (const [surfaceError, disposition, reason] of errors) {
+        const adapter = new TestAdapter(platform);
+        spyOn(adapter, "sendMsg").mockResolvedValue(Result.err(surfaceError));
+        const sent = await createPort(adapter).send({
+          channelId: "channel",
+          content: { text: "Queued" },
+        });
+        expect(sent.status).toBe("error");
+        if (sent.status === "error" && sent.error.kind === "failed") {
+          expect(sent.error.error).toMatchObject({ disposition, reason, operation: "send" });
+          if (reason === "rate-limited") expect(sent.error.error.retryAfterMs).toBe(100);
+        }
+      }
+
+      const notFoundAdapter = new TestAdapter(platform);
+      spyOn(notFoundAdapter, "readMsg").mockResolvedValue(
+        Result.err(
+          new SurfaceMessageNotFound({
+            platform,
+            operation: "read-message",
+            message: "missing",
+          }),
+        ),
+      );
+      spyOn(notFoundAdapter, "editMsg").mockResolvedValue(
+        Result.err(
+          new SurfaceMessageNotFound({
+            platform,
+            operation: "edit-message",
+            message: "missing",
+          }),
+        ),
+      );
+      const notFoundPort = createPort(notFoundAdapter);
+      expect(
+        await notFoundPort.checkMessage({ channelId: "channel", messageId: "message" }),
+      ).toEqual(Result.ok("missing"));
+      expect(
+        await notFoundPort.edit(
+          { channelId: "channel", messageId: "message" },
+          { text: "Running" },
+        ),
+      ).toEqual(Result.err({ kind: "not-found" }));
+
+      const permanentAdapter = new TestAdapter(platform);
+      spyOn(permanentAdapter, "readMsg").mockResolvedValue(
+        Result.err(
+          new SurfacePermissionDenied({
+            platform,
+            operation: "read-message",
+            message: "denied",
+          }),
+        ),
+      );
+      spyOn(permanentAdapter, "editMsg").mockResolvedValue(
+        Result.err(
+          new SurfaceOperationUnsupported({
+            platform,
+            operation: "edit-message",
+            message: "unsupported",
+          }),
+        ),
+      );
+      const permanentPort = createPort(permanentAdapter);
+      const checked = await permanentPort.checkMessage({
+        channelId: "channel",
+        messageId: "message",
+      });
+      expect(checked.status).toBe("error");
+      if (checked.status === "error") {
+        expect(checked.error.error).toMatchObject({
+          operation: "check-message",
+          disposition: "retryable",
+          reason: "permission-denied",
+        });
+      }
+      const edited = await permanentPort.edit(
+        { channelId: "channel", messageId: "message" },
+        { text: "Running" },
+      );
+      expect(edited.status).toBe("error");
+      if (edited.status === "error" && edited.error.kind === "failed") {
+        expect(edited.error.error).toMatchObject({
+          operation: "edit",
+          disposition: "permanent",
+          reason: "unsupported",
+        });
+      }
+
+      const partialAdapter = new TestAdapter(platform);
+      const created: MsgRef =
+        platform === "discord"
+          ? { platform: "discord", channelId: "channel", messageId: "created" }
+          : { platform: "github", channelId: "channel", messageId: "created" };
+      spyOn(partialAdapter, "sendMsg").mockResolvedValue(
+        Result.err(
+          new SurfaceOperationPartiallyCompleted({
+            platform,
+            operation: "send-message",
+            created,
+            message: "partially created",
+          }),
+        ),
+      );
+      const partial = await createPort(partialAdapter).send({
+        channelId: "channel",
+        content: { text: "Queued" },
+      });
+      expect(partial.status).toBe("error");
+      if (partial.status === "error") {
+        expect(partial.error.kind).toBe("created");
+        if (partial.error.kind === "created") expect(partial.error.ref).toEqual(created);
+      }
+    },
+  );
+
   it("constructs protocol refs and preserves action content and silent reply options", async () => {
     const adapter = new TestAdapter("discord");
     const send = spyOn(adapter, "sendMsg");

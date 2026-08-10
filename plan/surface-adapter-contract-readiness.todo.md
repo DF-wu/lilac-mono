@@ -55,12 +55,14 @@ The runner is the sole request-cache writer. After all bus entries are acknowled
 
 ## Stage 6: Workflow Port And Durable Correlation
 
-- [ ] Generalize partial-send recovery without a GitHub conditional type.
-- [ ] Consume adapter operation Results in both workflow progress ports.
-- [ ] Separate permanent descriptor failures from retryable protocol failures.
-- [ ] Validate durable binding, action, origin, target, actor, and ref correlation.
-- [ ] Preserve repair, authorization, and transactional outbox behavior.
-- [ ] Run focused workflow tests, Core typecheck, architecture checks, lint/fmt, and independent review.
+- [x] Generalize partial-send recovery without a GitHub conditional type.
+- [x] Consume adapter operation Results in both workflow progress ports.
+- [x] Separate permanent descriptor failures from retryable protocol failures.
+- [x] Validate durable binding, action, origin, target, actor, and ref correlation.
+- [x] Preserve repair, authorization, and transactional outbox behavior.
+- [x] Run focused workflow tests, Core typecheck, architecture checks, and lint/fmt. Parent review remains independent.
+
+Permanent workflow-port failures are stored on the surface binding with the exact target snapshot and adapter contract/policy revision. Matching event, retry, outbox, and startup paths perform no provider operation; target repair or a reviewed revision bump atomically clears the gate and revokes stale actions before fresh controls are rendered. Independently selected cross-session and cross-platform progress targets remain readable and operable; actions additionally require a transferable origin platform/user identity and exact target/binding/message correlation. Schema v25 adds the nullable gate column, migrates existing rows without rewriting them during decode, retains a v24 codec default, and rejects retry-only permanent reasons. The port failure contract is a disposition-discriminated union, and descriptor guards reject forged reason/disposition pairs and non-integer Retry-After values before projector policy. Persisted retry deadlines gate every projection path and remain integral; rate-limit deadlines honor the greater of bounded local backoff and provider delay, while provider and host timer delays are capped at 24 hours. Startup reconciliation synchronously processes at most one 1,000-row batch, then an owned, supervised concurrency-one drain continues the stable `(updated_at, run_id)` keyset so binding mutations cannot starve later rows. The drain advances its owned position only after a page completes; ordinary failures retain that position and retry with exponential 1-second to 60-second backoff, while Panic reports once without retry. Manual reconciliation cancels a pending retry and resumes the same position without overlapping an active drain. Matching current permanent gates are skipped before projection, while changed revisions remain eligible through the shared revision rule. Shutdown cancels retry timers, stops new pages, awaits an in-flight provider operation, and prevents its completion from scheduling new work. Populated v24 migration and direct binding/action rollback fixtures cover the persistence transitions. The shared Discord/GitHub contract suite, full repository tests/typecheck, architecture checks/tests, root lint fix/format, and final diff check pass.
 
 ## Stage 7: Versioned Recovery Hardening
 

@@ -204,6 +204,18 @@ export const workflowProgressTargetSchema = z.strictObject({
 });
 export type WorkflowProgressTarget = z.infer<typeof workflowProgressTargetSchema>;
 
+export function sameWorkflowProgressTarget(
+  left: WorkflowProgressTarget | null,
+  right: WorkflowProgressTarget | null,
+): boolean {
+  if (left === null || right === null) return left === right;
+  return (
+    left.platform === right.platform &&
+    left.channelId === right.channelId &&
+    left.replyToMessageId === right.replyToMessageId
+  );
+}
+
 export const workflowCompletionTargetSchema = z.discriminatedUnion("kind", [
   z.strictObject({ kind: z.literal("detached") }),
   z.strictObject({ kind: z.literal("durable_surface") }),
@@ -395,6 +407,25 @@ export const workflowTriggerSchema = z.strictObject({
 });
 export type WorkflowTrigger = z.infer<typeof workflowTriggerSchema>;
 
+export const workflowProgressPermanentFailureSchema = z.strictObject({
+  operation: z.enum(["check-message", "send", "edit"]),
+  reason: z.enum([
+    "unsupported",
+    "invalid-input",
+    "platform-mismatch",
+    "session-mismatch",
+    "not-found",
+    "partial-outcome",
+    "missing-port",
+  ]),
+  configurationRevision: z.string().min(1).max(200),
+  message: boundedTextSchema,
+  failedAt: timestampSchema,
+});
+export type WorkflowProgressPermanentFailure = z.infer<
+  typeof workflowProgressPermanentFailureSchema
+>;
+
 export const workflowSurfaceBindingSchema = z.strictObject({
   runId: idSchema,
   target: workflowProgressTargetSchema,
@@ -405,6 +436,7 @@ export const workflowSurfaceBindingSchema = z.strictObject({
   lastError: boundedTextSchema.nullable(),
   retryCount: z.number().int().nonnegative(),
   nextAttemptAt: nullableTimestampSchema,
+  permanentFailure: workflowProgressPermanentFailureSchema.nullable(),
   createdAt: timestampSchema,
   updatedAt: timestampSchema,
 });
@@ -413,22 +445,61 @@ export type WorkflowSurfaceBinding = z.infer<typeof workflowSurfaceBindingSchema
 export const workflowSurfaceActionKindSchema = z.enum(["pause", "resume", "cancel"]);
 export type WorkflowSurfaceActionKind = z.infer<typeof workflowSurfaceActionKindSchema>;
 
-export const workflowSurfaceActionSchema = z.strictObject({
-  actionId: idSchema,
-  tokenSha256: sha256Schema,
-  runId: idSchema,
-  kind: workflowSurfaceActionKindSchema,
-  expectedPlatform: platformSchema,
-  expectedUserId: idSchema,
-  expectedMessageRef: z
-    .strictObject({ platform: platformSchema, channelId: idSchema, messageId: idSchema })
-    .nullable(),
-  expiresAt: timestampSchema,
-  consumedAt: nullableTimestampSchema,
-  consumedByPlatform: platformSchema.nullable(),
-  consumedByUserId: idSchema.nullable(),
-  createdAt: timestampSchema,
-});
+export const workflowSurfaceActionSchema = z
+  .strictObject({
+    actionId: idSchema,
+    tokenSha256: sha256Schema,
+    runId: idSchema,
+    kind: workflowSurfaceActionKindSchema,
+    expectedPlatform: platformSchema,
+    expectedUserId: idSchema,
+    expectedMessageRef: z
+      .strictObject({ platform: platformSchema, channelId: idSchema, messageId: idSchema })
+      .nullable(),
+    expiresAt: timestampSchema,
+    consumedAt: nullableTimestampSchema,
+    consumedByPlatform: platformSchema.nullable(),
+    consumedByUserId: idSchema.nullable(),
+    createdAt: timestampSchema,
+  })
+  .superRefine((action, ctx) => {
+    if (
+      action.expectedMessageRef &&
+      action.expectedMessageRef.platform !== action.expectedPlatform
+    ) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["expectedMessageRef", "platform"],
+        message: "Workflow action message platform must match its expected platform",
+      });
+    }
+    const consumedIdentityComplete =
+      action.consumedByPlatform !== null && action.consumedByUserId !== null;
+    if ((action.consumedAt !== null) !== consumedIdentityComplete) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["consumedAt"],
+        message: "Workflow action consumption requires a complete actor identity",
+      });
+    }
+    if (
+      action.consumedByPlatform !== null &&
+      action.consumedByPlatform !== action.expectedPlatform
+    ) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["consumedByPlatform"],
+        message: "Workflow action consumer platform must match its expected platform",
+      });
+    }
+    if (action.consumedByUserId !== null && action.consumedByUserId !== action.expectedUserId) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["consumedByUserId"],
+        message: "Workflow action consumer must match its expected user",
+      });
+    }
+  });
 export type WorkflowSurfaceAction = z.infer<typeof workflowSurfaceActionSchema>;
 
 export const workflowSchemaMigrationSchema = z.strictObject({

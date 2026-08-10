@@ -15,6 +15,7 @@ import { preserveToolPanic } from "../tools/tool-result-adapters";
 import {
   jsonValueSchema,
   workflowOperationSchema,
+  workflowProgressPermanentFailureSchema,
   workflowRevisionSchema,
   workflowRunSchema,
   workflowSurfaceActionSchema,
@@ -162,6 +163,7 @@ const bindingRowSchema = z.strictObject({
   last_error: nullableStringSchema,
   retry_count: z.number(),
   next_attempt_at: nullableNumberSchema,
+  permanent_failure_json: nullableStringSchema.optional(),
   created_at: z.number(),
   updated_at: z.number(),
 });
@@ -781,6 +783,21 @@ function decodeWorkflowSurfaceBindingRow(input: {
     recordId,
   });
   if (messageRef.status === "error") return Result.err(messageRef.error);
+  if (
+    version.value.version === WORKFLOW_SCHEMA_VERSION &&
+    row.data.permanent_failure_json === undefined
+  ) {
+    return Result.err(invalidRow(table, version.value.version, recordId));
+  }
+  const permanentFailure = decodeNullableJsonField({
+    raw: row.data.permanent_failure_json ?? null,
+    schema: workflowProgressPermanentFailureSchema,
+    table,
+    field: "permanent_failure_json",
+    version: version.value.version,
+    recordId,
+  });
+  if (permanentFailure.status === "error") return Result.err(permanentFailure.error);
   const value = workflowSurfaceBindingSchema.safeParse({
     runId: row.data.run_id,
     target: target.value,
@@ -789,6 +806,7 @@ function decodeWorkflowSurfaceBindingRow(input: {
     lastError: row.data.last_error,
     retryCount: row.data.retry_count,
     nextAttemptAt: row.data.next_attempt_at,
+    permanentFailure: permanentFailure.value,
     createdAt: row.data.created_at,
     updatedAt: row.data.updated_at,
   });
@@ -1242,6 +1260,7 @@ const fixtureBindingRow = {
   last_error: null,
   retry_count: 0,
   next_attempt_at: null,
+  permanent_failure_json: null,
   created_at: 1,
   updated_at: 1,
 };

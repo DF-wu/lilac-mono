@@ -10,6 +10,7 @@ import type {
   SurfaceReplyTargetInvalid,
   SurfaceRuntimeDescriptor,
   SurfaceWorkflowProgressPort,
+  WorkflowProgressOperationFailed,
 } from "../runtime-descriptor";
 import {
   createDescriptorBoundSurfaceAdapter,
@@ -18,29 +19,19 @@ import {
 import {
   SurfaceReplyTargetInvalid as ReplyTargetInvalid,
   SurfaceRefInvalid as RefInvalid,
-  WorkflowProgressOperationFailed,
+  workflowProgressOperationFailure,
 } from "../runtime-descriptor";
 
 type DiscordWorkflowProgressOperation = "check-message" | "send" | "edit";
 
-function discordWorkflowProgressFailure(
-  operation: DiscordWorkflowProgressOperation,
-  message: string,
-): { readonly kind: "failed"; readonly error: WorkflowProgressOperationFailed } {
-  return {
-    kind: "failed",
-    error: new WorkflowProgressOperationFailed({
-      operation,
-      message,
-    }),
-  };
-}
+// Bump when the declared workflow operation contract or failure policy changes.
+export const DISCORD_WORKFLOW_PROGRESS_CONFIGURATION_REVISION = "discord-workflow-progress-v1";
 
 function discordWorkflowError(
   operation: DiscordWorkflowProgressOperation,
   error: SurfaceOperationError,
 ): { readonly kind: "failed"; readonly error: WorkflowProgressOperationFailed } {
-  return discordWorkflowProgressFailure(operation, error.message);
+  return { kind: "failed", error: workflowProgressOperationFailure(operation, error) };
 }
 
 export function createDiscordWorkflowProgressPort(
@@ -48,6 +39,7 @@ export function createDiscordWorkflowProgressPort(
 ): SurfaceWorkflowProgressPort<"discord"> {
   const guardedAdapter = createDescriptorBoundSurfaceAdapter("discord", adapter);
   return {
+    configurationRevision: DISCORD_WORKFLOW_PROGRESS_CONFIGURATION_REVISION,
     checkMessage: async (target) => {
       const checked = await guardedAdapter.readMsg({
         platform: "discord",
@@ -78,6 +70,19 @@ export function createDiscordWorkflowProgressPort(
           : { silent: input.silent },
       );
       if (sent.status === "error") {
+        if (sent.error._tag === "SurfaceOperationPartiallyCompleted") {
+          const created = sent.error.created;
+          if (created.platform === "discord") {
+            return Result.err({
+              kind: "created",
+              ref: {
+                platform: "discord",
+                channelId: created.channelId,
+                messageId: created.messageId,
+              },
+            });
+          }
+        }
         return Result.err(discordWorkflowError("send", sent.error));
       }
       return Result.ok({

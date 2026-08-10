@@ -1,4 +1,4 @@
-import { describe, expect, it } from "bun:test";
+import { describe, expect, expectTypeOf, it } from "bun:test";
 import { Panic, Result } from "better-result";
 
 import type {
@@ -14,6 +14,8 @@ import {
   hasCacheBurstProvider,
   hasSurfaceGuildIdResolver,
   SurfaceOperationPartiallyCompleted,
+  SurfaceRateLimited,
+  SurfaceUnavailable,
 } from "../../src/surface/adapter";
 import type { AdapterEvent } from "../../src/surface/events";
 import {
@@ -24,7 +26,9 @@ import {
 import type {
   RegisteredSurfacePlatform,
   SurfaceWorkflowProgressPort,
+  WorkflowProgressOperationFailureFields,
 } from "../../src/surface/runtime-descriptor";
+import { workflowProgressOperationFailure } from "../../src/surface/runtime-descriptor";
 import type {
   ContentOpts,
   LimitOpts,
@@ -41,6 +45,18 @@ const WRONG_PLATFORM_REF = {
   channelId: "channel",
   messageId: "wrong-platform",
 };
+
+type InvalidPermanentWorkflowFailure = {
+  readonly operation: "send";
+  readonly disposition: "permanent";
+  readonly reason: "rate-limited";
+  readonly message: string;
+};
+
+type InvalidPermanentWorkflowFailureIsAssignable =
+  InvalidPermanentWorkflowFailure extends WorkflowProgressOperationFailureFields ? true : false;
+
+expectTypeOf<InvalidPermanentWorkflowFailureIsAssignable>().toEqualTypeOf<false>();
 const WRONG_SESSION_REF = {
   platform: "discord" as const,
   channelId: "other",
@@ -389,6 +405,7 @@ describe("descriptor-bound produced ref guard", () => {
   it("rejects a workflow wrong-channel partial creation before persistence", async () => {
     const descriptorPlatform = ((): RegisteredSurfacePlatform => "github")();
     const port: SurfaceWorkflowProgressPort<RegisteredSurfacePlatform> = {
+      configurationRevision: "test-v1",
       checkMessage: async () => Result.ok("found"),
       send: async () =>
         Result.err({
@@ -412,6 +429,7 @@ describe("descriptor-bound produced ref guard", () => {
   it("rejects a workflow send ref with the selected platform and channel correlation", async () => {
     const descriptorPlatform = ((): RegisteredSurfacePlatform => "discord")();
     const port: SurfaceWorkflowProgressPort<RegisteredSurfacePlatform> = {
+      configurationRevision: "test-v1",
       checkMessage: async () => Result.ok("found"),
       send: async () => Result.ok(WRONG_PLATFORM_REF),
       edit: async () => Result.ok(undefined),
@@ -426,5 +444,76 @@ describe("descriptor-bound produced ref guard", () => {
       }),
     );
     expect(persisted).toBe(false);
+  });
+
+  it("rejects a forged workflow failure disposition and reason pair", async () => {
+    const failure = workflowProgressOperationFailure(
+      "send",
+      new SurfaceUnavailable({
+        platform: "discord",
+        operation: "send-message",
+        message: "unavailable",
+      }),
+    );
+    Object.defineProperty(failure, "disposition", { value: "permanent" });
+    const port: SurfaceWorkflowProgressPort<"discord"> = {
+      configurationRevision: "test-v1",
+      checkMessage: async () => Result.ok("found"),
+      send: async () => Result.err({ kind: "failed", error: failure }),
+      edit: async () => Result.ok(undefined),
+    };
+    const guarded = createDescriptorBoundWorkflowProgressPort("discord", port);
+
+    await expectPanic(() => guarded.send({ channelId: "channel", content: { text: "send" } }));
+  });
+
+  it.each([
+    ["fractional", 1.5],
+    ["NaN", Number.NaN],
+    ["infinite", Number.POSITIVE_INFINITY],
+    ["negative", -1],
+  ] as const)("rejects a %s workflow Retry-After", async (_label, retryAfterMs) => {
+    const failure = workflowProgressOperationFailure(
+      "send",
+      new SurfaceRateLimited({
+        platform: "discord",
+        operation: "send-message",
+        retryAfterMs,
+        message: "rate limited",
+      }),
+    );
+    const guarded = createDescriptorBoundWorkflowProgressPort("discord", {
+      configurationRevision: "test-v1",
+      checkMessage: async () => Result.ok("found"),
+      send: async () => Result.err({ kind: "failed", error: failure }),
+      edit: async () => Result.ok(undefined),
+    });
+
+    await expectPanic(() => guarded.send({ channelId: "channel", content: { text: "send" } }));
+  });
+
+  it("accepts an integer workflow Retry-After", async () => {
+    const failure = workflowProgressOperationFailure(
+      "send",
+      new SurfaceRateLimited({
+        platform: "discord",
+        operation: "send-message",
+        retryAfterMs: 1_500,
+        message: "rate limited",
+      }),
+    );
+    const guarded = createDescriptorBoundWorkflowProgressPort("discord", {
+      configurationRevision: "test-v1",
+      checkMessage: async () => Result.ok("found"),
+      send: async () => Result.err({ kind: "failed", error: failure }),
+      edit: async () => Result.ok(undefined),
+    });
+
+    const sent = await guarded.send({ channelId: "channel", content: { text: "send" } });
+
+    expect(sent.status).toBe("error");
+    if (sent.status === "error" && sent.error.kind === "failed") {
+      expect(sent.error.error.retryAfterMs).toBe(1_500);
+    }
   });
 });

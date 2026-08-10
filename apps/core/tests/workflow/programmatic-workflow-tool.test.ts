@@ -78,6 +78,39 @@ describe("ProgrammaticWorkflow trusted auto-run", () => {
         { scope: "project", name: "audit-routes", source: source() },
         { context },
       );
+      const crossTarget = invocationSchema.parse(
+        await tool.call(
+          "workflow.run.trigger",
+          {
+            scope: "project",
+            name: "audit-routes",
+            args: { directory: "src" },
+            progress: { client: "github", sessionId: "octo/repo#1" },
+            idempotencyKey: "cross-target",
+          },
+          { context },
+        ),
+      );
+      expect(
+        await tool.call("workflow.run.get", { runId: crossTarget.runId }, { context }),
+      ).toMatchObject({
+        run: {
+          origin: { client: "discord", sessionId: "channel-1", userId: "user-1" },
+          progressTarget: { platform: "github", channelId: "octo/repo#1" },
+        },
+      });
+      await expect(
+        tool.call(
+          "workflow.run.trigger",
+          { scope: "project", name: "audit-routes", args: { directory: "src" } },
+          {
+            context: {
+              ...context,
+              authenticatedPrincipal: { platform: "github", userId: "user-1" },
+            },
+          },
+        ),
+      ).rejects.toThrow("authenticated identity does not match the request origin");
       const first = invocationSchema.parse(
         await tool.call(
           "workflow.run.trigger",
@@ -86,7 +119,7 @@ describe("ProgrammaticWorkflow trusted auto-run", () => {
         ),
       );
       expect(first.state).toBe("queued");
-      expect(cards).toEqual([first.runId]);
+      expect(cards).toEqual([crossTarget.runId, first.runId]);
       const fetched = await tool.call("workflow.run.get", { runId: first.runId }, { context });
       expect(fetched).toMatchObject({
         run: {

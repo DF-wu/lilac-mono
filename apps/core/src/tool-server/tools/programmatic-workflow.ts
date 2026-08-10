@@ -234,6 +234,28 @@ function requestProgressTarget(context: RequestContext) {
   } as const;
 }
 
+function validateWorkflowRequestIdentity(
+  context: RequestContext,
+): ResultType<void, WorkflowToolFailure> {
+  const principal = context.authenticatedPrincipal;
+  if (!principal && context.authenticatedPrincipalSessionId === undefined) {
+    return Result.ok(undefined);
+  }
+  if (
+    !principal ||
+    principal.platform !== context.requestClient ||
+    !context.sessionId ||
+    context.authenticatedPrincipalSessionId !== context.sessionId
+  ) {
+    return Result.err(
+      new WorkflowToolFailure({
+        message: "Workflow authenticated identity does not match the request origin",
+      }),
+    );
+  }
+  return Result.ok(undefined);
+}
+
 function resolveWorkflowProgressTarget(
   progress: z.output<typeof progressInputSchema> | undefined,
   requestTarget: ReturnType<typeof requestProgressTarget>,
@@ -650,6 +672,7 @@ export class ProgrammaticWorkflow implements ServerTool {
     const { store, projectScope } = await this.workflowCallContext(opts);
     const definitions = await this.definitions(projectScope.canonicalRoot);
     const context = adaptWorkflowToolResultToHost(decodeTriggerContext(opts?.context));
+    adaptWorkflowToolResultToHost(validateWorkflowRequestIdentity(context));
     const requestTarget = requestProgressTarget(context);
     const definition = adaptWorkflowDefinitionResultToToolHost(
       await definitions.getResult({ scope: input.scope, name: input.name }),
@@ -883,6 +906,7 @@ export class ProgrammaticWorkflow implements ServerTool {
     const { store, projectScope } = await this.workflowCallContext(opts);
     const definitions = await this.definitions(projectScope.canonicalRoot);
     const context = adaptWorkflowToolResultToHost(decodeTriggerContext(opts?.context));
+    adaptWorkflowToolResultToHost(validateWorkflowRequestIdentity(context));
     const requestTarget = requestProgressTarget(context);
     const definition = adaptWorkflowDefinitionResultToToolHost(
       await definitions.getResult({ scope: input.scope, name: input.name }),

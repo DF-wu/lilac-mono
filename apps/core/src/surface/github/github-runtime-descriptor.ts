@@ -29,34 +29,25 @@ import type {
   SurfaceRequestIngress,
   SurfaceRuntimeDescriptor,
   SurfaceWorkflowProgressPort,
+  WorkflowProgressOperationFailed,
 } from "../runtime-descriptor";
 import {
   SurfaceIngressAcknowledgementCleanupFailed,
   SurfaceReplyTargetInvalid as ReplyTargetInvalid,
   SurfaceRefInvalid as RefInvalid,
-  WorkflowProgressOperationFailed,
+  workflowProgressOperationFailure,
 } from "../runtime-descriptor";
 
 type GithubWorkflowProgressOperation = "check-message" | "send" | "edit";
 
-function githubWorkflowProgressFailure(
-  operation: GithubWorkflowProgressOperation,
-  message: string,
-): { readonly kind: "failed"; readonly error: WorkflowProgressOperationFailed } {
-  return {
-    kind: "failed",
-    error: new WorkflowProgressOperationFailed({
-      operation,
-      message,
-    }),
-  };
-}
+// Bump when the declared workflow operation contract or failure policy changes.
+export const GITHUB_WORKFLOW_PROGRESS_CONFIGURATION_REVISION = "github-workflow-progress-v1";
 
 function githubWorkflowError(
   operation: GithubWorkflowProgressOperation,
   error: SurfaceOperationError,
 ): { readonly kind: "failed"; readonly error: WorkflowProgressOperationFailed } {
-  return githubWorkflowProgressFailure(operation, error.message);
+  return { kind: "failed", error: workflowProgressOperationFailure(operation, error) };
 }
 
 export function createGithubWorkflowProgressPort(
@@ -64,6 +55,7 @@ export function createGithubWorkflowProgressPort(
 ): SurfaceWorkflowProgressPort<"github"> {
   const guardedAdapter = createDescriptorBoundSurfaceAdapter("github", adapter);
   return {
+    configurationRevision: GITHUB_WORKFLOW_PROGRESS_CONFIGURATION_REVISION,
     checkMessage: async (target) => {
       const checked = await guardedAdapter.readMsg({
         platform: "github",

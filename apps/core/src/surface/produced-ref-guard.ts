@@ -12,7 +12,11 @@ import type {
 } from "./adapter";
 import { hasCacheBurstProvider, hasSurfaceGuildIdResolver } from "./adapter";
 import type { AdapterEvent } from "./events";
-import type { SurfaceRelayPolicy, SurfaceWorkflowProgressPort } from "./runtime-descriptor";
+import type {
+  SurfaceRelayPolicy,
+  SurfaceWorkflowProgressPort,
+  WorkflowProgressOperationFailed,
+} from "./runtime-descriptor";
 import type { MsgRef, RegisteredSurfacePlatform, SessionRef, SurfaceMessage } from "./types";
 import type { BusToAdapterRelaySnapshot } from "./bridge/subscribe-from-bus";
 
@@ -592,13 +596,102 @@ export function createDescriptorBoundSurfaceEventSource(
 
 const GUARDED_WORKFLOW_PORTS = new WeakMap<object, RegisteredSurfacePlatform>();
 
+function requireWorkflowProgressOperationFailure(
+  descriptorPlatform: RegisteredSurfacePlatform,
+  operation: WorkflowProgressOperationFailed["operation"],
+  error: WorkflowProgressOperationFailed,
+  contract: string,
+): void {
+  const receivedDisposition: string = error.disposition;
+  const receivedReason: string = error.reason;
+  if (error.operation !== operation) {
+    signalSurfaceAdapterContractViolation({
+      descriptorPlatform,
+      contract,
+      detail: `expected operation '${operation}', received '${error.operation}'`,
+    });
+  }
+  if (receivedDisposition === "permanent") {
+    const valid = [
+      "unsupported",
+      "invalid-input",
+      "platform-mismatch",
+      "session-mismatch",
+      "not-found",
+      "partial-outcome",
+    ].includes(receivedReason);
+    if (!valid) {
+      signalSurfaceAdapterContractViolation({
+        descriptorPlatform,
+        contract,
+        detail: `permanent failure cannot use reason '${receivedReason}'`,
+      });
+    }
+    if (error.retryAfterMs !== undefined) {
+      signalSurfaceAdapterContractViolation({
+        descriptorPlatform,
+        contract,
+        detail: "permanent failure cannot provide retryAfterMs",
+      });
+    }
+    return;
+  }
+  if (receivedDisposition === "retryable") {
+    const valid = ["permission-denied", "rate-limited", "unavailable"].includes(receivedReason);
+    if (!valid) {
+      signalSurfaceAdapterContractViolation({
+        descriptorPlatform,
+        contract,
+        detail: `retryable failure cannot use reason '${receivedReason}'`,
+      });
+    }
+    if (receivedReason !== "rate-limited" && error.retryAfterMs !== undefined) {
+      signalSurfaceAdapterContractViolation({
+        descriptorPlatform,
+        contract,
+        detail: `retryAfterMs cannot accompany reason '${receivedReason}'`,
+      });
+    }
+    if (
+      error.retryAfterMs !== undefined &&
+      (!Number.isFinite(error.retryAfterMs) ||
+        !Number.isInteger(error.retryAfterMs) ||
+        error.retryAfterMs < 0)
+    ) {
+      signalSurfaceAdapterContractViolation({
+        descriptorPlatform,
+        contract,
+        detail: "retryAfterMs must be a finite non-negative integer",
+      });
+    }
+    return;
+  }
+  signalSurfaceAdapterContractViolation({
+    descriptorPlatform,
+    contract,
+    detail: `unsupported failure disposition '${receivedDisposition}'`,
+  });
+}
+
 export function createDescriptorBoundWorkflowProgressPort<P extends RegisteredSurfacePlatform>(
   descriptorPlatform: P,
   port: SurfaceWorkflowProgressPort<P>,
 ): SurfaceWorkflowProgressPort<P> {
   if (GUARDED_WORKFLOW_PORTS.get(port) === descriptorPlatform) return port;
   const guarded: SurfaceWorkflowProgressPort<P> = {
-    checkMessage: (target) => port.checkMessage(target),
+    configurationRevision: port.configurationRevision,
+    checkMessage: async (target) => {
+      const checked = await port.checkMessage(target);
+      if (checked.status === "error" && checked.error.kind === "failed") {
+        requireWorkflowProgressOperationFailure(
+          descriptorPlatform,
+          "check-message",
+          checked.error.error,
+          "workflowProgress.checkMessage.result",
+        );
+      }
+      return checked;
+    },
     send: async (input) => {
       const sent = await port.send(input);
       if (sent.status === "ok") {
@@ -615,10 +708,28 @@ export function createDescriptorBoundWorkflowProgressPort<P extends RegisteredSu
           "workflowProgress.send.error.created",
           input.channelId,
         );
+      } else {
+        requireWorkflowProgressOperationFailure(
+          descriptorPlatform,
+          "send",
+          sent.error.error,
+          "workflowProgress.send.result",
+        );
       }
       return sent;
     },
-    edit: (target, content) => port.edit(target, content),
+    edit: async (target, content) => {
+      const edited = await port.edit(target, content);
+      if (edited.status === "error" && edited.error.kind === "failed") {
+        requireWorkflowProgressOperationFailure(
+          descriptorPlatform,
+          "edit",
+          edited.error.error,
+          "workflowProgress.edit.result",
+        );
+      }
+      return edited;
+    },
   };
   GUARDED_WORKFLOW_PORTS.set(guarded, descriptorPlatform);
   return guarded;

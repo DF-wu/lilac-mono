@@ -2,6 +2,7 @@ import type { AdapterPlatform, SurfaceMsgRef } from "@stanley2058/lilac-event-bu
 import { Result, TaggedError, type Result as ResultType } from "better-result";
 
 import type { SurfaceAdapter } from "./adapter";
+import type { SurfaceOperationError } from "./adapter";
 import type { ContentOpts, MsgRefFor, RegisteredSurfacePlatform, SessionRefFor } from "./types";
 import type { BusToAdapterRelaySnapshot } from "./bridge/subscribe-from-bus";
 import {
@@ -116,12 +117,129 @@ export type SurfaceRelayDescriptor<P extends RegisteredSurfacePlatform> = {
   readonly lifecycle: SurfaceRelayLifecyclePort<P>;
 } & SurfaceRelayPolicy<P>;
 
-export class WorkflowProgressOperationFailed extends TaggedError(
-  "WorkflowProgressOperationFailed",
-)<{
+type WorkflowProgressOperationFailureBase = {
   readonly operation: "check-message" | "send" | "edit";
   readonly message: string;
-}> {}
+};
+
+export type WorkflowProgressOperationFailureFields = WorkflowProgressOperationFailureBase &
+  (
+    | {
+        readonly disposition: "permanent";
+        readonly reason:
+          | "unsupported"
+          | "invalid-input"
+          | "platform-mismatch"
+          | "session-mismatch"
+          | "not-found"
+          | "partial-outcome";
+        readonly retryAfterMs?: never;
+      }
+    | {
+        readonly disposition: "retryable";
+        readonly reason: "rate-limited";
+        readonly retryAfterMs?: number;
+      }
+    | {
+        readonly disposition: "retryable";
+        readonly reason: "permission-denied" | "unavailable";
+        readonly retryAfterMs?: never;
+      }
+  );
+
+class WorkflowProgressPermanentOperationFailed extends TaggedError(
+  "WorkflowProgressOperationFailed",
+)<Extract<WorkflowProgressOperationFailureFields, { readonly disposition: "permanent" }>> {}
+
+class WorkflowProgressRateLimitedOperationFailed extends TaggedError(
+  "WorkflowProgressOperationFailed",
+)<Extract<WorkflowProgressOperationFailureFields, { readonly reason: "rate-limited" }>> {}
+
+class WorkflowProgressRetryableOperationFailed extends TaggedError(
+  "WorkflowProgressOperationFailed",
+)<
+  Extract<
+    WorkflowProgressOperationFailureFields,
+    { readonly reason: "permission-denied" | "unavailable" }
+  >
+> {}
+
+export type WorkflowProgressOperationFailed =
+  | WorkflowProgressPermanentOperationFailed
+  | WorkflowProgressRateLimitedOperationFailed
+  | WorkflowProgressRetryableOperationFailed;
+
+export function workflowProgressOperationFailure(
+  operation: WorkflowProgressOperationFailed["operation"],
+  error: SurfaceOperationError,
+): WorkflowProgressOperationFailed {
+  switch (error._tag) {
+    case "SurfaceOperationUnsupported":
+      return new WorkflowProgressPermanentOperationFailed({
+        operation,
+        disposition: "permanent",
+        reason: "unsupported",
+        message: error.message,
+      });
+    case "SurfaceInvalidInput":
+      return new WorkflowProgressPermanentOperationFailed({
+        operation,
+        disposition: "permanent",
+        reason: "invalid-input",
+        message: error.message,
+      });
+    case "SurfacePlatformMismatch":
+      return new WorkflowProgressPermanentOperationFailed({
+        operation,
+        disposition: "permanent",
+        reason: "platform-mismatch",
+        message: error.message,
+      });
+    case "SurfaceSessionMismatch":
+      return new WorkflowProgressPermanentOperationFailed({
+        operation,
+        disposition: "permanent",
+        reason: "session-mismatch",
+        message: error.message,
+      });
+    case "SurfaceMessageNotFound":
+      return new WorkflowProgressPermanentOperationFailed({
+        operation,
+        disposition: "permanent",
+        reason: "not-found",
+        message: error.message,
+      });
+    case "SurfacePermissionDenied":
+      return new WorkflowProgressRetryableOperationFailed({
+        operation,
+        disposition: "retryable",
+        reason: "permission-denied",
+        message: error.message,
+      });
+    case "SurfaceRateLimited":
+      return new WorkflowProgressRateLimitedOperationFailed({
+        operation,
+        disposition: "retryable",
+        reason: "rate-limited",
+        ...(error.retryAfterMs === undefined ? {} : { retryAfterMs: error.retryAfterMs }),
+        message: error.message,
+      });
+    case "SurfaceUnavailable":
+      return new WorkflowProgressRetryableOperationFailed({
+        operation,
+        disposition: "retryable",
+        reason: "unavailable",
+        message: error.message,
+      });
+    case "SurfaceOperationPartiallyCompleted":
+      return new WorkflowProgressPermanentOperationFailed({
+        operation,
+        disposition: "permanent",
+        reason: "partial-outcome",
+        message: error.message,
+      });
+  }
+}
 
 export type WorkflowProgressCheckFailure = {
   readonly kind: "failed";
@@ -129,7 +247,7 @@ export type WorkflowProgressCheckFailure = {
 };
 
 export type WorkflowProgressSendFailure<P extends RegisteredSurfacePlatform> =
-  | (P extends "github" ? { readonly kind: "created"; readonly ref: MsgRefFor<P> } : never)
+  | { readonly kind: "created"; readonly ref: MsgRefFor<P> }
   | { readonly kind: "failed"; readonly error: WorkflowProgressOperationFailed };
 
 export type WorkflowProgressEditFailure =
@@ -149,6 +267,7 @@ export type WorkflowProgressSendInput = {
 };
 
 export type SurfaceWorkflowProgressPort<P extends RegisteredSurfacePlatform> = {
+  readonly configurationRevision: string;
   checkMessage(
     target: WorkflowProgressMessageTarget,
   ): Promise<ResultType<"found" | "missing", WorkflowProgressCheckFailure>>;

@@ -4,7 +4,7 @@ import { Result, TaggedError, type Result as ResultType } from "better-result";
 
 import { WORKFLOW_MANUAL_RECONCILIATION_DETAIL } from "./workflow-domain";
 
-export const WORKFLOW_SCHEMA_VERSION = 24;
+export const WORKFLOW_SCHEMA_VERSION = 25;
 
 type WorkflowMigration = {
   version: number;
@@ -1433,6 +1433,11 @@ const WORKFLOW_MIGRATIONS: readonly WorkflowMigration[] = [
           );
         END`,
     ],
+  },
+  {
+    version: 25,
+    name: "durable workflow progress permanent failure gate",
+    statements: [`ALTER TABLE workflow_surface_bindings ADD COLUMN permanent_failure_json TEXT`],
   },
 ];
 

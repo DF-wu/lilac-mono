@@ -210,7 +210,12 @@ function downgradeSchemaToV21(db: Database): void {
         NEW.created_at
       );
     END`);
+  db.run("ALTER TABLE workflow_surface_bindings DROP COLUMN permanent_failure_json");
   db.run("DELETE FROM workflow_schema_migrations WHERE version >= 22");
+}
+function downgradeSchemaToV24(db: Database): void {
+  db.run("ALTER TABLE workflow_surface_bindings DROP COLUMN permanent_failure_json");
+  db.run("DELETE FROM workflow_schema_migrations WHERE version = 25");
 }
 function downgradeSchemaToV20(db: Database): void {
   downgradeSchemaToV21(db);
@@ -342,6 +347,57 @@ describe("durable workflow store minimal dispatch schema", () => {
       }
     });
   }
+  it("upgrades a populated on-disk v24 binding through v25 without changing its data", () => {
+    const file = dbPath("populated-v24-binding");
+    const target = {
+      platform: "discord" as const,
+      channelId: "channel-1",
+      replyToMessageId: "origin-1",
+    };
+    const binding = {
+      runId: "run-1",
+      target,
+      messageRef: { platform: "discord" as const, channelId: "channel-1", messageId: "card-1" },
+      lastRenderedSha256: "f".repeat(64),
+      lastError: "legacy retry",
+      retryCount: 2,
+      nextAttemptAt: 50,
+      permanentFailure: null,
+      createdAt: 10,
+      updatedAt: 20,
+    };
+    let store = new DurableWorkflowStore(file);
+    store.createInvocation({
+      revision: revision(),
+      run: { ...run(), progressTarget: target },
+    });
+    store.upsertSurfaceBinding(binding);
+    store.close();
+
+    const v24 = new Database(file);
+    try {
+      downgradeSchemaToV24(v24);
+      const upgraded = applyWorkflowSchemaMigrations(v24, () => 30);
+      expect(upgraded.status).toBe("ok");
+      expect(
+        v24
+          .query<{ permanent_failure_json: string | null }, []>(
+            "SELECT permanent_failure_json FROM workflow_surface_bindings WHERE run_id = 'run-1'",
+          )
+          .get(),
+      ).toEqual({ permanent_failure_json: null });
+    } finally {
+      v24.close();
+    }
+
+    store = new DurableWorkflowStore(file);
+    try {
+      expect(workflowStoreValue(store.getSurfaceBinding("run-1"))).toEqual(binding);
+    } finally {
+      store.close();
+      rmSync(file, { force: true });
+    }
+  });
   it("rejects workflow databases migrated by an unknown future runtime", () => {
     const file = dbPath("future-schema");
     const db = new Database(file);
@@ -457,7 +513,7 @@ describe("durable workflow store minimal dispatch schema", () => {
         }),
       ).toBe(true);
       expect(
-        workflowStoreValue(store.listRunsNeedingProjectionReconciliation(1)).map(
+        workflowStoreValue(store.listRunsNeedingProjectionReconciliation({ limit: 1 })).map(
           (item) => item.runId,
         ),
       ).toEqual(["active-a"]);
@@ -466,6 +522,70 @@ describe("durable workflow store minimal dispatch schema", () => {
           (item) => item.runId,
         ),
       ).toEqual(["active-a", "active-b", "terminal"]);
+    } finally {
+      store.close();
+      rmSync(file, { force: true });
+    }
+  });
+  it("rolls back a binding upsert when action revocation fails", () => {
+    const file = dbPath("binding-action-revocation-rollback");
+    const target = {
+      platform: "discord" as const,
+      channelId: "channel-1",
+      replyToMessageId: null,
+    };
+    const originalBinding = {
+      runId: "run-1",
+      target,
+      messageRef: null,
+      lastRenderedSha256: null,
+      lastError: null,
+      retryCount: 0,
+      nextAttemptAt: null,
+      permanentFailure: null,
+      createdAt: 10,
+      updatedAt: 10,
+    };
+    const store = new DurableWorkflowStore(file);
+    try {
+      store.createInvocation({
+        revision: revision(),
+        run: { ...run(), progressTarget: target },
+      });
+      store.upsertSurfaceBinding(originalBinding);
+      store.createSurfaceAction({
+        actionId: "action-1",
+        tokenSha256: "e".repeat(64),
+        runId: "run-1",
+        kind: "pause",
+        expectedPlatform: "discord",
+        expectedUserId: "user-1",
+        expectedMessageRef: null,
+        expiresAt: 100,
+        consumedAt: null,
+        consumedByPlatform: null,
+        consumedByUserId: null,
+        createdAt: 10,
+      });
+      const faultDb = new Database(file);
+      try {
+        faultDb.run(`CREATE TRIGGER fail_workflow_surface_action_expiry
+          BEFORE UPDATE OF expires_at ON workflow_surface_actions
+          BEGIN
+            SELECT RAISE(ABORT, 'injected action expiry failure');
+          END`);
+      } finally {
+        faultDb.close();
+      }
+
+      expect(() =>
+        store.commitSurfaceBindingWithActionRevocation(
+          { ...originalBinding, lastError: "must roll back", updatedAt: 20 },
+          20,
+        ),
+      ).toThrow("Durable workflow SQLite operation failed");
+      expect(workflowStoreValue(store.getSurfaceBinding("run-1"))).toEqual(originalBinding);
+      expect(workflowStoreValue(store.getSurfaceAction("action-1"))?.expiresAt).toBe(100);
     } finally {
       store.close();
       rmSync(file, { force: true });
@@ -485,7 +605,7 @@ describe("durable workflow store minimal dispatch schema", () => {
       );
       expect(store.listMigrations().at(-1)).toMatchObject({
         version: WORKFLOW_SCHEMA_VERSION,
-        name: "durable orphaned live-parent delivery",
+        name: "durable workflow progress permanent failure gate",
       });
     } finally {
       store.close();
@@ -549,6 +669,7 @@ describe("durable workflow store minimal dispatch schema", () => {
         "next_attempt_at",
         "created_at",
         "updated_at",
+        "permanent_failure_json",
       ]);
       expect(
         db
