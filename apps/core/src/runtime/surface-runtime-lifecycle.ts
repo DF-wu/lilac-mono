@@ -1,14 +1,25 @@
+import { Panic, Result, TaggedError, type Result as ResultType } from "better-result";
+import type { AdapterPlatform } from "@stanley2058/lilac-event-bus";
+
 import type { SurfaceAdapter } from "../surface/adapter";
-import type { AgentRunnerRecoveryEntry } from "../surface/bridge/bus-agent-runner";
+import type {
+  AgentRecoveryAttempt,
+  AgentRecoveryUnavailable,
+  AgentRunnerQueueAttempt,
+  AgentRunnerRecoveryEntry,
+} from "../surface/bridge/bus-agent-runner";
 import type { BusToAdapterRelaySnapshot } from "../surface/bridge/subscribe-from-bus";
 import type {
   RegisteredSurfacePlatform,
   RegisteredSurfaceWorkflowProgressPort,
   SurfaceAdapterIngressHandle,
   SurfaceRelayHandle,
+  SurfaceRelayRestoreAttempt,
+  SurfaceRelayRestoreRollbackFailed,
   SurfaceRequestIngressHandle,
   SurfaceRuntimeRegistry,
 } from "../surface/runtime-descriptor";
+import { SurfaceRelayRestoreApplyFailed } from "../surface/runtime-descriptor";
 import {
   requireDescriptorPlatform,
   requireSurfaceRelaySnapshot,
@@ -17,8 +28,73 @@ import {
 type AgentRecovery = {
   beginDrain(options: { readonly deadlineMs: number }): Promise<void>;
   snapshotRecoverables(): AgentRunnerRecoveryEntry[];
+  snapshotQueueAttempts(): AgentRunnerQueueAttempt[];
   restoreRecoverables(entries: readonly AgentRunnerRecoveryEntry[]): void;
+  prepareRecovery(input: {
+    readonly entries: readonly AgentRunnerRecoveryEntry[];
+    readonly queueAttempts: readonly AgentRunnerQueueAttempt[];
+  }): ResultType<AgentRecoveryAttempt, AgentRecoveryUnavailable>;
 };
+
+export class SurfaceRecoveryUnavailable extends TaggedError("SurfaceRecoveryUnavailable")<{
+  readonly requestId: string;
+  readonly platform: AdapterPlatform;
+  readonly sessionId: string;
+  readonly reason:
+    | "descriptor-unavailable"
+    | "relay-port-unavailable"
+    | "relay-handle-unavailable"
+    | "agent-attempt-unavailable"
+    | "legacy-queue-proof-ambiguous";
+  readonly message: string;
+}> {}
+
+export type SurfaceRecoveryPlan = {
+  readonly snapshot: {
+    readonly createdAt: number;
+    readonly deadlineMs: number;
+    readonly agent: readonly AgentRunnerRecoveryEntry[];
+    readonly queueAttempts: readonly AgentRunnerQueueAttempt[];
+    readonly queueAttemptProof: "complete" | "legacy-ambiguous";
+    readonly relays: readonly BusToAdapterRelaySnapshot[];
+  };
+  readonly attempts: readonly SurfaceRelayRestoreAttempt<RegisteredSurfacePlatform>[];
+  readonly agentAttempt: AgentRecoveryAttempt;
+};
+
+const activatedRecoveryPlans = new WeakSet<SurfaceRecoveryPlan>();
+
+export type PausedSurfaceRecoveryOwnership = {
+  readonly plan: SurfaceRecoveryPlan;
+  activate(): void;
+  rollback(): Promise<void>;
+};
+
+export function createPausedSurfaceRecoveryOwnership(
+  plan: SurfaceRecoveryPlan,
+): PausedSurfaceRecoveryOwnership {
+  let state: "pending" | "active" | "rolled-back" = "pending";
+  return {
+    plan,
+    activate: () => {
+      if (state !== "pending") return;
+      state = "active";
+      activateSurfaceRecovery(plan);
+    },
+    rollback: async () => {
+      if (state !== "pending") return;
+      state = "rolled-back";
+      await rollbackSurfaceRecovery(plan);
+    },
+  };
+}
+
+function signalSurfaceRecoveryRollbackAtomicityUnknown(
+  message: string,
+  failures: readonly SurfaceRelayRestoreRollbackFailed[],
+): never {
+  throw new Panic({ message, cause: failures });
+}
 
 type CleanupRunner = (label: string, cleanup: (() => Promise<void>) | undefined) => Promise<void>;
 
@@ -105,49 +181,264 @@ export async function startSurfaceOutputs(input: {
   }
 }
 
-export async function restoreSurfaceRecovery(input: {
+export function prepareSurfaceRecovery(input: {
   readonly registry: SurfaceRuntimeRegistry;
   readonly snapshot: {
+    readonly createdAt: number;
+    readonly deadlineMs: number;
     readonly agent: readonly AgentRunnerRecoveryEntry[];
+    readonly queueAttempts: readonly AgentRunnerQueueAttempt[];
+    readonly queueAttemptProof: "complete" | "legacy-ambiguous";
     readonly relays: readonly BusToAdapterRelaySnapshot[];
   };
   readonly relays: SurfaceRelayHandles;
-  readonly agentRunner: Pick<AgentRecovery, "restoreRecoverables"> | null;
-}): Promise<{
-  readonly agentEntriesDispatched: number;
-  readonly agentEntriesUndispatched: number;
-  readonly relayEntriesMatched: number;
-  readonly relayEntriesUnmatched: number;
-}> {
-  let relayEntriesMatched = 0;
-  for (const descriptor of input.registry.entries()) {
-    for (const snapshot of input.snapshot.relays) {
-      if (snapshot.platform !== descriptor.platform) continue;
-      requireSurfaceRelaySnapshot(descriptor.platform, snapshot, "gracefulRestart.restoreRelays");
+  readonly agentRunner: Pick<AgentRecovery, "prepareRecovery">;
+}): ResultType<
+  SurfaceRecoveryPlan,
+  SurfaceRecoveryUnavailable | SurfaceRelayRestoreApplyFailed | AgentRecoveryUnavailable
+> {
+  if (input.snapshot.queueAttemptProof === "legacy-ambiguous" && input.snapshot.agent.length > 0) {
+    const first = input.snapshot.agent[0];
+    return Result.err(
+      new SurfaceRecoveryUnavailable({
+        requestId: first?.requestId ?? "legacy-recovery",
+        platform: first?.requestClient ?? "unknown",
+        sessionId: first?.sessionId ?? "legacy-recovery",
+        reason: "legacy-queue-proof-ambiguous",
+        message: "Legacy recovery cannot prove the absence of parked queue reservations",
+      }),
+    );
+  }
+  const unsafeAttempt = input.snapshot.queueAttempts.find(
+    (attempt) => attempt.kind === "buffered-absorption" && !attempt.controlApplied,
+  );
+  if (unsafeAttempt) {
+    return Result.err(
+      new SurfaceRecoveryUnavailable({
+        requestId: unsafeAttempt.controlRequestId,
+        platform: unsafeAttempt.controlRequestClient,
+        sessionId: unsafeAttempt.sessionId,
+        reason: "agent-attempt-unavailable",
+        message: "Buffered queue control was not durably applied before process replacement",
+      }),
+    );
+  }
+  const requiredAgentSurfaces = new Map<
+    RegisteredSurfacePlatform,
+    { readonly requestId: string; readonly sessionId: string }
+  >();
+  for (const entry of input.snapshot.agent) {
+    if (entry.requestClient === "discord" || entry.requestClient === "github") {
+      requiredAgentSurfaces.set(entry.requestClient, {
+        requestId: entry.requestId,
+        sessionId: entry.sessionId,
+      });
+    }
+    const identity = entry.identity;
+    if (identity?.state === "durable" && identity.projection.authenticatedOrigin) {
+      const origin = identity.projection.authenticatedOrigin;
+      requiredAgentSurfaces.set(origin.platform, {
+        requestId: entry.requestId,
+        sessionId: origin.sessionRef.channelId,
+      });
     }
   }
-  for (const descriptor of input.registry.entries()) {
-    const relay = input.relays.get(descriptor.platform);
-    if (!relay) continue;
+  for (const [platform, required] of requiredAgentSurfaces) {
+    const descriptor = input.registry.entries().find((entry) => entry.platform === platform);
+    if (!descriptor) {
+      return Result.err(
+        new SurfaceRecoveryUnavailable({
+          ...required,
+          platform,
+          reason: "descriptor-unavailable",
+          message: "Recovery agent surface descriptor is unavailable",
+        }),
+      );
+    }
+    if (!descriptor.relay) {
+      return Result.err(
+        new SurfaceRecoveryUnavailable({
+          ...required,
+          platform,
+          reason: "relay-port-unavailable",
+          message: "Recovery agent surface relay port is unavailable",
+        }),
+      );
+    }
+    if (!input.relays.has(platform)) {
+      return Result.err(
+        new SurfaceRecoveryUnavailable({
+          ...required,
+          platform,
+          reason: "relay-handle-unavailable",
+          message: "Recovery agent surface relay handle is unavailable",
+        }),
+      );
+    }
+  }
+  const agentAttempt = input.agentRunner.prepareRecovery({
+    entries: input.snapshot.agent,
+    queueAttempts: input.snapshot.queueAttempts,
+  });
+  if (agentAttempt.status === "error") return Result.err(agentAttempt.error);
+  const identities = new Set<string>();
+  for (const snapshot of input.snapshot.relays) {
+    const identity = `${snapshot.requestId}\u0000${snapshot.platform}\u0000${snapshot.sessionId}`;
+    if (identities.has(identity)) {
+      return Result.err(
+        new SurfaceRelayRestoreApplyFailed({
+          platform: snapshot.platform,
+          requestId: snapshot.requestId,
+          message: "Graceful restart snapshot contains a duplicate relay identity",
+        }),
+      );
+    }
+    identities.add(identity);
+    const descriptor = input.registry
+      .entries()
+      .find((candidate) => candidate.platform === snapshot.platform);
+    if (!descriptor) {
+      return Result.err(
+        new SurfaceRecoveryUnavailable({
+          requestId: snapshot.requestId,
+          platform: snapshot.platform,
+          sessionId: snapshot.sessionId,
+          reason: "descriptor-unavailable",
+          message: "Graceful restart surface descriptor is unavailable",
+        }),
+      );
+    }
+    if (!descriptor.relay) {
+      return Result.err(
+        new SurfaceRecoveryUnavailable({
+          requestId: snapshot.requestId,
+          platform: snapshot.platform,
+          sessionId: snapshot.sessionId,
+          reason: "relay-port-unavailable",
+          message: "Graceful restart surface relay port is unavailable",
+        }),
+      );
+    }
+    const relay = input.relays.get(snapshot.platform);
+    if (!relay) {
+      return Result.err(
+        new SurfaceRecoveryUnavailable({
+          requestId: snapshot.requestId,
+          platform: snapshot.platform,
+          sessionId: snapshot.sessionId,
+          reason: "relay-handle-unavailable",
+          message: "Graceful restart surface relay handle is unavailable",
+        }),
+      );
+    }
     requireDescriptorPlatform(
-      descriptor.platform,
+      snapshot.platform,
       relay.platform,
       "gracefulRestart.restoreRelayHandle",
     );
+    requireSurfaceRelaySnapshot(snapshot.platform, snapshot, "gracefulRestart.restoreRelays");
+  }
+
+  const attempts: SurfaceRelayRestoreAttempt<RegisteredSurfacePlatform>[] = [];
+  for (const descriptor of input.registry.entries()) {
     const snapshots = input.snapshot.relays.filter(
       (snapshot) => snapshot.platform === descriptor.platform,
     );
-    await relay.restoreRelays(snapshots);
-    relayEntriesMatched += snapshots.length;
+    if (snapshots.length === 0) continue;
+    const relay = input.relays.get(descriptor.platform);
+    if (!relay) continue;
+    const prepared = relay.prepareRestoreRelays(snapshots);
+    if (prepared.status === "error") return Result.err(prepared.error);
+    attempts.push(prepared.value);
   }
-  input.agentRunner?.restoreRecoverables(input.snapshot.agent);
-  const agentEntriesDispatched = input.agentRunner ? input.snapshot.agent.length : 0;
-  return {
-    agentEntriesDispatched,
-    agentEntriesUndispatched: input.snapshot.agent.length - agentEntriesDispatched,
-    relayEntriesMatched,
-    relayEntriesUnmatched: input.snapshot.relays.length - relayEntriesMatched,
+  return Result.ok({ snapshot: input.snapshot, attempts, agentAttempt: agentAttempt.value });
+}
+
+export async function applySurfaceRecovery(
+  plan: SurfaceRecoveryPlan,
+): Promise<ResultType<void, SurfaceRelayRestoreApplyFailed>> {
+  const applied: SurfaceRelayRestoreAttempt<RegisteredSurfacePlatform>[] = [];
+  const rollbackApplied = async (): Promise<void> => {
+    const failures: SurfaceRelayRestoreRollbackFailed[] = [];
+    for (const rollback of applied.toReversed()) {
+      const rolledBack = await rollback.rollback();
+      if (rolledBack.status === "error") failures.push(rolledBack.error);
+    }
+    plan.agentAttempt.rollback();
+    if (failures.length > 0) {
+      signalSurfaceRecoveryRollbackAtomicityUnknown(
+        "Graceful relay restore rollback left recovery atomicity unknown",
+        failures,
+      );
+    }
   };
+  for (const attempt of plan.attempts) {
+    applied.push(attempt);
+    const result = await attempt.apply();
+    if (result.status === "ok") continue;
+    await rollbackApplied();
+    return Result.err(result.error);
+  }
+  const agentApplied = plan.agentAttempt.apply();
+  if (agentApplied.status === "error") {
+    await rollbackApplied();
+    return Result.err(
+      new SurfaceRelayRestoreApplyFailed({
+        platform: plan.snapshot.relays[0]?.platform ?? "discord",
+        requestId: agentApplied.error.requestId,
+        message: agentApplied.error.message,
+      }),
+    );
+  }
+  return Result.ok(undefined);
+}
+
+export async function rollbackSurfaceRecovery(plan: SurfaceRecoveryPlan): Promise<void> {
+  const failures: SurfaceRelayRestoreRollbackFailed[] = [];
+  for (const attempt of plan.attempts.toReversed()) {
+    const rolledBack = await attempt.rollback();
+    if (rolledBack.status === "error") failures.push(rolledBack.error);
+  }
+  plan.agentAttempt.rollback();
+  if (failures.length > 0) {
+    signalSurfaceRecoveryRollbackAtomicityUnknown(
+      "Graceful paused recovery rollback left atomicity unknown",
+      failures,
+    );
+  }
+}
+
+export function activateSurfaceRecovery(plan: SurfaceRecoveryPlan): void {
+  if (activatedRecoveryPlans.has(plan)) return;
+  activatedRecoveryPlans.add(plan);
+  for (const attempt of plan.attempts) attempt.activate();
+  plan.agentAttempt.activate();
+}
+
+export async function restoreSurfaceRecovery(input: {
+  readonly registry: SurfaceRuntimeRegistry;
+  readonly snapshot: {
+    readonly createdAt: number;
+    readonly deadlineMs: number;
+    readonly agent: readonly AgentRunnerRecoveryEntry[];
+    readonly queueAttempts: readonly AgentRunnerQueueAttempt[];
+    readonly queueAttemptProof: "complete" | "legacy-ambiguous";
+    readonly relays: readonly BusToAdapterRelaySnapshot[];
+  };
+  readonly relays: SurfaceRelayHandles;
+  readonly agentRunner: Pick<AgentRecovery, "prepareRecovery" | "restoreRecoverables">;
+}): Promise<
+  ResultType<
+    void,
+    SurfaceRecoveryUnavailable | SurfaceRelayRestoreApplyFailed | AgentRecoveryUnavailable
+  >
+> {
+  const prepared = prepareSurfaceRecovery(input);
+  if (prepared.status === "error") return Result.err(prepared.error);
+  const applied = await applySurfaceRecovery(prepared.value);
+  if (applied.status === "error") return Result.err(applied.error);
+  activateSurfaceRecovery(prepared.value);
+  return Result.ok(undefined);
 }
 
 export async function stopSurfaceAdapterIngress(input: {
@@ -208,6 +499,7 @@ export async function stopIngressAndDrainSurfaceRecovery(input: {
 }): Promise<{
   readonly agent: AgentRunnerRecoveryEntry[];
   readonly relays: BusToAdapterRelaySnapshot[];
+  readonly queueAttempts: AgentRunnerQueueAttempt[];
 }> {
   await input.stopAdapterIngress();
   await input.stopRouterIngress();
@@ -238,8 +530,12 @@ export async function stopIngressAndDrainSurfaceRecovery(input: {
   }
 
   let agent: AgentRunnerRecoveryEntry[] = [];
+  let queueAttempts: AgentRunnerQueueAttempt[] = [];
   await input.runCleanup("graceful.agentRunner.snapshotRecoverables", async () => {
-    agent = await input.agentRunner.snapshotRecoverables();
+    const capturedAgent = await input.agentRunner.snapshotRecoverables();
+    const capturedQueueAttempts = await input.agentRunner.snapshotQueueAttempts();
+    agent = capturedAgent;
+    queueAttempts = capturedQueueAttempts;
   });
   const relays: BusToAdapterRelaySnapshot[] = [];
   for (const descriptor of input.registry.entries()) {
@@ -272,6 +568,7 @@ export async function stopIngressAndDrainSurfaceRecovery(input: {
   }
   return {
     agent,
+    queueAttempts,
     relays,
   };
 }

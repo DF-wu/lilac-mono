@@ -23,34 +23,49 @@ export class GithubOutputStream implements SurfaceOutputStream {
     private readonly opts?: { replyTo?: MsgRef },
   ) {}
 
+  hydrateRecovery(parts: readonly SurfaceOutputPart[]): SurfaceOutputPartDisposition {
+    let disposition: SurfaceOutputPartDisposition = "ignored";
+    for (const part of parts) {
+      const applied = this.applyPart(part);
+      if (applied === "visible" || (applied === "terminal" && disposition === "ignored")) {
+        disposition = applied;
+      }
+    }
+    return disposition;
+  }
+
   async push(
     part: SurfaceOutputPart,
   ): Promise<SurfaceOperationResult<SurfaceOutputPartDisposition>> {
+    return Result.ok(this.applyPart(part));
+  }
+
+  private applyPart(part: SurfaceOutputPart): SurfaceOutputPartDisposition {
     switch (part.type) {
       case "text.delta": {
         // Buffer deltas; GitHub surface posts once at finish.
         this.text += part.delta;
-        return Result.ok("visible");
+        return "visible";
       }
       case "text.set": {
         this.text = part.text;
-        return Result.ok("visible");
+        return "visible";
       }
       case "attachment.add": {
         // GitHub omits binary attachments, but attachment-only replies still complete at finish.
-        return Result.ok("terminal");
+        return "terminal";
       }
       case "reasoning.status": {
         // Ignore (no streaming UI for GitHub).
-        return Result.ok("ignored");
+        return "ignored";
       }
       case "tool.status": {
         // GitHub has no tool UI, but tool-only replies still complete at finish.
-        return Result.ok("terminal");
+        return "terminal";
       }
       case "meta.stats": {
         // Ignore (no dedicated stats UI for GitHub).
-        return Result.ok("ignored");
+        return "ignored";
       }
       default: {
         const _exhaustive: never = part;

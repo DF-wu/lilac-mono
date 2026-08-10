@@ -79,6 +79,11 @@ export type RequestMessageCacheOptions = {
   readonly now?: () => number;
 };
 
+export type RequestMessageCacheRestoreAttempt = {
+  apply(): ResultType<void, AuthenticatedRequestIdentityConflict>;
+  rollback(): void;
+};
+
 export type RequestMessageCache = {
   get(requestId: string): readonly unknown[] | undefined;
   getOrigin(requestId: string): AuthenticatedRequestOrigin | undefined;
@@ -86,6 +91,12 @@ export type RequestMessageCache = {
     msg: LilacMessageForTopic<"cmd.request">,
     projection?: AuthenticatedRequestProjection,
   ): ResultType<AuthenticatedRequestOrigin | undefined, RequestMessageCacheAdmissionError>;
+  prepareRestore(
+    input: readonly {
+      readonly projection: AuthenticatedRequestProjection;
+      readonly parkedEventIds: readonly string[];
+    }[],
+  ): ResultType<RequestMessageCacheRestoreAttempt, AuthenticatedRequestIdentityConflict>;
   acquireOwner(
     requestId: string,
   ): ResultType<RequestMessageCacheOwner, RequestIdentitySourceMissing>;
@@ -241,6 +252,108 @@ export function createRequestMessageCache(
     return Result.ok(entry.projection);
   }
 
+  function cloneCacheEntry(entry: CacheEntry): CacheEntry {
+    return {
+      messages: entry.messages,
+      projection: entry.projection,
+      intakeEventIds: new Set(entry.intakeEventIds),
+      parkedEventIds: new Set(entry.parkedEventIds),
+      owners: new Set(entry.owners),
+      expiresAt: entry.expiresAt,
+      updatedAt: entry.updatedAt,
+    };
+  }
+
+  function prepareRestore(
+    input: readonly {
+      readonly projection: AuthenticatedRequestProjection;
+      readonly parkedEventIds: readonly string[];
+    }[],
+  ): ResultType<RequestMessageCacheRestoreAttempt, AuthenticatedRequestIdentityConflict> {
+    const proposed = new Map<
+      string,
+      { projection: AuthenticatedRequestProjection; parkedEventIds: Set<string> }
+    >();
+    for (const record of input) {
+      const current = proposed.get(record.projection.requestId);
+      if (current) {
+        const latched = latchAuthenticatedRequest(
+          current.projection,
+          record.projection,
+          "graceful-restart",
+        );
+        if (latched.status === "error") return Result.err(latched.error);
+        current.projection = latched.value;
+        for (const eventId of record.parkedEventIds) current.parkedEventIds.add(eventId);
+      } else {
+        proposed.set(record.projection.requestId, {
+          projection: record.projection,
+          parkedEventIds: new Set(record.parkedEventIds),
+        });
+      }
+    }
+    for (const [requestId, record] of proposed) {
+      const existing = entries.get(requestId);
+      if (!existing) continue;
+      const latched = latchAuthenticatedRequest(
+        existing.projection,
+        record.projection,
+        "graceful-restart",
+      );
+      if (latched.status === "error") return Result.err(latched.error);
+      record.projection = latched.value;
+    }
+
+    const before = new Map<string, CacheEntry | null>();
+    for (const requestId of proposed.keys()) {
+      const existing = entries.get(requestId);
+      before.set(requestId, existing ? cloneCacheEntry(existing) : null);
+    }
+    let applied = false;
+    return Result.ok({
+      apply: () => {
+        if (applied) return Result.ok(undefined);
+        const at = now();
+        for (const [requestId, record] of proposed) {
+          const existing = entries.get(requestId);
+          if (existing) {
+            const latched = latchAuthenticatedRequest(
+              existing.projection,
+              record.projection,
+              "graceful-restart",
+            );
+            if (latched.status === "error") return Result.err(latched.error);
+            existing.projection = latched.value;
+            for (const eventId of record.parkedEventIds) existing.parkedEventIds.add(eventId);
+            existing.expiresAt = at + ttlMs;
+            existing.updatedAt = at;
+          } else {
+            entries.set(requestId, {
+              messages: [],
+              projection: record.projection,
+              intakeEventIds: new Set(),
+              parkedEventIds: new Set(record.parkedEventIds),
+              owners: new Set(),
+              expiresAt: at + ttlMs,
+              updatedAt: at,
+            });
+          }
+        }
+        applied = true;
+        pruneMax();
+        return Result.ok(undefined);
+      },
+      rollback: () => {
+        if (!applied) return;
+        for (const [requestId, previous] of before) {
+          if (previous) entries.set(requestId, cloneCacheEntry(previous));
+          else entries.delete(requestId);
+        }
+        applied = false;
+      },
+    });
+  }
+
   return {
     get: (requestId) => {
       pruneExpired();
@@ -251,6 +364,7 @@ export function createRequestMessageCache(
       return entries.get(requestId)?.projection;
     },
     cacheMessage,
+    prepareRestore,
     acquireOwner: (requestId) => {
       const entry = entries.get(requestId);
       if (!entry) {

@@ -61,7 +61,6 @@ import {
 import {
   resolveAgentRunModel,
   resolveAgentRunModelFallbacks,
-  isWorkflowAgentRecoveryEntry,
   startBusAgentRunner,
 } from "../surface/bridge/bus-agent-runner";
 import { startDiscordSearchIndexer } from "../surface/bridge/discord-search-indexer";
@@ -133,12 +132,17 @@ import { CustomCommandManager } from "../custom-commands/manager";
 import { handleCoreConfigWatchEvent } from "./core-config-watch";
 import { loadOrCreateCoreDeadLetterKey, type CoreDeadLetterKeyError } from "./core-dead-letter-key";
 import { projectRuntimeError, safeRuntimeErrorText } from "./error-format";
-import { SqliteGracefulRestartStore, type GracefulRestartSnapshot } from "./graceful-restart-store";
 import {
+  GRACEFUL_RESTART_SNAPSHOT_VERSION,
+  SqliteGracefulRestartStore,
+} from "./graceful-restart-store";
+import {
+  applySurfaceRecovery,
   connectAndValidateSurfaceAdapters,
+  createPausedSurfaceRecoveryOwnership,
   createSurfaceWorkflowProgressPortMap,
   disconnectSurfaceAdapters,
-  restoreSurfaceRecovery,
+  prepareSurfaceRecovery,
   startSurfaceAdapterIngress,
   startSurfaceOutputs,
   stopIngressAndDrainSurfaceRecovery,
@@ -149,6 +153,8 @@ import {
   type SurfaceAdapterIngressHandles,
   type SurfaceRelayHandles,
   type SurfaceRequestIngressHandles,
+  type SurfaceRecoveryPlan,
+  type PausedSurfaceRecoveryOwnership,
 } from "./surface-runtime-lifecycle";
 
 import { SurfaceRuntimeRegistry } from "../surface/runtime-descriptor";
@@ -1248,7 +1254,10 @@ export async function createCoreRuntime(
   }
   const mcpRegistry = mcpRegistryCreated.value;
   function composeSurfaceRuntimeRegistry(appCredentialsAvailable: boolean) {
-    const discordRelayPolicy = createDiscordRelayPolicy(surfaceAdapter);
+    const discordRelayPolicy = createDiscordRelayPolicy(surfaceAdapter, {
+      activateRestoredOutputChains: (generation, chains) =>
+        stopRouter?.restoreActiveOutputChains(generation, chains),
+    });
     const githubRelayPolicy = createGithubRelayPolicy();
     return SurfaceRuntimeRegistry.create([
       createDiscordSurfaceRuntimeDescriptor({
@@ -1327,6 +1336,7 @@ export async function createCoreRuntime(
     ]);
   }
   let surfaceRuntimeRegistry: SurfaceRuntimeRegistry | null = null;
+  let pendingSurfaceRecovery: PausedSurfaceRecoveryOwnership | null = null;
   let runtimeFullyStarted = false;
   let routerSubscriptionHealthy = true;
   let mcpRegistryInitPromise: Promise<void> | null = null;
@@ -1638,31 +1648,6 @@ export async function createCoreRuntime(
     }
     coreConfigWatcher?.close();
     coreConfigWatcher = null;
-  }
-
-  async function restoreGracefulSnapshot(
-    snapshot: GracefulRestartSnapshot,
-    registry: SurfaceRuntimeRegistry,
-  ) {
-    logger.info("Dispatching graceful restart snapshot", {
-      createdAt: snapshot.createdAt,
-      agentEntries: snapshot.agent.length,
-      relayEntries: snapshot.relays.length,
-    });
-
-    const dispatched = await restoreSurfaceRecovery({
-      registry,
-      snapshot,
-      relays: surfaceRelayHandles,
-      agentRunner: stopAgentRunner,
-    });
-
-    logger.info("Graceful restart snapshot dispatched", {
-      agentEntriesDispatched: dispatched.agentEntriesDispatched,
-      agentEntriesUndispatched: dispatched.agentEntriesUndispatched,
-      relayEntriesMatched: dispatched.relayEntriesMatched,
-      relayEntriesUnmatched: dispatched.relayEntriesUnmatched,
-    });
   }
 
   async function start(): Promise<CoreRuntimeStartOutcome> {
@@ -2103,7 +2088,7 @@ export async function createCoreRuntime(
           relays: surfaceRelayHandles,
         });
 
-        const restartLoadResult = gracefulRestartStore?.loadAndConsumeCompletedSnapshot();
+        const restartLoadResult = gracefulRestartStore?.readCompletedSnapshot();
         const restartLoad =
           restartLoadResult?.status === "ok"
             ? restartLoadResult.value
@@ -2115,16 +2100,10 @@ export async function createCoreRuntime(
           );
         }
         const restartSnapshot = restartLoad.state === "loaded" ? restartLoad.snapshot : null;
-
-        const initialHeartbeatExternalState = restartSnapshot
-          ? {
-              activeRequestIds: restartSnapshot.agent
-                .filter(
-                  (entry) => entry.kind === "active" && !isHeartbeatSessionId(entry.sessionId),
-                )
-                .map((entry) => entry.requestId),
-            }
-          : undefined;
+        let recoveryPlan: SurfaceRecoveryPlan | null = null;
+        let initialHeartbeatExternalState:
+          | { readonly activeRequestIds: readonly string[] }
+          | undefined;
 
         if (restartLoad.state === "stale") {
           logger.warn("Graceful restart snapshot discarded (stale)", {
@@ -2133,24 +2112,15 @@ export async function createCoreRuntime(
             deadlineMs: restartLoad.deadlineMs,
           });
         }
-
-        const recoverableRootParentRequestIds =
-          restartSnapshot?.agent
-            .filter(
-              (entry) =>
-                entry.kind === "active" &&
-                !isHeartbeatSessionId(entry.sessionId) &&
-                !isWorkflowAgentRecoveryEntry(entry),
-            )
-            .map((entry) => entry.requestId) ?? [];
-        const remainingSnapshotProtectionMs = restartSnapshot
-          ? Math.max(1, restartSnapshot.createdAt + restartSnapshot.deadlineMs - Date.now())
-          : GRACEFUL_SNAPSHOT_TTL_MS;
-        await workflowLiveParentBridge.enableOrphanHandling({
-          protectedParentRequestIds: recoverableRootParentRequestIds,
-          protectionMs: remainingSnapshotProtectionMs,
-        });
-
+        if (restartLoad.state === "empty" || restartLoad.state === "stale") {
+          const consumed = gracefulRestartStore?.consumeCompletedSnapshot(restartLoad.rowToken);
+          if (consumed?.status === "error") {
+            logger.warn(
+              "Graceful restart snapshot disposition failed",
+              formatTaggedErrorForLog(consumed.error),
+            );
+          }
+        }
         // Start agent runner last so it can't publish replies before relay is online.
         stopAgentRunner = await startBusAgentRunner({
           bus,
@@ -2167,6 +2137,7 @@ export async function createCoreRuntime(
           durableWorkflowStore,
           projectAuthenticatedRequest,
           requestMessageCache: requestMessageCache ?? undefined,
+          startPaused: restartSnapshot !== null,
           issueControlCapability: async (input) => {
             const cachedRequest = requestMessageCache?.getOrigin(input.requestId);
             const identity = resolveRequestCapabilityIdentity({
@@ -2224,17 +2195,59 @@ export async function createCoreRuntime(
           cwd: canonicalWorkspaceRoot,
         });
 
-        if (restartSnapshot) {
-          const restored = await Result.tryPromise({
-            try: () => restoreGracefulSnapshot(restartSnapshot, registry),
-            catch: projectRuntimeError("Graceful restart snapshot restore failed"),
+        if (restartSnapshot && restartLoad.state === "loaded") {
+          const prepared = prepareSurfaceRecovery({
+            registry,
+            snapshot: restartSnapshot,
+            relays: surfaceRelayHandles,
+            agentRunner: stopAgentRunner,
           });
-          if (restored.status === "error") {
-            if (isPanic(restored.error)) return { kind: "panic", panic: restored.error };
-            logger.error("Failed to restore graceful restart snapshot", {
-              error: restored.error.message,
-            });
+          if (prepared.status === "error") {
+            logger.warn(
+              "Graceful restart snapshot retained because recovery is unavailable",
+              formatTaggedErrorForLog(prepared.error),
+            );
+          } else {
+            recoveryPlan = prepared.value;
+            const applied = await applySurfaceRecovery(recoveryPlan);
+            if (applied.status === "error") {
+              logger.warn(
+                "Graceful restart snapshot retained after paused admission failure",
+                formatTaggedErrorForLog(applied.error),
+              );
+              recoveryPlan = null;
+            } else {
+              pendingSurfaceRecovery = createPausedSurfaceRecoveryOwnership(recoveryPlan);
+            }
           }
+        }
+
+        const committedSnapshot = recoveryPlan?.snapshot;
+        const recoverableRootParentRequestIds =
+          committedSnapshot?.agent
+            .filter(
+              (entry) =>
+                entry.kind === "active" &&
+                !isHeartbeatSessionId(entry.sessionId) &&
+                !(
+                  entry.identity?.state === "durable" &&
+                  entry.identity.projection.source === "internal-delegated"
+                ),
+            )
+            .map((entry) => entry.requestId) ?? [];
+        await workflowLiveParentBridge.enableOrphanHandling({
+          protectedParentRequestIds: recoverableRootParentRequestIds,
+          protectionMs: committedSnapshot
+            ? Math.max(1, committedSnapshot.createdAt + committedSnapshot.deadlineMs - Date.now())
+            : GRACEFUL_SNAPSHOT_TTL_MS,
+        });
+
+        if (recoveryPlan) {
+          initialHeartbeatExternalState = {
+            activeRequestIds: recoveryPlan.snapshot.agent
+              .filter((entry) => entry.kind === "active" && !isHeartbeatSessionId(entry.sessionId))
+              .map((entry) => entry.requestId),
+          };
         }
 
         workflowEngine = new WorkflowEngine({
@@ -2306,6 +2319,32 @@ export async function createCoreRuntime(
           logger.debug("Conversation thread worker started");
         }
 
+        if (recoveryPlan && restartLoad.state === "loaded") {
+          const consumed = gracefulRestartStore?.consumeCompletedSnapshot(restartLoad.rowToken);
+          if (!consumed || consumed.status === "error") {
+            await pendingSurfaceRecovery?.rollback();
+            pendingSurfaceRecovery = null;
+            logger.warn(
+              "Graceful restart snapshot retained after conditional disposition failure",
+              consumed?.status === "error"
+                ? formatTaggedErrorForLog(consumed.error)
+                : { reason: "store-unavailable" },
+            );
+            recoveryPlan = null;
+            stopAgentRunner.activate();
+          } else {
+            const recoveryOwnership = pendingSurfaceRecovery;
+            pendingSurfaceRecovery = null;
+            recoveryOwnership?.activate();
+            logger.info("Graceful restart snapshot restored", {
+              agentEntries: recoveryPlan.snapshot.agent.length,
+              relayEntries: recoveryPlan.snapshot.relays.length,
+            });
+          }
+        } else if (restartSnapshot) {
+          stopAgentRunner.activate();
+        }
+
         runtimeFullyStarted = routerSubscriptionHealthy;
 
         logger.info(
@@ -2356,6 +2395,12 @@ export async function createCoreRuntime(
 
     const cleanup = createCoreRuntimeCleanupSupervisor(priorPanic);
     const safe = cleanup.run;
+
+    if (pendingSurfaceRecovery) {
+      const pausedRecovery = pendingSurfaceRecovery;
+      pendingSurfaceRecovery = null;
+      await safe("startup.surfaceRecovery.rollback", () => pausedRecovery.rollback());
+    }
 
     if (
       stopPass === "full" &&
@@ -2443,15 +2488,22 @@ export async function createCoreRuntime(
         relays: surfaceRelayHandles,
       });
       const agentRecoverables = recoverables.agent;
+      const queueAttempts = recoverables.queueAttempts;
       const relayRecoverables = recoverables.relays;
 
-      if (agentRecoverables.length > 0 || relayRecoverables.length > 0) {
+      if (
+        agentRecoverables.length > 0 ||
+        queueAttempts.length > 0 ||
+        relayRecoverables.length > 0
+      ) {
         await safe("graceful.store.saveCompletedSnapshot", async () => {
           const saved = gracefulRestartStore?.saveCompletedSnapshot({
-            version: 2,
+            version: GRACEFUL_RESTART_SNAPSHOT_VERSION,
             createdAt: Date.now(),
             deadlineMs: GRACEFUL_SNAPSHOT_TTL_MS,
+            queueAttemptProof: "complete",
             agent: agentRecoverables,
+            queueAttempts,
             relays: relayRecoverables,
           });
           if (saved?.status === "error") {

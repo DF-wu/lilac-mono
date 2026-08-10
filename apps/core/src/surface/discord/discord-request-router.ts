@@ -22,7 +22,11 @@ import {
 import { Panic, Result, TaggedError, type Result as ResultType } from "better-result";
 import type { Logger } from "@stanley2058/simple-module-logger";
 import type { SurfaceAdapter, SurfaceOperationError } from "../adapter";
-import type { MsgRefFor } from "../runtime-descriptor";
+import type {
+  MsgRefFor,
+  SurfaceRecoveryGeneration,
+  SurfaceRestoredOutputChain,
+} from "../runtime-descriptor";
 import type { MsgRef, SurfaceSelf } from "../types";
 import {
   CoreOwnedBlobIntegrityError,
@@ -206,6 +210,8 @@ type ActiveSessionState = {
   activeOutputMessageIds: Set<string>;
 };
 
+const MAX_TERMINAL_LIFECYCLE_TOMBSTONES = 2_048;
+
 export class BusRequestRouterMissingHeadersError extends TaggedError(
   "BusRequestRouterMissingHeadersError",
 )<{
@@ -217,6 +223,13 @@ export class BusRequestRouterMissingHeadersError extends TaggedError(
 export class BusRequestRouterRoutingError extends TaggedError("BusRequestRouterRoutingError")<{
   readonly topic: "evt.request" | "evt.adapter";
   readonly cause: unknown;
+  readonly message: string;
+}> {}
+
+export class BusRequestRouterLifecycleCorrelationInvalid extends TaggedError(
+  "BusRequestRouterLifecycleCorrelationInvalid",
+)<{
+  readonly requestId: string;
   readonly message: string;
 }> {}
 
@@ -253,6 +266,10 @@ type RouterDeliverySubscription = {
 
 export type DiscordRequestRouter = {
   readonly done: Promise<ResultType<void, EventDeliveryDoneError>>;
+  restoreActiveOutputChains(
+    generation: SurfaceRecoveryGeneration,
+    chains: readonly SurfaceRestoredOutputChain<"discord">[],
+  ): void;
   stop(): Promise<void>;
 };
 
@@ -340,9 +357,13 @@ export type DiscordRequestRouterStartOutcome =
     };
 
 function lifecycleDeliveryPolicy(
-  error: BusRequestRouterMissingHeadersError | BusRequestRouterRoutingError,
+  error:
+    | BusRequestRouterMissingHeadersError
+    | BusRequestRouterRoutingError
+    | BusRequestRouterLifecycleCorrelationInvalid,
 ): DeliveryDisposition {
   switch (error._tag) {
+    case "BusRequestRouterLifecycleCorrelationInvalid":
     case "BusRequestRouterMissingHeadersError":
     case "BusRequestRouterRoutingError":
       return "park-pending";
@@ -710,6 +731,7 @@ export type StartDiscordRequestRouterInput = {
   }) => Promise<{ suppress: boolean; reason?: string }>;
   /** Optional injection for unit tests (bypasses real model call). */
   routerGate?: (input: RouterGateInput) => Promise<RouterGateDecision>;
+  recoveryTombstoneCapacity?: number;
   /** Optional structured logger injection for embedding and tests. */
   logger?: Logger;
 };
@@ -782,6 +804,80 @@ export async function startDiscordRequestRouter(
   }
 
   const activeBySession = new Map<string, ActiveSessionState>();
+  const finalizedRecoveryGenerations = new WeakSet<SurfaceRecoveryGeneration>();
+  const terminalLifecycleTombstones = new Map<
+    string,
+    {
+      readonly requestId: string;
+      readonly platform: "discord";
+      readonly sessionId: string;
+    }
+  >();
+  const terminalLifecycleTombstoneCapacity = Math.max(
+    1,
+    Math.floor(params.recoveryTombstoneCapacity ?? MAX_TERMINAL_LIFECYCLE_TOMBSTONES),
+  );
+  let terminalLifecycleTombstoneOverflow = false;
+  const terminalLifecycleTombstoneKey = (requestId: string, sessionId: string): string =>
+    `${requestId}\u0000discord\u0000${sessionId}`;
+  const recordTerminalLifecycleTombstone = (requestId: string, sessionId: string): void => {
+    const key = terminalLifecycleTombstoneKey(requestId, sessionId);
+    if (terminalLifecycleTombstones.has(key) || terminalLifecycleTombstoneOverflow) return;
+    if (terminalLifecycleTombstones.size >= terminalLifecycleTombstoneCapacity) {
+      terminalLifecycleTombstoneOverflow = true;
+      return;
+    }
+    terminalLifecycleTombstones.set(key, {
+      requestId,
+      platform: "discord",
+      sessionId,
+    });
+  };
+  const activeSessionForRequest = (requestId: string): string | undefined => {
+    for (const [sessionId, active] of activeBySession) {
+      if (active.requestId === requestId) return sessionId;
+    }
+    return undefined;
+  };
+  const terminalSessionForRequest = (requestId: string): string | undefined => {
+    for (const tombstone of terminalLifecycleTombstones.values()) {
+      if (tombstone.requestId === requestId) return tombstone.sessionId;
+    }
+    return undefined;
+  };
+  const restoreActiveOutputChains = (
+    generation: SurfaceRecoveryGeneration,
+    chains: readonly SurfaceRestoredOutputChain<"discord">[],
+  ): void => {
+    if (finalizedRecoveryGenerations.has(generation)) return;
+    finalizedRecoveryGenerations.add(generation);
+    for (const chain of chains) {
+      if (terminalLifecycleTombstoneOverflow) {
+        const current = activeBySession.get(chain.sessionId);
+        if (current?.requestId === chain.requestId) activeBySession.delete(chain.sessionId);
+        continue;
+      }
+      const terminalKey = terminalLifecycleTombstoneKey(chain.requestId, chain.sessionId);
+      if (terminalLifecycleTombstones.has(terminalKey)) {
+        const current = activeBySession.get(chain.sessionId);
+        if (current?.requestId === chain.requestId) activeBySession.delete(chain.sessionId);
+        continue;
+      }
+      for (const [key, tombstone] of terminalLifecycleTombstones) {
+        if (tombstone.requestId === chain.requestId) terminalLifecycleTombstones.delete(key);
+      }
+      const current = activeBySession.get(chain.sessionId);
+      const active =
+        current?.requestId === chain.requestId
+          ? current
+          : { requestId: chain.requestId, activeOutputMessageIds: new Set<string>() };
+      const refs = chain.activeOutputRefs ?? chain.createdOutputRefs;
+      for (const ref of refs) active.activeOutputMessageIds.add(ref.messageId);
+      activeBySession.set(chain.sessionId, active);
+    }
+    terminalLifecycleTombstones.clear();
+    terminalLifecycleTombstoneOverflow = false;
+  };
   const buffers = new Map<string, DebounceBuffer>();
   const pendingMentionReplyBatchBySession = new Map<string, PendingMentionReplyBatch>();
   const debounceDefect = Promise.withResolvers<ResultType<void, EventDeliveryDoneError>>();
@@ -897,7 +993,8 @@ export async function startDiscordRequestRouter(
 
         const requestId = msg.headers?.request_id;
         const sessionId = msg.headers?.session_id;
-        if (!requestId || !sessionId) {
+        const requestClient = msg.headers?.request_client;
+        if (!requestId || !sessionId || !requestClient) {
           logger.error("router.message.invalid_headers", {
             topic: "evt.request",
             messageType: msg.type,
@@ -912,17 +1009,46 @@ export async function startDiscordRequestRouter(
               topic: "evt.request",
               messageType: msg.type,
               message:
-                "evt.request.lifecycle.changed missing required headers.request_id/session_id",
+                "evt.request.lifecycle.changed missing required headers.request_id/session_id/request_client",
+            }),
+          );
+        }
+
+        const activeSessionId = activeSessionForRequest(requestId);
+        const terminalSessionId = terminalSessionForRequest(requestId);
+        if (requestClient !== "discord") {
+          if (activeSessionId !== undefined || terminalSessionId !== undefined) {
+            return Result.err(
+              new BusRequestRouterLifecycleCorrelationInvalid({
+                requestId,
+                message: "Request lifecycle platform conflicts with Discord router ownership",
+              }),
+            );
+          }
+          return Result.ok(undefined);
+        }
+        if (
+          (activeSessionId !== undefined && activeSessionId !== sessionId) ||
+          (terminalSessionId !== undefined && terminalSessionId !== sessionId)
+        ) {
+          return Result.err(
+            new BusRequestRouterLifecycleCorrelationInvalid({
+              requestId,
+              message: "Request lifecycle session conflicts with Discord router ownership",
             }),
           );
         }
 
         return captureRouterRouting("evt.request", async () => {
           if (msg.data.state === "running") {
-            activeBySession.set(sessionId, {
-              requestId,
-              activeOutputMessageIds: new Set(),
-            });
+            terminalLifecycleTombstones.delete(terminalLifecycleTombstoneKey(requestId, sessionId));
+            const current = activeBySession.get(sessionId);
+            if (current?.requestId !== requestId) {
+              activeBySession.set(sessionId, {
+                requestId,
+                activeOutputMessageIds: new Set(),
+              });
+            }
           }
 
           if (
@@ -930,6 +1056,7 @@ export async function startDiscordRequestRouter(
             msg.data.state === "failed" ||
             msg.data.state === "cancelled"
           ) {
+            recordTerminalLifecycleTombstone(requestId, sessionId);
             const cur = activeBySession.get(sessionId);
             if (cur?.requestId === requestId) {
               await flushPendingMentionReplyBatchAsPrompt({
@@ -2683,6 +2810,7 @@ export async function startDiscordRequestRouter(
     residualRouter: null,
     result: Result.ok({
       done,
+      restoreActiveOutputChains,
       stop: async () => {
         try {
           await adaptRouterSubscriptionsStop(subscriptions);
@@ -2692,6 +2820,8 @@ export async function startDiscordRequestRouter(
           }
           buffers.clear();
           pendingMentionReplyBatchBySession.clear();
+          terminalLifecycleTombstones.clear();
+          terminalLifecycleTombstoneOverflow = false;
         }
       },
     }),

@@ -7,6 +7,7 @@ import type {
   SurfaceAdapterIngress,
   SurfaceRelayDescriptor,
   SurfaceRelayPolicy,
+  SurfaceRelayRecovery,
   SurfaceReplyTargetInvalid,
   SurfaceRuntimeDescriptor,
   SurfaceWorkflowProgressPort,
@@ -164,7 +165,10 @@ async function adaptDiscordSkippedOutputCleanupResultToHost(
   if (deleted.status === "error") throw deleted.error;
 }
 
-export function createDiscordRelayPolicy(adapter: SurfaceAdapter): SurfaceRelayPolicy<"discord"> {
+export function createDiscordRelayPolicy(
+  adapter: SurfaceAdapter,
+  recovery?: SurfaceRelayRecovery<"discord">,
+): SurfaceRelayPolicy<"discord"> {
   return {
     refs: {
       createSessionRef: (sessionId) => ({ platform: "discord", channelId: sessionId }),
@@ -210,6 +214,7 @@ export function createDiscordRelayPolicy(adapter: SurfaceAdapter): SurfaceRelayP
       cleanupSkippedOutput: async ({ ref }) =>
         adaptDiscordSkippedOutputCleanupResultToHost(adapter, ref),
     },
+    ...(recovery ? { recovery } : {}),
   };
 }
 

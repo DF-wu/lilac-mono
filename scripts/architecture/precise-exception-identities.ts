@@ -38,6 +38,23 @@ export const PRECISE_EXCEPTION_IDENTITIES: Readonly<
     ],
   ],
   "apps/core": [
+    [
+      "src/runtime/surface-runtime-lifecycle.ts",
+      "signalSurfaceRecoveryRollbackAtomicityUnknown",
+      "signal",
+    ],
+    [
+      "src/runtime/graceful-restart-store.ts",
+      "signalMissingGracefulRestartDispositionToken",
+      "signal",
+    ],
+    ["src/surface/bridge/subscribe-from-bus.ts", "bridgeBusToAdapter.restoreRelays", "signal"],
+    ["src/surface/bridge/subscribe-from-bus.ts", "bridgeBusToAdapter.startRelay", "both"],
+    [
+      "src/surface/bridge/subscribe-from-bus.ts",
+      "signalSurfaceRelayRecoveryAtomicityUnknown",
+      "signal",
+    ],
     ["src/surface/bridge/bridge-log.ts", "formatBridgeTaggedErrorForLog", "capture"],
     [
       "src/conversation/thread-service.ts",
@@ -263,7 +280,7 @@ export const PRECISE_EXCEPTION_IDENTITIES: Readonly<
     ],
     [
       "src/surface/bridge/bus-agent-runner.ts",
-      "startBusAgentRunner.superviseSubscriptionDone",
+      "startBusAgentRunner.superviseAgentRunnerBackgroundFailure",
       "capture",
     ],
     [
@@ -302,8 +319,6 @@ export const PRECISE_EXCEPTION_IDENTITIES: Readonly<
       "startBusAgentRunner.startSessionQueueDrain.observeSupervisedDrainRejection",
       "capture",
     ],
-    ["src/surface/bridge/bus-agent-runner.ts", "startBusAgentRunner.stopSubscription", "signal"],
-    ["src/surface/bridge/bus-agent-runner.ts", "startBusAgentRunner.then.<callback@1>", "signal"],
     ["src/surface/bridge/bus-agent-runner.ts", "startBusAgentRunner", "signal"],
     [
       "src/surface/bridge/bus-agent-runner.ts",

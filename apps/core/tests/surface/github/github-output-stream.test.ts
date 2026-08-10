@@ -5,6 +5,31 @@ import type { SurfaceOutputPart, SurfaceOutputPartDisposition } from "../../../s
 import { GithubOutputStream } from "../../../src/surface/github/output/github-output-stream";
 
 describe("GithubOutputStream", () => {
+  it("hydrates restored state without provider calls and publishes only on finish", async () => {
+    const comments: string[] = [];
+    const stream = new GithubOutputStream(
+      { platform: "github", channelId: "octo/repo#1" },
+      {
+        createComment: async (body) => {
+          comments.push(body);
+          return Result.ok({ id: 1 });
+        },
+      },
+    );
+
+    expect(stream.hydrateRecovery([{ type: "text.set", text: "restored" }])).toBe("visible");
+    expect(comments).toEqual([]);
+    await expect(stream.push({ type: "text.delta", delta: " live" })).resolves.toEqual(
+      Result.ok("visible"),
+    );
+    expect(comments).toEqual([]);
+
+    const finished = await stream.finish();
+    expect(finished.status).toBe("ok");
+    expect(comments).toHaveLength(1);
+    expect(comments[0]).toContain("restored live");
+  });
+
   it("distinguishes visible, terminal-only, and ignored presentation parts", async () => {
     const stream = new GithubOutputStream(
       {

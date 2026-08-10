@@ -175,6 +175,7 @@ export type SurfaceMergeBlockPlanOptions = {
 };
 
 export interface SurfaceOutputStream {
+  hydrateRecovery?(parts: readonly SurfaceOutputPart[]): SurfaceOutputPartDisposition;
   push(part: SurfaceOutputPart): Promise<SurfaceOperationResult<SurfaceOutputPartDisposition>>;
   finish(): Promise<SurfaceOperationResult<SurfaceOutputResult>>;
   abort(reason?: string): Promise<SurfaceOperationResult<void>>;
@@ -187,6 +188,8 @@ export interface SurfaceOutputStream {
 }
 
 export type StartOutputOpts = {
+  /** Internal preparation mode for recovery admission before snapshot disposition. */
+  preparationMode?: "paused-recovery";
   replyTo?: MsgRef;
   /** Disable all Discord notifications for this output stream (mentions + reply ping). */
   silent?: boolean;

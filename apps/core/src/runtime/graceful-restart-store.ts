@@ -1,8 +1,9 @@
 import { Database } from "bun:sqlite";
+import { createHash } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
 import {
   adapterPlatformSchema,
-  corePrimaryLineageV1Schema,
+  decodeCorePrimaryLineageV1,
   requestOriginSchema,
   requestQueueModeSchema,
   requestRunPolicySchema,
@@ -22,10 +23,19 @@ import { Panic, Result, TaggedError, type Result as ResultType } from "better-re
 import SuperJSON from "superjson";
 import { z } from "zod";
 
-import type { AgentRunnerRecoveryEntry } from "../surface/bridge/bus-agent-runner";
+import type {
+  AgentRunnerQueueAttempt,
+  AgentRunnerRecoveryEntry,
+  AgentRunnerRecoveryIdentity,
+} from "../surface/bridge/bus-agent-runner";
+import { parseBufferedForActiveRequestIdFromRaw } from "../surface/bridge/bus-agent-runner/raw";
+import {
+  isAuthenticatedRequestProjectionSemanticallyValid,
+  type AuthenticatedRequestProjection,
+} from "../surface/authenticated-request";
 import type { BusToAdapterRelaySnapshot } from "../surface/bridge/subscribe-from-bus";
 
-export const GRACEFUL_RESTART_SNAPSHOT_VERSION = 2 as const;
+export const GRACEFUL_RESTART_SNAPSHOT_VERSION = 3 as const;
 
 const GRACEFUL_RESTART_TABLE = "graceful_restart_state";
 const GRACEFUL_RESTART_RECORD_ID = "singleton";
@@ -36,17 +46,25 @@ export type GracefulRestartRawValue = OpaqueSuperJsonValue;
 
 export type PersistedGracefulRestartRow = {
   readonly status: string;
+  readonly updated_ts?: number;
   readonly payload_json: string;
+};
+
+export type GracefulRestartRowToken = {
+  readonly updatedAt: number;
+  readonly payloadSha256: string;
 };
 
 export type GracefulRestartLoadOutcome =
   | {
       readonly state: "loaded";
       readonly snapshot: GracefulRestartSnapshot;
+      readonly rowToken: GracefulRestartRowToken;
       readonly provenance: "current" | "migrated";
     }
   | {
       readonly state: "empty";
+      readonly rowToken: GracefulRestartRowToken;
       readonly provenance: "current" | "migrated";
     }
   | {
@@ -55,6 +73,7 @@ export type GracefulRestartLoadOutcome =
     }
   | {
       readonly state: "stale";
+      readonly rowToken: GracefulRestartRowToken;
       readonly createdAt: number;
       readonly deadlineMs: number;
       readonly ageMs: number;
@@ -62,13 +81,19 @@ export type GracefulRestartLoadOutcome =
     };
 
 export class GracefulRestartSqliteFailure extends TaggedError("GracefulRestartSqliteFailure")<{
-  readonly operation: "clear" | "load-and-consume" | "save";
+  readonly operation: "clear" | "consume" | "read" | "save";
   readonly code: string;
   readonly message: string;
 }> {}
 
 export class GracefulRestartSerializationFailure extends TaggedError(
   "GracefulRestartSerializationFailure",
+)<{
+  readonly message: string;
+}> {}
+
+export class GracefulRestartDispositionConflict extends TaggedError(
+  "GracefulRestartDispositionConflict",
 )<{
   readonly message: string;
 }> {}
@@ -85,6 +110,9 @@ export type GracefulRestartSaveError =
   | GracefulRestartSqliteFailure;
 
 export type GracefulRestartLoadError = PersistedDataError | GracefulRestartSqliteFailure;
+export type GracefulRestartConsumeError =
+  | GracefulRestartDispositionConflict
+  | GracefulRestartSqliteFailure;
 
 const finiteNonNegativeSchema = z.number().finite().nonnegative();
 const finitePositiveSchema = z.number().finite().positive();
@@ -388,7 +416,7 @@ const recoverySchema = z.strictObject({
   partialText: z.string(),
 });
 
-const agentRecoveryEntrySchema = z.strictObject({
+const legacyAgentRecoveryEntrySchema = z.strictObject({
   kind: z.enum(["active", "queued"]),
   requestId: nonemptyStringSchema,
   sessionId: nonemptyStringSchema,
@@ -401,6 +429,125 @@ const agentRecoveryEntrySchema = z.strictObject({
   modelOverride: z.string().optional(),
   raw: opaqueSuperJsonValueSchema.optional(),
   recovery: recoverySchema.optional(),
+});
+
+const registeredPlatformSchema = z.enum(["discord", "github"]);
+const discordSessionRefSchema = z.strictObject({
+  platform: z.literal("discord"),
+  channelId: nonemptyStringSchema,
+});
+const githubSessionRefSchema = z.strictObject({
+  platform: z.literal("github"),
+  channelId: nonemptyStringSchema,
+});
+const persistedSessionRefSchema = z.discriminatedUnion("platform", [
+  discordSessionRefSchema,
+  githubSessionRefSchema,
+]);
+const discordMsgRefSchema = z.strictObject({
+  platform: z.literal("discord"),
+  channelId: nonemptyStringSchema,
+  messageId: nonemptyStringSchema,
+});
+const githubMsgRefSchema = z.strictObject({
+  platform: z.literal("github"),
+  channelId: nonemptyStringSchema,
+  messageId: nonemptyStringSchema,
+});
+const persistedMsgRefSchema = z.discriminatedUnion("platform", [
+  discordMsgRefSchema,
+  githubMsgRefSchema,
+]);
+const authenticatedSurfaceOriginSchema = z.discriminatedUnion("platform", [
+  z.strictObject({
+    platform: z.literal("discord"),
+    userId: nonemptyStringSchema,
+    sessionRef: discordSessionRefSchema,
+    messageRef: discordMsgRefSchema.optional(),
+  }),
+  z.strictObject({
+    platform: z.literal("github"),
+    userId: nonemptyStringSchema,
+    sessionRef: githubSessionRefSchema,
+    messageRef: githubMsgRefSchema.optional(),
+  }),
+]);
+const authenticatedRequestProjectionSchema = z.strictObject({
+  requestId: nonemptyStringSchema,
+  requestClient: adapterPlatformSchema,
+  sessionId: nonemptyStringSchema,
+  source: z.enum(["external", "internal-delegated"]),
+  platform: registeredPlatformSchema.optional(),
+  sessionRef: persistedSessionRefSchema.optional(),
+  messageRef: persistedMsgRefSchema.optional(),
+  authenticatedActor: z
+    .strictObject({
+      platform: registeredPlatformSchema,
+      userId: nonemptyStringSchema,
+    })
+    .optional(),
+  authenticatedOrigin: authenticatedSurfaceOriginSchema.optional(),
+  authenticationMetadataKind: z.enum([
+    "absent",
+    "actor",
+    "origin",
+    "actor-origin",
+    "github-trigger",
+    "actor-github-trigger",
+    "origin-github-trigger",
+    "actor-origin-github-trigger",
+  ]),
+  githubTrigger: z
+    .strictObject({
+      kind: z.enum(["comment", "issue"]),
+      targetKind: z.enum(["issue", "pull-request"]).optional(),
+      repoFullName: nonemptyStringSchema.optional(),
+      issueNumber: z.number().int().positive().optional(),
+      messageId: nonemptyStringSchema,
+    })
+    .optional(),
+  verifiedIngress: z.boolean(),
+});
+const recoveryIdentitySchema = z.discriminatedUnion("state", [
+  z.strictObject({
+    state: z.literal("durable"),
+    projection: authenticatedRequestProjectionSchema,
+    assertedSafetyMode: z.enum(["trusted", "restricted"]),
+    parkedEventIds: z.array(nonemptyStringSchema),
+    delegationProof: z
+      .strictObject({
+        kind: z.literal("workflow"),
+        runId: nonemptyStringSchema,
+        operationId: nonemptyStringSchema,
+        dispatchEpoch: z.string().min(16),
+      })
+      .optional(),
+  }),
+  z.strictObject({
+    state: z.literal("restricted"),
+    reason: z.enum(["legacy-no-durable-proof", "missing-cache-proof"]),
+  }),
+]);
+const queueAttemptGroupSchema = z.strictObject({
+  publicationIndex: z.number().int().nonnegative(),
+  requestId: nonemptyStringSchema,
+  requestClient: adapterPlatformSchema,
+  targetQueueEntryIds: z.array(nonemptyStringSchema).min(1),
+});
+const queueAttemptSchema = z.strictObject({
+  eventId: nonemptyStringSchema,
+  controlRequestId: nonemptyStringSchema,
+  controlRequestClient: adapterPlatformSchema,
+  sessionId: nonemptyStringSchema,
+  kind: z.enum(["queued-cancellation", "buffered-absorption"]),
+  detail: nonemptyStringSchema,
+  controlApplied: z.boolean(),
+  controlIdentity: recoveryIdentitySchema,
+  pendingGroups: z.array(queueAttemptGroupSchema).min(1),
+});
+const currentAgentRecoveryEntrySchema = legacyAgentRecoveryEntrySchema.extend({
+  queueEntryId: nonemptyStringSchema,
+  identity: recoveryIdentitySchema,
 });
 
 type GracefulRestartModelMessage = z.output<typeof persistedModelMessageSchema>;
@@ -427,6 +574,7 @@ type GracefulRestartCorePrimaryLineage =
     };
 
 export type GracefulRestartAgentRecoveryEntry = {
+  readonly queueEntryId: string;
   readonly kind: "active" | "queued";
   readonly requestId: string;
   readonly sessionId: string;
@@ -442,13 +590,16 @@ export type GracefulRestartAgentRecoveryEntry = {
     readonly checkpointMessages: GracefulRestartModelMessage[];
     readonly partialText: string;
   };
+  readonly identity: AgentRunnerRecoveryIdentity;
 };
 
 export type GracefulRestartSnapshot = {
   version: typeof GRACEFUL_RESTART_SNAPSHOT_VERSION;
   createdAt: number;
   deadlineMs: number;
+  queueAttemptProof: "complete" | "legacy-ambiguous";
   agent: GracefulRestartAgentRecoveryEntry[];
+  queueAttempts: AgentRunnerQueueAttempt[];
   relays: BusToAdapterRelaySnapshot[];
 };
 
@@ -456,7 +607,7 @@ export type GracefulRestartSnapshotInput = Omit<GracefulRestartSnapshot, "agent"
   readonly agent: AgentRunnerRecoveryEntry[];
 };
 
-const msgRefSchema = z.strictObject({
+const relayMsgRefSchema = z.strictObject({
   platform: z.enum(["discord", "github"]),
   channelId: nonemptyStringSchema,
   messageId: nonemptyStringSchema,
@@ -470,16 +621,15 @@ const toolStatusSchema = z.strictObject({
   error: z.string().optional(),
 });
 
-const relaySnapshotSchema: z.ZodType<BusToAdapterRelaySnapshot> = z.strictObject({
+const relaySnapshotShape = {
   requestId: nonemptyStringSchema,
   sessionId: nonemptyStringSchema,
-  requestClient: z.string().optional(),
-  platform: z.enum(["discord", "github"]),
+  platform: registeredPlatformSchema,
   requestStartedAtMs: finiteNonNegativeSchema.optional(),
   routerSessionMode: z.enum(["mention", "active"]).optional(),
-  replyTo: msgRefSchema.optional(),
-  createdOutputRefs: z.array(msgRefSchema),
-  activeOutputRefs: z.array(msgRefSchema).optional(),
+  replyTo: relayMsgRefSchema.optional(),
+  createdOutputRefs: z.array(relayMsgRefSchema),
+  activeOutputRefs: z.array(relayMsgRefSchema).optional(),
   visibleText: z.string(),
   totalTextChars: finiteNonNegativeSchema.optional(),
   streamTextPrefixChars: finiteNonNegativeSchema.optional(),
@@ -500,23 +650,41 @@ const relaySnapshotSchema: z.ZodType<BusToAdapterRelaySnapshot> = z.strictObject
     .optional(),
   toolStatus: z.array(toolStatusSchema),
   outCursor: z.string().optional(),
+};
+const legacyRelaySnapshotSchema = z.strictObject({
+  ...relaySnapshotShape,
+  requestClient: z.string().optional(),
+});
+const currentRelaySnapshotSchema = z.strictObject({
+  ...relaySnapshotShape,
+  requestClient: registeredPlatformSchema,
 });
 
-const snapshotPayloadShape = {
+const legacySnapshotPayloadShape = {
   createdAt: finiteNonNegativeSchema,
   deadlineMs: finitePositiveSchema,
-  agent: z.array(agentRecoveryEntrySchema),
-  relays: z.array(relaySnapshotSchema),
+  agent: z.array(legacyAgentRecoveryEntrySchema),
+  relays: z.array(legacyRelaySnapshotSchema),
 };
 
 const currentSnapshotSchema = z.strictObject({
   version: z.literal(GRACEFUL_RESTART_SNAPSHOT_VERSION),
-  ...snapshotPayloadShape,
+  createdAt: finiteNonNegativeSchema,
+  deadlineMs: finitePositiveSchema,
+  queueAttemptProof: z.literal("complete"),
+  agent: z.array(currentAgentRecoveryEntrySchema),
+  queueAttempts: z.array(queueAttemptSchema),
+  relays: z.array(currentRelaySnapshotSchema),
 });
 
-const legacySnapshotSchema = z.strictObject({
+const legacySnapshotV1Schema = z.strictObject({
   version: z.literal(1),
-  ...snapshotPayloadShape,
+  ...legacySnapshotPayloadShape,
+});
+
+const legacySnapshotV2Schema = z.strictObject({
+  version: z.literal(2),
+  ...legacySnapshotPayloadShape,
 });
 
 function persistenceContext(input: {
@@ -554,6 +722,199 @@ function parsePersistedPayload(payloadJson: string): ResultType<unknown, Malform
   }
 }
 
+function validateRelayCorrelation(relay: BusToAdapterRelaySnapshot): boolean {
+  if (relay.requestClient !== relay.platform) return false;
+  const refs = [
+    ...(relay.replyTo ? [relay.replyTo] : []),
+    ...relay.createdOutputRefs,
+    ...(relay.activeOutputRefs ?? []),
+  ];
+  return refs.every((ref) => ref.platform === relay.platform && ref.channelId === relay.sessionId);
+}
+
+function validateAuthenticatedProjection(
+  entry: Pick<GracefulRestartAgentRecoveryEntry, "requestId" | "requestClient" | "sessionId">,
+  projection: AuthenticatedRequestProjection,
+): boolean {
+  return projection.requestId !== entry.requestId ||
+    projection.requestClient !== entry.requestClient ||
+    projection.sessionId !== entry.sessionId
+    ? false
+    : isAuthenticatedRequestProjectionSemanticallyValid(projection);
+}
+
+function validateRecoveryIdentity(
+  route: {
+    readonly requestId: string;
+    readonly requestClient: z.output<typeof adapterPlatformSchema>;
+    readonly sessionId: string;
+  },
+  identity: AgentRunnerRecoveryIdentity,
+): boolean {
+  if (identity.state === "restricted") return true;
+  if (!validateAuthenticatedProjection(route, identity.projection)) return false;
+  if (new Set(identity.parkedEventIds).size !== identity.parkedEventIds.length) return false;
+  if (identity.projection.source === "internal-delegated") {
+    return (
+      identity.delegationProof?.kind === "workflow" && identity.assertedSafetyMode === "restricted"
+    );
+  }
+  return identity.delegationProof === undefined;
+}
+
+function validateSnapshotCorrelation(snapshot: GracefulRestartSnapshot): boolean {
+  const routeByRequestId = new Map<
+    string,
+    { readonly requestClient: z.output<typeof adapterPlatformSchema>; readonly sessionId: string }
+  >();
+  const registerRoute = (
+    requestId: string,
+    requestClient: z.output<typeof adapterPlatformSchema>,
+    sessionId: string,
+  ): boolean => {
+    const existing = routeByRequestId.get(requestId);
+    if (
+      existing &&
+      (existing.requestClient !== requestClient || existing.sessionId !== sessionId)
+    ) {
+      return false;
+    }
+    routeByRequestId.set(requestId, { requestClient, sessionId });
+    return true;
+  };
+  const relayByRequestId = new Map<
+    string,
+    { readonly platform: "discord" | "github"; readonly sessionId: string }
+  >();
+  const relayIdentities = new Set<string>();
+  for (const relay of snapshot.relays) {
+    if (!validateRelayCorrelation(relay)) return false;
+    if (!registerRoute(relay.requestId, relay.platform, relay.sessionId)) return false;
+    const identity = `${relay.requestId}\u0000${relay.platform}\u0000${relay.sessionId}`;
+    if (relayIdentities.has(identity)) return false;
+    relayIdentities.add(identity);
+    const previous = relayByRequestId.get(relay.requestId);
+    if (
+      previous &&
+      (previous.platform !== relay.platform || previous.sessionId !== relay.sessionId)
+    ) {
+      return false;
+    }
+    relayByRequestId.set(relay.requestId, {
+      platform: relay.platform,
+      sessionId: relay.sessionId,
+    });
+  }
+
+  const queueEntries = new Map<string, GracefulRestartAgentRecoveryEntry>();
+  const activeSessions = new Set<string>();
+  const sessionsWithQueuedEntries = new Set<string>();
+  for (const entry of snapshot.agent) {
+    if (queueEntries.has(entry.queueEntryId)) return false;
+    if (!registerRoute(entry.requestId, entry.requestClient, entry.sessionId)) return false;
+    if (entry.kind === "active") {
+      if (activeSessions.has(entry.sessionId) || sessionsWithQueuedEntries.has(entry.sessionId)) {
+        return false;
+      }
+      activeSessions.add(entry.sessionId);
+    } else {
+      sessionsWithQueuedEntries.add(entry.sessionId);
+    }
+    queueEntries.set(entry.queueEntryId, entry);
+    const relay = relayByRequestId.get(entry.requestId);
+    if (relay && (entry.requestClient !== relay.platform || entry.sessionId !== relay.sessionId)) {
+      return false;
+    }
+    if (!validateRecoveryIdentity(entry, entry.identity)) return false;
+    if (entry.corePrimaryLineage) {
+      const lineage = decodeCorePrimaryLineageV1(entry.corePrimaryLineage, entry.messages);
+      if (lineage.status === "error") return false;
+    }
+  }
+
+  const attemptEventIds = new Set<string>();
+  const reservedEntryIds = new Set<string>();
+  for (const attempt of snapshot.queueAttempts) {
+    if (attemptEventIds.has(attempt.eventId) || queueEntries.has(attempt.eventId)) return false;
+    attemptEventIds.add(attempt.eventId);
+    if (!registerRoute(attempt.controlRequestId, attempt.controlRequestClient, attempt.sessionId)) {
+      return false;
+    }
+    if (
+      (attempt.kind === "queued-cancellation" && !attempt.controlApplied) ||
+      attempt.controlIdentity.state !== "durable" ||
+      !attempt.controlIdentity.parkedEventIds.includes(attempt.eventId) ||
+      !validateRecoveryIdentity(
+        {
+          requestId: attempt.controlRequestId,
+          requestClient: attempt.controlRequestClient,
+          sessionId: attempt.sessionId,
+        },
+        attempt.controlIdentity,
+      )
+    ) {
+      return false;
+    }
+    const publicationIndexes = new Set<number>();
+    for (const group of attempt.pendingGroups) {
+      if (publicationIndexes.has(group.publicationIndex)) return false;
+      if (!registerRoute(group.requestId, group.requestClient, attempt.sessionId)) return false;
+      publicationIndexes.add(group.publicationIndex);
+      for (const queueEntryId of group.targetQueueEntryIds) {
+        if (reservedEntryIds.has(queueEntryId)) return false;
+        reservedEntryIds.add(queueEntryId);
+        const target = queueEntries.get(queueEntryId);
+        if (
+          !target ||
+          target.kind !== "queued" ||
+          target.requestId !== group.requestId ||
+          target.requestClient !== group.requestClient ||
+          target.sessionId !== attempt.sessionId ||
+          (attempt.kind === "buffered-absorption" &&
+            parseBufferedForActiveRequestIdFromRaw(target.raw) !== attempt.controlRequestId) ||
+          (target.requestId !== attempt.controlRequestId &&
+            target.identity.state === "durable" &&
+            target.identity.parkedEventIds.includes(attempt.eventId))
+        ) {
+          return false;
+        }
+      }
+    }
+  }
+  return true;
+}
+
+function normalizeLegacySnapshot(
+  decoded: z.output<typeof legacySnapshotV1Schema> | z.output<typeof legacySnapshotV2Schema>,
+): ResultType<GracefulRestartSnapshot, CorruptPersistedFields> {
+  const relays: BusToAdapterRelaySnapshot[] = [];
+  for (const relay of decoded.relays) {
+    if (relay.requestClient !== undefined && relay.requestClient !== relay.platform) {
+      return Result.err(corruptSnapshot(decoded.version, "payload_json"));
+    }
+    relays.push({ ...relay, requestClient: relay.platform });
+  }
+  const snapshot: GracefulRestartSnapshot = {
+    version: GRACEFUL_RESTART_SNAPSHOT_VERSION,
+    createdAt: decoded.createdAt,
+    deadlineMs: decoded.deadlineMs,
+    queueAttemptProof: decoded.agent.some((entry) => entry.kind === "queued")
+      ? "legacy-ambiguous"
+      : "complete",
+    agent: decoded.agent.map((entry, index) => ({
+      ...entry,
+      queueEntryId: `legacy:${index}:${entry.requestId}`,
+      identity: { state: "restricted", reason: "legacy-no-durable-proof" },
+    })),
+    queueAttempts: [],
+    relays,
+  };
+  if (!validateSnapshotCorrelation(snapshot)) {
+    return Result.err(corruptSnapshot(decoded.version, "payload_json"));
+  }
+  return Result.ok(snapshot);
+}
+
 export function decodeGracefulRestartSnapshot(
   row: PersistedGracefulRestartRow | null,
 ): ResultType<DecodedPersistedValue<GracefulRestartSnapshot | null>, PersistedDataError> {
@@ -567,7 +928,7 @@ export function decodeGracefulRestartSnapshot(
   const version =
     typeof versionValue === "number" && Number.isInteger(versionValue) ? versionValue : undefined;
   if (version === undefined) return Result.err(corruptSnapshot(-1, "payload_json"));
-  if (version !== 1 && version !== GRACEFUL_RESTART_SNAPSHOT_VERSION) {
+  if (version !== 1 && version !== 2 && version !== GRACEFUL_RESTART_SNAPSHOT_VERSION) {
     return Result.err(
       new UnsupportedVersion(
         persistenceContext({
@@ -579,32 +940,24 @@ export function decodeGracefulRestartSnapshot(
     );
   }
 
-  if (version === 1) {
-    const decoded = legacySnapshotSchema.safeParse(parsed.value);
+  if (version === 1 || version === 2) {
+    const decoded =
+      version === 1
+        ? legacySnapshotV1Schema.safeParse(parsed.value)
+        : legacySnapshotV2Schema.safeParse(parsed.value);
     if (!decoded.success) return Result.err(corruptSnapshot(version, "payload_json"));
-    for (const entry of decoded.data.agent) {
-      if (
-        entry.corePrimaryLineage !== undefined &&
-        !corePrimaryLineageV1Schema.safeParse(entry.corePrimaryLineage).success
-      ) {
-        return Result.err(corruptSnapshot(version, "payload_json"));
-      }
-    }
+    const normalized = normalizeLegacySnapshot(decoded.data);
+    if (normalized.status === "error") return Result.err(normalized.error);
     return Result.ok({
-      value: { ...decoded.data, version: GRACEFUL_RESTART_SNAPSHOT_VERSION },
+      value: normalized.value,
       provenance: "migrated",
     });
   }
 
   const decoded = currentSnapshotSchema.safeParse(parsed.value);
   if (!decoded.success) return Result.err(corruptSnapshot(version, "payload_json"));
-  for (const entry of decoded.data.agent) {
-    if (
-      entry.corePrimaryLineage !== undefined &&
-      !corePrimaryLineageV1Schema.safeParse(entry.corePrimaryLineage).success
-    ) {
-      return Result.err(corruptSnapshot(version, "payload_json"));
-    }
+  if (!validateSnapshotCorrelation(decoded.data)) {
+    return Result.err(corruptSnapshot(version, "payload_json"));
   }
   return Result.ok({ value: decoded.data, provenance: "current" });
 }
@@ -663,18 +1016,23 @@ function classifySqliteFailure(
 function loadOutcome(
   decoded: DecodedPersistedValue<GracefulRestartSnapshot | null>,
   nowMs: number,
+  rowToken?: GracefulRestartRowToken,
 ): GracefulRestartLoadOutcome {
   if (decoded.value === null) {
     return { state: "absent", provenance: "missing-defaulted" };
   }
 
   const { value: snapshot } = decoded;
+  if (!rowToken) {
+    signalMissingGracefulRestartDispositionToken();
+  }
   const provenance: Exclude<PersistenceProvenance, "missing-defaulted"> =
     decoded.provenance === "migrated" ? "migrated" : "current";
   const ageMs = Math.max(0, nowMs - snapshot.createdAt);
   if (nowMs - snapshot.createdAt > snapshot.deadlineMs) {
     return {
       state: "stale",
+      rowToken,
       createdAt: snapshot.createdAt,
       deadlineMs: snapshot.deadlineMs,
       ageMs,
@@ -682,9 +1040,25 @@ function loadOutcome(
     };
   }
   if (snapshot.agent.length === 0 && snapshot.relays.length === 0) {
-    return { state: "empty", provenance };
+    return { state: "empty", rowToken, provenance };
   }
-  return { state: "loaded", snapshot, provenance };
+  return { state: "loaded", snapshot, rowToken, provenance };
+}
+
+function signalMissingGracefulRestartDispositionToken(): never {
+  throw new Panic({ message: "Decoded graceful restart row is missing its disposition token" });
+}
+
+function rowToken(row: PersistedGracefulRestartRow): GracefulRestartRowToken | null {
+  if (row.updated_ts === undefined || !Number.isSafeInteger(row.updated_ts)) return null;
+  return {
+    updatedAt: row.updated_ts,
+    payloadSha256: createHash("sha256")
+      .update(row.status)
+      .update("\u0000")
+      .update(row.payload_json)
+      .digest("hex"),
+  };
 }
 
 export class SqliteGracefulRestartStore {
@@ -740,28 +1114,68 @@ export class SqliteGracefulRestartStore {
     );
   }
 
-  /** The row is committed as deleted before decoding, including malformed payloads. */
-  loadAndConsumeCompletedSnapshot(
+  readCompletedSnapshot(
     nowMs: number = Date.now(),
   ): ResultType<GracefulRestartLoadOutcome, GracefulRestartLoadError> {
-    const consumed = runBunSqliteTransaction(
+    const read = runBunSqliteTransaction(
       this.db,
       () => {
         const row = this.db
           .query<PersistedGracefulRestartRow, [number]>(
-            "SELECT status, payload_json FROM graceful_restart_state WHERE singleton_id = ?",
+            "SELECT status, updated_ts, payload_json FROM graceful_restart_state WHERE singleton_id = ?",
           )
           .get(1);
-        this.db.run("DELETE FROM graceful_restart_state WHERE singleton_id = ?", [1]);
         return Result.ok(row);
       },
-      (cause) => classifySqliteFailure("load-and-consume", cause),
+      (cause) => classifySqliteFailure("read", cause),
     );
-    if (consumed.status === "error") return Result.err(consumed.error);
+    if (read.status === "error") return Result.err(read.error);
 
-    const decoded = decodeGracefulRestartSnapshot(consumed.value);
+    const token = read.value ? rowToken(read.value) : undefined;
+    if (read.value && !token) return Result.err(corruptSnapshot(-1, "payload_json"));
+    const decoded = decodeGracefulRestartSnapshot(read.value);
     if (decoded.status === "error") return Result.err(decoded.error);
-    return Result.ok(loadOutcome(decoded.value, nowMs));
+    return Result.ok(loadOutcome(decoded.value, nowMs, token ?? undefined));
+  }
+
+  consumeCompletedSnapshot(
+    token: GracefulRestartRowToken,
+  ): ResultType<void, GracefulRestartConsumeError> {
+    return runBunSqliteTransaction(
+      this.db,
+      () => {
+        const current = this.db
+          .query<PersistedGracefulRestartRow, [number]>(
+            "SELECT status, updated_ts, payload_json FROM graceful_restart_state WHERE singleton_id = ?",
+          )
+          .get(1);
+        const currentToken = current ? rowToken(current) : null;
+        if (
+          !currentToken ||
+          currentToken.updatedAt !== token.updatedAt ||
+          currentToken.payloadSha256 !== token.payloadSha256
+        ) {
+          return Result.err(
+            new GracefulRestartDispositionConflict({
+              message: "Graceful restart row changed before disposition",
+            }),
+          );
+        }
+        const deleted = this.db.run(
+          "DELETE FROM graceful_restart_state WHERE singleton_id = ? AND updated_ts = ?",
+          [1, token.updatedAt],
+        );
+        if (deleted.changes !== 1) {
+          return Result.err(
+            new GracefulRestartDispositionConflict({
+              message: "Graceful restart row changed during disposition",
+            }),
+          );
+        }
+        return Result.ok(undefined);
+      },
+      (cause) => classifySqliteFailure("consume", cause),
+    );
   }
 
   private migrate(): void {
@@ -780,7 +1194,9 @@ const fixtureSnapshot = {
   version: GRACEFUL_RESTART_SNAPSHOT_VERSION,
   createdAt: 1,
   deadlineMs: 1_000,
+  queueAttemptProof: "complete",
   agent: [],
+  queueAttempts: [],
   relays: [],
 } as const satisfies GracefulRestartSnapshot;
 
@@ -793,7 +1209,13 @@ export const gracefulRestartSnapshotCodecCases = {
   legacy: {
     input: {
       status: "completed",
-      payload_json: SuperJSON.stringify({ ...fixtureSnapshot, version: 1 }),
+      payload_json: SuperJSON.stringify({
+        version: 2,
+        createdAt: fixtureSnapshot.createdAt,
+        deadlineMs: fixtureSnapshot.deadlineMs,
+        agent: [],
+        relays: [],
+      }),
     },
     outcome: "ok",
     provenance: "migrated",
@@ -806,7 +1228,7 @@ export const gracefulRestartSnapshotCodecCases = {
   "unsupported-version": {
     input: {
       status: "completed",
-      payload_json: SuperJSON.stringify({ ...fixtureSnapshot, version: 3 }),
+      payload_json: SuperJSON.stringify({ ...fixtureSnapshot, version: 4 }),
     },
     outcome: "error",
   },

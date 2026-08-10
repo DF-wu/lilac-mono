@@ -126,6 +126,34 @@ describe("classifyDiscordSurfaceError", () => {
 });
 
 describe("DiscordAdapter nested refs", () => {
+  it("starts a resumable output stream without invoking Discord", async () => {
+    let providerCalls = 0;
+    const config = testConfigWithStatusMessage();
+    const adapter = createTestDiscordAdapter({ config });
+    const internals = adapter as unknown as { client: unknown; cfg: CoreConfig };
+    internals.client = {
+      channels: {
+        fetch: async () => {
+          providerCalls += 1;
+          return null;
+        },
+      },
+    };
+    internals.cfg = config;
+
+    const result = await adapter.startOutput(
+      { platform: "discord", channelId: "c1" },
+      {
+        resume: {
+          created: [{ platform: "discord", channelId: "c1", messageId: "existing" }],
+        },
+      },
+    );
+
+    expect(result.status).toBe("ok");
+    expect(providerCalls).toBe(0);
+  });
+
   it.each([
     [
       { platform: "github", channelId: "c1", messageId: "m1" } as const,
@@ -835,6 +863,105 @@ describe("DiscordAdapter detached event supervision", () => {
 });
 
 describe("DiscordAdapter.refreshCoreConfig", () => {
+  it("keeps paused recovery preparation provider-mutation free until normal output preparation", async () => {
+    const previousConfig = testConfigWithStatusMessage("previous presence");
+    const changedConfig = testConfigWithStatusMessage("changed presence");
+    let cfg = previousConfig;
+    let configReads = 0;
+    let channelFetches = 0;
+    const providerMutations: Array<{ readonly operation: string; readonly value?: unknown }> = [];
+    const adapter = createTestDiscordAdapter({
+      getConfig: async () => {
+        configReads += 1;
+        return cfg;
+      },
+    });
+    const internals = adapter as unknown as {
+      client: unknown;
+      cfg: CoreConfig;
+      appliedStatusMessage: string | null | undefined;
+    };
+    internals.client = {
+      user: {
+        setPresence(value: unknown) {
+          providerMutations.push({ operation: "setPresence", value });
+        },
+      },
+      channels: {
+        fetch: async () => {
+          channelFetches += 1;
+          const restoredMessage = {
+            id: "restored-output",
+            channelId: "c1",
+            attachments: new Map(),
+            edit: async (value: unknown) => {
+              providerMutations.push({ operation: "edit", value });
+              return restoredMessage;
+            },
+            reply: async (value: unknown) => {
+              providerMutations.push({ operation: "reply", value });
+              return restoredMessage;
+            },
+            delete: async () => {
+              providerMutations.push({ operation: "delete" });
+            },
+          };
+          return {
+            send: async (value: unknown) => {
+              providerMutations.push({ operation: "send", value });
+              return restoredMessage;
+            },
+            messages: { fetch: async () => restoredMessage },
+          };
+        },
+      },
+    };
+    internals.cfg = previousConfig;
+    internals.appliedStatusMessage = "previous presence";
+    cfg = changedConfig;
+
+    const prepared = await adapter.startOutput(
+      { platform: "discord", channelId: "c1" },
+      {
+        preparationMode: "paused-recovery",
+        resume: {
+          created: [{ platform: "discord", channelId: "c1", messageId: "restored-output" }],
+        },
+      },
+    );
+    expect(prepared.status).toBe("ok");
+    if (prepared.status === "error") throw prepared.error;
+    expect(
+      prepared.value.hydrateRecovery?.([{ type: "text.set", text: "restored response" }]),
+    ).toBe("visible");
+    await expect(prepared.value.abort("restore_rollback")).resolves.toEqual(Result.ok(undefined));
+    expect({ configReads, channelFetches, providerMutations }).toEqual({
+      configReads: 1,
+      channelFetches: 0,
+      providerMutations: [],
+    });
+
+    const normal = await adapter.startOutput({ platform: "discord", channelId: "c1" });
+    expect(normal.status).toBe("ok");
+    expect(configReads).toBe(2);
+    expect(channelFetches).toBe(0);
+    expect(providerMutations).toEqual([
+      {
+        operation: "setPresence",
+        value: {
+          activities: [
+            {
+              name: "changed presence",
+              state: "changed presence",
+              type: ActivityType.Custom,
+            },
+          ],
+          status: "online",
+        },
+      },
+    ]);
+  });
+
   it("applies, changes, and clears configured presence", async () => {
     let cfg = testConfigWithStatusMessage("reading threads");
     const presenceCalls: unknown[] = [];

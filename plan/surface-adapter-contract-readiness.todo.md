@@ -66,20 +66,22 @@ Permanent workflow-port failures are stored on the surface binding with the exac
 
 ## Stage 7: Versioned Recovery Hardening
 
-- [ ] Add centralized relay snapshot correlation decoding.
-- [ ] Add snapshot v3 with required `requestClient`.
-- [ ] Normalize missing legacy request clients to relay platform and retain v1/v2 fixtures.
-- [ ] Define explicit unavailable descriptor/relay restore behavior.
-- [ ] Preflight complete snapshots and add apply/rollback restore-attempt handles.
-- [ ] Roll back partial relay application before agent restore and supervise rollback failure.
-- [ ] Persist and restore parked queued-cancellation and buffered-absorption attempt state, PEL delivery identity, queue reservations, `controlApplied`, and partial lifecycle-publication progress; restore reservations before queue drain or fail-safe exclude affected entries until PEL recovery so process replacement cannot duplicate effects or run cancelled work.
-- [ ] Persist and restore normalized authenticated/delegated identity plus verified-ingress and safety correlation through versioned codecs; keep legacy snapshots without durable proof restricted and re-admit restored identity into the request cache/registry before Level-2 capability use.
-- [ ] Consume restorable snapshots only after success; consume empty/stale after classification.
-- [ ] Retain unavailable and failed-restoration snapshots.
-- [ ] Define row dispositions for every load, decode, staleness, and SQLite outcome.
-- [ ] Preserve transcript and Discord primary-continuation compatibility.
-- [ ] Add current-version and legacy snapshot/restore fixtures and process-replacement tests covering parked attempts, both `controlApplied` states, partial lifecycle publication, delegated/authenticated identity, verified ingress, restricted legacy fallback, cache/registry re-admission, and pre-Level-2 restore ordering.
-- [ ] Run focused restart/transcript tests, Core typecheck, architecture checks, lint/fmt, and independent review.
+- [x] Add centralized relay snapshot correlation decoding.
+- [x] Add snapshot v3 with required `requestClient`.
+- [x] Normalize missing legacy request clients to relay platform and retain v1/v2 fixtures.
+- [x] Define explicit unavailable descriptor/relay restore behavior.
+- [x] Preflight complete snapshots and add paused apply/rollback/activation restore-attempt handles.
+- [x] Roll back partial relay application before agent restore and supervise rollback failure.
+- [x] Persist and restore parked queued-cancellation and buffered-absorption attempt state, PEL delivery identity, queue reservations, `controlApplied`, and partial lifecycle-publication progress; restore reservations before queue drain or fail-safe exclude affected entries until PEL recovery so process replacement cannot duplicate effects or run cancelled work.
+- [x] Persist and restore normalized actor, origin, GitHub target/trigger, delegated authority, verified-ingress, and safety evidence through the shared live-ingress semantic policy; recompute current safety and keep delegated/legacy recovery restricted unless durable authority proves otherwise.
+- [x] Keep paused ownership through every later fallible startup, compare-and-delete the exact restorable row as the final startup transition, and then perform total synchronous activation; conditionally consume empty/stale rows after classification.
+- [x] Retain unavailable and failed-restoration snapshots.
+- [x] Define row dispositions for every load, decode, staleness, and SQLite outcome.
+- [x] Preserve transcript and Discord primary-continuation compatibility.
+- [x] Add current-version and legacy snapshot/restore fixtures and process-replacement tests covering parked attempts, both `controlApplied` states, partial lifecycle publication, delegated/authenticated identity, verified ingress, restricted legacy fallback, cache/registry re-admission, and pre-Level-2 restore ordering.
+- [x] Run focused restart/transcript tests, Core/root typechecks, architecture checks/tests, root lint/fmt, and diff check. Parent review remains independent.
+
+Snapshot v3 requires correlated relay clients, exact decoded authentication evidence, typed workflow delegation proof, stable queue-entry IDs, globally unique PEL event IDs, validated queue topology, and top-level queue-attempt state. Legacy v1/v2 rows migrate in memory without rewrite and default relay clients from their platform; active-only state restores principal-less and restricted, while any queued entry remains retained because reservation absence cannot be proven. Recovery reads an immutable row token, preflights every relay plus every agent-required surface, constructs output streams, hydrates restored presentation state locally, and starts subscriptions behind paused gates. Paused admission performs no provider push, typing, acknowledgement, or bus publication; Discord may decode refreshed output configuration but defers presence mutation to a normal output/config path. Workflow-authority, cache, and queue admission remain rollbackable. A runner activation-or-stop gate releases retained callbacks before subscription shutdown can wait for them. Every later runtime startup completes while ownership remains rollbackable. The final transition compare-and-deletes the exact row, synchronously restores the Discord router's validated active output-chain state, and immediately opens all relay and agent gates through an idempotent state flip; no Result, promise, provider operation, or awaited startup follows. Router seeding occurs before recovered queue drain, emits no restored output-created events, and is absent on pre-consume rollback. The router retains bounded exact terminal lifecycle tombstones without time expiry while activation is pending, so a terminal-before-activation race cannot resurrect a completed chain after a long startup. Only a matching `(requestId, platform, sessionId)` suppresses seeding, conflicting known routes fail closed, and capacity overflow suppresses every chain in that explicit recovery generation without evicting a relevant key. Generation finalization clears pending tombstones and overflow while retaining weak idempotence for repeated activation; an explicit new running lifecycle preserves ordinary request-ID reuse. Conflict or later startup failure rolls back every admitted resource in reverse order while retaining the row. Direct multi-relay restore also cleans partial application in reverse and raises the registered Panic if cleanup leaves atomicity unknown. Queue-attempt redelivery additionally requires the exact persisted event and control route before touching reserved targets. Unavailable, malformed, corrupt, unsupported, read-failed, apply-failed, conflicting-replacement, and fail-safe incomplete-control rows remain retained.
 
 ## Stage 8: Shared Contract Harness And Documentation
 

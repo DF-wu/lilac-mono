@@ -944,7 +944,9 @@ export class DiscordAdapter implements SurfaceAdapter {
     );
   }
 
-  private async reloadCoreConfigIfNeeded(): Promise<void> {
+  private async reloadCoreConfigIfNeeded(
+    options: { readonly applyPresence?: boolean } = {},
+  ): Promise<void> {
     if (this.opts?.config) return;
 
     const loaded = await Result.tryPromise({
@@ -954,7 +956,7 @@ export class DiscordAdapter implements SurfaceAdapter {
     if (loaded.status === "ok") {
       const cfg = loaded.value;
       this.cfg = cfg;
-      this.applyConfiguredPresence();
+      if (options.applyPresence !== false) this.applyConfiguredPresence();
 
       if (this.coreConfigReloadHadError) {
         this.logger.info("core-config reload recovered", {
@@ -1098,7 +1100,9 @@ export class DiscordAdapter implements SurfaceAdapter {
       });
       if (resumed.status === "error") return resumed;
     }
-    await this.reloadCoreConfigIfNeeded();
+    await this.reloadCoreConfigIfNeeded({
+      applyPresence: opts?.preparationMode !== "paused-recovery",
+    });
 
     const cfg = this.cfg;
     const clientResult = this.clientResult();

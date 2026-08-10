@@ -1057,25 +1057,44 @@ export class DiscordOutputStream implements SurfaceOutputStream {
     return await captureDiscordOutputOperation("push-output", () => this.pushOutput(part));
   }
 
+  hydrateRecovery(parts: readonly SurfaceOutputPart[]): SurfaceOutputPartDisposition {
+    let disposition: SurfaceOutputPartDisposition = "ignored";
+    for (const part of parts) {
+      const applied = this.applyOutputPartLocally(part);
+      if (applied === "visible" || (applied === "terminal" && disposition === "ignored")) {
+        disposition = applied;
+      }
+    }
+    return disposition;
+  }
+
   private async pushOutput(part: SurfaceOutputPart): Promise<SurfaceOutputPartDisposition> {
     // Ensure started on first push so attachments can be part of the first send.
     // If the first push is a delta, we start immediately.
     // If the first push is an attachment, we buffer it until we start.
 
+    const disposition = this.applyOutputPartLocally(part);
+    if (
+      part.type !== "attachment.add" &&
+      !(part.type === "reasoning.status" && this.deps.reasoningDisplayMode === "none")
+    ) {
+      await this.ensureStarted();
+    }
+    return disposition;
+  }
+
+  private applyOutputPartLocally(part: SurfaceOutputPart): SurfaceOutputPartDisposition {
     switch (part.type) {
       case "text.delta":
         this.finalTextSegments = null;
         this.textAcc += part.delta;
-        await this.ensureStarted();
         return "visible";
       case "text.set":
         this.textAcc = part.text;
         this.finalTextSegments = part.finalSegments?.slice() ?? null;
-        await this.ensureStarted();
         return "visible";
       case "meta.stats":
         this.statsForNerdsLine = part.line.trim().length > 0 ? part.line : null;
-        await this.ensureStarted();
         return "visible";
       case "reasoning.status": {
         if (this.deps.reasoningDisplayMode === "none") {
@@ -1086,7 +1105,6 @@ export class DiscordOutputStream implements SurfaceOutputStream {
         }
         this.hasReasoningStatus = true;
         this.reasoningDetailText = part.update.detailText ?? "";
-        await this.ensureStarted();
         return "visible";
       }
       case "tool.status": {
@@ -1117,8 +1135,6 @@ export class DiscordOutputStream implements SurfaceOutputStream {
           );
           if (ordinaryIdx >= 0) this.toolLines.splice(ordinaryIdx, 1);
         }
-        // Only start once we have something to show.
-        await this.ensureStarted();
         return "visible";
       }
       case "attachment.add": {

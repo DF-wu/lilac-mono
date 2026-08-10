@@ -777,6 +777,7 @@ export function requireSurfaceRelayPolicyRefs<P extends RegisteredSurfacePlatfor
       },
     },
     ...(policy.finalization ? { finalization: policy.finalization } : {}),
+    ...(policy.recovery ? { recovery: policy.recovery } : {}),
   };
 }
 

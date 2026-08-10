@@ -4,6 +4,7 @@ import { Result, TaggedError, type Result as ResultType } from "better-result";
 import { z } from "zod";
 
 import { parseRequestId } from "./bridge/request-ids";
+import { parseGithubRequestId } from "../github/github-ids";
 import type {
   AuthenticatedSurfaceOrigin,
   MsgRef,
@@ -24,6 +25,7 @@ type AuthenticationMetadataKind =
 
 type GithubTriggerProjection = {
   readonly kind: "comment" | "issue";
+  readonly targetKind?: "issue" | "pull-request";
   readonly repoFullName?: string;
   readonly issueNumber?: number;
   readonly messageId: string;
@@ -37,6 +39,10 @@ export type AuthenticatedRequestProjection = {
   readonly platform?: RegisteredSurfacePlatform;
   readonly sessionRef?: SessionRefFor<RegisteredSurfacePlatform>;
   readonly messageRef?: MsgRefFor<RegisteredSurfacePlatform>;
+  readonly authenticatedActor?: {
+    readonly platform: RegisteredSurfacePlatform;
+    readonly userId: string;
+  };
   readonly authenticatedOrigin?: AuthenticatedSurfaceOrigin;
   readonly authenticationMetadataKind: AuthenticationMetadataKind;
   readonly githubTrigger?: GithubTriggerProjection;
@@ -62,7 +68,7 @@ const requestRawSchema = z
     authenticatedActor: z
       .object({
         platform: z.enum(["discord", "github"]),
-        userId: z.string().trim().min(1).optional(),
+        userId: z.string().trim().min(1),
       })
       .optional(),
     authenticatedOrigin: z
@@ -105,6 +111,127 @@ function metadataKind(input: {
   return "absent";
 }
 
+function nonempty(value: string): boolean {
+  return value.trim().length > 0;
+}
+
+export function isAuthenticatedRequestProjectionSemanticallyValid(
+  projection: AuthenticatedRequestProjection,
+): boolean {
+  const hasActor = projection.authenticationMetadataKind.includes("actor");
+  const hasOrigin = projection.authenticationMetadataKind.includes("origin");
+  const hasGithubTrigger = projection.authenticationMetadataKind.includes("github-trigger");
+  const actor = projection.authenticatedActor;
+  const origin = projection.authenticatedOrigin;
+  if (
+    !nonempty(projection.requestId) ||
+    !nonempty(projection.sessionId) ||
+    hasActor !== (actor !== undefined) ||
+    hasGithubTrigger !== (projection.githubTrigger !== undefined) ||
+    (hasActor && origin === undefined) ||
+    (hasOrigin && origin === undefined) ||
+    (!hasActor && !hasOrigin && origin !== undefined)
+  ) {
+    return false;
+  }
+  if (projection.source === "internal-delegated") {
+    return (
+      projection.requestClient === "unknown" &&
+      projection.platform === undefined &&
+      projection.sessionRef === undefined &&
+      projection.messageRef === undefined &&
+      projection.authenticatedActor === undefined &&
+      projection.githubTrigger === undefined &&
+      !hasActor &&
+      projection.verifiedIngress === false &&
+      (origin === undefined ||
+        (nonempty(origin.userId) &&
+          nonempty(origin.sessionRef.channelId) &&
+          origin.sessionRef.platform === origin.platform))
+    );
+  }
+  if (projection.requestClient !== "discord" && projection.requestClient !== "github") {
+    return (
+      projection.authenticationMetadataKind === "absent" &&
+      projection.platform === undefined &&
+      projection.sessionRef === undefined &&
+      projection.messageRef === undefined &&
+      actor === undefined &&
+      origin === undefined &&
+      projection.githubTrigger === undefined &&
+      projection.verifiedIngress === false
+    );
+  }
+  if (
+    projection.platform !== projection.requestClient ||
+    projection.sessionRef?.platform !== projection.requestClient ||
+    projection.sessionRef.channelId !== projection.sessionId ||
+    !nonempty(projection.sessionRef.channelId) ||
+    (projection.messageRef !== undefined &&
+      (projection.messageRef.platform !== projection.requestClient ||
+        projection.messageRef.channelId !== projection.sessionId ||
+        !nonempty(projection.messageRef.messageId))) ||
+    (actor !== undefined &&
+      (actor.platform !== projection.requestClient ||
+        !nonempty(actor.userId) ||
+        actor.userId !== origin?.userId)) ||
+    (hasOrigin && origin?.messageRef === undefined) ||
+    (origin !== undefined &&
+      (origin.platform !== projection.requestClient ||
+        origin.sessionRef.platform !== origin.platform ||
+        origin.sessionRef.channelId !== projection.sessionId ||
+        !nonempty(origin.userId) ||
+        (origin.messageRef !== undefined &&
+          (origin.messageRef.platform !== projection.requestClient ||
+            origin.messageRef.channelId !== projection.sessionId ||
+            origin.messageRef.messageId !== projection.messageRef?.messageId))))
+  ) {
+    return false;
+  }
+  if (projection.requestClient === "discord") {
+    if (projection.githubTrigger !== undefined || hasGithubTrigger) return false;
+    const expectedVerified = hasOrigin || (hasActor && origin !== undefined);
+    if (projection.verifiedIngress !== expectedVerified) return false;
+    if (projection.messageRef) {
+      const parsed = parseRequestId(projection.requestId);
+      if (
+        parsed?.kind !== "discord_message" ||
+        parsed.channelId !== projection.sessionId ||
+        parsed.messageId !== projection.messageRef.messageId
+      ) {
+        return false;
+      }
+    }
+    return true;
+  }
+  const trigger = projection.githubTrigger;
+  if (trigger === undefined) return projection.verifiedIngress === false;
+  const session = /^(.+)#([1-9]\d*)$/u.exec(projection.sessionId);
+  if (
+    !session ||
+    trigger.messageId !== projection.messageRef?.messageId ||
+    !/^[1-9]\d*$/u.test(trigger.messageId) ||
+    (trigger.repoFullName !== undefined && trigger.repoFullName !== session[1]) ||
+    (trigger.issueNumber !== undefined && trigger.issueNumber !== Number(session[2])) ||
+    (trigger.kind === "issue" && trigger.messageId !== String(trigger.issueNumber))
+  ) {
+    return false;
+  }
+  const completeTrigger =
+    trigger.repoFullName !== undefined &&
+    trigger.issueNumber !== undefined &&
+    trigger.targetKind !== undefined &&
+    nonempty(trigger.repoFullName) &&
+    nonempty(trigger.messageId);
+  if (completeTrigger) {
+    const request = parseGithubRequestId({ requestId: projection.requestId });
+    if (request?.sessionId !== projection.sessionId || request.triggerId !== trigger.messageId) {
+      return false;
+    }
+  }
+  return projection.verifiedIngress === completeTrigger;
+}
+
 export function projectAuthenticatedRequest(
   msg: Extract<LilacMessageForTopic<"cmd.request">, { type: "cmd.request.message" }>,
 ): ResultType<AuthenticatedRequestProjection | undefined, AuthenticatedRequestProjectionInvalid> {
@@ -124,6 +251,10 @@ export function projectAuthenticatedRequest(
         message,
       }),
     );
+  const valid = (projection: AuthenticatedRequestProjection) =>
+    isAuthenticatedRequestProjectionSemanticallyValid(projection)
+      ? Result.ok(projection)
+      : invalid("cmd.request.message authentication projection is semantically inconsistent");
 
   if (!requestId || !sessionId) {
     if (!hasAuthenticationMetadata) return Result.ok(undefined);
@@ -135,7 +266,7 @@ export function projectAuthenticatedRequest(
     if (hasAuthenticationMetadata) {
       return invalid("surface authentication metadata requires a registered request platform");
     }
-    return Result.ok({
+    return valid({
       requestId,
       requestClient,
       sessionId,
@@ -171,6 +302,9 @@ export function projectAuthenticatedRequest(
   }
   if (platform !== "github" && trigger) {
     return invalid("GitHub trigger metadata does not match the request platform");
+  }
+  if (github?.issueNumber !== undefined && github.prNumber !== undefined) {
+    return invalid("GitHub trigger metadata declares both issue and pull-request targets");
   }
 
   let triggerMessageId: string | undefined;
@@ -224,9 +358,13 @@ export function projectAuthenticatedRequest(
     origin: origin !== undefined,
     githubTrigger: trigger !== undefined,
   });
+  let githubTargetKind: GithubTriggerProjection["targetKind"];
+  if (github?.prNumber !== undefined) githubTargetKind = "pull-request";
+  else if (github?.issueNumber !== undefined) githubTargetKind = "issue";
   const githubTrigger = triggerMessageId
     ? {
         kind: trigger?.kind ?? "comment",
+        ...(githubTargetKind ? { targetKind: githubTargetKind } : {}),
         ...(github?.repoFullName ? { repoFullName: github.repoFullName } : {}),
         ...(sessionIssueNumber ? { issueNumber: sessionIssueNumber } : {}),
         messageId: triggerMessageId,
@@ -236,6 +374,7 @@ export function projectAuthenticatedRequest(
     platform === "github" &&
     trigger !== undefined &&
     github?.repoFullName === sessionRepoFullName &&
+    (github?.issueNumber !== undefined || github?.prNumber !== undefined) &&
     declaredIssueNumbers.length > 0 &&
     declaredIssueNumbers.every((value) => value === sessionIssueNumber);
 
@@ -250,7 +389,7 @@ export function projectAuthenticatedRequest(
         ? { platform, userId, sessionRef, messageRef: discordMessageRef }
         : { platform, userId, sessionRef };
     }
-    return Result.ok({
+    return valid({
       requestId,
       requestClient,
       sessionId,
@@ -258,6 +397,7 @@ export function projectAuthenticatedRequest(
       platform,
       sessionRef,
       ...(discordMessageRef ? { messageRef: discordMessageRef } : {}),
+      ...(actor ? { authenticatedActor: { platform: actor.platform, userId: actor.userId } } : {}),
       ...(authenticatedOrigin ? { authenticatedOrigin } : {}),
       authenticationMetadataKind,
       verifiedIngress: actor !== undefined || origin !== undefined,
@@ -272,7 +412,7 @@ export function projectAuthenticatedRequest(
       ? { platform, userId, sessionRef, messageRef: githubMessageRef }
       : { platform, userId, sessionRef };
   }
-  return Result.ok({
+  return valid({
     requestId,
     requestClient,
     sessionId,
@@ -280,6 +420,7 @@ export function projectAuthenticatedRequest(
     platform,
     sessionRef,
     ...(githubMessageRef ? { messageRef: githubMessageRef } : {}),
+    ...(actor ? { authenticatedActor: { platform: actor.platform, userId: actor.userId } } : {}),
     ...(authenticatedOrigin ? { authenticatedOrigin } : {}),
     authenticationMetadataKind,
     ...(githubTrigger ? { githubTrigger } : {}),
@@ -306,6 +447,7 @@ function sameGithubTrigger(
   if (!left || !right) return left === right;
   return (
     left.kind === right.kind &&
+    left.targetKind === right.targetKind &&
     left.repoFullName === right.repoFullName &&
     left.issueNumber === right.issueNumber &&
     left.messageId === right.messageId

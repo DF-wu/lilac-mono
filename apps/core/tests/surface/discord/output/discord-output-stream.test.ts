@@ -595,6 +595,38 @@ function makeAttachment(index: number): SurfaceAttachment {
   };
 }
 
+describe("Discord recovery hydration", () => {
+  it("applies restored state without provider calls before the first live part", async () => {
+    const { client, createdMessageIds, operations } = createFakeDiscordClient();
+    const out = new DiscordOutputStream({
+      client,
+      sessionRef: { platform: "discord", channelId: "chan" },
+      useSmartSplitting: false,
+      outputMode: "inline",
+      reasoningDisplayMode: "simple",
+      workingIndicators: ["Working"],
+    });
+
+    expect(
+      out.hydrateRecovery([
+        { type: "text.set", text: "restored" },
+        {
+          type: "reasoning.status",
+          update: { startedAtMs: 1, frozenAtMs: 2, detailText: "reasoning" },
+        },
+      ]),
+    ).toBe("visible");
+    expect(createdMessageIds).toEqual([]);
+    expect(operations).toEqual([]);
+
+    await expect(out.push({ type: "text.delta", delta: " live" })).resolves.toEqual(
+      Result.ok("visible"),
+    );
+    expect(createdMessageIds).toEqual(["m_1"]);
+    expect(operations.map((operation) => operation.kind)).toEqual(["send", "edit"]);
+  });
+});
+
 describe("Discord compact progress integration", () => {
   it("moves a completed agent into history before newer tool activity", async () => {
     let resolveActiveEdit: (options: unknown) => void = () => {};

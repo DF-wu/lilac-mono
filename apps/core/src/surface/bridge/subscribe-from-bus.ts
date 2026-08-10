@@ -18,20 +18,29 @@ import type {
   SurfaceOutputPart,
   SurfaceOutputPartDisposition,
   SurfaceOutputResult,
+  SurfaceOutputStream,
   SurfaceOperationError,
   SurfaceOperationResult,
   StartOutputOpts,
   SurfaceToolStatusUpdate,
   TypingIndicatorSubscription,
 } from "../adapter";
-import type { MsgRef, SessionRef, SurfaceAttachment } from "../types";
+import { SurfaceOperationUnsupported } from "../adapter";
+import type { MsgRef, MsgRefFor, SessionRef, SurfaceAttachment } from "../types";
 import type {
   RegisteredSurfacePlatform,
   SurfaceIngressAcknowledgementCleanupFailed,
   SurfaceRelayPolicy,
+  SurfaceRelayRestoreAttempt,
   SurfaceRelaySnapshotFor,
+  SurfaceRecoveryGeneration,
+  SurfaceRestoredOutputChain,
   SurfaceReplyTargetInvalid,
   SurfaceRefInvalid,
+} from "../runtime-descriptor";
+import {
+  SurfaceRelayRestoreApplyFailed,
+  SurfaceRelayRestoreRollbackFailed,
 } from "../runtime-descriptor";
 import { requireSurfaceRelayPolicyRefs, requireSurfaceRelaySnapshot } from "../produced-ref-guard";
 import { mergeSubagentToolStatus } from "../subagent-tool-status";
@@ -161,6 +170,7 @@ type BusToAdapterEffect =
   | "publish-output-created"
   | "push-output"
   | "reanchor-output"
+  | "restore-relay"
   | "start-output"
   | "start-typing"
   | "stop-output-subscription"
@@ -297,6 +307,15 @@ export async function superviseBusToAdapterCleanup(
   if (failure !== null) throw failure.cause;
 }
 
+function signalSurfaceRelayRecoveryAtomicityUnknown(
+  cause: SurfaceRelayRestoreRollbackFailed,
+): never {
+  throw new Panic({
+    message: "Relay recovery rollback left atomicity unknown",
+    cause,
+  });
+}
+
 async function runBusToAdapterBestEffort(input: {
   operation: BusToAdapterEffect;
   effect: () => Promise<void>;
@@ -406,6 +425,8 @@ type ActiveRelay = {
   requestId: string;
   sessionId: string;
   platform: RegisteredSurfacePlatform;
+  activate(): void;
+  rollbackRestore(): Promise<ResultType<void, SurfaceRelayRestoreRollbackFailed>>;
   stopTyping(): Promise<void>;
   stop(): Promise<void>;
   cancel(): Promise<void>;
@@ -491,6 +512,7 @@ export async function bridgeBusToAdapter<P extends RegisteredSurfacePlatform>(pa
   const policy = requireSurfaceRelayPolicyRefs(platform, params.policy);
 
   const activeRelays = new Map<string, ActiveRelay>();
+  const admittedRestoreRelays = new Map<string, ActiveRelay>();
   const terminalLifecycleByRequestId = new Map<
     string,
     {
@@ -953,20 +975,38 @@ export async function bridgeBusToAdapter<P extends RegisteredSurfacePlatform>(pa
     ]);
   };
 
-  async function startRelay(input: {
-    adapter: SurfaceAdapter;
-    bus: LilacBus;
-    platform: P;
-    requestId: string;
-    sessionId: string;
-    requestStartedAtMs?: number;
-    routerSessionMode?: "mention" | "active";
-    requestClient?: string;
-    idleTimeoutMs: number;
-    initialReplyTo?: MsgRef;
-    restore?: BusToAdapterRelaySnapshot;
-  }): Promise<ActiveRelay> {
+  type RelayStartupResources = {
+    output?: SurfaceOutputStream;
+    subscription?: ResultSubscription;
+    typing?: TypingIndicatorSubscription;
+  };
+
+  async function startRelayUnchecked(
+    input: {
+      adapter: SurfaceAdapter;
+      bus: LilacBus;
+      platform: P;
+      requestId: string;
+      sessionId: string;
+      requestStartedAtMs?: number;
+      routerSessionMode?: "mention" | "active";
+      requestClient?: string;
+      idleTimeoutMs: number;
+      initialReplyTo?: MsgRef;
+      restore?: BusToAdapterRelaySnapshot;
+      paused?: boolean;
+    },
+    startupResources: RelayStartupResources,
+  ): Promise<ActiveRelay> {
     const { requestId, sessionId, idleTimeoutMs } = input;
+    let resolveActivationGate: (() => void) | null = null;
+    const activationGate = input.paused
+      ? new Promise<void>((resolve) => {
+          resolveActivationGate = resolve;
+        })
+      : Promise.resolve();
+    let activated = !input.paused;
+    let stopped = false;
 
     const relayStartedAt = Date.now();
     const requestStartedAtMs = Math.max(
@@ -1058,20 +1098,8 @@ export async function bridgeBusToAdapter<P extends RegisteredSurfacePlatform>(pa
 
     let streamToken = 0;
 
-    const publishCreatedForToken = (token: number) => (msgRef: MsgRef) => {
-      recordCreatedOutputRef(msgRef);
-
-      // Only publish created messages for the currently active output stream.
-      // This prevents a reanchor from temporarily treating "frozen" follow-up messages
-      // (e.g. attachment flushes) as the active streaming target.
-      if (token !== streamToken) return;
-      const key = `${msgRef.platform}:${msgRef.channelId}:${msgRef.messageId}`;
-      if (!activeOutputRefKeys.has(key)) {
-        activeOutputRefKeys.add(key);
-        activeOutputRefs.push(msgRef);
-      }
-
-      void runBusToAdapterBestEffort({
+    const publishOutputCreated = (msgRef: MsgRef) =>
+      runBusToAdapterBestEffort({
         operation: "publish-output-created",
         effect: async () => {
           adaptEventPublishResultToHost(
@@ -1099,6 +1127,20 @@ export async function bridgeBusToAdapter<P extends RegisteredSurfacePlatform>(pa
         logMessage: "failed to publish output message created",
         context: { requestId },
       });
+
+    const publishCreatedForToken = (token: number) => (msgRef: MsgRef) => {
+      recordCreatedOutputRef(msgRef);
+
+      // Only publish created messages for the currently active output stream.
+      // This prevents a reanchor from temporarily treating "frozen" follow-up messages
+      // (e.g. attachment flushes) as the active streaming target.
+      if (token !== streamToken) return;
+      const key = `${msgRef.platform}:${msgRef.channelId}:${msgRef.messageId}`;
+      if (!activeOutputRefKeys.has(key)) {
+        activeOutputRefKeys.add(key);
+        activeOutputRefs.push(msgRef);
+      }
+      if (activated && !stopped) void publishOutputCreated(msgRef);
     };
 
     let useResumeOpts = Boolean(input.restore);
@@ -1106,8 +1148,10 @@ export async function bridgeBusToAdapter<P extends RegisteredSurfacePlatform>(pa
     const buildStartOpts = (
       overrideReplyTo: MsgRef | undefined,
       token: number,
+      preparationMode?: "paused-recovery",
     ): StartOutputOpts => {
       const startOpts: StartOutputOpts = {
+        ...(preparationMode ? { preparationMode } : {}),
         replyTo: overrideReplyTo,
         requestId,
         requestStartedAtMs,
@@ -1129,8 +1173,16 @@ export async function bridgeBusToAdapter<P extends RegisteredSurfacePlatform>(pa
     streamToken += 1;
     let out = adaptSurfaceOperationToRelay(
       "start-output",
-      await adapter.startOutput(sessionRef, buildStartOpts(baseReplyTo, streamToken)),
+      await adapter.startOutput(
+        sessionRef,
+        buildStartOpts(
+          baseReplyTo,
+          streamToken,
+          input.restore && input.paused ? "paused-recovery" : undefined,
+        ),
+      ),
     );
+    startupResources.output = out;
     let finalTextMode: SurfaceFinalTextMode = out.getFinalTextMode?.() ?? "continuation";
     useResumeOpts = false;
     const recordOutputPartDisposition = (disposition: SurfaceOutputPartDisposition): void => {
@@ -1139,73 +1191,42 @@ export async function bridgeBusToAdapter<P extends RegisteredSurfacePlatform>(pa
       }
     };
 
-    if (input.restore) {
-      // Re-publish existing output refs so router active-output tracking can recover.
-      for (const ref of createdOutputRefs) {
-        void runBusToAdapterBestEffort({
-          operation: "publish-output-created",
-          effect: async () => {
-            adaptEventPublishResultToHost(
-              await bus.publish(
-                lilacEventTypes.EvtSurfaceOutputMessageCreated,
-                {
-                  msgRef: {
-                    platform: ref.platform,
-                    channelId: ref.channelId,
-                    messageId: ref.messageId,
-                  },
-                },
-                {
-                  headers: {
-                    request_id: requestId,
-                    session_id: sessionId,
-                    request_client: input.platform,
-                  },
-                },
-              ),
-            );
-          },
-          logger,
-          logLevel: "debug",
-          logMessage: "failed to publish restored output message created",
-          context: { requestId, sessionId, messageId: ref.messageId },
-        });
-      }
-
+    const hydrateRestoredState = (): void => {
+      if (!input.restore) return;
+      const parts: SurfaceOutputPart[] = [];
       if (visibleTextAcc.trim().length > 0) {
-        recordOutputPartDisposition(
-          adaptSurfaceOperationToRelay(
-            "push-output",
-            await out.push({ type: "text.set", text: visibleTextAcc }),
-          ),
-        );
+        parts.push({ type: "text.set", text: visibleTextAcc });
       }
       if (textPhase !== "final_answer" && typeof reasoningStartedAtMs === "number") {
-        recordOutputPartDisposition(
-          adaptSurfaceOperationToRelay(
-            "push-output",
-            await out.push({
-              type: "reasoning.status",
-              update: {
-                startedAtMs: reasoningStartedAtMs,
-                frozenAtMs: reasoningFrozenAtMs,
-                detailText: reasoningDetailText,
-              },
+        parts.push({
+          type: "reasoning.status",
+          update: {
+            startedAtMs: reasoningStartedAtMs,
+            frozenAtMs: reasoningFrozenAtMs,
+            detailText: reasoningDetailText,
+          },
+        });
+      }
+      if (textPhase !== "final_answer") {
+        for (const update of toolStatusById.values()) parts.push({ type: "tool.status", update });
+      }
+      const hydrate = out.hydrateRecovery;
+      if (!hydrate) {
+        adaptSurfaceOperationToRelay(
+          "start-output",
+          Result.err(
+            new SurfaceOperationUnsupported({
+              platform,
+              operation: "start-output",
+              message: "Surface output stream does not support recovery hydration",
             }),
           ),
         );
+        return;
       }
-      if (textPhase !== "final_answer") {
-        for (const update of toolStatusById.values()) {
-          recordOutputPartDisposition(
-            adaptSurfaceOperationToRelay(
-              "push-output",
-              await out.push({ type: "tool.status", update }),
-            ),
-          );
-        }
-      }
-    }
+      recordOutputPartDisposition(hydrate.call(out, parts));
+    };
+    hydrateRestoredState();
 
     const switchOutputLane = async (lane: {
       replyTo?: MsgRef;
@@ -1270,6 +1291,7 @@ export async function bridgeBusToAdapter<P extends RegisteredSurfacePlatform>(pa
     };
 
     let typing: TypingIndicatorSubscription | null = null;
+    let typingAttempted = false;
 
     const stopTyping = async () => {
       const currentTyping = typing;
@@ -1287,35 +1309,39 @@ export async function bridgeBusToAdapter<P extends RegisteredSurfacePlatform>(pa
     const bumpTimeout = () => {
       cancelTimeout?.();
       cancelTimeout = scheduleIdleTimeout(() => {
-        logger.warn("reply relay idle timeout", {
-          requestId,
-          sessionId,
-          idleTimeoutMs,
-        });
+        const expire = () => {
+          if (stopped) return;
+          logger.warn("reply relay idle timeout", {
+            requestId,
+            sessionId,
+            idleTimeoutMs,
+          });
 
-        const abortOutput = runBusToAdapterBestEffort({
-          operation: "abort-output",
-          effect: async () => {
-            adaptSurfaceOperationToRelay("abort-output", await out.abort("timeout"));
-          },
-          logger,
-          logLevel: "error",
-          logMessage: "failed to abort output stream",
-          context: { requestId },
-        });
-        const stopRelay = runBusToAdapterBestEffort({
-          operation: "stop-relay",
-          effect: relayStop,
-          logger,
-          logLevel: "error",
-          logMessage: "failed to stop relay",
-          context: { requestId },
-        });
-        void superviseBusToAdapterCleanup([() => abortOutput, () => stopRelay]);
+          const abortOutput = runBusToAdapterBestEffort({
+            operation: "abort-output",
+            effect: async () => {
+              adaptSurfaceOperationToRelay("abort-output", await out.abort("timeout"));
+            },
+            logger,
+            logLevel: "error",
+            logMessage: "failed to abort output stream",
+            context: { requestId },
+          });
+          const stopRelay = runBusToAdapterBestEffort({
+            operation: "stop-relay",
+            effect: relayStop,
+            logger,
+            logLevel: "error",
+            logMessage: "failed to stop relay",
+            context: { requestId },
+          });
+          void superviseBusToAdapterCleanup([() => abortOutput, () => stopRelay]);
+        };
+        if (activated) expire();
+        else void activationGate.then(expire);
       }, idleTimeoutMs);
     };
 
-    let stopped = false;
     let outputSub: ResultSubscription | null = null;
     let firstOutLogged = false;
     let handlingOutputEvent = false;
@@ -1396,6 +1422,8 @@ export async function bridgeBusToAdapter<P extends RegisteredSurfacePlatform>(pa
     const relayStop = async () => {
       if (stopped) return;
       stopped = true;
+      resolveActivationGate?.();
+      resolveActivationGate = null;
 
       // Remove from recoverable set immediately so graceful snapshots cannot
       // include a relay that has already reached terminal state.
@@ -1470,6 +1498,7 @@ export async function bridgeBusToAdapter<P extends RegisteredSurfacePlatform>(pa
         batch: { maxWaitMs: 250 },
       },
       async (outMsg, outCtx): Promise<ResultType<void, OutReqDeliveryError>> => {
+        await activationGate;
         if (
           outMsg.headers?.request_id !== requestId ||
           outMsg.headers?.session_id !== sessionId ||
@@ -1481,6 +1510,7 @@ export async function bridgeBusToAdapter<P extends RegisteredSurfacePlatform>(pa
           lastOutCursor = outCtx.cursor;
           return Result.ok(undefined);
         }
+        await startTyping();
 
         if (env.perf.log && !firstOutLogged) {
           firstOutLogged = true;
@@ -1908,19 +1938,37 @@ export async function bridgeBusToAdapter<P extends RegisteredSurfacePlatform>(pa
       applyOutReqDeliveryPolicy,
     );
     outputSub = adaptBusToAdapterSubscriptionStart(outputStarted);
+    startupResources.subscription = outputSub;
     observeSubscriptionDone(outputSub, outReqTopic(requestId), logger);
 
-    const startedTyping = await adapter.startTyping(sessionRef);
-    if (startedTyping.status === "ok") {
-      typing = startedTyping.value;
-    } else {
-      typing = null;
-      logger.warn("surface typing indicator unavailable", {
-        requestId,
-        sessionId,
-        ...formatTaggedErrorForLog(startedTyping.error),
-      });
+    async function startTyping(): Promise<void> {
+      if (typing || typingAttempted) return;
+      typingAttempted = true;
+      const captured = await captureBusToAdapterEffect("start-typing", () =>
+        adapter.startTyping(sessionRef),
+      );
+      if (captured.status === "error") {
+        logger.warn("surface typing indicator unavailable", {
+          requestId,
+          sessionId,
+          ...formatTaggedErrorForLog(captured.error),
+        });
+        return;
+      }
+      const startedTyping = captured.value;
+      if (startedTyping.status === "ok") {
+        typing = startedTyping.value;
+        startupResources.typing = typing;
+      } else {
+        typing = null;
+        logger.warn("surface typing indicator unavailable", {
+          requestId,
+          sessionId,
+          ...formatTaggedErrorForLog(startedTyping.error),
+        });
+      }
     }
+    if (!input.paused) await startTyping();
 
     if (env.perf.log) {
       const setupMs = Date.now() - subStart;
@@ -1945,10 +1993,56 @@ export async function bridgeBusToAdapter<P extends RegisteredSurfacePlatform>(pa
       }
     }
 
+    const cleanupRestoreResources = async (): Promise<
+      ResultType<void, SurfaceRelayRestoreRollbackFailed>
+    > => {
+      stopped = true;
+      activeRelays.delete(requestId);
+      terminalLifecycleByRequestId.delete(requestId);
+      cancelTimeout?.();
+      cancelTimeout = null;
+      resolveActivationGate?.();
+      resolveActivationGate = null;
+      const subToStop = outputSub;
+      const typingToStop = typing;
+      typing = null;
+      const settled = await Promise.allSettled([
+        out.abort("restore_rollback").then((result) => result.status === "ok"),
+        subToStop
+          ? subToStop.stop().then(async (stoppedResult) => {
+              if (stoppedResult.status === "error") return false;
+              const done = await subToStop.done;
+              return done.status === "ok";
+            })
+          : Promise.resolve(true),
+        typingToStop
+          ? typingToStop.stop().then((result) => result.status === "ok")
+          : Promise.resolve(true),
+      ]);
+      if (settled.some((result) => result.status === "rejected" || result.value === false)) {
+        return Result.err(
+          new SurfaceRelayRestoreRollbackFailed({
+            platform,
+            message: "Persisted relay restore cleanup failed",
+          }),
+        );
+      }
+      return Result.ok(undefined);
+    };
+
+    const activate = (): void => {
+      if (activated) return;
+      activated = true;
+      resolveActivationGate?.();
+      resolveActivationGate = null;
+    };
+
     return {
       requestId,
       sessionId,
       platform: input.platform,
+      activate,
+      rollbackRestore: cleanupRestoreResources,
       stopTyping,
       stop: relayStop,
       cancel: async () => {
@@ -2018,7 +2112,39 @@ export async function bridgeBusToAdapter<P extends RegisteredSurfacePlatform>(pa
     };
   }
 
-  return {
+  async function startRelay(
+    input: Parameters<typeof startRelayUnchecked>[0],
+  ): Promise<ActiveRelay> {
+    const resources: RelayStartupResources = {};
+    try {
+      return await startRelayUnchecked(input, resources);
+    } catch (cause) {
+      const settled = await Promise.allSettled([
+        resources.output
+          ? resources.output.abort("restore_start_failed").then((result) => result.status === "ok")
+          : Promise.resolve(true),
+        resources.subscription
+          ? resources.subscription.stop().then(async (stopped) => {
+              if (stopped.status === "error") return false;
+              const done = await resources.subscription?.done;
+              return done?.status === "ok";
+            })
+          : Promise.resolve(true),
+        resources.typing
+          ? resources.typing.stop().then((result) => result.status === "ok")
+          : Promise.resolve(true),
+      ]);
+      if (settled.some((result) => result.status === "rejected" || result.value === false)) {
+        throw new Panic({
+          message: "Relay startup cleanup left recovery atomicity unknown",
+          cause,
+        });
+      }
+      throw cause;
+    }
+  }
+
+  const handle = {
     platform,
     beginDrain: async (opts?: { deadlineMs?: number }) => {
       draining = true;
@@ -2038,73 +2164,207 @@ export async function bridgeBusToAdapter<P extends RegisteredSurfacePlatform>(pa
         return snapshot;
       });
     },
-    restoreRelays: async (snapshots: readonly BusToAdapterRelaySnapshot[]) => {
-      if (draining) return;
-
+    prepareRestoreRelays: (
+      snapshots: readonly BusToAdapterRelaySnapshot[],
+    ): ResultType<SurfaceRelayRestoreAttempt<P>, SurfaceRelayRestoreApplyFailed> => {
+      if (draining) {
+        return Result.err(
+          new SurfaceRelayRestoreApplyFailed({
+            platform,
+            requestId: snapshots[0]?.requestId ?? "unavailable",
+            message: "Relay restore is unavailable while the relay is draining",
+          }),
+        );
+      }
       for (const snapshot of snapshots) {
         requireSurfaceRelaySnapshot(platform, snapshot, "relay.restoreRelays");
       }
-
+      const decodeRecoveryRefs = (
+        snapshot: BusToAdapterRelaySnapshot,
+        refs: readonly MsgRef[],
+      ): ResultType<readonly MsgRefFor<P>[], SurfaceRelayRestoreApplyFailed> => {
+        const decodedRefs: MsgRefFor<P>[] = [];
+        for (const ref of refs) {
+          const decoded = policy.refs.decodeReanchorTarget({
+            ref,
+            expectedSessionId: snapshot.sessionId,
+          });
+          if (decoded.status === "error") {
+            return Result.err(
+              new SurfaceRelayRestoreApplyFailed({
+                platform,
+                requestId: snapshot.requestId,
+                message: "Persisted relay output chain contains an unavailable reference",
+              }),
+            );
+          }
+          decodedRefs.push(decoded.value);
+        }
+        return Result.ok(decodedRefs);
+      };
+      const prepared: Array<{
+        readonly snapshot: BusToAdapterRelaySnapshot;
+        readonly initialReplyTo?: MsgRef;
+        readonly recoveryChain: SurfaceRestoredOutputChain<P>;
+      }> = [];
       for (const snapshot of snapshots) {
-        if (activeRelays.has(snapshot.requestId)) continue;
-
+        const createdOutputRefs = decodeRecoveryRefs(snapshot, snapshot.createdOutputRefs);
+        if (createdOutputRefs.status === "error") return Result.err(createdOutputRefs.error);
+        const activeOutputRefs = snapshot.activeOutputRefs
+          ? decodeRecoveryRefs(snapshot, snapshot.activeOutputRefs)
+          : undefined;
+        if (activeOutputRefs?.status === "error") return Result.err(activeOutputRefs.error);
+        const recoveryChain: SurfaceRestoredOutputChain<P> = {
+          requestId: snapshot.requestId,
+          sessionId: snapshot.sessionId,
+          createdOutputRefs: createdOutputRefs.value,
+          ...(activeOutputRefs ? { activeOutputRefs: activeOutputRefs.value } : {}),
+        };
+        const existing =
+          activeRelays.get(snapshot.requestId) ?? admittedRestoreRelays.get(snapshot.requestId);
+        if (existing) {
+          if (existing.platform !== platform || existing.sessionId !== snapshot.sessionId) {
+            return Result.err(
+              new SurfaceRelayRestoreApplyFailed({
+                platform,
+                requestId: snapshot.requestId,
+                message: "An active relay conflicts with the persisted restore identity",
+              }),
+            );
+          }
+          prepared.push({ snapshot, recoveryChain });
+          continue;
+        }
         let initialReplyTo: MsgRef | undefined;
         if (snapshot.replyTo) {
           const decoded = policy.refs.decodeReanchorTarget({
             ref: snapshot.replyTo,
             expectedSessionId: snapshot.sessionId,
           });
-          if (decoded.status === "error") {
-            logger.error(
-              "relay restore reply target rejected",
-              formatBridgeTaggedErrorForLog(decoded.error, {
-                requestId: snapshot.requestId,
-                sessionId: snapshot.sessionId,
-                platform,
-              }),
-            );
-          } else {
-            initialReplyTo = decoded.value;
-          }
+          if (decoded.status === "ok") initialReplyTo = decoded.value;
         } else {
           const resolved = policy.refs.resolveInitialReplyTarget({
             requestId: snapshot.requestId,
             sessionId: snapshot.sessionId,
           });
-          if (resolved.kind === "invalid") {
-            logger.error(
-              "relay restore initial reply target rejected",
-              formatBridgeTaggedErrorForLog(resolved.error, {
-                requestId: snapshot.requestId,
-                sessionId: snapshot.sessionId,
-                platform,
-              }),
-            );
-          }
           if (resolved.kind === "target") initialReplyTo = resolved.ref;
         }
-
-        const relay = await startRelay({
-          adapter,
-          bus,
-          platform,
-          requestId: snapshot.requestId,
-          sessionId: snapshot.sessionId,
-          routerSessionMode: snapshot.routerSessionMode,
-          requestClient: snapshot.requestClient,
-          idleTimeoutMs,
-          initialReplyTo,
-          restore: snapshot,
+        prepared.push({
+          snapshot,
+          recoveryChain,
+          ...(initialReplyTo ? { initialReplyTo } : {}),
         });
-
-        activeRelays.set(snapshot.requestId, relay);
       }
+      const createdRequestIds: string[] = [];
+      const recoveryGeneration: SurfaceRecoveryGeneration = {
+        generation: Symbol("surface-recovery"),
+      };
+      let applied = false;
+      let activated = false;
+      const rollbackCreated = async (): Promise<
+        ResultType<void, SurfaceRelayRestoreRollbackFailed>
+      > => {
+        const failures: SurfaceRelayRestoreRollbackFailed[] = [];
+        for (const requestId of createdRequestIds.toReversed()) {
+          const relay = admittedRestoreRelays.get(requestId);
+          if (!relay) continue;
+          const stopped = await relay.rollbackRestore();
+          if (stopped.status === "error") failures.push(stopped.error);
+          admittedRestoreRelays.delete(requestId);
+        }
+        createdRequestIds.length = 0;
+        applied = false;
+        if (failures.length > 0) {
+          return Result.err(
+            new SurfaceRelayRestoreRollbackFailed({
+              platform,
+              message: `Persisted relay restore rollback failed for ${failures.length} relay(s)`,
+            }),
+          );
+        }
+        return Result.ok(undefined);
+      };
+      return Result.ok({
+        platform,
+        apply: async () => {
+          if (applied) return Result.ok(undefined);
+          for (const item of prepared) {
+            if (activeRelays.has(item.snapshot.requestId)) continue;
+            if (admittedRestoreRelays.has(item.snapshot.requestId)) continue;
+            const started = await captureBusToAdapterEffect("restore-relay", () =>
+              startRelay({
+                adapter,
+                bus,
+                platform,
+                requestId: item.snapshot.requestId,
+                sessionId: item.snapshot.sessionId,
+                routerSessionMode: item.snapshot.routerSessionMode,
+                requestClient: item.snapshot.requestClient,
+                idleTimeoutMs,
+                initialReplyTo: item.initialReplyTo,
+                restore: item.snapshot,
+                paused: true,
+              }),
+            );
+            if (started.status === "error") {
+              const rolledBack = await rollbackCreated();
+              if (rolledBack.status === "error") {
+                signalSurfaceRelayRecoveryAtomicityUnknown(rolledBack.error);
+              }
+              return Result.err(
+                new SurfaceRelayRestoreApplyFailed({
+                  platform,
+                  requestId: item.snapshot.requestId,
+                  message: "Persisted relay restore application failed",
+                }),
+              );
+            }
+            admittedRestoreRelays.set(item.snapshot.requestId, started.value);
+            createdRequestIds.push(item.snapshot.requestId);
+          }
+          applied = true;
+          return Result.ok(undefined);
+        },
+        rollback: rollbackCreated,
+        activate: () => {
+          if (!applied || activated) return;
+          activated = true;
+          policy.recovery?.activateRestoredOutputChains(
+            recoveryGeneration,
+            prepared.map((item) => item.recoveryChain),
+          );
+          for (const requestId of createdRequestIds) {
+            const relay = admittedRestoreRelays.get(requestId);
+            if (!relay) continue;
+            admittedRestoreRelays.delete(requestId);
+            activeRelays.set(requestId, relay);
+          }
+          for (const requestId of createdRequestIds) {
+            activeRelays.get(requestId)?.activate();
+          }
+        },
+      });
     },
     stop: async () => {
       await stopIngress();
       await superviseBusToAdapterCleanup(
-        [...activeRelays.values()].map((relay) => () => relay.stop()),
+        [
+          ...[...admittedRestoreRelays.values()].map(async (relay) => {
+            await relay.rollbackRestore();
+          }),
+          ...[...activeRelays.values()].map((relay) => relay.stop()),
+        ].map((operation) => () => operation),
       );
+    },
+  };
+  return {
+    ...handle,
+    restoreRelays: async (snapshots: readonly BusToAdapterRelaySnapshot[]) => {
+      const prepared = handle.prepareRestoreRelays(snapshots);
+      if (prepared.status === "error") throw prepared.error;
+      const applied = await prepared.value.apply();
+      if (applied.status === "error") throw applied.error;
+      prepared.value.activate();
     },
   };
 }

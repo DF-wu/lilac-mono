@@ -3717,6 +3717,67 @@ export const LEGACY_UNENFORCED_EXCEPTION_ADAPTERS = new Map<string, readonly Exc
       ),
       {
         identity: {
+          module: "src/runtime/surface-runtime-lifecycle.ts",
+          exportName: "signalSurfaceRecoveryRollbackAtomicityUnknown",
+        },
+        category: "defect-supervisor",
+        externalApi: { package: "better-result", exportName: "Panic" },
+        direction: "signal-host",
+        reason:
+          "Escalates an incomplete paused-recovery rollback to the runtime host because recovery atomicity is unknown.",
+      },
+      {
+        identity: {
+          module: "src/runtime/graceful-restart-store.ts",
+          exportName: "signalMissingGracefulRestartDispositionToken",
+        },
+        category: "defect-supervisor",
+        externalApi: { package: "better-result", exportName: "Panic" },
+        direction: "signal-host",
+        reason:
+          "Signals the impossible invariant that a decoded persisted row reached disposition classification without its immutable token.",
+      },
+      {
+        identity: {
+          module: "src/surface/bridge/subscribe-from-bus.ts",
+          exportName: "bridgeBusToAdapter.startRelay",
+        },
+        category: "compatibility",
+        externalApi: {
+          package: "@stanley2058/lilac-core",
+          exportName: "surface relay startup effects",
+        },
+        direction: "capture-external",
+        reason:
+          "Captures relay startup rejection at the smallest boundary so every partially created output, subscription, and typing resource is cleaned before propagation.",
+      },
+      {
+        identity: {
+          module: "src/surface/bridge/subscribe-from-bus.ts",
+          exportName: "bridgeBusToAdapter.startRelay",
+        },
+        category: "result-to-framework",
+        externalApi: {
+          package: "@stanley2058/lilac-core",
+          exportName: "surface relay startup host",
+        },
+        direction: "signal-host",
+        reason:
+          "Propagates the original startup rejection after complete cleanup, or the owned Panic when cleanup leaves atomicity unknown.",
+      },
+      {
+        identity: {
+          module: "src/surface/bridge/subscribe-from-bus.ts",
+          exportName: "signalSurfaceRelayRecoveryAtomicityUnknown",
+        },
+        category: "defect-supervisor",
+        externalApi: { package: "better-result", exportName: "Panic" },
+        direction: "signal-host",
+        reason:
+          "Signals that reverse exhaustive relay recovery cleanup failed and left atomicity unknown.",
+      },
+      {
+        identity: {
           module: "src/runtime/create-core-runtime.ts",
           exportName: "normalizeRouterDoneDefect",
         },
@@ -3740,13 +3801,13 @@ export const LEGACY_UNENFORCED_EXCEPTION_ADAPTERS = new Map<string, readonly Exc
       {
         identity: {
           module: "src/surface/bridge/bus-agent-runner.ts",
-          exportName: "startBusAgentRunner.superviseSubscriptionDone",
+          exportName: "startBusAgentRunner.superviseAgentRunnerBackgroundFailure",
         },
         category: "defect-supervisor",
         externalApi: { package: "global", exportName: "Promise.catch" },
         direction: "observe-panic",
         reason:
-          "Observes the typed command-request subscription completion at its runtime host boundary and reports rejected Panic without converting it to delivery error data.",
+          "Observes detached subscription and activation completion at the runner host boundary and reports rejected Panic without converting it to delivery error data.",
       },
       {
         identity: {
@@ -3783,20 +3844,6 @@ export const LEGACY_UNENFORCED_EXCEPTION_ADAPTERS = new Map<string, readonly Exc
         direction: "signal-host",
         reason:
           "Maps typed subscription start and completion failures to the existing runner startup/background host contract.",
-      },
-      {
-        identity: {
-          module: "src/surface/bridge/bus-agent-runner.ts",
-          exportName: "startBusAgentRunner.stopSubscription",
-        },
-        category: "result-to-framework",
-        externalApi: {
-          package: "@stanley2058/lilac-event-bus",
-          exportName: "subscription stop/done",
-        },
-        direction: "signal-host",
-        reason:
-          "Maps typed subscription stop and completion failures to the runner shutdown host while preserving rejected Panic.",
       },
       {
         identity: {
@@ -6294,7 +6341,7 @@ const CORE_GRACEFUL_RESTART_PERSISTED_CODEC = {
 const CORE_GRACEFUL_RESTART_PERSISTED_CONSUMER = {
   identity: {
     module: "src/runtime/graceful-restart-store.ts",
-    exportName: "SqliteGracefulRestartStore.loadAndConsumeCompletedSnapshot",
+    exportName: "SqliteGracefulRestartStore.readCompletedSnapshot",
   },
   codecs: [CORE_GRACEFUL_RESTART_PERSISTED_CODEC.identity],
 } as const satisfies PersistedStoreConsumerRegistration;
@@ -6661,8 +6708,9 @@ const CORE_SQLITE_TRANSACTION_CONSUMERS = [
   },
   ...[
     "SqliteGracefulRestartStore.clear",
+    "SqliteGracefulRestartStore.consumeCompletedSnapshot",
+    "SqliteGracefulRestartStore.readCompletedSnapshot",
     "SqliteGracefulRestartStore.saveCompletedSnapshot",
-    "SqliteGracefulRestartStore.loadAndConsumeCompletedSnapshot",
   ].map((exportName) => ({
     module: "src/runtime/graceful-restart-store.ts",
     exportName,
@@ -8705,7 +8753,7 @@ function approvedExceptionAdapterCatalogSha256(
 }
 
 export const APPROVED_EXCEPTION_ADAPTER_CATALOG_SHA256 =
-  "355b442325d10ef50ce4cf5e1b5fcc42f4ae3699757622783adca773ee7690c5";
+  "f77755efd5a309afc609774dd3cc784802364648b3141435e80849188f559069";
 
 export const architectureManifest = {
   version: 1,

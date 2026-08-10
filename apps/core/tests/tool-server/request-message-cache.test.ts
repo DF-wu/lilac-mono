@@ -258,6 +258,7 @@ describe("request message cache", () => {
         },
       });
     expect(cache.cacheMessage(trigger("1-0", 41)).status).toBe("ok");
+    expect(cache.getOrigin("github:owner/repo#1:41")?.verifiedIngress).toBe(true);
     expect(
       cache.cacheMessage(
         requestMessage({
@@ -269,6 +270,75 @@ describe("request message cache", () => {
       ).status,
     ).toBe("ok");
     expect(cache.cacheMessage(trigger("3-0", 42)).status).toBe("error");
+  });
+
+  it("keeps incomplete GitHub trigger evidence restricted and rejects actor metadata without a user", () => {
+    const cache = createRequestMessageCache();
+    const incomplete = requestMessage({
+      eventId: "1-0",
+      requestId: "github:owner/repo#1:41",
+      sessionId: "owner/repo#1",
+      requestClient: "github",
+      raw: {
+        github: {
+          issueNumber: 1,
+          trigger: { kind: "comment", commentId: 41 },
+        },
+      },
+    });
+    expect(cache.cacheMessage(incomplete).status).toBe("ok");
+    expect(cache.getOrigin(incomplete.key)?.verifiedIngress).toBe(false);
+
+    const missingActorUser = requestMessage({
+      eventId: "2-0",
+      requestId: "discord:channel-1:message-1",
+      raw: { authenticatedActor: { platform: "discord" } },
+    });
+    expect(cache.cacheMessage(missingActorUser).status).toBe("error");
+  });
+
+  it("preserves exact pull-request trigger evidence and rejects ambiguous target kinds", () => {
+    const cache = createRequestMessageCache();
+    const pullRequest = requestMessage({
+      eventId: "1-0",
+      requestId: "github:owner/repo#2:51",
+      sessionId: "owner/repo#2",
+      requestClient: "github",
+      raw: {
+        github: {
+          repoFullName: "owner/repo",
+          prNumber: 2,
+          trigger: { kind: "comment", commentId: 51 },
+        },
+      },
+    });
+    expect(cache.cacheMessage(pullRequest).status).toBe("ok");
+    expect(cache.getOrigin(pullRequest.key)).toMatchObject({
+      githubTrigger: {
+        kind: "comment",
+        targetKind: "pull-request",
+        repoFullName: "owner/repo",
+        issueNumber: 2,
+        messageId: "51",
+      },
+      verifiedIngress: true,
+    });
+
+    const ambiguous = requestMessage({
+      eventId: "2-0",
+      requestId: "github:owner/repo#2:52",
+      sessionId: "owner/repo#2",
+      requestClient: "github",
+      raw: {
+        github: {
+          repoFullName: "owner/repo",
+          issueNumber: 2,
+          prNumber: 2,
+          trigger: { kind: "comment", commentId: 52 },
+        },
+      },
+    });
+    expect(cache.cacheMessage(ambiguous).status).toBe("error");
   });
 
   it("treats request-ID reuse after committed release as a new lifecycle", () => {

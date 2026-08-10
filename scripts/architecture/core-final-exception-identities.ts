@@ -569,7 +569,6 @@ export const CORE_FINAL_EXCEPTION_IDENTITIES = [
   ["src/tools/batch.ts", "collectEditFileTouchedPaths", "signal"],
   ["src/tools/batch.ts", "batchTool", "signal"],
   ["src/mcp/registry.ts", "McpRegistry.discoverTools.map.<callback@1>", "signal"],
-  ["src/surface/bridge/bus-agent-runner.ts", "startBusAgentRunner.then.<callback@1>", "signal"],
   [
     "src/surface/bridge/bus-agent-runner/anthropic-fallback-media.ts",
     "resolveAnthropicFallbackDownload.promise.<callback>",

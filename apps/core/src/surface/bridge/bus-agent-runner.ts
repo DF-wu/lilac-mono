@@ -57,6 +57,7 @@ import {
   corePrimaryLineageV1Schema,
   createCorePrimaryLineageFreshOnlyV1,
   decodeCorePrimaryLineageV1,
+  EventDeliveryStopped,
   extendCoreLineagePrefixDigestV1,
   lilacEventTypes,
   type AdapterPlatform,
@@ -128,6 +129,7 @@ import {
 } from "../../tool-server/request-message-cache";
 import {
   AuthenticatedRequestProjectionInvalid,
+  isAuthenticatedRequestProjectionSemanticallyValid,
   projectAuthenticatedRequest,
   type AuthenticatedRequestProjection,
 } from "../authenticated-request";
@@ -348,6 +350,17 @@ export class BusAgentRunnerRequestHeadersInvalid extends TaggedError(
   readonly message: string;
 }> {}
 
+export class BusAgentRunnerQueueAttemptRouteInvalid extends TaggedError(
+  "BusAgentRunnerQueueAttemptRouteInvalid",
+)<{
+  readonly eventId: string;
+  readonly message: string;
+}> {}
+
+export class BusAgentRunnerRecoveryStopped extends TaggedError("BusAgentRunnerRecoveryStopped")<{
+  readonly message: string;
+}> {}
+
 export class BusAgentRunnerIntakeFailed extends TaggedError("BusAgentRunnerIntakeFailed")<{
   readonly cause: unknown;
   readonly message: string;
@@ -454,6 +467,8 @@ export function projectBusAgentRunnerError(
 
 export type BusAgentRunnerDeliveryError =
   | BusAgentRunnerRequestHeadersInvalid
+  | BusAgentRunnerQueueAttemptRouteInvalid
+  | BusAgentRunnerRecoveryStopped
   | BusAgentRunnerAuthenticationProjectionInvalid
   | BusAgentRunnerIntakeFailed;
 
@@ -462,8 +477,11 @@ export function busAgentRunnerDeliveryDisposition(
 ): DeliveryDisposition {
   switch (error._tag) {
     case "BusAgentRunnerRequestHeadersInvalid":
+    case "BusAgentRunnerQueueAttemptRouteInvalid":
     case "BusAgentRunnerAuthenticationProjectionInvalid":
       return "dead-letter";
+    case "BusAgentRunnerRecoveryStopped":
+      return "stop";
     case "BusAgentRunnerIntakeFailed":
       return "park-pending";
   }
@@ -1561,6 +1579,7 @@ function persistHeartbeatSurfaceHandoffs(params: {
 }
 
 type Enqueued = {
+  queueEntryId: string;
   requestId: string;
   sessionId: string;
   requestClient: AdapterPlatform;
@@ -1574,6 +1593,7 @@ type Enqueued = {
   authenticatedOrigin?: AuthenticatedSurfaceOrigin;
   verifiedIngress?: boolean;
   identityOwner?: RequestMessageCacheOwner;
+  restoredSafetyMode?: SessionSafetyMode;
   recovery?: {
     checkpointMessages: ModelMessage[];
     partialText: string;
@@ -1588,14 +1608,52 @@ type QueueCancellationGroup = {
 
 type QueueLifecycleAttempt = {
   readonly eventId: string;
+  readonly controlRequestId: string;
+  readonly controlRequestClient: AdapterPlatform;
   readonly sessionId: string;
   readonly kind: "queued-cancellation" | "buffered-absorption";
   readonly detail: string;
-  readonly pendingGroups: QueueCancellationGroup[];
+  pendingGroups: QueueCancellationGroup[];
   controlApplied: boolean;
 };
 
+export type AgentRunnerRecoveryIdentity =
+  | {
+      readonly state: "durable";
+      readonly projection: AuthenticatedRequestProjection;
+      readonly assertedSafetyMode: SessionSafetyMode;
+      readonly parkedEventIds: readonly string[];
+      readonly delegationProof?: {
+        readonly kind: "workflow";
+        readonly runId: string;
+        readonly operationId: string;
+        readonly dispatchEpoch: string;
+      };
+    }
+  | {
+      readonly state: "restricted";
+      readonly reason: "legacy-no-durable-proof" | "missing-cache-proof";
+    };
+
+export type AgentRunnerQueueAttempt = {
+  readonly eventId: string;
+  readonly controlRequestId: string;
+  readonly controlRequestClient: AdapterPlatform;
+  readonly sessionId: string;
+  readonly kind: "queued-cancellation" | "buffered-absorption";
+  readonly detail: string;
+  readonly controlApplied: boolean;
+  readonly controlIdentity: AgentRunnerRecoveryIdentity;
+  readonly pendingGroups: readonly {
+    readonly publicationIndex: number;
+    readonly requestId: string;
+    readonly requestClient: AdapterPlatform;
+    readonly targetQueueEntryIds: readonly string[];
+  }[];
+};
+
 export type AgentRunnerRecoveryEntry = {
+  queueEntryId?: string;
   kind: "active" | "queued";
   requestId: string;
   sessionId: string;
@@ -1611,6 +1669,29 @@ export type AgentRunnerRecoveryEntry = {
     checkpointMessages: ModelMessage[];
     partialText: string;
   };
+  identity?: AgentRunnerRecoveryIdentity;
+};
+
+export type AgentRunnerRecoveryState = {
+  readonly entries: readonly AgentRunnerRecoveryEntry[];
+  readonly queueAttempts: readonly AgentRunnerQueueAttempt[];
+};
+
+export class AgentRecoveryUnavailable extends TaggedError("AgentRecoveryUnavailable")<{
+  readonly requestId: string;
+  readonly reason:
+    | "cache-conflict"
+    | "delegation-proof-unavailable"
+    | "identity-conflict"
+    | "queue-admission-conflict"
+    | "queue-attempt-conflict";
+  readonly message: string;
+}> {}
+
+export type AgentRecoveryAttempt = {
+  apply(): ResultType<void, AgentRecoveryUnavailable>;
+  rollback(): void;
+  activate(): void;
 };
 
 export function isWorkflowAgentRecoveryEntry(entry: AgentRunnerRecoveryEntry): boolean {
@@ -2462,6 +2543,8 @@ export async function startBusAgentRunner(params: {
     AuthenticatedRequestProjectionInvalid
   >;
   requestMessageCache?: RequestMessageCache;
+  startPaused?: boolean;
+  initialRecovery?: AgentRunnerRecoveryState;
   beforeRequestIntake?: (
     message: DecodedLilacMessageForTopic<"cmd.request">,
   ) => void | Promise<void>;
@@ -2555,6 +2638,26 @@ export async function startBusAgentRunner(params: {
   let activeDrainOperation: Promise<void> | null = null;
   let terminalCleanupOperations: readonly BusAgentRunnerTerminalCleanupOperation[] = [];
   let terminalCleanupCompletion: Promise<void> | null = null;
+  let runnerActivated = params.startPaused !== true;
+  let runnerAdmissionStopped = false;
+  let resolveRunnerAdmission: ((outcome: "active" | "stopped") => void) | null = null;
+  const runnerActivation = runnerActivated
+    ? Promise.resolve("active" as const)
+    : new Promise<"active" | "stopped">((resolve) => {
+        resolveRunnerAdmission = resolve;
+      });
+  const activateRunnerAdmission = (): void => {
+    if (runnerActivated || runnerAdmissionStopped) return;
+    runnerActivated = true;
+    resolveRunnerAdmission?.("active");
+    resolveRunnerAdmission = null;
+  };
+  const stopRunnerAdmission = (): void => {
+    if (runnerActivated || runnerAdmissionStopped) return;
+    runnerAdmissionStopped = true;
+    resolveRunnerAdmission?.("stopped");
+    resolveRunnerAdmission = null;
+  };
   const reportFatalPanic = (panic: Panic): void => {
     terminalPanic ??= panic;
     if (terminalPanicReported) return;
@@ -2631,11 +2734,32 @@ export async function startBusAgentRunner(params: {
   async function handleCmdRequestMessage(
     msg: CmdRequestMessage,
   ): Promise<ResultType<void, BusAgentRunnerDeliveryError>> {
+    if ((await runnerActivation) === "stopped") {
+      return Result.err(
+        new BusAgentRunnerRecoveryStopped({
+          message: "Paused agent recovery stopped before delivery activation",
+        }),
+      );
+    }
     const requestId = msg.headers?.request_id;
     const sessionId = msg.headers?.session_id;
     const requestClient = msg.headers?.request_client ?? "unknown";
+    const pendingAttempt = queueLifecycleAttempts.get(msg.id);
+    if (
+      pendingAttempt &&
+      (requestId !== pendingAttempt.controlRequestId ||
+        sessionId !== pendingAttempt.sessionId ||
+        requestClient !== pendingAttempt.controlRequestClient)
+    ) {
+      return Result.err(
+        new BusAgentRunnerQueueAttemptRouteInvalid({
+          eventId: msg.id,
+          message: "Redelivered queue control route conflicts with persisted delivery ownership",
+        }),
+      );
+    }
     if (!requestId || !sessionId) {
-      abandonQueueLifecycleAttempt(msg.id);
+      if (!pendingAttempt) abandonQueueLifecycleAttempt(msg.id);
       const missing: ("request_id" | "session_id")[] = [];
       if (!requestId) missing.push("request_id");
       if (!sessionId) missing.push("session_id");
@@ -2651,7 +2775,7 @@ export async function startBusAgentRunner(params: {
       msg,
     );
     if (projectedRequest.status === "error") {
-      abandonQueueLifecycleAttempt(msg.id);
+      if (!pendingAttempt) abandonQueueLifecycleAttempt(msg.id);
       return Result.err(
         new BusAgentRunnerAuthenticationProjectionInvalid({
           cause: projectedRequest.error,
@@ -2660,7 +2784,7 @@ export async function startBusAgentRunner(params: {
       );
     }
     if (!projectedRequest.value) {
-      abandonQueueLifecycleAttempt(msg.id);
+      if (!pendingAttempt) abandonQueueLifecycleAttempt(msg.id);
       return Result.ok(undefined);
     }
     const raw = preserveAgentRunnerRaw(msg.data.raw);
@@ -2746,6 +2870,7 @@ export async function startBusAgentRunner(params: {
 
         const intakeRunProfile = parseSubagentMetaFromRaw(raw).profile;
         const entry: Enqueued = {
+          queueEntryId: msg.id,
           requestId,
           sessionId,
           requestClient,
@@ -2810,7 +2935,6 @@ export async function startBusAgentRunner(params: {
           });
         };
 
-        const pendingAttempt = queueLifecycleAttempts.get(msg.id);
         if (pendingAttempt) {
           await resumeQueueLifecycleAttempt(pendingAttempt, state);
           return;
@@ -2930,6 +3054,8 @@ export async function startBusAgentRunner(params: {
             for (const queued of matchedEntries) reservedQueueEntries.add(queued);
             const attempt: QueueLifecycleAttempt = {
               eventId: msg.id,
+              controlRequestId: requestId,
+              controlRequestClient: requestClient,
               sessionId,
               kind: "queued-cancellation",
               detail: "cancelled while queued",
@@ -3166,6 +3292,8 @@ export async function startBusAgentRunner(params: {
               }
               const attempt: QueueLifecycleAttempt = {
                 eventId: msg.id,
+                controlRequestId: requestId,
+                controlRequestClient: requestClient,
                 sessionId,
                 kind: "buffered-absorption",
                 detail:
@@ -3295,55 +3423,126 @@ export async function startBusAgentRunner(params: {
     }
   }
 
-  const startedSubscription = await bus.subscribeTopic(
-    "cmd.request",
-    {
-      mode: "work",
-      subscriptionId,
-      consumerId: consumerId(subscriptionId),
-      offset: { type: "begin" },
-      batch: { maxWaitMs: 1000 },
-    },
-    async (msg) => {
-      switch (msg.type) {
-        case lilacEventTypes.CmdRequestMessage:
-          return await handleCmdRequestMessage(msg);
-      }
-    },
-    busAgentRunnerDeliveryDisposition,
-  );
-  if (startedSubscription.status === "error") throw startedSubscription.error;
-  const sub = startedSubscription.value;
-
-  const subscriptionDone = sub.done.then((done) => {
-    if (done.status === "error") throw done.error;
-  });
-  const superviseSubscriptionDone = (cause: unknown): void => {
+  let stopStartedSubscription: (() => Promise<void>) | null = null;
+  let subscriptionStart: Promise<void> | null = null;
+  const superviseAgentRunnerBackgroundFailure = (cause: unknown): void => {
     rethrowBusAgentRunnerPanic(cause, reportFatalPanic);
-    const error = projectBusAgentRunnerError(cause, "cmd.request subscription stopped");
-    logger.error("cmd.request subscription stopped", {
-      error: error.message,
-    });
+    const error = projectBusAgentRunnerError(cause, "agent runner background operation failed");
+    logger.error("agent runner background operation failed", { error: error.message });
   };
   const observeSupervisedSubscriptionDoneRejection = (): void => undefined;
-  const supervisedSubscriptionDone = subscriptionDone.catch(superviseSubscriptionDone);
-  void supervisedSubscriptionDone.catch(observeSupervisedSubscriptionDoneRejection);
+  const isRunnerAdmissionStop = (error: EventDeliveryStopped): boolean =>
+    runnerAdmissionStopped && error.reason === "requested";
+  const startSubscription = (): Promise<void> => {
+    if (subscriptionStart) return subscriptionStart;
+    subscriptionStart = (async () => {
+      const startedSubscription = await bus.subscribeTopic(
+        "cmd.request",
+        {
+          mode: "work",
+          subscriptionId,
+          consumerId: consumerId(subscriptionId),
+          offset: { type: "begin" },
+          batch: { maxWaitMs: 1000 },
+        },
+        async (msg) => {
+          switch (msg.type) {
+            case lilacEventTypes.CmdRequestMessage:
+              return await handleCmdRequestMessage(msg);
+          }
+        },
+        busAgentRunnerDeliveryDisposition,
+      );
+      if (startedSubscription.status === "error") {
+        signalBusAgentRunnerHostFailure(startedSubscription.error);
+      }
+      const sub = startedSubscription.value;
+      const subscriptionDone = sub.done.then((done) => {
+        if (
+          done.status === "error" &&
+          !(done.error instanceof EventDeliveryStopped && isRunnerAdmissionStop(done.error))
+        ) {
+          signalBusAgentRunnerHostFailure(done.error);
+        }
+      });
+      const supervisedSubscriptionDone = subscriptionDone.catch(
+        superviseAgentRunnerBackgroundFailure,
+      );
+      void supervisedSubscriptionDone.catch(observeSupervisedSubscriptionDoneRejection);
+      stopStartedSubscription = async () => {
+        const stopped = await sub.stop();
+        if (stopped.status === "error") signalBusAgentRunnerHostFailure(stopped.error);
+        const done = await sub.done;
+        if (
+          done.status === "error" &&
+          !(done.error instanceof EventDeliveryStopped && isRunnerAdmissionStop(done.error))
+        ) {
+          signalBusAgentRunnerHostFailure(done.error);
+        }
+      };
+    })();
+    return subscriptionStart;
+  };
 
   let subscriptionStopped = false;
   const stopSubscription = async () => {
     if (subscriptionStopped) return;
     subscriptionStopped = true;
-    const stopped = await sub.stop();
-    if (stopped.status === "error") throw stopped.error;
-    const done = await sub.done;
-    if (done.status === "error") throw done.error;
+    await stopStartedSubscription?.();
   };
+
+  function buildRecoveryIdentity(input: {
+    readonly requestId: string;
+    readonly requestClient: AdapterPlatform;
+    readonly sessionId: string;
+  }): AgentRunnerRecoveryIdentity {
+    const projection = requestMessageCache.getOrigin(input.requestId);
+    if (!projection) return { state: "restricted", reason: "missing-cache-proof" };
+    const cacheState = requestMessageCache.snapshot(input.requestId);
+    let safetyMode: SessionSafetyMode = "restricted";
+    if (projection.source === "external" && projection.requestClient === "github") {
+      safetyMode = projection.verifiedIngress ? "trusted" : "restricted";
+    } else if (projection.source === "external" && projection.requestClient === "discord") {
+      const parentResolution = params.resolveParentChannelId?.(input.sessionId);
+      safetyMode =
+        parentResolution === undefined
+          ? "restricted"
+          : resolveSessionSafetyMode(cfg, input.sessionId, parentResolution ?? undefined);
+    }
+    if (projection.source === "internal-delegated") {
+      const authorized = params.durableWorkflowStore?.authorizeWorkflowRequest({
+        requestId: input.requestId,
+        sessionId: input.sessionId,
+        platform: input.requestClient,
+      });
+      if (!authorized) return { state: "restricted", reason: "missing-cache-proof" };
+      return {
+        state: "durable",
+        projection,
+        assertedSafetyMode: safetyMode,
+        parkedEventIds: cacheState?.parkedEventIds ?? [],
+        delegationProof: {
+          kind: "workflow",
+          runId: authorized.policy.runId,
+          operationId: authorized.policy.operationId,
+          dispatchEpoch: authorized.policy.dispatchEpoch,
+        },
+      };
+    }
+    return {
+      state: "durable",
+      projection,
+      assertedSafetyMode: safetyMode,
+      parkedEventIds: cacheState?.parkedEventIds ?? [],
+    };
+  }
 
   function buildActiveRecoveryEntry(state: SessionQueue): AgentRunnerRecoveryEntry | null {
     if (!state.running || !state.activeRun) return null;
 
     if (!state.agent) {
       return {
+        queueEntryId: `active:${state.activeRun.requestId}`,
         kind: "active",
         requestId: state.activeRun.requestId,
         sessionId: state.activeRun.sessionId,
@@ -3355,6 +3554,7 @@ export async function startBusAgentRunner(params: {
         corePrimaryLineage: state.activeRun.corePrimaryLineage,
         ...(state.activeRun.modelOverride ? { modelOverride: state.activeRun.modelOverride } : {}),
         raw: state.activeRun.raw,
+        identity: buildRecoveryIdentity(state.activeRun),
       };
     }
 
@@ -3364,6 +3564,7 @@ export async function startBusAgentRunner(params: {
     );
 
     return {
+      queueEntryId: `active:${state.activeRun.requestId}`,
       kind: "active",
       requestId: state.activeRun.requestId,
       sessionId: state.activeRun.sessionId,
@@ -3375,6 +3576,7 @@ export async function startBusAgentRunner(params: {
       corePrimaryLineage: degradeCorePrimaryLineageForMutation("restart-recovery-checkpoint"),
       ...(state.activeRun.modelOverride ? { modelOverride: state.activeRun.modelOverride } : {}),
       raw: state.activeRun.raw,
+      identity: buildRecoveryIdentity(state.activeRun),
       recovery: {
         checkpointMessages,
         partialText: state.activeRun.partialText,
@@ -3430,6 +3632,7 @@ export async function startBusAgentRunner(params: {
 
       for (const queued of state.queue) {
         out.push({
+          queueEntryId: queued.queueEntryId,
           kind: "queued",
           requestId: queued.requestId,
           sessionId: queued.sessionId,
@@ -3441,6 +3644,7 @@ export async function startBusAgentRunner(params: {
           corePrimaryLineage: queued.corePrimaryLineage,
           ...(queued.modelOverride ? { modelOverride: queued.modelOverride } : {}),
           raw: queued.raw,
+          identity: buildRecoveryIdentity(queued),
         });
       }
     }
@@ -3448,66 +3652,425 @@ export async function startBusAgentRunner(params: {
     return out;
   }
 
-  function restoreRecoverables(entries: readonly AgentRunnerRecoveryEntry[]) {
-    if (entries.length === 0) return;
+  function snapshotQueueAttempts(): AgentRunnerQueueAttempt[] {
+    return [...queueLifecycleAttempts.values()].map((attempt) => ({
+      eventId: attempt.eventId,
+      controlRequestId: attempt.controlRequestId,
+      controlRequestClient: attempt.controlRequestClient,
+      sessionId: attempt.sessionId,
+      kind: attempt.kind,
+      detail: attempt.detail,
+      controlApplied: attempt.controlApplied,
+      controlIdentity: buildRecoveryIdentity({
+        requestId: attempt.controlRequestId,
+        requestClient: attempt.controlRequestClient,
+        sessionId: attempt.sessionId,
+      }),
+      pendingGroups: attempt.pendingGroups.map((group, publicationIndex) => ({
+        publicationIndex,
+        requestId: group.requestId,
+        requestClient: group.requestClient,
+        targetQueueEntryIds: group.entries.map((entry) => entry.queueEntryId),
+      })),
+    }));
+  }
 
-    for (const entry of entries) {
-      if (isWorkflowAgentRecoveryEntry(entry)) {
-        const hint = parseWorkflowRequestHintFromRaw(entry.raw);
-        const authorized =
-          hint && params.durableWorkflowStore
-            ? params.durableWorkflowStore.authorizeWorkflowRequest({
-                requestId: entry.requestId,
-                sessionId: entry.sessionId,
-                platform: entry.requestClient,
-              })
-            : null;
-        if (
-          !hint ||
-          !authorized ||
-          authorized.policy.runId !== hint.runId ||
-          authorized.policy.operationId !== hint.operationId ||
-          authorized.policy.dispatchEpoch !== hint.dispatchEpoch
-        ) {
-          logger.warn("discarded stale workflow-owned agent recovery entry", {
-            requestId: entry.requestId,
-            sessionId: entry.sessionId,
-          });
-          continue;
-        }
+  function sameRestoredOrigin(
+    left: AuthenticatedSurfaceOrigin | undefined,
+    right: AuthenticatedSurfaceOrigin | undefined,
+  ): boolean {
+    if (!left || !right) return left === right;
+    return (
+      left.platform === right.platform &&
+      left.userId === right.userId &&
+      left.sessionRef.channelId === right.sessionRef.channelId &&
+      left.messageRef?.messageId === right.messageRef?.messageId
+    );
+  }
+
+  function currentSurfaceSafetyMode(input: {
+    readonly platform: AdapterPlatform;
+    readonly sessionId: string;
+    readonly verifiedIngress: boolean;
+  }): SessionSafetyMode {
+    if (input.platform === "github") return input.verifiedIngress ? "trusted" : "restricted";
+    if (input.platform !== "discord") return "restricted";
+    const parentResolution = params.resolveParentChannelId?.(input.sessionId);
+    if (parentResolution === undefined) return "restricted";
+    return resolveSessionSafetyMode(cfg, input.sessionId, parentResolution ?? undefined);
+  }
+
+  function resolveRecoveryIdentity(input: {
+    readonly requestId: string;
+    readonly sessionId: string;
+    readonly requestClient: AdapterPlatform;
+    readonly identity: AgentRunnerRecoveryIdentity | undefined;
+  }): ResultType<
+    {
+      readonly projection?: AuthenticatedRequestProjection;
+      readonly safetyMode: SessionSafetyMode;
+      readonly parkedEventIds: readonly string[];
+    },
+    AgentRecoveryUnavailable
+  > {
+    const identity = input.identity;
+    if (!identity || identity.state === "restricted") {
+      return Result.ok({ safetyMode: "restricted", parkedEventIds: [] });
+    }
+    const projection = identity.projection;
+    if (
+      projection.requestId !== input.requestId ||
+      projection.requestClient !== input.requestClient ||
+      projection.sessionId !== input.sessionId ||
+      !isAuthenticatedRequestProjectionSemanticallyValid(projection)
+    ) {
+      return Result.err(
+        new AgentRecoveryUnavailable({
+          requestId: input.requestId,
+          reason: "identity-conflict",
+          message: "Persisted recovery identity conflicts with its request route",
+        }),
+      );
+    }
+    if (projection.source === "internal-delegated") {
+      const proof = identity.delegationProof;
+      const authorized = params.durableWorkflowStore?.authorizeWorkflowRequest({
+        requestId: input.requestId,
+        sessionId: input.sessionId,
+        platform: input.requestClient,
+      });
+      if (
+        !proof ||
+        !authorized ||
+        authorized.policy.runId !== proof.runId ||
+        authorized.policy.operationId !== proof.operationId ||
+        authorized.policy.dispatchEpoch !== proof.dispatchEpoch
+      ) {
+        return Result.err(
+          new AgentRecoveryUnavailable({
+            requestId: input.requestId,
+            reason: "delegation-proof-unavailable",
+            message: "Persisted delegated recovery proof is unavailable or stale",
+          }),
+        );
       }
-      const state =
-        bySession.get(entry.sessionId) ??
-        ({
-          running: false,
-          agent: null,
-          queue: [] as Enqueued[],
-          activeRequestId: null,
-          activeRun: null,
-          compactedToolCallIds: new Set<string>(),
-        } satisfies SessionQueue);
-      bySession.set(entry.sessionId, state);
+      const origin = authorized.policy.originSession;
+      let authenticatedOrigin: AuthenticatedSurfaceOrigin | undefined;
+      if (origin.client === "discord" && origin.sessionId && origin.userId) {
+        authenticatedOrigin = {
+          platform: "discord",
+          userId: origin.userId,
+          sessionRef: { platform: "discord", channelId: origin.sessionId },
+        };
+      } else if (origin.client === "github" && origin.sessionId && origin.userId) {
+        authenticatedOrigin = {
+          platform: "github",
+          userId: origin.userId,
+          sessionRef: { platform: "github", channelId: origin.sessionId },
+        };
+      }
+      if (!sameRestoredOrigin(projection.authenticatedOrigin, authenticatedOrigin)) {
+        return Result.err(
+          new AgentRecoveryUnavailable({
+            requestId: input.requestId,
+            reason: "identity-conflict",
+            message: "Persisted delegated identity conflicts with durable workflow authority",
+          }),
+        );
+      }
+      const safetyMode = "restricted" as const;
+      if (identity.assertedSafetyMode !== safetyMode) {
+        return Result.err(
+          new AgentRecoveryUnavailable({
+            requestId: input.requestId,
+            reason: "identity-conflict",
+            message: "Persisted delegated safety assertion is not durably authorized",
+          }),
+        );
+      }
+      return Result.ok({
+        projection: { ...projection, authenticatedOrigin, verifiedIngress: false },
+        safetyMode,
+        parkedEventIds: identity.parkedEventIds,
+      });
+    }
+    const safetyMode = currentSurfaceSafetyMode({
+      platform: projection.requestClient,
+      sessionId: projection.sessionId,
+      verifiedIngress: projection.verifiedIngress,
+    });
+    if (identity.assertedSafetyMode !== safetyMode) {
+      return Result.err(
+        new AgentRecoveryUnavailable({
+          requestId: input.requestId,
+          reason: "identity-conflict",
+          message: "Persisted safety assertion conflicts with current surface policy",
+        }),
+      );
+    }
+    return Result.ok({
+      projection,
+      safetyMode,
+      parkedEventIds: identity.parkedEventIds,
+    });
+  }
 
-      state.queue.push({
+  function prepareRecovery(
+    recoveryState: AgentRunnerRecoveryState,
+  ): ResultType<AgentRecoveryAttempt, AgentRecoveryUnavailable> {
+    const queueEntries = new Map<string, AgentRunnerRecoveryEntry>();
+    const resolvedIdentities = new Map<
+      string,
+      {
+        readonly projection?: AuthenticatedRequestProjection;
+        readonly safetyMode: SessionSafetyMode;
+        readonly parkedEventIds: readonly string[];
+      }
+    >();
+    const cacheRecords: Array<{
+      readonly projection: AuthenticatedRequestProjection;
+      readonly parkedEventIds: readonly string[];
+    }> = [];
+    for (const entry of recoveryState.entries) {
+      const queueEntryId = entry.queueEntryId;
+      if (!queueEntryId || queueEntries.has(queueEntryId) || bySession.has(entry.sessionId)) {
+        return Result.err(
+          new AgentRecoveryUnavailable({
+            requestId: entry.requestId,
+            reason: "queue-admission-conflict",
+            message: "Persisted recovery queue admission conflicts with active state",
+          }),
+        );
+      }
+      queueEntries.set(queueEntryId, entry);
+      const resolved = resolveRecoveryIdentity({
         requestId: entry.requestId,
         sessionId: entry.sessionId,
         requestClient: entry.requestClient,
-        queue: entry.queue,
-        runPolicy: entry.runPolicy ?? "normal",
-        origin: entry.origin,
-        messages: entry.messages,
-        corePrimaryLineage: entry.recovery
-          ? degradeCorePrimaryLineageForMutation("restart-recovery-checkpoint")
-          : entry.corePrimaryLineage,
-        modelOverride: entry.modelOverride,
-        raw: entry.raw,
-        recovery: entry.recovery,
+        identity: entry.identity,
       });
-
-      if (!state.running) {
-        startSessionQueueDrain(entry.sessionId, state);
+      if (resolved.status === "error") return Result.err(resolved.error);
+      resolvedIdentities.set(queueEntryId, resolved.value);
+      if (resolved.value.projection) {
+        cacheRecords.push({
+          projection: resolved.value.projection,
+          parkedEventIds: resolved.value.parkedEventIds,
+        });
       }
     }
+
+    const reservedIds = new Set<string>();
+    const attemptEventIds = new Set<string>();
+    for (const attempt of recoveryState.queueAttempts) {
+      if (
+        attemptEventIds.has(attempt.eventId) ||
+        queueEntries.has(attempt.eventId) ||
+        queueLifecycleAttempts.has(attempt.eventId)
+      ) {
+        return Result.err(
+          new AgentRecoveryUnavailable({
+            requestId: attempt.controlRequestId,
+            reason: "queue-attempt-conflict",
+            message: "Persisted control delivery event identity is duplicated",
+          }),
+        );
+      }
+      attemptEventIds.add(attempt.eventId);
+      const control = resolveRecoveryIdentity({
+        requestId: attempt.controlRequestId,
+        sessionId: attempt.sessionId,
+        requestClient: attempt.controlRequestClient,
+        identity: attempt.controlIdentity,
+      });
+      if (
+        control.status === "error" ||
+        !control.value.projection ||
+        !control.value.parkedEventIds.includes(attempt.eventId) ||
+        (attempt.kind === "queued-cancellation" && !attempt.controlApplied)
+      ) {
+        return Result.err(
+          control.status === "error"
+            ? control.error
+            : new AgentRecoveryUnavailable({
+                requestId: attempt.controlRequestId,
+                reason: "queue-attempt-conflict",
+                message: "Persisted control delivery ownership is incomplete",
+              }),
+        );
+      }
+      cacheRecords.push({
+        projection: control.value.projection,
+        parkedEventIds: control.value.parkedEventIds,
+      });
+      for (const group of attempt.pendingGroups) {
+        for (const queueEntryId of group.targetQueueEntryIds) {
+          const target = queueEntries.get(queueEntryId);
+          if (
+            !target ||
+            reservedIds.has(queueEntryId) ||
+            target.kind !== "queued" ||
+            target.requestId !== group.requestId ||
+            target.requestClient !== group.requestClient ||
+            target.sessionId !== attempt.sessionId
+          ) {
+            return Result.err(
+              new AgentRecoveryUnavailable({
+                requestId: attempt.controlRequestId,
+                reason: "queue-attempt-conflict",
+                message: "Persisted queue reservation conflicts with its target entry",
+              }),
+            );
+          }
+          reservedIds.add(queueEntryId);
+        }
+      }
+    }
+    const cacheAttempt = requestMessageCache.prepareRestore(cacheRecords);
+    if (cacheAttempt.status === "error") {
+      return Result.err(
+        new AgentRecoveryUnavailable({
+          requestId: recoveryState.entries[0]?.requestId ?? "recovery",
+          reason: "cache-conflict",
+          message: "Persisted recovery identity conflicts with request cache state",
+        }),
+      );
+    }
+
+    const inserted = new Map<string, Enqueued>();
+    const owners: RequestMessageCacheOwner[] = [];
+    const sessions = new Set<string>();
+    let applied = false;
+    let activated = false;
+    const rollback = (): void => {
+      if (!applied || activated) return;
+      for (const attempt of recoveryState.queueAttempts) {
+        queueLifecycleAttempts.delete(attempt.eventId);
+      }
+      for (const queued of inserted.values()) reservedQueueEntries.delete(queued);
+      for (const sessionId of sessions) bySession.delete(sessionId);
+      for (const owner of owners) requestMessageCache.releaseOwner(owner);
+      cacheAttempt.value.rollback();
+      inserted.clear();
+      owners.length = 0;
+      sessions.clear();
+      applied = false;
+    };
+    return Result.ok({
+      apply: () => {
+        if (applied) return Result.ok(undefined);
+        const cached = cacheAttempt.value.apply();
+        if (cached.status === "error") {
+          return Result.err(
+            new AgentRecoveryUnavailable({
+              requestId: recoveryState.entries[0]?.requestId ?? "recovery",
+              reason: "cache-conflict",
+              message: "Request cache changed during paused recovery admission",
+            }),
+          );
+        }
+        applied = true;
+        for (const entry of recoveryState.entries) {
+          const queueEntryId = entry.queueEntryId;
+          if (!queueEntryId) continue;
+          const identity = resolvedIdentities.get(queueEntryId);
+          let identityOwner: RequestMessageCacheOwner | undefined;
+          if (identity?.projection) {
+            const owner = requestMessageCache.acquireOwner(entry.requestId);
+            if (owner.status === "error") {
+              rollback();
+              return Result.err(
+                new AgentRecoveryUnavailable({
+                  requestId: entry.requestId,
+                  reason: "cache-conflict",
+                  message: "Persisted recovery queue owner could not be acquired",
+                }),
+              );
+            }
+            identityOwner = owner.value;
+            owners.push(owner.value);
+          }
+          const queued: Enqueued = {
+            queueEntryId,
+            requestId: entry.requestId,
+            sessionId: entry.sessionId,
+            requestClient: entry.requestClient,
+            queue: entry.queue,
+            runPolicy: entry.runPolicy ?? "normal",
+            origin: entry.origin,
+            messages: entry.messages,
+            corePrimaryLineage: entry.recovery
+              ? degradeCorePrimaryLineageForMutation("restart-recovery-checkpoint")
+              : entry.corePrimaryLineage,
+            modelOverride: entry.modelOverride,
+            raw: entry.raw,
+            recovery: entry.recovery,
+            authenticatedOrigin: identity?.projection?.authenticatedOrigin,
+            verifiedIngress: identity?.projection?.verifiedIngress,
+            restoredSafetyMode: identity?.safetyMode ?? "restricted",
+            ...(identityOwner ? { identityOwner } : {}),
+          };
+          const state =
+            bySession.get(entry.sessionId) ??
+            ({
+              running: false,
+              agent: null,
+              queue: [] as Enqueued[],
+              activeRequestId: null,
+              activeRun: null,
+              compactedToolCallIds: new Set<string>(),
+            } satisfies SessionQueue);
+          state.queue.push(queued);
+          bySession.set(entry.sessionId, state);
+          sessions.add(entry.sessionId);
+          inserted.set(queueEntryId, queued);
+        }
+        for (const persisted of recoveryState.queueAttempts) {
+          const pendingGroups = persisted.pendingGroups
+            .toSorted((left, right) => left.publicationIndex - right.publicationIndex)
+            .map((group) => ({
+              requestId: group.requestId,
+              requestClient: group.requestClient,
+              entries: group.targetQueueEntryIds.flatMap((id) => {
+                const queued = inserted.get(id);
+                return queued ? [queued] : [];
+              }),
+            }));
+          const attempt: QueueLifecycleAttempt = {
+            eventId: persisted.eventId,
+            controlRequestId: persisted.controlRequestId,
+            controlRequestClient: persisted.controlRequestClient,
+            sessionId: persisted.sessionId,
+            kind: persisted.kind,
+            detail: persisted.detail,
+            pendingGroups,
+            controlApplied: persisted.controlApplied,
+          };
+          queueLifecycleAttempts.set(attempt.eventId, attempt);
+          for (const group of pendingGroups) {
+            for (const queued of group.entries) reservedQueueEntries.add(queued);
+          }
+        }
+        return Result.ok(undefined);
+      },
+      rollback,
+      activate: () => {
+        if (!applied || activated) return;
+        activated = true;
+        activateRunnerAdmission();
+        for (const sessionId of sessions) {
+          const state = bySession.get(sessionId);
+          if (state && !state.running) startSessionQueueDrain(sessionId, state);
+        }
+      },
+    });
+  }
+
+  function restoreRecoverables(entries: readonly AgentRunnerRecoveryEntry[]): void {
+    const prepared = prepareRecovery({ entries, queueAttempts: [] });
+    if (prepared.status === "error") return signalBusAgentRunnerHostFailure(prepared.error);
+    const applied = prepared.value.apply();
+    if (applied.status === "error") return signalBusAgentRunnerHostFailure(applied.error);
+    prepared.value.activate();
   }
 
   async function drainSessionQueue(sessionId: string, state: SessionQueue) {
@@ -4227,9 +4790,10 @@ export async function startBusAgentRunner(params: {
             next.requestClient === "discord" ? params.resolveParentChannelId?.(sessionId) : null;
           const parentChannelId = parentChannelResolution ?? undefined;
           let safetyMode: SessionSafetyMode =
-            next.requestClient === "discord" && parentChannelResolution === undefined
+            next.restoredSafetyMode ??
+            (next.requestClient === "discord" && parentChannelResolution === undefined
               ? "restricted"
-              : resolveSessionSafetyMode(cfg, sessionId, parentChannelId);
+              : resolveSessionSafetyMode(cfg, sessionId, parentChannelId));
           if (runProfile === "primary" && !workflowPolicy && isHeartbeatSessionId(next.sessionId)) {
             controlCapability =
               (await params.issueHeartbeatCapability?.({
@@ -7161,14 +7725,35 @@ export async function startBusAgentRunner(params: {
     return active;
   }
 
+  let initialRecoveryAttempt: AgentRecoveryAttempt | null = null;
+  if (params.initialRecovery) {
+    const prepared = prepareRecovery(params.initialRecovery);
+    if (prepared.status === "error") signalBusAgentRunnerHostFailure(prepared.error);
+    const applied = prepared.value.apply();
+    if (applied.status === "error") signalBusAgentRunnerHostFailure(applied.error);
+    initialRecoveryAttempt = prepared.value;
+  }
+  await startSubscription();
+  if (runnerActivated && initialRecoveryAttempt) {
+    initialRecoveryAttempt.activate();
+  }
+  const activate = (): void => {
+    activateRunnerAdmission();
+    initialRecoveryAttempt?.activate();
+  };
+
   return {
+    activate,
     beginDrain,
     getActiveLevel1Work,
     snapshotRecoverables,
+    snapshotQueueAttempts,
+    prepareRecovery,
     restoreRecoverables,
     getActiveDrainOperation: () => activeDrainOperation,
     getTerminalCleanupOperations: () => terminalCleanupOperations,
     stop: async () => {
+      stopRunnerAdmission();
       await stopSubscription();
       if (terminalCleanupCompletion) {
         let deadlineTimer: ReturnType<typeof setTimeout> | null = null;
