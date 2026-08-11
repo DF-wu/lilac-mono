@@ -385,7 +385,10 @@ class FakeAdapter extends SurfaceAdapterTestBase {
     return Result.ok(undefined);
   }
 
-  async getReplyContext(msgRef: MsgRef, opts?: LimitOpts) {
+  async getReplyContext(
+    msgRef: MsgRef,
+    opts?: LimitOpts,
+  ): Promise<SurfaceOperationResult<SurfaceMessage[]>> {
     const key = `${msgRef.channelId}:${msgRef.messageId}`;
     const base = this.messages[key];
     if (!base) return Result.ok([]);
@@ -571,12 +574,20 @@ describe("formatBufferedMessageForGateTranscript", () => {
 });
 
 describe("Discord request router context fallbacks", () => {
-  it("preserves Panic from previous-message context and falls back for an ordinary rejection", async () => {
+  it("preserves Panic from previous-message context and falls back for a typed failure", async () => {
     const adapter = new FakeAdapter({});
     const panic = new Panic({ message: "reply context invariant failed" });
     const getReplyContext = spyOn(adapter, "getReplyContext")
       .mockRejectedValueOnce(panic)
-      .mockRejectedValueOnce(new Error("reply context unavailable"));
+      .mockResolvedValueOnce(
+        Result.err(
+          new SurfaceUnavailable({
+            platform: "discord",
+            operation: "read-message",
+            message: "reply context unavailable",
+          }),
+        ),
+      );
     const input = {
       msgRef: { platform: "discord" as const, channelId: "channel", messageId: "message" },
       triggerTs: 1,
@@ -587,12 +598,20 @@ describe("Discord request router context fallbacks", () => {
     getReplyContext.mockRestore();
   });
 
-  it("preserves Panic from replied-message context and falls back for an ordinary rejection", async () => {
+  it("preserves Panic from replied-message context and falls back for a typed failure", async () => {
     const adapter = new FakeAdapter({});
     const panic = new Panic({ message: "message read invariant failed" });
     const readMsg = spyOn(adapter, "readMsg")
       .mockRejectedValueOnce(panic)
-      .mockRejectedValueOnce(new Error("message unavailable"));
+      .mockResolvedValueOnce(
+        Result.err(
+          new SurfaceUnavailable({
+            platform: "discord",
+            operation: "read-message",
+            message: "message unavailable",
+          }),
+        ),
+      );
     const input = { sessionId: "channel", replyToMessageId: "message" };
 
     await expect(resolveRepliedToMessageText({ adapter, input })).rejects.toBe(panic);
