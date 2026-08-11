@@ -10,6 +10,15 @@ export interface WorkspaceProgram {
   readonly program: ts.Program;
 }
 
+export type WorkspaceProgramFactory = (
+  repositoryRoot: string,
+  workspace: WorkspaceArchitecture,
+) => WorkspaceProgram;
+
+interface LoadedWorkspaceProgram extends WorkspaceProgram {
+  readonly parsed: ts.ParsedCommandLine;
+}
+
 const RULE_CRITICAL_PACKAGES = ["zod", "better-result"] as const;
 
 function packageMatches(specifier: string, packageName: string): boolean {
@@ -117,16 +126,15 @@ function failOnArchitectureBlockingDiagnostics(
   parsed: ts.ParsedCommandLine,
   program: ts.Program,
 ): void {
+  const syntacticDiagnostics = program
+    .getSourceFiles()
+    .filter((sourceFile) => isProductionFileName(sourceFile.fileName, workspaceRoot))
+    .flatMap((sourceFile) => program.getSyntacticDiagnostics(sourceFile));
   const diagnostics: ts.Diagnostic[] = [
     ...parsed.errors,
     ...program.getConfigFileParsingDiagnostics(),
     ...program.getOptionsDiagnostics(),
-    ...program
-      .getSyntacticDiagnostics()
-      .filter(
-        (diagnostic) =>
-          !diagnostic.file || isProductionFileName(diagnostic.file.fileName, workspaceRoot),
-      ),
+    ...syntacticDiagnostics,
     ...architectureResolutionDiagnostics(workspace, workspaceRoot, program),
   ];
   const unique = [
@@ -146,10 +154,10 @@ function failOnArchitectureBlockingDiagnostics(
   throw new Error(`TS6 cannot safely analyze ${workspace.name}:\n${formatted}`);
 }
 
-export function createWorkspaceProgram(
+function loadWorkspaceProgram(
   repositoryRoot: string,
   workspace: WorkspaceArchitecture,
-): WorkspaceProgram {
+): LoadedWorkspaceProgram {
   const tsconfig = path.resolve(repositoryRoot, workspace.tsconfig);
   const parsed = ts.getParsedCommandLineOfConfigFile(
     tsconfig,
@@ -165,7 +173,37 @@ export function createWorkspaceProgram(
   if (!parsed) throw new Error(`Cannot load ${tsconfig}`);
 
   const root = path.resolve(repositoryRoot, workspace.root);
-  const program = ts.createProgram({ rootNames: parsed.fileNames, options: parsed.options });
-  failOnArchitectureBlockingDiagnostics(workspace, root, parsed, program);
-  return { root, program };
+  const rootNames = parsed.fileNames.filter(
+    (fileName) => /\.d\.[cm]?ts$/u.test(fileName) || isProductionFileName(fileName, root),
+  );
+  const program = ts.createProgram({ rootNames, options: parsed.options });
+  return { root, parsed, program };
+}
+
+function validateLoadedWorkspaceProgram(
+  workspace: WorkspaceArchitecture,
+  loaded: LoadedWorkspaceProgram,
+): WorkspaceProgram {
+  failOnArchitectureBlockingDiagnostics(workspace, loaded.root, loaded.parsed, loaded.program);
+  return { root: loaded.root, program: loaded.program };
+}
+
+export function createWorkspaceProgram(
+  repositoryRoot: string,
+  workspace: WorkspaceArchitecture,
+): WorkspaceProgram {
+  return validateLoadedWorkspaceProgram(workspace, loadWorkspaceProgram(repositoryRoot, workspace));
+}
+
+export function createCachingWorkspaceProgramFactory(): WorkspaceProgramFactory {
+  const programs = new Map<string, LoadedWorkspaceProgram>();
+  return (repositoryRoot, workspace) => {
+    const key = `${path.resolve(repositoryRoot, workspace.root)}\0${path.resolve(repositoryRoot, workspace.tsconfig)}`;
+    let loaded = programs.get(key);
+    if (!loaded) {
+      loaded = loadWorkspaceProgram(repositoryRoot, workspace);
+      programs.set(key, loaded);
+    }
+    return validateLoadedWorkspaceProgram(workspace, loaded);
+  };
 }

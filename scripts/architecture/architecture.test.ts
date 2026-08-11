@@ -1,5 +1,6 @@
 import path from "node:path";
-import { readFileSync, readdirSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 
 import { describe, expect, test } from "bun:test";
 import ts from "typescript-codegen";
@@ -29,13 +30,14 @@ import {
   FINAL_PACKAGE_WIDE_ARCHITECTURE_RULES,
 } from "./manifest.ts";
 import type { ArchitectureDiagnostic, ArchitectureRule } from "./model.ts";
-import { createWorkspaceProgram } from "./program.ts";
+import { createCachingWorkspaceProgramFactory } from "./program.ts";
 import {
   analyzeArchitecture,
   analyzeArchitectureInWorkspaceProcesses,
   analyzeArchitectureWorkspace,
   ARCHITECTURE_FINDINGS_EXIT_CODE,
   createArchitectureAnalysisContext,
+  parseArchitectureWorkerCount,
 } from "./runner.ts";
 import { isProductionFileName } from "./source-policy.ts";
 import {
@@ -88,6 +90,49 @@ const BASE_WORKSPACE = {
   eventDeliveryApis: [],
   eventDeliveryConsumers: [],
 } as const satisfies WorkspaceArchitecture;
+
+const createWorkspaceProgram = createCachingWorkspaceProgramFactory();
+
+function withProgramFixture<T>(
+  files: Readonly<Record<string, string>>,
+  run: (fixture: {
+    readonly repositoryRoot: string;
+    readonly workspaceRoot: string;
+    readonly workspace: WorkspaceArchitecture;
+  }) => T,
+): T {
+  const repositoryRoot = mkdtempSync(path.join(tmpdir(), "lilac-architecture-program-"));
+  const workspaceRoot = path.join(repositoryRoot, "workspace");
+  const workspace = {
+    ...BASE_WORKSPACE,
+    name: "program-fixture",
+    packageName: "architecture-program-fixture",
+    root: "workspace",
+    tsconfig: "workspace/tsconfig.json",
+  } satisfies WorkspaceArchitecture;
+  try {
+    for (const [relativePath, content] of Object.entries({
+      "tsconfig.json": JSON.stringify({
+        compilerOptions: {
+          strict: true,
+          target: "ESNext",
+          module: "Preserve",
+          moduleResolution: "bundler",
+          noEmit: true,
+        },
+        include: ["**/*.ts"],
+      }),
+      ...files,
+    })) {
+      const fileName = path.join(workspaceRoot, relativePath);
+      mkdirSync(path.dirname(fileName), { recursive: true });
+      writeFileSync(fileName, content);
+    }
+    return run({ repositoryRoot, workspaceRoot, workspace });
+  } finally {
+    rmSync(repositoryRoot, { recursive: true, force: true });
+  }
+}
 
 const fixtureProgram = createWorkspaceProgram(REPOSITORY_ROOT, BASE_WORKSPACE).program;
 
@@ -3013,6 +3058,51 @@ describe("Stage 6 persistence and SQLite architecture", () => {
     );
   });
 
+  test("resolves each call at most once while preflighting persistence targets", () => {
+    const checker = fixtureProgram.getTypeChecker();
+    const resolutionCounts = new Map<ts.CallExpression, number>();
+    const instrumentedChecker = new Proxy(checker, {
+      get(target, property, receiver) {
+        if (property === "getResolvedSignature") {
+          return (...parameters: Parameters<ts.TypeChecker["getResolvedSignature"]>) => {
+            const call = parameters[0];
+            if (ts.isCallExpression(call)) {
+              resolutionCounts.set(call, (resolutionCounts.get(call) ?? 0) + 1);
+            }
+            return target.getResolvedSignature(...parameters);
+          };
+        }
+        return Reflect.get(target, property, receiver);
+      },
+    });
+    const instrumentedProgram = new Proxy(fixtureProgram, {
+      get(target, property, receiver) {
+        if (property === "getTypeChecker") return () => instrumentedChecker;
+        return Reflect.get(target, property, receiver);
+      },
+    });
+
+    expect(
+      analyzeWorkspace(BASE_WORKSPACE, FIXTURE_ROOT, instrumentedProgram, undefined, undefined, {
+        persistedCodecs: [
+          {
+            packageName: BASE_WORKSPACE.packageName,
+            identity: { module: "missing-codec.ts", exportName: "decodeMissing" },
+          },
+        ],
+        sqliteTransactionAdapters: [
+          {
+            packageName: BASE_WORKSPACE.packageName,
+            identity: { module: "missing-transaction.ts", exportName: "runMissingTransaction" },
+          },
+        ],
+        scanAllProductionModules: true,
+      }),
+    ).toEqual([]);
+    expect(resolutionCounts.size).toBeGreaterThan(0);
+    expect([...resolutionCounts.values()].every((count) => count === 1)).toBeTrue();
+  });
+
   test("executes real better-result codecs and bun:sqlite commit, rollback, driver, and Panic fixtures", async () => {
     const process = Bun.spawn(
       ["bun", "scripts/architecture/fixtures/real-libraries/stage6-runtime.ts"],
@@ -3678,6 +3768,110 @@ describe("real declaration integration", () => {
   });
 });
 
+describe("architecture Program construction", () => {
+  test("filters non-production roots, retains declarations, and resolves imported dependencies", () => {
+    withProgramFixture(
+      {
+        "src/index.ts":
+          'import { decodeFixture } from "../tests/support.ts";\nexport const value = decodeFixture("value");\n',
+        "tests/support.ts": "export function decodeFixture(value: unknown) { return value; }\n",
+        "tests/root-only.ts": "export const rootOnly = true;\n",
+        "tests/contracts.d.ts": "declare const fixtureContract: unique symbol;\n",
+        "dist/generated.ts": "export const generated = true;\n",
+      },
+      ({ repositoryRoot, workspaceRoot, workspace }) => {
+        const program = createWorkspaceProgram(repositoryRoot, workspace).program;
+        const relativeRoots = program
+          .getRootFileNames()
+          .map((fileName) => path.relative(workspaceRoot, fileName).split(path.sep).join("/"))
+          .sort();
+        expect(relativeRoots).toEqual(["src/index.ts", "tests/contracts.d.ts"]);
+        expect(program.getSourceFile(path.join(workspaceRoot, "tests/support.ts"))).toBeDefined();
+        expect(
+          program.getSourceFile(path.join(workspaceRoot, "tests/root-only.ts")),
+        ).toBeUndefined();
+
+        const nonProductionRegistration = {
+          ...workspace,
+          ruleZones: {
+            "architecture/persisted-codec-contract": [{ include: "tests/support.ts" }],
+          },
+          persistedCodecs: [
+            {
+              identity: { module: "tests/support.ts", exportName: "decodeFixture" },
+              inputParameter: 0,
+              fixtureCatalog: { module: "tests/support.ts", exportName: "fixtureCodecCases" },
+              provenance: ["current", "migrated", "missing-defaulted"],
+            },
+          ],
+        } satisfies WorkspaceArchitecture;
+        expect(() => analyzeWorkspace(nonProductionRegistration, workspaceRoot, program)).toThrow(
+          "must resolve to exactly one declaration; found 0",
+        );
+
+        const nonProductionOpenProtocol = {
+          ...workspace,
+          openProtocolAdapters: [
+            openProtocolAdapter("decodeFixture", {
+              identity: { module: "tests/support.ts", exportName: "decodeFixture" },
+            }),
+          ],
+        } satisfies WorkspaceArchitecture;
+        expect(() => analyzeWorkspace(nonProductionOpenProtocol, workspaceRoot, program)).toThrow(
+          "must resolve to exactly one callable implementation; found 0",
+        );
+
+        const nonProductionOperationalApi = {
+          ...workspace,
+          operationalResultApis: [{ module: "tests/support.ts", exportName: "decodeFixture" }],
+        } satisfies WorkspaceArchitecture;
+        expect(() => analyzeWorkspace(nonProductionOperationalApi, workspaceRoot, program)).toThrow(
+          "must resolve to exactly one callable implementation; found 0",
+        );
+
+        const nonProductionUnknownFreeModule = {
+          ...workspace,
+          ruleZones: {
+            "architecture/unknown-free-module": [{ include: "tests/support.ts" }],
+          },
+          unknownFreeModules: [{ module: "tests/support.ts" }],
+        } satisfies WorkspaceArchitecture;
+        expect(() =>
+          analyzeWorkspace(nonProductionUnknownFreeModule, workspaceRoot, program),
+        ).toThrow("must resolve to exactly one source module; found 0");
+      },
+    );
+  });
+
+  test("requests blocking syntactic diagnostics only for production sources", () => {
+    withProgramFixture(
+      {
+        "src/index.ts": 'import "../tests/broken.ts";\nexport const valid = true;\n',
+        "tests/broken.ts": "export const broken = ;\n",
+      },
+      ({ repositoryRoot, workspace }) => {
+        expect(() => createWorkspaceProgram(repositoryRoot, workspace)).not.toThrow();
+      },
+    );
+    withProgramFixture(
+      { "src/broken.ts": "export const broken = ;\n" },
+      ({ repositoryRoot, workspace }) => {
+        expect(() => createWorkspaceProgram(repositoryRoot, workspace)).toThrow(
+          "TS6 cannot safely analyze program-fixture",
+        );
+      },
+    );
+    withProgramFixture(
+      { "src/contracts.d.ts": "export declare const broken: ;\n" },
+      ({ repositoryRoot, workspace }) => {
+        expect(() => createWorkspaceProgram(repositoryRoot, workspace)).toThrow(
+          "TS6 cannot safely analyze program-fixture",
+        );
+      },
+    );
+  });
+});
+
 describe("gate infrastructure", () => {
   test("requires the manifest to exactly match discovered Bun workspaces", () => {
     expect(
@@ -3867,8 +4061,9 @@ describe("gate infrastructure", () => {
         async (_root, workspaceRoot) => {
           const result = await runFixtureWorkspaceProcess(workspaceRoot);
           observed.push({ workspaceRoot, ...result });
-          return result.exitCode;
+          return result;
         },
+        { writeStdout() {}, writeStderr() {} },
       ),
     ).rejects.toThrow(
       "Architecture analysis subprocess for fixture-missing failed with exit code 1",
@@ -3880,7 +4075,7 @@ describe("gate infrastructure", () => {
     expect(observed[1]?.stderr).toContain(`Unknown architecture workspace '${missingRoot}'.`);
   });
 
-  test("runs workspace subprocesses sequentially and preserves finding status", async () => {
+  test("defaults to sequential workspace subprocesses", async () => {
     const manifest = {
       version: 1,
       workspaces: [
@@ -3899,17 +4094,160 @@ describe("gate infrastructure", () => {
       ],
     } satisfies ArchitectureManifest;
     const visited: string[] = [];
+    let active = 0;
+    let maxActive = 0;
     const hasFindings = await analyzeArchitectureInWorkspaceProcesses(
       REPOSITORY_ROOT,
       manifest,
       async (_root, workspaceRoot) => {
         visited.push(workspaceRoot);
-        return workspaceRoot === "fixture-a" ? ARCHITECTURE_FINDINGS_EXIT_CODE : 0;
+        active += 1;
+        maxActive = Math.max(maxActive, active);
+        await Promise.resolve();
+        active -= 1;
+        return { exitCode: 0, stdout: "", stderr: "" };
       },
     );
 
     expect(visited).toEqual(["fixture-a", "fixture-b"]);
-    expect(hasFindings).toBeTrue();
+    expect(maxActive).toBe(1);
+    expect(hasFindings).toBeFalse();
+  });
+
+  test("limits workspace subprocess concurrency to two", async () => {
+    const manifest = {
+      version: 1,
+      workspaces: [
+        {
+          ...BASE_WORKSPACE,
+          name: "fixture-a",
+          root: "fixture-a",
+          ruleZones: PERMANENT_RULE_ZONES,
+        },
+        {
+          ...BASE_WORKSPACE,
+          name: "fixture-b",
+          root: "fixture-b",
+          ruleZones: PERMANENT_RULE_ZONES,
+        },
+        {
+          ...BASE_WORKSPACE,
+          name: "fixture-c",
+          root: "fixture-c",
+          ruleZones: PERMANENT_RULE_ZONES,
+        },
+        {
+          ...BASE_WORKSPACE,
+          name: "fixture-d",
+          root: "fixture-d",
+          ruleZones: PERMANENT_RULE_ZONES,
+        },
+      ],
+    } satisfies ArchitectureManifest;
+    const visited: string[] = [];
+    let active = 0;
+    let maxActive = 0;
+    let releaseFirstPair: (() => void) | undefined;
+    const firstPairReleased = new Promise<void>((resolve) => {
+      releaseFirstPair = resolve;
+    });
+    let observeFirstPair: (() => void) | undefined;
+    const firstPairStarted = new Promise<void>((resolve) => {
+      observeFirstPair = resolve;
+    });
+    const analysis = analyzeArchitectureInWorkspaceProcesses(
+      REPOSITORY_ROOT,
+      manifest,
+      async (_root, workspaceRoot) => {
+        visited.push(workspaceRoot);
+        active += 1;
+        maxActive = Math.max(maxActive, active);
+        if (active === 2) observeFirstPair?.();
+        if (workspaceRoot === "fixture-a" || workspaceRoot === "fixture-b") {
+          await firstPairReleased;
+        }
+        active -= 1;
+        return { exitCode: 0, stdout: "", stderr: "" };
+      },
+      { workers: 2 },
+    );
+
+    await firstPairStarted;
+    expect(visited).toEqual(["fixture-a", "fixture-b"]);
+    releaseFirstPair?.();
+    await analysis;
+    expect(visited).toEqual(["fixture-a", "fixture-b", "fixture-c", "fixture-d"]);
+    expect(maxActive).toBe(2);
+  });
+
+  test("emits workspace output in manifest order and aggregates findings", async () => {
+    const manifest = {
+      version: 1,
+      workspaces: [
+        {
+          ...BASE_WORKSPACE,
+          name: "fixture-a",
+          root: "fixture-a",
+          ruleZones: PERMANENT_RULE_ZONES,
+        },
+        {
+          ...BASE_WORKSPACE,
+          name: "fixture-b",
+          root: "fixture-b",
+          ruleZones: PERMANENT_RULE_ZONES,
+        },
+        {
+          ...BASE_WORKSPACE,
+          name: "fixture-c",
+          root: "fixture-c",
+          ruleZones: PERMANENT_RULE_ZONES,
+        },
+      ],
+    } satisfies ArchitectureManifest;
+    let releaseFirst: (() => void) | undefined;
+    const firstReleased = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+    let observeThird: (() => void) | undefined;
+    const thirdStarted = new Promise<void>((resolve) => {
+      observeThird = resolve;
+    });
+    const completionOrder: string[] = [];
+    const emitted: string[] = [];
+    const analysis = analyzeArchitectureInWorkspaceProcesses(
+      REPOSITORY_ROOT,
+      manifest,
+      async (_root, workspaceRoot) => {
+        if (workspaceRoot === "fixture-a") await firstReleased;
+        if (workspaceRoot === "fixture-c") observeThird?.();
+        completionOrder.push(workspaceRoot);
+        return {
+          exitCode: workspaceRoot === "fixture-b" ? 0 : ARCHITECTURE_FINDINGS_EXIT_CODE,
+          stdout: `stdout:${workspaceRoot}\n`,
+          stderr: `stderr:${workspaceRoot}\n`,
+        };
+      },
+      {
+        workers: 2,
+        writeStdout(output) {
+          emitted.push(output);
+        },
+        writeStderr(output) {
+          emitted.push(output);
+        },
+      },
+    );
+
+    await thirdStarted;
+    releaseFirst?.();
+    expect(await analysis).toBeTrue();
+    expect(completionOrder).toEqual(["fixture-b", "fixture-c", "fixture-a"]);
+    expect(emitted).toEqual(
+      ["fixture-a", "fixture-b", "fixture-c"].flatMap((workspaceRoot) => [
+        `stdout:${workspaceRoot}\n`,
+        `stderr:${workspaceRoot}\n`,
+      ]),
+    );
   });
 
   test("fails closed when a workspace subprocess cannot complete", async () => {
@@ -3943,10 +4281,25 @@ describe("gate infrastructure", () => {
         manifest,
         async (_root, workspaceRoot) => {
           visited.push(workspaceRoot);
-          return workspaceRoot === "fixture-b" ? 2 : 0;
+          return {
+            exitCode: workspaceRoot === "fixture-b" ? 2 : 0,
+            stdout: "",
+            stderr: "",
+          };
         },
       ),
     ).rejects.toThrow("Architecture analysis subprocess for fixture-b failed with exit code 2");
     expect(visited).toEqual(["fixture-a", "fixture-b"]);
+  });
+
+  test("parses the explicit architecture worker option", () => {
+    expect(parseArchitectureWorkerCount([])).toBe(1);
+    expect(parseArchitectureWorkerCount(["--workers=2"])).toBe(2);
+    expect(() => parseArchitectureWorkerCount(["--workers=0"])).toThrow(
+      "Architecture worker count must be a positive integer",
+    );
+    expect(() => parseArchitectureWorkerCount(["--workers", "2"])).toThrow(
+      "Unknown architecture option '--workers'",
+    );
   });
 });

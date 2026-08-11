@@ -9,11 +9,17 @@ import {
 } from "../architecture/manifest.ts";
 import {
   findExceptionFlowViolations,
+  findExceptionFlowViolationsInSourceFile,
   findDirectSqliteTransactionViolations,
+  findDirectSqliteTransactionViolationsInSourceFile,
   findInlineAsyncResultCallbackViolations,
+  findInlineAsyncResultCallbackViolationsInSourceFile,
   findLocalRecordGuardViolations,
   findPresentationDecoderImportViolations,
+  findPresentationDecoderImportViolationsInSourceFile,
   findStoreInlineDecodingViolations,
+  findStoreInlineDecodingViolationsInSourceFile,
+  parseProductionSyntaxSource,
 } from "./production-syntax.mts";
 import { type SyntacticPolicy, SYNTACTIC_POLICY } from "./syntax-policy.mts";
 
@@ -184,6 +190,73 @@ function adapter(exportName: string, direction: ExceptionAdapter["direction"]): 
     reason: "Test exact adapter registration",
   };
 }
+
+describe("parsed production syntax finders", () => {
+  it("keeps all active SourceFile finders equivalent to the text wrappers", () => {
+    const exceptionSource = `export function fail() { throw new Error("bad"); }`;
+    const exceptionPath = "apps/example/src/service.ts";
+    expect(
+      findExceptionFlowViolationsInSourceFile(
+        parseProductionSyntaxSource(exceptionSource, exceptionPath),
+        exceptionPath,
+      ),
+    ).toEqual(findExceptionFlowViolations(exceptionSource, exceptionPath));
+
+    const resultSource = `
+      import { Result } from "better-result";
+      Result.map(async (value) => value);
+    `;
+    const resultPath = "apps/example/src/result-flow.ts";
+    expect(
+      findInlineAsyncResultCallbackViolationsInSourceFile(
+        parseProductionSyntaxSource(resultSource, resultPath),
+        resultPath,
+      ),
+    ).toEqual(findInlineAsyncResultCallbackViolations(resultSource, resultPath));
+
+    const presentationSource = `import { z } from "zod"; z.string().parse("value");`;
+    const presentationPath = "apps/example/src/render.ts";
+    const presentationManifest = manifestWithUnknownFreeModule();
+    expect(
+      findPresentationDecoderImportViolationsInSourceFile(
+        parseProductionSyntaxSource(presentationSource, presentationPath),
+        presentationPath,
+        presentationManifest,
+      ),
+    ).toEqual(
+      findPresentationDecoderImportViolations(
+        presentationSource,
+        presentationPath,
+        policyWith(),
+        presentationManifest,
+      ),
+    );
+
+    const storeSource = `class Store { load(raw: string) { return JSON.parse(raw); } }`;
+    const storePath = "apps/example/src/store.ts";
+    const storeManifest = manifestWithStage6();
+    expect(
+      findStoreInlineDecodingViolationsInSourceFile(
+        parseProductionSyntaxSource(storeSource, storePath),
+        storePath,
+        storeManifest,
+      ),
+    ).toEqual(
+      findStoreInlineDecodingViolations(storeSource, storePath, policyWith(), storeManifest),
+    );
+
+    const sqliteSource = `class Store { save() { this.db.exec("BEGIN"); } }`;
+    expect(
+      findDirectSqliteTransactionViolationsInSourceFile(
+        parseProductionSyntaxSource(sqliteSource, storePath),
+        storePath,
+        storeManifest,
+      ),
+    ).toEqual(
+      findDirectSqliteTransactionViolations(sqliteSource, storePath, policyWith(), storeManifest),
+    );
+  });
+});
 
 describe("production exception syntax", () => {
   it("detects only syntactically proven Promise rejection channels and aliases", () => {

@@ -3440,9 +3440,10 @@ function registeredDeclarationIndex(
 
   const modules = new Map<string, Map<string, ts.Node[]>>();
   for (const sourceFile of program.getSourceFiles()) {
-    if (sourceFile.isDeclarationFile) continue;
+    if (sourceFile.isDeclarationFile || !isProductionFileName(sourceFile.fileName, identityRoot)) {
+      continue;
+    }
     const module = relativeModulePath(identityRoot, sourceFile);
-    if (module.startsWith("../")) continue;
     const identities = new Map<string, ts.Node[]>();
     const visit = (node: ts.Node): void => {
       if (isRegisteredDeclarationCandidate(node)) {
@@ -3995,6 +3996,7 @@ function analyzeUnknownFreeModule(
     .find(
       (candidate) =>
         !candidate.isDeclarationFile &&
+        isProductionFileName(candidate.fileName, workspaceRoot) &&
         relativeModulePath(workspaceRoot, candidate) === registration.module,
     );
   if (!sourceFile) {
@@ -4264,10 +4266,39 @@ function assertPersistenceInfrastructureCallsResolve(
   const registeredCatalogs = new Set(
     workspace.persistedCodecs.map(({ fixtureCatalog }) => registeredIdentityKey(fixtureCatalog)),
   );
+  const packageRootByName = new Map<string, string>();
+  for (const candidate of packageRoots) {
+    if (!packageRootByName.has(candidate.packageName)) {
+      packageRootByName.set(candidate.packageName, candidate.root);
+    }
+  }
+  const codecTargets = active.persistedCodecs.map((codec) => ({
+    value: codec,
+    identityRoot: packageRootByName.get(codec.packageName),
+  }));
+  const transactionTargets = active.sqliteTransactionAdapters.map((adapter) => ({
+    value: adapter,
+    identityRoot: packageRootByName.get(adapter.packageName),
+  }));
+  const codecModules = new Set([
+    ...registeredConsumers.map(({ identity }) => identity.module),
+    ...workspace.boundaryDecoders.map(({ identity }) => identity.module),
+    ...workspace.persistedCodecs.map(({ identity }) => identity.module),
+  ]);
+  const transactionModules = new Set(registeredTransactions.map(({ identity }) => identity.module));
+  const localCodecOwners = active.persistedCodecs.filter(
+    ({ packageName }) => packageName === workspace.packageName,
+  );
 
   for (const sourceFile of program.getSourceFiles()) {
     if (!isProductionSource(sourceFile, workspaceRoot)) continue;
     const module = relativeModulePath(workspaceRoot, sourceFile);
+    const scanCodecCalls =
+      codecTargets.length > 0 &&
+      (active.scanAllProductionModules === true || codecModules.has(module));
+    const scanTransactionCalls =
+      transactionTargets.length > 0 &&
+      (active.scanAllProductionModules === true || transactionModules.has(module));
     if (ruleApplies(workspace, "architecture/persisted-codec-fixture-catalog", module)) {
       for (const statement of sourceFile.statements) {
         if (!ts.isVariableStatement(statement) || !hasExportModifier(statement)) continue;
@@ -4286,73 +4317,85 @@ function assertPersistenceInfrastructureCallsResolve(
     }
 
     const visit = (node: ts.Node): void => {
-      if (ts.isCallExpression(node)) {
-        const callIdentity = nodeIdentity(node, workspaceRoot);
-        for (const codec of active.persistedCodecs) {
-          if (
-            active.scanAllProductionModules !== true &&
-            !registeredConsumers.some(({ identity }) => identity.module === module) &&
-            !workspace.boundaryDecoders.some(({ identity }) => identity.module === module) &&
-            !workspace.persistedCodecs.some(({ identity }) => identity.module === module)
-          ) {
-            continue;
-          }
-          const target = { ...codec.identity, package: codec.packageName };
-          if (!resolvedCallMatchesIdentity(node, target, checker, workspaceRoot, packageRoots)) {
-            continue;
-          }
-          if (
-            active.persistedCodecs.some(
-              (owner) =>
-                owner.packageName === workspace.packageName &&
-                identityOwns(owner.identity, callIdentity),
-            ) ||
-            workspace.boundaryDecoders.some(
-              (decoder) =>
-                decoder.category === "persistence" && identityOwns(decoder.identity, callIdentity),
-            )
-          ) {
-            continue;
-          }
-          const registered = registeredConsumers.some(
-            (consumer) =>
-              identityOwns(consumer.identity, callIdentity) &&
-              consumer.codecs.some((candidate) =>
-                sameRegisteredTarget(candidate, codec, workspace.packageName),
-              ),
-          );
-          if (!registered) {
-            throw new Error(
-              `Unregistered persisted store consumer in ${workspace.name}: ${module}#${callIdentity.symbolPath} calls ${codec.packageName}#${registeredIdentityKey(codec.identity)}.`,
-            );
-          }
+      if (ts.isCallExpression(node) && (scanCodecCalls || scanTransactionCalls)) {
+        const declaration = checker.getResolvedSignature(node)?.declaration;
+        if (!declaration) {
+          ts.forEachChild(node, visit);
+          return;
         }
-        for (const adapter of active.sqliteTransactionAdapters) {
-          if (
-            active.scanAllProductionModules !== true &&
-            !registeredTransactions.some(({ identity }) => identity.module === module)
-          ) {
-            continue;
+        const declarationModules = new Map<string, string>();
+        const declarationIdentities = new Map<string, NodeIdentity>();
+        const matchesTarget = (
+          identity: SymbolIdentity,
+          identityRoot: string | undefined,
+        ): boolean => {
+          if (!identityRoot) return false;
+          let declarationModule = declarationModules.get(identityRoot);
+          if (!declarationModule) {
+            declarationModule = relativeModulePath(identityRoot, declaration.getSourceFile());
+            declarationModules.set(identityRoot, declarationModule);
           }
-          const target = { ...adapter.identity, package: adapter.packageName };
-          if (!resolvedCallMatchesIdentity(node, target, checker, workspaceRoot, packageRoots)) {
-            continue;
+          if (declarationModule !== identity.module) return false;
+          let declarationIdentity = declarationIdentities.get(identityRoot);
+          if (!declarationIdentity) {
+            declarationIdentity = nodeIdentity(declaration, identityRoot);
+            declarationIdentities.set(identityRoot, declarationIdentity);
           }
-          if (
-            adapter.packageName === workspace.packageName &&
-            identityOwns(adapter.identity, callIdentity)
-          ) {
-            continue;
-          }
-          const registered = registeredTransactions.some(
-            (consumer) =>
-              identityOwns(consumer.identity, callIdentity) &&
-              sameRegisteredTarget(consumer.adapter, adapter, workspace.packageName),
-          );
-          if (!registered) {
-            throw new Error(
-              `Unregistered SQLite transaction consumer in ${workspace.name}: ${module}#${callIdentity.symbolPath} calls ${adapter.packageName}#${registeredIdentityKey(adapter.identity)}.`,
+          return identityMatches(identity, declarationIdentity);
+        };
+        const matchingCodecs = scanCodecCalls
+          ? codecTargets.filter(({ value, identityRoot }) =>
+              matchesTarget(value.identity, identityRoot),
+            )
+          : [];
+        const matchingTransactions = scanTransactionCalls
+          ? transactionTargets.filter(({ value, identityRoot }) =>
+              matchesTarget(value.identity, identityRoot),
+            )
+          : [];
+        if (matchingCodecs.length > 0 || matchingTransactions.length > 0) {
+          const callIdentity = nodeIdentity(node, workspaceRoot);
+          for (const { value: codec } of matchingCodecs) {
+            if (
+              localCodecOwners.some((owner) => identityOwns(owner.identity, callIdentity)) ||
+              workspace.boundaryDecoders.some(
+                (decoder) =>
+                  decoder.category === "persistence" &&
+                  identityOwns(decoder.identity, callIdentity),
+              )
+            ) {
+              continue;
+            }
+            const registered = registeredConsumers.some(
+              (consumer) =>
+                identityOwns(consumer.identity, callIdentity) &&
+                consumer.codecs.some((candidate) =>
+                  sameRegisteredTarget(candidate, codec, workspace.packageName),
+                ),
             );
+            if (!registered) {
+              throw new Error(
+                `Unregistered persisted store consumer in ${workspace.name}: ${module}#${callIdentity.symbolPath} calls ${codec.packageName}#${registeredIdentityKey(codec.identity)}.`,
+              );
+            }
+          }
+          for (const { value: adapter } of matchingTransactions) {
+            if (
+              adapter.packageName === workspace.packageName &&
+              identityOwns(adapter.identity, callIdentity)
+            ) {
+              continue;
+            }
+            const registered = registeredTransactions.some(
+              (consumer) =>
+                identityOwns(consumer.identity, callIdentity) &&
+                sameRegisteredTarget(consumer.adapter, adapter, workspace.packageName),
+            );
+            if (!registered) {
+              throw new Error(
+                `Unregistered SQLite transaction consumer in ${workspace.name}: ${module}#${callIdentity.symbolPath} calls ${adapter.packageName}#${registeredIdentityKey(adapter.identity)}.`,
+              );
+            }
           }
         }
       }
@@ -5319,6 +5362,7 @@ function assertOpenProtocolAdaptersResolve(
       .find(
         (candidate) =>
           !candidate.isDeclarationFile &&
+          isProductionFileName(candidate.fileName, workspaceRoot) &&
           relativeModulePath(workspaceRoot, candidate) === adapter.identity.module,
       );
     if (sourceFile) {
@@ -5354,6 +5398,7 @@ function assertOperationalResultApisResolve(
       .find(
         (candidate) =>
           !candidate.isDeclarationFile &&
+          isProductionFileName(candidate.fileName, workspaceRoot) &&
           relativeModulePath(workspaceRoot, candidate) === api.module,
       );
     if (sourceFile) {

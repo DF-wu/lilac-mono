@@ -29,10 +29,24 @@ export interface ArchitectureAnalysisContext {
   readonly approvedExceptionAdapters: ArchitectureManifest["approvedExceptionAdapters"];
 }
 
+export interface WorkspaceProcessResult {
+  readonly exitCode: number;
+  readonly stdout: string;
+  readonly stderr: string;
+}
+
 export type WorkspaceProcessRunner = (
   repositoryRoot: string,
   workspaceRoot: string,
-) => Promise<number>;
+) => Promise<WorkspaceProcessResult>;
+
+export interface WorkspaceProcessOptions {
+  readonly workers?: number;
+  readonly writeStdout?: (output: string) => void;
+  readonly writeStderr?: (output: string) => void;
+}
+
+const MAX_WORKSPACE_OUTPUT_BYTES = 8 * 1024 * 1024;
 
 export function createArchitectureAnalysisContext(
   repositoryRoot: string,
@@ -116,7 +130,34 @@ export function printDiagnostic(diagnostic: ArchitectureDiagnostic): void {
   );
 }
 
-async function runWorkspaceProcess(repositoryRoot: string, workspaceRoot: string): Promise<number> {
+async function readWorkspaceOutput(stream: ReadableStream<Uint8Array>): Promise<string> {
+  const reader = stream.getReader();
+  const decoder = new TextDecoder();
+  const output: string[] = [];
+  let capturedBytes = 0;
+  let truncated = false;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    const remaining = MAX_WORKSPACE_OUTPUT_BYTES - capturedBytes;
+    if (remaining <= 0) {
+      truncated = true;
+      continue;
+    }
+    const captured = value.byteLength <= remaining ? value : value.subarray(0, remaining);
+    output.push(decoder.decode(captured, { stream: true }));
+    capturedBytes += captured.byteLength;
+    if (captured.byteLength < value.byteLength) truncated = true;
+  }
+  output.push(decoder.decode());
+  if (truncated) output.push("\n[architecture workspace output truncated]\n");
+  return output.join("");
+}
+
+async function runWorkspaceProcess(
+  repositoryRoot: string,
+  workspaceRoot: string,
+): Promise<WorkspaceProcessResult> {
   const environment = Object.fromEntries(
     Object.entries(process.env).filter(([name]) => name !== ARCHITECTURE_WORKSPACE_FIXTURE_ENV),
   );
@@ -125,32 +166,115 @@ async function runWorkspaceProcess(repositoryRoot: string, workspaceRoot: string
     cwd: repositoryRoot,
     env: environment,
     stdin: "ignore",
-    stdout: "inherit",
-    stderr: "inherit",
+    stdout: "pipe",
+    stderr: "pipe",
   });
-  return subprocess.exited;
+  const [exitCode, stdout, stderr] = await Promise.all([
+    subprocess.exited,
+    readWorkspaceOutput(subprocess.stdout),
+    readWorkspaceOutput(subprocess.stderr),
+  ]);
+  return { exitCode, stdout, stderr };
 }
 
 export async function analyzeArchitectureInWorkspaceProcesses(
   repositoryRoot: string,
   manifest: ArchitectureManifest = architectureManifest,
   processRunner: WorkspaceProcessRunner = runWorkspaceProcess,
+  options: WorkspaceProcessOptions = {},
 ): Promise<boolean> {
   assertArchitectureManifestIntegrity(manifest);
+  const workers = options.workers ?? 1;
+  if (!Number.isSafeInteger(workers) || workers < 1) {
+    throw new Error(`Architecture worker count must be a positive integer; received ${workers}.`);
+  }
+  const writeStdout = options.writeStdout ?? ((output: string) => process.stdout.write(output));
+  const writeStderr = options.writeStderr ?? ((output: string) => process.stderr.write(output));
+  type Completion = { readonly result: WorkspaceProcessResult } | { readonly error: unknown };
+  const completions: (Completion | undefined)[] = [];
+  let nextWorkspace = 0;
+  let nextOutput = 0;
+  let stopScheduling = false;
   let hasFindings = false;
-  for (const workspace of manifest.workspaces) {
-    const exitCode = await processRunner(repositoryRoot, workspace.root);
-    if (exitCode === ARCHITECTURE_FINDINGS_EXIT_CODE) {
-      hasFindings = true;
-      continue;
+  let failure: { readonly message: string; readonly cause?: unknown } | undefined;
+
+  const emitCompletedOutput = (): void => {
+    for (;;) {
+      const completion = completions[nextOutput];
+      if (!completion) return;
+      const workspace = manifest.workspaces[nextOutput];
+      if (!workspace) return;
+      if ("result" in completion) {
+        if (completion.result.stdout) writeStdout(completion.result.stdout);
+        if (completion.result.stderr) writeStderr(completion.result.stderr);
+        if (completion.result.exitCode === ARCHITECTURE_FINDINGS_EXIT_CODE) {
+          hasFindings = true;
+        } else if (completion.result.exitCode !== 0 && !failure) {
+          failure = {
+            message: `Architecture analysis subprocess for ${workspace.name} failed with exit code ${completion.result.exitCode}.`,
+          };
+        }
+      } else if (!failure) {
+        failure = {
+          message: `Architecture analysis subprocess for ${workspace.name} failed to complete.`,
+          cause: completion.error,
+        };
+      }
+      nextOutput += 1;
     }
-    if (exitCode !== 0) {
-      throw new Error(
-        `Architecture analysis subprocess for ${workspace.name} failed with exit code ${exitCode}.`,
-      );
+  };
+
+  const runWorker = async (): Promise<void> => {
+    for (;;) {
+      if (stopScheduling) return;
+      const index = nextWorkspace;
+      const workspace = manifest.workspaces[index];
+      if (!workspace) return;
+      nextWorkspace += 1;
+      try {
+        const result = await processRunner(repositoryRoot, workspace.root);
+        completions[index] = { result };
+        if (result.exitCode !== 0 && result.exitCode !== ARCHITECTURE_FINDINGS_EXIT_CODE) {
+          stopScheduling = true;
+        }
+      } catch (error) {
+        completions[index] = { error };
+        stopScheduling = true;
+      }
+      emitCompletedOutput();
     }
+  };
+
+  await Promise.all(
+    Array.from({ length: Math.min(workers, manifest.workspaces.length) }, () => runWorker()),
+  );
+  emitCompletedOutput();
+  if (failure) {
+    throw new Error(
+      failure.message,
+      failure.cause === undefined ? undefined : { cause: failure.cause },
+    );
   }
   return hasFindings;
+}
+
+export function parseArchitectureWorkerCount(options: readonly string[]): number {
+  let workers = 1;
+  let supplied = false;
+  for (const option of options) {
+    const match = /^--workers=(.*)$/u.exec(option);
+    if (!match) throw new Error(`Unknown architecture option '${option}'.`);
+    if (supplied) throw new Error("Architecture option '--workers' may be supplied only once.");
+    const value = Number(match[1]);
+    if (!Number.isSafeInteger(value) || value < 1) {
+      throw new Error(
+        `Architecture worker count must be a positive integer; received '${match[1]}'.`,
+      );
+    }
+    workers = value;
+    supplied = true;
+  }
+  return workers;
 }
 
 async function main(): Promise<void> {
@@ -161,8 +285,14 @@ async function main(): Promise<void> {
       `Unknown architecture command '${command}'. The permanent gate supports only 'check'; inventory and baseline generation were removed after migration.`,
     );
   }
+  const workers = parseArchitectureWorkerCount(Bun.argv.slice(3));
   await validateWorkspaceInventory(repositoryRoot);
-  const hasFindings = await analyzeArchitectureInWorkspaceProcesses(repositoryRoot);
+  const hasFindings = await analyzeArchitectureInWorkspaceProcesses(
+    repositoryRoot,
+    architectureManifest,
+    runWorkspaceProcess,
+    { workers },
+  );
   if (hasFindings) process.exitCode = 1;
 }
 

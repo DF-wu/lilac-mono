@@ -809,8 +809,10 @@ const IMMEDIATE_TRANSIENT_RETRY = {
   maxDelayMs: 0,
 } as const;
 
-async function temporaryRuntime(model: LanguageModel, profile = "reader") {
-  const directory = await mkdtemp(path.join(tmpdir(), "mini-lilac-runtime-"));
+async function temporaryRuntime(model: LanguageModel, profile = "reader", initializeGit = false) {
+  const directory = await (initializeGit ? mkdtemp : mkdtempFs)(
+    path.join(tmpdir(), "mini-lilac-runtime-"),
+  );
   temporaryDirectories.push(directory);
   const service = new SessionService({
     config: config(),
@@ -6996,7 +6998,7 @@ describe("SessionService", () => {
 
   it("atomically rolls back transcript, run, session state, and prompt command", async () => {
     const model = new MockLanguageModelV4({ doStream: textResult("answer", "done") });
-    const { service, session } = await temporaryRuntime(model);
+    const { service, session } = await temporaryRuntime(model, "reader", true);
     service.store.database.exec(`
       CREATE TRIGGER fail_prompt_command BEFORE UPDATE OF run_id ON commands
       WHEN NEW.kind = 'prompt' AND NEW.run_id IS NOT NULL
@@ -7042,7 +7044,7 @@ describe("SessionService", () => {
 
   it("removes unreferenced snapshot rows at startup without deleting shared history snapshots", async () => {
     const model = new MockLanguageModelV4({ doStream: textResult("answer", "done") });
-    const { directory, service, session } = await temporaryRuntime(model);
+    const { directory, service, session } = await temporaryRuntime(model, "reader", true);
     const started = await service.startPrompt(
       session.id,
       userMessage("create referenced snapshot"),

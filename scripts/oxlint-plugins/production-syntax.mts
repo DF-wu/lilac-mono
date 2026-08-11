@@ -31,7 +31,7 @@ export type DirectSqliteTransactionKind =
   | "direct-sqlite-transaction"
   | "manual-sqlite-transaction-control";
 
-function sourceFileOf(sourceText: string, filePath: string): ts.SourceFile {
+export function parseProductionSyntaxSource(sourceText: string, filePath: string): ts.SourceFile {
   return ts.createSourceFile(
     filePath,
     sourceText,
@@ -600,7 +600,18 @@ export function findExceptionFlowViolations(
   manifest: ArchitectureManifest = architectureManifest,
 ): SyntacticFinding<ExceptionFlowKind>[] {
   if (isExcludedProductionFile(filePath, policy.productionExclusions)) return [];
-  const sourceFile = sourceFileOf(sourceText, filePath);
+  return findExceptionFlowViolationsInSourceFile(
+    parseProductionSyntaxSource(sourceText, filePath),
+    filePath,
+    manifest,
+  );
+}
+
+export function findExceptionFlowViolationsInSourceFile(
+  sourceFile: ts.SourceFile,
+  filePath: string,
+  manifest: ArchitectureManifest = architectureManifest,
+): SyntacticFinding<ExceptionFlowKind>[] {
   const provenance = collectPromiseProvenance(sourceFile);
   const namedCallbackBodies = collectNamedCallbackBodies(sourceFile);
   const streamControllers = collectStreamControllers(sourceFile);
@@ -936,7 +947,7 @@ export function findLocalRecordGuardViolations(
   policy: SyntacticPolicy = SYNTACTIC_POLICY,
 ): SyntacticFinding<LocalRecordGuardKind>[] {
   if (isExcludedProductionFile(filePath, policy.productionExclusions)) return [];
-  const sourceFile = sourceFileOf(sourceText, filePath);
+  const sourceFile = parseProductionSyntaxSource(sourceText, filePath);
   const identity = sourceIdentity(filePath);
   const findings: SyntacticFinding<LocalRecordGuardKind>[] = [];
   const visit = (node: ts.Node): void => {
@@ -1015,6 +1026,18 @@ export function findPresentationDecoderImportViolations(
   manifest: ArchitectureManifest = architectureManifest,
 ): SyntacticFinding<PresentationDecoderImportKind>[] {
   if (isExcludedProductionFile(filePath, policy.productionExclusions)) return [];
+  return findPresentationDecoderImportViolationsInSourceFile(
+    parseProductionSyntaxSource(sourceText, filePath),
+    filePath,
+    manifest,
+  );
+}
+
+export function findPresentationDecoderImportViolationsInSourceFile(
+  sourceFile: ts.SourceFile,
+  filePath: string,
+  manifest: ArchitectureManifest = architectureManifest,
+): SyntacticFinding<PresentationDecoderImportKind>[] {
   const identity = sourceIdentity(filePath);
   const sourceModule = `${identity.module}.ts`;
   const enforced = manifest.workspaces
@@ -1024,7 +1047,6 @@ export function findPresentationDecoderImportViolations(
     );
   if (!enforced) return [];
 
-  const sourceFile = sourceFileOf(sourceText, filePath);
   const findings: SyntacticFinding<PresentationDecoderImportKind>[] = [];
   const forbiddenValues = new Set<string>();
   const forbiddenNamespaces = new Map<string, ReadonlySet<string>>();
@@ -1383,7 +1405,16 @@ export function findInlineAsyncResultCallbackViolations(
   policy: SyntacticPolicy = SYNTACTIC_POLICY,
 ): SyntacticFinding<ResultCallbackKind>[] {
   if (isExcludedProductionFile(filePath, policy.productionExclusions)) return [];
-  const sourceFile = sourceFileOf(sourceText, filePath);
+  return findInlineAsyncResultCallbackViolationsInSourceFile(
+    parseProductionSyntaxSource(sourceText, filePath),
+    filePath,
+  );
+}
+
+export function findInlineAsyncResultCallbackViolationsInSourceFile(
+  sourceFile: ts.SourceFile,
+  filePath: string,
+): SyntacticFinding<ResultCallbackKind>[] {
   const provenance = collectResultProvenance(sourceFile);
   const findings: SyntacticFinding<ResultCallbackKind>[] = [];
   const visit = (node: ts.Node): void => {
@@ -1493,7 +1524,18 @@ export function findStoreInlineDecodingViolations(
   manifest: ArchitectureManifest = architectureManifest,
 ): SyntacticFinding<StoreInlineDecodingKind>[] {
   if (isExcludedProductionFile(filePath, policy.productionExclusions)) return [];
-  const sourceFile = sourceFileOf(sourceText, filePath);
+  return findStoreInlineDecodingViolationsInSourceFile(
+    parseProductionSyntaxSource(sourceText, filePath),
+    filePath,
+    manifest,
+  );
+}
+
+export function findStoreInlineDecodingViolationsInSourceFile(
+  sourceFile: ts.SourceFile,
+  filePath: string,
+  manifest: ArchitectureManifest = architectureManifest,
+): SyntacticFinding<StoreInlineDecodingKind>[] {
   const identity = sourceIdentity(filePath);
   const registrations =
     manifest.workspaces.find((workspace) => workspace.name === identity.workspace)
@@ -1603,7 +1645,18 @@ export function findDirectSqliteTransactionViolations(
   manifest: ArchitectureManifest = architectureManifest,
 ): SyntacticFinding<DirectSqliteTransactionKind>[] {
   if (isExcludedProductionFile(filePath, policy.productionExclusions)) return [];
-  const sourceFile = sourceFileOf(sourceText, filePath);
+  return findDirectSqliteTransactionViolationsInSourceFile(
+    parseProductionSyntaxSource(sourceText, filePath),
+    filePath,
+    manifest,
+  );
+}
+
+export function findDirectSqliteTransactionViolationsInSourceFile(
+  sourceFile: ts.SourceFile,
+  filePath: string,
+  manifest: ArchitectureManifest = architectureManifest,
+): SyntacticFinding<DirectSqliteTransactionKind>[] {
   const identity = sourceIdentity(filePath);
   const registrations =
     manifest.workspaces.find((workspace) => workspace.name === identity.workspace)

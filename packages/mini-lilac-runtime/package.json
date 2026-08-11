@@ -8,7 +8,7 @@
     ".": "./src/index.ts"
   },
   "scripts": {
-    "test": "bun test",
+    "test": "bun test --parallel=4",
     "typecheck": "bunx tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {

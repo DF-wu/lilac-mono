@@ -18,6 +18,17 @@ export interface SyntacticFinding<Kind extends string> {
   readonly workspace: string;
 }
 
+interface ProductionExclusion {
+  readonly pattern: string;
+}
+
+export type ProductionFileExclusionMatcher = (filePath: string) => boolean;
+
+const PRODUCTION_EXCLUSION_MATCHERS = new WeakMap<
+  readonly ProductionExclusion[],
+  ProductionFileExclusionMatcher
+>();
+
 export function normalizeFilePath(filePath: string): string {
   return filePath.replaceAll("\\", "/");
 }
@@ -34,10 +45,24 @@ export function sourceIdentity(filePath: string): SourceIdentity {
 
 export function isExcludedProductionFile(
   filePath: string,
-  exclusions: readonly { readonly pattern: string }[],
+  exclusions: readonly ProductionExclusion[],
 ): boolean {
-  const normalized = normalizeFilePath(filePath);
-  return exclusions.some((exclusion) => new RegExp(exclusion.pattern, "iu").test(normalized));
+  let matcher = PRODUCTION_EXCLUSION_MATCHERS.get(exclusions);
+  if (!matcher) {
+    matcher = createProductionFileExclusionMatcher(exclusions);
+    PRODUCTION_EXCLUSION_MATCHERS.set(exclusions, matcher);
+  }
+  return matcher(filePath);
+}
+
+export function createProductionFileExclusionMatcher(
+  exclusions: readonly ProductionExclusion[],
+): ProductionFileExclusionMatcher {
+  const patterns = exclusions.map((exclusion) => new RegExp(exclusion.pattern, "iu"));
+  return (filePath) => {
+    const normalized = normalizeFilePath(filePath);
+    return patterns.some((pattern) => pattern.test(normalized));
+  };
 }
 
 export function scriptKindFor(filePath: string): ts.ScriptKind {

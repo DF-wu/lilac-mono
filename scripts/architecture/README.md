@@ -7,19 +7,23 @@ with an exact workspace, source location, rule, owning symbol, remediation, and 
 ```sh
 # Standalone subsets for focused development
 bun scripts/architecture/runner.ts check
+bun scripts/architecture/runner.ts check --workers=2
 bun scripts/oxlint-plugins/check-production-syntax.mts
 bun test scripts/architecture/architecture.test.ts
 
-# Full permanent gate, then complete repository CI
+# Full permanent gate, concurrent local check, then conservative repository CI
 bun run lint
+bun run check
 bun run ci
 ```
 
 The standalone commands cover only their named subset. Use `bun run lint` for the complete lint and
-architecture gate, or `bun run ci` for all generated-code, lint, test, typecheck, and format validation.
+architecture gate. `bun run check` overlaps independent generated-code, lint, test, typecheck, and format
+gates for local validation; `bun run ci` runs the same classes of checks conservatively in series.
 
 There is no baseline, suppression, inventory-expansion, or migration-status path. `runner.ts` accepts only
-`check`; new findings must be fixed or represented by one of the exact reviewed registrations below.
+`check`, with an optional positive `--workers=N`; new findings must be fixed or represented by one of the
+exact reviewed registrations below.
 
 ## Fail-Closed Inventory
 
@@ -70,17 +74,17 @@ Production tests, generated output, and the generated Core remote-runner bundle 
 ## Performance
 
 `runner.ts check` validates workspace inventory and manifest integrity once in the parent, then analyzes
-workspaces sequentially in isolated subprocesses. Each child resolves one workspace configuration, creates
-exactly one TypeScript `Program`, prints that workspace's diagnostics, and exits. The operating system then
-reclaims the Program, checker, source files, and lazy declaration indexes before the next workspace starts.
+workspaces in isolated subprocesses. Each child resolves one workspace configuration, creates exactly one
+TypeScript `Program` rooted at production files and declarations, reports that workspace's diagnostics, and
+exits. The operating system then reclaims the Program, checker, source files, and lazy declaration indexes.
 Package-root, event-delivery, persistence, and approved-exception catalogs are still derived from the full
 manifest in every workspace analysis, so partitioning does not narrow cross-workspace rules.
 
-Workers run in manifest order with inherited output, preserving deterministic diagnostics. Exit status is
-aggregated so findings from any worker fail the unchanged parent command; an unexpected worker exit aborts
-the gate and fails closed. Nothing is cached across processes, and workers never overlap, so peak memory is
-bounded by the parent plus the largest single workspace rather than all workspace Programs retained by one
-runtime.
+The default is one worker, preserving the lowest-memory serial path used by `lint` and CI. Local `check`
+uses two workers. Worker output is bounded, captured, and emitted in manifest order so diagnostics remain
+deterministic even when workers overlap. Exit status is aggregated so findings from any worker fail the
+parent command; an unexpected worker exit stops new scheduling and fails closed. Nothing is cached across
+processes.
 
 Focused integration tests spawn the real worker against checked-in `fixtures/workspace-runner` projects and
 assert its exact output and exit protocol. The fixture manifest is selected only for those direct test
@@ -89,5 +93,8 @@ processes; `runner.ts check` removes the fixture selector from every production 
 On 2026-08-04, `/usr/bin/time -v bun scripts/architecture/runner.ts check` on the Stage 8 development
 checkout measured 61.67 seconds and 5,993,228 KB maximum RSS before subprocess partitioning. The same
 command after partitioning measured 76.68 seconds and 3,830,520 KB maximum RSS, a 36.1% peak reduction.
+On 2026-08-12, the current checkout measured 69.43 seconds and 3,413,012 KB before production-root and
+call-resolution optimization. The optimized serial command measured 65.83 seconds and 2,944,580 KB; the
+optimized `--workers=2` command measured 35.85 seconds and 3,285,296 KB.
 Re-run the command and record both wall time and maximum RSS when changing program creation, process
 partitioning, source traversal, or registration resolution.
