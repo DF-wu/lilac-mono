@@ -863,14 +863,15 @@ export async function startDiscordRequestRouter(
         if (current?.requestId === chain.requestId) activeBySession.delete(chain.sessionId);
         continue;
       }
+      const current = activeBySession.get(chain.sessionId);
+      if (current && current.requestId !== chain.requestId) continue;
       for (const [key, tombstone] of terminalLifecycleTombstones) {
         if (tombstone.requestId === chain.requestId) terminalLifecycleTombstones.delete(key);
       }
-      const current = activeBySession.get(chain.sessionId);
-      const active =
-        current?.requestId === chain.requestId
-          ? current
-          : { requestId: chain.requestId, activeOutputMessageIds: new Set<string>() };
+      const active = current ?? {
+        requestId: chain.requestId,
+        activeOutputMessageIds: new Set<string>(),
+      };
       const refs = chain.activeOutputRefs ?? chain.createdOutputRefs;
       for (const ref of refs) active.activeOutputMessageIds.add(ref.messageId);
       activeBySession.set(chain.sessionId, active);

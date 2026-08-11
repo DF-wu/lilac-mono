@@ -4943,6 +4943,102 @@ describe("startBusRequestRouter", () => {
     }
   });
 
+  it("preserves a newer active request when stale recovery activates", async () => {
+    const raw = createInMemoryRawBus();
+    const bus = createLilacBus(raw);
+    const sessionId = "newer-active-before-recovery";
+    const restoredRequestId = `discord:${sessionId}:restored-anchor`;
+    const newerRequestId = `discord:${sessionId}:newer-anchor`;
+    const messageId = "steer-newer-request";
+    const now = Date.now();
+    const adapter = new FakeAdapter({
+      [`${sessionId}:${messageId}`]: {
+        ref: { platform: "discord", channelId: sessionId, messageId },
+        session: { platform: "discord", channelId: sessionId },
+        userId: "u1",
+        userName: "user1",
+        text: "<@bot> keep the live request",
+        ts: now,
+        raw: { reference: {} },
+      },
+    });
+    const config = parseCoreConfigV1ToUniversal({});
+    config.surface.router.defaultMode = "active";
+    const router = await startBusRequestRouter({
+      adapter,
+      bus,
+      subscriptionId: "newer-active-before-recovery-router",
+      config,
+      routerGate: async () => ({ forward: true, reason: "deterministic recovery conflict" }),
+    });
+    const requests: Array<{ readonly requestId?: string; readonly queue: string }> = [];
+    const requestSub = await subscribeTopicForTest(
+      bus,
+      "cmd.request",
+      {
+        mode: "fanout",
+        subscriptionId: "newer-active-before-recovery-requests",
+        consumerId: "newer-active-before-recovery-consumer",
+        offset: { type: "now" },
+      },
+      async (message) => {
+        if (message.type === lilacEventTypes.CmdRequestMessage) {
+          requests.push({ requestId: message.headers?.request_id, queue: message.data.queue });
+        }
+        return Result.ok(undefined);
+      },
+    );
+    try {
+      await bus.publish(
+        lilacEventTypes.EvtRequestLifecycleChanged,
+        { state: "running", ts: now },
+        {
+          headers: {
+            request_id: newerRequestId,
+            session_id: sessionId,
+            request_client: "discord",
+          },
+        },
+      );
+      router.restoreActiveOutputChains({ generation: Symbol("stale-recovery") }, [
+        {
+          requestId: restoredRequestId,
+          sessionId,
+          createdOutputRefs: [
+            {
+              platform: "discord",
+              channelId: sessionId,
+              messageId: "restored-output",
+            },
+          ],
+        },
+      ]);
+
+      await bus.publish(lilacEventTypes.EvtAdapterMessageCreated, {
+        platform: "discord",
+        channelId: sessionId,
+        messageId,
+        userId: "u1",
+        userName: "user1",
+        text: "<@bot> keep the live request",
+        ts: now,
+        raw: {
+          discord: {
+            isDMBased: false,
+            mentionsBot: true,
+            replyToBot: false,
+          },
+        },
+      });
+
+      expect(requests).toEqual([{ requestId: newerRequestId, queue: "steer" }]);
+    } finally {
+      await requestSub.stop();
+      await router.stop();
+      await bus.close();
+    }
+  });
+
   it("leaves the Discord router unseeded when exact snapshot consume conflicts", async () => {
     const raw = createInMemoryRawBus();
     const bus = createLilacBus(raw);
