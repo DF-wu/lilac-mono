@@ -7,7 +7,6 @@ import { parseRequestId } from "./bridge/request-ids";
 import { parseGithubRequestId } from "../github/github-ids";
 import type {
   AuthenticatedSurfaceOrigin,
-  MsgRef,
   MsgRefFor,
   RegisteredSurfacePlatform,
   SessionRefFor,
@@ -22,6 +21,12 @@ type AuthenticationMetadataKind =
   | "actor-github-trigger"
   | "origin-github-trigger"
   | "actor-origin-github-trigger";
+
+type AuthenticationMetadataPresence = {
+  readonly actor: boolean;
+  readonly origin: boolean;
+  readonly githubTrigger: boolean;
+};
 
 type GithubTriggerProjection = {
   readonly kind: "comment" | "issue";
@@ -94,13 +99,70 @@ const requestRawSchema = z
       })
       .optional(),
   })
-  .passthrough();
+  .loose();
 
-function metadataKind(input: {
-  readonly actor: boolean;
-  readonly origin: boolean;
-  readonly githubTrigger: boolean;
-}): AuthenticationMetadataKind {
+type RequestRaw = z.output<typeof requestRawSchema>;
+type RequestMessage = Extract<LilacMessageForTopic<"cmd.request">, { type: "cmd.request.message" }>;
+
+type RequestRoute =
+  | {
+      readonly kind: "uncorrelated";
+      readonly requestClient: AdapterPlatform;
+    }
+  | {
+      readonly kind: "unregistered";
+      readonly requestId: string;
+      readonly requestClient: Exclude<AdapterPlatform, RegisteredSurfacePlatform>;
+      readonly sessionId: string;
+    }
+  | {
+      readonly kind: "discord";
+      readonly requestId: string;
+      readonly requestClient: "discord";
+      readonly sessionId: string;
+    }
+  | {
+      readonly kind: "github";
+      readonly requestId: string;
+      readonly requestClient: "github";
+      readonly sessionId: string;
+    };
+
+type GithubProjectionContext = {
+  readonly triggerMessageId?: string;
+  readonly githubTrigger?: GithubTriggerProjection;
+  readonly verifiedIngress: boolean;
+};
+
+function invalidProjection(
+  messageType: string,
+  message: string,
+): ResultType<never, AuthenticatedRequestProjectionInvalid> {
+  return Result.err(new AuthenticatedRequestProjectionInvalid({ messageType, message }));
+}
+
+function metadataPresence(kind: AuthenticationMetadataKind): AuthenticationMetadataPresence {
+  switch (kind) {
+    case "absent":
+      return { actor: false, origin: false, githubTrigger: false };
+    case "actor":
+      return { actor: true, origin: false, githubTrigger: false };
+    case "origin":
+      return { actor: false, origin: true, githubTrigger: false };
+    case "actor-origin":
+      return { actor: true, origin: true, githubTrigger: false };
+    case "github-trigger":
+      return { actor: false, origin: false, githubTrigger: true };
+    case "actor-github-trigger":
+      return { actor: true, origin: false, githubTrigger: true };
+    case "origin-github-trigger":
+      return { actor: false, origin: true, githubTrigger: true };
+    case "actor-origin-github-trigger":
+      return { actor: true, origin: true, githubTrigger: true };
+  }
+}
+
+function metadataKind(input: AuthenticationMetadataPresence): AuthenticationMetadataKind {
   if (input.actor && input.origin && input.githubTrigger) return "actor-origin-github-trigger";
   if (input.actor && input.githubTrigger) return "actor-github-trigger";
   if (input.origin && input.githubTrigger) return "origin-github-trigger";
@@ -115,94 +177,393 @@ function nonempty(value: string): boolean {
   return value.trim().length > 0;
 }
 
-export function isAuthenticatedRequestProjectionSemanticallyValid(
+function resolveRequestRoute(message: RequestMessage): RequestRoute {
+  const requestId = message.headers?.request_id;
+  const sessionId = message.headers?.session_id;
+  const requestClient = message.headers?.request_client ?? "unknown";
+  if (!requestId || !sessionId) return { kind: "uncorrelated", requestClient };
+
+  switch (requestClient) {
+    case "discord":
+      return { kind: "discord", requestId, requestClient, sessionId };
+    case "github":
+      return { kind: "github", requestId, requestClient, sessionId };
+    case "slack":
+    case "telegram":
+    case "unknown":
+    case "web":
+    case "whatsapp":
+      return { kind: "unregistered", requestId, requestClient, sessionId };
+  }
+}
+
+function validateSurfaceClaims(
+  platform: RegisteredSurfacePlatform,
+  sessionId: string,
+  raw: RequestRaw,
+  messageType: string,
+): ResultType<void, AuthenticatedRequestProjectionInvalid> {
+  const actor = raw.authenticatedActor;
+  const origin = raw.authenticatedOrigin;
+  if (actor && actor.platform !== platform) {
+    return invalidProjection(
+      messageType,
+      "authenticated actor platform does not match request headers",
+    );
+  }
+  if (
+    origin &&
+    (origin.platform !== platform ||
+      origin.messageRef.platform !== platform ||
+      origin.messageRef.channelId !== sessionId)
+  ) {
+    return invalidProjection(
+      messageType,
+      "authenticated origin does not match request headers and session",
+    );
+  }
+  if (actor && origin && actor.userId !== origin.userId) {
+    return invalidProjection(messageType, "authenticated actor and origin user IDs conflict");
+  }
+  return Result.ok(undefined);
+}
+
+function projectUnregisteredRequest(
+  route: Extract<RequestRoute, { kind: "unregistered" }>,
+): AuthenticatedRequestProjection {
+  return {
+    requestId: route.requestId,
+    requestClient: route.requestClient,
+    sessionId: route.sessionId,
+    source: "external",
+    authenticationMetadataKind: "absent",
+    verifiedIngress: false,
+  };
+}
+
+function projectDiscordRequest(
+  route: Extract<RequestRoute, { kind: "discord" }>,
+  raw: RequestRaw,
+  messageType: string,
+): ResultType<AuthenticatedRequestProjection, AuthenticatedRequestProjectionInvalid> {
+  const claimsValid = validateSurfaceClaims("discord", route.sessionId, raw, messageType);
+  if (claimsValid.status === "error") return Result.err(claimsValid.error);
+  if (raw.github?.trigger) {
+    return invalidProjection(
+      messageType,
+      "GitHub trigger metadata does not match the request platform",
+    );
+  }
+
+  const actor = raw.authenticatedActor;
+  const origin = raw.authenticatedOrigin;
+  let messageRef: MsgRefFor<"discord"> | undefined;
+  if (origin) {
+    messageRef = {
+      platform: "discord",
+      channelId: origin.messageRef.channelId,
+      messageId: origin.messageRef.messageId,
+    };
+  } else {
+    const parsedRequest = parseRequestId(route.requestId);
+    if (parsedRequest?.kind === "discord_message" && parsedRequest.channelId === route.sessionId) {
+      messageRef = {
+        platform: "discord",
+        channelId: route.sessionId,
+        messageId: parsedRequest.messageId,
+      };
+    }
+  }
+
+  const sessionRef = { platform: "discord", channelId: route.sessionId } as const;
+  const userId = origin?.userId ?? actor?.userId;
+  let authenticatedOrigin: Extract<AuthenticatedSurfaceOrigin, { platform: "discord" }> | undefined;
+  if (userId) {
+    authenticatedOrigin = messageRef
+      ? { platform: "discord", userId, sessionRef, messageRef }
+      : { platform: "discord", userId, sessionRef };
+  }
+  return Result.ok({
+    requestId: route.requestId,
+    requestClient: route.requestClient,
+    sessionId: route.sessionId,
+    source: "external",
+    platform: "discord",
+    sessionRef,
+    ...(messageRef ? { messageRef } : {}),
+    ...(actor
+      ? { authenticatedActor: { platform: "discord" as const, userId: actor.userId } }
+      : {}),
+    ...(authenticatedOrigin ? { authenticatedOrigin } : {}),
+    authenticationMetadataKind: metadataKind({
+      actor: actor !== undefined,
+      origin: origin !== undefined,
+      githubTrigger: false,
+    }),
+    verifiedIngress: actor !== undefined || origin !== undefined,
+  });
+}
+
+function resolveGithubProjectionContext(
+  route: Extract<RequestRoute, { kind: "github" }>,
+  raw: RequestRaw,
+  messageType: string,
+): ResultType<GithubProjectionContext, AuthenticatedRequestProjectionInvalid> {
+  const github = raw.github;
+  const trigger = github?.trigger;
+  if (github?.issueNumber !== undefined && github.prNumber !== undefined) {
+    return invalidProjection(
+      messageType,
+      "GitHub trigger metadata declares both issue and pull-request targets",
+    );
+  }
+
+  let triggerMessageId: string | undefined;
+  if (trigger?.kind === "comment") triggerMessageId = String(trigger.commentId);
+  if (trigger?.kind === "issue") triggerMessageId = String(trigger.issueNumber);
+
+  const sessionMatch = /^(.+)#([1-9]\d*)$/u.exec(route.sessionId);
+  const sessionRepoFullName = sessionMatch?.[1];
+  const sessionIssueNumber = sessionMatch?.[2] ? Number(sessionMatch[2]) : undefined;
+  if (trigger && (!sessionRepoFullName || !sessionIssueNumber)) {
+    return invalidProjection(
+      messageType,
+      "GitHub trigger metadata does not match the request session",
+    );
+  }
+
+  const declaredIssueNumbers = trigger
+    ? [
+        github?.issueNumber,
+        github?.prNumber,
+        trigger.kind === "issue" ? trigger.issueNumber : undefined,
+      ].filter((value): value is number => value !== undefined)
+    : [];
+  if (
+    sessionIssueNumber !== undefined &&
+    declaredIssueNumbers.some((value) => value !== sessionIssueNumber)
+  ) {
+    return invalidProjection(
+      messageType,
+      "GitHub trigger metadata conflicts with the request session identity",
+    );
+  }
+  if (github?.repoFullName && github.repoFullName !== sessionRepoFullName) {
+    return invalidProjection(
+      messageType,
+      "GitHub repository metadata conflicts with the request session identity",
+    );
+  }
+  if (
+    raw.authenticatedOrigin &&
+    triggerMessageId &&
+    raw.authenticatedOrigin.messageRef.messageId !== triggerMessageId
+  ) {
+    return invalidProjection(
+      messageType,
+      "GitHub trigger metadata conflicts with authenticated message identity",
+    );
+  }
+
+  let targetKind: GithubTriggerProjection["targetKind"];
+  if (github?.prNumber !== undefined) targetKind = "pull-request";
+  else if (github?.issueNumber !== undefined) targetKind = "issue";
+  const githubTrigger = triggerMessageId
+    ? {
+        kind: trigger?.kind ?? "comment",
+        ...(targetKind ? { targetKind } : {}),
+        ...(github?.repoFullName ? { repoFullName: github.repoFullName } : {}),
+        ...(sessionIssueNumber ? { issueNumber: sessionIssueNumber } : {}),
+        messageId: triggerMessageId,
+      }
+    : undefined;
+  const verifiedIngress =
+    trigger !== undefined &&
+    github?.repoFullName === sessionRepoFullName &&
+    (github?.issueNumber !== undefined || github?.prNumber !== undefined) &&
+    declaredIssueNumbers.length > 0 &&
+    declaredIssueNumbers.every((value) => value === sessionIssueNumber);
+  return Result.ok({
+    triggerMessageId,
+    githubTrigger,
+    verifiedIngress,
+  });
+}
+
+function projectGithubRequest(
+  route: Extract<RequestRoute, { kind: "github" }>,
+  raw: RequestRaw,
+  messageType: string,
+): ResultType<AuthenticatedRequestProjection, AuthenticatedRequestProjectionInvalid> {
+  const claimsValid = validateSurfaceClaims("github", route.sessionId, raw, messageType);
+  if (claimsValid.status === "error") return Result.err(claimsValid.error);
+  const context = resolveGithubProjectionContext(route, raw, messageType);
+  if (context.status === "error") return Result.err(context.error);
+
+  const actor = raw.authenticatedActor;
+  const origin = raw.authenticatedOrigin;
+  let messageRef: MsgRefFor<"github"> | undefined;
+  if (origin) {
+    messageRef = {
+      platform: "github",
+      channelId: origin.messageRef.channelId,
+      messageId: origin.messageRef.messageId,
+    };
+  } else if (context.value.triggerMessageId) {
+    messageRef = {
+      platform: "github",
+      channelId: route.sessionId,
+      messageId: context.value.triggerMessageId,
+    };
+  }
+
+  const sessionRef = { platform: "github", channelId: route.sessionId } as const;
+  const userId = origin?.userId ?? actor?.userId;
+  let authenticatedOrigin: Extract<AuthenticatedSurfaceOrigin, { platform: "github" }> | undefined;
+  if (userId) {
+    authenticatedOrigin = messageRef
+      ? { platform: "github", userId, sessionRef, messageRef }
+      : { platform: "github", userId, sessionRef };
+  }
+  return Result.ok({
+    requestId: route.requestId,
+    requestClient: route.requestClient,
+    sessionId: route.sessionId,
+    source: "external",
+    platform: "github",
+    sessionRef,
+    ...(messageRef ? { messageRef } : {}),
+    ...(actor ? { authenticatedActor: { platform: "github" as const, userId: actor.userId } } : {}),
+    ...(authenticatedOrigin ? { authenticatedOrigin } : {}),
+    authenticationMetadataKind: metadataKind({
+      actor: actor !== undefined,
+      origin: origin !== undefined,
+      githubTrigger: context.value.githubTrigger !== undefined,
+    }),
+    ...(context.value.githubTrigger ? { githubTrigger: context.value.githubTrigger } : {}),
+    verifiedIngress: context.value.verifiedIngress,
+  });
+}
+
+function hasConsistentMetadataState(projection: AuthenticatedRequestProjection): boolean {
+  const expected = metadataPresence(projection.authenticationMetadataKind);
+  const actor = projection.authenticatedActor;
+  const origin = projection.authenticatedOrigin;
+  if (expected.actor !== (actor !== undefined)) return false;
+  if (expected.githubTrigger !== (projection.githubTrigger !== undefined)) return false;
+  if (expected.actor && origin === undefined) return false;
+  if (expected.origin && origin === undefined) return false;
+  return expected.actor || expected.origin || origin === undefined;
+}
+
+function isInternalDelegatedProjectionValid(projection: AuthenticatedRequestProjection): boolean {
+  const origin = projection.authenticatedOrigin;
+  if (
+    projection.requestClient !== "unknown" ||
+    projection.platform !== undefined ||
+    projection.sessionRef !== undefined ||
+    projection.messageRef !== undefined ||
+    projection.authenticatedActor !== undefined ||
+    projection.githubTrigger !== undefined ||
+    metadataPresence(projection.authenticationMetadataKind).actor ||
+    projection.verifiedIngress
+  ) {
+    return false;
+  }
+  if (!origin) return true;
+  return (
+    nonempty(origin.userId) &&
+    nonempty(origin.sessionRef.channelId) &&
+    origin.sessionRef.platform === origin.platform
+  );
+}
+
+function isUnregisteredExternalProjectionValid(
   projection: AuthenticatedRequestProjection,
 ): boolean {
-  const hasActor = projection.authenticationMetadataKind.includes("actor");
-  const hasOrigin = projection.authenticationMetadataKind.includes("origin");
-  const hasGithubTrigger = projection.authenticationMetadataKind.includes("github-trigger");
+  return (
+    projection.authenticationMetadataKind === "absent" &&
+    projection.platform === undefined &&
+    projection.sessionRef === undefined &&
+    projection.messageRef === undefined &&
+    projection.authenticatedActor === undefined &&
+    projection.authenticatedOrigin === undefined &&
+    projection.githubTrigger === undefined &&
+    !projection.verifiedIngress
+  );
+}
+
+function hasValidRegisteredRoute(
+  projection: AuthenticatedRequestProjection,
+  platform: RegisteredSurfacePlatform,
+): boolean {
+  const sessionRef = projection.sessionRef;
+  const messageRef = projection.messageRef;
+  if (
+    projection.platform !== platform ||
+    sessionRef?.platform !== platform ||
+    sessionRef.channelId !== projection.sessionId ||
+    !nonempty(sessionRef.channelId)
+  ) {
+    return false;
+  }
+  return (
+    messageRef === undefined ||
+    (messageRef.platform === platform &&
+      messageRef.channelId === projection.sessionId &&
+      nonempty(messageRef.messageId))
+  );
+}
+
+function hasValidRegisteredIdentity(
+  projection: AuthenticatedRequestProjection,
+  platform: RegisteredSurfacePlatform,
+): boolean {
+  const expected = metadataPresence(projection.authenticationMetadataKind);
   const actor = projection.authenticatedActor;
   const origin = projection.authenticatedOrigin;
   if (
-    !nonempty(projection.requestId) ||
-    !nonempty(projection.sessionId) ||
-    hasActor !== (actor !== undefined) ||
-    hasGithubTrigger !== (projection.githubTrigger !== undefined) ||
-    (hasActor && origin === undefined) ||
-    (hasOrigin && origin === undefined) ||
-    (!hasActor && !hasOrigin && origin !== undefined)
+    actor &&
+    (actor.platform !== platform || !nonempty(actor.userId) || actor.userId !== origin?.userId)
   ) {
     return false;
   }
-  if (projection.source === "internal-delegated") {
-    return (
-      projection.requestClient === "unknown" &&
-      projection.platform === undefined &&
-      projection.sessionRef === undefined &&
-      projection.messageRef === undefined &&
-      projection.authenticatedActor === undefined &&
-      projection.githubTrigger === undefined &&
-      !hasActor &&
-      projection.verifiedIngress === false &&
-      (origin === undefined ||
-        (nonempty(origin.userId) &&
-          nonempty(origin.sessionRef.channelId) &&
-          origin.sessionRef.platform === origin.platform))
-    );
-  }
-  if (projection.requestClient !== "discord" && projection.requestClient !== "github") {
-    return (
-      projection.authenticationMetadataKind === "absent" &&
-      projection.platform === undefined &&
-      projection.sessionRef === undefined &&
-      projection.messageRef === undefined &&
-      actor === undefined &&
-      origin === undefined &&
-      projection.githubTrigger === undefined &&
-      projection.verifiedIngress === false
-    );
-  }
+  if (expected.origin && origin?.messageRef === undefined) return false;
+  if (!origin) return true;
   if (
-    projection.platform !== projection.requestClient ||
-    projection.sessionRef?.platform !== projection.requestClient ||
-    projection.sessionRef.channelId !== projection.sessionId ||
-    !nonempty(projection.sessionRef.channelId) ||
-    (projection.messageRef !== undefined &&
-      (projection.messageRef.platform !== projection.requestClient ||
-        projection.messageRef.channelId !== projection.sessionId ||
-        !nonempty(projection.messageRef.messageId))) ||
-    (actor !== undefined &&
-      (actor.platform !== projection.requestClient ||
-        !nonempty(actor.userId) ||
-        actor.userId !== origin?.userId)) ||
-    (hasOrigin && origin?.messageRef === undefined) ||
-    (origin !== undefined &&
-      (origin.platform !== projection.requestClient ||
-        origin.sessionRef.platform !== origin.platform ||
-        origin.sessionRef.channelId !== projection.sessionId ||
-        !nonempty(origin.userId) ||
-        (origin.messageRef !== undefined &&
-          (origin.messageRef.platform !== projection.requestClient ||
-            origin.messageRef.channelId !== projection.sessionId ||
-            origin.messageRef.messageId !== projection.messageRef?.messageId))))
+    origin.platform !== platform ||
+    origin.sessionRef.platform !== origin.platform ||
+    origin.sessionRef.channelId !== projection.sessionId ||
+    !nonempty(origin.userId)
   ) {
     return false;
   }
-  if (projection.requestClient === "discord") {
-    if (projection.githubTrigger !== undefined || hasGithubTrigger) return false;
-    const expectedVerified = hasOrigin || (hasActor && origin !== undefined);
-    const restrictedActorWithoutMessageProof =
-      hasActor &&
-      !hasOrigin &&
-      projection.messageRef === undefined &&
-      origin?.messageRef === undefined &&
-      projection.verifiedIngress === false;
-    if (restrictedActorWithoutMessageProof) return true;
-    if (projection.verifiedIngress !== expectedVerified) return false;
-    return true;
-  }
+  const originMessageRef = origin.messageRef;
+  if (!originMessageRef) return true;
+  return (
+    originMessageRef.platform === platform &&
+    originMessageRef.channelId === projection.sessionId &&
+    originMessageRef.messageId === projection.messageRef?.messageId
+  );
+}
+
+function isDiscordProjectionValid(projection: AuthenticatedRequestProjection): boolean {
+  const expected = metadataPresence(projection.authenticationMetadataKind);
+  if (projection.githubTrigger !== undefined || expected.githubTrigger) return false;
+  const expectedVerified =
+    expected.origin || (expected.actor && projection.authenticatedOrigin !== undefined);
+  const restrictedActorWithoutMessageProof =
+    expected.actor &&
+    !expected.origin &&
+    projection.messageRef === undefined &&
+    projection.authenticatedOrigin?.messageRef === undefined &&
+    !projection.verifiedIngress;
+  return restrictedActorWithoutMessageProof || projection.verifiedIngress === expectedVerified;
+}
+
+function isGithubProjectionValid(projection: AuthenticatedRequestProjection): boolean {
   const trigger = projection.githubTrigger;
-  if (trigger === undefined) return projection.verifiedIngress === false;
+  if (!trigger) return !projection.verifiedIngress;
   const session = /^(.+)#([1-9]\d*)$/u.exec(projection.sessionId);
   if (
     !session ||
@@ -229,241 +590,158 @@ export function isAuthenticatedRequestProjectionSemanticallyValid(
   return projection.verifiedIngress === completeTrigger;
 }
 
+function isRegisteredExternalProjectionValid(
+  projection: AuthenticatedRequestProjection,
+  platform: RegisteredSurfacePlatform,
+): boolean {
+  if (!hasValidRegisteredRoute(projection, platform)) return false;
+  if (!hasValidRegisteredIdentity(projection, platform)) return false;
+  switch (platform) {
+    case "discord":
+      return isDiscordProjectionValid(projection);
+    case "github":
+      return isGithubProjectionValid(projection);
+  }
+}
+
+export function isAuthenticatedRequestProjectionSemanticallyValid(
+  projection: AuthenticatedRequestProjection,
+): boolean {
+  if (!nonempty(projection.requestId) || !nonempty(projection.sessionId)) return false;
+  if (!hasConsistentMetadataState(projection)) return false;
+  if (projection.source === "internal-delegated") {
+    return isInternalDelegatedProjectionValid(projection);
+  }
+  switch (projection.requestClient) {
+    case "discord":
+      return isRegisteredExternalProjectionValid(projection, "discord");
+    case "github":
+      return isRegisteredExternalProjectionValid(projection, "github");
+    case "slack":
+    case "telegram":
+    case "unknown":
+    case "web":
+    case "whatsapp":
+      return isUnregisteredExternalProjectionValid(projection);
+  }
+}
+
+function hasDurableDiscordMessageProof(projection: AuthenticatedRequestProjection): boolean {
+  const messageRef = projection.messageRef;
+  const originMessageRef = projection.authenticatedOrigin?.messageRef;
+  if (!messageRef && !originMessageRef) return true;
+  if (!messageRef) return false;
+  const request = parseRequestId(projection.requestId);
+  if (
+    request?.kind !== "discord_message" ||
+    request.channelId !== projection.sessionId ||
+    request.channelId !== messageRef.channelId ||
+    request.messageId !== messageRef.messageId
+  ) {
+    return false;
+  }
+  return (
+    originMessageRef === undefined ||
+    (originMessageRef.channelId === request.channelId &&
+      originMessageRef.messageId === request.messageId)
+  );
+}
+
+function hasDurableGithubTriggerProof(projection: AuthenticatedRequestProjection): boolean {
+  const trigger = projection.githubTrigger;
+  if (!trigger) return true;
+  const request = parseGithubRequestId({ requestId: projection.requestId });
+  return (
+    request?.sessionId === projection.sessionId &&
+    request.triggerId === trigger.messageId &&
+    request.triggerId === projection.messageRef?.messageId &&
+    (projection.authenticatedOrigin?.messageRef === undefined ||
+      projection.authenticatedOrigin.messageRef.messageId === request.triggerId)
+  );
+}
+
 export function isPersistedRecoveryAuthenticatedRequestProjectionSemanticallyValid(
   projection: AuthenticatedRequestProjection,
 ): boolean {
   if (!isAuthenticatedRequestProjectionSemanticallyValid(projection)) return false;
-  if (projection.source !== "external") return true;
-
-  if (projection.requestClient === "discord") {
-    const messageRef = projection.messageRef;
-    const originMessageRef = projection.authenticatedOrigin?.messageRef;
-    if (!messageRef && !originMessageRef) return true;
-    if (!messageRef) return false;
-    const request = parseRequestId(projection.requestId);
-    if (
-      request?.kind !== "discord_message" ||
-      request.channelId !== projection.sessionId ||
-      request.channelId !== messageRef.channelId ||
-      request.messageId !== messageRef.messageId
-    ) {
-      return false;
-    }
-    return (
-      originMessageRef === undefined ||
-      (originMessageRef.channelId === request.channelId &&
-        originMessageRef.messageId === request.messageId)
-    );
+  if (projection.source === "internal-delegated") return true;
+  switch (projection.requestClient) {
+    case "discord":
+      return hasDurableDiscordMessageProof(projection);
+    case "github":
+      return hasDurableGithubTriggerProof(projection);
+    case "slack":
+    case "telegram":
+    case "unknown":
+    case "web":
+    case "whatsapp":
+      return true;
   }
+}
 
-  if (projection.requestClient === "github" && projection.githubTrigger) {
-    const request = parseGithubRequestId({ requestId: projection.requestId });
-    return (
-      request?.sessionId === projection.sessionId &&
-      request.triggerId === projection.githubTrigger.messageId &&
-      request.triggerId === projection.messageRef?.messageId &&
-      (projection.authenticatedOrigin?.messageRef === undefined ||
-        projection.authenticatedOrigin.messageRef.messageId === request.triggerId)
-    );
-  }
-
-  return true;
+function requireSemanticallyValidProjection(
+  projected: ResultType<AuthenticatedRequestProjection, AuthenticatedRequestProjectionInvalid>,
+  messageType: string,
+): ResultType<AuthenticatedRequestProjection, AuthenticatedRequestProjectionInvalid> {
+  if (projected.status === "error") return Result.err(projected.error);
+  if (isAuthenticatedRequestProjectionSemanticallyValid(projected.value)) return projected;
+  return invalidProjection(
+    messageType,
+    "cmd.request.message authentication projection is semantically inconsistent",
+  );
 }
 
 export function projectAuthenticatedRequest(
-  msg: Extract<LilacMessageForTopic<"cmd.request">, { type: "cmd.request.message" }>,
+  message: RequestMessage,
 ): ResultType<AuthenticatedRequestProjection | undefined, AuthenticatedRequestProjectionInvalid> {
-  const requestId = msg.headers?.request_id;
-  const sessionId = msg.headers?.session_id;
-  const requestClient = msg.headers?.request_client ?? "unknown";
-  const rawData = msg.data.raw;
-  const hasAuthenticationMetadata =
-    isRecord(rawData) &&
-    (Object.hasOwn(rawData, "authenticatedActor") ||
-      Object.hasOwn(rawData, "authenticatedOrigin") ||
-      Object.hasOwn(rawData, "github"));
-  const invalid = (message: string) =>
-    Result.err(
-      new AuthenticatedRequestProjectionInvalid({
-        messageType: msg.type,
-        message,
-      }),
-    );
-  const valid = (projection: AuthenticatedRequestProjection) =>
-    isAuthenticatedRequestProjectionSemanticallyValid(projection)
-      ? Result.ok(projection)
-      : invalid("cmd.request.message authentication projection is semantically inconsistent");
-
-  if (!requestId || !sessionId) {
-    if (!hasAuthenticationMetadata) return Result.ok(undefined);
-    return invalid(
+  const raw = message.data.raw;
+  const metadataClaimed =
+    isRecord(raw) &&
+    (Object.hasOwn(raw, "authenticatedActor") ||
+      Object.hasOwn(raw, "authenticatedOrigin") ||
+      Object.hasOwn(raw, "github"));
+  const route = resolveRequestRoute(message);
+  if (route.kind === "uncorrelated") {
+    if (!metadataClaimed) return Result.ok(undefined);
+    return invalidProjection(
+      message.type,
       "cmd.request.message authentication metadata requires correlated surface headers",
     );
   }
-  if (requestClient !== "discord" && requestClient !== "github") {
-    if (hasAuthenticationMetadata) {
-      return invalid("surface authentication metadata requires a registered request platform");
+  if (route.kind === "unregistered") {
+    if (metadataClaimed) {
+      return invalidProjection(
+        message.type,
+        "surface authentication metadata requires a registered request platform",
+      );
     }
-    return valid({
-      requestId,
-      requestClient,
-      sessionId,
-      source: "external",
-      authenticationMetadataKind: "absent",
-      verifiedIngress: false,
-    });
-  }
-  const platform = requestClient;
-
-  const raw = requestRawSchema.safeParse(rawData);
-  if (!raw.success && hasAuthenticationMetadata) {
-    return invalid("cmd.request.message contains invalid authentication metadata");
-  }
-  const actor = raw.success ? raw.data.authenticatedActor : undefined;
-  const origin = raw.success ? raw.data.authenticatedOrigin : undefined;
-  const github = raw.success ? raw.data.github : undefined;
-  const trigger = github?.trigger;
-
-  if (actor && actor.platform !== platform) {
-    return invalid("authenticated actor platform does not match request headers");
-  }
-  if (
-    origin &&
-    (origin.platform !== platform ||
-      origin.messageRef.platform !== platform ||
-      origin.messageRef.channelId !== sessionId)
-  ) {
-    return invalid("authenticated origin does not match request headers and session");
-  }
-  if (actor?.userId && origin && actor.userId !== origin.userId) {
-    return invalid("authenticated actor and origin user IDs conflict");
-  }
-  if (platform !== "github" && trigger) {
-    return invalid("GitHub trigger metadata does not match the request platform");
-  }
-  if (github?.issueNumber !== undefined && github.prNumber !== undefined) {
-    return invalid("GitHub trigger metadata declares both issue and pull-request targets");
+    return requireSemanticallyValidProjection(
+      Result.ok(projectUnregisteredRequest(route)),
+      message.type,
+    );
   }
 
-  let triggerMessageId: string | undefined;
-  if (trigger?.kind === "comment") triggerMessageId = String(trigger.commentId);
-  if (trigger?.kind === "issue") triggerMessageId = String(trigger.issueNumber);
-  const sessionMatch = /^(.+)#([1-9]\d*)$/u.exec(sessionId);
-  const sessionRepoFullName = sessionMatch?.[1];
-  const sessionIssueNumber = sessionMatch?.[2] ? Number(sessionMatch[2]) : undefined;
-  if (trigger && (!sessionRepoFullName || !sessionIssueNumber)) {
-    return invalid("GitHub trigger metadata does not match the request session");
+  const decoded = requestRawSchema.safeParse(raw);
+  if (!decoded.success && metadataClaimed) {
+    return invalidProjection(
+      message.type,
+      "cmd.request.message contains invalid authentication metadata",
+    );
   }
-  const declaredIssueNumbers = trigger
-    ? [
-        github?.issueNumber,
-        github?.prNumber,
-        trigger.kind === "issue" ? trigger.issueNumber : undefined,
-      ].filter((value): value is number => value !== undefined)
-    : [];
-  if (
-    sessionIssueNumber !== undefined &&
-    declaredIssueNumbers.some((value) => value !== sessionIssueNumber)
-  ) {
-    return invalid("GitHub trigger metadata conflicts with the request session identity");
-  }
-  if (github?.repoFullName && github.repoFullName !== sessionRepoFullName) {
-    return invalid("GitHub repository metadata conflicts with the request session identity");
-  }
-  if (origin && triggerMessageId && origin.messageRef.messageId !== triggerMessageId) {
-    return invalid("GitHub trigger metadata conflicts with authenticated message identity");
-  }
+  const metadata = decoded.success ? decoded.data : {};
 
-  let messageRef: MsgRef | undefined;
-  if (origin) {
-    messageRef = {
-      platform,
-      channelId: origin.messageRef.channelId,
-      messageId: origin.messageRef.messageId,
-    };
-  } else if (platform === "discord") {
-    const parsed = parseRequestId(requestId);
-    if (parsed?.kind === "discord_message" && parsed.channelId === sessionId) {
-      messageRef = { platform, channelId: sessionId, messageId: parsed.messageId };
-    }
-  } else if (triggerMessageId) {
-    messageRef = { platform, channelId: sessionId, messageId: triggerMessageId };
+  switch (route.kind) {
+    case "discord":
+      return requireSemanticallyValidProjection(
+        projectDiscordRequest(route, metadata, message.type),
+        message.type,
+      );
+    case "github":
+      return requireSemanticallyValidProjection(
+        projectGithubRequest(route, metadata, message.type),
+        message.type,
+      );
   }
-
-  const userId = origin?.userId ?? actor?.userId;
-  const authenticationMetadataKind = metadataKind({
-    actor: actor !== undefined,
-    origin: origin !== undefined,
-    githubTrigger: trigger !== undefined,
-  });
-  let githubTargetKind: GithubTriggerProjection["targetKind"];
-  if (github?.prNumber !== undefined) githubTargetKind = "pull-request";
-  else if (github?.issueNumber !== undefined) githubTargetKind = "issue";
-  const githubTrigger = triggerMessageId
-    ? {
-        kind: trigger?.kind ?? "comment",
-        ...(githubTargetKind ? { targetKind: githubTargetKind } : {}),
-        ...(github?.repoFullName ? { repoFullName: github.repoFullName } : {}),
-        ...(sessionIssueNumber ? { issueNumber: sessionIssueNumber } : {}),
-        messageId: triggerMessageId,
-      }
-    : undefined;
-  const verifiedGithubIngress =
-    platform === "github" &&
-    trigger !== undefined &&
-    github?.repoFullName === sessionRepoFullName &&
-    (github?.issueNumber !== undefined || github?.prNumber !== undefined) &&
-    declaredIssueNumbers.length > 0 &&
-    declaredIssueNumbers.every((value) => value === sessionIssueNumber);
-
-  if (platform === "discord") {
-    const sessionRef = { platform, channelId: sessionId };
-    const discordMessageRef = messageRef?.platform === "discord" ? messageRef : undefined;
-    let authenticatedOrigin:
-      | Extract<AuthenticatedSurfaceOrigin, { platform: "discord" }>
-      | undefined;
-    if (userId) {
-      authenticatedOrigin = discordMessageRef
-        ? { platform, userId, sessionRef, messageRef: discordMessageRef }
-        : { platform, userId, sessionRef };
-    }
-    return valid({
-      requestId,
-      requestClient,
-      sessionId,
-      source: "external",
-      platform,
-      sessionRef,
-      ...(discordMessageRef ? { messageRef: discordMessageRef } : {}),
-      ...(actor ? { authenticatedActor: { platform: actor.platform, userId: actor.userId } } : {}),
-      ...(authenticatedOrigin ? { authenticatedOrigin } : {}),
-      authenticationMetadataKind,
-      verifiedIngress: actor !== undefined || origin !== undefined,
-    });
-  }
-
-  const sessionRef = { platform, channelId: sessionId };
-  const githubMessageRef = messageRef?.platform === "github" ? messageRef : undefined;
-  let authenticatedOrigin: Extract<AuthenticatedSurfaceOrigin, { platform: "github" }> | undefined;
-  if (userId) {
-    authenticatedOrigin = githubMessageRef
-      ? { platform, userId, sessionRef, messageRef: githubMessageRef }
-      : { platform, userId, sessionRef };
-  }
-  return valid({
-    requestId,
-    requestClient,
-    sessionId,
-    source: "external",
-    platform,
-    sessionRef,
-    ...(githubMessageRef ? { messageRef: githubMessageRef } : {}),
-    ...(actor ? { authenticatedActor: { platform: actor.platform, userId: actor.userId } } : {}),
-    ...(authenticatedOrigin ? { authenticatedOrigin } : {}),
-    authenticationMetadataKind,
-    ...(githubTrigger ? { githubTrigger } : {}),
-    verifiedIngress: verifiedGithubIngress,
-  });
 }
 
 function sameGithubTrigger(
@@ -492,23 +770,44 @@ function hasUnprovenGithubOriginMessageReplacement(
   return next.githubTrigger?.messageId !== nextMessageRef.messageId;
 }
 
+type LatchConflictReason =
+  | "request-changed"
+  | "client-changed"
+  | "session-changed"
+  | "origin-introduced"
+  | "verification-upgraded"
+  | "github-origin-message-replaced"
+  | "github-trigger-changed";
+
+function latchConflictReason(
+  previous: AuthenticatedRequestProjection,
+  next: AuthenticatedRequestProjection,
+): LatchConflictReason | undefined {
+  if (previous.requestId !== next.requestId) return "request-changed";
+  if (previous.requestClient !== next.requestClient) return "client-changed";
+  if (previous.sessionId !== next.sessionId) return "session-changed";
+  if (!previous.authenticatedOrigin && next.authenticatedOrigin) return "origin-introduced";
+  if (!previous.verifiedIngress && next.verifiedIngress) return "verification-upgraded";
+  if (hasUnprovenGithubOriginMessageReplacement(previous, next)) {
+    return "github-origin-message-replaced";
+  }
+  if (
+    previous.verifiedIngress &&
+    next.githubTrigger !== undefined &&
+    !sameGithubTrigger(previous.githubTrigger, next.githubTrigger)
+  ) {
+    return "github-trigger-changed";
+  }
+  return undefined;
+}
+
 export function latchAuthenticatedRequest(
   previous: AuthenticatedRequestProjection | undefined,
   next: AuthenticatedRequestProjection,
   messageType: string,
 ): ResultType<AuthenticatedRequestProjection, AuthenticatedRequestIdentityConflict> {
   if (!previous) return Result.ok(next);
-  const conflicts =
-    previous.requestId !== next.requestId ||
-    previous.requestClient !== next.requestClient ||
-    previous.sessionId !== next.sessionId ||
-    (previous.authenticatedOrigin === undefined && next.authenticatedOrigin !== undefined) ||
-    (previous.verifiedIngress === false && next.verifiedIngress === true) ||
-    hasUnprovenGithubOriginMessageReplacement(previous, next) ||
-    (previous.verifiedIngress &&
-      next.githubTrigger !== undefined &&
-      !sameGithubTrigger(previous.githubTrigger, next.githubTrigger));
-  if (conflicts) {
+  if (latchConflictReason(previous, next)) {
     return Result.err(
       new AuthenticatedRequestIdentityConflict({
         messageType,
