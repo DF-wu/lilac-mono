@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, jest } from "bun:test";
 import { createOpenAI } from "@ai-sdk/openai";
 import { streamText } from "ai";
 
@@ -1435,27 +1435,31 @@ describe("createOpenAIResponsesWebSocketFetch", () => {
       throw new Error("should not fallback");
     }) as unknown as typeof globalThis.fetch;
 
-    const wsFetch = createOpenAIResponsesWebSocketFetch({
-      mode: "websocket",
-      idleTimeoutMs: 10,
-    });
+    jest.useFakeTimers({ now: 0 });
+    try {
+      const wsFetch = createOpenAIResponsesWebSocketFetch({
+        mode: "websocket",
+        idleTimeoutMs: 10,
+      });
 
-    const response = await wsFetch("https://api.openai.com/v1/responses", {
-      method: "POST",
-      body: JSON.stringify({ stream: true, input: "hello" }),
-    });
+      const response = await wsFetch("https://api.openai.com/v1/responses", {
+        method: "POST",
+        body: JSON.stringify({ stream: true, input: "hello" }),
+      });
 
-    const socket = FakeWebSocket.instances[0];
-    expect(socket).toBeDefined();
+      const socket = FakeWebSocket.instances[0];
+      expect(socket).toBeDefined();
 
-    const textPromise = response.text();
-    socket?.emitMessage(JSON.stringify({ type: "response.completed" }));
-    const text = await textPromise;
-    expect(text).toContain("[DONE]");
+      const textPromise = response.text();
+      socket?.emitMessage(JSON.stringify({ type: "response.completed" }));
+      const text = await textPromise;
+      expect(text).toContain("[DONE]");
 
-    // test-wait-justification: crosses the reusable websocket's real ten-millisecond idle-close deadline
-    await new Promise((resolve) => setTimeout(resolve, 25));
-    expect(socket?.readyState).toBe(FakeWebSocket.CLOSED);
-    wsFetch.close();
+      jest.advanceTimersByTime(10);
+      expect(socket?.readyState).toBe(FakeWebSocket.CLOSED);
+      wsFetch.close();
+    } finally {
+      jest.useRealTimers();
+    }
   });
 });

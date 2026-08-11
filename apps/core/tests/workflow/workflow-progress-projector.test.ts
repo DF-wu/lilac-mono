@@ -643,12 +643,22 @@ describe("WorkflowProgressProjector", () => {
     const store = new DurableWorkflowStore(dbPath);
     const adapter = new ProjectionAdapter();
     const bus = createLilacBus(new CapturingRawBus());
+    const clock = { now: 100 };
+    const scheduler = new FakeProjectionScheduler(clock);
+    const edited = Promise.withResolvers<void>();
+    const originalEdit = adapter.editMsg.bind(adapter);
+    const edit = spyOn(adapter, "editMsg").mockImplementation(async (...args) => {
+      const result = await originalEdit(...args);
+      edited.resolve();
+      return result;
+    });
     const projector = createWorkflowProgressProjectorForTest({
       bus,
       store,
       ports: projectionPorts(adapter),
       subscriptionId: "coalescing",
-      now: () => 100,
+      now: () => clock.now,
+      scheduleTimeout: scheduler.scheduleTimeout,
       coalesceMs: 5,
       minEditIntervalMs: 0,
     });
@@ -660,11 +670,13 @@ describe("WorkflowProgressProjector", () => {
       );
       projector.requestProjection("run-1");
       projector.requestProjection("run-1");
-      // test-wait-justification: crosses the real coalescing window before asserting one projected edit
-      await Bun.sleep(30);
+      expect(scheduler.scheduledTimes().filter((at) => at === 105)).toHaveLength(1);
+      scheduler.advanceTo(105);
+      await edited.promise;
       expect(adapter.edits).toBe(1);
       expect(adapter.contents.at(-1)?.text).toContain("**Running**");
     } finally {
+      edit.mockRestore();
       await projector.stop();
       await bus.close();
       store.close();

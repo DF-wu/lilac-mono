@@ -2354,6 +2354,8 @@ describe("WorkflowEngine", () => {
       cancelledRequestId: string | null = null;
       stateBeforeReceipt: string | null = null;
       interruptAttempts = 0;
+      readonly receiptRecordingStarted = Promise.withResolvers<void>();
+      readonly releaseReceiptRecording = Promise.withResolvers<void>();
       override async publish<TData>(
         message: Omit<Message<TData>, "id" | "ts">,
         options: PublishOptions,
@@ -2414,8 +2416,8 @@ describe("WorkflowEngine", () => {
             this.cancelledRequestId = requestId;
             this.stateBeforeReceipt =
               workflowStoreValue(store.getOperationByRequestId(requestId))?.state ?? null;
-            // test-wait-justification: holds terminal receipt recording open to exercise idle-cancellation ordering
-            await Bun.sleep(50);
+            this.receiptRecordingStarted.resolve();
+            await this.releaseReceiptRecording.promise;
             const operation = workflowStoreValue(store.getOperationByRequestId(requestId));
             if (!operation) throw new Error("Missing idle operation");
             const dispatch = store.getWorkflowRequestDispatchHandoff({
@@ -2480,6 +2482,13 @@ describe("WorkflowEngine", () => {
     });
     try {
       await engine.start();
+      await raw.receiptRecordingStarted.promise;
+      const runningOperation = workflowStoreValue(store.listOperations("run-idle-receipt"))[0];
+      expect(raw.cancelledRequestId).toBe(runningOperation?.requestId ?? null);
+      expect(raw.interruptAttempts).toBe(2);
+      expect(raw.stateBeforeReceipt).toBe("running");
+      expect(runningOperation?.state).toBe("running");
+      raw.releaseReceiptRecording.resolve();
       await waitFor(() => workflowStoreValue(store.getRun("run-idle-receipt"))?.state === "failed");
       const operation = workflowStoreValue(store.listOperations("run-idle-receipt"))[0];
       expect(raw.cancelledRequestId).toBe(operation?.requestId ?? null);
@@ -2496,6 +2505,7 @@ describe("WorkflowEngine", () => {
         detail: "idle process tree quiesced",
       });
     } finally {
+      raw.releaseReceiptRecording.resolve();
       await engine.stop();
       await bus.close();
       store.close();

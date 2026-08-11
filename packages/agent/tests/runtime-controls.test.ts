@@ -1,4 +1,4 @@
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, jest } from "bun:test";
 
 import { createLogger } from "@stanley2058/lilac-utils";
 
@@ -27,7 +27,7 @@ describe("agent run idle watchdog", () => {
     watchdog.stop();
   });
 
-  it("pauses monitoring between separately raced operations", async () => {
+  it("pauses monitoring between separately raced operations", () => {
     let timeoutCount = 0;
     const watchdog = createAgentRunIdleWatchdog({
       idleTimeoutMs: 10,
@@ -36,13 +36,17 @@ describe("agent run idle watchdog", () => {
       },
     });
 
-    watchdog.start();
-    watchdog.pause();
-    // test-wait-justification: crosses the real idle deadline while monitoring is paused
-    await Bun.sleep(20);
+    jest.useFakeTimers({ now: 0 });
+    try {
+      watchdog.start();
+      watchdog.pause();
+      jest.advanceTimersByTime(20);
 
-    expect(timeoutCount).toBe(0);
-    watchdog.stop();
+      expect(timeoutCount).toBe(0);
+    } finally {
+      watchdog.stop();
+      jest.useRealTimers();
+    }
   });
 
   it("can restart with a fresh timeout race after recovery", async () => {
@@ -65,18 +69,22 @@ describe("agent run idle watchdog", () => {
     watchdog.stop();
   });
 
-  it("does not clamp large idle deadlines to an immediate timer", async () => {
+  it("does not clamp large idle deadlines to an immediate timer", () => {
     let timeoutCount = 0;
     const timer = createIdleTimer(30 * 24 * 60 * 60 * 1000, () => {
       timeoutCount += 1;
     });
 
-    timer.reset();
-    // test-wait-justification: verifies a very large real idle deadline is not clamped to an immediate timer
-    await Bun.sleep(10);
+    jest.useFakeTimers({ now: 0 });
+    try {
+      timer.reset();
+      jest.advanceTimersByTime(10);
 
-    expect(timeoutCount).toBe(0);
-    timer.stop();
+      expect(timeoutCount).toBe(0);
+    } finally {
+      timer.stop();
+      jest.useRealTimers();
+    }
   });
 });
 

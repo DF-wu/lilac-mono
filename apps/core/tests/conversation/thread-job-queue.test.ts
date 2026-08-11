@@ -10,18 +10,11 @@ function deferred(): { promise: Promise<void>; resolve: () => void } {
   return { promise, resolve };
 }
 
-async function waitFor(predicate: () => boolean): Promise<void> {
-  for (let i = 0; i < 50; i++) {
-    if (predicate()) return;
-    // test-wait-justification: polls until the serial queue's asynchronously scheduled job transition runs
-    await Bun.sleep(1);
-  }
-  throw new Error("condition not met");
-}
-
 describe("conversation thread serial job queue", () => {
   it("runs queued jobs one at a time in FIFO order", async () => {
-    const releases = new Map<number, ReturnType<typeof deferred>>();
+    const starts = new Map([1, 2, 3].map((job) => [job, deferred()]));
+    const releases = new Map([1, 2, 3].map((job) => [job, deferred()]));
+    const idle = deferred();
     const events: string[] = [];
     let active = 0;
     let maxActive = 0;
@@ -31,33 +24,34 @@ describe("conversation thread serial job queue", () => {
         active += 1;
         maxActive = Math.max(maxActive, active);
         events.push(`start:${job}`);
-        const release = deferred();
-        releases.set(job, release);
-        await release.promise;
+        starts.get(job)?.resolve();
+        await releases.get(job)?.promise;
         events.push(`end:${job}`);
         active -= 1;
       },
+      onIdle: idle.resolve,
     });
 
     queue.enqueue(1);
     queue.enqueue(2);
     queue.enqueue(3);
 
-    await waitFor(() => events.includes("start:1"));
+    await starts.get(1)?.promise;
     expect(events).toEqual(["start:1"]);
     expect(queue.running).toBe(true);
 
     releases.get(1)?.resolve();
-    await waitFor(() => events.includes("start:2"));
+    await starts.get(2)?.promise;
     expect(events).toEqual(["start:1", "end:1", "start:2"]);
 
     releases.get(2)?.resolve();
-    await waitFor(() => events.includes("start:3"));
+    await starts.get(3)?.promise;
     expect(events).toEqual(["start:1", "end:1", "start:2", "end:2", "start:3"]);
 
     releases.get(3)?.resolve();
-    await waitFor(() => queue.running === false);
+    await idle.promise;
     expect(events).toEqual(["start:1", "end:1", "start:2", "end:2", "start:3", "end:3"]);
     expect(maxActive).toBe(1);
+    expect(queue.running).toBe(false);
   });
 });

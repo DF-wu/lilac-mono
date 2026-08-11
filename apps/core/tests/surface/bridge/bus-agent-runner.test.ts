@@ -1,4 +1,4 @@
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, jest } from "bun:test";
 import path from "node:path";
 import { mkdir, mkdtemp, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -1783,20 +1783,30 @@ describe("agent run activity", () => {
       },
     });
 
-    watchdog.start();
-    // test-wait-justification: advances part of the real idle deadline before resetting the watchdog
-    await Bun.sleep(30);
-    watchdog.reset();
+    jest.useFakeTimers({ now: 0 });
+    try {
+      watchdog.start();
+      jest.advanceTimersByTime(30);
+      watchdog.reset();
 
-    // test-wait-justification: keeps the watched operation active across the reset idle window
-    await expect(watchdog.waitFor(Bun.sleep(30).then(() => "resolved"))).resolves.toBe("resolved");
-    watchdog.stop();
-    // test-wait-justification: verifies no stale watchdog deadline fires after the watched operation completes
-    await Bun.sleep(20);
-    expect(timeoutCount).toBe(0);
+      // test-wait-justification: schedules the watched operation on Bun's fake clock
+      const operation = new Promise<string>((resolve) => {
+        setTimeout(() => resolve("resolved"), 30);
+      });
+      const watched = watchdog.waitFor(operation);
+      jest.advanceTimersByTime(30);
+
+      await expect(watched).resolves.toBe("resolved");
+      watchdog.stop();
+      jest.advanceTimersByTime(20);
+      expect(timeoutCount).toBe(0);
+    } finally {
+      watchdog.stop();
+      jest.useRealTimers();
+    }
   });
 
-  it("can pause between separately raced operations", async () => {
+  it("can pause between separately raced operations", () => {
     let timeoutCount = 0;
     const watchdog = createAgentRunIdleWatchdog({
       idleTimeoutMs: 20,
@@ -1805,27 +1815,35 @@ describe("agent run activity", () => {
       },
     });
 
-    watchdog.start();
-    watchdog.pause();
-    // test-wait-justification: crosses the real idle deadline while watchdog timing is paused
-    await Bun.sleep(30);
+    jest.useFakeTimers({ now: 0 });
+    try {
+      watchdog.start();
+      watchdog.pause();
+      jest.advanceTimersByTime(30);
 
-    expect(timeoutCount).toBe(0);
-    watchdog.stop();
+      expect(timeoutCount).toBe(0);
+    } finally {
+      watchdog.stop();
+      jest.useRealTimers();
+    }
   });
 
-  it("does not clamp large idle deadlines to an immediate timer", async () => {
+  it("does not clamp large idle deadlines to an immediate timer", () => {
     let timeoutCount = 0;
     const timer = createIdleTimer(30 * 24 * 60 * 60 * 1000, () => {
       timeoutCount += 1;
     });
 
-    timer.reset();
-    // test-wait-justification: verifies a very large real idle deadline is not clamped to an immediate timer
-    await Bun.sleep(10);
+    jest.useFakeTimers({ now: 0 });
+    try {
+      timer.reset();
+      jest.advanceTimersByTime(10);
 
-    expect(timeoutCount).toBe(0);
-    timer.stop();
+      expect(timeoutCount).toBe(0);
+    } finally {
+      timer.stop();
+      jest.useRealTimers();
+    }
   });
 
   it("publishes throttled activity on the request output topic", async () => {

@@ -1,5 +1,5 @@
 import { workflowStoreValue } from "./workflow-store-test-helpers";
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, jest } from "bun:test";
 import path from "node:path";
 import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -1253,20 +1253,29 @@ describe("workflow subagent convergence", () => {
       store,
       subscriptionId: "test-live-parent-protected",
     });
-    await bridge.enableOrphanHandling({
-      protectedParentRequestIds: ["parent:restored"],
-      protectionMs: 20,
-    });
-    expect(workflowStoreValue(store.getRun(run.runId))?.progressTarget).toBeNull();
-    const parent = bridge.registerParent({ parentRequestId: "parent:restored" });
-    // test-wait-justification: crosses the restored-parent protection window to verify fallback remains suppressed
-    await Bun.sleep(30);
-    expect(workflowStoreValue(store.getRun(run.runId))?.progressTarget).toBeNull();
-    expect(store.getLiveParentDeliveryState(run.runId)).toBe("pending");
-    expect(parent.listPending()).toHaveLength(1);
-    await parent.close();
-    await bridge.stop();
-    await bus.close();
-    store.close();
+    let parent: ReturnType<typeof bridge.registerParent> | undefined;
+    jest.useFakeTimers();
+    try {
+      await bridge.enableOrphanHandling({
+        protectedParentRequestIds: ["parent:restored"],
+        protectionMs: 20,
+      });
+      expect(workflowStoreValue(store.getRun(run.runId))?.progressTarget).toBeNull();
+      parent = bridge.registerParent({ parentRequestId: "parent:restored" });
+      await parent.ready;
+      jest.advanceTimersByTime(30);
+      expect(workflowStoreValue(store.getRun(run.runId))?.progressTarget).toBeNull();
+      expect(store.getLiveParentDeliveryState(run.runId)).toBe("pending");
+      expect(parent.listPending()).toHaveLength(1);
+    } finally {
+      try {
+        await parent?.close();
+        await bridge.stop();
+        await bus.close();
+        store.close();
+      } finally {
+        jest.useRealTimers();
+      }
+    }
   });
 });

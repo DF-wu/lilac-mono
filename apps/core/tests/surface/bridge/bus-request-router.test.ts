@@ -1,4 +1,4 @@
-import { describe, expect, it, spyOn } from "bun:test";
+import { afterEach, describe, expect, it, jest, spyOn } from "bun:test";
 import { Panic, Result, TaggedError, type Result as ResultType } from "better-result";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -120,8 +120,67 @@ async function subscribeTopicForTest<TTopic extends LilacTopic>(
   options: SubscriptionOptions,
   handler: (message: DecodedLilacMessageForTopic<TTopic>) => Promise<ResultType<void, never>>,
 ) {
-  return expectStarted(await bus.subscribeTopic(topic, options, handler, () => "park-pending"));
+  const deliveryWaiters: PromiseWithResolvers<void>[] = [];
+  const subscription = expectStarted(
+    await bus.subscribeTopic(
+      topic,
+      options,
+      (message) => {
+        const result = handler(message);
+        void result.then(
+          () => deliveryWaiters.shift()?.resolve(),
+          () => deliveryWaiters.shift()?.resolve(),
+        );
+        return result;
+      },
+      () => "park-pending",
+    ),
+  );
+  return {
+    ...subscription,
+    waitForDelivery: () => {
+      const delivery = Promise.withResolvers<void>();
+      deliveryWaiters.push(delivery);
+      return delivery.promise;
+    },
+  };
 }
+
+async function triggerRouterDebounce(
+  trigger: () => Promise<unknown>,
+  completed: Promise<unknown>,
+  debounceMs = 5,
+): Promise<void> {
+  jest.useFakeTimers({ now: Date.now() });
+  try {
+    await trigger();
+    jest.advanceTimersByTime(debounceMs);
+    await completed;
+  } finally {
+    jest.useRealTimers();
+  }
+}
+
+function observeRouterDecision() {
+  const logger = new Logger({ module: "bus-request-router-decision-test" });
+  const decided = Promise.withResolvers<void>();
+  const resolveDecision = (message: unknown) => {
+    if (message === "router.route.decision") decided.resolve();
+  };
+  const info = spyOn(logger, "info").mockImplementation(resolveDecision);
+  const debug = spyOn(logger, "debug").mockImplementation(resolveDecision);
+  return {
+    logger,
+    decided: decided.promise.finally(() => {
+      info.mockRestore();
+      debug.mockRestore();
+    }),
+  };
+}
+
+afterEach(() => {
+  jest.useRealTimers();
+});
 
 function createInMemoryRawBus(): TestRawBus {
   const topics = new Map<string, Array<Message<unknown>>>();
@@ -1811,6 +1870,7 @@ describe("startBusRequestRouter", () => {
   it("skips active channel batch when gate returns forward=false", async () => {
     const raw = createInMemoryRawBus();
     const bus = createLilacBus(raw);
+    const decision = observeRouterDecision();
 
     const sessionId = "chan";
     const msgId = "m1";
@@ -1833,6 +1893,7 @@ describe("startBusRequestRouter", () => {
       adapter,
       bus,
       subscriptionId: "router-test",
+      logger: decision.logger,
       routerGate: async () => ({ forward: false, reason: "no" }),
       config: {
         surface: {
@@ -1878,21 +1939,22 @@ describe("startBusRequestRouter", () => {
       },
     );
 
-    await bus.publish(lilacEventTypes.EvtAdapterMessageCreated, {
-      platform: "discord",
-      channelId: sessionId,
-      messageId: msgId,
-      userId: "u1",
-      userName: "user1",
-      text: "hello there",
-      ts: now,
-      raw: {
-        discord: { isDMBased: false, mentionsBot: false, replyToBot: false },
-      },
-    });
-
-    // test-wait-justification: exercises the router's real debounce or gate deadline before observing delivery
-    await new Promise((r) => setTimeout(r, 30));
+    await triggerRouterDebounce(
+      () =>
+        bus.publish(lilacEventTypes.EvtAdapterMessageCreated, {
+          platform: "discord",
+          channelId: sessionId,
+          messageId: msgId,
+          userId: "u1",
+          userName: "user1",
+          text: "hello there",
+          ts: now,
+          raw: {
+            discord: { isDMBased: false, mentionsBot: false, replyToBot: false },
+          },
+        }),
+      decision.decided,
+    );
 
     expect(received.length).toBe(0);
 
@@ -1972,21 +2034,22 @@ describe("startBusRequestRouter", () => {
       },
     );
 
-    await bus.publish(lilacEventTypes.EvtAdapterMessageCreated, {
-      platform: "discord",
-      channelId: sessionId,
-      messageId: msgId,
-      userId: "u1",
-      userName: "user1",
-      text: "hello there",
-      ts: now,
-      raw: {
-        discord: { isDMBased: false, mentionsBot: false, replyToBot: false },
-      },
-    });
-
-    // test-wait-justification: exercises the router's real debounce or gate deadline before observing delivery
-    await new Promise((r) => setTimeout(r, 30));
+    await triggerRouterDebounce(
+      () =>
+        bus.publish(lilacEventTypes.EvtAdapterMessageCreated, {
+          platform: "discord",
+          channelId: sessionId,
+          messageId: msgId,
+          userId: "u1",
+          userName: "user1",
+          text: "hello there",
+          ts: now,
+          raw: {
+            discord: { isDMBased: false, mentionsBot: false, replyToBot: false },
+          },
+        }),
+      sub.waitForDelivery(),
+    );
 
     expect(received.length).toBe(1);
     expect(received[0].data.queue).toBe("prompt");
@@ -2070,21 +2133,22 @@ describe("startBusRequestRouter", () => {
       },
     );
 
-    await bus.publish(lilacEventTypes.EvtAdapterMessageCreated, {
-      platform: "discord",
-      channelId: sessionId,
-      messageId: msgId,
-      userId: "u1",
-      userName: "user1",
-      text: "hello there",
-      ts: now,
-      raw: {
-        discord: { isDMBased: false, mentionsBot: false, replyToBot: false },
-      },
-    });
-
-    // test-wait-justification: exercises the router's real debounce or gate deadline before observing delivery
-    await new Promise((r) => setTimeout(r, 30));
+    await triggerRouterDebounce(
+      () =>
+        bus.publish(lilacEventTypes.EvtAdapterMessageCreated, {
+          platform: "discord",
+          channelId: sessionId,
+          messageId: msgId,
+          userId: "u1",
+          userName: "user1",
+          text: "hello there",
+          ts: now,
+          raw: {
+            discord: { isDMBased: false, mentionsBot: false, replyToBot: false },
+          },
+        }),
+      sub.waitForDelivery(),
+    );
 
     expect(received.length).toBe(1);
     expect(received[0].data.queue).toBe("prompt");
@@ -2096,6 +2160,7 @@ describe("startBusRequestRouter", () => {
   it("skips active channel batch when gate is enabled per session", async () => {
     const raw = createInMemoryRawBus();
     const bus = createLilacBus(raw);
+    const decision = observeRouterDecision();
 
     const sessionId = "chan";
     const msgId = "m1";
@@ -2119,6 +2184,7 @@ describe("startBusRequestRouter", () => {
       adapter,
       bus,
       subscriptionId: "router-test",
+      logger: decision.logger,
       routerGate: async () => {
         called += 1;
         return { forward: false, reason: "no" };
@@ -2169,21 +2235,22 @@ describe("startBusRequestRouter", () => {
       },
     );
 
-    await bus.publish(lilacEventTypes.EvtAdapterMessageCreated, {
-      platform: "discord",
-      channelId: sessionId,
-      messageId: msgId,
-      userId: "u1",
-      userName: "user1",
-      text: "hello there",
-      ts: now,
-      raw: {
-        discord: { isDMBased: false, mentionsBot: false, replyToBot: false },
-      },
-    });
-
-    // test-wait-justification: exercises the router's real debounce or gate deadline before observing delivery
-    await new Promise((r) => setTimeout(r, 30));
+    await triggerRouterDebounce(
+      () =>
+        bus.publish(lilacEventTypes.EvtAdapterMessageCreated, {
+          platform: "discord",
+          channelId: sessionId,
+          messageId: msgId,
+          userId: "u1",
+          userName: "user1",
+          text: "hello there",
+          ts: now,
+          raw: {
+            discord: { isDMBased: false, mentionsBot: false, replyToBot: false },
+          },
+        }),
+      decision.decided,
+    );
 
     expect(called).toBe(1);
     expect(received.length).toBe(0);
@@ -2268,27 +2335,28 @@ describe("startBusRequestRouter", () => {
       },
     );
 
-    await bus.publish(lilacEventTypes.EvtAdapterMessageCreated, {
-      platform: "discord",
-      channelId: threadId,
-      messageId: msgId,
-      userId: "u1",
-      userName: "user1",
-      text: "thread hello",
-      ts: now,
-      raw: {
-        discord: {
-          isDMBased: false,
-          mentionsBot: false,
-          replyToBot: false,
-          parentChannelId,
-          guildId,
-        },
-      },
-    });
-
-    // test-wait-justification: exercises the router's real debounce or gate deadline before observing delivery
-    await new Promise((r) => setTimeout(r, 30));
+    await triggerRouterDebounce(
+      () =>
+        bus.publish(lilacEventTypes.EvtAdapterMessageCreated, {
+          platform: "discord",
+          channelId: threadId,
+          messageId: msgId,
+          userId: "u1",
+          userName: "user1",
+          text: "thread hello",
+          ts: now,
+          raw: {
+            discord: {
+              isDMBased: false,
+              mentionsBot: false,
+              replyToBot: false,
+              parentChannelId,
+              guildId,
+            },
+          },
+        }),
+      sub.waitForDelivery(),
+    );
 
     expect(received.length).toBe(1);
     expect(received[0].data.queue).toBe("prompt");
@@ -2379,27 +2447,28 @@ describe("startBusRequestRouter", () => {
       },
     );
 
-    await bus.publish(lilacEventTypes.EvtAdapterMessageCreated, {
-      platform: "discord",
-      channelId: threadId,
-      messageId: msgId,
-      userId: "u1",
-      userName: "user1",
-      text: "thread hello",
-      ts: now,
-      raw: {
-        discord: {
-          isDMBased: false,
-          mentionsBot: false,
-          replyToBot: false,
-          parentChannelId,
-          guildId,
-        },
-      },
-    });
-
-    // test-wait-justification: exercises the router's real debounce or gate deadline before observing delivery
-    await new Promise((r) => setTimeout(r, 30));
+    await triggerRouterDebounce(
+      () =>
+        bus.publish(lilacEventTypes.EvtAdapterMessageCreated, {
+          platform: "discord",
+          channelId: threadId,
+          messageId: msgId,
+          userId: "u1",
+          userName: "user1",
+          text: "thread hello",
+          ts: now,
+          raw: {
+            discord: {
+              isDMBased: false,
+              mentionsBot: false,
+              replyToBot: false,
+              parentChannelId,
+              guildId,
+            },
+          },
+        }),
+      sub.waitForDelivery(),
+    );
 
     expect(received.length).toBe(1);
     expect(received[0].data.queue).toBe("prompt");
@@ -2413,6 +2482,7 @@ describe("startBusRequestRouter", () => {
   it("uses thread override instead of parent channel session mode", async () => {
     const raw = createInMemoryRawBus();
     const bus = createLilacBus(raw);
+    const decision = observeRouterDecision();
 
     const parentChannelId = "parent-chan";
     const threadId = "thread-1";
@@ -2435,6 +2505,7 @@ describe("startBusRequestRouter", () => {
       adapter,
       bus,
       subscriptionId: "router-test",
+      logger: decision.logger,
       config: {
         surface: {
           discord: {
@@ -2482,26 +2553,27 @@ describe("startBusRequestRouter", () => {
       },
     );
 
-    await bus.publish(lilacEventTypes.EvtAdapterMessageCreated, {
-      platform: "discord",
-      channelId: threadId,
-      messageId: msgId,
-      userId: "u1",
-      userName: "user1",
-      text: "thread hello",
-      ts: now,
-      raw: {
-        discord: {
-          isDMBased: false,
-          mentionsBot: false,
-          replyToBot: false,
-          parentChannelId,
-        },
-      },
-    });
-
-    // test-wait-justification: exercises the router's real debounce or gate deadline before observing delivery
-    await new Promise((r) => setTimeout(r, 30));
+    await triggerRouterDebounce(
+      () =>
+        bus.publish(lilacEventTypes.EvtAdapterMessageCreated, {
+          platform: "discord",
+          channelId: threadId,
+          messageId: msgId,
+          userId: "u1",
+          userName: "user1",
+          text: "thread hello",
+          ts: now,
+          raw: {
+            discord: {
+              isDMBased: false,
+              mentionsBot: false,
+              replyToBot: false,
+              parentChannelId,
+            },
+          },
+        }),
+      decision.decided,
+    );
 
     expect(received.length).toBe(0);
 
@@ -2584,26 +2656,27 @@ describe("startBusRequestRouter", () => {
       },
     );
 
-    await bus.publish(lilacEventTypes.EvtAdapterMessageCreated, {
-      platform: "discord",
-      channelId: threadId,
-      messageId: msgId,
-      userId: "u1",
-      userName: "user1",
-      text: "thread hello",
-      ts: now,
-      raw: {
-        discord: {
-          isDMBased: false,
-          mentionsBot: false,
-          replyToBot: false,
-          parentChannelId,
-        },
-      },
-    });
-
-    // test-wait-justification: exercises the router's real debounce or gate deadline before observing delivery
-    await new Promise((r) => setTimeout(r, 30));
+    await triggerRouterDebounce(
+      () =>
+        bus.publish(lilacEventTypes.EvtAdapterMessageCreated, {
+          platform: "discord",
+          channelId: threadId,
+          messageId: msgId,
+          userId: "u1",
+          userName: "user1",
+          text: "thread hello",
+          ts: now,
+          raw: {
+            discord: {
+              isDMBased: false,
+              mentionsBot: false,
+              replyToBot: false,
+              parentChannelId,
+            },
+          },
+        }),
+      sub.waitForDelivery(),
+    );
 
     expect(received.length).toBe(1);
     expect(received[0].data.raw?.sessionMode).toBe("active");
@@ -2682,21 +2755,22 @@ describe("startBusRequestRouter", () => {
       },
     );
 
-    await bus.publish(lilacEventTypes.EvtAdapterMessageCreated, {
-      platform: "discord",
-      channelId: sessionId,
-      messageId: msgId,
-      userId: "u1",
-      userName: "user1",
-      text: "hello there",
-      ts: now,
-      raw: {
-        discord: { isDMBased: false, mentionsBot: false, replyToBot: false },
-      },
-    });
-
-    // test-wait-justification: exercises the router's real debounce or gate deadline before observing delivery
-    await new Promise((r) => setTimeout(r, 30));
+    await triggerRouterDebounce(
+      () =>
+        bus.publish(lilacEventTypes.EvtAdapterMessageCreated, {
+          platform: "discord",
+          channelId: sessionId,
+          messageId: msgId,
+          userId: "u1",
+          userName: "user1",
+          text: "hello there",
+          ts: now,
+          raw: {
+            discord: { isDMBased: false, mentionsBot: false, replyToBot: false },
+          },
+        }),
+      sub.waitForDelivery(),
+    );
 
     expect(received.length).toBe(1);
     expect(received[0].data.queue).toBe("prompt");
@@ -2778,26 +2852,27 @@ describe("startBusRequestRouter", () => {
       },
     );
 
-    await bus.publish(lilacEventTypes.EvtAdapterMessageCreated, {
-      platform: "discord",
-      channelId: threadId,
-      messageId: msgId,
-      userId: "u1",
-      userName: "user1",
-      text: "thread hello",
-      ts: now,
-      raw: {
-        discord: {
-          isDMBased: false,
-          mentionsBot: false,
-          replyToBot: false,
-          parentChannelId,
-        },
-      },
-    });
-
-    // test-wait-justification: exercises the router's real debounce or gate deadline before observing delivery
-    await new Promise((r) => setTimeout(r, 30));
+    await triggerRouterDebounce(
+      () =>
+        bus.publish(lilacEventTypes.EvtAdapterMessageCreated, {
+          platform: "discord",
+          channelId: threadId,
+          messageId: msgId,
+          userId: "u1",
+          userName: "user1",
+          text: "thread hello",
+          ts: now,
+          raw: {
+            discord: {
+              isDMBased: false,
+              mentionsBot: false,
+              replyToBot: false,
+              parentChannelId,
+            },
+          },
+        }),
+      sub.waitForDelivery(),
+    );
 
     expect(received.length).toBe(1);
     expect(received[0].data.queue).toBe("prompt");
@@ -2811,6 +2886,7 @@ describe("startBusRequestRouter", () => {
   it("passes previous-message context to active channel gate", async () => {
     const raw = createInMemoryRawBus();
     const bus = createLilacBus(raw);
+    const decision = observeRouterDecision();
 
     const sessionId = "chan";
     const prevId = "m0";
@@ -2843,6 +2919,7 @@ describe("startBusRequestRouter", () => {
       adapter,
       bus,
       subscriptionId: "router-test",
+      logger: decision.logger,
       routerGate: async (input) => {
         gateInput = input;
         return { forward: false, reason: "no" };
@@ -2891,21 +2968,22 @@ describe("startBusRequestRouter", () => {
       },
     );
 
-    await bus.publish(lilacEventTypes.EvtAdapterMessageCreated, {
-      platform: "discord",
-      channelId: sessionId,
-      messageId: msgId,
-      userId: "u1",
-      userName: "user1",
-      text: "hello there",
-      ts: now,
-      raw: {
-        discord: { isDMBased: false, mentionsBot: false, replyToBot: false },
-      },
-    });
-
-    // test-wait-justification: exercises the router's real debounce or gate deadline before observing delivery
-    await new Promise((r) => setTimeout(r, 30));
+    await triggerRouterDebounce(
+      () =>
+        bus.publish(lilacEventTypes.EvtAdapterMessageCreated, {
+          platform: "discord",
+          channelId: sessionId,
+          messageId: msgId,
+          userId: "u1",
+          userName: "user1",
+          text: "hello there",
+          ts: now,
+          raw: {
+            discord: { isDMBased: false, mentionsBot: false, replyToBot: false },
+          },
+        }),
+      decision.decided,
+    );
 
     expect(received.length).toBe(0);
     expect(gateInput).not.toBeNull();
@@ -3011,9 +3089,6 @@ describe("startBusRequestRouter", () => {
         discord: { isDMBased: false, mentionsBot: false, replyToBot: false },
       },
     });
-
-    // test-wait-justification: exercises the router's real debounce or gate deadline before observing delivery
-    await new Promise((r) => setTimeout(r, 20));
 
     expect(gateCalled).toBe(0);
     expect(received.length).toBe(1);
@@ -3122,9 +3197,6 @@ describe("startBusRequestRouter", () => {
       },
     });
 
-    // test-wait-justification: exercises the router's real debounce or gate deadline before observing delivery
-    await new Promise((r) => setTimeout(r, 20));
-
     expect(gateCalled).toBe(0);
     expect(received.length).toBe(1);
     expect(received[0].headers?.request_id).toBe(`discord:${sessionId}:${msgId}`);
@@ -3219,26 +3291,27 @@ describe("startBusRequestRouter", () => {
       },
     );
 
-    await bus.publish(lilacEventTypes.EvtAdapterMessageCreated, {
-      platform: "discord",
-      channelId: sessionId,
-      messageId: msgId,
-      userId: "u1",
-      userName: "user1",
-      text: "!cont=1 resume please",
-      ts: now,
-      raw: {
-        discord: {
-          isDMBased: false,
-          mentionsBot: false,
-          replyToBot: false,
-          replyToMessageId: repliedToId,
-        },
-      },
-    });
-
-    // test-wait-justification: exercises the router's real debounce or gate deadline before observing delivery
-    await new Promise((r) => setTimeout(r, 20));
+    await triggerRouterDebounce(
+      () =>
+        bus.publish(lilacEventTypes.EvtAdapterMessageCreated, {
+          platform: "discord",
+          channelId: sessionId,
+          messageId: msgId,
+          userId: "u1",
+          userName: "user1",
+          text: "!cont=1 resume please",
+          ts: now,
+          raw: {
+            discord: {
+              isDMBased: false,
+              mentionsBot: false,
+              replyToBot: false,
+              replyToMessageId: repliedToId,
+            },
+          },
+        }),
+      sub.waitForDelivery(),
+    );
 
     expect(gateCalled).toBe(1);
     expect(received.length).toBe(1);
@@ -3456,9 +3529,6 @@ describe("startBusRequestRouter", () => {
       },
     });
 
-    // test-wait-justification: exercises the router's real debounce or gate deadline before observing delivery
-    await new Promise((r) => setTimeout(r, 20));
-
     expect(received).toHaveLength(1);
     const firstRequestId = String(received[0]?.headers?.request_id);
     expect(firstRequestId.startsWith("discord:")).toBe(false);
@@ -3475,25 +3545,26 @@ describe("startBusRequestRouter", () => {
       },
     );
 
-    await bus.publish(lilacEventTypes.EvtAdapterMessageCreated, {
-      platform: "discord",
-      channelId: sessionId,
-      messageId: secondId,
-      userId: "u1",
-      userName: "user1",
-      text: "plain follow-up",
-      ts: now,
-      raw: {
-        discord: {
-          isDMBased: false,
-          mentionsBot: false,
-          replyToBot: false,
-        },
-      },
-    });
-
-    // test-wait-justification: exercises the router's real debounce or gate deadline before observing delivery
-    await new Promise((r) => setTimeout(r, 30));
+    await triggerRouterDebounce(
+      () =>
+        bus.publish(lilacEventTypes.EvtAdapterMessageCreated, {
+          platform: "discord",
+          channelId: sessionId,
+          messageId: secondId,
+          userId: "u1",
+          userName: "user1",
+          text: "plain follow-up",
+          ts: now,
+          raw: {
+            discord: {
+              isDMBased: false,
+              mentionsBot: false,
+              replyToBot: false,
+            },
+          },
+        }),
+      sub.waitForDelivery(),
+    );
 
     expect(received.length).toBe(2);
     const secondUserText = collectUserText(received[1].data.messages as ModelMessage[]);
@@ -8071,42 +8142,41 @@ describe("startBusRequestRouter", () => {
       },
     );
 
-    await bus.publish(lilacEventTypes.EvtAdapterMessageCreated, {
-      platform: "discord",
-      channelId: sessionId,
-      messageId: firstMsgId,
-      userId: "u1",
-      userName: "user1",
-      text: "!m:sonnet write a short haiku",
-      ts: Date.now(),
-      raw: {
-        discord: {
-          isDMBased: false,
-          mentionsBot: false,
-          replyToBot: false,
+    await triggerRouterDebounce(async () => {
+      await bus.publish(lilacEventTypes.EvtAdapterMessageCreated, {
+        platform: "discord",
+        channelId: sessionId,
+        messageId: firstMsgId,
+        userId: "u1",
+        userName: "user1",
+        text: "!m:sonnet write a short haiku",
+        ts: Date.now(),
+        raw: {
+          discord: {
+            isDMBased: false,
+            mentionsBot: false,
+            replyToBot: false,
+          },
         },
-      },
-    });
+      });
 
-    await bus.publish(lilacEventTypes.EvtAdapterMessageCreated, {
-      platform: "discord",
-      channelId: sessionId,
-      messageId: secondMsgId,
-      userId: "u1",
-      userName: "user1",
-      text: "about shipping code",
-      ts: Date.now() + 1,
-      raw: {
-        discord: {
-          isDMBased: false,
-          mentionsBot: false,
-          replyToBot: false,
+      await bus.publish(lilacEventTypes.EvtAdapterMessageCreated, {
+        platform: "discord",
+        channelId: sessionId,
+        messageId: secondMsgId,
+        userId: "u1",
+        userName: "user1",
+        text: "about shipping code",
+        ts: Date.now() + 1,
+        raw: {
+          discord: {
+            isDMBased: false,
+            mentionsBot: false,
+            replyToBot: false,
+          },
         },
-      },
-    });
-
-    // test-wait-justification: exercises the router's real debounce or gate deadline before observing delivery
-    await new Promise((r) => setTimeout(r, 20));
+      });
+    }, sub.waitForDelivery());
 
     expect(received.length).toBe(1);
     expect(received[0].data.modelOverride).toBe("sonnet");
@@ -8197,42 +8267,41 @@ describe("startBusRequestRouter", () => {
       },
     );
 
-    await bus.publish(lilacEventTypes.EvtAdapterMessageCreated, {
-      platform: "discord",
-      channelId: sessionId,
-      messageId: firstMsgId,
-      userId: "u1",
-      userName: "user1",
-      text: "!model:sonnet write a short haiku",
-      ts: Date.now(),
-      raw: {
-        discord: {
-          isDMBased: false,
-          mentionsBot: false,
-          replyToBot: false,
+    await triggerRouterDebounce(async () => {
+      await bus.publish(lilacEventTypes.EvtAdapterMessageCreated, {
+        platform: "discord",
+        channelId: sessionId,
+        messageId: firstMsgId,
+        userId: "u1",
+        userName: "user1",
+        text: "!model:sonnet write a short haiku",
+        ts: Date.now(),
+        raw: {
+          discord: {
+            isDMBased: false,
+            mentionsBot: false,
+            replyToBot: false,
+          },
         },
-      },
-    });
+      });
 
-    await bus.publish(lilacEventTypes.EvtAdapterMessageCreated, {
-      platform: "discord",
-      channelId: sessionId,
-      messageId: secondMsgId,
-      userId: "u1",
-      userName: "user1",
-      text: "about shipping code",
-      ts: Date.now() + 1,
-      raw: {
-        discord: {
-          isDMBased: false,
-          mentionsBot: false,
-          replyToBot: false,
+      await bus.publish(lilacEventTypes.EvtAdapterMessageCreated, {
+        platform: "discord",
+        channelId: sessionId,
+        messageId: secondMsgId,
+        userId: "u1",
+        userName: "user1",
+        text: "about shipping code",
+        ts: Date.now() + 1,
+        raw: {
+          discord: {
+            isDMBased: false,
+            mentionsBot: false,
+            replyToBot: false,
+          },
         },
-      },
-    });
-
-    // test-wait-justification: exercises the router's real debounce or gate deadline before observing delivery
-    await new Promise((r) => setTimeout(r, 20));
+      });
+    }, sub.waitForDelivery());
 
     expect(received.length).toBe(1);
     expect(received[0].data.modelOverride).toBe("sonnet");
@@ -8347,9 +8416,6 @@ describe("startBusRequestRouter", () => {
       },
     });
 
-    // test-wait-justification: exercises the router's real debounce or gate deadline before observing delivery
-    await new Promise((r) => setTimeout(r, 10));
-
     expect(received.length).toBe(1);
     expect(received[0].type).toBe(lilacEventTypes.CmdRequestMessage);
 
@@ -8360,6 +8426,7 @@ describe("startBusRequestRouter", () => {
   it("fails closed for active-batch gate errors", async () => {
     const raw = createInMemoryRawBus();
     const bus = createLilacBus(raw);
+    const decision = observeRouterDecision();
 
     const sessionId = "chan-fail-closed";
     const msgId = "m1";
@@ -8381,6 +8448,7 @@ describe("startBusRequestRouter", () => {
       adapter,
       bus,
       subscriptionId: "router-test-fail-closed",
+      logger: decision.logger,
       routerGate: async () => {
         throw new Error("batch gate failed");
       },
@@ -8430,21 +8498,22 @@ describe("startBusRequestRouter", () => {
       },
     );
 
-    await bus.publish(lilacEventTypes.EvtAdapterMessageCreated, {
-      platform: "discord",
-      channelId: sessionId,
-      messageId: msgId,
-      userId: "u1",
-      userName: "user1",
-      text: "hello there",
-      ts: now,
-      raw: {
-        discord: { isDMBased: false, mentionsBot: false, replyToBot: false },
-      },
-    });
-
-    // test-wait-justification: exercises the router's real debounce or gate deadline before observing delivery
-    await new Promise((r) => setTimeout(r, 20));
+    await triggerRouterDebounce(
+      () =>
+        bus.publish(lilacEventTypes.EvtAdapterMessageCreated, {
+          platform: "discord",
+          channelId: sessionId,
+          messageId: msgId,
+          userId: "u1",
+          userName: "user1",
+          text: "hello there",
+          ts: now,
+          raw: {
+            discord: { isDMBased: false, mentionsBot: false, replyToBot: false },
+          },
+        }),
+      decision.decided,
+    );
 
     expect(received.length).toBe(0);
 

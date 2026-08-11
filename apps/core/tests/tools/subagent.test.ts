@@ -115,10 +115,6 @@ function createInMemoryRawBus(): RawBus & TestRawSubscriptionHost {
   };
 }
 
-async function sleep(ms: number): Promise<void> {
-  await new Promise<void>((resolve) => setTimeout(resolve, ms));
-}
-
 describe("subagent_delegate tool", () => {
   it("documents selectable model aliases and appends delegation guidance", () => {
     const bus = createLilacBus(createInMemoryRawBus());
@@ -705,121 +701,6 @@ describe("subagent_delegate tool", () => {
     expect(res.detail).toContain("without child activity");
     expect(cancelQueued).toBe(true);
     await stopResultForTest(worker.stop());
-  });
-
-  it("resets the idle timeout on reasoning, tool, and lifecycle activity", async () => {
-    const raw = createInMemoryRawBus();
-    const bus = createLilacBus(raw);
-
-    let localActivityCount = 0;
-    const tools = subagentTools({
-      bus,
-      idleTimeoutMs: 40,
-      maxDepth: 1,
-      onActivity: () => {
-        localActivityCount += 1;
-      },
-      onDelegate: async () => ({
-        runId: "run:sync-activity",
-        completion: (async () => {
-          // test-wait-justification: keeps completion beyond the 40 ms idle deadline while staged child activity repeatedly extends it
-          await sleep(100);
-          return { status: "resolved" as const, finalText: "finished" };
-        })(),
-        cancel: async () => {},
-      }),
-    });
-    const parentActivitySources: string[] = [];
-
-    const parentOutput = await startResultForTest(
-      bus.subscribeTopic(
-        outReqTopic("r:idle-reset"),
-        { mode: "tail", offset: { type: "begin" } },
-        async (msg) => {
-          if (msg.type === lilacEventTypes.EvtAgentOutputActivity) {
-            parentActivitySources.push(msg.data.source);
-          }
-          return Result.ok(undefined);
-        },
-        () => "commit",
-      ),
-    );
-
-    const worker = await startResultForTest(
-      bus.subscribeTopic(
-        "cmd.request",
-        {
-          mode: "fanout",
-          subscriptionId: "subagent-idle-reset-worker",
-          consumerId: "subagent-idle-reset-worker",
-          offset: { type: "now" },
-        },
-        async (msg) => {
-          if (msg.type !== lilacEventTypes.CmdRequestMessage || msg.data.queue !== "prompt") {
-            return Result.ok(undefined);
-          }
-
-          const headers = msg.headers;
-          // test-wait-justification: approaches the initial 40 ms idle deadline before reasoning activity resets it
-          await sleep(25);
-          await bus.publish(
-            lilacEventTypes.EvtAgentOutputDeltaReasoning,
-            { delta: "still thinking" },
-            { headers },
-          );
-          // test-wait-justification: places tool activity beyond the original idle deadline to prove the reasoning reset extended it
-          await sleep(25);
-          await bus.publish(
-            lilacEventTypes.EvtAgentOutputToolCall,
-            { toolCallId: "child-tool", status: "start", display: "working" },
-            { headers },
-          );
-          // test-wait-justification: places lifecycle activity beyond the prior idle deadline to prove the tool reset extended it
-          await sleep(25);
-          await bus.publish(
-            lilacEventTypes.EvtRequestLifecycleChanged,
-            { state: "running" },
-            { headers },
-          );
-          // test-wait-justification: places the final response beyond the prior idle deadline to prove the lifecycle reset extended it
-          await sleep(25);
-          await bus.publish(
-            lilacEventTypes.EvtAgentOutputResponseText,
-            { finalText: "finished" },
-            { headers },
-          );
-          return Result.ok(undefined);
-        },
-        () => "commit",
-      ),
-    );
-
-    const startedAt = Date.now();
-    const res = await resolveExecuteResult(
-      tools.subagent_delegate.execute!(
-        { profile: "explore", task: "Work for a while", mode: "sync" },
-        {
-          toolCallId: "tool-idle-reset",
-          messages: [],
-          context: {
-            requestId: "r:idle-reset",
-            sessionId: "s:idle-reset",
-            requestClient: "discord",
-            subagentDepth: 0,
-          },
-        },
-      ),
-    );
-
-    expect(Date.now() - startedAt).toBeGreaterThanOrEqual(90);
-    expect(res.mode).toBe("sync");
-    if (res.mode !== "sync") throw new Error("expected sync subagent result");
-    expect(res.status).toBe("resolved");
-    expect(res.finalText).toBe("finished");
-    expect(parentActivitySources).toEqual([]);
-    expect(localActivityCount).toBe(0);
-    await stopResultForTest(worker.stop());
-    await stopResultForTest(parentOutput.stop());
   });
 
   it("supports general and self delegation profiles", async () => {

@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, jest } from "bun:test";
 import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
@@ -2084,6 +2084,7 @@ describe("createToolServer", () => {
   });
 
   it("times out tool calls and marks wedged calls unhealthy", async () => {
+    const started = Promise.withResolvers<void>();
     const tool: ServerTool = {
       id: "hang",
       async init() {},
@@ -2100,54 +2101,67 @@ describe("createToolServer", () => {
         ];
       },
       async call() {
+        started.resolve();
         return await new Promise(() => {});
       },
     };
 
-    const server = createToolServer({
-      tools: [tool],
-      toolCallTimeouts: {
-        defaultTimeoutMs: 20,
-      },
-      healthConfig: {
-        eventLoopLagFailMs: 60_000,
-        maxRssBytes: Number.MAX_SAFE_INTEGER,
-        toolCallOverdueGraceMs: 10,
-      },
-    });
-
-    await server.init();
-    await server.start(0);
-
-    const callRes = await server.app.handle(
-      new Request("http://localhost/call", {
-        method: "POST",
-        headers: {
-          "content-type": "application/json",
+    jest.useFakeTimers({ now: 0 });
+    let server: ReturnType<typeof createToolServer> | undefined;
+    try {
+      server = createToolServer({
+        tools: [tool],
+        toolCallTimeouts: {
+          defaultTimeoutMs: 20,
         },
-        body: JSON.stringify({
-          callableId: "hang.forever",
-          input: {},
+        healthConfig: {
+          eventLoopLagFailMs: 60_000,
+          maxRssBytes: Number.MAX_SAFE_INTEGER,
+          toolCallOverdueGraceMs: 10,
+        },
+      });
+      await server.init();
+      await server.start(0);
+
+      const callResponse = server.app.handle(
+        new Request("http://localhost/call", {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+          },
+          body: JSON.stringify({
+            callableId: "hang.forever",
+            input: {},
+          }),
         }),
-      }),
-    );
-    expect(callRes.status).toBe(200);
-    expect(await callRes.json()).toEqual({
-      isError: true,
-      output: "Tool call timed out after 20ms",
-    });
+      );
+      await started.promise;
+      jest.advanceTimersByTime(20);
 
-    // test-wait-justification: crosses the overdue grace period after the real tool-call timeout fires
-    await Bun.sleep(20);
+      const callRes = await callResponse;
+      expect(callRes.status).toBe(200);
+      expect(await callRes.json()).toEqual({
+        isError: true,
+        output: "Tool call timed out after 20ms",
+      });
 
-    const healthRes = await server.app.handle(new Request("http://localhost/healthz"));
-    expect(healthRes.status).toBe(503);
-    const healthBody = (await healthRes.json()) as {
-      checks: Array<{ name: string; ok: boolean }>;
-    };
-    expect(healthBody.checks.find((check) => check.name === "tool-calls.overdue")?.ok).toBe(false);
+      jest.advanceTimersByTime(11);
 
-    await server.stop();
+      const healthRes = await server.app.handle(new Request("http://localhost/healthz"));
+      expect(healthRes.status).toBe(503);
+      const healthBody = (await healthRes.json()) as {
+        checks: Array<{ name: string; ok: boolean }>;
+      };
+      expect(healthBody.checks.find((check) => check.name === "tool-calls.overdue")?.ok).toBe(
+        false,
+      );
+    } finally {
+      try {
+        await server?.stop();
+      } finally {
+        jest.useRealTimers();
+      }
+    }
   });
 
   it("reports an immediate Level 2 Panic to the fatal supervisor", async () => {
@@ -2199,6 +2213,7 @@ describe("createToolServer", () => {
 
   it("invokes the fatal supervisor for a late Panic without changing the timeout response", async () => {
     const panic = new Panic({ message: "late tool invariant" });
+    const started = Promise.withResolvers<void>();
     const observed = Promise.withResolvers<Panic>();
     let fatalReports = 0;
     const tool: ServerTool = {
@@ -2218,38 +2233,51 @@ describe("createToolServer", () => {
       async call(_callableId, _input, options) {
         return await new Promise((_resolve, reject) => {
           options?.signal?.addEventListener("abort", () => reject(panic), { once: true });
+          started.resolve();
         });
       },
     };
-    const server = createToolServer({
-      tools: [tool],
-      toolCallTimeouts: { defaultTimeoutMs: 10 },
-      reportFatalToolCallDefect: (reported) => {
-        fatalReports += 1;
-        if (Panic.is(reported)) observed.resolve(reported);
-      },
-    });
+    jest.useFakeTimers({ now: 0 });
+    let server: ReturnType<typeof createToolServer> | undefined;
+    try {
+      server = createToolServer({
+        tools: [tool],
+        toolCallTimeouts: { defaultTimeoutMs: 10 },
+        reportFatalToolCallDefect: (reported) => {
+          fatalReports += 1;
+          if (Panic.is(reported)) observed.resolve(reported);
+        },
+      });
+      await server.init();
+      const responsePromise = server.app.handle(
+        new Request("http://localhost/call", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ callableId: "late-panic.call", input: {} }),
+        }),
+      );
+      await started.promise;
+      jest.advanceTimersByTime(10);
 
-    await server.init();
-    // test-wait-justification: verifies Panic observation after the real tool-call deadline wins
-    const response = await server.app.handle(
-      new Request("http://localhost/call", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ callableId: "late-panic.call", input: {} }),
-      }),
-    );
-    expect(await response.json()).toEqual({
-      isError: true,
-      output: "Tool call timed out after 10ms",
-    });
-    expect(await observed.promise).toBe(panic);
-    expect(fatalReports).toBe(1);
-    await server.stop();
+      const response = await responsePromise;
+      expect(await response.json()).toEqual({
+        isError: true,
+        output: "Tool call timed out after 10ms",
+      });
+      expect(await observed.promise).toBe(panic);
+      expect(fatalReports).toBe(1);
+    } finally {
+      try {
+        await server?.stop();
+      } finally {
+        jest.useRealTimers();
+      }
+    }
   });
 
   it("reports a late non-Panic rejection to the fatal supervisor", async () => {
     const defect = new Error("late logging defect");
+    const started = Promise.withResolvers<void>();
     const observed = Promise.withResolvers<unknown>();
     const chunks: string[] = [];
     const output = { write: (chunk: string) => chunks.push(chunk) };
@@ -2285,34 +2313,47 @@ describe("createToolServer", () => {
             () => reject(new Error("expected plugin cancellation failure")),
             { once: true },
           );
+          started.resolve();
         });
       },
     };
-    const server = createToolServer({
-      tools: [tool],
-      logger,
-      toolCallTimeouts: { defaultTimeoutMs: 10 },
-      reportFatalToolCallDefect: observed.resolve,
-    });
+    jest.useFakeTimers({ now: 0 });
+    let server: ReturnType<typeof createToolServer> | undefined;
+    try {
+      server = createToolServer({
+        tools: [tool],
+        logger,
+        toolCallTimeouts: { defaultTimeoutMs: 10 },
+        reportFatalToolCallDefect: observed.resolve,
+      });
+      await server.init();
+      const responsePromise = server.app.handle(
+        new Request("http://localhost/call", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ callableId: "late-error.call", input: {} }),
+        }),
+      );
+      await started.promise;
+      jest.advanceTimersByTime(10);
 
-    await server.init();
-    // test-wait-justification: verifies non-Panic defect observation after the real tool-call deadline
-    const response = await server.app.handle(
-      new Request("http://localhost/call", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ callableId: "late-error.call", input: {} }),
-      }),
-    );
-    expect(await response.json()).toEqual({
-      isError: true,
-      output: "Tool call timed out after 10ms",
-    });
-    expect(await observed.promise).toMatchObject({ message: defect.message });
-    await server.stop();
+      const response = await responsePromise;
+      expect(await response.json()).toEqual({
+        isError: true,
+        output: "Tool call timed out after 10ms",
+      });
+      expect(await observed.promise).toMatchObject({ message: defect.message });
+    } finally {
+      try {
+        await server?.stop();
+      } finally {
+        jest.useRealTimers();
+      }
+    }
   });
 
   it("does not report an ordinary Level 2 completion after timeout", async () => {
+    const started = Promise.withResolvers<void>();
     const release = Promise.withResolvers<void>();
     const settled = Promise.withResolvers<void>();
     let fatalReports = 0;
@@ -2331,37 +2372,50 @@ describe("createToolServer", () => {
         ];
       },
       async call() {
+        started.resolve();
         await release.promise;
         settled.resolve();
         return { late: true };
       },
     };
-    const server = createToolServer({
-      tools: [tool],
-      toolCallTimeouts: { defaultTimeoutMs: 10 },
-      reportFatalToolCallDefect: () => {
-        fatalReports += 1;
-      },
-    });
+    jest.useFakeTimers({ now: 0 });
+    let server: ReturnType<typeof createToolServer> | undefined;
+    try {
+      server = createToolServer({
+        tools: [tool],
+        toolCallTimeouts: { defaultTimeoutMs: 10 },
+        reportFatalToolCallDefect: () => {
+          fatalReports += 1;
+        },
+      });
+      await server.init();
+      const responsePromise = server.app.handle(
+        new Request("http://localhost/call", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ callableId: "late-success.call", input: {} }),
+        }),
+      );
+      await started.promise;
+      jest.advanceTimersByTime(10);
 
-    await server.init();
-    // test-wait-justification: verifies ordinary completion after the real tool-call deadline
-    const response = await server.app.handle(
-      new Request("http://localhost/call", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ callableId: "late-success.call", input: {} }),
-      }),
-    );
-    expect(await response.json()).toEqual({
-      isError: true,
-      output: "Tool call timed out after 10ms",
-    });
-    release.resolve();
-    await settled.promise;
-    await Promise.resolve();
-    expect(fatalReports).toBe(0);
-    await server.stop();
+      const response = await responsePromise;
+      expect(await response.json()).toEqual({
+        isError: true,
+        output: "Tool call timed out after 10ms",
+      });
+      release.resolve();
+      await settled.promise;
+      await Promise.resolve();
+      expect(fatalReports).toBe(0);
+    } finally {
+      release.resolve();
+      try {
+        await server?.stop();
+      } finally {
+        jest.useRealTimers();
+      }
+    }
   });
 
   it("leaves internal result-orchestration defects on the framework error path", async () => {
@@ -2433,54 +2487,60 @@ describe("createToolServer", () => {
       },
     };
 
-    const server = createToolServer({
-      tools: [tool],
-      toolCallTimeouts: {
-        defaultTimeoutMs: 20,
-      },
-      healthConfig: {
-        eventLoopLagFailMs: 60_000,
-        maxRssBytes: Number.MAX_SAFE_INTEGER,
-        toolCallOverdueGraceMs: 10,
-      },
-    });
-
-    await server.init();
-    await server.start(0);
-
-    const callRes = await server.app.handle(
-      new Request("http://localhost/call", {
-        method: "POST",
-        headers: {
-          "content-type": "application/json",
+    jest.useFakeTimers({ now: 0 });
+    let server: ReturnType<typeof createToolServer> | undefined;
+    try {
+      server = createToolServer({
+        tools: [tool],
+        toolCallTimeouts: {
+          defaultTimeoutMs: 20,
         },
-        body: JSON.stringify({
-          callableId: "sync-throw.fail",
-          input: {},
+        healthConfig: {
+          eventLoopLagFailMs: 60_000,
+          maxRssBytes: Number.MAX_SAFE_INTEGER,
+          toolCallOverdueGraceMs: 10,
+        },
+      });
+      await server.init();
+      await server.start(0);
+
+      const callRes = await server.app.handle(
+        new Request("http://localhost/call", {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+          },
+          body: JSON.stringify({
+            callableId: "sync-throw.fail",
+            input: {},
+          }),
         }),
-      }),
-    );
-    expect(await callRes.json()).toEqual({
-      isError: true,
-      output: "sync boom",
-    });
+      );
+      expect(await callRes.json()).toEqual({
+        isError: true,
+        output: "sync boom",
+      });
 
-    // test-wait-justification: crosses the timeout and overdue grace window to detect leaked synchronous failures
-    await Bun.sleep(40);
+      jest.advanceTimersByTime(31);
 
-    const healthRes = await server.app.handle(new Request("http://localhost/healthz"));
-    const healthBody = (await healthRes.json()) as {
-      checks: Array<{ name: string; ok: boolean }>;
-      info: {
-        toolServer: {
-          activeCalls: unknown[];
+      const healthRes = await server.app.handle(new Request("http://localhost/healthz"));
+      const healthBody = (await healthRes.json()) as {
+        checks: Array<{ name: string; ok: boolean }>;
+        info: {
+          toolServer: {
+            activeCalls: unknown[];
+          };
         };
       };
-    };
-    expect(healthBody.checks.find((check) => check.name === "tool-calls.overdue")?.ok).toBe(true);
-    expect(healthBody.info.toolServer.activeCalls).toEqual([]);
-
-    await server.stop();
+      expect(healthBody.checks.find((check) => check.name === "tool-calls.overdue")?.ok).toBe(true);
+      expect(healthBody.info.toolServer.activeCalls).toEqual([]);
+    } finally {
+      try {
+        await server?.stop();
+      } finally {
+        jest.useRealTimers();
+      }
+    }
   });
 
   it("wraps external TaggedErrors without returning or logging their causes or secrets", async () => {
