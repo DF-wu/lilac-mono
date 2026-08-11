@@ -270,11 +270,10 @@ function adapterDeliveryPolicy(error: BusRequestRouterRoutingError): DeliveryDis
 
 async function captureRouterRouting(
   topic: "evt.request" | "evt.adapter",
-  operation: () => Promise<void>,
+  operation: () => Promise<void | ResultType<void, BusRequestRouterRoutingError>>,
 ): Promise<ResultType<void, BusRequestRouterRoutingError>> {
   try {
-    await operation();
-    return Result.ok(undefined);
+    return (await operation()) ?? Result.ok(undefined);
   } catch (cause) {
     if (isPanic(cause)) throw cause;
     return Result.err(
@@ -1253,7 +1252,7 @@ export async function startDiscordRequestRouter(
             return;
           }
 
-          await handleMentionMode({
+          return handleMentionMode({
             adapter,
             bus,
             cfg,
@@ -1305,21 +1304,20 @@ export async function startDiscordRequestRouter(
     sessionMode: SessionMode;
     modelOverride?: string;
     item: PendingMentionReplyBatchItem;
-  }): Promise<void> {
+  }): Promise<ResultType<void, BusRequestRouterRoutingError>> {
     const existing = pendingMentionReplyBatchBySession.get(input.sessionId);
     if (existing && existing.sourceRequestId !== input.sourceRequestId) {
       const flushed = await flushPendingMentionReplyBatchAsFollowUp({
         sessionId: input.sessionId,
         sourceRequestId: existing.sourceRequestId,
       });
-      if (!flushed && pendingMentionReplyBatchBySession.get(input.sessionId) === existing) {
-        pendingMentionReplyBatchBySession.delete(input.sessionId);
-      }
+      if (flushed.status === "error") return flushed;
     }
     enqueuePendingMentionReplyBatchImpl({
       pendingMentionReplyBatchBySession,
       input,
     });
+    return Result.ok(undefined);
   }
 
   function takePendingMentionReplyBatch(input: {
@@ -1341,9 +1339,9 @@ export async function startDiscordRequestRouter(
   async function flushPendingMentionReplyBatchAsFollowUp(input: {
     sessionId: string;
     sourceRequestId: string;
-  }): Promise<boolean> {
+  }): Promise<ResultType<void, BusRequestRouterRoutingError>> {
     const batch = pendingMentionReplyBatchBySession.get(input.sessionId);
-    if (!batch || batch.sourceRequestId !== input.sourceRequestId) return true;
+    if (!batch || batch.sourceRequestId !== input.sourceRequestId) return Result.ok(undefined);
 
     while (batch.items.length > 0) {
       const item = batch.items[0]!;
@@ -1361,14 +1359,22 @@ export async function startDiscordRequestRouter(
         modelOverride: batch.modelOverride,
         transformUserText: transformPendingUserText(item),
       });
-      if (!published) return false;
+      if (published.status === "error") {
+        return Result.err(
+          new BusRequestRouterRoutingError({
+            topic: "evt.adapter",
+            cause: published.error,
+            message: "Bus request router failed while handling evt.adapter",
+          }),
+        );
+      }
       batch.items.shift();
     }
 
     if (pendingMentionReplyBatchBySession.get(input.sessionId) === batch) {
       pendingMentionReplyBatchBySession.delete(input.sessionId);
     }
-    return true;
+    return Result.ok(undefined);
   }
 
   async function flushPendingMentionReplyBatchAsPrompt(input: {
@@ -2264,7 +2270,7 @@ export async function startDiscordRequestRouter(
     requestModelOverride?: string;
     continueCount?: number;
     botMentionNames: readonly string[];
-  }) {
+  }): Promise<ResultType<void, BusRequestRouterRoutingError>> {
     const {
       adapter,
       bus,
@@ -2308,7 +2314,7 @@ export async function startDiscordRequestRouter(
         reason: "mention_mode_non_trigger",
         activeRequestId: active?.requestId,
       });
-      return;
+      return Result.ok(undefined);
     }
 
     const requestId = formatDiscordMessageRequestId({
@@ -2337,7 +2343,7 @@ export async function startDiscordRequestRouter(
         ),
         transformUserTextForMessageId: msgRef.messageId,
       });
-      return;
+      return Result.ok(undefined);
     }
 
     // Special case: if the user is replying to the currently active output message chain,
@@ -2394,8 +2400,9 @@ export async function startDiscordRequestRouter(
           sessionId,
           sourceRequestId: active.requestId,
         });
+        return Result.ok(undefined);
       } else {
-        await enqueuePendingMentionReplyBatch({
+        return enqueuePendingMentionReplyBatch({
           sessionId,
           sourceRequestId: active.requestId,
           sessionConfigId: input.sessionConfigId,
@@ -2410,7 +2417,6 @@ export async function startDiscordRequestRouter(
           },
         });
       }
-      return;
     }
 
     if (!active) {
@@ -2442,6 +2448,7 @@ export async function startDiscordRequestRouter(
       ),
       transformUserTextForMessageId: msgRef.messageId,
     });
+    return Result.ok(undefined);
   }
 
   async function publishBusRequest(input: PublishBusRequestInput) {
@@ -2519,7 +2526,7 @@ export async function startDiscordRequestRouter(
 
   async function publishSingleMessageToActiveRequest(
     input: PublishSingleMessageToActiveRequestLocalInput,
-  ): Promise<boolean> {
+  ) {
     const { adapter, bus, cfg, ...requestInput } = input;
     const published = await publishSingleMessageToActiveRequestImpl({
       adapter,
@@ -2535,9 +2542,8 @@ export async function startDiscordRequestRouter(
         sessionId: input.sessionId,
         error: "Core owned blob integrity check failed",
       });
-      return false;
     }
-    return true;
+    return published;
   }
 
   type PublishSingleMessagePromptLocalInput = Parameters<

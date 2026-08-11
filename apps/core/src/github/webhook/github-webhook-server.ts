@@ -18,10 +18,11 @@ import {
   listIssueComments,
 } from "../github-api";
 import {
-  clearGithubAck,
+  claimGithubAcknowledgement,
   getGithubLatestRequestForSession,
-  getGithubAck,
   getGithubRequestMeta,
+  restoreGithubLatestRequestForSession,
+  rollbackGithubAcknowledgementClaim,
   setGithubAck,
   setGithubLatestRequestForSession,
   setGithubRequestMeta,
@@ -374,16 +375,25 @@ function newGithubRequestId(input: {
   return input.suffix ? `${base}:${input.suffix}` : base;
 }
 
-export function transferGithubAcknowledgement(
-  previousRequestId: string | undefined,
-  requestId: string,
-): boolean {
-  if (!previousRequestId || previousRequestId === requestId) return false;
-  const acknowledgement = getGithubAck(previousRequestId);
-  if (!acknowledgement) return false;
-  setGithubAck(requestId, acknowledgement);
-  clearGithubAck(previousRequestId);
-  return true;
+const githubSessionOperationTails = new Map<string, Promise<void>>();
+
+async function runGithubSessionOperation<T>(
+  sessionId: string,
+  operation: () => Promise<T>,
+): Promise<T> {
+  const previous = githubSessionOperationTails.get(sessionId);
+  const gate = Promise.withResolvers<void>();
+  githubSessionOperationTails.set(sessionId, gate.promise);
+  if (previous) await previous;
+
+  try {
+    return await operation();
+  } finally {
+    gate.resolve();
+    if (githubSessionOperationTails.get(sessionId) === gate.promise) {
+      githubSessionOperationTails.delete(sessionId);
+    }
+  }
 }
 
 export async function startGithubWebhookServer(options: GithubWebhookOptions): Promise<{
@@ -792,91 +802,102 @@ async function onReviewRequested(input: {
   if (!owner || !repo) return null;
 
   const sessionId = `${input.repoFullName}#${prNumber}`;
-  const requestId = newGithubRequestId({
-    sessionId,
-    triggerId: String(prNumber),
-    suffix: headSha.slice(0, 8),
-  });
-  const previousRequestId = getGithubLatestRequestForSession(sessionId);
-  const acknowledgementTransferred = transferGithubAcknowledgement(previousRequestId, requestId);
+  return runGithubSessionOperation(sessionId, async () => {
+    const requestId = newGithubRequestId({
+      sessionId,
+      triggerId: String(prNumber),
+      suffix: headSha.slice(0, 8),
+    });
+    const previousRequestId = getGithubLatestRequestForSession(sessionId);
+    const acknowledgementClaim = claimGithubAcknowledgement(previousRequestId, requestId);
+    const latestTransition = setGithubLatestRequestForSession(sessionId, requestId);
+    let startupCompleted = false;
 
-  input.logger.info("github trigger: review_requested", {
-    repo: input.repoFullName,
-    prNumber,
-    requestedLogin,
-    requestId,
-  });
-
-  // Ack quickly on the PR description (issue).
-  if (!acknowledgementTransferred) {
-    const ack = await captureGithubWebhookOperation("review acknowledgement", () =>
-      addEyesReactionToIssue({ owner, repo, issueNumber: prNumber }),
-    );
-    if (ack.status === "ok") {
-      setGithubAck(requestId, {
-        target: { kind: "issue", issueNumber: prNumber },
-        reactionId: ack.value,
+    try {
+      input.logger.info("github trigger: review_requested", {
+        repo: input.repoFullName,
+        prNumber,
+        requestedLogin,
+        requestId,
       });
-    } else {
-      input.logger.warn("failed to add eyes reaction", formatTaggedErrorForLog(ack.error));
+
+      // Ack quickly on the PR description (issue).
+      if (acknowledgementClaim.kind === "unclaimed") {
+        const ack = await captureGithubWebhookOperation("review acknowledgement", () =>
+          addEyesReactionToIssue({ owner, repo, issueNumber: prNumber }),
+        );
+        if (ack.status === "ok") {
+          setGithubAck(requestId, {
+            target: { kind: "issue", issueNumber: prNumber },
+            reactionId: ack.value,
+          });
+        } else {
+          input.logger.warn("failed to add eyes reaction", formatTaggedErrorForLog(ack.error));
+        }
+      }
+
+      const prData = await getPullRequest({ owner, repo, number: prNumber });
+
+      const prompt = buildPrReviewPrompt({
+        repoFullName: input.repoFullName,
+        prNumber,
+        prTitle: prData.title,
+        prBody: prData.body ?? null,
+        prUrl: prData.html_url,
+        headSha: prData.head.sha,
+      });
+
+      const messages: ModelMessage[] = [{ role: "user", content: prompt }];
+
+      setGithubRequestMeta({
+        requestId,
+        sessionId,
+        repoFullName: input.repoFullName,
+        issueNumber: prNumber,
+        trigger: { kind: "issue", issueNumber: prNumber },
+        createdAtMs: Date.now(),
+        pr: { prNumber, headSha: prData.head.sha, mode: "review" },
+      });
+
+      adaptEventPublishResultToHost(
+        await input.bus.publish(
+          lilacEventTypes.CmdRequestMessage,
+          {
+            queue: "prompt",
+            messages,
+            raw: {
+              authenticatedActor: {
+                platform: "github",
+                userId: typeof senderLogin === "string" ? senderLogin : undefined,
+              },
+              github: {
+                repoFullName: input.repoFullName,
+                prNumber,
+                headSha: prData.head.sha,
+                trigger: { kind: "issue", issueNumber: prNumber },
+                mode: "review",
+              },
+            },
+          },
+          {
+            headers: {
+              request_id: requestId,
+              session_id: sessionId,
+              request_client: "github",
+            },
+          },
+        ),
+      );
+
+      startupCompleted = true;
+      return requestId;
+    } finally {
+      if (!startupCompleted) {
+        rollbackGithubAcknowledgementClaim(acknowledgementClaim);
+        restoreGithubLatestRequestForSession(latestTransition);
+      }
     }
-  }
-
-  const prData = await getPullRequest({ owner, repo, number: prNumber });
-
-  const prompt = buildPrReviewPrompt({
-    repoFullName: input.repoFullName,
-    prNumber,
-    prTitle: prData.title,
-    prBody: prData.body ?? null,
-    prUrl: prData.html_url,
-    headSha: prData.head.sha,
   });
-
-  const messages: ModelMessage[] = [{ role: "user", content: prompt }];
-
-  setGithubLatestRequestForSession(sessionId, requestId);
-  setGithubRequestMeta({
-    requestId,
-    sessionId,
-    repoFullName: input.repoFullName,
-    issueNumber: prNumber,
-    trigger: { kind: "issue", issueNumber: prNumber },
-    createdAtMs: Date.now(),
-    pr: { prNumber, headSha: prData.head.sha, mode: "review" },
-  });
-
-  adaptEventPublishResultToHost(
-    await input.bus.publish(
-      lilacEventTypes.CmdRequestMessage,
-      {
-        queue: "prompt",
-        messages,
-        raw: {
-          authenticatedActor: {
-            platform: "github",
-            userId: typeof senderLogin === "string" ? senderLogin : undefined,
-          },
-          github: {
-            repoFullName: input.repoFullName,
-            prNumber,
-            headSha: prData.head.sha,
-            trigger: { kind: "issue", issueNumber: prNumber },
-            mode: "review",
-          },
-        },
-      },
-      {
-        headers: {
-          request_id: requestId,
-          session_id: sessionId,
-          request_client: "github",
-        },
-      },
-    ),
-  );
-
-  return requestId;
 }
 
 async function onPullRequestSynchronize(input: {
@@ -889,118 +910,127 @@ async function onPullRequestSynchronize(input: {
   const headSha = input.payload.pull_request.head.sha;
 
   const sessionId = `${input.repoFullName}#${prNumber}`;
-  const latest = getGithubLatestRequestForSession(sessionId);
-  if (!latest) return null;
-  const meta = getGithubRequestMeta(latest);
-  if (!meta?.pr || meta.pr.mode !== "review") return null;
+  return runGithubSessionOperation(sessionId, async () => {
+    const latest = getGithubLatestRequestForSession(sessionId);
+    if (!latest) return null;
+    const meta = getGithubRequestMeta(latest);
+    if (!meta?.pr || meta.pr.mode !== "review") return null;
 
-  const ageMs = Date.now() - meta.createdAtMs;
-  if (ageMs > 30 * 60 * 1000) {
-    // Avoid surprise reruns long after a review completed.
-    return null;
-  }
+    const ageMs = Date.now() - meta.createdAtMs;
+    if (ageMs > 30 * 60 * 1000) {
+      // Avoid surprise reruns long after a review completed.
+      return null;
+    }
 
-  if (meta.pr.headSha === headSha) return null;
+    if (meta.pr.headSha === headSha) return null;
 
-  input.logger.info("github pr updated mid-review; restarting", {
-    repo: input.repoFullName,
-    prNumber,
-    prevSha: meta.pr.headSha,
-    nextSha: headSha,
-    prevRequestId: meta.requestId,
-  });
+    input.logger.info("github pr updated mid-review; restarting", {
+      repo: input.repoFullName,
+      prNumber,
+      prevSha: meta.pr.headSha,
+      nextSha: headSha,
+      prevRequestId: meta.requestId,
+    });
 
-  const [owner, repo] = input.repoFullName.split("/");
-  if (!owner || !repo) return null;
+    const [owner, repo] = input.repoFullName.split("/");
+    if (!owner || !repo) return null;
 
-  const requestId = newGithubRequestId({
-    sessionId,
-    triggerId: String(prNumber),
-    suffix: headSha.slice(0, 8),
-  });
+    const requestId = newGithubRequestId({
+      sessionId,
+      triggerId: String(prNumber),
+      suffix: headSha.slice(0, 8),
+    });
 
-  transferGithubAcknowledgement(meta.requestId, requestId);
+    const prData = await getPullRequest({ owner, repo, number: prNumber });
+    const prompt = buildPrReviewPrompt({
+      repoFullName: input.repoFullName,
+      prNumber,
+      prTitle: prData.title,
+      prBody: prData.body ?? null,
+      prUrl: prData.html_url,
+      headSha: prData.head.sha,
+    });
 
-  // Immediately treat the new request as the latest to suppress any stale output.
-  setGithubLatestRequestForSession(sessionId, requestId);
+    const messages: ModelMessage[] = [{ role: "user", content: prompt }];
 
-  // Cancel the in-flight request to unblock the session queue ASAP.
-  // This message is only applied if the request is currently active.
-  adaptEventPublishResultToHost(
-    await input.bus.publish(
-      lilacEventTypes.CmdRequestMessage,
-      {
-        queue: "interrupt",
-        messages: [
+    const acknowledgementClaim = claimGithubAcknowledgement(meta.requestId, requestId);
+
+    // Immediately treat the new request as the latest to suppress any stale output.
+    const latestTransition = setGithubLatestRequestForSession(sessionId, requestId);
+    let replacementPublished = false;
+
+    try {
+      setGithubRequestMeta({
+        requestId,
+        sessionId,
+        repoFullName: input.repoFullName,
+        issueNumber: prNumber,
+        trigger: { kind: "issue", issueNumber: prNumber },
+        createdAtMs: Date.now(),
+        pr: { prNumber, headSha: prData.head.sha, mode: "review" },
+      });
+
+      adaptEventPublishResultToHost(
+        await input.bus.publish(
+          lilacEventTypes.CmdRequestMessage,
           {
-            role: "user",
-            content:
-              "Branch updated (new commits pushed). Cancel the current review immediately and stop producing output.",
+            queue: "prompt",
+            messages,
+            raw: {
+              github: {
+                repoFullName: input.repoFullName,
+                prNumber,
+                headSha: prData.head.sha,
+                trigger: { kind: "issue", issueNumber: prNumber },
+                mode: "review",
+                restartedFrom: meta.requestId,
+              },
+            },
           },
-        ],
-        raw: { cancel: true, requiresActive: true },
-      },
-      {
-        headers: {
-          request_id: meta.requestId,
-          session_id: sessionId,
-          request_client: "github",
-        },
-      },
-    ),
-  );
-
-  // Keep the 👀 reaction as the "in progress" indicator.
-  // Fetch updated PR info for better prompt stability.
-  const prData = await getPullRequest({ owner, repo, number: prNumber });
-  const prompt = buildPrReviewPrompt({
-    repoFullName: input.repoFullName,
-    prNumber,
-    prTitle: prData.title,
-    prBody: prData.body ?? null,
-    prUrl: prData.html_url,
-    headSha: prData.head.sha,
-  });
-
-  const messages: ModelMessage[] = [{ role: "user", content: prompt }];
-
-  setGithubLatestRequestForSession(sessionId, requestId);
-  setGithubRequestMeta({
-    requestId,
-    sessionId,
-    repoFullName: input.repoFullName,
-    issueNumber: prNumber,
-    trigger: { kind: "issue", issueNumber: prNumber },
-    createdAtMs: Date.now(),
-    pr: { prNumber, headSha: prData.head.sha, mode: "review" },
-  });
-
-  adaptEventPublishResultToHost(
-    await input.bus.publish(
-      lilacEventTypes.CmdRequestMessage,
-      {
-        queue: "prompt",
-        messages,
-        raw: {
-          github: {
-            repoFullName: input.repoFullName,
-            prNumber,
-            headSha: prData.head.sha,
-            trigger: { kind: "issue", issueNumber: prNumber },
-            mode: "review",
-            restartedFrom: meta.requestId,
+          {
+            headers: {
+              request_id: requestId,
+              session_id: sessionId,
+              request_client: "github",
+            },
           },
-        },
-      },
-      {
-        headers: {
-          request_id: requestId,
-          session_id: sessionId,
-          request_client: "github",
-        },
-      },
-    ),
-  );
+        ),
+      );
 
-  return requestId;
+      // Once the replacement is durable, retaining its ownership is safer than reviving stale output.
+      replacementPublished = true;
+
+      // This interrupt is only applied if the old request is still active.
+      adaptEventPublishResultToHost(
+        await input.bus.publish(
+          lilacEventTypes.CmdRequestMessage,
+          {
+            queue: "interrupt",
+            messages: [
+              {
+                role: "user",
+                content:
+                  "Branch updated (new commits pushed). Cancel the current review immediately and stop producing output.",
+              },
+            ],
+            raw: { cancel: true, requiresActive: true },
+          },
+          {
+            headers: {
+              request_id: meta.requestId,
+              session_id: sessionId,
+              request_client: "github",
+            },
+          },
+        ),
+      );
+
+      return requestId;
+    } finally {
+      if (!replacementPublished) {
+        rollbackGithubAcknowledgementClaim(acknowledgementClaim);
+        restoreGithubLatestRequestForSession(latestTransition);
+      }
+    }
+  });
 }

@@ -48,7 +48,11 @@ import type {
   SurfaceSession,
 } from "../../../src/surface/types";
 
-import type { TranscriptStore } from "../../../src/transcript/transcript-store";
+import {
+  CoreOwnedBlobIntegrityError,
+  SqliteTranscriptStore,
+  type TranscriptStore,
+} from "../../../src/transcript/transcript-store";
 import type { ModelMessage } from "ai";
 
 type TestRawBus = RawBus & {
@@ -406,6 +410,10 @@ function collectUserText(messages: readonly ModelMessage[]): string {
     if (msg.role !== "user") continue;
     if (typeof msg.content === "string") {
       parts.push(msg.content);
+      continue;
+    }
+    for (const part of msg.content) {
+      if (part.type === "text") parts.push(part.text);
     }
   }
 
@@ -5587,6 +5595,284 @@ describe("startBusRequestRouter", () => {
 
     await sub.stop();
     await router.stop();
+  });
+
+  it("retains a source-handoff batch across typed composition failure and redelivery", async () => {
+    const raw = createInMemoryRawBus();
+    const bus = createLilacBus(raw);
+    const sessionId = "typed-composition-source-handoff";
+    const requestOne = `discord:${sessionId}:request-one`;
+    const requestTwo = `discord:${sessionId}:request-two`;
+    const outputOne = "output-one";
+    const outputTwo = "output-two";
+    const replyOneA = "reply-one-a";
+    const replyOneB = "reply-one-b";
+    const replyTwo = "reply-two";
+    const now = Date.now();
+    const adapter = new FakeAdapter({
+      [`${sessionId}:${outputOne}`]: {
+        ref: { platform: "discord", channelId: sessionId, messageId: outputOne },
+        session: { platform: "discord", channelId: sessionId },
+        userId: "bot",
+        text: "first output",
+        ts: now,
+        raw: { reference: {} },
+      },
+      [`${sessionId}:${replyOneA}`]: {
+        ref: { platform: "discord", channelId: sessionId, messageId: replyOneA },
+        session: { platform: "discord", channelId: sessionId },
+        userId: "user-one",
+        text: "first deferred reply A",
+        ts: now + 1,
+        raw: {
+          reference: { messageId: outputOne, channelId: sessionId },
+          discord: {
+            attachments: [
+              {
+                url: "https://cdn.discordapp.com/attachments/1/2/file.txt",
+                filename: "file.txt",
+              },
+            ],
+          },
+        },
+      },
+      [`${sessionId}:${replyOneB}`]: {
+        ref: { platform: "discord", channelId: sessionId, messageId: replyOneB },
+        session: { platform: "discord", channelId: sessionId },
+        userId: "user-one",
+        text: "first deferred reply B",
+        ts: now + 2,
+        raw: { reference: { messageId: outputOne, channelId: sessionId } },
+      },
+      [`${sessionId}:${outputTwo}`]: {
+        ref: { platform: "discord", channelId: sessionId, messageId: outputTwo },
+        session: { platform: "discord", channelId: sessionId },
+        userId: "bot",
+        text: "second output",
+        ts: now + 3,
+        raw: { reference: {} },
+      },
+      [`${sessionId}:${replyTwo}`]: {
+        ref: { platform: "discord", channelId: sessionId, messageId: replyTwo },
+        session: { platform: "discord", channelId: sessionId },
+        userId: "user-two",
+        text: "second deferred reply",
+        ts: now + 4,
+        raw: { reference: { messageId: outputTwo, channelId: sessionId } },
+      },
+    });
+    const transcriptStore = new SqliteTranscriptStore(":memory:");
+    const putCoreOwnedBlob = transcriptStore.putCoreOwnedBlob.bind(transcriptStore);
+    let failComposition = true;
+    const putCoreOwnedBlobStub = spyOn(transcriptStore, "putCoreOwnedBlob").mockImplementation(
+      (input) =>
+        failComposition
+          ? Result.err(new CoreOwnedBlobIntegrityError("forced typed composition failure"))
+          : putCoreOwnedBlob(input),
+    );
+    const fetchStub = spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response("attachment", { headers: { "content-type": "text/plain" } }),
+    );
+    const logger = new Logger({ module: "typed-composition-source-handoff-test" });
+    const debugStub = spyOn(logger, "debug").mockImplementation(() => undefined);
+    const infoStub = spyOn(logger, "info").mockImplementation(() => undefined);
+    const warnStub = spyOn(logger, "warn").mockImplementation(() => undefined);
+    const errorStub = spyOn(logger, "error").mockImplementation(() => undefined);
+    const router = await startBusRequestRouter({
+      adapter,
+      bus,
+      subscriptionId: "router-typed-composition-source-handoff",
+      transcriptStore,
+      logger,
+      config: {
+        surface: {
+          discord: {
+            tokenEnv: "DISCORD_TOKEN",
+            allowedChannelIds: [],
+            allowedGuildIds: [],
+            botName: "lilac",
+            outputMode: "inline",
+            previewFinalOutputStyle: "embed",
+          },
+          router: {
+            defaultMode: "mention",
+            sessionModes: {},
+            activeDebounceMs: 5,
+            activeGate: { enabled: true, timeoutMs: 2500 },
+          },
+        },
+        agent: { systemPrompt: "(unused in tests; compiled at runtime)" },
+        models: {
+          def: {},
+          main: { model: "openrouter/openai/gpt-4o" },
+          fast: { model: "openrouter/openai/gpt-4o-mini" },
+        },
+      },
+    });
+    const received: DecodedLilacMessageForTopic<"cmd.request">[] = [];
+    const sub = await subscribeTopicForTest(
+      bus,
+      "cmd.request",
+      {
+        mode: "fanout",
+        subscriptionId: "typed-composition-source-handoff-observer",
+        consumerId: "typed-composition-source-handoff-consumer",
+        offset: { type: "begin" },
+      },
+      async (message) => {
+        if (message.type === lilacEventTypes.CmdRequestMessage) received.push(message);
+        return Result.ok(undefined);
+      },
+    );
+    const publishLifecycle = async (requestId: string, state: "running" | "resolved") => {
+      await bus.publish(
+        lilacEventTypes.EvtRequestLifecycleChanged,
+        { state, ts: Date.now() },
+        {
+          headers: {
+            request_id: requestId,
+            session_id: sessionId,
+            request_client: "discord",
+          },
+        },
+      );
+    };
+    const publishOutput = async (requestId: string, messageId: string) => {
+      await bus.publish(
+        lilacEventTypes.EvtSurfaceOutputMessageCreated,
+        { msgRef: { platform: "discord", channelId: sessionId, messageId } },
+        {
+          headers: {
+            request_id: requestId,
+            session_id: sessionId,
+            request_client: "discord",
+          },
+        },
+      );
+    };
+    const publishReply = async (input: {
+      readonly messageId: string;
+      readonly outputMessageId: string;
+      readonly userId: string;
+      readonly text: string;
+      readonly ts: number;
+    }) => {
+      await bus.publish(lilacEventTypes.EvtAdapterMessageCreated, {
+        platform: "discord",
+        channelId: sessionId,
+        messageId: input.messageId,
+        userId: input.userId,
+        text: input.text,
+        ts: input.ts,
+        raw: {
+          discord: {
+            isDMBased: false,
+            mentionsBot: false,
+            replyToBot: true,
+            replyToMessageId: input.outputMessageId,
+          },
+        },
+      });
+    };
+
+    try {
+      await publishLifecycle(requestOne, "running");
+      await publishOutput(requestOne, outputOne);
+      await publishReply({
+        messageId: replyOneA,
+        outputMessageId: outputOne,
+        userId: "user-one",
+        text: "first deferred reply A",
+        ts: now + 1,
+      });
+      await publishReply({
+        messageId: replyOneB,
+        outputMessageId: outputOne,
+        userId: "user-one",
+        text: "first deferred reply B",
+        ts: now + 2,
+      });
+
+      await publishLifecycle(requestTwo, "running");
+      await publishOutput(requestTwo, outputTwo);
+      await publishReply({
+        messageId: replyTwo,
+        outputMessageId: outputTwo,
+        userId: "user-two",
+        text: "second deferred reply",
+        ts: now + 4,
+      });
+
+      expect(received).toHaveLength(0);
+      expect(
+        raw.deliveryActions
+          .filter(({ topic }) => topic === "evt.adapter")
+          .map(({ action }) => action.disposition)
+          .at(-1),
+      ).toBe("park-pending");
+
+      failComposition = false;
+      await publishReply({
+        messageId: replyTwo,
+        outputMessageId: outputTwo,
+        userId: "user-two",
+        text: "second deferred reply",
+        ts: now + 4,
+      });
+
+      expect(received).toHaveLength(2);
+      expect(
+        received.map((message) => ({
+          requestId: message.headers?.request_id,
+          queue: message.data.queue,
+          text: collectUserText(message.data.messages),
+        })),
+      ).toEqual([
+        {
+          requestId: requestOne,
+          queue: "followUp",
+          text: expect.stringContaining("first deferred reply A"),
+        },
+        {
+          requestId: requestOne,
+          queue: "followUp",
+          text: expect.stringContaining("first deferred reply B"),
+        },
+      ]);
+      expect(
+        raw.deliveryActions
+          .filter(({ topic }) => topic === "evt.adapter")
+          .map(({ action }) => action.disposition)
+          .slice(-2),
+      ).toEqual(["park-pending", "commit"]);
+
+      await publishLifecycle(requestTwo, "resolved");
+
+      expect(received).toHaveLength(3);
+      expect(received[2]?.headers?.request_id).toBe(`discord:${sessionId}:${replyTwo}`);
+      expect(received[2]?.data.queue).toBe("prompt");
+      expect(collectUserText(received[2]?.data.messages ?? [])).toContain("second deferred reply");
+      expect(
+        received.filter((message) =>
+          collectUserText(message.data.messages).includes("first deferred reply A"),
+        ),
+      ).toHaveLength(1);
+      expect(
+        received.filter((message) =>
+          collectUserText(message.data.messages).includes("first deferred reply B"),
+        ),
+      ).toHaveLength(1);
+    } finally {
+      await sub.stop();
+      await router.stop();
+      transcriptStore.close();
+      putCoreOwnedBlobStub.mockRestore();
+      fetchStub.mockRestore();
+      debugStub.mockRestore();
+      infoStub.mockRestore();
+      warnStub.mockRestore();
+      errorStub.mockRestore();
+    }
   });
 
   it("converts deferred mention-mode reply batch into followUps when steer arrives", async () => {
