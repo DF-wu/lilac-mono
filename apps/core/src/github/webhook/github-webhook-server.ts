@@ -276,6 +276,16 @@ export function parseIssueCommentTrigger(
   return null;
 }
 
+export function projectGithubAuthenticatedActor(
+  userId: string | undefined,
+):
+  | { readonly authenticatedActor: { readonly platform: "github"; readonly userId: string } }
+  | { readonly authenticatedActor?: never } {
+  return typeof userId === "string" && userId.length > 0
+    ? { authenticatedActor: { platform: "github" as const, userId } }
+    : {};
+}
+
 function buildIssuePrompt(input: {
   repoFullName: string;
   issueNumber: number;
@@ -745,10 +755,7 @@ async function onIssueCommentCreated(input: {
         queue: "prompt",
         messages,
         raw: {
-          authenticatedActor: {
-            platform: "github",
-            userId: typeof author === "string" ? author : undefined,
-          },
+          ...projectGithubAuthenticatedActor(typeof author === "string" ? author : undefined),
           github: {
             repoFullName: input.repoFullName,
             issueNumber,
@@ -866,10 +873,9 @@ async function onReviewRequested(input: {
             queue: "prompt",
             messages,
             raw: {
-              authenticatedActor: {
-                platform: "github",
-                userId: typeof senderLogin === "string" ? senderLogin : undefined,
-              },
+              ...projectGithubAuthenticatedActor(
+                typeof senderLogin === "string" ? senderLogin : undefined,
+              ),
               github: {
                 repoFullName: input.repoFullName,
                 prNumber,

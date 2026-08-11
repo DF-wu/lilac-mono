@@ -373,7 +373,8 @@ export class BusAgentRunnerAuthenticationProjectionInvalid extends TaggedError(
     | AuthenticatedRequestProjectionInvalid
     | RequestMessageCacheAdmissionError
     | RequestIdentitySourceMissing
-    | RequestIdentityAliasTargetOccupied;
+    | RequestIdentityAliasTargetOccupied
+    | AuthenticatedRequestProjectionInvalid;
   readonly message: string;
 }> {}
 
@@ -2792,6 +2793,7 @@ export async function startBusAgentRunner(params: {
     let identityError:
       | RequestIdentitySourceMissing
       | RequestIdentityAliasTargetOccupied
+      | AuthenticatedRequestProjectionInvalid
       | undefined;
     let intakeError: BusAgentRunnerOperationFailed | undefined;
     let parkPending = false;
@@ -3225,10 +3227,15 @@ export async function startBusAgentRunner(params: {
                 identityError = aliased.error;
                 return;
               }
+              const aliasProjection = aliased.value.projection;
               const queuedEntry: Enqueued = {
                 ...entry,
-                requestId: aliasRequestId,
+                requestId: aliasProjection.requestId,
+                sessionId: aliasProjection.sessionId,
+                requestClient: aliasProjection.requestClient,
                 queue: "prompt",
+                authenticatedOrigin: aliasProjection.authenticatedOrigin,
+                verifiedIngress: aliasProjection.verifiedIngress,
                 identityOwner: {
                   requestId: aliased.value.requestId,
                   ownerId: aliased.value.ownerId,

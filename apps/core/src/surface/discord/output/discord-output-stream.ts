@@ -593,10 +593,6 @@ async function safeEdit(msg: Message, options: Parameters<Message["edit"]>[0]): 
   return edited.status === "ok";
 }
 
-async function requiredEdit(msg: Message, options: Parameters<Message["edit"]>[0]): Promise<void> {
-  await msg.edit(options);
-}
-
 export class DiscordOutputStream implements SurfaceOutputStream {
   private readonly created: MsgRef[] = [];
   private readonly transientPreviewRefs: MsgRef[] = [];
@@ -985,7 +981,7 @@ export class DiscordOutputStream implements SurfaceOutputStream {
           // Replace the placeholder "Replying..." message with the first embed.
           // This keeps the reply target as the *user's* original message (instead of
           // creating a nested reply chain that replies to the placeholder).
-          await requiredEdit(first, {
+          await safeEdit(first, {
             content: "",
             embeds: [emb],
             components: buildCancelComponents(true),
@@ -1015,7 +1011,7 @@ export class DiscordOutputStream implements SurfaceOutputStream {
         getMaxLength,
         streamDone: this.done.promise,
         useSmartSplitting: this.deps.useSmartSplitting,
-        safeEdit: requiredEdit,
+        safeEdit,
         getFirstMessageEditExtras: (isStreaming) => ({
           components: isStreaming ? buildCancelComponents(true) : [],
         }),

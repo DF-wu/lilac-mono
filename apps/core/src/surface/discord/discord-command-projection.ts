@@ -25,10 +25,9 @@ export function toBusDiscordCommandInvokedData(
     ],
     ...(evt.modelOverride ? { modelOverride: evt.modelOverride } : {}),
     raw: {
-      authenticatedActor: {
-        platform: evt.platform,
-        userId: evt.userId,
-      },
+      ...(typeof evt.userId === "string" && evt.userId.length > 0
+        ? { authenticatedActor: { platform: evt.platform, userId: evt.userId } }
+        : {}),
       sessionMode: evt.sessionMode,
       sessionConfigId: evt.sessionConfigId,
       ...(evt.modelOverride ? { modelOverride: evt.modelOverride } : {}),

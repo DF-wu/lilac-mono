@@ -191,6 +191,13 @@ export function isAuthenticatedRequestProjectionSemanticallyValid(
   if (projection.requestClient === "discord") {
     if (projection.githubTrigger !== undefined || hasGithubTrigger) return false;
     const expectedVerified = hasOrigin || (hasActor && origin !== undefined);
+    const restrictedActorWithoutMessageProof =
+      hasActor &&
+      !hasOrigin &&
+      projection.messageRef === undefined &&
+      origin?.messageRef === undefined &&
+      projection.verifiedIngress === false;
+    if (restrictedActorWithoutMessageProof) return true;
     if (projection.verifiedIngress !== expectedVerified) return false;
     return true;
   }

@@ -1650,7 +1650,9 @@ export class DiscordAdapter implements SurfaceAdapter {
 
       if (!rel.reply_to_message_id) break;
 
-      currentChannelId = rel.reply_to_channel_id ?? rel.channel_id;
+      const replyChannelId = rel.reply_to_channel_id ?? rel.channel_id;
+      if (replyChannelId !== msgRef.channelId) break;
+      currentChannelId = replyChannelId;
       currentMessageId = rel.reply_to_message_id;
     }
 

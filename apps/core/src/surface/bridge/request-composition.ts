@@ -1121,6 +1121,22 @@ function applyDiscordSessionDividerCutoff(params: {
   return listOldestToNewest.slice(lastDividerIndex + 1);
 }
 
+function applyDiscordSessionDividerCutoffToReplyChain(params: {
+  chainOldestToNewest: readonly ReplyChainMessage[];
+  botUserId: string;
+}): ReplyChainMessage[] {
+  let lastDividerIndex = -1;
+  for (let i = 0; i < params.chainOldestToNewest.length; i++) {
+    const message = params.chainOldestToNewest[i]!;
+    if (message.authorId === params.botUserId && isDiscordSessionDividerText(message.text)) {
+      lastDividerIndex = i;
+    }
+  }
+  return lastDividerIndex < 0
+    ? [...params.chainOldestToNewest]
+    : params.chainOldestToNewest.slice(lastDividerIndex + 1);
+}
+
 async function findLastDiscordSessionDividerBefore(params: {
   adapter: SurfaceAdapter;
   channelId: string;
@@ -1373,20 +1389,17 @@ export async function composeRecentChannelMessages(
         if (anchoredResult.status === "error") return Result.err(anchoredResult.error);
         const anchored = anchoredResult.value;
 
-        const triggerIsReply = Boolean(toReplyChainMessage(triggerMsg).replyReference.messageId);
         const oldestAnchoredMessageId = anchored[0]?.messageId;
-        const dividerResult =
-          !triggerIsReply && oldestAnchoredMessageId
-            ? await findLastDiscordSessionDividerBefore({
-                adapter,
-                channelId: opts.sessionId,
-                botUserId: opts.botUserId,
-                beforeMessageId: triggerMsg.ref.messageId,
-                stopAtMessageId: oldestAnchoredMessageId,
-              })
-            : Result.ok(null);
-        if (dividerResult.status === "error") return Result.err(dividerResult.error);
-        const divider = dividerResult.value;
+        const dividerResult = oldestAnchoredMessageId
+          ? await findLastDiscordSessionDividerBefore({
+              adapter,
+              channelId: opts.sessionId,
+              botUserId: opts.botUserId,
+              beforeMessageId: triggerMsg.ref.messageId,
+              stopAtMessageId: oldestAnchoredMessageId,
+            })
+          : Result.ok(null);
+        const divider = dividerResult.status === "ok" ? dividerResult.value : null;
         const anchoredAfterDivider = divider
           ? anchored.filter(
               (message) =>
@@ -1396,9 +1409,10 @@ export async function composeRecentChannelMessages(
                 ) > 0,
             )
           : anchored;
-        const anchoredNoDivider = anchoredAfterDivider.filter(
-          (m) => !isDiscordSessionDividerText(m.text),
-        );
+        const anchoredNoDivider = applyDiscordSessionDividerCutoffToReplyChain({
+          chainOldestToNewest: anchoredAfterDivider,
+          botUserId: opts.botUserId,
+        }).filter((m) => !isDiscordSessionDividerText(m.text));
 
         const transformedAnchored = anchoredNoDivider.map((m) => {
           const targetMessageId = opts.transformUserTextForMessageId ?? triggerMsg.ref.messageId;

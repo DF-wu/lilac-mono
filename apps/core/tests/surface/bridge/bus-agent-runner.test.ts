@@ -4504,6 +4504,11 @@ describe("startBusAgentRunner production path", () => {
     const firstCallStarted = deferred<void>();
     const releaseFirstCall = deferred<void>();
     const createdSpecs: string[] = [];
+    const capabilityInputs: Array<
+      Parameters<
+        NonNullable<Parameters<typeof startBusAgentRunner>[0]["issueControlCapability"]>
+      >[0]
+    > = [];
     let activeCalls = 0;
     const runner = await startBusAgentRunner({
       bus,
@@ -4513,17 +4518,20 @@ describe("startBusAgentRunner production path", () => {
       pluginManager,
       requestMessageCache,
       resolveParentChannelId: (sessionId) => sessionId,
-      issueControlCapability: (input) => ({
-        capability: "test-capability",
-        principal: input.authenticatedOrigin
-          ? {
-              platform: input.authenticatedOrigin.platform,
-              userId: input.authenticatedOrigin.userId,
-            }
-          : null,
-        authenticatedOrigin: input.authenticatedOrigin ?? null,
-        safetyMode: input.safetyMode,
-      }),
+      issueControlCapability: (input) => {
+        capabilityInputs.push(input);
+        return {
+          capability: "test-capability",
+          principal: input.authenticatedOrigin
+            ? {
+                platform: input.authenticatedOrigin.platform,
+                userId: input.authenticatedOrigin.userId,
+              }
+            : null,
+          authenticatedOrigin: input.authenticatedOrigin ?? null,
+          safetyMode: input.safetyMode,
+        };
+      },
       createAgent: (options: AiSdkPiAgentOptions<ToolSet>) => {
         const spec = options.modelSpecifier ?? "unknown";
         createdSpecs.push(spec);
@@ -4612,6 +4620,20 @@ describe("startBusAgentRunner production path", () => {
       authenticatedPrincipal: { platform: "github", userId: "user-1" },
       authenticatedPrincipalSessionId: "session",
     });
+    expect(capabilityInputs).toHaveLength(2);
+    expect(capabilityInputs[0]?.authenticatedOrigin?.messageRef).toMatchObject({
+      messageId: "changed-message",
+    });
+    expect(capabilityInputs[1]).toMatchObject({
+      requestId: changedRequestId,
+      authenticatedOrigin: {
+        platform: "github",
+        userId: "user-1",
+        sessionRef: { platform: "github", channelId: "session" },
+      },
+      verifiedIngress: false,
+    });
+    expect(capabilityInputs[1]?.authenticatedOrigin?.messageRef).toBeUndefined();
 
     await activeLifecycle.stop();
     await changedLifecycle.stop();

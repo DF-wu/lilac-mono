@@ -166,7 +166,8 @@ function parseGithubThreadResult(
 ): SurfaceOperationResult<ReturnType<typeof parseGithubSessionId>> {
   try {
     return Result.ok(parseGithubSessionId(sessionRef.channelId));
-  } catch {
+  } catch (cause) {
+    if (Panic.is(cause)) throw cause;
     return Result.err(
       invalidInput(
         operation,

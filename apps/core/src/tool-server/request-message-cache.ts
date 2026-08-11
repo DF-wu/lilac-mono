@@ -5,6 +5,7 @@ import { Result, TaggedError, type Result as ResultType } from "better-result";
 import {
   AuthenticatedRequestIdentityConflict,
   AuthenticatedRequestProjectionInvalid,
+  isAuthenticatedRequestProjectionSemanticallyValid,
   latchAuthenticatedRequest,
   projectAuthenticatedRequest,
   type AuthenticatedRequestProjection,
@@ -51,7 +52,8 @@ export type RequestMessageCacheAdmissionError =
 
 export type RequestMessageCacheOwnerError =
   | RequestIdentitySourceMissing
-  | RequestIdentityAliasTargetOccupied;
+  | RequestIdentityAliasTargetOccupied
+  | AuthenticatedRequestProjectionInvalid;
 
 export type RequestMessageCacheOwner = {
   readonly requestId: string;
@@ -150,24 +152,36 @@ export function createRequestMessageCache(
     }
   }
 
-  function pruneMax(): void {
-    while (entries.size > maxEntries) {
+  function pruneMapToCapacity(target: Map<string, CacheEntry>): string[] {
+    const evicted: string[] = [];
+    while (target.size > maxEntries) {
       let oldestKey: string | undefined;
       let oldestUpdatedAt = Infinity;
-      for (const [requestId, entry] of entries) {
+      for (const [requestId, entry] of target) {
         if (isRetained(entry) || entry.updatedAt >= oldestUpdatedAt) continue;
         oldestUpdatedAt = entry.updatedAt;
         oldestKey = requestId;
       }
-      if (!oldestKey) return;
-      entries.delete(oldestKey);
+      if (!oldestKey) break;
+      target.delete(oldestKey);
+      evicted.push(oldestKey);
+    }
+    return evicted;
+  }
+
+  function logCapacityEvictions(evicted: readonly string[], sizeAfter: number): void {
+    for (const requestId of evicted) {
       logger.info("request_message_cache.evicted", {
-        requestId: oldestKey,
+        requestId,
         reason: "max_entries",
         maxEntries,
-        sizeAfter: entries.size,
+        sizeAfter,
       });
     }
+  }
+
+  function pruneMax(): void {
+    logCapacityEvictions(pruneMapToCapacity(entries), entries.size);
   }
 
   function cacheMessage(
@@ -264,6 +278,15 @@ export function createRequestMessageCache(
     };
   }
 
+  function cloneEntries(source: ReadonlyMap<string, CacheEntry>): Map<string, CacheEntry> {
+    return new Map([...source].map(([requestId, entry]) => [requestId, cloneCacheEntry(entry)]));
+  }
+
+  function replaceEntries(source: ReadonlyMap<string, CacheEntry>): void {
+    entries.clear();
+    for (const [requestId, entry] of source) entries.set(requestId, cloneCacheEntry(entry));
+  }
+
   function prepareRestore(
     input: readonly {
       readonly projection: AuthenticatedRequestProjection;
@@ -304,18 +327,15 @@ export function createRequestMessageCache(
       record.projection = latched.value;
     }
 
-    const before = new Map<string, CacheEntry | null>();
-    for (const requestId of proposed.keys()) {
-      const existing = entries.get(requestId);
-      before.set(requestId, existing ? cloneCacheEntry(existing) : null);
-    }
+    let before = new Map<string, CacheEntry>();
     let applied = false;
     return Result.ok({
       apply: () => {
         if (applied) return Result.ok(undefined);
         const at = now();
+        const staged = cloneEntries(entries);
         for (const [requestId, record] of proposed) {
-          const existing = entries.get(requestId);
+          const existing = staged.get(requestId);
           if (existing) {
             const latched = latchAuthenticatedRequest(
               existing.projection,
@@ -323,12 +343,14 @@ export function createRequestMessageCache(
               "graceful-restart",
             );
             if (latched.status === "error") return Result.err(latched.error);
-            existing.projection = latched.value;
-            for (const eventId of record.parkedEventIds) existing.parkedEventIds.add(eventId);
-            existing.expiresAt = at + ttlMs;
-            existing.updatedAt = at;
+            const next = cloneCacheEntry(existing);
+            next.projection = latched.value;
+            for (const eventId of record.parkedEventIds) next.parkedEventIds.add(eventId);
+            next.expiresAt = at + ttlMs;
+            next.updatedAt = at;
+            staged.set(requestId, next);
           } else {
-            entries.set(requestId, {
+            staged.set(requestId, {
               messages: [],
               projection: record.projection,
               intakeEventIds: new Set(),
@@ -339,16 +361,16 @@ export function createRequestMessageCache(
             });
           }
         }
+        const evicted = pruneMapToCapacity(staged);
+        before = cloneEntries(entries);
+        replaceEntries(staged);
         applied = true;
-        pruneMax();
+        logCapacityEvictions(evicted, entries.size);
         return Result.ok(undefined);
       },
       rollback: () => {
         if (!applied) return;
-        for (const [requestId, previous] of before) {
-          if (previous) entries.set(requestId, cloneCacheEntry(previous));
-          else entries.delete(requestId);
-        }
+        replaceEntries(before);
         applied = false;
       },
     });
@@ -407,13 +429,100 @@ export function createRequestMessageCache(
           }),
         );
       }
-      const projection: AuthenticatedRequestProjection = {
-        ...source.projection,
-        requestId: input.aliasRequestId,
-        requestClient: input.requestClient,
-        sessionId: input.sessionId,
-        source: "internal-delegated",
-      };
+      const platform =
+        input.requestClient === "discord" || input.requestClient === "github"
+          ? input.requestClient
+          : undefined;
+      let aliasActorUserId: string | undefined;
+      const authenticatedActor = source.projection.authenticatedActor;
+      const authenticatedOrigin = source.projection.authenticatedOrigin;
+      if (
+        source.projection.source === "external" &&
+        platform !== undefined &&
+        authenticatedActor?.platform === platform
+      ) {
+        aliasActorUserId = authenticatedActor.userId;
+      } else if (
+        source.projection.source === "external" &&
+        platform !== undefined &&
+        authenticatedOrigin?.platform === platform
+      ) {
+        aliasActorUserId = authenticatedOrigin.userId;
+      }
+      let projection: AuthenticatedRequestProjection;
+      switch (platform) {
+        case "discord": {
+          const sessionRef = { platform, channelId: input.sessionId } as const;
+          projection = aliasActorUserId
+            ? {
+                requestId: input.aliasRequestId,
+                requestClient: platform,
+                sessionId: input.sessionId,
+                source: "external",
+                platform,
+                sessionRef,
+                authenticatedActor: { platform, userId: aliasActorUserId },
+                authenticatedOrigin: { platform, userId: aliasActorUserId, sessionRef },
+                authenticationMetadataKind: "actor",
+                verifiedIngress: false,
+              }
+            : {
+                requestId: input.aliasRequestId,
+                requestClient: platform,
+                sessionId: input.sessionId,
+                source: "external",
+                platform,
+                sessionRef,
+                authenticationMetadataKind: "absent",
+                verifiedIngress: false,
+              };
+          break;
+        }
+        case "github": {
+          const sessionRef = { platform, channelId: input.sessionId } as const;
+          projection = aliasActorUserId
+            ? {
+                requestId: input.aliasRequestId,
+                requestClient: platform,
+                sessionId: input.sessionId,
+                source: "external",
+                platform,
+                sessionRef,
+                authenticatedActor: { platform, userId: aliasActorUserId },
+                authenticatedOrigin: { platform, userId: aliasActorUserId, sessionRef },
+                authenticationMetadataKind: "actor",
+                verifiedIngress: false,
+              }
+            : {
+                requestId: input.aliasRequestId,
+                requestClient: platform,
+                sessionId: input.sessionId,
+                source: "external",
+                platform,
+                sessionRef,
+                authenticationMetadataKind: "absent",
+                verifiedIngress: false,
+              };
+          break;
+        }
+        default:
+          projection = {
+            requestId: input.aliasRequestId,
+            requestClient: input.requestClient,
+            sessionId: input.sessionId,
+            source: "external",
+            authenticationMetadataKind: "absent",
+            verifiedIngress: false,
+          };
+      }
+      if (!isAuthenticatedRequestProjectionSemanticallyValid(projection)) {
+        return Result.err(
+          new AuthenticatedRequestProjectionInvalid({
+            messageType: "request-cache-alias",
+            message: "request cache alias projection is semantically invalid",
+          }),
+        );
+      }
       const ownerId = crypto.randomUUID();
       entries.set(input.aliasRequestId, {
         messages: projectCachedRequestMessageLineage(source.messages),

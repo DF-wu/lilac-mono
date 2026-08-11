@@ -6,7 +6,7 @@ import {
   composeSingleMessage as composeSingleMessageResult,
 } from "../../../src/surface/bridge/request-composition";
 import type { ModelMessage } from "ai";
-import { Result } from "better-result";
+import { Panic, Result } from "better-result";
 import type {
   AdapterEventHandler,
   AdapterSubscription,
@@ -14,7 +14,12 @@ import type {
   SurfaceOperationResult,
   SurfaceOutputStream,
 } from "../../../src/surface/adapter";
-import { SurfacePermissionDenied, SurfaceUnavailable } from "../../../src/surface/adapter";
+import {
+  SurfaceOperationUnsupported,
+  SurfacePermissionDenied,
+  SurfaceRateLimited,
+  SurfaceUnavailable,
+} from "../../../src/surface/adapter";
 import type { TranscriptSnapshot, TranscriptStore } from "../../../src/transcript/transcript-store";
 import type {
   ContentOpts,
@@ -215,6 +220,28 @@ describe("request-composition attachments", () => {
     expect(composed.status).toBe("ok");
     if (composed.status === "error") throw composed.error;
     expect(JSON.stringify(composed.value)).not.toContain("Reactions:");
+  });
+
+  it("preserves Panic from optional reaction enrichment", async () => {
+    const msg: SurfaceMessage = {
+      ref: { platform: "discord", channelId: "c", messageId: "m" },
+      session: { platform: "discord", channelId: "c" },
+      userId: "u",
+      text: "hi",
+      ts: 0,
+    };
+    const adapter = new FakeAdapter(msg);
+    const panic = new Panic({ message: "reaction provider invariant failed" });
+    spyOn(adapter, "listReactions").mockRejectedValue(panic);
+
+    await expect(
+      composeSingleMessageResult(adapter, {
+        platform: "discord",
+        botUserId: "bot",
+        botName: "lilac",
+        msgRef: msg.ref,
+      }),
+    ).rejects.toBe(panic);
   });
 
   it("includes reaction hint in attribution header", async () => {
@@ -2948,7 +2975,7 @@ describe("request-composition active channel burst rules", () => {
         _sessionRef: SessionRef,
         _opts?: LimitOpts,
       ): Promise<SurfaceOperationResult<SurfaceMessage[]>> {
-        throw new Error("listMsg should not be called");
+        return Result.ok([]);
       }
 
       async editMsg(_msgRef: MsgRef, _content: ContentOpts): Promise<SurfaceOperationResult<void>> {
@@ -3313,6 +3340,121 @@ describe("request-composition session divider", () => {
     }
   }
 
+  it("uses only the current trigger when optional reply context is unavailable", async () => {
+    const failure = new SurfaceUnavailable({
+      platform: "discord",
+      operation: "get-reply-context",
+      message: "reply context unavailable",
+    });
+    const trigger: SurfaceMessage = {
+      ref: { platform: "discord", channelId: "c", messageId: "trigger" },
+      session: { platform: "discord", channelId: "c" },
+      userId: "u",
+      text: "current trigger",
+      ts: 1,
+      raw: { reference: {} },
+    };
+    class TransientContextAdapter extends DividerAdapter {
+      override async getReplyContext(): Promise<SurfaceOperationResult<SurfaceMessage[]>> {
+        return Result.err(failure);
+      }
+    }
+    const adapter = new TransientContextAdapter([trigger]);
+
+    const reply = await composeRequestMessages(adapter, {
+      platform: "discord",
+      botUserId: "bot",
+      botName: "lilac",
+      trigger: { type: "reply", msgRef: trigger.ref },
+    });
+
+    expect(reply.chainMessageIds).toEqual(["trigger"]);
+    expect(JSON.stringify(reply.messages)).toContain("current trigger");
+  });
+
+  it("falls back through optional reply planners without hiding later reads", async () => {
+    const trigger: SurfaceMessage = {
+      ref: { platform: "discord", channelId: "c", messageId: "trigger" },
+      session: { platform: "discord", channelId: "c" },
+      userId: "u",
+      text: "current trigger",
+      ts: 1,
+      raw: { reference: {} },
+    };
+    const plannerFailure = new SurfacePermissionDenied({
+      platform: "discord",
+      operation: "plan-reply-chain",
+      message: "planner unavailable",
+    });
+    class PlannerFallbackAdapter extends DividerAdapter {
+      replyPlannerCalls = 0;
+      mergePlannerCalls = 0;
+
+      override async planReplyChain(): Promise<SurfaceOperationResult<readonly MsgRef[]>> {
+        this.replyPlannerCalls += 1;
+        return Result.err(plannerFailure);
+      }
+
+      override async planMergeBlockEndingAt(): Promise<SurfaceOperationResult<readonly MsgRef[]>> {
+        this.mergePlannerCalls += 1;
+        return Result.err(plannerFailure);
+      }
+    }
+    const adapter = new PlannerFallbackAdapter([trigger]);
+
+    const reply = await composeRequestMessages(adapter, {
+      platform: "discord",
+      botUserId: "bot",
+      botName: "lilac",
+      trigger: { type: "reply", msgRef: trigger.ref },
+    });
+
+    expect(reply.chainMessageIds).toEqual(["trigger"]);
+    expect(adapter.replyPlannerCalls).toBe(1);
+    expect(adapter.mergePlannerCalls).toBe(1);
+  });
+
+  it("propagates failures while reading a successful reply-chain plan", async () => {
+    const trigger: SurfaceMessage = {
+      ref: { platform: "discord", channelId: "c", messageId: "trigger" },
+      session: { platform: "discord", channelId: "c" },
+      userId: "u",
+      text: "current trigger",
+      ts: 2,
+      raw: { reference: { messageId: "parent", channelId: "c" } },
+    };
+    const readFailure = new SurfaceUnavailable({
+      platform: "discord",
+      operation: "read-message",
+      message: "planned history unavailable",
+    });
+    class PlannedReadFailureAdapter extends DividerAdapter {
+      override async planReplyChain(): Promise<SurfaceOperationResult<readonly MsgRef[]>> {
+        return Result.ok([
+          { platform: "discord", channelId: "c", messageId: "parent" },
+          trigger.ref,
+        ]);
+      }
+
+      override async readMsg(
+        msgRef: MsgRef,
+      ): Promise<SurfaceOperationResult<SurfaceMessage | null>> {
+        if (msgRef.messageId === "parent") return Result.err(readFailure);
+        return await super.readMsg(msgRef);
+      }
+    }
+    const adapter = new PlannedReadFailureAdapter([trigger]);
+
+    const reply = await composeRequestMessagesResult(adapter, {
+      platform: "discord",
+      botUserId: "bot",
+      botName: "lilac",
+      trigger: { type: "reply", msgRef: trigger.ref },
+    });
+
+    expect(reply).toEqual(Result.err(readFailure));
+  });
+
   it("cuts off recent context at the most recent divider", async () => {
     const sessionId = "c";
 
@@ -3550,9 +3692,8 @@ describe("request-composition session divider", () => {
     expect(combined).not.toContain("LILAC_SESSION_DIVIDER");
   });
 
-  it("cuts off mention-thread context at the most recent divider", async () => {
+  function createAnchoredDividerFixture() {
     const sessionId = "c";
-
     const root: SurfaceMessage = {
       ref: { platform: "discord", channelId: sessionId, messageId: "root" },
       session: { platform: "discord", channelId: sessionId },
@@ -3562,7 +3703,6 @@ describe("request-composition session divider", () => {
       ts: 1,
       raw: { reference: {} },
     };
-
     const divider: SurfaceMessage = {
       ref: { platform: "discord", channelId: sessionId, messageId: "div" },
       session: { platform: "discord", channelId: sessionId },
@@ -3572,7 +3712,6 @@ describe("request-composition session divider", () => {
       ts: 50,
       raw: { reference: {} },
     };
-
     const m1: SurfaceMessage = {
       ref: { platform: "discord", channelId: sessionId, messageId: "m1" },
       session: { platform: "discord", channelId: sessionId },
@@ -3582,7 +3721,6 @@ describe("request-composition session divider", () => {
       ts: 100,
       raw: { reference: { messageId: "root", channelId: sessionId } },
     };
-
     const m2: SurfaceMessage = {
       ref: { platform: "discord", channelId: sessionId, messageId: "m2" },
       session: { platform: "discord", channelId: sessionId },
@@ -3592,7 +3730,6 @@ describe("request-composition session divider", () => {
       ts: 110,
       raw: { reference: {} },
     };
-
     const m3: SurfaceMessage = {
       ref: { platform: "discord", channelId: sessionId, messageId: "m3" },
       session: { platform: "discord", channelId: sessionId },
@@ -3600,9 +3737,8 @@ describe("request-composition session divider", () => {
       userName: "user1",
       text: "<@bot> user msg 3",
       ts: 120,
-      raw: { reference: {} },
+      raw: { reference: { messageId: "m2", channelId: sessionId } },
     };
-
     class MentionDividerAdapter extends DividerAdapter {
       override async getReplyContext(
         msgRef: MsgRef,
@@ -3622,18 +3758,26 @@ describe("request-composition session divider", () => {
         return Result.ok(before.concat(after));
       }
     }
-
     const adapter = new MentionDividerAdapter([root, divider, m1, m2, m3]);
 
-    const out = await composeRecentChannelMessages(adapter, {
-      platform: "discord",
-      sessionId,
-      botUserId: "bot",
-      botName: "lilac",
-      limit: 50,
-      triggerMsgRef: m3.ref,
-      triggerType: "mention",
-    });
+    return {
+      adapter,
+      compose: () =>
+        composeRecentChannelMessages(adapter, {
+          platform: "discord",
+          sessionId,
+          botUserId: "bot",
+          botName: "lilac",
+          limit: 50,
+          triggerMsgRef: m3.ref,
+          triggerType: "mention",
+        }),
+    };
+  }
+
+  it("cuts off anchored mention-thread context at the most recent divider", async () => {
+    const { compose } = createAnchoredDividerFixture();
+    const out = await compose();
 
     expect(out.chainMessageIds).toEqual(["m1", "m2", "m3"]);
     const combined = out.messages
@@ -3644,5 +3788,43 @@ describe("request-composition session divider", () => {
     expect(combined).toContain("user msg 3");
     expect(combined).not.toContain("Root");
     expect(combined).not.toContain("LILAC_SESSION_DIVIDER");
+  });
+
+  it.each([
+    new SurfaceRateLimited({
+      platform: "discord",
+      operation: "list-messages",
+      message: "divider lookup rate limited",
+    }),
+    new SurfaceUnavailable({
+      platform: "discord",
+      operation: "list-messages",
+      message: "divider lookup unavailable",
+    }),
+    new SurfacePermissionDenied({
+      platform: "discord",
+      operation: "list-messages",
+      message: "divider lookup denied",
+    }),
+    new SurfaceOperationUnsupported({
+      platform: "discord",
+      operation: "list-messages",
+      message: "divider lookup unsupported",
+    }),
+  ])("continues an anchored chain without a divider for $error._tag", async (failure) => {
+    const { adapter, compose } = createAnchoredDividerFixture();
+    spyOn(adapter, "listMsg").mockResolvedValue(Result.err(failure));
+
+    const out = await compose();
+
+    expect(out.chainMessageIds).toEqual(["root", "m1", "m2", "m3"]);
+  });
+
+  it("preserves Panic from anchored divider discovery", async () => {
+    const { adapter, compose } = createAnchoredDividerFixture();
+    const panic = new Panic({ message: "divider lookup invariant failed" });
+    spyOn(adapter, "listMsg").mockRejectedValue(panic);
+
+    await expect(compose()).rejects.toBe(panic);
   });
 });

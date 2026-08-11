@@ -370,6 +370,18 @@ describe("GitHub adapter CRUD compatibility", () => {
       { ts: 1_577_836_800_000, editedTs: 1_577_923_200_000 },
     ]);
   });
+
+  it("preserves Panic thrown while parsing a GitHub thread", async () => {
+    const panic = new Panic({ message: "thread identity invariant failed" });
+    const session = {
+      platform: "github" as const,
+      get channelId(): string {
+        throw panic;
+      },
+    };
+
+    await expect(new GithubAdapter().listMsg(session)).rejects.toBe(panic);
+  });
 });
 
 describe("GitHub normalized workflow progress port", () => {

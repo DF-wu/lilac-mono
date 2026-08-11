@@ -9,6 +9,10 @@ import {
   BusAgentRunnerAuthenticationProjectionInvalid,
   busAgentRunnerDeliveryDisposition,
 } from "../../src/surface/bridge/bus-agent-runner";
+import {
+  isAuthenticatedRequestProjectionSemanticallyValid,
+  isPersistedRecoveryAuthenticatedRequestProjectionSemanticallyValid,
+} from "../../src/surface/authenticated-request";
 
 function requestMessage(input: {
   readonly eventId: string;
@@ -309,6 +313,164 @@ describe("request message cache", () => {
     expect(cache.getOrigin(requestId)?.authenticatedOrigin?.messageRef?.messageId).toBe(
       "message-1",
     );
+  });
+
+  it("validates a restore batch fully at apply time before mutating any entry", () => {
+    const cache = createRequestMessageCache();
+    const first = requestMessage({ eventId: "1-0", requestId: "first" });
+    expect(cache.cacheMessage(first).status).toBe("ok");
+    const firstProjection = cache.getOrigin(first.key);
+    if (!firstProjection) throw new Error("Expected first projection");
+
+    const projectionSource = createRequestMessageCache();
+    const second = requestMessage({ eventId: "2-0", requestId: "second" });
+    expect(projectionSource.cacheMessage(second).status).toBe("ok");
+    const secondProjection = projectionSource.getOrigin(second.key);
+    if (!secondProjection) throw new Error("Expected second projection");
+
+    const prepared = cache.prepareRestore([
+      { projection: firstProjection, parkedEventIds: ["parked-first"] },
+      { projection: secondProjection, parkedEventIds: ["parked-second"] },
+    ]);
+    if (prepared.status === "error") throw prepared.error;
+    expect(
+      cache.cacheMessage(
+        requestMessage({ eventId: "3-0", requestId: "second", sessionId: "other-channel" }),
+      ).status,
+    ).toBe("ok");
+
+    expect(prepared.value.apply().status).toBe("error");
+    expect(cache.snapshot("first")?.parkedEventIds).toEqual([]);
+    expect(cache.getOrigin("second")?.sessionId).toBe("other-channel");
+  });
+
+  it("restores unrelated capacity evictions on rollback", () => {
+    let now = 1;
+    const cache = createRequestMessageCache({ maxEntries: 2, now: () => now++ });
+    const projections = ["first", "second", "third"].map((requestId, index) => {
+      const source = createRequestMessageCache();
+      const message = requestMessage({ eventId: `${index + 1}-0`, requestId });
+      expect(source.cacheMessage(message).status).toBe("ok");
+      const projection = source.getOrigin(requestId);
+      if (!projection) throw new Error(`Expected ${requestId} projection`);
+      return projection;
+    });
+    const initial = cache.prepareRestore(
+      projections.slice(0, 2).map((projection) => ({ projection, parkedEventIds: [] })),
+    );
+    if (initial.status === "error") throw initial.error;
+    expect(initial.value.apply().status).toBe("ok");
+
+    const overCapacity = cache.prepareRestore([
+      { projection: projections[2]!, parkedEventIds: [] },
+    ]);
+    if (overCapacity.status === "error") throw overCapacity.error;
+    expect(overCapacity.value.apply().status).toBe("ok");
+    expect(cache.getOrigin("first")).toBeUndefined();
+    expect(cache.getOrigin("third")).toBeDefined();
+
+    overCapacity.value.rollback();
+    expect(cache.getOrigin("first")).toBeDefined();
+    expect(cache.getOrigin("second")).toBeDefined();
+    expect(cache.getOrigin("third")).toBeUndefined();
+  });
+
+  it("creates a restricted actor-based Discord alias without message proof", () => {
+    const cache = createRequestMessageCache();
+    const source = requestMessage({
+      eventId: "1-0",
+      requestId: "discord:channel-1:message-1",
+      raw: {
+        authenticatedOrigin: {
+          platform: "discord",
+          userId: "user-1",
+          messageRef: { platform: "discord", channelId: "channel-1", messageId: "message-1" },
+        },
+      },
+    });
+    expect(cache.cacheMessage(source).status).toBe("ok");
+    const alias = cache.createAliasOwner({
+      sourceRequestId: source.key,
+      aliasRequestId: "discord:channel-1:model-alias",
+      requestClient: "discord",
+      sessionId: "channel-1",
+    });
+    if (alias.status === "error") throw alias.error;
+
+    expect(alias.value.projection).toMatchObject({
+      source: "external",
+      requestClient: "discord",
+      sessionId: "channel-1",
+      authenticatedActor: { platform: "discord", userId: "user-1" },
+      authenticatedOrigin: { platform: "discord", userId: "user-1" },
+      authenticationMetadataKind: "actor",
+      verifiedIngress: false,
+    });
+    expect(alias.value.projection.messageRef).toBeUndefined();
+    expect(alias.value.projection.authenticatedOrigin?.messageRef).toBeUndefined();
+    expect(isAuthenticatedRequestProjectionSemanticallyValid(alias.value.projection)).toBe(true);
+    expect(
+      isPersistedRecoveryAuthenticatedRequestProjectionSemanticallyValid(alias.value.projection),
+    ).toBe(true);
+  });
+
+  it("creates a restricted actor-based GitHub alias without trigger proof", () => {
+    const cache = createRequestMessageCache();
+    const source = requestMessage({
+      eventId: "1-0",
+      requestId: "github:owner/repo#1:41",
+      sessionId: "owner/repo#1",
+      requestClient: "github",
+      raw: {
+        authenticatedActor: { platform: "github", userId: "octocat" },
+        github: {
+          repoFullName: "owner/repo",
+          issueNumber: 1,
+          trigger: { kind: "comment", commentId: 41 },
+        },
+      },
+    });
+    expect(cache.cacheMessage(source).status).toBe("ok");
+    const alias = cache.createAliasOwner({
+      sourceRequestId: source.key,
+      aliasRequestId: "github:owner/repo#1:model-alias",
+      requestClient: "github",
+      sessionId: "owner/repo#1",
+    });
+    if (alias.status === "error") throw alias.error;
+
+    expect(alias.value.projection).toMatchObject({
+      source: "external",
+      authenticatedActor: { platform: "github", userId: "octocat" },
+      authenticationMetadataKind: "actor",
+      verifiedIngress: false,
+    });
+    expect(alias.value.projection.messageRef).toBeUndefined();
+    expect(alias.value.projection.githubTrigger).toBeUndefined();
+    expect(alias.value.projection.authenticatedOrigin?.messageRef).toBeUndefined();
+    expect(isAuthenticatedRequestProjectionSemanticallyValid(alias.value.projection)).toBe(true);
+  });
+
+  it("creates an anonymous restricted alias without synthesizing authority", () => {
+    const cache = createRequestMessageCache();
+    const source = requestMessage({ eventId: "1-0", requestId: "anonymous-source" });
+    expect(cache.cacheMessage(source).status).toBe("ok");
+    const alias = cache.createAliasOwner({
+      sourceRequestId: source.key,
+      aliasRequestId: "discord:channel-1:anonymous-alias",
+      requestClient: "discord",
+      sessionId: "channel-1",
+    });
+    if (alias.status === "error") throw alias.error;
+
+    expect(alias.value.projection).toMatchObject({
+      source: "external",
+      authenticationMetadataKind: "absent",
+      verifiedIngress: false,
+    });
+    expect(alias.value.projection.authenticatedActor).toBeUndefined();
+    expect(alias.value.projection.authenticatedOrigin).toBeUndefined();
+    expect(isAuthenticatedRequestProjectionSemanticallyValid(alias.value.projection)).toBe(true);
   });
 
   it("dead-letters an unproven GitHub authenticated-origin message replacement", () => {

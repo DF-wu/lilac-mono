@@ -217,6 +217,58 @@ function buildSnapshot(
   };
 }
 
+const SHIPPED_POPULATED_V1_FIXTURE = Object.freeze({
+  version: 1,
+  createdAt: 1_000,
+  deadlineMs: 3_000,
+  agent: Object.freeze([
+    {
+      kind: "queued" as const,
+      requestId: "discord:legacy-channel:legacy-message",
+      sessionId: "legacy-channel",
+      requestClient: "discord" as const,
+      queue: "prompt" as const,
+      messages: Object.freeze([{ role: "user" as const, content: "legacy queued request" }]),
+    },
+  ]),
+  relays: Object.freeze([
+    {
+      requestId: "discord:legacy-channel:legacy-message",
+      sessionId: "legacy-channel",
+      platform: "discord" as const,
+      createdOutputRefs: Object.freeze([]),
+      visibleText: "legacy partial response",
+      toolStatus: Object.freeze([]),
+    },
+  ]),
+});
+
+const SHIPPED_POPULATED_V2_FIXTURE = Object.freeze({
+  version: 2,
+  createdAt: 2_000,
+  deadlineMs: 3_000,
+  agent: Object.freeze([
+    {
+      kind: "queued" as const,
+      requestId: "discord:legacy-channel:legacy-message-v2",
+      sessionId: "legacy-channel",
+      requestClient: "discord" as const,
+      queue: "prompt" as const,
+      messages: Object.freeze([{ role: "user" as const, content: "legacy queued request v2" }]),
+    },
+  ]),
+  relays: Object.freeze([
+    {
+      requestId: "discord:legacy-channel:legacy-message-v2",
+      sessionId: "legacy-channel",
+      platform: "discord" as const,
+      createdOutputRefs: Object.freeze([]),
+      visibleText: "legacy partial response v2",
+      toolStatus: Object.freeze([]),
+    },
+  ]),
+});
+
 function richOpaqueValue() {
   const date = new Date("2026-08-03T12:34:56.789Z");
   const url = new URL("https://example.com/path?opaque=yes#fragment");
@@ -333,6 +385,26 @@ describe("graceful restart persisted codec", () => {
         decoded.value.value.agent.every((entry) => entry.identity.state === "restricted"),
       ).toBe(true);
       expect(decoded.value.value.queueAttemptProof).toBe("legacy-ambiguous");
+    },
+  );
+
+  it.each([SHIPPED_POPULATED_V1_FIXTURE, SHIPPED_POPULATED_V2_FIXTURE])(
+    "migrates frozen populated shipped v$version literals",
+    (fixture) => {
+      const decoded = decodeGracefulRestartSnapshot({
+        status: "completed",
+        payload_json: SuperJSON.stringify(fixture),
+      });
+      expect(decoded.status).toBe("ok");
+      if (decoded.status === "error" || !decoded.value.value) return;
+      expect(decoded.value).toMatchObject({
+        provenance: "migrated",
+        value: {
+          queueAttemptProof: "legacy-ambiguous",
+          agent: [{ kind: "queued", identity: { state: "restricted" } }],
+          relays: [{ requestClient: "discord" }],
+        },
+      });
     },
   );
 
@@ -929,6 +1001,60 @@ describe("graceful restart persisted codec", () => {
         },
       },
     });
+  });
+
+  it("encodes a durable restricted alias projection without message proof", async () => {
+    const { store } = await makeStore();
+    const snapshot = buildSnapshot();
+    const active = snapshot.agent[0];
+    if (!active?.identity || active.identity.state !== "durable") {
+      throw new Error("Expected durable Discord identity fixture");
+    }
+    const requestId = "discord:chan:model-alias";
+    const sessionRef = { platform: "discord" as const, channelId: "chan" };
+    const aliasSnapshot: GracefulRestartSnapshotInput = {
+      ...snapshot,
+      relays: [],
+      agent: [
+        {
+          ...active,
+          requestId,
+          identity: {
+            ...active.identity,
+            projection: {
+              requestId,
+              requestClient: "discord",
+              sessionId: "chan",
+              source: "external",
+              platform: "discord",
+              sessionRef,
+              authenticatedActor: { platform: "discord", userId: "user_active" },
+              authenticatedOrigin: { platform: "discord", userId: "user_active", sessionRef },
+              authenticationMetadataKind: "actor",
+              verifiedIngress: false,
+            },
+            assertedSafetyMode: "restricted",
+          },
+        },
+      ],
+    };
+    try {
+      expect(store.saveCompletedSnapshot(aliasSnapshot).status).toBe("ok");
+      const loaded = store.readCompletedSnapshot();
+      expect(loaded.status).toBe("ok");
+      if (loaded.status === "error" || loaded.value.state !== "loaded") return;
+      expect(loaded.value.snapshot.agent[0]?.identity).toMatchObject({
+        state: "durable",
+        assertedSafetyMode: "restricted",
+        projection: {
+          requestId,
+          authenticationMetadataKind: "actor",
+          verifiedIngress: false,
+        },
+      });
+    } finally {
+      store.close();
+    }
   });
 
   it.each([

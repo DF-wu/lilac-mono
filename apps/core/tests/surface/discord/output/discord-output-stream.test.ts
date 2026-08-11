@@ -874,7 +874,7 @@ describe("output operation failures", () => {
     }
   });
 
-  it("returns partial completion when a required streaming edit fails", async () => {
+  it("finishes successfully when an ordinary best-effort streaming edit fails", async () => {
     const { client } = createFakeDiscordClient({ editFailure: { status: 503 } });
     const out = new DiscordOutputStream({
       client,
@@ -888,12 +888,7 @@ describe("output operation failures", () => {
     await out.push({ type: "text.delta", delta: "hello" });
     const result = await out.finish();
 
-    expect(result.status).toBe("error");
-    if (result.status === "ok") throw new Error("expected finish failure");
-    expect(result.error).toMatchObject({
-      _tag: "SurfaceOperationPartiallyCompleted",
-      operation: "finish-output",
-    });
+    expect(result.status).toBe("ok");
   });
 
   it("classifies resume fetch failures instead of creating a duplicate chain", async () => {

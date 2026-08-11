@@ -173,7 +173,7 @@ export const PRECISE_EXCEPTION_IDENTITIES: Readonly<
       "fetchExistingMessagesForResume",
       "both",
     ],
-    ["src/surface/github/github-adapter.ts", "parseGithubThreadResult", "capture"],
+    ["src/surface/github/github-adapter.ts", "parseGithubThreadResult", "both"],
     ["src/surface/github/github-adapter.ts", "captureGithubOperation", "both"],
     [
       "src/surface/store/discord-search-store.ts",

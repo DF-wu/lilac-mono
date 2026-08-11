@@ -4,6 +4,7 @@ import { Panic } from "better-result";
 
 import {
   decodeGithubWebhookEvent,
+  projectGithubAuthenticatedActor,
   superviseGithubWebhookHandler,
   verifyGithubWebhookSignature,
 } from "../../src/github/webhook/github-webhook-server";
@@ -17,6 +18,16 @@ import {
   setGithubAck,
   setGithubLatestRequestForSession,
 } from "../../src/github/github-state";
+
+describe("GitHub webhook actor projection", () => {
+  it("omits anonymous actors instead of emitting an incomplete actor", () => {
+    expect(projectGithubAuthenticatedActor(undefined)).toEqual({});
+    expect(projectGithubAuthenticatedActor("")).toEqual({});
+    expect(projectGithubAuthenticatedActor("octocat")).toEqual({
+      authenticatedActor: { platform: "github", userId: "octocat" },
+    });
+  });
+});
 
 describe("github webhook signature", () => {
   it("verifies sha256 signature", () => {

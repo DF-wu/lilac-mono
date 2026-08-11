@@ -191,12 +191,10 @@ export async function resolveMergeBlockEndingAt(
         return Result.ok(list);
       }
     }
-  } else if (planned.error._tag !== "SurfaceOperationUnsupported") {
-    return Result.err(planned.error);
   }
 
   const context = await adapter.getReplyContext(triggerMsg.ref, { limit });
-  if (context.status === "error") return Result.err(context.error);
+  if (context.status === "error") return Result.ok([triggerMsg]);
   const ctx = context.value;
 
   const list = ctx.length > 0 ? ctx.slice() : [triggerMsg];
@@ -272,12 +270,6 @@ export async function fetchReplyChainFrom(
           const plannedBlock = await adapter.planMergeBlockEndingAt(cursorRef, {
             lookbackLimit: DEFAULT_MENTION_BLOCK_LIMIT,
           });
-          if (
-            plannedBlock.status === "error" &&
-            plannedBlock.error._tag !== "SurfaceOperationUnsupported"
-          ) {
-            return Result.err(plannedBlock.error);
-          }
           const blockRefs = plannedBlock.status === "ok" ? plannedBlock.value : [cursorRef];
 
           const inChannelBlockRefs = blockRefs.filter(
@@ -324,8 +316,6 @@ export async function fetchReplyChainFrom(
         return Result.ok(dedupeByMessageId(flattened.map((m) => toReplyChainMessage(m))));
       }
     }
-  } else if (planned.error._tag !== "SurfaceOperationUnsupported") {
-    return Result.err(planned.error);
   }
 
   const groupsNewestToOldest: ReplyChainMessage[][] = [];

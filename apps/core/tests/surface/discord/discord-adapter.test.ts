@@ -39,6 +39,67 @@ import {
 } from "../../../src/surface/adapter";
 import type { AdapterEvent } from "../../../src/surface/events";
 import type { ContentOpts } from "../../../src/surface/types";
+import { toBusDiscordCommandInvokedData } from "../../../src/surface/discord/discord-command-projection";
+import { DiscordSurfaceStore } from "../../../src/surface/store/discord-surface-store";
+
+describe("Discord command actor projection", () => {
+  it("omits an anonymous actor instead of emitting an incomplete actor", () => {
+    const projected = toBusDiscordCommandInvokedData({
+      type: "adapter.command.invoked",
+      platform: "discord",
+      requestId: "discord:channel:command",
+      sessionId: "channel",
+      commandName: "ask",
+      args: [],
+      text: "hello",
+      ts: 1,
+      sessionMode: "mention",
+      sessionConfigId: "channel",
+    });
+
+    expect(Object.hasOwn(projected.raw ?? {}, "authenticatedActor")).toBe(false);
+  });
+});
+
+describe("Discord reply-chain channel boundary", () => {
+  it("truncates a thread-parent relation without exposing parent content or raising Panic", async () => {
+    const store = new DiscordSurfaceStore(":memory:");
+    const adapter = createTestDiscordAdapter();
+    Object.assign(adapter, { store });
+    store.upsertMessageRelation({
+      channelId: "thread",
+      messageId: "reply",
+      authorId: "user",
+      ts: 2,
+      isChat: true,
+      replyToChannelId: "parent",
+      replyToMessageId: "private-parent-content",
+      updatedTs: 2,
+    });
+    store.upsertMessageRelation({
+      channelId: "parent",
+      messageId: "private-parent-content",
+      authorId: "other-user",
+      ts: 1,
+      isChat: true,
+      updatedTs: 1,
+    });
+
+    try {
+      const planned = await adapter.planReplyChain({
+        platform: "discord",
+        channelId: "thread",
+        messageId: "reply",
+      });
+      expect(planned).toEqual(
+        Result.ok([{ platform: "discord", channelId: "thread", messageId: "reply" }]),
+      );
+      expect(JSON.stringify(planned)).not.toContain("private-parent-content");
+    } finally {
+      store.close();
+    }
+  });
+});
 
 function testConfigWithStatusMessage(statusMessage?: string): CoreConfig {
   const discord = {

@@ -4,7 +4,7 @@ import { Result, TaggedError, type Result as ResultType } from "better-result";
 
 import { chunkMarkdownForEmbeds } from "./markdown-chunker";
 
-export type SafeEdit = (msg: Message, options: Parameters<Message["edit"]>[0]) => Promise<void>;
+export type SafeEdit = (msg: Message, options: Parameters<Message["edit"]>[0]) => Promise<boolean>;
 
 const STREAMING_INDICATOR = " ⚪";
 const EDIT_DELAY_MS = 250;
