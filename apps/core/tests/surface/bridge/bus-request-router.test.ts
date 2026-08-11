@@ -24,11 +24,16 @@ import { Logger } from "@stanley2058/simple-module-logger";
 
 import {
   adaptDiscordRequestRouterStartOutcomeToHost,
+  DiscordRequestRouterAdapterSelfLookupRejected,
   DiscordRequestRouterStartupAndCleanupFailed,
   DiscordRequestRouterSubscriptionStopRejected,
   startDiscordRequestRouter,
   type StartDiscordRequestRouterInput,
 } from "../../../src/surface/discord/discord-request-router";
+import {
+  resolvePreviousMessageText,
+  resolveRepliedToMessageText,
+} from "../../../src/surface/discord/discord-request-router/context";
 import { formatBufferedMessageForGateTranscript } from "../../../src/surface/discord/discord-request-router/gate";
 
 import type { SurfaceAdapter, SurfaceOutputStream } from "../../../src/surface/adapter";
@@ -52,11 +57,13 @@ type TestRawBus = RawBus & {
   readonly stoppedTopics: string[];
   activeSubscriptionCount(): number;
   failPublicationsTo(topic: string, cause: unknown): void;
+  failNextPublicationTo(topic: string, cause: unknown): void;
   failStartsFor(topic: string, cause: unknown): void;
   rejectStartsFor(topic: string, cause: unknown): void;
   failStopsFor(topic: string, cause: unknown): void;
   rejectStopsFor(topic: string, cause: unknown): void;
   throwStopsFor(topic: string, cause: unknown): void;
+  blockStopsFor(topic: string): { readonly entered: Promise<void>; release(): void };
   clearStopFailuresFor(topic: string): void;
   finishDelivery(topic: string, error: EventDeliveryDoneError): void;
 };
@@ -100,11 +107,19 @@ function createInMemoryRawBus(): TestRawBus {
   const returnedStartFailures: EventDeliveryStartFailed[] = [];
   const stoppedTopics: string[] = [];
   const publicationFailures = new Map<string, unknown>();
+  const nextPublicationFailures = new Map<string, unknown[]>();
   const startFailures = new Map<string, unknown>();
   const startRejections = new Map<string, unknown>();
   const stopFailures = new Map<string, unknown>();
   const stopRejections = new Map<string, unknown>();
   const stopThrows = new Map<string, unknown>();
+  const stopBlocks = new Map<
+    string,
+    {
+      readonly entered: PromiseWithResolvers<void>;
+      readonly release: PromiseWithResolvers<void>;
+    }
+  >();
   const deliverySubs = new Set<{
     topic: string;
     opts: SubscriptionOptions;
@@ -134,6 +149,11 @@ function createInMemoryRawBus(): TestRawBus {
     failPublicationsTo: (topic, cause) => {
       publicationFailures.set(topic, cause);
     },
+    failNextPublicationTo: (topic, cause) => {
+      const failures = nextPublicationFailures.get(topic) ?? [];
+      failures.push(cause);
+      nextPublicationFailures.set(topic, failures);
+    },
     failStartsFor: (topic, cause) => {
       startFailures.set(topic, cause);
     },
@@ -149,6 +169,17 @@ function createInMemoryRawBus(): TestRawBus {
     throwStopsFor: (topic, cause) => {
       stopThrows.set(topic, cause);
     },
+    blockStopsFor: (topic) => {
+      const block = {
+        entered: Promise.withResolvers<void>(),
+        release: Promise.withResolvers<void>(),
+      };
+      stopBlocks.set(topic, block);
+      return {
+        entered: block.entered.promise,
+        release: () => block.release.resolve(),
+      };
+    },
     clearStopFailuresFor: (topic) => {
       stopFailures.delete(topic);
       stopRejections.delete(topic);
@@ -160,6 +191,12 @@ function createInMemoryRawBus(): TestRawBus {
       }
     },
     publish: async <TData>(msg: Omit<Message<TData>, "id" | "ts">, opts: PublishOptions) => {
+      const nextFailures = nextPublicationFailures.get(opts.topic);
+      if (nextFailures && nextFailures.length > 0) {
+        const cause = nextFailures.shift();
+        if (nextFailures.length === 0) nextPublicationFailures.delete(opts.topic);
+        throw cause;
+      }
       if (publicationFailures.has(opts.topic)) throw publicationFailures.get(opts.topic);
       const id = String(Date.now()) + "-0";
       const stored: Message<unknown> = {
@@ -210,22 +247,28 @@ function createInMemoryRawBus(): TestRawBus {
         done: done.promise,
         stop: () => {
           stoppedTopics.push(topic);
-          deliverySubs.delete(entry);
-          done.resolve(Result.ok(undefined));
-          if (stopThrows.has(topic)) throw stopThrows.get(topic);
-          if (stopRejections.has(topic)) return Promise.reject(stopRejections.get(topic));
-          if (stopFailures.has(topic)) {
-            return Promise.resolve(
-              Result.err(
-                new EventDeliveryStopFailed({
-                  topic,
-                  cause: stopFailures.get(topic),
-                  message: "forced stop failure",
-                }),
-              ),
-            );
-          }
-          return Promise.resolve(Result.ok(undefined));
+          const block = stopBlocks.get(topic);
+          const finishStop = (): Promise<ResultType<void, EventDeliveryStopFailed>> => {
+            deliverySubs.delete(entry);
+            done.resolve(Result.ok(undefined));
+            if (stopThrows.has(topic)) throw stopThrows.get(topic);
+            if (stopRejections.has(topic)) return Promise.reject(stopRejections.get(topic));
+            if (stopFailures.has(topic)) {
+              return Promise.resolve(
+                Result.err(
+                  new EventDeliveryStopFailed({
+                    topic,
+                    cause: stopFailures.get(topic),
+                    message: "forced stop failure",
+                  }),
+                ),
+              );
+            }
+            return Promise.resolve(Result.ok(undefined));
+          };
+          if (!block) return finishStop();
+          block.entered.resolve();
+          return block.release.promise.then(finishStop);
         },
       });
     },
@@ -390,7 +433,91 @@ describe("formatBufferedMessageForGateTranscript", () => {
   });
 });
 
+describe("Discord request router context fallbacks", () => {
+  it("preserves Panic from previous-message context and falls back for an ordinary rejection", async () => {
+    const adapter = new FakeAdapter({});
+    const panic = new Panic({ message: "reply context invariant failed" });
+    const getReplyContext = spyOn(adapter, "getReplyContext")
+      .mockRejectedValueOnce(panic)
+      .mockRejectedValueOnce(new Error("reply context unavailable"));
+    const input = {
+      msgRef: { platform: "discord" as const, channelId: "channel", messageId: "message" },
+      triggerTs: 1,
+    };
+
+    await expect(resolvePreviousMessageText({ adapter, input })).rejects.toBe(panic);
+    expect(await resolvePreviousMessageText({ adapter, input })).toBeUndefined();
+    getReplyContext.mockRestore();
+  });
+
+  it("preserves Panic from replied-message context and falls back for an ordinary rejection", async () => {
+    const adapter = new FakeAdapter({});
+    const panic = new Panic({ message: "message read invariant failed" });
+    const readMsg = spyOn(adapter, "readMsg")
+      .mockRejectedValueOnce(panic)
+      .mockRejectedValueOnce(new Error("message unavailable"));
+    const input = { sessionId: "channel", replyToMessageId: "message" };
+
+    await expect(resolveRepliedToMessageText({ adapter, input })).rejects.toBe(panic);
+    expect(await resolveRepliedToMessageText({ adapter, input })).toBeUndefined();
+    readMsg.mockRestore();
+  });
+});
+
 describe("startBusRequestRouter", () => {
+  it("returns an owned startup failure when adapter self lookup rejects", async () => {
+    const raw = createInMemoryRawBus();
+    const adapter = new FakeAdapter({});
+    const cause = new Error("adapter unavailable");
+    const getSelf = spyOn(adapter, "getSelf").mockRejectedValue(cause);
+
+    const outcome = await startDiscordRequestRouter({
+      adapter,
+      bus: createLilacBus(raw),
+      subscriptionId: "discord-router-self-rejection",
+      config: parseCoreConfigV1ToUniversal({}),
+    });
+
+    expect(outcome.kind).toBe("result");
+    expect(outcome.residualRouter).toBeNull();
+    if (outcome.kind === "result") {
+      expect(outcome.result.status).toBe("error");
+      if (outcome.result.status === "error") {
+        expect(outcome.result.error).toBeInstanceOf(DiscordRequestRouterAdapterSelfLookupRejected);
+        if (DiscordRequestRouterAdapterSelfLookupRejected.is(outcome.result.error)) {
+          expect(outcome.result.error.cause).toBe(cause);
+        }
+      }
+    }
+    expect(raw.activeSubscriptionCount()).toBe(0);
+    expect(raw.stoppedTopics).toEqual([]);
+    getSelf.mockRestore();
+  });
+
+  it("returns an exact adapter self lookup Panic without starting subscriptions", async () => {
+    const raw = createInMemoryRawBus();
+    const adapter = new FakeAdapter({});
+    const panic = new Panic({ message: "adapter identity invariant failed" });
+    const getSelf = spyOn(adapter, "getSelf").mockRejectedValue(panic);
+
+    const outcome = await startDiscordRequestRouter({
+      adapter,
+      bus: createLilacBus(raw),
+      subscriptionId: "discord-router-self-panic",
+      config: parseCoreConfigV1ToUniversal({}),
+    });
+
+    expect(outcome.kind).toBe("panic");
+    if (outcome.kind === "panic") {
+      expect(outcome.panic).toBe(panic);
+      expect(outcome.startupFailure).toBeNull();
+      expect(outcome.residualRouter).toBeNull();
+    }
+    expect(raw.activeSubscriptionCount()).toBe(0);
+    expect(raw.stoppedTopics).toEqual([]);
+    getSelf.mockRestore();
+  });
+
   it("rejects a non-Discord adapter before starting subscriptions", async () => {
     const raw = createInMemoryRawBus();
 
@@ -622,6 +749,29 @@ describe("startBusRequestRouter", () => {
     },
   );
 
+  it("awaits each reverse-order rollback stop before starting the next", async () => {
+    const raw = createInMemoryRawBus();
+    raw.failStartsFor("evt.adapter", new Error("adapter start failed"));
+    const surfaceStop = raw.blockStopsFor("evt.surface");
+
+    const starting = startDiscordRequestRouter({
+      adapter: new FakeAdapter({}),
+      bus: createLilacBus(raw),
+      subscriptionId: "router-sequential-rollback",
+      config: parseCoreConfigV1ToUniversal({}),
+    });
+
+    await surfaceStop.entered;
+    expect(raw.stoppedTopics).toEqual(["evt.surface"]);
+    surfaceStop.release();
+
+    const outcome = await starting;
+    expect(outcome.kind).toBe("result");
+    if (outcome.kind === "result") expect(outcome.result.status).toBe("error");
+    expect(raw.stoppedTopics).toEqual(["evt.surface", "evt.request"]);
+    expect(raw.activeSubscriptionCount()).toBe(0);
+  });
+
   it("preserves a subscription startup Panic while attempting every rollback", async () => {
     const raw = createInMemoryRawBus();
     const panic = new Panic({ message: "router subscription startup invariant failed" });
@@ -676,9 +826,15 @@ describe("startBusRequestRouter", () => {
 
     expect(outcome.kind).toBe("result");
     expect(outcome.residualRouter).not.toBeNull();
-    if (outcome.kind === "result" && outcome.result.status === "error") {
-      expect(outcome.result.error).toBeInstanceOf(DiscordRequestRouterStartupAndCleanupFailed);
-      if (DiscordRequestRouterStartupAndCleanupFailed.is(outcome.result.error)) {
+    if (outcome.kind === "result") {
+      expect(outcome.result.status).toBe("error");
+      if (outcome.result.status === "error") {
+        expect(outcome.result.error).toBeInstanceOf(DiscordRequestRouterStartupAndCleanupFailed);
+      }
+      if (
+        outcome.result.status === "error" &&
+        DiscordRequestRouterStartupAndCleanupFailed.is(outcome.result.error)
+      ) {
         const startupFailure = raw.returnedStartFailures.at(0);
         if (!startupFailure) throw new Error("expected a returned startup failure");
         expect(outcome.result.error.startup).toBe(startupFailure);
@@ -702,9 +858,15 @@ describe("startBusRequestRouter", () => {
     });
 
     expect(outcome.kind).toBe("result");
-    if (outcome.kind === "result" && outcome.result.status === "error") {
-      expect(outcome.result.error).toBeInstanceOf(DiscordRequestRouterStartupAndCleanupFailed);
-      if (DiscordRequestRouterStartupAndCleanupFailed.is(outcome.result.error)) {
+    if (outcome.kind === "result") {
+      expect(outcome.result.status).toBe("error");
+      if (outcome.result.status === "error") {
+        expect(outcome.result.error).toBeInstanceOf(DiscordRequestRouterStartupAndCleanupFailed);
+      }
+      if (
+        outcome.result.status === "error" &&
+        DiscordRequestRouterStartupAndCleanupFailed.is(outcome.result.error)
+      ) {
         expect(outcome.result.error.cleanup[0]).toBeInstanceOf(
           DiscordRequestRouterSubscriptionStopRejected,
         );
@@ -799,7 +961,7 @@ describe("startBusRequestRouter", () => {
     expect(raw.stoppedTopics).toEqual(["evt.surface", "evt.request", "evt.request", "evt.surface"]);
   });
 
-  it("all-settles mixed ordinary and Panic residual stop rejections", async () => {
+  it("continues mixed ordinary and Panic residual stop rejections sequentially", async () => {
     const raw = createInMemoryRawBus();
     raw.failStartsFor("evt.adapter", new Error("adapter start failed"));
     raw.failStopsFor("evt.surface", new Error("initial surface cleanup failed"));
@@ -827,8 +989,21 @@ describe("startBusRequestRouter", () => {
       expect(stopped.additionalPanics).toEqual([]);
       expect(stopped.ordinaryFailure?.failures).toHaveLength(1);
       expect(stopped.ordinaryFailure?.failures[0]?.cause).toBe(ordinary);
+      raw.clearStopFailuresFor("evt.surface");
+      raw.clearStopFailuresFor("evt.request");
+      const retried = await stopped.residualRouter.stop();
+      expect(retried.kind).toBe("result");
+      if (retried.kind === "result") {
+        expect(retried.result.status).toBe("ok");
+        expect(retried.residualRouter).toBeNull();
+      }
     }
-    expect(raw.stoppedTopics.slice(-2)).toEqual(["evt.request", "evt.surface"]);
+    expect(raw.stoppedTopics.slice(-4)).toEqual([
+      "evt.request",
+      "evt.surface",
+      "evt.surface",
+      "evt.request",
+    ]);
   });
 
   it("preserves every residual stop Panic by exact identity", async () => {
@@ -882,9 +1057,12 @@ describe("startBusRequestRouter", () => {
     const stopped = await residualRouter.stop();
 
     expect(stopped.kind).toBe("result");
-    if (stopped.kind === "result" && stopped.result.status === "error") {
-      expect(stopped.result.error.failures).toHaveLength(1);
-      expect(stopped.result.error.failures[0]?.cause).toBe(synchronousFailure);
+    if (stopped.kind === "result") {
+      expect(stopped.result.status).toBe("error");
+      if (stopped.result.status === "error") {
+        expect(stopped.result.error.failures).toHaveLength(1);
+        expect(stopped.result.error.failures[0]?.cause).toBe(synchronousFailure);
+      }
     }
     expect(raw.stoppedTopics.slice(-2)).toEqual(["evt.request", "evt.surface"]);
   });
@@ -902,10 +1080,13 @@ describe("startBusRequestRouter", () => {
 
     expect(outcome.kind).toBe("result");
     expect(outcome.residualRouter).toBeNull();
-    if (outcome.kind === "result" && outcome.result.status === "error") {
-      const startupFailure = raw.returnedStartFailures.at(0);
-      if (!startupFailure) throw new Error("expected a returned startup failure");
-      expect(outcome.result.error).toBe(startupFailure);
+    if (outcome.kind === "result") {
+      expect(outcome.result.status).toBe("error");
+      if (outcome.result.status === "error") {
+        const startupFailure = raw.returnedStartFailures.at(0);
+        if (!startupFailure) throw new Error("expected a returned startup failure");
+        expect(outcome.result.error).toBe(startupFailure);
+      }
     }
     expect(raw.stoppedTopics).toEqual(["evt.request"]);
   });
@@ -5157,6 +5338,252 @@ describe("startBusRequestRouter", () => {
     expect(userText).toContain("B one");
     expect(userText).toContain("B two");
     expect(userText.indexOf("B one")).toBeLessThan(userText.indexOf("B two"));
+
+    await sub.stop();
+    await router.stop();
+  });
+
+  it("retains unconfirmed rollover items across partial publication failure and redelivery", async () => {
+    const raw = createInMemoryRawBus();
+    const bus = createLilacBus(raw);
+    const sessionId = "batch-source-handoff";
+    const requestOne = `discord:${sessionId}:request-one`;
+    const requestTwo = `discord:${sessionId}:request-two`;
+    const outputOne = "output-one";
+    const outputTwo = "output-two";
+    const replyOneA = "reply-one-a";
+    const replyOneB = "reply-one-b";
+    const replyTwo = "reply-two";
+    const now = Date.now();
+    const adapter = new FakeAdapter({
+      [`${sessionId}:${outputOne}`]: {
+        ref: { platform: "discord", channelId: sessionId, messageId: outputOne },
+        session: { platform: "discord", channelId: sessionId },
+        userId: "bot",
+        text: "first output",
+        ts: now,
+        raw: { reference: {} },
+      },
+      [`${sessionId}:${replyOneA}`]: {
+        ref: { platform: "discord", channelId: sessionId, messageId: replyOneA },
+        session: { platform: "discord", channelId: sessionId },
+        userId: "user-one",
+        text: "first deferred reply A",
+        ts: now + 1,
+        raw: { reference: { messageId: outputOne, channelId: sessionId } },
+      },
+      [`${sessionId}:${replyOneB}`]: {
+        ref: { platform: "discord", channelId: sessionId, messageId: replyOneB },
+        session: { platform: "discord", channelId: sessionId },
+        userId: "user-one",
+        text: "first deferred reply B",
+        ts: now + 2,
+        raw: { reference: { messageId: outputOne, channelId: sessionId } },
+      },
+      [`${sessionId}:${outputTwo}`]: {
+        ref: { platform: "discord", channelId: sessionId, messageId: outputTwo },
+        session: { platform: "discord", channelId: sessionId },
+        userId: "bot",
+        text: "second output",
+        ts: now + 3,
+        raw: { reference: {} },
+      },
+      [`${sessionId}:${replyTwo}`]: {
+        ref: { platform: "discord", channelId: sessionId, messageId: replyTwo },
+        session: { platform: "discord", channelId: sessionId },
+        userId: "user-two",
+        text: "second deferred reply",
+        ts: now + 4,
+        raw: { reference: { messageId: outputTwo, channelId: sessionId } },
+      },
+    });
+    const router = await startBusRequestRouter({
+      adapter,
+      bus,
+      subscriptionId: "router-batch-source-handoff",
+      config: {
+        surface: {
+          discord: {
+            tokenEnv: "DISCORD_TOKEN",
+            allowedChannelIds: [],
+            allowedGuildIds: [],
+            botName: "lilac",
+            outputMode: "inline",
+            previewFinalOutputStyle: "embed",
+          },
+          router: {
+            defaultMode: "mention",
+            sessionModes: {},
+            activeDebounceMs: 5,
+            activeGate: { enabled: true, timeoutMs: 2500 },
+          },
+        },
+        agent: { systemPrompt: "(unused in tests; compiled at runtime)" },
+        models: {
+          def: {},
+          main: { model: "openrouter/openai/gpt-4o" },
+          fast: { model: "openrouter/openai/gpt-4o-mini" },
+        },
+      },
+    });
+    const received: DecodedLilacMessageForTopic<"cmd.request">[] = [];
+    let failAfterFirstOldFollowUp = false;
+    const sub = await subscribeTopicForTest(
+      bus,
+      "cmd.request",
+      {
+        mode: "fanout",
+        subscriptionId: "batch-source-handoff-observer",
+        consumerId: "batch-source-handoff-consumer",
+        offset: { type: "begin" },
+      },
+      async (message) => {
+        if (message.type === lilacEventTypes.CmdRequestMessage) {
+          received.push(message);
+          if (
+            failAfterFirstOldFollowUp &&
+            message.headers?.request_id === requestOne &&
+            message.data.queue === "followUp"
+          ) {
+            failAfterFirstOldFollowUp = false;
+            raw.failNextPublicationTo(
+              "cmd.request",
+              new Error("forced rollover publication failure"),
+            );
+          }
+        }
+        return Result.ok(undefined);
+      },
+    );
+    const publishLifecycle = async (requestId: string, state: "running" | "resolved") => {
+      await bus.publish(
+        lilacEventTypes.EvtRequestLifecycleChanged,
+        { state, ts: Date.now() },
+        {
+          headers: {
+            request_id: requestId,
+            session_id: sessionId,
+            request_client: "discord",
+          },
+        },
+      );
+    };
+    const publishOutput = async (requestId: string, messageId: string) => {
+      await bus.publish(
+        lilacEventTypes.EvtSurfaceOutputMessageCreated,
+        { msgRef: { platform: "discord", channelId: sessionId, messageId } },
+        {
+          headers: {
+            request_id: requestId,
+            session_id: sessionId,
+            request_client: "discord",
+          },
+        },
+      );
+    };
+    const publishReply = async (input: {
+      readonly messageId: string;
+      readonly outputMessageId: string;
+      readonly userId: string;
+      readonly text: string;
+      readonly ts: number;
+    }) => {
+      await bus.publish(lilacEventTypes.EvtAdapterMessageCreated, {
+        platform: "discord",
+        channelId: sessionId,
+        messageId: input.messageId,
+        userId: input.userId,
+        text: input.text,
+        ts: input.ts,
+        raw: {
+          discord: {
+            isDMBased: false,
+            mentionsBot: false,
+            replyToBot: true,
+            replyToMessageId: input.outputMessageId,
+          },
+        },
+      });
+    };
+
+    await publishLifecycle(requestOne, "running");
+    await publishOutput(requestOne, outputOne);
+    await publishReply({
+      messageId: replyOneA,
+      outputMessageId: outputOne,
+      userId: "user-one",
+      text: "first deferred reply A",
+      ts: now + 1,
+    });
+    await publishReply({
+      messageId: replyOneB,
+      outputMessageId: outputOne,
+      userId: "user-one",
+      text: "first deferred reply B",
+      ts: now + 2,
+    });
+    expect(received).toHaveLength(0);
+
+    await publishLifecycle(requestTwo, "running");
+    await publishOutput(requestTwo, outputTwo);
+    failAfterFirstOldFollowUp = true;
+    await publishReply({
+      messageId: replyTwo,
+      outputMessageId: outputTwo,
+      userId: "user-two",
+      text: "second deferred reply",
+      ts: now + 4,
+    });
+
+    expect(received).toHaveLength(1);
+    expect(received[0]?.headers?.request_id).toBe(requestOne);
+    expect(received[0]?.data.queue).toBe("followUp");
+    expect(collectUserText(received[0]?.data.messages ?? [])).toContain("first deferred reply A");
+    expect(
+      raw.deliveryActions
+        .filter(({ topic }) => topic === "evt.adapter")
+        .map(({ action }) => action.disposition)
+        .at(-1),
+    ).toBe("park-pending");
+
+    await publishReply({
+      messageId: replyTwo,
+      outputMessageId: outputTwo,
+      userId: "user-two",
+      text: "second deferred reply",
+      ts: now + 4,
+    });
+
+    expect(received).toHaveLength(2);
+    expect(received[1]?.headers?.request_id).toBe(requestOne);
+    expect(received[1]?.data.queue).toBe("followUp");
+    expect(collectUserText(received[1]?.data.messages ?? [])).toContain("first deferred reply B");
+    expect(
+      received.filter((message) =>
+        collectUserText(message.data.messages ?? []).includes("first deferred reply A"),
+      ),
+    ).toHaveLength(1);
+    expect(
+      raw.deliveryActions
+        .filter(({ topic }) => topic === "evt.adapter")
+        .map(({ action }) => action.disposition)
+        .slice(-2),
+    ).toEqual(["park-pending", "commit"]);
+
+    await publishLifecycle(requestOne, "resolved");
+    expect(received).toHaveLength(2);
+
+    await publishLifecycle(requestTwo, "resolved");
+    expect(received).toHaveLength(3);
+    expect(received[2]?.headers?.request_id).toBe(`discord:${sessionId}:${replyTwo}`);
+    expect(received[2]?.data.queue).toBe("prompt");
+    expect(received[2]?.data.raw).toMatchObject({
+      pendingMentionReplyBatch: {
+        sourceRequestId: requestTwo,
+        size: 1,
+      },
+    });
+    expect(collectUserText(received[2]?.data.messages ?? [])).toContain("second deferred reply");
 
     await sub.stop();
     await router.stop();

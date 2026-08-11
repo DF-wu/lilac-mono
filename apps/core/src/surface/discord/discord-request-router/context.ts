@@ -1,3 +1,5 @@
+import { isPanic } from "@stanley2058/lilac-utils";
+
 import type { SurfaceAdapter } from "../../adapter";
 import type { MsgRef, SurfaceMessage } from "../../types";
 
@@ -13,7 +15,10 @@ export async function resolvePreviousMessageText(params: {
 }): Promise<string | undefined> {
   const around = await params.adapter
     .getReplyContext(params.input.msgRef, { limit: 8 })
-    .catch(() => []);
+    .catch((cause) => {
+      if (isPanic(cause)) throw cause;
+      return [];
+    });
   if (around.length === 0) return undefined;
 
   let prev: SurfaceMessage | null = null;
@@ -52,7 +57,10 @@ export async function resolveRepliedToMessageText(params: {
       channelId: params.input.sessionId,
       messageId: params.input.replyToMessageId,
     })
-    .catch(() => null);
+    .catch((cause) => {
+      if (isPanic(cause)) throw cause;
+      return null;
+    });
 
   return normalizeGateText(repliedTo?.text ?? undefined);
 }

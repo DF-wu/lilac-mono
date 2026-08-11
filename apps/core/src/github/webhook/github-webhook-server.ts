@@ -374,6 +374,18 @@ function newGithubRequestId(input: {
   return input.suffix ? `${base}:${input.suffix}` : base;
 }
 
+export function transferGithubAcknowledgement(
+  previousRequestId: string | undefined,
+  requestId: string,
+): boolean {
+  if (!previousRequestId || previousRequestId === requestId) return false;
+  const acknowledgement = getGithubAck(previousRequestId);
+  if (!acknowledgement) return false;
+  setGithubAck(requestId, acknowledgement);
+  clearGithubAck(previousRequestId);
+  return true;
+}
+
 export async function startGithubWebhookServer(options: GithubWebhookOptions): Promise<{
   stop(): Promise<void>;
 }> {
@@ -785,6 +797,8 @@ async function onReviewRequested(input: {
     triggerId: String(prNumber),
     suffix: headSha.slice(0, 8),
   });
+  const previousRequestId = getGithubLatestRequestForSession(sessionId);
+  const acknowledgementTransferred = transferGithubAcknowledgement(previousRequestId, requestId);
 
   input.logger.info("github trigger: review_requested", {
     repo: input.repoFullName,
@@ -794,16 +808,18 @@ async function onReviewRequested(input: {
   });
 
   // Ack quickly on the PR description (issue).
-  const ack = await captureGithubWebhookOperation("review acknowledgement", () =>
-    addEyesReactionToIssue({ owner, repo, issueNumber: prNumber }),
-  );
-  if (ack.status === "ok") {
-    setGithubAck(requestId, {
-      target: { kind: "issue", issueNumber: prNumber },
-      reactionId: ack.value,
-    });
-  } else {
-    input.logger.warn("failed to add eyes reaction", formatTaggedErrorForLog(ack.error));
+  if (!acknowledgementTransferred) {
+    const ack = await captureGithubWebhookOperation("review acknowledgement", () =>
+      addEyesReactionToIssue({ owner, repo, issueNumber: prNumber }),
+    );
+    if (ack.status === "ok") {
+      setGithubAck(requestId, {
+        target: { kind: "issue", issueNumber: prNumber },
+        reactionId: ack.value,
+      });
+    } else {
+      input.logger.warn("failed to add eyes reaction", formatTaggedErrorForLog(ack.error));
+    }
   }
 
   const prData = await getPullRequest({ owner, repo, number: prNumber });
@@ -903,11 +919,7 @@ async function onPullRequestSynchronize(input: {
     suffix: headSha.slice(0, 8),
   });
 
-  const prevAck = getGithubAck(meta.requestId);
-  if (prevAck) {
-    setGithubAck(requestId, prevAck);
-    clearGithubAck(meta.requestId);
-  }
+  transferGithubAcknowledgement(meta.requestId, requestId);
 
   // Immediately treat the new request as the latest to suppress any stale output.
   setGithubLatestRequestForSession(sessionId, requestId);

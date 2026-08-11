@@ -477,12 +477,12 @@ export const PRECISE_EXCEPTION_IDENTITIES: Readonly<
     [
       "src/surface/discord/discord-request-router/context.ts",
       "resolvePreviousMessageText.catch.<callback@1>",
-      "capture",
+      "both",
     ],
     [
       "src/surface/discord/discord-request-router/context.ts",
       "resolveRepliedToMessageText.catch.<callback@1>",
-      "capture",
+      "both",
     ],
     [
       "src/surface/discord/discord-request-router/publish.ts",

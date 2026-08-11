@@ -9,7 +9,7 @@ import {
 import { Result } from "better-result";
 import { z } from "zod";
 
-import type { MsgRef } from "../../types";
+import type { MsgRefFor } from "../../runtime-descriptor";
 import { formatGenericRequestId, formatQueuedRequestId } from "../../bridge/request-ids";
 
 export type SessionMode = "mention" | "active";
@@ -242,7 +242,7 @@ export function bufferedPromptRequestIdForActiveRequest(activeRequestId: string)
 export function parseDiscordMsgRefFromAdapterEvent(data: {
   channelId: string;
   messageId: string;
-}): MsgRef {
+}): MsgRefFor<"discord"> {
   return {
     platform: "discord",
     channelId: data.channelId,

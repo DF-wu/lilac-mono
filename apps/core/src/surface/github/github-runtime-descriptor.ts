@@ -1,11 +1,7 @@
 import type { SurfaceMsgRef } from "@stanley2058/lilac-event-bus";
 import { Panic, Result, TaggedError, type Result as ResultType } from "better-result";
 
-import {
-  errorMessage,
-  formatTaggedErrorForLog,
-  opaqueErrorMessage,
-} from "@stanley2058/lilac-utils";
+import { formatTaggedErrorForLog, opaqueErrorMessage } from "@stanley2058/lilac-utils";
 
 import {
   deleteIssueCommentReactionById,
@@ -226,24 +222,32 @@ export function preserveGithubRelayPolicyPanic(cause: unknown): void {
 
 export async function deleteGithubAcknowledgement(
   input: {
-    readonly owner: string;
-    readonly repo: string;
+    readonly requestId: string;
+    readonly sessionId: string;
     readonly ack: GithubAckState;
   },
   api: GithubAcknowledgementApi,
 ): Promise<ResultType<void, GithubAcknowledgementDeleteFailed>> {
   try {
+    const meta = getGithubRequestMeta(input.requestId);
+    const thread = (() => {
+      if (meta?.repoFullName) {
+        const [owner, repo] = meta.repoFullName.split("/");
+        if (owner && repo) return { owner, repo };
+      }
+      return parseGithubSessionId(input.sessionId);
+    })();
     if (input.ack.target.kind === "issue") {
       await api.deleteIssueReactionById({
-        owner: input.owner,
-        repo: input.repo,
+        owner: thread.owner,
+        repo: thread.repo,
         issueNumber: input.ack.target.issueNumber,
         reactionId: input.ack.reactionId,
       });
     } else {
       await api.deleteIssueCommentReactionById({
-        owner: input.owner,
-        repo: input.repo,
+        owner: thread.owner,
+        repo: thread.repo,
         commentId: input.ack.target.commentId,
         reactionId: input.ack.reactionId,
       });
@@ -254,7 +258,7 @@ export async function deleteGithubAcknowledgement(
     return Result.err(
       new GithubAcknowledgementDeleteFailed({
         cause,
-        isNotFound: errorMessage(cause).includes("404"),
+        isNotFound: cause instanceof GithubApiError && cause.status === 404,
         message: "Failed to delete GitHub acknowledgement reaction",
       }),
     );
@@ -271,21 +275,12 @@ async function clearGithubIngressAcknowledgement(
   const ack = getGithubAck(input.requestId);
   if (!ack) return Result.ok(undefined);
 
-  const meta = getGithubRequestMeta(input.requestId);
-  const thread = (() => {
-    if (meta?.repoFullName) {
-      const [owner, repo] = meta.repoFullName.split("/");
-      if (owner && repo) return { owner, repo };
-    }
-    return parseGithubSessionId(input.sessionId);
-  })();
-
   let deleted: ResultType<void, GithubAcknowledgementDeleteFailed>;
   try {
     deleted = await deleteGithubAcknowledgement(
       {
-        owner: thread.owner,
-        repo: thread.repo,
+        requestId: input.requestId,
+        sessionId: input.sessionId,
         ack,
       },
       api,

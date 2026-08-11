@@ -5,8 +5,10 @@ import { Panic } from "better-result";
 import {
   decodeGithubWebhookEvent,
   superviseGithubWebhookHandler,
+  transferGithubAcknowledgement,
   verifyGithubWebhookSignature,
 } from "../../src/github/webhook/github-webhook-server";
+import { clearGithubAck, getGithubAck, setGithubAck } from "../../src/github/github-state";
 
 describe("github webhook signature", () => {
   it("verifies sha256 signature", () => {
@@ -92,5 +94,27 @@ describe("github webhook signature", () => {
       }),
     ).rejects.toBe(panic);
     expect(reported).toEqual([panic]);
+  });
+
+  it("transfers acknowledgement ownership only to a distinct request", () => {
+    const previousRequestId = `github-review-old-${crypto.randomUUID()}`;
+    const requestId = `github-review-new-${crypto.randomUUID()}`;
+    const acknowledgement = {
+      target: { kind: "issue" as const, issueNumber: 12 },
+      reactionId: 42,
+    };
+    setGithubAck(previousRequestId, acknowledgement);
+
+    try {
+      expect(transferGithubAcknowledgement(previousRequestId, requestId)).toBe(true);
+      expect(getGithubAck(previousRequestId)).toBeUndefined();
+      expect(getGithubAck(requestId)).toEqual(acknowledgement);
+
+      expect(transferGithubAcknowledgement(requestId, requestId)).toBe(false);
+      expect(getGithubAck(requestId)).toEqual(acknowledgement);
+    } finally {
+      clearGithubAck(previousRequestId);
+      clearGithubAck(requestId);
+    }
   });
 });

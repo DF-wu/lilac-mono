@@ -21,6 +21,7 @@ import {
 import { Panic, Result, TaggedError, type Result as ResultType } from "better-result";
 import type { Logger } from "@stanley2058/simple-module-logger";
 import type { SurfaceAdapter } from "../adapter";
+import type { MsgRefFor } from "../runtime-descriptor";
 import type { MsgRef, SurfaceSelf } from "../types";
 import type { TranscriptStore } from "../../transcript/transcript-store";
 import {
@@ -172,6 +173,13 @@ export class DiscordRequestRouterSubscriptionStartRejected extends TaggedError(
   readonly message: string;
 }> {}
 
+export class DiscordRequestRouterAdapterSelfLookupRejected extends TaggedError(
+  "DiscordRequestRouterAdapterSelfLookupRejected",
+)<{
+  readonly cause: unknown;
+  readonly message: string;
+}> {}
+
 export class DiscordRequestRouterSubscriptionStopRejected extends TaggedError(
   "DiscordRequestRouterSubscriptionStopRejected",
 )<{
@@ -181,7 +189,8 @@ export class DiscordRequestRouterSubscriptionStopRejected extends TaggedError(
 
 export type DiscordRequestRouterStartupFailure =
   | EventDeliveryStartFailed
-  | DiscordRequestRouterSubscriptionStartRejected;
+  | DiscordRequestRouterSubscriptionStartRejected
+  | DiscordRequestRouterAdapterSelfLookupRejected;
 
 export type DiscordRequestRouterCleanupFailure =
   | EventDeliveryStopFailed
@@ -324,6 +333,11 @@ type RouterSubscriptionStartOutcome =
   | { readonly kind: "failure"; readonly failure: DiscordRequestRouterStartupFailure }
   | { readonly kind: "panic"; readonly panic: Panic };
 
+type RouterSelfLookupOutcome =
+  | { readonly kind: "resolved"; readonly self: SurfaceSelf }
+  | { readonly kind: "failure"; readonly failure: DiscordRequestRouterAdapterSelfLookupRejected }
+  | { readonly kind: "panic"; readonly panic: Panic };
+
 type RouterSubscriptionRollbackOutcome = {
   readonly failures: readonly DiscordRequestRouterCleanupFailure[];
   readonly panics: readonly Panic[];
@@ -337,13 +351,9 @@ async function stopRouterSubscriptionsAllSettled(
   const panics: Panic[] = [];
   const residualSubscriptions: RouterDeliverySubscription[] = [];
 
-  const orderedSubscriptions = subscriptions.toReversed();
-  const stoppedSubscriptions = await Promise.allSettled(
-    orderedSubscriptions.map((subscription) => Promise.resolve().then(() => subscription.stop())),
-  );
-  for (const [index, stopped] of stoppedSubscriptions.entries()) {
-    const subscription = orderedSubscriptions[index];
-    if (!subscription) continue;
+  for (const subscription of subscriptions.toReversed()) {
+    const [stopped] = await Promise.allSettled([Promise.resolve().then(() => subscription.stop())]);
+    if (!stopped) continue;
     if (stopped.status === "rejected") {
       residualSubscriptions.push(subscription);
       if (isPanic(stopped.reason)) {
@@ -365,6 +375,23 @@ async function stopRouterSubscriptionsAllSettled(
   }
 
   return { failures, panics, residualSubscriptions };
+}
+
+async function adaptRouterSelfLookup(
+  operation: () => Promise<SurfaceSelf>,
+): Promise<RouterSelfLookupOutcome> {
+  const [settled] = await Promise.allSettled([Promise.resolve().then(operation)]);
+  if (settled.status === "rejected") {
+    if (isPanic(settled.reason)) return { kind: "panic", panic: settled.reason };
+    return {
+      kind: "failure",
+      failure: new DiscordRequestRouterAdapterSelfLookupRejected({
+        cause: settled.reason,
+        message: "Discord request router adapter self lookup rejected",
+      }),
+    };
+  }
+  return { kind: "resolved", self: settled.value };
 }
 
 async function rollbackRouterSubscriptionStartup(
@@ -444,13 +471,13 @@ function createResidualDiscordRequestRouter(
           : null;
 
       const panic = stopped.panics[0];
-      if (panic) {
+      if (panic && residualRouter) {
         return {
           kind: "panic",
           panic,
           additionalPanics: stopped.panics.slice(1),
           ordinaryFailure,
-          residualRouter: createResidualDiscordRequestRouter(stopped.residualSubscriptions),
+          residualRouter,
         };
       }
       if (ordinaryFailure) {
@@ -605,7 +632,14 @@ export async function startDiscordRequestRouter(
   params: StartDiscordRequestRouterInput,
 ): Promise<DiscordRequestRouterStartOutcome> {
   const { adapter, bus, subscriptionId, customCommands } = params;
-  const self = await adapter.getSelf();
+  const selfLookup = await adaptRouterSelfLookup(() => adapter.getSelf());
+  if (selfLookup.kind !== "resolved") {
+    return finishRouterSubscriptionStartFailure(
+      selfLookup.kind === "panic" ? selfLookup.panic : selfLookup.failure,
+      [],
+    );
+  }
+  const self = selfLookup.self;
   if (self.platform !== "discord") signalDiscordRequestRouterPlatformMismatch(self.platform);
 
   const logger =
@@ -1263,7 +1297,7 @@ export async function startDiscordRequestRouter(
     }
   }
 
-  function enqueuePendingMentionReplyBatch(input: {
+  async function enqueuePendingMentionReplyBatch(input: {
     sessionId: string;
     sourceRequestId: string;
     sessionConfigId: string;
@@ -1271,7 +1305,17 @@ export async function startDiscordRequestRouter(
     sessionMode: SessionMode;
     modelOverride?: string;
     item: PendingMentionReplyBatchItem;
-  }) {
+  }): Promise<void> {
+    const existing = pendingMentionReplyBatchBySession.get(input.sessionId);
+    if (existing && existing.sourceRequestId !== input.sourceRequestId) {
+      const flushed = await flushPendingMentionReplyBatchAsFollowUp({
+        sessionId: input.sessionId,
+        sourceRequestId: existing.sourceRequestId,
+      });
+      if (!flushed && pendingMentionReplyBatchBySession.get(input.sessionId) === existing) {
+        pendingMentionReplyBatchBySession.delete(input.sessionId);
+      }
+    }
     enqueuePendingMentionReplyBatchImpl({
       pendingMentionReplyBatchBySession,
       input,
@@ -1297,16 +1341,17 @@ export async function startDiscordRequestRouter(
   async function flushPendingMentionReplyBatchAsFollowUp(input: {
     sessionId: string;
     sourceRequestId: string;
-  }) {
-    const batch = takePendingMentionReplyBatch(input);
-    if (!batch || batch.items.length === 0) return;
+  }): Promise<boolean> {
+    const batch = pendingMentionReplyBatchBySession.get(input.sessionId);
+    if (!batch || batch.sourceRequestId !== input.sourceRequestId) return true;
 
-    for (const item of batch.items) {
-      await publishSingleMessageToActiveRequest({
+    while (batch.items.length > 0) {
+      const item = batch.items[0]!;
+      const published = await publishSingleMessageToActiveRequest({
         adapter,
         bus,
         cfg,
-        requestId: input.sourceRequestId,
+        requestId: batch.sourceRequestId,
         sessionId: input.sessionId,
         sessionConfigId: batch.sessionConfigId,
         parentChannelId: batch.parentChannelId,
@@ -1316,7 +1361,14 @@ export async function startDiscordRequestRouter(
         modelOverride: batch.modelOverride,
         transformUserText: transformPendingUserText(item),
       });
+      if (!published) return false;
+      batch.items.shift();
     }
+
+    if (pendingMentionReplyBatchBySession.get(input.sessionId) === batch) {
+      pendingMentionReplyBatchBySession.delete(input.sessionId);
+    }
+    return true;
   }
 
   async function flushPendingMentionReplyBatchAsPrompt(input: {
@@ -2198,7 +2250,7 @@ export async function startDiscordRequestRouter(
     cfg: CoreConfig;
     activeBySession: Map<string, ActiveSessionState>;
     sessionId: string;
-    msgRef: MsgRef;
+    msgRef: MsgRefFor<"discord">;
     userId: string;
     userText: string;
     mentionsBot?: boolean;
@@ -2343,7 +2395,7 @@ export async function startDiscordRequestRouter(
           sourceRequestId: active.requestId,
         });
       } else {
-        enqueuePendingMentionReplyBatch({
+        await enqueuePendingMentionReplyBatch({
           sessionId,
           sourceRequestId: active.requestId,
           sessionConfigId: input.sessionConfigId,
@@ -2467,7 +2519,7 @@ export async function startDiscordRequestRouter(
 
   async function publishSingleMessageToActiveRequest(
     input: PublishSingleMessageToActiveRequestLocalInput,
-  ) {
+  ): Promise<boolean> {
     const { adapter, bus, cfg, ...requestInput } = input;
     const published = await publishSingleMessageToActiveRequestImpl({
       adapter,
@@ -2483,7 +2535,9 @@ export async function startDiscordRequestRouter(
         sessionId: input.sessionId,
         error: "Core owned blob integrity check failed",
       });
+      return false;
     }
+    return true;
   }
 
   type PublishSingleMessagePromptLocalInput = Parameters<

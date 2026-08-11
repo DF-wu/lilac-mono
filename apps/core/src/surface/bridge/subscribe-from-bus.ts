@@ -112,8 +112,9 @@ type EvtRequestDeliveryError =
 function applyEvtRequestDeliveryPolicy(error: EvtRequestDeliveryError): DeliveryDisposition {
   switch (error._tag) {
     case "EvtRequestRequiredHeadersMissing":
-    case "EvtRequestReplyTargetInvalid":
       return "park-pending";
+    case "EvtRequestReplyTargetInvalid":
+      return "dead-letter";
     case "EvtRequestStopTypingFailed":
       return "commit";
   }
@@ -1876,9 +1877,9 @@ export async function bridgeBusToAdapter<P extends RegisteredSurfacePlatform>(pa
                 platform,
               }),
             );
-            continue;
+          } else {
+            initialReplyTo = decoded.value;
           }
-          initialReplyTo = decoded.value;
         } else {
           const resolved = policy.refs.resolveInitialReplyTarget({
             requestId: snapshot.requestId,
@@ -1893,7 +1894,6 @@ export async function bridgeBusToAdapter<P extends RegisteredSurfacePlatform>(pa
                 platform,
               }),
             );
-            continue;
           }
           if (resolved.kind === "target") initialReplyTo = resolved.ref;
         }

@@ -20,6 +20,7 @@ import {
   captureCoreEventBusCleanup,
   CoreEventBusCleanupFailed,
   CoreEventBusSetupFailed,
+  CoreResidualDiscordRequestRouterDoneTimedOut,
   type CoreResidualDiscordRequestRouterDoneOutcome,
   type CoreRuntimeCleanupFailure,
   createCoreEventBusDeliveryOptions,
@@ -265,12 +266,41 @@ describe("Core runtime startup", () => {
     await settleCoreResidualDiscordRequestRouterDone({
       supervision,
       cleanup,
+      reportLatePanic: () => {},
+      deadlineMs: 3_000,
     });
 
     expect(cleanup.failures).toEqual([
       { label: "residualRouter.done", error: panic.message, panic: true },
     ]);
     expect(() => cleanup.finish()).toThrow(panic);
+  });
+
+  it("records an in-time residual done Result error", async () => {
+    const failure = new EventDeliveryTransportFailed({
+      topic: "evt.request",
+      operation: "ack",
+      cursor: "8-0",
+      cause: new Error("Redis connection closed"),
+      message: "Redis delivery acknowledgement failed",
+    });
+    const cleanup = createCoreRuntimeCleanupSupervisor(null);
+    let cancelled = false;
+
+    await settleCoreResidualDiscordRequestRouterDone({
+      supervision: Promise.resolve({ kind: "result", result: Result.err(failure) }),
+      cleanup,
+      reportLatePanic: () => {},
+      deadlineMs: 3_000,
+      scheduleDeadline: () => () => {
+        cancelled = true;
+      },
+    });
+
+    expect(cancelled).toBe(true);
+    expect(cleanup.failures).toEqual([
+      { label: "residualRouter.done", error: failure.message, panic: false },
+    ]);
   });
 
   it("records every residual stop Panic and keeps exact first-Panic precedence", async () => {
@@ -381,8 +411,54 @@ describe("Core runtime startup", () => {
     expect(supervisions).toHaveLength(2);
     const supervision = supervisions[1];
     if (!supervision) throw new Error("expected replacement done supervision");
-    await settleCoreResidualDiscordRequestRouterDone({ supervision, cleanup });
+    await settleCoreResidualDiscordRequestRouterDone({
+      supervision,
+      cleanup,
+      reportLatePanic: () => {},
+      deadlineMs: 3_000,
+    });
     expect(cleanup.panics).toEqual([donePanic]);
+  });
+
+  it("reports a residual done Panic that settles after the cleanup deadline", async () => {
+    const done = Promise.withResolvers<CoreResidualDiscordRequestRouterDoneOutcome>();
+    const reported = Promise.withResolvers<Panic>();
+    const panic = new Panic({ message: "late residual done invariant failed" });
+    const recorded: Array<{ readonly label: string; readonly cause: Error }> = [];
+    let expireDeadline: () => void = () => {
+      throw new Error("deadline was not scheduled");
+    };
+    let cancelled = false;
+
+    const settling = settleCoreResidualDiscordRequestRouterDone({
+      supervision: done.promise,
+      cleanup: {
+        record: (label, cause) => recorded.push({ label, cause }),
+      },
+      reportLatePanic: (latePanic) => {
+        reported.resolve(latePanic);
+      },
+      deadlineMs: 3_000,
+      scheduleDeadline: (callback, delayMs) => {
+        expect(delayMs).toBe(3_000);
+        expireDeadline = callback;
+        return () => {
+          cancelled = true;
+        };
+      },
+    });
+    expireDeadline();
+    await settling;
+
+    expect(cancelled).toBe(true);
+    expect(recorded).toHaveLength(1);
+    expect(recorded[0]?.label).toBe("residualRouter.done");
+    expect(recorded[0]?.cause).toBeInstanceOf(CoreResidualDiscordRequestRouterDoneTimedOut);
+    expect(recorded[0]?.cause).toMatchObject({ deadlineMs: 3_000 });
+
+    done.resolve({ kind: "panic", panic });
+    expect(await reported.promise).toBe(panic);
+    expect(recorded).toHaveLength(1);
   });
 
   it("runs full cleanup once across residual-router stop re-entry and eventual release", async () => {
@@ -484,7 +560,12 @@ describe("Core runtime startup", () => {
 
       if (stopPass === "full") fullCleanupPending = false;
       for (const supervision of residualDoneSupervisions) {
-        await settleCoreResidualDiscordRequestRouterDone({ supervision, cleanup });
+        await settleCoreResidualDiscordRequestRouterDone({
+          supervision,
+          cleanup,
+          reportLatePanic: () => {},
+          deadlineMs: 3_000,
+        });
       }
       residualDoneSupervisions.length = 0;
       cleanupFailures.push(cleanup.failures);

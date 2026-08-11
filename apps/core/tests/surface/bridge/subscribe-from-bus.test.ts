@@ -549,7 +549,7 @@ describe("bridgeBusToAdapter", () => {
     ["github:octo/repo#1:10", "cross-platform"],
     ["discord:other:message", "cross-session"],
   ] as const)(
-    "parks an invalid initial %s target instead of starting top-level",
+    "dead-letters an invalid initial %s target instead of starting top-level",
     async (requestId) => {
       const deliveries: DeliveryObservation[] = [];
       const bus = createLilacBus(createInMemoryRawBus((delivery) => deliveries.push(delivery)));
@@ -575,7 +575,7 @@ describe("bridgeBusToAdapter", () => {
       );
 
       expect(adapter.streams).toHaveLength(0);
-      expect(deliveries.at(-1)?.disposition).toBe("park-pending");
+      expect(deliveries.at(-1)?.disposition).toBe("dead-letter");
       await bridge.stop();
     },
   );
@@ -2791,33 +2791,37 @@ describe("bridgeBusToAdapter", () => {
     ["discord:chan", "malformed"],
     ["github:octo/repo#1:10", "cross-platform"],
     ["discord:other:message", "cross-session"],
-  ] as const)("rejects absent-replyTo restore with %s request identity", async (requestId) => {
-    const bus = createLilacBus(createInMemoryRawBus());
-    const adapter = new FakeAdapter();
-    const bridge = await bridgeBusToAdapter({
-      adapter,
-      bus,
-      platform: "discord",
-      subscriptionId: `restore-invalid-request-${crypto.randomUUID()}`,
-      idleTimeoutMs: 10_000,
-    });
-
-    await bridge.restoreRelays([
-      {
-        requestId,
-        sessionId: "chan",
-        requestClient: "discord",
+  ] as const)(
+    "restores absent-replyTo snapshot with invalid %s request identity",
+    async (requestId) => {
+      const bus = createLilacBus(createInMemoryRawBus());
+      const adapter = new FakeAdapter();
+      const bridge = await bridgeBusToAdapter({
+        adapter,
+        bus,
         platform: "discord",
-        createdOutputRefs: [],
-        visibleText: "partial",
-        toolStatus: [],
-      },
-    ]);
+        subscriptionId: `restore-invalid-request-${crypto.randomUUID()}`,
+        idleTimeoutMs: 10_000,
+      });
 
-    expect(adapter.starts).toHaveLength(0);
-    expect(bridge.snapshotRelays()).toEqual([]);
-    await bridge.stop();
-  });
+      await bridge.restoreRelays([
+        {
+          requestId,
+          sessionId: "chan",
+          requestClient: "discord",
+          platform: "discord",
+          createdOutputRefs: [],
+          visibleText: "partial",
+          toolStatus: [],
+        },
+      ]);
+
+      expect(adapter.starts).toHaveLength(1);
+      expect(adapter.starts[0]?.opts?.replyTo).toBeUndefined();
+      expect(bridge.snapshotRelays()).toHaveLength(1);
+      await bridge.stop();
+    },
+  );
 
   it("prefers a valid persisted replyTo over malformed request identity during restore", async () => {
     const bus = createLilacBus(createInMemoryRawBus());
@@ -2851,7 +2855,7 @@ describe("bridgeBusToAdapter", () => {
   it.each([
     { platform: "github" as const, channelId: "chan", messageId: "cross-platform" },
     { platform: "discord" as const, channelId: "other", messageId: "cross-session" },
-  ])("rejects invalid persisted restore target $messageId", async (replyTo) => {
+  ])("restores invalid persisted target $messageId without a reply target", async (replyTo) => {
     const bus = createLilacBus(createInMemoryRawBus());
     const adapter = new FakeAdapter();
     const bridge = await bridgeBusToAdapter({
@@ -2875,8 +2879,9 @@ describe("bridgeBusToAdapter", () => {
       },
     ]);
 
-    expect(adapter.starts).toHaveLength(0);
-    expect(bridge.snapshotRelays()).toEqual([]);
+    expect(adapter.starts).toHaveLength(1);
+    expect(adapter.starts[0]?.opts?.replyTo).toBeUndefined();
+    expect(bridge.snapshotRelays()).toHaveLength(1);
     await bridge.stop();
   });
 

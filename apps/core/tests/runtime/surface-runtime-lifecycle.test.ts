@@ -1,4 +1,5 @@
 import { describe, expect, it } from "bun:test";
+import { Panic } from "better-result";
 
 import {
   connectAndValidateSurfaceAdapters,
@@ -229,15 +230,16 @@ describe("surface runtime lifecycle", () => {
       githubRequestIngressStart: async () => ({ stop: async () => undefined }),
     });
     const ports = createSurfaceWorkflowProgressPortMap(registry);
+    const [discord, github] = registry.entries();
+    if (!discord?.workflowProgress || !github?.workflowProgress) {
+      throw new Error("Missing expected workflow progress ports");
+    }
 
-    expect([...ports.keys()]).toEqual(["discord", "github"]);
-    expect(new Set(ports.keys()).size).toBe(ports.size);
-    expect([...ports.values()]).toEqual(
-      registry
-        .entries()
-        .flatMap((descriptor) =>
-          descriptor.workflowProgress ? [descriptor.workflowProgress] : [],
-        ),
+    expect(ports).toEqual(
+      new Map([
+        ["discord", discord.workflowProgress],
+        ["github", github.workflowProgress],
+      ]),
     );
   });
 
@@ -486,8 +488,11 @@ describe("surface runtime lifecycle", () => {
       "discord-drain:3000",
       "graceful.surface.github.relay.beginDrain",
       "github-drain:3000",
+      "graceful.agentRunner.snapshotRecoverables",
       "agent-snapshot",
+      "graceful.surface.discord.relay.snapshotRelays",
       "discord-snapshot",
+      "graceful.surface.github.relay.snapshotRelays",
       "github-snapshot",
     ]);
     expect(snapshot).toEqual({
@@ -497,7 +502,40 @@ describe("surface runtime lifecycle", () => {
     expect(JSON.parse(JSON.stringify(snapshot))).toEqual(snapshot);
   });
 
-  it("dispatches only platform-matching relay restores before agent restore", async () => {
+  it("reports matched relay dispatch and unmatched relay snapshots", async () => {
+    const calls: string[] = [];
+    const registry = createRegistry({ calls });
+    const handles = maps();
+    const discordSnapshot = relaySnapshot("discord", "discord-request");
+    const githubSnapshot = relaySnapshot("github", "github-request");
+    handles.relays.set("discord", {
+      ...emptyRelayHandle("discord"),
+      restoreRelays: async (snapshots) => {
+        calls.push(`discord:${snapshots.map((snapshot) => snapshot.requestId).join(",")}`);
+      },
+    });
+
+    const dispatched = await restoreSurfaceRecovery({
+      registry,
+      snapshot: { agent: [agentEntry], relays: [githubSnapshot, discordSnapshot] },
+      relays: handles.relays,
+      agentRunner: {
+        restoreRecoverables: (entries) => {
+          calls.push(`agent:${entries.map((entry) => entry.requestId).join(",")}`);
+        },
+      },
+    });
+
+    expect(calls).toEqual(["discord:discord-request", "agent:discord:session:request"]);
+    expect(dispatched).toEqual({
+      agentEntriesDispatched: 1,
+      agentEntriesUndispatched: 0,
+      relayEntriesMatched: 1,
+      relayEntriesUnmatched: 1,
+    });
+  });
+
+  it("matches Discord and GitHub relays while exposing entries undispatched without an agent runner", async () => {
     const calls: string[] = [];
     const registry = createRegistry({ calls });
     const handles = maps();
@@ -516,21 +554,108 @@ describe("surface runtime lifecycle", () => {
       },
     });
 
-    await restoreSurfaceRecovery({
+    const dispatched = await restoreSurfaceRecovery({
       registry,
       snapshot: { agent: [agentEntry], relays: [githubSnapshot, discordSnapshot] },
       relays: handles.relays,
-      agentRunner: {
-        restoreRecoverables: (entries) => {
-          calls.push(`agent:${entries.map((entry) => entry.requestId).join(",")}`);
-        },
-      },
+      agentRunner: null,
     });
 
-    expect(calls).toEqual([
-      "discord:discord-request",
-      "github:github-request",
-      "agent:discord:session:request",
+    expect(calls).toEqual(["discord:discord-request", "github:github-request"]);
+    expect(dispatched).toEqual({
+      agentEntriesDispatched: 0,
+      agentEntriesUndispatched: 1,
+      relayEntriesMatched: 2,
+      relayEntriesUnmatched: 0,
+    });
+  });
+
+  it("contains synchronous snapshot failures and continues later collection", async () => {
+    const calls: string[] = [];
+    const failures: Array<{ readonly label: string; readonly cause: unknown }> = [];
+    const registry = createRegistry({ calls });
+    const handles = maps();
+    const panic = new Panic({ message: "discord snapshot invariant failed" });
+    const githubSnapshot = relaySnapshot("github", "github-request");
+    handles.relays.set("discord", {
+      ...emptyRelayHandle("discord"),
+      snapshotRelays: () => {
+        throw panic;
+      },
+    });
+    handles.relays.set("github", {
+      ...emptyRelayHandle("github"),
+      snapshotRelays: () => [githubSnapshot],
+    });
+    const runCleanup = async (label: string, cleanup: (() => Promise<void>) | undefined) => {
+      calls.push(label);
+      const [settled] = await Promise.allSettled([Promise.resolve().then(() => cleanup?.())]);
+      if (settled?.status === "rejected") failures.push({ label, cause: settled.reason });
+    };
+
+    const snapshot = await stopIngressAndDrainSurfaceRecovery({
+      registry,
+      stopAdapterIngress: async () => undefined,
+      stopRouterIngress: async () => undefined,
+      stopWorkflowRequestProducers: async () => undefined,
+      stopRequestIngress: async () => undefined,
+      stopRemainingRequestProducers: async () => undefined,
+      deadlineMs: 3_000,
+      runCleanup,
+      agentRunner: {
+        beginDrain: async () => undefined,
+        snapshotRecoverables: () => {
+          throw new Error("agent snapshot failed");
+        },
+        restoreRecoverables: () => undefined,
+      },
+      relays: handles.relays,
+    });
+
+    expect(snapshot).toEqual({ agent: [], relays: [githubSnapshot] });
+    expect(failures.map(({ label }) => label)).toEqual([
+      "graceful.agentRunner.snapshotRecoverables",
+      "graceful.surface.discord.relay.snapshotRelays",
+    ]);
+    expect(failures[1]?.cause).toBe(panic);
+  });
+
+  it("contains rejected snapshot collection and contributes empty entries", async () => {
+    const calls: string[] = [];
+    const failures: string[] = [];
+    const registry = createRegistry({ calls });
+    const handles = maps();
+    const rejection = new Error("snapshot rejected");
+    const relay = emptyRelayHandle("discord");
+    Reflect.set(relay, "snapshotRelays", () => Promise.reject(rejection));
+    handles.relays.set("discord", relay);
+    const agentRunner = {
+      beginDrain: async () => undefined,
+      snapshotRecoverables: () => [agentEntry],
+      restoreRecoverables: () => undefined,
+    };
+    Reflect.set(agentRunner, "snapshotRecoverables", () => Promise.reject(rejection));
+
+    const snapshot = await stopIngressAndDrainSurfaceRecovery({
+      registry,
+      stopAdapterIngress: async () => undefined,
+      stopRouterIngress: async () => undefined,
+      stopWorkflowRequestProducers: async () => undefined,
+      stopRequestIngress: async () => undefined,
+      stopRemainingRequestProducers: async () => undefined,
+      deadlineMs: 3_000,
+      runCleanup: async (label, cleanup) => {
+        const [settled] = await Promise.allSettled([Promise.resolve().then(() => cleanup?.())]);
+        if (settled?.status === "rejected") failures.push(label);
+      },
+      agentRunner,
+      relays: handles.relays,
+    });
+
+    expect(snapshot).toEqual({ agent: [], relays: [] });
+    expect(failures).toEqual([
+      "graceful.agentRunner.snapshotRecoverables",
+      "graceful.surface.discord.relay.snapshotRelays",
     ]);
   });
 

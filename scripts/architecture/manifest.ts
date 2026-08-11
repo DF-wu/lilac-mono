@@ -3669,6 +3669,26 @@ export const LEGACY_UNENFORCED_EXCEPTION_ADAPTERS = new Map<string, readonly Exc
       {
         identity: {
           module: "src/surface/discord/discord-request-router.ts",
+          exportName: "adaptRouterSelfLookup",
+        },
+        category: "external-to-result",
+        externalApi: { package: "@stanley2058/lilac-core", exportName: "SurfaceAdapter.getSelf" },
+        direction: "capture-external",
+        reason: "Captures adapter self-lookup rejection into the Discord router startup Result.",
+      },
+      {
+        identity: {
+          module: "src/surface/discord/discord-request-router.ts",
+          exportName: "adaptRouterSelfLookup",
+        },
+        category: "defect-supervisor",
+        externalApi: { package: "better-result", exportName: "Panic.is" },
+        direction: "observe-panic",
+        reason: "Preserves exact Panic identity while adapting Discord router self lookup.",
+      },
+      {
+        identity: {
+          module: "src/surface/discord/discord-request-router.ts",
           exportName: "signalDiscordRequestRouterPlatformMismatch",
         },
         category: "defect-supervisor",
@@ -8724,7 +8744,7 @@ function approvedExceptionAdapterCatalogSha256(
 }
 
 export const APPROVED_EXCEPTION_ADAPTER_CATALOG_SHA256 =
-  "f488857147f6454b5baa62eb15036c96606f2d8b753ed0f4cd12da446a6bce44";
+  "c0205b48349be6083b4bb6c9caf252311c442ac72a2a65e932f7b6c728f65cfc";
 
 export const architectureManifest = {
   version: 1,

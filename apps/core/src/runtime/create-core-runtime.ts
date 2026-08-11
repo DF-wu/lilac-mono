@@ -352,6 +352,13 @@ export class CoreResidualDiscordRequestRouterDoneRejected extends TaggedError(
   readonly message: string;
 }> {}
 
+export class CoreResidualDiscordRequestRouterDoneTimedOut extends TaggedError(
+  "CoreResidualDiscordRequestRouterDoneTimedOut",
+)<{
+  readonly deadlineMs: number;
+  readonly message: string;
+}> {}
+
 export type CoreResidualDiscordRequestRouterDoneOutcome =
   | {
       readonly kind: "result";
@@ -439,17 +446,53 @@ export async function stopCoreResidualDiscordRequestRouter(params: {
 export function settleCoreResidualDiscordRequestRouterDone(params: {
   readonly supervision: Promise<CoreResidualDiscordRequestRouterDoneOutcome>;
   readonly cleanup: CoreResidualRouterCleanupRecorder;
+  readonly reportLatePanic: (panic: Panic) => void;
+  readonly deadlineMs: number;
+  readonly scheduleDeadline?: (callback: () => void, delayMs: number) => () => void;
 }): Promise<void> {
   return settle();
 
   async function settle(): Promise<void> {
-    const outcome = await params.supervision;
+    const deadline = Promise.withResolvers<{ readonly kind: "deadline" }>();
+    const scheduleDeadline =
+      params.scheduleDeadline ??
+      ((callback: () => void, delayMs: number) => {
+        const timeout = setTimeout(callback, delayMs);
+        return () => clearTimeout(timeout);
+      });
+    const cancelDeadline = scheduleDeadline(
+      () => deadline.resolve({ kind: "deadline" }),
+      params.deadlineMs,
+    );
+    const settled = await Promise.race([
+      params.supervision.then((outcome) => ({ kind: "outcome" as const, outcome })),
+      deadline.promise,
+    ]).finally(cancelDeadline);
+    if (settled.kind === "deadline") {
+      void reportLatePanic();
+      params.cleanup.record(
+        "residualRouter.done",
+        new CoreResidualDiscordRequestRouterDoneTimedOut({
+          deadlineMs: params.deadlineMs,
+          message: `Residual Discord request router done exceeded ${params.deadlineMs}ms cleanup deadline`,
+        }),
+      );
+      return;
+    }
+    const { outcome } = settled;
     if (outcome.kind === "panic") {
       params.cleanup.record("residualRouter.done", outcome.panic);
       return;
     }
     if (outcome.result.status === "error") {
       params.cleanup.record("residualRouter.done", outcome.result.error);
+    }
+
+    async function reportLatePanic(): Promise<void> {
+      const [late] = await Promise.allSettled([params.supervision]);
+      if (late?.status === "fulfilled" && late.value.kind === "panic") {
+        params.reportLatePanic(late.value.panic);
+      }
     }
   }
 }
@@ -862,12 +905,12 @@ export function createCoreRuntimeCleanupSupervisor(
   const failures: CoreRuntimeCleanupFailure[] = [];
   const panics: Panic[] = [];
 
-  function record(label: string, cause: Error): void {
+  function record(label: string, cause: Error, fallback = "Opaque cleanup failure"): void {
     const panic = isPanic(cause);
     if (panic) panics.push(cause);
     failures.push({
       label,
-      error: safeRuntimeErrorText(cause, "Opaque cleanup failure"),
+      error: safeRuntimeErrorText(cause, fallback),
       panic,
     });
   }
@@ -893,20 +936,14 @@ export function createCoreRuntimeCleanupSupervisor(
     if (!cleanup) return;
     const outcome = await cleanup();
     if (outcome.kind === "panic") {
-      panics.push(outcome.panic);
-      failures.push({
-        label,
-        error: safeRuntimeErrorText(outcome.panic, "Opaque cleanup panic"),
-        panic: true,
-      });
+      record(label, outcome.panic, "Opaque cleanup panic");
       return;
     }
     if (outcome.result.status === "error") {
-      failures.push({
+      record(
         label,
-        error: safeRuntimeErrorText(outcome.result.error, "Opaque cleanup failure"),
-        panic: false,
-      });
+        new Error(safeRuntimeErrorText(outcome.result.error, "Opaque cleanup failure")),
+      );
     }
   }
 
@@ -1547,22 +1584,24 @@ export async function createCoreRuntime(
     snapshot: GracefulRestartSnapshot,
     registry: SurfaceRuntimeRegistry,
   ) {
-    logger.info("Restoring graceful restart snapshot", {
+    logger.info("Dispatching graceful restart snapshot", {
       createdAt: snapshot.createdAt,
       agentEntries: snapshot.agent.length,
       relayEntries: snapshot.relays.length,
     });
 
-    await restoreSurfaceRecovery({
+    const dispatched = await restoreSurfaceRecovery({
       registry,
       snapshot,
       relays: surfaceRelayHandles,
       agentRunner: stopAgentRunner,
     });
 
-    logger.info("Graceful restart snapshot restored", {
-      agentEntries: snapshot.agent.length,
-      relayEntries: snapshot.relays.length,
+    logger.info("Graceful restart snapshot dispatched", {
+      agentEntriesDispatched: dispatched.agentEntriesDispatched,
+      agentEntriesUndispatched: dispatched.agentEntriesUndispatched,
+      relayEntriesMatched: dispatched.relayEntriesMatched,
+      relayEntriesUnmatched: dispatched.relayEntriesUnmatched,
     });
   }
 
@@ -2452,6 +2491,7 @@ export async function createCoreRuntime(
       );
     }
 
+    // Residual routers follow outputs and precede ingress/adapters because they own bus subscriptions.
     if (residualRouter) {
       const replacementRouter = await stopCoreResidualDiscordRequestRouter({
         router: residualRouter,
@@ -2535,6 +2575,8 @@ export async function createCoreRuntime(
       await settleCoreResidualDiscordRequestRouterDone({
         supervision,
         cleanup,
+        reportLatePanic: reportFatalError,
+        deadlineMs: GRACEFUL_DRAIN_DEADLINE_MS,
       });
     }
     residualRouterDoneSupervisions.length = 0;

@@ -39,7 +39,7 @@ function reverseEntries(registry: SurfaceRuntimeRegistry) {
 function surfaceCleanupLabel(input: {
   readonly platform: RegisteredSurfacePlatform;
   readonly resource: "adapter" | "adapter-ingress" | "relay" | "request-ingress";
-  readonly operation: "beginDrain" | "disconnect" | "stop";
+  readonly operation: "beginDrain" | "disconnect" | "snapshotRelays" | "stop";
   readonly graceful?: boolean;
 }): string {
   return `${input.graceful ? "graceful." : ""}surface.${input.platform}.${input.resource}.${input.operation}`;
@@ -104,15 +104,30 @@ export async function restoreSurfaceRecovery(input: {
   };
   readonly relays: SurfaceRelayHandles;
   readonly agentRunner: Pick<AgentRecovery, "restoreRecoverables"> | null;
-}): Promise<void> {
+}): Promise<{
+  readonly agentEntriesDispatched: number;
+  readonly agentEntriesUndispatched: number;
+  readonly relayEntriesMatched: number;
+  readonly relayEntriesUnmatched: number;
+}> {
+  let relayEntriesMatched = 0;
   for (const descriptor of input.registry.entries()) {
     const relay = input.relays.get(descriptor.platform);
     if (!relay) continue;
-    await relay.restoreRelays(
-      input.snapshot.relays.filter((snapshot) => snapshot.platform === descriptor.platform),
+    const snapshots = input.snapshot.relays.filter(
+      (snapshot) => snapshot.platform === descriptor.platform,
     );
+    await relay.restoreRelays(snapshots);
+    relayEntriesMatched += snapshots.length;
   }
   input.agentRunner?.restoreRecoverables(input.snapshot.agent);
+  const agentEntriesDispatched = input.agentRunner ? input.snapshot.agent.length : 0;
+  return {
+    agentEntriesDispatched,
+    agentEntriesUndispatched: input.snapshot.agent.length - agentEntriesDispatched,
+    relayEntriesMatched,
+    relayEntriesUnmatched: input.snapshot.relays.length - relayEntriesMatched,
+  };
 }
 
 export async function stopSurfaceAdapterIngress(input: {
@@ -197,10 +212,26 @@ export async function stopIngressAndDrainSurfaceRecovery(input: {
     );
   }
 
-  const agent = input.agentRunner.snapshotRecoverables();
+  let agent: AgentRunnerRecoveryEntry[] = [];
+  await input.runCleanup("graceful.agentRunner.snapshotRecoverables", async () => {
+    agent = await input.agentRunner.snapshotRecoverables();
+  });
   const relays: BusToAdapterRelaySnapshot[] = [];
   for (const descriptor of input.registry.entries()) {
-    relays.push(...(input.relays.get(descriptor.platform)?.snapshotRelays() ?? []));
+    const relay = input.relays.get(descriptor.platform);
+    if (!relay) continue;
+    await input.runCleanup(
+      surfaceCleanupLabel({
+        platform: descriptor.platform,
+        resource: "relay",
+        operation: "snapshotRelays",
+        graceful: true,
+      }),
+      async () => {
+        const snapshots = await relay.snapshotRelays();
+        relays.push(...snapshots);
+      },
+    );
   }
   return {
     agent,

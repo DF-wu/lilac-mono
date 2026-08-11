@@ -1,10 +1,10 @@
-import type { MsgRef } from "../../types";
+import type { MsgRefFor } from "../../runtime-descriptor";
 
 import type { SessionMode } from "./common";
 import { stripLeadingContinueDirective, stripLeadingModelOverrideDirective } from "./common";
 
 export type PendingMentionReplyBatchItem = {
-  msgRef: MsgRef;
+  msgRef: MsgRefFor<"discord">;
   requestModelOverride?: string;
   continueCount?: number;
   botMentionNames: readonly string[];

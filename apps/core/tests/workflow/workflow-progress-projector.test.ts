@@ -247,8 +247,13 @@ function combinedProjectionPorts(
 }
 function createInvocation(
   store: DurableWorkflowStore,
-  hasProgressTarget = true,
-  platform: "discord" | "github" = "discord",
+  {
+    hasProgressTarget = true,
+    platform = "discord",
+  }: {
+    readonly hasProgressTarget?: boolean;
+    readonly platform?: "discord" | "github";
+  } = {},
 ): void {
   store.createInvocation({
     revision: {
@@ -385,7 +390,7 @@ describe("WorkflowProgressProjector", () => {
       minEditIntervalMs: 0,
     });
     try {
-      createInvocation(store, false);
+      createInvocation(store, { hasProgressTarget: false });
       projector.requestProjection("run-1");
       // test-wait-justification: allows an asynchronously requested null-target projection to be ignored
       await Bun.sleep(20);
@@ -584,7 +589,7 @@ describe("WorkflowProgressProjector", () => {
           ? { platform: "github", channelId: "octo/repo#1", messageId: "42" }
           : { platform: "discord", channelId: "channel-1", messageId: "message-1" };
       try {
-        createInvocation(store, true, platform);
+        createInvocation(store, { platform });
         store.upsertSurfaceBinding({
           runId: "run-1",
           target: { platform, channelId: "channel-1", replyToMessageId: "origin-1" },
@@ -856,7 +861,7 @@ describe("WorkflowProgressProjector", () => {
       now: () => now,
     });
     try {
-      createInvocation(store, true, "github");
+      createInvocation(store, { platform: "github" });
       await expect(projector.ensureInitialCard("run-1")).resolves.toEqual(createdRef);
       expect(workflowStoreValue(store.getSurfaceBinding("run-1"))).toMatchObject({
         messageRef: createdRef,
@@ -1025,7 +1030,7 @@ describe("WorkflowProgressProjector", () => {
       now: () => 20,
     });
     try {
-      createInvocation(store, true, "github");
+      createInvocation(store, { platform: "github" });
       const messageRef = await projector.ensureInitialCard("run-1");
       expect(adapter.contents.at(-1)?.actions?.map((action) => action.label)).toEqual([
         "Pause",

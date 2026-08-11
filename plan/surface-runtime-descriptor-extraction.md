@@ -1,6 +1,6 @@
 # Surface Runtime Descriptor Extraction
 
-Status: proposed production-behavior-preserving refactor with malformed-header hardening.
+Status: completed production-behavior-preserving refactor with malformed-header hardening.
 
 This is Part 1 of the surface extension work. Part 2 is
 `plan/third-platform-surface-readiness.md`.
@@ -472,8 +472,9 @@ must not merge, transfer, or double-close those handles without a separate stora
   projector imports no provider error class and inspects no domain-bearing `unknown`.
 - The current request router is explicitly Discord-owned rather than partially generalized.
 - Core health keeps its existing concrete Discord/Redis aggregation without a descriptor health port.
-- Initial reply-target and reanchor decoding distinguish no-target, malformed, cross-platform, and
-  cross-session outcomes; invalid targets never degrade to a top-level reply.
+- Live initial reply-target and reanchor decoding distinguish no-target, malformed, cross-platform, and
+  cross-session outcomes; invalid live initial targets never degrade to a top-level reply. Invalid
+  persisted restore targets may use the restore path's top-level fallback to preserve active output.
 - GitHub acknowledgement cleanup remains on skip, empty output, and finish but not supersession; Discord
   skipped-output cleanup and reasoning restore/reanchor behavior remain intact.
 - Adapter-event ingress and independently hosted request ingress remain separate and preserve their
