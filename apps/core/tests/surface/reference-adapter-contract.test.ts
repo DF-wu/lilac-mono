@@ -1277,15 +1277,15 @@ describe("shared Discord/GitHub adapter and descriptor contract", () => {
   );
 
   it.each(REFERENCE_CASES)(
-    "%s restores v3 and v1/v2 compatibility with identity, PEL, and queue-attempt correlation",
+    "%s restores current and v1/v2 compatibility with identity, PEL, and queue-attempt correlation",
     (_name, reference) => {
       const current = recoverySnapshot(reference);
       const decoded = decodeSnapshot(current);
       if (decoded.status === "error") throw decoded.error;
       if (!decoded.value.value)
-        throw new Error(`Expected populated ${reference.platform} v3 snapshot`);
+        throw new Error(`Expected populated ${reference.platform} current snapshot`);
       expect(decoded.value.provenance).toBe("current");
-      expect(decoded.value.value.version).toBe(3);
+      expect(decoded.value.value.version).toBe(GRACEFUL_RESTART_SNAPSHOT_VERSION);
       expect(decoded.value.value.relays[0]?.requestClient).toBe(reference.platform);
       expect(decoded.value.value.queueAttempts[0]).toMatchObject({
         eventId: `${reference.platform}-pel-1`,

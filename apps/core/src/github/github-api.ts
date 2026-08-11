@@ -465,12 +465,13 @@ export async function listIssueReactions(input: {
   repo: string;
   issueNumber: number;
   limit: number;
+  page?: number;
 }): Promise<GithubReaction[]> {
   const c = await ctx();
   const perPage = Math.min(Math.max(input.limit, 1), 100);
   return await githubFetchJson({
     ...c,
-    path: `/repos/${input.owner}/${input.repo}/issues/${input.issueNumber}/reactions?per_page=${perPage}`,
+    path: `/repos/${input.owner}/${input.repo}/issues/${input.issueNumber}/reactions?per_page=${perPage}&page=${Math.max(1, input.page ?? 1)}`,
     schema: z.array(githubReactionSchema),
   });
 }
@@ -480,12 +481,13 @@ export async function listIssueCommentReactions(input: {
   repo: string;
   commentId: number;
   limit: number;
+  page?: number;
 }): Promise<GithubReaction[]> {
   const c = await ctx();
   const perPage = Math.min(Math.max(input.limit, 1), 100);
   return await githubFetchJson({
     ...c,
-    path: `/repos/${input.owner}/${input.repo}/issues/comments/${input.commentId}/reactions?per_page=${perPage}`,
+    path: `/repos/${input.owner}/${input.repo}/issues/comments/${input.commentId}/reactions?per_page=${perPage}&page=${Math.max(1, input.page ?? 1)}`,
     schema: z.array(githubReactionSchema),
   });
 }

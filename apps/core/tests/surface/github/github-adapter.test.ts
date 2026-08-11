@@ -384,6 +384,123 @@ describe("GitHub adapter CRUD compatibility", () => {
   });
 });
 
+describe("GitHub adapter reaction pagination", () => {
+  it("lists and aggregates every issue reaction page", async () => {
+    const listed: Array<Parameters<GithubAdapterApi["listIssueReactions"]>[0]> = [];
+    const adapter = new GithubAdapter({
+      api: createGithubApi({
+        listIssueReactions: async (input) => {
+          listed.push(input);
+          if (input.page === 1) {
+            return Array.from({ length: 100 }, (_, index) => ({
+              id: index + 1,
+              content: "+1",
+            }));
+          }
+          return [{ id: 101, content: "heart", user: { id: 7, login: "octocat" } }];
+        },
+        listIssueCommentReactions: async () => {
+          throw new Error("comment reaction endpoint should not be called");
+        },
+      }),
+    });
+
+    const result = await adapter.listReactionDetails({
+      platform: "github",
+      channelId: "octo/repo#12",
+      messageId: "12",
+    });
+
+    expect(result).toEqual(
+      Result.ok([
+        { emoji: "👍", count: 100, users: [] },
+        { emoji: "❤️", count: 1, users: [{ userId: "7", userName: "octocat" }] },
+      ]),
+    );
+    expect(listed).toEqual([
+      { owner: "octo", repo: "repo", issueNumber: 12, limit: 100, page: 1 },
+      { owner: "octo", repo: "repo", issueNumber: 12, limit: 100, page: 2 },
+    ]);
+  });
+
+  it("lists all comment pages before deleting an actor-owned page-two reaction", async () => {
+    const events: string[] = [];
+    const deleted: Array<Parameters<GithubAdapterApi["deleteIssueCommentReactionById"]>[0]> = [];
+    const adapter = new GithubAdapter({
+      api: createGithubApi({
+        getPreferredGithubActorLoginOrNull: async () => "lilac-bot",
+        listIssueReactions: async () => {
+          throw new Error("issue reaction endpoint should not be called");
+        },
+        listIssueCommentReactions: async (input) => {
+          events.push(`list:${input.page}`);
+          if (input.page === 1) {
+            return Array.from({ length: 100 }, (_, index) => ({
+              id: index + 1,
+              content: "heart",
+              user: { login: "someone-else" },
+            }));
+          }
+          if (input.page === 2) {
+            return [
+              { id: 200, content: "eyes", user: { login: "lilac-bot" } },
+              ...Array.from({ length: 99 }, (_, index) => ({
+                id: 201 + index,
+                content: "eyes",
+                user: { login: "someone-else" },
+              })),
+            ];
+          }
+          return [];
+        },
+        deleteIssueCommentReactionById: async (input) => {
+          events.push(`delete:${input.reactionId}`);
+          deleted.push(input);
+        },
+      }),
+    });
+
+    const result = await adapter.removeReaction(
+      { platform: "github", channelId: "octo/repo#12", messageId: "42" },
+      "eyes",
+    );
+
+    expect(result).toEqual(Result.ok(undefined));
+    expect(events).toEqual(["list:1", "list:2", "list:3", "delete:200"]);
+    expect(deleted).toEqual([{ owner: "octo", repo: "repo", commentId: 42, reactionId: 200 }]);
+  });
+
+  it("captures a later reaction page failure as the existing typed operation error", async () => {
+    const pages: number[] = [];
+    const adapter = new GithubAdapter({
+      api: createGithubApi({
+        listIssueReactions: async (input) => {
+          pages.push(input.page ?? -1);
+          if (input.page === 2) {
+            throw new GithubApiError(503, "/repos/octo/repo/issues/12/reactions", "unavailable");
+          }
+          return Array.from({ length: 100 }, (_, index) => ({
+            id: index + 1,
+            content: "+1",
+          }));
+        },
+      }),
+    });
+
+    const result = await adapter.listReactions({
+      platform: "github",
+      channelId: "octo/repo#12",
+      messageId: "12",
+    });
+
+    expect(result.status).toBe("error");
+    if (result.status === "ok") throw new Error("expected reaction listing failure");
+    expect(result.error).toBeInstanceOf(SurfaceUnavailable);
+    expect(result.error).toMatchObject({ operation: "list-reactions" });
+    expect(pages).toEqual([1, 2]);
+  });
+});
+
 describe("GitHub normalized workflow progress port", () => {
   it("uses textual reply composition and workflow-owned markers", async () => {
     const creates: Array<Parameters<GithubAdapterApi["createIssueComment"]>[0]> = [];

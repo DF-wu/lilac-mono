@@ -117,6 +117,7 @@ function buildSnapshot(
         requestClient: "discord",
         queue: "prompt",
         messages: [],
+        currentTurnUserId: "active-current-user",
         raw: { sessionMode: "active" },
         recovery: {
           checkpointMessages: [
@@ -164,6 +165,7 @@ function buildSnapshot(
         queue: "prompt",
         messages: [queuedMessage],
         corePrimaryLineage: lineage,
+        currentTurnUserId: "queued-current-user",
         raw: { triggerType: "mention" },
         identity: {
           state: "durable",
@@ -269,6 +271,66 @@ const SHIPPED_POPULATED_V2_FIXTURE = Object.freeze({
   ]),
 });
 
+const SHIPPED_POPULATED_V3_FIXTURE = Object.freeze({
+  version: 3,
+  createdAt: 3_000,
+  deadlineMs: 3_000,
+  queueAttemptProof: "complete" as const,
+  agent: Object.freeze([
+    {
+      queueEntryId: "v3-active-entry",
+      kind: "active" as const,
+      requestId: "discord:v3-channel:v3-message",
+      sessionId: "v3-channel",
+      requestClient: "discord" as const,
+      queue: "prompt" as const,
+      messages: Object.freeze([]),
+      identity: {
+        state: "durable" as const,
+        projection: {
+          requestId: "discord:v3-channel:v3-message",
+          requestClient: "discord" as const,
+          sessionId: "v3-channel",
+          source: "external" as const,
+          platform: "discord" as const,
+          sessionRef: { platform: "discord" as const, channelId: "v3-channel" },
+          messageRef: {
+            platform: "discord" as const,
+            channelId: "v3-channel",
+            messageId: "v3-message",
+          },
+          authenticatedOrigin: {
+            platform: "discord" as const,
+            userId: "v3-initiator",
+            sessionRef: { platform: "discord" as const, channelId: "v3-channel" },
+            messageRef: {
+              platform: "discord" as const,
+              channelId: "v3-channel",
+              messageId: "v3-message",
+            },
+          },
+          authenticationMetadataKind: "origin" as const,
+          verifiedIngress: true,
+        },
+        assertedSafetyMode: "trusted" as const,
+        parkedEventIds: Object.freeze([]),
+      },
+    },
+  ]),
+  queueAttempts: Object.freeze([]),
+  relays: Object.freeze([
+    {
+      requestId: "discord:v3-channel:v3-message",
+      sessionId: "v3-channel",
+      requestClient: "discord" as const,
+      platform: "discord" as const,
+      createdOutputRefs: Object.freeze([]),
+      visibleText: "v3 partial response",
+      toolStatus: Object.freeze([]),
+    },
+  ]),
+});
+
 function richOpaqueValue() {
   const date = new Date("2026-08-03T12:34:56.789Z");
   const url = new URL("https://example.com/path?opaque=yes#fragment");
@@ -369,7 +431,12 @@ describe("graceful restart persisted codec", () => {
         ...legacyBase,
         version,
         agent: current.agent.map(
-          ({ identity: _identity, queueEntryId: _queueEntryId, ...entry }) => entry,
+          ({
+            identity: _identity,
+            queueEntryId: _queueEntryId,
+            currentTurnUserId: _currentTurnUserId,
+            ...entry
+          }) => entry,
         ),
         relays: current.relays.map(({ requestClient: _requestClient, ...relay }) => relay),
       };
@@ -414,7 +481,12 @@ describe("graceful restart persisted codec", () => {
       const current = buildSnapshot();
       const active = current.agent.find((entry) => entry.kind === "active");
       if (!active) throw new Error("Expected active fixture");
-      const { identity: _identity, queueEntryId: _queueEntryId, ...legacyActive } = active;
+      const {
+        identity: _identity,
+        queueEntryId: _queueEntryId,
+        currentTurnUserId: _currentTurnUserId,
+        ...legacyActive
+      } = active;
       const decoded = decodeGracefulRestartSnapshot({
         status: "completed",
         payload_json: SuperJSON.stringify({
@@ -454,7 +526,12 @@ describe("graceful restart persisted codec", () => {
       ...legacyBase,
       version: 2,
       agent: current.agent.map(
-        ({ identity: _identity, queueEntryId: _queueEntryId, ...entry }) => entry,
+        ({
+          identity: _identity,
+          queueEntryId: _queueEntryId,
+          currentTurnUserId: _currentTurnUserId,
+          ...entry
+        }) => entry,
       ),
       relays: current.relays.map((relay) => ({ ...relay, requestClient: "github" })),
     };
@@ -983,7 +1060,7 @@ describe("graceful restart persisted codec", () => {
     }
   });
 
-  it("accepts exact v3 Discord initial message proof", () => {
+  it("accepts exact v4 Discord initial message proof", () => {
     const decoded = decodeGracefulRestartSnapshot({
       status: "completed",
       payload_json: SuperJSON.stringify(buildSnapshot()),
@@ -1001,6 +1078,40 @@ describe("graceful restart persisted codec", () => {
         },
       },
     });
+  });
+
+  it("migrates frozen v3 entries without inferring currentTurnUserId from the initiator", () => {
+    const decoded = decodeGracefulRestartSnapshot({
+      status: "completed",
+      payload_json: SuperJSON.stringify(SHIPPED_POPULATED_V3_FIXTURE),
+    });
+    expect(decoded.status).toBe("ok");
+    if (decoded.status === "error" || !decoded.value.value) return;
+    expect(decoded.value.provenance).toBe("migrated");
+    expect(decoded.value.value.version).toBe(GRACEFUL_RESTART_SNAPSHOT_VERSION);
+    expect(decoded.value.value.agent.map((entry) => entry.currentTurnUserId)).toEqual([undefined]);
+    expect(decoded.value.value.agent[0]?.identity).toMatchObject({
+      state: "durable",
+      projection: { authenticatedOrigin: { userId: "v3-initiator" } },
+    });
+  });
+
+  it("strictly rejects empty v4 currentTurnUserId and the v4 field in a v3 entry", () => {
+    const snapshot = buildSnapshot();
+    const active = snapshot.agent[0];
+    if (!active) throw new Error("Expected active fixture");
+    const invalidValues = [
+      { ...snapshot, agent: [{ ...active, currentTurnUserId: "" }] },
+      { ...snapshot, version: 3 },
+    ];
+    for (const value of invalidValues) {
+      const decoded = decodeGracefulRestartSnapshot({
+        status: "completed",
+        payload_json: SuperJSON.stringify(value),
+      });
+      expect(decoded.status).toBe("error");
+      if (decoded.status === "error") expect(decoded.error).toBeInstanceOf(CorruptPersistedFields);
+    }
   });
 
   it("encodes a durable restricted alias projection without message proof", async () => {
@@ -1061,7 +1172,7 @@ describe("graceful restart persisted codec", () => {
     ["requestId and messageRef", "outer"],
     ["messageRef and nested authenticatedOrigin", "nested"],
   ] as const)(
-    "rejects v3 Discord %s mismatches as corrupt persisted fields",
+    "rejects v4 Discord %s mismatches as corrupt persisted fields",
     (_label, mismatch) => {
       const snapshot = buildSnapshot();
       const active = snapshot.agent[0];
@@ -1099,7 +1210,7 @@ describe("graceful restart persisted codec", () => {
     },
   );
 
-  it("rejects v3 GitHub durable trigger evidence that does not match its parsed request ID", () => {
+  it("rejects v4 GitHub durable trigger evidence that does not match its parsed request ID", () => {
     const snapshot = buildSnapshot();
     const sessionId = "octo/repo#1";
     const requestId = "github:octo/repo#1:999";
@@ -1255,6 +1366,12 @@ describe("SqliteGracefulRestartStore", () => {
       expect(loaded.value.provenance).toBe("current");
       expect(loaded.value.snapshot.agent).toHaveLength(2);
       expect(loaded.value.snapshot.relays).toHaveLength(1);
+      expect(
+        loaded.value.snapshot.agent.map((entry) => [entry.kind, entry.currentTurnUserId]),
+      ).toEqual([
+        ["active", "active-current-user"],
+        ["queued", "queued-current-user"],
+      ]);
 
       const queued = loaded.value.snapshot.agent.find((entry) => entry.kind === "queued");
       expect(JSON.stringify(queued?.corePrimaryLineage)).toBe(
@@ -1353,7 +1470,7 @@ describe("SqliteGracefulRestartStore", () => {
     }
   });
 
-  it("retains v3 Discord durable message-proof corruption for operator repair", async () => {
+  it("retains v4 Discord durable message-proof corruption for operator repair", async () => {
     const { dbPath, store } = await makeStore();
     try {
       const snapshot = buildSnapshot();

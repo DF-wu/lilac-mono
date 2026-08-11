@@ -1666,6 +1666,7 @@ export type AgentRunnerRecoveryEntry = {
   messages: ModelMessage[];
   corePrimaryLineage?: CorePrimaryLineageV1;
   modelOverride?: string;
+  currentTurnUserId?: string;
   raw?: AgentRunnerRaw;
   recovery?: {
     checkpointMessages: ModelMessage[];
@@ -2393,6 +2394,7 @@ type SessionQueue = {
     messages: ModelMessage[];
     corePrimaryLineage?: CorePrimaryLineageV1;
     modelOverride?: string;
+    currentTurnUserId?: string;
     raw?: AgentRunnerRaw;
     resolvedModelSpec: string | null;
     resolvedReasoning: ModelReasoningEffort | undefined;
@@ -3563,6 +3565,7 @@ export async function startBusAgentRunner(params: {
         messages: state.activeRun.messages,
         corePrimaryLineage: state.activeRun.corePrimaryLineage,
         ...(state.activeRun.modelOverride ? { modelOverride: state.activeRun.modelOverride } : {}),
+        currentTurnUserId: state.activeRun.currentTurnUserId,
         raw: state.activeRun.raw,
         identity: buildRecoveryIdentity(state.activeRun),
       };
@@ -3585,6 +3588,7 @@ export async function startBusAgentRunner(params: {
       messages: [],
       corePrimaryLineage: degradeCorePrimaryLineageForMutation("restart-recovery-checkpoint"),
       ...(state.activeRun.modelOverride ? { modelOverride: state.activeRun.modelOverride } : {}),
+      currentTurnUserId: state.activeRun.currentTurnUserId,
       raw: state.activeRun.raw,
       identity: buildRecoveryIdentity(state.activeRun),
       recovery: {
@@ -3653,6 +3657,7 @@ export async function startBusAgentRunner(params: {
           messages: queued.messages,
           corePrimaryLineage: queued.corePrimaryLineage,
           ...(queued.modelOverride ? { modelOverride: queued.modelOverride } : {}),
+          currentTurnUserId: queued.currentTurnUserId,
           raw: queued.raw,
           identity: buildRecoveryIdentity(queued),
         });
@@ -4012,6 +4017,7 @@ export async function startBusAgentRunner(params: {
               ? degradeCorePrimaryLineageForMutation("restart-recovery-checkpoint")
               : entry.corePrimaryLineage,
             modelOverride: entry.modelOverride,
+            currentTurnUserId: entry.currentTurnUserId,
             raw: entry.raw,
             recovery: entry.recovery,
             authenticatedOrigin: identity?.projection?.authenticatedOrigin,
@@ -4407,6 +4413,7 @@ export async function startBusAgentRunner(params: {
       messages: next.messages,
       corePrimaryLineage: next.corePrimaryLineage,
       modelOverride: next.modelOverride,
+      currentTurnUserId: next.currentTurnUserId,
       raw: next.raw,
       resolvedModelSpec: null,
       resolvedReasoning: undefined,
@@ -5534,6 +5541,7 @@ export async function startBusAgentRunner(params: {
 
           const setCurrentTurnUserId = (userId: string | undefined) => {
             currentTurnUserId = userId;
+            if (state.activeRun) state.activeRun.currentTurnUserId = userId;
             activeBinding.requestContext.currentTurnUserId = userId;
             agent?.setContext({
               sessionId: next.sessionId,

@@ -36,7 +36,7 @@ import {
 } from "../surface/authenticated-request";
 import type { BusToAdapterRelaySnapshot } from "../surface/bridge/subscribe-from-bus";
 
-export const GRACEFUL_RESTART_SNAPSHOT_VERSION = 3 as const;
+export const GRACEFUL_RESTART_SNAPSHOT_VERSION = 4 as const;
 
 const GRACEFUL_RESTART_TABLE = "graceful_restart_state";
 const GRACEFUL_RESTART_RECORD_ID = "singleton";
@@ -546,9 +546,12 @@ const queueAttemptSchema = z.strictObject({
   controlIdentity: recoveryIdentitySchema,
   pendingGroups: z.array(queueAttemptGroupSchema).min(1),
 });
-const currentAgentRecoveryEntrySchema = legacyAgentRecoveryEntrySchema.extend({
+const agentRecoveryEntryV3Schema = legacyAgentRecoveryEntrySchema.extend({
   queueEntryId: nonemptyStringSchema,
   identity: recoveryIdentitySchema,
+});
+const currentAgentRecoveryEntrySchema = agentRecoveryEntryV3Schema.extend({
+  currentTurnUserId: nonemptyStringSchema.optional(),
 });
 
 type GracefulRestartModelMessage = z.output<typeof persistedModelMessageSchema>;
@@ -586,6 +589,7 @@ export type GracefulRestartAgentRecoveryEntry = {
   readonly messages: GracefulRestartModelMessage[];
   readonly corePrimaryLineage?: GracefulRestartCorePrimaryLineage;
   readonly modelOverride?: string;
+  readonly currentTurnUserId?: string;
   readonly raw?: GracefulRestartRawValue;
   readonly recovery?: {
     readonly checkpointMessages: GracefulRestartModelMessage[];
@@ -674,6 +678,16 @@ const currentSnapshotSchema = z.strictObject({
   deadlineMs: finitePositiveSchema,
   queueAttemptProof: z.literal("complete"),
   agent: z.array(currentAgentRecoveryEntrySchema),
+  queueAttempts: z.array(queueAttemptSchema),
+  relays: z.array(currentRelaySnapshotSchema),
+});
+
+const snapshotV3Schema = z.strictObject({
+  version: z.literal(3),
+  createdAt: finiteNonNegativeSchema,
+  deadlineMs: finitePositiveSchema,
+  queueAttemptProof: z.literal("complete"),
+  agent: z.array(agentRecoveryEntryV3Schema),
   queueAttempts: z.array(queueAttemptSchema),
   relays: z.array(currentRelaySnapshotSchema),
 });
@@ -917,12 +931,27 @@ function normalizeLegacySnapshot(
     agent: decoded.agent.map((entry, index) => ({
       ...entry,
       queueEntryId: `legacy:${index}:${entry.requestId}`,
+      currentTurnUserId: undefined,
       identity: { state: "restricted", reason: "legacy-no-durable-proof" },
     })),
     queueAttempts: [],
     relays,
   };
   if (!validateSnapshotCorrelation(snapshot, false)) {
+    return Result.err(corruptSnapshot(decoded.version, "payload_json"));
+  }
+  return Result.ok(snapshot);
+}
+
+function normalizeSnapshotV3(
+  decoded: z.output<typeof snapshotV3Schema>,
+): ResultType<GracefulRestartSnapshot, CorruptPersistedFields> {
+  const snapshot: GracefulRestartSnapshot = {
+    ...decoded,
+    version: GRACEFUL_RESTART_SNAPSHOT_VERSION,
+    agent: decoded.agent.map((entry) => ({ ...entry, currentTurnUserId: undefined })),
+  };
+  if (!validateSnapshotCorrelation(snapshot, true)) {
     return Result.err(corruptSnapshot(decoded.version, "payload_json"));
   }
   return Result.ok(snapshot);
@@ -941,7 +970,12 @@ export function decodeGracefulRestartSnapshot(
   const version =
     typeof versionValue === "number" && Number.isInteger(versionValue) ? versionValue : undefined;
   if (version === undefined) return Result.err(corruptSnapshot(-1, "payload_json"));
-  if (version !== 1 && version !== 2 && version !== GRACEFUL_RESTART_SNAPSHOT_VERSION) {
+  if (
+    version !== 1 &&
+    version !== 2 &&
+    version !== 3 &&
+    version !== GRACEFUL_RESTART_SNAPSHOT_VERSION
+  ) {
     return Result.err(
       new UnsupportedVersion(
         persistenceContext({
@@ -965,6 +999,14 @@ export function decodeGracefulRestartSnapshot(
       value: normalized.value,
       provenance: "migrated",
     });
+  }
+
+  if (version === 3) {
+    const decoded = snapshotV3Schema.safeParse(parsed.value);
+    if (!decoded.success) return Result.err(corruptSnapshot(version, "payload_json"));
+    const normalized = normalizeSnapshotV3(decoded.data);
+    if (normalized.status === "error") return Result.err(normalized.error);
+    return Result.ok({ value: normalized.value, provenance: "migrated" });
   }
 
   const decoded = currentSnapshotSchema.safeParse(parsed.value);
@@ -1241,7 +1283,7 @@ export const gracefulRestartSnapshotCodecCases = {
   "unsupported-version": {
     input: {
       status: "completed",
-      payload_json: SuperJSON.stringify({ ...fixtureSnapshot, version: 4 }),
+      payload_json: SuperJSON.stringify({ ...fixtureSnapshot, version: 5 }),
     },
     outcome: "error",
   },

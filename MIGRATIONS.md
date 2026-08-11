@@ -201,6 +201,12 @@ surface projections, total Core-owned blob bytes, and unreferenced blob counts/b
 pruning emits per-owner metadata-pruned diagnostics. These are internal retention/operational
 diagnostics and do not add a `core-config.yaml` key; the config contract remains `configVersion: 2`.
 
+## Graceful Restart Snapshot v4
+
+Graceful restart snapshot v4 adds the optional non-empty `currentTurnUserId` to active and queued
+agent recovery entries. Snapshot v3 remains readable; because it did not persist this field, migration
+sets it to undefined and does not infer it from the original authenticated initiator.
+
 ## Historical Workflow Schema 18
 
 Workflow capability review now stores a normalized maximum envelope with per-operation narrowing, exact Level-1 tools, concrete Level-2 callable IDs, destination-scoped origin surface operations, allowed roots, bounded reasoning, and explicit trusted executable authority.

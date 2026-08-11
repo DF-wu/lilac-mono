@@ -181,13 +181,13 @@ Redis, and decodes it again into a normalized origin. Downstream control, tool, 
 subagent contexts preserve one correlated `(platform, userId, sessionId)` identity; conflicting metadata
 fails closed before trusted authority is assigned.
 
-Graceful restart snapshot v3 preserves exact relay platform/request-client/session/ref correlation,
-normalized recovery identity, PEL event identity, queue reservations, control-application state, and
-partial lifecycle-publication progress. Recovery reads are non-destructive: v1/v2 remain readable and
-migrate in memory, unavailable or failed restore targets remain retained, paused apply stays rollbackable,
-and the exact row is compare-and-deleted only before total synchronous activation. Compatible wire and
-persistence readers remain broader than the installed registry and are not narrowed by executable adapter
-selection.
+Graceful restart snapshot v4 preserves exact relay platform/request-client/session/ref correlation,
+normalized recovery identity, current-turn user identity, PEL event identity, queue reservations,
+control-application state, and partial lifecycle-publication progress. Recovery reads are non-destructive:
+v1/v2/v3 remain readable and migrate in memory, unavailable or failed restore targets remain retained,
+paused apply stays rollbackable, and the exact row is compare-and-deleted only before total synchronous
+activation. Compatible wire and persistence readers remain broader than the installed registry and are not
+narrowed by executable adapter selection.
 
 The registry is internal runtime composition, not a dynamic plugin API. Discord health, request routing,
 aliases, allowlists, local storage, search indexing/healing, and search sidecars remain Discord-owned.
@@ -578,7 +578,7 @@ unknown is a registered `Panic`.
 - Expected failures use domain-owned `Result` error unions, including typed terminal errors for fallible streams. `Panic` is reserved for registered hard invariants and defects, is classified with `Panic.is`, and is never converted to an ordinary Err.
 - Exception capture, host signaling, rollback sentinels, compatibility mappings, and defect supervision are allowed only at exact registered adapters. Add exception registrations to the owning workspace in `scripts/architecture/manifest.ts`; the global approval catalog is derived from them, and its reviewed digest must be updated. Other manifest entries use exact symbol identities or exact modules according to their schema, with reasons only where required. Broad allowlists are not an approval mechanism.
 - Persisted codecs report successful provenance as `current`, `migrated`, or contractually valid `missing-defaulted`, while unsupported versions, malformed serialization, and corrupt fields remain distinct errors. Reads do not rewrite data. SQLite Result transactions use the registered private-sentinel adapter, preserve exact Panic and driver classification, and commit state transitions with their outbox records atomically.
-- Surface boundaries follow the closed-ref/registered-platform pattern: protocol adapters validate caller refs and classify provider failures into operation Results, registry facades guard every produced ref, workflow ports gate durable correlation and failure policy, and v3 recovery validates identity plus relay/queue state before paused admission. Protocol sidecars and search stay outside the descriptor.
+- Surface boundaries follow the closed-ref/registered-platform pattern: protocol adapters validate caller refs and classify provider failures into operation Results, registry facades guard every produced ref, workflow ports gate durable correlation and failure policy, and v4 recovery validates identity plus relay/queue state before paused admission. Protocol sidecars and search stay outside the descriptor.
 - Redis/SuperJSON receive paths begin with `Message<unknown>` and decode the complete event through the canonical codec registry before typed delivery. Handlers return Results; subscription policy owns commit, `park-pending`, dead-letter, or stop. Parked work entries are durable pending entries, not automatic retries.
 - Presentation code consumes closed render-ready projections, never raw tool or SDK payloads or runtime parsers. Lifecycle states are exhaustive, and unknown future variants normalize at the projection adapter.
 - `bun run lint:architecture` runs the semantic checker and production syntax gate; every finding is an error, with no baseline or migration-status path. Focused checks are `bun run test:architecture`, `bun run test:lint-rules`, and `bun run typecheck:architecture`. Root `bun run lint`, `bun run test:all`, `bun run typecheck`, `bun run fmt:check`, and `bun run ci` compose the repository gates.

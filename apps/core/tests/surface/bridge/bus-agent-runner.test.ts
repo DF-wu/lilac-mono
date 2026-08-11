@@ -2784,6 +2784,7 @@ describe("startBusAgentRunner production path", () => {
     const requestMessageCache = createRequestMessageCache();
     const firstCallStarted = deferred<void>();
     const releaseFirstCall = deferred<void>();
+    const followUpApplied = deferred<void>();
     const toolContexts: unknown[] = [];
     let level1RequestContext:
       | Parameters<CoreToolPluginManager["buildLevel1ToolsetResult"]>[0]["requestContext"]
@@ -2823,8 +2824,8 @@ describe("startBusAgentRunner production path", () => {
         authenticatedOrigin: input.authenticatedOrigin ?? null,
         safetyMode: input.safetyMode,
       }),
-      createAgent: (options) =>
-        new AiSdkPiAgent({
+      createAgent: (options) => {
+        const agent = new AiSdkPiAgent({
           ...options,
           model: new MockLanguageModelV4({
             modelId: "current-turn-user",
@@ -2840,7 +2841,15 @@ describe("startBusAgentRunner production path", () => {
                 : level1TextStep("done");
             },
           }),
-        }),
+        });
+        const followUp = agent.followUp.bind(agent);
+        agent.followUp = (message) => {
+          const id = followUp(message);
+          followUpApplied.resolve(undefined);
+          return id;
+        };
+        return agent;
+      },
     });
     const requestId = "discord:turn-session:first-message";
     const lifecycle = await observeRequestLifecycle(bus, requestId);
@@ -2884,6 +2893,10 @@ describe("startBusAgentRunner production path", () => {
         },
       });
       expect(requestMessageCache.getOrigin(requestId)?.authenticatedOrigin?.userId).toBe("user-a");
+      await followUpApplied.promise;
+      expect(
+        runner.snapshotRecoverables().find((entry) => entry.requestId === requestId),
+      ).toMatchObject({ kind: "active", currentTurnUserId: "user-b" });
       releaseFirstCall.resolve(undefined);
 
       await expect(lifecycle.terminal).resolves.toBe("resolved");
@@ -2914,7 +2927,10 @@ describe("startBusAgentRunner production path", () => {
     config.models.main = { model: "openai/restored-identity" };
     const bus = createLilacBus(createInMemoryRawBus());
     const requestMessageCache = createRequestMessageCache();
-    const pluginManager = corePrimaryTestPluginManager();
+    const recoveredCurrentTurnUserId = deferred<string | undefined>();
+    const pluginManager = corePrimaryTestPluginManager((context) =>
+      recoveredCurrentTurnUserId.resolve(context?.currentTurnUserId),
+    );
     const capabilityIssued = deferred<{
       readonly safetyMode: string;
       readonly userId: string | undefined;
@@ -2940,6 +2956,7 @@ describe("startBusAgentRunner production path", () => {
             requestClient: "discord",
             queue: "prompt",
             messages: [{ role: "user", content: "restored" }],
+            currentTurnUserId: "later-restored-user",
             identity: {
               state: "durable",
               projection: {
@@ -3010,6 +3027,10 @@ describe("startBusAgentRunner production path", () => {
         userId: "restored-user",
         cachedUserId: "restored-user",
       });
+      await expect(recoveredCurrentTurnUserId.promise).resolves.toBe("later-restored-user");
+      expect(
+        runner.snapshotRecoverables().find((entry) => entry.requestId === requestId),
+      ).toMatchObject({ kind: "active", currentTurnUserId: "later-restored-user" });
     } finally {
       releaseModel.resolve(undefined);
       await runner.getActiveDrainOperation();

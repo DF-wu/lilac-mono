@@ -744,26 +744,35 @@ export class GithubAdapter implements SurfaceAdapter {
     const session: GithubSessionRef = { platform: "github", channelId: ref.channelId };
     const thread = parseGithubThreadResult(operation, session);
     if (thread.status === "error") return thread;
+    let listPage: (page: number) => Promise<GithubReaction[]>;
     if (isGithubIssueTriggerId({ sessionId: ref.channelId, triggerId: ref.messageId })) {
-      return await captureGithubOperation(operation, () =>
+      listPage = (page) =>
         this.api.listIssueReactions({
           owner: thread.value.owner,
           repo: thread.value.repo,
           issueNumber: thread.value.number,
           limit: 100,
-        }),
-      );
+          page,
+        });
+    } else {
+      const commentId = githubCommentIdResult(operation, ref.messageId);
+      if (commentId.status === "error") return commentId;
+      listPage = (page) =>
+        this.api.listIssueCommentReactions({
+          owner: thread.value.owner,
+          repo: thread.value.repo,
+          commentId: commentId.value,
+          limit: 100,
+          page,
+        });
     }
-    const commentId = githubCommentIdResult(operation, ref.messageId);
-    if (commentId.status === "error") return commentId;
-    return await captureGithubOperation(operation, () =>
-      this.api.listIssueCommentReactions({
-        owner: thread.value.owner,
-        repo: thread.value.repo,
-        commentId: commentId.value,
-        limit: 100,
-      }),
-    );
+    const reactions: GithubReaction[] = [];
+    for (let page = 1; ; page += 1) {
+      const current = await captureGithubOperation(operation, () => listPage(page));
+      if (current.status === "error") return current;
+      reactions.push(...current.value);
+      if (current.value.length < 100) return Result.ok(reactions);
+    }
   }
 
   async addReaction(msgRef: MsgRef, reaction: string): Promise<SurfaceOperationResult<void>> {
