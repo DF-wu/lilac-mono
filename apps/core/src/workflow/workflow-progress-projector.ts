@@ -268,6 +268,7 @@ export class WorkflowProgressProjector implements WorkflowProgressCardService {
       coalesceMs?: number;
       minEditIntervalMs?: number;
       retryIntervalMs?: number;
+      reconciliationBatchSize?: number;
       scheduleTimeout?: (callback: () => void, delayMs: number) => WorkflowProgressScheduledTimeout;
       reportFatalPanic: (panic: Panic) => void;
     },
@@ -537,8 +538,14 @@ export class WorkflowProgressProjector implements WorkflowProgressCardService {
   private async reconcilePage(
     after?: WorkflowProgressReconciliationCursor,
   ): Promise<WorkflowProgressReconciliationCursor | undefined> {
+    const batchSize = Math.max(
+      1,
+      Math.floor(
+        this.input.reconciliationBatchSize ?? WORKFLOW_PROGRESS_STARTUP_RECONCILIATION_BATCH_SIZE,
+      ),
+    );
     const runs = this.input.store.listRunsNeedingProjectionReconciliation({
-      limit: WORKFLOW_PROGRESS_STARTUP_RECONCILIATION_BATCH_SIZE,
+      limit: batchSize,
       ...(after === undefined ? {} : { after }),
     });
     if (runs.status === "error") signalDurableWorkflowReadErrorToHost(runs.error);
@@ -553,7 +560,7 @@ export class WorkflowProgressProjector implements WorkflowProgressCardService {
         });
       }
     }
-    if (runs.value.length < WORKFLOW_PROGRESS_STARTUP_RECONCILIATION_BATCH_SIZE) return undefined;
+    if (runs.value.length < batchSize) return undefined;
     const last = runs.value.at(-1);
     return last ? { updatedAt: last.updatedAt, runId: last.runId } : undefined;
   }

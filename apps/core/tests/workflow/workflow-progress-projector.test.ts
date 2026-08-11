@@ -772,11 +772,12 @@ describe("WorkflowProgressProjector", () => {
       ports: projectionPorts(adapter),
       subscriptionId: "startup-reconcile-pages",
       now: () => clock.now,
+      reconciliationBatchSize: 3,
       scheduleTimeout: scheduler.scheduleTimeout,
     });
     let stopping: Promise<void> | undefined;
     try {
-      for (let index = 0; index < 1_000; index += 1) {
+      for (let index = 0; index < 3; index += 1) {
         createInvocation(store, {
           platform: "discord",
           targetChannelId: "early-channel",
@@ -788,10 +789,10 @@ describe("WorkflowProgressProjector", () => {
         platform: "discord",
         targetChannelId: "late-channel",
         origin: { platform: "discord", sessionId: "channel-1" },
-        runId: "run-1000",
+        runId: "run-0003",
       });
       store.upsertSurfaceBinding({
-        runId: "run-1000",
+        runId: "run-0003",
         target: {
           platform: "discord",
           channelId: "late-channel",
@@ -826,7 +827,7 @@ describe("WorkflowProgressProjector", () => {
       await adapter.lateSendStarted;
 
       await starting;
-      expect(adapter.sends).toBe(1_000);
+      expect(adapter.sends).toBe(3);
 
       stopping = projector.stop();
       expect(
@@ -838,9 +839,9 @@ describe("WorkflowProgressProjector", () => {
       adapter.release();
       await stopping;
 
-      expect(adapter.sends).toBe(1_001);
+      expect(adapter.sends).toBe(4);
       expect(store.listCalls).toBe(3);
-      expect(workflowStoreValue(store.getSurfaceBinding("run-1000"))).toMatchObject({
+      expect(workflowStoreValue(store.getSurfaceBinding("run-0003"))).toMatchObject({
         messageRef: { channelId: "late-channel" },
         permanentFailure: null,
       });
