@@ -1,4 +1,3 @@
-import { isRecord } from "@stanley2058/lilac-utils";
 import { Result } from "better-result";
 
 import type { MsgRef, SurfaceMessage } from "../../types";
@@ -60,9 +59,7 @@ export function toReplyChainMessage(
     authorNameFallback?: string;
   },
 ): ReplyChainMessage {
-  const discordRaw = isRecord(msg.raw) && isRecord(msg.raw.discord) ? msg.raw.discord : null;
-  const isChat =
-    discordRaw && typeof discordRaw.isChat === "boolean" ? discordRaw.isChat : undefined;
+  const isChat = normalizeDiscordRaw(msg.raw)?.isChat;
   let text = opts?.overrideText;
   if (text === undefined) {
     text =

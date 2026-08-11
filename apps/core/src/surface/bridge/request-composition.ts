@@ -22,6 +22,7 @@ import {
   isDiscordSessionDividerSurfaceMessage,
   isDiscordSessionDividerText,
 } from "../discord/discord-session-divider";
+import { normalizeDiscordRaw } from "../discord/discord-raw-normalizer";
 
 import {
   CORE_SURFACE_PROJECTION_FORMAT_VERSION,
@@ -72,7 +73,6 @@ export type {
 
 export type RequestCompositionError = CoreOwnedBlobIntegrityError | SurfaceOperationError;
 
-const DISCORD_REFERENCE_TYPE_FORWARD = 1;
 const DISCORD_SURFACE_ID_PREFIX = "discord:";
 
 function createFreshOnlyLineage(reason: string, currentCanonicalStart = 0): CorePrimaryLineageV1 {
@@ -657,24 +657,12 @@ function resolveTranscriptSnapshot(input: {
   return transcript.status === "ok" ? transcript.value : null;
 }
 
-function getDiscordIsChatFromRaw(raw: unknown): boolean | undefined {
-  if (!raw || typeof raw !== "object") return undefined;
-  const o = raw as Record<string, unknown>;
-  const discord =
-    "discord" in o && o.discord && typeof o.discord === "object"
-      ? (o.discord as Record<string, unknown>)
-      : null;
-  if (!discord) return undefined;
-  const isChat = discord["isChat"];
-  return typeof isChat === "boolean" ? isChat : undefined;
-}
-
 function shouldIncludeInModelContext(msg: SurfaceMessage): boolean {
   // Listing and surface tools may include platform/system messages (e.g. Discord
   // thread-created notices). By default, do not send those to the model.
   if (msg.session.platform !== "discord") return true;
 
-  const isChat = getDiscordIsChatFromRaw(msg.raw);
+  const isChat = normalizeDiscordRaw(msg.raw)?.isChat;
   return isChat ?? true;
 }
 
@@ -717,48 +705,8 @@ function getSurfaceMessageContextText(message: SurfaceMessage): string {
     : (getForwardSnapshotTextFromRaw(message.raw) ?? message.text);
 }
 
-function getSurfaceMessageReplyTargetId(message: SurfaceMessage): string | undefined {
-  const raw = message.raw;
-  if (!raw || typeof raw !== "object") return undefined;
-
-  const o = raw as Record<string, unknown>;
-
-  if ("reference" in o) {
-    const ref = o.reference;
-    if (ref && typeof ref === "object") {
-      const replyTargetId =
-        typeof (ref as Record<string, unknown>).messageId === "string"
-          ? ((ref as Record<string, unknown>).messageId as string)
-          : undefined;
-      const referenceType =
-        typeof (ref as Record<string, unknown>).type === "number"
-          ? ((ref as Record<string, unknown>).type as number)
-          : undefined;
-      if (replyTargetId && referenceType !== DISCORD_REFERENCE_TYPE_FORWARD) {
-        return replyTargetId;
-      }
-    }
-  }
-
-  const discord =
-    "discord" in o && o.discord && typeof o.discord === "object"
-      ? (o.discord as Record<string, unknown>)
-      : null;
-  if (!discord) return undefined;
-
-  const referenceType =
-    typeof discord.referenceType === "number" ? discord.referenceType : undefined;
-  const replyTargetId =
-    typeof discord.replyToMessageId === "string" ? discord.replyToMessageId : undefined;
-  if (!replyTargetId || referenceType === DISCORD_REFERENCE_TYPE_FORWARD) {
-    return undefined;
-  }
-
-  return replyTargetId;
-}
-
 function shouldApplyContinueDirectiveToSurfaceMessage(message: SurfaceMessage): boolean {
-  return getSurfaceMessageReplyTargetId(message) === undefined;
+  return normalizeDiscordRaw(message.raw)?.replyReference === undefined;
 }
 
 function stripContinueDirectiveFromReplyChainMessage(input: {

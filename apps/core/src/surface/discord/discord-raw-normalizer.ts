@@ -23,6 +23,7 @@ export type NormalizedDiscordForwardSnapshot = {
 
 export type NormalizedDiscordRaw = {
   content?: string;
+  isChat?: boolean;
   embeds: DiscordEmbedTextMeta[];
   attachments: DiscordAttachmentMeta[];
   reference?: NormalizedDiscordReference;
@@ -62,6 +63,7 @@ const discordAttachmentSchema = z
 const discordEnvelopeSchema = z
   .object({
     content: maybeStringSchema,
+    isChat: z.boolean().optional(),
     embeds: z.unknown().optional(),
     attachments: z.unknown().optional(),
     referenceType: maybeFiniteNumberSchema,
@@ -178,6 +180,7 @@ export function normalizeDiscordRaw(raw: unknown): NormalizedDiscordRaw | null {
 
   return {
     ...(content !== undefined ? { content } : {}),
+    ...(discord?.isChat !== undefined ? { isChat: discord.isChat } : {}),
     embeds: topEmbeds.length > 0 ? topEmbeds : discordEmbeds,
     attachments: discordAttachments.length > 0 ? discordAttachments : topAttachments,
     ...(reference ? { reference } : {}),
