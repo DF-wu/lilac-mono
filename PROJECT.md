@@ -1,6 +1,6 @@
 # Lilac Monorepo: Structure, Terminology, And Working Mental Model
 
-This repo is an event-driven “agent runtime” built around a typed event bus (Redis Streams), surface adapters (Discord with optional GitHub ingress), and **layered tools** that are **progressively disclosed** to the agent:
+This repo is an event-driven “agent runtime” built around a typed event bus (Redis Streams), Discord and GitHub surface adapters, and **layered tools** that are **progressively disclosed** to the agent:
 
 - Level 1 (direct AI SDK tools): low-level local tools the LLM can call during generation (`bash`, `read_file`, `glob`, `grep`, `apply_patch`, `batch`, and `subagent_delegate` when enabled).
 - Level 2 (tool server + `tools` CLI): a stable HTTP tool API (Elysia) exposed via the `tools` CLI (and usable by the agent through `bash`).
@@ -139,18 +139,69 @@ Many flows treat missing `request_id` as an error (especially request lifecycle 
 
 “Surface” is the user-facing platform integration layer.
 
-- Adapter: implements `SurfaceAdapter` (`apps/core/src/surface/discord/discord-adapter.ts`, `apps/core/src/surface/github/github-adapter.ts`).
+- Adapter: implements the unparameterized, operation-Result-returning `SurfaceAdapter` (`apps/core/src/surface/discord/discord-adapter.ts`, `apps/core/src/surface/github/github-adapter.ts`).
 - Session: a platform container (Discord channel/thread/DM or GitHub `OWNER/REPO#number`).
 - Message refs:
-  - `SessionRef` / `MsgRef` are small structs that identify sessions/messages across platforms.
+  - `SessionRef` / `MsgRef` are closed discriminated unions that identify sessions/messages for the implemented Core platforms.
 
 The Discord adapter also maintains a local SQLite cache (`discord-surface.db`) for read-history operations.
+
+### Surface Runtime Registry
+
+Core composes its implemented surfaces through one closed `SurfaceRuntimeRegistry` in
+`apps/core/src/surface/runtime-descriptor.ts`. A platform-parameterized descriptor binds an
+unparameterized adapter to coarse structural ports for adapter ingress, request ingress, output relay,
+and workflow progress. Port presence declares complete subsystem participation; optional adapter
+operations are attempted directly and their typed `SurfaceOperationResult` is authoritative. There is
+no predeclared operation-support metadata, dynamic descriptor loading, or search descriptor port.
+
+The registry exposes adapters to shared runtime and tool callers only through a guarded resolver. It
+resolves an exact registered platform, never infers executable support from the broader event-bus wire
+enum, and wraps the adapter with descriptor-bound guards. Callers validate primary and nested input refs
+before protocol access; the facade validates adapter-produced session, message, event, callback, output,
+workflow, and partial-completion refs before publication, transcript linking, persistence, or recovery.
+Expected operations return the closed Result algebra, including explicit unsupported, invalid-input,
+platform/session mismatch, partial completion, not-found, permission, rate-limit, and unavailable
+outcomes. Unrecognized exceptions and produced-ref mismatches remain supervised defects.
+
+Registry iteration in `apps/core/src/runtime/surface-runtime-lifecycle.ts` drives connection, startup
+rollback ownership, ingress shutdown, relay drain, snapshot collection, restore dispatch, and
+reverse-order cleanup without protocol branches. Workflow progress is gated by exact target/binding/ref
+correlation and persisted permanent-versus-retryable policy; actions remain protocol-rendered while
+their durable authorization and state transitions remain shared and atomic.
+
+`RegisteredSurfacePlatform` is derived from the closed `SessionRef` union and currently contains only
+`discord` and `github`. It is intentionally narrower than the event-bus `AdapterPlatform` wire enum,
+which also recognizes placeholder values such as `slack`, `telegram`, `whatsapp`, `web`, and `unknown`.
+A wire-valid platform is not therefore an implemented or registered Core surface.
+
+The trust chain begins at authenticated Discord gateway or verified GitHub webhook ingress, decodes the
+complete external envelope into a closed protocol projection, publishes compatible metadata on trusted
+Redis, and decodes it again into a normalized origin. Downstream control, tool, workflow, plugin, and
+subagent contexts preserve one correlated `(platform, userId, sessionId)` identity; conflicting metadata
+fails closed before trusted authority is assigned.
+
+Graceful restart snapshot v4 preserves exact relay platform/request-client/session/ref correlation,
+normalized recovery identity, current-turn user identity, PEL event identity, queue reservations,
+control-application state, and partial lifecycle-publication progress. Recovery reads are non-destructive:
+v1/v2/v3 remain readable and migrate in memory, unavailable or failed restore targets remain retained,
+paused apply stays rollbackable, and the exact row is compare-and-deleted only before total synchronous
+activation. Compatible wire and persistence readers remain broader than the installed registry and are not
+narrowed by executable adapter selection.
+
+The registry is internal runtime composition, not a dynamic plugin API. Discord health, request routing,
+aliases, allowlists, local storage, search indexing/healing, and search sidecars remain Discord-owned.
+GitHub webhook verification, authentication, trigger parsing, rendering, pagination, and acknowledgement
+state remain GitHub-owned. Shared discovery is a query-facing application service rather than a descriptor
+search port, and workflow reply waits remain Discord-only. Adding another platform requires a separate
+future plan; the canonical pattern itself adds no speculative ref variant, enum/config/persisted platform
+value, descriptor, or protocol module.
 
 ### Router
 
 The router subscribes to `evt.adapter` and decides whether to create/append to an agent request for Discord events.
 
-- Implementation: `apps/core/src/surface/bridge/bus-request-router.ts`.
+- Implementation: `apps/core/src/surface/discord/discord-request-router.ts`.
 - Routing modes:
   - `mention`: only start a new request when the bot is mentioned or replied-to.
   - `active`: treat the session like a group chat and respond more aggressively.
@@ -502,16 +553,22 @@ The Claude runtime integration and official SDK consume these directly rather th
 Startup order is intentional:
 
 1. Start Discord search indexer
-2. Bridge adapter -> bus (so early Discord events don’t get lost)
-3. Request-message cache, durable workflow action/wait resolvers, and surface adapters
+2. Start registered adapter-event ingress (so early Discord events don’t get lost)
+3. Request-message cache, durable workflow action/wait resolvers, and registered surface adapters
 4. Workflow progress projector, trigger scheduler, and live-parent completion bridge
 5. Router and privileged Level-2 tool server
-6. Surface output relays and optional GitHub webhook ingress
+6. Registered surface output relays and independently hosted request ingress such as the optional GitHub webhook
 7. Agent runner
 8. Restore graceful-restart request/relay snapshots
 9. Unified workflow engine, which reclaims active durable runs and replays their operation journals
 
-Shutdown happens in reverse (best-effort).
+Shutdown stops registered ingress before relay drain, combines relay recovery snapshots, then releases
+surface resources in deterministic reverse registry order (best-effort).
+
+Recovery startup preflights all required registered descriptors and live relay handles before applying any
+relay or agent state. Relay attempts apply behind paused gates, roll back in reverse order on failure, and
+activate only after the exact persisted row disposition succeeds. A rollback failure that leaves atomicity
+unknown is a registered `Panic`.
 
 ---
 
@@ -521,6 +578,7 @@ Shutdown happens in reverse (best-effort).
 - Expected failures use domain-owned `Result` error unions, including typed terminal errors for fallible streams. `Panic` is reserved for registered hard invariants and defects, is classified with `Panic.is`, and is never converted to an ordinary Err.
 - Exception capture, host signaling, rollback sentinels, compatibility mappings, and defect supervision are allowed only at exact registered adapters. Add exception registrations to the owning workspace in `scripts/architecture/manifest.ts`; the global approval catalog is derived from them, and its reviewed digest must be updated. Other manifest entries use exact symbol identities or exact modules according to their schema, with reasons only where required. Broad allowlists are not an approval mechanism.
 - Persisted codecs report successful provenance as `current`, `migrated`, or contractually valid `missing-defaulted`, while unsupported versions, malformed serialization, and corrupt fields remain distinct errors. Reads do not rewrite data. SQLite Result transactions use the registered private-sentinel adapter, preserve exact Panic and driver classification, and commit state transitions with their outbox records atomically.
+- Surface boundaries follow the closed-ref/registered-platform pattern: protocol adapters validate caller refs and classify provider failures into operation Results, registry facades guard every produced ref, workflow ports gate durable correlation and failure policy, and v4 recovery validates identity plus relay/queue state before paused admission. Protocol sidecars and search stay outside the descriptor.
 - Redis/SuperJSON receive paths begin with `Message<unknown>` and decode the complete event through the canonical codec registry before typed delivery. Handlers return Results; subscription policy owns commit, `park-pending`, dead-letter, or stop. Parked work entries are durable pending entries, not automatic retries.
 - Presentation code consumes closed render-ready projections, never raw tool or SDK payloads or runtime parsers. Lifecycle states are exhaustive, and unknown future variants normalize at the projection adapter.
 - `bun run lint:architecture` runs the semantic checker and production syntax gate; every finding is an error, with no baseline or migration-status path. Focused checks are `bun run test:architecture`, `bun run test:lint-rules`, and `bun run typecheck:architecture`. Root `bun run lint`, `bun run test:all`, `bun run typecheck`, `bun run fmt:check`, and `bun run ci` compose the repository gates.
@@ -530,7 +588,7 @@ Shutdown happens in reverse (best-effort).
 ## Common “Where Do I Change X?” Pointers
 
 - Add/modify bus event types: add one `LILAC_EVENTS` entry in `packages/event-bus/lilac-spec.ts`, add its wire compatibility fixture, then publish and subscribe with an explicit delivery policy.
-- Change request routing behavior: `apps/core/src/surface/bridge/bus-request-router.ts` and config schema in `packages/utils/core-config.ts`.
+- Change request routing behavior: `apps/core/src/surface/discord/discord-request-router.ts` and config schema in `packages/utils/core-config.ts`.
 - Change agent execution behavior (steer/follow-up/interrupt semantics): `packages/agent/ai-sdk-pi-agent.ts`.
 - Change which local tools the LLM can call: `apps/core/src/surface/bridge/bus-agent-runner.ts`.
 - Add a new HTTP tool: implement `ServerTool` in `apps/core/src/tool-server/tools/*` and expose it from a built-in plugin in `apps/core/src/plugins/builtin/*`.

@@ -19,6 +19,7 @@ import {
 import { Result, TaggedError, type Result as ResultType } from "better-result";
 
 import { projectRuntimeError } from "../runtime/error-format";
+import type { AuthenticatedSurfaceOrigin } from "../surface/types";
 import { adaptToolResultToHost, preserveToolPanic } from "./tool-result-adapters";
 
 const modelReasoningEffortSchema = z.enum(MODEL_REASONING_EFFORTS);
@@ -104,6 +105,8 @@ type RequestContextLike = {
   requestClient: string;
   subagentDepth?: number | string;
   subagentProfile?: string;
+  requestInitiator?: { platform: "discord" | "github"; userId: string };
+  requestInitiatorSessionId?: string;
 };
 
 type CurrentRunProfile = SubagentProfile | "primary";
@@ -114,6 +117,10 @@ const requestContextSchema = z.object({
   requestClient: z.string(),
   subagentDepth: z.union([z.number(), z.string()]).optional(),
   subagentProfile: z.string().optional(),
+  requestInitiator: z
+    .object({ platform: z.enum(["discord", "github"]), userId: z.string().trim().min(1) })
+    .optional(),
+  requestInitiatorSessionId: z.string().trim().min(1).optional(),
 });
 
 class SubagentDelegationError extends TaggedError("SubagentDelegationError")<{
@@ -298,6 +305,7 @@ export type SubagentDelegationRegistration = {
   initialMessages: ModelMessage[];
   modelOverride?: string;
   reasoningOverride?: ModelReasoningEffort;
+  authenticatedOrigin?: AuthenticatedSurfaceOrigin;
 };
 
 export type TrustedSubagentDelegationRegistration = SubagentDelegationRegistration & {
@@ -422,6 +430,26 @@ export function subagentTools(params: {
           session_id: ctx.sessionId,
           request_client: toAdapterPlatform(ctx.requestClient),
         };
+        let authenticatedOrigin: AuthenticatedSurfaceOrigin | undefined;
+        if (ctx.requestInitiator?.platform === "discord" && ctx.requestInitiatorSessionId) {
+          authenticatedOrigin = {
+            platform: "discord",
+            userId: ctx.requestInitiator.userId,
+            sessionRef: {
+              platform: "discord",
+              channelId: ctx.requestInitiatorSessionId,
+            },
+          };
+        } else if (ctx.requestInitiator?.platform === "github" && ctx.requestInitiatorSessionId) {
+          authenticatedOrigin = {
+            platform: "github",
+            userId: ctx.requestInitiator.userId,
+            sessionRef: {
+              platform: "github",
+              channelId: ctx.requestInitiatorSessionId,
+            },
+          };
+        }
         logger.info("subagent delegate start", {
           requestId: ctx.requestId,
           sessionId: ctx.sessionId,
@@ -466,6 +494,7 @@ export function subagentTools(params: {
               parentHeaders,
               childHeaders,
               initialMessages: [buildDelegatedTaskPrompt(parsed.task)],
+              ...(authenticatedOrigin ? { authenticatedOrigin } : {}),
               modelOverride: parsed.model,
               reasoningOverride: parsed.reasoning,
             }),

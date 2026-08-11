@@ -150,6 +150,7 @@ type RestrictedBashContext = {
   sessionId?: string;
   requestClient?: string;
   controlCapability?: string;
+  currentTurnUserId?: string;
   toolCallId?: string;
   workspaceWritable?: boolean;
   subagentProfile?: "explore" | "general" | "self";
@@ -450,6 +451,9 @@ function buildToolServerHeaders(
   if (context.requestClient) headers["x-lilac-request-client"] = context.requestClient;
   if (context.controlCapability) {
     headers["x-lilac-control-capability"] = context.controlCapability;
+  }
+  if (context.currentTurnUserId) {
+    headers["x-lilac-current-turn-user-id"] = context.currentTurnUserId;
   }
   if (context.toolCallId) headers["x-lilac-tool-call-id"] = context.toolCallId;
   if (context.subagentProfile) headers["x-lilac-subagent-profile"] = context.subagentProfile;
@@ -761,6 +765,9 @@ async function createRestrictedBash(params: {
       ...(params.context.requestClient
         ? { LILAC_REQUEST_CLIENT: params.context.requestClient }
         : {}),
+      ...(params.context.currentTurnUserId
+        ? { LILAC_CURRENT_TURN_USER_ID: params.context.currentTurnUserId }
+        : {}),
     },
     customCommands: [createToolsCommand(params.context)],
     defenseInDepth: true,
@@ -797,6 +804,7 @@ async function getRestrictedBash(params: {
     params.requestId,
     params.workspaceRoot,
     params.context.toolCallId ?? "",
+    params.context.currentTurnUserId ?? "",
     params.context.workspaceWritable ? "write" : "read",
   ]);
 

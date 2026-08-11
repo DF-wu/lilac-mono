@@ -6,36 +6,46 @@ import {
   type EventDeliveryStartFailed,
   type EventDeliveryStopFailed,
   type LilacBus,
-  type SurfaceMsgRef,
 } from "@stanley2058/lilac-event-bus";
 import { Panic, Result, TaggedError, type Result as ResultType } from "better-result";
 
-import { createLogger, env, errorMessage } from "@stanley2058/lilac-utils";
+import { createLogger, env, formatTaggedErrorForLog } from "@stanley2058/lilac-utils";
 import type { Logger } from "@stanley2058/simple-module-logger";
 
 import type {
   SurfaceFinalTextMode,
   SurfaceAdapter,
   SurfaceOutputPart,
+  SurfaceOutputPartDisposition,
   SurfaceOutputResult,
+  SurfaceOutputStream,
+  SurfaceOperationError,
+  SurfaceOperationResult,
   StartOutputOpts,
   SurfaceToolStatusUpdate,
-  TypingIndicatorProvider,
   TypingIndicatorSubscription,
 } from "../adapter";
-import type { MsgRef, SessionRef, SurfaceAttachment } from "../types";
+import { SurfaceOperationUnsupported } from "../adapter";
+import type { MsgRef, MsgRefFor, SessionRef, SurfaceAttachment } from "../types";
+import type {
+  RegisteredSurfacePlatform,
+  SurfaceIngressAcknowledgementCleanupFailed,
+  SurfaceRelayPolicy,
+  SurfaceRelayRestoreAttempt,
+  SurfaceRelaySnapshotFor,
+  SurfaceRecoveryGeneration,
+  SurfaceRestoredOutputChain,
+  SurfaceReplyTargetInvalid,
+  SurfaceRefInvalid,
+} from "../runtime-descriptor";
+import {
+  SurfaceRelayRestoreApplyFailed,
+  SurfaceRelayRestoreRollbackFailed,
+} from "../runtime-descriptor";
+import { requireSurfaceRelayPolicyRefs, requireSurfaceRelaySnapshot } from "../produced-ref-guard";
 import { mergeSubagentToolStatus } from "../subagent-tool-status";
 
-import { deleteIssueCommentReactionById, deleteIssueReactionById } from "../../github/github-api";
-import { parseGithubRequestId, parseGithubSessionId } from "../../github/github-ids";
-import { parseRequestId } from "./request-ids";
 import { parseRequestControlFromRaw } from "./bus-agent-runner/raw";
-import {
-  clearGithubAck,
-  getGithubAck,
-  getGithubLatestRequestForSession,
-  getGithubRequestMeta,
-} from "../../github/github-state";
 import { isPossibleNoReplyPrefix, resolveReplyDeliveryFromFinalText } from "./reply-directive";
 
 import type { TranscriptStore } from "../../transcript/transcript-store";
@@ -51,7 +61,15 @@ class CmdRequestCancelFailed extends TaggedError("CmdRequestCancelFailed")<{
   readonly message: string;
 }> {}
 
-type CmdRequestDeliveryError = CmdRequestRequiredHeadersMissing | CmdRequestCancelFailed;
+class RelayEventCorrelationInvalid extends TaggedError("RelayEventCorrelationInvalid")<{
+  readonly messageType: string;
+  readonly message: string;
+}> {}
+
+type CmdRequestDeliveryError =
+  | CmdRequestRequiredHeadersMissing
+  | CmdRequestCancelFailed
+  | RelayEventCorrelationInvalid;
 
 function applyCmdRequestDeliveryPolicy(error: CmdRequestDeliveryError): DeliveryDisposition {
   switch (error._tag) {
@@ -59,6 +77,8 @@ function applyCmdRequestDeliveryPolicy(error: CmdRequestDeliveryError): Delivery
       return "park-pending";
     case "CmdRequestCancelFailed":
       return "commit";
+    case "RelayEventCorrelationInvalid":
+      return "dead-letter";
   }
 }
 
@@ -71,14 +91,26 @@ class CmdSurfaceReanchorFailed extends TaggedError("CmdSurfaceReanchorFailed")<{
   readonly message: string;
 }> {}
 
-type CmdSurfaceDeliveryError = CmdSurfaceRequiredHeadersMissing | CmdSurfaceReanchorFailed;
+class CmdSurfaceReplyTargetInvalid extends TaggedError("CmdSurfaceReplyTargetInvalid")<{
+  readonly cause: SurfaceRefInvalid;
+  readonly message: string;
+}> {}
+
+type CmdSurfaceDeliveryError =
+  | CmdSurfaceRequiredHeadersMissing
+  | CmdSurfaceReanchorFailed
+  | CmdSurfaceReplyTargetInvalid
+  | RelayEventCorrelationInvalid;
 
 function applyCmdSurfaceDeliveryPolicy(error: CmdSurfaceDeliveryError): DeliveryDisposition {
   switch (error._tag) {
     case "CmdSurfaceRequiredHeadersMissing":
       return "park-pending";
     case "CmdSurfaceReanchorFailed":
+    case "CmdSurfaceReplyTargetInvalid":
       return "commit";
+    case "RelayEventCorrelationInvalid":
+      return "dead-letter";
   }
 }
 
@@ -91,14 +123,27 @@ class EvtRequestStopTypingFailed extends TaggedError("EvtRequestStopTypingFailed
   readonly message: string;
 }> {}
 
-type EvtRequestDeliveryError = EvtRequestRequiredHeadersMissing | EvtRequestStopTypingFailed;
+class EvtRequestReplyTargetInvalid extends TaggedError("EvtRequestReplyTargetInvalid")<{
+  readonly cause: SurfaceReplyTargetInvalid;
+  readonly message: string;
+}> {}
+
+type EvtRequestDeliveryError =
+  | EvtRequestRequiredHeadersMissing
+  | EvtRequestStopTypingFailed
+  | EvtRequestReplyTargetInvalid
+  | RelayEventCorrelationInvalid;
 
 function applyEvtRequestDeliveryPolicy(error: EvtRequestDeliveryError): DeliveryDisposition {
   switch (error._tag) {
     case "EvtRequestRequiredHeadersMissing":
       return "park-pending";
+    case "EvtRequestReplyTargetInvalid":
+      return "dead-letter";
     case "EvtRequestStopTypingFailed":
       return "commit";
+    case "RelayEventCorrelationInvalid":
+      return "dead-letter";
   }
 }
 
@@ -112,26 +157,31 @@ class OutReqFinishFailed extends TaggedError("OutReqFinishFailed")<{
   readonly message: string;
 }> {}
 
-type OutReqDeliveryError = OutReqPushFailed | OutReqFinishFailed;
+type OutReqDeliveryError = OutReqPushFailed | OutReqFinishFailed | RelayEventCorrelationInvalid;
 
 type BusToAdapterEffect =
   | "abort-output"
   | "cancel-active-relay"
-  | "cleanup-github-ack"
-  | "delete-output-message"
+  | "cleanup-skipped-output"
+  | "clear-ingress-acknowledgement"
   | "delete-transcript-checkpoint"
   | "finish-output"
   | "link-transcript"
   | "publish-output-created"
   | "push-output"
   | "reanchor-output"
+  | "restore-relay"
+  | "start-output"
   | "start-typing"
   | "stop-output-subscription"
   | "stop-relay"
   | "stop-typing";
 
-class BusToAdapterEffectFailed extends TaggedError("BusToAdapterEffectFailed")<{
+export class BusToAdapterEffectFailed extends TaggedError("BusToAdapterEffectFailed")<{
   readonly operation: BusToAdapterEffect;
+  readonly failureKind: "external-effect" | "partial-completion" | "permanent" | "transient";
+  readonly surfaceErrorTag: SurfaceOperationError["_tag"] | null;
+  readonly created: MsgRef | null;
   readonly cause: unknown;
   readonly message: string;
 }> {}
@@ -141,6 +191,8 @@ function applyOutReqDeliveryPolicy(error: OutReqDeliveryError): DeliveryDisposit
     case "OutReqPushFailed":
     case "OutReqFinishFailed":
       return "stop";
+    case "RelayEventCorrelationInvalid":
+      return "dead-letter";
   }
 }
 
@@ -161,14 +213,70 @@ export async function captureBusToAdapterEffect<T>(
     return Result.ok(await effect());
   } catch (cause) {
     rethrowBusToAdapterPanic(cause);
+    if (cause instanceof BusToAdapterEffectFailed) return Result.err(cause);
     return Result.err(
       new BusToAdapterEffectFailed({
         operation,
+        failureKind: "external-effect",
+        surfaceErrorTag: null,
+        created: null,
         cause,
         message: `Bus-to-adapter effect failed: ${operation}`,
       }),
     );
   }
+}
+
+function classifySurfaceOperationForRelay(
+  operation: BusToAdapterEffect,
+  error: SurfaceOperationError,
+): BusToAdapterEffectFailed {
+  switch (error._tag) {
+    case "SurfaceOperationUnsupported":
+    case "SurfacePlatformMismatch":
+    case "SurfaceSessionMismatch":
+    case "SurfaceInvalidInput":
+    case "SurfaceMessageNotFound":
+    case "SurfacePermissionDenied":
+      return new BusToAdapterEffectFailed({
+        operation,
+        failureKind: "permanent",
+        surfaceErrorTag: error._tag,
+        created: null,
+        cause: { errorTag: error._tag },
+        message: `Surface relay operation '${operation}' was rejected permanently (${error._tag})`,
+      });
+    case "SurfaceRateLimited":
+    case "SurfaceUnavailable":
+      return new BusToAdapterEffectFailed({
+        operation,
+        failureKind: "transient",
+        surfaceErrorTag: error._tag,
+        created: null,
+        cause:
+          error._tag === "SurfaceRateLimited"
+            ? { errorTag: error._tag, retryAfterMs: error.retryAfterMs }
+            : { errorTag: error._tag },
+        message: `Surface relay operation '${operation}' failed transiently (${error._tag})`,
+      });
+    case "SurfaceOperationPartiallyCompleted":
+      return new BusToAdapterEffectFailed({
+        operation,
+        failureKind: "partial-completion",
+        surfaceErrorTag: error._tag,
+        created: error.created,
+        cause: { errorTag: error._tag },
+        message: `Surface relay operation '${operation}' partially completed`,
+      });
+  }
+}
+
+export function adaptSurfaceOperationToRelay<T>(
+  operation: BusToAdapterEffect,
+  result: SurfaceOperationResult<T>,
+): T {
+  if (result.status === "ok") return result.value;
+  throw classifySurfaceOperationForRelay(operation, result.error);
 }
 
 export function adaptBusToAdapterSubscriptionStart(
@@ -199,6 +307,15 @@ export async function superviseBusToAdapterCleanup(
   if (failure !== null) throw failure.cause;
 }
 
+function signalSurfaceRelayRecoveryAtomicityUnknown(
+  cause: SurfaceRelayRestoreRollbackFailed,
+): never {
+  throw new Panic({
+    message: "Relay recovery rollback left atomicity unknown",
+    cause,
+  });
+}
+
 async function runBusToAdapterBestEffort(input: {
   operation: BusToAdapterEffect;
   effect: () => Promise<void>;
@@ -212,6 +329,23 @@ async function runBusToAdapterBestEffort(input: {
   input.logger[input.logLevel](
     input.logMessage,
     formatBridgeTaggedErrorForLog(result.error, input.context),
+  );
+}
+
+export function logIngressAcknowledgementCleanupFailure(input: {
+  readonly logger: Pick<Logger, "warn">;
+  readonly error: SurfaceIngressAcknowledgementCleanupFailed;
+  readonly requestId: string;
+  readonly sessionId: string;
+}): void {
+  input.logger.warn(
+    "failed to clear ingress acknowledgement",
+    formatBridgeTaggedErrorForLog(input.error, {
+      requestId: input.requestId,
+      sessionId: input.sessionId,
+      causeErrorTag: input.error.cause.errorTag,
+      causeErrorMessage: input.error.cause.errorMessage,
+    }),
   );
 }
 
@@ -240,35 +374,6 @@ function getConsumerId(prefix: string): string {
 function scheduleTimeout(callback: () => void, delayMs: number): () => void {
   const timeout = setTimeout(callback, delayMs);
   return () => clearTimeout(timeout);
-}
-
-function isTypingIndicatorProvider(
-  adapter: SurfaceAdapter,
-): adapter is SurfaceAdapter & TypingIndicatorProvider {
-  return "startTyping" in adapter && typeof adapter.startTyping === "function";
-}
-
-function parseDiscordReplyTo(params: { requestId: string; sessionId: string }): MsgRef | null {
-  const parsed = parseRequestId(params.requestId);
-  if (parsed?.kind !== "discord_message") return null;
-  if (parsed.channelId !== params.sessionId) return null;
-
-  return {
-    platform: "discord",
-    channelId: params.sessionId,
-    messageId: parsed.messageId,
-  };
-}
-
-function parseGithubReplyTo(params: { requestId: string; sessionId: string }): MsgRef | null {
-  const parsed = parseGithubRequestId({ requestId: params.requestId });
-  if (!parsed) return null;
-  if (parsed.sessionId !== params.sessionId) return null;
-  return {
-    platform: "github",
-    channelId: params.sessionId,
-    messageId: parsed.triggerId,
-  };
 }
 
 function parseRouterSessionMode(raw: string | undefined): "mention" | "active" | undefined {
@@ -316,61 +421,12 @@ function appendReasoningDetail(base: string, delta: string): string {
   return clampReasoningDetail(merged);
 }
 
-async function cleanupGithubAck(input: { logger: Logger; requestId: string; sessionId: string }) {
-  const ack = getGithubAck(input.requestId);
-  if (!ack) return;
-
-  const meta = getGithubRequestMeta(input.requestId);
-  const thread = (() => {
-    if (meta?.repoFullName) {
-      const [owner, repo] = meta.repoFullName.split("/");
-      if (owner && repo) {
-        return { owner, repo, issueNumber: meta.issueNumber };
-      }
-    }
-    const parsed = parseGithubSessionId(input.sessionId);
-    return {
-      owner: parsed.owner,
-      repo: parsed.repo,
-      issueNumber: parsed.number,
-    };
-  })();
-
-  let deleted: ResultType<void, BusToAdapterEffectFailed>;
-  try {
-    deleted = await captureBusToAdapterEffect("cleanup-github-ack", async () => {
-      if (ack.target.kind === "issue") {
-        await deleteIssueReactionById({
-          owner: thread.owner,
-          repo: thread.repo,
-          issueNumber: ack.target.issueNumber,
-          reactionId: ack.reactionId,
-        });
-      } else {
-        await deleteIssueCommentReactionById({
-          owner: thread.owner,
-          repo: thread.repo,
-          commentId: ack.target.commentId,
-          reactionId: ack.reactionId,
-        });
-      }
-    });
-  } finally {
-    clearGithubAck(input.requestId);
-  }
-
-  if (deleted.status === "error" && !errorMessage(deleted.error.cause).includes("404")) {
-    input.logger.warn(
-      "failed to delete github ack reaction",
-      formatBridgeTaggedErrorForLog(deleted.error, { requestId: input.requestId }),
-    );
-  }
-}
-
 type ActiveRelay = {
   requestId: string;
   sessionId: string;
-  requestClient?: string;
+  platform: RegisteredSurfacePlatform;
+  activate(): void;
+  rollbackRestore(): Promise<ResultType<void, SurfaceRelayRestoreRollbackFailed>>;
   stopTyping(): Promise<void>;
   stop(): Promise<void>;
   cancel(): Promise<void>;
@@ -388,7 +444,7 @@ export type BusToAdapterRelaySnapshot = {
   requestId: string;
   sessionId: string;
   requestClient?: string;
-  platform: "discord" | "github";
+  platform: RegisteredSurfacePlatform;
   requestStartedAtMs?: number;
   routerSessionMode?: "mention" | "active";
   replyTo?: MsgRef;
@@ -414,16 +470,6 @@ export type BusToAdapterRelaySnapshot = {
   outCursor?: string;
 };
 
-function toMsgRefFromSurfaceMsgRef(value: SurfaceMsgRef): MsgRef | null {
-  const { platform, channelId, messageId } = value;
-  if (platform !== "discord" && platform !== "github") return null;
-  return {
-    platform,
-    channelId,
-    messageId,
-  };
-}
-
 function mergeContinuationText(existing: string, continuation: string): string {
   if (existing.length === 0) return continuation;
   if (continuation.length === 0) return existing;
@@ -441,10 +487,11 @@ function mergeContinuationText(existing: string, continuation: string): string {
   return `${existing}${continuation}`;
 }
 
-export async function bridgeBusToAdapter(params: {
+export async function bridgeBusToAdapter<P extends RegisteredSurfacePlatform>(params: {
   adapter: SurfaceAdapter;
   bus: LilacBus;
-  platform: "discord" | "github";
+  platform: P;
+  policy: SurfaceRelayPolicy<P>;
   subscriptionId: string;
   idleTimeoutMs?: number;
   scheduleIdleTimeout?: (callback: () => void, delayMs: number) => () => void;
@@ -462,20 +509,38 @@ export async function bridgeBusToAdapter(params: {
     idleTimeoutMs = 60 * 60 * 1000,
     scheduleIdleTimeout = scheduleTimeout,
   } = params;
+  const policy = requireSurfaceRelayPolicyRefs(platform, params.policy);
 
   const activeRelays = new Map<string, ActiveRelay>();
-  const terminalLifecycleByRequestId = new Map<string, number>();
+  const admittedRestoreRelays = new Map<string, ActiveRelay>();
+  const terminalLifecycleByRequestId = new Map<
+    string,
+    {
+      readonly platform: RegisteredSurfacePlatform;
+      readonly sessionId: string;
+      readonly at: number;
+    }
+  >();
   const TERMINAL_LIFECYCLE_TTL_MS = 5 * 60 * 1000;
 
   const pruneTerminalLifecycleCache = (nowMs: number) => {
-    for (const [rid, ts] of terminalLifecycleByRequestId) {
-      if (nowMs - ts > TERMINAL_LIFECYCLE_TTL_MS) {
+    for (const [rid, terminal] of terminalLifecycleByRequestId) {
+      if (nowMs - terminal.at > TERMINAL_LIFECYCLE_TTL_MS) {
         terminalLifecycleByRequestId.delete(rid);
       }
     }
   };
   let draining = false;
   let ingressStopped = false;
+  const correlationError = (messageType: string) =>
+    Result.err(
+      new RelayEventCorrelationInvalid({
+        messageType,
+        message: "Relay event platform or session does not match its request correlation",
+      }),
+    );
+  const matchesRelay = (relay: ActiveRelay, eventPlatform: string, eventSessionId: string) =>
+    relay.platform === eventPlatform && relay.sessionId === eventSessionId;
 
   const cmdRequestStarted = await bus.subscribeTopic(
     "cmd.request",
@@ -495,7 +560,8 @@ export async function bridgeBusToAdapter(params: {
       const sessionId = msg.headers?.session_id;
       const requestClient = msg.headers?.request_client;
 
-      if (!requestId || !sessionId) {
+      if (!requestId || !sessionId || !requestClient) {
+        if (requestId && activeRelays.has(requestId)) return correlationError(msg.type);
         logger.warn("relay.event.rejected", {
           requestId,
           sessionId,
@@ -505,12 +571,15 @@ export async function bridgeBusToAdapter(params: {
         });
         return Result.err(
           new CmdRequestRequiredHeadersMissing({
-            message: "cmd.request.message missing required headers.request_id/session_id",
+            message:
+              "cmd.request.message missing required headers.request_id/session_id/request_client",
           }),
         );
       }
 
-      if (requestClient && requestClient !== platform) {
+      if (requestClient !== platform) {
+        const relay = activeRelays.get(requestId);
+        if (relay) return correlationError(msg.type);
         logger.debug("relay.event.ignored", {
           requestId,
           sessionId,
@@ -539,6 +608,7 @@ export async function bridgeBusToAdapter(params: {
         });
         return Result.ok(undefined);
       }
+      if (!matchesRelay(relay, requestClient, sessionId)) return correlationError(msg.type);
 
       const cancelled = await captureBusToAdapterEffect("cancel-active-relay", () =>
         relay.cancel(),
@@ -577,15 +647,19 @@ export async function bridgeBusToAdapter(params: {
       const requestId = msg.headers?.request_id;
       const sessionId = msg.headers?.session_id;
       const requestClient = msg.headers?.request_client;
-      if (!requestId || !sessionId) {
+      if (!requestId || !sessionId || !requestClient) {
+        if (requestId && activeRelays.has(requestId)) return correlationError(msg.type);
         return Result.err(
           new CmdSurfaceRequiredHeadersMissing({
-            message: "cmd.surface.output.reanchor missing required headers.request_id/session_id",
+            message:
+              "cmd.surface.output.reanchor missing required headers.request_id/session_id/request_client",
           }),
         );
       }
 
-      if (requestClient && requestClient !== platform) {
+      if (requestClient !== platform) {
+        const relay = activeRelays.get(requestId);
+        if (relay) return correlationError(msg.type);
         logger.debug("relay.event.ignored", {
           requestId,
           sessionId,
@@ -608,14 +682,34 @@ export async function bridgeBusToAdapter(params: {
         });
         return Result.ok(undefined);
       }
+      if (!matchesRelay(relay, requestClient, sessionId)) return correlationError(msg.type);
 
-      const replyTo = msg.data.replyTo ? toMsgRefFromSurfaceMsgRef(msg.data.replyTo) : null;
+      let replyTo: MsgRef | undefined;
+      if (msg.data.replyTo) {
+        const decoded = policy.refs.decodeReanchorTarget({
+          ref: msg.data.replyTo,
+          expectedSessionId: sessionId,
+        });
+        if (decoded.status === "error") {
+          logger.warn(
+            "relay reanchor target rejected",
+            formatBridgeTaggedErrorForLog(decoded.error, { requestId, sessionId, platform }),
+          );
+          return Result.err(
+            new CmdSurfaceReplyTargetInvalid({
+              cause: decoded.error,
+              message: "Output reanchor target is invalid",
+            }),
+          );
+        }
+        replyTo = decoded.value;
+      }
 
       const reanchored = await captureBusToAdapterEffect("reanchor-output", () =>
         relay.reanchor({
           inheritReplyTo: msg.data.inheritReplyTo,
           mode: msg.data.mode,
-          replyTo: replyTo ?? undefined,
+          replyTo,
         }),
       );
       if (reanchored.status === "ok") return Result.ok(undefined);
@@ -663,7 +757,13 @@ export async function bridgeBusToAdapter(params: {
       const requestClient = msg.headers?.request_client;
       const routerSessionMode = parseRouterSessionMode(msg.headers?.router_session_mode);
 
-      if (!requestId || !sessionId) {
+      if (!requestId || !sessionId || !requestClient) {
+        if (
+          requestId &&
+          (activeRelays.has(requestId) || terminalLifecycleByRequestId.has(requestId))
+        ) {
+          return correlationError(msg.type);
+        }
         // Do not ack malformed messages: they need investigation.
         logger.error("relay.event.rejected", {
           requestId,
@@ -674,12 +774,16 @@ export async function bridgeBusToAdapter(params: {
         });
         return Result.err(
           new EvtRequestRequiredHeadersMissing({
-            message: "evt.request event missing required headers.request_id/session_id",
+            message:
+              "evt.request event missing required headers.request_id/session_id/request_client",
           }),
         );
       }
 
-      if (requestClient && requestClient !== platform) {
+      if (requestClient !== platform) {
+        if (activeRelays.has(requestId) || terminalLifecycleByRequestId.has(requestId)) {
+          return correlationError(msg.type);
+        }
         logger.debug("relay.event.ignored", {
           requestId,
           sessionId,
@@ -693,13 +797,29 @@ export async function bridgeBusToAdapter(params: {
 
       pruneTerminalLifecycleCache(Date.now());
 
+      const activeRelay = activeRelays.get(requestId);
+      if (activeRelay && !matchesRelay(activeRelay, requestClient, sessionId)) {
+        return correlationError(msg.type);
+      }
+      const terminalLifecycle = terminalLifecycleByRequestId.get(requestId);
+      if (
+        terminalLifecycle &&
+        (terminalLifecycle.platform !== requestClient || terminalLifecycle.sessionId !== sessionId)
+      ) {
+        return correlationError(msg.type);
+      }
+
       if (msg.type === lilacEventTypes.EvtRequestLifecycleChanged) {
         if (
           msg.data.state === "resolved" ||
           msg.data.state === "failed" ||
           msg.data.state === "cancelled"
         ) {
-          terminalLifecycleByRequestId.set(requestId, Date.now());
+          terminalLifecycleByRequestId.set(requestId, {
+            platform,
+            sessionId,
+            at: Date.now(),
+          });
 
           const relay = activeRelays.get(requestId);
           if (relay) {
@@ -772,6 +892,24 @@ export async function bridgeBusToAdapter(params: {
         requestClient,
       });
 
+      const initialReplyTarget = policy.refs.resolveInitialReplyTarget({ requestId, sessionId });
+      if (initialReplyTarget.kind === "invalid") {
+        logger.error(
+          "relay initial reply target rejected",
+          formatBridgeTaggedErrorForLog(initialReplyTarget.error, {
+            requestId,
+            sessionId,
+            platform,
+          }),
+        );
+        return Result.err(
+          new EvtRequestReplyTargetInvalid({
+            cause: initialReplyTarget.error,
+            message: "Initial output reply target is invalid",
+          }),
+        );
+      }
+
       const relay = await startRelay({
         adapter,
         bus,
@@ -782,6 +920,7 @@ export async function bridgeBusToAdapter(params: {
         routerSessionMode,
         requestClient,
         idleTimeoutMs,
+        initialReplyTo: initialReplyTarget.kind === "target" ? initialReplyTarget.ref : undefined,
       });
 
       activeRelays.set(requestId, relay);
@@ -836,19 +975,38 @@ export async function bridgeBusToAdapter(params: {
     ]);
   };
 
-  async function startRelay(input: {
-    adapter: SurfaceAdapter;
-    bus: LilacBus;
-    platform: "discord" | "github";
-    requestId: string;
-    sessionId: string;
-    requestStartedAtMs?: number;
-    routerSessionMode?: "mention" | "active";
-    requestClient?: string;
-    idleTimeoutMs: number;
-    restore?: BusToAdapterRelaySnapshot;
-  }): Promise<ActiveRelay> {
+  type RelayStartupResources = {
+    output?: SurfaceOutputStream;
+    subscription?: ResultSubscription;
+    typing?: TypingIndicatorSubscription;
+  };
+
+  async function startRelayUnchecked(
+    input: {
+      adapter: SurfaceAdapter;
+      bus: LilacBus;
+      platform: P;
+      requestId: string;
+      sessionId: string;
+      requestStartedAtMs?: number;
+      routerSessionMode?: "mention" | "active";
+      requestClient?: string;
+      idleTimeoutMs: number;
+      initialReplyTo?: MsgRef;
+      restore?: BusToAdapterRelaySnapshot;
+      paused?: boolean;
+    },
+    startupResources: RelayStartupResources,
+  ): Promise<ActiveRelay> {
     const { requestId, sessionId, idleTimeoutMs } = input;
+    let resolveActivationGate: (() => void) | null = null;
+    const activationGate = input.paused
+      ? new Promise<void>((resolve) => {
+          resolveActivationGate = resolve;
+        })
+      : Promise.resolve();
+    let activated = !input.paused;
+    let stopped = false;
 
     const relayStartedAt = Date.now();
     const requestStartedAtMs = Math.max(
@@ -856,17 +1014,8 @@ export async function bridgeBusToAdapter(params: {
       input.restore?.requestStartedAtMs ?? input.requestStartedAtMs ?? relayStartedAt,
     );
 
-    const sessionRef: SessionRef =
-      platform === "discord"
-        ? { platform, channelId: sessionId }
-        : { platform: "github", channelId: sessionId };
-
-    const replyTo =
-      platform === "discord"
-        ? parseDiscordReplyTo({ requestId, sessionId })
-        : parseGithubReplyTo({ requestId, sessionId });
-
-    const baseReplyTo = input.restore?.replyTo ?? replyTo ?? undefined;
+    const sessionRef: SessionRef = policy.refs.createSessionRef(sessionId);
+    const baseReplyTo = input.initialReplyTo;
     let currentReplyTo: MsgRef | undefined = baseReplyTo;
 
     let totalTextChars = input.restore?.totalTextChars ?? input.restore?.visibleText.length ?? 0;
@@ -885,7 +1034,7 @@ export async function bridgeBusToAdapter(params: {
     let reasoningDetailText = input.restore?.reasoning?.detailText ?? "";
     let pendingNoReplyPrefix = "";
     let bufferNoReplyPrefix = true;
-    let streamHasVisibleOutput = false;
+    let streamShouldFinish = false;
     const withoutStreamPhaseBoundary = (text: string, textOffsetChars = 0): string => {
       if (streamPhaseBoundaryPrefixChars === 0) return text;
       const boundaryStart = Math.min(
@@ -949,20 +1098,8 @@ export async function bridgeBusToAdapter(params: {
 
     let streamToken = 0;
 
-    const publishCreatedForToken = (token: number) => (msgRef: MsgRef) => {
-      recordCreatedOutputRef(msgRef);
-
-      // Only publish created messages for the currently active output stream.
-      // This prevents a reanchor from temporarily treating "frozen" follow-up messages
-      // (e.g. attachment flushes) as the active streaming target.
-      if (token !== streamToken) return;
-      const key = `${msgRef.platform}:${msgRef.channelId}:${msgRef.messageId}`;
-      if (!activeOutputRefKeys.has(key)) {
-        activeOutputRefKeys.add(key);
-        activeOutputRefs.push(msgRef);
-      }
-
-      void runBusToAdapterBestEffort({
+    const publishOutputCreated = (msgRef: MsgRef) =>
+      runBusToAdapterBestEffort({
         operation: "publish-output-created",
         effect: async () => {
           adaptEventPublishResultToHost(
@@ -990,6 +1127,20 @@ export async function bridgeBusToAdapter(params: {
         logMessage: "failed to publish output message created",
         context: { requestId },
       });
+
+    const publishCreatedForToken = (token: number) => (msgRef: MsgRef) => {
+      recordCreatedOutputRef(msgRef);
+
+      // Only publish created messages for the currently active output stream.
+      // This prevents a reanchor from temporarily treating "frozen" follow-up messages
+      // (e.g. attachment flushes) as the active streaming target.
+      if (token !== streamToken) return;
+      const key = `${msgRef.platform}:${msgRef.channelId}:${msgRef.messageId}`;
+      if (!activeOutputRefKeys.has(key)) {
+        activeOutputRefKeys.add(key);
+        activeOutputRefs.push(msgRef);
+      }
+      if (activated && !stopped) void publishOutputCreated(msgRef);
     };
 
     let useResumeOpts = Boolean(input.restore);
@@ -997,8 +1148,10 @@ export async function bridgeBusToAdapter(params: {
     const buildStartOpts = (
       overrideReplyTo: MsgRef | undefined,
       token: number,
+      preparationMode?: "paused-recovery",
     ): StartOutputOpts => {
       const startOpts: StartOutputOpts = {
+        ...(preparationMode ? { preparationMode } : {}),
         replyTo: overrideReplyTo,
         requestId,
         requestStartedAtMs,
@@ -1018,53 +1171,34 @@ export async function bridgeBusToAdapter(params: {
     };
 
     streamToken += 1;
-    let out = await adapter.startOutput(sessionRef, buildStartOpts(baseReplyTo, streamToken));
+    let out = adaptSurfaceOperationToRelay(
+      "start-output",
+      await adapter.startOutput(
+        sessionRef,
+        buildStartOpts(
+          baseReplyTo,
+          streamToken,
+          input.restore && input.paused ? "paused-recovery" : undefined,
+        ),
+      ),
+    );
+    startupResources.output = out;
     let finalTextMode: SurfaceFinalTextMode = out.getFinalTextMode?.() ?? "continuation";
     useResumeOpts = false;
-
-    if (input.restore) {
-      // Re-publish existing output refs so router active-output tracking can recover.
-      for (const ref of createdOutputRefs) {
-        void runBusToAdapterBestEffort({
-          operation: "publish-output-created",
-          effect: async () => {
-            adaptEventPublishResultToHost(
-              await bus.publish(
-                lilacEventTypes.EvtSurfaceOutputMessageCreated,
-                {
-                  msgRef: {
-                    platform: ref.platform,
-                    channelId: ref.channelId,
-                    messageId: ref.messageId,
-                  },
-                },
-                {
-                  headers: {
-                    request_id: requestId,
-                    session_id: sessionId,
-                    request_client: input.platform,
-                  },
-                },
-              ),
-            );
-          },
-          logger,
-          logLevel: "debug",
-          logMessage: "failed to publish restored output message created",
-          context: { requestId, sessionId, messageId: ref.messageId },
-        });
+    const recordOutputPartDisposition = (disposition: SurfaceOutputPartDisposition): void => {
+      if (disposition === "visible" || disposition === "terminal") {
+        streamShouldFinish = true;
       }
+    };
 
+    const hydrateRestoredState = (): void => {
+      if (!input.restore) return;
+      const parts: SurfaceOutputPart[] = [];
       if (visibleTextAcc.trim().length > 0) {
-        await out.push({ type: "text.set", text: visibleTextAcc });
-        streamHasVisibleOutput = true;
+        parts.push({ type: "text.set", text: visibleTextAcc });
       }
-      if (
-        textPhase !== "final_answer" &&
-        platform === "discord" &&
-        typeof reasoningStartedAtMs === "number"
-      ) {
-        await out.push({
+      if (textPhase !== "final_answer" && typeof reasoningStartedAtMs === "number") {
+        parts.push({
           type: "reasoning.status",
           update: {
             startedAtMs: reasoningStartedAtMs,
@@ -1072,15 +1206,27 @@ export async function bridgeBusToAdapter(params: {
             detailText: reasoningDetailText,
           },
         });
-        streamHasVisibleOutput = true;
       }
       if (textPhase !== "final_answer") {
-        for (const update of toolStatusById.values()) {
-          await out.push({ type: "tool.status", update });
-          streamHasVisibleOutput = true;
-        }
+        for (const update of toolStatusById.values()) parts.push({ type: "tool.status", update });
       }
-    }
+      const hydrate = out.hydrateRecovery;
+      if (!hydrate) {
+        adaptSurfaceOperationToRelay(
+          "start-output",
+          Result.err(
+            new SurfaceOperationUnsupported({
+              platform,
+              operation: "start-output",
+              message: "Surface output stream does not support recovery hydration",
+            }),
+          ),
+        );
+        return;
+      }
+      recordOutputPartDisposition(hydrate.call(out, parts));
+    };
+    hydrateRestoredState();
 
     const switchOutputLane = async (lane: {
       replyTo?: MsgRef;
@@ -1094,7 +1240,9 @@ export async function bridgeBusToAdapter(params: {
       activeOutputRefKeys = new Set();
       await runBusToAdapterBestEffort({
         operation: "abort-output",
-        effect: () => out.abort(lane.abortReason),
+        effect: async () => {
+          adaptSurfaceOperationToRelay("abort-output", await out.abort(lane.abortReason));
+        },
       });
 
       const nextReplyTo = lane.resolveReplyToAfterAbort?.() ?? lane.replyTo;
@@ -1109,29 +1257,41 @@ export async function bridgeBusToAdapter(params: {
       finalAnswerText = "";
       phaseSegmentsValid = true;
       visibleTextAcc = "";
-      streamHasVisibleOutput = false;
-      out = await adapter.startOutput(sessionRef, buildStartOpts(nextReplyTo, streamToken));
+      streamShouldFinish = false;
+      out = adaptSurfaceOperationToRelay(
+        "start-output",
+        await adapter.startOutput(sessionRef, buildStartOpts(nextReplyTo, streamToken)),
+      );
       finalTextMode = out.getFinalTextMode?.() ?? "continuation";
 
       if (!lane.replayStatus) return;
-      if (platform === "discord" && typeof reasoningStartedAtMs === "number") {
-        await out.push({
-          type: "reasoning.status",
-          update: {
-            startedAtMs: reasoningStartedAtMs,
-            frozenAtMs: reasoningFrozenAtMs,
-            detailText: reasoningDetailText,
-          },
-        });
-        streamHasVisibleOutput = true;
+      if (typeof reasoningStartedAtMs === "number") {
+        recordOutputPartDisposition(
+          adaptSurfaceOperationToRelay(
+            "push-output",
+            await out.push({
+              type: "reasoning.status",
+              update: {
+                startedAtMs: reasoningStartedAtMs,
+                frozenAtMs: reasoningFrozenAtMs,
+                detailText: reasoningDetailText,
+              },
+            }),
+          ),
+        );
       }
       for (const update of toolStatusById.values()) {
-        await out.push({ type: "tool.status", update });
-        streamHasVisibleOutput = true;
+        recordOutputPartDisposition(
+          adaptSurfaceOperationToRelay(
+            "push-output",
+            await out.push({ type: "tool.status", update }),
+          ),
+        );
       }
     };
 
     let typing: TypingIndicatorSubscription | null = null;
+    let typingAttempted = false;
 
     const stopTyping = async () => {
       const currentTyping = typing;
@@ -1139,7 +1299,9 @@ export async function bridgeBusToAdapter(params: {
       if (!currentTyping) return;
       await runBusToAdapterBestEffort({
         operation: "stop-typing",
-        effect: () => currentTyping.stop(),
+        effect: async () => {
+          adaptSurfaceOperationToRelay("stop-typing", await currentTyping.stop());
+        },
       });
     };
 
@@ -1147,48 +1309,65 @@ export async function bridgeBusToAdapter(params: {
     const bumpTimeout = () => {
       cancelTimeout?.();
       cancelTimeout = scheduleIdleTimeout(() => {
-        logger.warn("reply relay idle timeout", {
-          requestId,
-          sessionId,
-          idleTimeoutMs,
-        });
+        const expire = () => {
+          if (stopped) return;
+          logger.warn("reply relay idle timeout", {
+            requestId,
+            sessionId,
+            idleTimeoutMs,
+          });
 
-        const abortOutput = runBusToAdapterBestEffort({
-          operation: "abort-output",
-          effect: () => out.abort("timeout"),
-          logger,
-          logLevel: "error",
-          logMessage: "failed to abort output stream",
-          context: { requestId },
-        });
-        const stopRelay = runBusToAdapterBestEffort({
-          operation: "stop-relay",
-          effect: relayStop,
-          logger,
-          logLevel: "error",
-          logMessage: "failed to stop relay",
-          context: { requestId },
-        });
-        void superviseBusToAdapterCleanup([() => abortOutput, () => stopRelay]);
+          const abortOutput = runBusToAdapterBestEffort({
+            operation: "abort-output",
+            effect: async () => {
+              adaptSurfaceOperationToRelay("abort-output", await out.abort("timeout"));
+            },
+            logger,
+            logLevel: "error",
+            logMessage: "failed to abort output stream",
+            context: { requestId },
+          });
+          const stopRelay = runBusToAdapterBestEffort({
+            operation: "stop-relay",
+            effect: relayStop,
+            logger,
+            logLevel: "error",
+            logMessage: "failed to stop relay",
+            context: { requestId },
+          });
+          void superviseBusToAdapterCleanup([() => abortOutput, () => stopRelay]);
+        };
+        if (activated) expire();
+        else void activationGate.then(expire);
       }, idleTimeoutMs);
     };
 
-    let stopped = false;
     let outputSub: ResultSubscription | null = null;
     let firstOutLogged = false;
     let handlingOutputEvent = false;
 
-    const deleteCreatedOutputMessages = async () => {
-      if (platform !== "discord") return;
-
+    const cleanupSkippedOutput = async () => {
+      const cleanup = policy.finalization?.cleanupSkippedOutput;
+      if (!cleanup) return;
       const deletions: Array<() => Promise<void>> = [];
       for (let i = createdOutputRefs.length - 1; i >= 0; i--) {
         const ref = createdOutputRefs[i];
         if (!ref) continue;
+        const decoded = policy.refs.decodeReanchorTarget({
+          ref,
+          expectedSessionId: sessionId,
+        });
+        if (decoded.status === "error") {
+          logger.warn(
+            "skipped output cleanup ref rejected",
+            formatBridgeTaggedErrorForLog(decoded.error, { requestId, sessionId, platform }),
+          );
+          continue;
+        }
         deletions.push(() =>
           runBusToAdapterBestEffort({
-            operation: "delete-output-message",
-            effect: () => adapter.deleteMsg(ref),
+            operation: "cleanup-skipped-output",
+            effect: () => cleanup({ ref: decoded.value }),
             logger,
             logLevel: "debug",
             logMessage: "failed to delete skipped output message",
@@ -1197,6 +1376,29 @@ export async function bridgeBusToAdapter(params: {
         );
       }
       await superviseBusToAdapterCleanup(deletions);
+    };
+
+    const clearIngressAcknowledgement = async () => {
+      const clear = policy.finalization?.clearIngressAcknowledgement;
+      if (!clear) return;
+      const cleared = await captureBusToAdapterEffect("clear-ingress-acknowledgement", () =>
+        clear({ requestId, sessionId }),
+      );
+      if (cleared.status === "error") {
+        logger.warn(
+          "failed to clear ingress acknowledgement",
+          formatBridgeTaggedErrorForLog(cleared.error, { requestId, sessionId }),
+        );
+        return;
+      }
+      if (cleared.value.status === "error") {
+        logIngressAcknowledgementCleanupFailure({
+          logger,
+          error: cleared.value.error,
+          requestId,
+          sessionId,
+        });
+      }
     };
 
     const deleteUnlinkedCheckpointCandidate = async () => {
@@ -1220,6 +1422,8 @@ export async function bridgeBusToAdapter(params: {
     const relayStop = async () => {
       if (stopped) return;
       stopped = true;
+      resolveActivationGate?.();
+      resolveActivationGate = null;
 
       // Remove from recoverable set immediately so graceful snapshots cannot
       // include a relay that has already reached terminal state.
@@ -1255,23 +1459,23 @@ export async function bridgeBusToAdapter(params: {
 
     const pushOutputPart = async (
       part: SurfaceOutputPart,
-    ): Promise<ResultType<void, OutReqPushFailed>> => {
-      const pushed = await captureBusToAdapterEffect("push-output", () => out.push(part));
-      if (pushed.status === "ok") return Result.ok(undefined);
+    ): Promise<ResultType<SurfaceOutputPartDisposition, OutReqPushFailed>> => {
+      const pushed = await out.push(part);
+      if (pushed.status === "ok") return Result.ok(pushed.value);
       logger.error(
         "failed to push relay output",
         formatBridgeTaggedErrorForLog(pushed.error, { requestId, sessionId }),
       );
       return Result.err(
         new OutReqPushFailed({
-          cause: pushed.error,
+          cause: classifySurfaceOperationForRelay("push-output", pushed.error),
           message: "Failed to push relay output",
         }),
       );
     };
 
     const finishOutput = async (): Promise<ResultType<SurfaceOutputResult, OutReqFinishFailed>> => {
-      const finished = await captureBusToAdapterEffect("finish-output", () => out.finish());
+      const finished = await out.finish();
       if (finished.status === "ok") return Result.ok(finished.value);
       logger.error(
         "failed to finish relay output",
@@ -1279,7 +1483,7 @@ export async function bridgeBusToAdapter(params: {
       );
       return Result.err(
         new OutReqFinishFailed({
-          cause: finished.error,
+          cause: classifySurfaceOperationForRelay("finish-output", finished.error),
           message: "Failed to finish relay output",
         }),
       );
@@ -1294,10 +1498,19 @@ export async function bridgeBusToAdapter(params: {
         batch: { maxWaitMs: 250 },
       },
       async (outMsg, outCtx): Promise<ResultType<void, OutReqDeliveryError>> => {
+        await activationGate;
+        if (
+          outMsg.headers?.request_id !== requestId ||
+          outMsg.headers?.session_id !== sessionId ||
+          outMsg.headers?.request_client !== input.platform
+        ) {
+          return correlationError(outMsg.type);
+        }
         if (stopped) {
           lastOutCursor = outCtx.cursor;
           return Result.ok(undefined);
         }
+        await startTyping();
 
         if (env.perf.log && !firstOutLogged) {
           firstOutLogged = true;
@@ -1346,32 +1559,27 @@ export async function bridgeBusToAdapter(params: {
               }
 
               case lilacEventTypes.EvtAgentOutputDeltaReasoning: {
-                if (platform === "discord") {
-                  const startedAtMs = reasoningStartedAtMs ?? outMsg.ts;
-                  reasoningStartedAtMs = startedAtMs;
+                const startedAtMs = reasoningStartedAtMs ?? outMsg.ts;
+                reasoningStartedAtMs = startedAtMs;
 
-                  const seq = outMsg.data.seq;
-                  if (typeof seq === "number" && Number.isFinite(seq)) {
-                    // New behavior: each sequenced event carries one fully completed
-                    // reasoning chunk and should replace the previous visible chunk.
-                    reasoningDetailText = clampReasoningDetail(outMsg.data.delta);
-                  } else {
-                    // Back-compat for legacy publishers that stream incremental deltas.
-                    reasoningDetailText = appendReasoningDetail(
-                      reasoningDetailText,
-                      outMsg.data.delta,
-                    );
-                  }
-
-                  part = {
-                    type: "reasoning.status",
-                    update: {
-                      startedAtMs,
-                      frozenAtMs: reasoningFrozenAtMs,
-                      detailText: reasoningDetailText,
-                    },
-                  };
+                const seq = outMsg.data.seq;
+                if (typeof seq === "number" && Number.isFinite(seq)) {
+                  reasoningDetailText = clampReasoningDetail(outMsg.data.delta);
+                } else {
+                  reasoningDetailText = appendReasoningDetail(
+                    reasoningDetailText,
+                    outMsg.data.delta,
+                  );
                 }
+
+                part = {
+                  type: "reasoning.status",
+                  update: {
+                    startedAtMs,
+                    frozenAtMs: reasoningFrozenAtMs,
+                    detailText: reasoningDetailText,
+                  },
+                };
                 break;
               }
 
@@ -1418,7 +1626,6 @@ export async function bridgeBusToAdapter(params: {
                 totalTextChars += outMsg.data.delta.length;
 
                 if (
-                  platform === "discord" &&
                   typeof reasoningStartedAtMs === "number" &&
                   typeof reasoningFrozenAtMs !== "number"
                 ) {
@@ -1523,14 +1730,14 @@ export async function bridgeBusToAdapter(params: {
                     () =>
                       runBusToAdapterBestEffort({
                         operation: "abort-output",
-                        effect: () => out.abort("skip"),
+                        effect: async () => {
+                          adaptSurfaceOperationToRelay("abort-output", await out.abort("skip"));
+                        },
                       }),
-                    deleteCreatedOutputMessages,
+                    cleanupSkippedOutput,
                     deleteUnlinkedCheckpointCandidate,
                     relayStop,
-                    ...(platform === "github"
-                      ? [() => cleanupGithubAck({ logger, requestId, sessionId })]
-                      : []),
+                    clearIngressAcknowledgement,
                   ]);
 
                   logger.info("reply relay skipped final surface reply", {
@@ -1540,24 +1747,29 @@ export async function bridgeBusToAdapter(params: {
                   return;
                 }
 
-                if (platform === "github") {
-                  const latest = getGithubLatestRequestForSession(sessionId);
-                  if (latest && latest !== requestId) {
-                    logger.info("github reply suppressed (superseded)", {
-                      requestId,
-                      sessionId,
-                      latest,
-                    });
-                    await superviseBusToAdapterCleanup([
-                      () =>
-                        runBusToAdapterBestEffort({
-                          operation: "abort-output",
-                          effect: () => out.abort("superseded"),
-                        }),
-                      relayStop,
-                    ]);
-                    return;
-                  }
+                if (
+                  policy.finalization?.isFinalResponseSuperseded?.({ requestId, sessionId }) ===
+                  true
+                ) {
+                  logger.info("surface reply suppressed (superseded)", {
+                    requestId,
+                    sessionId,
+                    platform,
+                  });
+                  await superviseBusToAdapterCleanup([
+                    () =>
+                      runBusToAdapterBestEffort({
+                        operation: "abort-output",
+                        effect: async () => {
+                          adaptSurfaceOperationToRelay(
+                            "abort-output",
+                            await out.abort("superseded"),
+                          );
+                        },
+                      }),
+                    relayStop,
+                  ]);
+                  return;
                 }
 
                 const statsLineRaw = outMsg.data.statsForNerdsLine;
@@ -1590,19 +1802,19 @@ export async function bridgeBusToAdapter(params: {
                   streamFinalText = mergeContinuationText(previousVisibleText, streamFinalText);
                 }
 
-                if (streamFinalText.length === 0 && !streamHasVisibleOutput) {
+                if (streamFinalText.length === 0 && !streamShouldFinish) {
                   await superviseBusToAdapterCleanup([
                     () =>
                       runBusToAdapterBestEffort({
                         operation: "abort-output",
-                        effect: () => out.abort("skip"),
+                        effect: async () => {
+                          adaptSurfaceOperationToRelay("abort-output", await out.abort("skip"));
+                        },
                       }),
-                    deleteCreatedOutputMessages,
+                    cleanupSkippedOutput,
                     deleteUnlinkedCheckpointCandidate,
                     relayStop,
-                    ...(platform === "github"
-                      ? [() => cleanupGithubAck({ logger, requestId, sessionId })]
-                      : []),
+                    clearIngressAcknowledgement,
                   ]);
 
                   logger.info("reply relay skipped empty post-reanchor stream", {
@@ -1632,7 +1844,6 @@ export async function bridgeBusToAdapter(params: {
                 pendingNoReplyPrefix = "";
                 bufferNoReplyPrefix = false;
                 if (
-                  platform === "discord" &&
                   typeof reasoningStartedAtMs === "number" &&
                   typeof reasoningFrozenAtMs !== "number"
                 ) {
@@ -1662,7 +1873,7 @@ export async function bridgeBusToAdapter(params: {
                   processingError = pushedFinal.error;
                   return;
                 }
-                streamHasVisibleOutput = true;
+                recordOutputPartDisposition(pushedFinal.value);
                 const finished = await finishOutput();
                 if (finished.status === "error") {
                   processingError = finished.error;
@@ -1692,9 +1903,7 @@ export async function bridgeBusToAdapter(params: {
                       ]
                     : []),
                   relayStop,
-                  ...(platform === "github"
-                    ? [() => cleanupGithubAck({ logger, requestId, sessionId })]
-                    : []),
+                  clearIngressAcknowledgement,
                 ]);
 
                 logger.info("reply relay finished", {
@@ -1715,7 +1924,7 @@ export async function bridgeBusToAdapter(params: {
                 processingError = pushed.error;
                 return;
               }
-              streamHasVisibleOutput = true;
+              recordOutputPartDisposition(pushed.value);
             }
           } finally {
             handlingOutputEvent = false;
@@ -1729,14 +1938,37 @@ export async function bridgeBusToAdapter(params: {
       applyOutReqDeliveryPolicy,
     );
     outputSub = adaptBusToAdapterSubscriptionStart(outputStarted);
+    startupResources.subscription = outputSub;
     observeSubscriptionDone(outputSub, outReqTopic(requestId), logger);
 
-    if (isTypingIndicatorProvider(adapter)) {
-      const startedTyping = await captureBusToAdapterEffect("start-typing", () =>
+    async function startTyping(): Promise<void> {
+      if (typing || typingAttempted) return;
+      typingAttempted = true;
+      const captured = await captureBusToAdapterEffect("start-typing", () =>
         adapter.startTyping(sessionRef),
       );
-      typing = startedTyping.status === "ok" ? startedTyping.value : null;
+      if (captured.status === "error") {
+        logger.warn("surface typing indicator unavailable", {
+          requestId,
+          sessionId,
+          ...formatTaggedErrorForLog(captured.error),
+        });
+        return;
+      }
+      const startedTyping = captured.value;
+      if (startedTyping.status === "ok") {
+        typing = startedTyping.value;
+        startupResources.typing = typing;
+      } else {
+        typing = null;
+        logger.warn("surface typing indicator unavailable", {
+          requestId,
+          sessionId,
+          ...formatTaggedErrorForLog(startedTyping.error),
+        });
+      }
     }
+    if (!input.paused) await startTyping();
 
     if (env.perf.log) {
       const setupMs = Date.now() - subStart;
@@ -1761,10 +1993,56 @@ export async function bridgeBusToAdapter(params: {
       }
     }
 
+    const cleanupRestoreResources = async (): Promise<
+      ResultType<void, SurfaceRelayRestoreRollbackFailed>
+    > => {
+      stopped = true;
+      activeRelays.delete(requestId);
+      terminalLifecycleByRequestId.delete(requestId);
+      cancelTimeout?.();
+      cancelTimeout = null;
+      resolveActivationGate?.();
+      resolveActivationGate = null;
+      const subToStop = outputSub;
+      const typingToStop = typing;
+      typing = null;
+      const settled = await Promise.allSettled([
+        out.abort("restore_rollback").then((result) => result.status === "ok"),
+        subToStop
+          ? subToStop.stop().then(async (stoppedResult) => {
+              if (stoppedResult.status === "error") return false;
+              const done = await subToStop.done;
+              return done.status === "ok";
+            })
+          : Promise.resolve(true),
+        typingToStop
+          ? typingToStop.stop().then((result) => result.status === "ok")
+          : Promise.resolve(true),
+      ]);
+      if (settled.some((result) => result.status === "rejected" || result.value === false)) {
+        return Result.err(
+          new SurfaceRelayRestoreRollbackFailed({
+            platform,
+            message: "Persisted relay restore cleanup failed",
+          }),
+        );
+      }
+      return Result.ok(undefined);
+    };
+
+    const activate = (): void => {
+      if (activated) return;
+      activated = true;
+      resolveActivationGate?.();
+      resolveActivationGate = null;
+    };
+
     return {
       requestId,
       sessionId,
-      requestClient: input.requestClient,
+      platform: input.platform,
+      activate,
+      rollbackRestore: cleanupRestoreResources,
       stopTyping,
       stop: relayStop,
       cancel: async () => {
@@ -1773,7 +2051,9 @@ export async function bridgeBusToAdapter(params: {
             () =>
               runBusToAdapterBestEffort({
                 operation: "abort-output",
-                effect: () => out.abort("cancel"),
+                effect: async () => {
+                  adaptSurfaceOperationToRelay("abort-output", await out.abort("cancel"));
+                },
                 logger,
                 logLevel: "error",
                 logMessage: "failed to abort output stream on cancel",
@@ -1832,7 +2112,40 @@ export async function bridgeBusToAdapter(params: {
     };
   }
 
-  return {
+  async function startRelay(
+    input: Parameters<typeof startRelayUnchecked>[0],
+  ): Promise<ActiveRelay> {
+    const resources: RelayStartupResources = {};
+    try {
+      return await startRelayUnchecked(input, resources);
+    } catch (cause) {
+      const settled = await Promise.allSettled([
+        resources.output
+          ? resources.output.abort("restore_start_failed").then((result) => result.status === "ok")
+          : Promise.resolve(true),
+        resources.subscription
+          ? resources.subscription.stop().then(async (stopped) => {
+              if (stopped.status === "error") return false;
+              const done = await resources.subscription?.done;
+              return done?.status === "ok";
+            })
+          : Promise.resolve(true),
+        resources.typing
+          ? resources.typing.stop().then((result) => result.status === "ok")
+          : Promise.resolve(true),
+      ]);
+      if (settled.some((result) => result.status === "rejected" || result.value === false)) {
+        throw new Panic({
+          message: "Relay startup cleanup left recovery atomicity unknown",
+          cause,
+        });
+      }
+      throw cause;
+    }
+  }
+
+  const handle = {
+    platform,
     beginDrain: async (opts?: { deadlineMs?: number }) => {
       draining = true;
       await stopIngress();
@@ -1844,36 +2157,214 @@ export async function bridgeBusToAdapter(params: {
         await new Promise((r) => setTimeout(r, 50));
       }
     },
-    snapshotRelays: (): BusToAdapterRelaySnapshot[] => {
-      return [...activeRelays.values()].map((r) => r.snapshot());
+    snapshotRelays: (): SurfaceRelaySnapshotFor<P>[] => {
+      return [...activeRelays.values()].map((relay) => {
+        const snapshot = { ...relay.snapshot(), platform };
+        requireSurfaceRelaySnapshot(platform, snapshot, "relay.snapshotRelays");
+        return snapshot;
+      });
     },
-    restoreRelays: async (snapshots: readonly BusToAdapterRelaySnapshot[]) => {
-      if (draining) return;
-
+    prepareRestoreRelays: (
+      snapshots: readonly BusToAdapterRelaySnapshot[],
+    ): ResultType<SurfaceRelayRestoreAttempt<P>, SurfaceRelayRestoreApplyFailed> => {
+      if (draining) {
+        return Result.err(
+          new SurfaceRelayRestoreApplyFailed({
+            platform,
+            requestId: snapshots[0]?.requestId ?? "unavailable",
+            message: "Relay restore is unavailable while the relay is draining",
+          }),
+        );
+      }
       for (const snapshot of snapshots) {
-        if (snapshot.platform !== platform) continue;
-        if (activeRelays.has(snapshot.requestId)) continue;
-
-        const relay = await startRelay({
-          adapter,
-          bus,
-          platform,
+        requireSurfaceRelaySnapshot(platform, snapshot, "relay.restoreRelays");
+      }
+      const decodeRecoveryRefs = (
+        snapshot: BusToAdapterRelaySnapshot,
+        refs: readonly MsgRef[],
+      ): ResultType<readonly MsgRefFor<P>[], SurfaceRelayRestoreApplyFailed> => {
+        const decodedRefs: MsgRefFor<P>[] = [];
+        for (const ref of refs) {
+          const decoded = policy.refs.decodeReanchorTarget({
+            ref,
+            expectedSessionId: snapshot.sessionId,
+          });
+          if (decoded.status === "error") {
+            return Result.err(
+              new SurfaceRelayRestoreApplyFailed({
+                platform,
+                requestId: snapshot.requestId,
+                message: "Persisted relay output chain contains an unavailable reference",
+              }),
+            );
+          }
+          decodedRefs.push(decoded.value);
+        }
+        return Result.ok(decodedRefs);
+      };
+      const prepared: Array<{
+        readonly snapshot: BusToAdapterRelaySnapshot;
+        readonly initialReplyTo?: MsgRef;
+        readonly recoveryChain: SurfaceRestoredOutputChain<P>;
+      }> = [];
+      for (const snapshot of snapshots) {
+        const createdOutputRefs = decodeRecoveryRefs(snapshot, snapshot.createdOutputRefs);
+        if (createdOutputRefs.status === "error") return Result.err(createdOutputRefs.error);
+        const activeOutputRefs = snapshot.activeOutputRefs
+          ? decodeRecoveryRefs(snapshot, snapshot.activeOutputRefs)
+          : undefined;
+        if (activeOutputRefs?.status === "error") return Result.err(activeOutputRefs.error);
+        const recoveryChain: SurfaceRestoredOutputChain<P> = {
           requestId: snapshot.requestId,
           sessionId: snapshot.sessionId,
-          routerSessionMode: snapshot.routerSessionMode,
-          requestClient: snapshot.requestClient,
-          idleTimeoutMs,
-          restore: snapshot,
+          createdOutputRefs: createdOutputRefs.value,
+          ...(activeOutputRefs ? { activeOutputRefs: activeOutputRefs.value } : {}),
+        };
+        const existing =
+          activeRelays.get(snapshot.requestId) ?? admittedRestoreRelays.get(snapshot.requestId);
+        if (existing) {
+          if (existing.platform !== platform || existing.sessionId !== snapshot.sessionId) {
+            return Result.err(
+              new SurfaceRelayRestoreApplyFailed({
+                platform,
+                requestId: snapshot.requestId,
+                message: "An active relay conflicts with the persisted restore identity",
+              }),
+            );
+          }
+          prepared.push({ snapshot, recoveryChain });
+          continue;
+        }
+        let initialReplyTo: MsgRef | undefined;
+        if (snapshot.replyTo) {
+          const decoded = policy.refs.decodeReanchorTarget({
+            ref: snapshot.replyTo,
+            expectedSessionId: snapshot.sessionId,
+          });
+          if (decoded.status === "ok") initialReplyTo = decoded.value;
+        } else {
+          const resolved = policy.refs.resolveInitialReplyTarget({
+            requestId: snapshot.requestId,
+            sessionId: snapshot.sessionId,
+          });
+          if (resolved.kind === "target") initialReplyTo = resolved.ref;
+        }
+        prepared.push({
+          snapshot,
+          recoveryChain,
+          ...(initialReplyTo ? { initialReplyTo } : {}),
         });
-
-        activeRelays.set(snapshot.requestId, relay);
       }
+      const createdRequestIds: string[] = [];
+      const recoveryGeneration: SurfaceRecoveryGeneration = {
+        generation: Symbol("surface-recovery"),
+      };
+      let applied = false;
+      let activated = false;
+      const rollbackCreated = async (): Promise<
+        ResultType<void, SurfaceRelayRestoreRollbackFailed>
+      > => {
+        const failures: SurfaceRelayRestoreRollbackFailed[] = [];
+        for (const requestId of createdRequestIds.toReversed()) {
+          const relay = admittedRestoreRelays.get(requestId);
+          if (!relay) continue;
+          const stopped = await relay.rollbackRestore();
+          if (stopped.status === "error") failures.push(stopped.error);
+          admittedRestoreRelays.delete(requestId);
+        }
+        createdRequestIds.length = 0;
+        applied = false;
+        if (failures.length > 0) {
+          return Result.err(
+            new SurfaceRelayRestoreRollbackFailed({
+              platform,
+              message: `Persisted relay restore rollback failed for ${failures.length} relay(s)`,
+            }),
+          );
+        }
+        return Result.ok(undefined);
+      };
+      return Result.ok({
+        platform,
+        apply: async () => {
+          if (applied) return Result.ok(undefined);
+          for (const item of prepared) {
+            if (activeRelays.has(item.snapshot.requestId)) continue;
+            if (admittedRestoreRelays.has(item.snapshot.requestId)) continue;
+            const started = await captureBusToAdapterEffect("restore-relay", () =>
+              startRelay({
+                adapter,
+                bus,
+                platform,
+                requestId: item.snapshot.requestId,
+                sessionId: item.snapshot.sessionId,
+                routerSessionMode: item.snapshot.routerSessionMode,
+                requestClient: item.snapshot.requestClient,
+                idleTimeoutMs,
+                initialReplyTo: item.initialReplyTo,
+                restore: item.snapshot,
+                paused: true,
+              }),
+            );
+            if (started.status === "error") {
+              const rolledBack = await rollbackCreated();
+              if (rolledBack.status === "error") {
+                signalSurfaceRelayRecoveryAtomicityUnknown(rolledBack.error);
+              }
+              return Result.err(
+                new SurfaceRelayRestoreApplyFailed({
+                  platform,
+                  requestId: item.snapshot.requestId,
+                  message: "Persisted relay restore application failed",
+                }),
+              );
+            }
+            admittedRestoreRelays.set(item.snapshot.requestId, started.value);
+            createdRequestIds.push(item.snapshot.requestId);
+          }
+          applied = true;
+          return Result.ok(undefined);
+        },
+        rollback: rollbackCreated,
+        activate: () => {
+          if (!applied || activated) return;
+          activated = true;
+          policy.recovery?.activateRestoredOutputChains(
+            recoveryGeneration,
+            prepared.map((item) => item.recoveryChain),
+          );
+          for (const requestId of createdRequestIds) {
+            const relay = admittedRestoreRelays.get(requestId);
+            if (!relay) continue;
+            admittedRestoreRelays.delete(requestId);
+            activeRelays.set(requestId, relay);
+          }
+          for (const requestId of createdRequestIds) {
+            activeRelays.get(requestId)?.activate();
+          }
+        },
+      });
     },
     stop: async () => {
       await stopIngress();
       await superviseBusToAdapterCleanup(
-        [...activeRelays.values()].map((relay) => () => relay.stop()),
+        [
+          ...[...admittedRestoreRelays.values()].map(async (relay) => {
+            await relay.rollbackRestore();
+          }),
+          ...[...activeRelays.values()].map((relay) => relay.stop()),
+        ].map((operation) => () => operation),
       );
+    },
+  };
+  return {
+    ...handle,
+    restoreRelays: async (snapshots: readonly BusToAdapterRelaySnapshot[]) => {
+      const prepared = handle.prepareRestoreRelays(snapshots);
+      if (prepared.status === "error") throw prepared.error;
+      const applied = await prepared.value.apply();
+      if (applied.status === "error") throw applied.error;
+      prepared.value.activate();
     },
   };
 }

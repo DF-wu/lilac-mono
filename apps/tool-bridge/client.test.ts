@@ -257,6 +257,7 @@ describe("tool-bridge CLI runtime", () => {
       LILAC_CWD: "/approved",
       LILAC_TOOL_CALL_ID: "tool-call-1",
       LILAC_CONTROL_CAPABILITY: "control-capability",
+      LILAC_CURRENT_TURN_USER_ID: "user-2",
       LILAC_WORKFLOW_CAPABILITY: "server-capability",
     };
     try {
@@ -283,6 +284,7 @@ describe("tool-bridge CLI runtime", () => {
         expect(request.headers.get("x-lilac-request-id")).toBe("wfr:request");
         expect(request.headers.get("x-lilac-tool-call-id")).toBe("tool-call-1");
         expect(request.headers.get("x-lilac-control-capability")).toBe("control-capability");
+        expect(request.headers.get("x-lilac-current-turn-user-id")).toBe("user-2");
         expect(request.headers.get("x-lilac-workflow-capability")).toBeNull();
       }
     } finally {

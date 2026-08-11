@@ -1,5 +1,5 @@
 import { Database } from "bun:sqlite";
-import { createLogger } from "@stanley2058/lilac-utils";
+import { createLogger, formatTaggedErrorForLog } from "@stanley2058/lilac-utils";
 import {
   preserveSurfacePanic,
   type SurfaceCacheBurstProvider,
@@ -547,14 +547,22 @@ export class DiscordSearchService {
       const messages = await this.params.adapter.listMsg(input.sessionRef, {
         limit,
       });
-      const indexed = this.params.store.upsertMessages(messages);
+      if (messages.status === "error") {
+        this.logger.error("search heal failed", {
+          channelId: input.sessionRef.channelId,
+          limit,
+          ...formatTaggedErrorForLog(messages.error),
+        });
+        return { attempted: true, skipped: false, limit, fetched: 0, indexed: 0 };
+      }
+      const indexed = this.params.store.upsertMessages(messages.value);
       if (indexed > 0) this.params.onMessagesIndexed?.(input.sessionRef.channelId);
 
       return {
         attempted: true,
         skipped: false,
         limit,
-        fetched: messages.length,
+        fetched: messages.value.length,
         indexed,
       };
     } catch (e) {

@@ -1,5 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import type { Client } from "discord.js";
+import { Panic, Result, type Result as ResultType } from "better-result";
 import type { SurfaceAttachment } from "../../../../src/surface/types";
 
 import {
@@ -14,6 +15,11 @@ import {
 } from "../../../../src/surface/discord/output/discord-output-stream";
 import type { SurfaceToolStatusUpdate } from "../../../../src/surface/adapter";
 import { buildProgressFieldValue } from "../../../../src/surface/discord/output/embed-pusher";
+
+function resultValue<T, E>(result: ResultType<T, E>): T {
+  if (result.status === "error") throw result.error;
+  return result.value;
+}
 
 describe("escapeDiscordMarkdown", () => {
   it("escapes emphasis markers in glob-like patterns", () => {
@@ -335,7 +341,13 @@ describe("compact subagent progress", () => {
 });
 
 function createFakeDiscordClient(opts?: {
+  failEdit?: boolean;
+  editFailure?: unknown;
   failEditWithFiles?: boolean;
+  failReplyAt?: number;
+  replyFailure?: unknown;
+  failResumeFetch?: boolean;
+  resumeFetchFailure?: unknown;
   onEdit?: (options: unknown) => void;
 }): {
   client: Client;
@@ -370,6 +382,7 @@ function createFakeDiscordClient(opts?: {
   const messages = new Map<string, FakeMessage>();
   let nextMessageId = 1;
   let nextAttachmentId = 1;
+  let replyAttempts = 0;
   const channelId = "chan";
 
   const fileCountFromOptions = (options: unknown): number => {
@@ -435,6 +448,8 @@ function createFakeDiscordClient(opts?: {
       edit: async (options) => {
         operations.push({ kind: "edit", messageId: id, options });
         opts?.onEdit?.(options);
+        if (opts?.editFailure) throw opts.editFailure;
+        if (opts?.failEdit) throw new Error("edit failed");
         if (opts?.failEditWithFiles && fileCountFromOptions(options) > 0) {
           throw new Error("edit failed");
         }
@@ -442,6 +457,10 @@ function createFakeDiscordClient(opts?: {
         return message;
       },
       reply: async (options) => {
+        replyAttempts += 1;
+        if (replyAttempts === opts?.failReplyAt) {
+          throw opts.replyFailure ?? new Error("reply failed");
+        }
         return createMessage({ operation: "reply", parentId: id, options });
       },
       delete: async () => {
@@ -467,7 +486,11 @@ function createFakeDiscordClient(opts?: {
   const channel = {
     send: async (options: unknown) => createMessage({ operation: "send", options }),
     messages: {
-      fetch: async (messageId: string) => messages.get(messageId) ?? null,
+      fetch: async (messageId: string) => {
+        if (opts?.resumeFetchFailure) throw opts.resumeFetchFailure;
+        if (opts?.failResumeFetch) throw new Error("resume fetch failed");
+        return messages.get(messageId) ?? null;
+      },
     },
   };
 
@@ -571,6 +594,38 @@ function makeAttachment(index: number): SurfaceAttachment {
     bytes: new Uint8Array([index]),
   };
 }
+
+describe("Discord recovery hydration", () => {
+  it("applies restored state without provider calls before the first live part", async () => {
+    const { client, createdMessageIds, operations } = createFakeDiscordClient();
+    const out = new DiscordOutputStream({
+      client,
+      sessionRef: { platform: "discord", channelId: "chan" },
+      useSmartSplitting: false,
+      outputMode: "inline",
+      reasoningDisplayMode: "simple",
+      workingIndicators: ["Working"],
+    });
+
+    expect(
+      out.hydrateRecovery([
+        { type: "text.set", text: "restored" },
+        {
+          type: "reasoning.status",
+          update: { startedAtMs: 1, frozenAtMs: 2, detailText: "reasoning" },
+        },
+      ]),
+    ).toBe("visible");
+    expect(createdMessageIds).toEqual([]);
+    expect(operations).toEqual([]);
+
+    await expect(out.push({ type: "text.delta", delta: " live" })).resolves.toEqual(
+      Result.ok("visible"),
+    );
+    expect(createdMessageIds).toEqual(["m_1"]);
+    expect(operations.map((operation) => operation.kind)).toEqual(["send", "edit"]);
+  });
+});
 
 describe("Discord compact progress integration", () => {
   it("moves a completed agent into history before newer tool activity", async () => {
@@ -716,6 +771,26 @@ describe("Discord compact progress integration", () => {
 });
 
 describe("preview reanchor behavior", () => {
+  it("reports hidden reasoning as terminal without rendering it", async () => {
+    const { client, operations } = createFakeDiscordClient();
+    const out = new DiscordOutputStream({
+      client,
+      sessionRef: { platform: "discord", channelId: "chan" },
+      useSmartSplitting: false,
+      outputMode: "inline",
+      reasoningDisplayMode: "none",
+      workingIndicators: ["Working"],
+    });
+
+    await expect(
+      out.push({
+        type: "reasoning.status",
+        update: { startedAtMs: 1, detailText: "hidden" },
+      }),
+    ).resolves.toEqual(Result.ok("terminal"));
+    expect(operations).toEqual([]);
+  });
+
   it("keeps frozen placeholder lane messages on reanchor", async () => {
     const { client, createdMessageIds, deletedMessageIds } = createFakeDiscordClient();
 
@@ -771,6 +846,109 @@ describe("preview reanchor behavior", () => {
   });
 });
 
+describe("output operation failures", () => {
+  it("raises a Panic when final output rejects with an impossible non-Error value", async () => {
+    const { client } = createFakeDiscordClient({
+      failReplyAt: 1,
+      replyFailure: "invalid non-Error rejection",
+    });
+    const out = new DiscordOutputStream({
+      client,
+      sessionRef: { platform: "discord", channelId: "chan" },
+      useSmartSplitting: false,
+      outputMode: "preview",
+      outputPreviewModeFinalStyle: "plain",
+      reasoningDisplayMode: "none",
+      workingIndicators: ["Working"],
+    });
+
+    await out.push({ type: "text.delta", delta: "x".repeat(4500) });
+
+    try {
+      await out.finish();
+      throw new Error("expected Discord output invariant Panic");
+    } catch (cause) {
+      expect(Panic.is(cause)).toBe(true);
+      if (!Panic.is(cause)) throw cause;
+      expect(cause.message).toBe("Discord output invariant violated");
+    }
+  });
+
+  it("finishes successfully when an ordinary best-effort streaming edit fails", async () => {
+    const { client } = createFakeDiscordClient({ editFailure: { status: 503 } });
+    const out = new DiscordOutputStream({
+      client,
+      sessionRef: { platform: "discord", channelId: "chan" },
+      useSmartSplitting: false,
+      outputMode: "inline",
+      reasoningDisplayMode: "none",
+      workingIndicators: ["Working"],
+    });
+
+    await out.push({ type: "text.delta", delta: "hello" });
+    const result = await out.finish();
+
+    expect(result.status).toBe("ok");
+  });
+
+  it("classifies resume fetch failures instead of creating a duplicate chain", async () => {
+    const { client, createdMessageIds } = createFakeDiscordClient({
+      resumeFetchFailure: { status: 403 },
+    });
+    const out = new DiscordOutputStream({
+      client,
+      sessionRef: { platform: "discord", channelId: "chan" },
+      opts: {
+        resume: {
+          created: [{ platform: "discord", channelId: "chan", messageId: "existing" }],
+        },
+      },
+      useSmartSplitting: false,
+      outputMode: "inline",
+      reasoningDisplayMode: "none",
+      workingIndicators: ["Working"],
+    });
+
+    const result = await out.push({ type: "text.delta", delta: "hello" });
+
+    expect(result.status).toBe("error");
+    if (result.status === "ok") throw new Error("expected push failure");
+    expect(result.error).toMatchObject({
+      _tag: "SurfacePermissionDenied",
+      operation: "push-output",
+    });
+    expect(createdMessageIds).toEqual([]);
+  });
+
+  it("returns partial completion when a later final chunk fails", async () => {
+    const replyFailure = Object.assign(new Error("reply unavailable"), { status: 503 });
+    const { client } = createFakeDiscordClient({
+      failReplyAt: 1,
+      replyFailure,
+    });
+    const out = new DiscordOutputStream({
+      client,
+      sessionRef: { platform: "discord", channelId: "chan" },
+      useSmartSplitting: false,
+      outputMode: "preview",
+      outputPreviewModeFinalStyle: "plain",
+      reasoningDisplayMode: "none",
+      workingIndicators: ["Working"],
+    });
+
+    await out.push({ type: "text.delta", delta: "x".repeat(4500) });
+    const result = await out.finish();
+
+    expect(result.status).toBe("error");
+    if (result.status === "ok") throw new Error("expected finish failure");
+    expect(result.error).toMatchObject({
+      _tag: "SurfaceOperationPartiallyCompleted",
+      operation: "finish-output",
+      created: { platform: "discord", channelId: "chan" },
+    });
+  });
+});
+
 describe("attachment finalization", () => {
   it("inline mode edits attachments onto the final split message", async () => {
     const { client, operations } = createFakeDiscordClient();
@@ -786,7 +964,7 @@ describe("attachment finalization", () => {
 
     await out.push({ type: "text.delta", delta: "a".repeat(9000) });
     await out.push({ type: "attachment.add", attachment: makeAttachment(1) });
-    const res = await out.finish();
+    const res = resultValue(await out.finish());
 
     expect(res.created.length).toBeGreaterThan(1);
 
@@ -813,7 +991,7 @@ describe("attachment finalization", () => {
 
     await out.push({ type: "text.delta", delta: "b".repeat(9000) });
     await out.push({ type: "attachment.add", attachment: makeAttachment(1) });
-    const res = await out.finish();
+    const res = resultValue(await out.finish());
 
     expect(res.created.length).toBeGreaterThan(1);
 
@@ -842,7 +1020,7 @@ describe("attachment finalization", () => {
 
     await out.push({ type: "text.delta", delta: "hello" });
     await out.push({ type: "attachment.add", attachment: makeAttachment(1) });
-    const res = await out.finish();
+    const res = resultValue(await out.finish());
 
     const replyWithFiles = operations.filter((op) => op.kind === "reply" && hasFiles(op.options));
     expect(replyWithFiles.length).toBe(1);
@@ -870,7 +1048,7 @@ describe("attachment finalization", () => {
       await out.push({ type: "attachment.add", attachment: makeAttachment(i) });
     }
 
-    const res = await out.finish();
+    const res = resultValue(await out.finish());
 
     const editsWithFiles = operations.filter((op) => op.kind === "edit" && hasFiles(op.options));
     expect(editsWithFiles.length).toBe(1);
@@ -907,7 +1085,7 @@ describe("preview final output style", () => {
       text: "Commentary.\n\nFinal answer.",
       finalSegments: ["Commentary.", "Final answer."],
     });
-    const res = await out.finish();
+    const res = resultValue(await out.finish());
 
     const plainFinalOps = operations.filter(
       (operation) =>
@@ -943,7 +1121,7 @@ describe("preview final output style", () => {
 
     await out.push({ type: "text.delta", delta: "preview text" });
     await out.push({ type: "meta.stats", line: "nerd stats" });
-    const res = await out.finish();
+    const res = resultValue(await out.finish());
 
     const finalSend = operations.find(
       (op) =>
@@ -977,7 +1155,7 @@ describe("preview final output style", () => {
 
     await out.push({ type: "text.delta", delta: "x".repeat(4500) });
     await out.push({ type: "meta.stats", line: "nerd stats" });
-    const res = await out.finish();
+    const res = resultValue(await out.finish());
 
     const plainFinalOps = operations.filter(
       (op) =>
@@ -1014,7 +1192,7 @@ describe("preview final output style", () => {
     });
 
     await out.push({ type: "text.delta", delta: "x".repeat(4500) });
-    const res = await out.finish();
+    const res = resultValue(await out.finish());
 
     const plainFinalOps = operations.filter(
       (op) =>

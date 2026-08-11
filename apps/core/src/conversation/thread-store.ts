@@ -25,7 +25,7 @@ import {
 } from "./thread-summary-persistence-codec";
 import { isDiscordSessionDividerText } from "../surface/discord/discord-session-divider";
 import { splitByDiscordWindowOldestToNewest } from "../surface/discord/merge-window";
-import { parseLeadingContinueDirective } from "../surface/bridge/bus-request-router/common";
+import { parseLeadingContinueDirective } from "../surface/discord/discord-request-router/common";
 import { configureSqliteConnection } from "../shared/sqlite";
 import type { DiscordSearchIndexedMessage } from "../surface/store/discord-search-store";
 import { adaptToolResultToHost } from "../tools/tool-result-adapters";

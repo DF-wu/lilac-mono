@@ -4,6 +4,11 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { z } from "zod";
+import { Result } from "better-result";
+import { MockLanguageModelV4, simulateReadableStream } from "ai/test";
+import type { ToolSet } from "ai";
+import { AiSdkPiAgent, type AiSdkPiAgentOptions } from "@stanley2058/lilac-agent";
+import { parseCoreConfigV1ToUniversal, toDurableResolvedModelPlan } from "@stanley2058/lilac-utils";
 import {
   createLilacBus,
   lilacEventTypes,
@@ -21,11 +26,6 @@ import {
   type TestRawMessageHandler,
 } from "../helpers/result-raw-bus";
 import type {
-  AdapterEventHandler,
-  SurfaceAdapter,
-  SurfaceOutputStream,
-} from "../../src/surface/adapter";
-import type {
   ContentOpts,
   LimitOpts,
   MsgRef,
@@ -33,11 +33,23 @@ import type {
   SessionRef,
   SurfaceMessage,
 } from "../../src/surface/types";
+import { createDiscordWorkflowProgressPort } from "../../src/surface/discord/discord-runtime-descriptor";
 import { ProgrammaticWorkflow } from "../../src/tool-server/tools/programmatic-workflow";
 import { DurableWorkflowStore } from "../../src/workflow/durable-workflow-store";
 import { startWorkflowActionResolver } from "../../src/workflow/workflow-action-resolver";
 import { WorkflowEngine } from "../../src/workflow/workflow-engine";
 import { WorkflowProgressProjector } from "../../src/workflow/workflow-progress-projector";
+import { SurfaceAdapterTestBase } from "../helpers/surface-adapter-test-base";
+import { createRequestMessageCache } from "../../src/tool-server/request-message-cache";
+import { resolveRequestCapabilityIdentity } from "../../src/runtime/create-core-runtime";
+import {
+  resolveAgentRunModel,
+  startBusAgentRunner,
+} from "../../src/surface/bridge/bus-agent-runner";
+import { createCoreToolPluginManager, type CoreToolPluginManager } from "../../src/plugins";
+import { createToolServer } from "../../src/tool-server/create-tool-server";
+import { RequestControlAuthority } from "../../src/tool-server/request-control-authority";
+import type { RequestContext, ServerTool } from "../../src/tool-server/types";
 
 function createWorkflowProgressProjectorForTest(
   input: Omit<ConstructorParameters<typeof WorkflowProgressProjector>[0], "reportFatalPanic">,
@@ -83,7 +95,7 @@ class LiveRawBus implements RawBus {
     this.subscriptions.clear();
   }
 }
-class WorkflowCardAdapter implements SurfaceAdapter {
+class WorkflowCardAdapter extends SurfaceAdapterTestBase {
   readonly contents: ContentOpts[] = [];
   readonly messages = new Map<string, SurfaceMessage>();
   sends = 0;
@@ -93,25 +105,20 @@ class WorkflowCardAdapter implements SurfaceAdapter {
   async getSelf() {
     return { platform: "discord" as const, userId: "bot", userName: "bot" };
   }
-  async getCapabilities() {
-    return {
-      platform: "discord" as const,
-      send: true,
-      edit: true,
-      delete: false,
-      reactions: false,
-      readHistory: true,
-      threads: false,
-      markRead: false,
-    };
-  }
   async listSessions() {
-    return [];
+    return Result.ok([]);
   }
-  async startOutput(): Promise<SurfaceOutputStream> {
-    throw new Error("not used");
+  async startOutput() {
+    return Result.ok({
+      push: async () => Result.ok("visible" as const),
+      finish: async () => {
+        const ref = { platform: "discord" as const, channelId: "unused", messageId: "unused" };
+        return Result.ok({ created: [ref], last: ref });
+      },
+      abort: async () => Result.ok(undefined),
+    });
   }
-  async sendMsg(session: SessionRef, content: ContentOpts, _opts?: SendOpts): Promise<MsgRef> {
+  async sendMsg(session: SessionRef, content: ContentOpts, _opts?: SendOpts) {
     this.sends += 1;
     this.contents.push(content);
     const ref = {
@@ -126,37 +133,43 @@ class WorkflowCardAdapter implements SurfaceAdapter {
       text: content.text ?? "",
       ts: Date.now(),
     });
-    return ref;
+    return Result.ok(ref);
   }
   async readMsg(ref: MsgRef) {
-    return this.messages.get(ref.messageId) ?? null;
+    return Result.ok(this.messages.get(ref.messageId) ?? null);
   }
   async listMsg(_session: SessionRef, _opts?: LimitOpts) {
-    return [...this.messages.values()];
+    return Result.ok([...this.messages.values()]);
   }
   async editMsg(ref: MsgRef, content: ContentOpts) {
     const current = this.messages.get(ref.messageId);
-    if (!current) throw new Error("workflow card is missing");
+    if (!current) return Result.ok(undefined);
     this.edits += 1;
     this.contents.push(content);
     this.messages.set(ref.messageId, { ...current, text: content.text ?? "" });
+    return Result.ok(undefined);
   }
-  async deleteMsg() {}
+  async deleteMsg() {
+    return Result.ok(undefined);
+  }
   async getReplyContext() {
-    return [];
+    return Result.ok([]);
   }
-  async addReaction() {}
-  async removeReaction() {}
+  async addReaction() {
+    return Result.ok(undefined);
+  }
+  async removeReaction() {
+    return Result.ok(undefined);
+  }
   async listReactions() {
-    return [];
-  }
-  async subscribe(_handler: AdapterEventHandler) {
-    return { stop: async () => {} };
+    return Result.ok([]);
   }
   async getUnRead() {
-    return [];
+    return Result.ok([]);
   }
-  async markRead() {}
+  async markRead() {
+    return Result.ok(undefined);
+  }
 }
 function source(): string {
   return `import { defineWorkflow } from "@lilac/workflow";
@@ -181,6 +194,26 @@ export default defineWorkflow({
 });
 `;
 }
+
+function workflowAgentTextStep(text: string) {
+  return {
+    stream: simulateReadableStream({
+      chunks: [
+        { type: "text-start" as const, id: "text" },
+        { type: "text-delta" as const, id: "text", delta: text },
+        { type: "text-end" as const, id: "text" },
+        {
+          type: "finish" as const,
+          finishReason: { unified: "stop" as const, raw: "stop" },
+          usage: {
+            inputTokens: { total: 0, noCache: 0, cacheRead: 0, cacheWrite: 0 },
+            outputTokens: { total: 0, text: 0, reasoning: 0 },
+          },
+        },
+      ],
+    }),
+  };
+}
 async function waitFor(predicate: () => boolean): Promise<void> {
   const deadline = Date.now() + 10000;
   while (!predicate()) {
@@ -202,11 +235,12 @@ describe("unified workflow integration", () => {
     await fs.mkdir(workspaceRoot);
     const store = new DurableWorkflowStore(path.join(root, "workflow.sqlite"));
     const bus = createLilacBus(new LiveRawBus());
+    const requestMessageCache = createRequestMessageCache();
     const adapter = new WorkflowCardAdapter();
     const projector = createWorkflowProgressProjectorForTest({
       bus,
       store,
-      adapters: new Map([["discord", adapter]]),
+      ports: new Map([["discord", createDiscordWorkflowProgressPort(adapter)]]),
       subscriptionId: "integration-projector",
       coalesceMs: 5,
       minEditIntervalMs: 0,
@@ -251,52 +285,138 @@ describe("unified workflow integration", () => {
                 platform: "unknown",
               })?.policy,
             ).toMatchObject(workflow);
-            expect(
-              store.claimWorkflowRequest({
-                requestId,
-                dispatchEpoch: workflow.dispatchEpoch,
-                ownerId: "integration-agent",
-                now: 100,
-              }),
-            ).toBe(true);
             requestIds.push(requestId);
-            await bus.publish(
-              lilacEventTypes.EvtRequestLifecycleChanged,
-              { state: "running" },
-              { headers: message.headers },
-            );
-            await bus.publish(
-              lilacEventTypes.EvtAgentOutputResponseText,
-              {
-                finalText: "integration result",
-                usage: { inputTokens: 8, outputTokens: 3, totalTokens: 11 },
-              },
-              { headers: message.headers },
-            );
-            expect(
-              store.recordWorkflowRequestTerminal({
-                requestId,
-                runId: workflow.runId,
-                operationId: workflow.operationId,
-                dispatchEpoch: workflow.dispatchEpoch,
-                ownerId: "integration-agent",
-                state: "resolved",
-                output: "integration result",
-                usage: { inputTokens: 8, outputTokens: 3, totalTokens: 11 },
-                now: 100,
-              }),
-            ).toBe(true);
-            await bus.publish(
-              lilacEventTypes.EvtRequestLifecycleChanged,
-              { state: "resolved" },
-              { headers: message.headers },
-            );
           }
           return okResultForTest();
         },
         () => "commit",
       ),
     );
+    const level1Contexts: Array<
+      NonNullable<
+        Parameters<CoreToolPluginManager["buildLevel1ToolsetResult"]>[0]["requestContext"]
+      >
+    > = [];
+    const level2Contexts: RequestContext[] = [];
+    const config = parseCoreConfigV1ToUniversal({});
+    config.models.main = { model: "openai/workflow-integration" };
+    const pluginManager = createCoreToolPluginManager({ runtime: { config }, dataDir });
+    const pluginInitialized = await pluginManager.init();
+    if (pluginInitialized.status === "error") throw pluginInitialized.error;
+    const buildLevel1ToolsetResult = pluginManager.buildLevel1ToolsetResult.bind(pluginManager);
+    pluginManager.buildLevel1ToolsetResult = async (input) => {
+      if (input.requestContext) level1Contexts.push(input.requestContext);
+      return await buildLevel1ToolsetResult(input);
+    };
+    const level2Tool: ServerTool = {
+      id: "workflow-integration-level2",
+      async init() {},
+      async destroy() {},
+      async list() {
+        return [
+          {
+            callableId: "workflow.integration.level2",
+            name: "Workflow integration Level 2",
+            description: "Exercises delegated workflow authority",
+            shortInput: [],
+          },
+        ];
+      },
+      async call(_callableId, _input, options) {
+        if (options?.context) level2Contexts.push(options.context);
+        return { ok: true };
+      },
+    };
+    const requestControlAuthority = new RequestControlAuthority();
+    const toolServer = createToolServer({
+      tools: [level2Tool],
+      requestMessageCache,
+      authorizeControlRequest: (input) => requestControlAuthority.authorize(input),
+    });
+    await toolServer.init();
+    let activeCapability:
+      | {
+          readonly requestId: string;
+          readonly sessionId: string;
+          readonly token: string;
+        }
+      | undefined;
+    const runner = await startBusAgentRunner({
+      bus,
+      subscriptionId: "integration-runner",
+      config,
+      pluginManager,
+      durableWorkflowStore: store,
+      requestMessageCache,
+      reportFatalPanic: (panic) => {
+        throw panic;
+      },
+      issueControlCapability: (input) => {
+        const cachedRequest = requestMessageCache.getOrigin(input.requestId);
+        expect(cachedRequest).toMatchObject({
+          requestClient: "unknown",
+          source: "internal-delegated",
+          authenticatedOrigin: { platform: "discord", userId: "user-1" },
+        });
+        const identity = resolveRequestCapabilityIdentity({
+          requestClient: input.requestClient,
+          sessionId: input.sessionId,
+          safetyMode: input.safetyMode,
+          ...(input.authenticatedOrigin ? { authenticatedOrigin: input.authenticatedOrigin } : {}),
+          ...(cachedRequest ? { cachedRequest } : {}),
+        });
+        const token = requestControlAuthority.issue({
+          kind: "primary",
+          requestId: input.requestId,
+          sessionId: input.sessionId,
+          platform: input.requestClient,
+          principal: identity.principal,
+          authenticatedOrigin: identity.authenticatedOrigin,
+          allowedCallables: null,
+          profile: input.profile,
+          canonicalCwd: input.canonicalCwd,
+          safetyMode: identity.safetyMode,
+          expiresAt: input.expiresAt,
+        });
+        activeCapability = {
+          requestId: input.requestId,
+          sessionId: input.sessionId,
+          token,
+        };
+        return { capability: token, ...identity };
+      },
+      expireControlCapability: (requestId) => requestControlAuthority.expire(requestId),
+      createAgent: (options: AiSdkPiAgentOptions<ToolSet>) =>
+        new AiSdkPiAgent({
+          ...options,
+          model: new MockLanguageModelV4({
+            modelId: "workflow-integration",
+            doStream: async () => {
+              const capability = activeCapability;
+              if (!capability) throw new Error("workflow capability was not issued");
+              const response = await toolServer.app.handle(
+                new Request("http://localhost/call", {
+                  method: "POST",
+                  headers: {
+                    "content-type": "application/json",
+                    "x-lilac-request-id": capability.requestId,
+                    "x-lilac-session-id": capability.sessionId,
+                    "x-lilac-request-client": "unknown",
+                    "x-lilac-cwd": workspaceRoot,
+                    "x-lilac-control-capability": capability.token,
+                  },
+                  body: JSON.stringify({
+                    callableId: "workflow.integration.level2",
+                    input: {},
+                  }),
+                }),
+              );
+              expect(response.status).toBe(200);
+              return workflowAgentTextStep("integration result");
+            },
+          }),
+        }),
+    });
     const engine = new WorkflowEngine({
       bus,
       store,
@@ -304,6 +424,19 @@ describe("unified workflow integration", () => {
       subscriptionId: "integration-engine",
       pollMs: 5,
       now: () => 100,
+      validateAgentSelection: ({ profile, model, reasoning }) => {
+        const resolved = resolveAgentRunModel({
+          cfg: config,
+          runProfile: profile,
+          ...(model ? { requestModelOverride: model } : {}),
+          ...(reasoning ? { reasoningOverride: reasoning } : {}),
+        });
+        return {
+          model: resolved.head.spec,
+          reasoning: resolved.head.reasoning ?? null,
+          request: toDurableResolvedModelPlan(resolved, config.agent.reasoningDisplay),
+        };
+      },
     });
     const context = {
       requestId: "discord:channel-1:origin-1",
@@ -313,7 +446,8 @@ describe("unified workflow integration", () => {
       projectRoot: workspaceRoot,
       safetyMode: "trusted" as const,
       serverOwnedRequest: true,
-      authenticatedPrincipal: { platform: "discord" as const, userId: "user-1" },
+      requestInitiator: { platform: "discord" as const, userId: "user-1" },
+      requestInitiatorSessionId: "channel-1",
       toolCallId: "integration-tool-1",
     };
     try {
@@ -371,17 +505,37 @@ describe("unified workflow integration", () => {
       expect(agentOperation).toMatchObject({
         state: "succeeded",
         output: "integration result",
-        usage: { totalTokens: 11 },
+        usage: { totalTokens: 0 },
       });
       expect(requestIds).toHaveLength(1);
       expect(agentOperation?.requestId).toBe(requestIds[0]);
       expect(requestIds[0]).toMatch(/^wfr:/u);
+      expect(level1Contexts).toHaveLength(1);
+      expect(level1Contexts[0]).toMatchObject({
+        requestId: requestIds[0],
+        requestClient: "unknown",
+        safetyMode: "trusted",
+        requestInitiator: { platform: "discord", userId: "user-1" },
+        requestInitiatorSessionId: "channel-1",
+      });
+      expect(level2Contexts).toHaveLength(1);
+      expect(level2Contexts[0]).toMatchObject({
+        requestId: requestIds[0],
+        requestClient: "unknown",
+        safetyMode: "trusted",
+        requestInitiator: { platform: "discord", userId: "user-1" },
+        requestInitiatorSessionId: "channel-1",
+      });
       expect(adapter.contents.at(-1)?.text).not.toContain("integration result");
       expect(adapter.contents.at(-1)?.actions).toEqual([]);
       expect(JSON.stringify(adapter.contents)).not.toContain("super-secret-value");
     } finally {
       await engine.stop();
+      await runner.stop();
       await stopResultForTest(requestResponder.stop());
+      await requestMessageCache.stop();
+      await toolServer.stop();
+      await pluginManager.destroy();
       await actionResolver.stop();
       await projector.stop();
       await tool.destroy();
@@ -407,13 +561,14 @@ describe("unified workflow integration", () => {
       projectRoot: workspaceRoot,
       safetyMode: "trusted" as const,
       serverOwnedRequest: true,
-      authenticatedPrincipal: { platform: "discord" as const, userId: "user-1" },
+      requestInitiator: { platform: "discord" as const, userId: "user-1" },
+      requestInitiatorSessionId: "channel-1",
       toolCallId: "restart-tool-1",
     };
     const firstProjector = createWorkflowProgressProjectorForTest({
       bus,
       store,
-      adapters: new Map([["discord", adapter]]),
+      ports: new Map([["discord", createDiscordWorkflowProgressPort(adapter)]]),
       subscriptionId: "restart-projector-first",
       coalesceMs: 5,
       minEditIntervalMs: 0,
@@ -478,7 +633,7 @@ describe("unified workflow integration", () => {
       restartedProjector = createWorkflowProgressProjectorForTest({
         bus,
         store,
-        adapters: new Map([["discord", adapter]]),
+        ports: new Map([["discord", createDiscordWorkflowProgressPort(adapter)]]),
         subscriptionId: "restart-projector-second",
         coalesceMs: 5,
         minEditIntervalMs: 0,

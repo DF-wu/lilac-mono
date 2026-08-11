@@ -5,10 +5,9 @@ import {
   getDiscordFlags,
   parseLeadingContinueDirective,
   resolveSessionConfigId,
-  resolveSessionSafetyMode,
   stripLeadingContinueDirective,
   withDefaultToolsConfig,
-} from "../../../src/surface/bridge/bus-request-router/common";
+} from "../../../src/surface/discord/discord-request-router/common";
 
 const EMPTY_DISCORD_FLAGS = {};
 
@@ -205,24 +204,5 @@ describe("continue directives", () => {
     expect(
       stripLeadingContinueDirective({ text: "<@bot> !continue resume please", botNames }),
     ).toBe("<@bot> resume please");
-  });
-});
-
-describe("session safety mode", () => {
-  it("inherits restricted safety mode from parent when child has local prompts", () => {
-    const parsed = withDefaultToolsConfig({
-      surface: {
-        router: {
-          sessionModes: {
-            parent: { safetyMode: "restricted" },
-            child: { additionalPrompts: ["child memo"] },
-          },
-        },
-      },
-    });
-    expect(parsed.status).toBe("ok");
-    if (parsed.status === "error") return;
-
-    expect(resolveSessionSafetyMode(parsed.value, "child", "parent")).toBe("restricted");
   });
 });

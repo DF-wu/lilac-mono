@@ -2,7 +2,7 @@ import { createLogger, type CoreConfig } from "@stanley2058/lilac-utils";
 
 import type { ThreadMaterializer } from "../../conversation/thread-materializer";
 import { classifyConversationThreadMessageUpdate } from "../../conversation/thread-store";
-import type { SurfaceAdapter } from "../adapter";
+import type { SurfaceAdapterEventSource } from "../adapter";
 import type { AdapterEvent } from "../events";
 import type { DiscordSearchService } from "../store/discord-search-store";
 
@@ -12,7 +12,7 @@ type DiscordSearchIndexerService = Pick<
 >;
 
 export async function startDiscordSearchIndexer(params: {
-  adapter: SurfaceAdapter;
+  eventSource: SurfaceAdapterEventSource;
   search: DiscordSearchIndexerService;
   getConfig: () => Promise<CoreConfig>;
   materializer?: Pick<ThreadMaterializer, "markDirty">;
@@ -89,7 +89,7 @@ export async function startDiscordSearchIndexer(params: {
   };
 
   const inFlight = new Set<Promise<void>>();
-  const subscription = await params.adapter.subscribe((evt) => {
+  const subscription = await params.eventSource.subscribe((evt) => {
     let task: Promise<void>;
     task = handleEvent(evt)
       .catch((e) => {

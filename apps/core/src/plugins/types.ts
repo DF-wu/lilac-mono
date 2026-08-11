@@ -6,7 +6,7 @@ import type {
   ServerTool,
 } from "@stanley2058/lilac-plugin-runtime";
 
-import type { SurfaceAdapter } from "../surface/adapter";
+import type { SurfaceAdapterResolver } from "../surface/runtime-descriptor";
 import type { DiscoveryService } from "../discovery/discovery-service";
 import type { ConversationThreadToolService } from "../conversation/thread-service";
 import type { DiscordSearchService } from "../surface/store/discord-search-store";
@@ -21,7 +21,7 @@ import type { McpOAuthCallbackControl } from "../mcp/oauth-callback";
 export type CoreToolPluginRuntime = {
   dataDir?: string;
   bus?: LilacBus;
-  adapter?: SurfaceAdapter;
+  surfaceAdapterResolver?: SurfaceAdapterResolver;
   config?: CoreConfig;
   getConfig?: () => Promise<CoreConfig>;
   discovery?: DiscoveryService;

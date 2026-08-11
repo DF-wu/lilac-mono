@@ -17,6 +17,7 @@ import {
   canTransitionWorkflowRun,
   canTransitionWorkflowTrigger,
   canTransitionWorkflowWait,
+  sameWorkflowProgressTarget,
   workflowOperationKindSchema,
   workflowOperationStateSchema,
   workflowSchemaMigrationSchema,
@@ -641,10 +642,20 @@ export class DurableWorkflowStore {
     return row?.count ?? 0;
   }
 
-  listRunsNeedingProjectionReconciliation(
-    limit = 1_000,
-  ): ResultType<WorkflowRun[], DurableWorkflowReadError> {
+  listRunsNeedingProjectionReconciliation(options?: {
+    readonly limit?: number;
+    readonly after?: { readonly updatedAt: number; readonly runId: string };
+  }): ResultType<WorkflowRun[], DurableWorkflowReadError> {
     return captureWorkflowRead("list-runs-needing-projection-reconciliation", () => {
+      const cursorClause = options?.after
+        ? `AND (
+             workflow_runs.updated_at > ?
+             OR (workflow_runs.updated_at = ? AND workflow_runs.run_id > ?)
+           )`
+        : "";
+      const cursorBindings = options?.after
+        ? [options.after.updatedAt, options.after.updatedAt, options.after.runId]
+        : [];
       const rows = this.persistedRows(
         `SELECT workflow_runs.* FROM workflow_runs
          LEFT JOIN workflow_surface_bindings
@@ -653,13 +664,15 @@ export class DurableWorkflowStore {
            AND (
              workflow_runs.state NOT IN ('succeeded', 'failed', 'rejected', 'cancelled')
              OR workflow_surface_bindings.run_id IS NULL
-             OR (
-               workflow_runs.terminal_at IS NOT NULL
-               AND workflow_surface_bindings.updated_at < workflow_runs.terminal_at
+              OR (
+                workflow_runs.terminal_at IS NOT NULL
+                AND workflow_surface_bindings.updated_at < workflow_runs.terminal_at
+              )
+              OR workflow_surface_bindings.permanent_failure_json IS NOT NULL
              )
-           )
-         ORDER BY workflow_runs.updated_at, workflow_runs.run_id LIMIT ?`,
-      ).all(boundedLimit(limit));
+           ${cursorClause}
+          ORDER BY workflow_runs.updated_at, workflow_runs.run_id LIMIT ?`,
+      ).all(...cursorBindings, boundedLimit(options?.limit));
       return this.decodeRows(rows, decodeWorkflowRunRow);
     });
   }
@@ -3043,7 +3056,11 @@ export class DurableWorkflowStore {
         trigger.claimedBy !== input.claimerId ||
         trigger.nextFireAt !== input.expectedFireAt ||
         requestedRun.revisionId !== trigger.revisionId ||
-        requestedRun.state !== "queued"
+        requestedRun.state !== "queued" ||
+        requestedRun.origin.client !== trigger.origin.client ||
+        requestedRun.origin.sessionId !== trigger.origin.sessionId ||
+        requestedRun.origin.userId !== trigger.origin.userId ||
+        !sameWorkflowProgressTarget(requestedRun.progressTarget, trigger.progressTarget)
       ) {
         return Result.ok(null);
       }
@@ -3169,16 +3186,17 @@ export class DurableWorkflowStore {
     this.db.run(
       `INSERT INTO workflow_surface_bindings (
          run_id, target_json, message_ref_json, last_rendered_sha256, last_error,
-         retry_count, next_attempt_at, created_at, updated_at
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+         retry_count, next_attempt_at, permanent_failure_json, created_at, updated_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(run_id) DO UPDATE SET
          target_json = excluded.target_json,
          message_ref_json = excluded.message_ref_json,
          last_rendered_sha256 = excluded.last_rendered_sha256,
-         last_error = excluded.last_error,
-         retry_count = excluded.retry_count,
-         next_attempt_at = excluded.next_attempt_at,
-         updated_at = excluded.updated_at`,
+          last_error = excluded.last_error,
+          retry_count = excluded.retry_count,
+          next_attempt_at = excluded.next_attempt_at,
+          permanent_failure_json = excluded.permanent_failure_json,
+          updated_at = excluded.updated_at`,
       [
         binding.runId,
         JSON.stringify(binding.target),
@@ -3187,9 +3205,21 @@ export class DurableWorkflowStore {
         binding.lastError,
         binding.retryCount,
         binding.nextAttemptAt,
+        binding.permanentFailure === null ? null : JSON.stringify(binding.permanentFailure),
         binding.createdAt,
         binding.updatedAt,
       ],
+    );
+  }
+
+  commitSurfaceBindingWithActionRevocation(binding: WorkflowSurfaceBinding, now: number): void {
+    runWorkflowTransactionForStoreHost(
+      this.db,
+      "commit-surface-binding-with-action-revocation",
+      () => {
+        this.upsertSurfaceBinding(binding);
+        this.expireActiveSurfaceActions(binding.runId, now);
+      },
     );
   }
 
@@ -3224,7 +3254,9 @@ export class DurableWorkflowStore {
       const clauses: string[] = [];
       const bindings: number[] = [];
       if (options?.dueBefore !== undefined) {
-        clauses.push("next_attempt_at IS NOT NULL AND next_attempt_at <= ?");
+        clauses.push(
+          "permanent_failure_json IS NULL AND next_attempt_at IS NOT NULL AND next_attempt_at <= ?",
+        );
         bindings.push(options.dueBefore);
       }
       if (options?.missingMessageOnly) clauses.push("message_ref_json IS NULL");
@@ -3364,6 +3396,8 @@ export class DurableWorkflowStore {
           action.expectedPlatform !== input.platform ||
           action.expectedUserId !== input.userId ||
           !expected ||
+          expected.platform !== action.expectedPlatform ||
+          input.messageRef.platform !== input.platform ||
           expected.platform !== input.messageRef.platform ||
           expected.channelId !== input.messageRef.channelId ||
           expected.messageId !== input.messageRef.messageId
@@ -3381,6 +3415,31 @@ export class DurableWorkflowStore {
         });
         if (decodedRun.status === "error") return Result.err(decodedRun.error);
         const run = decodedRun.value.value;
+        const bindingRow = this.persistedRows(
+          "SELECT * FROM workflow_surface_bindings WHERE run_id = ?",
+        ).get(run.runId);
+        if (bindingRow === null) return Result.ok({ status: "unauthorized" });
+        const decodedBinding = decodeWorkflowSurfaceBindingRow({
+          row: bindingRow,
+          schemaVersion: WORKFLOW_SCHEMA_VERSION,
+        });
+        if (decodedBinding.status === "error") return Result.err(decodedBinding.error);
+        const binding = decodedBinding.value.value;
+        if (
+          binding.permanentFailure !== null ||
+          run.origin.client !== action.expectedPlatform ||
+          run.origin.userId !== action.expectedUserId ||
+          !run.progressTarget ||
+          run.progressTarget.platform !== action.expectedPlatform ||
+          run.progressTarget.channelId !== expected.channelId ||
+          !sameWorkflowProgressTarget(run.progressTarget, binding.target) ||
+          !binding.messageRef ||
+          binding.messageRef.platform !== expected.platform ||
+          binding.messageRef.channelId !== expected.channelId ||
+          binding.messageRef.messageId !== expected.messageId
+        ) {
+          return Result.ok({ status: "unauthorized" });
+        }
         let nextState: WorkflowRunState;
         let valid: boolean;
         switch (action.kind) {

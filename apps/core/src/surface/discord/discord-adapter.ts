@@ -24,13 +24,6 @@ import {
 } from "discord.js";
 import { z } from "zod";
 import { Panic, Result, TaggedError, type Result as ResultType } from "better-result";
-import type {
-  EvtAdapterMessageCreatedData,
-  EvtAdapterMessageDeletedData,
-  EvtAdapterMessageUpdatedData,
-  EvtAdapterReactionAddedData,
-  EvtAdapterReactionRemovedData,
-} from "@stanley2058/lilac-event-bus";
 import type { CoreConfig, CustomCommandArgDef } from "@stanley2058/lilac-utils";
 import {
   CUSTOM_COMMAND_PROMPT_ARG_KEY,
@@ -42,7 +35,6 @@ import {
   resolveDiscordTokenResult,
 } from "@stanley2058/lilac-utils";
 import type {
-  AdapterCapabilities,
   ContentOpts,
   DiscordMsgRef,
   DiscordSessionRef,
@@ -58,18 +50,28 @@ import type {
   SurfaceSession,
 } from "../types";
 import type { AdapterEvent } from "../events";
-import type {
-  AdapterEventHandler,
-  AdapterSubscription,
-  SurfaceMergeBlockPlanOptions,
-  SurfaceReplyChainPlanOptions,
-  StartOutputOpts,
-  SurfaceAdapter,
+import {
+  SurfaceInvalidInput,
+  SurfaceMessageNotFound,
+  SurfacePermissionDenied,
+  SurfacePlatformMismatch,
+  SurfaceRateLimited,
+  SurfaceSessionMismatch,
+  SurfaceUnavailable,
+  type SurfaceOperation,
+  type SurfaceOperationError,
+  type SurfaceOperationResult,
+  type AdapterEventHandler,
+  type AdapterSubscription,
+  type SurfaceMergeBlockPlanOptions,
+  type SurfaceReplyChainPlanOptions,
+  type SurfaceSendPreparationInput,
+  type StartOutputOpts,
+  type SurfaceAdapter,
 } from "../adapter";
-import { SurfaceMessageNotFoundError } from "../adapter";
-import { signalSurfaceFailure, surfaceExternalFallback } from "../adapter";
+import { surfaceExternalFallback } from "../adapter";
 import { createDiscordEntityMapper, type EntityMapper } from "../../entity/entity-mapper";
-import { DiscordSurfaceStore } from "../store/discord-surface-store";
+import { DiscordSurfaceStore, type DbDiscordMessageRelation } from "../store/discord-surface-store";
 import { splitByDiscordWindowOldestToNewest } from "./merge-window";
 import { DiscordOutputStream, sendDiscordStyledMessage } from "./output/discord-output-stream";
 import { parseCancelCustomId } from "./discord-cancel";
@@ -84,12 +86,61 @@ function discordNotFoundCode(error: unknown): 10_003 | 10_008 | null {
   return parsed.success ? parsed.data.code : null;
 }
 
+const discordOperationErrorSchema = z
+  .object({
+    code: z.number().int().optional(),
+    status: z.number().int().optional(),
+    retry_after: z.number().finite().nonnegative().optional(),
+  })
+  .passthrough();
+
+export function classifyDiscordSurfaceError(
+  operation: SurfaceOperation,
+  error: unknown,
+  message = "Discord operation failed",
+): SurfaceOperationError | null {
+  if (error instanceof DiscordAdapterUnavailable) {
+    return new SurfaceUnavailable({ platform: "discord", operation, message: error.message });
+  }
+  const parsed = discordOperationErrorSchema.safeParse(error);
+  if (!parsed.success) return null;
+  const { code, status, retry_after: retryAfterSeconds } = parsed.data;
+  if (code === 10_003 || code === 10_008 || status === 404) {
+    return new SurfaceMessageNotFound({ platform: "discord", operation, message });
+  }
+  if (code === 50_001 || code === 50_013 || status === 401 || status === 403) {
+    return new SurfacePermissionDenied({ platform: "discord", operation, message });
+  }
+  if (code === 20_028 || code === 20_029 || status === 429) {
+    return new SurfaceRateLimited({
+      platform: "discord",
+      operation,
+      ...(retryAfterSeconds === undefined
+        ? {}
+        : { retryAfterMs: Math.ceil(retryAfterSeconds * 1000) }),
+      message,
+    });
+  }
+  if (code === 50_035 || status === 400) {
+    return new SurfaceInvalidInput({
+      platform: "discord",
+      operation,
+      field: "request",
+      message,
+    });
+  }
+  if (status !== undefined && status >= 500) {
+    return new SurfaceUnavailable({ platform: "discord", operation, message });
+  }
+  return null;
+}
+
 export function classifyDiscordSurfaceNotFound(
   error: unknown,
   message = "Discord resource not found",
-): SurfaceMessageNotFoundError | null {
-  const code = discordNotFoundCode(error);
-  return code === null ? null : new SurfaceMessageNotFoundError("discord", code, message);
+): SurfaceMessageNotFound | null {
+  const classified = classifyDiscordSurfaceError("read-message", error, message);
+  return classified instanceof SurfaceMessageNotFound ? classified : null;
 }
 import { buildDiscordSessionDividerText } from "./discord-session-divider";
 import { formatDiscordMessageRequestId, formatDiscordSlashRequestId } from "../bridge/request-ids";
@@ -128,7 +179,7 @@ import {
   customCommandInvocationErrorText,
   type CustomCommandManager,
 } from "../../custom-commands/manager";
-import { getSessionMode, resolveSessionConfigId } from "../bridge/bus-request-router/common";
+import { getSessionMode, resolveSessionConfigId } from "./discord-request-router/common";
 
 export {
   hasExplicitDiscordUserMentionInContent,
@@ -221,27 +272,102 @@ export class DiscordExternalCallFailed extends TaggedError("DiscordExternalCallF
 }> {}
 
 function discordSessionRefResult(
+  operation: SurfaceOperation,
   sessionRef: SessionRef,
-): ResultType<DiscordSessionRef, DiscordPlatformUnsupported> {
+  refRole = "sessionRef",
+): SurfaceOperationResult<DiscordSessionRef> {
   if (sessionRef.platform === "discord") return Result.ok(sessionRef);
   return Result.err(
-    new DiscordPlatformUnsupported({
-      platform: sessionRef.platform,
-      message: `Unsupported surface platform: ${sessionRef.platform}`,
+    new SurfacePlatformMismatch({
+      operation,
+      refRole,
+      expectedPlatform: "discord",
+      receivedPlatform: sessionRef.platform,
+      message: `Expected a Discord ${refRole}, received '${sessionRef.platform}'`,
     }),
   );
 }
 
 function discordMsgRefResult(
+  operation: SurfaceOperation,
   msgRef: MsgRef,
-): ResultType<DiscordMsgRef, DiscordPlatformUnsupported> {
+  refRole = "msgRef",
+): SurfaceOperationResult<DiscordMsgRef> {
   if (msgRef.platform === "discord") return Result.ok(msgRef);
   return Result.err(
-    new DiscordPlatformUnsupported({
-      platform: msgRef.platform,
-      message: `Unsupported surface platform: ${msgRef.platform}`,
+    new SurfacePlatformMismatch({
+      operation,
+      refRole,
+      expectedPlatform: "discord",
+      receivedPlatform: msgRef.platform,
+      message: `Expected a Discord ${refRole}, received '${msgRef.platform}'`,
     }),
   );
+}
+
+function discordNestedMsgRefResult(input: {
+  operation: SurfaceOperation;
+  sessionRef: DiscordSessionRef;
+  msgRef: MsgRef;
+  refRole: string;
+}): SurfaceOperationResult<DiscordMsgRef> {
+  const ref = discordMsgRefResult(input.operation, input.msgRef, input.refRole);
+  if (ref.status === "error") return ref;
+  if (ref.value.channelId === input.sessionRef.channelId) return ref;
+  return Result.err(
+    new SurfaceSessionMismatch({
+      operation: input.operation,
+      refRole: input.refRole,
+      expectedSessionId: input.sessionRef.channelId,
+      receivedSessionId: ref.value.channelId,
+      message: `Discord ${input.refRole} belongs to session '${ref.value.channelId}'`,
+    }),
+  );
+}
+
+function prepareDiscordSendResult(
+  sessionRef: SessionRef,
+  input: SurfaceSendPreparationInput,
+  opts?: SendOpts,
+): SurfaceOperationResult<DiscordSessionRef> {
+  const refResult = discordSessionRefResult("send-message", sessionRef);
+  if (refResult.status === "error") return refResult;
+  const discordRef = refResult.value;
+  if (opts?.replyTo) {
+    const reply = discordNestedMsgRefResult({
+      operation: "send-message",
+      sessionRef: discordRef,
+      msgRef: opts.replyTo,
+      refRole: "replyTo",
+    });
+    if (reply.status === "error") return reply;
+  }
+  const hasText = Boolean(input.text?.trim());
+  if (!hasText && input.attachmentCount === 0 && input.actionCount === 0) {
+    return Result.err(
+      new SurfaceInvalidInput({
+        platform: "discord",
+        operation: "send-message",
+        field: "content",
+        message: "Discord message content must include text, an attachment, or an action",
+      }),
+    );
+  }
+  return Result.ok(discordRef);
+}
+
+async function captureDiscordOperation<T>(
+  operation: SurfaceOperation,
+  effect: () => Promise<T>,
+): Promise<SurfaceOperationResult<T>> {
+  try {
+    return Result.ok(await effect());
+  } catch (cause) {
+    if (Panic.is(cause)) throw cause;
+    const classified = classifyDiscordSurfaceError(operation, cause);
+    if (classified) return Result.err(classified);
+    throw cause;
+  }
 }
 
 function externalCallFailure(operation: string): DiscordExternalCallFailed {
@@ -478,7 +604,7 @@ export class DiscordAdapter implements SurfaceAdapter {
     if (tokenResult.status === "error") {
       switch (tokenResult.error._tag) {
         case "DiscordTokenMissing":
-          return signalSurfaceFailure(tokenResult.error);
+          throw tokenResult.error;
       }
     }
     const token = tokenResult.value;
@@ -725,7 +851,7 @@ export class DiscordAdapter implements SurfaceAdapter {
       try: () => client.login(token),
       catch: surfaceExternalFallback(externalCallFailure("client.login")),
     });
-    if (loggedIn.status === "error") return signalSurfaceFailure(loggedIn.error);
+    if (loggedIn.status === "error") throw loggedIn.error;
 
     this.logger.debug("login ok");
 
@@ -757,12 +883,12 @@ export class DiscordAdapter implements SurfaceAdapter {
     this.logger.info("disconnected");
 
     if (destroyed?.status === "rejected" && Panic.is(destroyed.reason)) {
-      return signalSurfaceFailure(destroyed.reason);
+      throw destroyed.reason;
     }
     if (closed?.status === "rejected") {
       const failure =
         closed.reason instanceof Error ? closed.reason : externalCallFailure("surface-store.close");
-      return signalSurfaceFailure(failure);
+      throw failure;
     }
   }
 
@@ -783,9 +909,7 @@ export class DiscordAdapter implements SurfaceAdapter {
   async getSelf(): Promise<SurfaceSelf> {
     if (this.self) return this.self;
     if (!this.client?.user || !this.cfg) {
-      return signalSurfaceFailure(
-        new DiscordAdapterUnavailable({ message: "DiscordAdapter not connected" }),
-      );
+      throw new DiscordAdapterUnavailable({ message: "DiscordAdapter not connected" });
     }
     return {
       platform: "discord",
@@ -794,36 +918,35 @@ export class DiscordAdapter implements SurfaceAdapter {
     };
   }
 
-  async getCapabilities(): Promise<AdapterCapabilities> {
-    return {
-      platform: "discord",
-      send: true,
-      edit: true,
-      delete: true,
-      reactions: true,
-      readHistory: true,
-      threads: true,
-      markRead: true,
-    };
-  }
-
-  async listSessions(): Promise<SurfaceSession[]> {
+  async listSessions(): Promise<SurfaceOperationResult<SurfaceSession[]>> {
     const storeResult = this.storeResult();
-    if (storeResult.status === "error") return signalSurfaceFailure(storeResult.error);
+    if (storeResult.status === "error") {
+      return Result.err(
+        new SurfaceUnavailable({
+          platform: "discord",
+          operation: "list-sessions",
+          message: storeResult.error.message,
+        }),
+      );
+    }
     const store = storeResult.value;
     const sessions = store.listSessions();
-    return sessions.map((s) => ({
-      ref: asDiscordSessionRef({
-        channelId: s.channel_id,
-        guildId: s.guild_id,
-        parentChannelId: s.parent_channel_id,
-      }),
-      title: s.name ?? undefined,
-      kind: s.type,
-    }));
+    return Result.ok(
+      sessions.map((s) => ({
+        ref: asDiscordSessionRef({
+          channelId: s.channel_id,
+          guildId: s.guild_id,
+          parentChannelId: s.parent_channel_id,
+        }),
+        title: s.name ?? undefined,
+        kind: s.type,
+      })),
+    );
   }
 
-  private async reloadCoreConfigIfNeeded(): Promise<void> {
+  private async reloadCoreConfigIfNeeded(
+    options: { readonly applyPresence?: boolean } = {},
+  ): Promise<void> {
     if (this.opts?.config) return;
 
     const loaded = await Result.tryPromise({
@@ -833,7 +956,7 @@ export class DiscordAdapter implements SurfaceAdapter {
     if (loaded.status === "ok") {
       const cfg = loaded.value;
       this.cfg = cfg;
-      this.applyConfiguredPresence();
+      if (options.applyPresence !== false) this.applyConfiguredPresence();
 
       if (this.coreConfigReloadHadError) {
         this.logger.info("core-config reload recovered", {
@@ -939,9 +1062,7 @@ export class DiscordAdapter implements SurfaceAdapter {
   async fetchGuildIdForChannel(channelId: string): Promise<string | null> {
     const client = this.client;
     if (!client) {
-      return signalSurfaceFailure(
-        new DiscordAdapterUnavailable({ message: "DiscordAdapter not connected" }),
-      );
+      throw new DiscordAdapterUnavailable({ message: "DiscordAdapter not connected" });
     }
 
     const fetched = await Result.tryPromise({
@@ -957,16 +1078,51 @@ export class DiscordAdapter implements SurfaceAdapter {
   async startOutput(
     sessionRef: SessionRef,
     opts?: StartOutputOpts,
-  ): Promise<import("../adapter").SurfaceOutputStream> {
-    await this.reloadCoreConfigIfNeeded();
+  ): Promise<SurfaceOperationResult<import("../adapter").SurfaceOutputStream>> {
+    const refResult = discordSessionRefResult("start-output", sessionRef);
+    if (refResult.status === "error") return refResult;
+    const discordRef = refResult.value;
+    if (opts?.replyTo) {
+      const reply = discordNestedMsgRefResult({
+        operation: "start-output",
+        sessionRef: discordRef,
+        msgRef: opts.replyTo,
+        refRole: "replyTo",
+      });
+      if (reply.status === "error") return reply;
+    }
+    for (const [index, created] of (opts?.resume?.created ?? []).entries()) {
+      const resumed = discordNestedMsgRefResult({
+        operation: "start-output",
+        sessionRef: discordRef,
+        msgRef: created,
+        refRole: `resume.created[${index}]`,
+      });
+      if (resumed.status === "error") return resumed;
+    }
+    await this.reloadCoreConfigIfNeeded({
+      applyPresence: opts?.preparationMode !== "paused-recovery",
+    });
 
     const cfg = this.cfg;
     const clientResult = this.clientResult();
-    if (clientResult.status === "error") return signalSurfaceFailure(clientResult.error);
+    if (clientResult.status === "error") {
+      return Result.err(
+        new SurfaceUnavailable({
+          platform: "discord",
+          operation: "start-output",
+          message: clientResult.error.message,
+        }),
+      );
+    }
     const client = clientResult.value;
     if (!cfg) {
-      return signalSurfaceFailure(
-        new DiscordAdapterUnavailable({ message: "DiscordAdapter not connected" }),
+      return Result.err(
+        new SurfaceUnavailable({
+          platform: "discord",
+          operation: "start-output",
+          message: "DiscordAdapter not connected",
+        }),
       );
     }
     const markdownTableRender = resolveMarkdownTableRenderOptions(cfg);
@@ -974,41 +1130,61 @@ export class DiscordAdapter implements SurfaceAdapter {
     // TODO: plumb config for smart splitting.
     const useSmartSplitting = true;
 
-    return new DiscordOutputStream({
-      client,
-      sessionRef,
-      opts,
-      useSmartSplitting,
-      rewriteText: this.entityMapper?.rewriteOutgoingText,
-      markdownTableRender,
-      reasoningDisplayMode: cfg.agent.reasoningDisplay ?? "simple",
-      outputMode: cfg.surface.discord.outputMode ?? "inline",
-      outputPreviewModeFinalStyle: cfg.surface.discord.outputPreviewModeFinalStyle ?? "embed",
-      outputNotification: resolveOutputNotificationEnabled({
-        configured: cfg.surface.discord.outputNotification,
-        silent: opts?.silent,
+    return Result.ok(
+      new DiscordOutputStream({
+        client,
+        sessionRef: discordRef,
+        opts,
+        useSmartSplitting,
+        rewriteText: this.entityMapper?.rewriteOutgoingText,
+        markdownTableRender,
+        reasoningDisplayMode: cfg.agent.reasoningDisplay ?? "simple",
+        outputMode: cfg.surface.discord.outputMode ?? "inline",
+        outputPreviewModeFinalStyle: cfg.surface.discord.outputPreviewModeFinalStyle ?? "embed",
+        outputNotification: resolveOutputNotificationEnabled({
+          configured: cfg.surface.discord.outputNotification,
+          silent: opts?.silent,
+        }),
+        workingIndicators: cfg.surface.discord.workingIndicators ?? ["Working"],
       }),
-      workingIndicators: cfg.surface.discord.workingIndicators ?? ["Working"],
-    });
+    );
   }
 
-  async startTyping(sessionRef: SessionRef): Promise<{ stop(): Promise<void> }> {
+  async startTyping(
+    sessionRef: SessionRef,
+  ): Promise<SurfaceOperationResult<import("../adapter").TypingIndicatorSubscription>> {
+    const refResult = discordSessionRefResult("start-typing", sessionRef);
+    if (refResult.status === "error") return refResult;
     const clientResult = this.clientResult();
-    if (clientResult.status === "error") return signalSurfaceFailure(clientResult.error);
-    const refResult = discordSessionRefResult(sessionRef);
-    if (refResult.status === "error") return signalSurfaceFailure(refResult.error);
+    if (clientResult.status === "error") {
+      return Result.err(
+        new SurfaceUnavailable({
+          platform: "discord",
+          operation: "start-typing",
+          message: clientResult.error.message,
+        }),
+      );
+    }
     const client = clientResult.value;
     const discordRef = refResult.value;
 
-    const fetched = await Result.tryPromise({
-      try: () => client.channels.fetch(discordRef.channelId),
-      catch: surfaceExternalFallback(null),
-    });
-    const ch = fetched.status === "ok" ? fetched.value : null;
+    const fetched = await captureDiscordOperation("start-typing", () =>
+      client.channels.fetch(discordRef.channelId),
+    );
+    if (fetched.status === "error") return fetched;
+    const ch = fetched.value;
 
     const sendTyping = ch && "sendTyping" in ch ? ch.sendTyping : null;
 
-    if (!sendTyping) return { stop: async () => {} };
+    if (!sendTyping) {
+      return Result.err(
+        new SurfaceUnavailable({
+          platform: "discord",
+          operation: "start-typing",
+          message: `Discord channel cannot accept typing indicators: ${discordRef.channelId}`,
+        }),
+      );
+    }
 
     // Discord typing indicators last ~10s; refresh a bit earlier.
     const REFRESH_MS = 8000;
@@ -1043,74 +1219,112 @@ export class DiscordAdapter implements SurfaceAdapter {
       }
     };
 
-    // Fire once immediately, then refresh.
-    this.superviseDiscordCallback("typing-indicator", tick);
+    const initial = await captureDiscordOperation("start-typing", () => sendTyping.call(ch));
+    if (initial.status === "error") return initial;
     timer = setInterval(() => {
       this.superviseDiscordCallback("typing-indicator", tick);
     }, REFRESH_MS);
 
-    return {
+    return Result.ok({
       stop: async () => {
         stop();
+        return Result.ok(undefined);
       },
-    };
+    });
   }
 
-  async sendMsg(sessionRef: SessionRef, content: ContentOpts, opts?: SendOpts): Promise<MsgRef> {
+  async prepareSendMsg(
+    sessionRef: SessionRef,
+    input: SurfaceSendPreparationInput,
+    opts?: SendOpts,
+  ): Promise<SurfaceOperationResult<void>> {
+    const prepared = prepareDiscordSendResult(sessionRef, input, opts);
+    return prepared.status === "error" ? prepared : Result.ok(undefined);
+  }
+
+  async sendMsg(
+    sessionRef: SessionRef,
+    content: ContentOpts,
+    opts?: SendOpts,
+  ): Promise<SurfaceOperationResult<MsgRef>> {
+    const prepared = prepareDiscordSendResult(
+      sessionRef,
+      {
+        text: content.text,
+        attachmentCount: content.attachments?.length ?? 0,
+        actionCount: content.actions?.length ?? 0,
+      },
+      opts,
+    );
+    if (prepared.status === "error") return prepared;
+    const discordRef = prepared.value;
     await this.reloadCoreConfigIfNeeded();
 
     const cfg = this.cfg;
     const clientResult = this.clientResult();
-    if (clientResult.status === "error") return signalSurfaceFailure(clientResult.error);
-    const refResult = discordSessionRefResult(sessionRef);
-    if (refResult.status === "error") return signalSurfaceFailure(refResult.error);
+    if (clientResult.status === "error") {
+      return Result.err(
+        new SurfaceUnavailable({
+          platform: "discord",
+          operation: "send-message",
+          message: clientResult.error.message,
+        }),
+      );
+    }
     const client = clientResult.value;
-    const discordRef = refResult.value;
     const markdownTableRender = resolveMarkdownTableRenderOptions(cfg);
 
     const useSmartSplitting = true;
 
     if (content.actions && content.actions.length > 0) {
-      const fetched = await Result.tryPromise({
-        try: () => client.channels.fetch(discordRef.channelId),
-        catch: surfaceExternalFallback(null),
-      });
-      const channel = fetched.status === "ok" ? fetched.value : null;
+      const fetched = await captureDiscordOperation("send-message", () =>
+        client.channels.fetch(discordRef.channelId),
+      );
+      if (fetched.status === "error") return fetched;
+      const channel = fetched.value;
       if (!channel || !("send" in channel)) {
-        return signalSurfaceFailure(
-          new DiscordChannelUnavailable({
-            channelId: discordRef.channelId,
+        return Result.err(
+          new SurfaceMessageNotFound({
+            platform: "discord",
+            operation: "send-message",
             message: `Discord channel not found: ${discordRef.channelId}`,
           }),
         );
       }
       const components = buildDiscordActionComponentsResult(content.actions);
-      if (components.status === "error") return signalSurfaceFailure(components.error);
-      const text = this.entityMapper?.rewriteOutgoingText(content.text ?? "") ?? content.text ?? "";
-      const sent = await Result.tryPromise({
-        try: async () =>
-          await channel.send({
-            embeds: [new EmbedBuilder().setDescription(text || "*<empty_string>*")],
-            components: components.value,
-            files: content.attachments?.map((attachment) => ({
-              attachment: Buffer.from(attachment.bytes),
-              name: attachment.filename,
-            })),
-            reply:
-              opts?.replyTo?.platform === "discord"
-                ? { messageReference: opts.replyTo.messageId }
-                : undefined,
-            allowedMentions: { parse: [], repliedUser: false },
+      if (components.status === "error") {
+        return Result.err(
+          new SurfaceInvalidInput({
+            platform: "discord",
+            operation: "send-message",
+            field: "content.actions",
+            message: components.error.message,
           }),
-        catch: surfaceExternalFallback(externalCallFailure("channel.send")),
-      });
-      if (sent.status === "error") return signalSurfaceFailure(sent.error);
-      return asDiscordMsgRef(discordRef.channelId, sent.value.id);
+        );
+      }
+      const text = this.entityMapper?.rewriteOutgoingText(content.text ?? "") ?? content.text ?? "";
+      const sent = await captureDiscordOperation("send-message", async () =>
+        channel.send({
+          embeds: [new EmbedBuilder().setDescription(text || "*<empty_string>*")],
+          components: components.value,
+          files: content.attachments?.map((attachment) => ({
+            attachment: Buffer.from(attachment.bytes),
+            name: attachment.filename,
+          })),
+          reply:
+            opts?.replyTo?.platform === "discord"
+              ? { messageReference: opts.replyTo.messageId }
+              : undefined,
+          allowedMentions: { parse: [], repliedUser: false },
+        }),
+      );
+      if (sent.status === "error") return sent;
+      return Result.ok(asDiscordMsgRef(discordRef.channelId, sent.value.id));
     }
 
     return await sendDiscordStyledMessage({
       client,
-      sessionRef,
+      sessionRef: discordRef,
       content,
       opts: opts?.replyTo ? { replyTo: opts.replyTo } : undefined,
       useSmartSplitting,
@@ -1123,99 +1337,117 @@ export class DiscordAdapter implements SurfaceAdapter {
     });
   }
 
-  async readMsg(msgRef: MsgRef): Promise<SurfaceMessage | null> {
-    const refResult = discordMsgRefResult(msgRef);
-    if (refResult.status === "error") return signalSurfaceFailure(refResult.error);
+  async readMsg(msgRef: MsgRef): Promise<SurfaceOperationResult<SurfaceMessage | null>> {
+    const refResult = discordMsgRefResult("read-message", msgRef);
+    if (refResult.status === "error") return refResult;
     const discordRef = refResult.value;
 
-    const msg = await this.fetchDiscordMessage({
-      channelId: discordRef.channelId,
-      messageId: discordRef.messageId,
-    });
+    const fetched = await captureDiscordOperation("read-message", () =>
+      this.fetchDiscordMessage({
+        channelId: discordRef.channelId,
+        messageId: discordRef.messageId,
+      }),
+    );
+    if (fetched.status === "error") return fetched;
+    const msg = fetched.value;
 
-    if (!msg) return null;
+    if (!msg) return Result.ok(null);
 
     const projected = this.toSurfaceMessageFromDiscordMessageResult(msg);
-    return projected.status === "ok" ? projected.value : signalSurfaceFailure(projected.error);
+    if (projected.status === "error") {
+      return Result.err(
+        new SurfaceUnavailable({
+          platform: "discord",
+          operation: "read-message",
+          message: projected.error.message,
+        }),
+      );
+    }
+    return Result.ok(projected.value);
   }
 
-  async listMsg(sessionRef: SessionRef, opts?: LimitOpts): Promise<SurfaceMessage[]> {
-    const refResult = discordSessionRefResult(sessionRef);
-    if (refResult.status === "error") return signalSurfaceFailure(refResult.error);
+  async listMsg(
+    sessionRef: SessionRef,
+    opts?: LimitOpts,
+  ): Promise<SurfaceOperationResult<SurfaceMessage[]>> {
+    const refResult = discordSessionRefResult("list-messages", sessionRef);
+    if (refResult.status === "error") return refResult;
     const discordRef = refResult.value;
 
     const limit = Math.min(200, Math.max(1, opts?.limit ?? 50));
 
-    const messages = await this.fetchDiscordMessages({
-      channelId: discordRef.channelId,
-      limit,
-      beforeMessageId: opts?.beforeMessageId,
-      afterMessageId: opts?.afterMessageId,
-    });
+    const listed = await captureDiscordOperation("list-messages", () =>
+      this.fetchDiscordMessages({
+        channelId: discordRef.channelId,
+        limit,
+        beforeMessageId: opts?.beforeMessageId,
+        afterMessageId: opts?.afterMessageId,
+      }),
+    );
+    if (listed.status === "error") return listed;
+    const messages = listed.value;
 
     const projected: SurfaceMessage[] = [];
     for (const message of messages) {
       const result = this.toSurfaceMessageFromDiscordMessageResult(message);
-      if (result.status === "error") return signalSurfaceFailure(result.error);
+      if (result.status === "error") {
+        return Result.err(
+          new SurfaceUnavailable({
+            platform: "discord",
+            operation: "list-messages",
+            message: result.error.message,
+          }),
+        );
+      }
       projected.push(result.value);
     }
-    return projected;
+    return Result.ok(projected);
   }
 
-  async editMsg(msgRef: MsgRef, content: ContentOpts): Promise<void> {
+  async editMsg(msgRef: MsgRef, content: ContentOpts): Promise<SurfaceOperationResult<void>> {
+    const refResult = discordMsgRefResult("edit-message", msgRef);
+    if (refResult.status === "error") return refResult;
     const clientResult = this.clientResult();
-    if (clientResult.status === "error") return signalSurfaceFailure(clientResult.error);
-    const refResult = discordMsgRefResult(msgRef);
-    if (refResult.status === "error") return signalSurfaceFailure(refResult.error);
+    if (clientResult.status === "error") {
+      return Result.err(
+        new SurfaceUnavailable({
+          platform: "discord",
+          operation: "edit-message",
+          message: clientResult.error.message,
+        }),
+      );
+    }
     const client = clientResult.value;
     const discordRef = refResult.value;
     if (!client.user) {
-      return signalSurfaceFailure(
-        new DiscordAdapterUnavailable({ message: "Discord client user is unavailable" }),
+      return Result.err(
+        new SurfaceUnavailable({
+          platform: "discord",
+          operation: "edit-message",
+          message: "Discord client user is unavailable",
+        }),
       );
     }
 
-    const channelResult = await client.channels
-      .fetch(discordRef.channelId)
-      .then((channel) => Result.ok(channel))
-      .catch((error: unknown) => {
-        if (Panic.is(error)) return Promise.reject(error);
-        return Result.err(
-          classifyDiscordSurfaceNotFound(
-            error,
-            `Discord channel not found: ${discordRef.channelId}`,
-          ) ?? externalCallFailure("client.channels.fetch"),
-        );
-      });
-    if (channelResult.status === "error") {
-      return signalSurfaceFailure(channelResult.error);
-    }
+    const channelResult = await captureDiscordOperation("edit-message", () =>
+      client.channels.fetch(discordRef.channelId),
+    );
+    if (channelResult.status === "error") return channelResult;
     const channel = channelResult.value;
     if (!channel || !("messages" in channel) || !channel.messages?.fetch) {
-      return signalSurfaceFailure(
-        new SurfaceMessageNotFoundError(
-          "discord",
-          10_003,
-          `Discord channel not found: ${discordRef.channelId}`,
-        ),
+      return Result.err(
+        new SurfaceMessageNotFound({
+          platform: "discord",
+          operation: "edit-message",
+          message: `Discord channel not found: ${discordRef.channelId}`,
+        }),
       );
     }
 
-    const messageResult = await channel.messages
-      .fetch({ message: discordRef.messageId, cache: false, force: true })
-      .then((message) => Result.ok(message))
-      .catch((error: unknown) => {
-        if (Panic.is(error)) return Promise.reject(error);
-        return Result.err(
-          classifyDiscordSurfaceNotFound(
-            error,
-            `Discord message not found: ${discordRef.messageId}`,
-          ) ?? externalCallFailure("channel.messages.fetch"),
-        );
-      });
-    if (messageResult.status === "error") {
-      return signalSurfaceFailure(messageResult.error);
-    }
+    const messageResult = await captureDiscordOperation("edit-message", () =>
+      channel.messages.fetch({ message: discordRef.messageId, cache: false, force: true }),
+    );
+    if (messageResult.status === "error") return messageResult;
     const msg = messageResult.value;
 
     const raw = content.text ?? "";
@@ -1226,13 +1458,30 @@ export class DiscordAdapter implements SurfaceAdapter {
       embedCount: msg.embeds.length,
       content: msg.content,
     });
-    if (editTarget.status === "error") return signalSurfaceFailure(editTarget.error);
+    if (editTarget.status === "error") {
+      return Result.err(
+        new SurfacePermissionDenied({
+          platform: "discord",
+          operation: "edit-message",
+          message: editTarget.error.message,
+        }),
+      );
+    }
 
     const componentsResult =
       content.actions === undefined
         ? Result.ok(undefined)
         : buildDiscordActionComponentsResult(content.actions);
-    if (componentsResult.status === "error") return signalSurfaceFailure(componentsResult.error);
+    if (componentsResult.status === "error") {
+      return Result.err(
+        new SurfaceInvalidInput({
+          platform: "discord",
+          operation: "edit-message",
+          field: "content.actions",
+          message: componentsResult.error.message,
+        }),
+      );
+    }
     const components = componentsResult.value;
     const attachmentEdit =
       content.attachments === undefined
@@ -1246,18 +1495,19 @@ export class DiscordAdapter implements SurfaceAdapter {
           };
 
     if (editTarget.value === "content") {
-      const edited = await Result.tryPromise({
-        try: () => msg.edit({ content: rewritten, components, ...attachmentEdit }),
-        catch: surfaceExternalFallback(externalCallFailure("message.edit")),
-      });
-      if (edited.status === "error") return signalSurfaceFailure(edited.error);
-      return;
+      const edited = await captureDiscordOperation("edit-message", () =>
+        msg.edit({ content: rewritten, components, ...attachmentEdit }),
+      );
+      return edited.status === "error" ? edited : Result.ok(undefined);
     }
 
     const existingEmbed = msg.embeds[0];
     if (!existingEmbed) {
-      return signalSurfaceFailure(
-        new DiscordInvariantViolation({
+      return Result.err(
+        new SurfaceInvalidInput({
+          platform: "discord",
+          operation: "edit-message",
+          field: "message",
           message: "Discord message embed could not be resolved for editing",
         }),
       );
@@ -1265,79 +1515,99 @@ export class DiscordAdapter implements SurfaceAdapter {
 
     const embed = new EmbedBuilder(existingEmbed.toJSON());
     embed.setDescription(rewritten);
-    const edited = await Result.tryPromise({
-      try: () => msg.edit({ embeds: [embed], components, ...attachmentEdit }),
-      catch: surfaceExternalFallback(externalCallFailure("message.edit")),
-    });
-    if (edited.status === "error") return signalSurfaceFailure(edited.error);
+    const edited = await captureDiscordOperation("edit-message", () =>
+      msg.edit({ embeds: [embed], components, ...attachmentEdit }),
+    );
+    return edited.status === "error" ? edited : Result.ok(undefined);
   }
 
-  async deleteMsg(msgRef: MsgRef): Promise<void> {
+  async deleteMsg(msgRef: MsgRef): Promise<SurfaceOperationResult<void>> {
+    const refResult = discordMsgRefResult("delete-message", msgRef);
+    if (refResult.status === "error") return refResult;
     const clientResult = this.clientResult();
-    if (clientResult.status === "error") return signalSurfaceFailure(clientResult.error);
-    const refResult = discordMsgRefResult(msgRef);
-    if (refResult.status === "error") return signalSurfaceFailure(refResult.error);
+    if (clientResult.status === "error") {
+      return Result.err(
+        new SurfaceUnavailable({
+          platform: "discord",
+          operation: "delete-message",
+          message: clientResult.error.message,
+        }),
+      );
+    }
     const client = clientResult.value;
     const discordRef = refResult.value;
 
-    const fetched = await Result.tryPromise({
-      try: () => client.channels.fetch(discordRef.channelId),
-      catch: surfaceExternalFallback(null),
-    });
-    const channel = fetched.status === "ok" ? fetched.value : null;
+    const fetched = await captureDiscordOperation("delete-message", () =>
+      client.channels.fetch(discordRef.channelId),
+    );
+    if (fetched.status === "error") return fetched;
+    const channel = fetched.value;
     if (!channel || !("messages" in channel) || !channel.messages?.fetch) {
-      return signalSurfaceFailure(
-        new DiscordChannelUnavailable({
-          channelId: discordRef.channelId,
+      return Result.err(
+        new SurfaceMessageNotFound({
+          platform: "discord",
+          operation: "delete-message",
           message: `Discord channel not found: ${discordRef.channelId}`,
         }),
       );
     }
 
-    const message = await Result.tryPromise({
-      try: () =>
-        channel.messages.fetch({ message: discordRef.messageId, cache: false, force: true }),
-      catch: surfaceExternalFallback(externalCallFailure("channel.messages.fetch")),
-    });
-    if (message.status === "error") return signalSurfaceFailure(message.error);
-    const deleted = await Result.tryPromise({
-      try: () => message.value.delete(),
-      catch: surfaceExternalFallback(externalCallFailure("message.delete")),
-    });
-    if (deleted.status === "error") return signalSurfaceFailure(deleted.error);
+    const message = await captureDiscordOperation("delete-message", () =>
+      channel.messages.fetch({ message: discordRef.messageId, cache: false, force: true }),
+    );
+    if (message.status === "error") return message;
+    const deleted = await captureDiscordOperation("delete-message", () => message.value.delete());
+    return deleted.status === "error" ? deleted : Result.ok(undefined);
   }
 
-  async getReplyContext(msgRef: MsgRef, opts?: LimitOpts): Promise<SurfaceMessage[]> {
-    const refResult = discordMsgRefResult(msgRef);
-    if (refResult.status === "error") return signalSurfaceFailure(refResult.error);
+  async getReplyContext(
+    msgRef: MsgRef,
+    opts?: LimitOpts,
+  ): Promise<SurfaceOperationResult<SurfaceMessage[]>> {
+    const refResult = discordMsgRefResult("get-reply-context", msgRef);
+    if (refResult.status === "error") return refResult;
     const discordRef = refResult.value;
 
     const limit = Math.min(100, Math.max(1, opts?.limit ?? 20));
 
-    const messages = await this.fetchDiscordMessages({
-      channelId: discordRef.channelId,
-      limit,
-      aroundMessageId: discordRef.messageId,
-    });
+    const listed = await captureDiscordOperation("get-reply-context", () =>
+      this.fetchDiscordMessages({
+        channelId: discordRef.channelId,
+        limit,
+        aroundMessageId: discordRef.messageId,
+      }),
+    );
+    if (listed.status === "error") return listed;
+    const messages = listed.value;
 
     const projected: SurfaceMessage[] = [];
     for (const message of messages) {
       const result = this.toSurfaceMessageFromDiscordMessageResult(message);
-      if (result.status === "error") return signalSurfaceFailure(result.error);
+      if (result.status === "error") {
+        return Result.err(
+          new SurfaceUnavailable({
+            platform: "discord",
+            operation: "get-reply-context",
+            message: result.error.message,
+          }),
+        );
+      }
       projected.push(result.value);
     }
-    return projected.sort((a, b) => {
-      if (a.ts !== b.ts) return a.ts - b.ts;
-      return compareDiscordSnowflake(a.ref.messageId, b.ref.messageId);
-    });
+    return Result.ok(
+      projected.sort((a, b) => {
+        if (a.ts !== b.ts) return a.ts - b.ts;
+        return compareDiscordSnowflake(a.ref.messageId, b.ref.messageId);
+      }),
+    );
   }
 
   async planReplyChain(
     msgRef: MsgRef,
     opts?: SurfaceReplyChainPlanOptions,
-  ): Promise<readonly MsgRef[]> {
-    const refResult = discordMsgRefResult(msgRef);
-    if (refResult.status === "error") return signalSurfaceFailure(refResult.error);
+  ): Promise<SurfaceOperationResult<readonly MsgRef[]>> {
+    const refResult = discordMsgRefResult("plan-reply-chain", msgRef);
+    if (refResult.status === "error") return refResult;
     msgRef = refResult.value;
 
     const maxDepth = Math.min(100, Math.max(1, Math.floor(opts?.maxDepth ?? 20)));
@@ -1353,11 +1623,13 @@ export class DiscordAdapter implements SurfaceAdapter {
       if (seen.has(key)) break;
       seen.add(key);
 
-      const rel = await this.ensureMessageRelation({
+      const relation = await this.ensureMessageRelation("plan-reply-chain", {
         platform: "discord",
         channelId: currentChannelId,
         messageId: currentMessageId,
       });
+      if (relation.status === "error") return relation;
+      const rel = relation.value;
 
       if (!rel) {
         if (depth === 0) {
@@ -1378,29 +1650,40 @@ export class DiscordAdapter implements SurfaceAdapter {
 
       if (!rel.reply_to_message_id) break;
 
-      currentChannelId = rel.reply_to_channel_id ?? rel.channel_id;
+      const replyChannelId = rel.reply_to_channel_id ?? rel.channel_id;
+      if (replyChannelId !== msgRef.channelId) break;
+      currentChannelId = replyChannelId;
       currentMessageId = rel.reply_to_message_id;
     }
 
     out.reverse();
-    return out;
+    return Result.ok(out);
   }
 
   async planMergeBlockEndingAt(
     msgRef: MsgRef,
     opts?: SurfaceMergeBlockPlanOptions,
-  ): Promise<readonly MsgRef[]> {
-    const refResult = discordMsgRefResult(msgRef);
-    if (refResult.status === "error") return signalSurfaceFailure(refResult.error);
+  ): Promise<SurfaceOperationResult<readonly MsgRef[]>> {
+    const refResult = discordMsgRefResult("plan-merge-block", msgRef);
+    if (refResult.status === "error") return refResult;
     msgRef = refResult.value;
 
     const lookbackLimit = Math.min(200, Math.max(5, Math.floor(opts?.lookbackLimit ?? 50)));
 
+    const relationResult = await this.ensureMessageRelation("plan-merge-block", msgRef);
+    if (relationResult.status === "error") return relationResult;
+    const relation = relationResult.value;
+    if (!relation) return Result.ok([msgRef]);
     const store = this.store;
-    if (!store) return [msgRef];
-
-    const relation = await this.ensureMessageRelation(msgRef);
-    if (!relation) return [msgRef];
+    if (!store) {
+      return Result.err(
+        new SurfaceUnavailable({
+          platform: "discord",
+          operation: "plan-merge-block",
+          message: "DiscordAdapter not connected",
+        }),
+      );
+    }
 
     const list = store.listMessageRelationsBeforeOrAt({
       channelId: relation.channel_id,
@@ -1410,13 +1693,13 @@ export class DiscordAdapter implements SurfaceAdapter {
 
     const targetIndex = list.findIndex((m) => m.message_id === relation.message_id);
     if (targetIndex < 0) {
-      return [
+      return Result.ok([
         {
           platform: "discord",
           channelId: relation.channel_id,
           messageId: relation.message_id,
         },
-      ];
+      ]);
     }
 
     const authorId = list[targetIndex]!.author_id;
@@ -1440,129 +1723,199 @@ export class DiscordAdapter implements SurfaceAdapter {
 
     const endingGroup = groups[groups.length - 1] ?? [];
     if (endingGroup.length === 0) {
-      return [
+      return Result.ok([
         {
           platform: "discord",
           channelId: relation.channel_id,
           messageId: relation.message_id,
         },
-      ];
+      ]);
     }
 
-    return endingGroup.map((item) => ({
-      platform: "discord",
-      channelId: item.message.channel_id,
-      messageId: item.message.message_id,
-    }));
-  }
-
-  async addReaction(msgRef: MsgRef, reaction: string): Promise<void> {
-    const clientResult = this.clientResult();
-    if (clientResult.status === "error") return signalSurfaceFailure(clientResult.error);
-    const refResult = discordMsgRefResult(msgRef);
-    if (refResult.status === "error") return signalSurfaceFailure(refResult.error);
-    const client = clientResult.value;
-    const discordRef = refResult.value;
-
-    const fetched = await Result.tryPromise({
-      try: () => client.channels.fetch(discordRef.channelId),
-      catch: surfaceExternalFallback(null),
-    });
-    const channel = fetched.status === "ok" ? fetched.value : null;
-    if (!channel || !("messages" in channel) || !channel.messages?.fetch) {
-      return signalSurfaceFailure(
-        new DiscordChannelUnavailable({
-          channelId: discordRef.channelId,
-          message: `Discord channel not found: ${discordRef.channelId}`,
-        }),
-      );
-    }
-    const message = await Result.tryPromise({
-      try: () =>
-        channel.messages.fetch({
-          message: discordRef.messageId,
-          cache: false,
-          force: true,
-        }),
-      catch: surfaceExternalFallback(externalCallFailure("channel.messages.fetch")),
-    });
-    if (message.status === "error") return signalSurfaceFailure(message.error);
-    const reacted = await Result.tryPromise({
-      try: () => message.value.react(reaction),
-      catch: surfaceExternalFallback(externalCallFailure("message.react")),
-    });
-    if (reacted.status === "error") return signalSurfaceFailure(reacted.error);
-  }
-
-  async removeReaction(msgRef: MsgRef, reaction: string): Promise<void> {
-    const clientResult = this.clientResult();
-    if (clientResult.status === "error") return signalSurfaceFailure(clientResult.error);
-    const refResult = discordMsgRefResult(msgRef);
-    if (refResult.status === "error") return signalSurfaceFailure(refResult.error);
-    const client = clientResult.value;
-    const discordRef = refResult.value;
-
-    const fetched = await Result.tryPromise({
-      try: () => client.channels.fetch(discordRef.channelId),
-      catch: surfaceExternalFallback(null),
-    });
-    const channel = fetched.status === "ok" ? fetched.value : null;
-    if (!channel || !("messages" in channel) || !channel.messages?.fetch) {
-      return signalSurfaceFailure(
-        new DiscordChannelUnavailable({
-          channelId: discordRef.channelId,
-          message: `Discord channel not found: ${discordRef.channelId}`,
-        }),
-      );
-    }
-    const message = await Result.tryPromise({
-      try: () =>
-        channel.messages.fetch({
-          message: discordRef.messageId,
-          cache: false,
-          force: true,
-        }),
-      catch: surfaceExternalFallback(externalCallFailure("channel.messages.fetch")),
-    });
-    if (message.status === "error") return signalSurfaceFailure(message.error);
-    const resolvedReaction = message.value.reactions.resolve(reaction);
-    if (!resolvedReaction) return;
-    const removed = await Result.tryPromise({
-      try: () => resolvedReaction.remove(),
-      catch: surfaceExternalFallback(externalCallFailure("reaction.remove")),
-    });
-    if (removed.status === "error") return signalSurfaceFailure(removed.error);
-  }
-
-  async listReactions(msgRef: MsgRef): Promise<string[]> {
-    const refResult = discordMsgRefResult(msgRef);
-    if (refResult.status === "error") return signalSurfaceFailure(refResult.error);
-    const discordRef = refResult.value;
-
-    const msg = await this.fetchDiscordMessage({
-      channelId: discordRef.channelId,
-      messageId: discordRef.messageId,
-    });
-    if (!msg) return [];
-
-    return [...new Set([...msg.reactions.cache.values()].map((r) => r.emoji.toString()))].sort(
-      (a, b) => a.localeCompare(b),
+    return Result.ok(
+      endingGroup.map((item) => ({
+        platform: "discord",
+        channelId: item.message.channel_id,
+        messageId: item.message.message_id,
+      })),
     );
   }
 
-  async listReactionDetails(msgRef: MsgRef): Promise<SurfaceReactionDetail[]> {
-    const refResult = discordMsgRefResult(msgRef);
-    if (refResult.status === "error") return signalSurfaceFailure(refResult.error);
+  async addReaction(msgRef: MsgRef, reaction: string): Promise<SurfaceOperationResult<void>> {
+    const refResult = discordMsgRefResult("add-reaction", msgRef);
+    if (refResult.status === "error") return refResult;
+    if (!reaction.trim()) {
+      return Result.err(
+        new SurfaceInvalidInput({
+          platform: "discord",
+          operation: "add-reaction",
+          field: "reaction",
+          message: "Reaction is required",
+        }),
+      );
+    }
+    const clientResult = this.clientResult();
+    if (clientResult.status === "error") {
+      return Result.err(
+        new SurfaceUnavailable({
+          platform: "discord",
+          operation: "add-reaction",
+          message: clientResult.error.message,
+        }),
+      );
+    }
+    const client = clientResult.value;
+    const discordRef = refResult.value;
+
+    const fetched = await captureDiscordOperation("add-reaction", () =>
+      client.channels.fetch(discordRef.channelId),
+    );
+    if (fetched.status === "error") return fetched;
+    const channel = fetched.value;
+    if (!channel || !("messages" in channel) || !channel.messages?.fetch) {
+      return Result.err(
+        new SurfaceMessageNotFound({
+          platform: "discord",
+          operation: "add-reaction",
+          message: `Discord channel not found: ${discordRef.channelId}`,
+        }),
+      );
+    }
+    const message = await captureDiscordOperation("add-reaction", () =>
+      channel.messages.fetch({
+        message: discordRef.messageId,
+        cache: false,
+        force: true,
+      }),
+    );
+    if (message.status === "error") return message;
+    const reacted = await captureDiscordOperation("add-reaction", () =>
+      message.value.react(reaction),
+    );
+    return reacted.status === "error" ? reacted : Result.ok(undefined);
+  }
+
+  async removeReaction(msgRef: MsgRef, reaction: string): Promise<SurfaceOperationResult<void>> {
+    const refResult = discordMsgRefResult("remove-reaction", msgRef);
+    if (refResult.status === "error") return refResult;
+    if (!reaction.trim()) {
+      return Result.err(
+        new SurfaceInvalidInput({
+          platform: "discord",
+          operation: "remove-reaction",
+          field: "reaction",
+          message: "Reaction is required",
+        }),
+      );
+    }
+    const clientResult = this.clientResult();
+    if (clientResult.status === "error") {
+      return Result.err(
+        new SurfaceUnavailable({
+          platform: "discord",
+          operation: "remove-reaction",
+          message: clientResult.error.message,
+        }),
+      );
+    }
+    const client = clientResult.value;
+    const discordRef = refResult.value;
+
+    const fetched = await captureDiscordOperation("remove-reaction", () =>
+      client.channels.fetch(discordRef.channelId),
+    );
+    if (fetched.status === "error") return fetched;
+    const channel = fetched.value;
+    if (!channel || !("messages" in channel) || !channel.messages?.fetch) {
+      return Result.err(
+        new SurfaceMessageNotFound({
+          platform: "discord",
+          operation: "remove-reaction",
+          message: `Discord channel not found: ${discordRef.channelId}`,
+        }),
+      );
+    }
+    const message = await captureDiscordOperation("remove-reaction", () =>
+      channel.messages.fetch({
+        message: discordRef.messageId,
+        cache: false,
+        force: true,
+      }),
+    );
+    if (message.status === "error") return message;
+    const resolvedReaction = message.value.reactions.resolve(reaction);
+    if (!resolvedReaction) return Result.ok(undefined);
+    const removed = await captureDiscordOperation("remove-reaction", () =>
+      resolvedReaction.remove(),
+    );
+    return removed.status === "error" ? removed : Result.ok(undefined);
+  }
+
+  async listReactions(msgRef: MsgRef): Promise<SurfaceOperationResult<string[]>> {
+    const refResult = discordMsgRefResult("list-reactions", msgRef);
+    if (refResult.status === "error") return refResult;
+    const discordRef = refResult.value;
+
+    const fetched = await captureDiscordOperation("list-reactions", () =>
+      this.fetchDiscordMessage({
+        channelId: discordRef.channelId,
+        messageId: discordRef.messageId,
+      }),
+    );
+    if (fetched.status === "error") return fetched;
+    const msg = fetched.value;
+    if (!msg) {
+      return Result.err(
+        new SurfaceMessageNotFound({
+          platform: "discord",
+          operation: "list-reactions",
+          message: `Discord message not found: ${discordRef.messageId}`,
+        }),
+      );
+    }
+
+    return Result.ok(
+      [...new Set([...msg.reactions.cache.values()].map((r) => r.emoji.toString()))].sort((a, b) =>
+        a.localeCompare(b),
+      ),
+    );
+  }
+
+  async listReactionDetails(
+    msgRef: MsgRef,
+  ): Promise<SurfaceOperationResult<SurfaceReactionDetail[]>> {
+    const refResult = discordMsgRefResult("list-reaction-details", msgRef);
+    if (refResult.status === "error") return refResult;
     const storeResult = this.storeResult();
-    if (storeResult.status === "error") return signalSurfaceFailure(storeResult.error);
+    if (storeResult.status === "error") {
+      return Result.err(
+        new SurfaceUnavailable({
+          platform: "discord",
+          operation: "list-reaction-details",
+          message: storeResult.error.message,
+        }),
+      );
+    }
     const discordRef = refResult.value;
     const store = storeResult.value;
 
-    const msg = await this.fetchDiscordMessage({
-      channelId: discordRef.channelId,
-      messageId: discordRef.messageId,
-    });
-    if (!msg) return [];
+    const fetched = await captureDiscordOperation("list-reaction-details", () =>
+      this.fetchDiscordMessage({
+        channelId: discordRef.channelId,
+        messageId: discordRef.messageId,
+      }),
+    );
+    if (fetched.status === "error") return fetched;
+    const msg = fetched.value;
+    if (!msg) {
+      return Result.err(
+        new SurfaceMessageNotFound({
+          platform: "discord",
+          operation: "list-reaction-details",
+          message: `Discord message not found: ${discordRef.messageId}`,
+        }),
+      );
+    }
 
     const now = Date.now();
 
@@ -1572,11 +1925,12 @@ export class DiscordAdapter implements SurfaceAdapter {
     for (const reaction of reactions) {
       const emoji = reaction.emoji.toString();
 
-      const users = await this.fetchAllReactionUsers(reaction, {
+      const users = await this.fetchAllReactionUsers("list-reaction-details", reaction, {
         maxUsers: 1000,
       });
+      if (users.status === "error") return users;
 
-      const list = [...users.values()]
+      const list = [...users.value.values()]
         .map((u) => {
           const cached = store.getUserName(u.id);
           const cachedName =
@@ -1609,33 +1963,43 @@ export class DiscordAdapter implements SurfaceAdapter {
       return a.emoji.localeCompare(b.emoji);
     });
 
-    return out;
+    return Result.ok(out);
   }
 
   async listSessionParticipants(
     sessionRef: SessionRef,
     opts?: { limit?: number },
-  ): Promise<SurfaceSessionParticipantsResult> {
-    const refResult = discordSessionRefResult(sessionRef);
-    if (refResult.status === "error") return signalSurfaceFailure(refResult.error);
+  ): Promise<SurfaceOperationResult<SurfaceSessionParticipantsResult>> {
+    const refResult = discordSessionRefResult("list-session-participants", sessionRef);
+    if (refResult.status === "error") return refResult;
     const discordRef = refResult.value;
 
     const cfg = this.cfg;
     const client = this.client;
     const store = this.store;
     if (!cfg || !client || !store) {
-      return signalSurfaceFailure(
-        new DiscordAdapterUnavailable({ message: "DiscordAdapter not connected" }),
+      return Result.err(
+        new SurfaceUnavailable({
+          platform: "discord",
+          operation: "list-session-participants",
+          message: "DiscordAdapter not connected",
+        }),
       );
     }
 
-    const fetched = await Result.tryPromise({
-      try: () => client.channels.fetch(discordRef.channelId),
-      catch: surfaceExternalFallback(null),
-    });
-    const ch = fetched.status === "ok" ? fetched.value : null;
+    const fetched = await captureDiscordOperation("list-session-participants", () =>
+      client.channels.fetch(discordRef.channelId),
+    );
+    if (fetched.status === "error") return fetched;
+    const ch = fetched.value;
     if (!ch) {
-      return { source: "guild_members", participants: [] };
+      return Result.err(
+        new SurfaceMessageNotFound({
+          platform: "discord",
+          operation: "list-session-participants",
+          message: `Discord channel not found: ${discordRef.channelId}`,
+        }),
+      );
     }
 
     const guildId = "guildId" in ch ? ch.guildId : null;
@@ -1646,9 +2010,10 @@ export class DiscordAdapter implements SurfaceAdapter {
         guildId,
       })
     ) {
-      return signalSurfaceFailure(
-        new DiscordChannelUnavailable({
-          channelId: discordRef.channelId,
+      return Result.err(
+        new SurfacePermissionDenied({
+          platform: "discord",
+          operation: "list-session-participants",
           message: `Not allowed: channelId '${discordRef.channelId}'`,
         }),
       );
@@ -1661,18 +2026,17 @@ export class DiscordAdapter implements SurfaceAdapter {
       let after: string | undefined;
       while (out.length < limit) {
         const pageLimit = Math.min(100, limit - out.length);
-        const fetchedMembers = await Result.tryPromise({
-          try: () =>
-            ch.members.fetch({
-              withMember: true,
-              limit: pageLimit,
-              ...(after ? { after } : {}),
-              cache: false,
-            }),
-          catch: surfaceExternalFallback(null),
-        });
-        const members = fetchedMembers.status === "ok" ? fetchedMembers.value : null;
-        if (!members || members.size === 0) break;
+        const fetchedMembers = await captureDiscordOperation("list-session-participants", () =>
+          ch.members.fetch({
+            withMember: true,
+            limit: pageLimit,
+            ...(after ? { after } : {}),
+            cache: false,
+          }),
+        );
+        if (fetchedMembers.status === "error") return fetchedMembers;
+        const members = fetchedMembers.value;
+        if (members.size === 0) break;
 
         for (const threadMember of members.values()) {
           if (out.length >= limit) break;
@@ -1696,15 +2060,15 @@ export class DiscordAdapter implements SurfaceAdapter {
         if (!after || members.size < pageLimit) break;
       }
 
-      return {
+      return Result.ok({
         source: "thread_members",
         participants: sortSurfaceParticipants(out),
-      };
+      });
     }
 
     const guild = "guild" in ch ? ch.guild : null;
     if (!guild) {
-      return { source: "guild_members", participants: [] };
+      return Result.ok({ source: "guild_members", participants: [] });
     }
 
     const out: SurfaceSessionParticipant[] = [];
@@ -1715,17 +2079,11 @@ export class DiscordAdapter implements SurfaceAdapter {
 
     while (out.length < limit) {
       const pageLimit = Math.min(1000, Math.max(1, limit - out.length));
-      const listed = await Result.tryPromise({
-        try: () =>
-          guild.members.list({ limit: pageLimit, ...(after ? { after } : {}), cache: false }),
-        catch: surfaceExternalFallback(null),
-      });
-      const page = listed.status === "ok" ? listed.value : null;
-
-      if (!page) {
-        exhausted = true;
-        break;
-      }
+      const listed = await captureDiscordOperation("list-session-participants", () =>
+        guild.members.list({ limit: pageLimit, ...(after ? { after } : {}), cache: false }),
+      );
+      if (listed.status === "error") return listed;
+      const page = listed.value;
 
       if (page.size === 0) {
         exhausted = true;
@@ -1786,10 +2144,10 @@ export class DiscordAdapter implements SurfaceAdapter {
       }
     }
 
-    return {
+    return Result.ok({
       source: "guild_members",
       participants: sortSurfaceParticipants(out),
-    };
+    });
   }
 
   private toSurfaceSessionParticipant(input: {
@@ -1836,21 +2194,22 @@ export class DiscordAdapter implements SurfaceAdapter {
   }
 
   private async fetchAllReactionUsers(
+    operation: SurfaceOperation,
     reaction: MessageReaction,
     opts: { maxUsers: number },
-  ): Promise<Map<string, User>> {
+  ): Promise<SurfaceOperationResult<Map<string, User>>> {
     const out = new Map<string, User>();
 
     const pageLimit = 100;
     let after: string | undefined;
 
     while (out.size < opts.maxUsers) {
-      const fetched = await Result.tryPromise({
-        try: () => reaction.users.fetch({ limit: pageLimit, ...(after ? { after } : {}) }),
-        catch: surfaceExternalFallback(null),
-      });
-      const res = fetched.status === "ok" ? fetched.value : null;
-      if (!res || res.size === 0) break;
+      const fetched = await captureDiscordOperation(operation, () =>
+        reaction.users.fetch({ limit: pageLimit, ...(after ? { after } : {}) }),
+      );
+      if (fetched.status === "error") return fetched;
+      const res = fetched.value;
+      if (res.size === 0) break;
 
       for (const u of res.values()) {
         out.set(u.id, u);
@@ -1866,7 +2225,7 @@ export class DiscordAdapter implements SurfaceAdapter {
       }
     }
 
-    return out;
+    return Result.ok(out);
   }
 
   async subscribe(handler: AdapterEventHandler): Promise<AdapterSubscription> {
@@ -1878,11 +2237,19 @@ export class DiscordAdapter implements SurfaceAdapter {
     };
   }
 
-  async getUnRead(sessionRef: SessionRef): Promise<SurfaceMessage[]> {
+  async getUnRead(sessionRef: SessionRef): Promise<SurfaceOperationResult<SurfaceMessage[]>> {
+    const refResult = discordSessionRefResult("get-unread", sessionRef);
+    if (refResult.status === "error") return refResult;
     const storeResult = this.storeResult();
-    if (storeResult.status === "error") return signalSurfaceFailure(storeResult.error);
-    const refResult = discordSessionRefResult(sessionRef);
-    if (refResult.status === "error") return signalSurfaceFailure(refResult.error);
+    if (storeResult.status === "error") {
+      return Result.err(
+        new SurfaceUnavailable({
+          platform: "discord",
+          operation: "get-unread",
+          message: storeResult.error.message,
+        }),
+      );
+    }
     const store = storeResult.value;
     const discordRef = refResult.value;
 
@@ -1890,8 +2257,9 @@ export class DiscordAdapter implements SurfaceAdapter {
 
     // Best-effort: fetch a recent window and filter locally.
     const recent = await this.listMsg(sessionRef, { limit: 100 });
+    if (recent.status === "error") return recent;
 
-    const unread = recent.filter((m) => {
+    const unread = recent.value.filter((m) => {
       if (m.deleted) return false;
       if (m.ts > rs.last_read_ts) return true;
       if (m.ts < rs.last_read_ts) return false;
@@ -1903,44 +2271,79 @@ export class DiscordAdapter implements SurfaceAdapter {
       return compareDiscordSnowflake(a.ref.messageId, b.ref.messageId);
     });
 
-    return unread;
+    return Result.ok(unread);
   }
 
-  async markRead(sessionRef: SessionRef, upToMsgRef?: MsgRef): Promise<void> {
-    const storeResult = this.storeResult();
-    if (storeResult.status === "error") return signalSurfaceFailure(storeResult.error);
-    const refResult = discordSessionRefResult(sessionRef);
-    if (refResult.status === "error") return signalSurfaceFailure(refResult.error);
-    const store = storeResult.value;
+  async markRead(
+    sessionRef: SessionRef,
+    upToMsgRef?: MsgRef,
+  ): Promise<SurfaceOperationResult<void>> {
+    const refResult = discordSessionRefResult("mark-read", sessionRef);
+    if (refResult.status === "error") return refResult;
     const discordRef = refResult.value;
-
+    let discordUpToRef: DiscordMsgRef | undefined;
     if (upToMsgRef) {
-      const upToResult = discordMsgRefResult(upToMsgRef);
-      if (upToResult.status === "error") return signalSurfaceFailure(upToResult.error);
-      const discordUpToRef = upToResult.value;
-
-      const msg = await this.fetchDiscordMessage({
-        channelId: discordUpToRef.channelId,
-        messageId: discordUpToRef.messageId,
+      const upToResult = discordNestedMsgRefResult({
+        operation: "mark-read",
+        sessionRef: discordRef,
+        msgRef: upToMsgRef,
+        refRole: "upToMsgRef",
       });
+      if (upToResult.status === "error") return upToResult;
+      discordUpToRef = upToResult.value;
+    }
+    const storeResult = this.storeResult();
+    if (storeResult.status === "error") {
+      return Result.err(
+        new SurfaceUnavailable({
+          platform: "discord",
+          operation: "mark-read",
+          message: storeResult.error.message,
+        }),
+      );
+    }
+    const store = storeResult.value;
 
-      if (!msg) return;
+    if (discordUpToRef) {
+      const fetched = await captureDiscordOperation("mark-read", () =>
+        this.fetchDiscordMessage({
+          channelId: discordUpToRef.channelId,
+          messageId: discordUpToRef.messageId,
+        }),
+      );
+      if (fetched.status === "error") return fetched;
+      const msg = fetched.value;
+
+      if (!msg) {
+        return Result.err(
+          new SurfaceMessageNotFound({
+            platform: "discord",
+            operation: "mark-read",
+            message: `Discord message not found: ${discordUpToRef.messageId}`,
+          }),
+        );
+      }
 
       store.setReadState({
         channelId: discordRef.channelId,
         lastReadTs: getMessageTs(msg),
         lastReadMessageId: msg.id,
       });
-      return;
+      return Result.ok(undefined);
     }
 
-    const latest = await this.fetchLatestDiscordMessage(discordRef.channelId);
-    if (!latest) return;
+    const fetchedLatest = await captureDiscordOperation("mark-read", () =>
+      this.fetchLatestDiscordMessage(discordRef.channelId),
+    );
+    if (fetchedLatest.status === "error") return fetchedLatest;
+    const latest = fetchedLatest.value;
+    if (!latest) return Result.ok(undefined);
     store.setReadState({
       channelId: discordRef.channelId,
       lastReadTs: getMessageTs(latest),
       lastReadMessageId: latest.id,
     });
+    return Result.ok(undefined);
   }
 
   // --- internals ---
@@ -1955,21 +2358,40 @@ export class DiscordAdapter implements SurfaceAdapter {
     return Result.err(new DiscordAdapterUnavailable({ message: "DiscordAdapter not connected" }));
   }
 
-  private async ensureMessageRelation(msgRef: MsgRef) {
-    if (msgRef.platform !== "discord") return null;
+  private async ensureMessageRelation(
+    operation: "plan-reply-chain" | "plan-merge-block",
+    msgRef: MsgRef,
+  ): Promise<SurfaceOperationResult<DbDiscordMessageRelation | null>> {
+    if (msgRef.platform !== "discord") {
+      return Result.err(
+        new SurfacePlatformMismatch({
+          operation,
+          refRole: "msgRef",
+          expectedPlatform: "discord",
+          receivedPlatform: msgRef.platform,
+          message: `Expected a Discord msgRef, received '${msgRef.platform}'`,
+        }),
+      );
+    }
 
     const store = this.store;
-    if (!store) return null;
+    if (!store) {
+      return Result.err(
+        new SurfaceUnavailable({
+          platform: "discord",
+          operation,
+          message: "DiscordAdapter not connected",
+        }),
+      );
+    }
 
     const existing = store.getMessageRelation(msgRef.channelId, msgRef.messageId);
-    if (existing) return existing;
+    if (existing) return Result.ok(existing);
 
-    await Result.tryPromise({
-      try: () => this.readMsg(msgRef),
-      catch: surfaceExternalFallback(null),
-    });
+    const read = await this.readMsg(msgRef);
+    if (read.status === "error") return read;
 
-    return store.getMessageRelation(msgRef.channelId, msgRef.messageId);
+    return Result.ok(store.getMessageRelation(msgRef.channelId, msgRef.messageId));
   }
 
   private noteGatewayEvent(_event: string) {
@@ -2698,40 +3120,27 @@ export class DiscordAdapter implements SurfaceAdapter {
     const cfg = this.cfg;
     const client = this.client;
     if (!cfg || !client) {
-      return signalSurfaceFailure(
-        new DiscordAdapterUnavailable({ message: "Discord adapter is not connected" }),
-      );
+      throw new DiscordAdapterUnavailable({ message: "Discord adapter is not connected" });
     }
 
-    const fetchedChannel = await client.channels
-      .fetch(input.channelId)
-      .then((channel) => Result.ok(channel))
-      .catch((error: unknown) => {
-        if (Panic.is(error)) return Promise.reject(error);
-        return discordNotFoundCode(error) !== null
-          ? Result.ok(null)
-          : Result.err(externalCallFailure("client.channels.fetch"));
-      });
-    if (fetchedChannel.status === "error") {
-      return signalSurfaceFailure(fetchedChannel.error);
+    let ch;
+    try {
+      ch = await client.channels.fetch(input.channelId);
+    } catch (cause) {
+      if (Panic.is(cause)) throw cause;
+      if (discordNotFoundCode(cause) !== null) return null;
+      throw cause;
     }
-    const ch = fetchedChannel.value;
     if (!ch || !("messages" in ch) || !ch.messages?.fetch) return null;
 
-    const fetchedMessage = await ch.messages
-      .fetch({ message: input.messageId, cache: false, force: true })
-      .then((message) => Result.ok(message))
-      .catch((error: unknown) => {
-        if (Panic.is(error)) return Promise.reject(error);
-        return discordNotFoundCode(error) !== null
-          ? Result.ok(null)
-          : Result.err(externalCallFailure("channel.messages.fetch"));
-      });
-    if (fetchedMessage.status === "error") {
-      return signalSurfaceFailure(fetchedMessage.error);
+    let msg;
+    try {
+      msg = await ch.messages.fetch({ message: input.messageId, cache: false, force: true });
+    } catch (cause) {
+      if (Panic.is(cause)) throw cause;
+      if (discordNotFoundCode(cause) !== null) return null;
+      throw cause;
     }
-    const msg = fetchedMessage.value;
-    if (!msg) return null;
 
     if (
       !shouldAllowMessage({
@@ -2760,13 +3169,11 @@ export class DiscordAdapter implements SurfaceAdapter {
   }): Promise<Message[]> {
     const cfg = this.cfg;
     const client = this.client;
-    if (!cfg || !client) return [];
+    if (!cfg || !client) {
+      throw new DiscordAdapterUnavailable({ message: "Discord adapter is not connected" });
+    }
 
-    const fetchedChannel = await Result.tryPromise({
-      try: () => client.channels.fetch(input.channelId),
-      catch: surfaceExternalFallback(null),
-    });
-    const ch = fetchedChannel.status === "ok" ? fetchedChannel.value : null;
+    const ch = await client.channels.fetch(input.channelId);
     if (!ch || !("messages" in ch) || !ch.messages?.fetch) return [];
 
     // Allowlist is channel/guild scoped; for list operations the channel is authoritative.
@@ -2780,31 +3187,21 @@ export class DiscordAdapter implements SurfaceAdapter {
 
     // `around` and `after` are not paged (Discord API caps at 100 anyway).
     if (input.aroundMessageId) {
-      const fetched = await Result.tryPromise({
-        try: () =>
-          ch.messages.fetch({
-            limit: Math.min(100, limit),
-            around: input.aroundMessageId,
-            cache: false,
-          }),
-        catch: surfaceExternalFallback(null),
+      const res = await ch.messages.fetch({
+        limit: Math.min(100, limit),
+        around: input.aroundMessageId,
+        cache: false,
       });
-      const res = fetched.status === "ok" ? fetched.value : null;
-      return res ? [...res.values()] : [];
+      return [...res.values()];
     }
 
     if (input.afterMessageId) {
-      const fetched = await Result.tryPromise({
-        try: () =>
-          ch.messages.fetch({
-            limit: Math.min(100, limit),
-            after: input.afterMessageId,
-            cache: false,
-          }),
-        catch: surfaceExternalFallback(null),
+      const res = await ch.messages.fetch({
+        limit: Math.min(100, limit),
+        after: input.afterMessageId,
+        cache: false,
       });
-      const res = fetched.status === "ok" ? fetched.value : null;
-      return res ? [...res.values()] : [];
+      return [...res.values()];
     }
 
     // Default / before-cursor: page backwards using `before`.
@@ -2813,17 +3210,11 @@ export class DiscordAdapter implements SurfaceAdapter {
 
     while (out.length < limit) {
       const pageSize = Math.min(100, limit - out.length);
-      const fetched = await Result.tryPromise({
-        try: () =>
-          ch.messages.fetch({
-            limit: pageSize,
-            before,
-            cache: false,
-          }),
-        catch: surfaceExternalFallback(null),
+      const res = await ch.messages.fetch({
+        limit: pageSize,
+        before,
+        cache: false,
       });
-      const res = fetched.status === "ok" ? fetched.value : null;
-      if (!res) break;
 
       const page = [...res.values()];
       if (page.length === 0) break;
@@ -3457,103 +3848,4 @@ export class DiscordAdapter implements SurfaceAdapter {
       raw: { discord: { reaction } },
     });
   }
-}
-
-// --- Bus mapping helpers (used by bridge) ---
-
-export function toBusEvtAdapterMessageCreated(evt: {
-  message: SurfaceMessage;
-  channelName?: string;
-}): EvtAdapterMessageCreatedData {
-  return {
-    platform: "discord",
-    channelId: evt.message.session.channelId,
-    channelName: evt.channelName,
-    messageId: evt.message.ref.messageId,
-    userId: evt.message.userId,
-    userName: evt.message.userName,
-    text: evt.message.text,
-    ts: evt.message.ts,
-    raw: evt.message.raw,
-  };
-}
-
-export function toBusEvtAdapterMessageUpdated(evt: {
-  message: SurfaceMessage;
-  channelName?: string;
-}): EvtAdapterMessageUpdatedData {
-  return {
-    platform: "discord",
-    channelId: evt.message.session.channelId,
-    channelName: evt.channelName,
-    messageId: evt.message.ref.messageId,
-    userId: evt.message.userId,
-    userName: evt.message.userName,
-    text: evt.message.text,
-    ts: evt.message.ts,
-    raw: evt.message.raw,
-  };
-}
-
-export function toBusEvtAdapterMessageDeleted(evt: {
-  messageRef: MsgRef;
-  session: SessionRef;
-  channelName?: string;
-  ts: number;
-  raw?: unknown;
-}): EvtAdapterMessageDeletedData {
-  return {
-    platform: "discord",
-    channelId: evt.session.channelId,
-    channelName: evt.channelName,
-    messageId: evt.messageRef.messageId,
-    ts: evt.ts,
-    raw: evt.raw,
-  };
-}
-
-export function toBusEvtAdapterReactionAdded(evt: {
-  messageRef: MsgRef;
-  session: SessionRef;
-  channelName?: string;
-  reaction: string;
-  userId?: string;
-  userName?: string;
-  ts: number;
-  raw?: unknown;
-}): EvtAdapterReactionAddedData {
-  return {
-    platform: "discord",
-    channelId: evt.session.channelId,
-    channelName: evt.channelName,
-    messageId: evt.messageRef.messageId,
-    reaction: evt.reaction,
-    userId: evt.userId,
-    userName: evt.userName,
-    ts: evt.ts,
-    raw: evt.raw,
-  };
-}
-
-export function toBusEvtAdapterReactionRemoved(evt: {
-  messageRef: MsgRef;
-  session: SessionRef;
-  channelName?: string;
-  reaction: string;
-  userId?: string;
-  userName?: string;
-  ts: number;
-  raw?: unknown;
-}): EvtAdapterReactionRemovedData {
-  return {
-    platform: "discord",
-    channelId: evt.session.channelId,
-    channelName: evt.channelName,
-    messageId: evt.messageRef.messageId,
-    reaction: evt.reaction,
-    userId: evt.userId,
-    userName: evt.userName,
-    ts: evt.ts,
-    raw: evt.raw,
-  };
 }

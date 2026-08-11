@@ -1,328 +1,44 @@
-# AGENTS.md
-
-## Quick Repo Facts
-
-- Use `bun`
-- Monorepo: **Bun workspaces** (`apps/*`, `packages/*`).
-- Markdown plans/todos in `plan/*`.
-- Project mental model / terminology: search `PROJECT.md`.
-- `ref/` contains vendored/reference projects. Treat as read-only references.
-- Treat private internal APIs as greenfield and generally free to break. Preserve existing wire, persisted-data, filesystem-tool, and plugin contracts unless a separate compatibility change is explicitly approved.
-
-## Finding Type Definitions (Bun + symlinks)
-
-This repo uses Bun's install layout. Many packages in `apps/*/node_modules` are symlinks into Bun's cache under `node_modules/.bun/...`. If you can't find a type definition by searching the workspace `node_modules`, follow the symlink and then follow `package.json` `exports`/`types`. Always use `ls -al` because the `grep`, `glob` don't work on ignored files and dot-dirs.
-
-## Build / Test / Typecheck
-
-### Build
-
-- `apps/core`: `cd apps/core && bun run build:remote-runner` (`bun run test` builds this automatically for the remote-runner parity test)
-- `apps/tool-bridge`: `cd apps/tool-bridge && bun run build`
-- `apps/acp-controller`: `cd apps/acp-controller && bun run build` (`lilac-acp`)
-
-### Testing (Bun)
-
-Tests use Bun’s built-in runner + `bun:test`.
-
-- Every newly added workspace package under `apps/*` or `packages/*` must define a `test` script in its `package.json`.
-- Tests that intentionally trigger errors or warnings must suppress the expected console/logger output and restore mocks afterward so test output stays high-signal.
-
-- Run all tests in a package:
-  - `cd apps/core && bun run test`
-  - `cd packages/utils && bun run test`
-  - `cd packages/event-bus && bun run test`
-
-- Run all root and workspace tests from repo root:
-  - `bun run test:all`
-
-- Run a single test file:
-  - `cd apps/core && bun test tests/tools/bash.test.ts`
-  - `cd packages/event-bus && bun test tests/redis-streams-bus.test.ts`
-
-- Run a single test by name (regex):
-  - `cd apps/core && bun test --test-name-pattern "<pattern>"`
-
-### Test timing
-
-- Do not use fixed-time sleeps or waits to synchronize tests. Await the observable operation, resolve a deferred from the callback/event under test, or use an injected/fake clock.
-- Real-time waits are allowed only when elapsed time is itself the behavior under test and a fake clock cannot cover it safely.
-- Every allowed real-time wait must have an immediately preceding, specific justification:
-  - `// test-wait-justification: verifies the real idle deadline while monitoring is paused`
-- Rejection-only timeout guards are allowed because they do not delay the successful path.
-- `lilac/no-fixed-test-wait` enforces this policy through Oxlint for test files. Run its focused tests with `bun run test:lint-rules`.
-
-### Typechecking
-
-- Treat running `tsc` as essential (same tier as running tests).
-- Run all root and workspace typechecks: `bun run typecheck`.
-- Run typecheck in the package you changed:
-  - `cd <package> && bunx tsc -p tsconfig.json --noEmit`
-
-### Lint / Format
-
-This repo uses Oxc tooling and local Oxlint rules at the root:
-
-- Lint: `bun run lint` (`oxlint`, including local rules)
-- Lint fix: `bun run lint:fix` (`oxlint --fix`, including local rules)
-- Format check: `bun run fmt:check` (`oxfmt --check`)
-- Format write: `bun run fmt` (`oxfmt --write`)
-
-Before wrapping up any task that changes code/config/docs, run lint + format checks from repo root at least once as the final validation step:
-
-- `bun run lint:fix`
-- `bun run fmt`
-
-### Architecture enforcement
-
-- `scripts/architecture/manifest.ts` is the catalog of registered boundary decoders, projections, persistence codecs, compatibility outputs, Panic sites, and exception adapters. Use exact `module#exportName` identities for symbol-owned registrations and exact module paths for module registries. Add a reason only when that registration schema requires one; broad module or path exemptions are not accepted.
-- Add or change exception mechanics in the owning workspace's `exceptionAdapters`. The global approval catalog is derived from those registrations; review the derived callable, external API, direction, syntax, provenance, relationship, and reason, then update `APPROVED_EXCEPTION_ADAPTER_CATALOG_SHA256` and focused tests. Do not hand-maintain a second approval entry, and do not treat catalog membership as review of the adapter or external contract.
-- `bun run lint:architecture` runs the semantic checker and production syntax gate. `bun run test:architecture`, `bun run test:lint-rules`, and `bun run typecheck:architecture` cover their fixtures and typechecking. Root `lint`, `test:all`, and `typecheck` include these checks. The permanent gate has no baseline, advisory, inventory-expansion, or migration-status path; fix every finding or add the exact reviewed registration the manifest schema calls for.
-
-## Code Style Guidelines (TypeScript)
-
-### Types (important)
-
-- **No `any`** and **no `as any`**.
-- Prefer unions and discriminated unions for error/results.
-- Prefer `Record<string, T>` to `{ [k: string]: T }`.
-- Prefer `readonly T[]` when you don’t mutate.
-- Use `satisfies` when validating object shapes without widening.
-
-### Trust boundaries and runtime validation
-
-- Keep `unknown` at real trust boundaries. Decode it immediately and return a typed value.
-- Do not accept `unknown` in an internal function merely because its caller received external data. Decode in the caller's boundary adapter and type the internal parameter.
-- Decode again across each process, wire, persistence, plugin, or SDK boundary.
-- Use Zod for rich external structures. Validate the complete envelope and every payload field used after parsing.
-- Do not call `parse` or `safeParse` in ordinary service, domain, orchestration, or render functions. Use a registered boundary decoder, projection, or persistence codec; domain constructors accept typed values.
-- Keep boundary schemas and `z.output` types together. Use `z.input` explicitly when input and output differ.
-- Do not write generic `parseJson<T>` helpers that establish `T` only through an assertion.
-- Persisted-data codecs must explicitly handle valid current data, supported legacy data, unsupported versions, malformed serialization, and corrupt fields.
-
-### Persistence and SQLite
-
-- A persisted codec returns explicit provenance for successful reads: `current`, `migrated`, or `missing-defaulted`. Keep unsupported versions, malformed serialization, and corrupt fields as distinct owned errors; do not collapse these outcomes into absence or a generic parse failure.
-- Reads must not rewrite persisted data as a side effect of decoding or migration. Perform upgrades only through an explicit write or migration operation with its own failure contract.
-- Route Result-returning SQLite transactions through the registered adapter. The raw driver callback returns only the success value and uses the adapter's private rollback sentinel to escape an `Err`; the sentinel must never cross the adapter boundary.
-- In SQLite adapters, preserve `Panic` by exact `Panic.is` classification, map only recognized driver failures through the exact registered classifier, and rethrow every unrecognized exception unchanged.
-- Cleanup failures are expected values: cleanup `Err` wins after successful work, and a domain-owned combined error preserves both failures when work and cleanup fail. A rollback failure that leaves atomicity unknown is a `Panic`.
-- Persist state transitions and their outbox records in the same transaction. Never expose committed state without its corresponding durable publication intent, or publish an outbox record for state that did not commit.
-
-### Presentation boundaries
-
-- Keep third-party and otherwise open protocol values inside one registered adapter. The adapter validates or inspects the external value and returns a closed local projection; renderers and transcript builders accept only that projection.
-- Projection lifecycle unions must represent every supported state explicitly, including pending, active, approval, success, error, denied, and cancelled. Renderers exhaustively switch over those local states without a default arm.
-- Normalize unknown future protocol variants to an explicit bounded fallback such as `unsupported` or `unknown-tool` in the adapter. Do not pass raw payloads, parser functions, decoder functions, or `unknown` into presentation modules.
-- Type-only imports of closed projection contracts are allowed in renderers. Runtime imports or calls of projection/decoder boundaries are not; orchestration invokes the adapter before crossing the renderer API.
-
-```ts
-// Open external protocol edge: raw SDK variants are handled only here.
-function projectExternalChunk(chunk: ExternalUiChunk): ProjectedChunk {
-  switch (chunk.type) {
-    case "text-delta":
-      return { kind: "text", text: chunk.delta };
-    case "tool-output":
-      return { kind: "tool", projection: projectToolObservation(chunk.observation) };
-    default:
-      return { kind: "unsupported", chunkType: boundedChunkType(chunk) };
-  }
-}
-
-// Closed presentation edge: no SDK value, parser, decoder, or unknown payload is reachable.
-function renderProjectedChunk(chunk: ProjectedChunk): RenderEntry | undefined {
-  switch (chunk.kind) {
-    case "text":
-      return { kind: "text", text: chunk.text };
-    case "tool":
-      return renderToolProjection(chunk.projection);
-    case "unsupported":
-      return undefined;
-  }
-}
-```
-
-### Predicates and unions
-
-- Use `isX` for semantic predicates over typed values or exact capability checks.
-- Do not use a partial `isX(value: unknown): value is RichType` guard. Use a complete schema-backed decoder when downstream code relies on a rich structure.
-- For project-owned discriminated unions, prefer direct discriminant checks, exhaustive switches, or precise `Extract`-based predicates.
-- Never add a local `isRecord`; use the centralized utility only for small boundary inspections.
-- Do not write nested ternaries. Extract the decision or use a switch.
-- Treat project-owned unions as closed and handle every member with an exhaustive switch or exhaustive typed map. Do not hide an unhandled member behind a silent `default`, generic fallback, or final ternary arm.
-- Treat third-party/open protocols as open only in their adapter. Normalize unknown variants to an explicit local fallback before internal use.
-
-### Assertions
-
-- Never cast `unknown` to a structured domain type and never use `as unknown as T`.
-- A cast is not a substitute for boundary validation or a typed function signature.
-- Assertions are allowed only for documented representation-preserving bridges where the source is already typed and TypeScript cannot express the relationship.
-- Prefer fixing producer and consumer signatures over adding a cast or guard.
-
-### Imports
-
-- Group imports with blank lines:
-  - External imports
-  - Internal relative imports
-- Prefer named exports over default exports.
-
-### Naming conventions
-
-- Files: `kebab-case.ts`.
-- Functions/variables: `camelCase`.
-- Types/interfaces/classes: `PascalCase`.
-- Constants: `UPPER_SNAKE_CASE`.
-
-### Errors as values
-
-- Return expected failures as `Result<T, E>` or `Promise<Result<T, E>>`; do not throw or reject them.
-- Use `better-result` directly. The root catalog pins the exact version and every importing workspace declares `"better-result": "catalog:"`.
-- Define expected error variants in the owning domain's vocabulary. Prefer `TaggedError` variants with stable `_tag` discriminants over strings or generic `Error`.
-- Instantiate a `TaggedError` and return it with `Result.err`; never throw it.
-- Catch an external exception only in the smallest immediate adapter and map it to a specific typed error. Do not pass `unknown`, `UnhandledException`, SDK errors, or driver errors to consumers.
-- Use `Result.gen` and `Result.await` for multi-step linear workflows. Keep effects in named Result-returning functions and generator bodies declarative.
-- Use direct `result.status` branching for one or two steps. Handle or translate the complete error union at the next policy boundary.
-- Do not use `unwrap`, unsafe Result codecs, or generic `Result.try`/`tryPromise` in production flow.
-- Keep Result callbacks total. Capture throwing or rejecting operations before passing values into combinators, collection helpers, or a Result generator.
-- For a stream that can fail after yielding data, use `AsyncIterable<Result<TChunk, TTerminalError>>`; yield one terminal Err and close rather than rejecting for an expected failure.
-- Use Panic only for an individually registered unrecoverable defect or hard invariant. Never convert a Panic to an ordinary Err.
-- Do not wrap total helpers in Result or flatten meaningful state-machine outcomes such as cancelled, stale, expired, or skipped into generic success/error.
-- Do not serialize `better-result` objects or TaggedErrors onto existing contracts. Map them to the existing wire, storage, tool, or plugin representation at its compatibility adapter.
-- Never pass a TaggedError to implicit `JSON.stringify` or generic structured logging because `toJSON()` includes `cause`. Use `formatTaggedErrorForLog(error)` and log only its redacted projection plus explicitly safe context fields.
-- Avoid leaking secrets in logs; redact tokens and keys when printing command or environment data.
-
-Compact positive patterns:
-
-```ts
-class ConfigMissing extends TaggedError("ConfigMissing")<{
-  readonly configPath: string;
-  readonly message: string;
-}> {}
-
-class ConfigReadFailed extends TaggedError("ConfigReadFailed")<{
-  readonly configPath: string;
-  readonly cause: unknown;
-  readonly message: string;
-}> {}
-
-class ConfigInvalid extends TaggedError("ConfigInvalid")<{
-  readonly message: string;
-}> {}
-
-// Domain failure: construct the owned variant and return it as a value.
-return Result.err(
-  new ConfigMissing({ configPath, message: `Configuration not found at ${configPath}` }),
-);
-
-// Immediate external adapter: preserve Panic and map every other thrown value.
-return Result.tryPromise({
-  try: () => readTextFile(configPath),
-  catch: (cause) => {
-    if (Panic.is(cause)) throw cause;
-    return new ConfigReadFailed({ configPath, cause, message: "Configuration read failed" });
-  },
-});
-
-// One-step flow: better-result 3.0 statuses are "ok" and "error".
-const loaded = await loadConfig(configPath);
-if (loaded.status === "error") return Result.err(loaded.error);
-return Result.ok(loaded.value.endpoint);
-
-// Linear flow: keep effects named and await Result-returning promises explicitly.
-return Result.gen(async function* () {
-  const text = yield* Result.await(readConfigText(configPath));
-  const config = yield* Result.await(decodeConfigText(text));
-  return Result.ok(config.endpoint);
-});
-
-// Policy boundary: map success and every member of the closed error union.
-function toDeliveryDisposition(
-  result: ResultType<Config, ConfigMissing | ConfigReadFailed | ConfigInvalid>,
-): "commit" | "park-pending" | "dead-letter" {
-  if (result.status === "ok") return "commit";
-  switch (result.error._tag) {
-    case "ConfigMissing":
-    case "ConfigReadFailed":
-      return "park-pending";
-    case "ConfigInvalid":
-      return "dead-letter";
-  }
-}
-
-// Logging boundary: pass only the redacted projection and approved context.
-logger.warn("Configuration load failed", {
-  configPath,
-  ...formatTaggedErrorForLog(configError),
-});
-```
-
-### Framework edges
-
-- `try/finally` is allowed for cleanup; catch clauses are restricted to registered adapters and defect supervisors.
-- A result-to-framework adapter may signal an exception only when the host contract requires rollback, delivery parking, stream termination, or callback failure.
-- SQLite transaction bodies must not return Err after partial writes unless a transaction adapter turns that Err into a private rollback sentinel and converts it back immediately outside.
-- Event handlers return typed delivery Results. Subscription policy maps each error to commit, park-pending, dead-letter, or stop; handlers do not acknowledge messages directly.
-- Cancellation is a typed expected result. Capture external abort rejections using the exact owned `AbortSignal`; do not classify arbitrary errors solely by an `AbortError` name.
-- If `Result.tryPromise` stops an aborted retry delay, return its latest Err rather than synthesizing cancellation. When cancellation must remain distinct, use a cancellation-aware adapter that checks the owned signal around every attempt and delay, or do not use built-in retry.
-- Expected cleanup returns Result explicitly: cleanup Err wins after a successful main operation; if both fail, return a domain-owned combined failure preserving both. A rollback failure that leaves atomicity unknown is a Panic. Do not put expected throwing cleanup in a Result generator's `finally` block.
-
-### Event bus delivery
-
-- `LILAC_EVENTS` in `packages/event-bus/lilac-spec.ts` is the single event declaration. Its type, family, topic/key descriptors, payload schema, codec, request scope, and typed projections must remain derived rather than repeated in the architecture manifest or decoder dispatch.
-- `LilacBus.publish` provides compile-time producer typing only; it does not establish trust at a receiver in another process or reading persisted data.
-- The external Redis/SuperJSON boundary yields `Message<unknown>`. `createLilacBus` must decode the complete message with `decodeLilacMessageForTopic`, which dispatches through `lilacEventCodecRegistry`, before a typed handler runs. Do not replace this receiver validation with an assertion.
-- A `subscribeTopic` handler returns `Promise<Result<void, OwnedErrorUnion>>`. It does not commit, acknowledge, or choose transport behavior; `Ok` commits and the exhaustive delivery policy handles every owned error.
-- `park-pending` leaves a durable work-mode entry in the Redis PEL for manual recovery. It is not retry and does not schedule reclamation or redelivery.
-- `dead-letter` durably accepts the dead-letter record before acknowledging the source entry. Failed acceptance leaves work-mode delivery pending or stops tail delivery.
-- `Panic`, thrown/rejected defects, invalid handler Results, and invalid policy outputs bypass ordinary delivery policy and go to defect supervision.
-
-```ts
-// Producer typing does not validate data later read from Redis.
-await producerBus.publish(lilacEventTypes.CmdRequestMessage, requestData, publishOptions);
-
-// createLilacBus decodes raw Message<unknown> before typed delivery.
-const consumerBus = createLilacBus(rawBus, deliveryOptions);
-
-type RequestDeliveryError =
-  | RequestAlreadyHandled
-  | RequestDependencyUnavailable
-  | RequestInvalid
-  | RequestConsumerStopping;
-
-async function handleRequest(
-  message: DecodedLilacMessageForTopic<"cmd.request">,
-): Promise<ResultType<void, RequestDeliveryError>> {
-  // Expected failures return an owned Err; subscribeTopic owns acknowledgement.
-  return Result.ok(undefined);
-}
-
-function requestDeliveryPolicy(error: RequestDeliveryError): DeliveryDisposition {
-  switch (error._tag) {
-    case "RequestAlreadyHandled":
-      return "commit";
-    case "RequestDependencyUnavailable":
-      return "park-pending";
-    case "RequestInvalid":
-      return "dead-letter";
-    case "RequestConsumerStopping":
-      return "stop";
-  }
-}
-
-await consumerBus.subscribeTopic("cmd.request", options, handleRequest, requestDeliveryPolicy);
-```
-
-## Core Config
-
-- `core-config.yaml` is parsed by versioned parsers in `packages/utils/core-config/*` into `UniversalCoreConfig`.
-- v1 file shape is frozen: do not add keys to `coreConfigInputSchemaV1`; if `UniversalCoreConfig` gains fields, add v1 fallbacks in `parseCoreConfigV1ToUniversal`.
-- When v1 and v2 shape/defaults diverge, update `MIGRATIONS.md`.
-- When adding config options, update `packages/utils/config-templates/core-config.example.yaml`.
-
-## Monorepo / references
-
-- `ref/` is for reference material and vendored upstreams.
-  - `ref/*` are git submodules and may not be checked out on a fresh clone.
-  - Don’t copy rules from `ref/*` blindly; this repo’s active workspace is `apps/*` + `packages/*`.
-- When reading external/library code:
-  - Prefer `ref/` first (it often contains the upstream repo).
+# Lilac Agent Guide
+
+These rules apply to all tasks. Use the linked documents for detailed rules and commands.
+
+## Scope
+
+- Implement only the behavior that the user requests or an approved plan defines. Use the smallest
+  solution that meets the requirements.
+- Do not change an approved plan or its active checklist during implementation.
+- Do not add cleanup, future features, protection for possible problems, or unrelated fixes. Record
+  such work as residual work, but do not implement it.
+- Follow product decisions and non-goals. Do not follow conflicting reviewer suggestions.
+- Fix review findings that the current change causes. Also fix a finding if it proves that the change
+  violates an acceptance criterion or fails a required check.
+- Ask the user before you add a new contract, dependency, configuration option, or subsystem. Also ask
+  before you add stored data, a queue, a journal, a worker, or a recovery process.
+- Stop and ask if a fix needs a new product decision or increases the approved scope.
+
+## Compatibility And Safety
+
+- You can change private APIs. Do not change an existing wire contract, stored data contract,
+  filesystem tool contract, or plugin contract without approval.
+- Do not revert, overwrite, or include unrelated worktree changes.
+- Use `ref/` only as a read-only upstream reference.
+- Do not put credentials, tokens, private transcripts, or sensitive command data in outputs or files.
+
+## Repository Information
+
+- Use `bun` in this Bun workspace. The workspace packages are in `apps/*` and `packages/*`.
+- Read `PROJECT.md` for terms, architecture, code locations, and subsystem owners.
+- Read `scripts/architecture/README.md` before you change a trust boundary, persistence code, exception
+  code, or architecture registration.
+- Read `MIGRATIONS.md` before you change versioned configuration or a stored data contract.
+- Use the root `package.json` scripts for build, test, typecheck, lint, and format operations.
+- If a type is not visible, follow the `node_modules` symlink into `node_modules/.bun`. Inspect the
+  package `exports` or `types` entry to find its type declarations.
+
+## Work And Verification
+
+- Use focused tests and the typecheck for each changed workspace.
+- Run architecture checks when the change is in code that these checks control.
+- Run full repository checks only for broad changes, the final plan check, or a user request.
+- Do not use fixed waits to synchronize tests. Follow the `lilac/no-fixed-test-wait` rule.
+- Commit or create a pull request only when the user requests it.

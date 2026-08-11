@@ -299,6 +299,11 @@ describe("subagent_delegate tool", () => {
       | {
           modelOverride?: string;
           reasoningOverride?: string;
+          authenticatedOrigin?: {
+            platform: "discord" | "github";
+            userId: string;
+            sessionRef: { platform: "discord" | "github"; channelId: string };
+          };
         }
       | undefined;
     const tools = subagentTools({
@@ -342,6 +347,8 @@ describe("subagent_delegate tool", () => {
             sessionId: "s:model-override",
             requestClient: "discord",
             subagentDepth: 0,
+            requestInitiator: { platform: "discord", userId: "user-1" },
+            requestInitiatorSessionId: "surface-session",
           },
         },
       ),
@@ -349,6 +356,11 @@ describe("subagent_delegate tool", () => {
 
     expect(selected?.modelOverride).toBe("scout");
     expect(selected?.reasoningOverride).toBe("high");
+    expect(selected?.authenticatedOrigin).toEqual({
+      platform: "discord",
+      userId: "user-1",
+      sessionRef: { platform: "discord", channelId: "surface-session" },
+    });
 
     await expect(
       resolveExecuteResult(

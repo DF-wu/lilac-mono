@@ -1,6 +1,8 @@
 import { createHash, randomBytes } from "node:crypto";
 import type { NativeSubagentProfile } from "@stanley2058/lilac-utils";
 
+import type { AuthenticatedSurfaceOrigin } from "../surface/types";
+
 type SafetyMode = "trusted" | "restricted";
 
 type RequestControlPolicyBase = {
@@ -33,11 +35,13 @@ export type RequestControlPolicy = RequestControlPolicyBase &
     | {
         kind: "primary";
         principal: { platform: "discord" | "github"; userId: string } | null;
+        authenticatedOrigin: AuthenticatedSurfaceOrigin | null;
         allowedCallables: null;
       }
     | {
         kind: "heartbeat";
         principal: null;
+        authenticatedOrigin: null;
         allowedCallables: readonly string[];
       }
   );

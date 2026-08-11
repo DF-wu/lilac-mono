@@ -209,6 +209,7 @@ describe("durable workflow domain", () => {
         lastError: null,
         retryCount: 0,
         nextAttemptAt: null,
+        permanentFailure: null,
         createdAt: 1,
         updatedAt: 1,
       }).runId,

@@ -1,16 +1,19 @@
-import { Panic } from "better-result";
+import type { AdapterPlatform } from "@stanley2058/lilac-event-bus";
+import { Panic, TaggedError, type Result as ResultType } from "better-result";
 
 import type {
-  AdapterCapabilities,
   ContentOpts,
   LimitOpts,
   MsgRef,
+  RegisteredSurfacePlatform,
   SendOpts,
   SessionRef,
   SurfaceAttachment,
   SurfaceMessage,
+  SurfaceReactionDetail,
   SurfaceSelf,
   SurfaceSession,
+  SurfaceSessionParticipantsResult,
 } from "./types";
 import type { AdapterEvent } from "./events";
 
@@ -25,12 +28,111 @@ export function surfaceExternalFallback<T>(fallback: T): (cause: unknown) => T {
   };
 }
 
-/** Compatibility edge for the legacy Promise-based surface contract. */
-export function signalSurfaceFailure<T>(error: Error): Promise<T> {
-  const deferred = Promise.withResolvers<T>();
-  deferred.reject(error);
-  return deferred.promise;
-}
+export type SurfaceOperation =
+  | "list-sessions"
+  | "list-session-participants"
+  | "start-output"
+  | "push-output"
+  | "finish-output"
+  | "abort-output"
+  | "start-typing"
+  | "stop-typing"
+  | "send-message"
+  | "read-message"
+  | "list-messages"
+  | "edit-message"
+  | "delete-message"
+  | "get-reply-context"
+  | "plan-reply-chain"
+  | "plan-merge-block"
+  | "add-reaction"
+  | "remove-reaction"
+  | "list-reactions"
+  | "list-reaction-details"
+  | "get-unread"
+  | "mark-read";
+
+export class SurfaceOperationUnsupported extends TaggedError("SurfaceOperationUnsupported")<{
+  readonly platform: RegisteredSurfacePlatform;
+  readonly operation: SurfaceOperation;
+  readonly message: string;
+}> {}
+
+export class SurfacePlatformMismatch extends TaggedError("SurfacePlatformMismatch")<{
+  readonly operation: SurfaceOperation;
+  readonly refRole: string;
+  readonly expectedPlatform: RegisteredSurfacePlatform;
+  readonly receivedPlatform: AdapterPlatform;
+  readonly message: string;
+}> {}
+
+export class SurfaceSessionMismatch extends TaggedError("SurfaceSessionMismatch")<{
+  readonly operation: SurfaceOperation;
+  readonly refRole: string;
+  readonly expectedSessionId: string;
+  readonly receivedSessionId: string;
+  readonly message: string;
+}> {}
+
+export class SurfaceInvalidInput extends TaggedError("SurfaceInvalidInput")<{
+  readonly platform: RegisteredSurfacePlatform;
+  readonly operation: SurfaceOperation;
+  readonly field: string;
+  readonly message: string;
+}> {}
+
+export class SurfaceOperationPartiallyCompleted extends TaggedError(
+  "SurfaceOperationPartiallyCompleted",
+)<{
+  readonly platform: RegisteredSurfacePlatform;
+  readonly operation: SurfaceOperation;
+  readonly created: MsgRef;
+  readonly message: string;
+}> {}
+
+export class SurfaceMessageNotFound extends TaggedError("SurfaceMessageNotFound")<{
+  readonly platform: RegisteredSurfacePlatform;
+  readonly operation: SurfaceOperation;
+  readonly message: string;
+}> {}
+
+export class SurfacePermissionDenied extends TaggedError("SurfacePermissionDenied")<{
+  readonly platform: RegisteredSurfacePlatform;
+  readonly operation: SurfaceOperation;
+  readonly message: string;
+}> {}
+
+export class SurfaceRateLimited extends TaggedError("SurfaceRateLimited")<{
+  readonly platform: RegisteredSurfacePlatform;
+  readonly operation: SurfaceOperation;
+  readonly retryAfterMs?: number;
+  readonly message: string;
+}> {}
+
+export class SurfaceUnavailable extends TaggedError("SurfaceUnavailable")<{
+  readonly platform: RegisteredSurfacePlatform;
+  readonly operation: SurfaceOperation;
+  readonly message: string;
+}> {}
+
+export type SurfaceOperationError =
+  | SurfaceOperationUnsupported
+  | SurfacePlatformMismatch
+  | SurfaceSessionMismatch
+  | SurfaceInvalidInput
+  | SurfaceOperationPartiallyCompleted
+  | SurfaceMessageNotFound
+  | SurfacePermissionDenied
+  | SurfaceRateLimited
+  | SurfaceUnavailable;
+
+export type SurfaceOperationResult<T> = ResultType<T, SurfaceOperationError>;
+
+export type SurfaceSendPreparationInput = {
+  readonly text?: string;
+  readonly attachmentCount: number;
+  readonly actionCount: number;
+};
 
 export type SurfaceToolStatusUpdate = {
   toolCallId: string;
@@ -39,17 +141,6 @@ export type SurfaceToolStatusUpdate = {
   ok?: boolean;
   error?: string;
 };
-
-export class SurfaceMessageNotFoundError extends Error {
-  constructor(
-    readonly platform: "discord" | "github",
-    readonly code: number | string,
-    message: string,
-  ) {
-    super(message);
-    this.name = "SurfaceMessageNotFoundError";
-  }
-}
 
 export type SurfaceReasoningStatusUpdate = {
   startedAtMs: number;
@@ -73,6 +164,7 @@ export type SurfaceOutputResult = {
 };
 
 export type SurfaceFinalTextMode = "continuation" | "full";
+export type SurfaceOutputPartDisposition = "visible" | "terminal" | "ignored";
 
 export type SurfaceReplyChainPlanOptions = {
   maxDepth?: number;
@@ -83,9 +175,10 @@ export type SurfaceMergeBlockPlanOptions = {
 };
 
 export interface SurfaceOutputStream {
-  push(part: SurfaceOutputPart): Promise<void>;
-  finish(): Promise<SurfaceOutputResult>;
-  abort(reason?: string): Promise<void>;
+  hydrateRecovery?(parts: readonly SurfaceOutputPart[]): SurfaceOutputPartDisposition;
+  push(part: SurfaceOutputPart): Promise<SurfaceOperationResult<SurfaceOutputPartDisposition>>;
+  finish(): Promise<SurfaceOperationResult<SurfaceOutputResult>>;
+  abort(reason?: string): Promise<SurfaceOperationResult<void>>;
   /**
    * Optional final-text policy for bridge slicing behavior.
    * - continuation: treat finalText as current-lane continuation after reanchor
@@ -95,6 +188,8 @@ export interface SurfaceOutputStream {
 }
 
 export type StartOutputOpts = {
+  /** Internal preparation mode for recovery admission before snapshot disposition. */
+  preparationMode?: "paused-recovery";
   replyTo?: MsgRef;
   /** Disable all Discord notifications for this output stream (mentions + reply ping). */
   silent?: boolean;
@@ -118,77 +213,69 @@ export type AdapterSubscription = {
 };
 
 export type TypingIndicatorSubscription = {
-  stop(): Promise<void>;
+  stop(): Promise<SurfaceOperationResult<void>>;
 };
 
-/** Optional capability: start/stop a typing indicator for a session. */
-export interface TypingIndicatorProvider {
-  startTyping(sessionRef: SessionRef): Promise<TypingIndicatorSubscription>;
-}
-
 export type AdapterEventHandler = (evt: AdapterEvent) => Promise<void> | void;
+
+export interface SurfaceAdapterEventSource {
+  subscribe(handler: AdapterEventHandler): Promise<AdapterSubscription>;
+}
 
 export interface SurfaceAdapter {
   connect(): Promise<void>;
   disconnect(): Promise<void>;
   getSelf(): Promise<SurfaceSelf>;
-  getCapabilities(): Promise<AdapterCapabilities>;
 
-  listSessions(): Promise<SurfaceSession[]>;
+  listSessions(): Promise<SurfaceOperationResult<SurfaceSession[]>>;
+  listSessionParticipants(
+    sessionRef: SessionRef,
+    opts?: { limit?: number },
+  ): Promise<SurfaceOperationResult<SurfaceSessionParticipantsResult>>;
 
-  startOutput(sessionRef: SessionRef, opts?: StartOutputOpts): Promise<SurfaceOutputStream>;
+  startOutput(
+    sessionRef: SessionRef,
+    opts?: StartOutputOpts,
+  ): Promise<SurfaceOperationResult<SurfaceOutputStream>>;
+  startTyping(sessionRef: SessionRef): Promise<SurfaceOperationResult<TypingIndicatorSubscription>>;
 
-  sendMsg(sessionRef: SessionRef, content: ContentOpts, opts?: SendOpts): Promise<MsgRef>;
-  readMsg(msgRef: MsgRef): Promise<SurfaceMessage | null>;
-  listMsg(sessionRef: SessionRef, opts?: LimitOpts): Promise<SurfaceMessage[]>;
-  editMsg(msgRef: MsgRef, content: ContentOpts): Promise<void>;
-  deleteMsg(msgRef: MsgRef): Promise<void>;
-  getReplyContext(msgRef: MsgRef, opts?: LimitOpts): Promise<SurfaceMessage[]>;
-
-  addReaction(msgRef: MsgRef, reaction: string): Promise<void>;
-  removeReaction(msgRef: MsgRef, reaction: string): Promise<void>;
-  listReactions(msgRef: MsgRef): Promise<string[]>;
-
-  subscribe(handler: AdapterEventHandler): Promise<AdapterSubscription>;
-
-  getUnRead(sessionRef: SessionRef): Promise<SurfaceMessage[]>;
-  markRead(sessionRef: SessionRef, upToMsgRef?: MsgRef): Promise<void>;
-}
-
-export interface SurfaceAuthoritativeSelfMessageProvider {
-  resolveAuthoritativeSelfMessageVerifier(): Promise<(message: SurfaceMessage) => boolean>;
-  isAuthoritativelySelfAuthored(message: SurfaceMessage): Promise<boolean>;
-}
-
-export function hasAuthoritativeSelfMessageProvider(
-  adapter: SurfaceAdapter,
-): adapter is SurfaceAdapter & SurfaceAuthoritativeSelfMessageProvider {
-  return (
-    "resolveAuthoritativeSelfMessageVerifier" in adapter &&
-    typeof adapter.resolveAuthoritativeSelfMessageVerifier === "function" &&
-    "isAuthoritativelySelfAuthored" in adapter &&
-    typeof adapter.isAuthoritativelySelfAuthored === "function"
-  );
-}
-
-/** Optional capability: plan reply-chain traversal using local metadata/indexes. */
-export interface SurfaceReplyChainPlannerProvider {
-  planReplyChain(msgRef: MsgRef, opts?: SurfaceReplyChainPlanOptions): Promise<readonly MsgRef[]>;
+  prepareSendMsg(
+    sessionRef: SessionRef,
+    input: SurfaceSendPreparationInput,
+    opts?: SendOpts,
+  ): Promise<SurfaceOperationResult<void>>;
+  sendMsg(
+    sessionRef: SessionRef,
+    content: ContentOpts,
+    opts?: SendOpts,
+  ): Promise<SurfaceOperationResult<MsgRef>>;
+  readMsg(msgRef: MsgRef): Promise<SurfaceOperationResult<SurfaceMessage | null>>;
+  listMsg(
+    sessionRef: SessionRef,
+    opts?: LimitOpts,
+  ): Promise<SurfaceOperationResult<SurfaceMessage[]>>;
+  editMsg(msgRef: MsgRef, content: ContentOpts): Promise<SurfaceOperationResult<void>>;
+  deleteMsg(msgRef: MsgRef): Promise<SurfaceOperationResult<void>>;
+  getReplyContext(
+    msgRef: MsgRef,
+    opts?: LimitOpts,
+  ): Promise<SurfaceOperationResult<SurfaceMessage[]>>;
+  planReplyChain(
+    msgRef: MsgRef,
+    opts?: SurfaceReplyChainPlanOptions,
+  ): Promise<SurfaceOperationResult<readonly MsgRef[]>>;
   planMergeBlockEndingAt(
     msgRef: MsgRef,
     opts?: SurfaceMergeBlockPlanOptions,
-  ): Promise<readonly MsgRef[]>;
-}
+  ): Promise<SurfaceOperationResult<readonly MsgRef[]>>;
 
-export function hasReplyChainPlannerProvider(
-  adapter: SurfaceAdapter,
-): adapter is SurfaceAdapter & SurfaceReplyChainPlannerProvider {
-  return (
-    "planReplyChain" in adapter &&
-    typeof adapter.planReplyChain === "function" &&
-    "planMergeBlockEndingAt" in adapter &&
-    typeof adapter.planMergeBlockEndingAt === "function"
-  );
+  addReaction(msgRef: MsgRef, reaction: string): Promise<SurfaceOperationResult<void>>;
+  removeReaction(msgRef: MsgRef, reaction: string): Promise<SurfaceOperationResult<void>>;
+  listReactions(msgRef: MsgRef): Promise<SurfaceOperationResult<string[]>>;
+  listReactionDetails(msgRef: MsgRef): Promise<SurfaceOperationResult<SurfaceReactionDetail[]>>;
+
+  getUnRead(sessionRef: SessionRef): Promise<SurfaceOperationResult<SurfaceMessage[]>>;
+  markRead(sessionRef: SessionRef, upToMsgRef?: MsgRef): Promise<SurfaceOperationResult<void>>;
 }
 
 export type SurfaceBurstCacheInput = {
@@ -205,8 +292,20 @@ export interface SurfaceCacheBurstProvider {
   burstCache(input: SurfaceBurstCacheInput): Promise<void>;
 }
 
+export interface SurfaceGuildIdResolver {
+  fetchGuildIdForChannel(channelId: string): Promise<string | null>;
+}
+
 export function hasCacheBurstProvider(
   adapter: SurfaceAdapter,
 ): adapter is SurfaceAdapter & SurfaceCacheBurstProvider {
   return "burstCache" in adapter && typeof adapter.burstCache === "function";
+}
+
+export function hasSurfaceGuildIdResolver(
+  adapter: SurfaceAdapter,
+): adapter is SurfaceAdapter & SurfaceGuildIdResolver {
+  return (
+    "fetchGuildIdForChannel" in adapter && typeof adapter.fetchGuildIdForChannel === "function"
+  );
 }

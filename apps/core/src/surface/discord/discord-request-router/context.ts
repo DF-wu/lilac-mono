@@ -11,13 +11,11 @@ export async function resolvePreviousMessageText(params: {
     triggerTs: number;
   };
 }): Promise<string | undefined> {
-  const around = await params.adapter
-    .getReplyContext(params.input.msgRef, { limit: 8 })
-    .catch(() => []);
-  if (around.length === 0) return undefined;
+  const around = await params.adapter.getReplyContext(params.input.msgRef, { limit: 8 });
+  if (around.status === "error" || around.value.length === 0) return undefined;
 
   let prev: SurfaceMessage | null = null;
-  for (const candidate of around) {
+  for (const candidate of around.value) {
     const cmp = compareMessagePosition(
       { ts: candidate.ts, messageId: candidate.ref.messageId },
       { ts: params.input.triggerTs, messageId: params.input.msgRef.messageId },
@@ -46,15 +44,13 @@ export async function resolveRepliedToMessageText(params: {
 }): Promise<string | undefined> {
   if (!params.input.replyToMessageId) return undefined;
 
-  const repliedTo = await params.adapter
-    .readMsg({
-      platform: "discord",
-      channelId: params.input.sessionId,
-      messageId: params.input.replyToMessageId,
-    })
-    .catch(() => null);
+  const repliedTo = await params.adapter.readMsg({
+    platform: "discord",
+    channelId: params.input.sessionId,
+    messageId: params.input.replyToMessageId,
+  });
 
-  return normalizeGateText(repliedTo?.text ?? undefined);
+  return normalizeGateText(repliedTo.status === "ok" ? repliedTo.value?.text : undefined);
 }
 
 export async function resolvePreviousBatchMessageText(params: {

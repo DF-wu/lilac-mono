@@ -1247,14 +1247,11 @@ describe("Stage 2 union rules", () => {
     ]);
   });
 
-  test("registers exact heartbeat and request-cache lifecycle Result boundaries", () => {
+  test("registers exact heartbeat lifecycle Result boundaries", () => {
     const core = architectureManifest.workspaces.find(
       (workspace) => workspace.root === "apps/core",
     );
-    const modules = new Set([
-      "src/heartbeat/heartbeat-service.ts",
-      "src/tool-server/request-message-cache.ts",
-    ]);
+    const modules = new Set(["src/heartbeat/heartbeat-service.ts"]);
 
     expect(core?.operationalResultApis.filter((api) => modules.has(api.module))).toEqual([
       {
@@ -1273,24 +1270,13 @@ describe("Stage 2 union rules", () => {
         module: "src/heartbeat/heartbeat-service.ts",
         exportName: "startHeartbeatServiceResult.stopHeartbeatLifecycleResult",
       },
-      {
-        module: "src/tool-server/request-message-cache.ts",
-        exportName: "createRequestMessageCache.startRequestMessageCacheResult",
-      },
-      {
-        module: "src/tool-server/request-message-cache.ts",
-        exportName: "createRequestMessageCache.stopRequestMessageCacheResult",
-      },
     ]);
     expect(
       core?.exceptionAdapters
         .filter((adapter) => modules.has(adapter.identity.module))
         .filter((adapter) => adapter.identity.exportName.startsWith("adapt"))
         .map((adapter) => [adapter.identity.exportName, adapter.direction]),
-    ).toEqual([
-      ["adaptRequestMessageCacheStartResultToHost", "signal-host"],
-      ["adaptRequestMessageCacheStopResultToHost", "signal-host"],
-    ]);
+    ).toEqual([]);
     expect(
       core?.exceptionAdapters
         .filter(
@@ -1822,7 +1808,7 @@ describe("Stage 4 event architecture rules", () => {
       (workspace) => workspace.name === "apps/core",
     );
     if (!core) throw new Error("core workspace missing");
-    expect(core.eventDeliveryConsumers).toHaveLength(13);
+    expect(core.eventDeliveryConsumers).toHaveLength(12);
     expect(core.boundaryDecoders).toContainEqual({
       identity: {
         module: "src/surface/bridge/bus-agent-runner/raw.ts",
@@ -3495,6 +3481,7 @@ describe("real declaration integration", () => {
       "src/conversation/thread-materializer-worker-protocol.ts#decodeThreadMaterializerWorkerResponse",
       "src/github/github-app.ts#decodeGithubAppSecret",
       "src/github/github-app.ts#readGithubAppSecretResult",
+      "src/github/github-api.ts#decodeGithubApiErrorResponse",
       "src/github/github-user-token.ts#decodeGithubUserTokenSecret",
       "src/github/github-user-token.ts#readGithubUserTokenSecretResult",
       "src/github/webhook/github-webhook-server.ts#captureGithubWebhookOperation",
@@ -3559,6 +3546,69 @@ describe("real declaration integration", () => {
       { include: "**" },
     ]);
     expect(runtime.ruleZones["architecture/fallible-api-result"]).toEqual([{ include: "**" }]);
+  });
+
+  test("registers surface projections and platform mismatch Panic provenance", () => {
+    const core = architectureManifest.workspaces.find(
+      (workspace) => workspace.root === "apps/core",
+    );
+    if (!core) throw new Error("core workspace missing");
+    const platformMismatchIdentity = {
+      module: "src/surface/bridge/adapter-event-projection.ts",
+      exportName: "signalAdapterEventPlatformMismatch",
+    } as const;
+    const platformMismatchReason =
+      "Signals a hard invariant when a normalized adapter event contains mixed platforms.";
+
+    expect(core.exceptionAdapters).toContainEqual({
+      identity: platformMismatchIdentity,
+      category: "defect-supervisor",
+      externalApi: { package: "better-result", exportName: "Panic" },
+      direction: "signal-host",
+      reason: platformMismatchReason,
+    });
+    expect(architectureManifest.approvedExceptionAdapters).toContainEqual({
+      workspace: "apps/core",
+      callable: platformMismatchIdentity,
+      category: "defect-supervisor",
+      externalApi: { package: "better-result", exportName: "Panic" },
+      mode: "signal-host",
+      syntaxKinds: ["throw-statement", "host-rejection-call", "registered-host-signal-call"],
+      relationship: "host-contract",
+      provenance: "workspace-reviewed-manifest",
+      reason: platformMismatchReason,
+    });
+    const descriptorMismatchIdentity = {
+      module: "src/surface/produced-ref-guard.ts",
+      exportName: "signalSurfaceAdapterContractViolation",
+    } as const;
+    const descriptorMismatchReason =
+      "Signals a hard descriptor-bound contract defect before an adapter-produced ref crosses a shared publication or persistence seam.";
+    expect(core.exceptionAdapters).toContainEqual({
+      identity: descriptorMismatchIdentity,
+      category: "defect-supervisor",
+      externalApi: { package: "better-result", exportName: "Panic" },
+      direction: "signal-host",
+      reason: descriptorMismatchReason,
+    });
+    expect(architectureManifest.approvedExceptionAdapters).toContainEqual({
+      workspace: "apps/core",
+      callable: descriptorMismatchIdentity,
+      category: "defect-supervisor",
+      externalApi: { package: "better-result", exportName: "Panic" },
+      mode: "signal-host",
+      syntaxKinds: ["throw-statement", "host-rejection-call", "registered-host-signal-call"],
+      relationship: "host-contract",
+      provenance: "workspace-reviewed-manifest",
+      reason: descriptorMismatchReason,
+    });
+    expect(core.boundaryDecoders).toContainEqual({
+      identity: {
+        module: "src/surface/discord/discord-command-projection.ts",
+        exportName: "toBusDiscordCommandInvokedData",
+      },
+      category: "projection",
+    });
   });
 
   test("resolves Bun-realpathed cross-workspace declarations to package identities", () => {

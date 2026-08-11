@@ -66,6 +66,7 @@ export function bashTool() {
             requestId: string;
             sessionId: string;
             requestClient: string;
+            currentTurnUserId?: string;
           };
           abortSignal?: AbortSignal;
           toolCallId?: string;
@@ -97,6 +98,7 @@ export function bashToolWithCwd(
               sessionId?: string;
               requestClient?: string;
               safetyMode?: "trusted" | "restricted";
+              currentTurnUserId?: string;
             }
           | undefined;
         const suppliedCwd = "cwd" in input && typeof input.cwd === "string" ? input.cwd : undefined;
@@ -130,6 +132,7 @@ export function bashToolWithCwd(
             requestId: string;
             sessionId: string;
             requestClient: string;
+            currentTurnUserId?: string;
           };
           abortSignal?: AbortSignal;
           toolCallId?: string;

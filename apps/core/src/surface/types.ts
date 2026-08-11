@@ -37,6 +37,33 @@ export type GithubMsgRef = {
 export type SessionRef = DiscordSessionRef | GithubSessionRef;
 export type MsgRef = DiscordMsgRef | GithubMsgRef;
 
+export type RegisteredSurfacePlatform = SessionRef["platform"];
+
+export type SessionRefFor<P extends RegisteredSurfacePlatform> = Extract<
+  SessionRef,
+  { platform: P }
+>;
+
+export type MsgRefFor<P extends RegisteredSurfacePlatform> = Extract<MsgRef, { platform: P }>;
+
+export type AuthenticatedSurfaceOrigin = {
+  [P in RegisteredSurfacePlatform]: {
+    readonly platform: P;
+    readonly userId: string;
+    readonly sessionRef: SessionRefFor<P>;
+    readonly messageRef?: MsgRefFor<P>;
+  };
+}[RegisteredSurfacePlatform];
+
+type SurfacePlatformSetsEqual = [SessionRef["platform"]] extends [MsgRef["platform"]]
+  ? [MsgRef["platform"]] extends [SessionRef["platform"]]
+    ? true
+    : false
+  : false;
+type AssertSurfacePlatformSetsEqual<T extends true> = T;
+export type SurfaceRefPlatformSetsExactlyEqual =
+  AssertSurfacePlatformSetsEqual<SurfacePlatformSetsEqual>;
+
 export type SurfaceSelf = {
   platform: SurfacePlatform;
   userId: string;
@@ -141,15 +168,4 @@ export type SendOpts = {
   replyTo?: MsgRef;
   /** Disable all Discord notifications for this send (mentions + reply ping). */
   silent?: boolean;
-};
-
-export type AdapterCapabilities = {
-  platform: SurfacePlatform;
-  send: boolean;
-  edit: boolean;
-  delete: boolean;
-  reactions: boolean;
-  readHistory: boolean;
-  threads: boolean;
-  markRead: boolean;
 };

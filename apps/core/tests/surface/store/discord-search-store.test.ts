@@ -1,4 +1,5 @@
 import { describe, expect, it } from "bun:test";
+import { Result } from "better-result";
 import type { LimitOpts, SessionRef, SurfaceMessage } from "../../../src/surface/types";
 import {
   DISCORD_SEARCH_FIRST_SEARCH_HEAL_LIMIT,
@@ -12,10 +13,10 @@ class FakeSearchAdapter {
 
   constructor(private readonly messagesByChannelId: Record<string, SurfaceMessage[]>) {}
 
-  async listMsg(sessionRef: SessionRef, opts?: LimitOpts): Promise<SurfaceMessage[]> {
+  async listMsg(sessionRef: SessionRef, opts?: LimitOpts) {
     this.listCalls.push({ sessionRef, opts });
     const messages = this.messagesByChannelId[sessionRef.channelId] ?? [];
-    return messages.slice(0, opts?.limit ?? 50);
+    return Result.ok(messages.slice(0, opts?.limit ?? 50));
   }
 }
 

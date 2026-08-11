@@ -1,47 +1,71 @@
-import type { GithubSessionRef, MsgRef, SurfaceAttachment } from "../../types";
-import type { SurfaceOutputPart, SurfaceOutputResult, SurfaceOutputStream } from "../../adapter";
+import { Result } from "better-result";
 
-import { createIssueComment } from "../../../github/github-api";
+import type { GithubSessionRef, MsgRef } from "../../types";
+import type {
+  SurfaceOperationResult,
+  SurfaceOutputPart,
+  SurfaceOutputPartDisposition,
+  SurfaceOutputResult,
+  SurfaceOutputStream,
+} from "../../adapter";
+
 import { markGithubAgentComment } from "../../../github/github-comment-marker";
-import { parseGithubSessionId } from "../../../github/github-ids";
 
 export class GithubOutputStream implements SurfaceOutputStream {
   private text = "";
-  private attachments: SurfaceAttachment[] = [];
   private created: MsgRef[] = [];
 
   constructor(
     private readonly sessionRef: GithubSessionRef,
+    private readonly api: {
+      createComment(body: string): Promise<SurfaceOperationResult<{ readonly id: number }>>;
+    },
     private readonly opts?: { replyTo?: MsgRef },
   ) {}
 
-  async push(part: SurfaceOutputPart): Promise<void> {
+  hydrateRecovery(parts: readonly SurfaceOutputPart[]): SurfaceOutputPartDisposition {
+    let disposition: SurfaceOutputPartDisposition = "ignored";
+    for (const part of parts) {
+      const applied = this.applyPart(part);
+      if (applied === "visible" || (applied === "terminal" && disposition === "ignored")) {
+        disposition = applied;
+      }
+    }
+    return disposition;
+  }
+
+  async push(
+    part: SurfaceOutputPart,
+  ): Promise<SurfaceOperationResult<SurfaceOutputPartDisposition>> {
+    return Result.ok(this.applyPart(part));
+  }
+
+  private applyPart(part: SurfaceOutputPart): SurfaceOutputPartDisposition {
     switch (part.type) {
       case "text.delta": {
         // Buffer deltas; GitHub surface posts once at finish.
         this.text += part.delta;
-        return;
+        return "visible";
       }
       case "text.set": {
         this.text = part.text;
-        return;
+        return "visible";
       }
       case "attachment.add": {
-        // Not supported yet; keep for parity.
-        this.attachments.push(part.attachment);
-        return;
+        // GitHub omits binary attachments, but attachment-only replies still complete at finish.
+        return "terminal";
       }
       case "reasoning.status": {
         // Ignore (no streaming UI for GitHub).
-        return;
+        return "ignored";
       }
       case "tool.status": {
-        // Ignore (no streaming UI for GitHub).
-        return;
+        // GitHub has no tool UI, but tool-only replies still complete at finish.
+        return "terminal";
       }
       case "meta.stats": {
         // Ignore (no dedicated stats UI for GitHub).
-        return;
+        return "ignored";
       }
       default: {
         const _exhaustive: never = part;
@@ -50,9 +74,7 @@ export class GithubOutputStream implements SurfaceOutputStream {
     }
   }
 
-  async finish(): Promise<SurfaceOutputResult> {
-    const thread = parseGithubSessionId(this.sessionRef.channelId);
-
+  async finish(): Promise<SurfaceOperationResult<SurfaceOutputResult>> {
     const replyPrefix = (() => {
       const replyTo = this.opts?.replyTo;
       if (!replyTo || replyTo.platform !== "github") return "";
@@ -60,27 +82,23 @@ export class GithubOutputStream implements SurfaceOutputStream {
     })();
 
     const body = markGithubAgentComment(`${replyPrefix}${this.text}`);
-    const res = await createIssueComment({
-      owner: thread.owner,
-      repo: thread.repo,
-      issueNumber: thread.number,
-      body,
-    });
+    const res = await this.api.createComment(body);
+    if (res.status === "error") return res;
 
     const ref: MsgRef = {
       platform: "github",
       channelId: this.sessionRef.channelId,
-      messageId: String(res.id),
+      messageId: String(res.value.id),
     };
     this.created.push(ref);
 
-    return {
+    return Result.ok({
       created: this.created,
       last: ref,
-    };
+    });
   }
 
-  async abort(_reason?: string): Promise<void> {
-    // No-op: we do not create placeholder comments.
+  async abort(_reason?: string): Promise<SurfaceOperationResult<void>> {
+    return Result.ok(undefined);
   }
 }

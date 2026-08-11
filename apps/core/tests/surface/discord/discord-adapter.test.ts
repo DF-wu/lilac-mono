@@ -10,14 +10,16 @@ import {
   type ThreadMember,
 } from "discord.js";
 import { parseCoreConfigV1ToUniversal, type CoreConfig } from "@stanley2058/lilac-utils";
-import { Panic } from "better-result";
+import { Panic, Result } from "better-result";
 
 import {
   DiscordAdapter,
+  DiscordAdapterUnavailable,
   DISCORD_CACHE_LIMITS,
   DISCORD_CACHE_SETTINGS,
   classifyDiscordSurfaceNotFound,
   buildDiscordSlashOption,
+  classifyDiscordSurfaceError,
   hasExplicitDiscordUserMentionInContent,
   isExplicitDiscordUserMention,
   isRoutableDiscordUserMessage,
@@ -26,8 +28,78 @@ import {
   resolveEffectiveSessionModelOverride,
   type DiscordAdapterOptions,
 } from "../../../src/surface/discord/discord-adapter";
-import { SurfaceMessageNotFoundError } from "../../../src/surface/adapter";
+import {
+  SurfaceMessageNotFound,
+  SurfacePermissionDenied,
+  SurfacePlatformMismatch,
+  SurfaceRateLimited,
+  SurfaceSessionMismatch,
+  SurfaceUnavailable,
+  SurfaceInvalidInput,
+} from "../../../src/surface/adapter";
 import type { AdapterEvent } from "../../../src/surface/events";
+import type { ContentOpts } from "../../../src/surface/types";
+import { toBusDiscordCommandInvokedData } from "../../../src/surface/discord/discord-command-projection";
+import { DiscordSurfaceStore } from "../../../src/surface/store/discord-surface-store";
+
+describe("Discord command actor projection", () => {
+  it("omits an anonymous actor instead of emitting an incomplete actor", () => {
+    const projected = toBusDiscordCommandInvokedData({
+      type: "adapter.command.invoked",
+      platform: "discord",
+      requestId: "discord:channel:command",
+      sessionId: "channel",
+      commandName: "ask",
+      args: [],
+      text: "hello",
+      ts: 1,
+      sessionMode: "mention",
+      sessionConfigId: "channel",
+    });
+
+    expect(Object.hasOwn(projected.raw ?? {}, "authenticatedActor")).toBe(false);
+  });
+});
+
+describe("Discord reply-chain channel boundary", () => {
+  it("truncates a thread-parent relation without exposing parent content or raising Panic", async () => {
+    const store = new DiscordSurfaceStore(":memory:");
+    const adapter = createTestDiscordAdapter();
+    Object.assign(adapter, { store });
+    store.upsertMessageRelation({
+      channelId: "thread",
+      messageId: "reply",
+      authorId: "user",
+      ts: 2,
+      isChat: true,
+      replyToChannelId: "parent",
+      replyToMessageId: "private-parent-content",
+      updatedTs: 2,
+    });
+    store.upsertMessageRelation({
+      channelId: "parent",
+      messageId: "private-parent-content",
+      authorId: "other-user",
+      ts: 1,
+      isChat: true,
+      updatedTs: 1,
+    });
+
+    try {
+      const planned = await adapter.planReplyChain({
+        platform: "discord",
+        channelId: "thread",
+        messageId: "reply",
+      });
+      expect(planned).toEqual(
+        Result.ok([{ platform: "discord", channelId: "thread", messageId: "reply" }]),
+      );
+      expect(JSON.stringify(planned)).not.toContain("private-parent-content");
+    } finally {
+      store.close();
+    }
+  });
+});
 
 function testConfigWithStatusMessage(statusMessage?: string): CoreConfig {
   const discord = {
@@ -57,16 +129,182 @@ function makeMessage(input: { bot: boolean; system: boolean; type: MessageType }
   } as unknown as Message;
 }
 
+const EMPTY_DISCORD_CONTENT_CASES: ContentOpts[] = [
+  {},
+  { text: "" },
+  { text: "   " },
+  { attachments: [] },
+  { actions: [] },
+];
+
+const VALID_DISCORD_CONTENT_CASES: ContentOpts[] = [
+  { text: "hello" },
+  {
+    attachments: [
+      { kind: "file", filename: "a.txt", mimeType: "text/plain", bytes: new Uint8Array() },
+    ],
+  },
+  { actions: [{ actionId: "continue", label: "Continue", style: "primary" }] },
+];
+
 describe("classifyDiscordSurfaceNotFound", () => {
   it("maps only Discord unknown-channel/message codes to the common typed error", () => {
     for (const code of [10_003, 10_008]) {
       const classified = classifyDiscordSurfaceNotFound({ code }, "missing");
-      expect(classified).toBeInstanceOf(SurfaceMessageNotFoundError);
-      expect(classified).toMatchObject({ platform: "discord", code });
+      expect(classified).toBeInstanceOf(SurfaceMessageNotFound);
+      expect(classified).toMatchObject({
+        platform: "discord",
+        operation: "read-message",
+      });
     }
     expect(classifyDiscordSurfaceNotFound({ code: 50_013 }, "forbidden")).toBeNull();
     expect(classifyDiscordSurfaceNotFound(new Error("network"), "network")).toBeNull();
   });
+});
+
+describe("classifyDiscordSurfaceError", () => {
+  it.each([
+    [{ code: 50_013 }, SurfacePermissionDenied],
+    [{ status: 403 }, SurfacePermissionDenied],
+    [{ code: 20_028, retry_after: 1.25 }, SurfaceRateLimited],
+    [{ status: 400 }, SurfaceInvalidInput],
+    [{ status: 503 }, SurfaceUnavailable],
+  ] as const)("classifies recognized Discord failures", (cause, ErrorType) => {
+    const classified = classifyDiscordSurfaceError("send-message", cause);
+    expect(classified).toBeInstanceOf(ErrorType);
+    expect(classified).toMatchObject({ platform: "discord", operation: "send-message" });
+  });
+
+  it("classifies adapter availability and leaves unknown defects unclassified", () => {
+    expect(
+      classifyDiscordSurfaceError(
+        "list-sessions",
+        new DiscordAdapterUnavailable({ message: "disconnected" }),
+      ),
+    ).toBeInstanceOf(SurfaceUnavailable);
+    expect(classifyDiscordSurfaceError("send-message", new Error("unknown"))).toBeNull();
+  });
+});
+
+describe("DiscordAdapter nested refs", () => {
+  it("starts a resumable output stream without invoking Discord", async () => {
+    let providerCalls = 0;
+    const config = testConfigWithStatusMessage();
+    const adapter = createTestDiscordAdapter({ config });
+    const internals = adapter as unknown as { client: unknown; cfg: CoreConfig };
+    internals.client = {
+      channels: {
+        fetch: async () => {
+          providerCalls += 1;
+          return null;
+        },
+      },
+    };
+    internals.cfg = config;
+
+    const result = await adapter.startOutput(
+      { platform: "discord", channelId: "c1" },
+      {
+        resume: {
+          created: [{ platform: "discord", channelId: "c1", messageId: "existing" }],
+        },
+      },
+    );
+
+    expect(result.status).toBe("ok");
+    expect(providerCalls).toBe(0);
+  });
+
+  it.each([
+    [
+      { platform: "github", channelId: "c1", messageId: "m1" } as const,
+      SurfacePlatformMismatch,
+      "replyTo",
+    ],
+    [
+      { platform: "discord", channelId: "c2", messageId: "m1" } as const,
+      SurfaceSessionMismatch,
+      "replyTo",
+    ],
+  ] as const)(
+    "rejects invalid reply targets before connecting",
+    async (replyTo, ErrorType, refRole) => {
+      const result = await createTestDiscordAdapter().startOutput(
+        { platform: "discord", channelId: "c1" },
+        { replyTo },
+      );
+
+      expect(result.status).toBe("error");
+      if (result.status === "ok") throw new Error("expected nested-ref failure");
+      expect(result.error).toBeInstanceOf(ErrorType);
+      expect(result.error).toMatchObject({ operation: "start-output", refRole });
+    },
+  );
+
+  it("identifies the mismatched resumed ref", async () => {
+    const result = await createTestDiscordAdapter().startOutput(
+      { platform: "discord", channelId: "c1" },
+      {
+        resume: {
+          created: [{ platform: "discord", channelId: "c2", messageId: "m1" }],
+        },
+      },
+    );
+
+    expect(result.status).toBe("error");
+    if (result.status === "ok") throw new Error("expected nested-ref failure");
+    expect(result.error).toBeInstanceOf(SurfaceSessionMismatch);
+    expect(result.error).toMatchObject({ refRole: "resume.created[0]" });
+  });
+});
+
+describe("DiscordAdapter.sendMsg content validation", () => {
+  it("prepares sends without invoking the Discord provider", async () => {
+    let providerCalls = 0;
+    const adapter = createTestDiscordAdapter();
+    (adapter as unknown as { client: unknown }).client = {
+      channels: {
+        fetch: async () => {
+          providerCalls += 1;
+          return null;
+        },
+      },
+    };
+
+    expect(
+      await adapter.prepareSendMsg(
+        { platform: "discord", channelId: "c1" },
+        { text: "prepared", attachmentCount: 1, actionCount: 0 },
+      ),
+    ).toEqual(Result.ok(undefined));
+    expect(providerCalls).toBe(0);
+  });
+
+  it.each(EMPTY_DISCORD_CONTENT_CASES)("rejects a truly empty payload %#", async (content) => {
+    const result = await createTestDiscordAdapter().sendMsg(
+      { platform: "discord", channelId: "c1" },
+      content,
+    );
+
+    expect(result.status).toBe("error");
+    if (result.status === "ok") throw new Error("expected empty payload failure");
+    expect(result.error).toBeInstanceOf(SurfaceInvalidInput);
+    expect(result.error).toMatchObject({ operation: "send-message", field: "content" });
+  });
+
+  it.each(VALID_DISCORD_CONTENT_CASES)(
+    "accepts non-empty payload shape %# before provider availability",
+    async (content) => {
+      const result = await createTestDiscordAdapter().sendMsg(
+        { platform: "discord", channelId: "c1" },
+        content,
+      );
+
+      expect(result.status).toBe("error");
+      if (result.status === "ok") throw new Error("expected disconnected adapter failure");
+      expect(result.error).toBeInstanceOf(SurfaceUnavailable);
+    },
+  );
 });
 
 describe("isRoutableDiscordUserMessage", () => {
@@ -530,7 +768,9 @@ describe("DiscordAdapter.listSessionParticipants", () => {
     );
 
     expect(listCalls).toEqual([{ limit: 1, cache: false }]);
-    expect(result).toMatchObject({
+    expect(result.status).toBe("ok");
+    if (result.status === "error") throw result.error;
+    expect(result.value).toMatchObject({
       source: "guild_members",
       participants: [{ userId: "u1", userName: "alice", displayName: "Alice" }],
     });
@@ -602,7 +842,9 @@ describe("DiscordAdapter.listSessionParticipants", () => {
     expect(threadFetchCalls).toEqual([{ withMember: true, limit: 100, cache: false }]);
     expect(guildMemberFetches).toBe(0);
     expect(userFetches).toBe(0);
-    expect(result).toMatchObject({
+    expect(result.status).toBe("ok");
+    if (result.status === "error") throw result.error;
+    expect(result.value).toMatchObject({
       source: "thread_members",
       participants: [{ userId: "u1", userName: "alice", displayName: "Alice" }],
     });
@@ -682,6 +924,105 @@ describe("DiscordAdapter detached event supervision", () => {
 });
 
 describe("DiscordAdapter.refreshCoreConfig", () => {
+  it("keeps paused recovery preparation provider-mutation free until normal output preparation", async () => {
+    const previousConfig = testConfigWithStatusMessage("previous presence");
+    const changedConfig = testConfigWithStatusMessage("changed presence");
+    let cfg = previousConfig;
+    let configReads = 0;
+    let channelFetches = 0;
+    const providerMutations: Array<{ readonly operation: string; readonly value?: unknown }> = [];
+    const adapter = createTestDiscordAdapter({
+      getConfig: async () => {
+        configReads += 1;
+        return cfg;
+      },
+    });
+    const internals = adapter as unknown as {
+      client: unknown;
+      cfg: CoreConfig;
+      appliedStatusMessage: string | null | undefined;
+    };
+    internals.client = {
+      user: {
+        setPresence(value: unknown) {
+          providerMutations.push({ operation: "setPresence", value });
+        },
+      },
+      channels: {
+        fetch: async () => {
+          channelFetches += 1;
+          const restoredMessage = {
+            id: "restored-output",
+            channelId: "c1",
+            attachments: new Map(),
+            edit: async (value: unknown) => {
+              providerMutations.push({ operation: "edit", value });
+              return restoredMessage;
+            },
+            reply: async (value: unknown) => {
+              providerMutations.push({ operation: "reply", value });
+              return restoredMessage;
+            },
+            delete: async () => {
+              providerMutations.push({ operation: "delete" });
+            },
+          };
+          return {
+            send: async (value: unknown) => {
+              providerMutations.push({ operation: "send", value });
+              return restoredMessage;
+            },
+            messages: { fetch: async () => restoredMessage },
+          };
+        },
+      },
+    };
+    internals.cfg = previousConfig;
+    internals.appliedStatusMessage = "previous presence";
+    cfg = changedConfig;
+
+    const prepared = await adapter.startOutput(
+      { platform: "discord", channelId: "c1" },
+      {
+        preparationMode: "paused-recovery",
+        resume: {
+          created: [{ platform: "discord", channelId: "c1", messageId: "restored-output" }],
+        },
+      },
+    );
+    expect(prepared.status).toBe("ok");
+    if (prepared.status === "error") throw prepared.error;
+    expect(
+      prepared.value.hydrateRecovery?.([{ type: "text.set", text: "restored response" }]),
+    ).toBe("visible");
+    await expect(prepared.value.abort("restore_rollback")).resolves.toEqual(Result.ok(undefined));
+    expect({ configReads, channelFetches, providerMutations }).toEqual({
+      configReads: 1,
+      channelFetches: 0,
+      providerMutations: [],
+    });
+
+    const normal = await adapter.startOutput({ platform: "discord", channelId: "c1" });
+    expect(normal.status).toBe("ok");
+    expect(configReads).toBe(2);
+    expect(channelFetches).toBe(0);
+    expect(providerMutations).toEqual([
+      {
+        operation: "setPresence",
+        value: {
+          activities: [
+            {
+              name: "changed presence",
+              state: "changed presence",
+              type: ActivityType.Custom,
+            },
+          ],
+          status: "online",
+        },
+      },
+    ]);
+  });
+
   it("applies, changes, and clears configured presence", async () => {
     let cfg = testConfigWithStatusMessage("reading threads");
     const presenceCalls: unknown[] = [];
@@ -846,12 +1187,14 @@ describe("DiscordAdapter.editMsg", () => {
       },
     };
 
-    await expect(
-      adapter.editMsg(
-        { platform: "discord", channelId: "c1", messageId: "m1" },
-        { text: "updated" },
-      ),
-    ).rejects.toThrow("authored by the Lilac Discord bot");
+    const result = await adapter.editMsg(
+      { platform: "discord", channelId: "c1", messageId: "m1" },
+      { text: "updated" },
+    );
+    expect(result.status).toBe("error");
+    if (result.status === "ok") throw new Error("expected edit failure");
+    expect(result.error).toBeInstanceOf(SurfacePermissionDenied);
+    expect(result.error.message).toContain("authored by the Lilac Discord bot");
   });
 
   it("edits content when a bot message has visible content plus one embed", async () => {

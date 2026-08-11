@@ -45,6 +45,7 @@ describe("discord-raw-normalizer", () => {
     const normalized = normalizeDiscordRaw({
       discord: {
         content: "fallback content",
+        isChat: false,
         embeds: [{ description: "fallback embed" }],
         replyToMessageId: "parent",
         referenceType: 0,
@@ -59,6 +60,7 @@ describe("discord-raw-normalizer", () => {
     });
 
     expect(normalized?.content).toBe("fallback content");
+    expect(normalized?.isChat).toBe(false);
     expect(normalized?.embeds).toEqual([{ description: "fallback embed" }]);
     expect(normalized?.attachments).toEqual([
       {

@@ -772,6 +772,7 @@ function buildBashChildEnv(params: {
     requestId: string;
     sessionId: string;
     requestClient: string;
+    currentTurnUserId?: string;
   };
   resolvedCwd: string;
   toolCallId?: string;
@@ -786,6 +787,7 @@ function buildBashChildEnv(params: {
     LILAC_REQUEST_ID: params.context?.requestId,
     LILAC_SESSION_ID: params.context?.sessionId,
     LILAC_REQUEST_CLIENT: params.context?.requestClient,
+    LILAC_CURRENT_TURN_USER_ID: params.context?.currentTurnUserId,
     LILAC_CWD: params.resolvedCwd,
     LILAC_TOOL_CALL_ID: params.toolCallId,
     LILAC_CONTROL_CAPABILITY: params.controlCapability,
@@ -827,6 +829,7 @@ export async function executeBash(
       requestId: string;
       sessionId: string;
       requestClient: string;
+      currentTurnUserId?: string;
     };
     abortSignal?: AbortSignal;
     toolCallId?: string;

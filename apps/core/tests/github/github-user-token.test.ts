@@ -4,7 +4,6 @@ import os from "node:os";
 import path from "node:path";
 
 import { getGithubEnvForBash, getGithubViewerLoginOrThrow } from "../../src/github/github-auth";
-import { getPreferredGithubAuthoritativeActorOrNull } from "../../src/github/github-api";
 import {
   clearGithubUserTokenSecret,
   readGithubUserTokenSecret,
@@ -134,52 +133,5 @@ describe("github user token secret", () => {
       ).resolves.toBe("Recovered-Owner");
       expect(calls).toBe(2);
     }
-  });
-
-  it("propagates configured PAT identity lookup failures and later recovers", async () => {
-    await writeGithubUserTokenSecret({
-      dataDir,
-      token: `github_pat_authority_${crypto.randomUUID()}`,
-      apiBaseUrl: "https://api.github.test",
-      login: "stale-persisted-owner",
-    });
-    let calls = 0;
-    installMockFetch(async () => {
-      calls += 1;
-      if (calls === 1) return new Response("bad gateway", { status: 502 });
-      return Response.json({ login: "Canonical-Owner" });
-    });
-
-    await expect(getPreferredGithubAuthoritativeActorOrNull({ dataDir })).rejects.toThrow(
-      "GitHub API error (502",
-    );
-    await expect(getPreferredGithubAuthoritativeActorOrNull({ dataDir })).resolves.toEqual({
-      source: "user",
-      login: "canonical-owner",
-    });
-    expect(calls).toBe(2);
-  });
-
-  it("resolves the current PAT viewer on every authoritative verification", async () => {
-    const token = `github_pat_rename_${crypto.randomUUID()}`;
-    await writeGithubUserTokenSecret({
-      dataDir,
-      token,
-      apiBaseUrl: "https://api.github.test",
-      login: "persisted-old-owner",
-    });
-    const viewers = ["Renamed-Owner", "Renamed-Again"];
-    let calls = 0;
-    installMockFetch(async () => Response.json({ login: viewers[calls++] }));
-
-    await expect(getPreferredGithubAuthoritativeActorOrNull({ dataDir })).resolves.toEqual({
-      source: "user",
-      login: "renamed-owner",
-    });
-    await expect(getPreferredGithubAuthoritativeActorOrNull({ dataDir })).resolves.toEqual({
-      source: "user",
-      login: "renamed-again",
-    });
-    expect(calls).toBe(2);
   });
 });

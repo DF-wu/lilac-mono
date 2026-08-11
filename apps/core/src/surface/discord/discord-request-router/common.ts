@@ -9,11 +9,10 @@ import {
 import { Result } from "better-result";
 import { z } from "zod";
 
-import type { MsgRef } from "../../types";
-import { formatGenericRequestId, formatQueuedRequestId } from "../request-ids";
+import type { MsgRefFor } from "../../runtime-descriptor";
+import { formatGenericRequestId, formatQueuedRequestId } from "../../bridge/request-ids";
 
 export type SessionMode = "mention" | "active";
-export type SessionSafetyMode = "trusted" | "restricted";
 
 export function previewText(text: string, max = 200): string {
   const trimmed = text.trim();
@@ -243,7 +242,7 @@ export function bufferedPromptRequestIdForActiveRequest(activeRequestId: string)
 export function parseDiscordMsgRefFromAdapterEvent(data: {
   channelId: string;
   messageId: string;
-}): MsgRef {
+}): MsgRefFor<"discord"> {
   return {
     platform: "discord",
     channelId: data.channelId,
@@ -300,23 +299,6 @@ export function resolveSessionGateEnabled(
   if (typeof parentGate === "boolean") return parentGate;
 
   return cfg.surface.router.activeGate.enabled;
-}
-
-export function resolveSessionSafetyMode(
-  cfg: CoreConfig,
-  sessionId: string,
-  parentChannelId?: string,
-): SessionSafetyMode {
-  const threadSafetyMode = cfg.surface.router.sessionModes[sessionId]?.safetyMode;
-  if (threadSafetyMode) return threadSafetyMode;
-
-  const parentId = parentChannelId?.trim();
-  if (parentId) {
-    const parentSafetyMode = cfg.surface.router.sessionModes[parentId]?.safetyMode;
-    if (parentSafetyMode) return parentSafetyMode;
-  }
-
-  return "trusted";
 }
 
 export function resolveSessionModelOverride(

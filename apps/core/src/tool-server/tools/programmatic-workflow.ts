@@ -221,12 +221,39 @@ function requestProgressTarget(context: RequestContext) {
   ) {
     return null;
   }
+  const principal = context.requestInitiator;
+  const principalMatchesRequest =
+    principal !== undefined &&
+    principal.platform === context.requestClient &&
+    context.requestInitiatorSessionId === context.sessionId;
   return {
     platform: context.requestClient,
-    userId: context.authenticatedPrincipal?.userId ?? null,
+    userId: principalMatchesRequest ? principal.userId : null,
     sessionRef: { platform: context.requestClient, channelId: context.sessionId },
     originMessageRef: null,
   } as const;
+}
+
+function validateWorkflowRequestIdentity(
+  context: RequestContext,
+): ResultType<void, WorkflowToolFailure> {
+  const principal = context.requestInitiator;
+  if (!principal && context.requestInitiatorSessionId === undefined) {
+    return Result.ok(undefined);
+  }
+  if (
+    !principal ||
+    principal.platform !== context.requestClient ||
+    !context.sessionId ||
+    context.requestInitiatorSessionId !== context.sessionId
+  ) {
+    return Result.err(
+      new WorkflowToolFailure({
+        message: "Workflow authenticated identity does not match the request origin",
+      }),
+    );
+  }
+  return Result.ok(undefined);
 }
 
 function resolveWorkflowProgressTarget(
@@ -645,6 +672,7 @@ export class ProgrammaticWorkflow implements ServerTool {
     const { store, projectScope } = await this.workflowCallContext(opts);
     const definitions = await this.definitions(projectScope.canonicalRoot);
     const context = adaptWorkflowToolResultToHost(decodeTriggerContext(opts?.context));
+    adaptWorkflowToolResultToHost(validateWorkflowRequestIdentity(context));
     const requestTarget = requestProgressTarget(context);
     const definition = adaptWorkflowDefinitionResultToToolHost(
       await definitions.getResult({ scope: input.scope, name: input.name }),
@@ -878,6 +906,7 @@ export class ProgrammaticWorkflow implements ServerTool {
     const { store, projectScope } = await this.workflowCallContext(opts);
     const definitions = await this.definitions(projectScope.canonicalRoot);
     const context = adaptWorkflowToolResultToHost(decodeTriggerContext(opts?.context));
+    adaptWorkflowToolResultToHost(validateWorkflowRequestIdentity(context));
     const requestTarget = requestProgressTarget(context);
     const definition = adaptWorkflowDefinitionResultToToolHost(
       await definitions.getResult({ scope: input.scope, name: input.name }),

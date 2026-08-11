@@ -7,40 +7,30 @@ import { lilacEventTypes } from "@stanley2058/lilac-event-bus";
 import { createLogger } from "@stanley2058/lilac-utils";
 import { Panic, type Result as ResultType } from "better-result";
 
-import type { SurfaceAdapter } from "../adapter";
+import type { SurfaceAdapterEventSource } from "../adapter";
 import type { AdapterEvent } from "../events";
+import { requireDescriptorBoundAdapterEvent } from "../produced-ref-guard";
+import type { RegisteredSurfacePlatform } from "../types";
 import {
   toBusEvtAdapterMessageCreated,
   toBusEvtAdapterMessageDeleted,
   toBusEvtAdapterMessageUpdated,
   toBusEvtAdapterReactionAdded,
   toBusEvtAdapterReactionRemoved,
-} from "../discord/discord-adapter";
-import { escapeSurfaceMetadataTags, formatSurfaceMetadataLine } from "./surface-metadata";
+} from "./adapter-event-projection";
+import { toBusDiscordCommandInvokedData } from "../discord/discord-command-projection";
 import type { TranscriptStore } from "../../transcript/transcript-store";
 import { adaptEventPublishResultToHost } from "../../shared/event-bus-result";
 import { formatBridgeLogContext } from "./bridge-log";
 
-function buildSlashCommandUserMessageContent(
-  evt: Extract<AdapterEvent, { type: "adapter.command.invoked" }>,
-) {
-  const header = formatSurfaceMetadataLine({
-    platform: evt.platform,
-    ...(evt.userId ? { user_id: evt.userId } : {}),
-    ...(evt.userName ? { user_name: evt.userName } : {}),
-    message_time: new Date(evt.ts).toISOString(),
-  });
-
-  return `${header}\n${escapeSurfaceMetadataTags(evt.text)}`.trimEnd();
-}
-
 export async function bridgeAdapterToBus(params: {
-  adapter: SurfaceAdapter;
+  eventSource: SurfaceAdapterEventSource;
+  platform: RegisteredSurfacePlatform;
   bus: LilacBus;
   subscriptionId: string;
   transcriptStore?: TranscriptStore;
 }) {
-  const { adapter, bus } = params;
+  const { eventSource, bus } = params;
   const logger = createLogger({
     module: "bridge:adapter-to-bus",
   });
@@ -84,17 +74,15 @@ export async function bridgeAdapterToBus(params: {
     logPublish({ ...context, ok: true });
   };
 
-  return await adapter.subscribe(async (evt: AdapterEvent) => {
+  return await eventSource.subscribe(async (evt: AdapterEvent) => {
+    requireDescriptorBoundAdapterEvent(params.platform, evt);
     const startedAt = Date.now();
 
     switch (evt.type) {
       case "adapter.message.created": {
         const published = await bus.publish(
           lilacEventTypes.EvtAdapterMessageCreated,
-          toBusEvtAdapterMessageCreated({
-            message: evt.message,
-            channelName: evt.channelName,
-          }),
+          toBusEvtAdapterMessageCreated(evt),
         );
         finishPublish(published, {
           adapterEventType: evt.type,
@@ -111,10 +99,7 @@ export async function bridgeAdapterToBus(params: {
       case "adapter.message.updated": {
         const published = await bus.publish(
           lilacEventTypes.EvtAdapterMessageUpdated,
-          toBusEvtAdapterMessageUpdated({
-            message: evt.message,
-            channelName: evt.channelName,
-          }),
+          toBusEvtAdapterMessageUpdated(evt),
         );
         finishPublish(published, {
           adapterEventType: evt.type,
@@ -170,13 +155,7 @@ export async function bridgeAdapterToBus(params: {
 
         const published = await bus.publish(
           lilacEventTypes.EvtAdapterMessageDeleted,
-          toBusEvtAdapterMessageDeleted({
-            messageRef: evt.messageRef,
-            session: evt.session,
-            channelName: evt.channelName,
-            ts: evt.ts,
-            raw: evt.raw,
-          }),
+          toBusEvtAdapterMessageDeleted(evt),
         );
         finishPublish(published, {
           adapterEventType: evt.type,
@@ -192,16 +171,7 @@ export async function bridgeAdapterToBus(params: {
       case "adapter.reaction.added": {
         const published = await bus.publish(
           lilacEventTypes.EvtAdapterReactionAdded,
-          toBusEvtAdapterReactionAdded({
-            messageRef: evt.messageRef,
-            session: evt.session,
-            channelName: evt.channelName,
-            reaction: evt.reaction,
-            userId: evt.userId,
-            userName: evt.userName,
-            ts: evt.ts,
-            raw: evt.raw,
-          }),
+          toBusEvtAdapterReactionAdded(evt),
         );
         finishPublish(published, {
           adapterEventType: evt.type,
@@ -218,16 +188,7 @@ export async function bridgeAdapterToBus(params: {
       case "adapter.reaction.removed": {
         const published = await bus.publish(
           lilacEventTypes.EvtAdapterReactionRemoved,
-          toBusEvtAdapterReactionRemoved({
-            messageRef: evt.messageRef,
-            session: evt.session,
-            channelName: evt.channelName,
-            reaction: evt.reaction,
-            userId: evt.userId,
-            userName: evt.userName,
-            ts: evt.ts,
-            raw: evt.raw,
-          }),
+          toBusEvtAdapterReactionRemoved(evt),
         );
         finishPublish(published, {
           adapterEventType: evt.type,
@@ -285,27 +246,7 @@ export async function bridgeAdapterToBus(params: {
       case "adapter.command.invoked": {
         const published = await bus.publish(
           lilacEventTypes.CmdRequestMessage,
-          {
-            queue: "prompt",
-            messages: [{ role: "user", content: buildSlashCommandUserMessageContent(evt) }],
-            ...(evt.modelOverride ? { modelOverride: evt.modelOverride } : {}),
-            raw: {
-              authenticatedActor: {
-                platform: evt.platform,
-                userId: evt.userId,
-              },
-              sessionMode: evt.sessionMode,
-              sessionConfigId: evt.sessionConfigId,
-              ...(evt.modelOverride ? { modelOverride: evt.modelOverride } : {}),
-              customCommand: {
-                name: evt.commandName,
-                args: evt.args,
-                ...(evt.prompt ? { prompt: evt.prompt } : {}),
-                text: evt.text,
-                source: "discord-slash",
-              },
-            },
-          },
+          toBusDiscordCommandInvokedData(evt),
           {
             headers: {
               request_id: evt.requestId,

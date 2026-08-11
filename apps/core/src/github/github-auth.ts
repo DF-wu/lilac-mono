@@ -97,22 +97,6 @@ async function fetchViewerLoginFromGithub(input: {
   return Result.ok(parsed.data.login);
 }
 
-export async function resolveGithubViewerLoginResult(input: {
-  apiBaseUrl: string;
-  token: string;
-}): Promise<ResultType<string, GithubAuthFailed>> {
-  return await fetchViewerLoginFromGithub(input);
-}
-
-export async function resolveGithubViewerLoginOrThrow(input: {
-  apiBaseUrl: string;
-  token: string;
-}): Promise<string> {
-  const resolved = await resolveGithubViewerLoginResult(input);
-  if (resolved.status === "error") throw resolved.error;
-  return resolved.value;
-}
-
 export async function getGithubViewerLoginResult(input: {
   apiBaseUrl: string;
   token: string;

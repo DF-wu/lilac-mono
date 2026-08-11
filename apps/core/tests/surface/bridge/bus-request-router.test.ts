@@ -1,5 +1,8 @@
 import { describe, expect, it, spyOn } from "bun:test";
 import { Panic, Result, TaggedError, type Result as ResultType } from "better-result";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
 
 import {
   createLilacBus,
@@ -22,12 +25,37 @@ import {
 import { parseCoreConfigV1ToUniversal } from "@stanley2058/lilac-utils";
 import { Logger } from "@stanley2058/simple-module-logger";
 
-import { startBusRequestRouter } from "../../../src/surface/bridge/bus-request-router";
-import { formatBufferedMessageForGateTranscript } from "../../../src/surface/bridge/bus-request-router/gate";
+import {
+  adaptDiscordRequestRouterStartOutcomeToHost,
+  DiscordRequestRouterAdapterSelfLookupRejected,
+  DiscordRequestRouterStartupAndCleanupFailed,
+  DiscordRequestRouterSubscriptionStopRejected,
+  discordRequestCompositionFailurePolicy,
+  startDiscordRequestRouter,
+  type StartDiscordRequestRouterInput,
+} from "../../../src/surface/discord/discord-request-router";
+import {
+  resolvePreviousMessageText,
+  resolveRepliedToMessageText,
+} from "../../../src/surface/discord/discord-request-router/context";
+import { formatBufferedMessageForGateTranscript } from "../../../src/surface/discord/discord-request-router/gate";
+import { publishSingleMessagePrompt } from "../../../src/surface/discord/discord-request-router/publish";
+import { createDiscordRelayPolicy } from "../../../src/surface/discord/discord-runtime-descriptor";
+import { bridgeBusToAdapter } from "../../../src/surface/bridge/subscribe-from-bus";
+import {
+  GRACEFUL_RESTART_SNAPSHOT_VERSION,
+  GracefulRestartDispositionConflict,
+  SqliteGracefulRestartStore,
+} from "../../../src/runtime/graceful-restart-store";
+import {
+  SurfaceInvalidInput,
+  SurfacePermissionDenied,
+  SurfaceRateLimited,
+  SurfaceUnavailable,
+  type SurfaceOperationResult,
+} from "../../../src/surface/adapter";
 
-import type { SurfaceAdapter, SurfaceOutputStream } from "../../../src/surface/adapter";
 import type {
-  AdapterCapabilities,
   ContentOpts,
   LimitOpts,
   MsgRef,
@@ -35,17 +63,30 @@ import type {
   SessionRef,
   SurfaceMessage,
   SurfaceSelf,
-  SurfaceSession,
 } from "../../../src/surface/types";
 
-import type { TranscriptStore } from "../../../src/transcript/transcript-store";
+import {
+  CoreOwnedBlobIntegrityError,
+  SqliteTranscriptStore,
+  type TranscriptStore,
+} from "../../../src/transcript/transcript-store";
 import type { ModelMessage } from "ai";
+import { SurfaceAdapterTestBase } from "../../helpers/surface-adapter-test-base";
 
 type TestRawBus = RawBus & {
   readonly deliveryActions: Array<{ readonly topic: string; readonly action: RawDeliveryAction }>;
+  readonly returnedStartFailures: EventDeliveryStartFailed[];
+  readonly stoppedTopics: string[];
+  activeSubscriptionCount(): number;
   failPublicationsTo(topic: string, cause: unknown): void;
+  failNextPublicationTo(topic: string, cause: unknown): void;
   failStartsFor(topic: string, cause: unknown): void;
+  rejectStartsFor(topic: string, cause: unknown): void;
   failStopsFor(topic: string, cause: unknown): void;
+  rejectStopsFor(topic: string, cause: unknown): void;
+  throwStopsFor(topic: string, cause: unknown): void;
+  blockStopsFor(topic: string): { readonly entered: Promise<void>; release(): void };
+  clearStopFailuresFor(topic: string): void;
   finishDelivery(topic: string, error: EventDeliveryDoneError): void;
 };
 
@@ -53,6 +94,14 @@ class RouterTestHookFailure extends TaggedError("RouterTestHookFailure")<{
   readonly cause: unknown;
   readonly message: string;
 }> {}
+
+async function startBusRequestRouter(input: StartDiscordRequestRouterInput) {
+  return adaptDiscordRequestRouterStartOutcomeToHost(
+    await startDiscordRequestRouter(input),
+    () => {},
+    () => {},
+  );
+}
 
 function expectStarted<T>(started: ResultType<T, EventDeliveryStartFailed>): T {
   if (started.status === "ok") return started.value;
@@ -77,9 +126,22 @@ async function subscribeTopicForTest<TTopic extends LilacTopic>(
 function createInMemoryRawBus(): TestRawBus {
   const topics = new Map<string, Array<Message<unknown>>>();
   const deliveryActions: TestRawBus["deliveryActions"] = [];
+  const returnedStartFailures: EventDeliveryStartFailed[] = [];
+  const stoppedTopics: string[] = [];
   const publicationFailures = new Map<string, unknown>();
+  const nextPublicationFailures = new Map<string, unknown[]>();
   const startFailures = new Map<string, unknown>();
+  const startRejections = new Map<string, unknown>();
   const stopFailures = new Map<string, unknown>();
+  const stopRejections = new Map<string, unknown>();
+  const stopThrows = new Map<string, unknown>();
+  const stopBlocks = new Map<
+    string,
+    {
+      readonly entered: PromiseWithResolvers<void>;
+      readonly release: PromiseWithResolvers<void>;
+    }
+  >();
   const deliverySubs = new Set<{
     topic: string;
     opts: SubscriptionOptions;
@@ -103,14 +165,47 @@ function createInMemoryRawBus(): TestRawBus {
 
   return {
     deliveryActions,
+    returnedStartFailures,
+    stoppedTopics,
+    activeSubscriptionCount: () => deliverySubs.size,
     failPublicationsTo: (topic, cause) => {
       publicationFailures.set(topic, cause);
+    },
+    failNextPublicationTo: (topic, cause) => {
+      const failures = nextPublicationFailures.get(topic) ?? [];
+      failures.push(cause);
+      nextPublicationFailures.set(topic, failures);
     },
     failStartsFor: (topic, cause) => {
       startFailures.set(topic, cause);
     },
+    rejectStartsFor: (topic, cause) => {
+      startRejections.set(topic, cause);
+    },
     failStopsFor: (topic, cause) => {
       stopFailures.set(topic, cause);
+    },
+    rejectStopsFor: (topic, cause) => {
+      stopRejections.set(topic, cause);
+    },
+    throwStopsFor: (topic, cause) => {
+      stopThrows.set(topic, cause);
+    },
+    blockStopsFor: (topic) => {
+      const block = {
+        entered: Promise.withResolvers<void>(),
+        release: Promise.withResolvers<void>(),
+      };
+      stopBlocks.set(topic, block);
+      return {
+        entered: block.entered.promise,
+        release: () => block.release.resolve(),
+      };
+    },
+    clearStopFailuresFor: (topic) => {
+      stopFailures.delete(topic);
+      stopRejections.delete(topic);
+      stopThrows.delete(topic);
     },
     finishDelivery: (topic, error) => {
       for (const subscription of deliverySubs) {
@@ -118,6 +213,12 @@ function createInMemoryRawBus(): TestRawBus {
       }
     },
     publish: async <TData>(msg: Omit<Message<TData>, "id" | "ts">, opts: PublishOptions) => {
+      const nextFailures = nextPublicationFailures.get(opts.topic);
+      if (nextFailures && nextFailures.length > 0) {
+        const cause = nextFailures.shift();
+        if (nextFailures.length === 0) nextPublicationFailures.delete(opts.topic);
+        throw cause;
+      }
       if (publicationFailures.has(opts.topic)) throw publicationFailures.get(opts.topic);
       const id = String(Date.now()) + "-0";
       const stored: Message<unknown> = {
@@ -144,14 +245,15 @@ function createInMemoryRawBus(): TestRawBus {
     },
 
     subscribe: async (topic, opts, handler) => {
+      if (startRejections.has(topic)) throw startRejections.get(topic);
       if (startFailures.has(topic)) {
-        return Result.err(
-          new EventDeliveryStartFailed({
-            topic,
-            cause: startFailures.get(topic),
-            message: "forced start failure",
-          }),
-        );
+        const failure = new EventDeliveryStartFailed({
+          topic,
+          cause: startFailures.get(topic),
+          message: "forced start failure",
+        });
+        returnedStartFailures.push(failure);
+        return Result.err(failure);
       }
       const done = Promise.withResolvers<ResultType<void, EventDeliveryDoneError>>();
       const entry = { topic, opts, handler, done };
@@ -165,19 +267,30 @@ function createInMemoryRawBus(): TestRawBus {
 
       return Result.ok({
         done: done.promise,
-        stop: async () => {
-          deliverySubs.delete(entry);
-          done.resolve(Result.ok(undefined));
-          if (stopFailures.has(topic)) {
-            return Result.err(
-              new EventDeliveryStopFailed({
-                topic,
-                cause: stopFailures.get(topic),
-                message: "forced stop failure",
-              }),
-            );
-          }
-          return Result.ok(undefined);
+        stop: () => {
+          stoppedTopics.push(topic);
+          const block = stopBlocks.get(topic);
+          const finishStop = (): Promise<ResultType<void, EventDeliveryStopFailed>> => {
+            deliverySubs.delete(entry);
+            done.resolve(Result.ok(undefined));
+            if (stopThrows.has(topic)) throw stopThrows.get(topic);
+            if (stopRejections.has(topic)) return Promise.reject(stopRejections.get(topic));
+            if (stopFailures.has(topic)) {
+              return Promise.resolve(
+                Result.err(
+                  new EventDeliveryStopFailed({
+                    topic,
+                    cause: stopFailures.get(topic),
+                    message: "forced stop failure",
+                  }),
+                ),
+              );
+            }
+            return Promise.resolve(Result.ok(undefined));
+          };
+          if (!block) return finishStop();
+          block.entered.resolve();
+          return block.release.promise.then(finishStop);
         },
       });
     },
@@ -197,8 +310,13 @@ function createInMemoryRawBus(): TestRawBus {
   };
 }
 
-class FakeAdapter implements SurfaceAdapter {
-  constructor(private readonly messages: Record<string, SurfaceMessage>) {}
+class FakeAdapter extends SurfaceAdapterTestBase {
+  constructor(
+    private readonly messages: Record<string, SurfaceMessage>,
+    private readonly platform: "discord" | "github" = "discord",
+  ) {
+    super();
+  }
 
   async connect(): Promise<void> {
     throw new Error("not implemented");
@@ -208,30 +326,34 @@ class FakeAdapter implements SurfaceAdapter {
   }
 
   async getSelf(): Promise<SurfaceSelf> {
-    return { platform: "discord", userId: "bot", userName: "lilac" };
+    return { platform: this.platform, userId: "bot", userName: "lilac" };
   }
-  async getCapabilities(): Promise<AdapterCapabilities> {
-    throw new Error("not implemented");
-  }
-
-  async listSessions(): Promise<SurfaceSession[]> {
-    throw new Error("not implemented");
+  async listSessions() {
+    return Result.ok([]);
   }
 
-  async startOutput(_sessionRef: SessionRef): Promise<SurfaceOutputStream> {
-    throw new Error("not implemented");
+  async startOutput(_sessionRef: SessionRef) {
+    return Result.ok({
+      hydrateRecovery: () => "visible" as const,
+      push: async () => Result.ok("visible" as const),
+      finish: async () => {
+        const ref = { platform: "discord" as const, channelId: "unused", messageId: "unused" };
+        return Result.ok({ created: [ref], last: ref });
+      },
+      abort: async () => Result.ok(undefined),
+    });
   }
 
-  async sendMsg(_sessionRef: SessionRef, _content: ContentOpts, _opts?: SendOpts): Promise<MsgRef> {
-    throw new Error("not implemented");
+  async sendMsg(_sessionRef: SessionRef, _content: ContentOpts, _opts?: SendOpts) {
+    return Result.ok({ platform: "discord", channelId: "unused", messageId: "unused" } as const);
   }
 
-  async readMsg(msgRef: MsgRef): Promise<SurfaceMessage | null> {
+  async readMsg(msgRef: MsgRef): Promise<SurfaceOperationResult<SurfaceMessage | null>> {
     const key = `${msgRef.channelId}:${msgRef.messageId}`;
-    return this.messages[key] ?? null;
+    return Result.ok(this.messages[key] ?? null);
   }
 
-  async listMsg(sessionRef: SessionRef, opts?: LimitOpts): Promise<SurfaceMessage[]> {
+  async listMsg(sessionRef: SessionRef, opts?: LimitOpts) {
     const limit = opts?.limit ?? 50;
     const before = opts?.beforeMessageId;
 
@@ -252,21 +374,24 @@ class FakeAdapter implements SurfaceAdapter {
         })
       : list;
 
-    return eligible.slice(Math.max(0, eligible.length - limit));
+    return Result.ok(eligible.slice(Math.max(0, eligible.length - limit)));
   }
 
-  async editMsg(_msgRef: MsgRef, _content: ContentOpts): Promise<void> {
-    throw new Error("not implemented");
+  async editMsg(_msgRef: MsgRef, _content: ContentOpts) {
+    return Result.ok(undefined);
   }
 
-  async deleteMsg(_msgRef: MsgRef): Promise<void> {
-    throw new Error("not implemented");
+  async deleteMsg(_msgRef: MsgRef) {
+    return Result.ok(undefined);
   }
 
-  async getReplyContext(msgRef: MsgRef, opts?: LimitOpts): Promise<SurfaceMessage[]> {
+  async getReplyContext(
+    msgRef: MsgRef,
+    opts?: LimitOpts,
+  ): Promise<SurfaceOperationResult<SurfaceMessage[]>> {
     const key = `${msgRef.channelId}:${msgRef.messageId}`;
     const base = this.messages[key];
-    if (!base) return [];
+    if (!base) return Result.ok([]);
 
     const limit = opts?.limit ?? 20;
     const half = Math.max(1, Math.floor(limit / 2));
@@ -281,31 +406,31 @@ class FakeAdapter implements SurfaceAdapter {
 
     const after = all.filter((m) => m.ts > base.ts).slice(0, half);
 
-    return before.concat(after);
+    return Result.ok(before.concat(after));
   }
 
-  async addReaction(_msgRef: MsgRef, _reaction: string): Promise<void> {
-    throw new Error("not implemented");
+  async addReaction(_msgRef: MsgRef, _reaction: string) {
+    return Result.ok(undefined);
   }
 
-  async removeReaction(_msgRef: MsgRef, _reaction: string): Promise<void> {
-    throw new Error("not implemented");
+  async removeReaction(_msgRef: MsgRef, _reaction: string) {
+    return Result.ok(undefined);
   }
 
-  async listReactions(_msgRef: MsgRef): Promise<string[]> {
-    return [];
+  async listReactions(_msgRef: MsgRef) {
+    return Result.ok([]);
   }
 
   async subscribe(): Promise<{ stop(): Promise<void> }> {
     throw new Error("not implemented");
   }
 
-  async getUnRead(_sessionRef: SessionRef): Promise<SurfaceMessage[]> {
-    throw new Error("not implemented");
+  async getUnRead(_sessionRef: SessionRef) {
+    return Result.ok([]);
   }
 
-  async markRead(_sessionRef: SessionRef): Promise<void> {
-    throw new Error("not implemented");
+  async markRead(_sessionRef: SessionRef) {
+    return Result.ok(undefined);
   }
 }
 
@@ -316,11 +441,116 @@ function collectUserText(messages: readonly ModelMessage[]): string {
     if (msg.role !== "user") continue;
     if (typeof msg.content === "string") {
       parts.push(msg.content);
+      continue;
+    }
+    for (const part of msg.content) {
+      if (part.type === "text") parts.push(part.text);
     }
   }
 
   return parts.join("\n\n");
 }
+
+describe("Discord request composition failure policy", () => {
+  it.each([
+    new SurfaceRateLimited({
+      platform: "discord",
+      operation: "read-message",
+      message: "rate limited",
+    }),
+    new SurfaceUnavailable({
+      platform: "discord",
+      operation: "read-message",
+      message: "unavailable",
+    }),
+  ])("classifies $error._tag as a transient gateway drop", (error) => {
+    expect(discordRequestCompositionFailurePolicy(error)).toEqual({
+      disposition: "drop-transient-gateway-event",
+      level: "warn",
+      retryable: true,
+    });
+  });
+
+  it.each([
+    new SurfaceInvalidInput({
+      platform: "discord",
+      operation: "read-message",
+      field: "messageId",
+      message: "invalid",
+    }),
+    new SurfacePermissionDenied({
+      platform: "discord",
+      operation: "read-message",
+      message: "forbidden",
+    }),
+  ])("classifies $error._tag as a permanent gateway drop", (error) => {
+    expect(discordRequestCompositionFailurePolicy(error)).toEqual({
+      disposition: "drop-permanent-gateway-event",
+      level: "warn",
+      retryable: false,
+    });
+  });
+
+  it("keeps owned blob integrity failures distinct", () => {
+    expect(
+      discordRequestCompositionFailurePolicy(new CoreOwnedBlobIntegrityError("corrupt blob")),
+    ).toEqual({
+      disposition: "drop-integrity-failure",
+      level: "error",
+      retryable: false,
+    });
+  });
+});
+
+describe("Discord authenticated-origin publication", () => {
+  it("does not publish when the authenticated-origin re-read fails", async () => {
+    const raw = createInMemoryRawBus();
+    const bus = createLilacBus(raw);
+    const logger = new Logger({ module: "discord-origin-reread-test" });
+    const msgRef = { platform: "discord" as const, channelId: "channel", messageId: "message" };
+    const message: SurfaceMessage = {
+      ref: msgRef,
+      session: { platform: "discord", channelId: "channel" },
+      userId: "authenticated-user",
+      text: "hello",
+      ts: 1,
+    };
+    const adapter = new FakeAdapter({ "channel:message": message });
+    const failure = new SurfaceUnavailable({
+      platform: "discord",
+      operation: "read-message",
+      message: "origin re-read unavailable",
+    });
+    let reads = 0;
+    spyOn(adapter, "readMsg").mockImplementation(async () => {
+      reads += 1;
+      return reads === 1 ? Result.ok(message) : Result.err(failure);
+    });
+    const publish = spyOn(raw, "publish");
+
+    try {
+      const result = await publishSingleMessagePrompt({
+        adapter,
+        bus,
+        cfg: parseCoreConfigV1ToUniversal({}),
+        logger,
+        input: {
+          requestId: "discord:channel:message",
+          sessionId: "channel",
+          sessionConfigId: "channel",
+          msgRef,
+          sessionMode: "mention",
+        },
+      });
+
+      expect(result).toEqual(Result.err(failure));
+      expect(reads).toBe(2);
+      expect(publish).not.toHaveBeenCalled();
+    } finally {
+      await bus.close();
+    }
+  });
+});
 
 describe("formatBufferedMessageForGateTranscript", () => {
   it("escapes metadata tags anywhere in the buffered message text", () => {
@@ -343,7 +573,122 @@ describe("formatBufferedMessageForGateTranscript", () => {
   });
 });
 
+describe("Discord request router context fallbacks", () => {
+  it("preserves Panic from previous-message context and falls back for a typed failure", async () => {
+    const adapter = new FakeAdapter({});
+    const panic = new Panic({ message: "reply context invariant failed" });
+    const getReplyContext = spyOn(adapter, "getReplyContext")
+      .mockRejectedValueOnce(panic)
+      .mockResolvedValueOnce(
+        Result.err(
+          new SurfaceUnavailable({
+            platform: "discord",
+            operation: "read-message",
+            message: "reply context unavailable",
+          }),
+        ),
+      );
+    const input = {
+      msgRef: { platform: "discord" as const, channelId: "channel", messageId: "message" },
+      triggerTs: 1,
+    };
+
+    await expect(resolvePreviousMessageText({ adapter, input })).rejects.toBe(panic);
+    expect(await resolvePreviousMessageText({ adapter, input })).toBeUndefined();
+    getReplyContext.mockRestore();
+  });
+
+  it("preserves Panic from replied-message context and falls back for a typed failure", async () => {
+    const adapter = new FakeAdapter({});
+    const panic = new Panic({ message: "message read invariant failed" });
+    const readMsg = spyOn(adapter, "readMsg")
+      .mockRejectedValueOnce(panic)
+      .mockResolvedValueOnce(
+        Result.err(
+          new SurfaceUnavailable({
+            platform: "discord",
+            operation: "read-message",
+            message: "message unavailable",
+          }),
+        ),
+      );
+    const input = { sessionId: "channel", replyToMessageId: "message" };
+
+    await expect(resolveRepliedToMessageText({ adapter, input })).rejects.toBe(panic);
+    expect(await resolveRepliedToMessageText({ adapter, input })).toBeUndefined();
+    readMsg.mockRestore();
+  });
+});
+
 describe("startBusRequestRouter", () => {
+  it("returns an owned startup failure when adapter self lookup rejects", async () => {
+    const raw = createInMemoryRawBus();
+    const adapter = new FakeAdapter({});
+    const cause = new Error("adapter unavailable");
+    const getSelf = spyOn(adapter, "getSelf").mockRejectedValue(cause);
+
+    const outcome = await startDiscordRequestRouter({
+      adapter,
+      bus: createLilacBus(raw),
+      subscriptionId: "discord-router-self-rejection",
+      config: parseCoreConfigV1ToUniversal({}),
+    });
+
+    expect(outcome.kind).toBe("result");
+    expect(outcome.residualRouter).toBeNull();
+    if (outcome.kind === "result") {
+      expect(outcome.result.status).toBe("error");
+      if (outcome.result.status === "error") {
+        expect(outcome.result.error).toBeInstanceOf(DiscordRequestRouterAdapterSelfLookupRejected);
+        if (DiscordRequestRouterAdapterSelfLookupRejected.is(outcome.result.error)) {
+          expect(outcome.result.error.cause).toBe(cause);
+        }
+      }
+    }
+    expect(raw.activeSubscriptionCount()).toBe(0);
+    expect(raw.stoppedTopics).toEqual([]);
+    getSelf.mockRestore();
+  });
+
+  it("returns an exact adapter self lookup Panic without starting subscriptions", async () => {
+    const raw = createInMemoryRawBus();
+    const adapter = new FakeAdapter({});
+    const panic = new Panic({ message: "adapter identity invariant failed" });
+    const getSelf = spyOn(adapter, "getSelf").mockRejectedValue(panic);
+
+    const outcome = await startDiscordRequestRouter({
+      adapter,
+      bus: createLilacBus(raw),
+      subscriptionId: "discord-router-self-panic",
+      config: parseCoreConfigV1ToUniversal({}),
+    });
+
+    expect(outcome.kind).toBe("panic");
+    if (outcome.kind === "panic") {
+      expect(outcome.panic).toBe(panic);
+      expect(outcome.startupFailure).toBeNull();
+      expect(outcome.residualRouter).toBeNull();
+    }
+    expect(raw.activeSubscriptionCount()).toBe(0);
+    expect(raw.stoppedTopics).toEqual([]);
+    getSelf.mockRestore();
+  });
+
+  it("rejects a non-Discord adapter before starting subscriptions", async () => {
+    const raw = createInMemoryRawBus();
+
+    await expect(
+      startBusRequestRouter({
+        adapter: new FakeAdapter({}, "github"),
+        bus: createLilacBus(raw),
+        subscriptionId: "discord-router-platform-invariant",
+        config: parseCoreConfigV1ToUniversal({}),
+      }),
+    ).rejects.toBeInstanceOf(Panic);
+    expect(raw.activeSubscriptionCount()).toBe(0);
+    expect(raw.deliveryActions).toEqual([]);
+  });
+
   it("parks malformed lifecycle deliveries and commits ignored and successful lifecycle branches", async () => {
     const raw = createInMemoryRawBus();
     const bus = createLilacBus(raw);
@@ -369,7 +714,13 @@ describe("startBusRequestRouter", () => {
     await bus.publish(
       lilacEventTypes.EvtRequestLifecycleChanged,
       { state: "running" },
-      { headers: { request_id: "request", session_id: "session" } },
+      {
+        headers: {
+          request_id: "request",
+          session_id: "session",
+          request_client: "discord",
+        },
+      },
     );
 
     expect(raw.deliveryActions.map(({ action }) => action.disposition)).toEqual([
@@ -535,6 +886,371 @@ describe("startBusRequestRouter", () => {
 
     raw.failStopsFor("evt.surface", new Error("cleanup failed"));
     await expect(router.stop()).rejects.toBeInstanceOf(EventDeliveryStopFailed);
+  });
+
+  it.each([
+    ["evt.surface", ["evt.request"]],
+    ["evt.adapter", ["evt.surface", "evt.request"]],
+  ] as const)(
+    "rolls back earlier subscriptions in reverse order when %s startup fails",
+    async (failedTopic, expectedStops) => {
+      const raw = createInMemoryRawBus();
+      raw.failStartsFor(failedTopic, new Error("later subscription start failed"));
+
+      await expect(
+        startBusRequestRouter({
+          adapter: new FakeAdapter({}),
+          bus: createLilacBus(raw),
+          subscriptionId: `router-partial-start-${failedTopic}`,
+          config: parseCoreConfigV1ToUniversal({}),
+        }),
+      ).rejects.toBeInstanceOf(EventDeliveryStartFailed);
+
+      expect(raw.stoppedTopics).toEqual([...expectedStops]);
+      expect(raw.activeSubscriptionCount()).toBe(0);
+    },
+  );
+
+  it("awaits each reverse-order rollback stop before starting the next", async () => {
+    const raw = createInMemoryRawBus();
+    raw.failStartsFor("evt.adapter", new Error("adapter start failed"));
+    const surfaceStop = raw.blockStopsFor("evt.surface");
+
+    const starting = startDiscordRequestRouter({
+      adapter: new FakeAdapter({}),
+      bus: createLilacBus(raw),
+      subscriptionId: "router-sequential-rollback",
+      config: parseCoreConfigV1ToUniversal({}),
+    });
+
+    await surfaceStop.entered;
+    expect(raw.stoppedTopics).toEqual(["evt.surface"]);
+    surfaceStop.release();
+
+    const outcome = await starting;
+    expect(outcome.kind).toBe("result");
+    if (outcome.kind === "result") expect(outcome.result.status).toBe("error");
+    expect(raw.stoppedTopics).toEqual(["evt.surface", "evt.request"]);
+    expect(raw.activeSubscriptionCount()).toBe(0);
+  });
+
+  it("preserves a subscription startup Panic while attempting every rollback", async () => {
+    const raw = createInMemoryRawBus();
+    const panic = new Panic({ message: "router subscription startup invariant failed" });
+    raw.rejectStartsFor("evt.adapter", panic);
+    raw.throwStopsFor("evt.surface", new Error("surface cleanup threw"));
+    raw.failStopsFor("evt.request", new Error("lifecycle cleanup failed"));
+
+    const outcome = await startDiscordRequestRouter({
+      adapter: new FakeAdapter({}),
+      bus: createLilacBus(raw),
+      subscriptionId: "router-start-panic",
+      config: parseCoreConfigV1ToUniversal({}),
+    });
+
+    expect(outcome.kind).toBe("panic");
+    if (outcome.kind === "panic") {
+      expect(outcome.panic).toBe(panic);
+      expect(outcome.startupFailure).toBeNull();
+      expect(outcome.ordinaryCleanupFailure?.failures).toHaveLength(2);
+    }
+    expect(outcome.residualRouter).not.toBeNull();
+    expect(raw.stoppedTopics).toEqual(["evt.surface", "evt.request"]);
+
+    let loggedOrdinaryFailureCount = 0;
+    let thrown: unknown;
+    try {
+      adaptDiscordRequestRouterStartOutcomeToHost(
+        outcome,
+        () => {},
+        (diagnostics) => {
+          loggedOrdinaryFailureCount = diagnostics.ordinaryCleanupFailure?.failures.length ?? 0;
+        },
+      );
+    } catch (cause) {
+      thrown = cause;
+    }
+    expect(thrown).toBe(panic);
+    expect(loggedOrdinaryFailureCount).toBe(2);
+  });
+
+  it("combines a Result startup failure with a Result stop failure and exposes residual ownership", async () => {
+    const raw = createInMemoryRawBus();
+    raw.failStartsFor("evt.surface", new Error("surface start failed"));
+    raw.failStopsFor("evt.request", new Error("lifecycle cleanup failed"));
+
+    const outcome = await startDiscordRequestRouter({
+      adapter: new FakeAdapter({}),
+      bus: createLilacBus(raw),
+      subscriptionId: "router-result-cleanup-failure",
+      config: parseCoreConfigV1ToUniversal({}),
+    });
+
+    expect(outcome.kind).toBe("result");
+    expect(outcome.residualRouter).not.toBeNull();
+    if (outcome.kind === "result") {
+      expect(outcome.result.status).toBe("error");
+      if (outcome.result.status === "error") {
+        expect(outcome.result.error).toBeInstanceOf(DiscordRequestRouterStartupAndCleanupFailed);
+      }
+      if (
+        outcome.result.status === "error" &&
+        DiscordRequestRouterStartupAndCleanupFailed.is(outcome.result.error)
+      ) {
+        const startupFailure = raw.returnedStartFailures.at(0);
+        if (!startupFailure) throw new Error("expected a returned startup failure");
+        expect(outcome.result.error.startup).toBe(startupFailure);
+        expect(outcome.result.error.cleanup).toHaveLength(1);
+        expect(outcome.result.error.cleanup[0]).toBeInstanceOf(EventDeliveryStopFailed);
+      }
+    }
+  });
+
+  it("maps an ordinary rejected rollback into the combined startup failure", async () => {
+    const raw = createInMemoryRawBus();
+    const cleanupRejection = new Error("surface cleanup rejected");
+    raw.failStartsFor("evt.adapter", new Error("adapter start failed"));
+    raw.rejectStopsFor("evt.surface", cleanupRejection);
+
+    const outcome = await startDiscordRequestRouter({
+      adapter: new FakeAdapter({}),
+      bus: createLilacBus(raw),
+      subscriptionId: "router-rejected-cleanup",
+      config: parseCoreConfigV1ToUniversal({}),
+    });
+
+    expect(outcome.kind).toBe("result");
+    if (outcome.kind === "result") {
+      expect(outcome.result.status).toBe("error");
+      if (outcome.result.status === "error") {
+        expect(outcome.result.error).toBeInstanceOf(DiscordRequestRouterStartupAndCleanupFailed);
+      }
+      if (
+        outcome.result.status === "error" &&
+        DiscordRequestRouterStartupAndCleanupFailed.is(outcome.result.error)
+      ) {
+        expect(outcome.result.error.cleanup[0]).toBeInstanceOf(
+          DiscordRequestRouterSubscriptionStopRejected,
+        );
+        expect(outcome.result.error.cleanup[0]?.cause).toBe(cleanupRejection);
+      }
+    }
+  });
+
+  it("returns a rejected rollback Panic with exact identity after continuing rollback", async () => {
+    const raw = createInMemoryRawBus();
+    const panic = new Panic({ message: "cleanup invariant failed" });
+    raw.failStartsFor("evt.adapter", new Error("adapter start failed"));
+    raw.rejectStopsFor("evt.surface", panic);
+
+    const outcome = await startDiscordRequestRouter({
+      adapter: new FakeAdapter({}),
+      bus: createLilacBus(raw),
+      subscriptionId: "router-cleanup-panic",
+      config: parseCoreConfigV1ToUniversal({}),
+    });
+
+    expect(outcome.kind).toBe("panic");
+    if (outcome.kind === "panic") {
+      expect(outcome.panic).toBe(panic);
+      const startupFailure = raw.returnedStartFailures.at(0);
+      if (!startupFailure) throw new Error("expected a returned startup failure");
+      expect(outcome.startupFailure).toBe(startupFailure);
+    }
+    expect(outcome.residualRouter).not.toBeNull();
+    expect(raw.stoppedTopics).toEqual(["evt.surface", "evt.request"]);
+
+    let loggedStartupFailure: unknown;
+    let thrown: unknown;
+    try {
+      adaptDiscordRequestRouterStartOutcomeToHost(
+        outcome,
+        () => {},
+        (diagnostics) => {
+          loggedStartupFailure = diagnostics.startupFailure;
+        },
+      );
+    } catch (cause) {
+      thrown = cause;
+    }
+    expect(thrown).toBe(panic);
+    expect(loggedStartupFailure).toBe(raw.returnedStartFailures.at(0));
+  });
+
+  it("preserves multiple rollback failures and retains ownership before signaling Core", async () => {
+    const raw = createInMemoryRawBus();
+    const surfaceCleanup = new Error("surface cleanup rejected");
+    raw.failStartsFor("evt.adapter", new Error("adapter start failed"));
+    raw.rejectStopsFor("evt.surface", surfaceCleanup);
+    raw.failStopsFor("evt.request", new Error("lifecycle cleanup failed"));
+
+    const outcome = await startDiscordRequestRouter({
+      adapter: new FakeAdapter({}),
+      bus: createLilacBus(raw),
+      subscriptionId: "router-multiple-cleanup-failures",
+      config: parseCoreConfigV1ToUniversal({}),
+    });
+    let retainedRouter: unknown = null;
+    let thrown: unknown;
+    try {
+      adaptDiscordRequestRouterStartOutcomeToHost(
+        outcome,
+        (router) => {
+          retainedRouter = router;
+        },
+        () => {},
+      );
+    } catch (cause) {
+      thrown = cause;
+    }
+
+    expect(raw.stoppedTopics).toEqual(["evt.surface", "evt.request"]);
+    expect(retainedRouter).toBe(outcome.residualRouter);
+    expect(thrown).toBeInstanceOf(DiscordRequestRouterStartupAndCleanupFailed);
+    if (DiscordRequestRouterStartupAndCleanupFailed.is(thrown)) {
+      expect(thrown.cleanup).toHaveLength(2);
+      expect(thrown.cleanup[0]).toBeInstanceOf(DiscordRequestRouterSubscriptionStopRejected);
+      expect(thrown.cleanup[1]).toBeInstanceOf(EventDeliveryStopFailed);
+    }
+
+    const residualRouter = outcome.residualRouter;
+    if (!residualRouter) throw new Error("expected Core to retain a residual router");
+    raw.clearStopFailuresFor("evt.surface");
+    raw.clearStopFailuresFor("evt.request");
+    const retried = await residualRouter.stop();
+    expect(retried.kind).toBe("result");
+    if (retried.kind === "result") expect(retried.result.status).toBe("ok");
+    expect(raw.stoppedTopics).toEqual(["evt.surface", "evt.request", "evt.request", "evt.surface"]);
+  });
+
+  it("continues mixed ordinary and Panic residual stop rejections sequentially", async () => {
+    const raw = createInMemoryRawBus();
+    raw.failStartsFor("evt.adapter", new Error("adapter start failed"));
+    raw.failStopsFor("evt.surface", new Error("initial surface cleanup failed"));
+    raw.failStopsFor("evt.request", new Error("initial lifecycle cleanup failed"));
+    const started = await startDiscordRequestRouter({
+      adapter: new FakeAdapter({}),
+      bus: createLilacBus(raw),
+      subscriptionId: "router-mixed-residual-stop",
+      config: parseCoreConfigV1ToUniversal({}),
+    });
+    const residualRouter = started.residualRouter;
+    if (!residualRouter) throw new Error("expected a residual router");
+
+    raw.clearStopFailuresFor("evt.surface");
+    raw.clearStopFailuresFor("evt.request");
+    const ordinary = new Error("surface stop rejected");
+    const panic = new Panic({ message: "lifecycle stop invariant failed" });
+    raw.rejectStopsFor("evt.surface", ordinary);
+    raw.rejectStopsFor("evt.request", panic);
+    const stopped = await residualRouter.stop();
+
+    expect(stopped.kind).toBe("panic");
+    if (stopped.kind === "panic") {
+      expect(stopped.panic).toBe(panic);
+      expect(stopped.additionalPanics).toEqual([]);
+      expect(stopped.ordinaryFailure?.failures).toHaveLength(1);
+      expect(stopped.ordinaryFailure?.failures[0]?.cause).toBe(ordinary);
+      raw.clearStopFailuresFor("evt.surface");
+      raw.clearStopFailuresFor("evt.request");
+      const retried = await stopped.residualRouter.stop();
+      expect(retried.kind).toBe("result");
+      if (retried.kind === "result") {
+        expect(retried.result.status).toBe("ok");
+        expect(retried.residualRouter).toBeNull();
+      }
+    }
+    expect(raw.stoppedTopics.slice(-4)).toEqual([
+      "evt.request",
+      "evt.surface",
+      "evt.surface",
+      "evt.request",
+    ]);
+  });
+
+  it("preserves every residual stop Panic by exact identity", async () => {
+    const raw = createInMemoryRawBus();
+    raw.failStartsFor("evt.adapter", new Error("adapter start failed"));
+    raw.failStopsFor("evt.surface", new Error("initial surface cleanup failed"));
+    raw.failStopsFor("evt.request", new Error("initial lifecycle cleanup failed"));
+    const started = await startDiscordRequestRouter({
+      adapter: new FakeAdapter({}),
+      bus: createLilacBus(raw),
+      subscriptionId: "router-multiple-residual-panics",
+      config: parseCoreConfigV1ToUniversal({}),
+    });
+    const residualRouter = started.residualRouter;
+    if (!residualRouter) throw new Error("expected a residual router");
+
+    raw.clearStopFailuresFor("evt.surface");
+    raw.clearStopFailuresFor("evt.request");
+    const lifecyclePanic = new Panic({ message: "lifecycle stop invariant failed" });
+    const surfacePanic = new Panic({ message: "surface stop invariant failed" });
+    raw.rejectStopsFor("evt.request", lifecyclePanic);
+    raw.rejectStopsFor("evt.surface", surfacePanic);
+    const stopped = await residualRouter.stop();
+
+    expect(stopped.kind).toBe("panic");
+    if (stopped.kind === "panic") {
+      expect(stopped.panic).toBe(lifecyclePanic);
+      expect(stopped.additionalPanics).toEqual([surfacePanic]);
+    }
+    expect(raw.stoppedTopics.slice(-2)).toEqual(["evt.request", "evt.surface"]);
+  });
+
+  it("captures a synchronous residual stop throw and continues every attempt", async () => {
+    const raw = createInMemoryRawBus();
+    raw.failStartsFor("evt.adapter", new Error("adapter start failed"));
+    raw.failStopsFor("evt.surface", new Error("initial surface cleanup failed"));
+    raw.failStopsFor("evt.request", new Error("initial lifecycle cleanup failed"));
+    const started = await startDiscordRequestRouter({
+      adapter: new FakeAdapter({}),
+      bus: createLilacBus(raw),
+      subscriptionId: "router-synchronous-residual-stop",
+      config: parseCoreConfigV1ToUniversal({}),
+    });
+    const residualRouter = started.residualRouter;
+    if (!residualRouter) throw new Error("expected a residual router");
+
+    raw.clearStopFailuresFor("evt.surface");
+    raw.clearStopFailuresFor("evt.request");
+    const synchronousFailure = new Error("lifecycle stop threw");
+    raw.throwStopsFor("evt.request", synchronousFailure);
+    const stopped = await residualRouter.stop();
+
+    expect(stopped.kind).toBe("result");
+    if (stopped.kind === "result") {
+      expect(stopped.result.status).toBe("error");
+      if (stopped.result.status === "error") {
+        expect(stopped.result.error.failures).toHaveLength(1);
+        expect(stopped.result.error.failures[0]?.cause).toBe(synchronousFailure);
+      }
+    }
+    expect(raw.stoppedTopics.slice(-2)).toEqual(["evt.request", "evt.surface"]);
+  });
+
+  it("returns the original startup failure when rollback succeeds", async () => {
+    const raw = createInMemoryRawBus();
+    raw.failStartsFor("evt.surface", new Error("surface start failed"));
+
+    const outcome = await startDiscordRequestRouter({
+      adapter: new FakeAdapter({}),
+      bus: createLilacBus(raw),
+      subscriptionId: "router-clean-startup-rollback",
+      config: parseCoreConfigV1ToUniversal({}),
+    });
+
+    expect(outcome.kind).toBe("result");
+    expect(outcome.residualRouter).toBeNull();
+    if (outcome.kind === "result") {
+      expect(outcome.result.status).toBe("error");
+      if (outcome.result.status === "error") {
+        const startupFailure = raw.returnedStartFailures.at(0);
+        if (!startupFailure) throw new Error("expected a returned startup failure");
+        expect(outcome.result.error).toBe(startupFailure);
+      }
+    }
+    expect(raw.stoppedTopics).toEqual(["evt.request"]);
   });
 
   it("includes reply-thread root when mention is part of a mergeable reply burst (active channel)", async () => {
@@ -3646,6 +4362,832 @@ describe("startBusRequestRouter", () => {
     await router.stop();
   });
 
+  it.each([
+    {
+      name: "matching terminal before seed",
+      terminalTiming: "before",
+      terminalSession: "matching",
+      expectedQueue: "prompt",
+      expectedRequest: "fresh",
+      expectedTerminalDisposition: "commit",
+      publishRunningBeforeActivation: false,
+      advanceClockBeforeActivation: true,
+    },
+    {
+      name: "wrong-session terminal before seed",
+      terminalTiming: "before",
+      terminalSession: "wrong",
+      expectedQueue: "steer",
+      expectedRequest: "restored",
+      expectedTerminalDisposition: "commit",
+      publishRunningBeforeActivation: false,
+      advanceClockBeforeActivation: false,
+    },
+    {
+      name: "matching terminal followed by an explicit new running lifecycle",
+      terminalTiming: "before",
+      terminalSession: "matching",
+      expectedQueue: "steer",
+      expectedRequest: "restored",
+      expectedTerminalDisposition: "commit",
+      publishRunningBeforeActivation: true,
+      advanceClockBeforeActivation: false,
+    },
+    {
+      name: "matching terminal after seed",
+      terminalTiming: "after",
+      terminalSession: "matching",
+      expectedQueue: "prompt",
+      expectedRequest: "fresh",
+      expectedTerminalDisposition: "commit",
+      publishRunningBeforeActivation: false,
+      advanceClockBeforeActivation: false,
+    },
+    {
+      name: "wrong-session terminal after seed",
+      terminalTiming: "after",
+      terminalSession: "wrong",
+      expectedQueue: "steer",
+      expectedRequest: "restored",
+      expectedTerminalDisposition: "dead-letter",
+      publishRunningBeforeActivation: false,
+      advanceClockBeforeActivation: false,
+    },
+  ] as const)(
+    "handles $name without resurrecting or suppressing the wrong route",
+    async (testCase) => {
+      const raw = createInMemoryRawBus();
+      const bus = createLilacBus(raw);
+      const sessionId = `terminal-race-${testCase.terminalTiming}-${testCase.terminalSession}`;
+      const requestId = `discord:${sessionId}:restored-anchor`;
+      const restoredOutputId = "restored-output";
+      const replyMessageId = "reply-to-restored-output";
+      const now = Date.now();
+      const nowSpy = spyOn(Date, "now");
+      const adapter = new FakeAdapter({
+        [`${sessionId}:${replyMessageId}`]: {
+          ref: { platform: "discord", channelId: sessionId, messageId: replyMessageId },
+          session: { platform: "discord", channelId: sessionId },
+          userId: "u1",
+          userName: "user1",
+          text: "<@bot> route after terminal race",
+          ts: now,
+          raw: { reference: {} },
+        },
+      });
+      const config = parseCoreConfigV1ToUniversal({});
+      config.surface.router.defaultMode = "mention";
+      const router = await startBusRequestRouter({
+        adapter,
+        bus,
+        subscriptionId: `terminal-race-router-${testCase.terminalTiming}-${testCase.terminalSession}`,
+        config,
+        routerGate: async () => ({ forward: true, reason: "deterministic terminal route" }),
+      });
+      let activatedGeneration: Parameters<typeof router.restoreActiveOutputChains>[0] | null = null;
+      const relay = await bridgeBusToAdapter({
+        adapter,
+        bus,
+        platform: "discord",
+        policy: createDiscordRelayPolicy(adapter, {
+          activateRestoredOutputChains: (generation, chains) => {
+            activatedGeneration = generation;
+            router.restoreActiveOutputChains(generation, chains);
+          },
+        }),
+        subscriptionId: `terminal-race-relay-${testCase.terminalTiming}-${testCase.terminalSession}`,
+      });
+      const requests: Array<{ readonly requestId?: string; readonly queue: string }> = [];
+      const requestSub = await subscribeTopicForTest(
+        bus,
+        "cmd.request",
+        {
+          mode: "fanout",
+          subscriptionId: `terminal-race-requests-${testCase.terminalTiming}-${testCase.terminalSession}`,
+          consumerId: `terminal-race-consumer-${testCase.terminalTiming}-${testCase.terminalSession}`,
+          offset: { type: "now" },
+        },
+        async (message) => {
+          if (message.type === lilacEventTypes.CmdRequestMessage) {
+            requests.push({
+              requestId: message.headers?.request_id,
+              queue: message.data.queue,
+            });
+          }
+          return Result.ok(undefined);
+        },
+      );
+      const publishTerminal = () =>
+        bus.publish(
+          lilacEventTypes.EvtRequestLifecycleChanged,
+          { state: "resolved", ts: now },
+          {
+            headers: {
+              request_id: requestId,
+              session_id:
+                testCase.terminalSession === "matching" ? sessionId : `${sessionId}-wrong`,
+              request_client: "discord",
+            },
+          },
+        );
+      try {
+        if (testCase.terminalTiming === "before") {
+          await publishTerminal();
+          expect(raw.deliveryActions.at(-1)?.action.disposition).toBe(
+            testCase.expectedTerminalDisposition,
+          );
+        }
+        if (testCase.advanceClockBeforeActivation) {
+          nowSpy.mockReturnValue(now + 10 * 365 * 24 * 60 * 60 * 1000);
+        }
+        if (testCase.publishRunningBeforeActivation) {
+          await bus.publish(
+            lilacEventTypes.EvtRequestLifecycleChanged,
+            { state: "running", ts: now + 1 },
+            {
+              headers: {
+                request_id: requestId,
+                session_id: sessionId,
+                request_client: "discord",
+              },
+            },
+          );
+        }
+        const recoveryChain = {
+          requestId,
+          sessionId,
+          createdOutputRefs: [
+            { platform: "discord" as const, channelId: sessionId, messageId: restoredOutputId },
+          ],
+          activeOutputRefs: [
+            { platform: "discord" as const, channelId: sessionId, messageId: restoredOutputId },
+          ],
+        };
+        const prepared = relay.prepareRestoreRelays([
+          {
+            ...recoveryChain,
+            requestClient: "discord",
+            platform: "discord",
+            visibleText: "restored response",
+            toolStatus: [],
+          },
+        ]);
+        if (prepared.status === "error") throw prepared.error;
+        expect((await prepared.value.apply()).status).toBe("ok");
+        prepared.value.activate();
+        prepared.value.activate();
+        if (testCase.terminalTiming === "after") {
+          await publishTerminal();
+          expect(raw.deliveryActions.at(-1)?.action.disposition).toBe(
+            testCase.expectedTerminalDisposition,
+          );
+          if (testCase.terminalSession === "wrong") {
+            expect(
+              raw.deliveryActions.some(
+                ({ topic, action }) =>
+                  topic === "evt.request" && action.disposition === "park-pending",
+              ),
+            ).toBe(true);
+          }
+        }
+        const generation = activatedGeneration;
+        if (!generation) throw new Error("Expected restored output-chain activation generation");
+        router.restoreActiveOutputChains(generation, [recoveryChain]);
+
+        await bus.publish(lilacEventTypes.EvtAdapterMessageCreated, {
+          platform: "discord",
+          channelId: sessionId,
+          messageId: replyMessageId,
+          userId: "u1",
+          userName: "user1",
+          text: "<@bot> route after terminal race",
+          ts: now,
+          raw: {
+            discord: {
+              isDMBased: false,
+              mentionsBot: true,
+              replyToBot: true,
+              replyToMessageId: restoredOutputId,
+            },
+          },
+        });
+
+        expect(requests).toEqual([
+          {
+            requestId:
+              testCase.expectedRequest === "restored"
+                ? requestId
+                : `discord:${sessionId}:${replyMessageId}`,
+            queue: testCase.expectedQueue,
+          },
+        ]);
+      } finally {
+        nowSpy.mockRestore();
+        await requestSub.stop();
+        await relay.stop();
+        await router.stop();
+        await bus.close();
+      }
+    },
+  );
+
+  it.each([
+    { name: "at exact capacity", terminalCount: 2, expectedInitialQueue: "steer" },
+    { name: "after overflow", terminalCount: 3, expectedInitialQueue: "prompt" },
+  ] as const)("keeps restored-chain admission fail-closed $name", async (testCase) => {
+    const raw = createInMemoryRawBus();
+    const bus = createLilacBus(raw);
+    const sessions = ["capacity-target-a", "capacity-target-b"] as const;
+    const requestsBySession = new Map(
+      sessions.map((sessionId) => [sessionId, `discord:${sessionId}:restored-anchor`] as const),
+    );
+    const repliesBySession = new Map(
+      sessions.map((sessionId) => [sessionId, `${sessionId}-reply`] as const),
+    );
+    const outputId = "restored-output";
+    const reuseReplyId = "capacity-target-a-reuse-reply";
+    const now = Date.now();
+    const messages: Record<string, SurfaceMessage> = {};
+    for (const sessionId of sessions) {
+      const replyMessageId = repliesBySession.get(sessionId);
+      if (!replyMessageId) throw new Error("Expected capacity reply identity");
+      messages[`${sessionId}:${replyMessageId}`] = {
+        ref: { platform: "discord", channelId: sessionId, messageId: replyMessageId },
+        session: { platform: "discord", channelId: sessionId },
+        userId: "u1",
+        userName: "user1",
+        text: "<@bot> route capacity reply",
+        ts: now,
+        raw: { reference: {} },
+      };
+    }
+    messages[`capacity-target-a:${reuseReplyId}`] = {
+      ref: { platform: "discord", channelId: "capacity-target-a", messageId: reuseReplyId },
+      session: { platform: "discord", channelId: "capacity-target-a" },
+      userId: "u1",
+      userName: "user1",
+      text: "<@bot> route after overflow finalization",
+      ts: now + 1,
+      raw: { reference: {} },
+    };
+    const adapter = new FakeAdapter(messages);
+    const config = parseCoreConfigV1ToUniversal({});
+    config.surface.router.defaultMode = "mention";
+    const router = await startBusRequestRouter({
+      adapter,
+      bus,
+      subscriptionId: `capacity-router-${testCase.terminalCount}`,
+      config,
+      recoveryTombstoneCapacity: 2,
+      routerGate: async () => ({ forward: true, reason: "deterministic capacity route" }),
+    });
+    const relay = await bridgeBusToAdapter({
+      adapter,
+      bus,
+      platform: "discord",
+      policy: createDiscordRelayPolicy(adapter, {
+        activateRestoredOutputChains: (generation, chains) =>
+          router.restoreActiveOutputChains(generation, chains),
+      }),
+      subscriptionId: `capacity-relay-${testCase.terminalCount}`,
+    });
+    const requests: Array<{ readonly requestId?: string; readonly queue: string }> = [];
+    const requestSub = await subscribeTopicForTest(
+      bus,
+      "cmd.request",
+      {
+        mode: "fanout",
+        subscriptionId: `capacity-requests-${testCase.terminalCount}`,
+        consumerId: `capacity-consumer-${testCase.terminalCount}`,
+        offset: { type: "now" },
+      },
+      async (message) => {
+        if (message.type === lilacEventTypes.CmdRequestMessage) {
+          requests.push({ requestId: message.headers?.request_id, queue: message.data.queue });
+        }
+        return Result.ok(undefined);
+      },
+    );
+    try {
+      for (let index = 0; index < testCase.terminalCount; index += 1) {
+        await bus.publish(
+          lilacEventTypes.EvtRequestLifecycleChanged,
+          { state: "resolved", ts: now + index },
+          {
+            headers: {
+              request_id: `discord:capacity-terminal-${index}:anchor`,
+              session_id: `capacity-terminal-${index}`,
+              request_client: "discord",
+            },
+          },
+        );
+      }
+      const snapshots = sessions.map((sessionId) => {
+        const requestId = requestsBySession.get(sessionId);
+        if (!requestId) throw new Error("Expected capacity request identity");
+        return {
+          requestId,
+          sessionId,
+          requestClient: "discord",
+          platform: "discord" as const,
+          createdOutputRefs: [
+            { platform: "discord" as const, channelId: sessionId, messageId: outputId },
+          ],
+          activeOutputRefs: [
+            { platform: "discord" as const, channelId: sessionId, messageId: outputId },
+          ],
+          visibleText: "restored response",
+          toolStatus: [],
+        };
+      });
+      const prepared = relay.prepareRestoreRelays(snapshots);
+      if (prepared.status === "error") throw prepared.error;
+      expect((await prepared.value.apply()).status).toBe("ok");
+      prepared.value.activate();
+
+      for (const sessionId of sessions) {
+        const replyMessageId = repliesBySession.get(sessionId);
+        if (!replyMessageId) throw new Error("Expected capacity reply identity");
+        await bus.publish(lilacEventTypes.EvtAdapterMessageCreated, {
+          platform: "discord",
+          channelId: sessionId,
+          messageId: replyMessageId,
+          userId: "u1",
+          userName: "user1",
+          text: "<@bot> route capacity reply",
+          ts: now,
+          raw: {
+            discord: {
+              isDMBased: false,
+              mentionsBot: true,
+              replyToBot: true,
+              replyToMessageId: outputId,
+            },
+          },
+        });
+      }
+
+      expect(requests.map((request) => request.queue)).toEqual([
+        testCase.expectedInitialQueue,
+        testCase.expectedInitialQueue,
+      ]);
+      if (testCase.terminalCount === 3) {
+        expect(requests.map((request) => request.requestId)).toEqual(
+          sessions.map((sessionId) => `discord:${sessionId}:${repliesBySession.get(sessionId)}`),
+        );
+        const reuseSessionId = sessions[0];
+        const reuseRequestId = requestsBySession.get(reuseSessionId);
+        if (!reuseRequestId) throw new Error("Expected reuse request identity");
+        await bus.publish(
+          lilacEventTypes.EvtRequestLifecycleChanged,
+          { state: "running", ts: now + 1 },
+          {
+            headers: {
+              request_id: reuseRequestId,
+              session_id: reuseSessionId,
+              request_client: "discord",
+            },
+          },
+        );
+        await bus.publish(
+          lilacEventTypes.EvtSurfaceOutputMessageCreated,
+          {
+            msgRef: { platform: "discord", channelId: reuseSessionId, messageId: outputId },
+          },
+          {
+            headers: {
+              request_id: reuseRequestId,
+              session_id: reuseSessionId,
+              request_client: "discord",
+            },
+          },
+        );
+        await bus.publish(lilacEventTypes.EvtAdapterMessageCreated, {
+          platform: "discord",
+          channelId: reuseSessionId,
+          messageId: reuseReplyId,
+          userId: "u1",
+          userName: "user1",
+          text: "<@bot> route after overflow finalization",
+          ts: now + 1,
+          raw: {
+            discord: {
+              isDMBased: false,
+              mentionsBot: true,
+              replyToBot: true,
+              replyToMessageId: outputId,
+            },
+          },
+        });
+        expect(requests.at(-1)).toEqual({ requestId: reuseRequestId, queue: "steer" });
+      } else {
+        expect(requests.map((request) => request.requestId)).toEqual(
+          sessions.map((sessionId) => requestsBySession.get(sessionId)),
+        );
+      }
+    } finally {
+      await requestSub.stop();
+      await relay.stop();
+      await router.stop();
+      await bus.close();
+    }
+  });
+
+  it("routes replies through a restored output chain only after recovery activation", async () => {
+    const raw = createInMemoryRawBus();
+    const bus = createLilacBus(raw);
+    const sessionId = "restored-chain";
+    const requestId = `discord:${sessionId}:anchor`;
+    const restoredOutputId = "restored-output";
+    const newOutputId = "new-output";
+    const steerMessageId = "reply-steer";
+    const followUpMessageId = "reply-follow-up";
+    const now = Date.now();
+    const adapter = new FakeAdapter({
+      [`${sessionId}:${steerMessageId}`]: {
+        ref: { platform: "discord", channelId: sessionId, messageId: steerMessageId },
+        session: { platform: "discord", channelId: sessionId },
+        userId: "u1",
+        userName: "user1",
+        text: "<@bot> steer restored request",
+        ts: now,
+        raw: { reference: {} },
+      },
+      [`${sessionId}:${followUpMessageId}`]: {
+        ref: { platform: "discord", channelId: sessionId, messageId: followUpMessageId },
+        session: { platform: "discord", channelId: sessionId },
+        userId: "u1",
+        userName: "user1",
+        text: "continue on new output",
+        ts: now + 1,
+        raw: { reference: {} },
+      },
+    });
+    const config = parseCoreConfigV1ToUniversal({});
+    config.surface.router.defaultMode = "active";
+    const router = await startBusRequestRouter({
+      adapter,
+      bus,
+      subscriptionId: "restored-chain-router",
+      config,
+      routerGate: async () => ({ forward: true, reason: "deterministic recovery route" }),
+    });
+    const relay = await bridgeBusToAdapter({
+      adapter,
+      bus,
+      platform: "discord",
+      policy: createDiscordRelayPolicy(adapter, {
+        activateRestoredOutputChains: (generation, chains) =>
+          router.restoreActiveOutputChains(generation, chains),
+      }),
+      subscriptionId: "restored-chain-relay",
+    });
+    const requests: Array<{ readonly requestId?: string; readonly queue: string }> = [];
+    const requestSub = await subscribeTopicForTest(
+      bus,
+      "cmd.request",
+      {
+        mode: "fanout",
+        subscriptionId: "restored-chain-requests",
+        consumerId: "restored-chain-consumer",
+        offset: { type: "now" },
+      },
+      async (message) => {
+        if (message.type === lilacEventTypes.CmdRequestMessage) {
+          requests.push({
+            requestId: message.headers?.request_id,
+            queue: message.data.queue,
+          });
+        }
+        return Result.ok(undefined);
+      },
+    );
+    const publish = spyOn(raw, "publish");
+    try {
+      const prepared = relay.prepareRestoreRelays([
+        {
+          requestId,
+          sessionId,
+          requestClient: "discord",
+          platform: "discord",
+          createdOutputRefs: [
+            { platform: "discord", channelId: sessionId, messageId: "older-output" },
+            { platform: "discord", channelId: sessionId, messageId: restoredOutputId },
+          ],
+          activeOutputRefs: [
+            { platform: "discord", channelId: sessionId, messageId: restoredOutputId },
+          ],
+          visibleText: "restored response",
+          toolStatus: [],
+        },
+      ]);
+      if (prepared.status === "error") throw prepared.error;
+      expect((await prepared.value.apply()).status).toBe("ok");
+      expect(publish).not.toHaveBeenCalled();
+
+      prepared.value.activate();
+      prepared.value.activate();
+      expect(publish).not.toHaveBeenCalled();
+
+      await bus.publish(
+        lilacEventTypes.EvtRequestLifecycleChanged,
+        { state: "running", ts: Date.now() },
+        {
+          headers: {
+            request_id: requestId,
+            session_id: sessionId,
+            request_client: "discord",
+          },
+        },
+      );
+      await bus.publish(lilacEventTypes.EvtAdapterMessageCreated, {
+        platform: "discord",
+        channelId: sessionId,
+        messageId: steerMessageId,
+        userId: "u1",
+        userName: "user1",
+        text: "<@bot> steer restored request",
+        ts: now,
+        raw: {
+          discord: {
+            isDMBased: false,
+            mentionsBot: true,
+            replyToBot: true,
+            replyToMessageId: restoredOutputId,
+          },
+        },
+      });
+      expect(requests).toEqual([{ requestId, queue: "steer" }]);
+
+      await bus.publish(
+        lilacEventTypes.EvtSurfaceOutputMessageCreated,
+        {
+          msgRef: { platform: "discord", channelId: sessionId, messageId: newOutputId },
+        },
+        {
+          headers: {
+            request_id: requestId,
+            session_id: sessionId,
+            request_client: "discord",
+          },
+        },
+      );
+      await bus.publish(lilacEventTypes.EvtAdapterMessageCreated, {
+        platform: "discord",
+        channelId: sessionId,
+        messageId: followUpMessageId,
+        userId: "u1",
+        userName: "user1",
+        text: "continue on new output",
+        ts: now + 1,
+        raw: {
+          discord: {
+            isDMBased: false,
+            mentionsBot: false,
+            replyToBot: true,
+            replyToMessageId: newOutputId,
+          },
+        },
+      });
+      expect(requests).toEqual([
+        { requestId, queue: "steer" },
+        { requestId, queue: "followUp" },
+      ]);
+    } finally {
+      publish.mockRestore();
+      await requestSub.stop();
+      await relay.stop();
+      await router.stop();
+      await bus.close();
+    }
+  });
+
+  it("preserves a newer active request when stale recovery activates", async () => {
+    const raw = createInMemoryRawBus();
+    const bus = createLilacBus(raw);
+    const sessionId = "newer-active-before-recovery";
+    const restoredRequestId = `discord:${sessionId}:restored-anchor`;
+    const newerRequestId = `discord:${sessionId}:newer-anchor`;
+    const messageId = "steer-newer-request";
+    const now = Date.now();
+    const adapter = new FakeAdapter({
+      [`${sessionId}:${messageId}`]: {
+        ref: { platform: "discord", channelId: sessionId, messageId },
+        session: { platform: "discord", channelId: sessionId },
+        userId: "u1",
+        userName: "user1",
+        text: "<@bot> keep the live request",
+        ts: now,
+        raw: { reference: {} },
+      },
+    });
+    const config = parseCoreConfigV1ToUniversal({});
+    config.surface.router.defaultMode = "active";
+    const router = await startBusRequestRouter({
+      adapter,
+      bus,
+      subscriptionId: "newer-active-before-recovery-router",
+      config,
+      routerGate: async () => ({ forward: true, reason: "deterministic recovery conflict" }),
+    });
+    const requests: Array<{ readonly requestId?: string; readonly queue: string }> = [];
+    const requestSub = await subscribeTopicForTest(
+      bus,
+      "cmd.request",
+      {
+        mode: "fanout",
+        subscriptionId: "newer-active-before-recovery-requests",
+        consumerId: "newer-active-before-recovery-consumer",
+        offset: { type: "now" },
+      },
+      async (message) => {
+        if (message.type === lilacEventTypes.CmdRequestMessage) {
+          requests.push({ requestId: message.headers?.request_id, queue: message.data.queue });
+        }
+        return Result.ok(undefined);
+      },
+    );
+    try {
+      await bus.publish(
+        lilacEventTypes.EvtRequestLifecycleChanged,
+        { state: "running", ts: now },
+        {
+          headers: {
+            request_id: newerRequestId,
+            session_id: sessionId,
+            request_client: "discord",
+          },
+        },
+      );
+      router.restoreActiveOutputChains({ generation: Symbol("stale-recovery") }, [
+        {
+          requestId: restoredRequestId,
+          sessionId,
+          createdOutputRefs: [
+            {
+              platform: "discord",
+              channelId: sessionId,
+              messageId: "restored-output",
+            },
+          ],
+        },
+      ]);
+
+      await bus.publish(lilacEventTypes.EvtAdapterMessageCreated, {
+        platform: "discord",
+        channelId: sessionId,
+        messageId,
+        userId: "u1",
+        userName: "user1",
+        text: "<@bot> keep the live request",
+        ts: now,
+        raw: {
+          discord: {
+            isDMBased: false,
+            mentionsBot: true,
+            replyToBot: false,
+          },
+        },
+      });
+
+      expect(requests).toEqual([{ requestId: newerRequestId, queue: "steer" }]);
+    } finally {
+      await requestSub.stop();
+      await router.stop();
+      await bus.close();
+    }
+  });
+
+  it("leaves the Discord router unseeded when exact snapshot consume conflicts", async () => {
+    const raw = createInMemoryRawBus();
+    const bus = createLilacBus(raw);
+    const sessionId = "restore-consume-failure";
+    const restoredRequestId = `discord:${sessionId}:restored-anchor`;
+    const restoredOutputId = "restored-output";
+    const replyMessageId = "reply-after-conflict";
+    const now = Date.now();
+    const adapter = new FakeAdapter({
+      [`${sessionId}:${replyMessageId}`]: {
+        ref: { platform: "discord", channelId: sessionId, messageId: replyMessageId },
+        session: { platform: "discord", channelId: sessionId },
+        userId: "u1",
+        userName: "user1",
+        text: "<@bot> start fresh",
+        ts: now,
+        raw: { reference: {} },
+      },
+    });
+    const config = parseCoreConfigV1ToUniversal({});
+    config.surface.router.defaultMode = "mention";
+    const router = await startBusRequestRouter({
+      adapter,
+      bus,
+      subscriptionId: "restore-consume-failure-router",
+      config,
+      routerGate: async () => ({ forward: true, reason: "deterministic recovery route" }),
+    });
+    const relay = await bridgeBusToAdapter({
+      adapter,
+      bus,
+      platform: "discord",
+      policy: createDiscordRelayPolicy(adapter, {
+        activateRestoredOutputChains: (generation, chains) =>
+          router.restoreActiveOutputChains(generation, chains),
+      }),
+      subscriptionId: "restore-consume-failure-relay",
+    });
+    const directory = await mkdtemp(path.join(tmpdir(), "lilac-router-restore-conflict-"));
+    const store = new SqliteGracefulRestartStore(path.join(directory, "restart.db"));
+    const requests: Array<{ readonly requestId?: string; readonly queue: string }> = [];
+    const requestSub = await subscribeTopicForTest(
+      bus,
+      "cmd.request",
+      {
+        mode: "fanout",
+        subscriptionId: "restore-consume-failure-requests",
+        consumerId: "restore-consume-failure-consumer",
+        offset: { type: "now" },
+      },
+      async (message) => {
+        if (message.type === lilacEventTypes.CmdRequestMessage) {
+          requests.push({
+            requestId: message.headers?.request_id,
+            queue: message.data.queue,
+          });
+        }
+        return Result.ok(undefined);
+      },
+    );
+    try {
+      const relaySnapshot = {
+        requestId: restoredRequestId,
+        sessionId,
+        requestClient: "discord",
+        platform: "discord" as const,
+        createdOutputRefs: [
+          { platform: "discord" as const, channelId: sessionId, messageId: restoredOutputId },
+        ],
+        visibleText: "restored response",
+        toolStatus: [],
+      };
+      const snapshot = {
+        version: GRACEFUL_RESTART_SNAPSHOT_VERSION,
+        createdAt: Date.now(),
+        deadlineMs: 60_000,
+        queueAttemptProof: "complete" as const,
+        agent: [],
+        queueAttempts: [],
+        relays: [relaySnapshot],
+      };
+      const saved = store.saveCompletedSnapshot(snapshot);
+      if (saved.status === "error") throw saved.error;
+      const read = store.readCompletedSnapshot();
+      if (read.status === "error" || read.value.state !== "loaded") {
+        throw new Error("Expected restorable Discord snapshot");
+      }
+      const prepared = relay.prepareRestoreRelays([relaySnapshot]);
+      if (prepared.status === "error") throw prepared.error;
+      expect((await prepared.value.apply()).status).toBe("ok");
+
+      const replacement = store.saveCompletedSnapshot({ ...snapshot, createdAt: Date.now() + 1 });
+      if (replacement.status === "error") throw replacement.error;
+      const consumed = store.consumeCompletedSnapshot(read.value.rowToken);
+      expect(consumed.status).toBe("error");
+      if (consumed.status === "ok") throw new Error("Expected snapshot disposition conflict");
+      expect(consumed.error).toBeInstanceOf(GracefulRestartDispositionConflict);
+      expect((await prepared.value.rollback()).status).toBe("ok");
+
+      await bus.publish(lilacEventTypes.EvtAdapterMessageCreated, {
+        platform: "discord",
+        channelId: sessionId,
+        messageId: replyMessageId,
+        userId: "u1",
+        userName: "user1",
+        text: "<@bot> start fresh",
+        ts: now,
+        raw: {
+          discord: {
+            isDMBased: false,
+            mentionsBot: true,
+            replyToBot: true,
+            replyToMessageId: restoredOutputId,
+          },
+        },
+      });
+
+      expect(requests).toEqual([
+        { requestId: `discord:${sessionId}:${replyMessageId}`, queue: "prompt" },
+      ]);
+    } finally {
+      await requestSub.stop();
+      await relay.stop();
+      await router.stop();
+      await bus.close();
+      store.close();
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
   it("treats replies to active output as followUp, and reply+mention as steer", async () => {
     const raw = createInMemoryRawBus();
     const bus = createLilacBus(raw);
@@ -4787,6 +6329,530 @@ describe("startBusRequestRouter", () => {
 
     await sub.stop();
     await router.stop();
+  });
+
+  it("retains unconfirmed rollover items across partial publication failure and redelivery", async () => {
+    const raw = createInMemoryRawBus();
+    const bus = createLilacBus(raw);
+    const sessionId = "batch-source-handoff";
+    const requestOne = `discord:${sessionId}:request-one`;
+    const requestTwo = `discord:${sessionId}:request-two`;
+    const outputOne = "output-one";
+    const outputTwo = "output-two";
+    const replyOneA = "reply-one-a";
+    const replyOneB = "reply-one-b";
+    const replyTwo = "reply-two";
+    const now = Date.now();
+    const adapter = new FakeAdapter({
+      [`${sessionId}:${outputOne}`]: {
+        ref: { platform: "discord", channelId: sessionId, messageId: outputOne },
+        session: { platform: "discord", channelId: sessionId },
+        userId: "bot",
+        text: "first output",
+        ts: now,
+        raw: { reference: {} },
+      },
+      [`${sessionId}:${replyOneA}`]: {
+        ref: { platform: "discord", channelId: sessionId, messageId: replyOneA },
+        session: { platform: "discord", channelId: sessionId },
+        userId: "user-one",
+        text: "first deferred reply A",
+        ts: now + 1,
+        raw: { reference: { messageId: outputOne, channelId: sessionId } },
+      },
+      [`${sessionId}:${replyOneB}`]: {
+        ref: { platform: "discord", channelId: sessionId, messageId: replyOneB },
+        session: { platform: "discord", channelId: sessionId },
+        userId: "user-one",
+        text: "first deferred reply B",
+        ts: now + 2,
+        raw: { reference: { messageId: outputOne, channelId: sessionId } },
+      },
+      [`${sessionId}:${outputTwo}`]: {
+        ref: { platform: "discord", channelId: sessionId, messageId: outputTwo },
+        session: { platform: "discord", channelId: sessionId },
+        userId: "bot",
+        text: "second output",
+        ts: now + 3,
+        raw: { reference: {} },
+      },
+      [`${sessionId}:${replyTwo}`]: {
+        ref: { platform: "discord", channelId: sessionId, messageId: replyTwo },
+        session: { platform: "discord", channelId: sessionId },
+        userId: "user-two",
+        text: "second deferred reply",
+        ts: now + 4,
+        raw: { reference: { messageId: outputTwo, channelId: sessionId } },
+      },
+    });
+    const router = await startBusRequestRouter({
+      adapter,
+      bus,
+      subscriptionId: "router-batch-source-handoff",
+      config: {
+        surface: {
+          discord: {
+            tokenEnv: "DISCORD_TOKEN",
+            allowedChannelIds: [],
+            allowedGuildIds: [],
+            botName: "lilac",
+            outputMode: "inline",
+            previewFinalOutputStyle: "embed",
+          },
+          router: {
+            defaultMode: "mention",
+            sessionModes: {},
+            activeDebounceMs: 5,
+            activeGate: { enabled: true, timeoutMs: 2500 },
+          },
+        },
+        agent: { systemPrompt: "(unused in tests; compiled at runtime)" },
+        models: {
+          def: {},
+          main: { model: "openrouter/openai/gpt-4o" },
+          fast: { model: "openrouter/openai/gpt-4o-mini" },
+        },
+      },
+    });
+    const received: DecodedLilacMessageForTopic<"cmd.request">[] = [];
+    let failAfterFirstOldFollowUp = false;
+    const sub = await subscribeTopicForTest(
+      bus,
+      "cmd.request",
+      {
+        mode: "fanout",
+        subscriptionId: "batch-source-handoff-observer",
+        consumerId: "batch-source-handoff-consumer",
+        offset: { type: "begin" },
+      },
+      async (message) => {
+        if (message.type === lilacEventTypes.CmdRequestMessage) {
+          received.push(message);
+          if (
+            failAfterFirstOldFollowUp &&
+            message.headers?.request_id === requestOne &&
+            message.data.queue === "followUp"
+          ) {
+            failAfterFirstOldFollowUp = false;
+            raw.failNextPublicationTo(
+              "cmd.request",
+              new Error("forced rollover publication failure"),
+            );
+          }
+        }
+        return Result.ok(undefined);
+      },
+    );
+    const publishLifecycle = async (requestId: string, state: "running" | "resolved") => {
+      await bus.publish(
+        lilacEventTypes.EvtRequestLifecycleChanged,
+        { state, ts: Date.now() },
+        {
+          headers: {
+            request_id: requestId,
+            session_id: sessionId,
+            request_client: "discord",
+          },
+        },
+      );
+    };
+    const publishOutput = async (requestId: string, messageId: string) => {
+      await bus.publish(
+        lilacEventTypes.EvtSurfaceOutputMessageCreated,
+        { msgRef: { platform: "discord", channelId: sessionId, messageId } },
+        {
+          headers: {
+            request_id: requestId,
+            session_id: sessionId,
+            request_client: "discord",
+          },
+        },
+      );
+    };
+    const publishReply = async (input: {
+      readonly messageId: string;
+      readonly outputMessageId: string;
+      readonly userId: string;
+      readonly text: string;
+      readonly ts: number;
+    }) => {
+      await bus.publish(lilacEventTypes.EvtAdapterMessageCreated, {
+        platform: "discord",
+        channelId: sessionId,
+        messageId: input.messageId,
+        userId: input.userId,
+        text: input.text,
+        ts: input.ts,
+        raw: {
+          discord: {
+            isDMBased: false,
+            mentionsBot: false,
+            replyToBot: true,
+            replyToMessageId: input.outputMessageId,
+          },
+        },
+      });
+    };
+
+    await publishLifecycle(requestOne, "running");
+    await publishOutput(requestOne, outputOne);
+    await publishReply({
+      messageId: replyOneA,
+      outputMessageId: outputOne,
+      userId: "user-one",
+      text: "first deferred reply A",
+      ts: now + 1,
+    });
+    await publishReply({
+      messageId: replyOneB,
+      outputMessageId: outputOne,
+      userId: "user-one",
+      text: "first deferred reply B",
+      ts: now + 2,
+    });
+    expect(received).toHaveLength(0);
+
+    await publishLifecycle(requestTwo, "running");
+    await publishOutput(requestTwo, outputTwo);
+    failAfterFirstOldFollowUp = true;
+    await publishReply({
+      messageId: replyTwo,
+      outputMessageId: outputTwo,
+      userId: "user-two",
+      text: "second deferred reply",
+      ts: now + 4,
+    });
+
+    expect(received).toHaveLength(1);
+    expect(received[0]?.headers?.request_id).toBe(requestOne);
+    expect(received[0]?.data.queue).toBe("followUp");
+    expect(collectUserText(received[0]?.data.messages ?? [])).toContain("first deferred reply A");
+    expect(
+      raw.deliveryActions
+        .filter(({ topic }) => topic === "evt.adapter")
+        .map(({ action }) => action.disposition)
+        .at(-1),
+    ).toBe("park-pending");
+
+    await publishReply({
+      messageId: replyTwo,
+      outputMessageId: outputTwo,
+      userId: "user-two",
+      text: "second deferred reply",
+      ts: now + 4,
+    });
+
+    expect(received).toHaveLength(2);
+    expect(received[1]?.headers?.request_id).toBe(requestOne);
+    expect(received[1]?.data.queue).toBe("followUp");
+    expect(collectUserText(received[1]?.data.messages ?? [])).toContain("first deferred reply B");
+    expect(
+      received.filter((message) =>
+        collectUserText(message.data.messages ?? []).includes("first deferred reply A"),
+      ),
+    ).toHaveLength(1);
+    expect(
+      raw.deliveryActions
+        .filter(({ topic }) => topic === "evt.adapter")
+        .map(({ action }) => action.disposition)
+        .slice(-2),
+    ).toEqual(["park-pending", "commit"]);
+
+    await publishLifecycle(requestOne, "resolved");
+    expect(received).toHaveLength(2);
+
+    await publishLifecycle(requestTwo, "resolved");
+    expect(received).toHaveLength(3);
+    expect(received[2]?.headers?.request_id).toBe(`discord:${sessionId}:${replyTwo}`);
+    expect(received[2]?.data.queue).toBe("prompt");
+    expect(received[2]?.data.raw).toMatchObject({
+      pendingMentionReplyBatch: {
+        sourceRequestId: requestTwo,
+        size: 1,
+      },
+    });
+    expect(collectUserText(received[2]?.data.messages ?? [])).toContain("second deferred reply");
+
+    await sub.stop();
+    await router.stop();
+  });
+
+  it("retains a source-handoff batch across typed composition failure and redelivery", async () => {
+    const raw = createInMemoryRawBus();
+    const bus = createLilacBus(raw);
+    const sessionId = "typed-composition-source-handoff";
+    const requestOne = `discord:${sessionId}:request-one`;
+    const requestTwo = `discord:${sessionId}:request-two`;
+    const outputOne = "output-one";
+    const outputTwo = "output-two";
+    const replyOneA = "reply-one-a";
+    const replyOneB = "reply-one-b";
+    const replyTwo = "reply-two";
+    const now = Date.now();
+    const adapter = new FakeAdapter({
+      [`${sessionId}:${outputOne}`]: {
+        ref: { platform: "discord", channelId: sessionId, messageId: outputOne },
+        session: { platform: "discord", channelId: sessionId },
+        userId: "bot",
+        text: "first output",
+        ts: now,
+        raw: { reference: {} },
+      },
+      [`${sessionId}:${replyOneA}`]: {
+        ref: { platform: "discord", channelId: sessionId, messageId: replyOneA },
+        session: { platform: "discord", channelId: sessionId },
+        userId: "user-one",
+        text: "first deferred reply A",
+        ts: now + 1,
+        raw: {
+          reference: { messageId: outputOne, channelId: sessionId },
+          discord: {
+            attachments: [
+              {
+                url: "https://cdn.discordapp.com/attachments/1/2/file.txt",
+                filename: "file.txt",
+              },
+            ],
+          },
+        },
+      },
+      [`${sessionId}:${replyOneB}`]: {
+        ref: { platform: "discord", channelId: sessionId, messageId: replyOneB },
+        session: { platform: "discord", channelId: sessionId },
+        userId: "user-one",
+        text: "first deferred reply B",
+        ts: now + 2,
+        raw: { reference: { messageId: outputOne, channelId: sessionId } },
+      },
+      [`${sessionId}:${outputTwo}`]: {
+        ref: { platform: "discord", channelId: sessionId, messageId: outputTwo },
+        session: { platform: "discord", channelId: sessionId },
+        userId: "bot",
+        text: "second output",
+        ts: now + 3,
+        raw: { reference: {} },
+      },
+      [`${sessionId}:${replyTwo}`]: {
+        ref: { platform: "discord", channelId: sessionId, messageId: replyTwo },
+        session: { platform: "discord", channelId: sessionId },
+        userId: "user-two",
+        text: "second deferred reply",
+        ts: now + 4,
+        raw: { reference: { messageId: outputTwo, channelId: sessionId } },
+      },
+    });
+    const transcriptStore = new SqliteTranscriptStore(":memory:");
+    const putCoreOwnedBlob = transcriptStore.putCoreOwnedBlob.bind(transcriptStore);
+    let failComposition = true;
+    const putCoreOwnedBlobStub = spyOn(transcriptStore, "putCoreOwnedBlob").mockImplementation(
+      (input) =>
+        failComposition
+          ? Result.err(new CoreOwnedBlobIntegrityError("forced typed composition failure"))
+          : putCoreOwnedBlob(input),
+    );
+    const fetchStub = spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response("attachment", { headers: { "content-type": "text/plain" } }),
+    );
+    const logger = new Logger({ module: "typed-composition-source-handoff-test" });
+    const debugStub = spyOn(logger, "debug").mockImplementation(() => undefined);
+    const infoStub = spyOn(logger, "info").mockImplementation(() => undefined);
+    const warnStub = spyOn(logger, "warn").mockImplementation(() => undefined);
+    const errorStub = spyOn(logger, "error").mockImplementation(() => undefined);
+    const router = await startBusRequestRouter({
+      adapter,
+      bus,
+      subscriptionId: "router-typed-composition-source-handoff",
+      transcriptStore,
+      logger,
+      config: {
+        surface: {
+          discord: {
+            tokenEnv: "DISCORD_TOKEN",
+            allowedChannelIds: [],
+            allowedGuildIds: [],
+            botName: "lilac",
+            outputMode: "inline",
+            previewFinalOutputStyle: "embed",
+          },
+          router: {
+            defaultMode: "mention",
+            sessionModes: {},
+            activeDebounceMs: 5,
+            activeGate: { enabled: true, timeoutMs: 2500 },
+          },
+        },
+        agent: { systemPrompt: "(unused in tests; compiled at runtime)" },
+        models: {
+          def: {},
+          main: { model: "openrouter/openai/gpt-4o" },
+          fast: { model: "openrouter/openai/gpt-4o-mini" },
+        },
+      },
+    });
+    const received: DecodedLilacMessageForTopic<"cmd.request">[] = [];
+    const sub = await subscribeTopicForTest(
+      bus,
+      "cmd.request",
+      {
+        mode: "fanout",
+        subscriptionId: "typed-composition-source-handoff-observer",
+        consumerId: "typed-composition-source-handoff-consumer",
+        offset: { type: "begin" },
+      },
+      async (message) => {
+        if (message.type === lilacEventTypes.CmdRequestMessage) received.push(message);
+        return Result.ok(undefined);
+      },
+    );
+    const publishLifecycle = async (requestId: string, state: "running" | "resolved") => {
+      await bus.publish(
+        lilacEventTypes.EvtRequestLifecycleChanged,
+        { state, ts: Date.now() },
+        {
+          headers: {
+            request_id: requestId,
+            session_id: sessionId,
+            request_client: "discord",
+          },
+        },
+      );
+    };
+    const publishOutput = async (requestId: string, messageId: string) => {
+      await bus.publish(
+        lilacEventTypes.EvtSurfaceOutputMessageCreated,
+        { msgRef: { platform: "discord", channelId: sessionId, messageId } },
+        {
+          headers: {
+            request_id: requestId,
+            session_id: sessionId,
+            request_client: "discord",
+          },
+        },
+      );
+    };
+    const publishReply = async (input: {
+      readonly messageId: string;
+      readonly outputMessageId: string;
+      readonly userId: string;
+      readonly text: string;
+      readonly ts: number;
+    }) => {
+      await bus.publish(lilacEventTypes.EvtAdapterMessageCreated, {
+        platform: "discord",
+        channelId: sessionId,
+        messageId: input.messageId,
+        userId: input.userId,
+        text: input.text,
+        ts: input.ts,
+        raw: {
+          discord: {
+            isDMBased: false,
+            mentionsBot: false,
+            replyToBot: true,
+            replyToMessageId: input.outputMessageId,
+          },
+        },
+      });
+    };
+
+    try {
+      await publishLifecycle(requestOne, "running");
+      await publishOutput(requestOne, outputOne);
+      await publishReply({
+        messageId: replyOneA,
+        outputMessageId: outputOne,
+        userId: "user-one",
+        text: "first deferred reply A",
+        ts: now + 1,
+      });
+      await publishReply({
+        messageId: replyOneB,
+        outputMessageId: outputOne,
+        userId: "user-one",
+        text: "first deferred reply B",
+        ts: now + 2,
+      });
+
+      await publishLifecycle(requestTwo, "running");
+      await publishOutput(requestTwo, outputTwo);
+      await publishReply({
+        messageId: replyTwo,
+        outputMessageId: outputTwo,
+        userId: "user-two",
+        text: "second deferred reply",
+        ts: now + 4,
+      });
+
+      expect(received).toHaveLength(0);
+      expect(
+        raw.deliveryActions
+          .filter(({ topic }) => topic === "evt.adapter")
+          .map(({ action }) => action.disposition)
+          .at(-1),
+      ).toBe("park-pending");
+
+      failComposition = false;
+      await publishReply({
+        messageId: replyTwo,
+        outputMessageId: outputTwo,
+        userId: "user-two",
+        text: "second deferred reply",
+        ts: now + 4,
+      });
+
+      expect(received).toHaveLength(2);
+      expect(
+        received.map((message) => ({
+          requestId: message.headers?.request_id,
+          queue: message.data.queue,
+          text: collectUserText(message.data.messages),
+        })),
+      ).toEqual([
+        {
+          requestId: requestOne,
+          queue: "followUp",
+          text: expect.stringContaining("first deferred reply A"),
+        },
+        {
+          requestId: requestOne,
+          queue: "followUp",
+          text: expect.stringContaining("first deferred reply B"),
+        },
+      ]);
+      expect(
+        raw.deliveryActions
+          .filter(({ topic }) => topic === "evt.adapter")
+          .map(({ action }) => action.disposition)
+          .slice(-2),
+      ).toEqual(["park-pending", "commit"]);
+
+      await publishLifecycle(requestTwo, "resolved");
+
+      expect(received).toHaveLength(3);
+      expect(received[2]?.headers?.request_id).toBe(`discord:${sessionId}:${replyTwo}`);
+      expect(received[2]?.data.queue).toBe("prompt");
+      expect(collectUserText(received[2]?.data.messages ?? [])).toContain("second deferred reply");
+      expect(
+        received.filter((message) =>
+          collectUserText(message.data.messages).includes("first deferred reply A"),
+        ),
+      ).toHaveLength(1);
+      expect(
+        received.filter((message) =>
+          collectUserText(message.data.messages).includes("first deferred reply B"),
+        ),
+      ).toHaveLength(1);
+    } finally {
+      await sub.stop();
+      await router.stop();
+      transcriptStore.close();
+      putCoreOwnedBlobStub.mockRestore();
+      fetchStub.mockRestore();
+      debugStub.mockRestore();
+      infoStub.mockRestore();
+      warnStub.mockRestore();
+      errorStub.mockRestore();
+    }
   });
 
   it("converts deferred mention-mode reply batch into followUps when steer arrives", async () => {

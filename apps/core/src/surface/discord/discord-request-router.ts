@@ -1,6 +1,7 @@
 import {
   createLogger,
   extractAiErrorLogDetails,
+  formatTaggedErrorForLog,
   getCoreConfig,
   env,
   isPanic,
@@ -18,17 +19,26 @@ import {
   type LilacBus,
   type CorePrimaryLineageV1,
 } from "@stanley2058/lilac-event-bus";
-import { Result, TaggedError, type Panic, type Result as ResultType } from "better-result";
+import { Panic, Result, TaggedError, type Result as ResultType } from "better-result";
 import type { Logger } from "@stanley2058/simple-module-logger";
-import type { SurfaceAdapter } from "../adapter";
-import type { MsgRef } from "../types";
-import type { TranscriptStore } from "../../transcript/transcript-store";
+import type { SurfaceAdapter, SurfaceOperationError } from "../adapter";
+import type {
+  MsgRefFor,
+  SurfaceRecoveryGeneration,
+  SurfaceRestoredOutputChain,
+} from "../runtime-descriptor";
+import type { MsgRef, SurfaceSelf } from "../types";
+import {
+  CoreOwnedBlobIntegrityError,
+  type TranscriptStore,
+} from "../../transcript/transcript-store";
 import {
   composeRequestMessages,
   composeSingleMessageWithLineage,
+  type RequestCompositionError,
   type RequestCompositionResult,
-} from "./request-composition";
-import { formatDiscordMessageRequestId } from "./request-ids";
+} from "../bridge/request-composition";
+import { formatDiscordMessageRequestId } from "../bridge/request-ids";
 
 import {
   type SessionMode,
@@ -54,21 +64,21 @@ import {
   buildDiscordUserAliasById,
   getDiscordFlags,
   withDefaultToolsConfig,
-} from "./bus-request-router/common";
+} from "./discord-request-router/common";
 
 import {
   type BufferedMessage,
   type RouterGateInput,
   type RouterGateDecision,
   shouldForwardByGate,
-} from "./bus-request-router/gate";
+} from "./discord-request-router/gate";
 import {
   type PendingMentionReplyBatch,
   type PendingMentionReplyBatchItem,
   enqueuePendingMentionReplyBatch as enqueuePendingMentionReplyBatchImpl,
   takePendingMentionReplyBatch as takePendingMentionReplyBatchImpl,
   transformPendingUserText as transformPendingUserTextImpl,
-} from "./bus-request-router/pending-batch";
+} from "./discord-request-router/pending-batch";
 import {
   type PublishBusRequestInput,
   publishActiveChannelPrompt as publishActiveChannelPromptImpl,
@@ -77,18 +87,18 @@ import {
   publishSingleMessagePrompt as publishSingleMessagePromptImpl,
   publishSingleMessageToActiveRequest as publishSingleMessageToActiveRequestImpl,
   publishSurfaceOutputReanchor as publishSurfaceOutputReanchorImpl,
-} from "./bus-request-router/publish";
+} from "./discord-request-router/publish";
 import {
   resolvePreviousBatchMessageText as resolvePreviousBatchMessageTextImpl,
   resolvePreviousMessageText as resolvePreviousMessageTextImpl,
   resolveRepliedToMessageText as resolveRepliedToMessageTextImpl,
-} from "./bus-request-router/context";
-import { decideActiveRequestRoute } from "./bus-request-router/decisions";
+} from "./discord-request-router/context";
+import { decideActiveRequestRoute } from "./discord-request-router/decisions";
 import {
   customCommandInvocationErrorText,
   type CustomCommandManager,
 } from "../../custom-commands/manager";
-import { formatBridgeTaggedErrorForLog } from "./bridge-log";
+import { formatBridgeTaggedErrorForLog } from "../bridge/bridge-log";
 
 function createFreshOnlyLineage(
   reason: string,
@@ -104,11 +114,103 @@ function createFreshOnlyLineage(
   };
 }
 
+export type DiscordRequestCompositionFailurePolicy = {
+  readonly disposition:
+    | "drop-integrity-failure"
+    | "drop-permanent-gateway-event"
+    | "drop-transient-gateway-event";
+  readonly level: "error" | "warn";
+  readonly retryable: boolean;
+};
+
+export function discordRequestCompositionFailurePolicy(
+  error: RequestCompositionError,
+): DiscordRequestCompositionFailurePolicy {
+  if (error instanceof CoreOwnedBlobIntegrityError) {
+    return { disposition: "drop-integrity-failure", level: "error", retryable: false };
+  }
+  return discordSurfaceCompositionFailurePolicy(error);
+}
+
+function discordSurfaceCompositionFailurePolicy(
+  error: SurfaceOperationError,
+): DiscordRequestCompositionFailurePolicy {
+  switch (error._tag) {
+    case "SurfaceRateLimited":
+    case "SurfaceUnavailable":
+      return {
+        disposition: "drop-transient-gateway-event",
+        level: "warn",
+        retryable: true,
+      };
+    case "SurfaceOperationUnsupported":
+    case "SurfacePlatformMismatch":
+    case "SurfaceSessionMismatch":
+    case "SurfaceInvalidInput":
+    case "SurfaceOperationPartiallyCompleted":
+    case "SurfaceMessageNotFound":
+    case "SurfacePermissionDenied":
+      return {
+        disposition: "drop-permanent-gateway-event",
+        level: "warn",
+        retryable: false,
+      };
+  }
+}
+
+function logDiscordRequestCompositionFailure(
+  logger: Logger,
+  requestId: string,
+  sessionId: string,
+  error: RequestCompositionError,
+): void {
+  if (error instanceof CoreOwnedBlobIntegrityError) {
+    logger.error("request composition failed", {
+      requestId,
+      sessionId,
+      disposition: "drop-integrity-failure",
+      retryable: false,
+      errorType: "CoreOwnedBlobIntegrityError",
+      errorMessage: "Core owned blob integrity check failed",
+    });
+    return;
+  }
+  switch (error._tag) {
+    case "SurfaceRateLimited":
+    case "SurfaceUnavailable":
+      logger.warn("request composition failed", {
+        requestId,
+        sessionId,
+        disposition: "drop-transient-gateway-event",
+        retryable: true,
+        ...formatTaggedErrorForLog(error),
+      });
+      return;
+    case "SurfaceOperationUnsupported":
+    case "SurfacePlatformMismatch":
+    case "SurfaceSessionMismatch":
+    case "SurfaceInvalidInput":
+    case "SurfaceOperationPartiallyCompleted":
+    case "SurfaceMessageNotFound":
+    case "SurfacePermissionDenied":
+      logger.warn("request composition failed", {
+        requestId,
+        sessionId,
+        disposition: "drop-permanent-gateway-event",
+        retryable: false,
+        ...formatTaggedErrorForLog(error),
+      });
+      return;
+  }
+}
+
 type ActiveSessionState = {
   requestId: string;
   /** IDs of bot output messages in the current active output chain. */
   activeOutputMessageIds: Set<string>;
 };
+
+const MAX_TERMINAL_LIFECYCLE_TOMBSTONES = 2_048;
 
 export class BusRequestRouterMissingHeadersError extends TaggedError(
   "BusRequestRouterMissingHeadersError",
@@ -121,6 +223,13 @@ export class BusRequestRouterMissingHeadersError extends TaggedError(
 export class BusRequestRouterRoutingError extends TaggedError("BusRequestRouterRoutingError")<{
   readonly topic: "evt.request" | "evt.adapter";
   readonly cause: unknown;
+  readonly message: string;
+}> {}
+
+export class BusRequestRouterLifecycleCorrelationInvalid extends TaggedError(
+  "BusRequestRouterLifecycleCorrelationInvalid",
+)<{
+  readonly requestId: string;
   readonly message: string;
 }> {}
 
@@ -155,15 +264,106 @@ type RouterDeliverySubscription = {
   stop(): Promise<ResultType<void, EventDeliveryStopFailed>>;
 };
 
-export type BusRequestRouter = {
+export type DiscordRequestRouter = {
   readonly done: Promise<ResultType<void, EventDeliveryDoneError>>;
+  restoreActiveOutputChains(
+    generation: SurfaceRecoveryGeneration,
+    chains: readonly SurfaceRestoredOutputChain<"discord">[],
+  ): void;
   stop(): Promise<void>;
 };
 
+export type ResidualDiscordRequestRouter = {
+  readonly done: Promise<ResultType<void, EventDeliveryDoneError>>;
+  stop(): Promise<ResidualDiscordRequestRouterStopOutcome>;
+};
+
+export class DiscordRequestRouterSubscriptionStartRejected extends TaggedError(
+  "DiscordRequestRouterSubscriptionStartRejected",
+)<{
+  readonly cause: unknown;
+  readonly message: string;
+}> {}
+
+export class DiscordRequestRouterAdapterSelfLookupRejected extends TaggedError(
+  "DiscordRequestRouterAdapterSelfLookupRejected",
+)<{
+  readonly cause: unknown;
+  readonly message: string;
+}> {}
+
+export class DiscordRequestRouterSubscriptionStopRejected extends TaggedError(
+  "DiscordRequestRouterSubscriptionStopRejected",
+)<{
+  readonly cause: unknown;
+  readonly message: string;
+}> {}
+
+export type DiscordRequestRouterStartupFailure =
+  | EventDeliveryStartFailed
+  | DiscordRequestRouterSubscriptionStartRejected
+  | DiscordRequestRouterAdapterSelfLookupRejected;
+
+export type DiscordRequestRouterCleanupFailure =
+  | EventDeliveryStopFailed
+  | DiscordRequestRouterSubscriptionStopRejected;
+
+export class ResidualDiscordRequestRouterStopFailed extends TaggedError(
+  "ResidualDiscordRequestRouterStopFailed",
+)<{
+  readonly failures: readonly DiscordRequestRouterCleanupFailure[];
+  readonly message: string;
+}> {}
+
+export type ResidualDiscordRequestRouterStopOutcome =
+  | {
+      readonly kind: "result";
+      readonly result: ResultType<void, ResidualDiscordRequestRouterStopFailed>;
+      readonly residualRouter: ResidualDiscordRequestRouter | null;
+    }
+  | {
+      readonly kind: "panic";
+      readonly panic: Panic;
+      readonly additionalPanics: readonly Panic[];
+      readonly ordinaryFailure: ResidualDiscordRequestRouterStopFailed | null;
+      readonly residualRouter: ResidualDiscordRequestRouter;
+    };
+
+export class DiscordRequestRouterStartupAndCleanupFailed extends TaggedError(
+  "DiscordRequestRouterStartupAndCleanupFailed",
+)<{
+  readonly startup: DiscordRequestRouterStartupFailure;
+  readonly cleanup: readonly DiscordRequestRouterCleanupFailure[];
+  readonly message: string;
+}> {}
+
+type DiscordRequestRouterStartError =
+  | DiscordRequestRouterStartupFailure
+  | DiscordRequestRouterStartupAndCleanupFailed;
+
+export type DiscordRequestRouterStartOutcome =
+  | {
+      readonly kind: "result";
+      readonly result: ResultType<DiscordRequestRouter, DiscordRequestRouterStartError>;
+      readonly residualRouter: ResidualDiscordRequestRouter | null;
+    }
+  | {
+      readonly kind: "panic";
+      readonly panic: Panic;
+      readonly additionalPanics: readonly Panic[];
+      readonly startupFailure: DiscordRequestRouterStartupFailure | null;
+      readonly ordinaryCleanupFailure: ResidualDiscordRequestRouterStopFailed | null;
+      readonly residualRouter: ResidualDiscordRequestRouter | null;
+    };
+
 function lifecycleDeliveryPolicy(
-  error: BusRequestRouterMissingHeadersError | BusRequestRouterRoutingError,
+  error:
+    | BusRequestRouterMissingHeadersError
+    | BusRequestRouterRoutingError
+    | BusRequestRouterLifecycleCorrelationInvalid,
 ): DeliveryDisposition {
   switch (error._tag) {
+    case "BusRequestRouterLifecycleCorrelationInvalid":
     case "BusRequestRouterMissingHeadersError":
     case "BusRequestRouterRoutingError":
       return "park-pending";
@@ -186,11 +386,10 @@ function adapterDeliveryPolicy(error: BusRequestRouterRoutingError): DeliveryDis
 
 async function captureRouterRouting(
   topic: "evt.request" | "evt.adapter",
-  operation: () => Promise<void>,
+  operation: () => Promise<void | ResultType<void, BusRequestRouterRoutingError>>,
 ): Promise<ResultType<void, BusRequestRouterRoutingError>> {
   try {
-    await operation();
-    return Result.ok(undefined);
+    return (await operation()) ?? Result.ok(undefined);
   } catch (cause) {
     if (isPanic(cause)) throw cause;
     return Result.err(
@@ -244,11 +443,96 @@ async function captureRouterDebounceFlush(input: {
   }
 }
 
-function adaptRouterSubscriptionStart(
-  result: ResultType<RouterDeliverySubscription, EventDeliveryStartFailed>,
-): RouterDeliverySubscription {
-  if (result.status === "error") throw result.error;
-  return result.value;
+type RouterSubscriptionStartOutcome =
+  | { readonly kind: "started"; readonly subscription: RouterDeliverySubscription }
+  | { readonly kind: "failure"; readonly failure: DiscordRequestRouterStartupFailure }
+  | { readonly kind: "panic"; readonly panic: Panic };
+
+type RouterSelfLookupOutcome =
+  | { readonly kind: "resolved"; readonly self: SurfaceSelf }
+  | { readonly kind: "failure"; readonly failure: DiscordRequestRouterAdapterSelfLookupRejected }
+  | { readonly kind: "panic"; readonly panic: Panic };
+
+type RouterSubscriptionRollbackOutcome = {
+  readonly failures: readonly DiscordRequestRouterCleanupFailure[];
+  readonly panics: readonly Panic[];
+  readonly residualSubscriptions: readonly RouterDeliverySubscription[];
+};
+
+async function stopRouterSubscriptionsAllSettled(
+  subscriptions: readonly RouterDeliverySubscription[],
+): Promise<RouterSubscriptionRollbackOutcome> {
+  const failures: DiscordRequestRouterCleanupFailure[] = [];
+  const panics: Panic[] = [];
+  const residualSubscriptions: RouterDeliverySubscription[] = [];
+
+  for (const subscription of subscriptions.toReversed()) {
+    const [stopped] = await Promise.allSettled([Promise.resolve().then(() => subscription.stop())]);
+    if (!stopped) continue;
+    if (stopped.status === "rejected") {
+      residualSubscriptions.push(subscription);
+      if (isPanic(stopped.reason)) {
+        panics.push(stopped.reason);
+      } else {
+        failures.push(
+          new DiscordRequestRouterSubscriptionStopRejected({
+            cause: stopped.reason,
+            message: "Discord request router subscription stop rejected during cleanup",
+          }),
+        );
+      }
+      continue;
+    }
+    if (stopped.value.status === "error") {
+      residualSubscriptions.push(subscription);
+      failures.push(stopped.value.error);
+    }
+  }
+
+  return { failures, panics, residualSubscriptions };
+}
+
+async function adaptRouterSelfLookup(
+  operation: () => Promise<SurfaceSelf>,
+): Promise<RouterSelfLookupOutcome> {
+  const [settled] = await Promise.allSettled([Promise.resolve().then(operation)]);
+  if (settled.status === "rejected") {
+    if (isPanic(settled.reason)) return { kind: "panic", panic: settled.reason };
+    return {
+      kind: "failure",
+      failure: new DiscordRequestRouterAdapterSelfLookupRejected({
+        cause: settled.reason,
+        message: "Discord request router adapter self lookup rejected",
+      }),
+    };
+  }
+  return { kind: "resolved", self: settled.value };
+}
+
+async function rollbackRouterSubscriptionStartup(
+  startedSubscriptions: readonly RouterDeliverySubscription[],
+): Promise<RouterSubscriptionRollbackOutcome> {
+  return stopRouterSubscriptionsAllSettled(startedSubscriptions);
+}
+
+async function adaptRouterSubscriptionStart(
+  started: Promise<ResultType<RouterDeliverySubscription, EventDeliveryStartFailed>>,
+): Promise<RouterSubscriptionStartOutcome> {
+  const [settled] = await Promise.allSettled([started]);
+  if (settled.status === "rejected") {
+    if (isPanic(settled.reason)) return { kind: "panic", panic: settled.reason };
+    return {
+      kind: "failure",
+      failure: new DiscordRequestRouterSubscriptionStartRejected({
+        cause: settled.reason,
+        message: "Discord request router subscription start rejected",
+      }),
+    };
+  }
+  if (settled.value.status === "error") {
+    return { kind: "failure", failure: settled.value.error };
+  }
+  return { kind: "started", subscription: settled.value.value };
 }
 
 function adaptRouterConfigResult(result: ReturnType<typeof withDefaultToolsConfig>): CoreConfig {
@@ -282,6 +566,123 @@ async function adaptRouterSubscriptionsStop(
   }
 }
 
+function createResidualDiscordRequestRouter(
+  subscriptions: readonly RouterDeliverySubscription[],
+): ResidualDiscordRequestRouter {
+  return {
+    done: superviseRouterSubscriptionsDone(subscriptions),
+    stop: async () => {
+      const stopped = await stopRouterSubscriptionsAllSettled(subscriptions);
+      const residualRouter =
+        stopped.residualSubscriptions.length > 0
+          ? createResidualDiscordRequestRouter(stopped.residualSubscriptions)
+          : null;
+      const ordinaryFailure =
+        stopped.failures.length > 0
+          ? new ResidualDiscordRequestRouterStopFailed({
+              failures: stopped.failures,
+              message: "Discord request router residual subscription cleanup failed",
+            })
+          : null;
+
+      const panic = stopped.panics[0];
+      if (panic && residualRouter) {
+        return {
+          kind: "panic",
+          panic,
+          additionalPanics: stopped.panics.slice(1),
+          ordinaryFailure,
+          residualRouter,
+        };
+      }
+      if (ordinaryFailure) {
+        return {
+          kind: "result",
+          result: Result.err(ordinaryFailure),
+          residualRouter,
+        };
+      }
+      return { kind: "result", result: Result.ok(undefined), residualRouter: null };
+    },
+  };
+}
+
+async function finishRouterSubscriptionStartFailure(
+  startup: DiscordRequestRouterStartupFailure | Panic,
+  startedSubscriptions: readonly RouterDeliverySubscription[],
+): Promise<DiscordRequestRouterStartOutcome> {
+  const rollback = await rollbackRouterSubscriptionStartup(startedSubscriptions);
+  const residualRouter =
+    rollback.residualSubscriptions.length > 0
+      ? createResidualDiscordRequestRouter(rollback.residualSubscriptions)
+      : null;
+  const ordinaryCleanupFailure =
+    rollback.failures.length > 0
+      ? new ResidualDiscordRequestRouterStopFailed({
+          failures: rollback.failures,
+          message: "Discord request router startup rollback cleanup failed",
+        })
+      : null;
+
+  if (isPanic(startup)) {
+    return {
+      kind: "panic",
+      panic: startup,
+      additionalPanics: rollback.panics,
+      startupFailure: null,
+      ordinaryCleanupFailure,
+      residualRouter,
+    };
+  }
+  const rollbackPanic = rollback.panics[0];
+  if (rollbackPanic) {
+    return {
+      kind: "panic",
+      panic: rollbackPanic,
+      additionalPanics: rollback.panics.slice(1),
+      startupFailure: startup,
+      ordinaryCleanupFailure,
+      residualRouter,
+    };
+  }
+  if (rollback.failures.length === 0) {
+    return { kind: "result", result: Result.err(startup), residualRouter: null };
+  }
+  return {
+    kind: "result",
+    result: Result.err(
+      new DiscordRequestRouterStartupAndCleanupFailed({
+        startup,
+        cleanup: rollback.failures,
+        message: `${startup.message}; startup rollback also failed`,
+      }),
+    ),
+    residualRouter,
+  };
+}
+
+export function adaptDiscordRequestRouterStartOutcomeToHost(
+  outcome: DiscordRequestRouterStartOutcome,
+  retainResidualRouter: (router: ResidualDiscordRequestRouter) => void,
+  recordPanicDiagnostics: (diagnostics: {
+    readonly additionalPanicCount: number;
+    readonly startupFailure: DiscordRequestRouterStartupFailure | null;
+    readonly ordinaryCleanupFailure: ResidualDiscordRequestRouterStopFailed | null;
+  }) => void,
+): DiscordRequestRouter {
+  if (outcome.residualRouter) retainResidualRouter(outcome.residualRouter);
+  if (outcome.kind === "panic") {
+    recordPanicDiagnostics({
+      additionalPanicCount: outcome.additionalPanics.length,
+      startupFailure: outcome.startupFailure,
+      ordinaryCleanupFailure: outcome.ordinaryCleanupFailure,
+    });
+    throw outcome.panic;
+  }
+  if (outcome.result.status === "error") throw outcome.result.error;
+  return outcome.result.value;
+}
+
 function resolveTriggerType(input: {
   replyToBot: boolean | undefined;
   mentionsBot: boolean | undefined;
@@ -313,7 +714,7 @@ type DebounceBuffer = {
   timer: ReturnType<typeof setTimeout> | null;
 };
 
-export async function startBusRequestRouter(params: {
+export type StartDiscordRequestRouterInput = {
   adapter: SurfaceAdapter;
   bus: LilacBus;
   subscriptionId: string;
@@ -330,15 +731,37 @@ export async function startBusRequestRouter(params: {
   }) => Promise<{ suppress: boolean; reason?: string }>;
   /** Optional injection for unit tests (bypasses real model call). */
   routerGate?: (input: RouterGateInput) => Promise<RouterGateDecision>;
+  recoveryTombstoneCapacity?: number;
   /** Optional structured logger injection for embedding and tests. */
   logger?: Logger;
-}): Promise<BusRequestRouter> {
+};
+
+export function signalDiscordRequestRouterPlatformMismatch(
+  platform: SurfaceSelf["platform"],
+): never {
+  throw new Panic({
+    message: `Discord request router requires a Discord adapter (got '${platform}')`,
+  });
+}
+
+export async function startDiscordRequestRouter(
+  params: StartDiscordRequestRouterInput,
+): Promise<DiscordRequestRouterStartOutcome> {
   const { adapter, bus, subscriptionId, customCommands } = params;
+  const selfLookup = await adaptRouterSelfLookup(() => adapter.getSelf());
+  if (selfLookup.kind !== "resolved") {
+    return finishRouterSubscriptionStartFailure(
+      selfLookup.kind === "panic" ? selfLookup.panic : selfLookup.failure,
+      [],
+    );
+  }
+  const self = selfLookup.self;
+  if (self.platform !== "discord") signalDiscordRequestRouterPlatformMismatch(self.platform);
 
   const logger =
     params.logger ??
     createLogger({
-      module: "bus-request-router",
+      module: "discord-request-router",
     });
 
   let cfg = params.config
@@ -381,6 +804,81 @@ export async function startBusRequestRouter(params: {
   }
 
   const activeBySession = new Map<string, ActiveSessionState>();
+  const finalizedRecoveryGenerations = new WeakSet<SurfaceRecoveryGeneration>();
+  const terminalLifecycleTombstones = new Map<
+    string,
+    {
+      readonly requestId: string;
+      readonly platform: "discord";
+      readonly sessionId: string;
+    }
+  >();
+  const terminalLifecycleTombstoneCapacity = Math.max(
+    1,
+    Math.floor(params.recoveryTombstoneCapacity ?? MAX_TERMINAL_LIFECYCLE_TOMBSTONES),
+  );
+  let terminalLifecycleTombstoneOverflow = false;
+  const terminalLifecycleTombstoneKey = (requestId: string, sessionId: string): string =>
+    `${requestId}\u0000discord\u0000${sessionId}`;
+  const recordTerminalLifecycleTombstone = (requestId: string, sessionId: string): void => {
+    const key = terminalLifecycleTombstoneKey(requestId, sessionId);
+    if (terminalLifecycleTombstones.has(key) || terminalLifecycleTombstoneOverflow) return;
+    if (terminalLifecycleTombstones.size >= terminalLifecycleTombstoneCapacity) {
+      terminalLifecycleTombstoneOverflow = true;
+      return;
+    }
+    terminalLifecycleTombstones.set(key, {
+      requestId,
+      platform: "discord",
+      sessionId,
+    });
+  };
+  const activeSessionForRequest = (requestId: string): string | undefined => {
+    for (const [sessionId, active] of activeBySession) {
+      if (active.requestId === requestId) return sessionId;
+    }
+    return undefined;
+  };
+  const terminalSessionForRequest = (requestId: string): string | undefined => {
+    for (const tombstone of terminalLifecycleTombstones.values()) {
+      if (tombstone.requestId === requestId) return tombstone.sessionId;
+    }
+    return undefined;
+  };
+  const restoreActiveOutputChains = (
+    generation: SurfaceRecoveryGeneration,
+    chains: readonly SurfaceRestoredOutputChain<"discord">[],
+  ): void => {
+    if (finalizedRecoveryGenerations.has(generation)) return;
+    finalizedRecoveryGenerations.add(generation);
+    for (const chain of chains) {
+      if (terminalLifecycleTombstoneOverflow) {
+        const current = activeBySession.get(chain.sessionId);
+        if (current?.requestId === chain.requestId) activeBySession.delete(chain.sessionId);
+        continue;
+      }
+      const terminalKey = terminalLifecycleTombstoneKey(chain.requestId, chain.sessionId);
+      if (terminalLifecycleTombstones.has(terminalKey)) {
+        const current = activeBySession.get(chain.sessionId);
+        if (current?.requestId === chain.requestId) activeBySession.delete(chain.sessionId);
+        continue;
+      }
+      const current = activeBySession.get(chain.sessionId);
+      if (current && current.requestId !== chain.requestId) continue;
+      for (const [key, tombstone] of terminalLifecycleTombstones) {
+        if (tombstone.requestId === chain.requestId) terminalLifecycleTombstones.delete(key);
+      }
+      const active = current ?? {
+        requestId: chain.requestId,
+        activeOutputMessageIds: new Set<string>(),
+      };
+      const refs = chain.activeOutputRefs ?? chain.createdOutputRefs;
+      for (const ref of refs) active.activeOutputMessageIds.add(ref.messageId);
+      activeBySession.set(chain.sessionId, active);
+    }
+    terminalLifecycleTombstones.clear();
+    terminalLifecycleTombstoneOverflow = false;
+  };
   const buffers = new Map<string, DebounceBuffer>();
   const pendingMentionReplyBatchBySession = new Map<string, PendingMentionReplyBatch>();
   const debounceDefect = Promise.withResolvers<ResultType<void, EventDeliveryDoneError>>();
@@ -478,8 +976,9 @@ export async function startBusRequestRouter(params: {
     }
   }
 
-  const lifecycleSub = adaptRouterSubscriptionStart(
-    await bus.subscribeTopic(
+  const startedSubscriptions: RouterDeliverySubscription[] = [];
+  const lifecycleStarted = await adaptRouterSubscriptionStart(
+    bus.subscribeTopic(
       "evt.request",
       {
         mode: "fanout",
@@ -495,7 +994,8 @@ export async function startBusRequestRouter(params: {
 
         const requestId = msg.headers?.request_id;
         const sessionId = msg.headers?.session_id;
-        if (!requestId || !sessionId) {
+        const requestClient = msg.headers?.request_client;
+        if (!requestId || !sessionId || !requestClient) {
           logger.error("router.message.invalid_headers", {
             topic: "evt.request",
             messageType: msg.type,
@@ -510,17 +1010,46 @@ export async function startBusRequestRouter(params: {
               topic: "evt.request",
               messageType: msg.type,
               message:
-                "evt.request.lifecycle.changed missing required headers.request_id/session_id",
+                "evt.request.lifecycle.changed missing required headers.request_id/session_id/request_client",
+            }),
+          );
+        }
+
+        const activeSessionId = activeSessionForRequest(requestId);
+        const terminalSessionId = terminalSessionForRequest(requestId);
+        if (requestClient !== "discord") {
+          if (activeSessionId !== undefined || terminalSessionId !== undefined) {
+            return Result.err(
+              new BusRequestRouterLifecycleCorrelationInvalid({
+                requestId,
+                message: "Request lifecycle platform conflicts with Discord router ownership",
+              }),
+            );
+          }
+          return Result.ok(undefined);
+        }
+        if (
+          (activeSessionId !== undefined && activeSessionId !== sessionId) ||
+          (terminalSessionId !== undefined && terminalSessionId !== sessionId)
+        ) {
+          return Result.err(
+            new BusRequestRouterLifecycleCorrelationInvalid({
+              requestId,
+              message: "Request lifecycle session conflicts with Discord router ownership",
             }),
           );
         }
 
         return captureRouterRouting("evt.request", async () => {
           if (msg.data.state === "running") {
-            activeBySession.set(sessionId, {
-              requestId,
-              activeOutputMessageIds: new Set(),
-            });
+            terminalLifecycleTombstones.delete(terminalLifecycleTombstoneKey(requestId, sessionId));
+            const current = activeBySession.get(sessionId);
+            if (current?.requestId !== requestId) {
+              activeBySession.set(sessionId, {
+                requestId,
+                activeOutputMessageIds: new Set(),
+              });
+            }
           }
 
           if (
@@ -528,6 +1057,7 @@ export async function startBusRequestRouter(params: {
             msg.data.state === "failed" ||
             msg.data.state === "cancelled"
           ) {
+            recordTerminalLifecycleTombstone(requestId, sessionId);
             const cur = activeBySession.get(sessionId);
             if (cur?.requestId === requestId) {
               await flushPendingMentionReplyBatchAsPrompt({
@@ -542,9 +1072,17 @@ export async function startBusRequestRouter(params: {
       lifecycleDeliveryPolicy,
     ),
   );
+  if (lifecycleStarted.kind !== "started") {
+    return finishRouterSubscriptionStartFailure(
+      lifecycleStarted.kind === "panic" ? lifecycleStarted.panic : lifecycleStarted.failure,
+      startedSubscriptions,
+    );
+  }
+  const lifecycleSub = lifecycleStarted.subscription;
+  startedSubscriptions.push(lifecycleSub);
 
-  const surfaceSub = adaptRouterSubscriptionStart(
-    await bus.subscribeTopic(
+  const surfaceStarted = await adaptRouterSubscriptionStart(
+    bus.subscribeTopic(
       "evt.surface",
       {
         mode: "fanout",
@@ -599,9 +1137,17 @@ export async function startBusRequestRouter(params: {
       surfaceDeliveryPolicy,
     ),
   );
+  if (surfaceStarted.kind !== "started") {
+    return finishRouterSubscriptionStartFailure(
+      surfaceStarted.kind === "panic" ? surfaceStarted.panic : surfaceStarted.failure,
+      startedSubscriptions,
+    );
+  }
+  const surfaceSub = surfaceStarted.subscription;
+  startedSubscriptions.push(surfaceSub);
 
-  const adapterSub = adaptRouterSubscriptionStart(
-    await bus.subscribeTopic(
+  const adapterStarted = await adaptRouterSubscriptionStart(
+    bus.subscribeTopic(
       "evt.adapter",
       {
         mode: "fanout",
@@ -929,7 +1475,7 @@ export async function startBusRequestRouter(params: {
             return;
           }
 
-          await handleMentionMode({
+          return handleMentionMode({
             adapter,
             bus,
             cfg,
@@ -955,6 +1501,13 @@ export async function startBusRequestRouter(params: {
       adapterDeliveryPolicy,
     ),
   );
+  if (adapterStarted.kind !== "started") {
+    return finishRouterSubscriptionStartFailure(
+      adapterStarted.kind === "panic" ? adapterStarted.panic : adapterStarted.failure,
+      startedSubscriptions,
+    );
+  }
+  const adapterSub = adapterStarted.subscription;
 
   function clearDebounceBuffer(sessionId: string) {
     const b = buffers.get(sessionId);
@@ -966,7 +1519,7 @@ export async function startBusRequestRouter(params: {
     }
   }
 
-  function enqueuePendingMentionReplyBatch(input: {
+  async function enqueuePendingMentionReplyBatch(input: {
     sessionId: string;
     sourceRequestId: string;
     sessionConfigId: string;
@@ -974,11 +1527,20 @@ export async function startBusRequestRouter(params: {
     sessionMode: SessionMode;
     modelOverride?: string;
     item: PendingMentionReplyBatchItem;
-  }) {
+  }): Promise<ResultType<void, BusRequestRouterRoutingError>> {
+    const existing = pendingMentionReplyBatchBySession.get(input.sessionId);
+    if (existing && existing.sourceRequestId !== input.sourceRequestId) {
+      const flushed = await flushPendingMentionReplyBatchAsFollowUp({
+        sessionId: input.sessionId,
+        sourceRequestId: existing.sourceRequestId,
+      });
+      if (flushed.status === "error") return flushed;
+    }
     enqueuePendingMentionReplyBatchImpl({
       pendingMentionReplyBatchBySession,
       input,
     });
+    return Result.ok(undefined);
   }
 
   function takePendingMentionReplyBatch(input: {
@@ -1000,16 +1562,17 @@ export async function startBusRequestRouter(params: {
   async function flushPendingMentionReplyBatchAsFollowUp(input: {
     sessionId: string;
     sourceRequestId: string;
-  }) {
-    const batch = takePendingMentionReplyBatch(input);
-    if (!batch || batch.items.length === 0) return;
+  }): Promise<ResultType<void, BusRequestRouterRoutingError>> {
+    const batch = pendingMentionReplyBatchBySession.get(input.sessionId);
+    if (!batch || batch.sourceRequestId !== input.sourceRequestId) return Result.ok(undefined);
 
-    for (const item of batch.items) {
-      await publishSingleMessageToActiveRequest({
+    while (batch.items.length > 0) {
+      const item = batch.items[0]!;
+      const published = await publishSingleMessageToActiveRequest({
         adapter,
         bus,
         cfg,
-        requestId: input.sourceRequestId,
+        requestId: batch.sourceRequestId,
         sessionId: input.sessionId,
         sessionConfigId: batch.sessionConfigId,
         parentChannelId: batch.parentChannelId,
@@ -1019,7 +1582,22 @@ export async function startBusRequestRouter(params: {
         modelOverride: batch.modelOverride,
         transformUserText: transformPendingUserText(item),
       });
+      if (published.status === "error") {
+        return Result.err(
+          new BusRequestRouterRoutingError({
+            topic: "evt.adapter",
+            cause: published.error,
+            message: "Bus request router failed while handling evt.adapter",
+          }),
+        );
+      }
+      batch.items.shift();
     }
+
+    if (pendingMentionReplyBatchBySession.get(input.sessionId) === batch) {
+      pendingMentionReplyBatchBySession.delete(input.sessionId);
+    }
+    return Result.ok(undefined);
   }
 
   async function flushPendingMentionReplyBatchAsPrompt(input: {
@@ -1054,11 +1632,7 @@ export async function startBusRequestRouter(params: {
       },
     });
     if (composed.status === "error") {
-      logger.error("request composition failed", {
-        requestId,
-        sessionId: input.sessionId,
-        error: "Core owned blob integrity check failed",
-      });
+      logDiscordRequestCompositionFailure(logger, requestId, input.sessionId, composed.error);
       return;
     }
     const composition = composed.value;
@@ -1069,7 +1643,9 @@ export async function startBusRequestRouter(params: {
 
     for (const item of batch.items) {
       const surfaceMessage = await adapter.readMsg(item.msgRef);
-      if (surfaceMessage?.userId) batchParticipantUserIds.push(surfaceMessage.userId);
+      if (surfaceMessage.status === "ok" && surfaceMessage.value?.userId) {
+        batchParticipantUserIds.push(surfaceMessage.value.userId);
+      }
       if (chainMessageIds.has(item.msgRef.messageId)) continue;
       const extra = await composeSingleMessageWithLineage(adapter, {
         platform: "discord",
@@ -1082,11 +1658,7 @@ export async function startBusRequestRouter(params: {
       });
 
       if (extra.status === "error") {
-        logger.error("request composition failed", {
-          requestId,
-          sessionId: input.sessionId,
-          error: "Core owned blob integrity check failed",
-        });
+        logDiscordRequestCompositionFailure(logger, requestId, input.sessionId, extra.error);
         return;
       }
       if (!extra.value) continue;
@@ -1901,7 +2473,7 @@ export async function startBusRequestRouter(params: {
     cfg: CoreConfig;
     activeBySession: Map<string, ActiveSessionState>;
     sessionId: string;
-    msgRef: MsgRef;
+    msgRef: MsgRefFor<"discord">;
     userId: string;
     userText: string;
     mentionsBot?: boolean;
@@ -1915,7 +2487,7 @@ export async function startBusRequestRouter(params: {
     requestModelOverride?: string;
     continueCount?: number;
     botMentionNames: readonly string[];
-  }) {
+  }): Promise<ResultType<void, BusRequestRouterRoutingError>> {
     const {
       adapter,
       bus,
@@ -1959,7 +2531,7 @@ export async function startBusRequestRouter(params: {
         reason: "mention_mode_non_trigger",
         activeRequestId: active?.requestId,
       });
-      return;
+      return Result.ok(undefined);
     }
 
     const requestId = formatDiscordMessageRequestId({
@@ -1988,7 +2560,7 @@ export async function startBusRequestRouter(params: {
         ),
         transformUserTextForMessageId: msgRef.messageId,
       });
-      return;
+      return Result.ok(undefined);
     }
 
     // Special case: if the user is replying to the currently active output message chain,
@@ -2045,8 +2617,9 @@ export async function startBusRequestRouter(params: {
           sessionId,
           sourceRequestId: active.requestId,
         });
+        return Result.ok(undefined);
       } else {
-        enqueuePendingMentionReplyBatch({
+        return enqueuePendingMentionReplyBatch({
           sessionId,
           sourceRequestId: active.requestId,
           sessionConfigId: input.sessionConfigId,
@@ -2061,7 +2634,6 @@ export async function startBusRequestRouter(params: {
           },
         });
       }
-      return;
     }
 
     if (!active) {
@@ -2093,6 +2665,7 @@ export async function startBusRequestRouter(params: {
       ),
       transformUserTextForMessageId: msgRef.messageId,
     });
+    return Result.ok(undefined);
   }
 
   async function publishBusRequest(input: PublishBusRequestInput) {
@@ -2116,11 +2689,12 @@ export async function startBusRequestRouter(params: {
       input: requestInput,
     });
     if (published.status === "error") {
-      logger.error("request composition failed", {
-        requestId: input.requestId,
-        sessionId: input.sessionId,
-        error: "Core owned blob integrity check failed",
-      });
+      logDiscordRequestCompositionFailure(
+        logger,
+        input.requestId,
+        input.sessionId,
+        published.error,
+      );
     }
   }
 
@@ -2144,11 +2718,12 @@ export async function startBusRequestRouter(params: {
       input: requestInput,
     });
     if (published.status === "error") {
-      logger.error("request composition failed", {
-        requestId: input.requestId,
-        sessionId: input.sessionId,
-        error: "Core owned blob integrity check failed",
-      });
+      logDiscordRequestCompositionFailure(
+        logger,
+        input.requestId,
+        input.sessionId,
+        published.error,
+      );
       return;
     }
 
@@ -2181,12 +2756,14 @@ export async function startBusRequestRouter(params: {
       input: requestInput,
     });
     if (published.status === "error") {
-      logger.error("request composition failed", {
-        requestId: input.requestId,
-        sessionId: input.sessionId,
-        error: "Core owned blob integrity check failed",
-      });
+      logDiscordRequestCompositionFailure(
+        logger,
+        input.requestId,
+        input.sessionId,
+        published.error,
+      );
     }
+    return published;
   }
 
   type PublishSingleMessagePromptLocalInput = Parameters<
@@ -2208,11 +2785,12 @@ export async function startBusRequestRouter(params: {
       input: requestInput,
     });
     if (published.status === "error") {
-      logger.error("request composition failed", {
-        requestId: input.requestId,
-        sessionId: input.sessionId,
-        error: "Core owned blob integrity check failed",
-      });
+      logDiscordRequestCompositionFailure(
+        logger,
+        input.requestId,
+        input.sessionId,
+        published.error,
+      );
     }
   }
 
@@ -2229,17 +2807,24 @@ export async function startBusRequestRouter(params: {
   ]);
 
   return {
-    done,
-    stop: async () => {
-      try {
-        await adaptRouterSubscriptionsStop(subscriptions);
-      } finally {
-        for (const b of buffers.values()) {
-          if (b.timer) clearTimeout(b.timer);
+    kind: "result",
+    residualRouter: null,
+    result: Result.ok({
+      done,
+      restoreActiveOutputChains,
+      stop: async () => {
+        try {
+          await adaptRouterSubscriptionsStop(subscriptions);
+        } finally {
+          for (const b of buffers.values()) {
+            if (b.timer) clearTimeout(b.timer);
+          }
+          buffers.clear();
+          pendingMentionReplyBatchBySession.clear();
+          terminalLifecycleTombstones.clear();
+          terminalLifecycleTombstoneOverflow = false;
         }
-        buffers.clear();
-        pendingMentionReplyBatchBySession.clear();
-      }
-    },
+      },
+    }),
   };
 }

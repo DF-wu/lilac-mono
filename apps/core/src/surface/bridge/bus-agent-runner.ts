@@ -57,6 +57,7 @@ import {
   corePrimaryLineageV1Schema,
   createCorePrimaryLineageFreshOnlyV1,
   decodeCorePrimaryLineageV1,
+  EventDeliveryStopped,
   extendCoreLineagePrefixDigestV1,
   lilacEventTypes,
   type AdapterPlatform,
@@ -118,6 +119,20 @@ import type { WorkflowSubagentDispatcher } from "../../workflow/workflow-subagen
 import type { DurableWorkflowStore } from "../../workflow/durable-workflow-store";
 import type { WorkflowUsage } from "../../workflow/workflow-domain";
 import type { WorkflowRequestPolicy } from "../../workflow/workflow-request-authority";
+import {
+  createRequestMessageCache,
+  type RequestIdentityAliasTargetOccupied,
+  type RequestIdentitySourceMissing,
+  type RequestMessageCache,
+  type RequestMessageCacheAdmissionError,
+  type RequestMessageCacheOwner,
+} from "../../tool-server/request-message-cache";
+import {
+  AuthenticatedRequestProjectionInvalid,
+  isAuthenticatedRequestProjectionSemanticallyValid,
+  projectAuthenticatedRequest,
+  type AuthenticatedRequestProjection,
+} from "../authenticated-request";
 import { formatToolArgsForDisplayWithSpecs } from "../../tools/tool-args-display";
 import { isHeartbeatAckText, isHeartbeatSessionId } from "../../heartbeat/common";
 
@@ -212,7 +227,8 @@ import {
   maybeAppendResponseCommentaryPrompt,
   resolveSessionAdditionalPrompts,
 } from "./bus-agent-runner/prompt-overlays";
-import { resolveSessionSafetyMode, type SessionSafetyMode } from "./bus-request-router/common";
+import { resolveSessionSafetyMode, type SessionSafetyMode } from "../session-policy";
+import type { AuthenticatedSurfaceOrigin } from "../types";
 import type {
   CustomCommandExecutionError,
   CustomCommandManager,
@@ -334,8 +350,31 @@ export class BusAgentRunnerRequestHeadersInvalid extends TaggedError(
   readonly message: string;
 }> {}
 
+export class BusAgentRunnerQueueAttemptRouteInvalid extends TaggedError(
+  "BusAgentRunnerQueueAttemptRouteInvalid",
+)<{
+  readonly eventId: string;
+  readonly message: string;
+}> {}
+
+export class BusAgentRunnerRecoveryStopped extends TaggedError("BusAgentRunnerRecoveryStopped")<{
+  readonly message: string;
+}> {}
+
 export class BusAgentRunnerIntakeFailed extends TaggedError("BusAgentRunnerIntakeFailed")<{
   readonly cause: unknown;
+  readonly message: string;
+}> {}
+
+export class BusAgentRunnerAuthenticationProjectionInvalid extends TaggedError(
+  "BusAgentRunnerAuthenticationProjectionInvalid",
+)<{
+  readonly cause:
+    | AuthenticatedRequestProjectionInvalid
+    | RequestMessageCacheAdmissionError
+    | RequestIdentitySourceMissing
+    | RequestIdentityAliasTargetOccupied
+    | AuthenticatedRequestProjectionInvalid;
   readonly message: string;
 }> {}
 
@@ -429,6 +468,9 @@ export function projectBusAgentRunnerError(
 
 export type BusAgentRunnerDeliveryError =
   | BusAgentRunnerRequestHeadersInvalid
+  | BusAgentRunnerQueueAttemptRouteInvalid
+  | BusAgentRunnerRecoveryStopped
+  | BusAgentRunnerAuthenticationProjectionInvalid
   | BusAgentRunnerIntakeFailed;
 
 export function busAgentRunnerDeliveryDisposition(
@@ -436,7 +478,11 @@ export function busAgentRunnerDeliveryDisposition(
 ): DeliveryDisposition {
   switch (error._tag) {
     case "BusAgentRunnerRequestHeadersInvalid":
+    case "BusAgentRunnerQueueAttemptRouteInvalid":
+    case "BusAgentRunnerAuthenticationProjectionInvalid":
       return "dead-letter";
+    case "BusAgentRunnerRecoveryStopped":
+      return "stop";
     case "BusAgentRunnerIntakeFailed":
       return "park-pending";
   }
@@ -1534,6 +1580,7 @@ function persistHeartbeatSurfaceHandoffs(params: {
 }
 
 type Enqueued = {
+  queueEntryId: string;
   requestId: string;
   sessionId: string;
   requestClient: AdapterPlatform;
@@ -1544,13 +1591,71 @@ type Enqueued = {
   corePrimaryLineage?: CorePrimaryLineageV1;
   modelOverride?: string;
   raw?: AgentRunnerRaw;
+  authenticatedOrigin?: AuthenticatedSurfaceOrigin;
+  currentTurnUserId?: string;
+  verifiedIngress?: boolean;
+  identityOwner?: RequestMessageCacheOwner;
+  restoredSafetyMode?: SessionSafetyMode;
   recovery?: {
     checkpointMessages: ModelMessage[];
     partialText: string;
   };
 };
 
+type QueueCancellationGroup = {
+  readonly requestId: string;
+  readonly requestClient: AdapterPlatform;
+  readonly entries: readonly Enqueued[];
+};
+
+type QueueLifecycleAttempt = {
+  readonly eventId: string;
+  readonly controlRequestId: string;
+  readonly controlRequestClient: AdapterPlatform;
+  readonly sessionId: string;
+  readonly kind: "queued-cancellation" | "buffered-absorption";
+  readonly detail: string;
+  pendingGroups: QueueCancellationGroup[];
+  controlApplied: boolean;
+};
+
+export type AgentRunnerRecoveryIdentity =
+  | {
+      readonly state: "durable";
+      readonly projection: AuthenticatedRequestProjection;
+      readonly assertedSafetyMode: SessionSafetyMode;
+      readonly parkedEventIds: readonly string[];
+      readonly delegationProof?: {
+        readonly kind: "workflow";
+        readonly runId: string;
+        readonly operationId: string;
+        readonly dispatchEpoch: string;
+      };
+    }
+  | {
+      readonly state: "restricted";
+      readonly reason: "legacy-no-durable-proof" | "missing-cache-proof";
+    };
+
+export type AgentRunnerQueueAttempt = {
+  readonly eventId: string;
+  readonly controlRequestId: string;
+  readonly controlRequestClient: AdapterPlatform;
+  readonly sessionId: string;
+  readonly kind: "queued-cancellation" | "buffered-absorption";
+  readonly detail: string;
+  readonly controlApplied: boolean;
+  readonly controlIdentity: AgentRunnerRecoveryIdentity;
+  readonly pendingGroups: readonly {
+    readonly publicationIndex: number;
+    readonly requestId: string;
+    readonly requestClient: AdapterPlatform;
+    readonly targetQueueEntryIds: readonly string[];
+  }[];
+};
+
 export type AgentRunnerRecoveryEntry = {
+  queueEntryId?: string;
   kind: "active" | "queued";
   requestId: string;
   sessionId: string;
@@ -1561,11 +1666,35 @@ export type AgentRunnerRecoveryEntry = {
   messages: ModelMessage[];
   corePrimaryLineage?: CorePrimaryLineageV1;
   modelOverride?: string;
+  currentTurnUserId?: string;
   raw?: AgentRunnerRaw;
   recovery?: {
     checkpointMessages: ModelMessage[];
     partialText: string;
   };
+  identity?: AgentRunnerRecoveryIdentity;
+};
+
+export type AgentRunnerRecoveryState = {
+  readonly entries: readonly AgentRunnerRecoveryEntry[];
+  readonly queueAttempts: readonly AgentRunnerQueueAttempt[];
+};
+
+export class AgentRecoveryUnavailable extends TaggedError("AgentRecoveryUnavailable")<{
+  readonly requestId: string;
+  readonly reason:
+    | "cache-conflict"
+    | "delegation-proof-unavailable"
+    | "identity-conflict"
+    | "queue-admission-conflict"
+    | "queue-attempt-conflict";
+  readonly message: string;
+}> {}
+
+export type AgentRecoveryAttempt = {
+  apply(): ResultType<void, AgentRecoveryUnavailable>;
+  rollback(): void;
+  activate(): void;
 };
 
 export function isWorkflowAgentRecoveryEntry(entry: AgentRunnerRecoveryEntry): boolean {
@@ -1831,36 +1960,21 @@ function removeQueuedEntriesByReference(queue: Enqueued[], removed: readonly Enq
   return before - queue.length;
 }
 
-async function publishAbsorbedQueuedPromptCancelled(input: {
-  bus: LilacBus;
-  sessionId: string;
-  entries: readonly Enqueued[];
-  mode: "steer" | "interrupt";
-}) {
-  if (input.entries.length === 0) return;
-
-  const dedup = new Map<string, AdapterPlatform>();
-  for (const entry of input.entries) {
-    dedup.set(entry.requestId, entry.requestClient);
-  }
-
-  const detail =
-    input.mode === "interrupt"
-      ? "cancelled: absorbed into active interrupt"
-      : "cancelled: absorbed into active steer";
-
-  for (const [requestId, requestClient] of dedup) {
-    await publishLifecycle({
-      bus: input.bus,
-      headers: {
-        request_id: requestId,
-        session_id: input.sessionId,
-        request_client: requestClient,
-      },
-      state: "cancelled",
-      detail,
+function groupQueueCancellationEntries(entries: readonly Enqueued[]): QueueCancellationGroup[] {
+  const groups = new Map<string, QueueCancellationGroup>();
+  for (const entry of entries) {
+    const existing = groups.get(entry.requestId);
+    if (existing) {
+      groups.set(entry.requestId, { ...existing, entries: [...existing.entries, entry] });
+      continue;
+    }
+    groups.set(entry.requestId, {
+      requestId: entry.requestId,
+      requestClient: entry.requestClient,
+      entries: [entry],
     });
   }
+  return [...groups.values()];
 }
 
 async function maybeBuildSkillsSectionForPrimary(): Promise<string | null> {
@@ -2280,6 +2394,7 @@ type SessionQueue = {
     messages: ModelMessage[];
     corePrimaryLineage?: CorePrimaryLineageV1;
     modelOverride?: string;
+    currentTurnUserId?: string;
     raw?: AgentRunnerRaw;
     resolvedModelSpec: string | null;
     resolvedReasoning: ModelReasoningEffort | undefined;
@@ -2289,6 +2404,7 @@ type SessionQueue = {
     claudeCodeControl: ClaudeCodeRunControl | null;
     notifyWaiters: () => void;
     flushOutput: () => void;
+    setCurrentTurnUserId: (userId: string | undefined) => void;
     cancel: () => void;
     started: boolean;
     startedAt: number;
@@ -2320,17 +2436,60 @@ export function shouldQueueIncompatibleActiveRuntimeModel(input: {
   return !isActiveRuntimeModelCompatible(input);
 }
 
-function modelChangingRequestId(entry: Enqueued): string {
-  if (isRecord(entry.raw)) {
-    const origin = entry.raw["authenticatedOrigin"];
-    if (isRecord(origin)) {
-      const messageRef = origin["messageRef"];
-      if (isRecord(messageRef) && typeof messageRef["messageId"] === "string") {
-        return `${entry.requestClient}:${entry.sessionId}:${messageRef["messageId"]}`;
-      }
-    }
+export function deriveModelChangingRequestId(input: {
+  readonly requestId: string;
+  readonly authenticatedOrigin?: AuthenticatedSurfaceOrigin;
+}): string {
+  const messageRef = input.authenticatedOrigin?.messageRef;
+  if (messageRef) {
+    return `${messageRef.platform}:${messageRef.channelId}:${messageRef.messageId}`;
   }
-  return `${entry.requestId}:model-turn:${crypto.randomUUID()}`;
+  return `${input.requestId}:model-turn:${crypto.randomUUID()}`;
+}
+
+function projectDurableWorkflowRequestIdentity(input: {
+  readonly projection: AuthenticatedRequestProjection;
+  readonly raw: AgentRunnerRaw | undefined;
+  readonly store?: DurableWorkflowStore;
+}): AuthenticatedRequestProjection {
+  if (input.projection.requestClient !== "unknown" || !input.store) return input.projection;
+  const hint = parseWorkflowRequestHintFromRaw(input.raw);
+  if (!hint) return input.projection;
+  const authorized = input.store.authorizeWorkflowRequest({
+    requestId: input.projection.requestId,
+    sessionId: input.projection.sessionId,
+    platform: input.projection.requestClient,
+  });
+  if (
+    !authorized ||
+    authorized.policy.runId !== hint.runId ||
+    authorized.policy.operationId !== hint.operationId ||
+    authorized.policy.dispatchEpoch !== hint.dispatchEpoch
+  ) {
+    return input.projection;
+  }
+  const origin = authorized.policy.originSession;
+  let authenticatedOrigin: AuthenticatedSurfaceOrigin | undefined;
+  if (origin.client === "discord" && origin.sessionId && origin.userId) {
+    authenticatedOrigin = {
+      platform: "discord",
+      userId: origin.userId,
+      sessionRef: { platform: "discord", channelId: origin.sessionId },
+    };
+  } else if (origin.client === "github" && origin.sessionId && origin.userId) {
+    authenticatedOrigin = {
+      platform: "github",
+      userId: origin.userId,
+      sessionRef: { platform: "github", channelId: origin.sessionId },
+    };
+  }
+  return {
+    ...input.projection,
+    source: "internal-delegated",
+    ...(authenticatedOrigin ? { authenticatedOrigin } : {}),
+    authenticationMetadataKind: authenticatedOrigin ? "origin" : "absent",
+    verifiedIngress: false,
+  };
 }
 
 export type AgentRunnerActiveWork = {
@@ -2379,6 +2538,21 @@ export async function startBusAgentRunner(params: {
   workflowLiveParentBridge?: WorkflowLiveParentBridge;
   workflowSubagentDispatcher?: WorkflowSubagentDispatcher;
   durableWorkflowStore?: DurableWorkflowStore;
+  projectAuthenticatedRequest?: (
+    message: Extract<
+      DecodedLilacMessageForTopic<"cmd.request">,
+      { type: typeof lilacEventTypes.CmdRequestMessage }
+    >,
+  ) => ResultType<
+    AuthenticatedRequestProjection | undefined,
+    AuthenticatedRequestProjectionInvalid
+  >;
+  requestMessageCache?: RequestMessageCache;
+  startPaused?: boolean;
+  initialRecovery?: AgentRunnerRecoveryState;
+  beforeRequestIntake?: (
+    message: DecodedLilacMessageForTopic<"cmd.request">,
+  ) => void | Promise<void>;
   resolveParentChannelId?: (sessionId: string) => string | null | undefined;
   issueControlCapability?: (input: {
     requestId: string;
@@ -2388,15 +2562,20 @@ export async function startBusAgentRunner(params: {
     canonicalCwd: string;
     safetyMode: SessionSafetyMode;
     expiresAt: number;
-    principal?: { platform: "discord" | "github"; userId: string };
+    authenticatedOrigin?: AuthenticatedSurfaceOrigin;
+    verifiedIngress?: boolean;
   }) =>
     | {
         capability: string;
         principal: { platform: "discord" | "github"; userId: string } | null;
+        authenticatedOrigin?: AuthenticatedSurfaceOrigin | null;
+        safetyMode?: SessionSafetyMode;
       }
     | Promise<{
         capability: string;
         principal: { platform: "discord" | "github"; userId: string } | null;
+        authenticatedOrigin?: AuthenticatedSurfaceOrigin | null;
+        safetyMode?: SessionSafetyMode;
       }>;
   issueHeartbeatCapability?: (input: {
     requestId: string;
@@ -2453,20 +2632,86 @@ export async function startBusAgentRunner(params: {
 
   const bySession = new Map<string, SessionQueue>();
   const cancelledByRequestId = new Set<string>();
+  const reservedQueueEntries = new Set<Enqueued>();
+  const queueLifecycleAttempts = new Map<string, QueueLifecycleAttempt>();
   const restartAbortRequestIds = new Set<string>();
   const forcedRecoveryByRequestId = new Map<string, AgentRunnerRecoveryEntry>();
+  const requestMessageCache = params.requestMessageCache ?? createRequestMessageCache();
   let draining = false;
   let terminalPanic: Panic | null = null;
   let terminalPanicReported = false;
   let activeDrainOperation: Promise<void> | null = null;
   let terminalCleanupOperations: readonly BusAgentRunnerTerminalCleanupOperation[] = [];
   let terminalCleanupCompletion: Promise<void> | null = null;
+  let runnerActivated = params.startPaused !== true;
+  let runnerAdmissionStopped = false;
+  let resolveRunnerAdmission: ((outcome: "active" | "stopped") => void) | null = null;
+  const runnerActivation = runnerActivated
+    ? Promise.resolve("active" as const)
+    : new Promise<"active" | "stopped">((resolve) => {
+        resolveRunnerAdmission = resolve;
+      });
+  const activateRunnerAdmission = (): void => {
+    if (runnerActivated || runnerAdmissionStopped) return;
+    runnerActivated = true;
+    resolveRunnerAdmission?.("active");
+    resolveRunnerAdmission = null;
+  };
+  const stopRunnerAdmission = (): void => {
+    if (runnerActivated || runnerAdmissionStopped) return;
+    runnerAdmissionStopped = true;
+    resolveRunnerAdmission?.("stopped");
+    resolveRunnerAdmission = null;
+  };
   const reportFatalPanic = (panic: Panic): void => {
     terminalPanic ??= panic;
     if (terminalPanicReported) return;
     terminalPanicReported = true;
     params.reportFatalPanic(panic);
   };
+
+  async function resumeQueueLifecycleAttempt(
+    attempt: QueueLifecycleAttempt,
+    state: SessionQueue,
+  ): Promise<void> {
+    if (attempt.kind === "buffered-absorption" && !attempt.controlApplied) {
+      return signalBusAgentRunnerHostFailure(
+        new Error("Buffered absorption publication resumed before control application"),
+      );
+    }
+    while (attempt.pendingGroups.length > 0) {
+      const group = attempt.pendingGroups[0]!;
+      await publishLifecycle({
+        bus,
+        headers: {
+          request_id: group.requestId,
+          session_id: attempt.sessionId,
+          request_client: group.requestClient,
+        },
+        state: "cancelled",
+        detail: attempt.detail,
+      });
+      removeQueuedEntriesByReference(state.queue, group.entries);
+      for (const queued of group.entries) {
+        reservedQueueEntries.delete(queued);
+        if (queued.identityOwner) requestMessageCache.releaseOwner(queued.identityOwner);
+      }
+      attempt.pendingGroups.shift();
+    }
+    queueLifecycleAttempts.delete(attempt.eventId);
+    if (!state.running) startSessionQueueDrain(attempt.sessionId, state);
+  }
+
+  function abandonQueueLifecycleAttempt(eventId: string): void {
+    const attempt = queueLifecycleAttempts.get(eventId);
+    if (!attempt) return;
+    for (const group of attempt.pendingGroups) {
+      for (const queued of group.entries) reservedQueueEntries.delete(queued);
+    }
+    queueLifecycleAttempts.delete(eventId);
+    const state = bySession.get(attempt.sessionId);
+    if (state && !state.running) startSessionQueueDrain(attempt.sessionId, state);
+  }
 
   function startSessionQueueDrain(
     sessionId: string,
@@ -2494,10 +2739,32 @@ export async function startBusAgentRunner(params: {
   async function handleCmdRequestMessage(
     msg: CmdRequestMessage,
   ): Promise<ResultType<void, BusAgentRunnerDeliveryError>> {
+    if ((await runnerActivation) === "stopped") {
+      return Result.err(
+        new BusAgentRunnerRecoveryStopped({
+          message: "Paused agent recovery stopped before delivery activation",
+        }),
+      );
+    }
     const requestId = msg.headers?.request_id;
     const sessionId = msg.headers?.session_id;
     const requestClient = msg.headers?.request_client ?? "unknown";
+    const pendingAttempt = queueLifecycleAttempts.get(msg.id);
+    if (
+      pendingAttempt &&
+      (requestId !== pendingAttempt.controlRequestId ||
+        sessionId !== pendingAttempt.sessionId ||
+        requestClient !== pendingAttempt.controlRequestClient)
+    ) {
+      return Result.err(
+        new BusAgentRunnerQueueAttemptRouteInvalid({
+          eventId: msg.id,
+          message: "Redelivered queue control route conflicts with persisted delivery ownership",
+        }),
+      );
+    }
     if (!requestId || !sessionId) {
+      if (!pendingAttempt) abandonQueueLifecycleAttempt(msg.id);
       const missing: ("request_id" | "session_id")[] = [];
       if (!requestId) missing.push("request_id");
       if (!sessionId) missing.push("session_id");
@@ -2509,9 +2776,61 @@ export async function startBusAgentRunner(params: {
       );
     }
 
+    const projectedRequest = (params.projectAuthenticatedRequest ?? projectAuthenticatedRequest)(
+      msg,
+    );
+    if (projectedRequest.status === "error") {
+      if (!pendingAttempt) abandonQueueLifecycleAttempt(msg.id);
+      return Result.err(
+        new BusAgentRunnerAuthenticationProjectionInvalid({
+          cause: projectedRequest.error,
+          message: "cmd.request.message authentication projection is invalid",
+        }),
+      );
+    }
+    if (!projectedRequest.value) {
+      if (!pendingAttempt) abandonQueueLifecycleAttempt(msg.id);
+      return Result.ok(undefined);
+    }
+    const raw = preserveAgentRunnerRaw(msg.data.raw);
+    let cacheAdmitted = false;
+    let identityError:
+      | RequestIdentitySourceMissing
+      | RequestIdentityAliasTargetOccupied
+      | AuthenticatedRequestProjectionInvalid
+      | undefined;
+    let intakeError: BusAgentRunnerOperationFailed | undefined;
+    let parkPending = false;
     try {
+      const cachedExternal = requestMessageCache.cacheMessage(msg, projectedRequest.value);
+      if (cachedExternal.status === "error") {
+        return Result.err(
+          new BusAgentRunnerAuthenticationProjectionInvalid({
+            cause: cachedExternal.error,
+            message: "cmd.request.message cache admission is invalid",
+          }),
+        );
+      }
+      if (!cachedExternal.value) return Result.ok(undefined);
+      cacheAdmitted = true;
+      const trustedProjection = projectDurableWorkflowRequestIdentity({
+        projection: projectedRequest.value,
+        raw,
+        store: params.durableWorkflowStore,
+      });
+      const cachedTrusted = requestMessageCache.cacheMessage(msg, trustedProjection);
+      if (cachedTrusted.status === "error") {
+        return Result.err(
+          new BusAgentRunnerAuthenticationProjectionInvalid({
+            cause: cachedTrusted.error,
+            message: "cmd.request.message trusted cache admission is invalid",
+          }),
+        );
+      }
+      const authenticatedRequest = cachedTrusted.value ?? cachedExternal.value;
       await (async () => {
         rethrowBusAgentRunnerPanic(terminalPanic);
+        await params.beforeRequestIntake?.(msg);
 
         if (env.perf.log) {
           const lagMs = Date.now() - msg.ts;
@@ -2555,9 +2874,9 @@ export async function startBusAgentRunner(params: {
         // If reload fails, keep using the last known good config.
         await reloadCoreConfigIfNeeded();
 
-        const raw = preserveAgentRunnerRaw(msg.data.raw);
         const intakeRunProfile = parseSubagentMetaFromRaw(raw).profile;
         const entry: Enqueued = {
+          queueEntryId: msg.id,
           requestId,
           sessionId,
           requestClient,
@@ -2575,6 +2894,9 @@ export async function startBusAgentRunner(params: {
           }),
           modelOverride: msg.data.modelOverride,
           raw,
+          authenticatedOrigin: authenticatedRequest?.authenticatedOrigin,
+          currentTurnUserId: trustedProjection.authenticatedOrigin?.userId,
+          verifiedIngress: authenticatedRequest?.verifiedIngress,
         };
 
         const requestControl = parseRequestControlFromRaw(entry.raw);
@@ -2618,6 +2940,39 @@ export async function startBusAgentRunner(params: {
             activeRequestId: state.activeRequestId,
             queueDepth: state.queue.length,
           });
+        };
+
+        if (pendingAttempt) {
+          await resumeQueueLifecycleAttempt(pendingAttempt, state);
+          return;
+        }
+        const enqueueWithLifecycle = async (
+          queuedEntry: Enqueued,
+          detail: string,
+        ): Promise<ResultType<void, BusAgentRunnerOperationFailed>> => {
+          state.queue.push(queuedEntry);
+          const published = await captureBusAgentRunnerOperation(
+            "queued lifecycle publication",
+            () =>
+              publishLifecycle({
+                bus,
+                headers: {
+                  request_id: queuedEntry.requestId,
+                  session_id: sessionId,
+                  request_client: queuedEntry.requestClient,
+                },
+                state: "queued",
+                detail,
+              }),
+          );
+          if (published.status === "error") {
+            removeQueuedEntriesByReference(state.queue, [queuedEntry]);
+            if (queuedEntry.identityOwner) {
+              requestMessageCache.releaseOwner(queuedEntry.identityOwner);
+            }
+            return Result.err(published.error);
+          }
+          return Result.ok(undefined);
         };
 
         if (
@@ -2681,56 +3036,54 @@ export async function startBusAgentRunner(params: {
         };
 
         if (requestControl.cancel && requestControl.cancelQueued) {
-          const removed = new Map<string, AdapterPlatform>();
+          const matchedEntries: Enqueued[] = [];
 
-          const removedByRequestId = removeQueuedEntries(
-            state.queue,
-            (queued) => queued.requestId === requestId,
-          );
-          for (const queued of removedByRequestId) {
-            removed.set(queued.requestId, queued.requestClient);
+          for (const queued of state.queue) {
+            if (queued.requestId === requestId && !reservedQueueEntries.has(queued)) {
+              matchedEntries.push(queued);
+            }
           }
 
           const targetMessageId = requestControl.targetMessageId;
           if (targetMessageId) {
-            const removedByMessage = removeQueuedEntries(state.queue, (queued) =>
-              requestRawReferencesMessage(queued.raw, targetMessageId),
-            );
-            for (const queued of removedByMessage) {
-              removed.set(queued.requestId, queued.requestClient);
+            for (const queued of state.queue) {
+              if (
+                !matchedEntries.includes(queued) &&
+                !reservedQueueEntries.has(queued) &&
+                requestRawReferencesMessage(queued.raw, targetMessageId)
+              ) {
+                matchedEntries.push(queued);
+              }
             }
           }
 
-          if (removed.size > 0) {
-            for (const [cancelledRequestId, cancelledRequestClient] of removed) {
-              await publishLifecycle({
-                bus,
-                headers: {
-                  request_id: cancelledRequestId,
-                  session_id: sessionId,
-                  request_client: cancelledRequestClient,
-                },
-                state: "cancelled",
-                detail: "cancelled while queued",
-              });
-            }
+          if (matchedEntries.length > 0) {
+            for (const queued of matchedEntries) reservedQueueEntries.add(queued);
+            const attempt: QueueLifecycleAttempt = {
+              eventId: msg.id,
+              controlRequestId: requestId,
+              controlRequestClient: requestClient,
+              sessionId,
+              kind: "queued-cancellation",
+              detail: "cancelled while queued",
+              pendingGroups: groupQueueCancellationEntries(matchedEntries),
+              controlApplied: true,
+            };
+            queueLifecycleAttempts.set(msg.id, attempt);
+            await resumeQueueLifecycleAttempt(attempt, state);
 
             logger.debug("queued request cancelled", {
               requestId,
               sessionId,
-              cancelledRequestIds: [...removed.keys()],
+              cancelledRequestIds: [...new Set(matchedEntries.map((queued) => queued.requestId))],
               queueDepth: state.queue.length,
             });
             logQueueTransition({
               action: "cancel_queued",
-              queueDepthBefore: state.queue.length + removed.size,
+              queueDepthBefore: state.queue.length + matchedEntries.length,
               queueDepthAfter: state.queue.length,
               reason: "cancel_queued",
             });
-
-            if (!state.running) {
-              startSessionQueueDrain(sessionId, state, requestId);
-            }
 
             return;
           }
@@ -2803,6 +3156,12 @@ export async function startBusAgentRunner(params: {
           }
 
           const queueDepthBefore = state.queue.length;
+          const owner = requestMessageCache.acquireOwner(requestId);
+          if (owner.status === "error") {
+            identityError = owner.error;
+            return;
+          }
+          entry.identityOwner = owner.value;
           state.queue.push(entry);
           logQueueTransition({
             action: "enqueue",
@@ -2862,23 +3221,40 @@ export async function startBusAgentRunner(params: {
               }
             }
             if (incompatible) {
+              const aliasRequestId = deriveModelChangingRequestId(entry);
+              const aliased = requestMessageCache.createAliasOwner({
+                sourceRequestId: requestId,
+                aliasRequestId,
+                requestClient,
+                sessionId,
+              });
+              if (aliased.status === "error") {
+                identityError = aliased.error;
+                return;
+              }
+              const aliasProjection = aliased.value.projection;
               const queuedEntry: Enqueued = {
                 ...entry,
-                requestId: modelChangingRequestId(entry),
+                requestId: aliasProjection.requestId,
+                sessionId: aliasProjection.sessionId,
+                requestClient: aliasProjection.requestClient,
                 queue: "prompt",
+                authenticatedOrigin: aliasProjection.authenticatedOrigin,
+                verifiedIngress: aliasProjection.verifiedIngress,
+                identityOwner: {
+                  requestId: aliased.value.requestId,
+                  ownerId: aliased.value.ownerId,
+                },
               };
               const queueDepthBefore = state.queue.length;
-              state.queue.push(queuedEntry);
-              await publishLifecycle({
-                bus,
-                headers: {
-                  request_id: queuedEntry.requestId,
-                  session_id: sessionId,
-                  request_client: requestClient,
-                },
-                state: "queued",
-                detail: "queued for incompatible model or reasoning selection",
-              });
+              const enqueued = await enqueueWithLifecycle(
+                queuedEntry,
+                "queued for incompatible model or reasoning selection",
+              );
+              if (enqueued.status === "error") {
+                intakeError = enqueued.error;
+                return;
+              }
               logQueueTransition({
                 action: "enqueue",
                 queueDepthBefore,
@@ -2892,6 +3268,7 @@ export async function startBusAgentRunner(params: {
 
           // If the message is intended for the currently active request, apply immediately.
           if (state.activeRequestId && state.activeRequestId === requestId && state.agent) {
+            const runningAgent = state.agent;
             const queueDepthBefore = state.queue.length;
             const shouldAbsorbBufferedPrompts =
               (entry.queue === "steer" || entry.queue === "interrupt") &&
@@ -2901,7 +3278,7 @@ export async function startBusAgentRunner(params: {
               ? collectBufferedPromptEntriesForActiveRequest({
                   queue: state.queue,
                   activeRequestId: requestId,
-                })
+                }).filter((queued) => !reservedQueueEntries.has(queued))
               : [];
 
             const mergedEntry =
@@ -2914,28 +3291,57 @@ export async function startBusAgentRunner(params: {
                     ],
                     corePrimaryLineage: degradeCorePrimaryLineageForMutation(
                       "queued-buffer-absorbed-into-steering",
-                      state.agent.state.messages.length,
+                      runningAgent.state.messages.length,
                     ),
                   } satisfies Enqueued)
                 : entry;
 
-            await applyToRunningAgent(
-              state.agent,
-              mergedEntry,
-              cancelledByRequestId,
-              state.activeRun,
-            );
-
             if (bufferedPrompts.length > 0) {
               const absorbMode: "steer" | "interrupt" =
                 entry.queue === "interrupt" ? "interrupt" : "steer";
-              removeQueuedEntriesByReference(state.queue, bufferedPrompts);
-              await publishAbsorbedQueuedPromptCancelled({
-                bus,
+              for (const bufferedPrompt of bufferedPrompts) {
+                reservedQueueEntries.add(bufferedPrompt);
+              }
+              const attempt: QueueLifecycleAttempt = {
+                eventId: msg.id,
+                controlRequestId: requestId,
+                controlRequestClient: requestClient,
                 sessionId,
-                entries: bufferedPrompts,
-                mode: absorbMode,
-              });
+                kind: "buffered-absorption",
+                detail:
+                  absorbMode === "interrupt"
+                    ? "cancelled: absorbed into active interrupt"
+                    : "cancelled: absorbed into active steer",
+                pendingGroups: groupQueueCancellationEntries(bufferedPrompts),
+                controlApplied: false,
+              };
+              queueLifecycleAttempts.set(msg.id, attempt);
+              const applied = await captureBusAgentRunnerOperation(
+                "buffered prompt control application",
+                () =>
+                  applyToRunningAgent(
+                    runningAgent,
+                    mergedEntry,
+                    cancelledByRequestId,
+                    state.activeRun,
+                  ),
+              );
+              if (applied.status === "error") {
+                for (const bufferedPrompt of bufferedPrompts) {
+                  reservedQueueEntries.delete(bufferedPrompt);
+                }
+                queueLifecycleAttempts.delete(msg.id);
+                signalBusAgentRunnerHostFailure(applied.error);
+              }
+              attempt.controlApplied = true;
+              await resumeQueueLifecycleAttempt(attempt, state);
+            } else {
+              await applyToRunningAgent(
+                runningAgent,
+                mergedEntry,
+                cancelledByRequestId,
+                state.activeRun,
+              );
             }
 
             logQueueTransition({
@@ -2968,18 +3374,17 @@ export async function startBusAgentRunner(params: {
 
             // No parallel runs: queue prompt messages for later.
             const queueDepthBefore = state.queue.length;
-            state.queue.push(entry);
-
-            await publishLifecycle({
-              bus,
-              headers: {
-                request_id: requestId,
-                session_id: sessionId,
-                request_client: requestClient,
-              },
-              state: "queued",
-              detail: "queued behind active request",
-            });
+            const owner = requestMessageCache.acquireOwner(requestId);
+            if (owner.status === "error") {
+              identityError = owner.error;
+              return;
+            }
+            entry.identityOwner = owner.value;
+            const enqueued = await enqueueWithLifecycle(entry, "queued behind active request");
+            if (enqueued.status === "error") {
+              intakeError = enqueued.error;
+              return;
+            }
 
             logQueuedBehindActiveRun(requestId);
             logQueueTransition({
@@ -2991,67 +3396,165 @@ export async function startBusAgentRunner(params: {
           }
         }
       })();
+      if (intakeError) {
+        parkPending = true;
+        return Result.err(
+          new BusAgentRunnerIntakeFailed({
+            cause: intakeError,
+            message: "cmd.request.message intake failed",
+          }),
+        );
+      }
+      if (identityError) {
+        return Result.err(
+          new BusAgentRunnerAuthenticationProjectionInvalid({
+            cause: identityError,
+            message: "cmd.request.message identity ownership is invalid",
+          }),
+        );
+      }
       return Result.ok(undefined);
     } catch (cause) {
       rethrowBusAgentRunnerPanic(cause);
+      parkPending = true;
       return Result.err(
         new BusAgentRunnerIntakeFailed({
           cause,
           message: "cmd.request.message intake failed",
         }),
       );
+    } finally {
+      if (!parkPending) abandonQueueLifecycleAttempt(msg.id);
+      if (cacheAdmitted) {
+        requestMessageCache.finishDelivery({
+          requestId,
+          eventId: msg.id,
+          disposition: parkPending ? "park" : "release",
+        });
+      }
     }
   }
 
-  const startedSubscription = await bus.subscribeTopic(
-    "cmd.request",
-    {
-      mode: "work",
-      subscriptionId,
-      consumerId: consumerId(subscriptionId),
-      offset: { type: "begin" },
-      batch: { maxWaitMs: 1000 },
-    },
-    async (msg) => {
-      switch (msg.type) {
-        case lilacEventTypes.CmdRequestMessage:
-          return await handleCmdRequestMessage(msg);
-      }
-    },
-    busAgentRunnerDeliveryDisposition,
-  );
-  if (startedSubscription.status === "error") throw startedSubscription.error;
-  const sub = startedSubscription.value;
-
-  const subscriptionDone = sub.done.then((done) => {
-    if (done.status === "error") throw done.error;
-  });
-  const superviseSubscriptionDone = (cause: unknown): void => {
+  let stopStartedSubscription: (() => Promise<void>) | null = null;
+  let subscriptionStart: Promise<void> | null = null;
+  const superviseAgentRunnerBackgroundFailure = (cause: unknown): void => {
     rethrowBusAgentRunnerPanic(cause, reportFatalPanic);
-    const error = projectBusAgentRunnerError(cause, "cmd.request subscription stopped");
-    logger.error("cmd.request subscription stopped", {
-      error: error.message,
-    });
+    const error = projectBusAgentRunnerError(cause, "agent runner background operation failed");
+    logger.error("agent runner background operation failed", { error: error.message });
   };
   const observeSupervisedSubscriptionDoneRejection = (): void => undefined;
-  const supervisedSubscriptionDone = subscriptionDone.catch(superviseSubscriptionDone);
-  void supervisedSubscriptionDone.catch(observeSupervisedSubscriptionDoneRejection);
+  const isRunnerAdmissionStop = (error: EventDeliveryStopped): boolean =>
+    runnerAdmissionStopped && error.reason === "requested";
+  const startSubscription = (): Promise<void> => {
+    if (subscriptionStart) return subscriptionStart;
+    subscriptionStart = (async () => {
+      const startedSubscription = await bus.subscribeTopic(
+        "cmd.request",
+        {
+          mode: "work",
+          subscriptionId,
+          consumerId: consumerId(subscriptionId),
+          offset: { type: "begin" },
+          batch: { maxWaitMs: 1000 },
+        },
+        async (msg) => {
+          switch (msg.type) {
+            case lilacEventTypes.CmdRequestMessage:
+              return await handleCmdRequestMessage(msg);
+          }
+        },
+        busAgentRunnerDeliveryDisposition,
+      );
+      if (startedSubscription.status === "error") {
+        signalBusAgentRunnerHostFailure(startedSubscription.error);
+      }
+      const sub = startedSubscription.value;
+      const subscriptionDone = sub.done.then((done) => {
+        if (
+          done.status === "error" &&
+          !(done.error instanceof EventDeliveryStopped && isRunnerAdmissionStop(done.error))
+        ) {
+          signalBusAgentRunnerHostFailure(done.error);
+        }
+      });
+      const supervisedSubscriptionDone = subscriptionDone.catch(
+        superviseAgentRunnerBackgroundFailure,
+      );
+      void supervisedSubscriptionDone.catch(observeSupervisedSubscriptionDoneRejection);
+      stopStartedSubscription = async () => {
+        const stopped = await sub.stop();
+        if (stopped.status === "error") signalBusAgentRunnerHostFailure(stopped.error);
+        const done = await sub.done;
+        if (
+          done.status === "error" &&
+          !(done.error instanceof EventDeliveryStopped && isRunnerAdmissionStop(done.error))
+        ) {
+          signalBusAgentRunnerHostFailure(done.error);
+        }
+      };
+    })();
+    return subscriptionStart;
+  };
 
   let subscriptionStopped = false;
   const stopSubscription = async () => {
     if (subscriptionStopped) return;
     subscriptionStopped = true;
-    const stopped = await sub.stop();
-    if (stopped.status === "error") throw stopped.error;
-    const done = await sub.done;
-    if (done.status === "error") throw done.error;
+    await stopStartedSubscription?.();
   };
+
+  function buildRecoveryIdentity(input: {
+    readonly requestId: string;
+    readonly requestClient: AdapterPlatform;
+    readonly sessionId: string;
+  }): AgentRunnerRecoveryIdentity {
+    const projection = requestMessageCache.getOrigin(input.requestId);
+    if (!projection) return { state: "restricted", reason: "missing-cache-proof" };
+    const cacheState = requestMessageCache.snapshot(input.requestId);
+    let safetyMode: SessionSafetyMode = "restricted";
+    if (projection.source === "external" && projection.requestClient === "github") {
+      safetyMode = projection.verifiedIngress ? "trusted" : "restricted";
+    } else if (projection.source === "external" && projection.requestClient === "discord") {
+      const parentResolution = params.resolveParentChannelId?.(input.sessionId);
+      safetyMode =
+        parentResolution === undefined
+          ? "restricted"
+          : resolveSessionSafetyMode(cfg, input.sessionId, parentResolution ?? undefined);
+    }
+    if (projection.source === "internal-delegated") {
+      const authorized = params.durableWorkflowStore?.authorizeWorkflowRequest({
+        requestId: input.requestId,
+        sessionId: input.sessionId,
+        platform: input.requestClient,
+      });
+      if (!authorized) return { state: "restricted", reason: "missing-cache-proof" };
+      return {
+        state: "durable",
+        projection,
+        assertedSafetyMode: safetyMode,
+        parkedEventIds: cacheState?.parkedEventIds ?? [],
+        delegationProof: {
+          kind: "workflow",
+          runId: authorized.policy.runId,
+          operationId: authorized.policy.operationId,
+          dispatchEpoch: authorized.policy.dispatchEpoch,
+        },
+      };
+    }
+    return {
+      state: "durable",
+      projection,
+      assertedSafetyMode: safetyMode,
+      parkedEventIds: cacheState?.parkedEventIds ?? [],
+    };
+  }
 
   function buildActiveRecoveryEntry(state: SessionQueue): AgentRunnerRecoveryEntry | null {
     if (!state.running || !state.activeRun) return null;
 
     if (!state.agent) {
       return {
+        queueEntryId: `active:${state.activeRun.requestId}`,
         kind: "active",
         requestId: state.activeRun.requestId,
         sessionId: state.activeRun.sessionId,
@@ -3062,7 +3565,9 @@ export async function startBusAgentRunner(params: {
         messages: state.activeRun.messages,
         corePrimaryLineage: state.activeRun.corePrimaryLineage,
         ...(state.activeRun.modelOverride ? { modelOverride: state.activeRun.modelOverride } : {}),
+        currentTurnUserId: state.activeRun.currentTurnUserId,
         raw: state.activeRun.raw,
+        identity: buildRecoveryIdentity(state.activeRun),
       };
     }
 
@@ -3072,6 +3577,7 @@ export async function startBusAgentRunner(params: {
     );
 
     return {
+      queueEntryId: `active:${state.activeRun.requestId}`,
       kind: "active",
       requestId: state.activeRun.requestId,
       sessionId: state.activeRun.sessionId,
@@ -3082,7 +3588,9 @@ export async function startBusAgentRunner(params: {
       messages: [],
       corePrimaryLineage: degradeCorePrimaryLineageForMutation("restart-recovery-checkpoint"),
       ...(state.activeRun.modelOverride ? { modelOverride: state.activeRun.modelOverride } : {}),
+      currentTurnUserId: state.activeRun.currentTurnUserId,
       raw: state.activeRun.raw,
+      identity: buildRecoveryIdentity(state.activeRun),
       recovery: {
         checkpointMessages,
         partialText: state.activeRun.partialText,
@@ -3138,6 +3646,7 @@ export async function startBusAgentRunner(params: {
 
       for (const queued of state.queue) {
         out.push({
+          queueEntryId: queued.queueEntryId,
           kind: "queued",
           requestId: queued.requestId,
           sessionId: queued.sessionId,
@@ -3148,7 +3657,9 @@ export async function startBusAgentRunner(params: {
           messages: queued.messages,
           corePrimaryLineage: queued.corePrimaryLineage,
           ...(queued.modelOverride ? { modelOverride: queued.modelOverride } : {}),
+          currentTurnUserId: queued.currentTurnUserId,
           raw: queued.raw,
+          identity: buildRecoveryIdentity(queued),
         });
       }
     }
@@ -3156,66 +3667,426 @@ export async function startBusAgentRunner(params: {
     return out;
   }
 
-  function restoreRecoverables(entries: readonly AgentRunnerRecoveryEntry[]) {
-    if (entries.length === 0) return;
+  function snapshotQueueAttempts(): AgentRunnerQueueAttempt[] {
+    return [...queueLifecycleAttempts.values()].map((attempt) => ({
+      eventId: attempt.eventId,
+      controlRequestId: attempt.controlRequestId,
+      controlRequestClient: attempt.controlRequestClient,
+      sessionId: attempt.sessionId,
+      kind: attempt.kind,
+      detail: attempt.detail,
+      controlApplied: attempt.controlApplied,
+      controlIdentity: buildRecoveryIdentity({
+        requestId: attempt.controlRequestId,
+        requestClient: attempt.controlRequestClient,
+        sessionId: attempt.sessionId,
+      }),
+      pendingGroups: attempt.pendingGroups.map((group, publicationIndex) => ({
+        publicationIndex,
+        requestId: group.requestId,
+        requestClient: group.requestClient,
+        targetQueueEntryIds: group.entries.map((entry) => entry.queueEntryId),
+      })),
+    }));
+  }
 
-    for (const entry of entries) {
-      if (isWorkflowAgentRecoveryEntry(entry)) {
-        const hint = parseWorkflowRequestHintFromRaw(entry.raw);
-        const authorized =
-          hint && params.durableWorkflowStore
-            ? params.durableWorkflowStore.authorizeWorkflowRequest({
-                requestId: entry.requestId,
-                sessionId: entry.sessionId,
-                platform: entry.requestClient,
-              })
-            : null;
-        if (
-          !hint ||
-          !authorized ||
-          authorized.policy.runId !== hint.runId ||
-          authorized.policy.operationId !== hint.operationId ||
-          authorized.policy.dispatchEpoch !== hint.dispatchEpoch
-        ) {
-          logger.warn("discarded stale workflow-owned agent recovery entry", {
-            requestId: entry.requestId,
-            sessionId: entry.sessionId,
-          });
-          continue;
-        }
+  function sameRestoredOrigin(
+    left: AuthenticatedSurfaceOrigin | undefined,
+    right: AuthenticatedSurfaceOrigin | undefined,
+  ): boolean {
+    if (!left || !right) return left === right;
+    return (
+      left.platform === right.platform &&
+      left.userId === right.userId &&
+      left.sessionRef.channelId === right.sessionRef.channelId &&
+      left.messageRef?.messageId === right.messageRef?.messageId
+    );
+  }
+
+  function currentSurfaceSafetyMode(input: {
+    readonly platform: AdapterPlatform;
+    readonly sessionId: string;
+    readonly verifiedIngress: boolean;
+  }): SessionSafetyMode {
+    if (input.platform === "github") return input.verifiedIngress ? "trusted" : "restricted";
+    if (input.platform !== "discord") return "restricted";
+    const parentResolution = params.resolveParentChannelId?.(input.sessionId);
+    if (parentResolution === undefined) return "restricted";
+    return resolveSessionSafetyMode(cfg, input.sessionId, parentResolution ?? undefined);
+  }
+
+  function resolveRecoveryIdentity(input: {
+    readonly requestId: string;
+    readonly sessionId: string;
+    readonly requestClient: AdapterPlatform;
+    readonly identity: AgentRunnerRecoveryIdentity | undefined;
+  }): ResultType<
+    {
+      readonly projection?: AuthenticatedRequestProjection;
+      readonly safetyMode: SessionSafetyMode;
+      readonly parkedEventIds: readonly string[];
+    },
+    AgentRecoveryUnavailable
+  > {
+    const identity = input.identity;
+    if (!identity || identity.state === "restricted") {
+      return Result.ok({ safetyMode: "restricted", parkedEventIds: [] });
+    }
+    const projection = identity.projection;
+    if (
+      projection.requestId !== input.requestId ||
+      projection.requestClient !== input.requestClient ||
+      projection.sessionId !== input.sessionId ||
+      !isAuthenticatedRequestProjectionSemanticallyValid(projection)
+    ) {
+      return Result.err(
+        new AgentRecoveryUnavailable({
+          requestId: input.requestId,
+          reason: "identity-conflict",
+          message: "Persisted recovery identity conflicts with its request route",
+        }),
+      );
+    }
+    if (projection.source === "internal-delegated") {
+      const proof = identity.delegationProof;
+      const authorized = params.durableWorkflowStore?.authorizeWorkflowRequest({
+        requestId: input.requestId,
+        sessionId: input.sessionId,
+        platform: input.requestClient,
+      });
+      if (
+        !proof ||
+        !authorized ||
+        authorized.policy.runId !== proof.runId ||
+        authorized.policy.operationId !== proof.operationId ||
+        authorized.policy.dispatchEpoch !== proof.dispatchEpoch
+      ) {
+        return Result.err(
+          new AgentRecoveryUnavailable({
+            requestId: input.requestId,
+            reason: "delegation-proof-unavailable",
+            message: "Persisted delegated recovery proof is unavailable or stale",
+          }),
+        );
       }
-      const state =
-        bySession.get(entry.sessionId) ??
-        ({
-          running: false,
-          agent: null,
-          queue: [] as Enqueued[],
-          activeRequestId: null,
-          activeRun: null,
-          compactedToolCallIds: new Set<string>(),
-        } satisfies SessionQueue);
-      bySession.set(entry.sessionId, state);
+      const origin = authorized.policy.originSession;
+      let authenticatedOrigin: AuthenticatedSurfaceOrigin | undefined;
+      if (origin.client === "discord" && origin.sessionId && origin.userId) {
+        authenticatedOrigin = {
+          platform: "discord",
+          userId: origin.userId,
+          sessionRef: { platform: "discord", channelId: origin.sessionId },
+        };
+      } else if (origin.client === "github" && origin.sessionId && origin.userId) {
+        authenticatedOrigin = {
+          platform: "github",
+          userId: origin.userId,
+          sessionRef: { platform: "github", channelId: origin.sessionId },
+        };
+      }
+      if (!sameRestoredOrigin(projection.authenticatedOrigin, authenticatedOrigin)) {
+        return Result.err(
+          new AgentRecoveryUnavailable({
+            requestId: input.requestId,
+            reason: "identity-conflict",
+            message: "Persisted delegated identity conflicts with durable workflow authority",
+          }),
+        );
+      }
+      const safetyMode = "restricted" as const;
+      if (identity.assertedSafetyMode !== safetyMode) {
+        return Result.err(
+          new AgentRecoveryUnavailable({
+            requestId: input.requestId,
+            reason: "identity-conflict",
+            message: "Persisted delegated safety assertion is not durably authorized",
+          }),
+        );
+      }
+      return Result.ok({
+        projection: { ...projection, authenticatedOrigin, verifiedIngress: false },
+        safetyMode,
+        parkedEventIds: identity.parkedEventIds,
+      });
+    }
+    const safetyMode = currentSurfaceSafetyMode({
+      platform: projection.requestClient,
+      sessionId: projection.sessionId,
+      verifiedIngress: projection.verifiedIngress,
+    });
+    if (identity.assertedSafetyMode !== safetyMode) {
+      return Result.err(
+        new AgentRecoveryUnavailable({
+          requestId: input.requestId,
+          reason: "identity-conflict",
+          message: "Persisted safety assertion conflicts with current surface policy",
+        }),
+      );
+    }
+    return Result.ok({
+      projection,
+      safetyMode,
+      parkedEventIds: identity.parkedEventIds,
+    });
+  }
 
-      state.queue.push({
+  function prepareRecovery(
+    recoveryState: AgentRunnerRecoveryState,
+  ): ResultType<AgentRecoveryAttempt, AgentRecoveryUnavailable> {
+    const queueEntries = new Map<string, AgentRunnerRecoveryEntry>();
+    const resolvedIdentities = new Map<
+      string,
+      {
+        readonly projection?: AuthenticatedRequestProjection;
+        readonly safetyMode: SessionSafetyMode;
+        readonly parkedEventIds: readonly string[];
+      }
+    >();
+    const cacheRecords: Array<{
+      readonly projection: AuthenticatedRequestProjection;
+      readonly parkedEventIds: readonly string[];
+    }> = [];
+    for (const entry of recoveryState.entries) {
+      const queueEntryId = entry.queueEntryId;
+      if (!queueEntryId || queueEntries.has(queueEntryId) || bySession.has(entry.sessionId)) {
+        return Result.err(
+          new AgentRecoveryUnavailable({
+            requestId: entry.requestId,
+            reason: "queue-admission-conflict",
+            message: "Persisted recovery queue admission conflicts with active state",
+          }),
+        );
+      }
+      queueEntries.set(queueEntryId, entry);
+      const resolved = resolveRecoveryIdentity({
         requestId: entry.requestId,
         sessionId: entry.sessionId,
         requestClient: entry.requestClient,
-        queue: entry.queue,
-        runPolicy: entry.runPolicy ?? "normal",
-        origin: entry.origin,
-        messages: entry.messages,
-        corePrimaryLineage: entry.recovery
-          ? degradeCorePrimaryLineageForMutation("restart-recovery-checkpoint")
-          : entry.corePrimaryLineage,
-        modelOverride: entry.modelOverride,
-        raw: entry.raw,
-        recovery: entry.recovery,
+        identity: entry.identity,
       });
-
-      if (!state.running) {
-        startSessionQueueDrain(entry.sessionId, state);
+      if (resolved.status === "error") return Result.err(resolved.error);
+      resolvedIdentities.set(queueEntryId, resolved.value);
+      if (resolved.value.projection) {
+        cacheRecords.push({
+          projection: resolved.value.projection,
+          parkedEventIds: resolved.value.parkedEventIds,
+        });
       }
     }
+
+    const reservedIds = new Set<string>();
+    const attemptEventIds = new Set<string>();
+    for (const attempt of recoveryState.queueAttempts) {
+      if (
+        attemptEventIds.has(attempt.eventId) ||
+        queueEntries.has(attempt.eventId) ||
+        queueLifecycleAttempts.has(attempt.eventId)
+      ) {
+        return Result.err(
+          new AgentRecoveryUnavailable({
+            requestId: attempt.controlRequestId,
+            reason: "queue-attempt-conflict",
+            message: "Persisted control delivery event identity is duplicated",
+          }),
+        );
+      }
+      attemptEventIds.add(attempt.eventId);
+      const control = resolveRecoveryIdentity({
+        requestId: attempt.controlRequestId,
+        sessionId: attempt.sessionId,
+        requestClient: attempt.controlRequestClient,
+        identity: attempt.controlIdentity,
+      });
+      if (
+        control.status === "error" ||
+        !control.value.projection ||
+        !control.value.parkedEventIds.includes(attempt.eventId) ||
+        (attempt.kind === "queued-cancellation" && !attempt.controlApplied)
+      ) {
+        return Result.err(
+          control.status === "error"
+            ? control.error
+            : new AgentRecoveryUnavailable({
+                requestId: attempt.controlRequestId,
+                reason: "queue-attempt-conflict",
+                message: "Persisted control delivery ownership is incomplete",
+              }),
+        );
+      }
+      cacheRecords.push({
+        projection: control.value.projection,
+        parkedEventIds: control.value.parkedEventIds,
+      });
+      for (const group of attempt.pendingGroups) {
+        for (const queueEntryId of group.targetQueueEntryIds) {
+          const target = queueEntries.get(queueEntryId);
+          if (
+            !target ||
+            reservedIds.has(queueEntryId) ||
+            target.kind !== "queued" ||
+            target.requestId !== group.requestId ||
+            target.requestClient !== group.requestClient ||
+            target.sessionId !== attempt.sessionId
+          ) {
+            return Result.err(
+              new AgentRecoveryUnavailable({
+                requestId: attempt.controlRequestId,
+                reason: "queue-attempt-conflict",
+                message: "Persisted queue reservation conflicts with its target entry",
+              }),
+            );
+          }
+          reservedIds.add(queueEntryId);
+        }
+      }
+    }
+    const cacheAttempt = requestMessageCache.prepareRestore(cacheRecords);
+    if (cacheAttempt.status === "error") {
+      return Result.err(
+        new AgentRecoveryUnavailable({
+          requestId: recoveryState.entries[0]?.requestId ?? "recovery",
+          reason: "cache-conflict",
+          message: "Persisted recovery identity conflicts with request cache state",
+        }),
+      );
+    }
+
+    const inserted = new Map<string, Enqueued>();
+    const owners: RequestMessageCacheOwner[] = [];
+    const sessions = new Set<string>();
+    let applied = false;
+    let activated = false;
+    const rollback = (): void => {
+      if (!applied || activated) return;
+      for (const attempt of recoveryState.queueAttempts) {
+        queueLifecycleAttempts.delete(attempt.eventId);
+      }
+      for (const queued of inserted.values()) reservedQueueEntries.delete(queued);
+      for (const sessionId of sessions) bySession.delete(sessionId);
+      for (const owner of owners) requestMessageCache.releaseOwner(owner);
+      cacheAttempt.value.rollback();
+      inserted.clear();
+      owners.length = 0;
+      sessions.clear();
+      applied = false;
+    };
+    return Result.ok({
+      apply: () => {
+        if (applied) return Result.ok(undefined);
+        const cached = cacheAttempt.value.apply();
+        if (cached.status === "error") {
+          return Result.err(
+            new AgentRecoveryUnavailable({
+              requestId: recoveryState.entries[0]?.requestId ?? "recovery",
+              reason: "cache-conflict",
+              message: "Request cache changed during paused recovery admission",
+            }),
+          );
+        }
+        applied = true;
+        for (const entry of recoveryState.entries) {
+          const queueEntryId = entry.queueEntryId;
+          if (!queueEntryId) continue;
+          const identity = resolvedIdentities.get(queueEntryId);
+          let identityOwner: RequestMessageCacheOwner | undefined;
+          if (identity?.projection) {
+            const owner = requestMessageCache.acquireOwner(entry.requestId);
+            if (owner.status === "error") {
+              rollback();
+              return Result.err(
+                new AgentRecoveryUnavailable({
+                  requestId: entry.requestId,
+                  reason: "cache-conflict",
+                  message: "Persisted recovery queue owner could not be acquired",
+                }),
+              );
+            }
+            identityOwner = owner.value;
+            owners.push(owner.value);
+          }
+          const queued: Enqueued = {
+            queueEntryId,
+            requestId: entry.requestId,
+            sessionId: entry.sessionId,
+            requestClient: entry.requestClient,
+            queue: entry.queue,
+            runPolicy: entry.runPolicy ?? "normal",
+            origin: entry.origin,
+            messages: entry.messages,
+            corePrimaryLineage: entry.recovery
+              ? degradeCorePrimaryLineageForMutation("restart-recovery-checkpoint")
+              : entry.corePrimaryLineage,
+            modelOverride: entry.modelOverride,
+            currentTurnUserId: entry.currentTurnUserId,
+            raw: entry.raw,
+            recovery: entry.recovery,
+            authenticatedOrigin: identity?.projection?.authenticatedOrigin,
+            verifiedIngress: identity?.projection?.verifiedIngress,
+            restoredSafetyMode: identity?.safetyMode ?? "restricted",
+            ...(identityOwner ? { identityOwner } : {}),
+          };
+          const state =
+            bySession.get(entry.sessionId) ??
+            ({
+              running: false,
+              agent: null,
+              queue: [] as Enqueued[],
+              activeRequestId: null,
+              activeRun: null,
+              compactedToolCallIds: new Set<string>(),
+            } satisfies SessionQueue);
+          state.queue.push(queued);
+          bySession.set(entry.sessionId, state);
+          sessions.add(entry.sessionId);
+          inserted.set(queueEntryId, queued);
+        }
+        for (const persisted of recoveryState.queueAttempts) {
+          const pendingGroups = persisted.pendingGroups
+            .toSorted((left, right) => left.publicationIndex - right.publicationIndex)
+            .map((group) => ({
+              requestId: group.requestId,
+              requestClient: group.requestClient,
+              entries: group.targetQueueEntryIds.flatMap((id) => {
+                const queued = inserted.get(id);
+                return queued ? [queued] : [];
+              }),
+            }));
+          const attempt: QueueLifecycleAttempt = {
+            eventId: persisted.eventId,
+            controlRequestId: persisted.controlRequestId,
+            controlRequestClient: persisted.controlRequestClient,
+            sessionId: persisted.sessionId,
+            kind: persisted.kind,
+            detail: persisted.detail,
+            pendingGroups,
+            controlApplied: persisted.controlApplied,
+          };
+          queueLifecycleAttempts.set(attempt.eventId, attempt);
+          for (const group of pendingGroups) {
+            for (const queued of group.entries) reservedQueueEntries.add(queued);
+          }
+        }
+        return Result.ok(undefined);
+      },
+      rollback,
+      activate: () => {
+        if (!applied || activated) return;
+        activated = true;
+        activateRunnerAdmission();
+        for (const sessionId of sessions) {
+          const state = bySession.get(sessionId);
+          if (state && !state.running) startSessionQueueDrain(sessionId, state);
+        }
+      },
+    });
+  }
+
+  function restoreRecoverables(entries: readonly AgentRunnerRecoveryEntry[]): void {
+    const prepared = prepareRecovery({ entries, queueAttempts: [] });
+    if (prepared.status === "error") return signalBusAgentRunnerHostFailure(prepared.error);
+    const applied = prepared.value.apply();
+    if (applied.status === "error") return signalBusAgentRunnerHostFailure(applied.error);
+    prepared.value.activate();
   }
 
   async function drainSessionQueue(sessionId: string, state: SessionQueue) {
@@ -3223,8 +4094,10 @@ export async function startBusAgentRunner(params: {
     if (state.running) return;
 
     const queueDepthBefore = state.queue.length;
-    const next = state.queue.shift();
+    const next = state.queue[0];
     if (!next) return;
+    if (reservedQueueEntries.has(next)) return;
+    state.queue.shift();
 
     logger.debug("agent.queue.transition", {
       requestId: next.requestId,
@@ -3540,6 +4413,7 @@ export async function startBusAgentRunner(params: {
       messages: next.messages,
       corePrimaryLineage: next.corePrimaryLineage,
       modelOverride: next.modelOverride,
+      currentTurnUserId: next.currentTurnUserId,
       raw: next.raw,
       resolvedModelSpec: null,
       resolvedReasoning: undefined,
@@ -3549,6 +4423,7 @@ export async function startBusAgentRunner(params: {
       claudeCodeControl: null,
       notifyWaiters: notifyContinuationWaiters,
       flushOutput: outputPublisher.flush,
+      setCurrentTurnUserId: () => undefined,
       cancel: () => {
         cancelledByRequestId.add(headers.request_id);
         customCommandAbortController?.abort();
@@ -3932,10 +4807,11 @@ export async function startBusAgentRunner(params: {
           const parentChannelResolution =
             next.requestClient === "discord" ? params.resolveParentChannelId?.(sessionId) : null;
           const parentChannelId = parentChannelResolution ?? undefined;
-          const safetyMode: SessionSafetyMode =
-            next.requestClient === "discord" && parentChannelResolution === undefined
+          let safetyMode: SessionSafetyMode =
+            next.restoredSafetyMode ??
+            (next.requestClient === "discord" && parentChannelResolution === undefined
               ? "restricted"
-              : resolveSessionSafetyMode(cfg, sessionId, parentChannelId);
+              : resolveSessionSafetyMode(cfg, sessionId, parentChannelId));
           if (runProfile === "primary" && !workflowPolicy && isHeartbeatSessionId(next.sessionId)) {
             controlCapability =
               (await params.issueHeartbeatCapability?.({
@@ -3950,17 +4826,32 @@ export async function startBusAgentRunner(params: {
                 new Error("Heartbeat request is missing server-issued Level-2 authority"),
               );
             }
+            safetyMode = "trusted";
           } else if (
             workflowPolicy ||
             next.requestClient === "discord" ||
             next.requestClient === "github"
           ) {
-            const capabilityPrincipal = trustedFallbackSurface
-              ? {
-                  platform: trustedFallbackSurface.platform,
-                  userId: trustedFallbackSurface.userId,
-                }
-              : undefined;
+            let capabilityOrigin: AuthenticatedSurfaceOrigin | undefined = next.authenticatedOrigin;
+            if (trustedFallbackSurface?.platform === "discord") {
+              capabilityOrigin = {
+                platform: "discord",
+                userId: trustedFallbackSurface.userId,
+                sessionRef: {
+                  platform: "discord",
+                  channelId: trustedFallbackSurface.sessionId,
+                },
+              };
+            } else if (trustedFallbackSurface?.platform === "github") {
+              capabilityOrigin = {
+                platform: "github",
+                userId: trustedFallbackSurface.userId,
+                sessionRef: {
+                  platform: "github",
+                  channelId: trustedFallbackSurface.sessionId,
+                },
+              };
+            }
             const issuedControl = await params.issueControlCapability?.({
               requestId: next.requestId,
               sessionId: next.sessionId,
@@ -3969,7 +4860,10 @@ export async function startBusAgentRunner(params: {
               canonicalCwd: workflowPolicy?.cwd ?? cwd,
               safetyMode,
               expiresAt: Date.now() + 7 * 24 * 60 * 60 * 1_000,
-              ...(capabilityPrincipal ? { principal: capabilityPrincipal } : {}),
+              ...(capabilityOrigin ? { authenticatedOrigin: capabilityOrigin } : {}),
+              ...(next.verifiedIngress === undefined
+                ? {}
+                : { verifiedIngress: next.verifiedIngress }),
             });
             if (!issuedControl) {
               return signalBusAgentRunnerHostFailure(
@@ -3979,11 +4873,12 @@ export async function startBusAgentRunner(params: {
               );
             }
             controlCapability = issuedControl.capability;
-            if (issuedControl.principal) {
+            safetyMode = issuedControl.safetyMode ?? safetyMode;
+            if (issuedControl.authenticatedOrigin) {
               trustedFallbackSurface = {
-                platform: issuedControl.principal.platform,
-                sessionId: next.sessionId,
-                userId: issuedControl.principal.userId,
+                platform: issuedControl.authenticatedOrigin.platform,
+                sessionId: issuedControl.authenticatedOrigin.sessionRef.channelId,
+                userId: issuedControl.authenticatedOrigin.userId,
               };
             }
           }
@@ -4114,6 +5009,7 @@ export async function startBusAgentRunner(params: {
 
           const fallbackSurfaceForDelegation = trustedFallbackSurface;
           const executionCwd = path.resolve(workflowPolicy?.cwd ?? cwd);
+          let currentTurnUserId = next.currentTurnUserId;
           const listSelectedCatalogIds = () =>
             params.transcriptStore?.listSessionToolIds?.({
               requestClient: next.requestClient,
@@ -4197,6 +5093,39 @@ export async function startBusAgentRunner(params: {
               provider: resolved.provider,
               providerOptions: providerOptionsForAgent,
             });
+            const level1RequestContext = {
+              requestId: next.requestId,
+              sessionId: next.sessionId,
+              requestClient: next.requestClient,
+              subagentDepth: subagentMeta.depth,
+              subagentProfile: runProfile,
+              safetyMode,
+              ...(trustedFallbackSurface
+                ? {
+                    requestInitiator: {
+                      platform: trustedFallbackSurface.platform,
+                      userId: trustedFallbackSurface.userId,
+                    },
+                    requestInitiatorSessionId: trustedFallbackSurface.sessionId,
+                  }
+                : {}),
+              currentTurnUserId,
+              metadata: {
+                controlCapability: controlCapability ?? undefined,
+                readFileDirectAttachmentSupported:
+                  supportsReadFileDirectAttachments(capabilityInfo),
+                onActivity: (source: "tool" | "subagent") => markRunActivity(source),
+                onSubagentDelegate:
+                  workflowSubagentDispatcher && liveParentSession && fallbackSurfaceForDelegation
+                    ? async (registration: SubagentDelegationRegistration) =>
+                        await workflowSubagentDispatcher.delegate({
+                          ...registration,
+                          projectRoot: executionCwd,
+                          fallbackSurface: fallbackSurfaceForDelegation,
+                        })
+                    : undefined,
+              },
+            };
             const builtToolset = await waitForPreAgent(
               params.pluginManager.buildLevel1ToolsetResult({
                 cwd: executionCwd,
@@ -4208,31 +5137,7 @@ export async function startBusAgentRunner(params: {
                   idleTimeoutMs: deriveSubagentIdleTimeoutMs(cfg.agent.idleTimeoutMs),
                   maxDepth: subagents.maxDepth,
                 },
-                requestContext: {
-                  requestId: next.requestId,
-                  sessionId: next.sessionId,
-                  requestClient: next.requestClient,
-                  subagentDepth: subagentMeta.depth,
-                  subagentProfile: runProfile,
-                  safetyMode,
-                  metadata: {
-                    controlCapability: controlCapability ?? undefined,
-                    readFileDirectAttachmentSupported:
-                      supportsReadFileDirectAttachments(capabilityInfo),
-                    onActivity: (source: "tool" | "subagent") => markRunActivity(source),
-                    onSubagentDelegate:
-                      workflowSubagentDispatcher &&
-                      liveParentSession &&
-                      fallbackSurfaceForDelegation
-                        ? async (registration: SubagentDelegationRegistration) =>
-                            await workflowSubagentDispatcher.delegate({
-                              ...registration,
-                              projectRoot: executionCwd,
-                              fallbackSurface: fallbackSurfaceForDelegation,
-                            })
-                        : undefined,
-                  },
-                },
+                requestContext: level1RequestContext,
                 reportToolStatus: (update) => {
                   void publishAuxiliaryOutput("failed to publish batch tool status", () =>
                     outputPublisher.publishToolCall(update),
@@ -4240,6 +5145,7 @@ export async function startBusAgentRunner(params: {
                 },
               }),
             );
+            level1RequestContext.currentTurnUserId = currentTurnUserId;
             if (builtToolset.status === "error") return Result.err(builtToolset.error);
             const toolset = builtToolset.value;
             return Result.ok({
@@ -4253,6 +5159,7 @@ export async function startBusAgentRunner(params: {
               agentSystem,
               experimentalDownload,
               toolset,
+              requestContext: level1RequestContext,
               activeToolNames: selectedLevel1ToolNames(toolset, listSelectedCatalogIds()),
             });
           };
@@ -4632,14 +5539,31 @@ export async function startBusAgentRunner(params: {
           );
           activeAgent = agent;
 
-          agent.setContext({
-            sessionId: next.sessionId,
-            requestId: next.requestId,
-            requestClient: next.requestClient,
-            subagentDepth: subagentMeta.depth,
-            subagentProfile: runProfile,
-            safetyMode,
-          });
+          const setCurrentTurnUserId = (userId: string | undefined) => {
+            currentTurnUserId = userId;
+            if (state.activeRun) state.activeRun.currentTurnUserId = userId;
+            activeBinding.requestContext.currentTurnUserId = userId;
+            agent?.setContext({
+              sessionId: next.sessionId,
+              requestId: next.requestId,
+              requestClient: next.requestClient,
+              subagentDepth: subagentMeta.depth,
+              subagentProfile: runProfile,
+              safetyMode,
+              ...(trustedFallbackSurface
+                ? {
+                    requestInitiator: {
+                      platform: trustedFallbackSurface.platform,
+                      userId: trustedFallbackSurface.userId,
+                    },
+                    requestInitiatorSessionId: trustedFallbackSurface.sessionId,
+                  }
+                : {}),
+              currentTurnUserId: userId,
+            });
+          };
+          setCurrentTurnUserId(next.currentTurnUserId);
+          if (state.activeRun) state.activeRun.setCurrentTurnUserId = setCurrentTurnUserId;
 
           // Drain all buffered messages at boundaries (better UX in chat surfaces).
           agent.setFollowUpMode("all");
@@ -5885,7 +6809,13 @@ export async function startBusAgentRunner(params: {
             // First message should be a prompt.
             // If additional messages for the same request id were queued before the run started,
             // merge them into the initial prompt so they don't become separate runs.
-            const mergedInitial = mergeQueuedForSameRequest(next, state.queue);
+            const coalesced = mergeQueuedForSameRequest(next, state.queue, reservedQueueEntries);
+            const mergedInitial = coalesced.messages;
+            state.activeRun?.setCurrentTurnUserId(next.currentTurnUserId);
+            for (const discarded of coalesced.discarded) {
+              if (discarded.identityOwner)
+                requestMessageCache.releaseOwner(discarded.identityOwner);
+            }
             if (state.activeRun) state.activeRun.corePrimaryLineage = next.corePrimaryLineage;
             const control = parseRequestControlFromRaw(next.raw);
             const reportAutoInjectedThreadSearchError = (
@@ -6659,6 +7589,7 @@ export async function startBusAgentRunner(params: {
       const cleanupCoreNamedRuntime = getCoreNamedClaudeRuntime();
       const cleanupCorePrimaryRuntime = getCorePrimaryClaudeRuntime();
       const cleanupClaudeCodeRun = getClaudeCodeRun();
+      if (next.identityOwner) requestMessageCache.releaseOwner(next.identityOwner);
       if (terminalPanic) {
         rejectPreAgentCancellation = null;
         const terminalCleanups: BusAgentRunnerTerminalCleanup[] = [];
@@ -6833,14 +7764,35 @@ export async function startBusAgentRunner(params: {
     return active;
   }
 
+  let initialRecoveryAttempt: AgentRecoveryAttempt | null = null;
+  if (params.initialRecovery) {
+    const prepared = prepareRecovery(params.initialRecovery);
+    if (prepared.status === "error") signalBusAgentRunnerHostFailure(prepared.error);
+    const applied = prepared.value.apply();
+    if (applied.status === "error") signalBusAgentRunnerHostFailure(applied.error);
+    initialRecoveryAttempt = prepared.value;
+  }
+  await startSubscription();
+  if (runnerActivated && initialRecoveryAttempt) {
+    initialRecoveryAttempt.activate();
+  }
+  const activate = (): void => {
+    activateRunnerAdmission();
+    initialRecoveryAttempt?.activate();
+  };
+
   return {
+    activate,
     beginDrain,
     getActiveLevel1Work,
     snapshotRecoverables,
+    snapshotQueueAttempts,
+    prepareRecovery,
     restoreRecoverables,
     getActiveDrainOperation: () => activeDrainOperation,
     getTerminalCleanupOperations: () => terminalCleanupOperations,
     stop: async () => {
+      stopRunnerAdmission();
       await stopSubscription();
       if (terminalCleanupCompletion) {
         let deadlineTimer: ReturnType<typeof setTimeout> | null = null;
@@ -6861,6 +7813,8 @@ export async function startBusAgentRunner(params: {
         }
       }
       bySession.clear();
+      queueLifecycleAttempts.clear();
+      reservedQueueEntries.clear();
       forcedRecoveryByRequestId.clear();
       restartAbortRequestIds.clear();
     },
@@ -6886,52 +7840,37 @@ async function publishLifecycle(params: {
   if (published.status === "error") signalBusAgentRunnerHostFailure(published.error);
 }
 
-function mergeQueuedForSameRequest(first: Enqueued, queue: Enqueued[]): ModelMessage[] {
+function mergeQueuedForSameRequest(
+  first: Enqueued,
+  queue: Enqueued[],
+  reservedQueueEntries: ReadonlySet<Enqueued>,
+): { readonly messages: ModelMessage[]; readonly discarded: readonly Enqueued[] } {
   const merged: ModelMessage[] = [...first.messages];
-  let coalesced = false;
+  const discarded: Enqueued[] = [];
 
   // Pull in any already-queued items for the same request id so they become
   // additional user messages in the same initial run.
   for (let i = 0; i < queue.length; ) {
     const next = queue[i]!;
-    if (next.requestId !== first.requestId) {
+    if (next.requestId !== first.requestId || reservedQueueEntries.has(next)) {
       i += 1;
       continue;
     }
 
     merged.push(...next.messages);
+    first.currentTurnUserId = next.currentTurnUserId;
+    discarded.push(next);
     queue.splice(i, 1);
-    coalesced = true;
   }
 
-  if (coalesced) {
+  if (discarded.length > 0) {
     first.corePrimaryLineage = degradeCorePrimaryLineageForMutation(
       "queued-request-coalesced",
       first.corePrimaryLineage?.currentCanonicalStart,
     );
   }
 
-  return merged;
-}
-
-function removeQueuedEntries(
-  queue: Enqueued[],
-  shouldRemove: (entry: Enqueued) => boolean,
-): Enqueued[] {
-  const removed: Enqueued[] = [];
-
-  for (let i = 0; i < queue.length; ) {
-    const next = queue[i]!;
-    if (!shouldRemove(next)) {
-      i += 1;
-      continue;
-    }
-
-    removed.push(next);
-    queue.splice(i, 1);
-  }
-
-  return removed;
+  return { messages: merged, discarded };
 }
 
 async function applyToRunningAgent(
@@ -6962,6 +7901,7 @@ async function applyToRunningAgent(
   };
 
   const cancel = parseRequestControlFromRaw(entry.raw).cancel;
+  if (!cancel) activeRun?.setCurrentTurnUserId(entry.currentTurnUserId);
   if (!cancel && activeRun?.runProfile === "primary" && activeRun.requestClient === "discord") {
     activeRun.corePrimaryLineage = degradeCorePrimaryLineageForMutation(
       entry.queue === "steer" || entry.queue === "interrupt"

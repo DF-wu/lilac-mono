@@ -402,14 +402,6 @@ const STAGE_3_OPERATIONAL_RESULT_APIS = new Map<string, readonly SymbolIdentity[
         module: "src/heartbeat/heartbeat-service.ts",
         exportName: "startHeartbeatServiceResult.stopHeartbeatLifecycleResult",
       },
-      {
-        module: "src/tool-server/request-message-cache.ts",
-        exportName: "createRequestMessageCache.startRequestMessageCacheResult",
-      },
-      {
-        module: "src/tool-server/request-message-cache.ts",
-        exportName: "createRequestMessageCache.stopRequestMessageCacheResult",
-      },
       ...[
         "decodeRemoteFsRunnerPackageSpec",
         "buildRemoteFsRunnerCommand",
@@ -877,6 +869,54 @@ const CORE_FATAL_SIGNAL_ADAPTERS = CORE_FATAL_SIGNAL_IDENTITIES.map(
   }),
 );
 
+const CORE_ADAPTER_EVENT_EXCEPTION_ADAPTERS = [
+  {
+    identity: {
+      module: "src/surface/bridge/adapter-event-projection.ts",
+      exportName: "signalAdapterEventPlatformMismatch",
+    },
+    category: "defect-supervisor",
+    externalApi: { package: "better-result", exportName: "Panic" },
+    direction: "signal-host",
+    reason: "Signals a hard invariant when a normalized adapter event contains mixed platforms.",
+  },
+  {
+    identity: {
+      module: "src/surface/produced-ref-guard.ts",
+      exportName: "signalSurfaceAdapterContractViolation",
+    },
+    category: "defect-supervisor",
+    externalApi: { package: "better-result", exportName: "Panic" },
+    direction: "signal-host",
+    reason:
+      "Signals a hard descriptor-bound contract defect before an adapter-produced ref crosses a shared publication or persistence seam.",
+  },
+  {
+    identity: {
+      module: "src/surface/github/github-runtime-descriptor.ts",
+      exportName: "deleteGithubAcknowledgement",
+    },
+    category: "external-to-result",
+    externalApi: {
+      package: "@stanley2058/lilac-core",
+      exportName: "GitHub reaction deletion compatibility operation",
+    },
+    direction: "capture-external",
+    reason:
+      "Captures GitHub acknowledgement reaction deletion rejection before the descriptor finalization policy clears process-local acknowledgement state.",
+  },
+  {
+    identity: {
+      module: "src/surface/github/github-runtime-descriptor.ts",
+      exportName: "preserveGithubRelayPolicyPanic",
+    },
+    category: "defect-supervisor",
+    externalApi: { package: "better-result", exportName: "Panic.is" },
+    direction: "observe-panic",
+    reason: "Preserves exact Panic identity at the GitHub acknowledgement deletion boundary.",
+  },
+] as const satisfies readonly ExceptionAdapter[];
+
 const CORE_TOOL_SERVER_BOUNDARY_DECODERS = [
   ...[
     "isCurrentSessionScopedSurfaceCall",
@@ -1324,6 +1364,7 @@ const INTEGRATED_BOUNDARY_DECODERS = new Map<string, readonly BoundaryDecoder[]>
         category: "projection" as const,
       })),
       ...[
+        ["src/github/github-api.ts", "decodeGithubApiErrorResponse", "wire"],
         ["src/github/github-api.ts", "githubFetchJsonResult", "wire"],
         ["src/github/github-app.ts", "readGithubAppSecretResult", "persistence"],
         ["src/github/github-user-token.ts", "readGithubUserTokenSecretResult", "persistence"],
@@ -1368,8 +1409,15 @@ const INTEGRATED_BOUNDARY_DECODERS = new Map<string, readonly BoundaryDecoder[]>
       },
       {
         identity: {
+          module: "src/surface/authenticated-request.ts",
+          exportName: "projectAuthenticatedRequest",
+        },
+        category: "projection",
+      },
+      {
+        identity: {
           module: "src/tool-server/request-message-cache.ts",
-          exportName: "resolveAuthenticatedOrigin",
+          exportName: "projectCachedRequestMessageLineage",
         },
         category: "projection",
       },
@@ -3072,16 +3120,6 @@ export const LEGACY_UNENFORCED_EXCEPTION_ADAPTERS = new Map<string, readonly Exc
           "adaptHeartbeatLifecycleStopResultToHost",
           "HeartbeatService.stop",
         ],
-        [
-          "src/tool-server/request-message-cache.ts",
-          "adaptRequestMessageCacheStartResultToHost",
-          "createRequestMessageCache",
-        ],
-        [
-          "src/tool-server/request-message-cache.ts",
-          "adaptRequestMessageCacheStopResultToHost",
-          "RequestMessageCache.stop",
-        ],
       ].map(([module, exportName, externalExportName]) => ({
         identity: { module, exportName },
         category: "result-to-framework" as const,
@@ -3165,6 +3203,18 @@ export const LEGACY_UNENFORCED_EXCEPTION_ADAPTERS = new Map<string, readonly Exc
             "Preserves startup Panic precedence while supervising every runtime cleanup operation.",
         }),
       ),
+      ...[
+        "createCoreRuntimeCleanupSupervisor.record",
+        "stopCoreResidualDiscordRequestRouter",
+        "superviseCoreResidualDiscordRequestRouterDone",
+      ].map((exportName) => ({
+        identity: { module: "src/runtime/create-core-runtime.ts", exportName },
+        category: "defect-supervisor" as const,
+        externalApi: { package: "better-result", exportName: "Panic.is" },
+        direction: "observe-panic" as const,
+        reason:
+          "Preserves every residual router cleanup Panic by exact identity while Core retains cleanup ownership.",
+      })),
       {
         identity: {
           module: "src/runtime/create-core-runtime.ts",
@@ -3477,12 +3527,12 @@ export const LEGACY_UNENFORCED_EXCEPTION_ADAPTERS = new Map<string, readonly Exc
       })),
       ...[
         "captureRouterRouting",
-        "startBusRequestRouter.reloadCoreConfigIfNeeded",
-        "startBusRequestRouter.evaluateAdapterSuppression",
-        "startBusRequestRouter.evaluateDirectReplyRouterGate",
+        "startDiscordRequestRouter.reloadCoreConfigIfNeeded",
+        "startDiscordRequestRouter.evaluateAdapterSuppression",
+        "startDiscordRequestRouter.evaluateDirectReplyRouterGate",
       ].flatMap((exportName) => [
         {
-          identity: { module: "src/surface/bridge/bus-request-router.ts", exportName },
+          identity: { module: "src/surface/discord/discord-request-router.ts", exportName },
           category: (exportName.startsWith("captureRouter")
             ? "external-to-result"
             : "compatibility") as "external-to-result" | "compatibility",
@@ -3495,7 +3545,7 @@ export const LEGACY_UNENFORCED_EXCEPTION_ADAPTERS = new Map<string, readonly Exc
             "Captures an immediate router dependency rejection using its established typed Result or fail-open policy.",
         },
         {
-          identity: { module: "src/surface/bridge/bus-request-router.ts", exportName },
+          identity: { module: "src/surface/discord/discord-request-router.ts", exportName },
           category: "defect-supervisor" as const,
           externalApi: { package: "better-result", exportName: "Panic.is" },
           direction: "observe-panic" as const,
@@ -3518,7 +3568,7 @@ export const LEGACY_UNENFORCED_EXCEPTION_ADAPTERS = new Map<string, readonly Exc
         },
       ].map(({ category, externalApi, direction, reason }) => ({
         identity: {
-          module: "src/surface/bridge/bus-request-router/common.ts",
+          module: "src/surface/discord/discord-request-router/common.ts",
           exportName: "getDiscordFlags",
         },
         category,
@@ -3546,28 +3596,76 @@ export const LEGACY_UNENFORCED_EXCEPTION_ADAPTERS = new Map<string, readonly Exc
         },
       ].flatMap(({ exportName, externalApi, reason }) => [
         {
-          identity: { module: "src/surface/bridge/bus-request-router.ts", exportName },
+          identity: { module: "src/surface/discord/discord-request-router.ts", exportName },
           category: "external-to-result" as const,
           externalApi,
           direction: "capture-external" as const,
           reason,
         },
         {
-          identity: { module: "src/surface/bridge/bus-request-router.ts", exportName },
+          identity: { module: "src/surface/discord/discord-request-router.ts", exportName },
           category: "defect-supervisor" as const,
           externalApi: { package: "better-result", exportName: "Panic.is" },
           direction: "observe-panic" as const,
           reason: "Preserves Panic identity at the exact gate or detached timer boundary.",
         },
       ]),
-      ...["adaptRouterSubscriptionStart", "adaptRouterSubscriptionsStop"].map((exportName) => ({
-        identity: { module: "src/surface/bridge/bus-request-router.ts", exportName },
-        category: "result-to-framework" as const,
-        externalApi: { package: "@stanley2058/lilac-core", exportName: "request router lifecycle" },
-        direction: "signal-host" as const,
+      ...["adaptDiscordRequestRouterStartOutcomeToHost", "adaptRouterSubscriptionsStop"].map(
+        (exportName) => ({
+          identity: { module: "src/surface/discord/discord-request-router.ts", exportName },
+          category: "result-to-framework" as const,
+          externalApi: {
+            package: "@stanley2058/lilac-core",
+            exportName: "request router lifecycle",
+          },
+          direction: "signal-host" as const,
+          reason:
+            "Adapts the event-delivery lifecycle Result at the existing request-router host boundary.",
+        }),
+      ),
+      ...[
+        "adaptRouterSubscriptionStart",
+        "finishRouterSubscriptionStartFailure",
+        "stopRouterSubscriptionsAllSettled",
+      ].map((exportName) => ({
+        identity: { module: "src/surface/discord/discord-request-router.ts", exportName },
+        category: "defect-supervisor" as const,
+        externalApi: { package: "better-result", exportName: "Panic.is" },
+        direction: "observe-panic" as const,
         reason:
-          "Adapts the event-delivery lifecycle Result at the existing request-router host boundary.",
+          "Preserves exact startup or rollback Panic identity while retaining residual router ownership.",
       })),
+      {
+        identity: {
+          module: "src/surface/discord/discord-request-router.ts",
+          exportName: "adaptRouterSelfLookup",
+        },
+        category: "external-to-result",
+        externalApi: { package: "@stanley2058/lilac-core", exportName: "SurfaceAdapter.getSelf" },
+        direction: "capture-external",
+        reason: "Captures adapter self-lookup rejection into the Discord router startup Result.",
+      },
+      {
+        identity: {
+          module: "src/surface/discord/discord-request-router.ts",
+          exportName: "adaptRouterSelfLookup",
+        },
+        category: "defect-supervisor",
+        externalApi: { package: "better-result", exportName: "Panic.is" },
+        direction: "observe-panic",
+        reason: "Preserves exact Panic identity while adapting Discord router self lookup.",
+      },
+      {
+        identity: {
+          module: "src/surface/discord/discord-request-router.ts",
+          exportName: "signalDiscordRequestRouterPlatformMismatch",
+        },
+        category: "defect-supervisor",
+        externalApi: { package: "better-result", exportName: "Panic" },
+        direction: "signal-host",
+        reason:
+          "Signals a hard startup invariant when the Discord router receives another platform's adapter.",
+      },
       {
         identity: {
           module: "src/surface/bridge/subscribe-from-bus.ts",
@@ -3619,6 +3717,67 @@ export const LEGACY_UNENFORCED_EXCEPTION_ADAPTERS = new Map<string, readonly Exc
       ),
       {
         identity: {
+          module: "src/runtime/surface-runtime-lifecycle.ts",
+          exportName: "signalSurfaceRecoveryRollbackAtomicityUnknown",
+        },
+        category: "defect-supervisor",
+        externalApi: { package: "better-result", exportName: "Panic" },
+        direction: "signal-host",
+        reason:
+          "Escalates an incomplete paused-recovery rollback to the runtime host because recovery atomicity is unknown.",
+      },
+      {
+        identity: {
+          module: "src/runtime/graceful-restart-store.ts",
+          exportName: "signalMissingGracefulRestartDispositionToken",
+        },
+        category: "defect-supervisor",
+        externalApi: { package: "better-result", exportName: "Panic" },
+        direction: "signal-host",
+        reason:
+          "Signals the impossible invariant that a decoded persisted row reached disposition classification without its immutable token.",
+      },
+      {
+        identity: {
+          module: "src/surface/bridge/subscribe-from-bus.ts",
+          exportName: "bridgeBusToAdapter.startRelay",
+        },
+        category: "compatibility",
+        externalApi: {
+          package: "@stanley2058/lilac-core",
+          exportName: "surface relay startup effects",
+        },
+        direction: "capture-external",
+        reason:
+          "Captures relay startup rejection at the smallest boundary so every partially created output, subscription, and typing resource is cleaned before propagation.",
+      },
+      {
+        identity: {
+          module: "src/surface/bridge/subscribe-from-bus.ts",
+          exportName: "bridgeBusToAdapter.startRelay",
+        },
+        category: "result-to-framework",
+        externalApi: {
+          package: "@stanley2058/lilac-core",
+          exportName: "surface relay startup host",
+        },
+        direction: "signal-host",
+        reason:
+          "Propagates the original startup rejection after complete cleanup, or the owned Panic when cleanup leaves atomicity unknown.",
+      },
+      {
+        identity: {
+          module: "src/surface/bridge/subscribe-from-bus.ts",
+          exportName: "signalSurfaceRelayRecoveryAtomicityUnknown",
+        },
+        category: "defect-supervisor",
+        externalApi: { package: "better-result", exportName: "Panic" },
+        direction: "signal-host",
+        reason:
+          "Signals that reverse exhaustive relay recovery cleanup failed and left atomicity unknown.",
+      },
+      {
+        identity: {
           module: "src/runtime/create-core-runtime.ts",
           exportName: "normalizeRouterDoneDefect",
         },
@@ -3642,13 +3801,13 @@ export const LEGACY_UNENFORCED_EXCEPTION_ADAPTERS = new Map<string, readonly Exc
       {
         identity: {
           module: "src/surface/bridge/bus-agent-runner.ts",
-          exportName: "startBusAgentRunner.superviseSubscriptionDone",
+          exportName: "startBusAgentRunner.superviseAgentRunnerBackgroundFailure",
         },
         category: "defect-supervisor",
         externalApi: { package: "global", exportName: "Promise.catch" },
         direction: "observe-panic",
         reason:
-          "Observes the typed command-request subscription completion at its runtime host boundary and reports rejected Panic without converting it to delivery error data.",
+          "Observes detached subscription and activation completion at the runner host boundary and reports rejected Panic without converting it to delivery error data.",
       },
       {
         identity: {
@@ -3685,20 +3844,6 @@ export const LEGACY_UNENFORCED_EXCEPTION_ADAPTERS = new Map<string, readonly Exc
         direction: "signal-host",
         reason:
           "Maps typed subscription start and completion failures to the existing runner startup/background host contract.",
-      },
-      {
-        identity: {
-          module: "src/surface/bridge/bus-agent-runner.ts",
-          exportName: "startBusAgentRunner.stopSubscription",
-        },
-        category: "result-to-framework",
-        externalApi: {
-          package: "@stanley2058/lilac-event-bus",
-          exportName: "subscription stop/done",
-        },
-        direction: "signal-host",
-        reason:
-          "Maps typed subscription stop and completion failures to the runner shutdown host while preserving rejected Panic.",
       },
       {
         identity: {
@@ -6196,7 +6341,7 @@ const CORE_GRACEFUL_RESTART_PERSISTED_CODEC = {
 const CORE_GRACEFUL_RESTART_PERSISTED_CONSUMER = {
   identity: {
     module: "src/runtime/graceful-restart-store.ts",
-    exportName: "SqliteGracefulRestartStore.loadAndConsumeCompletedSnapshot",
+    exportName: "SqliteGracefulRestartStore.readCompletedSnapshot",
   },
   codecs: [CORE_GRACEFUL_RESTART_PERSISTED_CODEC.identity],
 } as const satisfies PersistedStoreConsumerRegistration;
@@ -6563,8 +6708,9 @@ const CORE_SQLITE_TRANSACTION_CONSUMERS = [
   },
   ...[
     "SqliteGracefulRestartStore.clear",
+    "SqliteGracefulRestartStore.consumeCompletedSnapshot",
+    "SqliteGracefulRestartStore.readCompletedSnapshot",
     "SqliteGracefulRestartStore.saveCompletedSnapshot",
-    "SqliteGracefulRestartStore.loadAndConsumeCompletedSnapshot",
   ].map((exportName) => ({
     module: "src/runtime/graceful-restart-store.ts",
     exportName,
@@ -6604,14 +6750,6 @@ const CORE_EVENT_DELIVERY_CONSUMERS = [
   },
   {
     identity: {
-      module: "src/tool-server/request-message-cache.ts",
-      exportName: "createRequestMessageCache.startRequestMessageCacheResult",
-    },
-    apiPackage: "@stanley2058/lilac-event-bus",
-    operations: ["subscribeTopic"],
-  },
-  {
-    identity: {
       module: "src/surface/bridge/bus-agent-runner.ts",
       exportName: "startBusAgentRunner",
     },
@@ -6620,8 +6758,8 @@ const CORE_EVENT_DELIVERY_CONSUMERS = [
   },
   {
     identity: {
-      module: "src/surface/bridge/bus-request-router.ts",
-      exportName: "startBusRequestRouter",
+      module: "src/surface/discord/discord-request-router.ts",
+      exportName: "startDiscordRequestRouter",
     },
     apiPackage: "@stanley2058/lilac-event-bus",
     operations: ["subscribeTopic"],
@@ -7209,7 +7347,7 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
             },
             {
               identity: {
-                module: "src/surface/bridge/bus-request-router/common.ts",
+                module: "src/surface/discord/discord-request-router/common.ts",
                 exportName: "getDiscordFlags",
               },
               category: "projection",
@@ -7361,6 +7499,14 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
                 exportName: "isAdapterPlatform",
               },
               reason: "Checks exact membership in the closed adapter platform string union.",
+            },
+            {
+              identity: {
+                module: "src/surface/adapter.ts",
+                exportName: "hasSurfaceGuildIdResolver",
+              },
+              reason:
+                "Checks the exact optional Discord guild lookup capability preserved by the descriptor-bound facade.",
             },
             {
               identity: {
@@ -8009,6 +8155,7 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
       ...(root === "apps/core" ? CORE_PARTITION_8_EXCEPTION_ADAPTERS : []),
       ...(root === "apps/core" ? CORE_REVIEWED_PANIC_ADAPTERS : []),
       ...(root === "apps/core" ? CORE_FATAL_SIGNAL_ADAPTERS : []),
+      ...(root === "apps/core" ? CORE_ADAPTER_EVENT_EXCEPTION_ADAPTERS : []),
       ...(root === "packages/plugin-runtime"
         ? ([
             ...[
@@ -8156,6 +8303,10 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
               module: "src/github/github-app.ts",
               exportName,
             })),
+            {
+              module: "src/github/github-api.ts",
+              exportName: "decodeGithubApiErrorResponse",
+            },
             ...["decodeGithubUserTokenSecret", "readGithubUserTokenSecretResult"].map(
               (exportName) => ({ module: "src/github/github-user-token.ts", exportName }),
             ),
@@ -8456,6 +8607,12 @@ const REVIEWED_INJECTED_EXTERNAL_EFFECT_KEYS = new Set([
     "readConfiguredSshHostsResult",
     "capture-external",
   ),
+  preciseExceptionAdapterKey(
+    "apps/core",
+    "src/surface/github/github-runtime-descriptor.ts",
+    "deleteGithubAcknowledgement",
+    "capture-external",
+  ),
 ]);
 
 function exceptionAdapterSyntaxKinds(
@@ -8596,7 +8753,7 @@ function approvedExceptionAdapterCatalogSha256(
 }
 
 export const APPROVED_EXCEPTION_ADAPTER_CATALOG_SHA256 =
-  "cca9f77935a9d6b83fb1e1f4c42c31d084240657953772daa294d22d69021499";
+  "507fdbc46ed807d47ea64cbe741c48cabf6daff4d8c956580aa85b6712c8e388";
 
 export const architectureManifest = {
   version: 1,
