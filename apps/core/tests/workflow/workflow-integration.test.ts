@@ -446,8 +446,8 @@ describe("unified workflow integration", () => {
       projectRoot: workspaceRoot,
       safetyMode: "trusted" as const,
       serverOwnedRequest: true,
-      authenticatedPrincipal: { platform: "discord" as const, userId: "user-1" },
-      authenticatedPrincipalSessionId: "channel-1",
+      requestInitiator: { platform: "discord" as const, userId: "user-1" },
+      requestInitiatorSessionId: "channel-1",
       toolCallId: "integration-tool-1",
     };
     try {
@@ -515,16 +515,16 @@ describe("unified workflow integration", () => {
         requestId: requestIds[0],
         requestClient: "unknown",
         safetyMode: "trusted",
-        authenticatedPrincipal: { platform: "discord", userId: "user-1" },
-        authenticatedPrincipalSessionId: "channel-1",
+        requestInitiator: { platform: "discord", userId: "user-1" },
+        requestInitiatorSessionId: "channel-1",
       });
       expect(level2Contexts).toHaveLength(1);
       expect(level2Contexts[0]).toMatchObject({
         requestId: requestIds[0],
         requestClient: "unknown",
         safetyMode: "trusted",
-        authenticatedPrincipal: { platform: "discord", userId: "user-1" },
-        authenticatedPrincipalSessionId: "channel-1",
+        requestInitiator: { platform: "discord", userId: "user-1" },
+        requestInitiatorSessionId: "channel-1",
       });
       expect(adapter.contents.at(-1)?.text).not.toContain("integration result");
       expect(adapter.contents.at(-1)?.actions).toEqual([]);
@@ -561,8 +561,8 @@ describe("unified workflow integration", () => {
       projectRoot: workspaceRoot,
       safetyMode: "trusted" as const,
       serverOwnedRequest: true,
-      authenticatedPrincipal: { platform: "discord" as const, userId: "user-1" },
-      authenticatedPrincipalSessionId: "channel-1",
+      requestInitiator: { platform: "discord" as const, userId: "user-1" },
+      requestInitiatorSessionId: "channel-1",
       toolCallId: "restart-tool-1",
     };
     const firstProjector = createWorkflowProgressProjectorForTest({

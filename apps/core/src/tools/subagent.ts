@@ -105,8 +105,8 @@ type RequestContextLike = {
   requestClient: string;
   subagentDepth?: number | string;
   subagentProfile?: string;
-  authenticatedPrincipal?: { platform: "discord" | "github"; userId: string };
-  authenticatedPrincipalSessionId?: string;
+  requestInitiator?: { platform: "discord" | "github"; userId: string };
+  requestInitiatorSessionId?: string;
 };
 
 type CurrentRunProfile = SubagentProfile | "primary";
@@ -117,10 +117,10 @@ const requestContextSchema = z.object({
   requestClient: z.string(),
   subagentDepth: z.union([z.number(), z.string()]).optional(),
   subagentProfile: z.string().optional(),
-  authenticatedPrincipal: z
+  requestInitiator: z
     .object({ platform: z.enum(["discord", "github"]), userId: z.string().trim().min(1) })
     .optional(),
-  authenticatedPrincipalSessionId: z.string().trim().min(1).optional(),
+  requestInitiatorSessionId: z.string().trim().min(1).optional(),
 });
 
 class SubagentDelegationError extends TaggedError("SubagentDelegationError")<{
@@ -431,28 +431,22 @@ export function subagentTools(params: {
           request_client: toAdapterPlatform(ctx.requestClient),
         };
         let authenticatedOrigin: AuthenticatedSurfaceOrigin | undefined;
-        if (
-          ctx.authenticatedPrincipal?.platform === "discord" &&
-          ctx.authenticatedPrincipalSessionId
-        ) {
+        if (ctx.requestInitiator?.platform === "discord" && ctx.requestInitiatorSessionId) {
           authenticatedOrigin = {
             platform: "discord",
-            userId: ctx.authenticatedPrincipal.userId,
+            userId: ctx.requestInitiator.userId,
             sessionRef: {
               platform: "discord",
-              channelId: ctx.authenticatedPrincipalSessionId,
+              channelId: ctx.requestInitiatorSessionId,
             },
           };
-        } else if (
-          ctx.authenticatedPrincipal?.platform === "github" &&
-          ctx.authenticatedPrincipalSessionId
-        ) {
+        } else if (ctx.requestInitiator?.platform === "github" && ctx.requestInitiatorSessionId) {
           authenticatedOrigin = {
             platform: "github",
-            userId: ctx.authenticatedPrincipal.userId,
+            userId: ctx.requestInitiator.userId,
             sessionRef: {
               platform: "github",
-              channelId: ctx.authenticatedPrincipalSessionId,
+              channelId: ctx.requestInitiatorSessionId,
             },
           };
         }

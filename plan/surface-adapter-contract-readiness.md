@@ -703,9 +703,8 @@ surface support.
 
 ### Medium: Plugin API Compatibility
 
-`RequestContext.authenticatedPrincipal` is plugin-facing. Preserve its existing Discord/GitHub wire shape
-unless a coordinated compatibility change is required, and keep session correlation in the surrounding
-context.
+`RequestContext.requestInitiator` is plugin-facing. Preserve its Discord/GitHub shape, and keep session
+correlation in `requestInitiatorSessionId`.
 
 ## Non-Goals
 

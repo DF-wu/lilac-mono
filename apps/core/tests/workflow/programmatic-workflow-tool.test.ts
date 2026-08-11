@@ -64,8 +64,8 @@ describe("ProgrammaticWorkflow trusted auto-run", () => {
       cwd: workspaceRoot,
       safetyMode: "trusted" as const,
       serverOwnedRequest: true,
-      authenticatedPrincipal: { platform: "discord" as const, userId: "user-1" },
-      authenticatedPrincipalSessionId: "channel-1",
+      requestInitiator: { platform: "discord" as const, userId: "user-1" },
+      requestInitiatorSessionId: "channel-1",
       toolCallId: "tool-call-1",
     } satisfies RequestContext;
     await tool.init();
@@ -106,7 +106,7 @@ describe("ProgrammaticWorkflow trusted auto-run", () => {
           {
             context: {
               ...context,
-              authenticatedPrincipal: { platform: "github", userId: "user-1" },
+              requestInitiator: { platform: "github", userId: "user-1" },
             },
           },
         ),
@@ -149,16 +149,16 @@ describe("ProgrammaticWorkflow trusted auto-run", () => {
       cwd: workspaceRoot,
       safetyMode: "trusted" as const,
       serverOwnedRequest: true,
-      authenticatedPrincipal: { platform: "discord" as const, userId: "user-1" },
-      authenticatedPrincipalSessionId: "channel-1",
+      requestInitiator: { platform: "discord" as const, userId: "user-1" },
+      requestInitiatorSessionId: "channel-1",
     } satisfies RequestContext;
     await tool.init();
     try {
       for (const context of [
         { ...trusted, serverOwnedRequest: false },
         { ...trusted, safetyMode: "restricted" as const },
-        { ...trusted, authenticatedPrincipal: undefined },
-        { ...trusted, authenticatedPrincipal: undefined, operator: true },
+        { ...trusted, requestInitiator: undefined },
+        { ...trusted, requestInitiator: undefined, operator: true },
       ]) {
         expect(await tool.call("workflow.run.list", {}, { context })).toMatchObject({ runs: [] });
       }
@@ -196,8 +196,8 @@ describe("ProgrammaticWorkflow trusted auto-run", () => {
       cwd: workspaceRoot,
       safetyMode: "trusted" as const,
       serverOwnedRequest: true,
-      authenticatedPrincipal: { platform: "discord" as const, userId: "user-1" },
-      authenticatedPrincipalSessionId: "channel-1",
+      requestInitiator: { platform: "discord" as const, userId: "user-1" },
+      requestInitiatorSessionId: "channel-1",
     } satisfies RequestContext;
     const sensitiveSource = source()
       .replace('required: ["directory"]', 'required: ["directory", "token"]')
@@ -321,8 +321,8 @@ describe("ProgrammaticWorkflow trusted auto-run", () => {
       cwd: workspaceRoot,
       safetyMode: "trusted" as const,
       serverOwnedRequest: true,
-      authenticatedPrincipal: { platform: "discord" as const, userId: "owner-1" },
-      authenticatedPrincipalSessionId: "channel-1",
+      requestInitiator: { platform: "discord" as const, userId: "owner-1" },
+      requestInitiatorSessionId: "channel-1",
       toolCallId: "trigger-call",
     } satisfies RequestContext;
     await tool.init();
@@ -362,7 +362,7 @@ describe("ProgrammaticWorkflow trusted auto-run", () => {
           {
             context: {
               ...context,
-              authenticatedPrincipal: { platform: "discord", userId: "other-user" },
+              requestInitiator: { platform: "discord", userId: "other-user" },
             },
           },
         ),

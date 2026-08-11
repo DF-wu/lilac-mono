@@ -248,24 +248,24 @@ describe("request message cache", () => {
     expect(cache.cacheMessage(raw).status).toBe("error");
   });
 
-  it("latches GitHub trigger identity while allowing raw-free follow-up", () => {
+  it("latches the first GitHub trigger while allowing later users", () => {
     const cache = createRequestMessageCache();
-    const trigger = (eventId: string, commentId: number) =>
+    const trigger = (eventId: string, userId: string) =>
       requestMessage({
         eventId,
         requestId: "github:owner/repo#1:41",
         sessionId: "owner/repo#1",
         requestClient: "github",
         raw: {
-          authenticatedActor: { platform: "github", userId: "octocat" },
+          authenticatedActor: { platform: "github", userId },
           github: {
             repoFullName: "owner/repo",
             issueNumber: 1,
-            trigger: { kind: "comment", commentId },
+            trigger: { kind: "comment", commentId: 41 },
           },
         },
       });
-    expect(cache.cacheMessage(trigger("1-0", 41)).status).toBe("ok");
+    expect(cache.cacheMessage(trigger("1-0", "octocat")).status).toBe("ok");
     expect(cache.getOrigin("github:owner/repo#1:41")?.verifiedIngress).toBe(true);
     expect(
       cache.cacheMessage(
@@ -277,10 +277,11 @@ describe("request message cache", () => {
         }),
       ).status,
     ).toBe("ok");
-    expect(cache.cacheMessage(trigger("3-0", 42)).status).toBe("error");
+    expect(cache.cacheMessage(trigger("3-0", "hubot")).status).toBe("ok");
+    expect(cache.getOrigin("github:owner/repo#1:41")?.githubTrigger?.messageId).toBe("41");
   });
 
-  it("preserves a Discord origin across same-user follow-ups with new message refs and metadata forms", () => {
+  it("preserves the Discord initiator across different-user follow-ups", () => {
     const cache = createRequestMessageCache();
     const requestId = "discord:channel-1:message-1";
     const first = requestMessage({
@@ -298,10 +299,10 @@ describe("request message cache", () => {
       eventId: "2-0",
       requestId,
       raw: {
-        authenticatedActor: { platform: "discord", userId: "user-1" },
+        authenticatedActor: { platform: "discord", userId: "user-2" },
         authenticatedOrigin: {
           platform: "discord",
-          userId: "user-1",
+          userId: "user-2",
           messageRef: { platform: "discord", channelId: "channel-1", messageId: "message-2" },
         },
       },
@@ -313,6 +314,7 @@ describe("request message cache", () => {
     expect(cache.getOrigin(requestId)?.authenticatedOrigin?.messageRef?.messageId).toBe(
       "message-1",
     );
+    expect(cache.getOrigin(requestId)?.authenticatedOrigin?.userId).toBe("user-1");
   });
 
   it("validates a restore batch fully at apply time before mutating any entry", () => {

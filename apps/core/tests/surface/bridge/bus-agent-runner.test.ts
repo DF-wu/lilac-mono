@@ -2762,12 +2762,145 @@ describe("startBusAgentRunner production path", () => {
         requestId,
         sessionId: "identity-session",
         requestClient: "discord",
-        authenticatedPrincipal: { platform: "discord", userId: "identity-user" },
-        authenticatedPrincipalSessionId: "identity-session",
+        requestInitiator: { platform: "discord", userId: "identity-user" },
+        requestInitiatorSessionId: "identity-session",
+        currentTurnUserId: "identity-user",
       });
       await runner.getActiveDrainOperation();
       expect(requestMessageCache.getOrigin(requestId)).toBeUndefined();
     } finally {
+      await lifecycle.stop();
+      await runner.stop();
+      await requestMessageCache.stop();
+      await pluginManager.destroy();
+      await bus.close();
+    }
+  });
+
+  it("keeps the initiator and updates tool context for a different-user follow-up", async () => {
+    const config = parseCoreConfigV1ToUniversal({});
+    config.models.main = { model: "openai/current-turn-user" };
+    const bus = createLilacBus(createInMemoryRawBus());
+    const requestMessageCache = createRequestMessageCache();
+    const firstCallStarted = deferred<void>();
+    const releaseFirstCall = deferred<void>();
+    const toolContexts: unknown[] = [];
+    let level1RequestContext:
+      | Parameters<CoreToolPluginManager["buildLevel1ToolsetResult"]>[0]["requestContext"]
+      | undefined;
+    const toolset = level1TestToolset();
+    toolset.tools.builtin = tool({
+      inputSchema: jsonSchema<Record<string, never>>({
+        type: "object",
+        properties: {},
+        additionalProperties: false,
+      }),
+      execute: (_input, options) => {
+        toolContexts.push(options.context);
+        return "ok";
+      },
+    });
+    const pluginManager = corePrimaryTestPluginManager((requestContext) => {
+      level1RequestContext = requestContext;
+    }, toolset);
+    let modelCalls = 0;
+    const runner = await startBusAgentRunner({
+      bus,
+      subscriptionId: "current-turn-user",
+      reportFatalPanic: () => undefined,
+      config,
+      pluginManager,
+      requestMessageCache,
+      resolveParentChannelId: () => null,
+      issueControlCapability: (input) => ({
+        capability: "current-turn-capability",
+        principal: input.authenticatedOrigin
+          ? {
+              platform: input.authenticatedOrigin.platform,
+              userId: input.authenticatedOrigin.userId,
+            }
+          : null,
+        authenticatedOrigin: input.authenticatedOrigin ?? null,
+        safetyMode: input.safetyMode,
+      }),
+      createAgent: (options) =>
+        new AiSdkPiAgent({
+          ...options,
+          model: new MockLanguageModelV4({
+            modelId: "current-turn-user",
+            doStream: async () => {
+              modelCalls += 1;
+              if (modelCalls === 1) {
+                firstCallStarted.resolve(undefined);
+                await releaseFirstCall.promise;
+                return level1TextStep("first response");
+              }
+              return modelCalls === 2
+                ? level1ToolCallStep([{ toolCallId: "current-turn", toolName: "builtin" }])
+                : level1TextStep("done");
+            },
+          }),
+        }),
+    });
+    const requestId = "discord:turn-session:first-message";
+    const lifecycle = await observeRequestLifecycle(bus, requestId);
+    try {
+      await publishRunnerRequest({
+        bus,
+        requestId,
+        sessionId: "turn-session",
+        requestClient: "discord",
+        text: "first",
+        raw: {
+          authenticatedOrigin: {
+            platform: "discord",
+            userId: "user-a",
+            messageRef: {
+              platform: "discord",
+              channelId: "turn-session",
+              messageId: "first-message",
+            },
+          },
+        },
+      });
+      await firstCallStarted.promise;
+      await publishRunnerRequest({
+        bus,
+        requestId,
+        sessionId: "turn-session",
+        requestClient: "discord",
+        queue: "followUp",
+        text: "second",
+        raw: {
+          authenticatedOrigin: {
+            platform: "discord",
+            userId: "user-b",
+            messageRef: {
+              platform: "discord",
+              channelId: "turn-session",
+              messageId: "second-message",
+            },
+          },
+        },
+      });
+      expect(requestMessageCache.getOrigin(requestId)?.authenticatedOrigin?.userId).toBe("user-a");
+      releaseFirstCall.resolve(undefined);
+
+      await expect(lifecycle.terminal).resolves.toBe("resolved");
+      expect(level1RequestContext).toMatchObject({
+        requestInitiator: { platform: "discord", userId: "user-a" },
+        requestInitiatorSessionId: "turn-session",
+        currentTurnUserId: "user-b",
+      });
+      expect(toolContexts).toEqual([
+        expect.objectContaining({
+          requestInitiator: { platform: "discord", userId: "user-a" },
+          requestInitiatorSessionId: "turn-session",
+          currentTurnUserId: "user-b",
+        }),
+      ]);
+    } finally {
+      releaseFirstCall.resolve(undefined);
       await lifecycle.stop();
       await runner.stop();
       await requestMessageCache.stop();
@@ -3698,7 +3831,10 @@ describe("startBusAgentRunner production path", () => {
     config.models.main = { model: "openai/drain-coalescing" };
     const bus = createLilacBus(createInMemoryRawBus());
     const requestMessageCache = createRequestMessageCache();
-    const pluginManager = corePrimaryTestPluginManager();
+    const contexts: Array<
+      Parameters<CoreToolPluginManager["buildLevel1ToolsetResult"]>[0]["requestContext"]
+    > = [];
+    const pluginManager = corePrimaryTestPluginManager((context) => contexts.push(context));
     const firstStarted = deferred<void>();
     const releaseFirst = deferred<void>();
     const coalescedStarted = deferred<void>();
@@ -3712,7 +3848,17 @@ describe("startBusAgentRunner production path", () => {
       config,
       pluginManager,
       requestMessageCache,
-      issueControlCapability: () => ({ capability: "coalescing-capability", principal: null }),
+      issueControlCapability: (input) => ({
+        capability: "coalescing-capability",
+        principal: input.authenticatedOrigin
+          ? {
+              platform: input.authenticatedOrigin.platform,
+              userId: input.authenticatedOrigin.userId,
+            }
+          : null,
+        authenticatedOrigin: input.authenticatedOrigin ?? null,
+        safetyMode: input.safetyMode,
+      }),
       createAgent: (options) =>
         new AiSdkPiAgent({
           ...options,
@@ -3734,7 +3880,7 @@ describe("startBusAgentRunner production path", () => {
         }),
     });
     const activeRequestId = "github:drain-coalescing:active";
-    const coalescedRequestId = "github:drain-coalescing:queued";
+    const coalescedRequestId = "discord:drain-coalescing:first-message";
     const lifecycle = await observeRequestLifecycle(bus, coalescedRequestId);
     try {
       await publishRunnerRequest({
@@ -3748,13 +3894,37 @@ describe("startBusAgentRunner production path", () => {
         bus,
         requestId: coalescedRequestId,
         sessionId: "drain-coalescing",
+        requestClient: "discord",
         text: "coalesced first",
+        raw: {
+          authenticatedOrigin: {
+            platform: "discord",
+            userId: "user-a",
+            messageRef: {
+              platform: "discord",
+              channelId: "drain-coalescing",
+              messageId: "first-message",
+            },
+          },
+        },
       });
       await publishRunnerRequest({
         bus,
         requestId: coalescedRequestId,
         sessionId: "drain-coalescing",
+        requestClient: "discord",
         text: "coalesced second",
+        raw: {
+          authenticatedOrigin: {
+            platform: "discord",
+            userId: "user-b",
+            messageRef: {
+              platform: "discord",
+              channelId: "drain-coalescing",
+              messageId: "second-message",
+            },
+          },
+        },
       });
       expect(requestMessageCache.snapshot(coalescedRequestId)?.ownerCount).toBe(2);
 
@@ -3763,6 +3933,10 @@ describe("startBusAgentRunner production path", () => {
       expect(requestMessageCache.snapshot(coalescedRequestId)?.ownerCount).toBe(1);
       expect(prompts[1]).toContain("coalesced first");
       expect(prompts[1]).toContain("coalesced second");
+      expect(contexts[1]).toMatchObject({
+        requestInitiator: { platform: "discord", userId: "user-a" },
+        currentTurnUserId: "user-b",
+      });
       releaseCoalesced.resolve(undefined);
       await expect(lifecycle.terminal).resolves.toBe("resolved");
       await runner.getActiveDrainOperation();
@@ -4617,8 +4791,8 @@ describe("startBusAgentRunner production path", () => {
     expect(requestContexts[1]).toMatchObject({
       requestId: changedRequestId,
       safetyMode: "trusted",
-      authenticatedPrincipal: { platform: "github", userId: "user-1" },
-      authenticatedPrincipalSessionId: "session",
+      requestInitiator: { platform: "github", userId: "user-1" },
+      requestInitiatorSessionId: "session",
     });
     expect(capabilityInputs).toHaveLength(2);
     expect(capabilityInputs[0]?.authenticatedOrigin?.messageRef).toMatchObject({
@@ -4872,8 +5046,8 @@ describe("startBusAgentRunner production path", () => {
         expect(contexts[1]).toMatchObject({
           requestId: testCase.requestId,
           safetyMode: "trusted",
-          authenticatedPrincipal: { platform: testCase.platform, userId: "self-alias-user" },
-          authenticatedPrincipalSessionId: testCase.sessionId,
+          requestInitiator: { platform: testCase.platform, userId: "self-alias-user" },
+          requestInitiatorSessionId: testCase.sessionId,
         });
       } finally {
         releaseFirst.resolve(undefined);
@@ -5220,8 +5394,8 @@ function corePrimaryTestPluginManager(
       CoreToolPluginManager["buildLevel1ToolsetResult"]
     >[0]["requestContext"],
   ) => void,
+  toolset = level1TestToolset(),
 ): CoreToolPluginManager {
-  const toolset = level1TestToolset();
   return {
     init: async () => Result.ok(),
     destroy: async () => Result.ok(),

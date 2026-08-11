@@ -163,6 +163,7 @@ function lilacRequestHeaders(includeJson = false): Record<string, string> {
     ["x-lilac-tool-call-id", process.env.LILAC_TOOL_CALL_ID],
     ["x-lilac-control-capability", process.env.LILAC_CONTROL_CAPABILITY],
     ["x-lilac-subagent-profile", process.env.LILAC_SUBAGENT_PROFILE],
+    ["x-lilac-current-turn-user-id", process.env.LILAC_CURRENT_TURN_USER_ID],
   ] as const;
   for (const [name, value] of values) {
     if (value) headers[name] = value;

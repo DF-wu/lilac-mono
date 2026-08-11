@@ -86,6 +86,7 @@ type ToolRequestHeaders = {
   readonly controlCapability?: string;
   readonly subagentProfile?: string;
   readonly safetyMode?: string;
+  readonly currentTurnUserId?: string;
 };
 
 type AuthenticatedToolRequest = {
@@ -114,6 +115,7 @@ const toolRequestHeadersSchema = z.object({
   "x-lilac-control-capability": z.string().optional(),
   "x-lilac-subagent-profile": z.string().optional(),
   "x-lilac-safety-mode": z.string().optional(),
+  "x-lilac-current-turn-user-id": z.string().optional(),
 });
 
 const SENSITIVE_PREVIEW_KEYS = new Set([
@@ -247,6 +249,7 @@ function decodeToolRequestHeaders(
     controlCapability: headerStr(decoded.data["x-lilac-control-capability"]),
     subagentProfile: headerStr(decoded.data["x-lilac-subagent-profile"]),
     safetyMode: headerStr(decoded.data["x-lilac-safety-mode"]),
+    currentTurnUserId: headerStr(decoded.data["x-lilac-current-turn-user-id"]),
   });
 }
 
@@ -266,6 +269,7 @@ function parseRequestContext(headers: ToolRequestHeaders): RequestContext {
     cwd: headers.cwd,
     toolCallId: headers.toolCallId,
     controlCapability: headers.controlCapability,
+    currentTurnUserId: headers.currentTurnUserId,
     subagentProfile: (() => {
       return isNativeSubagentProfile(headers.subagentProfile) ? headers.subagentProfile : undefined;
     })(),
@@ -287,11 +291,11 @@ function authenticateRequestContext(
     origin.requestClient === context.requestClient;
   context.serverOwnedRequest = routeMatches && origin?.verifiedIngress === true;
   if (routeMatches && origin?.authenticatedOrigin) {
-    context.authenticatedPrincipal = {
+    context.requestInitiator = {
       platform: origin.authenticatedOrigin.platform,
       userId: origin.authenticatedOrigin.userId,
     };
-    context.authenticatedPrincipalSessionId = origin.authenticatedOrigin.sessionRef.channelId;
+    context.requestInitiatorSessionId = origin.authenticatedOrigin.sessionRef.channelId;
   }
   return messages;
 }
@@ -938,8 +942,9 @@ export function createToolServer(options: ToolServerOptions) {
           allowedCallables: authorized.allowedCallables,
         };
         context.subagentProfile = undefined;
-        delete context.authenticatedPrincipal;
-        delete context.authenticatedPrincipalSessionId;
+        delete context.requestInitiator;
+        delete context.requestInitiatorSessionId;
+        delete context.currentTurnUserId;
         return Result.ok({ context, messages });
       }
       if (!cachedOrigin) {
@@ -989,11 +994,11 @@ export function createToolServer(options: ToolServerOptions) {
         allowedCallables: authorized.allowedCallables,
       };
       context.subagentProfile = authorized.profile === "primary" ? undefined : authorized.profile;
-      delete context.authenticatedPrincipal;
-      delete context.authenticatedPrincipalSessionId;
+      delete context.requestInitiator;
+      delete context.requestInitiatorSessionId;
       if (authorizedOrigin && authorized.principal) {
-        context.authenticatedPrincipal = authorized.principal;
-        context.authenticatedPrincipalSessionId = authorizedOrigin.sessionRef.channelId;
+        context.requestInitiator = authorized.principal;
+        context.requestInitiatorSessionId = authorizedOrigin.sessionRef.channelId;
       }
     }
     return Result.ok({ context, messages });

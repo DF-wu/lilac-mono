@@ -221,11 +221,11 @@ function requestProgressTarget(context: RequestContext) {
   ) {
     return null;
   }
-  const principal = context.authenticatedPrincipal;
+  const principal = context.requestInitiator;
   const principalMatchesRequest =
     principal !== undefined &&
     principal.platform === context.requestClient &&
-    context.authenticatedPrincipalSessionId === context.sessionId;
+    context.requestInitiatorSessionId === context.sessionId;
   return {
     platform: context.requestClient,
     userId: principalMatchesRequest ? principal.userId : null,
@@ -237,15 +237,15 @@ function requestProgressTarget(context: RequestContext) {
 function validateWorkflowRequestIdentity(
   context: RequestContext,
 ): ResultType<void, WorkflowToolFailure> {
-  const principal = context.authenticatedPrincipal;
-  if (!principal && context.authenticatedPrincipalSessionId === undefined) {
+  const principal = context.requestInitiator;
+  if (!principal && context.requestInitiatorSessionId === undefined) {
     return Result.ok(undefined);
   }
   if (
     !principal ||
     principal.platform !== context.requestClient ||
     !context.sessionId ||
-    context.authenticatedPrincipalSessionId !== context.sessionId
+    context.requestInitiatorSessionId !== context.sessionId
   ) {
     return Result.err(
       new WorkflowToolFailure({

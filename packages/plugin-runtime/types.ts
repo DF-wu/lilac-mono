@@ -12,8 +12,9 @@ export type RequestContext = {
   serverOwnedRequest?: boolean;
   /** Set only after authenticating the root-only container operator token. */
   operator?: boolean;
-  authenticatedPrincipal?: { platform: "discord" | "github"; userId: string };
-  authenticatedPrincipalSessionId?: string;
+  requestInitiator?: { platform: "discord" | "github"; userId: string };
+  requestInitiatorSessionId?: string;
+  currentTurnUserId?: string;
   toolCallId?: string;
   controlCapability?: string;
   controlPolicy?: {
@@ -82,8 +83,9 @@ export type Level1ExecutionRequestContext = {
   subagentDepth: number;
   subagentProfile: Level1RunProfile;
   safetyMode?: "trusted" | "restricted";
-  authenticatedPrincipal?: { platform: "discord" | "github"; userId: string };
-  authenticatedPrincipalSessionId?: string;
+  requestInitiator?: { platform: "discord" | "github"; userId: string };
+  requestInitiatorSessionId?: string;
+  currentTurnUserId?: string;
   metadata?: Readonly<Record<string, unknown>>;
 };
 

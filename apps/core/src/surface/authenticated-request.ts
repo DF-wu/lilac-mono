@@ -466,18 +466,6 @@ export function projectAuthenticatedRequest(
   });
 }
 
-function sameAuthenticatedOrigin(
-  left: AuthenticatedSurfaceOrigin | undefined,
-  right: AuthenticatedSurfaceOrigin | undefined,
-): boolean {
-  if (!left || !right) return left === right;
-  return (
-    left.platform === right.platform &&
-    left.userId === right.userId &&
-    left.sessionRef.channelId === right.sessionRef.channelId
-  );
-}
-
 function sameGithubTrigger(
   left: GithubTriggerProjection | undefined,
   right: GithubTriggerProjection | undefined,
@@ -516,9 +504,6 @@ export function latchAuthenticatedRequest(
     previous.sessionId !== next.sessionId ||
     (previous.authenticatedOrigin === undefined && next.authenticatedOrigin !== undefined) ||
     (previous.verifiedIngress === false && next.verifiedIngress === true) ||
-    (previous.authenticatedOrigin !== undefined &&
-      next.authenticatedOrigin !== undefined &&
-      !sameAuthenticatedOrigin(previous.authenticatedOrigin, next.authenticatedOrigin)) ||
     hasUnprovenGithubOriginMessageReplacement(previous, next) ||
     (previous.verifiedIngress &&
       next.githubTrigger !== undefined &&

@@ -324,6 +324,7 @@ describe("createToolServer", () => {
           "x-lilac-request-client": workflowChild ? "unknown" : "discord",
           "x-lilac-cwd": "/selected/child/cwd",
           "x-lilac-control-capability": capability,
+          "x-lilac-current-turn-user-id": "user-2",
         };
         const list = await server.app.handle(new Request("http://localhost/list", { headers }));
         expect(await list.json()).toMatchObject({ tools: [{ callableId: "workflow.test" }] });
@@ -346,15 +347,17 @@ describe("createToolServer", () => {
             cwd,
             subagentProfile,
             controlPolicy,
-            authenticatedPrincipal,
-            authenticatedPrincipalSessionId,
+            requestInitiator,
+            requestInitiatorSessionId,
+            currentTurnUserId,
             safetyMode,
           }) => ({
             cwd,
             subagentProfile,
             controlPolicy,
-            authenticatedPrincipal,
-            authenticatedPrincipalSessionId,
+            requestInitiator,
+            requestInitiatorSessionId,
+            currentTurnUserId,
             safetyMode,
           }),
         ),
@@ -363,16 +366,18 @@ describe("createToolServer", () => {
           cwd: "/selected/child/cwd",
           subagentProfile: "general",
           controlPolicy: { kind: "primary", allowedCallables: null },
-          authenticatedPrincipal: { platform: "discord", userId: "user-1" },
-          authenticatedPrincipalSessionId: "origin-session",
+          requestInitiator: { platform: "discord", userId: "user-1" },
+          requestInitiatorSessionId: "origin-session",
+          currentTurnUserId: "user-2",
           safetyMode: "trusted",
         },
         {
           cwd: "/selected/child/cwd",
           subagentProfile: "general",
           controlPolicy: { kind: "primary", allowedCallables: null },
-          authenticatedPrincipal: { platform: "discord", userId: "user-1" },
-          authenticatedPrincipalSessionId: "origin-session",
+          requestInitiator: { platform: "discord", userId: "user-1" },
+          requestInitiatorSessionId: "origin-session",
+          currentTurnUserId: "user-2",
           safetyMode: "trusted",
         },
       ]);
@@ -792,10 +797,7 @@ describe("createToolServer", () => {
         expect(await response.json()).toMatchObject({ isError: false });
       }
       expect(discordPolicyCalls).toBe(1);
-      expect(contexts.map((context) => context.authenticatedPrincipal)).toEqual([
-        undefined,
-        undefined,
-      ]);
+      expect(contexts.map((context) => context.requestInitiator)).toEqual([undefined, undefined]);
     } finally {
       await server.stop();
     }
@@ -854,8 +856,8 @@ describe("createToolServer", () => {
       expect(contexts[0]).toMatchObject({
         safetyMode: "restricted",
         serverOwnedRequest: false,
-        authenticatedPrincipal: { platform: "github", userId: "octocat" },
-        authenticatedPrincipalSessionId: "owner/repo#1",
+        requestInitiator: { platform: "github", userId: "octocat" },
+        requestInitiatorSessionId: "owner/repo#1",
       });
     } finally {
       await server.stop();
@@ -987,7 +989,7 @@ describe("createToolServer", () => {
       async call(callableId, _input, options) {
         called.push(callableId);
         expect(options?.context?.cwd).toBe("/canonical-workspace");
-        expect(options?.context?.authenticatedPrincipal).toBeUndefined();
+        expect(options?.context?.requestInitiator).toBeUndefined();
         return { ok: true };
       },
     };

@@ -517,7 +517,7 @@ rmdir "$media_dir"`,
     }
   });
 
-  it("forwards generic control capability and profile context through ordinary Bash", async () => {
+  it("forwards control capability, profile, and current user through ordinary Bash", async () => {
     const config = parseCoreConfigV1ToUniversal({});
     const bash = bashToolWithCwd(process.cwd(), {
       nativeProfile: resolveNativeSubagentProfile(config, "general"),
@@ -525,17 +525,21 @@ rmdir "$media_dir"`,
     }).bash;
     const result = await executeTool(
       bash,
-      { command: 'printf "%s|%s" "$LILAC_CONTROL_CAPABILITY" "$LILAC_SUBAGENT_PROFILE"' },
+      {
+        command:
+          'printf "%s|%s|%s" "$LILAC_CONTROL_CAPABILITY" "$LILAC_SUBAGENT_PROFILE" "$LILAC_CURRENT_TURN_USER_ID"',
+      },
       {
         requestId: "native-profile-bash",
         sessionId: "native-profile-bash",
         requestClient: "test",
         safetyMode: "trusted",
+        currentTurnUserId: "user-2",
       },
     );
 
     expect(result).toMatchObject({
-      stdout: "generic-control-capability|general",
+      stdout: "generic-control-capability|general|user-2",
       exitCode: 0,
     });
   });

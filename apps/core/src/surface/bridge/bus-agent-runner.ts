@@ -1592,6 +1592,7 @@ type Enqueued = {
   modelOverride?: string;
   raw?: AgentRunnerRaw;
   authenticatedOrigin?: AuthenticatedSurfaceOrigin;
+  currentTurnUserId?: string;
   verifiedIngress?: boolean;
   identityOwner?: RequestMessageCacheOwner;
   restoredSafetyMode?: SessionSafetyMode;
@@ -2401,6 +2402,7 @@ type SessionQueue = {
     claudeCodeControl: ClaudeCodeRunControl | null;
     notifyWaiters: () => void;
     flushOutput: () => void;
+    setCurrentTurnUserId: (userId: string | undefined) => void;
     cancel: () => void;
     started: boolean;
     startedAt: number;
@@ -2891,6 +2893,7 @@ export async function startBusAgentRunner(params: {
           modelOverride: msg.data.modelOverride,
           raw,
           authenticatedOrigin: authenticatedRequest?.authenticatedOrigin,
+          currentTurnUserId: trustedProjection.authenticatedOrigin?.userId,
           verifiedIngress: authenticatedRequest?.verifiedIngress,
         };
 
@@ -4413,6 +4416,7 @@ export async function startBusAgentRunner(params: {
       claudeCodeControl: null,
       notifyWaiters: notifyContinuationWaiters,
       flushOutput: outputPublisher.flush,
+      setCurrentTurnUserId: () => undefined,
       cancel: () => {
         cancelledByRequestId.add(headers.request_id);
         customCommandAbortController?.abort();
@@ -4998,6 +5002,7 @@ export async function startBusAgentRunner(params: {
 
           const fallbackSurfaceForDelegation = trustedFallbackSurface;
           const executionCwd = path.resolve(workflowPolicy?.cwd ?? cwd);
+          let currentTurnUserId = next.currentTurnUserId;
           const listSelectedCatalogIds = () =>
             params.transcriptStore?.listSessionToolIds?.({
               requestClient: next.requestClient,
@@ -5081,6 +5086,39 @@ export async function startBusAgentRunner(params: {
               provider: resolved.provider,
               providerOptions: providerOptionsForAgent,
             });
+            const level1RequestContext = {
+              requestId: next.requestId,
+              sessionId: next.sessionId,
+              requestClient: next.requestClient,
+              subagentDepth: subagentMeta.depth,
+              subagentProfile: runProfile,
+              safetyMode,
+              ...(trustedFallbackSurface
+                ? {
+                    requestInitiator: {
+                      platform: trustedFallbackSurface.platform,
+                      userId: trustedFallbackSurface.userId,
+                    },
+                    requestInitiatorSessionId: trustedFallbackSurface.sessionId,
+                  }
+                : {}),
+              currentTurnUserId,
+              metadata: {
+                controlCapability: controlCapability ?? undefined,
+                readFileDirectAttachmentSupported:
+                  supportsReadFileDirectAttachments(capabilityInfo),
+                onActivity: (source: "tool" | "subagent") => markRunActivity(source),
+                onSubagentDelegate:
+                  workflowSubagentDispatcher && liveParentSession && fallbackSurfaceForDelegation
+                    ? async (registration: SubagentDelegationRegistration) =>
+                        await workflowSubagentDispatcher.delegate({
+                          ...registration,
+                          projectRoot: executionCwd,
+                          fallbackSurface: fallbackSurfaceForDelegation,
+                        })
+                    : undefined,
+              },
+            };
             const builtToolset = await waitForPreAgent(
               params.pluginManager.buildLevel1ToolsetResult({
                 cwd: executionCwd,
@@ -5092,40 +5130,7 @@ export async function startBusAgentRunner(params: {
                   idleTimeoutMs: deriveSubagentIdleTimeoutMs(cfg.agent.idleTimeoutMs),
                   maxDepth: subagents.maxDepth,
                 },
-                requestContext: {
-                  requestId: next.requestId,
-                  sessionId: next.sessionId,
-                  requestClient: next.requestClient,
-                  subagentDepth: subagentMeta.depth,
-                  subagentProfile: runProfile,
-                  safetyMode,
-                  ...(trustedFallbackSurface
-                    ? {
-                        authenticatedPrincipal: {
-                          platform: trustedFallbackSurface.platform,
-                          userId: trustedFallbackSurface.userId,
-                        },
-                        authenticatedPrincipalSessionId: trustedFallbackSurface.sessionId,
-                      }
-                    : {}),
-                  metadata: {
-                    controlCapability: controlCapability ?? undefined,
-                    readFileDirectAttachmentSupported:
-                      supportsReadFileDirectAttachments(capabilityInfo),
-                    onActivity: (source: "tool" | "subagent") => markRunActivity(source),
-                    onSubagentDelegate:
-                      workflowSubagentDispatcher &&
-                      liveParentSession &&
-                      fallbackSurfaceForDelegation
-                        ? async (registration: SubagentDelegationRegistration) =>
-                            await workflowSubagentDispatcher.delegate({
-                              ...registration,
-                              projectRoot: executionCwd,
-                              fallbackSurface: fallbackSurfaceForDelegation,
-                            })
-                        : undefined,
-                  },
-                },
+                requestContext: level1RequestContext,
                 reportToolStatus: (update) => {
                   void publishAuxiliaryOutput("failed to publish batch tool status", () =>
                     outputPublisher.publishToolCall(update),
@@ -5133,6 +5138,7 @@ export async function startBusAgentRunner(params: {
                 },
               }),
             );
+            level1RequestContext.currentTurnUserId = currentTurnUserId;
             if (builtToolset.status === "error") return Result.err(builtToolset.error);
             const toolset = builtToolset.value;
             return Result.ok({
@@ -5146,6 +5152,7 @@ export async function startBusAgentRunner(params: {
               agentSystem,
               experimentalDownload,
               toolset,
+              requestContext: level1RequestContext,
               activeToolNames: selectedLevel1ToolNames(toolset, listSelectedCatalogIds()),
             });
           };
@@ -5525,14 +5532,30 @@ export async function startBusAgentRunner(params: {
           );
           activeAgent = agent;
 
-          agent.setContext({
-            sessionId: next.sessionId,
-            requestId: next.requestId,
-            requestClient: next.requestClient,
-            subagentDepth: subagentMeta.depth,
-            subagentProfile: runProfile,
-            safetyMode,
-          });
+          const setCurrentTurnUserId = (userId: string | undefined) => {
+            currentTurnUserId = userId;
+            activeBinding.requestContext.currentTurnUserId = userId;
+            agent?.setContext({
+              sessionId: next.sessionId,
+              requestId: next.requestId,
+              requestClient: next.requestClient,
+              subagentDepth: subagentMeta.depth,
+              subagentProfile: runProfile,
+              safetyMode,
+              ...(trustedFallbackSurface
+                ? {
+                    requestInitiator: {
+                      platform: trustedFallbackSurface.platform,
+                      userId: trustedFallbackSurface.userId,
+                    },
+                    requestInitiatorSessionId: trustedFallbackSurface.sessionId,
+                  }
+                : {}),
+              currentTurnUserId: userId,
+            });
+          };
+          setCurrentTurnUserId(next.currentTurnUserId);
+          if (state.activeRun) state.activeRun.setCurrentTurnUserId = setCurrentTurnUserId;
 
           // Drain all buffered messages at boundaries (better UX in chat surfaces).
           agent.setFollowUpMode("all");
@@ -6780,6 +6803,7 @@ export async function startBusAgentRunner(params: {
             // merge them into the initial prompt so they don't become separate runs.
             const coalesced = mergeQueuedForSameRequest(next, state.queue, reservedQueueEntries);
             const mergedInitial = coalesced.messages;
+            state.activeRun?.setCurrentTurnUserId(next.currentTurnUserId);
             for (const discarded of coalesced.discarded) {
               if (discarded.identityOwner)
                 requestMessageCache.releaseOwner(discarded.identityOwner);
@@ -7826,6 +7850,7 @@ function mergeQueuedForSameRequest(
     }
 
     merged.push(...next.messages);
+    first.currentTurnUserId = next.currentTurnUserId;
     discarded.push(next);
     queue.splice(i, 1);
   }
@@ -7868,6 +7893,7 @@ async function applyToRunningAgent(
   };
 
   const cancel = parseRequestControlFromRaw(entry.raw).cancel;
+  if (!cancel) activeRun?.setCurrentTurnUserId(entry.currentTurnUserId);
   if (!cancel && activeRun?.runProfile === "primary" && activeRun.requestClient === "discord") {
     activeRun.corePrimaryLineage = degradeCorePrimaryLineageForMutation(
       entry.queue === "steer" || entry.queue === "interrupt"
