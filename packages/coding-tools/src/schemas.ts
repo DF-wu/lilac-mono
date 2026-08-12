@@ -329,7 +329,7 @@ export const subagentDelegateBaseInputSchema = z.object({
   sessionName: subagentSessionNameSchema
     .optional()
     .describe(
-      "Optional stable short slug for continuing a subagent session within this parent session/channel. When omitted, a reusable short name is generated and returned.",
+      "Optional stable name for subagent continuation. Reuse starts a new invocation. If the session is active, the new invocation waits in the queue. Reuse does not check or join the active invocation. When omitted, a reusable name is generated and returned.",
     ),
 });
 

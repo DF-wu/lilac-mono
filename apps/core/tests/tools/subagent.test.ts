@@ -92,6 +92,7 @@ describe("subagent_delegate tool", () => {
         model?: { enum?: string[]; description?: string };
         mode?: { description?: string };
         reasoning?: { enum?: string[] };
+        sessionName?: { description?: string };
       };
     };
 
@@ -112,17 +113,22 @@ describe("subagent_delegate tool", () => {
     expect(schema.properties?.model?.enum).not.toContain("invalid/alias");
     expect(schema.properties?.model?.enum).not.toContain("invalidTarget");
     expect(schema.properties?.reasoning?.enum).toContain("xhigh");
+    expect(schema.properties?.sessionName?.description).toContain(
+      "If the session is active, the new invocation waits in the queue",
+    );
+    expect(schema.properties?.sessionName?.description).toContain(
+      "Reuse does not check or join the active invocation",
+    );
     expect(schema.properties?.mode?.description).toContain(
       "acceptance confirms that the child started, not that it finished",
     );
     expect(schema.properties?.mode?.description).toContain(
       "give the final answer after every deferred subagent has returned a terminal subagent_result",
     );
+    expect(delegate.description).toContain("reply with exactly NO_REPLY and end the turn");
+    expect(delegate.description).toContain("Do not call tools only to wait");
     expect(delegate.description).toContain(
-      "send a brief progress update saying that you are waiting for subagent results",
-    );
-    expect(delegate.description).toContain(
-      "Give the final answer only after every launched deferred subagent has returned a terminal subagent_result",
+      "Wait for all deferred results before you send the final response",
     );
     expect(delegate.description).toContain("Escalate critical reviews to a stronger model.");
     expect(JSON.stringify(asSchema(delegate.outputSchema as never).jsonSchema)).toContain(

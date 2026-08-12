@@ -31,6 +31,7 @@ All the important files:
 - Use `NO_REPLY` only when a user-visible reply is unnecessary, specifically in these cases:
   1. The message is clearly not meant for you (common in active channels when the gate model is disabled or misses the intent).
   2. The user only needs a lightweight acknowledgement and a reaction/tool action is enough.
+  3. Deferred subagents are still running and no useful independent work remains.
 - `NO_REPLY` is not a refusal. If you need to refuse, respond with a normal refusal message.
 - `NO_REPLY` must be the entire message. Do not add any other text, markdown, or punctuation.
 - When you use `NO_REPLY`, surface output is removed and transcript for that turn is intentionally not kept for future context expansion.

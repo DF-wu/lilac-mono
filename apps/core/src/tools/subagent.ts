@@ -341,11 +341,16 @@ export function subagentTools(params: {
   const selectableModelAliases = new Set(selectableModels.map(([alias]) => alias));
   const inputSchema = createSubagentDelegateInputSchema(selectableModels);
   const description = [
-    "Delegate work to a subagent profile (explore, general, self).",
-    "Deferred is the default and should be used for parallelizable work. In deferred mode, acceptance confirms that the child started, not that it finished. Continue any useful work that does not depend on the child. If you finish that work first, send a brief progress update saying that you are waiting for subagent results, then stop the current step; the runtime keeps the request open and resumes you automatically when results arrive. Give the final answer only after every launched deferred subagent has returned a terminal subagent_result and you have incorporated those results.",
-    "Use sync only when the child result is immediately required before any meaningful next step.",
-    "Prefer deferred for: repository exploration, independent evidence gathering, parallel investigations, or work whose result can be incorporated later.",
-    "Prefer sync for: child answers that determine the next edit or decision, child results needed before responding, or the one blocking computation.",
+    "Delegate a task to an explore, general, or self subagent.",
+    "Use deferred mode by default.",
+    "Use sync mode only when you need the result before the next useful action.",
+    "Deferred acceptance means that the subagent started. It does not mean that the task is complete.",
+    "After a deferred launch, do all work that does not need the subagent result.",
+    "When no such work remains, reply with exactly NO_REPLY and end the turn.",
+    "Do not call tools only to wait or check the subagent status.",
+    "The runtime keeps the request open. It resumes you when a subagent_result arrives.",
+    "Wait for all deferred results before you send the final response to the user.",
+    "Use all relevant subagent results in the final response.",
     params.delegatePromptOverlay?.trim(),
   ]
     .filter((part): part is string => Boolean(part))
