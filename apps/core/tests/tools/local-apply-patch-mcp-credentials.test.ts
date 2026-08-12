@@ -38,7 +38,7 @@ async function resolveExecuteResult<T>(value: T | PromiseLike<T> | AsyncIterable
   return last;
 }
 
-describe("local apply_patch MCP credential guards", () => {
+describe("local patch MCP credential guards", () => {
   let dataDir: string;
   let secretDir: string;
   let workspace: string;
@@ -72,9 +72,9 @@ describe("local apply_patch MCP credential guards", () => {
         subagentDepth: 0,
         subagentConfig: config.agent.subagents,
       });
-      const applyPatch = toolset.tools["apply_patch"];
+      const applyPatch = toolset.tools["patch"];
       if (!applyPatch || typeof applyPatch.execute !== "function") {
-        throw new Error("expected executable apply_patch tool");
+        throw new Error("expected executable patch tool");
       }
       const execute = applyPatch.execute;
       const executePatch = (input: unknown) =>
@@ -172,7 +172,7 @@ describe("local apply_patch MCP credential guards", () => {
       for (const input of patches) {
         const result = await resolveExecuteResult(executePatch(input));
         expect(result, input.label).toMatchObject({ status: "failed" });
-        if (!result || typeof result !== "object") throw new Error("expected apply_patch result");
+        if (!result || typeof result !== "object") throw new Error("expected patch result");
         expect(Reflect.get(result, "output"), input.label).toContain(
           input.label === "cyclic symlink alias" ? "Too many symbolic links" : "Access denied",
         );

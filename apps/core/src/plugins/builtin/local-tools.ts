@@ -126,7 +126,7 @@ function getFsTools(context: CoreToolBuildContext): ReturnType<typeof fsTool> {
 }
 
 function getFsReadOnlyTool(
-  name: "read_file" | "glob" | "grep" | "fuzzy_search",
+  name: "read" | "glob" | "grep" | "fuzzy_search",
   context: CoreToolBuildContext,
 ): unknown {
   const tools = getFsTools(context);
@@ -134,8 +134,7 @@ function getFsReadOnlyTool(
 }
 
 function getEditFileTool(context: CoreToolBuildContext): unknown {
-  return (getFsTools(context) as ReturnType<typeof fsTool> & { readonly edit_file?: unknown })
-    .edit_file;
+  return (getFsTools(context) as ReturnType<typeof fsTool> & { readonly edit?: unknown }).edit;
 }
 
 function isPathWithin(candidate: string, root: string): boolean {
@@ -159,7 +158,7 @@ async function captureLocalApplyPatchFs<T>(
       new LocalApplyPatchGuardFailed({
         ...(errorCode(cause) === undefined ? {} : { code: errorCode(cause) }),
         cause,
-        message: opaqueErrorMessage(cause, "Local apply_patch filesystem operation failed"),
+        message: opaqueErrorMessage(cause, "Local patch filesystem operation failed"),
       }),
     );
   }
@@ -243,7 +242,7 @@ async function assertLocalApplyPatchPathsAllowed(params: {
     ) {
       return Result.err(
         new LocalApplyPatchGuardFailed({
-          message: `Access denied: '${resolved}' is blocked for apply_patch`,
+          message: `Access denied: '${resolved}' is blocked for patch`,
         }),
       );
     }
@@ -329,12 +328,12 @@ export const BUILTIN_LEVEL1_TOOLS = {
       }).bash;
     },
   }),
-  read_file: defineLevel1Tool("bounded-and-aggregate-exempt", {
-    name: "read_file",
+  read: defineLevel1Tool("bounded-and-aggregate-exempt", {
+    name: "read",
     isEnabled: () => true,
     formatArgs: formatReadFileToolArgs,
-    summarizeFailure: ({ result }) => summarizeReadOrEditFailure(result, "read_file"),
-    createTool: (context) => getFsReadOnlyTool("read_file", context),
+    summarizeFailure: ({ result }) => summarizeReadOrEditFailure(result, "read"),
+    createTool: (context) => getFsReadOnlyTool("read", context),
   }),
   glob: defineLevel1Tool("generic", {
     name: "glob",
@@ -359,18 +358,18 @@ export const BUILTIN_LEVEL1_TOOLS = {
     summarizeFailure: ({ result }) => summarizeSearchFailure(result, "fuzzy_search"),
     createTool: (context) => getFsReadOnlyTool("fuzzy_search", context),
   }),
-  edit_file: defineLevel1Tool("bounded", {
-    name: "edit_file",
+  edit: defineLevel1Tool("bounded", {
+    name: "edit",
     isEnabled: (context) =>
       context.editingToolMode === "edit_file" &&
       context.requestContext?.safetyMode !== "restricted",
     formatArgs: formatEditFileToolArgs,
-    summarizeFailure: ({ result }) => summarizeReadOrEditFailure(result, "edit_file"),
+    summarizeFailure: ({ result }) => summarizeReadOrEditFailure(result, "edit"),
     createTool: (context) => getEditFileTool(context),
     editTargets: (args, context) => {
       const decoded = editTargetInputSchema.safeParse(args);
       if (!decoded.success) {
-        return signalBuiltinToolHostError("edit_file batch preflight requires valid input");
+        return signalBuiltinToolHostError("edit batch preflight requires valid input");
       }
       return collectEditFileTouchedPaths({
         path: decoded.data.path,
@@ -378,8 +377,8 @@ export const BUILTIN_LEVEL1_TOOLS = {
       });
     },
   }),
-  apply_patch: defineLevel1Tool("bounded", {
-    name: "apply_patch",
+  patch: defineLevel1Tool("bounded", {
+    name: "patch",
     isEnabled: (context) =>
       context.editingToolMode === "apply_patch" &&
       context.requestContext?.safetyMode !== "restricted",
@@ -389,7 +388,7 @@ export const BUILTIN_LEVEL1_TOOLS = {
     editTargets: (args, context) => {
       const decoded = applyPatchInputSchema.safeParse(args);
       if (!decoded.success) {
-        return signalBuiltinToolHostError("apply_patch batch preflight requires valid input");
+        return signalBuiltinToolHostError("patch batch preflight requires valid input");
       }
       return collectApplyPatchTouchedPaths({
         patchText: decoded.data.patchText,

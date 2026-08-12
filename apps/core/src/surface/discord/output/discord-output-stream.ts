@@ -206,9 +206,30 @@ function isBatchToolDisplay(display: string): boolean {
   return trimmed.startsWith("batch") || trimmed.startsWith("[batch]");
 }
 
+function normalizeRestoredBuiltinToolDisplay(display: string): string {
+  return display.replace(
+    /^(?<prefix>(?:[|`]-\s+(?:[▶…✓✗]\s+)?)?)(?<name>read_file|edit_file|apply_patch)(?=$|\s|\()/u,
+    (_match, prefix: string, name: string) => {
+      switch (name) {
+        case "read_file":
+          return `${prefix}read`;
+        case "edit_file":
+          return `${prefix}edit`;
+        case "apply_patch":
+          return `${prefix}patch`;
+        default:
+          return `${prefix}${name}`;
+      }
+    },
+  );
+}
+
 function normalizeToolDisplayForDiscord(display: string): string {
-  if (isBatchToolDisplay(display) || isSubagentToolDisplay(display)) return display;
-  return display
+  if (isSubagentToolDisplay(display)) return display;
+  if (isBatchToolDisplay(display)) {
+    return display.split("\n").map(normalizeRestoredBuiltinToolDisplay).join("\n");
+  }
+  return normalizeRestoredBuiltinToolDisplay(display)
     .replace(/\s*\n+\s*/g, " ")
     .replace(/\s+/g, " ")
     .trim();
@@ -355,8 +376,9 @@ function statusIcon(update: SurfaceToolStatusUpdate): "▶" | "…" | "✓" | "�
 function currentToolName(parsed: ParsedSubagentDisplay): string | null {
   const child = [...parsed.children].reverse().find((candidate) => candidate.icon === ">") ?? null;
   if (!child) return null;
-  const bracketed = /^\[([^\]]+)\]/u.exec(child.display)?.[1];
-  const tool = bracketed ?? child.display.split(/[\s(]/u, 1)[0];
+  const display = normalizeRestoredBuiltinToolDisplay(child.display);
+  const bracketed = /^\[([^\]]+)\]/u.exec(display)?.[1];
+  const tool = bracketed ?? display.split(/[\s(]/u, 1)[0];
   if (!tool) return null;
   return clampWithEllipsis(tool, SUBAGENT_CURRENT_TOOL_MAX_CHARS);
 }
@@ -402,7 +424,7 @@ function buildSubagentChildLines(parsed: ParsedSubagentDisplay, maxChildren: num
   return children.map((child, index) => {
     const branch = index === children.length - 1 ? "`-" : "|-";
     const display = clampWithEllipsis(
-      child.display.replace(/\s+/gu, " ").trim(),
+      normalizeRestoredBuiltinToolDisplay(child.display).replace(/\s+/gu, " ").trim(),
       SUBAGENT_CHILD_DISPLAY_MAX_CHARS,
     );
     return escapeDiscordMarkdown(`${branch} ${child.icon} ${display}`);

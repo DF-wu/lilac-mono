@@ -8,6 +8,7 @@ import {
   miniLilacSkillSummarySchema,
   miniLilacTodoWriteInputSchema,
   miniLilacWebfetchUrlSchema,
+  normalizeMiniLilacToolName,
 } from "@stanley2058/mini-lilac-client";
 
 import { captureTuiOperation } from "./failure-adapter";
@@ -96,7 +97,7 @@ interface BashDecodedObservation {
 }
 
 interface ReadDecodedObservation {
-  readonly toolName: "read_file";
+  readonly toolName: "read";
   readonly state: ToolProjectionState;
   readonly path?: string;
   readonly start?:
@@ -140,14 +141,14 @@ interface EditInput {
 }
 
 interface EditFileDecodedObservation {
-  readonly toolName: "edit_file";
+  readonly toolName: "edit";
   readonly state: ToolProjectionState;
   readonly edit?: EditInput;
   readonly replacementsMade: number;
 }
 
 interface ApplyPatchDecodedObservation {
-  readonly toolName: "apply_patch";
+  readonly toolName: "patch";
   readonly state: ToolProjectionState;
   readonly patchText?: string;
   readonly cwd?: string;
@@ -252,7 +253,7 @@ export type ToolProjection =
     })
   | (ToolProjectionBase & {
       readonly kind: "exploration";
-      readonly toolName: "read_file" | "glob" | "grep" | "fuzzy_search";
+      readonly toolName: "read" | "glob" | "grep" | "fuzzy_search";
       readonly action: "Read" | "Glob" | "Grep" | "Find";
       readonly detail?: string;
       readonly operationStatus: "pending" | "success" | "error" | "denied" | "cancelled";
@@ -260,7 +261,7 @@ export type ToolProjection =
     })
   | (ToolProjectionBase & {
       readonly kind: "edit";
-      readonly toolName: "edit_file" | "apply_patch";
+      readonly toolName: "edit" | "patch";
       readonly operations: readonly ProjectedEditOperation[];
     })
   | (ToolProjectionBase & {
@@ -815,7 +816,7 @@ const decodeRead: KnownToolCodec = (observation) => {
         : { line: start.line, ...(start.column === undefined ? {} : { column: start.column }) };
   }
   return Result.ok({
-    toolName: "read_file",
+    toolName: "read",
     state: stateFromObservation(observation),
     ...(input.value === undefined
       ? {}
@@ -877,7 +878,7 @@ const decodeEditFile: KnownToolCodec = (observation) => {
     }
   }
   return Result.ok({
-    toolName: "edit_file",
+    toolName: "edit",
     state,
     ...(input.value === undefined ? {} : { edit: input.value }),
     replacementsMade,
@@ -888,7 +889,7 @@ const decodeApplyPatch: KnownToolCodec = (observation) => {
   const input = parseInput(observation, patchInputSchema);
   if (input.status === "error") return Result.err(input.error);
   return Result.ok({
-    toolName: "apply_patch",
+    toolName: "patch",
     state: stateFromObservation(observation),
     ...(input.value === undefined
       ? {}
@@ -1021,12 +1022,12 @@ const decodeWebsearch: KnownToolCodec = (observation) => {
 
 export const toolObservationCodecRegistry = {
   bash: decodeBash,
-  read_file: decodeRead,
+  read: decodeRead,
   glob: decodeGlob,
   grep: decodeGrep,
   fuzzy_search: decodeFuzzy,
-  edit_file: decodeEditFile,
-  apply_patch: decodeApplyPatch,
+  edit: decodeEditFile,
+  patch: decodeApplyPatch,
   subagent_delegate: decodeSubagentDelegate,
   subagent_result: decodeSubagentResult,
   batch: decodeBatch,
@@ -1312,7 +1313,7 @@ function projectDecoded(
         ...(decoded.outputDelta === undefined ? {} : { outputDelta: decoded.outputDelta }),
       };
     }
-    case "read_file": {
+    case "read": {
       const details = [
         decoded.start !== undefined && "offset" in decoded.start
           ? `offset ${decoded.start.offset}`
@@ -1335,7 +1336,7 @@ function projectDecoded(
       const summary = decoded.path === undefined ? "Read File" : `Read ${decoded.path}`;
       return {
         kind: "exploration",
-        toolName: "read_file",
+        toolName: "read",
         ...projectionBase(lifecycle, decoded.state, summary, {
           tone: decoded.state.status === "success" ? "normal" : undefined,
           visibility: detail === undefined ? "hidden" : "visible",
@@ -1383,12 +1384,12 @@ function projectDecoded(
           : `Find ${quoted(previewText(decoded.query, 120))}`;
       return explorationProjection(lifecycle, decoded, "Find", detail, summary);
     }
-    case "edit_file": {
+    case "edit": {
       const operations = fileOperations(decoded.edit, decoded.replacementsMade, cwd);
       const summary = editSummary("Edit", operations);
       return {
         kind: "edit",
-        toolName: "edit_file",
+        toolName: "edit",
         ...projectionBase(lifecycle, decoded.state, summary, {
           tone:
             decoded.state.status === "pending" ||
@@ -1401,12 +1402,12 @@ function projectDecoded(
         operations,
       };
     }
-    case "apply_patch": {
+    case "patch": {
       const operations = patchOperations(decoded.patchText, decoded.cwd, cwd);
       const summary = editSummary("Patch", operations);
       return {
         kind: "edit",
-        toolName: "apply_patch",
+        toolName: "patch",
         ...projectionBase(lifecycle, decoded.state, summary, {
           tone:
             decoded.state.status === "pending" ||
@@ -1547,12 +1548,15 @@ export function projectToolObservation(
   observation: ToolObservation,
   options: { readonly cwd?: string } = {},
 ): ToolProjection {
-  if (!isKnownToolObservation(observation)) {
-    const toolName = previewText(observation.toolName, 80) || "Unknown Tool";
-    const state = stateFromObservation(observation);
+  const toolName = normalizeMiniLilacToolName(observation.toolName);
+  const normalizedObservation: ToolObservation =
+    toolName === observation.toolName ? observation : { ...observation, toolName };
+  if (!isKnownToolObservation(normalizedObservation)) {
+    const toolName = previewText(normalizedObservation.toolName, 80) || "Unknown Tool";
+    const state = stateFromObservation(normalizedObservation);
     const summary = humanizeToolName(toolName) || "Unknown Tool";
     let payloadPreview = "undefined";
-    switch (observation.lifecycle) {
+    switch (normalizedObservation.lifecycle) {
       case "pending":
         break;
       case "active":
@@ -1560,30 +1564,30 @@ export function projectToolObservation(
       case "error":
       case "denied":
       case "cancelled":
-        payloadPreview = safeToolPayloadPreview(observation.input);
+        payloadPreview = safeToolPayloadPreview(normalizedObservation.input);
         break;
       case "success":
-        payloadPreview = safeToolPayloadPreview(observation.output);
+        payloadPreview = safeToolPayloadPreview(normalizedObservation.output);
         break;
     }
     return {
       kind: "unknown-tool",
       toolName,
-      ...projectionBase(observation.lifecycle, state, summary),
+      ...projectionBase(normalizedObservation.lifecycle, state, summary),
       payloadPreview,
     };
   }
 
-  const decoded = decodeKnownToolObservation(observation);
+  const decoded = decodeKnownToolObservation(normalizedObservation);
   if (decoded.status === "ok")
-    return projectDecoded(observation.lifecycle, decoded.value, options.cwd);
+    return projectDecoded(normalizedObservation.lifecycle, decoded.value, options.cwd);
   const error = decoded.error;
-  const state = stateFromObservation(observation);
+  const state = stateFromObservation(normalizedObservation);
   const summary = humanizeToolName(error.toolName);
   return {
     kind: "malformed-known-tool",
     toolName: error.toolName,
-    ...projectionBase(observation.lifecycle, state, summary),
+    ...projectionBase(normalizedObservation.lifecycle, state, summary),
     malformedField: error.field,
     payloadPreview: error.payloadPreview,
   };

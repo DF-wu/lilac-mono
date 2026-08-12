@@ -74,7 +74,7 @@ describe("Stage 7 Result boundaries", () => {
         content: [
           {
             type: "tool-result",
-            toolName: "read_file",
+            toolName: "read",
             output: {
               type: "json",
               value: {
@@ -83,11 +83,23 @@ describe("Stage 7 Result boundaries", () => {
               },
             },
           },
+          {
+            type: "tool-result",
+            toolName: "read_file",
+            output: {
+              type: "json",
+              value: { loadedInstructions: ["/workspace/legacy/AGENTS.md"] },
+            },
+          },
         ],
       },
       { role: "tool", content: [{ type: "tool-result", toolName: "bash", output: null }] },
     ]);
 
-    expect([...paths]).toEqual(["/workspace/AGENTS.md", "/workspace/src/AGENTS.md"]);
+    expect([...paths]).toEqual([
+      "/workspace/AGENTS.md",
+      "/workspace/src/AGENTS.md",
+      "/workspace/legacy/AGENTS.md",
+    ]);
   });
 });

@@ -179,7 +179,7 @@ describe("request-local agent output publisher", () => {
     const toolPublished = publisher.publishToolCall({
       toolCallId: "tool:1",
       status: "start",
-      display: "read_file",
+      display: "read",
     });
     await textPublishStarted.promise;
     expect(raw.messages).toEqual([]);

@@ -4,7 +4,10 @@ import path from "node:path";
 import { Result, TaggedError, type Panic, type Result as ResultType } from "better-result";
 import { z } from "zod";
 
-import { MINI_LILAC_EXECUTABLE_TOOL_NAMES } from "@stanley2058/mini-lilac-client";
+import {
+  MINI_LILAC_EXECUTABLE_TOOL_NAMES,
+  normalizeMiniLilacToolName,
+} from "@stanley2058/mini-lilac-client";
 import { isPanic } from "@stanley2058/lilac-utils";
 
 const KNOWN_TOOL_NAMES: ReadonlySet<string> = new Set(MINI_LILAC_EXECUTABLE_TOOL_NAMES);
@@ -27,7 +30,7 @@ const profileSchema = z
     description: z.string().trim().min(1).optional(),
     promptOverlay: z.string().trim().min(1).optional(),
     subagentOnly: z.boolean().default(false),
-    tools: z.array(z.string().trim().min(1)),
+    tools: z.array(z.string().trim().min(1).transform(normalizeMiniLilacToolName)),
     execution: z.boolean(),
     workspaceWrites: z.boolean(),
     delegation: z.boolean(),

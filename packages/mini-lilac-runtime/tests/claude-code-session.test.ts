@@ -217,7 +217,7 @@ function userMessage(text: string): MiniLilacUIMessage {
   return { id: crypto.randomUUID(), role: "user", parts: [{ type: "text", text }] };
 }
 
-function config(profileTools: readonly string[] = ["read_file", "websearch"]): RuntimeConfig {
+function config(profileTools: readonly string[] = ["read", "websearch"]): RuntimeConfig {
   return {
     configVersion: 1,
     server: { host: "127.0.0.1", port: 3000 },
@@ -252,7 +252,7 @@ function config(profileTools: readonly string[] = ["read_file", "websearch"]): R
         child: {
           description: "Named child",
           subagentOnly: true,
-          tools: ["read_file"],
+          tools: ["read"],
           execution: false,
           workspaceWrites: false,
           delegation: false,
@@ -602,7 +602,7 @@ describe("claude-code sessions", () => {
     expect(calls).toHaveLength(1);
     expect(calls[0]?.modelId).toBe("claude-sonnet-4-6");
     expect(calls[0]?.cwd).toBe(directory);
-    expect(calls[0]?.toolNames).toContain("read_file");
+    expect(calls[0]?.toolNames).toContain("read");
     // Claude ignores AI SDK tool declarations; the toolset reaches it via MCP.
     expect(model.doStreamCalls[0]?.tools ?? []).toEqual([]);
     expect(runs[0]?.disposals).toBe(1);
@@ -1301,7 +1301,7 @@ describe("claude-code sessions", () => {
 
     const second = await temporaryRuntime({
       model: new MockLanguageModelV4({ doStream: [textResult("b", "done")] }),
-      profileTools: ["read_file"],
+      profileTools: ["read"],
       calls: withoutSearch,
     });
     await collect((await second.service.startPrompt(second.session.id, userMessage("hi"))).stream);
@@ -1368,7 +1368,7 @@ describe("claude-code sessions", () => {
       ),
     ).toEqual([
       expect.objectContaining({
-        toolName: "read_file",
+        toolName: "read",
         input: { path: "README.md" },
       }),
     ]);

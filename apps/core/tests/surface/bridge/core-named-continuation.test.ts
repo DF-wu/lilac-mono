@@ -834,7 +834,7 @@ describe("Core named Claude continuation", () => {
       pluginAuthority: { disabled: [] },
       workflowAuthority: { cwd: "/workspace" },
       systemPolicy: { base: "system" },
-      directToolNames: ["bash", "read_file", "apply_patch", "subagent_delegate"],
+      directToolNames: ["bash", "read", "patch", "subagent_delegate"],
       externalToolAuthority: [{ stableId: "mcp:search" }],
       subagentAuthority: { enabled: true, maxDepth: 2, currentDepth: 1 },
     } as const;
@@ -842,13 +842,13 @@ describe("Core named Claude continuation", () => {
     expect(
       hashCoreNamedExecutionScope({
         ...base,
-        directToolNames: ["bash", "read_file", "edit_file", "subagent_delegate"],
+        directToolNames: ["bash", "read", "edit", "subagent_delegate"],
       }).hash,
     ).toBe(baseline);
     expect(
       hashCoreNamedExecutionScope({
         ...base,
-        directToolNames: ["bash", "read_file", "apply_patch"],
+        directToolNames: ["bash", "read", "patch"],
       }).hash,
     ).not.toBe(baseline);
     expect(

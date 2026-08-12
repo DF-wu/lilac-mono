@@ -602,7 +602,7 @@ wait "$witness_pid"
     ).rejects.toBe(panic);
   });
 
-  it("propagates the public read_file abort signal to remote execution", async () => {
+  it("propagates the public read abort signal to remote execution", async () => {
     const controller = new AbortController();
     controller.abort();
     const tools = fsTool(tempDir);
@@ -614,7 +614,7 @@ wait "$witness_pid"
       })
       .parse(
         await executeTool(
-          tools.read_file,
+          tools.read,
           { path: "missing.ts", cwd: `fakehost:${tempDir}` },
           "remote-read-cancelled",
           controller.signal,
@@ -992,7 +992,7 @@ printf '%s' '{"ok":false,"error":"npx should not be used when bunx exists"}'
       })
       .parse(
         await executeTool(
-          tools.read_file,
+          tools.read,
           { path: "missing.ts", cwd: `fakehost:${tempDir}` },
           "remote-read-transport",
         ),
@@ -1017,14 +1017,14 @@ printf '%s' '{"ok":false,"error":"npx should not be used when bunx exists"}'
       fsBackend: "fff",
       readFileDirectAttachmentSupported: true,
     });
-    if (!("edit_file" in tools)) throw new Error("expected edit tool");
-    const editFile = tools.edit_file;
+    if (!("edit" in tools)) throw new Error("expected edit tool");
+    const editFile = tools.edit;
     const fuzzySearch = tools.fuzzy_search;
     if (!fuzzySearch) throw new Error("expected fuzzy tool");
     const remoteCwd = `fakehost:${tempDir}`;
 
     const initialRead = await executeTool(
-      tools.read_file,
+      tools.read,
       { path: "state.ts", cwd: remoteCwd },
       "remote-read-before-edit",
     );
@@ -1035,12 +1035,12 @@ printf '%s' '{"ok":false,"error":"npx should not be used when bunx exists"}'
       'printf \'%s\' \'{"ok":true,"value":{"variant":"future"}}\'';
 
     const readOutput = await executeTool(
-      tools.read_file,
+      tools.read,
       { path: "state.ts", cwd: remoteCwd },
       "remote-read-malformed",
     );
     const bytesOutput = await executeTool(
-      tools.read_file,
+      tools.read,
       { path: "image.png", cwd: remoteCwd },
       "remote-bytes-malformed",
     );

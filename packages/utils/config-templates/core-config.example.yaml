@@ -253,7 +253,7 @@ agent:
         modelSlot: main
         # Profile behavior applies identically to direct and workflow launches.
         level1:
-          tools: [read_file, glob, grep, fuzzy_search, batch]
+          tools: [read, glob, grep, fuzzy_search, batch]
           plugins: [builtin-local-tools]
         level2:
           callables:

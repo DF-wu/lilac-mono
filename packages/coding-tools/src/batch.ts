@@ -280,6 +280,19 @@ export function createBatchToolResult<TToolSpec extends BatchToolSpec = BatchToo
   if (enabledNames.status === "error") return Result.err(enabledNames.error);
   const allowedNames = enabledNames.value;
   const allowedNameSet = new Set(allowedNames);
+  const normalizeBatchToolName = (name: string): string => {
+    if (allowedNameSet.has(name)) return name;
+    switch (name) {
+      case "read_file":
+        return allowedNameSet.has("read") ? "read" : name;
+      case "edit_file":
+        return allowedNameSet.has("edit") ? "edit" : name;
+      case "apply_patch":
+        return allowedNameSet.has("patch") ? "patch" : name;
+      default:
+        return name;
+    }
+  };
   const inputSchema = z.object({
     tool_calls: z
       .array(
@@ -301,9 +314,13 @@ export function createBatchToolResult<TToolSpec extends BatchToolSpec = BatchToo
         new BatchRejected({ message: `Batch accepts at most ${maxCalls} tool calls.` }),
       );
     }
+    const calls = input.tool_calls.map((call) => ({
+      ...call,
+      tool: normalizeBatchToolName(call.tool),
+    }));
     const tools = params.getTools();
     const children = await Promise.all(
-      input.tool_calls.map(async (call, index): Promise<ExpandedToolCall> => {
+      calls.map(async (call, index): Promise<ExpandedToolCall> => {
         const child = {
           toolCallId: buildSyntheticToolCallId({
             prefix: "batch_child",
@@ -339,11 +356,12 @@ export function createBatchToolResult<TToolSpec extends BatchToolSpec = BatchToo
     for (let index = 0; index < children.length; index++) {
       const child = children[index]!;
       if (child.invalid) continue;
-      const call = input.tool_calls[index]!;
+      const call = calls[index]!;
       const spec = specs?.get(call.tool);
-      const activeEditTool = params.editingMode === "none" ? undefined : params.editingMode;
-      const isAdapterlessBuiltinEdit =
-        !specs && (call.tool === "apply_patch" || call.tool === "edit_file");
+      let activeEditTool: "patch" | "edit" | undefined;
+      if (params.editingMode === "apply_patch") activeEditTool = "patch";
+      if (params.editingMode === "edit_file") activeEditTool = "edit";
+      const isAdapterlessBuiltinEdit = !specs && (call.tool === "patch" || call.tool === "edit");
       if (!spec?.editTargets && call.tool !== activeEditTool && !isAdapterlessBuiltinEdit) continue;
       const record = decodeBatchEditInput(child);
       const cwd = record.cwd ?? params.cwd;
@@ -364,7 +382,7 @@ export function createBatchToolResult<TToolSpec extends BatchToolSpec = BatchToo
           );
         }
         touched = resolvedTargets.value;
-      } else if (call.tool === "apply_patch") {
+      } else if (call.tool === "patch") {
         const patchText = record.patchText;
         if (patchText === undefined) {
           const message = params.errorFormatters?.missingEditField?.({
@@ -376,7 +394,7 @@ export function createBatchToolResult<TToolSpec extends BatchToolSpec = BatchToo
           });
           return Result.err(
             new BatchRejected({
-              message: message ?? "batch apply_patch preflight requires string patchText",
+              message: message ?? "batch patch preflight requires string patchText",
             }),
           );
         }
@@ -399,7 +417,7 @@ export function createBatchToolResult<TToolSpec extends BatchToolSpec = BatchToo
           });
           return Result.err(
             new BatchRejected({
-              message: message ?? "batch edit_file preflight requires string path",
+              message: message ?? "batch edit preflight requires string path",
             }),
           );
         }
@@ -461,8 +479,8 @@ export function createBatchToolResult<TToolSpec extends BatchToolSpec = BatchToo
         "- Every child call must include all required parameters for its tool.",
         "- Do not emit empty parameters objects for tools with required fields.",
         "- If multiple edit calls with declared edit targets touch the same file path, the entire batch is rejected.",
-        'Bad example: {"tool_calls":[{"tool":"read_file","parameters":{}},{"tool":"bash","parameters":{}}]}',
-        'Good example: {"tool_calls":[{"tool":"read_file","parameters":{"path":"src/index.ts"}},{"tool":"bash","parameters":{"command":"bun test"}}]}',
+        'Bad example: {"tool_calls":[{"tool":"read","parameters":{}},{"tool":"bash","parameters":{}}]}',
+        'Good example: {"tool_calls":[{"tool":"read","parameters":{"path":"src/index.ts"}},{"tool":"bash","parameters":{"command":"bun test"}}]}',
       ].join("\n"),
       inputSchema,
       execute: async (input, options) => {

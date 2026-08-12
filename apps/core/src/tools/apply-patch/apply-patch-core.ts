@@ -100,13 +100,13 @@ async function captureApplyPatchOperation<T>(params: {
   if (captured.status === "error") {
     const cause = preserveToolPanic(captured.error);
     if (params.signal?.aborted) {
-      return Result.err(new ApplyPatchCancelled({ cause, message: "apply_patch was cancelled" }));
+      return Result.err(new ApplyPatchCancelled({ cause, message: "patch was cancelled" }));
     }
     return Result.err(
       new ApplyPatchOperationError({
         operation: params.operation,
         cause,
-        message: opaqueErrorMessage(cause, `apply_patch failed while ${params.operation}`),
+        message: opaqueErrorMessage(cause, `patch failed while ${params.operation}`),
       }),
     );
   }
@@ -118,7 +118,7 @@ function checkApplyPatchCancellation(
 ): ResultType<void, ApplyPatchCancelled> {
   if (!signal?.aborted) return Result.ok();
   return Result.err(
-    new ApplyPatchCancelled({ cause: signal.reason, message: "apply_patch was cancelled" }),
+    new ApplyPatchCancelled({ cause: signal.reason, message: "patch was cancelled" }),
   );
 }
 
@@ -387,7 +387,7 @@ export async function applyHunksResult(
     switch (hunk.type) {
       case "add": {
         const dst = resolvePath(baseResolved, hunk.path);
-        const allowed = await assertAllowed(dst, denyAbs, "apply_patch");
+        const allowed = await assertAllowed(dst, denyAbs, "patch");
         if (allowed.status === "error") return allowed;
         const created = await captureApplyPatchOperation({
           operation: `creating the parent directory for ${dst}`,
@@ -406,7 +406,7 @@ export async function applyHunksResult(
       }
       case "delete": {
         const target = resolvePath(baseResolved, hunk.path);
-        const allowed = await assertAllowed(target, denyAbs, "apply_patch");
+        const allowed = await assertAllowed(target, denyAbs, "patch");
         if (allowed.status === "error") return allowed;
         const inspected = await captureApplyPatchOperation({
           operation: `inspecting ${target}`,
@@ -435,10 +435,10 @@ export async function applyHunksResult(
       case "update": {
         const src = resolvePath(baseResolved, hunk.path);
         const moveTo = hunk.movePath ? resolvePath(baseResolved, hunk.movePath) : undefined;
-        const sourceAllowed = await assertAllowed(src, denyAbs, "apply_patch");
+        const sourceAllowed = await assertAllowed(src, denyAbs, "patch");
         if (sourceAllowed.status === "error") return sourceAllowed;
         if (moveTo) {
-          const destinationAllowed = await assertAllowed(moveTo, denyAbs, "apply_patch");
+          const destinationAllowed = await assertAllowed(moveTo, denyAbs, "patch");
           if (destinationAllowed.status === "error") return destinationAllowed;
         }
         const updated = await applyUpdateHunk({

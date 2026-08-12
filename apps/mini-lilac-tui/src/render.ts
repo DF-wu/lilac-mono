@@ -675,7 +675,7 @@ function explorationCategory(
   projection: Extract<ToolProjection, { kind: "exploration" }>,
 ): "read" | "search" {
   switch (projection.toolName) {
-    case "read_file":
+    case "read":
       return "read";
     case "glob":
     case "grep":

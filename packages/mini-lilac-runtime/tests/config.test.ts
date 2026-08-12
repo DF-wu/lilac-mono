@@ -296,4 +296,21 @@ describe("runtime config", () => {
       }),
     ).toThrow("unknown tool");
   });
+
+  it("accepts legacy configured tool names and normalizes them to canonical names", () => {
+    const parsed = runtimeConfigSchema.parse({
+      ...baseConfig,
+      agent: {
+        ...baseConfig.agent,
+        profiles: {
+          main: {
+            ...baseConfig.agent.profiles.main,
+            tools: ["read_file", "edit_file", "apply_patch"],
+          },
+        },
+      },
+    });
+
+    expect(parsed.agent.profiles.main?.tools).toEqual(["read", "edit", "patch"]);
+  });
 });

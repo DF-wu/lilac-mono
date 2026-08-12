@@ -73,7 +73,7 @@ const profileLevel2Schema = z.object({
 const EXPLORE_PROFILE_DEFAULT: SubagentProfileConfig = {
   modelSlot: "main",
   level1: {
-    tools: ["read_file", "glob", "grep", "fuzzy_search", "batch"],
+    tools: ["read", "glob", "grep", "fuzzy_search", "batch"],
     plugins: ["builtin-local-tools"],
   },
   level2: {
@@ -116,6 +116,27 @@ const SELF_PROFILE_DEFAULT: SubagentProfileConfig = {
   ...GENERAL_PROFILE_DEFAULT,
   delegation: true,
 };
+
+function normalizeProfileToolNames(profile: SubagentProfileConfig): SubagentProfileConfig {
+  return {
+    ...profile,
+    level1: {
+      ...profile.level1,
+      tools: profile.level1.tools.map((name) => {
+        switch (name) {
+          case "read_file":
+            return "read";
+          case "edit_file":
+            return "edit";
+          case "apply_patch":
+            return "patch";
+          default:
+            return name;
+        }
+      }),
+    },
+  };
+}
 
 function subagentProfileSchemaV2(defaults: SubagentProfileConfig) {
   return z
@@ -691,6 +712,14 @@ function coreConfigV2ToUniversal(
     },
     agent: {
       ...parsed.agent,
+      subagents: {
+        ...parsed.agent.subagents,
+        profiles: {
+          explore: normalizeProfileToolNames(parsed.agent.subagents.profiles.explore),
+          general: normalizeProfileToolNames(parsed.agent.subagents.profiles.general),
+          self: normalizeProfileToolNames(parsed.agent.subagents.profiles.self),
+        },
+      },
       systemPrompt: "",
     },
   };

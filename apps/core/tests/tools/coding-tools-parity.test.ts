@@ -44,8 +44,8 @@ describe("Core coding-tools parity", () => {
   });
 
   it("accepts legacy and hashline edit targets and honors child cwd overrides", async () => {
-    const editTargets = BUILTIN_LEVEL1_TOOLS.edit_file.editTargets;
-    const applyPatchTargets = BUILTIN_LEVEL1_TOOLS.apply_patch.editTargets;
+    const editTargets = BUILTIN_LEVEL1_TOOLS.edit.editTargets;
+    const applyPatchTargets = BUILTIN_LEVEL1_TOOLS.patch.editTargets;
     if (!editTargets || !applyPatchTargets)
       throw new Error("missing built-in edit target metadata");
 

@@ -17,7 +17,7 @@ const toolMessageSchema = z
 const readFileToolResultSchema = z
   .object({
     type: z.literal("tool-result"),
-    toolName: z.literal("read_file"),
+    toolName: z.enum(["read", "read_file"]),
     output: z.unknown(),
   })
   .passthrough();

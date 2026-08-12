@@ -23,25 +23,25 @@ describe("formatToolArgsForDisplay", () => {
     ).toBe(" echo 1234567890123456789012...");
   });
 
-  it("formats readFile path with middle truncation (14 ... 13)", () => {
+  it("formats read path with middle truncation (14 ... 13)", () => {
     expect(
-      formatBuiltinArgs("read_file", {
+      formatBuiltinArgs("read", {
         path: "/path/to/some/really/long/path/to/file.js",
       }),
     ).toBe(" /path/to/some/...th/to/file.js");
   });
 
-  it("formats remote read_file path with host initials", () => {
+  it("formats remote read path with host initials", () => {
     expect(
-      formatBuiltinArgs("read_file", {
+      formatBuiltinArgs("read", {
         path: "ssh://stanley-server/some/really/long/path/to/file.js",
       }),
     ).toBe(" @SS:/some/real...th/to/file.js");
   });
 
-  it("keeps scp-style read_file path literal", () => {
+  it("keeps scp-style read path literal", () => {
     expect(
-      formatBuiltinArgs("read_file", {
+      formatBuiltinArgs("read", {
         path: "stanley-desktop:/repo/apps/core/src/index.ts",
       }),
     ).toBe(" stanley-deskto.../src/index.ts");
@@ -49,13 +49,13 @@ describe("formatToolArgsForDisplay", () => {
 
   it("keeps local filenames with ':' literal", () => {
     expect(
-      formatBuiltinArgs("read_file", {
+      formatBuiltinArgs("read", {
         path: "notes:2026.md",
       }),
     ).toBe(" notes:2026.md");
   });
 
-  it("formats apply_patch (local) as first file + remaining count", () => {
+  it("formats patch as first file + remaining count", () => {
     const patchText = [
       "*** Begin Patch",
       "*** Update File: /path/to/some/really/long/path/to/file1.js",
@@ -70,14 +70,12 @@ describe("formatToolArgsForDisplay", () => {
       "*** End Patch",
     ].join("\n");
 
-    expect(formatBuiltinArgs("apply_patch", { patchText })).toBe(
-      " /path/to/some/...h/to/file1.js (+3)",
-    );
+    expect(formatBuiltinArgs("patch", { patchText })).toBe(" /path/to/some/...h/to/file1.js (+3)");
   });
 
-  it("formats edit_file path with middle truncation", () => {
+  it("formats edit path with middle truncation", () => {
     expect(
-      formatBuiltinArgs("edit_file", {
+      formatBuiltinArgs("edit", {
         path: "/path/to/some/really/long/path/to/file.js",
         oldText: "a",
         newText: "b",
@@ -160,15 +158,21 @@ describe("formatToolArgsForDisplay", () => {
 
   it("returns empty string on invalid args", () => {
     expect(formatBuiltinArgs("bash", { nope: true })).toBe("");
-    expect(formatBuiltinArgs("read_file", { nope: true })).toBe("");
-    expect(formatBuiltinArgs("apply_patch", { nope: true })).toBe("");
-    expect(formatBuiltinArgs("edit_file", { nope: true })).toBe("");
+    expect(formatBuiltinArgs("read", { nope: true })).toBe("");
+    expect(formatBuiltinArgs("patch", { nope: true })).toBe("");
+    expect(formatBuiltinArgs("edit", { nope: true })).toBe("");
     expect(formatBuiltinArgs("fuzzy_search", { nope: true })).toBe("");
   });
 
-  it("preserves the concrete legacy readFile fallback", () => {
+  it("preserves restored built-in argument formatter fallbacks", () => {
     expect(formatToolArgsForDisplay("readFile", { path: "legacy.txt" })).toBe(" legacy.txt");
-    expect(formatToolArgsForDisplay("read_file", { path: "canonical.txt" })).toBe("");
+    expect(formatToolArgsForDisplay("read_file", { path: "legacy.txt" })).toBe(" legacy.txt");
+    expect(formatToolArgsForDisplay("edit_file", { path: "legacy.txt" })).toBe(" legacy.txt");
+    expect(
+      formatToolArgsForDisplay("apply_patch", {
+        patchText: "*** Begin Patch\n*** Delete File: legacy.txt\n*** End Patch",
+      }),
+    ).toBe(" legacy.txt");
   });
 
   it("prefers plugin metadata formatter when provided", () => {

@@ -1,7 +1,7 @@
 import type { ToolResultArtifactStore } from "../artifacts/tool-result-artifact-store";
 
 const TOOL_RESULT_ENVELOPE =
-  /^(?<head>[\s\S]*)\n\n\[tool result truncated: \d+ characters omitted\]\nComplete output: (?<uri>tool-result:\/\/[0-9a-f-]{36})\nUse read_file with this URI and start: \{ "type": "offset", "offset": 0 \}\. Reuse the returned nextStart unchanged while more content remains\.\n\n(?<tail>[\s\S]*)$/u;
+  /^(?<head>[\s\S]*)\n\n\[tool result truncated: \d+ characters omitted\]\nComplete output: (?<uri>tool-result:\/\/[0-9a-f-]{36})\nUse (?:read|read_file) with this URI and start: \{ "type": "offset", "offset": 0 \}\. Reuse the returned nextStart unchanged while more content remains\.\n\n(?<tail>[\s\S]*)$/u;
 
 export async function resolveWorkflowSubagentToolResult(input: {
   finalText: string;

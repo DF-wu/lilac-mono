@@ -69,6 +69,13 @@ describe("core config versioning", () => {
     expect(parsed.tools.web.fetch.mode).toBe("auto");
     expect(parsed.tools.inspect.model).toBe("google/gemini-3-flash");
     expect(parsed.tools.editFile.hashline).toBe(false);
+    expect(parsed.agent.subagents.profiles.explore.level1.tools).toEqual([
+      "read",
+      "glob",
+      "grep",
+      "fuzzy_search",
+      "batch",
+    ]);
     expect("idleTimeoutMs" in parsed.agent.subagents).toBe(false);
     expect(parsed.workflows.maxActiveRuns).toBe(64);
   });
@@ -78,6 +85,13 @@ describe("core config versioning", () => {
 
     expect(parsed.configVersion).toBe(2);
     expect(parsed.tools.fsBackend).toBe("fff");
+    expect(parsed.agent.subagents.profiles.explore.level1.tools).toEqual([
+      "read",
+      "glob",
+      "grep",
+      "fuzzy_search",
+      "batch",
+    ]);
     expect(parsed.tools.inspect.model).toBe("google/gemini-3.5-flash");
     expect(parsed.tools.editFile.hashline).toBe(true);
     expect(parsed.surface.discord.outputMode).toBe("preview");

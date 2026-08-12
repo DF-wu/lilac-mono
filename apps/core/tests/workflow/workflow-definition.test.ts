@@ -130,7 +130,7 @@ describe("workflow definition validation", () => {
       'profiles: ["explore"],',
       'models: ["deep"],',
       'allowedRoots: ["project"],',
-      'tools: ["read_file"],',
+      'tools: ["read"],',
       'executables: "none",',
       'editing: ["shared"],',
       "delegation: false,",

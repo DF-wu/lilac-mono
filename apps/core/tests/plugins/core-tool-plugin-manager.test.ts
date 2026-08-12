@@ -253,30 +253,30 @@ describe("core tool plugin manager", () => {
       subagentConfig: cfg.agent.subagents!,
     });
     expect([...applyPatchTools.specs.keys()].sort()).toEqual([
-      "apply_patch",
       "bash",
       "batch",
       "glob",
       "grep",
-      "read_file",
+      "patch",
+      "read",
       "subagent_delegate",
     ]);
     expect([...applyPatchTools.genericOutputNormalizerBypassTools].sort()).toEqual([
-      "apply_patch",
       "bash",
       "batch",
       "grep",
-      "read_file",
+      "patch",
+      "read",
       "subagent_delegate",
     ]);
-    expect([...applyPatchTools.aggregateOutputBudgetExemptTools]).toEqual(["read_file", "grep"]);
+    expect([...applyPatchTools.aggregateOutputBudgetExemptTools]).toEqual(["read", "grep"]);
     expect([...applyPatchTools.directToolNames].sort()).toEqual([
-      "apply_patch",
       "bash",
       "batch",
       "glob",
       "grep",
-      "read_file",
+      "patch",
+      "read",
       "subagent_delegate",
     ]);
     expect(applyPatchTools.tools).not.toHaveProperty("tool_search");
@@ -291,10 +291,10 @@ describe("core tool plugin manager", () => {
     expect([...editFileTools.specs.keys()].sort()).toEqual([
       "bash",
       "batch",
-      "edit_file",
+      "edit",
       "glob",
       "grep",
-      "read_file",
+      "read",
       "subagent_delegate",
     ]);
 
@@ -305,7 +305,7 @@ describe("core tool plugin manager", () => {
       subagentDepth: 1,
       subagentConfig: cfg.agent.subagents!,
     });
-    expect([...exploreTools.specs.keys()].sort()).toEqual(["batch", "glob", "grep", "read_file"]);
+    expect([...exploreTools.specs.keys()].sort()).toEqual(["batch", "glob", "grep", "read"]);
 
     const generalTools = await manager.buildLevel1Toolset({
       cwd: dataDir,
@@ -315,12 +315,12 @@ describe("core tool plugin manager", () => {
       subagentConfig: cfg.agent.subagents!,
     });
     expect(Object.keys(generalTools.tools).sort()).toEqual([
-      "apply_patch",
       "bash",
       "batch",
       "glob",
       "grep",
-      "read_file",
+      "patch",
+      "read",
     ]);
 
     const selfTools = await manager.buildLevel1Toolset({
@@ -331,12 +331,12 @@ describe("core tool plugin manager", () => {
       subagentConfig: cfg.agent.subagents!,
     });
     expect(Object.keys(selfTools.tools).sort()).toEqual([
-      "apply_patch",
       "bash",
       "batch",
       "glob",
       "grep",
-      "read_file",
+      "patch",
+      "read",
       "subagent_delegate",
     ]);
   });
@@ -375,10 +375,10 @@ describe("core tool plugin manager", () => {
       },
     });
 
-    expect([...restrictedTools.specs.keys()].sort()).toEqual(["bash", "batch", "read_file"]);
+    expect([...restrictedTools.specs.keys()].sort()).toEqual(["bash", "batch", "read"]);
   });
 
-  it("threads direct attachment support metadata into read_file description", async () => {
+  it("threads direct attachment support metadata into read description", async () => {
     tmpRoot = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-core-plugin-manager-"));
     const dataDir = path.join(tmpRoot, "data");
     const cfg = testConfig({});
@@ -413,8 +413,8 @@ describe("core tool plugin manager", () => {
       },
     });
 
-    expect(getToolDescription(toolset.tools, "read_file")).toContain(
-      "calling read_file attaches the original file to your context for native visual or document analysis",
+    expect(getToolDescription(toolset.tools, "read")).toContain(
+      "calling read attaches the original file to your context for native visual or document analysis",
     );
   });
 
@@ -493,12 +493,12 @@ describe("core tool plugin manager", () => {
       workflowRunId: "run:false-attachment-metadata",
     });
     expect(delegationCount).toBe(1);
-    expect(getToolDescription(toolset.tools, "read_file")).not.toContain(
-      "calling read_file attaches the original file to your context for native visual or document analysis",
+    expect(getToolDescription(toolset.tools, "read")).not.toContain(
+      "calling read attaches the original file to your context for native visual or document analysis",
     );
   });
 
-  it("shares local read state between read_file and edit_file within one toolset", async () => {
+  it("shares local read state between read and edit within one toolset", async () => {
     tmpRoot = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-core-plugin-manager-"));
     const dataDir = path.join(tmpRoot, "data");
     const cfg = testConfig({});
@@ -529,8 +529,8 @@ describe("core tool plugin manager", () => {
       string,
       { execute?: (...args: readonly unknown[]) => unknown }
     >;
-    const readFile = getExecutableTool(tools, "read_file");
-    const editFile = getExecutableTool(tools, "edit_file");
+    const readFile = getExecutableTool(tools, "read");
+    const editFile = getExecutableTool(tools, "edit");
 
     const readRes = await resolveExecuteResult(
       readFile.execute!({ path: "note.txt" }, { toolCallId: "read-1", messages: [] }),
@@ -584,8 +584,8 @@ describe("core tool plugin manager", () => {
       string,
       { execute?: (...args: readonly unknown[]) => unknown }
     >;
-    const readFile = getExecutableTool(tools, "read_file");
-    const editFile = getExecutableTool(tools, "edit_file");
+    const readFile = getExecutableTool(tools, "read");
+    const editFile = getExecutableTool(tools, "edit");
 
     const readRes = await resolveExecuteResult(
       readFile.execute!(
@@ -646,8 +646,8 @@ describe("core tool plugin manager", () => {
       string,
       { execute?: (...args: readonly unknown[]) => unknown }
     >;
-    const readFile = getExecutableTool(tools, "read_file");
-    const editFile = getExecutableTool(tools, "edit_file");
+    const readFile = getExecutableTool(tools, "read");
+    const editFile = getExecutableTool(tools, "edit");
 
     const readRes = await resolveExecuteResult(
       readFile.execute!(
@@ -924,7 +924,7 @@ export default {
     await writeExternalPlugin({
       dataDir,
       pluginId: "builtin-name",
-      entryBody: pluginBody("builtin-name", ["read_file"]),
+      entryBody: pluginBody("builtin-name", ["read"]),
     });
     await writeExternalPlugin({
       dataDir,
@@ -951,7 +951,7 @@ export default {
         expect.objectContaining({
           pluginId: "builtin-name",
           state: "loaded",
-          level1Names: ["read_file"],
+          level1Names: ["read"],
         }),
         expect.objectContaining({ pluginId: "duplicate-own", state: "failed" }),
       ]),
@@ -971,7 +971,7 @@ export default {
     ).toEqual(["same-a", "same-b"]);
     expect(
       toolset.catalog.some(
-        (entry) => entry.sourceId === "builtin-name" && entry.rawName === "read_file",
+        (entry) => entry.sourceId === "builtin-name" && entry.rawName === "read",
       ),
     ).toBe(true);
   });

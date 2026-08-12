@@ -2,12 +2,12 @@ import { z } from "zod";
 
 export const LEVEL1_TOOL_NAMES = [
   "bash",
-  "read_file",
+  "read",
   "glob",
   "grep",
   "fuzzy_search",
-  "edit_file",
-  "apply_patch",
+  "edit",
+  "patch",
   "subagent_delegate",
   "batch",
 ] as const;
@@ -102,7 +102,7 @@ export function createReadFileInputSchema(options?: {
       .optional()
       .describe(
         hashlineEnabled
-          ? "Text files only. Output format. Default is raw. Use 'hashline' before edit_file when you need stable edit anchors."
+          ? "Text files only. Output format. Default is raw. Use 'hashline' before edit when you need stable edit anchors."
           : "Text files only. Output format. Default is raw (no line numbers). 'numbered' is for display only.",
       ),
     dangerouslyAllow: z.boolean().optional().describe("Bypass filesystem denylist guardrails."),
@@ -208,10 +208,7 @@ const expectedMatchesSchema = z.union([z.literal("any"), z.number().int().positi
 const hashlineEditSchema = z.discriminatedUnion("op", [
   z.object({
     op: z.literal("replace"),
-    pos: z
-      .string()
-      .min(1)
-      .describe("Starting hashline anchor from read_file/grep hashline output."),
+    pos: z.string().min(1).describe("Starting hashline anchor from read/grep hashline output."),
     end: z
       .string()
       .min(1)
@@ -253,7 +250,7 @@ const hashlineEditFileInputSchema = z.object({
     .string()
     .optional()
     .describe(
-      "Optional optimistic concurrency hash from read_file. If omitted, edit_file requires a prior read in the same tool session.",
+      "Optional optimistic concurrency hash from read. If omitted, edit requires a prior read in the same tool session.",
     ),
   dangerouslyAllow: z.boolean().optional().describe("Bypass filesystem denylist guardrails."),
 });
@@ -279,10 +276,7 @@ const legacyEditFileInputSchema = z.object({
   expectedMatches: expectedMatchesSchema
     .optional()
     .describe("Expected number of matches. Default: 1 when replaceAll=false, otherwise 'any'."),
-  expectedHash: z
-    .string()
-    .optional()
-    .describe("Optional optimistic concurrency hash from read_file."),
+  expectedHash: z.string().optional().describe("Optional optimistic concurrency hash from read."),
   dangerouslyAllow: z.boolean().optional().describe("Bypass filesystem denylist guardrails."),
 });
 

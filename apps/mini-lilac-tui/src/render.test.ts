@@ -846,7 +846,7 @@ describe("renderInitialMessages", () => {
     renderer.handle({
       type: "tool-input-available",
       toolCallId: "read-1",
-      toolName: "read_file",
+      toolName: "read",
       input: { path: "src/a.ts" },
       dynamic: true,
     });
@@ -894,7 +894,7 @@ describe("renderInitialMessages", () => {
           parts: [
             {
               type: "dynamic-tool",
-              toolName: "read_file",
+              toolName: "read",
               toolCallId: "read-1",
               state: "output-available",
               input: { path: "src/a.ts" },
@@ -922,7 +922,7 @@ describe("renderInitialMessages", () => {
         parts: [
           {
             type: "dynamic-tool",
-            toolName: "read_file",
+            toolName: "read",
             toolCallId: "read-error",
             state: "output-error",
             input: { path: "missing.ts" },
@@ -963,7 +963,7 @@ describe("renderInitialMessages", () => {
     failed.renderer.handle({
       type: "tool-input-available",
       toolCallId: "read-error",
-      toolName: "read_file",
+      toolName: "read",
       input: { path: "missing.ts" },
       dynamic: true,
     });
@@ -992,7 +992,7 @@ describe("renderInitialMessages", () => {
     renderer.handle({
       type: "tool-input-available",
       toolCallId: "read-error",
-      toolName: "read_file",
+      toolName: "read",
       input: { path: "missing.ts" },
       dynamic: true,
     });
@@ -1025,7 +1025,7 @@ describe("renderInitialMessages", () => {
     renderer.handle({
       type: "tool-input-available",
       toolCallId: "read-success",
-      toolName: "read_file",
+      toolName: "read",
       input: { path: "present.ts" },
       dynamic: true,
     });
@@ -1058,7 +1058,7 @@ describe("renderInitialMessages", () => {
         parts: [
           {
             type: "dynamic-tool",
-            toolName: "read_file",
+            toolName: "read",
             toolCallId: "read-invalid",
             state: "output-error",
             input: { path: 42, unexpected: "x".repeat(400) },
@@ -1071,7 +1071,7 @@ describe("renderInitialMessages", () => {
     expect(entry).toMatchObject({
       kind: "tool",
       tone: "danger",
-      text: "Read File: invalid read arguments · malformed input: <object>",
+      text: "Read: invalid read arguments · malformed input: <object>",
     });
     expect(entry).not.toHaveProperty("exploration");
   });
@@ -1080,7 +1080,7 @@ describe("renderInitialMessages", () => {
     const parts: MiniLilacUIMessage["parts"] = [
       {
         type: "dynamic-tool",
-        toolName: "read_file",
+        toolName: "read",
         toolCallId: "read-success",
         state: "output-available",
         input: { path: "present.ts" },
@@ -1155,7 +1155,7 @@ describe("renderInitialMessages", () => {
           parts: [
             {
               type: "dynamic-tool",
-              toolName: "read_file",
+              toolName: "read",
               toolCallId: "read-1",
               state: "output-available",
               input: { path: "/workspace/render.test.ts", start: { offset: 1 }, maxLines: 12 },
@@ -1263,7 +1263,7 @@ describe("renderInitialMessages", () => {
           parts: [
             {
               type: "dynamic-tool",
-              toolName: "apply_patch",
+              toolName: "patch",
               toolCallId: "patch-1",
               state: "output-available",
               input: {
@@ -1274,7 +1274,7 @@ describe("renderInitialMessages", () => {
             },
             {
               type: "dynamic-tool",
-              toolName: "edit_file",
+              toolName: "edit",
               toolCallId: "edit-1",
               state: "output-available",
               input: { path: "/workspace/src/store.ts", oldText: "one\ntwo", newText: "a\nb\nc" },
@@ -1289,7 +1289,7 @@ describe("renderInitialMessages", () => {
             },
             {
               type: "dynamic-tool",
-              toolName: "edit_file",
+              toolName: "edit",
               toolCallId: "edit-2",
               state: "output-available",
               input: {
@@ -1421,16 +1421,16 @@ describe("renderInitialMessages", () => {
         state: "output-available",
         input: {
           tool_calls: [
-            { tool: "read_file", parameters: { path: "a.ts" } },
-            { tool: "read_file", parameters: { path: "b.ts" } },
+            { tool: "read", parameters: { path: "a.ts" } },
+            { tool: "read", parameters: { path: "b.ts" } },
             { tool: "glob", parameters: { patterns: ["**/*.ts"] } },
           ],
         },
         output: { ok: true, total: 3 },
       },
       ...[
-        { toolName: "read_file", toolCallId: "read-1", input: { path: "a.ts" } },
-        { toolName: "read_file", toolCallId: "read-2", input: { path: "b.ts" } },
+        { toolName: "read", toolCallId: "read-1", input: { path: "a.ts" } },
+        { toolName: "read", toolCallId: "read-2", input: { path: "b.ts" } },
         { toolName: "glob", toolCallId: "glob-1", input: { patterns: ["**/*.ts"] } },
       ].map((child) => ({
         type: "dynamic-tool" as const,
@@ -1590,7 +1590,7 @@ describe("renderInitialMessages", () => {
     expect(entries).toHaveLength(2);
     expect(entries[0]?.text).toBe("$ pwd\n\nfirst");
     expect(entries[0]?.tone).toBe("normal");
-    expect(entries[1]?.text).toBe("Read");
+    expect(entries[1]?.text).toBe("Read · malformed input: undefined");
     expect(entries[1]?.tone).toBe("success");
   });
 
@@ -1824,14 +1824,14 @@ describe("renderInitialMessages", () => {
     renderer.handle({
       type: "tool-input-available",
       toolCallId: "read-active",
-      toolName: "read_file",
+      toolName: "read",
       input: { path: "src/app.ts" },
       dynamic: true,
     });
     renderer.handle({
       type: "tool-input-available",
       toolCallId: "edit-active",
-      toolName: "apply_patch",
+      toolName: "patch",
       input: {
         patchText: "*** Begin Patch\n*** Update File: src/app.ts\n@@\n-old\n+new\n*** End Patch",
       },
@@ -1840,7 +1840,7 @@ describe("renderInitialMessages", () => {
     renderer.handle({
       type: "tool-input-available",
       toolCallId: "edit-active-2",
-      toolName: "apply_patch",
+      toolName: "patch",
       input: {
         patchText:
           "*** Begin Patch\n*** Update File: src/other.ts\n@@\n-before\n+after\n*** End Patch",
@@ -2064,7 +2064,7 @@ describe("ChunkRenderer output rollback", () => {
     renderer.handle({
       type: "tool-input-available",
       toolCallId: "tool-b",
-      toolName: "read_file",
+      toolName: "read",
       input: { path: "kept.ts" },
       dynamic: true,
     });
@@ -2110,7 +2110,7 @@ describe("ChunkRenderer output rollback", () => {
       renderer.handle({
         type: "tool-input-available",
         toolCallId,
-        toolName: "read_file",
+        toolName: "read",
         input: { path },
         dynamic: true,
       });

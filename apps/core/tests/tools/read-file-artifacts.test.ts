@@ -18,7 +18,7 @@ function resultValue<T>(
   return result.value;
 }
 
-describe("read_file tool-result resources", () => {
+describe("read tool-result resources", () => {
   let baseDir: string;
 
   beforeEach(async () => {
@@ -46,7 +46,7 @@ describe("read_file tool-result resources", () => {
     const readFile = fsTool(baseDir, {
       toolResultArtifacts: store,
       requestContext: { requestId: "request-a", sessionId: "session-a" },
-    }).read_file;
+    }).read;
 
     const output = await readFile.execute!(
       {
@@ -93,7 +93,7 @@ describe("read_file tool-result resources", () => {
     const readFile = fsTool(baseDir, {
       toolResultArtifacts: store,
       requestContext: { requestId: "request-a", sessionId: "session-a" },
-    }).read_file;
+    }).read;
 
     await writeFile(path.join(baseDir, "ordinary.txt"), "ab😀\ncd");
 
@@ -144,7 +144,7 @@ describe("read_file tool-result resources", () => {
       artifactOnly: true,
       toolResultArtifacts: store,
       requestContext: { requestId: "request-a", sessionId: "session-a" },
-    }).read_file;
+    }).read;
 
     const artifact = await readFile.execute!(
       { path: created.uri },
@@ -160,7 +160,7 @@ describe("read_file tool-result resources", () => {
       success: false,
       error: {
         code: "PERMISSION",
-        message: "Restricted sessions can use read_file only with tool-result:// artifacts.",
+        message: "Restricted sessions can use read only with tool-result:// artifacts.",
       },
     });
   });
@@ -182,7 +182,7 @@ describe("read_file tool-result resources", () => {
     const readFile = fsTool(baseDir, {
       toolResultArtifacts: store,
       requestContext: { requestId: "request-b", sessionId: "session-b" },
-    }).read_file;
+    }).read;
 
     const foreign = await readFile.execute!(
       { path: created.uri },
@@ -226,7 +226,7 @@ describe("read_file tool-result resources", () => {
     const readFile = fsTool(baseDir, {
       toolResultArtifacts: store,
       requestContext: { requestId: "request-a", sessionId: "session-a" },
-    }).read_file;
+    }).read;
     const output = await readFile.execute!(
       { path: first.uri },
       { toolCallId: "read-evicted", messages: [], context: {} },

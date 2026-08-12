@@ -14,7 +14,7 @@ describe("coreConfigSchema agent.subagents", () => {
     expect(parsed.agent.subagents.profiles.self.model).toBeUndefined();
     expect(parsed.agent.subagents.profiles.explore).toMatchObject({
       level1: {
-        tools: ["read_file", "glob", "grep", "fuzzy_search", "batch"],
+        tools: ["read", "glob", "grep", "fuzzy_search", "batch"],
         plugins: ["builtin-local-tools"],
       },
       network: true,
@@ -36,14 +36,14 @@ describe("coreConfigSchema agent.subagents", () => {
     });
   });
 
-  it("accepts native tool, plugin, network, write, execution, and delegation overrides", () => {
+  it("normalizes legacy v2 tool names in profile overrides", () => {
     const profile = parseCoreConfigV2ToUniversal({
       configVersion: 2,
       agent: {
         subagents: {
           profiles: {
             general: {
-              level1: { tools: ["read_file"], plugins: ["local"] },
+              level1: { tools: ["read_file", "edit_file", "apply_patch"], plugins: ["local"] },
               level2: { callables: ["fetch"], plugins: ["web"] },
               network: false,
               workspaceWrites: false,
@@ -56,7 +56,7 @@ describe("coreConfigSchema agent.subagents", () => {
     }).agent.subagents.profiles.general;
 
     expect(profile).toMatchObject({
-      level1: { tools: ["read_file"], plugins: ["local"] },
+      level1: { tools: ["read", "edit", "patch"], plugins: ["local"] },
       level2: { callables: ["fetch"], plugins: ["web"] },
       network: false,
       workspaceWrites: false,

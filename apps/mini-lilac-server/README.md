@@ -119,13 +119,13 @@ hatch that bypasses its guardrails, including protected-path checks. Hidden path
 not require this flag unless a tool first reports an access denial. Bash receives an environment
 with the HTTP auth-token variable removed.
 
-Model-facing tool results are limited to 40 KiB. For `read_file`, that limit applies only to the
+Model-facing tool results are limited to 40 KiB. For `read`, that limit applies only to the
 returned textual payload, measured as UTF-8 bytes; metadata, paths, JSON encoding, and loaded
 `AGENTS.md` instructions are outside the limit. Direct and batched reads return `nextStart` rather
 than creating duplicate overflow artifacts, and batched reads do not share an aggregate inline
 budget. When another non-Bash tool completes with a larger materialized result, Mini Lilac stores
 the complete sanitized result under the transient, session-scoped `tool-result://` artifact
-referenced by the replacement tool error. Use `read_file` with that URI and its returned `nextStart`
+referenced by the replacement tool error. Use `read` with that URI and its returned `nextStart`
 to page the result, or use `grep` with the URI as `path` to search it without creating another
 artifact. Bash keeps a bounded head-and-tail
 preview and includes the artifact URI in its structured truncation metadata. Encrypted artifact
@@ -194,10 +194,10 @@ the first prompt's text, filename, or attachment type. Automatic and manual cont
 `agent.compaction.earlyCompactionPoint` (default `0.8`, range `0.05`-`0.95`).
 
 Each root and subagent run preloads workspace `AGENTS.md` files from its cwd upward through the Git
-root. Local `read_file` calls also load previously unseen `AGENTS.md` files between the target and
+root. Local `read` calls also load previously unseen `AGENTS.md` files between the target and
 the read cwd, so nested package rules enter context when the agent first reads inside that package.
 Instruction blocks identify their absolute source path and are not re-added after appearing in the
-system prompt or an earlier `read_file` result.
+system prompt or an earlier `read` result.
 
 Provider model metadata can override discovered models.dev or `/v1/models` values under
 `providers.<provider>.models.<model>`. Configured fields win while omitted fields keep their

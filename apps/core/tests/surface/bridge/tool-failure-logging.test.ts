@@ -31,9 +31,9 @@ describe("summarizeToolFailure", () => {
     expect(res.error).toContain("127");
   });
 
-  it("marks read_file success=false as soft failure", () => {
+  it("marks read success=false as soft failure", () => {
     const res = summarizeBuiltinFailure({
-      toolName: "read_file",
+      toolName: "read",
       isError: false,
       result: {
         success: false,

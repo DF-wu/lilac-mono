@@ -11,7 +11,7 @@ import { createToolResultOutputNormalizer } from "../../src/artifacts/tool-resul
 import { batchTool } from "../../src/tools/batch";
 import { fsTool } from "../../src/tools/fs/fs";
 
-describe("read_file attachments", () => {
+describe("read attachments", () => {
   let baseDir: string;
 
   function isAsyncIterable(value: unknown): value is AsyncIterable<unknown> {
@@ -99,31 +99,31 @@ describe("read_file attachments", () => {
   });
 
   it("advertises direct image and PDF reads only when enabled", () => {
-    const unsupportedDescription = getToolDescription(fsTool(baseDir).read_file);
+    const unsupportedDescription = getToolDescription(fsTool(baseDir).read);
     expect(unsupportedDescription).not.toContain("image");
     expect(unsupportedDescription).not.toContain("PDF");
     expect(unsupportedDescription).not.toContain("attachment");
 
     const supportedDescription = getToolDescription(
-      fsTool(baseDir, { readFileDirectAttachmentSupported: true }).read_file,
+      fsTool(baseDir, { readFileDirectAttachmentSupported: true }).read,
     );
     expect(supportedDescription).toContain(
-      "calling read_file attaches the original file to your context for native visual or document analysis",
+      "calling read attaches the original file to your context for native visual or document analysis",
     );
     expect(supportedDescription).toContain(
-      "Call read_file first for an image or PDF path, either directly or as an independent batch child",
+      "Call read first for an image or PDF path, either directly or as an independent batch child",
     );
     expect(supportedDescription).not.toContain("OCR");
     expect(supportedDescription).not.toContain("upstream provider");
   });
 
   it("describes native media paths and text-only options when enabled", () => {
-    const unsupported = getInputPropertyDescriptions(fsTool(baseDir).read_file);
+    const unsupported = getInputPropertyDescriptions(fsTool(baseDir).read);
     expect(unsupported.path).not.toContain("images");
     expect(unsupported.path).not.toContain("PDFs");
 
     const supported = getInputPropertyDescriptions(
-      fsTool(baseDir, { readFileDirectAttachmentSupported: true }).read_file,
+      fsTool(baseDir, { readFileDirectAttachmentSupported: true }).read,
     );
     expect(supported.path).toContain(
       "Supported images and PDFs are attached to your context for native visual or document analysis.",
@@ -140,7 +140,7 @@ describe("read_file attachments", () => {
       "base64",
     );
     await writeFile(path.join(baseDir, "unsupported.png"), png);
-    const readFile = fsTool(baseDir).read_file;
+    const readFile = fsTool(baseDir).read;
     const output = await resolveExecuteResult(
       readFile.execute!(
         { path: "unsupported.png" },
@@ -153,7 +153,7 @@ describe("read_file attachments", () => {
 
   it("rejects mislabeled attachment content and preserves failure semantics", async () => {
     await writeFile(path.join(baseDir, "fake.png"), "not an image");
-    const readFile = fsTool(baseDir, { readFileDirectAttachmentSupported: true }).read_file;
+    const readFile = fsTool(baseDir, { readFileDirectAttachmentSupported: true }).read;
     const output = await resolveExecuteResult(
       readFile.execute!(
         { path: "fake.png" },
@@ -179,7 +179,7 @@ describe("read_file attachments", () => {
     await writeFile(path.join(baseDir, "img.png"), pngBytes);
 
     const tools = fsTool(baseDir, { readFileDirectAttachmentSupported: true });
-    const readFile = tools.read_file;
+    const readFile = tools.read;
 
     expect(readFile.execute).toBeDefined();
     expect(readFile.toModelOutput).toBeDefined();
@@ -217,7 +217,7 @@ describe("read_file attachments", () => {
     await writeFile(path.join(baseDir, "doc.pdf"), pdf);
 
     const tools = fsTool(baseDir, { readFileDirectAttachmentSupported: true });
-    const readFile = tools.read_file;
+    const readFile = tools.read;
 
     expect(readFile.execute).toBeDefined();
     expect(readFile.toModelOutput).toBeDefined();
@@ -269,7 +269,7 @@ describe("read_file attachments", () => {
                 toolCallId: "batch-media",
                 toolName: "batch",
                 input: JSON.stringify({
-                  tool_calls: [{ tool: "read_file", parameters: { path: "batched.png" } }],
+                  tool_calls: [{ tool: "read", parameters: { path: "batched.png" } }],
                 }),
               },
               {
@@ -314,14 +314,12 @@ describe("read_file attachments", () => {
     const childResult = agent.state.messages.find(
       (message): message is ToolModelMessage =>
         message.role === "tool" &&
-        message.content.some(
-          (part) => part.type === "tool-result" && part.toolName === "read_file",
-        ),
+        message.content.some((part) => part.type === "tool-result" && part.toolName === "read"),
     );
     expect(childResult).toBeDefined();
     if (!childResult) return;
     const part = childResult.content.find(
-      (candidate) => candidate.type === "tool-result" && candidate.toolName === "read_file",
+      (candidate) => candidate.type === "tool-result" && candidate.toolName === "read",
     );
     expect(part?.type).toBe("tool-result");
     if (part?.type !== "tool-result") return;
@@ -344,7 +342,7 @@ describe("read_file attachments", () => {
     const readFile = fsTool(baseDir, {
       readFileDirectAttachmentSupported: true,
       maxInlineMediaBytesPerPart: 16,
-    }).read_file;
+    }).read;
 
     const output = await resolveExecuteResult(
       readFile.execute!(
@@ -365,7 +363,7 @@ describe("read_file attachments", () => {
     const readFile = fsTool(baseDir, {
       readFileDirectAttachmentSupported: true,
       maxInlineMediaBytesPerPart: 16,
-    }).read_file;
+    }).read;
 
     const output = await resolveExecuteResult(
       readFile.execute!(

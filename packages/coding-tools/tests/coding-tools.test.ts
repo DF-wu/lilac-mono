@@ -242,7 +242,7 @@ describe("coding tools", () => {
     expect(await readdir(cwd)).not.toContain("expanded-target");
     await expect(
       Promise.resolve().then(() =>
-        executable(tools, "read_file").execute(
+        executable(tools, "read").execute(
           { path: "marker.txt", dangerouslyAllow: true },
           options("filesystem-bypass-disabled"),
         ),
@@ -250,7 +250,7 @@ describe("coding tools", () => {
     ).rejects.toThrow("dangerouslyAllow is disabled");
     await expect(
       Promise.resolve().then(() =>
-        executable(tools, "edit_file").execute(
+        executable(tools, "edit").execute(
           {
             path: "marker.txt",
             oldText: "before",
@@ -263,7 +263,7 @@ describe("coding tools", () => {
     ).rejects.toThrow("dangerouslyAllow is disabled");
     await expect(
       Promise.resolve().then(() =>
-        executable(tools, "apply_patch").execute(
+        executable(tools, "patch").execute(
           {
             patchText: [
               "*** Begin Patch",
@@ -481,7 +481,7 @@ describe("coding tools", () => {
     expect(result.truncation.originalStdoutBytes).toBeGreaterThan(300);
     expect(result.truncation.originalStderrBytes).toBeGreaterThan(200);
 
-    const read = executable(tools, "read_file");
+    const read = executable(tools, "read");
     const pages: string[] = [];
     let start: { type: "offset"; offset: number } = { type: "offset", offset: 0 };
     for (let page = 0; page < 100; page += 1) {
@@ -774,7 +774,7 @@ describe("coding tools", () => {
     const tools = createCodingToolset({ cwd });
     await expect(
       Promise.resolve().then(() =>
-        executable(tools, "read_file").execute(
+        executable(tools, "read").execute(
           { path: "a.txt", cwd: "host:/repo" },
           options("read-ssh"),
         ),
@@ -782,7 +782,7 @@ describe("coding tools", () => {
     ).rejects.toThrow("local coding-tools adapter does not support SSH cwd target");
     await expect(
       Promise.resolve().then(() =>
-        executable(tools, "apply_patch").execute(
+        executable(tools, "patch").execute(
           {
             cwd: "host:/repo",
             patchText: "*** Begin Patch\n*** Delete File: a.txt\n*** End Patch",
@@ -814,7 +814,7 @@ describe("coding tools", () => {
     const serialized = JSON.stringify(readJsonSchema);
     expect(serialized).toContain('"hashline"');
     expect(serialized).toContain("runtime adapter has SSH configured");
-    const localEditSchema = createCodingToolset({ cwd }).edit_file?.inputSchema;
+    const localEditSchema = createCodingToolset({ cwd }).edit?.inputSchema;
     const localHashlineValidation = await asSchema(localEditSchema).validate?.({
       path: "a.ts",
       edits: [{ op: "replace", pos: "1#abcd", lines: ["next"] }],
@@ -822,9 +822,9 @@ describe("coding tools", () => {
     expect(localHashlineValidation?.success).toBe(false);
   });
 
-  it("read_file reads text and denies protected paths by default", async () => {
+  it("read reads text and denies protected paths by default", async () => {
     await writeFile(path.join(cwd, "hello.txt"), "hello\nworld\n");
-    const read = executable(createCodingToolset({ cwd }), "read_file");
+    const read = executable(createCodingToolset({ cwd }), "read");
     const result = await read.execute(
       { path: "hello.txt", format: "numbered", maxLines: 1 },
       options("read"),
@@ -842,7 +842,7 @@ describe("coding tools", () => {
         denyPaths: [protectedPath],
         allowGuardrailBypass: true,
       }),
-      "read_file",
+      "read",
     );
     const allowed = await protectedRead.execute(
       { path: protectedPath, dangerouslyAllow: true },
@@ -865,7 +865,7 @@ describe("coding tools", () => {
     await symlink(realDeniedDirectory, deniedDirectoryAlias);
     const symlinkedRootRead = executable(
       createCodingToolset({ cwd, denyPaths: [deniedDirectoryAlias] }),
-      "read_file",
+      "read",
     );
     expect(
       await symlinkedRootRead.execute(
@@ -877,7 +877,7 @@ describe("coding tools", () => {
 
   it("applies the configured UTF-8 payload cap independently of maxCharacters", async () => {
     await writeFile(path.join(cwd, "unicode.txt"), "A😀BéC");
-    const read = executable(createCodingToolset({ cwd, maxOutputBytes: 5 }), "read_file");
+    const read = executable(createCodingToolset({ cwd, maxOutputBytes: 5 }), "read");
 
     const result = await read.execute(
       { path: "unicode.txt", start: { type: "offset", offset: 0 }, maxCharacters: 100 },
@@ -892,7 +892,7 @@ describe("coding tools", () => {
     });
   });
 
-  it("read_file keeps image and PDF bytes out of its canonical result and attaches them for models", async () => {
+  it("read keeps image and PDF bytes out of its canonical result and attaches them for models", async () => {
     const attachments = [
       {
         filename: "pixel.png",
@@ -925,7 +925,7 @@ describe("coding tools", () => {
       readFileDirectAttachmentSupported: true,
       maxInlineMediaBytesPerPart: 128,
     });
-    const read = executable(tools, "read_file");
+    const read = executable(tools, "read");
 
     for (const [index, attachment] of attachments.entries()) {
       const toolCallId = `attachment-${index}`;
@@ -939,13 +939,13 @@ describe("coding tools", () => {
       });
       expect(JSON.stringify(result)).not.toContain(attachment.data.toString("base64"));
       expect(
-        await toModelOutput(tools, "read_file", toolCallId, { path: attachment.filename }, result),
+        await toModelOutput(tools, "read", toolCallId, { path: attachment.filename }, result),
       ).toEqual({
         type: "content",
         value: [
           {
             type: "text",
-            text: `Attached file from read_file: ${attachment.filename} (${attachment.mimeType}, ${attachment.data.byteLength} bytes).`,
+            text: `Attached file from read: ${attachment.filename} (${attachment.mimeType}, ${attachment.data.byteLength} bytes).`,
           },
           {
             type: "file",
@@ -956,10 +956,10 @@ describe("coding tools", () => {
         ],
       });
     }
-    expect(tools.read_file?.description).toContain("native visual or document analysis");
+    expect(tools.read?.description).toContain("native visual or document analysis");
   });
 
-  it("read_file preserves attachment instructions and reports consumed attachment bytes", async () => {
+  it("read preserves attachment instructions and reports consumed attachment bytes", async () => {
     const nestedDirectory = path.join(cwd, "nested");
     const image = Buffer.from(
       "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMB/axh8h0AAAAASUVORK5CYII=",
@@ -983,7 +983,7 @@ describe("coding tools", () => {
       })
       .passthrough()
       .parse(
-        await executable(tools, "read_file").execute(
+        await executable(tools, "read").execute(
           { path: "nested/pixel.png" },
           options("attachment-instructions"),
         ),
@@ -993,7 +993,7 @@ describe("coding tools", () => {
     expect(
       await toModelOutput(
         tools,
-        "read_file",
+        "read",
         "attachment-instructions",
         { path: "nested/pixel.png" },
         attachment,
@@ -1003,7 +1003,7 @@ describe("coding tools", () => {
       value: [
         {
           type: "text",
-          text: `Attached file from read_file: pixel.png (image/png, ${image.byteLength} bytes).`,
+          text: `Attached file from read: pixel.png (image/png, ${image.byteLength} bytes).`,
         },
         { type: "text", text: attachment.instructionsText.trim() },
         {
@@ -1017,7 +1017,7 @@ describe("coding tools", () => {
     expect(
       await toModelOutput(
         tools,
-        "read_file",
+        "read",
         "attachment-instructions",
         { path: "nested/pixel.png" },
         attachment,
@@ -1028,7 +1028,7 @@ describe("coding tools", () => {
     });
   });
 
-  it("read_file does not access or consume attachment state for malformed callback outputs", async () => {
+  it("read does not access or consume attachment state for malformed callback outputs", async () => {
     const image = Buffer.from(
       "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMB/axh8h0AAAAASUVORK5CYII=",
       "base64",
@@ -1039,7 +1039,7 @@ describe("coding tools", () => {
       loadInstructions: false,
       readFileDirectAttachmentSupported: true,
     });
-    const read = executable(tools, "read_file");
+    const read = executable(tools, "read");
     const validOutput = {
       success: true as const,
       kind: "attachment" as const,
@@ -1066,10 +1066,10 @@ describe("coding tools", () => {
       const toolCallId = `malformed-attachment-${index}`;
       await read.execute({ path: "pixel.png" }, options(toolCallId));
       expect(
-        await toModelOutput(tools, "read_file", toolCallId, { path: "pixel.png" }, malformedOutput),
+        await toModelOutput(tools, "read", toolCallId, { path: "pixel.png" }, malformedOutput),
       ).toEqual({ type: "json", value: malformedOutput });
       expect(
-        await toModelOutput(tools, "read_file", toolCallId, { path: "pixel.png" }, validOutput),
+        await toModelOutput(tools, "read", toolCallId, { path: "pixel.png" }, validOutput),
       ).toMatchObject({
         type: "content",
         value: [
@@ -1087,7 +1087,7 @@ describe("coding tools", () => {
     expect(
       await toModelOutput(
         tools,
-        "read_file",
+        "read",
         "malformed-failure",
         { path: "missing.txt" },
         malformedFailure,
@@ -1095,17 +1095,17 @@ describe("coding tools", () => {
     ).toEqual({ type: "json", value: malformedFailure });
   });
 
-  it("read_file rejects mislabeled attachments and projects structured failures as errors", async () => {
+  it("read rejects mislabeled attachments and projects structured failures as errors", async () => {
     await writeFile(path.join(cwd, "fake.png"), "not an image");
     const tools = createCodingToolset({ cwd, readFileDirectAttachmentSupported: true });
-    const read = executable(tools, "read_file");
+    const read = executable(tools, "read");
     const mislabeled = await read.execute({ path: "fake.png" }, options("fake-image"));
     expect(mislabeled).toMatchObject({ success: false });
     expect(JSON.stringify(mislabeled)).toContain("not a supported image or PDF");
 
     const missing = await read.execute({ path: "missing.txt" }, options("missing-read"));
     expect(
-      await toModelOutput(tools, "read_file", "missing-read", { path: "missing.txt" }, missing),
+      await toModelOutput(tools, "read", "missing-read", { path: "missing.txt" }, missing),
     ).toMatchObject({ type: "error-json", value: { success: false } });
   });
 
@@ -1118,10 +1118,10 @@ describe("coding tools", () => {
     }
   });
 
-  it("read_file enables media explicitly and enforces the decoded per-part byte limit", async () => {
+  it("read enables media explicitly and enforces the decoded per-part byte limit", async () => {
     await writeFile(path.join(cwd, "large.webp"), Buffer.alloc(17));
     const textOnly = createCodingToolset({ cwd });
-    expect(textOnly.read_file?.description).not.toContain("native visual or document analysis");
+    expect(textOnly.read?.description).not.toContain("native visual or document analysis");
 
     const read = executable(
       createCodingToolset({
@@ -1129,7 +1129,7 @@ describe("coding tools", () => {
         readFileDirectAttachmentSupported: true,
         maxInlineMediaBytesPerPart: 16,
       }),
-      "read_file",
+      "read",
     );
     const result = await read.execute({ path: "large.webp" }, options("large-image"));
     expect(result).toMatchObject({ success: false });
@@ -1161,7 +1161,7 @@ describe("coding tools", () => {
           requestId: "request-read",
         },
       }),
-      "read_file",
+      "read",
     );
     const first = await read.execute(
       {
@@ -1196,7 +1196,7 @@ describe("coding tools", () => {
           requestId: "request-foreign",
         },
       }),
-      "read_file",
+      "read",
     ).execute({ path: created.value.uri }, options("read-artifact-foreign"));
     expect(foreign).toMatchObject({
       success: false,
@@ -1204,7 +1204,7 @@ describe("coding tools", () => {
       error: { code: "UNKNOWN", message: TOOL_RESULT_UNAVAILABLE_MESSAGE },
     });
 
-    const unavailable = await executable(createCodingToolset({ cwd }), "read_file").execute(
+    const unavailable = await executable(createCodingToolset({ cwd }), "read").execute(
       { path: created.value.uri },
       options("read-artifact-no-authority"),
     );
@@ -1294,7 +1294,7 @@ describe("coding tools", () => {
           requestId: "request-read",
         },
       }),
-      "read_file",
+      "read",
     ).execute({ path: created.value.uri }, options("read-expired-artifact"));
 
     expect(result).toMatchObject({
@@ -1304,7 +1304,7 @@ describe("coding tools", () => {
     expect(await readdir(artifacts.rootDir)).toEqual([]);
   });
 
-  it("preloads workspace AGENTS.md and adds only nested instructions to read_file", async () => {
+  it("preloads workspace AGENTS.md and adds only nested instructions to read", async () => {
     const packageDirectory = path.join(cwd, "packages", "widget");
     const nestedDirectory = path.join(packageDirectory, "src");
     await mkdir(path.join(cwd, ".git"));
@@ -1326,8 +1326,8 @@ describe("coding tools", () => {
       cwd: packageDirectory,
       preloadedInstructionPaths: workspace?.loaded,
     });
-    expect(tools.read_file?.description).toContain("AGENTS.md");
-    const read = executable(tools, "read_file");
+    expect(tools.read?.description).toContain("AGENTS.md");
+    const read = executable(tools, "read");
     const first = z
       .object({
         success: z.literal(true),
@@ -1352,7 +1352,7 @@ describe("coding tools", () => {
           content: [
             {
               type: "tool-result",
-              toolName: "read_file",
+              toolName: "read",
               output: { type: "json", value: first },
             },
           ],
@@ -1371,7 +1371,7 @@ describe("coding tools", () => {
           content: [
             {
               type: "tool-result",
-              toolName: "read_file",
+              toolName: "read",
               output: {
                 type: "content",
                 value: [{ type: "text", text: first.instructionsText }],
@@ -1388,7 +1388,7 @@ describe("coding tools", () => {
         cwd: packageDirectory,
         preloadedInstructionPaths: workspace?.loaded,
       }),
-      "read_file",
+      "read",
     );
     const concurrentOptions = options("read-concurrent-1");
     const concurrent = await Promise.all([
@@ -1432,7 +1432,7 @@ describe("coding tools", () => {
       const aliasedInstructions = path.join(nestedDirectory, "rules.md");
       await writeFile(aliasedInstructions, "Aliased rules.\n");
       await symlink(aliasedInstructions, path.join(nestedDirectory, "AGENTS.md"));
-      const direct = await executable(createCodingToolset({ cwd }), "read_file").execute(
+      const direct = await executable(createCodingToolset({ cwd }), "read").execute(
         { path: "nested/AGENTS.md" },
         options("read-symlinked-agents"),
       );
@@ -1476,17 +1476,17 @@ describe("coding tools", () => {
     expect(result).toMatchObject({ results: expect.any(Array) });
   });
 
-  it("edit_file requires read_file and uses legacy replace-snippet semantics", async () => {
+  it("edit requires read and uses legacy replace-snippet semantics", async () => {
     await writeFile(path.join(cwd, "edit.txt"), "before\n");
     const tools = createCodingToolset({ cwd });
-    const edit = executable(tools, "edit_file");
+    const edit = executable(tools, "edit");
     const notRead = await edit.execute(
       { path: "edit.txt", oldText: "before", newText: "after" },
       options("edit-not-read"),
     );
     expect(notRead).toMatchObject({ success: false, error: { code: "NOT_READ" } });
 
-    await executable(tools, "read_file").execute({ path: "edit.txt" }, options("edit-read"));
+    await executable(tools, "read").execute({ path: "edit.txt" }, options("edit-read"));
     const edited = await edit.execute(
       { path: "edit.txt", oldText: "before", newText: "after" },
       options("edit"),
@@ -1495,7 +1495,7 @@ describe("coding tools", () => {
     expect(await readFile(path.join(cwd, "edit.txt"), "utf8")).toBe("after\n");
   });
 
-  it("apply_patch supports add, update, move, delete and refuses directory deletes", async () => {
+  it("patch supports add, update, move, delete and refuses directory deletes", async () => {
     await writeFile(path.join(cwd, "old.txt"), "old\n");
     const blockedPath = path.join(cwd, "blocked.txt");
     const applyPatch = executable(
@@ -1504,7 +1504,7 @@ describe("coding tools", () => {
         denyPaths: [blockedPath],
         allowGuardrailBypass: true,
       }),
-      "apply_patch",
+      "patch",
     );
     const patchText = [
       "*** Begin Patch",
@@ -1566,13 +1566,13 @@ describe("coding tools", () => {
     expect(await readFile(path.join(cwd, "trailing-empty.txt"), "utf8")).toBe("changed\n");
   });
 
-  it("apply_patch rejects add, update, and delete through a symlink into a denied directory", async () => {
+  it("patch rejects add, update, and delete through a symlink into a denied directory", async () => {
     const denied = path.join(cwd, "denied");
     await mkdir(denied);
     await writeFile(path.join(denied, "update.txt"), "before\n");
     await writeFile(path.join(denied, "delete.txt"), "keep\n");
     await symlink(denied, path.join(cwd, "workspace-link"), "dir");
-    const applyPatch = executable(createCodingToolset({ cwd, denyPaths: [denied] }), "apply_patch");
+    const applyPatch = executable(createCodingToolset({ cwd, denyPaths: [denied] }), "patch");
     const patches = [
       ["*** Begin Patch", "*** Add File: workspace-link/added.txt", "+blocked", "*** End Patch"],
       [
@@ -1601,7 +1601,7 @@ describe("coding tools", () => {
     expect(await readFile(path.join(denied, "delete.txt"), "utf8")).toBe("keep\n");
   });
 
-  it("apply_patch honors AbortSignal before starting later hunks", async () => {
+  it("patch honors AbortSignal before starting later hunks", async () => {
     const controller = new AbortController();
     let abortedReads = 0;
     const abortSignal = new Proxy(controller.signal, {
@@ -1625,7 +1625,7 @@ describe("coding tools", () => {
 
     await expect(
       Promise.resolve().then(() =>
-        executable(createCodingToolset({ cwd }), "apply_patch").execute(
+        executable(createCodingToolset({ cwd }), "patch").execute(
           { patchText },
           options("patch-abort", abortSignal),
         ),
@@ -1633,7 +1633,7 @@ describe("coding tools", () => {
     ).rejects.toMatchObject({
       _tag: "PatchAbortedAfterCommit",
       retrySafe: false,
-      message: expect.stringContaining("apply_patch aborted"),
+      message: expect.stringContaining("patch aborted"),
       committedMutations: expect.arrayContaining([
         { type: "file-written", path: path.join(cwd, "first.txt") },
       ]),
@@ -1700,7 +1700,7 @@ describe("coding tools", () => {
     const filesystemRoot = path.parse(cwd).root;
     const tools = createCodingToolset({ cwd, denyPaths: [filesystemRoot] });
 
-    const read = await executable(tools, "read_file").execute(
+    const read = await executable(tools, "read").execute(
       { path: "blocked.txt" },
       options("root-deny-read"),
     );
@@ -1718,7 +1718,7 @@ describe("coding tools", () => {
     );
     expect(grep).toMatchObject({ results: [], error: expect.stringContaining("Access denied") });
 
-    const edit = await executable(tools, "edit_file").execute(
+    const edit = await executable(tools, "edit").execute(
       { path: "blocked.txt", oldText: "blocked", newText: "changed" },
       options("root-deny-edit"),
     );
@@ -1732,7 +1732,7 @@ describe("coding tools", () => {
 
     await expect(
       Promise.resolve(
-        executable(tools, "apply_patch").execute(
+        executable(tools, "patch").execute(
           {
             patchText: [
               "*** Begin Patch",
@@ -1790,11 +1790,11 @@ describe("coding tools", () => {
           {
             tool_calls: [
               {
-                tool: "edit_file",
+                tool: "edit",
                 parameters: { path: "same.txt", oldText: "a", newText: "b" },
               },
               {
-                tool: "edit_file",
+                tool: "edit",
                 parameters: { path: "same.txt", oldText: "b", newText: "c" },
               },
             ],
@@ -1938,7 +1938,7 @@ describe("coding tools", () => {
   it("keeps filtered tools out of a read-only profile and its batch", async () => {
     const tools = createCodingToolset({
       cwd,
-      enabledTools: ["read_file", "glob", "grep", "batch"],
+      enabledTools: ["read", "glob", "grep", "batch"],
       extraTools: {
         custom_tool: tool({
           inputSchema: z.object({ value: z.string() }),
@@ -1946,8 +1946,8 @@ describe("coding tools", () => {
         }),
       },
     });
-    expect(Object.keys(tools).sort()).toEqual(["batch", "glob", "grep", "read_file"]);
-    expect(createCodingToolset({ cwd, enabledTools: ["read_file"] }).batch).toBeUndefined();
+    expect(Object.keys(tools).sort()).toEqual(["batch", "glob", "grep", "read"]);
+    expect(createCodingToolset({ cwd, enabledTools: ["read"] }).batch).toBeUndefined();
 
     const wildcardTools = createCodingToolset({
       cwd,
@@ -1965,7 +1965,7 @@ describe("coding tools", () => {
 
     const excludedFromBatch = createCodingToolset({
       cwd,
-      enabledTools: ["read_file", "custom_tool", "batch"],
+      enabledTools: ["read", "custom_tool", "batch"],
       batchExcludedTools: ["custom_tool"],
       extraTools: {
         custom_tool: tool({
@@ -1997,11 +1997,11 @@ describe("coding tools", () => {
       };
     };
     const exposedNames = schemaShape.properties?.tool_calls?.items?.properties?.tool?.enum ?? [];
-    expect(exposedNames.sort()).toEqual(["glob", "grep", "read_file"]);
+    expect(exposedNames.sort()).toEqual(["glob", "grep", "read"]);
 
     const expansion = await executable(tools, "batch").execute(
       {
-        tool_calls: ["bash", "edit_file", "apply_patch"].map((name) => ({
+        tool_calls: ["bash", "edit", "patch"].map((name) => ({
           tool: name,
           parameters: {},
         })),
@@ -2014,7 +2014,40 @@ describe("coding tools", () => {
     expect(expansion.children.every((child) => child.invalid === true)).toBe(true);
   });
 
-  it("rejects dangerouslyAllow by default for bash, filesystem, edit, and apply_patch", async () => {
+  it("normalizes legacy child names without advertising them in batch", async () => {
+    const tools = createCodingToolset({ cwd, enabledTools: ["read", "batch"] });
+    const schema = JSON.stringify(await asSchema(tools.batch?.inputSchema).jsonSchema);
+    expect(schema).toContain('"read"');
+    expect(schema).not.toContain("read_file");
+
+    const expansion = await executable(tools, "batch").execute(
+      { tool_calls: [{ tool: "read_file", parameters: { path: "missing.txt" } }] },
+      options("legacy-read-child"),
+    );
+    expect(isToolExpansion(expansion)).toBe(true);
+    if (!isToolExpansion(expansion)) throw new Error("expected ToolExpansion");
+    expect(expansion.children[0]?.toolName).toBe("read");
+  });
+
+  it("prefers an exact legacy-named batch child over the compatibility alias", async () => {
+    const tools = createCodingToolset({
+      cwd,
+      enabledTools: ["read", "read_file", "batch"],
+      extraTools: {
+        read_file: tool({ inputSchema: z.object({}), execute: () => "legacy" }),
+      },
+    });
+
+    const expansion = await executable(tools, "batch").execute(
+      { tool_calls: [{ tool: "read_file", parameters: {} }] },
+      options("exact-legacy-read-child"),
+    );
+    expect(isToolExpansion(expansion)).toBe(true);
+    if (!isToolExpansion(expansion)) throw new Error("expected ToolExpansion");
+    expect(expansion.children[0]?.toolName).toBe("read_file");
+  });
+
+  it("rejects dangerouslyAllow by default for bash, filesystem, edit, and patch", async () => {
     await writeFile(path.join(cwd, "guarded.txt"), "before\n");
     const tools = createCodingToolset({ cwd });
     const calls = [
@@ -2024,12 +2057,12 @@ describe("coding tools", () => {
           options("bypass-bash"),
         ),
       () =>
-        executable(tools, "read_file").execute(
+        executable(tools, "read").execute(
           { path: "guarded.txt", dangerouslyAllow: true },
           options("bypass-read"),
         ),
       () =>
-        executable(tools, "edit_file").execute(
+        executable(tools, "edit").execute(
           {
             path: "guarded.txt",
             oldText: "before",
@@ -2039,7 +2072,7 @@ describe("coding tools", () => {
           options("bypass-edit"),
         ),
       () =>
-        executable(tools, "apply_patch").execute(
+        executable(tools, "patch").execute(
           {
             patchText: [
               "*** Begin Patch",

@@ -304,13 +304,13 @@ function checkAborted(
 ): ResultType<void, PatchAborted | PatchAbortedAfterCommit> {
   if (!abortSignal?.aborted) return Result.ok(undefined);
   if (committedMutations.length === 0) {
-    return Result.err(new PatchAborted({ message: "apply_patch aborted" }));
+    return Result.err(new PatchAborted({ message: "patch aborted" }));
   }
   return Result.err(
     new PatchAbortedAfterCommit({
       committedMutations: [...committedMutations],
       message:
-        "apply_patch aborted after filesystem changes were committed; do not retry the patch without inspecting the listed mutations",
+        "patch aborted after filesystem changes were committed; do not retry the patch without inspecting the listed mutations",
       retrySafe: false,
     }),
   );
@@ -356,7 +356,7 @@ export async function applyPatchResult(params: {
       const allowed = await patchPathAllowed({
         targetPath: source,
         denyPaths: params.denyPaths,
-        operation: "apply_patch add",
+        operation: "patch add",
         dangerouslyAllow: params.dangerouslyAllow,
       });
       if (allowed.status === "error") return Result.err(allowed.error);
@@ -377,7 +377,7 @@ export async function applyPatchResult(params: {
       const allowedAfterCreate = await patchPathAllowed({
         targetPath: source,
         denyPaths: params.denyPaths,
-        operation: "apply_patch add",
+        operation: "patch add",
         dangerouslyAllow: params.dangerouslyAllow,
       });
       if (allowedAfterCreate.status === "error") return Result.err(allowedAfterCreate.error);
@@ -397,7 +397,7 @@ export async function applyPatchResult(params: {
       const allowed = await patchPathAllowed({
         targetPath: source,
         denyPaths: params.denyPaths,
-        operation: "apply_patch delete",
+        operation: "patch delete",
         dangerouslyAllow: params.dangerouslyAllow,
       });
       if (allowed.status === "error") return Result.err(allowed.error);
@@ -412,7 +412,7 @@ export async function applyPatchResult(params: {
       const allowedBeforeDelete = await patchPathAllowed({
         targetPath: source,
         denyPaths: params.denyPaths,
-        operation: "apply_patch delete",
+        operation: "patch delete",
         dangerouslyAllow: params.dangerouslyAllow,
       });
       if (allowedBeforeDelete.status === "error") return Result.err(allowedBeforeDelete.error);
@@ -435,7 +435,7 @@ export async function applyPatchResult(params: {
     const sourceAllowed = await patchPathAllowed({
       targetPath: source,
       denyPaths: params.denyPaths,
-      operation: "apply_patch update read",
+      operation: "patch update read",
       dangerouslyAllow: params.dangerouslyAllow,
     });
     if (sourceAllowed.status === "error") return Result.err(sourceAllowed.error);
@@ -448,7 +448,7 @@ export async function applyPatchResult(params: {
     const destinationAllowed = await patchPathAllowed({
       targetPath: destination,
       denyPaths: params.denyPaths,
-      operation: "apply_patch update write",
+      operation: "patch update write",
       dangerouslyAllow: params.dangerouslyAllow,
     });
     if (destinationAllowed.status === "error") return Result.err(destinationAllowed.error);
@@ -469,7 +469,7 @@ export async function applyPatchResult(params: {
     const destinationAllowedAfterCreate = await patchPathAllowed({
       targetPath: destination,
       denyPaths: params.denyPaths,
-      operation: "apply_patch update write",
+      operation: "patch update write",
       dangerouslyAllow: params.dangerouslyAllow,
     });
     if (destinationAllowedAfterCreate.status === "error") {
@@ -488,7 +488,7 @@ export async function applyPatchResult(params: {
       const sourceDeleteAllowed = await patchPathAllowed({
         targetPath: source,
         denyPaths: params.denyPaths,
-        operation: "apply_patch move delete",
+        operation: "patch move delete",
         dangerouslyAllow: params.dangerouslyAllow,
       });
       if (sourceDeleteAllowed.status === "error") return Result.err(sourceDeleteAllowed.error);
@@ -525,7 +525,7 @@ export function createApplyPatchTool(params: {
   allowGuardrailBypass?: boolean;
 }): ToolSet {
   return {
-    apply_patch: tool({
+    patch: tool({
       description:
         "Apply a local *** Begin Patch with Add, Delete, Update, and optional Move to sections. Directory deletion is refused.",
       inputSchema: applyPatchInputSchema,

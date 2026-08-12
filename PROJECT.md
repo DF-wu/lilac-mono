@@ -2,7 +2,7 @@
 
 This repo is an event-driven “agent runtime” built around a typed event bus (Redis Streams), Discord and GitHub surface adapters, and **layered tools** that are **progressively disclosed** to the agent:
 
-- Level 1 (direct AI SDK tools): low-level local tools the LLM can call during generation (`bash`, `read_file`, `glob`, `grep`, `apply_patch`, `batch`, and `subagent_delegate` when enabled).
+- Level 1 (direct AI SDK tools): low-level local tools the LLM can call during generation (`bash`, `read`, `glob`, `grep`, `edit` or `patch`, `batch`, and `subagent_delegate` when enabled).
 - Level 2 (tool server + `tools` CLI): a stable HTTP tool API (Elysia) exposed via the `tools` CLI (and usable by the agent through `bash`).
 - Level 3 (skills): higher-level, file-based “skill bundles” discovered on disk and loaded on-demand.
 
@@ -392,8 +392,8 @@ There are three tool “levels”. They all serve the agent; higher levels are u
          - Optional host: `GH_HOST`.
          - Explicit alternates: `LILAC_GITHUB_USER_TOKEN`, `LILAC_GITHUB_USER_HOST`, `LILAC_GITHUB_APP_TOKEN`, `LILAC_GITHUB_APP_HOST`.
          - This allows command-level override to app auth when needed (for example: `GH_TOKEN="$LILAC_GITHUB_APP_TOKEN" gh ...`).
-     - `read_file`, `glob`, `grep` (`apps/core/src/tools/fs/fs.ts`) (normal-operation denylists include `DATA_DIR/secret`, including MCP OAuth credentials, plus `~/.ssh`, `~/.aws`, and `~/.gnupg` unless `dangerouslyAllow=true`).
-     - `apply_patch` (`apps/core/src/tools/apply-patch/index.ts`) (format docs: `apps/core/src/tools/apply-patch/README.md`; remote denylist can be bypassed with `dangerouslyAllow=true`).
+     - `read`, `glob`, `grep` (`apps/core/src/tools/fs/fs.ts`) (normal-operation denylists include `DATA_DIR/secret`, including MCP OAuth credentials, plus `~/.ssh`, `~/.aws`, and `~/.gnupg` unless `dangerouslyAllow=true`).
+     - `edit` or `patch`, selected for the active model (`apps/core/src/tools/fs/fs.ts` and `apps/core/src/tools/apply-patch/index.ts`; patch format docs: `apps/core/src/tools/apply-patch/README.md`; the remote denylist can be bypassed with `dangerouslyAllow=true`).
      - `batch` (`apps/core/src/tools/batch.ts`) expands one call into ordinary synthetic Level 1 tool-call/result pairs.
      - `subagent_delegate` (`apps/core/src/tools/subagent.ts`) when `agent.subagents` is enabled and depth limits allow delegation. Its model argument is generated from agent-selectable `models.def` aliases, with optional per-call reasoning overrides and config-authored routing guidance.
 

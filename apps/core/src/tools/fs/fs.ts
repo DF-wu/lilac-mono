@@ -363,7 +363,7 @@ function stripGrepMetadata(output: GrepOutput & SearchBackendMetadata): GrepOutp
 }
 
 const SEARCH_TRUNCATION_HINT =
-  "Search output reached the serialized-size limit. Narrow the query or inspect source files with read_file.";
+  "Search output reached the serialized-size limit. Narrow the query or inspect source files with read.";
 
 function buildInlineMediaLimitMessage(params: {
   filename: string;
@@ -517,7 +517,7 @@ const instructionFieldsZod = z.object({
   loadedInstructions: z
     .array(z.string())
     .optional()
-    .describe("Instruction file paths loaded for this read_file call"),
+    .describe("Instruction file paths loaded for this read call"),
   instructionsText: z
     .string()
     .optional()
@@ -795,10 +795,10 @@ export function fsTool(
     let introduction: string;
     if (readFileDirectAttachmentSupported) {
       introduction =
-        "Reads files from the filesystem. For supported images and PDFs, calling read_file attaches the original file to your context for native visual or document analysis. Call read_file first for an image or PDF path, either directly or as an independent batch child; use shell media processing only if read_file reports that the input is unsupported or oversized.";
+        "Reads files from the filesystem. For supported images and PDFs, calling read attaches the original file to your context for native visual or document analysis. Call read first for an image or PDF path, either directly or as an independent batch child; use shell media processing only if read reports that the input is unsupported or oversized.";
     } else if (hashlineEnabled) {
       introduction =
-        "Reads a file from the filesystem. Default format is raw to preserve indentation. Use format='hashline' before edit_file when you need stable edit anchors. Very long lines may downgrade the response back to raw with a warning that tells you to use bash instead.";
+        "Reads a file from the filesystem. Default format is raw to preserve indentation. Use format='hashline' before edit when you need stable edit anchors. Very long lines may downgrade the response back to raw with a warning that tells you to use bash instead.";
     } else {
       introduction =
         "Reads a file from the filesystem. Default format is raw (no line numbers) to preserve indentation.";
@@ -807,7 +807,7 @@ export function fsTool(
 
     if (readFileDirectAttachmentSupported && hashlineEnabled) {
       parts.push(
-        "For text files, default format is raw to preserve indentation. Use format='hashline' before edit_file when you need stable edit anchors. Very long lines may downgrade the response back to raw with a warning that tells you to use bash instead.",
+        "For text files, default format is raw to preserve indentation. Use format='hashline' before edit when you need stable edit anchors. Very long lines may downgrade the response back to raw with a warning that tells you to use bash instead.",
       );
     } else if (readFileDirectAttachmentSupported) {
       parts.push(
@@ -882,7 +882,7 @@ export function fsTool(
   }
 
   const baseTools = {
-    read_file: tool({
+    read: tool({
       description: buildReadFileDescription(),
       inputSchema: readFileSchema,
       outputSchema: readFileOutputSchema,
@@ -932,7 +932,7 @@ export function fsTool(
             resolvedPath: input.path,
             error: {
               code: "PERMISSION" as const,
-              message: "Restricted sessions can use read_file only with tool-result:// artifacts.",
+              message: "Restricted sessions can use read only with tool-result:// artifacts.",
             },
           };
         }
@@ -1251,7 +1251,7 @@ export function fsTool(
           base64 = Buffer.from(bytesRes.bytes).toString("base64");
         }
 
-        const intro = `Attached file from read_file: ${filename} (${mimeType}, ${output.bytes} bytes).`;
+        const intro = `Attached file from read: ${filename} (${mimeType}, ${output.bytes} bytes).`;
 
         const instructionsText = output.instructionsText;
         const instructionParts =
@@ -1611,9 +1611,9 @@ export function fsTool(
 
   return {
     ...baseTools,
-    edit_file: tool({
+    edit: tool({
       description: hashlineEnabled
-        ? "Edit an existing file using hashline anchors from read_file(format='hashline') or grep(mode='hashline'). Batch all edits for the file into one call, then re-read before any further edits. edit_file also checks the file hash from your prior read so unrelated external modifications are rejected. Very long lines may prevent hashline anchoring and require bash instead. Denylisted paths require dangerouslyAllow=true."
+        ? "Edit an existing file using hashline anchors from read(format='hashline') or grep(mode='hashline'). Batch all edits for the file into one call, then re-read before any further edits. edit also checks the file hash from your prior read so unrelated external modifications are rejected. Very long lines may prevent hashline anchoring and require bash instead. Denylisted paths require dangerouslyAllow=true."
         : "Edit a file by find-and-replace. By default, oldText must be unique in the file. Set replaceAll=true to update all matches. Denylisted paths require dangerouslyAllow=true.",
       inputSchema: editFileSchema,
       outputSchema: editFileOutputZod,

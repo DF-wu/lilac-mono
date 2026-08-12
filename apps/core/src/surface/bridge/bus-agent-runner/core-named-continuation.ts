@@ -151,7 +151,7 @@ function semanticFingerprint(value: unknown): string {
 }
 
 function normalizeDirectToolAuthorityName(name: string): string {
-  return name === "apply_patch" || name === "edit_file" ? "workspace_edit" : name;
+  return name === "patch" || name === "edit" ? "workspace_edit" : name;
 }
 
 export function hashCoreNamedExecutionScope(input: {

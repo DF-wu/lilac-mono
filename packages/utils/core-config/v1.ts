@@ -768,7 +768,7 @@ function coreConfigV1ToUniversal(
           explore: {
             ...subagents.profiles.explore,
             level1: {
-              tools: ["read_file", "glob", "grep", "fuzzy_search", "batch"],
+              tools: ["read", "glob", "grep", "fuzzy_search", "batch"],
               plugins: ["builtin-local-tools"],
             },
             level2: {

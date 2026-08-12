@@ -12,11 +12,56 @@ import { asSchema, type ToolSet } from "ai";
 import type { ClaudeCodeSettings } from "ai-sdk-provider-claude-code";
 import { Panic, Result, TaggedError, type Result as ResultType } from "better-result";
 import path from "node:path";
+import { z } from "zod";
 
 const SERVER_NAME = "lilac";
 const NAMESPACED_PREFIX = `mcp__${SERVER_NAME}__`;
 const CORRELATION_TTL_MS = 5 * 60_000;
 const MAX_PENDING_CORRELATIONS = 256;
+
+function canonicalLilacToolName(name: string): string {
+  switch (name) {
+    case "read_file":
+      return "read";
+    case "edit_file":
+      return "edit";
+    case "apply_patch":
+      return "patch";
+    default:
+      return name;
+  }
+}
+
+const legacyBatchArgumentsSchema = z.object({
+  tool_calls: z.array(
+    z.object({
+      tool: z.string(),
+      parameters: z.record(z.string(), z.unknown()).optional(),
+    }),
+  ),
+});
+
+export function normalizeLegacyBatchArguments(
+  input: Record<string, unknown>,
+  exposedNames: ReadonlySet<string>,
+): Record<string, unknown> {
+  const decoded = legacyBatchArgumentsSchema.safeParse(input);
+  if (!decoded.success) return input;
+  let changed = false;
+  const toolCalls = decoded.data.tool_calls.map((call) => {
+    const requestedName = call.tool;
+    const toolName = exposedNames.has(requestedName)
+      ? requestedName
+      : canonicalLilacToolName(requestedName);
+    if (toolName === requestedName || !exposedNames.has(toolName)) return call;
+    changed = true;
+    return {
+      tool: toolName,
+      ...(call.parameters === undefined ? {} : { parameters: call.parameters }),
+    };
+  });
+  return changed ? { ...decoded.data, tool_calls: toolCalls } : input;
+}
 
 type CanUseTool = NonNullable<ClaudeCodeSettings["canUseTool"]>;
 type McpServers = NonNullable<ClaudeCodeSettings["mcpServers"]>;
@@ -498,12 +543,15 @@ export async function createClaudeCodeToolBridgeResult(options: {
 
   server.server.setRequestHandler(ListToolsRequestSchema, () => ({ tools: declarations }));
   server.server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
-    const toolName = request.params.name;
+    const requestedName = request.params.name;
+    const toolName = exposedNames.has(requestedName)
+      ? requestedName
+      : canonicalLilacToolName(requestedName);
     const validate = validators.get(toolName);
     if (!validate || !exposedNames.has(toolName))
       return toolError(`Unknown Lilac tool '${toolName}'`);
 
-    const rawInput = { ...request.params.arguments };
+    let rawInput = { ...request.params.arguments };
     const nonce = rawInput[nonceKey];
     delete rawInput[nonceKey];
     if (typeof nonce !== "string") {
@@ -518,6 +566,7 @@ export async function createClaudeCodeToolBridgeResult(options: {
     if (now() - correlation.createdAt > CORRELATION_TTL_MS) {
       return toolError(`Lilac tool '${toolName}' has expired execution correlation`);
     }
+    if (toolName === "batch") rawInput = normalizeLegacyBatchArguments(rawInput, exposedNames);
 
     const validation = await validate(rawInput);
     if (!validation.success) {
@@ -564,7 +613,10 @@ export async function createClaudeCodeToolBridgeResult(options: {
       if (allowedBuiltIns.has(toolName)) return { behavior: "allow", updatedInput: input };
       return { behavior: "deny", message: `Claude built-in tool '${toolName}' is disabled` };
     }
-    const localName = toolName.slice(NAMESPACED_PREFIX.length);
+    const requestedName = toolName.slice(NAMESPACED_PREFIX.length);
+    const localName = exposedNames.has(requestedName)
+      ? requestedName
+      : canonicalLilacToolName(requestedName);
     if (!exposedNames.has(localName)) {
       return { behavior: "deny", message: `Unknown Lilac tool '${localName}'` };
     }
@@ -624,6 +676,6 @@ export async function createClaudeCodeToolBridge(
 
 export function displayClaudeCodeToolName(toolName: string): string {
   return toolName.startsWith(NAMESPACED_PREFIX)
-    ? toolName.slice(NAMESPACED_PREFIX.length)
+    ? canonicalLilacToolName(toolName.slice(NAMESPACED_PREFIX.length))
     : toolName;
 }

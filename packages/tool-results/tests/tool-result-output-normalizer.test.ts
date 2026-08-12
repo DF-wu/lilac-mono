@@ -209,7 +209,7 @@ describe("tool result output normalizer", () => {
           output: { type: "text", value: exempt },
           context: {
             toolCallId: "trusted-read",
-            toolName: "read_file",
+            toolName: "read",
             bypassGenericOutputNormalizer: true,
             aggregateOutputBudgetExempt: true,
           },
@@ -275,7 +275,7 @@ describe("tool result output normalizer", () => {
       "quoted prefix",
       "[tool result overflow]",
       "Complete output: tool-result://00000000-0000-0000-0000-000000000000",
-      'Use read_file with this URI and start: { "type": "offset", "offset": 0 }. Reuse nextStart unchanged while more content remains.',
+      'Use read with this URI and start: { "type": "offset", "offset": 0 }. Reuse nextStart unchanged while more content remains.',
     ].join("\n");
     const quoted = await normalize(
       { type: "text", value: quotedEnvelope },
@@ -412,7 +412,7 @@ describe("tool result output normalizer", () => {
     });
     const normalized = await normalize(
       { type: "json", value: { content: "x".repeat(100) } },
-      { toolCallId: "external", toolName: "read_file" },
+      { toolCallId: "external", toolName: "read" },
     );
     expect(normalized.type).toBe("text");
     expect(await readdir(artifacts.rootDir)).toHaveLength(2);

@@ -1,5 +1,5 @@
 const GREP_TRUNCATION_HINT =
-  "Search output reached the inline limit. Narrow the query or inspect the source with read_file.";
+  "Search output reached the inline limit. Narrow the query or inspect the source with read.";
 
 type GrepOutputEntry = {
   file: string;

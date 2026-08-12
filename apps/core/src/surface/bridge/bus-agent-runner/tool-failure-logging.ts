@@ -157,7 +157,7 @@ export function summarizeApplyPatchFailure(result: unknown): ToolFailureSummary 
     return {
       ok: false,
       failureKind: "soft",
-      error: output ?? "apply_patch failed",
+      error: output ?? "patch failed",
     };
   }
   return { ok: true };

@@ -7148,6 +7148,25 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
             },
           ] satisfies readonly BoundaryDecoder[])
         : []),
+      ...(root === "packages/agent"
+        ? ([
+            {
+              identity: { module: "ai-sdk-pi-agent.ts", exportName: "repairLegacyBatchInput" },
+              category: "request",
+            },
+          ] satisfies readonly BoundaryDecoder[])
+        : []),
+      ...(root === "packages/claude-code-bridge"
+        ? ([
+            {
+              identity: {
+                module: "claude-code-tools.ts",
+                exportName: "normalizeLegacyBatchArguments",
+              },
+              category: "request",
+            },
+          ] satisfies readonly BoundaryDecoder[])
+        : []),
       ...(root === "packages/mini-lilac-runtime"
         ? ([
             ...MINI_WORKSPACE_HISTORY_PERSISTED_CODECS.map(({ identity }) => ({

@@ -221,7 +221,7 @@ function textAndReadToolResult(id: string, text: string, filePath: string) {
         {
           type: "tool-call" as const,
           toolCallId: `${id}-read`,
-          toolName: "read_file",
+          toolName: "read",
           input: JSON.stringify({ path: filePath }),
         },
         {
@@ -247,7 +247,7 @@ function commentaryAndReadToolResult(id: string, text: string, filePath: string)
         {
           type: "tool-call" as const,
           toolCallId: `${id}-read`,
-          toolName: "read_file",
+          toolName: "read",
           input: JSON.stringify({ path: filePath }),
         },
         {
@@ -378,7 +378,7 @@ function readToolResult(path: string, options?: { dangerouslyAllow?: boolean }) 
         {
           type: "tool-call" as const,
           toolCallId: "direct-read",
-          toolName: "read_file",
+          toolName: "read",
           input: JSON.stringify({ path, maxCharacters: 20_000, ...options }),
         },
         {
@@ -427,7 +427,7 @@ function batchedReadResult(paths: readonly string[]) {
           toolCallId: "batch-read",
           toolName: "batch",
           input: JSON.stringify({
-            tool_calls: paths.map((path) => ({ tool: "read_file", parameters: { path } })),
+            tool_calls: paths.map((path) => ({ tool: "read", parameters: { path } })),
           }),
         },
         {
@@ -477,7 +477,7 @@ function todoAndReadResult(
         {
           type: "tool-call" as const,
           toolCallId: "read-with-todos",
-          toolName: "read_file",
+          toolName: "read",
           input: JSON.stringify({ path: filePath }),
         },
         {
@@ -775,7 +775,7 @@ function config(): RuntimeConfig {
           description: "Read-only main agent",
           promptOverlay: "Be concise.",
           subagentOnly: false,
-          tools: ["read_file", "bash", "apply_patch", "subagent_delegate"],
+          tools: ["read", "bash", "patch", "subagent_delegate"],
           execution: false,
           workspaceWrites: false,
           delegation: false,
@@ -2509,7 +2509,7 @@ describe("SessionService", () => {
     service.close();
   });
 
-  it("exempts bounded read_file children from the settled aggregate budget", async () => {
+  it("exempts bounded read children from the settled aggregate budget", async () => {
     const directory = await mkdtemp(path.join(tmpdir(), "mini-lilac-batch-overflow-"));
     temporaryDirectories.push(directory);
     const largePayload = `large:${"x".repeat(900)}\n`;
@@ -2519,7 +2519,7 @@ describe("SessionService", () => {
       writeFile(path.join(directory, "small.txt"), smallPayload),
     ]);
     const runtimeConfig = config();
-    runtimeConfig.agent.profiles.reader!.tools = ["read_file", "batch"];
+    runtimeConfig.agent.profiles.reader!.tools = ["read", "batch"];
     const artifacts = createToolResultArtifactStore(path.join(directory, "tool-results"));
     await artifacts.init();
     const model = new MockLanguageModelV4({
@@ -2548,12 +2548,12 @@ describe("SessionService", () => {
     service.close();
   });
 
-  it("bounds direct multibyte read_file output by UTF-8 bytes", async () => {
+  it("bounds direct multibyte read output by UTF-8 bytes", async () => {
     const directory = await mkdtemp(path.join(tmpdir(), "mini-lilac-unicode-read-"));
     temporaryDirectories.push(directory);
     await writeFile(path.join(directory, "unicode.txt"), "😀".repeat(11_000));
     const runtimeConfig = config();
-    runtimeConfig.agent.profiles.reader!.tools = ["read_file"];
+    runtimeConfig.agent.profiles.reader!.tools = ["read"];
     const artifacts = createToolResultArtifactStore(path.join(directory, "tool-results"));
     await artifacts.init();
     const model = new MockLanguageModelV4({
@@ -2597,7 +2597,7 @@ describe("SessionService", () => {
       writeFile(path.join(directory, "reference.pdf"), pdf),
     ]);
     const runtimeConfig = config();
-    runtimeConfig.agent.profiles.reader!.tools = ["read_file", "batch"];
+    runtimeConfig.agent.profiles.reader!.tools = ["read", "batch"];
     const model = new MockLanguageModelV4({
       doStream: [
         batchedReadResult(["diagram.png", "reference.pdf"]),
@@ -2639,11 +2639,11 @@ describe("SessionService", () => {
     service.close();
   });
 
-  it("projects structured read_file failures as failed exploration calls", async () => {
+  it("projects structured read failures as failed exploration calls", async () => {
     const directory = await mkdtemp(path.join(tmpdir(), "mini-lilac-read-failure-"));
     temporaryDirectories.push(directory);
     const runtimeConfig = config();
-    runtimeConfig.agent.profiles.reader!.tools = ["read_file", "batch"];
+    runtimeConfig.agent.profiles.reader!.tools = ["read", "batch"];
     const model = new MockLanguageModelV4({
       doStream: [batchedReadResult(["missing.txt"]), textResult("answer", "handled")],
     });
@@ -2716,7 +2716,7 @@ describe("SessionService", () => {
     const longLine = `needle:${"x".repeat(8_000)}\n`;
     await writeFile(path.join(directory, "large.txt"), longLine);
     const runtimeConfig = config();
-    runtimeConfig.agent.profiles.reader!.tools = ["grep", "read_file"];
+    runtimeConfig.agent.profiles.reader!.tools = ["grep", "read"];
     const artifacts = createToolResultArtifactStore(path.join(directory, "tool-results"));
     await artifacts.init();
     const model = new MockLanguageModelV4({
@@ -3150,7 +3150,7 @@ describe("SessionService", () => {
     const call = model.doStreamCalls[0];
     expect(call?.prompt[0]).toMatchObject({ role: "system" });
     expect(JSON.stringify(call?.prompt[0])).toContain(`Working directory: ${directory}`);
-    expect(call?.tools?.map((entry) => entry.name)).toEqual(["read_file"]);
+    expect(call?.tools?.map((entry) => entry.name)).toEqual(["read"]);
     service.close();
 
     const reopened = new SessionService({
@@ -3591,7 +3591,7 @@ describe("SessionService", () => {
     service.close();
   });
 
-  it("preloads workspace AGENTS.md and injects nested instructions with read_file", async () => {
+  it("preloads workspace AGENTS.md and injects nested instructions with read", async () => {
     let turn = 0;
     const model = new MockLanguageModelV4({
       doStream: async () => {
@@ -4615,7 +4615,7 @@ describe("SessionService", () => {
                 {
                   type: "tool-result",
                   toolCallId: "media",
-                  toolName: "read_file",
+                  toolName: "read",
                   output: {
                     type: "content",
                     value: [
@@ -6383,7 +6383,7 @@ describe("SessionService", () => {
               {
                 type: "tool-input-start" as const,
                 id: "draft-read",
-                toolName: "read_file",
+                toolName: "read",
                 providerExecuted: false,
               },
               {
@@ -7465,7 +7465,7 @@ describe("SessionService", () => {
     const runtimeConfig = config();
     const readerProfile = runtimeConfig.agent.profiles.reader;
     if (!readerProfile) throw new Error("reader profile missing");
-    readerProfile.tools = ["bash", "read_file"];
+    readerProfile.tools = ["bash", "read"];
     readerProfile.execution = true;
     readerProfile.workspaceWrites = true;
     const model = new MockLanguageModelV4({
@@ -7780,8 +7780,8 @@ describe("SessionService", () => {
     expect(childPrompt).not.toContain("openai/child");
     expect(childPrompt).not.toContain('"low"');
     const childToolNames = model.doStreamCalls[1]?.tools?.map((entry) => entry.name) ?? [];
-    expect(childToolNames).toContain("apply_patch");
-    expect(childToolNames).not.toContain("edit_file");
+    expect(childToolNames).toContain("patch");
+    expect(childToolNames).not.toContain("edit");
     service.close();
   });
 
@@ -8505,7 +8505,7 @@ describe("SessionService", () => {
     const runtimeConfig = config();
     const reader = runtimeConfig.agent.profiles.reader;
     if (!reader) throw new Error("reader profile missing");
-    reader.tools = ["todowrite", "read_file", "batch"];
+    reader.tools = ["todowrite", "read", "batch"];
     const directory = await mkdtemp(path.join(tmpdir(), "mini-lilac-todo-parallel-"));
     temporaryDirectories.push(directory);
     const readable = path.join(directory, "parallel.txt");
@@ -8527,7 +8527,7 @@ describe("SessionService", () => {
     );
 
     const tools = model.doStreamCalls[0]?.tools ?? [];
-    expect(tools.map((entry) => entry.name)).toEqual(["read_file", "todowrite", "batch"]);
+    expect(tools.map((entry) => entry.name)).toEqual(["read", "todowrite", "batch"]);
     expect(JSON.stringify(tools.find((entry) => entry.name === "batch"))).not.toContain(
       '"todowrite"',
     );
@@ -8639,7 +8639,7 @@ describe("SessionService", () => {
     const runtimeConfig = config();
     const reader = runtimeConfig.agent.profiles.reader;
     if (reader === undefined) throw new Error("missing reader profile");
-    reader.tools = ["skill", "read_file", "batch"];
+    reader.tools = ["skill", "read", "batch"];
     const model = new MockLanguageModelV4({
       doStream: [batchedSkillResult("test-skill"), textResult("answer", "done")],
     });
@@ -8667,7 +8667,7 @@ describe("SessionService", () => {
     const firstCall = model.doStreamCalls[0];
     expect(JSON.stringify(firstCall?.prompt[0])).toContain("test-skill: Use for exact skill");
     expect(JSON.stringify(firstCall?.prompt[0])).toContain("@skills:<name>");
-    expect(firstCall?.tools?.map((entry) => entry.name)).toEqual(["read_file", "skill", "batch"]);
+    expect(firstCall?.tools?.map((entry) => entry.name)).toEqual(["read", "skill", "batch"]);
     expect(JSON.stringify(firstCall?.tools?.find((entry) => entry.name === "batch"))).toContain(
       '"skill"',
     );
@@ -8706,13 +8706,13 @@ describe("SessionService", () => {
     expect(names).toContain("batch");
     expect(names).toContain("webfetch");
     expect(names).not.toContain("bash");
-    expect(names).not.toContain("edit_file");
-    expect(names).not.toContain("apply_patch");
+    expect(names).not.toContain("edit");
+    expect(names).not.toContain("patch");
     expect(names).not.toContain("subagent_delegate");
     const batchSchema = JSON.stringify(tools.find((entry) => entry.name === "batch"));
     expect(batchSchema).not.toContain('"bash"');
-    expect(batchSchema).not.toContain('"edit_file"');
-    expect(batchSchema).not.toContain('"apply_patch"');
+    expect(batchSchema).not.toContain('"edit"');
+    expect(batchSchema).not.toContain('"patch"');
     expect(batchSchema).toContain('"webfetch"');
     service.close();
   });
@@ -8844,13 +8844,13 @@ describe("SessionService", () => {
   it("exposes exactly one editing tool based on the active model", async () => {
     for (const profileTools of [
       ["*"],
-      ["batch", "apply_patch", "edit_file"],
-      ["batch", "edit_file"],
-      ["batch", "apply_patch"],
+      ["batch", "patch", "edit"],
+      ["batch", "edit"],
+      ["batch", "patch"],
     ]) {
       for (const testCase of [
-        { modelSpecifier: "openai/gpt-test", exposed: "apply_patch", hidden: "edit_file" },
-        { modelSpecifier: "anthropic/claude-test", exposed: "edit_file", hidden: "apply_patch" },
+        { modelSpecifier: "openai/gpt-test", exposed: "patch", hidden: "edit" },
+        { modelSpecifier: "anthropic/claude-test", exposed: "edit", hidden: "patch" },
       ]) {
         const runtimeConfig = config();
         const reader = runtimeConfig.agent.profiles.reader;
@@ -8940,7 +8940,7 @@ describe("SessionService", () => {
               ...protectedPaths.map((protectedPath, index) => ({
                 type: "tool-call" as const,
                 toolCallId: `read-protected-${index}`,
-                toolName: "read_file",
+                toolName: "read",
                 input: JSON.stringify({ path: protectedPath }),
               })),
               {
@@ -9080,7 +9080,7 @@ describe("SessionService", () => {
               {
                 type: "tool-call",
                 toolCallId: "invalid-read",
-                toolName: "read_file",
+                toolName: "read",
                 input: "{}",
               },
               {

@@ -2633,7 +2633,7 @@ describe("Controller effect wiring", () => {
           parts: [
             {
               type: "dynamic-tool",
-              toolName: "read_file",
+              toolName: "read",
               toolCallId: "read-1",
               state: "output-available",
               input: { path: "src/index.ts" },

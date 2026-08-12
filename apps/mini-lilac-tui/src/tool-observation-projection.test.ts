@@ -32,7 +32,7 @@ describe("tool observation catalog", () => {
   it("projects every catalog member into its deliberate closed variant", () => {
     const fixtures = [
       ["bash", success("bash", { command: "pwd" }, "/workspace"), "bash", "$ pwd"],
-      ["read_file", success("read_file", { path: "src/app.ts" }), "exploration", "Read src/app.ts"],
+      ["read", success("read", { path: "src/app.ts" }), "exploration", "Read src/app.ts"],
       ["glob", success("glob", { patterns: ["**/*.ts"] }), "exploration", "Glob **/*.ts"],
       ["grep", success("grep", { pattern: "TODO" }), "exploration", 'Grep "TODO"'],
       [
@@ -42,18 +42,14 @@ describe("tool observation catalog", () => {
         'Find "app config"',
       ],
       [
-        "edit_file",
-        success(
-          "edit_file",
-          { path: "src/a.ts", oldText: "old", newText: "new\nnext" },
-          editSuccess(),
-        ),
+        "edit",
+        success("edit", { path: "src/a.ts", oldText: "old", newText: "new\nnext" }, editSuccess()),
         "edit",
         "Edit src/a.ts +2 -1",
       ],
       [
-        "apply_patch",
-        success("apply_patch", {
+        "patch",
+        success("patch", {
           patchText: "*** Begin Patch\n*** Update File: src/a.ts\n-old\n+new\n*** End Patch",
         }),
         "edit",
@@ -160,7 +156,7 @@ describe("known tool decoding", () => {
 
     const hostileOutputFixtures = [
       ["bash", { command: "pwd" }],
-      ["edit_file", { path: "a.ts", oldText: "old", newText: "new" }],
+      ["edit", { path: "a.ts", oldText: "old", newText: "new" }],
       ["subagent_delegate", { profile: "explore", prompt: "Inspect", mode: "sync" }],
       ["subagent_result", { childRunId: "child-1", profile: "explore" }],
       ["websearch", {}],
@@ -198,7 +194,7 @@ describe("known tool decoding", () => {
 
   it("rejects incomplete edit, batch, Bash, and subagent contract envelopes", () => {
     const malformedObservations = [
-      success("edit_file", { path: "a.ts" }, { replacementsMade: 1 }),
+      success("edit", { path: "a.ts" }, { replacementsMade: 1 }),
       success("batch", { tool_calls: [] }),
       success("batch", { tool_calls: [{ tool: "", parameters: {} }] }),
       success("bash", { command: "pwd" }, { stdout: "pwd", stderr: "", exitCode: 0 }),
@@ -249,7 +245,7 @@ describe("known tool decoding", () => {
 
   it("projects exact edit results and turns filesystem failures into tool errors", () => {
     const input = { path: "src/a.ts", oldText: "old", newText: "new" };
-    expect(projectToolObservation(success("edit_file", input, editSuccess(2)))).toMatchObject({
+    expect(projectToolObservation(success("edit", input, editSuccess(2)))).toMatchObject({
       kind: "edit",
       state: { status: "success" },
       operations: [{ added: 2, removed: 2 }],
@@ -257,7 +253,7 @@ describe("known tool decoding", () => {
 
     expect(
       projectToolObservation(
-        success("edit_file", input, {
+        success("edit", input, {
           success: false,
           resolvedPath: "/workspace/src/a.ts",
           currentHash: "current-hash",
@@ -293,7 +289,7 @@ describe("known tool decoding", () => {
         error: { code: "NOT_REAL", message: "bad" },
       },
     ]) {
-      expect(projectToolObservation(success("edit_file", input, output))).toMatchObject({
+      expect(projectToolObservation(success("edit", input, output))).toMatchObject({
         kind: "malformed-known-tool",
         malformedField: "output",
       });
@@ -302,10 +298,10 @@ describe("known tool decoding", () => {
 
   it("uses exact read, skill, and todo constraints", () => {
     expect(
-      projectToolObservation(success("read_file", { path: "a.ts", maxCharacters: 40_960 })),
+      projectToolObservation(success("read", { path: "a.ts", maxCharacters: 40_960 })),
     ).toMatchObject({ kind: "exploration" });
     expect(
-      projectToolObservation(success("read_file", { path: "a.ts", maxCharacters: 40_961 })),
+      projectToolObservation(success("read", { path: "a.ts", maxCharacters: 40_961 })),
     ).toMatchObject({ kind: "malformed-known-tool", malformedField: "input" });
 
     expect(projectToolObservation(success("skill", { name: "frontend-design" }))).toMatchObject({
@@ -615,7 +611,7 @@ describe("projection lifecycle", () => {
     expect(
       projectToolObservation(
         {
-          toolName: "read_file",
+          toolName: "read",
           lifecycle: "error",
           input: { path: "/workspace/src/app.ts", start: { offset: 4 }, maxLines: 12 },
           errorText: "file missing",
@@ -634,7 +630,7 @@ describe("projection lifecycle", () => {
     expect(
       projectToolObservation(
         {
-          toolName: "apply_patch",
+          toolName: "patch",
           lifecycle: "denied",
           input: {
             patchText:
@@ -700,6 +696,27 @@ describe("projection lifecycle", () => {
       kind: "subagent-result",
       visibility: "hidden",
     });
+  });
+
+  it("normalizes legacy persisted tool names before projection", () => {
+    expect(projectToolObservation(success("read_file", { path: "legacy.ts" }))).toMatchObject({
+      kind: "exploration",
+      toolName: "read",
+      action: "Read",
+      summary: "Read legacy.ts",
+    });
+    expect(
+      projectToolObservation(
+        success("apply_patch", {
+          patchText: "*** Begin Patch\n*** Update File: legacy.ts\n-old\n+new\n*** End Patch",
+        }),
+      ),
+    ).toMatchObject({ kind: "edit", toolName: "patch", summary: "Patch legacy.ts +1 -1" });
+    expect(
+      projectToolObservation(
+        success("edit_file", { path: "legacy.ts", oldText: "old", newText: "new" }, editSuccess()),
+      ),
+    ).toMatchObject({ kind: "edit", toolName: "edit", summary: "Edit legacy.ts +1 -1" });
   });
 });
 

@@ -53,7 +53,9 @@ function makeTools(
     bashToolWithCwd(cwd),
     fsTool(cwd, { includeEditFile: editingMode === "edit_file" }),
   );
-  if (editingMode === "apply_patch") Object.assign(tools, applyPatchTool({ cwd }));
+  if (editingMode === "apply_patch") {
+    Object.assign(tools, { patch: applyPatchTool({ cwd }).apply_patch });
+  }
   Object.assign(
     tools,
     batchTool({
@@ -121,7 +123,7 @@ describe("batch expansion tool", () => {
     ).rejects.toThrow("at most 8");
   });
 
-  it("rejects overlapping apply_patch calls before expansion", async () => {
+  it("rejects overlapping patch calls before expansion", async () => {
     const tools = makeTools(baseDir);
     const batch = getTool(tools, "batch");
     await writeFile(join(baseDir, "a.txt"), "hello\n");
@@ -140,8 +142,8 @@ describe("batch expansion tool", () => {
         batch.execute(
           {
             tool_calls: [
-              { tool: "apply_patch", parameters: { patchText: patch("one") } },
-              { tool: "apply_patch", parameters: { patchText: patch("two") } },
+              { tool: "patch", parameters: { patchText: patch("one") } },
+              { tool: "patch", parameters: { patchText: patch("two") } },
             ],
           },
           batchOptions("batch-overlap"),
@@ -170,18 +172,15 @@ describe("batch expansion tool", () => {
       await batch.execute(
         {
           tool_calls: [
-            { tool: "apply_patch", parameters: { patchText: patch("a.txt", "one", "ONE") } },
-            { tool: "apply_patch", parameters: { patchText: patch("b.txt", "two", "TWO") } },
+            { tool: "patch", parameters: { patchText: patch("a.txt", "one", "ONE") } },
+            { tool: "patch", parameters: { patchText: patch("b.txt", "two", "TWO") } },
           ],
         },
         batchOptions("batch-disjoint"),
       ),
     );
 
-    expect(expansion.children.map((child) => child.toolName)).toEqual([
-      "apply_patch",
-      "apply_patch",
-    ]);
+    expect(expansion.children.map((child) => child.toolName)).toEqual(["patch", "patch"]);
     expect(await readFile(join(baseDir, "a.txt"), "utf8")).toBe("one\n");
     expect(await readFile(join(baseDir, "b.txt"), "utf8")).toBe("two\n");
   });

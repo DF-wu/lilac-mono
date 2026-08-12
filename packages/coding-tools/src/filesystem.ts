@@ -195,8 +195,8 @@ export function createFilesystemTools(params: {
   const binaryCacheByToolCallId = new Map<string, Buffer>();
   const instructionClaims = createReadFileInstructionClaims();
   const tools: ToolSet = {
-    read_file: tool({
-      description: `${readFileDirectAttachmentSupported ? "Read a local text file, supported image or PDF, or a transient tool-result:// URI. Supported images and PDFs are attached to your context for native visual or document analysis, including when read_file is an independent batch child." : "Read a local text file or a transient tool-result:// URI."} Artifact URIs ignore cwd and support start/maxCharacters/maxLines paging; reuse nextStart unchanged while hasMore is true. Reading a local file records its hash so edit_file can safely edit it later. ${READ_FILE_INSTRUCTION_HINT}`,
+    read: tool({
+      description: `${readFileDirectAttachmentSupported ? "Read a local text file, supported image or PDF, or a transient tool-result:// URI. Supported images and PDFs are attached to your context for native visual or document analysis, including when read is an independent batch child." : "Read a local text file or a transient tool-result:// URI."} Artifact URIs ignore cwd and support start/maxCharacters/maxLines paging; reuse nextStart unchanged while hasMore is true. Reading a local file records its hash so edit can safely edit it later. ${READ_FILE_INSTRUCTION_HINT}`,
       inputSchema: readFileInputSchema,
       execute: async ({ cwd: operationCwd, ...input }, options) => {
         if (input.path.startsWith(TOOL_RESULT_URI_PREFIX)) {
@@ -244,7 +244,7 @@ export function createFilesystemTools(params: {
           inputPath: input.path,
           cwd: effectiveCwd,
           denyPaths: denyPaths ?? [],
-          operation: "read_file",
+          operation: "read",
           dangerouslyAllow: input.dangerouslyAllow,
         });
         if (guardedPath.allowed.status === "error") {
@@ -376,7 +376,7 @@ export function createFilesystemTools(params: {
           value: [
             {
               type: "text",
-              text: `Attached file from read_file: ${decoded.data.filename} (${decoded.data.mimeType}, ${decoded.data.bytes} bytes).`,
+              text: `Attached file from read: ${decoded.data.filename} (${decoded.data.mimeType}, ${decoded.data.bytes} bytes).`,
             },
             ...(instructions ? [{ type: "text" as const, text: instructions }] : []),
             {
@@ -511,9 +511,9 @@ export function createFilesystemTools(params: {
           ? { type: "error-json", value: output }
           : { type: "json", value: output },
     }),
-    edit_file: tool({
+    edit: tool({
       description:
-        "Replace a snippet in an existing local file. The file must first be read with read_file; by default oldText must match exactly once.",
+        "Replace a snippet in an existing local file. The file must first be read with read; by default oldText must match exactly once.",
       inputSchema: editFileInputSchema,
       execute: async ({ cwd: operationCwd, ...input }) => {
         if (operationCwd) assertLocalCwd(operationCwd);
@@ -523,7 +523,7 @@ export function createFilesystemTools(params: {
           inputPath: input.path,
           cwd: effectiveCwd,
           denyPaths: denyPaths ?? [],
-          operation: "edit_file",
+          operation: "edit",
           dangerouslyAllow: input.dangerouslyAllow,
         });
         if (guardedPath.allowed.status === "error") {

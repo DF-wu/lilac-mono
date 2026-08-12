@@ -16,13 +16,16 @@ import {
   type FinishReason,
   type LanguageModel,
   type LanguageModelUsage,
+  InvalidToolInputError,
   type ModelMessage,
+  NoSuchToolError,
   type SystemModelMessage,
   type TextStreamPart,
   type ToolModelMessage,
   type ToolSet,
 } from "ai";
 import { Result, TaggedError, type Result as ResultType } from "better-result";
+import { z } from "zod";
 import {
   createLogger,
   errorMessage,
@@ -53,6 +56,45 @@ import type { ExpandedToolCall } from "./tool-call-expansion";
 
 const logger = createLogger({ module: "ai-sdk-pi-agent" });
 const SETTLED_NORMALIZATION_FAILED = "[settled tool results could not be normalized]";
+
+function canonicalToolName(name: string): string {
+  switch (name) {
+    case "read_file":
+      return "read";
+    case "edit_file":
+      return "edit";
+    case "apply_patch":
+      return "patch";
+    default:
+      return name;
+  }
+}
+
+const legacyBatchInputSchema = z.object({
+  tool_calls: z.array(
+    z.object({
+      tool: z.string(),
+      parameters: z.record(z.string(), z.unknown()).optional(),
+    }),
+  ),
+});
+
+export function repairLegacyBatchInput(input: OpaqueAgentValue, tools: ToolSet): string | null {
+  const decoded = legacyBatchInputSchema.safeParse(normalizeToolCallInputValue(input));
+  if (!decoded.success) return null;
+  let changed = false;
+  const toolCalls = decoded.data.tool_calls.map((call) => {
+    const requestedName = call.tool;
+    const toolName = tools[requestedName] ? requestedName : canonicalToolName(requestedName);
+    if (toolName === requestedName || !tools[toolName]) return call;
+    changed = true;
+    return {
+      tool: toolName,
+      ...(call.parameters === undefined ? {} : { parameters: call.parameters }),
+    };
+  });
+  return changed ? JSON.stringify({ ...decoded.data, tool_calls: toolCalls }) : null;
+}
 
 export type {
   NormalizeSettledToolResultOutputsFn,
@@ -1457,16 +1499,20 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
       names: Object.keys(this.state.tools),
     };
     const snapshotTools = snapshot.tools;
+    const toolName =
+      snapshotTools[input.toolName] || this.state.tools[input.toolName]
+        ? input.toolName
+        : canonicalToolName(input.toolName);
 
     const executed = await executeAtomicToolCallResult({
       call: {
         toolCallId: input.toolCallId,
-        toolName: input.toolName,
+        toolName,
         input: input.input,
       },
       tools: snapshotTools,
-      ...(snapshotTools[input.toolName] === undefined && this.state.tools[input.toolName]
-        ? { executionRejection: hiddenToolRejection(input.toolName) }
+      ...(snapshotTools[toolName] === undefined && this.state.tools[toolName]
+        ? { executionRejection: hiddenToolRejection(toolName) }
         : {}),
       messages: this.state.messages,
       context: this.context,
@@ -1475,8 +1521,8 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
       inputValidation: { type: input.inputValidation ?? "validate" },
       expansionHandling: { type: "capture" },
       normalizeToolResultOutput: this.normalizeToolResultOutput,
-      bypassGenericOutputNormalizer: this.genericOutputNormalizerBypassTools.has(input.toolName),
-      aggregateOutputBudgetExempt: this.aggregateOutputBudgetExemptTools.has(input.toolName),
+      bypassGenericOutputNormalizer: this.genericOutputNormalizerBypassTools.has(toolName),
+      aggregateOutputBudgetExempt: this.aggregateOutputBudgetExemptTools.has(toolName),
       onEvent: (event) => this.emit(event),
     });
     if (executed.status === "error") {
@@ -3016,6 +3062,19 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
       instructions: this.state.system,
       messages: messagesForModel,
       ...(callPreparation.runtime.executionMode === "local-tools" ? { tools: allModelTools } : {}),
+      experimental_repairToolCall: async ({ toolCall, tools, error }) => {
+        if (NoSuchToolError.isInstance(error)) {
+          const toolName = canonicalToolName(toolCall.toolName);
+          return toolName !== toolCall.toolName && tools[toolName]
+            ? { ...toolCall, toolName }
+            : null;
+        }
+        if (InvalidToolInputError.isInstance(error) && toolCall.toolName === "batch") {
+          const input = repairLegacyBatchInput(toolCall.input, tools);
+          return input === null ? null : { ...toolCall, input };
+        }
+        return null;
+      },
       reasoning: this.state.reasoning,
       providerOptions: this.state.providerOptions,
       experimental_download: this.experimentalDownload,

@@ -71,14 +71,14 @@ describe("compact subagent progress", () => {
           entry("tool-1", 1, { status: "end", display: "glob src", ok: true }),
           entry("tool-2", 2, { status: "end", display: "grep auth", ok: true }),
           entry("tool-3", 3, { status: "start", display: "bash bun test" }),
-          entry("tool-4", 4, { status: "start", display: "read_file failing.test.ts" }),
+          entry("tool-4", 4, { status: "start", display: "read failing.test.ts" }),
         ],
         subagents: [
           entry("agent-1", 5, {
             status: "update",
             display: [
               "subagent (general; claude-fable-5 [high]; 1/2 done)",
-              "|- + read_file package.json",
+              "|- + read package.json",
               "`- > bash bunx tsc --noEmit",
             ].join("\n"),
           }),
@@ -88,9 +88,9 @@ describe("compact subagent progress", () => {
 
     expect(lines).toEqual([
       "▶ bash bun test",
-      "▶ read_file failing.test.ts",
+      "▶ read failing.test.ts",
       "… general (cl...fable-5 [hi]; 1/2)",
-      "|- + read_file package.json",
+      "|- + read package.json",
       "`- > bash bunx tsc --noEmit",
     ]);
   });
@@ -127,12 +127,11 @@ describe("compact subagent progress", () => {
         subagents: [
           entry("agent-1", 1, {
             status: "update",
-            display:
-              "subagent (general; claude-fable-5 [high]; 12/13 done)\n`- > read_file src/a.ts",
+            display: "subagent (general; claude-fable-5 [high]; 12/13 done)\n`- > read src/a.ts",
           }),
           entry("agent-2", 2, {
             status: "update",
-            display: "subagent (self; gpt-5.6-sol [medium]; 1/2 done)\n`- > apply_patch src/b.ts",
+            display: "subagent (self; gpt-5.6-sol [medium]; 1/2 done)\n`- > patch src/b.ts",
           }),
           entry("agent-3", 3, {
             status: "update",
@@ -156,8 +155,8 @@ describe("compact subagent progress", () => {
       "✓ explore (3/3)",
       "✓ general (4/4)",
       "… explore (grok-4.5 [xh]; 8/10; batch)",
-      "… self (gpt-5.6-sol [md]; 1/2; apply_patch)",
-      "… general (cl...fable-5 [hi]; 12/13; read_file)",
+      "… self (gpt-5.6-sol [md]; 1/2; patch)",
+      "… general (cl...fable-5 [hi]; 12/13; read)",
     ]);
   });
 
@@ -311,7 +310,7 @@ describe("compact subagent progress", () => {
             status: "update",
             display: [
               "batch (3 tools; 2/3 done)",
-              "|- ✓ read_file a.ts",
+              "|- ✓ read a.ts",
               "|- ✓ grep auth",
               "`- ▶ bash bun test",
             ].join("\n"),
@@ -337,6 +336,58 @@ describe("compact subagent progress", () => {
     expect(lines).toHaveLength(5);
     expect(lines.slice(0, 2)).toEqual(["… batch (3 tools; 2/3 done)", "`- ▶ bash bun test"]);
     expect(lines.slice(2).every((line) => line.includes("gpt-5.6-sol"))).toBe(true);
+  });
+
+  it("normalizes restored builtin prefixes without rewriting plugin or batch displays", () => {
+    const lines = visible(
+      buildDiscordProgressLines({
+        tools: [
+          entry("read", 1, { status: "start", display: "read_file restored.ts" }),
+          entry("plugin", 2, { status: "start", display: "read_file_plugin restored.ts" }),
+          entry("batch", 3, {
+            status: "update",
+            display: "batch (1 tools)\n`- ▶ read_file restored.ts",
+          }),
+        ],
+        subagents: [
+          entry("agent", 4, {
+            status: "update",
+            display: "subagent (explore; 1/2 done)\n`- > apply_patch restored.ts",
+          }),
+        ],
+      }),
+    );
+
+    expect(lines).toContain("▶ read_file_plugin restored.ts");
+    expect(lines).toContain("… batch (1 tools)");
+    expect(lines).toContain("`- ▶ read restored.ts");
+    expect(lines).toContain("`- > patch restored.ts");
+  });
+
+  it("normalizes restored builtin names in compact subagent headers", () => {
+    const lines = visible(
+      buildDiscordProgressLines({
+        tools: [],
+        subagents: [
+          entry("one", 1, {
+            status: "update",
+            display: "subagent (explore; 1/2 done)\n`- > read_file one.ts",
+          }),
+          entry("two", 2, {
+            status: "update",
+            display: "subagent (general; 1/2 done)\n`- > apply_patch two.ts",
+          }),
+          entry("three", 3, {
+            status: "update",
+            display: "subagent (self; 1/2 done)\n`- > edit_file three.ts",
+          }),
+        ],
+      }),
+    );
+
+    expect(lines.some((line) => line.includes("; read)"))).toBe(true);
+    expect(lines.some((line) => line.includes("; patch)"))).toBe(true);
+    expect(lines.some((line) => line.includes("; edit)"))).toBe(true);
   });
 });
 
@@ -745,7 +796,7 @@ describe("Discord compact progress integration", () => {
         status: "update",
         display: [
           "subagent (general; claude-fable-5 [high]; 1/2 done)",
-          "|- + read_file package.json",
+          "|- + read package.json",
           "`- > bash bun test",
         ].join("\n"),
       },
@@ -760,7 +811,7 @@ describe("Discord compact progress integration", () => {
       "▶ bash command-3",
       "▶ bash command-4",
       "… general (cl...fable-5 [hi]; 1/2)",
-      "|- + read_file package.json",
+      "|- + read package.json",
       "`- > bash bun test",
     ]);
 

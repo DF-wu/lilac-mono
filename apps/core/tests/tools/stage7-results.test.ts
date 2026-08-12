@@ -23,7 +23,7 @@ describe("Core tool Result boundaries", () => {
     if (result.status === "error") expect(ApplyPatchCancelled.is(result.error)).toBe(true);
 
     await expect(applyHunks("/tmp", [], { signal: controller.signal })).rejects.toThrow(
-      "apply_patch was cancelled",
+      "patch was cancelled",
     );
   });
 

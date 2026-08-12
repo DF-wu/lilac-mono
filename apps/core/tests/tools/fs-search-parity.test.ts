@@ -627,7 +627,7 @@ describe("fs search parity (local vs remote runner)", () => {
     expect(remote.error.code).toBe("HASH_MISMATCH");
   });
 
-  it("hashline grep can bootstrap local edit_file and provide expectedHash for remote edits", async () => {
+  it("hashline grep can bootstrap local edit and provide expectedHash for remote edits", async () => {
     await writeFile(path.join(baseDir, "grep-edit-local.ts"), "alpha\nbeta\n");
     await writeFile(path.join(baseDir, "grep-edit-remote.ts"), "alpha\nbeta\n");
 

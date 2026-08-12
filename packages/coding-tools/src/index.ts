@@ -35,7 +35,7 @@ export type CodingToolsetOptions = {
   /** Optional Bash wall-clock deadline. The fixed no-output deadline is independent. */
   bashTimeoutMs?: number;
   bashMaxOutputBytes?: number;
-  /** Maximum UTF-8 bytes in a read_file textual payload. */
+  /** Maximum UTF-8 bytes in a read textual payload. */
   maxOutputBytes?: number;
   bashStreamOutput?: boolean;
   bashMergeOutput?: boolean;
@@ -51,9 +51,9 @@ export type CodingToolsetOptions = {
   preloadedInstructionPaths?: readonly string[];
   /** Fixed artifact authority for recoverable Bash output and tool-result:// reads. */
   artifactIntegration?: CodingToolArtifactIntegration;
-  /** Attach supported local images and PDFs to the model-facing read_file result. */
+  /** Attach supported local images and PDFs to the model-facing read result. */
   readFileDirectAttachmentSupported?: boolean;
-  /** Maximum decoded bytes in one read_file media attachment. */
+  /** Maximum decoded bytes in one read media attachment. */
   maxInlineMediaBytesPerPart?: number;
 };
 

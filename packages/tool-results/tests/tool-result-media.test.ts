@@ -63,7 +63,7 @@ describe("tool result media", () => {
         {
           type: "tool-result",
           toolCallId: id,
-          toolName: "read_file",
+          toolName: "read",
           output: {
             type: "content",
             value: [
@@ -97,7 +97,7 @@ describe("tool result media", () => {
           {
             type: "tool-result",
             toolCallId: "malformed-data-url",
-            toolName: "read_file",
+            toolName: "read",
             output: {
               type: "content",
               value: [{ type: "file-url", url: malformedUrl, mediaType: "text/plain" }],

@@ -44,6 +44,7 @@ import {
   type MaterializedClaudeCodeRun,
 } from "@stanley2058/lilac-claude-code-bridge";
 import {
+  createBatchTool,
   createCodingToolset,
   DEFAULT_DENY_PATHS,
   loadWorkspaceInstructions,
@@ -74,6 +75,7 @@ import {
   miniLilacUserUIMessageSchema,
   miniLilacUndoResultSchema,
   miniLilacUpdateSessionBindingsRequestSchema,
+  normalizeMiniLilacToolName,
   type MiniLilacCancelRequest,
   type MiniLilacCancelResult,
   type MiniLilacCompactionEvent,
@@ -959,20 +961,20 @@ function profileRequestsTool(profile: AgentProfile, name: string): boolean {
 
 function enabledProfileTools(profile: AgentProfile, availableTools: readonly string[]): string[] {
   const available = new Set(availableTools);
-  const editingTool = available.has("apply_patch") ? "apply_patch" : "edit_file";
+  const editingTool = available.has("patch") ? "patch" : "edit";
   const requested = profile.tools.includes("*")
     ? availableTools
     : [
         ...new Set(
           profile.tools
-            .map((name) => (name === "apply_patch" || name === "edit_file" ? editingTool : name))
+            .map((name) => (name === "patch" || name === "edit" ? editingTool : name))
             .filter((name) => available.has(name)),
         ),
       ];
   return requested.filter((name) => {
     // Bash retains unrestricted process authority after its preflight guardrails.
     if (name === "bash" && (!profile.execution || !profile.workspaceWrites)) return false;
-    if ((name === "edit_file" || name === "apply_patch") && !profile.workspaceWrites) {
+    if ((name === "edit" || name === "patch") && !profile.workspaceWrites) {
       return false;
     }
     if (name === "subagent_delegate" && !profile.delegation) return false;
@@ -2559,8 +2561,8 @@ class SessionActor {
       normalizeToolResultOutput,
       normalizeSettledToolResultOutputs: (entries) =>
         normalizeOverflow.normalizeSettled(entries, normalizeToolResultOutput),
-      genericOutputNormalizerBypassTools: new Set(["bash", "read_file", "grep"]),
-      aggregateOutputBudgetExemptTools: new Set(["read_file", "grep"]),
+      genericOutputNormalizerBypassTools: new Set(["bash", "read", "grep"]),
+      aggregateOutputBudgetExemptTools: new Set(["read", "grep"]),
       providerOptions,
       turnErrorHandler: openaiServerCompactionEnabled
         ? turnErrorHandler
@@ -3021,15 +3023,41 @@ class SessionActor {
       provider: modelRef.providerId,
       modelId: modelRef.modelId,
     });
-    const availableTools = Object.keys(createCodingToolset(commonOptions)).filter(
-      (name) =>
-        (name !== "apply_patch" || editingToolMode === "apply_patch") &&
-        (name !== "edit_file" || editingToolMode === "edit_file"),
+    const availableTools = Object.keys(createCodingToolset(commonOptions))
+      .map(normalizeMiniLilacToolName)
+      .filter(
+        (name) =>
+          (name !== "patch" || editingToolMode === "apply_patch") &&
+          (name !== "edit" || editingToolMode === "edit_file"),
+      );
+    const enabledTools = enabledProfileTools(profile, availableTools);
+    const tools: ToolSet = Object.fromEntries(
+      Object.entries(createCodingToolset(commonOptions))
+        .map(([name, candidate]) => [normalizeMiniLilacToolName(name), candidate] as const)
+        .filter(
+          ([name]) =>
+            enabledTools.includes(name) &&
+            (name !== "patch" || editingToolMode === "apply_patch") &&
+            (name !== "edit" || editingToolMode === "edit_file"),
+        )
+        .filter(([name]) => name !== "batch"),
     );
-    return createCodingToolset({
-      ...commonOptions,
-      enabledTools: enabledProfileTools(profile, availableTools),
-    });
+    const batchableTools = Object.keys(tools).filter(
+      (name) => name !== "todowrite" && name !== "websearch",
+    );
+    if (!enabledTools.includes("batch") || batchableTools.length === 0) return tools;
+    const toolsAvailableToBatch = Object.fromEntries(
+      Object.entries(tools).filter(([name]) => batchableTools.includes(name)),
+    );
+
+    const batch = createBatchTool({
+      cwd: this.snapshot.cwd,
+      getTools: () => toolsAvailableToBatch,
+      editingMode: editingToolMode,
+    }).batch;
+    if (batch === undefined) return tools;
+    tools.batch = batch;
+    return tools;
   }
 
   private replaceTodos(context: RunContext, todos: readonly MiniLilacTodo[]) {
@@ -3865,7 +3893,7 @@ class SessionActor {
             await this.appendChunk(runId, {
               type: "tool-input-start",
               toolCallId: update.toolCallId,
-              toolName: update.toolName,
+              toolName: normalizeMiniLilacToolName(update.toolName),
               providerExecuted: update.raw.providerExecuted,
               providerMetadata: browserSafeProviderMetadata(update.raw.providerMetadata),
               dynamic: true,
@@ -3935,7 +3963,7 @@ class SessionActor {
         await this.appendChunk(runId, {
           type: "tool-input-available",
           toolCallId: event.toolCallId,
-          toolName: event.toolName,
+          toolName: normalizeMiniLilacToolName(event.toolName),
           input: event.args,
           dynamic: true,
         });
@@ -3987,7 +4015,7 @@ class SessionActor {
           await this.appendChunk(runId, {
             type: "tool-input-error",
             toolCallId: event.toolCallId,
-            toolName: event.toolName,
+            toolName: normalizeMiniLilacToolName(event.toolName),
             input: event.args,
             errorText: toolOutputErrorText(event.output, "Invalid tool input"),
             dynamic: true,
@@ -4072,8 +4100,8 @@ class SessionActor {
             projection.visibleToolCallIds.add(part.toolCallId);
             if (projection.toolInputsAvailable.has(part.toolCallId)) continue;
             const toolName = !projection.isClaudeCode
-              ? part.toolName
-              : displayClaudeCodeToolName(part.toolName);
+              ? normalizeMiniLilacToolName(part.toolName)
+              : normalizeMiniLilacToolName(displayClaudeCodeToolName(part.toolName));
             projection.toolInputsAvailable.set(part.toolCallId, {
               toolName,
               input: part.input,
@@ -4134,8 +4162,8 @@ class SessionActor {
               type: "tool-input-error",
               toolCallId: part.toolCallId,
               toolName: !projection.isClaudeCode
-                ? part.toolName
-                : displayClaudeCodeToolName(part.toolName),
+                ? normalizeMiniLilacToolName(part.toolName)
+                : normalizeMiniLilacToolName(displayClaudeCodeToolName(part.toolName)),
               input: toolInput?.input,
               errorText,
               dynamic: true,

@@ -57,12 +57,12 @@ describe("fs tool search wrappers", () => {
     );
   });
 
-  it("exposes edit_file only when enabled", async () => {
+  it("exposes edit only when enabled", async () => {
     const defaultTools = fsTool(baseDir);
     const editEnabledTools = fsTool(baseDir, { includeEditFile: true });
 
-    expect("edit_file" in defaultTools).toBe(false);
-    expect("edit_file" in editEnabledTools).toBe(true);
+    expect("edit" in defaultTools).toBe(false);
+    expect("edit" in editEnabledTools).toBe(true);
   });
 
   it("glob lists matching paths", async () => {
@@ -151,7 +151,7 @@ describe("fs tool search wrappers", () => {
     expect(out.error).toBeDefined();
     expect(out.error).toContain("rg");
     expect(out.truncationHint).toContain("Narrow the query");
-    expect(out.truncationHint).toContain("read_file");
+    expect(out.truncationHint).toContain("read");
     expect(Buffer.byteLength(JSON.stringify(out), "utf8")).toBeGreaterThan(64);
     expect(Buffer.byteLength(JSON.stringify(out), "utf8")).toBeLessThanOrEqual(512);
   });
@@ -171,7 +171,7 @@ describe("fs tool search wrappers", () => {
     expect(Buffer.byteLength(JSON.stringify(out), "utf8")).toBeLessThanOrEqual(300);
   });
 
-  it("caps read_file pages at 40 KiB characters", () => {
+  it("caps read pages at 40 KiB characters", () => {
     expect(readFileInputZod.safeParse({ path: "a.txt", maxCharacters: 40 * 1024 }).success).toBe(
       true,
     );

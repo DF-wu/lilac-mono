@@ -784,7 +784,7 @@ export async function executeLocalBash(
         ...(artifactUri ? { artifactUri } : {}),
         ...(artifactBytes === undefined ? {} : { artifactBytes }),
         message: artifactUri
-          ? `Bash output was truncated. Complete output: ${artifactUri}. Use read_file with this URI and start: { "type": "offset", "offset": 0 }. Reuse nextStart unchanged while hasMore is true.`
+          ? `Bash output was truncated. Complete output: ${artifactUri}. Use read with this URI and start: { "type": "offset", "offset": 0 }. Reuse nextStart unchanged while hasMore is true.`
           : "Bash output was truncated and the complete output could not be retained. Re-run the command with narrower output if needed.",
         originalStdoutBytes: stdoutStreamResult.totalBytes,
         originalStderrBytes: stderrStreamResult.totalBytes,
@@ -939,7 +939,7 @@ export function createBashTool(params: {
   return {
     bash: tool({
       description:
-        "Execute a command in local bash from the caller-supplied cwd. Commands are terminated after 3 minutes without stdout or stderr; timeoutMs optionally adds an independent wall-clock deadline. Output is capped with a head/tail preview and interactive stdin is disabled. When complete truncated output is retained, truncation.artifactUri can be paged with read_file using the returned nextStart. Bash safety blocks known destructive operations and protected paths but is not a sandbox. Set dangerouslyAllow=true only to intentionally bypass every Bash guardrail for one call.",
+        "Execute a command in local bash from the caller-supplied cwd. Commands are terminated after 3 minutes without stdout or stderr; timeoutMs optionally adds an independent wall-clock deadline. Output is capped with a head/tail preview and interactive stdin is disabled. When complete truncated output is retained, truncation.artifactUri can be paged with read using the returned nextStart. Bash safety blocks known destructive operations and protected paths but is not a sandbox. Set dangerouslyAllow=true only to intentionally bypass every Bash guardrail for one call.",
       inputSchema: bashInputSchema,
       execute: (input, { abortSignal, toolCallId }) => {
         const options = {

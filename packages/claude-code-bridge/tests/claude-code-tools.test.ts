@@ -308,6 +308,73 @@ describe("Claude Code tool bridge", () => {
     ]);
   });
 
+  it("prefers an exact legacy-named MCP tool over the compatibility alias", async () => {
+    const called: string[] = [];
+    const bridge = await createClaudeCodeToolBridge({
+      tools: {
+        read: tool({ inputSchema: z.object({}), execute: () => "unused" }),
+        read_file: tool({ inputSchema: z.object({}), execute: () => "unused" }),
+      },
+      execute: async (request) => {
+        called.push(request.toolName);
+        return {
+          result: "ok",
+          isError: false,
+          outcome: "success",
+          toolOutput: { type: "text", value: "ok" },
+        };
+      },
+    });
+    const client = await connectBridge(bridge);
+    const permission = await bridge.canUseTool(
+      "mcp__lilac__read_file",
+      {},
+      permissionOptions("legacy-exact"),
+    );
+    if (!permission || permission.behavior !== "allow") throw new Error("Expected allow");
+
+    await client.callTool({ name: "read_file", arguments: permission.updatedInput });
+
+    expect(called).toEqual(["read_file"]);
+  });
+
+  it("normalizes legacy batch children before MCP validation", async () => {
+    const inputs: unknown[] = [];
+    const bridge = await createClaudeCodeToolBridge({
+      tools: {
+        read: tool({ inputSchema: z.object({}), execute: () => "unused" }),
+        batch: tool({
+          inputSchema: z.object({
+            tool_calls: z.array(
+              z.object({ tool: z.literal("read"), parameters: z.record(z.string(), z.unknown()) }),
+            ),
+          }),
+          execute: () => "unused",
+        }),
+      },
+      execute: async (request) => {
+        inputs.push(request.input);
+        return {
+          result: "ok",
+          isError: false,
+          outcome: "success",
+          toolOutput: { type: "text", value: "ok" },
+        };
+      },
+    });
+    const client = await connectBridge(bridge);
+    const permission = await bridge.canUseTool(
+      "mcp__lilac__batch",
+      { tool_calls: [{ tool: "read_file", parameters: {} }] },
+      permissionOptions("legacy-batch"),
+    );
+    if (!permission || permission.behavior !== "allow") throw new Error("Expected allow");
+
+    await client.callTool({ name: "batch", arguments: permission.updatedInput });
+
+    expect(inputs).toEqual([{ tool_calls: [{ tool: "read", parameters: {} }] }]);
+  });
+
   it("skips provider-executed tools the model runs itself", async () => {
     const bridge = await createClaudeCodeToolBridge({
       tools: {
@@ -444,7 +511,7 @@ describe("Claude Code tool bridge", () => {
   it("marks Lilac built-ins always-load and gives deferred catalog tools search hints", async () => {
     const bridge = await createClaudeCodeToolBridge({
       tools: {
-        read_file: tool({
+        read: tool({
           description: "Read a workspace file",
           inputSchema: z.object({ path: z.string() }),
           execute: () => "value",
@@ -477,7 +544,7 @@ describe("Claude Code tool bridge", () => {
 
     const listed = await client.listTools();
     expect(listed.tools).toHaveLength(2);
-    expect(listed.tools.find((entry) => entry.name === "read_file")?._meta).toEqual({
+    expect(listed.tools.find((entry) => entry.name === "read")?._meta).toEqual({
       "anthropic/alwaysLoad": true,
     });
     expect(listed.tools.find((entry) => entry.name === "mcp_issue_tracker_lookup")?._meta).toEqual({
@@ -517,7 +584,8 @@ describe("Claude Code tool bridge", () => {
   });
 
   it("formats only the Lilac MCP namespace for display", () => {
-    expect(displayClaudeCodeToolName("mcp__lilac__read_file")).toBe("read_file");
+    expect(displayClaudeCodeToolName("mcp__lilac__read")).toBe("read");
+    expect(displayClaudeCodeToolName("mcp__lilac__read_file")).toBe("read");
     expect(displayClaudeCodeToolName("mcp__other__read_file")).toBe("mcp__other__read_file");
   });
 });

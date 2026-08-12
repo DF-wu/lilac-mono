@@ -351,7 +351,7 @@ rmdir "$media_dir"`,
       expect(res.truncation?.completeOutputRetained).toBe(true);
       expect(res.truncation?.originalStdoutBytes).toBe(210_030);
       expect(res.truncation?.originalStderrBytes).toBe(0);
-      expect(res.truncation?.message).toContain("Use read_file with this URI");
+      expect(res.truncation?.message).toContain("Use read with this URI");
       expect(persistenceTempEntries).toHaveLength(1);
       expect(persistenceTempEntries[0]).toEndWith(".stdout.part");
       expect(persistenceTempEntries.some((entry) => entry.endsWith(".sanitized"))).toBe(false);

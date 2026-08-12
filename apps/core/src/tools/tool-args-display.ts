@@ -270,8 +270,20 @@ export const formatBatchToolArgs: ToolArgsFormatter = (args) => {
 };
 
 export function formatToolArgsForDisplay(toolName: string, args: unknown): string {
-  // Back-compat for older transcripts and callers that used the pre-Level-1 name.
-  return toolName === "readFile" ? formatReadFileToolArgs(args) : "";
+  switch (toolName) {
+    case "read":
+    case "read_file":
+    case "readFile":
+      return formatReadFileToolArgs(args);
+    case "edit":
+    case "edit_file":
+      return formatEditFileToolArgs(args);
+    case "patch":
+    case "apply_patch":
+      return formatApplyPatchToolArgs(args);
+    default:
+      return "";
+  }
 }
 
 export function formatToolArgsForDisplayWithSpecs(

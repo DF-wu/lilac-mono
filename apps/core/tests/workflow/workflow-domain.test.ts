@@ -69,7 +69,7 @@ describe("durable workflow domain", () => {
     expect(() =>
       normalizeWorkflowResourcePolicy({
         ...resources(),
-        agents: { ...resources().agents, tools: ["read_file"] },
+        agents: { ...resources().agents, tools: ["read"] },
       }),
     ).toThrow("Unrecognized key");
     expect(() =>

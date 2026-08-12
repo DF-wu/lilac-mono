@@ -1,12 +1,12 @@
 /** Tools that can be selected in Mini Lilac runtime profile configuration. */
 export const MINI_LILAC_EXECUTABLE_TOOL_NAMES = [
   "bash",
-  "read_file",
+  "read",
   "glob",
   "grep",
   "fuzzy_search",
-  "edit_file",
-  "apply_patch",
+  "edit",
+  "patch",
   "subagent_delegate",
   "batch",
   "skill",
@@ -21,12 +21,12 @@ export const MINI_LILAC_SYNTHETIC_TOOL_NAMES = ["subagent_result"] as const;
 /** Complete protocol catalog consumed by transcript projection. */
 export const MINI_LILAC_TOOL_NAMES = [
   "bash",
-  "read_file",
+  "read",
   "glob",
   "grep",
   "fuzzy_search",
-  "edit_file",
-  "apply_patch",
+  "edit",
+  "patch",
   "subagent_delegate",
   "subagent_result",
   "batch",
@@ -39,3 +39,17 @@ export const MINI_LILAC_TOOL_NAMES = [
 export type MiniLilacExecutableToolName = (typeof MINI_LILAC_EXECUTABLE_TOOL_NAMES)[number];
 export type MiniLilacSyntheticToolName = (typeof MINI_LILAC_SYNTHETIC_TOOL_NAMES)[number];
 export type MiniLilacToolName = (typeof MINI_LILAC_TOOL_NAMES)[number];
+
+/** Compatibility mapping for configurations and transcripts written before the rename. */
+export function normalizeMiniLilacToolName(name: string): string {
+  switch (name) {
+    case "read_file":
+      return "read";
+    case "edit_file":
+      return "edit";
+    case "apply_patch":
+      return "patch";
+    default:
+      return name;
+  }
+}

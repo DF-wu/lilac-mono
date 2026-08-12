@@ -104,7 +104,7 @@ async function executeApplyPatchResult(params: {
             new ApplyPatchAccessDenied({
               resolvedPath: deniedPath,
               operation: "apply_patch",
-              message: `Access denied: '${deniedPath}' is blocked for apply_patch when cwd=${cwdTarget.cwd}`,
+              message: `Access denied: '${deniedPath}' is blocked for patch when cwd=${cwdTarget.cwd}`,
             }),
           );
         }

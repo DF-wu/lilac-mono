@@ -192,7 +192,7 @@ function subagentMessagesResponse(): Response {
         parts: [
           {
             type: "dynamic-tool",
-            toolName: "read_file",
+            toolName: "read",
             toolCallId: "read-1",
             state: "output-available",
             input: { path: "/workspace/first.ts" },
@@ -200,7 +200,7 @@ function subagentMessagesResponse(): Response {
           },
           {
             type: "dynamic-tool",
-            toolName: "read_file",
+            toolName: "read",
             toolCallId: "read-2",
             state: "output-available",
             input: { path: "/workspace/second.ts" },
@@ -621,7 +621,7 @@ describe("MiniLilacApp tool interactions", () => {
           parts: [
             {
               type: "dynamic-tool",
-              toolName: "apply_patch",
+              toolName: "patch",
               toolCallId: "patch-summary-1",
               state: "output-available",
               input: { patchText },
@@ -660,7 +660,7 @@ describe("MiniLilacApp tool interactions", () => {
         parts: [
           {
             type: "dynamic-tool",
-            toolName: "apply_patch",
+            toolName: "patch",
             toolCallId: "patch-nearby-1",
             state: "output-available",
             input: {
@@ -671,7 +671,7 @@ describe("MiniLilacApp tool interactions", () => {
           },
           {
             type: "dynamic-tool",
-            toolName: "apply_patch",
+            toolName: "patch",
             toolCallId: "patch-nearby-2",
             state: "output-available",
             input: {
@@ -1147,7 +1147,7 @@ describe("MiniLilacApp tool interactions", () => {
           },
           {
             type: "dynamic-tool",
-            toolName: "read_file",
+            toolName: "read",
             toolCallId: "read-surfaces-1",
             state: "output-available",
             input: { path: "/workspace/src/app.ts" },
@@ -1155,7 +1155,7 @@ describe("MiniLilacApp tool interactions", () => {
           },
           {
             type: "dynamic-tool",
-            toolName: "apply_patch",
+            toolName: "patch",
             toolCallId: "patch-surfaces-1",
             state: "output-available",
             input: {
@@ -1494,7 +1494,7 @@ describe("MiniLilacApp tool interactions", () => {
             },
             {
               type: "dynamic-tool",
-              toolName: "read_file",
+              toolName: "read",
               toolCallId: "read-narrow",
               state: "output-available",
               input: { path: "src/app.ts" },
@@ -1502,7 +1502,7 @@ describe("MiniLilacApp tool interactions", () => {
             },
             {
               type: "dynamic-tool",
-              toolName: "apply_patch",
+              toolName: "patch",
               toolCallId: "patch-narrow",
               state: "output-available",
               input: {
@@ -1758,7 +1758,7 @@ describe("MiniLilacApp tool interactions", () => {
         parts: [
           {
             type: "dynamic-tool",
-            toolName: "read_file",
+            toolName: "read",
             toolCallId: "read-failed",
             state: "output-error",
             input: { path: "src/missing.ts" },
