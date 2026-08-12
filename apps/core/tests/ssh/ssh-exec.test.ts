@@ -821,7 +821,7 @@ wait "$witness_pid"
       bunxPath,
       `#!/usr/bin/env bash
 set -euo pipefail
-if [ "\${1:-}" != "@stanley2058/lilac-remote-fs-runner@0.0.4" ]; then
+if [ "\${1:-}" != "@stanley2058/lilac-remote-fs-runner@0.0.5" ]; then
   printf '%s' '{"ok":false,"error":"unexpected remote fs runner package spec"}'
   exit 0
 fi
@@ -1113,7 +1113,7 @@ printf '%s' '{"ok":false,"error":"npx should not be used when bunx exists"}'
         error: z.string(),
       })
       .parse(fuzzyOutput);
-    expect(fuzzyFailure.error).toContain("remote fff fuzzy_search unavailable");
+    expect(fuzzyFailure.error).toContain("remote fuzzy_search unavailable");
     expect(patchOutput.ok).toBeFalse();
     if (!patchOutput.ok)
       expect(patchOutput.error).toContain("invalid apply_patch response payload");

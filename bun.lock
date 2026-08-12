@@ -251,6 +251,7 @@
       "dependencies": {
         "@ff-labs/fff-node": "^0.9.4",
         "better-result": "catalog:",
+        "fzf": "^0.5.2",
         "zod": "^4.3.6",
       },
       "devDependencies": {
@@ -323,7 +324,7 @@
     },
     "packages/remote-fs-runner": {
       "name": "@stanley2058/lilac-remote-fs-runner",
-      "version": "0.0.4",
+      "version": "0.0.5",
       "bin": {
         "lilac-remote-fs": "dist/cli.js",
       },

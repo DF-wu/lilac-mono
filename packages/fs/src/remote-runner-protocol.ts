@@ -3,6 +3,7 @@ import { z } from "zod";
 
 const finiteNumberSchema = z.number().finite();
 const effectiveSearchBackendSchema = z.enum(["fff", "node-rg", "node-fs"]);
+const effectiveFuzzySearchBackendSchema = z.enum(["fff", "fzf"]);
 const readErrorCodeSchema = z.enum(["NOT_FOUND", "PERMISSION", "UNKNOWN"]);
 const editErrorCodeSchema = z.enum([
   "NOT_FOUND",
@@ -343,7 +344,7 @@ export const remoteFuzzySearchResponseSchema = z.union([
     totalMatched: finiteNumberSchema,
     totalFiles: finiteNumberSchema,
     truncated: z.boolean(),
-    effectiveBackend: z.literal("fff"),
+    effectiveBackend: effectiveFuzzySearchBackendSchema,
     error: z.undefined().optional(),
   }),
   z.object({
@@ -351,7 +352,7 @@ export const remoteFuzzySearchResponseSchema = z.union([
     totalMatched: z.literal(0),
     totalFiles: z.literal(0),
     truncated: z.literal(false),
-    effectiveBackend: effectiveSearchBackendSchema.optional(),
+    effectiveBackend: effectiveFuzzySearchBackendSchema.optional(),
     error: z.string(),
   }),
 ]);

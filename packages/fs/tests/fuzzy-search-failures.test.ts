@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
@@ -35,7 +35,7 @@ describe("FFF fuzzy search failures", () => {
         totalMatched: 0,
         totalFiles: 0,
         truncated: false,
-        error: "fff fuzzy file search is unavailable for this path",
+        error: "fuzzy file search is unavailable for this path",
       });
     } finally {
       fileSearch.mockRestore();
@@ -52,6 +52,27 @@ describe("FFF fuzzy search failures", () => {
       expect(
         new FileSystem(root, { fsBackend: "fff" }).fuzzySearchFiles({ query: "fixture" }),
       ).rejects.toBe(panic);
+    } finally {
+      fileSearch.mockRestore();
+    }
+  });
+
+  it("falls back to fzf when fileSearch throws and fallback is enabled", async () => {
+    await writeFile(path.join(root, "fixture-target.ts"), "export const target = true;\n");
+    const fileSearch = spyOn(FileFinder.prototype, "fileSearch").mockImplementation(() => {
+      throw new Error("FFF file search failed");
+    });
+
+    try {
+      const result = await new FileSystem(root, {
+        fsBackend: "fff",
+        fuzzySearchFallback: "fzf",
+      }).fuzzySearchFiles({ query: "fixture-target" });
+
+      expect(fileSearch).toHaveBeenCalled();
+      expect(result.error).toBeUndefined();
+      expect(result.effectiveBackend).toBe("fzf");
+      expect(result.results.map((entry) => entry.path)).toEqual(["fixture-target.ts"]);
     } finally {
       fileSearch.mockRestore();
     }

@@ -6,6 +6,7 @@ import {
   READ_ERROR_CODES,
   expandTilde,
   grepText,
+  type EffectiveFuzzySearchBackend,
   type EffectiveSearchBackend,
   type FileEdit,
   type FsBackend,
@@ -342,6 +343,7 @@ function grepFailure(mode: GrepMode, error: string): GrepOutput {
 }
 
 type SearchBackendMetadata = { effectiveBackend?: EffectiveSearchBackend };
+type FuzzySearchBackendMetadata = { effectiveBackend?: EffectiveFuzzySearchBackend };
 
 function stripGlobMetadata(output: GlobOutput & SearchBackendMetadata): GlobOutput {
   const { effectiveBackend: _effectiveBackend, ...rest } = output;
@@ -349,7 +351,7 @@ function stripGlobMetadata(output: GlobOutput & SearchBackendMetadata): GlobOutp
 }
 
 function stripFuzzySearchMetadata(
-  output: FuzzySearchOutput & SearchBackendMetadata,
+  output: FuzzySearchOutput & FuzzySearchBackendMetadata,
 ): FuzzySearchOutput {
   const { effectiveBackend: _effectiveBackend, ...rest } = output;
   return rest;
@@ -769,6 +771,7 @@ export function fsTool(
     denyPaths,
     fsBackend,
     fffCacheDir: FFF_CACHE_DIR,
+    fuzzySearchFallback: "fzf",
   });
 
   const attachmentExts = new Set([".png", ".jpg", ".jpeg", ".gif", ".webp", ".pdf"]);
@@ -1368,7 +1371,7 @@ export function fsTool(
       ? {
           fuzzy_search: tool({
             description:
-              "Fuzzy-ranked file/path search powered by FFF. Use this when you know an approximate filename, symbol-adjacent path, or path fragment and want likely files. Use grep instead when searching file contents or exact text inside files. Supports SSH cwd targets when the remote fff runner can be installed. Denylisted paths require dangerouslyAllow=true.",
+              "Fuzzy-ranked file/path search powered by FFF with an on-demand fzf fallback. Use this when you know an approximate filename, symbol-adjacent path, or path fragment and want likely files. Use grep instead when searching file contents or exact text inside files. Supports SSH cwd targets when the remote filesystem runner can be installed. Denylisted paths require dangerouslyAllow=true.",
             inputSchema: fuzzySearchInputZod,
             outputSchema: fuzzySearchOutputZod,
             execute: async (
@@ -1407,7 +1410,7 @@ export function fsTool(
                     totalMatched: 0,
                     totalFiles: 0,
                     truncated: false,
-                    error: `remote fff fuzzy_search unavailable: ${remoteResult.error.message}`,
+                    error: `remote fuzzy_search unavailable: ${remoteResult.error.message}`,
                   };
                 }
 

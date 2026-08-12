@@ -595,4 +595,21 @@ describe("fs tool search wrappers", () => {
     expect(result.error).toBeUndefined();
     expect(Array.isArray(result.results)).toBe(true);
   });
+
+  it("falls back to fzf when a denied descendant prevents FFF indexing", async () => {
+    const deniedDir = path.join(baseDir, "denied");
+    await mkdir(deniedDir);
+    await writeFile(path.join(deniedDir, "denied-target.ts"), "denied\n");
+    await writeFile(path.join(baseDir, "src", "allowed-target.ts"), "allowed\n");
+    const tools = fsTool(baseDir, { fsBackend: "fff", denyPaths: [deniedDir] });
+    const fuzzySearch = tools.fuzzy_search;
+    if (!fuzzySearch?.execute) throw new Error("expected fuzzy_search execute");
+
+    const out = await resolveExecuteResult(
+      fuzzySearch.execute({ query: "target", maxResults: 10 }, toolOptions("fuzzy-fallback")),
+    );
+
+    expect(out.error).toBeUndefined();
+    expect(out.results.map((entry) => entry.path)).toEqual(["src/allowed-target.ts"]);
+  });
 });

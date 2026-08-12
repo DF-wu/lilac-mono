@@ -6,7 +6,9 @@ import { z } from "zod";
 import {
   decodeBundledRemoteRunnerRequestJson,
   decodeRemoteFsDaemonRequest,
+  decodeRemoteFuzzySearchResponseJson,
   decodeRemoteGlobResponseJson,
+  decodeRemoteGrepResponseJson,
   decodeRemoteReadTextResponseJson,
   decodeRemoteRunnerResponseJson,
 } from "../src/remote-runner-protocol";
@@ -84,6 +86,56 @@ describe("remote runner request protocol", () => {
 });
 
 describe("remote runner response protocol", () => {
+  it("accepts fzf-backed fuzzy search responses", () => {
+    const decoded = decodeRemoteFuzzySearchResponseJson(
+      JSON.stringify({
+        ok: true,
+        value: {
+          results: [
+            {
+              path: "src/index.ts",
+              fileName: "index.ts",
+              size: 42,
+              gitStatus: "unknown",
+              score: 10,
+              matchType: "fuzzy",
+            },
+          ],
+          totalMatched: 1,
+          totalFiles: 2,
+          truncated: false,
+          effectiveBackend: "fzf",
+        },
+      }),
+    );
+
+    expect(decoded.status).toBe("ok");
+    if (decoded.status === "error") throw new Error(decoded.error.message);
+    expect(decoded.value.effectiveBackend).toBe("fzf");
+  });
+
+  it("rejects fzf metadata for glob and grep responses", () => {
+    const glob = decodeRemoteGlobResponseJson(
+      JSON.stringify({
+        ok: true,
+        value: { mode: "default", paths: [], truncated: false, effectiveBackend: "fzf" },
+      }),
+    );
+    const grep = decodeRemoteGrepResponseJson(
+      JSON.stringify({
+        ok: true,
+        value: { mode: "default", results: [], truncated: false, effectiveBackend: "fzf" },
+      }),
+    );
+
+    expect(glob.status === "error" ? glob.error._tag : "ok").toBe(
+      "RemoteRunnerResponsePayloadError",
+    );
+    expect(grep.status === "error" ? grep.error._tag : "ok").toBe(
+      "RemoteRunnerResponsePayloadError",
+    );
+  });
+
   it("accepts existing successful and operation-specific failure fixtures", () => {
     const success = decodeRemoteReadTextResponseJson(
       JSON.stringify({

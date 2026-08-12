@@ -1,11 +1,12 @@
 import fs from "node:fs/promises";
 import { createHash } from "node:crypto";
-import { join, relative, sep } from "node:path";
+import { basename, join, relative, sep } from "node:path";
 
 import type { FileFinderApi } from "@ff-labs/fff-node";
 import { Panic, Result, TaggedError, type Result as ResultType } from "better-result";
+import { AsyncFzf } from "fzf";
 
-import { captureFilesystemOperation } from "./filesystem-operation";
+import { captureFilesystemOperation, type FileSystemOperationFailed } from "./filesystem-operation";
 import {
   ripgrep,
   type GrepMatch,
@@ -17,6 +18,7 @@ import {
 export const FS_BACKENDS = ["fff", "node-rg"] as const;
 export type FsBackend = (typeof FS_BACKENDS)[number];
 export type EffectiveSearchBackend = FsBackend | "node-fs";
+export type EffectiveFuzzySearchBackend = "fff" | "fzf";
 
 export type GlobSearchResult = {
   paths: string[];
@@ -36,7 +38,7 @@ export type FuzzyFileSearchResult = {
   totalMatched: number;
   totalFiles: number;
   truncated: boolean;
-  effectiveBackend: "fff";
+  effectiveBackend: EffectiveFuzzySearchBackend;
 };
 
 export type FffPrewarmResult = {
@@ -112,6 +114,8 @@ type FffStoragePaths = {
 };
 
 const MAX_FFF_FINDER_CACHE_ENTRIES = 8;
+const MAX_FZF_FILES = 10_000;
+const FZF_SCAN_BUDGET_MS = 10_000;
 const fffFindersByBasePath = new Map<string, FffFinderEntry>();
 const FFF_NODE_PACKAGE = ["@ff-labs", "fff-node"].join("/");
 
@@ -174,6 +178,19 @@ function shouldFallbackForDenyPaths(params: {
   }
 
   return false;
+}
+
+function isDeniedPath(path: string, denyPaths: readonly string[]): boolean {
+  return denyPaths.some((denyPath) => path === denyPath || path.startsWith(`${denyPath}${sep}`));
+}
+
+function isSkippableTraversalError(error: FileSystemOperationFailed): boolean {
+  return (
+    error.code === "EACCES" ||
+    error.code === "EPERM" ||
+    error.code === "ENOENT" ||
+    error.code === "ENOTDIR"
+  );
 }
 
 async function getFffFinder(basePath: string, cacheDir?: string): Promise<FileFinderApi | null> {
@@ -310,6 +327,125 @@ export async function fuzzyFileSearch(params: {
     totalFiles: result.value.totalFiles,
     truncated: result.value.items.length > limit || result.value.totalMatched > limit,
     effectiveBackend: "fff",
+  };
+}
+
+export async function fzfFileSearch(params: {
+  cwd: string;
+  query: string;
+  maxResults: number;
+  denyPaths: readonly string[];
+  dangerouslyAllow: boolean;
+}): Promise<FuzzyFileSearchResult | null> {
+  const files: string[] = [];
+  const pendingDirectories = [params.cwd];
+  const scanDeadline = Date.now() + FZF_SCAN_BUDGET_MS;
+  let scanTruncated = false;
+
+  while (pendingDirectories.length > 0) {
+    if (files.length >= MAX_FZF_FILES || Date.now() >= scanDeadline) {
+      scanTruncated = true;
+      break;
+    }
+    const directory = pendingDirectories.pop();
+    if (!directory) break;
+    if (!params.dangerouslyAllow && isDeniedPath(directory, params.denyPaths)) continue;
+
+    const directoryStats = await captureFilesystemOperation("inspect fzf search directory", () =>
+      fs.lstat(directory),
+    );
+    if (directoryStats.status === "error") {
+      if (isSkippableTraversalError(directoryStats.error)) continue;
+      return null;
+    }
+    if (!directoryStats.value.isDirectory()) continue;
+
+    const opened = await captureFilesystemOperation("open fzf search directory", () =>
+      fs.opendir(directory),
+    );
+    if (opened.status === "error") {
+      if (isSkippableTraversalError(opened.error)) continue;
+      return null;
+    }
+
+    const canonicalDirectory = await captureFilesystemOperation(
+      "resolve opened fzf search directory",
+      () => fs.realpath(directory),
+    );
+    if (
+      canonicalDirectory.status === "error" ||
+      canonicalDirectory.value !== directory ||
+      (!params.dangerouslyAllow && isDeniedPath(canonicalDirectory.value, params.denyPaths))
+    ) {
+      await captureFilesystemOperation("close skipped fzf search directory", () =>
+        opened.value.close(),
+      );
+      if (
+        canonicalDirectory.status === "error" &&
+        !isSkippableTraversalError(canonicalDirectory.error)
+      ) {
+        return null;
+      }
+      continue;
+    }
+
+    const childDirectories: string[] = [];
+    const iterated = await captureFilesystemOperation("iterate fzf search directory", async () => {
+      for await (const dirent of opened.value) {
+        if (files.length >= MAX_FZF_FILES || Date.now() >= scanDeadline) {
+          scanTruncated = true;
+          break;
+        }
+        const absolutePath = join(directory, dirent.name);
+        if (!params.dangerouslyAllow && isDeniedPath(absolutePath, params.denyPaths)) continue;
+        if (dirent.isDirectory()) {
+          childDirectories.push(absolutePath);
+        } else if (dirent.isFile()) {
+          files.push(relative(params.cwd, absolutePath).split(sep).join("/"));
+        }
+      }
+    });
+    if (iterated.status === "error") {
+      if (isSkippableTraversalError(iterated.error)) continue;
+      return null;
+    }
+
+    childDirectories.sort().reverse();
+    pendingDirectories.push(...childDirectories);
+  }
+
+  const limit = Math.max(1, params.maxResults);
+  files.sort();
+  const matches = await new AsyncFzf(files).find(params.query);
+  const results: FuzzyFileSearchResult["results"] = [];
+
+  for (const match of matches) {
+    if (results.length >= limit) break;
+    const stats = await captureFilesystemOperation("inspect fzf search result", () =>
+      fs.lstat(join(params.cwd, match.item)),
+    );
+    if (stats.status === "error") {
+      if (isSkippableTraversalError(stats.error)) continue;
+      return null;
+    }
+    if (!stats.value.isFile()) continue;
+
+    results.push({
+      path: match.item,
+      fileName: basename(match.item),
+      size: stats.value.size,
+      gitStatus: "unknown",
+      score: match.score,
+      matchType: "fuzzy",
+    });
+  }
+
+  return {
+    results,
+    totalMatched: matches.length,
+    totalFiles: files.length,
+    truncated: scanTruncated || matches.length > results.length,
+    effectiveBackend: "fzf",
   };
 }
 

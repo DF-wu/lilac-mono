@@ -33,8 +33,10 @@ import {
 
 import {
   fuzzyFileSearch,
+  fzfFileSearch,
   getSearchBackend,
   type EffectiveSearchBackend,
+  type EffectiveFuzzySearchBackend,
   type FsBackend,
   type FuzzyFileSearchResult,
 } from "./search-backend";
@@ -582,7 +584,7 @@ export type FuzzySearchResult =
       totalMatched: 0;
       totalFiles: 0;
       truncated: false;
-      effectiveBackend?: EffectiveSearchBackend;
+      effectiveBackend?: EffectiveFuzzySearchBackend;
       error: string;
     };
 
@@ -644,6 +646,7 @@ export class FileSystem {
   private readonly denyPaths: readonly string[];
   private readonly fsBackend: FsBackend;
   private readonly fffCacheDir: string | undefined;
+  private readonly fuzzySearchFallback: "fzf" | undefined;
 
   constructor(
     private root: string,
@@ -652,6 +655,7 @@ export class FileSystem {
       denyPaths?: readonly string[];
       fsBackend?: FsBackend;
       fffCacheDir?: string;
+      fuzzySearchFallback?: "fzf";
     },
   ) {
     this.denyPaths = (opts?.denyPaths ?? []).flatMap((p) => {
@@ -667,6 +671,7 @@ export class FileSystem {
     });
     this.fsBackend = opts?.fsBackend ?? "node-rg";
     this.fffCacheDir = opts?.fffCacheDir ? resolve(expandTilde(opts.fffCacheDir)) : undefined;
+    this.fuzzySearchFallback = opts?.fuzzySearchFallback;
   }
 
   private isDeniedPath(resolvedPath: string): boolean {
@@ -1965,7 +1970,7 @@ export class FileSystem {
       };
     }
 
-    const result = await fuzzyFileSearch({
+    let result = await fuzzyFileSearch({
       cwd: canonicalBaseDir,
       query,
       maxResults,
@@ -1974,13 +1979,23 @@ export class FileSystem {
       cacheDir: this.fffCacheDir,
     });
 
+    if (!result && this.fuzzySearchFallback === "fzf") {
+      result = await fzfFileSearch({
+        cwd: canonicalBaseDir,
+        query,
+        maxResults,
+        denyPaths: this.denyPaths,
+        dangerouslyAllow,
+      });
+    }
+
     if (!result) {
       return {
         results: [],
         totalMatched: 0,
         totalFiles: 0,
         truncated: false,
-        error: "fff fuzzy file search is unavailable for this path",
+        error: "fuzzy file search is unavailable for this path",
       };
     }
 

@@ -271,6 +271,7 @@ export async function handleRequest(envelope: RemoteFsDaemonRequest): Promise<Re
     denyPaths: envelope.denyPaths,
     fsBackend: "fff",
     fffCacheDir: fffCacheDir(),
+    fuzzySearchFallback: "fzf",
   });
 
   switch (envelope.op) {
