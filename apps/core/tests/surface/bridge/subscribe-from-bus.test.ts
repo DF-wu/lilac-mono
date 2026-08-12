@@ -46,6 +46,8 @@ import { createGithubRelayPolicy } from "../../../src/surface/github/github-runt
 import {
   SurfaceIngressAcknowledgementCleanupFailed,
   SurfaceRelayRestoreApplyFailed,
+  type SurfaceRelayHandle,
+  type SurfaceRelaySnapshotFor,
 } from "../../../src/surface/runtime-descriptor";
 import {
   GRACEFUL_RESTART_SNAPSHOT_VERSION,
@@ -302,6 +304,17 @@ async function bridgeBusToAdapter(
     platform: "github",
     policy: createGithubRelayPolicy(),
   });
+}
+
+async function applyAndActivateRelayRecovery<P extends "discord" | "github">(
+  bridge: Pick<SurfaceRelayHandle<P>, "prepareRestoreRelays">,
+  snapshots: readonly SurfaceRelaySnapshotFor<P>[],
+): Promise<void> {
+  const prepared = bridge.prepareRestoreRelays(snapshots);
+  if (prepared.status === "error") throw prepared.error;
+  const applied = await prepared.value.apply();
+  if (applied.status === "error") throw applied.error;
+  prepared.value.activate();
 }
 
 function relayFailure(error: SurfaceOperationError): BusToAdapterEffectFailed {
@@ -2452,7 +2465,7 @@ describe("bridgeBusToAdapter", () => {
       idleTimeoutMs: 10_000,
     });
 
-    await bridge.restoreRelays([
+    await applyAndActivateRelayRecovery(bridge, [
       {
         requestId,
         sessionId: "chan",
@@ -2614,7 +2627,7 @@ describe("bridgeBusToAdapter", () => {
         idleTimeoutMs: 10_000,
       });
 
-      await bridge.restoreRelays([
+      await applyAndActivateRelayRecovery(bridge, [
         {
           requestId,
           sessionId,
@@ -2658,7 +2671,7 @@ describe("bridgeBusToAdapter", () => {
       idleTimeoutMs: 10_000,
     });
 
-    await bridge.restoreRelays([
+    await applyAndActivateRelayRecovery(bridge, [
       {
         requestId,
         sessionId,
@@ -2765,7 +2778,7 @@ describe("bridgeBusToAdapter", () => {
           subscriptionId: `${platform}-terminal-restored-${crypto.randomUUID()}`,
           idleTimeoutMs: 10_000,
         });
-        await restoredBridge.restoreRelays(loaded.value.snapshot.relays);
+        await applyAndActivateRelayRecovery(restoredBridge, loaded.value.snapshot.relays);
         await bus.publish(
           lilacEventTypes.EvtAgentOutputResponseText,
           { finalText: "" },
@@ -2805,8 +2818,8 @@ describe("bridgeBusToAdapter", () => {
       visibleText: "partial",
       toolStatus: [],
     } satisfies BusToAdapterRelaySnapshot;
-    await bridge.restoreRelays([snapshot]);
-    await bridge.restoreRelays([snapshot]);
+    await applyAndActivateRelayRecovery(bridge, [snapshot]);
+    await applyAndActivateRelayRecovery(bridge, [snapshot]);
 
     expect(adapter.starts).toHaveLength(1);
     expect(adapter.starts[0]?.opts?.replyTo).toBeUndefined();
@@ -2842,7 +2855,7 @@ describe("bridgeBusToAdapter", () => {
     expect(adapter.stream?.aborted).toBe("restore_start_failed");
   });
 
-  it("rolls back earlier direct restores when a later relay admission fails", async () => {
+  it("rolls back earlier paused restores when a later relay admission fails", async () => {
     let outputSubscriptionStarts = 0;
     const bus = createLilacBus(
       createInMemoryRawBus(undefined, undefined, true, (topic) => {
@@ -2861,7 +2874,7 @@ describe("bridgeBusToAdapter", () => {
     });
 
     await expect(
-      bridge.restoreRelays([
+      applyAndActivateRelayRecovery(bridge, [
         {
           requestId: "discord:chan:restore-first",
           sessionId: "chan",
@@ -2893,7 +2906,7 @@ describe("bridgeBusToAdapter", () => {
     await bus.close();
   });
 
-  it("signals atomicity-unknown Panic when direct restore cleanup fails", async () => {
+  it("signals atomicity-unknown Panic when paused restore cleanup fails", async () => {
     let outputSubscriptionStarts = 0;
     const bus = createLilacBus(
       createInMemoryRawBus(undefined, undefined, true, (topic) => {
@@ -2921,7 +2934,7 @@ describe("bridgeBusToAdapter", () => {
     });
     let failure: unknown;
     try {
-      await bridge.restoreRelays([
+      await applyAndActivateRelayRecovery(bridge, [
         {
           requestId: "discord:chan:restore-first",
           sessionId: "chan",
@@ -3116,7 +3129,7 @@ describe("bridgeBusToAdapter", () => {
         idleTimeoutMs: 10_000,
       });
 
-      await bridge.restoreRelays([
+      await applyAndActivateRelayRecovery(bridge, [
         {
           requestId,
           sessionId: "chan",
@@ -3147,7 +3160,7 @@ describe("bridgeBusToAdapter", () => {
     });
     const replyTo = { platform: "discord" as const, channelId: "chan", messageId: "persisted" };
 
-    await bridge.restoreRelays([
+    await applyAndActivateRelayRecovery(bridge, [
       {
         requestId: "discord:malformed",
         sessionId: "chan",
@@ -3178,7 +3191,7 @@ describe("bridgeBusToAdapter", () => {
       idleTimeoutMs: 10_000,
     });
 
-    await bridge.restoreRelays([
+    await applyAndActivateRelayRecovery(bridge, [
       {
         requestId: "discord:chan:valid-request",
         sessionId: "chan",
@@ -3255,7 +3268,7 @@ describe("bridgeBusToAdapter", () => {
       idleTimeoutMs: 10_000,
     });
 
-    await bridgeB.restoreRelays([snapshot]);
+    await applyAndActivateRelayRecovery(bridgeB, [snapshot]);
 
     expect(adapterB.starts).toHaveLength(1);
     expect(adapterB.starts[0]?.opts?.resume?.created).toEqual(snapshot.createdOutputRefs);
@@ -3307,7 +3320,7 @@ describe("bridgeBusToAdapter", () => {
       idleTimeoutMs: 10_000,
     });
 
-    await bridge.restoreRelays([
+    await applyAndActivateRelayRecovery(bridge, [
       {
         requestId,
         sessionId: "chan",
@@ -3369,7 +3382,7 @@ describe("bridgeBusToAdapter", () => {
       idleTimeoutMs: 10_000,
     });
 
-    await bridge.restoreRelays([
+    await applyAndActivateRelayRecovery(bridge, [
       {
         requestId,
         sessionId: "chan",
@@ -3416,7 +3429,7 @@ describe("bridgeBusToAdapter", () => {
       idleTimeoutMs: 10_000,
     });
 
-    await bridge.restoreRelays([
+    await applyAndActivateRelayRecovery(bridge, [
       {
         requestId,
         sessionId: "chan",
@@ -3465,7 +3478,7 @@ describe("bridgeBusToAdapter", () => {
       idleTimeoutMs: 10_000,
     });
 
-    await bridge.restoreRelays([
+    await applyAndActivateRelayRecovery(bridge, [
       {
         requestId,
         sessionId: "chan",
@@ -3512,7 +3525,7 @@ describe("bridgeBusToAdapter", () => {
       idleTimeoutMs: 10_000,
     });
 
-    await bridge.restoreRelays([
+    await applyAndActivateRelayRecovery(bridge, [
       {
         requestId,
         sessionId: "chan",
@@ -3564,7 +3577,7 @@ describe("bridgeBusToAdapter", () => {
       idleTimeoutMs: 10_000,
     });
 
-    await bridge.restoreRelays([
+    await applyAndActivateRelayRecovery(bridge, [
       {
         requestId,
         sessionId: "chan",
@@ -3616,7 +3629,7 @@ describe("bridgeBusToAdapter", () => {
       idleTimeoutMs: 10_000,
     });
 
-    await bridge.restoreRelays([
+    await applyAndActivateRelayRecovery(bridge, [
       {
         requestId,
         sessionId: "chan",
@@ -3661,7 +3674,7 @@ describe("bridgeBusToAdapter", () => {
       idleTimeoutMs: 10_000,
     });
 
-    await bridge.restoreRelays([
+    await applyAndActivateRelayRecovery(bridge, [
       {
         requestId,
         sessionId: "chan",
@@ -3741,7 +3754,7 @@ describe("bridgeBusToAdapter", () => {
       idleTimeoutMs: 10_000,
     });
 
-    await bridgeB.restoreRelays([snapshot]);
+    await applyAndActivateRelayRecovery(bridgeB, [snapshot]);
 
     // No new deltas were published after restore; only final arrives.
     await bus.publish(
@@ -3776,7 +3789,7 @@ describe("bridgeBusToAdapter", () => {
       idleTimeoutMs: 10_000,
     });
 
-    await bridge.restoreRelays([
+    await applyAndActivateRelayRecovery(bridge, [
       {
         requestId,
         sessionId: "chan",
@@ -3888,7 +3901,7 @@ describe("bridgeBusToAdapter", () => {
       idleTimeoutMs: 10_000,
     });
 
-    await bridge.restoreRelays([
+    await applyAndActivateRelayRecovery(bridge, [
       {
         requestId,
         sessionId: "chan",

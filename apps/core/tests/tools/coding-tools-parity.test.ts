@@ -8,15 +8,13 @@ import {
   createGrepInputSchema,
   createReadFileInputSchema,
   LEVEL1_TOOL_NAMES,
-  applyPatchInputSchema as sharedApplyPatchInputSchema,
+  applyPatchInputSchema,
   bashInputSchema as sharedBashInputSchema,
   editFileInputSchema as sharedEditFileInputSchema,
   fuzzySearchInputSchema as sharedFuzzySearchInputSchema,
   globInputSchema as sharedGlobInputSchema,
   grepInputSchema as sharedGrepInputSchema,
   readFileInputSchema as sharedReadFileInputSchema,
-  subagentDelegateBaseInputSchema as sharedSubagentDelegateBaseInputSchema,
-  subagentDelegateOutputSchema as sharedSubagentDelegateOutputSchema,
 } from "@stanley2058/lilac-coding-tools/schemas";
 import {
   applyPatch as applySharedPatch,
@@ -24,7 +22,6 @@ import {
 } from "@stanley2058/lilac-coding-tools/apply-patch";
 
 import { BUILTIN_LEVEL1_TOOLS, createLocalToolSpecs } from "../../src/plugins/builtin/local-tools";
-import { applyPatchInputSchema } from "../../src/tools/apply-patch";
 import { applyHunks } from "../../src/tools/apply-patch/apply-patch-core";
 import { bashInputSchema } from "../../src/tools/bash";
 import {
@@ -34,10 +31,6 @@ import {
   grepInputZod,
   readFileInputZod,
 } from "../../src/tools/fs/fs";
-import {
-  subagentDelegateBaseInputSchema,
-  subagentDelegateOutputSchema,
-} from "../../src/tools/subagent";
 
 describe("Core coding-tools parity", () => {
   it("keeps the complete built-in Level-1 registry aligned", () => {
@@ -95,9 +88,6 @@ describe("Core coding-tools parity", () => {
     expect(grepInputZod).toBe(sharedGrepInputSchema);
     expect(fuzzySearchInputZod).toBe(sharedFuzzySearchInputSchema);
     expect(editFileInputZod).toBe(sharedEditFileInputSchema);
-    expect(applyPatchInputSchema).toBe(sharedApplyPatchInputSchema);
-    expect(subagentDelegateBaseInputSchema).toBe(sharedSubagentDelegateBaseInputSchema);
-    expect(subagentDelegateOutputSchema).toBe(sharedSubagentDelegateOutputSchema);
   });
 
   it("retains representative Core contract fields in shared schemas", () => {

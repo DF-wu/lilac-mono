@@ -11,8 +11,8 @@ import {
   RedisEventDeadLetterCiphertextInvalid,
   RedisEventDeadLetterConfigInvalid,
   RedisEventDeadLetterContextMismatch,
+  RedisEventDeadLetter,
   createLilacBus,
-  createRedisEventDeadLetter,
   createRedisStreamsBus,
   decryptRedisEventDeadLetterRecord,
   decryptRedisEventDeadLetterRecoveryValue,
@@ -157,7 +157,7 @@ describe("result-based event delivery", () => {
       transactionCalls += 1;
       throw new Error("unexpected dead-letter transaction");
     });
-    const deadLetter = createRedisEventDeadLetter({
+    const deadLetter = new RedisEventDeadLetter({
       redis,
       encryptionKey: TEST_DEAD_LETTER_KEY,
     });
@@ -198,7 +198,7 @@ describe("result-based event delivery", () => {
       transactionCalls += 1;
       throw new Error("unexpected dead-letter transaction");
     });
-    const deadLetter = createRedisEventDeadLetter({
+    const deadLetter = new RedisEventDeadLetter({
       redis,
       encryptionKey: TEST_DEAD_LETTER_KEY,
     });
@@ -224,7 +224,7 @@ describe("result-based event delivery", () => {
       exec: async () => receipts,
     };
     Reflect.set(redis, "multi", () => transaction);
-    const deadLetter = createRedisEventDeadLetter({
+    const deadLetter = new RedisEventDeadLetter({
       redis,
       encryptionKey: TEST_DEAD_LETTER_KEY,
     });
@@ -294,15 +294,16 @@ describe("result-based event delivery", () => {
     }
 
     const redis = new Redis(TEST_REDIS_URL, { lazyConnect: true });
-    expect(() =>
-      createRedisEventDeadLetter({
-        redis,
-        encryptionKey: TEST_DEAD_LETTER_KEY,
-        recordTtlSeconds: 60,
-        indexMaxLen: 0,
-      }),
+    expect(
+      () =>
+        new RedisEventDeadLetter({
+          redis,
+          encryptionKey: TEST_DEAD_LETTER_KEY,
+          recordTtlSeconds: 60,
+          indexMaxLen: 0,
+        }),
     ).toThrow(RedisEventDeadLetterConfigInvalid);
-    expect(() => createRedisEventDeadLetter({ redis, encryptionKey: Buffer.alloc(31) })).toThrow(
+    expect(() => new RedisEventDeadLetter({ redis, encryptionKey: Buffer.alloc(31) })).toThrow(
       RedisEventDeadLetterConfigInvalid,
     );
     redis.disconnect();
@@ -438,7 +439,7 @@ describe("result-based event delivery", () => {
     const group = "dead-evidence-invalid";
     const acceptance =
       Promise.withResolvers<ResultType<EventDeadLetterAcceptance, EventDeadLetterAcceptFailed>>();
-    const redisDeadLetter = createRedisEventDeadLetter({
+    const redisDeadLetter = new RedisEventDeadLetter({
       redis,
       encryptionKey: TEST_DEAD_LETTER_KEY,
       keyPrefix: `${keyPrefix}:dead`,
@@ -1048,7 +1049,7 @@ describe("result-based event delivery", () => {
     const group = "invalid-contract";
     const raw = createRedisStreamsBus({ redis, keyPrefix });
     const bus = createLilacBus(raw, {
-      deadLetter: createRedisEventDeadLetter({
+      deadLetter: new RedisEventDeadLetter({
         redis,
         encryptionKey: TEST_DEAD_LETTER_KEY,
         keyPrefix: deadLetterPrefix,
@@ -1137,7 +1138,7 @@ describe("result-based event delivery", () => {
   it("bounds the payload-free dead-letter index while retaining complete records by TTL", async () => {
     const redis = new Redis(TEST_REDIS_URL);
     const deadLetterPrefix = `test:lilac-delivery:${randomId("bounded-dead-index")}`;
-    const deadLetter = createRedisEventDeadLetter({
+    const deadLetter = new RedisEventDeadLetter({
       redis,
       encryptionKey: TEST_DEAD_LETTER_KEY,
       keyPrefix: deadLetterPrefix,
@@ -1220,7 +1221,7 @@ describe("result-based event delivery", () => {
     const redis = new Redis(TEST_REDIS_URL);
     const deadLetterPrefix = `test:lilac-delivery:${randomId("dead-recovery-errors")}`;
     const recordKey = `${deadLetterPrefix}:record:recovery-errors`;
-    const deadLetter = createRedisEventDeadLetter({
+    const deadLetter = new RedisEventDeadLetter({
       redis,
       encryptionKey: TEST_DEAD_LETTER_KEY,
       keyPrefix: deadLetterPrefix,

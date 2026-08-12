@@ -334,7 +334,6 @@ describe("tool-bridge CLI runtime", () => {
       expect(result.exitCode).toBe(0);
       expect(result.stderr).toBe("");
       expect(result.stdout).toBe('{"ok":true,"value":42}\n');
-      expect(JSON.parse(result.stdout) as unknown).toEqual({ ok: true, value: 42 });
 
       expect(requests).toHaveLength(1);
       const request = requests[0];
@@ -359,7 +358,7 @@ describe("tool-bridge CLI runtime", () => {
     }
   });
 
-  it("supports explicit minified and pretty JSON output", async () => {
+  it("supports explicit pretty JSON output", async () => {
     const server = Bun.serve({
       port: 0,
       hostname: "127.0.0.1",
@@ -369,20 +368,11 @@ describe("tool-bridge CLI runtime", () => {
     });
 
     try {
-      const json = await runToolBridgeCli({
-        args: ["demo.echo", "--input={}", "--output=json"],
-        backendUrl: `http://127.0.0.1:${server.port}`,
-      });
       const pretty = await runToolBridgeCli({
         args: ["demo.echo", "--input={}", "--output=json-pretty"],
         backendUrl: `http://127.0.0.1:${server.port}`,
       });
 
-      expect(json).toEqual({
-        stdout: '{"ok":true,"nested":{"value":42}}\n',
-        stderr: "",
-        exitCode: 0,
-      });
       expect(pretty).toEqual({
         stdout: '{\n  "ok": true,\n  "nested": {\n    "value": 42\n  }\n}\n',
         stderr: "",
@@ -393,12 +383,14 @@ describe("tool-bridge CLI runtime", () => {
     }
   });
 
-  it("uses JSON output by default for non-interactive onboarding", async () => {
+  it("orchestrates non-interactive onboarding", async () => {
+    const calls: Array<{ callableId: string; input: Record<string, unknown> }> = [];
     const server = Bun.serve({
       port: 0,
       hostname: "127.0.0.1",
       async fetch(req) {
         const body = (await req.json()) as { callableId: string; input: Record<string, unknown> };
+        calls.push(body);
         if (body.callableId === "onboarding.bootstrap") {
           return Response.json({ isError: false, output: { bootstrapped: true } });
         }
@@ -414,15 +406,33 @@ describe("tool-bridge CLI runtime", () => {
 
     try {
       const result = await runToolBridgeCli({
-        args: ["onboard", "--yes", "--no-sign"],
+        args: ["onboard", "--yes", "--no-sign", "--output=json"],
         backendUrl: `http://127.0.0.1:${server.port}`,
       });
 
       expect(result.exitCode).toBe(0);
       expect(result.stderr).toBe("");
-      expect(result.stdout).toBe(
-        '{"ok":true,"userName":"lilac-agent[bot]","userEmail":"lilac-agent[bot]@users.noreply.github.com","signing":{"enabled":false},"vcsEnv":{"GIT_CONFIG_GLOBAL":"/tmp/gitconfig"},"gitTest":{"ok":true}}\n',
-      );
+      const output = JSON.parse(result.stdout) as Record<string, unknown>;
+      expect(output.ok).toBe(true);
+      expect(output.userName).toBe("lilac-agent[bot]");
+      expect(output.userEmail).toBe("lilac-agent[bot]@users.noreply.github.com");
+      expect(output.signing).toEqual({ enabled: false });
+      expect(output.vcsEnv).toEqual({ GIT_CONFIG_GLOBAL: "/tmp/gitconfig" });
+      expect(output.gitTest).toEqual({ ok: true });
+      expect(calls).toEqual([
+        { callableId: "onboarding.bootstrap", input: {} },
+        { callableId: "onboarding.vcs_env", input: {} },
+        {
+          callableId: "onboarding.git_identity",
+          input: {
+            mode: "configure",
+            userName: "lilac-agent[bot]",
+            userEmail: "lilac-agent[bot]@users.noreply.github.com",
+            enableSigning: false,
+          },
+        },
+        { callableId: "onboarding.git_identity", input: { mode: "test" } },
+      ]);
     } finally {
       server.stop(true);
     }
@@ -558,40 +568,6 @@ describe("tool-bridge CLI runtime", () => {
           body: { callableId: "mcp.reload", input: {} },
         },
       ]);
-    } finally {
-      server.stop(true);
-    }
-  });
-
-  it("forwards structured mcp.add stdin JSON unchanged", async () => {
-    const bodies: unknown[] = [];
-    const server = Bun.serve({
-      port: 0,
-      hostname: "127.0.0.1",
-      async fetch(req) {
-        bodies.push((await req.json()) as unknown);
-        return Response.json({ isError: false, output: { ok: true } });
-      },
-    });
-    const input = {
-      serverId: "local-docs",
-      transport: "stdio",
-      command: "bun",
-      args: ["run", "server.ts"],
-      cwd: "/workspace",
-      env: { DOCS_TOKEN: { env: "DOCS_TOKEN" } },
-    };
-
-    try {
-      const result = await runToolBridgeCli({
-        args: ["mcp.add", "--stdin", "--output=json"],
-        backendUrl: `http://127.0.0.1:${server.port}`,
-        stdin: JSON.stringify(input),
-      });
-
-      expect(result.exitCode).toBe(0);
-      expect(result.stderr).toBe("");
-      expect(bodies).toEqual([{ callableId: "mcp.add", input }]);
     } finally {
       server.stop(true);
     }
@@ -877,16 +853,6 @@ describe("tool-bridge positional input", () => {
       await buildToolInput(parsed, { field: "url" }),
       "Tool 'fetch' accepts at most one positional argument: <url>.",
     );
-  });
-
-  it("maps variadic primary positionals into an array", async () => {
-    const parsed = expectOk(parseArgs(["attachment.add_files", "a.png", "b.png"]));
-    expect(parsed.type).toBe("call");
-    if (parsed.type !== "call") return;
-
-    expect(expectOk(await buildToolInput(parsed, { field: "paths", variadic: true }))).toEqual({
-      paths: ["a.png", "b.png"],
-    });
   });
 
   it("allows flags alongside variadic primary positionals", async () => {

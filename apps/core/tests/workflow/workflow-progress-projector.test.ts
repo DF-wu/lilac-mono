@@ -15,7 +15,6 @@ import {
   type SubscriptionOptions,
 } from "@stanley2058/lilac-event-bus";
 import { Panic, Result } from "better-result";
-import { formatTaggedErrorForLog } from "@stanley2058/lilac-utils";
 import { subscribeForTest, type TestRawMessageHandler } from "../helpers/result-raw-bus";
 import {
   SurfaceMessageNotFound,
@@ -32,7 +31,6 @@ import type {
   RegisteredSurfaceWorkflowProgressPort,
   SurfaceWorkflowProgressPort,
 } from "../../src/surface/runtime-descriptor";
-import { workflowProgressOperationFailure } from "../../src/surface/runtime-descriptor";
 import type {
   ContentOpts,
   LimitOpts,
@@ -45,13 +43,7 @@ import { SurfaceAdapterTestBase } from "../helpers/surface-adapter-test-base";
 import { DurableWorkflowStore } from "../../src/workflow/durable-workflow-store";
 import { startWorkflowActionResolver } from "../../src/workflow/workflow-action-resolver";
 import { sha256 } from "../../src/workflow/workflow-definition";
-import {
-  MAX_WORKFLOW_PROGRESS_TIMER_DELAY_MS,
-  WorkflowProgressProjector,
-  WorkflowProgressSurfaceCallFailed,
-  WorkflowProgressSurfaceCreated,
-  WorkflowProgressSurfaceNotFound,
-} from "../../src/workflow/workflow-progress-projector";
+import { WorkflowProgressProjector } from "../../src/workflow/workflow-progress-projector";
 const HASH_A = "a".repeat(64);
 const HASH_B = "b".repeat(64);
 
@@ -518,49 +510,6 @@ class FakeProjectionScheduler {
   }
 }
 describe("WorkflowProgressProjector", () => {
-  it("uses unique stable tags for each workflow progress surface outcome", () => {
-    const createdRef: MsgRef = {
-      platform: "github",
-      channelId: "octo/repo#1",
-      messageId: "42",
-    };
-    const errors = [
-      new WorkflowProgressSurfaceCreated({
-        failureKind: "created",
-        createdRef,
-        message: "created",
-      }),
-      new WorkflowProgressSurfaceNotFound({
-        failureKind: "not-found",
-        createdRef: null,
-        message: "not found",
-      }),
-      new WorkflowProgressSurfaceCallFailed({
-        failureKind: "failed",
-        createdRef: null,
-        failure: workflowProgressOperationFailure(
-          "send",
-          new SurfaceUnavailable({
-            platform: "github",
-            operation: "send-message",
-            message: "failed",
-          }),
-        ),
-        message: "failed",
-      }),
-    ];
-    expect(errors.map((error) => error._tag)).toEqual([
-      "WorkflowProgressSurfaceCreated",
-      "WorkflowProgressSurfaceNotFound",
-      "WorkflowProgressSurfaceCallFailed",
-    ]);
-    expect(errors.map((error) => formatTaggedErrorForLog(error).errorTag)).toEqual([
-      "WorkflowProgressSurfaceCreated",
-      "WorkflowProgressSurfaceNotFound",
-      "WorkflowProgressSurfaceCallFailed",
-    ]);
-  });
-
   it("ignores event projection for a null target and rejects explicit card creation", async () => {
     const dbPath = tempDbPath("workflow-null-target");
     const store = new DurableWorkflowStore(dbPath);
@@ -2156,13 +2105,13 @@ describe.each(["discord", "github"] as const)("%s workflow progress port contrac
         "initial progress card could not be created",
       );
 
-      const expectedAttemptAt = clock.now + MAX_WORKFLOW_PROGRESS_TIMER_DELAY_MS;
+      const expectedAttemptAt = clock.now + 24 * 60 * 60 * 1_000;
       expect(workflowStoreValue(store.getSurfaceBinding("run-1"))?.nextAttemptAt).toBe(
         expectedAttemptAt,
       );
       expect(Number.isInteger(expectedAttemptAt)).toBe(true);
       expect(scheduler.scheduledTimes()).toEqual([expectedAttemptAt]);
-      expect(MAX_WORKFLOW_PROGRESS_TIMER_DELAY_MS).toBeLessThan(2_147_483_647);
+      expect(expectedAttemptAt - clock.now).toBeLessThan(2_147_483_647);
     } finally {
       await projector.stop();
       await bus.close();

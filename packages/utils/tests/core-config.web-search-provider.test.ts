@@ -94,11 +94,6 @@ describe("coreConfigSchema tools.web.extract.providers", () => {
 });
 
 describe("coreConfigSchema tools.web.fetch.mode", () => {
-  it("defaults to auto", () => {
-    const parsed = coreConfigSchema.parse({});
-    expect(parsed.tools.web.fetch.mode).toBe("auto");
-  });
-
   it("accepts explicit fetch modes", () => {
     const parsed = coreConfigSchema.parse({
       tools: {

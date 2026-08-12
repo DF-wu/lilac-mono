@@ -420,7 +420,7 @@ export default defineWorkflow({`,
     ).toThrow("only be called directly or forwarded unchanged");
   });
 
-  it("rejects removed profile-native agent options statically", () => {
+  it("validates statically known host-call options", () => {
     const profileNative = source().replace(
       BASE_AGENT_CALL,
       'return agent(`Audit ${args.directory}`, { profile: "general", isolation: "shared" });',
@@ -428,9 +428,6 @@ export default defineWorkflow({`,
     expect(() => validateWorkflowSource({ name: "audit-routes", source: profileNative })).toThrow(
       "Workflow agent option 'isolation' was removed",
     );
-  });
-
-  it("validates statically known host-call options", () => {
     expect(() =>
       validateWorkflowSource({
         name: "audit-routes",

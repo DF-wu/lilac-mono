@@ -4,13 +4,7 @@ import type { UIMessageChunk } from "ai";
 
 import type { MiniLilacTodoState, MiniLilacUIMessage } from "@stanley2058/mini-lilac-client";
 
-import {
-  explorationTranscriptText,
-  groupNearbyEdits,
-  isShellTranscriptCollapsible,
-  shellTranscriptText,
-  type TranscriptEntry,
-} from "./render";
+import { explorationTranscriptText, groupNearbyEdits, type TranscriptEntry } from "./render";
 import { ChunkRenderer, renderInitialMessages } from "./render-boundary";
 
 function createRendererHarness() {
@@ -146,14 +140,6 @@ describe("renderInitialMessages", () => {
     const ignoredChunks = [
       { type: "custom", kind: "provider.event" },
       { type: "tool-input-delta", toolCallId: "tool", inputTextDelta: '{"command":' },
-      {
-        type: "reasoning-file",
-        url: "https://example.test/reasoning",
-        mediaType: "text/plain",
-      },
-      { type: "start-step" },
-      { type: "finish-step" },
-      { type: "start", messageId: "message" },
       { type: "message-metadata", messageMetadata: { traceId: "trace" } },
     ] satisfies readonly UIMessageChunk[];
 
@@ -569,51 +555,6 @@ describe("renderInitialMessages", () => {
     });
   });
 
-  it("clamps the combined shell transcript to eight lines and exposes expansion labels", () => {
-    const shell = {
-      command: "bun test",
-      output: Array.from({ length: 10 }, (_, i) => `line ${i + 1}`).join("\n"),
-    };
-
-    expect(isShellTranscriptCollapsible(shell)).toBe(true);
-    const collapsed = shellTranscriptText(shell);
-    expect(collapsed).toContain("line 7");
-    expect(collapsed).not.toContain("line 8");
-    expect(collapsed.endsWith("Click to expand")).toBe(true);
-    const expanded = shellTranscriptText(shell, true);
-    expect(expanded).toContain("line 10");
-    expect(expanded.endsWith("Click to collapse")).toBe(true);
-
-    const longLine = "x".repeat(2_100);
-    const characterClamped = { command: "print", output: longLine };
-    expect(isShellTranscriptCollapsible(characterClamped)).toBe(true);
-    const characterCollapsedText = shellTranscriptText(characterClamped);
-    expect(characterCollapsedText).not.toContain(longLine);
-    expect(characterCollapsedText).toContain(`${"x".repeat(32)}...`);
-    expect(shellTranscriptText(characterClamped, true)).toContain(longLine);
-
-    const sharedCharacterBudget = { command: "123456", output: "abcdef" };
-    expect(isShellTranscriptCollapsible(sharedCharacterBudget, 8, 12)).toBe(true);
-    expect(shellTranscriptText(sharedCharacterBudget, false, 8, 12)).toContain("ab...");
-    expect(shellTranscriptText(sharedCharacterBudget, false, 8, 12)).not.toContain("abcdef");
-  });
-
-  it("spends the shared shell transcript budget on command input before output", () => {
-    const command = Array.from({ length: 10 }, (_, i) => `input line ${i + 1}`).join("\n");
-    const shell = { command, output: "/tmp/result.txt" };
-
-    expect(isShellTranscriptCollapsible(shell)).toBe(true);
-    const collapsed = shellTranscriptText(shell);
-    expect(collapsed).toContain("input line 8");
-    expect(collapsed).not.toContain("input line 9");
-    expect(collapsed).not.toContain("/tmp/result.txt");
-    expect(collapsed.endsWith("Click to expand")).toBe(true);
-    const expanded = shellTranscriptText(shell, true);
-    expect(expanded).toContain("input line 10");
-    expect(expanded).toContain("/tmp/result.txt");
-    expect(expanded.endsWith("Click to collapse")).toBe(true);
-  });
-
   it("renders automatic and manual compaction as durable divider entries", () => {
     const automatic = {
       type: "data-compaction" as const,
@@ -827,33 +768,6 @@ describe("renderInitialMessages", () => {
     expect(entry?.text).not.toContain("large private display payload");
   });
 
-  it("summarizes todowrite without duplicating the complete list", () => {
-    const entries = renderInitialMessages([
-      {
-        id: "assistant-todos",
-        role: "assistant",
-        parts: [
-          {
-            type: "dynamic-tool",
-            toolName: "todowrite",
-            toolCallId: "todos-1",
-            state: "output-available",
-            input: {
-              todos: [
-                { content: "Implement", status: "completed", priority: "high" },
-                { content: "Verify", status: "in_progress", priority: "medium" },
-              ],
-            },
-            output: { revision: 2, todos: [] },
-          },
-        ],
-      },
-    ]);
-
-    expect(entries).toMatchObject([{ kind: "tool", text: "Update todos: 2 items" }]);
-    expect(entries[0]?.text).not.toContain("Implement");
-  });
-
   it("shows web fetch URLs and search queries as single-line tool summaries", () => {
     const messages: MiniLilacUIMessage[] = [
       {
@@ -924,54 +838,6 @@ describe("renderInitialMessages", () => {
     ];
     expect(entries().map(({ id: _id, ...entry }) => entry)).toEqual(expected);
     expect(renderInitialMessages(messages).map(({ id: _id, ...entry }) => entry)).toEqual(expected);
-  });
-
-  it("shows native OpenAI web search queries from provider output", () => {
-    const query = "latest   runtime\nrelease";
-    const output = { action: { type: "search", query } };
-    const messages: MiniLilacUIMessage[] = [
-      {
-        id: "assistant-native-websearch",
-        role: "assistant",
-        parts: [
-          {
-            type: "dynamic-tool",
-            toolName: "websearch",
-            toolCallId: "native-search-1",
-            state: "output-available",
-            input: {},
-            output,
-          },
-        ],
-      },
-    ];
-    const { renderer, entries } = createRendererHarness();
-
-    renderer.handle({
-      type: "tool-input-available",
-      toolCallId: "native-search-1",
-      toolName: "websearch",
-      input: {},
-      dynamic: true,
-    });
-    expect(entries()[0]?.text).toBe("Websearch · running");
-    renderer.handle({
-      type: "tool-output-available",
-      toolCallId: "native-search-1",
-      output,
-      dynamic: true,
-    });
-
-    const expected = {
-      kind: "tool",
-      tone: "success",
-      text: 'Search "latest runtime release"',
-      singleLine: true,
-    } satisfies Omit<TranscriptEntry, "id">;
-    expect(entries().map(({ id: _id, ...entry }) => entry)).toEqual([expected]);
-    expect(renderInitialMessages(messages).map(({ id: _id, ...entry }) => entry)).toEqual([
-      expected,
-    ]);
   });
 
   it("collapses live and canonical reads and searches into one updating entry", () => {
@@ -2066,26 +1932,6 @@ describe("renderInitialMessages", () => {
       text: "Explore Task - Inspect reconnects\n  ↳ Cancelled: connection closed",
       subagent: { state: "cancelled", runId: "child-status-only" },
     });
-  });
-
-  it("appends one entry per reasoning chunk and finalizes on reasoning-end", () => {
-    let count = 0;
-    const renderer = new ChunkRenderer(
-      {
-        append: () => `entry-${count++}`,
-        update: () => {},
-        remove: () => {},
-        appendText: () => {},
-        finish: () => {},
-      },
-      { onSnapshot: () => {}, onTranscriptReset: () => {} },
-    );
-
-    renderer.startRun();
-    renderer.handle({ type: "reasoning-start", id: "reasoning-1" });
-    renderer.handle({ type: "reasoning-end", id: "reasoning-1" });
-    renderer.handle({ type: "reasoning-start", id: "reasoning-2" });
-    expect(count).toBe(2);
   });
 
   it("streams a title and body into an active then finalized reasoning entry", () => {

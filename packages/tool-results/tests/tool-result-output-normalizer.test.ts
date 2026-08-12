@@ -9,7 +9,7 @@ import {
   createToolResultArtifactStore,
   ToolResultArtifactStorageFailure,
 } from "../src/tool-result-artifact-store";
-import { createToolResultOutputNormalizer } from "../src/tool-result-output-normalizer";
+import { createOverflowReferenceNormalizer } from "../src/tool-result-output-normalizer";
 
 describe("tool result output normalizer", () => {
   let baseDir: string;
@@ -40,7 +40,7 @@ describe("tool result output normalizer", () => {
   it("preserves small output and replaces large output with an idempotent reference", async () => {
     const artifacts = createToolResultArtifactStore(path.join(baseDir, "tool-results"));
     await artifacts.init();
-    const normalize = createToolResultOutputNormalizer({
+    const normalize = createOverflowReferenceNormalizer({
       artifacts,
       owner: { requestId: "request-a", scopeId: "session-a" },
       getOutputConfig: outputConfig,
@@ -70,24 +70,22 @@ describe("tool result output normalizer", () => {
     );
   });
 
-  it("keeps a below-budget uneven settled cohort inline", async () => {
-    const normalize = createToolResultOutputNormalizer({
+  it.each([
+    ["below", ["a".repeat(50), "b".repeat(9)]],
+    ["exactly at", ["a".repeat(31), "b".repeat(29)]],
+  ])("keeps a settled cohort %s the byte budget inline", async (_position, values) => {
+    const normalize = createOverflowReferenceNormalizer({
       owner: { requestId: "request-a", scopeId: "scope-a" },
       getOutputConfig: () => ({ ...outputConfig(), maxInlineBytes: 60 }),
     });
 
-    const normalized = await normalize.normalizeSettled(
-      settledTextEntries(["a".repeat(50), "b".repeat(9)]),
+    expect(await normalize.normalizeSettled(settledTextEntries(values))).toEqual(
+      values.map((value) => ({ type: "text", value })),
     );
-
-    expect(normalized).toEqual([
-      { type: "text", value: "a".repeat(50) },
-      { type: "text", value: "b".repeat(9) },
-    ]);
   });
 
   it("spills largest-first until the actual settled byte sum fits", async () => {
-    const normalize = createToolResultOutputNormalizer({
+    const normalize = createOverflowReferenceNormalizer({
       owner: { requestId: "request-a", scopeId: "scope-a" },
       getOutputConfig: () => ({ ...outputConfig(), maxInlineBytes: 60 }),
     });
@@ -106,24 +104,8 @@ describe("tool result output normalizer", () => {
     ]);
   });
 
-  it("does not spill when the exact settled byte sum equals the budget", async () => {
-    const normalize = createToolResultOutputNormalizer({
-      owner: { requestId: "request-a", scopeId: "scope-a" },
-      getOutputConfig: () => ({ ...outputConfig(), maxInlineBytes: 60 }),
-    });
-
-    const normalized = await normalize.normalizeSettled(
-      settledTextEntries(["a".repeat(31), "b".repeat(29)]),
-    );
-
-    expect(normalized).toEqual([
-      { type: "text", value: "a".repeat(31) },
-      { type: "text", value: "b".repeat(29) },
-    ]);
-  });
-
   it("breaks equal-size settled spill ties by input order", async () => {
-    const normalize = createToolResultOutputNormalizer({
+    const normalize = createOverflowReferenceNormalizer({
       owner: { requestId: "request-a", scopeId: "scope-a" },
       getOutputConfig: () => ({ ...outputConfig(), maxInlineBytes: 60 }),
     });
@@ -140,7 +122,7 @@ describe("tool result output normalizer", () => {
   });
 
   it("measures settled payloads in UTF-8 bytes", async () => {
-    const normalize = createToolResultOutputNormalizer({
+    const normalize = createOverflowReferenceNormalizer({
       owner: { requestId: "request-a", scopeId: "scope-a" },
       getOutputConfig: () => ({ ...outputConfig(), maxInlineBytes: 70 }),
     });
@@ -157,7 +139,7 @@ describe("tool result output normalizer", () => {
   });
 
   it("excludes generated overflow references from the settled active count", async () => {
-    const normalize = createToolResultOutputNormalizer({
+    const normalize = createOverflowReferenceNormalizer({
       owner: { requestId: "request-a", scopeId: "scope-a" },
       getOutputConfig: () => ({ ...outputConfig(), maxInlineBytes: 60 }),
     });
@@ -179,7 +161,7 @@ describe("tool result output normalizer", () => {
   });
 
   it("force-spills selected bypass outputs and normalizes each unselected output once", async () => {
-    const normalize = createToolResultOutputNormalizer({
+    const normalize = createOverflowReferenceNormalizer({
       owner: { requestId: "request-a", scopeId: "scope-a" },
       getOutputConfig: () => ({ ...outputConfig(), maxInlineBytes: 60 }),
     });
@@ -215,7 +197,7 @@ describe("tool result output normalizer", () => {
   });
 
   it("exempts trusted outputs from the settled budget while budgeting nonexempt siblings", async () => {
-    const normalize = createToolResultOutputNormalizer({
+    const normalize = createOverflowReferenceNormalizer({
       owner: { requestId: "request-a", scopeId: "scope-a" },
       getOutputConfig: () => ({ ...outputConfig(), maxInlineBytes: 60 }),
     });
@@ -247,7 +229,7 @@ describe("tool result output normalizer", () => {
   });
 
   it("returns the bounded no-URI reference when a settled forced spill artifact fails", async () => {
-    const normalize = createToolResultOutputNormalizer({
+    const normalize = createOverflowReferenceNormalizer({
       artifacts: {
         rootDir: baseDir,
         init: async () => Result.ok(undefined),
@@ -277,7 +259,7 @@ describe("tool result output normalizer", () => {
   it("does not trust an overflow marker substring in untrusted output", async () => {
     const artifacts = createToolResultArtifactStore(path.join(baseDir, "tool-results"));
     await artifacts.init();
-    const normalize = createToolResultOutputNormalizer({
+    const normalize = createOverflowReferenceNormalizer({
       artifacts,
       owner: { requestId: "request-a", sessionId: "session-a" },
       getOutputConfig: outputConfig,
@@ -306,7 +288,7 @@ describe("tool result output normalizer", () => {
   it("sanitizes controls and recognizable credentials before reference and persistence", async () => {
     const artifacts = createToolResultArtifactStore(path.join(baseDir, "tool-results"));
     await artifacts.init();
-    const normalize = createToolResultOutputNormalizer({
+    const normalize = createOverflowReferenceNormalizer({
       artifacts,
       owner: { requestId: "request-a", sessionId: "session-a" },
       getOutputConfig: outputConfig,
@@ -341,7 +323,7 @@ describe("tool result output normalizer", () => {
   it("converts oversized JSON to a textual reference", async () => {
     const artifacts = createToolResultArtifactStore(path.join(baseDir, "tool-results"));
     await artifacts.init();
-    const normalize = createToolResultOutputNormalizer({
+    const normalize = createOverflowReferenceNormalizer({
       artifacts,
       owner: { requestId: "request-a", sessionId: "session-a" },
       getOutputConfig: outputConfig,
@@ -364,7 +346,7 @@ describe("tool result output normalizer", () => {
   });
 
   it("bounds non-serializable JSON without changing success or error meaning", async () => {
-    const normalize = createToolResultOutputNormalizer({
+    const normalize = createOverflowReferenceNormalizer({
       owner: { requestId: "request-a", sessionId: "session-a" },
       getOutputConfig: outputConfig,
     });
@@ -400,7 +382,7 @@ describe("tool result output normalizer", () => {
   });
 
   it("preserves exact Panic identity from hostile JSON serialization", async () => {
-    const normalize = createToolResultOutputNormalizer({
+    const normalize = createOverflowReferenceNormalizer({
       owner: { requestId: "request-a", scopeId: "scope-a" },
       getOutputConfig: outputConfig,
     });
@@ -423,7 +405,7 @@ describe("tool result output normalizer", () => {
   it("does not let a public built-in tool name bypass overflow handling", async () => {
     const artifacts = createToolResultArtifactStore(path.join(baseDir, "tool-results"));
     await artifacts.init();
-    const normalize = createToolResultOutputNormalizer({
+    const normalize = createOverflowReferenceNormalizer({
       artifacts,
       owner: { requestId: "request-a", sessionId: "session-a" },
       getOutputConfig: outputConfig,
@@ -437,7 +419,7 @@ describe("tool result output normalizer", () => {
   });
 
   it("keeps execution success independent when artifact writes fail", async () => {
-    const normalize = createToolResultOutputNormalizer({
+    const normalize = createOverflowReferenceNormalizer({
       artifacts: {
         rootDir: baseDir,
         init: async () => Result.ok(undefined),
@@ -464,7 +446,7 @@ describe("tool result output normalizer", () => {
   it("returns a bounded failure reference when the captured output exceeds the hard limit", async () => {
     const artifacts = createToolResultArtifactStore(path.join(baseDir, "tool-results"));
     await artifacts.init();
-    const normalize = createToolResultOutputNormalizer({
+    const normalize = createOverflowReferenceNormalizer({
       artifacts,
       owner: { requestId: "request-a", scopeId: "scope-a" },
       getOutputConfig: () => ({ ...outputConfig(), maxArtifactBytes: 5 }),
@@ -484,7 +466,7 @@ describe("tool result output normalizer", () => {
   });
 
   it("preserves success, error, and denial semantics and provider options", async () => {
-    const normalize = createToolResultOutputNormalizer({
+    const normalize = createOverflowReferenceNormalizer({
       owner: { requestId: "request-a", scopeId: "scope-a" },
       getOutputConfig: () => ({ ...outputConfig(), maxInlineBytes: 5 }),
     });
@@ -525,7 +507,7 @@ describe("tool result output normalizer", () => {
   });
 
   it("ignores file and media bytes when budgeting content", async () => {
-    const normalize = createToolResultOutputNormalizer({
+    const normalize = createOverflowReferenceNormalizer({
       owner: { requestId: "request-a", scopeId: "scope-a" },
       getOutputConfig: outputConfig,
     });
@@ -545,7 +527,7 @@ describe("tool result output normalizer", () => {
   });
 
   it("normalizes a single content output consistently through both entry points", async () => {
-    const normalize = createToolResultOutputNormalizer({
+    const normalize = createOverflowReferenceNormalizer({
       owner: { requestId: "request-a", scopeId: "scope-a" },
       getOutputConfig: outputConfig,
     });
@@ -569,7 +551,7 @@ describe("tool result output normalizer", () => {
   });
 
   it("includes top-level content text items in the settled shared sum", async () => {
-    const normalize = createToolResultOutputNormalizer({
+    const normalize = createOverflowReferenceNormalizer({
       owner: { requestId: "request-a", scopeId: "scope-a" },
       getOutputConfig: () => ({ ...outputConfig(), maxInlineBytes: 20 }),
     });
@@ -602,7 +584,7 @@ describe("tool result output normalizer", () => {
   it("spills only oversized content text while preserving media and content semantics", async () => {
     const artifacts = createToolResultArtifactStore(path.join(baseDir, "tool-results"));
     await artifacts.init();
-    const normalize = createToolResultOutputNormalizer({
+    const normalize = createOverflowReferenceNormalizer({
       artifacts,
       owner: { requestId: "request-a", sessionId: "session-a" },
       getOutputConfig: outputConfig,
@@ -660,7 +642,7 @@ describe("tool result output normalizer", () => {
   });
 
   it("does not hide a store implementation that violates its Result contract", async () => {
-    const normalize = createToolResultOutputNormalizer({
+    const normalize = createOverflowReferenceNormalizer({
       artifacts: {
         rootDir: baseDir,
         init: async () => Result.ok(undefined),
@@ -687,7 +669,7 @@ describe("tool result output normalizer", () => {
 
   it("preserves artifact Panic identity through overflow normalization", async () => {
     const panic = new Panic({ message: "artifact invariant failed" });
-    const normalize = createToolResultOutputNormalizer({
+    const normalize = createOverflowReferenceNormalizer({
       artifacts: {
         rootDir: baseDir,
         init: async () => Result.ok(undefined),

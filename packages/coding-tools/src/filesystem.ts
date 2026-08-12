@@ -25,8 +25,8 @@ import {
   createReadFileInputSchema,
 } from "./schemas";
 
-export const DEFAULT_MAX_INLINE_MEDIA_BYTES_PER_PART = 10 * 1024 * 1024;
-export const DEFAULT_MAX_READ_FILE_OUTPUT_BYTES = 40 * 1024;
+const DEFAULT_MAX_INLINE_MEDIA_BYTES_PER_PART = 10 * 1024 * 1024;
+const DEFAULT_MAX_READ_FILE_OUTPUT_BYTES = 40 * 1024;
 
 const ATTACHMENT_MIME_TYPES: ReadonlyMap<string, string> = new Map([
   [".png", "image/png"],

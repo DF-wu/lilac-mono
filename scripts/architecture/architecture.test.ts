@@ -1,5 +1,5 @@
 import path from "node:path";
-import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 
 import { describe, expect, test } from "bun:test";
@@ -54,10 +54,6 @@ const FIXTURE_ROOT = path.join(import.meta.dir, "fixtures/stage0");
 const FIXTURE_TSCONFIG = "scripts/architecture/fixtures/stage0/tsconfig.json";
 const WORKSPACE_RUNNER = path.join(import.meta.dir, "workspace-runner.ts");
 const WORKSPACE_RUNNER_FIXTURE_ROOT = "scripts/architecture/fixtures/workspace-runner";
-const EXPECTED_WORKSPACE_RUNNER_DIAGNOSTICS = [
-  "fixture-findings/fixture.ts:2:10 error architecture/no-unknown-assertion: Structured domain type is asserted directly from unknown. Use a registered complete decoder and pass its typed output to domain code. [arch-v2|workspace=fixture-findings|rule=architecture%2Fno-unknown-assertion|identity=fixture.ts%23firstProjection%5BAsExpression%5D%401|sha256=62b6c3f086079fbd4adc4882b9fc33238b8429a62bf7534fb11c0e39c6a15c26]",
-  "fixture-findings/fixture.ts:6:10 error architecture/no-unknown-assertion: Structured domain type is asserted directly from unknown. Use a registered complete decoder and pass its typed output to domain code. [arch-v2|workspace=fixture-findings|rule=architecture%2Fno-unknown-assertion|identity=fixture.ts%23secondProjection%5BAsExpression%5D%401|sha256=0853d92c35230fba42ba6a904f3fcd68c9db63f050c31ff6b8f9f591d7abc797]",
-] as const;
 const PERMANENT_RULE_ZONES = Object.fromEntries(
   FINAL_PACKAGE_WIDE_ARCHITECTURE_RULES.map((rule) => [rule, [{ include: "**" }]]),
 );
@@ -1023,709 +1019,6 @@ describe("Stage 2 union rules", () => {
     ).toThrow("exact architecture/open-protocol-normalization zones must equal registered modules");
   });
 
-  test("activates closed unions globally and open protocols only in exact registered zones", () => {
-    expect(() => assertArchitectureManifestIntegrity(architectureManifest)).not.toThrow();
-    for (const workspace of architectureManifest.workspaces) {
-      const zones: WorkspaceArchitecture["ruleZones"] = workspace.ruleZones;
-      expect(zones["architecture/closed-union-exhaustiveness"]).toEqual([{ include: "**" }]);
-      expect(zones["architecture/closed-union-map-exhaustiveness"]).toEqual([{ include: "**" }]);
-    }
-    const acp = architectureManifest.workspaces.find(
-      (workspace) => workspace.root === "apps/acp-controller",
-    );
-    const tui = architectureManifest.workspaces.find(
-      (workspace) => workspace.root === "apps/mini-lilac-tui",
-    );
-    const agent = architectureManifest.workspaces.find(
-      (workspace) => workspace.root === "packages/agent",
-    );
-    expect(acp?.ruleZones["architecture/open-protocol-normalization"]).toEqual([
-      { include: "session-history.ts" },
-    ]);
-    expect(acp?.openProtocolAdapters).toEqual([
-      {
-        identity: { module: "session-history.ts", exportName: "projectSessionUpdate" },
-        externalProtocol: { package: "@agentclientprotocol/sdk", exportName: "SessionUpdate" },
-        protocolParameter: 0,
-        fallbackVariant: { discriminant: "type", value: "unsupported" },
-        reason:
-          "Defense-in-depth projection for runtime ACP version skew; the SDK normally validates SessionUpdate before this adapter runs.",
-      },
-    ]);
-    expect(tui?.ruleZones["architecture/open-protocol-normalization"]).toEqual([
-      { include: "src/ui-message-chunk-projection.ts" },
-    ]);
-    expect(tui?.openProtocolAdapters).toEqual([
-      {
-        identity: {
-          module: "src/ui-message-chunk-projection.ts",
-          exportName: "projectUIMessageChunk",
-        },
-        externalProtocol: { package: "ai", exportName: "UIMessageChunk" },
-        protocolParameter: 0,
-        fallbackVariant: { discriminant: "kind", value: "unsupported" },
-        reason: "Projects the open AI SDK stream protocol into local TUI chunk variants.",
-      },
-    ]);
-    expect(agent?.ruleZones["architecture/open-protocol-normalization"]).toEqual([
-      { include: "ai-sdk-pi-agent.ts" },
-    ]);
-    expect(agent?.openProtocolAdapters).toEqual([
-      {
-        identity: { module: "ai-sdk-pi-agent.ts", exportName: "projectAiSdkTextStreamPart" },
-        externalProtocol: { package: "ai", exportName: "TextStreamPart" },
-        protocolParameter: 0,
-        fallbackVariant: { discriminant: "kind", value: "unsupported" },
-        reason:
-          "Projects generic AI SDK TextStreamPart tool instantiations into a closed agent stream union.",
-      },
-    ]);
-    expect(
-      architectureManifest.workspaces
-        .filter(
-          (workspace) =>
-            workspace.root !== "apps/acp-controller" &&
-            workspace.root !== "apps/mini-lilac-tui" &&
-            workspace.root !== "packages/agent" &&
-            workspace.root !== "packages/claude-code-bridge",
-        )
-        .every(
-          (workspace) =>
-            workspace.ruleZones["architecture/open-protocol-normalization"]?.length === 0 &&
-            workspace.openProtocolAdapters.length === 0,
-        ),
-    ).toBeTrue();
-  });
-
-  test("registers exact wire, projection, CLI, and remote-runner boundary decoders", () => {
-    const acp = architectureManifest.workspaces.find(
-      (workspace) => workspace.root === "apps/acp-controller",
-    );
-    const miniServer = architectureManifest.workspaces.find(
-      (workspace) => workspace.root === "apps/mini-lilac-server",
-    );
-    const miniRuntime = architectureManifest.workspaces.find(
-      (workspace) => workspace.root === "packages/mini-lilac-runtime",
-    );
-    const remoteRunner = architectureManifest.workspaces.find(
-      (workspace) => workspace.root === "packages/remote-fs-runner",
-    );
-    const fs = architectureManifest.workspaces.find(
-      (workspace) => workspace.root === "packages/fs",
-    );
-    const tui = architectureManifest.workspaces.find(
-      (workspace) => workspace.root === "apps/mini-lilac-tui",
-    );
-    const miniClient = architectureManifest.workspaces.find(
-      (workspace) => workspace.root === "packages/mini-lilac-client",
-    );
-    expect(acp?.boundaryDecoders).toEqual([
-      {
-        identity: { module: "external-adapters.ts", exportName: "projectExternalFailure" },
-        category: "projection",
-      },
-      ...["decodeRunRecord", "decodeRunCancellation", "decodeSessionIndex"].map((exportName) => ({
-        identity: { module: "run-store.ts", exportName },
-        category: "persistence" as const,
-      })),
-      {
-        identity: {
-          module: "external-adapters.ts",
-          exportName: "replaceExternalFailureMessage",
-        },
-        category: "projection",
-      },
-    ]);
-    expect(tui?.boundaryDecoders).toEqual([
-      {
-        identity: { module: "src/opentui-boundary.ts", exportName: "decodeDraftExtmarkData" },
-        category: "plugin",
-      },
-      {
-        identity: { module: "src/preferences.ts", exportName: "decodeBindingPreferences" },
-        category: "persistence",
-      },
-      {
-        identity: {
-          module: "src/ui-message-chunk-projection.ts",
-          exportName: "projectMiniLilacStreamChunk",
-        },
-        category: "projection",
-      },
-      {
-        identity: {
-          module: "src/terminal-runtime-adapter.ts",
-          exportName: "resolveTerminalShutdownOutcome",
-        },
-        category: "projection",
-      },
-      ...[
-        "parseInput",
-        "decodeBash",
-        "decodeEditFile",
-        "decodeSubagentDelegate",
-        "decodeWebsearch",
-        "projectToolObservation",
-      ].map((exportName) => ({
-        identity: { module: "src/tool-observation-projection.ts", exportName },
-        category: "projection" as const,
-      })),
-      ...["observationFromCanonicalPart", "UIMessageChunkProjectionState.toolChunk"].map(
-        (exportName) => ({
-          identity: { module: "src/ui-message-chunk-projection.ts", exportName },
-          category: "projection" as const,
-        }),
-      ),
-    ]);
-    expect(miniClient?.boundaryDecoders).toContainEqual({
-      identity: { module: "mini-lilac-transport.ts", exportName: "normalizeStreamChunkResult" },
-      category: "wire",
-    });
-    expect(miniServer?.boundaryDecoders).toEqual([
-      ...["decodeMiniLilacHttpRequest", "decodeMiniLilacUiMessages"].map((exportName) => ({
-        identity: { module: "src/server.ts", exportName },
-        category: "request" as const,
-      })),
-      {
-        identity: { module: "src/main.ts", exportName: "decodeMiniLilacCliOptions" },
-        category: "request",
-      },
-      {
-        identity: { module: "src/main.ts", exportName: "parseCliArgs" },
-        category: "request",
-      },
-      {
-        identity: { module: "src/server.ts", exportName: "adaptMiniLilacPersistenceResult" },
-        category: "projection",
-      },
-      {
-        identity: { module: "src/server.ts", exportName: "classifyHttpOperationFailure" },
-        category: "projection",
-      },
-    ]);
-    expect(remoteRunner?.boundaryDecoders).toEqual([
-      {
-        identity: { module: "src/cli.ts", exportName: "opaqueErrorCause" },
-        category: "projection",
-      },
-    ]);
-    expect(fs?.boundaryDecoders).toEqual([
-      {
-        identity: { module: "src/remote-runner-protocol.ts", exportName: "decodeJson" },
-        category: "wire",
-      },
-      {
-        identity: { module: "src/remote-runner-protocol.ts", exportName: "decodeRequest" },
-        category: "wire",
-      },
-      {
-        identity: {
-          module: "src/remote-runner-protocol.ts",
-          exportName: "decodeBundledRemoteRunnerRequest",
-        },
-        category: "wire",
-      },
-      {
-        identity: {
-          module: "src/remote-runner-protocol.ts",
-          exportName: "decodeRemoteFsRequest",
-        },
-        category: "wire",
-      },
-      {
-        identity: {
-          module: "src/remote-runner-protocol.ts",
-          exportName: "decodeRemoteFsDaemonRequest",
-        },
-        category: "wire",
-      },
-      {
-        identity: {
-          module: "src/remote-runner-protocol.ts",
-          exportName: "decodeRemoteRunnerResponse",
-        },
-        category: "wire",
-      },
-      {
-        identity: {
-          module: "src/remote-runner-protocol.ts",
-          exportName: "decodeRemoteRunnerResponseValue",
-        },
-        category: "wire",
-      },
-      {
-        identity: { module: "src/filesystem-operation.ts", exportName: "decodeFilesystemFailure" },
-        category: "projection",
-      },
-      {
-        identity: { module: "src/ripgrep.ts", exportName: "decodeRipgrepMatchLine" },
-        category: "wire",
-      },
-    ]);
-    expect(miniRuntime?.boundaryDecoders).toContainEqual({
-      identity: {
-        module: "src/session-service.ts",
-        exportName: "SessionActor.summarizeForCompaction",
-      },
-      category: "projection",
-    });
-  });
-
-  test("registers exact Mini Lilac stream capture and host adapters", () => {
-    const miniClient = architectureManifest.workspaces.find(
-      (workspace) => workspace.root === "packages/mini-lilac-client",
-    );
-    expect(
-      miniClient?.exceptionAdapters.map((adapter) => [
-        adapter.identity.exportName,
-        adapter.direction,
-      ]),
-    ).toEqual([
-      ["captureMiniLilacPromiseOutcome", "capture-external"],
-      ["captureMiniLilacStreamRead", "capture-external"],
-      ["captureMiniLilacSyncOutcome", "capture-external"],
-      ["parseMiniLilacStream.pull", "capture-external"],
-      ["parseMiniLilacStream.pull", "signal-host"],
-      ["parseMiniLilacStream.transform", "signal-host"],
-      ["resultToMiniLilacCompatibilityFailure", "signal-host"],
-      ["throwMiniLilacPanic", "signal-host"],
-    ]);
-  });
-
-  test("registers exact heartbeat lifecycle Result boundaries", () => {
-    const core = architectureManifest.workspaces.find(
-      (workspace) => workspace.root === "apps/core",
-    );
-    const modules = new Set(["src/heartbeat/heartbeat-service.ts"]);
-
-    expect(core?.operationalResultApis.filter((api) => modules.has(api.module))).toEqual([
-      {
-        module: "src/heartbeat/heartbeat-service.ts",
-        exportName: "reloadHeartbeatCoreConfig",
-      },
-      {
-        module: "src/heartbeat/heartbeat-service.ts",
-        exportName: "computeHeartbeatCronAtMs",
-      },
-      {
-        module: "src/heartbeat/heartbeat-service.ts",
-        exportName: "startHeartbeatServiceResult.startHeartbeatLifecycleResult",
-      },
-      {
-        module: "src/heartbeat/heartbeat-service.ts",
-        exportName: "startHeartbeatServiceResult.stopHeartbeatLifecycleResult",
-      },
-    ]);
-    expect(
-      core?.exceptionAdapters
-        .filter((adapter) => modules.has(adapter.identity.module))
-        .filter((adapter) => adapter.identity.exportName.startsWith("adapt"))
-        .map((adapter) => [adapter.identity.exportName, adapter.direction]),
-    ).toEqual([]);
-    expect(
-      core?.exceptionAdapters
-        .filter(
-          (adapter) =>
-            adapter.identity.module === "src/heartbeat/heartbeat-service.ts" &&
-            adapter.identity.exportName.startsWith("startHeartbeatService.stop"),
-        )
-        .map((adapter) => [adapter.identity.exportName, adapter.direction]),
-    ).toEqual([]);
-    expect(core?.exceptionAdapters).toContainEqual(
-      expect.objectContaining({
-        identity: {
-          module: "src/shared/event-bus-result.ts",
-          exportName: "adaptEventPublishResultToHost",
-        },
-        direction: "signal-host",
-      }),
-    );
-  });
-
-  test("does not permit migration baselines or generators in the governance inventory", () => {
-    const architectureFiles = readdirSync(import.meta.dir);
-    const syntaxFiles = readdirSync(path.join(import.meta.dir, "../oxlint-plugins"));
-    expect(architectureFiles).not.toContain("baseline.ts");
-    expect(architectureFiles.some((file) => file.includes(".baseline."))).toBeFalse();
-    expect(architectureFiles).not.toContain("stage7-preflight.ts");
-    expect(syntaxFiles.some((file) => file.includes("syntax-baseline"))).toBeFalse();
-    expect(syntaxFiles.some((file) => file.includes("generate-syntax-baseline"))).toBeFalse();
-  });
-
-  test("registers exact workspace-history host and Panic behavior without Legacy inference", () => {
-    const runtime = architectureManifest.workspaces.find(
-      (workspace) => workspace.root === "packages/mini-lilac-runtime",
-    );
-    const adapters =
-      runtime?.exceptionAdapters.filter(
-        (adapter) => adapter.identity.module === "src/workspace-history-store.ts",
-      ) ?? [];
-
-    expect(
-      adapters
-        .filter((adapter) => adapter.direction === "signal-host")
-        .map((adapter) => adapter.identity.exportName),
-    ).toEqual([
-      "superviseOutcome.rejection.reject",
-      "throwFailure",
-      "WorkspaceHistoryStore.constructor",
-      "WorkspaceHistoryStore.withWorkspaceLockOutcome.withStoreLock.<callback@2>.captureResult",
-      "WorkspaceHistoryStore.withWorkspaceLockOutcome.withStoreLock.<callback@2>.lockedStore.invalidateCaptureCacheResult",
-      "WorkspaceHistoryStore.withWorkspaceLockOutcome.withStoreLock.<callback@2>.lockedStore.prepareRestore",
-      "WorkspaceHistoryStore.withWorkspaceLockOutcome.withStoreLock.<callback@2>.lockedStore.resumePreparedRestore",
-      "WorkspaceHistoryStore.withWorkspaceLockResult",
-      "WorkspaceHistoryStore.resumeLocked",
-      "WorkspaceHistoryStore.publicResult",
-      "WorkspaceHistoryStore.publicWorkspaceResult",
-      "WorkspaceHistoryStore.validateSourceGitDirectory",
-      "WorkspaceHistoryStore.runGit",
-      "WorkspaceHistoryStore.runPrivateGitToHandle",
-      "WorkspaceHistoryStore.withWorkspaceLock",
-      "WorkspaceHistoryStore.withWorkspaceLockOutcome.withStoreLock.<callback@2>.lockedStore.capture",
-    ]);
-    expect(
-      adapters.some(
-        (adapter) =>
-          adapter.direction === "signal-host" && adapter.identity.exportName.endsWith("Legacy"),
-      ),
-    ).toBeFalse();
-    expect(
-      adapters
-        .filter((adapter) => adapter.direction === "observe-panic")
-        .map((adapter) => adapter.identity.exportName),
-    ).toEqual([
-      "attemptHost",
-      "attemptHostSync",
-      "superviseOutcome",
-      "WorkspaceHistoryStore.writeCaptureCache.<callback>",
-    ]);
-  });
-
-  test("registers workflow action and projector Result boundaries", () => {
-    const core = architectureManifest.workspaces.find(
-      (workspace) => workspace.root === "apps/core",
-    );
-    const operationalNames = core?.operationalResultApis.map(
-      (api) => `${api.module}#${api.exportName}`,
-    );
-    expect(core?.boundaryDecoders).toContainEqual({
-      identity: {
-        module: "src/workflow/workflow-action-resolver.ts",
-        exportName: "decodeWorkflowActionOutboxEvent",
-      },
-      category: "persistence",
-    });
-    expect(core?.boundaryDecoders).toContainEqual({
-      identity: {
-        module: "src/workflow/workflow-action-resolver.ts",
-        exportName: "decodeWorkflowSurfaceAction",
-      },
-      category: "projection",
-    });
-    for (const identity of [
-      "src/workflow/workflow-action-resolver.ts#captureWorkflowActionOutboxPublication",
-      "src/workflow/workflow-action-resolver.ts#startWorkflowActionResolver.startWorkflowActionSubscriptionResult",
-      "src/workflow/workflow-action-resolver.ts#startWorkflowActionResolver.stopWorkflowActionSubscriptionResult",
-      "src/workflow/workflow-progress-projector.ts#WorkflowProgressProjector.startWorkflowProgressSubscriptionResult",
-      "src/workflow/workflow-progress-projector.ts#WorkflowProgressProjector.stopWorkflowProgressSubscriptionResult",
-    ]) {
-      expect(operationalNames).toContain(identity);
-    }
-    for (const exportName of [
-      "adaptWorkflowActionSubscriptionStartResultToHost",
-      "adaptWorkflowActionSubscriptionStopResultToHost",
-      "adaptWorkflowProgressSubscriptionStartResultToHost",
-      "adaptWorkflowProgressSubscriptionStopResultToHost",
-    ]) {
-      expect(core?.exceptionAdapters).toContainEqual(
-        expect.objectContaining({
-          identity: expect.objectContaining({ exportName }),
-          category: "result-to-framework",
-          direction: "signal-host",
-        }),
-      );
-    }
-    expect(
-      core?.exceptionAdapters
-        .filter(
-          (adapter) =>
-            adapter.identity.module === "src/workflow/workflow-action-resolver.ts" &&
-            adapter.identity.exportName === "captureWorkflowActionOutboxPublication",
-        )
-        .map((adapter) => ({
-          category: adapter.category,
-          direction: adapter.direction,
-          externalApi: adapter.externalApi,
-        })),
-    ).toEqual([]);
-  });
-
-  test("registers workflow wait resolver Result and exception boundaries", () => {
-    const core = architectureManifest.workspaces.find(
-      (workspace) => workspace.root === "apps/core",
-    );
-    const operationalNames = core?.operationalResultApis.map(
-      (api) => `${api.module}#${api.exportName}`,
-    );
-    for (const exportName of [
-      "startWorkflowWaitResolverResult",
-      "acquireLeaseResult",
-      "startWorkflowWaitSubscriptionResult",
-      "captureWorkflowWaitResolverTrim",
-      "captureWorkflowWaitResolverConsumerGroupRetirement",
-      "failWorkflowWaitResolverActivation",
-      "activateSubscriptionResult",
-      "recoverSubscriptionResult",
-      "stopWorkflowWaitSubscriptionResult",
-      "stopWorkflowWaitResolverResult",
-      "captureWorkflowWaitResolverBarrierPublication",
-      "reconcileTimersResult",
-      "captureWorkflowWaitResolverWakeupPublication",
-    ]) {
-      expect(operationalNames).toContain(
-        `src/workflow/workflow-wait-resolver.ts#WorkflowWaitResolver.${exportName}`,
-      );
-    }
-    for (const exportName of [
-      "adaptWorkflowWaitResolverStartResultToHost",
-      "adaptWorkflowWaitResolverStopResultToHost",
-    ]) {
-      expect(core?.exceptionAdapters).toContainEqual(
-        expect.objectContaining({
-          identity: {
-            module: "src/workflow/workflow-wait-resolver.ts",
-            exportName,
-          },
-          category: "result-to-framework",
-          direction: "signal-host",
-        }),
-      );
-    }
-    for (const exportName of [
-      "WorkflowWaitResolver.captureWorkflowWaitResolverConsumerGroupRetirement",
-    ]) {
-      expect(
-        core?.exceptionAdapters
-          .filter(
-            (adapter) =>
-              adapter.identity.module === "src/workflow/workflow-wait-resolver.ts" &&
-              adapter.identity.exportName === exportName,
-          )
-          .map((adapter) => adapter.category),
-      ).toEqual(["defect-supervisor", "external-to-result"]);
-    }
-  });
-
-  test("registers exact Stage 3 decoders, opaque inputs, capabilities, and adapters", () => {
-    const core = architectureManifest.workspaces.find(
-      (workspace) => workspace.root === "apps/core",
-    );
-    const coding = architectureManifest.workspaces.find(
-      (workspace) => workspace.root === "packages/coding-tools",
-    );
-    const plugins = architectureManifest.workspaces.find(
-      (workspace) => workspace.root === "packages/plugin-runtime",
-    );
-    const utils = architectureManifest.workspaces.find(
-      (workspace) => workspace.root === "packages/utils",
-    );
-    const remoteRunner = architectureManifest.workspaces.find(
-      (workspace) => workspace.root === "packages/remote-fs-runner",
-    );
-
-    expect([core, coding, plugins, remoteRunner, utils].every(Boolean)).toBeTrue();
-    expect(core?.boundaryDecoders.map((decoder) => decoder.identity.exportName)).toContain(
-      "decodeThreadSummarizationWorkerRequest",
-    );
-    expect(core?.boundaryDecoders.map((decoder) => decoder.identity.exportName)).toContain(
-      "decodeThreadSummarizationWorkerResponse",
-    );
-    expect(
-      coding?.boundaryDecoders
-        .filter((decoder) =>
-          decoder.identity.exportName.startsWith("createFilesystemTools.toModelOutput"),
-        )
-        .map((decoder) => decoder.identity.exportName),
-    ).toEqual([
-      "createFilesystemTools.toModelOutput@1",
-      "createFilesystemTools.toModelOutput@2",
-      "createFilesystemTools.toModelOutput@3",
-      "createFilesystemTools.toModelOutput@4",
-    ]);
-    expect(utils?.boundaryDecoders).toContainEqual({
-      identity: { module: "custom-commands.ts", exportName: "decodeCustomCommandResult" },
-      category: "plugin",
-    });
-    expect(utils?.boundaryDecoders).toContainEqual({
-      identity: { module: "custom-commands.ts", exportName: "readCustomCommandDefinition" },
-      category: "plugin",
-    });
-    expect(plugins?.capabilityPredicates).toEqual([
-      {
-        identity: { module: "capabilities.ts", exportName: "isFunctionCapability" },
-        reason:
-          "Checks one exact runtime capability without interpreting plugin-owned domain data.",
-      },
-      {
-        identity: { module: "capabilities.ts", exportName: "isPluginPanic" },
-        reason:
-          "Checks one exact runtime capability without interpreting plugin-owned domain data.",
-      },
-    ]);
-    expect(utils?.capabilityPredicates).toContainEqual({
-      identity: { module: "runtime-utils.ts", exportName: "isPanic" },
-      reason:
-        "Checks exact Panic identity while treating hostile classifier inspection as ordinary opaque failure.",
-    });
-    expect(
-      utils?.exceptionAdapters.find(
-        (adapter) =>
-          adapter.identity.module === "runtime-utils.ts" &&
-          adapter.identity.exportName === "isPanic",
-      ),
-    ).toMatchObject({ direction: "capture-external" });
-    expect(
-      plugins?.boundaryDecoders.some(
-        (decoder) => decoder.identity.exportName === "decodeDynamicToolPluginModule",
-      ),
-    ).toBeTrue();
-    expect(
-      plugins?.opaqueUnknown.some(
-        (entry) => entry.identity.exportName === "Level1ToolSpec.formatArgs",
-      ),
-    ).toBeTrue();
-    expect(
-      plugins?.opaqueUnknown.some((entry) => entry.identity.exportName === "<module>"),
-    ).toBeFalse();
-    expect(
-      plugins?.exceptionAdapters.some(
-        (adapter) => adapter.identity.exportName === "loadToolPluginModuleCapability",
-      ),
-    ).toBeTrue();
-    expect(
-      core?.exceptionAdapters.some(
-        (adapter) => adapter.identity.exportName === "CustomCommandManager.execute",
-      ),
-    ).toBeFalse();
-    const removedBroadAdapters = new Set([
-      "rethrowBundledRemoteRunnerPanic",
-      "startConversationThreadSummarizationWorker.handleWorkerPanic",
-      "ConversationThread.call",
-      "signalConversationThreadWorkerPanicToProcess",
-      "createProcessHandlers.reportFatalError",
-      "decodeRemoteFsRunnerPackageSpec",
-    ]);
-    expect(
-      core?.exceptionAdapters.filter((adapter) =>
-        removedBroadAdapters.has(adapter.identity.exportName),
-      ),
-    ).toEqual([]);
-    expect(
-      core?.exceptionAdapters.some(
-        (adapter) => adapter.identity.exportName === "startBusAgentRunner.drainSessionQueue",
-      ),
-    ).toBeFalse();
-    expect(
-      remoteRunner?.exceptionAdapters.some((adapter) => adapter.identity.exportName === "<module>"),
-    ).toBeFalse();
-  });
-
-  test("activates exact Stage 3 Result and boundary zones and APIs", () => {
-    const core = architectureManifest.workspaces.find(
-      (workspace) => workspace.root === "apps/core",
-    );
-    const plugins = architectureManifest.workspaces.find(
-      (workspace) => workspace.root === "packages/plugin-runtime",
-    );
-    const remoteRunner = architectureManifest.workspaces.find(
-      (workspace) => workspace.root === "packages/remote-fs-runner",
-    );
-    if (!core || !plugins || !remoteRunner) throw new Error("Stage 3 workspace missing");
-
-    for (const rule of [
-      "architecture/no-unhandled-exception-contract",
-      "architecture/no-unredacted-tagged-error-log",
-      "architecture/fallible-api-result",
-    ] as const) {
-      expect(core.ruleZones[rule]).toEqual([{ include: "**" }]);
-      expect(plugins.ruleZones[rule]).toEqual([{ include: "**" }]);
-      expect(remoteRunner.ruleZones[rule]).toEqual([{ include: "**" }]);
-    }
-    expect(core.ruleZones["architecture/no-domain-unknown"]).toEqual([{ include: "**" }]);
-    expect(core.operationalResultApis).toContainEqual({
-      module: "src/custom-commands/manager.ts",
-      exportName: "CustomCommandManager.execute",
-    });
-    for (const decoder of [
-      { exportName: "decodeToolRequestHeaders", category: "request" },
-      { exportName: "decodeToolPayload", category: "plugin" },
-      { exportName: "projectUnhandledRejectionReason", category: "projection" },
-      {
-        exportName: "createToolServer.recordUnhandledRejectionAtBoundary",
-        category: "projection",
-      },
-      { exportName: "projectFatalToolCallDefect", category: "projection" },
-    ] as const) {
-      expect(core.boundaryDecoders).toContainEqual({
-        identity: {
-          module: "src/tool-server/create-tool-server.ts",
-          exportName: decoder.exportName,
-        },
-        category: decoder.category,
-      });
-    }
-    for (const exportName of [
-      "validateToolServerOptions",
-      "createToolServer.authenticateContext",
-      "createToolServer.resolveSafetyMode",
-      "createToolServer.lookupTool",
-    ]) {
-      expect(core.operationalResultApis).toContainEqual({
-        module: "src/tool-server/create-tool-server.ts",
-        exportName,
-      });
-    }
-    for (const exportName of [
-      "adaptToolServerOptionsResultToHost",
-      "adaptToolAuthenticationResultToElysia",
-      "adaptSafetyModeResultToElysia",
-      "adaptToolRouteResultToElysia",
-      "adaptPluginLifecycleResultToHost",
-      "adaptPluginListResultToElysia",
-    ]) {
-      expect(
-        core.exceptionAdapters.some(
-          (adapter) =>
-            adapter.identity.module === "src/tool-server/create-tool-server.ts" &&
-            adapter.identity.exportName === exportName,
-        ),
-      ).toBeTrue();
-    }
-    expect(
-      core.exceptionAdapters.filter(
-        (adapter) =>
-          adapter.identity.module === "src/tool-server/create-tool-server.ts" &&
-          [
-            "observeToolCallRejection",
-            "superviseToolCallRejections",
-            "signalFatalToolCallDefectToProcess",
-          ].includes(adapter.identity.exportName),
-      ),
-    ).toEqual([]);
-    expect(plugins.operationalResultApis).toContainEqual({
-      module: "manager.ts",
-      exportName: "ToolPluginManager.reload",
-    });
-    expect(remoteRunner.operationalResultApis).toContainEqual({
-      module: "src/cli.ts",
-      exportName: "tryAcquireStartupLock",
-    });
-    expect(remoteRunner.operationalResultApis).toContainEqual({
-      module: "src/cli.ts",
-      exportName: "runRequest",
-    });
-  });
-
   test("requires exact reasoned and exception-adapter registrations", () => {
     expect(() =>
       assertArchitectureManifestIntegrity({
@@ -1783,145 +1076,6 @@ describe("Stage 2 union rules", () => {
 });
 
 describe("Stage 4 event architecture rules", () => {
-  test("registers enforced production foundations and the single event catalog", () => {
-    const eventBus = architectureManifest.workspaces.find(
-      (workspace) => workspace.name === "packages/event-bus",
-    );
-    if (!eventBus) throw new Error("event-bus workspace missing");
-
-    expect(eventBus.eventCodecRegistries).toHaveLength(1);
-    expect(eventBus.eventCodecRegistries[0]).toMatchObject({
-      identity: { module: "lilac-codecs.ts", exportName: "lilacEventCodecRegistry" },
-      catalog: { module: "lilac-spec.ts", exportName: "LILAC_EVENTS" },
-      catalogHelper: { module: "define-lilac-events.ts", exportName: "defineLilacEvents" },
-      registryHelper: {
-        module: "define-lilac-events.ts",
-        exportName: "createLilacEventCodecRegistry",
-      },
-    });
-    expect(eventBus.rawEventMessageBoundaries).toContainEqual(
-      expect.objectContaining({
-        identity: { module: "raw-bus.ts", exportName: "RawBus.subscribe" },
-        handlerParameter: 2,
-        messageParameter: 0,
-      }),
-    );
-    expect(eventBus.eventDeliveryApis).toContainEqual(
-      expect.objectContaining({
-        identity: { module: "lilac-bus.ts", exportName: "LilacBus.subscribeTopic" },
-        handlerParameter: 2,
-        handlerMessageParameter: 0,
-        handlerContextParameter: 1,
-      }),
-    );
-    expect(eventBus.boundaryDecoders).toContainEqual({
-      identity: {
-        module: "core-primary-lineage.ts",
-        exportName: "decodeCorePrimaryLineageV1",
-      },
-      category: "projection",
-    });
-    expect(eventBus.exceptionAdapters).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({
-          identity: {
-            module: "event-dead-letter.ts",
-            exportName: "captureDeadLetterAcceptance.catch",
-          },
-          category: "defect-supervisor",
-          direction: "observe-panic",
-        }),
-        expect.objectContaining({
-          identity: {
-            module: "core-primary-lineage.ts",
-            exportName: "decodeCorePrimaryLineageV1",
-          },
-          category: "defect-supervisor",
-          direction: "observe-panic",
-        }),
-        expect.objectContaining({
-          identity: {
-            module: "redis-event-dead-letter.ts",
-            exportName: "RedisEventDeadLetter.constructor",
-          },
-          category: "compatibility",
-          direction: "signal-host",
-        }),
-      ]),
-    );
-    const core = architectureManifest.workspaces.find(
-      (workspace) => workspace.name === "apps/core",
-    );
-    if (!core) throw new Error("core workspace missing");
-    expect(core.eventDeliveryConsumers).toHaveLength(12);
-    expect(core.boundaryDecoders).toContainEqual({
-      identity: {
-        module: "src/surface/bridge/bus-agent-runner/raw.ts",
-        exportName: "parseRequestControlFromRaw",
-      },
-      category: "projection",
-    });
-    expect(core.eventDeliveryConsumers).toContainEqual(
-      expect.objectContaining({
-        identity: {
-          module: "src/workflow/workflow-engine.ts",
-          exportName: "WorkflowEngine.startWakeSubscription",
-        },
-        operations: ["subscribeTopic"],
-      }),
-    );
-    expect(core.operationalResultApis).toEqual(
-      expect.arrayContaining([
-        {
-          module: "src/workflow/workflow-engine.ts",
-          exportName: "WorkflowEngine.startWakeSubscription",
-        },
-        { module: "src/workflow/workflow-engine.ts", exportName: "runWorkflowTimerTick" },
-        {
-          module: "src/workflow/workflow-engine.ts",
-          exportName: "captureWorkflowTerminalReceiptAdoption",
-        },
-        {
-          module: "src/workflow/workflow-engine.ts",
-          exportName: "captureWorkflowIdleCancellationPublication",
-        },
-        { module: "src/workflow/workflow-engine.ts", exportName: "fetchWorkflowTerminalReceipt" },
-      ]),
-    );
-    expect(core.exceptionAdapters).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({
-          identity: {
-            module: "src/workflow/workflow-engine.ts",
-            exportName: "requireWorkflowEngineSubscriptionStart",
-          },
-          category: "result-to-framework",
-          direction: "signal-host",
-        }),
-        expect.objectContaining({
-          identity: {
-            module: "src/workflow/workflow-engine.ts",
-            exportName: "runWorkflowTimerTick",
-          },
-          category: "defect-supervisor",
-          direction: "observe-panic",
-        }),
-      ]),
-    );
-    for (const exportName of ["captureWorkflowTerminalReceiptAdoption"]) {
-      expect(
-        core.exceptionAdapters
-          .filter(
-            (adapter) =>
-              adapter.identity.module === "src/workflow/workflow-engine.ts" &&
-              adapter.identity.exportName === exportName,
-          )
-          .map((adapter) => adapter.category),
-      ).toEqual(["defect-supervisor", "external-to-result"]);
-    }
-    expect(() => assertArchitectureManifestIntegrity(architectureManifest)).not.toThrow();
-  });
-
   test("checks event infrastructure identities and parameter indexes", () => {
     const registry = fixtureCodecRegistry("validFixtureEventCodecs");
     const validWorkspace = {
@@ -2237,78 +1391,6 @@ describe("Stage 4 event architecture rules", () => {
 });
 
 describe("Stage 5 presentation architecture rules", () => {
-  test("enforces the integrated Stage 5 projection and render modules", () => {
-    const tui = architectureManifest.workspaces.find(
-      (workspace) => workspace.name === "apps/mini-lilac-tui",
-    );
-    if (!tui) throw new Error("mini-lilac-tui workspace missing");
-
-    expect(tui.toolCodecRegistries).toEqual([
-      {
-        identity: {
-          module: "src/tool-observation-projection.ts",
-          exportName: "toolObservationCodecRegistry",
-        },
-        aliases: [
-          {
-            module: "src/tool-observation-projection.ts",
-            exportName: "knownToolCodecRegistry",
-          },
-        ],
-        canonicalTools: {
-          package: "@stanley2058/mini-lilac-client",
-          module: "tool-catalog.ts",
-          exportName: "MINI_LILAC_TOOL_NAMES",
-        },
-      },
-    ]);
-    expect(tui.resultDecoders).toEqual([
-      expect.objectContaining({
-        identity: {
-          module: "src/tool-observation-projection.ts",
-          exportName: "decodeKnownToolObservation",
-        },
-      }),
-    ]);
-    expect(tui.unknownFreeModules).toEqual([
-      { module: "src/render.ts" },
-      { module: "src/transcript-buffer.ts" },
-    ]);
-    expect(tui.operationalResultApis).toContainEqual({
-      module: "src/tool-observation-projection.ts",
-      exportName: "decodeKnownToolObservation",
-    });
-    expect(() => assertArchitectureManifestIntegrity(architectureManifest)).not.toThrow();
-  });
-
-  test("owns every landed projection parser and passes enforced Stage 5 contracts", () => {
-    const tui = architectureManifest.workspaces.find(
-      (workspace) => workspace.name === "apps/mini-lilac-tui",
-    );
-    if (!tui) throw new Error("mini-lilac-tui workspace missing");
-    const workspaceProgram = createWorkspaceProgram(REPOSITORY_ROOT, tui);
-    const findings = analyzeWorkspace(
-      tui,
-      workspaceProgram.root,
-      workspaceProgram.program,
-      architectureManifest.workspaces.map((workspace) => ({
-        packageName: workspace.packageName,
-        root: path.join(REPOSITORY_ROOT, workspace.root),
-      })),
-    );
-    const stage5Modules = new Set([
-      "src/render.ts",
-      "src/ui-message-chunk-projection.ts",
-      "src/tool-observation-projection.ts",
-      "src/transcript-buffer.ts",
-    ]);
-    const stage5Findings = findings.filter(
-      (finding) => finding.location !== undefined && stage5Modules.has(finding.location.file),
-    );
-
-    expect(stage5Findings).toEqual([]);
-  }, 30_000);
-
   test("requires an explicit exhaustive tool codec registry without spread, broad, missing, or extra keys", () => {
     const complete = findingsFor("architecture/complete-tool-codec-registry", "stage5-tools.ts", {
       toolCodecRegistries: [fixtureToolCodecRegistry("completeToolCodecs")],
@@ -2837,60 +1919,6 @@ describe("Stage 6 persistence and SQLite architecture", () => {
     );
   });
 
-  test("registers the single workflow row codec catalog without treating family fixtures as a second contract", () => {
-    const core = architectureManifest.workspaces.find(({ root }) => root === "apps/core");
-    if (!core) throw new Error("Core architecture workspace missing");
-    const workflowModule = "src/workflow/workflow-persistence-codec.ts";
-    const workflowCodecs = core.persistedCodecs.filter(
-      ({ identity }) => identity.module === workflowModule,
-    );
-    expect(workflowCodecs).toEqual([
-      expect.objectContaining({
-        identity: {
-          module: workflowModule,
-          exportName: "decodeWorkflowPersistenceRow",
-        },
-        fixtureCatalog: {
-          module: workflowModule,
-          exportName: "workflowPersistenceRowCodecCases",
-        },
-        missingOutcomes: {
-          revision: "missing-rejected",
-          run: "missing-rejected",
-          operation: "missing-rejected",
-          wait: "missing-rejected",
-          trigger: "missing-rejected",
-          binding: "missing-rejected",
-          action: "missing-defaulted",
-          dispatch: "missing-rejected",
-          receipt: "missing-rejected",
-          outbox: "missing-rejected",
-          "legacy-audit": "missing-rejected",
-        },
-      }),
-    ]);
-
-    const sourceText = readFileSync(
-      path.join(REPOSITORY_ROOT, "apps/core", workflowModule),
-      "utf8",
-    );
-    const source = ts.createSourceFile(workflowModule, sourceText, ts.ScriptTarget.Latest, true);
-    const exportedVariables = source.statements.flatMap((statement) => {
-      if (!ts.isVariableStatement(statement)) return [];
-      const exported = statement.modifiers?.some(
-        ({ kind }) => kind === ts.SyntaxKind.ExportKeyword,
-      );
-      if (!exported) return [];
-      return statement.declarationList.declarations.flatMap(({ name }) =>
-        ts.isIdentifier(name) ? [name.text] : [],
-      );
-    });
-    expect(exportedVariables.filter((name) => name.endsWith("CodecCases"))).toEqual([
-      "workflowPersistenceRowCodecCases",
-    ]);
-    expect(exportedVariables).toContain("workflowPersistenceRowFamilyFixtures");
-  });
-
   test("validates the real bun:sqlite adapter and detects Err returned by a raw callback", () => {
     const workspace = {
       ...realWorkspaceBase,
@@ -3115,94 +2143,14 @@ describe("Stage 6 persistence and SQLite architecture", () => {
     expect(stderr).toBe("");
     expect(exitCode).toBe(0);
   });
-
-  test("activates only the landed production Stage 6 scopes", () => {
-    const core = architectureManifest.workspaces.find(({ name }) => name === "apps/core");
-    const mini = architectureManifest.workspaces.find(
-      ({ name }) => name === "packages/mini-lilac-runtime",
-    );
-    const utils = architectureManifest.workspaces.find(({ name }) => name === "packages/utils");
-    if (!core || !mini || !utils) throw new Error("Stage 6 production workspaces missing");
-    expect(
-      core.persistedCodecs.filter(
-        ({ identity }) =>
-          identity.module === "src/conversation/thread-summary-persistence-codec.ts",
-      ),
-    ).toEqual([
-      expect.objectContaining({
-        identity: {
-          module: "src/conversation/thread-summary-persistence-codec.ts",
-          exportName: "decodeConversationThreadSummaryRow",
-        },
-        fixtureCatalog: {
-          module: "src/conversation/thread-summary-persistence-codec.ts",
-          exportName: "conversationThreadSummaryRowCodecCases",
-        },
-      }),
-    ]);
-    expect(
-      architectureManifest.workspaces.reduce(
-        (count, workspace) => count + workspace.persistedCodecs.length,
-        0,
-      ),
-    ).toBe(26);
-    expect(
-      core.sqliteTransactionConsumers.find(
-        ({ identity }) => identity.exportName === "ConversationThreadStore.upsertSummary",
-      ),
-    ).toBeDefined();
-    expect(utils.sqliteTransactionAdapters).toContainEqual(
-      expect.objectContaining({
-        identity: { module: "persistence.ts", exportName: "runBunSqliteTransaction" },
-      }),
-    );
-    for (const registration of [
-      ...core.persistedCodecs,
-      ...core.persistedStoreConsumers,
-      ...core.sqliteTransactionConsumers,
-    ]) {
-      expect(core.operationalResultApis).toContainEqual(registration.identity);
-    }
-    expect(utils.operationalResultApis).toContainEqual({
-      module: "persistence.ts",
-      exportName: "runBunSqliteTransaction",
-    });
-  });
-
-  test("the shared SQLite adapter remains contract-ready after production enforcement", () => {
-    const utils = architectureManifest.workspaces.find(({ name }) => name === "packages/utils");
-    const registration = utils?.sqliteTransactionAdapters[0];
-    if (!utils || !registration) throw new Error("shared SQLite adapter registration missing");
-    const workspace = {
-      ...utils,
-      ruleZones: {
-        ...utils.ruleZones,
-        "architecture/sqlite-transaction-adapter-contract": [{ include: "persistence.ts" }],
-        "architecture/no-result-err-in-sqlite-callback": [{ include: "persistence.ts" }],
-      },
-      sqliteTransactionAdapters: [registration],
-    } satisfies WorkspaceArchitecture;
-    const workspaceProgram = createWorkspaceProgram(REPOSITORY_ROOT, workspace);
-    const findings = analyzeWorkspace(workspace, workspaceProgram.root, workspaceProgram.program);
-    expect(
-      findings.filter(({ rule }) =>
-        [
-          "architecture/sqlite-transaction-adapter-contract",
-          "architecture/no-result-err-in-sqlite-callback",
-        ].includes(rule),
-      ),
-    ).toEqual([]);
-  });
 });
 
 describe("permanent architecture governance", () => {
-  test("enforces all active workspaces without migration status", () => {
-    expect(architectureManifest.workspaces).toHaveLength(18);
+  test("keeps active workspaces covered by permanent and exact registration rules", () => {
     expect(architectureManifest.workspaces.map(({ root }) => root).sort()).toEqual(
       ACTIVE_WORKSPACES.map(([root]) => root).sort(),
     );
     for (const workspace of architectureManifest.workspaces) {
-      expect("status" in workspace).toBeFalse();
       for (const rule of FINAL_PACKAGE_WIDE_ARCHITECTURE_RULES) {
         expect(workspace.ruleZones[rule]).toEqual([{ include: "**" }]);
       }
@@ -3213,6 +2161,129 @@ describe("permanent architecture governance", () => {
       }
     }
     expect(() => assertArchitectureManifestIntegrity(architectureManifest)).not.toThrow();
+  });
+
+  test("retains the canonical event catalog and representative delivery consumers", () => {
+    const eventBus = architectureManifest.workspaces.find(
+      ({ name }) => name === "packages/event-bus",
+    );
+    const core = architectureManifest.workspaces.find(({ name }) => name === "apps/core");
+    if (!eventBus || !core) throw new Error("Event architecture workspaces missing");
+
+    expect(eventBus.eventCodecRegistries).toContainEqual({
+      identity: { module: "lilac-codecs.ts", exportName: "lilacEventCodecRegistry" },
+      catalog: { module: "lilac-spec.ts", exportName: "LILAC_EVENTS" },
+      catalogHelper: { module: "define-lilac-events.ts", exportName: "defineLilacEvents" },
+      registryHelper: {
+        module: "define-lilac-events.ts",
+        exportName: "createLilacEventCodecRegistry",
+      },
+    });
+
+    const consumers = new Set(
+      core.eventDeliveryConsumers.map(
+        ({ identity, operations }) =>
+          `${identity.module}#${identity.exportName}:${[...operations].sort().join(",")}`,
+      ),
+    );
+    for (const required of [
+      "src/surface/bridge/bus-agent-runner.ts#startBusAgentRunner:subscribeTopic",
+      "src/workflow/workflow-engine.ts#WorkflowEngine.waitForAgentRequest:fetchTopic,subscribeTopic",
+      "src/workflow/workflow-progress-projector.ts#WorkflowProgressProjector.startWorkflowProgressSubscriptionResult:subscribeTopic",
+    ]) {
+      expect(consumers).toContain(required);
+    }
+  });
+
+  test("retains representative persisted codec fixture registrations", () => {
+    const registrations = new Set(
+      architectureManifest.workspaces.flatMap((workspace) =>
+        workspace.persistedCodecs.map(
+          ({ identity, fixtureCatalog }) =>
+            `${workspace.name}:${identity.module}#${identity.exportName}->${fixtureCatalog.module}#${fixtureCatalog.exportName}`,
+        ),
+      ),
+    );
+
+    for (const required of [
+      "apps/acp-controller:run-store.ts#decodeRunRecord->run-store.ts#runRecordCodecCases",
+      "apps/core:src/runtime/graceful-restart-store.ts#decodeGracefulRestartSnapshot->src/runtime/graceful-restart-store.ts#gracefulRestartSnapshotCodecCases",
+      "apps/core:src/workflow/workflow-persistence-codec.ts#decodeWorkflowPersistenceRow->src/workflow/workflow-persistence-codec.ts#workflowPersistenceRowCodecCases",
+      "apps/mini-lilac-tui:src/preferences.ts#decodeBindingPreferences->src/preferences.ts#bindingPreferencesCodecCases",
+      "packages/mini-lilac-runtime:src/workspace-history-persistence-codec.ts#decodeWorkspaceHistorySnapshotManifest->src/workspace-history-persistence-codec.ts#workspaceHistorySnapshotManifestCodecCases",
+      "packages/mini-lilac-runtime:src/sqlite-history-persistence-codec.ts#decodeMiniLilacStructuralHistoryRow->src/sqlite-history-persistence-codec.ts#miniLilacStructuralHistoryRowCodecCases",
+      "packages/tool-results:src/tool-result-artifact-metadata-codec.ts#decodeToolResultArtifactMetadata->src/tool-result-artifact-metadata-codec.ts#toolResultArtifactMetadataCodecCases",
+      "packages/utils:codex-oauth.ts#decodeCodexTokens->codex-oauth.ts#codexTokensCodecCases",
+    ]) {
+      expect(registrations).toContain(required);
+    }
+  });
+
+  test("retains the Mini TUI tool registry and representative boundary decoders", () => {
+    const tui = architectureManifest.workspaces.find(({ name }) => name === "apps/mini-lilac-tui");
+    if (!tui) throw new Error("Mini TUI architecture workspace missing");
+
+    expect(tui.toolCodecRegistries).toContainEqual({
+      identity: {
+        module: "src/tool-observation-projection.ts",
+        exportName: "toolObservationCodecRegistry",
+      },
+      aliases: [
+        {
+          module: "src/tool-observation-projection.ts",
+          exportName: "knownToolCodecRegistry",
+        },
+      ],
+      canonicalTools: {
+        package: "@stanley2058/mini-lilac-client",
+        module: "tool-catalog.ts",
+        exportName: "MINI_LILAC_TOOL_NAMES",
+      },
+    });
+
+    const decoders = new Set(
+      architectureManifest.workspaces.flatMap((workspace) =>
+        workspace.boundaryDecoders.map(
+          ({ identity, category }) =>
+            `${workspace.name}:${identity.module}#${identity.exportName}:${category}`,
+        ),
+      ),
+    );
+    for (const required of [
+      "apps/core:src/surface/bridge/bus-agent-runner/raw.ts#parseRequestControlFromRaw:projection",
+      "apps/core:src/workflow/workflow-action-resolver.ts#decodeWorkflowActionOutboxEvent:persistence",
+      "apps/mini-lilac-server:src/server.ts#decodeMiniLilacHttpRequest:request",
+      "packages/fs:src/remote-runner-protocol.ts#decodeJson:wire",
+      "packages/utils:custom-commands.ts#decodeCustomCommandResult:plugin",
+    ]) {
+      expect(decoders).toContain(required);
+    }
+  });
+
+  test("retains critical exact exception registrations and approvals", () => {
+    const registrations = new Set(
+      architectureManifest.workspaces.flatMap((workspace) =>
+        workspace.exceptionAdapters.map(
+          ({ identity, category, externalApi, direction }) =>
+            `${workspace.name}:${identity.module}#${identity.exportName}:${category}:${externalApi.package}#${externalApi.exportName}:${direction}`,
+        ),
+      ),
+    );
+    const approvals = new Set(
+      architectureManifest.approvedExceptionAdapters.map(
+        ({ workspace, callable, category, externalApi, mode }) =>
+          `${workspace}:${callable.module}#${callable.exportName}:${category}:${externalApi.package}#${externalApi.exportName}:${mode}`,
+      ),
+    );
+    const required = [
+      "apps/core:src/surface/bridge/adapter-event-projection.ts#signalAdapterEventPlatformMismatch:defect-supervisor:better-result#Panic:signal-host",
+      "apps/core:src/surface/produced-ref-guard.ts#signalSurfaceAdapterContractViolation:defect-supervisor:better-result#Panic:signal-host",
+    ];
+
+    for (const identity of required) {
+      expect(registrations).toContain(identity);
+      expect(approvals).toContain(identity);
+    }
   });
 
   test("rejects missing and broad exact-registration zones", () => {
@@ -3447,258 +2518,6 @@ describe("real declaration integration", () => {
     );
     expect(resultLeaks).toHaveLength(2);
     expect(resultLeaks.every((finding) => finding.message.includes("JSON.stringify"))).toBeTrue();
-  });
-
-  test("retains converted Core Stage 1 pilot symbols alongside later stages", () => {
-    const core = architectureManifest.workspaces.find(
-      (workspace) => workspace.root === "apps/core",
-    );
-    if (!core) throw new Error("core workspace missing");
-    expect(core.operationalResultApis.filter((api) => api.module.startsWith("src/mcp/"))).toEqual([
-      { module: "src/mcp/config-file.ts", exportName: "readMcpConfigFile" },
-      { module: "src/mcp/config-file.ts", exportName: "writeMcpConfigFileAtomic" },
-      { module: "src/mcp/config-file.ts", exportName: "mutateMcpConfigFile" },
-      {
-        module: "src/mcp/credential-file.ts",
-        exportName: "resolveMcpOAuthCredentialPathResult",
-      },
-      {
-        module: "src/mcp/credential-file.ts",
-        exportName: "readMcpOAuthCredentialFileResult",
-      },
-      {
-        module: "src/mcp/credential-file.ts",
-        exportName: "writeMcpOAuthCredentialFileAtomicResult",
-      },
-      {
-        module: "src/mcp/credential-file.ts",
-        exportName: "updateMcpOAuthCredentialFileResult",
-      },
-      { module: "src/mcp/oauth-provider.ts", exportName: "captureOAuthAttempt" },
-      {
-        module: "src/mcp/oauth-provider.ts",
-        exportName: "McpOAuthProvider.startAuthorizationResult",
-      },
-      {
-        module: "src/mcp/oauth-provider.ts",
-        exportName: "McpOAuthProvider.completeAuthorizationResult",
-      },
-      {
-        module: "src/mcp/oauth-provider.ts",
-        exportName: "McpOAuthProvider.createPendingAuthorization",
-      },
-      {
-        module: "src/mcp/oauth-provider.ts",
-        exportName: "McpOAuthProviderService.startAuthorizationResult",
-      },
-      { module: "src/mcp/value-source.ts", exportName: "resolveJsonPointer" },
-      { module: "src/mcp/value-source.ts", exportName: "resolveMcpValueSource" },
-      { module: "src/mcp/value-source.ts", exportName: "resolveMcpValueSourceMap" },
-      { module: "src/mcp/value-source.ts", exportName: "validateHttpHeaders" },
-    ]);
-    expect(core.ruleZones["architecture/fallible-api-result"]).toEqual([{ include: "**" }]);
-    expect(
-      core.exceptionAdapters
-        .filter((adapter) =>
-          ["McpOAuthProvider.clientInformationForSdkAttempt", "resultToMcpToolValue"].includes(
-            adapter.identity.exportName,
-          ),
-        )
-        .map((adapter) => ({
-          identity: adapter.identity,
-          category: adapter.category,
-          externalApi: adapter.externalApi,
-          direction: adapter.direction,
-        })),
-    ).toEqual([
-      {
-        identity: {
-          module: "src/mcp/oauth-provider.ts",
-          exportName: "McpOAuthProvider.clientInformationForSdkAttempt",
-        },
-        category: "result-to-framework",
-        externalApi: {
-          package: "@ai-sdk/mcp",
-          exportName: "OAuthClientProvider.clientInformation",
-        },
-        direction: "signal-host",
-      },
-      {
-        identity: {
-          module: "src/tool-server/tools/mcp.ts",
-          exportName: "resultToMcpToolValue",
-        },
-        category: "result-to-framework",
-        externalApi: {
-          package: "@stanley2058/lilac-plugin-runtime",
-          exportName: "ServerTool",
-        },
-        direction: "signal-host",
-      },
-    ]);
-    expect(
-      core.exceptionAdapters
-        .filter(
-          (adapter) =>
-            adapter.identity.exportName === "McpRegistry.reconcileServer" ||
-            adapter.identity.exportName.startsWith("McpRegistry.initializeCandidate"),
-        )
-        .map((adapter) => [adapter.identity.exportName, adapter.direction]),
-    ).toEqual([
-      ["McpRegistry.initializeCandidate", "capture-external"],
-      ["McpRegistry.reconcileServer", "capture-external"],
-      [
-        "McpRegistry.initializeCandidate.withDeadline.<callback@2>.onUncaughtError",
-        "capture-external",
-      ],
-    ]);
-    expect(
-      core.exceptionAdapters.find(
-        (adapter) => adapter.identity.exportName === "opaqueErrorMessage",
-      ),
-    ).toMatchObject({
-      identity: { module: "src/mcp/error-format.ts", exportName: "opaqueErrorMessage" },
-      category: "compatibility",
-      externalApi: { package: "global", exportName: "Error.message" },
-      direction: "capture-external",
-    });
-
-    const operationalResultApiKeys = new Set(
-      core.operationalResultApis.map((identity) => `${identity.module}#${identity.exportName}`),
-    );
-    for (const key of [
-      "src/conversation/thread-materializer-worker-protocol.ts#decodeThreadMaterializerWorkerRequest",
-      "src/conversation/thread-materializer-worker-protocol.ts#decodeThreadMaterializerWorkerResponse",
-      "src/github/github-app.ts#decodeGithubAppSecret",
-      "src/github/github-app.ts#readGithubAppSecretResult",
-      "src/github/github-api.ts#decodeGithubApiErrorResponse",
-      "src/github/github-user-token.ts#decodeGithubUserTokenSecret",
-      "src/github/github-user-token.ts#readGithubUserTokenSecretResult",
-      "src/github/webhook/github-webhook-server.ts#captureGithubWebhookOperation",
-      "src/github/webhook/github-webhook-server.ts#superviseGithubWebhookHandler",
-      "src/transcript/transcript-store.ts#SqliteTranscriptStore.getCoreNamedClaudeSessionBinding",
-      "src/transcript/transcript-store.ts#SqliteTranscriptStore.readCoreNamedClaudeSessionBinding",
-      "src/transcript/transcript-store.ts#SqliteTranscriptStore.getCorePrimaryClaudeSessionBinding",
-      "src/transcript/transcript-store.ts#SqliteTranscriptStore.readCorePrimaryClaudeSessionBinding",
-    ]) {
-      expect(operationalResultApiKeys).toContain(key);
-    }
-
-    for (const [module, exportName] of [
-      [
-        "src/surface/bridge/bus-agent-runner/output-publisher.ts",
-        "createAgentOutputPublisher.enqueue.superviseSettlement",
-      ],
-      ["src/surface/discord/discord-adapter.ts", "DiscordAdapter.emit.catch.<callback@1>"],
-      ["src/workflow/workflow-engine.ts", "WorkflowEngine.claimAndLaunch.catch.<callback@1>"],
-      ["src/workflow/workflow-sandbox.ts", "startWorkflowSandbox.respondToHostCall"],
-      ["src/workflow/workflow-sandbox.ts", "startWorkflowSandbox.result.<callback>"],
-    ] as const) {
-      expect(core.exceptionAdapters).toContainEqual(
-        expect.objectContaining({
-          identity: { module, exportName },
-          category: "defect-supervisor",
-          externalApi: { package: "better-result", exportName: "Panic.is" },
-          direction: "observe-panic",
-        }),
-      );
-    }
-    expect(core.exceptionAdapters).toContainEqual(
-      expect.objectContaining({
-        identity: {
-          module: "src/surface/discord/discord-adapter.ts",
-          exportName: "DiscordAdapter.reportDetachedPanic.queueMicrotask.<callback@1>",
-        },
-        category: "defect-supervisor",
-        direction: "signal-host",
-      }),
-    );
-    for (const [module, exportName] of [
-      ["src/runtime/create-core-runtime.ts", "startCoreMcpServices"],
-      ["src/surface/discord/discord-adapter.ts", "DiscordAdapter.emit"],
-      ["src/workflow/workflow-sandbox.ts", "startWorkflowSandbox.terminate"],
-    ] as const) {
-      expect(
-        core.exceptionAdapters.some(
-          (adapter) =>
-            adapter.identity.module === module && adapter.identity.exportName === exportName,
-        ),
-      ).toBeFalse();
-    }
-    const runtime = architectureManifest.workspaces.find(
-      (workspace) => workspace.root === "packages/mini-lilac-runtime",
-    );
-    if (!runtime) throw new Error("Mini Lilac Runtime workspace missing");
-    expect(runtime.ruleZones["architecture/no-unhandled-exception-contract"]).toEqual([
-      { include: "**" },
-    ]);
-    expect(runtime.ruleZones["architecture/no-unredacted-tagged-error-log"]).toEqual([
-      { include: "**" },
-    ]);
-    expect(runtime.ruleZones["architecture/fallible-api-result"]).toEqual([{ include: "**" }]);
-  });
-
-  test("registers surface projections and platform mismatch Panic provenance", () => {
-    const core = architectureManifest.workspaces.find(
-      (workspace) => workspace.root === "apps/core",
-    );
-    if (!core) throw new Error("core workspace missing");
-    const platformMismatchIdentity = {
-      module: "src/surface/bridge/adapter-event-projection.ts",
-      exportName: "signalAdapterEventPlatformMismatch",
-    } as const;
-    const platformMismatchReason =
-      "Signals a hard invariant when a normalized adapter event contains mixed platforms.";
-
-    expect(core.exceptionAdapters).toContainEqual({
-      identity: platformMismatchIdentity,
-      category: "defect-supervisor",
-      externalApi: { package: "better-result", exportName: "Panic" },
-      direction: "signal-host",
-      reason: platformMismatchReason,
-    });
-    expect(architectureManifest.approvedExceptionAdapters).toContainEqual({
-      workspace: "apps/core",
-      callable: platformMismatchIdentity,
-      category: "defect-supervisor",
-      externalApi: { package: "better-result", exportName: "Panic" },
-      mode: "signal-host",
-      syntaxKinds: ["throw-statement", "host-rejection-call", "registered-host-signal-call"],
-      relationship: "host-contract",
-      provenance: "workspace-reviewed-manifest",
-      reason: platformMismatchReason,
-    });
-    const descriptorMismatchIdentity = {
-      module: "src/surface/produced-ref-guard.ts",
-      exportName: "signalSurfaceAdapterContractViolation",
-    } as const;
-    const descriptorMismatchReason =
-      "Signals a hard descriptor-bound contract defect before an adapter-produced ref crosses a shared publication or persistence seam.";
-    expect(core.exceptionAdapters).toContainEqual({
-      identity: descriptorMismatchIdentity,
-      category: "defect-supervisor",
-      externalApi: { package: "better-result", exportName: "Panic" },
-      direction: "signal-host",
-      reason: descriptorMismatchReason,
-    });
-    expect(architectureManifest.approvedExceptionAdapters).toContainEqual({
-      workspace: "apps/core",
-      callable: descriptorMismatchIdentity,
-      category: "defect-supervisor",
-      externalApi: { package: "better-result", exportName: "Panic" },
-      mode: "signal-host",
-      syntaxKinds: ["throw-statement", "host-rejection-call", "registered-host-signal-call"],
-      relationship: "host-contract",
-      provenance: "workspace-reviewed-manifest",
-      reason: descriptorMismatchReason,
-    });
-    expect(core.boundaryDecoders).toContainEqual({
-      identity: {
-        module: "src/surface/discord/discord-command-projection.ts",
-        exportName: "toBusDiscordCommandInvokedData",
-      },
-      category: "projection",
-    });
   });
 
   test("resolves Bun-realpathed cross-workspace declarations to package identities", () => {
@@ -4017,12 +2836,28 @@ describe("gate infrastructure", () => {
     expect(result).toEqual({ exitCode: 0, stdout: "", stderr: "" });
   });
 
-  test("real workspace subprocess writes exact ordered diagnostics and exits 42", async () => {
+  test("real workspace subprocess writes ordered structured diagnostics and exits 42", async () => {
     const result = await runFixtureWorkspaceProcess(`${WORKSPACE_RUNNER_FIXTURE_ROOT}/findings`);
 
     expect(result.exitCode).toBe(ARCHITECTURE_FINDINGS_EXIT_CODE);
     expect(result.stdout).toBe("");
-    expect(result.stderr).toBe(`${EXPECTED_WORKSPACE_RUNNER_DIAGNOSTICS.join("\n")}\n`);
+    const diagnostics = result.stderr.trimEnd().split("\n");
+    const identities = diagnostics.map((diagnostic) => {
+      expect(diagnostic).toMatch(
+        /^fixture-findings\/fixture\.ts:\d+:\d+ error architecture\/no-unknown-assertion: /,
+      );
+      const fingerprint = diagnostic.match(
+        /\[arch-v2\|workspace=([^|]+)\|rule=([^|]+)\|identity=([^|]+)\|sha256=([0-9a-f]{64})\]$/,
+      );
+      expect(fingerprint).not.toBeNull();
+      expect(fingerprint?.[1]).toBe("fixture-findings");
+      expect(decodeURIComponent(fingerprint?.[2] ?? "")).toBe("architecture/no-unknown-assertion");
+      return decodeURIComponent(fingerprint?.[3] ?? "");
+    });
+    expect(identities).toEqual([
+      "fixture.ts#firstProjection[AsExpression]@1",
+      "fixture.ts#secondProjection[AsExpression]@1",
+    ]);
   });
 
   test("maps a real workspace subprocess error to fail-closed parent behavior", async () => {

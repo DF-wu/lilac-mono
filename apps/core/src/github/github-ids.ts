@@ -1,9 +1,6 @@
-export type GithubRepoRef = {
+export type GithubThreadRef = {
   owner: string;
   repo: string;
-};
-
-export type GithubThreadRef = GithubRepoRef & {
   number: number;
 };
 
@@ -45,8 +42,4 @@ export function isGithubIssueTriggerId(input: { sessionId: string; triggerId: st
   // as a reaction target on the issue itself (PR description).
   const thread = parseGithubSessionId(input.sessionId);
   return String(thread.number) === input.triggerId;
-}
-
-export function repoFullName(ref: GithubRepoRef): string {
-  return `${ref.owner}/${ref.repo}`;
 }

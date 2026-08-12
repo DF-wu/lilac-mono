@@ -12,11 +12,9 @@ import {
 
 import { captureTuiOperation } from "./failure-adapter";
 
-export const canonicalTuiToolNames = MINI_LILAC_TOOL_NAMES;
+const KNOWN_TOOL_NAMES = MINI_LILAC_TOOL_NAMES;
 
-export const KNOWN_TOOL_NAMES = canonicalTuiToolNames;
-
-export type KnownToolName = (typeof canonicalTuiToolNames)[number];
+type KnownToolName = (typeof MINI_LILAC_TOOL_NAMES)[number];
 
 export type ToolObservation =
   | { readonly toolName: string; readonly lifecycle: "pending" }
@@ -331,7 +329,7 @@ export class KnownToolObservationMalformed extends TaggedError("KnownToolObserva
 
 const knownToolNameSet: ReadonlySet<string> = new Set(KNOWN_TOOL_NAMES);
 
-export function isKnownToolName(name: string): name is KnownToolName {
+function isKnownToolName(name: string): name is KnownToolName {
   return knownToolNameSet.has(name);
 }
 
@@ -625,7 +623,7 @@ function previewText(value: string, max: number): string {
 }
 
 /** A non-reflective fallback preview. Object properties and hooks are never inspected. */
-export function safeToolPayloadPreview<T>(value: T, max = 120): string {
+function safeToolPayloadPreview<T>(value: T, max = 120): string {
   const limit = Number.isFinite(max) ? Math.min(256, Math.max(0, Math.floor(max))) : 120;
   switch (typeof value) {
     case "string":

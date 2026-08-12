@@ -236,12 +236,6 @@ export const codexTokensCodecCases = {
   },
 } as const;
 
-export const codexTokensLoggedOutCase = {
-  input: { serialized: "{}", storagePath: CODEX_TOKEN_FIXTURE_PATH },
-  outcome: "ok",
-  provenance: "current",
-} as const;
-
 function parseJwtClaims(token: string): Record<string, unknown> | undefined {
   const parts = token.split(".");
   if (parts.length !== 3) return undefined;

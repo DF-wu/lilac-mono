@@ -3,7 +3,7 @@ import path from "node:path";
 
 import { Panic, Result, TaggedError, type Result as ResultType } from "better-result";
 
-export const HELP_TEXT = `mini-lilac - local coding-agent clients and server
+const HELP_TEXT = `mini-lilac - local coding-agent clients and server
 
 Usage:
   mini-lilac [tui-options]
@@ -25,13 +25,13 @@ export type MiniLilacCommandRunners = {
   readonly server: (args: readonly string[]) => Promise<void>;
 };
 
-export class MiniLilacCommandFailed extends TaggedError("MiniLilacCommandFailed")<{
+class MiniLilacCommandFailed extends TaggedError("MiniLilacCommandFailed")<{
   readonly command: "cli" | "server" | "tui";
   readonly cause: unknown;
   readonly message: string;
 }> {}
 
-export function ensureServerDataDir(
+function ensureServerDataDir(
   env: Record<string, string | undefined>,
   homeDirectory = homedir(),
 ): void {

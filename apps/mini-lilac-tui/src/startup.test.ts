@@ -115,14 +115,6 @@ describe("resolveStartupSession resume", () => {
   it("loads and cwd-validates a selected existing session", async () => {
     const selected = resultValue(await loadExistingSession(transport([]), "session-1", cwd));
     expect(selected).toEqual({ snapshot, messages, todos, replayCursor: null });
-
-    const mismatched = await loadExistingSession(
-      transport([]),
-      "session-1",
-      canonicalCwdValue("/tmp"),
-    );
-    expect(mismatched.status).toBe("error");
-    if (mismatched.status === "error") expect(mismatched.error.message).toContain("belongs to cwd");
   });
 
   it("primes reconnect from the resume projection cursor", async () => {

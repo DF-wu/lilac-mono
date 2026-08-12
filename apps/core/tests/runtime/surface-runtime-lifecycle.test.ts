@@ -9,7 +9,6 @@ import {
   createSurfaceWorkflowProgressPortMap,
   disconnectSurfaceAdapters,
   prepareSurfaceRecovery,
-  restoreSurfaceRecovery,
   startSurfaceAdapterIngress,
   startSurfaceOutputs,
   stopIngressAndDrainSurfaceRecovery,
@@ -84,7 +83,6 @@ function testAgentRecovery(
   onActivate: (entries: readonly AgentRunnerRecoveryEntry[]) => void = () => undefined,
 ) {
   return {
-    restoreRecoverables: () => undefined,
     prepareRecovery: (input: { readonly entries: readonly AgentRunnerRecoveryEntry[] }) =>
       Result.ok({
         apply: () => Result.ok(undefined),
@@ -238,7 +236,6 @@ function emptyRelayHandle<P extends "discord" | "github">(
         rollback: async () => Result.ok(undefined),
         activate: () => undefined,
       }),
-    restoreRelays: restore,
     stop,
   };
 }
@@ -527,7 +524,6 @@ describe("surface runtime lifecycle", () => {
           rollback: async () => Result.ok(undefined),
           activate: () => undefined,
         }),
-      restoreRelays: async () => undefined,
       stop: async () => undefined,
     });
     handles.relays.set("discord", relay("discord", discordSnapshot));
@@ -565,7 +561,6 @@ describe("surface runtime lifecycle", () => {
         },
         snapshotQueueAttempts: () => [],
         prepareRecovery: testAgentRecovery().prepareRecovery,
-        restoreRecoverables: () => undefined,
       },
       relays: handles.relays,
     });
@@ -636,7 +631,6 @@ describe("surface runtime lifecycle", () => {
         },
         snapshotQueueAttempts: () => [],
         prepareRecovery: testAgentRecovery().prepareRecovery,
-        restoreRecoverables: () => undefined,
       },
       relays: handles.relays,
     });
@@ -663,7 +657,6 @@ describe("surface runtime lifecycle", () => {
       snapshotRecoverables: () => [agentEntry],
       snapshotQueueAttempts: () => [],
       prepareRecovery: testAgentRecovery().prepareRecovery,
-      restoreRecoverables: () => undefined,
     };
     Reflect.set(agentRunner, "snapshotRecoverables", () => Promise.reject(rejection));
 
@@ -717,40 +710,37 @@ describe("surface runtime lifecycle", () => {
     expect(calls).toEqual(["discord-active", "github-active", "agent-active"]);
   });
 
-  it.each(["workflow", "heartbeat", "post-admission service"])(
-    "rolls back paused recovery when %s startup fails before disposition",
-    async () => {
-      const calls: string[] = [];
-      const ownership = createPausedSurfaceRecoveryOwnership({
-        snapshot: recoverySnapshot([], []),
-        attempts: ["discord", "github"].map((platform) => ({
-          platform: platform as "discord" | "github",
-          apply: async () => Result.ok(undefined),
-          rollback: async () => {
-            calls.push(`${platform}-rollback`);
-            return Result.ok(undefined);
-          },
-          activate: () => {
-            calls.push(`${platform}-active`);
-          },
-        })),
-        agentAttempt: {
-          apply: () => Result.ok(undefined),
-          rollback: () => {
-            calls.push("agent-rollback");
-          },
-          activate: () => {
-            calls.push("agent-active");
-          },
+  it("rolls back paused recovery when startup fails before disposition", async () => {
+    const calls: string[] = [];
+    const ownership = createPausedSurfaceRecoveryOwnership({
+      snapshot: recoverySnapshot([], []),
+      attempts: ["discord", "github"].map((platform) => ({
+        platform: platform as "discord" | "github",
+        apply: async () => Result.ok(undefined),
+        rollback: async () => {
+          calls.push(`${platform}-rollback`);
+          return Result.ok(undefined);
         },
-      });
+        activate: () => {
+          calls.push(`${platform}-active`);
+        },
+      })),
+      agentAttempt: {
+        apply: () => Result.ok(undefined),
+        rollback: () => {
+          calls.push("agent-rollback");
+        },
+        activate: () => {
+          calls.push("agent-active");
+        },
+      },
+    });
 
-      await ownership.rollback();
-      await ownership.rollback();
-      ownership.activate();
-      expect(calls).toEqual(["github-rollback", "discord-rollback", "agent-rollback"]);
-    },
-  );
+    await ownership.rollback();
+    await ownership.rollback();
+    ownership.activate();
+    expect(calls).toEqual(["github-rollback", "discord-rollback", "agent-rollback"]);
+  });
 
   it("performs successful final ownership activation synchronously and exactly once", () => {
     const calls: string[] = [];
@@ -966,7 +956,6 @@ describe("surface runtime lifecycle", () => {
           },
           activate: () => undefined,
         }),
-      restoreRelays: async () => undefined,
       stop: async () => undefined,
     });
     handles.relays.set("discord", attemptHandle("discord", false));
@@ -1118,7 +1107,6 @@ describe("surface runtime lifecycle", () => {
         snapshotRecoverables: () => [],
         snapshotQueueAttempts: () => [],
         prepareRecovery: testAgentRecovery().prepareRecovery,
-        restoreRecoverables: () => undefined,
       },
       relays: handles.relays,
     }).then(() => {
@@ -1132,14 +1120,15 @@ describe("surface runtime lifecycle", () => {
     expect(persisted).toBe(false);
   });
 
-  it("rejects faulty direct restore refs before relay or agent restoration", async () => {
+  it("rejects faulty recovery refs before relay or agent restoration", () => {
     const calls: string[] = [];
     const registry = createRegistry({ calls });
     const handles = maps();
     handles.relays.set("discord", {
       ...emptyRelayHandle("discord"),
-      restoreRelays: async () => {
-        calls.push("relay-restored");
+      prepareRestoreRelays: () => {
+        calls.push("relay-prepared");
+        return emptyRelayHandle("discord").prepareRestoreRelays([]);
       },
     });
     const invalid = {
@@ -1149,20 +1138,18 @@ describe("surface runtime lifecycle", () => {
       ],
     };
 
-    const restored = restoreSurfaceRecovery({
-      registry,
-      snapshot: recoverySnapshot([agentEntry], [invalid]),
-      relays: handles.relays,
-      agentRunner: testAgentRecovery(() => {
-        calls.push("agent-restored");
+    expect(() =>
+      prepareSurfaceRecovery({
+        registry,
+        snapshot: recoverySnapshot([agentEntry], [invalid]),
+        relays: handles.relays,
+        agentRunner: testAgentRecovery(() => {
+          calls.push("agent-restored");
+        }),
       }),
-    });
+    ).toThrow(Panic);
 
-    const [settled] = await Promise.allSettled([restored]);
-    expect(settled?.status).toBe("rejected");
-    if (settled?.status !== "rejected") return;
-    expect(Panic.is(settled.reason)).toBe(true);
-    expect(calls).not.toContain("relay-restored");
+    expect(calls).not.toContain("relay-prepared");
     expect(calls).not.toContain("agent-restored");
   });
 

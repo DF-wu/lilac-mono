@@ -1215,37 +1215,40 @@ describe("lilac-acp controller", () => {
   });
 
   it("renders prompt results in human output mode", async () => {
-    await createFakeHarness(tempRoot, {
-      commandName: "opencode",
-      requiresAcpArg: true,
-      harnessId: "opencode",
-      sessions: [],
-    });
-
-    const submit = (await runCliJson(tempRoot, [
-      "prompt",
-      "submit",
-      "--directory",
-      "/repo",
-      "--harness",
-      "opencode",
-      "--text",
-      "build feature",
-    ])) as { parsed: { runId: string }; exitCode: number };
-
-    expect(submit.exitCode).toBe(0);
+    const runId = "run_11111111-1111-4111-8111-111111111111";
+    const previousStateHome = process.env.XDG_STATE_HOME;
+    process.env.XDG_STATE_HOME = path.join(tempRoot, "state");
+    try {
+      const saved = await saveRunRecord({
+        id: runId,
+        status: "completed",
+        createdAt: 1,
+        updatedAt: 2,
+        directory: "/repo",
+        harnessId: "opencode",
+        targetKind: "new",
+        promptText: "build feature",
+        textPreview: "build feature",
+        permissions: createEmptyPermissionCounters(),
+        resultText: "Completed build feature via opencode",
+      });
+      expect(saved.status).toBe("ok");
+    } finally {
+      if (previousStateHome === undefined) delete process.env.XDG_STATE_HOME;
+      else process.env.XDG_STATE_HOME = previousStateHome;
+    }
 
     const result = await runCliText(tempRoot, [
       "prompt",
-      "wait",
+      "result",
       "--run-id",
-      submit.parsed.runId,
+      runId,
       "--output",
       "human",
     ]);
 
     expect(result.exitCode).toBe(0);
-    expect(result.stdout).toContain(`Run ${submit.parsed.runId}: completed`);
+    expect(result.stdout).toContain(`Run ${runId}: completed`);
     expect(result.stdout).toContain("Harness: opencode");
     expect(result.stdout).toContain("Completed build feature via opencode");
   });

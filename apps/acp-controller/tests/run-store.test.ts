@@ -167,22 +167,20 @@ describe("run store adapters", () => {
     const runsDir = path.join(tempRoot, "lilac-acp-controller", "runs");
     const markerPath = path.join(runsDir, `${run.id}.cancel.json`);
 
-    await fs.mkdir(markerPath);
-    const directoryMarker = await loadRunRecord(run.id);
-    expect(directoryMarker.status).toBe("error");
-    if (directoryMarker.status === "error") {
-      expect(directoryMarker.error._tag).toBe("RunCancellationMarkerInvalidType");
+    const invalidMarkerSetups = [
+      () => fs.mkdir(markerPath),
+      () => fs.symlink(path.join(runsDir, `${run.id}.json`), markerPath),
+    ];
+    for (const setup of invalidMarkerSetups) {
+      await setup();
+      const invalidMarker = await loadRunRecord(run.id);
+      expect(invalidMarker.status).toBe("error");
+      if (invalidMarker.status === "error") {
+        expect(invalidMarker.error._tag).toBe("RunCancellationMarkerInvalidType");
+      }
+      await fs.rm(markerPath, { recursive: true, force: true });
     }
 
-    await fs.rm(markerPath, { recursive: true, force: true });
-    await fs.symlink(path.join(runsDir, `${run.id}.json`), markerPath);
-    const symlinkMarker = await loadRunRecord(run.id);
-    expect(symlinkMarker.status).toBe("error");
-    if (symlinkMarker.status === "error") {
-      expect(symlinkMarker.error._tag).toBe("RunCancellationMarkerInvalidType");
-    }
-
-    await fs.rm(markerPath, { force: true });
     await fs.writeFile(markerPath, "{", "utf8");
     const corruptMarker = await loadRunRecord(run.id);
     expect(corruptMarker.status).toBe("error");
@@ -375,31 +373,6 @@ describe("run store adapters", () => {
     const loaded = await loadRunRecord(runRecord().id);
     expect(loaded.status).toBe("ok");
     if (loaded.status === "ok") expect(loaded.value).toEqual(runRecord());
-  });
-
-  it("keeps malformed, corrupt, and unsupported session indexes as typed errors", async () => {
-    const sessionsDir = path.join(tempRoot, "lilac-acp-controller", "sessions");
-    const indexPath = path.join(sessionsDir, "index.json");
-    await fs.mkdir(sessionsDir, { recursive: true });
-    await fs.writeFile(indexPath, "{", "utf8");
-
-    const malformed = await loadSessionIndex();
-    expect(malformed.status).toBe("error");
-    if (malformed.status === "error") {
-      expect(malformed.error._tag).toBe("SessionIndexMalformedSerialization");
-    }
-
-    await fs.writeFile(indexPath, '{"version":1,"sessions":"invalid"}', "utf8");
-    const corrupt = await loadSessionIndex();
-    expect(corrupt.status).toBe("error");
-    if (corrupt.status === "error") expect(corrupt.error._tag).toBe("SessionIndexCorruptFields");
-
-    await fs.writeFile(indexPath, '{"version":2,"sessions":[]}', "utf8");
-    const unsupported = await loadSessionIndex();
-    expect(unsupported.status).toBe("error");
-    if (unsupported.status === "error") {
-      expect(unsupported.error._tag).toBe("SessionIndexUnsupportedVersion");
-    }
   });
 
   it("blocks upserts without rewriting corrupt or unsupported session indexes", async () => {

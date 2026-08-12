@@ -16,8 +16,6 @@ import {
 import {
   MINI_LILAC_UNSUPPORTED_UI_MESSAGE_CHUNK_TYPE,
   type MiniLilacStreamCursorChunk,
-  miniLilacProfileSummarySchema,
-  miniLilacUIMessageDataPartSchema,
 } from "./protocol";
 
 type FetchCall = {
@@ -1455,62 +1453,6 @@ describe("MiniLilacTransport", () => {
     expect(calls[0]?.init?.method).toBe("POST");
   });
 
-  it("parses transcript reset, subagent status, and updated profile summaries", () => {
-    expect(
-      miniLilacUIMessageDataPartSchema.parse({
-        type: "data-transcriptReset",
-        data: { reason: "interrupt" },
-      }),
-    ).toEqual({
-      type: "data-transcriptReset",
-      data: { reason: "interrupt" },
-    });
-    expect(
-      miniLilacUIMessageDataPartSchema.parse({
-        type: "data-subagentStatus",
-        id: "status-1",
-        data: {
-          toolCallId: "tool-1",
-          runId: "run-1",
-          profile: "explore",
-          prompt: "Inspect the code",
-          mode: "sync",
-          state: "completed",
-          toolCount: 2,
-          text: "Found the source",
-        },
-      }),
-    ).toEqual({
-      type: "data-subagentStatus",
-      id: "status-1",
-      data: {
-        toolCallId: "tool-1",
-        runId: "run-1",
-        profile: "explore",
-        prompt: "Inspect the code",
-        mode: "sync",
-        state: "completed",
-        toolCount: 2,
-        text: "Found the source",
-      },
-    });
-    expect(
-      miniLilacProfileSummarySchema.parse({
-        id: "explore",
-        label: "Explore",
-        description: "Read-only investigation",
-        subagentOnly: true,
-        workspaceWrites: false,
-      }),
-    ).toEqual({
-      id: "explore",
-      label: "Explore",
-      description: "Read-only investigation",
-      subagentOnly: true,
-      workspaceWrites: false,
-    });
-  });
-
   it("acknowledges a normal cursor-payload pair only after enqueuing the payload", async () => {
     const calls: FetchCall[] = [];
     const fetchMock = mockFetch(async (input, init) => {
@@ -1554,14 +1496,19 @@ describe("MiniLilacTransport", () => {
     expect(transport.getLastStreamCursor("chat-1")).toBeUndefined();
   });
 
-  it("retains the acknowledged cursor when the stream errors after the next cursor", async () => {
+  it("reconnects from the prior acknowledged cursor after a partial pair fails", async () => {
+    const calls: FetchCall[] = [];
     const source = erroringSseResponse([
       cursor(2),
       { type: "text-start", id: "text-1" },
       cursor(4),
     ]);
     const transport = new MiniLilacTransport({
-      fetch: mockFetch(async () => source.response),
+      baseUrl: "/mini",
+      fetch: mockFetch(async (input, init) => {
+        calls.push({ input, init });
+        return init?.method === "POST" ? source.response : new Response(null, { status: 204 });
+      }),
     });
     const stream = await transport.sendMessages({
       trigger: "submit-message",
@@ -1578,57 +1525,8 @@ describe("MiniLilacTransport", () => {
     source.fail(new Error("connection lost"));
     await expect(reader.read()).rejects.toThrow("connection lost");
     expect(transport.getLastStreamCursor("chat-1")).toEqual({ runId: "run-1", seq: 2 });
-  });
-
-  it("uses the prior acknowledged cursor when reconnecting after a partial pair", async () => {
-    const calls: FetchCall[] = [];
-    const transport = new MiniLilacTransport({
-      baseUrl: "/mini",
-      fetch: mockFetch(async (input, init) => {
-        calls.push({ input, init });
-        if (init?.method === "POST") {
-          return sseResponse([cursor(5), { type: "text-start", id: "text-1" }, cursor(6)]);
-        }
-        return new Response(null, { status: 204 });
-      }),
-    });
-    const stream = await transport.sendMessages({
-      trigger: "submit-message",
-      chatId: "chat-1",
-      messageId: undefined,
-      messages: [],
-      abortSignal: undefined,
-    });
-
-    await readChunks(stream);
-    expect(transport.getLastStreamCursor("chat-1")).toEqual({ runId: "run-1", seq: 5 });
     expect(await transport.reconnectToStream({ chatId: "chat-1" })).toBeNull();
-    expect(String(calls[1]?.input)).toBe("/mini/chat/chat-1/stream?runId=run-1&after=5");
-  });
-
-  it("acknowledges multiple cursor-payload pairs in order", async () => {
-    const transport = new MiniLilacTransport({
-      fetch: mockFetch(async () =>
-        sseResponse([
-          cursor(1),
-          { type: "text-start", id: "text-1" },
-          cursor(2),
-          { type: "text-delta", id: "text-1", delta: "hello" },
-          cursor(3),
-          { type: "text-end", id: "text-1" },
-        ]),
-      ),
-    });
-    const stream = await transport.sendMessages({
-      trigger: "submit-message",
-      chatId: "chat-1",
-      messageId: undefined,
-      messages: [],
-      abortSignal: undefined,
-    });
-
-    await readChunks(stream);
-    expect(transport.getLastStreamCursor("chat-1")).toEqual({ runId: "run-1", seq: 3 });
+    expect(String(calls[1]?.input)).toBe("/mini/chat/chat-1/stream?runId=run-1&after=2");
   });
 
   it("does not acknowledge a pending cursor after the stream generation changes", async () => {

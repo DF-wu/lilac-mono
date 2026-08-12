@@ -1,9 +1,6 @@
 import { createInterface, type Interface } from "node:readline";
 
-import type {
-  MiniLilacModelSummary,
-  MiniLilacProfileSummary,
-} from "@stanley2058/mini-lilac-client";
+import type { MiniLilacModelSummary } from "@stanley2058/mini-lilac-client";
 import { Result, TaggedError, type Result as ResultType } from "better-result";
 
 export interface Choice {
@@ -14,13 +11,13 @@ export interface Choice {
 }
 
 /** Index of the default choice, or 0 when none is marked. Pure. */
-export function defaultChoiceIndex(choices: readonly Choice[]): number {
+function defaultChoiceIndex(choices: readonly Choice[]): number {
   const index = choices.findIndex((choice) => choice.isDefault);
   return index >= 0 ? index : 0;
 }
 
 /** Resolve a numbered-selection input to a choice, or `undefined` if invalid. Pure. */
-export function resolveChoiceInput(
+function resolveChoiceInput(
   input: string,
   choices: readonly Choice[],
   defaultIndex: number,
@@ -42,23 +39,7 @@ export function modelChoices(models: readonly MiniLilacModelSummary[]): Choice[]
   }));
 }
 
-/** Profiles usable interactively (subagent-only profiles are filtered out). */
-export function selectableProfileChoices(profiles: readonly MiniLilacProfileSummary[]): Choice[] {
-  return profiles
-    .filter((profile) => !profile.subagentOnly)
-    .map((profile) => ({
-      id: profile.id,
-      label: profile.label,
-      hint: profile.description,
-      isDefault: profile.isDefault === true,
-    }));
-}
-
-export function renderChoiceList(
-  title: string,
-  choices: readonly Choice[],
-  defaultIndex: number,
-): string {
+function renderChoiceList(title: string, choices: readonly Choice[], defaultIndex: number): string {
   const lines = [title];
   choices.forEach((choice, index) => {
     const marker = index === defaultIndex ? "*" : " ";

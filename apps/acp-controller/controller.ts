@@ -2047,10 +2047,7 @@ async function runWorkerProcess(
   return Result.ok(run.status === "completed" ? 0 : 1);
 }
 
-export async function main(
-  argv: readonly string[],
-  options?: { write?: OutputWriter },
-): Promise<number> {
+export async function main(argv: readonly string[]): Promise<number> {
   const commandName = "lilac-acp";
   const packageVersion = typeof PACKAGE_VERSION === "string" ? PACKAGE_VERSION : "0.0.0";
   const globalFlags = parseFlags(argv).flags;
@@ -2064,7 +2061,7 @@ export async function main(
     return 1;
   }
   const outputMode: OutputMode = outputFlag === "human" ? "human" : "json";
-  const write = options?.write ?? createOutputWriter(outputMode, commandName);
+  const write = createOutputWriter(outputMode, commandName);
 
   if (cleanArgv.length === 0 || cleanArgv[0] === "help" || cleanArgv.includes("--help")) {
     write({ ok: true, help: help(commandName), version: packageVersion });

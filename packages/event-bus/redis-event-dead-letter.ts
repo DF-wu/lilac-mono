@@ -645,9 +645,3 @@ export class RedisEventDeadLetter implements EventDeadLetter {
     });
   }
 }
-
-export function createRedisEventDeadLetter(
-  options: RedisEventDeadLetterOptions,
-): RedisEventDeadLetter {
-  return new RedisEventDeadLetter(options);
-}

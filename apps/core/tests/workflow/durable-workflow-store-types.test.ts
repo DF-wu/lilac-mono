@@ -1,5 +1,3 @@
-import { expect, it } from "bun:test";
-
 import type { DurableWorkflowStore } from "../../src/workflow/durable-workflow-store";
 import type { WorkflowRun } from "../../src/workflow/workflow-domain";
 
@@ -26,7 +24,3 @@ function compileTimeReadContract(store: DurableWorkflowStore): void {
 
 void compileTimeReadContract;
 void (false satisfies GetRunIsNotDomain | GetRunIsNotNullable | ListRunsIsNotArray);
-
-it("keeps durable workflow reads as Result-only contracts", () => {
-  expect(true).toBe(true);
-});

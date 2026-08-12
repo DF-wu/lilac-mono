@@ -8,7 +8,13 @@ import {
 } from "../../src/workflow/workflow-persistence-codec";
 
 describe("workflow persistence row codec catalog", () => {
-  it("executes all six outcomes for every persisted row family", () => {
+  it("executes and classifies all six outcomes for every persisted row family", () => {
+    const errorTags = {
+      "unsupported-version": "UnsupportedVersion",
+      "malformed-serialization": "MalformedSerialization",
+      "corrupt-fields": "CorruptPersistedFields",
+      "missing-rejected": "CorruptPersistedFields",
+    } as const;
     for (const fixtures of Object.values(workflowPersistenceRowFamilyFixtures)) {
       for (const [outcome, fixture] of Object.entries(fixtures)) {
         const result = (() => {
@@ -47,45 +53,11 @@ describe("workflow persistence row codec catalog", () => {
           else if (outcome === "legacy") provenance = "migrated";
           else provenance = "missing-defaulted";
           expect(result.value.provenance).toBe(provenance);
+        } else {
+          expect(result.error._tag).toBe(errorTags[outcome as keyof typeof errorTags]);
         }
       }
     }
-  });
-
-  it("covers current, legacy, missing, unsupported, malformed, and corrupt rows", () => {
-    const current = decodeWorkflowPersistenceRow(workflowPersistenceRowCodecCases.current.input);
-    expect(current.status).toBe("ok");
-    if (current.status === "ok") expect(current.value.provenance).toBe("current");
-
-    const legacy = decodeWorkflowPersistenceRow(workflowPersistenceRowCodecCases.legacy.input);
-    expect(legacy.status).toBe("ok");
-    if (legacy.status === "ok") expect(legacy.value.provenance).toBe("migrated");
-
-    const missing = decodeWorkflowPersistenceRow(
-      workflowPersistenceRowCodecCases["missing-defaulted"].input,
-    );
-    expect(missing.status).toBe("ok");
-    if (missing.status === "ok") expect(missing.value.provenance).toBe("missing-defaulted");
-
-    const unsupported = decodeWorkflowPersistenceRow(
-      workflowPersistenceRowCodecCases["unsupported-version"].input,
-    );
-    expect(unsupported.status).toBe("error");
-    if (unsupported.status === "error") expect(unsupported.error._tag).toBe("UnsupportedVersion");
-
-    const malformed = decodeWorkflowPersistenceRow(
-      workflowPersistenceRowCodecCases["malformed-serialization"].input,
-    );
-    expect(malformed.status).toBe("error");
-    if (malformed.status === "error") {
-      expect(malformed.error._tag).toBe("MalformedSerialization");
-    }
-
-    const corrupt = decodeWorkflowPersistenceRow(
-      workflowPersistenceRowCodecCases["corrupt-fields"].input,
-    );
-    expect(corrupt.status).toBe("error");
-    if (corrupt.status === "error") expect(corrupt.error._tag).toBe("CorruptPersistedFields");
   });
 
   it("decodes legacy rows without rewriting the persisted input", () => {

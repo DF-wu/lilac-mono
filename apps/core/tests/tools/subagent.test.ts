@@ -1,24 +1,7 @@
 import { describe, expect, it } from "bun:test";
 import { asSchema } from "ai";
-import { Result } from "better-result";
-import {
-  createLilacBus,
-  lilacEventTypes,
-  outReqTopic,
-  type Message,
-  type PublishOptions,
-  type RawBus,
-  type SubscriptionOptions,
-} from "@stanley2058/lilac-event-bus";
 
 import { subagentTools } from "../../src/tools/subagent";
-import {
-  startResultForTest,
-  stopResultForTest,
-  subscribeForTest,
-  type TestRawMessageHandler,
-  type TestRawSubscriptionHost,
-} from "../helpers/result-raw-bus";
 
 function isAsyncIterable(value: unknown): value is AsyncIterable<unknown> {
   return (
@@ -44,82 +27,9 @@ async function resolveExecuteResult<T>(value: T | PromiseLike<T> | AsyncIterable
   return await value;
 }
 
-function createInMemoryRawBus(): RawBus & TestRawSubscriptionHost {
-  const topics = new Map<string, Array<Message<unknown>>>();
-  const subs = new Set<{
-    topic: string;
-    opts: SubscriptionOptions;
-    handler: TestRawMessageHandler;
-  }>();
-
-  return {
-    publish: async <TData>(msg: Omit<Message<TData>, "id" | "ts">, opts: PublishOptions) => {
-      const id = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
-      const stored: Message<unknown> = {
-        topic: opts.topic,
-        id,
-        type: opts.type,
-        ts: Date.now(),
-        key: opts.key,
-        headers: opts.headers,
-        data: msg.data,
-      };
-
-      const list = topics.get(opts.topic) ?? [];
-      list.push(stored);
-      topics.set(opts.topic, list);
-
-      for (const s of subs) {
-        if (s.topic !== opts.topic) continue;
-        await s.handler(stored, id);
-      }
-
-      return { id, cursor: id };
-    },
-
-    subscribe: subscribeForTest,
-    openTestSubscription: async (
-      topic: string,
-      opts: SubscriptionOptions,
-      handler: TestRawMessageHandler,
-    ) => {
-      const entry = { topic, opts, handler };
-      subs.add(entry);
-
-      if (opts.offset?.type === "begin") {
-        const existing = topics.get(topic) ?? [];
-        for (const m of existing) {
-          await handler(m, m.id);
-        }
-      }
-
-      return {
-        stop: async () => {
-          subs.delete(entry);
-        },
-      };
-    },
-
-    fetch: async (topic: string) => {
-      const existing = topics.get(topic) ?? [];
-      return {
-        messages: existing.map((m) => ({
-          msg: m,
-          cursor: m.id,
-        })),
-        next: existing.length > 0 ? existing[existing.length - 1]?.id : undefined,
-      };
-    },
-
-    close: async () => {},
-  };
-}
-
 describe("subagent_delegate tool", () => {
   it("documents selectable model aliases and appends delegation guidance", () => {
-    const bus = createLilacBus(createInMemoryRawBus());
     const tools = subagentTools({
-      bus,
       idleTimeoutMs: 2_000,
       maxDepth: 1,
       delegatePromptOverlay: "Escalate critical reviews to a stronger model.",
@@ -221,9 +131,7 @@ describe("subagent_delegate tool", () => {
   });
 
   it("omits the model field when no aliases are selectable", async () => {
-    const bus = createLilacBus(createInMemoryRawBus());
     const tools = subagentTools({
-      bus,
       idleTimeoutMs: 2_000,
       maxDepth: 1,
       modelPresets: {
@@ -290,7 +198,6 @@ describe("subagent_delegate tool", () => {
   });
 
   it("passes selected model and reasoning to deferred registration", async () => {
-    const bus = createLilacBus(createInMemoryRawBus());
     let selected:
       | {
           modelOverride?: string;
@@ -303,7 +210,6 @@ describe("subagent_delegate tool", () => {
         }
       | undefined;
     const tools = subagentTools({
-      bus,
       idleTimeoutMs: 2_000,
       maxDepth: 1,
       modelPresets: {
@@ -378,9 +284,6 @@ describe("subagent_delegate tool", () => {
   });
 
   it("returns an accepted handle by default in deferred mode", async () => {
-    const raw = createInMemoryRawBus();
-    const bus = createLilacBus(raw);
-
     const launches: Array<{
       sessionName: string;
       childRequestId: string;
@@ -390,7 +293,6 @@ describe("subagent_delegate tool", () => {
     }> = [];
 
     const tools = subagentTools({
-      bus,
       idleTimeoutMs: 2_000,
       maxDepth: 1,
       onDelegate: async (registration) => {
@@ -445,14 +347,10 @@ describe("subagent_delegate tool", () => {
   });
 
   it("ignores legacy raw sessionId input and creates a named child session", async () => {
-    const raw = createInMemoryRawBus();
-    const bus = createLilacBus(raw);
-
     const launches: Array<{ sessionName: string; childRequestId: string; childSessionId: string }> =
       [];
 
     const tools = subagentTools({
-      bus,
       idleTimeoutMs: 2_000,
       maxDepth: 1,
       onDelegate: async (registration) => {
@@ -501,11 +399,7 @@ describe("subagent_delegate tool", () => {
   });
 
   it("delegates to child request and returns child final text", async () => {
-    const raw = createInMemoryRawBus();
-    const bus = createLilacBus(raw);
-
     const tools = subagentTools({
-      bus,
       idleTimeoutMs: 2_000,
       maxDepth: 1,
       onDelegate: async () => ({
@@ -514,93 +408,6 @@ describe("subagent_delegate tool", () => {
         cancel: async () => {},
       }),
     });
-
-    const worker = await startResultForTest(
-      bus.subscribeTopic(
-        "cmd.request",
-        {
-          mode: "fanout",
-          subscriptionId: "subagent-test-worker-1",
-          consumerId: "subagent-test-worker-1",
-          offset: { type: "begin" },
-        },
-        async (msg) => {
-          if (msg.type !== lilacEventTypes.CmdRequestMessage) {
-            return Result.ok(undefined);
-          }
-
-          const requestId = msg.headers?.request_id;
-          const sessionId = msg.headers?.session_id;
-          const requestClient = msg.headers?.request_client;
-          if (!requestId || !sessionId || !requestClient) {
-            return Result.ok(undefined);
-          }
-
-          if (msg.data.queue !== "prompt") {
-            return Result.ok(undefined);
-          }
-
-          await bus.publish(
-            lilacEventTypes.EvtRequestLifecycleChanged,
-            {
-              state: "running",
-            },
-            {
-              headers: {
-                request_id: requestId,
-                session_id: sessionId,
-                request_client: requestClient,
-              },
-            },
-          );
-
-          await bus.publish(
-            lilacEventTypes.EvtAgentOutputDeltaText,
-            {
-              delta: "hello ",
-            },
-            {
-              headers: {
-                request_id: requestId,
-                session_id: sessionId,
-                request_client: requestClient,
-              },
-            },
-          );
-
-          await bus.publish(
-            lilacEventTypes.EvtAgentOutputResponseText,
-            {
-              finalText: "hello world",
-            },
-            {
-              headers: {
-                request_id: requestId,
-                session_id: sessionId,
-                request_client: requestClient,
-              },
-            },
-          );
-
-          await bus.publish(
-            lilacEventTypes.EvtRequestLifecycleChanged,
-            {
-              state: "resolved",
-            },
-            {
-              headers: {
-                request_id: requestId,
-                session_id: sessionId,
-                request_client: requestClient,
-              },
-            },
-          );
-
-          return Result.ok(undefined);
-        },
-        () => "commit",
-      ),
-    );
 
     const res = await resolveExecuteResult(
       tools.subagent_delegate.execute!(
@@ -634,16 +441,12 @@ describe("subagent_delegate tool", () => {
     expect(res).not.toHaveProperty("childSessionId");
     expect(res).not.toHaveProperty("timeoutMs");
     expect(res).not.toHaveProperty("durationMs");
-    await stopResultForTest(worker.stop());
   });
 
   it("times out after the configured period without child activity", async () => {
-    const raw = createInMemoryRawBus();
-    const bus = createLilacBus(raw);
     let cancelQueued = false;
 
     const tools = subagentTools({
-      bus,
       idleTimeoutMs: 30,
       maxDepth: 1,
       onDelegate: async () => {
@@ -659,25 +462,6 @@ describe("subagent_delegate tool", () => {
         };
       },
     });
-
-    const worker = await startResultForTest(
-      bus.subscribeTopic(
-        "cmd.request",
-        {
-          mode: "fanout",
-          subscriptionId: "subagent-idle-timeout-worker",
-          consumerId: "subagent-idle-timeout-worker",
-          offset: { type: "now" },
-        },
-        async (msg) => {
-          if (msg.type === lilacEventTypes.CmdRequestMessage && msg.data.queue === "interrupt") {
-            cancelQueued = Reflect.get(msg.data.raw ?? {}, "cancelQueued") === true;
-          }
-          return Result.ok(undefined);
-        },
-        () => "commit",
-      ),
-    );
 
     const res = await resolveExecuteResult(
       tools.subagent_delegate.execute!(
@@ -700,15 +484,10 @@ describe("subagent_delegate tool", () => {
     expect(res.status).toBe("timeout");
     expect(res.detail).toContain("without child activity");
     expect(cancelQueued).toBe(true);
-    await stopResultForTest(worker.stop());
   });
 
   it("supports general and self delegation profiles", async () => {
-    const raw = createInMemoryRawBus();
-    const bus = createLilacBus(raw);
-
     const tools = subagentTools({
-      bus,
       idleTimeoutMs: 2_000,
       maxDepth: 1,
       onDelegate: async (registration) => {
@@ -725,70 +504,6 @@ describe("subagent_delegate tool", () => {
     });
 
     const seenProfiles: string[] = [];
-
-    const worker = await startResultForTest(
-      bus.subscribeTopic(
-        "cmd.request",
-        {
-          mode: "fanout",
-          subscriptionId: "subagent-test-worker-profiles",
-          consumerId: "subagent-test-worker-profiles",
-          offset: { type: "begin" },
-        },
-        async (msg) => {
-          if (msg.type !== lilacEventTypes.CmdRequestMessage) {
-            return Result.ok(undefined);
-          }
-
-          const requestId = msg.headers?.request_id;
-          const sessionId = msg.headers?.session_id;
-          const requestClient = msg.headers?.request_client;
-          if (!requestId || !sessionId || !requestClient) {
-            return Result.ok(undefined);
-          }
-
-          if (msg.data.queue !== "prompt") {
-            return Result.ok(undefined);
-          }
-
-          const profile = msg.headers?.subagent_profile;
-          if (typeof profile === "string") {
-            seenProfiles.push(profile);
-          }
-
-          await bus.publish(
-            lilacEventTypes.EvtAgentOutputResponseText,
-            {
-              finalText: `done:${profile ?? "unknown"}`,
-            },
-            {
-              headers: {
-                request_id: requestId,
-                session_id: sessionId,
-                request_client: requestClient,
-              },
-            },
-          );
-
-          await bus.publish(
-            lilacEventTypes.EvtRequestLifecycleChanged,
-            {
-              state: "resolved",
-            },
-            {
-              headers: {
-                request_id: requestId,
-                session_id: sessionId,
-                request_client: requestClient,
-              },
-            },
-          );
-
-          return Result.ok(undefined);
-        },
-        () => "commit",
-      ),
-    );
 
     const profiles = ["general", "self"] as const;
 
@@ -822,15 +537,10 @@ describe("subagent_delegate tool", () => {
     }
 
     expect(seenProfiles).toEqual(["general", "self"]);
-    await stopResultForTest(worker.stop());
   });
 
   it("derives child session id from sessionName for continuation", async () => {
-    const raw = createInMemoryRawBus();
-    const bus = createLilacBus(raw);
-
     const tools = subagentTools({
-      bus,
       idleTimeoutMs: 2_000,
       maxDepth: 1,
       onDelegate: async (registration) => {
@@ -848,67 +558,6 @@ describe("subagent_delegate tool", () => {
     const expectedSessionId = `sub:s:parent:named:${sessionName}`;
     let seenChildSessionId: string | null = null;
     let seenStableNamedContinuation = false;
-
-    const worker = await startResultForTest(
-      bus.subscribeTopic(
-        "cmd.request",
-        {
-          mode: "fanout",
-          subscriptionId: "subagent-test-worker-continued-session",
-          consumerId: "subagent-test-worker-continued-session",
-          offset: { type: "begin" },
-        },
-        async (msg) => {
-          if (msg.type !== lilacEventTypes.CmdRequestMessage) {
-            return Result.ok(undefined);
-          }
-
-          const requestId = msg.headers?.request_id;
-          const sessionId = msg.headers?.session_id;
-          const requestClient = msg.headers?.request_client;
-          if (!requestId || !sessionId || !requestClient) {
-            return Result.ok(undefined);
-          }
-
-          if (msg.data.queue !== "prompt") {
-            return Result.ok(undefined);
-          }
-
-          seenChildSessionId = sessionId;
-
-          await bus.publish(
-            lilacEventTypes.EvtAgentOutputResponseText,
-            {
-              finalText: "continued",
-            },
-            {
-              headers: {
-                request_id: requestId,
-                session_id: sessionId,
-                request_client: requestClient,
-              },
-            },
-          );
-
-          await bus.publish(
-            lilacEventTypes.EvtRequestLifecycleChanged,
-            {
-              state: "resolved",
-            },
-            {
-              headers: {
-                request_id: requestId,
-                session_id: sessionId,
-                request_client: requestClient,
-              },
-            },
-          );
-
-          return Result.ok(undefined);
-        },
-        () => "commit",
-      ),
-    );
 
     const res = await resolveExecuteResult(
       tools.subagent_delegate.execute!(
@@ -935,14 +584,11 @@ describe("subagent_delegate tool", () => {
     expect(res.sessionName).toBe(sessionName);
     expect(seenChildSessionId === expectedSessionId).toBe(true);
     expect(seenStableNamedContinuation).toBe(true);
-    await stopResultForTest(worker.stop());
   });
 
   it("makes a generated child name reusable for stable continuation", async () => {
-    const bus = createLilacBus(createInMemoryRawBus());
     const launches: Array<{ sessionName: string; childSessionId: string; stable: true }> = [];
     const tools = subagentTools({
-      bus,
       idleTimeoutMs: 2_000,
       maxDepth: 1,
       onDelegate: async (registration) => {
@@ -1011,10 +657,7 @@ describe("subagent_delegate tool", () => {
   });
 
   it("rejects invalid continuation session names", async () => {
-    const raw = createInMemoryRawBus();
-    const bus = createLilacBus(raw);
     const tools = subagentTools({
-      bus,
       idleTimeoutMs: 2_000,
       maxDepth: 1,
     });
@@ -1042,10 +685,7 @@ describe("subagent_delegate tool", () => {
   });
 
   it("rejects delegation when depth limit is reached", async () => {
-    const raw = createInMemoryRawBus();
-    const bus = createLilacBus(raw);
     const tools = subagentTools({
-      bus,
       idleTimeoutMs: 2_000,
       maxDepth: 1,
     });
@@ -1068,10 +708,7 @@ describe("subagent_delegate tool", () => {
   });
 
   it("rejects delegation from explore and general runs", async () => {
-    const raw = createInMemoryRawBus();
-    const bus = createLilacBus(raw);
     const tools = subagentTools({
-      bus,
       idleTimeoutMs: 2_000,
       maxDepth: 2,
     });
@@ -1112,10 +749,7 @@ describe("subagent_delegate tool", () => {
   });
 
   it("rejects self->self recursion but allows self->explore at depth 1", async () => {
-    const raw = createInMemoryRawBus();
-    const bus = createLilacBus(raw);
     const tools = subagentTools({
-      bus,
       idleTimeoutMs: 2_000,
       maxDepth: 2,
       onDelegate: async () => ({
@@ -1141,65 +775,6 @@ describe("subagent_delegate tool", () => {
         },
       ),
     ).rejects.toThrow(/cannot delegate to self profile/i);
-
-    const worker = await startResultForTest(
-      bus.subscribeTopic(
-        "cmd.request",
-        {
-          mode: "fanout",
-          subscriptionId: "subagent-test-worker-self-explore",
-          consumerId: "subagent-test-worker-self-explore",
-          offset: { type: "begin" },
-        },
-        async (msg) => {
-          if (msg.type !== lilacEventTypes.CmdRequestMessage) {
-            return Result.ok(undefined);
-          }
-
-          const requestId = msg.headers?.request_id;
-          const sessionId = msg.headers?.session_id;
-          const requestClient = msg.headers?.request_client;
-          if (!requestId || !sessionId || !requestClient) {
-            return Result.ok(undefined);
-          }
-
-          if (msg.data.queue !== "prompt") {
-            return Result.ok(undefined);
-          }
-
-          await bus.publish(
-            lilacEventTypes.EvtAgentOutputResponseText,
-            {
-              finalText: "self->explore ok",
-            },
-            {
-              headers: {
-                request_id: requestId,
-                session_id: sessionId,
-                request_client: requestClient,
-              },
-            },
-          );
-
-          await bus.publish(
-            lilacEventTypes.EvtRequestLifecycleChanged,
-            {
-              state: "resolved",
-            },
-            {
-              headers: {
-                request_id: requestId,
-                session_id: sessionId,
-                request_client: requestClient,
-              },
-            },
-          );
-
-          return Result.ok(undefined);
-        },
-        () => "commit",
-      ),
-    );
 
     const res = await resolveExecuteResult(
       tools.subagent_delegate.execute!(
@@ -1227,16 +802,12 @@ describe("subagent_delegate tool", () => {
     expect(res.status).toBe("resolved");
     expect(res.finalText).toBe("self->explore ok");
     expect(res.profile).toBe("explore");
-    await stopResultForTest(worker.stop());
   });
 
   it("ignores legacy caller timeouts and uses the configured idle timeout", async () => {
-    const raw = createInMemoryRawBus();
-    const bus = createLilacBus(raw);
     let capturedIdleTimeoutMs: number | undefined;
 
     const tools = subagentTools({
-      bus,
       idleTimeoutMs: 2_000,
       maxDepth: 1,
       onDelegate: async (registration) => {
@@ -1271,170 +842,5 @@ describe("subagent_delegate tool", () => {
 
     expect(capturedIdleTimeoutMs).toBe(2_000);
     expect(res.status).toBe("accepted");
-  });
-
-  it("surfaces child tool execution progress on the parent tool line", async () => {
-    const raw = createInMemoryRawBus();
-    const bus = createLilacBus(raw);
-
-    const tools = subagentTools({
-      bus,
-      idleTimeoutMs: 2_000,
-      maxDepth: 1,
-      onDelegate: async () => ({
-        runId: "run:sync-progress",
-        completion: Promise.resolve({ status: "resolved", finalText: "done" }),
-        cancel: async () => {},
-      }),
-    });
-
-    const parentRequestId = "r:4";
-    const parentToolCallId = "tool-4";
-    const parentUpdates: Array<{ status: "start" | "update" | "end"; display: string }> = [];
-
-    const parentOutput = await startResultForTest(
-      bus.subscribeTopic(
-        outReqTopic(parentRequestId),
-        {
-          mode: "fanout",
-          subscriptionId: "subagent-test-parent-out-1",
-          consumerId: "subagent-test-parent-out-1",
-          offset: { type: "begin" },
-        },
-        async (msg) => {
-          if (msg.type !== lilacEventTypes.EvtAgentOutputToolCall) {
-            return Result.ok(undefined);
-          }
-
-          if (msg.data.toolCallId !== parentToolCallId) {
-            return Result.ok(undefined);
-          }
-
-          parentUpdates.push({
-            status: msg.data.status,
-            display: msg.data.display,
-          });
-          return Result.ok(undefined);
-        },
-        () => "commit",
-      ),
-    );
-
-    const worker = await startResultForTest(
-      bus.subscribeTopic(
-        "cmd.request",
-        {
-          mode: "fanout",
-          subscriptionId: "subagent-test-worker-3",
-          consumerId: "subagent-test-worker-3",
-          offset: { type: "begin" },
-        },
-        async (msg) => {
-          if (msg.type !== lilacEventTypes.CmdRequestMessage) {
-            return Result.ok(undefined);
-          }
-
-          const requestId = msg.headers?.request_id;
-          const sessionId = msg.headers?.session_id;
-          const requestClient = msg.headers?.request_client;
-          if (!requestId || !sessionId || !requestClient) {
-            return Result.ok(undefined);
-          }
-
-          if (msg.data.queue !== "prompt") {
-            return Result.ok(undefined);
-          }
-
-          await bus.publish(
-            lilacEventTypes.EvtAgentOutputToolCall,
-            {
-              toolCallId: "child-tool-1",
-              status: "start",
-              display: "grep auth src",
-            },
-            {
-              headers: {
-                request_id: requestId,
-                session_id: sessionId,
-                request_client: requestClient,
-              },
-            },
-          );
-
-          await bus.publish(
-            lilacEventTypes.EvtAgentOutputToolCall,
-            {
-              toolCallId: "child-tool-1",
-              status: "end",
-              ok: true,
-              display: "grep auth src",
-            },
-            {
-              headers: {
-                request_id: requestId,
-                session_id: sessionId,
-                request_client: requestClient,
-              },
-            },
-          );
-
-          await bus.publish(
-            lilacEventTypes.EvtAgentOutputResponseText,
-            {
-              finalText: "done",
-            },
-            {
-              headers: {
-                request_id: requestId,
-                session_id: sessionId,
-                request_client: requestClient,
-              },
-            },
-          );
-
-          await bus.publish(
-            lilacEventTypes.EvtRequestLifecycleChanged,
-            {
-              state: "resolved",
-            },
-            {
-              headers: {
-                request_id: requestId,
-                session_id: sessionId,
-                request_client: requestClient,
-              },
-            },
-          );
-
-          return Result.ok(undefined);
-        },
-        () => "commit",
-      ),
-    );
-
-    const res = await resolveExecuteResult(
-      tools.subagent_delegate.execute!(
-        {
-          profile: "explore",
-          task: "Map auth flow",
-          mode: "sync",
-        },
-        {
-          toolCallId: parentToolCallId,
-          messages: [],
-          context: {
-            requestId: parentRequestId,
-            sessionId: "s:4",
-            requestClient: "discord",
-            subagentDepth: 0,
-          },
-        },
-      ),
-    );
-
-    expect(res.status).toBe("resolved");
-    expect(parentUpdates).toEqual([]);
-    await stopResultForTest(worker.stop());
-    await stopResultForTest(parentOutput.stop());
   });
 });

@@ -9,8 +9,7 @@ import { captureTuiOperation } from "./failure-adapter";
 
 export const DEFAULT_SERVER_URL = "http://127.0.0.1:8090/api/mini-lilac";
 
-/** Environment variable consulted for the bearer token. */
-export const TOKEN_ENV_VARS = ["MINI_LILAC_TOKEN"] as const;
+const TOKEN_ENV_VARS = ["MINI_LILAC_TOKEN"] as const;
 
 export interface CliOptions {
   readonly server: string;

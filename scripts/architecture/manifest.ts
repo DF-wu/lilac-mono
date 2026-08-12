@@ -3098,17 +3098,6 @@ export const LEGACY_UNENFORCED_EXCEPTION_ADAPTERS = new Map<string, readonly Exc
         reason:
           "Terminates the worker and immediately forwards its terminal Panic to the explicit fatal supervisor.",
       },
-      {
-        identity: {
-          module: "src/runtime/create-core-runtime.ts",
-          exportName: "adaptCustomCommandInitializationResultToStartup",
-        },
-        category: "result-to-framework",
-        externalApi: { package: "@stanley2058/lilac-core", exportName: "runtime host startup" },
-        direction: "signal-host",
-        reason:
-          "Signals custom-command initialization failure through the established host startup exception contract.",
-      },
       ...[
         [
           "src/heartbeat/heartbeat-service.ts",
@@ -3182,17 +3171,16 @@ export const LEGACY_UNENFORCED_EXCEPTION_ADAPTERS = new Map<string, readonly Exc
         reason:
           "Preserves the original event-bus setup Panic while supervising owned Redis cleanup to completion.",
       },
-      ...[
-        ["adaptCoreEventBusSetupResultToStartup", "runtime host startup"],
-        ["adaptCoreEventBusCleanupResultToHost", "runtime host cleanup"],
-      ].map(([exportName, externalExportName]) => ({
-        identity: { module: "src/runtime/create-core-runtime.ts", exportName },
-        category: "result-to-framework" as const,
-        externalApi: { package: "@stanley2058/lilac-core", exportName: externalExportName },
-        direction: "signal-host" as const,
-        reason:
-          "Adapts an owned event-bus Result to the exact core runtime startup or cleanup exception contract.",
-      })),
+      ...[["adaptCoreEventBusCleanupResultToHost", "runtime host cleanup"]].map(
+        ([exportName, externalExportName]) => ({
+          identity: { module: "src/runtime/create-core-runtime.ts", exportName },
+          category: "result-to-framework" as const,
+          externalApi: { package: "@stanley2058/lilac-core", exportName: externalExportName },
+          direction: "signal-host" as const,
+          reason:
+            "Adapts an owned event-bus Result to the exact core runtime startup or cleanup exception contract.",
+        }),
+      ),
       ...["createCoreRuntime.start", "createCoreRuntimeCleanupSupervisor.run"].map(
         (exportName) => ({
           identity: { module: "src/runtime/create-core-runtime.ts", exportName },
@@ -3830,20 +3818,6 @@ export const LEGACY_UNENFORCED_EXCEPTION_ADAPTERS = new Map<string, readonly Exc
         direction: "observe-panic",
         reason:
           "Preserves exact Panic identity while ordinary request intake failure becomes an Err.",
-      },
-      {
-        identity: {
-          module: "src/surface/bridge/bus-agent-runner.ts",
-          exportName: "startBusAgentRunner",
-        },
-        category: "result-to-framework",
-        externalApi: {
-          package: "@stanley2058/lilac-event-bus",
-          exportName: "subscription start/done",
-        },
-        direction: "signal-host",
-        reason:
-          "Maps typed subscription start and completion failures to the existing runner startup/background host contract.",
       },
       {
         identity: {
@@ -8753,7 +8727,7 @@ function approvedExceptionAdapterCatalogSha256(
 }
 
 export const APPROVED_EXCEPTION_ADAPTER_CATALOG_SHA256 =
-  "507fdbc46ed807d47ea64cbe741c48cabf6daff4d8c956580aa85b6712c8e388";
+  "3202d507441d854b9d50599bab4a698c16565934689c0137faac58d173350668";
 
 export const architectureManifest = {
   version: 1,

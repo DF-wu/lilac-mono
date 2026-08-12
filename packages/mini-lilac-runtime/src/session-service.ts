@@ -144,12 +144,12 @@ import {
   type RuntimeConfig,
 } from "./config";
 import { parseModelRef, parseModelRefResult, resolveLanguageModel } from "./model-catalog";
+import { toolResultContentDisplayValue } from "@stanley2058/lilac-tool-results/tool-result-media";
 import {
   READ_FILE_MEDIA_MAX_BYTES_PER_PART,
   READ_FILE_MEDIA_MAX_BYTES_TOTAL,
   scrubReadFileMediaForModelView,
   supportsReadFileMedia,
-  toolResultContentDisplayValue,
 } from "./model-message-media";
 import {
   reasoningProviderOptions,

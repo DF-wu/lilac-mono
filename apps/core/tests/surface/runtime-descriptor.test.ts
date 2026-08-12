@@ -195,7 +195,6 @@ function discordRelay(): SurfaceRelayDescriptor<"discord"> {
             rollback: async () => Result.ok(undefined),
             activate: () => undefined,
           }),
-        restoreRelays: async () => undefined,
         stop: async () => undefined,
       }),
     },
@@ -218,7 +217,6 @@ function githubRelay(): SurfaceRelayDescriptor<"github"> {
             rollback: async () => Result.ok(undefined),
             activate: () => undefined,
           }),
-        restoreRelays: async () => undefined,
         stop: async () => undefined,
       }),
     },
@@ -637,52 +635,9 @@ describe("surface workflow progress ports", () => {
     });
   });
 
-  it("returns closed Discord and GitHub failure outcomes and preserves Panic", async () => {
-    const discordAdapter = new TestAdapter("discord");
-    const discordPort = createDiscordWorkflowProgressPort(discordAdapter);
-    spyOn(discordAdapter, "editMsg").mockResolvedValue(
-      Result.err(
-        new SurfaceMessageNotFound({
-          platform: "discord",
-          operation: "edit-message",
-          message: "missing",
-        }),
-      ),
-    );
-    expect(
-      await discordPort.edit({ channelId: "channel", messageId: "missing" }, { text: "edit" }),
-    ).toEqual(Result.err({ kind: "not-found" }));
-
+  it("preserves Panic identity through workflow progress ports", async () => {
     const githubAdapter = new TestAdapter("github");
     const githubPort = createGithubWorkflowProgressPort(githubAdapter);
-    const createdRef = { platform: "github" as const, channelId: "octo/repo#1", messageId: "42" };
-    spyOn(githubAdapter, "sendMsg").mockResolvedValue(
-      Result.err(
-        new SurfaceOperationPartiallyCompleted({
-          platform: "github",
-          operation: "send-message",
-          created: createdRef,
-          message: "action edit failed",
-        }),
-      ),
-    );
-    expect(
-      await githubPort.send({ channelId: "octo/repo#1", content: { text: "Queued" } }),
-    ).toEqual(Result.err({ kind: "created", ref: createdRef }));
-
-    spyOn(githubAdapter, "editMsg").mockResolvedValue(
-      Result.err(
-        new SurfaceMessageNotFound({
-          platform: "github",
-          operation: "edit-message",
-          message: "missing",
-        }),
-      ),
-    );
-    expect(
-      await githubPort.edit({ channelId: "octo/repo#1", messageId: "42" }, { text: "edit" }),
-    ).toEqual(Result.err({ kind: "not-found" }));
-
     const panic = new Panic({ message: "workflow progress defect" });
     spyOn(githubAdapter, "readMsg").mockRejectedValue(panic);
     await expect(

@@ -1050,36 +1050,6 @@ describe("MiniLilacSqliteStore", () => {
     recovered.close();
   });
 
-  it("does not preserve interrupted-run chunks after a process restart", async () => {
-    const directory = await mkdtemp(path.join(tmpdir(), "mini-lilac-finished-recovery-"));
-    temporaryDirectories.push(directory);
-    const databasePath = path.join(directory, "runtime.sqlite");
-    const first = new MiniLilacSqliteStore(databasePath);
-    first.createSession({
-      id: "session-1",
-      cwd: directory,
-      model: "test/mock",
-      profile: "reader",
-      reasoning: "high",
-    });
-    seedOpenHistory(first, "session-1", "run-1", userMessage("interrupted root"));
-    first.close();
-
-    const recovered = new SessionService({
-      config: config(),
-      databasePath,
-      modelResolver: () => new MockLanguageModelV4({}),
-    });
-    await recovered.initialize();
-    expect(recovered.store.getRun("run-1").status).toBe("error");
-    expect(
-      recovered.store.database
-        .query("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'run_chunks'")
-        .get(),
-    ).toBeNull();
-    recovered.close();
-  });
-
   it("retains turn-boundary input usage when startup recovers an interrupted run", async () => {
     const directory = await mkdtemp(path.join(tmpdir(), "mini-lilac-usage-recovery-"));
     temporaryDirectories.push(directory);

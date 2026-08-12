@@ -44,7 +44,7 @@ export function formatSessionTitle(title: string): string {
   return `${characters.slice(0, MAX_TITLE_LENGTH - 3).join("")}...`;
 }
 
-export function formatTokenCount(tokens: number): string {
+function formatTokenCount(tokens: number): string {
   if (tokens < 1_000) return String(Math.round(tokens));
   const divisor = tokens < 1_000_000 ? 1_000 : 1_000_000;
   const suffix = divisor === 1_000 ? "K" : "M";

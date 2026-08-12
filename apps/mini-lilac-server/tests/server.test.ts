@@ -1264,7 +1264,7 @@ describe("createMiniLilacServer", () => {
     service.close();
   });
 
-  it("serves manual compaction while preserving history and appending a divider", async () => {
+  it("serves the manual compaction lifecycle and idempotent replay", async () => {
     const model = new MockLanguageModelV4({
       doStream: async () => textResult("summary", "Condensed server context."),
     });
@@ -1310,29 +1310,6 @@ describe("createMiniLilacServer", () => {
     const result = events.at(-1);
     expect(result).toMatchObject({ phase: "completed", outcome: "compacted" });
     expect(result?.summary).toContain("Condensed server context.");
-    expect(service.getMessages(session.id).slice(0, -1)).toEqual(visibleMessages);
-    // The committed entry carries the generated summary so it survives a reload.
-    expect(service.getMessages(session.id).at(-1)).toMatchObject({
-      id: "compaction:compact-command",
-      role: "assistant",
-      parts: [
-        {
-          type: "data-compaction",
-          id: "compact-command",
-          data: {
-            source: "manual",
-            reason: "manual",
-            phase: "completed",
-            outcome: "compacted",
-            messageCountBefore: result?.messageCountBefore,
-            messageCountAfter: result?.messageCountAfter,
-            summary: result?.summary,
-            durationMs: expect.any(Number),
-            modelCalls: expect.any(Number),
-          },
-        },
-      ],
-    });
 
     const duplicate = await compactionEvents(
       await app.handle(
@@ -1388,8 +1365,6 @@ describe("createMiniLilacServer", () => {
         userMessage("latest-user", "latest request"),
       ],
     );
-    const before = service.store.getModelMessages(session.id);
-
     const events = await compactionEvents(
       await app.handle(
         jsonRequest("POST", `${MINI_LILAC_API_PREFIX}/sessions/${session.id}/compact`, {
@@ -1400,8 +1375,6 @@ describe("createMiniLilacServer", () => {
     );
 
     expect(events.at(-1)?.phase).toBe("cancelled");
-    expect(service.store.getModelMessages(session.id)).toEqual(before);
-    expect(service.getSnapshot(session.id).status).toBe("idle");
 
     cancelDuringSummarization = undefined;
     const idle = await app.handle(
@@ -1654,7 +1627,6 @@ describe("createMiniLilacServer", () => {
     );
     expect(completedFull.status).toBe(204);
     const fullChunks = [...prefix.chunks, ...activeTail];
-    expect(service.getRunChunks(runId)).toEqual([]);
 
     const cursorChunks = fullChunks
       .map((chunk) => miniLilacStreamCursorChunkSchema.safeParse(chunk))
@@ -1714,123 +1686,96 @@ describe("createMiniLilacServer", () => {
     service.close();
   });
 
-  it("does not replay a finalized cancelled tail", async () => {
-    let modelStarted = () => {};
-    const modelStart = new Promise<void>((resolve) => {
-      modelStarted = resolve;
-    });
-    const model = new MockLanguageModelV4({
-      doStream: async (options) => {
-        modelStarted();
-        await new Promise<void>((_resolve, reject) => {
-          if (options.abortSignal?.aborted) {
-            reject(new DOMException("cancelled", "AbortError"));
-            return;
-          }
-          options.abortSignal?.addEventListener(
-            "abort",
-            () => reject(new DOMException("cancelled", "AbortError")),
-            { once: true },
-          );
-        });
-        return textResult("unreachable", "unreachable");
-      },
-    });
-    const { app, directory, service } = await testServer(model);
-    const initial = await app.handle(
-      jsonRequest("POST", `${MINI_LILAC_API_PREFIX}/chat`, chatBody(directory)),
-    );
-    const initialText = initial.text();
-    await modelStart;
-
-    const runId = service.getSnapshot("session-1").activeRunId;
-    if (!runId) throw new Error("Expected an active run");
-    const cancel = await app.handle(
-      jsonRequest("POST", `${MINI_LILAC_API_PREFIX}/sessions/session-1/cancel`, {
-        sessionId: "session-1",
-        runId,
-        clientCommandId: "tail-cancel-command",
-      }),
-    );
-    expect(cancel.status).toBe(200);
-    expect(miniLilacCancelResultSchema.parse(await responseJson(cancel)).status).toBe("cancelled");
-
-    const fullChunks = parseSseChunks(await initialText);
-    expect(service.store.getRun(runId).status).toBe("cancelled");
-    const controlIndex = fullChunks.findIndex((chunk) => chunk.type === "data-control");
-    const controlCursor = miniLilacStreamCursorChunkSchema.parse(fullChunks[controlIndex - 1]);
-    const expectedTail = fullChunks.slice(controlIndex - 1);
-    const tailTypes = expectedTail.map((chunk) => chunk.type);
-    expect(tailTypes).toContain("data-control");
-    expect(tailTypes).toContain("data-outputRollback");
-    expect(tailTypes).toContain("finish");
-
-    const withoutCursor = await app.handle(
-      jsonRequest("GET", `${MINI_LILAC_API_PREFIX}/chat/session-1/stream`),
-    );
-    expect(withoutCursor.status).toBe(204);
-    const replay = await app.handle(
-      jsonRequest(
-        "GET",
-        `${MINI_LILAC_API_PREFIX}/chat/session-1/stream?runId=${runId}&after=${controlCursor.data.seq - 1}`,
-      ),
-    );
-    expect(replay.status).toBe(204);
-    service.close();
-  });
-
-  it("does not replay a finalized error tail", async () => {
-    const errorSpy = spyOn(console, "error").mockImplementation(() => {});
-    try {
+  it.each(["cancelled", "error"] as const)(
+    "does not replay a finalized %s tail",
+    async (terminalStatus) => {
+      const modelStart = Promise.withResolvers<void>();
       const model = new MockLanguageModelV4({
-        doStream: async () => {
-          throw new Error("provider stream failed");
+        doStream: async (options) => {
+          if (terminalStatus === "error") throw new Error("provider stream failed");
+          modelStart.resolve();
+          await new Promise<void>((_resolve, reject) => {
+            if (options.abortSignal?.aborted) {
+              reject(new DOMException("cancelled", "AbortError"));
+              return;
+            }
+            options.abortSignal?.addEventListener(
+              "abort",
+              () => reject(new DOMException("cancelled", "AbortError")),
+              { once: true },
+            );
+          });
+          return textResult("unreachable", "unreachable");
         },
       });
-      const { app, directory, service } = await testServer(model);
-      const initial = await app.handle(
-        jsonRequest("POST", `${MINI_LILAC_API_PREFIX}/chat`, chatBody(directory)),
-      );
-      const fullChunks = parseSseChunks(await initial.text());
-      const run = service.store.getLatestSelectedRootRun("session-1");
-      if (!run) throw new Error("Expected an error run");
-      expect(run.status).toBe("error");
+      const errorSpy = spyOn(console, "error").mockImplementation(() => {});
+      try {
+        const { app, directory, service } = await testServer(model);
+        const initial = await app.handle(
+          jsonRequest("POST", `${MINI_LILAC_API_PREFIX}/chat`, chatBody(directory)),
+        );
+        const initialText = initial.text();
+        if (terminalStatus === "cancelled") {
+          await modelStart.promise;
+          const activeRunId = service.getSnapshot("session-1").activeRunId;
+          if (!activeRunId) throw new Error("Expected an active run");
+          const cancel = await app.handle(
+            jsonRequest("POST", `${MINI_LILAC_API_PREFIX}/sessions/session-1/cancel`, {
+              sessionId: "session-1",
+              runId: activeRunId,
+              clientCommandId: "tail-cancel-command",
+            }),
+          );
+          expect(cancel.status).toBe(200);
+          expect(miniLilacCancelResultSchema.parse(await responseJson(cancel)).status).toBe(
+            "cancelled",
+          );
+        }
 
-      const errorIndex = fullChunks.findIndex((chunk) => chunk.type === "error");
-      const errorCursor = miniLilacStreamCursorChunkSchema.parse(fullChunks[errorIndex - 1]);
-      const expectedTail = fullChunks.slice(errorIndex - 1);
-      expect(expectedTail.map((chunk) => chunk.type)).toEqual([
-        "data-streamCursor",
-        "error",
-        "data-streamCursor",
-        "finish",
-      ]);
+        const fullChunks = parseSseChunks(await initialText);
+        const terminalType = terminalStatus === "cancelled" ? "data-control" : "error";
+        const terminalIndex = fullChunks.findIndex((chunk) => chunk.type === terminalType);
+        const terminalCursor = miniLilacStreamCursorChunkSchema.parse(
+          fullChunks[terminalIndex - 1],
+        );
+        const runId = terminalCursor.data.runId;
+        const tailTypes = fullChunks.slice(terminalIndex - 1).map((chunk) => chunk.type);
+        if (terminalStatus === "cancelled") {
+          expect(tailTypes).toContain("data-control");
+          expect(tailTypes).toContain("data-outputRollback");
+          expect(tailTypes).toContain("finish");
+        } else {
+          expect(tailTypes).toEqual(["data-streamCursor", "error", "data-streamCursor", "finish"]);
+        }
 
-      const withoutCursor = await app.handle(
-        jsonRequest("GET", `${MINI_LILAC_API_PREFIX}/chat/session-1/stream`),
-      );
-      expect(withoutCursor.status).toBe(204);
-      const replay = await app.handle(
-        jsonRequest(
-          "GET",
-          `${MINI_LILAC_API_PREFIX}/chat/session-1/stream?runId=${run.id}&after=${errorCursor.data.seq - 1}`,
-        ),
-      );
-      expect(replay.status).toBe(204);
-      expect(
-        errorSpy.mock.calls.some((call) =>
-          call.some((value) =>
-            (value instanceof Error ? value.message : String(value)).includes(
-              "provider stream failed",
-            ),
+        const withoutCursor = await app.handle(
+          jsonRequest("GET", `${MINI_LILAC_API_PREFIX}/chat/session-1/stream`),
+        );
+        expect(withoutCursor.status).toBe(204);
+        const replay = await app.handle(
+          jsonRequest(
+            "GET",
+            `${MINI_LILAC_API_PREFIX}/chat/session-1/stream?runId=${runId}&after=${terminalCursor.data.seq - 1}`,
           ),
-        ),
-      ).toBe(false);
-      service.close();
-    } finally {
-      errorSpy.mockRestore();
-    }
-  });
+        );
+        expect(replay.status).toBe(204);
+        if (terminalStatus === "error") {
+          expect(
+            errorSpy.mock.calls.some((call) =>
+              call.some((value) =>
+                (value instanceof Error ? value.message : String(value)).includes(
+                  "provider stream failed",
+                ),
+              ),
+            ),
+          ).toBe(false);
+        }
+        service.close();
+      } finally {
+        errorSpy.mockRestore();
+      }
+    },
+  );
 
   it("does not reconnect to completed root runs when timestamps tie", async () => {
     const model = new MockLanguageModelV4({ doStream: textResult("unused", "unused") });

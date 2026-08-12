@@ -1,7 +1,6 @@
 import { describe, expect, it } from "bun:test";
 
 import { Panic, Result, type Result as ResultType } from "better-result";
-import { CustomCommandDirectoryReadError } from "@stanley2058/lilac-utils";
 import {
   createLilacBus,
   EventDeliveryStopFailed,
@@ -12,14 +11,10 @@ import {
 } from "@stanley2058/lilac-event-bus";
 import Redis from "ioredis";
 
-import { CustomCommandManager } from "../../src/custom-commands/manager";
 import {
   adaptCoreEventBusCleanupResultToHost,
-  adaptCoreEventBusSetupResultToStartup,
-  adaptCustomCommandInitializationResultToStartup,
   captureCoreEventBusCleanup,
   CoreEventBusCleanupFailed,
-  CoreEventBusSetupFailed,
   CoreResidualDiscordRequestRouterDoneTimedOut,
   type CoreResidualDiscordRequestRouterDoneOutcome,
   type CoreRuntimeCleanupFailure,
@@ -93,36 +88,6 @@ describe("delegated request capability identity", () => {
 });
 
 describe("Core runtime startup", () => {
-  it("returns the initialized custom command manager", () => {
-    const manager = new CustomCommandManager("/data");
-
-    expect(adaptCustomCommandInitializationResultToStartup(Result.ok(undefined), manager)).toBe(
-      manager,
-    );
-  });
-
-  it("maps custom command initialization failure to a fresh plain startup Error", () => {
-    const manager = new CustomCommandManager("/data");
-    const discoveryError = new CustomCommandDirectoryReadError({
-      directoryPath: "/data/cmds",
-      cause: new Error("permission denied"),
-      message: "Failed to read custom command directory '/data/cmds': permission denied",
-    });
-
-    let thrown: unknown;
-    try {
-      adaptCustomCommandInitializationResultToStartup(Result.err(discoveryError), manager);
-    } catch (cause) {
-      thrown = cause;
-    }
-
-    expect(thrown).toBeInstanceOf(Error);
-    expect(Object.getPrototypeOf(thrown)).toBe(Error.prototype);
-    expect(thrown).not.toBe(discoveryError);
-    expect(thrown).toHaveProperty("message", discoveryError.message);
-    expect(thrown).not.toHaveProperty("cause");
-  });
-
   it.each([
     ["Error", () => new Error("cleanup failed")],
     ["Panic", () => new Panic({ message: "cleanup invariant failed" })],
@@ -649,20 +614,12 @@ describe("Core runtime startup", () => {
 });
 
 describe("Core runtime event delivery", () => {
-  it("adapts setup and cleanup Results only at their exact runtime host boundaries", () => {
-    const setupError = new CoreEventBusSetupFailed({
-      operation: "ping-redis",
-      cause: new Error("unavailable"),
-      message: "Core event bus setup failed during ping-redis",
-    });
+  it("adapts cleanup Results only at the exact runtime host boundary", () => {
     const cleanupError = new CoreEventBusCleanupFailed({
       cause: new Error("close failed"),
       message: "Core event bus cleanup failed",
     });
 
-    expect(() => adaptCoreEventBusSetupResultToStartup(Result.err(setupError))).toThrow(
-      setupError.message,
-    );
     expect(() => adaptCoreEventBusCleanupResultToHost(Result.err(cleanupError))).toThrow(
       cleanupError.message,
     );

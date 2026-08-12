@@ -1,6 +1,6 @@
 import { tool, type ModelMessage } from "ai";
 import { z } from "zod";
-import { type AdapterPlatform, type LilacBus } from "@stanley2058/lilac-event-bus";
+import type { AdapterPlatform } from "@stanley2058/lilac-event-bus";
 import {
   subagentDelegateBaseInputSchema,
   subagentDelegateOutputSchema,
@@ -87,7 +87,6 @@ function createSubagentDelegateInputSchema(
 
 type SubagentTerminalStatus = z.infer<typeof subagentTerminalStatusSchema>;
 export type { SubagentDelegateOutput, SubagentMode, SubagentProfile };
-export { subagentDelegateBaseInputSchema, subagentDelegateOutputSchema };
 
 type ChildToolStatus = "running" | "done";
 
@@ -267,7 +266,7 @@ export function renderSubagentDisplay(params: {
   return [header, ...lines].join("\n");
 }
 
-export function buildDelegatedTaskPrompt(task: string): ModelMessage {
+function buildDelegatedTaskPrompt(task: string): ModelMessage {
   return {
     role: "user",
     content: task,
@@ -330,13 +329,11 @@ export type SubagentDelegationHandle = {
 };
 
 export function subagentTools(params: {
-  bus: LilacBus;
   idleTimeoutMs: number;
   maxDepth: number;
   modelPresets?: Readonly<Record<string, AgentSelectableModelPreset>>;
   delegatePromptOverlay?: string;
   onDelegate?: (registration: SubagentDelegationRegistration) => Promise<SubagentDelegationHandle>;
-  onActivity?: () => void;
 }) {
   const selectableModels = Object.entries(params.modelPresets ?? {}).filter(
     isSelectableModelPreset,

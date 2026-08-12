@@ -39,7 +39,7 @@ afterEach(async () => {
 });
 
 describe("workflow value artifact persistence codec", () => {
-  it("exports and executes the exact six-case compatibility catalog", () => {
+  it("executes and classifies the exact six-case compatibility catalog", () => {
     expect(Object.keys(workflowValueArtifactCodecCases).sort()).toEqual([
       "corrupt-fields",
       "current",
@@ -49,38 +49,19 @@ describe("workflow value artifact persistence codec", () => {
       "unsupported-version",
     ]);
 
-    for (const fixture of Object.values(workflowValueArtifactCodecCases)) {
+    const errorClasses = {
+      "unsupported-version": WorkflowArtifactUnsupportedVersion,
+      "malformed-serialization": WorkflowArtifactMalformedJson,
+      "corrupt-fields": WorkflowArtifactCorruptFields,
+    } as const;
+    for (const [outcome, fixture] of Object.entries(workflowValueArtifactCodecCases)) {
       const decoded = decodeWorkflowValueArtifact(fixture.input);
       expect(decoded.status).toBe(fixture.outcome);
       if (decoded.status === "ok" && "provenance" in fixture) {
         expect(decoded.value.provenance).toBe(fixture.provenance);
+      } else if (decoded.status === "error" && outcome in errorClasses) {
+        expect(decoded.error).toBeInstanceOf(errorClasses[outcome as keyof typeof errorClasses]);
       }
-    }
-  });
-
-  it("classifies unsupported, malformed, corrupt, and hash-mismatched content separately", () => {
-    const unsupported = decodeWorkflowValueArtifact(
-      workflowValueArtifactCodecCases["unsupported-version"].input,
-    );
-    expect(unsupported.status).toBe("error");
-    if (unsupported.status === "error") {
-      expect(unsupported.error).toBeInstanceOf(WorkflowArtifactUnsupportedVersion);
-    }
-
-    const malformed = decodeWorkflowValueArtifact(
-      workflowValueArtifactCodecCases["malformed-serialization"].input,
-    );
-    expect(malformed.status).toBe("error");
-    if (malformed.status === "error") {
-      expect(malformed.error).toBeInstanceOf(WorkflowArtifactMalformedJson);
-    }
-
-    const corrupt = decodeWorkflowValueArtifact(
-      workflowValueArtifactCodecCases["corrupt-fields"].input,
-    );
-    expect(corrupt.status).toBe("error");
-    if (corrupt.status === "error") {
-      expect(corrupt.error).toBeInstanceOf(WorkflowArtifactCorruptFields);
     }
 
     const current = workflowValueArtifactCodecCases.current.input;

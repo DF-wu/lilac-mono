@@ -37,9 +37,9 @@ import {
   type WorkflowProgressView,
 } from "./workflow-progress-view";
 
-export const MAX_WORKFLOW_PROGRESS_TIMER_DELAY_MS = 24 * 60 * 60 * 1_000;
-export const WORKFLOW_PROGRESS_STARTUP_RECONCILIATION_BATCH_SIZE = 1_000;
-export const MAX_WORKFLOW_PROGRESS_RECONCILIATION_RETRY_DELAY_MS = 60_000;
+const MAX_WORKFLOW_PROGRESS_TIMER_DELAY_MS = 24 * 60 * 60 * 1_000;
+const WORKFLOW_PROGRESS_STARTUP_RECONCILIATION_BATCH_SIZE = 1_000;
+const MAX_WORKFLOW_PROGRESS_RECONCILIATION_RETRY_DELAY_MS = 60_000;
 
 export interface WorkflowProgressCardService {
   ensureInitialCard(runId: string): Promise<MsgRef>;
@@ -71,17 +71,17 @@ type WorkflowProgressSurfaceCallFailureFields =
       readonly message: string;
     };
 
-export class WorkflowProgressSurfaceCreated extends TaggedError("WorkflowProgressSurfaceCreated")<
+class WorkflowProgressSurfaceCreated extends TaggedError("WorkflowProgressSurfaceCreated")<
   Extract<WorkflowProgressSurfaceCallFailureFields, { failureKind: "created" }>
 > {}
 
-export class WorkflowProgressSurfaceNotFound extends TaggedError("WorkflowProgressSurfaceNotFound")<
+class WorkflowProgressSurfaceNotFound extends TaggedError("WorkflowProgressSurfaceNotFound")<
   Extract<WorkflowProgressSurfaceCallFailureFields, { failureKind: "not-found" }>
 > {}
 
-export class WorkflowProgressSurfaceCallFailed extends TaggedError(
-  "WorkflowProgressSurfaceCallFailed",
-)<Extract<WorkflowProgressSurfaceCallFailureFields, { failureKind: "failed" }>> {}
+class WorkflowProgressSurfaceCallFailed extends TaggedError("WorkflowProgressSurfaceCallFailed")<
+  Extract<WorkflowProgressSurfaceCallFailureFields, { failureKind: "failed" }>
+> {}
 
 type WorkflowProgressSurfaceFailure =
   | WorkflowProgressSurfaceCreated

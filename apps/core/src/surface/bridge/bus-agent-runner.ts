@@ -250,7 +250,6 @@ import {
 } from "./bus-agent-runner/core-primary-continuation";
 
 export { formatUnknownErrorForDisplay } from "./bus-agent-runner/error-display";
-export { AgentIdleTimeoutError, createAgentRunIdleWatchdog };
 export {
   shouldEnableAnthropicPromptCache,
   toOpenAIPromptCacheKey,
@@ -261,11 +260,6 @@ export {
   measureMeaningfulTextUnits,
   shouldRunAutoInjectedThreadSearch,
 } from "./bus-agent-runner/text-units";
-export {
-  computeTransientRetryDelayMs,
-  createTransientModelRetryController,
-  isRetryableTransientModelError,
-} from "./bus-agent-runner/transient-retry";
 export {
   appendAdditionalSessionMemoBlock,
   appendConfiguredAliasPromptBlock,
@@ -2549,7 +2543,6 @@ export async function startBusAgentRunner(params: {
   >;
   requestMessageCache?: RequestMessageCache;
   startPaused?: boolean;
-  initialRecovery?: AgentRunnerRecoveryState;
   beforeRequestIntake?: (
     message: DecodedLilacMessageForTopic<"cmd.request">,
   ) => void | Promise<void>;
@@ -4079,14 +4072,6 @@ export async function startBusAgentRunner(params: {
         }
       },
     });
-  }
-
-  function restoreRecoverables(entries: readonly AgentRunnerRecoveryEntry[]): void {
-    const prepared = prepareRecovery({ entries, queueAttempts: [] });
-    if (prepared.status === "error") return signalBusAgentRunnerHostFailure(prepared.error);
-    const applied = prepared.value.apply();
-    if (applied.status === "error") return signalBusAgentRunnerHostFailure(applied.error);
-    prepared.value.activate();
   }
 
   async function drainSessionQueue(sessionId: string, state: SessionQueue) {
@@ -7764,21 +7749,9 @@ export async function startBusAgentRunner(params: {
     return active;
   }
 
-  let initialRecoveryAttempt: AgentRecoveryAttempt | null = null;
-  if (params.initialRecovery) {
-    const prepared = prepareRecovery(params.initialRecovery);
-    if (prepared.status === "error") signalBusAgentRunnerHostFailure(prepared.error);
-    const applied = prepared.value.apply();
-    if (applied.status === "error") signalBusAgentRunnerHostFailure(applied.error);
-    initialRecoveryAttempt = prepared.value;
-  }
   await startSubscription();
-  if (runnerActivated && initialRecoveryAttempt) {
-    initialRecoveryAttempt.activate();
-  }
   const activate = (): void => {
     activateRunnerAdmission();
-    initialRecoveryAttempt?.activate();
   };
 
   return {
@@ -7788,7 +7761,6 @@ export async function startBusAgentRunner(params: {
     snapshotRecoverables,
     snapshotQueueAttempts,
     prepareRecovery,
-    restoreRecoverables,
     getActiveDrainOperation: () => activeDrainOperation,
     getTerminalCleanupOperations: () => terminalCleanupOperations,
     stop: async () => {

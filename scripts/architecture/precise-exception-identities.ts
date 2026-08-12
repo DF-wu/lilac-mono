@@ -50,7 +50,6 @@ export const PRECISE_EXCEPTION_IDENTITIES: Readonly<
       "signalMissingGracefulRestartDispositionToken",
       "signal",
     ],
-    ["src/surface/bridge/subscribe-from-bus.ts", "bridgeBusToAdapter.restoreRelays", "signal"],
     ["src/surface/bridge/subscribe-from-bus.ts", "bridgeBusToAdapter.startRelay", "both"],
     [
       "src/surface/bridge/subscribe-from-bus.ts",
@@ -117,12 +116,6 @@ export const PRECISE_EXCEPTION_IDENTITIES: Readonly<
     ["src/plugins/manager.ts", "createCoreToolPluginManager.adaptPluginResultToHost", "signal"],
     ["src/runtime/core-config-watch.ts", "captureCoreConfigWatchRead", "both"],
     ["src/runtime/create-core-runtime.ts", "adaptCoreEventBusCleanupResultToHost", "signal"],
-    ["src/runtime/create-core-runtime.ts", "adaptCoreEventBusSetupResultToStartup", "signal"],
-    [
-      "src/runtime/create-core-runtime.ts",
-      "adaptCustomCommandInitializationResultToStartup",
-      "signal",
-    ],
     ["src/runtime/create-core-runtime.ts", "captureCoreEventBusCleanup", "both"],
     ["src/runtime/create-core-runtime.ts", "captureCoreLilacBusConstruction", "both"],
     ["src/runtime/create-core-runtime.ts", "captureCoreRawBusConstruction", "both"],
@@ -321,7 +314,6 @@ export const PRECISE_EXCEPTION_IDENTITIES: Readonly<
       "startBusAgentRunner.startSessionQueueDrain.observeSupervisedDrainRejection",
       "capture",
     ],
-    ["src/surface/bridge/bus-agent-runner.ts", "startBusAgentRunner", "signal"],
     [
       "src/surface/bridge/bus-agent-runner.ts",
       "applyToRunningAgent.promptWhileIdle.catch.<callback@1>",

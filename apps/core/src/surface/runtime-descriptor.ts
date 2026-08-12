@@ -69,7 +69,6 @@ export interface SurfaceRelayHandle<
   prepareRestoreRelays(
     snapshots: readonly SurfaceRelaySnapshotFor<P>[],
   ): ResultType<SurfaceRelayRestoreAttempt<P>, SurfaceRelayRestoreApplyFailed>;
-  restoreRelays(snapshots: readonly SurfaceRelaySnapshotFor<P>[]): Promise<void>;
 }
 
 export interface SurfaceRelayLifecyclePort<

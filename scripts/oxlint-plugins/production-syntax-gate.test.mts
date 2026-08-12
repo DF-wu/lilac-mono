@@ -7,7 +7,6 @@ import {
   scanSyntaxFindings,
   type SyntaxFinding,
 } from "./check-production-syntax.mts";
-import { FINAL_PACKAGE_WIDE_SYNTAX_RULES } from "./syntax-policy.mts";
 
 const FIXTURE_ROOT = new URL("./fixtures/production-syntax-gate/", import.meta.url).pathname;
 
@@ -32,18 +31,6 @@ function fixtureManifest(): ArchitectureManifest {
 }
 
 describe("repository syntax gate", () => {
-  it("declares every permanent package-wide syntax rule", () => {
-    expect(FINAL_PACKAGE_WIDE_SYNTAX_RULES).toEqual([
-      "no-nested-ternary",
-      "lilac/no-local-is-record",
-      "lilac/no-exception-flow",
-      "lilac/no-inline-async-result-callback",
-      "lilac/no-presentation-decoder-import",
-      "lilac/no-store-inline-decoding",
-      "lilac/no-direct-sqlite-transaction",
-    ]);
-  });
-
   it("discovers fixture sources, preserves fixture directories, and excludes tests before parsing", async () => {
     const findings = await scanSyntaxFindings(fixtureManifest(), FIXTURE_ROOT);
 

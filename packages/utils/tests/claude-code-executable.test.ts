@@ -14,11 +14,4 @@ describe("claudeCodeExecutableSettings", () => {
     // rather than being overridden with an empty path.
     expect(claudeCodeExecutableSettings(() => null)).toEqual({});
   });
-
-  it("resolves from PATH by default", () => {
-    const claudePath = Bun.which("claude");
-    expect(claudeCodeExecutableSettings()).toEqual(
-      claudePath === null ? {} : { pathToClaudeCodeExecutable: claudePath },
-    );
-  });
 });

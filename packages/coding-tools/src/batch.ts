@@ -14,7 +14,7 @@ import { parsePatchResult } from "./apply-patch";
 import { validateLocalCwd } from "./guardrails";
 import { adaptCodingToolResultToHost } from "./host-compatibility";
 
-export const MAX_BATCH_CALLS = 8;
+const MAX_BATCH_CALLS = 8;
 
 export const batchCallSchema = z.object({
   tool: z.string().min(1),

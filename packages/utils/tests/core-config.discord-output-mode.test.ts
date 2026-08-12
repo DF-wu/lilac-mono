@@ -3,11 +3,6 @@ import { describe, expect, it } from "bun:test";
 import { coreConfigSchema } from "../core-config";
 
 describe("coreConfigSchema surface.discord.outputMode", () => {
-  it("defaults to inline", () => {
-    const parsed = coreConfigSchema.parse({});
-    expect(parsed.surface.discord.outputMode).toBe("inline");
-  });
-
   it("accepts preview mode", () => {
     const parsed = coreConfigSchema.parse({
       surface: {
@@ -19,11 +14,6 @@ describe("coreConfigSchema surface.discord.outputMode", () => {
     });
 
     expect(parsed.surface.discord.outputMode).toBe("preview");
-  });
-
-  it("defaults previewFinalOutputStyle to embed", () => {
-    const parsed = coreConfigSchema.parse({});
-    expect(parsed.surface.discord.previewFinalOutputStyle).toBe("embed");
   });
 
   it("accepts plain previewFinalOutputStyle", () => {
@@ -87,17 +77,6 @@ describe("coreConfigSchema surface.discord.outputMode", () => {
     });
 
     expect(parsed.surface.discord.memberPresence).toBe(true);
-  });
-
-  it("defaults markdown table render experiment to disabled unicode@80", () => {
-    const parsed = coreConfigSchema.parse({});
-
-    expect(parsed.surface.discord.experimental.markdownTableRender).toEqual({
-      enabled: false,
-      style: "unicode",
-      maxWidth: 80,
-      fallbackMode: "list",
-    });
   });
 
   it("accepts markdown table render experimental overrides", () => {

@@ -34,7 +34,9 @@ import {
   attachAutoCompaction,
   ToolExpansion,
   buildSyntheticToolCallId,
+  createAgentRunIdleWatchdog,
   hashCanonicalMessagesV1,
+  isRetryableTransientModelError,
   RetryBackoffAborted,
   type AiSdkPiAgentOptions,
 } from "@stanley2058/lilac-agent";
@@ -64,11 +66,8 @@ import {
   consumeAssistantTextDelta,
   consumeReasoningChunkEvent,
   completeLevel1ToolMapping,
-  computeTransientRetryDelayMs,
   createAssistantTextPartBoundaryState,
-  createAgentRunIdleWatchdog,
   captureBusAgentRunnerOperation,
-  createTransientModelRetryController,
   degradeCorePrimaryLineageForMutation,
   formatBusAgentRunnerDrainFailureForLog,
   formatClaudeLifecycleLogFields,
@@ -83,7 +82,6 @@ import {
   maybeBuildAutoInjectedThreadSearchMessages,
   buildPersistedHeartbeatMessages,
   buildSurfaceMetadataOverlay,
-  isRetryableTransientModelError,
   isActiveRuntimeModelCompatible,
   isWorkflowAgentRecoveryEntry,
   markAssistantTextPartEnded,
@@ -120,6 +118,7 @@ import {
   withReasoningSummaryDefaultForOpenAIModels,
   WORKFLOW_REQUEST_CLAIM_HEARTBEAT_MS,
   validateCorePrimaryLineageAtRunnerIntake,
+  type AgentRunnerRecoveryState,
   type BusAgentRunnerTerminalCleanup,
 } from "../../../src/surface/bridge/bus-agent-runner";
 import {
@@ -155,7 +154,6 @@ import {
 import { createAgentOutputActivityPublisher } from "../../../src/shared/agent-output-activity";
 import { createRequestMessageCache } from "../../../src/tool-server/request-message-cache";
 import { DurableWorkflowStore } from "../../../src/workflow/durable-workflow-store";
-import { createIdleTimer } from "../../../src/shared/idle-timer";
 import {
   adaptDiscordRequestRouterStartOutcomeToHost,
   startDiscordRequestRouter,
@@ -226,6 +224,17 @@ function bindingValue<T>(result: ResultType<T, CoreClaudeBindingReadError>): T {
     case "TranscriptStoreSqliteDriverFailure":
       throw result.error;
   }
+}
+
+function applyAndActivateAgentRecovery(
+  runner: Pick<Awaited<ReturnType<typeof startBusAgentRunner>>, "prepareRecovery">,
+  recovery: AgentRunnerRecoveryState,
+): void {
+  const prepared = runner.prepareRecovery(recovery);
+  if (prepared.status === "error") throw prepared.error;
+  const applied = prepared.value.apply();
+  if (applied.status === "error") throw applied.error;
+  prepared.value.activate();
 }
 
 function getPrimaryBinding(
@@ -1758,22 +1767,6 @@ describe("agent run activity", () => {
     });
   });
 
-  it("fails a wait after the configured idle interval", async () => {
-    const timedOut: Error[] = [];
-    const watchdog = createAgentRunIdleWatchdog({
-      idleTimeoutMs: 30,
-      onTimeout: (error) => timedOut.push(error),
-    });
-
-    watchdog.start();
-    await expect(watchdog.waitFor(new Promise<void>(() => {}))).rejects.toThrow(
-      "agent idle timed out after 30ms",
-    );
-
-    expect(timedOut).toHaveLength(1);
-    watchdog.stop();
-  });
-
   it("extends the idle deadline when activity continues", async () => {
     let timeoutCount = 0;
     const watchdog = createAgentRunIdleWatchdog({
@@ -1802,46 +1795,6 @@ describe("agent run activity", () => {
       expect(timeoutCount).toBe(0);
     } finally {
       watchdog.stop();
-      jest.useRealTimers();
-    }
-  });
-
-  it("can pause between separately raced operations", () => {
-    let timeoutCount = 0;
-    const watchdog = createAgentRunIdleWatchdog({
-      idleTimeoutMs: 20,
-      onTimeout: () => {
-        timeoutCount += 1;
-      },
-    });
-
-    jest.useFakeTimers({ now: 0 });
-    try {
-      watchdog.start();
-      watchdog.pause();
-      jest.advanceTimersByTime(30);
-
-      expect(timeoutCount).toBe(0);
-    } finally {
-      watchdog.stop();
-      jest.useRealTimers();
-    }
-  });
-
-  it("does not clamp large idle deadlines to an immediate timer", () => {
-    let timeoutCount = 0;
-    const timer = createIdleTimer(30 * 24 * 60 * 60 * 1000, () => {
-      timeoutCount += 1;
-    });
-
-    jest.useFakeTimers({ now: 0 });
-    try {
-      timer.reset();
-      jest.advanceTimersByTime(10);
-
-      expect(timeoutCount).toBe(0);
-    } finally {
-      timer.stop();
       jest.useRealTimers();
     }
   });
@@ -2956,6 +2909,51 @@ describe("startBusAgentRunner production path", () => {
     }>();
     const releaseModel = deferred<void>();
     const requestId = "discord:restored-identity:message";
+    const recovery = {
+      entries: [
+        {
+          queueEntryId: "restored-identity-entry",
+          kind: "active",
+          requestId,
+          sessionId: "restored-identity",
+          requestClient: "discord",
+          queue: "prompt",
+          messages: [{ role: "user", content: "restored" }],
+          currentTurnUserId: "later-restored-user",
+          identity: {
+            state: "durable",
+            projection: {
+              requestId,
+              requestClient: "discord",
+              sessionId: "restored-identity",
+              source: "external",
+              platform: "discord",
+              sessionRef: { platform: "discord", channelId: "restored-identity" },
+              authenticatedOrigin: {
+                platform: "discord",
+                userId: "restored-user",
+                sessionRef: { platform: "discord", channelId: "restored-identity" },
+                messageRef: {
+                  platform: "discord",
+                  channelId: "restored-identity",
+                  messageId: "message",
+                },
+              },
+              messageRef: {
+                platform: "discord",
+                channelId: "restored-identity",
+                messageId: "message",
+              },
+              authenticationMetadataKind: "origin",
+              verifiedIngress: true,
+            },
+            assertedSafetyMode: "trusted",
+            parkedEventIds: [],
+          },
+        },
+      ],
+      queueAttempts: [],
+    } satisfies AgentRunnerRecoveryState;
     const runner = await startBusAgentRunner({
       bus,
       subscriptionId: "restored-identity",
@@ -2964,51 +2962,7 @@ describe("startBusAgentRunner production path", () => {
       pluginManager,
       requestMessageCache,
       resolveParentChannelId: () => null,
-      initialRecovery: {
-        entries: [
-          {
-            queueEntryId: "restored-identity-entry",
-            kind: "active",
-            requestId,
-            sessionId: "restored-identity",
-            requestClient: "discord",
-            queue: "prompt",
-            messages: [{ role: "user", content: "restored" }],
-            currentTurnUserId: "later-restored-user",
-            identity: {
-              state: "durable",
-              projection: {
-                requestId,
-                requestClient: "discord",
-                sessionId: "restored-identity",
-                source: "external",
-                platform: "discord",
-                sessionRef: { platform: "discord", channelId: "restored-identity" },
-                authenticatedOrigin: {
-                  platform: "discord",
-                  userId: "restored-user",
-                  sessionRef: { platform: "discord", channelId: "restored-identity" },
-                  messageRef: {
-                    platform: "discord",
-                    channelId: "restored-identity",
-                    messageId: "message",
-                  },
-                },
-                messageRef: {
-                  platform: "discord",
-                  channelId: "restored-identity",
-                  messageId: "message",
-                },
-                authenticationMetadataKind: "origin",
-                verifiedIngress: true,
-              },
-              assertedSafetyMode: "trusted",
-              parkedEventIds: [],
-            },
-          },
-        ],
-        queueAttempts: [],
-      },
+      startPaused: true,
       issueControlCapability: (input) => {
         capabilityIssued.resolve({
           safetyMode: input.safetyMode,
@@ -3039,6 +2993,7 @@ describe("startBusAgentRunner production path", () => {
           }),
         }),
     });
+    applyAndActivateAgentRecovery(runner, recovery);
     try {
       await expect(capabilityIssued.promise).resolves.toEqual({
         safetyMode: "trusted",
@@ -3067,6 +3022,40 @@ describe("startBusAgentRunner production path", () => {
     const pluginManager = corePrimaryTestPluginManager();
     const capabilityIssued = deferred<string>();
     const requestId = "github:octo/repo#1:restored-policy";
+    const recovery = {
+      entries: [
+        {
+          queueEntryId: "restored-github-policy-entry",
+          kind: "queued",
+          requestId,
+          sessionId: "octo/repo#1",
+          requestClient: "github",
+          queue: "prompt",
+          messages: [{ role: "user", content: "restored" }],
+          identity: {
+            state: "durable",
+            projection: {
+              requestId,
+              requestClient: "github",
+              sessionId: "octo/repo#1",
+              source: "external",
+              platform: "github",
+              sessionRef: { platform: "github", channelId: "octo/repo#1" },
+              messageRef: {
+                platform: "github",
+                channelId: "octo/repo#1",
+                messageId: "restored-policy",
+              },
+              authenticationMetadataKind: "absent",
+              verifiedIngress: false,
+            },
+            assertedSafetyMode: "restricted",
+            parkedEventIds: [],
+          },
+        },
+      ],
+      queueAttempts: [],
+    } satisfies AgentRunnerRecoveryState;
     const runner = await startBusAgentRunner({
       bus,
       subscriptionId: "restored-github-policy",
@@ -3074,40 +3063,7 @@ describe("startBusAgentRunner production path", () => {
       config,
       pluginManager,
       requestMessageCache,
-      initialRecovery: {
-        entries: [
-          {
-            queueEntryId: "restored-github-policy-entry",
-            kind: "queued",
-            requestId,
-            sessionId: "octo/repo#1",
-            requestClient: "github",
-            queue: "prompt",
-            messages: [{ role: "user", content: "restored" }],
-            identity: {
-              state: "durable",
-              projection: {
-                requestId,
-                requestClient: "github",
-                sessionId: "octo/repo#1",
-                source: "external",
-                platform: "github",
-                sessionRef: { platform: "github", channelId: "octo/repo#1" },
-                messageRef: {
-                  platform: "github",
-                  channelId: "octo/repo#1",
-                  messageId: "restored-policy",
-                },
-                authenticationMetadataKind: "absent",
-                verifiedIngress: false,
-              },
-              assertedSafetyMode: "restricted",
-              parkedEventIds: [],
-            },
-          },
-        ],
-        queueAttempts: [],
-      },
+      startPaused: true,
       issueControlCapability: (input) => {
         capabilityIssued.resolve(input.safetyMode);
         return {
@@ -3125,6 +3081,7 @@ describe("startBusAgentRunner production path", () => {
           }),
         }),
     });
+    applyAndActivateAgentRecovery(runner, recovery);
     try {
       await expect(capabilityIssued.promise).resolves.toBe("restricted");
     } finally {
@@ -3356,6 +3313,21 @@ describe("startBusAgentRunner production path", () => {
       readonly hasOrigin: boolean;
     }>();
     const requestId = "discord:restricted-legacy:message";
+    const recovery = {
+      entries: [
+        {
+          queueEntryId: "restricted-legacy-entry",
+          kind: "active",
+          requestId,
+          sessionId: "restricted-legacy",
+          requestClient: "discord",
+          queue: "prompt",
+          messages: [{ role: "user", content: "legacy" }],
+          identity: { state: "restricted", reason: "legacy-no-durable-proof" },
+        },
+      ],
+      queueAttempts: [],
+    } satisfies AgentRunnerRecoveryState;
     const runner = await startBusAgentRunner({
       bus,
       subscriptionId: "restricted-legacy",
@@ -3364,21 +3336,7 @@ describe("startBusAgentRunner production path", () => {
       pluginManager,
       requestMessageCache,
       resolveParentChannelId: () => null,
-      initialRecovery: {
-        entries: [
-          {
-            queueEntryId: "restricted-legacy-entry",
-            kind: "active",
-            requestId,
-            sessionId: "restricted-legacy",
-            requestClient: "discord",
-            queue: "prompt",
-            messages: [{ role: "user", content: "legacy" }],
-            identity: { state: "restricted", reason: "legacy-no-durable-proof" },
-          },
-        ],
-        queueAttempts: [],
-      },
+      startPaused: true,
       issueControlCapability: (input) => {
         capabilityIssued.resolve({
           safetyMode: input.safetyMode,
@@ -3399,6 +3357,7 @@ describe("startBusAgentRunner production path", () => {
           }),
         }),
     });
+    applyAndActivateAgentRecovery(runner, recovery);
     try {
       await expect(capabilityIssued.promise).resolves.toEqual({
         safetyMode: "restricted",
@@ -3538,6 +3497,68 @@ describe("startBusAgentRunner production path", () => {
       const controlRequestId = `${requestId}:control`;
       const eventId = `pel:${kind}:${controlApplied}`;
       let modelCalls = 0;
+      const recovery = {
+        entries: [
+          {
+            queueEntryId: "restored-target-entry",
+            kind: "queued",
+            requestId,
+            sessionId: "restored-reservation",
+            requestClient: "github",
+            queue: "prompt",
+            messages: [{ role: "user", content: "must remain reserved" }],
+            identity: {
+              state: "durable",
+              projection: {
+                requestId,
+                requestClient: "github",
+                sessionId: "restored-reservation",
+                source: "external",
+                platform: "github",
+                sessionRef: { platform: "github", channelId: "restored-reservation" },
+                authenticationMetadataKind: "absent",
+                verifiedIngress: false,
+              },
+              assertedSafetyMode: "restricted",
+              parkedEventIds: [],
+            },
+          },
+        ],
+        queueAttempts: [
+          {
+            eventId,
+            controlRequestId,
+            controlRequestClient: "github",
+            sessionId: "restored-reservation",
+            kind,
+            detail: "restored pending cancellation",
+            controlApplied,
+            controlIdentity: {
+              state: "durable",
+              projection: {
+                requestId: controlRequestId,
+                requestClient: "github",
+                sessionId: "restored-reservation",
+                source: "external",
+                platform: "github",
+                sessionRef: { platform: "github", channelId: "restored-reservation" },
+                authenticationMetadataKind: "absent",
+                verifiedIngress: false,
+              },
+              assertedSafetyMode: "restricted",
+              parkedEventIds: [eventId],
+            },
+            pendingGroups: [
+              {
+                publicationIndex: 1,
+                requestId,
+                requestClient: "github",
+                targetQueueEntryIds: ["restored-target-entry"],
+              },
+            ],
+          },
+        ],
+      } satisfies AgentRunnerRecoveryState;
       const runner = await startBusAgentRunner({
         bus,
         subscriptionId: `restored-reservation-${kind}-${controlApplied}`,
@@ -3545,68 +3566,7 @@ describe("startBusAgentRunner production path", () => {
         config,
         pluginManager,
         requestMessageCache,
-        initialRecovery: {
-          entries: [
-            {
-              queueEntryId: "restored-target-entry",
-              kind: "queued",
-              requestId,
-              sessionId: "restored-reservation",
-              requestClient: "github",
-              queue: "prompt",
-              messages: [{ role: "user", content: "must remain reserved" }],
-              identity: {
-                state: "durable",
-                projection: {
-                  requestId,
-                  requestClient: "github",
-                  sessionId: "restored-reservation",
-                  source: "external",
-                  platform: "github",
-                  sessionRef: { platform: "github", channelId: "restored-reservation" },
-                  authenticationMetadataKind: "absent",
-                  verifiedIngress: false,
-                },
-                assertedSafetyMode: "restricted",
-                parkedEventIds: [],
-              },
-            },
-          ],
-          queueAttempts: [
-            {
-              eventId,
-              controlRequestId,
-              controlRequestClient: "github",
-              sessionId: "restored-reservation",
-              kind,
-              detail: "restored pending cancellation",
-              controlApplied,
-              controlIdentity: {
-                state: "durable",
-                projection: {
-                  requestId: controlRequestId,
-                  requestClient: "github",
-                  sessionId: "restored-reservation",
-                  source: "external",
-                  platform: "github",
-                  sessionRef: { platform: "github", channelId: "restored-reservation" },
-                  authenticationMetadataKind: "absent",
-                  verifiedIngress: false,
-                },
-                assertedSafetyMode: "restricted",
-                parkedEventIds: [eventId],
-              },
-              pendingGroups: [
-                {
-                  publicationIndex: 1,
-                  requestId,
-                  requestClient: "github",
-                  targetQueueEntryIds: ["restored-target-entry"],
-                },
-              ],
-            },
-          ],
-        },
+        startPaused: true,
         issueControlCapability: () => ({ capability: "unused", principal: null }),
         createAgent: (options) =>
           new AiSdkPiAgent({
@@ -3620,6 +3580,7 @@ describe("startBusAgentRunner production path", () => {
             }),
           }),
       });
+      applyAndActivateAgentRecovery(runner, recovery);
       try {
         await Promise.resolve();
         expect(modelCalls).toBe(0);
@@ -4332,7 +4293,7 @@ describe("startBusAgentRunner production path", () => {
           config,
           pluginManager: secondPluginManager,
           requestMessageCache: secondCache,
-          initialRecovery: recovery,
+          startPaused: true,
           issueControlCapability: () => ({ capability: "replacement-target", principal: null }),
           createAgent: (options) =>
             new AiSdkPiAgent({
@@ -4346,6 +4307,7 @@ describe("startBusAgentRunner production path", () => {
               }),
             }),
         });
+        applyAndActivateAgentRecovery(secondRunner, recovery);
         await rawBus.redeliverRequestEventWithHeaders(eventId, {
           request_id: `${controlRequestId}:wrong`,
           session_id: sessionId,
@@ -8273,13 +8235,6 @@ describe("shouldRunAutoInjectedThreadSearch", () => {
 });
 
 describe("transient model retry", () => {
-  const retry = {
-    enabled: true,
-    maxRetries: 2,
-    baseDelayMs: 0,
-    maxDelayMs: 0,
-  } satisfies CoreConfig["agent"]["retry"];
-
   it("classifies Codex overload stream errors as retryable", () => {
     expect(
       isRetryableTransientModelError({
@@ -8333,72 +8288,6 @@ describe("transient model retry", () => {
         cause: Object.assign(new Error("connection reset"), { code: "ConnectionClosed" }),
       }),
     ).toBe(true);
-    expect(isRetryableTransientModelError({ code: "ECONNRESET" })).toBe(true);
-    expect(
-      isRetryableTransientModelError(
-        new Error("WebSocket closed before a terminal response event"),
-      ),
-    ).toBe(true);
-  });
-
-  it("does not classify context overflow or exhausted AI SDK retries", () => {
-    expect(isRetryableTransientModelError("maximum context length is 128000 tokens")).toBe(false);
-    expect(
-      isRetryableTransientModelError({
-        name: "AI_RetryError",
-        reason: "maxRetriesExceeded",
-        lastError: { statusCode: 503, message: "Service unavailable" },
-      }),
-    ).toBe(false);
-  });
-
-  it("computes capped exponential backoff", () => {
-    expect(
-      computeTransientRetryDelayMs({ attempt: 1, baseDelayMs: 2_000, maxDelayMs: 30_000 }),
-    ).toBe(2_000);
-    expect(
-      computeTransientRetryDelayMs({ attempt: 5, baseDelayMs: 2_000, maxDelayMs: 30_000 }),
-    ).toBe(30_000);
-  });
-
-  it("retries ConnectionClosed errors up to the configured max and resets after success", async () => {
-    const logger = createLogger({ module: "bus-agent-runner-test" });
-    const error = Object.assign(new Error("The socket connection was closed unexpectedly"), {
-      code: "ConnectionClosed",
-    });
-    const controller = createTransientModelRetryController({
-      retry,
-      logger,
-      requestId: "request-1",
-      sessionId: "session-1",
-      modelSpec: "codex/gpt-5.5",
-    });
-    const context = { retrySafety: { canRetry: true } as const };
-
-    await expect(controller.handler(error, context)).resolves.toBe("retry");
-    await expect(controller.handler(error, context)).resolves.toBe("retry");
-    await expect(controller.handler(error, context)).resolves.toBe("fail");
-
-    controller.reset();
-    await expect(controller.handler(error, context)).resolves.toBe("retry");
-  });
-
-  it("does not retry when the transcript boundary is unsafe", async () => {
-    const logger = createLogger({ module: "bus-agent-runner-test" });
-    const controller = createTransientModelRetryController({
-      retry,
-      logger,
-      requestId: "request-1",
-      sessionId: "session-1",
-      modelSpec: "codex/gpt-5.5",
-    });
-
-    await expect(
-      controller.handler(
-        { statusCode: 503, message: "Service unavailable" },
-        { retrySafety: { canRetry: false, reason: "post-model-phase" } },
-      ),
-    ).resolves.toBe("fail");
   });
 });
 

@@ -905,25 +905,10 @@ export async function setupCoreEventBusResources(params: {
   return { kind: "panic", panic: cause };
 }
 
-export function adaptCoreEventBusSetupResultToStartup(
-  result: ResultType<CoreEventBusResources, CoreEventBusSetupError>,
-): CoreEventBusResources {
-  if (result.status === "ok") return result.value;
-  throw new Error(result.error.message);
-}
-
 export function adaptCoreEventBusCleanupResultToHost(
   result: ResultType<void, CoreEventBusCleanupFailed>,
 ): void {
   if (result.status === "error") throw new Error(result.error.message);
-}
-
-export function adaptCustomCommandInitializationResultToStartup(
-  result: ResultType<void, CustomCommandDiscoveryError>,
-  manager: CustomCommandManager,
-): CustomCommandManager {
-  if (result.status === "ok") return manager;
-  throw new Error(result.error.message);
 }
 
 export type CoreRuntimeCleanupFailure = {

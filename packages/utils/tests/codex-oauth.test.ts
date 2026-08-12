@@ -8,7 +8,6 @@ import { Panic } from "better-result";
 import {
   clearCodexTokens,
   codexTokensCodecCases,
-  codexTokensLoggedOutCase,
   decodeCodexTokens,
   exchangeCodeForTokens,
   parseCodexOAuthCallback,
@@ -113,7 +112,7 @@ describe("Codex OAuth login", () => {
     expect(corrupt.status).toBe("error");
     if (corrupt.status === "error") expect(corrupt.error._tag).toBe("CodexTokensCorrupt");
 
-    const loggedOut = decodeCodexTokens(codexTokensLoggedOutCase.input);
+    const loggedOut = decodeCodexTokens({ serialized: "{}", storagePath: "/tmp/codex.json" });
     expect(loggedOut.status).toBe("ok");
     if (loggedOut.status === "ok") {
       expect(loggedOut.value).toEqual({ value: null, provenance: "current" });

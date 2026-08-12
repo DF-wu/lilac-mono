@@ -570,11 +570,3 @@ export function canTransitionWorkflowTrigger(
 ): boolean {
   return from === to || includesState(TRIGGER_TRANSITIONS[from], to);
 }
-
-export const WORKFLOW_TERMINAL_RUN_STATES = [
-  "succeeded",
-  "failed",
-  "cancelled",
-] as const satisfies readonly WorkflowRunState[];
-
-export const WORKFLOW_REVISION_IDENTITY_VERSION = 1;

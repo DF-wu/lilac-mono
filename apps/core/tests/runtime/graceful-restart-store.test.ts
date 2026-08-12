@@ -386,7 +386,7 @@ describe("graceful restart persisted codec", () => {
     }
   });
 
-  it("exports and executes the complete six-case fixture catalog", () => {
+  it("exports, executes, and classifies the complete six-case fixture catalog", () => {
     expect(Object.keys(gracefulRestartSnapshotCodecCases).sort()).toEqual([
       "corrupt-fields",
       "current",
@@ -396,9 +396,21 @@ describe("graceful restart persisted codec", () => {
       "unsupported-version",
     ]);
 
-    for (const fixture of Object.values(gracefulRestartSnapshotCodecCases)) {
+    for (const [name, fixture] of Object.entries(gracefulRestartSnapshotCodecCases)) {
       const decoded = decodeGracefulRestartSnapshot(fixture.input);
       expect(decoded.status).toBe(fixture.outcome);
+      if (decoded.status === "ok") {
+        if (!("provenance" in fixture)) throw new Error(`Missing provenance for ${name}`);
+        expect(decoded.value.provenance).toBe(fixture.provenance);
+      } else {
+        const expectedError = {
+          "corrupt-fields": CorruptPersistedFields,
+          "malformed-serialization": MalformedSerialization,
+          "unsupported-version": UnsupportedVersion,
+        }[name];
+        if (!expectedError) throw new Error(`Missing error classification for ${name}`);
+        expect(decoded.error).toBeInstanceOf(expectedError);
+      }
     }
   });
 
@@ -1248,30 +1260,6 @@ describe("graceful restart persisted codec", () => {
     if (decoded.status === "error") expect(decoded.error).toBeInstanceOf(CorruptPersistedFields);
   });
 
-  it("distinguishes absent, malformed serialization, and corrupt nested fields", () => {
-    const absent = decodeGracefulRestartSnapshot(null);
-    expect(absent.status).toBe("ok");
-    if (absent.status === "ok") {
-      expect(absent.value).toEqual({ value: null, provenance: "missing-defaulted" });
-    }
-
-    const malformed = decodeGracefulRestartSnapshot(
-      gracefulRestartSnapshotCodecCases["malformed-serialization"].input,
-    );
-    expect(malformed.status).toBe("error");
-    if (malformed.status === "error") {
-      expect(malformed.error).toBeInstanceOf(MalformedSerialization);
-    }
-
-    const corrupt = decodeGracefulRestartSnapshot(
-      gracefulRestartSnapshotCodecCases["corrupt-fields"].input,
-    );
-    expect(corrupt.status).toBe("error");
-    if (corrupt.status === "error") {
-      expect(corrupt.error).toBeInstanceOf(CorruptPersistedFields);
-    }
-  });
-
   it("does not include persisted content in corruption diagnostics", () => {
     const secret = "SECRET_SENTINEL_DO_NOT_LOG";
     const decoded = decodeGracefulRestartSnapshot({
@@ -1755,47 +1743,44 @@ describe("SqliteGracefulRestartStore", () => {
     }
   });
 
-  it.each(["workflow", "heartbeat", "post-admission service"])(
-    "retains the exact snapshot row when %s startup fails after paused apply",
-    async () => {
-      const { store } = await makeStore();
-      const snapshot = buildSnapshot({ createdAt: 1_000 });
-      let paused = false;
-      const plan: SurfaceRecoveryPlan = {
-        snapshot,
-        attempts: [],
-        agentAttempt: {
-          apply: () => {
-            paused = true;
-            return Result.ok(undefined);
-          },
-          rollback: () => {
-            paused = false;
-          },
-          activate: () => undefined,
+  it("retains the exact snapshot row when startup fails after paused apply", async () => {
+    const { store } = await makeStore();
+    const snapshot = buildSnapshot({ createdAt: 1_000 });
+    let paused = false;
+    const plan: SurfaceRecoveryPlan = {
+      snapshot,
+      attempts: [],
+      agentAttempt: {
+        apply: () => {
+          paused = true;
+          return Result.ok(undefined);
         },
-      };
-      try {
-        expect(store.saveCompletedSnapshot(snapshot).status).toBe("ok");
-        const before = store.readCompletedSnapshot(1_000);
-        if (before.status !== "ok" || before.value.state !== "loaded") {
-          throw new Error("Expected startup recovery row");
-        }
-        expect((await applySurfaceRecovery(plan)).status).toBe("ok");
-        const ownership = createPausedSurfaceRecoveryOwnership(plan);
-        await ownership.rollback();
-        expect(paused).toBe(false);
-
-        const retained = store.readCompletedSnapshot(1_000);
-        expect(retained.status).toBe("ok");
-        if (retained.status === "ok" && retained.value.state === "loaded") {
-          expect(retained.value.rowToken).toEqual(before.value.rowToken);
-        } else {
-          throw new Error("Expected exact retained startup recovery row");
-        }
-      } finally {
-        store.close();
+        rollback: () => {
+          paused = false;
+        },
+        activate: () => undefined,
+      },
+    };
+    try {
+      expect(store.saveCompletedSnapshot(snapshot).status).toBe("ok");
+      const before = store.readCompletedSnapshot(1_000);
+      if (before.status !== "ok" || before.value.state !== "loaded") {
+        throw new Error("Expected startup recovery row");
       }
-    },
-  );
+      expect((await applySurfaceRecovery(plan)).status).toBe("ok");
+      const ownership = createPausedSurfaceRecoveryOwnership(plan);
+      await ownership.rollback();
+      expect(paused).toBe(false);
+
+      const retained = store.readCompletedSnapshot(1_000);
+      expect(retained.status).toBe("ok");
+      if (retained.status === "ok" && retained.value.state === "loaded") {
+        expect(retained.value.rowToken).toEqual(before.value.rowToken);
+      } else {
+        throw new Error("Expected exact retained startup recovery row");
+      }
+    } finally {
+      store.close();
+    }
+  });
 });

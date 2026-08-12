@@ -4,16 +4,14 @@ import { Panic } from "better-result";
 import { MINI_LILAC_TOOL_NAMES } from "@stanley2058/mini-lilac-client";
 
 import {
-  KNOWN_TOOL_NAMES,
   KnownToolObservationMalformed,
   decodeKnownToolObservation,
-  knownToolCodecRegistry,
   projectToolObservation,
-  safeToolPayloadPreview,
-  type KnownToolName,
   type ToolObservation,
   type ToolProjection,
 } from "./tool-observation-projection";
+
+type KnownToolName = (typeof MINI_LILAC_TOOL_NAMES)[number];
 
 function success(toolName: string, input: unknown, output: unknown = {}): ToolObservation {
   return { toolName, lifecycle: "success", input, output };
@@ -31,27 +29,6 @@ function editSuccess(replacementsMade = 1) {
 }
 
 describe("tool observation catalog", () => {
-  it("keeps the exact 14-name catalog and an exhaustive codec registry", () => {
-    expect(KNOWN_TOOL_NAMES).toEqual([
-      "bash",
-      "read_file",
-      "glob",
-      "grep",
-      "fuzzy_search",
-      "edit_file",
-      "apply_patch",
-      "subagent_delegate",
-      "subagent_result",
-      "batch",
-      "skill",
-      "todowrite",
-      "webfetch",
-      "websearch",
-    ]);
-    expect(Object.keys(knownToolCodecRegistry)).toEqual([...KNOWN_TOOL_NAMES]);
-    expect(KNOWN_TOOL_NAMES).toBe(MINI_LILAC_TOOL_NAMES);
-  });
-
   it("projects every catalog member into its deliberate closed variant", () => {
     const fixtures = [
       ["bash", success("bash", { command: "pwd" }, "/workspace"), "bash", "$ pwd"],
@@ -148,7 +125,7 @@ describe("tool observation catalog", () => {
       string,
     ][];
 
-    expect(fixtures.map(([toolName]) => toolName)).toEqual([...KNOWN_TOOL_NAMES]);
+    expect(fixtures.map(([toolName]) => toolName)).toEqual([...MINI_LILAC_TOOL_NAMES]);
     for (const [toolName, observation, kind, summary] of fixtures) {
       const projection = projectToolObservation(observation);
       expect(projection.toolName).toBe(toolName);
@@ -165,7 +142,7 @@ describe("tool observation catalog", () => {
 
 describe("known tool decoding", () => {
   it("turns hostile input and output reflection into owned malformed errors", () => {
-    const revokedInputs = KNOWN_TOOL_NAMES.map((toolName) => {
+    const revokedInputs = MINI_LILAC_TOOL_NAMES.map((toolName) => {
       const revocable = Proxy.revocable({}, {});
       revocable.revoke();
       return { toolName, lifecycle: "active", input: revocable.proxy } satisfies ToolObservation;
@@ -755,38 +732,5 @@ describe("safe fallbacks", () => {
     expect(projection.toolName.length).toBeLessThanOrEqual(80);
     expect(projection).toMatchObject({ payloadPreview: "<object>" });
     expect(reads).toBe(0);
-  });
-
-  it("provides total bounded previews for every JavaScript value category", () => {
-    const throwingFunction = () => {
-      throw new Error("not called");
-    };
-    expect([
-      safeToolPayloadPreview("  a\n" + "x".repeat(200), 20),
-      safeToolPayloadPreview(42),
-      safeToolPayloadPreview(Number.NaN),
-      safeToolPayloadPreview(12n),
-      safeToolPayloadPreview(true),
-      safeToolPayloadPreview(undefined),
-      safeToolPayloadPreview(Symbol("secret")),
-      safeToolPayloadPreview(throwingFunction),
-      safeToolPayloadPreview(null),
-      safeToolPayloadPreview({ secret: true }),
-      safeToolPayloadPreview("secret", 0),
-      safeToolPayloadPreview("x".repeat(1_000), 1_000),
-    ]).toEqual([
-      "a xxxxxxxxxxxxxxx...",
-      "42",
-      "NaN",
-      "12",
-      "true",
-      "undefined",
-      "<symbol>",
-      "<function>",
-      "null",
-      "<object>",
-      "",
-      `${"x".repeat(253)}...`,
-    ]);
   });
 });

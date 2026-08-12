@@ -8,10 +8,10 @@ import { isRecord } from "@stanley2058/lilac-utils";
 
 import { rethrowAgentPanic, type OpaqueAgentValue } from "./failure-adapters";
 
-export const CANONICAL_HEAD_HASH_VERSION = 1 as const;
-export const CANONICAL_HEAD_HASH_DOMAIN = "lilac:canonical-head:v1" as const;
-export const EXECUTION_SCOPE_HASH_VERSION = 1 as const;
-export const EXECUTION_SCOPE_HASH_DOMAIN = "lilac:execution-scope:v1" as const;
+const CANONICAL_HEAD_HASH_VERSION = 1 as const;
+const CANONICAL_HEAD_HASH_DOMAIN = "lilac:canonical-head:v1" as const;
+const EXECUTION_SCOPE_HASH_VERSION = 1 as const;
+const EXECUTION_SCOPE_HASH_DOMAIN = "lilac:execution-scope:v1" as const;
 
 export const historyProviderFamilySchema = z.enum(["claude-code", "ai-sdk"]);
 export type HistoryProviderFamily = z.infer<typeof historyProviderFamilySchema>;

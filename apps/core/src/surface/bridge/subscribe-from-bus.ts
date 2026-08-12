@@ -2177,7 +2177,7 @@ export async function bridgeBusToAdapter<P extends RegisteredSurfacePlatform>(pa
         );
       }
       for (const snapshot of snapshots) {
-        requireSurfaceRelaySnapshot(platform, snapshot, "relay.restoreRelays");
+        requireSurfaceRelaySnapshot(platform, snapshot, "relay.prepareRestoreRelays");
       }
       const decodeRecoveryRefs = (
         snapshot: BusToAdapterRelaySnapshot,
@@ -2357,14 +2357,5 @@ export async function bridgeBusToAdapter<P extends RegisteredSurfacePlatform>(pa
       );
     },
   };
-  return {
-    ...handle,
-    restoreRelays: async (snapshots: readonly BusToAdapterRelaySnapshot[]) => {
-      const prepared = handle.prepareRestoreRelays(snapshots);
-      if (prepared.status === "error") throw prepared.error;
-      const applied = await prepared.value.apply();
-      if (applied.status === "error") throw applied.error;
-      prepared.value.activate();
-    },
-  };
+  return handle;
 }

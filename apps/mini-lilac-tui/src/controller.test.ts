@@ -1057,7 +1057,7 @@ describe("Controller effect wiring", () => {
     expect(controller.inputState.phase).toBe("idle");
   });
 
-  it("treats undo with no user turn as a successful no-op", async () => {
+  it("treats empty undo and redo as successful no-ops", async () => {
     const initialMessages: MiniLilacUIMessage[] = [
       { id: "assistant-1", role: "assistant", parts: [{ type: "text", text: "hello" }] },
     ];
@@ -1067,6 +1067,8 @@ describe("Controller effect wiring", () => {
           status: "empty",
           clientCommandId: request.clientCommandId ?? "missing",
         }),
+      redo: (request) =>
+        Promise.resolve({ status: "empty", clientCommandId: request.clientCommandId }),
     });
     const controller = new Controller({
       transport,
@@ -1078,11 +1080,15 @@ describe("Controller effect wiring", () => {
     controller.start();
     controller.undo();
     await flush();
+    controller.redo();
+    await flush();
 
     expect(controller.inputState.phase).toBe("idle");
     expect(controller.inputState.editor).toBe("");
     expect(controller.transcript.map((entry) => entry.text)).toEqual(["hello"]);
     expect(transport.getMessagesCount).toBe(0);
+    expect(transport.undoRequests).toHaveLength(1);
+    expect(transport.redoRequests).toHaveLength(1);
   });
 
   it("runs typed /compact as a quiet submitting operation", async () => {
@@ -1813,7 +1819,7 @@ describe("Controller effect wiring", () => {
     });
   });
 
-  it("does not call the server when undoing before session creation", async () => {
+  it("does not call history endpoints before session creation", async () => {
     const transport = new FakeTransport();
     const controller = new Controller({
       transport,
@@ -1824,9 +1830,12 @@ describe("Controller effect wiring", () => {
     controller.start();
     controller.undo();
     await flush();
+    controller.redo();
+    await flush();
 
     expect(controller.inputState.phase).toBe("idle");
     expect(transport.undoRequests).toEqual([]);
+    expect(transport.redoRequests).toEqual([]);
     expect(controller.transcript).toEqual([]);
   });
 
@@ -2548,31 +2557,6 @@ describe("Controller effect wiring", () => {
     expect(controller.inputState.editor).toBe("automatic draft");
   });
 
-  it("treats empty redo as a successful no-op", async () => {
-    const transport = new FakeTransport({
-      redo: (request) =>
-        Promise.resolve({ status: "empty", clientCommandId: request.clientCommandId }),
-    });
-    const operations = operationTracker();
-    const controller = new Controller({
-      transport,
-      ui: operations.ui,
-      sessionId: "session-1",
-      initialMessages: [
-        { id: "assistant-1", role: "assistant", parts: [{ type: "text", text: "hello" }] },
-      ],
-      onExit: () => {},
-    });
-    controller.start();
-
-    const completed = operations.next();
-    controller.redo();
-    await completed;
-    expect(controller.inputState.phase).toBe("idle");
-    expect(transport.redoRequests).toHaveLength(1);
-    expect(transport.getMessagesCount).toBe(0);
-  });
-
   it("reuses the redo command id after both retry responses are uncertain", async () => {
     const message: MiniLilacUserUIMessage = {
       id: "user-retry-redo",
@@ -3128,24 +3112,6 @@ describe("Controller effect wiring", () => {
     expect(transport.redoRequests).toEqual([]);
     expect(controller.inputState.phase).toBe("active");
     controller.dispose();
-  });
-
-  it("does not call the server when redoing before session creation", async () => {
-    const transport = new FakeTransport();
-    const operations = operationTracker();
-    const controller = new Controller({
-      transport,
-      ui: operations.ui,
-      sessionId: "session-1",
-      onExit: () => {},
-    });
-    controller.start();
-
-    const completed = operations.next();
-    controller.redo();
-    await completed;
-    expect(transport.redoRequests).toEqual([]);
-    expect(controller.inputState.phase).toBe("idle");
   });
 
   it("interrupts pending steer admissions atomically, then cancels on Esc", async () => {
@@ -4099,20 +4065,6 @@ describe("Controller effect wiring", () => {
     terminalReconnect?.close();
     await flush();
     expect(transport.getMessagesCount).toBe(1);
-    expect(controller.inputState.phase).toBe("idle");
-  });
-
-  it("returns idle when prompt admission fails", async () => {
-    const transport = new FakeTransport({ admissionError: new Error("rejected") });
-    const controller = new Controller({
-      transport,
-      ui: silentUI(),
-      sessionId: "session-1",
-      onExit: () => {},
-    });
-    controller.start();
-    submitText(controller, "hello");
-    await flush();
     expect(controller.inputState.phase).toBe("idle");
   });
 

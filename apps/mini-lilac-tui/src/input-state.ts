@@ -126,16 +126,6 @@ export function initialInputState(): InputState {
   };
 }
 
-/** An editor is "dirty" when it holds submittable (non-whitespace) content. */
-export function isEditorDirty(state: InputState): boolean {
-  return state.editor.trim().length > 0 || state.files.length > 0;
-}
-
-/** True when there is any queued or in-flight steering that could be interrupted. */
-export function hasSteering(state: InputState): boolean {
-  return state.queuedSteeringCount > 0;
-}
-
 export function reduceInput(state: InputState, event: InputEvent): InputTransition {
   switch (event.type) {
     case "set-editor":

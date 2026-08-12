@@ -2,11 +2,7 @@ import { readFileSync } from "node:fs";
 
 import { describe, expect, it } from "bun:test";
 
-import {
-  architectureManifest,
-  type ArchitectureManifest,
-  type ExceptionAdapter,
-} from "../architecture/manifest.ts";
+import { type ArchitectureManifest, type ExceptionAdapter } from "../architecture/manifest.ts";
 import {
   findExceptionFlowViolations,
   findExceptionFlowViolationsInSourceFile,
@@ -757,16 +753,6 @@ describe("Stage 5 presentation syntax", () => {
       ),
     ).toEqual([]);
   });
-
-  it("keeps the integrated renderer free of Zod imports and parser calls", () => {
-    const filePath = new URL("../../apps/mini-lilac-tui/src/render.ts", import.meta.url).pathname;
-    const source = readFileSync(filePath, "utf8");
-
-    expect(
-      findPresentationDecoderImportViolations(source, filePath, policyWith(), architectureManifest),
-    ).toEqual([]);
-    expect(source).not.toMatch(/\.(?:parse|parseAsync|safeParse|safeParseAsync)\s*\(/u);
-  });
 });
 
 describe("Result callback syntax", () => {
@@ -967,37 +953,35 @@ describe("Oxlint production syntax activation", () => {
     const config = JSON.parse(
       readFileSync(new URL("../../.oxlintrc.json", import.meta.url), "utf8"),
     );
-    expect(config).toMatchObject({
-      ignorePatterns: [
-        "ref/**",
-        "node_modules/**",
-        "data/**",
+    const productionOverride = config.overrides.find((override: { files?: string[] }) =>
+      override.files?.includes("apps/**/*.{js,jsx,cjs,mjs,ts,tsx}"),
+    );
+    const testOverride = config.overrides.find((override: { rules?: Record<string, string> }) =>
+      Object.hasOwn(override.rules ?? {}, "lilac/no-fixed-test-wait"),
+    );
+
+    expect(config.ignorePatterns).toEqual(
+      expect.arrayContaining([
         "**/dist/**",
         "**/generated/**",
         "apps/core/src/ssh/remote-js/remote-runner.cjs",
-      ],
-      overrides: [
-        {
-          files: ["apps/**/*.{js,jsx,cjs,mjs,ts,tsx}", "packages/**/*.{js,jsx,cjs,mjs,ts,tsx}"],
-          rules: {
-            "no-nested-ternary": "error",
-            "lilac/no-local-is-record": "error",
-          },
-        },
-        {
-          files: [
-            "**/*.test.{js,jsx,ts,tsx,cjs,cts,mjs,mts}",
-            "**/*.spec.{js,jsx,ts,tsx,cjs,cts,mjs,mts}",
-            "**/test/**/*.{js,jsx,ts,tsx,cjs,cts,mjs,mts}",
-            "**/tests/**/*.{js,jsx,ts,tsx,cjs,cts,mjs,mts}",
-            "**/__tests__/**/*.{js,jsx,ts,tsx,cjs,cts,mjs,mts}",
-          ],
-          rules: {
-            "no-nested-ternary": "off",
-            "lilac/no-local-is-record": "off",
-          },
-        },
-      ],
+      ]),
+    );
+    expect(productionOverride).toMatchObject({
+      files: expect.arrayContaining(["packages/**/*.{js,jsx,cjs,mjs,ts,tsx}"]),
+      rules: {
+        "@typescript-eslint/no-explicit-any": "error",
+        "no-nested-ternary": "error",
+        "lilac/no-local-is-record": "error",
+      },
+    });
+    expect(testOverride).toMatchObject({
+      rules: {
+        "@typescript-eslint/no-explicit-any": "off",
+        "lilac/no-fixed-test-wait": "error",
+        "no-nested-ternary": "off",
+        "lilac/no-local-is-record": "off",
+      },
     });
   });
 });

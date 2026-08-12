@@ -18,7 +18,7 @@ import type {
   RenderedUIMessageChunk,
 } from "./ui-message-chunk-projection";
 
-export type TranscriptKind =
+type TranscriptKind =
   | "user"
   | "assistant"
   | "reasoning"
@@ -77,7 +77,7 @@ export interface ShellTranscript {
   readonly output?: string;
 }
 
-export interface ShellTranscriptPreview {
+interface ShellTranscriptPreview {
   readonly command: string;
   readonly output?: string;
 }
@@ -232,7 +232,7 @@ function formatCompactionDuration(ms: number | undefined): string | undefined {
   return `${Math.floor(seconds / 60)}m${String(seconds % 60).padStart(2, "0")}s`;
 }
 
-export function compactionHeadline(event: MiniLilacCompactionEvent): string {
+function compactionHeadline(event: MiniLilacCompactionEvent): string {
   const elapsed = formatCompactionDuration(event.durationMs ?? event.elapsedMs);
   switch (event.phase) {
     case "started":
@@ -335,13 +335,13 @@ export function editTranscriptAction(edit: EditTranscript): "Patch" | "Edit" {
   return edit.operations.every((operation) => operation.action === first) ? first : "Edit";
 }
 
-export function editOperationText(edit: EditOperation): string {
+function editOperationText(edit: EditOperation): string {
   const additions = edit.added > 0 ? ` +${edit.added}` : "";
   const removals = edit.removed > 0 ? ` -${edit.removed}` : "";
   return `${edit.action} ${edit.path}${additions}${removals}${edit.detail ?? ""}`;
 }
 
-export function editTranscriptText(edit: EditTranscript): string {
+function editTranscriptText(edit: EditTranscript): string {
   if (edit.operations.length === 1) {
     const operation = edit.operations[0];
     return operation === undefined ? "Edit" : editOperationText(operation);
@@ -395,7 +395,7 @@ function groupedEditTone(tone: TranscriptTone): "normal" | "muted" | "warning" |
   }
 }
 
-export function shellTranscriptText(
+function shellTranscriptText(
   shell: ShellTranscript,
   expanded = false,
   lineLimit = DEFAULT_SHELL_OUTPUT_LINES,

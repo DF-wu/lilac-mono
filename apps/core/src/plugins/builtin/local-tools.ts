@@ -410,15 +410,12 @@ export const BUILTIN_LEVEL1_TOOLS = {
       if (!runtime.bus) {
         return signalBuiltinToolHostError("subagent_delegate requires bus");
       }
-      const onActivity = requestContext ? getAgentActivityHandler(requestContext) : undefined;
       return subagentTools({
-        bus: runtime.bus,
         idleTimeoutMs: subagentConfig.idleTimeoutMs,
         maxDepth: subagentConfig.maxDepth,
         modelPresets: runtime.config?.models.def,
         delegatePromptOverlay: runtime.config?.agent.subagents.delegatePromptOverlay,
         onDelegate: requestContext ? getDelegateHandler(requestContext) : undefined,
-        onActivity: onActivity ? () => onActivity("subagent") : undefined,
       }).subagent_delegate;
     },
   }),

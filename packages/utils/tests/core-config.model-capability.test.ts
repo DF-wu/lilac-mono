@@ -1,35 +1,9 @@
 import { describe, expect, it } from "bun:test";
 
-import {
-  coreConfigInputSchemaV2,
-  coreConfigSchema,
-  parseCoreConfigV1ToUniversal,
-} from "../core-config";
+import { coreConfigInputSchemaV2, coreConfigSchema } from "../core-config";
 
 describe("coreConfigSchema models.capability", () => {
   it("defaults conversation thread summarization, embedding, and auto injection config", () => {
-    const v1 = parseCoreConfigV1ToUniversal({});
-    expect(v1.conversation.thread.summarization).toEqual({
-      enabled: false,
-      model: "fast",
-      concurrency: 1,
-      batchSize: 32,
-      includePromptContext: false,
-    });
-    expect(v1.conversation.thread.embedding).toEqual({
-      enabled: false,
-      model: "openai/text-embedding-3-small",
-    });
-    expect(v1.conversation.thread.autoInject).toEqual({
-      enabled: false,
-      minTextUnits: 80,
-      followUpMinTextUnits: 110,
-      limit: 3,
-      minScore: 0.1,
-      mode: "hybrid",
-      filterCurrentParticipants: false,
-    });
-
     const v2 = coreConfigInputSchemaV2.parse({ configVersion: 2 });
     expect(v2.conversation.thread.summarization).toEqual({
       enabled: false,

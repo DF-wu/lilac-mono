@@ -318,7 +318,7 @@ function ToolDisclosure(props: {
   );
 }
 
-export function formatRunDuration(durationMs: number): string {
+function formatRunDuration(durationMs: number): string {
   const totalSeconds = Math.floor(Math.max(0, durationMs) / 1_000);
   const hours = Math.floor(totalSeconds / 3_600);
   const minutes = Math.floor((totalSeconds % 3_600) / 60);

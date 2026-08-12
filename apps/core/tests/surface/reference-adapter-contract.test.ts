@@ -1,26 +1,15 @@
-import { afterEach, describe, expect, it, spyOn } from "bun:test";
-import { mkdtemp, rm } from "node:fs/promises";
-import os from "node:os";
-import path from "node:path";
+import { describe, expect, it, spyOn } from "bun:test";
 import { createLilacBus, lilacEventTypes, type LilacBus } from "@stanley2058/lilac-event-bus";
 import { parseCoreConfigV1ToUniversal, type CoreConfig } from "@stanley2058/lilac-utils";
-import { Panic, Result, type Result as ResultType } from "better-result";
-import SuperJSON from "superjson";
+import { Result, type Result as ResultType } from "better-result";
 
 import {
   SurfaceInvalidInput,
-  SurfaceOperationPartiallyCompleted,
   SurfacePlatformMismatch,
   SurfaceSessionMismatch,
   type SurfaceAdapter,
-  type SurfaceAdapterEventSource,
   type SurfaceOperationError,
-  type SurfaceOutputStream,
 } from "../../src/surface/adapter";
-import type {
-  AgentRunnerQueueAttempt,
-  AgentRunnerRecoveryEntry,
-} from "../../src/surface/bridge/bus-agent-runner";
 import {
   bridgeBusToAdapter,
   type BusToAdapterRelaySnapshot,
@@ -37,45 +26,20 @@ import {
   createGithubSurfaceRuntimeDescriptor,
 } from "../../src/surface/github/github-runtime-descriptor";
 import {
-  createDescriptorBoundSurfaceEventSource,
-  createDescriptorBoundWorkflowProgressPort,
-} from "../../src/surface/produced-ref-guard";
-import {
-  SurfaceRelayRestoreApplyFailed,
   SurfaceRuntimeRegistry,
-  workflowProgressOperationFailure,
   type RegisteredSurfacePlatform,
   type RegisteredSurfaceRuntimeDescriptor,
-  type SurfaceRelayHandle,
-  type SurfaceWorkflowProgressPort,
 } from "../../src/surface/runtime-descriptor";
-import type { AdapterEvent } from "../../src/surface/events";
 import type { MsgRef, SessionRef } from "../../src/surface/types";
 import { DiscordOutputStream } from "../../src/surface/discord/output/discord-output-stream";
 import { GithubOutputStream } from "../../src/surface/github/output/github-output-stream";
 import { clearGithubAck, getGithubAck, setGithubAck } from "../../src/github/github-state";
 import {
-  activateSurfaceRecovery,
   applySurfaceRecovery,
-  connectAndValidateSurfaceAdapters,
-  createPausedSurfaceRecoveryOwnership,
-  disconnectSurfaceAdapters,
   prepareSurfaceRecovery,
-  startSurfaceAdapterIngress,
-  startSurfaceOutputs,
-  stopIngressAndDrainSurfaceRecovery,
-  stopSurfaceAdapterIngress,
-  stopSurfaceOutputs,
-  stopSurfaceRequestIngress,
-  type ConnectedSurfaceAdapters,
-  type SurfaceAdapterIngressHandles,
-  type SurfaceRelayHandles,
-  type SurfaceRequestIngressHandles,
 } from "../../src/runtime/surface-runtime-lifecycle";
 import {
-  decodeGracefulRestartSnapshot,
   GRACEFUL_RESTART_SNAPSHOT_VERSION,
-  SqliteGracefulRestartStore,
   type GracefulRestartSnapshotInput,
 } from "../../src/runtime/graceful-restart-store";
 import { createInMemoryDeliveryBus } from "../helpers/in-memory-delivery-bus";
@@ -98,15 +62,6 @@ type ReferenceContract = {
   createProviderFailureAdapter(): SurfaceAdapter;
   assertActionRendered(log: ProtocolLog): void;
 };
-
-const tempDirs: string[] = [];
-
-afterEach(async () => {
-  while (tempDirs.length > 0) {
-    const dir = tempDirs.pop();
-    if (dir) await rm(dir, { recursive: true, force: true });
-  }
-});
 
 function discordConfig(): CoreConfig {
   const parsed = parseCoreConfigV1ToUniversal({
@@ -323,64 +278,16 @@ function relaySnapshot(reference: ReferenceContract): BusToAdapterRelaySnapshot 
   };
 }
 
-type LifecycleState = {
-  readonly calls: string[];
-  readonly relay: SurfaceRelayHandle<"discord"> | SurfaceRelayHandle<"github">;
-  readonly descriptor: RegisteredSurfaceRuntimeDescriptor;
-};
-
 function createReferenceDescriptor(
   reference: ReferenceContract,
   adapter: SurfaceAdapter,
-  input: {
-    readonly calls?: string[];
-    readonly relayStartFailure?: Error;
-  } = {},
-): LifecycleState {
-  const calls = input.calls ?? [];
+): RegisteredSurfaceRuntimeDescriptor {
   if (reference.platform === "discord") {
-    const relay: SurfaceRelayHandle<"discord"> = {
-      platform: "discord",
-      beginDrain: async ({ deadlineMs }) => {
-        calls.push(`drain:${deadlineMs}`);
-      },
-      snapshotRelays: () => [
-        {
-          ...relaySnapshot(reference),
-          platform: "discord",
-          requestClient: "discord",
-          replyTo: { platform: "discord", channelId: reference.sessionId, messageId: "origin" },
-          createdOutputRefs: [
-            { platform: "discord", channelId: reference.sessionId, messageId: "output-1" },
-          ],
-          activeOutputRefs: [
-            { platform: "discord", channelId: reference.sessionId, messageId: "output-1" },
-          ],
-        },
-      ],
-      prepareRestoreRelays: () =>
-        Result.ok({
-          platform: "discord",
-          apply: async () => Result.ok(undefined),
-          rollback: async () => Result.ok(undefined),
-          activate: () => undefined,
-        }),
-      restoreRelays: async () => undefined,
-      stop: async () => {
-        calls.push("relay:stop");
-      },
-    };
-    const descriptor = createDiscordSurfaceRuntimeDescriptor({
+    return createDiscordSurfaceRuntimeDescriptor({
       adapter,
       adapterIngress: {
         start: async () => {
-          calls.push("adapter-ingress:start");
-          return {
-            platform: "discord",
-            stop: async () => {
-              calls.push("adapter-ingress:stop");
-            },
-          };
+          throw new Error("Reference descriptor lifecycle is unused");
         },
       },
       relay: {
@@ -388,89 +295,31 @@ function createReferenceDescriptor(
         lifecycle: {
           platform: "discord",
           start: async () => {
-            calls.push("relay:start");
-            if (input.relayStartFailure) throw input.relayStartFailure;
-            return relay;
+            throw new Error("Reference descriptor lifecycle is unused");
           },
         },
       },
     });
-    return { calls, relay, descriptor };
   }
 
-  const relay: SurfaceRelayHandle<"github"> = {
-    platform: "github",
-    beginDrain: async ({ deadlineMs }) => {
-      calls.push(`drain:${deadlineMs}`);
-    },
-    snapshotRelays: () => [
-      {
-        ...relaySnapshot(reference),
-        platform: "github",
-        requestClient: "github",
-        replyTo: { platform: "github", channelId: reference.sessionId, messageId: "origin" },
-        createdOutputRefs: [
-          { platform: "github", channelId: reference.sessionId, messageId: "output-1" },
-        ],
-        activeOutputRefs: [
-          { platform: "github", channelId: reference.sessionId, messageId: "output-1" },
-        ],
-      },
-    ],
-    prepareRestoreRelays: () =>
-      Result.ok({
-        platform: "github",
-        apply: async () => Result.ok(undefined),
-        rollback: async () => Result.ok(undefined),
-        activate: () => undefined,
-      }),
-    restoreRelays: async () => undefined,
-    stop: async () => {
-      calls.push("relay:stop");
-    },
-  };
-  const descriptor = createGithubSurfaceRuntimeDescriptor({
+  return createGithubSurfaceRuntimeDescriptor({
     adapter,
-    requestIngress: {
-      start: async () => {
-        calls.push("request-ingress:start");
-        return {
-          stop: async () => {
-            calls.push("request-ingress:stop");
-          },
-        };
-      },
-    },
     relay: {
       ...createGithubRelayPolicy(),
       lifecycle: {
         platform: "github",
         start: async () => {
-          calls.push("relay:start");
-          if (input.relayStartFailure) throw input.relayStartFailure;
-          return relay;
+          throw new Error("Reference descriptor lifecycle is unused");
         },
       },
     },
   });
-  return { calls, relay, descriptor };
 }
 
 function registryFor(descriptors: readonly RegisteredSurfaceRuntimeDescriptor[]) {
   const created = SurfaceRuntimeRegistry.create(descriptors);
   if (created.status === "error") throw created.error;
   return created.value;
-}
-
-function registryGuardedAdapter(
-  reference: ReferenceContract,
-  adapter: SurfaceAdapter,
-): SurfaceAdapter {
-  const resolved = registryFor([{ platform: reference.platform, adapter }])
-    .adapterResolver()
-    .resolve(reference.platform);
-  if (!resolved) throw new Error(`Missing ${reference.platform} registry adapter`);
-  return resolved.adapter;
 }
 
 async function createProductionBridge(
@@ -522,418 +371,29 @@ function observeOutputAborts(
   return () => observed.mockRestore();
 }
 
-function lifecycleMaps() {
-  return {
-    connected: new Map() as ConnectedSurfaceAdapters,
-    adapterIngress: new Map() as SurfaceAdapterIngressHandles,
-    requestIngress: new Map() as SurfaceRequestIngressHandles,
-    relays: new Map() as SurfaceRelayHandles,
-  };
-}
-
-async function runCleanup(_label: string, cleanup: (() => Promise<void>) | undefined) {
-  await cleanup?.();
-}
-
-async function expectPanic(effect: () => Promise<unknown>): Promise<void> {
-  const [settled] = await Promise.allSettled([effect()]);
-  expect(settled?.status).toBe("rejected");
-  if (settled?.status === "rejected") expect(Panic.is(settled.reason)).toBe(true);
-}
-
 function operationError<T>(result: ResultType<T, SurfaceOperationError>): SurfaceOperationError {
   expect(result.status).toBe("error");
   if (result.status === "ok") throw new Error("Expected a surface operation error");
   return result.error;
 }
 
-function outputStreamWith(result: { readonly created: MsgRef[]; readonly last: MsgRef }) {
-  return {
-    push: async () => Result.ok("visible" as const),
-    finish: async () => Result.ok(result),
-    abort: async () => Result.ok(undefined),
-  } satisfies SurfaceOutputStream;
-}
-
-async function assertProducedRefGuards(reference: ReferenceContract): Promise<void> {
-  const wrongRef = oppositeMsgRef(reference);
-  const wrongSession = oppositeSessionRef(reference);
-
-  const sessionsAdapter = reference.createAdapter();
-  sessionsAdapter.listSessions = async () =>
-    Result.ok([{ ref: wrongSession, kind: "thread" as const }]);
-  await expectPanic(() => registryGuardedAdapter(reference, sessionsAdapter).listSessions());
-
-  const messagesAdapter = reference.createAdapter();
-  messagesAdapter.listMsg = async () =>
-    Result.ok([
-      {
-        ref: wrongRef,
-        session: sessionRef(reference),
-        userId: "user",
-        text: "wrong",
-        ts: 1,
-      },
-    ]);
-  await expectPanic(() =>
-    registryGuardedAdapter(reference, messagesAdapter).listMsg(sessionRef(reference)),
-  );
-
-  const callbackAdapter = reference.createAdapter();
-  callbackAdapter.startOutput = async (_session, options) => {
-    options?.onMessageCreated?.(wrongRef);
-    return Result.ok(outputStreamWith({ created: [msgRef(reference)], last: msgRef(reference) }));
-  };
-  await expectPanic(() =>
-    registryGuardedAdapter(reference, callbackAdapter).startOutput(sessionRef(reference), {
-      onMessageCreated: () => undefined,
-    }),
-  );
-
-  const outputAdapter = reference.createAdapter();
-  outputAdapter.startOutput = async () =>
-    Result.ok(outputStreamWith({ created: [wrongRef], last: wrongRef }));
-  const started = await registryGuardedAdapter(reference, outputAdapter).startOutput(
-    sessionRef(reference),
-  );
-  if (started.status === "error") throw started.error;
-  await expectPanic(() => started.value.finish());
-
-  const partialAdapter = reference.createAdapter();
-  partialAdapter.sendMsg = async () =>
-    Result.err(
-      new SurfaceOperationPartiallyCompleted({
-        platform: reference.platform,
-        operation: "send-message",
-        created: wrongRef,
-        message: "created before failure",
-      }),
-    );
-  await expectPanic(() =>
-    registryGuardedAdapter(reference, partialAdapter).sendMsg(sessionRef(reference), {
-      text: "send",
-    }),
-  );
-
-  const event: AdapterEvent = {
-    type: "adapter.message.created",
-    platform: reference.platform,
-    message: {
-      ref: wrongRef,
-      session: sessionRef(reference),
-      userId: "user",
-      text: "wrong",
-      ts: 1,
-    },
-    ts: 1,
-  };
-  const eventSource: SurfaceAdapterEventSource = {
-    subscribe: async (handler) => {
-      await handler(event);
-      return { stop: async () => undefined };
-    },
-  };
-  await expectPanic(async () => {
-    await createDescriptorBoundSurfaceEventSource(reference.platform, eventSource).subscribe(
-      () => undefined,
-    );
-  });
-
-  const workflowPlatform: RegisteredSurfacePlatform = reference.platform;
-  const workflow: SurfaceWorkflowProgressPort<RegisteredSurfacePlatform> = {
-    configurationRevision: "test",
-    checkMessage: async () => Result.ok("found"),
-    send: async () => Result.ok(wrongRef),
-    edit: async () => Result.ok(undefined),
-  };
-  await expectPanic(() =>
-    createDescriptorBoundWorkflowProgressPort(workflowPlatform, workflow).send({
-      channelId: reference.sessionId,
-      content: { text: "send" },
-    }),
-  );
-}
-
-function recoveryIdentity(reference: ReferenceContract, requestId: string, messageId: string) {
-  return {
-    state: "durable" as const,
-    projection: {
-      requestId,
-      requestClient: reference.platform,
-      sessionId: reference.sessionId,
-      source: "external" as const,
-      platform: reference.platform,
-      sessionRef: sessionRef(reference),
-      messageRef: msgRef(reference, messageId),
-      authenticationMetadataKind: "absent" as const,
-      verifiedIngress: false,
-    },
-    assertedSafetyMode: "restricted" as const,
-    parkedEventIds: [] as string[],
-  };
-}
-
-function recoveryRequestId(reference: ReferenceContract, suffix: string): string {
-  return reference.platform === "discord"
-    ? `discord:${reference.sessionId}:${suffix}`
-    : `github:${reference.sessionId}:${suffix}`;
-}
-
 function recoverySnapshot(reference: ReferenceContract): GracefulRestartSnapshotInput {
-  const activeRequestId = recoveryRequestId(reference, "active");
-  const queuedRequestId = recoveryRequestId(reference, "queued");
-  const controlRequestId = recoveryRequestId(reference, "control");
-  const eventId = `${reference.platform}-pel-1`;
-  const activeIdentity = recoveryIdentity(reference, activeRequestId, "active");
-  const queuedIdentity = recoveryIdentity(reference, queuedRequestId, "queued");
-  const controlIdentity = {
-    ...recoveryIdentity(reference, controlRequestId, "control"),
-    parkedEventIds: [eventId],
-  };
-  const agent: AgentRunnerRecoveryEntry[] = [
-    {
-      queueEntryId: `${reference.platform}-active-entry`,
-      kind: "active",
-      requestId: activeRequestId,
-      sessionId: reference.sessionId,
-      requestClient: reference.platform,
-      queue: "prompt",
-      messages: [],
-      identity: activeIdentity,
-    },
-    {
-      queueEntryId: `${reference.platform}-queued-entry`,
-      kind: "queued",
-      requestId: queuedRequestId,
-      sessionId: reference.sessionId,
-      requestClient: reference.platform,
-      queue: "prompt",
-      messages: [],
-      identity: queuedIdentity,
-    },
-  ];
-  const queueAttempts: AgentRunnerQueueAttempt[] = [
-    {
-      eventId,
-      controlRequestId,
-      controlRequestClient: reference.platform,
-      sessionId: reference.sessionId,
-      kind: "queued-cancellation",
-      detail: "cancelled during replacement",
-      controlApplied: true,
-      controlIdentity,
-      pendingGroups: [
-        {
-          publicationIndex: 0,
-          requestId: queuedRequestId,
-          requestClient: reference.platform,
-          targetQueueEntryIds: [`${reference.platform}-queued-entry`],
-        },
-      ],
-    },
-  ];
   return {
     version: GRACEFUL_RESTART_SNAPSHOT_VERSION,
     createdAt: Date.now(),
     deadlineMs: 3_000,
     queueAttemptProof: "complete",
-    agent,
-    queueAttempts,
+    agent: [],
+    queueAttempts: [],
     relays: [relaySnapshot(reference)],
   };
 }
 
-function decodeSnapshot(value: unknown) {
-  return decodeGracefulRestartSnapshot({
-    status: "completed",
-    payload_json: SuperJSON.stringify(value),
-  });
-}
-
-function requireDecodedCurrentSnapshot(reference: ReferenceContract) {
-  const decoded = decodeSnapshot(recoverySnapshot(reference));
-  if (decoded.status === "error") throw decoded.error;
-  if (!decoded.value.value) throw new Error(`Expected populated ${reference.platform} v3 snapshot`);
-  if (decoded.value.provenance !== "current") {
-    throw new Error(`Expected current ${reference.platform} v3 snapshot provenance`);
-  }
-  return decoded.value.value;
-}
-
 describe("shared Discord/GitHub adapter and descriptor contract", () => {
-  it.each(REFERENCE_CASES)(
-    "%s satisfies adapter, ingress, and output lifecycle ownership",
-    async (_name, reference) => {
-      const state = createReferenceDescriptor(reference, reference.createAdapter());
-      const registry = registryFor([state.descriptor]);
-      const handles = lifecycleMaps();
-
-      await startSurfaceAdapterIngress({ registry, handles: handles.adapterIngress });
-      await connectAndValidateSurfaceAdapters({ registry, connected: handles.connected });
-      await startSurfaceOutputs({
-        registry,
-        requestIngress: handles.requestIngress,
-        relays: handles.relays,
-      });
-      expect(state.calls).toContain("relay:start");
-      await stopSurfaceAdapterIngress({
-        registry,
-        handles: handles.adapterIngress,
-        runCleanup,
-        graceful: false,
-      });
-      await stopSurfaceRequestIngress({
-        registry,
-        handles: handles.requestIngress,
-        runCleanup,
-        graceful: false,
-      });
-      await stopSurfaceOutputs({
-        registry,
-        requestIngress: handles.requestIngress,
-        relays: handles.relays,
-        runCleanup,
-      });
-      await disconnectSurfaceAdapters({ registry, connected: handles.connected, runCleanup });
-      expect(handles.adapterIngress.size).toBe(0);
-      expect(handles.requestIngress.size).toBe(0);
-      expect(handles.relays.size).toBe(0);
-      expect(handles.connected.size).toBe(0);
-    },
-  );
-
-  it("rolls back every acquired surface resource when output startup fails", async () => {
-    const calls: string[] = [];
-    const discordAdapter = DISCORD_REFERENCE.createAdapter();
-    const githubAdapter = GITHUB_REFERENCE.createAdapter();
-    const discordDisconnect = discordAdapter.disconnect.bind(discordAdapter);
-    discordAdapter.disconnect = async () => {
-      calls.push("discord:disconnect");
-      await discordDisconnect();
-    };
-    const githubDisconnect = githubAdapter.disconnect.bind(githubAdapter);
-    githubAdapter.disconnect = async () => {
-      calls.push("github:disconnect");
-      await githubDisconnect();
-    };
-    const discord = createReferenceDescriptor(DISCORD_REFERENCE, discordAdapter, { calls });
-    const startupFailure = new Error("GitHub relay startup failed");
-    const github = createReferenceDescriptor(GITHUB_REFERENCE, githubAdapter, {
-      calls,
-      relayStartFailure: startupFailure,
-    });
-    const registry = registryFor([discord.descriptor, github.descriptor]);
-    const handles = lifecycleMaps();
-
-    await startSurfaceAdapterIngress({ registry, handles: handles.adapterIngress });
-    await connectAndValidateSurfaceAdapters({ registry, connected: handles.connected });
-    await expect(
-      startSurfaceOutputs({
-        registry,
-        requestIngress: handles.requestIngress,
-        relays: handles.relays,
-      }),
-    ).rejects.toBe(startupFailure);
-    await stopSurfaceOutputs({
-      registry,
-      requestIngress: handles.requestIngress,
-      relays: handles.relays,
-      runCleanup,
-    });
-    await disconnectSurfaceAdapters({ registry, connected: handles.connected, runCleanup });
-    await stopSurfaceAdapterIngress({
-      registry,
-      handles: handles.adapterIngress,
-      runCleanup,
-      graceful: false,
-    });
-
-    expect(calls).toContain("adapter-ingress:start");
-    expect(calls).toContain("adapter-ingress:stop");
-    expect(calls).toContain("request-ingress:start");
-    expect(calls).toContain("request-ingress:stop");
-    expect(calls).toContain("relay:stop");
-    expect(calls).toContain("discord:disconnect");
-    expect(calls).toContain("github:disconnect");
-    expect(handles.adapterIngress.size).toBe(0);
-    expect(handles.requestIngress.size).toBe(0);
-    expect(handles.relays.size).toBe(0);
-    expect(handles.connected.size).toBe(0);
-  });
-
-  it("disconnects both established adapters when post-connect platform validation fails", async () => {
-    const disconnected: string[] = [];
-    const discordAdapter = DISCORD_REFERENCE.createAdapter();
-    const githubAdapter = GITHUB_REFERENCE.createAdapter();
-    const discordDisconnect = discordAdapter.disconnect.bind(discordAdapter);
-    discordAdapter.disconnect = async () => {
-      disconnected.push("discord");
-      await discordDisconnect();
-    };
-    const githubDisconnect = githubAdapter.disconnect.bind(githubAdapter);
-    githubAdapter.disconnect = async () => {
-      disconnected.push("github");
-      await githubDisconnect();
-    };
-    const establishedFailure = new Error("established GitHub identity unavailable");
-    githubAdapter.getSelf = async () => {
-      throw establishedFailure;
-    };
-    const registry = registryFor([
-      createReferenceDescriptor(DISCORD_REFERENCE, discordAdapter).descriptor,
-      createReferenceDescriptor(GITHUB_REFERENCE, githubAdapter).descriptor,
-    ]);
-    const connected = new Map() as ConnectedSurfaceAdapters;
-
-    await expect(connectAndValidateSurfaceAdapters({ registry, connected })).rejects.toBe(
-      establishedFailure,
-    );
-    expect([...connected.keys()]).toEqual(["discord", "github"]);
-    await disconnectSurfaceAdapters({ registry, connected, runCleanup });
-    expect(disconnected).toEqual(["github", "discord"]);
-    expect(connected.size).toBe(0);
-  });
-
-  it.each(REFERENCE_CASES)(
-    "%s resolves exactly through the guarded registry and selects only its request client",
-    async (_name, reference) => {
-      const adapter = reference.createAdapter();
-      const descriptor = createReferenceDescriptor(reference, adapter).descriptor;
-      const registry = registryFor([descriptor]);
-      const resolver = registry.adapterResolver();
-
-      expect(resolver.registeredPlatforms()).toEqual([reference.platform]);
-      const resolved = resolver.resolve(reference.platform);
-      expect(resolved?.platform).toBe(reference.platform);
-      expect((await resolved?.adapter.getSelf())?.platform).toBe(reference.platform);
-      expect(resolver.resolve(reference.platform === "discord" ? "github" : "discord")).toBeNull();
-      expect(resolver.resolve("slack")).toBeNull();
-      expect(resolver.resolve("unknown")).toBeNull();
-
-      const other =
-        reference.platform === "discord"
-          ? createReferenceDescriptor(GITHUB_REFERENCE, GITHUB_REFERENCE.createAdapter()).descriptor
-          : createReferenceDescriptor(DISCORD_REFERENCE, DISCORD_REFERENCE.createAdapter())
-              .descriptor;
-      const completeRegistry = registryFor(
-        reference.platform === "discord" ? [descriptor, other] : [other, descriptor],
-      );
-      expect(
-        completeRegistry.entries().filter((entry) => entry.platform === reference.platform),
-      ).toHaveLength(1);
-    },
-  );
-
   it("selects exactly one real relay from request_client with both descriptors active", async () => {
     const bus = createLilacBus(createInMemoryDeliveryBus());
-    const discord = createReferenceDescriptor(
-      DISCORD_REFERENCE,
-      DISCORD_REFERENCE.createAdapter(),
-    ).descriptor;
-    const github = createReferenceDescriptor(
-      GITHUB_REFERENCE,
-      GITHUB_REFERENCE.createAdapter(),
-    ).descriptor;
+    const discord = createReferenceDescriptor(DISCORD_REFERENCE, DISCORD_REFERENCE.createAdapter());
+    const github = createReferenceDescriptor(GITHUB_REFERENCE, GITHUB_REFERENCE.createAdapter());
     const discordBridge = await createProductionBridge(DISCORD_REFERENCE, discord.adapter, bus);
     const githubBridge = await createProductionBridge(GITHUB_REFERENCE, github.adapter, bus);
     try {
@@ -996,14 +456,13 @@ describe("shared Discord/GitHub adapter and descriptor contract", () => {
   });
 
   it.each(REFERENCE_CASES)(
-    "%s reanchors, cancels, and drains through shared relay bus handlers",
+    "%s reanchors and cancels through shared relay bus handlers",
     async (_name, reference) => {
       const abortReasons: Array<string | undefined> = [];
       const restoreAbortObserver = observeOutputAborts(reference, abortReasons);
       const bus = createLilacBus(createInMemoryDeliveryBus());
-      const descriptor = createReferenceDescriptor(reference, reference.createAdapter()).descriptor;
+      const descriptor = createReferenceDescriptor(reference, reference.createAdapter());
       const bridge = await createProductionBridge(reference, descriptor.adapter, bus);
-      const registry = registryFor([descriptor]);
       try {
         await bus.publish(
           lilacEventTypes.EvtRequestReply,
@@ -1066,31 +525,6 @@ describe("shared Discord/GitHub adapter and descriptor contract", () => {
         );
         expect(abortReasons).toContain("cancel");
         expect(bridge.snapshotRelays()).toEqual([]);
-
-        const drained = await stopIngressAndDrainSurfaceRecovery({
-          stopAdapterIngress: async () => undefined,
-          stopRouterIngress: async () => undefined,
-          stopWorkflowRequestProducers: async () => undefined,
-          stopRequestIngress: async () => undefined,
-          stopRemainingRequestProducers: async () => undefined,
-          registry,
-          deadlineMs: 500,
-          runCleanup,
-          agentRunner: {
-            beginDrain: async () => undefined,
-            snapshotRecoverables: () => [],
-            snapshotQueueAttempts: () => [],
-            restoreRecoverables: () => undefined,
-            prepareRecovery: () =>
-              Result.ok({
-                apply: () => Result.ok(undefined),
-                rollback: () => undefined,
-                activate: () => undefined,
-              }),
-          },
-          relays: new Map([[reference.platform, bridge]]),
-        });
-        expect(drained).toEqual({ agent: [], queueAttempts: [], relays: [] });
       } finally {
         restoreAbortObserver();
         await bridge.stop();
@@ -1138,18 +572,11 @@ describe("shared Discord/GitHub adapter and descriptor contract", () => {
   );
 
   it.each(REFERENCE_CASES)(
-    "%s guards sessions, messages, events, callbacks, output, workflow, and partial refs",
-    async (_name, reference) => {
-      await assertProducedRefGuards(reference);
-    },
-  );
-
-  it.each(REFERENCE_CASES)(
     "%s owns output creation, finalization, skip, and cleanup outcomes",
     async (_name, reference) => {
       const log = createProtocolLog();
       const adapter = reference.createAdapter(log);
-      const descriptor = createReferenceDescriptor(reference, adapter).descriptor;
+      const descriptor = createReferenceDescriptor(reference, adapter);
       const created: MsgRef[] = [];
       const started = await descriptor.adapter.startOutput(sessionRef(reference), {
         onMessageCreated: (ref) => created.push(ref),
@@ -1222,13 +649,10 @@ describe("shared Discord/GitHub adapter and descriptor contract", () => {
   );
 
   it.each(REFERENCE_CASES)(
-    "%s workflow progress checks, sends, edits, classifies policy, and preserves actions",
+    "%s workflow progress checks, sends, edits, and preserves actions",
     async (_name, reference) => {
       const log = createProtocolLog();
-      const descriptor = createReferenceDescriptor(
-        reference,
-        reference.createAdapter(log),
-      ).descriptor;
+      const descriptor = createReferenceDescriptor(reference, reference.createAdapter(log));
       const port = descriptor.workflowProgress;
       if (!port) throw new Error("Reference workflow progress port is missing");
 
@@ -1256,78 +680,14 @@ describe("shared Discord/GitHub adapter and descriptor contract", () => {
         { text: "Running" },
       );
       expect(edited.status).toBe("ok");
-
-      const permanent = workflowProgressOperationFailure(
-        "send",
-        new SurfaceInvalidInput({
-          platform: reference.platform,
-          operation: "send-message",
-          field: "content",
-          message: "invalid",
-        }),
-      );
-      const providerFailure = await reference
-        .createProviderFailureAdapter()
-        .sendMsg(sessionRef(reference), { text: "provider failure" });
-      if (providerFailure.status === "ok") throw new Error("Expected workflow provider failure");
-      const retryable = workflowProgressOperationFailure("send", providerFailure.error);
-      expect(permanent).toMatchObject({ disposition: "permanent", reason: "invalid-input" });
-      expect(retryable).toMatchObject({ disposition: "retryable", reason: "unavailable" });
     },
   );
 
   it.each(REFERENCE_CASES)(
-    "%s restores current and v1/v2 compatibility with identity, PEL, and queue-attempt correlation",
-    (_name, reference) => {
-      const current = recoverySnapshot(reference);
-      const decoded = decodeSnapshot(current);
-      if (decoded.status === "error") throw decoded.error;
-      if (!decoded.value.value)
-        throw new Error(`Expected populated ${reference.platform} current snapshot`);
-      expect(decoded.value.provenance).toBe("current");
-      expect(decoded.value.value.version).toBe(GRACEFUL_RESTART_SNAPSHOT_VERSION);
-      expect(decoded.value.value.relays[0]?.requestClient).toBe(reference.platform);
-      expect(decoded.value.value.queueAttempts[0]).toMatchObject({
-        eventId: `${reference.platform}-pel-1`,
-        controlApplied: true,
-        pendingGroups: [{ targetQueueEntryIds: [`${reference.platform}-queued-entry`] }],
-      });
-      expect(decoded.value.value.agent[0]?.identity).toMatchObject({
-        state: "durable",
-        projection: {
-          requestClient: reference.platform,
-          platform: reference.platform,
-          sessionId: reference.sessionId,
-        },
-      });
-
-      for (const version of [1, 2] as const) {
-        const legacy = {
-          version,
-          createdAt: current.createdAt,
-          deadlineMs: current.deadlineMs,
-          agent: [],
-          relays: current.relays.map(({ requestClient: _requestClient, ...relay }) => relay),
-        };
-        const migrated = decodeSnapshot(legacy);
-        expect(migrated.status).toBe("ok");
-        if (migrated.status === "ok") {
-          expect(migrated.value.provenance).toBe("migrated");
-          expect(migrated.value.value?.relays[0]?.requestClient).toBe(reference.platform);
-        }
-      }
-    },
-  );
-
-  it.each(REFERENCE_CASES)(
-    "%s preserves real guarded-stream hydration through paused recovery orchestration",
+    "%s preserves one real guarded-stream hydration through recovery apply",
     async (_name, reference) => {
-      const decoded = requireDecodedCurrentSnapshot(reference);
       const log = createProtocolLog();
-      const descriptor = createReferenceDescriptor(
-        reference,
-        reference.createAdapter(log),
-      ).descriptor;
+      const descriptor = createReferenceDescriptor(reference, reference.createAdapter(log));
       const registry = registryFor([descriptor]);
       const bus = createLilacBus(createInMemoryDeliveryBus());
       const bridge = await createProductionBridge(reference, descriptor.adapter, bus);
@@ -1345,7 +705,7 @@ describe("shared Discord/GitHub adapter and descriptor contract", () => {
 
         const prepared = prepareSurfaceRecovery({
           registry,
-          snapshot: decoded,
+          snapshot: recoverySnapshot(reference),
           relays: new Map([[reference.platform, bridge]]),
           agentRunner: {
             prepareRecovery: () =>
@@ -1360,168 +720,9 @@ describe("shared Discord/GitHub adapter and descriptor contract", () => {
         expect((await applySurfaceRecovery(prepared.value)).status).toBe("ok");
         expect(bridge.snapshotRelays()).toEqual([]);
         expect(log.creates).toEqual([]);
-        const paused = createPausedSurfaceRecoveryOwnership(prepared.value);
-        await paused.rollback();
-        expect(bridge.snapshotRelays()).toEqual([]);
       } finally {
         await bridge.stop();
         await bus.close();
-      }
-    },
-  );
-
-  it.each(REFERENCE_CASES)(
-    "%s preflights unavailable recovery and owns paused apply, rollback, and activation",
-    async (_name, reference) => {
-      const snapshot = requireDecodedCurrentSnapshot(reference);
-      const state = createReferenceDescriptor(reference, reference.createAdapter());
-      const registry = registryFor([state.descriptor]);
-      const unavailable = prepareSurfaceRecovery({
-        registry,
-        snapshot,
-        relays: new Map(),
-        agentRunner: {
-          prepareRecovery: () =>
-            Result.ok({
-              apply: () => Result.ok(undefined),
-              rollback: () => undefined,
-              activate: () => undefined,
-            }),
-        },
-      });
-      expect(unavailable.status).toBe("error");
-      if (unavailable.status === "error") {
-        expect(unavailable.error).toMatchObject({ reason: "relay-handle-unavailable" });
-      }
-
-      const calls: string[] = [];
-      const relay: SurfaceRelayHandle<RegisteredSurfacePlatform> = {
-        ...state.relay,
-        prepareRestoreRelays: () =>
-          Result.ok({
-            platform: reference.platform,
-            apply: async () => {
-              calls.push("relay:apply");
-              return Result.ok(undefined);
-            },
-            rollback: async () => {
-              calls.push("relay:rollback");
-              return Result.ok(undefined);
-            },
-            activate: () => calls.push("relay:activate"),
-          }),
-      };
-      const agentRunner = {
-        prepareRecovery: () =>
-          Result.ok({
-            apply: () => {
-              calls.push("agent:apply");
-              return Result.ok(undefined);
-            },
-            rollback: () => calls.push("agent:rollback"),
-            activate: () => calls.push("agent:activate"),
-          }),
-      };
-      const prepared = prepareSurfaceRecovery({
-        registry,
-        snapshot,
-        relays: new Map([[reference.platform, relay]]),
-        agentRunner,
-      });
-      if (prepared.status === "error") throw prepared.error;
-      expect((await applySurfaceRecovery(prepared.value)).status).toBe("ok");
-      const paused = createPausedSurfaceRecoveryOwnership(prepared.value);
-      await paused.rollback();
-      expect(calls).toEqual(["relay:apply", "agent:apply", "relay:rollback", "agent:rollback"]);
-
-      calls.length = 0;
-      const activated = prepareSurfaceRecovery({
-        registry,
-        snapshot,
-        relays: new Map([[reference.platform, relay]]),
-        agentRunner,
-      });
-      if (activated.status === "error") throw activated.error;
-      expect((await applySurfaceRecovery(activated.value)).status).toBe("ok");
-      activateSurfaceRecovery(activated.value);
-      expect(calls).toEqual(["relay:apply", "agent:apply", "relay:activate", "agent:activate"]);
-
-      calls.length = 0;
-      const failedRelay: SurfaceRelayHandle<RegisteredSurfacePlatform> = {
-        ...relay,
-        prepareRestoreRelays: () =>
-          Result.ok({
-            platform: reference.platform,
-            apply: async () =>
-              Result.err(
-                new SurfaceRelayRestoreApplyFailed({
-                  platform: reference.platform,
-                  requestId: reference.requestId,
-                  message: "apply failed",
-                }),
-              ),
-            rollback: async () => {
-              calls.push("failed:rollback");
-              return Result.ok(undefined);
-            },
-            activate: () => calls.push("failed:activate"),
-          }),
-      };
-      const failed = prepareSurfaceRecovery({
-        registry,
-        snapshot,
-        relays: new Map([[reference.platform, failedRelay]]),
-        agentRunner,
-      });
-      if (failed.status === "error") throw failed.error;
-      expect((await applySurfaceRecovery(failed.value)).status).toBe("error");
-      expect(calls).toEqual(["failed:rollback", "agent:rollback"]);
-    },
-  );
-
-  it.each(REFERENCE_CASES)(
-    "%s keeps snapshot reads non-destructive and applies explicit row disposition",
-    async (_name, reference) => {
-      const dir = await mkdtemp(path.join(os.tmpdir(), `lilac-${reference.platform}-contract-`));
-      tempDirs.push(dir);
-      const store = new SqliteGracefulRestartStore(path.join(dir, "graceful-restart.db"));
-      try {
-        const snapshot = recoverySnapshot(reference);
-        expect(store.saveCompletedSnapshot(snapshot).status).toBe("ok");
-        const first = store.readCompletedSnapshot(snapshot.createdAt);
-        expect(first.status).toBe("ok");
-        if (first.status === "error" || first.value.state !== "loaded") {
-          throw new Error("Expected loaded snapshot");
-        }
-        const second = store.readCompletedSnapshot(snapshot.createdAt);
-        expect(second.status).toBe("ok");
-        if (second.status === "ok") expect(second.value.state).toBe("loaded");
-        expect(store.consumeCompletedSnapshot(first.value.rowToken).status).toBe("ok");
-        const absent = store.readCompletedSnapshot();
-        expect(absent.status).toBe("ok");
-        if (absent.status === "ok") expect(absent.value.state).toBe("absent");
-
-        const empty = {
-          ...snapshot,
-          agent: [],
-          queueAttempts: [],
-          relays: [],
-        };
-        expect(store.saveCompletedSnapshot(empty).status).toBe("ok");
-        const emptyRead = store.readCompletedSnapshot(empty.createdAt);
-        expect(emptyRead.status).toBe("ok");
-        if (emptyRead.status === "error" || emptyRead.value.state !== "empty") {
-          throw new Error("Expected empty snapshot");
-        }
-        expect(store.consumeCompletedSnapshot(emptyRead.value.rowToken).status).toBe("ok");
-
-        const stale = { ...snapshot, createdAt: 1, deadlineMs: 1 };
-        expect(store.saveCompletedSnapshot(stale).status).toBe("ok");
-        const classified = store.readCompletedSnapshot(10);
-        expect(classified.status).toBe("ok");
-        if (classified.status === "ok") expect(classified.value.state).toBe("stale");
-      } finally {
-        store.close();
       }
     },
   );

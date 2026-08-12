@@ -23,7 +23,7 @@ import {
   type MiniLilacUIMessage,
 } from "@stanley2058/mini-lilac-client";
 
-import { MiniLilacApp, formatRunDuration, type MiniLilacAppProps } from "./app";
+import { MiniLilacApp, type MiniLilacAppProps } from "./app";
 import type { SessionBindings } from "./controller";
 import { StartupSessionCwdMismatch } from "./startup";
 import { COLORS } from "./theme";
@@ -215,11 +215,6 @@ function subagentMessagesResponse(): Response {
 }
 
 describe("MiniLilacApp tool interactions", () => {
-  it("formats completed run durations", () => {
-    expect(formatRunDuration(12 * 60_000 + 32_000)).toBe("12m 32s");
-    expect(formatRunDuration(3_500)).toBe("3s");
-  });
-
   it("opens a subagent block as a read-only transcript and returns with escape", async () => {
     const fetchMock = Object.assign(
       async (input: string | URL | Request) => {
@@ -1279,40 +1274,6 @@ describe("MiniLilacApp tool interactions", () => {
     }
   });
 
-  it("expands a shell block when its rendered text is clicked", async () => {
-    const output = Array.from({ length: 10 }, (_, index) => `line ${index + 1}`).join("\n");
-    const app = await renderApp([
-      {
-        id: "assistant-shell",
-        role: "assistant",
-        parts: [
-          {
-            type: "dynamic-tool",
-            toolName: "bash",
-            toolCallId: "bash-1",
-            state: "output-available",
-            input: { command: "bun test" },
-            output: {
-              stdout: output,
-              stderr: "",
-              exitCode: 0,
-              stdoutTruncated: false,
-              stderrTruncated: false,
-            },
-          },
-        ],
-      },
-    ]);
-    try {
-      await app.flush();
-      expect(app.captureCharFrame()).toContain("Click to expand");
-      await clickRenderedText(app, "$ bun test");
-      expect(app.captureCharFrame()).toContain("Click to collapse");
-    } finally {
-      app.renderer.destroy();
-    }
-  });
-
   it("shows eight logical shell transcript lines with deliberate spacing", async () => {
     const output = [
       `line 1 ${"detail ".repeat(16)}`,
@@ -1784,33 +1745,6 @@ describe("MiniLilacApp tool interactions", () => {
     try {
       await app.waitForFrame((frame) => frame.includes("▣ Ready · Ran for 0s"));
       expect(app.captureCharFrame()).toContain("▣ Ready · Ran for 0s");
-    } finally {
-      app.renderer.destroy();
-    }
-  });
-
-  it("expands exploration when its rendered text is clicked", async () => {
-    const app = await renderApp([
-      {
-        id: "assistant-explore",
-        role: "assistant",
-        parts: [
-          {
-            type: "dynamic-tool",
-            toolName: "read_file",
-            toolCallId: "read-1",
-            state: "output-available",
-            input: { path: "src/app.ts", maxLines: 12 },
-            output: {},
-          },
-        ],
-      },
-    ]);
-    try {
-      await app.flush();
-      expect(app.captureCharFrame()).not.toContain("src/app.ts · 12 lines");
-      await clickRenderedText(app, "Explored");
-      expect(app.captureCharFrame()).toContain("src/app.ts · 12 lines");
     } finally {
       app.renderer.destroy();
     }

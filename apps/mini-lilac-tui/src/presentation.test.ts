@@ -2,21 +2,12 @@ import { describe, expect, it } from "bun:test";
 
 import {
   formatSessionTitle,
-  formatTokenCount,
   formatTokenUsage,
   resolveContextWindow,
   sessionPresentation,
 } from "./presentation";
 
 describe("presentation formatting", () => {
-  it("formats token counts with compact K and M suffixes", () => {
-    expect(formatTokenCount(999)).toBe("999");
-    expect(formatTokenCount(1_000)).toBe("1K");
-    expect(formatTokenCount(12_450)).toBe("12.5K");
-    expect(formatTokenCount(999_999)).toBe("1M");
-    expect(formatTokenCount(1_250_000)).toBe("1.3M");
-  });
-
   it("derives rounded context usage and hides unavailable values", () => {
     expect(formatTokenUsage(12_500, 50_000)).toBe("12.5K (25%)");
     expect(formatTokenUsage(0, 128_000)).toBe("0 (0%)");

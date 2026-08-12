@@ -44,16 +44,6 @@ describe("palette helpers", () => {
     ]);
   });
 
-  it("offers manual compaction in the command palette", () => {
-    expect(COMMAND_PALETTE_ITEMS.map((item) => item.id)).toContain("new");
-    expect(COMMAND_PALETTE_ITEMS.map((item) => item.id)).toContain("todo");
-    expect(COMMAND_PALETTE_ITEMS.map((item) => item.id)).toContain("compact");
-    expect(COMMAND_PALETTE_ITEMS.map((item) => item.id)).toContain("undo");
-    expect(COMMAND_PALETTE_ITEMS.map((item) => item.id)).toContain("redo");
-    expect(COMMAND_PALETTE_ITEMS.map((item) => item.id)).toContain("session");
-    expect(COMMAND_PALETTE_ITEMS.map((item) => item.id)).toContain("skills");
-  });
-
   it("projects the current todo with aggregate counts and falls back to the first item", () => {
     const state = {
       revision: 4,

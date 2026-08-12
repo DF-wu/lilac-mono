@@ -29,7 +29,6 @@ type AgentRecovery = {
   beginDrain(options: { readonly deadlineMs: number }): Promise<void>;
   snapshotRecoverables(): AgentRunnerRecoveryEntry[];
   snapshotQueueAttempts(): AgentRunnerQueueAttempt[];
-  restoreRecoverables(entries: readonly AgentRunnerRecoveryEntry[]): void;
   prepareRecovery(input: {
     readonly entries: readonly AgentRunnerRecoveryEntry[];
     readonly queueAttempts: readonly AgentRunnerQueueAttempt[];
@@ -336,7 +335,11 @@ export function prepareSurfaceRecovery(input: {
       relay.platform,
       "gracefulRestart.restoreRelayHandle",
     );
-    requireSurfaceRelaySnapshot(snapshot.platform, snapshot, "gracefulRestart.restoreRelays");
+    requireSurfaceRelaySnapshot(
+      snapshot.platform,
+      snapshot,
+      "gracefulRestart.prepareRestoreRelays",
+    );
   }
 
   const attempts: SurfaceRelayRestoreAttempt<RegisteredSurfacePlatform>[] = [];
@@ -413,32 +416,6 @@ export function activateSurfaceRecovery(plan: SurfaceRecoveryPlan): void {
   activatedRecoveryPlans.add(plan);
   for (const attempt of plan.attempts) attempt.activate();
   plan.agentAttempt.activate();
-}
-
-export async function restoreSurfaceRecovery(input: {
-  readonly registry: SurfaceRuntimeRegistry;
-  readonly snapshot: {
-    readonly createdAt: number;
-    readonly deadlineMs: number;
-    readonly agent: readonly AgentRunnerRecoveryEntry[];
-    readonly queueAttempts: readonly AgentRunnerQueueAttempt[];
-    readonly queueAttemptProof: "complete" | "legacy-ambiguous";
-    readonly relays: readonly BusToAdapterRelaySnapshot[];
-  };
-  readonly relays: SurfaceRelayHandles;
-  readonly agentRunner: Pick<AgentRecovery, "prepareRecovery" | "restoreRecoverables">;
-}): Promise<
-  ResultType<
-    void,
-    SurfaceRecoveryUnavailable | SurfaceRelayRestoreApplyFailed | AgentRecoveryUnavailable
-  >
-> {
-  const prepared = prepareSurfaceRecovery(input);
-  if (prepared.status === "error") return Result.err(prepared.error);
-  const applied = await applySurfaceRecovery(prepared.value);
-  if (applied.status === "error") return Result.err(applied.error);
-  activateSurfaceRecovery(prepared.value);
-  return Result.ok(undefined);
 }
 
 export async function stopSurfaceAdapterIngress(input: {

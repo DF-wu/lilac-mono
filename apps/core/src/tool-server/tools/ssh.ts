@@ -7,7 +7,6 @@ import {
   type ServerToolCallOptions,
 } from "@stanley2058/lilac-plugin-runtime";
 
-export { parseSshHostsFromConfigText } from "../../ssh/ssh-config";
 import { readConfiguredSshHosts, requireConfiguredSshHost } from "../../ssh/ssh-config";
 
 const DEFAULT_SSH_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes

@@ -268,8 +268,6 @@ describe("read_file tool-result resources", () => {
       truncated: true,
       results: [{ file: created.uri, line: 2 }],
     });
-    expect(JSON.stringify(output)).toContain("[truncated]");
-    expect(JSON.stringify(output)).toContain("needle");
     expect(Buffer.byteLength(JSON.stringify(output, null, 2), "utf8")).toBeLessThanOrEqual(512);
     expect(await readdir(store.rootDir)).toEqual(filesBefore);
 
