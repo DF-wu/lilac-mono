@@ -47,4 +47,27 @@ describe("native subagent profile prompt parity", () => {
       expect(prompt).toContain("Do not edit files.");
     });
   }
+
+  it("only prohibits Bash when explore execution is disabled", () => {
+    const disabled = parseCoreConfigV2ToUniversal({
+      configVersion: 2,
+      agent: { subagents: { profiles: { explore: { execution: false } } } },
+    }).agent.subagents.profiles.explore;
+    const restricted = config.agent.subagents.profiles.explore;
+
+    expect(
+      buildSystemPromptForProfile({
+        baseSystemPrompt: "base",
+        profile: "explore",
+        profileConfig: disabled,
+      }),
+    ).toContain("Do not use bash.");
+    expect(
+      buildSystemPromptForProfile({
+        baseSystemPrompt: "base",
+        profile: "explore",
+        profileConfig: restricted,
+      }),
+    ).not.toContain("Do not use bash.");
+  });
 });

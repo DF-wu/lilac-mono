@@ -42,6 +42,8 @@ export type ConfiguredModelRef = {
 
 export type ConfiguredModelChainEntry = string | ConfiguredModelRef;
 
+export type SubagentExecution = false | "restricted" | "native";
+
 export type SubagentProfileConfig = {
   modelSlot: "main" | "fast";
   model?: string;
@@ -61,7 +63,7 @@ export type SubagentProfileConfig = {
   network: boolean;
   /** Write behavior/edit-tool setting; not a trusted-Bash filesystem boundary. */
   workspaceWrites: boolean;
-  execution: boolean;
+  execution: SubagentExecution;
   delegation: boolean;
 };
 

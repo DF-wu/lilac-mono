@@ -16,7 +16,7 @@ import {
   type MaterializedClaudeCodeRun,
 } from "@stanley2058/lilac-claude-code-bridge";
 import { Result, type AnyTaggedError, type Result as ResultType } from "better-result";
-import { opaqueErrorMessage } from "@stanley2058/lilac-utils";
+import { opaqueErrorMessage, type SubagentExecution } from "@stanley2058/lilac-utils";
 
 import {
   type CoreClaudeAttemptMutationError,
@@ -152,6 +152,12 @@ function semanticFingerprint(value: unknown): string {
 
 function normalizeDirectToolAuthorityName(name: string): string {
   return name === "patch" || name === "edit" ? "workspace_edit" : name;
+}
+
+export function coreProfileExecutionScopeAuthority(
+  execution: SubagentExecution,
+): boolean | SubagentExecution {
+  return execution === "native" ? true : execution;
 }
 
 export function hashCoreNamedExecutionScope(input: {

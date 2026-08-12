@@ -14,24 +14,24 @@ describe("coreConfigSchema agent.subagents", () => {
     expect(parsed.agent.subagents.profiles.self.model).toBeUndefined();
     expect(parsed.agent.subagents.profiles.explore).toMatchObject({
       level1: {
-        tools: ["read", "glob", "grep", "fuzzy_search", "batch"],
+        tools: ["bash", "read", "glob", "grep", "fuzzy_search", "batch"],
         plugins: ["builtin-local-tools"],
       },
       network: true,
       workspaceWrites: false,
-      execution: false,
+      execution: "restricted",
       delegation: false,
     });
     expect(parsed.agent.subagents.profiles.general).toMatchObject({
       network: true,
       workspaceWrites: true,
-      execution: true,
+      execution: "native",
       delegation: false,
     });
     expect(parsed.agent.subagents.profiles.self).toMatchObject({
       network: true,
       workspaceWrites: true,
-      execution: true,
+      execution: "native",
       delegation: true,
     });
   });
@@ -63,6 +63,31 @@ describe("coreConfigSchema agent.subagents", () => {
       execution: false,
       delegation: true,
     });
+  });
+
+  it("accepts execution modes and rejects the former true value", () => {
+    const parsed = parseCoreConfigV2ToUniversal({
+      configVersion: 2,
+      agent: {
+        subagents: {
+          profiles: {
+            explore: { execution: false },
+            general: { execution: "restricted" },
+            self: { execution: "native" },
+          },
+        },
+      },
+    });
+
+    expect(parsed.agent.subagents.profiles.explore.execution).toBe(false);
+    expect(parsed.agent.subagents.profiles.general.execution).toBe("restricted");
+    expect(parsed.agent.subagents.profiles.self.execution).toBe("native");
+    expect(() =>
+      parseCoreConfigV2ToUniversal({
+        configVersion: 2,
+        agent: { subagents: { profiles: { general: { execution: true } } } },
+      }),
+    ).toThrow();
   });
 
   it("accepts profile model alias/spec with options", () => {

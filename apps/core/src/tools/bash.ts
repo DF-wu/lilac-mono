@@ -103,7 +103,10 @@ export function bashToolWithCwd(
           | undefined;
         const suppliedCwd = "cwd" in input && typeof input.cwd === "string" ? input.cwd : undefined;
         const payload = { ...input, cwd: suppliedCwd ?? defaultCwd };
-        if (typedContext?.safetyMode === "restricted") {
+        if (
+          typedContext?.safetyMode === "restricted" ||
+          opts?.nativeProfile?.execution === "restricted"
+        ) {
           return executeRestrictedBash(payload, {
             workspaceRoot: defaultCwd,
             context: {

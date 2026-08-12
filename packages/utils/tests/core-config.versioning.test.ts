@@ -76,6 +76,9 @@ describe("core config versioning", () => {
       "fuzzy_search",
       "batch",
     ]);
+    expect(parsed.agent.subagents.profiles.explore.execution).toBe(false);
+    expect(parsed.agent.subagents.profiles.general.execution).toBe("native");
+    expect(parsed.agent.subagents.profiles.self.execution).toBe("native");
     expect("idleTimeoutMs" in parsed.agent.subagents).toBe(false);
     expect(parsed.workflows.maxActiveRuns).toBe(64);
   });
@@ -86,12 +89,16 @@ describe("core config versioning", () => {
     expect(parsed.configVersion).toBe(2);
     expect(parsed.tools.fsBackend).toBe("fff");
     expect(parsed.agent.subagents.profiles.explore.level1.tools).toEqual([
+      "bash",
       "read",
       "glob",
       "grep",
       "fuzzy_search",
       "batch",
     ]);
+    expect(parsed.agent.subagents.profiles.explore.execution).toBe("restricted");
+    expect(parsed.agent.subagents.profiles.general.execution).toBe("native");
+    expect(parsed.agent.subagents.profiles.self.execution).toBe("native");
     expect(parsed.tools.inspect.model).toBe("google/gemini-3.5-flash");
     expect(parsed.tools.editFile.hashline).toBe(true);
     expect(parsed.surface.discord.outputMode).toBe("preview");
@@ -436,9 +443,14 @@ describe("core config versioning", () => {
       enabled: true,
       maxDepth: 2,
       profiles: {
-        explore: { modelSlot: "main", execution: false, workspaceWrites: false },
-        general: { modelSlot: "main", execution: true, workspaceWrites: true },
-        self: { modelSlot: "main", execution: true, workspaceWrites: true, delegation: true },
+        explore: { modelSlot: "main", execution: "restricted", workspaceWrites: false },
+        general: { modelSlot: "main", execution: "native", workspaceWrites: true },
+        self: {
+          modelSlot: "main",
+          execution: "native",
+          workspaceWrites: true,
+          delegation: true,
+        },
       },
     });
     expect("idleTimeoutMs" in parsed.agent.subagents).toBe(false);

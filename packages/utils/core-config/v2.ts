@@ -73,7 +73,7 @@ const profileLevel2Schema = z.object({
 const EXPLORE_PROFILE_DEFAULT: SubagentProfileConfig = {
   modelSlot: "main",
   level1: {
-    tools: ["read", "glob", "grep", "fuzzy_search", "batch"],
+    tools: ["bash", "read", "glob", "grep", "fuzzy_search", "batch"],
     plugins: ["builtin-local-tools"],
   },
   level2: {
@@ -98,7 +98,7 @@ const EXPLORE_PROFILE_DEFAULT: SubagentProfileConfig = {
   },
   network: true,
   workspaceWrites: false,
-  execution: false,
+  execution: "restricted",
   delegation: false,
 };
 
@@ -108,7 +108,7 @@ const GENERAL_PROFILE_DEFAULT: SubagentProfileConfig = {
   level2: { callables: ["*"], plugins: ["*"] },
   network: true,
   workspaceWrites: true,
-  execution: true,
+  execution: "native",
   delegation: false,
 };
 
@@ -155,7 +155,9 @@ function subagentProfileSchemaV2(defaults: SubagentProfileConfig) {
       level2: profileLevel2Schema.default(defaults.level2),
       network: z.boolean().default(defaults.network),
       workspaceWrites: z.boolean().default(defaults.workspaceWrites),
-      execution: z.boolean().default(defaults.execution),
+      execution: z
+        .union([z.literal(false), z.enum(["restricted", "native"])])
+        .default(defaults.execution),
       delegation: z.boolean().default(defaults.delegation),
     })
     .superRefine((input, ctx) => {

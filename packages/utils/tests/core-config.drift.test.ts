@@ -101,6 +101,9 @@ describe("core config drift coverage", () => {
     });
     expect(cfg.agent.reasoningDisplay).toBe("detailed");
     expect(cfg.agent.idleTimeoutMs).toBe(15 * 60 * 1000);
+    expect(cfg.agent.subagents.profiles.explore.execution).toBe("restricted");
+    expect(cfg.agent.subagents.profiles.general.execution).toBe("native");
+    expect(cfg.agent.subagents.profiles.self.execution).toBe("native");
     expect(cfg.agent.retry).toEqual({
       enabled: true,
       maxRetries: 3,

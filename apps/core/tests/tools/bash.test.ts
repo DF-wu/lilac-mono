@@ -4,6 +4,7 @@ import {
   env,
   isRecord,
   parseCoreConfigV1ToUniversal,
+  parseCoreConfigV2ToUniversal,
   resolveNativeSubagentProfile,
 } from "@stanley2058/lilac-utils";
 import fs from "node:fs/promises";
@@ -542,6 +543,41 @@ rmdir "$media_dir"`,
       stdout: "generic-control-capability|general|user-2",
       exitCode: 0,
     });
+  });
+
+  it("selects Bash mode from the profile without weakening restricted sessions", async () => {
+    const workspace = await fs.mkdtemp(
+      path.join(await fs.realpath("/tmp"), "lilac-profile-bash-workspace-"),
+    );
+    const config = parseCoreConfigV2ToUniversal({ configVersion: 2 });
+    const cases = [
+      { profile: "explore" as const, safetyMode: "trusted" as const, expected: "1" },
+      { profile: "general" as const, safetyMode: "trusted" as const, expected: "native" },
+      { profile: "general" as const, safetyMode: "restricted" as const, expected: "1" },
+    ];
+
+    try {
+      for (const [index, testCase] of cases.entries()) {
+        const sessionId = `profile-bash-mode-${index}-${crypto.randomUUID()}`;
+        const result = await executeTool(
+          bashToolWithCwd(workspace, {
+            nativeProfile: resolveNativeSubagentProfile(config, testCase.profile),
+          }).bash,
+          { command: 'printf "%s" "${LILAC_RESTRICTED:-native}"' },
+          {
+            requestId: sessionId,
+            sessionId,
+            requestClient: "test",
+            safetyMode: testCase.safetyMode,
+          },
+        );
+
+        expect(result).toMatchObject({ stdout: testCase.expected, exitCode: 0 });
+        await fs.rm(resolveRestrictedSessionTmpDir(sessionId), { recursive: true, force: true });
+      }
+    } finally {
+      await fs.rm(workspace, { recursive: true, force: true });
+    }
   });
 });
 

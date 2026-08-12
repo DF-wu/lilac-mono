@@ -13,6 +13,7 @@ import type {
 } from "@stanley2058/lilac-claude-code-bridge";
 
 import {
+  coreProfileExecutionScopeAuthority,
   createCoreNamedClaudeRuntime as createCoreNamedClaudeRuntimeResult,
   hashCoreNamedExecutionScope,
   prepareCoreNamedHistoryView,
@@ -848,6 +849,21 @@ describe("Core named Claude continuation", () => {
     expect(
       hashCoreNamedExecutionScope({
         ...base,
+        profileAuthority: {
+          execution: coreProfileExecutionScopeAuthority("native"),
+          workspaceWrites: true,
+        },
+      }).hash,
+    ).toBe(baseline);
+    expect(
+      hashCoreNamedExecutionScope({
+        ...base,
+        profileAuthority: { execution: "restricted", workspaceWrites: true },
+      }).hash,
+    ).not.toBe(baseline);
+    expect(
+      hashCoreNamedExecutionScope({
+        ...base,
         directToolNames: ["bash", "read", "patch"],
       }).hash,
     ).not.toBe(baseline);
@@ -866,6 +882,12 @@ describe("Core named Claude continuation", () => {
     expect(hashCoreNamedExecutionScope({ ...base, safetyMode: "restricted" }).hash).not.toBe(
       baseline,
     );
+  });
+
+  it("preserves native execution authority while distinguishing restricted mode", () => {
+    expect(coreProfileExecutionScopeAuthority(false)).toBe(false);
+    expect(coreProfileExecutionScopeAuthority("restricted")).toBe("restricted");
+    expect(coreProfileExecutionScopeAuthority("native")).toBe(true);
   });
 
   it("uses text-only history replay for cross-family, mixed, and legacy heads", () => {

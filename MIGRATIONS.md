@@ -67,6 +67,10 @@ New v2 fields:
 - `models.def.<alias>.comment`: optional guidance shown when an agent selects a model for a subagent.
 - `models.def.<alias>.agentCanSelect`: explicitly opts an alias into dynamic selection through `subagent_delegate`; defaults to `false`. It does not restrict static profiles, model slots, or explicit human overrides.
 
+Changed v2 fields:
+
+- `agent.subagents.profiles.<profile>.execution` is `false | "restricted" | "native"`. `false` omits Bash, `restricted` exposes the virtual restricted Bash implementation, and `native` exposes trusted host Bash unless the surface is restricted. This intentionally replaces the earlier v2 boolean contract: change `true` to `native`; `false` remains valid.
+
 Tool byte-size fields accept `B`, `KB`, `MB`, `GB`, `KiB`, `MiB`, and `GiB`. Duration fields accept `ms`, `s`, `m`, `h`, `d`, `w`, and `mo`; `mo` is a fixed 30 days. These fields cannot be configured in the frozen v1 input shape, but v1 receives the same universal runtime defaults.
 
 Default changes from v1:
@@ -80,6 +84,7 @@ Default changes from v1:
 - `surface.discord.markdownTableRender: { enabled: true, style: unicode, maxWidth: 50, fallbackMode: list }`
 - `agent.reasoningDisplay: detailed`
 - Subagent idle timeouts derive from the primary agent timeout as `floor(2/3)`, with a `1000ms` minimum. This produces `600000` for the default `900000ms` primary timeout. Frozen v1 legacy timeout fields are ignored.
+- The built-in `explore` profile includes restricted Bash; `general` and `self` use native Bash. Frozen v1 profiles retain their historical no-Bash explore and native-Bash general/self behavior.
 
 ## Mini Lilac Database Schema 3
 

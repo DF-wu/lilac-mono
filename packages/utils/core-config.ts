@@ -77,6 +77,7 @@ export type {
   JSONArray,
   JSONObject,
   ModelReasoningEffort,
+  SubagentExecution,
   SubagentProfileConfig,
   UniversalCoreConfig,
 } from "./core-config/types";

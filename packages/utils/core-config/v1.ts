@@ -809,7 +809,7 @@ function coreConfigV1ToUniversal(
             level2: { callables: ["*"], plugins: ["*"] },
             network: true,
             workspaceWrites: true,
-            execution: true,
+            execution: "native",
             delegation: false,
           },
           self: {
@@ -818,7 +818,7 @@ function coreConfigV1ToUniversal(
             level2: { callables: ["*"], plugins: ["*"] },
             network: true,
             workspaceWrites: true,
-            execution: true,
+            execution: "native",
             delegation: true,
           },
         },

@@ -253,7 +253,7 @@ agent:
         modelSlot: main
         # Profile behavior applies identically to direct and workflow launches.
         level1:
-          tools: [read, glob, grep, fuzzy_search, batch]
+          tools: [bash, read, glob, grep, fuzzy_search, batch]
           plugins: [builtin-local-tools]
         level2:
           callables:
@@ -275,10 +275,12 @@ agent:
               surface.reactions.listDetailed,
             ]
           plugins: [web, skills, content.inspect, discovery, conversation.thread, surface]
-        # Behavioral/tool-surface settings; these do not sandbox trusted Bash.
+        # Behavioral/tool-surface settings. execution accepts false, restricted,
+        # or native. restricted uses the virtual restricted Bash implementation;
+        # native uses trusted host Bash unless the surface is restricted.
         network: true
         workspaceWrites: false
-        execution: false
+        execution: restricted
         delegation: false
         # Optional direct model override. Can be provider/model or an alias from models.def.
         # model: "openrouter/openai/gpt-4o"
@@ -302,7 +304,7 @@ agent:
         level2: { callables: ["*"], plugins: ["*"] }
         network: true
         workspaceWrites: true
-        execution: true
+        execution: native
         delegation: false
         # model: "openrouter/openai/gpt-4o"
         # reasoning: medium
@@ -317,7 +319,7 @@ agent:
         level2: { callables: ["*"], plugins: ["*"] }
         network: true
         workspaceWrites: true
-        execution: true
+        execution: native
         delegation: true
         # Self subagent is an isolated fork of the primary agent prompt/tooling.
         # model: "openrouter/openai/gpt-4o"

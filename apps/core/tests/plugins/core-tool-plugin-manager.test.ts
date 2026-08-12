@@ -4,7 +4,11 @@ import os from "node:os";
 import path from "node:path";
 import { asSchema, jsonSchema, tool } from "ai";
 import type { LilacBus } from "@stanley2058/lilac-event-bus";
-import { parseCoreConfigV1ToUniversal, type CoreConfig } from "@stanley2058/lilac-utils";
+import {
+  parseCoreConfigV1ToUniversal,
+  parseCoreConfigV2ToUniversal,
+  type CoreConfig,
+} from "@stanley2058/lilac-utils";
 import { Panic, Result } from "better-result";
 
 import { createCoreToolPluginManager as createCoreToolPluginManagerResult } from "../../src/plugins";
@@ -172,6 +176,11 @@ function testConfig(input: unknown): CoreConfig {
   return { ...cfg, agent: { ...cfg.agent, systemPrompt: "(test)" } };
 }
 
+function testConfigV2(input: unknown): CoreConfig {
+  const cfg = parseCoreConfigV2ToUniversal(input);
+  return { ...cfg, agent: { ...cfg.agent, systemPrompt: "(test)" } };
+}
+
 async function writeExternalPlugin(params: {
   dataDir: string;
   pluginId: string;
@@ -230,7 +239,27 @@ describe("core tool plugin manager", () => {
   it("preserves built-in Level 1 tool exposure across profiles and edit modes", async () => {
     tmpRoot = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-core-plugin-manager-"));
     const dataDir = path.join(tmpRoot, "data");
-    const cfg = testConfig({});
+    const baseCfg = testConfig({});
+    const cfg: CoreConfig = {
+      ...baseCfg,
+      agent: {
+        ...baseCfg.agent,
+        subagents: {
+          ...baseCfg.agent.subagents,
+          profiles: {
+            ...baseCfg.agent.subagents.profiles,
+            explore: {
+              ...baseCfg.agent.subagents.profiles.explore,
+              level1: {
+                ...baseCfg.agent.subagents.profiles.explore.level1,
+                tools: ["bash", ...baseCfg.agent.subagents.profiles.explore.level1.tools],
+              },
+              execution: "restricted",
+            },
+          },
+        },
+      },
+    };
 
     const manager = createCoreToolPluginManager({
       runtime: {
@@ -305,7 +334,13 @@ describe("core tool plugin manager", () => {
       subagentDepth: 1,
       subagentConfig: cfg.agent.subagents!,
     });
-    expect([...exploreTools.specs.keys()].sort()).toEqual(["batch", "glob", "grep", "read"]);
+    expect([...exploreTools.specs.keys()].sort()).toEqual([
+      "bash",
+      "batch",
+      "glob",
+      "grep",
+      "read",
+    ]);
 
     const generalTools = await manager.buildLevel1Toolset({
       cwd: dataDir,
@@ -338,6 +373,43 @@ describe("core tool plugin manager", () => {
       "patch",
       "read",
       "subagent_delegate",
+    ]);
+  });
+
+  it("omits Bash when a profile disables execution", async () => {
+    tmpRoot = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-core-plugin-manager-"));
+    const dataDir = path.join(tmpRoot, "data");
+    const cfg = testConfigV2({
+      configVersion: 2,
+      agent: { subagents: { profiles: { explore: { execution: false } } } },
+    });
+    const manager = createCoreToolPluginManager({
+      runtime: {
+        bus: {} as LilacBus,
+        surfaceAdapterResolver: TEST_SURFACE_ADAPTER_RESOLVER,
+        discovery: {} as DiscoveryService,
+        conversationThreads: {} as ConversationThreadToolService,
+        config: cfg,
+      },
+      dataDir,
+    });
+    await manager.init();
+
+    const exploreTools = await manager.buildLevel1Toolset({
+      cwd: dataDir,
+      runProfile: "explore",
+      editingToolMode: "none",
+      subagentDepth: 1,
+      subagentConfig: cfg.agent.subagents,
+    });
+
+    expect(exploreTools.specs.has("bash")).toBe(false);
+    expect([...exploreTools.specs.keys()].sort()).toEqual([
+      "batch",
+      "fuzzy_search",
+      "glob",
+      "grep",
+      "read",
     ]);
   });
 

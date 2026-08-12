@@ -234,6 +234,7 @@ import type {
   CustomCommandManager,
 } from "../../custom-commands/manager";
 import {
+  coreProfileExecutionScopeAuthority,
   createCoreNamedClaudeRuntime as createCoreNamedClaudeRuntimeResult,
   hashCoreNamedExecutionScope,
   prepareCoreNamedHistoryView,
@@ -5353,7 +5354,10 @@ export async function startBusAgentRunner(params: {
                   level2: profileConfig?.level2 ?? null,
                   network: profileConfig?.network ?? null,
                   workspaceWrites: profileConfig?.workspaceWrites ?? null,
-                  execution: profileConfig?.execution ?? null,
+                  execution:
+                    profileConfig === null
+                      ? null
+                      : coreProfileExecutionScopeAuthority(profileConfig.execution),
                   delegation: profileConfig?.delegation ?? null,
                 },
                 pluginAuthority: cfg.plugins ?? null,

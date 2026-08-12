@@ -58,7 +58,7 @@ function isStructurallyAllowed(
   const profile = resolveNativeSubagentProfile(config, params.runProfile);
   if (!profileIncludes(profile.level1.plugins, contribution.pluginId)) return false;
   if (!profileIncludes(profile.level1.tools, specName)) return false;
-  if (specName === "bash" && !profile.execution) return false;
+  if (specName === "bash" && profile.execution === false) return false;
   if (["edit", "patch"].includes(specName) && !profile.workspaceWrites) return false;
   if (specName === "subagent_delegate" && !profile.delegation) return false;
   return true;
