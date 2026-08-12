@@ -754,6 +754,11 @@ function coreConfigV1ToUniversal(
         ...discordRest,
         outputPreviewModeFinalStyle: previewFinalOutputStyle,
         markdownTableRender: experimental.markdownTableRender,
+        markdownMathRender: {
+          enabled: false,
+          maxWidth: 50,
+          fallbackMode: "source",
+        },
       },
     },
     agent: {

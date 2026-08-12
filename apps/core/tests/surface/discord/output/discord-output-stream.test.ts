@@ -577,6 +577,23 @@ function hasEmbeds(options: unknown): boolean {
   return Array.isArray(embeds) && embeds.length > 0;
 }
 
+function embedDescriptionsFromOptions(options: unknown): string[] {
+  if (!options || typeof options !== "object") return [];
+  const embeds = (options as { embeds?: unknown }).embeds;
+  if (!Array.isArray(embeds)) return [];
+
+  return embeds.flatMap((embed) => {
+    let serialized: unknown = embed;
+    if (embed && typeof embed === "object") {
+      const toJSON = (embed as { toJSON?: unknown }).toJSON;
+      if (typeof toJSON === "function") serialized = toJSON.call(embed);
+    }
+    if (!serialized || typeof serialized !== "object") return [];
+    const description = (serialized as { description?: unknown }).description;
+    return typeof description === "string" ? [description] : [];
+  });
+}
+
 function embedFieldValuesFromOptions(options: unknown): string[] {
   if (!options || typeof options !== "object") return [];
   const embeds = (options as { embeds?: unknown }).embeds;
@@ -925,7 +942,7 @@ describe("output operation failures", () => {
     }
   });
 
-  it("finishes successfully when an ordinary best-effort streaming edit fails", async () => {
+  it("does not finish successfully when embed synchronization fails", async () => {
     const { client } = createFakeDiscordClient({ editFailure: { status: 503 } });
     const out = new DiscordOutputStream({
       client,
@@ -937,9 +954,9 @@ describe("output operation failures", () => {
     });
 
     await out.push({ type: "text.delta", delta: "hello" });
-    const result = await out.finish();
-
-    expect(result.status).toBe("ok");
+    await expect(out.finish()).rejects.toMatchObject({
+      _tag: "DiscordEmbedPusherInvariant",
+    });
   });
 
   it("classifies resume fetch failures instead of creating a duplicate chain", async () => {
@@ -1157,6 +1174,34 @@ describe("preview final output style", () => {
     expect(res.last.messageId).toBe(finalPlainOperation.messageId);
   });
 
+  it("renders each final segment in the terminal phase", async () => {
+    const { client, operations } = createFakeDiscordClient();
+    const out = new DiscordOutputStream({
+      client,
+      sessionRef: { platform: "discord", channelId: "chan" },
+      useSmartSplitting: false,
+      outputMode: "preview",
+      outputPreviewModeFinalStyle: "plain",
+      reasoningDisplayMode: "none",
+      workingIndicators: ["Working"],
+      markdownMathRender: { fallbackMode: "passthrough" },
+    });
+
+    await out.push({
+      type: "text.set",
+      text: "combined",
+      finalSegments: ["first \\(partial", "second \\(x+1\\)"],
+    });
+    await out.finish();
+
+    const finalContents = operations
+      .filter((operation) => operation.kind === "send" || operation.kind === "reply")
+      .map((operation) => contentFromOptions(operation.options))
+      .filter((content): content is string => content !== undefined);
+    expect(finalContents).toContain("first \\(partial");
+    expect(finalContents).toContain("second `x + 1`");
+  });
+
   it("posts preview final output as content and stats as metadata when configured", async () => {
     const { client, operations, deletedMessageIds } = createFakeDiscordClient();
 
@@ -1334,7 +1379,7 @@ describe("discord blockquote normalization", () => {
     if (typeof method !== "function") {
       throw new Error("getRenderedText is unavailable");
     }
-    return method.call(stream) as string;
+    return method.call(stream, "terminal") as string;
   }
 
   it("normalizes bare blockquote continuation lines before rendering", () => {
@@ -1384,7 +1429,7 @@ describe("experimental markdown table rendering", () => {
     if (typeof method !== "function") {
       throw new Error("getRenderedText is unavailable");
     }
-    return method.call(stream) as string;
+    return method.call(stream, "terminal") as string;
   }
 
   it("rewrites markdown tables into fixed-width blocks when enabled", () => {
@@ -1424,6 +1469,94 @@ describe("experimental markdown table rendering", () => {
 
     const rendered = getRenderedText(out);
     expect(rendered).toBe(markdownTable);
+  });
+});
+
+describe("Discord markdown math integration", () => {
+  function getRenderedText(stream: DiscordOutputStream, phase: "streaming" | "terminal"): string {
+    const method = Reflect.get(stream as object, "getRenderedText");
+    if (typeof method !== "function") throw new Error("getRenderedText is unavailable");
+    return method.call(stream, phase) as string;
+  }
+
+  function createMathStream(options?: {
+    markdownMathRender?: { maxWidth?: number; fallbackMode?: "source" | "passthrough" };
+    rewriteText?: (text: string) => string;
+    markdownTableRender?: { style?: "unicode" | "ascii"; maxWidth?: number };
+  }): DiscordOutputStream {
+    const { client } = createFakeDiscordClient();
+    return new DiscordOutputStream({
+      client,
+      sessionRef: { platform: "discord", channelId: "chan" },
+      useSmartSplitting: false,
+      outputMode: "inline",
+      reasoningDisplayMode: "none",
+      workingIndicators: ["Working"],
+      ...options,
+    });
+  }
+
+  it("renders inline and display math when enabled", () => {
+    const out = createMathStream({ markdownMathRender: { maxWidth: 50 } });
+    Reflect.set(out as object, "textAcc", "inline \\(x+1\\)\n\n$$y^2$$");
+
+    expect(getRenderedText(out, "terminal")).toBe("inline `x + 1`\n\n```text\ny²\n```");
+  });
+
+  it("leaves math source byte-for-byte unchanged when options are omitted", () => {
+    const out = createMathStream();
+    const source = "inline \\(x+1\\)\r\n\r\n$$y^2$$";
+    Reflect.set(out as object, "textAcc", source);
+
+    expect(getRenderedText(out, "streaming")).toBe(source);
+    expect(getRenderedText(out, "terminal")).toBe(source);
+  });
+
+  it("runs rewrite, blockquote normalization, tables, then math", () => {
+    const out = createMathStream({
+      rewriteText: () =>
+        [">", "", "| Formula |", "| --- |", "| $$x+1$$ |", "", "outside \\(y+1\\)"].join("\n"),
+      markdownTableRender: { style: "ascii", maxWidth: 40 },
+      markdownMathRender: { maxWidth: 50 },
+    });
+    Reflect.set(out as object, "textAcc", "unrewritten \\(z\\)");
+
+    const rendered = getRenderedText(out, "terminal");
+    expect(rendered).toStartWith("> \n\n```text\n");
+    expect(rendered).toContain("| $$x+1$$ |");
+    expect(rendered).not.toContain("```text\nx + 1\n```");
+    expect(rendered).toEndWith("outside `y + 1`");
+    expect(rendered).not.toContain("unrewritten");
+  });
+
+  it("withholds incomplete math while streaming and restores it at terminal", () => {
+    const out = createMathStream({ markdownMathRender: { fallbackMode: "passthrough" } });
+    Reflect.set(out as object, "textAcc", "before \\(partial");
+
+    expect(getRenderedText(out, "streaming")).toBe("before ");
+    expect(getRenderedText(out, "terminal")).toBe("before \\(partial");
+  });
+
+  it("uses terminal rendering for the final embed-pusher sync", async () => {
+    const { client, operations } = createFakeDiscordClient();
+    const out = new DiscordOutputStream({
+      client,
+      sessionRef: { platform: "discord", channelId: "chan" },
+      useSmartSplitting: false,
+      outputMode: "inline",
+      reasoningDisplayMode: "none",
+      workingIndicators: ["Working"],
+      markdownMathRender: { fallbackMode: "passthrough" },
+    });
+
+    await out.push({ type: "text.delta", delta: "before \\(partial" });
+    await out.finish();
+
+    const descriptions = operations.flatMap((operation) =>
+      embedDescriptionsFromOptions(operation.options),
+    );
+    expect(descriptions.some((description) => description.includes("\\(partial"))).toBe(true);
+    expect(descriptions.at(-1)).toBe("before \\(partial");
   });
 });
 

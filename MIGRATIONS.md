@@ -66,6 +66,7 @@ New v2 fields:
 - `agent.subagents.delegatePromptOverlay`: optional free-form guidance appended to the parent-visible `subagent_delegate` tool description.
 - `models.def.<alias>.comment`: optional guidance shown when an agent selects a model for a subagent.
 - `models.def.<alias>.agentCanSelect`: explicitly opts an alias into dynamic selection through `subagent_delegate`; defaults to `false`. It does not restrict static profiles, model slots, or explicit human overrides.
+- `surface.discord.markdownMathRender`: Discord markdown math rendering policy. Defaults to `{ enabled: false, maxWidth: 50, fallbackMode: source }`; frozen v1 configs receive this disabled universal fallback but cannot configure it.
 
 Changed v2 fields:
 

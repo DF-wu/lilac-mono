@@ -175,6 +175,7 @@ import {
   resolveEffectiveSessionModelOverride,
 } from "./discord-session-model";
 import type { MarkdownTableRenderOptions } from "../../shared/markdown-table-renderer";
+import type { DiscordMarkdownMathRenderOptions } from "./output/discord-markdown-math-renderer";
 import {
   customCommandInvocationErrorText,
   type CustomCommandManager,
@@ -406,6 +407,20 @@ function resolveMarkdownTableRenderOptions(
     style: tableRender.style ?? "unicode",
     maxWidth: tableRender.maxWidth ?? 80,
     fallbackMode: tableRender.fallbackMode ?? "list",
+  };
+}
+
+function resolveMarkdownMathRenderOptions(
+  cfg: CoreConfig | null | undefined,
+): DiscordMarkdownMathRenderOptions | undefined {
+  const mathRender = cfg?.surface.discord.markdownMathRender;
+  if (!mathRender || mathRender.enabled !== true) {
+    return undefined;
+  }
+
+  return {
+    maxWidth: mathRender.maxWidth,
+    fallbackMode: mathRender.fallbackMode,
   };
 }
 
@@ -1126,6 +1141,7 @@ export class DiscordAdapter implements SurfaceAdapter {
       );
     }
     const markdownTableRender = resolveMarkdownTableRenderOptions(cfg);
+    const markdownMathRender = resolveMarkdownMathRenderOptions(cfg);
 
     // TODO: plumb config for smart splitting.
     const useSmartSplitting = true;
@@ -1138,6 +1154,7 @@ export class DiscordAdapter implements SurfaceAdapter {
         useSmartSplitting,
         rewriteText: this.entityMapper?.rewriteOutgoingText,
         markdownTableRender,
+        markdownMathRender,
         reasoningDisplayMode: cfg.agent.reasoningDisplay ?? "simple",
         outputMode: cfg.surface.discord.outputMode ?? "inline",
         outputPreviewModeFinalStyle: cfg.surface.discord.outputPreviewModeFinalStyle ?? "embed",
@@ -1273,6 +1290,7 @@ export class DiscordAdapter implements SurfaceAdapter {
     }
     const client = clientResult.value;
     const markdownTableRender = resolveMarkdownTableRenderOptions(cfg);
+    const markdownMathRender = resolveMarkdownMathRenderOptions(cfg);
 
     const useSmartSplitting = true;
 
@@ -1330,6 +1348,7 @@ export class DiscordAdapter implements SurfaceAdapter {
       useSmartSplitting,
       rewriteText: this.entityMapper?.rewriteOutgoingText,
       markdownTableRender,
+      markdownMathRender,
       outputNotification: resolveOutputNotificationEnabled({
         configured: cfg?.surface.discord.outputNotification,
         silent: opts?.silent,

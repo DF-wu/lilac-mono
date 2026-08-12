@@ -215,6 +215,43 @@ describe("DiscordAdapter nested refs", () => {
     expect(providerCalls).toBe(0);
   });
 
+  it("threads enabled math options into output streams and omits disabled options", async () => {
+    const base = testConfigWithStatusMessage();
+    const enabledConfig: CoreConfig = {
+      ...base,
+      surface: {
+        ...base.surface,
+        discord: {
+          ...base.surface.discord,
+          markdownMathRender: {
+            enabled: true,
+            maxWidth: 37,
+            fallbackMode: "passthrough",
+          },
+        },
+      },
+    };
+
+    for (const [config, expected] of [
+      [enabledConfig, { maxWidth: 37, fallbackMode: "passthrough" }],
+      [base, undefined],
+    ] as const) {
+      const adapter = createTestDiscordAdapter({ config });
+      Object.assign(adapter, {
+        client: { channels: { fetch: async () => null } },
+        cfg: config,
+      });
+
+      const result = await adapter.startOutput({ platform: "discord", channelId: "c1" });
+      expect(result.status).toBe("ok");
+      if (result.status === "error") throw result.error;
+      const deps = Reflect.get(result.value as object, "deps") as {
+        markdownMathRender?: unknown;
+      };
+      expect(deps.markdownMathRender).toEqual(expected);
+    }
+  });
+
   it.each([
     [
       { platform: "github", channelId: "c1", messageId: "m1" } as const,

@@ -189,6 +189,16 @@ surface:
       # - passthrough: keep original markdown table unchanged
       fallbackMode: list
 
+    markdownMathRender:
+      # Render markdown math expressions. Disabled by default.
+      enabled: false
+      # Maximum rendered math width in display cells.
+      maxWidth: 50
+      # Fallback when math cannot render within maxWidth:
+      # - source: show the original markdown math source as code
+      # - passthrough: pass the original content through unchanged
+      fallbackMode: source
+
   heartbeat:
     # Enable the internal autonomous heartbeat lane.
     enabled: false

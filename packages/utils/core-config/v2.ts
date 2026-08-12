@@ -269,6 +269,18 @@ const discordMarkdownTableRenderSchema = z
     fallbackMode: "list",
   });
 
+const discordMarkdownMathRenderSchema = z
+  .object({
+    enabled: z.boolean().default(false),
+    maxWidth: z.number().int().min(40).max(240).default(50),
+    fallbackMode: z.enum(["source", "passthrough"]).default("source"),
+  })
+  .default({
+    enabled: false,
+    maxWidth: 50,
+    fallbackMode: "source",
+  });
+
 const discordSurfaceSchema = z
   .object({
     tokenEnv: z.string().min(1).default("DISCORD_TOKEN"),
@@ -290,6 +302,7 @@ const discordSurfaceSchema = z
       .min(1)
       .default(cloneDefaultWorkingIndicators()),
     markdownTableRender: discordMarkdownTableRenderSchema,
+    markdownMathRender: discordMarkdownMathRenderSchema,
   })
   .default({
     tokenEnv: "DISCORD_TOKEN",
@@ -305,6 +318,11 @@ const discordSurfaceSchema = z
       style: "unicode",
       maxWidth: 50,
       fallbackMode: "list",
+    },
+    markdownMathRender: {
+      enabled: false,
+      maxWidth: 50,
+      fallbackMode: "source",
     },
   });
 
@@ -608,6 +626,11 @@ export const coreConfigInputSchemaV2 = z.object({
           style: "unicode",
           maxWidth: 50,
           fallbackMode: "list",
+        },
+        markdownMathRender: {
+          enabled: false,
+          maxWidth: 50,
+          fallbackMode: "source",
         },
       },
       heartbeat: {

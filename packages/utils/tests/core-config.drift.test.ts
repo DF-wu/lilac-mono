@@ -99,6 +99,11 @@ describe("core config drift coverage", () => {
       maxWidth: 50,
       fallbackMode: "list",
     });
+    expect(cfg.surface.discord.markdownMathRender).toEqual({
+      enabled: false,
+      maxWidth: 50,
+      fallbackMode: "source",
+    });
     expect(cfg.agent.reasoningDisplay).toBe("detailed");
     expect(cfg.agent.idleTimeoutMs).toBe(15 * 60 * 1000);
     expect(cfg.agent.subagents.profiles.explore.execution).toBe("restricted");

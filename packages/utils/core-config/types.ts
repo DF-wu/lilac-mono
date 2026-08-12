@@ -217,6 +217,11 @@ export type UniversalCoreConfig = {
         maxWidth: number;
         fallbackMode: "list" | "passthrough";
       };
+      markdownMathRender: {
+        enabled: boolean;
+        maxWidth: number;
+        fallbackMode: "source" | "passthrough";
+      };
     };
 
     heartbeat: {

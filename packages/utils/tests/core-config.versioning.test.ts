@@ -57,6 +57,11 @@ describe("core config versioning", () => {
     expect(parsed.surface.discord.outputMode).toBe("inline");
     expect(parsed.surface.discord.outputPreviewModeFinalStyle).toBe("embed");
     expect(parsed.surface.discord.markdownTableRender.enabled).toBe(false);
+    expect(parsed.surface.discord.markdownMathRender).toEqual({
+      enabled: false,
+      maxWidth: 50,
+      fallbackMode: "source",
+    });
     expect(parsed.agent.reasoningDisplay).toBe("simple");
     expect(parsed.agent.idleTimeoutMs).toBe(15 * 60 * 1000);
     expect(parsed.agent.retry).toEqual({
@@ -110,6 +115,11 @@ describe("core config versioning", () => {
       maxWidth: 50,
       fallbackMode: "list",
     });
+    expect(parsed.surface.discord.markdownMathRender).toEqual({
+      enabled: false,
+      maxWidth: 50,
+      fallbackMode: "source",
+    });
     expect(parsed.agent.reasoningDisplay).toBe("detailed");
     expect(parsed.agent.idleTimeoutMs).toBe(15 * 60 * 1000);
     expect(parsed.agent.retry).toEqual({
@@ -139,6 +149,73 @@ describe("core config versioning", () => {
     });
 
     expect(parsed.workflows.maxActiveRuns).toBe(64);
+  });
+
+  it("parses v2 Discord markdown math rendering settings", () => {
+    const parsed = parseCoreConfigV2ToUniversal({
+      configVersion: 2,
+      surface: {
+        discord: {
+          markdownMathRender: {
+            enabled: true,
+            maxWidth: 240,
+            fallbackMode: "passthrough",
+          },
+        },
+      },
+    });
+
+    expect(parsed.surface.discord.markdownMathRender).toEqual({
+      enabled: true,
+      maxWidth: 240,
+      fallbackMode: "passthrough",
+    });
+  });
+
+  it("rejects invalid v2 Discord markdown math rendering settings", () => {
+    for (const markdownMathRender of [
+      { enabled: true, maxWidth: 39, fallbackMode: "source" },
+      { enabled: true, maxWidth: 241, fallbackMode: "source" },
+      { enabled: true, maxWidth: 50.5, fallbackMode: "source" },
+      { enabled: true, maxWidth: 50, fallbackMode: "invalid" },
+    ]) {
+      expect(() =>
+        parseCoreConfigV2ToUniversal({
+          configVersion: 2,
+          surface: { discord: { markdownMathRender } },
+        }),
+      ).toThrow();
+    }
+  });
+
+  it("keeps Discord markdown math rendering out of the frozen v1 input shape", () => {
+    const unknownKeys: string[][] = [];
+    const parsed = parseCoreConfigV1ToUniversal(
+      {
+        surface: {
+          discord: {
+            botName: "lilac",
+            markdownMathRender: {
+              enabled: true,
+              maxWidth: 240,
+              fallbackMode: "passthrough",
+            },
+          },
+        },
+      },
+      {
+        onUnknownKey(path) {
+          unknownKeys.push([...path] as string[]);
+        },
+      },
+    );
+
+    expect(unknownKeys).toEqual([["surface", "discord", "markdownMathRender"]]);
+    expect(parsed.surface.discord.markdownMathRender).toEqual({
+      enabled: false,
+      maxWidth: 50,
+      fallbackMode: "source",
+    });
   });
 
   it("parses v2 portable model reasoning fields", async () => {

@@ -114,7 +114,7 @@ function addStreamingIndicator(chunk: string): string {
 export async function startEmbedPusher(params: {
   createFirst: (emb: EmbedBuilder) => Promise<Message>;
   createReply: (parent: Message, emb: EmbedBuilder) => Promise<Message>;
-  getContent: () => string;
+  getContent: (isStreaming: boolean) => string;
   getProgressTitle?: () => string | null;
   getReasoningValue?: () => string | null;
   shouldHeartbeatProgress?: () => boolean;
@@ -158,7 +158,9 @@ export async function startEmbedPusher(params: {
   let lastProgressHeartbeatAt = 0;
   let lastStreamPushAt = 0;
 
-  const syncToDiscord = async (content: string): Promise<boolean> => {
+  const syncToDiscord = async (
+    content: string,
+  ): Promise<ResultType<boolean, DiscordEmbedPusherInvariant>> => {
     const maxChunkLength = params.getMaxLength(false);
     const maxLastChunkLength = params.getMaxLength(true);
 
@@ -187,10 +189,9 @@ export async function startEmbedPusher(params: {
       displayChunks = [""];
     }
 
-    responseQueue = displayChunks;
-
     if (displayChunks.length === 0) {
-      return false;
+      responseQueue = displayChunks;
+      return Result.ok(false);
     }
 
     let didUpdate = false;
@@ -262,10 +263,17 @@ export async function startEmbedPusher(params: {
         shouldForceProgressHeartbeat ||
         shouldForceStreamPush
       ) {
-        await params.safeEdit(chunkMessages[i]!, {
+        const edited = await params.safeEdit(chunkMessages[i]!, {
           embeds: [emb],
           ...firstExtras,
         });
+        if (!edited) {
+          return Result.err(
+            new DiscordEmbedPusherInvariant({
+              message: `startEmbedPusher failed to edit message ${chunkMessages[i]!.id}`,
+            }),
+          );
+        }
         sentDescriptions[i] = description;
         sentColors[i] = color;
         sentProgressTitle[i] = progressTitleForChunk ?? "";
@@ -282,14 +290,19 @@ export async function startEmbedPusher(params: {
       }
     }
 
-    return didUpdate;
+    responseQueue = displayChunks;
+    return Result.ok(didUpdate);
   };
 
   while (true) {
-    const content = params.getContent();
-    const didUpdate = await syncToDiscord(content);
+    const contentWasStreaming = streaming;
+    const content = params.getContent(contentWasStreaming);
+    const syncResult = await syncToDiscord(content);
+    if (syncResult.status === "error") return syncResult;
+    const didUpdate = syncResult.value;
 
     if (!streaming) {
+      if (contentWasStreaming) continue;
       if (!didUpdate) {
         break;
       }

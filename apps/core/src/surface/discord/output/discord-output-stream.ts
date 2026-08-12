@@ -47,6 +47,11 @@ import type { MarkdownTableRenderOptions } from "../../../shared/markdown-table-
 import { getEmbedPusherConstants, startEmbedPusher } from "./embed-pusher";
 import { chunkMarkdownForEmbeds } from "./markdown-chunker";
 import { normalizeDiscordBlockquotes } from "./discord-markdown-normalize";
+import {
+  renderDiscordMarkdownMath,
+  type DiscordMarkdownMathRenderOptions,
+  type DiscordMarkdownMathRenderPhase,
+} from "./discord-markdown-math-renderer";
 import { renderMarkdownTablesAsCodeBlocks } from "../../../shared/markdown-table-renderer";
 import { buildCancelCustomId } from "../discord-cancel";
 import { isTextSendableChannel, type SendableDiscordChannel } from "../discord-channel-guards";
@@ -647,6 +652,7 @@ export class DiscordOutputStream implements SurfaceOutputStream {
   private usedEmbedPusher = false;
   private finalTextSegments: readonly string[] | null = null;
   private renderedTextCacheInput: string | null = null;
+  private renderedTextCachePhase: DiscordMarkdownMathRenderPhase | null = null;
   private renderedTextCacheOutput = "";
 
   constructor(
@@ -657,6 +663,7 @@ export class DiscordOutputStream implements SurfaceOutputStream {
       useSmartSplitting: boolean;
       rewriteText?: (text: string) => string;
       markdownTableRender?: MarkdownTableRenderOptions;
+      markdownMathRender?: DiscordMarkdownMathRenderOptions;
       outputMode: DiscordOutputMode;
       outputPreviewModeFinalStyle?: DiscordPreviewFinalOutputStyle;
       outputNotification?: boolean;
@@ -707,19 +714,20 @@ export class DiscordOutputStream implements SurfaceOutputStream {
     this.transientPreviewRefs.push(ref);
   }
 
-  private getRenderedText(): string {
-    if (this.renderedTextCacheInput === this.textAcc) {
+  private getRenderedText(phase: DiscordMarkdownMathRenderPhase): string {
+    if (this.renderedTextCacheInput === this.textAcc && this.renderedTextCachePhase === phase) {
       return this.renderedTextCacheOutput;
     }
 
-    const rendered = this.renderText(this.textAcc);
+    const rendered = this.renderText(this.textAcc, phase);
 
     this.renderedTextCacheInput = this.textAcc;
+    this.renderedTextCachePhase = phase;
     this.renderedTextCacheOutput = rendered;
     return rendered;
   }
 
-  private renderText(text: string): string {
+  private renderText(text: string, phase: DiscordMarkdownMathRenderPhase): string {
     const rewrite = this.deps.rewriteText;
     let rendered = rewrite ? rewrite(text) : text;
     rendered = normalizeDiscordBlockquotes(rendered);
@@ -729,11 +737,16 @@ export class DiscordOutputStream implements SurfaceOutputStream {
       rendered = renderMarkdownTablesAsCodeBlocks(rendered, tableRender);
     }
 
+    const mathRender = this.deps.markdownMathRender;
+    if (mathRender) {
+      rendered = renderDiscordMarkdownMath(rendered, mathRender, phase);
+    }
+
     return rendered;
   }
 
-  private getStreamingDisplayText(): string {
-    const rendered = this.getRenderedText();
+  private getStreamingDisplayText(isStreaming: boolean): string {
+    const rendered = this.getRenderedText(isStreaming ? "streaming" : "terminal");
     if (!this.isPreviewMode()) return rendered;
     return toPreviewTail(rendered);
   }
@@ -1023,7 +1036,7 @@ export class DiscordOutputStream implements SurfaceOutputStream {
           this.notifyCreated(ref);
           return msg;
         },
-        getContent: () => this.getStreamingDisplayText(),
+        getContent: (isStreaming) => this.getStreamingDisplayText(isStreaming),
         getProgressTitle: () => this.getProgressTitle(),
         getReasoningValue: () => this.getReasoningValue(),
         shouldHeartbeatProgress: () => this.isProgressTimerLive(),
@@ -1059,7 +1072,7 @@ export class DiscordOutputStream implements SurfaceOutputStream {
       // We keep `first` as the stable anchor and rely on embed replies for the visible response.
       // If no embeds were created, turn `first` into the final plain message.
       if (res.discordMessageCreated.length === 0) {
-        const content = this.getStreamingDisplayText();
+        const content = this.getStreamingDisplayText(false);
         await safeEdit(first, {
           content: content || "*<empty_string>*",
           components: [],
@@ -1233,7 +1246,7 @@ export class DiscordOutputStream implements SurfaceOutputStream {
     if (channelResult.status === "error") throw channelResult.error;
     const channel = channelResult.value;
     const { CLOSING_TAG_BUFFER } = getEmbedPusherConstants();
-    const fullText = this.getRenderedText();
+    const fullText = this.getRenderedText("terminal");
     const content = fullText.length > 0 ? fullText : "*<empty_string>*";
 
     const maxChunkLength = 4096 - (this.deps.useSmartSplitting ? CLOSING_TAG_BUFFER : 0);
@@ -1323,8 +1336,8 @@ export class DiscordOutputStream implements SurfaceOutputStream {
       DISCORD_CONTENT_MAX_CHARS - (this.deps.useSmartSplitting ? CLOSING_TAG_BUFFER : 0);
     const finalTexts =
       this.finalTextSegments && this.finalTextSegments.length > 0
-        ? this.finalTextSegments.map((segment) => this.renderText(segment))
-        : [this.getRenderedText()];
+        ? this.finalTextSegments.map((segment) => this.renderText(segment, "terminal"))
+        : [this.getRenderedText("terminal")];
     const chunks = finalTexts.flatMap((text) =>
       chunkMarkdownForEmbeds(text.length > 0 ? text : "*<empty_string>*", {
         maxChunkLength,
@@ -1577,6 +1590,7 @@ export async function sendDiscordStyledMessage(params: {
   useSmartSplitting: boolean;
   rewriteText?: (text: string) => string;
   markdownTableRender?: MarkdownTableRenderOptions;
+  markdownMathRender?: DiscordMarkdownMathRenderOptions;
   outputNotification?: boolean;
 }): Promise<SurfaceOperationResult<MsgRef>> {
   const { text, attachments } = normalizeContent(params.content);
@@ -1587,6 +1601,7 @@ export async function sendDiscordStyledMessage(params: {
     useSmartSplitting: params.useSmartSplitting,
     rewriteText: params.rewriteText,
     markdownTableRender: params.markdownTableRender,
+    markdownMathRender: params.markdownMathRender,
     outputMode: "inline",
     outputNotification: params.outputNotification,
     reasoningDisplayMode: "none",
