@@ -964,6 +964,7 @@ describe("Oxlint production syntax activation", () => {
       expect.arrayContaining([
         "**/dist/**",
         "**/generated/**",
+        "**/vendor/**",
         "apps/core/src/ssh/remote-js/remote-runner.cjs",
       ]),
     );

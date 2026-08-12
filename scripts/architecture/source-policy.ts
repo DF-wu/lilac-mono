@@ -9,7 +9,7 @@ export function isProductionFileName(fileName: string, workspaceRoot: string): b
   if (relative.startsWith("../")) return false;
   if (relative === "src/ssh/remote-js/remote-runner.cjs") return false;
   return !(
-    /(?:^|\/)(?:__tests__|tests?|fixtures|generated|dist)(?:\/|$)/u.test(relative) ||
+    /(?:^|\/)(?:__tests__|tests?|fixtures|generated|dist|vendor)(?:\/|$)/u.test(relative) ||
     /\.(?:spec|test)\.[cm]?[jt]sx?$/u.test(relative)
   );
 }

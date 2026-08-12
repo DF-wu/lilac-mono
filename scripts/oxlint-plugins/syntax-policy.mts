@@ -56,6 +56,10 @@ export const SYNTACTIC_POLICY: SyntacticPolicy = {
       reason: "Generated output is enforced at its source module",
     },
     {
+      pattern: "(?:^|/)vendor(?:/|$)",
+      reason: "Vendored third-party source is enforced by its upstream project",
+    },
+    {
       pattern: "^apps/core/src/ssh/remote-js/remote-runner\\.cjs$",
       reason: "Generated remote runner bundle is enforced at its TypeScript source",
     },

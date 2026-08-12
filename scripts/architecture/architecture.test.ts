@@ -1072,6 +1072,7 @@ describe("Stage 2 union rules", () => {
     expect(isProductionFileName(path.join(root, "__tests__/support.ts"), root)).toBeFalse();
     expect(isProductionFileName(path.join(root, "src/generated/output.ts"), root)).toBeFalse();
     expect(isProductionFileName(path.join(root, "src/fixtures/production.ts"), root)).toBeFalse();
+    expect(isProductionFileName(path.join(root, "src/vendor/library.ts"), root)).toBeFalse();
   });
 });
 
