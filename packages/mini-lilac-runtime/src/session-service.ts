@@ -2559,8 +2559,8 @@ class SessionActor {
       normalizeToolResultOutput,
       normalizeSettledToolResultOutputs: (entries) =>
         normalizeOverflow.normalizeSettled(entries, normalizeToolResultOutput),
-      genericOutputNormalizerBypassTools: new Set(["bash", "read_file"]),
-      aggregateOutputBudgetExemptTools: new Set(["read_file"]),
+      genericOutputNormalizerBypassTools: new Set(["bash", "read_file", "grep"]),
+      aggregateOutputBudgetExemptTools: new Set(["read_file", "grep"]),
       providerOptions,
       turnErrorHandler: openaiServerCompactionEnabled
         ? turnErrorHandler

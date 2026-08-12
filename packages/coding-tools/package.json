@@ -28,6 +28,10 @@
     "./buffered-file-sink": {
       "import": "./src/buffered-file-sink.ts",
       "types": "./src/buffered-file-sink.ts"
+    },
+    "./search-output": {
+      "import": "./src/search-output.ts",
+      "types": "./src/search-output.ts"
     }
   },
   "private": true,

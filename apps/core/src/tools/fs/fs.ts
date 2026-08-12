@@ -5,6 +5,7 @@ import {
   FileSystem,
   READ_ERROR_CODES,
   expandTilde,
+  grepText,
   type EffectiveSearchBackend,
   type FileEdit,
   type FsBackend,
@@ -14,6 +15,7 @@ import {
   type ReadFileStart,
 } from "@stanley2058/lilac-fs";
 import { createLogger, env } from "@stanley2058/lilac-utils";
+import { boundGrepOutput } from "@stanley2058/lilac-coding-tools/search-output";
 import {
   createReadFileInstructionClaims,
   loadReadFileInstructions,
@@ -149,7 +151,7 @@ export const grepInputZod = sharedGrepInputSchema;
 
 type GrepInput = {
   pattern: string;
-  cwd?: string;
+  path?: string;
   regex?: boolean;
   maxResults?: number;
   fileExtensions?: string[];
@@ -327,6 +329,17 @@ function countGlobItems(output: GlobOutput): number {
 
 function countGrepItems(output: GrepOutput): number {
   return output.results.length;
+}
+
+function grepFailure(mode: GrepMode, error: string): GrepOutput {
+  switch (mode) {
+    case "default":
+      return { mode, truncated: false, results: [], error };
+    case "detailed":
+      return { mode, truncated: false, results: [], error };
+    case "hashline":
+      return { mode, truncated: false, results: [], error };
+  }
 }
 
 type SearchBackendMetadata = { effectiveBackend?: EffectiveSearchBackend };
@@ -1429,20 +1442,80 @@ export function fsTool(
 
     grep: tool({
       description: hashlineEnabled
-        ? "Search file contents. Recommended mode='default'; use mode='hashline' when you want grep output that can be turned into edit anchors. Use mode='detailed' only when you need column/submatches metadata. Very long lines may downgrade hashline output back to default with a warning that tells you to use bash instead. Denylisted paths require dangerouslyAllow=true."
-        : "Search file contents. Recommended mode='default'; use mode='detailed' only when you need column/submatches metadata. Denylisted paths require dangerouslyAllow=true.",
+        ? "Search a local file or directory, SSH path, or transient tool-result:// resource. Recommended mode='default'; use mode='hashline' only for editable filesystem paths, or mode='detailed' for column/submatches metadata. Output always stays inline and may be truncated with narrowing guidance. Denylisted filesystem paths require dangerouslyAllow=true."
+        : "Search a local file or directory, SSH path, or transient tool-result:// resource. Recommended mode='default'; use mode='detailed' only for column/submatches metadata. Output always stays inline and may be truncated with narrowing guidance. Denylisted filesystem paths require dangerouslyAllow=true.",
       inputSchema: grepInputSchema,
       outputSchema: grepOutputSchema,
-      execute: async ({ cwd: opCwd, dangerouslyAllow, ...input }: GrepInput, options) => {
+      execute: async ({ dangerouslyAllow, ...input }: GrepInput, options): Promise<GrepOutput> => {
         if (opts?.enforceDenylist) dangerouslyAllow = false;
         const mode = input.mode ?? "default";
-        const cwdTarget = parseSshCwdTarget(opCwd);
+        const targetPath = input.path;
+        if (targetPath?.startsWith(TOOL_RESULT_URI_PREFIX)) {
+          const sessionId = opts?.requestContext?.sessionId;
+          const artifact =
+            opts?.toolResultArtifacts && sessionId
+              ? await adaptToolResultArtifactReadToUnavailablePolicy(
+                  opts.toolResultArtifacts,
+                  await opts.toolResultArtifacts.read(targetPath, sessionId),
+                )
+              : { ok: false as const };
+          if (!artifact.ok) {
+            return boundGrepOutput(
+              grepFailure(mode, TOOL_RESULT_UNAVAILABLE_MESSAGE),
+              maxOutputBytes,
+            );
+          }
+          if (mode === "hashline") {
+            return boundGrepOutput(
+              grepFailure(
+                mode,
+                "grep mode='hashline' is unavailable for tool-result:// resources; use mode='default' or mode='detailed'.",
+              ),
+              maxOutputBytes,
+            );
+          }
+
+          const searched = await grepText({
+            content: artifact.content,
+            reportedPath: targetPath,
+            pattern: input.pattern,
+            regex: input.regex,
+            maxMatches: input.maxResults ?? 100,
+            extraArgs:
+              input.includeContextLines && input.includeContextLines > 0
+                ? ["--context", String(input.includeContextLines)]
+                : [],
+          });
+          if (searched.status === "error") {
+            return boundGrepOutput(grepFailure(mode, searched.error.message), maxOutputBytes);
+          }
+          if (mode === "default") {
+            return boundGrepOutput(
+              {
+                mode,
+                truncated: searched.value.truncated,
+                results: searched.value.matches.map(({ file, line, text }) => ({
+                  file,
+                  line,
+                  text,
+                })),
+              },
+              maxOutputBytes,
+            );
+          }
+          return boundGrepOutput(
+            { mode, truncated: searched.value.truncated, results: searched.value.matches },
+            maxOutputBytes,
+          );
+        }
+
+        const pathTarget = parseSshCwdTarget(targetPath);
         const remoteDenyPaths = resolveRemoteDenyPaths(dangerouslyAllow);
 
         logger.info("fs.grep", {
           pattern: input.pattern,
-          cwd: opCwd,
-          target: cwdTarget.kind,
+          path: targetPath,
+          target: pathTarget.kind,
           regex: input.regex,
           fileExtensions: input.fileExtensions,
           includeContextLines: input.includeContextLines,
@@ -1451,10 +1524,10 @@ export function fsTool(
           dangerouslyAllow: dangerouslyAllow === true,
         });
 
-        if (cwdTarget.kind === "ssh") {
+        if (pathTarget.kind === "ssh") {
           const remoteResult = await remoteGrep({
-            host: cwdTarget.host,
-            cwd: cwdTarget.cwd,
+            host: pathTarget.host,
+            cwd: pathTarget.cwd,
             input: {
               pattern: input.pattern,
               regex: input.regex,
@@ -1497,8 +1570,8 @@ export function fsTool(
           if (res.mode === "hashline") {
             for (const match of res.results) {
               recordRemoteFileAccess({
-                host: cwdTarget.host,
-                remoteCwd: cwdTarget.cwd,
+                host: pathTarget.host,
+                remoteCwd: pathTarget.cwd,
                 inputPath: match.file,
                 resolvedPath: match.resolvedPath,
                 fileHash: match.fileHash,
@@ -1506,7 +1579,7 @@ export function fsTool(
             }
           }
 
-          return boundSearchOutput(stripGrepMetadata(res), "results", maxOutputBytes);
+          return boundGrepOutput(stripGrepMetadata(res), maxOutputBytes);
         }
 
         const res = await fileSystem.grep({
@@ -1515,7 +1588,7 @@ export function fsTool(
           maxResults: input.maxResults,
           fileExtensions: input.fileExtensions,
           includeContextLines: input.includeContextLines,
-          baseDir: opCwd,
+          baseDir: targetPath,
           mode,
           dangerouslyAllow,
         });
@@ -1528,7 +1601,7 @@ export function fsTool(
           effectiveBackend: res.effectiveBackend,
         });
 
-        return boundSearchOutput(stripGrepMetadata(res), "results", maxOutputBytes);
+        return boundGrepOutput(stripGrepMetadata(res), maxOutputBytes);
       },
       toModelOutput: ({ output }): ToolResultOutput =>
         hasSearchFailure(output)

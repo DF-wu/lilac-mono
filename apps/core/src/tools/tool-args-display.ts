@@ -139,11 +139,11 @@ function getGlobArgs(value: unknown): { patterns: string[]; cwd?: string } | nul
   };
 }
 
-function getGrepArgs(value: unknown): { pattern: string; cwd?: string } | null {
+function getGrepArgs(value: unknown): { pattern: string; path?: string } | null {
   if (!isRecord(value) || typeof value["pattern"] !== "string") return null;
   return {
     pattern: value["pattern"],
-    cwd: typeof value["cwd"] === "string" ? value["cwd"] : undefined,
+    path: typeof value["path"] === "string" ? value["path"] : undefined,
   };
 }
 
@@ -204,10 +204,14 @@ export const formatGrepToolArgs: ToolArgsFormatter = (args) => {
   const pattern = parsed.pattern.replace(/\s+/g, " ").trim();
   if (!pattern) return "";
 
-  const cwd = normalizeRemoteCwdDisplay(parsed.cwd ?? "")
+  const target = (
+    parsed.path?.startsWith("tool-result://")
+      ? parsed.path
+      : normalizeRemoteCwdDisplay(parsed.path ?? "")
+  )
     .replace(/\s+/g, " ")
     .trim();
-  const raw = cwd ? `${pattern} ${cwd}` : pattern;
+  const raw = target ? `${pattern} ${target}` : pattern;
   return " " + truncateEnd(raw, DISPLAY_MAX_LEN);
 };
 

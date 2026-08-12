@@ -799,6 +799,8 @@ describe("coding tools", () => {
     const editSchema = createEditFileInputSchema(true);
     expect(readSchema.safeParse({ path: "a.ts", format: "hashline" }).success).toBe(true);
     expect(grepSchema.safeParse({ pattern: "needle", mode: "hashline" }).success).toBe(true);
+    expect(grepSchema.safeParse({ pattern: "needle", path: "src" }).success).toBe(true);
+    expect(grepSchema.safeParse({ pattern: "needle", cwd: "src" }).success).toBe(false);
     expect(
       editSchema.safeParse({
         path: "a.ts",
@@ -1209,6 +1211,62 @@ describe("coding tools", () => {
       success: false,
       error: { code: "UNKNOWN", message: TOOL_RESULT_UNAVAILABLE_MESSAGE },
     });
+  });
+
+  it("searches scoped artifact URIs with a bounded inline result", async () => {
+    const artifacts = createToolResultArtifactStore(path.join(cwd, "grep-artifacts"));
+    await artifacts.init();
+    const created = await artifacts.create({
+      scopeId: "scope-grep",
+      requestId: "request-grep",
+      toolCallId: "producer",
+      toolName: "bash",
+      content: `first\n${"x".repeat(8_000)}:needle\nlast`,
+      ttlMs: 60_000,
+      maxBytesPerScope: 16 * 1024,
+    });
+    if (created.status === "error") throw created.error;
+    const filesBefore = await readdir(artifacts.rootDir);
+    const grep = executable(
+      createCodingToolset({
+        cwd,
+        maxOutputBytes: 512,
+        artifactIntegration: {
+          artifacts,
+          scopeId: "scope-grep",
+          requestId: "request-grep",
+        },
+      }),
+      "grep",
+    );
+
+    const output = await grep.execute(
+      { pattern: "needle", path: created.value.uri, fileExtensions: ["ts"] },
+      options("grep-artifact"),
+    );
+    expect(output).toMatchObject({
+      mode: "default",
+      truncated: true,
+      results: [{ file: created.value.uri, line: 2 }],
+    });
+    expect(JSON.stringify(output)).toContain("[truncated]");
+    expect(JSON.stringify(output)).toContain("needle");
+    expect(Buffer.byteLength(JSON.stringify(output, null, 2), "utf8")).toBeLessThanOrEqual(512);
+    expect(await readdir(artifacts.rootDir)).toEqual(filesBefore);
+
+    const foreign = await executable(
+      createCodingToolset({
+        cwd,
+        artifactIntegration: {
+          artifacts,
+          scopeId: "scope-foreign",
+          requestId: "request-foreign",
+        },
+      }),
+      "grep",
+    ).execute({ pattern: "needle", path: created.value.uri }, options("grep-artifact-foreign"));
+    expect(foreign).toMatchObject({ error: TOOL_RESULT_UNAVAILABLE_MESSAGE, results: [] });
+    expect(await readdir(artifacts.rootDir)).toEqual(filesBefore);
   });
 
   it("maintains expired artifacts after an unavailable artifact read", async () => {

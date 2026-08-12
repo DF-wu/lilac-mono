@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
@@ -235,5 +235,63 @@ describe("read_file tool-result resources", () => {
       success: false,
       error: { message: TOOL_RESULT_UNAVAILABLE_MESSAGE },
     });
+  });
+
+  it("greps artifacts inline without creating another artifact", async () => {
+    const store = createToolResultArtifactStore(path.join(baseDir, "tool-results"));
+    await store.init();
+    const created = resultValue(
+      await store.create({
+        sessionId: "session-a",
+        requestId: "request-a",
+        toolCallId: "call-a",
+        toolName: "bash",
+        content: `first\n${"x".repeat(8_000)}:needle\nlast`,
+        ttlMs: 60_000,
+        maxBytesPerSession: 16 * 1024,
+      }),
+    );
+    const filesBefore = await readdir(store.rootDir);
+    const tools = fsTool(baseDir, {
+      experimentalHashlineEdit: true,
+      maxOutputBytes: 512,
+      toolResultArtifacts: store,
+      requestContext: { requestId: "request-a", sessionId: "session-a" },
+    });
+
+    const output = await tools.grep.execute!(
+      { pattern: "needle", path: created.uri },
+      { toolCallId: "grep-artifact", messages: [], context: {} },
+    );
+    expect(output).toMatchObject({
+      mode: "default",
+      truncated: true,
+      results: [{ file: created.uri, line: 2 }],
+    });
+    expect(JSON.stringify(output)).toContain("[truncated]");
+    expect(JSON.stringify(output)).toContain("needle");
+    expect(Buffer.byteLength(JSON.stringify(output, null, 2), "utf8")).toBeLessThanOrEqual(512);
+    expect(await readdir(store.rootDir)).toEqual(filesBefore);
+
+    const hashline = await tools.grep.execute!(
+      { pattern: "needle", path: created.uri, mode: "hashline" },
+      { toolCallId: "grep-artifact-hashline", messages: [], context: {} },
+    );
+    expect(hashline).toMatchObject({
+      mode: "hashline",
+      error: expect.stringContaining("unavailable for tool-result://"),
+    });
+
+    const foreignTools = fsTool(baseDir, {
+      experimentalHashlineEdit: true,
+      toolResultArtifacts: store,
+      requestContext: { requestId: "request-b", sessionId: "session-b" },
+    });
+    const foreignHashline = await foreignTools.grep.execute!(
+      { pattern: "needle", path: created.uri, mode: "hashline" },
+      { toolCallId: "grep-artifact-foreign", messages: [], context: {} },
+    );
+    expect(foreignHashline).toMatchObject({ error: TOOL_RESULT_UNAVAILABLE_MESSAGE });
+    expect(await readdir(store.rootDir)).toEqual(filesBefore);
   });
 });

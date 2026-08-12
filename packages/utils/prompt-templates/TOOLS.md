@@ -21,7 +21,7 @@ You have access to three tiers of tools:
 
 ## Remote Workdirs (SSH-style cwd)
 
-These tools: `bash`, `read_file`, `glob`, `grep`, `apply_patch` supports SSH-style working directory in `cwd`:
+These tools support SSH-style targets: `bash`, `read_file`, `glob`, and `apply_patch` use `cwd`; `grep` uses `path`:
 
 - Format: `<host>:<path>`
   - `<host>` must be a configured SSH host alias from the server's SSH config (see `ssh.hosts`).

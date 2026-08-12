@@ -119,7 +119,7 @@ interface GrepDecodedObservation {
   readonly toolName: "grep";
   readonly state: ToolProjectionState;
   readonly pattern?: string;
-  readonly cwd?: string;
+  readonly path?: string;
 }
 
 interface FuzzyDecodedObservation {
@@ -374,7 +374,7 @@ const globInputSchema = z.object({
 });
 const grepInputSchema = z.object({
   pattern: z.string().min(1),
-  cwd: z.string().optional(),
+  path: z.string().optional(),
   regex: z.boolean().optional(),
   maxResults: z.number().int().positive().max(10_000).optional(),
   fileExtensions: z.array(z.string().min(1)).max(100).optional(),
@@ -848,7 +848,7 @@ const decodeGrep: KnownToolCodec = (observation) => {
   return Result.ok({
     toolName: "grep",
     state: stateFromObservation(observation),
-    ...(input.value === undefined ? {} : { pattern: input.value.pattern, cwd: input.value.cwd }),
+    ...(input.value === undefined ? {} : { pattern: input.value.pattern, path: input.value.path }),
   });
 };
 
@@ -1363,7 +1363,7 @@ function projectDecoded(
       const detail =
         decoded.pattern === undefined
           ? undefined
-          : [explorationScope(decoded.cwd, cwd), quoted(decoded.pattern)]
+          : [explorationScope(decoded.path, cwd), quoted(decoded.pattern)]
               .filter((value) => value !== undefined)
               .join(" · ");
       const summary =

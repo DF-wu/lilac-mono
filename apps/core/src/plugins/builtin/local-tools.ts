@@ -343,7 +343,7 @@ export const BUILTIN_LEVEL1_TOOLS = {
     summarizeFailure: ({ result }) => summarizeSearchFailure(result, "glob"),
     createTool: (context) => getFsReadOnlyTool("glob", context),
   }),
-  grep: defineLevel1Tool("generic", {
+  grep: defineLevel1Tool("bounded-and-aggregate-exempt", {
     name: "grep",
     isEnabled: (context) => context.requestContext?.safetyMode !== "restricted",
     formatArgs: formatGrepToolArgs,

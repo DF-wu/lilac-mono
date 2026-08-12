@@ -126,7 +126,8 @@ than creating duplicate overflow artifacts, and batched reads do not share an ag
 budget. When another non-Bash tool completes with a larger materialized result, Mini Lilac stores
 the complete sanitized result under the transient, session-scoped `tool-result://` artifact
 referenced by the replacement tool error. Use `read_file` with that URI and its returned `nextStart`
-to page the result instead of rerunning the original tool. Bash keeps a bounded head-and-tail
+to page the result, or use `grep` with the URI as `path` to search it without creating another
+artifact. Bash keeps a bounded head-and-tail
 preview and includes the artifact URI in its structured truncation metadata. Encrypted artifact
 files live under `$XDG_STATE_HOME/mini-lilac/tool-results`, are invalidated when the server restarts,
 and never include results omitted by native query limits such as `maxResults` or `maxCharacters`.

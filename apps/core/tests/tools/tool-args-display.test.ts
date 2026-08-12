@@ -85,22 +85,31 @@ describe("formatToolArgsForDisplay", () => {
     ).toBe(" /path/to/some/...th/to/file.js");
   });
 
-  it("formats grep as pattern + cwd", () => {
+  it("formats grep as pattern + path", () => {
     expect(
       formatBuiltinArgs("grep", {
         pattern: "foo",
-        cwd: "/tmp",
+        path: "/tmp",
       }),
     ).toBe(" foo /tmp");
   });
 
-  it("formats grep remote cwd with host initials", () => {
+  it("formats grep remote path with host initials", () => {
     expect(
       formatBuiltinArgs("grep", {
         pattern: "foo",
-        cwd: "stanley-server:/repo/apps/core",
+        path: "stanley-server:/repo/apps/core",
       }),
     ).toBe(" foo @SS:/repo/apps/core");
+  });
+
+  it("formats grep artifact paths without treating them as SSH targets", () => {
+    expect(
+      formatBuiltinArgs("grep", {
+        pattern: "foo",
+        path: "tool-result://00000000-0000-0000-0000-000000000000",
+      }),
+    ).toBe(" foo tool-result://00000000-...");
   });
 
   it("formats glob as patterns + cwd", () => {

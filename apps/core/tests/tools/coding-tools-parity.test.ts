@@ -129,6 +129,8 @@ describe("Core coding-tools parity", () => {
     const hashlineEdit = createEditFileInputSchema(true);
     expect(hashlineRead.safeParse({ path: "src/index.ts", format: "hashline" }).success).toBe(true);
     expect(hashlineGrep.safeParse({ pattern: "needle", mode: "hashline" }).success).toBe(true);
+    expect(hashlineGrep.safeParse({ pattern: "needle", path: "host:/repo" }).success).toBe(true);
+    expect(hashlineGrep.safeParse({ pattern: "needle", cwd: "host:/repo" }).success).toBe(false);
     expect(
       hashlineEdit.safeParse({
         path: "src/index.ts",

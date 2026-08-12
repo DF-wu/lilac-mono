@@ -1,6 +1,6 @@
 import path from "node:path";
 
-import { expandTilde, FileSystem, type FsBackend } from "@stanley2058/lilac-fs";
+import { expandTilde, FileSystem, grepText, type FsBackend } from "@stanley2058/lilac-fs";
 import {
   adaptToolResultArtifactReadToUnavailablePolicy,
   TOOL_RESULT_URI_PREFIX,
@@ -10,6 +10,7 @@ import { tool, type ToolSet } from "ai";
 import { z } from "zod";
 
 import type { CodingToolArtifactIntegration } from "./artifact-integration";
+import { boundGrepOutput } from "./search-output";
 import { canonicalPathAllowed, assertGuardrailBypassAllowed, assertLocalCwd } from "./guardrails";
 import {
   createReadFileInstructionClaims,
@@ -425,28 +426,89 @@ export function createFilesystemTools(params: {
           : { type: "json", value: output },
     }),
     grep: tool({
-      description: "Search local file contents, using literal matching unless regex=true.",
+      description:
+        "Search a local file, directory, or transient tool-result:// resource, using literal matching unless regex=true. Output always stays inline and may be truncated with narrowing guidance.",
       inputSchema: grepInputSchema,
-      execute: async ({ cwd: operationCwd, ...input }) => {
-        if (operationCwd) assertLocalCwd(operationCwd);
+      execute: async (input) => {
+        if (input.path?.startsWith(TOOL_RESULT_URI_PREFIX)) {
+          const artifact = artifactIntegration
+            ? await adaptToolResultArtifactReadToUnavailablePolicy(
+                artifactIntegration.artifacts,
+                await artifactIntegration.artifacts.read(input.path, artifactIntegration.scopeId),
+              )
+            : { ok: false as const };
+          if (!artifact.ok) {
+            return boundGrepOutput(
+              {
+                mode: input.mode ?? "default",
+                truncated: false,
+                results: [],
+                error: TOOL_RESULT_UNAVAILABLE_MESSAGE,
+              },
+              maxOutputBytes,
+            );
+          }
+          const searched = await grepText({
+            content: artifact.content,
+            reportedPath: input.path,
+            pattern: input.pattern,
+            regex: input.regex,
+            maxMatches: input.maxResults ?? 100,
+            extraArgs:
+              input.includeContextLines && input.includeContextLines > 0
+                ? ["--context", String(input.includeContextLines)]
+                : [],
+          });
+          if (searched.status === "error") {
+            return boundGrepOutput(
+              {
+                mode: input.mode ?? "default",
+                truncated: false,
+                results: [],
+                error: searched.error.message,
+              },
+              maxOutputBytes,
+            );
+          }
+          const results =
+            input.mode === "detailed"
+              ? searched.value.matches
+              : searched.value.matches.map(({ file, line, text }) => ({ file, line, text }));
+          return boundGrepOutput(
+            {
+              mode: input.mode ?? "default",
+              truncated: searched.value.truncated,
+              results,
+            },
+            maxOutputBytes,
+          );
+        }
+
         assertGuardrailBypassAllowed(input.dangerouslyAllow, allowGuardrailBypass);
-        const effectiveCwd = operationCwd ?? cwd;
+        const targetPath = input.path ?? cwd;
         const guardedPath = await localFilesystemPathAllowed({
-          inputPath: effectiveCwd,
-          cwd: effectiveCwd,
+          inputPath: targetPath,
+          cwd,
           denyPaths: denyPaths ?? [],
           operation: "grep",
           dangerouslyAllow: input.dangerouslyAllow,
         });
         if (guardedPath.allowed.status === "error") {
-          return {
-            mode: input.mode ?? "default",
-            truncated: false,
-            results: [],
-            error: guardedPath.allowed.error.message,
-          };
+          return boundGrepOutput(
+            {
+              mode: input.mode ?? "default",
+              truncated: false,
+              results: [],
+              error: guardedPath.allowed.error.message,
+            },
+            maxOutputBytes,
+          );
         }
-        return fileSystem.grep({ ...input, baseDir: operationCwd ?? cwd });
+        const { path: _path, ...searchInput } = input;
+        return boundGrepOutput(
+          await fileSystem.grep({ ...searchInput, baseDir: targetPath }),
+          maxOutputBytes,
+        );
       },
       toModelOutput: ({ output }) =>
         searchFailureSchema.safeParse(output).success

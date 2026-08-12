@@ -1061,7 +1061,7 @@ printf '%s' '{"ok":false,"error":"npx should not be used when bunx exists"}'
     );
     const grepOutput = await executeTool(
       tools.grep,
-      { pattern: "oldValue", cwd: remoteCwd, mode: "detailed" },
+      { pattern: "oldValue", path: remoteCwd, mode: "detailed" },
       "remote-grep-malformed",
     );
     const fuzzyOutput = await executeTool(

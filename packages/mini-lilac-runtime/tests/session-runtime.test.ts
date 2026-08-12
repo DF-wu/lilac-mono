@@ -351,7 +351,7 @@ function textThenBashToolResult(command: string) {
   };
 }
 
-function grepToolResult(pattern: string) {
+function grepToolResult(pattern: string, targetPath?: string) {
   return {
     stream: simulateReadableStream({
       chunks: [
@@ -359,7 +359,7 @@ function grepToolResult(pattern: string) {
           type: "tool-call" as const,
           toolCallId: "oversized-grep",
           toolName: "grep",
-          input: JSON.stringify({ pattern }),
+          input: JSON.stringify({ pattern, path: targetPath }),
         },
         {
           type: "finish" as const,
@@ -2701,7 +2701,7 @@ describe("SessionService", () => {
     temporaryDirectories.push(directory);
     const runtimeConfig = config();
     runtimeConfig.agent.profiles.reader!.tools = ["grep"];
-    const missingCwd = path.join(directory, "missing");
+    const missingPath = path.join(directory, "missing");
     const model = new MockLanguageModelV4({
       doStream: [
         {
@@ -2711,7 +2711,7 @@ describe("SessionService", () => {
                 type: "tool-call" as const,
                 toolCallId: "failed-grep",
                 toolName: "grep",
-                input: JSON.stringify({ pattern: "needle", cwd: missingCwd }),
+                input: JSON.stringify({ pattern: "needle", path: missingPath }),
               },
               {
                 type: "finish" as const,
@@ -2740,7 +2740,7 @@ describe("SessionService", () => {
     service.close();
   });
 
-  it("stores oversized grep output out of line before the next model turn and UI persistence", async () => {
+  it("keeps oversized grep output bounded inline without creating an artifact", async () => {
     const directory = await mkdtemp(path.join(tmpdir(), "mini-lilac-tool-overflow-"));
     temporaryDirectories.push(directory);
     const longLine = `needle:${"x".repeat(8_000)}\n`;
@@ -2770,8 +2770,9 @@ describe("SessionService", () => {
     );
 
     const secondPrompt = JSON.stringify(model.doStreamCalls[1]?.prompt);
-    expect(secondPrompt).toContain("[tool result overflow]");
-    expect(secondPrompt).toContain("tool-result://");
+    expect(secondPrompt).toContain("Search output reached the inline limit");
+    expect(secondPrompt).toContain("[truncated]");
+    expect(secondPrompt).not.toContain("tool-result://");
     expect(secondPrompt).not.toContain("x".repeat(1_000));
     expect(JSON.stringify(chunks)).not.toContain("x".repeat(1_000));
     expect(chunks).toContainEqual(
@@ -2783,21 +2784,72 @@ describe("SessionService", () => {
 
     const transcript = service.store.getModelMessages(session.id);
     const serializedTranscript = JSON.stringify(transcript);
-    const uri = /tool-result:\/\/[0-9a-f-]{36}/u.exec(serializedTranscript)?.[0];
-    if (uri === undefined) throw new Error("overflow artifact URI was not persisted");
+    expect(serializedTranscript).toContain("[truncated]");
+    expect(serializedTranscript).not.toContain("tool-result://");
     expect(serializedTranscript).not.toContain("x".repeat(1_000));
-    const artifact = await artifacts.read(uri, session.id);
-    expect(artifact.status).toBe("ok");
-    if (artifact.status === "ok") expect(artifact.value.content).toContain(longLine.trim());
+    expect(await readdir(artifacts.rootDir)).toEqual([]);
+    service.close();
+  });
+
+  it("greps a tool-result artifact without spilling into another artifact", async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), "mini-lilac-artifact-grep-"));
+    temporaryDirectories.push(directory);
+    const runtimeConfig = config();
+    runtimeConfig.agent.profiles.reader!.tools = ["grep"];
+    const artifacts = createToolResultArtifactStore(path.join(directory, "tool-results"));
+    await artifacts.init();
+    let artifactUri = "";
+    let modelCall = 0;
+    const model = new MockLanguageModelV4({
+      doStream: async () =>
+        modelCall++ === 0
+          ? grepToolResult("needle", artifactUri)
+          : textResult("answer", "inspected"),
+    });
+    const service = new SessionService({
+      config: runtimeConfig,
+      databasePath: path.join(directory, "runtime.sqlite"),
+      modelResolver: () => model,
+      toolResultArtifacts: artifacts,
+      toolResultOutputConfig: {
+        maxInlineBytes: 512,
+        artifactTtlMs: 60_000,
+        maxArtifactBytesPerScope: 1024 * 1024,
+        maxArtifactBytes: 1024 * 1024,
+      },
+    });
+    const session = await service.createSession({ cwd: directory, model: "test/mock" });
+    const artifact = await artifacts.create({
+      scopeId: session.id,
+      requestId: "producer-request",
+      toolCallId: "producer-call",
+      toolName: "bash",
+      content: `${"x".repeat(8_000)}needle\n`,
+      ttlMs: 60_000,
+      maxBytesPerScope: 1024 * 1024,
+    });
+    if (artifact.status === "error") throw artifact.error;
+    artifactUri = artifact.value.uri;
+    const filesBefore = await readdir(artifacts.rootDir);
+
+    await collect((await service.startPrompt(session.id, userMessage("search it"))).stream);
+
+    const transcript = JSON.stringify(service.store.getModelMessages(session.id));
+    expect(transcript).toContain(artifactUri);
+    expect(transcript).toContain("needle");
+    expect(transcript).toContain("[truncated]");
+    expect(transcript).not.toContain("[tool result overflow]");
+    expect(await readdir(artifacts.rootDir)).toEqual(filesBefore);
     service.close();
   });
 
   it("shares artifact authority between a root session and delegated children", async () => {
     const directory = await mkdtemp(path.join(tmpdir(), "mini-lilac-child-artifacts-"));
     temporaryDirectories.push(directory);
-    await writeFile(path.join(directory, "large.txt"), `needle:${"y".repeat(8_000)}\n`);
     const runtimeConfig = config();
-    runtimeConfig.agent.profiles.child!.tools = ["grep"];
+    runtimeConfig.agent.profiles.child!.tools = ["bash"];
+    runtimeConfig.agent.profiles.child!.execution = true;
+    runtimeConfig.agent.profiles.child!.workspaceWrites = true;
     const artifacts = createToolResultArtifactStore(path.join(directory, "tool-results"));
     await artifacts.init();
     const model = new MockLanguageModelV4({
@@ -2807,10 +2859,12 @@ describe("SessionService", () => {
           options.prompt.filter((message) => message.role === "user").at(-1),
         );
         if (prompt.includes("child complete")) return textResult("root", "root complete");
-        if (latestUser.includes("investigate") && prompt.includes("tool result overflow")) {
+        if (latestUser.includes("investigate") && prompt.includes("tool-result://")) {
           return textResult("child", "child complete");
         }
-        if (latestUser.includes("investigate")) return grepToolResult("needle");
+        if (latestUser.includes("investigate")) {
+          return bashToolResult("printf '%050000d' 0");
+        }
         return delegateResult("sync", "investigate");
       },
     });

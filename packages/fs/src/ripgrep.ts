@@ -1,5 +1,9 @@
 /* from @stanley2058/tool-eval */
-import { spawn, type ChildProcessByStdio } from "node:child_process";
+import {
+  spawn,
+  type ChildProcessByStdio,
+  type ChildProcessWithoutNullStreams,
+} from "node:child_process";
 import type { Readable } from "node:stream";
 
 import { Panic, Result, TaggedError, type Result as ResultType } from "better-result";
@@ -28,6 +32,8 @@ export type GrepOptions = {
    * Explicit file or directory to search relative to cwd. Defaults to cwd itself.
    */
   searchPath?: string;
+  /** Optional text to search through stdin instead of reading searchPath. */
+  input?: string;
   /**
    * The pattern to search for (literal by default)
    */
@@ -58,6 +64,11 @@ export type RipgrepResult = {
   matches: GrepMatch[];
   truncated: boolean;
   effectiveBackend: EffectiveSearchBackend;
+};
+
+export type GrepTextOptions = Omit<GrepOptions, "cwd" | "searchPath" | "globs" | "fffCacheDir"> & {
+  content: string;
+  reportedPath: string;
 };
 
 export class RipgrepLineMalformed extends TaggedError("RipgrepLineMalformed")<{
@@ -138,7 +149,8 @@ export async function ripgrep(
 ): Promise<ResultType<RipgrepResult, RipgrepError>> {
   const {
     cwd,
-    searchPath = ".",
+    searchPath = options.input === undefined ? "." : "-",
+    input,
     pattern,
     globs = [],
     extraArgs = [],
@@ -147,16 +159,13 @@ export async function ripgrep(
   } = options;
   const limit = Math.max(1, maxMatches);
 
-  let child: ChildProcessByStdio<null, Readable, Readable>;
+  let child: ChildProcessByStdio<null, Readable, Readable> | ChildProcessWithoutNullStreams;
   try {
-    child = spawn(
-      "rg",
-      [...argsForRipgrep({ extraArgs, globs, limit, pattern, regex }), searchPath],
-      {
-        cwd,
-        stdio: ["ignore", "pipe", "pipe"],
-      },
-    );
+    const args = [...argsForRipgrep({ extraArgs, globs, limit, pattern, regex }), searchPath];
+    child =
+      input === undefined
+        ? spawn("rg", args, { cwd, stdio: ["ignore", "pipe", "pipe"] })
+        : spawn("rg", args, { cwd, stdio: ["pipe", "pipe", "pipe"] });
   } catch (cause) {
     if (Panic.is(cause)) throw cause;
     return Result.err(
@@ -174,6 +183,7 @@ export async function ripgrep(
     let stdoutRemainder = "";
     let reachedLimit = false;
     let outputFailed = false;
+    let stdinFailure: RipgrepExecutionFailed | undefined;
     let settled = false;
     let forceKillTimer: ReturnType<typeof setTimeout> | undefined;
 
@@ -196,6 +206,21 @@ export async function ripgrep(
       // Stop parsing buffered output once we know we have N+1.
       child.stdout.destroy();
     };
+
+    if (input !== undefined && child.stdin) {
+      child.stdin.on("error", (error: NodeJS.ErrnoException) => {
+        if (error.code === "EPIPE" || reachedLimit || outputFailed) return;
+        outputFailed = true;
+        stdinFailure = new RipgrepExecutionFailed({
+          code: null,
+          signal: null,
+          message: error.message,
+        });
+        child.kill("SIGTERM");
+        forceKillTimer = setTimeout(() => child.kill("SIGKILL"), 300);
+      });
+      child.stdin.end(input);
+    }
 
     const processLine = (line: string) => {
       if (reachedLimit || outputFailed) return;
@@ -262,7 +287,10 @@ export async function ripgrep(
         forceKillTimer = undefined;
       }
 
-      if (outputFailed) return;
+      if (outputFailed) {
+        if (stdinFailure) settle(Result.err(stdinFailure));
+        return;
+      }
 
       if (!reachedLimit && stdoutRemainder.length > 0) {
         processLine(stdoutRemainder);
@@ -294,6 +322,22 @@ export async function ripgrep(
         ),
       );
     });
+  });
+}
+
+export async function grepText(
+  options: GrepTextOptions,
+): Promise<ResultType<RipgrepResult, RipgrepError>> {
+  const { content, reportedPath, ...grepOptions } = options;
+  const result = await ripgrep({
+    ...grepOptions,
+    cwd: process.cwd(),
+    input: content,
+  });
+  if (result.status === "error") return result;
+  return Result.ok({
+    ...result.value,
+    matches: result.value.matches.map((match) => ({ ...match, file: reportedPath })),
   });
 }
 

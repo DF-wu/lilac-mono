@@ -163,13 +163,13 @@ export const fuzzySearchInputSchema = z.object({
 });
 
 export function createGrepInputSchema(hashlineEnabled = false) {
-  return z.object({
+  return z.strictObject({
     pattern: z.string().min(1).describe("Search pattern. Literal by default unless regex=true."),
-    cwd: z
+    path: z
       .string()
       .optional()
       .describe(
-        "Optional file or base directory to search (supports ~). Also supports ssh-style '<host>:<path>' when the runtime adapter has SSH configured. Defaults to the tool root.",
+        "Optional file, directory, or tool-result:// resource to search (supports ~). Also supports ssh-style '<host>:<path>' when the runtime adapter has SSH configured. Defaults to the tool root.",
       ),
     regex: z
       .boolean()

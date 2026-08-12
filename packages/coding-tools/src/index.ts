@@ -20,6 +20,7 @@ export * from "./buffered-file-sink";
 export * from "./filesystem";
 export * from "./guardrails";
 export * from "./instructions";
+export * from "./search-output";
 export * from "./schemas";
 
 export const DEFAULT_DENY_PATHS = ["~/.ssh", "~/.aws", "~/.gnupg"] as const;
