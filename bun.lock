@@ -324,13 +324,13 @@
     },
     "packages/remote-fs-runner": {
       "name": "@stanley2058/lilac-remote-fs-runner",
-      "version": "0.0.5",
+      "version": "0.0.6",
       "bin": {
         "lilac-remote-fs": "dist/cli.js",
       },
       "dependencies": {
         "@ff-labs/fff-node": "^0.9.4",
-        "better-result": "catalog:",
+        "better-result": "^3.0.0",
       },
       "devDependencies": {
         "@stanley2058/lilac-fs": "workspace:*",
