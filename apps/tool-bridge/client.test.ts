@@ -320,7 +320,7 @@ describe("tool-bridge CLI runtime", () => {
 
     try {
       const result = await runToolBridgeCli({
-        args: ["demo.echo", "--stdin", "--output=json"],
+        args: ["demo.echo", "--stdin"],
         backendUrl: `http://127.0.0.1:${server.port}`,
         stdin: JSON.stringify({ message: "hello", nested: { count: 2 } }),
         env: {
@@ -333,6 +333,7 @@ describe("tool-bridge CLI runtime", () => {
 
       expect(result.exitCode).toBe(0);
       expect(result.stderr).toBe("");
+      expect(result.stdout).toBe('{"ok":true,"value":42}\n');
       expect(JSON.parse(result.stdout) as unknown).toEqual({ ok: true, value: 42 });
 
       expect(requests).toHaveLength(1);
@@ -353,6 +354,99 @@ describe("tool-bridge CLI runtime", () => {
           nested: { count: 2 },
         },
       });
+    } finally {
+      server.stop(true);
+    }
+  });
+
+  it("supports explicit minified and pretty JSON output", async () => {
+    const server = Bun.serve({
+      port: 0,
+      hostname: "127.0.0.1",
+      fetch() {
+        return Response.json({ isError: false, output: { ok: true, nested: { value: 42 } } });
+      },
+    });
+
+    try {
+      const json = await runToolBridgeCli({
+        args: ["demo.echo", "--input={}", "--output=json"],
+        backendUrl: `http://127.0.0.1:${server.port}`,
+      });
+      const pretty = await runToolBridgeCli({
+        args: ["demo.echo", "--input={}", "--output=json-pretty"],
+        backendUrl: `http://127.0.0.1:${server.port}`,
+      });
+
+      expect(json).toEqual({
+        stdout: '{"ok":true,"nested":{"value":42}}\n',
+        stderr: "",
+        exitCode: 0,
+      });
+      expect(pretty).toEqual({
+        stdout: '{\n  "ok": true,\n  "nested": {\n    "value": 42\n  }\n}\n',
+        stderr: "",
+        exitCode: 0,
+      });
+    } finally {
+      server.stop(true);
+    }
+  });
+
+  it("uses JSON output by default for non-interactive onboarding", async () => {
+    const server = Bun.serve({
+      port: 0,
+      hostname: "127.0.0.1",
+      async fetch(req) {
+        const body = (await req.json()) as { callableId: string; input: Record<string, unknown> };
+        if (body.callableId === "onboarding.bootstrap") {
+          return Response.json({ isError: false, output: { bootstrapped: true } });
+        }
+        if (body.callableId === "onboarding.vcs_env") {
+          return Response.json({ isError: false, output: { GIT_CONFIG_GLOBAL: "/tmp/gitconfig" } });
+        }
+        if (body.callableId === "onboarding.git_identity" && body.input.mode === "test") {
+          return Response.json({ isError: false, output: { ok: true } });
+        }
+        return Response.json({ isError: false, output: { configured: true } });
+      },
+    });
+
+    try {
+      const result = await runToolBridgeCli({
+        args: ["onboard", "--yes", "--no-sign"],
+        backendUrl: `http://127.0.0.1:${server.port}`,
+      });
+
+      expect(result.exitCode).toBe(0);
+      expect(result.stderr).toBe("");
+      expect(result.stdout).toBe(
+        '{"ok":true,"userName":"lilac-agent[bot]","userEmail":"lilac-agent[bot]@users.noreply.github.com","signing":{"enabled":false},"vcsEnv":{"GIT_CONFIG_GLOBAL":"/tmp/gitconfig"},"gitTest":{"ok":true}}\n',
+      );
+    } finally {
+      server.stop(true);
+    }
+  });
+
+  it("advertises JSON output modes without compact output", async () => {
+    const server = Bun.serve({
+      port: 0,
+      hostname: "127.0.0.1",
+      fetch() {
+        return Response.json({ ok: true, version: "dev", commit: "unknown", dirty: false });
+      },
+    });
+
+    try {
+      const result = await runToolBridgeCli({
+        args: ["--help"],
+        backendUrl: `http://127.0.0.1:${server.port}`,
+      });
+
+      expect(result.exitCode).toBe(0);
+      expect(result.stderr).toBe("");
+      expect(result.stdout).toContain('--output=<"json" | "json-pretty"> (default: "json")');
+      expect(result.stdout).not.toContain("compact");
     } finally {
       server.stop(true);
     }
@@ -728,9 +822,30 @@ describe("tool-bridge positional input", () => {
   it("requires equals syntax for value-required control flags", () => {
     expectErrorMessage(
       parseArgs(["fetch", "--output", "json"]),
-      "--output requires a value: --output=compact|json",
+      "--output requires a value: --output=json|json-pretty",
     );
     expectErrorMessage(parseArgs(["fetch", "--input", "payload.json"]), "--input requires a value");
+  });
+
+  it("defaults to JSON and rejects removed compact output", () => {
+    const parsed = expectOk(parseArgs(["fetch"]));
+    expect(parsed.type).toBe("call");
+    if (parsed.type !== "call") return;
+    expect(parsed.outputMode).toBe("json");
+
+    const onboarded = expectOk(parseArgs(["onboard", "--yes", "--no-sign"]));
+    expect(onboarded.type).toBe("onboard");
+    if (onboarded.type !== "onboard") return;
+    expect(onboarded.outputMode).toBe("json");
+
+    expectErrorMessage(
+      parseArgs(["fetch", "--output=compact"]),
+      "Invalid --output value 'compact' (expected json|json-pretty)",
+    );
+    expectErrorMessage(
+      parseArgs(["onboard", "--output=compact"]),
+      "Invalid --output value 'compact' (expected json|json-pretty)",
+    );
   });
 
   it("supports `--` for positional values that begin with dashes", () => {

@@ -1,6 +1,5 @@
 /* oxlint-disable eslint/no-control-regex */
 
-import { encode } from "@toon-format/toon";
 import { getBuildInfo, type BuildInfo } from "@stanley2058/lilac-utils";
 import { Panic, Result, TaggedError, type Result as ResultType } from "better-result";
 import { z } from "zod";
@@ -979,11 +978,11 @@ function formatToolBlock(
   return lines.join("\n");
 }
 
-type OutputMode = "compact" | "json";
+type OutputMode = "json" | "json-pretty";
 
 const commonOptions = [
   "--operator, --op (authenticate with the root-only container operator token)",
-  '--output=<"compact" | "json"> (default: "compact")',
+  '--output=<"json" | "json-pretty"> (default: "json")',
   "--input=@file.json | --input='<json>' | --input=@-",
   "--stdin (alias for --input=@-)",
   "--<field>:json=@file.json | --<field>:json='<json>' | --<field>:json=@-",
@@ -1063,7 +1062,7 @@ async function main(): Promise<ResultType<void, BridgeClientError>> {
                 "--sign\tEnable GPG commit signing (default)",
                 "--no-sign\tDisable commit signing",
                 "--yes, -y\tNon-interactive (accept defaults)",
-                "--output=compact|json\tOutput format",
+                "--output=json|json-pretty\tOutput format (default: json)",
               ]),
             ),
           ].join("\n"),
@@ -1194,21 +1193,21 @@ async function main(): Promise<ResultType<void, BridgeClientError>> {
         return Result.err(new BridgeToolReportedFailure({ message: called.value.output }));
       }
 
-      if (command.outputMode === "json") {
-        console.log(JSON.stringify(called.value.output, null, 2));
-      } else {
-        console.log(encode(called.value.output));
-      }
+      console.log(
+        JSON.stringify(
+          called.value.output,
+          null,
+          command.outputMode === "json-pretty" ? 2 : undefined,
+        ),
+      );
       return Result.ok(undefined);
     }
     case "onboard": {
       const onboarded = await runOnboardingWizard(command);
       if (onboarded.status === "error") return Result.err(onboarded.error);
-      if (command.outputMode === "json") {
-        console.log(JSON.stringify(onboarded.value, null, 2));
-      } else {
-        console.log(encode(onboarded.value));
-      }
+      console.log(
+        JSON.stringify(onboarded.value, null, command.outputMode === "json-pretty" ? 2 : undefined),
+      );
       return Result.ok(undefined);
     }
     case "unknown":
@@ -1299,7 +1298,7 @@ export function parseArgs(
 
   if (firstArg === "onboard") {
     const restArgs = args.slice(1);
-    let outputMode: OutputMode = "compact";
+    let outputMode: OutputMode = "json";
     let dataDir: string | undefined;
     let userName: string | undefined;
     let userEmail: string | undefined;
@@ -1329,10 +1328,10 @@ export function parseArgs(
 
       if (k === "--output") {
         if (!hasValue) {
-          return argumentError("--output requires a value: --output=compact|json");
+          return argumentError("--output requires a value: --output=json|json-pretty");
         }
-        if (v !== "compact" && v !== "json") {
-          return argumentError(`Invalid --output value '${v}' (expected compact|json)`);
+        if (v !== "json" && v !== "json-pretty") {
+          return argumentError(`Invalid --output value '${v}' (expected json|json-pretty)`);
         }
         outputMode = v;
         continue;
@@ -1398,7 +1397,7 @@ export function parseArgs(
     const seenCanonicalFields = new Map<string, string>();
 
     let baseInput: JsonSource | undefined;
-    let outputMode: OutputMode = "compact";
+    let outputMode: OutputMode = "json";
 
     let stdinConsumer: string | undefined;
 
@@ -1442,10 +1441,10 @@ export function parseArgs(
 
       if (k === "--output") {
         if (!hasValue) {
-          return argumentError("--output requires a value: --output=compact|json");
+          return argumentError("--output requires a value: --output=json|json-pretty");
         }
-        if (v !== "compact" && v !== "json") {
-          return argumentError(`Invalid --output value '${v}' (expected compact|json)`);
+        if (v !== "json" && v !== "json-pretty") {
+          return argumentError(`Invalid --output value '${v}' (expected json|json-pretty)`);
         }
         outputMode = v;
         continue;
