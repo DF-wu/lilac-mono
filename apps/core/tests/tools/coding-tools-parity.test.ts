@@ -131,6 +131,9 @@ describe("Core coding-tools parity", () => {
     expect(hashlineGrep.safeParse({ pattern: "needle", mode: "hashline" }).success).toBe(true);
     expect(hashlineGrep.safeParse({ pattern: "needle", path: "host:/repo" }).success).toBe(true);
     expect(hashlineGrep.safeParse({ pattern: "needle", cwd: "host:/repo" }).success).toBe(false);
+    expect(grepInputZod.safeParse({ pattern: "needle", includeContextLines: 1 }).success).toBe(
+      false,
+    );
     expect(
       hashlineEdit.safeParse({
         path: "src/index.ts",

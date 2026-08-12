@@ -155,7 +155,6 @@ type GrepInput = {
   regex?: boolean;
   maxResults?: number;
   fileExtensions?: string[];
-  includeContextLines?: number;
   mode?: GrepMode;
   dangerouslyAllow?: boolean;
 };
@@ -1481,10 +1480,6 @@ export function fsTool(
             pattern: input.pattern,
             regex: input.regex,
             maxMatches: input.maxResults ?? 100,
-            extraArgs:
-              input.includeContextLines && input.includeContextLines > 0
-                ? ["--context", String(input.includeContextLines)]
-                : [],
           });
           if (searched.status === "error") {
             return boundGrepOutput(grepFailure(mode, searched.error.message), maxOutputBytes);
@@ -1518,7 +1513,6 @@ export function fsTool(
           target: pathTarget.kind,
           regex: input.regex,
           fileExtensions: input.fileExtensions,
-          includeContextLines: input.includeContextLines,
           maxResults: input.maxResults,
           mode,
           dangerouslyAllow: dangerouslyAllow === true,
@@ -1533,7 +1527,6 @@ export function fsTool(
               regex: input.regex,
               maxResults: input.maxResults,
               fileExtensions: input.fileExtensions,
-              includeContextLines: input.includeContextLines,
               mode,
             },
             denyPaths: remoteDenyPaths,
@@ -1587,7 +1580,6 @@ export function fsTool(
           regex: input.regex,
           maxResults: input.maxResults,
           fileExtensions: input.fileExtensions,
-          includeContextLines: input.includeContextLines,
           baseDir: targetPath,
           mode,
           dangerouslyAllow,

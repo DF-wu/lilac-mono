@@ -801,6 +801,7 @@ describe("coding tools", () => {
     expect(grepSchema.safeParse({ pattern: "needle", mode: "hashline" }).success).toBe(true);
     expect(grepSchema.safeParse({ pattern: "needle", path: "src" }).success).toBe(true);
     expect(grepSchema.safeParse({ pattern: "needle", cwd: "src" }).success).toBe(false);
+    expect(grepSchema.safeParse({ pattern: "needle", includeContextLines: 1 }).success).toBe(false);
     expect(
       editSchema.safeParse({
         path: "a.ts",

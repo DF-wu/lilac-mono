@@ -454,10 +454,6 @@ export function createFilesystemTools(params: {
             pattern: input.pattern,
             regex: input.regex,
             maxMatches: input.maxResults ?? 100,
-            extraArgs:
-              input.includeContextLines && input.includeContextLines > 0
-                ? ["--context", String(input.includeContextLines)]
-                : [],
           });
           if (searched.status === "error") {
             return boundGrepOutput(

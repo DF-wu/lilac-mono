@@ -187,13 +187,6 @@ export function createGrepInputSchema(hashlineEnabled = false) {
       .max(100)
       .optional()
       .describe('Optional file extension filters (e.g. ["ts", "tsx"]).'),
-    includeContextLines: z
-      .number()
-      .int()
-      .nonnegative()
-      .max(100)
-      .optional()
-      .describe("Include N context lines around each match."),
     mode: (hashlineEnabled
       ? z.enum(["default", "detailed", "hashline"])
       : z.enum(["default", "detailed"])
