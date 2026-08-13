@@ -203,7 +203,35 @@ function buildRemoteFsRunnerCommand(): ResultType<string, RemoteFsRunnerSetupErr
   }
   const packageSpec = shellSingleQuote(packageSpecValue);
   return Result.ok(`if command -v bunx >/dev/null 2>&1; then
-  bunx ${packageSpec} request
+  LILAC_RUNNER_CACHE_DIR="\${XDG_CACHE_HOME:-$HOME/.cache}/lilac/remote-fs-runner"
+  LILAC_BUNX_TMPDIR="$LILAC_RUNNER_CACHE_DIR/bunx"
+  LILAC_RUNNER_INSTALL_LOCK="$LILAC_RUNNER_CACHE_DIR/package-launch.lock"
+  mkdir -p "$LILAC_BUNX_TMPDIR"
+
+  run_lilac_bunx() {
+    TMPDIR="$LILAC_BUNX_TMPDIR" bunx "$@"
+  }
+
+  if command -v flock >/dev/null 2>&1; then
+    if ! run_lilac_bunx --no-install ${packageSpec} --version >/dev/null 2>&1; then
+      (
+        flock -x 9
+        if ! run_lilac_bunx --no-install ${packageSpec} --version >/dev/null 2>&1; then
+          run_lilac_bunx ${packageSpec} --version >/dev/null
+        fi
+      ) 9> "$LILAC_RUNNER_INSTALL_LOCK"
+    fi
+    run_lilac_bunx --no-install ${packageSpec} request
+  else
+    if command -v mktemp >/dev/null 2>&1; then
+      LILAC_BUNX_ISOLATED_TMPDIR=$(mktemp -d "\${TMPDIR:-/tmp}/lilac-bunx.XXXXXX")
+    else
+      LILAC_BUNX_ISOLATED_TMPDIR="\${TMPDIR:-/tmp}/lilac-bunx.$$.$RANDOM"
+      mkdir "$LILAC_BUNX_ISOLATED_TMPDIR"
+    fi
+    trap 'rm -rf "$LILAC_BUNX_ISOLATED_TMPDIR" >/dev/null 2>&1 || true' EXIT
+    TMPDIR="$LILAC_BUNX_ISOLATED_TMPDIR" bunx ${packageSpec} request
+  fi
 elif command -v npx >/dev/null 2>&1; then
   npx --no-workspaces -y ${packageSpec} request
 else

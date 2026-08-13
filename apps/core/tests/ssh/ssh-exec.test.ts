@@ -821,12 +821,19 @@ wait "$witness_pid"
       bunxPath,
       `#!/usr/bin/env bash
 set -euo pipefail
-if [ "\${1:-}" != "@stanley2058/lilac-remote-fs-runner@0.0.5" ]; then
+if [ "\${1:-}" != "--no-install" ]; then
+  printf '%s' '{"ok":false,"error":"unexpected bunx install invocation"}'
+  exit 0
+fi
+if [ "\${2:-}" != "@stanley2058/lilac-remote-fs-runner@0.0.6" ]; then
   printf '%s' '{"ok":false,"error":"unexpected remote fs runner package spec"}'
   exit 0
 fi
-if [ "\${2:-}" != "request" ]; then
+if [ "\${3:-}" != "--version" ] && [ "\${3:-}" != "request" ]; then
   printf '%s' '{"ok":false,"error":"unexpected bunx invocation"}'
+  exit 0
+fi
+if [ "\${3:-}" = "--version" ]; then
   exit 0
 fi
 payload=$(cat)
@@ -876,6 +883,141 @@ printf '%s' '{"ok":false,"error":"npx should not be used when bunx exists"}'
       truncated: false,
       effectiveBackend: "fff",
     });
+  });
+
+  it("coordinates cold bunx installation for concurrent home-scope remote searches", async () => {
+    const bunxPath = path.join(binDir, "bunx");
+    const installedPath = path.join(tempDir, "runner-installed");
+    const installerPath = path.join(tempDir, "runner-installer");
+    const installerStartedPath = path.join(tempDir, "runner-installer-started");
+    const installerReleasePath = path.join(tempDir, "runner-installer-release");
+    const installerLogPath = path.join(tempDir, "runner-installer-log");
+    const probeTicketDir = path.join(tempDir, "runner-probe-tickets");
+    const concurrentProbePath = path.join(tempDir, "runner-concurrent-probe");
+    const cacheHome = path.join(tempDir, "cache");
+    const bunxTempDir = path.join(cacheHome, "lilac", "remote-fs-runner", "bunx");
+    const previousCacheHome = process.env.XDG_CACHE_HOME;
+    await mkdir(probeTicketDir);
+    await writeFile(
+      bunxPath,
+      `#!/usr/bin/env bash
+set -euo pipefail
+PACKAGE='@stanley2058/lilac-remote-fs-runner@0.0.6'
+INSTALLED=${JSON.stringify(installedPath)}
+INSTALLER=${JSON.stringify(installerPath)}
+INSTALLER_STARTED=${JSON.stringify(installerStartedPath)}
+INSTALLER_RELEASE=${JSON.stringify(installerReleasePath)}
+INSTALLER_LOG=${JSON.stringify(installerLogPath)}
+PROBE_TICKETS=${JSON.stringify(probeTicketDir)}
+CONCURRENT_PROBE=${JSON.stringify(concurrentProbePath)}
+EXPECTED_TMPDIR=${JSON.stringify(bunxTempDir)}
+
+if [ "\${TMPDIR:-}" != "$EXPECTED_TMPDIR" ]; then
+  exit 89
+fi
+
+if [ "\${1:-}" = "--no-install" ]; then
+  if [ "\${2:-}" != "$PACKAGE" ]; then
+    exit 90
+  fi
+  if [ "\${3:-}" = "--version" ]; then
+    if mkdir "$PROBE_TICKETS/1" 2>/dev/null; then :
+    elif mkdir "$PROBE_TICKETS/2" 2>/dev/null; then :
+    elif mkdir "$PROBE_TICKETS/3" 2>/dev/null; then printf 'probed\n' > "$CONCURRENT_PROBE"
+    fi
+    [ -f "$INSTALLED" ]
+    exit
+  fi
+  if [ "\${3:-}" != "request" ] || [ ! -f "$INSTALLED" ]; then
+    exit 91
+  fi
+elif [ "\${1:-}" = "$PACKAGE" ] && [ "\${2:-}" = "--version" ]; then
+  if ! mkdir "$INSTALLER" 2>/dev/null; then
+    printf '%s\n' 'Failed to link typescript: EEXIST' >&2
+    printf '%s\n' 'Failed to link @stanley2058/lilac-remote-fs-runner: EEXIST' >&2
+    exit 1
+  fi
+  trap 'rmdir "$INSTALLER" >/dev/null 2>&1 || true; rm -f "$INSTALLER_RELEASE" >/dev/null 2>&1 || true' EXIT
+  mkfifo "$INSTALLER_RELEASE"
+  printf 'started\n' > "$INSTALLER_STARTED"
+  read -r _ < "$INSTALLER_RELEASE"
+  touch "$INSTALLED"
+  printf 'install\n' >> "$INSTALLER_LOG"
+  exit 0
+else
+  exit 92
+fi
+
+payload=$(cat)
+if [[ "$payload" != *'"op":"fs.fuzzy_search"'* ]]; then
+  exit 93
+fi
+printf '%s' '{"ok":true,"value":{"results":[],"totalMatched":0,"totalFiles":0,"truncated":false,"effectiveBackend":"fff"}}'
+`,
+      "utf8",
+    );
+    await chmod(bunxPath, 0o755);
+
+    const installerStarted = observeFileCreation(tempDir, path.basename(installerStartedPath));
+    const concurrentProbe = observeFileCreation(tempDir, path.basename(concurrentProbePath));
+    const firstController = new AbortController();
+    const secondController = new AbortController();
+    let first: ReturnType<typeof remoteFuzzySearch> | undefined;
+    let second: ReturnType<typeof remoteFuzzySearch> | undefined;
+    process.env.XDG_CACHE_HOME = cacheHome;
+
+    try {
+      first = remoteFuzzySearch({
+        host: "fakehost",
+        cwd: "~",
+        input: { query: "first" },
+        denyPaths: [],
+        timeoutMs: 5_000,
+        signal: firstController.signal,
+      });
+      expect(
+        await withRejectionTimeout(
+          installerStarted.outcome,
+          2_000,
+          "cold bunx installer did not start",
+        ),
+      ).toBe("created");
+
+      second = remoteFuzzySearch({
+        host: "fakehost",
+        cwd: "~",
+        input: { query: "second" },
+        denyPaths: [],
+        timeoutMs: 5_000,
+        signal: secondController.signal,
+      });
+      expect(
+        await withRejectionTimeout(
+          concurrentProbe.outcome,
+          2_000,
+          "concurrent bunx probe did not start",
+        ),
+      ).toBe("created");
+
+      await writeFile(installerReleasePath, "continue\n");
+      const [firstResult, secondResult] = await Promise.all([first, second]);
+
+      expect(firstResult.status).toBe("ok");
+      expect(secondResult.status).toBe("ok");
+      expect(await readFile(installerLogPath, "utf8")).toBe("install\n");
+    } finally {
+      installerStarted.close();
+      concurrentProbe.close();
+      firstController.abort();
+      secondController.abort();
+      await Promise.allSettled([first, second].filter((value) => value !== undefined));
+      await Promise.allSettled([installerStarted.outcome, concurrentProbe.outcome]);
+      if (previousCacheHome === undefined) {
+        delete process.env.XDG_CACHE_HOME;
+      } else {
+        process.env.XDG_CACHE_HOME = previousCacheHome;
+      }
+    }
   });
 
   it("keeps hostile remote FFF request serialization inside Result", async () => {
