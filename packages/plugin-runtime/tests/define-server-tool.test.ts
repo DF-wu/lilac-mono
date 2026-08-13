@@ -1,7 +1,13 @@
-import { describe, expect, it } from "bun:test";
+import { describe, expect, expectTypeOf, it } from "bun:test";
 import { z, ZodError } from "zod";
 
+import type { Level1ExecutionRequestContext, RequestContext } from "../types";
 import { defineServerTool, ToolInputValidationError, type ServerToolCallOptions } from "../index";
+
+expectTypeOf<NonNullable<RequestContext["requestInitiator"]>["platform"]>().toEqualTypeOf<string>();
+expectTypeOf<
+  NonNullable<Level1ExecutionRequestContext["requestInitiator"]>["platform"]
+>().toEqualTypeOf<string>();
 
 describe("defineServerTool", () => {
   it("lists heterogeneous callables in declaration order using their exact external IDs", async () => {

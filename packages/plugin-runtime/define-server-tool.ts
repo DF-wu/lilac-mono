@@ -26,7 +26,11 @@ export type ServerToolCatalogResult = false | ServerToolCatalogOverrides;
 
 export type ServerToolCatalog = () => ServerToolCatalogResult | Promise<ServerToolCatalogResult>;
 
-export type ServerToolCallableDefinition<TSchema extends z.ZodType, TResult> = {
+export type ServerToolCallableDefinition<
+  TSchema extends z.ZodType,
+  TResult,
+  P extends string = string,
+> = {
   readonly name: string;
   readonly description: string;
   readonly inputSchema: TSchema;
@@ -37,11 +41,11 @@ export type ServerToolCallableDefinition<TSchema extends z.ZodType, TResult> = {
   readonly catalog?: false | ServerToolCatalog;
   run(
     input: z.output<TSchema>,
-    opts: ServerToolCallOptions | undefined,
+    opts: ServerToolCallOptions<P> | undefined,
   ): TResult | Promise<TResult>;
 };
 
-export type ServerToolCallable = {
+export type ServerToolCallable<P extends string = string> = {
   readonly name: string;
   readonly description: string;
   readonly inputSchema: z.ZodType;
@@ -52,63 +56,68 @@ export type ServerToolCallable = {
   invoke(
     callableId: string,
     input: Record<string, unknown>,
-    opts: ServerToolCallOptions | undefined,
+    opts: ServerToolCallOptions<P> | undefined,
   ): Promise<unknown>;
 };
 
-export type ServerToolCallableBuilder = <TSchema extends z.ZodType, TResult>(
-  definition: ServerToolCallableDefinition<TSchema, TResult>,
-) => ServerToolCallable;
+export type ServerToolCallableBuilder<P extends string = string> = <
+  TSchema extends z.ZodType,
+  TResult,
+>(
+  definition: ServerToolCallableDefinition<TSchema, TResult, P>,
+) => ServerToolCallable<P>;
 
-export type ServerToolDefinition = {
+export type ServerToolDefinition<P extends string = string> = {
   readonly id: string;
   readonly init?: () => void | Promise<void>;
   readonly destroy?: () => void | Promise<void>;
   readonly callables: (helpers: {
-    readonly callable: ServerToolCallableBuilder;
-  }) => Readonly<Record<string, ServerToolCallable>>;
+    readonly callable: ServerToolCallableBuilder<P>;
+  }) => Readonly<Record<string, ServerToolCallable<P>>>;
 };
 
-const callable: ServerToolCallableBuilder = <TSchema extends z.ZodType, TResult>(
-  definition: ServerToolCallableDefinition<TSchema, TResult>,
-): ServerToolCallable => {
-  const validation = definition.validation ?? "guided";
-  const primaryPositional =
-    typeof definition.primaryPositional === "string"
-      ? { field: definition.primaryPositional }
-      : definition.primaryPositional;
+function createCallable<P extends string>(): ServerToolCallableBuilder<P> {
+  return <TSchema extends z.ZodType, TResult>(
+    definition: ServerToolCallableDefinition<TSchema, TResult, P>,
+  ): ServerToolCallable<P> => {
+    const validation = definition.validation ?? "guided";
+    const primaryPositional =
+      typeof definition.primaryPositional === "string"
+        ? { field: definition.primaryPositional }
+        : definition.primaryPositional;
 
-  return {
-    name: definition.name,
-    description: definition.description,
-    inputSchema: definition.inputSchema,
-    primaryPositional,
-    hidden: definition.hidden,
-    cli: definition.cli,
-    catalog: definition.catalog,
-    async invoke(callableId, input: Record<string, unknown>, opts) {
-      const decoded =
-        validation === "guided"
-          ? parseToolInput({ callableId, input, schema: definition.inputSchema })
-          : parseToolInputPreservingZodError({
-              callableId,
-              input,
-              schema: definition.inputSchema,
-            });
-      return definition.run(decoded, opts);
-    },
+    return {
+      name: definition.name,
+      description: definition.description,
+      inputSchema: definition.inputSchema,
+      primaryPositional,
+      hidden: definition.hidden,
+      cli: definition.cli,
+      catalog: definition.catalog,
+      async invoke(callableId, input: Record<string, unknown>, opts) {
+        const decoded =
+          validation === "guided"
+            ? parseToolInput({ callableId, input, schema: definition.inputSchema })
+            : parseToolInputPreservingZodError({
+                callableId,
+                input,
+                schema: definition.inputSchema,
+              });
+        return definition.run(decoded, opts);
+      },
+    };
   };
-};
+}
 
 class ServerToolCallableNotFound extends TaggedError("ServerToolCallableNotFound")<{
   readonly callableId: string;
   readonly message: string;
 }> {}
 
-function lookupServerToolCallable(
-  callables: ReadonlyMap<string, ServerToolCallable>,
+function lookupServerToolCallable<P extends string>(
+  callables: ReadonlyMap<string, ServerToolCallable<P>>,
   callableId: string,
-): ResultType<ServerToolCallable, ServerToolCallableNotFound> {
+): ResultType<ServerToolCallable<P>, ServerToolCallableNotFound> {
   const entry = callables.get(callableId);
   if (entry) return Result.ok(entry);
   return Result.err(
@@ -126,9 +135,9 @@ function adaptServerToolDispatchResultToHost<TValue>(
   throw new Error(result.error.message);
 }
 
-function createHelpEntry(
+function createHelpEntry<P extends string>(
   callableId: string,
-  definition: ServerToolCallable,
+  definition: ServerToolCallable<P>,
   overrides?: ServerToolCatalogOverrides,
 ): ServerToolHelpEntry {
   const hidden = overrides?.hidden ?? definition.hidden;
@@ -147,7 +156,10 @@ function createHelpEntry(
   };
 }
 
-export function defineServerTool(definition: ServerToolDefinition): ServerTool {
+export function defineServerTool<P extends string = string>(
+  definition: ServerToolDefinition<P>,
+): ServerTool<P> {
+  const callable = createCallable<P>();
   const callables = new Map(Object.entries(definition.callables({ callable })));
 
   return {

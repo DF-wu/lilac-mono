@@ -2,7 +2,7 @@ import type { ToolSet } from "ai";
 
 export type PluginSource = "builtin" | "external";
 
-export type RequestContext = {
+export type RequestContext<P extends string = string> = {
   requestId?: string;
   sessionId?: string;
   requestClient?: string;
@@ -12,7 +12,7 @@ export type RequestContext = {
   serverOwnedRequest?: boolean;
   /** Set only after authenticating the root-only container operator token. */
   operator?: boolean;
-  requestInitiator?: { platform: "discord" | "github"; userId: string };
+  requestInitiator?: { platform: P; userId: string };
   requestInitiatorSessionId?: string;
   currentTurnUserId?: string;
   toolCallId?: string;
@@ -41,13 +41,13 @@ export type ServerToolHelpEntry = {
 
 export type ServerToolListResult = ServerToolHelpEntry[];
 
-export type ServerToolCallOptions = {
+export type ServerToolCallOptions<P extends string = string> = {
   signal?: AbortSignal;
-  context?: RequestContext;
+  context?: RequestContext<P>;
   messages?: readonly unknown[];
 };
 
-export interface ServerTool {
+export interface ServerTool<P extends string = string> {
   id: string;
 
   init(): Promise<void>;
@@ -56,7 +56,7 @@ export interface ServerTool {
   call(
     callableId: string,
     input: Record<string, unknown>,
-    opts?: ServerToolCallOptions,
+    opts?: ServerToolCallOptions<P>,
   ): Promise<unknown>;
 }
 
@@ -76,34 +76,37 @@ export type Level1SubagentConfig = {
   maxDepth: number;
 };
 
-export type Level1ExecutionRequestContext = {
+export type Level1ExecutionRequestContext<P extends string = string> = {
   requestId: string;
   sessionId: string;
   requestClient: string;
   subagentDepth: number;
   subagentProfile: Level1RunProfile;
   safetyMode?: "trusted" | "restricted";
-  requestInitiator?: { platform: "discord" | "github"; userId: string };
+  requestInitiator?: { platform: P; userId: string };
   requestInitiatorSessionId?: string;
   currentTurnUserId?: string;
   metadata?: Readonly<Record<string, unknown>>;
 };
 
-export type Level1ToolRunContext<TRuntimeContext> = {
+export type Level1ToolRunContext<TRuntimeContext, P extends string = string> = {
   runtime: TRuntimeContext;
   cwd: string;
   runProfile: Level1RunProfile;
   editingToolMode: "apply_patch" | "edit_file" | "none";
   subagentDepth: number;
   subagentConfig: Level1SubagentConfig;
-  requestContext?: Level1ExecutionRequestContext;
+  requestContext?: Level1ExecutionRequestContext<P>;
 };
 
-export type Level1ToolBuildContext<TRuntimeContext> = Level1ToolRunContext<TRuntimeContext> & {
+export type Level1ToolBuildContext<
+  TRuntimeContext,
+  P extends string = string,
+> = Level1ToolRunContext<TRuntimeContext, P> & {
   getTools(): ToolSet;
-  getLevel1ToolSpecs(): ReadonlyMap<string, Level1ToolSpec<TRuntimeContext>>;
+  getLevel1ToolSpecs(): ReadonlyMap<string, Level1ToolSpec<TRuntimeContext, P>>;
   resolveEditTargets(
-    spec: Level1ToolSpec<TRuntimeContext>,
+    spec: Level1ToolSpec<TRuntimeContext, P>,
     args: unknown,
     context: { cwd: string },
   ): Promise<readonly string[]>;
@@ -116,12 +119,12 @@ export type Level1ToolBuildContext<TRuntimeContext> = Level1ToolRunContext<TRunt
   }) => void | Promise<void>;
 };
 
-export interface Level1ToolSpec<TRuntimeContext> {
+export interface Level1ToolSpec<TRuntimeContext, P extends string = string> {
   name: string;
   /** Enabled tools are batch-callable by default. Set false to opt out. */
   supportsBatch?: boolean;
-  createTool(buildContext: Level1ToolBuildContext<TRuntimeContext>): unknown;
-  isEnabled(runContext: Level1ToolRunContext<TRuntimeContext>): boolean;
+  createTool(buildContext: Level1ToolBuildContext<TRuntimeContext, P>): unknown;
+  isEnabled(runContext: Level1ToolRunContext<TRuntimeContext, P>): boolean;
   editTargets?(
     args: unknown,
     context: { cwd: string },
