@@ -74,7 +74,7 @@ type CmdRequestDeliveryError =
 function applyCmdRequestDeliveryPolicy(error: CmdRequestDeliveryError): DeliveryDisposition {
   switch (error._tag) {
     case "CmdRequestRequiredHeadersMissing":
-      return "park-pending";
+      return "dead-letter";
     case "CmdRequestCancelFailed":
       return "commit";
     case "RelayEventCorrelationInvalid":
@@ -105,7 +105,7 @@ type CmdSurfaceDeliveryError =
 function applyCmdSurfaceDeliveryPolicy(error: CmdSurfaceDeliveryError): DeliveryDisposition {
   switch (error._tag) {
     case "CmdSurfaceRequiredHeadersMissing":
-      return "park-pending";
+      return "dead-letter";
     case "CmdSurfaceReanchorFailed":
     case "CmdSurfaceReplyTargetInvalid":
       return "commit";
@@ -137,7 +137,7 @@ type EvtRequestDeliveryError =
 function applyEvtRequestDeliveryPolicy(error: EvtRequestDeliveryError): DeliveryDisposition {
   switch (error._tag) {
     case "EvtRequestRequiredHeadersMissing":
-      return "park-pending";
+      return "dead-letter";
     case "EvtRequestReplyTargetInvalid":
       return "dead-letter";
     case "EvtRequestStopTypingFailed":

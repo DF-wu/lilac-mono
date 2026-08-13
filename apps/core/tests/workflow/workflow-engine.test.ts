@@ -44,6 +44,7 @@ import {
   type WorkflowCompletionTarget,
 } from "../../src/workflow/workflow-domain";
 import { WorkflowWaitResolver } from "../../src/workflow/workflow-wait-resolver";
+import { workflowConsumerId } from "../../src/workflow/workflow-consumer-id";
 import { readWorkflowValueArtifact } from "../../src/workflow/workflow-artifact-store";
 import {
   compileWorkflowSourceResult,
@@ -102,16 +103,18 @@ class HeartbeatTrackingWorkflowStore extends DurableWorkflowStore {
 class CapturingRawBus implements RawBus {
   readonly messages: Array<Omit<Message<unknown>, "id" | "ts">> = [];
   readonly history: Message<unknown>[] = [];
+  readonly subscriptionOptions: Array<{ topic: string; options: SubscriptionOptions }> = [];
   subscribe = subscribeForTest;
   async publish<TData>(message: Omit<Message<TData>, "id" | "ts">, _options: PublishOptions) {
     this.messages.push(message);
     return { id: `${this.messages.length}-0`, cursor: `${this.messages.length}-0` };
   }
   async openTestSubscription(
-    _topic: string,
-    _options: SubscriptionOptions,
+    topic: string,
+    options: SubscriptionOptions,
     _handler: TestRawMessageHandler,
   ) {
+    this.subscriptionOptions.push({ topic, options });
     return { stop: async () => {} };
   }
   async fetch(topic: string, _options: FetchOptions) {
@@ -134,6 +137,7 @@ class CapturingRawBus implements RawBus {
 }
 class LiveCapturingRawBus implements RawBus {
   readonly messages: Array<Omit<Message<unknown>, "id" | "ts">> = [];
+  readonly subscriptionOptions: Array<{ topic: string; options: SubscriptionOptions }> = [];
   subscribe = subscribeForTest;
   private sequence = 0;
   private readonly subscriptions = new Set<{
@@ -153,9 +157,10 @@ class LiveCapturingRawBus implements RawBus {
   }
   async openTestSubscription(
     topic: string,
-    _options: SubscriptionOptions,
+    options: SubscriptionOptions,
     handler: TestRawMessageHandler,
   ) {
+    this.subscriptionOptions.push({ topic, options });
     const subscription = { topic, handler };
     this.subscriptions.add(subscription);
     return { stop: async () => void this.subscriptions.delete(subscription) };
@@ -351,6 +356,13 @@ function firstOperationId(source: string): string {
   return `wfop:${sha256(`root:${callSite.callSiteId}:0`).slice(0, 40)}`;
 }
 describe("WorkflowEngine", () => {
+  it("creates boot-unique workflow consumer identities", () => {
+    const first = workflowConsumerId("core:workflow");
+    const second = workflowConsumerId("core:workflow");
+    expect(first).toStartWith(`core:workflow:${process.pid}:`);
+    expect(second).toStartWith(`core:workflow:${process.pid}:`);
+    expect(first).not.toBe(second);
+  });
   it("maps owned delivery failures to the required subscription dispositions", () => {
     const cases: readonly [
       WorkflowWakeDeliveryFailed | WorkflowOutputDeliveryFailed | WorkflowLifecycleDeliveryFailed,
@@ -2326,6 +2338,14 @@ describe("WorkflowEngine", () => {
             message.data.queue === "prompt",
         ),
       );
+      const lifecycleSubscription = raw.subscriptionOptions.find(
+        ({ topic, options }) => topic === "evt.request" && options.mode === "tail",
+      );
+      expect(lifecycleSubscription?.options).toEqual({
+        mode: "tail",
+        offset: { type: "begin" },
+        batch: { maxWaitMs: 100 },
+      });
       expect(
         store.cancelRunAndChildren({ runId: "run-1", now: 10, detail: "test cancellation" })?.state,
       ).toBe("cancelled");

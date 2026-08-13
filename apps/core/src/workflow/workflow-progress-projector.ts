@@ -30,6 +30,7 @@ import {
   type WorkflowSurfaceBinding,
 } from "./workflow-domain";
 import { formatWorkflowErrorForLog } from "./workflow-error-log";
+import { workflowConsumerId } from "./workflow-consumer-id";
 import {
   buildWorkflowProgressViewResult,
   renderWorkflowProgressView,
@@ -308,7 +309,7 @@ export class WorkflowProgressProjector implements WorkflowProgressCardService {
       {
         mode: "fanout",
         subscriptionId: this.input.subscriptionId,
-        consumerId: `${this.input.subscriptionId}:${process.pid}`,
+        consumerId: workflowConsumerId(this.input.subscriptionId),
         offset: { type: "now" },
         batch: { maxWaitMs: 1_000 },
       },

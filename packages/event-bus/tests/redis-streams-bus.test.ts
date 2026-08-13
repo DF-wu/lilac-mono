@@ -1,4 +1,4 @@
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, spyOn } from "bun:test";
 import { Panic, Result, type Result as ResultType } from "better-result";
 import Redis from "ioredis";
 import SuperJSON from "superjson";
@@ -69,6 +69,109 @@ function subscriberPoolStats(raw: ReturnType<typeof createRedisStreamsBus>) {
 }
 
 describe("RedisStreamsBus", () => {
+  it("warns with aggregate PEL health when an existing group has pending entries", async () => {
+    const redis = new Redis(TEST_REDIS_URL);
+    const keyPrefix = `test:lilac-event-bus:${randomId("pending-start-observability")}`;
+    const streamKey = `${keyPrefix}:topic`;
+    const group = "pending-start-observability";
+    const id = await redis.xadd(streamKey, "*", "type", "test", "ts", "1", "data", "null");
+    if (typeof id !== "string") throw new Error("Redis did not return an entry id");
+    await redis.xgroup("CREATE", streamKey, group, "0-0");
+    await redis.xreadgroup("GROUP", group, "abandoned", "STREAMS", streamKey, ">");
+
+    const raw = createRedisStreamsBus({ redis, keyPrefix });
+    const logger = Reflect.get(raw, "logger") as {
+      warn(event: string, context: Record<string, unknown>): void;
+    };
+    const warnings: Array<{ event: string; context: Record<string, unknown> }> = [];
+    const warningObserved = Promise.withResolvers<void>();
+    const warn = spyOn(logger, "warn").mockImplementation((event, context) => {
+      warnings.push({ event, context });
+      if (event === "event_bus.pending_entries") warningObserved.resolve();
+    });
+    try {
+      const subscription = requireOk(
+        await raw.subscribe(
+          "topic",
+          {
+            mode: "work",
+            subscriptionId: group,
+            consumerId: "replacement",
+            batch: { maxWaitMs: 50 },
+          },
+          async () => ({ disposition: "commit" }),
+        ),
+      );
+      await warningObserved.promise;
+      expect(warnings).toEqual([
+        {
+          event: "event_bus.pending_entries",
+          context: {
+            topic: "topic",
+            group,
+            trigger: "subscription_start",
+            pendingCount: 1,
+            oldestPendingIdleMs: expect.any(Number),
+          },
+        },
+      ]);
+      expect(JSON.stringify(warnings)).not.toContain("abandoned");
+      requireOk(await subscription.stop());
+    } finally {
+      warn.mockRestore();
+      await raw.close();
+      await redis.del(streamKey);
+      redis.disconnect();
+    }
+  });
+
+  it("warns with aggregate PEL health when a delivery is parked", async () => {
+    const redis = new Redis(TEST_REDIS_URL);
+    const keyPrefix = `test:lilac-event-bus:${randomId("pending-park-observability")}`;
+    const streamKey = `${keyPrefix}:topic`;
+    const group = "pending-park-observability";
+    const raw = createRedisStreamsBus({ redis, keyPrefix });
+    const logger = Reflect.get(raw, "logger") as {
+      warn(event: string, context: Record<string, unknown>): void;
+    };
+    const warningObserved = Promise.withResolvers<Record<string, unknown>>();
+    const warn = spyOn(logger, "warn").mockImplementation((event, context) => {
+      if (event === "event_bus.pending_entries") warningObserved.resolve(context);
+    });
+    try {
+      const subscription = requireOk(
+        await raw.subscribe(
+          "topic",
+          {
+            mode: "work",
+            subscriptionId: group,
+            consumerId: "consumer",
+            offset: { type: "begin" },
+            batch: { maxWaitMs: 50 },
+          },
+          async () => ({ disposition: "park-pending" }),
+        ),
+      );
+      await raw.publish(
+        { topic: "topic", type: "test", data: { secret: "must-not-be-logged" } },
+        { topic: "topic", type: "test", headers: { request_id: "private-request" } },
+      );
+      expect(await warningObserved.promise).toEqual({
+        topic: "topic",
+        group,
+        trigger: "parked",
+        pendingCount: 1,
+        oldestPendingIdleMs: expect.any(Number),
+      });
+      requireOk(await subscription.stop());
+    } finally {
+      warn.mockRestore();
+      await raw.close();
+      await redis.del(streamKey);
+      redis.disconnect();
+    }
+  });
+
   it("fails typed fetches for malformed XREAD stream, entry, and id responses", async () => {
     const redis = new Redis(TEST_REDIS_URL, { lazyConnect: true });
     const keyPrefix = `test:lilac-event-bus:${randomId("malformed-xread")}`;

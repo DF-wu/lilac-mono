@@ -32,6 +32,7 @@ import {
   readWorkflowValueArtifact,
 } from "./workflow-artifact-store";
 import { formatWorkflowErrorForLog } from "./workflow-error-log";
+import { workflowConsumerId } from "./workflow-consumer-id";
 import { resolveWorkflowSubagentToolResult } from "./workflow-subagent-output";
 
 export type WorkflowLiveParentCompletion = {
@@ -311,7 +312,7 @@ export class WorkflowLiveParentBridge {
       {
         mode: "fanout",
         subscriptionId: this.input.subscriptionId,
-        consumerId: `${this.input.subscriptionId}:${process.pid}`,
+        consumerId: workflowConsumerId(this.input.subscriptionId),
         offset: { type: "now" },
         batch: { maxWaitMs: 250 },
       },

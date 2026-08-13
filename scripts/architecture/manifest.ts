@@ -1486,6 +1486,14 @@ const INTEGRATED_BOUNDARY_DECODERS = new Map<string, readonly BoundaryDecoder[]>
         category: "wire",
       },
       {
+        identity: { module: "redis-streams-bus.ts", exportName: "decodeRedisPendingSummary" },
+        category: "wire",
+      },
+      {
+        identity: { module: "redis-streams-bus.ts", exportName: "decodeRedisOldestPendingIdle" },
+        category: "wire",
+      },
+      {
         identity: {
           module: "redis-event-dead-letter.ts",
           exportName: "decodeRedisDeadLetterEvidenceEntry",
@@ -7624,6 +7632,13 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
                 "Redis.xgroup or Redis.xpending",
                 "Captures consumer-group cleanup failure for the typed stop Result.",
               ],
+              [
+                "redis-streams-bus.ts",
+                "captureRedisPendingSummary",
+                "ioredis",
+                "Redis.xpending",
+                "Maps a rejected payload-free pending-summary inspection to an owned observability failure.",
+              ],
             ].map(([module, exportName, packageName, externalName, reason]) => ({
               identity: { module, exportName },
               category: "external-to-result" as const,
@@ -8746,7 +8761,7 @@ function approvedExceptionAdapterCatalogSha256(
 }
 
 export const APPROVED_EXCEPTION_ADAPTER_CATALOG_SHA256 =
-  "3202d507441d854b9d50599bab4a698c16565934689c0137faac58d173350668";
+  "22d13a31e9841837b5028a85eca0ae8f66914d8eae8b99aea9de46bc8f5d5da9";
 
 export const architectureManifest = {
   version: 1,

@@ -12,6 +12,7 @@ import { Result, TaggedError, type Result as ResultType } from "better-result";
 import { createLogger, formatTaggedErrorForLog } from "@stanley2058/lilac-utils";
 
 import { DurableWorkflowStore, type WorkflowActionOutboxEntry } from "./durable-workflow-store";
+import { workflowConsumerId } from "./workflow-consumer-id";
 import { sha256 } from "./workflow-definition";
 
 const surfaceActionEventSchema = z.strictObject({
@@ -288,7 +289,7 @@ export async function startWorkflowActionResolver(input: {
       {
         mode: "fanout",
         subscriptionId: input.subscriptionId,
-        consumerId: `${input.subscriptionId}:${process.pid}`,
+        consumerId: workflowConsumerId(input.subscriptionId),
         offset: { type: "now" },
         batch: { maxWaitMs: 1_000 },
       },

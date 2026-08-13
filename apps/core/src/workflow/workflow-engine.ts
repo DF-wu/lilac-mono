@@ -71,6 +71,7 @@ import {
   type WorkflowAgentOperationInputInvalid,
 } from "./workflow-operation-policy";
 import { formatWorkflowErrorForLog } from "./workflow-error-log";
+import { workflowConsumerId } from "./workflow-consumer-id";
 import { adaptEventPublishResultToHost } from "../shared/event-bus-result";
 
 const WORKFLOW_LEASE_STALE_MS = 60_000;
@@ -594,7 +595,7 @@ export class WorkflowEngine {
       {
         mode: "fanout",
         subscriptionId: this.input.subscriptionId,
-        consumerId: `${this.input.subscriptionId}:${process.pid}`,
+        consumerId: workflowConsumerId(this.input.subscriptionId),
         offset: { type: "now" },
         batch: { maxWaitMs: 500 },
       },
@@ -2008,7 +2009,6 @@ export class WorkflowEngine {
     const resetIdle = (): void => {
       if (!idleTimedOut) armIdle();
     };
-    const suffix = `${input.requestId}:${crypto.randomUUID()}`;
     const handleOutputMessage = async (
       message: DecodedLilacMessageForTopic<ReturnType<typeof outReqTopic>>,
     ): Promise<void> => {
@@ -2130,10 +2130,7 @@ export class WorkflowEngine {
     const evtSubscription = await this.input.bus.subscribeTopic(
       "evt.request",
       {
-        mode: "fanout",
-        subscriptionId: `workflow-request:${suffix}`,
-        consumerId: suffix,
-        ephemeral: true,
+        mode: "tail",
         offset: { type: "begin" },
         batch: { maxWaitMs: 100 },
       },

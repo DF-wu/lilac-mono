@@ -748,7 +748,7 @@ describe("startBusRequestRouter", () => {
     expect(raw.deliveryActions).toEqual([]);
   });
 
-  it("parks malformed lifecycle deliveries and commits ignored and successful lifecycle branches", async () => {
+  it("dead-letters malformed lifecycle deliveries and commits ignored and successful branches", async () => {
     const raw = createInMemoryRawBus();
     const bus = createLilacBus(raw);
     const router = await startBusRequestRouter({
@@ -784,14 +784,14 @@ describe("startBusRequestRouter", () => {
 
     expect(raw.deliveryActions.map(({ action }) => action.disposition)).toEqual([
       "commit",
-      "park-pending",
+      "dead-letter",
       "commit",
     ]);
     await router.stop();
     await router.done;
   });
 
-  it("parks malformed surface deliveries and commits stale and successful surface branches", async () => {
+  it("dead-letters malformed surface deliveries and commits stale and successful branches", async () => {
     const raw = createInMemoryRawBus();
     const bus = createLilacBus(raw);
     const router = await startBusRequestRouter({
@@ -827,7 +827,7 @@ describe("startBusRequestRouter", () => {
       raw.deliveryActions
         .filter(({ topic }) => topic === "evt.surface")
         .map(({ action }) => action.disposition),
-    ).toEqual(["park-pending", "commit", "commit"]);
+    ).toEqual(["dead-letter", "commit", "commit"]);
     await router.stop();
   });
 
@@ -4616,7 +4616,7 @@ describe("startBusRequestRouter", () => {
             expect(
               raw.deliveryActions.some(
                 ({ topic, action }) =>
-                  topic === "evt.request" && action.disposition === "park-pending",
+                  topic === "evt.request" && action.disposition === "dead-letter",
               ),
             ).toBe(true);
           }

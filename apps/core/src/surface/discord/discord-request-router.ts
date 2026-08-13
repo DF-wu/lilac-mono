@@ -365,6 +365,7 @@ function lifecycleDeliveryPolicy(
   switch (error._tag) {
     case "BusRequestRouterLifecycleCorrelationInvalid":
     case "BusRequestRouterMissingHeadersError":
+      return "dead-letter";
     case "BusRequestRouterRoutingError":
       return "park-pending";
   }
@@ -373,7 +374,7 @@ function lifecycleDeliveryPolicy(
 function surfaceDeliveryPolicy(error: BusRequestRouterMissingHeadersError): DeliveryDisposition {
   switch (error._tag) {
     case "BusRequestRouterMissingHeadersError":
-      return "park-pending";
+      return "dead-letter";
   }
 }
 
@@ -1003,7 +1004,7 @@ export async function startDiscordRequestRouter(
             hasSessionId: Boolean(sessionId),
             cursor: ctx.cursor,
             rawHeadersKeys: msg.headers ? Object.keys(msg.headers) : [],
-            action: "park_pending",
+            action: "dead_letter",
           });
           return Result.err(
             new BusRequestRouterMissingHeadersError({
@@ -1106,7 +1107,7 @@ export async function startDiscordRequestRouter(
             hasSessionId: Boolean(sessionId),
             cursor: ctx.cursor,
             rawHeadersKeys: msg.headers ? Object.keys(msg.headers) : [],
-            action: "park_pending",
+            action: "dead_letter",
           });
           return Result.err(
             new BusRequestRouterMissingHeadersError({

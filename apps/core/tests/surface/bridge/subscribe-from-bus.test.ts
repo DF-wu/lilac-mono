@@ -4278,7 +4278,7 @@ describe("bridgeBusToAdapter", () => {
     await bridge.stop();
   });
 
-  it("parks missing request_client headers in every relay consumer", async () => {
+  it("dead-letters missing request_client headers in every relay consumer", async () => {
     const deliveries: DeliveryObservation[] = [];
     const bus = createLilacBus(createInMemoryRawBus((delivery) => deliveries.push(delivery)));
     const bridge = await bridgeBusToAdapter({
@@ -4306,9 +4306,9 @@ describe("bridgeBusToAdapter", () => {
     );
 
     expect(deliveries.map(({ topic, disposition }) => ({ topic, disposition }))).toEqual([
-      { topic: "cmd.request", disposition: "park-pending" },
-      { topic: "cmd.surface", disposition: "park-pending" },
-      { topic: "evt.request", disposition: "park-pending" },
+      { topic: "cmd.request", disposition: "dead-letter" },
+      { topic: "cmd.surface", disposition: "dead-letter" },
+      { topic: "evt.request", disposition: "dead-letter" },
     ]);
     expect(deliveries.every((delivery) => !delivery.contextHasCommit)).toBe(true);
 

@@ -262,6 +262,69 @@ function decodeRedisWatermarkResponse(response: unknown): RedisResponseDecodeRes
   return { status: "ok", value: latest[0] };
 }
 
+function decodeRedisPendingSummary(
+  response: unknown,
+): RedisResponseDecodeResult<{ count: number; oldestId: string | null }> {
+  if (!Array.isArray(response) || response.length < 3) {
+    return { status: "error", message: "Redis XPENDING returned an invalid summary" };
+  }
+  const count = response[0];
+  const oldestId = response[1];
+  if (
+    typeof count !== "number" ||
+    !isRedisCount(count) ||
+    (oldestId !== null && (typeof oldestId !== "string" || !isRedisStreamId(oldestId)))
+  ) {
+    return { status: "error", message: "Redis XPENDING returned invalid summary fields" };
+  }
+  return { status: "ok", value: { count, oldestId } };
+}
+
+function decodeRedisOldestPendingIdle(response: unknown): RedisResponseDecodeResult<number> {
+  if (
+    !Array.isArray(response) ||
+    response.length !== 1 ||
+    !Array.isArray(response[0]) ||
+    response[0].length < 3 ||
+    typeof response[0][2] !== "number" ||
+    !isRedisCount(response[0][2])
+  ) {
+    return { status: "error", message: "Redis XPENDING returned an invalid oldest entry" };
+  }
+  return { status: "ok", value: response[0][2] };
+}
+
+class RedisPendingInspectionFailed extends TaggedError("RedisPendingInspectionFailed")<{
+  readonly message: string;
+}> {}
+
+async function captureRedisPendingSummary(
+  redis: Redis,
+  streamKey: string,
+  group: string,
+): Promise<
+  ResultType<{ count: number; oldestIdleMs: number | null }, RedisPendingInspectionFailed>
+> {
+  try {
+    const summary = decodeRedisPendingSummary((await redis.xpending(streamKey, group)) as unknown);
+    if (summary.status === "error") {
+      return Result.err(new RedisPendingInspectionFailed({ message: summary.message }));
+    }
+    if (summary.value.count === 0) return Result.ok({ count: 0, oldestIdleMs: null });
+    const oldest = decodeRedisOldestPendingIdle(
+      (await redis.xpending(streamKey, group, "-", "+", 1)) as unknown,
+    );
+    if (oldest.status === "error") {
+      return Result.err(new RedisPendingInspectionFailed({ message: oldest.message }));
+    }
+    return Result.ok({ count: summary.value.count, oldestIdleMs: oldest.value });
+  } catch {
+    return Result.err(
+      new RedisPendingInspectionFailed({ message: "Redis pending inspection failed" }),
+    );
+  }
+}
+
 type RedisFieldsDecodeResult =
   | { status: "ok"; value: Record<string, string> }
   | { status: "error"; issues: readonly RedisMessageDecodeIssue[] };
@@ -657,6 +720,28 @@ export class RedisStreamsBus implements RawBus {
     return topic.startsWith("out.req.");
   }
 
+  private async observePendingEntries(
+    topic: Topic,
+    streamKey: string,
+    group: string,
+    trigger: "parked" | "subscription_start",
+  ): Promise<void> {
+    const inspected = await captureRedisPendingSummary(this.redis, streamKey, group);
+    if (inspected.status === "error") {
+      this.logger.warn("event_bus.pending_inspection_failed", { topic, group, trigger });
+      return;
+    }
+    const { count: pendingCount, oldestIdleMs } = inspected.value;
+    if (pendingCount === 0) return;
+    this.logger.warn("event_bus.pending_entries", {
+      topic,
+      group,
+      trigger,
+      pendingCount,
+      oldestPendingIdleMs: oldestIdleMs,
+    });
+  }
+
   private scheduleAcknowledgedTrim(topic: Topic, streamKey: string): void {
     if (
       this.closing ||
@@ -934,6 +1019,9 @@ export class RedisStreamsBus implements RawBus {
         if (opts.ephemeral && !createdGroup) {
           throw new Error(`Ephemeral consumer group already exists: ${group}`);
         }
+        if (!createdGroup) {
+          void this.observePendingEntries(topic, streamKey, group, "subscription_start");
+        }
       }
     } catch (cause) {
       if (!lease.shared) await lease.release({ unhealthy: true }).catch(() => undefined);
@@ -1022,7 +1110,10 @@ export class RedisStreamsBus implements RawBus {
           return { status: "advance" };
         }
         case "park-pending":
-          if (opts.mode !== "tail") return { status: "park" };
+          if (opts.mode !== "tail") {
+            if (group) void this.observePendingEntries(topic, streamKey, group, "parked");
+            return { status: "park" };
+          }
           return {
             status: "stop",
             error: new EventDeliveryStopped({
