@@ -148,21 +148,27 @@ The Discord adapter also maintains a local SQLite cache (`discord-surface.db`) f
 
 ### Surface Runtime Registry
 
-Core composes its implemented surfaces through one closed `SurfaceRuntimeRegistry` in
-`apps/core/src/surface/runtime-descriptor.ts`. A platform-parameterized descriptor binds an
-unparameterized adapter to coarse structural ports for adapter ingress, request ingress, output relay,
-and workflow progress. Port presence declares complete subsystem participation; optional adapter
-operations are attempted directly and their typed `SurfaceOperationResult` is authoritative. There is
-no predeclared operation-support metadata, dynamic descriptor loading, or search descriptor port.
+`apps/core/src/surface/builtin-surface-protocols.ts` contains the exhaustive static
+`BUILTIN_SURFACE_PROTOCOLS` catalog for the closed `SessionRef`/`MsgRef` platform set. It provides
+existing protocol-specific ref construction/decoding, tool targets, and normalized-origin interpretation;
+it neither enables a platform nor admits trust.
 
-The registry exposes adapters to shared runtime and tool callers only through a guarded resolver. It
-resolves an exact registered platform, never infers executable support from the broader event-bus wire
-enum, and wraps the adapter with descriptor-bound guards. Callers validate primary and nested input refs
-before protocol access; the facade validates adapter-produced session, message, event, callback, output,
-workflow, and partial-completion refs before publication, transcript linking, persistence, or recovery.
-Expected operations return the closed Result algebra, including explicit unsupported, invalid-input,
-platform/session mismatch, partial completion, not-found, permission, rate-limit, and unavailable
-outcomes. Unrecognized exceptions and produced-ref mismatches remain supervised defects.
+Executable runtime membership is separate. `SurfaceRuntimeRegistry` in
+`apps/core/src/surface/runtime-descriptor.ts` binds a platform-parameterized descriptor to its catalog
+protocol and coarse adapter-ingress, request-ingress, relay, and workflow-progress participation. The
+registry resolves only exact registered descriptors, never infers executability from the broader
+event-bus wire enum. It owns descriptor-bound adapter guarding: it creates one guarded adapter, passes
+that exact facade to narrow relay and workflow-progress factories, and guards the resulting
+workflow-progress port before exposure. Port presence declares complete subsystem participation; optional
+adapter operations are attempted directly and their typed `SurfaceOperationResult` is authoritative.
+There is no operation-support metadata, dynamic descriptor loading, or search descriptor port.
+
+Callers validate primary and nested input refs before protocol access; the guarded facade validates
+adapter-produced session, message, event, callback, output, workflow, and partial-completion refs before
+publication, transcript linking, persistence, or recovery. Expected operations return the closed Result
+algebra, including explicit unsupported, invalid-input, platform/session mismatch, partial completion,
+not-found, permission, rate-limit, and unavailable outcomes. Unrecognized exceptions and produced-ref
+mismatches remain supervised defects.
 
 Registry iteration in `apps/core/src/runtime/surface-runtime-lifecycle.ts` drives connection, startup
 rollback ownership, ingress shutdown, relay drain, snapshot collection, restore dispatch, and
@@ -177,17 +183,19 @@ A wire-valid platform is not therefore an implemented or registered Core surface
 
 The trust chain begins at authenticated Discord gateway or verified GitHub webhook ingress, decodes the
 complete external envelope into a closed protocol projection, publishes compatible metadata on trusted
-Redis, and decodes it again into a normalized origin. Downstream control, tool, workflow, plugin, and
-subagent contexts preserve one correlated `(platform, userId, sessionId)` identity; conflicting metadata
-fails closed before trusted authority is assigned.
+Redis, and generically routes correlated normalized identity through the selected built-in protocol.
+`SurfacePrincipal` is the shared closed built-in `(platform, userId)` shape; Core instantiates the plugin
+request context's generic platform parameter with that type. Catalog or descriptor membership cannot
+create a principal or trust admission: only correlated normalized trusted-bus identity can do so, and
+conflicting metadata fails closed.
 
 Graceful restart snapshot v4 preserves exact relay platform/request-client/session/ref correlation,
 normalized recovery identity, current-turn user identity, PEL event identity, queue reservations,
 control-application state, and partial lifecycle-publication progress. Recovery reads are non-destructive:
 v1/v2/v3 remain readable and migrate in memory, unavailable or failed restore targets remain retained,
 paused apply stays rollbackable, and the exact row is compare-and-deleted only before total synchronous
-activation. Compatible wire and persistence readers remain broader than the installed registry and are not
-narrowed by executable adapter selection.
+activation. Explicit wire and persisted compatibility readers remain broader than the installed registry;
+they are unchanged and do not derive accepted values or versions from the catalog or registry.
 
 The registry is internal runtime composition, not a dynamic plugin API. Discord health, request routing,
 aliases, allowlists, local storage, search indexing/healing, and search sidecars remain Discord-owned.
