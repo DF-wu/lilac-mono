@@ -20,6 +20,10 @@ import {
   SurfaceUnavailable,
 } from "../../src/surface/adapter";
 import {
+  BUILTIN_SURFACE_PROTOCOLS,
+  type BuiltinSurfaceProtocolKeysExactlyEqualRefPlatforms,
+} from "../../src/surface/builtin-surface-protocols";
+import {
   createDiscordRelayPolicy,
   createDiscordSurfaceRuntimeDescriptor,
   createDiscordWorkflowProgressPort,
@@ -46,6 +50,8 @@ import {
 } from "../../src/surface/runtime-descriptor";
 import type {
   ContentOpts,
+  DiscordSessionRef,
+  GithubSessionRef,
   LimitOpts,
   MsgRef,
   SendOpts,
@@ -229,7 +235,7 @@ function discordDescriptor(
   return createDiscordSurfaceRuntimeDescriptor({
     adapter,
     adapterIngress: discordAdapterIngress(),
-    relay: discordRelay(),
+    createRelay: () => discordRelay(),
   });
 }
 
@@ -239,7 +245,7 @@ function githubDescriptor(
   return createGithubSurfaceRuntimeDescriptor({
     adapter,
     requestIngress: requestIngress(),
-    relay: githubRelay(),
+    createRelay: () => githubRelay(),
   });
 }
 
@@ -251,8 +257,31 @@ describe("surface runtime descriptor factories", () => {
     expectTypeOf<RegisteredSurfacePlatform>().toEqualTypeOf<"discord" | "github">();
   });
 
+  it("keeps catalog keys exactly equal to session and message ref platforms", () => {
+    expectTypeOf<BuiltinSurfaceProtocolKeysExactlyEqualRefPlatforms>().toEqualTypeOf<true>();
+    expectTypeOf<keyof typeof BUILTIN_SURFACE_PROTOCOLS>().toEqualTypeOf<SessionRef["platform"]>();
+    expectTypeOf<keyof typeof BUILTIN_SURFACE_PROTOCOLS>().toEqualTypeOf<MsgRef["platform"]>();
+    expect(Object.keys(BUILTIN_SURFACE_PROTOCOLS)).toEqual(["discord", "github"]);
+  });
+
+  it("keeps message-ref construction correlated to the selected protocol session ref", () => {
+    type DiscordMessageSession = Parameters<
+      (typeof BUILTIN_SURFACE_PROTOCOLS)["discord"]["refs"]["createMessageRef"]
+    >[0];
+    type GithubMessageSession = Parameters<
+      (typeof BUILTIN_SURFACE_PROTOCOLS)["github"]["refs"]["createMessageRef"]
+    >[0];
+
+    expectTypeOf<DiscordMessageSession>().toEqualTypeOf<DiscordSessionRef>();
+    expectTypeOf<GithubMessageSession>().toEqualTypeOf<GithubSessionRef>();
+    expectTypeOf<IsAssignable<GithubSessionRef, DiscordMessageSession>>().toEqualTypeOf<false>();
+    expectTypeOf<IsAssignable<DiscordSessionRef, GithubMessageSession>>().toEqualTypeOf<false>();
+  });
+
   it("does not allow GitHub relay lifecycle values in Discord descriptors", () => {
-    type DiscordFactoryRelay = Parameters<typeof createDiscordSurfaceRuntimeDescriptor>[0]["relay"];
+    type DiscordFactoryRelay = ReturnType<
+      NonNullable<Parameters<typeof createDiscordSurfaceRuntimeDescriptor>[0]["createRelay"]>
+    >;
 
     expectTypeOf<
       IsAssignable<SurfaceRelayLifecyclePort<"github">, SurfaceRelayLifecyclePort<"discord">>
@@ -301,21 +330,21 @@ describe("surface runtime descriptor factories", () => {
     const descriptor = createDiscordSurfaceRuntimeDescriptor({
       adapter,
       adapterIngress,
-      relay,
+      createRelay: () => relay,
     });
 
     expect(descriptor).toEqual({
-      platform: "discord",
-      adapter: descriptor.adapter,
+      protocol: BUILTIN_SURFACE_PROTOCOLS.discord,
+      adapter,
       adapterIngress,
-      relay,
-      workflowProgress: descriptor.workflowProgress,
+      createRelay: descriptor.createRelay,
+      createWorkflowProgress: createDiscordWorkflowProgressPort,
     });
-    expect(descriptor.adapter).not.toBe(adapter);
+    expect(descriptor.adapter).toBe(adapter);
     expect("requestIngress" in descriptor).toBe(false);
     expect("health" in descriptor).toBe(false);
     expect("surfaceStore" in descriptor).toBe(false);
-    expect("refs" in descriptor.relay!).toBe(true);
+    expect(descriptor.createRelay?.(adapter)).toBe(relay);
   });
 
   it("exposes GitHub workflow progress independently of ingress and relay", () => {
@@ -324,13 +353,12 @@ describe("surface runtime descriptor factories", () => {
         const descriptor = createGithubSurfaceRuntimeDescriptor({
           adapter: new TestAdapter("github"),
           ...(requestIngressEnabled ? { requestIngress: requestIngress() } : {}),
-          ...(relayEnabled ? { relay: githubRelay() } : {}),
+          ...(relayEnabled ? { createRelay: () => githubRelay() } : {}),
         });
 
         expect("requestIngress" in descriptor).toBe(requestIngressEnabled);
-        expect("relay" in descriptor).toBe(relayEnabled);
-        expect(descriptor.workflowProgress).toBeDefined();
-        expect("workflowProgress" in descriptor).toBe(true);
+        expect("createRelay" in descriptor).toBe(relayEnabled);
+        expect(descriptor.createWorkflowProgress).toBe(createGithubWorkflowProgressPort);
         expect("adapterIngress" in descriptor).toBe(false);
       }
     }
@@ -353,7 +381,7 @@ describe("surface runtime descriptor factories", () => {
         webhookSecret: webhookConfigured ? "webhook-secret" : undefined,
         appCredentialsAvailable,
         requestIngress: ingress,
-        relay,
+        createRelay: () => relay,
         logger: {
           info: (message, context) => logs.push({ level: "info", message, context }),
           warn: (message, context) => logs.push({ level: "warn", message, context }),
@@ -361,12 +389,10 @@ describe("surface runtime descriptor factories", () => {
       });
 
       const requestIngressAvailable = webhookConfigured && appCredentialsAvailable;
-      expect(descriptor.adapter).not.toBe(adapter);
+      expect(descriptor.adapter).toBe(adapter);
       expect(descriptor.requestIngress).toBe(requestIngressAvailable ? ingress : undefined);
-      expect(descriptor.relay).toBe(appCredentialsAvailable ? relay : undefined);
-      expect(descriptor.workflowProgress).toBeDefined();
-      expect("workflowProgress" in descriptor).toBe(true);
-      if (descriptor.relay) expect("refs" in descriptor.relay).toBe(true);
+      expect(descriptor.createRelay?.(adapter)).toBe(appCredentialsAvailable ? relay : undefined);
+      expect(descriptor.createWorkflowProgress).toBe(createGithubWorkflowProgressPort);
       expect(logs).toEqual([
         ...(requestIngressAvailable
           ? []
@@ -700,6 +726,13 @@ describe("surface relay policies", () => {
       if (resolved.kind === "invalid") {
         if (expectedReason === undefined) throw new Error("invalid case is missing its reason");
         expect(resolved.error.reason).toBe(expectedReason);
+        if (expectedReason === "platform-mismatch") {
+          expect(resolved.error.message).toBe(
+            platform === "discord"
+              ? "GitHub request ID cannot target Discord output"
+              : "Discord request ID cannot target GitHub output",
+          );
+        }
       }
       if (resolved.kind === "target") {
         expect(resolved.ref).toEqual({
@@ -740,12 +773,44 @@ describe("surface relay policies", () => {
 });
 
 describe("surface runtime registry", () => {
+  it("binds relay and workflow factories to the exact single guarded adapter", () => {
+    const rawAdapter = new TestAdapter("discord");
+    const relay = discordRelay();
+    const workflowProgress = createDiscordWorkflowProgressPort(rawAdapter);
+    let relayAdapter: SurfaceAdapter | undefined;
+    let workflowAdapter: SurfaceAdapter | undefined;
+    const created = SurfaceRuntimeRegistry.create([
+      {
+        protocol: BUILTIN_SURFACE_PROTOCOLS.discord,
+        adapter: rawAdapter,
+        createRelay: (guardedAdapter) => {
+          relayAdapter = guardedAdapter;
+          return relay;
+        },
+        createWorkflowProgress: (guardedAdapter) => {
+          workflowAdapter = guardedAdapter;
+          return workflowProgress;
+        },
+      },
+    ]);
+    if (created.status === "error") throw created.error;
+    const [descriptor] = created.value.entries();
+    if (!descriptor) throw new Error("missing bound descriptor");
+
+    expect(descriptor.adapter).not.toBe(rawAdapter);
+    expect(relayAdapter).toBe(descriptor.adapter);
+    expect(workflowAdapter).toBe(descriptor.adapter);
+    expect(relayAdapter).toBe(workflowAdapter);
+    expect(descriptor.relay).toBe(relay);
+    expect(descriptor.workflowProgress).not.toBe(workflowProgress);
+  });
+
   it("resolves only registered adapters through descriptor-bound facades", async () => {
     const discordAdapter = new TestAdapter("discord");
     const githubAdapter = new TestAdapter("github");
     const created = SurfaceRuntimeRegistry.create([
-      { platform: "discord", adapter: discordAdapter },
-      { platform: "github", adapter: githubAdapter },
+      { protocol: BUILTIN_SURFACE_PROTOCOLS.discord, adapter: discordAdapter },
+      { protocol: BUILTIN_SURFACE_PROTOCOLS.github, adapter: githubAdapter },
     ]);
     if (created.status === "error") throw created.error;
 
@@ -753,10 +818,28 @@ describe("surface runtime registry", () => {
     expect(resolver.registeredPlatforms()).toEqual(["discord", "github"]);
     expect(resolver.resolve("discord")).toMatchObject({ platform: "discord" });
     expect(resolver.resolve("github")).toMatchObject({ platform: "github" });
-    expect(resolver.resolve("slack")).toBeNull();
-    expect(resolver.resolve("unknown")).toBeNull();
+    expect(resolver.resolve("discord")?.protocol).toBe(BUILTIN_SURFACE_PROTOCOLS.discord);
+    expect(resolver.resolve("github")?.protocol).toBe(BUILTIN_SURFACE_PROTOCOLS.github);
+    for (const platform of ["whatsapp", "slack", "telegram", "web", "unknown"] as const) {
+      expect(resolver.resolve(platform)).toBeNull();
+    }
     expect(resolver.resolve("discord")?.adapter).not.toBe(discordAdapter);
     expect(resolver.resolve("github")?.adapter).not.toBe(githubAdapter);
+  });
+
+  it("returns fresh exact-key adapter projections without bound lifecycle ports", () => {
+    const created = SurfaceRuntimeRegistry.create([discordDescriptor()]);
+    if (created.status === "error") throw created.error;
+    const [bound] = created.value.entries();
+    if (!bound) throw new Error("missing bound descriptor");
+
+    const resolver = created.value.adapterResolver();
+    const first = resolver.resolve("discord");
+    const second = resolver.resolve("discord");
+
+    expect(first).not.toBe(bound);
+    expect(second).not.toBe(first);
+    expect(Object.keys(first ?? {})).toEqual(["platform", "protocol", "adapter"]);
   });
 
   it("does not resolve an implemented wire platform unless its descriptor is registered", () => {
@@ -776,7 +859,9 @@ describe("surface runtime registry", () => {
         },
       ]),
     );
-    const created = SurfaceRuntimeRegistry.create([{ platform: "discord", adapter }]);
+    const created = SurfaceRuntimeRegistry.create([
+      { protocol: BUILTIN_SURFACE_PROTOCOLS.discord, adapter },
+    ]);
     if (created.status === "error") throw created.error;
     const [descriptor] = created.value.entries();
     if (!descriptor) throw new Error("missing descriptor");
@@ -795,7 +880,10 @@ describe("surface runtime registry", () => {
 
     expect(created.status).toBe("ok");
     if (created.status === "error") return;
-    expect(created.value.entries()).toEqual([discord, github]);
+    expect(created.value.entries().map((entry) => entry.protocol)).toEqual([
+      discord.protocol,
+      github.protocol,
+    ]);
   });
 
   it.each(["discord", "github"] as const)(

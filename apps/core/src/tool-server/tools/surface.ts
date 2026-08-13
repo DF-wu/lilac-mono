@@ -3,17 +3,13 @@ import fs from "node:fs/promises";
 import { basename } from "node:path";
 import { fileTypeFromBuffer } from "file-type";
 import { getDiscordUserAliasValue, type CoreConfig } from "@stanley2058/lilac-utils";
-import {
-  defineServerTool,
-  type ServerTool,
-  type ServerToolCallOptions,
-} from "@stanley2058/lilac-plugin-runtime";
 import { Panic, Result, TaggedError, type Result as ResultType } from "better-result";
+
+import { defineServerTool, type ServerTool, type ServerToolCallOptions } from "../types";
 
 import { isAdapterPlatform } from "../../shared/is-adapter-platform";
 import {
   hasCacheBurstProvider,
-  hasSurfaceGuildIdResolver,
   type SurfaceAdapter,
   type SurfaceOperationError,
 } from "../../surface/adapter";
@@ -25,11 +21,15 @@ import type {
   MsgRef,
   RegisteredSurfacePlatform,
   SessionRef,
+  SessionRefFor,
   SurfaceAttachment,
   SurfaceMessage,
   SurfaceReactionSummary,
-  SurfaceSession,
 } from "../../surface/types";
+import {
+  getBuiltinSurfaceProtocol,
+  inferBuiltinSurfaceToolRequestTarget,
+} from "../../surface/builtin-surface-protocols";
 import type { DiscordSearchService } from "../../surface/store/discord-search-store";
 import type { RequestContext } from "../types";
 import type { RecentAgentWriteSnapshot, TranscriptStore } from "../../transcript/transcript-store";
@@ -37,8 +37,9 @@ import { isHeartbeatSessionId } from "../../transcript/heartbeat-handoff";
 
 import {
   bestEffortAliasForDiscordChannelId,
-  resolveDiscordSessionId,
-} from "./resolve-discord-session-id";
+  resolveGuildIdForChannel,
+  shouldAllowDiscordChannel as checkDiscordChannelAllowed,
+} from "../../surface/discord/discord-tool-targets";
 import {
   formatToolPathForRequestContext,
   inferMimeTypeFromFilename,
@@ -51,7 +52,6 @@ import {
   normalizeDiscordRaw,
 } from "../../surface/discord/discord-raw-normalizer";
 
-import { parseGithubRequestId } from "../../github/github-ids";
 class SurfaceToolFailure extends TaggedError("SurfaceToolFailure")<{
   readonly message: string;
 }> {}
@@ -65,6 +65,13 @@ function adaptSurfaceResultToToolHost<TValue>(
 
 function signalSurfaceFailureToToolHost(message: string): never {
   return adaptSurfaceResultToToolHost(Result.err(new SurfaceToolFailure({ message })));
+}
+
+function adaptSurfaceTargetResultToToolHost<T>(
+  result: ResultType<T, { readonly message: string }>,
+): T {
+  if (result.status === "ok") return result.value;
+  signalSurfaceFailureToToolHost(result.error.message);
 }
 
 function adaptSurfaceOperationToToolHost<T>(result: ResultType<T, SurfaceOperationError>): T {
@@ -83,6 +90,14 @@ function adaptSurfaceOperationToToolHost<T>(result: ResultType<T, SurfaceOperati
   }
 }
 
+function createSurfaceMessageRef<P extends RegisteredSurfacePlatform>(
+  sessionRef: SessionRefFor<P>,
+  messageId: string,
+) {
+  const protocol = getBuiltinSurfaceProtocol(sessionRef.platform);
+  return protocol.refs.createMessageRef(sessionRef, messageId);
+}
+
 const surfaceClientSchema = z
   .enum(["discord", "github", "whatsapp", "slack", "telegram", "web"])
   .describe(
@@ -90,24 +105,6 @@ const surfaceClientSchema = z
   );
 
 type SurfaceClient = z.infer<typeof surfaceClientSchema>;
-
-function inferDiscordOriginFromRequestId(
-  requestId: string | undefined,
-): { sessionId: string; messageId: string } | null {
-  if (!requestId) return null;
-  const m = /^discord:([^:]+):([^:]+)$/.exec(requestId);
-  if (!m) return null;
-  return { sessionId: m[1]!, messageId: m[2]! };
-}
-
-function inferGithubOriginFromRequestId(
-  requestId: string | undefined,
-): { sessionId: string; messageId: string } | null {
-  if (!requestId) return null;
-  const parsed = parseGithubRequestId({ requestId });
-  if (!parsed) return null;
-  return { sessionId: parsed.sessionId, messageId: parsed.triggerId };
-}
 
 function formatRegisteredPlatforms(resolver: SurfaceAdapterResolver): string {
   return resolver
@@ -159,60 +156,12 @@ function resolveSurfaceAdapter(params: {
   );
 }
 
-function mustDiscordSurfaceConfig(cfg: CoreConfig) {
-  const discord = cfg.surface.discord;
-  if (!discord) signalSurfaceFailureToToolHost("surface.discord config missing");
-  return discord;
-}
-
 function shouldAllowDiscordChannel(params: {
   cfg: CoreConfig;
   channelId: string;
   guildId?: string | null;
 }): boolean {
-  const discord = mustDiscordSurfaceConfig(params.cfg);
-
-  const allowedChannelIds = new Set(discord.allowedChannelIds);
-  const allowedGuildIds = new Set(discord.allowedGuildIds);
-
-  if (allowedChannelIds.size === 0 && allowedGuildIds.size === 0) return false;
-
-  if (allowedChannelIds.has(params.channelId)) return true;
-
-  const gid = params.guildId ?? null;
-  if (gid && allowedGuildIds.has(gid)) return true;
-
-  return false;
-}
-
-function asSurfaceSessionRef(
-  platform: RegisteredSurfacePlatform,
-  channelId: string,
-  discord?: { readonly guildId?: string; readonly parentChannelId?: string },
-): SessionRef {
-  switch (platform) {
-    case "discord":
-      return {
-        platform,
-        channelId,
-        guildId: discord?.guildId,
-        parentChannelId: discord?.parentChannelId,
-      };
-    case "github":
-      return { platform, channelId };
-  }
-}
-
-function asSurfaceMsgRef(
-  platform: RegisteredSurfacePlatform,
-  channelId: string,
-  messageId: string,
-): MsgRef {
-  switch (platform) {
-    case "discord":
-    case "github":
-      return { platform, channelId, messageId };
-  }
+  return adaptSurfaceTargetResultToToolHost(checkDiscordChannelAllowed(params));
 }
 
 const DEFAULT_OUTBOUND_MAX_FILE_BYTES = 8 * 1024 * 1024;
@@ -287,35 +236,6 @@ export async function loadLocalAttachments(params: {
   return out;
 }
 
-async function tryGetCachedSession(
-  adapter: SurfaceAdapter,
-  channelId: string,
-): Promise<SurfaceSession | null> {
-  const sessions = await adapter.listSessions();
-  if (sessions.status === "error") return null;
-  for (const s of sessions.value) {
-    if (s.ref.platform !== "discord") continue;
-    if (s.ref.channelId === channelId) return s;
-  }
-  return null;
-}
-
-async function resolveGuildIdForChannel(params: {
-  adapter: SurfaceAdapter;
-  channelId: string;
-}): Promise<string | null> {
-  const sess = await tryGetCachedSession(params.adapter, params.channelId);
-  if (sess?.ref.platform === "discord") {
-    return sess.ref.guildId ?? null;
-  }
-
-  if (hasSurfaceGuildIdResolver(params.adapter)) {
-    return await params.adapter.fetchGuildIdForChannel(params.channelId);
-  }
-
-  return null;
-}
-
 function buildDiscordUserAliasById(cfg: CoreConfig): Map<string, string> {
   const out = new Map<string, string>();
   const users = cfg.entity?.users ?? {};
@@ -368,8 +288,7 @@ function withDefaultSessionId<TInput extends { readonly sessionId?: string }>(
   const ctxSessionId =
     typeof ctx?.sessionId === "string" && ctx.sessionId.length > 0
       ? ctx.sessionId
-      : (inferDiscordOriginFromRequestId(ctx?.requestId)?.sessionId ??
-        inferGithubOriginFromRequestId(ctx?.requestId)?.sessionId);
+      : inferBuiltinSurfaceToolRequestTarget(ctx?.requestId)?.sessionId;
 
   if (ctxSessionId) {
     return { ...input, sessionId: ctxSessionId };
@@ -386,11 +305,8 @@ function withDefaultMessageId<TInput extends { readonly messageId?: string }>(
 ): TInput {
   if (input.messageId !== undefined) return input;
 
-  const inferred = inferDiscordOriginFromRequestId(ctx?.requestId);
+  const inferred = inferBuiltinSurfaceToolRequestTarget(ctx?.requestId);
   if (inferred?.messageId) return { ...input, messageId: inferred.messageId };
-
-  const inferredGh = inferGithubOriginFromRequestId(ctx?.requestId);
-  if (inferredGh?.messageId) return { ...input, messageId: inferredGh.messageId };
 
   const rid = typeof ctx?.requestId === "string" ? ctx.requestId : undefined;
   const hint = rid ? ` (requestId='${rid}')` : " (no requestId in context)";
@@ -1332,69 +1248,30 @@ export class Surface implements ServerTool {
     const ctxClient = isAdapterPlatform(ctxClientRaw) ? ctxClientRaw : "unknown";
     const contextAdapter = this.params.adapterResolver.resolve(ctxClient);
     const registeredPlatforms = this.params.adapterResolver.registeredPlatforms();
-    let effectiveClient = contextAdapter?.platform;
+    let effective = contextAdapter;
     if (input.client) {
-      effectiveClient = resolveSurfaceAdapter({
+      effective = resolveSurfaceAdapter({
         inputClient: input.client,
         ctx,
         resolver: this.params.adapterResolver,
-      }).platform;
-    } else if (!effectiveClient) {
-      if (registeredPlatforms.includes("discord")) effectiveClient = "discord";
-      else if (registeredPlatforms.length === 1) effectiveClient = registeredPlatforms[0];
+      });
+    } else if (!effective) {
+      effective =
+        registeredPlatforms
+          .map((platform) => this.params.adapterResolver.resolve(platform))
+          .filter((resolved) => resolved?.protocol.toolTargets !== undefined)
+          .sort(
+            (left, right) =>
+              left!.protocol.toolTargets!.helpFallbackPriority -
+              right!.protocol.toolTargets!.helpFallbackPriority,
+          )[0] ?? null;
     }
     const cfg = await this.getCfg();
     const contextSessionId = typeof ctx?.sessionId === "string" ? ctx.sessionId : null;
-    const contextAlias =
-      contextSessionId !== null && (ctxClient === "discord" || effectiveClient === "discord")
-        ? bestEffortAliasForDiscordChannelId({
-            channelId: contextSessionId,
-            cfg,
-          })
-        : undefined;
-
-    const discordSessionIdFormats = {
-      client: "discord" as const,
-      accepted: [
-        {
-          format: "123456789012345678",
-          meaning: "Raw Discord channel id",
-        },
-        {
-          format: "<#123456789012345678>",
-          meaning: "Discord channel mention",
-        },
-        {
-          format: "dev-chat",
-          meaning:
-            "Configured session alias (cfg.entity.sessions.discord maps alias -> channelId or { discord, comment })",
-        },
-        {
-          format: "#dev-chat",
-          meaning: "Configured session alias with optional leading # prefix",
-        },
-      ],
-      notes: [
-        "If the request has no session context, you must pass --session-id (or set LILAC_SESSION_ID). Some requests also allow inferring sessionId/messageId from requestId when it is 'discord:<sessionId>:<messageId>'.",
-      ],
-    };
-    const githubSessionIdFormats = {
-      client: "github" as const,
-      accepted: [
-        {
-          format: "OWNER/REPO#123",
-          meaning: "GitHub issue/PR thread",
-        },
-      ],
-      notes: [
-        "For GitHub triggers, surface tools can default sessionId/messageId from requestId when it is 'github:<OWNER/REPO#N>:<triggerId>'.",
-      ],
-    };
-    const sessionIdFormatByPlatform = {
-      discord: discordSessionIdFormats,
-      github: githubSessionIdFormats,
-    } satisfies Record<RegisteredSurfacePlatform, unknown>;
-    const sessionIdFormats = effectiveClient ? sessionIdFormatByPlatform[effectiveClient] : null;
+    const targetHelp = effective?.protocol.toolTargets?.describeSessionIds({
+      contextSessionId,
+      config: cfg,
+    });
 
     return {
       tool: "surface" as const,
@@ -1402,7 +1279,7 @@ export class Surface implements ServerTool {
       context: {
         requestClient: ctxClient,
         sessionId: contextSessionId,
-        alias: contextAlias,
+        alias: targetHelp?.contextAlias,
       },
       terminology: {
         client:
@@ -1422,7 +1299,7 @@ export class Surface implements ServerTool {
         attachments:
           "Outbound: local files offered to the selected adapter (paths resolved relative to request cwd; unsupported adapters reject them explicitly). Inbound: message attachment/media metadata is first-class on surface.messages.read and hinted on surface.messages.list.",
       },
-      sessionIdFormats,
+      sessionIdFormats: targetHelp?.sessionIdFormats ?? null,
       relatedConfigKeys: {
         requestClientEnv: "LILAC_REQUEST_CLIENT",
         sessionIdEnv: "LILAC_SESSION_ID",
@@ -1453,50 +1330,40 @@ export class Surface implements ServerTool {
   }
 
   private async resolveSessionTarget(params: {
-    readonly inputClient?: SurfaceClient;
+    readonly resolved: ResolvedSurfaceAdapter;
     readonly sessionId: string;
-    readonly ctx?: RequestContext;
   }): Promise<{
     readonly resolved: ResolvedSurfaceAdapter;
     readonly sessionRef: SessionRef;
     readonly cfg?: CoreConfig;
   }> {
-    const resolved = this.resolveAdapter(params.inputClient, params.ctx);
-    if (resolved.platform === "github") {
-      return {
-        resolved,
-        sessionRef: asSurfaceSessionRef("github", params.sessionId),
-      };
+    const routing = params.resolved.protocol.toolTargets;
+    if (!routing) {
+      signalSurfaceFailureToToolHost(
+        `surface tool: client '${params.resolved.platform}' does not provide target routing`,
+      );
     }
-
-    const cfg = await this.getCfg();
-    const channelId = resolveDiscordSessionId({ sessionId: params.sessionId, cfg });
-    const guildId = await resolveGuildIdForChannel({ adapter: resolved.adapter, channelId });
-    if (!shouldAllowDiscordChannel({ cfg, channelId, guildId })) {
-      signalSurfaceFailureToToolHost(`Not allowed: channelId '${channelId}'`);
-    }
+    const target = await routing.resolveSession({
+      selector: params.sessionId,
+      adapter: params.resolved.adapter,
+      getConfig: () => this.getCfg(),
+    });
+    if (target.status === "error") signalSurfaceFailureToToolHost(target.error.message);
     return {
-      resolved,
-      sessionRef: asSurfaceSessionRef("discord", channelId, {
-        guildId: guildId ?? undefined,
-      }),
-      cfg,
+      resolved: params.resolved,
+      sessionRef: target.value.sessionRef,
+      cfg: target.value.config,
     };
   }
 
   private async resolveMessageTarget(params: {
-    readonly inputClient?: SurfaceClient;
+    readonly resolved: ResolvedSurfaceAdapter;
     readonly sessionId: string;
     readonly messageId: string;
-    readonly ctx?: RequestContext;
     readonly burstDiscordCache?: boolean;
   }) {
     const target = await this.resolveSessionTarget(params);
-    const msgRef = asSurfaceMsgRef(
-      target.resolved.platform,
-      target.sessionRef.channelId,
-      params.messageId,
-    );
+    const msgRef = createSurfaceMessageRef(target.sessionRef, params.messageId);
     if (
       params.burstDiscordCache &&
       target.resolved.platform === "discord" &&
@@ -1516,7 +1383,10 @@ export class Surface implements ServerTool {
     const resolved = this.params.adapterResolver.resolve(row.client);
     if (!resolved) return row.finalText ?? "";
     const msg = await resolved.adapter.readMsg(
-      asSurfaceMsgRef(resolved.platform, row.sessionId, row.messageId),
+      createSurfaceMessageRef(
+        resolved.protocol.refs.createSessionRef(row.sessionId),
+        row.messageId,
+      ),
     );
     return msg.status === "ok" ? (msg.value?.text ?? row.finalText ?? "") : (row.finalText ?? "");
   }
@@ -1685,11 +1555,11 @@ export class Surface implements ServerTool {
     decodedInput: z.output<typeof sessionsListParticipantsInputSchema>,
     ctx: RequestContext | undefined,
   ) {
+    const resolved = this.resolveAdapter(decodedInput.client, ctx);
     const input = withDefaultSessionId(decodedInput, ctx);
     const target = await this.resolveSessionTarget({
-      inputClient: input.client,
+      resolved,
       sessionId: mustPresentString(input.sessionId, "sessionId"),
-      ctx,
     });
     const participants = adaptSurfaceOperationToToolHost(
       await target.resolved.adapter.listSessionParticipants(target.sessionRef, {
@@ -1711,14 +1581,14 @@ export class Surface implements ServerTool {
     decodedInput: z.output<typeof messagesListInputSchema>,
     ctx: RequestContext | undefined,
   ) {
+    const resolved = this.resolveAdapter(decodedInput.client, ctx);
     const input = withDefaultSessionId(decodedInput, ctx);
     const order: MessageListOrder = input.order ?? "ts_desc";
     const includeRaw = input.includeRaw ?? false;
     const includeAttachments = input.includeAttachments ?? false;
     const target = await this.resolveSessionTarget({
-      inputClient: input.client,
+      resolved,
       sessionId: mustPresentString(input.sessionId, "sessionId"),
-      ctx,
     });
 
     if (target.resolved.platform === "discord" && hasCacheBurstProvider(target.resolved.adapter)) {
@@ -1774,16 +1644,15 @@ export class Surface implements ServerTool {
     decodedInput: z.output<typeof messagesReadInputSchema>,
     ctx: RequestContext | undefined,
   ) {
+    const resolved = this.resolveAdapter(decodedInput.client, ctx);
     const input = withDefaultMessageId(withDefaultSessionId(decodedInput, ctx), ctx);
     const includeRaw = input.includeRaw ?? false;
     const target = await this.resolveSessionTarget({
-      inputClient: input.client,
+      resolved,
       sessionId: mustPresentString(input.sessionId, "sessionId"),
-      ctx,
     });
-    const msgRef = asSurfaceMsgRef(
-      target.resolved.platform,
-      target.sessionRef.channelId,
+    const msgRef = createSurfaceMessageRef(
+      target.sessionRef,
       mustPresentString(input.messageId, "messageId"),
     );
 
@@ -1846,11 +1715,11 @@ export class Surface implements ServerTool {
     decodedInput: z.output<typeof messagesSearchInputSchema>,
     ctx: RequestContext | undefined,
   ) {
+    const resolved = this.resolveAdapter(decodedInput.client, ctx);
     const input = withDefaultSessionId(decodedInput, ctx);
     const target = await this.resolveSessionTarget({
-      inputClient: input.client,
+      resolved,
       sessionId: mustPresentString(input.sessionId, "sessionId"),
-      ctx,
     });
 
     if (
@@ -1933,19 +1802,15 @@ export class Surface implements ServerTool {
     decodedInput: z.output<typeof messagesSendInputSchema>,
     ctx: RequestContext | undefined,
   ) {
+    const resolved = this.resolveAdapter(decodedInput.client, ctx);
     const input = withDefaultSessionId(decodedInput, ctx);
     const target = await this.resolveSessionTarget({
-      inputClient: input.client,
+      resolved,
       sessionId: mustPresentString(input.sessionId, "sessionId"),
-      ctx,
     });
 
     const replyTo = input.replyToMessageId
-      ? asSurfaceMsgRef(
-          target.resolved.platform,
-          target.sessionRef.channelId,
-          input.replyToMessageId,
-        )
+      ? createSurfaceMessageRef(target.sessionRef, input.replyToMessageId)
       : undefined;
 
     const paths = input.paths ?? [];
@@ -1997,16 +1862,16 @@ export class Surface implements ServerTool {
     decodedInput: z.output<typeof messagesEditInputSchema>,
     ctx: RequestContext | undefined,
   ) {
+    const resolved = this.resolveAdapter(decodedInput.client, ctx);
     const input = withDefaultSessionId(decodedInput, ctx);
     const target = await this.resolveSessionTarget({
-      inputClient: input.client,
+      resolved,
       sessionId: mustPresentString(input.sessionId, "sessionId"),
-      ctx,
     });
 
     adaptSurfaceOperationToToolHost(
       await target.resolved.adapter.editMsg(
-        asSurfaceMsgRef(target.resolved.platform, target.sessionRef.channelId, input.messageId),
+        createSurfaceMessageRef(target.sessionRef, input.messageId),
         { text: input.text },
       ),
     );
@@ -2018,16 +1883,16 @@ export class Surface implements ServerTool {
     decodedInput: z.output<typeof messagesDeleteInputSchema>,
     ctx: RequestContext | undefined,
   ) {
+    const resolved = this.resolveAdapter(decodedInput.client, ctx);
     const input = withDefaultSessionId(decodedInput, ctx);
     const target = await this.resolveSessionTarget({
-      inputClient: input.client,
+      resolved,
       sessionId: mustPresentString(input.sessionId, "sessionId"),
-      ctx,
     });
 
     adaptSurfaceOperationToToolHost(
       await target.resolved.adapter.deleteMsg(
-        asSurfaceMsgRef(target.resolved.platform, target.sessionRef.channelId, input.messageId),
+        createSurfaceMessageRef(target.sessionRef, input.messageId),
       ),
     );
     return { ok: true as const };
@@ -2037,12 +1902,12 @@ export class Surface implements ServerTool {
     decodedInput: z.output<typeof reactionsListInputSchema>,
     ctx: RequestContext | undefined,
   ) {
+    const resolved = this.resolveAdapter(decodedInput.client, ctx);
     const input = withDefaultMessageId(withDefaultSessionId(decodedInput, ctx), ctx);
     const target = await this.resolveMessageTarget({
-      inputClient: input.client,
+      resolved,
       sessionId: mustPresentString(input.sessionId, "sessionId"),
       messageId: mustPresentString(input.messageId, "messageId"),
-      ctx,
       burstDiscordCache: true,
     });
 
@@ -2062,12 +1927,12 @@ export class Surface implements ServerTool {
     decodedInput: z.output<typeof reactionsListDetailedInputSchema>,
     ctx: RequestContext | undefined,
   ) {
+    const resolved = this.resolveAdapter(decodedInput.client, ctx);
     const input = withDefaultMessageId(withDefaultSessionId(decodedInput, ctx), ctx);
     const target = await this.resolveMessageTarget({
-      inputClient: input.client,
+      resolved,
       sessionId: mustPresentString(input.sessionId, "sessionId"),
       messageId: mustPresentString(input.messageId, "messageId"),
-      ctx,
       burstDiscordCache: true,
     });
 
@@ -2080,12 +1945,12 @@ export class Surface implements ServerTool {
     decodedInput: z.output<typeof reactionsAddInputSchema>,
     ctx: RequestContext | undefined,
   ) {
+    const resolved = this.resolveAdapter(decodedInput.client, ctx);
     const input = withDefaultMessageId(withDefaultSessionId(decodedInput, ctx), ctx);
     const target = await this.resolveMessageTarget({
-      inputClient: input.client,
+      resolved,
       sessionId: mustPresentString(input.sessionId, "sessionId"),
       messageId: mustPresentString(input.messageId, "messageId"),
-      ctx,
     });
 
     adaptSurfaceOperationToToolHost(
@@ -2099,12 +1964,12 @@ export class Surface implements ServerTool {
     decodedInput: z.output<typeof reactionsRemoveInputSchema>,
     ctx: RequestContext | undefined,
   ) {
+    const resolved = this.resolveAdapter(decodedInput.client, ctx);
     const input = withDefaultMessageId(withDefaultSessionId(decodedInput, ctx), ctx);
     const target = await this.resolveMessageTarget({
-      inputClient: input.client,
+      resolved,
       sessionId: mustPresentString(input.sessionId, "sessionId"),
       messageId: mustPresentString(input.messageId, "messageId"),
-      ctx,
     });
 
     adaptSurfaceOperationToToolHost(

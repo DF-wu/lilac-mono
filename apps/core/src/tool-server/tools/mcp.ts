@@ -1,6 +1,6 @@
 import { z } from "zod";
 import { Result, TaggedError, type Result as ResultType } from "better-result";
-import { defineServerTool } from "@stanley2058/lilac-plugin-runtime";
+import { defineServerTool } from "../types";
 
 import {
   MCP_CONFIG_VERSION,

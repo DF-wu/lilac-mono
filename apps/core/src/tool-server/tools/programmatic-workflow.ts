@@ -4,7 +4,7 @@ import path from "node:path";
 import { env } from "@stanley2058/lilac-utils";
 import { lilacEventTypes, type LilacBus } from "@stanley2058/lilac-event-bus";
 import { Result, TaggedError, type Result as ResultType } from "better-result";
-import { defineServerTool } from "@stanley2058/lilac-plugin-runtime";
+import { defineServerTool } from "../types";
 
 import { isAdapterPlatform } from "../../shared/is-adapter-platform";
 import {
@@ -44,6 +44,7 @@ import {
 } from "../../workflow/workflow-artifact-store";
 import { redactWorkflowValue } from "../../workflow/workflow-progress-view";
 import { adaptEventPublishResultToHost } from "../../shared/event-bus-result";
+import { getBuiltinSurfaceProtocol } from "../../surface/builtin-surface-protocols";
 
 function adaptWorkflowInvocationResultToToolHost(
   result: ResultType<CreateWorkflowInvocationResult, CreateWorkflowInvocationError>,
@@ -215,21 +216,18 @@ type WorkflowCallOptions = {
 };
 
 function requestProgressTarget(context: RequestContext) {
-  if (
-    !context.sessionId ||
-    (context.requestClient !== "discord" && context.requestClient !== "github")
-  ) {
-    return null;
-  }
+  if (!context.sessionId || !context.requestClient) return null;
+  const protocol = getBuiltinSurfaceProtocol(context.requestClient);
+  if (!protocol) return null;
   const principal = context.requestInitiator;
   const principalMatchesRequest =
     principal !== undefined &&
-    principal.platform === context.requestClient &&
+    principal.platform === protocol.platform &&
     context.requestInitiatorSessionId === context.sessionId;
   return {
-    platform: context.requestClient,
+    platform: protocol.platform,
     userId: principalMatchesRequest ? principal.userId : null,
-    sessionRef: { platform: context.requestClient, channelId: context.sessionId },
+    sessionRef: protocol.refs.createSessionRef(context.sessionId),
     originMessageRef: null,
   } as const;
 }

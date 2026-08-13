@@ -16,7 +16,7 @@ import {
 
 import type { DiscordSearchStore } from "../surface/store/discord-search-store";
 import type { TranscriptStore } from "../transcript/transcript-store";
-import { bestEffortAliasForDiscordChannelId } from "../tool-server/tools/resolve-discord-session-id";
+import { bestEffortAliasForDiscordChannelId } from "../surface/discord/discord-tool-targets";
 
 export const DISCOVERY_LIMIT_MAX = 100;
 export const DISCOVERY_SURROUNDING_MAX = 20;

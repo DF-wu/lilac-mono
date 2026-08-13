@@ -39,6 +39,11 @@ export type MsgRef = DiscordMsgRef | GithubMsgRef;
 
 export type RegisteredSurfacePlatform = SessionRef["platform"];
 
+export type SurfacePrincipal = {
+  readonly platform: RegisteredSurfacePlatform;
+  readonly userId: string;
+};
+
 export type SessionRefFor<P extends RegisteredSurfacePlatform> = Extract<
   SessionRef,
   { platform: P }
@@ -46,14 +51,16 @@ export type SessionRefFor<P extends RegisteredSurfacePlatform> = Extract<
 
 export type MsgRefFor<P extends RegisteredSurfacePlatform> = Extract<MsgRef, { platform: P }>;
 
-export type AuthenticatedSurfaceOrigin = {
-  [P in RegisteredSurfacePlatform]: {
-    readonly platform: P;
+export type AuthenticatedSurfaceOriginFor<P extends RegisteredSurfacePlatform> = {
+  [Platform in P]: {
+    readonly platform: Platform;
     readonly userId: string;
-    readonly sessionRef: SessionRefFor<P>;
-    readonly messageRef?: MsgRefFor<P>;
+    readonly sessionRef: SessionRefFor<Platform>;
+    readonly messageRef?: MsgRefFor<Platform>;
   };
-}[RegisteredSurfacePlatform];
+}[P];
+
+export type AuthenticatedSurfaceOrigin = AuthenticatedSurfaceOriginFor<RegisteredSurfacePlatform>;
 
 type SurfacePlatformSetsEqual = [SessionRef["platform"]] extends [MsgRef["platform"]]
   ? [MsgRef["platform"]] extends [SessionRef["platform"]]

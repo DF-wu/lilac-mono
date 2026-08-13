@@ -1,6 +1,7 @@
 import { describe, expect, it } from "bun:test";
 import { asSchema } from "ai";
 
+import { BUILTIN_SURFACE_PROTOCOLS } from "../../src/surface/builtin-surface-protocols";
 import { subagentTools } from "../../src/tools/subagent";
 
 function isAsyncIterable(value: unknown): value is AsyncIterable<unknown> {
@@ -544,6 +545,82 @@ describe("subagent_delegate tool", () => {
 
     expect(seenProfiles).toEqual(["general", "self"]);
   });
+
+  it.each(Object.values(BUILTIN_SURFACE_PROTOCOLS).map((protocol) => protocol.platform))(
+    "projects a registered %s initiator into delegated origin without message authority",
+    async (platform) => {
+      let origin: unknown;
+      const tools = subagentTools({
+        idleTimeoutMs: 2_000,
+        maxDepth: 1,
+        onDelegate: async (registration) => {
+          origin = registration.authenticatedOrigin;
+          return {
+            runId: `run:${platform}-origin`,
+            completion: Promise.resolve({ status: "resolved", finalText: "done" }),
+            cancel: async () => {},
+          };
+        },
+      });
+
+      await resolveExecuteResult(
+        tools.subagent_delegate.execute!(
+          { profile: "explore", task: "Inspect origin", mode: "deferred" },
+          {
+            toolCallId: `tool-${platform}-origin`,
+            messages: [],
+            context: {
+              requestId: `request-${platform}`,
+              sessionId: `session-${platform}`,
+              requestClient: platform,
+              requestInitiator: { platform, userId: "user-1" },
+              requestInitiatorSessionId: `origin-${platform}`,
+            },
+          },
+        ),
+      );
+
+      expect(origin).toEqual({
+        platform,
+        userId: "user-1",
+        sessionRef: { platform, channelId: `origin-${platform}` },
+      });
+    },
+  );
+
+  it.each(["slack", "future-surface"])(
+    "rejects unsupported initiator platform %s",
+    async (platform) => {
+      const tools = subagentTools({
+        idleTimeoutMs: 2_000,
+        maxDepth: 1,
+        onDelegate: async () => ({
+          runId: "run:unsupported-origin",
+          completion: Promise.resolve({ status: "resolved", finalText: "done" }),
+          cancel: async () => {},
+        }),
+      });
+
+      await expect(
+        resolveExecuteResult(
+          tools.subagent_delegate.execute!(
+            { profile: "explore", task: "Inspect origin", mode: "deferred" },
+            {
+              toolCallId: `tool-${platform}-origin`,
+              messages: [],
+              context: {
+                requestId: `request-${platform}`,
+                sessionId: `session-${platform}`,
+                requestClient: platform,
+                requestInitiator: { platform, userId: "user-1" },
+                requestInitiatorSessionId: `origin-${platform}`,
+              },
+            },
+          ),
+        ),
+      ).rejects.toThrow("subagent_delegate requires request context");
+    },
+  );
 
   it("derives child session id from sessionName for continuation", async () => {
     const tools = subagentTools({

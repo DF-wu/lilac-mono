@@ -403,6 +403,7 @@ describe("request message cache", () => {
       source: "external",
       requestClient: "discord",
       sessionId: "channel-1",
+      sessionRef: { platform: "discord", channelId: "channel-1" },
       authenticatedActor: { platform: "discord", userId: "user-1" },
       authenticatedOrigin: { platform: "discord", userId: "user-1" },
       authenticationMetadataKind: "actor",
@@ -443,6 +444,9 @@ describe("request message cache", () => {
 
     expect(alias.value.projection).toMatchObject({
       source: "external",
+      requestClient: "github",
+      sessionId: "owner/repo#1",
+      sessionRef: { platform: "github", channelId: "owner/repo#1" },
       authenticatedActor: { platform: "github", userId: "octocat" },
       authenticationMetadataKind: "actor",
       verifiedIngress: false,
@@ -472,6 +476,29 @@ describe("request message cache", () => {
     });
     expect(alias.value.projection.authenticatedActor).toBeUndefined();
     expect(alias.value.projection.authenticatedOrigin).toBeUndefined();
+    expect(isAuthenticatedRequestProjectionSemanticallyValid(alias.value.projection)).toBe(true);
+  });
+
+  it("keeps unregistered external aliases ref-free and restricted", () => {
+    const cache = createRequestMessageCache();
+    const source = requestMessage({ eventId: "1-0", requestId: "unregistered-source" });
+    expect(cache.cacheMessage(source).status).toBe("ok");
+    const alias = cache.createAliasOwner({
+      sourceRequestId: source.key,
+      aliasRequestId: "unregistered-alias",
+      requestClient: "slack",
+      sessionId: "channel-1",
+    });
+    if (alias.status === "error") throw alias.error;
+
+    expect(alias.value.projection).toEqual({
+      requestId: "unregistered-alias",
+      requestClient: "slack",
+      sessionId: "channel-1",
+      source: "external",
+      authenticationMetadataKind: "absent",
+      verifiedIngress: false,
+    });
     expect(isAuthenticatedRequestProjectionSemanticallyValid(alias.value.projection)).toBe(true);
   });
 

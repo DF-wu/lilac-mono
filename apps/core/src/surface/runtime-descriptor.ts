@@ -9,6 +9,14 @@ import {
   createDescriptorBoundSurfaceAdapter,
   createDescriptorBoundWorkflowProgressPort,
 } from "./produced-ref-guard";
+import type { SurfaceProtocolRouting } from "./protocol";
+
+export {
+  SurfaceRefInvalid,
+  SurfaceReplyTargetInvalid,
+  type ReplyTargetResolution,
+} from "./protocol";
+import type { ReplyTargetResolution, SurfaceRefInvalid } from "./protocol";
 
 export type { MsgRefFor, RegisteredSurfacePlatform, SessionRefFor } from "./types";
 
@@ -76,25 +84,6 @@ export interface SurfaceRelayLifecyclePort<
 > extends SurfaceLifecyclePort<SurfaceRelayHandle<P>> {
   readonly platform: P;
 }
-
-export class SurfaceReplyTargetInvalid extends TaggedError("SurfaceReplyTargetInvalid")<{
-  readonly reason: "malformed" | "platform-mismatch" | "session-mismatch";
-  readonly expectedPlatform: RegisteredSurfacePlatform;
-  readonly expectedSessionId: string;
-  readonly message: string;
-}> {}
-
-export class SurfaceRefInvalid extends TaggedError("SurfaceRefInvalid")<{
-  readonly reason: "platform-mismatch" | "session-mismatch";
-  readonly expectedPlatform: RegisteredSurfacePlatform;
-  readonly expectedSessionId: string;
-  readonly message: string;
-}> {}
-
-export type ReplyTargetResolution<T> =
-  | { readonly kind: "none" }
-  | { readonly kind: "target"; readonly ref: T }
-  | { readonly kind: "invalid"; readonly error: SurfaceReplyTargetInvalid };
 
 export type SurfaceRelayRefs<P extends RegisteredSurfacePlatform> = {
   createSessionRef(sessionId: string): SessionRefFor<P>;
@@ -324,8 +313,34 @@ export type SurfaceWorkflowProgressPort<P extends RegisteredSurfacePlatform> = {
 export type RegisteredSurfaceWorkflowProgressPort =
   SurfaceWorkflowProgressPort<RegisteredSurfacePlatform>;
 
-export type SurfaceRuntimeDescriptor<P extends RegisteredSurfacePlatform> = {
+export type SurfaceWorkflowProgressRegistration<P extends RegisteredSurfacePlatform> = {
   readonly platform: P;
+  readonly protocol: SurfaceProtocolRouting<P>;
+  readonly port: SurfaceWorkflowProgressPort<P>;
+};
+
+export type RegisteredSurfaceWorkflowProgressRegistration = {
+  [P in RegisteredSurfacePlatform]: SurfaceWorkflowProgressRegistration<P>;
+}[RegisteredSurfacePlatform];
+
+export type SurfaceRuntimeDescriptor<P extends RegisteredSurfacePlatform> = {
+  readonly protocol: SurfaceProtocolRouting<P>;
+  readonly adapter: SurfaceAdapter;
+  readonly adapterIngress?: SurfaceAdapterIngress<P>;
+  readonly requestIngress?: SurfaceRequestIngress;
+  readonly createRelay?: (guardedAdapter: SurfaceAdapter) => SurfaceRelayDescriptor<P>;
+  readonly createWorkflowProgress?: (
+    guardedAdapter: SurfaceAdapter,
+  ) => SurfaceWorkflowProgressPort<P>;
+};
+
+export type RegisteredSurfaceRuntimeDescriptor = {
+  [P in RegisteredSurfacePlatform]: SurfaceRuntimeDescriptor<P>;
+}[RegisteredSurfacePlatform];
+
+export type BoundSurfaceRuntimeDescriptor<P extends RegisteredSurfacePlatform> = {
+  readonly platform: P;
+  readonly protocol: SurfaceProtocolRouting<P>;
   readonly adapter: SurfaceAdapter;
   readonly adapterIngress?: SurfaceAdapterIngress<P>;
   readonly requestIngress?: SurfaceRequestIngress;
@@ -333,16 +348,16 @@ export type SurfaceRuntimeDescriptor<P extends RegisteredSurfacePlatform> = {
   readonly workflowProgress?: SurfaceWorkflowProgressPort<P>;
 };
 
-export type RegisteredSurfaceRuntimeDescriptor = {
-  [P in RegisteredSurfacePlatform]: SurfaceRuntimeDescriptor<P>;
+export type RegisteredBoundSurfaceRuntimeDescriptor = {
+  [P in RegisteredSurfacePlatform]: BoundSurfaceRuntimeDescriptor<P>;
 }[RegisteredSurfacePlatform];
 
-export type ResolvedSurfaceAdapter = {
-  [P in RegisteredSurfacePlatform]: {
-    readonly platform: P;
-    readonly adapter: SurfaceAdapter;
-  };
-}[RegisteredSurfacePlatform];
+type ResolvedSurfaceDescriptor<T> = T extends RegisteredBoundSurfaceRuntimeDescriptor
+  ? Pick<T, "platform" | "protocol" | "adapter">
+  : never;
+
+export type ResolvedSurfaceAdapter =
+  ResolvedSurfaceDescriptor<RegisteredBoundSurfaceRuntimeDescriptor>;
 
 export type SurfaceAdapterResolver = {
   registeredPlatforms(): readonly RegisteredSurfacePlatform[];
@@ -356,48 +371,39 @@ export class SurfaceRuntimeRegistrationDuplicate extends TaggedError(
   readonly message: string;
 }> {}
 
-function guardRuntimeDescriptor(
+function bindRuntimeDescriptor(
   descriptor: RegisteredSurfaceRuntimeDescriptor,
-): RegisteredSurfaceRuntimeDescriptor {
-  switch (descriptor.platform) {
-    case "discord": {
-      const adapter = createDescriptorBoundSurfaceAdapter("discord", descriptor.adapter);
-      return {
-        ...descriptor,
-        adapter,
-        ...(descriptor.workflowProgress
-          ? {
-              workflowProgress: createDescriptorBoundWorkflowProgressPort(
-                "discord",
-                descriptor.workflowProgress,
-              ),
-            }
-          : {}),
-      };
-    }
-    case "github": {
-      const adapter = createDescriptorBoundSurfaceAdapter("github", descriptor.adapter);
-      return {
-        ...descriptor,
-        adapter,
-        ...(descriptor.workflowProgress
-          ? {
-              workflowProgress: createDescriptorBoundWorkflowProgressPort(
-                "github",
-                descriptor.workflowProgress,
-              ),
-            }
-          : {}),
-      };
-    }
-  }
+): RegisteredBoundSurfaceRuntimeDescriptor {
+  const platform = descriptor.protocol.platform;
+  const adapter = createDescriptorBoundSurfaceAdapter(platform, descriptor.adapter);
+  const workflowProgress = descriptor.createWorkflowProgress?.(adapter);
+  return {
+    platform,
+    protocol: descriptor.protocol,
+    adapter,
+    ...(descriptor.adapterIngress ? { adapterIngress: descriptor.adapterIngress } : {}),
+    ...(descriptor.requestIngress ? { requestIngress: descriptor.requestIngress } : {}),
+    ...(descriptor.createRelay ? { relay: descriptor.createRelay(adapter) } : {}),
+    ...(workflowProgress
+      ? {
+          workflowProgress: createDescriptorBoundWorkflowProgressPort(
+            platform,
+            workflowProgress as RegisteredSurfaceWorkflowProgressPort,
+          ),
+        }
+      : {}),
+  } as RegisteredBoundSurfaceRuntimeDescriptor;
 }
 
 export class SurfaceRuntimeRegistry {
-  readonly #descriptors: readonly RegisteredSurfaceRuntimeDescriptor[];
+  readonly #descriptors: readonly RegisteredBoundSurfaceRuntimeDescriptor[];
+  readonly #byPlatform: ReadonlyMap<AdapterPlatform, RegisteredBoundSurfaceRuntimeDescriptor>;
 
-  private constructor(descriptors: readonly RegisteredSurfaceRuntimeDescriptor[]) {
+  private constructor(descriptors: readonly RegisteredBoundSurfaceRuntimeDescriptor[]) {
     this.#descriptors = descriptors;
+    this.#byPlatform = new Map<AdapterPlatform, RegisteredBoundSurfaceRuntimeDescriptor>(
+      descriptors.map((descriptor) => [descriptor.platform, descriptor]),
+    );
   }
 
   static create(
@@ -405,34 +411,36 @@ export class SurfaceRuntimeRegistry {
   ): ResultType<SurfaceRuntimeRegistry, SurfaceRuntimeRegistrationDuplicate> {
     const platforms = new Set<RegisteredSurfacePlatform>();
     for (const descriptor of descriptors) {
-      if (platforms.has(descriptor.platform)) {
+      const platform = descriptor.protocol.platform;
+      if (platforms.has(platform)) {
         return Result.err(
           new SurfaceRuntimeRegistrationDuplicate({
-            platform: descriptor.platform,
-            message: `Surface runtime already registered for platform '${descriptor.platform}'`,
+            platform,
+            message: `Surface runtime already registered for platform '${platform}'`,
           }),
         );
       }
-      platforms.add(descriptor.platform);
+      platforms.add(platform);
     }
-    return Result.ok(new SurfaceRuntimeRegistry(descriptors.map(guardRuntimeDescriptor)));
+    return Result.ok(new SurfaceRuntimeRegistry(descriptors.map(bindRuntimeDescriptor)));
   }
 
-  entries(): readonly RegisteredSurfaceRuntimeDescriptor[] {
+  entries(): readonly RegisteredBoundSurfaceRuntimeDescriptor[] {
     return this.#descriptors;
   }
 
   adapterResolver(): SurfaceAdapterResolver {
-    const adapters = new Map(
-      this.#descriptors.map((descriptor) => [descriptor.platform, descriptor.adapter] as const),
-    );
     const registeredPlatforms = this.#descriptors.map((descriptor) => descriptor.platform);
     return {
       registeredPlatforms: () => registeredPlatforms,
       resolve: (platform) => {
-        if (platform !== "discord" && platform !== "github") return null;
-        const adapter = adapters.get(platform);
-        return adapter ? { platform, adapter } : null;
+        const descriptor = this.#byPlatform.get(platform);
+        if (!descriptor) return null;
+        return {
+          platform: descriptor.platform,
+          protocol: descriptor.protocol,
+          adapter: descriptor.adapter,
+        } as ResolvedSurfaceAdapter;
       },
     };
   }

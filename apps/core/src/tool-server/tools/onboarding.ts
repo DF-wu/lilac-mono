@@ -16,11 +16,7 @@ import {
   resolvePromptDir,
   seedCoreConfig,
 } from "@stanley2058/lilac-utils";
-import {
-  defineServerTool,
-  type ServerTool,
-  type ServerToolCallOptions,
-} from "@stanley2058/lilac-plugin-runtime";
+import { defineServerTool, type ServerTool, type ServerToolCallOptions } from "../types";
 
 import { parseToolInputPreservingZodError as parseToolInput } from "../validation-error-message";
 import { chromium } from "playwright";

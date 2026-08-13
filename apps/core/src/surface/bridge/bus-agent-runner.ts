@@ -133,6 +133,10 @@ import {
   projectAuthenticatedRequest,
   type AuthenticatedRequestProjection,
 } from "../authenticated-request";
+import {
+  getBuiltinSurfaceProtocol,
+  resolveAuthenticatedRequestSafetyMode,
+} from "../builtin-surface-protocols";
 import { formatToolArgsForDisplayWithSpecs } from "../../tools/tool-args-display";
 import { isHeartbeatAckText, isHeartbeatSessionId } from "../../heartbeat/common";
 
@@ -228,7 +232,7 @@ import {
   resolveSessionAdditionalPrompts,
 } from "./bus-agent-runner/prompt-overlays";
 import { resolveSessionSafetyMode, type SessionSafetyMode } from "../session-policy";
-import type { AuthenticatedSurfaceOrigin } from "../types";
+import type { AuthenticatedSurfaceOrigin, SurfacePrincipal } from "../types";
 import type {
   CustomCommandExecutionError,
   CustomCommandManager,
@@ -2464,20 +2468,7 @@ function projectDurableWorkflowRequestIdentity(input: {
     return input.projection;
   }
   const origin = authorized.policy.originSession;
-  let authenticatedOrigin: AuthenticatedSurfaceOrigin | undefined;
-  if (origin.client === "discord" && origin.sessionId && origin.userId) {
-    authenticatedOrigin = {
-      platform: "discord",
-      userId: origin.userId,
-      sessionRef: { platform: "discord", channelId: origin.sessionId },
-    };
-  } else if (origin.client === "github" && origin.sessionId && origin.userId) {
-    authenticatedOrigin = {
-      platform: "github",
-      userId: origin.userId,
-      sessionRef: { platform: "github", channelId: origin.sessionId },
-    };
-  }
+  const authenticatedOrigin = projectAuthorizedWorkflowOrigin(origin);
   return {
     ...input.projection,
     source: "internal-delegated",
@@ -2485,6 +2476,21 @@ function projectDurableWorkflowRequestIdentity(input: {
     authenticationMetadataKind: authenticatedOrigin ? "origin" : "absent",
     verifiedIngress: false,
   };
+}
+
+function projectAuthorizedWorkflowOrigin(origin: {
+  readonly client: AdapterPlatform | null;
+  readonly sessionId: string | null;
+  readonly userId: string | null;
+}): AuthenticatedSurfaceOrigin | undefined {
+  if (!origin.client || !origin.sessionId || !origin.userId) return undefined;
+  const protocol = getBuiltinSurfaceProtocol(origin.client);
+  if (!protocol) return undefined;
+  return {
+    platform: protocol.platform,
+    userId: origin.userId,
+    sessionRef: protocol.refs.createSessionRef(origin.sessionId),
+  } as AuthenticatedSurfaceOrigin;
 }
 
 export type AgentRunnerActiveWork = {
@@ -2561,13 +2567,13 @@ export async function startBusAgentRunner(params: {
   }) =>
     | {
         capability: string;
-        principal: { platform: "discord" | "github"; userId: string } | null;
+        principal: SurfacePrincipal | null;
         authenticatedOrigin?: AuthenticatedSurfaceOrigin | null;
         safetyMode?: SessionSafetyMode;
       }
     | Promise<{
         capability: string;
-        principal: { platform: "discord" | "github"; userId: string } | null;
+        principal: SurfacePrincipal | null;
         authenticatedOrigin?: AuthenticatedSurfaceOrigin | null;
         safetyMode?: SessionSafetyMode;
       }>;
@@ -3505,16 +3511,14 @@ export async function startBusAgentRunner(params: {
     const projection = requestMessageCache.getOrigin(input.requestId);
     if (!projection) return { state: "restricted", reason: "missing-cache-proof" };
     const cacheState = requestMessageCache.snapshot(input.requestId);
-    let safetyMode: SessionSafetyMode = "restricted";
-    if (projection.source === "external" && projection.requestClient === "github") {
-      safetyMode = projection.verifiedIngress ? "trusted" : "restricted";
-    } else if (projection.source === "external" && projection.requestClient === "discord") {
-      const parentResolution = params.resolveParentChannelId?.(input.sessionId);
-      safetyMode =
-        parentResolution === undefined
-          ? "restricted"
-          : resolveSessionSafetyMode(cfg, input.sessionId, parentResolution ?? undefined);
-    }
+    let safetyMode: SessionSafetyMode =
+      projection.source === "external"
+        ? currentSurfaceSafetyMode({
+            platform: projection.requestClient,
+            sessionId: input.sessionId,
+            verifiedIngress: projection.verifiedIngress,
+          })
+        : "restricted";
     if (projection.source === "internal-delegated") {
       const authorized = params.durableWorkflowStore?.authorizeWorkflowRequest({
         requestId: input.requestId,
@@ -3702,11 +3706,26 @@ export async function startBusAgentRunner(params: {
     readonly sessionId: string;
     readonly verifiedIngress: boolean;
   }): SessionSafetyMode {
-    if (input.platform === "github") return input.verifiedIngress ? "trusted" : "restricted";
-    if (input.platform !== "discord") return "restricted";
-    const parentResolution = params.resolveParentChannelId?.(input.sessionId);
-    if (parentResolution === undefined) return "restricted";
-    return resolveSessionSafetyMode(cfg, input.sessionId, parentResolution ?? undefined);
+    let assertedSafetyMode: SessionSafetyMode = "restricted";
+    if (input.platform === "discord") {
+      const parentResolution = params.resolveParentChannelId?.(input.sessionId);
+      if (parentResolution !== undefined) {
+        assertedSafetyMode = resolveSessionSafetyMode(
+          cfg,
+          input.sessionId,
+          parentResolution ?? undefined,
+        );
+      }
+    }
+    return resolveAuthenticatedRequestSafetyMode({
+      projection: {
+        requestClient: input.platform,
+        source: "external",
+        verifiedIngress: input.verifiedIngress,
+      },
+      assertedSafetyMode,
+      correlatedAuthority: true,
+    });
   }
 
   function resolveRecoveryIdentity(input: {
@@ -3764,20 +3783,7 @@ export async function startBusAgentRunner(params: {
         );
       }
       const origin = authorized.policy.originSession;
-      let authenticatedOrigin: AuthenticatedSurfaceOrigin | undefined;
-      if (origin.client === "discord" && origin.sessionId && origin.userId) {
-        authenticatedOrigin = {
-          platform: "discord",
-          userId: origin.userId,
-          sessionRef: { platform: "discord", channelId: origin.sessionId },
-        };
-      } else if (origin.client === "github" && origin.sessionId && origin.userId) {
-        authenticatedOrigin = {
-          platform: "github",
-          userId: origin.userId,
-          sessionRef: { platform: "github", channelId: origin.sessionId },
-        };
-      }
+      const authenticatedOrigin = projectAuthorizedWorkflowOrigin(origin);
       if (!sameRestoredOrigin(projection.authenticatedOrigin, authenticatedOrigin)) {
         return Result.err(
           new AgentRecoveryUnavailable({
@@ -4819,24 +4825,13 @@ export async function startBusAgentRunner(params: {
             next.requestClient === "github"
           ) {
             let capabilityOrigin: AuthenticatedSurfaceOrigin | undefined = next.authenticatedOrigin;
-            if (trustedFallbackSurface?.platform === "discord") {
+            if (trustedFallbackSurface) {
+              const protocol = getBuiltinSurfaceProtocol(trustedFallbackSurface.platform);
               capabilityOrigin = {
-                platform: "discord",
+                platform: protocol.platform,
                 userId: trustedFallbackSurface.userId,
-                sessionRef: {
-                  platform: "discord",
-                  channelId: trustedFallbackSurface.sessionId,
-                },
-              };
-            } else if (trustedFallbackSurface?.platform === "github") {
-              capabilityOrigin = {
-                platform: "github",
-                userId: trustedFallbackSurface.userId,
-                sessionRef: {
-                  platform: "github",
-                  channelId: trustedFallbackSurface.sessionId,
-                },
-              };
+                sessionRef: protocol.refs.createSessionRef(trustedFallbackSurface.sessionId),
+              } as AuthenticatedSurfaceOrigin;
             }
             const issuedControl = await params.issueControlCapability?.({
               requestId: next.requestId,

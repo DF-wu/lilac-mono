@@ -11,7 +11,7 @@ import type {
 import type { BusToAdapterRelaySnapshot } from "../surface/bridge/subscribe-from-bus";
 import type {
   RegisteredSurfacePlatform,
-  RegisteredSurfaceWorkflowProgressPort,
+  RegisteredSurfaceWorkflowProgressRegistration,
   SurfaceAdapterIngressHandle,
   SurfaceRelayHandle,
   SurfaceRelayRestoreAttempt,
@@ -126,11 +126,15 @@ function surfaceCleanupLabel(input: {
 
 export function createSurfaceWorkflowProgressPortMap(
   registry: SurfaceRuntimeRegistry,
-): Map<RegisteredSurfacePlatform, RegisteredSurfaceWorkflowProgressPort> {
-  const ports = new Map<RegisteredSurfacePlatform, RegisteredSurfaceWorkflowProgressPort>();
+): Map<RegisteredSurfacePlatform, RegisteredSurfaceWorkflowProgressRegistration> {
+  const ports = new Map<RegisteredSurfacePlatform, RegisteredSurfaceWorkflowProgressRegistration>();
   for (const descriptor of registry.entries()) {
     if (descriptor.workflowProgress) {
-      ports.set(descriptor.platform, descriptor.workflowProgress);
+      ports.set(descriptor.platform, {
+        platform: descriptor.platform,
+        protocol: descriptor.protocol,
+        port: descriptor.workflowProgress,
+      } as RegisteredSurfaceWorkflowProgressRegistration);
     }
   }
   return ports;

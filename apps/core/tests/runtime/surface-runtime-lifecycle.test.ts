@@ -254,6 +254,7 @@ function createRegistry(input: {
 }): SurfaceRuntimeRegistry {
   const discordAdapter = input.discordAdapter ?? new TestAdapter("discord", input.calls);
   const githubAdapter = input.githubAdapter ?? new TestAdapter("github", input.calls);
+  const githubRelayStart = input.githubRelayStart;
   const created = SurfaceRuntimeRegistry.create([
     createDiscordSurfaceRuntimeDescriptor({
       adapter: discordAdapter,
@@ -262,25 +263,25 @@ function createRegistry(input: {
           input.adapterIngressStart ??
           (async () => ({ platform: "discord", stop: async () => undefined })),
       },
-      relay: {
-        ...createDiscordRelayPolicy(discordAdapter),
+      createRelay: (guardedAdapter) => ({
+        ...createDiscordRelayPolicy(guardedAdapter),
         lifecycle: {
           platform: "discord",
           start: input.discordRelayStart ?? (async () => emptyRelayHandle("discord")),
         },
-      },
+      }),
     }),
     createGithubSurfaceRuntimeDescriptor({
       adapter: githubAdapter,
       ...(input.githubRequestIngressStart
         ? { requestIngress: { start: input.githubRequestIngressStart } }
         : {}),
-      ...(input.githubRelayStart
+      ...(githubRelayStart
         ? {
-            relay: {
+            createRelay: () => ({
               ...createGithubRelayPolicy(),
-              lifecycle: { platform: "github" as const, start: input.githubRelayStart },
-            },
+              lifecycle: { platform: "github" as const, start: githubRelayStart },
+            }),
           }
         : {}),
     }),
@@ -311,12 +312,14 @@ describe("surface runtime lifecycle", () => {
       throw new Error("Missing expected workflow progress ports");
     }
 
-    expect(ports).toEqual(
-      new Map([
-        ["discord", discord.workflowProgress],
-        ["github", github.workflowProgress],
-      ]),
-    );
+    const discordRegistration = ports.get("discord");
+    const githubRegistration = ports.get("github");
+    expect(discordRegistration?.platform).toBe("discord");
+    expect(discordRegistration?.protocol).toBe(discord.protocol);
+    expect(discordRegistration?.port).toBe(discord.workflowProgress);
+    expect(githubRegistration?.platform).toBe("github");
+    expect(githubRegistration?.protocol).toBe(github.protocol);
+    expect(githubRegistration?.port).toBe(github.workflowProgress);
   });
 
   it("preserves adapter ingress, connection, validation, and output activation phases", async () => {

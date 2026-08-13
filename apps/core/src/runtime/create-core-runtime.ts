@@ -37,21 +37,8 @@ import {
 } from "@stanley2058/lilac-event-bus";
 
 import { DiscordAdapter } from "../surface/discord/discord-adapter";
-import {
-  createDiscordRelayPolicy,
-  createDiscordSurfaceRuntimeDescriptor,
-} from "../surface/discord/discord-runtime-descriptor";
 import { GithubAdapter } from "../surface/github/github-adapter";
-import {
-  createConfiguredGithubSurfaceRuntimeDescriptor,
-  createGithubRelayPolicy,
-} from "../surface/github/github-runtime-descriptor";
-import { bridgeAdapterToBus } from "../surface/bridge/publish-to-bus";
-import { bridgeBusToAdapter } from "../surface/bridge/subscribe-from-bus";
-import {
-  createDescriptorBoundSurfaceAdapter,
-  createDescriptorBoundSurfaceEventSource,
-} from "../surface/produced-ref-guard";
+import { createDescriptorBoundSurfaceEventSource } from "../surface/produced-ref-guard";
 import {
   adaptDiscordRequestRouterStartOutcomeToHost,
   startDiscordRequestRouter,
@@ -91,7 +78,6 @@ import {
 } from "../conversation/thread-worker";
 
 import { readGithubAppSecretResult } from "../github/github-app";
-import { startGithubWebhookServer } from "../github/webhook/github-webhook-server";
 
 import { SqliteTranscriptStore } from "../transcript/transcript-store";
 import { isHeartbeatSessionId } from "../heartbeat/common";
@@ -157,7 +143,10 @@ import {
   type PausedSurfaceRecoveryOwnership,
 } from "./surface-runtime-lifecycle";
 
-import { SurfaceRuntimeRegistry } from "../surface/runtime-descriptor";
+import type { SurfaceRuntimeRegistry } from "../surface/runtime-descriptor";
+import { resolveAuthenticatedRequestSafetyMode } from "../surface/builtin-surface-protocols";
+import type { SurfacePrincipal } from "../surface/types";
+import { composeBuiltinSurfaceRuntimes } from "./compose-builtin-surface-runtimes";
 import { prewarmFffFinders } from "@stanley2058/lilac-fs";
 import {
   adaptToolResultArtifactStoreInitToHost,
@@ -183,7 +172,7 @@ export function resolveRequestCapabilityIdentity(input: {
   readonly authenticatedOrigin?: AuthenticatedSurfaceOrigin;
   readonly cachedRequest?: AuthenticatedRequestProjection;
 }): {
-  readonly principal: { readonly platform: "discord" | "github"; readonly userId: string } | null;
+  readonly principal: SurfacePrincipal | null;
   readonly authenticatedOrigin: AuthenticatedSurfaceOrigin | null;
   readonly safetyMode: "trusted" | "restricted";
 } {
@@ -203,22 +192,13 @@ export function resolveRequestCapabilityIdentity(input: {
   const principal = authenticatedOrigin
     ? { platform: authenticatedOrigin.platform, userId: authenticatedOrigin.userId }
     : null;
-  let safetyMode: "trusted" | "restricted" = "restricted";
-  if (cacheMatches && input.requestClient === "github") {
-    safetyMode = input.cachedRequest.verifiedIngress ? "trusted" : "restricted";
-  } else if (
-    cacheMatches &&
-    input.requestClient === "discord" &&
-    input.cachedRequest.verifiedIngress
-  ) {
-    safetyMode = input.safetyMode;
-  } else if (
-    cacheMatches &&
-    input.requestClient === "unknown" &&
-    input.cachedRequest.source === "internal-delegated"
-  ) {
-    safetyMode = input.safetyMode;
-  }
+  const safetyMode = input.cachedRequest
+    ? resolveAuthenticatedRequestSafetyMode({
+        projection: input.cachedRequest,
+        assertedSafetyMode: input.safetyMode,
+        correlatedAuthority: cacheMatches,
+      })
+    : "restricted";
   return { principal, authenticatedOrigin, safetyMode };
 }
 
@@ -1161,8 +1141,6 @@ export async function createCoreRuntime(
 
   const adapter = new DiscordAdapter({ customCommands, reportFatalPanic: reportFatalError });
   const githubAdapter = new GithubAdapter();
-  const surfaceAdapter = createDescriptorBoundSurfaceAdapter("discord", adapter);
-  const githubSurfaceAdapter = createDescriptorBoundSurfaceAdapter("github", githubAdapter);
   const discordEventSource = createDescriptorBoundSurfaceEventSource("discord", adapter);
   const durableWorkflowStore = new DurableWorkflowStore();
 
@@ -1238,88 +1216,6 @@ export async function createCoreRuntime(
     };
   }
   const mcpRegistry = mcpRegistryCreated.value;
-  function composeSurfaceRuntimeRegistry(appCredentialsAvailable: boolean) {
-    const discordRelayPolicy = createDiscordRelayPolicy(surfaceAdapter, {
-      activateRestoredOutputChains: (generation, chains) =>
-        stopRouter?.restoreActiveOutputChains(generation, chains),
-    });
-    const githubRelayPolicy = createGithubRelayPolicy();
-    return SurfaceRuntimeRegistry.create([
-      createDiscordSurfaceRuntimeDescriptor({
-        adapter: surfaceAdapter,
-        adapterIngress: {
-          start: async () => {
-            const handle = await bridgeAdapterToBus({
-              eventSource: discordEventSource,
-              platform: "discord",
-              bus,
-              subscriptionId: subId(subscriptionPrefix, "adapter-to-bus"),
-              transcriptStore: transcriptStore ?? undefined,
-            });
-            logger.debug("bridgeAdapterToBus started", {
-              subscriptionId: subId(subscriptionPrefix, "adapter-to-bus"),
-            });
-            return { platform: "discord", stop: () => handle.stop() };
-          },
-        },
-        relay: {
-          ...discordRelayPolicy,
-          lifecycle: {
-            platform: "discord",
-            start: async () => {
-              const relay = await bridgeBusToAdapter({
-                adapter: surfaceAdapter,
-                bus,
-                platform: "discord",
-                policy: discordRelayPolicy,
-                subscriptionId: subId(subscriptionPrefix, "bus-to-adapter"),
-                transcriptStore: transcriptStore ?? undefined,
-              });
-              logger.debug("bridgeBusToAdapter started", {
-                subscriptionId: subId(subscriptionPrefix, "bus-to-adapter"),
-              });
-              return relay;
-            },
-          },
-        },
-      }),
-      createConfiguredGithubSurfaceRuntimeDescriptor({
-        adapter: githubSurfaceAdapter,
-        webhookSecret: env.github.webhookSecret,
-        appCredentialsAvailable,
-        logger,
-        requestIngress: {
-          start: async () => {
-            return await startGithubWebhookServer({
-              bus,
-              subscriptionId: subId(subscriptionPrefix, "github-webhook"),
-              reportFatalError,
-            });
-          },
-        },
-        relay: {
-          ...githubRelayPolicy,
-          lifecycle: {
-            platform: "github",
-            start: async () => {
-              const relay = await bridgeBusToAdapter({
-                adapter: githubSurfaceAdapter,
-                bus,
-                platform: "github",
-                policy: githubRelayPolicy,
-                subscriptionId: subId(subscriptionPrefix, "bus-to-github"),
-                transcriptStore: transcriptStore ?? undefined,
-              });
-              logger.debug("GitHub output relay started", {
-                subscriptionId: subId(subscriptionPrefix, "bus-to-github"),
-              });
-              return relay;
-            },
-          },
-        },
-      }),
-    ]);
-  }
   let surfaceRuntimeRegistry: SurfaceRuntimeRegistry | null = null;
   let pendingSurfaceRecovery: PausedSurfaceRecoveryOwnership | null = null;
   let runtimeFullyStarted = false;
@@ -1675,7 +1571,20 @@ export async function createCoreRuntime(
             ),
           };
         }
-        const registryCreated = composeSurfaceRuntimeRegistry(githubAppSecret.value !== null);
+        const registryCreated = composeBuiltinSurfaceRuntimes({
+          discordAdapter: adapter,
+          githubAdapter,
+          descriptorBoundDiscordEventSource: discordEventSource,
+          bus,
+          subscriptionPrefix,
+          webhookSecret: env.github.webhookSecret,
+          githubAppCredentialsAvailable: githubAppSecret.value !== null,
+          getTranscriptStore: () => transcriptStore ?? undefined,
+          activateRestoredDiscordOutputChains: (generation, chains) =>
+            stopRouter?.restoreActiveOutputChains(generation, chains),
+          logger,
+          reportFatalError,
+        });
         if (registryCreated.status === "error") {
           return {
             kind: "result",
@@ -1690,6 +1599,9 @@ export async function createCoreRuntime(
         }
         const registry = registryCreated.value;
         surfaceRuntimeRegistry = registry;
+        const surfaceAdapter = registry
+          .entries()
+          .find((descriptor) => descriptor.platform === "discord")!.adapter;
         const workflowProgressPorts = createSurfaceWorkflowProgressPortMap(registry);
         if (startupConfig.tools.fsBackend === "fff") {
           void prewarmFffFinders({
@@ -2049,7 +1961,6 @@ export async function createCoreRuntime(
           operatorTokenSha256: process.env.LILAC_OPERATOR_TOKEN_SHA256,
           authorizeControlRequest: (input) => requestControlAuthority.authorize(input),
           resolveServerSafetyMode: async (context) => {
-            if (context.serverOwnedRequest && context.requestClient === "github") return "trusted";
             if (context.requestClient !== "discord" || !context.sessionId) return "restricted";
             const config = await getCoreConfig();
             const session = discordSurfaceStore?.getSession(context.sessionId);

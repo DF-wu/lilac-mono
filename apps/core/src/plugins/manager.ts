@@ -46,6 +46,7 @@ import {
   type CoreLevel1ToolSpec,
   type CoreToolPluginRuntime,
 } from "./types";
+import type { RegisteredSurfacePlatform } from "../surface/types";
 
 function isStructurallyAllowed(
   specName: string,
@@ -93,7 +94,7 @@ export type BuildLevel1ToolsetParams = {
     idleTimeoutMs?: number;
     maxDepth: number;
   };
-  requestContext?: Level1ExecutionRequestContext;
+  requestContext?: Level1ExecutionRequestContext<RegisteredSurfacePlatform>;
   reportToolStatus?: (update: {
     toolCallId: string;
     status: "start" | "update" | "end";

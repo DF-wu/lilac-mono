@@ -19,7 +19,14 @@ import {
 import { Result, TaggedError, type Result as ResultType } from "better-result";
 
 import { projectRuntimeError } from "../runtime/error-format";
-import type { AuthenticatedSurfaceOrigin } from "../surface/types";
+import { getBuiltinSurfaceProtocol } from "../surface/builtin-surface-protocols";
+import type { SurfaceProtocolRouting } from "../surface/protocol";
+import type {
+  AuthenticatedSurfaceOrigin,
+  AuthenticatedSurfaceOriginFor,
+  RegisteredSurfacePlatform,
+  SurfacePrincipal,
+} from "../surface/types";
 import { adaptToolResultToHost, preserveToolPanic } from "./tool-result-adapters";
 
 const modelReasoningEffortSchema = z.enum(MODEL_REASONING_EFFORTS);
@@ -104,7 +111,7 @@ type RequestContextLike = {
   requestClient: string;
   subagentDepth?: number | string;
   subagentProfile?: string;
-  requestInitiator?: { platform: "discord" | "github"; userId: string };
+  requestInitiator?: SurfacePrincipal;
   requestInitiatorSessionId?: string;
 };
 
@@ -117,7 +124,7 @@ const requestContextSchema = z.object({
   subagentDepth: z.union([z.number(), z.string()]).optional(),
   subagentProfile: z.string().optional(),
   requestInitiator: z
-    .object({ platform: z.enum(["discord", "github"]), userId: z.string().trim().min(1) })
+    .object({ platform: z.string().trim().min(1), userId: z.string().trim().min(1) })
     .optional(),
   requestInitiatorSessionId: z.string().trim().min(1).optional(),
 });
@@ -159,7 +166,21 @@ function decodeRequestContext(
   context: unknown,
 ): ResultType<RequestContextLike, SubagentDelegationError> {
   const decoded = requestContextSchema.safeParse(context);
-  if (decoded.success) return Result.ok(decoded.data);
+  if (decoded.success) {
+    const initiator = decoded.data.requestInitiator;
+    const { requestInitiator: _, ...common } = decoded.data;
+    if (!initiator) return Result.ok(common);
+    const protocol = getBuiltinSurfaceProtocol(initiator.platform);
+    if (protocol) {
+      return Result.ok({
+        ...common,
+        requestInitiator: {
+          platform: protocol.platform,
+          userId: initiator.userId,
+        },
+      });
+    }
+  }
   return Result.err(
     new SubagentDelegationError({
       operation: "decode_context",
@@ -167,6 +188,18 @@ function decodeRequestContext(
       message: "subagent_delegate requires request context",
     }),
   );
+}
+
+function createAuthenticatedSurfaceOrigin<P extends RegisteredSurfacePlatform>(
+  protocol: SurfaceProtocolRouting<P>,
+  userId: string,
+  sessionId: string,
+): AuthenticatedSurfaceOriginFor<P> {
+  return {
+    platform: protocol.platform,
+    userId,
+    sessionRef: protocol.refs.createSessionRef(sessionId),
+  };
 }
 
 function parseDepth(ctx: RequestContextLike): number {
@@ -310,7 +343,7 @@ export type SubagentDelegationRegistration = {
 export type TrustedSubagentDelegationRegistration = SubagentDelegationRegistration & {
   projectRoot: string;
   fallbackSurface: {
-    platform: "discord" | "github";
+    platform: SurfacePrincipal["platform"];
     sessionId: string;
     userId: string;
   };
@@ -433,24 +466,13 @@ export function subagentTools(params: {
           request_client: toAdapterPlatform(ctx.requestClient),
         };
         let authenticatedOrigin: AuthenticatedSurfaceOrigin | undefined;
-        if (ctx.requestInitiator?.platform === "discord" && ctx.requestInitiatorSessionId) {
-          authenticatedOrigin = {
-            platform: "discord",
-            userId: ctx.requestInitiator.userId,
-            sessionRef: {
-              platform: "discord",
-              channelId: ctx.requestInitiatorSessionId,
-            },
-          };
-        } else if (ctx.requestInitiator?.platform === "github" && ctx.requestInitiatorSessionId) {
-          authenticatedOrigin = {
-            platform: "github",
-            userId: ctx.requestInitiator.userId,
-            sessionRef: {
-              platform: "github",
-              channelId: ctx.requestInitiatorSessionId,
-            },
-          };
+        if (ctx.requestInitiator && ctx.requestInitiatorSessionId) {
+          const protocol = getBuiltinSurfaceProtocol(ctx.requestInitiator.platform);
+          authenticatedOrigin = createAuthenticatedSurfaceOrigin(
+            protocol,
+            ctx.requestInitiator.userId,
+            ctx.requestInitiatorSessionId,
+          );
         }
         logger.info("subagent delegate start", {
           requestId: ctx.requestId,

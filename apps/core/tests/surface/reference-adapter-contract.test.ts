@@ -11,6 +11,11 @@ import {
   type SurfaceOperationError,
 } from "../../src/surface/adapter";
 import {
+  BUILTIN_SURFACE_PROTOCOLS,
+  inferBuiltinSurfaceToolRequestTarget,
+  resolveBuiltinSurfaceRequestMessageRef,
+} from "../../src/surface/builtin-surface-protocols";
+import {
   bridgeBusToAdapter,
   type BusToAdapterRelaySnapshot,
 } from "../../src/surface/bridge/subscribe-from-bus";
@@ -27,6 +32,7 @@ import {
 } from "../../src/surface/github/github-runtime-descriptor";
 import {
   SurfaceRuntimeRegistry,
+  type RegisteredBoundSurfaceRuntimeDescriptor,
   type RegisteredSurfacePlatform,
   type RegisteredSurfaceRuntimeDescriptor,
 } from "../../src/surface/runtime-descriptor";
@@ -290,21 +296,21 @@ function createReferenceDescriptor(
           throw new Error("Reference descriptor lifecycle is unused");
         },
       },
-      relay: {
-        ...createDiscordRelayPolicy(adapter),
+      createRelay: (guardedAdapter) => ({
+        ...createDiscordRelayPolicy(guardedAdapter),
         lifecycle: {
           platform: "discord",
           start: async () => {
             throw new Error("Reference descriptor lifecycle is unused");
           },
         },
-      },
+      }),
     });
   }
 
   return createGithubSurfaceRuntimeDescriptor({
     adapter,
-    relay: {
+    createRelay: () => ({
       ...createGithubRelayPolicy(),
       lifecycle: {
         platform: "github",
@@ -312,7 +318,7 @@ function createReferenceDescriptor(
           throw new Error("Reference descriptor lifecycle is unused");
         },
       },
-    },
+    }),
   });
 }
 
@@ -320,6 +326,15 @@ function registryFor(descriptors: readonly RegisteredSurfaceRuntimeDescriptor[])
   const created = SurfaceRuntimeRegistry.create(descriptors);
   if (created.status === "error") throw created.error;
   return created.value;
+}
+
+function bindReferenceDescriptor(
+  reference: ReferenceContract,
+  adapter: SurfaceAdapter,
+): RegisteredBoundSurfaceRuntimeDescriptor {
+  const [descriptor] = registryFor([createReferenceDescriptor(reference, adapter)]).entries();
+  if (!descriptor) throw new Error("Reference descriptor is missing");
+  return descriptor;
 }
 
 async function createProductionBridge(
@@ -390,10 +405,114 @@ function recoverySnapshot(reference: ReferenceContract): GracefulRestartSnapshot
 }
 
 describe("shared Discord/GitHub adapter and descriptor contract", () => {
+  it("classifies foreign request IDs through catalog composition", () => {
+    const discordSession = BUILTIN_SURFACE_PROTOCOLS.discord.refs.createSessionRef("channel");
+    const githubSession = BUILTIN_SURFACE_PROTOCOLS.github.refs.createSessionRef("octo/repo#1");
+
+    expect(
+      BUILTIN_SURFACE_PROTOCOLS.discord.refs.resolveRequestMessageRef({
+        requestId: "github:octo/repo#1:10",
+        sessionRef: discordSession,
+      }),
+    ).toEqual({ kind: "none" });
+    expect(
+      resolveBuiltinSurfaceRequestMessageRef({
+        protocol: BUILTIN_SURFACE_PROTOCOLS.discord,
+        requestId: "github:octo/repo#1:10",
+        sessionRef: discordSession,
+      }),
+    ).toMatchObject({ kind: "invalid", error: { reason: "platform-mismatch" } });
+    expect(
+      resolveBuiltinSurfaceRequestMessageRef({
+        protocol: BUILTIN_SURFACE_PROTOCOLS.github,
+        requestId: "discord:channel:message",
+        sessionRef: githubSession,
+      }),
+    ).toMatchObject({ kind: "invalid", error: { reason: "platform-mismatch" } });
+  });
+
+  it("infers tool defaults by scanning protocol-local request ID parsers", () => {
+    expect(inferBuiltinSurfaceToolRequestTarget("discord:channel:message")).toEqual({
+      sessionId: "channel",
+      messageId: "message",
+    });
+    expect(inferBuiltinSurfaceToolRequestTarget("github:octo/repo#1:10")).toEqual({
+      sessionId: "octo/repo#1",
+      messageId: "10",
+    });
+    expect(inferBuiltinSurfaceToolRequestTarget("req:generic")).toBeNull();
+  });
+
+  it.each(REFERENCE_CASES)(
+    "%s uses the catalog as the sole ref-routing implementation",
+    (_name, reference) => {
+      if (reference.platform === "discord") {
+        const session = BUILTIN_SURFACE_PROTOCOLS.discord.refs.createSessionRef(
+          reference.sessionId,
+        );
+        const message = BUILTIN_SURFACE_PROTOCOLS.discord.refs.createMessageRef(
+          session,
+          reference.messageId,
+        );
+        const policy = createDiscordRelayPolicy(reference.createAdapter());
+
+        expect(session).toEqual({ platform: "discord", channelId: reference.sessionId });
+        expect(message).toEqual({
+          platform: "discord",
+          channelId: reference.sessionId,
+          messageId: reference.messageId,
+        });
+        expect(
+          policy.refs.resolveInitialReplyTarget({
+            requestId: reference.requestId,
+            sessionId: reference.sessionId,
+          }),
+        ).toEqual(
+          BUILTIN_SURFACE_PROTOCOLS.discord.refs.resolveRequestMessageRef({
+            requestId: reference.requestId,
+            sessionRef: session,
+          }),
+        );
+        expect(policy.refs.decodeReanchorTarget).toBe(
+          BUILTIN_SURFACE_PROTOCOLS.discord.refs.decodeMessageRef,
+        );
+        return;
+      }
+
+      const session = BUILTIN_SURFACE_PROTOCOLS.github.refs.createSessionRef(reference.sessionId);
+      const message = BUILTIN_SURFACE_PROTOCOLS.github.refs.createMessageRef(
+        session,
+        reference.messageId,
+      );
+      const policy = createGithubRelayPolicy();
+
+      expect(session).toEqual({ platform: "github", channelId: reference.sessionId });
+      expect(message).toEqual({
+        platform: "github",
+        channelId: reference.sessionId,
+        messageId: reference.messageId,
+      });
+      expect(
+        policy.refs.resolveInitialReplyTarget({
+          requestId: reference.requestId,
+          sessionId: reference.sessionId,
+        }),
+      ).toEqual(
+        BUILTIN_SURFACE_PROTOCOLS.github.refs.resolveRequestMessageRef({
+          requestId: reference.requestId,
+          sessionRef: session,
+        }),
+      );
+      expect(policy.refs.decodeReanchorTarget).toBe(
+        BUILTIN_SURFACE_PROTOCOLS.github.refs.decodeMessageRef,
+      );
+    },
+  );
+
   it("selects exactly one real relay from request_client with both descriptors active", async () => {
     const bus = createLilacBus(createInMemoryDeliveryBus());
-    const discord = createReferenceDescriptor(DISCORD_REFERENCE, DISCORD_REFERENCE.createAdapter());
-    const github = createReferenceDescriptor(GITHUB_REFERENCE, GITHUB_REFERENCE.createAdapter());
+    const discord = bindReferenceDescriptor(DISCORD_REFERENCE, DISCORD_REFERENCE.createAdapter());
+    const github = bindReferenceDescriptor(GITHUB_REFERENCE, GITHUB_REFERENCE.createAdapter());
     const discordBridge = await createProductionBridge(DISCORD_REFERENCE, discord.adapter, bus);
     const githubBridge = await createProductionBridge(GITHUB_REFERENCE, github.adapter, bus);
     try {
@@ -461,7 +580,7 @@ describe("shared Discord/GitHub adapter and descriptor contract", () => {
       const abortReasons: Array<string | undefined> = [];
       const restoreAbortObserver = observeOutputAborts(reference, abortReasons);
       const bus = createLilacBus(createInMemoryDeliveryBus());
-      const descriptor = createReferenceDescriptor(reference, reference.createAdapter());
+      const descriptor = bindReferenceDescriptor(reference, reference.createAdapter());
       const bridge = await createProductionBridge(reference, descriptor.adapter, bus);
       try {
         await bus.publish(
@@ -576,7 +695,7 @@ describe("shared Discord/GitHub adapter and descriptor contract", () => {
     async (_name, reference) => {
       const log = createProtocolLog();
       const adapter = reference.createAdapter(log);
-      const descriptor = createReferenceDescriptor(reference, adapter);
+      const descriptor = bindReferenceDescriptor(reference, adapter);
       const created: MsgRef[] = [];
       const started = await descriptor.adapter.startOutput(sessionRef(reference), {
         onMessageCreated: (ref) => created.push(ref),
@@ -652,7 +771,7 @@ describe("shared Discord/GitHub adapter and descriptor contract", () => {
     "%s workflow progress checks, sends, edits, and preserves actions",
     async (_name, reference) => {
       const log = createProtocolLog();
-      const descriptor = createReferenceDescriptor(reference, reference.createAdapter(log));
+      const descriptor = bindReferenceDescriptor(reference, reference.createAdapter(log));
       const port = descriptor.workflowProgress;
       if (!port) throw new Error("Reference workflow progress port is missing");
 
@@ -687,8 +806,11 @@ describe("shared Discord/GitHub adapter and descriptor contract", () => {
     "%s preserves one real guarded-stream hydration through recovery apply",
     async (_name, reference) => {
       const log = createProtocolLog();
-      const descriptor = createReferenceDescriptor(reference, reference.createAdapter(log));
-      const registry = registryFor([descriptor]);
+      const registry = registryFor([
+        createReferenceDescriptor(reference, reference.createAdapter(log)),
+      ]);
+      const [descriptor] = registry.entries();
+      if (!descriptor) throw new Error("Reference descriptor is missing");
       const bus = createLilacBus(createInMemoryDeliveryBus());
       const bridge = await createProductionBridge(reference, descriptor.adapter, bus);
       try {

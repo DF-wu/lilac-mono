@@ -17,6 +17,7 @@ import type { WorkflowProgressCardService } from "../workflow/workflow-progress-
 import type { McpRegistryApi } from "../mcp/registry-types";
 import type { McpOAuthProviderService } from "../mcp/oauth-provider";
 import type { McpOAuthCallbackControl } from "../mcp/oauth-callback";
+import type { RegisteredSurfacePlatform } from "../surface/types";
 
 export type CoreToolPluginRuntime = {
   dataDir?: string;
@@ -40,7 +41,10 @@ export type CoreToolPluginRuntime = {
 const BOUNDED_BUILTIN_OUTPUT = Symbol("bounded-builtin-output");
 const AGGREGATE_OUTPUT_BUDGET_EXEMPT = Symbol("aggregate-output-budget-exempt");
 
-export type CoreLevel1ToolSpec = Level1ToolSpec<CoreToolPluginRuntime> & {
+export type CoreLevel1ToolSpec = Level1ToolSpec<
+  CoreToolPluginRuntime,
+  RegisteredSurfacePlatform
+> & {
   [BOUNDED_BUILTIN_OUTPUT]?: true;
   [AGGREGATE_OUTPUT_BUDGET_EXEMPT]?: true;
 };
@@ -61,4 +65,8 @@ export function isAggregateOutputBudgetExempt(spec: CoreLevel1ToolSpec): boolean
   return spec[AGGREGATE_OUTPUT_BUDGET_EXEMPT] === true;
 }
 
-export type CoreToolPlugin = LilacToolPlugin<CoreToolPluginRuntime, CoreLevel1ToolSpec, ServerTool>;
+export type CoreToolPlugin = LilacToolPlugin<
+  CoreToolPluginRuntime,
+  CoreLevel1ToolSpec,
+  ServerTool<RegisteredSurfacePlatform>
+>;

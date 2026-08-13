@@ -42,6 +42,8 @@ import type {
   SurfaceSession,
   SurfaceSessionParticipantsResult,
 } from "../../src/surface/types";
+import type { RequestContext as PluginRequestContext } from "@stanley2058/lilac-plugin-runtime";
+import type { RequestContext as CoreRequestContext } from "../../src/tool-server/types";
 
 const SESSION_REF_FIXTURES = {
   discord: { platform: "discord", channelId: "discord-channel" },
@@ -218,6 +220,12 @@ describe("surface operation contract", () => {
   it("keeps session and message platform sets exactly equal", () => {
     expectTypeOf<SessionRef["platform"]>().toEqualTypeOf<MsgRef["platform"]>();
     expectTypeOf<RegisteredSurfacePlatform>().toEqualTypeOf<"discord" | "github">();
+    expectTypeOf<
+      NonNullable<PluginRequestContext["requestInitiator"]>["platform"]
+    >().toEqualTypeOf<string>();
+    expectTypeOf<
+      NonNullable<CoreRequestContext["requestInitiator"]>["platform"]
+    >().toEqualTypeOf<RegisteredSurfacePlatform>();
     expectTypeOf<SurfaceRefPlatformSetsExactlyEqual>().toEqualTypeOf<true>();
     expect(Object.keys(SESSION_REF_FIXTURES).sort()).toEqual(
       Object.keys(MESSAGE_REF_FIXTURES).sort(),

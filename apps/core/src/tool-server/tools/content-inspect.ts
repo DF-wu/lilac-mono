@@ -9,11 +9,7 @@ import {
 import { z } from "zod";
 import { fileTypeFromBuffer } from "file-type";
 import { google, type GoogleLanguageModelOptions } from "@ai-sdk/google";
-import {
-  defineServerTool,
-  type ServerTool,
-  type ServerToolCallOptions,
-} from "@stanley2058/lilac-plugin-runtime";
+import { defineServerTool, type ServerTool, type ServerToolCallOptions } from "../types";
 import {
   createLogger,
   errorMessage,

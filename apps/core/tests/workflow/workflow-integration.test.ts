@@ -34,6 +34,7 @@ import type {
   SurfaceMessage,
 } from "../../src/surface/types";
 import { createDiscordWorkflowProgressPort } from "../../src/surface/discord/discord-runtime-descriptor";
+import { discordSurfaceProtocol } from "../../src/surface/discord/discord-surface-protocol";
 import { ProgrammaticWorkflow } from "../../src/tool-server/tools/programmatic-workflow";
 import { DurableWorkflowStore } from "../../src/workflow/durable-workflow-store";
 import { startWorkflowActionResolver } from "../../src/workflow/workflow-action-resolver";
@@ -60,6 +61,19 @@ function createWorkflowProgressProjectorForTest(
       throw panic;
     },
   });
+}
+
+function workflowProgressPorts(adapter: WorkflowCardAdapter) {
+  return new Map([
+    [
+      "discord" as const,
+      {
+        platform: "discord" as const,
+        protocol: discordSurfaceProtocol,
+        port: createDiscordWorkflowProgressPort(adapter),
+      },
+    ],
+  ]);
 }
 
 class LiveRawBus implements RawBus {
@@ -240,7 +254,7 @@ describe("unified workflow integration", () => {
     const projector = createWorkflowProgressProjectorForTest({
       bus,
       store,
-      ports: new Map([["discord", createDiscordWorkflowProgressPort(adapter)]]),
+      ports: workflowProgressPorts(adapter),
       subscriptionId: "integration-projector",
       coalesceMs: 5,
       minEditIntervalMs: 0,
@@ -568,7 +582,7 @@ describe("unified workflow integration", () => {
     const firstProjector = createWorkflowProgressProjectorForTest({
       bus,
       store,
-      ports: new Map([["discord", createDiscordWorkflowProgressPort(adapter)]]),
+      ports: workflowProgressPorts(adapter),
       subscriptionId: "restart-projector-first",
       coalesceMs: 5,
       minEditIntervalMs: 0,
@@ -633,7 +647,7 @@ describe("unified workflow integration", () => {
       restartedProjector = createWorkflowProgressProjectorForTest({
         bus,
         store,
-        ports: new Map([["discord", createDiscordWorkflowProgressPort(adapter)]]),
+        ports: workflowProgressPorts(adapter),
         subscriptionId: "restart-projector-second",
         coalesceMs: 5,
         minEditIntervalMs: 0,

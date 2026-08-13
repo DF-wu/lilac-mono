@@ -25,10 +25,12 @@ import {
   type SurfaceOperationError,
 } from "../../src/surface/adapter";
 import { createDiscordWorkflowProgressPort } from "../../src/surface/discord/discord-runtime-descriptor";
+import { discordSurfaceProtocol } from "../../src/surface/discord/discord-surface-protocol";
 import { createGithubWorkflowProgressPort } from "../../src/surface/github/github-runtime-descriptor";
+import { githubSurfaceProtocol } from "../../src/surface/github/github-surface-protocol";
 import type {
   RegisteredSurfacePlatform,
-  RegisteredSurfaceWorkflowProgressPort,
+  RegisteredSurfaceWorkflowProgressRegistration,
   SurfaceWorkflowProgressPort,
 } from "../../src/surface/runtime-descriptor";
 import type {
@@ -337,19 +339,27 @@ class ReconciliationFailureStore extends DurableWorkflowStore {
 }
 function projectionPorts(
   adapter: ProjectionAdapter,
-): Map<RegisteredSurfacePlatform, RegisteredSurfaceWorkflowProgressPort> {
-  const ports = new Map<RegisteredSurfacePlatform, RegisteredSurfaceWorkflowProgressPort>();
+): Map<RegisteredSurfacePlatform, RegisteredSurfaceWorkflowProgressRegistration> {
+  const ports = new Map<RegisteredSurfacePlatform, RegisteredSurfaceWorkflowProgressRegistration>();
   if (adapter.platform === "discord") {
-    ports.set("discord", createDiscordWorkflowProgressPort(adapter));
+    ports.set("discord", {
+      platform: "discord",
+      protocol: discordSurfaceProtocol,
+      port: createDiscordWorkflowProgressPort(adapter),
+    });
   } else {
-    ports.set("github", createGithubWorkflowProgressPort(adapter));
+    ports.set("github", {
+      platform: "github",
+      protocol: githubSurfaceProtocol,
+      port: createGithubWorkflowProgressPort(adapter),
+    });
   }
   return ports;
 }
 function combinedProjectionPorts(
   ...adapters: readonly ProjectionAdapter[]
-): Map<RegisteredSurfacePlatform, RegisteredSurfaceWorkflowProgressPort> {
-  const ports = new Map<RegisteredSurfacePlatform, RegisteredSurfaceWorkflowProgressPort>();
+): Map<RegisteredSurfacePlatform, RegisteredSurfaceWorkflowProgressRegistration> {
+  const ports = new Map<RegisteredSurfacePlatform, RegisteredSurfaceWorkflowProgressRegistration>();
   for (const adapter of adapters) {
     for (const [platform, port] of projectionPorts(adapter)) ports.set(platform, port);
   }
@@ -980,10 +990,15 @@ describe("WorkflowProgressProjector", () => {
       rmSync(dbPath, { force: true });
     }
   });
-  it.each(["discord", "github"] as const)(
-    "repairs a persisted %s binding ref platform mismatch and does not duplicate after restart",
-    async (platform) => {
-      const dbPath = tempDbPath(`workflow-binding-platform-mismatch-${platform}`);
+  it.each([
+    ["discord", "platform"],
+    ["discord", "session"],
+    ["github", "platform"],
+    ["github", "session"],
+  ] as const)(
+    "repairs a persisted %s binding ref %s mismatch and does not duplicate after restart",
+    async (platform, mismatch) => {
+      const dbPath = tempDbPath(`workflow-binding-${mismatch}-mismatch-${platform}`);
       let store = new DurableWorkflowStore(dbPath);
       const discordAdapter = new ProjectionAdapter("discord");
       const githubAdapter = new ProjectionAdapter("github");
@@ -994,13 +1009,17 @@ describe("WorkflowProgressProjector", () => {
         bus,
         store,
         ports: combinedProjectionPorts(discordAdapter, githubAdapter),
-        subscriptionId: `binding-platform-mismatch-${platform}`,
+        subscriptionId: `binding-${mismatch}-mismatch-${platform}`,
         now: () => 20,
       });
       const mismatchedRef: MsgRef =
-        platform === "discord"
-          ? { platform: "github", channelId: "octo/repo#1", messageId: "42" }
-          : { platform: "discord", channelId: "channel-1", messageId: "message-1" };
+        mismatch === "platform"
+          ? platform === "discord"
+            ? { platform: "github", channelId: "channel-1", messageId: "42" }
+            : { platform: "discord", channelId: "channel-1", messageId: "message-1" }
+          : platform === "discord"
+            ? { platform: "discord", channelId: "other-channel", messageId: "message-1" }
+            : { platform: "github", channelId: "other-channel", messageId: "42" };
       try {
         createInvocation(store, { platform });
         store.upsertSurfaceBinding({
@@ -1039,7 +1058,7 @@ describe("WorkflowProgressProjector", () => {
           bus,
           store,
           ports: combinedProjectionPorts(discordAdapter, githubAdapter),
-          subscriptionId: `binding-platform-mismatch-${platform}-restarted`,
+          subscriptionId: `binding-${mismatch}-mismatch-${platform}-restarted`,
           now: () => 30,
         });
         await projector.start();
@@ -1278,7 +1297,9 @@ describe("WorkflowProgressProjector", () => {
     let projector = createWorkflowProgressProjectorForTest({
       bus,
       store,
-      ports: new Map([["github", port]]),
+      ports: new Map([
+        ["github", { platform: "github", protocol: githubSurfaceProtocol, port } as const],
+      ]),
       subscriptionId: "created-outcome",
       now: () => now,
     });
@@ -1314,7 +1335,9 @@ describe("WorkflowProgressProjector", () => {
       projector = createWorkflowProgressProjectorForTest({
         bus,
         store,
-        ports: new Map([["github", port]]),
+        ports: new Map([
+          ["github", { platform: "github", protocol: githubSurfaceProtocol, port } as const],
+        ]),
         subscriptionId: "created-outcome-restarted",
         now: () => now,
       });
@@ -2274,8 +2297,11 @@ describe.each(["discord", "github"] as const)("%s workflow progress port contrac
       if (!currentPort) throw new Error("Missing workflow progress port");
       revisedPorts.set(platform, {
         ...currentPort,
-        configurationRevision: `${currentPort.configurationRevision}-reconfigured`,
-      });
+        port: {
+          ...currentPort.port,
+          configurationRevision: `${currentPort.port.configurationRevision}-reconfigured`,
+        },
+      } as RegisteredSurfaceWorkflowProgressRegistration);
       projector = createWorkflowProgressProjectorForTest({
         bus,
         store,
@@ -2354,8 +2380,11 @@ describe.each(["discord", "github"] as const)("%s workflow progress port contrac
       if (!currentPort) throw new Error("Missing terminal workflow port");
       revisedPorts.set(platform, {
         ...currentPort,
-        configurationRevision: `${currentPort.configurationRevision}-terminal-fix`,
-      });
+        port: {
+          ...currentPort.port,
+          configurationRevision: `${currentPort.port.configurationRevision}-terminal-fix`,
+        },
+      } as RegisteredSurfaceWorkflowProgressRegistration);
       projector = createWorkflowProgressProjectorForTest({
         bus,
         store,
@@ -2382,10 +2411,13 @@ describe.each(["discord", "github"] as const)("%s workflow progress port contrac
     const basePorts = projectionPorts(adapter);
     const basePort = basePorts.get(platform);
     if (!basePort) throw new Error("Missing configurable workflow port");
-    const configurablePort = { ...basePort };
-    const ports = new Map<RegisteredSurfacePlatform, RegisteredSurfaceWorkflowProgressPort>([
-      [platform, configurablePort],
-    ]);
+    const configurablePort = {
+      ...basePort,
+      port: { ...basePort.port },
+    } as RegisteredSurfaceWorkflowProgressRegistration;
+    const ports = new Map<RegisteredSurfacePlatform, RegisteredSurfaceWorkflowProgressRegistration>(
+      [[platform, configurablePort]],
+    );
     const bus = createLilacBus(new CapturingRawBus());
     let now = 20;
     const projector = createWorkflowProgressProjectorForTest({
@@ -2413,7 +2445,13 @@ describe.each(["discord", "github"] as const)("%s workflow progress port contrac
       );
 
       adapter.editOperationFailure = null;
-      configurablePort.configurationRevision = `${configurablePort.configurationRevision}-fixed`;
+      ports.set(platform, {
+        ...configurablePort,
+        port: {
+          ...configurablePort.port,
+          configurationRevision: `${configurablePort.port.configurationRevision}-fixed`,
+        },
+      } as RegisteredSurfaceWorkflowProgressRegistration);
       now += 1;
       await projector.ensureInitialCard("run-1");
       const revisedToken = actionToken(adapter, "Pause");

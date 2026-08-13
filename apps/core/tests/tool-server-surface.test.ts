@@ -3,6 +3,7 @@ import { Panic, Result } from "better-result";
 import { parseCoreConfigV1ToUniversal, type CoreConfig } from "@stanley2058/lilac-utils";
 import { Surface as ProductionSurface } from "../src/tool-server/tools/surface";
 import { SurfaceUnavailable, type SurfaceAdapter } from "../src/surface/adapter";
+import { BUILTIN_SURFACE_PROTOCOLS } from "../src/surface/builtin-surface-protocols";
 import {
   GithubAdapter,
   type GithubAdapterApi as GithubSurfaceApi,
@@ -68,8 +69,11 @@ class Surface extends ProductionSurface {
     super({
       ...surfaceParams,
       adapterResolver: createTestAdapterResolver([
-        { platform: "discord", adapter: params.adapter },
-        { platform: "github", adapter: params.githubAdapter ?? DEFAULT_GITHUB_TEST_ADAPTER },
+        { protocol: BUILTIN_SURFACE_PROTOCOLS.discord, adapter: params.adapter },
+        {
+          protocol: BUILTIN_SURFACE_PROTOCOLS.github,
+          adapter: params.githubAdapter ?? DEFAULT_GITHUB_TEST_ADAPTER,
+        },
       ]),
     });
   }
@@ -439,10 +443,22 @@ describe("tool-server surface", () => {
     ).rejects.toThrow("context requestClient 'desktop' is not a valid surface wire value");
   });
 
+  it("does not route an unregistered wire client target operation through Discord", async () => {
+    const adapter = new FakeAdapter([], {});
+    const tool = new Surface({ adapter, config: testConfig({}) });
+
+    await expect(
+      tool.call("surface.messages.list", { client: "slack", sessionId: "channel-1" }),
+    ).rejects.toThrow("client 'slack' is recognized but has no registered executable adapter");
+    expect(adapter.listCalls).toEqual([]);
+  });
+
   it("lists only registered executable platforms in help without operation support metadata", async () => {
     const adapter = new FakeAdapter([], {});
     const tool = new ProductionSurface({
-      adapterResolver: createTestAdapterResolver([{ platform: "discord", adapter }]),
+      adapterResolver: createTestAdapterResolver([
+        { protocol: BUILTIN_SURFACE_PROTOCOLS.discord, adapter },
+      ]),
       config: testConfig({}),
     });
 
@@ -459,7 +475,7 @@ describe("tool-server surface", () => {
   it("shows GitHub session syntax for a GitHub-only registry", async () => {
     const tool = new ProductionSurface({
       adapterResolver: createTestAdapterResolver([
-        { platform: "github", adapter: DEFAULT_GITHUB_TEST_ADAPTER },
+        { protocol: BUILTIN_SURFACE_PROTOCOLS.github, adapter: DEFAULT_GITHUB_TEST_ADAPTER },
       ]),
       config: testConfig({}),
     });
@@ -509,6 +525,22 @@ describe("tool-server surface", () => {
     });
   });
 
+  it("uses GitHub session syntax for GitHub context with both adapters registered", async () => {
+    const tool = new Surface({ adapter: new FakeAdapter([], {}), config: testConfig({}) });
+
+    const out = (await tool.call("surface.help", {}, { context: { requestClient: "github" } })) as {
+      supportedClients: readonly string[];
+      sessionIdFormats: { client: string; accepted: Array<{ format: string; meaning: string }> };
+    };
+
+    expect(out.supportedClients).toEqual(["discord", "github"]);
+    expect(out.sessionIdFormats.client).toBe("github");
+    expect(out.sessionIdFormats.accepted).toContainEqual({
+      format: "OWNER/REPO#123",
+      meaning: "GitHub issue/PR thread",
+    });
+  });
+
   it("uses the registered Discord default for unregistered context without inventing support", async () => {
     const both = new Surface({ adapter: new FakeAdapter([], {}), config: testConfig({}) });
     const unregistered = (await both.call(
@@ -550,6 +582,27 @@ describe("tool-server surface", () => {
     expect(source).not.toContain("GithubAdapter");
     expect(source).not.toContain("DiscordAdapter");
     expect(source).not.toContain("githubAdapter:");
+  });
+
+  it("keeps generic target and help routing free of explicit platform selection", async () => {
+    const source = await fs.readFile(
+      join(import.meta.dir, "../src/tool-server/tools/surface.ts"),
+      "utf8",
+    );
+    const defaultSection = source.slice(
+      source.indexOf("function withDefaultSessionId"),
+      source.indexOf("function mustPresentString"),
+    );
+    const targetSection = source.slice(
+      source.indexOf("private async callHelp"),
+      source.indexOf("private async resolveMessageTarget"),
+    );
+    const routingSection = `${defaultSection}\n${targetSection}`;
+
+    expect(routingSection).not.toMatch(/platform === ["'](?:discord|github)["']/u);
+    expect(routingSection).not.toMatch(/switch \([^)]*platform/u);
+    expect(routingSection).not.toContain("inferDiscordOrigin");
+    expect(routingSection).not.toContain("inferGithubOrigin");
   });
 
   it("lists session participants", async () => {
@@ -2877,6 +2930,55 @@ describe("tool-server surface", () => {
       { owner: "octo", repo: "repo", commentId: 345, body: "updated comment" },
     ]);
     expect(deleted).toEqual([{ owner: "octo", repo: "repo", commentId: 345 }]);
+  });
+
+  it("passes a non-empty arbitrary GitHub session selector to the GitHub adapter unchanged", async () => {
+    const githubAdapter = new FakeAdapter([], {});
+    const tool = new Surface({
+      adapter: new FakeAdapter([], {}),
+      githubAdapter,
+      config: testConfig({}),
+    });
+
+    await tool.call("surface.messages.list", {
+      client: "github",
+      sessionId: "arbitrary selector",
+    });
+
+    expect(githubAdapter.listCalls).toEqual([
+      {
+        sessionRef: { platform: "github", channelId: "arbitrary selector" },
+        opts: { limit: 50, beforeMessageId: undefined, afterMessageId: undefined },
+      },
+    ]);
+  });
+
+  it("defaults selected GitHub targets from a Discord-form requestId", async () => {
+    const githubAdapter = new FakeAdapter([], {});
+    const tool = new Surface({
+      adapter: new FakeAdapter([], {}),
+      githubAdapter,
+      config: testConfig({}),
+    });
+
+    await tool.call(
+      "surface.messages.read",
+      { client: "github" },
+      {
+        context: {
+          requestClient: "github",
+          requestId: "discord:discord-channel:discord-message",
+        },
+      },
+    );
+
+    expect(githubAdapter.readCalls).toEqual([
+      {
+        platform: "github",
+        channelId: "discord-channel",
+        messageId: "discord-message",
+      },
+    ]);
   });
 
   it("defaults github sessionId/messageId from requestId", async () => {

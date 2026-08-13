@@ -1,9 +1,5 @@
 import { z } from "zod";
-import {
-  defineServerTool,
-  type ServerTool,
-  type ServerToolCallOptions,
-} from "@stanley2058/lilac-plugin-runtime";
+import { defineServerTool, type ServerTool, type ServerToolCallOptions } from "../types";
 
 import {
   DISCOVERY_LIMIT_MAX,

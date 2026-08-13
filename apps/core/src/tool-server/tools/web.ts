@@ -4,7 +4,7 @@ import { JSDOM } from "jsdom";
 import { Readability } from "@mozilla/readability";
 import { chromium, type Browser, type BrowserContext, type Page } from "playwright";
 import Exa from "exa-js";
-import type { ServerTool } from "../types";
+import { defineServerTool, type ServerTool } from "../types";
 import { tavily, type TavilyClient } from "@tavily/core";
 import TurndownService from "turndown";
 import {
@@ -17,7 +17,6 @@ import {
 import fs from "node:fs/promises";
 import { constants as fsConstants } from "node:fs";
 import { Result, TaggedError, type Result as ResultType } from "better-result";
-import { defineServerTool } from "@stanley2058/lilac-plugin-runtime";
 
 import {
   createDefaultWebSearchProviders,

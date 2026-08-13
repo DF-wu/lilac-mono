@@ -4,7 +4,7 @@ import {
   type RequestContext,
   type ServerTool,
   type ServerToolCallOptions,
-} from "@stanley2058/lilac-plugin-runtime";
+} from "../types";
 import { Result, TaggedError, type Result as ResultType } from "better-result";
 import {
   experimental_generateVideo as generateVideo,

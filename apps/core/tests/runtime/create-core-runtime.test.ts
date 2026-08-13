@@ -36,6 +36,11 @@ import {
   ResidualDiscordRequestRouterStopFailed,
   type ResidualDiscordRequestRouter,
 } from "../../src/surface/discord/discord-request-router";
+import {
+  BUILTIN_SURFACE_PROTOCOLS,
+  resolveBuiltinSurfaceProtocolSafetyMode,
+} from "../../src/surface/builtin-surface-protocols";
+import type { SurfaceProtocolRouting } from "../../src/surface/protocol";
 
 describe("delegated request capability identity", () => {
   const authenticatedOrigin = {
@@ -84,6 +89,49 @@ describe("delegated request capability identity", () => {
         },
       }),
     ).toEqual({ principal: null, authenticatedOrigin: null, safetyMode: "restricted" });
+  });
+
+  it("does not grant principal or asserted trust from registered protocol membership", () => {
+    expect(
+      resolveRequestCapabilityIdentity({
+        requestClient: "discord",
+        sessionId: "channel-1",
+        safetyMode: "trusted",
+        cachedRequest: {
+          requestId: "discord:channel-1:message-1",
+          requestClient: "discord",
+          sessionId: "channel-1",
+          source: "external",
+          platform: "discord",
+          sessionRef: { platform: "discord", channelId: "channel-1" },
+          messageRef: { platform: "discord", channelId: "channel-1", messageId: "message-1" },
+          authenticationMetadataKind: "absent",
+          verifiedIngress: false,
+        },
+      }),
+    ).toEqual({ principal: null, authenticatedOrigin: null, safetyMode: "restricted" });
+  });
+
+  it("preserves asserted safety when a built-in protocol has no external override", () => {
+    const protocol = {
+      ...BUILTIN_SURFACE_PROTOCOLS.discord,
+      requestProjection: { inferRequestMessageRef: true },
+    } satisfies SurfaceProtocolRouting<"discord">;
+
+    expect(
+      resolveBuiltinSurfaceProtocolSafetyMode({
+        protocol,
+        verifiedIngress: true,
+        assertedSafetyMode: "trusted",
+      }),
+    ).toBe("trusted");
+    expect(
+      resolveBuiltinSurfaceProtocolSafetyMode({
+        protocol,
+        verifiedIngress: true,
+        assertedSafetyMode: "restricted",
+      }),
+    ).toBe("restricted");
   });
 });
 

@@ -1,4 +1,3 @@
-import type { SurfaceMsgRef } from "@stanley2058/lilac-event-bus";
 import { Panic, Result, TaggedError, type Result as ResultType } from "better-result";
 
 import { formatTaggedErrorForLog } from "@stanley2058/lilac-utils";
@@ -8,7 +7,7 @@ import {
   deleteIssueReactionById,
   GithubApiError,
 } from "../../github/github-api";
-import { parseGithubRequestId, parseGithubSessionId } from "../../github/github-ids";
+import { parseGithubSessionId } from "../../github/github-ids";
 import { markGithubAgentComment } from "../../github/github-comment-marker";
 import {
   clearGithubAck,
@@ -18,14 +17,11 @@ import {
   type GithubAckState,
 } from "../../github/github-state";
 import type { SurfaceAdapter, SurfaceOperationError } from "../adapter";
-import {
-  createDescriptorBoundSurfaceAdapter,
-  createDescriptorBoundWorkflowProgressPort,
-} from "../produced-ref-guard";
+import { resolveBuiltinSurfaceRequestMessageRef } from "../builtin-surface-protocols";
+import { githubSurfaceProtocol } from "./github-surface-protocol";
 import type {
   SurfaceRelayDescriptor,
   SurfaceRelayPolicy,
-  SurfaceReplyTargetInvalid,
   SurfaceRequestIngress,
   SurfaceRuntimeDescriptor,
   SurfaceWorkflowProgressPort,
@@ -33,8 +29,6 @@ import type {
 } from "../runtime-descriptor";
 import {
   SurfaceIngressAcknowledgementCleanupFailed,
-  SurfaceReplyTargetInvalid as ReplyTargetInvalid,
-  SurfaceRefInvalid as RefInvalid,
   workflowProgressOperationFailure,
 } from "../runtime-descriptor";
 
@@ -53,11 +47,10 @@ function githubWorkflowError(
 export function createGithubWorkflowProgressPort(
   adapter: SurfaceAdapter,
 ): SurfaceWorkflowProgressPort<"github"> {
-  const guardedAdapter = createDescriptorBoundSurfaceAdapter("github", adapter);
   return {
     configurationRevision: GITHUB_WORKFLOW_PROGRESS_CONFIGURATION_REVISION,
     checkMessage: async (target) => {
-      const checked = await guardedAdapter.readMsg({
+      const checked = await adapter.readMsg({
         platform: "github",
         channelId: target.channelId,
         messageId: target.messageId,
@@ -77,7 +70,7 @@ export function createGithubWorkflowProgressPort(
             text: `In reply to ${input.replyToMessageId}:\n\n${input.content.text ?? ""}`,
           }
         : input.content;
-      const sent = await guardedAdapter.sendMsg(
+      const sent = await adapter.sendMsg(
         { platform: "github", channelId: input.channelId },
         content,
         { silent: input.silent },
@@ -102,7 +95,7 @@ export function createGithubWorkflowProgressPort(
       });
     },
     edit: async (target, content) => {
-      const edited = await guardedAdapter.editMsg(
+      const edited = await adapter.editMsg(
         {
           platform: "github",
           channelId: target.channelId,
@@ -220,53 +213,6 @@ async function clearGithubIngressAcknowledgement(
   );
 }
 
-function invalidInitialTarget(input: {
-  readonly reason: SurfaceReplyTargetInvalid["reason"];
-  readonly sessionId: string;
-  readonly message: string;
-}) {
-  return {
-    kind: "invalid" as const,
-    error: new ReplyTargetInvalid({
-      reason: input.reason,
-      expectedPlatform: "github",
-      expectedSessionId: input.sessionId,
-      message: input.message,
-    }),
-  };
-}
-
-function decodeGithubRef(input: {
-  readonly ref: SurfaceMsgRef;
-  readonly expectedSessionId: string;
-}) {
-  if (input.ref.platform !== "github") {
-    return Result.err(
-      new RefInvalid({
-        reason: "platform-mismatch",
-        expectedPlatform: "github",
-        expectedSessionId: input.expectedSessionId,
-        message: `Expected a GitHub reply target, received '${input.ref.platform}'`,
-      }),
-    );
-  }
-  if (input.ref.channelId !== input.expectedSessionId) {
-    return Result.err(
-      new RefInvalid({
-        reason: "session-mismatch",
-        expectedPlatform: "github",
-        expectedSessionId: input.expectedSessionId,
-        message: `GitHub reply target belongs to session '${input.ref.channelId}'`,
-      }),
-    );
-  }
-  return Result.ok({
-    platform: "github" as const,
-    channelId: input.ref.channelId,
-    messageId: input.ref.messageId,
-  });
-}
-
 export function createGithubRelayPolicy(
   input: {
     readonly acknowledgementApi?: GithubAcknowledgementApi;
@@ -275,43 +221,14 @@ export function createGithubRelayPolicy(
   const acknowledgementApi = input.acknowledgementApi ?? DEFAULT_GITHUB_ACKNOWLEDGEMENT_API;
   return {
     refs: {
-      createSessionRef: (sessionId) => ({ platform: "github", channelId: sessionId }),
-      resolveInitialReplyTarget: ({ requestId, sessionId }) => {
-        const parsed = parseGithubRequestId({ requestId });
-        if (parsed) {
-          if (parsed.sessionId !== sessionId) {
-            return invalidInitialTarget({
-              reason: "session-mismatch",
-              sessionId,
-              message: `GitHub request belongs to session '${parsed.sessionId}'`,
-            });
-          }
-          return {
-            kind: "target",
-            ref: {
-              platform: "github",
-              channelId: sessionId,
-              messageId: parsed.triggerId,
-            },
-          };
-        }
-        if (requestId.startsWith("github:")) {
-          return invalidInitialTarget({
-            reason: "malformed",
-            sessionId,
-            message: `Malformed GitHub request ID '${requestId}'`,
-          });
-        }
-        if (requestId.startsWith("discord:")) {
-          return invalidInitialTarget({
-            reason: "platform-mismatch",
-            sessionId,
-            message: `Discord request ID cannot target GitHub output`,
-          });
-        }
-        return { kind: "none" };
-      },
-      decodeReanchorTarget: decodeGithubRef,
+      createSessionRef: githubSurfaceProtocol.refs.createSessionRef,
+      resolveInitialReplyTarget: ({ requestId, sessionId }) =>
+        resolveBuiltinSurfaceRequestMessageRef({
+          protocol: githubSurfaceProtocol,
+          requestId,
+          sessionRef: githubSurfaceProtocol.refs.createSessionRef(sessionId),
+        }),
+      decodeReanchorTarget: githubSurfaceProtocol.refs.decodeMessageRef,
     },
     finalization: {
       isFinalResponseSuperseded: ({ requestId, sessionId }) => {
@@ -327,18 +244,14 @@ export function createGithubRelayPolicy(
 export function createGithubSurfaceRuntimeDescriptor(input: {
   readonly adapter: SurfaceAdapter;
   readonly requestIngress?: SurfaceRequestIngress;
-  readonly relay?: SurfaceRelayDescriptor<"github">;
+  readonly createRelay?: (guardedAdapter: SurfaceAdapter) => SurfaceRelayDescriptor<"github">;
 }): SurfaceRuntimeDescriptor<"github"> {
-  const adapter = createDescriptorBoundSurfaceAdapter("github", input.adapter);
   return {
-    platform: "github",
-    adapter,
+    protocol: githubSurfaceProtocol,
+    adapter: input.adapter,
     ...(input.requestIngress ? { requestIngress: input.requestIngress } : {}),
-    ...(input.relay ? { relay: input.relay } : {}),
-    workflowProgress: createDescriptorBoundWorkflowProgressPort(
-      "github",
-      createGithubWorkflowProgressPort(adapter),
-    ),
+    ...(input.createRelay ? { createRelay: input.createRelay } : {}),
+    createWorkflowProgress: createGithubWorkflowProgressPort,
   };
 }
 
@@ -352,7 +265,7 @@ export function createConfiguredGithubSurfaceRuntimeDescriptor(input: {
   readonly webhookSecret: string | undefined;
   readonly appCredentialsAvailable: boolean;
   readonly requestIngress: SurfaceRequestIngress;
-  readonly relay: SurfaceRelayDescriptor<"github">;
+  readonly createRelay: (guardedAdapter: SurfaceAdapter) => SurfaceRelayDescriptor<"github">;
   readonly logger: GithubSurfaceRuntimeCompositionLogger;
 }): SurfaceRuntimeDescriptor<"github"> {
   const requestIngressAvailable = Boolean(input.webhookSecret) && input.appCredentialsAvailable;
@@ -371,6 +284,6 @@ export function createConfiguredGithubSurfaceRuntimeDescriptor(input: {
   return createGithubSurfaceRuntimeDescriptor({
     adapter: input.adapter,
     ...(requestIngressAvailable ? { requestIngress: input.requestIngress } : {}),
-    ...(input.appCredentialsAvailable ? { relay: input.relay } : {}),
+    ...(input.appCredentialsAvailable ? { createRelay: input.createRelay } : {}),
   });
 }

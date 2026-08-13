@@ -52,7 +52,8 @@ import {
   type ToolServerLagIncident,
 } from "./health-state";
 import type { RequestContext, ServerTool } from "./types";
-import type { AuthenticatedSurfaceOrigin } from "../surface/types";
+import type { AuthenticatedSurfaceOrigin, SurfacePrincipal } from "../surface/types";
+import { resolveAuthenticatedRequestSafetyMode } from "../surface/builtin-surface-protocols";
 import type { AuthenticatedRequestOrigin } from "./request-message-cache";
 import { ToolInputValidationError } from "./validation-error-message";
 
@@ -398,7 +399,7 @@ export type ToolServerOptions = {
     now: number;
   }) => {
     kind: "primary" | "heartbeat";
-    principal: { platform: "discord" | "github"; userId: string } | null;
+    principal: SurfacePrincipal | null;
     authenticatedOrigin: AuthenticatedSurfaceOrigin | null;
     allowedCallables: readonly string[] | null;
     profile: "primary" | NativeSubagentProfile;
@@ -755,21 +756,35 @@ export function createToolServer(options: ToolServerOptions) {
     if (ctx.controlPolicy) return Result.ok(ctx.safetyMode ?? "restricted");
     if (ctx.safetyMode === "restricted") return Result.ok("restricted");
     if (!ctx.serverOwnedRequest) return Result.ok("restricted");
-    if (ctx.requestClient === "github") return Result.ok("trusted");
-    if (ctx.requestClient !== "discord") return Result.ok("restricted");
-    const serverSafetyModeProvider = options.resolveServerSafetyMode;
-    if (serverSafetyModeProvider) {
-      const resolved = await captureSafetyModeProvider(ctx, "server-provider", () =>
-        serverSafetyModeProvider(ctx),
-      );
-      if (resolved.status === "error") return resolved;
-      return Result.ok(resolved.value);
+    let assertedSafetyMode: SafetyMode = "restricted";
+    if (ctx.requestClient === "discord") {
+      const serverSafetyModeProvider = options.resolveServerSafetyMode;
+      if (serverSafetyModeProvider) {
+        const resolved = await captureSafetyModeProvider(ctx, "server-provider", () =>
+          serverSafetyModeProvider(ctx),
+        );
+        if (resolved.status === "error") return resolved;
+        assertedSafetyMode = resolved.value;
+      } else {
+        const sessionId = ctx.sessionId;
+        if (!sessionId || !options.getConfig) return Result.ok("restricted");
+        const loaded = await captureSafetyModeProvider(ctx, "config", options.getConfig);
+        if (loaded.status === "error") return loaded;
+        assertedSafetyMode =
+          loaded.value.surface.router.sessionModes[sessionId]?.safetyMode ?? "trusted";
+      }
     }
-    const sessionId = ctx.sessionId;
-    if (!sessionId || !options.getConfig) return Result.ok("restricted");
-    const loaded = await captureSafetyModeProvider(ctx, "config", options.getConfig);
-    if (loaded.status === "error") return loaded;
-    return Result.ok(loaded.value.surface.router.sessionModes[sessionId]?.safetyMode ?? "trusted");
+    return Result.ok(
+      resolveAuthenticatedRequestSafetyMode({
+        projection: {
+          requestClient: ctx.requestClient ?? "unknown",
+          source: "external",
+          verifiedIngress: ctx.serverOwnedRequest,
+        },
+        assertedSafetyMode,
+        correlatedAuthority: true,
+      }),
+    );
   }
 
   function resolveSafetyModeFailClosed(

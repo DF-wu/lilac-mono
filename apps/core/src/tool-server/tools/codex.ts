@@ -5,11 +5,7 @@ import {
   startCodexOAuthLogin,
   type CodexOAuthLogin,
 } from "@stanley2058/lilac-utils";
-import {
-  defineServerTool,
-  type ServerTool,
-  type ServerToolCallOptions,
-} from "@stanley2058/lilac-plugin-runtime";
+import { defineServerTool, type ServerTool, type ServerToolCallOptions } from "../types";
 import { z } from "zod";
 import { Result, TaggedError, type Result as ResultType } from "better-result";
 

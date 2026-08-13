@@ -640,11 +640,6 @@ export const PRECISE_EXCEPTION_IDENTITIES: Readonly<
       "capture",
     ],
     ["src/tool-server/tools/programmatic-workflow.ts", "adaptWorkflowToolResultToHost", "signal"],
-    [
-      "src/tool-server/tools/resolve-discord-session-id.ts",
-      "adaptDiscordSessionResolutionResultToToolHost",
-      "signal",
-    ],
     ["src/tool-server/tools/skills.ts", "adaptSkillsResultToToolHost", "signal"],
     ["src/tool-server/tools/surface.ts", "adaptSurfaceResultToToolHost", "signal"],
     ["src/tool-server/tools/surface.ts", "Surface.callActivitiesRecentAgentWrites", "capture"],

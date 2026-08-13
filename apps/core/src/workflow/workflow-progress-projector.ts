@@ -5,6 +5,7 @@ import {
   type EventDeliveryStopFailed,
   lilacEventTypes,
   type LilacBus,
+  type SurfaceMsgRef,
 } from "@stanley2058/lilac-event-bus";
 import { Result, TaggedError, type Panic, type Result as ResultType } from "better-result";
 import { createLogger, formatTaggedErrorForLog, isPanic } from "@stanley2058/lilac-utils";
@@ -12,7 +13,7 @@ import { createLogger, formatTaggedErrorForLog, isPanic } from "@stanley2058/lil
 import type { ContentOpts, MsgRef } from "../surface/types";
 import type {
   RegisteredSurfacePlatform,
-  RegisteredSurfaceWorkflowProgressPort,
+  RegisteredSurfaceWorkflowProgressRegistration,
   WorkflowProgressOperationFailed,
 } from "../surface/runtime-descriptor";
 import { adaptToolResultToHost } from "../tools/tool-result-adapters";
@@ -95,11 +96,6 @@ type WorkflowProgressProjectionError =
 
 type WorkflowProgressProjectionResult<T> = ResultType<T, WorkflowProgressProjectionError>;
 
-type WorkflowProgressPortRegistration = {
-  readonly platform: RegisteredSurfacePlatform;
-  readonly port: RegisteredSurfaceWorkflowProgressPort;
-};
-
 function workflowProgressProjectionFailure(message: string): WorkflowProgressProjectionFailed {
   return new WorkflowProgressProjectionFailed({ message });
 }
@@ -118,18 +114,18 @@ function workflowProgressSurfaceCallFailure(
 }
 
 function findWorkflowProgressPort(
-  ports: ReadonlyMap<RegisteredSurfacePlatform, RegisteredSurfaceWorkflowProgressPort>,
+  ports: ReadonlyMap<RegisteredSurfacePlatform, RegisteredSurfaceWorkflowProgressRegistration>,
   platform: string,
-): WorkflowProgressPortRegistration | undefined {
-  for (const [registeredPlatform, port] of ports) {
-    if (registeredPlatform === platform) return { platform: registeredPlatform, port };
+): RegisteredSurfaceWorkflowProgressRegistration | undefined {
+  for (const [registeredPlatform, registration] of ports) {
+    if (registeredPlatform === platform) return registration;
   }
   return undefined;
 }
 
 function workflowProgressConfigurationRevision(
   target: WorkflowProgressTarget,
-  registration: WorkflowProgressPortRegistration | undefined,
+  registration: RegisteredSurfaceWorkflowProgressRegistration | undefined,
 ): string {
   return registration ? registration.port.configurationRevision : `missing-port:${target.platform}`;
 }
@@ -170,44 +166,24 @@ function adaptWorkflowProgressSubscriptionStopResultToHost(
 const WORKFLOW_CARD_TEXT_LIMIT = 4_000;
 
 function correlateWorkflowProgressMessageRef(input: {
-  readonly runTargetPlatform: RegisteredSurfacePlatform;
+  readonly registration: RegisteredSurfaceWorkflowProgressRegistration;
   readonly runTargetChannelId: string;
   readonly bindingTarget: WorkflowProgressTarget;
-  readonly messageRef: {
-    readonly platform: string;
-    readonly channelId: string;
-    readonly messageId: string;
-  };
+  readonly messageRef: SurfaceMsgRef;
 }): { readonly kind: "correlated"; readonly ref: MsgRef } | { readonly kind: "mismatch" } {
   if (
-    input.bindingTarget.platform !== input.runTargetPlatform ||
-    input.bindingTarget.channelId !== input.runTargetChannelId ||
-    input.messageRef.channelId !== input.runTargetChannelId
+    input.bindingTarget.platform !== input.registration.platform ||
+    input.bindingTarget.channelId !== input.runTargetChannelId
   ) {
     return { kind: "mismatch" };
   }
-  switch (input.runTargetPlatform) {
-    case "discord":
-      if (input.messageRef.platform !== "discord") return { kind: "mismatch" };
-      return {
-        kind: "correlated",
-        ref: {
-          platform: "discord",
-          channelId: input.messageRef.channelId,
-          messageId: input.messageRef.messageId,
-        },
-      };
-    case "github":
-      if (input.messageRef.platform !== "github") return { kind: "mismatch" };
-      return {
-        kind: "correlated",
-        ref: {
-          platform: "github",
-          channelId: input.messageRef.channelId,
-          messageId: input.messageRef.messageId,
-        },
-      };
-  }
+  const decoded = input.registration.protocol.refs.decodeMessageRef({
+    ref: input.messageRef,
+    expectedSessionId: input.runTargetChannelId,
+  });
+  return decoded.status === "ok"
+    ? { kind: "correlated", ref: decoded.value }
+    : { kind: "mismatch" };
 }
 
 function limitContentText(content: ContentOpts): ContentOpts {
@@ -263,7 +239,7 @@ export class WorkflowProgressProjector implements WorkflowProgressCardService {
     private readonly input: {
       bus: LilacBus;
       store: DurableWorkflowStore;
-      ports: ReadonlyMap<RegisteredSurfacePlatform, RegisteredSurfaceWorkflowProgressPort>;
+      ports: ReadonlyMap<RegisteredSurfacePlatform, RegisteredSurfaceWorkflowProgressRegistration>;
       subscriptionId: string;
       now?: () => number;
       coalesceMs?: number;
@@ -824,7 +800,7 @@ export class WorkflowProgressProjector implements WorkflowProgressCardService {
     }
     if (existing?.messageRef && registration) {
       const correlated = correlateWorkflowProgressMessageRef({
-        runTargetPlatform: registration.platform,
+        registration,
         runTargetChannelId: target.channelId,
         bindingTarget: existing.target,
         messageRef: existing.messageRef,

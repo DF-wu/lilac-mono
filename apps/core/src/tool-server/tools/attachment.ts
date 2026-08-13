@@ -5,14 +5,14 @@ import fs from "node:fs/promises";
 import { basename, extname, join, resolve } from "node:path";
 import type { ModelMessage } from "ai";
 import { lilacEventTypes, type LilacBus } from "@stanley2058/lilac-event-bus";
-import {
-  defineServerTool,
-  type ServerTool,
-  type ServerToolCallOptions,
-} from "@stanley2058/lilac-plugin-runtime";
 import { Result, TaggedError, type Result as ResultType } from "better-result";
 
-import type { RequestContext } from "../types";
+import {
+  defineServerTool,
+  type RequestContext,
+  type ServerTool,
+  type ServerToolCallOptions,
+} from "../types";
 import {
   requireToolServerHeaders,
   type RequiredToolServerHeaders,

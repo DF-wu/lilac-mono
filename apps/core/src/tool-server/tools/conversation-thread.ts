@@ -1,10 +1,6 @@
 import { z } from "zod";
 import type { Result as ResultType } from "better-result";
-import {
-  defineServerTool,
-  type ServerTool,
-  type ServerToolCallOptions,
-} from "@stanley2058/lilac-plugin-runtime";
+import { defineServerTool, type ServerTool, type ServerToolCallOptions } from "../types";
 
 import type {
   ConversationThreadRunSummarizationResult,

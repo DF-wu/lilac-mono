@@ -18,6 +18,7 @@ import { catalogToolStableId } from "../../src/mcp/catalog-identity";
 import type { ConversationThreadToolService } from "../../src/conversation/thread-service";
 import type { DiscoveryService } from "../../src/discovery/discovery-service";
 import type { SurfaceAdapter } from "../../src/surface/adapter";
+import { BUILTIN_SURFACE_PROTOCOLS } from "../../src/surface/builtin-surface-protocols";
 import { SurfaceRuntimeRegistry } from "../../src/surface/runtime-descriptor";
 import {
   configSnapshot,
@@ -43,8 +44,8 @@ function createCoreToolPluginManager(
 }
 
 const TEST_SURFACE_REGISTRY = SurfaceRuntimeRegistry.create([
-  { platform: "discord", adapter: {} as SurfaceAdapter },
-  { platform: "github", adapter: {} as SurfaceAdapter },
+  { protocol: BUILTIN_SURFACE_PROTOCOLS.discord, adapter: {} as SurfaceAdapter },
+  { protocol: BUILTIN_SURFACE_PROTOCOLS.github, adapter: {} as SurfaceAdapter },
 ]);
 if (TEST_SURFACE_REGISTRY.status === "error") throw TEST_SURFACE_REGISTRY.error;
 const TEST_SURFACE_ADAPTER_RESOLVER = TEST_SURFACE_REGISTRY.value.adapterResolver();

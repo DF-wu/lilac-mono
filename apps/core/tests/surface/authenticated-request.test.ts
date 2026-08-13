@@ -7,13 +7,14 @@ import {
   projectAuthenticatedRequest,
   type AuthenticatedRequestProjection,
 } from "../../src/surface/authenticated-request";
+import { BUILTIN_SURFACE_PROTOCOLS } from "../../src/surface/builtin-surface-protocols";
 
 type RequestMessage = Extract<LilacMessageForTopic<"cmd.request">, { type: "cmd.request.message" }>;
 
 function requestMessage(input: {
   readonly requestId?: string;
   readonly sessionId?: string;
-  readonly requestClient?: "discord" | "github" | "unknown";
+  readonly requestClient?: "discord" | "github" | "slack" | "unknown";
   readonly raw?: unknown;
 }): RequestMessage {
   return {
@@ -84,6 +85,79 @@ describe("authenticated request projection", () => {
     ).toBe("error");
   });
 
+  it("does not derive identity or trust from understood catalog or descriptor membership", () => {
+    expect(
+      project(
+        requestMessage({
+          requestId: "discord:channel-1:message-1",
+          sessionId: "channel-1",
+          requestClient: "discord",
+        }),
+      ),
+    ).toEqual({
+      requestId: "discord:channel-1:message-1",
+      requestClient: "discord",
+      sessionId: "channel-1",
+      source: "external",
+      platform: "discord",
+      sessionRef: { platform: "discord", channelId: "channel-1" },
+      messageRef: { platform: "discord", channelId: "channel-1", messageId: "message-1" },
+      authenticationMetadataKind: "absent",
+      verifiedIngress: false,
+    });
+    expect(
+      project(
+        requestMessage({
+          requestId: "github:owner/repo#1:41",
+          sessionId: "owner/repo#1",
+          requestClient: "github",
+        }),
+      ),
+    ).toEqual({
+      requestId: "github:owner/repo#1:41",
+      requestClient: "github",
+      sessionId: "owner/repo#1",
+      source: "external",
+      platform: "github",
+      sessionRef: { platform: "github", channelId: "owner/repo#1" },
+      authenticationMetadataKind: "absent",
+      verifiedIngress: false,
+    });
+  });
+
+  it("keeps wire-valid unregistered platforms principal-less and rejects claimed identity", () => {
+    expect(
+      project(
+        requestMessage({
+          requestId: "slack-request",
+          sessionId: "slack-session",
+          requestClient: "slack",
+        }),
+      ),
+    ).toEqual({
+      requestId: "slack-request",
+      requestClient: "slack",
+      sessionId: "slack-session",
+      source: "external",
+      authenticationMetadataKind: "absent",
+      verifiedIngress: false,
+    });
+    const claimed = projectAuthenticatedRequest(
+      requestMessage({
+        requestId: "slack-request",
+        sessionId: "slack-session",
+        requestClient: "slack",
+        raw: { authenticatedActor: { platform: "discord", userId: "user-1" } },
+      }),
+    );
+    expect(claimed.status).toBe("error");
+    if (claimed.status === "error") {
+      expect(claimed.error.message).toBe(
+        "surface authentication metadata requires a registered request platform",
+      );
+    }
+  });
+
   it("rejects whitespace-only correlation IDs for unsupported clients", () => {
     expect(
       projectAuthenticatedRequest(
@@ -127,6 +201,41 @@ describe("authenticated request projection", () => {
     });
   });
 
+  it("accepts normalized claims for every catalog platform", () => {
+    for (const protocol of Object.values(BUILTIN_SURFACE_PROTOCOLS)) {
+      const projected = project(
+        requestMessage({
+          requestId: `request-${protocol.platform}`,
+          sessionId: `session-${protocol.platform}`,
+          requestClient: protocol.platform,
+          raw: {
+            authenticatedActor: { platform: protocol.platform, userId: "user-1" },
+          },
+        }),
+      );
+
+      expect(projected?.authenticatedActor).toEqual({
+        platform: protocol.platform,
+        userId: "user-1",
+      });
+    }
+  });
+
+  it("rejects unsupported normalized claim platform strings", () => {
+    for (const platform of ["slack", "future-surface"]) {
+      const projected = projectAuthenticatedRequest(
+        requestMessage({
+          requestId: "discord:channel-1:message-1",
+          sessionId: "channel-1",
+          requestClient: "discord",
+          raw: { authenticatedActor: { platform, userId: "user-1" } },
+        }),
+      );
+
+      expect(projected.status).toBe("error");
+    }
+  });
+
   it("distinguishes partial and complete GitHub trigger evidence", () => {
     const partial = project(
       requestMessage({
@@ -164,6 +273,42 @@ describe("authenticated request projection", () => {
         issueNumber: 1,
         messageId: "41",
       },
+      verifiedIngress: true,
+    });
+  });
+
+  it("retains correlated GitHub normalized identity with complete trigger proof", () => {
+    expect(
+      project(
+        requestMessage({
+          requestId: "github:owner/repo#1:41",
+          sessionId: "owner/repo#1",
+          requestClient: "github",
+          raw: {
+            authenticatedActor: { platform: "github", userId: "user-1" },
+            authenticatedOrigin: {
+              platform: "github",
+              userId: "user-1",
+              messageRef: { platform: "github", channelId: "owner/repo#1", messageId: "41" },
+            },
+            github: {
+              repoFullName: "owner/repo",
+              prNumber: 1,
+              trigger: { kind: "comment", commentId: 41 },
+            },
+          },
+        }),
+      ),
+    ).toMatchObject({
+      authenticatedActor: { platform: "github", userId: "user-1" },
+      authenticatedOrigin: {
+        platform: "github",
+        userId: "user-1",
+        sessionRef: { platform: "github", channelId: "owner/repo#1" },
+        messageRef: { platform: "github", channelId: "owner/repo#1", messageId: "41" },
+      },
+      authenticationMetadataKind: "actor-origin-github-trigger",
+      githubTrigger: { targetKind: "pull-request", messageId: "41" },
       verifiedIngress: true,
     });
   });

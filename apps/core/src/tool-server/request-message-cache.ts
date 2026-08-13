@@ -10,6 +10,8 @@ import {
   projectAuthenticatedRequest,
   type AuthenticatedRequestProjection,
 } from "../surface/authenticated-request";
+import { getBuiltinSurfaceProtocol } from "../surface/builtin-surface-protocols";
+import type { AuthenticatedSurfaceOrigin } from "../surface/types";
 
 export {
   AuthenticatedRequestProjectionInvalid as RequestMessageCacheProjectionInvalid,
@@ -429,10 +431,8 @@ export function createRequestMessageCache(
           }),
         );
       }
-      const platform =
-        input.requestClient === "discord" || input.requestClient === "github"
-          ? input.requestClient
-          : undefined;
+      const protocol = getBuiltinSurfaceProtocol(input.requestClient);
+      const platform = protocol?.platform;
       let aliasActorUserId: string | undefined;
       const authenticatedActor = source.projection.authenticatedActor;
       const authenticatedOrigin = source.projection.authenticatedOrigin;
@@ -450,70 +450,45 @@ export function createRequestMessageCache(
         aliasActorUserId = authenticatedOrigin.userId;
       }
       let projection: AuthenticatedRequestProjection;
-      switch (platform) {
-        case "discord": {
-          const sessionRef = { platform, channelId: input.sessionId } as const;
-          projection = aliasActorUserId
-            ? {
-                requestId: input.aliasRequestId,
-                requestClient: platform,
-                sessionId: input.sessionId,
-                source: "external",
-                platform,
+      if (protocol) {
+        const registeredPlatform = protocol.platform;
+        const sessionRef = protocol.refs.createSessionRef(input.sessionId);
+        projection = aliasActorUserId
+          ? {
+              requestId: input.aliasRequestId,
+              requestClient: registeredPlatform,
+              sessionId: input.sessionId,
+              source: "external",
+              platform: registeredPlatform,
+              sessionRef,
+              authenticatedActor: { platform: registeredPlatform, userId: aliasActorUserId },
+              authenticatedOrigin: {
+                platform: registeredPlatform,
+                userId: aliasActorUserId,
                 sessionRef,
-                authenticatedActor: { platform, userId: aliasActorUserId },
-                authenticatedOrigin: { platform, userId: aliasActorUserId, sessionRef },
-                authenticationMetadataKind: "actor",
-                verifiedIngress: false,
-              }
-            : {
-                requestId: input.aliasRequestId,
-                requestClient: platform,
-                sessionId: input.sessionId,
-                source: "external",
-                platform,
-                sessionRef,
-                authenticationMetadataKind: "absent",
-                verifiedIngress: false,
-              };
-          break;
-        }
-        case "github": {
-          const sessionRef = { platform, channelId: input.sessionId } as const;
-          projection = aliasActorUserId
-            ? {
-                requestId: input.aliasRequestId,
-                requestClient: platform,
-                sessionId: input.sessionId,
-                source: "external",
-                platform,
-                sessionRef,
-                authenticatedActor: { platform, userId: aliasActorUserId },
-                authenticatedOrigin: { platform, userId: aliasActorUserId, sessionRef },
-                authenticationMetadataKind: "actor",
-                verifiedIngress: false,
-              }
-            : {
-                requestId: input.aliasRequestId,
-                requestClient: platform,
-                sessionId: input.sessionId,
-                source: "external",
-                platform,
-                sessionRef,
-                authenticationMetadataKind: "absent",
-                verifiedIngress: false,
-              };
-          break;
-        }
-        default:
-          projection = {
-            requestId: input.aliasRequestId,
-            requestClient: input.requestClient,
-            sessionId: input.sessionId,
-            source: "external",
-            authenticationMetadataKind: "absent",
-            verifiedIngress: false,
-          };
+              } as AuthenticatedSurfaceOrigin,
+              authenticationMetadataKind: "actor",
+              verifiedIngress: false,
+            }
+          : {
+              requestId: input.aliasRequestId,
+              requestClient: registeredPlatform,
+              sessionId: input.sessionId,
+              source: "external",
+              platform: registeredPlatform,
+              sessionRef,
+              authenticationMetadataKind: "absent",
+              verifiedIngress: false,
+            };
+      } else {
+        projection = {
+          requestId: input.aliasRequestId,
+          requestClient: input.requestClient,
+          sessionId: input.sessionId,
+          source: "external",
+          authenticationMetadataKind: "absent",
+          verifiedIngress: false,
+        };
       }
       if (!isAuthenticatedRequestProjectionSemanticallyValid(projection)) {
         return Result.err(
