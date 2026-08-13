@@ -503,6 +503,69 @@ describe("Core primary Claude continuation", () => {
     store.close();
   });
 
+  it.each([
+    ["before the first result", 2],
+    ["between parallel results", 3],
+  ] as const)("keeps a completed tool exchange structural when replay ends %s", async (_, end) => {
+    const store = await createStore();
+    const messages = [
+      { role: "user", content: "run checks" },
+      {
+        role: "assistant",
+        content: [
+          {
+            type: "tool-call",
+            toolCallId: "lint-call",
+            toolName: "bash",
+            input: { command: "bun run lint" },
+          },
+          {
+            type: "tool-call",
+            toolCallId: "test-call",
+            toolName: "bash",
+            input: { command: "bun test" },
+          },
+        ],
+      },
+      {
+        role: "tool",
+        content: [
+          {
+            type: "tool-result",
+            toolCallId: "lint-call",
+            toolName: "bash",
+            output: { type: "text", value: "lint passed" },
+          },
+        ],
+      },
+      {
+        role: "tool",
+        content: [
+          {
+            type: "tool-result",
+            toolCallId: "test-call",
+            toolName: "bash",
+            output: { type: "text", value: "tests passed" },
+          },
+        ],
+      },
+      { role: "user", content: "focus on the failures" },
+    ] satisfies ModelMessage[];
+    const lineage = createCorePrimaryLineageFreshOnlyV1("steering-transform", end);
+
+    const prepared = prepareCorePrimaryHistoryView({
+      canonicalMessages: messages,
+      lineage,
+      replayHistoricalPrefix: true,
+      targetFamily: "ai-sdk",
+      modelSpecifier: "codex/gpt-5.6-sol",
+    });
+
+    expect(prepared.slice(1)).toEqual(messages.slice(1));
+    expect(typeof prepared[0]?.content).toBe("string");
+    store.close();
+  });
+
   it("promotes mixed fresh history without output IDs, then exact-forks only after reachability", async () => {
     const store = await createStore();
     const starts: ClaudeNativeSessionStart[] = [];

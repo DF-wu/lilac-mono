@@ -295,6 +295,7 @@ function level1TestTool(execute: () => unknown) {
 }
 
 function level1TestToolset(params?: {
+  builtinExecute?: () => unknown;
   catalogExecute?: () => unknown;
   searchExecute?: () => unknown;
   onCatalogCreate?: () => void;
@@ -303,7 +304,7 @@ function level1TestToolset(params?: {
   params?.onCatalogCreate?.();
   const catalogTool = level1TestTool(params?.catalogExecute ?? (() => "catalog"));
   const tools = {
-    builtin: level1TestTool(() => "builtin"),
+    builtin: level1TestTool(params?.builtinExecute ?? (() => "builtin")),
     tool_search: level1TestTool(params?.searchExecute ?? (() => "search")),
     deferred_tool: catalogTool,
   } satisfies ToolSet;
@@ -3819,6 +3820,107 @@ describe("startBusAgentRunner production path", () => {
       }
     } finally {
       releaseFirst.resolve(undefined);
+      await runner.stop();
+      await requestMessageCache.stop();
+      await pluginManager.destroy();
+      await bus.close();
+    }
+  });
+
+  it("keeps the tool call paired with its result when steering during tool execution", async () => {
+    const config = parseCoreConfigV1ToUniversal({});
+    config.models.main = { model: "openai/steer-during-tool" };
+    const bus = createLilacBus(createInMemoryRawBus());
+    const requestMessageCache = createRequestMessageCache();
+    const toolEntered = deferred<void>();
+    const releaseTool = deferred<void>();
+    const pluginManager = corePrimaryTestPluginManager(
+      undefined,
+      level1TestToolset({
+        builtinExecute: async () => {
+          toolEntered.resolve(undefined);
+          await releaseTool.promise;
+          return "tool complete";
+        },
+      }),
+    );
+    const modelPrompts: ModelMessage[][] = [];
+    let modelCalls = 0;
+    const runner = await startBusAgentRunner({
+      bus,
+      subscriptionId: "steer-during-tool",
+      reportFatalPanic: () => undefined,
+      config,
+      pluginManager,
+      requestMessageCache,
+      issueControlCapability: () => ({ capability: "steer-capability", principal: null }),
+      createAgent: (options) =>
+        new AiSdkPiAgent({
+          ...options,
+          model: new MockLanguageModelV4({
+            modelId: "steer-during-tool",
+            doStream: async (call) => {
+              modelPrompts.push([...call.prompt]);
+              modelCalls += 1;
+              return modelCalls === 1
+                ? level1ToolCallStep([{ toolCallId: "active-tool", toolName: "builtin" }])
+                : level1TextStep("steered response");
+            },
+          }),
+        }),
+    });
+    const sessionId = "steer-during-tool";
+    const requestId = `discord:${sessionId}:input`;
+    const lifecycle = await observeRequestLifecycle(bus, requestId);
+    try {
+      await publishRunnerRequest({
+        bus,
+        requestId,
+        sessionId,
+        requestClient: "discord",
+        text: "run the tool",
+      });
+      await toolEntered.promise;
+
+      await publishRunnerRequest({
+        bus,
+        requestId,
+        sessionId,
+        requestClient: "discord",
+        queue: "steer",
+        text: "use the result carefully",
+      });
+      releaseTool.resolve(undefined);
+
+      await expect(lifecycle.terminal).resolves.toBe("resolved");
+      expect(modelPrompts).toHaveLength(2);
+      const secondPrompt = modelPrompts[1] ?? [];
+      const toolCallIndex = secondPrompt.findIndex(
+        (message) =>
+          message.role === "assistant" &&
+          Array.isArray(message.content) &&
+          message.content.some(
+            (part) => part.type === "tool-call" && part.toolCallId === "active-tool",
+          ),
+      );
+      const toolResultIndex = secondPrompt.findIndex(
+        (message) =>
+          message.role === "tool" &&
+          message.content.some(
+            (part) => part.type === "tool-result" && part.toolCallId === "active-tool",
+          ),
+      );
+      const steeringIndex = secondPrompt.findIndex(
+        (message) =>
+          message.role === "user" &&
+          JSON.stringify(message.content).includes("use the result carefully"),
+      );
+      expect(toolCallIndex).toBeGreaterThanOrEqual(0);
+      expect(toolResultIndex).toBeGreaterThan(toolCallIndex);
+      expect(steeringIndex).toBeGreaterThan(toolResultIndex);
+    } finally {
+      releaseTool.resolve(undefined);
+      await lifecycle.stop();
       await runner.stop();
       await requestMessageCache.stop();
       await pluginManager.destroy();

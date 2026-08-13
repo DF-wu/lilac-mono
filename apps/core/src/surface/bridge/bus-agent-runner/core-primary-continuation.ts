@@ -202,13 +202,14 @@ export function prepareCorePrimaryHistoryView(input: {
       (input.lineage?.currentCanonicalStart ?? 0) - (input.canonicalStartIndex ?? 0),
     ),
   );
-  const trailingToolExchangeStart =
-    requestedHistoricalEnd === input.canonicalMessages.length
-      ? completedTrailingToolExchangeStart(input.canonicalMessages, requestedHistoricalEnd)
+  const structuralToolExchangeStart =
+    requestedHistoricalEnd === input.canonicalMessages.length ||
+    input.canonicalMessages[requestedHistoricalEnd]?.role === "tool"
+      ? completedToolExchangeStart(input.canonicalMessages, requestedHistoricalEnd)
       : null;
   // A continuation-triggering tool result must remain structural even if a stale
   // lineage boundary classifies the whole transcript as portable history.
-  const historicalEnd = trailingToolExchangeStart ?? requestedHistoricalEnd;
+  const historicalEnd = structuralToolExchangeStart ?? requestedHistoricalEnd;
   return [
     ...preparePlainTextReplayForTarget(input.canonicalMessages.slice(0, historicalEnd), {
       providerFamily: input.targetFamily,
@@ -220,15 +221,18 @@ export function prepareCorePrimaryHistoryView(input: {
   ];
 }
 
-function completedTrailingToolExchangeStart(
-  messages: readonly ModelMessage[],
-  end: number,
-): number | null {
-  if (end <= 0 || messages[end - 1]?.role !== "tool") return null;
+function completedToolExchangeStart(messages: readonly ModelMessage[], end: number): number | null {
+  if (end <= 0) return null;
 
-  let firstToolIndex = end - 1;
+  let firstToolIndex = messages[end]?.role === "tool" ? end : end - 1;
+  if (messages[firstToolIndex]?.role !== "tool") return null;
   while (firstToolIndex > 0 && messages[firstToolIndex - 1]?.role === "tool") {
     firstToolIndex -= 1;
+  }
+
+  let toolEnd = firstToolIndex;
+  while (toolEnd < messages.length && messages[toolEnd]?.role === "tool") {
+    toolEnd += 1;
   }
 
   const assistantIndex = firstToolIndex - 1;
@@ -246,7 +250,7 @@ function completedTrailingToolExchangeStart(
   }
   if (unresolved.size === 0) return null;
 
-  for (let index = firstToolIndex; index < end; index += 1) {
+  for (let index = firstToolIndex; index < toolEnd; index += 1) {
     const message = messages[index];
     if (message?.role !== "tool") return null;
     for (const part of message.content) {
