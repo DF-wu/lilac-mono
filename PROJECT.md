@@ -155,7 +155,8 @@ it neither enables a platform nor admits trust.
 
 Executable runtime membership is separate. `SurfaceRuntimeRegistry` in
 `apps/core/src/surface/runtime-descriptor.ts` binds a platform-parameterized descriptor to its catalog
-protocol and coarse adapter-ingress, request-ingress, relay, and workflow-progress participation. The
+protocol and coarse adapter-ingress, request-ingress, relay, workflow-progress, and optional health
+participation. The
 registry resolves only exact registered descriptors, never infers executability from the broader
 event-bus wire enum. It owns descriptor-bound adapter guarding: it creates one guarded adapter, passes
 that exact facade to narrow relay and workflow-progress factories, and guards the resulting
@@ -174,7 +175,11 @@ Registry iteration in `apps/core/src/runtime/surface-runtime-lifecycle.ts` drive
 rollback ownership, ingress shutdown, relay drain, snapshot collection, restore dispatch, and
 reverse-order cleanup without protocol branches. Workflow progress is gated by exact target/binding/ref
 correlation and persisted permanent-versus-retryable policy; actions remain protocol-rendered while
-their durable authorization and state transitions remain shared and atomic.
+their durable authorization and state transitions remain shared and atomic. Agent execution authority
+and workflow action interpretation resolve executable participation through the registry, while recovery
+recognizes the closed built-in protocol catalog before requiring the corresponding registered descriptor
+and live relay. Transcript compatibility readers continue to decode broad persisted platform values, then
+project executable built-in refs through the static protocol catalog rather than local platform lists.
 
 `RegisteredSurfacePlatform` is derived from the closed `SessionRef` union and currently contains only
 `discord` and `github`. It is intentionally narrower than the event-bus `AdapterPlatform` wire enum,
@@ -197,8 +202,9 @@ paused apply stays rollbackable, and the exact row is compare-and-deleted only b
 activation. Explicit wire and persisted compatibility readers remain broader than the installed registry;
 they are unchanged and do not derive accepted values or versions from the catalog or registry.
 
-The registry is internal runtime composition, not a dynamic plugin API. Discord health, request routing,
-aliases, allowlists, local storage, search indexing/healing, and search sidecars remain Discord-owned.
+The registry is internal runtime composition, not a dynamic plugin API. Discord health policy is exposed
+through its optional descriptor health port; request routing, aliases, allowlists, local storage, search
+indexing/healing, and search sidecars remain Discord-owned.
 GitHub webhook verification, authentication, trigger parsing, rendering, pagination, and acknowledgement
 state remain GitHub-owned. Shared discovery is a query-facing application service rather than a descriptor
 search port, and workflow reply waits remain Discord-only. Adding another platform requires a separate
