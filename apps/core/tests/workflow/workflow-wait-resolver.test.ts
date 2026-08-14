@@ -59,9 +59,10 @@ class IdleRawBus implements RawBus {
   ) {
     const subscription = { topic, handler };
     this.subscriptions.push(subscription);
-    if (options.offset?.type === "begin" || options.offset?.type === "cursor") {
+    const offset = options.mode === "tail" ? options.offset : undefined;
+    if (offset?.type === "begin" || offset?.type === "cursor") {
       const topicHistory = this.history.filter((message) => message.topic === topic);
-      const requestedCursor = options.offset.type === "cursor" ? options.offset.cursor : null;
+      const requestedCursor = offset.type === "cursor" ? offset.cursor : null;
       const start =
         requestedCursor !== null
           ? topicHistory.findIndex((message) => message.id === requestedCursor) + 1

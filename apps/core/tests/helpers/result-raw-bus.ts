@@ -64,40 +64,85 @@ export const subscribeForTest: RawBus["subscribe"] = async function (
       async (message, cursor) => {
         if (!active) return;
         try {
-          const action = await handler(message, {
-            cursor,
-            mode: options.mode,
-            evidence: {
-              source: {
-                transport: "redis-streams",
-                streamKey: `test:${topic}`,
-                topic,
-                messageId: cursor,
-              },
-              wire: { kind: "bounded-complete", fields: [] },
+          const evidence = {
+            source: {
+              transport: "redis-streams" as const,
+              streamKey: `test:${topic}`,
+              topic,
+              messageId: cursor,
             },
-          });
-          testDeliveryActions.get(this)?.push(action.disposition);
-          await this.onTestDeliveryAction?.(action, cursor);
-          switch (action.disposition) {
-            case "commit":
-            case "dead-letter":
-              return;
-            case "park-pending":
-            case "stop":
-              if (testDeliveriesRemainOpenOnPolicyStop.has(this)) return;
-              active = false;
-              done.resolve(
-                Result.err(
-                  new EventDeliveryStopped({
-                    reason: action.disposition === "stop" ? "requested" : "tail-cannot-park",
-                    topic,
+            wire: { kind: "bounded-complete" as const, fields: [] },
+          };
+          for (const attempt of [1, 2, 3, 4, 5] as const) {
+            const action = await handler(
+              message,
+              options.mode === "tail"
+                ? { cursor, mode: "tail", evidence }
+                : {
                     cursor,
-                    message: "Test delivery stopped by policy",
-                  }),
-                ),
-              );
+                    mode: options.mode,
+                    evidence,
+                    deliveryId: "0000000000000000000000000000000000000000000000000000000000000000",
+                    attempt,
+                    leaseDeadline: Date.now() + 60_000,
+                    signal: new AbortController().signal,
+                  },
+            );
+            testDeliveryActions.get(this)?.push(action.disposition);
+            await this.onTestDeliveryAction?.(action, cursor);
+            switch (action.disposition) {
+              case "commit":
+              case "dead-letter":
+                return;
+              case "retry":
+                if (options.mode !== "tail" && attempt < 5) continue;
+                active = false;
+                if (options.mode === "tail") {
+                  done.resolve(
+                    Result.err(
+                      new EventDeliveryStopped({
+                        reason: "tail-cannot-park",
+                        topic,
+                        cursor,
+                        message:
+                          "Tail delivery stopped because retry is not supported in tail mode",
+                      }),
+                    ),
+                  );
+                } else {
+                  done.resolve(
+                    Result.err(
+                      new EventDeliveryTransportFailed({
+                        cause: new Error(
+                          "Test delivery retry exhausted without a dead-letter store",
+                        ),
+                        operation: "ack",
+                        topic,
+                        cursor,
+                        message: "Test delivery could not terminalize an exhausted retry",
+                      }),
+                    ),
+                  );
+                }
+                return;
+              case "park-pending":
+              case "stop":
+                if (testDeliveriesRemainOpenOnPolicyStop.has(this)) return;
+                active = false;
+                done.resolve(
+                  Result.err(
+                    new EventDeliveryStopped({
+                      reason: action.disposition === "stop" ? "requested" : "tail-cannot-park",
+                      topic,
+                      cursor,
+                      message: "Test delivery stopped by policy",
+                    }),
+                  ),
+                );
+                return;
+            }
           }
+          throw new Error("Test delivery retry attempts were not exhausted");
         } catch (cause) {
           done.reject(cause);
           throw cause;

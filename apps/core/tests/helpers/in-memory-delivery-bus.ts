@@ -1,6 +1,7 @@
 import {
   EventDeliveryStartFailed,
   EventDeliveryStopped,
+  EventDeliveryTransportFailed,
   type EventDeliveryContext,
   type EventDeliveryDoneError,
   type FetchOptions,
@@ -31,19 +32,32 @@ function createDeliveryContext(
   topic: string,
   cursor: string,
   mode: SubscriptionOptions["mode"],
+  attempt: 1 | 2 | 3 | 4 | 5,
 ): EventDeliveryContext {
+  const evidence = {
+    source: {
+      transport: "redis-streams" as const,
+      streamKey: topic,
+      topic,
+      messageId: cursor,
+    },
+    wire: { kind: "bounded-complete" as const, fields: [] },
+  };
+  if (mode === "tail") {
+    return {
+      cursor,
+      mode: "tail",
+      evidence,
+    };
+  }
   return {
     cursor,
     mode,
-    evidence: {
-      source: {
-        transport: "redis-streams",
-        streamKey: topic,
-        topic,
-        messageId: cursor,
-      },
-      wire: { kind: "bounded-complete", fields: [] },
-    },
+    evidence,
+    deliveryId: "0000000000000000000000000000000000000000000000000000000000000000",
+    attempt,
+    leaseDeadline: Date.now() + 60_000,
+    signal: new AbortController().signal,
   };
 }
 
@@ -65,31 +79,68 @@ export function createInMemoryDeliveryBus(
     subscription: InMemoryDeliverySubscription,
     message: Message<unknown>,
   ): Promise<RawDeliveryAction> => {
-    const context = createDeliveryContext(subscription.topic, message.id, subscription.opts.mode);
-    const action = await subscription.handler(message, context);
-    onDelivery?.({
-      topic: subscription.topic,
-      cursor: message.id,
-      disposition: action.disposition,
-      contextHasCommit: Object.hasOwn(context, "commit"),
-    });
-    if (
-      action.disposition === "stop" ||
-      (action.disposition === "park-pending" && subscription.opts.mode === "tail")
-    ) {
-      deliverySubs.delete(subscription);
-      subscription.done.resolve(
-        Result.err(
-          new EventDeliveryStopped({
-            reason: action.disposition === "stop" ? "requested" : "tail-cannot-park",
-            topic: subscription.topic,
-            cursor: message.id,
-            message: "In-memory delivery stopped",
-          }),
-        ),
+    for (const attempt of [1, 2, 3, 4, 5] as const) {
+      const context = createDeliveryContext(
+        subscription.topic,
+        message.id,
+        subscription.opts.mode,
+        attempt,
       );
+      const action = await subscription.handler(message, context);
+      onDelivery?.({
+        topic: subscription.topic,
+        cursor: message.id,
+        disposition: action.disposition,
+        contextHasCommit: Object.hasOwn(context, "commit"),
+      });
+      if (action.disposition === "retry") {
+        if (subscription.opts.mode !== "tail" && attempt < 5) continue;
+        deliverySubs.delete(subscription);
+        if (subscription.opts.mode === "tail") {
+          subscription.done.resolve(
+            Result.err(
+              new EventDeliveryStopped({
+                reason: "tail-cannot-park",
+                topic: subscription.topic,
+                cursor: message.id,
+                message: "Tail delivery stopped because retry is not supported in tail mode",
+              }),
+            ),
+          );
+        } else {
+          subscription.done.resolve(
+            Result.err(
+              new EventDeliveryTransportFailed({
+                cause: new Error("In-memory delivery retry exhausted without a dead-letter store"),
+                operation: "ack",
+                topic: subscription.topic,
+                cursor: message.id,
+                message: "In-memory delivery could not terminalize an exhausted retry",
+              }),
+            ),
+          );
+        }
+        return action;
+      }
+      if (
+        action.disposition === "stop" ||
+        (action.disposition === "park-pending" && subscription.opts.mode === "tail")
+      ) {
+        deliverySubs.delete(subscription);
+        subscription.done.resolve(
+          Result.err(
+            new EventDeliveryStopped({
+              reason: action.disposition === "stop" ? "requested" : "tail-cannot-park",
+              topic: subscription.topic,
+              cursor: message.id,
+              message: "In-memory delivery stopped",
+            }),
+          ),
+        );
+      }
+      return action;
     }
-    return action;
+    throw new Error("In-memory delivery retry attempts were not exhausted");
   };
 
   return {

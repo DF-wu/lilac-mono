@@ -985,7 +985,6 @@ export async function startDiscordRequestRouter(
         mode: "fanout",
         subscriptionId: `${subscriptionId}:lifecycle`,
         consumerId: consumerId(`${subscriptionId}:lifecycle`),
-        offset: { type: "now" },
         batch: { maxWaitMs: 1000 },
       },
       async (msg, ctx) => {
@@ -1089,7 +1088,6 @@ export async function startDiscordRequestRouter(
         mode: "fanout",
         subscriptionId: `${subscriptionId}:surface`,
         consumerId: consumerId(`${subscriptionId}:surface`),
-        offset: { type: "now" },
         batch: { maxWaitMs: 1000 },
       },
       async (msg, ctx) => {
@@ -1154,7 +1152,6 @@ export async function startDiscordRequestRouter(
         mode: "fanout",
         subscriptionId: `${subscriptionId}:adapter`,
         consumerId: consumerId(`${subscriptionId}:adapter`),
-        offset: { type: "now" },
         batch: { maxWaitMs: 1000 },
       },
       async (msg) => {

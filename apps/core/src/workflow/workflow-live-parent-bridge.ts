@@ -313,7 +313,6 @@ export class WorkflowLiveParentBridge {
         mode: "fanout",
         subscriptionId: this.input.subscriptionId,
         consumerId: workflowConsumerId(this.input.subscriptionId),
-        offset: { type: "now" },
         batch: { maxWaitMs: 250 },
       },
       async (message) => {

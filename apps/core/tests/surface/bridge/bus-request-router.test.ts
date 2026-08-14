@@ -10,6 +10,7 @@ import {
   EventDeliveryStopFailed,
   EventDeliveryTransportFailed,
   lilacEventTypes,
+  type EventDeliveryContext,
   type EventDeliveryDoneError,
   type DecodedLilacMessageForTopic,
   type FetchOptions,
@@ -208,10 +209,12 @@ function createInMemoryRawBus(): TestRawBus {
     done: PromiseWithResolvers<ResultType<void, EventDeliveryDoneError>>;
   }>();
 
-  const deliveryContext = (topic: string, id: string, opts: SubscriptionOptions) => ({
-    cursor: id,
-    mode: opts.mode,
-    evidence: {
+  const deliveryContext = (
+    topic: string,
+    id: string,
+    opts: SubscriptionOptions,
+  ): EventDeliveryContext => {
+    const evidence = {
       source: {
         transport: "redis-streams" as const,
         streamKey: topic,
@@ -219,8 +222,18 @@ function createInMemoryRawBus(): TestRawBus {
         messageId: id,
       },
       wire: { kind: "bounded-complete" as const, fields: [] },
-    },
-  });
+    };
+    if (opts.mode === "tail") return { cursor: id, mode: "tail", evidence };
+    return {
+      cursor: id,
+      mode: opts.mode,
+      evidence,
+      deliveryId: "0000000000000000000000000000000000000000000000000000000000000000",
+      attempt: 1,
+      leaseDeadline: Date.now() + 60_000,
+      signal: new AbortController().signal,
+    };
+  };
 
   return {
     deliveryActions,
@@ -318,7 +331,7 @@ function createInMemoryRawBus(): TestRawBus {
       const entry = { topic, opts, handler, done };
       deliverySubs.add(entry);
 
-      if (opts.offset?.type === "begin") {
+      if (opts.mode === "tail" && opts.offset?.type === "begin") {
         for (const message of topics.get(topic) ?? []) {
           await handler(message, deliveryContext(topic, message.id, opts));
         }
@@ -1420,7 +1433,6 @@ describe("startBusRequestRouter", () => {
         mode: "fanout",
         subscriptionId: "test",
         consumerId: "c1",
-        offset: { type: "begin" },
       },
       async (m) => {
         if (m.type === lilacEventTypes.CmdRequestMessage) {
@@ -1571,7 +1583,6 @@ describe("startBusRequestRouter", () => {
         mode: "fanout",
         subscriptionId: "test",
         consumerId: "c1",
-        offset: { type: "begin" },
       },
       async (m) => {
         if (m.type === lilacEventTypes.CmdRequestMessage) {
@@ -1676,7 +1687,6 @@ describe("startBusRequestRouter", () => {
         mode: "fanout",
         subscriptionId: "test",
         consumerId: "c1",
-        offset: { type: "begin" },
       },
       async (m) => {
         if (m.type === lilacEventTypes.CmdRequestMessage) {
@@ -1773,7 +1783,6 @@ describe("startBusRequestRouter", () => {
         mode: "fanout",
         subscriptionId: "test",
         consumerId: "c1",
-        offset: { type: "begin" },
       },
       async (m) => {
         if (m.type === lilacEventTypes.CmdRequestMessage) {
@@ -1929,7 +1938,6 @@ describe("startBusRequestRouter", () => {
         mode: "fanout",
         subscriptionId: "test",
         consumerId: "c1",
-        offset: { type: "begin" },
       },
       async (m) => {
         if (m.type === lilacEventTypes.CmdRequestMessage) {
@@ -2024,7 +2032,6 @@ describe("startBusRequestRouter", () => {
         mode: "fanout",
         subscriptionId: "test",
         consumerId: "c1",
-        offset: { type: "begin" },
       },
       async (m) => {
         if (m.type === lilacEventTypes.CmdRequestMessage) {
@@ -2123,7 +2130,6 @@ describe("startBusRequestRouter", () => {
         mode: "fanout",
         subscriptionId: "test",
         consumerId: "c1",
-        offset: { type: "begin" },
       },
       async (m) => {
         if (m.type === lilacEventTypes.CmdRequestMessage) {
@@ -2225,7 +2231,6 @@ describe("startBusRequestRouter", () => {
         mode: "fanout",
         subscriptionId: "test",
         consumerId: "c1",
-        offset: { type: "begin" },
       },
       async (m) => {
         if (m.type === lilacEventTypes.CmdRequestMessage) {
@@ -2325,7 +2330,6 @@ describe("startBusRequestRouter", () => {
         mode: "fanout",
         subscriptionId: "test",
         consumerId: "c1",
-        offset: { type: "begin" },
       },
       async (m) => {
         if (m.type === lilacEventTypes.CmdRequestMessage) {
@@ -2437,7 +2441,6 @@ describe("startBusRequestRouter", () => {
         mode: "fanout",
         subscriptionId: "test",
         consumerId: "c1",
-        offset: { type: "begin" },
       },
       async (m) => {
         if (m.type === lilacEventTypes.CmdRequestMessage) {
@@ -2543,7 +2546,6 @@ describe("startBusRequestRouter", () => {
         mode: "fanout",
         subscriptionId: "test",
         consumerId: "c1",
-        offset: { type: "begin" },
       },
       async (m) => {
         if (m.type === lilacEventTypes.CmdRequestMessage) {
@@ -2646,7 +2648,6 @@ describe("startBusRequestRouter", () => {
         mode: "fanout",
         subscriptionId: "test",
         consumerId: "c1",
-        offset: { type: "begin" },
       },
       async (m) => {
         if (m.type === lilacEventTypes.CmdRequestMessage) {
@@ -2745,7 +2746,6 @@ describe("startBusRequestRouter", () => {
         mode: "fanout",
         subscriptionId: "test",
         consumerId: "c1",
-        offset: { type: "begin" },
       },
       async (m) => {
         if (m.type === lilacEventTypes.CmdRequestMessage) {
@@ -2842,7 +2842,6 @@ describe("startBusRequestRouter", () => {
         mode: "fanout",
         subscriptionId: "test",
         consumerId: "c1",
-        offset: { type: "begin" },
       },
       async (m) => {
         if (m.type === lilacEventTypes.CmdRequestMessage) {
@@ -2958,7 +2957,6 @@ describe("startBusRequestRouter", () => {
         mode: "fanout",
         subscriptionId: "test",
         consumerId: "c1",
-        offset: { type: "begin" },
       },
       async (m) => {
         if (m.type === lilacEventTypes.CmdRequestMessage) {
@@ -3067,7 +3065,6 @@ describe("startBusRequestRouter", () => {
         mode: "fanout",
         subscriptionId: "test",
         consumerId: "c1",
-        offset: { type: "begin" },
       },
       async (m) => {
         if (m.type === lilacEventTypes.CmdRequestMessage) {
@@ -3174,7 +3171,6 @@ describe("startBusRequestRouter", () => {
         mode: "fanout",
         subscriptionId: "test",
         consumerId: "c1",
-        offset: { type: "begin" },
       },
       async (m) => {
         if (m.type === lilacEventTypes.CmdRequestMessage) {
@@ -3281,7 +3277,6 @@ describe("startBusRequestRouter", () => {
         mode: "fanout",
         subscriptionId: "test",
         consumerId: "c1",
-        offset: { type: "begin" },
       },
       async (m) => {
         if (m.type === lilacEventTypes.CmdRequestMessage) {
@@ -3382,7 +3377,6 @@ describe("startBusRequestRouter", () => {
         mode: "fanout",
         subscriptionId: "test",
         consumerId: "c1",
-        offset: { type: "begin" },
       },
       async (m) => {
         if (m.type === lilacEventTypes.CmdRequestMessage) {
@@ -3501,7 +3495,6 @@ describe("startBusRequestRouter", () => {
         mode: "fanout",
         subscriptionId: "test",
         consumerId: "c1",
-        offset: { type: "begin" },
       },
       async (m) => {
         if (m.type === lilacEventTypes.CmdRequestMessage) {
@@ -3663,7 +3656,6 @@ describe("startBusRequestRouter", () => {
         mode: "fanout",
         subscriptionId: "test",
         consumerId: "c1",
-        offset: { type: "begin" },
       },
       async (m) => {
         if (m.type === lilacEventTypes.CmdRequestMessage) {
@@ -3766,7 +3758,6 @@ describe("startBusRequestRouter", () => {
         mode: "fanout",
         subscriptionId: "test",
         consumerId: "c1",
-        offset: { type: "begin" },
       },
       async (m) => {
         if (m.type === lilacEventTypes.CmdRequestMessage) {
@@ -3879,7 +3870,6 @@ describe("startBusRequestRouter", () => {
         mode: "fanout",
         subscriptionId: "test",
         consumerId: "c1",
-        offset: { type: "begin" },
       },
       async (m) => {
         if (m.type === lilacEventTypes.CmdRequestMessage) {
@@ -4007,7 +3997,6 @@ describe("startBusRequestRouter", () => {
         mode: "fanout",
         subscriptionId: "test",
         consumerId: "c1",
-        offset: { type: "begin" },
       },
       async (m) => {
         if (m.type === lilacEventTypes.CmdRequestMessage) {
@@ -4024,7 +4013,6 @@ describe("startBusRequestRouter", () => {
         mode: "fanout",
         subscriptionId: "test-surface",
         consumerId: "c2",
-        offset: { type: "begin" },
       },
       async (m) => {
         if (m.type === lilacEventTypes.CmdSurfaceOutputReanchor) {
@@ -4177,7 +4165,6 @@ describe("startBusRequestRouter", () => {
         mode: "fanout",
         subscriptionId: "test",
         consumerId: "c1",
-        offset: { type: "begin" },
       },
       async (m) => {
         if (m.type === lilacEventTypes.CmdRequestMessage) {
@@ -4194,7 +4181,6 @@ describe("startBusRequestRouter", () => {
         mode: "fanout",
         subscriptionId: "test-surface",
         consumerId: "c2",
-        offset: { type: "begin" },
       },
       async (m) => {
         if (m.type === lilacEventTypes.CmdSurfaceOutputReanchor) {
@@ -4347,7 +4333,6 @@ describe("startBusRequestRouter", () => {
         mode: "fanout",
         subscriptionId: "test",
         consumerId: "c1",
-        offset: { type: "begin" },
       },
       async (m) => {
         if (m.type === lilacEventTypes.CmdRequestMessage) {
@@ -4364,7 +4349,6 @@ describe("startBusRequestRouter", () => {
         mode: "fanout",
         subscriptionId: "test-surface",
         consumerId: "c2",
-        offset: { type: "begin" },
       },
       async (m) => {
         if (m.type === lilacEventTypes.CmdSurfaceOutputReanchor) {
@@ -4536,7 +4520,6 @@ describe("startBusRequestRouter", () => {
           mode: "fanout",
           subscriptionId: `terminal-race-requests-${testCase.terminalTiming}-${testCase.terminalSession}`,
           consumerId: `terminal-race-consumer-${testCase.terminalTiming}-${testCase.terminalSession}`,
-          offset: { type: "now" },
         },
         async (message) => {
           if (message.type === lilacEventTypes.CmdRequestMessage) {
@@ -4730,7 +4713,6 @@ describe("startBusRequestRouter", () => {
         mode: "fanout",
         subscriptionId: `capacity-requests-${testCase.terminalCount}`,
         consumerId: `capacity-consumer-${testCase.terminalCount}`,
-        offset: { type: "now" },
       },
       async (message) => {
         if (message.type === lilacEventTypes.CmdRequestMessage) {
@@ -4921,7 +4903,6 @@ describe("startBusRequestRouter", () => {
         mode: "fanout",
         subscriptionId: "restored-chain-requests",
         consumerId: "restored-chain-consumer",
-        offset: { type: "now" },
       },
       async (message) => {
         if (message.type === lilacEventTypes.CmdRequestMessage) {
@@ -5069,7 +5050,6 @@ describe("startBusRequestRouter", () => {
         mode: "fanout",
         subscriptionId: "newer-active-before-recovery-requests",
         consumerId: "newer-active-before-recovery-consumer",
-        offset: { type: "now" },
       },
       async (message) => {
         if (message.type === lilacEventTypes.CmdRequestMessage) {
@@ -5177,7 +5157,6 @@ describe("startBusRequestRouter", () => {
         mode: "fanout",
         subscriptionId: "restore-consume-failure-requests",
         consumerId: "restore-consume-failure-consumer",
-        offset: { type: "now" },
       },
       async (message) => {
         if (message.type === lilacEventTypes.CmdRequestMessage) {
@@ -5333,7 +5312,6 @@ describe("startBusRequestRouter", () => {
         mode: "fanout",
         subscriptionId: "test",
         consumerId: "c1",
-        offset: { type: "begin" },
       },
       async (m) => {
         if (m.type === lilacEventTypes.CmdRequestMessage) {
@@ -5350,7 +5328,6 @@ describe("startBusRequestRouter", () => {
         mode: "fanout",
         subscriptionId: "test-surface",
         consumerId: "c2",
-        offset: { type: "begin" },
       },
       async (m) => {
         if (m.type === lilacEventTypes.CmdSurfaceOutputReanchor) {
@@ -5518,7 +5495,6 @@ describe("startBusRequestRouter", () => {
         mode: "fanout",
         subscriptionId: "test",
         consumerId: "c1",
-        offset: { type: "begin" },
       },
       async (m) => {
         if (m.type === lilacEventTypes.CmdRequestMessage) {
@@ -5535,7 +5511,6 @@ describe("startBusRequestRouter", () => {
         mode: "fanout",
         subscriptionId: "test-surface",
         consumerId: "c2",
-        offset: { type: "begin" },
       },
       async (m) => {
         if (m.type === lilacEventTypes.CmdSurfaceOutputReanchor) {
@@ -5655,7 +5630,6 @@ describe("startBusRequestRouter", () => {
         mode: "fanout",
         subscriptionId: "test",
         consumerId: "c1",
-        offset: { type: "begin" },
       },
       async (m) => {
         if (m.type === lilacEventTypes.CmdRequestMessage) {
@@ -5672,7 +5646,6 @@ describe("startBusRequestRouter", () => {
         mode: "fanout",
         subscriptionId: "test-surface",
         consumerId: "c2",
-        offset: { type: "begin" },
       },
       async (m) => {
         if (m.type === lilacEventTypes.CmdSurfaceOutputReanchor) {
@@ -5823,7 +5796,6 @@ describe("startBusRequestRouter", () => {
         mode: "fanout",
         subscriptionId: "test",
         consumerId: "c1",
-        offset: { type: "begin" },
       },
       async (m) => {
         if (m.type === lilacEventTypes.CmdRequestMessage) {
@@ -5840,7 +5812,6 @@ describe("startBusRequestRouter", () => {
         mode: "fanout",
         subscriptionId: "test-surface",
         consumerId: "c2",
-        offset: { type: "begin" },
       },
       async (m) => {
         if (m.type === lilacEventTypes.CmdSurfaceOutputReanchor) {
@@ -5993,7 +5964,6 @@ describe("startBusRequestRouter", () => {
         mode: "fanout",
         subscriptionId: "test",
         consumerId: "c1",
-        offset: { type: "begin" },
       },
       async (m) => {
         if (m.type === lilacEventTypes.CmdRequestMessage) {
@@ -6125,7 +6095,6 @@ describe("startBusRequestRouter", () => {
         mode: "fanout",
         subscriptionId: "test",
         consumerId: "c1",
-        offset: { type: "begin" },
       },
       async (m) => {
         if (m.type === lilacEventTypes.CmdRequestMessage) {
@@ -6292,7 +6261,6 @@ describe("startBusRequestRouter", () => {
         mode: "fanout",
         subscriptionId: "test",
         consumerId: "c1",
-        offset: { type: "begin" },
       },
       async (m) => {
         if (m.type === lilacEventTypes.CmdRequestMessage) {
@@ -6494,7 +6462,6 @@ describe("startBusRequestRouter", () => {
         mode: "fanout",
         subscriptionId: "batch-source-handoff-observer",
         consumerId: "batch-source-handoff-consumer",
-        offset: { type: "begin" },
       },
       async (message) => {
         if (message.type === lilacEventTypes.CmdRequestMessage) {
@@ -6768,7 +6735,6 @@ describe("startBusRequestRouter", () => {
         mode: "fanout",
         subscriptionId: "typed-composition-source-handoff-observer",
         consumerId: "typed-composition-source-handoff-consumer",
-        offset: { type: "begin" },
       },
       async (message) => {
         if (message.type === lilacEventTypes.CmdRequestMessage) received.push(message);
@@ -7017,7 +6983,6 @@ describe("startBusRequestRouter", () => {
         mode: "fanout",
         subscriptionId: "test",
         consumerId: "c1",
-        offset: { type: "begin" },
       },
       async (m) => {
         if (m.type === lilacEventTypes.CmdRequestMessage) {
@@ -7034,7 +6999,6 @@ describe("startBusRequestRouter", () => {
         mode: "fanout",
         subscriptionId: "test-surface",
         consumerId: "c2",
-        offset: { type: "begin" },
       },
       async (m) => {
         if (m.type === lilacEventTypes.CmdSurfaceOutputReanchor) {
@@ -7252,7 +7216,6 @@ describe("startBusRequestRouter", () => {
         mode: "fanout",
         subscriptionId: "test",
         consumerId: "c1",
-        offset: { type: "begin" },
       },
       async (m) => {
         if (m.type === lilacEventTypes.CmdRequestMessage) {
@@ -7269,7 +7232,6 @@ describe("startBusRequestRouter", () => {
         mode: "fanout",
         subscriptionId: "test-surface",
         consumerId: "c2",
-        offset: { type: "begin" },
       },
       async (m) => {
         if (m.type === lilacEventTypes.CmdSurfaceOutputReanchor) {
@@ -7440,7 +7402,6 @@ describe("startBusRequestRouter", () => {
         mode: "fanout",
         subscriptionId: "test",
         consumerId: "c1",
-        offset: { type: "begin" },
       },
       async (m) => {
         if (m.type === lilacEventTypes.CmdRequestMessage) {
@@ -7537,7 +7498,6 @@ describe("startBusRequestRouter", () => {
         mode: "fanout",
         subscriptionId: "test",
         consumerId: "c1",
-        offset: { type: "begin" },
       },
       async (m) => {
         if (m.type === lilacEventTypes.CmdRequestMessage) {
@@ -7639,7 +7599,6 @@ describe("startBusRequestRouter", () => {
         mode: "fanout",
         subscriptionId: "test",
         consumerId: "c1",
-        offset: { type: "begin" },
       },
       async (m) => {
         if (m.type === lilacEventTypes.CmdRequestMessage) {
@@ -7742,7 +7701,6 @@ describe("startBusRequestRouter", () => {
         mode: "fanout",
         subscriptionId: "test",
         consumerId: "c1",
-        offset: { type: "begin" },
       },
       async (m) => {
         if (m.type === lilacEventTypes.CmdRequestMessage) {
@@ -7841,7 +7799,6 @@ describe("startBusRequestRouter", () => {
         mode: "fanout",
         subscriptionId: "test",
         consumerId: "c1",
-        offset: { type: "begin" },
       },
       async (m) => {
         if (m.type === lilacEventTypes.CmdRequestMessage) {
@@ -7972,7 +7929,6 @@ describe("startBusRequestRouter", () => {
         mode: "fanout",
         subscriptionId: "test",
         consumerId: "c1",
-        offset: { type: "begin" },
       },
       async (m) => {
         if (m.type === lilacEventTypes.CmdRequestMessage) {
@@ -8132,7 +8088,6 @@ describe("startBusRequestRouter", () => {
         mode: "fanout",
         subscriptionId: "test",
         consumerId: "c1",
-        offset: { type: "begin" },
       },
       async (m) => {
         if (m.type === lilacEventTypes.CmdRequestMessage) {
@@ -8257,7 +8212,6 @@ describe("startBusRequestRouter", () => {
         mode: "fanout",
         subscriptionId: "test",
         consumerId: "c1",
-        offset: { type: "begin" },
       },
       async (m) => {
         if (m.type === lilacEventTypes.CmdRequestMessage) {
@@ -8388,7 +8342,6 @@ describe("startBusRequestRouter", () => {
         mode: "fanout",
         subscriptionId: "test-fail-open",
         consumerId: "c1",
-        offset: { type: "begin" },
       },
       async (m) => {
         if (m.type === lilacEventTypes.CmdRequestMessage) {
@@ -8488,7 +8441,6 @@ describe("startBusRequestRouter", () => {
         mode: "fanout",
         subscriptionId: "test-fail-closed",
         consumerId: "c1",
-        offset: { type: "begin" },
       },
       async (m) => {
         if (m.type === lilacEventTypes.CmdRequestMessage) {

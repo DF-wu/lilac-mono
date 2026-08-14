@@ -596,7 +596,6 @@ export class WorkflowEngine {
         mode: "fanout",
         subscriptionId: this.input.subscriptionId,
         consumerId: workflowConsumerId(this.input.subscriptionId),
-        offset: { type: "now" },
         batch: { maxWaitMs: 500 },
       },
       async (): Promise<ResultType<void, WorkflowWakeDeliveryFailed>> => {

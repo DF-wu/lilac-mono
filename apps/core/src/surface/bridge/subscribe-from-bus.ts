@@ -548,7 +548,6 @@ export async function bridgeBusToAdapter<P extends RegisteredSurfacePlatform>(pa
       mode: "fanout",
       subscriptionId: `${subscriptionId}:cmd_request`,
       consumerId: getConsumerId(`${subscriptionId}:cmd_request`),
-      offset: { type: "now" },
       batch: { maxWaitMs: 1000 },
     },
     async (msg): Promise<ResultType<void, CmdRequestDeliveryError>> => {
@@ -636,7 +635,6 @@ export async function bridgeBusToAdapter<P extends RegisteredSurfacePlatform>(pa
       mode: "fanout",
       subscriptionId: `${subscriptionId}:cmd_surface`,
       consumerId: getConsumerId(`${subscriptionId}:cmd_surface`),
-      offset: { type: "now" },
       batch: { maxWaitMs: 1000 },
     },
     async (msg): Promise<ResultType<void, CmdSurfaceDeliveryError>> => {
@@ -741,7 +739,6 @@ export async function bridgeBusToAdapter<P extends RegisteredSurfacePlatform>(pa
       mode: "fanout",
       subscriptionId,
       consumerId: getConsumerId(subscriptionId),
-      offset: { type: "now" },
       batch: { maxWaitMs: 1000 },
     },
     async (msg): Promise<ResultType<void, EvtRequestDeliveryError>> => {

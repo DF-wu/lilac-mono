@@ -1128,7 +1128,7 @@ describe("WorkflowEngine", () => {
       const responder = await startResultForTest(
         bus.subscribeTopic(
           "cmd.request",
-          { mode: "fanout", subscriptionId: `mismatch-${lifecycleState}`, offset: { type: "now" } },
+          { mode: "fanout", subscriptionId: `mismatch-${lifecycleState}` },
           async (message) => {
             if (
               message.type === lilacEventTypes.CmdRequestMessage &&

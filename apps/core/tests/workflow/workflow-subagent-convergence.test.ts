@@ -715,7 +715,7 @@ describe("workflow subagent convergence", () => {
     await startResultForTest(
       bus.subscribeTopic(
         "cmd.request",
-        { mode: "fanout", subscriptionId: "generated-agent", offset: { type: "now" } },
+        { mode: "fanout", subscriptionId: "generated-agent" },
         async (message) => {
           if (
             message.type === lilacEventTypes.CmdRequestMessage &&

@@ -215,7 +215,6 @@ describe("bridgeAdapterToBus cancel mapping", () => {
         mode: "fanout",
         subscriptionId: "test:invalid-event",
         consumerId: "invalid-event-consumer",
-        offset: { type: "now" },
       },
       async (message) => {
         published.push(message);
@@ -315,7 +314,6 @@ describe("bridgeAdapterToBus cancel mapping", () => {
         mode: "fanout",
         subscriptionId: "test:unlink-failure",
         consumerId: "c1",
-        offset: { type: "now" },
       },
       async (msg) => {
         publishedTypes.push(msg.type);
@@ -366,7 +364,6 @@ describe("bridgeAdapterToBus cancel mapping", () => {
         mode: "fanout",
         subscriptionId: "test:evt",
         consumerId: "c1",
-        offset: { type: "begin" },
       },
       async (msg) => {
         published.push(msg as Message<unknown>);
@@ -494,7 +491,6 @@ describe("bridgeAdapterToBus cancel mapping", () => {
         mode: "fanout",
         subscriptionId: "test:cmd",
         consumerId: "c1",
-        offset: { type: "begin" },
       },
       async (msg) => {
         published.push(msg as Message<unknown>);
@@ -553,7 +549,6 @@ describe("bridgeAdapterToBus cancel mapping", () => {
         mode: "fanout",
         subscriptionId: "test:cmd",
         consumerId: "c1",
-        offset: { type: "begin" },
       },
       async (msg) => {
         published.push(msg as Message<unknown>);
@@ -616,7 +611,6 @@ describe("bridgeAdapterToBus cancel mapping", () => {
         mode: "fanout",
         subscriptionId: "test:cmd",
         consumerId: "c1",
-        offset: { type: "begin" },
       },
       async (msg) => {
         published.push(msg as Message<unknown>);

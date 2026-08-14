@@ -379,7 +379,6 @@ export async function startHeartbeatServiceResult(params: {
         mode: "fanout",
         subscriptionId: `${params.subscriptionId}:lifecycle`,
         consumerId: consumerId(`${params.subscriptionId}:lifecycle`),
-        offset: { type: "now" },
         batch: { maxWaitMs: 1000 },
       },
       async (msg): Promise<ResultType<void, HeartbeatLifecycleDeliveryError>> => {

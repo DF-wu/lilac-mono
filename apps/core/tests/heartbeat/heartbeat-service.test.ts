@@ -100,19 +100,29 @@ function createInMemoryRawBus(options?: {
 
       for (const sub of deliverySubs) {
         if (sub.topic !== opts.topic) continue;
-        const action = await sub.handler(stored, {
-          cursor: id,
-          mode: sub.mode,
-          evidence: {
-            source: {
-              transport: "redis-streams",
-              streamKey: opts.topic,
-              topic: opts.topic,
-              messageId: id,
-            },
-            wire: { kind: "bounded-complete", fields: [] },
+        const evidence = {
+          source: {
+            transport: "redis-streams" as const,
+            streamKey: opts.topic,
+            topic: opts.topic,
+            messageId: id,
           },
-        });
+          wire: { kind: "bounded-complete" as const, fields: [] },
+        };
+        const action = await sub.handler(
+          stored,
+          sub.mode === "tail"
+            ? { cursor: id, mode: "tail", evidence }
+            : {
+                cursor: id,
+                mode: sub.mode,
+                evidence,
+                deliveryId: "0000000000000000000000000000000000000000000000000000000000000000",
+                attempt: 1,
+                leaseDeadline: Date.now() + 60_000,
+                signal: new AbortController().signal,
+              },
+        );
         options?.onDeliveryAction?.(stored, action);
       }
 
@@ -298,7 +308,7 @@ describe("heartbeat service", () => {
     const missingSessionAction = actions[2];
     expect(missingSessionAction?.disposition).toBe("dead-letter");
     if (missingSessionAction?.disposition === "dead-letter") {
-      expect(missingSessionAction.record.reason).toMatchObject({
+      expect(missingSessionAction.reason).toMatchObject({
         kind: "handler-error",
         errorTag: "HeartbeatLifecycleEventInvalid",
       });
@@ -306,7 +316,7 @@ describe("heartbeat service", () => {
     const missingRequestAction = actions[3];
     expect(missingRequestAction?.disposition).toBe("dead-letter");
     if (missingRequestAction?.disposition === "dead-letter") {
-      expect(missingRequestAction.record.reason).toMatchObject({
+      expect(missingRequestAction.reason).toMatchObject({
         kind: "contract-invalid",
         stage: "headers",
       });
@@ -460,7 +470,6 @@ describe("heartbeat service", () => {
           mode: "fanout",
           subscriptionId: "hb-test-requests",
           consumerId: "hb-test-requests",
-          offset: { type: "begin" },
         },
         async (msg) => {
           if (msg.type === lilacEventTypes.CmdRequestMessage) {
@@ -591,7 +600,6 @@ describe("heartbeat service", () => {
           mode: "fanout",
           subscriptionId: "hb-test-requests",
           consumerId: "hb-test-requests",
-          offset: { type: "begin" },
         },
         async (msg) => {
           if (msg.type === lilacEventTypes.CmdRequestMessage) {
@@ -644,7 +652,6 @@ describe("heartbeat service", () => {
           mode: "fanout",
           subscriptionId: "hb-test-requests",
           consumerId: "hb-test-requests",
-          offset: { type: "begin" },
         },
         async (msg) => {
           if (msg.type === lilacEventTypes.CmdRequestMessage) {
@@ -689,7 +696,6 @@ describe("heartbeat service", () => {
           mode: "fanout",
           subscriptionId: "hb-test-requests",
           consumerId: "hb-test-requests",
-          offset: { type: "begin" },
         },
         async (msg) => {
           if (msg.type === lilacEventTypes.CmdRequestMessage) {
@@ -734,7 +740,6 @@ describe("heartbeat service", () => {
           mode: "fanout",
           subscriptionId: "hb-test-requests",
           consumerId: "hb-test-requests",
-          offset: { type: "begin" },
         },
         async (msg) => {
           if (msg.type === lilacEventTypes.CmdRequestMessage) {
@@ -784,7 +789,6 @@ describe("heartbeat service", () => {
           mode: "fanout",
           subscriptionId: "hb-test-requests",
           consumerId: "hb-test-requests",
-          offset: { type: "begin" },
         },
         async (msg) => {
           if (msg.type === lilacEventTypes.CmdRequestMessage) {
@@ -872,7 +876,6 @@ describe("heartbeat service", () => {
           mode: "fanout",
           subscriptionId: "hb-test-requests",
           consumerId: "hb-test-requests",
-          offset: { type: "begin" },
         },
         async (msg) => {
           if (msg.type === lilacEventTypes.CmdRequestMessage) {
@@ -947,7 +950,6 @@ describe("heartbeat service", () => {
           mode: "fanout",
           subscriptionId: "hb-test-requests",
           consumerId: "hb-test-requests",
-          offset: { type: "begin" },
         },
         async (msg) => {
           if (msg.type === lilacEventTypes.CmdRequestMessage) {

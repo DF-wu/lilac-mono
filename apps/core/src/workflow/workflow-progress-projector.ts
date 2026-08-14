@@ -287,7 +287,6 @@ export class WorkflowProgressProjector implements WorkflowProgressCardService {
         mode: "fanout",
         subscriptionId: this.input.subscriptionId,
         consumerId: workflowConsumerId(this.input.subscriptionId),
-        offset: { type: "now" },
         batch: { maxWaitMs: 1_000 },
       },
       async (message): Promise<ResultType<void, WorkflowProgressProjectorStopping>> => {

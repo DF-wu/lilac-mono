@@ -2169,7 +2169,7 @@ function createInMemoryRawBus(
       const entry = { topic, opts, handler, activeHandlers: new Set<Promise<void>>() };
       subs.add(entry);
 
-      const offset = opts.offset;
+      const offset = opts.mode === "tail" ? opts.offset : undefined;
       if (suppressNextWorkReplay && topic === "cmd.request" && opts.mode === "work") {
         suppressNextWorkReplay = false;
       } else if (offset?.type === "begin" || offset?.type === "cursor") {

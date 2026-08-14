@@ -312,7 +312,6 @@ export async function startWorkflowActionResolver(input: {
         mode: "fanout",
         subscriptionId: input.subscriptionId,
         consumerId: workflowConsumerId(input.subscriptionId),
-        offset: { type: "now" },
         batch: { maxWaitMs: 1_000 },
       },
       async (message): Promise<ResultType<void, WorkflowActionResolverDeliveryError>> => {

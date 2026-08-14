@@ -281,7 +281,7 @@ describe("unified workflow integration", () => {
     const requestResponder = await startResultForTest(
       bus.subscribeTopic(
         "cmd.request",
-        { mode: "fanout", subscriptionId: "integration-agent", offset: { type: "now" } },
+        { mode: "fanout", subscriptionId: "integration-agent" },
         async (message) => {
           if (
             message.type === lilacEventTypes.CmdRequestMessage &&

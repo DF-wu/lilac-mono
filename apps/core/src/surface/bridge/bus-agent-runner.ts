@@ -3463,7 +3463,6 @@ export async function startBusAgentRunner(params: {
           mode: "work",
           subscriptionId,
           consumerId: consumerId(subscriptionId),
-          offset: { type: "begin" },
           batch: { maxWaitMs: 1000 },
         },
         async (msg) => {
