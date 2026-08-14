@@ -1,6 +1,7 @@
 export * from "./types";
 export * from "./raw-bus";
 export * from "./redis-streams-bus";
+export * from "./redis-managed-delivery";
 export * from "./redis-event-dead-letter";
 
 export * from "./event-dead-letter";

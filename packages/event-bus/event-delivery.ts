@@ -1,13 +1,14 @@
 import { TaggedError } from "better-result";
 
 import type {
-  EventDeadLetter,
-  EventDeadLetterRecordV1,
+  EventDeadLetterHandlerFailure,
+  EventDeadLetterReason,
   EventTransportEvidence,
 } from "./event-dead-letter";
+import type { RedisEventDeadLetter } from "./redis-event-dead-letter";
 import type { Cursor, Mode, RawMessageDecodeOutcome } from "./types";
 
-export type DeliveryDisposition = "commit" | "park-pending" | "dead-letter" | "stop";
+export type DeliveryDisposition = "commit" | "retry" | "park-pending" | "dead-letter" | "stop";
 
 export class EventContractInvalid extends TaggedError("EventContractInvalid")<{
   readonly source: "transport" | "contract";
@@ -68,15 +69,26 @@ export function applyEventDeliveryPolicy(error: EventDeliveryError): DeliveryDis
   }
 }
 
-export type EventDeliveryContext = {
-  readonly cursor: Cursor;
-  readonly mode: Mode;
-  readonly evidence: EventTransportEvidence;
-};
+export type EventDeliveryContext =
+  | {
+      readonly cursor: Cursor;
+      readonly mode: "work" | "fanout";
+      readonly evidence: EventTransportEvidence;
+      readonly deliveryId: string;
+      readonly attempt: 1 | 2 | 3 | 4 | 5;
+      readonly leaseDeadline: number;
+      readonly signal: AbortSignal;
+    }
+  | {
+      readonly cursor: Cursor;
+      readonly mode: Extract<Mode, "tail">;
+      readonly evidence: EventTransportEvidence;
+    };
 
 export type RawDeliveryAction =
   | { readonly disposition: "commit" | "park-pending" | "stop" }
-  | { readonly disposition: "dead-letter"; readonly record: EventDeadLetterRecordV1 };
+  | { readonly disposition: "retry"; readonly failure: EventDeadLetterHandlerFailure }
+  | { readonly disposition: "dead-letter"; readonly reason: EventDeadLetterReason };
 
 export type RawDeliveryHandler = (
   message: RawMessageDecodeOutcome,
@@ -104,7 +116,7 @@ export interface EventDeliveryFatalReporter {
 }
 
 export type RawDeliveryDependencies = {
-  readonly deadLetter?: EventDeadLetter;
+  readonly deadLetter?: RedisEventDeadLetter;
   readonly logger?: EventDeliveryLogger;
   readonly reportFatal?: EventDeliveryFatalReporter;
 };

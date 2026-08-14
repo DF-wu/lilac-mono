@@ -12,11 +12,11 @@ import { formatTaggedErrorForLog } from "@stanley2058/lilac-utils";
 import type { RawBus } from "./raw-bus";
 import type { Cursor, FetchOptions, RedisMessageDecodeFailure, SubscriptionOptions } from "./types";
 import {
-  createContractInvalidDeadLetterRecord,
-  createHandlerErrorDeadLetterRecord,
+  createContractInvalidDeadLetterReason,
+  createHandlerErrorDeadLetterReason,
   redisDecodeIssuesForDeadLetter,
-  type EventDeadLetter,
 } from "./event-dead-letter";
+import type { RedisEventDeadLetter } from "./redis-event-dead-letter";
 import {
   applyEventDeliveryPolicy,
   EventBusCloseFailed,
@@ -75,7 +75,7 @@ export type DecodedLilacMessageForTopic<TTopic extends LilacTopic> = DecodedLila
 >;
 
 export type CreateLilacBusOptions = {
-  readonly deadLetter?: EventDeadLetter;
+  readonly deadLetter?: RedisEventDeadLetter;
   readonly logger?: EventDeliveryLogger;
   readonly reportFatal?: EventDeliveryFatalReporter;
 };
@@ -165,6 +165,7 @@ function logContractInvalid(
 function checkedDisposition(value: DeliveryDisposition): DeliveryDisposition {
   switch (value) {
     case "commit":
+    case "retry":
     case "park-pending":
     case "dead-letter":
     case "stop":
@@ -240,8 +241,6 @@ export interface LilacBus {
       topic?: LilacTopicForType<TType>;
       /** Override the default correlation key (advanced). */
       key?: string;
-      /** Best-effort retention hint. */
-      retention?: { maxLenApprox?: number };
     },
   ): Promise<
     ResultType<
@@ -317,7 +316,6 @@ export function createLilacBus(raw: RawBus, options: CreateLilacBusOptions = {})
         headers?: Record<string, string> & Partial<LilacEnvelopeHeaders>;
         topic?: LilacTopicForType<TType>;
         key?: string;
-        retention?: { maxLenApprox?: number };
       },
     ) => {
       let topic = options?.topic;
@@ -348,7 +346,6 @@ export function createLilacBus(raw: RawBus, options: CreateLilacBusOptions = {})
             type,
             key,
             headers: options?.headers,
-            retention: options?.retention,
           },
         );
       } catch (cause) {
@@ -402,15 +399,20 @@ export function createLilacBus(raw: RawBus, options: CreateLilacBusOptions = {})
               if (handled.status === "ok") return { disposition: "commit" };
 
               const disposition = checkedDisposition(deliveryPolicy(handled.error));
-              if (disposition !== "dead-letter") return { disposition };
               const formatted = formatTaggedErrorForLog(handled.error);
+              if (disposition === "retry") {
+                return {
+                  disposition,
+                  failure: createHandlerErrorDeadLetterReason({
+                    errorTag: formatted.errorTag,
+                    errorMessage: formatted.errorMessage,
+                  }),
+                };
+              }
+              if (disposition !== "dead-letter") return { disposition };
               return {
                 disposition,
-                record: createHandlerErrorDeadLetterRecord({
-                  topic,
-                  cursor: context.cursor,
-                  mode: context.mode,
-                  evidence: context.evidence,
+                reason: createHandlerErrorDeadLetterReason({
                   errorTag: formatted.errorTag,
                   errorMessage: formatted.errorMessage,
                 }),
@@ -420,14 +422,15 @@ export function createLilacBus(raw: RawBus, options: CreateLilacBusOptions = {})
 
           logContractInvalid(options.logger, topic, context.cursor, contractError);
           const disposition = applyEventDeliveryPolicy(contractError);
+          if (disposition === "retry") {
+            throw new Panic({
+              message: "Package event delivery policy cannot retry without a failure",
+            });
+          }
           if (disposition !== "dead-letter") return { disposition };
           return {
             disposition,
-            record: createContractInvalidDeadLetterRecord({
-              topic,
-              cursor: context.cursor,
-              mode: context.mode,
-              evidence: context.evidence,
+            reason: createContractInvalidDeadLetterReason({
               stage: contractError.stage,
               eventType: contractError.eventType ?? eventType,
               issues: contractError.issues,

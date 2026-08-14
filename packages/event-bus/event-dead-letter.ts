@@ -1,8 +1,11 @@
+import { createHash } from "node:crypto";
+
 import { Err, Ok, Panic, Result, TaggedError, type Result as ResultType } from "better-result";
 
 import type { RedisMessageDecodeIssue, RedisWireValueEvidence, Topic } from "./types";
 
-export const EVENT_DEAD_LETTER_VERSION = 1 as const;
+export const EVENT_DEAD_LETTER_VERSION = 2 as const;
+export const EVENT_DEAD_LETTER_MAX_ATTEMPTS = 5 as const;
 
 export type RedisEvidenceSource = {
   readonly transport: "redis-streams";
@@ -38,7 +41,13 @@ export type EventTransportEvidence = {
       };
 };
 
-export type EventDeadLetterReasonV1 =
+export type EventDeadLetterHandlerFailure = {
+  readonly kind: "handler-error";
+  readonly errorTag: string;
+  readonly errorMessage: string;
+};
+
+export type EventDeadLetterReason =
   | {
       readonly kind: "contract-invalid";
       readonly diagnostic: "event_bus.contract_invalid";
@@ -53,13 +62,13 @@ export type EventDeadLetterReasonV1 =
       readonly eventType?: string;
       readonly issues: readonly string[];
     }
+  | EventDeadLetterHandlerFailure
   | {
-      readonly kind: "handler-error";
-      readonly errorTag: string;
-      readonly errorMessage: string;
+      readonly kind: "attempts-exhausted";
+      readonly finalFailure: EventDeadLetterHandlerFailure | { readonly kind: "lease-expired" };
     };
 
-export type EventDeadLetterRecordV1 = {
+export type EventDeadLetterRecord = {
   readonly version: typeof EVENT_DEAD_LETTER_VERSION;
   readonly deadLetterId: string;
   readonly recordedAt: number;
@@ -69,7 +78,15 @@ export type EventDeadLetterRecordV1 = {
     readonly messageId: string;
     readonly mode: "work" | "fanout" | "tail";
   };
-  readonly reason: EventDeadLetterReasonV1;
+  readonly delivery:
+    | {
+        readonly kind: "managed-v2";
+        readonly physicalGroup: string;
+        readonly attempt: 1 | 2 | 3 | 4 | 5;
+        readonly maxAttempts: typeof EVENT_DEAD_LETTER_MAX_ATTEMPTS;
+      }
+    | { readonly kind: "tail" };
+  readonly reason: EventDeadLetterReason;
   readonly evidence: EventTransportEvidence;
 };
 
@@ -84,7 +101,7 @@ export type EventDeadLetterAcceptance = {
 
 export interface EventDeadLetter {
   accept(
-    record: EventDeadLetterRecordV1,
+    record: EventDeadLetterRecord,
   ): Promise<ResultType<EventDeadLetterAcceptance, EventDeadLetterAcceptFailed>>;
 }
 
@@ -158,33 +175,17 @@ function boundReasonText(value: string): string {
   return value.length <= MAX_REASON_CHARS ? value : value.slice(0, MAX_REASON_CHARS);
 }
 
-export function createContractInvalidDeadLetterRecord(options: {
-  readonly topic: Topic;
-  readonly cursor: string;
-  readonly mode: "work" | "fanout" | "tail";
-  readonly evidence: EventTransportEvidence;
-  readonly stage: Extract<EventDeadLetterReasonV1, { kind: "contract-invalid" }>["stage"];
+export function createContractInvalidDeadLetterReason(options: {
+  readonly stage: Extract<EventDeadLetterReason, { kind: "contract-invalid" }>["stage"];
   readonly eventType?: string;
   readonly issues: readonly string[];
-}): EventDeadLetterRecordV1 {
+}): Extract<EventDeadLetterReason, { kind: "contract-invalid" }> {
   return {
-    version: EVENT_DEAD_LETTER_VERSION,
-    deadLetterId: crypto.randomUUID(),
-    recordedAt: Date.now(),
-    source: {
-      topic: options.topic,
-      cursor: options.cursor,
-      messageId: options.evidence.source.messageId,
-      mode: options.mode,
-    },
-    reason: {
-      kind: "contract-invalid",
-      diagnostic: "event_bus.contract_invalid",
-      stage: options.stage,
-      ...(options.eventType === undefined ? {} : { eventType: boundReasonText(options.eventType) }),
-      issues: options.issues.slice(0, MAX_REASON_ISSUES).map(boundReasonText),
-    },
-    evidence: options.evidence,
+    kind: "contract-invalid",
+    diagnostic: "event_bus.contract_invalid",
+    stage: options.stage,
+    ...(options.eventType === undefined ? {} : { eventType: boundReasonText(options.eventType) }),
+    issues: options.issues.slice(0, MAX_REASON_ISSUES).map(boundReasonText),
   };
 }
 
@@ -199,14 +200,93 @@ export function redisDecodeIssuesForDeadLetter(
   });
 }
 
-export function createHandlerErrorDeadLetterRecord(options: {
-  readonly topic: Topic;
-  readonly cursor: string;
-  readonly mode: "work" | "fanout" | "tail";
-  readonly evidence: EventTransportEvidence;
+export function createHandlerErrorDeadLetterReason(options: {
   readonly errorTag: string;
   readonly errorMessage: string;
-}): EventDeadLetterRecordV1 {
+}): EventDeadLetterHandlerFailure {
+  return {
+    kind: "handler-error",
+    errorTag: boundReasonText(options.errorTag),
+    errorMessage: boundReasonText(options.errorMessage),
+  };
+}
+
+export function createAttemptsExhaustedDeadLetterReason(options: {
+  readonly finalFailure:
+    | { readonly kind: "handler-error"; readonly errorTag: string; readonly errorMessage: string }
+    | { readonly kind: "lease-expired" };
+}): Extract<EventDeadLetterReason, { kind: "attempts-exhausted" }> {
+  return {
+    kind: "attempts-exhausted",
+    finalFailure:
+      options.finalFailure.kind === "handler-error"
+        ? createHandlerErrorDeadLetterReason(options.finalFailure)
+        : { kind: "lease-expired" },
+  };
+}
+
+function appendLengthPrefixedIdentityPart(
+  hash: ReturnType<typeof createHash>,
+  value: string,
+): void {
+  const bytes = Buffer.from(value, "utf8");
+  const length = Buffer.allocUnsafe(4);
+  length.writeUInt32BE(bytes.byteLength);
+  hash.update(length);
+  hash.update(bytes);
+}
+
+function managedDeadLetterId(streamKey: string, physicalGroup: string, messageId: string): string {
+  const hash = createHash("sha256");
+  hash.update("lilac:event-dead-letter");
+  hash.update(Uint8Array.of(EVENT_DEAD_LETTER_VERSION));
+  appendLengthPrefixedIdentityPart(hash, streamKey);
+  appendLengthPrefixedIdentityPart(hash, physicalGroup);
+  appendLengthPrefixedIdentityPart(hash, messageId);
+  return hash.digest("hex");
+}
+
+export function createManagedEventDeadLetterRecord(options: {
+  readonly topic: Topic;
+  readonly cursor: string;
+  readonly mode: "work" | "fanout";
+  readonly physicalGroup: string;
+  readonly attempt: 1 | 2 | 3 | 4 | 5;
+  readonly recordedAt: number;
+  readonly reason: EventDeadLetterReason;
+  readonly evidence: EventTransportEvidence;
+}): EventDeadLetterRecord {
+  return {
+    version: EVENT_DEAD_LETTER_VERSION,
+    deadLetterId: managedDeadLetterId(
+      options.evidence.source.streamKey,
+      options.physicalGroup,
+      options.evidence.source.messageId,
+    ),
+    recordedAt: options.recordedAt,
+    source: {
+      topic: options.topic,
+      cursor: options.cursor,
+      messageId: options.evidence.source.messageId,
+      mode: options.mode,
+    },
+    delivery: {
+      kind: "managed-v2",
+      physicalGroup: options.physicalGroup,
+      attempt: options.attempt,
+      maxAttempts: EVENT_DEAD_LETTER_MAX_ATTEMPTS,
+    },
+    reason: options.reason,
+    evidence: options.evidence,
+  };
+}
+
+export function createTailEventDeadLetterRecord(options: {
+  readonly topic: Topic;
+  readonly cursor: string;
+  readonly reason: EventDeadLetterReason;
+  readonly evidence: EventTransportEvidence;
+}): EventDeadLetterRecord {
   return {
     version: EVENT_DEAD_LETTER_VERSION,
     deadLetterId: crypto.randomUUID(),
@@ -215,13 +295,10 @@ export function createHandlerErrorDeadLetterRecord(options: {
       topic: options.topic,
       cursor: options.cursor,
       messageId: options.evidence.source.messageId,
-      mode: options.mode,
+      mode: "tail",
     },
-    reason: {
-      kind: "handler-error",
-      errorTag: boundReasonText(options.errorTag),
-      errorMessage: boundReasonText(options.errorMessage),
-    },
+    delivery: { kind: "tail" },
+    reason: options.reason,
     evidence: options.evidence,
   };
 }

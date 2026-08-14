@@ -9,9 +9,15 @@ import {
   computeCoreLineagePrefixDigestV1,
   createLilacBus,
   createRedisStreamsBus,
+  type EventDeliveryStopFailed,
   EventHandlerFailed,
   lilacEventTypes,
+  MANAGED_REDIS_HEARTBEAT_MS,
+  managedRedisDeliveryId,
+  managedRedisGroupId,
+  managedRedisPhysicalGroup,
   outReqTopic,
+  RedisEventDeadLetter,
   type CoreLineageAtomV1,
   type CoreLineageManifestV1,
   type DecodedMessage,
@@ -19,6 +25,7 @@ import {
   type RedisMessageDecodeFailure,
 } from "../index";
 import { RedisConnectionPool } from "../redis-connection-pool";
+import { COMMIT_SCRIPT, HEARTBEAT_SCRIPT } from "../redis-managed-delivery/lua";
 
 const TEST_REDIS_URL = env.redisUrl || "redis://127.0.0.1:6379";
 
@@ -68,26 +75,98 @@ function subscriberPoolStats(raw: ReturnType<typeof createRedisStreamsBus>) {
   return pool.stats();
 }
 
+function consumerGroupNames(groups: unknown): readonly string[] {
+  if (!Array.isArray(groups)) throw new Error("Redis consumer groups response is invalid");
+  return groups.flatMap((group) => {
+    if (!Array.isArray(group)) return [];
+    const nameIndex = group.indexOf("name");
+    const name = group[nameIndex + 1];
+    return typeof name === "string" ? [name] : [];
+  });
+}
+
+function ephemeralGroupNames(groups: unknown): readonly string[] {
+  return consumerGroupNames(groups).filter((group) => group.startsWith("__lilac_ephemeral__:"));
+}
+
+function observeSubscriberRead(redis: Redis): Promise<void> {
+  const started = Promise.withResolvers<void>();
+  const duplicate = redis.duplicate.bind(redis);
+  Reflect.set(redis, "duplicate", () => {
+    const subscriber = duplicate();
+    const xread = Reflect.get(subscriber, "xread");
+    Reflect.set(subscriber, "xread", (...args: unknown[]) => {
+      const result = Reflect.apply(xread, subscriber, args);
+      started.resolve();
+      return result;
+    });
+    return subscriber;
+  });
+  return started.promise;
+}
+
+function testDeadLetter(redis: Redis, keyPrefix: string): RedisEventDeadLetter {
+  return new RedisEventDeadLetter({
+    redis,
+    encryptionKey: Buffer.alloc(32, 7),
+    keyPrefix: `${keyPrefix}:dead-letter`,
+  });
+}
+
+function controlManagedHeartbeatTimers(): {
+  next(): Promise<() => void>;
+  restore(): void;
+} {
+  const callbacks: Array<() => void> = [];
+  const waiters: Array<ReturnType<typeof Promise.withResolvers<() => void>>> = [];
+  const nativeSetTimeout = globalThis.setTimeout;
+  const controlledSetTimeout = Object.assign(
+    (callback: (...args: unknown[]) => void, delay?: number, ...args: unknown[]) => {
+      if (delay !== MANAGED_REDIS_HEARTBEAT_MS) {
+        return nativeSetTimeout(callback, delay, ...args);
+      }
+      const scheduled = () => callback(...args);
+      const waiter = waiters.shift();
+      if (waiter) waiter.resolve(scheduled);
+      else callbacks.push(scheduled);
+      return { unref() {} } as ReturnType<typeof setTimeout>;
+    },
+    { __promisify__: nativeSetTimeout.__promisify__ },
+  );
+  const timerSpy = spyOn(globalThis, "setTimeout").mockImplementation(
+    controlledSetTimeout as typeof setTimeout,
+  );
+  return {
+    next: () => {
+      const callback = callbacks.shift();
+      if (callback) return Promise.resolve(callback);
+      const waiter = Promise.withResolvers<() => void>();
+      waiters.push(waiter);
+      return waiter.promise;
+    },
+    restore: () => timerSpy.mockRestore(),
+  };
+}
+
 describe("RedisStreamsBus", () => {
-  it("warns with aggregate PEL health when an existing group has pending entries", async () => {
+  it("ignores pending entries in a preexisting unversioned group", async () => {
     const redis = new Redis(TEST_REDIS_URL);
     const keyPrefix = `test:lilac-event-bus:${randomId("pending-start-observability")}`;
     const streamKey = `${keyPrefix}:topic`;
-    const group = "pending-start-observability";
+    const subscriptionId = "pending-start-observability";
+    const physicalGroup = managedRedisPhysicalGroup("work", subscriptionId);
     const id = await redis.xadd(streamKey, "*", "type", "test", "ts", "1", "data", "null");
     if (typeof id !== "string") throw new Error("Redis did not return an entry id");
-    await redis.xgroup("CREATE", streamKey, group, "0-0");
-    await redis.xreadgroup("GROUP", group, "abandoned", "STREAMS", streamKey, ">");
+    await redis.xgroup("CREATE", streamKey, subscriptionId, "0-0");
+    await redis.xreadgroup("GROUP", subscriptionId, "abandoned", "STREAMS", streamKey, ">");
 
     const raw = createRedisStreamsBus({ redis, keyPrefix });
     const logger = Reflect.get(raw, "logger") as {
       warn(event: string, context: Record<string, unknown>): void;
     };
     const warnings: Array<{ event: string; context: Record<string, unknown> }> = [];
-    const warningObserved = Promise.withResolvers<void>();
     const warn = spyOn(logger, "warn").mockImplementation((event, context) => {
       warnings.push({ event, context });
-      if (event === "event_bus.pending_entries") warningObserved.resolve();
     });
     try {
       const subscription = requireOk(
@@ -95,27 +174,16 @@ describe("RedisStreamsBus", () => {
           "topic",
           {
             mode: "work",
-            subscriptionId: group,
+            subscriptionId,
             consumerId: "replacement",
             batch: { maxWaitMs: 50 },
           },
           async () => ({ disposition: "commit" }),
         ),
       );
-      await warningObserved.promise;
-      expect(warnings).toEqual([
-        {
-          event: "event_bus.pending_entries",
-          context: {
-            topic: "topic",
-            group,
-            trigger: "subscription_start",
-            pendingCount: 1,
-            oldestPendingIdleMs: expect.any(Number),
-          },
-        },
-      ]);
-      expect(JSON.stringify(warnings)).not.toContain("abandoned");
+      expect(await pendingCount(redis, streamKey, subscriptionId)).toBe(1);
+      expect(await pendingCount(redis, streamKey, physicalGroup)).toBe(0);
+      expect(warnings).toEqual([]);
       requireOk(await subscription.stop());
     } finally {
       warn.mockRestore();
@@ -129,7 +197,8 @@ describe("RedisStreamsBus", () => {
     const redis = new Redis(TEST_REDIS_URL);
     const keyPrefix = `test:lilac-event-bus:${randomId("pending-park-observability")}`;
     const streamKey = `${keyPrefix}:topic`;
-    const group = "pending-park-observability";
+    const subscriptionId = "pending-park-observability";
+    const physicalGroup = managedRedisPhysicalGroup("work", subscriptionId);
     const raw = createRedisStreamsBus({ redis, keyPrefix });
     const logger = Reflect.get(raw, "logger") as {
       warn(event: string, context: Record<string, unknown>): void;
@@ -144,9 +213,8 @@ describe("RedisStreamsBus", () => {
           "topic",
           {
             mode: "work",
-            subscriptionId: group,
+            subscriptionId,
             consumerId: "consumer",
-            offset: { type: "begin" },
             batch: { maxWaitMs: 50 },
           },
           async () => ({ disposition: "park-pending" }),
@@ -158,7 +226,7 @@ describe("RedisStreamsBus", () => {
       );
       expect(await warningObserved.promise).toEqual({
         topic: "topic",
-        group,
+        group: physicalGroup,
         trigger: "parked",
         pendingCount: 1,
         oldestPendingIdleMs: expect.any(Number),
@@ -240,52 +308,13 @@ describe("RedisStreamsBus", () => {
 
   it("surfaces a malformed acknowledged-prefix XTRIM response as Panic", async () => {
     const redis = new Redis(TEST_REDIS_URL, { lazyConnect: true });
-    const duplicate = redis.duplicate();
     const keyPrefix = `test:lilac-event-bus:${randomId("malformed-acknowledged-trim")}`;
     const streamKey = `${keyPrefix}:topic`;
-    const nextRead = Promise.withResolvers<unknown>();
-    const acknowledged = Promise.withResolvers<void>();
-    const secondReadStarted = Promise.withResolvers<void>();
-    let readCount = 0;
-    let disconnected = false;
-    Reflect.set(redis, "duplicate", () => duplicate);
     Reflect.set(redis, "eval", async () => "invalid-count");
-    Reflect.set(redis, "xpending", async () => [["1-0", "consumer", 1, 1]]);
-    Reflect.set(duplicate, "xgroup", async () => "OK");
-    Reflect.set(duplicate, "xreadgroup", async () => {
-      readCount += 1;
-      if (readCount === 1) {
-        return [[streamKey, [["1-0", ["type", "test", "ts", "1", "data", "null"]]]]];
-      }
-      secondReadStarted.resolve();
-      return await nextRead.promise;
-    });
-    Reflect.set(duplicate, "xack", async () => {
-      acknowledged.resolve();
-      return 1;
-    });
-    Reflect.set(duplicate, "disconnect", () => {
-      if (disconnected) return;
-      disconnected = true;
-      nextRead.reject(new Error("Connection is closed."));
-    });
-    const raw = createRedisStreamsBus({ redis, keyPrefix, subscriberPool: { max: 1 } });
-    const subscription = requireOk(
-      await raw.subscribe(
-        "topic",
-        {
-          mode: "work",
-          subscriptionId: "malformed-acknowledged-trim",
-          offset: { type: "begin" },
-          batch: { maxWaitMs: 5_000 },
-        },
-        async () => ({ disposition: "commit" }),
-      ),
-    );
-    await acknowledged.promise;
-    await secondReadStarted.promise;
+    const raw = createRedisStreamsBus({ redis, keyPrefix });
+    const scheduleAcknowledgedTrim = Reflect.get(raw, "scheduleAcknowledgedTrim");
+    Reflect.apply(scheduleAcknowledgedTrim, raw, ["topic", streamKey]);
     await expect(raw.flushPendingTrims()).rejects.toBeInstanceOf(Panic);
-    requireOk(await subscription.stop());
     await expect(raw.close()).rejects.toBeInstanceOf(Panic);
     redis.disconnect();
   });
@@ -392,25 +421,51 @@ describe("RedisStreamsBus", () => {
 
   it("preserves an ephemeral loop Panic after DESTROY and lease cleanup failures", async () => {
     const redis = new Redis(TEST_REDIS_URL, { lazyConnect: true });
-    const duplicate = redis.duplicate();
+    const subscriberRedis = redis.duplicate();
+    const managedRedis = redis.duplicate();
     const read = Promise.withResolvers<unknown>();
     const readStarted = Promise.withResolvers<void>();
     const panic = new Panic({ message: "ephemeral loop invariant" });
-    let disconnectCalls = 0;
+    let duplicateCalls = 0;
+    let subscriberDisconnectCalls = 0;
+    let managedDisconnectCalls = 0;
     let destroyCalls = 0;
-    Reflect.set(redis, "duplicate", () => duplicate);
-    Reflect.set(duplicate, "xgroup", async () => "OK");
-    Reflect.set(duplicate, "xreadgroup", async () => {
+    Reflect.set(redis, "duplicate", () => {
+      duplicateCalls += 1;
+      return duplicateCalls === 1 ? subscriberRedis : managedRedis;
+    });
+    Reflect.set(subscriberRedis, "xgroup", async (...args: unknown[]) => {
+      if (args[0] === "CREATE" && typeof args[2] === "string") physicalGroup = args[2];
+      return "OK";
+    });
+    Reflect.set(managedRedis, "eval", async () => ["none"]);
+    let physicalGroup = "";
+    Reflect.set(subscriberRedis, "xreadgroup", async (...args: unknown[]) => {
+      expect(args).toEqual([
+        "GROUP",
+        physicalGroup,
+        expect.any(String),
+        "COUNT",
+        "1",
+        "BLOCK",
+        "1000",
+        "STREAMS",
+        "lilac:event-bus:topic",
+        ">",
+      ]);
       readStarted.resolve();
       return await read.promise;
     });
-    Reflect.set(duplicate, "disconnect", () => {
-      disconnectCalls += 1;
-      if (disconnectCalls === 1) {
+    Reflect.set(subscriberRedis, "disconnect", () => {
+      subscriberDisconnectCalls += 1;
+      if (subscriberDisconnectCalls === 1) {
         read.reject(panic);
         return;
       }
-      throw new Error("lease disconnect failed");
+      if (subscriberDisconnectCalls === 2) throw new Error("lease disconnect failed");
+    });
+    Reflect.set(managedRedis, "disconnect", () => {
+      managedDisconnectCalls += 1;
     });
     Reflect.set(redis, "xgroup", async (command: string) => {
       if (command === "DESTROY") destroyCalls += 1;
@@ -423,8 +478,8 @@ describe("RedisStreamsBus", () => {
         {
           mode: "work",
           subscriptionId: "panic-ephemeral",
+          consumerId: "panic-ephemeral-consumer",
           ephemeral: true,
-          offset: { type: "begin" },
           batch: { maxWaitMs: 5_000 },
         },
         async () => ({ disposition: "commit" }),
@@ -442,7 +497,8 @@ describe("RedisStreamsBus", () => {
     expect(await doneCause).toBe(panic);
     expect(await stopCause).toBe(panic);
     expect(destroyCalls).toBe(1);
-    expect(disconnectCalls).toBe(2);
+    expect(subscriberDisconnectCalls).toBe(2);
+    expect(managedDisconnectCalls).toBe(2);
     expect(subscriberPoolStats(raw)).toEqual({ max: 1, created: 0, available: 0, inUse: 0 });
     await raw.close();
     redis.disconnect();
@@ -450,22 +506,32 @@ describe("RedisStreamsBus", () => {
 
   it("preserves a work loop Panic after DELCONSUMER cleanup failure", async () => {
     const redis = new Redis(TEST_REDIS_URL, { lazyConnect: true });
-    const duplicate = redis.duplicate();
+    const subscriberRedis = redis.duplicate();
+    const managedRedis = redis.duplicate();
     const read = Promise.withResolvers<unknown>();
     const readStarted = Promise.withResolvers<void>();
     const panic = new Panic({ message: "work loop invariant" });
-    let disconnectCalls = 0;
+    let duplicateCalls = 0;
+    let subscriberDisconnectCalls = 0;
+    let managedDisconnectCalls = 0;
     let pendingCalls = 0;
     let delconsumerCalls = 0;
-    Reflect.set(redis, "duplicate", () => duplicate);
-    Reflect.set(duplicate, "xgroup", async () => "OK");
-    Reflect.set(duplicate, "xreadgroup", async () => {
+    Reflect.set(redis, "duplicate", () => {
+      duplicateCalls += 1;
+      return duplicateCalls === 1 ? subscriberRedis : managedRedis;
+    });
+    Reflect.set(subscriberRedis, "xgroup", async () => "OK");
+    Reflect.set(managedRedis, "eval", async () => ["none"]);
+    Reflect.set(subscriberRedis, "xreadgroup", async () => {
       readStarted.resolve();
       return await read.promise;
     });
-    Reflect.set(duplicate, "disconnect", () => {
-      disconnectCalls += 1;
-      if (disconnectCalls === 1) read.reject(panic);
+    Reflect.set(subscriberRedis, "disconnect", () => {
+      subscriberDisconnectCalls += 1;
+      if (subscriberDisconnectCalls === 1) read.reject(panic);
+    });
+    Reflect.set(managedRedis, "disconnect", () => {
+      managedDisconnectCalls += 1;
     });
     Reflect.set(redis, "xpending", async () => {
       pendingCalls += 1;
@@ -482,7 +548,6 @@ describe("RedisStreamsBus", () => {
         {
           mode: "work",
           subscriptionId: "panic-work",
-          offset: { type: "begin" },
           batch: { maxWaitMs: 5_000 },
         },
         async () => ({ disposition: "commit" }),
@@ -501,7 +566,8 @@ describe("RedisStreamsBus", () => {
     expect(await stopCause).toBe(panic);
     expect(pendingCalls).toBe(1);
     expect(delconsumerCalls).toBe(1);
-    expect(disconnectCalls).toBe(2);
+    expect(subscriberDisconnectCalls).toBe(2);
+    expect(managedDisconnectCalls).toBe(2);
     expect(subscriberPoolStats(raw)).toEqual({ max: 1, created: 0, available: 0, inUse: 0 });
     await raw.close();
     redis.disconnect();
@@ -518,7 +584,6 @@ describe("RedisStreamsBus", () => {
       {
         mode: "work",
         subscriptionId: "malformed-create",
-        offset: { type: "begin" },
       },
       async () => ({ disposition: "commit" }),
     );
@@ -527,17 +592,23 @@ describe("RedisStreamsBus", () => {
     createRedis.disconnect();
 
     const cleanupRedis = new Redis(TEST_REDIS_URL, { lazyConnect: true });
-    const cleanupDuplicate = cleanupRedis.duplicate();
+    const cleanupSubscriberRedis = cleanupRedis.duplicate();
+    const cleanupManagedRedis = cleanupRedis.duplicate();
     const read = Promise.withResolvers<unknown>();
     const readStarted = Promise.withResolvers<void>();
+    let cleanupDuplicateCalls = 0;
     let disconnected = false;
-    Reflect.set(cleanupRedis, "duplicate", () => cleanupDuplicate);
-    Reflect.set(cleanupDuplicate, "xgroup", async () => "OK");
-    Reflect.set(cleanupDuplicate, "xreadgroup", async () => {
+    Reflect.set(cleanupRedis, "duplicate", () => {
+      cleanupDuplicateCalls += 1;
+      return cleanupDuplicateCalls === 1 ? cleanupSubscriberRedis : cleanupManagedRedis;
+    });
+    Reflect.set(cleanupSubscriberRedis, "xgroup", async () => "OK");
+    Reflect.set(cleanupManagedRedis, "eval", async () => ["none"]);
+    Reflect.set(cleanupSubscriberRedis, "xreadgroup", async () => {
       readStarted.resolve();
       return await read.promise;
     });
-    Reflect.set(cleanupDuplicate, "disconnect", () => {
+    Reflect.set(cleanupSubscriberRedis, "disconnect", () => {
       if (disconnected) return;
       disconnected = true;
       read.reject(new Error("Connection is closed."));
@@ -554,7 +625,6 @@ describe("RedisStreamsBus", () => {
           mode: "work",
           subscriptionId: "malformed-cleanup",
           ephemeral: true,
-          offset: { type: "begin" },
           batch: { maxWaitMs: 5_000 },
         },
         async () => ({ disposition: "commit" }),
@@ -564,21 +634,27 @@ describe("RedisStreamsBus", () => {
     const stopped = await subscription.stop();
     expect(stopped.status).toBe("error");
     if (stopped.status === "error") expect(stopped.error._tag).toBe("EventDeliveryStopFailed");
-    await cleanupRaw.close();
+    await expect(cleanupRaw.close()).rejects.toHaveProperty("_tag", "EventDeliveryStopFailed");
     cleanupRedis.disconnect();
 
     const consumerRedis = new Redis(TEST_REDIS_URL, { lazyConnect: true });
-    const consumerDuplicate = consumerRedis.duplicate();
+    const consumerSubscriberRedis = consumerRedis.duplicate();
+    const consumerManagedRedis = consumerRedis.duplicate();
     const consumerRead = Promise.withResolvers<unknown>();
     const consumerReadStarted = Promise.withResolvers<void>();
+    let consumerDuplicateCalls = 0;
     let consumerDisconnected = false;
-    Reflect.set(consumerRedis, "duplicate", () => consumerDuplicate);
-    Reflect.set(consumerDuplicate, "xgroup", async () => "OK");
-    Reflect.set(consumerDuplicate, "xreadgroup", async () => {
+    Reflect.set(consumerRedis, "duplicate", () => {
+      consumerDuplicateCalls += 1;
+      return consumerDuplicateCalls === 1 ? consumerSubscriberRedis : consumerManagedRedis;
+    });
+    Reflect.set(consumerSubscriberRedis, "xgroup", async () => "OK");
+    Reflect.set(consumerManagedRedis, "eval", async () => ["none"]);
+    Reflect.set(consumerSubscriberRedis, "xreadgroup", async () => {
       consumerReadStarted.resolve();
       return await consumerRead.promise;
     });
-    Reflect.set(consumerDuplicate, "disconnect", () => {
+    Reflect.set(consumerSubscriberRedis, "disconnect", () => {
       if (consumerDisconnected) return;
       consumerDisconnected = true;
       consumerRead.reject(new Error("Connection is closed."));
@@ -595,7 +671,6 @@ describe("RedisStreamsBus", () => {
         {
           mode: "work",
           subscriptionId: "malformed-delconsumer",
-          offset: { type: "begin" },
           batch: { maxWaitMs: 5_000 },
         },
         async () => ({ disposition: "commit" }),
@@ -607,8 +682,701 @@ describe("RedisStreamsBus", () => {
     if (consumerStopped.status === "error") {
       expect(consumerStopped.error._tag).toBe("EventDeliveryStopFailed");
     }
-    await consumerRaw.close();
+    await expect(consumerRaw.close()).rejects.toHaveProperty("_tag", "EventDeliveryStopFailed");
     consumerRedis.disconnect();
+  });
+
+  it("stop disconnects an unresolved managed operation without hanging", async () => {
+    const redis = new Redis(TEST_REDIS_URL, { lazyConnect: true });
+    const subscriberRedis = redis.duplicate();
+    const managedRedis = redis.duplicate();
+    const operation = Promise.withResolvers<unknown>();
+    const operationStarted = Promise.withResolvers<void>();
+    const rejection = new Error("Connection is closed.");
+    let duplicateCalls = 0;
+    let managedDisconnectCalls = 0;
+    Reflect.set(redis, "duplicate", () => {
+      duplicateCalls += 1;
+      return duplicateCalls === 1 ? subscriberRedis : managedRedis;
+    });
+    Reflect.set(subscriberRedis, "xgroup", async () => "OK");
+    Reflect.set(managedRedis, "eval", async () => {
+      operationStarted.resolve();
+      return await operation.promise;
+    });
+    Reflect.set(managedRedis, "disconnect", () => {
+      managedDisconnectCalls += 1;
+      if (managedDisconnectCalls === 1) operation.reject(rejection);
+    });
+    Reflect.set(redis, "xpending", async () => []);
+    Reflect.set(redis, "xgroup", async () => 0);
+    const raw = createRedisStreamsBus({ redis, subscriberPool: { max: 1 } });
+    const subscription = requireOk(
+      await raw.subscribe(
+        "topic",
+        {
+          mode: "work",
+          subscriptionId: "unresolved-managed-operation",
+          consumerId: "consumer",
+          batch: { maxWaitMs: 50 },
+        },
+        async () => ({ disposition: "commit" }),
+      ),
+    );
+    await operationStarted.promise;
+
+    const stopping = subscription.stop();
+    const done = await subscription.done;
+    expect(done.status).toBe("error");
+    if (done.status === "error" && done.error._tag === "EventDeliveryTransportFailed") {
+      expect(done.error.cause).toBe(rejection);
+    }
+    requireOk(await stopping);
+    expect(managedDisconnectCalls).toBe(2);
+    await raw.close();
+    redis.disconnect();
+  });
+
+  it("awaits an in-flight heartbeat failure before committing handler success", async () => {
+    const redis = new Redis(TEST_REDIS_URL);
+    const keyPrefix = `test:lilac-event-bus:${randomId("heartbeat-close-race")}`;
+    const streamKey = `${keyPrefix}:topic`;
+    const duplicate = redis.duplicate.bind(redis);
+    const heartbeat = Promise.withResolvers<unknown>();
+    const heartbeatStarted = Promise.withResolvers<void>();
+    const handlerAction = Promise.withResolvers<{ disposition: "commit" }>();
+    const handlerReturning = Promise.withResolvers<void>();
+    const laterReadFailure = new Error("read after an incorrect commit");
+    const heartbeatFailure = new Error("forced in-flight heartbeat failure");
+    let duplicateCalls = 0;
+    let commitCalls = 0;
+    let subscription:
+      | {
+          readonly done: Promise<ResultType<void, unknown>>;
+          stop(): Promise<ResultType<void, EventDeliveryStopFailed>>;
+        }
+      | undefined;
+
+    Reflect.set(redis, "duplicate", () => {
+      const client = duplicate();
+      duplicateCalls += 1;
+      if (duplicateCalls === 1) {
+        const xreadgroup = client.xreadgroup.bind(client);
+        let reads = 0;
+        Reflect.set(client, "xreadgroup", async (...args: Parameters<Redis["xreadgroup"]>) => {
+          reads += 1;
+          if (reads > 1) throw laterReadFailure;
+          return await xreadgroup(...args);
+        });
+      } else {
+        const evaluate = client.eval.bind(client);
+        Reflect.set(client, "eval", async (script: string, ...args: unknown[]) => {
+          if (script === HEARTBEAT_SCRIPT) {
+            heartbeatStarted.resolve();
+            return await heartbeat.promise;
+          }
+          if (script === COMMIT_SCRIPT) commitCalls += 1;
+          return await Reflect.apply(evaluate, client, [script, ...args]);
+        });
+      }
+      return client;
+    });
+
+    const heartbeatTimers = controlManagedHeartbeatTimers();
+    const raw = createRedisStreamsBus({ redis, keyPrefix, subscriberPool: { max: 1 } });
+
+    try {
+      subscription = requireOk(
+        await raw.subscribe(
+          "topic",
+          {
+            mode: "work",
+            subscriptionId: "heartbeat-close-race",
+            consumerId: "consumer",
+            batch: { maxWaitMs: 50 },
+          },
+          async () => {
+            const action = await handlerAction.promise;
+            handlerReturning.resolve();
+            return action;
+          },
+        ),
+      );
+      await raw.publish(
+        { topic: "topic", type: "test", data: null },
+        { topic: "topic", type: "test" },
+      );
+      const heartbeatTimer = await heartbeatTimers.next();
+      heartbeatTimer();
+      await heartbeatStarted.promise;
+      handlerAction.resolve({ disposition: "commit" });
+      await handlerReturning.promise;
+      heartbeat.reject(heartbeatFailure);
+
+      const done = await subscription.done;
+      expect(done.status).toBe("error");
+      if (done.status === "error") {
+        expect(done.error).toMatchObject({
+          _tag: "EventDeliveryTransportFailed",
+          cause: heartbeatFailure,
+          operation: "read",
+          message: "Redis delivery heartbeat failed",
+        });
+      }
+      expect(commitCalls).toBe(0);
+    } finally {
+      heartbeatTimers.restore();
+      if (subscription) await subscription.stop().catch(() => undefined);
+      await raw.close();
+      await redis.del(streamKey);
+      await redis.quit();
+    }
+  });
+
+  it("keeps a live managed handler owned through multiple heartbeats and commits", async () => {
+    const redis = new Redis(TEST_REDIS_URL);
+    const keyPrefix = `test:lilac-event-bus:${randomId("heartbeat-live-handler")}`;
+    const streamKey = `${keyPrefix}:topic`;
+    const subscriptionId = "heartbeat-live-handler";
+    const physicalGroup = managedRedisPhysicalGroup("work", subscriptionId);
+    const duplicate = redis.duplicate.bind(redis);
+    const handlerStarted = Promise.withResolvers<AbortSignal>();
+    const handlerAction = Promise.withResolvers<{ disposition: "commit" }>();
+    const commitCompleted = Promise.withResolvers<void>();
+    let duplicateCalls = 0;
+    let heartbeatCalls = 0;
+    let commitCalls = 0;
+
+    Reflect.set(redis, "duplicate", () => {
+      const client = duplicate();
+      duplicateCalls += 1;
+      if (duplicateCalls === 2) {
+        const evaluate = client.eval.bind(client);
+        Reflect.set(client, "eval", async (script: string, ...args: unknown[]) => {
+          if (script === HEARTBEAT_SCRIPT) heartbeatCalls += 1;
+          if (script === COMMIT_SCRIPT) commitCalls += 1;
+          const response = await Reflect.apply(evaluate, client, [script, ...args]);
+          if (script === COMMIT_SCRIPT) commitCompleted.resolve();
+          return response;
+        });
+      }
+      return client;
+    });
+
+    const heartbeatTimers = controlManagedHeartbeatTimers();
+    const raw = createRedisStreamsBus({ redis, keyPrefix, subscriberPool: { max: 1 } });
+    let subscription: { stop(): Promise<ResultType<void, EventDeliveryStopFailed>> } | undefined;
+    try {
+      subscription = requireOk(
+        await raw.subscribe(
+          "topic",
+          {
+            mode: "work",
+            subscriptionId,
+            consumerId: "consumer",
+            batch: { maxWaitMs: 50 },
+          },
+          async (_message, context) => {
+            if (context.mode === "tail") throw new Error("Expected a managed delivery context");
+            handlerStarted.resolve(context.signal);
+            return await handlerAction.promise;
+          },
+        ),
+      );
+      await raw.publish(
+        { topic: "topic", type: "test", data: null },
+        { topic: "topic", type: "test" },
+      );
+      const signal = await handlerStarted.promise;
+
+      const firstHeartbeat = await heartbeatTimers.next();
+      firstHeartbeat();
+      const secondHeartbeat = await heartbeatTimers.next();
+      expect(heartbeatCalls).toBe(1);
+      expect(signal.aborted).toBe(false);
+
+      secondHeartbeat();
+      await heartbeatTimers.next();
+      expect(heartbeatCalls).toBe(2);
+      expect(signal.aborted).toBe(false);
+
+      handlerAction.resolve({ disposition: "commit" });
+      await commitCompleted.promise;
+      expect(commitCalls).toBe(1);
+      expect(signal.aborted).toBe(false);
+      expect(await pendingCount(redis, streamKey, physicalGroup)).toBe(0);
+    } finally {
+      heartbeatTimers.restore();
+      if (subscription) await subscription.stop().catch(() => undefined);
+      await raw.close().catch(() => undefined);
+      await redis.del(streamKey);
+      await redis.quit();
+    }
+  });
+
+  it("aborts an active managed handler and preserves its pending entry after a stale heartbeat", async () => {
+    const redis = new Redis(TEST_REDIS_URL);
+    const keyPrefix = `test:lilac-event-bus:${randomId("heartbeat-stale-handler")}`;
+    const streamKey = `${keyPrefix}:topic`;
+    const subscriptionId = "heartbeat-stale-handler";
+    const physicalGroup = managedRedisPhysicalGroup("work", subscriptionId);
+    const duplicate = redis.duplicate.bind(redis);
+    const handlerStarted = Promise.withResolvers<AbortSignal>();
+    const handlerAborted = Promise.withResolvers<void>();
+    const handlerReleased = Promise.withResolvers<void>();
+    const handlerReturned = Promise.withResolvers<void>();
+    const nextReadStarted = Promise.withResolvers<void>();
+    let duplicateCalls = 0;
+    let heartbeatCalls = 0;
+    let commitCalls = 0;
+
+    Reflect.set(redis, "duplicate", () => {
+      const client = duplicate();
+      duplicateCalls += 1;
+      if (duplicateCalls === 1) {
+        const xreadgroup = client.xreadgroup.bind(client);
+        let reads = 0;
+        Reflect.set(client, "xreadgroup", async (...args: Parameters<Redis["xreadgroup"]>) => {
+          reads += 1;
+          if (reads > 1) nextReadStarted.resolve();
+          return await xreadgroup(...args);
+        });
+      } else {
+        const evaluate = client.eval.bind(client);
+        Reflect.set(client, "eval", async (script: string, ...args: unknown[]) => {
+          if (script === HEARTBEAT_SCRIPT) {
+            heartbeatCalls += 1;
+            return ["stale"];
+          }
+          if (script === COMMIT_SCRIPT) commitCalls += 1;
+          return await Reflect.apply(evaluate, client, [script, ...args]);
+        });
+      }
+      return client;
+    });
+
+    const heartbeatTimers = controlManagedHeartbeatTimers();
+    const raw = createRedisStreamsBus({ redis, keyPrefix, subscriberPool: { max: 1 } });
+    let subscription: { stop(): Promise<ResultType<void, EventDeliveryStopFailed>> } | undefined;
+    try {
+      subscription = requireOk(
+        await raw.subscribe(
+          "topic",
+          {
+            mode: "work",
+            subscriptionId,
+            consumerId: "consumer",
+            batch: { maxWaitMs: 50 },
+          },
+          async (_message, context) => {
+            if (context.mode === "tail") throw new Error("Expected a managed delivery context");
+            handlerStarted.resolve(context.signal);
+            context.signal.addEventListener(
+              "abort",
+              () => {
+                handlerAborted.resolve();
+                handlerReleased.resolve();
+              },
+              { once: true },
+            );
+            await handlerReleased.promise;
+            handlerReturned.resolve();
+            return { disposition: "commit" };
+          },
+        ),
+      );
+      await raw.publish(
+        { topic: "topic", type: "test", data: null },
+        { topic: "topic", type: "test" },
+      );
+      const signal = await handlerStarted.promise;
+
+      const heartbeat = await heartbeatTimers.next();
+      heartbeat();
+      await handlerAborted.promise;
+      await handlerReturned.promise;
+      await nextReadStarted.promise;
+
+      expect(heartbeatCalls).toBe(1);
+      expect(signal.aborted).toBe(true);
+      expect(commitCalls).toBe(0);
+      expect(await pendingCount(redis, streamKey, physicalGroup)).toBe(1);
+    } finally {
+      handlerReleased.resolve();
+      heartbeatTimers.restore();
+      if (subscription) await subscription.stop().catch(() => undefined);
+      await raw.close().catch(() => undefined);
+      await redis.del(streamKey);
+      await redis.quit();
+    }
+  });
+
+  it("close aborts an active durable handler and settles every dedicated client", async () => {
+    const redis = new Redis(TEST_REDIS_URL);
+    const keyPrefix = `test:lilac-event-bus:${randomId("close-active-durable")}`;
+    const streamKey = `${keyPrefix}:topic`;
+    const duplicates: Redis[] = [];
+    const duplicate = redis.duplicate.bind(redis);
+    Reflect.set(redis, "duplicate", () => {
+      const client = duplicate();
+      duplicates.push(client);
+      return client;
+    });
+    const raw = createRedisStreamsBus({ redis, keyPrefix, subscriberPool: { max: 1 } });
+    const handlerStarted = Promise.withResolvers<AbortSignal>();
+    const handlerAborted = Promise.withResolvers<void>();
+    const handlerReleased = Promise.withResolvers<void>();
+    try {
+      const subscription = requireOk(
+        await raw.subscribe(
+          "topic",
+          {
+            mode: "work",
+            subscriptionId: "close-active-durable",
+            consumerId: "consumer",
+            batch: { maxWaitMs: 5_000 },
+          },
+          async (_message, context) => {
+            if (context.mode === "tail") throw new Error("Expected a managed delivery context");
+            handlerStarted.resolve(context.signal);
+            context.signal.addEventListener(
+              "abort",
+              () => {
+                handlerAborted.resolve();
+                handlerReleased.resolve();
+              },
+              { once: true },
+            );
+            await handlerReleased.promise;
+            return { disposition: "commit" };
+          },
+        ),
+      );
+      await raw.publish(
+        { topic: "topic", type: "test", data: null },
+        { topic: "topic", type: "test" },
+      );
+      const signal = await handlerStarted.promise;
+      const subscriberRedis = duplicates[0];
+      const managedRedis = duplicates[1];
+      if (!subscriberRedis || !managedRedis) {
+        throw new Error("Durable subscription did not create both dedicated Redis clients");
+      }
+      const subscriberEnded = Promise.withResolvers<void>();
+      const managedEnded = Promise.withResolvers<void>();
+      let subscriberReconnects = 0;
+      let managedReconnects = 0;
+      subscriberRedis.once("end", () => subscriberEnded.resolve());
+      managedRedis.once("end", () => managedEnded.resolve());
+      subscriberRedis.on("reconnecting", () => {
+        subscriberReconnects += 1;
+      });
+      managedRedis.on("reconnecting", () => {
+        managedReconnects += 1;
+      });
+
+      const closing = raw.close();
+      await handlerAborted.promise;
+      const [done] = await Promise.all([
+        subscription.done,
+        closing,
+        subscriberEnded.promise,
+        managedEnded.promise,
+      ]);
+
+      expect(signal.aborted).toBe(true);
+      requireOk(done);
+      expect(subscriberRedis.status).toBe("end");
+      expect(managedRedis.status).toBe("end");
+      expect(subscriberReconnects).toBe(0);
+      expect(managedReconnects).toBe(0);
+      expect(Reflect.get(subscriberRedis, "reconnectTimeout")).toBeNull();
+      expect(Reflect.get(managedRedis, "reconnectTimeout")).toBeNull();
+      expect(subscriberPoolStats(raw)).toEqual({ max: 1, created: 0, available: 0, inUse: 0 });
+      expect(Reflect.get(raw, "activeSubscriptionStops").size).toBe(0);
+      expect(Reflect.get(raw, "trimTimers").size).toBe(0);
+      expect(Reflect.get(raw, "activeTrims").size).toBe(0);
+      requireOk(await subscription.stop());
+    } finally {
+      await raw.close().catch(() => undefined);
+      await redis.del(streamKey);
+      await redis.quit();
+    }
+  });
+
+  it("retries ephemeral managed state cleanup without destroying the group twice", async () => {
+    const redis = new Redis(TEST_REDIS_URL);
+    const keyPrefix = `test:lilac-event-bus:${randomId("ephemeral-cleanup-retry")}`;
+    const streamKey = `${keyPrefix}:topic`;
+    const subscriptionId = "ephemeral-cleanup-retry";
+    const consumerId = "consumer";
+    const raw = createRedisStreamsBus({ redis, keyPrefix });
+    let physicalGroup = "";
+    let metadataPattern = "";
+    let statePattern = "";
+    const parked = Promise.withResolvers<void>();
+    const cleanupFailure = new Error("forced managed state cleanup failure");
+    const originalScan = Reflect.get(redis, "scan");
+    const originalXgroup = Reflect.get(redis, "xgroup");
+    if (typeof originalScan !== "function" || typeof originalXgroup !== "function") {
+      throw new Error("Redis cleanup commands are unavailable");
+    }
+    let cleanupAttempts = 0;
+    let destroyCalls = 0;
+    Reflect.set(redis, "scan", async (...args: unknown[]) => {
+      if (args[0] === "0" && args[1] === "MATCH" && args[2] === statePattern) {
+        cleanupAttempts += 1;
+        if (cleanupAttempts === 1) throw cleanupFailure;
+      }
+      return await Reflect.apply(originalScan, redis, args);
+    });
+    Reflect.set(redis, "xgroup", (...args: unknown[]) => {
+      if (args[0] === "DESTROY" && args[1] === streamKey && args[2] === physicalGroup) {
+        destroyCalls += 1;
+      }
+      return Reflect.apply(originalXgroup, redis, args);
+    });
+    let subscription: { stop(): Promise<ResultType<void, EventDeliveryStopFailed>> } | undefined;
+    try {
+      subscription = requireOk(
+        await raw.subscribe(
+          "topic",
+          {
+            mode: "work",
+            subscriptionId,
+            consumerId,
+            ephemeral: true,
+            batch: { maxWaitMs: 50 },
+          },
+          async () => {
+            parked.resolve();
+            return { disposition: "park-pending" };
+          },
+        ),
+      );
+      const groups = ephemeralGroupNames(await redis.xinfo("GROUPS", streamKey));
+      expect(groups).toHaveLength(1);
+      physicalGroup = groups[0]!;
+      metadataPattern = `lilac:event-bus:managed-delivery:v2:${managedRedisGroupId(streamKey, physicalGroup)}*`;
+      statePattern = metadataPattern.replace(/\*$/, ":message:*");
+      await raw.publish(
+        { topic: "topic", type: "test", data: null },
+        { topic: "topic", type: "test" },
+      );
+      await parked.promise;
+      expect(
+        await eventually(
+          () => redis.keys(metadataPattern),
+          (keys) => keys.length > 0,
+        ),
+      ).not.toEqual([]);
+
+      const firstStop = await subscription.stop();
+      expect(firstStop.status).toBe("error");
+      if (firstStop.status === "error") {
+        expect(firstStop.error._tag).toBe("EventDeliveryStopFailed");
+        expect(firstStop.error.cause).toBe(cleanupFailure);
+      }
+      expect(consumerGroupNames(await redis.xinfo("GROUPS", streamKey))).not.toContain(
+        physicalGroup,
+      );
+      expect(await redis.keys(metadataPattern)).not.toEqual([]);
+
+      requireOk(await subscription.stop());
+      expect(cleanupAttempts).toBe(2);
+      expect(destroyCalls).toBe(1);
+      expect(await redis.keys(metadataPattern)).toEqual([]);
+    } finally {
+      Reflect.set(redis, "scan", originalScan);
+      Reflect.set(redis, "xgroup", originalXgroup);
+      if (subscription) await subscription.stop().catch(() => undefined);
+      await raw.close().catch(() => undefined);
+      await redis.del(streamKey);
+      await redis.quit();
+    }
+  });
+
+  it("single-flights concurrent stop and close during ephemeral cleanup", async () => {
+    const redis = new Redis(TEST_REDIS_URL);
+    const keyPrefix = `test:lilac-event-bus:${randomId("ephemeral-stop-close")}`;
+    const streamKey = `${keyPrefix}:topic`;
+    const raw = createRedisStreamsBus({ redis, keyPrefix });
+    const originalXgroup = Reflect.get(redis, "xgroup");
+    if (typeof originalXgroup !== "function") throw new Error("Redis XGROUP is unavailable");
+    const destroyStarted = Promise.withResolvers<void>();
+    const releaseDestroy = Promise.withResolvers<void>();
+    let destroyCalls = 0;
+    let subscription: { stop(): Promise<ResultType<void, EventDeliveryStopFailed>> } | undefined;
+    try {
+      subscription = requireOk(
+        await raw.subscribe(
+          "topic",
+          {
+            mode: "work",
+            subscriptionId: "ephemeral-stop-close",
+            consumerId: "consumer",
+            ephemeral: true,
+            batch: { maxWaitMs: 50 },
+          },
+          async () => ({ disposition: "commit" }),
+        ),
+      );
+      const groups = ephemeralGroupNames(await redis.xinfo("GROUPS", streamKey));
+      expect(groups).toHaveLength(1);
+      const physicalGroup = groups[0]!;
+      Reflect.set(redis, "xgroup", async (...args: unknown[]) => {
+        if (args[0] === "DESTROY" && args[1] === streamKey && args[2] === physicalGroup) {
+          destroyCalls += 1;
+          destroyStarted.resolve();
+          await releaseDestroy.promise;
+        }
+        return await Reflect.apply(originalXgroup, redis, args);
+      });
+
+      const stopping = subscription.stop();
+      await destroyStarted.promise;
+      const closing = raw.close();
+      releaseDestroy.resolve();
+
+      requireOk(await stopping);
+      await closing;
+      expect(destroyCalls).toBe(1);
+      expect(consumerGroupNames(await redis.xinfo("GROUPS", streamKey))).not.toContain(
+        physicalGroup,
+      );
+    } finally {
+      releaseDestroy.resolve();
+      Reflect.set(redis, "xgroup", originalXgroup);
+      if (subscription) await subscription.stop().catch(() => undefined);
+      await raw.close().catch(() => undefined);
+      await redis.del(streamKey);
+      await redis.quit();
+    }
+  });
+
+  it("isolates a same-bus replacement ephemeral incarnation from stale cleanup", async () => {
+    const redis = new Redis(TEST_REDIS_URL);
+    const keyPrefix = `test:lilac-event-bus:${randomId("ephemeral-replacement")}`;
+    const streamKey = `${keyPrefix}:topic`;
+    const subscriptionId = "ephemeral-replacement";
+    const consumerId = "consumer";
+    const raw = createRedisStreamsBus({ redis, keyPrefix });
+    let firstStatePattern = "";
+    const firstParked = Promise.withResolvers<string>();
+    const cleanupFailure = new Error("forced first incarnation cleanup failure");
+    const originalScan = Reflect.get(redis, "scan");
+    if (typeof originalScan !== "function") throw new Error("Redis SCAN is unavailable");
+    let failedFirstCleanup = false;
+    Reflect.set(redis, "scan", async (...args: unknown[]) => {
+      if (
+        args[0] === "0" &&
+        args[1] === "MATCH" &&
+        args[2] === firstStatePattern &&
+        !failedFirstCleanup
+      ) {
+        failedFirstCleanup = true;
+        throw cleanupFailure;
+      }
+      return await Reflect.apply(originalScan, redis, args);
+    });
+    let firstSubscription:
+      | { stop(): Promise<ResultType<void, EventDeliveryStopFailed>> }
+      | undefined;
+    let secondSubscription: typeof firstSubscription;
+    try {
+      firstSubscription = requireOk(
+        await raw.subscribe(
+          "topic",
+          {
+            mode: "work",
+            subscriptionId,
+            consumerId,
+            ephemeral: true,
+            batch: { maxWaitMs: 50 },
+          },
+          async (_message, context) => {
+            if (context.mode === "tail") throw new Error("Expected a managed delivery context");
+            firstParked.resolve(context.deliveryId);
+            return { disposition: "park-pending" };
+          },
+        ),
+      );
+      const firstGroups = ephemeralGroupNames(await redis.xinfo("GROUPS", streamKey));
+      expect(firstGroups).toHaveLength(1);
+      const firstGroup = firstGroups[0]!;
+      const firstMetadataPattern = `lilac:event-bus:managed-delivery:v2:${managedRedisGroupId(streamKey, firstGroup)}*`;
+      firstStatePattern = firstMetadataPattern.replace(/\*$/, ":message:*");
+      const firstPublished = await raw.publish(
+        { topic: "topic", type: "test.first", data: null },
+        { topic: "topic", type: "test.first" },
+      );
+      const firstDeliveryId = await firstParked.promise;
+      await eventually(
+        () => redis.keys(firstMetadataPattern),
+        (keys) => keys.length > 0,
+      );
+      const firstStop = await firstSubscription.stop();
+      expect(firstStop.status).toBe("error");
+      expect(consumerGroupNames(await redis.xinfo("GROUPS", streamKey))).not.toContain(firstGroup);
+      expect(await redis.keys(firstMetadataPattern)).not.toEqual([]);
+
+      const secondDelivered = Promise.withResolvers<{ cursor: string; deliveryId: string }>();
+      secondSubscription = requireOk(
+        await raw.subscribe(
+          "topic",
+          {
+            mode: "work",
+            subscriptionId,
+            consumerId,
+            ephemeral: true,
+            batch: { maxWaitMs: 50 },
+          },
+          async (_message, context) => {
+            if (context.mode === "tail") throw new Error("Expected a managed delivery context");
+            secondDelivered.resolve({ cursor: context.cursor, deliveryId: context.deliveryId });
+            return { disposition: "park-pending" };
+          },
+        ),
+      );
+      const secondGroups = ephemeralGroupNames(await redis.xinfo("GROUPS", streamKey));
+      expect(secondGroups).toHaveLength(1);
+      const secondGroup = secondGroups[0]!;
+      expect(secondGroup).not.toBe(firstGroup);
+      const secondMetadataPattern = `lilac:event-bus:managed-delivery:v2:${managedRedisGroupId(streamKey, secondGroup)}*`;
+      const secondPublished = await raw.publish(
+        { topic: "topic", type: "test.second", data: null },
+        { topic: "topic", type: "test.second" },
+      );
+      const replacement = await secondDelivered.promise;
+      expect(replacement).toEqual({
+        cursor: secondPublished.cursor,
+        deliveryId: managedRedisDeliveryId(streamKey, secondGroup, secondPublished.id),
+      });
+      expect(replacement.deliveryId).not.toBe(firstDeliveryId);
+      expect(firstDeliveryId).toBe(
+        managedRedisDeliveryId(streamKey, firstGroup, firstPublished.id),
+      );
+      expect(await redis.keys(firstMetadataPattern)).not.toEqual([]);
+      const replacementMetadata = await eventually(
+        () => redis.keys(secondMetadataPattern),
+        (keys) => keys.length > 0,
+      );
+
+      requireOk(await firstSubscription.stop());
+      expect(await redis.keys(firstMetadataPattern)).toEqual([]);
+      expect((await redis.keys(secondMetadataPattern)).toSorted()).toEqual(
+        replacementMetadata.toSorted(),
+      );
+      requireOk(await secondSubscription.stop());
+      expect(await redis.keys(secondMetadataPattern)).toEqual([]);
+    } finally {
+      Reflect.set(redis, "scan", originalScan);
+      if (firstSubscription) await firstSubscription.stop().catch(() => undefined);
+      if (secondSubscription) await secondSubscription.stop().catch(() => undefined);
+      await raw.close().catch(() => undefined);
+      await redis.del(streamKey);
+      await redis.quit();
+    }
   });
 
   it("returns bounded evidence for malformed SuperJSON data", async () => {
@@ -820,6 +1588,7 @@ describe("RedisStreamsBus", () => {
 
   it("does not block publish while a tail subscription is blocked", async () => {
     const redis = new Redis(TEST_REDIS_URL);
+    const readStarted = observeSubscriberRead(redis);
     const keyPrefix = `test:lilac-event-bus:${randomId("hol")}`;
     const raw = createRedisStreamsBus({
       redis,
@@ -839,8 +1608,7 @@ describe("RedisStreamsBus", () => {
       ),
     );
 
-    // test-wait-justification: the pooled subscriber exposes no client ID or readiness hook, so Redis cannot safely identify when this test's XREAD has entered BLOCK.
-    await new Promise((r) => setTimeout(r, 50));
+    await readStarted;
 
     const startedAt = Date.now();
     await raw.publish(
@@ -858,6 +1626,7 @@ describe("RedisStreamsBus", () => {
 
   it("stop() interrupts a blocking XREAD promptly", async () => {
     const redis = new Redis(TEST_REDIS_URL);
+    const readStarted = observeSubscriberRead(redis);
     const keyPrefix = `test:lilac-event-bus:${randomId("stop")}`;
     const raw = createRedisStreamsBus({
       redis,
@@ -876,8 +1645,7 @@ describe("RedisStreamsBus", () => {
       ),
     );
 
-    // test-wait-justification: the pooled subscriber exposes no client ID or readiness hook, so Redis cannot safely identify when this test's XREAD has entered BLOCK before stop() is timed.
-    await new Promise((r) => setTimeout(r, 50));
+    await readStarted;
 
     const startedAt = Date.now();
     requireOk(await sub.stop());
@@ -1002,7 +1770,6 @@ describe("RedisStreamsBus", () => {
           mode: "fanout",
           subscriptionId: "group-a",
           consumerId: "consumer-a",
-          offset: { type: "now" },
           batch: { maxWaitMs: 50 },
         },
         async () => {
@@ -1019,7 +1786,6 @@ describe("RedisStreamsBus", () => {
           mode: "fanout",
           subscriptionId: "group-b",
           consumerId: "consumer-b",
-          offset: { type: "now" },
           batch: { maxWaitMs: 50 },
         },
         async () => {
@@ -1043,6 +1809,10 @@ describe("RedisStreamsBus", () => {
 
     firstBAction.resolve({ disposition: "commit" });
     await secondBReady.promise;
+    await eventually(
+      () => pendingCount(redis, streamKey, managedRedisPhysicalGroup("fanout", "group-b")),
+      (count) => count === 0,
+    );
     await raw.flushPendingTrims();
     expect(await redis.xlen(streamKey)).toBe(1);
 
@@ -1067,7 +1837,6 @@ describe("RedisStreamsBus", () => {
           mode: "fanout",
           subscriptionId: "durable-group",
           consumerId: "consumer",
-          offset: { type: "now" },
           batch: { maxWaitMs: 50 },
         },
         async () => {
@@ -1140,12 +1909,80 @@ describe("RedisStreamsBus", () => {
       expect(await redis.xrange(streamKey, cursors[49]!, cursors[49]!)).toHaveLength(1);
       expect(await redis.xrange(streamKey, cursors[39]!, cursors[39]!)).toHaveLength(0);
 
-      await redis.xgroup("CREATE", streamKey, "durable-adapter-reader", cursors[79]!);
+      await redis.xgroup(
+        "CREATE",
+        streamKey,
+        managedRedisPhysicalGroup("fanout", "durable-adapter-reader"),
+        cursors[79]!,
+      );
       await raw.trimBeforeCheckpoint("evt.adapter", cursors.at(-1)!, 10);
       expect(await redis.xrange(streamKey, cursors[79]!, cursors[79]!)).toHaveLength(1);
       expect(await redis.xrange(streamKey, cursors[69]!, cursors[69]!)).toHaveLength(0);
       expect(await redis.xrange(streamKey, cursors[100]!, cursors[100]!)).toHaveLength(1);
     } finally {
+      await redis.del(streamKey);
+      await raw.close();
+      await redis.quit();
+    }
+  });
+
+  it("preserves a parked ephemeral source until its group is destroyed", async () => {
+    const redis = new Redis(TEST_REDIS_URL);
+    const keyPrefix = `test:lilac-event-bus:${randomId("ephemeral-checkpoint-trim")}`;
+    const streamKey = `${keyPrefix}:evt.adapter`;
+    const raw = createRedisStreamsBus({ redis, keyPrefix });
+    const subscriptionId = "ephemeral-checkpoint-reader";
+    const consumerId = "ephemeral-checkpoint-consumer";
+    const parked = Promise.withResolvers<void>();
+    const subscription = requireOk(
+      await raw.subscribe(
+        "evt.adapter",
+        {
+          mode: "fanout",
+          subscriptionId,
+          consumerId,
+          ephemeral: true,
+          batch: { maxWaitMs: 50 },
+        },
+        async () => {
+          parked.resolve();
+          return { disposition: "park-pending" };
+        },
+      ),
+    );
+    const groups = ephemeralGroupNames(await redis.xinfo("GROUPS", streamKey));
+    expect(groups).toHaveLength(1);
+    const physicalGroup = groups[0]!;
+    try {
+      const sourceBody = `ephemeral-source-${randomId("body")}`;
+      const source = await raw.publish(
+        { topic: "evt.adapter", type: "test", data: { body: sourceBody } },
+        { topic: "evt.adapter", type: "test" },
+      );
+      await parked.promise;
+      await eventually(
+        () => pendingCount(redis, streamKey, physicalGroup),
+        (count) => count === 1,
+      );
+      await raw.publish(
+        { topic: "evt.adapter", type: "test", data: { body: "later-1" } },
+        { topic: "evt.adapter", type: "test" },
+      );
+      const checkpoint = await raw.publish(
+        { topic: "evt.adapter", type: "test", data: { body: "later-2" } },
+        { topic: "evt.adapter", type: "test" },
+      );
+
+      await raw.trimBeforeCheckpoint("evt.adapter", checkpoint.cursor, 1);
+      const retained = await redis.xrange(streamKey, source.id, source.id);
+      expect(retained).toHaveLength(1);
+      expect(retained[0]?.[1]).toContain(SuperJSON.stringify({ body: sourceBody }));
+
+      requireOk(await subscription.stop());
+      await raw.trimBeforeCheckpoint("evt.adapter", checkpoint.cursor, 1);
+      expect(await redis.xrange(streamKey, source.id, source.id)).toEqual([]);
+    } finally {
+      await subscription.stop().catch(() => undefined);
       await redis.del(streamKey);
       await raw.close();
       await redis.quit();
@@ -1216,47 +2053,27 @@ describe("RedisStreamsBus", () => {
     }
   });
 
-  it("preserves lagged evt.adapter entries when other groups acknowledge later entries", async () => {
+  it("does not trim topic history while publishing", async () => {
     const redis = new Redis(TEST_REDIS_URL);
-    const keyPrefix = `test:lilac-event-bus:${randomId("adapter-recovery")}`;
+    const keyPrefix = `test:lilac-event-bus:${randomId("publish-without-trim")}`;
     const streamKey = `${keyPrefix}:evt.adapter`;
     const raw = createRedisStreamsBus({ redis, keyPrefix });
-    let deliveries = 0;
-    const commitsReady = Promise.withResolvers<void>();
-    const sub = requireOk(
-      await raw.subscribe(
-        "evt.adapter",
-        {
-          mode: "fanout",
-          subscriptionId: "other-adapter-group",
-          consumerId: "other-consumer",
-          offset: { type: "now" },
-          batch: { maxWaitMs: 50 },
-        },
-        async () => {
-          deliveries += 1;
-          if (deliveries === 2) commitsReady.resolve();
-          return { disposition: "commit" };
-        },
-      ),
-    );
-
-    await raw.publish(
-      { topic: "evt.adapter", type: "test.reply", data: 1 },
-      { topic: "evt.adapter", type: "test.reply", retention: { maxLenApprox: 1 } },
-    );
-    await raw.publish(
-      { topic: "evt.adapter", type: "test.barrier", data: 2 },
-      { topic: "evt.adapter", type: "test.barrier", retention: { maxLenApprox: 1 } },
-    );
-    await commitsReady.promise;
-    await raw.flushPendingTrims();
-    expect(await redis.xlen(streamKey)).toBe(2);
-
-    requireOk(await sub.stop());
-    await redis.del(streamKey);
-    await raw.close();
-    await redis.quit();
+    try {
+      const first = await raw.publish(
+        { topic: "evt.adapter", type: "test.reply", data: 1 },
+        { topic: "evt.adapter", type: "test.reply" },
+      );
+      await raw.publish(
+        { topic: "evt.adapter", type: "test.barrier", data: 2 },
+        { topic: "evt.adapter", type: "test.barrier" },
+      );
+      expect(await redis.xlen(streamKey)).toBe(2);
+      expect(await redis.xrange(streamKey, first.cursor, first.cursor)).toHaveLength(1);
+    } finally {
+      await redis.del(streamKey);
+      await raw.close();
+      await redis.quit();
+    }
   });
 
   it("destroys ephemeral consumer groups on stop", async () => {
@@ -1272,22 +2089,24 @@ describe("RedisStreamsBus", () => {
           subscriptionId: "temporary-group",
           consumerId: "temporary-consumer",
           ephemeral: true,
-          offset: { type: "now" },
           batch: { maxWaitMs: 50 },
         },
         async () => ({ disposition: "commit" }),
       ),
     );
 
+    const groups = ephemeralGroupNames(await redis.xinfo("GROUPS", streamKey));
+    expect(groups).toHaveLength(1);
+    const physicalGroup = groups[0]!;
     requireOk(await sub.stop());
-    expect(await redis.xinfo("GROUPS", streamKey)).toEqual([]);
+    expect(consumerGroupNames(await redis.xinfo("GROUPS", streamKey))).not.toContain(physicalGroup);
 
     await redis.del(streamKey);
     await raw.close();
     await redis.quit();
   });
 
-  it("requires exclusive ephemeral consumer groups", async () => {
+  it("gives concurrent ephemeral subscriptions distinct independently destroyed groups", async () => {
     const redis = new Redis(TEST_REDIS_URL);
     const keyPrefix = `test:lilac-event-bus:${randomId("ephemeral-owner")}`;
     const streamKey = `${keyPrefix}:topic`;
@@ -1296,7 +2115,6 @@ describe("RedisStreamsBus", () => {
       mode: "fanout" as const,
       subscriptionId: "shared-temporary-group",
       ephemeral: true,
-      offset: { type: "now" as const },
       batch: { maxWaitMs: 50 },
     };
     const owner = requireOk(
@@ -1304,16 +2122,14 @@ describe("RedisStreamsBus", () => {
         disposition: "commit",
       })),
     );
-    const participant = await raw.subscribe(
-      "topic",
-      { ...options, consumerId: "participant" },
-      async () => ({ disposition: "commit" }),
+    const participant = requireOk(
+      await raw.subscribe("topic", { ...options, consumerId: "participant" }, async () => ({
+        disposition: "commit",
+      })),
     );
-    expect(participant.status).toBe("error");
-    if (participant.status === "error") {
-      expect(participant.error.message).toContain("Failed to initialize Redis delivery");
-      expect(String(participant.error.cause)).toContain("Ephemeral consumer group already exists");
-    }
+    const ephemeralGroups = ephemeralGroupNames(await redis.xinfo("GROUPS", streamKey));
+    expect(ephemeralGroups).toHaveLength(2);
+    expect(new Set(ephemeralGroups).size).toBe(2);
 
     const durable = requireOk(
       await raw.subscribe(
@@ -1322,18 +2138,23 @@ describe("RedisStreamsBus", () => {
           mode: "fanout",
           subscriptionId: "shared-temporary-group",
           consumerId: "durable",
-          offset: { type: "now" },
           batch: { maxWaitMs: 50 },
         },
         async () => ({ disposition: "commit" }),
       ),
     );
 
-    const groups = await redis.xinfo("GROUPS", streamKey);
-    expect(groups).toHaveLength(2);
+    const durableGroup = managedRedisPhysicalGroup("fanout", "shared-temporary-group");
+    expect(consumerGroupNames(await redis.xinfo("GROUPS", streamKey))).toEqual(
+      expect.arrayContaining([...ephemeralGroups, durableGroup]),
+    );
 
     requireOk(await owner.stop());
-    expect(await redis.xinfo("GROUPS", streamKey)).toHaveLength(1);
+    const remainingEphemeralGroups = ephemeralGroupNames(await redis.xinfo("GROUPS", streamKey));
+    expect(remainingEphemeralGroups).toHaveLength(1);
+    expect(ephemeralGroups).toContain(remainingEphemeralGroups[0]!);
+    requireOk(await participant.stop());
+    expect(consumerGroupNames(await redis.xinfo("GROUPS", streamKey))).toEqual([durableGroup]);
     requireOk(await durable.stop());
 
     await redis.del(streamKey);
@@ -1345,7 +2166,7 @@ describe("RedisStreamsBus", () => {
     const redis = new Redis(TEST_REDIS_URL);
     const keyPrefix = `test:lilac-event-bus:${randomId("fanout")}`;
     const raw = createRedisStreamsBus({ redis, keyPrefix, ownsRedis: true });
-    const bus = createLilacBus(raw);
+    const bus = createLilacBus(raw, { deadLetter: testDeadLetter(redis, keyPrefix) });
 
     const requestId = randomId("req");
 
@@ -1361,7 +2182,6 @@ describe("RedisStreamsBus", () => {
           mode: "fanout",
           subscriptionId: "adapter-a",
           consumerId: "a",
-          offset: { type: "now" },
           batch: { maxWaitMs: 250 },
         },
         async (msg) => {
@@ -1382,7 +2202,6 @@ describe("RedisStreamsBus", () => {
           mode: "fanout",
           subscriptionId: "adapter-b",
           consumerId: "b",
-          offset: { type: "now" },
           batch: { maxWaitMs: 250 },
         },
         async (msg) => {
@@ -1411,13 +2230,13 @@ describe("RedisStreamsBus", () => {
     const streamKey = `${keyPrefix}:evt.request`;
     expect(
       await eventually(
-        () => pendingCount(redis, streamKey, "adapter-a"),
+        () => pendingCount(redis, streamKey, managedRedisPhysicalGroup("fanout", "adapter-a")),
         (count) => count === 0,
       ),
     ).toBe(0);
     expect(
       await eventually(
-        () => pendingCount(redis, streamKey, "adapter-b"),
+        () => pendingCount(redis, streamKey, managedRedisPhysicalGroup("fanout", "adapter-b")),
         (count) => count === 0,
       ),
     ).toBe(0);
@@ -1496,7 +2315,7 @@ describe("RedisStreamsBus", () => {
     const redis = new Redis(TEST_REDIS_URL);
     const keyPrefix = `test:lilac-event-bus:${randomId("work")}`;
     const raw = createRedisStreamsBus({ redis, keyPrefix, ownsRedis: true });
-    const bus = createLilacBus(raw);
+    const bus = createLilacBus(raw, { deadLetter: testDeadLetter(redis, keyPrefix) });
 
     const requestId = randomId("req");
 
@@ -1510,7 +2329,6 @@ describe("RedisStreamsBus", () => {
           mode: "work",
           subscriptionId: "agent-service",
           consumerId: "instance-1",
-          offset: { type: "begin" },
           batch: { maxWaitMs: 250 },
         },
         async (msg) => {
@@ -1543,7 +2361,12 @@ describe("RedisStreamsBus", () => {
     expect(received).toBe(1);
     expect(
       await eventually(
-        () => pendingCount(redis, `${keyPrefix}:cmd.request`, "agent-service"),
+        () =>
+          pendingCount(
+            redis,
+            `${keyPrefix}:cmd.request`,
+            managedRedisPhysicalGroup("work", "agent-service"),
+          ),
         (count) => count === 0,
       ),
     ).toBe(0);
@@ -1556,7 +2379,7 @@ describe("RedisStreamsBus", () => {
     const redis = new Redis(TEST_REDIS_URL);
     const keyPrefix = `test:lilac-event-bus:${randomId("superjson")}`;
     const raw = createRedisStreamsBus({ redis, keyPrefix, ownsRedis: true });
-    const bus = createLilacBus(raw);
+    const bus = createLilacBus(raw, { deadLetter: testDeadLetter(redis, keyPrefix) });
 
     const requestId = randomId("req");
 
@@ -1598,7 +2421,6 @@ describe("RedisStreamsBus", () => {
           mode: "work",
           subscriptionId: "test-agent",
           consumerId: "instance-1",
-          offset: { type: "begin" },
           batch: { maxWaitMs: 250 },
         },
         async (msg) => {
@@ -1676,7 +2498,7 @@ describe("RedisStreamsBus", () => {
     const redis = new Redis(TEST_REDIS_URL);
     const keyPrefix = `test:lilac-event-bus:${randomId("work-loop")}`;
     const raw = createRedisStreamsBus({ redis, keyPrefix, ownsRedis: true });
-    const bus = createLilacBus(raw);
+    const bus = createLilacBus(raw, { deadLetter: testDeadLetter(redis, keyPrefix) });
 
     let calls = 0;
     let deliveredAfterError = false;
@@ -1689,7 +2511,6 @@ describe("RedisStreamsBus", () => {
           mode: "work",
           subscriptionId: "agent-service-loop",
           consumerId: "instance-1",
-          offset: { type: "begin" },
           batch: { maxWaitMs: 250 },
         },
         async (msg) => {
@@ -1744,7 +2565,12 @@ describe("RedisStreamsBus", () => {
     expect(deliveredAfterError).toBe(true);
     expect(
       await eventually(
-        () => pendingCount(redis, `${keyPrefix}:cmd.request`, "agent-service-loop"),
+        () =>
+          pendingCount(
+            redis,
+            `${keyPrefix}:cmd.request`,
+            managedRedisPhysicalGroup("work", "agent-service-loop"),
+          ),
         (count) => count === 0,
       ),
     ).toBe(0);

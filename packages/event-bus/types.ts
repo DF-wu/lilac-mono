@@ -102,16 +102,18 @@ export type PublishOptions = {
   key?: string;
   /** Optional metadata (string->string). */
   headers?: Record<string, string>;
-  /** Best-effort retention hint (e.g. approximate MAXLEN). */
-  retention?: { maxLenApprox?: number };
 };
 
-/** Flow control options for read loops. */
-export type BatchOptions = {
-  /** Max messages per poll. */
-  maxMessages?: number;
+/** Flow control options shared by subscription read loops. */
+export type SubscriptionWaitOptions = {
   /** Max time to block waiting for messages. */
   maxWaitMs?: number;
+};
+
+/** Flow control options for non-durable tail reads. */
+export type BatchOptions = SubscriptionWaitOptions & {
+  /** Max messages per poll. */
+  maxMessages?: number;
 };
 
 /** Durable subscription (consumer group) options. */
@@ -127,12 +129,7 @@ export type WorkOrFanoutSubscriptionOptions = {
   consumerId?: string;
   /** Destroy this consumer group when the subscription stops. */
   ephemeral?: boolean;
-  /**
-   * Only applied if the consumer group needs to be created.
-   * If the group already exists, the offset is ignored.
-   */
-  offset?: Exclude<Offset, { type: "cursor" }>;
-  batch?: BatchOptions;
+  batch?: SubscriptionWaitOptions;
 };
 
 /** Non-durable streaming read options (no consumer group). */

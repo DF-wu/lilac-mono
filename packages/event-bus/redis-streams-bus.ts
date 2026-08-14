@@ -18,8 +18,12 @@ import {
 } from "./event-delivery";
 import {
   checkedDeadLetterAcceptance,
+  createAttemptsExhaustedDeadLetterReason,
+  createManagedEventDeadLetterRecord,
+  createTailEventDeadLetterRecord,
   EventDeadLetterAcceptFailed,
   type EventDeadLetterAcceptance,
+  type EventDeadLetterReason,
   type EventTransportEvidence,
 } from "./event-dead-letter";
 import {
@@ -27,6 +31,15 @@ import {
   type RedisConnectionPoolOptions,
   type RedisConnectionPoolAutoscaleOptions,
 } from "./redis-connection-pool";
+import {
+  MANAGED_REDIS_HEARTBEAT_MS,
+  managedRedisPhysicalGroup,
+  RedisManagedDelivery,
+  type ManagedClaim,
+  type ManagedExhaustionFailure,
+  type ManagedLease,
+  type ManagedTerminalMaterial,
+} from "./redis-managed-delivery";
 import type {
   Cursor,
   FetchOptions,
@@ -44,12 +57,30 @@ const DEFAULT_MAX_MESSAGES = 50;
 const DEFAULT_BLOCK_MS = 1000;
 const OUTPUT_STREAM_TTL_SECONDS = 24 * 60 * 60;
 const TRIM_DEBOUNCE_MS = 100;
-const EPHEMERAL_GROUP_PREFIX = "__lilac_ephemeral__:";
 const TAIL_REPLAY_TOPICS = new Set<Topic>(["evt.request", "evt.adapter"]);
 const MAX_EVIDENCE_VALUES = 32;
 const MAX_EVIDENCE_VALUE_CHARS = 1024;
 const STRING_HEADERS_SCHEMA = z.record(z.string(), z.string());
 const REDIS_STREAM_ID_PATTERN = /^\d+-\d+$/;
+const HANDLER_FAILURE_SCHEMA = z.object({
+  kind: z.literal("handler-error"),
+  errorTag: z.string(),
+  errorMessage: z.string(),
+});
+const DEAD_LETTER_REASON_SCHEMA = z.discriminatedUnion("kind", [
+  z.object({
+    kind: z.literal("contract-invalid"),
+    diagnostic: z.literal("event_bus.contract_invalid"),
+    stage: z.enum(["transport", "envelope", "event_type", "headers", "topic", "key", "payload"]),
+    eventType: z.string().optional(),
+    issues: z.array(z.string()),
+  }),
+  HANDLER_FAILURE_SCHEMA,
+  z.object({
+    kind: z.literal("attempts-exhausted"),
+    finalFailure: z.union([HANDLER_FAILURE_SCHEMA, z.object({ kind: z.literal("lease-expired") })]),
+  }),
+]);
 
 const XADD_WITH_EXPIRY_SCRIPT = `
 local id = redis.call("XADD", KEYS[1], unpack(ARGV, 2))
@@ -132,16 +163,14 @@ for _, fields in ipairs(groups) do
     if fields[index] == "last-delivered-id" then last_delivered_id = fields[index + 1] end
   end
   if not name or pending == nil or not last_delivered_id then return 0 end
-  if string.sub(name, 1, string.len(ARGV[3])) ~= ARGV[3] then
-    local boundary = last_delivered_id
-    if pending > 0 then
-      local pending_summary = redis.call("XPENDING", KEYS[1], name)
-      boundary = pending_summary[2]
-      if not boundary then return 0 end
-    end
-    if boundary == "0-0" then return 0 end
-    if less_than(boundary, watermark) then watermark = boundary end
+  local boundary = last_delivered_id
+  if pending > 0 then
+    local pending_summary = redis.call("XPENDING", KEYS[1], name)
+    boundary = pending_summary[2]
+    if not boundary then return 0 end
   end
+  if boundary == "0-0" then return 0 end
+  if less_than(boundary, watermark) then watermark = boundary end
 end
 
 local retained = redis.call("XREVRANGE", KEYS[1], watermark, "-", "COUNT", ARGV[2])
@@ -202,96 +231,186 @@ function isRedisCount(value: number): boolean {
   return Number.isSafeInteger(value) && value >= 0;
 }
 
+const redisStreamEntrySchema = z
+  .array(z.unknown())
+  .length(2)
+  .pipe(z.tuple([z.unknown(), z.unknown()]))
+  .transform(([id, fields]) => ({ id, fields }));
+const redisReadStreamSchema = z
+  .array(z.unknown())
+  .length(2)
+  .pipe(z.tuple([z.unknown(), z.array(redisStreamEntrySchema)]))
+  .transform(([streamKey, entries]) => ({ streamKey, entries }));
+const redisReadResponseSchema = z
+  .array(z.unknown())
+  .length(1)
+  .pipe(z.tuple([redisReadStreamSchema]))
+  .transform(([stream]) => stream)
+  .nullable();
+const redisRangeResponseSchema = z
+  .array(z.unknown())
+  .length(1)
+  .pipe(z.tuple([redisStreamEntrySchema]))
+  .transform(([entry]) => entry);
+const redisWatermarkEntrySchema = z
+  .array(z.unknown())
+  .length(2)
+  .pipe(z.tuple([z.unknown(), z.array(z.unknown())]))
+  .transform(([id, fields]) => ({ id, fields }));
+const redisWatermarkResponseSchema = z
+  .array(redisWatermarkEntrySchema)
+  .max(1)
+  .transform(([entry]) => ({ entry: entry ?? null }));
+const redisPendingSummarySchema = z
+  .array(z.unknown())
+  .min(3)
+  .pipe(
+    z
+      .tuple([
+        z.number().refine(isRedisCount),
+        z.string().refine(isRedisStreamId).nullable(),
+        z.unknown(),
+      ])
+      .rest(z.unknown()),
+  )
+  .transform(([count, oldestId]) => ({ count, oldestId }));
+const redisOldestPendingEntrySchema = z
+  .array(z.unknown())
+  .min(3)
+  .pipe(z.tuple([z.unknown(), z.unknown(), z.number().refine(isRedisCount)]).rest(z.unknown()))
+  .transform(([, , oldestIdleMs]) => ({ oldestIdleMs }));
+const redisOldestPendingResponseSchema = z
+  .array(z.unknown())
+  .length(1)
+  .pipe(z.tuple([redisOldestPendingEntrySchema]))
+  .transform(([entry]) => entry);
+const redisCleanupPendingPresenceSchema = z
+  .array(z.unknown())
+  .transform((entries) => ({ hasPendingEntries: entries.length > 0 }));
+
 function decodeRedisReadResponse(
   response: unknown,
   topic: Topic,
   expectedStreamKey: string,
   logger?: Logger,
 ): RedisResponseDecodeResult<readonly RedisReadEntry[]> {
-  if (response === null) return { status: "ok", value: [] };
-  if (!Array.isArray(response) || response.length !== 1) {
-    return { status: "error", message: "Redis XREAD returned an invalid stream collection" };
+  const decoded = redisReadResponseSchema.safeParse(response);
+  if (!decoded.success) {
+    let message = "Redis XREAD returned an invalid stream collection";
+    if (decoded.error.issues.some((issue) => issue.path.length >= 3)) {
+      message = "Redis XREAD returned an invalid message entry";
+    } else if (decoded.error.issues.some((issue) => issue.path.length > 0)) {
+      message = "Redis XREAD returned an invalid stream entry";
+    }
+    return { status: "error", message };
   }
-  const stream = response[0];
-  if (
-    !Array.isArray(stream) ||
-    stream.length !== 2 ||
-    stream[0] !== expectedStreamKey ||
-    !Array.isArray(stream[1])
-  ) {
+  if (decoded.data === null) return { status: "ok", value: [] };
+  if (decoded.data.streamKey !== expectedStreamKey) {
     return { status: "error", message: "Redis XREAD returned an invalid stream entry" };
   }
 
   const entries: RedisReadEntry[] = [];
-  for (const entry of stream[1]) {
-    if (!Array.isArray(entry) || entry.length !== 2) {
-      return { status: "error", message: "Redis XREAD returned an invalid message entry" };
-    }
-    if (typeof entry[0] !== "string" || !isRedisStreamId(entry[0])) {
+  for (const entry of decoded.data.entries) {
+    if (typeof entry.id !== "string" || !isRedisStreamId(entry.id)) {
       return { status: "error", message: "Redis XREAD returned an invalid message id" };
     }
-    const id = entry[0];
-    const fields = entry[1];
     entries.push({
-      id,
-      message: decodeMessage(topic, expectedStreamKey, id, fields, logger),
-      evidence: redisTransportEvidence(topic, expectedStreamKey, id, fields),
+      id: entry.id,
+      message: decodeMessage(topic, decoded.data.streamKey, entry.id, entry.fields, logger),
+      evidence: redisTransportEvidence(topic, decoded.data.streamKey, entry.id, entry.fields),
     });
   }
   return { status: "ok", value: entries };
 }
 
-function decodeRedisWatermarkResponse(response: unknown): RedisResponseDecodeResult<string | null> {
-  if (!Array.isArray(response)) {
-    return { status: "error", message: "Redis XREVRANGE returned an invalid entry collection" };
+function decodeRedisRangeResponse(
+  response: unknown,
+  topic: Topic,
+  streamKey: string,
+  expectedId: string,
+  logger?: Logger,
+): RedisResponseDecodeResult<RedisReadEntry> {
+  const decoded = redisRangeResponseSchema.safeParse(response);
+  if (!decoded.success) {
+    return {
+      status: "error",
+      message: decoded.error.issues.some((issue) => issue.path.length > 0)
+        ? "Redis XRANGE returned an invalid source entry"
+        : "Redis XRANGE did not return exactly one source entry",
+    };
   }
-  if (response.length === 0) return { status: "ok", value: null };
-  if (response.length !== 1) {
-    return { status: "error", message: "Redis XREVRANGE returned too many entries" };
-  }
-  const latest = response[0];
   if (
-    !Array.isArray(latest) ||
-    latest.length !== 2 ||
-    typeof latest[0] !== "string" ||
-    !isRedisStreamId(latest[0]) ||
-    !Array.isArray(latest[1])
+    decoded.data.id !== expectedId ||
+    typeof decoded.data.id !== "string" ||
+    !isRedisStreamId(decoded.data.id)
   ) {
+    return { status: "error", message: "Redis XRANGE returned an invalid source entry" };
+  }
+  return {
+    status: "ok",
+    value: {
+      id: decoded.data.id,
+      message: decodeMessage(topic, streamKey, decoded.data.id, decoded.data.fields, logger),
+      evidence: redisTransportEvidence(topic, streamKey, decoded.data.id, decoded.data.fields),
+    },
+  };
+}
+
+function decodeRedisWatermarkResponse(
+  response: unknown,
+): RedisResponseDecodeResult<{ readonly watermark: string | null }> {
+  const decoded = redisWatermarkResponseSchema.safeParse(response);
+  if (!decoded.success) {
+    let message = "Redis XREVRANGE returned an invalid entry collection";
+    if (decoded.error.issues.some((issue) => issue.path.length > 0)) {
+      message = "Redis XREVRANGE returned an invalid entry";
+    } else if (decoded.error.issues.some((issue) => issue.code === "too_big")) {
+      message = "Redis XREVRANGE returned too many entries";
+    }
+    return { status: "error", message };
+  }
+  if (decoded.data.entry === null) return { status: "ok", value: { watermark: null } };
+  if (typeof decoded.data.entry.id !== "string" || !isRedisStreamId(decoded.data.entry.id)) {
     return { status: "error", message: "Redis XREVRANGE returned an invalid entry" };
   }
-  return { status: "ok", value: latest[0] };
+  return { status: "ok", value: { watermark: decoded.data.entry.id } };
 }
+
+type RedisPendingSummaryValue = { readonly count: number; readonly oldestId: string | null };
 
 function decodeRedisPendingSummary(
   response: unknown,
-): RedisResponseDecodeResult<{ count: number; oldestId: string | null }> {
-  if (!Array.isArray(response) || response.length < 3) {
-    return { status: "error", message: "Redis XPENDING returned an invalid summary" };
+): RedisResponseDecodeResult<RedisPendingSummaryValue> {
+  const decoded = redisPendingSummarySchema.safeParse(response);
+  if (!decoded.success) {
+    return {
+      status: "error",
+      message: decoded.error.issues.some((issue) => issue.path.length > 0)
+        ? "Redis XPENDING returned invalid summary fields"
+        : "Redis XPENDING returned an invalid summary",
+    };
   }
-  const count = response[0];
-  const oldestId = response[1];
-  if (
-    typeof count !== "number" ||
-    !isRedisCount(count) ||
-    (oldestId !== null && (typeof oldestId !== "string" || !isRedisStreamId(oldestId)))
-  ) {
-    return { status: "error", message: "Redis XPENDING returned invalid summary fields" };
-  }
-  return { status: "ok", value: { count, oldestId } };
+  return { status: "ok", value: decoded.data };
 }
 
-function decodeRedisOldestPendingIdle(response: unknown): RedisResponseDecodeResult<number> {
-  if (
-    !Array.isArray(response) ||
-    response.length !== 1 ||
-    !Array.isArray(response[0]) ||
-    response[0].length < 3 ||
-    typeof response[0][2] !== "number" ||
-    !isRedisCount(response[0][2])
-  ) {
+function decodeRedisOldestPendingIdle(
+  response: unknown,
+): RedisResponseDecodeResult<{ readonly oldestIdleMs: number }> {
+  const decoded = redisOldestPendingResponseSchema.safeParse(response);
+  if (!decoded.success) {
     return { status: "error", message: "Redis XPENDING returned an invalid oldest entry" };
   }
-  return { status: "ok", value: response[0][2] };
+  return { status: "ok", value: decoded.data };
+}
+
+function decodeRedisCleanupPendingPresence(
+  response: unknown,
+): RedisResponseDecodeResult<{ readonly hasPendingEntries: boolean }> {
+  const decoded = redisCleanupPendingPresenceSchema.safeParse(response);
+  if (!decoded.success) {
+    return { status: "error", message: "Redis XPENDING returned an invalid cleanup response" };
+  }
+  return { status: "ok", value: decoded.data };
 }
 
 class RedisPendingInspectionFailed extends TaggedError("RedisPendingInspectionFailed")<{
@@ -317,7 +436,7 @@ async function captureRedisPendingSummary(
     if (oldest.status === "error") {
       return Result.err(new RedisPendingInspectionFailed({ message: oldest.message }));
     }
-    return Result.ok({ count: summary.value.count, oldestIdleMs: oldest.value });
+    return Result.ok({ count: summary.value.count, oldestIdleMs: oldest.value.oldestIdleMs });
   } catch {
     return Result.err(
       new RedisPendingInspectionFailed({ message: "Redis pending inspection failed" }),
@@ -326,7 +445,7 @@ async function captureRedisPendingSummary(
 }
 
 type RedisFieldsDecodeResult =
-  | { status: "ok"; value: Record<string, string> }
+  | { status: "ok"; value: { readonly fields: Record<string, string> } }
   | { status: "error"; issues: readonly RedisMessageDecodeIssue[] };
 
 type SuperJsonDecodeResult = { status: "ok"; value: unknown } | { status: "error" };
@@ -408,10 +527,17 @@ function deliveryAction(value: RawDeliveryAction): RawDeliveryAction {
     case "park-pending":
     case "stop":
       return value;
+    case "retry": {
+      const failure = Reflect.get(value, "failure");
+      if (!HANDLER_FAILURE_SCHEMA.safeParse(failure).success) {
+        throw new Panic({ message: "Retry disposition has an invalid handler failure" });
+      }
+      return value;
+    }
     case "dead-letter": {
-      const record = Reflect.get(value, "record");
-      if (typeof record !== "object" || record === null) {
-        throw new Panic({ message: "Dead-letter disposition omitted its record" });
+      const reason = Reflect.get(value, "reason");
+      if (!DEAD_LETTER_REASON_SCHEMA.safeParse(reason).success) {
+        throw new Panic({ message: "Dead-letter disposition has an invalid reason" });
       }
       return value;
     }
@@ -432,20 +558,22 @@ function decodeRedisFields(fields: unknown): RedisFieldsDecodeResult {
   if (fields.length % 2 !== 0) {
     issues.push({ field: "entry", reason: "odd_field_count" });
   }
+  const record: Record<string, string> = {};
+  let key: string | undefined;
   for (let index = 0; index < fields.length; index += 1) {
-    if (typeof fields[index] !== "string") {
+    const field = fields[index];
+    if (typeof field !== "string") {
       issues.push({ field: "entry", reason: "non_string_field", index });
+    }
+    if (index % 2 === 0) {
+      key = typeof field === "string" ? field : undefined;
+    } else {
+      if (key !== undefined && typeof field === "string") record[key] = field;
+      key = undefined;
     }
   }
   if (issues.length > 0) return { status: "error", issues };
-
-  const record: Record<string, string> = {};
-  for (let index = 0; index + 1 < fields.length; index += 2) {
-    const key = fields[index];
-    const value = fields[index + 1];
-    if (typeof key === "string" && typeof value === "string") record[key] = value;
-  }
-  return { status: "ok", value: record };
+  return { status: "ok", value: { fields: record } };
 }
 
 function decodeSuperJson(value: string): SuperJsonDecodeResult {
@@ -489,7 +617,7 @@ function decodeMessage(
 
   const fieldsResult = decodeRedisFields(fields);
   if (fieldsResult.status === "error") return failure(fieldsResult.issues);
-  const record = fieldsResult.value;
+  const record = fieldsResult.value.fields;
 
   let typeResult:
     | { status: "ok"; value: string }
@@ -682,8 +810,12 @@ export class RedisStreamsBus implements RawBus {
   private readonly ownsRedis: boolean;
   private readonly logger: Logger;
   private readonly subPool: RedisConnectionPool;
+  private readonly ownerId = randomConsumerId();
   private readonly trimTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private readonly activeTrims = new Set<Promise<void>>();
+  private readonly activeSubscriptionStops = new Set<
+    () => Promise<ResultType<void, EventDeliveryStopFailed>>
+  >();
   private acknowledgedTrimPanic: Panic | null = null;
   private closing = false;
 
@@ -810,7 +942,6 @@ export class RedisStreamsBus implements RawBus {
       this.streamKey(topic),
       checkpoint,
       String(retainedCount),
-      EPHEMERAL_GROUP_PREFIX,
     );
     if (typeof trimmed !== "number" || !isRedisCount(trimmed)) {
       throw new Panic({ message: "Redis XTRIM returned an invalid count" });
@@ -869,12 +1000,7 @@ export class RedisStreamsBus implements RawBus {
       fields.push("headers", SuperJSON.stringify(opts.headers));
     }
 
-    // If requested, apply approximate trimming.
-    // TODO: decide retention policy and move to config.
-    const xaddArgs =
-      opts.retention?.maxLenApprox && !TAIL_REPLAY_TOPICS.has(opts.topic)
-        ? ["MAXLEN", "~", String(opts.retention.maxLenApprox), "*", ...fields]
-        : ["*", ...fields];
+    const xaddArgs = ["*", ...fields];
     const id = this.isOutputTopic(opts.topic)
       ? await this.redis.eval(
           XADD_WITH_EXPIRY_SCRIPT,
@@ -946,7 +1072,7 @@ export class RedisStreamsBus implements RawBus {
     )) as unknown;
     const decoded = decodeRedisWatermarkResponse(entries);
     if (decoded.status === "error") throw new Error(decoded.message);
-    return decoded.value;
+    return decoded.value.watermark;
   }
 
   /** Subscribe with transport-owned delivery actions and typed operational Results. */
@@ -965,6 +1091,16 @@ export class RedisStreamsBus implements RawBus {
     >
   > {
     const streamKey = this.streamKey(topic);
+    if (opts.mode !== "tail" && this.isOutputTopic(topic)) {
+      return Result.err(
+        new EventDeliveryStartFailed({
+          cause: new Error("Expiring output streams support tail subscriptions only"),
+          topic,
+          message: "Durable Redis delivery is not supported for output streams",
+        }),
+      );
+    }
+
     const abortController = new AbortController();
     const acquired = await this.subPool.acquire();
     if (acquired.status === "error") {
@@ -983,26 +1119,29 @@ export class RedisStreamsBus implements RawBus {
     let releaseUnhealthy = false;
     let group: string | null = null;
     let consumerId: string | null = null;
+    let managedDelivery: RedisManagedDelivery | null = null;
+    let managedRedisClient: Redis | null = null;
     let createdGroup = false;
     const ephemeral = opts.mode !== "tail" && Boolean(opts.ephemeral);
-    const maxMessages = opts.batch?.maxMessages ?? DEFAULT_MAX_MESSAGES;
-    const blockMs = Math.min(Math.max(1, opts.batch?.maxWaitMs ?? DEFAULT_BLOCK_MS), 30_000);
+    const ephemeralIncarnation = ephemeral ? randomConsumerId() : undefined;
+    const tailMaxMessages =
+      opts.mode === "tail" ? (opts.batch?.maxMessages ?? DEFAULT_MAX_MESSAGES) : 1;
+    const blockMs = Math.min(Math.max(1, opts.batch?.maxWaitMs ?? DEFAULT_BLOCK_MS), 1_000);
 
     try {
       if (opts.mode === "work" || opts.mode === "fanout") {
-        if (!opts.ephemeral && opts.subscriptionId.startsWith(EPHEMERAL_GROUP_PREFIX)) {
-          throw new Error(`Consumer group uses reserved prefix: ${EPHEMERAL_GROUP_PREFIX}`);
-        }
-        group = opts.ephemeral
-          ? `${EPHEMERAL_GROUP_PREFIX}${opts.subscriptionId}`
-          : opts.subscriptionId;
         consumerId = opts.consumerId ?? randomConsumerId();
-        const startId = opts.offset?.type === "begin" ? "0-0" : "$";
+        group = managedRedisPhysicalGroup(
+          opts.mode,
+          opts.subscriptionId,
+          ephemeral,
+          ephemeralIncarnation,
+        );
         const ensuredGroup = await ensureGroup({
           redis: subRedis,
           streamKey,
           group,
-          startId,
+          startId: "$",
           logger: this.logger,
         });
         if (ensuredGroup.status === "error") {
@@ -1022,8 +1161,17 @@ export class RedisStreamsBus implements RawBus {
         if (!createdGroup) {
           void this.observePendingEntries(topic, streamKey, group, "subscription_start");
         }
+        managedRedisClient = this.redis.duplicate();
+        managedDelivery = new RedisManagedDelivery(
+          managedRedisClient,
+          streamKey,
+          group,
+          consumerId,
+          this.ownerId,
+        );
       }
     } catch (cause) {
+      managedRedisClient?.disconnect();
       if (!lease.shared) await lease.release({ unhealthy: true }).catch(() => undefined);
       if (Panic.is(cause)) throw cause;
       return Result.err(
@@ -1048,52 +1196,18 @@ export class RedisStreamsBus implements RawBus {
       }
     };
 
-    const acknowledge = async (
-      id: Cursor,
-    ): Promise<ResultType<void, EventDeliveryTransportFailed>> => {
-      if (!group) return Result.ok(undefined);
-      try {
-        const acknowledged = await subRedis.xack(streamKey, group, id);
-        if (acknowledged !== 1) {
-          return Result.err(
-            new EventDeliveryTransportFailed({
-              cause: new Error(`Redis XACK acknowledged ${String(acknowledged)} entries`),
-              operation: "ack",
-              topic,
-              cursor: id,
-              message: "Redis delivery acknowledgement failed",
-            }),
-          );
-        }
-        this.scheduleAcknowledgedTrim(topic, streamKey);
-        return Result.ok(undefined);
-      } catch (cause) {
-        if (Panic.is(cause)) throw cause;
-        return Result.err(
-          new EventDeliveryTransportFailed({
-            cause,
-            operation: "ack",
-            topic,
-            cursor: id,
-            message: "Redis delivery acknowledgement failed",
-          }),
-        );
-      }
-    };
-
-    const handleEntry = async (
-      entry: RedisReadEntry,
-    ): Promise<
+    type EntryHandlingResult =
       | { readonly status: "advance" }
       | { readonly status: "park" }
       | { readonly status: "stop"; readonly error: EventDeliveryStopped }
-      | { readonly status: "transport-error"; readonly error: EventDeliveryTransportFailed }
-    > => {
+      | { readonly status: "transport-error"; readonly error: EventDeliveryTransportFailed };
+
+    const handleTailEntry = async (entry: RedisReadEntry): Promise<EntryHandlingResult> => {
       const id = entry.id;
       let action: RawDeliveryAction;
       try {
         action = deliveryAction(
-          await handler(entry.message, { cursor: id, mode: opts.mode, evidence: entry.evidence }),
+          await handler(entry.message, { cursor: id, mode: "tail", evidence: entry.evidence }),
         );
       } catch (cause) {
         const phase = Panic.is(cause) ? "delivery-action" : "handler";
@@ -1102,18 +1216,9 @@ export class RedisStreamsBus implements RawBus {
       }
 
       switch (action.disposition) {
-        case "commit": {
-          const acknowledged = await acknowledge(id);
-          if (acknowledged.status === "error") {
-            return { status: "transport-error", error: acknowledged.error };
-          }
+        case "commit":
           return { status: "advance" };
-        }
         case "park-pending":
-          if (opts.mode !== "tail") {
-            if (group) void this.observePendingEntries(topic, streamKey, group, "parked");
-            return { status: "park" };
-          }
           return {
             status: "stop",
             error: new EventDeliveryStopped({
@@ -1121,6 +1226,16 @@ export class RedisStreamsBus implements RawBus {
               topic,
               cursor: id,
               message: "Tail delivery stopped because park-pending is not durable in tail mode",
+            }),
+          };
+        case "retry":
+          return {
+            status: "stop",
+            error: new EventDeliveryStopped({
+              reason: "tail-cannot-park",
+              topic,
+              cursor: id,
+              message: "Tail delivery stopped because retry is not supported in tail mode",
             }),
           };
         case "stop":
@@ -1145,7 +1260,14 @@ export class RedisStreamsBus implements RawBus {
           } else {
             try {
               accepted = checkedDeadLetterAcceptance(
-                await dependencies.deadLetter.accept(action.record),
+                await dependencies.deadLetter.accept(
+                  createTailEventDeadLetterRecord({
+                    topic,
+                    cursor: id,
+                    reason: action.reason,
+                    evidence: entry.evidence,
+                  }),
+                ),
               );
             } catch (cause) {
               await reportFatal(cause, id, "dead-letter");
@@ -1159,7 +1281,6 @@ export class RedisStreamsBus implements RawBus {
               cursor: id,
               mode: opts.mode,
             });
-            if (opts.mode !== "tail") return { status: "park" };
             return {
               status: "stop",
               error: new EventDeliveryStopped({
@@ -1169,11 +1290,6 @@ export class RedisStreamsBus implements RawBus {
                 message: "Tail delivery stopped after dead-letter acceptance failed",
               }),
             };
-          }
-
-          const acknowledged = await acknowledge(id);
-          if (acknowledged.status === "error") {
-            return { status: "transport-error", error: acknowledged.error };
           }
           return { status: "advance" };
         }
@@ -1189,66 +1305,531 @@ export class RedisStreamsBus implements RawBus {
         message: "Redis delivery read failed",
       });
 
-    const runLoop = async (): Promise<ResultType<void, EventDeliveryDoneError>> => {
-      if (opts.mode === "tail") {
-        let cursor = redisIdForOptionalOffset(opts.offset);
-        while (!abortController.signal.aborted) {
-          let response: unknown;
-          try {
-            response = await subRedis.xread(
-              "COUNT",
-              String(maxMessages),
-              "BLOCK",
-              String(blockMs),
-              "STREAMS",
-              streamKey,
-              cursor,
-            );
-          } catch (cause) {
-            if (Panic.is(cause)) throw cause;
-            if (
-              disconnectOnStop &&
-              abortController.signal.aborted &&
-              cause instanceof Error &&
-              cause.name === "Error" &&
-              cause.message === "Connection is closed."
-            ) {
-              return Result.ok(undefined);
-            }
-            releaseUnhealthy = true;
-            return Result.err(readFailure(cause, cursor));
-          }
+    type ActiveAttempt = { shutdown(): void };
+    let activeAttempt: ActiveAttempt | null = null;
 
-          const decodedResponse = decodeRedisReadResponse(response, topic, streamKey, this.logger);
-          if (decodedResponse.status === "error") {
-            releaseUnhealthy = true;
-            return Result.err(readFailure(new Error(decodedResponse.message), cursor));
+    const runTailLoop = async (): Promise<ResultType<void, EventDeliveryDoneError>> => {
+      if (opts.mode !== "tail") {
+        throw new Panic({ message: "Tail delivery loop started for a durable subscription" });
+      }
+      let cursor = redisIdForOptionalOffset(opts.offset);
+      while (!abortController.signal.aborted) {
+        let response: unknown;
+        try {
+          response = await subRedis.xread(
+            "COUNT",
+            String(tailMaxMessages),
+            "BLOCK",
+            String(blockMs),
+            "STREAMS",
+            streamKey,
+            cursor,
+          );
+        } catch (cause) {
+          if (Panic.is(cause)) throw cause;
+          if (
+            disconnectOnStop &&
+            abortController.signal.aborted &&
+            cause instanceof Error &&
+            cause.name === "Error" &&
+            cause.message === "Connection is closed."
+          ) {
+            return Result.ok(undefined);
           }
-          for (const entry of decodedResponse.value) {
-            const handled = await handleEntry(entry);
-            if (handled.status === "stop") return Result.err(handled.error);
-            if (handled.status === "transport-error") return Result.err(handled.error);
-            if (handled.status === "park") {
-              throw new Panic({ message: "Tail delivery produced an impossible park action" });
+          releaseUnhealthy = true;
+          return Result.err(readFailure(cause, cursor));
+        }
+
+        const decodedResponse = decodeRedisReadResponse(response, topic, streamKey, this.logger);
+        if (decodedResponse.status === "error") {
+          releaseUnhealthy = true;
+          return Result.err(readFailure(new Error(decodedResponse.message), cursor));
+        }
+        for (const entry of decodedResponse.value) {
+          const handled = await handleTailEntry(entry);
+          if (handled.status === "stop") return Result.err(handled.error);
+          if (handled.status === "transport-error") return Result.err(handled.error);
+          if (handled.status === "park") {
+            throw new Panic({ message: "Tail delivery produced an impossible park action" });
+          }
+          cursor = entry.id;
+        }
+      }
+      return Result.ok(undefined);
+    };
+
+    const runDurableLoop = async (): Promise<ResultType<void, EventDeliveryDoneError>> => {
+      if (
+        opts.mode === "tail" ||
+        group === null ||
+        consumerId === null ||
+        managedDelivery === null
+      ) {
+        throw new Panic({ message: "Managed Redis delivery started without durable identities" });
+      }
+      const mode = opts.mode;
+      const physicalGroup = group;
+      const managed = managedDelivery;
+
+      type CapturedTransport<T> =
+        | { readonly status: "ok"; readonly value: T }
+        | { readonly status: "error"; readonly error: EventDeliveryTransportFailed };
+      const captureTransport = async <T>(
+        operation: () => Promise<T>,
+        operationName: "read" | "ack",
+        cursor: Cursor | undefined,
+        message: string,
+      ): Promise<CapturedTransport<T>> => {
+        try {
+          return { status: "ok", value: await operation() };
+        } catch (cause) {
+          if (Panic.is(cause)) throw cause;
+          return {
+            status: "error",
+            error: new EventDeliveryTransportFailed({
+              cause,
+              operation: operationName,
+              topic,
+              cursor,
+              message,
+            }),
+          };
+        }
+      };
+
+      type LeaseLoss =
+        | { readonly kind: "shutdown" }
+        | { readonly kind: "stale" }
+        | { readonly kind: "error"; readonly cause: unknown };
+      const startLeaseHeartbeat = (id: Cursor, initialLease: ManagedLease) => {
+        const attemptController = new AbortController();
+        const lossResolvers = Promise.withResolvers<LeaseLoss>();
+        let loss: LeaseLoss | null = null;
+        let lease = initialLease;
+        let stopped = false;
+        let timer: ReturnType<typeof setTimeout> | null = null;
+        let heartbeatTask: Promise<void> | null = null;
+
+        const lose = (nextLoss: LeaseLoss): void => {
+          if (loss !== null) return;
+          loss = nextLoss;
+          stopped = true;
+          if (timer !== null) clearTimeout(timer);
+          timer = null;
+          attemptController.abort();
+          lossResolvers.resolve(nextLoss);
+        };
+        const schedule = (): void => {
+          if (stopped) return;
+          timer = setTimeout(() => {
+            timer = null;
+            heartbeatTask = (async () => {
+              try {
+                const heartbeat = await managed.heartbeat(id, lease);
+                if (heartbeat.status === "stale") {
+                  lose({ kind: "stale" });
+                  return;
+                }
+                lease = heartbeat.lease;
+              } catch (cause) {
+                lose({ kind: "error", cause });
+                return;
+              }
+              schedule();
+            })();
+            void heartbeatTask;
+          }, MANAGED_REDIS_HEARTBEAT_MS);
+          timer.unref?.();
+        };
+        const control: ActiveAttempt = {
+          shutdown: () => lose({ kind: "shutdown" }),
+        };
+        activeAttempt = control;
+        schedule();
+
+        return {
+          signal: attemptController.signal,
+          loss: lossResolvers.promise,
+          currentLoss: (): LeaseLoss | null => loss,
+          close: async (): Promise<void> => {
+            stopped = true;
+            if (timer !== null) clearTimeout(timer);
+            timer = null;
+            await heartbeatTask;
+            if (activeAttempt === control) activeAttempt = null;
+          },
+        };
+      };
+
+      const handleLeaseLoss = async (id: Cursor, loss: LeaseLoss): Promise<EntryHandlingResult> => {
+        if (loss.kind === "shutdown" || loss.kind === "stale") return { status: "advance" };
+        if (Panic.is(loss.cause)) {
+          await reportFatal(loss.cause, id, "delivery-action");
+          throw loss.cause;
+        }
+        return {
+          status: "transport-error",
+          error: new EventDeliveryTransportFailed({
+            cause: loss.cause,
+            operation: "read",
+            topic,
+            cursor: id,
+            message: "Redis delivery heartbeat failed",
+          }),
+        };
+      };
+
+      const loadRecoveryEntry = async (id: Cursor): Promise<CapturedTransport<RedisReadEntry>> =>
+        captureTransport(
+          async () => {
+            if (!managedRedisClient) {
+              throw new Panic({ message: "Managed Redis recovery connection is unavailable" });
             }
-            cursor = entry.id;
+            const response = (await managedRedisClient.xrange(
+              streamKey,
+              id,
+              id,
+              "COUNT",
+              1,
+            )) as unknown;
+            const decoded = decodeRedisRangeResponse(response, topic, streamKey, id, this.logger);
+            if (decoded.status === "error") throw new Error(decoded.message);
+            return decoded.value;
+          },
+          "read",
+          id,
+          "Redis delivery source recovery failed",
+        );
+
+      const deadLetterManaged = async (
+        entry: RedisReadEntry,
+        lease: ManagedLease,
+        reason: EventDeadLetterReason,
+      ): Promise<EntryHandlingResult> => {
+        const scope = startLeaseHeartbeat(entry.id, lease);
+        type Preparation =
+          | {
+              readonly status: "prepared";
+              readonly material: ManagedTerminalMaterial;
+            }
+          | { readonly status: "failed"; readonly cause: unknown };
+        const preparation: Promise<Preparation> = (async () => {
+          try {
+            if (!dependencies.deadLetter) {
+              throw new Error("No event dead-letter adapter is configured");
+            }
+            const recordedAt = await dependencies.deadLetter.serverTimeMs();
+            const record = createManagedEventDeadLetterRecord({
+              topic,
+              cursor: entry.id,
+              mode,
+              physicalGroup,
+              attempt: lease.attempt,
+              recordedAt,
+              reason,
+              evidence: entry.evidence,
+            });
+            return { status: "prepared", material: await dependencies.deadLetter.prepare(record) };
+          } catch (cause) {
+            return { status: "failed", cause };
+          }
+        })();
+        const completed = await Promise.race([
+          preparation,
+          scope.loss.then(
+            (lost): Preparation | { readonly status: "lease-lost"; loss: LeaseLoss } => ({
+              status: "lease-lost",
+              loss: lost,
+            }),
+          ),
+        ]);
+        await scope.close();
+        const currentLoss = scope.currentLoss();
+        if (currentLoss !== null) return handleLeaseLoss(entry.id, currentLoss);
+        if (completed.status === "lease-lost") return handleLeaseLoss(entry.id, completed.loss);
+        if (completed.status === "failed") {
+          if (Panic.is(completed.cause)) {
+            await reportFatal(completed.cause, entry.id, "dead-letter");
+            throw completed.cause;
+          }
+          dependencies.logger?.error("event_bus.dead_letter_failed", {
+            topic,
+            cursor: entry.id,
+            mode,
+          });
+          return {
+            status: "transport-error",
+            error: new EventDeliveryTransportFailed({
+              cause: completed.cause,
+              operation: "ack",
+              topic,
+              cursor: entry.id,
+              message: "Redis managed dead-letter preparation failed",
+            }),
+          };
+        }
+        if (abortController.signal.aborted) return { status: "advance" };
+
+        try {
+          const staged = await managed.stageTerminal(entry.id, lease, completed.material);
+          if (staged.status === "stale") return { status: "advance" };
+          const finalized = await managed.finalizeTerminal(entry.id, lease);
+          if (finalized.status === "stale") return { status: "advance" };
+          this.scheduleAcknowledgedTrim(topic, streamKey);
+          return { status: "advance" };
+        } catch (cause) {
+          if (Panic.is(cause)) {
+            await reportFatal(cause, entry.id, "dead-letter");
+            throw cause;
+          }
+          return {
+            status: "transport-error",
+            error: new EventDeliveryTransportFailed({
+              cause,
+              operation: "ack",
+              topic,
+              cursor: entry.id,
+              message: "Redis managed dead-letter finalization failed",
+            }),
+          };
+        }
+      };
+
+      const beginDeadLetterManaged = async (
+        entry: RedisReadEntry,
+        ownership: ManagedLease | ManagedClaim,
+        reason: EventDeadLetterReason,
+      ): Promise<EntryHandlingResult> => {
+        const preparing = await captureTransport(
+          () => managed.beginTerminal(entry.id, ownership, reason),
+          "ack",
+          entry.id,
+          "Redis managed terminal preparation transition failed",
+        );
+        if (preparing.status === "error") {
+          return { status: "transport-error", error: preparing.error };
+        }
+        if (preparing.value.status === "stale") return { status: "advance" };
+        return deadLetterManaged(entry, preparing.value.lease, preparing.value.reason);
+      };
+
+      const handleManagedEntry = async (
+        entry: RedisReadEntry,
+        lease: ManagedLease,
+      ): Promise<EntryHandlingResult> => {
+        const scope = startLeaseHeartbeat(entry.id, lease);
+        type HandlerCompletion =
+          | { readonly status: "action"; readonly action: RawDeliveryAction }
+          | { readonly status: "defect"; readonly cause: unknown };
+        const handlerCompletion: Promise<HandlerCompletion> = (async () => {
+          try {
+            return {
+              status: "action",
+              action: deliveryAction(
+                await handler(entry.message, {
+                  cursor: entry.id,
+                  mode,
+                  evidence: entry.evidence,
+                  deliveryId: lease.deliveryId,
+                  attempt: lease.attempt,
+                  leaseDeadline: lease.leaseDeadline,
+                  signal: scope.signal,
+                }),
+              ),
+            };
+          } catch (cause) {
+            const phase = Panic.is(cause) ? "delivery-action" : "handler";
+            await reportFatal(cause, entry.id, phase);
+            return { status: "defect", cause };
+          }
+        })();
+        const completed = await Promise.race([
+          handlerCompletion,
+          scope.loss.then(
+            (lost): HandlerCompletion | { readonly status: "lease-lost"; loss: LeaseLoss } => ({
+              status: "lease-lost",
+              loss: lost,
+            }),
+          ),
+        ]);
+        await scope.close();
+        const currentLoss = scope.currentLoss();
+        if (currentLoss !== null) return handleLeaseLoss(entry.id, currentLoss);
+        if (completed.status === "lease-lost") return handleLeaseLoss(entry.id, completed.loss);
+        if (completed.status === "defect") throw completed.cause;
+        if (abortController.signal.aborted) return { status: "advance" };
+        const action = completed.action;
+
+        switch (action.disposition) {
+          case "commit": {
+            const committed = await captureTransport(
+              () => managed.commit(entry.id, lease),
+              "ack",
+              entry.id,
+              "Redis managed delivery commit failed",
+            );
+            if (committed.status === "error") {
+              return { status: "transport-error", error: committed.error };
+            }
+            if (committed.value.status === "committed") {
+              this.scheduleAcknowledgedTrim(topic, streamKey);
+            }
+            return { status: "advance" };
+          }
+          case "retry": {
+            const retried = await captureTransport(
+              () => managed.scheduleRetry(entry.id, lease, action.failure),
+              "ack",
+              entry.id,
+              "Redis managed delivery retry scheduling failed",
+            );
+            if (retried.status === "error") {
+              return { status: "transport-error", error: retried.error };
+            }
+            if (retried.value.status === "exhausted") {
+              return beginDeadLetterManaged(
+                entry,
+                retried.value.lease,
+                createAttemptsExhaustedDeadLetterReason({
+                  finalFailure: retried.value.finalFailure,
+                }),
+              );
+            }
+            return { status: "advance" };
+          }
+          case "park-pending": {
+            const parked = await captureTransport(
+              () => managed.park(entry.id, lease),
+              "ack",
+              entry.id,
+              "Redis managed delivery parking failed",
+            );
+            if (parked.status === "error") {
+              return { status: "transport-error", error: parked.error };
+            }
+            if (parked.value.status === "parked") {
+              void this.observePendingEntries(topic, streamKey, physicalGroup, "parked");
+              return { status: "park" };
+            }
+            return { status: "advance" };
+          }
+          case "dead-letter":
+            return beginDeadLetterManaged(entry, lease, action.reason);
+          case "stop":
+            return {
+              status: "stop",
+              error: new EventDeliveryStopped({
+                reason: "requested",
+                topic,
+                cursor: entry.id,
+                message: "Event delivery policy requested stop",
+              }),
+            };
+        }
+      };
+
+      const invokeManagedEntry = async (
+        entry: RedisReadEntry,
+        claim: ManagedClaim,
+      ): Promise<EntryHandlingResult> => {
+        const begun = await captureTransport(
+          () => managed.beginInvocation(entry.id, claim),
+          "read",
+          entry.id,
+          "Redis managed invocation transition failed",
+        );
+        if (begun.status === "error") return { status: "transport-error", error: begun.error };
+        if (begun.value.status === "stale") return { status: "advance" };
+        if (begun.value.status === "exhausted") {
+          throw new Panic({ message: "Managed recovery attempted a sixth invocation" });
+        }
+        return handleManagedEntry(entry, begun.value.lease);
+      };
+
+      const handleExhausted = async (
+        id: Cursor,
+        lease: ManagedLease,
+        finalFailure: ManagedExhaustionFailure,
+      ): Promise<EntryHandlingResult> => {
+        const loaded = await loadRecoveryEntry(id);
+        if (loaded.status === "error") {
+          return { status: "transport-error", error: loaded.error };
+        }
+        return beginDeadLetterManaged(
+          loaded.value,
+          lease,
+          createAttemptsExhaustedDeadLetterReason({ finalFailure }),
+        );
+      };
+
+      while (!abortController.signal.aborted) {
+        const recovered = await captureTransport(
+          () => managed.claimRecoverable(),
+          "read",
+          undefined,
+          "Redis managed delivery recovery failed",
+        );
+        if (recovered.status === "error") return Result.err(recovered.error);
+
+        let recoveryHandled: EntryHandlingResult | null = null;
+        const recovery = recovered.value;
+        switch (recovery.status) {
+          case "none":
+            break;
+          case "terminal": {
+            const recoveryId = recovery.id;
+            const recoveryLease = recovery.lease;
+            const finalized = await captureTransport(
+              () => managed.finalizeTerminal(recoveryId, recoveryLease),
+              "ack",
+              recoveryId,
+              "Redis managed terminal recovery failed",
+            );
+            if (finalized.status === "error") return Result.err(finalized.error);
+            if (finalized.value.status === "finalized") {
+              this.scheduleAcknowledgedTrim(topic, streamKey);
+            }
+            recoveryHandled = { status: "advance" };
+            break;
+          }
+          case "prepare-terminal": {
+            const loaded = await loadRecoveryEntry(recovery.id);
+            if (loaded.status === "error") return Result.err(loaded.error);
+            recoveryHandled = await deadLetterManaged(
+              loaded.value,
+              recovery.lease,
+              recovery.reason,
+            );
+            break;
+          }
+          case "exhausted":
+            recoveryHandled = await handleExhausted(
+              recovery.id,
+              recovery.lease,
+              recovery.finalFailure,
+            );
+            break;
+          case "claimed": {
+            const loaded = await loadRecoveryEntry(recovery.id);
+            if (loaded.status === "error") return Result.err(loaded.error);
+            recoveryHandled = await invokeManagedEntry(loaded.value, recovery.claim);
+            break;
           }
         }
-        return Result.ok(undefined);
-      }
+        if (recoveryHandled?.status === "stop") return Result.err(recoveryHandled.error);
+        if (recoveryHandled?.status === "transport-error") {
+          return Result.err(recoveryHandled.error);
+        }
+        if (abortController.signal.aborted) break;
 
-      if (!group || !consumerId) {
-        throw new Panic({ message: "Redis delivery started without a group and consumer" });
-      }
-      while (!abortController.signal.aborted) {
         let response: unknown;
         try {
           response = await subRedis.xreadgroup(
             "GROUP",
-            group,
+            physicalGroup,
             consumerId,
             "COUNT",
-            String(maxMessages),
+            "1",
             "BLOCK",
             String(blockMs),
             "STREAMS",
@@ -1276,7 +1857,15 @@ export class RedisStreamsBus implements RawBus {
           return Result.err(readFailure(new Error(decodedResponse.message)));
         }
         for (const entry of decodedResponse.value) {
-          const handled = await handleEntry(entry);
+          const begun = await captureTransport(
+            () => managed.beginFresh(entry.id),
+            "read",
+            entry.id,
+            "Redis managed fresh delivery initialization failed",
+          );
+          if (begun.status === "error") return Result.err(begun.error);
+          if (begun.value.status === "stale") continue;
+          const handled = await invokeManagedEntry(entry, begun.value.claim);
           if (handled.status === "stop") return Result.err(handled.error);
           if (handled.status === "transport-error") return Result.err(handled.error);
         }
@@ -1284,12 +1873,16 @@ export class RedisStreamsBus implements RawBus {
       return Result.ok(undefined);
     };
 
+    const runLoop = (): Promise<ResultType<void, EventDeliveryDoneError>> =>
+      opts.mode === "tail" ? runTailLoop() : runDurableLoop();
+
     type CleanupAttempt =
       | { readonly status: "ok" }
       | { readonly status: "error"; readonly cause: unknown };
     let leaseCleanup: Promise<CleanupAttempt> | null = null;
     const cleanupLease = (): Promise<CleanupAttempt> => {
       leaseCleanup ??= (async () => {
+        managedRedisClient?.disconnect();
         if (lease.shared) return { status: "ok" };
         try {
           await lease.release({ unhealthy: disconnectOnStop || releaseUnhealthy });
@@ -1338,10 +1931,20 @@ export class RedisStreamsBus implements RawBus {
       try {
         if (group && consumerId) {
           if (ephemeral && createdGroup) {
-            const destroyed = await this.redis.xgroup("DESTROY", streamKey, group);
-            if (destroyed !== 1) {
-              throw new Error("Redis XGROUP DESTROY returned an invalid cleanup response");
+            if (!ephemeralGroupDestroyed) {
+              const destroyed = await this.redis.xgroup("DESTROY", streamKey, group);
+              if (destroyed !== 1) {
+                throw new Error("Redis XGROUP DESTROY returned an invalid cleanup response");
+              }
+              ephemeralGroupDestroyed = true;
             }
+            await new RedisManagedDelivery(
+              this.redis,
+              streamKey,
+              group,
+              consumerId,
+              this.ownerId,
+            ).clearAllState();
             this.scheduleAcknowledgedTrim(topic, streamKey);
           } else {
             const pending = (await this.redis.xpending(
@@ -1352,10 +1955,9 @@ export class RedisStreamsBus implements RawBus {
               1,
               consumerId,
             )) as unknown;
-            if (!Array.isArray(pending)) {
-              throw new Error("Redis XPENDING returned an invalid cleanup response");
-            }
-            if (pending.length === 0) {
+            const pendingPresence = decodeRedisCleanupPendingPresence(pending);
+            if (pendingPresence.status === "error") throw new Error(pendingPresence.message);
+            if (!pendingPresence.value.hasPendingEntries) {
               const removed = await this.redis.xgroup("DELCONSUMER", streamKey, group, consumerId);
               if (typeof removed !== "number" || !isRedisCount(removed)) {
                 throw new Error("Redis XGROUP DELCONSUMER returned an invalid cleanup response");
@@ -1369,10 +1971,17 @@ export class RedisStreamsBus implements RawBus {
       }
     };
 
-    return Result.ok({
-      done: running,
-      stop: async () => {
+    let ephemeralGroupDestroyed = false;
+    let stopSequence = Promise.resolve();
+    const stop = async (): Promise<ResultType<void, EventDeliveryStopFailed>> => {
+      const previousStop = stopSequence;
+      const stopTurn = Promise.withResolvers<void>();
+      stopSequence = stopTurn.promise;
+      await previousStop;
+      try {
         abortController.abort();
+        activeAttempt?.shutdown();
+        managedRedisClient?.disconnect();
         if (!lease.shared && blockMs > 500) {
           disconnectOnStop = true;
           subRedis.disconnect();
@@ -1381,11 +1990,18 @@ export class RedisStreamsBus implements RawBus {
         const groupCleanup = await cleanupGroup();
         const released = await cleanupLease();
 
-        if (completedLoop.status === "defect") throw completedLoop.cause;
+        if (completedLoop.status === "defect") {
+          this.activeSubscriptionStops.delete(stop);
+          throw completedLoop.cause;
+        }
         if (groupCleanup.status === "error" && Panic.is(groupCleanup.cause)) {
+          this.activeSubscriptionStops.delete(stop);
           throw groupCleanup.cause;
         }
-        if (released.status === "error" && Panic.is(released.cause)) throw released.cause;
+        if (released.status === "error" && Panic.is(released.cause)) {
+          this.activeSubscriptionStops.delete(stop);
+          throw released.cause;
+        }
         if (groupCleanup.status === "error") {
           return Result.err(
             new EventDeliveryStopFailed({
@@ -1404,14 +2020,33 @@ export class RedisStreamsBus implements RawBus {
             }),
           );
         }
+        this.activeSubscriptionStops.delete(stop);
         return Result.ok(undefined);
-      },
+      } finally {
+        stopTurn.resolve();
+      }
+    };
+    this.activeSubscriptionStops.add(stop);
+    return Result.ok({
+      done: running,
+      stop,
     });
   }
 
   /** Close the bus (no-op unless `ownsRedis` was set). */
   async close(): Promise<void> {
     this.closing = true;
+    const stopped = await Promise.allSettled(
+      Array.from(this.activeSubscriptionStops, async (stop) => await stop()),
+    );
+    let stopFailure: unknown;
+    for (const outcome of stopped) {
+      if (outcome.status === "rejected") {
+        stopFailure ??= outcome.reason;
+      } else if (outcome.value.status === "error") {
+        stopFailure ??= outcome.value.error;
+      }
+    }
     for (const timer of this.trimTimers.values()) clearTimeout(timer);
     this.trimTimers.clear();
     await Promise.allSettled(this.activeTrims);
@@ -1421,6 +2056,7 @@ export class RedisStreamsBus implements RawBus {
       await this.redis.quit();
     }
 
+    if (stopFailure !== undefined) throw stopFailure;
     if (this.acknowledgedTrimPanic !== null) throw this.acknowledgedTrimPanic;
   }
 }

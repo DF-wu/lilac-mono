@@ -7,11 +7,13 @@ import { z } from "zod";
 
 import {
   captureDeadLetterAcceptance,
+  createManagedEventDeadLetterRecord,
   type EventDeadLetter,
   type EventDeadLetterAcceptance,
   type EventDeadLetterAcceptFailed,
-  type EventDeadLetterRecordV1,
+  type EventDeadLetterRecord,
 } from "./event-dead-letter";
+import { managedRedisPhysicalGroup } from "./redis-managed-delivery";
 
 const DEFAULT_RECORD_TTL_SECONDS = 30 * 24 * 60 * 60;
 const DEFAULT_INDEX_MAX_LEN = 10_000;
@@ -28,8 +30,21 @@ export type RedisEventDeadLetterOptions = {
   readonly keyPrefix?: string;
   /** TTL for encrypted complete records and evidence. */
   readonly recordTtlSeconds?: number;
-  /** Exact maximum number of payload-free metadata entries retained in the index stream. */
+  /** Exact maximum number of payload-free metadata entries retained in the index sorted set. */
   readonly indexMaxLen?: number;
+};
+
+export type PreparedRedisEventDeadLetter = {
+  readonly id: string;
+  readonly record: { readonly key: string; readonly value: string };
+  readonly evidence?: { readonly key: string; readonly value: string };
+  readonly index: {
+    readonly key: string;
+    readonly fields: readonly string[];
+    readonly score: number;
+    readonly maxLen: number;
+  };
+  readonly ttlSeconds: number;
 };
 
 export class RedisEventDeadLetterConfigInvalid extends TaggedError(
@@ -343,8 +358,8 @@ const eventTransportEvidenceSchema = z.strictObject({
   ]),
 });
 
-const eventDeadLetterRecordSchema: z.ZodType<EventDeadLetterRecordV1> = z.strictObject({
-  version: z.literal(1),
+const eventDeadLetterRecordSchema: z.ZodType<EventDeadLetterRecord> = z.strictObject({
+  version: z.literal(2),
   deadLetterId: z.string(),
   recordedAt: z.number(),
   source: z.strictObject({
@@ -353,6 +368,15 @@ const eventDeadLetterRecordSchema: z.ZodType<EventDeadLetterRecordV1> = z.strict
     messageId: z.string(),
     mode: z.enum(["work", "fanout", "tail"]),
   }),
+  delivery: z.discriminatedUnion("kind", [
+    z.strictObject({
+      kind: z.literal("managed-v2"),
+      physicalGroup: z.string(),
+      attempt: z.union([z.literal(1), z.literal(2), z.literal(3), z.literal(4), z.literal(5)]),
+      maxAttempts: z.literal(5),
+    }),
+    z.strictObject({ kind: z.literal("tail") }),
+  ]),
   reason: z.discriminatedUnion("kind", [
     z.strictObject({
       kind: z.literal("contract-invalid"),
@@ -366,15 +390,162 @@ const eventDeadLetterRecordSchema: z.ZodType<EventDeadLetterRecordV1> = z.strict
       errorTag: z.string(),
       errorMessage: z.string(),
     }),
+    z.strictObject({
+      kind: z.literal("attempts-exhausted"),
+      finalFailure: z.discriminatedUnion("kind", [
+        z.strictObject({
+          kind: z.literal("handler-error"),
+          errorTag: z.string(),
+          errorMessage: z.string(),
+        }),
+        z.strictObject({ kind: z.literal("lease-expired") }),
+      ]),
+    }),
   ]),
   evidence: eventTransportEvidenceSchema,
 });
 
+const MANAGED_GROUP_PROBE = "dead-letter-mode-probe";
+const MANAGED_GROUP_INCARNATION_PROBE = "incarnation";
 const REDIS_STREAM_ID_PATTERN = /^\d+-\d+$/;
-const redisEvidenceEntrySchema = z.tuple([z.string(), z.array(z.string())]);
-const redisEvidenceEntriesSchema = z.array(redisEvidenceEntrySchema).length(1);
-const redisTransactionResultSchema = z.tuple([z.unknown(), z.unknown()]);
-const redisTransactionResultsSchema = z.array(redisTransactionResultSchema);
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+function managedPhysicalGroupHasMode(physicalGroup: string, mode: "work" | "fanout"): boolean {
+  const durableProbe = managedRedisPhysicalGroup(mode, MANAGED_GROUP_PROBE);
+  const durablePrefix = durableProbe.slice(0, -MANAGED_GROUP_PROBE.length);
+  const ephemeralSuffix = `${MANAGED_GROUP_PROBE}:${MANAGED_GROUP_INCARNATION_PROBE}`;
+  const ephemeralProbe = managedRedisPhysicalGroup(
+    mode,
+    MANAGED_GROUP_PROBE,
+    true,
+    MANAGED_GROUP_INCARNATION_PROBE,
+  );
+  const ephemeralPrefix = ephemeralProbe.slice(0, -ephemeralSuffix.length);
+  if (physicalGroup.startsWith(durablePrefix)) {
+    return physicalGroup.length > durablePrefix.length;
+  }
+  if (!physicalGroup.startsWith(ephemeralPrefix)) return false;
+  const ephemeralIdentity = physicalGroup.slice(ephemeralPrefix.length);
+  return ephemeralIdentity.slice(1, -1).includes(":");
+}
+
+function eventDeadLetterRecordSemanticIssue(record: EventDeadLetterRecord): string | null {
+  if (!REDIS_STREAM_ID_PATTERN.test(record.source.messageId)) {
+    return "Dead-letter source message id is not a Redis stream id";
+  }
+  if (record.source.cursor !== record.source.messageId) {
+    return "Dead-letter source cursor and message id are inconsistent";
+  }
+  if (
+    record.evidence.source.topic !== record.source.topic ||
+    record.evidence.source.messageId !== record.source.messageId
+  ) {
+    return "Dead-letter source and evidence identities are inconsistent";
+  }
+  if (record.evidence.wire.kind === "controlled-reference") {
+    const locator = record.evidence.wire.locator;
+    if (
+      locator.kind === "redis-stream-entry" &&
+      (locator.streamKey !== record.evidence.source.streamKey ||
+        locator.messageId !== record.evidence.source.messageId)
+    ) {
+      return "Referenced Redis source evidence identity is inconsistent";
+    }
+  }
+  if (record.source.mode === "tail") {
+    if (record.delivery.kind !== "tail") {
+      return "Tail dead-letter source requires tail delivery identity";
+    }
+    return UUID_PATTERN.test(record.deadLetterId) ? null : "Tail dead-letter id is invalid";
+  }
+  if (record.delivery.kind !== "managed-v2") {
+    return "Managed dead-letter source requires managed-v2 delivery identity";
+  }
+  if (!managedPhysicalGroupHasMode(record.delivery.physicalGroup, record.source.mode)) {
+    return "Managed dead-letter physical group mode is inconsistent";
+  }
+  const expectedIdentity = createManagedEventDeadLetterRecord({
+    topic: record.source.topic,
+    cursor: record.source.cursor,
+    mode: record.source.mode,
+    physicalGroup: record.delivery.physicalGroup,
+    attempt: record.delivery.attempt,
+    recordedAt: record.recordedAt,
+    reason: record.reason,
+    evidence: record.evidence,
+  });
+  return expectedIdentity.deadLetterId === record.deadLetterId
+    ? null
+    : "Managed dead-letter id is inconsistent with its delivery identity";
+}
+
+function decodeEventDeadLetterRecord(
+  value: unknown,
+):
+  | { readonly status: "ok"; readonly value: EventDeadLetterRecord }
+  | { readonly status: "error"; readonly message: string } {
+  const decoded = eventDeadLetterRecordSchema.safeParse(value);
+  if (!decoded.success) {
+    return {
+      status: "error",
+      message: "Decrypted dead-letter record contract is invalid or unsupported",
+    };
+  }
+  const semanticIssue = eventDeadLetterRecordSemanticIssue(decoded.data);
+  return semanticIssue === null
+    ? { status: "ok", value: decoded.data }
+    : { status: "error", message: semanticIssue };
+}
+
+const redisEvidenceEntrySchema = z
+  .tuple([z.string(), z.array(z.string())])
+  .transform(([messageId, fields]) => ({ messageId, fields }));
+const redisEvidenceEntriesSchema = z
+  .tuple([redisEvidenceEntrySchema])
+  .transform(([entry]) => entry);
+const redisTransactionReceiptSchema = z
+  .tuple([z.unknown(), z.unknown()])
+  .transform(([error, value]) => ({ error, value }));
+const redisAbortedTransactionSchema = z
+  .custom<null | undefined | false | 0 | "">((value) => !value)
+  .transform(() => ({ kind: "aborted" as const }));
+const redisTransactionWithoutEvidenceSchema = z.union([
+  redisAbortedTransactionSchema,
+  z
+    .tuple([
+      redisTransactionReceiptSchema,
+      redisTransactionReceiptSchema,
+      redisTransactionReceiptSchema,
+    ])
+    .transform(([recordSet, zadd, zremrangebyrank]) => ({
+      kind: "receipts" as const,
+      sets: { evidence: undefined, record: recordSet },
+      zadd,
+      zremrangebyrank,
+    })),
+]);
+const redisTransactionWithEvidenceSchema = z.union([
+  redisAbortedTransactionSchema,
+  z
+    .tuple([
+      redisTransactionReceiptSchema,
+      redisTransactionReceiptSchema,
+      redisTransactionReceiptSchema,
+      redisTransactionReceiptSchema,
+    ])
+    .transform(([evidenceSet, recordSet, zadd, zremrangebyrank]) => ({
+      kind: "receipts" as const,
+      sets: { evidence: evidenceSet, record: recordSet },
+      zadd,
+      zremrangebyrank,
+    })),
+]);
+const redisTimeSchema = z
+  .tuple([
+    z.string().transform(Number).refine(Number.isSafeInteger),
+    z.string().transform(Number).refine(Number.isSafeInteger),
+  ])
+  .transform(([seconds, microseconds]) => ({ seconds, microseconds }));
 
 type RedisDeadLetterEvidenceDecodeResult =
   | { readonly status: "ok"; readonly fields: readonly string[] }
@@ -391,32 +562,44 @@ function decodeRedisDeadLetterEvidenceEntry(
       message: "Referenced Redis source evidence returned an invalid entry collection",
     };
   }
-  const entry = decoded.data[0];
-  if (!entry) {
-    return {
-      status: "error",
-      message: "Referenced Redis source evidence returned an invalid entry collection",
-    };
-  }
-  const [messageId, fields] = entry;
-  if (!REDIS_STREAM_ID_PATTERN.test(expectedMessageId) || messageId !== expectedMessageId) {
+  if (
+    !REDIS_STREAM_ID_PATTERN.test(expectedMessageId) ||
+    decoded.data.messageId !== expectedMessageId
+  ) {
     return {
       status: "error",
       message: "Referenced Redis source evidence returned an unexpected message id",
     };
   }
-  if (fields.length === 0 || fields.length % 2 !== 0) {
+  if (decoded.data.fields.length === 0 || decoded.data.fields.length % 2 !== 0) {
     return {
       status: "error",
       message: "Referenced Redis source evidence returned invalid field pairs",
     };
   }
-  return { status: "ok", fields };
+  return { status: "ok", fields: decoded.data.fields };
 }
 
 type RedisDeadLetterTransactionDecodeResult =
-  | { readonly status: "ok"; readonly id: string }
+  | {
+      readonly status: "ok";
+      readonly value: {
+        readonly sets: {
+          readonly record: "OK";
+          readonly evidence?: "OK";
+        };
+        readonly zadd: number;
+        readonly zremrangebyrank: number;
+      };
+    }
   | { readonly status: "error"; readonly cause: Error };
+
+type RedisDeadLetterTimeDecodeResult =
+  | {
+      readonly status: "ok";
+      readonly value: { readonly seconds: number; readonly microseconds: number };
+    }
+  | { readonly status: "error"; readonly message: string };
 
 function invalidRedisDeadLetterTransaction(): RedisDeadLetterTransactionDecodeResult {
   return {
@@ -427,36 +610,74 @@ function invalidRedisDeadLetterTransaction(): RedisDeadLetterTransactionDecodeRe
 
 function decodeRedisDeadLetterTransactionId(
   results: unknown,
-  expectedSetCount: number,
+  hasEvidence: boolean,
 ): RedisDeadLetterTransactionDecodeResult {
-  if (!Array.isArray(results) || results.length !== expectedSetCount + 1) {
-    return invalidRedisDeadLetterTransaction();
-  }
-  const decoded = redisTransactionResultsSchema.safeParse(results);
+  const decoded = (
+    hasEvidence ? redisTransactionWithEvidenceSchema : redisTransactionWithoutEvidenceSchema
+  ).safeParse(results);
   if (!decoded.success) return invalidRedisDeadLetterTransaction();
-  for (const result of decoded.data) {
-    if (result[0] !== null) {
+  if (decoded.data.kind === "aborted") {
+    return {
+      status: "error",
+      cause: new Error("Redis dead-letter transaction was aborted"),
+    };
+  }
+
+  const receipts = decoded.data;
+  const commandReceipts = [
+    ...(receipts.sets.evidence === undefined ? [] : [receipts.sets.evidence]),
+    receipts.sets.record,
+    receipts.zadd,
+    receipts.zremrangebyrank,
+  ];
+  for (const receipt of commandReceipts) {
+    if (receipt.error !== null) {
       return {
         status: "error",
         cause:
-          result[0] instanceof Error
-            ? result[0]
+          receipt.error instanceof Error
+            ? receipt.error
             : new Error("Redis dead-letter transaction returned an invalid command error"),
       };
     }
   }
-  for (let index = 0; index < expectedSetCount; index += 1) {
-    const setResult = decoded.data[index];
-    if (setResult?.[1] !== "OK") {
-      return invalidRedisDeadLetterTransaction();
-    }
+  const evidenceSetValue = receipts.sets.evidence?.value;
+  if (receipts.sets.evidence !== undefined && evidenceSetValue !== "OK") {
+    return invalidRedisDeadLetterTransaction();
   }
-  const xaddResult = decoded.data[expectedSetCount];
-  if (!xaddResult) return invalidRedisDeadLetterTransaction();
-  const id = xaddResult[1];
-  return typeof id === "string" && REDIS_STREAM_ID_PATTERN.test(id)
-    ? { status: "ok", id }
-    : invalidRedisDeadLetterTransaction();
+  const recordSetValue = receipts.sets.record.value;
+  if (recordSetValue !== "OK") return invalidRedisDeadLetterTransaction();
+  const zaddValue = receipts.zadd.value;
+  const zremrangebyrankValue = receipts.zremrangebyrank.value;
+  if (
+    typeof zaddValue !== "number" ||
+    !Number.isSafeInteger(zaddValue) ||
+    zaddValue < 0 ||
+    typeof zremrangebyrankValue !== "number" ||
+    !Number.isSafeInteger(zremrangebyrankValue) ||
+    zremrangebyrankValue < 0
+  ) {
+    return invalidRedisDeadLetterTransaction();
+  }
+  return {
+    status: "ok",
+    value: {
+      sets: {
+        ...(evidenceSetValue === "OK" ? { evidence: evidenceSetValue } : {}),
+        record: recordSetValue,
+      },
+      zadd: zaddValue,
+      zremrangebyrank: zremrangebyrankValue,
+    },
+  };
+}
+
+function decodeRedisDeadLetterTime(value: unknown): RedisDeadLetterTimeDecodeResult {
+  const decoded = redisTimeSchema.safeParse(value);
+  if (!decoded.success) {
+    return { status: "error", message: "Redis TIME returned an invalid dead-letter timestamp" };
+  }
+  return { status: "ok", value: decoded.data };
 }
 
 /** Explicit recovery-only helper. Normal delivery APIs never return dead-letter plaintext. */
@@ -465,7 +686,7 @@ export function decryptRedisEventDeadLetterRecord(options: {
   readonly expectedIdentity: RedisEventDeadLetterStorageIdentity;
   readonly ciphertextEnvelope: string;
 }): ResultType<
-  EventDeadLetterRecordV1,
+  EventDeadLetterRecord,
   | RedisEventDeadLetterConfigInvalid
   | RedisEventDeadLetterCiphertextInvalid
   | RedisEventDeadLetterContextMismatch
@@ -488,15 +709,15 @@ export function decryptRedisEventDeadLetterRecord(options: {
       }),
     );
   }
-  const record = eventDeadLetterRecordSchema.safeParse(serialized);
-  if (!record.success) {
+  const record = decodeEventDeadLetterRecord(serialized);
+  if (record.status === "error") {
     return Result.err(
       new RedisEventDeadLetterRecordInvalid({
-        message: "Decrypted dead-letter record contract is invalid or unsupported",
+        message: record.message,
       }),
     );
   }
-  if (record.data.deadLetterId !== options.expectedIdentity.deadLetterId) {
+  if (record.value.deadLetterId !== options.expectedIdentity.deadLetterId) {
     return Result.err(
       new RedisEventDeadLetterContextMismatch({
         expectedKind: "record",
@@ -506,10 +727,10 @@ export function decryptRedisEventDeadLetterRecord(options: {
       }),
     );
   }
-  return Result.ok(record.data);
+  return Result.ok(record.value);
 }
 
-/** Redis adapter that durably accepts an encrypted v1 record before source acknowledgement. */
+/** Redis adapter that durably accepts an encrypted v2 record before source acknowledgement. */
 export class RedisEventDeadLetter implements EventDeadLetter {
   private readonly redis: Redis;
   private readonly encryptionKey: Uint8Array;
@@ -522,9 +743,9 @@ export class RedisEventDeadLetter implements EventDeadLetter {
   constructor(options: RedisEventDeadLetterOptions) {
     const keyPrefix = options.keyPrefix ?? "lilac:event-bus:dead-letter";
     this.redis = options.redis;
-    this.indexKey = `${keyPrefix}:records`;
-    this.recordPrefix = `${keyPrefix}:record`;
-    this.evidencePrefix = `${keyPrefix}:evidence`;
+    this.indexKey = `${keyPrefix}:v2:records`;
+    this.recordPrefix = `${keyPrefix}:v2:record`;
+    this.evidencePrefix = `${keyPrefix}:v2:evidence`;
     const config = validateRedisEventDeadLetterConfig({
       recordTtlSeconds: options.recordTtlSeconds ?? DEFAULT_RECORD_TTL_SECONDS,
       indexMaxLen: options.indexMaxLen ?? DEFAULT_INDEX_MAX_LEN,
@@ -537,111 +758,138 @@ export class RedisEventDeadLetter implements EventDeadLetter {
   }
 
   accept(
-    record: EventDeadLetterRecordV1,
+    record: EventDeadLetterRecord,
   ): Promise<ResultType<EventDeadLetterAcceptance, EventDeadLetterAcceptFailed>> {
     return captureDeadLetterAcceptance(async () => {
-      const recordKey = `${this.recordPrefix}:${record.deadLetterId}`;
-      const evidenceKey = `${this.evidencePrefix}:${record.deadLetterId}`;
-      const expiresAt = Date.now() + this.recordTtlSeconds * 1000;
-      let persistedRecord = record;
-      let encodedEvidence: string | undefined;
-
-      if (record.evidence.wire.kind === "controlled-reference") {
-        const locator = record.evidence.wire.locator;
-        let evidencePlaintext: string;
-        if (locator.kind === "redis-stream-entry") {
-          if (
-            locator.streamKey !== record.evidence.source.streamKey ||
-            locator.messageId !== record.evidence.source.messageId ||
-            locator.messageId !== record.source.messageId ||
-            record.evidence.source.topic !== record.source.topic
-          ) {
-            throw new Error("Referenced Redis source evidence identity is inconsistent");
-          }
-          const entries = (await this.redis.xrange(
-            locator.streamKey,
-            locator.messageId,
-            locator.messageId,
-          )) as unknown;
-          const evidence = decodeRedisDeadLetterEvidenceEntry(entries, locator.messageId);
-          if (evidence.status === "error") throw new Error(evidence.message);
-          evidencePlaintext = SuperJSON.stringify({
-            version: 1,
-            source: record.evidence.source,
-            fields: evidence.fields,
-          });
-        } else {
-          const existingEvidence = await this.redis.get(locator.key);
-          if (existingEvidence === null) {
-            throw new Error("Referenced Redis key evidence is no longer available");
-          }
-          evidencePlaintext = existingEvidence;
-        }
-        const encryptedEvidence = encryptRedisEventDeadLetterRecoveryValue({
-          encryptionKey: this.encryptionKey,
-          kind: "evidence",
-          identity: { deadLetterId: record.deadLetterId, storageKey: evidenceKey },
-          plaintext: evidencePlaintext,
-        });
-        if (encryptedEvidence.status === "error") throw encryptedEvidence.error;
-        encodedEvidence = encryptedEvidence.value;
-        persistedRecord = {
-          ...record,
-          evidence: {
-            source: record.evidence.source,
-            wire: {
-              kind: "controlled-reference",
-              locator: { kind: "redis-key", key: evidenceKey, expiresAt },
-              preview: record.evidence.wire.preview,
-            },
-          },
-        };
-      }
-
-      const encryptedRecord = encryptRedisEventDeadLetterRecoveryValue({
-        encryptionKey: this.encryptionKey,
-        kind: "record",
-        identity: { deadLetterId: record.deadLetterId, storageKey: recordKey },
-        plaintext: SuperJSON.stringify(persistedRecord),
-      });
-      if (encryptedRecord.status === "error") throw encryptedRecord.error;
-
+      const prepared = await this.prepare(record);
       const transaction = this.redis.multi();
-      if (encodedEvidence !== undefined) {
-        transaction.set(evidenceKey, encodedEvidence, "EX", this.recordTtlSeconds);
+      if (prepared.evidence !== undefined) {
+        transaction.set(prepared.evidence.key, prepared.evidence.value, "EX", prepared.ttlSeconds);
       }
-      transaction.set(recordKey, encryptedRecord.value, "EX", this.recordTtlSeconds);
-      transaction.xadd(
-        this.indexKey,
-        "MAXLEN",
-        "=",
-        String(this.indexMaxLen),
-        "*",
-        "version",
-        "1",
-        "deadLetterId",
-        record.deadLetterId,
-        "recordedAt",
-        String(record.recordedAt),
-        "topic",
-        record.source.topic,
-        "mode",
-        record.source.mode,
-        "reason",
-        record.reason.kind,
-        "recordKey",
-        recordKey,
-        "expiresAt",
-        String(expiresAt),
+      transaction.set(prepared.record.key, prepared.record.value, "EX", prepared.ttlSeconds);
+      transaction.zadd(
+        prepared.index.key,
+        prepared.index.score,
+        JSON.stringify(prepared.index.fields),
       );
+      transaction.zremrangebyrank(prepared.index.key, 0, -prepared.index.maxLen - 1);
       const results = await transaction.exec();
-      if (!results) throw new Error("Redis dead-letter transaction was aborted");
-      const receipt = decodeRedisDeadLetterTransactionId(
-        results,
-        encodedEvidence === undefined ? 1 : 2,
-      );
+      const receipt = decodeRedisDeadLetterTransactionId(results, prepared.evidence !== undefined);
       if (receipt.status === "error") throw receipt.cause;
-      return { id: receipt.id };
+      return { id: prepared.id };
     });
+  }
+
+  async serverTimeMs(): Promise<number> {
+    const decoded = decodeRedisDeadLetterTime(await this.redis.time());
+    if (decoded.status === "error") throw new Panic({ message: decoded.message });
+    return decoded.value.seconds * 1000 + Math.floor(decoded.value.microseconds / 1000);
+  }
+
+  async prepare(record: EventDeadLetterRecord): Promise<PreparedRedisEventDeadLetter> {
+    const decodedRecord = decodeEventDeadLetterRecord(record);
+    if (decodedRecord.status === "error") throw new Error(decodedRecord.message);
+    record = decodedRecord.value;
+    const recordKey = `${this.recordPrefix}:${record.deadLetterId}`;
+    const evidenceKey = `${this.evidencePrefix}:${record.deadLetterId}`;
+    const expiresAt = (await this.serverTimeMs()) + this.recordTtlSeconds * 1000;
+    let persistedRecord = record;
+    let evidenceMaterial: PreparedRedisEventDeadLetter["evidence"];
+
+    if (record.evidence.wire.kind === "controlled-reference") {
+      const locator = record.evidence.wire.locator;
+      let evidencePlaintext: string;
+      if (locator.kind === "redis-stream-entry") {
+        if (
+          locator.streamKey !== record.evidence.source.streamKey ||
+          locator.messageId !== record.evidence.source.messageId ||
+          locator.messageId !== record.source.messageId ||
+          record.evidence.source.topic !== record.source.topic
+        ) {
+          throw new Error("Referenced Redis source evidence identity is inconsistent");
+        }
+        const entries = (await this.redis.xrange(
+          locator.streamKey,
+          locator.messageId,
+          locator.messageId,
+        )) as unknown;
+        const evidence = decodeRedisDeadLetterEvidenceEntry(entries, locator.messageId);
+        if (evidence.status === "error") throw new Error(evidence.message);
+        evidencePlaintext = SuperJSON.stringify({
+          version: 2,
+          source: record.evidence.source,
+          fields: evidence.fields,
+        });
+      } else {
+        const existingEvidence = await this.redis.get(locator.key);
+        if (existingEvidence === null) {
+          throw new Error("Referenced Redis key evidence is no longer available");
+        }
+        evidencePlaintext = existingEvidence;
+      }
+      const encryptedEvidence = encryptRedisEventDeadLetterRecoveryValue({
+        encryptionKey: this.encryptionKey,
+        kind: "evidence",
+        identity: { deadLetterId: record.deadLetterId, storageKey: evidenceKey },
+        plaintext: evidencePlaintext,
+      });
+      if (encryptedEvidence.status === "error") throw encryptedEvidence.error;
+      evidenceMaterial = { key: evidenceKey, value: encryptedEvidence.value };
+      persistedRecord = {
+        ...record,
+        evidence: {
+          source: record.evidence.source,
+          wire: {
+            kind: "controlled-reference",
+            locator: { kind: "redis-key", key: evidenceKey, expiresAt },
+            preview: record.evidence.wire.preview,
+          },
+        },
+      };
+    }
+
+    const encryptedRecord = encryptRedisEventDeadLetterRecoveryValue({
+      encryptionKey: this.encryptionKey,
+      kind: "record",
+      identity: { deadLetterId: record.deadLetterId, storageKey: recordKey },
+      plaintext: SuperJSON.stringify(persistedRecord),
+    });
+    if (encryptedRecord.status === "error") throw encryptedRecord.error;
+    const indexFields = [
+      "version",
+      "2",
+      "deadLetterId",
+      record.deadLetterId,
+      "recordedAt",
+      String(record.recordedAt),
+      "topic",
+      record.source.topic,
+      "mode",
+      record.source.mode,
+      "reason",
+      record.reason.kind,
+      "recordKey",
+      recordKey,
+    ];
+    if (record.delivery.kind === "managed-v2") {
+      indexFields.push(
+        "physicalGroup",
+        record.delivery.physicalGroup,
+        "attempt",
+        String(record.delivery.attempt),
+      );
+    }
+    return {
+      id: record.deadLetterId,
+      record: { key: recordKey, value: encryptedRecord.value },
+      ...(evidenceMaterial === undefined ? {} : { evidence: evidenceMaterial }),
+      index: {
+        key: this.indexKey,
+        fields: indexFields,
+        score: record.recordedAt,
+        maxLen: this.indexMaxLen,
+      },
+      ttlSeconds: this.recordTtlSeconds,
+    };
   }
 }
