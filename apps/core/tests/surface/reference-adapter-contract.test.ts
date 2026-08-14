@@ -13,6 +13,7 @@ import {
 import {
   BUILTIN_SURFACE_PROTOCOLS,
   inferBuiltinSurfaceToolRequestTarget,
+  projectBuiltinSurfaceMessageRef,
   resolveBuiltinSurfaceRequestMessageRef,
 } from "../../src/surface/builtin-surface-protocols";
 import {
@@ -405,6 +406,25 @@ function recoverySnapshot(reference: ReferenceContract): GracefulRestartSnapshot
 }
 
 describe("shared Discord/GitHub adapter and descriptor contract", () => {
+  it("projects persisted message triples through the built-in protocol catalog", () => {
+    for (const protocol of Object.values(BUILTIN_SURFACE_PROTOCOLS)) {
+      expect(
+        projectBuiltinSurfaceMessageRef({
+          platform: protocol.platform,
+          channelId: "channel",
+          messageId: "message",
+        }),
+      ).toEqual({ platform: protocol.platform, channelId: "channel", messageId: "message" });
+    }
+    expect(
+      projectBuiltinSurfaceMessageRef({
+        platform: "slack",
+        channelId: "channel",
+        messageId: "message",
+      }),
+    ).toBeNull();
+  });
+
   it("classifies foreign request IDs through catalog composition", () => {
     const discordSession = BUILTIN_SURFACE_PROTOCOLS.discord.refs.createSessionRef("channel");
     const githubSession = BUILTIN_SURFACE_PROTOCOLS.github.refs.createSessionRef("octo/repo#1");

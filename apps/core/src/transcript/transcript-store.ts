@@ -28,10 +28,13 @@ import {
 import { Panic, Result, TaggedError, type Result as ResultType } from "better-result";
 
 import type { MsgRef } from "../surface/types";
+import { projectBuiltinSurfaceMessageRef } from "../surface/builtin-surface-protocols";
 import { adaptToolResultToHost } from "../tools/tool-result-adapters";
 import {
   decodeCoreLineageManifestRow as decodePersistedCoreLineageManifestRow,
   decodeCoreSurfaceProjectionRow as decodePersistedCoreSurfaceProjectionRow,
+  decodeDiscoveryRecordRow as decodePersistedDiscoveryRecordRow,
+  decodeRecentAgentWriteRow as decodePersistedRecentAgentWriteRow,
   decodeTranscriptCompactionContext as decodePersistedTranscriptCompactionContext,
   decodeTranscriptMessages,
   decodeTranscriptProviderState as decodePersistedTranscriptProviderState,
@@ -45,6 +48,8 @@ import {
   type DecodedCorePrimaryClaudeAttemptRow,
   type DecodedCorePrimaryClaudeBindingRow,
   type DecodedCoreSurfaceProjectionRow,
+  type DecodedDiscoveryRecordRow,
+  type DecodedRecentAgentWriteRow,
   type DecodedTranscriptBlobMetricsRow,
   type DecodedTranscriptCountRow,
   type DecodedTranscriptForeignKeyFailureRow,
@@ -52,6 +57,8 @@ import {
   type DecodedTranscriptRow,
   type PersistedCoreLineageManifestRow,
   type PersistedCoreSurfaceProjectionRow,
+  type PersistedDiscoveryRecordRow,
+  type PersistedRecentAgentWriteRow,
   type PersistedTranscriptRow,
   type TranscriptStorePersistedRowKind,
 } from "./transcript-persistence-codec";
@@ -74,6 +81,18 @@ function decodeTranscriptProviderState(
   input: Parameters<typeof decodePersistedTranscriptProviderState>[0],
 ) {
   return decodePersistedTranscriptProviderState(input);
+}
+
+function decodeRecentAgentWriteRow(
+  input: Parameters<typeof decodePersistedRecentAgentWriteRow>[0],
+): ResultType<DecodedPersistedValue<DecodedRecentAgentWriteRow>, PersistedDataError> {
+  return decodePersistedRecentAgentWriteRow(input);
+}
+
+function decodeDiscoveryRecordRow(
+  input: Parameters<typeof decodePersistedDiscoveryRecordRow>[0],
+): ResultType<DecodedPersistedValue<DecodedDiscoveryRecordRow>, PersistedDataError> {
+  return decodePersistedDiscoveryRecordRow(input);
 }
 
 type TranscriptStoreRowOutputMap = {
@@ -4014,17 +4033,7 @@ export class SqliteTranscriptStore implements TranscriptStore {
     const client = input?.client ?? null;
 
     const rows = this.db
-      .query<
-        {
-          request_id: string;
-          platform: string;
-          channel_id: string;
-          message_id: string;
-          updated_ts: number;
-          final_text: string | null;
-        },
-        [AdapterPlatform | null, number, number]
-      >(
+      .query<PersistedRecentAgentWriteRow, [AdapterPlatform | null, number, number]>(
         `
         SELECT
           rt.request_id,
@@ -4054,14 +4063,29 @@ export class SqliteTranscriptStore implements TranscriptStore {
 
     const out: RecentAgentWriteSnapshot[] = [];
     for (const row of rows) {
-      if (row.platform !== "discord" && row.platform !== "github") continue;
+      const decoded = decodeRecentAgentWriteRow({
+        row,
+        schemaVersion: TRANSCRIPT_SCHEMA_VERSION,
+        recordId: typeof row.request_id === "string" ? row.request_id : "unknown-record",
+      });
+      if (decoded.status === "error") {
+        this.reportPersistenceError(decoded.error);
+        continue;
+      }
+      const value = decoded.value.value;
+      const ref = projectBuiltinSurfaceMessageRef({
+        platform: value.platform,
+        channelId: value.channelId,
+        messageId: value.messageId,
+      });
+      if (!ref) continue;
       out.push({
-        requestId: row.request_id,
-        sessionId: row.channel_id,
-        client: row.platform,
-        messageId: row.message_id,
-        updatedTs: row.updated_ts,
-        finalText: row.final_text ?? undefined,
+        requestId: value.requestId,
+        sessionId: ref.channelId,
+        client: ref.platform,
+        messageId: ref.messageId,
+        updatedTs: value.updatedTs,
+        finalText: value.finalText ?? undefined,
       });
     }
 
@@ -4070,19 +4094,7 @@ export class SqliteTranscriptStore implements TranscriptStore {
 
   listDiscoveryRecords(): TranscriptDiscoveryRecord[] {
     const rows = this.db
-      .query<
-        {
-          request_id: string;
-          session_id: string;
-          request_client: string;
-          updated_ts: number;
-          final_text: string | null;
-          surface_platform: string | null;
-          surface_channel_id: string | null;
-          surface_message_id: string | null;
-        },
-        []
-      >(
+      .query<PersistedDiscoveryRecordRow, []>(
         `
         SELECT
           rt.request_id,
@@ -4104,31 +4116,32 @@ export class SqliteTranscriptStore implements TranscriptStore {
 
     const byRequestId = new Map<string, TranscriptDiscoveryRecord>();
     for (const row of rows) {
-      let record = byRequestId.get(row.request_id);
+      const decoded = decodeDiscoveryRecordRow({
+        row,
+        schemaVersion: TRANSCRIPT_SCHEMA_VERSION,
+        recordId: typeof row.request_id === "string" ? row.request_id : "unknown-record",
+      });
+      if (decoded.status === "error") {
+        this.reportPersistenceError(decoded.error);
+        continue;
+      }
+      const value = decoded.value.value;
+      let record = byRequestId.get(value.requestId);
       if (!record) {
         record = {
-          requestId: row.request_id,
-          sessionId: row.session_id,
-          requestClient: row.request_client as AdapterPlatform,
-          updatedTs: row.updated_ts,
-          finalText: row.final_text ?? undefined,
+          requestId: value.requestId,
+          sessionId: value.sessionId,
+          requestClient: value.requestClient,
+          updatedTs: value.updatedTs,
+          finalText: value.finalText ?? undefined,
           surfaceRefs: [],
         };
-        byRequestId.set(row.request_id, record);
+        byRequestId.set(value.requestId, record);
       }
 
-      if (
-        row.surface_platform !== null &&
-        row.surface_channel_id !== null &&
-        row.surface_message_id !== null &&
-        (row.surface_platform === "discord" || row.surface_platform === "github")
-      ) {
-        record.surfaceRefs.push({
-          platform: row.surface_platform,
-          channelId: row.surface_channel_id,
-          messageId: row.surface_message_id,
-        });
-      }
+      if (!value.surfaceRef) continue;
+      const ref = projectBuiltinSurfaceMessageRef(value.surfaceRef);
+      if (ref) record.surfaceRefs.push(ref);
     }
 
     return [...byRequestId.values()];

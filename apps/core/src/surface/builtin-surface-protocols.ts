@@ -6,7 +6,7 @@ import {
   type SurfaceProtocolRouting,
   type SurfaceToolRequestTarget,
 } from "./protocol";
-import type { MsgRefFor, RegisteredSurfacePlatform, SessionRefFor } from "./types";
+import type { MsgRef, MsgRefFor, RegisteredSurfacePlatform, SessionRefFor } from "./types";
 
 export const BUILTIN_SURFACE_PROTOCOLS = {
   discord: discordSurfaceProtocol,
@@ -36,6 +36,17 @@ export function getBuiltinSurfaceProtocol(
 ): SurfaceProtocolRouting<RegisteredSurfacePlatform> | undefined {
   if (!Object.hasOwn(BUILTIN_SURFACE_PROTOCOLS, platform)) return undefined;
   return BUILTIN_SURFACE_PROTOCOLS[platform as RegisteredSurfacePlatform];
+}
+
+export function projectBuiltinSurfaceMessageRef(input: {
+  readonly platform: string;
+  readonly channelId: string;
+  readonly messageId: string;
+}): MsgRef | null {
+  const protocol = getBuiltinSurfaceProtocol(input.platform);
+  if (!protocol) return null;
+  const sessionRef = protocol.refs.createSessionRef(input.channelId);
+  return protocol.refs.createMessageRef(sessionRef, input.messageId);
 }
 
 export function resolveBuiltinSurfaceRequestMessageRef<P extends RegisteredSurfacePlatform>(input: {

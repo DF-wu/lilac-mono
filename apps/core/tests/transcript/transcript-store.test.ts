@@ -863,6 +863,121 @@ describe("SqliteTranscriptStore", () => {
     await fs.rm(dir, { recursive: true, force: true });
   });
 
+  it("projects built-in transcript rows and diagnoses corrupt or unknown linked refs", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-transcript-projection-"));
+    const dbPath = path.join(dir, "transcripts.db");
+    const diagnostics: Array<{ recordId: string; field: string }> = [];
+    const store = new SqliteTranscriptStore(dbPath, undefined, (diagnostic) => {
+      diagnostics.push({ recordId: diagnostic.recordId, field: diagnostic.field });
+    });
+    const saveLinked = (
+      requestId: string,
+      requestClient: "discord" | "github" | "slack",
+      platform: "discord" | "github",
+      finalText: string,
+    ) => {
+      store.saveRequestTranscript({
+        requestId,
+        sessionId: `${requestId}-session`,
+        requestClient,
+        messages: [{ role: "assistant", content: finalText }],
+        finalText,
+      });
+      const channelId = `${requestId}-channel`;
+      const messageId = `${requestId}-message`;
+      const ref =
+        platform === "discord"
+          ? { platform: "discord" as const, channelId, messageId }
+          : { platform: "github" as const, channelId, messageId };
+      store.linkSurfaceMessagesToRequest({
+        requestId,
+        created: [ref],
+        last: ref,
+      });
+    };
+
+    saveLinked("discord-write", "discord", "discord", "discord fallback");
+    saveLinked("github-write", "github", "github", "github fallback");
+    saveLinked("corrupt-write", "discord", "discord", "corrupt fallback");
+    store.saveRequestTranscript({
+      requestId: "placeholder-request",
+      sessionId: "placeholder-session",
+      requestClient: "slack",
+      messages: [{ role: "assistant", content: "placeholder" }],
+      finalText: "placeholder fallback",
+    });
+
+    const db = new Database(dbPath);
+    db.run(
+      `INSERT INTO surface_message_to_request
+         (platform, channel_id, message_id, request_id, created_ts)
+       VALUES (?, ?, ?, ?, ?)`,
+      ["unknown", "placeholder-channel", "placeholder-message", "placeholder-request", 1],
+    );
+    db.run("UPDATE surface_message_to_request SET platform = ? WHERE request_id = ?", [
+      "future",
+      "corrupt-write",
+    ]);
+
+    const recent = store.listRecentAgentWrites({ limit: 20 });
+    expect(recent).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          requestId: "discord-write",
+          client: "discord",
+          finalText: "discord fallback",
+        }),
+        expect.objectContaining({
+          requestId: "github-write",
+          client: "github",
+          finalText: "github fallback",
+        }),
+      ]),
+    );
+    expect(recent.map((row) => row.requestId)).not.toContain("placeholder-request");
+    expect(recent.map((row) => row.requestId)).not.toContain("corrupt-write");
+
+    const discovery = store.listDiscoveryRecords();
+    expect(discovery).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          requestId: "placeholder-request",
+          requestClient: "slack",
+          surfaceRefs: [],
+        }),
+        expect.objectContaining({
+          requestId: "discord-write",
+          surfaceRefs: [
+            {
+              platform: "discord",
+              channelId: "discord-write-channel",
+              messageId: "discord-write-message",
+            },
+          ],
+        }),
+        expect.objectContaining({
+          requestId: "github-write",
+          surfaceRefs: [
+            {
+              platform: "github",
+              channelId: "github-write-channel",
+              messageId: "github-write-message",
+            },
+          ],
+        }),
+      ]),
+    );
+    expect(discovery.map((row) => row.requestId)).not.toContain("corrupt-write");
+    expect(diagnostics).toEqual([
+      { recordId: "corrupt-write", field: "recent-agent-write-row" },
+      { recordId: "corrupt-write", field: "discovery-record-row" },
+    ]);
+
+    db.close();
+    store.close();
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+
   it("roundtrips compaction metadata and rejects invalid metadata", async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-transcripts-"));
     const dbPath = path.join(dir, "transcripts.db");

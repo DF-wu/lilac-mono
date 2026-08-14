@@ -6161,6 +6161,8 @@ const CORE_TRANSCRIPT_PERSISTED_CODECS = [
   ["decodeTranscriptRow", "transcriptRowCodecCases"],
   ["decodeCoreSurfaceProjectionRow", "coreSurfaceProjectionRowCodecCases"],
   ["decodeCoreLineageManifestRow", "coreLineageManifestRowCodecCases"],
+  ["decodeRecentAgentWriteRow", "recentAgentWriteRowCodecCases"],
+  ["decodeDiscoveryRecordRow", "discoveryRecordRowCodecCases"],
 ].map(
   ([exportName, fixtureExportName]): PersistedCodecRegistration => ({
     identity: { module: "src/transcript/transcript-persistence-codec.ts", exportName },
@@ -6169,7 +6171,10 @@ const CORE_TRANSCRIPT_PERSISTED_CODECS = [
       module: "src/transcript/transcript-persistence-codec.ts",
       exportName: fixtureExportName,
     },
-    provenance: ["current", "migrated", "missing-defaulted"],
+    provenance:
+      exportName === "decodeRecentAgentWriteRow" || exportName === "decodeDiscoveryRecordRow"
+        ? ["current", "migrated"]
+        : ["current", "migrated", "missing-defaulted"],
   }),
 );
 
@@ -6179,6 +6184,8 @@ const CORE_TRANSCRIPT_PERSISTED_CONSUMERS = [
   ["decodeTranscriptRow", [2]],
   ["decodeCoreSurfaceProjectionRow", [3]],
   ["decodeCoreLineageManifestRow", [4]],
+  ["decodeRecentAgentWriteRow", [5]],
+  ["decodeDiscoveryRecordRow", [6]],
 ].map(
   ([exportName, codecIndexes]): PersistedStoreConsumerRegistration => ({
     identity: { module: "src/transcript/transcript-store.ts", exportName: String(exportName) },
@@ -7221,6 +7228,8 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
               "decodeTranscriptRow",
               "decodeCoreSurfaceProjectionRow",
               "decodeCoreLineageManifestRow",
+              "decodeRecentAgentWriteRow",
+              "decodeDiscoveryRecordRow",
             ].map((exportName) => ({
               identity: {
                 module: "src/transcript/transcript-persistence-codec.ts",

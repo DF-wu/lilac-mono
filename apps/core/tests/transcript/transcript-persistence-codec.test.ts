@@ -12,10 +12,14 @@ import {
   coreSurfaceProjectionRowCodecCases,
   decodeCoreLineageManifestRow,
   decodeCoreSurfaceProjectionRow,
+  decodeDiscoveryRecordRow,
+  decodeRecentAgentWriteRow,
   decodeTranscriptCompactionContext,
   decodeTranscriptMessages,
   decodeTranscriptProviderState,
   decodeTranscriptRow,
+  discoveryRecordRowCodecCases,
+  recentAgentWriteRowCodecCases,
   transcriptCompactionContextCodecCases,
   transcriptProviderStateCodecCases,
   transcriptRowCodecCases,
@@ -73,6 +77,46 @@ describe("transcript persistence codecs", () => {
     expectCatalog(transcriptStoreRowFixtures, decodeTranscriptRow);
     expectCatalog(coreSurfaceProjectionRowCodecCases, decodeCoreSurfaceProjectionRow);
     expectCatalog(coreLineageManifestRowCodecCases, decodeCoreLineageManifestRow);
+    expectCatalog(recentAgentWriteRowCodecCases, decodeRecentAgentWriteRow);
+    expectCatalog(discoveryRecordRowCodecCases, decodeDiscoveryRecordRow);
+  });
+
+  it("keeps placeholder request and linked platforms broad at the persistence boundary", () => {
+    const discovery = decodeDiscoveryRecordRow({
+      row: {
+        request_id: "placeholder-request",
+        session_id: "placeholder-session",
+        request_client: "whatsapp",
+        updated_ts: 10,
+        final_text: null,
+        surface_platform: "telegram",
+        surface_channel_id: "placeholder-channel",
+        surface_message_id: "placeholder-message",
+        surface_created_ts: 9,
+      },
+      schemaVersion: 5,
+      recordId: "placeholder-request",
+    });
+    expect(discovery.status).toBe("ok");
+    if (discovery.status === "ok") {
+      expect(discovery.value.value.requestClient).toBe("whatsapp");
+      expect(discovery.value.value.surfaceRef?.platform).toBe("telegram");
+    }
+
+    const recent = decodeRecentAgentWriteRow({
+      row: {
+        request_id: "placeholder-request",
+        platform: "web",
+        channel_id: "placeholder-channel",
+        message_id: "placeholder-message",
+        updated_ts: 10,
+        final_text: null,
+      },
+      schemaVersion: 5,
+      recordId: "placeholder-request",
+    });
+    expect(recent.status).toBe("ok");
+    if (recent.status === "ok") expect(recent.value.value.platform).toBe("web");
   });
 
   for (const startVersion of SUPPORTED_TRANSCRIPT_SCHEMA_STARTS) {

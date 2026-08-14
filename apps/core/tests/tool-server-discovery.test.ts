@@ -374,6 +374,35 @@ describe("tool-server discovery", () => {
       );
       expect(duplicateTranscript).toBeUndefined();
 
+      const indexedConversationSources = new Database(path.join(fixture.root, "discovery.db"));
+      try {
+        expect(
+          indexedConversationSources
+            .query<{ doc_key: string; kind: string }, []>(
+              `SELECT doc_key, kind
+               FROM discovery_documents
+               WHERE doc_key IN (
+                 'conversation:surface:discord:c1:m2',
+                 'conversation:transcript:discord:c1:req-surface',
+                 'conversation:transcript:github:owner/repo#12:req-github'
+               )
+               ORDER BY doc_key`,
+            )
+            .all(),
+        ).toEqual([
+          {
+            doc_key: "conversation:surface:discord:c1:m2",
+            kind: "surface_message",
+          },
+          {
+            doc_key: "conversation:transcript:github:owner/repo#12:req-github",
+            kind: "transcript_request",
+          },
+        ]);
+      } finally {
+        indexedConversationSources.close();
+      }
+
       const fileGroups = result.groups.filter((group) => group.origin?.kind === "file");
       expect(fileGroups.length).toBeGreaterThan(0);
       expect(

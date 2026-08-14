@@ -47,6 +47,7 @@ export const CORE_TRANSCRIPT_DIGEST_VERSION = 1 as const;
 const TRANSCRIPT_TABLE = "request_transcripts";
 const PROJECTION_TABLE = "core_surface_projections";
 const LINEAGE_TABLE = "core_primary_lineage_manifests";
+const SURFACE_LINK_TABLE = "surface_message_to_request";
 
 const adapterPlatformSchema = z.enum([
   "discord",
@@ -347,6 +348,54 @@ export type DecodedTranscriptBlobMetricsRow = {
   readonly unreferencedBytes: number;
 };
 
+export type PersistedRecentAgentWriteRow = {
+  readonly request_id: string;
+  readonly platform: string;
+  readonly channel_id: string;
+  readonly message_id: string;
+  readonly updated_ts: number;
+  readonly final_text: string | null;
+};
+
+export type DecodedRecentAgentWriteRow = {
+  readonly requestId: string;
+  readonly platform: AdapterPlatform;
+  readonly channelId: string;
+  readonly messageId: string;
+  readonly updatedTs: number;
+  readonly finalText: string | null;
+};
+
+export type PersistedDiscoveryRecordRow = {
+  readonly request_id: string;
+  readonly session_id: string;
+  readonly request_client: string;
+  readonly updated_ts: number;
+  readonly final_text: string | null;
+  readonly surface_platform: string | null;
+  readonly surface_channel_id: string | null;
+  readonly surface_message_id: string | null;
+  readonly surface_created_ts: number | null;
+};
+
+export type DecodedDiscoveryRecordRow = {
+  readonly requestId: string;
+  readonly sessionId: string;
+  readonly requestClient: AdapterPlatform;
+  readonly updatedTs: number;
+  readonly finalText: string | null;
+  readonly surfaceRef: {
+    readonly platform: AdapterPlatform;
+    readonly channelId: string;
+    readonly messageId: string;
+  } | null;
+};
+
+type DecodedRequiredPersistedValue<T> = {
+  readonly value: T;
+  readonly provenance: "current" | "migrated";
+};
+
 export type TranscriptStorePersistedRowKind =
   | "migration-version"
   | "foreign-key-failure"
@@ -514,6 +563,25 @@ const corePrimaryClaudeAttemptRowSchema = z.strictObject({
   last_reasoning: z.string().nullable(),
   created_ts: nonNegativeIntegerSchema,
   updated_ts: nonNegativeIntegerSchema,
+});
+const recentAgentWriteRowSchema = z.strictObject({
+  request_id: z.string().min(1),
+  platform: adapterPlatformSchema,
+  channel_id: z.string().min(1),
+  message_id: z.string().min(1),
+  updated_ts: nonNegativeIntegerSchema,
+  final_text: z.string().nullable(),
+});
+const discoveryRecordRowSchema = z.strictObject({
+  request_id: z.string().min(1),
+  session_id: z.string().min(1),
+  request_client: adapterPlatformSchema,
+  updated_ts: nonNegativeIntegerSchema,
+  final_text: z.string().nullable(),
+  surface_platform: adapterPlatformSchema.nullable(),
+  surface_channel_id: z.string().min(1).nullable(),
+  surface_message_id: z.string().min(1).nullable(),
+  surface_created_ts: nonNegativeIntegerSchema.nullable(),
 });
 
 type DecodedTranscriptStoreRow =
@@ -790,6 +858,97 @@ function aggregateProvenance(
   return values.some((value) => value.provenance === "missing-defaulted")
     ? "missing-defaulted"
     : "current";
+}
+
+export function decodeRecentAgentWriteRow(input: {
+  readonly row: unknown;
+  readonly schemaVersion: number;
+  readonly recordId: string;
+}): ResultType<DecodedRequiredPersistedValue<DecodedRecentAgentWriteRow>, PersistedDataError> {
+  const version = decodeSchemaVersion(input.schemaVersion, SURFACE_LINK_TABLE, input.recordId);
+  if (version.status === "error") return Result.err(version.error);
+  const decoded = recentAgentWriteRowSchema.safeParse(input.row);
+  if (!decoded.success) {
+    return Result.err(
+      corrupt({
+        table: SURFACE_LINK_TABLE,
+        field: "recent-agent-write-row",
+        version: version.value.version,
+        issueCode: "invalid-transcript-row",
+        recordId: input.recordId,
+      }),
+    );
+  }
+  return Result.ok({
+    value: {
+      requestId: decoded.data.request_id,
+      platform: decoded.data.platform,
+      channelId: decoded.data.channel_id,
+      messageId: decoded.data.message_id,
+      updatedTs: decoded.data.updated_ts,
+      finalText: decoded.data.final_text,
+    },
+    provenance: version.value.provenance,
+  });
+}
+
+export function decodeDiscoveryRecordRow(input: {
+  readonly row: unknown;
+  readonly schemaVersion: number;
+  readonly recordId: string;
+}): ResultType<DecodedRequiredPersistedValue<DecodedDiscoveryRecordRow>, PersistedDataError> {
+  const version = decodeSchemaVersion(input.schemaVersion, TRANSCRIPT_TABLE, input.recordId);
+  if (version.status === "error") return Result.err(version.error);
+  const decoded = discoveryRecordRowSchema.safeParse(input.row);
+  if (!decoded.success) {
+    return Result.err(
+      corrupt({
+        table: TRANSCRIPT_TABLE,
+        field: "discovery-record-row",
+        version: version.value.version,
+        issueCode: "invalid-transcript-row",
+        recordId: input.recordId,
+      }),
+    );
+  }
+  const linkedValues = [
+    decoded.data.surface_platform,
+    decoded.data.surface_channel_id,
+    decoded.data.surface_message_id,
+    decoded.data.surface_created_ts,
+  ];
+  const hasLinkedValue = linkedValues.some((value) => value !== null);
+  if (hasLinkedValue && linkedValues.some((value) => value === null)) {
+    return Result.err(
+      corrupt({
+        table: TRANSCRIPT_TABLE,
+        field: "discovery-record-row",
+        version: version.value.version,
+        issueCode: "invalid-transcript-row",
+        recordId: input.recordId,
+      }),
+    );
+  }
+  return Result.ok({
+    value: {
+      requestId: decoded.data.request_id,
+      sessionId: decoded.data.session_id,
+      requestClient: decoded.data.request_client,
+      updatedTs: decoded.data.updated_ts,
+      finalText: decoded.data.final_text,
+      surfaceRef:
+        decoded.data.surface_platform === null ||
+        decoded.data.surface_channel_id === null ||
+        decoded.data.surface_message_id === null
+          ? null
+          : {
+              platform: decoded.data.surface_platform,
+              channelId: decoded.data.surface_channel_id,
+              messageId: decoded.data.surface_message_id,
+            },
+    },
+    provenance: version.value.provenance,
+  });
 }
 
 export function decodeTranscriptRow(input: {
@@ -1333,6 +1492,101 @@ const fixtureTranscriptRow = {
   stable_named_request_client: null,
   transcript_digest: fixtureDigest,
 } as const satisfies PersistedTranscriptRow;
+
+const fixtureRecentAgentWriteRow = {
+  request_id: "fixture",
+  platform: "discord",
+  channel_id: "session",
+  message_id: "message",
+  updated_ts: 2,
+  final_text: "fixture",
+} as const satisfies PersistedRecentAgentWriteRow;
+
+export const recentAgentWriteRowCodecCases = {
+  current: {
+    input: { row: fixtureRecentAgentWriteRow, schemaVersion: 5, recordId: "current" },
+    outcome: "ok",
+    provenance: "current",
+  },
+  legacy: {
+    input: { row: fixtureRecentAgentWriteRow, schemaVersion: 1, recordId: "legacy" },
+    outcome: "ok",
+    provenance: "migrated",
+  },
+  "missing-defaulted": {
+    input: { row: null, schemaVersion: 5, recordId: "missing" },
+    outcome: "error",
+  },
+  "unsupported-version": {
+    input: { row: fixtureRecentAgentWriteRow, schemaVersion: 6, recordId: "unsupported" },
+    outcome: "error",
+  },
+  "malformed-serialization": {
+    input: {
+      row: { ...fixtureRecentAgentWriteRow, updated_ts: "{" },
+      schemaVersion: 5,
+      recordId: "malformed",
+    },
+    outcome: "error",
+  },
+  "corrupt-fields": {
+    input: {
+      row: { ...fixtureRecentAgentWriteRow, platform: "future" },
+      schemaVersion: 5,
+      recordId: "corrupt",
+    },
+    outcome: "error",
+  },
+} as const;
+
+const fixtureDiscoveryRecordRow = {
+  request_id: "fixture",
+  session_id: "session",
+  request_client: "slack",
+  updated_ts: 2,
+  final_text: "fixture",
+  surface_platform: "github",
+  surface_channel_id: "owner/repo#1",
+  surface_message_id: "1",
+  surface_created_ts: 1,
+} as const satisfies PersistedDiscoveryRecordRow;
+
+export const discoveryRecordRowCodecCases = {
+  current: {
+    input: { row: fixtureDiscoveryRecordRow, schemaVersion: 5, recordId: "current" },
+    outcome: "ok",
+    provenance: "current",
+  },
+  legacy: {
+    input: { row: fixtureDiscoveryRecordRow, schemaVersion: 1, recordId: "legacy" },
+    outcome: "ok",
+    provenance: "migrated",
+  },
+  "missing-defaulted": {
+    input: { row: null, schemaVersion: 5, recordId: "missing" },
+    outcome: "error",
+  },
+  "unsupported-version": {
+    input: { row: fixtureDiscoveryRecordRow, schemaVersion: 6, recordId: "unsupported" },
+    outcome: "error",
+  },
+  "malformed-serialization": {
+    input: {
+      row: { ...fixtureDiscoveryRecordRow, updated_ts: "{" },
+      schemaVersion: 5,
+      recordId: "malformed",
+    },
+    outcome: "error",
+  },
+  "corrupt-fields": {
+    input: {
+      row: { ...fixtureDiscoveryRecordRow, surface_message_id: null },
+      schemaVersion: 5,
+      recordId: "corrupt",
+    },
+    outcome: "error",
+  },
+} as const;
 
 export const transcriptCompactionContextCodecCases = {
   current: {
