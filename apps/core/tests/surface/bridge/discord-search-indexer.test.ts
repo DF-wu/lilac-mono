@@ -53,6 +53,7 @@ function indexedMessage(text: string): DiscordSearchIndexedMessage {
     ts: 1,
     deleted: false,
     updatedTs: 1,
+    attachments: [],
   };
 }
 

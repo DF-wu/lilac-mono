@@ -3,15 +3,18 @@ import { Database } from "bun:sqlite";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { createHash } from "node:crypto";
 import { parseCoreConfigV1ToUniversal, type CoreConfig } from "@stanley2058/lilac-utils";
 import { Panic, Result, type Result as ResultType } from "better-result";
 
 import {
   buildThreadSummaryInstructions,
+  buildThreadSummaryModelMessages,
   createConversationThreadToolService,
   ConversationThreadOperationFailed,
   ConversationThreadService as RuntimeConversationThreadService,
   ConversationThreadSummaryParseError,
+  filterUtilityModelAttachments,
 } from "../../src/conversation/thread-service";
 import { ConversationThreadSummarizationRemoteError } from "../../src/conversation/thread-worker";
 import type { ConversationThreadEmbeddingAdapter } from "../../src/conversation/thread-embedding";
@@ -172,6 +175,7 @@ function msg(input: {
   text: string;
   ts: number;
   editedTs?: number;
+  raw?: unknown;
 }): SurfaceMessage {
   return {
     ref: { platform: "discord", channelId: input.channelId, messageId: input.messageId },
@@ -186,6 +190,7 @@ function msg(input: {
     text: input.text,
     ts: input.ts,
     editedTs: input.editedTs,
+    raw: input.raw,
   };
 }
 
@@ -202,6 +207,7 @@ function indexedMessage(
     editedTs?: number;
     deleted?: boolean;
     updatedTs?: number;
+    attachments?: DiscordSearchIndexedMessage["attachments"];
   } = {},
 ): DiscordSearchIndexedMessage {
   const channelId = input.channelId ?? "c1";
@@ -224,6 +230,7 @@ function indexedMessage(
     editedTs: input.editedTs,
     deleted: input.deleted ?? false,
     updatedTs: input.updatedTs ?? 1,
+    attachments: input.attachments ?? [],
   };
 }
 
@@ -302,6 +309,21 @@ describe("conversation thread store", () => {
     expect(classifyConversationThreadMessageUpdate(before, { ...before, editedTs: 2 }, cfg)).toBe(
       "content",
     );
+    const imageAttachment = [{ id: "a1", filename: "image.png", mimeType: "image/png" }];
+    expect(
+      classifyConversationThreadMessageUpdate(
+        before,
+        { ...before, attachments: imageAttachment },
+        cfg,
+      ),
+    ).toBe("content");
+    expect(
+      classifyConversationThreadMessageUpdate(
+        { ...before, text: " ", attachments: [] },
+        { ...before, text: " ", attachments: imageAttachment },
+        cfg,
+      ),
+    ).toBe("topology");
     expect(classifyConversationThreadMessageUpdate(before, { ...before, text: " " }, cfg)).toBe(
       "topology",
     );
@@ -325,6 +347,34 @@ describe("conversation thread store", () => {
         cfg,
       ),
     ).toBe("topology");
+  });
+
+  it("preserves legacy thread input hashes while attachment state is unknown", async () => {
+    const dbPath = await createDbPath();
+    const searchStore = new DiscordSearchStore(dbPath);
+    searchStore.upsertMessages([
+      msg({ channelId: "c1", messageId: "m1", userId: "u1", text: "first", ts: 1 }),
+      msg({ channelId: "c1", messageId: "m2", userId: "u2", text: "second", ts: 2 }),
+    ]);
+    const db = new Database(dbPath);
+    db.run("UPDATE discord_search_messages SET attachments_hash = NULL");
+    db.close();
+    const threadStore = new ConversationThreadStore(dbPath);
+    threadStore.refreshInferredThreads();
+    const expectedHash = createHash("sha256")
+      .update(
+        [
+          ["c1", "m1", "u1", "user-u1", 1, "", "first"].join("\u001f"),
+          ["c1", "m2", "u2", "user-u2", 2, "", "second"].join("\u001f"),
+        ].join("\u001e"),
+      )
+      .digest("hex");
+
+    expect(threadStore.getThread("discord:channel:c1:m1")?.summary_input_hash).toBe(expectedHash);
+    threadStore.refreshInferredThreads();
+    expect(threadStore.getThread("discord:channel:c1:m1")?.summary_input_hash).toBe(expectedHash);
+    searchStore.close();
+    threadStore.close();
   });
 
   it("instructs summaries to use broad natural retrieval hints", () => {
@@ -3003,6 +3053,204 @@ describe("conversation thread store", () => {
 
     searchStore.close();
     threadStore.close();
+  });
+
+  it("includes newly indexed attachment-only messages and hydrates summary media", async () => {
+    const dbPath = await createDbPath();
+    const searchStore = new DiscordSearchStore(dbPath);
+    const threadStore = new ConversationThreadStore(dbPath);
+    searchStore.upsertMessages([
+      msg({
+        channelId: "c1",
+        messageId: "m1",
+        userId: "u1",
+        text: "",
+        ts: 1,
+        raw: {
+          attachments: [
+            {
+              id: "a1",
+              url: "https://cdn.discordapp.com/attachments/1/2/old.png",
+              filename: "diagram.png",
+              mimeType: "image/png",
+              size: 123,
+            },
+          ],
+        },
+      }),
+      msg({
+        channelId: "c1",
+        messageId: "m2",
+        userId: "u2",
+        text: "What do you think?",
+        ts: 2,
+      }),
+    ]);
+    threadStore.refreshInferredThreads();
+
+    let summarizedUrl = "";
+    const service = new ConversationThreadService({
+      store: threadStore,
+      getConfig: async () => testConfig(),
+      attachmentHydrator: async ({ refs }) =>
+        Result.ok(
+          refs.map((ref) => ({
+            ref,
+            attachments: [
+              {
+                id: "a1",
+                url: "https://cdn.discordapp.com/attachments/1/2/fresh.png",
+                filename: "diagram.png",
+                mimeType: "image/png",
+                size: 123,
+              },
+            ],
+          })),
+        ),
+      summarizer: async ({ messages }) => {
+        summarizedUrl = messages[0]?.attachments[0]?.url ?? "";
+        return { title: "Diagram discussion", brief: "A discussion about a diagram.", topics: [] };
+      },
+    });
+
+    const result = await service.runSummarization({ now: Date.now() + 2 * 60 * 60 * 1000 });
+
+    expect(result.summarized).toBe(1);
+    expect(summarizedUrl).toContain("fresh.png");
+    expect(threadStore.listMessages("discord:channel:c1:m1", 0, 10)[0]?.attachments).toEqual([
+      { id: "a1", filename: "diagram.png", mimeType: "image/png", size: 123 },
+    ]);
+    searchStore.close();
+    threadStore.close();
+  });
+
+  it("builds ordered multipart summary content with in-memory attachment bytes", async () => {
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = Object.assign(
+      async () =>
+        new Response(new Uint8Array([1, 2, 3]), {
+          headers: { "content-type": "image/png" },
+        }),
+      { preconnect: originalFetch.preconnect },
+    );
+    try {
+      const messages = await buildThreadSummaryModelMessages({
+        previous: "(none)",
+        promptContextSection: null,
+        omittedMessages: 0,
+        messages: [
+          {
+            channelId: "c1",
+            messageId: "m1",
+            ordinal: 0,
+            userId: "u1",
+            text: "See this diagram",
+            ts: 1,
+            attachments: [
+              {
+                id: "a1",
+                url: "https://cdn.discordapp.com/attachments/1/2/diagram.png",
+                filename: "diagram.png",
+                mimeType: "image/png",
+                size: 3,
+              },
+            ],
+          },
+        ],
+      });
+      const user = messages[0];
+      if (user?.role !== "user" || !Array.isArray(user.content)) {
+        throw new Error("Expected multipart user summary message");
+      }
+      expect(user.content.map((part) => part.type)).toEqual(["text", "text", "file"]);
+      const file = user.content[2];
+      expect(file?.type).toBe("file");
+      if (file?.type === "file") expect(file.data).toEqual(new Uint8Array([1, 2, 3]));
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it("omits unsupported utility media before downloading it", async () => {
+    const originalFetch = globalThis.fetch;
+    let fetchCalls = 0;
+    globalThis.fetch = Object.assign(
+      async () => {
+        fetchCalls += 1;
+        return new Response(new Uint8Array([1, 2, 3]));
+      },
+      { preconnect: originalFetch.preconnect },
+    );
+    try {
+      const messages = await buildThreadSummaryModelMessages({
+        previous: "(none)",
+        promptContextSection: null,
+        omittedMessages: 0,
+        capability: null,
+        messages: [
+          {
+            channelId: "c1",
+            messageId: "m1",
+            ordinal: 0,
+            userId: "u1",
+            text: "See this diagram",
+            ts: 1,
+            attachments: [
+              {
+                id: "a1",
+                url: "https://cdn.discordapp.com/attachments/1/2/diagram.png",
+                filename: "diagram.png",
+                mimeType: "image/png",
+                size: 3,
+              },
+            ],
+          },
+        ],
+      });
+      const user = messages[0];
+      if (user?.role !== "user" || !Array.isArray(user.content)) {
+        throw new Error("Expected multipart user summary message");
+      }
+      expect(user.content.map((part) => part.type)).toEqual(["text", "text", "text"]);
+      expect(fetchCalls).toBe(0);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it("filters planner media using the utility model capability", () => {
+    const input = [
+      {
+        role: "user" as const,
+        content: [
+          {
+            type: "file" as const,
+            data: new Uint8Array([1, 2, 3]),
+            filename: "diagram.png",
+            mediaType: "image/png",
+          },
+        ],
+      },
+    ];
+    const unsupported = filterUtilityModelAttachments(input, null);
+    const supported = filterUtilityModelAttachments(input, {
+      provider: "test",
+      model: "vision",
+      attachment: true,
+      limit: { context: 10_000, output: 1_000 },
+      modalities: { input: ["text", "image"] },
+    });
+
+    expect(
+      unsupported[0]?.role === "user" && Array.isArray(unsupported[0].content)
+        ? unsupported[0].content[0]?.type
+        : null,
+    ).toBe("text");
+    expect(
+      supported[0]?.role === "user" && Array.isArray(supported[0].content)
+        ? supported[0].content[0]?.type
+        : null,
+    ).toBe("file");
   });
 
   it("treats summary and embedding version mismatches as stale", async () => {

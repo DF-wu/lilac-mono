@@ -54,6 +54,53 @@ describe("discord search store", () => {
     }
   });
 
+  it("persists stable attachment metadata without signed URLs", () => {
+    const store = new DiscordSearchStore(":memory:");
+    const message: SurfaceMessage = {
+      ref: { platform: "discord", channelId: "123", messageId: "m1" },
+      session: { platform: "discord", channelId: "123" },
+      userId: "u1",
+      text: "",
+      ts: 1,
+      raw: {
+        attachments: [
+          {
+            id: "a1",
+            url: "https://cdn.discordapp.com/attachments/1/2/image.png?ex=secret",
+            filename: "image.png",
+            mimeType: "image/png",
+            size: 123,
+          },
+        ],
+      },
+    };
+
+    expect(store.upsertMessages([message])).toBe(1);
+    expect(store.getIndexedMessage({ channelId: "123", messageId: "m1" })?.attachments).toEqual([
+      { id: "a1", filename: "image.png", mimeType: "image/png", size: 123 },
+    ]);
+    expect(store.upsertMessages([message])).toBe(0);
+    expect(
+      store.upsertMessages([
+        {
+          ...message,
+          raw: {
+            attachments: [
+              {
+                id: "a2",
+                url: "https://cdn.discordapp.com/attachments/1/2/other.png?ex=other",
+                filename: "other.png",
+                mimeType: "image/png",
+                size: 456,
+              },
+            ],
+          },
+        },
+      ]),
+    ).toBe(1);
+    store.close();
+  });
+
   it("returns message mutations for inserts, edits, and duplicate updates", () => {
     const store = new DiscordSearchStore(":memory:");
     const service = new DiscordSearchService({

@@ -8,19 +8,23 @@ import {
   type ConversationThreadSummarizationWorkerTransport,
 } from "../../src/conversation/thread-worker";
 import type {
+  ThreadSummarizationParentMessage,
   ThreadSummarizationResult,
   ThreadSummarizationWorkerRequest,
 } from "../../src/conversation/thread-summarization-worker-protocol";
+import { Result } from "better-result";
 
 class FakeWorker implements ConversationThreadSummarizationWorkerTransport {
-  readonly requests: ThreadSummarizationWorkerRequest[] = [];
+  readonly requests: ThreadSummarizationParentMessage[] = [];
   terminated = false;
   postFailure: unknown;
+  onPost: (message: ThreadSummarizationParentMessage) => void = () => {};
   private messageListener: (event: MessageEvent<unknown>) => void = () => {};
   private errorListener: (panic: Panic) => void = () => {};
 
-  postMessage(request: ThreadSummarizationWorkerRequest): void {
+  postMessage(request: ThreadSummarizationParentMessage): void {
     this.requests.push(request);
+    this.onPost(request);
     if (this.postFailure !== undefined) throw this.postFailure;
   }
 
@@ -45,7 +49,9 @@ class FakeWorker implements ConversationThreadSummarizationWorkerTransport {
   }
 
   lastRequest(): ThreadSummarizationWorkerRequest {
-    const request = this.requests.at(-1);
+    const request = this.requests.findLast(
+      (item): item is ThreadSummarizationWorkerRequest => !("type" in item),
+    );
     if (!request) throw new Error("Expected the fake worker to receive a request");
     return request;
   }
@@ -69,12 +75,14 @@ function resultFixture(): ThreadSummarizationResult {
 function startClient(
   worker: FakeWorker,
   reportFatalPanic: ConversationThreadWorkerFatalReporter = () => {},
+  adapter?: Parameters<typeof startConversationThreadSummarizationWorker>[0]["adapter"],
 ) {
   return startConversationThreadSummarizationWorker({
     searchDbPath: "/data/search.sqlite",
     surfaceDbPath: "/data/surface.sqlite",
     createWorker: () => worker,
     reportFatalPanic,
+    adapter,
   });
 }
 
@@ -84,6 +92,74 @@ afterEach(() => {
 });
 
 describe("conversation thread summarization worker client", () => {
+  it("hydrates worker attachment requests through the surface adapter", async () => {
+    const worker = new FakeWorker();
+    const readStarted = Promise.withResolvers<void>();
+    const responsePosted = Promise.withResolvers<void>();
+    worker.onPost = (message) => {
+      if ("type" in message) responsePosted.resolve();
+    };
+    const readResponse =
+      Promise.withResolvers<
+        Awaited<ReturnType<NonNullable<Parameters<typeof startClient>[2]>["readMsg"]>>
+      >();
+    const client = startClient(worker, () => {}, {
+      async readMsg() {
+        readStarted.resolve();
+        return await readResponse.promise;
+      },
+    });
+
+    worker.emitMessage({
+      type: "hydrate-discord-attachments",
+      id: "hydrate-1",
+      refs: [{ channelId: "c1", messageId: "m1" }],
+    });
+    await readStarted.promise;
+    readResponse.resolve(
+      Result.ok({
+        ref: { platform: "discord", channelId: "c1", messageId: "m1" },
+        session: { platform: "discord", channelId: "c1" },
+        userId: "u1",
+        text: "",
+        ts: 1,
+        raw: {
+          attachments: [
+            {
+              id: "a1",
+              url: "https://cdn.discordapp.com/attachments/1/2/image.png",
+              filename: "image.png",
+              mimeType: "image/png",
+              size: 123,
+            },
+          ],
+        },
+      }),
+    );
+    await responsePosted.promise;
+
+    expect(worker.requests.at(-1)).toEqual({
+      type: "hydrate-discord-attachments-result",
+      id: "hydrate-1",
+      results: [
+        {
+          ref: { channelId: "c1", messageId: "m1" },
+          ok: true,
+          attachments: [
+            {
+              id: "a1",
+              url: "https://cdn.discordapp.com/attachments/1/2/image.png",
+              filename: "image.png",
+              mimeType: "image/png",
+              size: 123,
+            },
+          ],
+        },
+      ],
+    });
+    await client.stop();
+  });
+
   it("returns queued and completed successes without changing the wire request", async () => {
     const worker = new FakeWorker();
     const client = startClient(worker);
@@ -151,8 +227,8 @@ describe("conversation thread summarization worker client", () => {
     expect(firstResult.status).toBe("error");
     expect(secondResult.status).toBe("error");
     if (firstResult.status === "error" && secondResult.status === "error") {
-      expect(firstResult.error._tag).toBe("ThreadSummarizationWorkerResponseDecodeError");
-      expect(secondResult.error._tag).toBe("ThreadSummarizationWorkerResponseDecodeError");
+      expect(firstResult.error._tag).toBe("ThreadSummarizationWorkerMessageDecodeError");
+      expect(secondResult.error._tag).toBe("ThreadSummarizationWorkerMessageDecodeError");
     }
     const requestCount = worker.requests.length;
     const futureResult = await client.runSummarization({ wait: true });
@@ -160,7 +236,7 @@ describe("conversation thread summarization worker client", () => {
     expect(worker.requests).toHaveLength(requestCount);
     expect(futureResult.status).toBe("error");
     if (firstResult.status === "error" && futureResult.status === "error") {
-      expect(futureResult.error._tag).toBe("ThreadSummarizationWorkerResponseDecodeError");
+      expect(futureResult.error._tag).toBe("ThreadSummarizationWorkerMessageDecodeError");
       expect(futureResult.error).toBe(firstResult.error);
     }
     await client.stop();

@@ -1,6 +1,8 @@
 import { describe, expect, it } from "bun:test";
 
 import {
+  decodeThreadSummarizationParentMessage,
+  decodeThreadSummarizationWorkerMessage,
   decodeThreadSummarizationWorkerRequest,
   decodeThreadSummarizationWorkerResponse,
   type ThreadSummarizationResult,
@@ -26,6 +28,49 @@ function resultFixture(): ThreadSummarizationResult {
 }
 
 describe("conversation thread summarization worker protocol", () => {
+  it("decodes strict attachment hydration messages in both directions", () => {
+    const request = {
+      type: "hydrate-discord-attachments" as const,
+      id: "hydrate-1",
+      refs: [{ channelId: "c1", messageId: "m1" }],
+    };
+    const response = {
+      type: "hydrate-discord-attachments-result" as const,
+      id: "hydrate-1",
+      results: [
+        {
+          ref: request.refs[0]!,
+          ok: true as const,
+          attachments: [
+            {
+              id: "a1",
+              url: "https://cdn.discordapp.com/attachments/1/2/image.png",
+              filename: "image.png",
+              mimeType: "image/png",
+              size: 123,
+            },
+          ],
+        },
+      ],
+    };
+
+    const decodedRequest = decodeThreadSummarizationWorkerMessage(request);
+    const decodedResponse = decodeThreadSummarizationParentMessage(response);
+    expect(decodedRequest.status).toBe("ok");
+    if (decodedRequest.status === "ok") expect(decodedRequest.value).toEqual(request);
+    expect(decodedResponse.status).toBe("ok");
+    if (decodedResponse.status === "ok") expect(decodedResponse.value).toEqual(response);
+    expect(decodeThreadSummarizationWorkerMessage({ ...request, extra: true }).status).toBe(
+      "error",
+    );
+    expect(
+      decodeThreadSummarizationParentMessage({
+        ...response,
+        results: [{ ...response.results[0], attachments: [{ url: "not-a-url" }] }],
+      }).status,
+    ).toBe("error");
+  });
+
   it("decodes the complete existing request envelope", () => {
     const request = {
       id: "job-1",

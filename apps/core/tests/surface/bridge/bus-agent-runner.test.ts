@@ -47,6 +47,7 @@ import {
   type ClaudeNativeSessionStart,
   type MaterializedClaudeCodeRun,
 } from "@stanley2058/lilac-claude-code-bridge";
+import type { ConversationThreadToolService } from "../../../src/conversation/thread-service";
 
 import {
   AUTO_INJECTED_THREAD_BRIEF_DISPLAY_LENGTH,
@@ -7118,6 +7119,87 @@ describe("buildAutoInjectedThreadSearchMessages", () => {
 });
 
 describe("maybeBuildAutoInjectedThreadSearchMessages", () => {
+  it("plans from the latest attachment-only user message without falling back to older text", async () => {
+    const cfg = parseCoreConfigV1ToUniversal({
+      surface: { discord: { botName: "lilac", allowedChannelIds: ["c1"] } },
+    });
+    const autoInjectCfg: CoreConfig = {
+      ...cfg,
+      conversation: {
+        ...cfg.conversation,
+        thread: {
+          ...cfg.conversation.thread,
+          autoInject: {
+            enabled: true,
+            minTextUnits: 80,
+            followUpMinTextUnits: 110,
+            limit: 3,
+            minScore: 0.1,
+            mode: "hybrid",
+            filterCurrentParticipants: false,
+          },
+        },
+      },
+    };
+    const plannerInputs: Array<
+      Parameters<ConversationThreadToolService["planAutoInjectSearch"]>[0]
+    > = [];
+
+    const messages = await maybeBuildAutoInjectedThreadSearchMessages({
+      cfg: autoInjectCfg,
+      requestId: "attachment-only",
+      raw: {},
+      userMessages: [
+        { role: "user", content: "This older message must not be used for planning." },
+        {
+          role: "user",
+          content: [
+            {
+              type: "file",
+              data: new Uint8Array([1, 2, 3]),
+              filename: "diagram.png",
+              mediaType: "image/png",
+            },
+          ],
+        },
+      ],
+      conversationThreads: {
+        planAutoInjectSearch: async (input) => {
+          plannerInputs.push(input);
+          return autoInjectPlanForQuery("diagram contents", "Find prior diagram discussions.");
+        },
+        search: async () => ({
+          meta: {
+            query: "diagram contents",
+            limit: 3,
+            mode: "hybrid",
+            minScore: 0.1,
+            count: 0,
+            vectorAvailable: false,
+          },
+          results: [],
+        }),
+        metadata: async () => ({ threads: [], missing: [] }),
+        read: async () => {
+          throw new Error("not used");
+        },
+        runSummarization: async () => {
+          throw new Error("not used");
+        },
+      },
+      publishToolStatus: async () => {},
+      onError: () => {},
+    });
+
+    expect(messages).toEqual([]);
+    const plannerInput = plannerInputs[0];
+    expect(plannerInput?.text).toBe("");
+    expect(Array.isArray(plannerInput?.content)).toBe(true);
+    expect(Array.isArray(plannerInput?.content) ? plannerInput.content[0]?.type : null).toBe(
+      "file",
+    );
+  });
+
   it("includes dynamically capped brief metadata", async () => {
     const cfg = parseCoreConfigV1ToUniversal({
       surface: {
