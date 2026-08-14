@@ -71,6 +71,58 @@ identities as semantic analysis; there is no separate syntax exception catalog.
 Production tests, generated output, and the generated Core remote-runner bundle are excluded by
 `source-policy.ts` and `syntax-policy.mts`; their TypeScript source remains enforced.
 
+### Persisted Codecs
+
+Each `persistedCodecs` registration names one exact Result-returning callable, its persisted input
+parameter, one exact fixture catalog, and its complete success-provenance union. Success has the shape
+`{ value: Decoded; provenance }`; `current` and `migrated` are required, while
+`missing-defaulted` is allowed only for a genuine missing-value default contract. Decoded values and
+owned errors recursively exclude `any`, `unknown`, and `never`.
+
+The fixture catalog contains exactly `current`, `legacy`, `missing-defaulted`, `unsupported-version`,
+`malformed-serialization`, and `corrupt-fields`. Current and legacy fixtures succeed with their matching
+provenance. The missing fixture succeeds with `missing-defaulted` only when registered; otherwise it
+fails. Unsupported, malformed, and corrupt fixtures fail without provenance.
+
+Every codec is also an `operationalResultApis` entry. `persistedStoreConsumers` binds store policy to
+the complete codec set each consumer must call, and each consumer is likewise an operational Result API.
+`lilac/no-store-inline-decoding` rejects `JSON.parse`, Zod-style `parse` or `safeParse`, and their async
+variants in registered consumers and nested callbacks. Persisted decoding belongs in the registered
+codec, not in the store.
+
+### SQLite Results
+
+Each `sqliteTransactionAdapters` registration names the adapter, database and operation parameters,
+rollback sentinel, Panic classifier, and SQLite driver classifier. The adapter must:
+
+- accept a real `bun:sqlite` `Database` and a callback returning a direct Result;
+- invoke `Database.transaction` with a callback that returns a plain value;
+- throw one exact non-exported sentinel when the logical callback returns Err and recover only that
+  sentinel immediately outside the driver callback;
+- call the exact `better-result#Panic.is` registration and rethrow the same Panic;
+- return only failures recognized by the exact registered SQLite driver classifier;
+- rethrow every unrecognized thrown value as a defect; and
+- be linked in `operationalResultApis`.
+
+`architecture/no-result-err-in-sqlite-callback` resolves the actual `bun:sqlite` callback and
+`better-result` declarations. It rejects inline `Result.err` and named callbacks whose return type
+contains `Err`, preventing a logical failure from being committed as a plain callback return.
+
+Each `sqliteTransactionConsumers` entry must invoke its exact adapter and be linked in
+`operationalResultApis`. `lilac/no-direct-sqlite-transaction` rejects direct `.transaction()` calls and
+SQL `BEGIN`, `COMMIT`, or `ROLLBACK` in registered consumers and descendants. The registered adapter is
+the only rollback exception boundary.
+
+For either contract, land focused real compatibility or atomicity tests before registration, register
+every public or operational Result consumer, and add every owned module to the exact semantic zone.
+Manifest integrity rejects broad, missing, extra, and stale zones. Run `bun run test:architecture`,
+`bun run test:lint-rules`, `bun run typecheck:architecture`, `bun run typecheck:lint-plugins`, the
+architecture runner, `bun run lint`, and `bun run fmt:check` after changing these registrations.
+
+The real-library fixtures use installed `better-result` 3.0 and `bun:sqlite` to exercise all six
+persistence outcomes plus commit, logical-Err rollback, recognized driver failure mapping, and exact
+Panic identity propagation against in-memory SQLite.
+
 ## Performance
 
 `runner.ts check` validates workspace inventory and manifest integrity once in the parent, then analyzes
@@ -90,11 +142,8 @@ Focused integration tests spawn the real worker against checked-in `fixtures/wor
 assert its exact output and exit protocol. The fixture manifest is selected only for those direct test
 processes; `runner.ts check` removes the fixture selector from every production worker environment.
 
-On 2026-08-04, `/usr/bin/time -v bun scripts/architecture/runner.ts check` on the Stage 8 development
-checkout measured 61.67 seconds and 5,993,228 KB maximum RSS before subprocess partitioning. The same
-command after partitioning measured 76.68 seconds and 3,830,520 KB maximum RSS, a 36.1% peak reduction.
-On 2026-08-12, the current checkout measured 69.43 seconds and 3,413,012 KB before production-root and
-call-resolution optimization. The optimized serial command measured 65.83 seconds and 2,944,580 KB; the
-optimized `--workers=2` command measured 35.85 seconds and 3,285,296 KB.
-Re-run the command and record both wall time and maximum RSS when changing program creation, process
-partitioning, source traversal, or registration resolution.
+Measure architecture-runner changes with
+`/usr/bin/time -v bun scripts/architecture/runner.ts check` and the equivalent `--workers=2` command.
+Record wall time and maximum RSS for both when changing program creation, process partitioning, source
+traversal, or registration resolution. Compare the same checkout and environment before and after the
+change; dated development-checkout snapshots are not permanent benchmarks.

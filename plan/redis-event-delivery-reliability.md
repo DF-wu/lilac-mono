@@ -1,12 +1,10 @@
 # Redis Event Delivery Reliability Follow-Up
 
-## Status And Relationship To Stage 4
+## Status
 
-This is the separate runtime follow-up required by Stage 4 of
-`plan/boundary-type-safety-refactor.md`. Stage 4 establishes decoded event contracts, typed handler
-Results, transport-owned acknowledgement, and explicit delivery dispositions. This plan starts only
-after those contracts are stable; it is not a prerequisite for completing the type and failure-safety
-refactor.
+This is the active runtime follow-up to the boundary contracts summarized in `PROJECT.md`: complete event
+decoding, typed handler Results, transport-owned acknowledgement, and explicit delivery dispositions are
+already implemented. This plan does not change those established contracts.
 
 The follow-up covers Redis pending-entry reclamation, leased attempt ownership, retry scheduling,
 attempt exhaustion, idempotency and deduplication, the dead-letter/`XACK` crash window, and
@@ -24,8 +22,9 @@ The active event-bus path has these relevant contracts and behaviors:
   `park-pending` leaves an entry in the pending entries list (PEL) without scheduling retry.
 - `packages/event-bus/redis-streams-bus.ts` implements durable delivery with
   `XREADGROUP GROUP <group> <consumer> ... STREAMS <stream> ">"`. It invokes `XACK` only for `commit`
-  or after dead-letter acceptance. It does not call `XAUTOCLAIM`, `XCLAIM`, or read a consumer's
-  pending range.
+  or after dead-letter acceptance. It may inspect `XPENDING` summaries or bounded ranges for
+  trimming, cleanup, and observability, but it does not call `XAUTOCLAIM` or `XCLAIM`, reclaim
+  pending entries, or redispatch them to handlers.
 - `RedisStreamsBus.subscribe().stop()` deletes a durable consumer only when that consumer has
   no pending entries. A consumer that owns parked entries remains in Redis for manual inspection and
   recovery.
@@ -392,7 +391,7 @@ Expected files include changes to:
 
 ## Operational Recovery
 
-### Stage 4 Operations Before This Follow-Up
+### Operations Before This Follow-Up
 
 Recovery is manual today. With Core's default prefix, a topic stream is
 `lilac:event-bus:<topic>`; dead-letter records use

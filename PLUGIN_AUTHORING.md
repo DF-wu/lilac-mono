@@ -1,6 +1,8 @@
 # Plugin Authoring
 
-Lilac Level 1 and Level 2 tools now load through the same in-process plugin runtime.
+Core loads built-in and external Level 1 and Level 2 tools through the same in-process plugin runtime.
+This is the canonical external-plugin contract. Plugins are trusted Core code with the service user's
+authority.
 
 ## Package Layout
 
@@ -92,9 +94,7 @@ const plugin: LilacToolPlugin<unknown, Level1ToolSpec<unknown>, ServerTool> = {
 export default plugin;
 ```
 
-Native subagent availability is deployment-owned under `agent.subagents.profiles`. Level-1 tools are selected by both plugin id and tool name; Level-2 tools are selected by both plugin id and callable id. The same resolved profile is used for direct, generated-delegation, and user-authored workflow launches. A `"*"` entry includes every globally enabled contribution at that level.
-
-Plugins should keep `isEnabled` for runtime prerequisites, not caller classification.
+Keep `isEnabled` for runtime prerequisites, not caller classification.
 
 `defineServerTool` derives Level 2 lifecycle defaults, callable listing, CLI help, input
 decoding, and dispatch. Callable-map keys are the exact externally visible callable IDs; keep
@@ -127,16 +127,18 @@ plugins:
 - `plugins.disabled` disables a plugin without uninstalling it.
 - `plugins.config.<pluginId>` is passed through as `context.pluginConfig`.
 - `agent.subagents.profiles.<profile>.level1` and `.level2` select plugin contributions for that native profile.
+- Level 1 selection uses both plugin id and tool name; Level 2 selection uses both plugin id and callable
+  id. A `"*"` entry includes every globally enabled contribution at that level.
+- The same resolved native profile applies to direct, generated-delegation, and user-authored workflow
+  launches. Plugin code cannot grant a profile additional authority.
 - Plugins are expected to validate their own config, typically with Zod.
 
 ## Runtime Notes
 
-- Plugins run in-process and have the same privileges as core code.
 - Built-in Level 1 names are reserved. External Level 1 names are qualified by plugin ID in the
   model-facing catalog, so different plugins may use the same raw name.
 - Level 2 callable ids must be globally unique.
 - Level 2 tools can opt into a single string positional shortcut via `primaryPositional`, e.g. `tools fetch <url>`.
-- Built-in and external plugins share the same loading path and validation rules.
 - Hot reload is based on `core-config.yaml` and plugin directory contents; changing the built entrypoint and then calling `/reload`, `/list`, `/help/:callableId`, or `/call` will cause re-evaluation.
 
 ## Level 1 Output

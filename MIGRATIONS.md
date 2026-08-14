@@ -1,6 +1,7 @@
 # MIGRATIONS.md
 
-This file documents config-version changes in a form that is readable by both humans and agents.
+This file records persisted-data, wire, and protocol migrations. Manual `core-config.yaml` upgrades are
+documented separately in [`docs/core-config-migrations.md`](docs/core-config-migrations.md).
 
 ## Core SQLite
 
@@ -10,115 +11,30 @@ Existing rows retain an unknown attachment fingerprint and are not backfilled. N
 messages record known empty or populated attachment state; attachment bytes and signed Discord CDN URLs
 are not persisted.
 
-## Core Config
+## Historical Mini Lilac Database Schema 3
 
-Lilac parses `core-config.yaml` through a versioned parser into one universal runtime config shape. The app only consumes the universal shape.
-
-Rules:
-
-- New generated configs include `configVersion`.
-- Existing configs without `configVersion` are treated as `configVersion: 1`.
-- Lilac does not auto-upgrade config files at startup.
-- Versioned parsers own defaults for their version.
-- New behavior-changing defaults only apply to configs on the version that introduced them.
-- If a newer field cannot be represented safely in an older version, that field requires the newer `configVersion`.
-
-## v1
-
-`configVersion: 1` is the initial versioned config contract and matches the defaults used before config versioning was introduced.
-
-To make an existing implicit v1 config explicit, add:
-
-```yaml
-configVersion: 1
-```
-
-No field migrations are required for v1.
-
-## v2
-
-`configVersion: 2` uses the universal runtime config field names directly and changes several defaults.
-
-Field renames from v1:
-
-- `tools.experimental_hashline_edit` -> `tools.editFile.hashline`
-- `surface.discord.previewFinalOutputStyle` -> `surface.discord.outputPreviewModeFinalStyle`
-- `surface.discord.experimental.markdownTableRender` -> `surface.discord.markdownTableRender`
-
-Removed v2 fields:
-
-- `agent.subagents.idleTimeoutMs`; subagent idle timeouts are derived from `agent.idleTimeoutMs` as `floor(2/3)`, with a `1000ms` minimum.
-- `agent.subagents.defaultTimeoutMs` and `agent.subagents.maxTimeoutMs`; frozen v1 configs may still contain these legacy fields, but they are ignored during universal parsing.
-
-New v2 fields:
-
-- `workflows.maxActiveRuns`: principal-blind global admission cap across all nonterminal workflow runs, including scheduled and generated subagent runs; defaults to `64`. Frozen v1 configs receive the same universal fallback but cannot override it.
-- `agent.idleTimeoutMs`: primary agent inactivity timeout; defaults to `900000` (15 minutes). Active runs have no total runtime cap. Frozen v1 configs receive the same universal fallback but cannot override it.
-- `tools.inspect.model`: configurable Gemini model for `content.inspect`; must start with `google/`.
-- `models.capability.overrides.<provider/model>.attachment`: optional manual override for model attachment input support.
-- `conversation.thread.summarization.enabled`: default-false gate for background conversation thread summarization.
-- `conversation.thread.summarization.model`: model used for conversation thread summaries; defaults to `fast`.
-- `conversation.thread.summarization.concurrency`: number of threads to summarize concurrently inside one run; defaults to `1`.
-- `conversation.thread.summarization.batchSize`: maximum threads processed by one periodic run; defaults to `32`. Manual runs remain unbounded unless they provide a limit. Frozen v1 configs receive the same universal fallback but cannot override it.
-- `conversation.thread.summarization.includePromptContext`: default-false option to include `MEMORY.md`, `USER.md`, and optional `ENTITIES.md` as background-only summarization context.
-- `conversation.thread.embedding.enabled` and `conversation.thread.embedding.model`: default-false semantic thread embedding generation using an AI SDK embedding model ref.
-- `conversation.thread.autoInject.plannerModel`: optional model used for request-time auto-inject query planning; when unset, it inherits `conversation.thread.summarization.model`.
-- `conversation.thread.autoInject.minTextUnits`: minimum authored text mass before auto-injecting conversation thread metadata; defaults to `80`.
-- `conversation.thread.autoInject.followUpMinTextUnits`: higher text-mass threshold after prior auto-injected thread metadata exists in the same conversation; defaults to `110`.
-- `conversation.thread.autoInject.minScore`: minimum final `conversation.thread.search` score for auto-injected metadata; defaults to `0.1`.
-- `tools.output`: direct-result preview and transient artifact policy. Defaults to `40KiB`, `7d`, and `50MiB` per session.
-- `tools.historicalResultPruning`: compatibility policy for rewriting old tool results. It defaults to disabled with the prior `40000`/`20000` token thresholds retained when enabled.
-- `tools.batch.maxCalls`: maximum calls accepted by one batch; defaults to `8`.
-- Batch now expands children into ordinary Level 1 tool calls. Enabled tools are batchable by default; plugin authors can set `supportsBatch: false` to opt out.
-- `tools.media`: model-view inline binary limits. Defaults to `10MiB` per part and `20MiB` in total.
-- `agent.subagents.delegatePromptOverlay`: optional free-form guidance appended to the parent-visible `subagent_delegate` tool description.
-- `models.def.<alias>.comment`: optional guidance shown when an agent selects a model for a subagent.
-- `models.def.<alias>.agentCanSelect`: explicitly opts an alias into dynamic selection through `subagent_delegate`; defaults to `false`. It does not restrict static profiles, model slots, or explicit human overrides.
-- `surface.discord.markdownMathRender`: Discord markdown math rendering policy. Defaults to `{ enabled: false, maxWidth: 50, fallbackMode: source }`; frozen v1 configs receive this disabled universal fallback but cannot configure it.
-
-Changed v2 fields:
-
-- `agent.subagents.profiles.<profile>.execution` is `false | "restricted" | "native"`. `false` omits Bash, `restricted` exposes the virtual restricted Bash implementation, and `native` exposes trusted host Bash unless the surface is restricted. This intentionally replaces the earlier v2 boolean contract: change `true` to `native`; `false` remains valid.
-
-Tool byte-size fields accept `B`, `KB`, `MB`, `GB`, `KiB`, `MiB`, and `GiB`. Duration fields accept `ms`, `s`, `m`, `h`, `d`, `w`, and `mo`; `mo` is a fixed 30 days. These fields cannot be configured in the frozen v1 input shape, but v1 receives the same universal runtime defaults.
-
-Default changes from v1:
-
-- `tools.fsBackend: fff`
-- `tools.editFile.hashline: true`
-- `tools.inspect.model: google/gemini-3.5-flash` (`configVersion: 1` always uses `google/gemini-3-flash`)
-- `surface.discord.outputMode: preview`
-- `surface.discord.outputPreviewModeFinalStyle: plain`
-- `surface.discord.outputNotification: true`
-- `surface.discord.markdownTableRender: { enabled: true, style: unicode, maxWidth: 50, fallbackMode: list }`
-- `agent.reasoningDisplay: detailed`
-- Subagent idle timeouts derive from the primary agent timeout as `floor(2/3)`, with a `1000ms` minimum. This produces `600000` for the default `900000ms` primary timeout. Frozen v1 legacy timeout fields are ignored.
-- The built-in `explore` profile includes restricted Bash; `general` and `self` use native Bash. Frozen v1 profiles retain their historical no-Bash explore and native-Bash general/self behavior.
-
-## Mini Lilac Database Schema 3
-
-Mini Lilac migrates schema 2 databases to schema 3 transactionally at startup. Schema 3 preserves
-sessions, runs, commands, and todos, and replaces mutable full transcript rows and full-prefix undo
-checkpoint blobs with immutable, hash-chained model/UI nodes. Session heads and undo checkpoints
-reference those chains, so common prefixes are shared while legacy divergent checkpoint branches
-remain usable. The migration drops `run_chunks`, `model_transcript`, and `ui_messages`, and sets
-`user_version` to 3 only after all data and tables have migrated successfully. It does not run
-`VACUUM`. Database versions other than 0, 2, and 3 are rejected.
+The schema 2-to-3 step preserves sessions, runs, commands, and todos, and replaces mutable full
+transcript rows and full-prefix undo checkpoint blobs with immutable, hash-chained model/UI nodes.
+Session heads and undo checkpoints reference those chains, so common prefixes are shared while legacy
+divergent checkpoint branches remain usable. The step drops `run_chunks`, `model_transcript`, and
+`ui_messages` and does not run `VACUUM`. When schema 3 was current, the transaction set `user_version`
+to 3 only after migration succeeded and versions other than 0, 2, and 3 were rejected. The current
+schema 8 startup path described below supersedes that version acceptance and final-version behavior.
 
 Stream chunks are no longer durable SQLite state. An active session actor keeps a monotonic live log
 for replay, tail reconnect, resume projection, and final UI reconstruction. The log is discarded at
 run finalization. A process crash therefore retains no partial chunks and startup marks interrupted
 runs as errors; finalized canonical transcripts remain durable.
 
-## Mini Lilac Database Schema 4
+## Historical Mini Lilac Database Schema 4
 
-Mini Lilac migrates schema 3 databases to schema 4 transactionally at startup. Schema 4 rebuilds the
+The schema 3-to-4 step rebuilds the
 `sessions` table to widen its status `CHECK` with `compacting` and to add
 `input_tokens_estimated`. Every other table cascades from `sessions`, so the rebuild follows
 SQLite's documented recipe: `foreign_keys` off and `legacy_alter_table` on around the transaction,
 with `PRAGMA foreign_key_check` verified afterwards. No row content changes; existing sessions get
-`input_tokens_estimated = 0`. Database versions other than 0, 2, 3, and 4 are rejected, and a
-schema 2 database migrates through 3 to 4 in one startup.
+`input_tokens_estimated = 0`. When schema 4 was current, versions other than 0, 2, 3, and 4 were
+rejected, and a schema 2 database migrated through 3 to 4 in one startup.
 
 Behaviour changes that accompany the schema:
 
@@ -130,13 +46,43 @@ Behaviour changes that accompany the schema:
   with `input_tokens_estimated = 1`, where it previously wrote `NULL`. The next turn's reported
   usage clears the flag.
 
+## Historical Mini Lilac Database Schema 5
+
+The schema 4-to-5 step introduces workspace-owned durable history while preserving sessions, runs,
+commands, todos, and readable transcripts. It recomputes every transcript-node hash from its parent
+hash and serialized value, canonicalizes stored session working directories, creates one `workspaces`
+row per canonical directory, and rebuilds session/run ownership around that workspace identity.
+
+Legacy user checkpoints become immutable history states and prompt/steer transitions. Because schema
+4 had no workspace snapshots, every migrated state records `workspace_status = unavailable` and
+`workspace_unavailable_reason = legacy-migration`; migration does not claim that the filesystem can be
+restored. A linear active prompt remains an open transition and can recover. A readable quiescent
+history with no checkpoints, or with unusual checkpoint ordering, is preserved as one current
+migration state with undo disabled; unusual ordering while a run is active is rejected. Structural
+foreign-key, transcript-parent, active-run ownership, and unreadable persisted-data failures abort and
+roll back the migration. After successful conversion, `user_checkpoints` is dropped.
+
+The legacy migration codec also removes persisted `data-session` UI parts, converts the old
+`data-compaction.data.status` discriminant to `phase` (adding `outcome: compacted` for completed
+events), and removes non-user UI messages left empty by that normalization. This compatibility is
+specific to legacy database migration; it does not make the old protocol shape valid for current
+transcript writes or reads.
+
+## Historical Mini Lilac Database Schema 6
+
+The schema 5-to-6 step rebuilds `history_states` and `history_operations` without changing their rows.
+It widens the unavailable/skip reason `CHECK` constraints to admit `platform-unsupported`, preserving
+rowids, indexes, history topology, and all existing content. Fresh databases in the current startup
+path are created directly with the schema 6 table set before later migrations are applied.
+
 ## Mini Lilac Protocol: compaction lifecycle
 
 `miniLilacCompactionEventSchema` replaces its terminal-only `status: "completed" | "failed"` field
 with a `phase` discriminant (`started`, `progress`, `completed`, `failed`, `cancelled`) plus
 `outcome`, `progress`, `summary`, `elapsedMs`, `durationMs`, and `modelCalls`. Persisted
 `data-compaction` UI parts written by older builds carry `status` and no longer parse; they are
-rejected at the transcript boundary rather than silently dropped.
+rejected at the current transcript boundary rather than silently dropped. The legacy database
+migration normalization described under schema 5 is the only compatibility exception.
 
 `POST /sessions/:id/compact` returns a UI message event stream instead of a JSON body. Admission
 still happens before the stream opens, so a non-quiescent session is still a 409.
@@ -155,9 +101,7 @@ Clients that previously cancelled by aborting the request will no longer stop an
 Schema 7 adds provider-family metadata to history states and pending finalizations, plus
 exact-history-state Claude bindings and bounded attempt records for Mini main sessions. Existing
 history has unknown provider-family metadata and no native binding, so its next Claude turn starts a
-fresh persisted session rather than guessing that native state is synchronized. The current schema 8
-startup path applies this step to schema 6 and older supported databases in the same transaction as
-the schema 8 step.
+fresh persisted session rather than guessing that native state is synchronized.
 
 Successful Claude turns promote a binding only with their committed terminal history state. Main
 bindings remain attached to retained history states, allowing restart, undo, redo, and branch
@@ -174,7 +118,14 @@ are eligible; callers continue an automatically named child by reusing the retur
 
 Main-session schema 7 behavior is unchanged. Startup recovery marks interrupted named attempts
 uncertain and can finish a canonically verified pending success. Foreign keys are checked before
-`user_version` becomes 8. Fresh databases and supported schema 2 through 7 databases end at schema 8.
+`user_version` becomes 8.
+
+The current startup path accepts a fresh version 0 database and persisted schemas 2 through 8;
+schema 1 and every other version are rejected. Fresh databases are created at
+the schema 6 table set, and every supported older database receives all applicable steps through 8
+in one transaction. Migration uses `foreign_keys = OFF` and `legacy_alter_table = ON` for the required
+table rebuilds, verifies foreign keys before setting `user_version = 8`, restores both pragmas, and
+does not expose an intermediate schema as the completed startup state.
 
 ## Core Transcript Database Schemas 1-5
 
@@ -218,12 +169,24 @@ diagnostics and do not add a `core-config.yaml` key; the config contract remains
 ## Graceful Restart Snapshot v4
 
 Graceful restart snapshot v4 adds the optional non-empty `currentTurnUserId` to active and queued
-agent recovery entries. Snapshot v3 remains readable; because it did not persist this field, migration
-sets it to undefined and does not infer it from the original authenticated initiator.
+agent recovery entries. Persisted snapshots v1, v2, and v3 remain readable and are normalized to v4
+in memory; reads do not rewrite the SQLite row.
+
+- v1 and v2 relay entries default a missing `requestClient` to their relay `platform`; an explicit
+  disagreement is corrupt. Agent entries receive synthetic per-entry queue IDs, no queue-attempt
+  records, `currentTurnUserId: undefined`, and restricted recovery identity because those versions
+  persisted no durable proof. Their queue-attempt proof is `legacy-ambiguous` when any queued entry
+  exists and `complete` for active-only snapshots.
+- v3 preserves its complete queue-attempt proof, queue attempts, relay correlation, and durable
+  recovery identity. It receives only `currentTurnUserId: undefined`; the value is not inferred from
+  the original authenticated initiator.
+- v4 requires its current strict shape, including a non-empty value when `currentTurnUserId` is
+  present. Unsupported versions and malformed or correlation-invalid snapshots fail the persisted
+  boundary instead of being guessed or partially restored.
 
 ## Historical Workflow Schema 18
 
-Workflow capability review now stores a normalized maximum envelope with per-operation narrowing, exact Level-1 tools, concrete Level-2 callable IDs, destination-scoped origin surface operations, allowed roots, bounded reasoning, and explicit trusted executable authority.
+At schema 18, workflow capability review stored a normalized maximum envelope with per-operation narrowing, exact Level-1 tools, concrete Level-2 callable IDs, destination-scoped origin surface operations, allowed roots, bounded reasoning, and explicit trusted executable authority. Schema 20 later removed that envelope and approval model.
 
 Pre-envelope revisions cannot be interpreted without changing their approval meaning. Migration 18 therefore removes their dependent runs, triggers, approvals, and revision rows. Workflow source files remain in place and must be triggered and reviewed again under the new contract.
 
@@ -231,7 +194,7 @@ Pre-envelope revisions cannot be interpreted without changing their approval mea
 
 The unified programmatic workflow runtime does not read or migrate legacy `WorkflowDefinitionV2`/`WorkflowDefinitionV3` records. Existing `workflows` and `workflow_tasks` SQLite tables may remain on disk but are inert. Recreate scheduled jobs as JavaScript definitions plus `workflow.trigger.create`; existing approvals do not carry forward because approval identity includes the immutable source, schema, capability profile, project path, and runtime version.
 
-Deferred subagents now persist as generated unified workflow runs. Graceful-restart snapshots no longer contain runner-local deferred child handles, output cursors, timers, or buffered completions. Active generated runs and pending live-parent deliveries recover from the durable workflow database; terminal results fall back to a durable progress card when the parent cannot be restored.
+Deferred subagents persist as generated unified workflow runs. Graceful-restart snapshots no longer contain runner-local deferred child handles, output cursors, timers, or buffered completions. Active generated runs and pending live-parent deliveries recover from the durable workflow database. At this clean break, terminal results fell back to a durable progress card when the parent could not be restored; Schema 24 supersedes that behavior by durably orphaning unreachable live-parent deliveries instead.
 
 At the time of this clean break, workflow JavaScript ran inside a fail-closed OS sandbox that required a systemd-PID1 Docker image with Bubblewrap, cgroup v2, and a reachable `lilac` user systemd manager. That deployment requirement is historical and is superseded by Schema 21, which runs the deterministic program child as a plain Bun subprocess. See the Schema 21 section below.
 
@@ -289,3 +252,32 @@ The v4 API also removes the unused public `parallel(..., { concurrency })` optio
 Terminal results, terminal detail, and requested result artifacts are returned without sensitivity gating. Sensitive input fields, argument hashes, and progress values remain redacted. The obsolete `includeSensitiveResult` run-inspection option is removed.
 
 This is a clean break for persisted v3 execution identity. Migration 23 archives bounded summaries for old revisions, runs, triggers, and terminal receipts; quarantines nonterminal runs and active triggers; deactivates dispatches; and removes v3 executable rows. Source definition files remain on disk and can be corrected and saved as v4 definitions. The request-dispatch table no longer has a hard expiry column; active state, run and operation state, dispatch epochs, owner heartbeats, idle cancellation, and exact terminal receipts govern its lifecycle.
+
+## Workflow Schema 24
+
+Schema 24 makes an unreachable live-parent delivery a durable `orphaned` state instead of creating a
+fallback progress card. Migration rebuilds `workflow_completion_deliveries`, converts every historical
+`fallback` delivery to `orphaned`, and clears `progress_target_json` on the corresponding live-parent
+run so the retired fallback card is not recreated. Other delivery fields, including materialization
+attempt/error state, are preserved.
+
+At startup, pending live-parent chains are retained only when their parent request is restorable or
+reachable through another retained active workflow request. An unreachable nonterminal run has its
+operations and waits cancelled, active dispatches deactivated, and run terminalized as `cancelled`
+before its delivery becomes `orphaned`. An unreachable terminal run keeps its terminal state and
+result, but its delivery becomes `orphaned`. This reconciliation is idempotent and does not reinterpret
+an orphan as delivered.
+
+## Workflow Schema 25
+
+Schema 25 adds nullable `permanent_failure_json` to each durable workflow surface binding. Existing
+v24 bindings keep their message reference, rendered hash, retry count, next attempt, errors, and
+timestamps and receive no permanent failure. The v24 persistence reader also treats the absent field
+as `null`; v25 rows require the field.
+
+A permanent surface failure or missing registered progress port now persists a gate containing the
+operation/reason, failure time, message, and surface configuration revision. The projector clears its
+retry time and revokes active controls, and startup reconciliation does not repeat the same permanent
+failure while the target and configuration revision still match. A changed target or progress-port
+configuration clears the stale gate and allows projection to be attempted again; retryable failures
+continue to use the existing durable backoff state.
