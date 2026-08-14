@@ -100,13 +100,13 @@ Trust admission starts at authenticated Discord ingress or verified GitHub webho
 
 The typed API wraps Redis Streams and decodes complete `Message<unknown>` envelopes through the canonical event codec registry before handlers receive domain messages.
 
-- `work` is a durable consumer group with competing consumers.
-- `fanout` is a durable consumer group per `subscriptionId`; each distinct subscription receives every event.
+- `work` is a managed durable consumer group with competing consumers.
+- `fanout` is a managed durable consumer group per `subscriptionId`; each distinct subscription receives every event.
 - `tail` is a non-durable read without a consumer group and may start at the beginning, now, or a cursor.
 
-Every subscription handler returns `Result<void, TaggedError>` and supplies an explicit delivery policy. Success commits. An error policy must choose `commit`, `park-pending`, `dead-letter`, or `stop`. `park-pending` leaves durable work in the Redis pending-entry list and is not an automatic retry; tail subscriptions cannot park and stop instead. Contract-invalid transport or event data is dead-lettered by the package policy. Dead-letter failure parks durable delivery or stops tail delivery. Throws, malformed Results, and Panics are defects handled by the registered fatal boundary, not ordinary handler failures. Manual fetch decodes the complete batch and fails on the first invalid entry rather than exposing it as typed data.
+Every subscription handler returns `Result<void, TaggedError>` and supplies an explicit delivery policy. Success commits. A managed durable error policy may choose `commit`, `retry`, `park-pending`, `dead-letter`, or `stop`; tail does not retry. `retry` uses the package-owned lease, attempt, and capped-backoff policy. `park-pending` leaves durable work in the Redis pending-entry list and is excluded from automatic reclamation. Contract-invalid transport or event data is dead-lettered by the package policy. Throws, malformed Results, and Panics are defects handled by the registered fatal boundary, not ordinary handler failures. Manual fetch decodes the complete batch and fails on the first invalid entry rather than exposing it as typed data.
 
-Durable consumers need stable `subscriptionId` values. `consumerId` identifies one process within a group, and the Redis stream entry ID is the cursor/checkpoint.
+Durable consumers need stable `subscriptionId` values. The transport maps them to versioned physical groups created at the current stream end, leases each invocation, heartbeats live attempts, and reclaims expired attempts with token fencing. Delivery is at-least-once: handlers that perform external effects own their idempotency. The fixed policy allows five attempts before Redis-only dead-letter exhaustion. Managed dead-letter persistence, source acknowledgement, and delivery-metadata cleanup are atomic; ordinary commit atomically acknowledges and removes metadata. `consumerId` identifies one process within a group, and the Redis stream entry ID is the cursor/checkpoint. Tail delivery retains its cursor behavior and no lease.
 
 ## Tools, Plugins, And Skills
 

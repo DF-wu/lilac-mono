@@ -11,6 +11,23 @@ Existing rows retain an unknown attachment fingerprint and are not backfilled. N
 messages record known empty or populated attachment state; attachment bytes and signed Discord CDN URLs
 are not persisted.
 
+## Redis Managed Event Delivery V2
+
+Durable event-bus subscriptions use new transport-owned physical consumer-group names and create missing
+groups at the current stream end. Existing unversioned groups, pending entries, and stream entries are not
+replayed or migrated. They remain in Redis until an operator deliberately removes the old groups or data;
+the v2 runtime never treats them as managed work.
+
+The v2 delivery path stores lease, attempt, retry, and terminalization metadata in a separate versioned
+Redis namespace. Existing v1 dead-letter records remain under their old keys and are not readable through
+the v2 record codec. New encrypted records use the `:v2:` dead-letter namespace and are finalized
+atomically with source acknowledgement. Deployments that need old event or dead-letter evidence must
+export it before switching versions.
+
+Durable subscriptions no longer accept a start offset and always handle only entries added after their v2
+physical group is created. Publisher-supplied approximate `MAXLEN` retention is removed. Expiring output
+streams remain tail-only, and supported trimming preserves all managed pending frontiers.
+
 ## Historical Mini Lilac Database Schema 3
 
 The schema 2-to-3 step preserves sessions, runs, commands, and todos, and replaces mutable full
