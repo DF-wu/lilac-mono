@@ -2,6 +2,7 @@ import { Panic, Result, TaggedError, type Result as ResultType } from "better-re
 import type { AdapterPlatform } from "@stanley2058/lilac-event-bus";
 
 import type { SurfaceAdapter } from "../surface/adapter";
+import { getBuiltinSurfaceProtocol } from "../surface/builtin-surface-protocols";
 import type {
   AgentRecoveryAttempt,
   AgentRecoveryUnavailable,
@@ -231,8 +232,9 @@ export function prepareSurfaceRecovery(input: {
     { readonly requestId: string; readonly sessionId: string }
   >();
   for (const entry of input.snapshot.agent) {
-    if (entry.requestClient === "discord" || entry.requestClient === "github") {
-      requiredAgentSurfaces.set(entry.requestClient, {
+    const protocol = getBuiltinSurfaceProtocol(entry.requestClient);
+    if (protocol) {
+      requiredAgentSurfaces.set(protocol.platform, {
         requestId: entry.requestId,
         sessionId: entry.sessionId,
       });

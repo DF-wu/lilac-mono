@@ -101,7 +101,7 @@ import {
   shouldCancelRunPolicyRequest,
   shouldCancelIdleOnlyGlobalRequest,
   shouldUsePersistentCoreClaudeRuntime,
-  startBusAgentRunner,
+  startBusAgentRunner as startBusAgentRunnerProduction,
   startBusAgentRunnerTerminalCleanup,
   shouldEnableAnthropicPromptCache,
   selectPersistedTranscriptMessages,
@@ -161,6 +161,11 @@ import {
 import { bridgeAdapterToBus } from "../../../src/surface/bridge/publish-to-bus";
 import { bridgeBusToAdapter } from "../../../src/surface/bridge/subscribe-from-bus";
 import { createDiscordRelayPolicy } from "../../../src/surface/discord/discord-runtime-descriptor";
+import { getBuiltinSurfaceProtocol } from "../../../src/surface/builtin-surface-protocols";
+import type {
+  ResolvedSurfaceProtocol,
+  SurfaceProtocolResolver,
+} from "../../../src/surface/runtime-descriptor";
 import { formatSurfaceMetadataLine } from "../../../src/surface/bridge/surface-metadata";
 import type {
   AdapterEventHandler,
@@ -195,6 +200,20 @@ import {
   type TestRawMessageHandler,
   type TestRawSubscriptionHost,
 } from "../../helpers/result-raw-bus";
+
+const TEST_SURFACE_PROTOCOL_RESOLVER: SurfaceProtocolResolver = {
+  resolve: (platform) => {
+    const protocol = getBuiltinSurfaceProtocol(platform);
+    return protocol ? ({ platform: protocol.platform, protocol } as ResolvedSurfaceProtocol) : null;
+  },
+};
+
+function startBusAgentRunner(params: Parameters<typeof startBusAgentRunnerProduction>[0]) {
+  return startBusAgentRunnerProduction({
+    ...params,
+    surfaceProtocolResolver: params.surfaceProtocolResolver ?? TEST_SURFACE_PROTOCOL_RESOLVER,
+  });
+}
 
 function transcriptResultValue<T, E>(result: ResultType<T, E>): T {
   if (result.status === "error") throw result.error;

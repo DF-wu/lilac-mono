@@ -233,6 +233,7 @@ import {
 } from "./bus-agent-runner/prompt-overlays";
 import { resolveSessionSafetyMode, type SessionSafetyMode } from "../session-policy";
 import type { AuthenticatedSurfaceOrigin, SurfacePrincipal } from "../types";
+import type { SurfaceProtocolResolver } from "../runtime-descriptor";
 import type {
   CustomCommandExecutionError,
   CustomCommandManager,
@@ -2549,6 +2550,7 @@ export async function startBusAgentRunner(params: {
     AuthenticatedRequestProjectionInvalid
   >;
   requestMessageCache?: RequestMessageCache;
+  surfaceProtocolResolver?: SurfaceProtocolResolver;
   startPaused?: boolean;
   beforeRequestIntake?: (
     message: DecodedLilacMessageForTopic<"cmd.request">,
@@ -4497,13 +4499,16 @@ export async function startBusAgentRunner(params: {
             }
             workflowRequestClaimed = true;
             workflowPolicy = authorized.policy;
+            const fallbackClient = authorized.policy.originSession.client;
+            const fallbackProtocol = fallbackClient
+              ? params.surfaceProtocolResolver?.resolve(fallbackClient)
+              : null;
             trustedFallbackSurface =
               authorized.policy.originSession.sessionId &&
-              (authorized.policy.originSession.client === "discord" ||
-                authorized.policy.originSession.client === "github") &&
+              fallbackProtocol &&
               authorized.policy.originSession.userId
                 ? {
-                    platform: authorized.policy.originSession.client,
+                    platform: fallbackProtocol.platform,
                     sessionId: authorized.policy.originSession.sessionId,
                     userId: authorized.policy.originSession.userId,
                   }
@@ -4821,8 +4826,7 @@ export async function startBusAgentRunner(params: {
             safetyMode = "trusted";
           } else if (
             workflowPolicy ||
-            next.requestClient === "discord" ||
-            next.requestClient === "github"
+            (params.surfaceProtocolResolver?.resolve(next.requestClient) ?? null) !== null
           ) {
             let capabilityOrigin: AuthenticatedSurfaceOrigin | undefined = next.authenticatedOrigin;
             if (trustedFallbackSurface) {

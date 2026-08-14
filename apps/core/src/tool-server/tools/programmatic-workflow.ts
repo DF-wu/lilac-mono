@@ -45,6 +45,7 @@ import {
 import { redactWorkflowValue } from "../../workflow/workflow-progress-view";
 import { adaptEventPublishResultToHost } from "../../shared/event-bus-result";
 import { getBuiltinSurfaceProtocol } from "../../surface/builtin-surface-protocols";
+import type { RegisteredSurfacePlatform } from "../../surface/types";
 
 function adaptWorkflowInvocationResultToToolHost(
   result: ResultType<CreateWorkflowInvocationResult, CreateWorkflowInvocationError>,
@@ -139,7 +140,7 @@ const definitionListInputSchema = z.strictObject({
 const progressInputSchema = z
   .strictObject({
     requestOrigin: z.literal(true).optional(),
-    client: z.enum(["discord", "github"]).optional(),
+    client: z.string().min(1).max(200).optional(),
     sessionId: z.string().min(1).max(200).optional(),
   })
   .superRefine((progress, ctx) => {
@@ -257,20 +258,52 @@ function validateWorkflowRequestIdentity(
 function resolveWorkflowProgressTarget(
   progress: z.output<typeof progressInputSchema> | undefined,
   requestTarget: ReturnType<typeof requestProgressTarget>,
+  explicitPlatform: RegisteredSurfacePlatform | null,
+  requestPlatform: RegisteredSurfacePlatform | null,
 ): WorkflowRun["progressTarget"] {
-  if (progress?.client) {
+  if (progress?.client && explicitPlatform) {
     return {
-      platform: progress.client,
+      platform: explicitPlatform,
       channelId: progress.sessionId!,
       replyToMessageId: null,
     };
   }
-  if (!requestTarget) return null;
+  if (!requestTarget || !requestPlatform) return null;
   return {
-    platform: requestTarget.platform,
+    platform: requestPlatform,
     channelId: requestTarget.sessionRef.channelId,
     replyToMessageId: null,
   };
+}
+
+function resolveRequestWorkflowProgressPlatform(
+  progress: z.output<typeof progressInputSchema> | undefined,
+  requestTarget: ReturnType<typeof requestProgressTarget>,
+  progressCards: WorkflowProgressCardService | undefined,
+): RegisteredSurfacePlatform | null {
+  if (!requestTarget) return null;
+  const platform = progressCards?.resolveTarget(requestTarget.platform) ?? null;
+  if (platform === requestTarget.platform) return platform;
+  if (progress?.requestOrigin) {
+    return signalWorkflowToolFailureToHost(
+      `Workflow request-origin surface is not registered with a progress port: ${requestTarget.platform}`,
+    );
+  }
+  return null;
+}
+
+function resolveExplicitWorkflowProgressPlatform(
+  progress: z.output<typeof progressInputSchema> | undefined,
+  progressCards: WorkflowProgressCardService | undefined,
+): RegisteredSurfacePlatform | null {
+  if (!progress?.client) return null;
+  const platform = progressCards?.resolveTarget(progress.client) ?? null;
+  if (!platform || platform !== progress.client) {
+    return signalWorkflowToolFailureToHost(
+      `Workflow progress surface is not registered with a progress port: ${progress.client}`,
+    );
+  }
+  return platform;
 }
 
 function resolveScheduleTiming(
@@ -672,6 +705,15 @@ export class ProgrammaticWorkflow implements ServerTool {
     const context = adaptWorkflowToolResultToHost(decodeTriggerContext(opts?.context));
     adaptWorkflowToolResultToHost(validateWorkflowRequestIdentity(context));
     const requestTarget = requestProgressTarget(context);
+    const explicitProgressPlatform = resolveExplicitWorkflowProgressPlatform(
+      input.progress,
+      this.params.progressCards,
+    );
+    const requestProgressPlatform = resolveRequestWorkflowProgressPlatform(
+      input.progress,
+      requestTarget,
+      this.params.progressCards,
+    );
     const definition = adaptWorkflowDefinitionResultToToolHost(
       await definitions.getResult({ scope: input.scope, name: input.name }),
     );
@@ -733,7 +775,12 @@ export class ProgrammaticWorkflow implements ServerTool {
     if (schedule.kind === "timestamp" && !Number.isFinite(timestampAt)) {
       return signalWorkflowToolFailureToHost(`Invalid workflow trigger timestamp: ${schedule.at}`);
     }
-    const progressTarget = resolveWorkflowProgressTarget(input.progress, requestTarget);
+    const progressTarget = resolveWorkflowProgressTarget(
+      input.progress,
+      requestTarget,
+      explicitProgressPlatform,
+      requestProgressPlatform,
+    );
     const trigger: WorkflowTrigger = {
       triggerId,
       revisionId,
@@ -906,6 +953,15 @@ export class ProgrammaticWorkflow implements ServerTool {
     const context = adaptWorkflowToolResultToHost(decodeTriggerContext(opts?.context));
     adaptWorkflowToolResultToHost(validateWorkflowRequestIdentity(context));
     const requestTarget = requestProgressTarget(context);
+    const explicitProgressPlatform = resolveExplicitWorkflowProgressPlatform(
+      input.progress,
+      this.params.progressCards,
+    );
+    const requestProgressPlatform = resolveRequestWorkflowProgressPlatform(
+      input.progress,
+      requestTarget,
+      this.params.progressCards,
+    );
     const definition = adaptWorkflowDefinitionResultToToolHost(
       await definitions.getResult({ scope: input.scope, name: input.name }),
     );
@@ -953,7 +1009,12 @@ export class ProgrammaticWorkflow implements ServerTool {
     const runId = `wfrun:${canonicalJsonSha256(
       projectWorkflowJsonObject({ idempotencyKey, invocationFingerprint }),
     )}`;
-    const progressTarget = resolveWorkflowProgressTarget(input.progress, requestTarget);
+    const progressTarget = resolveWorkflowProgressTarget(
+      input.progress,
+      requestTarget,
+      explicitProgressPlatform,
+      requestProgressPlatform,
+    );
     const run: WorkflowRun = {
       runId,
       revisionId,

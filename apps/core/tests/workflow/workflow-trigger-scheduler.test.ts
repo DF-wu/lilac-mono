@@ -227,6 +227,7 @@ describe("workflow trigger scheduler", () => {
     const bus = createLilacBus(new CapturingRawBus());
     const panic = new Panic({ message: "progress card defect" });
     const progressCards: WorkflowProgressCardService = {
+      resolveTarget: () => "discord",
       ensureInitialCard: async () => {
         throw panic;
       },

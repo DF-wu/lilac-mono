@@ -44,6 +44,7 @@ const WORKFLOW_PROGRESS_STARTUP_RECONCILIATION_BATCH_SIZE = 1_000;
 const MAX_WORKFLOW_PROGRESS_RECONCILIATION_RETRY_DELAY_MS = 60_000;
 
 export interface WorkflowProgressCardService {
+  resolveTarget(platform: string): RegisteredSurfacePlatform | null;
   ensureInitialCard(runId: string): Promise<MsgRef>;
   requestProjection(runId: string): void;
 }
@@ -393,6 +394,10 @@ export class WorkflowProgressProjector implements WorkflowProgressCardService {
       last + (this.input.minEditIntervalMs ?? 1_000) - now,
     );
     this.scheduleProjectionAfter(runId, Math.max(0, delay));
+  }
+
+  resolveTarget(platform: string): RegisteredSurfacePlatform | null {
+    return findWorkflowProgressPort(this.input.ports, platform)?.platform ?? null;
   }
 
   private scheduleProjectionAfter(runId: string, delayMs: number): void {

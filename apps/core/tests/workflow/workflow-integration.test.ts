@@ -35,6 +35,7 @@ import type {
 } from "../../src/surface/types";
 import { createDiscordWorkflowProgressPort } from "../../src/surface/discord/discord-runtime-descriptor";
 import { discordSurfaceProtocol } from "../../src/surface/discord/discord-surface-protocol";
+import type { SurfaceProtocolResolver } from "../../src/surface/runtime-descriptor";
 import { ProgrammaticWorkflow } from "../../src/tool-server/tools/programmatic-workflow";
 import { DurableWorkflowStore } from "../../src/workflow/durable-workflow-store";
 import { startWorkflowActionResolver } from "../../src/workflow/workflow-action-resolver";
@@ -51,6 +52,11 @@ import { createCoreToolPluginManager, type CoreToolPluginManager } from "../../s
 import { createToolServer } from "../../src/tool-server/create-tool-server";
 import { RequestControlAuthority } from "../../src/tool-server/request-control-authority";
 import type { RequestContext, ServerTool } from "../../src/tool-server/types";
+
+const TEST_SURFACE_PROTOCOL_RESOLVER: SurfaceProtocolResolver = {
+  resolve: (platform) =>
+    platform === "discord" ? { platform, protocol: discordSurfaceProtocol } : null,
+};
 
 function createWorkflowProgressProjectorForTest(
   input: Omit<ConstructorParameters<typeof WorkflowProgressProjector>[0], "reportFatalPanic">,
@@ -263,6 +269,7 @@ describe("unified workflow integration", () => {
       bus,
       store,
       subscriptionId: "integration-actions",
+      surfaceProtocolResolver: TEST_SURFACE_PROTOCOL_RESOLVER,
     });
     const tool = new ProgrammaticWorkflow({
       dataDir,
@@ -361,6 +368,7 @@ describe("unified workflow integration", () => {
       config,
       pluginManager,
       durableWorkflowStore: store,
+      surfaceProtocolResolver: TEST_SURFACE_PROTOCOL_RESOLVER,
       requestMessageCache,
       reportFatalPanic: (panic) => {
         throw panic;

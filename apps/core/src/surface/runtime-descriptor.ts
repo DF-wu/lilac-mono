@@ -356,8 +356,19 @@ type ResolvedSurfaceDescriptor<T> = T extends RegisteredBoundSurfaceRuntimeDescr
   ? Pick<T, "platform" | "protocol" | "adapter">
   : never;
 
+type ResolvedSurfaceProtocolDescriptor<T> = T extends RegisteredBoundSurfaceRuntimeDescriptor
+  ? Pick<T, "platform" | "protocol">
+  : never;
+
 export type ResolvedSurfaceAdapter =
   ResolvedSurfaceDescriptor<RegisteredBoundSurfaceRuntimeDescriptor>;
+
+export type ResolvedSurfaceProtocol =
+  ResolvedSurfaceProtocolDescriptor<RegisteredBoundSurfaceRuntimeDescriptor>;
+
+export type SurfaceProtocolResolver = {
+  resolve(platform: AdapterPlatform): ResolvedSurfaceProtocol | null;
+};
 
 export type SurfaceAdapterResolver = {
   registeredPlatforms(): readonly RegisteredSurfacePlatform[];
@@ -441,6 +452,19 @@ export class SurfaceRuntimeRegistry {
           protocol: descriptor.protocol,
           adapter: descriptor.adapter,
         } as ResolvedSurfaceAdapter;
+      },
+    };
+  }
+
+  protocolResolver(): SurfaceProtocolResolver {
+    return {
+      resolve: (platform) => {
+        const descriptor = this.#byPlatform.get(platform);
+        if (!descriptor) return null;
+        return {
+          platform: descriptor.platform,
+          protocol: descriptor.protocol,
+        } as ResolvedSurfaceProtocol;
       },
     };
   }

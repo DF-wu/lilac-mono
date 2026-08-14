@@ -1764,6 +1764,7 @@ export async function createCoreRuntime(
           bus,
           store: durableWorkflowStore,
           subscriptionId: subId(subscriptionPrefix, "workflow-actions"),
+          surfaceProtocolResolver: registry.protocolResolver(),
         });
 
         // Subscribe durably before adapter.connect() so replies around startup replay.
@@ -2033,6 +2034,7 @@ export async function createCoreRuntime(
           durableWorkflowStore,
           projectAuthenticatedRequest,
           requestMessageCache: requestMessageCache ?? undefined,
+          surfaceProtocolResolver: registry.protocolResolver(),
           startPaused: restartSnapshot !== null,
           issueControlCapability: async (input) => {
             const cachedRequest = requestMessageCache?.getOrigin(input.requestId);

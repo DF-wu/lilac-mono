@@ -31,6 +31,7 @@ import { githubSurfaceProtocol } from "../../src/surface/github/github-surface-p
 import type {
   RegisteredSurfacePlatform,
   RegisteredSurfaceWorkflowProgressRegistration,
+  SurfaceProtocolResolver,
   SurfaceWorkflowProgressPort,
 } from "../../src/surface/runtime-descriptor";
 import type {
@@ -43,11 +44,33 @@ import type {
 } from "../../src/surface/types";
 import { SurfaceAdapterTestBase } from "../helpers/surface-adapter-test-base";
 import { DurableWorkflowStore } from "../../src/workflow/durable-workflow-store";
-import { startWorkflowActionResolver } from "../../src/workflow/workflow-action-resolver";
+import { startWorkflowActionResolver as startWorkflowActionResolverProduction } from "../../src/workflow/workflow-action-resolver";
 import { sha256 } from "../../src/workflow/workflow-definition";
 import { WorkflowProgressProjector } from "../../src/workflow/workflow-progress-projector";
 const HASH_A = "a".repeat(64);
 const HASH_B = "b".repeat(64);
+
+const TEST_SURFACE_PROTOCOL_RESOLVER: SurfaceProtocolResolver = {
+  resolve: (platform) => {
+    switch (platform) {
+      case "discord":
+        return { platform, protocol: discordSurfaceProtocol };
+      case "github":
+        return { platform, protocol: githubSurfaceProtocol };
+      default:
+        return null;
+    }
+  },
+};
+
+function startWorkflowActionResolver(
+  input: Parameters<typeof startWorkflowActionResolverProduction>[0],
+) {
+  return startWorkflowActionResolverProduction({
+    ...input,
+    surfaceProtocolResolver: input.surfaceProtocolResolver ?? TEST_SURFACE_PROTOCOL_RESOLVER,
+  });
+}
 
 type WorkflowProgressProjectorTestInput = Omit<
   ConstructorParameters<typeof WorkflowProgressProjector>[0],
@@ -1901,7 +1924,7 @@ describe("WorkflowProgressProjector", () => {
       rmSync(dbPath, { force: true });
     }
   });
-  it("commits an authenticated action rejected by owner validation", async () => {
+  it("commits actions with mismatched refs or unregistered platforms as malformed", async () => {
     const dbPath = tempDbPath("workflow-malformed-action-commit");
     const store = new DurableWorkflowStore(dbPath);
     const raw = new CapturingRawBus();
@@ -1925,7 +1948,18 @@ describe("WorkflowProgressProjector", () => {
         },
         ts: 20,
       });
-      expect(raw.commits).toBe(1);
+      await bus.publish(lilacEventTypes.EvtAdapterActionInvoked, {
+        actionId: "unregistered-action-token",
+        platform: "slack",
+        userId: "user-1",
+        messageRef: {
+          platform: "slack",
+          channelId: "channel-1",
+          messageId: "message-1",
+        },
+        ts: 20,
+      });
+      expect(raw.commits).toBe(2);
     } finally {
       warning.mockRestore();
       await resolver.stop();

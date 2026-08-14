@@ -892,6 +892,53 @@ describe("surface runtime lifecycle", () => {
     expect(calls).toEqual([]);
   });
 
+  it("requires a catalog surface descriptor even when it is absent from the registry", () => {
+    const calls: string[] = [];
+    const created = SurfaceRuntimeRegistry.create([
+      createDiscordSurfaceRuntimeDescriptor({
+        adapter: new TestAdapter("discord", calls),
+        adapterIngress: {
+          start: async () => ({ platform: "discord", stop: async () => undefined }),
+        },
+        createRelay: (guardedAdapter) => ({
+          ...createDiscordRelayPolicy(guardedAdapter),
+          lifecycle: {
+            platform: "discord",
+            start: async () => emptyRelayHandle("discord"),
+          },
+        }),
+      }),
+    ]);
+    if (created.status === "error") throw created.error;
+    const handles = maps();
+    const prepared = prepareSurfaceRecovery({
+      registry: created.value,
+      snapshot: recoverySnapshot(
+        [
+          {
+            ...agentEntry,
+            requestId: "github:octo/repo:1:request",
+            sessionId: "octo/repo#1",
+            requestClient: "github",
+          },
+        ],
+        [],
+      ),
+      relays: handles.relays,
+      agentRunner: testAgentRecovery(),
+    });
+
+    expect(prepared.status).toBe("error");
+    if (prepared.status === "error") {
+      expect(prepared.error).toMatchObject({
+        _tag: "SurfaceRecoveryUnavailable",
+        platform: "github",
+        reason: "descriptor-unavailable",
+      });
+    }
+    expect(calls).toEqual([]);
+  });
+
   it("rejects an agent-only cache conflict before relay preparation or apply", () => {
     const calls: string[] = [];
     const registry = createRegistry({ calls });

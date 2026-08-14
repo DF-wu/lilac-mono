@@ -14,13 +14,18 @@ import { createLogger, formatTaggedErrorForLog } from "@stanley2058/lilac-utils"
 import { DurableWorkflowStore, type WorkflowActionOutboxEntry } from "./durable-workflow-store";
 import { workflowConsumerId } from "./workflow-consumer-id";
 import { sha256 } from "./workflow-definition";
+import type { MsgRef } from "../surface/types";
+import type {
+  ResolvedSurfaceProtocol,
+  SurfaceProtocolResolver,
+} from "../surface/runtime-descriptor";
 
 const surfaceActionEventSchema = z.strictObject({
   actionId: z.string().min(16).max(200),
-  platform: z.enum(["discord", "github"]),
+  platform: z.string().min(1).max(200),
   userId: z.string().min(1).max(200),
   messageRef: z.strictObject({
-    platform: z.enum(["discord", "github"]),
+    platform: z.string().min(1).max(200),
     channelId: z.string().min(1).max(200),
     messageId: z.string().min(1).max(200),
   }),
@@ -152,9 +157,21 @@ function decodeWorkflowActionOutboxEvent(
 function decodeWorkflowSurfaceAction(
   eventId: string,
   data: EvtAdapterActionInvokedData,
-): ResultType<z.output<typeof surfaceActionEventSchema>, WorkflowActionMalformed> {
+  surfaceProtocolResolver: SurfaceProtocolResolver | undefined,
+): ResultType<
+  Omit<z.output<typeof surfaceActionEventSchema>, "platform" | "messageRef"> & {
+    readonly platform: ResolvedSurfaceProtocol["platform"];
+    readonly messageRef: MsgRef;
+  },
+  WorkflowActionMalformed
+> {
   const decoded = surfaceActionEventSchema.safeParse(data);
-  if (!decoded.success || decoded.data.platform !== decoded.data.messageRef.platform) {
+  const resolved = surfaceProtocolResolver?.resolve(data.platform) ?? null;
+  const messageRef = resolved?.protocol.refs.decodeMessageRef({
+    ref: data.messageRef,
+    expectedSessionId: data.messageRef.channelId,
+  });
+  if (!decoded.success || !resolved || !messageRef || messageRef.status === "error") {
     return Result.err(
       new WorkflowActionMalformed({
         eventId,
@@ -162,7 +179,11 @@ function decodeWorkflowSurfaceAction(
       }),
     );
   }
-  return Result.ok(decoded.data);
+  return Result.ok({
+    ...decoded.data,
+    platform: resolved.platform,
+    messageRef: messageRef.value,
+  });
 }
 
 async function captureWorkflowActionOutboxPublication(
@@ -222,6 +243,7 @@ export async function startWorkflowActionResolver(input: {
   bus: LilacBus;
   store: DurableWorkflowStore;
   subscriptionId: string;
+  surfaceProtocolResolver?: SurfaceProtocolResolver;
   now?: () => number;
 }): Promise<{ stop(): Promise<void> }> {
   const logger = createLogger({ module: "workflow-action-resolver" });
@@ -305,7 +327,11 @@ export async function startWorkflowActionResolver(input: {
           await drainOutbox();
           return Result.ok(undefined);
         }
-        const event = decodeWorkflowSurfaceAction(message.id, message.data);
+        const event = decodeWorkflowSurfaceAction(
+          message.id,
+          message.data,
+          input.surfaceProtocolResolver,
+        );
         if (event.status === "error") {
           logger.warn("Rejected malformed authenticated surface action event", {
             eventId: message.id,

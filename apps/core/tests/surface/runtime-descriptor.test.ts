@@ -849,6 +849,20 @@ describe("surface runtime registry", () => {
     expect(created.value.adapterResolver().resolve("github")).toBeNull();
   });
 
+  it("resolves registered protocols without exposing adapters or lifecycle ports", () => {
+    const created = SurfaceRuntimeRegistry.create([discordDescriptor()]);
+    if (created.status === "error") throw created.error;
+
+    const resolved = created.value.protocolResolver().resolve("discord");
+    expect(resolved).toEqual({
+      platform: "discord",
+      protocol: BUILTIN_SURFACE_PROTOCOLS.discord,
+    });
+    expect(Object.keys(resolved ?? {})).toEqual(["platform", "protocol"]);
+    expect(created.value.protocolResolver().resolve("github")).toBeNull();
+    expect(created.value.protocolResolver().resolve("slack")).toBeNull();
+  });
+
   it("exposes only a descriptor-bound adapter facade from direct registrations", async () => {
     const adapter = new TestAdapter("discord");
     spyOn(adapter, "listSessions").mockResolvedValue(
