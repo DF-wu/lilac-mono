@@ -164,7 +164,7 @@ export type DeliveryError =
   | { readonly _tag: "HandlerFailed" }
   | { readonly _tag: "DeadLetterFailed" };
 
-export type DeliveryDisposition = "commit" | "park-pending" | "dead-letter" | "stop";
+export type DeliveryDisposition = "commit" | "retry" | "park-pending" | "dead-letter" | "stop";
 
 export interface FixtureDeliveryApi {
   good(
@@ -211,7 +211,7 @@ export function exhaustiveDeliveryPolicy(error: DeliveryError): DeliveryDisposit
     case "DecodeFailed":
       return "dead-letter";
     case "HandlerFailed":
-      return "park-pending";
+      return "retry";
     case "DeadLetterFailed":
       return "stop";
   }

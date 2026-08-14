@@ -1499,6 +1499,34 @@ const INTEGRATED_BOUNDARY_DECODERS = new Map<string, readonly BoundaryDecoder[]>
   [
     "packages/event-bus",
     [
+      ...[
+        "decodeBeginFreshResponse",
+        "decodeBeginInvocationResponse",
+        "decodeHeartbeatResponse",
+        "decodeCommitResponse",
+        "decodeScheduleRetryResponse",
+        "decodeParkResponse",
+        "decodeClaimRecoverableResponse",
+        "decodeBeginTerminalResponse",
+        "decodeStageTerminalResponse",
+        "decodeFinalizeTerminalResponse",
+        "decodeStateCleanupScanResponse",
+        "decodeStateCleanupDeleteResponse",
+      ].map((exportName) => ({
+        identity: { module: "redis-managed-delivery/responses.ts", exportName },
+        category: "wire" as const,
+      })),
+      {
+        identity: {
+          module: "redis-managed-delivery/responses.ts",
+          exportName: "transform.<callback@1>@5",
+        },
+        category: "wire",
+      },
+      {
+        identity: { module: "redis-streams-bus.ts", exportName: "deliveryAction" },
+        category: "request",
+      },
       {
         identity: { module: "redis-streams-bus.ts", exportName: "decodeRedisReadResponse" },
         category: "wire",
@@ -1516,6 +1544,17 @@ const INTEGRATED_BOUNDARY_DECODERS = new Map<string, readonly BoundaryDecoder[]>
         category: "wire",
       },
       {
+        identity: { module: "redis-streams-bus.ts", exportName: "decodeRedisRangeResponse" },
+        category: "wire",
+      },
+      {
+        identity: {
+          module: "redis-streams-bus.ts",
+          exportName: "decodeRedisCleanupPendingPresence",
+        },
+        category: "wire",
+      },
+      {
         identity: {
           module: "redis-event-dead-letter.ts",
           exportName: "decodeRedisDeadLetterEvidenceEntry",
@@ -1529,6 +1568,24 @@ const INTEGRATED_BOUNDARY_DECODERS = new Map<string, readonly BoundaryDecoder[]>
         },
         category: "persistence",
       },
+      {
+        identity: {
+          module: "redis-event-dead-letter.ts",
+          exportName: "decodeRedisDeadLetterTime",
+        },
+        category: "persistence",
+      },
+      {
+        identity: {
+          module: "redis-event-dead-letter.ts",
+          exportName: "decodeEventDeadLetterRecord",
+        },
+        category: "persistence",
+      },
+      ...["transform.<callback@1>@3", "custom.<callback@1>"].map((exportName) => ({
+        identity: { module: "redis-event-dead-letter.ts", exportName },
+        category: "persistence" as const,
+      })),
     ],
   ],
   [
@@ -7149,7 +7206,9 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
               "redisTransportEvidence",
               "decodeRedisFields",
               "decodeMessage",
-              "RedisStreamsBus.subscribe.handleEntry",
+              "transform.<callback@1>@1",
+              "transform.<callback@1>@2",
+              "transform.<callback@1>@5",
             ].map((exportName) => ({
               identity: { module: "redis-streams-bus.ts", exportName },
               category: "wire" as const,
@@ -7614,21 +7673,6 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
               ],
               [
                 "redis-streams-bus.ts",
-                "RedisStreamsBus.subscribe.acknowledge",
-                "Preserves Panic while mapping Redis acknowledgement failures to transport errors.",
-              ],
-              [
-                "redis-streams-bus.ts",
-                "RedisStreamsBus.subscribe.handleEntry",
-                "Classifies handler Panic for fatal supervision instead of treating it as an expected delivery error.",
-              ],
-              [
-                "redis-streams-bus.ts",
-                "RedisStreamsBus.subscribe.runLoop",
-                "Preserves Panic while converting ordinary Redis read failures to terminal delivery errors.",
-              ],
-              [
-                "redis-streams-bus.ts",
                 "RedisStreamsBus.subscribe.stop",
                 "Rethrows the original delivery defect and preserves Panic from either cleanup operation.",
               ],
@@ -7653,13 +7697,6 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
                 "external",
                 "EventDeliveryFatalReporter.report",
                 "Contains a rejected fatal reporter at the logging-only defect reporting boundary.",
-              ],
-              [
-                "redis-streams-bus.ts",
-                "RedisStreamsBus.subscribe.runLoop",
-                "ioredis",
-                "Redis.xread or Redis.xreadgroup",
-                "Maps an immediate Redis read rejection to EventDeliveryTransportFailed.",
               ],
               [
                 "redis-streams-bus.ts",
@@ -8797,7 +8834,7 @@ function approvedExceptionAdapterCatalogSha256(
 }
 
 export const APPROVED_EXCEPTION_ADAPTER_CATALOG_SHA256 =
-  "753d1145eb54b1af42f980a3ec3e03365735879607b90e6f7310aea9ce5b119b";
+  "1d9b04fc2d8cc570d65b6b1e1ab29e8f62846215ae4e95a8af10cd51607d41c7";
 
 export const architectureManifest = {
   version: 1,

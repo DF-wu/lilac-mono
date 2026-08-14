@@ -1380,6 +1380,7 @@ describe("Stage 4 event architecture rules", () => {
     expect(good).toEqual([]);
     expect(bad).toHaveLength(1);
     expect(bad[0]?.message).toContain("DeadLetterFailed");
+    expect(bad[0]?.suggestion).toContain("retry");
   });
 
   test("fails closed when an enforced event registration drifts", () => {

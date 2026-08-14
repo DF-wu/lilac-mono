@@ -5073,7 +5073,7 @@ function analyzeEventDeliveryPolicy(
       "architecture/event-delivery-policy-exhaustiveness",
       switches.find((_node, index) => issues[index] !== undefined) ?? error ?? policy,
       `Event delivery policy ${registration.deliveryPolicy.exportName} is not exhaustive: ${issues.find((issue) => issue !== undefined) ?? "no switch over the registered error parameter"}.`,
-      "Map every delivery error variant explicitly to commit, park-pending, dead-letter, or stop without a silent default.",
+      "Map every delivery error variant explicitly to commit, retry, park-pending, dead-letter, or stop without a silent default.",
     ),
   );
 }

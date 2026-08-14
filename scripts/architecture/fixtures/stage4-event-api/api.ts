@@ -10,10 +10,10 @@ export interface FixtureEventBus {
   subscribeTopic(): Promise<void>;
 }
 
-export function fixtureDeliveryPolicy(error: FixtureDeliveryError): "park-pending" | "stop" {
+export function fixtureDeliveryPolicy(error: FixtureDeliveryError): "retry" | "stop" {
   switch (error._tag) {
     case "HandlerFailed":
-      return "park-pending";
+      return "retry";
     case "Stopping":
       return "stop";
   }
