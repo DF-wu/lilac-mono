@@ -379,6 +379,14 @@ const STAGE_3_OPERATIONAL_RESULT_APIS = new Map<string, readonly SymbolIdentity[
         exportName: "decodeThreadSummarizationWorkerResponse",
       },
       {
+        module: "src/conversation/thread-summarization-worker-protocol.ts",
+        exportName: "decodeThreadSummarizationParentMessage",
+      },
+      {
+        module: "src/conversation/thread-summarization-worker-protocol.ts",
+        exportName: "decodeThreadSummarizationWorkerMessage",
+      },
+      {
         module: "src/conversation/thread-worker.ts",
         exportName: "ConversationThreadSummarizationRunner.runSummarization",
       },
@@ -1432,6 +1440,20 @@ const INTEGRATED_BOUNDARY_DECODERS = new Map<string, readonly BoundaryDecoder[]>
         identity: {
           module: "src/conversation/thread-summarization-worker-protocol.ts",
           exportName: "decodeThreadSummarizationWorkerResponse",
+        },
+        category: "wire",
+      },
+      {
+        identity: {
+          module: "src/conversation/thread-summarization-worker-protocol.ts",
+          exportName: "decodeThreadSummarizationParentMessage",
+        },
+        category: "wire",
+      },
+      {
+        identity: {
+          module: "src/conversation/thread-summarization-worker-protocol.ts",
+          exportName: "decodeThreadSummarizationWorkerMessage",
         },
         category: "wire",
       },

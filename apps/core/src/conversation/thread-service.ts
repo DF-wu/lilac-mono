@@ -6,6 +6,7 @@ import {
   type FinishReason,
   type LanguageModelUsage,
   type ModelMessage,
+  type UserContent,
 } from "ai";
 import { createHash } from "node:crypto";
 import path from "node:path";
@@ -18,10 +19,12 @@ import {
   extractAiErrorLogDetails,
   formatTaggedErrorForLog,
   ModelResolutionFailed,
+  ModelCapability,
   resolveModelRefResult,
   resolveModelSlotResult,
   resolvePromptDir,
   type CoreConfig,
+  type ModelCapabilityInfo,
   type PersistedDataError,
 } from "@stanley2058/lilac-utils";
 import { Panic, Result, TaggedError, type Result as ResultType } from "better-result";
@@ -43,6 +46,15 @@ import type {
   ConversationThreadEmbeddingUsageEvent,
 } from "./thread-embedding";
 import type { EntityMapper } from "../entity/entity-mapper";
+import {
+  hashIndexedDiscordAttachments,
+  toIndexedDiscordAttachments,
+  type DiscordAttachmentMeta,
+} from "../surface/discord/discord-attachment";
+import {
+  appendDiscordAttachmentsToUserContent,
+  createDiscordAttachmentState,
+} from "../surface/bridge/request-composition/attachments";
 import { stripLeadingContinueDirective } from "../surface/discord/discord-request-router/common";
 import { isSqliteBusyError } from "../shared/sqlite";
 import { adaptToolResultToHost } from "../tools/tool-result-adapters";
@@ -143,6 +155,7 @@ export type ConversationThreadQueryAboutnessSummarizer = (input: {
 export type ConversationThreadAutoInjectQueryPlanner = (input: {
   cfg: CoreConfig;
   text: string;
+  content?: UserContent;
 }) => Promise<ConversationThreadAutoInjectQueryPlan>;
 
 export type ConversationThreadRunSummarizationInput = {
@@ -416,9 +429,25 @@ export type ConversationThreadSummarizer = (input: {
   attempt?: number;
   previousSummary: ConversationThreadSummary | null;
   promptContext: ConversationThreadPromptContext | null;
-  messages: readonly ConversationThreadMessage[];
+  messages: readonly ConversationThreadSummaryMessage[];
   omittedMessages?: number;
 }) => Promise<ConversationThreadSummaryInput>;
+
+export type ConversationThreadSummaryMessage = Omit<ConversationThreadMessage, "attachments"> & {
+  attachments: DiscordAttachmentMeta[];
+};
+
+export type ConversationThreadAttachmentHydrator = (input: {
+  refs: readonly { channelId: string; messageId: string }[];
+}) => Promise<
+  ResultType<
+    Array<{
+      ref: { channelId: string; messageId: string };
+      attachments: DiscordAttachmentMeta[];
+    }>,
+    ConversationThreadOperationFailed
+  >
+>;
 
 type ConversationThreadPromptContext = {
   hash: string;
@@ -606,19 +635,121 @@ function formatMessageForSummary(message: ConversationThreadMessage): string {
   ].join("\n");
 }
 
-function formatSummaryTranscript(
-  messages: readonly ConversationThreadMessage[],
-  omittedMessages: number,
-): string {
-  if (omittedMessages <= 0) return messages.map(formatMessageForSummary).join("\n\n");
+export async function buildThreadSummaryModelMessages(input: {
+  previous: string;
+  promptContextSection: string | null;
+  messages: readonly ConversationThreadSummaryMessage[];
+  omittedMessages: number;
+  capability?: ModelCapabilityInfo | null;
+}): Promise<ModelMessage[]> {
+  const content: Exclude<UserContent, string> = [
+    {
+      type: "text",
+      text: [
+        "## Previous summary",
+        input.previous,
+        "",
+        ...(input.promptContextSection ? [input.promptContextSection, ""] : []),
+        "## Transcript",
+      ].join("\n"),
+    },
+  ];
+  const attachmentState = createDiscordAttachmentState({ inlineFileData: true });
+  for (let index = 0; index < input.messages.length; index += 1) {
+    if (input.omittedMessages > 0 && index === SUMMARY_HEAD_MESSAGES) {
+      content.push({
+        type: "text",
+        text: `[transcript truncated: ${input.omittedMessages} middle messages omitted]`,
+      });
+    }
+    const message = input.messages[index]!;
+    content.push({ type: "text", text: formatMessageForSummary(message) });
+    for (const attachment of message.attachments) {
+      const mediaType = attachment.mimeType?.split(";", 1)[0]?.trim().toLowerCase();
+      let modality: "image" | "pdf" | null = null;
+      if (mediaType?.startsWith("image/")) modality = "image";
+      else if (mediaType === "application/pdf") modality = "pdf";
+      if (
+        input.capability !== undefined &&
+        modality !== null &&
+        !supportsUtilityModelAttachment(input.capability, modality)
+      ) {
+        content.push({
+          type: "text",
+          text: attachmentMetadataText({
+            filename: attachment.filename,
+            mediaType: attachment.mimeType,
+            size: attachment.size,
+          }),
+        });
+        continue;
+      }
+      await appendDiscordAttachmentsToUserContent(content, [attachment], attachmentState);
+    }
+  }
+  return [{ role: "user", content }];
+}
 
-  const head = messages.slice(0, SUMMARY_HEAD_MESSAGES);
-  const tail = messages.slice(SUMMARY_HEAD_MESSAGES);
-  return [
-    ...head.map(formatMessageForSummary),
-    `[transcript truncated: ${omittedMessages} middle text messages omitted]`,
-    ...tail.map(formatMessageForSummary),
-  ].join("\n\n");
+function attachmentMetadataText(input: {
+  filename?: string;
+  mediaType?: string;
+  size?: number;
+}): string {
+  const fields = [
+    input.filename ? `filename="${input.filename.replace(/[\n\r"\\]/gu, "_")}"` : null,
+    input.mediaType ? `mime="${input.mediaType.replace(/[\n\r"\\]/gu, "_")}"` : null,
+    input.size !== undefined ? `size=${input.size}` : null,
+  ].filter((field): field is string => field !== null);
+  return `[discord_attachment ${fields.join(" ")}]\n(attachment omitted: utility model does not support this media type)`;
+}
+
+function supportsUtilityModelAttachment(
+  capability: ModelCapabilityInfo | null,
+  modality: "image" | "pdf",
+): boolean {
+  return (
+    capability?.attachment === true && capability.modalities?.input.includes(modality) === true
+  );
+}
+
+export function filterUtilityModelAttachments(
+  messages: readonly ModelMessage[],
+  capability: ModelCapabilityInfo | null,
+): ModelMessage[] {
+  return messages.map((message) => {
+    if (message.role !== "user" || !Array.isArray(message.content)) return message;
+    const content: Exclude<UserContent, string> = message.content.map((part) => {
+      if (part.type !== "file") return part;
+      let modality: "image" | "pdf" | null = null;
+      if (part.mediaType.startsWith("image/")) modality = "image";
+      else if (part.mediaType === "application/pdf") modality = "pdf";
+      if (modality && supportsUtilityModelAttachment(capability, modality)) {
+        return part;
+      }
+      return {
+        type: "text",
+        text: attachmentMetadataText({
+          filename: part.filename,
+          mediaType: part.mediaType,
+          size: part.data instanceof Uint8Array ? part.data.byteLength : undefined,
+        }),
+      };
+    });
+    return { ...message, content };
+  });
+}
+
+async function resolveUtilityModelCapability(
+  cfg: CoreConfig,
+  modelSpec: string,
+): Promise<ModelCapabilityInfo | null> {
+  const config = cfg.models.capability;
+  const capability = new ModelCapability({
+    forceUnknownProviders: config?.forceUnknownProviders ?? ["openai-compatible"],
+    overrides: config?.overrides ?? {},
+  });
+  const resolved = await capability.resolveResult(modelSpec);
+  return resolved.status === "ok" ? resolved.value : null;
 }
 
 function stableHash(input: string): string {
@@ -1161,13 +1292,12 @@ async function defaultSummarizer(input: {
   attempt?: number;
   previousSummary: ConversationThreadSummary | null;
   promptContext: ConversationThreadPromptContext | null;
-  messages: readonly ConversationThreadMessage[];
+  messages: readonly ConversationThreadSummaryMessage[];
   omittedMessages?: number;
 }): Promise<ResultType<ConversationThreadSummaryInput, ConversationThreadGenerationError>> {
   const resolution = resolveSummarizationModel(input.cfg);
   if (resolution.status === "error") return Result.err(resolution.error);
   const resolved = resolution.value;
-  const transcript = formatSummaryTranscript(input.messages, input.omittedMessages ?? 0);
   const previous = input.previousSummary
     ? [
         `Previous title: ${input.previousSummary.title}`,
@@ -1197,16 +1327,14 @@ async function defaultSummarizer(input: {
         input.promptContext.text,
       ].join("\n")
     : null;
-  const contentParts = ["## Previous summary", previous, ""];
-  if (promptContextSection) contentParts.push(promptContextSection, "");
-  contentParts.push("## Transcript", transcript);
-
-  const messages = [
-    {
-      role: "user",
-      content: contentParts.join("\n"),
-    },
-  ] satisfies ModelMessage[];
+  const capability = await resolveUtilityModelCapability(input.cfg, resolved.spec);
+  const messages = await buildThreadSummaryModelMessages({
+    previous,
+    promptContextSection,
+    messages: input.messages,
+    omittedMessages: input.omittedMessages ?? 0,
+    capability,
+  });
 
   const instructions = buildThreadSummaryInstructions();
   const onLanguageModelCallEnd = createThreadLanguageModelUsageLogger({
@@ -1326,23 +1454,32 @@ async function defaultQueryAboutnessSummarizer(input: {
 async function defaultAutoInjectQueryPlanner(input: {
   cfg: CoreConfig;
   text: string;
+  content?: UserContent;
 }): Promise<ResultType<ConversationThreadAutoInjectQueryPlan, ConversationThreadGenerationError>> {
   const resolution = resolveAutoInjectPlannerModel(input.cfg);
   if (resolution.status === "error") return Result.err(resolution.error);
   const resolved = resolution.value;
-  const messages = [
+  const plannerPrefix = [
+    "Create compact conversation-memory search queries for this new user message.",
+    "Do not answer the message. Extract what prior conversation threads would be relevant context for responding.",
+    "Return grouped search plans and positive aboutness evidence only.",
+    "",
+    "## User message",
+  ].join("\n");
+  const plannerContent = input.content ?? input.text;
+  const plannerMessages = [
     {
       role: "user",
-      content: [
-        "Create compact conversation-memory search queries for this new user message.",
-        "Do not answer the message. Extract what prior conversation threads would be relevant context for responding.",
-        "Return grouped search plans and positive aboutness evidence only.",
-        "",
-        "## User message",
-        input.text,
-      ].join("\n"),
+      content:
+        typeof plannerContent === "string"
+          ? `${plannerPrefix}\n${plannerContent}`
+          : [{ type: "text" as const, text: plannerPrefix }, ...plannerContent],
     },
   ] satisfies ModelMessage[];
+  const messages = filterUtilityModelAttachments(
+    plannerMessages,
+    await resolveUtilityModelCapability(input.cfg, resolved.spec),
+  );
   const instructions = buildAutoInjectQueryPlanInstructions();
   const onLanguageModelCallEnd = createThreadLanguageModelUsageLogger({
     operation: "auto_inject_query_plan",
@@ -1496,6 +1633,7 @@ export class ConversationThreadService {
       summarizer?: ConversationThreadSummarizer;
       queryAboutnessSummarizer?: ConversationThreadQueryAboutnessSummarizer;
       autoInjectQueryPlanner?: ConversationThreadAutoInjectQueryPlanner;
+      attachmentHydrator?: ConversationThreadAttachmentHydrator;
       getEmbeddingAdapter?: ConversationThreadEmbeddingAdapterResolver;
       entityMapper?: Pick<EntityMapper, "normalizeIncomingText">;
     },
@@ -1580,6 +1718,7 @@ export class ConversationThreadService {
 
   async planAutoInjectSearch(input: {
     text: string;
+    content?: UserContent;
   }): Promise<
     ResultType<
       ConversationThreadAutoInjectQueryPlan,
@@ -1587,7 +1726,8 @@ export class ConversationThreadService {
     >
   > {
     const text = input.text.trim();
-    if (!text) {
+    const hasMultipartContent = Array.isArray(input.content) && input.content.length > 0;
+    if (!text && !hasMultipartContent) {
       return Result.err(
         new ConversationThreadInvalidInput({
           field: "text",
@@ -1599,11 +1739,11 @@ export class ConversationThreadService {
     const planner = this.params.autoInjectQueryPlanner;
     const planned = planner
       ? await captureConversationThreadGeneration(
-          () => planner({ cfg, text }),
+          () => planner({ cfg, text, content: input.content }),
           "summarize-thread",
           "Query planning failed",
         )
-      : await defaultAutoInjectQueryPlanner({ cfg, text });
+      : await defaultAutoInjectQueryPlanner({ cfg, text, content: input.content });
     return planned.status === "ok"
       ? Result.ok(normalizeAutoInjectQueryPlan(planned.value))
       : Result.err(planned.error);
@@ -1924,7 +2064,6 @@ export class ConversationThreadService {
             this.params.store.deleteThread(thread.thread_id);
             return;
           }
-          const summaryMessages = this.normalizeMessagesForSummarization(summaryRead.messages, cfg);
           const summaryIsStale = item.summaryIsStale;
           const previousSummary = this.params.store.getSummary(thread.thread_id);
           if (previousSummary.status === "error") {
@@ -1942,6 +2081,9 @@ export class ConversationThreadService {
           }
           const summaryWrite = summaryIsStale
             ? await (async () => {
+                const hydrated = await this.hydrateMessagesForSummarization(summaryRead.messages);
+                if (hydrated.status === "error") return Result.err(hydrated.error);
+                const summaryMessages = this.normalizeMessagesForSummarization(hydrated.value, cfg);
                 this.logger.debug("thread summary generation started", {
                   jobId,
                   threadId: thread.thread_id,
@@ -2104,7 +2246,7 @@ export class ConversationThreadService {
     cfg: CoreConfig;
     promptContext: ConversationThreadPromptContext | null;
     previousSummary: ConversationThreadSummary | null;
-    messages: readonly ConversationThreadMessage[];
+    messages: readonly ConversationThreadSummaryMessage[];
     omittedMessages: number;
   }): Promise<ResultType<ConversationThreadSummaryInput, ConversationThreadGenerationError>> {
     let lastError: ConversationThreadSummaryParseError | null = null;
@@ -2151,9 +2293,9 @@ export class ConversationThreadService {
   }
 
   private normalizeMessagesForSummarization(
-    messages: readonly ConversationThreadMessage[],
+    messages: readonly ConversationThreadSummaryMessage[],
     cfg: CoreConfig,
-  ): ConversationThreadMessage[] {
+  ): ConversationThreadSummaryMessage[] {
     const mapper = this.params.entityMapper;
     const botMentionNames = resolveThreadBotMentionNames(cfg);
     const stripped = messages.map((message) => ({
@@ -2170,6 +2312,60 @@ export class ConversationThreadService {
       userName: mapper.normalizeIncomingText(`<@${message.userId}>`),
       text: mapper.normalizeIncomingText(message.text),
     }));
+  }
+
+  private async hydrateMessagesForSummarization(
+    messages: readonly ConversationThreadMessage[],
+  ): Promise<ResultType<ConversationThreadSummaryMessage[], ConversationThreadOperationFailed>> {
+    const refs = messages
+      .filter((message) => message.attachments.length > 0)
+      .map((message) => ({ channelId: message.channelId, messageId: message.messageId }));
+    if (refs.length === 0) {
+      return Result.ok(messages.map((message) => ({ ...message, attachments: [] })));
+    }
+    if (!this.params.attachmentHydrator) {
+      return Result.err(
+        conversationThreadOperationFailed(
+          "summarize-thread",
+          "Thread attachment hydration is unavailable",
+        ),
+      );
+    }
+    const hydrated = await this.params.attachmentHydrator({ refs });
+    if (hydrated.status === "error") return hydrated;
+    const byRef = new Map(
+      hydrated.value.map((item) => [`${item.ref.channelId}\u001f${item.ref.messageId}`, item]),
+    );
+    const output: ConversationThreadSummaryMessage[] = [];
+    for (const message of messages) {
+      if (message.attachments.length === 0) {
+        output.push({ ...message, attachments: [] });
+        continue;
+      }
+      const item = byRef.get(`${message.channelId}\u001f${message.messageId}`);
+      if (!item) {
+        return Result.err(
+          conversationThreadOperationFailed(
+            "summarize-thread",
+            `Thread attachment hydration omitted message ${message.messageId}`,
+          ),
+        );
+      }
+      const expectedHash = hashIndexedDiscordAttachments(message.attachments);
+      const actualHash = hashIndexedDiscordAttachments(
+        toIndexedDiscordAttachments(item.attachments),
+      );
+      if (expectedHash !== actualHash) {
+        return Result.err(
+          conversationThreadOperationFailed(
+            "summarize-thread",
+            `Thread attachments changed while summarizing message ${message.messageId}`,
+          ),
+        );
+      }
+      output.push({ ...message, attachments: item.attachments });
+    }
+    return Result.ok(output);
   }
 
   private async tryEmbedThread(input: {

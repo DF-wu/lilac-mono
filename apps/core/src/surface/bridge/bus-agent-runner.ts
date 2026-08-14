@@ -202,7 +202,7 @@ import {
   type AgentOutputPublishFailed,
   createAgentOutputPublisher,
 } from "./bus-agent-runner/output-publisher";
-import { latestUserText, shouldRunAutoInjectedThreadSearch } from "./bus-agent-runner/text-units";
+import { latestUserInput, shouldRunAutoInjectedThreadSearch } from "./bus-agent-runner/text-units";
 import { createTransientModelRetryController } from "./bus-agent-runner/transient-retry";
 import {
   materializeClaudeCodeRun,
@@ -1220,13 +1220,17 @@ export async function maybeBuildAutoInjectedThreadSearchMessages(params: {
   if (!params.conversationThreads) return [];
   const conversationThreads = params.conversationThreads;
 
-  const text = latestUserText(params.userMessages);
+  const latestInput = latestUserInput(params.userMessages);
+  const text = latestInput.text;
   const previouslyInjectedThreadIds = collectAutoInjectedThreadIds(params.previousMessages ?? []);
   const minTextUnits =
     previouslyInjectedThreadIds.size > 0
       ? autoInject.followUpMinTextUnits
       : autoInject.minTextUnits;
-  if (!shouldRunAutoInjectedThreadSearch({ text, minTextUnits })) {
+  if (
+    !latestInput.hasAttachment &&
+    !shouldRunAutoInjectedThreadSearch({ text: latestInput.authoredText, minTextUnits })
+  ) {
     return [];
   }
 
@@ -1257,7 +1261,10 @@ export async function maybeBuildAutoInjectedThreadSearchMessages(params: {
   await publishToolStatusBestEffort({ toolCallId, status: "start", display });
 
   try {
-    const plan = await conversationThreads.planAutoInjectSearch({ text });
+    const plan = await conversationThreads.planAutoInjectSearch({
+      text,
+      content: latestInput.content,
+    });
     const searchRecallLimit = Math.min(50, autoInject.limit * plan.searches.length);
     const settledSearches = await Promise.allSettled(
       plan.searches.map((searchPlan) =>

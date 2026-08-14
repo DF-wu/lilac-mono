@@ -2,6 +2,14 @@
 
 This file documents config-version changes in a form that is readable by both humans and agents.
 
+## Core SQLite
+
+`discord-search.db` now records URL-free Discord attachment identity metadata in
+`discord_search_message_attachments` and an attachment fingerprint on `discord_search_messages`.
+Existing rows retain an unknown attachment fingerprint and are not backfilled. Newly indexed or updated
+messages record known empty or populated attachment state; attachment bytes and signed Discord CDN URLs
+are not persisted.
+
 ## Core Config
 
 Lilac parses `core-config.yaml` through a versioned parser into one universal runtime config shape. The app only consumes the universal shape.

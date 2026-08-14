@@ -7,6 +7,13 @@ import {
   type SurfaceBurstCacheInput,
 } from "../adapter";
 import { getDiscordSurfaceDisplayText } from "../discord/discord-surface-display-text";
+import {
+  selectVisibleDiscordAttachments,
+  hashIndexedDiscordAttachments,
+  toIndexedDiscordAttachments,
+  type DiscordIndexedAttachmentMeta,
+} from "../discord/discord-attachment";
+import { normalizeDiscordRaw } from "../discord/discord-raw-normalizer";
 import type { DiscordMsgRef, DiscordSessionRef, SurfaceMessage, SurfacePlatform } from "../types";
 import { configureSqliteConnection } from "../../shared/sqlite";
 
@@ -38,6 +45,7 @@ export type DiscordSearchIndexedMessage = {
   editedTs?: number;
   deleted: boolean;
   updatedTs: number;
+  attachments: DiscordIndexedAttachmentMeta[];
 };
 
 export type DiscordSearchMessageMutation = {
@@ -112,9 +120,20 @@ type RawIndexedRow = {
   edited_ts: number | null;
   deleted: number;
   updated_ts: number;
+  attachments_hash: string | null;
 };
 
-function asDiscordSearchIndexedMessage(row: RawIndexedRow): DiscordSearchIndexedMessage {
+type RawIndexedAttachmentRow = {
+  attachment_id: string | null;
+  filename: string | null;
+  mime_type: string | null;
+  size: number | null;
+};
+
+function asDiscordSearchIndexedMessage(
+  row: RawIndexedRow,
+  attachments: DiscordIndexedAttachmentMeta[],
+): DiscordSearchIndexedMessage {
   return {
     ref: asDiscordMsgRef(row.channel_id, row.message_id),
     session: asDiscordSessionRef({
@@ -128,6 +147,7 @@ function asDiscordSearchIndexedMessage(row: RawIndexedRow): DiscordSearchIndexed
     editedTs: row.edited_ts ?? undefined,
     deleted: row.deleted !== 0,
     updatedTs: row.updated_ts,
+    attachments,
   };
 }
 
@@ -157,7 +177,31 @@ export class DiscordSearchStore {
         edited_ts INTEGER,
         deleted INTEGER NOT NULL DEFAULT 0,
         updated_ts INTEGER NOT NULL,
+        attachments_hash TEXT,
         PRIMARY KEY (channel_id, message_id)
+      );
+    `);
+
+    const columns = this.db
+      .query<{ name: string }, []>("PRAGMA table_info(discord_search_messages)")
+      .all();
+    if (!columns.some((column) => column.name === "attachments_hash")) {
+      this.db.run("ALTER TABLE discord_search_messages ADD COLUMN attachments_hash TEXT;");
+    }
+
+    this.db.run(`
+      CREATE TABLE IF NOT EXISTS discord_search_message_attachments (
+        channel_id TEXT NOT NULL,
+        message_id TEXT NOT NULL,
+        ordinal INTEGER NOT NULL,
+        attachment_id TEXT,
+        filename TEXT,
+        mime_type TEXT,
+        size INTEGER,
+        PRIMARY KEY (channel_id, message_id, ordinal),
+        FOREIGN KEY (channel_id, message_id)
+          REFERENCES discord_search_messages(channel_id, message_id)
+          ON DELETE CASCADE
       );
     `);
 
@@ -228,6 +272,10 @@ export class DiscordSearchStore {
     const tx = this.db.transaction((input: readonly SurfaceMessage[]) => {
       for (const message of input) {
         if (!isDiscordMessage(message)) continue;
+        const attachments = toIndexedDiscordAttachments(
+          selectVisibleDiscordAttachments(normalizeDiscordRaw(message.raw)),
+        );
+        const attachmentsHash = hashIndexedDiscordAttachments(attachments);
 
         const result = this.db.run(
           `
@@ -241,8 +289,9 @@ export class DiscordSearchStore {
             ts,
             edited_ts,
             deleted,
-            updated_ts
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            updated_ts,
+            attachments_hash
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
           ON CONFLICT(channel_id, message_id) DO UPDATE SET
             guild_id=excluded.guild_id,
             user_id=excluded.user_id,
@@ -251,14 +300,16 @@ export class DiscordSearchStore {
             ts=excluded.ts,
             edited_ts=excluded.edited_ts,
             deleted=excluded.deleted,
-            updated_ts=excluded.updated_ts
+            updated_ts=excluded.updated_ts,
+            attachments_hash=excluded.attachments_hash
           WHERE discord_search_messages.guild_id IS NOT excluded.guild_id
              OR discord_search_messages.user_id IS NOT excluded.user_id
              OR discord_search_messages.user_name IS NOT excluded.user_name
              OR discord_search_messages.text IS NOT excluded.text
              OR discord_search_messages.ts IS NOT excluded.ts
              OR discord_search_messages.edited_ts IS NOT excluded.edited_ts
-             OR discord_search_messages.deleted IS NOT excluded.deleted;
+             OR discord_search_messages.deleted IS NOT excluded.deleted
+             OR discord_search_messages.attachments_hash IS NOT excluded.attachments_hash;
           `,
           [
             message.session.channelId,
@@ -274,8 +325,33 @@ export class DiscordSearchStore {
             message.editedTs ?? null,
             message.deleted ? 1 : 0,
             now,
+            attachmentsHash,
           ],
         );
+        if (result.changes > 0) {
+          this.db.run(
+            "DELETE FROM discord_search_message_attachments WHERE channel_id = ? AND message_id = ?",
+            [message.session.channelId, message.ref.messageId],
+          );
+          attachments.forEach((attachment, ordinal) => {
+            this.db.run(
+              `
+              INSERT INTO discord_search_message_attachments (
+                channel_id, message_id, ordinal, attachment_id, filename, mime_type, size
+              ) VALUES (?, ?, ?, ?, ?, ?, ?)
+              `,
+              [
+                message.session.channelId,
+                message.ref.messageId,
+                ordinal,
+                attachment.id ?? null,
+                attachment.filename ?? null,
+                attachment.mimeType ?? null,
+                attachment.size ?? null,
+              ],
+            );
+          });
+        }
         // FTS trigger writes are included in SQLite's change count, but each upsert affects one message.
         wrote += result.changes > 0 ? 1 : 0;
       }
@@ -323,13 +399,19 @@ export class DiscordSearchStore {
           edited_ts,
           deleted,
           updated_ts
+          , attachments_hash
         FROM discord_search_messages
         WHERE channel_id = ? AND message_id = ?
         `,
       )
       .get(input.channelId, input.messageId);
 
-    return row ? asDiscordSearchIndexedMessage(row) : null;
+    return row
+      ? asDiscordSearchIndexedMessage(
+          row,
+          this.listMessageAttachments(row.channel_id, row.message_id),
+        )
+      : null;
   }
 
   listMessagesForDiscovery(sinceUpdatedTs?: number): DiscordSearchIndexedMessage[] {
@@ -349,6 +431,7 @@ export class DiscordSearchStore {
               edited_ts,
               deleted,
               updated_ts
+              , attachments_hash
             FROM discord_search_messages
             ORDER BY updated_ts ASC, channel_id ASC, message_id ASC
             `,
@@ -368,6 +451,7 @@ export class DiscordSearchStore {
               edited_ts,
               deleted,
               updated_ts
+              , attachments_hash
             FROM discord_search_messages
             WHERE updated_ts >= ?
             ORDER BY updated_ts ASC, channel_id ASC, message_id ASC
@@ -375,7 +459,31 @@ export class DiscordSearchStore {
             )
             .all(sinceUpdatedTs);
 
-    return rows.map(asDiscordSearchIndexedMessage);
+    return rows.map((row) =>
+      asDiscordSearchIndexedMessage(
+        row,
+        this.listMessageAttachments(row.channel_id, row.message_id),
+      ),
+    );
+  }
+
+  listMessageAttachments(channelId: string, messageId: string): DiscordIndexedAttachmentMeta[] {
+    const rows = this.db
+      .query<RawIndexedAttachmentRow, [string, string]>(
+        `
+        SELECT attachment_id, filename, mime_type, size
+        FROM discord_search_message_attachments
+        WHERE channel_id = ? AND message_id = ?
+        ORDER BY ordinal ASC
+        `,
+      )
+      .all(channelId, messageId);
+    return rows.map((row) => ({
+      ...(row.attachment_id ? { id: row.attachment_id } : {}),
+      ...(row.filename ? { filename: row.filename } : {}),
+      ...(row.mime_type ? { mimeType: row.mime_type } : {}),
+      ...(row.size !== null ? { size: row.size } : {}),
+    }));
   }
 
   searchChannel(input: { channelId: string; query: string; limit?: number }): DiscordSearchHit[] {

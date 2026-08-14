@@ -9,11 +9,16 @@ import { Panic, Result, TaggedError, type Result as ResultType } from "better-re
 import { createConversationThreadEmbeddingAdapterResolver } from "./thread-embedding";
 import { createSerialJobQueue } from "./thread-job-queue";
 import {
-  decodeThreadSummarizationWorkerRequest,
+  decodeThreadSummarizationParentMessage,
+  type ThreadSummarizationHydrationResponse,
+  type ThreadSummarizationWorkerMessage,
   type ThreadSummarizationWorkerRequest,
-  type ThreadSummarizationWorkerResponse,
 } from "./thread-summarization-worker-protocol";
-import { ConversationThreadService } from "./thread-service";
+import {
+  ConversationThreadOperationFailed,
+  ConversationThreadService,
+  type ConversationThreadAttachmentHydrator,
+} from "./thread-service";
 import { ConversationThreadStore } from "./thread-store";
 import { createDiscordEntityMapper } from "../entity/entity-mapper";
 import { DiscordSurfaceStore } from "../surface/store/discord-surface-store";
@@ -97,9 +102,69 @@ export async function runThreadSummarizationWorkerOperation(params: {
   return Result.ok(undefined);
 }
 
-function respond(response: ThreadSummarizationWorkerResponse): void {
+function respond(response: ThreadSummarizationWorkerMessage): void {
   postMessage(response);
 }
+
+const pendingHydrations = new Map<
+  string,
+  {
+    refs: readonly { channelId: string; messageId: string }[];
+    resolve: (response: ThreadSummarizationHydrationResponse) => void;
+  }
+>();
+
+const hydrateAttachments: ConversationThreadAttachmentHydrator = async ({ refs }) => {
+  const id = crypto.randomUUID();
+  const response = await new Promise<ThreadSummarizationHydrationResponse>((resolve) => {
+    pendingHydrations.set(id, { refs, resolve });
+    respond({ type: "hydrate-discord-attachments", id, refs: [...refs] });
+  });
+  const pendingRefs = refs;
+  if (response.results.length !== pendingRefs.length) {
+    return Result.err(
+      new ConversationThreadOperationFailed({
+        operation: "summarize-thread",
+        message: "Attachment hydration returned an unexpected result count",
+      }),
+    );
+  }
+  const hydrated: Array<{
+    ref: { channelId: string; messageId: string };
+    attachments: Array<{
+      id?: string;
+      url: string;
+      filename?: string;
+      mimeType?: string;
+      size?: number;
+    }>;
+  }> = [];
+  for (let index = 0; index < response.results.length; index += 1) {
+    const result = response.results[index]!;
+    const expected = pendingRefs[index]!;
+    if (
+      result.ref.channelId !== expected.channelId ||
+      result.ref.messageId !== expected.messageId
+    ) {
+      return Result.err(
+        new ConversationThreadOperationFailed({
+          operation: "summarize-thread",
+          message: "Attachment hydration returned mismatched message references",
+        }),
+      );
+    }
+    if (!result.ok) {
+      return Result.err(
+        new ConversationThreadOperationFailed({
+          operation: "summarize-thread",
+          message: result.error,
+        }),
+      );
+    }
+    hydrated.push({ ref: result.ref, attachments: result.attachments });
+  }
+  return Result.ok(hydrated);
+};
 
 async function runJob(request: ThreadSummarizationWorkerRequest): Promise<void> {
   const startedAt = Date.now();
@@ -137,15 +202,12 @@ async function runJob(request: ThreadSummarizationWorkerRequest): Promise<void> 
         getConfig: () => getCoreConfig(),
         getEmbeddingAdapter,
         entityMapper,
+        attachmentHydrator: hydrateAttachments,
       });
       const result = await service.runSummarization({ ...request.input, jobId: request.id });
       logger.debug("conversation thread summarization worker job completed", {
         jobId: request.id,
         durationMs: Date.now() - startedAt,
-        eligible: result.eligible,
-        cleared: result.cleared,
-        summarized: result.summarized,
-        failed: result.failed,
       });
       respond({ id: request.id, ok: true, result });
     },
@@ -188,13 +250,25 @@ const jobQueue = createSerialJobQueue<ThreadSummarizationWorkerRequest>({
 });
 
 self.addEventListener("message", (event: MessageEvent<unknown>) => {
-  const decoded = decodeThreadSummarizationWorkerRequest(event.data);
+  const decoded = decodeThreadSummarizationParentMessage(event.data);
   if (decoded.status === "error") {
     respond({ id: "unknown", ok: false, error: "invalid worker request" });
     return;
   }
 
   const request = decoded.value;
+  if ("type" in request) {
+    const pending = pendingHydrations.get(request.id);
+    if (!pending) {
+      logger.warn("conversation thread hydration response had no pending request", {
+        hydrationId: request.id,
+      });
+      return;
+    }
+    pendingHydrations.delete(request.id);
+    pending.resolve(request);
+    return;
+  }
   jobQueue.enqueue(request);
   logger.debug("conversation thread summarization worker job enqueued", {
     jobId: request.id,

@@ -59,10 +59,12 @@ import { createDiscordEntityMapper } from "../entity/entity-mapper";
 import { DiscoveryService } from "../discovery/discovery-service";
 import {
   createConversationThreadToolService,
+  ConversationThreadOperationFailed,
   ConversationThreadService,
   type ConversationThreadRunSummarizationInput,
   type ConversationThreadToolService,
 } from "../conversation/thread-service";
+import { toReplyChainMessage } from "../surface/bridge/request-composition/reply-chain";
 import { ConversationThreadStore } from "../conversation/thread-store";
 import { createConversationThreadEmbeddingAdapterResolver } from "../conversation/thread-embedding";
 import {
@@ -1606,11 +1608,41 @@ export async function createCoreRuntime(
             conversationThreadMaterializer?.markDirty({ channelId, kind: "topology" });
           },
         });
+        const hydrateThreadAttachments = async (input: {
+          refs: readonly { channelId: string; messageId: string }[];
+        }) => {
+          const hydrated = [];
+          for (const ref of input.refs) {
+            const read = await surfaceAdapter.readMsg({ platform: "discord", ...ref });
+            if (read.status === "error") {
+              return Result.err(
+                new ConversationThreadOperationFailed({
+                  operation: "summarize-thread",
+                  message: read.error.message,
+                }),
+              );
+            }
+            if (!read.value) {
+              return Result.err(
+                new ConversationThreadOperationFailed({
+                  operation: "summarize-thread",
+                  message: `Surface message not found: ${ref.messageId}`,
+                }),
+              );
+            }
+            hydrated.push({
+              ref,
+              attachments: toReplyChainMessage(read.value).attachments,
+            });
+          }
+          return Result.ok(hydrated);
+        };
         const threadService = new ConversationThreadService({
           store: conversationThreadStore,
           getConfig: () => getCoreConfig(),
           getEmbeddingAdapter: getConversationThreadEmbeddingAdapter,
           entityMapper: conversationThreadEntityMapper,
+          attachmentHydrator: hydrateThreadAttachments,
         });
         conversationThreadService = threadService;
         const captureSummarizationRuntimeOperation = async <T>(
@@ -1637,6 +1669,7 @@ export async function createCoreRuntime(
         stopConversationThreadSummarizationWorker = startConversationThreadSummarizationWorker({
           searchDbPath: discordSearchDbPath,
           surfaceDbPath: discordSurfaceDbPath,
+          adapter: surfaceAdapter,
         });
         conversationThreadSummarizationRunner = {
           async runSummarization(input) {

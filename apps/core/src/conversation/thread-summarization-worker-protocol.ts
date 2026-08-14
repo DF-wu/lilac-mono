@@ -3,6 +3,17 @@ import { z } from "zod";
 
 const nonemptyStringSchema = z.string().min(1);
 const countSchema = z.number().finite().int().nonnegative();
+const discordMessageRefSchema = z.strictObject({
+  channelId: nonemptyStringSchema,
+  messageId: nonemptyStringSchema,
+});
+const discordAttachmentSchema = z.strictObject({
+  id: nonemptyStringSchema.optional(),
+  url: z.url(),
+  filename: nonemptyStringSchema.optional(),
+  mimeType: nonemptyStringSchema.optional(),
+  size: countSchema.optional(),
+});
 
 const threadSummarizationInputSchema = z.strictObject({
   jobId: nonemptyStringSchema.optional(),
@@ -84,6 +95,44 @@ export type ThreadSummarizationWorkerResponse = z.infer<
   typeof threadSummarizationWorkerResponseSchema
 >;
 
+export const threadSummarizationHydrationRequestSchema = z.strictObject({
+  type: z.literal("hydrate-discord-attachments"),
+  id: nonemptyStringSchema,
+  refs: z.array(discordMessageRefSchema).min(1).max(200),
+});
+
+export const threadSummarizationHydrationResponseSchema = z.strictObject({
+  type: z.literal("hydrate-discord-attachments-result"),
+  id: nonemptyStringSchema,
+  results: z.array(
+    z.discriminatedUnion("ok", [
+      z.strictObject({
+        ref: discordMessageRefSchema,
+        ok: z.literal(true),
+        attachments: z.array(discordAttachmentSchema),
+      }),
+      z.strictObject({
+        ref: discordMessageRefSchema,
+        ok: z.literal(false),
+        error: nonemptyStringSchema,
+      }),
+    ]),
+  ),
+});
+
+export type ThreadSummarizationHydrationRequest = z.infer<
+  typeof threadSummarizationHydrationRequestSchema
+>;
+export type ThreadSummarizationHydrationResponse = z.infer<
+  typeof threadSummarizationHydrationResponseSchema
+>;
+export type ThreadSummarizationParentMessage =
+  | ThreadSummarizationWorkerRequest
+  | ThreadSummarizationHydrationResponse;
+export type ThreadSummarizationWorkerMessage =
+  | ThreadSummarizationWorkerResponse
+  | ThreadSummarizationHydrationRequest;
+
 export class ThreadSummarizationWorkerRequestDecodeError extends TaggedError(
   "ThreadSummarizationWorkerRequestDecodeError",
 )<{
@@ -97,6 +146,14 @@ export class ThreadSummarizationWorkerResponseDecodeError extends TaggedError(
   readonly issues: readonly string[];
   readonly message: string;
 }> {}
+
+export class ThreadSummarizationParentMessageDecodeError extends TaggedError(
+  "ThreadSummarizationParentMessageDecodeError",
+)<{ readonly issues: readonly string[]; readonly message: string }> {}
+
+export class ThreadSummarizationWorkerMessageDecodeError extends TaggedError(
+  "ThreadSummarizationWorkerMessageDecodeError",
+)<{ readonly issues: readonly string[]; readonly message: string }> {}
 
 function formatIssues(error: z.ZodError): readonly string[] {
   return error.issues.map((issue) => {
@@ -127,6 +184,36 @@ export function decodeThreadSummarizationWorkerResponse(
     new ThreadSummarizationWorkerResponseDecodeError({
       issues: formatIssues(parsed.error),
       message: "Invalid conversation thread summarization worker response",
+    }),
+  );
+}
+
+export function decodeThreadSummarizationParentMessage(
+  input: unknown,
+): ResultType<ThreadSummarizationParentMessage, ThreadSummarizationParentMessageDecodeError> {
+  const parsed = z
+    .union([threadSummarizationWorkerRequestSchema, threadSummarizationHydrationResponseSchema])
+    .safeParse(input);
+  if (parsed.success) return Result.ok(parsed.data);
+  return Result.err(
+    new ThreadSummarizationParentMessageDecodeError({
+      issues: formatIssues(parsed.error),
+      message: "Invalid conversation thread summarization parent message",
+    }),
+  );
+}
+
+export function decodeThreadSummarizationWorkerMessage(
+  input: unknown,
+): ResultType<ThreadSummarizationWorkerMessage, ThreadSummarizationWorkerMessageDecodeError> {
+  const parsed = z
+    .union([threadSummarizationWorkerResponseSchema, threadSummarizationHydrationRequestSchema])
+    .safeParse(input);
+  if (parsed.success) return Result.ok(parsed.data);
+  return Result.err(
+    new ThreadSummarizationWorkerMessageDecodeError({
+      issues: formatIssues(parsed.error),
+      message: "Invalid conversation thread summarization worker message",
     }),
   );
 }

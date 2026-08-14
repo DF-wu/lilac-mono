@@ -3,12 +3,13 @@ import { Result } from "better-result";
 import type { MsgRef, SurfaceMessage } from "../../types";
 
 import type { SurfaceAdapter, SurfaceOperationResult } from "../../adapter";
+import { selectVisibleDiscordAttachments } from "../../discord/discord-attachment";
 import { buildDiscordRichTextFromContentAndEmbeds } from "../../discord/discord-embed-text";
 import { normalizeDiscordRaw } from "../../discord/discord-raw-normalizer";
 
 import { splitByDiscordWindowOldestToNewest } from "../../discord/merge-window";
 
-import type { DiscordAttachmentMeta, MergedChunk, ReplyChainMessage } from "./types";
+import type { MergedChunk, ReplyChainMessage } from "./types";
 
 const DEFAULT_MENTION_BLOCK_LIMIT = 50;
 
@@ -35,13 +36,6 @@ export function getForwardSnapshotTextFromRaw(raw: unknown): string | undefined 
   });
 
   return fromSnapshot.length > 0 ? fromSnapshot : undefined;
-}
-
-function extractDiscordAttachmentsFromRaw(raw: unknown): DiscordAttachmentMeta[] {
-  const discordRaw = normalizeDiscordRaw(raw);
-  const snapshotAttachments = discordRaw?.forwardSnapshot?.attachments;
-  if (snapshotAttachments && snapshotAttachments.length > 0) return snapshotAttachments;
-  return discordRaw?.attachments ?? [];
 }
 
 function getReferenceFromRaw(raw: unknown): {
@@ -72,7 +66,7 @@ export function toReplyChainMessage(
     authorName: msg.userName ?? opts?.authorNameFallback ?? `user_${msg.userId}`,
     ts: msg.ts,
     text,
-    attachments: extractDiscordAttachmentsFromRaw(msg.raw),
+    attachments: selectVisibleDiscordAttachments(normalizeDiscordRaw(msg.raw)),
     ...(isChat === undefined ? {} : { isChat }),
     replyReference: getReferenceFromRaw(msg.raw),
   };

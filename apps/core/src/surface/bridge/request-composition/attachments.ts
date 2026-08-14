@@ -10,7 +10,7 @@ import type {
   CoreOwnedBlobReference,
 } from "../../../transcript/transcript-store";
 
-import type { DiscordAttachmentMeta } from "./types";
+import type { DiscordAttachmentMeta } from "../../discord/discord-attachment";
 
 const DEFAULT_INBOUND_MAX_FILE_BYTES = 25 * 1024 * 1024;
 const DEFAULT_INBOUND_MAX_TOTAL_BYTES = 50 * 1024 * 1024;
@@ -19,6 +19,7 @@ const DISCORD_CDN_HOSTS = new Set(["cdn.discordapp.com", "media.discordapp.net"]
 
 type DiscordAttachmentState = {
   downloadedTotalBytes: number;
+  inlineFileData: boolean;
   // URL -> downloaded bytes + inferred mime type
   cache: Map<string, { bytes: Uint8Array; mimeType?: string }>;
   ownBlob?: (input: {
@@ -33,9 +34,11 @@ type DiscordAttachmentState = {
 
 export function createDiscordAttachmentState(input?: {
   ownBlob?: DiscordAttachmentState["ownBlob"];
+  inlineFileData?: boolean;
 }): DiscordAttachmentState {
   return {
     downloadedTotalBytes: 0,
+    inlineFileData: input?.inlineFileData === true,
     cache: new Map(),
     ownBlob: input?.ownBlob,
     ownershipError: null,
@@ -208,7 +211,7 @@ async function resolveOwnedFileData(input: {
   mediaType: string;
   filename?: string;
 }): Promise<URL | Uint8Array> {
-  if (!input.state.ownBlob) return input.url;
+  if (!input.state.ownBlob && !input.state.inlineFileData) return input.url;
   const cacheKey = input.url.toString();
   const cached = input.state.cache.get(cacheKey);
   const downloaded = cached ? null : await downloadDiscordAttachment(input.url);

@@ -28,6 +28,7 @@ import { splitByDiscordWindowOldestToNewest } from "../surface/discord/merge-win
 import { parseLeadingContinueDirective } from "../surface/discord/discord-request-router/common";
 import { configureSqliteConnection } from "../shared/sqlite";
 import type { DiscordSearchIndexedMessage } from "../surface/store/discord-search-store";
+import type { DiscordIndexedAttachmentMeta } from "../surface/discord/discord-attachment";
 import { adaptToolResultToHost } from "../tools/tool-result-adapters";
 
 const SEARCH_LIMIT_MAX = 50;
@@ -104,6 +105,7 @@ export type ConversationThreadMessage = {
   userName?: string;
   text: string;
   ts: number;
+  attachments: DiscordIndexedAttachmentMeta[];
 };
 
 export type { ConversationThreadAboutness, ConversationThreadImportance };
@@ -193,6 +195,7 @@ type IndexedMessageRow = {
   ts: number;
   edited_ts: number | null;
   updated_ts: number;
+  attachments_hash: string | null;
   is_chat: number;
   reply_to_channel_id: string | null;
   reply_to_message_id: string | null;
@@ -325,8 +328,8 @@ function normalizeSummary(summary: ConversationThreadSummaryInput): Conversation
 function computeThreadInputHash(messages: readonly IndexedMessageRow[]): string {
   return stableHash(
     messages
-      .map((message) =>
-        [
+      .map((message) => {
+        const fields: Array<string | number> = [
           message.channel_id,
           message.message_id,
           message.user_id,
@@ -334,8 +337,10 @@ function computeThreadInputHash(messages: readonly IndexedMessageRow[]): string 
           message.ts,
           message.edited_ts ?? "",
           message.text,
-        ].join("\u001f"),
-      )
+        ];
+        if (message.attachments_hash !== null) fields.push(message.attachments_hash);
+        return fields.join("\u001f");
+      })
       .join("\u001e"),
   );
 }
@@ -501,7 +506,10 @@ export function classifyConversationThreadMessageUpdate(
 ): ConversationThreadRepairKind | null {
   if (!before) return "topology";
 
-  const persistedContentChanged = before.text !== after.text || before.editedTs !== after.editedTs;
+  const attachmentContentChanged =
+    JSON.stringify(before.attachments) !== JSON.stringify(after.attachments);
+  const persistedContentChanged =
+    before.text !== after.text || before.editedTs !== after.editedTs || attachmentContentChanged;
   const persistedTopologyFieldChanged =
     before.ref.platform !== after.ref.platform ||
     before.ref.channelId !== after.ref.channelId ||
@@ -517,7 +525,9 @@ export function classifyConversationThreadMessageUpdate(
 
   if (!persistedContentChanged && !persistedTopologyFieldChanged) return null;
   if (persistedTopologyFieldChanged) return "topology";
-  if ((before.text.trim().length === 0) !== (after.text.trim().length === 0)) return "topology";
+  const beforeEligible = before.text.trim().length > 0 || before.attachments.length > 0;
+  const afterEligible = after.text.trim().length > 0 || after.attachments.length > 0;
+  if (beforeEligible !== afterEligible) return "topology";
   if (isDiscordSessionDividerText(before.text) !== isDiscordSessionDividerText(after.text)) {
     return "topology";
   }
@@ -1033,12 +1043,21 @@ export class ConversationThreadStore {
           m.text,
           m.ts,
           m.edited_ts,
-          m.updated_ts
+          m.updated_ts,
+          m.attachments_hash
         FROM discord_search_messages m
         ${metadataJoin}
         WHERE m.channel_id = ?
           AND m.deleted = 0
-          AND trim(m.text) <> ''
+          AND (
+            trim(m.text) <> ''
+            OR EXISTS (
+              SELECT 1
+              FROM discord_search_message_attachments a
+              WHERE a.channel_id = m.channel_id
+                AND a.message_id = m.message_id
+            )
+          )
           AND (${hasSurfaceDb ? "r.is_chat IS NULL OR r.is_chat != 0" : "1 = 1"})
         ORDER BY m.ts ASC, m.message_id ASC
         `,
@@ -1338,6 +1357,37 @@ export class ConversationThreadStore {
       userName: row.user_name ?? undefined,
       text: row.text,
       ts: row.ts,
+      attachments: this.listMessageAttachments(row.channel_id, row.message_id),
+    }));
+  }
+
+  private listMessageAttachments(
+    channelId: string,
+    messageId: string,
+  ): DiscordIndexedAttachmentMeta[] {
+    const rows = this.db
+      .query<
+        {
+          attachment_id: string | null;
+          filename: string | null;
+          mime_type: string | null;
+          size: number | null;
+        },
+        [string, string]
+      >(
+        `
+        SELECT attachment_id, filename, mime_type, size
+        FROM discord_search_message_attachments
+        WHERE channel_id = ? AND message_id = ?
+        ORDER BY ordinal ASC
+        `,
+      )
+      .all(channelId, messageId);
+    return rows.map((row) => ({
+      ...(row.attachment_id ? { id: row.attachment_id } : {}),
+      ...(row.filename ? { filename: row.filename } : {}),
+      ...(row.mime_type ? { mimeType: row.mime_type } : {}),
+      ...(row.size !== null ? { size: row.size } : {}),
     }));
   }
 

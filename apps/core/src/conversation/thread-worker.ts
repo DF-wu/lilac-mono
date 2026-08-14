@@ -8,12 +8,17 @@ import {
 import { Panic, Result, TaggedError, type Result as ResultType } from "better-result";
 
 import {
-  decodeThreadSummarizationWorkerResponse,
-  ThreadSummarizationWorkerResponseDecodeError,
+  decodeThreadSummarizationWorkerMessage,
+  ThreadSummarizationWorkerMessageDecodeError,
+  type ThreadSummarizationParentMessage,
   type ThreadSummarizationResult,
+  type ThreadSummarizationHydrationRequest,
+  type ThreadSummarizationHydrationResponse,
   type ThreadSummarizationWorkerRequest,
 } from "./thread-summarization-worker-protocol";
 import type { ConversationThreadRunSummarizationInput } from "./thread-service";
+import type { SurfaceAdapter } from "../surface/adapter";
+import { toReplyChainMessage } from "../surface/bridge/request-composition/reply-chain";
 
 const CHECK_INTERVAL_MS = 10 * 60 * 1000;
 const INITIAL_CHECK_DELAY_MS = 10_000;
@@ -86,7 +91,7 @@ export class ConversationThreadSummarizationRuntimeError extends TaggedError(
 }> {}
 
 export type ConversationThreadSummarizationWorkerError =
-  | ThreadSummarizationWorkerResponseDecodeError
+  | ThreadSummarizationWorkerMessageDecodeError
   | ConversationThreadSummarizationRemoteError
   | ConversationThreadSummarizationTransportError;
 
@@ -95,7 +100,7 @@ export type ConversationThreadSummarizationError =
   | ConversationThreadSummarizationRuntimeError;
 
 export type ConversationThreadSummarizationWorkerTransport = {
-  postMessage(request: ThreadSummarizationWorkerRequest): void;
+  postMessage(request: ThreadSummarizationParentMessage): void;
   terminate(): void;
   onMessage(listener: (event: MessageEvent<unknown>) => void): void;
   onError(listener: (panic: Panic) => void): void;
@@ -160,6 +165,7 @@ function queuedResult(jobId: string): ThreadSummarizationResult {
 export function startConversationThreadSummarizationWorker(params: {
   searchDbPath: string;
   surfaceDbPath?: string;
+  adapter?: Pick<SurfaceAdapter, "readMsg">;
   createWorker?: () => ConversationThreadSummarizationWorkerTransport;
   reportFatalPanic?: ConversationThreadWorkerFatalReporter;
 }): ConversationThreadSummarizationRunner & { stop(): Promise<void> } {
@@ -188,7 +194,7 @@ export function startConversationThreadSummarizationWorker(params: {
   >();
   let stopped = false;
   let terminated = false;
-  let terminalFailure: ThreadSummarizationWorkerResponseDecodeError | null = null;
+  let terminalFailure: ThreadSummarizationWorkerMessageDecodeError | null = null;
   let terminalPanic: Panic | null = null;
 
   const terminateWorker = () => {
@@ -211,9 +217,92 @@ export function startConversationThreadSummarizationWorker(params: {
     for (const waiter of waiters) waiter.reject(panic);
   };
 
+  const postRequest = (request: ThreadSummarizationParentMessage) => {
+    try {
+      worker.postMessage(request);
+      return Result.ok(undefined);
+    } catch (cause) {
+      pending.delete(request.id);
+      jobs.delete(request.id);
+      if (Panic.is(cause)) rethrowConversationThreadWorkerPanic(cause);
+      return Result.err(
+        new ConversationThreadSummarizationTransportError({
+          operation: "post-message",
+          cause,
+          message: "Could not post conversation thread summarization worker request",
+        }),
+      );
+    }
+  };
+
+  const handleHydrationRequest = async (request: ThreadSummarizationHydrationRequest) => {
+    const results: ThreadSummarizationHydrationResponse["results"] = [];
+    for (const ref of request.refs) {
+      if (!params.adapter) {
+        results.push({ ref, ok: false, error: "surface adapter unavailable" });
+        continue;
+      }
+      const [settled] = await Promise.allSettled([
+        params.adapter.readMsg({ platform: "discord", ...ref }),
+      ]);
+      if (settled.status === "rejected") {
+        const panic = Panic.is(settled.reason)
+          ? settled.reason
+          : new Panic({
+              message: "Conversation thread attachment hydration defect",
+              cause: settled.reason,
+            });
+        handleWorkerPanic(panic);
+        return;
+      }
+      const read = settled.value;
+      if (read.status === "error") {
+        results.push({ ref, ok: false, error: read.error.message });
+        continue;
+      }
+      if (!read.value) {
+        results.push({ ref, ok: false, error: "surface message not found" });
+        continue;
+      }
+      results.push({
+        ref,
+        ok: true,
+        attachments: toReplyChainMessage(read.value).attachments,
+      });
+    }
+    if (stopped || terminalFailure || terminalPanic) return;
+    const response: ThreadSummarizationParentMessage = {
+      type: "hydrate-discord-attachments-result",
+      id: request.id,
+      results,
+    };
+    const [posted] = await Promise.allSettled([
+      Promise.resolve().then(() => postRequest(response)),
+    ]);
+    if (posted.status === "rejected") {
+      handleWorkerPanic(
+        Panic.is(posted.reason)
+          ? posted.reason
+          : new Panic({
+              message: "Conversation thread hydration response failed",
+              cause: posted.reason,
+            }),
+      );
+      return;
+    }
+    if (posted.value.status === "error") {
+      handleWorkerPanic(
+        new Panic({
+          message: "Conversation thread hydration response failed",
+          cause: posted.value.error,
+        }),
+      );
+    }
+  };
+
   worker.onMessage((event) => {
     if (stopped || terminalFailure || terminalPanic) return;
-    const decoded = decodeThreadSummarizationWorkerResponse(event.data);
+    const decoded = decodeThreadSummarizationWorkerMessage(event.data);
     if (decoded.status === "error") {
       terminalFailure = decoded.error;
       settlePending(terminalFailure);
@@ -226,6 +315,10 @@ export function startConversationThreadSummarizationWorker(params: {
     }
 
     const response = decoded.value;
+    if ("type" in response) {
+      void handleHydrationRequest(response);
+      return;
+    }
     const waiter = pending.get(response.id);
     const job = jobs.get(response.id);
     if (!waiter && !job) {
@@ -280,24 +373,6 @@ export function startConversationThreadSummarizationWorker(params: {
     logger.error("conversation thread worker defect", formatTaggedErrorForLog(terminalPanic));
   };
   worker.onError(handleWorkerPanic);
-
-  const postRequest = (request: ThreadSummarizationWorkerRequest) => {
-    try {
-      worker.postMessage(request);
-      return Result.ok(undefined);
-    } catch (cause) {
-      pending.delete(request.id);
-      jobs.delete(request.id);
-      if (Panic.is(cause)) rethrowConversationThreadWorkerPanic(cause);
-      return Result.err(
-        new ConversationThreadSummarizationTransportError({
-          operation: "post-message",
-          cause,
-          message: "Could not post conversation thread summarization worker request",
-        }),
-      );
-    }
-  };
 
   return {
     async runSummarization(input = {}) {

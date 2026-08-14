@@ -2,6 +2,7 @@ import type { ModelMessage } from "ai";
 import type { CorePrimaryLineageV1 } from "@stanley2058/lilac-event-bus";
 
 import type { MsgRef } from "../../types";
+import type { DiscordAttachmentMeta } from "../../discord/discord-attachment";
 
 import type { TranscriptStore } from "../../../transcript/transcript-store";
 
@@ -58,13 +59,6 @@ export type ComposeRequestOpts = {
   /** Optional transform applied to one selected user message id. */
   transformUserTextForMessageId?: string;
   transformUserText?: (text: string) => string;
-};
-
-export type DiscordAttachmentMeta = {
-  url: string;
-  filename?: string;
-  mimeType?: string;
-  size?: number;
 };
 
 export type ReplyChainMessage = {

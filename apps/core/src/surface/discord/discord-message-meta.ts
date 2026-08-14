@@ -10,6 +10,7 @@ import {
 import { z } from "zod";
 
 import type { SurfaceSessionParticipant, SurfaceSessionParticipantActivity } from "../types";
+import type { DiscordAttachmentMeta } from "./discord-attachment";
 import {
   buildDiscordTaggedTextFromContentAndEmbeds,
   type DiscordEmbedTextMeta,
@@ -84,13 +85,6 @@ export function sortSurfaceParticipants(
   });
 }
 
-export type DiscordAttachmentMeta = {
-  url: string;
-  filename?: string;
-  mimeType?: string;
-  size?: number;
-};
-
 const DISCORD_REFERENCE_TYPE_DEFAULT = 0;
 const DISCORD_REFERENCE_TYPE_FORWARD = 1;
 
@@ -138,6 +132,7 @@ export function getReplyReference(msg: Message): {
 
 function toDiscordAttachmentMeta(attachment: Attachment): DiscordAttachmentMeta {
   return {
+    id: attachment.id,
     url: attachment.url,
     filename: attachment.name,
     ...(attachment.contentType ? { mimeType: attachment.contentType } : {}),

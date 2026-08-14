@@ -1,30 +1,51 @@
-import type { ModelMessage } from "ai";
+import type { ModelMessage, UserContent } from "ai";
 
 import { stripSurfaceMetadataLines } from "../surface-metadata";
 
-function userContentText(content: ModelMessage["content"]): string {
-  if (typeof content === "string") return content;
-  if (!Array.isArray(content)) return "";
-
-  const parts: string[] = [];
-  for (const part of content) {
-    if (!part || typeof part !== "object") continue;
-    const record = part as Record<string, unknown>;
-    if (record.type !== "text") continue;
-    const text = record.text;
-    if (typeof text === "string") parts.push(text);
-  }
-  return parts.join("\n");
+export function latestUserText(messages: readonly ModelMessage[]): string {
+  return latestUserInput(messages).text;
 }
 
-export function latestUserText(messages: readonly ModelMessage[]): string {
+export type LatestUserInput = {
+  text: string;
+  authoredText: string;
+  content: UserContent;
+  hasAttachment: boolean;
+};
+
+export function latestUserInput(messages: readonly ModelMessage[]): LatestUserInput {
   for (let i = messages.length - 1; i >= 0; i -= 1) {
     const message = messages[i]!;
     if (message.role !== "user") continue;
-    const text = stripSurfaceMetadataLines(userContentText(message.content)).trim();
-    if (text.length > 0) return text;
+    if (typeof message.content === "string") {
+      const text = stripSurfaceMetadataLines(message.content).trim();
+      return { text, authoredText: text, content: text, hasAttachment: false };
+    }
+    const content: Exclude<UserContent, string> = [];
+    const textParts: string[] = [];
+    const authoredParts: string[] = [];
+    let hasAttachment = false;
+    for (const part of message.content) {
+      if (part.type === "text") {
+        const text = stripSurfaceMetadataLines(part.text).trim();
+        if (!text) continue;
+        content.push({ ...part, text });
+        textParts.push(text);
+        if (text.startsWith("[discord_attachment ")) hasAttachment = true;
+        else authoredParts.push(text);
+        continue;
+      }
+      if (part.type === "file" || part.type === "image") hasAttachment = true;
+      content.push(part);
+    }
+    return {
+      text: textParts.join("\n"),
+      authoredText: authoredParts.join("\n"),
+      content,
+      hasAttachment,
+    };
   }
-  return "";
+  return { text: "", authoredText: "", content: "", hasAttachment: false };
 }
 
 const URL_RE = /\b(?:https?:\/\/|www\.)[^\s<>()]+/giu;

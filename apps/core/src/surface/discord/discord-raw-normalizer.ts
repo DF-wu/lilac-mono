@@ -1,6 +1,6 @@
 import { z } from "zod";
 
-import type { DiscordAttachmentMeta } from "../bridge/request-composition/types";
+import type { DiscordAttachmentMeta } from "./discord-attachment";
 
 import { normalizeDiscordEmbeds, type DiscordEmbedTextMeta } from "./discord-embed-text";
 
@@ -52,6 +52,7 @@ const discordReferenceSchema = z
   .passthrough();
 const discordAttachmentSchema = z
   .object({
+    id: maybeStringSchema,
     url: z.string().min(1),
     filename: maybeStringSchema,
     name: maybeStringSchema,
@@ -113,6 +114,7 @@ export function normalizeDiscordRaw(raw: unknown): NormalizedDiscordRaw | null {
     const mimeType = attachment.mimeType ?? attachment.contentType;
 
     return {
+      ...(attachment.id ? { id: attachment.id } : {}),
       url: attachment.url,
       ...(filename ? { filename } : {}),
       ...(mimeType ? { mimeType } : {}),
