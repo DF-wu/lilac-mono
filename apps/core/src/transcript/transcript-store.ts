@@ -35,6 +35,7 @@ import {
   decodeCoreSurfaceProjectionRow as decodePersistedCoreSurfaceProjectionRow,
   decodeDiscoveryRecordRow as decodePersistedDiscoveryRecordRow,
   decodeRecentAgentWriteRow as decodePersistedRecentAgentWriteRow,
+  decodeSurfaceMessageLinkRow as decodePersistedSurfaceMessageLinkRow,
   decodeTranscriptCompactionContext as decodePersistedTranscriptCompactionContext,
   decodeTranscriptMessages,
   decodeTranscriptProviderState as decodePersistedTranscriptProviderState,
@@ -50,6 +51,7 @@ import {
   type DecodedCoreSurfaceProjectionRow,
   type DecodedDiscoveryRecordRow,
   type DecodedRecentAgentWriteRow,
+  type DecodedSurfaceMessageLinkRow,
   type DecodedTranscriptBlobMetricsRow,
   type DecodedTranscriptCountRow,
   type DecodedTranscriptForeignKeyFailureRow,
@@ -59,6 +61,7 @@ import {
   type PersistedCoreSurfaceProjectionRow,
   type PersistedDiscoveryRecordRow,
   type PersistedRecentAgentWriteRow,
+  type PersistedSurfaceMessageLinkRow,
   type PersistedTranscriptRow,
   type TranscriptStorePersistedRowKind,
 } from "./transcript-persistence-codec";
@@ -87,6 +90,12 @@ function decodeRecentAgentWriteRow(
   input: Parameters<typeof decodePersistedRecentAgentWriteRow>[0],
 ): ResultType<DecodedPersistedValue<DecodedRecentAgentWriteRow>, PersistedDataError> {
   return decodePersistedRecentAgentWriteRow(input);
+}
+
+function decodeSurfaceMessageLinkRow(
+  input: Parameters<typeof decodePersistedSurfaceMessageLinkRow>[0],
+): ResultType<DecodedPersistedValue<DecodedSurfaceMessageLinkRow>, PersistedDataError> {
+  return decodePersistedSurfaceMessageLinkRow(input);
 }
 
 function decodeDiscoveryRecordRow(
@@ -4000,9 +4009,9 @@ export class SqliteTranscriptStore implements TranscriptStore {
 
   listSurfaceMessagesForRequest(input: { requestId: string }): MsgRef[] {
     const rows = this.db
-      .query<{ platform: string; channel_id: string; message_id: string }, [string]>(
+      .query<PersistedSurfaceMessageLinkRow, [string]>(
         `
-        SELECT platform, channel_id, message_id
+        SELECT request_id, platform, channel_id, message_id
         FROM surface_message_to_request
         WHERE request_id = ?
         ORDER BY created_ts ASC, rowid ASC
@@ -4012,12 +4021,17 @@ export class SqliteTranscriptStore implements TranscriptStore {
 
     const refs: MsgRef[] = [];
     for (const row of rows) {
-      if (row.platform !== "discord" && row.platform !== "github") continue;
-      refs.push({
-        platform: row.platform,
-        channelId: row.channel_id,
-        messageId: row.message_id,
+      const decoded = decodeSurfaceMessageLinkRow({
+        row,
+        schemaVersion: TRANSCRIPT_SCHEMA_VERSION,
+        recordId: typeof row.request_id === "string" ? row.request_id : "unknown-record",
       });
+      if (decoded.status === "error") {
+        this.reportPersistenceError(decoded.error);
+        continue;
+      }
+      const ref = projectBuiltinSurfaceMessageRef(decoded.value.value);
+      if (ref) refs.push(ref);
     }
 
     return refs;

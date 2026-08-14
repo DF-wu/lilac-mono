@@ -215,9 +215,7 @@ export async function bridgeAdapterToBus(params: {
               cancel: true,
               cancelQueued,
               requiresActive: !cancelQueued,
-              source:
-                evt.source ??
-                (cancelQueued ? "discord_cancel_context_menu" : "discord_cancel_button"),
+              source: evt.source ?? (cancelQueued ? "context_menu" : "button"),
               ...(evt.userId ? { userId: evt.userId } : {}),
               ...(evt.messageId ? { messageId: evt.messageId } : {}),
             },

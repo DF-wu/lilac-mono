@@ -49,7 +49,7 @@ export type SurfaceRelaySnapshotFor<P extends RegisteredSurfacePlatform> = Omit<
 };
 
 export class SurfaceRelayRestoreApplyFailed extends TaggedError("SurfaceRelayRestoreApplyFailed")<{
-  readonly platform: RegisteredSurfacePlatform;
+  readonly platform: AdapterPlatform;
   readonly requestId: string;
   readonly message: string;
 }> {}

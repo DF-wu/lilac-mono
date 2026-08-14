@@ -391,9 +391,16 @@ export async function applySurfaceRecovery(
   const agentApplied = plan.agentAttempt.apply();
   if (agentApplied.status === "error") {
     await rollbackApplied();
+    const failedAgent = plan.snapshot.agent.find(
+      (entry) => entry.requestId === agentApplied.error.requestId,
+    );
     return Result.err(
       new SurfaceRelayRestoreApplyFailed({
-        platform: plan.snapshot.relays[0]?.platform ?? "discord",
+        platform:
+          failedAgent?.requestClient ??
+          plan.snapshot.agent[0]?.requestClient ??
+          plan.snapshot.relays[0]?.platform ??
+          "unknown",
         requestId: agentApplied.error.requestId,
         message: agentApplied.error.message,
       }),

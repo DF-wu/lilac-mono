@@ -1026,6 +1026,54 @@ describe("surface runtime lifecycle", () => {
     expect(calls).toEqual(["discord-apply", "github-apply", "github-rollback", "discord-rollback"]);
   });
 
+  it("reports the failed agent platform instead of the first relay platform", async () => {
+    const calls: string[] = [];
+    const registry = createRegistry({
+      calls,
+      githubRelayStart: async () => emptyRelayHandle("github"),
+    });
+    const handles = maps();
+    handles.relays.set("discord", emptyRelayHandle("discord"));
+    handles.relays.set("github", emptyRelayHandle("github"));
+    const githubEntry: AgentRunnerRecoveryEntry = {
+      ...agentEntry,
+      requestId: "github:octo/repo#1:request",
+      sessionId: "octo/repo#1",
+      requestClient: "github",
+    };
+    const prepared = prepareSurfaceRecovery({
+      registry,
+      snapshot: recoverySnapshot([githubEntry], [relaySnapshot("discord", "discord-request")]),
+      relays: handles.relays,
+      agentRunner: {
+        prepareRecovery: () =>
+          Result.ok({
+            apply: () =>
+              Result.err(
+                new AgentRecoveryUnavailable({
+                  requestId: githubEntry.requestId,
+                  reason: "cache-conflict",
+                  message: "injected agent apply failure",
+                }),
+              ),
+            rollback: () => undefined,
+            activate: () => undefined,
+          }),
+      },
+    });
+    if (prepared.status === "error") throw prepared.error;
+
+    const applied = await applySurfaceRecovery(prepared.value);
+    expect(applied.status).toBe("error");
+    if (applied.status === "error") {
+      expect(applied.error).toMatchObject({
+        platform: "github",
+        requestId: githubEntry.requestId,
+        message: "injected agent apply failure",
+      });
+    }
+  });
+
   it("raises the registered Panic when relay rollback leaves atomicity unknown", async () => {
     const calls: string[] = [];
     const registry = createRegistry({ calls });

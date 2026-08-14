@@ -348,6 +348,20 @@ export type DecodedTranscriptBlobMetricsRow = {
   readonly unreferencedBytes: number;
 };
 
+export type PersistedSurfaceMessageLinkRow = {
+  readonly request_id: string;
+  readonly platform: string;
+  readonly channel_id: string;
+  readonly message_id: string;
+};
+
+export type DecodedSurfaceMessageLinkRow = {
+  readonly requestId: string;
+  readonly platform: AdapterPlatform;
+  readonly channelId: string;
+  readonly messageId: string;
+};
+
 export type PersistedRecentAgentWriteRow = {
   readonly request_id: string;
   readonly platform: string;
@@ -571,6 +585,12 @@ const recentAgentWriteRowSchema = z.strictObject({
   message_id: z.string().min(1),
   updated_ts: nonNegativeIntegerSchema,
   final_text: z.string().nullable(),
+});
+const surfaceMessageLinkRowSchema = z.strictObject({
+  request_id: z.string().min(1),
+  platform: adapterPlatformSchema,
+  channel_id: z.string().min(1),
+  message_id: z.string().min(1),
 });
 const discoveryRecordRowSchema = z.strictObject({
   request_id: z.string().min(1),
@@ -858,6 +878,36 @@ function aggregateProvenance(
   return values.some((value) => value.provenance === "missing-defaulted")
     ? "missing-defaulted"
     : "current";
+}
+
+export function decodeSurfaceMessageLinkRow(input: {
+  readonly row: unknown;
+  readonly schemaVersion: number;
+  readonly recordId: string;
+}): ResultType<DecodedRequiredPersistedValue<DecodedSurfaceMessageLinkRow>, PersistedDataError> {
+  const version = decodeSchemaVersion(input.schemaVersion, SURFACE_LINK_TABLE, input.recordId);
+  if (version.status === "error") return Result.err(version.error);
+  const decoded = surfaceMessageLinkRowSchema.safeParse(input.row);
+  if (!decoded.success) {
+    return Result.err(
+      corrupt({
+        table: SURFACE_LINK_TABLE,
+        field: "surface-message-link-row",
+        version: version.value.version,
+        issueCode: "invalid-transcript-row",
+        recordId: input.recordId,
+      }),
+    );
+  }
+  return Result.ok({
+    value: {
+      requestId: decoded.data.request_id,
+      platform: decoded.data.platform,
+      channelId: decoded.data.channel_id,
+      messageId: decoded.data.message_id,
+    },
+    provenance: version.value.provenance,
+  });
 }
 
 export function decodeRecentAgentWriteRow(input: {
@@ -1501,6 +1551,50 @@ const fixtureRecentAgentWriteRow = {
   updated_ts: 2,
   final_text: "fixture",
 } as const satisfies PersistedRecentAgentWriteRow;
+
+const fixtureSurfaceMessageLinkRow = {
+  request_id: "fixture",
+  platform: "discord",
+  channel_id: "session",
+  message_id: "message",
+} as const satisfies PersistedSurfaceMessageLinkRow;
+
+export const surfaceMessageLinkRowCodecCases = {
+  current: {
+    input: { row: fixtureSurfaceMessageLinkRow, schemaVersion: 5, recordId: "current" },
+    outcome: "ok",
+    provenance: "current",
+  },
+  legacy: {
+    input: { row: fixtureSurfaceMessageLinkRow, schemaVersion: 1, recordId: "legacy" },
+    outcome: "ok",
+    provenance: "migrated",
+  },
+  "missing-defaulted": {
+    input: { row: null, schemaVersion: 5, recordId: "missing" },
+    outcome: "error",
+  },
+  "unsupported-version": {
+    input: { row: fixtureSurfaceMessageLinkRow, schemaVersion: 6, recordId: "unsupported" },
+    outcome: "error",
+  },
+  "malformed-serialization": {
+    input: {
+      row: { ...fixtureSurfaceMessageLinkRow, request_id: 1 },
+      schemaVersion: 5,
+      recordId: "malformed",
+    },
+    outcome: "error",
+  },
+  "corrupt-fields": {
+    input: {
+      row: { ...fixtureSurfaceMessageLinkRow, platform: "future" },
+      schemaVersion: 5,
+      recordId: "corrupt",
+    },
+    outcome: "error",
+  },
+} as const;
 
 export const recentAgentWriteRowCodecCases = {
   current: {

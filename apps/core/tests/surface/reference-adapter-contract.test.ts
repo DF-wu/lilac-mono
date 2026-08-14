@@ -38,6 +38,7 @@ import {
   type RegisteredSurfaceRuntimeDescriptor,
 } from "../../src/surface/runtime-descriptor";
 import type { MsgRef, SessionRef } from "../../src/surface/types";
+import type { ReplyTargetResolution } from "../../src/surface/protocol";
 import { DiscordOutputStream } from "../../src/surface/discord/output/discord-output-stream";
 import { GithubOutputStream } from "../../src/surface/github/output/github-output-stream";
 import { clearGithubAck, getGithubAck, setGithubAck } from "../../src/github/github-state";
@@ -59,14 +60,37 @@ type ProtocolLog = {
 
 type ReferenceContract = {
   readonly platform: RegisteredSurfacePlatform;
+  readonly protocol: (typeof BUILTIN_SURFACE_PROTOCOLS)[RegisteredSurfacePlatform];
   readonly sessionId: string;
   readonly requestId: string;
   readonly messageId: string;
   readonly missingMessageId: string;
   readonly expectedListSessionsError: SurfaceOperationError["_tag"];
   readonly expectedProviderOperation: "push-output" | "send-message";
+  createSessionRef(): SessionRef;
+  createMessageRef(messageId?: string): MsgRef;
+  readonly foreignSessionRef: SessionRef;
+  readonly foreignMessageRef: MsgRef;
+  resolveProtocolRequestMessageRef(): ReplyTargetResolution<MsgRef>;
   createAdapter(log?: ProtocolLog): SurfaceAdapter;
   createProviderFailureAdapter(): SurfaceAdapter;
+  createDescriptor(adapter: SurfaceAdapter): RegisteredSurfaceRuntimeDescriptor;
+  createRelayPolicy(adapter: SurfaceAdapter): {
+    readonly refs: {
+      resolveInitialReplyTarget(input: {
+        readonly requestId: string;
+        readonly sessionId: string;
+      }): ReplyTargetResolution<MsgRef>;
+      readonly decodeReanchorTarget: unknown;
+    };
+  };
+  createBridge(adapter: SurfaceAdapter, bus: LilacBus): ReturnType<typeof bridgeBusToAdapter>;
+  observeOutputAborts(abortReasons: Array<string | undefined>): () => void;
+  assertOutputCreated(
+    created: readonly MsgRef[],
+    finished: { readonly created: readonly MsgRef[] },
+  ): void;
+  assertFinalization(adapter: SurfaceAdapter, log: ProtocolLog): Promise<void>;
   assertActionRendered(log: ProtocolLog): void;
 };
 
@@ -208,89 +232,35 @@ function createDiscordAdapter(
 
 const DISCORD_REFERENCE: ReferenceContract = {
   platform: "discord",
+  protocol: BUILTIN_SURFACE_PROTOCOLS.discord,
   sessionId: "channel-1",
   requestId: "discord:channel-1:origin",
   messageId: "origin",
   missingMessageId: "missing",
   expectedListSessionsError: "SurfaceUnavailable",
   expectedProviderOperation: "push-output",
+  createSessionRef: () => BUILTIN_SURFACE_PROTOCOLS.discord.refs.createSessionRef("channel-1"),
+  createMessageRef: (messageId = "origin") =>
+    BUILTIN_SURFACE_PROTOCOLS.discord.refs.createMessageRef(
+      BUILTIN_SURFACE_PROTOCOLS.discord.refs.createSessionRef("channel-1"),
+      messageId,
+    ),
+  foreignSessionRef: { platform: "github", channelId: "channel-1" },
+  foreignMessageRef: {
+    platform: "github",
+    channelId: "channel-1",
+    messageId: "wrong",
+  },
+  resolveProtocolRequestMessageRef: () =>
+    BUILTIN_SURFACE_PROTOCOLS.discord.refs.resolveRequestMessageRef({
+      requestId: "discord:channel-1:origin",
+      sessionRef: BUILTIN_SURFACE_PROTOCOLS.discord.refs.createSessionRef("channel-1"),
+    }),
   createAdapter: (log = createProtocolLog()) => createDiscordAdapter(log),
   createProviderFailureAdapter: () =>
     createDiscordAdapter(createProtocolLog(), { channelFetchFailure: { status: 503 } }),
-  assertActionRendered: (log) => {
-    expect(log.creates.some((entry) => entry.includes("Cancel"))).toBe(true);
-  },
-};
-
-const GITHUB_REFERENCE: ReferenceContract = {
-  platform: "github",
-  sessionId: "octo/repo#1",
-  requestId: "github:octo/repo#1:origin",
-  messageId: "origin",
-  missingMessageId: "404",
-  expectedListSessionsError: "SurfaceOperationUnsupported",
-  expectedProviderOperation: "send-message",
-  createAdapter: (log = createProtocolLog()) => new GithubAdapter({ api: createGithubApi(log) }),
-  createProviderFailureAdapter: () =>
-    new GithubAdapter({
-      api: createGithubApi(createProtocolLog(), {
-        createFailure: new GithubApiError(503, "/repos/octo/repo/issues/1/comments", "unavailable"),
-      }),
-    }),
-  assertActionRendered: (log) => {
-    expect(log.edits.some((entry) => entry.includes("Cancel"))).toBe(true);
-  },
-};
-
-const REFERENCE_CASES = [
-  ["Discord", DISCORD_REFERENCE],
-  ["GitHub", GITHUB_REFERENCE],
-] as const;
-
-function sessionRef(reference: ReferenceContract): SessionRef {
-  return reference.platform === "discord"
-    ? { platform: "discord", channelId: reference.sessionId }
-    : { platform: "github", channelId: reference.sessionId };
-}
-
-function msgRef(reference: ReferenceContract, messageId = reference.messageId): MsgRef {
-  return reference.platform === "discord"
-    ? { platform: "discord", channelId: reference.sessionId, messageId }
-    : { platform: "github", channelId: reference.sessionId, messageId };
-}
-
-function oppositeSessionRef(reference: ReferenceContract): SessionRef {
-  return reference.platform === "discord"
-    ? { platform: "github", channelId: reference.sessionId }
-    : { platform: "discord", channelId: reference.sessionId };
-}
-
-function oppositeMsgRef(reference: ReferenceContract): MsgRef {
-  return reference.platform === "discord"
-    ? { platform: "github", channelId: reference.sessionId, messageId: "wrong" }
-    : { platform: "discord", channelId: reference.sessionId, messageId: "wrong" };
-}
-
-function relaySnapshot(reference: ReferenceContract): BusToAdapterRelaySnapshot {
-  return {
-    requestId: reference.requestId,
-    sessionId: reference.sessionId,
-    requestClient: reference.platform,
-    platform: reference.platform,
-    replyTo: msgRef(reference),
-    createdOutputRefs: [msgRef(reference, "output-1")],
-    activeOutputRefs: [msgRef(reference, "output-1")],
-    visibleText: "partial output",
-    toolStatus: [],
-  };
-}
-
-function createReferenceDescriptor(
-  reference: ReferenceContract,
-  adapter: SurfaceAdapter,
-): RegisteredSurfaceRuntimeDescriptor {
-  if (reference.platform === "discord") {
-    return createDiscordSurfaceRuntimeDescriptor({
+  createDescriptor: (adapter) =>
+    createDiscordSurfaceRuntimeDescriptor({
       adapter,
       adapterIngress: {
         start: async () => {
@@ -306,21 +276,161 @@ function createReferenceDescriptor(
           },
         },
       }),
-    });
-  }
-
-  return createGithubSurfaceRuntimeDescriptor({
-    adapter,
-    createRelay: () => ({
-      ...createGithubRelayPolicy(),
-      lifecycle: {
-        platform: "github",
-        start: async () => {
-          throw new Error("Reference descriptor lifecycle is unused");
-        },
-      },
     }),
-  });
+  createRelayPolicy: (adapter) => createDiscordRelayPolicy(adapter),
+  createBridge: (adapter, bus) =>
+    bridgeBusToAdapter({
+      adapter,
+      bus,
+      platform: "discord",
+      policy: createDiscordRelayPolicy(adapter),
+      subscriptionId: `reference-discord-${crypto.randomUUID()}`,
+      idleTimeoutMs: 10_000,
+    }),
+  observeOutputAborts: (abortReasons) => {
+    const abort = DiscordOutputStream.prototype.abort;
+    const observed = spyOn(DiscordOutputStream.prototype, "abort").mockImplementation(
+      function (this: DiscordOutputStream, reason) {
+        abortReasons.push(reason);
+        return abort.call(this, reason);
+      },
+    );
+    return () => observed.mockRestore();
+  },
+  assertOutputCreated: (created, finished) => {
+    expect(created).toEqual(finished.created);
+  },
+  assertFinalization: async (adapter, log) => {
+    const skippedCleanup = createDiscordRelayPolicy(adapter).finalization?.cleanupSkippedOutput;
+    if (!skippedCleanup) throw new Error("Discord skip cleanup is missing");
+    await expect(
+      skippedCleanup({
+        ref: { platform: "discord", channelId: "channel-1", messageId: "skip" },
+      }),
+    ).resolves.toBeUndefined();
+    expect(log.deletes).toContain("skip");
+  },
+  assertActionRendered: (log) => {
+    expect(log.creates.some((entry) => entry.includes("Cancel"))).toBe(true);
+  },
+};
+
+const GITHUB_REFERENCE: ReferenceContract = {
+  platform: "github",
+  protocol: BUILTIN_SURFACE_PROTOCOLS.github,
+  sessionId: "octo/repo#1",
+  requestId: "github:octo/repo#1:origin",
+  messageId: "origin",
+  missingMessageId: "404",
+  expectedListSessionsError: "SurfaceOperationUnsupported",
+  expectedProviderOperation: "send-message",
+  createSessionRef: () => BUILTIN_SURFACE_PROTOCOLS.github.refs.createSessionRef("octo/repo#1"),
+  createMessageRef: (messageId = "origin") =>
+    BUILTIN_SURFACE_PROTOCOLS.github.refs.createMessageRef(
+      BUILTIN_SURFACE_PROTOCOLS.github.refs.createSessionRef("octo/repo#1"),
+      messageId,
+    ),
+  foreignSessionRef: { platform: "discord", channelId: "octo/repo#1" },
+  foreignMessageRef: {
+    platform: "discord",
+    channelId: "octo/repo#1",
+    messageId: "wrong",
+  },
+  resolveProtocolRequestMessageRef: () =>
+    BUILTIN_SURFACE_PROTOCOLS.github.refs.resolveRequestMessageRef({
+      requestId: "github:octo/repo#1:origin",
+      sessionRef: BUILTIN_SURFACE_PROTOCOLS.github.refs.createSessionRef("octo/repo#1"),
+    }),
+  createAdapter: (log = createProtocolLog()) => new GithubAdapter({ api: createGithubApi(log) }),
+  createProviderFailureAdapter: () =>
+    new GithubAdapter({
+      api: createGithubApi(createProtocolLog(), {
+        createFailure: new GithubApiError(503, "/repos/octo/repo/issues/1/comments", "unavailable"),
+      }),
+    }),
+  createDescriptor: (adapter) =>
+    createGithubSurfaceRuntimeDescriptor({
+      adapter,
+      createRelay: () => ({
+        ...createGithubRelayPolicy(),
+        lifecycle: {
+          platform: "github",
+          start: async () => {
+            throw new Error("Reference descriptor lifecycle is unused");
+          },
+        },
+      }),
+    }),
+  createRelayPolicy: () => createGithubRelayPolicy(),
+  createBridge: (adapter, bus) =>
+    bridgeBusToAdapter({
+      adapter,
+      bus,
+      platform: "github",
+      policy: createGithubRelayPolicy(),
+      subscriptionId: `reference-github-${crypto.randomUUID()}`,
+      idleTimeoutMs: 10_000,
+    }),
+  observeOutputAborts: (abortReasons) => {
+    const abort = GithubOutputStream.prototype.abort;
+    const observed = spyOn(GithubOutputStream.prototype, "abort").mockImplementation(
+      function (this: GithubOutputStream, reason) {
+        abortReasons.push(reason);
+        return abort.call(this, reason);
+      },
+    );
+    return () => observed.mockRestore();
+  },
+  assertOutputCreated: (created) => {
+    expect(created).toEqual([]);
+  },
+  assertFinalization: async () => {
+    expect(createGithubRelayPolicy().finalization?.cleanupSkippedOutput).toBeUndefined();
+    const requestId = `github-ack-${crypto.randomUUID()}`;
+    const deleted: number[] = [];
+    setGithubAck(requestId, {
+      target: { kind: "issue", issueNumber: 1 },
+      reactionId: 42,
+    });
+    try {
+      const cleanup = createGithubRelayPolicy({
+        acknowledgementApi: {
+          deleteIssueReactionById: async ({ reactionId }) => {
+            deleted.push(reactionId);
+          },
+          deleteIssueCommentReactionById: async () => undefined,
+        },
+      }).finalization?.clearIngressAcknowledgement;
+      if (!cleanup) throw new Error("GitHub acknowledgement cleanup is missing");
+      expect(await cleanup({ requestId, sessionId: "octo/repo#1" })).toEqual(Result.ok(undefined));
+      expect(deleted).toEqual([42]);
+      expect(getGithubAck(requestId)).toBeUndefined();
+    } finally {
+      clearGithubAck(requestId);
+    }
+  },
+  assertActionRendered: (log) => {
+    expect(log.edits.some((entry) => entry.includes("Cancel"))).toBe(true);
+  },
+};
+
+const REFERENCE_CASES = [
+  ["Discord", DISCORD_REFERENCE],
+  ["GitHub", GITHUB_REFERENCE],
+] as const;
+
+function relaySnapshot(reference: ReferenceContract): BusToAdapterRelaySnapshot {
+  return {
+    requestId: reference.requestId,
+    sessionId: reference.sessionId,
+    requestClient: reference.platform,
+    platform: reference.platform,
+    replyTo: reference.createMessageRef(),
+    createdOutputRefs: [reference.createMessageRef("output-1")],
+    activeOutputRefs: [reference.createMessageRef("output-1")],
+    visibleText: "partial output",
+    toolStatus: [],
+  };
 }
 
 function registryFor(descriptors: readonly RegisteredSurfaceRuntimeDescriptor[]) {
@@ -333,58 +443,9 @@ function bindReferenceDescriptor(
   reference: ReferenceContract,
   adapter: SurfaceAdapter,
 ): RegisteredBoundSurfaceRuntimeDescriptor {
-  const [descriptor] = registryFor([createReferenceDescriptor(reference, adapter)]).entries();
+  const [descriptor] = registryFor([reference.createDescriptor(adapter)]).entries();
   if (!descriptor) throw new Error("Reference descriptor is missing");
   return descriptor;
-}
-
-async function createProductionBridge(
-  reference: ReferenceContract,
-  adapter: SurfaceAdapter,
-  bus: LilacBus,
-) {
-  if (reference.platform === "discord") {
-    return await bridgeBusToAdapter({
-      adapter,
-      bus,
-      platform: "discord",
-      policy: createDiscordRelayPolicy(adapter),
-      subscriptionId: `reference-discord-${crypto.randomUUID()}`,
-      idleTimeoutMs: 10_000,
-    });
-  }
-  return await bridgeBusToAdapter({
-    adapter,
-    bus,
-    platform: "github",
-    policy: createGithubRelayPolicy(),
-    subscriptionId: `reference-github-${crypto.randomUUID()}`,
-    idleTimeoutMs: 10_000,
-  });
-}
-
-function observeOutputAborts(
-  reference: ReferenceContract,
-  abortReasons: Array<string | undefined>,
-): () => void {
-  if (reference.platform === "discord") {
-    const abort = DiscordOutputStream.prototype.abort;
-    const observed = spyOn(DiscordOutputStream.prototype, "abort").mockImplementation(
-      function (this: DiscordOutputStream, reason) {
-        abortReasons.push(reason);
-        return abort.call(this, reason);
-      },
-    );
-    return () => observed.mockRestore();
-  }
-  const abort = GithubOutputStream.prototype.abort;
-  const observed = spyOn(GithubOutputStream.prototype, "abort").mockImplementation(
-    function (this: GithubOutputStream, reason) {
-      abortReasons.push(reason);
-      return abort.call(this, reason);
-    },
-  );
-  return () => observed.mockRestore();
 }
 
 function operationError<T>(result: ResultType<T, SurfaceOperationError>): SurfaceOperationError {
@@ -418,7 +479,7 @@ describe("shared Discord/GitHub adapter and descriptor contract", () => {
     }
     expect(
       projectBuiltinSurfaceMessageRef({
-        platform: "slack",
+        platform: "unknown",
         channelId: "channel",
         messageId: "message",
       }),
@@ -466,49 +527,13 @@ describe("shared Discord/GitHub adapter and descriptor contract", () => {
   it.each(REFERENCE_CASES)(
     "%s uses the catalog as the sole ref-routing implementation",
     (_name, reference) => {
-      if (reference.platform === "discord") {
-        const session = BUILTIN_SURFACE_PROTOCOLS.discord.refs.createSessionRef(
-          reference.sessionId,
-        );
-        const message = BUILTIN_SURFACE_PROTOCOLS.discord.refs.createMessageRef(
-          session,
-          reference.messageId,
-        );
-        const policy = createDiscordRelayPolicy(reference.createAdapter());
+      const session = reference.createSessionRef();
+      const message = reference.createMessageRef();
+      const policy = reference.createRelayPolicy(reference.createAdapter());
 
-        expect(session).toEqual({ platform: "discord", channelId: reference.sessionId });
-        expect(message).toEqual({
-          platform: "discord",
-          channelId: reference.sessionId,
-          messageId: reference.messageId,
-        });
-        expect(
-          policy.refs.resolveInitialReplyTarget({
-            requestId: reference.requestId,
-            sessionId: reference.sessionId,
-          }),
-        ).toEqual(
-          BUILTIN_SURFACE_PROTOCOLS.discord.refs.resolveRequestMessageRef({
-            requestId: reference.requestId,
-            sessionRef: session,
-          }),
-        );
-        expect(policy.refs.decodeReanchorTarget).toBe(
-          BUILTIN_SURFACE_PROTOCOLS.discord.refs.decodeMessageRef,
-        );
-        return;
-      }
-
-      const session = BUILTIN_SURFACE_PROTOCOLS.github.refs.createSessionRef(reference.sessionId);
-      const message = BUILTIN_SURFACE_PROTOCOLS.github.refs.createMessageRef(
-        session,
-        reference.messageId,
-      );
-      const policy = createGithubRelayPolicy();
-
-      expect(session).toEqual({ platform: "github", channelId: reference.sessionId });
+      expect(session).toEqual({ platform: reference.platform, channelId: reference.sessionId });
       expect(message).toEqual({
-        platform: "github",
+        platform: reference.platform,
         channelId: reference.sessionId,
         messageId: reference.messageId,
       });
@@ -516,80 +541,62 @@ describe("shared Discord/GitHub adapter and descriptor contract", () => {
         policy.refs.resolveInitialReplyTarget({
           requestId: reference.requestId,
           sessionId: reference.sessionId,
-        }),
-      ).toEqual(
-        BUILTIN_SURFACE_PROTOCOLS.github.refs.resolveRequestMessageRef({
-          requestId: reference.requestId,
-          sessionRef: session,
-        }),
-      );
-      expect(policy.refs.decodeReanchorTarget).toBe(
-        BUILTIN_SURFACE_PROTOCOLS.github.refs.decodeMessageRef,
-      );
+        }) as ReplyTargetResolution<MsgRef>,
+      ).toEqual(reference.resolveProtocolRequestMessageRef());
+      expect(policy.refs.decodeReanchorTarget).toBe(reference.protocol.refs.decodeMessageRef);
     },
   );
 
-  it("selects exactly one real relay from request_client with both descriptors active", async () => {
+  it("selects exactly one real relay from request_client with all descriptors active", async () => {
     const bus = createLilacBus(createInMemoryDeliveryBus());
-    const discord = bindReferenceDescriptor(DISCORD_REFERENCE, DISCORD_REFERENCE.createAdapter());
-    const github = bindReferenceDescriptor(GITHUB_REFERENCE, GITHUB_REFERENCE.createAdapter());
-    const discordBridge = await createProductionBridge(DISCORD_REFERENCE, discord.adapter, bus);
-    const githubBridge = await createProductionBridge(GITHUB_REFERENCE, github.adapter, bus);
+    const bridges = await Promise.all(
+      REFERENCE_CASES.map(async ([, reference]) => {
+        const descriptor = bindReferenceDescriptor(reference, reference.createAdapter());
+        return {
+          reference,
+          bridge: await reference.createBridge(descriptor.adapter, bus),
+        };
+      }),
+    );
     try {
-      await bus.publish(
-        lilacEventTypes.EvtRequestReply,
-        {},
-        {
-          headers: {
-            request_id: GITHUB_REFERENCE.requestId,
-            session_id: GITHUB_REFERENCE.sessionId,
-            request_client: "github",
+      for (const target of bridges) {
+        await bus.publish(
+          lilacEventTypes.EvtRequestReply,
+          {},
+          {
+            headers: {
+              request_id: target.reference.requestId,
+              session_id: target.reference.sessionId,
+              request_client: target.reference.platform,
+            },
           },
-        },
-      );
-      await bus.publish(
-        lilacEventTypes.EvtAgentOutputDeltaText,
-        { delta: "github output" },
-        { headers: { request_id: GITHUB_REFERENCE.requestId } },
-      );
-      expect(discordBridge.snapshotRelays()).toEqual([]);
-      expect(githubBridge.snapshotRelays()).toMatchObject([
-        {
-          requestId: GITHUB_REFERENCE.requestId,
-          requestClient: "github",
-          platform: "github",
-          visibleText: "github output",
-        },
-      ]);
+        );
+        await bus.publish(
+          lilacEventTypes.EvtAgentOutputDeltaText,
+          { delta: `${target.reference.platform} output` },
+          { headers: { request_id: target.reference.requestId } },
+        );
 
-      await bus.publish(
-        lilacEventTypes.EvtRequestReply,
-        {},
-        {
-          headers: {
-            request_id: DISCORD_REFERENCE.requestId,
-            session_id: DISCORD_REFERENCE.sessionId,
-            request_client: "discord",
-          },
-        },
-      );
-      await bus.publish(
-        lilacEventTypes.EvtAgentOutputDeltaText,
-        { delta: "discord output" },
-        { headers: { request_id: DISCORD_REFERENCE.requestId } },
-      );
-      expect(discordBridge.snapshotRelays()).toMatchObject([
-        {
-          requestId: DISCORD_REFERENCE.requestId,
-          requestClient: "discord",
-          platform: "discord",
-          visibleText: "discord output",
-        },
-      ]);
-      expect(githubBridge.snapshotRelays()).toHaveLength(1);
+        for (const candidate of bridges) {
+          const matching = candidate.bridge
+            .snapshotRelays()
+            .filter((snapshot) => snapshot.requestId === target.reference.requestId);
+          expect(matching).toMatchObject(
+            candidate.reference === target.reference
+              ? [
+                  {
+                    requestId: target.reference.requestId,
+                    requestClient: target.reference.platform,
+                    platform: target.reference.platform,
+                    visibleText: `${target.reference.platform} output`,
+                  },
+                ]
+              : [],
+          );
+        }
+      }
     } finally {
-      await githubBridge.stop();
-      await discordBridge.stop();
+      for (const { bridge } of bridges.toReversed()) await bridge.stop();
       await bus.close();
     }
   });
@@ -598,10 +605,10 @@ describe("shared Discord/GitHub adapter and descriptor contract", () => {
     "%s reanchors and cancels through shared relay bus handlers",
     async (_name, reference) => {
       const abortReasons: Array<string | undefined> = [];
-      const restoreAbortObserver = observeOutputAborts(reference, abortReasons);
+      const restoreAbortObserver = reference.observeOutputAborts(abortReasons);
       const bus = createLilacBus(createInMemoryDeliveryBus());
       const descriptor = bindReferenceDescriptor(reference, reference.createAdapter());
-      const bridge = await createProductionBridge(reference, descriptor.adapter, bus);
+      const bridge = await reference.createBridge(descriptor.adapter, bus);
       try {
         await bus.publish(
           lilacEventTypes.EvtRequestReply,
@@ -676,23 +683,27 @@ describe("shared Discord/GitHub adapter and descriptor contract", () => {
     "%s returns the closed operation algebra, validates nested refs, and declares optional behavior",
     async (_name, reference) => {
       const adapter = reference.createAdapter();
-      const primary = operationError(await adapter.startOutput(oppositeSessionRef(reference)));
+      const primary = operationError(await adapter.startOutput(reference.foreignSessionRef));
       expect(primary).toBeInstanceOf(SurfacePlatformMismatch);
 
       const nestedPlatform = operationError(
-        await adapter.startOutput(sessionRef(reference), { replyTo: oppositeMsgRef(reference) }),
+        await adapter.startOutput(reference.createSessionRef(), {
+          replyTo: reference.foreignMessageRef,
+        }),
       );
       expect(nestedPlatform).toBeInstanceOf(SurfacePlatformMismatch);
 
       const nestedSession = operationError(
-        await adapter.markRead(sessionRef(reference), {
-          ...msgRef(reference),
+        await adapter.markRead(reference.createSessionRef(), {
+          ...reference.createMessageRef(),
           channelId: `${reference.sessionId}-other`,
         }),
       );
       expect(nestedSession).toBeInstanceOf(SurfaceSessionMismatch);
 
-      const invalid = operationError(await adapter.sendMsg(sessionRef(reference), { text: "   " }));
+      const invalid = operationError(
+        await adapter.sendMsg(reference.createSessionRef(), { text: "   " }),
+      );
       expect(invalid).toBeInstanceOf(SurfaceInvalidInput);
 
       const declared = operationError(await adapter.listSessions());
@@ -700,7 +711,7 @@ describe("shared Discord/GitHub adapter and descriptor contract", () => {
 
       const provider = await reference
         .createProviderFailureAdapter()
-        .sendMsg(sessionRef(reference), { text: "provider failure" });
+        .sendMsg(reference.createSessionRef(), { text: "provider failure" });
       expect(provider.status).toBe("error");
       if (provider.status === "ok") throw new Error("Expected provider failure");
       expect(provider.error._tag).toBe("SurfaceUnavailable");
@@ -717,7 +728,7 @@ describe("shared Discord/GitHub adapter and descriptor contract", () => {
       const adapter = reference.createAdapter(log);
       const descriptor = bindReferenceDescriptor(reference, adapter);
       const created: MsgRef[] = [];
-      const started = await descriptor.adapter.startOutput(sessionRef(reference), {
+      const started = await descriptor.adapter.startOutput(reference.createSessionRef(), {
         onMessageCreated: (ref) => created.push(ref),
       });
       if (started.status === "error") throw started.error;
@@ -726,18 +737,17 @@ describe("shared Discord/GitHub adapter and descriptor contract", () => {
       expect(finished.value.created.length).toBeGreaterThan(0);
       expect(finished.value.created.every((ref) => ref.platform === reference.platform)).toBe(true);
       expect(finished.value.last.platform).toBe(reference.platform);
-      if (reference.platform === "discord") expect(created).toEqual(finished.value.created);
-      else expect(created).toEqual([]);
+      reference.assertOutputCreated(created, finished.value);
 
       const relay = descriptor.relay;
       if (!relay) throw new Error("Reference relay is missing");
       const valid = relay.refs.decodeReanchorTarget({
-        ref: msgRef(reference),
+        ref: reference.createMessageRef(),
         expectedSessionId: reference.sessionId,
       });
       expect(valid.status).toBe("ok");
       const crossPlatform = relay.refs.decodeReanchorTarget({
-        ref: oppositeMsgRef(reference),
+        ref: reference.foreignMessageRef,
         expectedSessionId: reference.sessionId,
       });
       expect(crossPlatform.status).toBe("error");
@@ -747,43 +757,7 @@ describe("shared Discord/GitHub adapter and descriptor contract", () => {
         sessionId: reference.sessionId,
       });
       expect(initial.kind).toBe("target");
-
-      if (reference.platform === "discord") {
-        const skippedCleanup = createDiscordRelayPolicy(adapter).finalization?.cleanupSkippedOutput;
-        if (!skippedCleanup) throw new Error("Discord skip cleanup is missing");
-        await expect(
-          skippedCleanup({
-            ref: { platform: "discord", channelId: reference.sessionId, messageId: "skip" },
-          }),
-        ).resolves.toBeUndefined();
-        expect(log.deletes).toContain("skip");
-      } else {
-        expect(createGithubRelayPolicy().finalization?.cleanupSkippedOutput).toBeUndefined();
-        const requestId = `github-ack-${crypto.randomUUID()}`;
-        const deleted: number[] = [];
-        setGithubAck(requestId, {
-          target: { kind: "issue", issueNumber: 1 },
-          reactionId: 42,
-        });
-        try {
-          const cleanup = createGithubRelayPolicy({
-            acknowledgementApi: {
-              deleteIssueReactionById: async ({ reactionId }) => {
-                deleted.push(reactionId);
-              },
-              deleteIssueCommentReactionById: async () => undefined,
-            },
-          }).finalization?.clearIngressAcknowledgement;
-          if (!cleanup) throw new Error("GitHub acknowledgement cleanup is missing");
-          expect(await cleanup({ requestId, sessionId: GITHUB_REFERENCE.sessionId })).toEqual(
-            Result.ok(undefined),
-          );
-          expect(deleted).toEqual([42]);
-          expect(getGithubAck(requestId)).toBeUndefined();
-        } finally {
-          clearGithubAck(requestId);
-        }
-      }
+      await reference.assertFinalization(adapter, log);
     },
   );
 
@@ -826,17 +800,15 @@ describe("shared Discord/GitHub adapter and descriptor contract", () => {
     "%s preserves one real guarded-stream hydration through recovery apply",
     async (_name, reference) => {
       const log = createProtocolLog();
-      const registry = registryFor([
-        createReferenceDescriptor(reference, reference.createAdapter(log)),
-      ]);
+      const registry = registryFor([reference.createDescriptor(reference.createAdapter(log))]);
       const [descriptor] = registry.entries();
       if (!descriptor) throw new Error("Reference descriptor is missing");
       const bus = createLilacBus(createInMemoryDeliveryBus());
-      const bridge = await createProductionBridge(reference, descriptor.adapter, bus);
+      const bridge = await reference.createBridge(descriptor.adapter, bus);
       try {
-        const probed = await descriptor.adapter.startOutput(sessionRef(reference), {
+        const probed = await descriptor.adapter.startOutput(reference.createSessionRef(), {
           preparationMode: "paused-recovery",
-          resume: { created: [msgRef(reference, "output-1")] },
+          resume: { created: [reference.createMessageRef("output-1")] },
         });
         if (probed.status === "error") throw probed.error;
         expect(probed.value.hydrateRecovery).toBeFunction();

@@ -834,7 +834,10 @@ describe("SqliteTranscriptStore", () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-transcripts-"));
     const dbPath = path.join(dir, "transcripts.db");
 
-    const store = new SqliteTranscriptStore(dbPath);
+    const diagnostics: Array<{ recordId: string; field: string }> = [];
+    const store = new SqliteTranscriptStore(dbPath, undefined, (diagnostic) => {
+      diagnostics.push({ recordId: diagnostic.recordId, field: diagnostic.field });
+    });
 
     store.saveRequestTranscript({
       requestId: "r1",
@@ -854,9 +857,24 @@ describe("SqliteTranscriptStore", () => {
       last: { platform: "discord", channelId: "chan", messageId: "m2" },
     });
 
+    const db = new Database(dbPath);
+    const insert = db.prepare(
+      `INSERT INTO surface_message_to_request
+         (platform, channel_id, message_id, request_id, created_ts)
+       VALUES (?, ?, ?, ?, ?)`,
+    );
+    insert.run("slack", "slack-channel", "slack-message", "r1", 3);
+    insert.run("future", "future-channel", "future-message", "r1", 4);
+    insert.run("discord", "", "empty-channel", "r1", 5);
+    db.close();
+
     expect(store.listSurfaceMessagesForRequest?.({ requestId: "r1" })).toEqual([
       { platform: "discord", channelId: "chan", messageId: "m1" },
       { platform: "discord", channelId: "chan", messageId: "m2" },
+    ]);
+    expect(diagnostics).toEqual([
+      { recordId: "r1", field: "surface-message-link-row" },
+      { recordId: "r1", field: "surface-message-link-row" },
     ]);
 
     store.close();

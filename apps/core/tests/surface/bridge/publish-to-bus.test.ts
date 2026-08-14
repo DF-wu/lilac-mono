@@ -476,7 +476,7 @@ describe("bridgeAdapterToBus cancel mapping", () => {
     if (stopped.status === "error") throw stopped.error;
   });
 
-  it("keeps active-only behavior for cancel button events", async () => {
+  it("defaults active-only cancellation metadata to button", async () => {
     const bus = createLilacBus(createInMemoryRawBus());
     const adapter = new FakeAdapter();
 
@@ -511,7 +511,6 @@ describe("bridgeAdapterToBus cancel mapping", () => {
       ts: Date.now(),
       requestId: "discord:chan:m1",
       sessionId: "chan",
-      source: "button",
       cancelScope: "active_only",
     });
 
@@ -536,7 +535,7 @@ describe("bridgeAdapterToBus cancel mapping", () => {
     if (stopped.status === "error") throw stopped.error;
   });
 
-  it("marks context-menu cancels as queue-capable", async () => {
+  it("defaults queue-capable cancellation metadata to context menu", async () => {
     const bus = createLilacBus(createInMemoryRawBus());
     const adapter = new FakeAdapter();
 
@@ -571,7 +570,6 @@ describe("bridgeAdapterToBus cancel mapping", () => {
       ts: Date.now(),
       requestId: "discord:chan:m2",
       sessionId: "chan",
-      source: "context_menu",
       cancelScope: "active_or_queued",
       userId: "u1",
       messageId: "m2",

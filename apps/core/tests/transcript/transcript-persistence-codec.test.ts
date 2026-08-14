@@ -14,12 +14,14 @@ import {
   decodeCoreSurfaceProjectionRow,
   decodeDiscoveryRecordRow,
   decodeRecentAgentWriteRow,
+  decodeSurfaceMessageLinkRow,
   decodeTranscriptCompactionContext,
   decodeTranscriptMessages,
   decodeTranscriptProviderState,
   decodeTranscriptRow,
   discoveryRecordRowCodecCases,
   recentAgentWriteRowCodecCases,
+  surfaceMessageLinkRowCodecCases,
   transcriptCompactionContextCodecCases,
   transcriptProviderStateCodecCases,
   transcriptRowCodecCases,
@@ -78,6 +80,7 @@ describe("transcript persistence codecs", () => {
     expectCatalog(coreSurfaceProjectionRowCodecCases, decodeCoreSurfaceProjectionRow);
     expectCatalog(coreLineageManifestRowCodecCases, decodeCoreLineageManifestRow);
     expectCatalog(recentAgentWriteRowCodecCases, decodeRecentAgentWriteRow);
+    expectCatalog(surfaceMessageLinkRowCodecCases, decodeSurfaceMessageLinkRow);
     expectCatalog(discoveryRecordRowCodecCases, decodeDiscoveryRecordRow);
   });
 
@@ -117,6 +120,19 @@ describe("transcript persistence codecs", () => {
     });
     expect(recent.status).toBe("ok");
     if (recent.status === "ok") expect(recent.value.value.platform).toBe("web");
+
+    const linked = decodeSurfaceMessageLinkRow({
+      row: {
+        request_id: "placeholder-request",
+        platform: "telegram",
+        channel_id: "placeholder-channel",
+        message_id: "placeholder-message",
+      },
+      schemaVersion: 5,
+      recordId: "placeholder-request",
+    });
+    expect(linked.status).toBe("ok");
+    if (linked.status === "ok") expect(linked.value.value.platform).toBe("telegram");
   });
 
   for (const startVersion of SUPPORTED_TRANSCRIPT_SCHEMA_STARTS) {

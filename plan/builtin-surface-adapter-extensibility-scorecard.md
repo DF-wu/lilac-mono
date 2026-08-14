@@ -44,6 +44,7 @@ files do not count. This meets the two-to-four target, excluding the independent
 | Workflow | `apps/core/src/workflow/` domain, store, and progress owners | None unless the adapter opts into workflow actions/progress with durable semantics. | Registered progress ports and protocols provide routing; persistence and durable authorization remain independently reviewed. |
 | Transcript | `apps/core/src/transcript/` | None unless transcript links or continuation need an adapter-specific stored contract. | Generic read projection follows the catalog; persisted codecs and continuation contracts remain independently reviewed. |
 | Health | Optional descriptor health port | None for an adapter without persistent health semantics. | Protocol-local health contributions participate without another Core-root platform branch. |
+| Rich protocol parity | `surface/types.ts`, `surface/adapter.ts`, `surface/events.ts`, `surface/protocol.ts`, and `surface/authenticated-request.ts` | Review when an adapter needs new participant provenance, output-routing hints, guild-like capabilities, shared commands, or specialized verified-ingress proof. | Existing Discord/GitHub vocabulary remains an intentional shared-contract limitation. It does not block ordinary participation, but richer parity can require additional shared contract edits. |
 | Plugin-compatible context | `packages/plugin-runtime/` and Core request-context plumbing | Review only when a plugin-visible contract must change. | Separately reviewed; generic platform context avoids another built-in principal-union edit and does not change runtime context shape. |
 | External boundary | Protocol ingress plus `scripts/architecture/manifest.ts` registrations | Required for actual external SDK, gateway, webhook, CLI, or host boundary handling. | Separately reviewed; ingress remains the existing external authentication owner, with no new trust admission. |
 
@@ -55,4 +56,4 @@ files do not count. This meets the two-to-four target, excluding the independent
 | Meets the two-to-four shared-production-edit target | Yes. |
 | Shared contract harness | One test registration; excluded from production-edit total. |
 | Protocol-local files | Required but excluded from shared production-edit total. |
-| Intentional config/wire/persistence/recovery/workflow/transcript/plugin/external reviews recorded separately | Yes; each remains independently owned and is not implied by registry registration. |
+| Intentional config/wire/persistence/recovery/workflow/transcript/rich-parity/plugin/external reviews recorded separately | Yes; each remains independently owned and is not implied by registry registration. |
