@@ -41,6 +41,7 @@ import type { AdapterEvent } from "../../../src/surface/events";
 import type { ContentOpts } from "../../../src/surface/types";
 import { toBusDiscordCommandInvokedData } from "../../../src/surface/discord/discord-command-projection";
 import { DiscordSurfaceStore } from "../../../src/surface/store/discord-surface-store";
+import { composeRequestMessages } from "../../../src/surface/bridge/request-composition";
 
 describe("Discord command actor projection", () => {
   it("omits an anonymous actor instead of emitting an incomplete actor", () => {
@@ -638,6 +639,197 @@ describe("Discord cache policy", () => {
 
     expect(DISCORD_CACHE_SETTINGS.GuildMemberManager.keepOverLimit(botMember)).toBe(true);
     expect(DISCORD_CACHE_SETTINGS.GuildMemberManager.keepOverLimit(otherMember)).toBe(false);
+  });
+});
+
+describe("DiscordAdapter request read scope", () => {
+  it("reuses one fresh Discord snapshot within a composition and refreshes the next composition", async () => {
+    const adapter = createTestDiscordAdapter();
+    const store = new DiscordSurfaceStore(":memory:");
+    const fetchOptions: unknown[] = [];
+    let content = "first";
+
+    const channel = {
+      name: "general",
+      guildId: "g1",
+      isThread: () => false,
+      isDMBased: () => false,
+      messages: {
+        fetch: async (options: unknown) => {
+          fetchOptions.push(options);
+          const message = {
+            id: "m1",
+            channelId: "c1",
+            guildId: "g1",
+            channel,
+            author: {
+              id: "u1",
+              username: "user",
+              globalName: null,
+              bot: false,
+            },
+            member: null,
+            content,
+            createdTimestamp: 1_000,
+            editedTimestamp: content === "first" ? null : 2_000,
+            attachments: new Collection(),
+            embeds: [],
+            reference: null,
+            system: false,
+            type: MessageType.Default,
+            reactions: {
+              cache: new Collection([["rose", { emoji: { toString: () => "rose" } }]]),
+            },
+          } as unknown as Message;
+          return typeof options === "object" && options !== null && "message" in options
+            ? message
+            : new Collection([[message.id, message]]);
+        },
+      },
+    };
+    const state = adapter as unknown as {
+      cfg: CoreConfig | null;
+      client: { channels: { fetch(channelId: string): Promise<unknown> } } | null;
+      store: DiscordSurfaceStore | null;
+    };
+    state.cfg = testConfigWithStatusMessage();
+    state.client = { channels: { fetch: async () => channel } };
+    state.store = store;
+
+    const compose = async () => {
+      const result = await composeRequestMessages(adapter, {
+        platform: "discord",
+        botUserId: "bot",
+        botName: "lilac",
+        trigger: {
+          type: "mention",
+          msgRef: { platform: "discord", channelId: "c1", messageId: "m1" },
+        },
+      });
+      if (result.status === "error") throw result.error;
+      return result.value;
+    };
+
+    try {
+      const first = await compose();
+      expect(fetchOptions).toEqual([{ message: "m1", cache: false, force: true }]);
+      expect(JSON.stringify(first.messages)).toContain("first");
+      expect(JSON.stringify(first.messages)).toContain("rose");
+
+      content = "edited";
+      const second = await compose();
+      expect(fetchOptions).toEqual([
+        { message: "m1", cache: false, force: true },
+        { message: "m1", cache: false, force: true },
+      ]);
+      expect(JSON.stringify(second.messages)).toContain("edited");
+
+      content = "scope-start";
+      await adapter.withRequestReadScope(async () => {
+        const read = await adapter.readMsg({
+          platform: "discord",
+          channelId: "c1",
+          messageId: "m1",
+        });
+        if (read.status === "error") throw read.error;
+        expect(read.value?.text).toBe("scope-start");
+
+        content = "edited-during-scope";
+        const listed = await adapter.listMsg(
+          { platform: "discord", channelId: "c1" },
+          { limit: 1 },
+        );
+        if (listed.status === "error") throw listed.error;
+        expect(listed.value.map((message) => message.text)).toEqual(["scope-start"]);
+      });
+    } finally {
+      store.close();
+    }
+  });
+
+  it("keeps concurrent composition scopes isolated", async () => {
+    const adapter = createTestDiscordAdapter();
+    let fetches = 0;
+    let notifyStarted = () => {};
+    const started = new Promise<void>((resolve) => {
+      notifyStarted = resolve;
+    });
+    const pending: Array<(message: Message) => void> = [];
+    const state = adapter as unknown as {
+      cfg: CoreConfig | null;
+      client: { channels: { fetch(channelId: string): Promise<unknown> } } | null;
+    };
+    state.cfg = testConfigWithStatusMessage();
+    state.client = {
+      channels: {
+        fetch: async () => ({
+          messages: {
+            fetch: async () => {
+              fetches += 1;
+              if (fetches === 2) notifyStarted();
+              return await new Promise<Message>((resolve) => pending.push(resolve));
+            },
+          },
+        }),
+      },
+    };
+
+    const ref = { platform: "discord" as const, channelId: "c1", messageId: "m1" };
+    const first = adapter.withRequestReadScope(() => adapter.listReactions(ref));
+    const second = adapter.withRequestReadScope(() => adapter.listReactions(ref));
+    await started;
+    expect(fetches).toBe(2);
+
+    const message = {
+      guildId: "g1",
+      reactions: { cache: new Collection() },
+    } as unknown as Message;
+    for (const resolve of pending) resolve(message);
+    expect(await first).toEqual(Result.ok([]));
+    expect(await second).toEqual(Result.ok([]));
+  });
+
+  it("shares an in-flight fetch within one composition scope", async () => {
+    const adapter = createTestDiscordAdapter();
+    let fetches = 0;
+    let notifyStarted = () => {};
+    const started = new Promise<void>((resolve) => {
+      notifyStarted = resolve;
+    });
+    let resolveFetch = (_message: Message) => {};
+    const state = adapter as unknown as {
+      cfg: CoreConfig | null;
+      client: { channels: { fetch(channelId: string): Promise<unknown> } } | null;
+    };
+    state.cfg = testConfigWithStatusMessage();
+    state.client = {
+      channels: {
+        fetch: async () => ({
+          messages: {
+            fetch: async () => {
+              fetches += 1;
+              notifyStarted();
+              return await new Promise<Message>((resolve) => {
+                resolveFetch = resolve;
+              });
+            },
+          },
+        }),
+      },
+    };
+
+    const ref = { platform: "discord" as const, channelId: "c1", messageId: "m1" };
+    const result = adapter.withRequestReadScope(() =>
+      Promise.all([adapter.listReactions(ref), adapter.listReactions(ref)]),
+    );
+    await started;
+    expect(fetches).toBe(1);
+
+    resolveFetch({
+      guildId: "g1",
+      reactions: { cache: new Collection() },
+    } as unknown as Message);
+    expect(await result).toEqual([Result.ok([]), Result.ok([])]);
   });
 });
 

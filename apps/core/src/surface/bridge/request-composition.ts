@@ -10,7 +10,12 @@ import {
   type CoreLineageSegmentInputV1,
   type CorePrimaryLineageV1,
 } from "@stanley2058/lilac-event-bus";
-import type { SurfaceAdapter, SurfaceOperationError, SurfaceOperationResult } from "../adapter";
+import {
+  withSurfaceRequestReadScope,
+  type SurfaceAdapter,
+  type SurfaceOperationError,
+  type SurfaceOperationResult,
+} from "../adapter";
 import type { MsgRef, SurfaceMessage } from "../types";
 
 import {
@@ -74,6 +79,7 @@ export type {
 export type RequestCompositionError = CoreOwnedBlobIntegrityError | SurfaceOperationError;
 
 const DISCORD_SURFACE_ID_PREFIX = "discord:";
+const ACTIVE_REQUEST_READ_SCOPE = Symbol("active-request-read-scope");
 
 function createFreshOnlyLineage(reason: string, currentCanonicalStart = 0): CorePrimaryLineageV1 {
   const created = createCorePrimaryLineageFreshOnlyV1(reason, currentCanonicalStart);
@@ -1214,7 +1220,13 @@ async function getReactionsByMessageId(input: {
 export async function composeRequestMessages(
   adapter: SurfaceAdapter,
   opts: ComposeRequestOpts,
+  requestReadScope?: typeof ACTIVE_REQUEST_READ_SCOPE,
 ): Promise<ResultType<RequestCompositionResult, RequestCompositionError>> {
+  if (requestReadScope !== ACTIVE_REQUEST_READ_SCOPE) {
+    return withSurfaceRequestReadScope(adapter, () =>
+      composeRequestMessages(adapter, opts, ACTIVE_REQUEST_READ_SCOPE),
+    );
+  }
   // Step 1: fetch reply chain from the adapter store / platform.
   // Mention triggers get merge-window parity even if messages are not linked via reply references.
   const triggerMsg = await adapter.readMsg(opts.trigger.msgRef);
@@ -1308,7 +1320,13 @@ export async function composeRequestMessages(
 export async function composeRecentChannelMessages(
   adapter: SurfaceAdapter,
   opts: ComposeRecentChannelMessagesOpts,
+  requestReadScope?: typeof ACTIVE_REQUEST_READ_SCOPE,
 ): Promise<ResultType<RequestCompositionResult, RequestCompositionError>> {
+  if (requestReadScope !== ACTIVE_REQUEST_READ_SCOPE) {
+    return withSurfaceRequestReadScope(adapter, () =>
+      composeRecentChannelMessages(adapter, opts, ACTIVE_REQUEST_READ_SCOPE),
+    );
+  }
   // Reply precedence: if the trigger is a Discord reply (even when the router
   // classified it as a "mention" trigger because it wasn't a reply-to-bot),
   // treat it as an explicit reply-chain continuation.
@@ -1606,7 +1624,13 @@ export async function composeSingleMessage(
 export async function composeSingleMessageWithLineage(
   adapter: SurfaceAdapter,
   opts: ComposeSingleMessageOpts,
+  requestReadScope?: typeof ACTIVE_REQUEST_READ_SCOPE,
 ): Promise<ResultType<RequestCompositionResult | null, RequestCompositionError>> {
+  if (requestReadScope !== ACTIVE_REQUEST_READ_SCOPE) {
+    return withSurfaceRequestReadScope(adapter, () =>
+      composeSingleMessageWithLineage(adapter, opts, ACTIVE_REQUEST_READ_SCOPE),
+    );
+  }
   const m = await adapter.readMsg(opts.msgRef);
   if (m.status === "error") return Result.err(m.error);
   if (!m.value) return Result.ok(null);

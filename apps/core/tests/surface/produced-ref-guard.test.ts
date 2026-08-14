@@ -9,9 +9,11 @@ import type {
   SurfaceOperationResult,
   SurfaceOutputResult,
   SurfaceOutputStream,
+  SurfaceRequestReadScopeProvider,
 } from "../../src/surface/adapter";
 import {
   hasCacheBurstProvider,
+  hasRequestReadScopeProvider,
   hasSurfaceGuildIdResolver,
   SurfaceOperationPartiallyCompleted,
   SurfaceRateLimited,
@@ -286,10 +288,15 @@ describe("descriptor-bound produced ref guard", () => {
 
   it("forwards optional capabilities and output final-text mode through the facade", async () => {
     const burstInputs: Array<Parameters<SurfaceCacheBurstProvider["burstCache"]>[0]> = [];
+    let scopeRuns = 0;
     const raw = {
       ...DEFAULT_ADAPTER,
       burstCache: async (input: Parameters<SurfaceCacheBurstProvider["burstCache"]>[0]) => {
         burstInputs.push(input);
+      },
+      withRequestReadScope: async <T>(run: () => Promise<T>) => {
+        scopeRuns += 1;
+        return await run();
       },
       fetchGuildIdForChannel: async (channelId: string) => `guild:${channelId}`,
       startOutput: async () =>
@@ -298,13 +305,21 @@ describe("descriptor-bound produced ref guard", () => {
           hydrateRecovery: () => "terminal" as const,
           getFinalTextMode: () => "full" as const,
         }),
-    } satisfies SurfaceAdapter & SurfaceCacheBurstProvider & SurfaceGuildIdResolver;
+    } satisfies SurfaceAdapter &
+      SurfaceCacheBurstProvider &
+      SurfaceRequestReadScopeProvider &
+      SurfaceGuildIdResolver;
     const guarded = createDescriptorBoundSurfaceAdapter("discord", raw);
 
     expect(hasCacheBurstProvider(guarded)).toBe(true);
     if (!hasCacheBurstProvider(guarded)) throw new Error("cache burst capability missing");
     await guarded.burstCache({ sessionRef: DISCORD_SESSION, reason: "other" });
     expect(burstInputs).toEqual([{ sessionRef: DISCORD_SESSION, reason: "other" }]);
+
+    expect(hasRequestReadScopeProvider(guarded)).toBe(true);
+    if (!hasRequestReadScopeProvider(guarded)) throw new Error("request scope capability missing");
+    expect(await guarded.withRequestReadScope(async () => "scoped")).toBe("scoped");
+    expect(scopeRuns).toBe(1);
 
     expect(hasSurfaceGuildIdResolver(guarded)).toBe(true);
     if (!hasSurfaceGuildIdResolver(guarded)) throw new Error("guild resolver capability missing");
@@ -320,24 +335,36 @@ describe("descriptor-bound produced ref guard", () => {
 
   it("preserves exact Panic identity through forwarded capabilities", async () => {
     const cachePanic = new Panic({ message: "cache invariant" });
+    const scopePanic = new Panic({ message: "scope invariant" });
     const guildPanic = new Panic({ message: "guild invariant" });
     const raw = {
       ...DEFAULT_ADAPTER,
       burstCache: async () => {
         throw cachePanic;
       },
+      withRequestReadScope: async () => {
+        throw scopePanic;
+      },
       fetchGuildIdForChannel: async () => {
         throw guildPanic;
       },
-    } satisfies SurfaceAdapter & SurfaceCacheBurstProvider & SurfaceGuildIdResolver;
+    } satisfies SurfaceAdapter &
+      SurfaceCacheBurstProvider &
+      SurfaceRequestReadScopeProvider &
+      SurfaceGuildIdResolver;
     const guarded = createDescriptorBoundSurfaceAdapter("discord", raw);
-    if (!hasCacheBurstProvider(guarded) || !hasSurfaceGuildIdResolver(guarded)) {
+    if (
+      !hasCacheBurstProvider(guarded) ||
+      !hasRequestReadScopeProvider(guarded) ||
+      !hasSurfaceGuildIdResolver(guarded)
+    ) {
       throw new Error("forwarded capabilities missing");
     }
 
     await expect(guarded.burstCache({ sessionRef: DISCORD_SESSION, reason: "other" })).rejects.toBe(
       cachePanic,
     );
+    await expect(guarded.withRequestReadScope(async () => undefined)).rejects.toBe(scopePanic);
     await expect(guarded.fetchGuildIdForChannel("channel")).rejects.toBe(guildPanic);
   });
 

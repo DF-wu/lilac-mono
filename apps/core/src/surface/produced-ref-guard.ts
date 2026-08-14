@@ -8,9 +8,14 @@ import type {
   SurfaceOperationResult,
   SurfaceOutputResult,
   SurfaceOutputStream,
+  SurfaceRequestReadScopeProvider,
   StartOutputOpts,
 } from "./adapter";
-import { hasCacheBurstProvider, hasSurfaceGuildIdResolver } from "./adapter";
+import {
+  hasCacheBurstProvider,
+  hasRequestReadScopeProvider,
+  hasSurfaceGuildIdResolver,
+} from "./adapter";
 import type { AdapterEvent } from "./events";
 import type {
   SurfaceRelayPolicy,
@@ -537,6 +542,12 @@ export function createDescriptorBoundSurfaceAdapter(
     Object.defineProperty(guarded, "burstCache", {
       value: (input: Parameters<SurfaceCacheBurstProvider["burstCache"]>[0]) =>
         adapter.burstCache(input),
+    });
+  }
+  if (hasRequestReadScopeProvider(adapter)) {
+    Object.defineProperty(guarded, "withRequestReadScope", {
+      value: <T>(run: () => Promise<T>) =>
+        (adapter as SurfaceAdapter & SurfaceRequestReadScopeProvider).withRequestReadScope(run),
     });
   }
   if (hasSurfaceGuildIdResolver(adapter)) {

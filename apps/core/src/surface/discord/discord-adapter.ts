@@ -1,3 +1,5 @@
+import { AsyncLocalStorage } from "node:async_hooks";
+
 import {
   ActivityType,
   ApplicationCommandType,
@@ -576,6 +578,9 @@ export class DiscordAdapter implements SurfaceAdapter {
   private lastCoreConfigReloadError: string | null = null;
   private handlers = new Set<AdapterEventHandler>();
   private sessionModelOverrides = new Map<string, string>();
+  private readonly requestReadSnapshots = new AsyncLocalStorage<
+    Map<string, Promise<Message | null>>
+  >();
 
   private readonly logger = createLogger({
     module: "surface:discord",
@@ -1073,6 +1078,11 @@ export class DiscordAdapter implements SurfaceAdapter {
     ch.messages.cache.clear();
   }
 
+  withRequestReadScope<T>(run: () => Promise<T>): Promise<T> {
+    if (this.requestReadSnapshots.getStore()) return run();
+    return this.requestReadSnapshots.run(new Map(), run);
+  }
+
   /** Lightweight Discord API fetch to get a channel's guildId (no history). */
   async fetchGuildIdForChannel(channelId: string): Promise<string | null> {
     const client = this.client;
@@ -1362,7 +1372,7 @@ export class DiscordAdapter implements SurfaceAdapter {
     const discordRef = refResult.value;
 
     const fetched = await captureDiscordOperation("read-message", () =>
-      this.fetchDiscordMessage({
+      this.fetchRequestScopedDiscordMessage({
         channelId: discordRef.channelId,
         messageId: discordRef.messageId,
       }),
@@ -1876,7 +1886,7 @@ export class DiscordAdapter implements SurfaceAdapter {
     const discordRef = refResult.value;
 
     const fetched = await captureDiscordOperation("list-reactions", () =>
-      this.fetchDiscordMessage({
+      this.fetchRequestScopedDiscordMessage({
         channelId: discordRef.channelId,
         messageId: discordRef.messageId,
       }),
@@ -3174,6 +3184,40 @@ export class DiscordAdapter implements SurfaceAdapter {
     return msg;
   }
 
+  private fetchRequestScopedDiscordMessage(input: {
+    channelId: string;
+    messageId: string;
+  }): Promise<Message | null> {
+    const snapshots = this.requestReadSnapshots.getStore();
+    if (!snapshots) return this.fetchDiscordMessage(input);
+
+    const key = `${input.channelId}:${input.messageId}`;
+    const existing = snapshots.get(key);
+    if (existing) return existing;
+
+    const pending = this.fetchDiscordMessage(input);
+    snapshots.set(key, pending);
+    return pending;
+  }
+
+  private async resolveRequestReadSnapshots(messages: readonly Message[]): Promise<Message[]> {
+    const snapshots = this.requestReadSnapshots.getStore();
+    if (!snapshots) return [...messages];
+
+    const resolved = await Promise.all(
+      messages.map((message) => {
+        const key = `${message.channelId}:${message.id}`;
+        const existing = snapshots.get(key);
+        if (existing) return existing;
+
+        const admitted = Promise.resolve(message);
+        snapshots.set(key, admitted);
+        return admitted;
+      }),
+    );
+    return resolved.filter((message): message is Message => message !== null);
+  }
+
   private async fetchLatestDiscordMessage(channelId: string): Promise<Message | null> {
     const list = await this.fetchDiscordMessages({ channelId, limit: 1 });
     return list[0] ?? null;
@@ -3211,7 +3255,8 @@ export class DiscordAdapter implements SurfaceAdapter {
         around: input.aroundMessageId,
         cache: false,
       });
-      return [...res.values()];
+      const messages = [...res.values()];
+      return await this.resolveRequestReadSnapshots(messages);
     }
 
     if (input.afterMessageId) {
@@ -3220,7 +3265,8 @@ export class DiscordAdapter implements SurfaceAdapter {
         after: input.afterMessageId,
         cache: false,
       });
-      return [...res.values()];
+      const messages = [...res.values()];
+      return await this.resolveRequestReadSnapshots(messages);
     }
 
     // Default / before-cursor: page backwards using `before`.
@@ -3244,7 +3290,7 @@ export class DiscordAdapter implements SurfaceAdapter {
       before = page[page.length - 1]!.id;
     }
 
-    return out;
+    return await this.resolveRequestReadSnapshots(out);
   }
 
   private toSurfaceMessageFromDiscordMessageResult(

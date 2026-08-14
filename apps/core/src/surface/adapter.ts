@@ -292,6 +292,10 @@ export interface SurfaceCacheBurstProvider {
   burstCache(input: SurfaceBurstCacheInput): Promise<void>;
 }
 
+export interface SurfaceRequestReadScopeProvider {
+  withRequestReadScope<T>(run: () => Promise<T>): Promise<T>;
+}
+
 export interface SurfaceGuildIdResolver {
   fetchGuildIdForChannel(channelId: string): Promise<string | null>;
 }
@@ -300,6 +304,19 @@ export function hasCacheBurstProvider(
   adapter: SurfaceAdapter,
 ): adapter is SurfaceAdapter & SurfaceCacheBurstProvider {
   return "burstCache" in adapter && typeof adapter.burstCache === "function";
+}
+
+export function hasRequestReadScopeProvider(
+  adapter: SurfaceAdapter,
+): adapter is SurfaceAdapter & SurfaceRequestReadScopeProvider {
+  return "withRequestReadScope" in adapter && typeof adapter.withRequestReadScope === "function";
+}
+
+export function withSurfaceRequestReadScope<T>(
+  adapter: SurfaceAdapter,
+  run: () => Promise<T>,
+): Promise<T> {
+  return hasRequestReadScopeProvider(adapter) ? adapter.withRequestReadScope(run) : run();
 }
 
 export function hasSurfaceGuildIdResolver(
