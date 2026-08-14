@@ -805,6 +805,22 @@ describe("surface runtime registry", () => {
     expect(descriptor.workflowProgress).not.toBe(workflowProgress);
   });
 
+  it("preserves optional health participation while binding a descriptor", () => {
+    const health = {
+      getContribution: () => ({ checks: [], info: { state: "healthy" } }),
+    };
+    const created = SurfaceRuntimeRegistry.create([
+      {
+        protocol: BUILTIN_SURFACE_PROTOCOLS.discord,
+        adapter: new TestAdapter("discord"),
+        health,
+      },
+    ]);
+    if (created.status === "error") throw created.error;
+
+    expect(created.value.entries()[0]?.health).toBe(health);
+  });
+
   it("resolves only registered adapters through descriptor-bound facades", async () => {
     const discordAdapter = new TestAdapter("discord");
     const githubAdapter = new TestAdapter("github");

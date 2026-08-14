@@ -12,7 +12,11 @@ import {
   createConfiguredGithubSurfaceRuntimeDescriptor,
   createGithubRelayPolicy,
 } from "../surface/github/github-runtime-descriptor";
-import { SurfaceRuntimeRegistry, type SurfaceRelayRecovery } from "../surface/runtime-descriptor";
+import {
+  SurfaceRuntimeRegistry,
+  type SurfaceRelayRecovery,
+  type SurfaceRuntimeHealthPort,
+} from "../surface/runtime-descriptor";
 import { startGithubWebhookServer } from "../github/webhook/github-webhook-server";
 
 type BuiltinSurfaceRuntimeLogger = {
@@ -25,6 +29,7 @@ export type ComposeBuiltinSurfaceRuntimesInput = {
   readonly discordAdapter: SurfaceAdapter;
   readonly githubAdapter: SurfaceAdapter;
   readonly descriptorBoundDiscordEventSource: SurfaceAdapterEventSource;
+  readonly discordHealth?: SurfaceRuntimeHealthPort;
   readonly bus: LilacBus;
   readonly subscriptionPrefix: string;
   readonly webhookSecret: string | undefined;
@@ -41,6 +46,7 @@ export function composeBuiltinSurfaceRuntimes(input: ComposeBuiltinSurfaceRuntim
   return SurfaceRuntimeRegistry.create([
     createDiscordSurfaceRuntimeDescriptor({
       adapter: input.discordAdapter,
+      ...(input.discordHealth ? { health: input.discordHealth } : {}),
       adapterIngress: {
         start: async () => {
           const id = subscriptionId("adapter-to-bus");

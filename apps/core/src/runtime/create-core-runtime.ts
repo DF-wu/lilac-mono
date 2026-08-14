@@ -38,6 +38,7 @@ import {
 
 import { DiscordAdapter } from "../surface/discord/discord-adapter";
 import { GithubAdapter } from "../surface/github/github-adapter";
+import { createDiscordRuntimeHealthPort } from "../surface/discord/discord-runtime-health";
 import { createDescriptorBoundSurfaceEventSource } from "../surface/produced-ref-guard";
 import {
   adaptDiscordRequestRouterStartOutcomeToHost,
@@ -1255,8 +1256,6 @@ export async function createCoreRuntime(
   // How long a saved snapshot remains valid for restore on next boot.
   const GRACEFUL_SNAPSHOT_TTL_MS = 120_000;
   const REDIS_HEALTH_TIMEOUT_MS = 1_000;
-  const DISCORD_DISCONNECT_GRACE_MS = 60_000;
-  const DISCORD_GATEWAY_STALE_MS = 60_000;
 
   async function probeRedisHealth(): Promise<{
     ok: boolean;
@@ -1314,62 +1313,21 @@ export async function createCoreRuntime(
       },
     ];
 
-    const discord = adapter.getHealthSnapshot({
-      includeCache: options.includeMemoryDiagnostics,
-    });
-    const disconnectedForMs = discord.lastDisconnectAt ? now - discord.lastDisconnectAt : 0;
-    checks.push({
-      name: "discord.ready",
-      ok: !runtimeFullyStarted || discord.isReady,
-      impact: "ready",
-      reason: !runtimeFullyStarted || discord.isReady ? undefined : "discord gateway is not ready",
-      details: discord,
-    });
-    checks.push({
-      name: "discord.connection",
-      ok:
-        !runtimeFullyStarted || discord.isReady || disconnectedForMs < DISCORD_DISCONNECT_GRACE_MS,
-      impact: "live",
-      reason:
-        !runtimeFullyStarted || discord.isReady || disconnectedForMs < DISCORD_DISCONNECT_GRACE_MS
-          ? undefined
-          : `discord gateway disconnected for ${disconnectedForMs}ms`,
-      details: {
-        connectionState: discord.connectionState,
-        disconnectedForMs,
-        thresholdMs: DISCORD_DISCONNECT_GRACE_MS,
-      },
-    });
-
-    const gatewayEventStaleForMs = discord.lastGatewayEventAt
-      ? now - discord.lastGatewayEventAt
-      : null;
-    const gatewayPingStaleForMs = discord.lastGatewayPingAt
-      ? now - discord.lastGatewayPingAt
-      : null;
-    const gatewayEventFresh =
-      gatewayEventStaleForMs !== null && gatewayEventStaleForMs < DISCORD_GATEWAY_STALE_MS;
-    const gatewayPingFresh =
-      Number.isFinite(discord.gatewayPingMs) &&
-      gatewayPingStaleForMs !== null &&
-      gatewayPingStaleForMs < DISCORD_GATEWAY_STALE_MS;
-    checks.push({
-      name: "discord.gateway",
-      ok: !runtimeFullyStarted || !discord.isReady || gatewayEventFresh || gatewayPingFresh,
-      impact: "live",
-      reason:
-        !runtimeFullyStarted || !discord.isReady || gatewayEventFresh || gatewayPingFresh
-          ? undefined
-          : `discord gateway dispatches and heartbeat acknowledgements are stale (event=${gatewayEventStaleForMs ?? "unknown"}ms, ping=${gatewayPingStaleForMs ?? "unknown"}ms)`,
-      details: {
-        lastGatewayEventAt: discord.lastGatewayEventAt,
-        lastGatewayPingAt: discord.lastGatewayPingAt,
-        gatewayPingMs: discord.gatewayPingMs,
-        eventStaleForMs: gatewayEventStaleForMs,
-        pingStaleForMs: gatewayPingStaleForMs,
-        thresholdMs: DISCORD_GATEWAY_STALE_MS,
-      },
-    });
+    const surfaceInfo: Record<string, object> = {};
+    const surfaceMemoryDiagnostics: Record<string, object> = {};
+    for (const descriptor of surfaceRuntimeRegistry?.entries() ?? []) {
+      if (!descriptor.health) continue;
+      const contribution = await descriptor.health.getContribution({
+        now,
+        runtimeFullyStarted,
+        includeMemoryDiagnostics: options.includeMemoryDiagnostics === true,
+      });
+      checks.push(...contribution.checks);
+      surfaceInfo[descriptor.platform] = contribution.info;
+      if (contribution.memoryDiagnostics) {
+        surfaceMemoryDiagnostics[descriptor.platform] = contribution.memoryDiagnostics;
+      }
+    }
 
     const redisHealth = await probeRedisHealth();
     checks.push({
@@ -1385,7 +1343,7 @@ export async function createCoreRuntime(
       ...(options.includeMemoryDiagnostics
         ? {
             memoryDiagnostics: {
-              discord: discord.cache,
+              ...surfaceMemoryDiagnostics,
               openObserve: getOpenObserveDiagnostics(),
             },
           }
@@ -1397,7 +1355,7 @@ export async function createCoreRuntime(
           mcpRegistryInitPending: mcpRegistryInitPromise !== null,
           mcpOAuthCallback: mcpOAuthCallback.getStatus(),
         },
-        discord,
+        ...surfaceInfo,
         redis: redisHealth,
       },
     };
@@ -1575,6 +1533,7 @@ export async function createCoreRuntime(
           discordAdapter: adapter,
           githubAdapter,
           descriptorBoundDiscordEventSource: discordEventSource,
+          discordHealth: createDiscordRuntimeHealthPort(adapter),
           bus,
           subscriptionPrefix,
           webhookSecret: env.github.webhookSecret,

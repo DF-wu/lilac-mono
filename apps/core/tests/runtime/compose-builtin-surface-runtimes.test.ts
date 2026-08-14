@@ -9,11 +9,13 @@ import type {
   SurfaceAdapterEventSource,
 } from "../../src/surface/adapter";
 import { createDescriptorBoundSurfaceEventSource } from "../../src/surface/produced-ref-guard";
+import type { SurfaceRuntimeHealthPort } from "../../src/surface/runtime-descriptor";
 import { createInMemoryDeliveryBus } from "../helpers/in-memory-delivery-bus";
 
 function createComposition(input: {
   readonly webhookSecret?: string;
   readonly githubAppCredentialsAvailable: boolean;
+  readonly discordHealth?: SurfaceRuntimeHealthPort;
 }) {
   const logs: Array<{
     readonly level: "debug" | "info" | "warn";
@@ -38,6 +40,7 @@ function createComposition(input: {
       "discord",
       eventSource,
     ),
+    ...(input.discordHealth ? { discordHealth: input.discordHealth } : {}),
     bus: createLilacBus(createInMemoryDeliveryBus()),
     subscriptionPrefix: "focused",
     webhookSecret: input.webhookSecret,
@@ -69,6 +72,20 @@ function createComposition(input: {
 }
 
 describe("built-in surface runtime composition", () => {
+  it("registers optional Discord health without adding it to other descriptors", () => {
+    const health: SurfaceRuntimeHealthPort = {
+      getContribution: () => ({ checks: [], info: { ready: true } }),
+    };
+    const composition = createComposition({
+      githubAppCredentialsAvailable: false,
+      discordHealth: health,
+    });
+    const [discord, github] = composition.registry.entries();
+
+    expect(discord?.health).toBe(health);
+    expect(github?.health).toBeUndefined();
+  });
+
   it.each([
     [false, false],
     [false, true],

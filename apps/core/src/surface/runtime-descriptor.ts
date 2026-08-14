@@ -323,11 +323,34 @@ export type RegisteredSurfaceWorkflowProgressRegistration = {
   [P in RegisteredSurfacePlatform]: SurfaceWorkflowProgressRegistration<P>;
 }[RegisteredSurfacePlatform];
 
+export type SurfaceRuntimeHealthCheck = {
+  readonly name: string;
+  readonly ok: boolean;
+  readonly impact?: "live" | "ready";
+  readonly reason?: string;
+  readonly details?: object;
+};
+
+export type SurfaceRuntimeHealthContribution = {
+  readonly checks: readonly SurfaceRuntimeHealthCheck[];
+  readonly info: object;
+  readonly memoryDiagnostics?: object;
+};
+
+export type SurfaceRuntimeHealthPort = {
+  getContribution(input: {
+    readonly now: number;
+    readonly runtimeFullyStarted: boolean;
+    readonly includeMemoryDiagnostics: boolean;
+  }): SurfaceRuntimeHealthContribution | Promise<SurfaceRuntimeHealthContribution>;
+};
+
 export type SurfaceRuntimeDescriptor<P extends RegisteredSurfacePlatform> = {
   readonly protocol: SurfaceProtocolRouting<P>;
   readonly adapter: SurfaceAdapter;
   readonly adapterIngress?: SurfaceAdapterIngress<P>;
   readonly requestIngress?: SurfaceRequestIngress;
+  readonly health?: SurfaceRuntimeHealthPort;
   readonly createRelay?: (guardedAdapter: SurfaceAdapter) => SurfaceRelayDescriptor<P>;
   readonly createWorkflowProgress?: (
     guardedAdapter: SurfaceAdapter,
@@ -344,6 +367,7 @@ export type BoundSurfaceRuntimeDescriptor<P extends RegisteredSurfacePlatform> =
   readonly adapter: SurfaceAdapter;
   readonly adapterIngress?: SurfaceAdapterIngress<P>;
   readonly requestIngress?: SurfaceRequestIngress;
+  readonly health?: SurfaceRuntimeHealthPort;
   readonly relay?: SurfaceRelayDescriptor<P>;
   readonly workflowProgress?: SurfaceWorkflowProgressPort<P>;
 };
@@ -394,6 +418,7 @@ function bindRuntimeDescriptor(
     adapter,
     ...(descriptor.adapterIngress ? { adapterIngress: descriptor.adapterIngress } : {}),
     ...(descriptor.requestIngress ? { requestIngress: descriptor.requestIngress } : {}),
+    ...(descriptor.health ? { health: descriptor.health } : {}),
     ...(descriptor.createRelay ? { relay: descriptor.createRelay(adapter) } : {}),
     ...(workflowProgress
       ? {

@@ -8,6 +8,7 @@ import type {
   SurfaceRelayDescriptor,
   SurfaceRelayPolicy,
   SurfaceRelayRecovery,
+  SurfaceRuntimeHealthPort,
   SurfaceRuntimeDescriptor,
   SurfaceWorkflowProgressPort,
   WorkflowProgressOperationFailed,
@@ -134,12 +135,14 @@ export function createDiscordRelayPolicy(
 export function createDiscordSurfaceRuntimeDescriptor(input: {
   readonly adapter: SurfaceAdapter;
   readonly adapterIngress: SurfaceAdapterIngress<"discord">;
+  readonly health?: SurfaceRuntimeHealthPort;
   readonly createRelay: (guardedAdapter: SurfaceAdapter) => SurfaceRelayDescriptor<"discord">;
 }): SurfaceRuntimeDescriptor<"discord"> {
   return {
     protocol: discordSurfaceProtocol,
     adapter: input.adapter,
     adapterIngress: input.adapterIngress,
+    ...(input.health ? { health: input.health } : {}),
     createRelay: input.createRelay,
     createWorkflowProgress: createDiscordWorkflowProgressPort,
   };
