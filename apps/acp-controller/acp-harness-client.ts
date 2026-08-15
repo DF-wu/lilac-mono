@@ -101,8 +101,11 @@ export class AcpHarnessClient {
         env: process.env,
       }),
     );
-    if (spawned.status === "error") return Result.err(spawned.error);
-    const child = spawned.value;
+    const child = spawned.match<ChildProcessWithoutNullStreams | ExternalOperationFailed>({
+      ok: (value) => value,
+      err: (error) => error,
+    });
+    if (ExternalOperationFailed.is(child)) return Result.err(child);
 
     const stderrBuffer = { value: "" };
     child.stderr.on("data", (chunk: Buffer | string) => {
@@ -153,13 +156,17 @@ export class AcpHarnessClient {
       },
       `Failed to initialize harness '${params.harness.descriptor.id}'.`,
     );
-    if (initialized.status === "ok") {
+    const initializedValue = initialized.match<
+      | { connection: ClientSideConnection; initializeResponse: InitializeResponse }
+      | ExternalOperationFailed
+    >({ ok: (value) => value, err: (error) => error });
+    if (!ExternalOperationFailed.is(initializedValue)) {
       return Result.ok(
         new AcpHarnessClient(
           params.harness,
-          initialized.value.initializeResponse,
+          initializedValue.initializeResponse,
           child,
-          initialized.value.connection,
+          initializedValue.connection,
           stderrBuffer,
         ),
       );
@@ -171,14 +178,15 @@ export class AcpHarnessClient {
     const stderr = stderrBuffer.value.trim();
     const details = stderr.length > 0 ? ` stderr=${stderr}` : "";
     const primary = replaceExternalFailureMessage(
-      initialized.error,
-      `${initialized.error.message}${details}`,
+      initializedValue,
+      `${initializedValue.message}${details}`,
     );
-    if (cleanup.status === "ok") return Result.err(primary);
+    const cleanupError = cleanup.match({ ok: () => undefined, err: (error) => error });
+    if (cleanupError === undefined) return Result.err(primary);
     return Result.err(
       new WorkAndCleanupFailed({
         primary,
-        cleanup: cleanup.error,
+        cleanup: cleanupError,
         message: `${primary.message} Harness process cleanup also failed.`,
       }),
     );
@@ -222,9 +230,13 @@ export class AcpHarnessClient {
       const response = await captureExternal("list-sessions", () =>
         this.connection.listSessions({ cwd, ...(cursor ? { cursor } : {}) }),
       );
-      if (response.status === "error") return Result.err(response.error);
-      sessions.push(...response.value.sessions);
-      cursor = response.value.nextCursor;
+      const page = response.match<ListSessionsResponse | ExternalOperationFailed>({
+        ok: (value) => value,
+        err: (error) => error,
+      });
+      if (ExternalOperationFailed.is(page)) return Result.err(page);
+      sessions.push(...page.sessions);
+      cursor = page.nextCursor;
     } while (cursor);
 
     return Result.ok(sessions);
@@ -246,14 +258,14 @@ export class AcpHarnessClient {
       const loaded = await captureExternal("load-session", () =>
         this.connection.loadSession({ sessionId, cwd, mcpServers: [] }),
       );
-      return loaded.status === "ok" ? Result.ok(undefined) : Result.err(loaded.error);
+      return loaded.map(() => undefined);
     }
 
     if (this.initializeResponse.agentCapabilities?.sessionCapabilities?.resume) {
       const resumed = await captureExternal("load-session", () =>
         this.connection.unstable_resumeSession({ sessionId, cwd }),
       );
-      return resumed.status === "ok" ? Result.ok(undefined) : Result.err(resumed.error);
+      return resumed.map(() => undefined);
     }
 
     return Result.err(
@@ -271,7 +283,7 @@ export class AcpHarnessClient {
     const updated = await captureExternal("set-session-mode", () =>
       this.connection.setSessionMode({ sessionId, modeId }),
     );
-    return updated.status === "ok" ? Result.ok(undefined) : Result.err(updated.error);
+    return updated.map(() => undefined);
   }
 
   async setModel(
@@ -281,7 +293,7 @@ export class AcpHarnessClient {
     const updated = await captureExternal("set-session-model", () =>
       this.connection.unstable_setSessionModel({ sessionId, modelId }),
     );
-    return updated.status === "ok" ? Result.ok(undefined) : Result.err(updated.error);
+    return updated.map(() => undefined);
   }
 
   async prompt(
@@ -302,7 +314,7 @@ export class AcpHarnessClient {
     const cancelled = await captureExternal("cancel-session", () =>
       this.connection.cancel({ sessionId }),
     );
-    return cancelled.status === "ok" ? Result.ok(undefined) : Result.err(cancelled.error);
+    return cancelled.map(() => undefined);
   }
 
   async close(): Promise<ResultType<void, ExternalOperationFailed>> {

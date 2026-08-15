@@ -406,7 +406,7 @@ async function isProcessAlive(
     process.kill(pid, 0);
   });
   // The historical probe treats every signal failure as a dead process.
-  return Result.ok(probed.status === "ok");
+  return Result.ok(probed.match({ ok: () => true, err: () => false }));
 }
 
 async function refreshRunStatus(
@@ -423,14 +423,19 @@ async function refreshRunStatus(
   if (isTerminalStatus(run.status)) return Result.ok(run);
 
   const alive = await isProcessAlive(run.workerPid);
-  if (alive.status === "error") return Result.err(alive.error);
-  if (run.status === "submitted" && !run.cancelRequestedAt && !alive.value) {
+  const aliveError = alive.match({ ok: () => undefined, err: (error) => error });
+  if (aliveError !== undefined) return Result.err(aliveError);
+  const processAlive = alive.match({ ok: (value) => value, err: () => false });
+  if (run.status === "submitted" && !run.cancelRequestedAt && !processAlive) {
     const worker = await spawnWorker(run.id);
-    if (worker.status === "error") return Result.err(worker.error);
-    return persistSpawnedWorkerAdmission(run, worker.value);
+    const workerError = worker.match({ ok: () => undefined, err: (error) => error });
+    if (workerError !== undefined) return Result.err(workerError);
+    const spawned = worker.match({ ok: (value) => value, err: () => undefined });
+    if (spawned === undefined) return worker.map(() => run);
+    return persistSpawnedWorkerAdmission(run, spawned);
   }
 
-  if (run.workerPid && alive.value) return Result.ok(run);
+  if (run.workerPid && processAlive) return Result.ok(run);
   const next: PromptRunRecord = {
     ...run,
     status: run.cancelRequestedAt ? "cancelled" : "failed",
@@ -442,7 +447,7 @@ async function refreshRunStatus(
         : "Background worker exited before producing a terminal result."),
   };
   const saved = await saveRunRecord(next);
-  return saved.status === "ok" ? Result.ok(next) : Result.err(saved.error);
+  return saved.map(() => next);
 }
 
 type SessionCollectionError =
@@ -463,7 +468,10 @@ async function collectSessionsForHarness(params: {
   >
 > {
   const indexed = await loadSessionIndex();
-  if (indexed.status === "error") return Result.err(indexed.error);
+  const indexError = indexed.match({ ok: () => undefined, err: (error) => error });
+  if (indexError !== undefined) return Result.err(indexError);
+  const index = indexed.match({ ok: (value) => value.value, err: () => undefined });
+  if (index === undefined) return indexed.map(() => ({ sessions: [] }));
   const descriptor = getHarnessDescriptor(params.harnessId);
   if (!descriptor) {
     return Result.err(
@@ -475,12 +483,14 @@ async function collectSessionsForHarness(params: {
   }
 
   const resolved = await resolveHarness(params.harnessId);
-  if (resolved.status === "error") return Result.err(resolved.error);
-  const cachedSessions = indexed.value.value.sessions
+  const resolveError = resolved.match({ ok: () => undefined, err: (error) => error });
+  if (resolveError !== undefined) return Result.err(resolveError);
+  const harness = resolved.match({ ok: (value) => value, err: () => null });
+  const cachedSessions = index.sessions
     .filter((entry) => entry.harnessId === params.harnessId && entry.cwd === params.directory)
     .map(listedSessionFromIndex);
 
-  if (!resolved.value) {
+  if (!harness) {
     return Result.ok({
       sessions: sortSessions(
         cachedSessions.filter((entry) => sessionMatchesSearch(entry, params.search)),
@@ -490,31 +500,35 @@ async function collectSessionsForHarness(params: {
   }
 
   const connected = await AcpHarnessClient.connect({
-    harness: resolved.value,
+    harness,
     version: params.version,
     permissionBehavior: "reject",
     counters: createEmptyPermissionCounters(),
   });
-  if (connected.status === "error") return Result.err(connected.error);
-  const client = connected.value;
+  const connectError = connected.match({ ok: () => undefined, err: (error) => error });
+  if (connectError !== undefined) return Result.err(connectError);
+  const client = connected.match({ ok: (value) => value, err: () => undefined });
+  if (client === undefined) return connected.map(() => ({ sessions: [] }));
 
   const listed = await client.listSessions(params.directory);
   let work: ResultType<
     { sessions: ListedSession[]; warning?: string },
     ExternalOperationFailed | HarnessUnavailable | SessionStoreError
   >;
-  if (listed.status === "error") {
-    if (listed.error._tag === "ExternalOperationFailed" && isAuthRequiredError(listed.error)) {
+  const listError = listed.match({ ok: () => undefined, err: (error) => error });
+  if (listError !== undefined) {
+    if (ExternalOperationFailed.is(listError) && isAuthRequiredError(listError)) {
       work = Result.err(
-        replaceExternalFailureMessage(listed.error, client.authHint() ?? listed.error.message),
+        replaceExternalFailureMessage(listError, client.authHint() ?? listError.message),
       );
     } else {
-      work = Result.err(listed.error);
+      work = Result.err(listError);
     }
   } else {
-    const liveSessions = listed.value.map((session) => {
+    const sessions = listed.match({ ok: (value) => value, err: () => [] });
+    const liveSessions = sessions.map((session) => {
       const sessionRef = formatSessionRef(params.harnessId, session.sessionId);
-      const cached = indexed.value.value.sessions.find((entry) => entry.sessionRef === sessionRef);
+      const cached = index.sessions.find((entry) => entry.sessionRef === sessionRef);
       return mergeSessionWithIndex(
         {
           harnessId: params.harnessId,
@@ -532,25 +546,24 @@ async function collectSessionsForHarness(params: {
     const saved = await upsertSessionIndexEntries(
       liveSessions.map((session) => buildIndexEntry(session)),
     );
-    work =
-      saved.status === "error"
-        ? Result.err(saved.error)
-        : Result.ok({
-            sessions: sortSessions(
-              liveSessions.filter((entry) => sessionMatchesSearch(entry, params.search)),
-            ),
-            ...(client.authHint() ? { warning: client.authHint() } : {}),
-          });
+    work = saved.map(() => ({
+      sessions: sortSessions(
+        liveSessions.filter((entry) => sessionMatchesSearch(entry, params.search)),
+      ),
+      ...(client.authHint() ? { warning: client.authHint() } : {}),
+    }));
   }
 
   const cleanup = await client.close();
-  if (cleanup.status === "ok") return work;
-  if (work.status === "ok") return Result.err(cleanup.error);
+  const cleanupError = cleanup.match({ ok: () => undefined, err: (error) => error });
+  if (cleanupError === undefined) return work;
+  const workError = work.match({ ok: () => undefined, err: (error) => error });
+  if (workError === undefined) return Result.err(cleanupError);
   return Result.err(
     new WorkAndCleanupFailed({
-      primary: work.error,
-      cleanup: cleanup.error,
-      message: `${work.error.message} Harness cleanup also failed.`,
+      primary: workError,
+      cleanup: cleanupError,
+      message: `${workError.message} Harness cleanup also failed.`,
     }),
   );
 }
@@ -568,10 +581,12 @@ async function collectSessions(params: {
     harnessIds = [params.harnessId];
   } else {
     const resolved = await listResolvedHarnesses();
-    if (resolved.status === "error") {
-      return { sessions, warnings: [resolved.error.message] };
-    }
-    harnessIds = resolved.value.map((entry) => entry.descriptor.id);
+    const resolutionError = resolved.match({ ok: () => undefined, err: (error) => error });
+    if (resolutionError !== undefined) return { sessions, warnings: [resolutionError.message] };
+    harnessIds = resolved.match({
+      ok: (value) => value.map((entry) => entry.descriptor.id),
+      err: () => [],
+    });
   }
 
   for (const harnessId of harnessIds) {
@@ -581,12 +596,15 @@ async function collectSessions(params: {
       version: params.version,
       search: params.search,
     });
-    if (collected.status === "error") {
-      warnings.push(`Harness '${harnessId}': ${collected.error.message}`);
+    const collectionError = collected.match({ ok: () => undefined, err: (error) => error });
+    if (collectionError !== undefined) {
+      warnings.push(`Harness '${harnessId}': ${collectionError.message}`);
       continue;
     }
-    sessions.push(...collected.value.sessions);
-    if (collected.value.warning) warnings.push(collected.value.warning);
+    const collection = collected.match({ ok: (value) => value, err: () => undefined });
+    if (collection === undefined) continue;
+    sessions.push(...collection.sessions);
+    if (collection.warning) warnings.push(collection.warning);
   }
 
   return { sessions: sortSessions(sessions), warnings };
@@ -763,12 +781,14 @@ async function terminateChildProcess(
   child.once("exit", onExit);
   child.once("error", onError);
   const signalled = await captureExternal("terminate-worker", async () => child.kill("SIGKILL"));
-  if (signalled.status === "error") {
+  const signalError = signalled.match({ ok: () => undefined, err: (error) => error });
+  if (signalError !== undefined) {
     child.off("exit", onExit);
     child.off("error", onError);
-    return Result.err(signalled.error);
+    return Result.err(signalError);
   }
-  if (!signalled.value && child.exitCode === null && child.signalCode === null) {
+  const signalSent = signalled.match({ ok: (value) => value, err: () => false });
+  if (!signalSent && child.exitCode === null && child.signalCode === null) {
     child.off("exit", onExit);
     child.off("error", onError);
     const cause = new Error("Failed to terminate uncommitted prompt worker.");
@@ -783,7 +803,7 @@ async function terminateChildProcess(
   const settled = await captureExternal("terminate-worker", () => exited);
   child.off("exit", onExit);
   child.off("error", onError);
-  return settled.status === "ok" ? Result.ok(undefined) : Result.err(settled.error);
+  return settled.map(() => undefined);
 }
 
 async function spawnWorker(
@@ -809,11 +829,15 @@ async function spawnWorker(
       },
     });
   });
-  if (spawned.status === "error") return Result.err(spawned.error);
-  const child = spawned.value;
+  const child = spawned.match<ChildProcess | ExternalOperationFailed>({
+    ok: (value) => value,
+    err: (error) => error,
+  });
+  if (ExternalOperationFailed.is(child)) return Result.err(child);
   if (child.pid === undefined) {
     const terminated = await terminateChildProcess(child);
-    if (terminated.status === "error") return Result.err(terminated.error);
+    const terminationError = terminated.match({ ok: () => undefined, err: (error) => error });
+    if (terminationError !== undefined) return Result.err(terminationError);
     return Result.err(
       new RunInvariantFailed({
         runId,
@@ -849,7 +873,11 @@ export async function persistSpawnedWorkerAdmission(
     try: () => persist(admitted),
     catch: captureAcpFailure,
   });
-  if (persistence.status === "ok" && persistence.value.status === "ok") {
+  const persistedSuccessfully = persistence.match({
+    ok: (result) => result.match({ ok: () => true, err: () => false }),
+    err: () => false,
+  });
+  if (persistedSuccessfully) {
     worker.detach();
     return Result.ok(admitted);
   }
@@ -858,51 +886,71 @@ export async function persistSpawnedWorkerAdmission(
     try: worker.terminate,
     catch: captureAcpFailure,
   });
-  let primary: ExternalOperationFailed;
-  if (persistence.status === "ok") {
-    if (persistence.value.status === "ok") {
-      worker.detach();
-      return Result.ok(admitted);
-    }
-    primary = persistence.value.error;
-  } else {
-    switch (persistence.error.kind) {
+  const persistenceCaptureFailure = persistence.match({
+    ok: () => undefined,
+    err: (failure) => failure,
+  });
+  const terminationCaptureFailure = termination.match({
+    ok: () => undefined,
+    err: (failure) => failure,
+  });
+  if (persistenceCaptureFailure !== undefined) {
+    switch (persistenceCaptureFailure.kind) {
       case "panic": {
-        if (termination.status === "ok") {
-          if (termination.value.status === "error") {
-            recordAcpCleanupFailure(persistence.error.panic, termination.value.error);
+        if (terminationCaptureFailure === undefined) {
+          const cleanupError = termination.match({
+            ok: (result) => result.match({ ok: () => undefined, err: (error) => error }),
+            err: () => undefined,
+          });
+          if (cleanupError !== undefined) {
+            recordAcpCleanupFailure(persistenceCaptureFailure.panic, cleanupError);
           }
         } else {
           const cleanupFailure =
-            termination.error.kind === "panic"
-              ? termination.error.panic
-              : capturedWorkerFailure("terminate-worker", termination.error);
-          recordAcpCleanupFailure(persistence.error.panic, cleanupFailure);
+            terminationCaptureFailure.kind === "panic"
+              ? terminationCaptureFailure.panic
+              : capturedWorkerFailure("terminate-worker", terminationCaptureFailure);
+          recordAcpCleanupFailure(persistenceCaptureFailure.panic, cleanupFailure);
         }
-        return signalAcpDefect(persistence.error.panic);
+        return signalAcpDefect(persistenceCaptureFailure.panic);
       }
-      case "ordinary":
-        primary = capturedWorkerFailure("write-run", persistence.error);
-        break;
+      case "ordinary": {
+        const primary = capturedWorkerFailure("write-run", persistenceCaptureFailure);
+        const cleanupError = termination.match<ExternalOperationFailed | Panic | undefined>({
+          ok: (result) => result.match({ ok: () => undefined, err: (error) => error }),
+          err: (failure) =>
+            failure.kind === "panic"
+              ? failure.panic
+              : capturedWorkerFailure("terminate-worker", failure),
+        });
+        if (Panic.is(cleanupError)) return signalAcpDefect(cleanupError);
+        if (cleanupError === undefined) return Result.err(primary);
+        return Result.err(
+          new WorkAndCleanupFailed({
+            primary,
+            cleanup: cleanupError,
+            message: `${primary.message} Prompt worker termination also failed.`,
+          }),
+        );
+      }
     }
   }
-  let cleanup: ResultType<void, ExternalOperationFailed>;
-  if (termination.status === "ok") {
-    cleanup = termination.value;
-  } else {
-    switch (termination.error.kind) {
-      case "panic":
-        return signalAcpDefect(termination.error.panic);
-      case "ordinary":
-        cleanup = Result.err(capturedWorkerFailure("terminate-worker", termination.error));
-        break;
-    }
-  }
-  if (cleanup.status === "ok") return Result.err(primary);
+  const primary = persistence.match({
+    ok: (result) => result.match({ ok: () => undefined, err: (error) => error }),
+    err: () => undefined,
+  });
+  if (primary === undefined) return Result.ok(admitted);
+  const cleanupError = termination.match<ExternalOperationFailed | Panic | undefined>({
+    ok: (result) => result.match({ ok: () => undefined, err: (error) => error }),
+    err: (failure) =>
+      failure.kind === "panic" ? failure.panic : capturedWorkerFailure("terminate-worker", failure),
+  });
+  if (Panic.is(cleanupError)) return signalAcpDefect(cleanupError);
+  if (cleanupError === undefined) return Result.err(primary);
   return Result.err(
     new WorkAndCleanupFailed({
       primary,
-      cleanup: cleanup.error,
+      cleanup: cleanupError,
       message: `${primary.message} Prompt worker termination also failed.`,
     }),
   );
@@ -931,12 +979,11 @@ function capturedCleanupResult(
   attempted: ResultType<ResultType<void, ExternalOperationFailed>, CapturedAcpFailure>,
   operation: "close-harness" | "close-run-cancellation-watch",
 ): ExternalOperationFailed | Panic | undefined {
-  if (attempted.status === "ok") {
-    return attempted.value.status === "error" ? attempted.value.error : undefined;
-  }
-  return attempted.error.kind === "panic"
-    ? attempted.error.panic
-    : capturedWorkerFailure(operation, attempted.error);
+  return attempted.match({
+    ok: (result) => result.match({ ok: () => undefined, err: (error) => error }),
+    err: (failure) =>
+      failure.kind === "panic" ? failure.panic : capturedWorkerFailure(operation, failure),
+  });
 }
 
 function help(commandName: string): string {
@@ -965,13 +1012,15 @@ function help(commandName: string): string {
 
 async function runHarnessesList(version: string, write: OutputWriter): Promise<number> {
   const harnesses = await listResolvedHarnesses();
-  if (harnesses.status === "error") {
-    write({ ok: false, error: harnesses.error.message });
+  const harnessError = harnesses.match({ ok: () => undefined, err: (error) => error });
+  if (harnessError !== undefined) {
+    write({ ok: false, error: harnessError.message });
     return 1;
   }
+  const entries = harnesses.match({ ok: (value) => value, err: () => [] });
   write({
     ok: true,
-    harnesses: harnesses.value.map((entry) => ({
+    harnesses: entries.map((entry) => ({
       id: entry.descriptor.id,
       title: entry.descriptor.title,
       description: entry.descriptor.description,
@@ -1029,11 +1078,13 @@ async function runSessionsSnapshot(params: {
     directory: params.directory,
     version: params.version,
   });
-  if (selected.status === "error") {
-    params.write({ ok: false, error: selected.error.message });
+  const selectionError = selected.match({ ok: () => undefined, err: (error) => error });
+  if (selectionError !== undefined) {
+    params.write({ ok: false, error: selectionError.message });
     return 1;
   }
-  const target = selected.value;
+  const target = selected.match({ ok: (value) => value, err: () => undefined });
+  if (target === undefined) return 1;
 
   if (!target.remoteSessionId || !target.sessionRef) {
     params.write({
@@ -1048,11 +1099,13 @@ async function runSessionsSnapshot(params: {
   }
 
   const resolvedHarness = await resolveHarness(target.harnessId);
-  if (resolvedHarness.status === "error") {
-    params.write({ ok: false, error: resolvedHarness.error.message });
+  const resolveError = resolvedHarness.match({ ok: () => undefined, err: (error) => error });
+  if (resolveError !== undefined) {
+    params.write({ ok: false, error: resolveError.message });
     return 1;
   }
-  if (!resolvedHarness.value) {
+  const harness = resolvedHarness.match({ ok: (value) => value, err: () => null });
+  if (!harness) {
     const descriptor = getHarnessDescriptor(target.harnessId);
     params.write({
       ok: false,
@@ -1063,28 +1116,31 @@ async function runSessionsSnapshot(params: {
 
   const collector = new SessionHistoryCollector();
   const connected = await AcpHarnessClient.connect({
-    harness: resolvedHarness.value,
+    harness,
     version: params.version,
     permissionBehavior: "reject",
     counters: createEmptyPermissionCounters(),
     onUpdate: (notification) => collector.add(notification),
   });
-  if (connected.status === "error") {
+  const connectError = connected.match({ ok: () => undefined, err: (error) => error });
+  if (connectError !== undefined) {
     params.write({
       ok: false,
-      error: connected.error.message,
+      error: connectError.message,
       harnessId: target.harnessId,
       sessionRef: target.sessionRef,
     });
     return 1;
   }
-  const client = connected.value;
+  const client = connected.match({ ok: (value) => value, err: () => undefined });
+  if (client === undefined) return 1;
   const loaded = await client.loadSession(target.remoteSessionId, params.directory);
   const cleanup = await client.close();
-  if (loaded.status === "error" || cleanup.status === "error") {
-    let failureMessage = "Harness operation failed.";
-    if (loaded.status === "error") failureMessage = loaded.error.message;
-    else if (cleanup.status === "error") failureMessage = cleanup.error.message;
+  const loadError = loaded.match({ ok: () => undefined, err: (error) => error });
+  const cleanupError = cleanup.match({ ok: () => undefined, err: (error) => error });
+  if (loadError !== undefined || cleanupError !== undefined) {
+    const failureMessage =
+      loadError?.message ?? cleanupError?.message ?? "Harness operation failed.";
     params.write({
       ok: false,
       error: failureMessage,
@@ -1141,11 +1197,13 @@ async function runPromptSubmit(params: {
     directory: params.directory,
     version: params.version,
   });
-  if (selected.status === "error") {
-    params.write({ ok: false, error: selected.error.message });
+  const selectionError = selected.match({ ok: () => undefined, err: (error) => error });
+  if (selectionError !== undefined) {
+    params.write({ ok: false, error: selectionError.message });
     return 1;
   }
-  const target = selected.value;
+  const target = selected.match({ ok: (value) => value, err: () => undefined });
+  if (target === undefined) return 1;
 
   if (!target.harnessId) {
     params.write({
@@ -1159,11 +1217,13 @@ async function runPromptSubmit(params: {
   }
 
   const resolvedHarness = await resolveHarness(target.harnessId);
-  if (resolvedHarness.status === "error") {
-    params.write({ ok: false, error: resolvedHarness.error.message });
+  const resolveError = resolvedHarness.match({ ok: () => undefined, err: (error) => error });
+  if (resolveError !== undefined) {
+    params.write({ ok: false, error: resolveError.message });
     return 1;
   }
-  if (!resolvedHarness.value) {
+  const harness = resolvedHarness.match({ ok: (value) => value, err: () => null });
+  if (!harness) {
     const descriptor = getHarnessDescriptor(target.harnessId);
     params.write({
       ok: false,
@@ -1192,21 +1252,27 @@ async function runPromptSubmit(params: {
   };
 
   const initialSave = await saveRunRecord(run);
-  if (initialSave.status === "error") {
-    params.write({ ok: false, error: initialSave.error.message, runId });
+  const initialSaveError = initialSave.match({ ok: () => undefined, err: (error) => error });
+  if (initialSaveError !== undefined) {
+    params.write({ ok: false, error: initialSaveError.message, runId });
     return 1;
   }
   const worker = await spawnWorker(runId);
-  if (worker.status === "error") {
-    params.write({ ok: false, error: worker.error.message, runId });
+  const workerError = worker.match({ ok: () => undefined, err: (error) => error });
+  if (workerError !== undefined) {
+    params.write({ ok: false, error: workerError.message, runId });
     return 1;
   }
-  const admitted = await persistSpawnedWorkerAdmission(run, worker.value);
-  if (admitted.status === "error") {
-    params.write({ ok: false, error: admitted.error.message, runId });
+  const spawnedWorker = worker.match({ ok: (value) => value, err: () => undefined });
+  if (spawnedWorker === undefined) return 1;
+  const admitted = await persistSpawnedWorkerAdmission(run, spawnedWorker);
+  const admissionError = admitted.match({ ok: () => undefined, err: (error) => error });
+  if (admissionError !== undefined) {
+    params.write({ ok: false, error: admissionError.message, runId });
     return 1;
   }
-  const withWorker = admitted.value;
+  const withWorker = admitted.match({ ok: (value) => value, err: () => undefined });
+  if (withWorker === undefined) return 1;
 
   if (params.wait) {
     return runPromptWait({
@@ -1231,16 +1297,21 @@ async function runPromptSubmit(params: {
 
 async function runPromptInspect(params: { runId: string; write: OutputWriter }): Promise<number> {
   const loaded = await loadRunRecord(params.runId);
-  if (loaded.status === "error") {
-    params.write({ ok: false, error: loaded.error.message, runId: params.runId });
+  const loadError = loaded.match({ ok: () => undefined, err: (error) => error });
+  if (loadError !== undefined) {
+    params.write({ ok: false, error: loadError.message, runId: params.runId });
     return 1;
   }
-  const refreshed = await refreshRunStatus(loaded.value);
-  if (refreshed.status === "error") {
-    params.write({ ok: false, error: refreshed.error.message, runId: params.runId });
+  const loadedRun = loaded.match({ ok: (value) => value, err: () => undefined });
+  if (loadedRun === undefined) return 1;
+  const refreshed = await refreshRunStatus(loadedRun);
+  const refreshError = refreshed.match({ ok: () => undefined, err: (error) => error });
+  if (refreshError !== undefined) {
+    params.write({ ok: false, error: refreshError.message, runId: params.runId });
     return 1;
   }
-  const run = refreshed.value;
+  const run = refreshed.match({ ok: (value) => value, err: () => undefined });
+  if (run === undefined) return 1;
   params.write({
     ok: true,
     runId: run.id,
@@ -1254,16 +1325,21 @@ async function runPromptInspect(params: { runId: string; write: OutputWriter }):
 
 async function runPromptResult(params: { runId: string; write: OutputWriter }): Promise<number> {
   const loaded = await loadRunRecord(params.runId);
-  if (loaded.status === "error") {
-    params.write({ ok: false, error: loaded.error.message, runId: params.runId });
+  const loadError = loaded.match({ ok: () => undefined, err: (error) => error });
+  if (loadError !== undefined) {
+    params.write({ ok: false, error: loadError.message, runId: params.runId });
     return 1;
   }
-  const refreshed = await refreshRunStatus(loaded.value);
-  if (refreshed.status === "error") {
-    params.write({ ok: false, error: refreshed.error.message, runId: params.runId });
+  const loadedRun = loaded.match({ ok: (value) => value, err: () => undefined });
+  if (loadedRun === undefined) return 1;
+  const refreshed = await refreshRunStatus(loadedRun);
+  const refreshError = refreshed.match({ ok: () => undefined, err: (error) => error });
+  if (refreshError !== undefined) {
+    params.write({ ok: false, error: refreshError.message, runId: params.runId });
     return 1;
   }
-  const run = refreshed.value;
+  const run = refreshed.match({ ok: (value) => value, err: () => undefined });
+  if (run === undefined) return 1;
   if (!isTerminalStatus(run.status)) {
     params.write({
       ok: false,
@@ -1296,16 +1372,21 @@ async function runPromptWait(params: {
 
   while (true) {
     const loaded = await loadRunRecord(params.runId);
-    if (loaded.status === "error") {
-      params.write({ ok: false, error: loaded.error.message, runId: params.runId });
+    const loadError = loaded.match({ ok: () => undefined, err: (error) => error });
+    if (loadError !== undefined) {
+      params.write({ ok: false, error: loadError.message, runId: params.runId });
       return 1;
     }
-    const refreshed = await refreshRunStatus(loaded.value);
-    if (refreshed.status === "error") {
-      params.write({ ok: false, error: refreshed.error.message, runId: params.runId });
+    const loadedRun = loaded.match({ ok: (value) => value, err: () => undefined });
+    if (loadedRun === undefined) return 1;
+    const refreshed = await refreshRunStatus(loadedRun);
+    const refreshError = refreshed.match({ ok: () => undefined, err: (error) => error });
+    if (refreshError !== undefined) {
+      params.write({ ok: false, error: refreshError.message, runId: params.runId });
       return 1;
     }
-    const run = refreshed.value;
+    const run = refreshed.match({ ok: (value) => value, err: () => undefined });
+    if (run === undefined) return 1;
     if (isTerminalStatus(run.status)) {
       params.write({
         ok: run.status === "completed",
@@ -1335,26 +1416,31 @@ async function runPromptWait(params: {
 
 async function runPromptCancel(params: { runId: string; write: OutputWriter }): Promise<number> {
   const cancellation = await requestRunCancellation(params.runId);
-  if (cancellation.status === "error") {
-    params.write({ ok: false, error: cancellation.error.message, runId: params.runId });
+  const cancellationError = cancellation.match({ ok: () => undefined, err: (error) => error });
+  if (cancellationError !== undefined) {
+    params.write({ ok: false, error: cancellationError.message, runId: params.runId });
     return 1;
   }
-  if (cancellation.value.kind === "already-terminal") {
+  const cancellationResult = cancellation.match({ ok: (value) => value, err: () => undefined });
+  if (cancellationResult === undefined) return 1;
+  if (cancellationResult.kind === "already-terminal") {
     params.write({
       ok: false,
       runId: params.runId,
-      error: `Run '${params.runId}' already finished with status '${cancellation.value.run.status}'.`,
+      error: `Run '${params.runId}' already finished with status '${cancellationResult.run.status}'.`,
     });
     return 1;
   }
-  const run = cancellation.value.run;
+  const run = cancellationResult.run;
 
   const alive = await isProcessAlive(run.workerPid);
-  if (alive.status === "error") {
-    params.write({ ok: false, error: alive.error.message, runId: params.runId });
+  const aliveError = alive.match({ ok: () => undefined, err: (error) => error });
+  if (aliveError !== undefined) {
+    params.write({ ok: false, error: aliveError.message, runId: params.runId });
     return 1;
   }
-  if (!run.workerPid || !alive.value) {
+  const processAlive = alive.match({ ok: (value) => value, err: () => false });
+  if (!run.workerPid || !processAlive) {
     params.write({ ok: true, runId: params.runId, signalled: false });
     return 0;
   }
@@ -1362,8 +1448,9 @@ async function runPromptCancel(params: { runId: string; write: OutputWriter }): 
   const signalled = await captureExternal("signal-worker", async () => {
     process.kill(workerPid, "SIGTERM");
   });
-  if (signalled.status === "error") {
-    params.write({ ok: false, error: signalled.error.message, runId: params.runId });
+  const signalError = signalled.match({ ok: () => undefined, err: (error) => error });
+  if (signalError !== undefined) {
+    params.write({ ok: false, error: signalError.message, runId: params.runId });
     return 1;
   }
   params.write({
@@ -1387,9 +1474,9 @@ export async function persistRunFromCollector(
     record,
   ) => {
     const saved = await saveWorkerRunRecord(record);
-    if (saved.status === "error") return Result.err(saved.error);
-    Object.assign(record, saved.value);
-    return Result.ok(undefined);
+    return saved.map((value) => {
+      Object.assign(record, value);
+    });
   },
 ): Promise<ResultType<void, RunStoreError>> {
   let sessionUpdate: Pick<PromptRunRecord, "session"> | Record<string, never> = {};
@@ -1422,9 +1509,9 @@ export async function persistRunFromCollector(
     ...(collector.latestAssistantText() ? { resultText: collector.latestAssistantText() } : {}),
   };
   const saved = await persist(next);
-  if (saved.status === "error") return Result.err(saved.error);
-  Object.assign(run, next);
-  return Result.ok(undefined);
+  return saved.map(() => {
+    Object.assign(run, next);
+  });
 }
 
 export function createSessionUpdatePersistence(
@@ -1444,11 +1531,14 @@ export function createSessionUpdatePersistence(
   const enqueuePersistence = (record: PromptRunRecord) => {
     const persisted = pending.then(async () => {
       const result = await persist(record, collector);
-      if (result.status === "error") {
-        persistenceError ??= result.error;
-      } else {
-        Object.assign(run, record);
-      }
+      result.match({
+        err: (error) => {
+          persistenceError ??= error;
+        },
+        ok: () => {
+          Object.assign(run, record);
+        },
+      });
       return result;
     });
     pending = persisted.then(() => undefined);
@@ -1461,7 +1551,12 @@ export function createSessionUpdatePersistence(
       const update = pending.then(async () => {
         collector.add(notification);
         const persisted = await persist(run, collector);
-        if (persisted.status === "error") persistenceError ??= persisted.error;
+        persisted.match({
+          ok: () => {},
+          err: (error) => {
+            persistenceError ??= error;
+          },
+        });
       });
       pending = update;
       return update;
@@ -1492,105 +1587,110 @@ export async function runAcpWorkerLifecycle<T, WorkError extends { readonly mess
   const removalAttempted = Result.try({ try: removeSignals, catch: captureAcpFailure });
   const cleanupAttempted = await Result.tryPromise({ try: cleanup, catch: captureAcpFailure });
 
-  if (attempted.status === "error" && attempted.error.kind === "panic") {
-    if (removalAttempted.status === "error") {
+  const workCaptureFailure = attempted.match({ ok: () => undefined, err: (failure) => failure });
+  const removalCaptureFailure = removalAttempted.match({
+    ok: () => undefined,
+    err: (failure) => failure,
+  });
+  const cleanupCaptureFailure = cleanupAttempted.match({
+    ok: () => undefined,
+    err: (failure) => failure,
+  });
+
+  if (workCaptureFailure?.kind === "panic") {
+    if (removalCaptureFailure !== undefined) {
       const removalFailure =
-        removalAttempted.error.kind === "panic"
-          ? removalAttempted.error.panic
-          : capturedWorkerFailure("remove-worker-signals", removalAttempted.error);
-      recordAcpCleanupFailure(attempted.error.panic, removalFailure);
+        removalCaptureFailure.kind === "panic"
+          ? removalCaptureFailure.panic
+          : capturedWorkerFailure("remove-worker-signals", removalCaptureFailure);
+      recordAcpCleanupFailure(workCaptureFailure.panic, removalFailure);
     }
-    if (cleanupAttempted.status === "ok") {
-      if (cleanupAttempted.value.status === "error") {
-        recordAcpCleanupFailure(attempted.error.panic, cleanupAttempted.value.error);
+    if (cleanupCaptureFailure === undefined) {
+      const cleanupError = cleanupAttempted.match({
+        ok: (result) => result.match({ ok: () => undefined, err: (error) => error }),
+        err: () => undefined,
+      });
+      if (cleanupError !== undefined)
+        recordAcpCleanupFailure(workCaptureFailure.panic, cleanupError);
+    } else {
+      const cleanupFailure =
+        cleanupCaptureFailure.kind === "panic"
+          ? cleanupCaptureFailure.panic
+          : capturedWorkerFailure("close-harness", cleanupCaptureFailure);
+      recordAcpCleanupFailure(workCaptureFailure.panic, cleanupFailure);
+    }
+    return signalAcpDefect(workCaptureFailure.panic);
+  }
+
+  if (removalCaptureFailure?.kind === "panic") {
+    if (cleanupCaptureFailure === undefined) {
+      const cleanupError = cleanupAttempted.match({
+        ok: (result) => result.match({ ok: () => undefined, err: (error) => error }),
+        err: () => undefined,
+      });
+      if (cleanupError !== undefined) {
+        recordAcpCleanupFailure(removalCaptureFailure.panic, cleanupError);
       }
     } else {
       const cleanupFailure =
-        cleanupAttempted.error.kind === "panic"
-          ? cleanupAttempted.error.panic
-          : capturedWorkerFailure("close-harness", cleanupAttempted.error);
-      recordAcpCleanupFailure(attempted.error.panic, cleanupFailure);
+        cleanupCaptureFailure.kind === "panic"
+          ? cleanupCaptureFailure.panic
+          : capturedWorkerFailure("close-harness", cleanupCaptureFailure);
+      recordAcpCleanupFailure(removalCaptureFailure.panic, cleanupFailure);
     }
-    return signalAcpDefect(attempted.error.panic);
+    return signalAcpDefect(removalCaptureFailure.panic);
   }
 
-  if (removalAttempted.status === "error" && removalAttempted.error.kind === "panic") {
-    if (cleanupAttempted.status === "ok") {
-      if (cleanupAttempted.value.status === "error") {
-        recordAcpCleanupFailure(removalAttempted.error.panic, cleanupAttempted.value.error);
-      }
-    } else {
-      const cleanupFailure =
-        cleanupAttempted.error.kind === "panic"
-          ? cleanupAttempted.error.panic
-          : capturedWorkerFailure("close-harness", cleanupAttempted.error);
-      recordAcpCleanupFailure(removalAttempted.error.panic, cleanupFailure);
-    }
-    return signalAcpDefect(removalAttempted.error.panic);
-  }
-
-  if (cleanupAttempted.status === "error" && cleanupAttempted.error.kind === "panic") {
-    if (removalAttempted.status === "error" && removalAttempted.error.kind === "ordinary") {
+  if (cleanupCaptureFailure?.kind === "panic") {
+    if (removalCaptureFailure?.kind === "ordinary") {
       recordAcpCleanupFailure(
-        cleanupAttempted.error.panic,
-        capturedWorkerFailure("remove-worker-signals", removalAttempted.error),
+        cleanupCaptureFailure.panic,
+        capturedWorkerFailure("remove-worker-signals", removalCaptureFailure),
       );
     }
-    return signalAcpDefect(cleanupAttempted.error.panic);
+    return signalAcpDefect(cleanupCaptureFailure.panic);
   }
 
-  let result: ResultType<T, WorkError | ExternalOperationFailed>;
-  if (attempted.status === "ok") {
-    result = attempted.value;
-  } else {
-    switch (attempted.error.kind) {
-      case "panic":
-        return signalAcpDefect(attempted.error.panic);
-      case "ordinary":
-        result = Result.err(capturedWorkerFailure("worker-process", attempted.error));
-        break;
-    }
-  }
-
-  let removalFailure: ExternalOperationFailed | undefined;
-  if (removalAttempted.status === "error") {
-    switch (removalAttempted.error.kind) {
-      case "panic":
-        return signalAcpDefect(removalAttempted.error.panic);
-      case "ordinary":
-        removalFailure = capturedWorkerFailure("remove-worker-signals", removalAttempted.error);
-        break;
-    }
-  }
-
-  let cleaned: ResultType<void, ExternalOperationFailed>;
-  if (cleanupAttempted.status === "ok") {
-    cleaned = cleanupAttempted.value;
-  } else {
-    switch (cleanupAttempted.error.kind) {
-      case "panic":
-        return signalAcpDefect(cleanupAttempted.error.panic);
-      case "ordinary":
-        cleaned = Result.err(capturedWorkerFailure("close-harness", cleanupAttempted.error));
-        break;
-    }
-  }
-  const harnessCleanup = cleaned.status === "error" ? cleaned.error : undefined;
+  const resultOrPanic = attempted.match<ResultType<T, WorkError | ExternalOperationFailed> | Panic>(
+    {
+      ok: (result) => result,
+      err: (failure) =>
+        failure.kind === "panic"
+          ? failure.panic
+          : Result.err(capturedWorkerFailure("worker-process", failure)),
+    },
+  );
+  if (Panic.is(resultOrPanic)) return signalAcpDefect(resultOrPanic);
+  const result = resultOrPanic;
+  const removalFailure =
+    removalCaptureFailure?.kind === "ordinary"
+      ? capturedWorkerFailure("remove-worker-signals", removalCaptureFailure)
+      : undefined;
+  const cleanedOrPanic = cleanupAttempted.match<ResultType<void, ExternalOperationFailed> | Panic>({
+    ok: (result) => result,
+    err: (failure) =>
+      failure.kind === "panic"
+        ? failure.panic
+        : Result.err(capturedWorkerFailure("close-harness", failure)),
+  });
+  if (Panic.is(cleanedOrPanic)) return signalAcpDefect(cleanedOrPanic);
+  const harnessCleanup = cleanedOrPanic.match({ ok: () => undefined, err: (error) => error });
   if (!removalFailure && !harnessCleanup) return result;
-  if (result.status === "ok" && removalFailure && !harnessCleanup) {
+  const resultError = result.match({ ok: () => undefined, err: (error) => error });
+  if (resultError === undefined && removalFailure && !harnessCleanup) {
     return Result.err(removalFailure);
   }
-  if (result.status === "ok" && harnessCleanup && !removalFailure) {
+  if (resultError === undefined && harnessCleanup && !removalFailure) {
     return Result.err(harnessCleanup);
   }
   return Result.err(
     new WorkerLifecycleCleanupFailed({
-      ...(result.status === "error" ? { primary: result.error } : {}),
+      ...(resultError !== undefined ? { primary: resultError } : {}),
       ...(removalFailure ? { signalCleanup: removalFailure } : {}),
       ...(harnessCleanup ? { harnessCleanup } : {}),
       message:
-        result.status === "error"
-          ? `${result.error.message} Worker lifecycle cleanup also failed.`
+        resultError !== undefined
+          ? `${resultError.message} Worker lifecycle cleanup also failed.`
           : "Worker lifecycle cleanup failed.",
     }),
   );
@@ -1611,8 +1711,11 @@ export async function runPromptWithCancellationMonitor(params: {
   >
 > {
   const observed = await params.observe();
-  if (observed.status === "error") return Result.err(observed.error);
-  const observation = observed.value;
+  const observation = observed.match<RunCancellationObservation | ExternalOperationFailed>({
+    ok: (value) => value,
+    err: (error) => error,
+  });
+  if (ExternalOperationFailed.is(observation)) return Result.err(observation);
   let promptActive = false;
   let signalPromptStarted: () => void = () => undefined;
   const promptStarted = new Promise<void>((resolve) => {
@@ -1620,8 +1723,10 @@ export async function runPromptWithCancellationMonitor(params: {
   });
   const monitored = (async (): Promise<ResultType<void, RunStoreError>> => {
     const cancellation = await observation.result;
-    if (cancellation.status === "error") return Result.err(cancellation.error);
-    if (cancellation.value === "stopped") return Result.ok(undefined);
+    const cancellationError = cancellation.match({ ok: () => undefined, err: (error) => error });
+    if (cancellationError !== undefined) return Result.err(cancellationError);
+    const cancellationState = cancellation.match({ ok: (value) => value, err: () => "stopped" });
+    if (cancellationState === "stopped") return Result.ok(undefined);
     await promptStarted;
     if (!promptActive) return Result.ok(undefined);
     return params.cancel();
@@ -1652,10 +1757,13 @@ export async function runPromptWithCancellationMonitor(params: {
     monitorAttemptedPromise.then((attempted) => ({ kind: "monitor" as const, attempted })),
   ]);
 
-  if (
+  const firstMonitorFailed =
     first.kind === "monitor" &&
-    (first.attempted.status === "error" || first.attempted.value.status === "error")
-  ) {
+    first.attempted.match({
+      ok: (result) => result.match({ ok: () => false, err: () => true }),
+      err: () => true,
+    });
+  if (firstMonitorFailed && first.kind === "monitor") {
     promptActive = false;
     const watcherCleanupPromise = Result.tryPromise({
       try: observation.close,
@@ -1673,8 +1781,14 @@ export async function runPromptWithCancellationMonitor(params: {
 
     let monitorPanic: Panic | undefined;
     let monitorError: RunStoreError;
-    if (first.attempted.status === "ok") {
-      if (first.attempted.value.status === "ok") {
+    const monitorCaptureFailure = first.attempted.match({
+      ok: () => undefined,
+      err: (failure) => failure,
+    });
+    if (monitorCaptureFailure === undefined) {
+      const result = first.attempted.match({ ok: (value) => value, err: () => undefined });
+      const error = result?.match({ ok: () => undefined, err: (failure) => failure });
+      if (error === undefined) {
         return Result.err(
           new ExternalOperationFailed({
             operation: "watch-run-cancellation",
@@ -1683,11 +1797,11 @@ export async function runPromptWithCancellationMonitor(params: {
           }),
         );
       }
-      monitorError = first.attempted.value.error;
+      monitorError = error;
     } else {
-      switch (first.attempted.error.kind) {
+      switch (monitorCaptureFailure.kind) {
         case "panic":
-          monitorPanic = first.attempted.error.panic;
+          monitorPanic = monitorCaptureFailure.panic;
           monitorError = new ExternalOperationFailed({
             operation: "watch-run-cancellation",
             cause: monitorPanic,
@@ -1695,7 +1809,7 @@ export async function runPromptWithCancellationMonitor(params: {
           });
           break;
         case "ordinary":
-          monitorError = capturedWorkerFailure("watch-run-cancellation", first.attempted.error);
+          monitorError = capturedWorkerFailure("watch-run-cancellation", monitorCaptureFailure);
           break;
       }
     }
@@ -1734,62 +1848,70 @@ export async function runPromptWithCancellationMonitor(params: {
     first.kind === "prompt" ? first.attempted : await promptedAttemptedPromise;
   const monitorAttempted =
     first.kind === "monitor" ? first.attempted : await monitorAttemptedPromise;
-  if (promptedAttempted.status === "error" && promptedAttempted.error.kind === "panic") {
-    if (monitorAttempted.status === "error") {
+  const promptCaptureFailure = promptedAttempted.match({
+    ok: () => undefined,
+    err: (failure) => failure,
+  });
+  const monitorCaptureFailure = monitorAttempted.match({
+    ok: () => undefined,
+    err: (failure) => failure,
+  });
+  if (promptCaptureFailure?.kind === "panic") {
+    if (monitorCaptureFailure !== undefined) {
       const secondary =
-        monitorAttempted.error.kind === "panic"
-          ? monitorAttempted.error.panic
-          : capturedWorkerFailure("watch-run-cancellation", monitorAttempted.error);
-      recordAcpCleanupFailure(promptedAttempted.error.panic, secondary);
-    } else if (monitorAttempted.value.status === "error") {
-      const secondary =
-        monitorAttempted.value.error._tag === "ExternalOperationFailed"
-          ? monitorAttempted.value.error
+        monitorCaptureFailure.kind === "panic"
+          ? monitorCaptureFailure.panic
+          : capturedWorkerFailure("watch-run-cancellation", monitorCaptureFailure);
+      recordAcpCleanupFailure(promptCaptureFailure.panic, secondary);
+    } else {
+      const monitorError = monitorAttempted.match({
+        ok: (result) => result.match({ ok: () => undefined, err: (error) => error }),
+        err: () => undefined,
+      });
+      if (monitorError !== undefined) {
+        const secondary = ExternalOperationFailed.is(monitorError)
+          ? monitorError
           : new ExternalOperationFailed({
               operation: "watch-run-cancellation",
-              cause: monitorAttempted.value.error,
-              message: monitorAttempted.value.error.message,
+              cause: monitorError,
+              message: monitorError.message,
             });
-      recordAcpCleanupFailure(promptedAttempted.error.panic, secondary);
+        recordAcpCleanupFailure(promptCaptureFailure.panic, secondary);
+      }
     }
-    return signalAcpDefect(promptedAttempted.error.panic);
+    return signalAcpDefect(promptCaptureFailure.panic);
   }
-  if (monitorAttempted.status === "error" && monitorAttempted.error.kind === "panic") {
-    return signalAcpDefect(monitorAttempted.error.panic);
+  if (monitorCaptureFailure?.kind === "panic") {
+    return signalAcpDefect(monitorCaptureFailure.panic);
   }
-  let prompted: ResultType<PromptResponse, AcpWorkerLifecycleError<ExternalOperationFailed>>;
-  if (promptedAttempted.status === "ok") {
-    prompted = promptedAttempted.value;
-  } else {
-    switch (promptedAttempted.error.kind) {
-      case "panic":
-        return signalAcpDefect(promptedAttempted.error.panic);
-      case "ordinary":
-        prompted = Result.err(capturedWorkerFailure("worker-process", promptedAttempted.error));
-        break;
-    }
-  }
-  let monitor: ResultType<void, RunStoreError>;
-  if (monitorAttempted.status === "ok") {
-    monitor = monitorAttempted.value;
-  } else {
-    switch (monitorAttempted.error.kind) {
-      case "panic":
-        return signalAcpDefect(monitorAttempted.error.panic);
-      case "ordinary":
-        monitor = Result.err(
-          capturedWorkerFailure("watch-run-cancellation", monitorAttempted.error),
-        );
-        break;
-    }
-  }
-  if (monitor.status === "ok") return prompted;
-  if (prompted.status === "ok") return Result.err(monitor.error);
+  const promptedOrPanic = promptedAttempted.match<
+    ResultType<PromptResponse, AcpWorkerLifecycleError<ExternalOperationFailed>> | Panic
+  >({
+    ok: (result) => result,
+    err: (failure) =>
+      failure.kind === "panic"
+        ? failure.panic
+        : Result.err(capturedWorkerFailure("worker-process", failure)),
+  });
+  if (Panic.is(promptedOrPanic)) return signalAcpDefect(promptedOrPanic);
+  const prompted = promptedOrPanic;
+  const monitorOrPanic = monitorAttempted.match<ResultType<void, RunStoreError> | Panic>({
+    ok: (result) => result,
+    err: (failure) =>
+      failure.kind === "panic"
+        ? failure.panic
+        : Result.err(capturedWorkerFailure("watch-run-cancellation", failure)),
+  });
+  if (Panic.is(monitorOrPanic)) return signalAcpDefect(monitorOrPanic);
+  const monitorError = monitorOrPanic.match({ ok: () => undefined, err: (error) => error });
+  if (monitorError === undefined) return prompted;
+  const promptError = prompted.match({ ok: () => undefined, err: (error) => error });
+  if (promptError === undefined) return Result.err(monitorError);
   return Result.err(
     new WorkAndMonitorFailed({
-      primary: prompted.error,
-      monitor: monitor.error,
-      message: `${prompted.error.message} Cancellation monitoring also failed.`,
+      primary: promptError,
+      monitor: monitorError,
+      message: `${promptError.message} Cancellation monitoring also failed.`,
     }),
   );
 }
@@ -1799,46 +1921,53 @@ async function runWorkerProcess(
   version: string,
 ): Promise<ResultType<number, RunStoreError>> {
   const loaded = await loadRunRecord(runId);
-  if (loaded.status === "error") return Result.err(loaded.error);
-  const run = loaded.value;
+  const loadError = loaded.match({ ok: () => undefined, err: (error) => error });
+  if (loadError !== undefined) return Result.err(loadError);
+  const run = loaded.match({ ok: (value) => value, err: () => undefined });
+  if (run === undefined) return loaded.map(() => 1);
   const resolvedHarness = await resolveHarness(run.harnessId);
-  if (resolvedHarness.status === "error" || !resolvedHarness.value) {
+  const resolveError = resolvedHarness.match({ ok: () => undefined, err: (error) => error });
+  const harness = resolvedHarness.match({ ok: (value) => value, err: () => null });
+  if (resolveError !== undefined || !harness) {
     const failed: PromptRunRecord = {
       ...run,
       status: "failed",
       updatedAt: Date.now(),
       error:
-        resolvedHarness.status === "error"
-          ? resolvedHarness.error.message
+        resolveError !== undefined
+          ? resolveError.message
           : (getHarnessDescriptor(run.harnessId)?.installHint ??
             `Harness '${run.harnessId}' is not launchable.`),
     };
     const saved = await saveRunRecord(failed);
-    return saved.status === "error" ? Result.err(saved.error) : Result.ok(1);
+    return saved.map(() => 1);
   }
 
   const collector = new SessionHistoryCollector();
   const sessionUpdates = createSessionUpdatePersistence(run, collector);
   const connected = await AcpHarnessClient.connect({
-    harness: resolvedHarness.value,
+    harness,
     version,
     permissionBehavior: "always",
     counters: run.permissions,
     onUpdate: sessionUpdates.onUpdate,
   });
-  if (connected.status === "error") {
+  const connectError = connected.match({ ok: () => undefined, err: (error) => error });
+  if (connectError !== undefined) {
     const updatesFinalized = await sessionUpdates.finalize();
     const failed: PromptRunRecord = {
       ...run,
       status: "failed",
       updatedAt: Date.now(),
-      error: connected.error.message,
+      error: connectError.message,
     };
     const saved = await sessionUpdates.persist(failed);
-    if (saved.status === "error") return Result.err(saved.error);
-    return updatesFinalized.status === "error" ? Result.err(updatesFinalized.error) : Result.ok(1);
+    const saveError = saved.match({ ok: () => undefined, err: (error) => error });
+    if (saveError !== undefined) return Result.err(saveError);
+    return updatesFinalized.map(() => 1);
   }
-  const client = connected.value;
+  const client = connected.match({ ok: (value) => value, err: () => undefined });
+  if (client === undefined) return Result.ok(1);
   let clientCloseAttempted = false;
   const closeClient = async (): Promise<ResultType<void, ExternalOperationFailed>> => {
     if (clientCloseAttempted) return Result.ok(undefined);
@@ -1866,14 +1995,22 @@ async function runWorkerProcess(
           });
         } else {
           const sessionLoaded = await client.loadSession(remoteSessionId, run.directory);
-          if (sessionLoaded.status === "error") workError = sessionLoaded.error;
+          sessionLoaded.match({
+            ok: () => {},
+            err: (error) => {
+              workError = error;
+            },
+          });
         }
       } else {
         const created = await client.createSession(run.directory);
-        if (created.status === "error") {
-          workError = created.error;
+        const createError = created.match({ ok: () => undefined, err: (error) => error });
+        if (createError !== undefined) {
+          workError = createError;
         } else {
-          remoteSessionId = created.value.sessionId;
+          const createdSession = created.match({ ok: (value) => value, err: () => undefined });
+          if (createdSession === undefined) return created.map(() => undefined);
+          remoteSessionId = createdSession.sessionId;
           run.remoteSessionId = remoteSessionId;
           run.sessionRef = formatSessionRef(run.harnessId, remoteSessionId);
           const indexed = await upsertSessionIndexEntries([
@@ -1889,10 +2026,20 @@ async function runWorkerProcess(
               ...(run.requestedTitle ? { localTitle: run.requestedTitle } : {}),
             },
           ]);
-          if (indexed.status === "error") workError = indexed.error;
+          indexed.match({
+            ok: () => {},
+            err: (error) => {
+              workError = error;
+            },
+          });
           if (!workError && run.requestedTitle) {
             const titled = await setLocalSessionTitle(run.sessionRef, run.requestedTitle);
-            if (titled.status === "error") workError = titled.error;
+            titled.match({
+              ok: () => {},
+              err: (error) => {
+                workError = error;
+              },
+            });
           }
         }
       }
@@ -1922,21 +2069,30 @@ async function runWorkerProcess(
           updatedAt: Date.now(),
         };
         const runningSaved = await sessionUpdates.persist(running);
-        if (runningSaved.status === "error") {
-          workError = runningSaved.error;
-        } else {
-          Object.assign(run, running);
-        }
+        runningSaved.match({
+          err: (error) => {
+            workError = error;
+          },
+          ok: () => {
+            Object.assign(run, running);
+          },
+        });
 
         if (!workError) {
           const refreshedRun = await loadRunRecord(run.id);
-          if (refreshedRun.status === "error") {
-            workError = refreshedRun.error;
-          } else if (cancellationRequested || refreshedRun.value.cancelRequestedAt) {
+          const refreshError = refreshedRun.match({ ok: () => undefined, err: (error) => error });
+          const currentRun = refreshedRun.match({ ok: (value) => value, err: () => undefined });
+          if (refreshError !== undefined) {
+            workError = refreshError;
+          } else if (cancellationRequested || currentRun?.cancelRequestedAt) {
             cancellationRequested = true;
             const updatesFinalized = await sessionUpdates.finalize();
-            if (updatesFinalized.status === "error") {
-              workError = updatesFinalized.error;
+            const finalizeError = updatesFinalized.match({
+              ok: () => undefined,
+              err: (error) => error,
+            });
+            if (finalizeError !== undefined) {
+              workError = finalizeError;
             } else {
               const cancelled: PromptRunRecord = {
                 ...run,
@@ -1945,22 +2101,35 @@ async function runWorkerProcess(
                 error: "Cancelled before prompt submission completed.",
               };
               const cancelledSaved = await sessionUpdates.persist(cancelled);
-              if (cancelledSaved.status === "error") {
-                workError = cancelledSaved.error;
-              } else {
-                Object.assign(run, cancelled);
-              }
+              cancelledSaved.match({
+                err: (error) => {
+                  workError = error;
+                },
+                ok: () => {
+                  Object.assign(run, cancelled);
+                },
+              });
             }
           }
         }
 
         if (!workError && run.status !== "cancelled" && run.requestedMode) {
           const mode = await client.setMode(activeSessionId, run.requestedMode);
-          if (mode.status === "error") workError = mode.error;
+          mode.match({
+            ok: () => {},
+            err: (error) => {
+              workError = error;
+            },
+          });
         }
         if (!workError && run.status !== "cancelled" && run.requestedModel) {
           const model = await client.setModel(activeSessionId, run.requestedModel);
-          if (model.status === "error") workError = model.error;
+          model.match({
+            ok: () => {},
+            err: (error) => {
+              workError = error;
+            },
+          });
         }
 
         if (!workError && run.status !== "cancelled") {
@@ -1970,14 +2139,23 @@ async function runWorkerProcess(
             cancel: () => client.cancel(activeSessionId),
             terminate: closeClient,
           });
-          if (prompted.status === "error") {
-            workError = prompted.error;
+          const promptError = prompted.match({ ok: () => undefined, err: (error) => error });
+          if (promptError !== undefined) {
+            workError = promptError;
           } else {
             const updatesFinalized = await sessionUpdates.finalize();
-            if (updatesFinalized.status === "error") {
-              workError = updatesFinalized.error;
+            const finalizeError = updatesFinalized.match({
+              ok: () => undefined,
+              err: (error) => error,
+            });
+            if (finalizeError !== undefined) {
+              workError = finalizeError;
             } else {
-              const promptResponse: PromptResponse = prompted.value;
+              const promptResponse = prompted.match<PromptResponse | undefined>({
+                ok: (value) => value,
+                err: () => undefined,
+              });
+              if (promptResponse === undefined) return prompted.map(() => undefined);
               const terminal: PromptRunRecord = {
                 ...run,
                 stopReason: promptResponse.stopReason,
@@ -1988,8 +2166,9 @@ async function runWorkerProcess(
                 updatedAt: Date.now(),
               };
               const persisted = await sessionUpdates.persist(terminal);
-              if (persisted.status === "error") {
-                workError = persisted.error;
+              const persistError = persisted.match({ ok: () => undefined, err: (error) => error });
+              if (persistError !== undefined) {
+                workError = persistError;
               } else {
                 Object.assign(run, terminal);
                 const indexed = await upsertSessionIndexEntries([
@@ -2006,7 +2185,12 @@ async function runWorkerProcess(
                     run.requestedTitle,
                   ),
                 ]);
-                if (indexed.status === "error") workError = indexed.error;
+                indexed.match({
+                  ok: () => {},
+                  err: (error) => {
+                    workError = error;
+                  },
+                });
               }
             }
           }
@@ -2014,7 +2198,8 @@ async function runWorkerProcess(
       }
 
       const updatesFinalized = await sessionUpdates.finalize();
-      if (!workError && updatesFinalized.status === "error") workError = updatesFinalized.error;
+      const finalizeError = updatesFinalized.match({ ok: () => undefined, err: (error) => error });
+      if (!workError && finalizeError !== undefined) workError = finalizeError;
       return workError ? Result.err(workError) : Result.ok(undefined);
     },
     closeClient,
@@ -2023,8 +2208,10 @@ async function runWorkerProcess(
       process.off("SIGINT", onTerminate);
     },
   );
-  let workError: { readonly message: string } | undefined =
-    lifecycle.status === "error" ? lifecycle.error : undefined;
+  const workError: { readonly message: string } | undefined = lifecycle.match({
+    ok: () => undefined,
+    err: (error) => error,
+  });
 
   if (workError) {
     const authHint = client.authHint();
@@ -2042,7 +2229,7 @@ async function runWorkerProcess(
       error: runError,
     };
     const saved = await sessionUpdates.persist(next);
-    return saved.status === "error" ? Result.err(saved.error) : Result.ok(1);
+    return saved.map(() => 1);
   }
   return Result.ok(run.status === "completed" ? 0 : 1);
 }
@@ -2085,11 +2272,12 @@ export async function main(argv: readonly string[]): Promise<number> {
       return 1;
     }
     const worker = await runWorkerProcess(runId, packageVersion);
-    if (worker.status === "error") {
-      write({ ok: false, error: worker.error.message, runId });
+    const workerError = worker.match({ ok: () => undefined, err: (error) => error });
+    if (workerError !== undefined) {
+      write({ ok: false, error: workerError.message, runId });
       return 1;
     }
-    return worker.value;
+    return worker.match({ ok: (value) => value, err: () => 1 });
   }
 
   const command = cleanArgv[0] ?? "";

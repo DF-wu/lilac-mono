@@ -4,7 +4,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
-import { Result, type Panic, type Result as ResultType } from "better-result";
+import { Panic, Result, type Result as ResultType } from "better-result";
 import { z } from "zod";
 
 import {
@@ -124,9 +124,12 @@ function parseJson(content: string): ResultType<unknown, { readonly cause: Error
     try: () => JSON.parse(content),
     catch: captureAcpFailure,
   });
-  if (parsed.status === "ok") return Result.ok(parsed.value);
-  if (parsed.error.kind === "panic") return signalAcpDefect(parsed.error.panic);
-  return Result.err({ cause: parsed.error.cause });
+  const outcome = parsed.match<ResultType<unknown, { readonly cause: Error }> | Panic>({
+    ok: (value) => Result.ok(value),
+    err: (failure) =>
+      failure.kind === "panic" ? failure.panic : Result.err({ cause: failure.cause }),
+  });
+  return Panic.is(outcome) ? signalAcpDefect(outcome) : outcome;
 }
 
 export function decodeRunRecord(
@@ -136,39 +139,47 @@ export function decodeRunRecord(
   RunRecordMalformedSerialization | RunRecordCorruptFields
 > {
   const decoded = parseJson(input.content);
-  if (decoded.status === "error") {
-    return Result.err(
-      new RunRecordMalformedSerialization({
-        runId: input.runId,
-        message:
-          decoded.error.cause instanceof Error
-            ? decoded.error.cause.message
-            : `Run record '${input.runId}' contains malformed JSON.`,
-      }),
-    );
-  }
-  const parsed = promptRunRecordSchema.safeParse(decoded.value);
-  if (parsed.success) return Result.ok({ provenance: "current", value: parsed.data });
-  const legacy = legacyRunRecordSchema.safeParse(decoded.value);
-  if (legacy.success) {
-    return Result.ok({
-      provenance: "migrated",
-      value: {
-        ...legacy.data,
-        permissions: {
-          permissionsApproved: 0,
-          permissionsRejected: 0,
-          permissionsCancelled: 0,
-        },
-      },
-    });
-  }
-  return Result.err(
-    new RunRecordCorruptFields({
-      runId: input.runId,
-      message: `Run record '${input.runId}' is malformed.`,
-    }),
-  );
+  return decoded.match<
+    ResultType<
+      PresentPersistedRead<PromptRunRecord>,
+      RunRecordMalformedSerialization | RunRecordCorruptFields
+    >
+  >({
+    err: (error) =>
+      Result.err(
+        new RunRecordMalformedSerialization({
+          runId: input.runId,
+          message:
+            error.cause instanceof Error
+              ? error.cause.message
+              : `Run record '${input.runId}' contains malformed JSON.`,
+        }),
+      ),
+    ok: (value) => {
+      const parsed = promptRunRecordSchema.safeParse(value);
+      if (parsed.success) return Result.ok({ provenance: "current", value: parsed.data });
+      const legacy = legacyRunRecordSchema.safeParse(value);
+      if (legacy.success) {
+        return Result.ok({
+          provenance: "migrated",
+          value: {
+            ...legacy.data,
+            permissions: {
+              permissionsApproved: 0,
+              permissionsRejected: 0,
+              permissionsCancelled: 0,
+            },
+          },
+        });
+      }
+      return Result.err(
+        new RunRecordCorruptFields({
+          runId: input.runId,
+          message: `Run record '${input.runId}' is malformed.`,
+        }),
+      );
+    },
+  });
 }
 
 export function decodeRunCancellation(
@@ -180,39 +191,49 @@ export function decodeRunCancellation(
   | RunCancellationCorruptFields
 > {
   const decoded = parseJson(input.content);
-  if (decoded.status === "error") {
-    return Result.err(
-      new RunCancellationMalformedSerialization({
-        runId: input.runId,
-        message: `Run cancellation marker '${input.runId}' contains malformed JSON.`,
-      }),
-    );
-  }
-  const parsed = runCancellationSchema.safeParse(decoded.value);
-  if (parsed.success) return Result.ok({ provenance: "current", value: parsed.data });
-  const legacy = legacyRunCancellationSchema.safeParse(decoded.value);
-  if (legacy.success) {
-    return Result.ok({
-      provenance: "migrated",
-      value: { ...legacy.data, version: 1 },
-    });
-  }
-  const version = persistedVersionSchema.safeParse(decoded.value);
-  if (version.success && version.data.version !== 1) {
-    return Result.err(
-      new RunCancellationUnsupportedVersion({
-        runId: input.runId,
-        version: version.data.version,
-        message: `Run cancellation marker '${input.runId}' has unsupported version ${version.data.version}.`,
-      }),
-    );
-  }
-  return Result.err(
-    new RunCancellationCorruptFields({
-      runId: input.runId,
-      message: `Run cancellation marker '${input.runId}' contains corrupt fields.`,
-    }),
-  );
+  return decoded.match<
+    ResultType<
+      PresentPersistedRead<RunCancellation>,
+      | RunCancellationMalformedSerialization
+      | RunCancellationUnsupportedVersion
+      | RunCancellationCorruptFields
+    >
+  >({
+    err: () =>
+      Result.err(
+        new RunCancellationMalformedSerialization({
+          runId: input.runId,
+          message: `Run cancellation marker '${input.runId}' contains malformed JSON.`,
+        }),
+      ),
+    ok: (value) => {
+      const parsed = runCancellationSchema.safeParse(value);
+      if (parsed.success) return Result.ok({ provenance: "current", value: parsed.data });
+      const legacy = legacyRunCancellationSchema.safeParse(value);
+      if (legacy.success) {
+        return Result.ok({
+          provenance: "migrated",
+          value: { ...legacy.data, version: 1 },
+        });
+      }
+      const version = persistedVersionSchema.safeParse(value);
+      if (version.success && version.data.version !== 1) {
+        return Result.err(
+          new RunCancellationUnsupportedVersion({
+            runId: input.runId,
+            version: version.data.version,
+            message: `Run cancellation marker '${input.runId}' has unsupported version ${version.data.version}.`,
+          }),
+        );
+      }
+      return Result.err(
+        new RunCancellationCorruptFields({
+          runId: input.runId,
+          message: `Run cancellation marker '${input.runId}' contains corrupt fields.`,
+        }),
+      );
+    },
+  });
 }
 
 export function decodeSessionIndex(
@@ -225,37 +246,40 @@ export function decodeSessionIndex(
     });
   }
   const decoded = parseJson(content);
-  if (decoded.status === "error") {
-    return Result.err(
-      new SessionIndexMalformedSerialization({
-        message:
-          decoded.error.cause instanceof Error
-            ? decoded.error.cause.message
-            : "Session index contains malformed JSON.",
-      }),
-    );
-  }
-  const parsed = sessionIndexSchema.safeParse(decoded.value);
-  if (parsed.success) return Result.ok({ provenance: "current", value: parsed.data });
-  const legacy = legacySessionIndexSchema.safeParse(decoded.value);
-  if (legacy.success) {
-    return Result.ok({
-      provenance: "migrated",
-      value: { version: 1, sessions: legacy.data.sessions },
-    });
-  }
-  const version = persistedVersionSchema.safeParse(decoded.value);
-  if (version.success && version.data.version !== 1) {
-    return Result.err(
-      new SessionIndexUnsupportedVersion({
-        version: version.data.version,
-        message: `Session index version ${version.data.version} is unsupported.`,
-      }),
-    );
-  }
-  return Result.err(
-    new SessionIndexCorruptFields({ message: "Session index contains corrupt fields." }),
-  );
+  return decoded.match<ResultType<SessionIndexRead, SessionIndexCodecError>>({
+    err: (error) =>
+      Result.err(
+        new SessionIndexMalformedSerialization({
+          message:
+            error.cause instanceof Error
+              ? error.cause.message
+              : "Session index contains malformed JSON.",
+        }),
+      ),
+    ok: (value) => {
+      const parsed = sessionIndexSchema.safeParse(value);
+      if (parsed.success) return Result.ok({ provenance: "current", value: parsed.data });
+      const legacy = legacySessionIndexSchema.safeParse(value);
+      if (legacy.success) {
+        return Result.ok({
+          provenance: "migrated",
+          value: { version: 1, sessions: legacy.data.sessions },
+        });
+      }
+      const version = persistedVersionSchema.safeParse(value);
+      if (version.success && version.data.version !== 1) {
+        return Result.err(
+          new SessionIndexUnsupportedVersion({
+            version: version.data.version,
+            message: `Session index version ${version.data.version} is unsupported.`,
+          }),
+        );
+      }
+      return Result.err(
+        new SessionIndexCorruptFields({ message: "Session index contains corrupt fields." }),
+      );
+    },
+  });
 }
 
 async function atomicWriteFile(
@@ -269,7 +293,8 @@ async function atomicWriteFile(
     `.${path.basename(filePath)}.${process.pid}.${Date.now()}.${randomUUID()}.tmp`,
   );
   const written = await captureExternal(operation, () => fs.writeFile(tempPath, content, "utf8"));
-  if (written.status === "error") return Result.err(written.error);
+  const writeError = written.match({ ok: () => undefined, err: (error) => error });
+  if (writeError !== undefined) return Result.err(writeError);
   return captureExternal(operation, () => fs.rename(tempPath, filePath));
 }
 
@@ -283,14 +308,16 @@ async function acquireSessionIndexLock(): Promise<
   const directory = await captureExternal("acquire-session-lock", () =>
     fs.mkdir(sessionsDir(), { recursive: true }),
   );
-  if (directory.status === "error") return Result.err(directory.error);
+  const directoryError = directory.match({ ok: () => undefined, err: (error) => error });
+  if (directoryError !== undefined) return Result.err(directoryError);
   const lockPath = sessionIndexLockPath();
   const deadline = Date.now() + 5_000;
 
   while (true) {
     const acquired = await captureExternal("acquire-session-lock", () => fs.mkdir(lockPath));
-    if (acquired.status === "ok") return Result.ok(undefined);
-    if (acquired.error.code !== "EEXIST") return Result.err(acquired.error);
+    const acquireError = acquired.match({ ok: () => undefined, err: (error) => error });
+    if (acquireError === undefined) return Result.ok(undefined);
+    if (acquireError.code !== "EEXIST") return Result.err(acquireError);
     if (Date.now() >= deadline) {
       return Result.err(
         new SessionIndexLockTimedOut({
@@ -308,7 +335,8 @@ async function withSessionIndexLock<T>(
   >,
 ): Promise<ResultType<T, SessionStoreError>> {
   const acquired = await acquireSessionIndexLock();
-  if (acquired.status === "error") return Result.err(acquired.error);
+  const acquireError = acquired.match({ ok: () => undefined, err: (error) => error });
+  if (acquireError !== undefined) return Result.err(acquireError);
 
   const attempted = await Result.tryPromise({
     try: work,
@@ -334,58 +362,58 @@ async function withSessionIndexLock<T>(
     });
   }
 
-  if (attempted.status === "error" && attempted.error.kind === "panic") {
-    if (cleanupAttempted.status === "ok") {
-      if (cleanupAttempted.value.status === "error") {
-        recordAcpCleanupFailure(attempted.error.panic, cleanupAttempted.value.error);
-      }
+  const workCaptureFailure = attempted.match({ ok: () => undefined, err: (failure) => failure });
+  const cleanupCaptureFailure = cleanupAttempted.match({
+    ok: () => undefined,
+    err: (failure) => failure,
+  });
+  if (workCaptureFailure?.kind === "panic") {
+    if (cleanupCaptureFailure === undefined) {
+      const cleanupResult = cleanupAttempted.match({ ok: (value) => value, err: () => undefined });
+      const cleanupError = cleanupResult?.match({ ok: () => undefined, err: (error) => error });
+      if (cleanupError !== undefined)
+        recordAcpCleanupFailure(workCaptureFailure.panic, cleanupError);
     } else {
       const cleanupFailure =
-        cleanupAttempted.error.kind === "panic"
-          ? cleanupAttempted.error.panic
-          : ordinaryCaptureToExternal("remove-session-lock", cleanupAttempted.error);
-      recordAcpCleanupFailure(attempted.error.panic, cleanupFailure);
+        cleanupCaptureFailure.kind === "panic"
+          ? cleanupCaptureFailure.panic
+          : ordinaryCaptureToExternal("remove-session-lock", cleanupCaptureFailure);
+      recordAcpCleanupFailure(workCaptureFailure.panic, cleanupFailure);
     }
-    return signalAcpDefect(attempted.error.panic);
+    return signalAcpDefect(workCaptureFailure.panic);
   }
 
-  let result: ResultType<
-    T,
-    ExternalOperationFailed | SessionIndexCodecError | SessionIndexLockTimedOut
-  >;
-  if (attempted.status === "ok") {
-    result = attempted.value;
-  } else {
-    switch (attempted.error.kind) {
-      case "panic":
-        return signalAcpDefect(attempted.error.panic);
-      case "ordinary":
-        result = Result.err(ordinaryCaptureToExternal("session-index-work", attempted.error));
-        break;
-    }
-  }
+  const resultOrPanic = attempted.match<
+    | ResultType<T, ExternalOperationFailed | SessionIndexCodecError | SessionIndexLockTimedOut>
+    | Panic
+  >({
+    ok: (value) => value,
+    err: (failure) =>
+      failure.kind === "panic"
+        ? failure.panic
+        : Result.err(ordinaryCaptureToExternal("session-index-work", failure)),
+  });
+  if (Panic.is(resultOrPanic)) return signalAcpDefect(resultOrPanic);
+  const result = resultOrPanic;
 
-  let cleanup: ResultType<void, ExternalOperationFailed>;
-  if (cleanupAttempted.status === "ok") {
-    cleanup = cleanupAttempted.value;
-  } else {
-    switch (cleanupAttempted.error.kind) {
-      case "panic":
-        return signalAcpDefect(cleanupAttempted.error.panic);
-      case "ordinary":
-        cleanup = Result.err(
-          ordinaryCaptureToExternal("remove-session-lock", cleanupAttempted.error),
-        );
-        break;
-    }
-  }
-  if (cleanup.status === "ok") return result;
-  if (result.status === "ok") return Result.err(cleanup.error);
+  const cleanupOrPanic = cleanupAttempted.match<ResultType<void, ExternalOperationFailed> | Panic>({
+    ok: (value) => value,
+    err: (failure) =>
+      failure.kind === "panic"
+        ? failure.panic
+        : Result.err(ordinaryCaptureToExternal("remove-session-lock", failure)),
+  });
+  if (Panic.is(cleanupOrPanic)) return signalAcpDefect(cleanupOrPanic);
+  const cleanup = cleanupOrPanic;
+  const cleanupError = cleanup.match({ ok: () => undefined, err: (error) => error });
+  if (cleanupError === undefined) return result;
+  const resultError = result.match({ ok: () => undefined, err: (error) => error });
+  if (resultError === undefined) return Result.err(cleanupError);
   return Result.err(
     new WorkAndCleanupFailed({
-      primary: result.error,
-      cleanup: cleanup.error,
-      message: `${result.error.message} Session index lock cleanup also failed.`,
+      primary: resultError,
+      cleanup: cleanupError,
+      message: `${resultError.message} Session index lock cleanup also failed.`,
     }),
   );
 }
@@ -396,7 +424,8 @@ export async function saveRunRecord(
   const directory = await captureExternal("write-run", () =>
     fs.mkdir(runsDir(), { recursive: true }),
   );
-  if (directory.status === "error") return Result.err(directory.error);
+  const directoryError = directory.match({ ok: () => undefined, err: (error) => error });
+  if (directoryError !== undefined) return Result.err(directoryError);
   return atomicWriteFile(runFilePath(run.id), `${JSON.stringify(run)}\n`, "write-run");
 }
 
@@ -405,10 +434,13 @@ export async function loadRunCancellation(
 ): Promise<ResultType<number | undefined, RunStoreError>> {
   const markerPath = runCancellationPath(run.id);
   const marker = await captureExternal("read-run", () => fs.lstat(markerPath));
-  if (marker.status === "error") {
-    return marker.error.code === "ENOENT" ? Result.ok(undefined) : Result.err(marker.error);
+  const markerError = marker.match({ ok: () => undefined, err: (error) => error });
+  if (markerError !== undefined) {
+    return markerError.code === "ENOENT" ? Result.ok(undefined) : Result.err(markerError);
   }
-  if (marker.value.isSymbolicLink() || !marker.value.isFile()) {
+  const markerStat = marker.match({ ok: (value) => value, err: () => undefined });
+  if (markerStat === undefined) return Result.ok(undefined);
+  if (markerStat.isSymbolicLink() || !markerStat.isFile()) {
     return Result.err(
       new RunCancellationMarkerInvalidType({
         runId: run.id,
@@ -417,16 +449,19 @@ export async function loadRunCancellation(
     );
   }
   const content = await captureExternal("read-run", () => fs.readFile(markerPath, "utf8"));
-  if (content.status === "error") return Result.err(content.error);
-  const decoded = decodeRunCancellation({ runId: run.id, content: content.value });
-  if (decoded.status === "error") return Result.err(decoded.error);
-  if (
-    decoded.value.value.runCreatedAt !== run.createdAt ||
-    decoded.value.value.requestedAt < run.createdAt
-  ) {
+  const contentError = content.match({ ok: () => undefined, err: (error) => error });
+  if (contentError !== undefined) return Result.err(contentError);
+  const text = content.match({ ok: (value) => value, err: () => undefined });
+  if (text === undefined) return Result.ok(undefined);
+  const decoded = decodeRunCancellation({ runId: run.id, content: text });
+  const decodeError = decoded.match({ ok: () => undefined, err: (error) => error });
+  if (decodeError !== undefined) return Result.err(decodeError);
+  const cancellation = decoded.match({ ok: (value) => value.value, err: () => undefined });
+  if (cancellation === undefined) return Result.ok(undefined);
+  if (cancellation.runCreatedAt !== run.createdAt || cancellation.requestedAt < run.createdAt) {
     return Result.ok(undefined);
   }
-  return Result.ok(decoded.value.value.requestedAt);
+  return Result.ok(cancellation.requestedAt);
 }
 
 function applyRunCancellation(
@@ -456,17 +491,32 @@ export async function saveWorkerRunRecord(
   run: PromptRunRecord,
 ): Promise<ResultType<PromptRunRecord, RunStoreError>> {
   const cancellationBefore = await loadRunCancellation(run);
-  if (cancellationBefore.status === "error") return Result.err(cancellationBefore.error);
-  let next = applyRunCancellation(run, cancellationBefore.value);
+  const cancellationBeforeError = cancellationBefore.match({
+    ok: () => undefined,
+    err: (error) => error,
+  });
+  if (cancellationBeforeError !== undefined) return Result.err(cancellationBeforeError);
+  const before = cancellationBefore.match({ ok: (value) => value, err: () => undefined });
+  let next = applyRunCancellation(run, before);
   const saved = await saveRunRecord(next);
-  if (saved.status === "error") return Result.err(saved.error);
+  const saveError = saved.match({ ok: () => undefined, err: (error) => error });
+  if (saveError !== undefined) return Result.err(saveError);
 
   const cancellationAfter = await loadRunCancellation(run);
-  if (cancellationAfter.status === "error") return Result.err(cancellationAfter.error);
-  const merged = applyRunCancellation(next, cancellationAfter.value);
+  const cancellationAfterError = cancellationAfter.match({
+    ok: () => undefined,
+    err: (error) => error,
+  });
+  if (cancellationAfterError !== undefined) return Result.err(cancellationAfterError);
+  const after = cancellationAfter.match({ ok: (value) => value, err: () => undefined });
+  const merged = applyRunCancellation(next, after);
   if (merged !== next) {
     const cancellationSaved = await saveRunRecord(merged);
-    if (cancellationSaved.status === "error") return Result.err(cancellationSaved.error);
+    const cancellationSaveError = cancellationSaved.match({
+      ok: () => undefined,
+      err: (error) => error,
+    });
+    if (cancellationSaveError !== undefined) return Result.err(cancellationSaveError);
     next = merged;
   }
   return Result.ok(next);
@@ -484,7 +534,8 @@ export async function commitRunCancellationRequest(
   const directory = await captureExternal("write-run", () =>
     fs.mkdir(runsDir(), { recursive: true }),
   );
-  if (directory.status === "error") return Result.err(directory.error);
+  const directoryError = directory.match({ ok: () => undefined, err: (error) => error });
+  if (directoryError !== undefined) return Result.err(directoryError);
   const requestedAt = run.cancelRequestedAt ?? Math.max(Date.now(), run.createdAt);
   const marked = await atomicWriteFile(
     runCancellationPath(run.id),
@@ -495,23 +546,32 @@ export async function commitRunCancellationRequest(
     } satisfies RunCancellation)}\n`,
     "write-run",
   );
-  if (marked.status === "error") return Result.err(marked.error);
+  const markError = marked.match({ ok: () => undefined, err: (error) => error });
+  if (markError !== undefined) return Result.err(markError);
   const current = await loadRunRecord(run.id);
-  if (current.status === "error") return Result.err(current.error);
-  return Result.ok({ kind: "requested", run: current.value });
+  return current.map((value) => ({ kind: "requested" as const, run: value }));
 }
 
 export async function requestRunCancellation(
   runId: string,
 ): Promise<ResultType<RunCancellationRequestOutcome, RunStoreError>> {
   const safeRunId = validateRunId(runId);
-  if (safeRunId.status === "error") return Result.err(safeRunId.error);
-  const loaded = await loadRunRecord(safeRunId.value);
-  if (loaded.status === "error") return Result.err(loaded.error);
-  if (isTerminalRunStatus(loaded.value.status)) {
-    return Result.ok({ kind: "already-terminal", run: loaded.value });
+  const id = safeRunId.match<string | InvalidRunId>({
+    ok: (value) => value,
+    err: (error) => error,
+  });
+  if (InvalidRunId.is(id)) return Result.err(id);
+  const loaded = await loadRunRecord(id);
+  const loadError = loaded.match({ ok: () => undefined, err: (error) => error });
+  if (loadError !== undefined) return Result.err(loadError);
+  const current = loaded.match({ ok: (value) => value, err: () => undefined });
+  if (current === undefined) {
+    return loaded.map((value) => ({ kind: "already-terminal" as const, run: value }));
   }
-  return commitRunCancellationRequest(loaded.value);
+  if (isTerminalRunStatus(current.status)) {
+    return Result.ok({ kind: "already-terminal", run: current });
+  }
+  return commitRunCancellationRequest(current);
 }
 
 export type RunCancellationObservation = {
@@ -526,8 +586,11 @@ export async function observeRunCancellation(
   ) => Promise<ResultType<number | undefined, RunStoreError>> = loadRunCancellation,
 ): Promise<ResultType<RunCancellationObservation, ExternalOperationFailed>> {
   const watched = await captureExternal("watch-run-cancellation", async () => watch(runsDir()));
-  if (watched.status === "error") return Result.err(watched.error);
-  const watcher = watched.value;
+  const watcher = watched.match<ReturnType<typeof watch> | ExternalOperationFailed>({
+    ok: (value) => value,
+    err: (error) => error,
+  });
+  if (ExternalOperationFailed.is(watcher)) return Result.err(watcher);
   let accepting = true;
   let settled = false;
   let resolveResult: (result: ResultType<"requested" | "stopped", RunStoreError>) => void = () =>
@@ -561,32 +624,35 @@ export async function observeRunCancellation(
         try: () => inspect(run),
         catch: captureAcpFailure,
       });
-      if (inspected.status === "error") {
-        switch (inspected.error.kind) {
+      const inspectionFailure = inspected.match({ ok: () => undefined, err: (failure) => failure });
+      if (inspectionFailure !== undefined) {
+        switch (inspectionFailure.kind) {
           case "panic":
-            settlePanic(inspected.error);
+            settlePanic(inspectionFailure);
             return;
           case "ordinary":
             settle(
               Result.err(
                 new ExternalOperationFailed({
                   operation: "watch-run-cancellation",
-                  cause: inspected.error.cause,
-                  ...(inspected.error.projection.code
-                    ? { code: inspected.error.projection.code }
+                  cause: inspectionFailure.cause,
+                  ...(inspectionFailure.projection.code
+                    ? { code: inspectionFailure.projection.code }
                     : {}),
-                  message: inspected.error.projection.message,
+                  message: inspectionFailure.projection.message,
                 }),
               ),
             );
             return;
         }
       }
-      if (inspected.value.status === "error") {
-        settle(Result.err(inspected.value.error));
-      } else if (inspected.value.value !== undefined) {
-        settle(Result.ok("requested"));
-      }
+      const inspection = inspected.match({ ok: (value) => value, err: () => undefined });
+      inspection?.match({
+        err: (error) => settle(Result.err(error)),
+        ok: (value) => {
+          if (value !== undefined) settle(Result.ok("requested"));
+        },
+      });
     });
   };
   watcher.on("change", scheduleCheck);
@@ -618,7 +684,7 @@ export async function observeRunCancellation(
       );
       await pendingCheck;
       if (!settled) settle(Result.ok("stopped"));
-      return closed.status === "error" ? Result.err(closed.error) : Result.ok(undefined);
+      return closed.map(() => undefined);
     })();
     return closeResult;
   };
@@ -633,16 +699,22 @@ export async function loadRunRecord(
   runId: string,
 ): Promise<ResultType<PromptRunRecord, RunStoreError>> {
   const safeRunId = validateRunId(runId);
-  if (safeRunId.status === "error") return Result.err(safeRunId.error);
-  const content = await captureExternal("read-run", () =>
-    fs.readFile(runFilePath(safeRunId.value), "utf8"),
-  );
-  if (content.status === "error") return Result.err(content.error);
-  const decoded = decodeRunRecord({ runId: safeRunId.value, content: content.value });
-  if (decoded.status === "error") return Result.err(decoded.error);
-  const cancellation = await loadRunCancellation(decoded.value.value);
-  if (cancellation.status === "error") return Result.err(cancellation.error);
-  return Result.ok(applyRunCancellation(decoded.value.value, cancellation.value));
+  const id = safeRunId.match<string | InvalidRunId>({
+    ok: (value) => value,
+    err: (error) => error,
+  });
+  if (InvalidRunId.is(id)) return Result.err(id);
+  const content = await captureExternal("read-run", () => fs.readFile(runFilePath(id), "utf8"));
+  const contentError = content.match({ ok: () => undefined, err: (error) => error });
+  if (contentError !== undefined) return Result.err(contentError);
+  const text = content.match({ ok: (value) => value, err: () => "" });
+  const decoded = decodeRunRecord({ runId: id, content: text });
+  const decodeError = decoded.match({ ok: () => undefined, err: (error) => error });
+  if (decodeError !== undefined) return Result.err(decodeError);
+  const record = decoded.match({ ok: (value) => value.value, err: () => undefined });
+  if (record === undefined) return decoded.map((value) => value.value);
+  const cancellation = await loadRunCancellation(record);
+  return cancellation.map((requestedAt) => applyRunCancellation(record, requestedAt));
 }
 
 async function saveSessionIndex(
@@ -651,7 +723,8 @@ async function saveSessionIndex(
   const directory = await captureExternal("write-session-index", () =>
     fs.mkdir(sessionsDir(), { recursive: true }),
   );
-  if (directory.status === "error") return Result.err(directory.error);
+  const directoryError = directory.match({ ok: () => undefined, err: (error) => error });
+  if (directoryError !== undefined) return Result.err(directoryError);
   const payload: SessionIndex = { version: 1, sessions: [...entries] };
   return atomicWriteFile(sessionIndexPath(), `${JSON.stringify(payload)}\n`, "write-session-index");
 }
@@ -662,17 +735,18 @@ export async function loadSessionIndex(): Promise<
   const content = await captureExternal("read-session-index", () =>
     fs.readFile(sessionIndexPath(), "utf8"),
   );
-  if (content.status === "error") {
-    if (content.error.code === "ENOENT") {
+  const contentError = content.match({ ok: () => undefined, err: (error) => error });
+  if (contentError !== undefined) {
+    if (contentError.code === "ENOENT") {
       return Result.ok({
         provenance: "missing-defaulted",
         value: { version: 1, sessions: [] },
       });
     }
-    return Result.err(content.error);
+    return Result.err(contentError);
   }
-  const decoded = decodeSessionIndex(content.value);
-  return decoded.status === "ok" ? Result.ok(decoded.value) : Result.err(decoded.error);
+  const text = content.match({ ok: (value) => value, err: () => "" });
+  return decodeSessionIndex(text);
 }
 
 const fixtureRunId = "run_11111111-1111-4111-8111-111111111111";
@@ -798,8 +872,11 @@ export async function upsertSessionIndexEntries(
 ): Promise<ResultType<SessionIndex, SessionStoreError>> {
   return withSessionIndexLock(async () => {
     const loaded = await loadSessionIndex();
-    if (loaded.status === "error") return Result.err(loaded.error);
-    const merged = new Map(loaded.value.value.sessions.map((entry) => [entry.sessionRef, entry]));
+    const loadError = loaded.match({ ok: () => undefined, err: (error) => error });
+    if (loadError !== undefined) return Result.err(loadError);
+    const index = loaded.match({ ok: (value) => value.value, err: () => undefined });
+    if (index === undefined) return loaded.map((value) => value.value);
+    const merged = new Map(index.sessions.map((entry) => [entry.sessionRef, entry]));
     for (const entry of entries) {
       const previous = merged.get(entry.sessionRef);
       merged.set(entry.sessionRef, {
@@ -810,7 +887,7 @@ export async function upsertSessionIndexEntries(
     }
     const next: SessionIndex = { version: 1, sessions: [...merged.values()] };
     const saved = await saveSessionIndex(next.sessions);
-    return saved.status === "ok" ? Result.ok(next) : Result.err(saved.error);
+    return saved.map(() => next);
   });
 }
 
@@ -820,12 +897,15 @@ export async function setLocalSessionTitle(
 ): Promise<ResultType<SessionIndex, SessionStoreError>> {
   return withSessionIndexLock(async () => {
     const loaded = await loadSessionIndex();
-    if (loaded.status === "error") return Result.err(loaded.error);
-    const nextSessions = loaded.value.value.sessions.map((entry) =>
+    const loadError = loaded.match({ ok: () => undefined, err: (error) => error });
+    if (loadError !== undefined) return Result.err(loadError);
+    const index = loaded.match({ ok: (value) => value.value, err: () => undefined });
+    if (index === undefined) return loaded.map((value) => value.value);
+    const nextSessions = index.sessions.map((entry) =>
       entry.sessionRef === sessionRef ? { ...entry, localTitle, title: localTitle } : entry,
     );
     const next: SessionIndex = { version: 1, sessions: nextSessions };
     const saved = await saveSessionIndex(next.sessions);
-    return saved.status === "ok" ? Result.ok(next) : Result.err(saved.error);
+    return saved.map(() => next);
   });
 }

@@ -51,7 +51,7 @@ async function isExecutable(
   const accessed = await captureExternal("access-harness", () =>
     fs.access(filePath, constants.X_OK),
   );
-  return accessed.status === "ok" ? Result.ok(true) : Result.err(accessed.error);
+  return accessed.map(() => true);
 }
 
 async function resolveCommand(
@@ -59,8 +59,7 @@ async function resolveCommand(
 ): Promise<ResultType<string | null, ExternalOperationFailed>> {
   if (command.includes(path.sep)) {
     const executable = await isExecutable(command);
-    if (executable.status === "error") return Result.err(executable.error);
-    return Result.ok(executable.value ? command : null);
+    return executable.map((value) => (value ? command : null));
   }
 
   const extensions =
@@ -77,11 +76,15 @@ async function resolveCommand(
         process.platform === "win32" ? `${command}${extension}` : command,
       );
       const executable = await isExecutable(fullPath);
-      if (executable.status === "error") {
-        if (executable.error.code === "ENOENT" || executable.error.code === "EACCES") continue;
-        return Result.err(executable.error);
-      }
-      if (executable.value) return Result.ok(fullPath);
+      const resolution = executable.match<ResultType<
+        string | null,
+        ExternalOperationFailed
+      > | null>({
+        ok: (value) => (value ? Result.ok(fullPath) : null),
+        err: (error) =>
+          error.code === "ENOENT" || error.code === "EACCES" ? null : Result.err(error),
+      });
+      if (resolution !== null) return resolution;
     }
   }
 
@@ -104,11 +107,13 @@ export async function resolveHarness(
 
   for (const candidate of descriptor.launchCandidates) {
     const resolvedCommand = await resolveCommand(candidate.command);
-    if (resolvedCommand.status === "error") return Result.err(resolvedCommand.error);
-    if (!resolvedCommand.value) continue;
+    const resolutionError = resolvedCommand.match({ ok: () => undefined, err: (error) => error });
+    if (resolutionError !== undefined) return Result.err(resolutionError);
+    const command = resolvedCommand.match({ ok: (value) => value, err: () => null });
+    if (!command) continue;
     return Result.ok({
       descriptor,
-      command: resolvedCommand.value,
+      command,
       args: candidate.args,
       source: candidate.source,
     });
@@ -139,14 +144,16 @@ export async function listResolvedHarnesses(): Promise<
 
   for (const descriptor of BUILTIN_HARNESSES) {
     const resolved = await resolveHarness(descriptor.id);
-    if (resolved.status === "error") return Result.err(resolved.error);
-    if (resolved.value) {
+    const resolutionError = resolved.match({ ok: () => undefined, err: (error) => error });
+    if (resolutionError !== undefined) return Result.err(resolutionError);
+    const harness = resolved.match({ ok: (value) => value, err: () => null });
+    if (harness) {
       results.push({
         descriptor,
         launchable: true,
-        command: resolved.value.command,
-        args: resolved.value.args,
-        source: resolved.value.source,
+        command: harness.command,
+        args: harness.args,
+        source: harness.source,
       });
       continue;
     }

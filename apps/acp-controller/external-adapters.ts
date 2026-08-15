@@ -39,7 +39,8 @@ export function captureAcpFailure(cause: unknown): CapturedAcpFailure {
     try: () => (Panic.is(cause) ? cause : null),
     catch: () => null,
   });
-  if (panic.status === "ok" && panic.value) return { kind: "panic", panic: panic.value };
+  const capturedPanic = panic.match({ ok: (value) => value, err: () => null });
+  if (capturedPanic) return { kind: "panic", panic: capturedPanic };
   const projection = projectExternalFailure(cause);
   return {
     kind: "ordinary",
@@ -60,7 +61,8 @@ export function projectExternalFailure(cause: unknown): ExternalFailureProjectio
     },
     catch: () => null,
   });
-  if (errorProjection.status === "ok" && errorProjection.value) return errorProjection.value;
+  const projected = errorProjection.match({ ok: (value) => value, err: () => null });
+  if (projected) return projected;
   switch (typeof cause) {
     case "string":
       return { message: cause };
@@ -98,14 +100,19 @@ export async function captureExternal<T>(
     try: run,
     catch: captureAcpFailure,
   });
-  if (captured.status === "ok") return Result.ok(captured.value);
-  if (captured.error.kind === "panic") return signalAcpDefect(captured.error.panic);
-  return Result.err(
-    new ExternalOperationFailed({
-      operation,
-      cause: captured.error.cause,
-      ...(captured.error.projection.code ? { code: captured.error.projection.code } : {}),
-      message: message ?? captured.error.projection.message,
-    }),
-  );
+  const outcome = captured.match<ResultType<T, ExternalOperationFailed> | (() => never)>({
+    ok: (value) => Result.ok(value),
+    err: (failure) =>
+      failure.kind === "panic"
+        ? () => signalAcpDefect(failure.panic)
+        : Result.err(
+            new ExternalOperationFailed({
+              operation,
+              cause: failure.cause,
+              ...(failure.projection.code ? { code: failure.projection.code } : {}),
+              message: message ?? failure.projection.message,
+            }),
+          ),
+  });
+  return typeof outcome === "function" ? outcome() : outcome;
 }
