@@ -1927,6 +1927,7 @@ describe("Stage 6 persistence and SQLite architecture", () => {
       ruleZones: {
         "architecture/sqlite-transaction-adapter-contract": [{ include: "stage6-transactions.ts" }],
         "architecture/no-result-err-in-sqlite-callback": [{ include: "stage6-transactions.ts" }],
+        "architecture/no-manual-result-branching": [{ include: "stage6-transactions.ts" }],
       },
       sqliteTransactionAdapters: [transactionAdapter],
       operationalResultApis: [transactionAdapter.identity],
@@ -1943,6 +1944,12 @@ describe("Stage 6 persistence and SQLite architecture", () => {
     expect(
       findings.filter(({ rule }) => rule === "architecture/sqlite-transaction-adapter-contract"),
     ).toEqual([]);
+    expect(
+      findings.filter(({ rule }) => rule === "architecture/no-manual-result-branching"),
+    ).toHaveLength(1);
+    expect(
+      findings.find(({ rule }) => rule === "architecture/no-manual-result-branching")?.identity,
+    ).toContain("inspectAdapterOwnedStatus");
   });
 
   test("rejects non-private sentinels and inexact Panic or driver classifiers", () => {
@@ -2350,6 +2357,48 @@ describe("permanent architecture governance", () => {
 });
 
 describe("real declaration integration", () => {
+  test("rejects manual Result branch discrimination through real better-result declarations and aliases", () => {
+    const workspace = {
+      ...BASE_WORKSPACE,
+      name: "real-libraries-manual-result-branching",
+      packageName: "architecture-real-libraries",
+      root: "scripts/architecture/fixtures/real-libraries",
+      tsconfig: "scripts/architecture/fixtures/real-libraries/tsconfig.json",
+      ruleZones: {
+        "architecture/no-manual-result-branching": [
+          { include: "manual-result-branching-invalid.ts" },
+        ],
+      },
+    } satisfies WorkspaceArchitecture;
+    const workspaceProgram = createWorkspaceProgram(REPOSITORY_ROOT, workspace);
+    const findings = analyzeWorkspace(workspace, workspaceProgram.root, workspaceProgram.program);
+
+    expect(findings).toHaveLength(22);
+    expect(findings.map((finding) => finding.location?.line)).toEqual([
+      14, 18, 22, 26, 32, 37, 38, 42, 43, 47, 48, 52, 52, 58, 58, 58, 66, 70, 74, 81, 98, 102,
+    ]);
+  });
+
+  test("permits structural domain statuses, serialized envelopes, and Result composition", () => {
+    const workspace = {
+      ...BASE_WORKSPACE,
+      name: "real-libraries-valid-result-composition",
+      packageName: "architecture-real-libraries",
+      root: "scripts/architecture/fixtures/real-libraries",
+      tsconfig: "scripts/architecture/fixtures/real-libraries/tsconfig.json",
+      ruleZones: {
+        "architecture/no-manual-result-branching": [
+          { include: "manual-result-branching-valid.ts" },
+        ],
+      },
+    } satisfies WorkspaceArchitecture;
+    const workspaceProgram = createWorkspaceProgram(REPOSITORY_ROOT, workspace);
+
+    expect(analyzeWorkspace(workspace, workspaceProgram.root, workspaceProgram.program)).toEqual(
+      [],
+    );
+  });
+
   test("recognizes real installed zod and better-result 3.0 declarations", () => {
     const workspace = {
       ...BASE_WORKSPACE,
@@ -2860,6 +2909,19 @@ describe("gate infrastructure", () => {
       "fixture.ts#firstProjection[AsExpression]@1",
       "fixture.ts#secondProjection[AsExpression]@1",
     ]);
+  });
+
+  test("real workspace subprocess reports manual Result branching", async () => {
+    const result = await runFixtureWorkspaceProcess(
+      `${WORKSPACE_RUNNER_FIXTURE_ROOT}/manual-result`,
+    );
+
+    expect(result.exitCode).toBe(ARCHITECTURE_FINDINGS_EXIT_CODE);
+    expect(result.stdout).toBe("");
+    expect(result.stderr).toMatch(
+      /^fixture-manual-result\/fixture\.ts:\d+:\d+ error architecture\/no-manual-result-branching: /,
+    );
+    expect(result.stderr).toContain("reconstructs both Result branch envelopes");
   });
 
   test("maps a real workspace subprocess error to fail-closed parent behavior", async () => {

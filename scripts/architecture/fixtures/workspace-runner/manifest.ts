@@ -27,6 +27,13 @@ const EMPTY_POLICY = {
   eventDeliveryConsumers: [],
 } as const;
 
+const MANUAL_RESULT_POLICY = {
+  ...EMPTY_POLICY,
+  ruleZones: {
+    "architecture/no-manual-result-branching": [{ include: "**" }],
+  },
+} as const;
+
 const workspaces = [
   {
     ...EMPTY_POLICY,
@@ -41,6 +48,13 @@ const workspaces = [
     packageName: "architecture-workspace-runner-findings-fixture",
     root: "scripts/architecture/fixtures/workspace-runner/findings",
     tsconfig: "scripts/architecture/fixtures/workspace-runner/findings/tsconfig.json",
+  },
+  {
+    ...MANUAL_RESULT_POLICY,
+    name: "fixture-manual-result",
+    packageName: "architecture-workspace-runner-manual-result-fixture",
+    root: "scripts/architecture/fixtures/workspace-runner/manual-result",
+    tsconfig: "scripts/architecture/fixtures/workspace-runner/manual-result/tsconfig.json",
   },
 ] as const satisfies readonly WorkspaceArchitecture[];
 

@@ -60,8 +60,14 @@ owning registration, review the derived catalog metadata, then update the digest
 ## Permanent Rules
 
 Semantic rules enforce boundary decoding, domain-owned `unknown`, assertion and predicate safety, closed
-union exhaustiveness, Result handling, Panic registration, compatibility serialization, redacted
-TaggedError logging, event delivery, persisted codecs, and SQLite transaction atomicity.
+union exhaustiveness, declarative Result handling, Panic registration, compatibility serialization,
+redacted TaggedError logging, event delivery, persisted codecs, and SQLite transaction atomicity.
+Production code must compose actual `better-result` values through `match`, `map`, `mapError`, `andThen`,
+`tryRecover`, `gen`, or collection helpers instead of reading branch discriminants, invoking branch guards,
+or extracting with `unwrap`. The analyzer resolves aliases and the installed library declarations so domain
+objects and serialized compatibility envelopes with their own `status` fields remain unaffected.
+Actual Result `match` calls also may not rebuild both `{ status: "ok", value }` and
+`{ status: "error", error }` branches; domain projections and `Result.codec` envelopes remain valid.
 
 The syntax gate rejects unregistered exception flow, inline async Result callbacks, presentation decoder
 imports, store-owned inline decoding, and direct SQLite transactions. Oxlint also applies the permanent
@@ -103,6 +109,11 @@ rollback sentinel, Panic classifier, and SQLite driver classifier. The adapter m
 - return only failures recognized by the exact registered SQLite driver classifier;
 - rethrow every unrecognized thrown value as a defect; and
 - be linked in `operationalResultApis`.
+
+The direct Err discriminator required inside that exact driver callback is the only registered exception
+to declarative Result handling. The analyzer derives it from the SQLite adapter registration and verifies
+that the branch throws the registered private rollback sentinel; registration does not exempt other Result
+branching in the adapter.
 
 `architecture/no-result-err-in-sqlite-callback` resolves the actual `bun:sqlite` callback and
 `better-result` declarations. It rejects inline `Result.err` and named callbacks whose return type

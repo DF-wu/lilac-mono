@@ -296,6 +296,7 @@ export const FINAL_PACKAGE_WIDE_ARCHITECTURE_RULES = [
   "architecture/closed-union-exhaustiveness",
   "architecture/closed-union-map-exhaustiveness",
   "architecture/no-production-unwrap",
+  "architecture/no-manual-result-branching",
   "architecture/no-unmapped-result-capture",
   "architecture/no-unhandled-exception-contract",
   "architecture/registered-panic-site",
@@ -759,18 +760,18 @@ const CORE_PARTITION_8_EXCEPTION_ADAPTERS = [
     },
   ]),
   ...[
-    ["src/discovery/discovery-service.ts", "adaptDiscoverySearchInputResultToHost"],
-    ["src/discovery/discovery-service.ts", "adaptDiscoverySearchResultToHost"],
-    ["src/discovery/discovery-service.ts", "adaptDiscoveryCloseResultToHost"],
+    ["src/discovery/discovery-service.ts", "adaptDiscoverySearchInputResultToHost.err.<callback>"],
+    ["src/discovery/discovery-service.ts", "adaptDiscoverySearchResultToHost.err.<callback>"],
+    ["src/discovery/discovery-service.ts", "adaptDiscoveryCloseResultToHost.err.<callback>"],
     [
       "src/shared/attachment-utils.ts",
-      "resolveToolPathForRequestContext",
+      "resolveToolPathForRequestContext.err.<callback>",
       "resolveToolPathForRequestContextResult",
     ],
-    ["src/shared/attachment-utils.ts", "decodeDataUrl", "decodeDataUrlResult"],
+    ["src/shared/attachment-utils.ts", "decodeDataUrl.err.<callback>", "decodeDataUrlResult"],
     ["src/shared/req-context.ts", "requireRequestContext"],
     ["src/shared/tool-server-context.ts", "requireToolServerHeaders"],
-    ["src/ssh/ssh-config.ts", "requireConfiguredSshHost"],
+    ["src/ssh/ssh-config.ts", "requireConfiguredSshHost.err.<callback>"],
   ].map(([module, exportName, externalExportName]) => ({
     identity: { module: module!, exportName: exportName! },
     category: "result-to-framework" as const,
@@ -2559,7 +2560,7 @@ const CORE_TOOL_SERVER_EXCEPTION_ADAPTERS = [
   ...[
     [
       "src/tool-server/tools/programmatic-workflow.ts",
-      "adaptWorkflowJsonProjectionResultToToolHost",
+      "adaptWorkflowJsonProjectionResultToToolHost.err.<callback>",
       "programmatic workflow tool projection",
     ],
   ].map(([module, exportName, externalExportName]) => ({
@@ -7848,31 +7849,6 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
             {
               identity: {
                 module: "src/workflow/workflow-artifact-store.ts",
-                exportName: "writeWorkflowValueArtifact",
-              },
-              category: "defect-supervisor",
-              externalApi: { package: "better-result", exportName: "Panic" },
-              direction: "signal-host",
-              reason:
-                "Signals Panic when an atomically published workflow artifact cannot be verified.",
-            },
-            {
-              identity: {
-                module: "src/workflow/workflow-artifact-store.ts",
-                exportName: "adaptWorkflowArtifactResultToException",
-              },
-              category: "result-to-framework",
-              externalApi: {
-                package: "@stanley2058/lilac-core",
-                exportName: "workflow orchestration exception contract",
-              },
-              direction: "signal-host",
-              reason:
-                "Adapts typed artifact failures only where legacy workflow orchestration requires rejection.",
-            },
-            {
-              identity: {
-                module: "src/workflow/workflow-artifact-store.ts",
                 exportName: "rethrowWorkflowArtifactPanic",
               },
               category: "defect-supervisor",
@@ -7893,7 +7869,8 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
             {
               identity: {
                 module: "src/conversation/thread-service.ts",
-                exportName: "createConversationThreadToolService.resolvePersistenceOperation",
+                exportName:
+                  "createConversationThreadToolService.resolvePersistenceOperation.err.<callback>",
               },
               category: "result-to-framework",
               externalApi: {
@@ -8046,48 +8023,6 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
                 reason: "Maps an event-bus rejection to an owned wait resolver Result error.",
               },
             ]),
-            ...[
-              [
-                "src/workflow/workflow-action-resolver.ts",
-                "adaptWorkflowActionSubscriptionStartResultToHost",
-                "startWorkflowActionResolver",
-              ],
-              [
-                "src/workflow/workflow-action-resolver.ts",
-                "adaptWorkflowActionSubscriptionStopResultToHost",
-                "WorkflowActionResolver.stop",
-              ],
-              [
-                "src/workflow/workflow-progress-projector.ts",
-                "adaptWorkflowProgressSubscriptionStartResultToHost",
-                "WorkflowProgressProjector.start",
-              ],
-              [
-                "src/workflow/workflow-progress-projector.ts",
-                "adaptWorkflowProgressSubscriptionStopResultToHost",
-                "WorkflowProgressProjector.stop",
-              ],
-              [
-                "src/workflow/workflow-wait-resolver.ts",
-                "adaptWorkflowWaitResolverStartResultToHost",
-                "WorkflowWaitResolver.start",
-              ],
-              [
-                "src/workflow/workflow-wait-resolver.ts",
-                "adaptWorkflowWaitResolverStopResultToHost",
-                "WorkflowWaitResolver.stop",
-              ],
-            ].map(([module, exportName, externalExportName]) => ({
-              identity: { module, exportName },
-              category: "result-to-framework" as const,
-              externalApi: {
-                package: "@stanley2058/lilac-core",
-                exportName: externalExportName,
-              },
-              direction: "signal-host" as const,
-              reason:
-                "Adapts a typed event-bus subscription Result to the owner's existing lifecycle rejection contract.",
-            })),
             {
               identity: {
                 module: "src/workflow/workflow-engine.ts",
@@ -8122,11 +8057,7 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
                 reason: `Maps workflow ${operation} rejection to an owned Result error.`,
               },
             ]),
-            ...[
-              "WorkflowLiveParentBridge.registerParent",
-              "WorkflowLiveParentBridge.registerParent.cancelAll",
-              "WorkflowLiveParentBridge.cancelRun",
-            ].map((exportName) => ({
+            ...["WorkflowLiveParentBridge.registerParent"].map((exportName) => ({
               identity: {
                 module: "src/workflow/workflow-live-parent-bridge.ts",
                 exportName,
@@ -8140,38 +8071,6 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
               reason:
                 "Adapts live-parent invariant or publication failure to the established lifecycle rejection contract.",
             })),
-            ...[
-              ["requireSubscriptionStart", "LilacBus.subscribeTopic"],
-              ["requireSubscriptionStop", "LilacBus.subscribeTopic"],
-              ["requireChildOutputBatch", "LilacBus.fetchTopic"],
-            ].map(([exportName, externalExportName]) => ({
-              identity: {
-                module: "src/workflow/workflow-live-parent-bridge.ts",
-                exportName,
-              },
-              category: "result-to-framework" as const,
-              externalApi: {
-                package: "@stanley2058/lilac-event-bus",
-                exportName: externalExportName,
-              },
-              direction: "signal-host" as const,
-              reason:
-                "Adapts a typed event-bus Result to the bridge's existing startup, cleanup, or reconciliation rejection contract.",
-            })),
-            {
-              identity: {
-                module: "src/workflow/workflow-engine.ts",
-                exportName: "requireWorkflowEngineSubscriptionStart",
-              },
-              category: "result-to-framework",
-              externalApi: {
-                package: "@stanley2058/lilac-event-bus",
-                exportName: "LilacBus.subscribeTopic",
-              },
-              direction: "signal-host",
-              reason:
-                "Adapts workflow-engine subscription startup failure to its existing host rejection contract.",
-            },
             {
               identity: { module: "src/mcp/error-format.ts", exportName: "rethrowPanic" },
               category: "defect-supervisor",
@@ -8191,7 +8090,7 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
             {
               identity: {
                 module: "src/mcp/oauth-provider.ts",
-                exportName: "McpOAuthProvider.clientInformationForSdkAttempt",
+                exportName: "McpOAuthProvider.clientInformationForSdkAttempt.err.<callback>",
               },
               category: "result-to-framework",
               externalApi: {
@@ -8205,7 +8104,7 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
             {
               identity: {
                 module: "src/tool-server/tools/mcp.ts",
-                exportName: "resultToMcpToolValue",
+                exportName: "resultToMcpToolValue.err.<callback>",
               },
               category: "result-to-framework",
               externalApi: {
@@ -8834,7 +8733,7 @@ function approvedExceptionAdapterCatalogSha256(
 }
 
 export const APPROVED_EXCEPTION_ADAPTER_CATALOG_SHA256 =
-  "1d9b04fc2d8cc570d65b6b1e1ab29e8f62846215ae4e95a8af10cd51607d41c7";
+  "ac14885c848d8774ee1457f55a7a3b827c3f1d755df12017a67b1897b4ce462d";
 
 export const architectureManifest = {
   version: 1,

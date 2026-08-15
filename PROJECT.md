@@ -178,7 +178,7 @@ Persisted formats are trust boundaries. Their codecs distinguish current, migrat
 
 - External HTTP, Redis, SDK, MCP, ACP, SSH, filesystem, subprocess, and persistence values are decoded or projected at registered boundaries before entering domain code.
 - Open protocol values are normalized into closed local unions with explicit fallbacks. Internal services should not carry domain-bearing `unknown`.
-- Expected failures use domain-owned `Result` error unions, including terminal errors for fallible streams. `Panic` is reserved for registered hard invariants and defects and must not be converted into an ordinary error.
+- Expected failures use domain-owned `Result` error unions, including terminal errors for fallible streams. Production code composes Results declaratively rather than reading their branch discriminants; the registered SQLite rollback adapter owns the sole direct Err check required before driver commit. `Panic` is reserved for registered hard invariants and defects and must not be converted into an ordinary error.
 - Exception capture, framework signaling, rollback sentinels, compatibility output, and defect supervision are allowed only at exact registrations in `scripts/architecture/manifest.ts`. The manifest also registers event delivery, persisted codecs, SQLite transactions, tool codecs, and cross-workspace consumers.
 - Presentation receives closed render-ready projections, not raw SDK/tool payloads or ad hoc parsers.
 - Mini's loopback server may omit HTTP authentication; a non-loopback listener requires its configured bearer token. Core's Level 2 server has no equivalent public authentication contract and must remain on a trusted network.

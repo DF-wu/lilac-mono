@@ -57,6 +57,7 @@ export interface ActivePersistenceInfrastructure {
 
 const ZOD_PARSE_MEMBERS = new Set(["parse", "parseAsync", "safeParse", "safeParseAsync"]);
 const UNSAFE_RESULT_MEMBERS = new Set(["deserializeUnsafe", "serializeUnsafe", "unwrap"]);
+const MANUAL_RESULT_BRANCH_MEMBERS = new Set(["isError", "isErr", "isOk"]);
 const RESULT_CAPTURE_MEMBERS = new Set(["try", "tryPromise"]);
 const MAX_TYPE_DEPTH = 6;
 const MAX_VISITED_PROPERTIES = 256;
@@ -1232,6 +1233,585 @@ function makeDiagnostic(
   };
 }
 
+function literalPropertyName(
+  expression: ts.Expression | undefined,
+  checker: ts.TypeChecker,
+): string | undefined {
+  if (!expression) return undefined;
+  const unwrapped = unwrapExpression(expression);
+  if (ts.isStringLiteralLike(unwrapped) || ts.isNumericLiteral(unwrapped)) {
+    return unwrapped.text;
+  }
+  const type = checker.getTypeAtLocation(unwrapped);
+  return type.isStringLiteral() || type.isNumberLiteral() ? String(type.value) : undefined;
+}
+
+function assignmentPatternSource(
+  node: ts.PropertyAssignment | ts.ShorthandPropertyAssignment,
+): ts.Expression | undefined {
+  let pattern: ts.Expression = node.parent;
+  while (ts.isParenthesizedExpression(pattern.parent)) pattern = pattern.parent;
+  const assignment = pattern.parent;
+  return ts.isBinaryExpression(assignment) &&
+    assignment.operatorToken.kind === ts.SyntaxKind.EqualsToken &&
+    assignment.left === pattern
+    ? assignment.right
+    : undefined;
+}
+
+function sameExpressionSymbol(
+  left: ts.Expression,
+  right: ts.Expression,
+  checker: ts.TypeChecker,
+): boolean {
+  const unwrappedLeft = unwrapExpression(left);
+  const unwrappedRight = unwrapExpression(right);
+  if (unwrappedLeft === unwrappedRight) return true;
+  const leftSymbol = checker.getSymbolAtLocation(unwrappedLeft);
+  const rightSymbol = checker.getSymbolAtLocation(unwrappedRight);
+  return Boolean(leftSymbol && rightSymbol && leftSymbol === rightSymbol);
+}
+
+function registeredSentinelThrowUsesResult(
+  statement: ts.Statement,
+  result: ts.Expression,
+  adapter: SqliteTransactionAdapterRegistration,
+  checker: ts.TypeChecker,
+  workspaceRoot: string,
+): boolean {
+  let found = false;
+  const visit = (node: ts.Node): void => {
+    if (found || (node !== statement && ts.isFunctionLike(node))) return;
+    if (ts.isThrowStatement(node) && node.expression) {
+      let thrown = unwrapExpression(node.expression);
+      if (ts.isIdentifier(thrown)) {
+        const thrownSymbol = checker.getSymbolAtLocation(thrown);
+        const source = thrownSymbol && latestSymbolSource(thrownSymbol, thrown, checker);
+        if (source) thrown = unwrapExpression(source);
+      }
+      if (ts.isNewExpression(thrown)) {
+        const sentinelSymbol = checker.getSymbolAtLocation(unwrapExpression(thrown.expression));
+        const sentinelDeclaration =
+          sentinelSymbol && canonicalSymbol(sentinelSymbol, checker).declarations?.[0];
+        const argument = thrown.arguments?.[0];
+        if (
+          sentinelDeclaration &&
+          identityMatches(
+            adapter.rollbackSentinel,
+            nodeIdentity(sentinelDeclaration, workspaceRoot),
+          ) &&
+          argument &&
+          sameExpressionSymbol(argument, result, checker)
+        ) {
+          found = true;
+          return;
+        }
+      }
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(statement);
+  return found;
+}
+
+function enclosingInlineCallbackCall(
+  node: ts.Node,
+): { readonly callback: ts.FunctionLikeDeclaration; readonly call: ts.CallExpression } | undefined {
+  let callback: ts.ArrowFunction | ts.FunctionExpression | undefined;
+  for (let current: ts.Node | undefined = node; current; current = current.parent) {
+    if (!ts.isFunctionLike(current)) continue;
+    if (!ts.isArrowFunction(current) && !ts.isFunctionExpression(current)) return undefined;
+    callback = current;
+    break;
+  }
+  if (!callback) return undefined;
+  let expression: ts.Expression = callback;
+  while (ts.isParenthesizedExpression(expression.parent)) expression = expression.parent;
+  const call = expression.parent;
+  return ts.isCallExpression(call) && call.arguments.some((argument) => argument === expression)
+    ? { callback, call }
+    : undefined;
+}
+
+function isRegisteredSqliteRollbackStatusRead(
+  node: ts.PropertyAccessExpression | ts.ElementAccessExpression,
+  result: ts.Expression,
+  checker: ts.TypeChecker,
+  workspace: WorkspaceArchitecture,
+  workspaceRoot: string,
+  packageRoots: readonly WorkspacePackageRoot[],
+): boolean {
+  const callbackCall = enclosingInlineCallbackCall(node);
+  if (!callbackCall) return false;
+  const signature = checker.getResolvedSignature(callbackCall.call);
+  if (
+    packageForSignature(signature, packageRoots) !== "bun:sqlite" ||
+    declarationName(signature?.declaration) !== "transaction"
+  ) {
+    return false;
+  }
+  const adapter = workspace.sqliteTransactionAdapters.find((candidate) =>
+    identityOwns(candidate.identity, nodeIdentity(callbackCall.callback, workspaceRoot)),
+  );
+  if (!adapter) return false;
+
+  let comparison: ts.Node = node;
+  while (
+    ts.isParenthesizedExpression(comparison.parent) ||
+    ts.isAsExpression(comparison.parent) ||
+    ts.isSatisfiesExpression(comparison.parent) ||
+    ts.isTypeAssertionExpression(comparison.parent) ||
+    ts.isNonNullExpression(comparison.parent)
+  ) {
+    comparison = comparison.parent;
+  }
+  const binary = comparison.parent;
+  if (
+    !ts.isBinaryExpression(binary) ||
+    (binary.operatorToken.kind !== ts.SyntaxKind.EqualsEqualsEqualsToken &&
+      binary.operatorToken.kind !== ts.SyntaxKind.EqualsEqualsToken)
+  ) {
+    return false;
+  }
+  const discriminator = binary.left === comparison ? binary.right : binary.left;
+  if (literalPropertyName(discriminator, checker) !== "error") return false;
+
+  let condition: ts.Expression = binary;
+  while (ts.isParenthesizedExpression(condition.parent)) condition = condition.parent;
+  const branch = condition.parent;
+  return (
+    ts.isIfStatement(branch) &&
+    branch.expression === condition &&
+    registeredSentinelThrowUsesResult(branch.thenStatement, result, adapter, checker, workspaceRoot)
+  );
+}
+
+function betterResultBranchMemberFromExpression(
+  expression: ts.Expression,
+  checker: ts.TypeChecker,
+  packageRoots: readonly WorkspacePackageRoot[],
+  seenSymbols: Set<ts.Symbol> = new Set(),
+): string | undefined {
+  const unwrapped = unwrapExpression(expression);
+  if (ts.isCallExpression(unwrapped)) {
+    const selected = selectedProperty(unwrapped.expression);
+    if (selected?.name === "bind") {
+      return betterResultBranchMemberFromExpression(
+        selected.receiver,
+        checker,
+        packageRoots,
+        seenSymbols,
+      );
+    }
+  }
+  const symbol = checker.getSymbolAtLocation(unwrapped);
+  if (symbol) {
+    const canonical = canonicalSymbol(symbol, checker);
+    if (seenSymbols.has(canonical)) return undefined;
+    seenSymbols.add(canonical);
+    const declarations = canonical.declarations ?? [];
+    const localDeclarations = declarations.filter(
+      (declaration) => declarationPackageName(declaration, packageRoots) !== "better-result",
+    );
+    if (localDeclarations.length > 0) {
+      for (const declaration of localDeclarations) {
+        let source: ts.Expression | undefined;
+        if (ts.isVariableDeclaration(declaration) || ts.isParameter(declaration)) {
+          source = declaration.initializer;
+        }
+        if (source) {
+          const member = betterResultBranchMemberFromExpression(
+            source,
+            checker,
+            packageRoots,
+            seenSymbols,
+          );
+          if (member) return member;
+        }
+        if (ts.isBindingElement(declaration)) {
+          const property = declaration.propertyName ?? declaration.name;
+          const member =
+            (ts.isIdentifier(property) || ts.isStringLiteral(property)) && property.text;
+          const bindingSource = bindingElementSource(declaration, checker);
+          const bindingSymbol = bindingSource && checker.getSymbolAtLocation(bindingSource);
+          if (
+            member &&
+            MANUAL_RESULT_BRANCH_MEMBERS.has(member) &&
+            bindingSymbol &&
+            symbolComesFromPackage(
+              canonicalSymbol(bindingSymbol, checker),
+              "better-result",
+              packageRoots,
+            )
+          ) {
+            return member;
+          }
+        }
+      }
+      return undefined;
+    }
+  }
+  for (const signature of checker.getSignaturesOfType(
+    checker.getTypeAtLocation(unwrapped),
+    ts.SignatureKind.Call,
+  )) {
+    const member = declarationName(signature.declaration);
+    if (
+      packageForSignature(signature, packageRoots) === "better-result" &&
+      member &&
+      MANUAL_RESULT_BRANCH_MEMBERS.has(member)
+    ) {
+      return member;
+    }
+  }
+  return undefined;
+}
+
+function invokedBetterResultBranchMember(
+  node: ts.CallExpression,
+  checker: ts.TypeChecker,
+  packageRoots: readonly WorkspacePackageRoot[],
+): string | undefined {
+  const selected = selectedProperty(node.expression);
+  if (selected?.name === "call" || selected?.name === "apply") {
+    return betterResultBranchMemberFromExpression(selected.receiver, checker, packageRoots);
+  }
+  return betterResultBranchMemberFromExpression(node.expression, checker, packageRoots);
+}
+
+function expressionReferencesBetterResultStaticMatch(
+  expression: ts.Expression,
+  checker: ts.TypeChecker,
+  packageRoots: readonly WorkspacePackageRoot[],
+  seenSymbols: Set<ts.Symbol> = new Set(),
+): boolean {
+  const unwrapped = unwrapExpression(expression);
+  const symbol = checker.getSymbolAtLocation(unwrapped);
+  if (symbol) {
+    const canonical = canonicalSymbol(symbol, checker);
+    if (seenSymbols.has(canonical)) return false;
+    seenSymbols.add(canonical);
+    const localDeclarations = (canonical.declarations ?? []).filter(
+      (declaration) => declarationPackageName(declaration, packageRoots) !== "better-result",
+    );
+    if (localDeclarations.length > 0) {
+      for (const declaration of localDeclarations) {
+        let source: ts.Expression | undefined;
+        if (ts.isVariableDeclaration(declaration) || ts.isParameter(declaration)) {
+          source = declaration.initializer;
+        }
+        if (ts.isBindingElement(declaration)) source = bindingElementSource(declaration, checker);
+        if (
+          source &&
+          expressionReferencesBetterResultStaticMatch(
+            source,
+            checker,
+            packageRoots,
+            new Set(seenSymbols),
+          )
+        ) {
+          return true;
+        }
+      }
+      return false;
+    }
+  }
+
+  return checker
+    .getSignaturesOfType(checker.getTypeAtLocation(unwrapped), ts.SignatureKind.Call)
+    .some(
+      (signature) =>
+        packageForSignature(signature, packageRoots) === "better-result" &&
+        declarationName(signature.declaration) === "match" &&
+        Boolean(signature.declaration && ts.isCallSignatureDeclaration(signature.declaration)),
+    );
+}
+
+function resultMatchHandlersArgument(
+  node: ts.CallExpression,
+  signature: ts.Signature | undefined,
+  checker: ts.TypeChecker,
+  packageRoots: readonly WorkspacePackageRoot[],
+): ts.Expression | undefined {
+  if (
+    packageForSignature(signature, packageRoots) !== "better-result" ||
+    declarationName(signature?.declaration) !== "match"
+  ) {
+    return undefined;
+  }
+
+  const selected = selectedProperty(node.expression);
+  if (
+    selected?.name === "match" &&
+    isDirectResultType(checker.getTypeAtLocation(selected.receiver), packageRoots)
+  ) {
+    return node.arguments[0];
+  }
+
+  if (
+    signature?.declaration &&
+    ts.isCallSignatureDeclaration(signature.declaration) &&
+    expressionReferencesBetterResultStaticMatch(node.expression, checker, packageRoots)
+  ) {
+    return node.arguments.length > 1 ? node.arguments[1] : node.arguments[0];
+  }
+  return undefined;
+}
+
+function resolvedPropertyNameText(
+  name: ts.PropertyName,
+  checker: ts.TypeChecker,
+): string | undefined {
+  if (ts.isComputedPropertyName(name)) return literalPropertyName(name.expression, checker);
+  if (ts.isPrivateIdentifier(name)) return undefined;
+  return name.text;
+}
+
+function functionLikeFromExpression(
+  expression: ts.Expression,
+  checker: ts.TypeChecker,
+  seenSymbols: Set<ts.Symbol> = new Set(),
+): ts.FunctionLikeDeclaration | undefined {
+  const unwrapped = unwrapExpression(expression);
+  if (ts.isArrowFunction(unwrapped) || ts.isFunctionExpression(unwrapped)) return unwrapped;
+  if (!ts.isIdentifier(unwrapped)) return undefined;
+
+  const symbol = checker.getSymbolAtLocation(unwrapped);
+  if (!symbol) return undefined;
+  const canonical = canonicalSymbol(symbol, checker);
+  if (seenSymbols.has(canonical)) return undefined;
+  seenSymbols.add(canonical);
+  for (const declaration of canonical.declarations ?? []) {
+    if (ts.isFunctionDeclaration(declaration) && declaration.body) return declaration;
+    if (ts.isMethodDeclaration(declaration) && declaration.body) return declaration;
+    if (
+      (ts.isVariableDeclaration(declaration) || ts.isPropertyAssignment(declaration)) &&
+      declaration.initializer
+    ) {
+      const resolved = functionLikeFromExpression(
+        declaration.initializer,
+        checker,
+        new Set(seenSymbols),
+      );
+      if (resolved) return resolved;
+    }
+  }
+  return undefined;
+}
+
+function resultMatchHandler(
+  expression: ts.Expression,
+  branch: "ok" | "err",
+  checker: ts.TypeChecker,
+  seenSymbols: Set<ts.Symbol> = new Set(),
+): ts.FunctionLikeDeclaration | undefined {
+  const unwrapped = unwrapExpression(expression);
+  if (ts.isIdentifier(unwrapped)) {
+    const symbol = checker.getSymbolAtLocation(unwrapped);
+    if (!symbol) return undefined;
+    const canonical = canonicalSymbol(symbol, checker);
+    if (seenSymbols.has(canonical)) return undefined;
+    seenSymbols.add(canonical);
+    const source = latestSymbolSource(symbol, unwrapped, checker);
+    return source ? resultMatchHandler(source, branch, checker, new Set(seenSymbols)) : undefined;
+  }
+  if (!ts.isObjectLiteralExpression(unwrapped)) return undefined;
+
+  for (const property of [...unwrapped.properties].reverse()) {
+    if (ts.isSpreadAssignment(property)) {
+      const handler = resultMatchHandler(
+        property.expression,
+        branch,
+        checker,
+        new Set(seenSymbols),
+      );
+      if (handler) return handler;
+      continue;
+    }
+    if (resolvedPropertyNameText(property.name, checker) !== branch) continue;
+    if (ts.isMethodDeclaration(property) && property.body) return property;
+    if (ts.isPropertyAssignment(property)) {
+      return functionLikeFromExpression(property.initializer, checker);
+    }
+    if (ts.isShorthandPropertyAssignment(property)) {
+      return functionLikeFromExpression(property.name, checker);
+    }
+  }
+  return undefined;
+}
+
+function handlerReturnExpressions(handler: ts.FunctionLikeDeclaration): readonly ts.Expression[] {
+  if (!handler.body) return [];
+  if (!ts.isBlock(handler.body)) return [handler.body];
+
+  const returns: ts.Expression[] = [];
+  const visit = (node: ts.Node): void => {
+    if (node !== handler.body && ts.isFunctionLike(node)) return;
+    if (ts.isReturnStatement(node)) {
+      if (node.expression) returns.push(node.expression);
+      return;
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(handler.body);
+  return returns;
+}
+
+function objectPropertyExpression(
+  object: ts.ObjectLiteralExpression,
+  name: string,
+  checker: ts.TypeChecker,
+  seenSymbols: Set<ts.Symbol>,
+): ts.Expression | undefined {
+  for (const property of [...object.properties].reverse()) {
+    if (ts.isSpreadAssignment(property)) {
+      const spread = returnedObjectLiteral(property.expression, checker, new Set(seenSymbols));
+      const expression =
+        spread && objectPropertyExpression(spread, name, checker, new Set(seenSymbols));
+      if (expression) return expression;
+      continue;
+    }
+    if (resolvedPropertyNameText(property.name, checker) !== name) continue;
+    if (ts.isPropertyAssignment(property)) return property.initializer;
+    if (ts.isShorthandPropertyAssignment(property)) return property.name;
+    return undefined;
+  }
+  return undefined;
+}
+
+function returnedObjectLiteral(
+  expression: ts.Expression,
+  checker: ts.TypeChecker,
+  seenSymbols: Set<ts.Symbol> = new Set(),
+): ts.ObjectLiteralExpression | undefined {
+  const unwrapped = unwrapExpression(expression);
+  if (ts.isObjectLiteralExpression(unwrapped)) return unwrapped;
+  if (!ts.isIdentifier(unwrapped)) return undefined;
+
+  const symbol = checker.getSymbolAtLocation(unwrapped);
+  if (!symbol) return undefined;
+  const canonical = canonicalSymbol(symbol, checker);
+  if (seenSymbols.has(canonical)) return undefined;
+  seenSymbols.add(canonical);
+  const source = latestSymbolSource(symbol, unwrapped, checker);
+  return source ? returnedObjectLiteral(source, checker, seenSymbols) : undefined;
+}
+
+function handlerReconstructsBranchEnvelope(
+  handler: ts.FunctionLikeDeclaration,
+  status: "ok" | "error",
+  payload: "value" | "error",
+  checker: ts.TypeChecker,
+): boolean {
+  return handlerReturnExpressions(handler).some((expression) => {
+    const object = returnedObjectLiteral(expression, checker);
+    if (!object) return false;
+    const statusExpression = objectPropertyExpression(object, "status", checker, new Set());
+    return (
+      literalPropertyName(statusExpression, checker) === status &&
+      objectPropertyExpression(object, payload, checker, new Set()) !== undefined
+    );
+  });
+}
+
+function reconstructsResultBranchEnvelopes(
+  handlers: ts.Expression | undefined,
+  checker: ts.TypeChecker,
+): boolean {
+  if (!handlers) return false;
+  const ok = resultMatchHandler(handlers, "ok", checker);
+  const err = resultMatchHandler(handlers, "err", checker);
+  return Boolean(
+    ok &&
+    err &&
+    handlerReconstructsBranchEnvelope(ok, "ok", "value", checker) &&
+    handlerReconstructsBranchEnvelope(err, "error", "error", checker),
+  );
+}
+
+function analyzeManualResultStatusRead(
+  node:
+    | ts.PropertyAccessExpression
+    | ts.ElementAccessExpression
+    | ts.BindingElement
+    | ts.PropertyAssignment
+    | ts.ShorthandPropertyAssignment,
+  checker: ts.TypeChecker,
+  workspace: WorkspaceArchitecture,
+  workspaceRoot: string,
+  packageRoots: readonly WorkspacePackageRoot[],
+  diagnostics: ArchitectureDiagnostic[],
+): void {
+  let sourceType: ts.Type;
+  let statusSymbol: ts.Symbol | undefined;
+  let sourceExpression: ts.Expression | undefined;
+  if (ts.isPropertyAccessExpression(node)) {
+    if (node.name.text !== "status") return;
+    sourceExpression = node.expression;
+    sourceType = checker.getTypeAtLocation(node.expression);
+    statusSymbol = checker.getSymbolAtLocation(node.name) ?? sourceType.getProperty("status");
+  } else if (ts.isElementAccessExpression(node)) {
+    if (literalPropertyName(node.argumentExpression, checker) !== "status") return;
+    sourceExpression = node.expression;
+    sourceType = checker.getTypeAtLocation(node.expression);
+    statusSymbol = sourceType.getProperty("status");
+  } else if (ts.isBindingElement(node)) {
+    if (!ts.isObjectBindingPattern(node.parent)) return;
+    const property = node.propertyName ?? node.name;
+    if (
+      (!ts.isIdentifier(property) && !ts.isStringLiteral(property)) ||
+      property.text !== "status"
+    ) {
+      return;
+    }
+    sourceType = checker.getTypeAtLocation(node.parent);
+    statusSymbol = sourceType.getProperty("status");
+  } else {
+    const property = node.name;
+    if (
+      (!ts.isIdentifier(property) && !ts.isStringLiteral(property)) ||
+      property.text !== "status"
+    ) {
+      return;
+    }
+    sourceExpression = assignmentPatternSource(node);
+    if (!sourceExpression) return;
+    sourceType = checker.getTypeAtLocation(sourceExpression);
+    statusSymbol = sourceType.getProperty("status");
+  }
+
+  if (
+    !isDirectResultType(sourceType, packageRoots) ||
+    !symbolComesFromPackage(statusSymbol, "better-result", packageRoots)
+  ) {
+    return;
+  }
+  if (
+    sourceExpression &&
+    (ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node)) &&
+    isRegisteredSqliteRollbackStatusRead(
+      node,
+      sourceExpression,
+      checker,
+      workspace,
+      workspaceRoot,
+      packageRoots,
+    )
+  ) {
+    return;
+  }
+  diagnostics.push(
+    makeDiagnostic(
+      workspace,
+      workspaceRoot,
+      "architecture/no-manual-result-branching",
+      node,
+      "better-result Result status is read directly to discriminate a branch.",
+      "Compose with Result.match, Result.gen, map, mapError, andThen, or tryRecover instead.",
+    ),
+  );
+}
+
 function analyzeCall(
   node: ts.CallExpression,
   checker: ts.TypeChecker,
@@ -1244,6 +1824,15 @@ function analyzeCall(
   const signature = checker.getResolvedSignature(node);
   const sourcePackage = packageForSignature(signature, packageRoots);
   const member = declarationName(signature?.declaration);
+  const manualResultBranchMember = activeRules.has("architecture/no-manual-result-branching")
+    ? invokedBetterResultBranchMember(node, checker, packageRoots)
+    : undefined;
+  const reconstructedResultEnvelopes =
+    activeRules.has("architecture/no-manual-result-branching") &&
+    reconstructsResultBranchEnvelopes(
+      resultMatchHandlersArgument(node, signature, checker, packageRoots),
+      checker,
+    );
 
   if (activeRules.has("architecture/no-result-err-in-sqlite-callback")) {
     analyzeSqliteTransactionCallback(
@@ -1296,7 +1885,33 @@ function analyzeCall(
         "architecture/no-production-unwrap",
         node,
         `better-result ${member} performs unsafe Result extraction.`,
-        "Branch on result.status, compose with Result.gen, or map at the owning policy boundary.",
+        "Compose with Result.match, Result.gen, unwrapOr, or map at the owning policy boundary.",
+      ),
+    );
+  }
+
+  if (activeRules.has("architecture/no-manual-result-branching") && manualResultBranchMember) {
+    diagnostics.push(
+      makeDiagnostic(
+        workspace,
+        workspaceRoot,
+        "architecture/no-manual-result-branching",
+        node,
+        `better-result ${manualResultBranchMember} manually discriminates a Result branch.`,
+        "Compose with Result.match, Result.gen, map, mapError, andThen, or tryRecover instead.",
+      ),
+    );
+  }
+
+  if (reconstructedResultEnvelopes) {
+    diagnostics.push(
+      makeDiagnostic(
+        workspace,
+        workspaceRoot,
+        "architecture/no-manual-result-branching",
+        node,
+        "better-result match reconstructs both Result branch envelopes.",
+        "Return a domain projection, or use Result.codec when a serialized Result envelope is required.",
       ),
     );
   }
@@ -1354,7 +1969,7 @@ function analyzeCall(
           "architecture/no-result-wire-leak",
           serialized,
           "JSON.stringify would serialize a Result object instead of an existing wire representation.",
-          "Branch on result.status and serialize an explicit compatibility payload.",
+          "Use Result.match to serialize an explicit compatibility payload.",
         ),
       );
     }
@@ -5728,6 +6343,55 @@ function adapterMatchesApproval(
   );
 }
 
+function normalizedExceptionCallbackIdentity(identity: string): string {
+  return identity.replace(/@\d+(?=\.|$)/gu, "");
+}
+
+function exceptionAdapterDeclarations(
+  adapter: WorkspaceArchitecture["exceptionAdapters"][number],
+  workspace: WorkspaceArchitecture,
+  workspaceRoot: string,
+  program: ts.Program,
+  checker: ts.TypeChecker,
+  signalAdapterKeys: ReadonlySet<string>,
+): readonly ts.SignatureDeclaration[] {
+  const direct = registeredNodes(adapter.identity, workspaceRoot, program, isImplementedCallable);
+  if (direct.length > 0) return direct;
+
+  const normalizedIdentity = normalizedExceptionCallbackIdentity(adapter.identity.exportName);
+  const registeredIdentities = Array.from(
+    new Set(
+      workspace.exceptionAdapters
+        .filter(
+          (candidate) =>
+            candidate.identity.module === adapter.identity.module &&
+            normalizedExceptionCallbackIdentity(candidate.identity.exportName) ===
+              normalizedIdentity,
+        )
+        .map((candidate) => candidate.identity.exportName),
+    ),
+  );
+  const candidates = Array.from(
+    registeredDeclarationIndex(program, workspaceRoot).get(adapter.identity.module) ?? [],
+  )
+    .filter(([identity]) => normalizedExceptionCallbackIdentity(identity) === normalizedIdentity)
+    .flatMap(([, declarations]) => declarations)
+    .filter(isImplementedCallable)
+    .filter((declaration) =>
+      callableHasExceptionRelationship(
+        declaration,
+        adapter.direction,
+        checker,
+        workspaceRoot,
+        signalAdapterKeys,
+      ),
+    )
+    .sort((left, right) => left.getStart() - right.getStart());
+  if (registeredIdentities.length !== candidates.length) return [];
+  const index = registeredIdentities.indexOf(adapter.identity.exportName);
+  return index < 0 ? [] : [candidates[index]!];
+}
+
 export function assertEveryExceptionAdapterResolves(
   workspace: WorkspaceArchitecture,
   workspaceRoot: string,
@@ -5770,11 +6434,13 @@ export function assertEveryExceptionAdapterResolves(
       );
       continue;
     }
-    const declarations = registeredNodes(
-      adapter.identity,
+    const declarations = exceptionAdapterDeclarations(
+      adapter,
+      workspace,
       workspaceRoot,
       program,
-      isImplementedCallable,
+      checker,
+      signalAdapterKeys,
     );
     if (declarations.length !== 1) {
       failures.push(
@@ -5947,11 +6613,13 @@ export function assertCoreFinalExceptionAdaptersResolve(
           );
         declarations = sourceFile ? [sourceFile] : [];
       } else {
-        declarations = registeredNodes(
-          { module: registration.module, exportName: registration.exportName },
+        declarations = exceptionAdapterDeclarations(
+          adapter,
+          workspace,
           workspaceRoot,
           program,
-          isImplementedCallable,
+          checker,
+          signalAdapterKeys,
         );
       }
       if (declarations.length === 0) {
@@ -6167,18 +6835,39 @@ export function analyzeWorkspace(
       ARCHITECTURE_RULES.filter((rule) => ruleApplies(workspace, rule, module)),
     );
     const candidateNames = callCandidateNames(sourceFile, workspace, activeRules);
+    const analyzeEveryCall = activeRules.has("architecture/no-manual-result-branching");
     const sourceExports = activeRules.has("architecture/no-unhandled-exception-contract")
       ? exportedSymbols(sourceFile, checker)
       : new Set<ts.Symbol>();
 
     const visit = (node: ts.Node): void => {
-      if (ts.isCallExpression(node) && candidateNames.has(expressionName(node.expression) ?? "")) {
+      if (
+        ts.isCallExpression(node) &&
+        (analyzeEveryCall || candidateNames.has(expressionName(node.expression) ?? ""))
+      ) {
         analyzeCall(
           node,
           checker,
           workspace,
           workspaceRoot,
           activeRules,
+          packageRoots,
+          diagnostics,
+        );
+      }
+      if (
+        activeRules.has("architecture/no-manual-result-branching") &&
+        (ts.isPropertyAccessExpression(node) ||
+          ts.isElementAccessExpression(node) ||
+          ts.isBindingElement(node) ||
+          ts.isPropertyAssignment(node) ||
+          ts.isShorthandPropertyAssignment(node))
+      ) {
+        analyzeManualResultStatusRead(
+          node,
+          checker,
+          workspace,
+          workspaceRoot,
           packageRoots,
           diagnostics,
         );

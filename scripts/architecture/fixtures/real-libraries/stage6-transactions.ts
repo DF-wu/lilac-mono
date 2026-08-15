@@ -32,7 +32,12 @@ export function runFixtureSqliteTransaction<T, E>(
     const value = database
       .transaction((): T => {
         const result = operation();
-        if (result.status === "error") throw new FixtureRollback(result);
+        const inspectAdapterOwnedStatus = (): string => result.status;
+        void inspectAdapterOwnedStatus;
+        if (result.status === "error") {
+          const rollbackSentinel = new FixtureRollback(result);
+          throw rollbackSentinel;
+        }
         return result.value;
       })
       .immediate();
