@@ -45,20 +45,22 @@ function analyzeCommandAtCwd(
   }
 
   const parsed = parseBashCommand(command);
-  if (parsed.status === "error") {
-    const reason = dangerousReasonInText(command);
-    return reason ? { reason, segment: command } : null;
-  }
-
-  return analyzeScript(
-    parsed.value,
-    {
-      depth,
-      options,
-      originalCwd: options.cwd,
-      analyzeNestedCommand: (nestedCommand, nestedDepth, nestedCwd) =>
-        analyzeCommandAtCwd(nestedCommand, nestedDepth, options, nestedCwd),
+  return parsed.match({
+    ok: (script) =>
+      analyzeScript(
+        script,
+        {
+          depth,
+          options,
+          originalCwd: options.cwd,
+          analyzeNestedCommand: (nestedCommand, nestedDepth, nestedCwd) =>
+            analyzeCommandAtCwd(nestedCommand, nestedDepth, options, nestedCwd),
+        },
+        { cwd: effectiveCwd },
+      ),
+    err: () => {
+      const reason = dangerousReasonInText(command);
+      return reason ? { reason, segment: command } : null;
     },
-    { cwd: effectiveCwd },
-  );
+  });
 }

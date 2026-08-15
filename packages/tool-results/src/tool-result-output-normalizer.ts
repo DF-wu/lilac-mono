@@ -3,7 +3,11 @@ import type { ToolModelMessage } from "ai";
 import { Panic, Result, TaggedError, type Result as ResultType } from "better-result";
 import { stripVTControlCharacters } from "node:util";
 
-import { type ToolResultArtifactStore } from "./tool-result-artifact-store";
+import type {
+  CreatedToolResultArtifact,
+  ToolResultArtifactError,
+  ToolResultArtifactStore,
+} from "./tool-result-artifact-store";
 
 const GENERATED_OVERFLOW_REFERENCE =
   /^\[tool result overflow\]\nThe tool completed, but its output exceeded the inline limit\.\n(?:Complete captured output: tool-result:\/\/[0-9a-f-]{36}\nUse read with this URI and start: \{ "type": "offset", "offset": 0 \}\. Reuse nextStart unchanged while more content remains\. Do not re-run the original tool\.|The complete output could not be retained\. Narrow the request or re-run the tool\.)$/u;
@@ -174,13 +178,21 @@ export function createOverflowReferenceNormalizer(
         ? {}
         : { maxArtifactBytes: config.maxArtifactBytes }),
     });
-    if (artifact?.status === "ok") {
-      uri = artifact.value.uri;
-    } else if (artifact?.status === "error") {
-      logger.warn("tool.artifact.write_failed", {
-        toolName: context.toolName,
-        errorTag: artifact.error._tag,
+    if (artifact) {
+      const outcome = artifact.match<
+        { value: CreatedToolResultArtifact } | { error: ToolResultArtifactError }
+      >({
+        ok: (value) => ({ value }),
+        err: (error) => ({ error }),
       });
+      if ("value" in outcome) {
+        uri = outcome.value.uri;
+      } else {
+        logger.warn("tool.artifact.write_failed", {
+          toolName: context.toolName,
+          errorTag: outcome.error._tag,
+        });
+      }
     }
 
     logger.info("tool.result.overflow", {
@@ -218,8 +230,11 @@ export function createOverflowReferenceNormalizer(
 
     if (output.type === "json" || output.type === "error-json") {
       const serialized = serializeOutput(output.value);
-      if (serialized.status === "error" || serialized.value === undefined) return [];
-      return [{ outputIndex, value: serialized.value, bytes: utf8Bytes(serialized.value) }];
+      return serialized.match({
+        err: () => [],
+        ok: (value) =>
+          value === undefined ? [] : [{ outputIndex, value, bytes: utf8Bytes(value) }],
+      });
     }
 
     if (output.type === "content") {
@@ -287,16 +302,21 @@ export function createOverflowReferenceNormalizer(
 
     if (output.type === "json" || output.type === "error-json") {
       const serialized = serializeOutput(output.value);
-      if (serialized.status === "error" || serialized.value === undefined) {
-        return output.type === "error-json"
+      const unserializable = (): ToolResultOutput =>
+        output.type === "error-json"
           ? { ...output, type: "error-text", value: UNSERIALIZABLE_JSON_OUTPUT }
           : { ...output, type: "text", value: UNSERIALIZABLE_JSON_OUTPUT };
-      }
-      if (!spillOutput) return output;
-      const value = await normalizeCapturedText(serialized.value, context, true, config);
-      return output.type === "error-json"
-        ? { ...output, type: "error-text", value }
-        : { ...output, type: "text", value };
+      return serialized.match({
+        err: async () => unserializable(),
+        ok: async (serializedValue) => {
+          if (serializedValue === undefined) return unserializable();
+          if (!spillOutput) return output;
+          const value = await normalizeCapturedText(serializedValue, context, true, config);
+          return output.type === "error-json"
+            ? { ...output, type: "error-text", value }
+            : { ...output, type: "text", value };
+        },
+      });
     }
 
     if (output.type === "content") {

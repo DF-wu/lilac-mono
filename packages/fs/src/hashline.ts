@@ -188,8 +188,13 @@ function normalizeEdit(
   if (!pos) {
     return hashlineEditFailure("INVALID_EDIT", `Invalid hashline anchor: ${edit.pos}`);
   }
-  const validatedPos = validateHashlineRef(lines, pos);
-  if (validatedPos.status === "error") return Result.err(validatedPos.error);
+  const validatedPos = validateHashlineRef(lines, pos).match<
+    { value: number } | { error: HashlineEditFailed }
+  >({
+    ok: (value) => ({ value }),
+    err: (error) => ({ error }),
+  });
+  if ("error" in validatedPos) return Result.err(validatedPos.error);
   const posLine = validatedPos.value;
 
   if (edit.op === "replace") {
@@ -199,8 +204,13 @@ function normalizeEdit(
       if (!end) {
         return hashlineEditFailure("INVALID_EDIT", `Invalid hashline anchor: ${edit.end}`);
       }
-      const validatedEnd = validateHashlineRef(lines, end);
-      if (validatedEnd.status === "error") return Result.err(validatedEnd.error);
+      const validatedEnd = validateHashlineRef(lines, end).match<
+        { value: number } | { error: HashlineEditFailed }
+      >({
+        ok: (value) => ({ value }),
+        err: (error) => ({ error }),
+      });
+      if ("error" in validatedEnd) return Result.err(validatedEnd.error);
       endLine = validatedEnd.value;
     }
 
@@ -217,7 +227,7 @@ function normalizeEdit(
       endLine,
       lines: normalizeReplacementLines(edit.lines),
       originalIndex,
-    });
+    } satisfies NormalizedHashlineEdit);
   }
 
   return Result.ok({
@@ -225,7 +235,7 @@ function normalizeEdit(
     line: posLine,
     lines: normalizeReplacementLines(edit.lines),
     originalIndex,
-  });
+  } satisfies NormalizedHashlineEdit);
 }
 
 function editsOverlap(a: NormalizedHashlineEdit, b: NormalizedHashlineEdit): boolean {
@@ -292,13 +302,23 @@ export function applyHashlineEdits(params: {
   for (let index = 0; index < params.edits.length; index++) {
     const edit = params.edits[index];
     if (!edit) continue;
-    const decoded = normalizeEdit(edit, originalLines, index);
-    if (decoded.status === "error") return Result.err(decoded.error);
+    const decoded = normalizeEdit(edit, originalLines, index).match<
+      { value: NormalizedHashlineEdit } | { error: HashlineEditFailed }
+    >({
+      ok: (value) => ({ value }),
+      err: (error) => ({ error }),
+    });
+    if ("error" in decoded) return Result.err(decoded.error);
     normalized.push(decoded.value);
   }
 
-  const overlaps = validateNoOverlaps(normalized);
-  if (overlaps.status === "error") return Result.err(overlaps.error);
+  const overlaps = validateNoOverlaps(normalized).match<
+    { value: void } | { error: HashlineEditFailed }
+  >({
+    ok: (value) => ({ value }),
+    err: (error) => ({ error }),
+  });
+  if ("error" in overlaps) return Result.err(overlaps.error);
 
   const nextLines = [...originalLines];
   const sorted = [...normalized].sort((a, b) => {

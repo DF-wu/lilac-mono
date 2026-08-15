@@ -1,6 +1,12 @@
 import path from "node:path";
 
-import { expandTilde, FileSystem, grepText, type FsBackend } from "@stanley2058/lilac-fs";
+import {
+  expandTilde,
+  FileSystem,
+  grepText,
+  type FsBackend,
+  type FuzzySearchResult,
+} from "@stanley2058/lilac-fs";
 import {
   adaptToolResultArtifactReadToUnavailablePolicy,
   TOOL_RESULT_URI_PREFIX,
@@ -247,16 +253,15 @@ export function createFilesystemTools(params: {
           operation: "read",
           dangerouslyAllow: input.dangerouslyAllow,
         });
-        if (guardedPath.allowed.status === "error") {
-          return {
+        const pathFailure = guardedPath.allowed.match({
+          ok: () => null,
+          err: (error) => ({
             success: false as const,
             resolvedPath: guardedPath.resolvedPath,
-            error: {
-              code: "PERMISSION" as const,
-              message: guardedPath.allowed.error.message,
-            },
-          };
-        }
+            error: { code: "PERMISSION" as const, message: error.message },
+          }),
+        });
+        if (pathFailure) return pathFailure;
         const expectedMimeType = readFileDirectAttachmentSupported
           ? ATTACHMENT_MIME_TYPES.get(path.extname(input.path).toLowerCase())
           : undefined;
@@ -403,22 +408,23 @@ export function createFilesystemTools(params: {
           operation: "glob",
           dangerouslyAllow: input.dangerouslyAllow,
         });
-        if (guardedPath.allowed.status === "error") {
-          return input.mode === "detailed"
-            ? {
-                mode: "detailed" as const,
-                truncated: false,
-                entries: [],
-                error: guardedPath.allowed.error.message,
-              }
-            : {
-                mode: "default" as const,
-                truncated: false,
-                paths: [],
-                error: guardedPath.allowed.error.message,
-              };
-        }
-        return fileSystem.glob({ ...input, baseDir: operationCwd ?? cwd });
+        return guardedPath.allowed.match({
+          ok: () => fileSystem.glob({ ...input, baseDir: operationCwd ?? cwd }),
+          err: async (error) =>
+            input.mode === "detailed"
+              ? {
+                  mode: "detailed" as const,
+                  truncated: false,
+                  entries: [],
+                  error: error.message,
+                }
+              : {
+                  mode: "default" as const,
+                  truncated: false,
+                  paths: [],
+                  error: error.message,
+                },
+        });
       },
       toModelOutput: ({ output }) =>
         searchFailureSchema.safeParse(output).success
@@ -455,29 +461,32 @@ export function createFilesystemTools(params: {
             regex: input.regex,
             maxMatches: input.maxResults ?? 100,
           });
-          if (searched.status === "error") {
-            return boundGrepOutput(
-              {
-                mode: input.mode ?? "default",
-                truncated: false,
-                results: [],
-                error: searched.error.message,
-              },
-              maxOutputBytes,
-            );
-          }
-          const results =
-            input.mode === "detailed"
-              ? searched.value.matches
-              : searched.value.matches.map(({ file, line, text }) => ({ file, line, text }));
-          return boundGrepOutput(
-            {
-              mode: input.mode ?? "default",
-              truncated: searched.value.truncated,
-              results,
+          return searched.match({
+            err: (error) =>
+              boundGrepOutput(
+                {
+                  mode: input.mode ?? "default",
+                  truncated: false,
+                  results: [],
+                  error: error.message,
+                },
+                maxOutputBytes,
+              ),
+            ok: (value) => {
+              const results =
+                input.mode === "detailed"
+                  ? value.matches
+                  : value.matches.map(({ file, line, text }) => ({ file, line, text }));
+              return boundGrepOutput(
+                {
+                  mode: input.mode ?? "default",
+                  truncated: value.truncated,
+                  results,
+                },
+                maxOutputBytes,
+              );
             },
-            maxOutputBytes,
-          );
+          });
         }
 
         assertGuardrailBypassAllowed(input.dangerouslyAllow, allowGuardrailBypass);
@@ -489,22 +498,25 @@ export function createFilesystemTools(params: {
           operation: "grep",
           dangerouslyAllow: input.dangerouslyAllow,
         });
-        if (guardedPath.allowed.status === "error") {
-          return boundGrepOutput(
-            {
-              mode: input.mode ?? "default",
-              truncated: false,
-              results: [],
-              error: guardedPath.allowed.error.message,
-            },
-            maxOutputBytes,
-          );
-        }
-        const { path: _path, ...searchInput } = input;
-        return boundGrepOutput(
-          await fileSystem.grep({ ...searchInput, baseDir: targetPath }),
-          maxOutputBytes,
-        );
+        return guardedPath.allowed.match({
+          err: async (error) =>
+            boundGrepOutput(
+              {
+                mode: input.mode ?? "default",
+                truncated: false,
+                results: [],
+                error: error.message,
+              },
+              maxOutputBytes,
+            ),
+          ok: async () => {
+            const { path: _path, ...searchInput } = input;
+            return boundGrepOutput(
+              await fileSystem.grep({ ...searchInput, baseDir: targetPath }),
+              maxOutputBytes,
+            );
+          },
+        });
       },
       toModelOutput: ({ output }) =>
         searchFailureSchema.safeParse(output).success
@@ -526,36 +538,35 @@ export function createFilesystemTools(params: {
           operation: "edit",
           dangerouslyAllow: input.dangerouslyAllow,
         });
-        if (guardedPath.allowed.status === "error") {
-          return {
+        return guardedPath.allowed.match({
+          err: async (error) => ({
             success: false as const,
             resolvedPath: guardedPath.resolvedPath,
-            error: {
-              code: "PERMISSION" as const,
-              message: guardedPath.allowed.error.message,
-            },
-          };
-        }
-        const occurrence = input.replaceAll ? "all" : "first";
-        const expectedMatches = input.expectedMatches ?? (input.replaceAll ? "any" : 1);
-        return fileSystem.editFile(
-          {
-            path: input.path,
-            edits: [
+            error: { code: "PERMISSION" as const, message: error.message },
+          }),
+          ok: () => {
+            const occurrence = input.replaceAll ? "all" : "first";
+            const expectedMatches = input.expectedMatches ?? (input.replaceAll ? "any" : 1);
+            return fileSystem.editFile(
               {
-                type: "replace_snippet",
-                target: input.oldText,
-                matching: input.matching,
-                newText: input.newText,
-                occurrence,
-                expectedMatches,
+                path: input.path,
+                edits: [
+                  {
+                    type: "replace_snippet",
+                    target: input.oldText,
+                    matching: input.matching,
+                    newText: input.newText,
+                    occurrence,
+                    expectedMatches,
+                  },
+                ],
+                expectedHash: input.expectedHash,
+                dangerouslyAllow: input.dangerouslyAllow,
               },
-            ],
-            expectedHash: input.expectedHash,
-            dangerouslyAllow: input.dangerouslyAllow,
+              operationCwd ?? cwd,
+            );
           },
-          operationCwd ?? cwd,
-        );
+        });
       },
     }),
   };
@@ -575,16 +586,16 @@ export function createFilesystemTools(params: {
           operation: "fuzzy_search",
           dangerouslyAllow: input.dangerouslyAllow,
         });
-        if (guardedPath.allowed.status === "error") {
-          return {
+        return guardedPath.allowed.match({
+          err: async (error): Promise<FuzzySearchResult> => ({
             results: [],
             totalMatched: 0,
             totalFiles: 0,
             truncated: false as const,
-            error: guardedPath.allowed.error.message,
-          };
-        }
-        return fileSystem.fuzzySearchFiles({ ...input, baseDir: operationCwd ?? cwd });
+            error: error.message,
+          }),
+          ok: () => fileSystem.fuzzySearchFiles({ ...input, baseDir: operationCwd ?? cwd }),
+        });
       },
       toModelOutput: ({ output }) =>
         searchFailureSchema.safeParse(output).success

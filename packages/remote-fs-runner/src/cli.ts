@@ -234,6 +234,15 @@ function responseSuccess(value: RemoteFsResponse): ResponseEnvelope {
   return { ok: true, value };
 }
 
+function resultOutcome<T, E>(
+  result: ResultType<T, E>,
+): { ok: true; value: T } | { ok: false; error: E } {
+  return result.match<{ ok: true; value: T } | { ok: false; error: E }>({
+    ok: (value) => ({ ok: true, value }),
+    err: (error) => ({ ok: false, error }),
+  });
+}
+
 type EditResult =
   | Awaited<ReturnType<FileSystem["editFile"]>>
   | Awaited<ReturnType<FileSystem["hashlineEditFile"]>>;
@@ -430,8 +439,8 @@ export async function connectOnce(
   ResultType<RemoteFsResponse, RemoteFsSocketTransportError | RemoteRunnerResponseDecodeError>
 > {
   const response = await readSocketResponse(payload, timeoutMs);
-  if (response.status === "error") return response;
-  return decodeSocketResponse(payload, response.value);
+  const outcome = resultOutcome(response);
+  return outcome.ok ? decodeSocketResponse(payload, outcome.value) : Result.err(outcome.error);
 }
 
 function sleep(ms: number): Promise<void> {
@@ -497,9 +506,17 @@ async function tryConnectUntil(
     });
   while (Date.now() < deadline) {
     const response = await connectOnce(payload, Math.max(1, deadline - Date.now()));
-    if (response.status === "ok") return response;
-    if (!RemoteFsSocketTransportError.is(response.error)) return response;
-    latestError = response.error;
+    const completed = response.match<
+      ResultType<RemoteFsResponse, RemoteRunnerResponseDecodeError> | undefined
+    >({
+      ok: (value) => Result.ok(value),
+      err: (error) => {
+        if (!RemoteFsSocketTransportError.is(error)) return Result.err(error);
+        latestError = error;
+        return undefined;
+      },
+    });
+    if (completed) return completed;
     const remainingMs = deadline - Date.now();
     if (remainingMs > 0) await sleep(Math.min(CONNECT_RETRY_MS, remainingMs));
   }
@@ -512,44 +529,40 @@ export async function tryAcquireStartupLock(
   },
 ): Promise<ResultType<boolean, RemoteFsRuntimeSetupError>> {
   const target = lockPath();
-  const created = await captureRuntimeOperation(
-    `failed to create remote fs startup lock: ${target}`,
-    () => createLock(target),
+  const created = resultOutcome(
+    await captureRuntimeOperation(`failed to create remote fs startup lock: ${target}`, () =>
+      createLock(target),
+    ),
   );
-  if (created.status === "ok") return Result.ok(true);
-  if (created.error.code !== "EEXIST") {
-    return Result.err(created.error);
-  }
+  if (created.ok) return Result.ok(true);
+  if (created.error.code !== "EEXIST") return Result.err(created.error);
 
-  const statResult = await captureRuntimeOperation(
-    `failed to inspect remote fs startup lock: ${target}`,
-    () => fs.stat(target),
+  const statResult = resultOutcome(
+    await captureRuntimeOperation(`failed to inspect remote fs startup lock: ${target}`, () =>
+      fs.stat(target),
+    ),
   );
-  if (statResult.status === "error") {
-    if (statResult.error.code === "ENOENT") {
-      return Result.ok(false);
-    }
-    return Result.err(statResult.error);
+  if (!statResult.ok) {
+    return statResult.error.code === "ENOENT" ? Result.ok(false) : Result.err(statResult.error);
   }
 
   const lockAgeMs = Date.now() - statResult.value.mtimeMs;
   if (lockAgeMs <= STARTUP_TIMEOUT_MS) return Result.ok(false);
 
-  const removed = await captureRuntimeOperation(
-    `failed to remove stale remote fs startup lock: ${target}`,
-    () => fs.rm(target, { recursive: true, force: true }),
+  const removed = resultOutcome(
+    await captureRuntimeOperation(`failed to remove stale remote fs startup lock: ${target}`, () =>
+      fs.rm(target, { recursive: true, force: true }),
+    ),
   );
-  if (removed.status === "error") return Result.err(removed.error);
+  if (!removed.ok) return Result.err(removed.error);
 
-  const recreated = await captureRuntimeOperation(
-    `failed to recreate remote fs startup lock: ${target}`,
-    () => createLock(target),
+  const recreated = resultOutcome(
+    await captureRuntimeOperation(`failed to recreate remote fs startup lock: ${target}`, () =>
+      createLock(target),
+    ),
   );
-  if (recreated.status === "ok") return Result.ok(true);
-  if (recreated.error.code === "EEXIST") {
-    return Result.ok(false);
-  }
-  return Result.err(recreated.error);
+  if (recreated.ok) return Result.ok(true);
+  return recreated.error.code === "EEXIST" ? Result.ok(false) : Result.err(recreated.error);
 }
 
 export async function releaseStartupLock(
@@ -578,15 +591,21 @@ export function applyStartupLockCleanup(
   operation: ResultType<ResponseEnvelope, RemoteFsRequestOperationError>,
   cleanup: ResultType<void, RemoteFsStartupLockCleanupError>,
 ): ResultType<ResponseEnvelope, RemoteFsRunRequestError> {
-  if (cleanup.status === "ok") return operation;
-  if (operation.status === "ok") return Result.err(cleanup.error);
-  return Result.err(
-    new RemoteFsRequestCleanupCombinedError({
-      operationError: operation.error,
-      cleanupError: cleanup.error,
-      message: `${operation.error.message}; additionally, ${cleanup.error.message}`,
-    }),
-  );
+  return cleanup.match<ResultType<ResponseEnvelope, RemoteFsRunRequestError>>({
+    ok: () => operation,
+    err: (cleanupError) =>
+      operation.match<ResultType<ResponseEnvelope, RemoteFsRunRequestError>>({
+        ok: () => Result.err(cleanupError),
+        err: (operationError) =>
+          Result.err(
+            new RemoteFsRequestCleanupCombinedError({
+              operationError,
+              cleanupError,
+              message: `${operationError.message}; additionally, ${cleanupError.message}`,
+            }),
+          ),
+      }),
+  });
 }
 
 type StartupLockOperationOutcome =
@@ -635,9 +654,10 @@ async function superviseStartupLockCleanupAfterOperationDefect(
 ): Promise<void> {
   try {
     const cleanupResult = await cleanup();
-    if (cleanupResult.status === "error") {
-      reportCleanupFailureWithoutMaskingOperation(report, cleanupResult.error);
-    }
+    cleanupResult.match({
+      ok: () => undefined,
+      err: (error) => reportCleanupFailureWithoutMaskingOperation(report, error),
+    });
   } catch (cause) {
     const failure =
       cause instanceof Error ? cause : new Error("unknown startup-lock cleanup defect");
@@ -675,34 +695,38 @@ async function waitForDaemon(
   >
 > {
   const response = await tryConnectUntil(Date.now() + STARTUP_TIMEOUT_MS, payload);
-  if (response.status === "ok") return Result.ok(responseSuccess(response.value));
-  if (!RemoteFsSocketTransportError.is(response.error)) return Result.err(response.error);
-  return Result.err(new RemoteFsDaemonStartupError({ message: "remote fs daemon did not start" }));
+  return response
+    .map(responseSuccess)
+    .mapError((error) =>
+      RemoteFsSocketTransportError.is(error)
+        ? new RemoteFsDaemonStartupError({ message: "remote fs daemon did not start" })
+        : error,
+    );
 }
 
 export async function runRequest(): Promise<ResultType<ResponseEnvelope, RemoteFsRunRequestError>> {
-  const stdin = await readStdinText();
-  if (stdin.status === "error") return Result.err(stdin.error);
-  const request = decodeRemoteFsRequestJson(stdin.value);
-  if (request.status === "error") return Result.err(request.error);
+  const stdin = resultOutcome(await readStdinText());
+  if (!stdin.ok) return Result.err(stdin.error);
+  const request = resultOutcome(decodeRemoteFsRequestJson(stdin.value));
+  if (!request.ok) return Result.err(request.error);
   const payload: RemoteFsDaemonRequest = { ...request.value, cwd: process.cwd() };
-  const runtimeDir = await ensureRuntimeDir();
-  if (runtimeDir.status === "error") return Result.err(runtimeDir.error);
+  const runtimeDir = resultOutcome(await ensureRuntimeDir());
+  if (!runtimeDir.ok) return Result.err(runtimeDir.error);
 
-  const direct = await tryConnectUntil(Date.now() + CONNECT_RETRY_MS, payload);
-  if (direct.status === "ok") return Result.ok(responseSuccess(direct.value));
+  const direct = resultOutcome(await tryConnectUntil(Date.now() + CONNECT_RETRY_MS, payload));
+  if (direct.ok) return Result.ok(responseSuccess(direct.value));
   if (!RemoteFsSocketTransportError.is(direct.error)) return Result.err(direct.error);
 
-  const lockResult = await tryAcquireStartupLock();
-  if (lockResult.status === "error") return Result.err(lockResult.error);
-  const acquiredLock = lockResult.value;
+  const lock = resultOutcome(await tryAcquireStartupLock());
+  if (!lock.ok) return Result.err(lock.error);
+  const acquiredLock = lock.value;
 
   const operation = async (): Promise<
     ResultType<ResponseEnvelope, RemoteFsRequestOperationError>
   > => {
     if (!acquiredLock) return await waitForDaemon(payload);
-    const spawned = await spawnDaemon();
-    if (spawned.status === "error") return Result.err(spawned.error);
+    const spawned = resultOutcome(await spawnDaemon());
+    if (!spawned.ok) return Result.err(spawned.error);
     return await waitForDaemon(payload);
   };
 
@@ -753,19 +777,18 @@ function createServer(idleMs: number): net.Server {
     socket.on("end", () => {
       void (async () => {
         const request = decodeRemoteFsDaemonRequestJson(requestText);
-        if (request.status === "error") {
-          socket.end(JSON.stringify(responseError(request.error)));
-          inFlight -= 1;
-          scheduleIdleExit();
-          return;
-        }
-
-        const handled = await executeDaemonRequest(request.value);
-        if (handled.status === "ok") {
-          socket.end(JSON.stringify(responseSuccess(handled.value)));
-        } else {
-          socket.end(JSON.stringify(responseError(handled.error)));
-        }
+        await request.match({
+          err: async (error) => {
+            socket.end(JSON.stringify(responseError(error)));
+          },
+          ok: async (value) => {
+            const handled = await executeDaemonRequest(value);
+            handled.match({
+              ok: (response) => socket.end(JSON.stringify(responseSuccess(response))),
+              err: (error) => socket.end(JSON.stringify(responseError(error))),
+            });
+          },
+        });
         inFlight -= 1;
         scheduleIdleExit();
       })();
@@ -782,58 +805,69 @@ function createServer(idleMs: number): net.Server {
 
 async function runDaemon(): Promise<ResultType<void, RemoteFsRuntimeSetupError>> {
   const runtimeDir = await ensureRuntimeDir();
-  if (runtimeDir.status === "error") return Result.err(runtimeDir.error);
-  const sock = socketPath();
-  if (process.platform !== "win32" && fsSync.existsSync(sock)) {
-    const unlinked = await captureRuntimeOperation(
-      `failed to remove stale remote fs socket: ${sock}`,
-      () => fs.unlink(sock),
-    );
-    if (unlinked.status === "error") return Result.err(unlinked.error);
-  }
+  return runtimeDir.match({
+    err: async (error) => Result.err(error),
+    ok: async () => {
+      const sock = socketPath();
+      if (process.platform !== "win32" && fsSync.existsSync(sock)) {
+        const unlinked = await captureRuntimeOperation(
+          `failed to remove stale remote fs socket: ${sock}`,
+          () => fs.unlink(sock),
+        );
+        const unlinkError = unlinked.match({ ok: () => null, err: (error) => error });
+        if (unlinkError) return Result.err(unlinkError);
+      }
 
-  const idleMs = numberOrUndefined(process.env.LILAC_REMOTE_FS_IDLE_MS) ?? DEFAULT_IDLE_MS;
-  const server = createServer(idleMs);
+      const idleMs = numberOrUndefined(process.env.LILAC_REMOTE_FS_IDLE_MS) ?? DEFAULT_IDLE_MS;
+      const server = createServer(idleMs);
 
-  const shutdown = () => {
-    server.close(() => process.exit(0));
-  };
-  process.once("SIGTERM", shutdown);
-  process.once("SIGINT", shutdown);
+      const shutdown = () => {
+        server.close(() => process.exit(0));
+      };
+      process.once("SIGTERM", shutdown);
+      process.once("SIGINT", shutdown);
 
-  return await new Promise((resolve) => {
-    let settled = false;
-    server.once("error", (cause) => {
-      if (settled) return;
-      settled = true;
-      resolve(
-        Result.err(
-          new RemoteFsRuntimeSetupError({
-            cause,
-            message: `failed to listen on remote fs socket: ${sock}`,
-          }),
-        ),
-      );
-    });
-    server.listen(sock, () => {
-      void (async () => {
-        if (settled) return;
-        if (process.platform !== "win32") {
-          const secured = await captureRuntimeOperation(
-            `failed to secure remote fs socket: ${sock}`,
-            () => fs.chmod(sock, 0o600),
+      return await new Promise((resolve) => {
+        let settled = false;
+        server.once("error", (cause) => {
+          if (settled) return;
+          settled = true;
+          resolve(
+            Result.err(
+              new RemoteFsRuntimeSetupError({
+                cause,
+                message: `failed to listen on remote fs socket: ${sock}`,
+              }),
+            ),
           );
-          if (secured.status === "error") {
+        });
+        server.listen(sock, () => {
+          void (async () => {
+            if (settled) return;
+            if (process.platform !== "win32") {
+              const secured = await captureRuntimeOperation(
+                `failed to secure remote fs socket: ${sock}`,
+                () => fs.chmod(sock, 0o600),
+              );
+              secured.match({
+                err: (error) => {
+                  settled = true;
+                  server.close();
+                  resolve(Result.err(error));
+                },
+                ok: () => {
+                  settled = true;
+                  resolve(Result.ok(undefined));
+                },
+              });
+              return;
+            }
             settled = true;
-            server.close();
-            resolve(Result.err(secured.error));
-            return;
-          }
-        }
-        settled = true;
-        resolve(Result.ok(undefined));
-      })();
-    });
+            resolve(Result.ok(undefined));
+          })();
+        });
+      });
+    },
   });
 }
 
@@ -845,34 +879,39 @@ async function main(): Promise<void> {
   }
   if (command === "daemon") {
     const daemon = await runDaemon();
-    if (daemon.status === "error") {
-      writeJson(responseError(daemon.error));
-      process.exitCode = 1;
-    }
+    daemon.match({
+      ok: () => undefined,
+      err: (error) => {
+        writeJson(responseError(error));
+        process.exitCode = 1;
+      },
+    });
     return;
   }
   if (command === "request") {
     const request = await runRequest();
-    writeJson(request.status === "ok" ? request.value : responseError(request.error));
+    writeJson(request.match({ ok: (value) => value, err: responseError }));
     return;
   }
   if (command === "health") {
     const runtimeDir = await ensureRuntimeDir();
-    if (runtimeDir.status === "error") {
-      writeJson(responseError(runtimeDir.error));
-      return;
-    }
-    const response = await connectOnce({
-      op: "health",
-      input: {},
-      denyPaths: [],
-      cwd: process.cwd(),
+    await runtimeDir.match({
+      err: async (error) => writeJson(responseError(error)),
+      ok: async () => {
+        const response = await connectOnce({
+          op: "health",
+          input: {},
+          denyPaths: [],
+          cwd: process.cwd(),
+        });
+        writeJson(
+          response.match({
+            ok: (value) => ({ ok: true, value }) satisfies ResponseEnvelope,
+            err: responseError,
+          }),
+        );
+      },
     });
-    writeJson(
-      response.status === "ok"
-        ? ({ ok: true, value: response.value } satisfies ResponseEnvelope)
-        : responseError(response.error),
-    );
     return;
   }
 

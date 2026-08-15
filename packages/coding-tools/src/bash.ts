@@ -488,8 +488,11 @@ async function persistBashArtifact(params: {
     }),
   );
   if (captured.kind === "panic") return signalCodingToolHost(captured.panic);
-  if (captured.kind === "error" || captured.value.status === "error") return undefined;
-  return { uri: captured.value.value.uri, bytes: captured.value.value.bytes };
+  if (captured.kind === "error") return undefined;
+  return captured.value.match({
+    err: () => undefined,
+    ok: (value) => ({ uri: value.uri, bytes: value.bytes }),
+  });
 }
 
 async function cleanupBashSpoolAfterExecution(
@@ -538,7 +541,7 @@ export async function executeLocalBash(
       denyPaths: options.denyPaths,
       operation: "bash cwd",
     });
-    if (allowedCwd.status === "error") cwdBlockReason = allowedCwd.error.message;
+    cwdBlockReason = allowedCwd.match({ ok: () => undefined, err: (error) => error.message });
   }
 
   if (analysis || blockedPath || cwdBlockReason) {

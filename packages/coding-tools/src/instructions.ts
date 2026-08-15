@@ -94,7 +94,7 @@ async function pathExists(candidatePath: string): Promise<boolean> {
   const checked = await captureFilesystemOperation("inspect instruction path", () =>
     stat(candidatePath),
   );
-  return checked.status === "ok";
+  return checked.match({ ok: () => true, err: () => false });
 }
 
 async function canonicalPath(candidatePath: string): Promise<string> {
@@ -102,7 +102,7 @@ async function canonicalPath(candidatePath: string): Promise<string> {
   const canonicalized = await captureFilesystemOperation("canonicalize instruction path", () =>
     realpath(absolute),
   );
-  return canonicalized.status === "ok" ? canonicalized.value : absolute;
+  return canonicalized.match({ ok: (value) => value, err: () => absolute });
 }
 
 async function canonicalPaths(paths: Iterable<string>): Promise<Set<string>> {
@@ -130,11 +130,15 @@ async function readInstructionFile(filePath: string): Promise<string | null> {
   const read = await captureFilesystemOperation("read instruction file", () =>
     readFile(filePath, "utf8"),
   );
-  if (read.status === "error") return null;
-  const content = read.value.trim();
-  if (!content) return null;
-  if (content.length <= MAX_INSTRUCTION_CHARS) return content;
-  return `${content.slice(0, MAX_INSTRUCTION_CHARS)}\n... (truncated)`;
+  return read.match({
+    err: () => null,
+    ok: (value) => {
+      const content = value.trim();
+      if (!content) return null;
+      if (content.length <= MAX_INSTRUCTION_CHARS) return content;
+      return `${content.slice(0, MAX_INSTRUCTION_CHARS)}\n... (truncated)`;
+    },
+  });
 }
 
 function parseInstructionPathsFromText(text: string): string[] {

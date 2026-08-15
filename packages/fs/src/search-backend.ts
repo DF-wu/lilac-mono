@@ -1,5 +1,6 @@
 import fs from "node:fs/promises";
 import { createHash } from "node:crypto";
+import type { Dir, Stats } from "node:fs";
 import { basename, join, relative, sep } from "node:path";
 
 import type { FileFinderApi } from "@ff-labs/fff-node";
@@ -155,12 +156,18 @@ async function resolveFffStoragePaths(
   const frecencyCreated = await captureFilesystemOperation("create FFF frecency directory", () =>
     fs.mkdir(frecencyDbPath, { recursive: true }),
   );
-  if (frecencyCreated.status === "error") return {};
-  const historyCreated = await captureFilesystemOperation("create FFF history directory", () =>
-    fs.mkdir(historyDbPath, { recursive: true }),
-  );
-  if (historyCreated.status === "error") return {};
-  return { frecencyDbPath, historyDbPath };
+  return frecencyCreated.match({
+    err: () => ({}),
+    ok: async () => {
+      const historyCreated = await captureFilesystemOperation("create FFF history directory", () =>
+        fs.mkdir(historyDbPath, { recursive: true }),
+      );
+      return historyCreated.match({
+        err: () => ({}),
+        ok: () => ({ frecencyDbPath, historyDbPath }),
+      });
+    },
+  });
 }
 
 function shouldFallbackForDenyPaths(params: {
@@ -219,20 +226,20 @@ async function getFffFinder(basePath: string, cacheDir?: string): Promise<FileFi
     if (!created.ok) return null;
 
     const finder = created.value;
-    const ready = captureFffOperation(() => finder.waitForIndexReady(10_000)).then(
-      (result) => result.status === "ok" && result.value.ok && result.value.value,
+    const ready = captureFffOperation(() => finder.waitForIndexReady(10_000)).then((result) =>
+      result.match({ ok: (value) => value.ok && value.value, err: () => false }),
     );
     cacheFffFinder(cacheKey, { finder, ready });
 
     await ready;
     return finder;
   });
-  return loaded.status === "ok" ? loaded.value : null;
+  return loaded.match({ ok: (value) => value, err: () => null });
 }
 
 async function isDirectory(path: string): Promise<boolean> {
   const stat = await captureFilesystemOperation("stat FFF search root", () => fs.stat(path));
-  return stat.status === "ok" && stat.value.isDirectory();
+  return stat.match({ ok: (value) => value.isDirectory(), err: () => false });
 }
 
 export async function prewarmFffFinders(params: {
@@ -247,7 +254,7 @@ export async function prewarmFffFinders(params: {
     const canonical = await captureFilesystemOperation("resolve FFF deny path", () =>
       fs.realpath(denyPath),
     );
-    canonicalDenyPaths.push(canonical.status === "ok" ? canonical.value : denyPath);
+    canonicalDenyPaths.push(canonical.match({ ok: (value) => value, err: () => denyPath }));
   }
 
   for (const basePath of params.basePaths) {
@@ -256,7 +263,7 @@ export async function prewarmFffFinders(params: {
     const canonical = await captureFilesystemOperation("resolve FFF search root", () =>
       fs.realpath(basePath),
     );
-    const canonicalBasePath = canonical.status === "ok" ? canonical.value : basePath;
+    const canonicalBasePath = canonical.match({ ok: (value) => value, err: () => basePath });
 
     if (!(await isDirectory(canonicalBasePath))) {
       results.push({ basePath, ok: false, skipped: "not-directory" });
@@ -306,28 +313,30 @@ export async function fuzzyFileSearch(params: {
   const searched = captureFffSyncOperation(() =>
     finder.fileSearch(params.query, { pageSize: limit + 1 }),
   );
-  if (searched.status === "error") return null;
-  const result = searched.value;
-  if (!result.ok) return null;
-
-  const items = result.value.items.slice(0, limit);
-  return {
-    results: items.map((item, index) => {
-      const score = result.value.scores[index];
+  return searched.match({
+    err: () => null,
+    ok: (result) => {
+      if (!result.ok) return null;
+      const items = result.value.items.slice(0, limit);
       return {
-        path: item.relativePath,
-        fileName: item.fileName,
-        size: item.size,
-        gitStatus: item.gitStatus,
-        score: score?.total,
-        matchType: score?.matchType,
+        results: items.map((item, index) => {
+          const score = result.value.scores[index];
+          return {
+            path: item.relativePath,
+            fileName: item.fileName,
+            size: item.size,
+            gitStatus: item.gitStatus,
+            score: score?.total,
+            matchType: score?.matchType,
+          };
+        }),
+        totalMatched: result.value.totalMatched,
+        totalFiles: result.value.totalFiles,
+        truncated: result.value.items.length > limit || result.value.totalMatched > limit,
+        effectiveBackend: "fff",
       };
-    }),
-    totalMatched: result.value.totalMatched,
-    totalFiles: result.value.totalFiles,
-    truncated: result.value.items.length > limit || result.value.totalMatched > limit,
-    effectiveBackend: "fff",
-  };
+    },
+  });
 }
 
 export async function fzfFileSearch(params: {
@@ -354,44 +363,45 @@ export async function fzfFileSearch(params: {
     const directoryStats = await captureFilesystemOperation("inspect fzf search directory", () =>
       fs.lstat(directory),
     );
-    if (directoryStats.status === "error") {
-      if (isSkippableTraversalError(directoryStats.error)) continue;
-      return null;
-    }
-    if (!directoryStats.value.isDirectory()) continue;
+    const stats = directoryStats.match<Stats | null | false>({
+      ok: (value) => value,
+      err: (error) => (isSkippableTraversalError(error) ? null : false),
+    });
+    if (stats === false) return null;
+    if (stats === null || !stats.isDirectory()) continue;
 
     const opened = await captureFilesystemOperation("open fzf search directory", () =>
       fs.opendir(directory),
     );
-    if (opened.status === "error") {
-      if (isSkippableTraversalError(opened.error)) continue;
-      return null;
-    }
+    const dir = opened.match<Dir | null | false>({
+      ok: (value) => value,
+      err: (error) => (isSkippableTraversalError(error) ? null : false),
+    });
+    if (dir === false) return null;
+    if (dir === null) continue;
 
     const canonicalDirectory = await captureFilesystemOperation(
       "resolve opened fzf search directory",
       () => fs.realpath(directory),
     );
+    const canonicalPath = canonicalDirectory.match<string | null | false>({
+      ok: (value) => value,
+      err: (error) => (isSkippableTraversalError(error) ? null : false),
+    });
     if (
-      canonicalDirectory.status === "error" ||
-      canonicalDirectory.value !== directory ||
-      (!params.dangerouslyAllow && isDeniedPath(canonicalDirectory.value, params.denyPaths))
+      canonicalPath === null ||
+      canonicalPath === false ||
+      canonicalPath !== directory ||
+      (!params.dangerouslyAllow && isDeniedPath(canonicalPath, params.denyPaths))
     ) {
-      await captureFilesystemOperation("close skipped fzf search directory", () =>
-        opened.value.close(),
-      );
-      if (
-        canonicalDirectory.status === "error" &&
-        !isSkippableTraversalError(canonicalDirectory.error)
-      ) {
-        return null;
-      }
+      await captureFilesystemOperation("close skipped fzf search directory", () => dir.close());
+      if (canonicalPath === false) return null;
       continue;
     }
 
     const childDirectories: string[] = [];
     const iterated = await captureFilesystemOperation("iterate fzf search directory", async () => {
-      for await (const dirent of opened.value) {
+      for await (const dirent of dir) {
         if (files.length >= MAX_FZF_FILES || Date.now() >= scanDeadline) {
           scanTruncated = true;
           break;
@@ -405,10 +415,12 @@ export async function fzfFileSearch(params: {
         }
       }
     });
-    if (iterated.status === "error") {
-      if (isSkippableTraversalError(iterated.error)) continue;
-      return null;
-    }
+    const iterationCompleted = iterated.match({
+      ok: () => true,
+      err: (error) => (isSkippableTraversalError(error) ? false : null),
+    });
+    if (iterationCompleted === null) return null;
+    if (!iterationCompleted) continue;
 
     childDirectories.sort().reverse();
     pendingDirectories.push(...childDirectories);
@@ -424,16 +436,17 @@ export async function fzfFileSearch(params: {
     const stats = await captureFilesystemOperation("inspect fzf search result", () =>
       fs.lstat(join(params.cwd, match.item)),
     );
-    if (stats.status === "error") {
-      if (isSkippableTraversalError(stats.error)) continue;
-      return null;
-    }
-    if (!stats.value.isFile()) continue;
+    const fileStats = stats.match<Stats | null | false>({
+      ok: (value) => value,
+      err: (error) => (isSkippableTraversalError(error) ? null : false),
+    });
+    if (fileStats === false) return null;
+    if (fileStats === null || !fileStats.isFile()) continue;
 
     results.push({
       path: match.item,
       fileName: basename(match.item),
-      size: stats.value.size,
+      size: fileStats.size,
       gitStatus: "unknown",
       score: match.score,
       matchType: "fuzzy",
@@ -525,18 +538,22 @@ const fffBackend: SearchBackend = {
         afterContext: options.contextLines ?? 0,
       }),
     );
-    if (captured.status === "error") return await nodeRgBackend.grep(options);
-    const result = captured.value;
+    return captured.match({
+      err: () => nodeRgBackend.grep(options),
+      ok: async (result) => {
+        if (!result.ok) return await nodeRgBackend.grep(options);
+        if (options.regex && result.value.regexFallbackError) {
+          return await nodeRgBackend.grep(options);
+        }
 
-    if (!result.ok) return await nodeRgBackend.grep(options);
-    if (options.regex && result.value.regexFallbackError) return await nodeRgBackend.grep(options);
-
-    const matches = result.value.items.map(mapFffGrepMatch);
-    const truncated = matches.length > limit;
-    return Result.ok({
-      matches: truncated ? matches.slice(0, limit) : matches,
-      truncated,
-      effectiveBackend: "fff",
+        const matches = result.value.items.map(mapFffGrepMatch);
+        const truncated = matches.length > limit;
+        return Result.ok({
+          matches: truncated ? matches.slice(0, limit) : matches,
+          truncated,
+          effectiveBackend: "fff",
+        });
+      },
     });
   },
 
@@ -575,8 +592,8 @@ const fffBackend: SearchBackend = {
       const captured = captureFffSyncOperation(() =>
         finder.glob(pattern, { pageSize: options.maxEntries + 1 }),
       );
-      if (captured.status === "error") return null;
-      const result = captured.value;
+      const result = captured.match({ ok: (value) => value, err: () => null });
+      if (result === null) return null;
       if (!result.ok) return null;
 
       for (const item of result.value.items) {
@@ -585,7 +602,8 @@ const fffBackend: SearchBackend = {
 
         const abs = join(options.cwd, relPath);
         const stat = await captureFilesystemOperation("stat FFF glob match", () => fs.stat(abs));
-        if (stat.status === "error" || !stat.value.isFile()) continue;
+        const isFile = stat.match({ ok: (value) => value.isFile(), err: () => false });
+        if (!isFile) continue;
 
         seen.add(relPath);
         if (paths.length >= options.maxEntries) {

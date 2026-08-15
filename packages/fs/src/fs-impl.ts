@@ -47,6 +47,15 @@ export function expandTilde(input: string) {
   return input;
 }
 
+function resultOutcome<T, E>(
+  result: ResultType<T, E>,
+): { ok: true; value: T } | { ok: false; error: E } {
+  return result.match<{ ok: true; value: T } | { ok: false; error: E }>({
+    ok: (value) => ({ ok: true, value }),
+    err: (error) => ({ ok: false, error }),
+  });
+}
+
 export async function canonicalizePathAsFarAsExists(
   inputPath: string,
 ): Promise<ResultType<string, FileSystemOperationFailed>> {
@@ -54,24 +63,25 @@ export async function canonicalizePathAsFarAsExists(
   const missingSegments: string[] = [];
 
   while (true) {
-    const canonical = await captureFilesystemOperation("canonicalize path", () =>
-      fs.realpath(current),
+    const canonical = resultOutcome(
+      await captureFilesystemOperation("canonicalize path", () => fs.realpath(current)),
     );
-    if (canonical.status === "ok") {
-      return Result.ok(resolve(canonical.value, ...missingSegments));
-    }
+    if (canonical.ok) return Result.ok(resolve(canonical.value, ...missingSegments));
     if (canonical.error.code !== "ENOENT" && canonical.error.code !== "ENOTDIR") {
       return Result.err(canonical.error);
     }
 
-    const stats = await captureFilesystemOperation("inspect canonical path segment", () =>
-      fs.lstat(current),
+    const stats = resultOutcome(
+      await captureFilesystemOperation("inspect canonical path segment", () => fs.lstat(current)),
     );
-    if (stats.status === "ok" && stats.value.isSymbolicLink()) {
-      const target = await captureFilesystemOperation("read canonical path symlink", () =>
-        fs.readlink(current),
+    if (!stats.ok && stats.error.code !== "ENOENT" && stats.error.code !== "ENOTDIR") {
+      return Result.err(stats.error);
+    }
+    if (stats.ok && stats.value.isSymbolicLink()) {
+      const target = resultOutcome(
+        await captureFilesystemOperation("read canonical path symlink", () => fs.readlink(current)),
       );
-      if (target.status === "error") return Result.err(target.error);
+      if (!target.ok) return Result.err(target.error);
       current = isAbsolute(target.value)
         ? resolve(target.value)
         : resolve(dirname(current), target.value);
@@ -663,11 +673,11 @@ export class FileSystem {
       const canonical = captureFilesystemOperationSync("canonicalize deny path", () =>
         realpathSync(resolvedPath),
       );
-      if (canonical.status === "ok") {
-        const canonicalPath = canonical.value;
-        return canonicalPath === resolvedPath ? [resolvedPath] : [resolvedPath, canonicalPath];
-      }
-      return [resolvedPath];
+      return canonical.match({
+        ok: (canonicalPath) =>
+          canonicalPath === resolvedPath ? [resolvedPath] : [resolvedPath, canonicalPath],
+        err: () => [resolvedPath],
+      });
     });
     this.fsBackend = opts?.fsBackend ?? "node-rg";
     this.fffCacheDir = opts?.fffCacheDir ? resolve(expandTilde(opts.fffCacheDir)) : undefined;
@@ -723,289 +733,303 @@ export class FileSystem {
     cwd?: string,
   ): Promise<ReadFileResult> {
     const resolvedPath = this.resolvePath(path, cwd);
-    const {
-      start = { type: "line", line: 1 },
-      maxLines = 2000,
-      maxCharacters = 10000,
-      maxBytes,
-      format = "raw",
-      dangerouslyAllow = false,
-    } = opts;
+    const readResult = await (async (): Promise<
+      ResultType<ReadFileResult, FileSystemOperationFailed>
+    > => {
+      const {
+        start = { type: "line", line: 1 },
+        maxLines = 2000,
+        maxCharacters = 10000,
+        maxBytes,
+        format = "raw",
+        dangerouslyAllow = false,
+      } = opts;
 
-    const allowedPath = this.assertAllowed(resolvedPath, "readFile", dangerouslyAllow);
-    if (allowedPath.status === "error") return this.readFailure(resolvedPath, allowedPath.error);
-    const canonical = await captureFilesystemOperation("resolve file for reading", () =>
-      fs.realpath(resolvedPath),
-    );
-    if (canonical.status === "error") return this.readFailure(resolvedPath, canonical.error);
-    const canonicalPath = canonical.value;
-    const allowedCanonical = this.assertAllowed(canonicalPath, "readFile", dangerouslyAllow);
-    if (allowedCanonical.status === "error") {
-      return this.readFailure(resolvedPath, allowedCanonical.error);
-    }
-
-    const requestedStartLine = start.type === "line" ? Math.max(1, Math.floor(start.line)) : 1;
-    const requestedStartColumn =
-      start.type === "line" ? Math.max(0, Math.floor(start.column ?? 0)) : 0;
-    const requestedStartOffset =
-      start.type === "offset" ? Math.max(0, Math.floor(start.offset)) : undefined;
-    const requestedMaxLines = Number.isFinite(maxLines) ? Math.max(1, Math.floor(maxLines)) : 2000;
-    const requestedMaxCharacters = Number.isFinite(maxCharacters)
-      ? Math.max(1, Math.floor(maxCharacters))
-      : 10000;
-    const requestedMaxBytes =
-      maxBytes !== undefined && Number.isFinite(maxBytes)
-        ? Math.max(1, Math.floor(maxBytes))
-        : Number.POSITIVE_INFINITY;
-    if (requestedMaxBytes < 4) {
-      return {
-        success: false,
-        resolvedPath,
-        error: {
-          code: "UNKNOWN",
-          message: "readFile maxBytes must be at least 4 to fit one Unicode character",
-        },
-      };
-    }
-    const storedLineLimit = requestedMaxCharacters + 2;
-    const storedCharacterLimit = requestedMaxCharacters + 1;
-    const windowLines: string[] = [];
-    const decoder = new StringDecoder("utf8");
-    const hasher = createHash("sha256");
-    let lineNumber = 1;
-    let selectedLineCount = 0;
-    let storedCharacters = 0;
-    let currentLine = "";
-    let currentLineCharacters = 0;
-    let currentLineUtf16Length = 0;
-    let firstSelectedLineCharacters = 0;
-    let sourceOffset = 0;
-    let offsetStartLine: number | undefined;
-    let offsetStartColumn: number | undefined;
-    let normalizedStartOffset: number | undefined;
-    let selectedNextLineOffset: number | undefined;
-    let hashlineOverflow: HashlineWarning | undefined;
-
-    const resolveOffsetStart = () => {
-      if (
-        requestedStartOffset === undefined ||
-        offsetStartLine !== undefined ||
-        sourceOffset < requestedStartOffset
-      ) {
-        return;
-      }
-      offsetStartLine = lineNumber;
-      offsetStartColumn = currentLineCharacters;
-      normalizedStartOffset = sourceOffset;
-    };
-
-    const isCurrentLineSelected = () => {
-      if (start.type === "line") {
-        return (
-          lineNumber >= requestedStartLine && lineNumber < requestedStartLine + requestedMaxLines
-        );
-      }
-      return (
-        offsetStartLine !== undefined &&
-        lineNumber >= offsetStartLine &&
-        lineNumber < offsetStartLine + requestedMaxLines
+      const allowedPath = resultOutcome(
+        this.assertAllowed(resolvedPath, "readFile", dangerouslyAllow),
       );
-    };
+      if (!allowedPath.ok) return Result.err(allowedPath.error);
+      const canonical = resultOutcome(
+        await captureFilesystemOperation("resolve file for reading", () =>
+          fs.realpath(resolvedPath),
+        ),
+      );
+      if (!canonical.ok) return Result.err(canonical.error);
+      const canonicalPath = canonical.value;
+      const allowedCanonical = resultOutcome(
+        this.assertAllowed(canonicalPath, "readFile", dangerouslyAllow),
+      );
+      if (!allowedCanonical.ok) return Result.err(allowedCanonical.error);
 
-    const finishLine = (hasNewline: boolean) => {
-      resolveOffsetStart();
-      if (isCurrentLineSelected()) {
-        if (selectedLineCount === 0) firstSelectedLineCharacters = currentLineCharacters;
-        if (!hashlineOverflow && currentLineUtf16Length > HASHLINE_MAX_LINE_CHARS) {
-          hashlineOverflow = buildHashlineWarning(lineNumber, currentLineUtf16Length);
-        }
-        if (windowLines.length < storedLineLimit) windowLines.push(currentLine);
-        selectedLineCount++;
-        if (hasNewline) selectedNextLineOffset = sourceOffset + 1;
+      const requestedStartLine = start.type === "line" ? Math.max(1, Math.floor(start.line)) : 1;
+      const requestedStartColumn =
+        start.type === "line" ? Math.max(0, Math.floor(start.column ?? 0)) : 0;
+      const requestedStartOffset =
+        start.type === "offset" ? Math.max(0, Math.floor(start.offset)) : undefined;
+      const requestedMaxLines = Number.isFinite(maxLines)
+        ? Math.max(1, Math.floor(maxLines))
+        : 2000;
+      const requestedMaxCharacters = Number.isFinite(maxCharacters)
+        ? Math.max(1, Math.floor(maxCharacters))
+        : 10000;
+      const requestedMaxBytes =
+        maxBytes !== undefined && Number.isFinite(maxBytes)
+          ? Math.max(1, Math.floor(maxBytes))
+          : Number.POSITIVE_INFINITY;
+      if (requestedMaxBytes < 4) {
+        return Result.ok<ReadFileResult>({
+          success: false,
+          resolvedPath,
+          error: {
+            code: "UNKNOWN",
+            message: "readFile maxBytes must be at least 4 to fit one Unicode character",
+          },
+        });
       }
-      currentLine = "";
-      currentLineCharacters = 0;
-      currentLineUtf16Length = 0;
-    };
+      const storedLineLimit = requestedMaxCharacters + 2;
+      const storedCharacterLimit = requestedMaxCharacters + 1;
+      const windowLines: string[] = [];
+      const decoder = new StringDecoder("utf8");
+      const hasher = createHash("sha256");
+      let lineNumber = 1;
+      let selectedLineCount = 0;
+      let storedCharacters = 0;
+      let currentLine = "";
+      let currentLineCharacters = 0;
+      let currentLineUtf16Length = 0;
+      let firstSelectedLineCharacters = 0;
+      let sourceOffset = 0;
+      let offsetStartLine: number | undefined;
+      let offsetStartColumn: number | undefined;
+      let normalizedStartOffset: number | undefined;
+      let selectedNextLineOffset: number | undefined;
+      let hashlineOverflow: HashlineWarning | undefined;
 
-    const consumeText = (text: string) => {
-      for (const character of text) {
-        if (character === "\n") {
-          finishLine(true);
-          sourceOffset++;
-          lineNumber++;
-          continue;
-        }
-
-        resolveOffsetStart();
-        currentLineCharacters++;
-        currentLineUtf16Length += character.length;
+      const resolveOffsetStart = () => {
         if (
-          isCurrentLineSelected() &&
-          (start.type === "offset" ||
-            lineNumber !== requestedStartLine ||
-            currentLineCharacters > requestedStartColumn) &&
-          storedCharacters < storedCharacterLimit
+          requestedStartOffset === undefined ||
+          offsetStartLine !== undefined ||
+          sourceOffset < requestedStartOffset
         ) {
-          currentLine += character;
-          storedCharacters++;
+          return;
         }
-        sourceOffset++;
+        offsetStartLine = lineNumber;
+        offsetStartColumn = currentLineCharacters;
+        normalizedStartOffset = sourceOffset;
+      };
+
+      const isCurrentLineSelected = () => {
+        if (start.type === "line") {
+          return (
+            lineNumber >= requestedStartLine && lineNumber < requestedStartLine + requestedMaxLines
+          );
+        }
+        return (
+          offsetStartLine !== undefined &&
+          lineNumber >= offsetStartLine &&
+          lineNumber < offsetStartLine + requestedMaxLines
+        );
+      };
+
+      const finishLine = (hasNewline: boolean) => {
+        resolveOffsetStart();
+        if (isCurrentLineSelected()) {
+          if (selectedLineCount === 0) firstSelectedLineCharacters = currentLineCharacters;
+          if (!hashlineOverflow && currentLineUtf16Length > HASHLINE_MAX_LINE_CHARS) {
+            hashlineOverflow = buildHashlineWarning(lineNumber, currentLineUtf16Length);
+          }
+          if (windowLines.length < storedLineLimit) windowLines.push(currentLine);
+          selectedLineCount++;
+          if (hasNewline) selectedNextLineOffset = sourceOffset + 1;
+        }
+        currentLine = "";
+        currentLineCharacters = 0;
+        currentLineUtf16Length = 0;
+      };
+
+      const consumeText = (text: string) => {
+        for (const character of text) {
+          if (character === "\n") {
+            finishLine(true);
+            sourceOffset++;
+            lineNumber++;
+            continue;
+          }
+
+          resolveOffsetStart();
+          currentLineCharacters++;
+          currentLineUtf16Length += character.length;
+          if (
+            isCurrentLineSelected() &&
+            (start.type === "offset" ||
+              lineNumber !== requestedStartLine ||
+              currentLineCharacters > requestedStartColumn) &&
+            storedCharacters < storedCharacterLimit
+          ) {
+            currentLine += character;
+            storedCharacters++;
+          }
+          sourceOffset++;
+        }
+      };
+
+      const streamed = resultOutcome(
+        await captureFilesystemOperation("stream file for reading", async () => {
+          for await (const chunk of createReadStream(canonicalPath)) {
+            const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+            hasher.update(bytes);
+            consumeText(decoder.write(bytes));
+          }
+        }),
+      );
+      if (!streamed.ok) return Result.err(streamed.error);
+      consumeText(decoder.end());
+      if (requestedStartOffset !== undefined && offsetStartLine === undefined) {
+        offsetStartLine = lineNumber;
+        offsetStartColumn = currentLineCharacters;
+        normalizedStartOffset = sourceOffset;
       }
-    };
+      finishLine(false);
 
-    const streamed = await captureFilesystemOperation("stream file for reading", async () => {
-      for await (const chunk of createReadStream(canonicalPath)) {
-        const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
-        hasher.update(bytes);
-        consumeText(decoder.write(bytes));
-      }
-    });
-    if (streamed.status === "error") return this.readFailure(resolvedPath, streamed.error);
-    consumeText(decoder.end());
-    if (requestedStartOffset !== undefined && offsetStartLine === undefined) {
-      offsetStartLine = lineNumber;
-      offsetStartColumn = currentLineCharacters;
-      normalizedStartOffset = sourceOffset;
-    }
-    finishLine(false);
+      const fileHash = hasher.digest("hex");
+      const totalLines = lineNumber;
+      const normalizedStartLine =
+        start.type === "line"
+          ? Math.min(requestedStartLine, totalLines + 1)
+          : (offsetStartLine ?? totalLines);
+      const normalizedStartColumn =
+        start.type === "line"
+          ? Math.min(requestedStartColumn, firstSelectedLineCharacters)
+          : (offsetStartColumn ?? 0);
+      const windowEndLine = normalizedStartLine + selectedLineCount - 1;
 
-    const fileHash = hasher.digest("hex");
-    const totalLines = lineNumber;
-    const normalizedStartLine =
-      start.type === "line"
-        ? Math.min(requestedStartLine, totalLines + 1)
-        : (offsetStartLine ?? totalLines);
-    const normalizedStartColumn =
-      start.type === "line"
-        ? Math.min(requestedStartColumn, firstSelectedLineCharacters)
-        : (offsetStartColumn ?? 0);
-    const windowEndLine = normalizedStartLine + selectedLineCount - 1;
+      let output: string;
+      let warnings: HashlineWarning[] | undefined;
+      let degradedFromHashline = false;
+      let effectiveFormat: "raw" | "numbered" | "hashline" = format;
 
-    let output: string;
-    let warnings: HashlineWarning[] | undefined;
-    let degradedFromHashline = false;
-    let effectiveFormat: "raw" | "numbered" | "hashline" = format;
-
-    if (format === "numbered") {
-      const digits = Math.max(1, String(Math.max(windowEndLine, normalizedStartLine)).length);
-      output = windowLines
-        .map((line, i) => `${String(normalizedStartLine + i).padStart(digits, " ")}| ${line}`)
-        .join("\n");
-    } else if (format === "hashline") {
-      const overflow = hashlineOverflow;
-      if (normalizedStartColumn > 0) {
-        effectiveFormat = "raw";
-        degradedFromHashline = true;
-        output = windowLines.join("\n");
-      } else if (overflow) {
-        effectiveFormat = "raw";
-        degradedFromHashline = true;
-        warnings = [overflow];
-        output = windowLines.join("\n");
+      if (format === "numbered") {
+        const digits = Math.max(1, String(Math.max(windowEndLine, normalizedStartLine)).length);
+        output = windowLines
+          .map((line, i) => `${String(normalizedStartLine + i).padStart(digits, " ")}| ${line}`)
+          .join("\n");
+      } else if (format === "hashline") {
+        const overflow = hashlineOverflow;
+        if (normalizedStartColumn > 0) {
+          effectiveFormat = "raw";
+          degradedFromHashline = true;
+          output = windowLines.join("\n");
+        } else if (overflow) {
+          effectiveFormat = "raw";
+          degradedFromHashline = true;
+          warnings = [overflow];
+          output = windowLines.join("\n");
+        } else {
+          output = formatHashlineWindow(windowLines, normalizedStartLine);
+        }
       } else {
-        output = formatHashlineWindow(windowLines, normalizedStartLine);
+        output = windowLines.join("\n");
       }
-    } else {
-      output = windowLines.join("\n");
-    }
-    const includesOffsetBoundaryNewline =
-      start.type === "offset" &&
-      selectedLineCount >= requestedMaxLines &&
-      selectedNextLineOffset !== undefined;
-    if (includesOffsetBoundaryNewline) output += "\n";
+      const includesOffsetBoundaryNewline =
+        start.type === "offset" &&
+        selectedLineCount >= requestedMaxLines &&
+        selectedNextLineOffset !== undefined;
+      if (includesOffsetBoundaryNewline) output += "\n";
 
-    let outputCharacters = Array.from(output);
-    if (
-      (outputCharacters.length > requestedMaxCharacters ||
-        Buffer.byteLength(output, "utf8") > requestedMaxBytes) &&
-      effectiveFormat !== "raw"
-    ) {
-      effectiveFormat = "raw";
-      degradedFromHashline ||= format === "hashline";
-      output = windowLines.join("\n") + (includesOffsetBoundaryNewline ? "\n" : "");
-      outputCharacters = Array.from(output);
-    }
-    const truncatedByChars = outputCharacters.length > requestedMaxCharacters;
-    const boundedCharacters: string[] = [];
-    let outputBytes = 0;
-    for (const character of outputCharacters.slice(0, requestedMaxCharacters)) {
-      const characterBytes = Buffer.byteLength(character, "utf8");
-      if (outputBytes + characterBytes > requestedMaxBytes) break;
-      boundedCharacters.push(character);
-      outputBytes += characterBytes;
-    }
-    const truncatedByBytes =
-      boundedCharacters.length < Math.min(outputCharacters.length, requestedMaxCharacters);
-    output = boundedCharacters.join("");
-    const truncated = truncatedByChars || truncatedByBytes;
-    const completeLines = truncated ? output.split("\n").length - 1 : selectedLineCount;
-    const endLine = truncated ? normalizedStartLine + completeLines - 1 : windowEndLine;
-    const hasMoreLines = truncated || endLine < totalLines;
-    let nextStart: ReadFileStart | undefined;
-    if (hasMoreLines) {
-      if (start.type === "offset") {
-        nextStart = {
-          type: "offset",
-          offset: truncated
-            ? (normalizedStartOffset ?? sourceOffset) + Array.from(output).length
-            : (selectedNextLineOffset ?? normalizedStartOffset ?? sourceOffset),
-        };
-      } else if (truncated) {
-        nextStart = {
-          type: "line",
-          line: normalizedStartLine + completeLines,
-          column:
-            completeLines === 0
-              ? normalizedStartColumn + Array.from(output).length
-              : Array.from(output.slice(output.lastIndexOf("\n") + 1)).length,
-        };
-      } else {
-        nextStart = {
-          type: "line",
-          line:
-            selectedLineCount > 0 ? normalizedStartLine + selectedLineCount : normalizedStartLine,
-          ...(selectedLineCount === 0 && normalizedStartColumn > 0
-            ? { column: normalizedStartColumn }
-            : {}),
-        };
+      let outputCharacters = Array.from(output);
+      if (
+        (outputCharacters.length > requestedMaxCharacters ||
+          Buffer.byteLength(output, "utf8") > requestedMaxBytes) &&
+        effectiveFormat !== "raw"
+      ) {
+        effectiveFormat = "raw";
+        degradedFromHashline ||= format === "hashline";
+        output = windowLines.join("\n") + (includesOffsetBoundaryNewline ? "\n" : "");
+        outputCharacters = Array.from(output);
       }
-    }
+      const truncatedByChars = outputCharacters.length > requestedMaxCharacters;
+      const boundedCharacters: string[] = [];
+      let outputBytes = 0;
+      for (const character of outputCharacters.slice(0, requestedMaxCharacters)) {
+        const characterBytes = Buffer.byteLength(character, "utf8");
+        if (outputBytes + characterBytes > requestedMaxBytes) break;
+        boundedCharacters.push(character);
+        outputBytes += characterBytes;
+      }
+      const truncatedByBytes =
+        boundedCharacters.length < Math.min(outputCharacters.length, requestedMaxCharacters);
+      output = boundedCharacters.join("");
+      const truncated = truncatedByChars || truncatedByBytes;
+      const completeLines = truncated ? output.split("\n").length - 1 : selectedLineCount;
+      const endLine = truncated ? normalizedStartLine + completeLines - 1 : windowEndLine;
+      const hasMoreLines = truncated || endLine < totalLines;
+      let nextStart: ReadFileStart | undefined;
+      if (hasMoreLines) {
+        if (start.type === "offset") {
+          nextStart = {
+            type: "offset",
+            offset: truncated
+              ? (normalizedStartOffset ?? sourceOffset) + Array.from(output).length
+              : (selectedNextLineOffset ?? normalizedStartOffset ?? sourceOffset),
+          };
+        } else if (truncated) {
+          nextStart = {
+            type: "line",
+            line: normalizedStartLine + completeLines,
+            column:
+              completeLines === 0
+                ? normalizedStartColumn + Array.from(output).length
+                : Array.from(output.slice(output.lastIndexOf("\n") + 1)).length,
+          };
+        } else {
+          nextStart = {
+            type: "line",
+            line:
+              selectedLineCount > 0 ? normalizedStartLine + selectedLineCount : normalizedStartLine,
+            ...(selectedLineCount === 0 && normalizedStartColumn > 0
+              ? { column: normalizedStartColumn }
+              : {}),
+          };
+        }
+      }
 
-    this.fileAccessRecord.set(resolvedPath, {
-      lastAccess: Date.now(),
-      fileHash,
-    });
+      this.fileAccessRecord.set(resolvedPath, {
+        lastAccess: Date.now(),
+        fileHash,
+      });
 
-    this.fireEvent({
-      type: "readFile",
-      path: resolvedPath,
-      accessAt: Date.now(),
-    });
+      this.fireEvent({
+        type: "readFile",
+        path: resolvedPath,
+        accessAt: Date.now(),
+      });
 
-    const base: ReadFileSuccessBase = {
-      success: true,
-      resolvedPath,
-      fileHash,
-      startLine: normalizedStartLine,
-      endLine,
-      totalLines,
-      hasMoreLines,
-      truncatedByChars,
-      ...(nextStart ? { nextStart } : {}),
-      ...(warnings ? { warnings } : {}),
-      ...(degradedFromHashline ? { degradedFromHashline } : {}),
-    };
+      const base: ReadFileSuccessBase = {
+        success: true,
+        resolvedPath,
+        fileHash,
+        startLine: normalizedStartLine,
+        endLine,
+        totalLines,
+        hasMoreLines,
+        truncatedByChars,
+        ...(nextStart ? { nextStart } : {}),
+        ...(warnings ? { warnings } : {}),
+        ...(degradedFromHashline ? { degradedFromHashline } : {}),
+      };
 
-    if (effectiveFormat === "numbered") {
-      return { ...base, format: "numbered", numberedContent: output };
-    }
+      if (effectiveFormat === "numbered") {
+        return Result.ok<ReadFileResult>({ ...base, format: "numbered", numberedContent: output });
+      }
 
-    if (effectiveFormat === "hashline") {
-      return { ...base, format: "hashline", hashlineContent: output };
-    }
+      if (effectiveFormat === "hashline") {
+        return Result.ok<ReadFileResult>({ ...base, format: "hashline", hashlineContent: output });
+      }
 
-    return { ...base, format: "raw", content: output };
+      return Result.ok<ReadFileResult>({ ...base, format: "raw", content: output });
+    })();
+    const outcome = resultOutcome(readResult);
+    return outcome.ok ? outcome.value : this.readFailure(resolvedPath, outcome.error);
   }
 
   /**
@@ -1027,61 +1051,70 @@ export class FileSystem {
     cwd?: string,
   ): Promise<ReadFileBytesResult> {
     const resolvedPath = this.resolvePath(path, cwd);
-    const allowedPath = this.assertAllowed(resolvedPath, "readFile", dangerouslyAllow);
-    if (allowedPath.status === "error")
-      return this.readBytesFailure(resolvedPath, allowedPath.error);
-    const canonical = await captureFilesystemOperation("resolve byte file for reading", () =>
-      fs.realpath(resolvedPath),
-    );
-    if (canonical.status === "error") return this.readBytesFailure(resolvedPath, canonical.error);
-    const canonicalPath = canonical.value;
-    const allowedCanonical = this.assertAllowed(canonicalPath, "readFile", dangerouslyAllow);
-    if (allowedCanonical.status === "error") {
-      return this.readBytesFailure(resolvedPath, allowedCanonical.error);
-    }
-
-    if (maxBytes !== undefined) {
-      const stats = await captureFilesystemOperation("stat byte file", () =>
-        fs.stat(canonicalPath),
+    const readResult = await (async (): Promise<
+      ResultType<ReadFileBytesResult, FileSystemOperationFailed>
+    > => {
+      const allowedPath = resultOutcome(
+        this.assertAllowed(resolvedPath, "readFile", dangerouslyAllow),
       );
-      if (stats.status === "error") return this.readBytesFailure(resolvedPath, stats.error);
-      if (stats.value.size > maxBytes) {
-        return {
-          success: false,
-          resolvedPath,
-          error: {
-            code: "UNKNOWN",
-            message: `File is too large to inline (${stats.value.size} bytes; maximum ${maxBytes} bytes): ${resolvedPath}`,
-          },
-        };
+      if (!allowedPath.ok) return Result.err(allowedPath.error);
+      const canonical = resultOutcome(
+        await captureFilesystemOperation("resolve byte file for reading", () =>
+          fs.realpath(resolvedPath),
+        ),
+      );
+      if (!canonical.ok) return Result.err(canonical.error);
+      const canonicalPath = canonical.value;
+      const allowedCanonical = resultOutcome(
+        this.assertAllowed(canonicalPath, "readFile", dangerouslyAllow),
+      );
+      if (!allowedCanonical.ok) return Result.err(allowedCanonical.error);
+
+      if (maxBytes !== undefined) {
+        const stats = resultOutcome(
+          await captureFilesystemOperation("stat byte file", () => fs.stat(canonicalPath)),
+        );
+        if (!stats.ok) return Result.err(stats.error);
+        if (stats.value.size > maxBytes) {
+          return Result.ok<ReadFileBytesResult>({
+            success: false,
+            resolvedPath,
+            error: {
+              code: "UNKNOWN",
+              message: `File is too large to inline (${stats.value.size} bytes; maximum ${maxBytes} bytes): ${resolvedPath}`,
+            },
+          });
+        }
       }
-    }
 
-    const read = await captureFilesystemOperation("read byte file", () =>
-      fs.readFile(canonicalPath),
-    );
-    if (read.status === "error") return this.readBytesFailure(resolvedPath, read.error);
-    const bytes = read.value;
-    const fileHash = this.hash(bytes);
+      const read = resultOutcome(
+        await captureFilesystemOperation("read byte file", () => fs.readFile(canonicalPath)),
+      );
+      if (!read.ok) return Result.err(read.error);
+      const bytes = read.value;
+      const fileHash = this.hash(bytes);
 
-    this.fileAccessRecord.set(resolvedPath, {
-      lastAccess: Date.now(),
-      fileHash,
-    });
+      this.fileAccessRecord.set(resolvedPath, {
+        lastAccess: Date.now(),
+        fileHash,
+      });
 
-    this.fireEvent({
-      type: "readFile",
-      path: resolvedPath,
-      accessAt: Date.now(),
-    });
+      this.fireEvent({
+        type: "readFile",
+        path: resolvedPath,
+        accessAt: Date.now(),
+      });
 
-    return {
-      success: true,
-      resolvedPath,
-      fileHash,
-      bytes,
-      bytesLength: bytes.byteLength,
-    };
+      return Result.ok<ReadFileBytesResult>({
+        success: true,
+        resolvedPath,
+        fileHash,
+        bytes,
+        bytesLength: bytes.byteLength,
+      });
+    })();
+    const outcome = resultOutcome(readResult);
+    return outcome.ok ? outcome.value : this.readBytesFailure(resolvedPath, outcome.error);
   }
 
   async writeFile(
@@ -1101,129 +1134,141 @@ export class FileSystem {
     cwd?: string,
   ): Promise<WriteFileResult> {
     const resolvedPath = this.resolvePath(path, cwd);
-    const allowedPath = this.assertAllowed(resolvedPath, "writeFile");
-    if (allowedPath.status === "error") return this.writeFailure(resolvedPath, allowedPath.error);
-    const canonical = await canonicalizePathAsFarAsExists(resolvedPath);
-    if (canonical.status === "error") return this.writeFailure(resolvedPath, canonical.error);
-    const canonicalPath = canonical.value;
-    const allowedCanonical = this.assertAllowed(canonicalPath, "writeFile");
-    if (allowedCanonical.status === "error") {
-      return this.writeFailure(resolvedPath, allowedCanonical.error);
-    }
+    const writeResult = await (async (): Promise<
+      ResultType<WriteFileResult, FileSystemOperationFailed>
+    > => {
+      const allowedPath = resultOutcome(this.assertAllowed(resolvedPath, "writeFile"));
+      if (!allowedPath.ok) return Result.err(allowedPath.error);
+      const canonical = resultOutcome(await canonicalizePathAsFarAsExists(resolvedPath));
+      if (!canonical.ok) return Result.err(canonical.error);
+      const canonicalPath = canonical.value;
+      const allowedCanonical = resultOutcome(this.assertAllowed(canonicalPath, "writeFile"));
+      if (!allowedCanonical.ok) return Result.err(allowedCanonical.error);
 
-    let existed = true;
-    let currentHash: string | undefined;
-
-    const existing = await captureFilesystemOperation("read file before writing", () =>
-      fs.readFile(canonicalPath, "utf-8"),
-    );
-    if (existing.status === "ok") {
-      currentHash = this.hash(existing.value);
-    } else if (existing.error.code === "ENOENT") {
-      existed = false;
-    } else {
-      return this.writeFailure(resolvedPath, existing.error);
-    }
-
-    if (existed) {
-      if (!overwrite) {
-        return {
-          success: false as const,
-          resolvedPath,
-          error: {
-            code: "FILE_EXISTS",
-            message: `File already exists: ${resolvedPath}. Set overwrite=true to overwrite it.`,
-          },
-        };
-      }
-
-      if (expectedHash && currentHash && expectedHash !== currentHash) {
-        return {
-          success: false as const,
-          resolvedPath,
-          currentHash,
-          error: {
-            code: "HASH_MISMATCH",
-            message: `File has changed since last read: ${resolvedPath}`,
-          },
-        };
-      }
-    } else {
-      if (expectedHash) {
-        return {
-          success: false as const,
-          resolvedPath,
-          error: {
-            code: "NOT_FOUND",
-            message: `File does not exist: ${resolvedPath}`,
-          },
-        };
-      }
-    }
-
-    if (createParents) {
-      const created = await captureFilesystemOperation("create parent directories", () =>
-        fs.mkdir(dirname(canonicalPath), { recursive: true }),
+      const inspected = resultOutcome(
+        await captureFilesystemOperation("read file before writing", () =>
+          fs.readFile(canonicalPath, "utf-8"),
+        ),
       );
-      if (created.status === "error") return this.writeFailure(resolvedPath, created.error);
-    }
+      if (!inspected.ok && inspected.error.code !== "ENOENT") return Result.err(inspected.error);
+      const existing = inspected.ok ? inspected.value : null;
+      const existed = existing !== null;
+      const currentHash = existing === null ? undefined : this.hash(existing);
 
-    const written = await captureFilesystemOperation("write file", () =>
-      fs.writeFile(canonicalPath, content),
-    );
-    if (written.status === "error") return this.writeFailure(resolvedPath, written.error);
-    const fileHash = this.hash(content);
+      if (existed) {
+        if (!overwrite) {
+          return Result.ok<WriteFileResult>({
+            success: false as const,
+            resolvedPath,
+            error: {
+              code: "FILE_EXISTS",
+              message: `File already exists: ${resolvedPath}. Set overwrite=true to overwrite it.`,
+            },
+          });
+        }
 
-    this.fileAccessRecord.set(resolvedPath, {
-      lastAccess: Date.now(),
-      fileHash,
-    });
+        if (expectedHash && currentHash && expectedHash !== currentHash) {
+          return Result.ok<WriteFileResult>({
+            success: false as const,
+            resolvedPath,
+            currentHash,
+            error: {
+              code: "HASH_MISMATCH",
+              message: `File has changed since last read: ${resolvedPath}`,
+            },
+          });
+        }
+      } else {
+        if (expectedHash) {
+          return Result.ok<WriteFileResult>({
+            success: false as const,
+            resolvedPath,
+            error: {
+              code: "NOT_FOUND",
+              message: `File does not exist: ${resolvedPath}`,
+            },
+          });
+        }
+      }
 
-    this.fireEvent({
-      type: "writeFile",
-      path: resolvedPath,
-      accessAt: Date.now(),
-    });
+      if (createParents) {
+        const created = resultOutcome(
+          await captureFilesystemOperation("create parent directories", () =>
+            fs.mkdir(dirname(canonicalPath), { recursive: true }),
+          ),
+        );
+        if (!created.ok) return Result.err(created.error);
+      }
 
-    return {
-      success: true as const,
-      resolvedPath,
-      created: !existed,
-      overwritten: existed,
-      fileHash,
-    };
+      const written = resultOutcome(
+        await captureFilesystemOperation("write file", () => fs.writeFile(canonicalPath, content)),
+      );
+      if (!written.ok) return Result.err(written.error);
+      const fileHash = this.hash(content);
+
+      this.fileAccessRecord.set(resolvedPath, {
+        lastAccess: Date.now(),
+        fileHash,
+      });
+
+      this.fireEvent({
+        type: "writeFile",
+        path: resolvedPath,
+        accessAt: Date.now(),
+      });
+
+      return Result.ok<WriteFileResult>({
+        success: true as const,
+        resolvedPath,
+        created: !existed,
+        overwritten: existed,
+        fileHash,
+      });
+    })();
+    const outcome = resultOutcome(writeResult);
+    return outcome.ok ? outcome.value : this.writeFailure(resolvedPath, outcome.error);
   }
 
-  async deleteFile({ path, cwd }: { path: string; cwd?: string }) {
+  async deleteFile({
+    path,
+    cwd,
+  }: {
+    path: string;
+    cwd?: string;
+  }): Promise<{ success: true; error?: undefined } | { success: false; error: string }> {
     const resolvedPath = this.resolvePath(path, cwd);
-    const allowedPath = this.assertAllowed(resolvedPath, "deleteFile");
-    if (allowedPath.status === "error") {
-      return { success: false as const, error: allowedPath.error.message };
-    }
-    const parent = await captureFilesystemOperation("resolve deleted file parent", () =>
-      fs.realpath(dirname(resolvedPath)),
-    );
-    if (parent.status === "error") return { success: false as const, error: parent.error.message };
-    const allowedCanonical = this.assertAllowed(
-      resolve(parent.value, basename(resolvedPath)),
-      "deleteFile",
-    );
-    if (allowedCanonical.status === "error") {
-      return { success: false as const, error: allowedCanonical.error.message };
-    }
+    const deletedResult = await (async (): Promise<
+      ResultType<{ success: true }, FileSystemOperationFailed>
+    > => {
+      const allowedPath = resultOutcome(this.assertAllowed(resolvedPath, "deleteFile"));
+      if (!allowedPath.ok) return Result.err(allowedPath.error);
+      const resolvedParent = resultOutcome(
+        await captureFilesystemOperation("resolve deleted file parent", () =>
+          fs.realpath(dirname(resolvedPath)),
+        ),
+      );
+      if (!resolvedParent.ok) return Result.err(resolvedParent.error);
+      const allowedCanonical = resultOutcome(
+        this.assertAllowed(resolve(resolvedParent.value, basename(resolvedPath)), "deleteFile"),
+      );
+      if (!allowedCanonical.ok) return Result.err(allowedCanonical.error);
 
-    const deleted = await captureFilesystemOperation("delete file", () => fs.unlink(resolvedPath));
-    if (deleted.status === "error")
-      return { success: false as const, error: deleted.error.message };
-    this.fileAccessRecord.delete(resolvedPath);
+      const deleted = resultOutcome(
+        await captureFilesystemOperation("delete file", () => fs.unlink(resolvedPath)),
+      );
+      if (!deleted.ok) return Result.err(deleted.error);
+      this.fileAccessRecord.delete(resolvedPath);
 
-    this.fireEvent({
-      type: "deleteFile",
-      path: resolvedPath,
-      accessAt: Date.now(),
-    });
+      this.fireEvent({
+        type: "deleteFile",
+        path: resolvedPath,
+        accessAt: Date.now(),
+      });
 
-    return { success: true as const };
+      return Result.ok({ success: true as const });
+    })();
+    const outcome = resultOutcome(deletedResult);
+    return outcome.ok ? outcome.value : { success: false as const, error: outcome.error.message };
   }
 
   /**
@@ -1246,454 +1291,474 @@ export class FileSystem {
     cwd?: string,
   ): Promise<EditFileResult> {
     const resolvedPath = this.resolvePath(path, cwd);
-    const allowedPath = this.assertAllowed(resolvedPath, "editFile", dangerouslyAllow);
-    if (allowedPath.status === "error")
-      return this.editFilesystemFailure(resolvedPath, allowedPath.error);
-    const canonical = await captureFilesystemOperation("resolve file for editing", () =>
-      fs.realpath(resolvedPath),
-    );
-    if (canonical.status === "error")
-      return this.editFilesystemFailure(resolvedPath, canonical.error);
-    const canonicalPath = canonical.value;
-    const allowedCanonical = this.assertAllowed(canonicalPath, "editFile", dangerouslyAllow);
-    if (allowedCanonical.status === "error") {
-      return this.editFilesystemFailure(resolvedPath, allowedCanonical.error);
-    }
-
     const lastAccess = this.fileAccessRecord.get(resolvedPath);
-    const read = await captureFilesystemOperation("read file for editing", () =>
-      fs.readFile(canonicalPath, "utf-8"),
-    );
-    if (read.status === "error") return this.editFilesystemFailure(resolvedPath, read.error);
-    const file = read.value;
+    const prepared = await (async (): Promise<
+      ResultType<{ canonicalPath: string; file: string }, FileSystemOperationFailed>
+    > => {
+      const allowedPath = resultOutcome(
+        this.assertAllowed(resolvedPath, "editFile", dangerouslyAllow),
+      );
+      if (!allowedPath.ok) return Result.err(allowedPath.error);
+      const canonical = resultOutcome(
+        await captureFilesystemOperation("resolve file for editing", () =>
+          fs.realpath(resolvedPath),
+        ),
+      );
+      if (!canonical.ok) return Result.err(canonical.error);
+      const canonicalPath = canonical.value;
+      const allowedCanonical = resultOutcome(
+        this.assertAllowed(canonicalPath, "editFile", dangerouslyAllow),
+      );
+      if (!allowedCanonical.ok) return Result.err(allowedCanonical.error);
+      const read = resultOutcome(
+        await captureFilesystemOperation("read file for editing", () =>
+          fs.readFile(canonicalPath, "utf-8"),
+        ),
+      );
+      if (!read.ok) return Result.err(read.error);
+      return Result.ok({ canonicalPath, file: read.value });
+    })();
+    return prepared.match({
+      err: async (error) => this.editFilesystemFailure(resolvedPath, error),
+      ok: async ({ canonicalPath, file }) => {
+        const oldHash = this.hash(file);
+        if (expectedHash) {
+          if (expectedHash !== oldHash) {
+            return {
+              success: false as const,
+              resolvedPath,
+              currentHash: oldHash,
+              error: {
+                code: "HASH_MISMATCH",
+                message: `File has changed since last read: ${resolvedPath}`,
+              },
+            };
+          }
+        } else {
+          if (!lastAccess) {
+            return {
+              success: false as const,
+              resolvedPath,
+              currentHash: oldHash,
+              error: {
+                code: "NOT_READ",
+                message: `File must be read before editing: ${resolvedPath}`,
+              },
+            };
+          }
 
-    const oldHash = this.hash(file);
-    if (expectedHash) {
-      if (expectedHash !== oldHash) {
-        return {
-          success: false as const,
-          resolvedPath,
-          currentHash: oldHash,
-          error: {
-            code: "HASH_MISMATCH",
-            message: `File has changed since last read: ${resolvedPath}`,
-          },
-        };
-      }
-    } else {
-      if (!lastAccess) {
-        return {
-          success: false as const,
-          resolvedPath,
-          currentHash: oldHash,
-          error: {
-            code: "NOT_READ",
-            message: `File must be read before editing: ${resolvedPath}`,
-          },
-        };
-      }
-
-      if (lastAccess.fileHash !== oldHash) {
-        return {
-          success: false as const,
-          resolvedPath,
-          currentHash: oldHash,
-          error: {
-            code: "HASH_MISMATCH",
-            message: `File has changed since last read: ${resolvedPath}`,
-          },
-        };
-      }
-    }
-
-    const countExactOccurrences = (haystack: string, needle: string) => {
-      if (needle.length === 0) return 0;
-      let count = 0;
-      let i = 0;
-      while (true) {
-        i = haystack.indexOf(needle, i);
-        if (i === -1) break;
-        count++;
-        i += needle.length;
-      }
-      return count;
-    };
-
-    const replaceExactOccurrences = (
-      haystack: string,
-      needle: string,
-      replacement: string,
-      maxReplacements: number,
-    ) => {
-      if (needle.length === 0) {
-        return { result: haystack, replacementsMade: 0 };
-      }
-
-      let replacementsMade = 0;
-      let start = 0;
-      let result = "";
-      while (replacementsMade < maxReplacements) {
-        const idx = haystack.indexOf(needle, start);
-        if (idx === -1) break;
-        result += haystack.slice(start, idx) + replacement;
-        start = idx + needle.length;
-        replacementsMade++;
-      }
-
-      result += haystack.slice(start);
-      return { result, replacementsMade };
-    };
-
-    const countRegexMatches = (haystack: string, re: RegExp) => {
-      let count = 0;
-      re.lastIndex = 0;
-      while (true) {
-        const match = re.exec(haystack);
-        if (!match) break;
-        count++;
-        if (match[0].length === 0) re.lastIndex++;
-      }
-      return count;
-    };
-
-    const replaceRegexOccurrences = (
-      haystack: string,
-      re: RegExp,
-      replacement: string,
-      maxReplacements: number,
-    ) => {
-      let replacementsMade = 0;
-      let lastIndex = 0;
-      let result = "";
-
-      re.lastIndex = 0;
-      while (replacementsMade < maxReplacements) {
-        const match = re.exec(haystack);
-        if (!match) break;
-
-        result += haystack.slice(lastIndex, match.index) + replacement;
-        lastIndex = match.index + match[0].length;
-        replacementsMade++;
-
-        if (match[0].length === 0) re.lastIndex++;
-      }
-
-      result += haystack.slice(lastIndex);
-      return { result, replacementsMade };
-    };
-
-    const enforceExpectedMatches = (
-      matchesFound: number,
-      expected: number | "any",
-      target: string,
-    ): EditOperationFailed | undefined => {
-      if (expected === "any") {
-        if (matchesFound === 0) {
-          return new EditOperationFailed({
-            code: "NO_MATCHES",
-            message: `No matches found for target: ${target}`,
-          });
+          if (lastAccess.fileHash !== oldHash) {
+            return {
+              success: false as const,
+              resolvedPath,
+              currentHash: oldHash,
+              error: {
+                code: "HASH_MISMATCH",
+                message: `File has changed since last read: ${resolvedPath}`,
+              },
+            };
+          }
         }
-        return undefined;
-      }
 
-      if (matchesFound === 0) {
-        return new EditOperationFailed({
-          code: "NO_MATCHES",
-          message: `No matches found for target: ${target}`,
+        const countExactOccurrences = (haystack: string, needle: string) => {
+          if (needle.length === 0) return 0;
+          let count = 0;
+          let i = 0;
+          while (true) {
+            i = haystack.indexOf(needle, i);
+            if (i === -1) break;
+            count++;
+            i += needle.length;
+          }
+          return count;
+        };
+
+        const replaceExactOccurrences = (
+          haystack: string,
+          needle: string,
+          replacement: string,
+          maxReplacements: number,
+        ) => {
+          if (needle.length === 0) {
+            return { result: haystack, replacementsMade: 0 };
+          }
+
+          let replacementsMade = 0;
+          let start = 0;
+          let result = "";
+          while (replacementsMade < maxReplacements) {
+            const idx = haystack.indexOf(needle, start);
+            if (idx === -1) break;
+            result += haystack.slice(start, idx) + replacement;
+            start = idx + needle.length;
+            replacementsMade++;
+          }
+
+          result += haystack.slice(start);
+          return { result, replacementsMade };
+        };
+
+        const countRegexMatches = (haystack: string, re: RegExp) => {
+          let count = 0;
+          re.lastIndex = 0;
+          while (true) {
+            const match = re.exec(haystack);
+            if (!match) break;
+            count++;
+            if (match[0].length === 0) re.lastIndex++;
+          }
+          return count;
+        };
+
+        const replaceRegexOccurrences = (
+          haystack: string,
+          re: RegExp,
+          replacement: string,
+          maxReplacements: number,
+        ) => {
+          let replacementsMade = 0;
+          let lastIndex = 0;
+          let result = "";
+
+          re.lastIndex = 0;
+          while (replacementsMade < maxReplacements) {
+            const match = re.exec(haystack);
+            if (!match) break;
+
+            result += haystack.slice(lastIndex, match.index) + replacement;
+            lastIndex = match.index + match[0].length;
+            replacementsMade++;
+
+            if (match[0].length === 0) re.lastIndex++;
+          }
+
+          result += haystack.slice(lastIndex);
+          return { result, replacementsMade };
+        };
+
+        const enforceExpectedMatches = (
+          matchesFound: number,
+          expected: number | "any",
+          target: string,
+        ): EditOperationFailed | undefined => {
+          if (expected === "any") {
+            if (matchesFound === 0) {
+              return new EditOperationFailed({
+                code: "NO_MATCHES",
+                message: `No matches found for target: ${target}`,
+              });
+            }
+            return undefined;
+          }
+
+          if (matchesFound === 0) {
+            return new EditOperationFailed({
+              code: "NO_MATCHES",
+              message: `No matches found for target: ${target}`,
+            });
+          }
+
+          if (matchesFound > expected) {
+            return new EditOperationFailed({
+              code: "TOO_MANY_MATCHES",
+              message: `Too many matches found (${matchesFound}); expected ${expected} for target: ${target}`,
+            });
+          }
+
+          if (matchesFound < expected) {
+            return new EditOperationFailed({
+              code: "NOT_ENOUGH_MATCHES",
+              message: `Not enough matches found (${matchesFound}); expected ${expected} for target: ${target}`,
+            });
+          }
+          return undefined;
+        };
+
+        const validateRange = (
+          lines: string[],
+          startLine: number,
+          endLine: number,
+        ): EditOperationFailed | undefined => {
+          if (startLine < 1 || endLine < startLine || endLine > lines.length) {
+            return new EditOperationFailed({
+              code: "INVALID_RANGE",
+              message: `Invalid range ${startLine}-${endLine}. File has ${lines.length} lines.`,
+            });
+          }
+          return undefined;
+        };
+
+        let lines = file.split("\n");
+        const succeededOperations: FileEdit["type"][] = [];
+        let replacementsMade = 0;
+
+        for (let editIndex = 0; editIndex < edits.length; editIndex++) {
+          const suppliedEdit = edits[editIndex]!;
+          const decodedEdit = decodeFileEdit(suppliedEdit);
+          if (!decodedEdit.success) {
+            return this.editOperationFailure(
+              resolvedPath,
+              oldHash,
+              editIndex,
+              suppliedEdit,
+              new EditOperationFailed({ code: "INVALID_EDIT", message: decodedEdit.message }),
+            );
+          }
+          const edit = decodedEdit.edit;
+          switch (edit.type) {
+            case "replace_range": {
+              const {
+                newText,
+                expectedOldText,
+                range: { startLine, endLine },
+              } = edit;
+
+              const rangeError = validateRange(lines, startLine, endLine);
+              if (rangeError) {
+                return this.editOperationFailure(
+                  resolvedPath,
+                  oldHash,
+                  editIndex,
+                  suppliedEdit,
+                  rangeError,
+                );
+              }
+
+              if (expectedOldText !== undefined) {
+                const actual = lines.slice(startLine - 1, endLine).join("\n");
+                if (actual !== expectedOldText) {
+                  return this.editOperationFailure(
+                    resolvedPath,
+                    oldHash,
+                    editIndex,
+                    suppliedEdit,
+                    new EditOperationFailed({
+                      code: "RANGE_MISMATCH",
+                      message: `Range content mismatch for ${startLine}-${endLine}. Re-read the file and try again.`,
+                    }),
+                  );
+                }
+              }
+
+              lines.splice(startLine - 1, endLine - startLine + 1, ...newText.split("\n"));
+              break;
+            }
+            case "insert_at": {
+              const { line, newText } = edit;
+              if (line < 1 || line > lines.length + 1) {
+                return this.editOperationFailure(
+                  resolvedPath,
+                  oldHash,
+                  editIndex,
+                  suppliedEdit,
+                  new EditOperationFailed({
+                    code: "INVALID_RANGE",
+                    message: `Invalid insert line ${line}. Must be between 1 and ${lines.length + 1}.`,
+                  }),
+                );
+              }
+
+              lines.splice(line - 1, 0, ...newText.split("\n"));
+              break;
+            }
+            case "delete_range": {
+              const {
+                expectedOldText,
+                range: { startLine, endLine },
+              } = edit;
+
+              const rangeError = validateRange(lines, startLine, endLine);
+              if (rangeError) {
+                return this.editOperationFailure(
+                  resolvedPath,
+                  oldHash,
+                  editIndex,
+                  suppliedEdit,
+                  rangeError,
+                );
+              }
+
+              if (expectedOldText !== undefined) {
+                const actual = lines.slice(startLine - 1, endLine).join("\n");
+                if (actual !== expectedOldText) {
+                  return this.editOperationFailure(
+                    resolvedPath,
+                    oldHash,
+                    editIndex,
+                    suppliedEdit,
+                    new EditOperationFailed({
+                      code: "RANGE_MISMATCH",
+                      message: `Range content mismatch for ${startLine}-${endLine}. Re-read the file and try again.`,
+                    }),
+                  );
+                }
+              }
+
+              lines.splice(startLine - 1, endLine - startLine + 1);
+              break;
+            }
+            case "replace_snippet": {
+              const {
+                target,
+                matching = "exact",
+                newText,
+                occurrence = "first",
+                expectedMatches = 1,
+              } = edit;
+
+              if (target.length === 0) {
+                return this.editOperationFailure(
+                  resolvedPath,
+                  oldHash,
+                  editIndex,
+                  suppliedEdit,
+                  new EditOperationFailed({
+                    code: "INVALID_EDIT",
+                    message: "target must not be empty",
+                  }),
+                );
+              }
+
+              if (matching === "exact" && target === newText) {
+                return this.editOperationFailure(
+                  resolvedPath,
+                  oldHash,
+                  editIndex,
+                  suppliedEdit,
+                  new EditOperationFailed({
+                    code: "INVALID_EDIT",
+                    message: "newText is identical to target; edit would be a no-op",
+                  }),
+                );
+              }
+
+              let maxReplace: number;
+              if (typeof occurrence === "number") {
+                maxReplace = occurrence;
+              } else {
+                switch (occurrence) {
+                  case "first":
+                    maxReplace = 1;
+                    break;
+                  case "all":
+                    maxReplace = Number.MAX_SAFE_INTEGER;
+                    break;
+                }
+              }
+
+              if (typeof occurrence === "number" && occurrence <= 0) {
+                return this.editOperationFailure(
+                  resolvedPath,
+                  oldHash,
+                  editIndex,
+                  suppliedEdit,
+                  new EditOperationFailed({
+                    code: "INVALID_EDIT",
+                    message: "occurrence must be a positive number",
+                  }),
+                );
+              }
+
+              const content = lines.join("\n");
+
+              if (matching === "exact") {
+                const matchesFound = countExactOccurrences(content, target);
+                const matchError = enforceExpectedMatches(matchesFound, expectedMatches, target);
+                if (matchError) {
+                  return this.editOperationFailure(
+                    resolvedPath,
+                    oldHash,
+                    editIndex,
+                    suppliedEdit,
+                    matchError,
+                  );
+                }
+
+                const replaced = replaceExactOccurrences(content, target, newText, maxReplace);
+
+                lines = replaced.result.split("\n");
+                replacementsMade += replaced.replacementsMade;
+              } else {
+                const compiled = compileEditRegex(target);
+                const operationFailure = compiled.match<EditFileResult | null>({
+                  err: (error) =>
+                    this.editOperationFailure(
+                      resolvedPath,
+                      oldHash,
+                      editIndex,
+                      suppliedEdit,
+                      error,
+                    ),
+                  ok: (re) => {
+                    const matchesFound = countRegexMatches(content, re);
+                    const matchError = enforceExpectedMatches(
+                      matchesFound,
+                      expectedMatches,
+                      target,
+                    );
+                    if (matchError) {
+                      return this.editOperationFailure(
+                        resolvedPath,
+                        oldHash,
+                        editIndex,
+                        suppliedEdit,
+                        matchError,
+                      );
+                    }
+
+                    const replaced = replaceRegexOccurrences(content, re, newText, maxReplace);
+                    lines = replaced.result.split("\n");
+                    replacementsMade += replaced.replacementsMade;
+                    return null;
+                  },
+                });
+                if (operationFailure) return operationFailure;
+              }
+
+              break;
+            }
+          }
+
+          succeededOperations.push(edit.type);
+        }
+
+        const nextContent = lines.join("\n");
+        const newHash = this.hash(nextContent);
+        const changesMade = newHash !== oldHash;
+
+        if (changesMade) {
+          const written = await captureFilesystemOperation("write edited file", () =>
+            fs.writeFile(canonicalPath, nextContent),
+          );
+          const writeFailure = written.match<EditFileResult | null>({
+            ok: () => null,
+            err: (error) => this.editFilesystemFailure(resolvedPath, error),
+          });
+          if (writeFailure) return writeFailure;
+        }
+
+        this.fileAccessRecord.set(resolvedPath, {
+          lastAccess: Date.now(),
+          fileHash: newHash,
         });
-      }
 
-      if (matchesFound > expected) {
-        return new EditOperationFailed({
-          code: "TOO_MANY_MATCHES",
-          message: `Too many matches found (${matchesFound}); expected ${expected} for target: ${target}`,
+        this.fireEvent({
+          type: "editFile",
+          path: resolvedPath,
+          accessAt: Date.now(),
+          operations: succeededOperations,
         });
-      }
 
-      if (matchesFound < expected) {
-        return new EditOperationFailed({
-          code: "NOT_ENOUGH_MATCHES",
-          message: `Not enough matches found (${matchesFound}); expected ${expected} for target: ${target}`,
-        });
-      }
-      return undefined;
-    };
-
-    const validateRange = (
-      lines: string[],
-      startLine: number,
-      endLine: number,
-    ): EditOperationFailed | undefined => {
-      if (startLine < 1 || endLine < startLine || endLine > lines.length) {
-        return new EditOperationFailed({
-          code: "INVALID_RANGE",
-          message: `Invalid range ${startLine}-${endLine}. File has ${lines.length} lines.`,
-        });
-      }
-      return undefined;
-    };
-
-    let lines = file.split("\n");
-    const succeededOperations: FileEdit["type"][] = [];
-    let replacementsMade = 0;
-
-    for (let editIndex = 0; editIndex < edits.length; editIndex++) {
-      const suppliedEdit = edits[editIndex]!;
-      const decodedEdit = decodeFileEdit(suppliedEdit);
-      if (!decodedEdit.success) {
-        return this.editOperationFailure(
+        return {
+          success: true as const,
           resolvedPath,
           oldHash,
-          editIndex,
-          suppliedEdit,
-          new EditOperationFailed({ code: "INVALID_EDIT", message: decodedEdit.message }),
-        );
-      }
-      const edit = decodedEdit.edit;
-      switch (edit.type) {
-        case "replace_range": {
-          const {
-            newText,
-            expectedOldText,
-            range: { startLine, endLine },
-          } = edit;
-
-          const rangeError = validateRange(lines, startLine, endLine);
-          if (rangeError) {
-            return this.editOperationFailure(
-              resolvedPath,
-              oldHash,
-              editIndex,
-              suppliedEdit,
-              rangeError,
-            );
-          }
-
-          if (expectedOldText !== undefined) {
-            const actual = lines.slice(startLine - 1, endLine).join("\n");
-            if (actual !== expectedOldText) {
-              return this.editOperationFailure(
-                resolvedPath,
-                oldHash,
-                editIndex,
-                suppliedEdit,
-                new EditOperationFailed({
-                  code: "RANGE_MISMATCH",
-                  message: `Range content mismatch for ${startLine}-${endLine}. Re-read the file and try again.`,
-                }),
-              );
-            }
-          }
-
-          lines.splice(startLine - 1, endLine - startLine + 1, ...newText.split("\n"));
-          break;
-        }
-        case "insert_at": {
-          const { line, newText } = edit;
-          if (line < 1 || line > lines.length + 1) {
-            return this.editOperationFailure(
-              resolvedPath,
-              oldHash,
-              editIndex,
-              suppliedEdit,
-              new EditOperationFailed({
-                code: "INVALID_RANGE",
-                message: `Invalid insert line ${line}. Must be between 1 and ${lines.length + 1}.`,
-              }),
-            );
-          }
-
-          lines.splice(line - 1, 0, ...newText.split("\n"));
-          break;
-        }
-        case "delete_range": {
-          const {
-            expectedOldText,
-            range: { startLine, endLine },
-          } = edit;
-
-          const rangeError = validateRange(lines, startLine, endLine);
-          if (rangeError) {
-            return this.editOperationFailure(
-              resolvedPath,
-              oldHash,
-              editIndex,
-              suppliedEdit,
-              rangeError,
-            );
-          }
-
-          if (expectedOldText !== undefined) {
-            const actual = lines.slice(startLine - 1, endLine).join("\n");
-            if (actual !== expectedOldText) {
-              return this.editOperationFailure(
-                resolvedPath,
-                oldHash,
-                editIndex,
-                suppliedEdit,
-                new EditOperationFailed({
-                  code: "RANGE_MISMATCH",
-                  message: `Range content mismatch for ${startLine}-${endLine}. Re-read the file and try again.`,
-                }),
-              );
-            }
-          }
-
-          lines.splice(startLine - 1, endLine - startLine + 1);
-          break;
-        }
-        case "replace_snippet": {
-          const {
-            target,
-            matching = "exact",
-            newText,
-            occurrence = "first",
-            expectedMatches = 1,
-          } = edit;
-
-          if (target.length === 0) {
-            return this.editOperationFailure(
-              resolvedPath,
-              oldHash,
-              editIndex,
-              suppliedEdit,
-              new EditOperationFailed({
-                code: "INVALID_EDIT",
-                message: "target must not be empty",
-              }),
-            );
-          }
-
-          if (matching === "exact" && target === newText) {
-            return this.editOperationFailure(
-              resolvedPath,
-              oldHash,
-              editIndex,
-              suppliedEdit,
-              new EditOperationFailed({
-                code: "INVALID_EDIT",
-                message: "newText is identical to target; edit would be a no-op",
-              }),
-            );
-          }
-
-          let maxReplace: number;
-          if (typeof occurrence === "number") {
-            maxReplace = occurrence;
-          } else {
-            switch (occurrence) {
-              case "first":
-                maxReplace = 1;
-                break;
-              case "all":
-                maxReplace = Number.MAX_SAFE_INTEGER;
-                break;
-            }
-          }
-
-          if (typeof occurrence === "number" && occurrence <= 0) {
-            return this.editOperationFailure(
-              resolvedPath,
-              oldHash,
-              editIndex,
-              suppliedEdit,
-              new EditOperationFailed({
-                code: "INVALID_EDIT",
-                message: "occurrence must be a positive number",
-              }),
-            );
-          }
-
-          const content = lines.join("\n");
-
-          if (matching === "exact") {
-            const matchesFound = countExactOccurrences(content, target);
-            const matchError = enforceExpectedMatches(matchesFound, expectedMatches, target);
-            if (matchError) {
-              return this.editOperationFailure(
-                resolvedPath,
-                oldHash,
-                editIndex,
-                suppliedEdit,
-                matchError,
-              );
-            }
-
-            const replaced = replaceExactOccurrences(content, target, newText, maxReplace);
-
-            lines = replaced.result.split("\n");
-            replacementsMade += replaced.replacementsMade;
-          } else {
-            const compiled = compileEditRegex(target);
-            if (compiled.status === "error") {
-              return this.editOperationFailure(
-                resolvedPath,
-                oldHash,
-                editIndex,
-                suppliedEdit,
-                compiled.error,
-              );
-            }
-            const re = compiled.value;
-
-            const matchesFound = countRegexMatches(content, re);
-            const matchError = enforceExpectedMatches(matchesFound, expectedMatches, target);
-            if (matchError) {
-              return this.editOperationFailure(
-                resolvedPath,
-                oldHash,
-                editIndex,
-                suppliedEdit,
-                matchError,
-              );
-            }
-
-            const replaced = replaceRegexOccurrences(content, re, newText, maxReplace);
-
-            lines = replaced.result.split("\n");
-            replacementsMade += replaced.replacementsMade;
-          }
-
-          break;
-        }
-      }
-
-      succeededOperations.push(edit.type);
-    }
-
-    const nextContent = lines.join("\n");
-    const newHash = this.hash(nextContent);
-    const changesMade = newHash !== oldHash;
-
-    if (changesMade) {
-      const written = await captureFilesystemOperation("write edited file", () =>
-        fs.writeFile(canonicalPath, nextContent),
-      );
-      if (written.status === "error")
-        return this.editFilesystemFailure(resolvedPath, written.error);
-    }
-
-    this.fileAccessRecord.set(resolvedPath, {
-      lastAccess: Date.now(),
-      fileHash: newHash,
+          newHash,
+          changesMade,
+          replacementsMade,
+        };
+      },
     });
-
-    this.fireEvent({
-      type: "editFile",
-      path: resolvedPath,
-      accessAt: Date.now(),
-      operations: succeededOperations,
-    });
-
-    return {
-      success: true as const,
-      resolvedPath,
-      oldHash,
-      newHash,
-      changesMade,
-      replacementsMade,
-    };
   }
 
   async hashlineEditFile(
@@ -1711,106 +1776,123 @@ export class FileSystem {
     cwd?: string,
   ): Promise<HashlineEditFileResult> {
     const resolvedPath = this.resolvePath(path, cwd);
-    const allowedPath = this.assertAllowed(resolvedPath, "editFile", dangerouslyAllow);
-    if (allowedPath.status === "error")
-      return this.editFilesystemFailure(resolvedPath, allowedPath.error);
-    const canonical = await captureFilesystemOperation("resolve file for hashline editing", () =>
-      fs.realpath(resolvedPath),
-    );
-    if (canonical.status === "error")
-      return this.editFilesystemFailure(resolvedPath, canonical.error);
-    const canonicalPath = canonical.value;
-    const allowedCanonical = this.assertAllowed(canonicalPath, "editFile", dangerouslyAllow);
-    if (allowedCanonical.status === "error") {
-      return this.editFilesystemFailure(resolvedPath, allowedCanonical.error);
-    }
-
     const lastAccess = this.fileAccessRecord.get(resolvedPath);
-    const read = await captureFilesystemOperation("read file for hashline editing", () =>
-      fs.readFile(canonicalPath, "utf-8"),
-    );
-    if (read.status === "error") return this.editFilesystemFailure(resolvedPath, read.error);
-    const file = read.value;
-    const oldHash = this.hash(file);
-
-    if (expectedHash) {
-      if (expectedHash !== oldHash) {
-        return {
-          success: false,
-          resolvedPath,
-          currentHash: oldHash,
-          error: {
-            code: "HASH_MISMATCH",
-            message: `File has changed since last read: ${resolvedPath}`,
-          },
-        };
-      }
-    } else {
-      if (!lastAccess) {
-        return {
-          success: false,
-          resolvedPath,
-          currentHash: oldHash,
-          error: {
-            code: "NOT_READ",
-            message: `File must be read before editing: ${resolvedPath}`,
-          },
-        };
-      }
-
-      if (lastAccess.fileHash !== oldHash) {
-        return {
-          success: false,
-          resolvedPath,
-          currentHash: oldHash,
-          error: {
-            code: "HASH_MISMATCH",
-            message: `File has changed since last read: ${resolvedPath}`,
-          },
-        };
-      }
-    }
-
-    const applied = applyHashlineEdits({ content: file, edits });
-    if (applied.status === "error") {
-      return {
-        success: false,
-        resolvedPath,
-        currentHash: oldHash,
-        error: { code: applied.error.code, message: applied.error.message },
-      };
-    }
-    const newHash = this.hash(applied.value.content);
-    const changesMade = newHash !== oldHash;
-
-    if (changesMade) {
-      const written = await captureFilesystemOperation("write hashline-edited file", () =>
-        fs.writeFile(canonicalPath, applied.value.content),
+    const prepared = await (async (): Promise<
+      ResultType<{ canonicalPath: string; file: string }, FileSystemOperationFailed>
+    > => {
+      const allowedPath = resultOutcome(
+        this.assertAllowed(resolvedPath, "editFile", dangerouslyAllow),
       );
-      if (written.status === "error")
-        return this.editFilesystemFailure(resolvedPath, written.error);
-    }
+      if (!allowedPath.ok) return Result.err(allowedPath.error);
+      const canonical = resultOutcome(
+        await captureFilesystemOperation("resolve file for hashline editing", () =>
+          fs.realpath(resolvedPath),
+        ),
+      );
+      if (!canonical.ok) return Result.err(canonical.error);
+      const canonicalPath = canonical.value;
+      const allowedCanonical = resultOutcome(
+        this.assertAllowed(canonicalPath, "editFile", dangerouslyAllow),
+      );
+      if (!allowedCanonical.ok) return Result.err(allowedCanonical.error);
+      const read = resultOutcome(
+        await captureFilesystemOperation("read file for hashline editing", () =>
+          fs.readFile(canonicalPath, "utf-8"),
+        ),
+      );
+      if (!read.ok) return Result.err(read.error);
+      return Result.ok({ canonicalPath, file: read.value });
+    })();
+    return prepared.match({
+      err: async (error) => this.editFilesystemFailure(resolvedPath, error),
+      ok: async ({ canonicalPath, file }) => {
+        const oldHash = this.hash(file);
 
-    this.fileAccessRecord.set(resolvedPath, {
-      lastAccess: Date.now(),
-      fileHash: newHash,
+        if (expectedHash) {
+          if (expectedHash !== oldHash) {
+            return {
+              success: false,
+              resolvedPath,
+              currentHash: oldHash,
+              error: {
+                code: "HASH_MISMATCH",
+                message: `File has changed since last read: ${resolvedPath}`,
+              },
+            };
+          }
+        } else {
+          if (!lastAccess) {
+            return {
+              success: false,
+              resolvedPath,
+              currentHash: oldHash,
+              error: {
+                code: "NOT_READ",
+                message: `File must be read before editing: ${resolvedPath}`,
+              },
+            };
+          }
+
+          if (lastAccess.fileHash !== oldHash) {
+            return {
+              success: false,
+              resolvedPath,
+              currentHash: oldHash,
+              error: {
+                code: "HASH_MISMATCH",
+                message: `File has changed since last read: ${resolvedPath}`,
+              },
+            };
+          }
+        }
+
+        const applied = applyHashlineEdits({ content: file, edits });
+        return applied.match({
+          err: async (error) => ({
+            success: false,
+            resolvedPath,
+            currentHash: oldHash,
+            error: { code: error.code, message: error.message },
+          }),
+          ok: async (appliedEdit) => {
+            const newHash = this.hash(appliedEdit.content);
+            const changesMade = newHash !== oldHash;
+
+            if (changesMade) {
+              const written = await captureFilesystemOperation("write hashline-edited file", () =>
+                fs.writeFile(canonicalPath, appliedEdit.content),
+              );
+              const writeFailure = written.match<HashlineEditFileResult | null>({
+                ok: () => null,
+                err: (error) => this.editFilesystemFailure(resolvedPath, error),
+              });
+              if (writeFailure) return writeFailure;
+            }
+
+            this.fileAccessRecord.set(resolvedPath, {
+              lastAccess: Date.now(),
+              fileHash: newHash,
+            });
+
+            this.fireEvent({
+              type: "editFile",
+              path: resolvedPath,
+              accessAt: Date.now(),
+              operations: ["replace_snippet"],
+            });
+
+            return {
+              success: true,
+              resolvedPath,
+              oldHash,
+              newHash,
+              changesMade,
+              replacementsMade: appliedEdit.appliedEditCount,
+            };
+          },
+        });
+      },
     });
-
-    this.fireEvent({
-      type: "editFile",
-      path: resolvedPath,
-      accessAt: Date.now(),
-      operations: ["replace_snippet"],
-    });
-
-    return {
-      success: true,
-      resolvedPath,
-      oldHash,
-      newHash,
-      changesMade,
-      replacementsMade: applied.value.appliedEditCount,
-    };
   }
 
   /**
@@ -1826,115 +1908,128 @@ export class FileSystem {
       dangerouslyAllow = false,
     } = opts;
     const resolvedBaseDir = this.resolvePath(baseDir);
-
-    const allowedPath = this.assertAllowed(resolvedBaseDir, "glob", dangerouslyAllow);
-    if (allowedPath.status === "error") return this.globFailure(mode, allowedPath.error);
-    const canonical = await captureFilesystemOperation("resolve glob root", () =>
-      fs.realpath(resolvedBaseDir),
-    );
-    if (canonical.status === "error") return this.globFailure(mode, canonical.error);
-    const canonicalBaseDir = canonical.value;
-    const allowedCanonical = this.assertAllowed(canonicalBaseDir, "glob", dangerouslyAllow);
-    if (allowedCanonical.status === "error") return this.globFailure(mode, allowedCanonical.error);
-
-    const includes: string[] = [];
-    const excludes: string[] = [];
-    for (const pattern of patterns) {
-      if (!pattern) continue;
-      if (pattern.startsWith("!")) {
-        const negated = normalizeGlobPatternForBase(pattern.slice(1), resolvedBaseDir);
-        if (negated.length > 0) {
-          excludes.push(negated);
+    const prepared = await (async (): Promise<ResultType<string, FileSystemOperationFailed>> => {
+      const allowedPath = resultOutcome(
+        this.assertAllowed(resolvedBaseDir, "glob", dangerouslyAllow),
+      );
+      if (!allowedPath.ok) return Result.err(allowedPath.error);
+      const canonical = resultOutcome(
+        await captureFilesystemOperation("resolve glob root", () => fs.realpath(resolvedBaseDir)),
+      );
+      if (!canonical.ok) return Result.err(canonical.error);
+      const canonicalBaseDir = canonical.value;
+      const allowedCanonical = resultOutcome(
+        this.assertAllowed(canonicalBaseDir, "glob", dangerouslyAllow),
+      );
+      if (!allowedCanonical.ok) return Result.err(allowedCanonical.error);
+      return Result.ok(canonicalBaseDir);
+    })();
+    return prepared.match({
+      err: async (error) => this.globFailure(mode, error),
+      ok: async (canonicalBaseDir) => {
+        const includes: string[] = [];
+        const excludes: string[] = [];
+        for (const pattern of patterns) {
+          if (!pattern) continue;
+          if (pattern.startsWith("!")) {
+            const negated = normalizeGlobPatternForBase(pattern.slice(1), resolvedBaseDir);
+            if (negated.length > 0) {
+              excludes.push(negated);
+            }
+            continue;
+          }
+          includes.push(normalizeGlobPatternForBase(pattern, resolvedBaseDir));
         }
-        continue;
-      }
-      includes.push(normalizeGlobPatternForBase(pattern, resolvedBaseDir));
-    }
 
-    if (includes.length === 0) {
-      if (mode === "default") {
-        return {
-          mode,
-          truncated: false,
-          paths: [],
-        };
-      }
-      return {
-        mode,
-        truncated: false,
-        entries: [],
-      };
-    }
-
-    if (this.fsBackend === "fff") {
-      const normalizedPatterns = [...includes, ...excludes.map((pattern) => `!${pattern}`)];
-      const fffResult = await getSearchBackend("fff").glob({
-        cwd: canonicalBaseDir,
-        patterns: normalizedPatterns,
-        maxEntries,
-        denyPaths: this.denyPaths,
-        dangerouslyAllow,
-        cacheDir: this.fffCacheDir,
-      });
-
-      if (fffResult) {
-        if (mode === "default") {
+        if (includes.length === 0) {
+          if (mode === "default") {
+            return {
+              mode,
+              truncated: false,
+              paths: [],
+            };
+          }
           return {
             mode,
-            truncated: fffResult.truncated,
-            paths: fffResult.paths,
-            effectiveBackend: fffResult.effectiveBackend,
+            truncated: false,
+            entries: [],
           };
         }
 
-        const entries: GlobEntry[] = [];
-        for (const entry of fffResult.paths) {
-          const stats = await captureFilesystemOperation("stat FFF glob result", () =>
-            fs.stat(join(canonicalBaseDir, entry)),
-          );
-          if (stats.status === "error") return this.globFailure(mode, stats.error);
-          entries.push({
-            path: entry,
-            type: this.getFileTypeFromStats(stats.value),
-            size: stats.value.size,
+        if (this.fsBackend === "fff") {
+          const normalizedPatterns = [...includes, ...excludes.map((pattern) => `!${pattern}`)];
+          const fffResult = await getSearchBackend("fff").glob({
+            cwd: canonicalBaseDir,
+            patterns: normalizedPatterns,
+            maxEntries,
+            denyPaths: this.denyPaths,
+            dangerouslyAllow,
+            cacheDir: this.fffCacheDir,
           });
+
+          if (fffResult) {
+            if (mode === "default") {
+              return {
+                mode,
+                truncated: fffResult.truncated,
+                paths: fffResult.paths,
+                effectiveBackend: fffResult.effectiveBackend,
+              };
+            }
+
+            const values: GlobEntry[] = [];
+            for (const entry of fffResult.paths) {
+              const stats = resultOutcome(
+                await captureFilesystemOperation("stat FFF glob result", () =>
+                  fs.stat(join(canonicalBaseDir, entry)),
+                ),
+              );
+              if (!stats.ok) return this.globFailure(mode, stats.error);
+              values.push({
+                path: entry,
+                type: this.getFileTypeFromStats(stats.value),
+                size: stats.value.size,
+              });
+            }
+            return {
+              mode,
+              truncated: fffResult.truncated,
+              entries: values,
+              effectiveBackend: fffResult.effectiveBackend,
+            };
+          }
         }
 
-        return {
+        const collected = await this.collectGlobMatches({
+          resolvedBaseDir: canonicalBaseDir,
+          includes,
+          excludes,
+          maxEntries,
           mode,
-          truncated: fffResult.truncated,
-          entries,
-          effectiveBackend: fffResult.effectiveBackend,
-        };
-      }
-    }
+          dangerouslyAllow,
+        });
+        return collected.match<GlobResult>({
+          err: (error) => this.globFailure(mode, error),
+          ok: ({ paths, entries, truncated }) => {
+            if (mode === "default") {
+              return {
+                mode,
+                truncated,
+                paths,
+                effectiveBackend: "node-fs",
+              };
+            }
 
-    const collected = await this.collectGlobMatches({
-      resolvedBaseDir: canonicalBaseDir,
-      includes,
-      excludes,
-      maxEntries,
-      mode,
-      dangerouslyAllow,
+            return {
+              mode,
+              truncated,
+              entries,
+              effectiveBackend: "node-fs",
+            };
+          },
+        });
+      },
     });
-    if (collected.status === "error") return this.globFailure(mode, collected.error);
-    const { paths, entries, truncated } = collected.value;
-
-    if (mode === "default") {
-      return {
-        mode,
-        truncated,
-        paths,
-        effectiveBackend: "node-fs",
-      };
-    }
-
-    return {
-      mode,
-      truncated,
-      entries,
-      effectiveBackend: "node-fs",
-    };
   }
 
   async fuzzySearchFiles({
@@ -1948,58 +2043,69 @@ export class FileSystem {
   }): Promise<FuzzySearchResult> {
     const { baseDir = this.root, maxResults = 50, dangerouslyAllow = false } = opts;
     const resolvedBaseDir = this.resolvePath(baseDir);
+    const prepared = await (async (): Promise<ResultType<string, FileSystemOperationFailed>> => {
+      const allowedPath = resultOutcome(
+        this.assertAllowed(resolvedBaseDir, "fuzzySearch", dangerouslyAllow),
+      );
+      if (!allowedPath.ok) return Result.err(allowedPath.error);
+      const canonical = resultOutcome(
+        await captureFilesystemOperation("resolve fuzzy search root", () =>
+          fs.realpath(resolvedBaseDir),
+        ),
+      );
+      if (!canonical.ok) return Result.err(canonical.error);
+      const canonicalBaseDir = canonical.value;
+      const allowedCanonical = resultOutcome(
+        this.assertAllowed(canonicalBaseDir, "fuzzySearch", dangerouslyAllow),
+      );
+      if (!allowedCanonical.ok) return Result.err(allowedCanonical.error);
+      return Result.ok(canonicalBaseDir);
+    })();
+    return prepared.match({
+      err: async (error) => this.fuzzyFailure(error.message),
+      ok: async (canonicalBaseDir) => {
+        if (this.fsBackend !== "fff") {
+          return {
+            results: [],
+            totalMatched: 0,
+            totalFiles: 0,
+            truncated: false,
+            error: "fuzzy_search requires tools.fsBackend='fff'",
+          };
+        }
 
-    const allowedPath = this.assertAllowed(resolvedBaseDir, "fuzzySearch", dangerouslyAllow);
-    if (allowedPath.status === "error") return this.fuzzyFailure(allowedPath.error.message);
-    const canonical = await captureFilesystemOperation("resolve fuzzy search root", () =>
-      fs.realpath(resolvedBaseDir),
-    );
-    if (canonical.status === "error") return this.fuzzyFailure(canonical.error.message);
-    const canonicalBaseDir = canonical.value;
-    const allowedCanonical = this.assertAllowed(canonicalBaseDir, "fuzzySearch", dangerouslyAllow);
-    if (allowedCanonical.status === "error")
-      return this.fuzzyFailure(allowedCanonical.error.message);
+        let result = await fuzzyFileSearch({
+          cwd: canonicalBaseDir,
+          query,
+          maxResults,
+          denyPaths: this.denyPaths,
+          dangerouslyAllow,
+          cacheDir: this.fffCacheDir,
+        });
 
-    if (this.fsBackend !== "fff") {
-      return {
-        results: [],
-        totalMatched: 0,
-        totalFiles: 0,
-        truncated: false,
-        error: "fuzzy_search requires tools.fsBackend='fff'",
-      };
-    }
+        if (!result && this.fuzzySearchFallback === "fzf") {
+          result = await fzfFileSearch({
+            cwd: canonicalBaseDir,
+            query,
+            maxResults,
+            denyPaths: this.denyPaths,
+            dangerouslyAllow,
+          });
+        }
 
-    let result = await fuzzyFileSearch({
-      cwd: canonicalBaseDir,
-      query,
-      maxResults,
-      denyPaths: this.denyPaths,
-      dangerouslyAllow,
-      cacheDir: this.fffCacheDir,
+        if (!result) {
+          return {
+            results: [],
+            totalMatched: 0,
+            totalFiles: 0,
+            truncated: false,
+            error: "fuzzy file search is unavailable for this path",
+          };
+        }
+
+        return result;
+      },
     });
-
-    if (!result && this.fuzzySearchFallback === "fzf") {
-      result = await fzfFileSearch({
-        cwd: canonicalBaseDir,
-        query,
-        maxResults,
-        denyPaths: this.denyPaths,
-        dangerouslyAllow,
-      });
-    }
-
-    if (!result) {
-      return {
-        results: [],
-        totalMatched: 0,
-        totalFiles: 0,
-        truncated: false,
-        error: "fuzzy file search is unavailable for this path",
-      };
-    }
-
-    return result;
   }
 
   async grep({ pattern, ...opts }: GrepOpts & { pattern: string }): Promise<GrepResult> {
@@ -2014,167 +2120,186 @@ export class FileSystem {
     } = opts;
 
     const resolvedBaseDir = this.resolvePath(baseDir);
-
-    const allowedPath = this.assertAllowed(resolvedBaseDir, "grep", dangerouslyAllow);
-    if (allowedPath.status === "error") return this.grepFailure(mode, allowedPath.error.message);
-    const canonical = await captureFilesystemOperation("resolve grep target", () =>
-      fs.realpath(resolvedBaseDir),
-    );
-    if (canonical.status === "error") return this.grepFailure(mode, canonical.error.message);
-    const canonicalBaseDir = canonical.value;
-    const allowedCanonical = this.assertAllowed(canonicalBaseDir, "grep", dangerouslyAllow);
-    if (allowedCanonical.status === "error")
-      return this.grepFailure(mode, allowedCanonical.error.message);
-    const stats = await captureFilesystemOperation("stat grep target", () =>
-      fs.stat(canonicalBaseDir),
-    );
-    if (stats.status === "error") return this.grepFailure(mode, stats.error.message);
-    const targetStats = stats.value;
-    if (!targetStats.isDirectory() && !targetStats.isFile()) {
-      return this.grepFailure(
-        mode,
-        `Grep target '${resolvedBaseDir}' must be a regular file or directory`,
+    const prepared = await (async (): Promise<
+      ResultType<{ canonicalBaseDir: string; targetStats: Stats }, FileSystemOperationFailed>
+    > => {
+      const allowedPath = resultOutcome(
+        this.assertAllowed(resolvedBaseDir, "grep", dangerouslyAllow),
       );
-    }
-
-    const isFileTarget = targetStats.isFile();
-    const searchCwd = isFileTarget ? dirname(canonicalBaseDir) : canonicalBaseDir;
-    const searchPath = isFileTarget ? basename(canonicalBaseDir) : undefined;
-    const reportedFilePath = opts.reportedFilePath ?? baseDir;
-
-    const globs = fileExtensions.map((ext) => `**/*.${ext.replace(/^\./, "")}`);
-
-    if (!dangerouslyAllow && !isFileTarget) {
-      // Ensure ripgrep doesn't traverse blocked paths when searching from broad base dirs (e.g. "/").
-      for (const denyAbs of this.denyPaths) {
-        const rel = relative(canonicalBaseDir, denyAbs);
-        if (rel.length === 0) continue;
-        if (rel.startsWith("..") || rel.startsWith(sep)) continue;
-        globs.push(`!${rel}`);
-        globs.push(`!${rel}/**`);
-      }
-    }
-
-    const extraArgs: string[] = [];
-    if (includeContextLines > 0) {
-      extraArgs.push("--context", String(includeContextLines));
-    }
-
-    const searched = await getSearchBackend(this.fsBackend).grep({
-      pattern,
-      regex,
-      cwd: searchCwd,
-      searchPath,
-      maxMatches: maxResults,
-      globs: globs.length > 0 ? globs : undefined,
-      extraArgs,
-      denyPaths: this.denyPaths,
-      dangerouslyAllow,
-      contextLines: includeContextLines,
-      fffCacheDir: this.fffCacheDir,
-    });
-    if (searched.status === "error") return this.grepFailure(mode, searched.error.message);
-    const ripgrepResult = searched.value;
-    const fileMatchesExtensions =
-      !isFileTarget ||
-      fileExtensions.length === 0 ||
-      fileExtensions.some((ext) => canonicalBaseDir.endsWith(`.${ext.replace(/^\./, "")}`));
-    let matches = ripgrepResult.matches;
-    if (!fileMatchesExtensions) {
-      matches = [];
-    } else if (isFileTarget) {
-      matches = ripgrepResult.matches.map((match) => ({ ...match, file: reportedFilePath }));
-    }
-    const truncated = fileMatchesExtensions ? ripgrepResult.truncated : false;
-
-    if (mode === "hashline") {
-      const warnings: HashlineWarning[] = [];
-      const rawResults = matches.map((match) => ({
-        file: match.file,
-        line: match.line,
-        text: match.text,
-      }));
-      const hashlineResults: {
-        file: string;
-        resolvedPath: string;
-        fileHash: string;
-        line: number;
-        text: string;
-      }[] = [];
-      const fileHashCache = new Map<string, string>();
-
-      for (const match of matches) {
-        const normalizedMatchText = match.text.replace(/\r?\n$/, "");
-
-        if (normalizedMatchText.length > HASHLINE_MAX_LINE_CHARS) {
-          warnings.push(buildHashlineWarning(match.line, normalizedMatchText.length));
-          continue;
-        }
-
-        const resolvedMatchPath = isFileTarget
-          ? canonicalBaseDir
-          : this.resolvePath(match.file, resolvedBaseDir);
-        let fileHash = fileHashCache.get(resolvedMatchPath);
-        if (!fileHash) {
-          const read = await captureFilesystemOperation("read hashline grep result", () =>
-            fs.readFile(resolvedMatchPath, "utf-8"),
+      if (!allowedPath.ok) return Result.err(allowedPath.error);
+      const canonical = resultOutcome(
+        await captureFilesystemOperation("resolve grep target", () => fs.realpath(resolvedBaseDir)),
+      );
+      if (!canonical.ok) return Result.err(canonical.error);
+      const canonicalBaseDir = canonical.value;
+      const allowedCanonical = resultOutcome(
+        this.assertAllowed(canonicalBaseDir, "grep", dangerouslyAllow),
+      );
+      if (!allowedCanonical.ok) return Result.err(allowedCanonical.error);
+      const stats = resultOutcome(
+        await captureFilesystemOperation("stat grep target", () => fs.stat(canonicalBaseDir)),
+      );
+      if (!stats.ok) return Result.err(stats.error);
+      return Result.ok({ canonicalBaseDir, targetStats: stats.value });
+    })();
+    return prepared.match({
+      err: async (error) => this.grepFailure(mode, error.message),
+      ok: async ({ canonicalBaseDir, targetStats }) => {
+        if (!targetStats.isDirectory() && !targetStats.isFile()) {
+          return this.grepFailure(
+            mode,
+            `Grep target '${resolvedBaseDir}' must be a regular file or directory`,
           );
-          if (read.status === "error") return this.grepFailure(mode, read.error.message);
-          fileHash = this.hash(read.value);
-          fileHashCache.set(resolvedMatchPath, fileHash);
-          const access = { lastAccess: Date.now(), fileHash };
-          this.fileAccessRecord.set(resolvedMatchPath, access);
-          if (isFileTarget) this.fileAccessRecord.set(resolvedBaseDir, access);
         }
 
-        hashlineResults.push({
-          file: match.file,
-          resolvedPath: resolvedMatchPath,
-          fileHash,
-          line: match.line,
-          text: formatHashlineWindow([normalizedMatchText], match.line),
+        const isFileTarget = targetStats.isFile();
+        const searchCwd = isFileTarget ? dirname(canonicalBaseDir) : canonicalBaseDir;
+        const searchPath = isFileTarget ? basename(canonicalBaseDir) : undefined;
+        const reportedFilePath = opts.reportedFilePath ?? baseDir;
+
+        const globs = fileExtensions.map((ext) => `**/*.${ext.replace(/^\./, "")}`);
+
+        if (!dangerouslyAllow && !isFileTarget) {
+          // Ensure ripgrep doesn't traverse blocked paths when searching from broad base dirs (e.g. "/").
+          for (const denyAbs of this.denyPaths) {
+            const rel = relative(canonicalBaseDir, denyAbs);
+            if (rel.length === 0) continue;
+            if (rel.startsWith("..") || rel.startsWith(sep)) continue;
+            globs.push(`!${rel}`);
+            globs.push(`!${rel}/**`);
+          }
+        }
+
+        const extraArgs: string[] = [];
+        if (includeContextLines > 0) {
+          extraArgs.push("--context", String(includeContextLines));
+        }
+
+        const searched = await getSearchBackend(this.fsBackend).grep({
+          pattern,
+          regex,
+          cwd: searchCwd,
+          searchPath,
+          maxMatches: maxResults,
+          globs: globs.length > 0 ? globs : undefined,
+          extraArgs,
+          denyPaths: this.denyPaths,
+          dangerouslyAllow,
+          contextLines: includeContextLines,
+          fffCacheDir: this.fffCacheDir,
         });
-      }
+        return searched.match({
+          err: async (error) => this.grepFailure(mode, error.message),
+          ok: async (ripgrepResult) => {
+            const fileMatchesExtensions =
+              !isFileTarget ||
+              fileExtensions.length === 0 ||
+              fileExtensions.some((ext) => canonicalBaseDir.endsWith(`.${ext.replace(/^\./, "")}`));
+            let matches = ripgrepResult.matches;
+            if (!fileMatchesExtensions) {
+              matches = [];
+            } else if (isFileTarget) {
+              matches = ripgrepResult.matches.map((match) => ({
+                ...match,
+                file: reportedFilePath,
+              }));
+            }
+            const truncated = fileMatchesExtensions ? ripgrepResult.truncated : false;
 
-      if (warnings.length > 0) {
-        return {
-          mode: "default",
-          truncated,
-          results: rawResults,
-          effectiveBackend: ripgrepResult.effectiveBackend,
-          warnings,
-          degradedFromHashline: true,
-        };
-      }
+            if (mode === "hashline") {
+              const warnings: HashlineWarning[] = [];
+              const rawResults = matches.map((match) => ({
+                file: match.file,
+                line: match.line,
+                text: match.text,
+              }));
+              const hashlineResults: {
+                file: string;
+                resolvedPath: string;
+                fileHash: string;
+                line: number;
+                text: string;
+              }[] = [];
+              const fileHashCache = new Map<string, string>();
 
-      return {
-        mode,
-        truncated,
-        results: hashlineResults,
-        effectiveBackend: ripgrepResult.effectiveBackend,
-      };
-    }
+              for (const match of matches) {
+                const normalizedMatchText = match.text.replace(/\r?\n$/, "");
 
-    if (mode === "default") {
-      const results = matches.map((match) => ({
-        file: match.file,
-        line: match.line,
-        text: match.text,
-      }));
-      return {
-        mode,
-        truncated,
-        results,
-        effectiveBackend: ripgrepResult.effectiveBackend,
-      };
-    }
+                if (normalizedMatchText.length > HASHLINE_MAX_LINE_CHARS) {
+                  warnings.push(buildHashlineWarning(match.line, normalizedMatchText.length));
+                  continue;
+                }
 
-    return {
-      mode,
-      truncated,
-      results: matches,
-      effectiveBackend: ripgrepResult.effectiveBackend,
-    };
+                const resolvedMatchPath = isFileTarget
+                  ? canonicalBaseDir
+                  : this.resolvePath(match.file, resolvedBaseDir);
+                let fileHash = fileHashCache.get(resolvedMatchPath);
+                if (!fileHash) {
+                  const read = resultOutcome(
+                    await captureFilesystemOperation("read hashline grep result", () =>
+                      fs.readFile(resolvedMatchPath, "utf-8"),
+                    ),
+                  );
+                  if (!read.ok) return this.grepFailure(mode, read.error.message);
+                  fileHash = this.hash(read.value);
+                  fileHashCache.set(resolvedMatchPath, fileHash);
+                  const access = { lastAccess: Date.now(), fileHash };
+                  this.fileAccessRecord.set(resolvedMatchPath, access);
+                  if (isFileTarget) this.fileAccessRecord.set(resolvedBaseDir, access);
+                }
+
+                hashlineResults.push({
+                  file: match.file,
+                  resolvedPath: resolvedMatchPath,
+                  fileHash,
+                  line: match.line,
+                  text: formatHashlineWindow([normalizedMatchText], match.line),
+                });
+              }
+
+              if (warnings.length > 0) {
+                return {
+                  mode: "default",
+                  truncated,
+                  results: rawResults,
+                  effectiveBackend: ripgrepResult.effectiveBackend,
+                  warnings,
+                  degradedFromHashline: true,
+                };
+              }
+
+              return {
+                mode,
+                truncated,
+                results: hashlineResults,
+                effectiveBackend: ripgrepResult.effectiveBackend,
+              };
+            }
+
+            if (mode === "default") {
+              const results = matches.map((match) => ({
+                file: match.file,
+                line: match.line,
+                text: match.text,
+              }));
+              return {
+                mode,
+                truncated,
+                results,
+                effectiveBackend: ripgrepResult.effectiveBackend,
+              };
+            }
+
+            return {
+              mode,
+              truncated,
+              results: matches,
+              effectiveBackend: ripgrepResult.effectiveBackend,
+            };
+          },
+        });
+      },
+    });
   }
 
   private hash(input: string | Uint8Array) {
@@ -2330,17 +2455,20 @@ export class FileSystem {
         return Result.ok(undefined);
       }
 
-      const stats = await captureFilesystemOperation("stat glob match", () => fs.stat(abs));
-      if (stats.status === "ok") {
-        entries.push({
-          path: entry,
-          type: this.getFileTypeFromStats(stats.value),
-          size: stats.value.size,
-        });
-        return Result.ok(undefined);
+      const stats = resultOutcome(
+        await captureFilesystemOperation("stat glob match", () => fs.stat(abs)),
+      );
+      if (!stats.ok) {
+        return isSkippableTraversalError(stats.error)
+          ? Result.ok(undefined)
+          : Result.err(stats.error);
       }
-      if (isSkippableTraversalError(stats.error)) return Result.ok(undefined);
-      return Result.err(stats.error);
+      entries.push({
+        path: entry,
+        type: this.getFileTypeFromStats(stats.value),
+        size: stats.value.size,
+      });
+      return Result.ok(undefined);
     };
 
     const walk = async (relDir: string): Promise<ResultType<void, FileSystemOperationFailed>> => {
@@ -2350,52 +2478,62 @@ export class FileSystem {
       if (!params.dangerouslyAllow && this.isDeniedPath(absDir)) return Result.ok(undefined);
       if (relDir && matchesAnyGlob(relDir, params.excludes)) return Result.ok(undefined);
       if (relDir && matchesAnyGlob(relDir, params.includes)) {
-        const added = await addMatch(relDir, absDir);
-        if (added.status === "error") return Result.err(added.error);
+        const added = resultOutcome(await addMatch(relDir, absDir));
+        if (!added.ok) return Result.err(added.error);
         if (truncated) return Result.ok(undefined);
       }
 
-      const opened = await captureFilesystemOperation("open glob directory", () =>
-        fs.opendir(absDir),
+      const opened = resultOutcome(
+        await captureFilesystemOperation("open glob directory", () => fs.opendir(absDir)),
       );
-      if (opened.status === "error") {
-        if (isSkippableTraversalError(opened.error)) return Result.ok(undefined);
-        return Result.err(opened.error);
+      if (!opened.ok) {
+        return isSkippableTraversalError(opened.error)
+          ? Result.ok(undefined)
+          : Result.err(opened.error);
       }
 
-      const iterated = await captureFilesystemOperation("iterate glob directory", async () => {
-        const dir = opened.value;
-        for await (const dirent of dir) {
-          if (truncated) break;
+      let iterationError: FileSystemOperationFailed | undefined;
+      const iterated = resultOutcome(
+        await captureFilesystemOperation("iterate glob directory", async () => {
+          for await (const dirent of opened.value) {
+            if (truncated) break;
 
-          const relPath = relDir ? `${relDir}/${dirent.name}` : dirent.name;
-          const abs = join(params.resolvedBaseDir, relPath);
+            const relPath = relDir ? `${relDir}/${dirent.name}` : dirent.name;
+            const abs = join(params.resolvedBaseDir, relPath);
 
-          if (!params.dangerouslyAllow && this.isDeniedPath(abs)) continue;
-          if (matchesAnyGlob(relPath, params.excludes)) continue;
+            if (!params.dangerouslyAllow && this.isDeniedPath(abs)) continue;
+            if (matchesAnyGlob(relPath, params.excludes)) continue;
 
-          if (matchesAnyGlob(relPath, params.includes)) {
-            const added = await addMatch(relPath, abs);
-            if (added.status === "error") return Result.err(added.error);
+            if (matchesAnyGlob(relPath, params.includes)) {
+              const added = resultOutcome(await addMatch(relPath, abs));
+              if (!added.ok) {
+                iterationError = added.error;
+                break;
+              }
+            }
+
+            if (dirent.isDirectory()) {
+              const walked = resultOutcome(await walk(relPath));
+              if (!walked.ok) {
+                iterationError = walked.error;
+                break;
+              }
+            }
           }
-
-          if (dirent.isDirectory()) {
-            const walked = await walk(relPath);
-            if (walked.status === "error") return Result.err(walked.error);
-          }
-        }
-        return Result.ok(undefined);
-      });
-      if (iterated.status === "error") {
-        if (isSkippableTraversalError(iterated.error)) return Result.ok(undefined);
-        return Result.err(iterated.error);
+        }),
+      );
+      if (!iterated.ok) {
+        return isSkippableTraversalError(iterated.error)
+          ? Result.ok(undefined)
+          : Result.err(iterated.error);
       }
-      return iterated.value;
+      if (iterationError) return Result.err(iterationError);
+      return Result.ok(undefined);
     };
 
     for (const root of getGlobSearchRoots(params.includes)) {
-      const walked = await walk(root);
-      if (walked.status === "error") return Result.err(walked.error);
+      const walked = resultOutcome(await walk(root));
+      if (!walked.ok) return Result.err(walked.error);
     }
 
     return Result.ok({ paths, entries, truncated });

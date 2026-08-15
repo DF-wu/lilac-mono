@@ -258,12 +258,15 @@ function isCwdSelfTarget(target: string, cwd: string): boolean {
   }
 
   const resolvedPaths = resolveRmPaths(cwd, target);
-  if (resolvedPaths.status === "ok") return resolvedPaths.value.target === resolvedPaths.value.cwd;
-
-  // Missing paths cannot be canonicalized, so preserve the lexical fallback.
-  const resolved = resolve(cwd, target);
-  const normalizedCwd = normalize(cwd);
-  return resolved === normalizedCwd;
+  return resolvedPaths.match({
+    ok: (paths) => paths.target === paths.cwd,
+    err: () => {
+      // Missing paths cannot be canonicalized, so preserve the lexical fallback.
+      const resolved = resolve(cwd, target);
+      const normalizedCwd = normalize(cwd);
+      return resolved === normalizedCwd;
+    },
+  });
 }
 
 function isTargetWithinCwd(target: string, originalCwd: string, effectiveCwd?: string): boolean {

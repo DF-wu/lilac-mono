@@ -35,7 +35,7 @@ function inlineDataUrl(value: string | URL): { bytes: number; mediaType: string 
     catch: () =>
       new ToolResultDataUrlDecodeFailed({ message: "Inline data URL payload is malformed" }),
   });
-  const decodedPayload = decoded.status === "ok" ? decoded.value : payload;
+  const decodedPayload = decoded.match({ ok: (value) => value, err: () => payload });
   return { bytes: Buffer.byteLength(decodedPayload, "utf8"), mediaType };
 }
 

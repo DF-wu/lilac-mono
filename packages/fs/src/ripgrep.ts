@@ -231,18 +231,20 @@ export async function ripgrep(
       }
 
       const parsed = decodeRipgrepMatchLine(line);
-      if (parsed.status === "error") {
-        outputFailed = true;
-        child.kill("SIGTERM");
-        child.stdout.destroy();
-        settle(Result.err(parsed.error));
-        return;
-      }
-      if (parsed.value === null) return;
-      matches.push(parsed.value);
-      if (matches.length > limit) {
-        stopAtLimit();
-      }
+      const handle = parsed.match<() => void>({
+        err: (error) => () => {
+          outputFailed = true;
+          child.kill("SIGTERM");
+          child.stdout.destroy();
+          settle(Result.err(error));
+        },
+        ok: (match) => () => {
+          if (match === null) return;
+          matches.push(match);
+          if (matches.length > limit) stopAtLimit();
+        },
+      });
+      handle();
     };
 
     child.stdout.setEncoding("utf8");
@@ -334,11 +336,10 @@ export async function grepText(
     cwd: process.cwd(),
     input: content,
   });
-  if (result.status === "error") return result;
-  return Result.ok({
-    ...result.value,
-    matches: result.value.matches.map((match) => ({ ...match, file: reportedPath })),
-  });
+  return result.map((value) => ({
+    ...value,
+    matches: value.matches.map((match) => ({ ...match, file: reportedPath })),
+  }));
 }
 
 function argsForRipgrep(options: {

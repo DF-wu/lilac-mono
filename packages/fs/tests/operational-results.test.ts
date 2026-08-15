@@ -1,5 +1,5 @@
-import { describe, expect, it } from "bun:test";
-import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { describe, expect, it, spyOn } from "bun:test";
+import fs, { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
@@ -7,6 +7,7 @@ import { Panic } from "better-result";
 
 import {
   applyHashlineEdits,
+  canonicalizePathAsFarAsExists,
   captureFilesystemOperation,
   decodeRipgrepMatchLine,
   ripgrep,
@@ -38,6 +39,31 @@ describe("filesystem operational Results", () => {
     expect(
       captureFilesystemOperation("defect fixture", async () => await Promise.reject(defect)),
     ).rejects.toBe(defect);
+  });
+
+  it("fails closed on canonicalization permission errors and preserves Panic identity", async () => {
+    for (const code of ["EACCES", "EPERM"] as const) {
+      const realpath = spyOn(fs, "realpath").mockRejectedValueOnce(
+        Object.assign(new Error(code), { code }),
+      );
+      try {
+        const result = await canonicalizePathAsFarAsExists("/permission-fixture/child");
+        expect(result).toMatchObject({
+          status: "error",
+          error: { _tag: "FileSystemOperationFailed", code },
+        });
+      } finally {
+        realpath.mockRestore();
+      }
+    }
+
+    const panic = new Panic({ message: "canonicalization invariant" });
+    const realpath = spyOn(fs, "realpath").mockRejectedValueOnce(panic);
+    try {
+      await expect(canonicalizePathAsFarAsExists("/panic-fixture/child")).rejects.toBe(panic);
+    } finally {
+      realpath.mockRestore();
+    }
   });
 
   it("returns hashline validation failures as values", () => {

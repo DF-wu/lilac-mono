@@ -1,5 +1,7 @@
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, spyOn } from "bun:test";
+import fs from "node:fs/promises";
 import path from "node:path";
+import { Panic } from "better-result";
 
 import {
   applyPatchResult,
@@ -50,6 +52,53 @@ describe("Stage 7 Result boundaries", () => {
       if (applied.error._tag === "FileSystemOperationFailed") {
         expect(applied.error.code).toBe("ENOENT");
       }
+    }
+  });
+
+  it("propagates patch deletion stat failures except an absent target", async () => {
+    for (const code of ["EACCES", "EPERM"] as const) {
+      const stat = spyOn(fs, "stat").mockRejectedValueOnce(
+        Object.assign(new Error(code), { code }),
+      );
+      try {
+        const result = await applyPatchResult({
+          cwd: process.cwd(),
+          denyPaths: [],
+          dangerouslyAllow: true,
+          allowGuardrailBypass: true,
+          patchText: [
+            "*** Begin Patch",
+            "*** Delete File: permission-fixture.txt",
+            "*** End Patch",
+          ].join("\n"),
+        });
+        expect(result).toMatchObject({
+          status: "error",
+          error: { _tag: "FileSystemOperationFailed", code },
+        });
+      } finally {
+        stat.mockRestore();
+      }
+    }
+
+    const panic = new Panic({ message: "patch deletion invariant" });
+    const stat = spyOn(fs, "stat").mockRejectedValueOnce(panic);
+    try {
+      await expect(
+        applyPatchResult({
+          cwd: process.cwd(),
+          denyPaths: [],
+          dangerouslyAllow: true,
+          allowGuardrailBypass: true,
+          patchText: [
+            "*** Begin Patch",
+            "*** Delete File: panic-fixture.txt",
+            "*** End Patch",
+          ].join("\n"),
+        }),
+      ).rejects.toBe(panic);
+    } finally {
+      stat.mockRestore();
     }
   });
 

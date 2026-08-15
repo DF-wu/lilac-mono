@@ -71,32 +71,50 @@ export async function canonicalizeAsFarAsExistsResult(
     const existing = await captureFilesystemOperation("canonicalize path", () =>
       fs.realpath(current),
     );
-    if (existing.status === "ok") {
-      return Result.ok(path.resolve(existing.value, ...missingSegments));
+    const existingOutcome = existing.match<
+      { value: string } | { error: FileSystemOperationFailed }
+    >({
+      ok: (value) => ({ value }),
+      err: (error) => ({ error }),
+    });
+    if ("value" in existingOutcome) {
+      return Result.ok(path.resolve(existingOutcome.value, ...missingSegments));
     }
-    if (existing.error.code !== "ENOENT" && existing.error.code !== "ENOTDIR") {
-      return Result.err(existing.error);
+    if (existingOutcome.error.code !== "ENOENT" && existingOutcome.error.code !== "ENOTDIR") {
+      return Result.err(existingOutcome.error);
     }
 
     const stats = await captureFilesystemOperation("inspect unresolved path", () =>
       fs.lstat(current),
     );
-    if (stats.status === "ok" && stats.value.isSymbolicLink()) {
+    const statsOutcome = stats.match<
+      { value: Awaited<ReturnType<typeof fs.lstat>> } | { error: FileSystemOperationFailed }
+    >({
+      ok: (value) => ({ value }),
+      err: (error) => ({ error }),
+    });
+    if (
+      "error" in statsOutcome &&
+      statsOutcome.error.code !== "ENOENT" &&
+      statsOutcome.error.code !== "ENOTDIR"
+    ) {
+      return Result.err(statsOutcome.error);
+    }
+    if ("value" in statsOutcome && statsOutcome.value.isSymbolicLink()) {
       const linkTarget = await captureFilesystemOperation("read symbolic link", () =>
         fs.readlink(current),
       );
-      if (linkTarget.status === "error") return Result.err(linkTarget.error);
-      current = path.isAbsolute(linkTarget.value)
-        ? path.resolve(linkTarget.value)
-        : path.resolve(path.dirname(current), linkTarget.value);
+      const targetOutcome = linkTarget.match<
+        { value: string } | { error: FileSystemOperationFailed }
+      >({
+        ok: (value) => ({ value }),
+        err: (error) => ({ error }),
+      });
+      if ("error" in targetOutcome) return Result.err(targetOutcome.error);
+      current = path.isAbsolute(targetOutcome.value)
+        ? path.resolve(targetOutcome.value)
+        : path.resolve(path.dirname(current), targetOutcome.value);
       continue;
-    }
-    if (
-      stats.status === "error" &&
-      stats.error.code !== "ENOENT" &&
-      stats.error.code !== "ENOTDIR"
-    ) {
-      return Result.err(stats.error);
     }
 
     const parent = path.dirname(current);
@@ -117,15 +135,23 @@ export async function canonicalPathAllowed(params: {
   dangerouslyAllow?: boolean;
 }): Promise<ResultType<void, CanonicalPathError>> {
   if (params.dangerouslyAllow) return Result.ok(undefined);
-  const canonicalTarget = await canonicalizeAsFarAsExistsResult(params.targetPath);
-  if (canonicalTarget.status === "error") return Result.err(canonicalTarget.error);
+  const target = await canonicalizeAsFarAsExistsResult(params.targetPath);
+  const targetOutcome = target.match<{ value: string } | { error: FileSystemOperationFailed }>({
+    ok: (value) => ({ value }),
+    err: (error) => ({ error }),
+  });
+  if ("error" in targetOutcome) return Result.err(targetOutcome.error);
   for (const denyPath of params.denyPaths) {
-    const canonicalDenyPath = await canonicalizeAsFarAsExistsResult(denyPath);
-    if (canonicalDenyPath.status === "error") return Result.err(canonicalDenyPath.error);
-    if (isPathWithin(canonicalTarget.value, canonicalDenyPath.value)) {
+    const denied = await canonicalizeAsFarAsExistsResult(denyPath);
+    const deniedOutcome = denied.match<{ value: string } | { error: FileSystemOperationFailed }>({
+      ok: (value) => ({ value }),
+      err: (error) => ({ error }),
+    });
+    if ("error" in deniedOutcome) return Result.err(deniedOutcome.error);
+    if (isPathWithin(targetOutcome.value, deniedOutcome.value)) {
       return Result.err(
         new CodingToolGuardrailViolation({
-          message: `Access denied: '${params.targetPath}' resolves into protected path '${canonicalDenyPath.value}' for ${params.operation}`,
+          message: `Access denied: '${params.targetPath}' resolves into protected path '${deniedOutcome.value}' for ${params.operation}`,
         }),
       );
     }

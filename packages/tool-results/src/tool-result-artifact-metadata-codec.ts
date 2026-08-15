@@ -116,17 +116,18 @@ export function decodeToolResultArtifactMetadata(
 
   const serialized = input.serialized;
   const parsedJson = Result.try({
-    try: () => JSON.parse(serialized),
+    try: () => JSON.parse(serialized) as unknown,
     catch: () =>
       new ToolResultArtifactMetadataMalformed({
         issueCode: "malformed-serialization",
         message: "Tool result artifact metadata is not valid JSON",
       }),
+  }).match<{ value: unknown } | { error: ToolResultArtifactMetadataMalformed }>({
+    ok: (value) => ({ value }),
+    err: (error) => ({ error }),
   });
-  if (parsedJson.status === "error") {
-    return Result.err(parsedJson.error);
-  }
-  const parsed: unknown = parsedJson.value;
+  if ("error" in parsedJson) return Result.err(parsedJson.error);
+  const parsed = parsedJson.value;
 
   const versioned = envelopeVersionSchema.safeParse(parsed);
   if (versioned.success && versioned.data.version !== TOOL_RESULT_ARTIFACT_METADATA_VERSION) {
@@ -149,12 +150,17 @@ export function decodeToolResultArtifactMetadata(
         }),
       );
     }
-    const validated = validateMetadata(envelope.data.metadata, input.expectedStorageKey);
-    if (validated.status === "error") return Result.err(validated.error);
+    const validated = validateMetadata(envelope.data.metadata, input.expectedStorageKey).match<
+      { value: ToolResultArtifactMetadata } | { error: ToolResultArtifactMetadataCodecError }
+    >({
+      ok: (value) => ({ value }),
+      err: (error) => ({ error }),
+    });
+    if ("error" in validated) return Result.err(validated.error);
     return Result.ok({
       value: validated.value,
       provenance: envelope.data.metadata.scopeId === undefined ? "missing-defaulted" : "current",
-    });
+    } satisfies DecodedToolResultArtifactMetadata);
   }
 
   const legacy = artifactMetadataSchema.safeParse(parsed);
@@ -166,8 +172,13 @@ export function decodeToolResultArtifactMetadata(
       }),
     );
   }
-  const validated = validateMetadata(legacy.data, input.expectedStorageKey);
-  if (validated.status === "error") return Result.err(validated.error);
+  const validated = validateMetadata(legacy.data, input.expectedStorageKey).match<
+    { value: ToolResultArtifactMetadata } | { error: ToolResultArtifactMetadataCodecError }
+  >({
+    ok: (value) => ({ value }),
+    err: (error) => ({ error }),
+  });
+  if ("error" in validated) return Result.err(validated.error);
   return Result.ok({ value: validated.value, provenance: "migrated" });
 }
 

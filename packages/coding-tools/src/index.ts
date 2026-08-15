@@ -75,80 +75,94 @@ export type CreateCodingToolsetError =
 export function createCodingToolsetResult(
   options: CodingToolsetOptions,
 ): ResultType<ToolSet, CreateCodingToolsetError> {
-  const localCwd = validateLocalCwd(options.cwd);
-  if (localCwd.status === "error") return Result.err(localCwd.error);
-  if (options.artifactIntegration?.scopeId.trim().length === 0) {
-    return Result.err(
-      new CodingToolsetInvalidOptions({ message: "artifactIntegration.scopeId must not be empty" }),
-    );
-  }
-  if (options.artifactIntegration?.requestId.trim().length === 0) {
-    return Result.err(
-      new CodingToolsetInvalidOptions({
-        message: "artifactIntegration.requestId must not be empty",
-      }),
-    );
-  }
-  const cwd = path.resolve(expandTilde(options.cwd));
-  const fsBackend = options.fsBackend ?? "node-rg";
-  const denyPaths = [...DEFAULT_DENY_PATHS, ...(options.denyPaths ?? [])];
-  const enabledTools = options.enabledTools;
-  const allToolsEnabled = enabledTools === undefined || enabledTools.includes("*");
-  const isEnabled = (name: string) => allToolsEnabled || enabledTools?.includes(name) === true;
-  const allowGuardrailBypass = options.allowGuardrailBypass ?? false;
-  const allowBashGuardrailBypass = options.allowBashGuardrailBypass ?? allowGuardrailBypass;
-  const artifactIntegration = options.artifactIntegration
-    ? { ...options.artifactIntegration }
-    : undefined;
-  const fileSystem = new FileSystem(cwd, {
-    denyPaths,
-    fsBackend,
-    fffCacheDir: options.fffCacheDir,
-  });
-  const candidates: ToolSet = {
-    ...createBashTool({
-      cwd,
-      denyPaths,
-      timeoutMs: options.bashTimeoutMs,
-      maxOutputBytes: options.bashMaxOutputBytes,
-      streamOutput: options.bashStreamOutput,
-      mergeOutput: options.bashMergeOutput,
-      env: options.bashEnv,
-      allowGuardrailBypass: allowBashGuardrailBypass,
-      artifactIntegration,
-    }),
-    ...createFilesystemTools({
-      fileSystem,
-      cwd,
-      fsBackend,
-      allowGuardrailBypass,
-      loadInstructions: options.loadInstructions,
-      preloadedInstructionPaths: options.preloadedInstructionPaths,
-      denyPaths,
-      artifactIntegration,
-      readFileDirectAttachmentSupported: options.readFileDirectAttachmentSupported,
-      maxInlineMediaBytesPerPart: options.maxInlineMediaBytesPerPart,
-      maxOutputBytes: options.maxOutputBytes,
-    }),
-    ...createApplyPatchTool({ cwd, denyPaths, allowGuardrailBypass }),
-    ...options.extraTools,
-  };
-  const tools: ToolSet = {};
-  for (const [name, candidate] of Object.entries(candidates)) {
-    if (name !== "batch" && isEnabled(name)) tools[name] = candidate;
-  }
-  if (isEnabled("batch")) {
-    const getBatchTools = () =>
-      Object.fromEntries(
-        Object.entries(tools).filter(([name]) => !options.batchExcludedTools?.includes(name)),
+  {
+    const localCwd = validateLocalCwd(options.cwd).match<
+      { value: void } | { error: CodingToolGuardrailViolation }
+    >({
+      ok: (value) => ({ value }),
+      err: (error) => ({ error }),
+    });
+    if ("error" in localCwd) return Result.err(localCwd.error);
+    if (options.artifactIntegration?.scopeId.trim().length === 0) {
+      return Result.err(
+        new CodingToolsetInvalidOptions({
+          message: "artifactIntegration.scopeId must not be empty",
+        }),
       );
-    if (Object.keys(getBatchTools()).length > 0) {
-      const batch = createBatchToolResult({ cwd, getTools: getBatchTools });
-      if (batch.status === "error") return Result.err(batch.error);
-      Object.assign(tools, batch.value);
     }
+    if (options.artifactIntegration?.requestId.trim().length === 0) {
+      return Result.err(
+        new CodingToolsetInvalidOptions({
+          message: "artifactIntegration.requestId must not be empty",
+        }),
+      );
+    }
+    const cwd = path.resolve(expandTilde(options.cwd));
+    const fsBackend = options.fsBackend ?? "node-rg";
+    const denyPaths = [...DEFAULT_DENY_PATHS, ...(options.denyPaths ?? [])];
+    const enabledTools = options.enabledTools;
+    const allToolsEnabled = enabledTools === undefined || enabledTools.includes("*");
+    const isEnabled = (name: string) => allToolsEnabled || enabledTools?.includes(name) === true;
+    const allowGuardrailBypass = options.allowGuardrailBypass ?? false;
+    const allowBashGuardrailBypass = options.allowBashGuardrailBypass ?? allowGuardrailBypass;
+    const artifactIntegration = options.artifactIntegration
+      ? { ...options.artifactIntegration }
+      : undefined;
+    const fileSystem = new FileSystem(cwd, {
+      denyPaths,
+      fsBackend,
+      fffCacheDir: options.fffCacheDir,
+    });
+    const candidates: ToolSet = {
+      ...createBashTool({
+        cwd,
+        denyPaths,
+        timeoutMs: options.bashTimeoutMs,
+        maxOutputBytes: options.bashMaxOutputBytes,
+        streamOutput: options.bashStreamOutput,
+        mergeOutput: options.bashMergeOutput,
+        env: options.bashEnv,
+        allowGuardrailBypass: allowBashGuardrailBypass,
+        artifactIntegration,
+      }),
+      ...createFilesystemTools({
+        fileSystem,
+        cwd,
+        fsBackend,
+        allowGuardrailBypass,
+        loadInstructions: options.loadInstructions,
+        preloadedInstructionPaths: options.preloadedInstructionPaths,
+        denyPaths,
+        artifactIntegration,
+        readFileDirectAttachmentSupported: options.readFileDirectAttachmentSupported,
+        maxInlineMediaBytesPerPart: options.maxInlineMediaBytesPerPart,
+        maxOutputBytes: options.maxOutputBytes,
+      }),
+      ...createApplyPatchTool({ cwd, denyPaths, allowGuardrailBypass }),
+      ...options.extraTools,
+    };
+    const tools: ToolSet = {};
+    for (const [name, candidate] of Object.entries(candidates)) {
+      if (name !== "batch" && isEnabled(name)) tools[name] = candidate;
+    }
+    if (isEnabled("batch")) {
+      const getBatchTools = () =>
+        Object.fromEntries(
+          Object.entries(tools).filter(([name]) => !options.batchExcludedTools?.includes(name)),
+        );
+      if (Object.keys(getBatchTools()).length > 0) {
+        const batch = createBatchToolResult({ cwd, getTools: getBatchTools }).match<
+          { value: ToolSet } | { error: BatchRejected }
+        >({
+          ok: (value) => ({ value }),
+          err: (error) => ({ error }),
+        });
+        if ("error" in batch) return Result.err(batch.error);
+        Object.assign(tools, batch.value);
+      }
+    }
+    return Result.ok(tools);
   }
-  return Result.ok(tools);
 }
 
 export function createCodingToolset(options: CodingToolsetOptions): ToolSet {
