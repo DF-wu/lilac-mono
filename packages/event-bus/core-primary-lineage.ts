@@ -348,11 +348,11 @@ export function buildCoreLineageManifestV1(
     candidate,
     segments.flatMap((segment) => segment.canonicalMessages),
   );
-  if (decoded.status === "error") return Result.err(decoded.error);
-  if (decoded.value.state === "fresh-only") {
-    return invalidLineage([{ path: ["state"], message: "Built lineage must be complete" }]);
-  }
-  return Result.ok(decoded.value);
+  return decoded.andThen((lineage) =>
+    lineage.state === "fresh-only"
+      ? invalidLineage([{ path: ["state"], message: "Built lineage must be complete" }])
+      : Result.ok(lineage),
+  );
 }
 
 export const corePrimaryLineageFreshOnlyV1Schema = z.strictObject({

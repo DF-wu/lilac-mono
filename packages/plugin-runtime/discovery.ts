@@ -177,15 +177,19 @@ export async function discoverExternalToolPlugins(params: {
     filePath: pluginsDir,
     run: () => fs.readdir(pluginsDir, { withFileTypes: true }),
   });
-  if (readPlugins.status === "error") {
-    if (isMissingPluginPathCode(readPlugins.error.code)) {
+  const pluginDirents = readPlugins.match<Dirent[] | ToolPluginDiscoveryError>({
+    ok: (value) => value,
+    err: (error) => error,
+  });
+  if (ToolPluginDiscoveryError.is(pluginDirents)) {
+    if (isMissingPluginPathCode(pluginDirents.code)) {
       return Result.ok([]);
     }
-    return readPlugins;
+    return Result.err(pluginDirents);
   }
 
   const entries: ExternalToolPluginDiscovery[] = [];
-  for (const dirent of [...readPlugins.value].sort((a, b) => a.name.localeCompare(b.name))) {
+  for (const dirent of [...pluginDirents].sort((a, b) => a.name.localeCompare(b.name))) {
     if (!dirent.isDirectory()) continue;
 
     const pluginId = dirent.name;
@@ -196,15 +200,19 @@ export async function discoverExternalToolPlugins(params: {
       filePath: packageJsonPath,
       run: () => statMtimeMs(packageJsonPath),
     });
-    if (packageStat.status === "error") {
+    const packageMtime = packageStat.match<number | ToolPluginDiscoveryError>({
+      ok: (value) => value,
+      err: (error) => error,
+    });
+    if (ToolPluginDiscoveryError.is(packageMtime)) {
       entries.push({
         type: "invalid",
         pluginId,
         pluginDir,
         packageJsonPath,
-        reason: isMissingPluginPathCode(packageStat.error.code)
+        reason: isMissingPluginPathCode(packageMtime.code)
           ? "missing package.json"
-          : packageStat.error.message,
+          : packageMtime.message,
       });
       continue;
     }
@@ -214,45 +222,56 @@ export async function discoverExternalToolPlugins(params: {
       filePath: packageJsonPath,
       run: () => fs.readFile(packageJsonPath, "utf8"),
     });
-    if (packageText.status === "error") {
+    const packageRaw = packageText.match<string | ToolPluginDiscoveryError>({
+      ok: (value) => value,
+      err: (error) => error,
+    });
+    if (ToolPluginDiscoveryError.is(packageRaw)) {
       entries.push({
         type: "invalid",
         pluginId,
         pluginDir,
         packageJsonPath,
-        packageJsonMtimeMs: packageStat.value,
-        reason: packageText.error.message,
+        packageJsonMtimeMs: packageMtime,
+        reason: packageRaw.message,
       });
       continue;
     }
 
-    const packageJson = decodePluginPackageJsonText(packageText.value);
-    if (packageJson.status === "error") {
+    const packageJson = decodePluginPackageJsonText(packageRaw).match<PluginPackageJson | string>({
+      ok: (value) => value,
+      err: (error) => error,
+    });
+    if (typeof packageJson === "string") {
       entries.push({
         type: "invalid",
         pluginId,
         pluginDir,
         packageJsonPath,
-        packageJsonMtimeMs: packageStat.value,
-        reason: packageJson.error,
+        packageJsonMtimeMs: packageMtime,
+        reason: packageJson,
       });
       continue;
     }
 
-    const entrypointPath = path.resolve(pluginDir, packageJson.value.lilac.plugin);
+    const entrypointPath = path.resolve(pluginDir, packageJson.lilac.plugin);
     const entrypointStat = await captureFileOperation({
       operation: "fingerprint_plugins",
       filePath: entrypointPath,
       run: () => statMtimeMs(entrypointPath),
     });
-    if (entrypointStat.status === "error") {
+    const entrypointMtime = entrypointStat.match<number | ToolPluginDiscoveryError>({
+      ok: (value) => value,
+      err: (error) => error,
+    });
+    if (ToolPluginDiscoveryError.is(entrypointMtime)) {
       entries.push({
         type: "invalid",
         pluginId,
         pluginDir,
         packageJsonPath,
-        packageJsonMtimeMs: packageStat.value,
-        reason: `plugin entrypoint missing or unreadable: ${entrypointStat.error.message}`,
+        packageJsonMtimeMs: packageMtime,
+        reason: `plugin entrypoint missing or unreadable: ${entrypointMtime.message}`,
       });
       continue;
     }
@@ -263,8 +282,8 @@ export async function discoverExternalToolPlugins(params: {
       pluginDir,
       packageJsonPath,
       entrypointPath,
-      packageJsonMtimeMs: packageStat.value,
-      entrypointMtimeMs: entrypointStat.value,
+      packageJsonMtimeMs: packageMtime,
+      entrypointMtimeMs: entrypointMtime,
     });
   }
 
@@ -276,7 +295,13 @@ export async function buildExternalToolPluginFreshnessKey(params: {
   configPath?: string;
 }): Promise<ResultType<string, ToolPluginDiscoveryError>> {
   const discovered = await discoverExternalToolPlugins({ dataDir: params.dataDir });
-  if (discovered.status === "error") return discovered;
+  const discoveredEntries = discovered.match<
+    readonly ExternalToolPluginDiscovery[] | ToolPluginDiscoveryError
+  >({
+    ok: (value) => value,
+    err: (error) => error,
+  });
+  if (ToolPluginDiscoveryError.is(discoveredEntries)) return Result.err(discoveredEntries);
 
   let configMtimeMs: number | null = null;
   if (params.configPath) {
@@ -285,9 +310,14 @@ export async function buildExternalToolPluginFreshnessKey(params: {
       filePath: params.configPath,
       run: () => statMtimeMs(params.configPath!),
     });
-    if (configStat.status === "ok") configMtimeMs = configStat.value;
-    if (configStat.status === "error" && !isMissingPluginPathCode(configStat.error.code)) {
-      return configStat;
+    const configMtime = configStat.match<number | ToolPluginDiscoveryError>({
+      ok: (value) => value,
+      err: (error) => error,
+    });
+    if (ToolPluginDiscoveryError.is(configMtime)) {
+      if (!isMissingPluginPathCode(configMtime.code)) return Result.err(configMtime);
+    } else {
+      configMtimeMs = configMtime;
     }
   }
 
@@ -296,7 +326,7 @@ export async function buildExternalToolPluginFreshnessKey(params: {
     filePath: resolveExternalPluginsDir(params.dataDir),
     run: async () => {
       const discoveredFingerprints = [];
-      for (const entry of discovered.value) {
+      for (const entry of discoveredEntries) {
         if (entry.type === "plugin") {
           discoveredFingerprints.push({
             type: entry.type,
@@ -318,6 +348,5 @@ export async function buildExternalToolPluginFreshnessKey(params: {
       return { configMtimeMs, discovered: discoveredFingerprints };
     },
   });
-  if (fingerprint.status === "error") return fingerprint;
-  return Result.ok(Bun.hash(JSON.stringify(fingerprint.value)).toString(16));
+  return fingerprint.map((value) => Bun.hash(JSON.stringify(value)).toString(16));
 }

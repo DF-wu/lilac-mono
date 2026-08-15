@@ -93,8 +93,7 @@ export async function loadToolPluginModuleCapability<TRuntimeContext = unknown>(
   }
 
   const decoded = decodeDynamicToolPluginModule<TRuntimeContext>(imported);
-  if (decoded.status === "error") return decoded;
-  return Result.ok(decoded.value.plugin);
+  return decoded.map((value) => value.plugin);
 }
 
 export async function loadToolPluginModule<TRuntimeContext = unknown>(params: {
@@ -108,6 +107,5 @@ export async function loadToolPluginModule<TRuntimeContext = unknown>(params: {
   >
 > {
   const loaded = await loadToolPluginModuleCapability<TRuntimeContext>(params);
-  if (loaded.status === "error") return loaded;
-  return Result.ok(loaded.value.plugin);
+  return loaded.map((value) => value.plugin);
 }

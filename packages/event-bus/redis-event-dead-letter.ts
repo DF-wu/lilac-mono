@@ -211,16 +211,23 @@ export function encryptRedisEventDeadLetterRecoveryValue(options: {
   readonly identity: RedisEventDeadLetterStorageIdentity;
   readonly plaintext: string;
 }): ResultType<string, RedisEventDeadLetterConfigInvalid | RedisEventDeadLetterEncryptFailed> {
-  const config = validateRedisEventDeadLetterConfig({
+  const configResult = validateRedisEventDeadLetterConfig({
     recordTtlSeconds: 1,
     indexMaxLen: 1,
     encryptionKey: options.encryptionKey,
   });
-  if (config.status === "error") return Result.err(config.error);
-
+  const resolved = configResult.match<
+    | { readonly config: RedisEventDeadLetterConfig }
+    | { readonly error: RedisEventDeadLetterConfigInvalid }
+  >({
+    ok: (config) => ({ config }),
+    err: (error) => ({ error }),
+  });
+  if ("error" in resolved) return Result.err(resolved.error);
+  const encryptionKey = Buffer.from(options.encryptionKey);
   try {
     const nonce = randomBytes(NONCE_BYTES);
-    const cipher = createCipheriv(CIPHERTEXT_ALGORITHM, config.value.encryptionKey, nonce, {
+    const cipher = createCipheriv(CIPHERTEXT_ALGORITHM, encryptionKey, nonce, {
       authTagLength: AUTH_TAG_BYTES,
     });
     cipher.setAAD(authenticatedData(options.kind, options.identity));
@@ -257,28 +264,40 @@ export function decryptRedisEventDeadLetterRecoveryValue(options: {
   | RedisEventDeadLetterContextMismatch
   | RedisEventDeadLetterAuthenticationFailed
 > {
-  const config = validateRedisEventDeadLetterConfig({
+  const configResult = validateRedisEventDeadLetterConfig({
     recordTtlSeconds: 1,
     indexMaxLen: 1,
     encryptionKey: options.encryptionKey,
   });
-  if (config.status === "error") return Result.err(config.error);
-  const envelope = decodeRedisEventDeadLetterCiphertextEnvelope(options.ciphertextEnvelope);
-  if (envelope.status === "error") return Result.err(envelope.error);
-  if (envelope.value.kind !== options.kind) {
+  const config = configResult.match<RedisEventDeadLetterConfig | RedisEventDeadLetterConfigInvalid>(
+    {
+      ok: (value) => value,
+      err: (error) => error,
+    },
+  );
+  if (RedisEventDeadLetterConfigInvalid.is(config)) return Result.err(config);
+  const envelopeResult = decodeRedisEventDeadLetterCiphertextEnvelope(options.ciphertextEnvelope);
+  const envelope = envelopeResult.match<
+    RedisEventDeadLetterCiphertextEnvelope | RedisEventDeadLetterCiphertextInvalid
+  >({
+    ok: (value) => value,
+    err: (error) => error,
+  });
+  if (RedisEventDeadLetterCiphertextInvalid.is(envelope)) return Result.err(envelope);
+  if (envelope.kind !== options.kind) {
     return Result.err(
       new RedisEventDeadLetterContextMismatch({
         expectedKind: options.kind,
-        actualKind: envelope.value.kind,
+        actualKind: envelope.kind,
         expectedIdentity: options.expectedIdentity,
         message: "Dead-letter ciphertext kind does not match the recovery operation",
       }),
     );
   }
 
-  const nonce = decodeCanonicalBase64(envelope.value.nonce, NONCE_BYTES);
-  const authTag = decodeCanonicalBase64(envelope.value.authTag, AUTH_TAG_BYTES);
-  const ciphertext = decodeCanonicalBase64(envelope.value.ciphertext);
+  const nonce = decodeCanonicalBase64(envelope.nonce, NONCE_BYTES);
+  const authTag = decodeCanonicalBase64(envelope.authTag, AUTH_TAG_BYTES);
+  const ciphertext = decodeCanonicalBase64(envelope.ciphertext);
   if (!nonce || !authTag || !ciphertext) {
     return Result.err(
       new RedisEventDeadLetterCiphertextInvalid({
@@ -288,7 +307,7 @@ export function decryptRedisEventDeadLetterRecoveryValue(options: {
   }
 
   try {
-    const decipher = createDecipheriv(CIPHERTEXT_ALGORITHM, config.value.encryptionKey, nonce, {
+    const decipher = createDecipheriv(CIPHERTEXT_ALGORITHM, config.encryptionKey, nonce, {
       authTagLength: AUTH_TAG_BYTES,
     });
     decipher.setAAD(authenticatedData(options.kind, options.expectedIdentity));
@@ -693,15 +712,25 @@ export function decryptRedisEventDeadLetterRecord(options: {
   | RedisEventDeadLetterAuthenticationFailed
   | RedisEventDeadLetterRecordInvalid
 > {
-  const decrypted = decryptRedisEventDeadLetterRecoveryValue({
+  const decryptedResult = decryptRedisEventDeadLetterRecoveryValue({
     ...options,
     kind: "record",
   });
-  if (decrypted.status === "error") return Result.err(decrypted.error);
+  const decrypted = decryptedResult.match<
+    | string
+    | RedisEventDeadLetterConfigInvalid
+    | RedisEventDeadLetterCiphertextInvalid
+    | RedisEventDeadLetterContextMismatch
+    | RedisEventDeadLetterAuthenticationFailed
+  >({
+    ok: (value) => value,
+    err: (error) => error,
+  });
+  if (TaggedError.is(decrypted)) return Result.err(decrypted);
 
   let serialized: unknown;
   try {
-    serialized = SuperJSON.parse(decrypted.value);
+    serialized = SuperJSON.parse(decrypted);
   } catch {
     return Result.err(
       new RedisEventDeadLetterRecordInvalid({
@@ -751,10 +780,14 @@ export class RedisEventDeadLetter implements EventDeadLetter {
       indexMaxLen: options.indexMaxLen ?? DEFAULT_INDEX_MAX_LEN,
       encryptionKey: options.encryptionKey,
     });
-    if (config.status === "error") throw config.error;
-    this.recordTtlSeconds = config.value.recordTtlSeconds;
-    this.indexMaxLen = config.value.indexMaxLen;
-    this.encryptionKey = config.value.encryptionKey;
+    const validated = config.match<RedisEventDeadLetterConfig | RedisEventDeadLetterConfigInvalid>({
+      ok: (value) => value,
+      err: (error) => error,
+    });
+    if (RedisEventDeadLetterConfigInvalid.is(validated)) throw validated;
+    this.recordTtlSeconds = validated.recordTtlSeconds;
+    this.indexMaxLen = validated.indexMaxLen;
+    this.encryptionKey = validated.encryptionKey;
   }
 
   accept(
@@ -833,8 +866,14 @@ export class RedisEventDeadLetter implements EventDeadLetter {
         identity: { deadLetterId: record.deadLetterId, storageKey: evidenceKey },
         plaintext: evidencePlaintext,
       });
-      if (encryptedEvidence.status === "error") throw encryptedEvidence.error;
-      evidenceMaterial = { key: evidenceKey, value: encryptedEvidence.value };
+      const encryptedEvidenceValue = encryptedEvidence.match<
+        string | RedisEventDeadLetterConfigInvalid | RedisEventDeadLetterEncryptFailed
+      >({
+        ok: (value) => value,
+        err: (error) => error,
+      });
+      if (TaggedError.is(encryptedEvidenceValue)) throw encryptedEvidenceValue;
+      evidenceMaterial = { key: evidenceKey, value: encryptedEvidenceValue };
       persistedRecord = {
         ...record,
         evidence: {
@@ -854,7 +893,13 @@ export class RedisEventDeadLetter implements EventDeadLetter {
       identity: { deadLetterId: record.deadLetterId, storageKey: recordKey },
       plaintext: SuperJSON.stringify(persistedRecord),
     });
-    if (encryptedRecord.status === "error") throw encryptedRecord.error;
+    const encryptedRecordValue = encryptedRecord.match<
+      string | RedisEventDeadLetterConfigInvalid | RedisEventDeadLetterEncryptFailed
+    >({
+      ok: (value) => value,
+      err: (error) => error,
+    });
+    if (TaggedError.is(encryptedRecordValue)) throw encryptedRecordValue;
     const indexFields = [
       "version",
       "2",
@@ -881,7 +926,7 @@ export class RedisEventDeadLetter implements EventDeadLetter {
     }
     return {
       id: record.deadLetterId,
-      record: { key: recordKey, value: encryptedRecord.value },
+      record: { key: recordKey, value: encryptedRecordValue },
       ...(evidenceMaterial === undefined ? {} : { evidence: evidenceMaterial }),
       index: {
         key: this.indexKey,

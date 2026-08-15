@@ -89,15 +89,18 @@ export const cmdRequestMessageDataSchema = cmdRequestMessageDataShapeSchema.supe
   (data, context) => {
     if (!data.corePrimaryLineage) return;
     const decoded = decodeCorePrimaryLineageV1(data.corePrimaryLineage, data.messages);
-    if (decoded.status === "error") {
-      for (const issue of decoded.error.issues) {
-        context.addIssue({
-          code: "custom",
-          path: ["corePrimaryLineage", ...issue.path],
-          message: issue.message,
-        });
-      }
-    }
+    decoded.match({
+      ok: () => undefined,
+      err: (error) => {
+        for (const issue of error.issues) {
+          context.addIssue({
+            code: "custom",
+            path: ["corePrimaryLineage", ...issue.path],
+            message: issue.message,
+          });
+        }
+      },
+    });
   },
 );
 export type CmdRequestMessageData = z.output<typeof cmdRequestMessageDataSchema>;

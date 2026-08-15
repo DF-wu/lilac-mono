@@ -137,6 +137,15 @@ export type ClaudeCodeToolBridgeCreateError =
   | ClaudeCodeBuiltInToolUnsupported
   | ClaudeCodeToolBridgeConfigurationFailed;
 
+function resultOutcome<T, E>(
+  result: ResultType<T, E>,
+): { ok: true; value: T } | { ok: false; error: E } {
+  return result.match<{ ok: true; value: T } | { ok: false; error: E }>({
+    ok: (value) => ({ ok: true, value }),
+    err: (error) => ({ ok: false, error }),
+  });
+}
+
 export type ClaudeCodeToolCatalogMetadata = {
   readonly sourceId: string;
   readonly rawName: string;
@@ -181,8 +190,8 @@ export function validateClaudeCodeBuiltInToolsResult(
 export function validateClaudeCodeBuiltInTools(
   names: readonly string[] = [],
 ): ClaudeCodeBuiltInTool[] {
-  const validated = validateClaudeCodeBuiltInToolsResult(names);
-  if (validated.status === "error") throw validated.error;
+  const validated = resultOutcome(validateClaudeCodeBuiltInToolsResult(names));
+  if (!validated.ok) throw validated.error;
   return validated.value;
 }
 
@@ -352,26 +361,23 @@ export function mapToolResultOutputToMcpResult(
     case "text":
       return Result.ok({ isError, content: [{ type: "text", text: output.value }] });
     case "json": {
-      const text = stringifyJson(output.value);
-      if (text.status === "error") return text;
-      return Result.ok({
+      return stringifyJson(output.value).map((text) => ({
         isError,
-        content: [{ type: "text", text: text.value }],
+        content: [{ type: "text", text }],
         ...(isRecord(output.value) ? { structuredContent: output.value } : {}),
-      });
+      }));
     }
     case "execution-denied":
       return Result.ok(toolError(output.reason ?? "Tool execution was denied."));
     case "error-text":
       return Result.ok(toolError(output.value));
     case "error-json": {
-      const text = stringifyJson(output.value);
-      return text.status === "error" ? text : Result.ok(toolError(text.value));
+      return stringifyJson(output.value).map(toolError);
     }
     case "content": {
-      const result = mapContentOutput(output);
-      if (result.status === "error") return result;
-      return Result.ok(isError ? { ...result.value, isError: true } : result.value);
+      return mapContentOutput(output).map((result) =>
+        isError ? { ...result, isError: true } : result,
+      );
     }
     default: {
       const _exhaustive: never = output;
@@ -385,8 +391,8 @@ export function mapToolResultOutputToMcp(
   output: ToolResultOutput,
   isError: boolean,
 ): CallToolResult {
-  const mapped = mapToolResultOutputToMcpResult(output, isError);
-  if (mapped.status === "error") throw mapped.error;
+  const mapped = resultOutcome(mapToolResultOutputToMcpResult(output, isError));
+  if (!mapped.ok) throw mapped.error;
   return mapped.value;
 }
 
@@ -406,13 +412,14 @@ function mapExecutedExpansionToMcp(
     });
 
     const mapped = mapToolResultOutputToMcpResult(child.toolOutput, child.isError);
-    if (mapped.status === "ok") content.push(...mapped.value.content);
-    else {
-      content.push({
-        type: "text",
-        text: `Failed to map child tool output: ${mapped.error.message}`,
-      });
-    }
+    mapped.match({
+      ok: (value) => content.push(...value.content),
+      err: (error) =>
+        content.push({
+          type: "text",
+          text: `Failed to map child tool output: ${error.message}`,
+        }),
+    });
 
     return {
       index,
@@ -482,8 +489,10 @@ export async function createClaudeCodeToolBridgeResult(options: {
     ([name, definition]) => name !== "tool_search" && definition.isProviderExecuted !== true,
   );
   const exposedNames = new Set(exposedEntries.map(([name]) => name));
-  const validatedBuiltIns = validateClaudeCodeBuiltInToolsResult(options.builtInTools);
-  if (validatedBuiltIns.status === "error") return validatedBuiltIns;
+  const validatedBuiltIns = resultOutcome(
+    validateClaudeCodeBuiltInToolsResult(options.builtInTools),
+  );
+  if (!validatedBuiltIns.ok) return Result.err(validatedBuiltIns.error);
   const allowedBuiltIns = new Set<string>(validatedBuiltIns.value);
   const validators = new Map<string, NonNullable<ReturnType<typeof asSchema>["validate"]>>();
   const declarations: McpTool[] = [];
@@ -588,7 +597,7 @@ export async function createClaudeCodeToolBridgeResult(options: {
         return toolError(`Lilac tool '${toolName}' returned an unsupported tool-call expansion`);
       }
       const mapped = mapToolResultOutputToMcpResult(outcome.toolOutput, outcome.isError);
-      return mapped.status === "ok" ? mapped.value : toolError(mapped.error.message);
+      return mapped.match({ ok: (value) => value, err: (error) => toolError(error.message) });
     } catch (cause) {
       if (Panic.is(cause)) throw cause;
       const error = extra.signal.aborted
@@ -659,8 +668,8 @@ export async function createClaudeCodeToolBridgeResult(options: {
     clear: () => pending.clear(),
     closeResult,
     close: async () => {
-      const closed = await closeResult();
-      if (closed.status === "error") throw closed.error;
+      const closed = resultOutcome(await closeResult());
+      if (!closed.ok) throw closed.error;
     },
   });
 }
@@ -669,8 +678,8 @@ export async function createClaudeCodeToolBridgeResult(options: {
 export async function createClaudeCodeToolBridge(
   options: Parameters<typeof createClaudeCodeToolBridgeResult>[0],
 ): Promise<ClaudeCodeToolBridge> {
-  const created = await createClaudeCodeToolBridgeResult(options);
-  if (created.status === "error") throw created.error;
+  const created = resultOutcome(await createClaudeCodeToolBridgeResult(options));
+  if (!created.ok) throw created.error;
   return created.value;
 }
 

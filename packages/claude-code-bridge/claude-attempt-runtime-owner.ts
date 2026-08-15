@@ -106,6 +106,15 @@ type ValidatedCandidate = ClaudeAttemptRuntimeCandidate & {
   readonly attemptIdentity: string;
 };
 
+function resultOutcome<T, E>(
+  result: ResultType<T, E>,
+): { ok: true; value: T } | { ok: false; error: E } {
+  return result.match<{ ok: true; value: T } | { ok: false; error: E }>({
+    ok: (value) => ({ ok: true, value }),
+    err: (error) => ({ ok: false, error }),
+  });
+}
+
 function stateError(message: string): ClaudeAttemptRuntimeStateFailed {
   return new ClaudeAttemptRuntimeStateFailed({ message });
 }
@@ -133,8 +142,8 @@ async function captureCandidateFactory(
 async function disposeRun(
   run: MaterializedClaudeCodeRun,
 ): Promise<ResultType<void, ClaudeAttemptRuntimeCleanupFailed>> {
-  const disposed = await run.disposeResult();
-  if (disposed.status === "error") {
+  const disposed = resultOutcome(await run.disposeResult());
+  if (!disposed.ok) {
     return Result.err(
       new ClaudeAttemptRuntimeCleanupFailed({
         cause: disposed.error,
@@ -155,11 +164,12 @@ async function rejectCandidate(
   >
 > {
   const cleanup = await disposeRun(run);
-  if (cleanup.status === "ok") return Result.err(error);
+  const cleanupOutcome = resultOutcome(cleanup);
+  if (cleanupOutcome.ok) return Result.err(error);
   return Result.err(
     new ClaudeAttemptRuntimeOperationAndCleanupFailed({
       operationError: error,
-      cleanupError: cleanup.error,
+      cleanupError: cleanupOutcome.error,
       message: `${error.message}; cleanup also failed`,
     }),
   );
@@ -168,8 +178,8 @@ async function rejectCandidate(
 export class ClaudeAttemptRuntimeOwner<FactoryInputs> {
   /** Compatibility adapter required by the Agent `PrepareModelCall` contract. */
   readonly prepare: PrepareModelCall = async (context) => {
-    const prepared = await this.prepareResult(context);
-    if (prepared.status === "error") throw prepared.error;
+    const prepared = resultOutcome(await this.prepareResult(context));
+    if (!prepared.ok) throw prepared.error;
     return prepared.value;
   };
 
@@ -267,8 +277,8 @@ export class ClaudeAttemptRuntimeOwner<FactoryInputs> {
 
   /** Compatibility adapter for the established synchronous estimate contract. */
   getNativeInputEstimateFloor(input: ClaudeAttemptRuntimeInputEstimate): number | null {
-    const estimate = this.getNativeInputEstimateFloorResult(input);
-    if (estimate.status === "error") throw estimate.error;
+    const estimate = resultOutcome(this.getNativeInputEstimateFloorResult(input));
+    if (!estimate.ok) throw estimate.error;
     return estimate.value;
   }
 
@@ -338,8 +348,8 @@ export class ClaudeAttemptRuntimeOwner<FactoryInputs> {
         candidate,
         "terminal native context usage is missing",
       );
-      return unusable.status === "error" &&
-        unusable.error._tag === "ClaudeAttemptRuntimeStateFailed"
+      const unusableOutcome = resultOutcome(unusable);
+      return !unusableOutcome.ok && unusableOutcome.error._tag === "ClaudeAttemptRuntimeStateFailed"
         ? Result.ok()
         : unusable;
     }
@@ -355,13 +365,13 @@ export class ClaudeAttemptRuntimeOwner<FactoryInputs> {
 
   /** Compatibility adapter for existing continuation consumers. */
   async recordSuccessfulModelCall(canonicalMessages: readonly ModelMessage[]): Promise<void> {
-    const recorded = await this.recordSuccessfulModelCallResult(canonicalMessages);
-    if (recorded.status === "error") throw recorded.error;
+    const recorded = resultOutcome(await this.recordSuccessfulModelCallResult(canonicalMessages));
+    if (!recorded.ok) throw recorded.error;
   }
 
   async retireForRetryResult(): Promise<ResultType<void, ClaudeAttemptRuntimeError>> {
-    const active = this.notEnded("retry");
-    if (active.status === "error") return active;
+    const active = resultOutcome(this.notEnded("retry"));
+    if (!active.ok) return Result.err(active.error);
     if (!this.attemptConsumed) return Result.ok();
     const retired = await this.retireCandidateResult();
     this.attemptIndex += 1;
@@ -371,15 +381,15 @@ export class ClaudeAttemptRuntimeOwner<FactoryInputs> {
   }
 
   async retireForRetry(): Promise<void> {
-    const retired = await this.retireForRetryResult();
-    if (retired.status === "error") throw retired.error;
+    const retired = resultOutcome(await this.retireForRetryResult());
+    if (!retired.ok) throw retired.error;
   }
 
   async retireForCanonicalReplacementResult(): Promise<
     ResultType<void, ClaudeAttemptRuntimeError>
   > {
-    const active = this.notEnded("canonical replacement");
-    if (active.status === "error") return active;
+    const active = resultOutcome(this.notEnded("canonical replacement"));
+    if (!active.ok) return Result.err(active.error);
     const consumed = this.attemptConsumed;
     const retired = await this.retireCandidateResult();
     if (consumed) this.attemptIndex += 1;
@@ -389,8 +399,8 @@ export class ClaudeAttemptRuntimeOwner<FactoryInputs> {
   }
 
   async retireForCanonicalReplacement(): Promise<void> {
-    const retired = await this.retireForCanonicalReplacementResult();
-    if (retired.status === "error") throw retired.error;
+    const retired = resultOutcome(await this.retireForCanonicalReplacementResult());
+    if (!retired.ok) throw retired.error;
   }
 
   retireAtRunEndResult(): Promise<ResultType<void, ClaudeAttemptRuntimeError>> {
@@ -409,15 +419,15 @@ export class ClaudeAttemptRuntimeOwner<FactoryInputs> {
   async prepareResult(
     context: PrepareModelCallContext,
   ): Promise<ResultType<PreparedModelCall, ClaudeAttemptRuntimeError>> {
-    const active = this.notEnded("prepare");
-    if (active.status === "error") return active;
+    const active = resultOutcome(this.notEnded("prepare"));
+    if (!active.ok) return Result.err(active.error);
     if (this.unusableReason) {
       return Result.err(stateError(`Claude candidate is unusable: ${this.unusableReason}`));
     }
 
     this.stablePrepareContext ??= context;
-    let materialized = await this.materializeCandidateResult();
-    if (materialized.status === "error") return materialized;
+    let materialized = resultOutcome(await this.materializeCandidateResult());
+    if (!materialized.ok) return Result.err(materialized.error);
     let candidate = materialized.value;
     let payload: CanonicalPayloadSelection = this.hasSuccessfulCall
       ? { mode: "suffix", startIndex: this.cursor?.canonicalMessageCount ?? 0 }
@@ -428,11 +438,11 @@ export class ClaudeAttemptRuntimeOwner<FactoryInputs> {
         context.canonicalMessages.slice(0, payload.startIndex),
       ).hash;
       if (currentPrefixHash !== this.cursor.canonicalPrefixHash) {
-        const replaced = await this.replaceForCanonicalMismatchResult();
-        if (replaced.status === "error") return replaced;
+        const replaced = resultOutcome(await this.replaceForCanonicalMismatchResult());
+        if (!replaced.ok) return Result.err(replaced.error);
         this.stablePrepareContext = context;
-        materialized = await this.materializeCandidateResult();
-        if (materialized.status === "error") return materialized;
+        materialized = resultOutcome(await this.materializeCandidateResult());
+        if (!materialized.ok) return Result.err(materialized.error);
         candidate = materialized.value;
         payload = candidate.initialPayload;
       }
@@ -482,16 +492,18 @@ export class ClaudeAttemptRuntimeOwner<FactoryInputs> {
   private async createAndValidateCandidate(
     prepareContext: PrepareModelCallContext,
   ): Promise<ResultType<ValidatedCandidate, ClaudeAttemptRuntimeError>> {
-    const created = await captureCandidateFactory(() =>
-      this.createCandidate({
-        attemptIndex: this.attemptIndex,
-        inputs: this.factoryInputs,
-        prepareContext,
-      }),
+    const created = resultOutcome(
+      await captureCandidateFactory(() =>
+        this.createCandidate({
+          attemptIndex: this.attemptIndex,
+          inputs: this.factoryInputs,
+          prepareContext,
+        }),
+      ),
     );
-    if (created.status === "error") {
+    if (!created.ok) {
       this.unusableReason = created.error.message;
-      return created;
+      return Result.err(created.error);
     }
     const candidate = created.value;
     const nativeSession = candidate.run.nativeSession;
@@ -578,11 +590,12 @@ export class ClaudeAttemptRuntimeOwner<FactoryInputs> {
     this.candidate = null;
     const operationError = stateError(`Claude candidate is unusable: ${reason}`);
     const cleanup = await disposeRun(candidate.run);
-    if (cleanup.status === "error") {
+    const cleanupOutcome = resultOutcome(cleanup);
+    if (!cleanupOutcome.ok) {
       return Result.err(
         new ClaudeAttemptRuntimeOperationAndCleanupFailed({
           operationError,
-          cleanupError: cleanup.error,
+          cleanupError: cleanupOutcome.error,
           message: `${operationError.message}; cleanup also failed`,
         }),
       );
@@ -621,8 +634,8 @@ export class ClaudeAttemptRuntimeOwner<FactoryInputs> {
   }
 
   private async adaptRunEndRetirementToHost(): Promise<void> {
-    const retired = await this.retireAtRunEndResult();
-    if (retired.status === "error") throw retired.error;
+    const retired = resultOutcome(await this.retireAtRunEndResult());
+    if (!retired.ok) throw retired.error;
   }
 
   private resetAttemptState(options: { readonly preservePrepareContext: boolean }): void {

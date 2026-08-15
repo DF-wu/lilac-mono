@@ -314,6 +314,29 @@ describe("plugin hook adapters", () => {
     expect(listed.error._tag).toBe("ToolPluginHookError");
   });
 
+  it("preserves Panic identity from hostile hook-result decoding", async () => {
+    const panic = new Panic({ message: "list decoder invariant" });
+    const hostileList = new Proxy([], {
+      getPrototypeOf() {
+        throw panic;
+      },
+      get() {
+        throw panic;
+      },
+    });
+    const tool: ServerTool = {
+      id: "hostile-decoder",
+      async init() {},
+      async destroy() {},
+      async list() {
+        return hostileList;
+      },
+      async call() {},
+    };
+
+    await expect(invokeLevel2List({ ...context, tool })).rejects.toBe(panic);
+  });
+
   it("propagates Panic from external hooks", () => {
     const panic = new Panic({ message: "hook invariant" });
     const spec = level1({

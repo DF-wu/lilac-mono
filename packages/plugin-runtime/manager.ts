@@ -12,7 +12,11 @@ import {
   type ToolPluginCapabilitySnapshot,
   type ToolPluginInstanceCapabilitySnapshot,
 } from "./capabilities";
-import { buildExternalToolPluginFreshnessKey, discoverExternalToolPlugins } from "./discovery";
+import {
+  buildExternalToolPluginFreshnessKey,
+  discoverExternalToolPlugins,
+  type ExternalToolPluginDiscovery,
+} from "./discovery";
 import {
   ToolPluginCapabilityError,
   ToolPluginCleanupError,
@@ -42,7 +46,9 @@ import type {
   PluginLogger,
   PluginSource,
   ServerTool,
+  ServerToolListResult,
   ToolPluginCreateContext,
+  ToolPluginInstance,
   ToolPluginStatus,
 } from "./types";
 
@@ -83,6 +89,17 @@ type LoadedOutcome<TRuntimeContext, TLevel1, TLevel2> =
   | { readonly kind: "skipped"; readonly pluginId: string; readonly reason: string };
 
 const level1ContributionSnapshots = new WeakMap<object, Level1ContributionInfo>();
+
+function continueResult<T, E, ROk, RErr>(
+  result: ResultType<T, E>,
+  branches: { ok: (value: T) => ROk; err: (error: E) => RErr },
+): ROk | RErr {
+  const continuation = result.match<() => ROk | RErr>({
+    ok: (value) => () => branches.ok(value),
+    err: (error) => () => branches.err(error),
+  });
+  return continuation();
+}
 
 export function getLevel1ContributionSnapshot(
   spec: Level1ToolSpec<unknown>,
@@ -174,11 +191,14 @@ function combineOperationAndCleanup(
   primary: ToolPluginOperationError,
   cleanup: ResultType<void, ToolPluginCleanupError>,
 ): ToolPluginManagerError {
-  if (cleanup.status === "ok") return primary;
-  return new ToolPluginOperationAndCleanupError({
-    primary,
-    cleanup: cleanup.error,
-    message: `${primary.message}; cleanup also failed: ${cleanup.error.message}`,
+  return cleanup.match<ToolPluginManagerError>({
+    ok: () => primary,
+    err: (error) =>
+      new ToolPluginOperationAndCleanupError({
+        primary,
+        cleanup: error,
+        message: `${primary.message}; cleanup also failed: ${error.message}`,
+      }),
   });
 }
 
@@ -186,26 +206,40 @@ function appendCleanup(
   error: ToolPluginManagerError,
   cleanup: ResultType<void, ToolPluginCleanupError>,
 ): ToolPluginManagerError {
-  if (cleanup.status === "ok") return error;
-  if (error._tag === "ToolPluginCleanupError") {
-    return cleanupError([...error.failures, ...cleanup.error.failures]);
-  }
-  if (error._tag === "ToolPluginOperationAndCleanupError") {
-    const combinedCleanup = cleanupError([...error.cleanup.failures, ...cleanup.error.failures]);
-    return new ToolPluginOperationAndCleanupError({
-      primary: error.primary,
-      cleanup: combinedCleanup,
-      message: `${error.primary.message}; cleanup also failed: ${combinedCleanup.message}`,
-    });
-  }
-  if (error._tag === "ToolPluginReloadCommittedCleanupError") {
-    const combinedCleanup = cleanupError([...error.cleanup.failures, ...cleanup.error.failures]);
-    return new ToolPluginReloadCommittedCleanupError({
-      cleanup: combinedCleanup,
-      message: `Plugin reload committed, but cleanup failed: ${combinedCleanup.message}`,
-    });
-  }
-  return combineOperationAndCleanup(error, cleanup);
+  return cleanup.match<ToolPluginManagerError>({
+    ok: () => error,
+    err: (cleanupFailure) => {
+      if (error._tag === "ToolPluginCleanupError") {
+        return cleanupError([...error.failures, ...cleanupFailure.failures]);
+      }
+      if (error._tag === "ToolPluginOperationAndCleanupError") {
+        const combinedCleanup = cleanupError([
+          ...error.cleanup.failures,
+          ...cleanupFailure.failures,
+        ]);
+        return new ToolPluginOperationAndCleanupError({
+          primary: error.primary,
+          cleanup: combinedCleanup,
+          message: `${error.primary.message}; cleanup also failed: ${combinedCleanup.message}`,
+        });
+      }
+      if (error._tag === "ToolPluginReloadCommittedCleanupError") {
+        const combinedCleanup = cleanupError([
+          ...error.cleanup.failures,
+          ...cleanupFailure.failures,
+        ]);
+        return new ToolPluginReloadCommittedCleanupError({
+          cleanup: combinedCleanup,
+          message: `Plugin reload committed, but cleanup failed: ${combinedCleanup.message}`,
+        });
+      }
+      return new ToolPluginOperationAndCleanupError({
+        primary: error,
+        cleanup: cleanupFailure,
+        message: `${error.message}; cleanup also failed: ${cleanupFailure.message}`,
+      });
+    },
+  });
 }
 
 function cleanupRejectionError<TCause>(pluginId: string, cause: TCause): ToolPluginCapabilityError {
@@ -297,10 +331,14 @@ export class ToolPluginManager<
   async init(): Promise<ResultType<void, ToolPluginManagerError>> {
     if (this.initialized) return Result.ok();
     const next = await this.loadAll();
-    if (next.status === "error") return next;
-    this.state = next.value;
-    this.initialized = true;
-    return Result.ok();
+    return continueResult(next, {
+      ok: (nextState) => {
+        this.state = nextState;
+        this.initialized = true;
+        return Result.ok();
+      },
+      err: (error) => Result.err(error),
+    });
   }
 
   async destroy(): Promise<ResultType<void, ToolPluginCleanupError>> {
@@ -314,19 +352,32 @@ export class ToolPluginManager<
     const next = await this.loadAll({
       cacheBustToken: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
     });
-    if (next.status === "error") return next;
+    let nextState!: LoadedState<TRuntimeContext, TLevel1, TLevel2>;
+    let nextError: ToolPluginManagerError | undefined;
+    continueResult(next, {
+      ok: (value) => {
+        nextState = value;
+      },
+      err: (error) => {
+        nextError = error;
+      },
+    });
+    if (nextError !== undefined) return Result.err(nextError);
 
     const previous = this.state;
-    this.state = next.value;
+    this.state = nextState;
     this.initialized = true;
     const cleanup = await this.destroyLoaded(previous.loaded);
-    if (cleanup.status === "ok") return Result.ok();
-    return Result.err(
-      new ToolPluginReloadCommittedCleanupError({
-        cleanup: cleanup.error,
-        message: `Plugin reload committed, but previous plugin cleanup failed: ${cleanup.error.message}`,
-      }),
-    );
+    return continueResult(cleanup, {
+      ok: () => Result.ok(undefined),
+      err: (error) =>
+        Result.err(
+          new ToolPluginReloadCommittedCleanupError({
+            cleanup: error,
+            message: `Plugin reload committed, but previous plugin cleanup failed: ${error.message}`,
+          }),
+        ),
+    });
   }
 
   async ensureFresh(): Promise<ResultType<void, ToolPluginManagerError>> {
@@ -335,26 +386,48 @@ export class ToolPluginManager<
       dataDir: this.options.dataDir,
       configPath: this.options.configPath,
     });
-    if (nextKey.status === "error") return nextKey;
-    if (nextKey.value === this.state.freshnessKey) return Result.ok();
-    return this.reload();
+    return continueResult(nextKey, {
+      ok: (freshnessKey) =>
+        freshnessKey === this.state.freshnessKey ? Result.ok() : this.reload(),
+      err: (error) => Result.err(error),
+    });
   }
 
   private async loadAll(options?: {
     cacheBustToken?: string;
   }): Promise<ResultType<LoadedState<TRuntimeContext, TLevel1, TLevel2>, ToolPluginManagerError>> {
     const disabled = await this.resolveDisabledPluginIds();
-    if (disabled.status === "error") return disabled;
-    const disabledPluginIds = new Set(disabled.value);
+    let disabledIds!: readonly string[];
+    let disabledError: ToolPluginManagerError | undefined;
+    continueResult(disabled, {
+      ok: (value) => {
+        disabledIds = value;
+      },
+      err: (error) => {
+        disabledError = error;
+      },
+    });
+    if (disabledError !== undefined) return Result.err(disabledError);
+    const disabledPluginIds = new Set(disabledIds);
 
     const freshness = await buildExternalToolPluginFreshnessKey({
       dataDir: this.options.dataDir,
       configPath: this.options.configPath,
     });
-    if (freshness.status === "error") return freshness;
+    let freshnessKey!: string;
+    let freshnessError: ToolPluginManagerError | undefined;
+    continueResult(freshness, {
+      ok: (value) => {
+        freshnessKey = value;
+      },
+      err: (error) => {
+        freshnessError = error;
+      },
+    });
+    if (freshnessError !== undefined) return Result.err(freshnessError);
     const moduleCacheBustKey = options?.cacheBustToken
-      ? `${freshness.value}-${options.cacheBustToken}`
-      : freshness.value;
+      ? `${freshnessKey}-${options.cacheBustToken}`
+      : freshnessKey;
 
     const statuses: ToolPluginStatus[] = [];
     const loaded: LoadedPlugin<TRuntimeContext, TLevel1, TLevel2>[] = [];
@@ -366,40 +439,80 @@ export class ToolPluginManager<
 
     for (const candidate of this.options.builtinPlugins ?? []) {
       const decoded = decodeToolPlugin<TRuntimeContext>(candidate);
-      if (decoded.status === "error") return this.failLoad(decoded.error, loaded);
+      let plugin!: ToolPluginCapabilitySnapshot<TRuntimeContext>;
+      let decodeError: ToolPluginCapabilityError | undefined;
+      continueResult(decoded, {
+        ok: (value) => {
+          plugin = value;
+        },
+        err: (error) => {
+          decodeError = error;
+        },
+      });
+      if (decodeError !== undefined) return this.failLoad(decodeError, loaded);
       const outcome = await this.tryLoadPlugin({
-        plugin: decoded.value,
+        plugin,
         source: "builtin",
         disabledPluginIds,
       });
-      if (outcome.status === "error") return this.failLoad(outcome.error, loaded);
-      if (outcome.value.kind !== "loaded") {
-        statuses.push(this.outcomeStatus(outcome.value, "builtin"));
+      let loadedOutcome!: LoadedOutcome<TRuntimeContext, TLevel1, TLevel2>;
+      let loadError: ToolPluginManagerError | undefined;
+      continueResult(outcome, {
+        ok: (value) => {
+          loadedOutcome = value;
+        },
+        err: (error) => {
+          loadError = error;
+        },
+      });
+      if (loadError !== undefined) return this.failLoad(loadError, loaded);
+      if (loadedOutcome.kind !== "loaded") {
+        statuses.push(this.outcomeStatus(loadedOutcome, "builtin"));
         continue;
       }
       const registered = await this.registerPluginPreservingPanic(
         {
-          plugin: outcome.value.plugin,
+          plugin: loadedOutcome.plugin,
           seenPluginIds,
           seenLevel1Names,
           seenLevel2Ids,
         },
         loaded,
       );
-      if (registered.status === "error") {
-        const ownCleanup = await this.destroyLoaded([outcome.value.plugin]);
-        const primary = appendCleanup(registered.error, ownCleanup);
+      let callableIds!: readonly string[];
+      let registrationError: ToolPluginManagerError | undefined;
+      continueResult(registered, {
+        ok: (value) => {
+          callableIds = value;
+        },
+        err: (error) => {
+          registrationError = error;
+        },
+      });
+      if (registrationError !== undefined) {
+        const ownCleanup = await this.destroyLoaded([loadedOutcome.plugin]);
+        const primary = appendCleanup(registrationError, ownCleanup);
         return this.failLoad(primary, loaded);
       }
-      loaded.push(outcome.value.plugin);
-      level1.push(...outcome.value.plugin.level1);
-      level2.push(...outcome.value.plugin.level2);
-      statuses.push(this.loadedStatus(outcome.value.plugin, registered.value));
+      loaded.push(loadedOutcome.plugin);
+      level1.push(...loadedOutcome.plugin.level1);
+      level2.push(...loadedOutcome.plugin.level2);
+      statuses.push(this.loadedStatus(loadedOutcome.plugin, callableIds));
     }
 
     const discovered = await discoverExternalToolPlugins({ dataDir: this.options.dataDir });
-    if (discovered.status === "error") return this.failLoad(discovered.error, loaded);
-    for (const entry of discovered.value) {
+    let discoveredEntries: readonly ExternalToolPluginDiscovery[] = [];
+    let discoveryError: ToolPluginManagerError | undefined;
+    continueResult(discovered, {
+      ok: (value) => {
+        discoveredEntries = value;
+      },
+      err: (error) => {
+        discoveryError = error;
+      },
+    });
+    if (discoveryError !== undefined) return this.failLoad(discoveryError, loaded);
+    for (const entry of discoveredEntries) {
       if (entry.type === "invalid") {
         statuses.push({
           pluginId: entry.pluginId,
@@ -433,15 +546,25 @@ export class ToolPluginManager<
         pluginDir: entry.pluginDir,
         cacheBustKey: moduleCacheBustKey,
       });
-      if (module.status === "error") {
-        statuses.push(this.failedExternalStatus(entry, module.error.message, disabledPluginIds));
+      let moduleCapability!: ToolPluginCapabilitySnapshot<TRuntimeContext>;
+      let moduleError: ToolPluginManagerError | undefined;
+      continueResult(module, {
+        ok: (value) => {
+          moduleCapability = value;
+        },
+        err: (error) => {
+          moduleError = error;
+        },
+      });
+      if (moduleError !== undefined) {
+        statuses.push(this.failedExternalStatus(entry, moduleError.message, disabledPluginIds));
         continue;
       }
-      if (module.value.meta.id !== entry.pluginId) {
+      if (moduleCapability.meta.id !== entry.pluginId) {
         statuses.push(
           this.failedExternalStatus(
             entry,
-            `plugin meta.id '${module.value.meta.id}' must match directory name '${entry.pluginId}'`,
+            `plugin meta.id '${moduleCapability.meta.id}' must match directory name '${entry.pluginId}'`,
             disabledPluginIds,
           ),
         );
@@ -449,42 +572,62 @@ export class ToolPluginManager<
       }
 
       const outcome = await this.tryLoadPlugin({
-        plugin: module.value,
+        plugin: moduleCapability,
         source: "external",
         disabledPluginIds,
         pluginDir: entry.pluginDir,
         entrypointPath: entry.entrypointPath,
       });
-      if (outcome.status === "error") {
-        statuses.push(this.failedExternalStatus(entry, outcome.error.message, disabledPluginIds));
+      let loadedOutcome!: LoadedOutcome<TRuntimeContext, TLevel1, TLevel2>;
+      let loadError: ToolPluginManagerError | undefined;
+      continueResult(outcome, {
+        ok: (value) => {
+          loadedOutcome = value;
+        },
+        err: (error) => {
+          loadError = error;
+        },
+      });
+      if (loadError !== undefined) {
+        statuses.push(this.failedExternalStatus(entry, loadError.message, disabledPluginIds));
         continue;
       }
-      if (outcome.value.kind !== "loaded") {
+      if (loadedOutcome.kind !== "loaded") {
         statuses.push(
-          this.outcomeStatus(outcome.value, "external", entry.pluginDir, entry.entrypointPath),
+          this.outcomeStatus(loadedOutcome, "external", entry.pluginDir, entry.entrypointPath),
         );
         continue;
       }
 
       const registered = await this.registerPluginPreservingPanic(
         {
-          plugin: outcome.value.plugin,
+          plugin: loadedOutcome.plugin,
           seenPluginIds,
           seenLevel1Names,
           seenLevel2Ids,
         },
         loaded,
       );
-      if (registered.status === "error") {
-        const ownCleanup = await this.destroyLoaded([outcome.value.plugin]);
-        const failure = appendCleanup(registered.error, ownCleanup);
+      let callableIds!: readonly string[];
+      let registrationError: ToolPluginManagerError | undefined;
+      continueResult(registered, {
+        ok: (value) => {
+          callableIds = value;
+        },
+        err: (error) => {
+          registrationError = error;
+        },
+      });
+      if (registrationError !== undefined) {
+        const ownCleanup = await this.destroyLoaded([loadedOutcome.plugin]);
+        const failure = appendCleanup(registrationError, ownCleanup);
         statuses.push(this.failedExternalStatus(entry, failure.message, disabledPluginIds));
         continue;
       }
-      loaded.push(outcome.value.plugin);
-      level1.push(...outcome.value.plugin.level1);
-      level2.push(...outcome.value.plugin.level2);
-      statuses.push(this.loadedStatus(outcome.value.plugin, registered.value));
+      loaded.push(loadedOutcome.plugin);
+      level1.push(...loadedOutcome.plugin.level1);
+      level2.push(...loadedOutcome.plugin.level2);
+      statuses.push(this.loadedStatus(loadedOutcome.plugin, callableIds));
     }
 
     return Result.ok({
@@ -492,7 +635,7 @@ export class ToolPluginManager<
       level1,
       level2,
       statuses,
-      freshnessKey: freshness.value,
+      freshnessKey,
     });
   }
 
@@ -542,30 +685,64 @@ export class ToolPluginManager<
           continueWith: createWithConfig,
         })
       : await createWithConfig(undefined);
-    if (created.status === "error") {
-      if (created.error._tag === "ToolPluginSkipped") {
-        return Result.ok({ kind: "skipped", pluginId, reason: created.error.reason });
+    const decodeCreated = Result.match<
+      ToolPluginInstance<Level1ToolSpec<TRuntimeContext>, ServerTool>,
+      ToolPluginManagerError,
+      () => ResultType<
+        ToolPluginInstanceCapabilitySnapshot<TRuntimeContext>,
+        ToolPluginManagerError
+      >
+    >(created, {
+      ok: (value) => () => decodeToolPluginInstance<TRuntimeContext>(pluginId, value),
+      err: (error) => () => Result.err(error),
+    });
+    const instanceResult = decodeCreated();
+    let instance!: ToolPluginInstanceCapabilitySnapshot<TRuntimeContext>;
+    let instanceError: ToolPluginManagerError | undefined;
+    continueResult(instanceResult, {
+      ok: (value) => {
+        instance = value;
+      },
+      err: (error) => {
+        instanceError = error;
+      },
+    });
+    if (instanceError !== undefined) {
+      if (instanceError._tag === "ToolPluginSkipped") {
+        return Result.ok({ kind: "skipped", pluginId, reason: instanceError.reason });
       }
-      return created;
+      return Result.err(instanceError);
     }
-    const instance = decodeToolPluginInstance<TRuntimeContext>(pluginId, created.value);
-    if (instance.status === "error") return instance;
 
     const initialized = await invokeToolPluginInstanceInit({
       pluginId,
       source: params.source,
-      capability: instance.value,
+      capability: instance,
     });
-    if (initialized.status === "error") {
-      if (initialized.error._tag === "ToolPluginSkipped") {
-        const cleanup = await this.destroyInstance(pluginId, params.source, instance.value);
-        if (cleanup.status === "error") {
-          return Result.err(combineOperationAndCleanup(initialized.error, cleanup));
+    let initializationError: ToolPluginOperationError | undefined;
+    continueResult(initialized, {
+      ok: () => undefined,
+      err: (error) => {
+        initializationError = error;
+      },
+    });
+    if (initializationError !== undefined) {
+      if (initializationError._tag === "ToolPluginSkipped") {
+        const cleanup = await this.destroyInstance(pluginId, params.source, instance);
+        let cleanupFailed = false;
+        continueResult(cleanup, {
+          ok: () => undefined,
+          err: () => {
+            cleanupFailed = true;
+          },
+        });
+        if (cleanupFailed) {
+          return Result.err(combineOperationAndCleanup(initializationError, cleanup));
         }
-        return Result.ok({ kind: "skipped", pluginId, reason: initialized.error.reason });
+        return Result.ok({ kind: "skipped", pluginId, reason: initializationError.reason });
       }
-      const cleanup = await this.destroyInstance(pluginId, params.source, instance.value);
-      return Result.err(combineOperationAndCleanup(initialized.error, cleanup));
+      const cleanup = await this.destroyInstance(pluginId, params.source, instance);
+      return Result.err(combineOperationAndCleanup(initializationError, cleanup));
     }
 
     const context = { pluginId, source: params.source } satisfies Level1RegistrationContext;
@@ -574,64 +751,84 @@ export class ToolPluginManager<
       TLevel1,
       Level1ToolSpecCapabilitySnapshot<TRuntimeContext>
     >();
-    for (const capability of instance.value.level1) {
+    for (const capability of instance.level1) {
       const item = capability.spec;
       const adapted = await captureManagerHook({
         hook: "adaptLevel1Item",
         pluginId,
         run: () => this.options.adaptLevel1Item(item, context),
       });
-      if (adapted.status === "error") {
-        return this.cleanupFailedInstance(adapted.error, pluginId, params.source, instance.value);
+      let adaptedItem!: TLevel1;
+      let adaptationError: ToolPluginManagerHookError | undefined;
+      continueResult(adapted, {
+        ok: (value) => {
+          adaptedItem = value;
+        },
+        err: (error) => {
+          adaptationError = error;
+        },
+      });
+      if (adaptationError !== undefined) {
+        return this.cleanupFailedInstance(adaptationError, pluginId, params.source, instance);
       }
-      if (!Object.is(adapted.value, item)) {
+      if (!Object.is(adaptedItem, item)) {
         const error = mapPluginManagerHookException({
           hook: "adaptLevel1Item",
           pluginId,
           cause: new Error("adapter must preserve the original object identity"),
         });
-        return this.cleanupFailedInstance(error, pluginId, params.source, instance.value);
+        return this.cleanupFailedInstance(error, pluginId, params.source, instance);
       }
-      adaptedLevel1.push(adapted.value);
-      level1Capabilities.set(adapted.value, capability);
-      level1ContributionSnapshots.set(adapted.value, context);
+      adaptedLevel1.push(adaptedItem);
+      level1Capabilities.set(adaptedItem, capability);
+      level1ContributionSnapshots.set(adaptedItem, context);
     }
 
     const adaptedLevel2: TLevel2[] = [];
     const level2Capabilities = new Map<TLevel2, ServerToolCapabilitySnapshot>();
-    for (const capability of instance.value.level2) {
+    for (const capability of instance.level2) {
       const item = capability.tool;
       const adapted = await captureManagerHook({
         hook: "adaptLevel2Item",
         pluginId,
         run: () => this.options.adaptLevel2Item(item, context),
       });
-      if (adapted.status === "error") {
-        return this.cleanupFailedInstance(adapted.error, pluginId, params.source, instance.value);
+      let adaptedItem!: TLevel2;
+      let adaptationError: ToolPluginManagerHookError | undefined;
+      continueResult(adapted, {
+        ok: (value) => {
+          adaptedItem = value;
+        },
+        err: (error) => {
+          adaptationError = error;
+        },
+      });
+      if (adaptationError !== undefined) {
+        return this.cleanupFailedInstance(adaptationError, pluginId, params.source, instance);
       }
-      if (!Object.is(adapted.value, item)) {
+      if (!Object.is(adaptedItem, item)) {
         const error = mapPluginManagerHookException({
           hook: "adaptLevel2Item",
           pluginId,
           cause: new Error("adapter must preserve the original object identity"),
         });
-        return this.cleanupFailedInstance(error, pluginId, params.source, instance.value);
+        return this.cleanupFailedInstance(error, pluginId, params.source, instance);
       }
-      adaptedLevel2.push(adapted.value);
-      level2Capabilities.set(adapted.value, capability);
+      adaptedLevel2.push(adaptedItem);
+      level2Capabilities.set(adaptedItem, capability);
     }
 
     return Result.ok({
       kind: "loaded",
       plugin: {
         pluginId,
-        instance: instance.value,
+        instance,
         meta: params.plugin.meta,
         source: params.source,
         pluginDir: params.pluginDir,
         entrypointPath: params.entrypointPath,
         level1: adaptedLevel1,
-        level1Names: instance.value.level1.map((capability) => capability.name),
+        level1Names: instance.level1.map((capability) => capability.name),
         level1Capabilities,
         level2: adaptedLevel2,
         level2Capabilities,
@@ -693,10 +890,29 @@ export class ToolPluginManager<
         pluginId,
         run: () => this.options.getLevel1RegistrationKey!(item, context, capability.name),
       });
-      if (resolved.status === "error") return resolved;
-      const decoded = decodeLevel1RegistrationKey(pluginId, resolved.value);
-      if (decoded.status === "error") return decoded;
-      level1Keys.push(decoded.value);
+      let rawRegistrationKey!: string;
+      let registrationError: ToolPluginManagerError | undefined;
+      continueResult(resolved, {
+        ok: (value) => {
+          rawRegistrationKey = value;
+        },
+        err: (error) => {
+          registrationError = error;
+        },
+      });
+      if (registrationError !== undefined) return Result.err(registrationError);
+      const decodedKey = decodeLevel1RegistrationKey(pluginId, rawRegistrationKey);
+      let registrationKey!: string;
+      continueResult(decodedKey, {
+        ok: (value) => {
+          registrationKey = value;
+        },
+        err: (error) => {
+          registrationError = error;
+        },
+      });
+      if (registrationError !== undefined) return Result.err(registrationError);
+      level1Keys.push(registrationKey);
     }
 
     for (const item of params.plugin.level2) {
@@ -717,7 +933,14 @@ export class ToolPluginManager<
         tool: item,
         capability,
       });
-      if (result.status === "error") return result;
+      let initializationError: ToolPluginManagerError | undefined;
+      continueResult(result, {
+        ok: () => undefined,
+        err: (error) => {
+          initializationError = error;
+        },
+      });
+      if (initializationError !== undefined) return Result.err(initializationError);
       params.plugin.initializedLevel2.push(capability);
     }
 
@@ -740,8 +963,18 @@ export class ToolPluginManager<
         tool: item,
         capability,
       });
-      if (listed.status === "error") return listed;
-      callableIds.push(...listed.value.map((entry) => entry.callableId));
+      let entries!: ServerToolListResult;
+      let listError: ToolPluginManagerError | undefined;
+      continueResult(listed, {
+        ok: (value) => {
+          entries = value;
+        },
+        err: (error) => {
+          listError = error;
+        },
+      });
+      if (listError !== undefined) return Result.err(listError);
+      callableIds.push(...entries.map((entry) => entry.callableId));
     }
 
     const localLevel1 = new Set<string>();
@@ -815,8 +1048,15 @@ export class ToolPluginManager<
 
     let detail = "cleanup rejected with Panic";
     if (cleanup.status === "fulfilled") {
-      if (cleanup.value.status === "ok") return;
-      detail = cleanup.value.error.message;
+      let cleanupFailure: ToolPluginCleanupError | undefined;
+      continueResult(cleanup.value, {
+        ok: () => undefined,
+        err: (error) => {
+          cleanupFailure = error;
+        },
+      });
+      if (cleanupFailure === undefined) return;
+      detail = cleanupFailure.message;
     }
     await Promise.allSettled([
       Promise.resolve().then(() =>
@@ -836,8 +1076,10 @@ export class ToolPluginManager<
       hook: "getDisabledPluginIds",
       run: this.options.getDisabledPluginIds,
     });
-    if (resolved.status === "error") return resolved;
-    return decodeDisabledPluginIds(resolved.value);
+    return continueResult(resolved, {
+      ok: (value) => decodeDisabledPluginIds(value),
+      err: (error) => Result.err(error),
+    });
   }
 
   private async destroyInstance(
@@ -869,8 +1111,11 @@ export class ToolPluginManager<
         return;
       }
       if (state.panic === undefined) state.panic = settled.reason;
-    } else if (settled.value.status === "error") {
-      state.failures.push(settled.value.error);
+    } else {
+      settled.value.match({
+        ok: () => undefined,
+        err: (error) => state.failures.push(error),
+      });
     }
   }
 
@@ -895,8 +1140,11 @@ export class ToolPluginManager<
           continue;
         }
         if (state.panic === undefined) state.panic = settled.reason;
-      } else if (settled.value.status === "error") {
-        state.failures.push(settled.value.error);
+      } else {
+        settled.value.match({
+          ok: () => undefined,
+          err: (error) => state.failures.push(error),
+        });
       }
     }
   }

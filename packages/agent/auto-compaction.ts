@@ -65,6 +65,15 @@ function signalAutoCompactionHost(error: AutoCompactionFailed): never {
   throw error.cause;
 }
 
+function resultOutcome<T, E>(
+  result: ResultType<T, E>,
+): { ok: true; value: T } | { ok: false; error: E } {
+  return result.match<{ ok: true; value: T } | { ok: false; error: E }>({
+    ok: (value) => ({ ok: true, value }),
+    err: (error) => ({ ok: false, error }),
+  });
+}
+
 function cloneMessage(message: ModelMessage): ModelMessage {
   if (message.role === "assistant") {
     return {
@@ -508,8 +517,9 @@ function shrinkCompactedMessagesToBudget(params: {
   inputBudget: number;
   summary: string;
 }): { messages: ModelMessage[]; summary: string } {
-  const result = shrinkCompactedMessagesToBudgetResult(params);
-  return result.status === "ok" ? result.value : signalAutoCompactionHost(result.error);
+  const result = resultOutcome(shrinkCompactedMessagesToBudgetResult(params));
+  if (!result.ok) return signalAutoCompactionHost(result.error);
+  return result.value;
 }
 
 type CompactionBoundary = {
@@ -902,8 +912,9 @@ async function summarizeMessagesHierarchicalResult(
 async function summarizeMessagesHierarchical(
   options: SummarizeMessagesHierarchicalOptions,
 ): Promise<string> {
-  const result = await summarizeMessagesHierarchicalResult(options);
-  return result.status === "ok" ? result.value : signalAutoCompactionHost(result.error);
+  const result = resultOutcome(await summarizeMessagesHierarchicalResult(options));
+  if (!result.ok) return signalAutoCompactionHost(result.error);
+  return result.value;
 }
 
 const DEFAULT_THRESHOLD_FRACTION = 0.8;
@@ -1547,7 +1558,7 @@ async function compactRepairedMessages(
       Math.floor(options.budget.inputBudget * 4 * passScale),
     );
 
-    const summarized = await summarizeMessagesHierarchicalResult({
+    const summarizedResult = await summarizeMessagesHierarchicalResult({
       messages: historyMessages,
       initialChunkTokenBudget: chunkTokenBudget,
       maxReductionPasses: DEFAULT_SUMMARY_REDUCTION_PASSES,
@@ -1572,8 +1583,14 @@ async function compactRepairedMessages(
       onProgress: options.onProgress,
       abortSignal: options.abortSignal,
     });
-    if (summarized.status === "error") return Result.err(summarized.error);
-    let finalSummary = summarized.value.trim();
+    const summarizedOutcome = summarizedResult.match<
+      { type: "ok"; value: string } | { type: "error"; error: AutoCompactionFailed }
+    >({
+      ok: (value) => ({ type: "ok" as const, value }),
+      err: (error) => ({ type: "error" as const, error }),
+    });
+    if (summarizedOutcome.type === "error") return Result.err(summarizedOutcome.error);
+    let finalSummary = summarizedOutcome.value.trim();
     if (!finalSummary) {
       return Result.err(
         autoCompactionFailure(
@@ -1608,8 +1625,15 @@ async function compactRepairedMessages(
     inputBudget: options.budget.inputBudget,
     summary: persistedSummary,
   });
-  if (localCompactionResult.status === "error") return Result.err(localCompactionResult.error);
-  const localCompaction = localCompactionResult.value;
+  const localCompactionOutcome = localCompactionResult.match<
+    | { type: "ok"; value: { messages: ModelMessage[]; summary: string } }
+    | { type: "error"; error: AutoCompactionFailed }
+  >({
+    ok: (value) => ({ type: "ok" as const, value }),
+    err: (error) => ({ type: "error" as const, error }),
+  });
+  if (localCompactionOutcome.type === "error") return Result.err(localCompactionOutcome.error);
+  const localCompaction = localCompactionOutcome.value;
 
   if (
     !options.serverCompaction ||
@@ -1766,8 +1790,9 @@ export async function compactMessages(
     onProgress: options.onProgress,
     onSummaryDelta: options.onSummaryDelta,
   });
-  if (compactedResult.status === "error") return signalAutoCompactionHost(compactedResult.error);
-  const compacted = compactedResult.value;
+  const compactedOutcome = resultOutcome(compactedResult);
+  if (!compactedOutcome.ok) return signalAutoCompactionHost(compactedOutcome.error);
+  const compacted = compactedOutcome.value;
   if (!compacted) return noop("already-minimal");
 
   const messages = cloneMessages(compacted.messages);
@@ -2000,28 +2025,30 @@ async function compactCanonicalMessages(options: {
       ...options.budget,
       inputBudget: options.budget.inputBudget - suffixAndOverlayTokens,
     };
-    const compactedPrefixResult = await compactRepairedMessages({
-      messages: transformedPrefix,
-      budget: prefixBudget,
-      summaryContextLimit: options.summaryContextLimit,
-      resolveModel: options.resolveModel,
-      providerOptions: options.providerOptions,
-      keepRecentTurns: 0,
-      keepRecentTokens: 0,
-      summarySystem: options.summarySystem,
-      buildSummaryPrompt: options.buildSummaryPrompt,
-      buildSummaryUpdatePrompt: options.buildSummaryUpdatePrompt,
-      forceCompaction: true,
-      serverCompaction: options.serverCompaction,
-      serverCompactionEnabled: options.serverCompactionEnabled,
-      serverCompactionContext: options.context,
-      onServerCompactionError: options.onServerCompactionError,
-      abortSignal: options.abortSignal,
-      onProgress: options.onProgress,
-      onSummaryDelta: options.onSummaryDelta,
-    });
-    if (compactedPrefixResult.status === "error") return Result.err(compactedPrefixResult.error);
-    const compactedPrefix = compactedPrefixResult.value;
+    const compactedPrefixOutcome = resultOutcome(
+      await compactRepairedMessages({
+        messages: transformedPrefix,
+        budget: prefixBudget,
+        summaryContextLimit: options.summaryContextLimit,
+        resolveModel: options.resolveModel,
+        providerOptions: options.providerOptions,
+        keepRecentTurns: 0,
+        keepRecentTokens: 0,
+        summarySystem: options.summarySystem,
+        buildSummaryPrompt: options.buildSummaryPrompt,
+        buildSummaryUpdatePrompt: options.buildSummaryUpdatePrompt,
+        forceCompaction: true,
+        serverCompaction: options.serverCompaction,
+        serverCompactionEnabled: options.serverCompactionEnabled,
+        serverCompactionContext: options.context,
+        onServerCompactionError: options.onServerCompactionError,
+        abortSignal: options.abortSignal,
+        onProgress: options.onProgress,
+        onSummaryDelta: options.onSummaryDelta,
+      }),
+    );
+    if (!compactedPrefixOutcome.ok) return Result.err(compactedPrefixOutcome.error);
+    const compactedPrefix = compactedPrefixOutcome.value;
     if (!compactedPrefix) return Result.ok(null);
 
     const summaryMessage = buildCompactionSummaryMessage(compactedPrefix.summary);
@@ -2342,10 +2369,9 @@ export async function attachAutoCompaction(
       overlay,
       context,
     });
-    if (inputEstimateResult.status === "error") {
-      return signalAutoCompactionHost(inputEstimateResult.error);
-    }
-    const inputEstimate = inputEstimateResult.value;
+    const inputEstimateOutcome = resultOutcome(inputEstimateResult);
+    if (!inputEstimateOutcome.ok) return signalAutoCompactionHost(inputEstimateOutcome.error);
+    const inputEstimate = inputEstimateOutcome.value;
     const modelInputEstimate = inputEstimate.effective;
     lastModelInputEstimate = modelInputEstimate;
     const providerInputTokens = thresholdInputSource === "usage" ? lastTurnInputTokens : null;
@@ -2518,10 +2544,11 @@ export async function attachAutoCompaction(
           return Math.min(currentStart, compactableMessages.length);
         })(),
       });
-      if (compactionResult.status === "error") {
-        return signalAutoCompactionHost(compactionResult.error);
+      const compactionResultOutcome = resultOutcome(compactionResult);
+      if (!compactionResultOutcome.ok) {
+        return signalAutoCompactionHost(compactionResultOutcome.error);
       }
-      const compactionOutcome = compactionResult.value;
+      const compactionOutcome = compactionResultOutcome.value;
 
       if (!compactionOutcome)
         return signalAutoCompactionHost(
@@ -2550,10 +2577,11 @@ export async function attachAutoCompaction(
         overlay: refreshedOverlay,
         context,
       });
-      if (refreshedInputEstimateResult.status === "error") {
-        return signalAutoCompactionHost(refreshedInputEstimateResult.error);
+      const refreshedInputEstimateOutcome = resultOutcome(refreshedInputEstimateResult);
+      if (!refreshedInputEstimateOutcome.ok) {
+        return signalAutoCompactionHost(refreshedInputEstimateOutcome.error);
       }
-      const refreshedInputEstimate = refreshedInputEstimateResult.value;
+      const refreshedInputEstimate = refreshedInputEstimateOutcome.value;
       lastModelInputEstimate = refreshedInputEstimate.effective;
       if (latestCapability.known) {
         pendingCompactionReason =

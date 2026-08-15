@@ -754,6 +754,15 @@ function signalAgentStateHost(error: AgentStateTransitionFailed | TurnAbortedErr
   throw new Error(error.message, { cause: error });
 }
 
+function resultOutcome<T, E>(
+  result: ResultType<T, E>,
+): { ok: true; value: T } | { ok: false; error: E } {
+  return result.match<{ ok: true; value: T } | { ok: false; error: E }>({
+    ok: (value) => ({ ok: true, value }),
+    err: (error) => ({ ok: false, error }),
+  });
+}
+
 function cloneSteeringValue(
   value: OpaqueAgentValue,
   ancestors: ReadonlySet<object>,
@@ -791,9 +800,9 @@ function cloneSteeringValue(
   if (Array.isArray(value)) {
     const cloned: OpaqueAgentValue[] = [];
     for (const entry of value) {
-      const result = cloneSteeringValue(entry, nestedAncestors);
-      if (result.status === "error") return Result.err(result.error);
-      cloned.push(result.value);
+      const outcome = resultOutcome(cloneSteeringValue(entry, nestedAncestors));
+      if (!outcome.ok) return Result.err(outcome.error);
+      cloned.push(outcome.value);
     }
     return Result.ok(cloned);
   }
@@ -839,8 +848,8 @@ function cloneSteeringValue(
         new SteeringMessageCloneFailed({ message: `accessor property '${key}' is unsupported` }),
       );
     }
-    const property = cloneSteeringValue(descriptor.value, nestedAncestors);
-    if (property.status === "error") return Result.err(property.error);
+    const property = resultOutcome(cloneSteeringValue(descriptor.value, nestedAncestors));
+    if (!property.ok) return Result.err(property.error);
     Object.defineProperty(cloned, key, {
       value: property.value,
       enumerable: true,
@@ -865,22 +874,24 @@ function cloneQueuedMessageValue(
   message: ModelMessage,
 ): ResultType<ModelMessage, SteeringMessageCloneFailed> {
   const cloned = cloneSteeringValue(message, new Set());
-  if (cloned.status === "error") return Result.err(cloned.error);
-  if (!isClonedModelMessage(cloned.value)) {
+  const outcome = resultOutcome(cloned);
+  if (!outcome.ok) return Result.err(outcome.error);
+  if (!isClonedModelMessage(outcome.value)) {
     return Result.err(
       new SteeringMessageCloneFailed({ message: "cloned message lost its valid role" }),
     );
   }
-  return Result.ok(cloned.value);
+  return Result.ok(outcome.value);
 }
 
 function cloneQueuedMessage(message: ModelMessage, operation: "queue" | "deliver"): ModelMessage {
   const cloned = cloneQueuedMessageValue(message);
-  if (cloned.status === "ok") return cloned.value;
+  const outcome = resultOutcome(cloned);
+  if (outcome.ok) return outcome.value;
   return signalAgentStateHost(
     new AgentStateTransitionFailed({
       operation: `${operation} steering message`,
-      message: `Cannot ${operation} steering message: messages must be safely cloneable (${cloned.error.message})`,
+      message: `Cannot ${operation} steering message: messages must be safely cloneable (${outcome.error.message})`,
     }),
   );
 }
@@ -1525,11 +1536,12 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
       aggregateOutputBudgetExempt: this.aggregateOutputBudgetExemptTools.has(toolName),
       onEvent: (event) => this.emit(event),
     });
-    if (executed.status === "error") {
+    const executedOutcome = resultOutcome(executed);
+    if (!executedOutcome.ok) {
       if (abortSignal?.aborted) this.alreadyNormalizedExternalToolCallIds.clear();
-      return signalExternalToolCallHost(executed.error);
+      return signalExternalToolCallHost(executedOutcome.error);
     }
-    const outcome = executed.value;
+    const outcome = executedOutcome.value;
 
     let executedExpansion: ExternalToolExecutionOutcome["executedExpansion"];
     if (outcome.expansion) {
@@ -1540,11 +1552,12 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
               abortSignal,
               appendToTranscript: false,
             });
-      if (childResult.status === "error") {
+      const childResultOutcome = resultOutcome(childResult);
+      if (!childResultOutcome.ok) {
         if (abortSignal?.aborted) this.alreadyNormalizedExternalToolCallIds.clear();
-        return signalExternalToolCallHost(childResult.error);
+        return signalExternalToolCallHost(childResultOutcome.error);
       }
-      const childOutcomes = childResult.value;
+      const childOutcomes = childResultOutcome.value;
       executedExpansion = {
         children: outcome.expansion.children.map((child, index) => {
           const childOutcome = childOutcomes[index];
@@ -1759,8 +1772,9 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
   }
 
   acknowledgeSteeringDelivery(id: SteeringQueueId): boolean {
-    const result = this.acknowledgeSteeringDeliveryResult(id);
-    return result.status === "ok" ? result.value : signalAgentStateHost(result.error);
+    const result = resultOutcome(this.acknowledgeSteeringDeliveryResult(id));
+    if (!result.ok) return signalAgentStateHost(result.error);
+    return result.value;
   }
 
   /**
@@ -1948,8 +1962,8 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
   }
 
   async interrupt(message: string | ModelMessage): Promise<void> {
-    const result = await this.interruptResult(message);
-    if (result.status === "error") signalAgentStateHost(result.error);
+    const result = resultOutcome(await this.interruptResult(message));
+    if (!result.ok) signalAgentStateHost(result.error);
   }
 
   /**
@@ -2003,8 +2017,8 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
    * Start a new agent run by appending message(s) and executing turns until done.
    */
   async prompt(input: string | ModelMessage | ModelMessage[]) {
-    const valid = this.validateRunStart("prompt");
-    if (valid.status === "error") signalAgentStateHost(valid.error);
+    const valid = resultOutcome(this.validateRunStart("prompt"));
+    if (!valid.ok) signalAgentStateHost(valid.error);
 
     let newMessages: ModelMessage[];
     if (Array.isArray(input)) newMessages = input;
@@ -2020,8 +2034,8 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
    * The last message must not be an assistant message.
    */
   async continue() {
-    const valid = this.validateRunStart("continue");
-    if (valid.status === "error") signalAgentStateHost(valid.error);
+    const valid = resultOutcome(this.validateRunStart("continue"));
+    if (!valid.ok) signalAgentStateHost(valid.error);
 
     await this.runLoop({ newMessages: undefined });
   }
@@ -2223,16 +2237,17 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
     }
 
     const consumed = this.consumeSteeringDelivery(preparation);
-    if (consumed.status === "error") {
+    const consumedOutcome = resultOutcome(consumed);
+    if (!consumedOutcome.ok) {
       this.clearSteeringDeliveryPreparation(preparation);
       this.settleAwaitedSteeringInterrupt(request, {
         status: "failed",
         steeringIds: preparation.steeringEntries.map((entry) => entry.id),
-        error: consumed.error.message,
+        error: consumedOutcome.error.message,
       });
       return;
     }
-    for (const message of consumed.value) this.appendMessage(message);
+    for (const message of consumedOutcome.value) this.appendMessage(message);
     this.settleAwaitedSteeringInterrupt(request, {
       status: "interrupted",
       steeringIds: preparation.steeringEntries.map((entry) => entry.id),
@@ -2609,8 +2624,9 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
             const toolExecution = hasLocalToolCalls
               ? await this.executeToolCalls(turn.toolCalls, turn.toolSnapshot)
               : Result.ok<number, ToolBatchExecutionFailed>(0);
-            if (toolExecution.status === "error") throw toolExecution.error.cause;
-            const executedToolCallCount = toolExecution.value;
+            const toolExecutionOutcome = resultOutcome(toolExecution);
+            if (!toolExecutionOutcome.ok) throw toolExecutionOutcome.error.cause;
+            const executedToolCallCount = toolExecutionOutcome.value;
             if (hasLocalToolCalls) this.recoveryCheckpoint = null;
 
             const boundaryDecision = await this.applyTurnBoundary({
@@ -2630,11 +2646,12 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
             const steeringPreparation = await this.prepareQueuedSteeringDelivery();
             if (steeringPreparation.status === "prepared") {
               const consumed = this.consumeSteeringDelivery(steeringPreparation.preparation);
-              if (consumed.status === "error") {
+              const consumedOutcome = resultOutcome(consumed);
+              if (!consumedOutcome.ok) {
                 this.clearSteeringDeliveryPreparation(steeringPreparation.preparation);
                 break;
               }
-              for (const msg of consumed.value) {
+              for (const msg of consumedOutcome.value) {
                 this.appendMessage(msg);
               }
               continue;
@@ -3610,8 +3627,14 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
           if (index >= toolCalls.length) return;
           next += 1;
           const result = await settleAtomicToolCallResult(atomicOptions[index]!);
-          if (result.status === "ok") settled[index] = result.value;
-          else executionError ??= result.error;
+          result.match({
+            ok: (value) => {
+              settled[index] = value;
+            },
+            err: (error) => {
+              executionError ??= error;
+            },
+          });
           if (isAborted()) return;
         }
       })(),
@@ -3903,11 +3926,12 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
           next += 1;
 
           const result = await executeOne(toolCalls[index]!);
-          if (result.status === "error") {
-            executionError ??= result.error;
+          const outcome = resultOutcome(result);
+          if (!outcome.ok) {
+            executionError ??= outcome.error;
             return;
           }
-          outcomes[index] = result.value;
+          outcomes[index] = outcome.value;
           checkpointCompletedOutcomes();
           appendReadyOutcomes();
         }
@@ -3954,8 +3978,9 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
         abortSignal: this.abortController?.signal,
         appendToTranscript: true,
       });
-      if (childOutcomes.status === "error") return Result.err(childOutcomes.error);
-      executed += childOutcomes.value.length;
+      const childOutcome = resultOutcome(childOutcomes);
+      if (!childOutcome.ok) return Result.err(childOutcome.error);
+      executed += childOutcome.value.length;
     }
 
     return Result.ok(executed);

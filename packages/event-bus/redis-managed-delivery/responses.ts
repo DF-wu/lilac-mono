@@ -74,11 +74,13 @@ const terminalReasonJsonSchema = z
       try: () => JSON.parse(value) as unknown,
       catch: () => new Error("Invalid terminal reason JSON"),
     });
-    if (parsed.status === "error") {
-      context.addIssue({ code: "custom", message: "Invalid terminal reason JSON" });
-      return z.NEVER;
-    }
-    return parsed.value;
+    return parsed.match({
+      ok: (parsedValue) => parsedValue,
+      err: () => {
+        context.addIssue({ code: "custom", message: "Invalid terminal reason JSON" });
+        return z.NEVER;
+      },
+    });
   })
   .pipe(terminalReasonSchema);
 

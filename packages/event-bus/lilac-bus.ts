@@ -104,9 +104,7 @@ function getTopicForType<TType extends LilacEventType>(
 ): ResultType<LilacTopicForType<TType>, EventPublishContractInvalid> {
   const codec = lilacEventCodecRegistry[type];
   if (!codec.requiresRequestId) return Result.ok(codec.resolveTopic(""));
-  const requestId = requireRequestId(headers, type);
-  if (requestId.status === "error") return Result.err(requestId.error);
-  return Result.ok(codec.resolveTopic(requestId.value));
+  return requireRequestId(headers, type).map((requestId) => codec.resolveTopic(requestId));
 }
 
 function getKeyForType<TType extends LilacEventType>(
@@ -116,9 +114,7 @@ function getKeyForType<TType extends LilacEventType>(
 ): ResultType<string | undefined, EventPublishContractInvalid> {
   const keySource = lilacEventCodecRegistry[type].keySource;
   if (keySource === "request_id") {
-    const requestId = requireRequestId(headers, type);
-    if (requestId.status === "error") return Result.err(requestId.error);
-    return Result.ok(requestId.value);
+    return requireRequestId(headers, type);
   }
   const key: unknown = Reflect.get(data, keySource);
   return Result.ok(typeof key === "string" ? key : undefined);
@@ -320,15 +316,25 @@ export function createLilacBus(raw: RawBus, options: CreateLilacBusOptions = {})
     ) => {
       let topic = options?.topic;
       if (topic === undefined) {
-        const resolvedTopic = getTopicForType(type, options?.headers);
-        if (resolvedTopic.status === "error") return Result.err(resolvedTopic.error);
-        topic = resolvedTopic.value;
+        const resolvedTopic = getTopicForType(type, options?.headers).match<
+          LilacTopicForType<TType> | EventPublishContractInvalid
+        >({
+          ok: (value) => value,
+          err: (error) => error,
+        });
+        if (EventPublishContractInvalid.is(resolvedTopic)) return Result.err(resolvedTopic);
+        topic = resolvedTopic;
       }
       let key = options?.key;
       if (key === undefined) {
-        const resolvedKey = getKeyForType(type, options?.headers, data);
-        if (resolvedKey.status === "error") return Result.err(resolvedKey.error);
-        key = resolvedKey.value;
+        const resolvedKey = getKeyForType(type, options?.headers, data).match<
+          string | undefined | EventPublishContractInvalid
+        >({
+          ok: (value) => value,
+          err: (error) => error,
+        });
+        if (EventPublishContractInvalid.is(resolvedKey)) return Result.err(resolvedKey);
+        key = resolvedKey;
       }
 
       let res: Awaited<ReturnType<RawBus["publish"]>>;
@@ -391,35 +397,49 @@ export function createLilacBus(raw: RawBus, options: CreateLilacBusOptions = {})
             contractError = normalizeTransportInvalid(message);
           } else {
             eventType = message.type;
-            const decoded = decodeLilacMessageForTopic(message, topic);
-            if (decoded.status === "error") {
-              contractError = normalizeContractInvalid(decoded.error);
-            } else {
-              const handled = checkedHandlerResult(await handler(decoded.value, context));
-              if (handled.status === "ok") return { disposition: "commit" };
-
-              const disposition = checkedDisposition(deliveryPolicy(handled.error));
-              const formatted = formatTaggedErrorForLog(handled.error);
-              if (disposition === "retry") {
-                return {
-                  disposition,
-                  failure: createHandlerErrorDeadLetterReason({
-                    errorTag: formatted.errorTag,
-                    errorMessage: formatted.errorMessage,
-                  }),
-                };
-              }
-              if (disposition !== "dead-letter") return { disposition };
-              return {
-                disposition,
-                reason: createHandlerErrorDeadLetterReason({
-                  errorTag: formatted.errorTag,
-                  errorMessage: formatted.errorMessage,
-                }),
-              };
-            }
+            const continueDecoded = decodeLilacMessageForTopic(message, topic).match<
+              () => Promise<RawDeliveryAction | undefined>
+            >({
+              ok: (decoded) => async () => {
+                const handled = checkedHandlerResult(await handler(decoded, context));
+                const continueHandled = handled.match<() => RawDeliveryAction>({
+                  ok: () => () => ({ disposition: "commit" }),
+                  err: (error) => () => {
+                    const disposition = checkedDisposition(deliveryPolicy(error));
+                    const formatted = formatTaggedErrorForLog(error);
+                    if (disposition === "retry") {
+                      return {
+                        disposition,
+                        failure: createHandlerErrorDeadLetterReason({
+                          errorTag: formatted.errorTag,
+                          errorMessage: formatted.errorMessage,
+                        }),
+                      };
+                    }
+                    if (disposition !== "dead-letter") return { disposition };
+                    return {
+                      disposition,
+                      reason: createHandlerErrorDeadLetterReason({
+                        errorTag: formatted.errorTag,
+                        errorMessage: formatted.errorMessage,
+                      }),
+                    };
+                  },
+                });
+                return continueHandled();
+              },
+              err: (error) => async () => {
+                contractError = normalizeContractInvalid(error);
+                return undefined;
+              },
+            });
+            const action = await continueDecoded();
+            if (action !== undefined) return action;
           }
 
+          if (contractError === undefined) {
+            throw new Panic({ message: "Event contract failure was not captured" });
+          }
           logContractInvalid(options.logger, topic, context.cursor, contractError);
           const disposition = applyEventDeliveryPolicy(contractError);
           if (disposition === "retry") {
@@ -469,12 +489,18 @@ export function createLilacBus(raw: RawBus, options: CreateLilacBusOptions = {})
         if ("_tag" in entry.msg) {
           contractError = normalizeTransportInvalid(entry.msg);
         } else {
-          const decoded = decodeLilacMessageForTopic(entry.msg, topic);
-          if (decoded.status === "ok") {
-            messages.push({ msg: decoded.value, cursor: entry.cursor });
-            continue;
-          }
-          contractError = normalizeContractInvalid(decoded.error);
+          const continueDecoded = decodeLilacMessageForTopic(entry.msg, topic).match<
+            () => EventContractInvalid | undefined
+          >({
+            ok: (message) => () => {
+              messages.push({ msg: message, cursor: entry.cursor });
+              return undefined;
+            },
+            err: (error) => () => normalizeContractInvalid(error),
+          });
+          const decodedError = continueDecoded();
+          if (decodedError === undefined) continue;
+          contractError = decodedError;
         }
         logContractInvalid(options.logger, topic, entry.cursor, contractError);
         return Result.err(

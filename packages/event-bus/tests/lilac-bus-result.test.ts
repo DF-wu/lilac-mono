@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { Panic, Result } from "better-result";
+import { Panic, Result, TaggedError } from "better-result";
 
 import {
   createLilacBus,
@@ -17,6 +17,10 @@ type PublicResultHandlerContext = Parameters<PublicResultHandler>[1];
 type PublicResultHandlerHasNoAck = "commit" extends keyof PublicResultHandlerContext ? false : true;
 
 const PUBLIC_RESULT_HANDLER_HAS_NO_ACK: PublicResultHandlerHasNoAck = true;
+
+class DeliveryPolicyFailure extends TaggedError("DeliveryPolicyFailure")<{
+  readonly message: string;
+}> {}
 
 function rawBusWithFetch(
   fetch: RawBus["fetch"],
@@ -150,6 +154,57 @@ describe("LilacBus Result APIs", () => {
     );
     expect(handlerContextHasAck).toBe(false);
     expect(action).toEqual({ disposition: "commit" });
+  });
+
+  it("preserves Panic identity from the delivery policy", async () => {
+    let rawHandler: RawDeliveryHandler | undefined;
+    const raw = rawBusWithFetch(
+      async () => ({ messages: [] }),
+      async (_topic, _options, handler) => {
+        rawHandler = handler;
+        return Result.ok({
+          done: Promise.resolve(Result.ok(undefined)),
+          stop: async () => Result.ok(undefined),
+        });
+      },
+    );
+    const panic = new Panic({ message: "delivery policy invariant" });
+    await createLilacBus(raw).subscribeTopic(
+      "cmd.request",
+      { mode: "tail", offset: { type: "begin" } },
+      async () => Result.err(new DeliveryPolicyFailure({ message: "rejected" })),
+      () => {
+        throw panic;
+      },
+    );
+    if (!rawHandler) throw new Error("Raw delivery handler was not captured");
+
+    await expect(
+      rawHandler(
+        {
+          topic: "cmd.request",
+          id: "1-0",
+          type: "cmd.request.message",
+          ts: 1,
+          key: "request-1",
+          headers: { request_id: "request-1" },
+          data: { queue: "prompt", messages: [{ role: "user", content: "hello" }] },
+        },
+        {
+          cursor: "1-0",
+          mode: "tail",
+          evidence: {
+            source: {
+              transport: "redis-streams",
+              streamKey: "test:cmd.request",
+              topic: "cmd.request",
+              messageId: "1-0",
+            },
+            wire: { kind: "bounded-complete", fields: [] },
+          },
+        },
+      ),
+    ).rejects.toBe(panic);
   });
 
   it("returns invalid contracts as typed errors and redacts diagnostic payloads", async () => {

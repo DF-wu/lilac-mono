@@ -232,10 +232,14 @@ export class RedisConnectionPool {
   > {
     this.creating += 1;
     try {
-      const created = await this.createConnection();
-      if (created.status === "error") return Result.err(created.error);
+      const createdResult = await this.createConnection();
+      const created = createdResult.match<Redis | RedisConnectionCreateFailed>({
+        ok: (value) => value,
+        err: (error) => error,
+      });
+      if (RedisConnectionCreateFailed.is(created)) return Result.err(created);
       if (this.closed) {
-        created.value.disconnect();
+        created.disconnect();
         return Result.err(
           new RedisConnectionPoolClosed({
             label: this.label,
@@ -244,7 +248,7 @@ export class RedisConnectionPool {
         );
       }
       this.created += 1;
-      return Result.ok(created.value);
+      return Result.ok(created);
     } finally {
       this.creating -= 1;
     }
@@ -256,10 +260,15 @@ export class RedisConnectionPool {
     const target = this.warm;
 
     while (!this.closed && this.created + this.creating < target) {
-      const created = await this.createReservedConnection();
-      if (created.status === "error") return Result.err(created.error);
-      const c = created.value;
-      this.available.push(c);
+      const createdResult = await this.createReservedConnection();
+      const created = createdResult.match<
+        Redis | RedisConnectionPoolClosed | RedisConnectionCreateFailed
+      >({
+        ok: (value) => value,
+        err: (error) => error,
+      });
+      if (TaggedError.is(created)) return Result.err(created);
+      this.available.push(created);
       // Let the connection establish asynchronously (no await).
       // The first command on this client will trigger the connect.
       await Promise.resolve();
@@ -293,8 +302,11 @@ export class RedisConnectionPool {
 
     if (this.created + this.creating < this.max) {
       const created = await this.createReservedConnection();
-      if (created.status === "error") return Result.err(created.error);
-      const c = created.value;
+      const c = created.match<Redis | RedisConnectionPoolClosed | RedisConnectionCreateFailed>({
+        ok: (value) => value,
+        err: (error) => error,
+      });
+      if (TaggedError.is(c)) return Result.err(c);
       this.inUse.add(c);
       return Result.ok({
         redis: c,
@@ -308,8 +320,11 @@ export class RedisConnectionPool {
     // Pool exhausted; try to scale up instead of falling back to the shared client.
     if (this.maybeScaleUpOnExhausted() && this.created + this.creating < this.max) {
       const created = await this.createReservedConnection();
-      if (created.status === "error") return Result.err(created.error);
-      const c = created.value;
+      const c = created.match<Redis | RedisConnectionPoolClosed | RedisConnectionCreateFailed>({
+        ok: (value) => value,
+        err: (error) => error,
+      });
+      if (TaggedError.is(c)) return Result.err(c);
       this.inUse.add(c);
       return Result.ok({
         redis: c,

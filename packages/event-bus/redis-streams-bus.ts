@@ -30,6 +30,7 @@ import {
   RedisConnectionPool,
   type RedisConnectionPoolOptions,
   type RedisConnectionPoolAutoscaleOptions,
+  type RedisLease,
 } from "./redis-connection-pool";
 import {
   MANAGED_REDIS_HEARTBEAT_MS,
@@ -859,19 +860,24 @@ export class RedisStreamsBus implements RawBus {
     trigger: "parked" | "subscription_start",
   ): Promise<void> {
     const inspected = await captureRedisPendingSummary(this.redis, streamKey, group);
-    if (inspected.status === "error") {
-      this.logger.warn("event_bus.pending_inspection_failed", { topic, group, trigger });
-      return;
-    }
-    const { count: pendingCount, oldestIdleMs } = inspected.value;
-    if (pendingCount === 0) return;
-    this.logger.warn("event_bus.pending_entries", {
-      topic,
-      group,
-      trigger,
-      pendingCount,
-      oldestPendingIdleMs: oldestIdleMs,
+    const report = inspected.match<() => void>({
+      err: () => () => {
+        this.logger.warn("event_bus.pending_inspection_failed", { topic, group, trigger });
+      },
+      ok:
+        ({ count: pendingCount, oldestIdleMs }) =>
+        () => {
+          if (pendingCount === 0) return;
+          this.logger.warn("event_bus.pending_entries", {
+            topic,
+            group,
+            trigger,
+            pendingCount,
+            oldestPendingIdleMs: oldestIdleMs,
+          });
+        },
     });
+    report();
   }
 
   private scheduleAcknowledgedTrim(topic: Topic, streamKey: string): void {
@@ -1103,16 +1109,18 @@ export class RedisStreamsBus implements RawBus {
 
     const abortController = new AbortController();
     const acquired = await this.subPool.acquire();
-    if (acquired.status === "error") {
-      return Result.err(
+    const lease = acquired.match<RedisLease | EventDeliveryStartFailed>({
+      ok: (value) => value,
+      err: (error) =>
         new EventDeliveryStartFailed({
-          cause: acquired.error,
+          cause: error,
           topic,
           message: "Failed to acquire a Redis delivery connection",
         }),
-      );
+    });
+    if (EventDeliveryStartFailed.is(lease)) {
+      return Result.err(lease);
     }
-    const lease = acquired.value;
 
     const subRedis = lease.redis;
     let disconnectOnStop = false;
@@ -1144,17 +1152,20 @@ export class RedisStreamsBus implements RawBus {
           startId: "$",
           logger: this.logger,
         });
-        if (ensuredGroup.status === "error") {
-          if (!lease.shared) await lease.release({ unhealthy: true });
-          return Result.err(
+        const initializedGroup = ensuredGroup.match<boolean | EventDeliveryStartFailed>({
+          ok: (value) => value,
+          err: (error) =>
             new EventDeliveryStartFailed({
-              cause: ensuredGroup.error,
+              cause: error,
               topic,
               message: "Failed to initialize Redis delivery",
             }),
-          );
+        });
+        if (EventDeliveryStartFailed.is(initializedGroup)) {
+          if (!lease.shared) await lease.release({ unhealthy: true });
+          return Result.err(initializedGroup);
         }
-        createdGroup = ensuredGroup.value;
+        createdGroup = initializedGroup;
         if (opts.ephemeral && !createdGroup) {
           throw new Error(`Ephemeral consumer group already exists: ${group}`);
         }
@@ -1275,23 +1286,25 @@ export class RedisStreamsBus implements RawBus {
             }
           }
 
-          if (accepted.status === "error") {
-            dependencies.logger?.error("event_bus.dead_letter_failed", {
-              topic,
-              cursor: id,
-              mode: opts.mode,
-            });
-            return {
-              status: "stop",
-              error: new EventDeliveryStopped({
-                reason: "dead-letter-failed",
+          return accepted.match<EntryHandlingResult>({
+            ok: () => ({ status: "advance" }),
+            err: () => {
+              dependencies.logger?.error("event_bus.dead_letter_failed", {
                 topic,
                 cursor: id,
-                message: "Tail delivery stopped after dead-letter acceptance failed",
-              }),
-            };
-          }
-          return { status: "advance" };
+                mode: opts.mode,
+              });
+              return {
+                status: "stop",
+                error: new EventDeliveryStopped({
+                  reason: "dead-letter-failed",
+                  topic,
+                  cursor: id,
+                  message: "Tail delivery stopped after dead-letter acceptance failed",
+                }),
+              };
+            },
+          });
         }
       }
     };
@@ -2043,8 +2056,13 @@ export class RedisStreamsBus implements RawBus {
     for (const outcome of stopped) {
       if (outcome.status === "rejected") {
         stopFailure ??= outcome.reason;
-      } else if (outcome.value.status === "error") {
-        stopFailure ??= outcome.value.error;
+      } else {
+        outcome.value.match({
+          ok: () => undefined,
+          err: (error) => {
+            stopFailure ??= error;
+          },
+        });
       }
     }
     for (const timer of this.trimTimers.values()) clearTimeout(timer);

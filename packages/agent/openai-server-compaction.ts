@@ -385,6 +385,15 @@ export async function compactWithOpenAIResponses(
   request: OpenAIServerCompactionRequest,
 ): Promise<OpenAIServerCompactionArtifact> {
   const result = await compactWithOpenAIResponsesResult(request);
-  if (result.status === "ok") return result.value;
-  throw new Error(result.error.message, { cause: result.error });
+  const outcome = result.match<
+    | { type: "ok"; value: OpenAIServerCompactionArtifact }
+    | { type: "error"; error: OpenAIServerCompactionError }
+  >({
+    ok: (value) => ({ type: "ok" as const, value }),
+    err: (error) => ({ type: "error" as const, error }),
+  });
+  if (outcome.type === "error") {
+    throw new Error(outcome.error.message, { cause: outcome.error });
+  }
+  return outcome.value;
 }

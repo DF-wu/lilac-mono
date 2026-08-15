@@ -155,8 +155,11 @@ function decodeKnownMessage(
     stage: "headers",
     eventType,
   });
-  if (headersResult.status === "error") return Result.err(headersResult.error);
-  const headers = headersResult.value;
+  const headers = headersResult.match<Record<string, string> | LilacEventDecodeError>({
+    ok: (value) => value,
+    err: (error) => error,
+  });
+  if (LilacEventDecodeError.is(headers)) return Result.err(headers);
 
   const requestId = headers["request_id"];
   if (codec.requiresRequestId && !requestId) {
@@ -207,7 +210,11 @@ function decodeKnownMessage(
     stage: "topic",
     eventType,
   });
-  if (topicResult.status === "error") return Result.err(topicResult.error);
+  const topic = topicResult.match<LilacTopic | LilacEventDecodeError>({
+    ok: (value) => value,
+    err: (error) => error,
+  });
+  if (LilacEventDecodeError.is(topic)) return Result.err(topic);
 
   const dataResult = decodeSchema({
     schema: codec.dataSchema as z.ZodType<LilacDataForType<LilacEventType>>,
@@ -215,23 +222,31 @@ function decodeKnownMessage(
     stage: "payload",
     eventType,
   });
-  if (dataResult.status === "error") return Result.err(dataResult.error);
+  const data = dataResult.match<LilacDataForType<LilacEventType> | LilacEventDecodeError>({
+    ok: (value) => value,
+    err: (error) => error,
+  });
+  if (LilacEventDecodeError.is(data)) return Result.err(data);
   const keyResult = decodeSchema({
     schema: nonemptyStringSchema,
     value: envelope.key,
     stage: "key",
     eventType,
   });
-  if (keyResult.status === "error") return Result.err(keyResult.error);
+  const key = keyResult.match<string | LilacEventDecodeError>({
+    ok: (value) => value,
+    err: (error) => error,
+  });
+  if (LilacEventDecodeError.is(key)) return Result.err(key);
 
   const decoded = {
-    topic: topicResult.value,
+    topic,
     id: envelope.id,
     type: eventType,
     ts: envelope.ts,
-    key: keyResult.value,
+    key,
     ...(envelope.headers === undefined ? {} : { headers }),
-    data: dataResult.value,
+    data,
   };
 
   // The Map key, type, topic schema, and data schema all come from one catalog entry.
@@ -248,9 +263,15 @@ export function decodeLilacMessage(
     value: message,
     stage: "envelope",
   });
-  if (envelopeResult.status === "error") return Result.err(envelopeResult.error);
-  const envelope = envelopeResult.value;
-
+  const resolved = envelopeResult.match<
+    | { readonly envelope: z.output<typeof envelopeSchema> }
+    | { readonly error: LilacEventDecodeError }
+  >({
+    ok: (envelope) => ({ envelope }),
+    err: (error) => ({ error }),
+  });
+  if ("error" in resolved) return Result.err(resolved.error);
+  const envelope = resolved.envelope;
   const codec = lilacEventCodecsByType.get(envelope.type);
   if (codec !== undefined) return decodeKnownMessage(codec, envelope);
 
@@ -258,10 +279,14 @@ export function decodeLilacMessage(
     new LilacEventDecodeError({
       stage: "event_type",
       eventType: envelope.type,
-      issues: [`type: Unknown Lilac event type ${JSON.stringify(envelope.type)}`],
+      issues: [`type: Unknown Lilac event type ${formatUnknownEventType(envelope.type)}`],
       message: "Unknown Lilac event type",
     }),
   );
+}
+
+function formatUnknownEventType(eventType: string): string {
+  return JSON.stringify(eventType);
 }
 
 /** Decode a message and prove that it belongs to the requested topic contract. */
@@ -269,20 +294,18 @@ export function decodeLilacMessageForTopic<TTopic extends LilacTopic>(
   message: Message<unknown>,
   topic: TTopic,
 ): ResultType<DecodedLilacMessage<LilacEventTypesForTopic<TTopic>>, LilacEventDecodeError> {
-  const decoded = decodeLilacMessage(message);
-  if (decoded.status === "error") return Result.err(decoded.error);
-  if (!isDecodedLilacMessageForTopic(decoded.value, topic)) {
-    return Result.err(
-      new LilacEventDecodeError({
-        stage: "topic",
-        eventType: decoded.value.type,
-        issues: [`topic: Expected subscribed topic ${JSON.stringify(topic)}`],
-        message: "Lilac event does not belong to the subscribed topic",
-      }),
-    );
-  }
-
-  return Result.ok(decoded.value);
+  return decodeLilacMessage(message).andThen((decoded) =>
+    isDecodedLilacMessageForTopic(decoded, topic)
+      ? Result.ok(decoded)
+      : Result.err(
+          new LilacEventDecodeError({
+            stage: "topic",
+            eventType: decoded.type,
+            issues: [`topic: Expected subscribed topic ${JSON.stringify(topic)}`],
+            message: "Lilac event does not belong to the subscribed topic",
+          }),
+        ),
+  );
 }
 
 function isDecodedLilacMessageForTopic<TTopic extends LilacTopic>(

@@ -7,6 +7,7 @@ import { Panic } from "better-result";
 
 import {
   ToolPluginManager,
+  ToolPluginManagerHookError,
   ToolPluginSkipError,
   discoverExternalToolPlugins,
   invokeLevel2Call,
@@ -251,6 +252,39 @@ export default { meta: { id: "demo-plugin" }, create() { return { level1: [level
     expect(failed.status).toBe("error");
     if (failed.status === "ok") throw new Error("expected builtin failure");
     expect(failed.error._tag).toBe("ToolPluginHookError");
+  });
+
+  it("does not misclassify a tagged Level 1 contribution as a manager failure", async () => {
+    const taggedSpec = Object.assign(
+      new ToolPluginManagerHookError({
+        hook: "adaptLevel1Item",
+        pluginId: "tagged-success",
+        cause: new Error("payload only"),
+        message: "valid tagged contribution",
+      }),
+      {
+        name: "tagged_success",
+        createTool() {
+          return {};
+        },
+        isEnabled() {
+          return true;
+        },
+      },
+    ) as ToolPluginManagerHookError & Level1ToolSpec<Runtime>;
+    const value = manager({
+      dataDir: "/tmp/plugin-runtime-tagged-success-unused",
+      builtinPlugins: [
+        {
+          meta: { id: "tagged-success" },
+          create: () => ({ level1: [taggedSpec] }),
+        },
+      ],
+    });
+
+    const initialized = await value.init();
+    expect(initialized.status).toBe("ok");
+    expect(value.getLevel1Items()).toEqual([taggedSpec]);
   });
 
   it("maps getPluginConfig failure and preserves Panic from its create continuation", async () => {

@@ -23,7 +23,7 @@ import {
   ToolPluginHookError,
   ToolPluginSkipError,
   ToolPluginSkipped,
-  type ToolPluginCapabilityError,
+  ToolPluginCapabilityError,
   type ToolPluginHookName,
 } from "./errors";
 import type {
@@ -183,11 +183,11 @@ export async function invokeToolPluginInstanceInit<TRuntimeContext>(params: {
     source: params.source,
     hook: "instance.init",
   } satisfies HookContext;
-  const invoked = await captureAsyncHook(context, () =>
-    params.capability.init!.call(params.capability.instance),
+  return captureAsyncHook(
+    context,
+    () => params.capability.init!.call(params.capability.instance),
+    (value) => decodeVoidHookResult(params.pluginId, value),
   );
-  if (invoked.status === "error") return invoked;
-  return decodeVoidHookResult(params.pluginId, invoked.value);
 }
 
 export async function invokeToolPluginInstanceDestroy<TRuntimeContext>(params: {
@@ -201,11 +201,11 @@ export async function invokeToolPluginInstanceDestroy<TRuntimeContext>(params: {
     source: params.source,
     hook: "instance.destroy",
   } satisfies HookContext;
-  const invoked = await captureAsyncHook(context, () =>
-    params.capability.destroy!.call(params.capability.instance),
+  return captureAsyncHook(
+    context,
+    () => params.capability.destroy!.call(params.capability.instance),
+    (value) => decodeVoidHookResult(params.pluginId, value),
   );
-  if (invoked.status === "error") return invoked;
-  return decodeVoidHookResult(params.pluginId, invoked.value);
 }
 
 export function invokeLevel1CreateTool<TRuntimeContext>(params: {
@@ -216,16 +216,22 @@ export function invokeLevel1CreateTool<TRuntimeContext>(params: {
   context: Level1ToolBuildContext<TRuntimeContext>;
 }): ResultType<unknown, ToolPluginInvocationError | ToolPluginCapabilityError> {
   const capability = resolveLevel1Capability(params);
-  if (capability.status === "error") return capability;
-  return captureSyncHook(
-    {
-      pluginId: params.pluginId,
-      source: params.source,
-      hook: "level1.createTool",
-      itemId: capability.value.name,
-    },
-    () => capability.value.createTool.call(params.spec, params.context),
-  );
+  const invoke = capability.match<
+    () => ResultType<unknown, ToolPluginInvocationError | ToolPluginCapabilityError>
+  >({
+    err: (error) => () => Result.err(error),
+    ok: (value) => () =>
+      captureSyncHook(
+        {
+          pluginId: params.pluginId,
+          source: params.source,
+          hook: "level1.createTool",
+          itemId: value.name,
+        },
+        () => value.createTool.call(params.spec, params.context),
+      ),
+  });
+  return invoke();
 }
 
 export function invokeLevel1IsEnabled<TRuntimeContext>(params: {
@@ -236,17 +242,23 @@ export function invokeLevel1IsEnabled<TRuntimeContext>(params: {
   context: Level1ToolRunContext<TRuntimeContext>;
 }): ResultType<boolean, ToolPluginInvocationError | ToolPluginCapabilityError> {
   const capability = resolveLevel1Capability(params);
-  if (capability.status === "error") return capability;
-  return captureSyncHook(
-    {
-      pluginId: params.pluginId,
-      source: params.source,
-      hook: "level1.isEnabled",
-      itemId: capability.value.name,
-    },
-    () => capability.value.isEnabled.call(params.spec, params.context),
-    (value) => decodeBooleanHookResult(params.pluginId, value),
-  );
+  const invoke = capability.match<
+    () => ResultType<boolean, ToolPluginInvocationError | ToolPluginCapabilityError>
+  >({
+    err: (error) => () => Result.err(error),
+    ok: (value) => () =>
+      captureSyncHook(
+        {
+          pluginId: params.pluginId,
+          source: params.source,
+          hook: "level1.isEnabled",
+          itemId: value.name,
+        },
+        () => value.isEnabled.call(params.spec, params.context),
+        (enabled) => decodeBooleanHookResult(params.pluginId, enabled),
+      ),
+  });
+  return invoke();
 }
 
 export async function invokeLevel1EditTargets<TArgs>(params: {
@@ -260,24 +272,36 @@ export async function invokeLevel1EditTargets<TArgs>(params: {
   ResultType<readonly string[] | undefined, ToolPluginInvocationError | ToolPluginCapabilityError>
 > {
   const capability = resolveLevel1Capability(params);
-  if (capability.status === "error") return capability;
-  if (capability.value.editTargets === undefined) return Result.ok(undefined);
-  const context = {
-    pluginId: params.pluginId,
-    source: params.source,
-    hook: "level1.editTargets",
-    itemId: capability.value.name,
-  } satisfies HookContext;
-  return captureAsyncHook(
-    context,
-    () => capability.value.editTargets!.call(params.spec, params.args, { cwd: params.cwd }),
-    (value) =>
-      captureSyncHook(
+  const invoke = capability.match<
+    () => Promise<
+      ResultType<
+        readonly string[] | undefined,
+        ToolPluginInvocationError | ToolPluginCapabilityError
+      >
+    >
+  >({
+    err: (error) => async () => Result.err(error),
+    ok: (value) => async () => {
+      if (value.editTargets === undefined) return Result.ok(undefined);
+      const context = {
+        pluginId: params.pluginId,
+        source: params.source,
+        hook: "level1.editTargets",
+        itemId: value.name,
+      } satisfies HookContext;
+      return captureAsyncHook(
         context,
-        () => Array.from(value),
-        (collected) => decodeStringArrayHookResult(params.pluginId, collected),
-      ),
-  );
+        () => value.editTargets!.call(params.spec, params.args, { cwd: params.cwd }),
+        (targets) =>
+          captureSyncHook(
+            context,
+            () => Array.from(targets),
+            (collected) => decodeStringArrayHookResult(params.pluginId, collected),
+          ),
+      );
+    },
+  });
+  return invoke();
 }
 
 export function invokeLevel1FormatArgs<TArgs>(params: {
@@ -288,18 +312,25 @@ export function invokeLevel1FormatArgs<TArgs>(params: {
   args: TArgs;
 }): ResultType<string | undefined, ToolPluginInvocationError | ToolPluginCapabilityError> {
   const capability = resolveLevel1Capability(params);
-  if (capability.status === "error") return capability;
-  if (capability.value.formatArgs === undefined) return Result.ok(undefined);
-  return captureSyncHook(
-    {
-      pluginId: params.pluginId,
-      source: params.source,
-      hook: "level1.formatArgs",
-      itemId: capability.value.name,
+  const invoke = capability.match<
+    () => ResultType<string | undefined, ToolPluginInvocationError | ToolPluginCapabilityError>
+  >({
+    err: (error) => () => Result.err(error),
+    ok: (value) => () => {
+      if (value.formatArgs === undefined) return Result.ok(undefined);
+      return captureSyncHook(
+        {
+          pluginId: params.pluginId,
+          source: params.source,
+          hook: "level1.formatArgs",
+          itemId: value.name,
+        },
+        () => value.formatArgs!.call(params.spec, params.args),
+        (formatted) => decodeStringHookResult(params.pluginId, formatted),
+      );
     },
-    () => capability.value.formatArgs!.call(params.spec, params.args),
-    (value) => decodeStringHookResult(params.pluginId, value),
-  );
+  });
+  return invoke();
 }
 
 export function invokeLevel1SummarizeFailure(params: {
@@ -313,18 +344,28 @@ export function invokeLevel1SummarizeFailure(params: {
   ToolPluginInvocationError | ToolPluginCapabilityError
 > {
   const capability = resolveLevel1Capability(params);
-  if (capability.status === "error") return capability;
-  if (capability.value.summarizeFailure === undefined) return Result.ok(undefined);
-  return captureSyncHook(
-    {
-      pluginId: params.pluginId,
-      source: params.source,
-      hook: "level1.summarizeFailure",
-      itemId: capability.value.name,
+  const invoke = capability.match<
+    () => ResultType<
+      Level1ToolFailureSummary | undefined,
+      ToolPluginInvocationError | ToolPluginCapabilityError
+    >
+  >({
+    err: (error) => () => Result.err(error),
+    ok: (value) => () => {
+      if (value.summarizeFailure === undefined) return Result.ok(undefined);
+      return captureSyncHook(
+        {
+          pluginId: params.pluginId,
+          source: params.source,
+          hook: "level1.summarizeFailure",
+          itemId: value.name,
+        },
+        () => value.summarizeFailure!.call(params.spec, params.value),
+        (summary) => decodeLevel1ToolFailureSummary(params.pluginId, summary),
+      );
     },
-    () => capability.value.summarizeFailure!.call(params.spec, params.value),
-    (value) => decodeLevel1ToolFailureSummary(params.pluginId, value),
-  );
+  });
+  return invoke();
 }
 
 async function invokeLevel2VoidHook(params: {
@@ -335,17 +376,25 @@ async function invokeLevel2VoidHook(params: {
   hook: "level2.init" | "level2.destroy";
 }): Promise<ResultType<void, ToolPluginInvocationError | ToolPluginCapabilityError>> {
   const capability = resolveServerToolCapability(params);
-  if (capability.status === "error") return capability;
-  const method = params.hook === "level2.init" ? capability.value.init : capability.value.destroy;
+  const capabilityValue = capability.match<
+    ServerToolCapabilitySnapshot | ToolPluginCapabilityError
+  >({
+    ok: (value) => value,
+    err: (error) => error,
+  });
+  if (ToolPluginCapabilityError.is(capabilityValue)) return Result.err(capabilityValue);
+  const method = params.hook === "level2.init" ? capabilityValue.init : capabilityValue.destroy;
   const context = {
     pluginId: params.pluginId,
     source: params.source,
     hook: params.hook,
-    itemId: capability.value.id,
+    itemId: capabilityValue.id,
   } satisfies HookContext;
-  const invoked = await captureAsyncHook(context, () => method.call(params.tool));
-  if (invoked.status === "error") return invoked;
-  return decodeVoidHookResult(params.pluginId, invoked.value);
+  return captureAsyncHook(
+    context,
+    () => method.call(params.tool),
+    (value) => decodeVoidHookResult(params.pluginId, value),
+  );
 }
 
 export function invokeLevel2Init(params: {
@@ -375,18 +424,23 @@ export async function invokeLevel2List(params: {
   ResultType<ServerToolListResult, ToolPluginInvocationError | ToolPluginCapabilityError>
 > {
   const capability = resolveServerToolCapability(params);
-  if (capability.status === "error") return capability;
-  const invoked = await captureAsyncHook(
+  const capabilityValue = capability.match<
+    ServerToolCapabilitySnapshot | ToolPluginCapabilityError
+  >({
+    ok: (value) => value,
+    err: (error) => error,
+  });
+  if (ToolPluginCapabilityError.is(capabilityValue)) return Result.err(capabilityValue);
+  return captureAsyncHook(
     {
       pluginId: params.pluginId,
       source: params.source,
       hook: "level2.list",
-      itemId: capability.value.id,
+      itemId: capabilityValue.id,
     },
-    () => capability.value.list.call(params.tool),
+    () => capabilityValue.list.call(params.tool),
+    (value) => decodeServerToolListResult(params.pluginId, value),
   );
-  if (invoked.status === "error") return invoked;
-  return decodeServerToolListResult(params.pluginId, invoked.value);
 }
 
 export function invokeLevel2Call(params: {
@@ -399,14 +453,20 @@ export function invokeLevel2Call(params: {
   opts?: Parameters<ServerTool["call"]>[2];
 }): Promise<ResultType<unknown, ToolPluginInvocationError | ToolPluginCapabilityError>> {
   const capability = resolveServerToolCapability(params);
-  if (capability.status === "error") return Promise.resolve(capability);
-  return captureAsyncHook(
-    {
-      pluginId: params.pluginId,
-      source: params.source,
-      hook: "level2.call",
-      itemId: capability.value.id,
-    },
-    () => capability.value.call.call(params.tool, params.callableId, params.input, params.opts),
-  );
+  const invoke = capability.match<
+    () => Promise<ResultType<unknown, ToolPluginInvocationError | ToolPluginCapabilityError>>
+  >({
+    err: (error) => async () => Result.err(error),
+    ok: (value) => () =>
+      captureAsyncHook(
+        {
+          pluginId: params.pluginId,
+          source: params.source,
+          hook: "level2.call",
+          itemId: value.id,
+        },
+        () => value.call.call(params.tool, params.callableId, params.input, params.opts),
+      ),
+  });
+  return invoke();
 }

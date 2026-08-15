@@ -131,8 +131,14 @@ function lookupServerToolCallable<P extends string>(
 function adaptServerToolDispatchResultToHost<TValue>(
   result: ResultType<TValue, ServerToolCallableNotFound>,
 ): TValue {
-  if (result.status === "ok") return result.value;
-  throw new Error(result.error.message);
+  const resolved = result.match<
+    { readonly value: TValue } | { readonly error: ServerToolCallableNotFound }
+  >({
+    ok: (value) => ({ value }),
+    err: (error) => ({ error }),
+  });
+  if ("error" in resolved) throw new Error(resolved.error.message);
+  return resolved.value;
 }
 
 function createHelpEntry<P extends string>(

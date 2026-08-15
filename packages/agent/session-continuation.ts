@@ -236,6 +236,15 @@ function signalCanonicalJsonInvalid(error: CanonicalJsonInvalid): never {
   throw new TypeError(error.message);
 }
 
+function resultOutcome<T, E>(
+  result: ResultType<T, E>,
+): { ok: true; value: T } | { ok: false; error: E } {
+  return result.match<{ ok: true; value: T } | { ok: false; error: E }>({
+    ok: (value) => ({ ok: true, value }),
+    err: (error) => ({ ok: false, error }),
+  });
+}
+
 function parseStrictJsonValue(
   value: unknown,
   ancestors = new WeakSet<object>(),
@@ -257,47 +266,43 @@ function parseStrictJsonValue(
     );
   }
   ancestors.add(value);
-  if (Array.isArray(value)) {
-    const result: StrictJsonValue[] = [];
-    for (const item of value) {
-      const parsed = parseStrictJsonValue(item, ancestors);
-      if (parsed.status === "error") {
-        ancestors.delete(value);
-        return Result.err(parsed.error);
+  try {
+    if (Array.isArray(value)) {
+      const result: StrictJsonValue[] = [];
+      for (const item of value) {
+        const parsed = resultOutcome(parseStrictJsonValue(item, ancestors));
+        if (!parsed.ok) return Result.err(parsed.error);
+        result.push(parsed.value);
       }
-      result.push(parsed.value);
+      return Result.ok(result);
     }
-    ancestors.delete(value);
-    return Result.ok(result);
-  }
-  const prototype = Object.getPrototypeOf(value);
-  if (
-    (prototype !== Object.prototype && prototype !== null) ||
-    typeof value["toJSON"] === "function"
-  ) {
-    ancestors.delete(value);
-    return Result.err(
-      new CanonicalJsonInvalid({
-        message: "Canonical JSON objects must be plain data objects",
-      }),
-    );
-  }
-  const entries: Array<[string, StrictJsonValue]> = [];
-  for (const key of Object.keys(value)) {
-    const parsed = parseStrictJsonValue(value[key], ancestors);
-    if (parsed.status === "error") {
-      ancestors.delete(value);
-      return Result.err(parsed.error);
+    const prototype = Object.getPrototypeOf(value);
+    if (
+      (prototype !== Object.prototype && prototype !== null) ||
+      typeof value["toJSON"] === "function"
+    ) {
+      return Result.err(
+        new CanonicalJsonInvalid({
+          message: "Canonical JSON objects must be plain data objects",
+        }),
+      );
     }
-    entries.push([key, parsed.value]);
+    const entries: Array<[string, StrictJsonValue]> = [];
+    for (const key of Object.keys(value)) {
+      const parsed = resultOutcome(parseStrictJsonValue(value[key], ancestors));
+      if (!parsed.ok) return Result.err(parsed.error);
+      entries.push([key, parsed.value]);
+    }
+    return Result.ok(Object.fromEntries(entries));
+  } finally {
+    ancestors.delete(value);
   }
-  ancestors.delete(value);
-  return Result.ok(Object.fromEntries(entries));
 }
 
 function requireStrictJsonValue(value: OpaqueAgentValue): StrictJsonValue {
-  const parsed = parseStrictJsonValue(value);
-  return parsed.status === "ok" ? parsed.value : signalCanonicalJsonInvalid(parsed.error);
+  const parsed = resultOutcome(parseStrictJsonValue(value));
+  if (!parsed.ok) return signalCanonicalJsonInvalid(parsed.error);
+  return parsed.value;
 }
 
 function sortCanonicalJsonValue(value: StrictJsonValue): StrictJsonValue {

@@ -98,15 +98,27 @@ export function decodeToolInput<TSchema extends ZodType>(params: {
 export function adaptToolInputResultToServerToolHost<T>(
   result: ResultType<T, ToolInputValidationError>,
 ): T {
-  if (result.status === "ok") return result.value;
-  throw result.error;
+  const resolved = result.match<
+    { readonly value: T } | { readonly error: ToolInputValidationError }
+  >({
+    ok: (value) => ({ value }),
+    err: (error) => ({ error }),
+  });
+  if ("error" in resolved) throw resolved.error;
+  return resolved.value;
 }
 
 export function adaptToolInputResultToZodHost<T>(
   result: ResultType<T, ToolInputValidationError>,
 ): T {
-  if (result.status === "ok") return result.value;
-  throw result.error.cause;
+  const resolved = result.match<
+    { readonly value: T } | { readonly error: ToolInputValidationError }
+  >({
+    ok: (value) => ({ value }),
+    err: (error) => ({ error }),
+  });
+  if ("error" in resolved) throw resolved.error.cause;
+  return resolved.value;
 }
 
 export function parseToolInput<TSchema extends ZodType>(params: {

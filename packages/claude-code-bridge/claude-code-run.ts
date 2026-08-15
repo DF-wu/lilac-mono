@@ -134,6 +134,15 @@ export class ClaudeCodeRunOperationAndCleanupFailed extends TaggedError(
   readonly message: string;
 }> {}
 
+function resultOutcome<T, E>(
+  result: ResultType<T, E>,
+): { ok: true; value: T } | { ok: false; error: E } {
+  return result.match<{ ok: true; value: T } | { ok: false; error: E }>({
+    ok: (value) => ({ ok: true, value }),
+    err: (error) => ({ ok: false, error }),
+  });
+}
+
 export type ClaudeCodeRunMaterializationError =
   | ClaudeCodeRunInvalidConfiguration
   | ClaudeNativeSessionPreflightError
@@ -514,8 +523,8 @@ async function settleQueryAndProcess(input: {
   for (const outcome of [settled, exited]) {
     const panic = deferredCleanupPanic(outcome);
     if (panic) firstPanic ??= panic;
-    else if (outcome.status === "fulfilled" && outcome.value.status === "error") {
-      errors.push(outcome.value.error);
+    else if (outcome.status === "fulfilled") {
+      outcome.value.match({ ok: () => undefined, err: (error) => errors.push(error) });
     }
   }
   if (firstPanic) throw firstPanic;
@@ -552,10 +561,12 @@ async function readSessionInfo(
   sessionId: string,
   cwd: string,
 ): Promise<SessionReadResult> {
-  const read = await captureExternalOperation("Claude native session metadata read", () =>
-    reader(sessionId, { dir: cwd }),
+  const read = resultOutcome(
+    await captureExternalOperation("Claude native session metadata read", () =>
+      reader(sessionId, { dir: cwd }),
+    ),
   );
-  if (read.status === "error") {
+  if (!read.ok) {
     return {
       status: "failed",
       error: boundedExternalFailure(read.error, MAX_CALLBACK_ERROR_CHARS),
@@ -564,10 +575,13 @@ async function readSessionInfo(
   const raw = read.value;
   if (raw === undefined) return { status: "missing" };
 
-  const parsed = decodeClaudeSessionInfo(raw);
-  return parsed.status === "ok"
-    ? { status: "ok", metadata: parsed.value }
-    : { status: "invalid", error: boundedText(parsed.error.message, MAX_CALLBACK_ERROR_CHARS) };
+  return decodeClaudeSessionInfo(raw).match<SessionReadResult>({
+    ok: (metadata) => ({ status: "ok", metadata }),
+    err: (error) => ({
+      status: "invalid",
+      error: boundedText(error.message, MAX_CALLBACK_ERROR_CHARS),
+    }),
+  });
 }
 
 export function decodeClaudeSessionInfo(
@@ -627,8 +641,8 @@ export async function materializeClaudeCodeRunResult(options: {
     ClaudeCodeRunMaterializationError | ClaudeCodeRunOperationAndCleanupFailed
   >
 > {
-  const decodedStart = decodeClaudeNativeSessionStart(options.nativeSession);
-  if (decodedStart.status === "error") return decodedStart;
+  const decodedStart = resultOutcome(decodeClaudeNativeSessionStart(options.nativeSession));
+  if (!decodedStart.ok) return Result.err(decodedStart.error);
   const start = decodedStart.value;
   const readInfo: ClaudeNativeSessionInfoReader =
     options.getSessionInfo ?? ((sessionId, readOptions) => getSessionInfo(sessionId, readOptions));
@@ -674,16 +688,20 @@ export async function materializeClaudeCodeRunResult(options: {
 
   // Validated here as well as in the bridge, because this array also reaches
   // the Agent SDK's own built-in allowlist.
-  const validatedBuiltIns = validateClaudeCodeBuiltInToolsResult(options.builtInTools);
-  if (validatedBuiltIns.status === "error") return validatedBuiltIns;
+  const validatedBuiltIns = resultOutcome(
+    validateClaudeCodeBuiltInToolsResult(options.builtInTools),
+  );
+  if (!validatedBuiltIns.ok) return Result.err(validatedBuiltIns.error);
   const builtInTools = [...new Set([...validatedBuiltIns.value, "ToolSearch" as const])];
-  const createdBridge = await createClaudeCodeToolBridgeResult({
-    tools: options.tools,
-    catalogMetadata: options.catalogMetadata,
-    execute: options.execute,
-    builtInTools,
-  });
-  if (createdBridge.status === "error") return createdBridge;
+  const createdBridge = resultOutcome(
+    await createClaudeCodeToolBridgeResult({
+      tools: options.tools,
+      catalogMetadata: options.catalogMetadata,
+      execute: options.execute,
+      builtInTools,
+    }),
+  );
+  if (!createdBridge.ok) return Result.err(createdBridge.error);
   const bridge = createdBridge.value;
   const createModel =
     options.createModel ??
@@ -715,14 +733,16 @@ export async function materializeClaudeCodeRunResult(options: {
         const settled = await captureExternalOperation("Claude query settlement", () =>
           injectedController.settle(),
         );
-        return settled.status === "ok"
-          ? Result.ok()
-          : Result.err(
+        return settled.match<ResultType<void, ClaudeCodeRunCleanupFailed>>({
+          ok: () => Result.ok(),
+          err: (error) =>
+            Result.err(
               new ClaudeCodeRunCleanupFailed({
-                failures: [settled.error],
+                failures: [error],
                 message: "Claude query settlement failed",
               }),
-            );
+            ),
+        });
       },
     });
   }
@@ -796,8 +816,8 @@ export async function materializeClaudeCodeRunResult(options: {
 
     const sequence = ++contextCaptureSequence;
     const capture = (async () => {
-      const requestedUsage = await captureClaudeContextUsage(liveController);
-      if (requestedUsage.status === "error") {
+      const requestedUsage = resultOutcome(await captureClaudeContextUsage(liveController));
+      if (!requestedUsage.ok) {
         const message =
           requestedUsage.error._tag === "ClaudeCodeRunExternalFailure"
             ? boundedExternalFailure(requestedUsage.error, MAX_CALLBACK_ERROR_CHARS)
@@ -854,17 +874,19 @@ export async function materializeClaudeCodeRunResult(options: {
         const observed = await captureExternalOperation("Optional Claude SDK observer", () =>
           options.onSdkMessage?.(message),
         );
-        if (observed.status === "error") {
-          recordCallbackError(boundedExternalFailure(observed.error, MAX_CALLBACK_ERROR_CHARS));
-        }
+        observed.match({
+          ok: () => undefined,
+          err: (error) =>
+            recordCallbackError(boundedExternalFailure(error, MAX_CALLBACK_ERROR_CHARS)),
+        });
       })();
       pendingObservabilityCallbacks.add(pending);
     }
   };
 
   const stopHook = async (...args: unknown[]): Promise<unknown> => {
-    const parsed = decodeClaudeStopHookInput(args);
-    if (parsed.status === "error") {
+    const parsed = resultOutcome(decodeClaudeStopHookInput(args));
+    if (!parsed.ok) {
       recordCallbackError(parsed.error.message, true);
       return {};
     }
@@ -947,8 +969,11 @@ export async function materializeClaudeCodeRunResult(options: {
       for (const settlement of settlements) {
         const panic = deferredCleanupPanic(settlement);
         if (panic) throw panic;
-        if (settlement.status === "fulfilled" && settlement.value.status === "error") {
-          errors.push(...settlement.value.error.failures);
+        if (settlement.status === "fulfilled") {
+          settlement.value.match({
+            ok: () => undefined,
+            err: (error) => errors.push(...error.failures),
+          });
         }
       }
     }
@@ -969,7 +994,7 @@ export async function materializeClaudeCodeRunResult(options: {
     const interrupted = await captureExternalOperation("Claude query interruption", () =>
       controller?.interrupt(),
     );
-    return interrupted.status === "error" ? interrupted : Result.ok(true);
+    return interrupted.map(() => true);
   };
 
   const clearResult = (): ResultType<void, ClaudeCodeRunCleanupFailed> => {
@@ -978,7 +1003,7 @@ export async function materializeClaudeCodeRunResult(options: {
     const attempt = (operation: string, effect: () => void): void => {
       const captured = captureCleanupOperationSync(operation, effect);
       if (captured.status === "panic") firstPanic ??= captured.panic;
-      else if (captured.result.status === "error") errors.push(captured.result.error);
+      else captured.result.match({ ok: () => undefined, err: (error) => errors.push(error) });
     };
     for (const activeInjector of injectors) {
       attempt("Claude message injector close", () => activeInjector.close());
@@ -1007,12 +1032,12 @@ export async function materializeClaudeCodeRunResult(options: {
     interruptResult,
     async interrupt() {
       const interrupted = await interruptResult();
-      return interrupted.status === "ok" ? interrupted.value : false;
+      return interrupted.match({ ok: (value) => value, err: () => false });
     },
     clearResult,
     clear() {
-      const cleared = clearResult();
-      if (cleared.status === "error") throw cleanupFailureToAggregateError(cleared.error);
+      const cleared = resultOutcome(clearResult());
+      if (!cleared.ok) throw cleanupFailureToAggregateError(cleared.error);
     },
   };
 
@@ -1025,7 +1050,7 @@ export async function materializeClaudeCodeRunResult(options: {
       const errors: ClaudeCodeRunExternalFailure[] = [];
       let firstPanic: Panic | undefined;
       const collectCleanup = (result: ResultType<void, ClaudeCodeRunCleanupFailed>): void => {
-        if (result.status === "error") errors.push(...result.error.failures);
+        result.match({ ok: () => undefined, err: (error) => errors.push(...error.failures) });
       };
       const attemptCleanup = async (effect: () => void | Promise<void>): Promise<void> => {
         const [settled] = await Promise.allSettled([Promise.resolve().then(effect)]);
@@ -1039,8 +1064,8 @@ export async function materializeClaudeCodeRunResult(options: {
         for (const exitProof of exitProofs) {
           const panic = deferredCleanupPanic(exitProof);
           if (panic) firstPanic ??= panic;
-          else if (exitProof.status === "fulfilled" && exitProof.value.status === "error") {
-            errors.push(exitProof.value.error);
+          else if (exitProof.status === "fulfilled") {
+            exitProof.value.match({ ok: () => undefined, err: (error) => errors.push(error) });
           }
         }
       };
@@ -1049,7 +1074,7 @@ export async function materializeClaudeCodeRunResult(options: {
           "Claude observability settlement",
           waitForObservability,
         );
-        if (observability.status === "error") errors.push(observability.error);
+        observability.match({ ok: () => undefined, err: (error) => errors.push(error) });
       });
       await attemptCleanup(() => collectCleanup(clearResult()));
       await attemptCleanup(async () => collectCleanup(await drainQueryControllers()));
@@ -1057,15 +1082,17 @@ export async function materializeClaudeCodeRunResult(options: {
       await attemptCleanup(async () => collectCleanup(await drainQueryControllers()));
       await attemptCleanup(async () => {
         const bridgeClosed = await bridge.closeResult();
-        if (bridgeClosed.status === "error") {
-          errors.push(
-            new ClaudeCodeRunExternalFailure({
-              operation: "Claude MCP bridge cleanup",
-              cause: bridgeClosed.error,
-              message: bridgeClosed.error.message,
-            }),
-          );
-        }
+        bridgeClosed.match({
+          ok: () => undefined,
+          err: (error) =>
+            errors.push(
+              new ClaudeCodeRunExternalFailure({
+                operation: "Claude MCP bridge cleanup",
+                cause: error,
+                message: error.message,
+              }),
+            ),
+        });
       });
       await attemptCleanup(async () => collectCleanup(await drainQueryControllers()));
       if (unclaimedProcesses.length > 0) {
@@ -1096,8 +1123,8 @@ export async function materializeClaudeCodeRunResult(options: {
   const dispose = (): Promise<void> => {
     if (disposalPromise) return disposalPromise;
     disposalPromise = (async () => {
-      const disposedRun = await disposeResult();
-      if (disposedRun.status === "error") throw cleanupFailureToAggregateError(disposedRun.error);
+      const disposedRun = resultOutcome(await disposeResult());
+      if (!disposedRun.ok) throw cleanupFailureToAggregateError(disposedRun.error);
     })();
     return disposalPromise;
   };
@@ -1183,8 +1210,8 @@ export async function materializeClaudeCodeRunResult(options: {
       const disposalPanic = deferredCleanupPanic(disposed);
       if (observabilityPanic) throw observabilityPanic;
       if (disposed.status === "rejected") throw disposalPanic;
-      const disposedRun = disposed.value;
-      if (disposedRun.status === "error") return disposedRun;
+      const disposedRun = resultOutcome(disposed.value);
+      if (!disposedRun.ok) return Result.err(disposedRun.error);
 
       const reads = await Promise.all([
         readSessionInfo(readInfo, start.sessionId, options.cwd),
@@ -1254,8 +1281,8 @@ export async function materializeClaudeCodeRunResult(options: {
   };
 
   const finalizeToHost = async (): Promise<ClaudeNativeSessionFinalization> => {
-    const finalized = await finalizeResult();
-    if (finalized.status === "error") {
+    const finalized = resultOutcome(await finalizeResult());
+    if (!finalized.ok) {
       if (finalized.error._tag === "ClaudeCodeRunCleanupFailed") {
         throw cleanupFailureToAggregateError(finalized.error);
       }
@@ -1288,9 +1315,11 @@ export async function materializeClaudeCodeRunResult(options: {
           const closed = captureExternalOperationSync("Late Claude message injector close", () =>
             nextInjector.close(),
           );
-          if (closed.status === "error") {
-            recordCallbackError(boundedExternalFailure(closed.error, MAX_CALLBACK_ERROR_CHARS));
-          }
+          closed.match({
+            ok: () => undefined,
+            err: (error) =>
+              recordCallbackError(boundedExternalFailure(error, MAX_CALLBACK_ERROR_CHARS)),
+          });
           return;
         }
         injectors.add(nextInjector);
@@ -1343,8 +1372,8 @@ export async function materializeClaudeCodeRunResult(options: {
         }),
       );
     const createUtilityModel = () => {
-      const created = createUtilityModelResult();
-      if (created.status === "error") throw created.error;
+      const created = resultOutcome(createUtilityModelResult());
+      if (!created.ok) throw created.error;
       return created.value;
     };
     return Result.ok({
@@ -1371,24 +1400,31 @@ export async function materializeClaudeCodeRunResult(options: {
     let cleanupPanic: Panic | undefined;
     const controlsCleared = captureCleanupOperationSync("Claude run control cleanup", clearResult);
     if (controlsCleared.status === "panic") cleanupPanic = controlsCleared.panic;
-    else if (controlsCleared.result.status === "error") {
-      cleanupFailures.push(controlsCleared.result.error);
-    } else if (controlsCleared.result.value.status === "error") {
-      cleanupFailures.push(...controlsCleared.result.value.error.failures);
+    else {
+      const controlsOutcome = resultOutcome(controlsCleared.result);
+      if (!controlsOutcome.ok) cleanupFailures.push(controlsOutcome.error);
+      else {
+        controlsOutcome.value.match({
+          ok: () => undefined,
+          err: (error) => cleanupFailures.push(...error.failures),
+        });
+      }
     }
     const [bridgeCleanup] = await Promise.allSettled([bridge.closeResult()]);
     const bridgePanic = deferredCleanupPanic(bridgeCleanup);
     if (bridgeCleanup.status === "fulfilled") {
       const bridgeClosed = bridgeCleanup.value;
-      if (bridgeClosed.status === "error") {
-        cleanupFailures.push(
-          new ClaudeCodeRunExternalFailure({
-            operation: "Claude MCP bridge cleanup",
-            cause: bridgeClosed.error,
-            message: bridgeClosed.error.message,
-          }),
-        );
-      }
+      bridgeClosed.match({
+        ok: () => undefined,
+        err: (error) =>
+          cleanupFailures.push(
+            new ClaudeCodeRunExternalFailure({
+              operation: "Claude MCP bridge cleanup",
+              cause: error,
+              message: error.message,
+            }),
+          ),
+      });
     }
     if (bridgePanic) cleanupPanic ??= bridgePanic;
     if (operationPanic) throw operationPanic;
@@ -1416,7 +1452,7 @@ export async function materializeClaudeCodeRunResult(options: {
 export async function materializeClaudeCodeRun(
   options: Parameters<typeof materializeClaudeCodeRunResult>[0],
 ): Promise<MaterializedClaudeCodeRun> {
-  const materialized = await materializeClaudeCodeRunResult(options);
-  if (materialized.status === "error") throw materialized.error;
+  const materialized = resultOutcome(await materializeClaudeCodeRunResult(options));
+  if (!materialized.ok) throw materialized.error;
   return materialized.value;
 }

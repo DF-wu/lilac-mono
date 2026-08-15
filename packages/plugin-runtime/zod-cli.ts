@@ -12,8 +12,14 @@ class ZodCliProjectionInvalid extends TaggedError("ZodCliProjectionInvalid")<{
 function adaptZodCliResultToToolHost<TValue>(
   result: ResultType<TValue, ZodCliProjectionInvalid>,
 ): TValue {
-  if (result.status === "ok") return result.value;
-  throw new Error(result.error.message);
+  const resolved = result.match<
+    { readonly value: TValue } | { readonly error: ZodCliProjectionInvalid }
+  >({
+    ok: (value) => ({ value }),
+    err: (error) => ({ error }),
+  });
+  if ("error" in resolved) throw new Error(resolved.error.message);
+  return resolved.value;
 }
 
 function signalZodCliFailureToToolHost(message: string): never {
