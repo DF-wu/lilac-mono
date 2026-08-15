@@ -197,7 +197,8 @@ export const requiredFixtureCases = {
 } as const;
 
 export function consumeFixturePersistence(raw: string | null) {
-  return decodeFixtureStringArray(raw);
+  const decode = decodeFixtureStringArray;
+  return decode(raw);
 }
 
 export function consumeFixturePersistenceInline(raw: string) {

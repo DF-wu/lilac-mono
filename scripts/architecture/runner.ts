@@ -1,10 +1,6 @@
 import path from "node:path";
 
-import {
-  analyzeWorkspace,
-  type ActivePersistenceInfrastructure,
-  type WorkspacePackageRoot,
-} from "./analyzer.ts";
+import { analyzeWorkspace } from "./analyzer.ts";
 import type { ArchitectureManifest, WorkspaceArchitecture } from "./manifest.ts";
 import { architectureManifest, assertArchitectureManifestIntegrity } from "./manifest.ts";
 import type { ArchitectureDiagnostic } from "./model.ts";
@@ -14,6 +10,11 @@ import {
   ARCHITECTURE_FINDINGS_EXIT_CODE,
   ARCHITECTURE_WORKSPACE_FIXTURE_ENV,
 } from "./workspace-runner-protocol.ts";
+import {
+  type WorkspaceAnalysisCacheInputs,
+  WorkspaceAnalysisCache,
+  workspaceAnalysisCacheKey,
+} from "./workspace-analysis-cache.ts";
 
 export { ARCHITECTURE_FINDINGS_EXIT_CODE } from "./workspace-runner-protocol.ts";
 
@@ -22,12 +23,7 @@ export type ProgramFactory = (
   workspace: ArchitectureManifest["workspaces"][number],
 ) => WorkspaceProgram;
 
-export interface ArchitectureAnalysisContext {
-  readonly packageRoots: readonly WorkspacePackageRoot[];
-  readonly activeEventDeliveryApiPackages: ReadonlySet<string>;
-  readonly activePersistenceInfrastructure: ActivePersistenceInfrastructure;
-  readonly approvedExceptionAdapters: ArchitectureManifest["approvedExceptionAdapters"];
-}
+export type ArchitectureAnalysisContext = WorkspaceAnalysisCacheInputs;
 
 export interface WorkspaceProcessResult {
   readonly exitCode: number;
@@ -92,9 +88,15 @@ export function analyzeArchitectureWorkspace(
   workspace: WorkspaceArchitecture,
   context: ArchitectureAnalysisContext,
   programFactory: ProgramFactory = createWorkspaceProgram,
+  cache?: WorkspaceAnalysisCache,
 ): readonly ArchitectureDiagnostic[] {
   const workspaceProgram = programFactory(repositoryRoot, workspace);
-  return analyzeWorkspace(
+  const cacheKey = cache
+    ? workspaceAnalysisCacheKey(repositoryRoot, workspace, workspaceProgram.program, context)
+    : undefined;
+  const cached = cacheKey && cache?.read(cacheKey);
+  if (cached) return cached;
+  const diagnostics = analyzeWorkspace(
     workspace,
     workspaceProgram.root,
     workspaceProgram.program,
@@ -103,6 +105,8 @@ export function analyzeArchitectureWorkspace(
     context.activePersistenceInfrastructure,
     context.approvedExceptionAdapters,
   );
+  if (cacheKey) cache?.write(cacheKey, diagnostics);
+  return diagnostics;
 }
 
 export function analyzeArchitecture(

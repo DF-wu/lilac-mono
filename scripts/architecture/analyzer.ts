@@ -68,6 +68,45 @@ const declarationPackageCache = new WeakMap<
   Map<string, string | null>
 >();
 
+interface SourceAnalysisIndex {
+  readonly aliases: readonly (readonly [source: string, target: string])[];
+  readonly calls: readonly ts.CallExpression[];
+  readonly errorCallbackReferences: readonly ts.Identifier[];
+}
+
+interface ProgramProductionSourceIndex {
+  readonly files: readonly ts.SourceFile[];
+  readonly modules: ReadonlyMap<string, ts.SourceFile>;
+}
+
+const SOURCE_ANALYSIS_INDEXES = new WeakMap<ts.SourceFile, SourceAnalysisIndex>();
+const PROGRAM_PRODUCTION_SOURCE_INDEXES = new WeakMap<
+  ts.Program,
+  Map<string, ProgramProductionSourceIndex>
+>();
+const NODE_IDENTITIES = new WeakMap<ts.Node, Map<string, NodeIdentity>>();
+const RESOLVED_SIGNATURES = new WeakMap<
+  ts.TypeChecker,
+  WeakMap<ts.CallLikeExpression, ts.Signature | null>
+>();
+const NODE_STARTS = new WeakMap<ts.Node, number>();
+const SYMBOL_ASSIGNMENT_INDEXES = new WeakMap<
+  ts.TypeChecker,
+  WeakMap<ts.SourceFile, ReadonlyMap<ts.Symbol, readonly SymbolSource[]>>
+>();
+const ERROR_CALLBACK_SYMBOLS = new WeakMap<
+  ts.TypeChecker,
+  WeakMap<ts.SourceFile, ReadonlySet<ts.Symbol>>
+>();
+const TYPE_FLAG_FACTS = new WeakMap<
+  ts.TypeChecker,
+  WeakMap<ts.Node, WeakMap<ts.Type, Map<ts.TypeFlags, boolean>>>
+>();
+const PACKAGE_TYPE_FACTS = new WeakMap<
+  ts.TypeChecker,
+  WeakMap<readonly WorkspacePackageRoot[], WeakMap<ts.Node, WeakMap<ts.Type, Map<string, boolean>>>>
+>();
+
 function normalizedPath(value: string): string {
   return value.split(path.sep).join("/");
 }
@@ -82,6 +121,32 @@ function canonicalPath(value: string): string {
 
 function isProductionSource(sourceFile: ts.SourceFile, workspaceRoot: string): boolean {
   return !sourceFile.isDeclarationFile && isProductionFileName(sourceFile.fileName, workspaceRoot);
+}
+
+function productionSourceIndex(
+  program: ts.Program,
+  workspaceRoot: string,
+): ProgramProductionSourceIndex {
+  const root = canonicalPath(workspaceRoot);
+  let programIndexes = PROGRAM_PRODUCTION_SOURCE_INDEXES.get(program);
+  if (!programIndexes) {
+    programIndexes = new Map();
+    PROGRAM_PRODUCTION_SOURCE_INDEXES.set(program, programIndexes);
+  }
+  const cached = programIndexes.get(root);
+  if (cached) return cached;
+
+  const files = program
+    .getSourceFiles()
+    .filter((sourceFile) => isProductionSource(sourceFile, workspaceRoot));
+  const index = {
+    files,
+    modules: new Map(
+      files.map((sourceFile) => [relativeModulePath(workspaceRoot, sourceFile), sourceFile]),
+    ),
+  };
+  programIndexes.set(root, index);
+  return index;
 }
 
 function matchesPattern(file: string, pattern: string): boolean {
@@ -121,6 +186,75 @@ function expressionName(expression: ts.Expression): string | undefined {
   return undefined;
 }
 
+function sourceAnalysisIndex(sourceFile: ts.SourceFile): SourceAnalysisIndex {
+  const cached = SOURCE_ANALYSIS_INDEXES.get(sourceFile);
+  if (cached) return cached;
+
+  const aliases: Array<readonly [source: string, target: string]> = [];
+  const calls: ts.CallExpression[] = [];
+  const errorCallbackReferences: ts.Identifier[] = [];
+  const addAlias = (source: string | undefined, target: ts.BindingName | ts.PropertyName): void => {
+    if (!source || !ts.isIdentifier(target)) return;
+    aliases.push([source, target.text]);
+  };
+  const visit = (node: ts.Node): void => {
+    if (ts.isCallExpression(node)) calls.push(node);
+    if (
+      ts.isIdentifier(node) &&
+      (ts.isPropertyAssignment(node.parent) || ts.isCallExpression(node.parent))
+    ) {
+      errorCallbackReferences.push(node);
+    }
+    if (ts.isImportSpecifier(node)) {
+      aliases.push([node.propertyName?.text ?? node.name.text, node.name.text]);
+    } else if (ts.isVariableDeclaration(node) && node.initializer) {
+      addAlias(expressionName(node.initializer), node.name);
+    } else if (ts.isBindingElement(node)) {
+      const source = node.propertyName;
+      if (source && (ts.isIdentifier(source) || ts.isStringLiteral(source))) {
+        addAlias(source.text, node.name);
+      }
+    } else if (ts.isPropertyAssignment(node)) {
+      addAlias(expressionName(node.initializer), node.name);
+    } else if (
+      ts.isBinaryExpression(node) &&
+      node.operatorToken.kind === ts.SyntaxKind.EqualsToken &&
+      ts.isIdentifier(node.left)
+    ) {
+      addAlias(expressionName(node.right), node.left);
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(sourceFile);
+  const index = { aliases, calls, errorCallbackReferences };
+  SOURCE_ANALYSIS_INDEXES.set(sourceFile, index);
+  return index;
+}
+
+function resolvedSignature(
+  checker: ts.TypeChecker,
+  node: ts.CallLikeExpression,
+): ts.Signature | undefined {
+  let checkerCache = RESOLVED_SIGNATURES.get(checker);
+  if (!checkerCache) {
+    checkerCache = new WeakMap();
+    RESOLVED_SIGNATURES.set(checker, checkerCache);
+  }
+  const cached = checkerCache.get(node);
+  if (cached !== undefined) return cached ?? undefined;
+  const signature = checker.getResolvedSignature(node);
+  checkerCache.set(node, signature ?? null);
+  return signature;
+}
+
+function nodeStart(node: ts.Node): number {
+  const cached = NODE_STARTS.get(node);
+  if (cached !== undefined) return cached;
+  const start = node.getStart(node.getSourceFile());
+  NODE_STARTS.set(node, start);
+  return start;
+}
+
 function callCandidateNames(
   sourceFile: ts.SourceFile,
   workspace: WorkspaceArchitecture,
@@ -150,38 +284,18 @@ function callCandidateNames(
     names.add("transaction");
   }
 
-  const aliases: Array<readonly [source: string, target: string]> = [];
-  const addAlias = (source: string | undefined, target: ts.BindingName | ts.PropertyName): void => {
-    if (!source || !ts.isIdentifier(target)) return;
-    aliases.push([source, target.text]);
-  };
-  const visit = (node: ts.Node): void => {
-    if (ts.isImportSpecifier(node)) {
-      aliases.push([node.propertyName?.text ?? node.name.text, node.name.text]);
-    } else if (ts.isVariableDeclaration(node) && node.initializer) {
-      addAlias(expressionName(node.initializer), node.name);
-    } else if (ts.isBindingElement(node)) {
-      const source = node.propertyName;
-      if (source && (ts.isIdentifier(source) || ts.isStringLiteral(source))) {
-        addAlias(source.text, node.name);
-      }
-    } else if (ts.isPropertyAssignment(node)) {
-      addAlias(expressionName(node.initializer), node.name);
-    } else if (
-      ts.isBinaryExpression(node) &&
-      node.operatorToken.kind === ts.SyntaxKind.EqualsToken &&
-      ts.isIdentifier(node.left)
-    ) {
-      addAlias(expressionName(node.right), node.left);
-    }
-    ts.forEachChild(node, visit);
-  };
-  visit(sourceFile);
+  return aliasExpandedNames(sourceFile, names);
+}
 
+function aliasExpandedNames(
+  sourceFile: ts.SourceFile,
+  initialNames: ReadonlySet<string>,
+): ReadonlySet<string> {
+  const names = new Set(initialNames);
   let changed = true;
   while (changed) {
     changed = false;
-    for (const [source, target] of aliases) {
+    for (const [source, target] of sourceAnalysisIndex(sourceFile).aliases) {
       if (!names.has(source) || names.has(target)) continue;
       names.add(target);
       changed = true;
@@ -362,6 +476,11 @@ function callablePart(node: ts.Node): string | undefined {
 }
 
 function nodeIdentity(node: ts.Node, workspaceRoot: string): NodeIdentity {
+  const root = canonicalPath(workspaceRoot);
+  let identities = NODE_IDENTITIES.get(node);
+  const cached = identities?.get(root);
+  if (cached) return cached;
+
   const parts: string[] = [];
   for (
     let current: ts.Node | undefined = node;
@@ -400,12 +519,18 @@ function nodeIdentity(node: ts.Node, workspaceRoot: string): NodeIdentity {
   const declaredContractName =
     ts.isInterfaceDeclaration(node) || ts.isTypeAliasDeclaration(node) ? node.name.text : undefined;
   const symbolPath = parts.join(".") || signatureContractPath || declaredContractName || "<module>";
-  return {
+  const identity = {
     module: relativeModulePath(workspaceRoot, node.getSourceFile()),
     exportName:
       parts[0] ?? signatureContractPath?.split(".")[0] ?? declaredContractName ?? "<module>",
     symbolPath,
   };
+  if (!identities) {
+    identities = new Map();
+    NODE_IDENTITIES.set(node, identities);
+  }
+  identities.set(root, identity);
+  return identity;
 }
 
 function identityOwns(owner: SymbolIdentity, candidate: NodeIdentity): boolean {
@@ -479,12 +604,34 @@ function typeContainsFlags(
   forbiddenFlags: ts.TypeFlags,
   checker: ts.TypeChecker,
   location: ts.Node,
-  state: UnknownTraversalState = {
-    inspectMethodProperties: true,
-    seen: new Set(),
-    remainingProperties: MAX_VISITED_PROPERTIES,
-  },
+  state?: UnknownTraversalState,
 ): boolean {
+  if (!state) {
+    let checkerCache = TYPE_FLAG_FACTS.get(checker);
+    if (!checkerCache) {
+      checkerCache = new WeakMap();
+      TYPE_FLAG_FACTS.set(checker, checkerCache);
+    }
+    let locationCache = checkerCache.get(location);
+    if (!locationCache) {
+      locationCache = new WeakMap();
+      checkerCache.set(location, locationCache);
+    }
+    let typeCache = locationCache.get(type);
+    if (!typeCache) {
+      typeCache = new Map();
+      locationCache.set(type, typeCache);
+    }
+    const cached = typeCache.get(forbiddenFlags);
+    if (cached !== undefined) return cached;
+    const result = typeContainsFlags(type, forbiddenFlags, checker, location, {
+      inspectMethodProperties: true,
+      seen: new Set(),
+      remainingProperties: MAX_VISITED_PROPERTIES,
+    });
+    typeCache.set(forbiddenFlags, result);
+    return result;
+  }
   if ((type.flags & forbiddenFlags) !== 0) return true;
   if (isClosedPlatformType(type)) return false;
   if (state.seen.has(type)) return false;
@@ -633,9 +780,46 @@ function typeContainsPackageType(
   packageName: string,
   symbolNames: ReadonlySet<string>,
   location: ts.Node,
-  state: TypeTraversalState = { seen: new Set(), remainingProperties: MAX_VISITED_PROPERTIES },
+  state?: TypeTraversalState,
   depth = 0,
 ): boolean {
+  if (!state) {
+    let checkerCache = PACKAGE_TYPE_FACTS.get(checker);
+    if (!checkerCache) {
+      checkerCache = new WeakMap();
+      PACKAGE_TYPE_FACTS.set(checker, checkerCache);
+    }
+    let rootsCache = checkerCache.get(packageRoots);
+    if (!rootsCache) {
+      rootsCache = new WeakMap();
+      checkerCache.set(packageRoots, rootsCache);
+    }
+    let locationCache = rootsCache.get(location);
+    if (!locationCache) {
+      locationCache = new WeakMap();
+      rootsCache.set(location, locationCache);
+    }
+    let typeCache = locationCache.get(type);
+    if (!typeCache) {
+      typeCache = new Map();
+      locationCache.set(type, typeCache);
+    }
+    const key = `${packageName}\0${[...symbolNames].sort().join("\0")}`;
+    const cached = typeCache.get(key);
+    if (cached !== undefined) return cached;
+    const result = typeContainsPackageType(
+      type,
+      checker,
+      packageRoots,
+      packageName,
+      symbolNames,
+      location,
+      { seen: new Set(), remainingProperties: MAX_VISITED_PROPERTIES },
+      depth,
+    );
+    typeCache.set(key, result);
+    return result;
+  }
   if (depth > MAX_TYPE_DEPTH || state.seen.has(type)) return false;
   state.seen.add(type);
 
@@ -976,7 +1160,7 @@ function analyzeSqliteTransactionCallback(
     const visit = (child: ts.Node): void => {
       if (resultErrCall || (child !== callback && ts.isFunctionLike(child))) return;
       if (ts.isCallExpression(child)) {
-        const childSignature = checker.getResolvedSignature(child);
+        const childSignature = resolvedSignature(checker, child);
         if (
           packageForSignature(childSignature, packageRoots) === "better-result" &&
           declarationName(childSignature?.declaration) === "err"
@@ -1033,7 +1217,7 @@ function isRegisteredFormatterCall(
   workspaceRoot: string,
   packageRoots: readonly WorkspacePackageRoot[],
 ): boolean {
-  const signature = checker.getResolvedSignature(node);
+  const signature = resolvedSignature(checker, node);
   return workspace.taggedErrorFormatters.some((formatter) =>
     outputIdentityMatches(formatter, signature, workspaceRoot, packageRoots),
   );
@@ -1123,35 +1307,73 @@ function bindingElementSource(
   }
 }
 
+interface SymbolSource {
+  readonly position: number;
+  readonly expression: ts.Expression;
+}
+
+function symbolAssignmentIndex(
+  sourceFile: ts.SourceFile,
+  checker: ts.TypeChecker,
+): ReadonlyMap<ts.Symbol, readonly SymbolSource[]> {
+  let checkerCache = SYMBOL_ASSIGNMENT_INDEXES.get(checker);
+  if (!checkerCache) {
+    checkerCache = new WeakMap();
+    SYMBOL_ASSIGNMENT_INDEXES.set(checker, checkerCache);
+  }
+  const cached = checkerCache.get(sourceFile);
+  if (cached) return cached;
+
+  const assignments = new Map<ts.Symbol, SymbolSource[]>();
+  const visit = (node: ts.Node): void => {
+    if (
+      ts.isBinaryExpression(node) &&
+      node.operatorToken.kind === ts.SyntaxKind.EqualsToken &&
+      ts.isIdentifier(node.left)
+    ) {
+      const symbol = checker.getSymbolAtLocation(node.left);
+      if (symbol) {
+        const sources = assignments.get(symbol) ?? [];
+        sources.push({ position: nodeStart(node), expression: node.right });
+        assignments.set(symbol, sources);
+      }
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(sourceFile);
+  for (const sources of assignments.values()) {
+    sources.sort((left, right) => left.position - right.position);
+  }
+  checkerCache.set(sourceFile, assignments);
+  return assignments;
+}
+
 function latestSymbolSource(
   symbol: ts.Symbol,
   use: ts.Identifier,
   checker: ts.TypeChecker,
 ): ts.Expression | undefined {
-  let latest: { readonly position: number; readonly expression: ts.Expression } | undefined;
+  const usePosition = nodeStart(use);
+  let latest: SymbolSource | undefined;
   for (const declaration of symbol.declarations ?? []) {
     let expression: ts.Expression | undefined;
     if (ts.isVariableDeclaration(declaration)) expression = declaration.initializer;
     if (ts.isBindingElement(declaration)) expression = bindingElementSource(declaration, checker);
-    if (expression && declaration.getStart() < use.getStart()) {
-      latest = { position: declaration.getStart(), expression };
+    const position = nodeStart(declaration);
+    if (expression && position < usePosition) {
+      latest = { position, expression };
     }
   }
-  const sourceFile = use.getSourceFile();
-  const visit = (node: ts.Node): void => {
-    if (node.getStart(sourceFile) >= use.getStart()) return;
-    if (
-      ts.isBinaryExpression(node) &&
-      node.operatorToken.kind === ts.SyntaxKind.EqualsToken &&
-      ts.isIdentifier(node.left) &&
-      checker.getSymbolAtLocation(node.left) === symbol &&
-      (!latest || node.getStart(sourceFile) > latest.position)
-    ) {
-      latest = { position: node.getStart(sourceFile), expression: node.right };
-    }
-    ts.forEachChild(node, visit);
-  };
-  visit(sourceFile);
+  const assignments = symbolAssignmentIndex(use.getSourceFile(), checker).get(symbol) ?? [];
+  let left = 0;
+  let right = assignments.length;
+  while (left < right) {
+    const middle = Math.floor((left + right) / 2);
+    if (assignments[middle]!.position < usePosition) left = middle + 1;
+    else right = middle;
+  }
+  const assignment = assignments[left - 1];
+  if (assignment && (!latest || assignment.position > latest.position)) latest = assignment;
   return latest?.expression;
 }
 
@@ -1343,7 +1565,7 @@ function isRegisteredSqliteRollbackStatusRead(
 ): boolean {
   const callbackCall = enclosingInlineCallbackCall(node);
   if (!callbackCall) return false;
-  const signature = checker.getResolvedSignature(callbackCall.call);
+  const signature = resolvedSignature(checker, callbackCall.call);
   if (
     packageForSignature(signature, packageRoots) !== "bun:sqlite" ||
     declarationName(signature?.declaration) !== "transaction"
@@ -1821,7 +2043,7 @@ function analyzeCall(
   packageRoots: readonly WorkspacePackageRoot[],
   diagnostics: ArchitectureDiagnostic[],
 ): void {
-  const signature = checker.getResolvedSignature(node);
+  const signature = resolvedSignature(checker, node);
   const sourcePackage = packageForSignature(signature, packageRoots);
   const member = declarationName(signature?.declaration);
   const manualResultBranchMember = activeRules.has("architecture/no-manual-result-branching")
@@ -2992,7 +3214,7 @@ function expressionInfersLiteralUnion(
     );
   }
   if (ts.isCallExpression(unwrapped)) {
-    const declaration = checker.getResolvedSignature(unwrapped)?.declaration;
+    const declaration = resolvedSignature(checker, unwrapped)?.declaration;
     return Boolean(
       declaration &&
       isProjectDeclaration(declaration, packageRoots) &&
@@ -3093,7 +3315,7 @@ function expressionInfersObjectDiscriminant(
     );
   }
   if (ts.isCallExpression(unwrapped)) {
-    const declaration = checker.getResolvedSignature(unwrapped)?.declaration;
+    const declaration = resolvedSignature(checker, unwrapped)?.declaration;
     if (!declaration || !isProjectDeclaration(declaration, packageRoots)) return false;
     const returned = functionReturnExpressions(declaration);
     return (
@@ -3244,7 +3466,7 @@ function defaultContainsNeverSink(
   const visit = (node: ts.Node): void => {
     if (found) return;
     if (ts.isCallExpression(node)) {
-      const signature = checker.getResolvedSignature(node);
+      const signature = resolvedSignature(checker, node);
       for (const [index, argument] of node.arguments.entries()) {
         const parameter = signature?.parameters[Math.min(index, signature.parameters.length - 1)];
         if (!parameter) continue;
@@ -4054,10 +4276,7 @@ function registeredDeclarationIndex(
   if (cached) return cached;
 
   const modules = new Map<string, Map<string, ts.Node[]>>();
-  for (const sourceFile of program.getSourceFiles()) {
-    if (sourceFile.isDeclarationFile || !isProductionFileName(sourceFile.fileName, identityRoot)) {
-      continue;
-    }
+  for (const sourceFile of productionSourceIndex(program, identityRoot).files) {
     const module = relativeModulePath(identityRoot, sourceFile);
     const identities = new Map<string, ts.Node[]>();
     const visit = (node: ts.Node): void => {
@@ -4606,14 +4825,7 @@ function analyzeUnknownFreeModule(
   program: ts.Program,
   diagnostics: ArchitectureDiagnostic[],
 ): void {
-  const sourceFile = program
-    .getSourceFiles()
-    .find(
-      (candidate) =>
-        !candidate.isDeclarationFile &&
-        isProductionFileName(candidate.fileName, workspaceRoot) &&
-        relativeModulePath(workspaceRoot, candidate) === registration.module,
-    );
+  const sourceFile = productionSourceIndex(program, workspaceRoot).modules.get(registration.module);
   if (!sourceFile) {
     throw new Error(
       `Unknown-free module ${workspace.name}/${registration.module} must resolve to exactly one source module; found 0.`,
@@ -4819,7 +5031,7 @@ function resolvedCallMatchesIdentity(
   workspaceRoot: string,
   packageRoots: readonly WorkspacePackageRoot[],
 ): boolean {
-  const declaration = checker.getResolvedSignature(call)?.declaration;
+  const declaration = resolvedSignature(checker, call)?.declaration;
   if (!declaration) return false;
   const identityRoot =
     identity.package === undefined
@@ -4895,6 +5107,13 @@ function assertPersistenceInfrastructureCallsResolve(
     value: adapter,
     identityRoot: packageRootByName.get(adapter.packageName),
   }));
+  const persistenceTargets = [...codecTargets, ...transactionTargets];
+  const persistenceTargetNames = new Set(
+    persistenceTargets.map(({ value }) => {
+      const parts = value.identity.exportName.split(".");
+      return parts[parts.length - 1] ?? value.identity.exportName;
+    }),
+  );
   const codecModules = new Set([
     ...registeredConsumers.map(({ identity }) => identity.module),
     ...workspace.boundaryDecoders.map(({ identity }) => identity.module),
@@ -4905,9 +5124,9 @@ function assertPersistenceInfrastructureCallsResolve(
     ({ packageName }) => packageName === workspace.packageName,
   );
 
-  for (const sourceFile of program.getSourceFiles()) {
-    if (!isProductionSource(sourceFile, workspaceRoot)) continue;
+  for (const sourceFile of productionSourceIndex(program, workspaceRoot).files) {
     const module = relativeModulePath(workspaceRoot, sourceFile);
+    const persistenceCallNames = aliasExpandedNames(sourceFile, persistenceTargetNames);
     const scanCodecCalls =
       codecTargets.length > 0 &&
       (active.scanAllProductionModules === true || codecModules.has(module));
@@ -4931,12 +5150,13 @@ function assertPersistenceInfrastructureCallsResolve(
       }
     }
 
-    const visit = (node: ts.Node): void => {
-      if (ts.isCallExpression(node) && (scanCodecCalls || scanTransactionCalls)) {
-        const declaration = checker.getResolvedSignature(node)?.declaration;
+    if (scanCodecCalls || scanTransactionCalls) {
+      for (const node of sourceAnalysisIndex(sourceFile).calls) {
+        const called = expressionName(node.expression);
+        if (called && !persistenceCallNames.has(called)) continue;
+        const declaration = resolvedSignature(checker, node)?.declaration;
         if (!declaration) {
-          ts.forEachChild(node, visit);
-          return;
+          continue;
         }
         const declarationModules = new Map<string, string>();
         const declarationIdentities = new Map<string, NodeIdentity>();
@@ -5014,9 +5234,7 @@ function assertPersistenceInfrastructureCallsResolve(
           }
         }
       }
-      ts.forEachChild(node, visit);
-    };
-    visit(sourceFile);
+    }
   }
 }
 
@@ -5065,7 +5283,7 @@ function externalCallMatches(
   checker: ts.TypeChecker,
   packageRoots: readonly WorkspacePackageRoot[],
 ): boolean {
-  const signature = checker.getResolvedSignature(call);
+  const signature = resolvedSignature(checker, call);
   return (
     packageForSignature(signature, packageRoots) === identity.package &&
     declarationName(signature?.declaration) === identity.exportName.split(".").at(-1)
@@ -5171,7 +5389,7 @@ function analyzeSqliteTransactionAdapter(
       if (symbol) catchSymbols.add(symbol);
     }
     if (ts.isCallExpression(node)) {
-      const signature = checker.getResolvedSignature(node);
+      const signature = resolvedSignature(checker, node);
       if (
         packageForSignature(signature, packageRoots) === "bun:sqlite" &&
         declarationName(signature?.declaration) === "transaction"
@@ -5715,7 +5933,7 @@ function assertEventDeliveryConsumersResolve(
       if (ts.isCallExpression(node)) {
         const operation = expressionName(node.expression);
         if (operation === "subscribeTopic" || operation === "fetchTopic") {
-          const signature = checker.getResolvedSignature(node);
+          const signature = resolvedSignature(checker, node);
           if (packageForSignature(signature, packageRoots) === registration.apiPackage) {
             actual.add(operation);
           }
@@ -5735,33 +5953,28 @@ function assertEventDeliveryConsumersResolve(
     }
   }
   if (activeEventDeliveryApiPackages.size === 0) return;
-  for (const sourceFile of program.getSourceFiles()) {
-    if (!isProductionSource(sourceFile, workspaceRoot)) continue;
-    const visit = (node: ts.Node): void => {
-      if (ts.isCallExpression(node)) {
-        const operation = expressionName(node.expression);
-        if (operation === "subscribeTopic" || operation === "fetchTopic") {
-          const signature = checker.getResolvedSignature(node);
-          const apiPackage = packageForSignature(signature, packageRoots);
-          if (apiPackage && activeEventDeliveryApiPackages.has(apiPackage)) {
-            const identity = nodeIdentity(node, workspaceRoot);
-            const registered = workspace.eventDeliveryConsumers.some(
-              (registration) =>
-                registration.apiPackage === apiPackage &&
-                registration.operations.includes(operation) &&
-                identityOwns(registration.identity, identity),
+  for (const sourceFile of productionSourceIndex(program, workspaceRoot).files) {
+    for (const node of sourceAnalysisIndex(sourceFile).calls) {
+      const operation = expressionName(node.expression);
+      if (operation === "subscribeTopic" || operation === "fetchTopic") {
+        const signature = resolvedSignature(checker, node);
+        const apiPackage = packageForSignature(signature, packageRoots);
+        if (apiPackage && activeEventDeliveryApiPackages.has(apiPackage)) {
+          const identity = nodeIdentity(node, workspaceRoot);
+          const registered = workspace.eventDeliveryConsumers.some(
+            (registration) =>
+              registration.apiPackage === apiPackage &&
+              registration.operations.includes(operation) &&
+              identityOwns(registration.identity, identity),
+          );
+          if (!registered) {
+            throw new Error(
+              `Unregistered event delivery consumer in ${workspace.name}: ${identity.module}#${identity.symbolPath} calls ${apiPackage}#${operation}.`,
             );
-            if (!registered) {
-              throw new Error(
-                `Unregistered event delivery consumer in ${workspace.name}: ${identity.module}#${identity.symbolPath} calls ${apiPackage}#${operation}.`,
-              );
-            }
           }
         }
       }
-      ts.forEachChild(node, visit);
-    };
-    visit(sourceFile);
+    }
   }
 }
 
@@ -5971,28 +6184,12 @@ function assertOpenProtocolAdaptersResolve(
   program: ts.Program,
 ): void {
   for (const adapter of workspace.openProtocolAdapters) {
-    const matches: ts.SignatureDeclaration[] = [];
-    const sourceFile = program
-      .getSourceFiles()
-      .find(
-        (candidate) =>
-          !candidate.isDeclarationFile &&
-          isProductionFileName(candidate.fileName, workspaceRoot) &&
-          relativeModulePath(workspaceRoot, candidate) === adapter.identity.module,
-      );
-    if (sourceFile) {
-      const visit = (node: ts.Node): void => {
-        if (
-          ts.isFunctionLike(node) &&
-          functionHasImplementation(node) &&
-          identityMatches(adapter.identity, nodeIdentity(node, workspaceRoot))
-        ) {
-          matches.push(node);
-        }
-        ts.forEachChild(node, visit);
-      };
-      visit(sourceFile);
-    }
+    const matches = registeredNodes(
+      adapter.identity,
+      workspaceRoot,
+      program,
+      isImplementedCallable,
+    );
     if (matches.length !== 1) {
       throw new Error(
         `Open-protocol adapter ${workspace.name}/${adapter.identity.module}#${adapter.identity.exportName} must resolve to exactly one callable implementation; found ${matches.length}.`,
@@ -6007,28 +6204,13 @@ function assertOperationalResultApisResolve(
   program: ts.Program,
 ): void {
   for (const api of workspace.operationalResultApis) {
-    const matches: ts.SignatureDeclaration[] = [];
-    const sourceFile = program
-      .getSourceFiles()
-      .find(
-        (candidate) =>
-          !candidate.isDeclarationFile &&
-          isProductionFileName(candidate.fileName, workspaceRoot) &&
-          relativeModulePath(workspaceRoot, candidate) === api.module,
-      );
-    if (sourceFile) {
-      const visit = (node: ts.Node): void => {
-        if (
-          ts.isFunctionLike(node) &&
-          (functionHasImplementation(node) || ts.isMethodSignature(node)) &&
-          identityMatches(api, nodeIdentity(node, workspaceRoot))
-        ) {
-          matches.push(node);
-        }
-        ts.forEachChild(node, visit);
-      };
-      visit(sourceFile);
-    }
+    const matches = registeredNodes(
+      api,
+      workspaceRoot,
+      program,
+      (node): node is ts.SignatureDeclaration =>
+        (ts.isFunctionLike(node) && functionHasImplementation(node)) || ts.isMethodSignature(node),
+    );
     if (matches.length !== 1) {
       throw new Error(
         `Operational Result API ${workspace.name}/${api.module}#${api.exportName} must resolve to exactly one callable implementation; found ${matches.length}.`,
@@ -6060,6 +6242,45 @@ function callableBody(node: ts.SignatureDeclaration): ts.ConciseBody | undefined
 
 function isErrorCallbackPropertyName(name: string): boolean {
   return /^(?:catch|on.*(?:error|failure|reject))$/iu.test(name);
+}
+
+function isErrorCallbackReference(node: ts.Identifier, checker: ts.TypeChecker): boolean {
+  const parent = node.parent;
+  if (ts.isPropertyAssignment(parent)) {
+    const propertyName = propertyStringValue(parent, checker);
+    return propertyName !== undefined && isErrorCallbackPropertyName(propertyName);
+  }
+  return (
+    ts.isCallExpression(parent) &&
+    ((expressionName(parent.expression) === "catch" && parent.arguments.includes(node)) ||
+      (expressionName(parent.expression) === "then" && parent.arguments[1] === node) ||
+      (expressionName(parent.expression) === "addEventListener" &&
+        ts.isStringLiteral(parent.arguments[0]) &&
+        parent.arguments[0].text === "error" &&
+        parent.arguments[1] === node))
+  );
+}
+
+function errorCallbackSymbols(
+  sourceFile: ts.SourceFile,
+  checker: ts.TypeChecker,
+): ReadonlySet<ts.Symbol> {
+  let checkerIndexes = ERROR_CALLBACK_SYMBOLS.get(checker);
+  if (!checkerIndexes) {
+    checkerIndexes = new WeakMap();
+    ERROR_CALLBACK_SYMBOLS.set(checker, checkerIndexes);
+  }
+  const cached = checkerIndexes.get(sourceFile);
+  if (cached) return cached;
+
+  const symbols = new Set<ts.Symbol>();
+  for (const reference of sourceAnalysisIndex(sourceFile).errorCallbackReferences) {
+    if (!isErrorCallbackReference(reference, checker)) continue;
+    const symbol = checker.getSymbolAtLocation(reference);
+    if (symbol) symbols.add(canonicalSymbol(symbol, checker));
+  }
+  checkerIndexes.set(sourceFile, symbols);
+  return symbols;
 }
 
 function callableIsErrorCallback(node: ts.SignatureDeclaration, checker: ts.TypeChecker): boolean {
@@ -6096,38 +6317,7 @@ function callableIsErrorCallback(node: ts.SignatureDeclaration, checker: ts.Type
   if (!name || !ts.isIdentifier(name)) return false;
   const symbol = checker.getSymbolAtLocation(name);
   if (!symbol) return false;
-  let found = false;
-  const visit = (current: ts.Node): void => {
-    if (found) return;
-    if (ts.isIdentifier(current) && current !== name) {
-      const candidate = checker.getSymbolAtLocation(current);
-      if (candidate && canonicalSymbol(candidate, checker) === canonicalSymbol(symbol, checker)) {
-        const currentParent = current.parent;
-        if (
-          (ts.isPropertyAssignment(currentParent) &&
-            (() => {
-              const propertyName = propertyStringValue(currentParent, checker);
-              return propertyName !== undefined && isErrorCallbackPropertyName(propertyName);
-            })()) ||
-          (ts.isCallExpression(currentParent) &&
-            ((expressionName(currentParent.expression) === "catch" &&
-              currentParent.arguments.includes(current)) ||
-              (expressionName(currentParent.expression) === "then" &&
-                currentParent.arguments[1] === current) ||
-              (expressionName(currentParent.expression) === "addEventListener" &&
-                ts.isStringLiteral(currentParent.arguments[0]) &&
-                currentParent.arguments[0].text === "error" &&
-                currentParent.arguments[1] === current)))
-        ) {
-          found = true;
-          return;
-        }
-      }
-    }
-    ts.forEachChild(current, visit);
-  };
-  visit(node.getSourceFile());
-  return found;
+  return errorCallbackSymbols(node.getSourceFile(), checker).has(canonicalSymbol(symbol, checker));
 }
 
 function callableHasExceptionRelationship(
@@ -6165,7 +6355,7 @@ function callableHasExceptionRelationship(
         return;
       }
       if (direction === "signal-host") {
-        const calledDeclaration = checker.getResolvedSignature(current)?.declaration;
+        const calledDeclaration = resolvedSignature(checker, current)?.declaration;
         if (calledDeclaration && isImplementedCallable(calledDeclaration)) {
           const calledKey = symbolIdentityKey(nodeIdentity(calledDeclaration, workspaceRoot));
           if (calledKey !== callableKey && signalAdapterKeys.has(calledKey)) {
@@ -6231,7 +6421,7 @@ function callableReferencesExternalApi(
       }
     }
     if (ts.isCallExpression(current) || ts.isNewExpression(current)) {
-      const declaration = checker.getResolvedSignature(current)?.declaration;
+      const declaration = resolvedSignature(checker, current)?.declaration;
       if (
         declaration &&
         (declarationReferencesPackage(declaration, adapter.externalApi.package) ||
@@ -6259,7 +6449,7 @@ function callableReferencesPlatformApi(
   const visit = (current: ts.Node): void => {
     if (found || (current !== body && ts.isFunctionLike(current))) return;
     if (ts.isCallExpression(current) || ts.isNewExpression(current)) {
-      const declaration = checker.getResolvedSignature(current)?.declaration;
+      const declaration = resolvedSignature(checker, current)?.declaration;
       if (
         isDefaultLibraryDeclaration(declaration) &&
         /DateTimeFormat/u.test(declarationOwnerName(declaration) ?? "")
@@ -6604,13 +6794,9 @@ export function assertCoreFinalExceptionAdaptersResolve(
     let declarations = resolved.get(key);
     if (!declarations) {
       if (registration.exportName === "<module>") {
-        const sourceFile = program
-          .getSourceFiles()
-          .find(
-            (candidate) =>
-              !candidate.isDeclarationFile &&
-              relativeModulePath(workspaceRoot, candidate) === registration.module,
-          );
+        const sourceFile = productionSourceIndex(program, workspaceRoot).modules.get(
+          registration.module,
+        );
         declarations = sourceFile ? [sourceFile] : [];
       } else {
         declarations = exceptionAdapterDeclarations(
@@ -6828,8 +7014,7 @@ export function analyzeWorkspace(
   const reportedCustomDecoders = new Set<string>();
   const reportedMaps = new Set<string>();
 
-  for (const sourceFile of program.getSourceFiles()) {
-    if (!isProductionSource(sourceFile, workspaceRoot)) continue;
+  for (const sourceFile of productionSourceIndex(program, workspaceRoot).files) {
     const module = relativeModulePath(workspaceRoot, sourceFile);
     const activeRules = new Set(
       ARCHITECTURE_RULES.filter((rule) => ruleApplies(workspace, rule, module)),

@@ -12,6 +12,7 @@ import {
   ARCHITECTURE_WORKSPACE_FIXTURE_ENV,
   ARCHITECTURE_WORKSPACE_FIXTURE_VALUE,
 } from "./workspace-runner-protocol.ts";
+import { WorkspaceAnalysisCache } from "./workspace-analysis-cache.ts";
 
 async function selectedManifest(): Promise<ArchitectureManifest> {
   const fixture = process.env[ARCHITECTURE_WORKSPACE_FIXTURE_ENV];
@@ -33,7 +34,14 @@ async function main(): Promise<void> {
   }
 
   const context = createArchitectureAnalysisContext(repositoryRoot, manifest);
-  const findings = analyzeArchitectureWorkspace(repositoryRoot, workspace, context);
+  const cache = new WorkspaceAnalysisCache(repositoryRoot);
+  const findings = analyzeArchitectureWorkspace(
+    repositoryRoot,
+    workspace,
+    context,
+    undefined,
+    cache,
+  );
   for (const diagnostic of findings) printDiagnostic(diagnostic);
   if (findings.length > 0) process.exitCode = ARCHITECTURE_FINDINGS_EXIT_CODE;
 }

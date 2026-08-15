@@ -146,8 +146,11 @@ manifest in every workspace analysis, so partitioning does not narrow cross-work
 The default is one worker, preserving the lowest-memory serial path used by `lint` and CI. Local `check`
 uses two workers. Worker output is bounded, captured, and emitted in manifest order so diagnostics remain
 deterministic even when workers overlap. Exit status is aggregated so findings from any worker fail the
-parent command; an unexpected worker exit stops new scheduling and fails closed. Nothing is cached across
-processes.
+parent command; an unexpected worker exit stops new scheduling and fails closed. Each worker constructs
+and validates its TypeScript Program, then reuses completed workspace diagnostics from a repository-scoped
+cache under the system temporary directory when every loaded source, compiler option, registration,
+analyzer implementation file, and TypeScript version has the same content hash. Entries are immutable and
+written with an atomic rename so overlapping workers and commands cannot observe partial data.
 
 Focused integration tests spawn the real worker against checked-in `fixtures/workspace-runner` projects and
 assert its exact output and exit protocol. The fixture manifest is selected only for those direct test
@@ -156,5 +159,6 @@ processes; `runner.ts check` removes the fixture selector from every production 
 Measure architecture-runner changes with
 `/usr/bin/time -v bun scripts/architecture/runner.ts check` and the equivalent `--workers=2` command.
 Record wall time and maximum RSS for both when changing program creation, process partitioning, source
-traversal, or registration resolution. Compare the same checkout and environment before and after the
-change; dated development-checkout snapshots are not permanent benchmarks.
+traversal, registration resolution, or caching. Measure both a cold cache and an immediate warm rerun.
+Compare the same checkout and environment before and after the change; dated development-checkout
+snapshots are not permanent benchmarks.

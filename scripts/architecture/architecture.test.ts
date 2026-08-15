@@ -44,6 +44,7 @@ import {
   ARCHITECTURE_WORKSPACE_FIXTURE_ENV,
   ARCHITECTURE_WORKSPACE_FIXTURE_VALUE,
 } from "./workspace-runner-protocol.ts";
+import { WorkspaceAnalysisCache, workspaceAnalysisCacheKey } from "./workspace-analysis-cache.ts";
 import {
   assertWorkspaceInventoryMatches,
   compareWorkspaceInventory,
@@ -2124,13 +2125,13 @@ describe("Stage 6 persistence and SQLite architecture", () => {
         persistedCodecs: [
           {
             packageName: BASE_WORKSPACE.packageName,
-            identity: { module: "missing-codec.ts", exportName: "decodeMissing" },
+            identity: { module: "missing-codec.ts", exportName: "safeParse" },
           },
         ],
         sqliteTransactionAdapters: [
           {
             packageName: BASE_WORKSPACE.packageName,
-            identity: { module: "missing-transaction.ts", exportName: "runMissingTransaction" },
+            identity: { module: "missing-transaction.ts", exportName: "transaction" },
           },
         ],
         scanAllProductionModules: true,
@@ -2879,6 +2880,66 @@ describe("gate infrastructure", () => {
     );
 
     expect([...partitioned]).toEqual([...direct]);
+  });
+
+  test("reuses cached workspace diagnostics without reentering the TypeChecker", () => {
+    const cacheRoot = mkdtempSync(path.join(tmpdir(), "lilac-architecture-cache-test-"));
+    try {
+      const cache = new WorkspaceAnalysisCache(REPOSITORY_ROOT, cacheRoot);
+      const context = createArchitectureAnalysisContext(REPOSITORY_ROOT, {
+        ...architectureManifest,
+        workspaces: [BASE_WORKSPACE],
+      });
+      const programFactory = () => ({ root: FIXTURE_ROOT, program: fixtureProgram });
+      const expected = analyzeArchitectureWorkspace(
+        REPOSITORY_ROOT,
+        BASE_WORKSPACE,
+        context,
+        programFactory,
+        cache,
+      );
+      const cachedProgram = new Proxy(fixtureProgram, {
+        get(target, property, receiver) {
+          if (property === "getTypeChecker") {
+            return () => {
+              throw new Error("cached analysis reentered the TypeChecker");
+            };
+          }
+          return Reflect.get(target, property, receiver);
+        },
+      });
+
+      expect(
+        analyzeArchitectureWorkspace(
+          REPOSITORY_ROOT,
+          BASE_WORKSPACE,
+          context,
+          () => ({ root: FIXTURE_ROOT, program: cachedProgram }),
+          cache,
+        ),
+      ).toEqual(expected);
+    } finally {
+      rmSync(cacheRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("invalidates cached workspace diagnostics when a loaded source changes", () => {
+    withProgramFixture(
+      { "input.ts": "export const value = 1;" },
+      ({ repositoryRoot, workspace }) => {
+        const context = createArchitectureAnalysisContext(repositoryRoot, {
+          ...architectureManifest,
+          workspaces: [workspace],
+        });
+        const first = createCachingWorkspaceProgramFactory()(repositoryRoot, workspace).program;
+        const firstKey = workspaceAnalysisCacheKey(repositoryRoot, workspace, first, context);
+        writeFileSync(path.join(repositoryRoot, "workspace/input.ts"), "export const value = 2;");
+        const second = createCachingWorkspaceProgramFactory()(repositoryRoot, workspace).program;
+        const secondKey = workspaceAnalysisCacheKey(repositoryRoot, workspace, second, context);
+
+        expect(secondKey).not.toBe(firstKey);
+      },
+    );
   });
 
   test("real workspace subprocess exits cleanly without writing output", async () => {
