@@ -1,9 +1,10 @@
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, spyOn } from "bun:test";
 import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { stripVTControlCharacters } from "node:util";
+import { Panic } from "better-result";
 
 import {
   buildToolInput,
@@ -111,6 +112,18 @@ describe("tool-bridge entrypoint detection", () => {
 });
 
 describe("tool-bridge build id", () => {
+  it("preserves Panic identity from captured filesystem operations", async () => {
+    const panic = new Panic({ message: "build artifact invariant" });
+    const stat = spyOn(fs, "stat").mockRejectedValueOnce(panic);
+    try {
+      await expect(resolveBuildId("/workspace/apps/tool-bridge/dist/client.js")).rejects.toBe(
+        panic,
+      );
+    } finally {
+      stat.mockRestore();
+    }
+  });
+
   it("hashes the built client artifact and trims to 8 characters", async () => {
     const root = await fs.mkdtemp(path.join(tmpdir(), "tool-bridge-"));
 

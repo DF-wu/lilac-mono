@@ -111,10 +111,11 @@ export function decodeBindingPreferences(input: {
         message: "Preferences are not valid JSON",
       }),
   });
-  if (parsedJson.status === "error") {
-    return Result.err(parsedJson.error);
-  }
-  const json: unknown = parsedJson.value;
+  const json: unknown = parsedJson.match<unknown>({
+    ok: (value) => value,
+    err: (error) => error,
+  });
+  if (BindingPreferencesMalformed.is(json)) return Result.err(json);
   const version = preferenceVersionSchema.safeParse(json);
   if (!version.success) {
     const legacy = legacyBindingPreferencesSchema.safeParse(json);
@@ -298,18 +299,36 @@ export async function loadBindingPreferences(
   filePath: string,
 ): Promise<ResultType<BindingPreferencesRead, BindingPreferencesLoadError>> {
   const exists = await bindingPreferencesFileExists(filePath);
-  if (exists.status === "error") return Result.err(exists.error);
+  const existsValue = exists.match<boolean | BindingPreferencesIoFailed>({
+    ok: (value) => value,
+    err: (error) => error,
+  });
+  if (BindingPreferencesIoFailed.is(existsValue)) return Result.err(existsValue);
   let text: string | undefined;
-  if (exists.value) {
+  if (existsValue) {
     const read = await readBindingPreferencesFile(filePath);
-    if (read.status === "error") return Result.err(read.error);
-    text = read.value;
+    const readValue = read.match<string | BindingPreferencesIoFailed>({
+      ok: (value) => value,
+      err: (error) => error,
+    });
+    if (BindingPreferencesIoFailed.is(readValue)) return Result.err(readValue);
+    text = readValue;
   }
   const decoded = decodeBindingPreferences({ filePath, serialized: text ?? null });
-  if (decoded.status === "error") return Result.err(decoded.error);
+  const decodedValue = decoded.match<DecodedBindingPreferences | BindingPreferencesDecodeError>({
+    ok: (value) => value,
+    err: (error) => error,
+  });
+  if (
+    BindingPreferencesMalformed.is(decodedValue) ||
+    BindingPreferencesUnsupportedVersion.is(decodedValue) ||
+    BindingPreferencesCorrupt.is(decodedValue)
+  ) {
+    return Result.err(decodedValue);
+  }
   return Result.ok({
-    preferences: decoded.value.value,
-    provenance: decoded.value.provenance,
+    preferences: decodedValue.value,
+    provenance: decodedValue.provenance,
   });
 }
 
@@ -319,25 +338,38 @@ export async function saveBindingPreferences(
 ): Promise<ResultType<void, BindingPreferencesIoFailed | BindingPreferencesWriteAndCleanupFailed>> {
   const temporaryPath = `${filePath}.${process.pid}.${crypto.randomUUID()}.tmp`;
   const directory = await createBindingPreferencesDirectory(filePath);
-  if (directory.status === "error") return Result.err(directory.error);
+  const directoryFailure = directory.match<BindingPreferencesIoFailed | undefined>({
+    ok: () => undefined,
+    err: (error) => error,
+  });
+  if (directoryFailure !== undefined) return Result.err(directoryFailure);
   const written = await writeBindingPreferencesFile(
     temporaryPath,
     `${JSON.stringify(preferences, null, 2)}\n`,
   );
-  let writeFailure: BindingPreferencesIoFailed | undefined =
-    written.status === "error" ? written.error : undefined;
+  let writeFailure = written.match<BindingPreferencesIoFailed | undefined>({
+    ok: () => undefined,
+    err: (error) => error,
+  });
   if (writeFailure === undefined) {
     const renamed = await renameBindingPreferencesFile(temporaryPath, filePath);
-    if (renamed.status === "error") writeFailure = renamed.error;
+    writeFailure = renamed.match<BindingPreferencesIoFailed | undefined>({
+      ok: () => undefined,
+      err: (error) => error,
+    });
   }
   if (writeFailure === undefined) return Result.ok(undefined);
   const cleaned = await removeTemporaryBindingPreferences(temporaryPath);
-  if (cleaned.status === "error") {
+  const cleanupFailure = cleaned.match<BindingPreferencesIoFailed | undefined>({
+    ok: () => undefined,
+    err: (error) => error,
+  });
+  if (cleanupFailure !== undefined) {
     return Result.err(
       new BindingPreferencesWriteAndCleanupFailed({
         write: writeFailure,
-        cleanup: cleaned.error,
-        message: `${writeFailure.message}; ${cleaned.error.message}`,
+        cleanup: cleanupFailure,
+        message: `${writeFailure.message}; ${cleanupFailure.message}`,
       }),
     );
   }

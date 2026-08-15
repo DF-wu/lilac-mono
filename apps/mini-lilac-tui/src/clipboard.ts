@@ -75,8 +75,11 @@ function command(
   options: { readonly maxBytes?: number; readonly timeoutMs?: number } = {},
 ): Promise<ResultType<Uint8Array, ClipboardReadError>> {
   const spawned = spawnClipboardCommand(name, args);
-  if (spawned.status === "error") return Promise.resolve(Result.err(spawned.error));
-  const child = spawned.value;
+  const child = spawned.match<ClipboardProcess | ClipboardOperationFailed>({
+    ok: (value) => value,
+    err: (error) => error,
+  });
+  if (ClipboardOperationFailed.is(child)) return Promise.resolve(Result.err(child));
   return new Promise((resolve) => {
     const maxBytes = options.maxBytes ?? MAX_CLIPBOARD_IMAGE_BYTES;
     const chunks: Buffer[] = [];
@@ -233,13 +236,20 @@ async function readBoundedFile(
   >
 > {
   const opened = await openClipboardFile(file);
-  if (opened.status === "error") return Result.err(opened.error);
-  const handle = opened.value;
+  const handle = opened.match<FileHandle | ClipboardOperationFailed>({
+    ok: (value) => value,
+    err: (error) => error,
+  });
+  if (ClipboardOperationFailed.is(handle)) return Result.err(handle);
   let readResult: ResultType<Uint8Array, ClipboardReadError>;
   const stat = await statClipboardFile(handle);
-  if (stat.status === "error") {
-    readResult = Result.err(stat.error);
-  } else if (stat.value.size > maxBytes) {
+  const fileStat = stat.match<Awaited<ReturnType<FileHandle["stat"]>> | ClipboardOperationFailed>({
+    ok: (value) => value,
+    err: (error) => error,
+  });
+  if (ClipboardOperationFailed.is(fileStat)) {
+    readResult = Result.err(fileStat);
+  } else if (fileStat.size > maxBytes) {
     readResult = Result.err(new ClipboardImageTooLargeError(maxBytes));
   } else {
     const chunks: Buffer[] = [];
@@ -248,34 +258,49 @@ async function readBoundedFile(
     readResult = Result.ok(new Uint8Array());
     for (;;) {
       const read = await readClipboardFile(handle, buffer);
-      if (read.status === "error") {
-        readResult = Result.err(read.error);
+      const readValue = read.match<{ readonly bytesRead: number } | ClipboardOperationFailed>({
+        ok: (value) => value,
+        err: (error) => error,
+      });
+      if (ClipboardOperationFailed.is(readValue)) {
+        readResult = Result.err(readValue);
         break;
       }
-      if (read.value.bytesRead === 0) {
+      if (readValue.bytesRead === 0) {
         readResult = Result.ok(Buffer.concat(chunks, totalBytes));
         break;
       }
-      totalBytes += read.value.bytesRead;
+      totalBytes += readValue.bytesRead;
       if (totalBytes > maxBytes) {
         readResult = Result.err(new ClipboardImageTooLargeError(maxBytes));
         break;
       }
-      chunks.push(Buffer.from(buffer.subarray(0, read.value.bytesRead)));
+      chunks.push(Buffer.from(buffer.subarray(0, readValue.bytesRead)));
     }
   }
   const closed = await closeClipboardFile(handle);
-  if (closed.status === "ok") return readResult;
-  if (readResult.status === "error") {
-    return Result.err(
-      new ClipboardReadAndCleanupFailed({
-        read: readResult.error,
-        cleanup: closed.error,
-        message: `${readResult.error.message}; ${closed.error.message}`,
+  return closed.match<
+    ResultType<
+      Uint8Array,
+      ClipboardReadError | ClipboardCleanupFailed | ClipboardReadAndCleanupFailed
+    >
+  >({
+    ok: () => readResult,
+    err: (cleanup) =>
+      readResult.match<
+        ResultType<Uint8Array, ClipboardCleanupFailed | ClipboardReadAndCleanupFailed>
+      >({
+        ok: () => Result.err(cleanup),
+        err: (read) =>
+          Result.err(
+            new ClipboardReadAndCleanupFailed({
+              read,
+              cleanup,
+              message: `${read.message}; ${cleanup.message}`,
+            }),
+          ),
       }),
-    );
-  }
-  return Result.err(closed.error);
+  });
 }
 
 async function runAppleScript(
@@ -313,11 +338,11 @@ async function removeClipboardFile(
 function optionalClipboardBytes(
   result: ResultType<Uint8Array, ClipboardReadError>,
 ): ResultType<Uint8Array | undefined, ClipboardReadError> {
-  if (result.status === "ok")
-    return Result.ok(result.value.length === 0 ? undefined : result.value);
-  return ClipboardImageTooLargeError.is(result.error)
-    ? Result.err(result.error)
-    : Result.ok(undefined);
+  return result.match<ResultType<Uint8Array | undefined, ClipboardReadError>>({
+    ok: (value) => Result.ok(value.length === 0 ? undefined : value),
+    err: (error) =>
+      ClipboardImageTooLargeError.is(error) ? Result.err(error) : Result.ok(undefined),
+  });
 }
 
 /** Read an image clipboard using native platform tools, without reading clipboard text. */
@@ -339,34 +364,37 @@ export async function readClipboardImage(): Promise<
       "close access fileRef",
     ]);
     let readResult: ResultType<Uint8Array | undefined, ClipboardError> = Result.ok(undefined);
-    if (scripted.status === "ok") {
+    const scriptSucceeded = scripted.match({ ok: () => true, err: () => false });
+    if (scriptSucceeded) {
       const read = await readBoundedFile(file, MAX_CLIPBOARD_IMAGE_BYTES);
-      readResult =
-        read.status === "ok"
-          ? Result.ok(read.value.length === 0 ? undefined : read.value)
-          : Result.err(read.error);
+      readResult = read.map((value) => (value.length === 0 ? undefined : value));
     }
     const removed = await removeClipboardFile(file);
-    if (removed.status === "error") {
-      if (readResult.status === "error" && !ClipboardCleanupFailed.is(readResult.error)) {
-        const primary = ClipboardReadAndCleanupFailed.is(readResult.error)
-          ? readResult.error.read
-          : readResult.error;
+    const removeFailure = removed.match<ClipboardCleanupFailed | undefined>({
+      ok: () => undefined,
+      err: (error) => error,
+    });
+    if (removeFailure !== undefined) {
+      const readFailure = readResult.match<ClipboardError | undefined>({
+        ok: () => undefined,
+        err: (error) => error,
+      });
+      if (readFailure !== undefined && !ClipboardCleanupFailed.is(readFailure)) {
+        const primary = ClipboardReadAndCleanupFailed.is(readFailure)
+          ? readFailure.read
+          : readFailure;
         return Result.err(
           new ClipboardReadAndCleanupFailed({
             read: primary,
-            cleanup: removed.error,
-            message: `${primary.message}; ${removed.error.message}`,
+            cleanup: removeFailure,
+            message: `${primary.message}; ${removeFailure.message}`,
           }),
         );
       }
-      return Result.err(removed.error);
+      return Result.err(removeFailure);
     }
-    if (readResult.status === "error") return Result.err(readResult.error);
-    return Result.ok(
-      readResult.value === undefined
-        ? undefined
-        : { bytes: readResult.value, mediaType: "image/png" },
+    return readResult.map((value) =>
+      value === undefined ? undefined : { bytes: value, mediaType: "image/png" as const },
     );
   }
 
@@ -376,22 +404,40 @@ export async function readClipboardImage(): Promise<
     const bytes = optionalClipboardBytes(
       await command("powershell.exe", ["-NonInteractive", "-NoProfile", "-Command", script]),
     );
-    if (bytes.status === "error") return Result.err(bytes.error);
+    const byteValue = bytes.match<Uint8Array | undefined | ClipboardReadError>({
+      ok: (value) => value,
+      err: (error) => error,
+    });
+    if (ClipboardImageTooLargeError.is(byteValue) || ClipboardOperationFailed.is(byteValue)) {
+      return Result.err(byteValue);
+    }
     return Result.ok(
-      bytes.value === undefined ? undefined : { bytes: bytes.value, mediaType: "image/png" },
+      byteValue === undefined ? undefined : { bytes: byteValue, mediaType: "image/png" },
     );
   }
 
   if (platform() === "linux") {
     const wayland = optionalClipboardBytes(await command("wl-paste", ["-t", "image/png"]));
-    if (wayland.status === "error") return Result.err(wayland.error);
-    if (wayland.value !== undefined)
-      return Result.ok({ bytes: wayland.value, mediaType: "image/png" });
+    const waylandValue = wayland.match<Uint8Array | undefined | ClipboardReadError>({
+      ok: (value) => value,
+      err: (error) => error,
+    });
+    if (ClipboardImageTooLargeError.is(waylandValue) || ClipboardOperationFailed.is(waylandValue)) {
+      return Result.err(waylandValue);
+    }
+    if (waylandValue !== undefined)
+      return Result.ok({ bytes: waylandValue, mediaType: "image/png" });
     const x11 = optionalClipboardBytes(
       await command("xclip", ["-selection", "clipboard", "-t", "image/png", "-o"]),
     );
-    if (x11.status === "error") return Result.err(x11.error);
-    if (x11.value !== undefined) return Result.ok({ bytes: x11.value, mediaType: "image/png" });
+    const x11Value = x11.match<Uint8Array | undefined | ClipboardReadError>({
+      ok: (value) => value,
+      err: (error) => error,
+    });
+    if (ClipboardImageTooLargeError.is(x11Value) || ClipboardOperationFailed.is(x11Value)) {
+      return Result.err(x11Value);
+    }
+    if (x11Value !== undefined) return Result.ok({ bytes: x11Value, mediaType: "image/png" });
   }
 
   return Result.ok(undefined);

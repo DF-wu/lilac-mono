@@ -88,8 +88,14 @@ export function validateMiniLilacPersistedSuperJsonValue(
       seen.set(candidate, decodedValues);
       for (const nested of candidate) {
         const decoded = decode(nested);
-        if (decoded.status === "error") return Result.err(decoded.error);
-        decodedValues.push(decoded.value);
+        let value!: MiniLilacPersistedSuperJsonValue;
+        let failure: MiniLilacPersistedSuperJsonValueInvalid | undefined;
+        decoded.match({
+          ok: (decodedValue) => void (value = decodedValue),
+          err: (error) => void (failure = error),
+        });
+        if (failure !== undefined) return Result.err(failure);
+        decodedValues.push(value);
       }
       return Result.ok(decodedValues);
     }
@@ -99,12 +105,18 @@ export function validateMiniLilacPersistedSuperJsonValue(
         MiniLilacPersistedSuperJsonValue
       >();
       seen.set(candidate, decodedMap);
-      for (const [key, nestedValue] of candidate) {
-        const decodedKey = decode(key);
-        if (decodedKey.status === "error") return Result.err(decodedKey.error);
-        const decodedValue = decode(nestedValue);
-        if (decodedValue.status === "error") return Result.err(decodedValue.error);
-        decodedMap.set(decodedKey.value, decodedValue.value);
+      for (const entry of candidate) {
+        const decodedEntry = decode(entry[0]).andThen((decodedKey) =>
+          decode(entry[1]).map((decodedValue) => {
+            decodedMap.set(decodedKey, decodedValue);
+          }),
+        );
+        let failure: MiniLilacPersistedSuperJsonValueInvalid | undefined;
+        decodedEntry.match({
+          ok: () => undefined,
+          err: (error) => void (failure = error),
+        });
+        if (failure !== undefined) return Result.err(failure);
       }
       return Result.ok(decodedMap);
     }
@@ -113,8 +125,14 @@ export function validateMiniLilacPersistedSuperJsonValue(
       seen.set(candidate, decodedSet);
       for (const nested of candidate) {
         const decoded = decode(nested);
-        if (decoded.status === "error") return Result.err(decoded.error);
-        decodedSet.add(decoded.value);
+        let value!: MiniLilacPersistedSuperJsonValue;
+        let failure: MiniLilacPersistedSuperJsonValueInvalid | undefined;
+        decoded.match({
+          ok: (decodedValue) => void (value = decodedValue),
+          err: (error) => void (failure = error),
+        });
+        if (failure !== undefined) return Result.err(failure);
+        decodedSet.add(value);
       }
       return Result.ok(decodedSet);
     }
@@ -126,8 +144,14 @@ export function validateMiniLilacPersistedSuperJsonValue(
     seen.set(candidate, decodedRecord);
     for (const [key, nested] of Object.entries(candidate)) {
       const decoded = decode(nested);
-      if (decoded.status === "error") return Result.err(decoded.error);
-      decodedRecord[key] = decoded.value;
+      let value!: MiniLilacPersistedSuperJsonValue;
+      let failure: MiniLilacPersistedSuperJsonValueInvalid | undefined;
+      decoded.match({
+        ok: (decodedValue) => void (value = decodedValue),
+        err: (error) => void (failure = error),
+      });
+      if (failure !== undefined) return Result.err(failure);
+      decodedRecord[key] = value;
     }
     return Result.ok(decodedRecord);
   };
@@ -135,7 +159,10 @@ export function validateMiniLilacPersistedSuperJsonValue(
 }
 
 function acceptsMiniLilacPersistedSuperJsonValue(value: unknown): boolean {
-  return validateMiniLilacPersistedSuperJsonValue(value).status === "ok";
+  return validateMiniLilacPersistedSuperJsonValue(value).match({
+    ok: () => true,
+    err: () => false,
+  });
 }
 
 export const superJsonValueSchema: z.ZodType<MiniLilacPersistedSuperJsonValue> =

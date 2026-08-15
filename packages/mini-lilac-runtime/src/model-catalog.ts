@@ -331,12 +331,18 @@ export function parseModelRefResult(value: string): ResultType<ModelRef, ModelRe
 /** Compatibility adapter for callers that consume model reference failures as exceptions. */
 export function parseModelRef(value: string): ModelRef {
   const parsed = parseModelRefResult(value);
-  if (parsed.status === "error") {
-    throw new Error(parsed.error.message, {
-      cause: parsed.error.validationError,
+  let ref!: ModelRef;
+  let failure: ModelReferenceInvalid | undefined;
+  parsed.match({
+    ok: (value) => void (ref = value),
+    err: (error) => void (failure = error),
+  });
+  if (failure !== undefined) {
+    throw new Error(failure.message, {
+      cause: failure.validationError,
     });
   }
-  return parsed.value;
+  return ref;
 }
 
 export function resolveLanguageModelResult(
@@ -347,8 +353,13 @@ export function resolveLanguageModelResult(
   ModelReferenceInvalid | ModelProviderNotConfigured | LanguageModelResolutionFailed
 > {
   const parsed = parseModelRefResult(value);
-  if (parsed.status === "error") return Result.err(parsed.error);
-  const ref = parsed.value;
+  let ref!: ModelRef;
+  let parseFailure: ModelReferenceInvalid | undefined;
+  parsed.match({
+    ok: (value) => void (ref = value),
+    err: (error) => void (parseFailure = error),
+  });
+  if (parseFailure !== undefined) return Result.err(parseFailure);
   if (!providers.config.providers[ref.providerId]) {
     return Result.err(
       new ModelProviderNotConfigured({
@@ -636,14 +647,25 @@ export class ModelCatalog {
       options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS,
       "requestTimeoutMs",
     );
-    if (requestTimeoutMs.status === "error") throw requestTimeoutMs.error;
-    this.requestTimeoutMs = requestTimeoutMs.value;
+    let invalidOption: ModelCatalogOptionsInvalid | undefined;
+    let requestTimeoutValue!: number;
+    requestTimeoutMs.match({
+      ok: (value) => void (requestTimeoutValue = value),
+      err: (error) => void (invalidOption = error),
+    });
+    if (invalidOption !== undefined) throw invalidOption;
+    this.requestTimeoutMs = requestTimeoutValue;
     const maxResponseBytes = decodePositiveInteger(
       options.maxResponseBytes ?? DEFAULT_MAX_RESPONSE_BYTES,
       "maxResponseBytes",
     );
-    if (maxResponseBytes.status === "error") throw maxResponseBytes.error;
-    this.maxResponseBytes = maxResponseBytes.value;
+    let maxResponseBytesValue!: number;
+    maxResponseBytes.match({
+      ok: (value) => void (maxResponseBytesValue = value),
+      err: (error) => void (invalidOption = error),
+    });
+    if (invalidOption !== undefined) throw invalidOption;
+    this.maxResponseBytes = maxResponseBytesValue;
     this.now = options.now ?? Date.now;
     this.onWarning = options.onWarning;
     this.codexOAuthProviderIds = new Set(options.codexOAuthProviderIds);
@@ -679,10 +701,16 @@ export class ModelCatalog {
     options: { forceRefresh?: boolean; backgroundRefresh?: boolean; signal?: AbortSignal } = {},
   ): Promise<ModelCatalogSnapshot> {
     const snapshot = await this.getResult(options);
-    if (snapshot.status === "error") {
-      throw new DOMException(catalogCancellationMessage(snapshot.error), "AbortError");
+    let value!: ModelCatalogSnapshot;
+    let failure: ModelCatalogGetError | undefined;
+    snapshot.match({
+      ok: (result) => void (value = result),
+      err: (error) => void (failure = error),
+    });
+    if (failure !== undefined) {
+      throw new DOMException(catalogCancellationMessage(failure), "AbortError");
     }
-    return snapshot.value;
+    return value;
   }
 
   clear(): void {
@@ -729,11 +757,17 @@ export class ModelCatalog {
 
     for (const [providerId, definition] of this.modelsDevProviders()) {
       const sourceProvider = modelsDevProvider(registry, providerId, definition);
-      if (sourceProvider.status === "error") {
-        errors.push(sourceProvider.error);
+      let provider!: ModelsDevProvider;
+      let providerFailure: ModelsDevProviderError | undefined;
+      sourceProvider.match({
+        ok: (value) => void (provider = value),
+        err: (error) => void (providerFailure = error),
+      });
+      if (providerFailure !== undefined) {
+        errors.push(providerFailure);
         continue;
       }
-      const entries = Object.values(sourceProvider.value.models).filter(
+      const entries = Object.values(provider.models).filter(
         (entry) =>
           (!this.codexOAuthProviderIds.has(providerId) || isCodexOAuthModel(entry)) &&
           (definition.type !== "claude-code" || isClaudeCodeModel(entry)),
@@ -786,22 +820,37 @@ export class ModelCatalog {
   private async loadDiskCache(): Promise<void> {
     if (!this.cacheFilePath) return;
     const sourceResult = await this.readDiskCacheSource(this.cacheFilePath);
-    if (sourceResult.status === "error") {
-      this.cacheWarning("cache-read-failed", sourceResult.error.message);
+    let source: string | null = null;
+    let sourceFailure:
+      | ModelCatalogCacheReadFailed
+      | ModelCatalogCacheCleanupFailed
+      | ModelCatalogCacheReadAndCleanupFailed
+      | undefined;
+    sourceResult.match({
+      ok: (value) => void (source = value),
+      err: (error) => void (sourceFailure = error),
+    });
+    if (sourceFailure !== undefined) {
+      this.cacheWarning("cache-read-failed", sourceFailure.message);
       return;
     }
-    if (sourceResult.value === null) return;
-    const source = sourceResult.value;
+    if (source === null) return;
 
     const parsed = decodeModelsDevCache(source);
-    if (parsed.status === "error") {
+    let cache!: ModelsDevCache;
+    let cacheFailure: ModelCatalogCacheReadFailed | undefined;
+    parsed.match({
+      ok: (value) => void (cache = value),
+      err: (error) => void (cacheFailure = error),
+    });
+    if (cacheFailure !== undefined) {
       this.cacheWarning(
         "cache-invalid",
-        `Ignoring invalid models.dev cache '${this.cacheFilePath}': ${parsed.error.message}`,
+        `Ignoring invalid models.dev cache '${this.cacheFilePath}': ${cacheFailure.message}`,
       );
       return;
     }
-    const catalog = this.modelsFromModelsDev(parsed.value.registry);
+    const catalog = this.modelsFromModelsDev(cache.registry);
     if (catalog.errors.length > 0) {
       this.cacheWarning(
         "cache-invalid",
@@ -810,7 +859,7 @@ export class ModelCatalog {
       return;
     }
 
-    const stale = this.now() - parsed.value.fetchedAt >= this.cacheTtlMs;
+    const stale = this.now() - cache.fetchedAt >= this.cacheTtlMs;
     const warnings: ModelCatalogWarning[] = [];
     if (stale) {
       for (const [providerId] of this.modelsDevProviders()) {
@@ -829,10 +878,10 @@ export class ModelCatalog {
       })),
       models: catalog.models,
       warnings,
-      fetchedAt: new Date(parsed.value.fetchedAt),
+      fetchedAt: new Date(cache.fetchedAt),
       stale,
     };
-    this.cacheTime = parsed.value.fetchedAt;
+    this.cacheTime = cache.fetchedAt;
     this.cacheComplete = Object.values(this.config.providers).every(
       (provider) => provider.catalog === "models-dev",
     );
@@ -922,20 +971,26 @@ export class ModelCatalog {
       }
       return Result.err(read.error.error);
     }
-    if (read.value.status === "error") {
+    let source!: string;
+    let sourceFailure: ModelCatalogCacheReadFailed | undefined;
+    read.value.match({
+      ok: (value) => void (source = value),
+      err: (error) => void (sourceFailure = error),
+    });
+    if (sourceFailure !== undefined) {
       if (cleanup?.status === "error") {
         return Result.err(
           new ModelCatalogCacheReadAndCleanupFailed({
-            readError: read.value.error,
+            readError: sourceFailure,
             cleanupError: cleanup.error,
             message: `Failed to read and close models.dev cache '${cacheFilePath}'`,
           }),
         );
       }
-      return Result.err(read.value.error);
+      return Result.err(sourceFailure);
     }
     if (cleanup?.status === "error") return Result.err(cleanup.error);
-    return Result.ok(read.value.value);
+    return Result.ok(source);
   }
 
   private async writeDiskCache(
@@ -1298,35 +1353,47 @@ export class ModelCatalog {
 
     if (modelsDevProviders.length > 0) {
       const fetched = await this.fetchText(this.modelsDevUrl, {}, signal);
-      if (fetched.status === "error") {
-        if (isCatalogCancellation(fetched.error)) return Result.err(fetched.error);
+      let fetchedText!: string;
+      let fetchFailure: ModelCatalogFetchError | undefined;
+      fetched.match({
+        ok: (value) => void (fetchedText = value),
+        err: (error) => void (fetchFailure = error),
+      });
+      if (fetchFailure !== undefined) {
+        if (isCatalogCancellation(fetchFailure)) return Result.err(fetchFailure);
         for (const [providerId] of modelsDevProviders) {
           this.warn(warnings, {
             code: "source-fetch-failed",
             providerId,
-            message: `Failed to fetch models.dev catalog for provider '${providerId}': ${fetched.error.message}`,
+            message: `Failed to fetch models.dev catalog for provider '${providerId}': ${fetchFailure.message}`,
           });
           stale = this.useStale(providerId, models, warnings) || stale;
         }
       } else {
-        const registry = decodeModelsDevRegistry(fetched.value);
-        if (registry.status === "error") {
+        const registry = decodeModelsDevRegistry(fetchedText);
+        let decodedRegistry!: ModelsDevRegistry;
+        let registryFailure: ModelCatalogRequestFailed | undefined;
+        registry.match({
+          ok: (value) => void (decodedRegistry = value),
+          err: (error) => void (registryFailure = error),
+        });
+        if (registryFailure !== undefined) {
           for (const [providerId] of modelsDevProviders) {
             this.warn(warnings, {
               code: "source-invalid",
               providerId,
-              message: `models.dev returned an invalid registry for provider '${providerId}': ${registry.error.message}`,
+              message: `models.dev returned an invalid registry for provider '${providerId}': ${registryFailure.message}`,
             });
             stale = this.useStale(providerId, models, warnings) || stale;
           }
         } else {
-          const catalog = this.modelsFromModelsDev(registry.value);
+          const catalog = this.modelsFromModelsDev(decodedRegistry);
           models.push(...catalog.models);
           for (const error of catalog.errors) {
             this.warn(warnings, error);
             stale = this.useStale(error.providerId, models, warnings) || stale;
           }
-          if (catalog.errors.length === 0) registryForCache = registry.value;
+          if (catalog.errors.length === 0) registryForCache = decodedRegistry;
         }
       }
     }
@@ -1350,27 +1417,39 @@ export class ModelCatalog {
             { headers: authHeaders(definition.type, apiKey) },
             signal,
           );
-          if (fetched.status === "error") {
-            if (isCatalogCancellation(fetched.error)) return Result.err(fetched.error);
+          let fetchedText!: string;
+          let fetchFailure: ModelCatalogFetchError | undefined;
+          fetched.match({
+            ok: (value) => void (fetchedText = value),
+            err: (error) => void (fetchFailure = error),
+          });
+          if (fetchFailure !== undefined) {
+            if (isCatalogCancellation(fetchFailure)) return Result.err(fetchFailure);
             this.warn(warnings, {
               code: "source-fetch-failed",
               providerId,
-              message: `Failed to fetch /v1/models for provider '${providerId}': ${fetched.error.message}`,
+              message: `Failed to fetch /v1/models for provider '${providerId}': ${fetchFailure.message}`,
             });
             stale = this.useStale(providerId, models, warnings) || stale;
             return Result.ok(undefined);
           }
-          const parsed = decodeV1ModelsResponse(fetched.value);
-          if (parsed.status === "error") {
+          const parsed = decodeV1ModelsResponse(fetchedText);
+          let response!: z.infer<typeof v1ModelsResponseSchema>;
+          let responseFailure: ModelCatalogRequestFailed | undefined;
+          parsed.match({
+            ok: (value) => void (response = value),
+            err: (error) => void (responseFailure = error),
+          });
+          if (responseFailure !== undefined) {
             this.warn(warnings, {
               code: "source-invalid",
               providerId,
-              message: `Provider '${providerId}' returned invalid /v1/models data: ${parsed.error.message}`,
+              message: `Provider '${providerId}' returned invalid /v1/models data: ${responseFailure.message}`,
             });
             stale = this.useStale(providerId, models, warnings) || stale;
             return Result.ok(undefined);
           }
-          for (const entry of parsed.value.data) {
+          for (const entry of response.data) {
             models.push(
               applyModelOverride(
                 {
@@ -1386,8 +1465,9 @@ export class ModelCatalog {
           return Result.ok(undefined);
         }),
     );
-    const cancelled = v1Results.find((result) => result.status === "error");
-    if (cancelled?.status === "error") return Result.err(cancelled.error);
+    const [, cancellations] = Result.partition(v1Results);
+    const cancelled = cancellations[0];
+    if (cancelled !== undefined) return Result.err(cancelled);
 
     const fetchedAt = this.now();
     if (registryForCache) {
@@ -1396,12 +1476,21 @@ export class ModelCatalog {
         fetchedAt,
         registry: registryForCache,
       });
-      if (written.status === "error") {
+      let writeFailure:
+        | ModelCatalogCacheWriteFailed
+        | ModelCatalogCacheCleanupFailed
+        | ModelCatalogCacheWriteAndCleanupFailed
+        | undefined;
+      written.match({
+        ok: () => {},
+        err: (error) => void (writeFailure = error),
+      });
+      if (writeFailure !== undefined) {
         for (const [providerId] of modelsDevProviders) {
           this.warn(warnings, {
             code: "cache-write-failed",
             providerId,
-            message: written.error.message,
+            message: writeFailure.message,
           });
         }
       }
@@ -1433,11 +1522,15 @@ export function createModelCatalogResult(
     options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS,
     "requestTimeoutMs",
   );
-  if (requestTimeoutMs.status === "error") return Result.err(requestTimeoutMs.error);
   const maxResponseBytes = decodePositiveInteger(
     options.maxResponseBytes ?? DEFAULT_MAX_RESPONSE_BYTES,
     "maxResponseBytes",
   );
-  if (maxResponseBytes.status === "error") return Result.err(maxResponseBytes.error);
+  let optionsFailure: ModelCatalogOptionsInvalid | undefined;
+  Result.all([requestTimeoutMs, maxResponseBytes]).match({
+    ok: () => {},
+    err: (error) => void (optionsFailure = error),
+  });
+  if (optionsFailure !== undefined) return Result.err(optionsFailure);
   return Result.ok(new ModelCatalog(config, auth, options));
 }

@@ -50,6 +50,6 @@ describe("mini-lilac build boundaries", () => {
 
   it("signals a typed build failure through the Bun script host contract", () => {
     const error = new MiniLilacBuildPatchMissing({ message: "patch missing" });
-    expect(() => signalBuildFailure(error)).toThrow("patch missing");
+    expect(() => signalBuildFailure(error)).toThrow(error);
   });
 });

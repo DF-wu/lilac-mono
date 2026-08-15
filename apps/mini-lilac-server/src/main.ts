@@ -151,8 +151,14 @@ async function captureServerCleanup(
 }
 
 function adaptLifecycleResultToHost<T>(result: ResultType<T, MiniLilacLifecycleFailure>): T {
-  if (result.status === "ok") return result.value;
-  throw result.error;
+  let value!: T;
+  let failure: MiniLilacLifecycleFailure | undefined;
+  result.match({
+    ok: (resultValue) => void (value = resultValue),
+    err: (error) => void (failure = error),
+  });
+  if (failure !== undefined) throw failure;
+  return value;
 }
 
 function combineCleanupFailures(
@@ -233,16 +239,18 @@ export async function acquireDatabaseLockResult(
       { stdin: "pipe", stdout: "pipe", stderr: "pipe", detached: true },
     );
   });
-  if (started.status === "error") {
-    return Result.err(
-      serverFailureWithMessage(
+  let holder!: Bun.Subprocess<"pipe", "pipe", "pipe">;
+  let startFailure: MiniLilacServerFailure | undefined;
+  started.match({
+    ok: (startedHolder) => void (holder = startedHolder),
+    err: (error) =>
+      void (startFailure = serverFailureWithMessage(
         "acquire database lock",
         `Failed to start database lock holder for '${lockPath}'; ensure 'flock' is installed`,
-        started.error,
-      ),
-    );
-  }
-  const holder = started.value;
+        error,
+      )),
+  });
+  if (startFailure !== undefined) return Result.err(startFailure);
 
   const reader = holder.stdout.getReader();
   const handshake = await captureServerOperation("database lock handshake", async () => {
@@ -252,19 +260,31 @@ export async function acquireDatabaseLockResult(
   });
   reader.releaseLock();
 
-  if (handshake.status === "error" || handshake.value !== FLOCK_READY_BYTE) {
+  let handshakeValue: number | undefined;
+  let handshakeFailure: MiniLilacServerFailure | undefined;
+  handshake.match({
+    ok: (value) => void (handshakeValue = value),
+    err: (error) => void (handshakeFailure = error),
+  });
+  if (handshakeFailure !== undefined || handshakeValue !== FLOCK_READY_BYTE) {
     holder.stdin.end();
     const settled = await captureServerOperation("database lock holder exit", async () =>
       Promise.all([holder.exited, new Response(holder.stderr).text()]),
     );
-    if (settled.status === "error") return Result.err(settled.error);
-    const [exitCode, stderr] = settled.value;
+    let settlement!: [number, string];
+    let settlementFailure: MiniLilacServerFailure | undefined;
+    settled.match({
+      ok: (value) => void (settlement = value),
+      err: (error) => void (settlementFailure = error),
+    });
+    if (settlementFailure !== undefined) return Result.err(settlementFailure);
+    const [exitCode, stderr] = settlement;
     if (exitCode === FLOCK_CONTENTION_EXIT_CODE) {
       return Result.err(
         serverFailureWithMessage(
           "acquire database lock",
           `Mini Lilac is already using database '${resolvedDatabasePath}'`,
-          handshake.status === "error" ? handshake.error : undefined,
+          handshakeFailure,
         ),
       );
     }
@@ -275,7 +295,7 @@ export async function acquireDatabaseLockResult(
         `Failed to acquire database lock '${lockPath}' (flock exited with code ${exitCode})${
           detail ? `: ${detail}` : ""
         }`,
-        handshake.status === "error" ? handshake.error : undefined,
+        handshakeFailure,
       ),
     );
   }
@@ -287,22 +307,25 @@ export async function acquireDatabaseLockResult(
       releasePromise ??= (async () => {
         holder.stdin.end();
         const exited = await captureServerOperation("release database lock", () => holder.exited);
-        if (exited.status === "error") {
-          return Result.err(
-            cleanupFailureWithMessage(
-              "release database lock",
-              `Failed to release database lock '${lockPath}'`,
-              exited.error,
+        return exited.match({
+          ok: (exitCode) =>
+            exitCode === 0
+              ? Result.ok(undefined)
+              : Result.err(
+                  cleanupFailureWithMessage(
+                    "release database lock",
+                    `Failed to release database lock '${lockPath}' (flock exited with code ${exitCode})`,
+                  ),
+                ),
+          err: (error) =>
+            Result.err(
+              cleanupFailureWithMessage(
+                "release database lock",
+                `Failed to release database lock '${lockPath}'`,
+                error,
+              ),
             ),
-          );
-        }
-        if (exited.value === 0) return Result.ok(undefined);
-        return Result.err(
-          cleanupFailureWithMessage(
-            "release database lock",
-            `Failed to release database lock '${lockPath}' (flock exited with code ${exited.value})`,
-          ),
-        );
+        });
       })();
       return releasePromise;
     },
@@ -315,10 +338,18 @@ export async function acquireDatabaseLockResult(
 
 export async function acquireDatabaseLock(databasePath: string): Promise<MiniLilacDatabaseLock> {
   const result = await acquireDatabaseLockResult(databasePath);
-  if (result.status === "ok") return result.value;
-  throw new MiniLilacDatabaseLockError(result.error.message, databaseLockPath(databasePath), {
-    cause: result.error,
+  let lock!: MiniLilacDatabaseLock;
+  let failure: MiniLilacServerFailure | undefined;
+  result.match({
+    ok: (value) => void (lock = value),
+    err: (error) => void (failure = error),
   });
+  if (failure !== undefined) {
+    throw new MiniLilacDatabaseLockError(failure.message, databaseLockPath(databasePath), {
+      cause: failure,
+    });
+  }
+  return lock;
 }
 
 export type MiniLilacShutdownOptions = {
@@ -509,16 +540,19 @@ export async function shutdownMiniLilacServerResult(
 
   if (operation.kind === "panic") rethrowPanic(operation.panic);
   if (cleanup.kind === "panic") rethrowPanic(cleanup.panic);
-  if (operation.result.status === "ok") return cleanup.result;
-  if (cleanup.result.status === "ok") return Result.err(operation.result.error);
-  return Result.err(
-    combineLifecycleFailureWithCleanup(operation.result.error, cleanup.result.error),
-  );
+  return operation.result.match<ResultType<void, MiniLilacLifecycleFailure>>({
+    ok: () => cleanup.result,
+    err: (operationError) =>
+      cleanup.result.match<ResultType<void, MiniLilacLifecycleFailure>>({
+        ok: () => Result.err(operationError),
+        err: (cleanupError) =>
+          Result.err(combineLifecycleFailureWithCleanup(operationError, cleanupError)),
+      }),
+  });
 }
 
 export async function shutdownMiniLilacServer(options: MiniLilacShutdownOptions): Promise<void> {
-  const result = await shutdownMiniLilacServerResult(options);
-  if (result.status === "error") throw result.error;
+  adaptLifecycleResultToHost(await shutdownMiniLilacServerResult(options));
 }
 
 export async function shutdownMiniLilacServerAndReleaseLockResult(
@@ -534,11 +568,15 @@ export async function shutdownMiniLilacServerAndReleaseLockResult(
 
   if (shutdown.kind === "panic") rethrowPanic(shutdown.panic);
   if (lockCleanup.kind === "panic") rethrowPanic(lockCleanup.panic);
-  if (shutdown.result.status === "ok") return lockCleanup.result;
-  if (lockCleanup.result.status === "ok") return Result.err(shutdown.result.error);
-  return Result.err(
-    combineLifecycleFailureWithCleanup(shutdown.result.error, lockCleanup.result.error),
-  );
+  return shutdown.result.match<ResultType<void, MiniLilacLifecycleFailure>>({
+    ok: () => lockCleanup.result,
+    err: (shutdownError) =>
+      lockCleanup.result.match<ResultType<void, MiniLilacLifecycleFailure>>({
+        ok: () => Result.err(shutdownError),
+        err: (cleanupError) =>
+          Result.err(combineLifecycleFailureWithCleanup(shutdownError, cleanupError)),
+      }),
+  });
 }
 
 const serveOptionsSchema = z.object({
@@ -656,19 +694,23 @@ export function parseCliArgsResult(
         strict: true,
       }),
     );
-    if (parsed.status === "error") return Result.err(parsed.error);
-    if (parsed.value.values.status && parsed.value.values.logout) {
-      return Result.err(
-        serverFailureWithMessage("parse Mini Lilac CLI", "Choose only one of --status or --logout"),
-      );
-    }
-    let action: "login" | "logout" | "status" = "login";
-    if (parsed.value.values.status) action = "status";
-    else if (parsed.value.values.logout) action = "logout";
-    return decodeMiniLilacCliOptions(authOptionsSchema, {
-      command: "auth",
-      provider,
-      action,
+    return parsed.andThen(({ values }) => {
+      if (values.status && values.logout) {
+        return Result.err(
+          serverFailureWithMessage(
+            "parse Mini Lilac CLI",
+            "Choose only one of --status or --logout",
+          ),
+        );
+      }
+      let action: "login" | "logout" | "status" = "login";
+      if (values.status) action = "status";
+      else if (values.logout) action = "logout";
+      return decodeMiniLilacCliOptions(authOptionsSchema, {
+        command: "auth",
+        provider,
+        action,
+      });
     });
   }
   if (args[0] === "init") {
@@ -680,11 +722,12 @@ export function parseCliArgsResult(
         strict: true,
       }),
     );
-    if (parsed.status === "error") return Result.err(parsed.error);
-    return decodeMiniLilacCliOptions(initOptionsSchema, {
-      command: "init",
-      force: parsed.value.values.force,
-    });
+    return parsed.andThen(({ values }) =>
+      decodeMiniLilacCliOptions(initOptionsSchema, {
+        command: "init",
+        force: values.force,
+      }),
+    );
   }
   if (args[0] === "history-recovery") {
     const action = args[1];
@@ -700,29 +743,30 @@ export function parseCliArgsResult(
         strict: true,
       }),
     );
-    if (parsed.status === "error") return Result.err(parsed.error);
-    if (action === "status" && parsed.value.values["acknowledge-partial-worktree"]) {
-      return Result.err(
-        serverFailureWithMessage(
-          "parse Mini Lilac CLI",
-          "--acknowledge-partial-worktree is valid only with abandon",
-        ),
-      );
-    }
-    if (action === "abandon" && !parsed.value.values["acknowledge-partial-worktree"]) {
-      return Result.err(
-        serverFailureWithMessage(
-          "parse Mini Lilac CLI",
-          "history-recovery abandon requires --acknowledge-partial-worktree",
-        ),
-      );
-    }
-    return decodeMiniLilacCliOptions(historyRecoveryOptionsSchema, {
-      command: "history-recovery",
-      action,
-      workspace: parsed.value.values.workspace,
-      database: parsed.value.values.database,
-      acknowledgePartialWorktree: parsed.value.values["acknowledge-partial-worktree"],
+    return parsed.andThen(({ values }) => {
+      if (action === "status" && values["acknowledge-partial-worktree"]) {
+        return Result.err(
+          serverFailureWithMessage(
+            "parse Mini Lilac CLI",
+            "--acknowledge-partial-worktree is valid only with abandon",
+          ),
+        );
+      }
+      if (action === "abandon" && !values["acknowledge-partial-worktree"]) {
+        return Result.err(
+          serverFailureWithMessage(
+            "parse Mini Lilac CLI",
+            "history-recovery abandon requires --acknowledge-partial-worktree",
+          ),
+        );
+      }
+      return decodeMiniLilacCliOptions(historyRecoveryOptionsSchema, {
+        command: "history-recovery",
+        action,
+        workspace: values.workspace,
+        database: values.database,
+        acknowledgePartialWorktree: values["acknowledge-partial-worktree"],
+      });
     });
   }
 
@@ -737,11 +781,12 @@ export function parseCliArgsResult(
       strict: true,
     }),
   );
-  if (parsed.status === "error") return Result.err(parsed.error);
-  return decodeMiniLilacCliOptions(serveOptionsSchema, {
-    command: "serve",
-    ...parsed.value.values,
-  });
+  return parsed.andThen(({ values }) =>
+    decodeMiniLilacCliOptions(serveOptionsSchema, {
+      command: "serve",
+      ...values,
+    }),
+  );
 }
 
 export function parseCliArgs(args: readonly string[]): MiniLilacServerCliOptions {
@@ -804,22 +849,35 @@ async function canonicalWorkspaceResult(
   const canonical = await captureServerOperation("resolve recovery workspace", () =>
     realpath(workspace),
   );
-  if (canonical.status === "error") {
-    const code = canonical.error.code;
+  let canonicalPath!: string;
+  let canonicalFailure: MiniLilacServerFailure | undefined;
+  canonical.match({
+    ok: (value) => void (canonicalPath = value),
+    err: (error) => void (canonicalFailure = error),
+  });
+  if (canonicalFailure !== undefined) {
+    const code = canonicalFailure.code;
     if (code === "ENOENT" || code === "ENOTDIR") return Result.ok(path.resolve(workspace));
-    return Result.err(canonical.error);
+    return Result.err(canonicalFailure);
   }
   const metadata = await captureServerOperation("inspect recovery workspace", () =>
-    stat(canonical.value),
+    stat(canonicalPath),
   );
-  if (metadata.status === "error") return Result.err(metadata.error);
-  if (metadata.value.isDirectory()) return Result.ok(canonical.value);
-  return Result.err(
-    serverFailureWithMessage(
-      "inspect recovery workspace",
-      `Workspace '${workspace}' is not a directory`,
-    ),
-  );
+  let metadataValue!: Awaited<ReturnType<typeof stat>>;
+  let metadataFailure: MiniLilacServerFailure | undefined;
+  metadata.match({
+    ok: (value) => void (metadataValue = value),
+    err: (error) => void (metadataFailure = error),
+  });
+  if (metadataFailure !== undefined) return Result.err(metadataFailure);
+  return metadataValue.isDirectory()
+    ? Result.ok(canonicalPath)
+    : Result.err(
+        serverFailureWithMessage(
+          "inspect recovery workspace",
+          `Workspace '${workspace}' is not a directory`,
+        ),
+      );
 }
 
 function recoveryWorkspace(
@@ -842,13 +900,20 @@ async function runHistoryRecoveryOperation(
   let workspace: string | undefined;
   if (cli.workspace !== undefined) {
     const canonical = await canonicalWorkspaceResult(cli.workspace);
-    if (canonical.status === "error") return Result.err(canonical.error);
-    workspace = canonical.value;
+    let canonicalFailure: MiniLilacServerFailure | undefined;
+    canonical.match({
+      ok: (value) => void (workspace = value),
+      err: (error) => void (canonicalFailure = error),
+    });
+    if (canonicalFailure !== undefined) return Result.err(canonicalFailure);
   }
   const databaseMetadata = await captureServerOperation("inspect recovery database", () =>
     stat(databasePath),
   );
-  const databaseExists = databaseMetadata.status === "ok" && databaseMetadata.value.isFile();
+  const databaseExists = databaseMetadata.match({
+    ok: (metadata) => metadata.isFile(),
+    err: () => false,
+  });
   if (!databaseExists) {
     if (cli.action === "abandon") {
       return Result.err(
@@ -956,38 +1021,50 @@ export async function runHistoryRecoveryCommandResult(
 ): Promise<ResultType<MiniLilacHistoryRecoveryCommandResult, MiniLilacLifecycleFailure>> {
   const databasePath = path.resolve(cli.database ?? options.defaultDatabasePath);
   const acquired = await acquireDatabaseLockResult(databasePath);
-  if (acquired.status === "error") return Result.err(acquired.error);
-  const lock = acquired.value;
+  let lock!: MiniLilacDatabaseLock;
+  let acquireFailure: MiniLilacServerFailure | undefined;
+  acquired.match({
+    ok: (value) => void (lock = value),
+    err: (error) => void (acquireFailure = error),
+  });
+  if (acquireFailure !== undefined) return Result.err(acquireFailure);
   const storeOwner: { store?: MiniLilacSqliteStore } = {};
   const captured = await captureServerOperation("run history recovery command", () =>
     runHistoryRecoveryOperation(cli, options, storeOwner),
   );
-  const operation = captured.status === "error" ? Result.err(captured.error) : captured.value;
+  const operation = captured.andThen((result) => result);
 
   let cleanupError: MiniLilacCleanupFailure | undefined;
   if (storeOwner.store !== undefined) {
     const storeCleanup = await captureServerCleanup("close history recovery store", () =>
       storeOwner.store?.close(),
     );
-    if (storeCleanup.status === "error") cleanupError = storeCleanup.error;
+    storeCleanup.match({
+      ok: () => {},
+      err: (error) => void (cleanupError = error),
+    });
   }
   const lockCleanup = await lock.releaseResult();
-  if (lockCleanup.status === "error") {
-    cleanupError = combineCleanupFailures(cleanupError, lockCleanup.error);
-  }
+  lockCleanup.match({
+    ok: () => {},
+    err: (error) => void (cleanupError = combineCleanupFailures(cleanupError, error)),
+  });
 
-  if (operation.status === "ok") {
-    if (cleanupError === undefined) return Result.ok(operation.value);
-    return Result.err(cleanupError);
-  }
-  if (cleanupError === undefined) return Result.err(operation.error);
-  return Result.err(
-    new MiniLilacServerOperationAndCleanupFailure({
-      operationError: operation.error,
-      cleanupError,
-      message: `${operation.error.message}; cleanup also failed: ${cleanupError.message}`,
-    }),
-  );
+  return operation.match<
+    ResultType<MiniLilacHistoryRecoveryCommandResult, MiniLilacLifecycleFailure>
+  >({
+    ok: (value) => (cleanupError === undefined ? Result.ok(value) : Result.err(cleanupError)),
+    err: (operationError) =>
+      cleanupError === undefined
+        ? Result.err(operationError)
+        : Result.err(
+            new MiniLilacServerOperationAndCleanupFailure({
+              operationError,
+              cleanupError,
+              message: `${operationError.message}; cleanup also failed: ${cleanupError.message}`,
+            }),
+          ),
+  });
 }
 
 export async function runHistoryRecoveryCommand(
@@ -1036,7 +1113,12 @@ export async function initializeMiniLilacStateResult(
       await chmod(paths.workspaceHistoryDirectory, 0o700);
     },
   );
-  if (directories.status === "error") return Result.err(directories.error);
+  let directoryFailure: MiniLilacServerFailure | undefined;
+  directories.match({
+    ok: () => {},
+    err: (error) => void (directoryFailure = error),
+  });
+  if (directoryFailure !== undefined) return Result.err(directoryFailure);
 
   const files = [
     { path: paths.configFile, contents: runtimeConfigTemplate },
@@ -1053,21 +1135,19 @@ export async function initializeMiniLilacStateResult(
       });
       await chmod(file.path, 0o600);
     });
-    if (written.status === "ok") {
-      results.push({ path: file.path, status: "written" });
-      continue;
-    }
-    if (!options.force && written.error.code === "EEXIST") {
-      results.push({ path: file.path, status: "skipped" });
-      continue;
-    }
-    return Result.err(
-      serverFailureWithMessage(
-        "initialize Mini Lilac file",
-        `Failed to initialize '${file.path}': ${written.error.message}`,
-        written.error,
-      ),
-    );
+    const decision = written.match<MiniLilacInitFileResult | MiniLilacServerFailure>({
+      ok: () => ({ path: file.path, status: "written" }),
+      err: (error) =>
+        !options.force && error.code === "EEXIST"
+          ? { path: file.path, status: "skipped" }
+          : serverFailureWithMessage(
+              "initialize Mini Lilac file",
+              `Failed to initialize '${file.path}': ${error.message}`,
+              error,
+            ),
+    });
+    if (decision instanceof MiniLilacServerFailure) return Result.err(decision);
+    results.push(decision);
   }
   return Result.ok(results);
 }
@@ -1113,8 +1193,13 @@ export async function runAuthCommandResult(
   }
 
   const started = await captureServerOperation("start Codex OAuth login", dependencies.startLogin);
-  if (started.status === "error") return Result.err(started.error);
-  const login = started.value;
+  let login!: CodexOAuthLoginWithResult;
+  let startFailure: MiniLilacServerFailure | undefined;
+  started.match({
+    ok: (value) => void (login = value),
+    err: (error) => void (startFailure = error),
+  });
+  if (startFailure !== undefined) return Result.err(startFailure);
   const operation = await captureServerOperation("complete Codex OAuth login", async () => {
     dependencies.log(`Open this URL to authorize Codex:\n${login.authorizeUrl}`);
     dependencies.log(`Tokens will be stored at ${login.storagePath}`);
@@ -1127,28 +1212,28 @@ export async function runAuthCommandResult(
     );
   });
   const cleanup = await captureServerCleanup("close Codex OAuth login", login.close);
-  if (operation.status === "ok") {
-    if (cleanup.status === "ok") return Result.ok(undefined);
-    return Result.err(cleanup.error);
-  }
-  if (cleanup.status === "ok") return Result.err(operation.error);
-  return Result.err(
-    new MiniLilacServerOperationAndCleanupFailure({
-      operationError: operation.error,
-      cleanupError: cleanup.error,
-      message: `${operation.error.message}; cleanup also failed: ${cleanup.error.message}`,
-    }),
-  );
+  return operation.match<ResultType<void, MiniLilacLifecycleFailure>>({
+    ok: () => cleanup,
+    err: (operationError) =>
+      cleanup.match<ResultType<void, MiniLilacLifecycleFailure>>({
+        ok: () => Result.err(operationError),
+        err: (cleanupError) =>
+          Result.err(
+            new MiniLilacServerOperationAndCleanupFailure({
+              operationError,
+              cleanupError,
+              message: `${operationError.message}; cleanup also failed: ${cleanupError.message}`,
+            }),
+          ),
+      }),
+  });
 }
 
 export async function runAuthCommand(
   cli: z.infer<typeof authOptionsSchema>,
   dependencies: MiniLilacAuthDependencies = createMiniLilacAuthDependencies(),
 ): Promise<void> {
-  const result = await runAuthCommandResult(cli, dependencies);
-  if (result.status === "error") {
-    adaptLifecycleResultToHost(result);
-  }
+  adaptLifecycleResultToHost(await runAuthCommandResult(cli, dependencies));
 }
 
 export async function superviseMiniLilacSignalShutdown(
@@ -1166,8 +1251,13 @@ export async function superviseMiniLilacSignalShutdown(
     markFailed();
     return;
   }
-  if (settled.result.status === "error") {
-    logError(`Mini Lilac shutdown failed: ${settled.result.error.message}`);
+  let shutdownFailure: MiniLilacLifecycleFailure | undefined;
+  settled.result.match({
+    ok: () => {},
+    err: (error) => void (shutdownFailure = error),
+  });
+  if (shutdownFailure !== undefined) {
+    logError(`Mini Lilac shutdown failed: ${shutdownFailure.message}`);
     markFailed();
   }
 }
@@ -1178,8 +1268,13 @@ async function runServeCommand(
 ): Promise<ResultType<void, MiniLilacLifecycleFailure>> {
   const databasePath = path.resolve(cli.database ?? statePaths.databaseFile);
   const acquired = await acquireDatabaseLockResult(databasePath);
-  if (acquired.status === "error") return Result.err(acquired.error);
-  const databaseLock = acquired.value;
+  let databaseLock!: MiniLilacDatabaseLock;
+  let acquireFailure: MiniLilacServerFailure | undefined;
+  acquired.match({
+    ok: (lock) => void (databaseLock = lock),
+    err: (error) => void (acquireFailure = error),
+  });
+  if (acquireFailure !== undefined) return Result.err(acquireFailure);
   let sessionService: SessionService | undefined;
   let stopListener: (() => Promise<void>) | undefined;
 
@@ -1280,7 +1375,12 @@ async function runServeCommand(
     process.once("SIGTERM", handleSignal);
   });
 
-  if (startup.status === "ok") return Result.ok(undefined);
+  let startupFailure: MiniLilacServerFailure | undefined;
+  startup.match({
+    ok: () => {},
+    err: (error) => void (startupFailure = error),
+  });
+  if (startupFailure === undefined) return Result.ok(undefined);
 
   let cleanupError: MiniLilacCleanupFailure | undefined;
   let cleanupPanic: Panic | undefined;
@@ -1289,9 +1389,10 @@ async function runServeCommand(
       cleanupPanic ??= settled.panic;
       return;
     }
-    if (settled.result.status === "error") {
-      cleanupError = combineCleanupFailures(cleanupError, settled.result.error);
-    }
+    settled.result.match({
+      ok: () => {},
+      err: (error) => void (cleanupError = combineCleanupFailures(cleanupError, error)),
+    });
   };
   if (stopListener !== undefined) {
     collectCleanup(await settleCleanupEffect("stop Mini Lilac listener", stopListener));
@@ -1302,7 +1403,10 @@ async function runServeCommand(
       runtime.shutdown({ graceMs: SHUTDOWN_GRACE_MS }),
     );
     collectCleanup(runtimeCleanup);
-    if (runtimeCleanup.kind === "panic" || runtimeCleanup.result.status === "error") {
+    const closeRuntime =
+      runtimeCleanup.kind === "panic" ||
+      runtimeCleanup.result.match({ ok: () => false, err: () => true });
+    if (closeRuntime) {
       collectCleanup(await settleCleanupEffect("close Mini Lilac runtime", () => runtime.close()));
     }
   }
@@ -1310,8 +1414,8 @@ async function runServeCommand(
     await settleCleanupResult("release database lock", () => databaseLock.releaseResult()),
   );
   if (cleanupPanic !== undefined) rethrowPanic(cleanupPanic);
-  if (cleanupError === undefined) return Result.err(startup.error);
-  return Result.err(combineLifecycleFailureWithCleanup(startup.error, cleanupError));
+  if (cleanupError === undefined) return Result.err(startupFailure);
+  return Result.err(combineLifecycleFailureWithCleanup(startupFailure, cleanupError));
 }
 
 export async function mainResult(
@@ -1320,8 +1424,13 @@ export async function mainResult(
   options: { readonly statePaths?: MiniLilacStatePaths } = {},
 ): Promise<ResultType<void, MiniLilacLifecycleFailure>> {
   const parsed = parseCliArgsResult(args);
-  if (parsed.status === "error") return Result.err(parsed.error);
-  const cli = parsed.value;
+  let cli!: MiniLilacServerCliOptions;
+  let parseFailure: MiniLilacServerFailure | undefined;
+  parsed.match({
+    ok: (value) => void (cli = value),
+    err: (error) => void (parseFailure = error),
+  });
+  if (parseFailure !== undefined) return Result.err(parseFailure);
   const statePaths = options.statePaths ?? miniLilacStatePaths();
   if (cli.command === "help") {
     console.log(MINI_LILAC_SERVER_HELP);
@@ -1335,8 +1444,14 @@ export async function mainResult(
   }
   if (cli.command === "init") {
     const initialized = await initializeMiniLilacStateResult(statePaths, { force: cli.force });
-    if (initialized.status === "error") return Result.err(initialized.error);
-    for (const result of initialized.value) {
+    let initResults: readonly MiniLilacInitFileResult[] = [];
+    let initFailure: MiniLilacServerFailure | undefined;
+    initialized.match({
+      ok: (results) => void (initResults = results),
+      err: (error) => void (initFailure = error),
+    });
+    if (initFailure !== undefined) return Result.err(initFailure);
+    for (const result of initResults) {
       console.log(
         result.status === "written"
           ? `Wrote ${result.path}`
@@ -1349,7 +1464,7 @@ export async function mainResult(
     const recovered = await runHistoryRecoveryCommandResult(cli, {
       defaultDatabasePath: statePaths.databaseFile,
     });
-    return recovered.status === "ok" ? Result.ok(undefined) : Result.err(recovered.error);
+    return recovered.map(() => undefined);
   }
   return runServeCommand(cli, statePaths);
 }

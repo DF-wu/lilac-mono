@@ -76,7 +76,11 @@ export async function readTerminalPalette(
 
 export async function readTerminalTheme(renderer: TerminalPaletteReader): Promise<ThemeColors> {
   const palette = await readTerminalPalette(renderer);
-  return palette.status === "ok" ? createTerminalTheme(palette.value) : COLORS;
+  const create = palette.match<() => ThemeColors>({
+    ok: (value) => () => createTerminalTheme(value),
+    err: () => () => COLORS,
+  });
+  return create();
 }
 
 export function setTerminalBackground(
@@ -139,16 +143,17 @@ export function requestTerminalRendererShutdown(
   } finally {
     settle();
   }
-  if (attempted.status === "error") {
-    return {
+  return attempted.match<TerminalShutdownOutcome>({
+    err: (error) => ({
       kind: "defect",
-      defect: attempted.error.kind === "panic" ? attempted.error.panic : attempted.error.cause,
-    };
-  }
-  if (attempted.value.status === "error") {
-    return { kind: "failure", error: attempted.value.error };
-  }
-  return { kind: "success" };
+      defect: error.kind === "panic" ? error.panic : error.cause,
+    }),
+    ok: (result) =>
+      result.match<TerminalShutdownOutcome>({
+        ok: () => ({ kind: "success" }),
+        err: (error) => ({ kind: "failure", error }),
+      }),
+  });
 }
 
 /** Resolve the retained shutdown outcome after the renderer wait has completed. */
@@ -174,32 +179,37 @@ export async function runWithOwnedTerminalRenderer<T>(
     try: operation,
     catch: captureTuiFailure,
   });
-  if (attempted.status === "error") {
-    if (!renderer.isDestroyed) {
-      Result.try({
-        try: () => destroyTerminalRenderer(renderer),
-        catch: () => undefined,
-      });
-    }
-    return signalTuiDefect(
-      attempted.error.kind === "panic" ? attempted.error.panic : attempted.error.cause,
-    );
-  }
-  const work = attempted.value;
+  const resolveWork = attempted.match<() => ResultType<T, TerminalRuntimeFailed>>({
+    ok: (value) => () => value,
+    err: (error) => () => {
+      if (!renderer.isDestroyed) {
+        Result.try({
+          try: () => destroyTerminalRenderer(renderer),
+          catch: () => undefined,
+        });
+      }
+      return signalTuiDefect(error.kind === "panic" ? error.panic : error.cause);
+    },
+  });
+  const work = resolveWork();
 
   if (renderer.isDestroyed) return work;
   const cleanup = destroyTerminalRenderer(renderer);
-  if (cleanup.status === "ok") return work;
-  if (work.status === "error") {
-    return Result.err(
-      new TerminalOperationAndCleanupFailed({
-        operation: work.error,
-        cleanup: cleanup.error,
-        message: `${work.error.message}; ${cleanup.error.message}`,
+  return cleanup.match<ResultType<T, TerminalRuntimeFailed | TerminalOperationAndCleanupFailed>>({
+    ok: () => work,
+    err: (cleanupError) =>
+      work.match<ResultType<T, TerminalRuntimeFailed | TerminalOperationAndCleanupFailed>>({
+        ok: () => Result.err(cleanupError),
+        err: (operationError) =>
+          Result.err(
+            new TerminalOperationAndCleanupFailed({
+              operation: operationError,
+              cleanup: cleanupError,
+              message: `${operationError.message}; ${cleanupError.message}`,
+            }),
+          ),
       }),
-    );
-  }
-  return Result.err(cleanup.error);
+  });
 }
 
 /** Top-level host adapter classifies defects before mapping them to the process exit contract. */
@@ -210,13 +220,17 @@ export async function runTerminalEntrypoint(
     try: operation,
     catch: captureTuiFailure,
   });
-  if (captured.status === "ok") return Result.ok(captured.value);
-  const cause = captured.error.kind === "panic" ? captured.error.panic : captured.error.cause;
-  return Result.err(
-    new TerminalRuntimeFailed({
-      operation: "entrypoint",
-      cause,
-      message: Panic.is(cause) ? cause.message : "Mini Lilac terminal entrypoint failed",
-    }),
-  );
+  return captured.match<ResultType<number, TerminalRuntimeFailed>>({
+    ok: (value) => Result.ok(value),
+    err: (error) => {
+      const cause = error.kind === "panic" ? error.panic : error.cause;
+      return Result.err(
+        new TerminalRuntimeFailed({
+          operation: "entrypoint",
+          cause,
+          message: Panic.is(cause) ? cause.message : "Mini Lilac terminal entrypoint failed",
+        }),
+      );
+    },
+  });
 }

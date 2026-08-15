@@ -4124,6 +4124,59 @@ describe("SessionService", () => {
     service.close();
   });
 
+  it("cancels manual compaction when an aborted provider rejects an ordinary Error", async () => {
+    const providerReached = Promise.withResolvers<void>();
+    const summaryModel = new MockLanguageModelV4({
+      doStream: async ({ abortSignal }) => {
+        if (abortSignal === undefined) throw new Error("Expected compaction abort signal");
+        const aborted = new Promise<void>((resolve) => {
+          if (abortSignal.aborted) resolve();
+          else abortSignal.addEventListener("abort", () => resolve(), { once: true });
+        });
+        providerReached.resolve();
+        await aborted;
+        throw new Error("Provider rejected after cancellation");
+      },
+    });
+    const directory = await mkdtemp(path.join(tmpdir(), "mini-lilac-compact-error-cancel-"));
+    temporaryDirectories.push(directory);
+    const service = new SessionService({
+      config: config(),
+      databasePath: path.join(directory, "runtime.sqlite"),
+      modelResolver: () => summaryModel,
+      modelLimitsResolver: async () => ({ context: 10_000, output: 1_000 }),
+    });
+    const session = await service.createSession({ cwd: directory, model: "test/mock" });
+    seedCompletedHistory(
+      service.store,
+      session.id,
+      [
+        { role: "user", content: `old request ${"a".repeat(6_000)}` },
+        { role: "assistant", content: `old answer ${"b".repeat(6_000)}` },
+        { role: "user", content: "latest request must remain" },
+      ],
+      [userMessage("old request"), userMessage("latest request must remain")],
+    );
+    const before = service.store.getModelMessages(session.id);
+
+    const started = await service.compact({
+      sessionId: session.id,
+      clientCommandId: "compact-provider-error-cancelled",
+    });
+    await providerReached.promise;
+    expect(await service.cancelCompaction({ sessionId: session.id })).toEqual({
+      status: "cancelling",
+    });
+    const events = (await collect(started.stream)).flatMap((chunk) =>
+      chunk.type === "data-compaction" ? [chunk.data] : [],
+    );
+
+    expect(events.at(-1)?.phase).toBe("cancelled");
+    expect(service.store.getModelMessages(session.id)).toEqual(before);
+    expect(service.getSnapshot(session.id).status).toBe("idle");
+    service.close();
+  });
+
   it("commits compaction and the idle transition in one store transaction", async () => {
     const summaryModel = new MockLanguageModelV4({
       doStream: async () => textResult("summary", "Condensed prior context."),

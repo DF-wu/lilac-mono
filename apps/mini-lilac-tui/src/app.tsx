@@ -1172,16 +1172,22 @@ export function MiniLilacApp(props: MiniLilacAppProps) {
         props.transport.getMessagesResult(subagent.sessionId, { signal: abortController.signal }),
         props.transport.getSessionResult(subagent.sessionId, { signal: abortController.signal }),
       ]);
-      if (messagesResult.status === "error") {
-        fail(messagesResult.error);
-        return;
-      }
-      if (snapshotResult.status === "error") {
-        fail(snapshotResult.error);
-        return;
-      }
-      const messages = messagesResult.value;
-      const snapshot = snapshotResult.value;
+      const messages = messagesResult.match({
+        ok: (value) => value,
+        err: (error) => {
+          fail(error);
+          return undefined;
+        },
+      });
+      if (messages === undefined) return;
+      const snapshot = snapshotResult.match({
+        ok: (value) => value,
+        err: (error) => {
+          fail(error);
+          return undefined;
+        },
+      });
+      if (snapshot === undefined) return;
       const canonicalEntries = renderInitialMessages(messages, { cwd: props.cwd });
       latestEntries = canonicalEntries;
       setSubagentView((current) =>
@@ -1232,27 +1238,42 @@ export function MiniLilacApp(props: MiniLilacAppProps) {
       const streamResult = await props.transport.streamSessionResult(subagent.sessionId, {
         signal: abortController.signal,
       });
-      if (streamResult.status === "error") {
-        fail(streamResult.error);
-        return;
-      }
-      const stream = streamResult.value;
+      const stream = streamResult.match({
+        ok: (value) => value,
+        err: (error) => {
+          fail(error);
+          return undefined;
+        },
+      });
+      if (stream === undefined) return;
       if (stream === null) continue;
       const reader = stream.getReader();
       while (generation === subagentOpenGeneration) {
         const read = await readTerminalStream(reader);
-        if (read.status === "error") {
-          fail(read.error);
+        const streamRead = read.match({
+          ok: (value) => value,
+          err: (error) => {
+            fail(error);
+            return undefined;
+          },
+        });
+        if (streamRead === undefined) {
           releaseTerminalStreamLock(reader);
           return;
         }
-        if (read.value.done) break;
-        if (read.value.value.status === "error") {
-          fail(read.value.value.error);
+        if (streamRead.done) break;
+        const chunk = streamRead.value.match({
+          ok: (value) => value,
+          err: (error) => {
+            fail(error);
+            return undefined;
+          },
+        });
+        if (chunk === undefined) {
           releaseTerminalStreamLock(reader);
           return;
         }
-        const projected = projectMiniLilacStreamChunk(read.value.value.value, streamProjection);
+        const projected = projectMiniLilacStreamChunk(chunk, streamProjection);
         switch (projected.kind) {
           case "finish":
             renderer.handleProjected({ kind: "rendered", chunk: projected.chunk });
@@ -1304,11 +1325,14 @@ export function MiniLilacApp(props: MiniLilacAppProps) {
     closePalette();
     showNotice("loading sessions");
     const listed = await props.transport.listSessionsResult(props.cwd);
-    if (listed.status === "error") {
-      showNotice(listed.error.message);
-      return;
-    }
-    const sessions = listed.value.filter((candidate) => candidate.id !== props.sessionId);
+    const sessions = listed.match({
+      ok: (value) => value.filter((candidate) => candidate.id !== props.sessionId),
+      err: (error) => {
+        showNotice(error.message);
+        return undefined;
+      },
+    });
+    if (sessions === undefined) return;
     if (sessions.length === 0) {
       showNotice("no other sessions in this directory");
       return;
@@ -1328,11 +1352,14 @@ export function MiniLilacApp(props: MiniLilacAppProps) {
     showNotice("loading skills");
     const requestedProfile = bindings().profile;
     const listed = await props.transport.listSkillsResult(props.cwd, requestedProfile);
-    if (listed.status === "error") {
-      showNotice(listed.error.message);
-      return;
-    }
-    const skills = listed.value;
+    const skills = listed.match({
+      ok: (value) => value,
+      err: (error) => {
+        showNotice(error.message);
+        return undefined;
+      },
+    });
+    if (skills === undefined) return;
     if (bindings().profile !== requestedProfile) {
       showNotice("profile changed; reopen skills");
       return;
@@ -1400,10 +1427,13 @@ export function MiniLilacApp(props: MiniLilacAppProps) {
     if (current.kind === "sessions") {
       setBindingBusy(true);
       const selected = await props.onSessionSelect(item.id);
-      if (selected.status === "error") {
-        showNotice(selected.error.message);
-        setBindingBusy(false);
-      }
+      selected.match({
+        ok: () => {},
+        err: (error) => {
+          showNotice(error.message);
+          setBindingBusy(false);
+        },
+      });
       return;
     }
     if (current.kind === "skills") {
@@ -1590,15 +1620,18 @@ export function MiniLilacApp(props: MiniLilacAppProps) {
   async function pasteClipboardImage(): Promise<void> {
     const generation = draftGeneration;
     const read = await readClipboardImage();
-    if (read.status === "error") {
-      if (ClipboardImageTooLargeError.is(read.error) && generation === draftGeneration) {
-        showNotice("image exceeds 10 MB");
-      }
-      return;
-    }
-    if (read.value !== undefined && generation === draftGeneration) {
-      attachImage(read.value.bytes, read.value.mediaType);
-    }
+    read.match({
+      ok: (value) => {
+        if (value !== undefined && generation === draftGeneration) {
+          attachImage(value.bytes, value.mediaType);
+        }
+      },
+      err: (error) => {
+        if (ClipboardImageTooLargeError.is(error) && generation === draftGeneration) {
+          showNotice("image exceeds 10 MB");
+        }
+      },
+    });
   }
 
   useKeyboard((event: KeyEvent) => {

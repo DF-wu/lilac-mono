@@ -26,6 +26,6 @@ describe("mini-lilac local install boundaries", () => {
 
   it("signals a typed install failure through the Bun script host contract", () => {
     const error = new NpmPackFailed({ exitCode: 1, message: "npm pack failed" });
-    expect(() => signalLocalInstallFailure(error)).toThrow("npm pack failed");
+    expect(() => signalLocalInstallFailure(error)).toThrow(error);
   });
 });

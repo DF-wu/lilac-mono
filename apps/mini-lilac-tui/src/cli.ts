@@ -101,8 +101,15 @@ export function parseCliOptions(input: ParseCliInput): ResultType<CliOptions, Cl
         message: "Invalid command-line arguments",
       }),
   );
-  if (parsed.status === "error") return Result.err(parsed.error);
-  const values: ParsedCliValues = parsed.value.values;
+  const parsedValue = parsed.match<ReturnType<typeof parseArgs> | CliArgumentsInvalid>({
+    ok: (value) => value,
+    err: (error) => error,
+  });
+  if (CliArgumentsInvalid.is(parsedValue)) return Result.err(parsedValue);
+  const values: ParsedCliValues = {
+    ...parsedValue.values,
+    help: parsedValue.values.help === true,
+  };
 
   const reasoningInput = optional(values.reasoning);
   const reasoning =
@@ -118,8 +125,12 @@ export function parseCliOptions(input: ParseCliInput): ResultType<CliOptions, Cl
   }
 
   const cwd = canonicalCwd(input.cwd);
-  if (cwd.status === "error") {
-    return Result.err(new CliArgumentsInvalid({ cause: cwd.error, message: cwd.error.message }));
+  const cwdValue = cwd.match<string | CanonicalCwdFailed>({
+    ok: (value) => value,
+    err: (error) => error,
+  });
+  if (CanonicalCwdFailed.is(cwdValue)) {
+    return Result.err(new CliArgumentsInvalid({ cause: cwdValue, message: cwdValue.message }));
   }
   return Result.ok({
     server: optional(values.server) ?? DEFAULT_SERVER_URL,
@@ -130,7 +141,7 @@ export function parseCliOptions(input: ParseCliInput): ResultType<CliOptions, Cl
     reasoning,
     // Resolve symlinks as well as relative segments so resumed-session checks
     // and transport binding use one canonical workspace identity.
-    cwd: cwd.value,
+    cwd: cwdValue,
     help: values.help === true,
   });
 }

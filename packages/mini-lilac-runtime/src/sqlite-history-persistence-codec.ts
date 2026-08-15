@@ -520,7 +520,24 @@ export function decodeMiniLilacStructuralHistoryRow(
   input: MiniLilacStructuralHistoryRowCodecInput,
 ): ResultType<DecodedPersistedValue<MiniLilacStructuralHistoryRecord | null>, PersistedDataError> {
   const version = decodeVersion(input);
-  if (version.status === "error") return Result.err(version.error);
+  let $versionResultValue19093!: import("better-result").InferOk<NonNullable<typeof version>>;
+  let $versionResultError19093!: import("better-result").InferErr<NonNullable<typeof version>>;
+  const $versionResultOk19093 = Result.match<
+    import("better-result").InferOk<NonNullable<typeof version>>,
+    import("better-result").InferErr<NonNullable<typeof version>>,
+    boolean
+  >(version, {
+    ok: (value) => {
+      $versionResultValue19093 = value;
+      return true;
+    },
+    err: (error) => {
+      $versionResultError19093 = error;
+      return false;
+    },
+  });
+  if (($versionResultOk19093 ? "ok" : "error") === "error")
+    return Result.err($versionResultError19093);
   if (input.row === null || input.row === undefined) {
     return Result.ok({ value: null, provenance: "missing-defaulted" });
   }
@@ -528,18 +545,18 @@ export function decodeMiniLilacStructuralHistoryRow(
   switch (input.kind) {
     case "store-metadata": {
       const row = historyStoreMetadataRowSchema.safeParse(input.row);
-      if (!row.success) return invalidRow(input, version.value.version);
+      if (!row.success) return invalidRow(input, $versionResultValue19093.version);
       return Result.ok({
         value: {
           kind: input.kind,
           value: { namespaceId: row.data.namespace_id, createdAt: row.data.created_at },
         },
-        provenance: version.value.provenance,
+        provenance: $versionResultValue19093.provenance,
       });
     }
     case "workspace": {
       const row = workspaceRowSchema.safeParse(input.row);
-      if (!row.success) return invalidRow(input, version.value.version);
+      if (!row.success) return invalidRow(input, $versionResultValue19093.version);
       return Result.ok({
         value: {
           kind: input.kind,
@@ -551,12 +568,12 @@ export function decodeMiniLilacStructuralHistoryRow(
             createdAt: row.data.created_at,
           },
         },
-        provenance: version.value.provenance,
+        provenance: $versionResultValue19093.provenance,
       });
     }
     case "workspace-snapshot": {
       const row = workspaceSnapshotRowSchema.safeParse(input.row);
-      if (!row.success) return invalidRow(input, version.value.version);
+      if (!row.success) return invalidRow(input, $versionResultValue19093.version);
       return Result.ok({
         value: {
           kind: input.kind,
@@ -571,12 +588,12 @@ export function decodeMiniLilacStructuralHistoryRow(
             createdAt: row.data.created_at,
           },
         },
-        provenance: version.value.provenance,
+        provenance: $versionResultValue19093.provenance,
       });
     }
     case "state": {
       const row = historyStateRowSchema.safeParse(input.row);
-      if (!row.success) return invalidRow(input, version.value.version);
+      if (!row.success) return invalidRow(input, $versionResultValue19093.version);
       return Result.ok({
         value: {
           kind: input.kind,
@@ -597,18 +614,35 @@ export function decodeMiniLilacStructuralHistoryRow(
             createdAt: row.data.created_at,
           },
         },
-        provenance: version.value.provenance,
+        provenance: $versionResultValue19093.provenance,
       });
     }
     case "transition": {
       const row = historyTransitionRowSchema.safeParse(input.row);
-      if (!row.success) return invalidRow(input, version.value.version);
+      if (!row.success) return invalidRow(input, $versionResultValue19093.version);
       const message = decodeMiniLilacHistoryUserMessage({
         raw: row.data.user_message_json,
-        schemaVersion: version.value.version,
+        schemaVersion: $versionResultValue19093.version,
         recordId: row.data.id,
       });
-      if (message.status === "error") return Result.err(message.error);
+      let $messageResultValue22181!: import("better-result").InferOk<NonNullable<typeof message>>;
+      let $messageResultError22181!: import("better-result").InferErr<NonNullable<typeof message>>;
+      const $messageResultOk22181 = Result.match<
+        import("better-result").InferOk<NonNullable<typeof message>>,
+        import("better-result").InferErr<NonNullable<typeof message>>,
+        boolean
+      >(message, {
+        ok: (value) => {
+          $messageResultValue22181 = value;
+          return true;
+        },
+        err: (error) => {
+          $messageResultError22181 = error;
+          return false;
+        },
+      });
+      if (($messageResultOk22181 ? "ok" : "error") === "error")
+        return Result.err($messageResultError22181);
       return Result.ok({
         value: {
           kind: input.kind,
@@ -620,19 +654,19 @@ export function decodeMiniLilacStructuralHistoryRow(
             kind: row.data.kind,
             delivery: row.data.delivery,
             commandId: row.data.command_id,
-            userMessage: message.value.value,
+            userMessage: $messageResultValue22181.value,
             rootRunId: row.data.root_run_id,
             replayAfterSeq: row.data.replay_after_seq,
             createdAt: row.data.created_at,
             completedAt: row.data.completed_at,
           },
         },
-        provenance: version.value.provenance,
+        provenance: $versionResultValue19093.provenance,
       });
     }
     case "session-history": {
       const row = sessionHistoryRowSchema.safeParse(input.row);
-      if (!row.success) return invalidRow(input, version.value.version);
+      if (!row.success) return invalidRow(input, $versionResultValue19093.version);
       return Result.ok({
         value: {
           kind: input.kind,
@@ -644,12 +678,12 @@ export function decodeMiniLilacStructuralHistoryRow(
             updatedAt: row.data.updated_at,
           },
         },
-        provenance: version.value.provenance,
+        provenance: $versionResultValue19093.provenance,
       });
     }
     case "redo": {
       const row = historyRedoRowSchema.safeParse(input.row);
-      if (!row.success) return invalidRow(input, version.value.version);
+      if (!row.success) return invalidRow(input, $versionResultValue19093.version);
       return Result.ok({
         value: {
           kind: input.kind,
@@ -661,12 +695,12 @@ export function decodeMiniLilacStructuralHistoryRow(
             createdAt: row.data.created_at,
           },
         },
-        provenance: version.value.provenance,
+        provenance: $versionResultValue19093.provenance,
       });
     }
     case "operation": {
       const row = historyOperationRowSchema.safeParse(input.row);
-      if (!row.success) return invalidRow(input, version.value.version);
+      if (!row.success) return invalidRow(input, $versionResultValue19093.version);
       return Result.ok({
         value: {
           kind: input.kind,
@@ -688,39 +722,102 @@ export function decodeMiniLilacStructuralHistoryRow(
             updatedAt: row.data.updated_at,
           },
         },
-        provenance: version.value.provenance,
+        provenance: $versionResultValue19093.provenance,
       });
     }
     case "pending-finalization": {
       const row = pendingRunFinalizationRowSchema.safeParse(input.row);
-      if (!row.success) return invalidRow(input, version.value.version);
+      if (!row.success) return invalidRow(input, $versionResultValue19093.version);
       const terminalResult = decodeMiniLilacSuperJsonPayload({
         raw: row.data.terminal_result_json,
-        schemaVersion: version.value.version,
+        schemaVersion: $versionResultValue19093.version,
         recordId: row.data.run_id,
         field: "pending_finalization",
       });
-      if (terminalResult.status === "error") return Result.err(terminalResult.error);
+      let $terminalResultResultValue25532!: import("better-result").InferOk<
+        NonNullable<typeof terminalResult>
+      >;
+      let $terminalResultResultError25532!: import("better-result").InferErr<
+        NonNullable<typeof terminalResult>
+      >;
+      const $terminalResultResultOk25532 = Result.match<
+        import("better-result").InferOk<NonNullable<typeof terminalResult>>,
+        import("better-result").InferErr<NonNullable<typeof terminalResult>>,
+        boolean
+      >(terminalResult, {
+        ok: (value) => {
+          $terminalResultResultValue25532 = value;
+          return true;
+        },
+        err: (error) => {
+          $terminalResultResultError25532 = error;
+          return false;
+        },
+      });
+      if (($terminalResultResultOk25532 ? "ok" : "error") === "error")
+        return Result.err($terminalResultResultError25532);
       const mainPromotion =
         row.data.claude_binding_promotion_json === null
           ? Result.ok({ value: null, provenance: "missing-defaulted" as const })
           : decodeMiniMainClaudeBindingPromotion({
               raw: row.data.claude_binding_promotion_json,
-              schemaVersion: version.value.version,
+              schemaVersion: $versionResultValue19093.version,
               recordId: row.data.run_id,
               field: "pending_finalization",
             });
-      if (mainPromotion.status === "error") return Result.err(mainPromotion.error);
+      let $mainPromotionResultValue25855!: import("better-result").InferOk<
+        NonNullable<typeof mainPromotion>
+      >;
+      let $mainPromotionResultError25855!: import("better-result").InferErr<
+        NonNullable<typeof mainPromotion>
+      >;
+      const $mainPromotionResultOk25855 = Result.match<
+        import("better-result").InferOk<NonNullable<typeof mainPromotion>>,
+        import("better-result").InferErr<NonNullable<typeof mainPromotion>>,
+        boolean
+      >(mainPromotion, {
+        ok: (value) => {
+          $mainPromotionResultValue25855 = value;
+          return true;
+        },
+        err: (error) => {
+          $mainPromotionResultError25855 = error;
+          return false;
+        },
+      });
+      if (($mainPromotionResultOk25855 ? "ok" : "error") === "error")
+        return Result.err($mainPromotionResultError25855);
       const namedPromotion =
         row.data.named_claude_binding_promotion_json === null
           ? Result.ok({ value: null, provenance: "missing-defaulted" as const })
           : decodeMiniNamedClaudeBindingPromotion({
               raw: row.data.named_claude_binding_promotion_json,
-              schemaVersion: version.value.version,
+              schemaVersion: $versionResultValue19093.version,
               recordId: row.data.run_id,
               field: "pending_finalization",
             });
-      if (namedPromotion.status === "error") return Result.err(namedPromotion.error);
+      let $namedPromotionResultValue26368!: import("better-result").InferOk<
+        NonNullable<typeof namedPromotion>
+      >;
+      let $namedPromotionResultError26368!: import("better-result").InferErr<
+        NonNullable<typeof namedPromotion>
+      >;
+      const $namedPromotionResultOk26368 = Result.match<
+        import("better-result").InferOk<NonNullable<typeof namedPromotion>>,
+        import("better-result").InferErr<NonNullable<typeof namedPromotion>>,
+        boolean
+      >(namedPromotion, {
+        ok: (value) => {
+          $namedPromotionResultValue26368 = value;
+          return true;
+        },
+        err: (error) => {
+          $namedPromotionResultError26368 = error;
+          return false;
+        },
+      });
+      if (($namedPromotionResultOk26368 ? "ok" : "error") === "error")
+        return Result.err($namedPromotionResultError26368);
       const value: MiniLilacPendingRunFinalizationProjection = {
         runId: row.data.run_id,
         sessionId: row.data.session_id,
@@ -731,24 +828,24 @@ export function decodeMiniLilacStructuralHistoryRow(
         runStatus: row.data.run_status,
         sessionStatus: row.data.session_status,
         error: row.data.error,
-        terminalResult: terminalResult.value.value ?? undefined,
+        terminalResult: $terminalResultResultValue25532.value ?? undefined,
         inputTokens: row.data.input_tokens,
         providerState: providerState(
           row.data.last_provider_family,
           row.data.contains_cross_family_turns,
         ),
-        claudeBindingPromotion: mainPromotion.value.value,
-        namedClaudeBindingPromotion: namedPromotion.value.value,
+        claudeBindingPromotion: $mainPromotionResultValue25855.value,
+        namedClaudeBindingPromotion: $namedPromotionResultValue26368.value,
         preparedAt: row.data.prepared_at,
       };
       return Result.ok({
         value: { kind: input.kind, value },
-        provenance: version.value.provenance,
+        provenance: $versionResultValue19093.provenance,
       });
     }
     case "accounting": {
       const row = historyAccountingRowSchema.safeParse(input.row);
-      if (!row.success) return invalidRow(input, version.value.version);
+      if (!row.success) return invalidRow(input, $versionResultValue19093.version);
       return Result.ok({
         value: {
           kind: input.kind,
@@ -762,12 +859,12 @@ export function decodeMiniLilacStructuralHistoryRow(
             pendingFinalizationCount: row.data.pending_finalization_count,
           },
         },
-        provenance: version.value.provenance,
+        provenance: $versionResultValue19093.provenance,
       });
     }
     case "recoverable-open-root-run": {
       const row = recoverableOpenRootRunRowSchema.safeParse(input.row);
-      if (!row.success) return invalidRow(input, version.value.version);
+      if (!row.success) return invalidRow(input, $versionResultValue19093.version);
       return Result.ok({
         value: {
           kind: input.kind,
@@ -779,7 +876,7 @@ export function decodeMiniLilacStructuralHistoryRow(
             inputTokens: row.data.input_tokens,
           },
         },
-        provenance: version.value.provenance,
+        provenance: $versionResultValue19093.provenance,
       });
     }
   }
@@ -806,8 +903,28 @@ export function decodeMiniLilacStructuralHistoryRows<
       schemaVersion: input.schemaVersion,
       recordId,
     });
-    if (decoded.status === "error") return Result.err(decoded.error);
-    if (decoded.value.value === null || decoded.value.value.kind !== input.kind) {
+    let $decodedResultValue29828!: import("better-result").InferOk<NonNullable<typeof decoded>>;
+    let $decodedResultError29828!: import("better-result").InferErr<NonNullable<typeof decoded>>;
+    const $decodedResultOk29828 = Result.match<
+      import("better-result").InferOk<NonNullable<typeof decoded>>,
+      import("better-result").InferErr<NonNullable<typeof decoded>>,
+      boolean
+    >(decoded, {
+      ok: (value) => {
+        $decodedResultValue29828 = value;
+        return true;
+      },
+      err: (error) => {
+        $decodedResultError29828 = error;
+        return false;
+      },
+    });
+    if (($decodedResultOk29828 ? "ok" : "error") === "error")
+      return Result.err($decodedResultError29828);
+    if (
+      $decodedResultValue29828.value === null ||
+      $decodedResultValue29828.value.kind !== input.kind
+    ) {
       return Result.err(
         corrupt({
           kind: input.kind,
@@ -817,10 +934,10 @@ export function decodeMiniLilacStructuralHistoryRows<
         }),
       );
     }
-    if (decoded.value.provenance === "migrated") provenance = "migrated";
+    if ($decodedResultValue29828.provenance === "migrated") provenance = "migrated";
     // The discriminant comparison above preserves this generic correlation,
     // which TypeScript cannot retain through Extract over a generic key.
-    values.push(decoded.value.value.value as MiniLilacStructuralHistoryValueFor<K>);
+    values.push($decodedResultValue29828.value.value as MiniLilacStructuralHistoryValueFor<K>);
   }
   return Result.ok({ value: values, provenance });
 }

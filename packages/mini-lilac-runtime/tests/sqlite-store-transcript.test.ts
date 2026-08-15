@@ -243,6 +243,27 @@ describe("MiniLilacSqliteStore transcript schema", () => {
     expect(validateMiniLilacPersistedSuperJsonValue({ nested: new Date(0) }).status).toBe("ok");
   });
 
+  it("does not access a Map value when its key is invalid", () => {
+    let valueAccessed = false;
+    const throwingValue = new Proxy(
+      {},
+      {
+        getPrototypeOf() {
+          valueAccessed = true;
+          throw new Error("Map value must not be accessed");
+        },
+      },
+    );
+
+    expect(
+      validateMiniLilacPersistedSuperJsonValue(new Map([[Symbol("invalid"), throwingValue]])),
+    ).toMatchObject({
+      status: "error",
+      error: { _tag: "MiniLilacPersistedSuperJsonValueInvalid" },
+    });
+    expect(valueAccessed).toBe(false);
+  });
+
   it("migrates v2 chains and divergent checkpoints while preserving durable state", async () => {
     const { databasePath } = await createV2Database();
     seedLegacyTranscripts(databasePath);

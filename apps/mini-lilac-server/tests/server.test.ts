@@ -2100,6 +2100,39 @@ describe("createMiniLilacServer", () => {
     service.close();
   });
 
+  it("maps ordinary rejecting HTTP work to normal 500 responses", async () => {
+    const model = new MockLanguageModelV4({ doStream: textResult("unused", "unused") });
+    const { config, directory, service } = await testServer(model, { skills: true });
+    const reported: Panic[] = [];
+    service.listSkills = () => Promise.reject(new Error("skill catalog unavailable"));
+    const app = createMiniLilacServer({
+      config,
+      sessionService: service,
+      modelCatalog: {
+        get: (request = {}) =>
+          request.forceRefresh
+            ? Promise.reject(new Error("model refresh unavailable"))
+            : Promise.resolve(catalogSnapshot()),
+      },
+      reportFatalPanic: (panic) => reported.push(panic),
+    });
+
+    const responses = await Promise.all([
+      app.handle(jsonRequest("POST", `${MINI_LILAC_API_PREFIX}/models/refresh`)),
+      app.handle(
+        jsonRequest("GET", `${MINI_LILAC_API_PREFIX}/skills?cwd=${encodeURIComponent(directory)}`),
+      ),
+    ]);
+    for (const response of responses) {
+      expect(response.status).toBe(500);
+      expect(await responseJson(response)).toEqual({
+        error: { code: "internal_error", message: "The request could not be completed" },
+      });
+    }
+    expect(reported).toEqual([]);
+    service.close();
+  });
+
   it("routes an exact Elysia-boundary Panic to the fatal supervisor", async () => {
     const model = new MockLanguageModelV4({ doStream: textResult("unused", "unused") });
     const { config, service } = await testServer(model);

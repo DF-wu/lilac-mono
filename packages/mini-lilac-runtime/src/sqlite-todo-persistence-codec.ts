@@ -97,7 +97,13 @@ export function decodeMiniLilacTodos(
   input: MiniLilacTodosCodecInput,
 ): ResultType<DecodedPersistedValue<MiniLilacTodoState>, PersistedDataError> {
   const version = decodeVersion(input.schemaVersion, input.recordId);
-  if (version.status === "error") return Result.err(version.error);
+  let decodedVersion!: { version: number; provenance: "current" | "migrated" };
+  let versionFailure: PersistedDataError | undefined;
+  version.match({
+    ok: (value) => void (decodedVersion = value),
+    err: (error) => void (versionFailure = error),
+  });
+  if (versionFailure !== undefined) return Result.err(versionFailure);
   if (input.row === null) {
     return Result.ok({ value: { revision: 0, todos: [] }, provenance: "missing-defaulted" });
   }
@@ -110,7 +116,7 @@ export function decodeMiniLilacTodos(
   ) {
     return Result.err(
       corrupt({
-        version: version.value.version,
+        version: decodedVersion.version,
         issueCode: "invalid-row-field",
         recordId: input.recordId,
       }),
@@ -124,7 +130,7 @@ export function decodeMiniLilacTodos(
     return Result.err(
       new MalformedSerialization(
         context({
-          version: version.value.version,
+          version: decodedVersion.version,
           issueCode: "malformed-json",
           recordId: input.recordId,
         }),
@@ -138,13 +144,13 @@ export function decodeMiniLilacTodos(
   if (!state.success) {
     return Result.err(
       corrupt({
-        version: version.value.version,
+        version: decodedVersion.version,
         issueCode: "invalid-row-field",
         recordId: input.recordId,
       }),
     );
   }
-  return Result.ok({ value: state.data, provenance: version.value.provenance });
+  return Result.ok({ value: state.data, provenance: decodedVersion.provenance });
 }
 
 export function readMiniLilacTodos(
@@ -173,8 +179,7 @@ export function readMiniLilacTodos(
       schemaVersion: CURRENT_VERSION,
       recordId: sessionId,
     });
-    if (decoded.status === "error") return Result.err(decoded.error);
-    return Result.ok(decoded.value.value);
+    return decoded.map((value) => value.value);
   } catch (cause) {
     if (Panic.is(cause)) throw cause;
     if (!(cause instanceof Error)) throw cause;

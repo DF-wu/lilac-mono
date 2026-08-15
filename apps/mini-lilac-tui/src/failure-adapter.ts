@@ -28,9 +28,12 @@ export function captureTuiOperation<T, E>(
     try: operation,
     catch: captureTuiFailure,
   });
-  if (captured.status === "ok") return Result.ok(captured.value);
-  if (captured.error.kind === "panic") return signalTuiDefect(captured.error.panic);
-  return Result.err(mapError(captured.error.cause));
+  const finish = captured.match<() => ResultType<T, E>>({
+    ok: (value) => () => Result.ok(value),
+    err: (error) => () =>
+      error.kind === "panic" ? signalTuiDefect(error.panic) : Result.err(mapError(error.cause)),
+  });
+  return finish();
 }
 
 export async function captureTuiOperationAsync<T, E>(
@@ -38,7 +41,10 @@ export async function captureTuiOperationAsync<T, E>(
   mapError: (cause: Error) => E,
 ): Promise<ResultType<T, E>> {
   const captured = await Result.tryPromise({ try: operation, catch: captureTuiFailure });
-  if (captured.status === "ok") return Result.ok(captured.value);
-  if (captured.error.kind === "panic") return signalTuiDefect(captured.error.panic);
-  return Result.err(mapError(captured.error.cause));
+  const finish = captured.match<() => ResultType<T, E>>({
+    ok: (value) => () => Result.ok(value),
+    err: (error) => () =>
+      error.kind === "panic" ? signalTuiDefect(error.panic) : Result.err(mapError(error.cause)),
+  });
+  return finish();
 }

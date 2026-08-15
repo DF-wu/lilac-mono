@@ -292,8 +292,7 @@ export function decodeProviderConfigYaml(
   );
   if (captured.status === "panic") return throwProviderPanic(captured.panic);
   if (captured.status === "error") return Result.err(captured.error);
-  if (captured.value.status === "error") return Result.err(captured.value.error);
-  return Result.ok(captured.value.value);
+  return captured.value;
 }
 
 export async function loadProviderConfigResult(
@@ -315,8 +314,14 @@ export async function loadProviderConfigResult(
 /** Compatibility adapter for callers that consume provider config failures as rejections. */
 export async function loadProviderConfig(file: string): Promise<ProviderConfig> {
   const loaded = await loadProviderConfigResult(file);
-  if (loaded.status === "error") throw loaded.error;
-  return loaded.value;
+  let config!: ProviderConfig;
+  let failure: LoadProviderConfigError | undefined;
+  loaded.match({
+    ok: (value) => void (config = value),
+    err: (error) => void (failure = error),
+  });
+  if (failure !== undefined) throw failure;
+  return config;
 }
 
 export async function loadProviderAuthResult(
@@ -376,8 +381,14 @@ export async function loadProviderAuthResult(
 /** Compatibility adapter for callers that consume provider auth failures as rejections. */
 export async function loadProviderAuth(file: string): Promise<ProviderAuth> {
   const loaded = await loadProviderAuthResult(file);
-  if (loaded.status === "error") throw loaded.error;
-  return loaded.value;
+  let auth!: ProviderAuth;
+  let failure: LoadProviderAuthError | undefined;
+  loaded.match({
+    ok: (value) => void (auth = value),
+    err: (error) => void (failure = error),
+  });
+  if (failure !== undefined) throw failure;
+  return auth;
 }
 
 export async function writeProviderAuthResult(
@@ -386,7 +397,13 @@ export async function writeProviderAuthResult(
 ): Promise<ResultType<void, WriteProviderAuthError>> {
   const absoluteFile = path.resolve(file);
   const decoded = decodeProviderAuth(auth, absoluteFile);
-  if (decoded.status === "error") return Result.err(decoded.error);
+  let providerAuth!: ProviderAuth;
+  let decodeFailure: ProviderAuthInvalid | undefined;
+  decoded.match({
+    ok: (value) => void (providerAuth = value),
+    err: (error) => void (decodeFailure = error),
+  });
+  if (decodeFailure !== undefined) return Result.err(decodeFailure);
   const temporaryFile = path.join(
     path.dirname(absoluteFile),
     `.${path.basename(absoluteFile)}.${crypto.randomUUID()}.tmp`,
@@ -401,7 +418,7 @@ export async function writeProviderAuthResult(
     handle = await open(temporaryFile, "wx", 0o600);
     needsCleanup = true;
     await handle.chmod(0o600);
-    await handle.writeFile(`${JSON.stringify(decoded.value, null, 2)}\n`, "utf8");
+    await handle.writeFile(`${JSON.stringify(providerAuth, null, 2)}\n`, "utf8");
     await handle.sync();
     await handle.close();
     handle = undefined;
@@ -461,8 +478,12 @@ export async function writeProviderAuthResult(
 
 /** Compatibility adapter for callers that consume provider auth failures as rejections. */
 export async function writeProviderAuth(file: string, auth: unknown): Promise<void> {
-  const written = await writeProviderAuthResult(file, auth);
-  if (written.status === "error") throw written.error;
+  let failure: WriteProviderAuthError | undefined;
+  (await writeProviderAuthResult(file, auth)).match({
+    ok: () => {},
+    err: (error) => void (failure = error),
+  });
+  if (failure !== undefined) throw failure;
 }
 
 function isCredentialless(definition: ProviderDefinition | undefined): boolean {
@@ -613,7 +634,12 @@ export function createAiProviderRegistryResult(
 ): ResultType<ReturnType<typeof createAiProviderRegistryUnchecked>, CreateAiProviderRegistryError> {
   const supersededProviderIds = options.supersededProviderIds ?? new Set<string>();
   const validated = validateProviderAuth(config, auth, supersededProviderIds);
-  if (validated.status === "error") return Result.err(validated.error);
+  let validationFailure: ProviderCredentialsInvalid | undefined;
+  validated.match({
+    ok: () => {},
+    err: (error) => void (validationFailure = error),
+  });
+  if (validationFailure !== undefined) return Result.err(validationFailure);
   for (const providerId of supersededProviderIds) {
     const definition = config.providers[providerId];
     if (definition?.type !== "openai" || definition.baseUrl) {
@@ -642,8 +668,14 @@ export function createAiProviderRegistry(
   options: CreateAiProviderRegistryOptions = {},
 ) {
   const created = createAiProviderRegistryResult(config, auth, options);
-  if (created.status === "error") throw created.error;
-  return created.value;
+  let registry!: ReturnType<typeof createAiProviderRegistryUnchecked>;
+  let failure: CreateAiProviderRegistryError | undefined;
+  created.match({
+    ok: (value) => void (registry = value),
+    err: (error) => void (failure = error),
+  });
+  if (failure !== undefined) throw failure;
+  return registry;
 }
 
 /**
@@ -723,12 +755,14 @@ export async function loadProviderRegistryResult(
     loadProviderAuthResult(runtimeConfig.providerAuthFile),
     codexTokensPromise,
   ]);
-  if (configResult.status === "error") return Result.err(configResult.error);
-  if (authResult.status === "error") return Result.err(authResult.error);
-  if (codexTokensResult.status === "error") return Result.err(codexTokensResult.error);
-  const config = configResult.value;
-  const auth = authResult.value;
-  const codexTokens = codexTokensResult.value;
+  let providerInputs!: readonly [ProviderConfig, ProviderAuth, CodexOAuthTokens | null];
+  let providerInputFailure: LoadProviderRegistryError | undefined;
+  Result.all([configResult, authResult, codexTokensResult]).match({
+    ok: (value) => void (providerInputs = value),
+    err: (error) => void (providerInputFailure = error),
+  });
+  if (providerInputFailure !== undefined) return Result.err(providerInputFailure);
+  const [config, auth, codexTokens] = providerInputs;
   const supersededProviderIds = codexTokens
     ? Object.entries(config.providers)
         .filter(([, definition]) => definition.type === "openai" && !definition.baseUrl)
@@ -760,8 +794,14 @@ export async function loadProviderRegistryResult(
     supersededProviderIds: supersededSet,
     codexOAuthProvider,
   });
-  if (registry.status === "error") return Result.err(registry.error);
-  const loaded = { config, auth, registry: registry.value, supersededProviderIds };
+  let createdRegistry!: ReturnType<typeof createAiProviderRegistryUnchecked>;
+  let registryFailure: CreateAiProviderRegistryError | undefined;
+  registry.match({
+    ok: (value) => void (createdRegistry = value),
+    err: (error) => void (registryFailure = error),
+  });
+  if (registryFailure !== undefined) return Result.err(registryFailure);
+  const loaded = { config, auth, registry: createdRegistry, supersededProviderIds };
   Object.defineProperty(loaded, "toJSON", {
     enumerable: false,
     value: () => ({ config, supersededProviderIds }),
@@ -775,6 +815,12 @@ export async function loadProviderRegistry(
   options: LoadProviderRegistryOptions = {},
 ): Promise<LoadedProviderRegistry> {
   const loaded = await loadProviderRegistryResult(runtimeConfig, options);
-  if (loaded.status === "error") throw loaded.error;
-  return loaded.value;
+  let registry!: LoadedProviderRegistry;
+  let failure: LoadProviderRegistryError | undefined;
+  loaded.match({
+    ok: (value) => void (registry = value),
+    err: (error) => void (failure = error),
+  });
+  if (failure !== undefined) throw failure;
+  return registry;
 }

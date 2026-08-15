@@ -74,15 +74,15 @@ export async function runMiniLilac(
 
   if (command === "--help" || command === "-h" || command === "help") {
     const output = await captureCommand("cli", async () => writeOutput(HELP_TEXT));
-    return output.status === "ok" ? Result.ok(0) : Result.err(output.error);
+    return output.map(() => 0);
   }
   if (command === "server") {
     const server = await captureCommand("server", () => runners.server(commandArgs));
-    return server.status === "ok" ? Result.ok(0) : Result.err(server.error);
+    return server.map(() => 0);
   }
   if (command === "history-recovery") {
     const server = await captureCommand("server", () => runners.server([command, ...commandArgs]));
-    return server.status === "ok" ? Result.ok(0) : Result.err(server.error);
+    return server.map(() => 0);
   }
   if (command === "tui") return captureCommand("tui", () => runners.tui(commandArgs));
   return captureCommand("tui", () => runners.tui(args));
@@ -98,12 +98,13 @@ export async function runMiniLilacMain(
   },
 ): Promise<void> {
   const result = await runMiniLilac(args, runners, writeOutput);
-  if (result.status === "error") {
-    writeError(`${result.error.message}\n`);
-    setExitCode(1);
-    return;
-  }
-  setExitCode(result.value);
+  result.match({
+    ok: (exitCode) => () => setExitCode(exitCode),
+    err: (error) => () => {
+      writeError(`${error.message}\n`);
+      setExitCode(1);
+    },
+  })();
 }
 
 if (import.meta.main) await runMiniLilacMain(process.argv.slice(2));

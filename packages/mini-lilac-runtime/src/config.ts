@@ -168,49 +168,40 @@ export type LoadRuntimeConfigError =
   | RuntimeConfigInvalid
   | RuntimeConfigAuthTokenMissing;
 
-type RuntimeConfigCapture<T, E> =
-  | { readonly status: "ok"; readonly value: T }
-  | { readonly status: "error"; readonly error: E }
-  | { readonly status: "panic"; readonly panic: Panic };
-
-function throwRuntimeConfigPanic(panic: Panic): never {
+function throwRuntimeConfigPanic(panic: Panic | LoadRuntimeConfigError): never {
   throw panic;
 }
 
 function captureRuntimeConfigYaml(
   source: string,
   configFile: string,
-): RuntimeConfigCapture<RuntimeConfig, RuntimeConfigYamlInvalid | RuntimeConfigInvalid> {
+): ResultType<RuntimeConfig, RuntimeConfigYamlInvalid | RuntimeConfigInvalid> {
   try {
-    const decoded = decodeRuntimeConfig(Bun.YAML.parse(source), configFile);
-    if (decoded.status === "error") return { status: "error", error: decoded.error };
-    return { status: "ok", value: decoded.value };
+    return decodeRuntimeConfig(Bun.YAML.parse(source), configFile);
   } catch (cause) {
-    if (isPanic(cause)) return { status: "panic", panic: cause };
-    return {
-      status: "error",
-      error: new RuntimeConfigYamlInvalid({
+    if (isPanic(cause)) return throwRuntimeConfigPanic(cause);
+    return Result.err(
+      new RuntimeConfigYamlInvalid({
         configFile,
         message: `Failed to parse YAML file '${configFile}'`,
       }),
-    };
+    );
   }
 }
 
 async function captureRuntimeConfigRead(
   configFile: string,
-): Promise<RuntimeConfigCapture<string, RuntimeConfigReadFailed>> {
+): Promise<ResultType<string, RuntimeConfigReadFailed>> {
   try {
-    return { status: "ok", value: await readFile(configFile, "utf8") };
+    return Result.ok(await readFile(configFile, "utf8"));
   } catch (cause) {
-    if (isPanic(cause)) return { status: "panic", panic: cause };
-    return {
-      status: "error",
-      error: new RuntimeConfigReadFailed({
+    if (isPanic(cause)) return throwRuntimeConfigPanic(cause);
+    return Result.err(
+      new RuntimeConfigReadFailed({
         configFile,
         message: `Failed to read runtime config '${configFile}'`,
       }),
-    };
+    );
   }
 }
 
@@ -233,10 +224,7 @@ export function decodeRuntimeConfigYaml(
   source: string,
   configFile: string,
 ): ResultType<RuntimeConfig, RuntimeConfigYamlInvalid | RuntimeConfigInvalid> {
-  const captured = captureRuntimeConfigYaml(source, configFile);
-  if (captured.status === "panic") return throwRuntimeConfigPanic(captured.panic);
-  if (captured.status === "error") return Result.err(captured.error);
-  return Result.ok(captured.value);
+  return captureRuntimeConfigYaml(source, configFile);
 }
 
 export async function loadRuntimeConfigResult(
@@ -245,32 +233,44 @@ export async function loadRuntimeConfigResult(
 ): Promise<ResultType<LoadedRuntimeConfig, LoadRuntimeConfigError>> {
   const absoluteConfigFile = path.resolve(configFile);
   const source = await captureRuntimeConfigRead(absoluteConfigFile);
-  if (source.status === "panic") return throwRuntimeConfigPanic(source.panic);
-  if (source.status === "error") return Result.err(source.error);
-  const decoded = decodeRuntimeConfigYaml(source.value, absoluteConfigFile);
-  if (decoded.status === "error") return Result.err(decoded.error);
-  const config = decoded.value;
-  const env = options.env ?? process.env;
+  const continueWithSource = source.match<
+    () => ResultType<LoadedRuntimeConfig, LoadRuntimeConfigError>
+  >({
+    err: (error) => () => Result.err(error),
+    ok: (contents) => () => {
+      const decoded = decodeRuntimeConfigYaml(contents, absoluteConfigFile);
+      const continueWithConfig = decoded.match<
+        () => ResultType<LoadedRuntimeConfig, LoadRuntimeConfigError>
+      >({
+        err: (error) => () => Result.err(error),
+        ok: (config) => () => {
+          const env = options.env ?? process.env;
 
-  if (config.server.authTokenEnv) {
-    const token = env[config.server.authTokenEnv];
-    if (!token?.trim()) {
-      return Result.err(
-        new RuntimeConfigAuthTokenMissing({
-          environmentVariable: config.server.authTokenEnv,
-          message: `Server auth token environment variable '${config.server.authTokenEnv}' is missing or empty`,
-        }),
-      );
-    }
-  }
+          if (config.server.authTokenEnv) {
+            const token = env[config.server.authTokenEnv];
+            if (!token?.trim()) {
+              return Result.err(
+                new RuntimeConfigAuthTokenMissing({
+                  environmentVariable: config.server.authTokenEnv,
+                  message: `Server auth token environment variable '${config.server.authTokenEnv}' is missing or empty`,
+                }),
+              );
+            }
+          }
 
-  const configDirectory = path.dirname(absoluteConfigFile);
-  return Result.ok({
-    ...config,
-    configFile: absoluteConfigFile,
-    providerConfigFile: path.resolve(configDirectory, config.providerConfigFile),
-    providerAuthFile: path.resolve(configDirectory, config.providerAuthFile),
+          const configDirectory = path.dirname(absoluteConfigFile);
+          return Result.ok({
+            ...config,
+            configFile: absoluteConfigFile,
+            providerConfigFile: path.resolve(configDirectory, config.providerConfigFile),
+            providerAuthFile: path.resolve(configDirectory, config.providerAuthFile),
+          });
+        },
+      });
+      return continueWithConfig();
+    },
   });
+  return continueWithSource();
 }
 
 /** Compatibility adapter for callers that consume startup failures as rejections. */
@@ -279,6 +279,14 @@ export async function loadRuntimeConfig(
   options: LoadRuntimeConfigOptions = {},
 ): Promise<LoadedRuntimeConfig> {
   const loaded = await loadRuntimeConfigResult(configFile, options);
-  if (loaded.status === "error") throw loaded.error;
-  return loaded.value;
+  const failure = loaded.match<LoadRuntimeConfigError | undefined>({
+    ok: () => undefined,
+    err: (error) => error,
+  });
+  if (failure !== undefined) throw failure;
+  const resolve = loaded.match<() => LoadedRuntimeConfig>({
+    ok: (config) => () => config,
+    err: (error) => () => throwRuntimeConfigPanic(error),
+  });
+  return resolve();
 }

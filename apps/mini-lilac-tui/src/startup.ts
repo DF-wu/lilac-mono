@@ -69,17 +69,20 @@ export function verifySessionCwd(
   cwd: string,
 ): ResultType<void, StartupSessionCwdUnresolvable | StartupSessionCwdMismatch> {
   const canonical = canonicalCwd(snapshot.cwd);
-  if (canonical.status === "error") {
+  const storedCwd = canonical.match<string | import("./cli").CanonicalCwdFailed>({
+    ok: (value) => value,
+    err: (error) => error,
+  });
+  if (typeof storedCwd !== "string") {
     return Result.err(
       new StartupSessionCwdUnresolvable({
         sessionId: snapshot.id,
         cwd: snapshot.cwd,
-        cause: canonical.error,
+        cause: storedCwd,
         message: `Session '${snapshot.id}' cwd no longer resolves: ${snapshot.cwd}`,
       }),
     );
   }
-  const storedCwd = canonical.value;
   if (storedCwd !== cwd) {
     return Result.err(
       new StartupSessionCwdMismatch({
@@ -109,10 +112,20 @@ export async function loadExistingSession(
   >
 > {
   const loaded = await transport.getSessionResumeResult(sessionId);
-  if (loaded.status === "error") return Result.err(loaded.error);
-  const { snapshot, messages, todos, replayCursor } = loaded.value;
+  const loadedValue = loaded.match<MiniLilacSessionResume | MiniLilacRequestError>({
+    ok: (value) => value,
+    err: (error) => error,
+  });
+  if (TaggedError.is(loadedValue)) return Result.err(loadedValue);
+  const { snapshot, messages, todos, replayCursor } = loadedValue;
   const verified = verifySessionCwd(snapshot, cwd);
-  if (verified.status === "error") return Result.err(verified.error);
+  const verificationError = verified.match<
+    StartupSessionCwdUnresolvable | StartupSessionCwdMismatch | undefined
+  >({
+    ok: () => undefined,
+    err: (error) => error,
+  });
+  if (verificationError !== undefined) return Result.err(verificationError);
   transport.setReconnectCursor(sessionId, replayCursor);
   return Result.ok({ snapshot, messages, todos, replayCursor });
 }
@@ -132,8 +145,20 @@ export async function resolveStartupSession(
   if (options.session !== undefined) {
     // Resume state and canonical transcript are loaded before catalog selection.
     const loaded = await loadExistingSession(transport, options.session, options.cwd);
-    if (loaded.status === "error") return Result.err(loaded.error);
-    ({ snapshot, messages, todos, replayCursor } = loaded.value);
+    const loadedValue = loaded.match<
+      | {
+          readonly snapshot: MiniLilacSessionSnapshot;
+          readonly messages: MiniLilacUIMessage[];
+          readonly todos: MiniLilacTodoState;
+          readonly replayCursor: MiniLilacSessionResume["replayCursor"];
+        }
+      | ExistingSessionLoadError
+    >({
+      ok: (value) => value,
+      err: (error) => error,
+    });
+    if (TaggedError.is(loadedValue)) return Result.err(loadedValue);
+    ({ snapshot, messages, todos, replayCursor } = loadedValue);
     const ignoredBindings: string[] = [];
     if (options.model !== undefined && options.model !== (snapshot.model ?? undefined)) {
       ignoredBindings.push("--model");
@@ -158,10 +183,18 @@ export async function resolveStartupSession(
     transport.listModelsResult(),
     transport.listProfilesResult(),
   ]);
-  if (modelsResult.status === "error") return Result.err(modelsResult.error);
-  if (profilesResult.status === "error") return Result.err(profilesResult.error);
-  const models = modelsResult.value;
-  const profiles = profilesResult.value;
+  const models = modelsResult.match<readonly MiniLilacModelSummary[] | MiniLilacRequestError>({
+    ok: (value) => value,
+    err: (error) => error,
+  });
+  if (TaggedError.is(models)) return Result.err(models);
+  const profiles = profilesResult.match<readonly MiniLilacProfileSummary[] | MiniLilacRequestError>(
+    {
+      ok: (value) => value,
+      err: (error) => error,
+    },
+  );
+  if (TaggedError.is(profiles)) return Result.err(profiles);
   // Every persisted value is authoritative on resume, including null (which is
   // represented as an omitted transport option). Never select a fresh binding.
   const preferredModel = options.model ?? preference?.model;
@@ -176,8 +209,14 @@ export async function resolveStartupSession(
       modelChoices(models),
       options.model ?? rememberedModel,
     );
-    if (selected.status === "error") return Result.err(selected.error);
-    model = selected.value.id;
+    const selectedModel = selected.match<
+      ReturnType<typeof modelChoices>[number] | PreflightSelectionError
+    >({
+      ok: (value) => value,
+      err: (error) => error,
+    });
+    if (TaggedError.is(selectedModel)) return Result.err(selectedModel);
+    model = selectedModel.id;
   }
   const preferredProfile = options.profile ?? preference?.profile;
   if (

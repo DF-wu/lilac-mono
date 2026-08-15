@@ -118,6 +118,15 @@ type CapturedBridgeFailure =
   | { readonly kind: "panic"; readonly panic: Panic }
   | { readonly kind: "ordinary"; readonly cause: Error };
 
+function resultOutcome<T, E>(
+  result: ResultType<T, E>,
+): { ok: true; value: T } | { ok: false; error: E } {
+  return result.match<{ ok: true; value: T } | { ok: false; error: E }>({
+    ok: (value) => ({ ok: true, value }),
+    err: (error) => ({ ok: false, error }),
+  });
+}
+
 function captureBridgeFailure(cause: unknown): CapturedBridgeFailure {
   if (Panic.is(cause)) return { kind: "panic", panic: cause };
   return {
@@ -135,9 +144,14 @@ function captureBridgeOperation<T, E>(
     try: operation,
     catch: captureBridgeFailure,
   });
-  if (captured.status === "ok") return Result.ok(captured.value);
-  if (captured.error.kind === "panic") return signalBridgeDefect(captured.error.panic);
-  return Result.err(mapError(captured.error.cause));
+  const continueCapture = captured.match<() => ResultType<T, E>>({
+    ok: (value) => () => Result.ok(value),
+    err: (failure) => () => {
+      if (failure.kind === "panic") signalBridgeDefect(failure.panic);
+      return Result.err(mapError(failure.cause));
+    },
+  });
+  return continueCapture();
 }
 
 async function captureBridgeOperationAsync<T, E>(
@@ -145,9 +159,14 @@ async function captureBridgeOperationAsync<T, E>(
   mapError: (cause: Error) => E,
 ): Promise<ResultType<T, E>> {
   const captured = await Result.tryPromise({ try: operation, catch: captureBridgeFailure });
-  if (captured.status === "ok") return Result.ok(captured.value);
-  if (captured.error.kind === "panic") return signalBridgeDefect(captured.error.panic);
-  return Result.err(mapError(captured.error.cause));
+  const continueCapture = captured.match<() => ResultType<T, E>>({
+    ok: (value) => () => Result.ok(value),
+    err: (failure) => () => {
+      if (failure.kind === "panic") signalBridgeDefect(failure.panic);
+      return Result.err(mapError(failure.cause));
+    },
+  });
+  return continueCapture();
 }
 
 let callableIdsCache: string[] | undefined;
@@ -207,8 +226,8 @@ async function readFileBytes(
 
 async function enableOperatorMode(): Promise<ResultType<void, BridgeClientError>> {
   const tokenPath = process.env.LILAC_OPERATOR_TOKEN_FILE || DEFAULT_OPERATOR_TOKEN_FILE;
-  const tokenFile = await readFileText(tokenPath, "read operator token");
-  if (tokenFile.status === "error") return Result.err(tokenFile.error);
+  const tokenFile = resultOutcome(await readFileText(tokenPath, "read operator token"));
+  if (!tokenFile.ok) return Result.err(tokenFile.error);
   const token = tokenFile.value.trim();
   if (!/^[A-Za-z0-9_-]{43}$/u.test(token)) {
     return Result.err(
@@ -344,13 +363,15 @@ function decodeOnboardingGpgExport(
 }
 
 function decodeJsonText(raw: string, source: string): ResultType<JsonValue, BridgeJsonInvalid> {
-  const parsedJson = Result.try({
-    try: () => JSON.parse(raw),
-    catch: (cause) =>
-      new BridgeJsonInvalid({ cause, source, message: `${source} is not valid JSON` }),
-  });
-  if (parsedJson.status === "error") return Result.err(parsedJson.error);
-  const decoded = jsonValueSchema.safeParse(parsedJson.value);
+  const parsed = resultOutcome(
+    Result.try({
+      try: () => JSON.parse(raw),
+      catch: (cause) =>
+        new BridgeJsonInvalid({ cause, source, message: `${source} is not valid JSON` }),
+    }),
+  );
+  if (!parsed.ok) return Result.err(parsed.error);
+  const decoded = jsonValueSchema.safeParse(parsed.value);
   if (!decoded.success) {
     return Result.err(
       new BridgeJsonInvalid({
@@ -423,18 +444,24 @@ async function listCallableIdsBestEffort(): Promise<string[]> {
   const response = await fetchRequest(`${BACKEND_URL}/list`, "fetch tools list", {
     headers: lilacRequestHeaders(),
   });
-  if (response.status === "error" || !response.value.ok) {
+  const res = response.match({ ok: (value) => value, err: () => undefined });
+  if (!res?.ok) {
     callableIdsCache = [];
     return callableIdsCache;
   }
 
-  const payload = await readResponseJson(response.value, "tool list");
-  if (payload.status === "error") {
+  const payload = (await readResponseJson(res, "tool list")).match({
+    ok: (value) => value,
+    err: () => undefined,
+  });
+  if (payload === undefined) {
     callableIdsCache = [];
     return callableIdsCache;
   }
-  const decoded = decodeCallableIdListPayload(payload.value);
-  callableIdsCache = decoded.status === "ok" ? [...decoded.value] : [];
+  callableIdsCache = decodeCallableIdListPayload(payload).match({
+    ok: (value) => [...value],
+    err: () => [],
+  });
   return callableIdsCache;
 }
 
@@ -485,19 +512,23 @@ async function readResponseJson(
   boundary: string,
 ): Promise<ResultType<JsonValue, BridgeExternalOperationFailed | BridgeJsonInvalid>> {
   const text = await readResponseText(response, `read ${boundary} response`);
-  if (text.status === "error") return Result.err(text.error);
-  return decodeJsonText(text.value, `${boundary} response`);
+  const outcome = resultOutcome(text);
+  return outcome.ok
+    ? decodeJsonText(outcome.value, `${boundary} response`)
+    : Result.err(outcome.error);
 }
 
 async function readHttpErrorMessage(res: Response): Promise<string | undefined> {
-  const text = await readResponseText(res, "read backend error response");
-  if (text.status === "error") return undefined;
-  const body = text.value.trim();
+  const body = (await readResponseText(res, "read backend error response")).match({
+    ok: (text) => text.trim(),
+    err: () => undefined,
+  });
   if (!body) return undefined;
 
-  const payload = decodeJsonText(body, "backend error response");
-  if (payload.status === "error") return body;
-  return extractErrorMessage(payload.value) ?? body;
+  return decodeJsonText(body, "backend error response").match({
+    ok: (payload) => extractErrorMessage(payload) ?? body,
+    err: () => body,
+  });
 }
 
 function formatHttpStatus(res: Response): string {
@@ -616,11 +647,13 @@ async function buildCallableIdErrorMessage(params: {
 async function listTools(): Promise<
   ResultType<{ readonly tools: readonly Omit<ToolOutputFull, "input">[] }, BridgeClientError>
 > {
-  const response = await fetchRequest(`${BACKEND_URL}/list`, "fetch tools list", {
-    headers: lilacRequestHeaders(),
-  });
-  if (response.status === "error") return Result.err(response.error);
-  const res = response.value;
+  const fetched = resultOutcome(
+    await fetchRequest(`${BACKEND_URL}/list`, "fetch tools list", {
+      headers: lilacRequestHeaders(),
+    }),
+  );
+  if (!fetched.ok) return Result.err(fetched.error);
+  const res = fetched.value;
   if (!res.ok) {
     const detail = await readHttpErrorMessage(res);
     return Result.err(
@@ -631,20 +664,24 @@ async function listTools(): Promise<
       }),
     );
   }
-  const payload = await readResponseJson(res, "tool list");
-  if (payload.status === "error") return Result.err(payload.error);
+  const payload = resultOutcome(await readResponseJson(res, "tool list"));
+  if (!payload.ok) return Result.err(payload.error);
   return decodeListPayload(payload.value);
 }
 
 async function getBackendVersionInfoBestEffort(): Promise<BackendVersionInfo | null> {
   backendVersionInfoPromise ??= (async () => {
-    const response = await fetchWithTimeout(`${BACKEND_URL}/versionz`, VERSION_FETCH_TIMEOUT_MS);
-    if (response.status === "error" || !response.value.ok) return null;
+    const response = (
+      await fetchWithTimeout(`${BACKEND_URL}/versionz`, VERSION_FETCH_TIMEOUT_MS)
+    ).match({ ok: (value) => value, err: () => undefined });
+    if (!response?.ok) return null;
 
-    const payload = await readResponseJson(response.value, "version");
-    if (payload.status === "error") return null;
-    const decoded = decodeBackendVersionPayload(payload.value);
-    return decoded.status === "ok" ? decoded.value : null;
+    const payload = (await readResponseJson(response, "version")).match({
+      ok: (value) => value,
+      err: () => undefined,
+    });
+    if (payload === undefined) return null;
+    return decodeBackendVersionPayload(payload).match({ ok: (value) => value, err: () => null });
   })();
 
   return await backendVersionInfoPromise;
@@ -653,15 +690,13 @@ async function getBackendVersionInfoBestEffort(): Promise<BackendVersionInfo | n
 async function toolHelp(
   callableId: string,
 ): Promise<ResultType<ToolOutputFull, BridgeClientError>> {
-  const response = await fetchRequest(
-    `${BACKEND_URL}/help/${encodeURIComponent(callableId)}`,
-    "fetch tool help",
-    {
+  const fetched = resultOutcome(
+    await fetchRequest(`${BACKEND_URL}/help/${encodeURIComponent(callableId)}`, "fetch tool help", {
       headers: lilacRequestHeaders(),
-    },
+    }),
   );
-  if (response.status === "error") return Result.err(response.error);
-  const res = response.value;
+  if (!fetched.ok) return Result.err(fetched.error);
+  const res = fetched.value;
   if (!res.ok) {
     const detail = await readHttpErrorMessage(res);
     return Result.err(
@@ -677,8 +712,8 @@ async function toolHelp(
       }),
     );
   }
-  const payload = await readResponseJson(res, "tool help");
-  if (payload.status === "error") return Result.err(payload.error);
+  const payload = resultOutcome(await readResponseJson(res, "tool help"));
+  if (!payload.ok) return Result.err(payload.error);
   return decodeToolHelpPayload(payload.value);
 }
 
@@ -688,16 +723,18 @@ async function callTool(
 ): Promise<ResultType<ToolCallPayload, BridgeClientError>> {
   const headers = lilacRequestHeaders(true);
 
-  const response = await fetchRequest(`${BACKEND_URL}/call`, "call tool", {
-    method: "POST",
-    headers,
-    body: JSON.stringify({
-      callableId,
-      input,
+  const fetched = resultOutcome(
+    await fetchRequest(`${BACKEND_URL}/call`, "call tool", {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        callableId,
+        input,
+      }),
     }),
-  });
-  if (response.status === "error") return Result.err(response.error);
-  const res = response.value;
+  );
+  if (!fetched.ok) return Result.err(fetched.error);
+  const res = fetched.value;
   if (!res.ok) {
     const detail = await readHttpErrorMessage(res);
     return Result.err(
@@ -713,8 +750,8 @@ async function callTool(
       }),
     );
   }
-  const payload = await readResponseJson(res, "tool call");
-  if (payload.status === "error") return Result.err(payload.error);
+  const payload = resultOutcome(await readResponseJson(res, "tool call"));
+  if (!payload.ok) return Result.err(payload.error);
   return decodeToolCallPayload(payload.value);
 }
 
@@ -818,7 +855,7 @@ async function isFile(filePath: string): Promise<boolean> {
     () => fs.stat(filePath),
     (cause) => cause,
   );
-  return inspected.status === "ok" && inspected.value.isFile();
+  return inspected.match({ ok: (value) => value.isFile(), err: () => false });
 }
 
 async function sha256HexPrefix(
@@ -826,8 +863,7 @@ async function sha256HexPrefix(
   length = BUILD_ID_LENGTH,
 ): Promise<ResultType<string, BridgeExternalOperationFailed>> {
   const bytes = await readFileBytes(filePath, "read tool bridge build artifact");
-  if (bytes.status === "error") return Result.err(bytes.error);
-  return Result.ok(createHash("sha256").update(bytes.value).digest("hex").slice(0, length));
+  return bytes.map((value) => createHash("sha256").update(value).digest("hex").slice(0, length));
 }
 
 export async function resolveBuildId(currentFile = CURRENT_FILE): Promise<string> {
@@ -845,7 +881,7 @@ export async function resolveBuildId(currentFile = CURRENT_FILE): Promise<string
   if (!(await isFile(artifactPath))) return DEV_BUILD_ID;
 
   const buildId = await sha256HexPrefix(artifactPath);
-  return buildId.status === "ok" ? buildId.value : DEV_BUILD_ID;
+  return buildId.match({ ok: (value) => value, err: () => DEV_BUILD_ID });
 }
 
 async function getBuildId(): Promise<string> {
@@ -1020,9 +1056,9 @@ function buildUsageLinesForTool(
 
 async function main(): Promise<ResultType<void, BridgeClientError>> {
   const globalArgs = parseGlobalArgs();
-  const parsed = parseArgs(globalArgs.args);
-  if (parsed.status === "error") return Result.err(parsed.error);
-  const command = parsed.value;
+  const parsedCommand = resultOutcome(parseArgs(globalArgs.args));
+  if (!parsedCommand.ok) return Result.err(parsedCommand.error);
+  const command = parsedCommand.value;
 
   if (
     globalArgs.operator &&
@@ -1030,8 +1066,8 @@ async function main(): Promise<ResultType<void, BridgeClientError>> {
       command.type === "call" ||
       (command.type === "help" && command.callableId !== undefined))
   ) {
-    const enabled = await enableOperatorMode();
-    if (enabled.status === "error") return Result.err(enabled.error);
+    const enabled = resultOutcome(await enableOperatorMode());
+    if (!enabled.ok) return Result.err(enabled.error);
   }
 
   switch (command.type) {
@@ -1071,9 +1107,9 @@ async function main(): Promise<ResultType<void, BridgeClientError>> {
       }
 
       if (command.callableId) {
-        const help = await toolHelp(command.callableId);
-        if (help.status === "error") return Result.err(help.error);
-        const tool = help.value;
+        const helped = resultOutcome(await toolHelp(command.callableId));
+        if (!helped.ok) return Result.err(helped.error);
+        const tool = helped.value;
         console.log(
           [
             await banner(),
@@ -1136,8 +1172,8 @@ async function main(): Promise<ResultType<void, BridgeClientError>> {
       return Result.ok(undefined);
     }
     case "list": {
-      const listed = await listTools();
-      if (listed.status === "error") return Result.err(listed.error);
+      const listed = resultOutcome(await listTools());
+      if (!listed.ok) return Result.err(listed.error);
       const visibleTools = command.showHidden
         ? listed.value.tools
         : listed.value.tools.filter((tool) => tool.hidden !== true);
@@ -1181,34 +1217,45 @@ async function main(): Promise<ResultType<void, BridgeClientError>> {
 
       let primaryPositional: PrimaryPositional | undefined;
       if (command.positionalArgs.length > 0) {
-        const help = await toolHelp(command.callableId);
-        if (help.status === "error") return Result.err(help.error);
-        primaryPositional = help.value.primaryPositional;
+        const helped = resultOutcome(await toolHelp(command.callableId));
+        if (!helped.ok) return Result.err(helped.error);
+        primaryPositional = helped.value.primaryPositional;
       }
-      const input = await buildToolInput(command, primaryPositional);
-      if (input.status === "error") return Result.err(input.error);
-      const called = await callTool(command.callableId, input.value);
-      if (called.status === "error") return Result.err(called.error);
-      if (called.value.isError) {
-        return Result.err(new BridgeToolReportedFailure({ message: called.value.output }));
-      }
-
-      console.log(
-        JSON.stringify(
-          called.value.output,
-          null,
-          command.outputMode === "json-pretty" ? 2 : undefined,
-        ),
-      );
-      return Result.ok(undefined);
+      const input = resultOutcome(await buildToolInput(command, primaryPositional));
+      if (!input.ok) return Result.err(input.error);
+      const continueCalled = (await callTool(command.callableId, input.value)).match<
+        () => ResultType<void, BridgeClientError>
+      >({
+        ok: (called) => () => {
+          if (called.isError) {
+            return Result.err(new BridgeToolReportedFailure({ message: called.output }));
+          }
+          console.log(
+            JSON.stringify(
+              called.output,
+              null,
+              command.outputMode === "json-pretty" ? 2 : undefined,
+            ),
+          );
+          return Result.ok(undefined);
+        },
+        err: (error) => () => Result.err(error),
+      });
+      return continueCalled();
     }
     case "onboard": {
-      const onboarded = await runOnboardingWizard(command);
-      if (onboarded.status === "error") return Result.err(onboarded.error);
-      console.log(
-        JSON.stringify(onboarded.value, null, command.outputMode === "json-pretty" ? 2 : undefined),
-      );
-      return Result.ok(undefined);
+      const continueOnboarded = (await runOnboardingWizard(command)).match<
+        () => ResultType<void, BridgeClientError>
+      >({
+        ok: (onboarded) => () => {
+          console.log(
+            JSON.stringify(onboarded, null, command.outputMode === "json-pretty" ? 2 : undefined),
+          );
+          return Result.ok(undefined);
+        },
+        err: (error) => () => Result.err(error),
+      });
+      return continueOnboarded();
     }
     case "unknown":
       return Result.err(new BridgeArgumentInvalid({ message: "Unknown command, try --help" }));
@@ -1270,293 +1317,301 @@ function argumentError(message: string): ResultType<never, BridgeArgumentInvalid
 export function parseArgs(
   args = process.argv.slice(2),
 ): ResultType<ParsedArgs, BridgeArgumentInvalid> {
-  const firstArg = args[0];
+  {
+    const firstArg = args[0];
 
-  if (firstArg === "--version") return Result.ok({ type: "version" });
+    if (firstArg === "--version") return Result.ok({ type: "version" } satisfies ParsedArgs);
 
-  // Alias / fallback: tools --help <callableId>
-  if (firstArg === "--help") {
-    const maybeTool = args[1];
-    if (maybeTool && !maybeTool.startsWith("--")) {
-      return Result.ok({ type: "help", callableId: maybeTool });
+    // Alias / fallback: tools --help <callableId>
+    if (firstArg === "--help") {
+      const maybeTool = args[1];
+      if (maybeTool && !maybeTool.startsWith("--")) {
+        return Result.ok({ type: "help", callableId: maybeTool } satisfies ParsedArgs);
+      }
+      return Result.ok({ type: "help" } satisfies ParsedArgs);
     }
-    return Result.ok({ type: "help" });
-  }
 
-  if (firstArg === "--list") {
-    const showHidden = args.some((a) => {
-      if (a === "--show-hidden") return true;
-      if (a.startsWith("--show-hidden=")) {
+    if (firstArg === "--list") {
+      const showHidden = args.some((a) => {
+        if (a === "--show-hidden") return true;
+        if (a.startsWith("--show-hidden=")) {
+          const eq = a.indexOf("=");
+          const v = eq === -1 ? "" : a.slice(eq + 1);
+          return parseBooleanLike(v) === true;
+        }
+        return false;
+      });
+      return Result.ok({ type: "list", showHidden } satisfies ParsedArgs);
+    }
+
+    if (firstArg === "onboard") {
+      const restArgs = args.slice(1);
+      let outputMode: OutputMode = "json";
+      let dataDir: string | undefined;
+      let userName: string | undefined;
+      let userEmail: string | undefined;
+      let sign: boolean | undefined;
+      let yes = false;
+
+      for (let i = 0; i < restArgs.length; i++) {
+        const a = restArgs[i];
+        if (a === "-y") {
+          yes = true;
+          continue;
+        }
+        if (!a || !a.startsWith("--")) {
+          return argumentError(`Unexpected argument '${a ?? ""}'. Expected --key=value`);
+        }
+
         const eq = a.indexOf("=");
+        const k = eq === -1 ? a : a.slice(0, eq);
         const v = eq === -1 ? "" : a.slice(eq + 1);
-        return parseBooleanLike(v) === true;
-      }
-      return false;
-    });
-    return Result.ok({ type: "list", showHidden });
-  }
+        const hasValue = eq !== -1;
 
-  if (firstArg === "onboard") {
-    const restArgs = args.slice(1);
-    let outputMode: OutputMode = "json";
-    let dataDir: string | undefined;
-    let userName: string | undefined;
-    let userEmail: string | undefined;
-    let sign: boolean | undefined;
-    let yes = false;
-
-    for (let i = 0; i < restArgs.length; i++) {
-      const a = restArgs[i];
-      if (a === "-y") {
-        yes = true;
-        continue;
-      }
-      if (!a || !a.startsWith("--")) {
-        return argumentError(`Unexpected argument '${a ?? ""}'. Expected --key=value`);
-      }
-
-      const eq = a.indexOf("=");
-      const k = eq === -1 ? a : a.slice(0, eq);
-      const v = eq === -1 ? "" : a.slice(eq + 1);
-      const hasValue = eq !== -1;
-
-      if (k === "--help") {
-        const value = hasValue ? parseBooleanLike(v) : true;
-        if (value !== false) return Result.ok({ type: "help", callableId: "onboard" });
-        continue;
-      }
-
-      if (k === "--output") {
-        if (!hasValue) {
-          return argumentError("--output requires a value: --output=json|json-pretty");
+        if (k === "--help") {
+          const value = hasValue ? parseBooleanLike(v) : true;
+          if (value !== false) {
+            return Result.ok({ type: "help", callableId: "onboard" } satisfies ParsedArgs);
+          }
+          continue;
         }
-        if (v !== "json" && v !== "json-pretty") {
-          return argumentError(`Invalid --output value '${v}' (expected json|json-pretty)`);
+
+        if (k === "--output") {
+          if (!hasValue) {
+            return argumentError("--output requires a value: --output=json|json-pretty");
+          }
+          if (v !== "json" && v !== "json-pretty") {
+            return argumentError(`Invalid --output value '${v}' (expected json|json-pretty)`);
+          }
+          outputMode = v;
+          continue;
         }
-        outputMode = v;
-        continue;
+
+        if (k === "--yes") {
+          const value = hasValue ? parseBooleanLike(v) : true;
+          if (value !== false) yes = true;
+          continue;
+        }
+
+        if (k === "--data-dir") {
+          if (!hasValue) return argumentError("--data-dir requires a value: --data-dir=<path>");
+          dataDir = normalizeMaybePath("dataDir", v);
+          continue;
+        }
+
+        if (k === "--name") {
+          if (!hasValue) return argumentError("--name requires a value: --name=<string>");
+          userName = v;
+          continue;
+        }
+
+        if (k === "--email") {
+          if (!hasValue) return argumentError("--email requires a value: --email=<string>");
+          userEmail = v;
+          continue;
+        }
+
+        if (k === "--sign") {
+          const value = hasValue ? parseBooleanLike(v) : true;
+          sign = value ?? true;
+          continue;
+        }
+
+        if (k === "--no-sign") {
+          const value = hasValue ? parseBooleanLike(v) : true;
+          if (value !== false) sign = false;
+          continue;
+        }
+
+        return argumentError(`Unknown flag '${k}' for onboard`);
       }
 
-      if (k === "--yes") {
-        const value = hasValue ? parseBooleanLike(v) : true;
-        if (value !== false) yes = true;
-        continue;
-      }
-
-      if (k === "--data-dir") {
-        if (!hasValue) return argumentError("--data-dir requires a value: --data-dir=<path>");
-        dataDir = normalizeMaybePath("dataDir", v);
-        continue;
-      }
-
-      if (k === "--name") {
-        if (!hasValue) return argumentError("--name requires a value: --name=<string>");
-        userName = v;
-        continue;
-      }
-
-      if (k === "--email") {
-        if (!hasValue) return argumentError("--email requires a value: --email=<string>");
-        userEmail = v;
-        continue;
-      }
-
-      if (k === "--sign") {
-        const value = hasValue ? parseBooleanLike(v) : true;
-        sign = value ?? true;
-        continue;
-      }
-
-      if (k === "--no-sign") {
-        const value = hasValue ? parseBooleanLike(v) : true;
-        if (value !== false) sign = false;
-        continue;
-      }
-
-      return argumentError(`Unknown flag '${k}' for onboard`);
+      return Result.ok({
+        type: "onboard",
+        outputMode,
+        dataDir,
+        userName,
+        userEmail,
+        sign,
+        yes,
+      } satisfies ParsedArgs);
     }
 
-    return Result.ok({
-      type: "onboard",
-      outputMode,
-      dataDir,
-      userName,
-      userEmail,
-      sign,
-      yes,
-    });
-  }
+    if (firstArg && !firstArg.startsWith("--")) {
+      const callableId = firstArg;
 
-  if (firstArg && !firstArg.startsWith("--")) {
-    const callableId = firstArg;
+      const fieldInputs: { field: string; value: string | boolean }[] = [];
+      const jsonFieldInputs: { field: string; source: JsonSource }[] = [];
+      const positionalArgs: string[] = [];
 
-    const fieldInputs: { field: string; value: string | boolean }[] = [];
-    const jsonFieldInputs: { field: string; source: JsonSource }[] = [];
-    const positionalArgs: string[] = [];
+      const seenCanonicalFields = new Map<string, string>();
 
-    const seenCanonicalFields = new Map<string, string>();
+      let baseInput: JsonSource | undefined;
+      let outputMode: OutputMode = "json";
 
-    let baseInput: JsonSource | undefined;
-    let outputMode: OutputMode = "json";
+      let stdinConsumer: string | undefined;
 
-    let stdinConsumer: string | undefined;
-
-    function claimStdin(consumer: string): ResultType<void, BridgeArgumentInvalid> {
-      if (stdinConsumer && stdinConsumer !== consumer) {
-        return argumentError(
-          `Stdin can only be used once per invocation (already used by ${stdinConsumer}, cannot use for ${consumer}).`,
-        );
-      }
-      stdinConsumer = consumer;
-      return Result.ok(undefined);
-    }
-
-    const restArgs = args.slice(1);
-    for (let i = 0; i < restArgs.length; i++) {
-      const a = restArgs[i];
-      if (!a) continue;
-
-      if (a === "--") {
-        positionalArgs.push(...restArgs.slice(i + 1));
-        break;
-      }
-
-      if (!a.startsWith("--")) {
-        positionalArgs.push(a);
-        continue;
-      }
-
-      const eq = a.indexOf("=");
-      const k = eq === -1 ? a : a.slice(0, eq);
-      const v = eq === -1 ? "" : a.slice(eq + 1);
-      const hasValue = eq !== -1;
-      if (!k || k === "--") continue;
-
-      // Special-case: tools <tool> --help / --help=true
-      if (k === "--help") {
-        const value = hasValue ? parseBooleanLike(v) : true;
-        if (value !== false) return Result.ok({ type: "help", callableId });
-        continue;
-      }
-
-      if (k === "--output") {
-        if (!hasValue) {
-          return argumentError("--output requires a value: --output=json|json-pretty");
-        }
-        if (v !== "json" && v !== "json-pretty") {
-          return argumentError(`Invalid --output value '${v}' (expected json|json-pretty)`);
-        }
-        outputMode = v;
-        continue;
-      }
-
-      // Whole payload JSON.
-      if (k === "--stdin") {
-        const value = hasValue ? parseBooleanLike(v) : true;
-        if (value === false) continue;
-
-        if (baseInput) {
-          return argumentError("Only one of --stdin/--input may be provided");
-        }
-        baseInput = { kind: "stdin" };
-        const claimed = claimStdin("--stdin");
-        if (claimed.status === "error") return Result.err(claimed.error);
-        continue;
-      }
-
-      if (k === "--input") {
-        if (!hasValue) {
+      function claimStdin(consumer: string): ResultType<void, BridgeArgumentInvalid> {
+        if (stdinConsumer && stdinConsumer !== consumer) {
           return argumentError(
-            "--input requires a value: --input=@file.json, --input=@-, or --input='<json>'",
+            `Stdin can only be used once per invocation (already used by ${stdinConsumer}, cannot use for ${consumer}).`,
           );
         }
-
-        if (baseInput) {
-          return argumentError("Only one of --stdin/--input may be provided");
-        }
-
-        const source = parseJsonSource(v);
-        if (source.status === "error") return Result.err(source.error);
-        if (source.value.kind === "stdin") {
-          const claimed = claimStdin("--input=@-");
-          if (claimed.status === "error") return Result.err(claimed.error);
-        }
-        baseInput = source.value;
-        continue;
+        stdinConsumer = consumer;
+        return Result.ok(undefined);
       }
 
-      const fieldRaw = k.slice(2);
-      if (!fieldRaw) continue;
+      const restArgs = args.slice(1);
+      for (let i = 0; i < restArgs.length; i++) {
+        const a = restArgs[i];
+        if (!a) continue;
 
-      if (fieldRaw.endsWith(":json")) {
-        const rawField = fieldRaw.slice(0, -":json".length);
-        const field = kebabToCamelCase(rawField);
-        if (!field) {
-          return argumentError(`Invalid JSON field flag '${k}'`);
+        if (a === "--") {
+          positionalArgs.push(...restArgs.slice(i + 1));
+          break;
         }
 
+        if (!a.startsWith("--")) {
+          positionalArgs.push(a);
+          continue;
+        }
+
+        const eq = a.indexOf("=");
+        const k = eq === -1 ? a : a.slice(0, eq);
+        const v = eq === -1 ? "" : a.slice(eq + 1);
+        const hasValue = eq !== -1;
+        if (!k || k === "--") continue;
+
+        // Special-case: tools <tool> --help / --help=true
+        if (k === "--help") {
+          const value = hasValue ? parseBooleanLike(v) : true;
+          if (value !== false) {
+            return Result.ok({ type: "help", callableId } satisfies ParsedArgs);
+          }
+          continue;
+        }
+
+        if (k === "--output") {
+          if (!hasValue) {
+            return argumentError("--output requires a value: --output=json|json-pretty");
+          }
+          if (v !== "json" && v !== "json-pretty") {
+            return argumentError(`Invalid --output value '${v}' (expected json|json-pretty)`);
+          }
+          outputMode = v;
+          continue;
+        }
+
+        // Whole payload JSON.
+        if (k === "--stdin") {
+          const value = hasValue ? parseBooleanLike(v) : true;
+          if (value === false) continue;
+
+          if (baseInput) {
+            return argumentError("Only one of --stdin/--input may be provided");
+          }
+          baseInput = { kind: "stdin" };
+          const claimed = resultOutcome(claimStdin("--stdin"));
+          if (!claimed.ok) return Result.err(claimed.error);
+          continue;
+        }
+
+        if (k === "--input") {
+          if (!hasValue) {
+            return argumentError(
+              "--input requires a value: --input=@file.json, --input=@-, or --input='<json>'",
+            );
+          }
+
+          if (baseInput) {
+            return argumentError("Only one of --stdin/--input may be provided");
+          }
+
+          const parsedSource = resultOutcome(parseJsonSource(v));
+          if (!parsedSource.ok) return Result.err(parsedSource.error);
+          const source = parsedSource.value;
+          if (source.kind === "stdin") {
+            const claimed = resultOutcome(claimStdin("--input=@-"));
+            if (!claimed.ok) return Result.err(claimed.error);
+          }
+          baseInput = source;
+          continue;
+        }
+
+        const fieldRaw = k.slice(2);
+        if (!fieldRaw) continue;
+
+        if (fieldRaw.endsWith(":json")) {
+          const rawField = fieldRaw.slice(0, -":json".length);
+          const field = kebabToCamelCase(rawField);
+          if (!field) {
+            return argumentError(`Invalid JSON field flag '${k}'`);
+          }
+
+          const previous = seenCanonicalFields.get(field);
+          if (previous && previous !== rawField) {
+            return argumentError(
+              `Duplicate field '${field}' via flags '--${previous}' and '--${rawField}'. Use only one casing.`,
+            );
+          }
+          if (!previous) seenCanonicalFields.set(field, rawField);
+
+          if (!hasValue) {
+            return argumentError(
+              `--${field}:json requires a value: --${rawField}:json=<json|@file|@->`,
+            );
+          }
+
+          const parsedSource = resultOutcome(parseJsonSource(v));
+          if (!parsedSource.ok) return Result.err(parsedSource.error);
+          const source = parsedSource.value;
+          if (source.kind === "stdin") {
+            const claimed = resultOutcome(claimStdin(`--${field}:json=@-`));
+            if (!claimed.ok) return Result.err(claimed.error);
+          }
+
+          jsonFieldInputs.push({ field, source });
+          continue;
+        }
+
+        // Default: treat as primitive string/bool.
+        const field = kebabToCamelCase(fieldRaw);
         const previous = seenCanonicalFields.get(field);
-        if (previous && previous !== rawField) {
+        if (previous && previous !== fieldRaw) {
           return argumentError(
-            `Duplicate field '${field}' via flags '--${previous}' and '--${rawField}'. Use only one casing.`,
+            `Duplicate field '${field}' via flags '--${previous}' and '--${fieldRaw}'. Use only one casing.`,
           );
         }
-        if (!previous) seenCanonicalFields.set(field, rawField);
+        if (!previous) seenCanonicalFields.set(field, fieldRaw);
 
-        if (!hasValue) {
-          return argumentError(
-            `--${field}:json requires a value: --${rawField}:json=<json|@file|@->`,
-          );
+        let parsedValue: string | boolean = true;
+
+        if (hasValue) {
+          const boolValue = parseBooleanLike(v);
+          parsedValue = boolValue ?? v;
         }
 
-        const source = parseJsonSource(v);
-        if (source.status === "error") return Result.err(source.error);
-        if (source.value.kind === "stdin") {
-          const claimed = claimStdin(`--${field}:json=@-`);
-          if (claimed.status === "error") return Result.err(claimed.error);
+        if (typeof parsedValue === "string") {
+          parsedValue = normalizeMaybePath(field, parsedValue);
         }
 
-        jsonFieldInputs.push({ field, source: source.value });
-        continue;
+        fieldInputs.push({ field, value: parsedValue });
       }
 
-      // Default: treat as primitive string/bool.
-      const field = kebabToCamelCase(fieldRaw);
-      const previous = seenCanonicalFields.get(field);
-      if (previous && previous !== fieldRaw) {
-        return argumentError(
-          `Duplicate field '${field}' via flags '--${previous}' and '--${fieldRaw}'. Use only one casing.`,
-        );
-      }
-      if (!previous) seenCanonicalFields.set(field, fieldRaw);
-
-      let parsedValue: string | boolean = true;
-
-      if (hasValue) {
-        const boolValue = parseBooleanLike(v);
-        parsedValue = boolValue ?? v;
-      }
-
-      if (typeof parsedValue === "string") {
-        parsedValue = normalizeMaybePath(field, parsedValue);
-      }
-
-      fieldInputs.push({ field, value: parsedValue });
+      return Result.ok({
+        type: "call",
+        callableId,
+        outputMode,
+        baseInput,
+        fieldInputs,
+        jsonFieldInputs,
+        positionalArgs,
+        usesStdin: stdinConsumer !== undefined,
+      } satisfies ParsedArgs);
     }
 
-    return Result.ok({
-      type: "call",
-      callableId,
-      outputMode,
-      baseInput,
-      fieldInputs,
-      jsonFieldInputs,
-      positionalArgs,
-      usesStdin: stdinConsumer !== undefined,
-    });
+    return Result.ok({ type: "unknown" } satisfies ParsedArgs);
   }
-
-  return Result.ok({ type: "unknown" });
 }
 
 export async function buildToolInput(
@@ -1566,15 +1621,17 @@ export async function buildToolInput(
   let input: JsonObject = {};
 
   if (parsed.baseInput) {
-    const baseInput = await readJsonObjectSource(parsed.baseInput, "--input/--stdin");
-    if (baseInput.status === "error") return Result.err(baseInput.error);
+    const baseInput = resultOutcome(
+      await readJsonObjectSource(parsed.baseInput, "--input/--stdin"),
+    );
+    if (!baseInput.ok) return Result.err(baseInput.error);
     input = baseInput.value;
   }
 
   for (const { field, source } of parsed.jsonFieldInputs) {
-    const value = await readJsonSource(source, `--${field}:json`);
-    if (value.status === "error") return Result.err(value.error);
-    input[field] = value.value;
+    const decoded = resultOutcome(await readJsonSource(source, `--${field}:json`));
+    if (!decoded.ok) return Result.err(decoded.error);
+    input[field] = decoded.value;
   }
 
   for (const { field, value } of parsed.fieldInputs) {
@@ -1688,11 +1745,12 @@ function closePrompt(prompt: PromptInterface): ResultType<void, BridgeCleanupFai
 function toolOutput(
   result: ResultType<ToolCallPayload, BridgeClientError>,
 ): ResultType<JsonValue, BridgeClientError> {
-  if (result.status === "error") return Result.err(result.error);
-  if (result.value.isError) {
-    return Result.err(new BridgeToolReportedFailure({ message: result.value.output }));
+  const outcome = resultOutcome(result);
+  if (!outcome.ok) return Result.err(outcome.error);
+  if (outcome.value.isError) {
+    return Result.err(new BridgeToolReportedFailure({ message: outcome.value.output }));
   }
-  return Result.ok(result.value.output);
+  return Result.ok(outcome.value.output);
 }
 
 async function runOnboardingOperation(
@@ -1706,10 +1764,8 @@ async function runOnboardingOperation(
     fallback: string,
   ): Promise<ResultType<string, BridgeExternalOperationFailed>> => {
     if (!prompt || parsed.yes) return Result.ok(fallback);
-    const answer = await askPrompt(prompt, `${label} (${fallback}): `);
-    if (answer.status === "error") return Result.err(answer.error);
-    const value = answer.value.trim();
-    return Result.ok(value.length > 0 ? value : fallback);
+    const answer = resultOutcome(await askPrompt(prompt, `${label} (${fallback}): `));
+    return answer.ok ? Result.ok(answer.value.trim() || fallback) : Result.err(answer.error);
   };
 
   const askYesNo = async (
@@ -1718,8 +1774,8 @@ async function runOnboardingOperation(
   ): Promise<ResultType<boolean, BridgeExternalOperationFailed>> => {
     if (!prompt || parsed.yes) return Result.ok(fallback);
     const suffix = fallback ? "Y/n" : "y/N";
-    const answer = await askPrompt(prompt, `${label} (${suffix}): `);
-    if (answer.status === "error") return Result.err(answer.error);
+    const answer = resultOutcome(await askPrompt(prompt, `${label} (${suffix}): `));
+    if (!answer.ok) return Result.err(answer.error);
     const value = answer.value.trim().toLowerCase();
     if (value === "") return Result.ok(fallback);
     if (value === "y" || value === "yes" || value === "true") return Result.ok(true);
@@ -1729,74 +1785,84 @@ async function runOnboardingOperation(
 
   let userName = parsed.userName;
   if (userName === undefined) {
-    const answer = await askText("Git user.name", defaultName);
-    if (answer.status === "error") return Result.err(answer.error);
-    userName = answer.value;
+    const answered = resultOutcome(await askText("Git user.name", defaultName));
+    if (!answered.ok) return Result.err(answered.error);
+    userName = answered.value;
   }
   let userEmail = parsed.userEmail;
   if (userEmail === undefined) {
-    const answer = await askText("Git user.email", defaultEmail);
-    if (answer.status === "error") return Result.err(answer.error);
-    userEmail = answer.value;
+    const answered = resultOutcome(await askText("Git user.email", defaultEmail));
+    if (!answered.ok) return Result.err(answered.error);
+    userEmail = answered.value;
   }
   let sign = parsed.sign;
   if (sign === undefined) {
-    const answer = await askYesNo("Enable GPG commit signing (no-passphrase key)", true);
-    if (answer.status === "error") return Result.err(answer.error);
-    sign = answer.value;
+    const answered = resultOutcome(
+      await askYesNo("Enable GPG commit signing (no-passphrase key)", true),
+    );
+    if (!answered.ok) return Result.err(answered.error);
+    sign = answered.value;
   }
 
   const baseInput: JsonObject = parsed.dataDir ? { dataDir: parsed.dataDir } : {};
-  const bootstrap = toolOutput(await callTool("onboarding.bootstrap", baseInput));
-  if (bootstrap.status === "error") return Result.err(bootstrap.error);
-  const vcsEnv = toolOutput(await callTool("onboarding.vcs_env", baseInput));
-  if (vcsEnv.status === "error") return Result.err(vcsEnv.error);
+  const bootstrap = resultOutcome(toolOutput(await callTool("onboarding.bootstrap", baseInput)));
+  if (!bootstrap.ok) return Result.err(bootstrap.error);
+  const vcs = resultOutcome(toolOutput(await callTool("onboarding.vcs_env", baseInput)));
+  if (!vcs.ok) return Result.err(vcs.error);
+  const vcsEnv = vcs.value;
 
   let fingerprint: string | undefined;
   let publicKeyArmored: string | undefined;
   if (sign) {
-    const generated = toolOutput(
-      await callTool("onboarding.gnupg", {
-        ...baseInput,
-        mode: "generate",
-        userName,
-        userEmail,
-        uidComment: "lilac",
-      }),
+    const generated = resultOutcome(
+      toolOutput(
+        await callTool("onboarding.gnupg", {
+          ...baseInput,
+          mode: "generate",
+          userName,
+          userEmail,
+          uidComment: "lilac",
+        }),
+      ),
     );
-    if (generated.status === "error") return Result.err(generated.error);
-    const decodedGenerate = decodeOnboardingGpgGenerate(generated.value);
-    if (decodedGenerate.status === "error") return Result.err(decodedGenerate.error);
+    if (!generated.ok) return Result.err(generated.error);
+    const decodedGenerate = resultOutcome(decodeOnboardingGpgGenerate(generated.value));
+    if (!decodedGenerate.ok) return Result.err(decodedGenerate.error);
     fingerprint = decodedGenerate.value.fingerprint;
 
-    const exported = toolOutput(
-      await callTool("onboarding.gnupg", {
-        ...baseInput,
-        mode: "export_public",
-        fingerprint,
-      }),
+    const exported = resultOutcome(
+      toolOutput(
+        await callTool("onboarding.gnupg", {
+          ...baseInput,
+          mode: "export_public",
+          fingerprint,
+        }),
+      ),
     );
-    if (exported.status === "error") return Result.err(exported.error);
-    const decodedExport = decodeOnboardingGpgExport(exported.value);
-    if (decodedExport.status === "error") return Result.err(decodedExport.error);
+    if (!exported.ok) return Result.err(exported.error);
+    const decodedExport = resultOutcome(decodeOnboardingGpgExport(exported.value));
+    if (!decodedExport.ok) return Result.err(decodedExport.error);
     publicKeyArmored = decodedExport.value.publicKeyArmored;
   }
 
-  const configured = toolOutput(
-    await callTool("onboarding.git_identity", {
-      ...baseInput,
-      mode: "configure",
-      userName,
-      userEmail,
-      enableSigning: sign,
-      ...(sign ? { signingKey: fingerprint } : {}),
-    }),
+  const configured = resultOutcome(
+    toolOutput(
+      await callTool("onboarding.git_identity", {
+        ...baseInput,
+        mode: "configure",
+        userName,
+        userEmail,
+        enableSigning: sign,
+        ...(sign ? { signingKey: fingerprint } : {}),
+      }),
+    ),
   );
-  if (configured.status === "error") return Result.err(configured.error);
-  const tested = toolOutput(
-    await callTool("onboarding.git_identity", { ...baseInput, mode: "test" }),
+  if (!configured.ok) return Result.err(configured.error);
+  const testResult = resultOutcome(
+    toolOutput(await callTool("onboarding.git_identity", { ...baseInput, mode: "test" })),
   );
-  if (tested.status === "error") return Result.err(tested.error);
+  if (!testResult.ok) return Result.err(testResult.error);
+  const tested = testResult.value;
 
   let signing: OnboardingOutput["signing"] = { enabled: false };
   if (sign) {
@@ -1819,9 +1885,9 @@ async function runOnboardingOperation(
     userName,
     userEmail,
     signing,
-    vcsEnv: vcsEnv.value,
-    gitTest: tested.value,
-  });
+    vcsEnv,
+    gitTest: tested,
+  } satisfies OnboardingOutput);
 }
 
 async function runOnboardingWizard(
@@ -1838,19 +1904,20 @@ async function runOnboardingWizard(
 
   let prompt: PromptInterface | null = null;
   if (process.stdin.isTTY) {
-    const opened = openPromptInterface();
-    if (opened.status === "error") return Result.err(opened.error);
+    const opened = resultOutcome(openPromptInterface());
+    if (!opened.ok) return Result.err(opened.error);
     prompt = opened.value;
   }
 
   const operation = await runOnboardingOperation(parsed, prompt);
   if (!prompt) return operation;
-  const cleanup = closePrompt(prompt);
-  if (cleanup.status === "ok") return operation;
-  if (operation.status === "ok") return Result.err(cleanup.error);
+  const cleanup = resultOutcome(closePrompt(prompt));
+  if (cleanup.ok) return operation;
+  const operationOutcome = resultOutcome(operation);
+  if (operationOutcome.ok) return Result.err(cleanup.error);
   return Result.err(
     new BridgeOperationAndCleanupFailed({
-      operationError: operation.error,
+      operationError: operationOutcome.error,
       cleanupError: cleanup.error,
       message: "Onboarding and prompt cleanup both failed",
     }),
@@ -1882,8 +1949,8 @@ async function readJsonObjectSource(
   label: string,
 ): Promise<ResultType<JsonObject, BridgeClientError>> {
   const value = await readJsonSource(source, label);
-  if (value.status === "error") return Result.err(value.error);
-  return decodeJsonObject(value.value, label);
+  const outcome = resultOutcome(value);
+  return outcome.ok ? decodeJsonObject(outcome.value, label) : Result.err(outcome.error);
 }
 
 async function readJsonSource(
@@ -1893,13 +1960,13 @@ async function readJsonSource(
   let raw: string;
 
   if (source.kind === "stdin") {
-    const stdin = await readStdinText();
-    if (stdin.status === "error") return Result.err(stdin.error);
-    raw = stdin.value;
+    const read = resultOutcome(await readStdinText());
+    if (!read.ok) return Result.err(read.error);
+    raw = read.value;
   } else if (source.kind === "file") {
-    const file = await readFileText(source.path, `read JSON file for ${label}`);
-    if (file.status === "error") return Result.err(file.error);
-    raw = file.value;
+    const read = resultOutcome(await readFileText(source.path, `read JSON file for ${label}`));
+    if (!read.ok) return Result.err(read.error);
+    raw = read.value;
   } else {
     raw = source.text;
   }
@@ -1995,7 +2062,7 @@ function normalizePathCandidate(candidate: string | undefined, cwd: string): str
     () => realpathSync.native(resolved),
     (cause) => cause,
   );
-  return normalized.status === "ok" ? normalized.value : resolved;
+  return normalized.match({ ok: (value) => value, err: () => resolved });
 }
 
 export function isMainModule(args = process.argv, cwd = process.cwd(), currentFile = CURRENT_FILE) {
@@ -2022,9 +2089,14 @@ export function isMainModule(args = process.argv, cwd = process.cwd(), currentFi
 }
 
 function reportMainResult(result: ResultType<void, BridgeClientError>): void {
-  if (result.status === "ok") return;
-  console.error(`${styles.red("Error:")} ${result.error.message}`);
-  process.exitCode = 1;
+  const report = result.match<() => void>({
+    ok: () => () => undefined,
+    err: (error) => () => {
+      console.error(`${styles.red("Error:")} ${error.message}`);
+      process.exitCode = 1;
+    },
+  });
+  report();
 }
 
 export function reportMainDefect(cause: unknown): void {
@@ -2041,11 +2113,12 @@ async function runMainEntrypoint(): Promise<void> {
     try: main,
     catch: captureBridgeFailure,
   });
-  if (result.status === "error") {
-    reportMainDefect(result.error.kind === "panic" ? result.error.panic : result.error.cause);
-    return;
-  }
-  reportMainResult(result.value);
+  const report = result.match<() => void>({
+    ok: (value) => () => reportMainResult(value),
+    err: (failure) => () =>
+      reportMainDefect(failure.kind === "panic" ? failure.panic : failure.cause),
+  });
+  report();
 }
 
 function startMain(): void {

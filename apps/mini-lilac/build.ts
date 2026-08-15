@@ -94,98 +94,101 @@ export function hasOpenTuiCoreImport(specifiers: readonly (string | undefined)[]
 }
 
 export async function buildMiniLilac(): Promise<ResultType<void, MiniLilacBuildError>> {
-  const prepared = await captureBuildOperation("prepare the output directory", async () => {
-    await fs.rm("./dist", { recursive: true, force: true });
-    await fs.mkdir("./dist", { recursive: true });
-  });
-  if (prepared.status === "error") return Result.err(prepared.error);
-
-  const openTui = await captureBuildOperation("read @opentui/core", async () => {
-    const entry = fileURLToPath(import.meta.resolve("@opentui/core"));
-    return { entry, source: await fs.readFile(entry, "utf8") };
-  });
-  if (openTui.status === "error") return Result.err(openTui.error);
-  if (!openTui.value.source.includes('forceTableRefresh && block.token.type === "table"')) {
-    return Result.err(
-      new MiniLilacBuildPatchMissing({
-        message: "The required @opentui/core Markdown patch is not installed",
+  return Result.gen(async function* () {
+    yield* Result.await(
+      captureBuildOperation("prepare the output directory", async () => {
+        await fs.rm("./dist", { recursive: true, force: true });
+        await fs.mkdir("./dist", { recursive: true });
       }),
     );
-  }
 
-  const bundled = await captureBuildOperation("bundle the executable", () =>
-    Bun.build({
-      entrypoints: ["./src/main.ts"],
-      outdir: "./dist",
-      target: "bun",
-      plugins: [solidPlugin],
-      external: ["@opentui/core-darwin-*", "@opentui/core-linux-*", "@opentui/core-win32-*"],
-      banner: "#!/usr/bin/env bun",
-    }),
-  );
-  if (bundled.status === "error") return Result.err(bundled.error);
-  if (!bundled.value.success) {
-    console.error("mini-lilac build failed:");
-    for (const log of bundled.value.logs) console.error(log);
-    return Result.err(new MiniLilacBundlingFailed({ message: "Bun.build failed" }));
-  }
-
-  const scanned = await captureBuildOperation("inspect bundled imports", async () => {
-    const transpiler = new Bun.Transpiler({ loader: "js" });
-    return (
-      await Promise.all(
-        bundled.value.outputs
-          .filter((output) => output.path.endsWith(".js"))
-          .map(async (output) =>
-            transpiler.scanImports((await output.text()).replace(/^#![^\n]*\n/u, "")),
-          ),
-      )
-    ).flat();
-  });
-  if (scanned.status === "error") return Result.err(scanned.error);
-  if (hasOpenTuiCoreImport(scanned.value.map((importRecord) => importRecord.path))) {
-    return Result.err(
-      new MiniLilacBuildRetainedDependency({
-        message: "The published bundle still imports unpatched @opentui/core JavaScript",
+    const openTui = yield* Result.await(
+      captureBuildOperation("read @opentui/core", async () => {
+        const entry = fileURLToPath(import.meta.resolve("@opentui/core"));
+        return { entry, source: await fs.readFile(entry, "utf8") };
       }),
     );
-  }
+    if (!openTui.source.includes('forceTableRefresh && block.token.type === "table"')) {
+      return Result.err(
+        new MiniLilacBuildPatchMissing({
+          message: "The required @opentui/core Markdown patch is not installed",
+        }),
+      );
+    }
 
-  const sourcePackageFile = await captureBuildOperation("read package.json", () =>
-    Bun.file("./package.json").json(),
-  );
-  if (sourcePackageFile.status === "error") return Result.err(sourcePackageFile.error);
-  const sourcePackage = decodeSourcePackage(sourcePackageFile.value);
-  if (sourcePackage.status === "error") return Result.err(sourcePackage.error);
-
-  const publishedPackage = {
-    ...sourcePackage.value,
-    type: "module",
-    bin: { "mini-lilac": "main.js" },
-    files: ["main.js", "parser.worker.js", "*.scm", "*.wasm", "README.md", "LICENSE"],
-  };
-  const staged = await captureBuildOperation("stage publication files", () =>
-    Promise.all([
-      fs.writeFile("./dist/package.json", `${JSON.stringify(publishedPackage, null, 2)}\n`),
-      fs.copyFile(
-        path.join(path.dirname(openTui.value.entry), "parser.worker.js"),
-        "./dist/parser.worker.js",
+    const bundled = yield* Result.await(
+      captureBuildOperation("bundle the executable", () =>
+        Bun.build({
+          entrypoints: ["./src/main.ts"],
+          outdir: "./dist",
+          target: "bun",
+          plugins: [solidPlugin],
+          external: ["@opentui/core-darwin-*", "@opentui/core-linux-*", "@opentui/core-win32-*"],
+          banner: "#!/usr/bin/env bun",
+        }),
       ),
-      fs.copyFile("./README.md", "./dist/README.md"),
-      fs.copyFile("./LICENSE", "./dist/LICENSE"),
-    ]).then(() => undefined),
-  );
-  if (staged.status === "error") return Result.err(staged.error);
-  return Result.ok(undefined);
+    );
+    if (!bundled.success) {
+      console.error("mini-lilac build failed:");
+      for (const log of bundled.logs) console.error(log);
+      return Result.err(new MiniLilacBundlingFailed({ message: "Bun.build failed" }));
+    }
+
+    const scanned = yield* Result.await(
+      captureBuildOperation("inspect bundled imports", async () => {
+        const transpiler = new Bun.Transpiler({ loader: "js" });
+        return (
+          await Promise.all(
+            bundled.outputs
+              .filter((output) => output.path.endsWith(".js"))
+              .map(async (output) =>
+                transpiler.scanImports((await output.text()).replace(/^#![^\n]*\n/u, "")),
+              ),
+          )
+        ).flat();
+      }),
+    );
+    if (hasOpenTuiCoreImport(scanned.map((importRecord) => importRecord.path))) {
+      return Result.err(
+        new MiniLilacBuildRetainedDependency({
+          message: "The published bundle still imports unpatched @opentui/core JavaScript",
+        }),
+      );
+    }
+
+    const sourcePackageFile = yield* Result.await(
+      captureBuildOperation("read package.json", () => Bun.file("./package.json").json()),
+    );
+    const sourcePackage = yield* decodeSourcePackage(sourcePackageFile);
+
+    const publishedPackage = {
+      ...sourcePackage,
+      type: "module",
+      bin: { "mini-lilac": "main.js" },
+      files: ["main.js", "parser.worker.js", "*.scm", "*.wasm", "README.md", "LICENSE"],
+    };
+    yield* Result.await(
+      captureBuildOperation("stage publication files", () =>
+        Promise.all([
+          fs.writeFile("./dist/package.json", `${JSON.stringify(publishedPackage, null, 2)}\n`),
+          fs.copyFile(
+            path.join(path.dirname(openTui.entry), "parser.worker.js"),
+            "./dist/parser.worker.js",
+          ),
+          fs.copyFile("./README.md", "./dist/README.md"),
+          fs.copyFile("./LICENSE", "./dist/LICENSE"),
+        ]).then(() => undefined),
+      ),
+    );
+    return Result.ok(undefined);
+  });
 }
 
 export function signalBuildFailure(error: MiniLilacBuildError): never {
-  const options =
-    error._tag === "MiniLilacBuildOperationFailed" ? { cause: error.cause } : undefined;
-  throw new Error(error.message, options);
+  throw error;
 }
 
 if (import.meta.main) {
   const result = await buildMiniLilac();
-  if (result.status === "error") signalBuildFailure(result.error);
+  result.match({ ok: () => undefined, err: (error) => () => signalBuildFailure(error) })?.();
 }

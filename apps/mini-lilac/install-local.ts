@@ -59,82 +59,91 @@ async function captureInstallOperation<T>(
 export async function decodeNpmPackOutput(
   output: string,
 ): Promise<ResultType<string, LocalInstallOperationFailed | NpmPackOutputInvalid>> {
-  const parsedJson = await captureInstallOperation("parse npm pack output", async () => {
-    const value: unknown = JSON.parse(output);
-    return value;
-  });
-  if (parsedJson.status === "error") return Result.err(parsedJson.error);
-
-  const parsed = npmPackOutputSchema.safeParse(parsedJson.value);
-  if (!parsed.success) {
-    return Result.err(
-      new NpmPackOutputInvalid({ message: `Invalid npm pack output: ${parsed.error.message}` }),
+  return Result.gen(async function* () {
+    const parsedJson = yield* Result.await(
+      captureInstallOperation("parse npm pack output", async () => {
+        const value: unknown = JSON.parse(output);
+        return value;
+      }),
     );
-  }
-  return Result.ok(parsed.data[0].filename);
+
+    const parsed = npmPackOutputSchema.safeParse(parsedJson);
+    if (!parsed.success) {
+      return Result.err(
+        new NpmPackOutputInvalid({ message: `Invalid npm pack output: ${parsed.error.message}` }),
+      );
+    }
+    return Result.ok(parsed.data[0].filename);
+  });
 }
 
 async function run(command: readonly string[]): Promise<ResultType<void, LocalInstallError>> {
-  const executed = await captureInstallOperation(`run ${command.join(" ")}`, async () => {
-    const child = Bun.spawn([...command], {
-      cwd: import.meta.dir,
-      stdin: "inherit",
-      stdout: "inherit",
-      stderr: "inherit",
-    });
-    return child.exited;
-  });
-  if (executed.status === "error") return Result.err(executed.error);
-  if (executed.value !== 0) {
-    return Result.err(
-      new LocalInstallCommandFailed({
-        command,
-        exitCode: executed.value,
-        message: `Command failed (${executed.value}): ${command.join(" ")}`,
+  return Result.gen(async function* () {
+    const exitCode = yield* Result.await(
+      captureInstallOperation(`run ${command.join(" ")}`, async () => {
+        const child = Bun.spawn([...command], {
+          cwd: import.meta.dir,
+          stdin: "inherit",
+          stdout: "inherit",
+          stderr: "inherit",
+        });
+        return child.exited;
       }),
     );
-  }
-  return Result.ok(undefined);
+    if (exitCode !== 0) {
+      return Result.err(
+        new LocalInstallCommandFailed({
+          command,
+          exitCode,
+          message: `Command failed (${exitCode}): ${command.join(" ")}`,
+        }),
+      );
+    }
+    return Result.ok(undefined);
+  });
 }
 
 export async function installLocalPackage(): Promise<ResultType<void, LocalInstallError>> {
   const bun = Bun.which("bun") ?? "bun";
-  const built = await run([bun, "run", "build"]);
-  if (built.status === "error") return Result.err(built.error);
+  return Result.gen(async function* () {
+    yield* Result.await(run([bun, "run", "build"]));
 
-  const packed = await captureInstallOperation("run npm pack", async () => {
-    const pack = Bun.spawn(["npm", "pack", "--workspaces=false", "./dist", "--json"], {
-      cwd: import.meta.dir,
-      stdin: "ignore",
-      stdout: "pipe",
-      stderr: "inherit",
-    });
-    const [output, exitCode] = await Promise.all([new Response(pack.stdout).text(), pack.exited]);
-    return { output, exitCode };
-  });
-  if (packed.status === "error") return Result.err(packed.error);
-  if (packed.value.exitCode !== 0) {
-    return Result.err(
-      new NpmPackFailed({
-        exitCode: packed.value.exitCode,
-        message: `npm pack failed with exit code ${packed.value.exitCode}`,
+    const packed = yield* Result.await(
+      captureInstallOperation("run npm pack", async () => {
+        const pack = Bun.spawn(["npm", "pack", "--workspaces=false", "./dist", "--json"], {
+          cwd: import.meta.dir,
+          stdin: "ignore",
+          stdout: "pipe",
+          stderr: "inherit",
+        });
+        const [output, exitCode] = await Promise.all([
+          new Response(pack.stdout).text(),
+          pack.exited,
+        ]);
+        return { output, exitCode };
       }),
     );
-  }
+    if (packed.exitCode !== 0) {
+      return Result.err(
+        new NpmPackFailed({
+          exitCode: packed.exitCode,
+          message: `npm pack failed with exit code ${packed.exitCode}`,
+        }),
+      );
+    }
 
-  const filename = await decodeNpmPackOutput(packed.value.output);
-  if (filename.status === "error") return Result.err(filename.error);
-  const removed = await run([bun, "remove", "--global", PACKAGE_NAME]);
-  if (removed.status === "error") return Result.err(removed.error);
-  return run([bun, "add", "--global", path.resolve(import.meta.dir, filename.value)]);
+    const filename = yield* Result.await(decodeNpmPackOutput(packed.output));
+    yield* Result.await(run([bun, "remove", "--global", PACKAGE_NAME]));
+    yield* Result.await(run([bun, "add", "--global", path.resolve(import.meta.dir, filename)]));
+    return Result.ok(undefined);
+  });
 }
 
 export function signalLocalInstallFailure(error: LocalInstallError): never {
-  const options = error._tag === "LocalInstallOperationFailed" ? { cause: error.cause } : undefined;
-  throw new Error(error.message, options);
+  throw error;
 }
 
 if (import.meta.main) {
   const result = await installLocalPackage();
-  if (result.status === "error") signalLocalInstallFailure(result.error);
+  result.match({ ok: () => undefined, err: (error) => () => signalLocalInstallFailure(error) })?.();
 }

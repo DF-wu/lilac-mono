@@ -34,11 +34,14 @@ import {
 
 export async function main(argv: readonly string[]): Promise<number> {
   const parsedOptions = parseCliOptions({ argv, env: process.env, cwd: process.cwd() });
-  if (parsedOptions.status === "error") {
-    process.stderr.write(`${parsedOptions.error.message}\n`);
-    return 1;
-  }
-  const options = parsedOptions.value;
+  const options = parsedOptions.match({
+    ok: (value) => value,
+    err: (error) => {
+      process.stderr.write(`${error.message}\n`);
+      return undefined;
+    },
+  });
+  if (options === undefined) return 1;
 
   if (options.help) {
     process.stdout.write(HELP_TEXT);
@@ -60,13 +63,14 @@ export async function main(argv: readonly string[]): Promise<number> {
   const preferenceServer = bindingPreferenceServerKey(options.server);
   let preferences: BindingPreferences = { version: 1, servers: {} };
   const loadedPreferences = await loadBindingPreferences(preferencesPath);
-  if (loadedPreferences.status === "ok") {
-    preferences = loadedPreferences.value.preferences;
-  } else {
-    process.stderr.write(
-      `Warning: could not load TUI preferences: ${loadedPreferences.error.message}\n`,
-    );
-  }
+  loadedPreferences.match({
+    ok: (value) => {
+      preferences = value.preferences;
+    },
+    err: (error) => {
+      process.stderr.write(`Warning: could not load TUI preferences: ${error.message}\n`);
+    },
+  });
 
   const io = createReadlinePreflightIO();
   const resolvedStartup = await resolveStartupSession(
@@ -76,11 +80,14 @@ export async function main(argv: readonly string[]): Promise<number> {
     preferences.servers[preferenceServer],
   );
   io.close();
-  if (resolvedStartup.status === "error") {
-    process.stderr.write(`Failed to start: ${resolvedStartup.error.message}\n`);
-    return 1;
-  }
-  const startup = resolvedStartup.value;
+  const startup = resolvedStartup.match({
+    ok: (value) => value,
+    err: (error) => {
+      process.stderr.write(`Failed to start: ${error.message}\n`);
+      return undefined;
+    },
+  });
+  if (startup === undefined) return 1;
 
   const transport = new MiniLilacTransport({
     baseUrl: options.server,
@@ -106,11 +113,14 @@ export async function main(argv: readonly string[]): Promise<number> {
     backgroundColor: "transparent",
     onDestroy: () => resolveDestroyed?.(),
   });
-  if (createdRenderer.status === "error") {
-    process.stderr.write(`Failed to start: ${createdRenderer.error.message}\n`);
-    return 1;
-  }
-  const renderer = createdRenderer.value;
+  const renderer = createdRenderer.match({
+    ok: (value) => value,
+    err: (error) => {
+      process.stderr.write(`Failed to start: ${error.message}\n`);
+      return undefined;
+    },
+  });
+  if (renderer === undefined) return 1;
   let continuationRequested = false;
   let currentSessionId = startup.sessionId;
   let shutdownOutcome: TerminalShutdownOutcome = { kind: "success" };
@@ -119,7 +129,8 @@ export async function main(argv: readonly string[]): Promise<number> {
   const terminalRun = await runWithOwnedTerminalRenderer(renderer, async () => {
     const theme = await readTerminalTheme(renderer);
     const background = setTerminalBackground(renderer, theme.background);
-    if (background.status === "error") return Result.err(background.error);
+    const backgroundError = background.match({ ok: () => undefined, err: (error) => error });
+    if (backgroundError !== undefined) return Result.err(backgroundError);
 
     const rememberBindings = (bindings: {
       readonly model: string | undefined;
@@ -132,11 +143,12 @@ export async function main(argv: readonly string[]): Promise<number> {
       };
       preferenceWrite = preferenceWrite.then(async () => {
         const saved = await saveBindingPreferences(preferencesPath, preferences);
-        if (saved.status === "error") {
-          deferredWarnings.push(
-            `Warning: could not save TUI preferences: ${saved.error.message}\n`,
-          );
-        }
+        saved.match({
+          ok: () => {},
+          err: (error) => {
+            deferredWarnings.push(`Warning: could not save TUI preferences: ${error.message}\n`);
+          },
+        });
       });
     };
     const rendered = await renderTerminalApp(() => {
@@ -145,27 +157,26 @@ export async function main(argv: readonly string[]): Promise<number> {
         sessionId: string,
       ): Promise<ResultType<void, ExistingSessionLoadError>> => {
         const loaded = await loadExistingSession(transport, sessionId, options.cwd);
-        if (loaded.status === "error") return Result.err(loaded.error);
-        const { snapshot, messages, todos, replayCursor } = loaded.value;
-        transport.setSessionBindings({
-          model: snapshot.model ?? undefined,
-          profile: snapshot.profile ?? undefined,
-          reasoning: snapshot.reasoning ?? undefined,
+        return loaded.map(({ snapshot, messages, todos, replayCursor }) => {
+          transport.setSessionBindings({
+            model: snapshot.model ?? undefined,
+            profile: snapshot.profile ?? undefined,
+            reasoning: snapshot.reasoning ?? undefined,
+          });
+          currentSessionId = snapshot.id;
+          setCurrent({
+            sessionId: snapshot.id,
+            model: snapshot.model ?? undefined,
+            profile: snapshot.profile ?? undefined,
+            reasoning: snapshot.reasoning ?? undefined,
+            snapshot,
+            messages,
+            todos,
+            replayCursor,
+            models: startup.models,
+            profiles: startup.profiles,
+          });
         });
-        currentSessionId = snapshot.id;
-        setCurrent({
-          sessionId: snapshot.id,
-          model: snapshot.model ?? undefined,
-          profile: snapshot.profile ?? undefined,
-          reasoning: snapshot.reasoning ?? undefined,
-          snapshot,
-          messages,
-          todos,
-          replayCursor,
-          models: startup.models,
-          profiles: startup.profiles,
-        });
-        return Result.ok(undefined);
       };
       const newSession = (bindings: {
         readonly model: string | undefined;
@@ -216,17 +227,20 @@ export async function main(argv: readonly string[]): Promise<number> {
         </Show>
       );
     }, renderer);
-    if (rendered.status === "error") return Result.err(rendered.error);
+    const renderError = rendered.match({ ok: () => undefined, err: (error) => error });
+    if (renderError !== undefined) return Result.err(renderError);
     await destroyed;
     const shutdown = resolveTerminalShutdownOutcome(shutdownOutcome);
-    if (shutdown.status === "error") return Result.err(shutdown.error);
+    const shutdownError = shutdown.match({ ok: () => undefined, err: (error) => error });
+    if (shutdownError !== undefined) return Result.err(shutdownError);
     await preferenceWrite;
     return Result.ok(undefined);
   });
 
   for (const warning of deferredWarnings) process.stderr.write(warning);
-  if (terminalRun.status === "error") {
-    process.stderr.write(`${terminalRun.error.message}\n`);
+  const terminalError = terminalRun.match({ ok: () => undefined, err: (error) => error });
+  if (terminalError !== undefined) {
+    process.stderr.write(`${terminalError.message}\n`);
     return 1;
   }
   if (continuationRequested) {
@@ -247,6 +261,11 @@ export async function main(argv: readonly string[]): Promise<number> {
 
 if (import.meta.main) {
   const outcome = await runTerminalEntrypoint(() => main(process.argv.slice(2)));
-  if (outcome.status === "error") process.stderr.write(`${outcome.error.message}\n`);
-  process.exitCode = outcome.status === "ok" ? outcome.value : 1;
+  process.exitCode = outcome.match({
+    ok: (value) => value,
+    err: (error) => {
+      process.stderr.write(`${error.message}\n`);
+      return 1;
+    },
+  });
 }

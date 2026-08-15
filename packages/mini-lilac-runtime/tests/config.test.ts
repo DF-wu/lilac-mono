@@ -1,7 +1,9 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, spyOn } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
+
+import { Panic } from "better-result";
 
 import { LEVEL1_TOOL_NAMES } from "@stanley2058/lilac-coding-tools";
 import {
@@ -14,6 +16,7 @@ import {
   decodeRuntimeConfigYaml,
   loadRuntimeConfig,
   loadRuntimeConfigResult,
+  RuntimeConfigAuthTokenMissing,
   runtimeConfigSchema,
 } from "../src/config";
 import * as runtimeRoot from "../src/index";
@@ -96,6 +99,24 @@ const baseConfig = {
 } as const;
 
 describe("runtime config", () => {
+  it("propagates the exact Panic from YAML decoding", () => {
+    const panic = new Panic({ message: "runtime config parser invariant" });
+    const parse = spyOn(Bun.YAML, "parse").mockImplementation(() => {
+      throw panic;
+    });
+
+    let thrown: unknown;
+    try {
+      decodeRuntimeConfigYaml("configVersion: 1", "fixture.yaml");
+    } catch (cause) {
+      thrown = cause;
+    } finally {
+      parse.mockRestore();
+    }
+
+    expect(thrown).toBe(panic);
+  });
+
   it("redacts malformed YAML parser payloads", () => {
     const secret = "runtime-config-parser-secret";
     const malformed = decodeRuntimeConfigYaml(`server: [${secret}`, "fixture.yaml");
@@ -208,7 +229,13 @@ describe("runtime config", () => {
         server: { host: "0.0.0.0", port: 8080, authTokenEnv: "MINI_TOKEN" },
       }),
     );
-    await expect(loadRuntimeConfig(file, { env: {} })).rejects.toThrow("missing or empty");
+    let missingToken: unknown;
+    try {
+      await loadRuntimeConfig(file, { env: {} });
+    } catch (cause) {
+      missingToken = cause;
+    }
+    expect(missingToken).toBeInstanceOf(RuntimeConfigAuthTokenMissing);
     expect((await loadRuntimeConfig(file, { env: { MINI_TOKEN: "secret" } })).server.host).toBe(
       "0.0.0.0",
     );

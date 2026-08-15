@@ -377,15 +377,25 @@ async function validatePublicDestination(
   }
 
   const normalized = normalizedHostname(url);
-  if (normalized.status === "error") return Result.err(normalized.error);
-  const hostname = normalized.value;
+  let hostname!: string;
+  let validationFailure: WebfetchPrimaryError | undefined;
+  normalized.match({
+    ok: (value) => void (hostname = value),
+    err: (error) => void (validationFailure = error),
+  });
+  if (validationFailure !== undefined) return Result.err(validationFailure);
   if (isBlockedHostname(hostname)) {
     return Result.err(destinationRejected(`webfetch blocked hostname '${hostname}'`));
   }
   if (isIP(hostname) !== 0) {
     const blocked = blockedAddressResult(hostname);
-    if (blocked.status === "error") return Result.err(blocked.error);
-    if (blocked.value) {
+    let addressBlocked = false;
+    blocked.match({
+      ok: (value) => void (addressBlocked = value),
+      err: (error) => void (validationFailure = error),
+    });
+    if (validationFailure !== undefined) return Result.err(validationFailure);
+    if (addressBlocked) {
       return Result.err(destinationRejected(`webfetch blocked address '${hostname}'`));
     }
     return Result.ok({ addresses: [hostname], hostname });
@@ -400,8 +410,12 @@ async function validatePublicDestination(
       signal,
     ),
   );
-  if (lookupResult.status === "error") return Result.err(lookupResult.error);
-  const addresses = lookupResult.value;
+  let addresses!: readonly LookupResult[];
+  lookupResult.match({
+    ok: (value) => void (addresses = value),
+    err: (error) => void (validationFailure = error),
+  });
+  if (validationFailure !== undefined) return Result.err(validationFailure);
   if (addresses.length === 0) {
     return Result.err(destinationRejected(`webfetch could not resolve '${hostname}'`));
   }
@@ -410,7 +424,8 @@ async function validatePublicDestination(
       return Result.err(destinationRejected(`webfetch blocked destination for '${hostname}'`));
     }
     const blocked = blockedAddressResult(result.address);
-    if (blocked.status === "error" || blocked.value) {
+    const rejected = blocked.match({ ok: (value) => value, err: () => true });
+    if (rejected) {
       return Result.err(destinationRejected(`webfetch blocked destination for '${hostname}'`));
     }
   }
@@ -507,8 +522,13 @@ async function readBoundedBody(
       externalFailure("Acquire response reader", "webfetch could not read the response body"),
     ),
   );
-  if (readerResult.status === "error") return Result.err(readerResult.error);
-  const reader = readerResult.value;
+  let reader!: ReadableStreamDefaultReader<Uint8Array>;
+  let readerFailure: WebfetchPrimaryError | undefined;
+  readerResult.match({
+    ok: (value) => void (reader = value),
+    err: (error) => void (readerFailure = error),
+  });
+  if (readerFailure !== undefined) return Result.err(readerFailure);
   const chunks: Uint8Array[] = [];
   let total = 0;
   let primary: WebfetchPrimaryError | undefined;
@@ -677,10 +697,16 @@ function convertHtml(
   format: WebfetchInput["format"],
 ): ResultType<ConvertedHtml, WebfetchResponseRejected | WebfetchExternalOperationFailed> {
   const inspected = inspectHtml(html);
-  if (inspected.status === "error") return Result.err(inspected.error);
-  if (format === "html") return Result.ok({ title: inspected.value.title, content: html });
+  let document!: { readonly title: string; readonly text: string };
+  let conversionFailure: WebfetchResponseRejected | WebfetchExternalOperationFailed | undefined;
+  inspected.match({
+    ok: (value) => void (document = value),
+    err: (error) => void (conversionFailure = error),
+  });
+  if (conversionFailure !== undefined) return Result.err(conversionFailure);
+  if (format === "html") return Result.ok({ title: document.title, content: html });
   if (format === "text") {
-    return Result.ok({ title: inspected.value.title, content: inspected.value.text });
+    return Result.ok({ title: document.title, content: document.text });
   }
 
   const markdown = captureToResult(
@@ -700,8 +726,7 @@ function convertHtml(
       externalFailure("Convert HTML", "webfetch could not convert HTML to Markdown"),
     ),
   );
-  if (markdown.status === "error") return Result.err(markdown.error);
-  return Result.ok({ title: inspected.value.title, content: markdown.value });
+  return markdown.map((content) => ({ title: document.title, content }));
 }
 
 async function defaultLookup(hostname: string): Promise<readonly LookupResult[]> {
@@ -722,7 +747,12 @@ async function executeDecodedWebfetch(
   const fetchImpl = dependencies.fetch ?? globalThis.fetch;
   if (dependencies.fetch === undefined) {
     const proxy = validateNoInheritedProxy(dependencies.environment ?? process.env);
-    if (proxy.status === "error") return Result.err(proxy.error);
+    let proxyFailure: WebfetchDestinationRejected | undefined;
+    proxy.match({
+      ok: () => {},
+      err: (error) => void (proxyFailure = error),
+    });
+    if (proxyFailure !== undefined) return Result.err(proxyFailure);
   }
   const lookupAddresses = dependencies.lookup ?? defaultLookup;
   const visited = new Set<string>();
@@ -735,11 +765,17 @@ async function executeDecodedWebfetch(
     }
     visited.add(current.href);
     const destination = await validatePublicDestination(current, signal, lookupAddresses);
-    if (destination.status === "error") return Result.err(destination.error);
+    let target!: Destination;
+    let destinationFailure: WebfetchPrimaryError | undefined;
+    destination.match({
+      ok: (value) => void (target = value),
+      err: (error) => void (destinationFailure = error),
+    });
+    if (destinationFailure !== undefined) return Result.err(destinationFailure);
 
     let response: Response | undefined;
     let lastFetchFailure: WebfetchExternalOperationFailed | undefined;
-    for (const address of destination.value.addresses) {
+    for (const address of target.addresses) {
       const requestUrl = new URL(current);
       requestUrl.hostname = isIP(address) === 6 ? `[${address}]` : address;
       const fetched = await awaitWebfetchCapture(
@@ -759,14 +795,9 @@ async function executeDecodedWebfetch(
                 Host: current.host,
                 "User-Agent": "MiniLilac/1.0 webfetch",
               },
-              ...(current.protocol === "https:"
-                ? { tls: { serverName: destination.value.hostname } }
-                : {}),
+              ...(current.protocol === "https:" ? { tls: { serverName: target.hostname } } : {}),
             }),
-          externalFailure(
-            "Fetch URL",
-            `webfetch could not connect to '${destination.value.hostname}'`,
-          ),
+          externalFailure("Fetch URL", `webfetch could not connect to '${target.hostname}'`),
         ),
         signal,
       );
@@ -781,10 +812,7 @@ async function executeDecodedWebfetch(
     if (!response) {
       return Result.err(
         lastFetchFailure ??
-          externalFailure(
-            "Fetch URL",
-            `webfetch could not connect to '${destination.value.hostname}'`,
-          ),
+          externalFailure("Fetch URL", `webfetch could not connect to '${target.hostname}'`),
       );
     }
 
@@ -812,10 +840,15 @@ async function executeDecodedWebfetch(
           responseRejected(`webfetch redirect ${response.status} has an invalid Location`),
         ),
       );
-      if (nextResult.status === "error") {
-        return Result.err(await responseFailureAfterCancel(response, nextResult.error));
+      let next!: URL;
+      let redirectFailure: WebfetchPrimaryError | undefined;
+      nextResult.match({
+        ok: (value) => void (next = value),
+        err: (error) => void (redirectFailure = error),
+      });
+      if (redirectFailure !== undefined) {
+        return Result.err(await responseFailureAfterCancel(response, redirectFailure));
       }
-      const next = nextResult.value;
       next.hash = "";
       if (current.protocol === "https:" && next.protocol === "http:") {
         return Result.err(
@@ -842,33 +875,49 @@ async function executeDecodedWebfetch(
     }
 
     const contentType = parseContentType(response.headers.get("content-type"));
-    if (contentType.status === "error") {
-      return Result.err(await responseFailureAfterCancel(response, contentType.error));
+    let parsedContentType!: ParsedContentType;
+    let contentTypeFailure: WebfetchResponseRejected | undefined;
+    contentType.match({
+      ok: (value) => void (parsedContentType = value),
+      err: (error) => void (contentTypeFailure = error),
+    });
+    if (contentTypeFailure !== undefined) {
+      return Result.err(await responseFailureAfterCancel(response, contentTypeFailure));
     }
     const body = await readBoundedBody(response, signal);
-    if (body.status === "error") return Result.err(body.error);
+    let bytes!: Uint8Array;
+    let responseFailure: WebfetchError | undefined;
+    body.match({
+      ok: (value) => void (bytes = value),
+      err: (error) => void (responseFailure = error),
+    });
+    if (responseFailure !== undefined) return Result.err(responseFailure);
     if (
-      body.value.byteLength >= 2 &&
-      ((body.value[0] === 0xff && body.value[1] === 0xfe) ||
-        (body.value[0] === 0xfe && body.value[1] === 0xff))
+      bytes.byteLength >= 2 &&
+      ((bytes[0] === 0xff && bytes[1] === 0xfe) || (bytes[0] === 0xfe && bytes[1] === 0xff))
     ) {
       return Result.err(responseRejected("webfetch does not support UTF-16 content"));
     }
-    const decoded = new TextDecoder("utf-8").decode(body.value).replace(/^\uFEFF/u, "");
-    const converted = HTML_MIME_TYPES.has(contentType.value.mime)
+    const decoded = new TextDecoder("utf-8").decode(bytes).replace(/^\uFEFF/u, "");
+    const converted = HTML_MIME_TYPES.has(parsedContentType.mime)
       ? convertHtml(decoded, input.format)
       : Result.ok({ title: "", content: decoded });
-    if (converted.status === "error") return Result.err(converted.error);
-    const truncated = converted.value.content.length > input.maxCharacters;
+    let content!: ConvertedHtml;
+    converted.match({
+      ok: (value) => void (content = value),
+      err: (error) => void (responseFailure = error),
+    });
+    if (responseFailure !== undefined) return Result.err(responseFailure);
+    const truncated = content.content.length > input.maxCharacters;
     const output = {
       requestedUrl: requested.href,
       url: current.href,
       status: response.status,
-      contentType: contentType.value.raw,
+      contentType: parsedContentType.raw,
       format: input.format,
-      title: converted.value.title || current.hostname,
-      content: converted.value.content.slice(0, input.maxCharacters),
-      bytesRead: body.value.byteLength,
+      title: content.title || current.hostname,
+      content: content.content.slice(0, input.maxCharacters),
+      bytesRead: bytes.byteLength,
       redirects,
       truncated,
     } satisfies WebfetchOutput;
@@ -882,8 +931,14 @@ export async function executeWebfetchResult(
   dependencies: WebfetchDependencies = {},
 ): Promise<ResultType<WebfetchOutput, WebfetchError>> {
   const input = decodeWebfetchInput(rawInput);
-  if (input.status === "error") return Result.err(input.error);
-  return executeDecodedWebfetch(input.value, options, dependencies);
+  let decoded!: WebfetchInput;
+  let failure: WebfetchInputInvalid | undefined;
+  input.match({
+    ok: (value) => void (decoded = value),
+    err: (error) => void (failure = error),
+  });
+  if (failure !== undefined) return Result.err(failure);
+  return executeDecodedWebfetch(decoded, options, dependencies);
 }
 
 function legacyWebfetchPrimaryError(error: WebfetchPrimaryError): Error | undefined {
@@ -936,11 +991,17 @@ function webfetchResultToLegacyOutput(
   result: ResultType<WebfetchOutput, WebfetchError>,
   signal?: AbortSignal,
 ): WebfetchOutput {
-  if (result.status === "ok") return result.value;
-  const legacyError = legacyWebfetchError(result.error);
+  let output: WebfetchOutput | undefined;
+  let failure!: WebfetchError;
+  result.match({
+    ok: (value) => void (output = value),
+    err: (error) => void (failure = error),
+  });
+  if (output !== undefined) return output;
+  const legacyError = legacyWebfetchError(failure);
   if (legacyError !== undefined) throw legacyError;
-  if (isWebfetchCancellation(result.error) && signal?.aborted) throw signal.reason;
-  throw new Error(result.error.message);
+  if (isWebfetchCancellation(failure) && signal?.aborted) throw signal.reason;
+  throw new Error(failure.message);
 }
 
 function webfetchCompatibilitySignal(input: WebfetchInput, signal?: AbortSignal): AbortSignal {

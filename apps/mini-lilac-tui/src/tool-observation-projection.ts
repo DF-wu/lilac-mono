@@ -672,6 +672,15 @@ function malformed<T>(
   return Result.err(malformedError(observation, field, value));
 }
 
+function valueOrMalformed<T>(
+  result: ResultType<T, KnownToolObservationMalformed>,
+): T | KnownToolObservationMalformed {
+  return result.match<T | KnownToolObservationMalformed>({
+    ok: (value) => value,
+    err: (error) => error,
+  });
+}
+
 function stateFromObservation(observation: ToolObservation): ToolProjectionState {
   switch (observation.lifecycle) {
     case "pending":
@@ -727,12 +736,13 @@ function parseInput<T>(
     },
     () => malformedError(observation, field, value),
   );
-  if (attempted.status === "error") return Result.err(attempted.error);
-  if (attempted.value === undefined) return Result.ok(undefined);
-  if (!attempted.value.success) {
+  const parsed = valueOrMalformed(attempted);
+  if (KnownToolObservationMalformed.is(parsed)) return Result.err(parsed);
+  if (parsed === undefined) return Result.ok(undefined);
+  if (!parsed.success) {
     return malformed(observation, field, value);
   }
-  return Result.ok(attempted.value.data);
+  return Result.ok(parsed.data);
 }
 
 function executionErrorText(error: BashExecutionError | undefined): string | undefined {
@@ -774,30 +784,30 @@ function isKnownToolObservation(observation: ToolObservation): observation is Kn
 }
 
 const decodeBash: KnownToolCodec = (observation) => {
-  const input = parseInput(observation, bashInputSchema);
-  if (input.status === "error") return Result.err(input.error);
-  const partial = parseInput(observation, bashPartialSchema, "partial", true);
-  if (partial.status === "error") return Result.err(partial.error);
-  const outputDelta = partial.value?.delta;
+  const input = valueOrMalformed(parseInput(observation, bashInputSchema));
+  if (KnownToolObservationMalformed.is(input)) return Result.err(input);
+  const partial = valueOrMalformed(parseInput(observation, bashPartialSchema, "partial", true));
+  if (KnownToolObservationMalformed.is(partial)) return Result.err(partial);
+  const outputDelta = partial?.delta;
   let resultText: string | undefined;
   let resultTone: BashDecodedObservation["resultTone"] = "normal";
   if (observation.lifecycle === "success") {
-    const output = parseInput(observation, bashOutputSchema, "output");
-    if (output.status === "error") {
-      if (outputDelta === undefined) return Result.err(output.error);
+    const output = valueOrMalformed(parseInput(observation, bashOutputSchema, "output"));
+    if (KnownToolObservationMalformed.is(output)) {
+      if (outputDelta === undefined) return Result.err(output);
       resultText = outputDelta.trimEnd() || undefined;
     } else {
-      if (output.value === undefined) return malformed(observation, "output", undefined);
-      resultText = bashResultText(output.value);
-      if (typeof output.value !== "string" && output.value.executionError !== undefined) {
-        resultTone = output.value.executionError.type === "aborted" ? "muted" : "danger";
+      if (output === undefined) return malformed(observation, "output", undefined);
+      resultText = bashResultText(output);
+      if (typeof output !== "string" && output.executionError !== undefined) {
+        resultTone = output.executionError.type === "aborted" ? "muted" : "danger";
       }
     }
   }
   return Result.ok({
     toolName: "bash",
     state: stateFromObservation(observation),
-    ...(input.value === undefined ? {} : { command: input.value.command, cwd: input.value.cwd }),
+    ...(input === undefined ? {} : { command: input.command, cwd: input.cwd }),
     ...(resultText === undefined ? {} : { resultText }),
     resultTone,
     ...(outputDelta === undefined ? {} : { outputDelta }),
@@ -805,9 +815,9 @@ const decodeBash: KnownToolCodec = (observation) => {
 };
 
 const decodeRead: KnownToolCodec = (observation) => {
-  const input = parseInput(observation, readInputSchema);
-  if (input.status === "error") return Result.err(input.error);
-  const start = input.value?.start;
+  const input = valueOrMalformed(parseInput(observation, readInputSchema));
+  if (KnownToolObservationMalformed.is(input)) return Result.err(input);
+  const start = input?.start;
   let normalizedStart: ReadDecodedObservation["start"];
   if (start !== undefined) {
     normalizedStart =
@@ -818,93 +828,89 @@ const decodeRead: KnownToolCodec = (observation) => {
   return Result.ok({
     toolName: "read",
     state: stateFromObservation(observation),
-    ...(input.value === undefined
+    ...(input === undefined
       ? {}
       : {
-          path: input.value.path,
+          path: input.path,
           ...(normalizedStart === undefined ? {} : { start: normalizedStart }),
-          ...(input.value.maxLines === undefined ? {} : { maxLines: input.value.maxLines }),
-          ...(input.value.maxCharacters === undefined
-            ? {}
-            : { maxCharacters: input.value.maxCharacters }),
+          ...(input.maxLines === undefined ? {} : { maxLines: input.maxLines }),
+          ...(input.maxCharacters === undefined ? {} : { maxCharacters: input.maxCharacters }),
         }),
   });
 };
 
 const decodeGlob: KnownToolCodec = (observation) => {
-  const input = parseInput(observation, globInputSchema);
-  if (input.status === "error") return Result.err(input.error);
+  const input = valueOrMalformed(parseInput(observation, globInputSchema));
+  if (KnownToolObservationMalformed.is(input)) return Result.err(input);
   return Result.ok({
     toolName: "glob",
     state: stateFromObservation(observation),
-    ...(input.value === undefined ? {} : { patterns: input.value.patterns, cwd: input.value.cwd }),
+    ...(input === undefined ? {} : { patterns: input.patterns, cwd: input.cwd }),
   });
 };
 
 const decodeGrep: KnownToolCodec = (observation) => {
-  const input = parseInput(observation, grepInputSchema);
-  if (input.status === "error") return Result.err(input.error);
+  const input = valueOrMalformed(parseInput(observation, grepInputSchema));
+  if (KnownToolObservationMalformed.is(input)) return Result.err(input);
   return Result.ok({
     toolName: "grep",
     state: stateFromObservation(observation),
-    ...(input.value === undefined ? {} : { pattern: input.value.pattern, path: input.value.path }),
+    ...(input === undefined ? {} : { pattern: input.pattern, path: input.path }),
   });
 };
 
 const decodeFuzzy: KnownToolCodec = (observation) => {
-  const input = parseInput(observation, fuzzyInputSchema);
-  if (input.status === "error") return Result.err(input.error);
+  const input = valueOrMalformed(parseInput(observation, fuzzyInputSchema));
+  if (KnownToolObservationMalformed.is(input)) return Result.err(input);
   return Result.ok({
     toolName: "fuzzy_search",
     state: stateFromObservation(observation),
-    ...(input.value === undefined ? {} : { query: input.value.query, cwd: input.value.cwd }),
+    ...(input === undefined ? {} : { query: input.query, cwd: input.cwd }),
   });
 };
 
 const decodeEditFile: KnownToolCodec = (observation) => {
-  const input = parseInput(observation, editInputSchema);
-  if (input.status === "error") return Result.err(input.error);
+  const input = valueOrMalformed(parseInput(observation, editInputSchema));
+  if (KnownToolObservationMalformed.is(input)) return Result.err(input);
   let replacementsMade = 1;
   let state = stateFromObservation(observation);
   if (observation.lifecycle === "success") {
-    const output = parseInput(observation, editOutputSchema, "output");
-    if (output.status === "error") return Result.err(output.error);
-    if (output.value === undefined) return malformed(observation, "output", undefined);
-    if (output.value.success) {
-      replacementsMade = output.value.replacementsMade;
+    const output = valueOrMalformed(parseInput(observation, editOutputSchema, "output"));
+    if (KnownToolObservationMalformed.is(output)) return Result.err(output);
+    if (output === undefined) return malformed(observation, "output", undefined);
+    if (output.success) {
+      replacementsMade = output.replacementsMade;
     } else {
       replacementsMade = 0;
-      state = { status: "error", errorText: previewText(output.value.error.message, 180) };
+      state = { status: "error", errorText: previewText(output.error.message, 180) };
     }
   }
   return Result.ok({
     toolName: "edit",
     state,
-    ...(input.value === undefined ? {} : { edit: input.value }),
+    ...(input === undefined ? {} : { edit: input }),
     replacementsMade,
   });
 };
 
 const decodeApplyPatch: KnownToolCodec = (observation) => {
-  const input = parseInput(observation, patchInputSchema);
-  if (input.status === "error") return Result.err(input.error);
+  const input = valueOrMalformed(parseInput(observation, patchInputSchema));
+  if (KnownToolObservationMalformed.is(input)) return Result.err(input);
   return Result.ok({
     toolName: "patch",
     state: stateFromObservation(observation),
-    ...(input.value === undefined
-      ? {}
-      : { patchText: input.value.patchText, cwd: input.value.cwd }),
+    ...(input === undefined ? {} : { patchText: input.patchText, cwd: input.cwd }),
   });
 };
 
 const decodeSubagentDelegate: KnownToolCodec = (observation) => {
-  const input = parseInput(observation, subagentInputSchema);
-  if (input.status === "error") return Result.err(input.error);
+  const input = valueOrMalformed(parseInput(observation, subagentInputSchema));
+  if (KnownToolObservationMalformed.is(input)) return Result.err(input);
   let result: z.output<typeof subagentResultSchema> | undefined;
   if (observation.lifecycle === "success") {
-    const parsed = parseInput(observation, subagentResultSchema, "output");
-    if (parsed.status === "error") return Result.err(parsed.error);
-    result = parsed.value;
+    const parsed = valueOrMalformed(parseInput(observation, subagentResultSchema, "output"));
+    if (KnownToolObservationMalformed.is(parsed)) return Result.err(parsed);
+    result = parsed;
   }
   let state = stateFromObservation(observation);
   if (result !== undefined) {
@@ -939,22 +945,22 @@ const decodeSubagentDelegate: KnownToolCodec = (observation) => {
     toolName: "subagent_delegate",
     state,
     profile:
-      result !== undefined && "profile" in result
-        ? result.profile
-        : (input.value?.profile ?? "subagent"),
-    prompt: input.value?.prompt ?? "Delegated task",
-    mode: input.value?.mode ?? "sync",
-    ...(input.value?.sessionName === undefined ? {} : { sessionName: input.value.sessionName }),
+      result !== undefined && "profile" in result ? result.profile : (input?.profile ?? "subagent"),
+    prompt: input?.prompt ?? "Delegated task",
+    mode: input?.mode ?? "sync",
+    ...(input?.sessionName === undefined ? {} : { sessionName: input.sessionName }),
     ...(result === undefined ? {} : { result }),
   });
 };
 
 const decodeSubagentResult: KnownToolCodec = (observation) => {
-  const input = parseInput(observation, subagentResultInputSchema);
-  if (input.status === "error") return Result.err(input.error);
+  const input = valueOrMalformed(parseInput(observation, subagentResultInputSchema));
+  if (KnownToolObservationMalformed.is(input)) return Result.err(input);
   if (observation.lifecycle === "success") {
-    const output = parseInput(observation, subagentTerminalResultSchema, "output");
-    if (output.status === "error") return Result.err(output.error);
+    const output = valueOrMalformed(
+      parseInput(observation, subagentTerminalResultSchema, "output"),
+    );
+    if (KnownToolObservationMalformed.is(output)) return Result.err(output);
   }
   return Result.ok({
     toolName: "subagent_result",
@@ -963,60 +969,60 @@ const decodeSubagentResult: KnownToolCodec = (observation) => {
 };
 
 const decodeBatch: KnownToolCodec = (observation) => {
-  const input = parseInput(observation, batchInputSchema);
-  if (input.status === "error") return Result.err(input.error);
+  const input = valueOrMalformed(parseInput(observation, batchInputSchema));
+  if (KnownToolObservationMalformed.is(input)) return Result.err(input);
   return Result.ok({
     toolName: "batch",
     state: stateFromObservation(observation),
-    ...(input.value === undefined ? {} : { toolCount: input.value.tool_calls.length }),
+    ...(input === undefined ? {} : { toolCount: input.tool_calls.length }),
   });
 };
 
 const decodeSkill: KnownToolCodec = (observation) => {
-  const input = parseInput(observation, skillInputSchema);
-  if (input.status === "error") return Result.err(input.error);
+  const input = valueOrMalformed(parseInput(observation, skillInputSchema));
+  if (KnownToolObservationMalformed.is(input)) return Result.err(input);
   return Result.ok({
     toolName: "skill",
     state: stateFromObservation(observation),
-    ...(input.value === undefined ? {} : { name: input.value.name }),
+    ...(input === undefined ? {} : { name: input.name }),
   });
 };
 
 const decodeTodo: KnownToolCodec = (observation) => {
-  const input = parseInput(observation, todoWriteInputSchema);
-  if (input.status === "error") return Result.err(input.error);
+  const input = valueOrMalformed(parseInput(observation, todoWriteInputSchema));
+  if (KnownToolObservationMalformed.is(input)) return Result.err(input);
   return Result.ok({
     toolName: "todowrite",
     state: stateFromObservation(observation),
-    ...(input.value === undefined ? {} : { todoCount: input.value.todos.length }),
+    ...(input === undefined ? {} : { todoCount: input.todos.length }),
   });
 };
 
 const decodeWebfetch: KnownToolCodec = (observation) => {
-  const input = parseInput(observation, webfetchInputSchema);
-  if (input.status === "error") return Result.err(input.error);
+  const input = valueOrMalformed(parseInput(observation, webfetchInputSchema));
+  if (KnownToolObservationMalformed.is(input)) return Result.err(input);
   return Result.ok({
     toolName: "webfetch",
     state: stateFromObservation(observation),
-    ...(input.value === undefined ? {} : { url: input.value.url }),
+    ...(input === undefined ? {} : { url: input.url }),
   });
 };
 
 const decodeWebsearch: KnownToolCodec = (observation) => {
-  const input = parseInput(observation, websearchInputSchema);
-  if (input.status === "error") return Result.err(input.error);
+  const input = valueOrMalformed(parseInput(observation, websearchInputSchema));
+  if (KnownToolObservationMalformed.is(input)) return Result.err(input);
   let outputQuery: string | undefined;
-  if (observation.lifecycle === "success" && input.value?.query === undefined) {
-    const output = parseInput(observation, websearchOutputSchema, "output");
-    if (output.status === "error") return Result.err(output.error);
-    outputQuery = output.value?.action.query;
+  if (observation.lifecycle === "success" && input?.query === undefined) {
+    const output = valueOrMalformed(parseInput(observation, websearchOutputSchema, "output"));
+    if (KnownToolObservationMalformed.is(output)) return Result.err(output);
+    outputQuery = output?.action.query;
   }
   return Result.ok({
     toolName: "websearch",
     state: stateFromObservation(observation),
-    ...(input.value?.query === undefined && outputQuery === undefined
+    ...(input?.query === undefined && outputQuery === undefined
       ? {}
-      : { query: input.value?.query ?? outputQuery }),
+      : { query: input?.query ?? outputQuery }),
   });
 };
 
@@ -1046,7 +1052,8 @@ export function decodeKnownToolObservation(
     () => toolObservationCodecRegistry[observation.toolName](observation),
     () => malformedError(observation, "input", undefined),
   );
-  return decoded.status === "error" ? Result.err(decoded.error) : decoded.value;
+  const value = valueOrMalformed(decoded);
+  return KnownToolObservationMalformed.is(value) ? Result.err(value) : value;
 }
 
 function humanizeToolName(name: string): string {
@@ -1578,10 +1585,10 @@ export function projectToolObservation(
     };
   }
 
-  const decoded = decodeKnownToolObservation(normalizedObservation);
-  if (decoded.status === "ok")
-    return projectDecoded(normalizedObservation.lifecycle, decoded.value, options.cwd);
-  const error = decoded.error;
+  const decoded = valueOrMalformed(decodeKnownToolObservation(normalizedObservation));
+  if (!KnownToolObservationMalformed.is(decoded))
+    return projectDecoded(normalizedObservation.lifecycle, decoded, options.cwd);
+  const error = decoded;
   const state = stateFromObservation(normalizedObservation);
   const summary = humanizeToolName(error.toolName);
   return {

@@ -160,8 +160,13 @@ export class MiniLilacSkillCatalogSnapshot {
       );
     }
     const location = await this.resolvePath(name, skill.location, "resolve-file");
-    if (location.status === "error") return Result.err(location.error);
-    const canonicalLocation = location.value;
+    let canonicalLocation!: string;
+    let loadFailure: MiniLilacSkillLoadError | undefined;
+    location.match({
+      ok: (value) => void (canonicalLocation = value),
+      err: (error) => void (loadFailure = error),
+    });
+    if (loadFailure !== undefined) return Result.err(loadFailure);
     if (path.normalize(canonicalLocation) !== path.normalize(path.resolve(skill.location))) {
       return Result.err(
         new MiniLilacSkillPathInvalid({
@@ -172,18 +177,29 @@ export class MiniLilacSkillCatalogSnapshot {
       );
     }
     const raw = await this.readSkillFile(name, canonicalLocation);
-    if (raw.status === "error") return Result.err(raw.error);
-    const parsed = parseSkillMarkdownResult(raw.value);
-    if (parsed.status === "error") {
-      return Result.err(
-        new MiniLilacSkillContentInvalid({
+    let source!: string;
+    raw.match({
+      ok: (value) => void (source = value),
+      err: (error) => void (loadFailure = error),
+    });
+    if (loadFailure !== undefined) return Result.err(loadFailure);
+    let parsedSkill!: ReturnType<typeof parseSkillMarkdownResult> extends ResultType<
+      infer T,
+      infer _
+    >
+      ? T
+      : never;
+    parseSkillMarkdownResult(source).match({
+      ok: (value) => void (parsedSkill = value),
+      err: (error) =>
+        void (loadFailure = new MiniLilacSkillContentInvalid({
           name,
           issue: "markdown",
-          message: `Skill '${name}' is invalid: ${parsed.error.message}`,
-        }),
-      );
-    }
-    if (parsed.value.name !== name) {
+          message: `Skill '${name}' is invalid: ${error.message}`,
+        })),
+    });
+    if (loadFailure !== undefined) return Result.err(loadFailure);
+    if (parsedSkill.name !== name) {
       return Result.err(
         new MiniLilacSkillContentInvalid({
           name,
@@ -192,7 +208,7 @@ export class MiniLilacSkillCatalogSnapshot {
         }),
       );
     }
-    if (parsed.value.body.length > MAX_SKILL_INSTRUCTION_CHARS) {
+    if (parsedSkill.body.length > MAX_SKILL_INSTRUCTION_CHARS) {
       return Result.err(
         new MiniLilacSkillContentInvalid({
           name,
@@ -202,8 +218,12 @@ export class MiniLilacSkillCatalogSnapshot {
       );
     }
     const baseDirectory = await this.resolvePath(name, skill.baseDir, "resolve-directory");
-    if (baseDirectory.status === "error") return Result.err(baseDirectory.error);
-    const canonicalBaseDirectory = baseDirectory.value;
+    let canonicalBaseDirectory!: string;
+    baseDirectory.match({
+      ok: (value) => void (canonicalBaseDirectory = value),
+      err: (error) => void (loadFailure = error),
+    });
+    if (loadFailure !== undefined) return Result.err(loadFailure);
     if (path.normalize(canonicalBaseDirectory) !== path.normalize(path.resolve(skill.baseDir))) {
       return Result.err(
         new MiniLilacSkillPathInvalid({
@@ -214,22 +234,33 @@ export class MiniLilacSkillCatalogSnapshot {
       );
     }
     const listed = await this.listResources(name, canonicalBaseDirectory);
-    if (listed.status === "error") return Result.err(listed.error);
+    let resources!: { readonly resources: string[]; readonly truncated: boolean };
+    listed.match({
+      ok: (value) => void (resources = value),
+      err: (error) => void (loadFailure = error),
+    });
+    if (loadFailure !== undefined) return Result.err(loadFailure);
     return Result.ok({
       name,
-      description: parsed.value.description,
-      instructions: parsed.value.body,
+      description: parsedSkill.description,
+      instructions: parsedSkill.body,
       baseDirectory: skill.baseDir,
-      resources: listed.value.resources,
-      resourceListingTruncated: listed.value.truncated,
+      resources: resources.resources,
+      resourceListingTruncated: resources.truncated,
     });
   }
 
   /** Compatibility adapter for the skill tool's established rejection contract. */
   async load(name: string): Promise<MiniLilacSkillLoadResult> {
     const loaded = await this.loadResult(name);
-    if (loaded.status === "error") throw loaded.error;
-    return loaded.value;
+    let skill!: MiniLilacSkillLoadResult;
+    let failure: MiniLilacSkillLoadError | undefined;
+    loaded.match({
+      ok: (value) => void (skill = value),
+      err: (error) => void (failure = error),
+    });
+    if (failure !== undefined) throw failure;
+    return skill;
   }
 
   private async resolvePath(
@@ -309,7 +340,13 @@ export class MiniLilacSkillCatalogSnapshot {
     if (closed.status === "panic") return throwSkillPanic(closed.panic);
     let ownedReadError: MiniLilacSkillFilesystemFailed | MiniLilacSkillContentInvalid | undefined;
     if (read.status === "error") ownedReadError = read.error;
-    else if (read.value.status === "error") ownedReadError = read.value.error;
+    else {
+      Result.match(read.value, {
+        ok: () => {},
+        err: (error: MiniLilacSkillFilesystemFailed | MiniLilacSkillContentInvalid) =>
+          void (ownedReadError = error),
+      });
+    }
     if (ownedReadError && closed.status === "error") {
       const normalizedReadError =
         ownedReadError instanceof MiniLilacSkillFilesystemFailed
@@ -331,8 +368,7 @@ export class MiniLilacSkillCatalogSnapshot {
     if (ownedReadError) return Result.err(ownedReadError);
     if (closed.status === "error") return Result.err(closed.error);
     if (read.status === "error") return Result.err(read.error);
-    if (read.value.status === "error") return Result.err(read.value.error);
-    return Result.ok(read.value.value);
+    return read.value;
   }
 
   private async listResources(
@@ -381,8 +417,7 @@ export class MiniLilacSkillCatalog {
     cwd: string,
   ): Promise<ResultType<MiniLilacSkillCatalogSnapshot, MiniLilacSkillDiscoveryFailed>> {
     const foundWorkspaceRoot = findWorkspaceRootResult(cwd);
-    const workspaceRoot =
-      foundWorkspaceRoot.status === "ok" ? foundWorkspaceRoot.value : path.resolve(cwd);
+    const workspaceRoot = foundWorkspaceRoot.unwrapOr(path.resolve(cwd));
     const homeDir = this.options.homeDir ?? homedir();
     const roots: SkillScanRoot[] = [
       {
@@ -420,7 +455,12 @@ export class MiniLilacSkillCatalog {
     if (discovered.status === "error") return Result.err(discovered.error);
     for (const warning of discovered.value.warnings) {
       const emitted = this.emitWarning(workspaceRoot, warning);
-      if (emitted.status === "error") return Result.err(emitted.error);
+      let warningFailure: MiniLilacSkillDiscoveryFailed | undefined;
+      emitted.match({
+        ok: () => {},
+        err: (error) => void (warningFailure = error),
+      });
+      if (warningFailure !== undefined) return Result.err(warningFailure);
     }
     const skills: DiscoveredSkill[] = [];
     for (const skill of discovered.value.skills) {
@@ -437,7 +477,12 @@ export class MiniLilacSkillCatalog {
           location: skill.location,
           message: "skill path resolution failed",
         });
-        if (emitted.status === "error") return Result.err(emitted.error);
+        let warningFailure: MiniLilacSkillDiscoveryFailed | undefined;
+        emitted.match({
+          ok: () => {},
+          err: (error) => void (warningFailure = error),
+        });
+        if (warningFailure !== undefined) return Result.err(warningFailure);
         continue;
       }
       if (path.normalize(resolved.value) !== path.normalize(path.resolve(skill.location))) {
@@ -445,7 +490,12 @@ export class MiniLilacSkillCatalog {
           location: skill.location,
           message: "skill resolves through a symbolic link",
         });
-        if (emitted.status === "error") return Result.err(emitted.error);
+        let warningFailure: MiniLilacSkillDiscoveryFailed | undefined;
+        emitted.match({
+          ok: () => {},
+          err: (error) => void (warningFailure = error),
+        });
+        if (warningFailure !== undefined) return Result.err(warningFailure);
         continue;
       }
       skills.push(skill);
@@ -455,7 +505,12 @@ export class MiniLilacSkillCatalog {
             location: workspaceRoot,
             message: `skill discovery capped at ${MAX_DISCOVERED_SKILLS} entries`,
           });
-          if (emitted.status === "error") return Result.err(emitted.error);
+          let warningFailure: MiniLilacSkillDiscoveryFailed | undefined;
+          emitted.match({
+            ok: () => {},
+            err: (error) => void (warningFailure = error),
+          });
+          if (warningFailure !== undefined) return Result.err(warningFailure);
         }
         break;
       }
@@ -481,10 +536,16 @@ export class MiniLilacSkillCatalog {
 
   async discover(cwd: string): Promise<MiniLilacSkillCatalogSnapshot> {
     const discovered = await this.discoverResult(cwd);
-    if (discovered.status === "ok") return discovered.value;
+    let snapshot: MiniLilacSkillCatalogSnapshot | undefined;
+    let failure!: MiniLilacSkillDiscoveryFailed;
+    discovered.match({
+      ok: (value) => void (snapshot = value),
+      err: (error) => void (failure = error),
+    });
+    if (snapshot !== undefined) return snapshot;
     this.options.onWarning?.({
-      location: discovered.error.workspaceRoot,
-      message: discovered.error.message,
+      location: failure.workspaceRoot,
+      message: failure.message,
     });
     return new MiniLilacSkillCatalogSnapshot([]);
   }

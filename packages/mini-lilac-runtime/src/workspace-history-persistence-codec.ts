@@ -282,12 +282,21 @@ export function decodeWorkspaceHistoryOwnership(
 > {
   if (input.serialized === null) return Result.err(corrupt("ownership", "record-absent"));
   const json = parseJson("ownership", input.serialized);
-  if (json.status === "error") return Result.err(json.error);
-  const version = detectFormatVersion("ownership", json.value);
-  if (version.status === "error") return Result.err(version.error);
-  const parsed = ownershipSchema.safeParse(json.value);
+  let value: unknown;
+  let failure: WorkspaceHistoryPersistenceCodecError | undefined;
+  json.match({
+    ok: (decoded) => void (value = decoded),
+    err: (error) => void (failure = error),
+  });
+  if (failure !== undefined) return Result.err(failure);
+  detectFormatVersion("ownership", value).match({
+    ok: () => {},
+    err: (error) => void (failure = error),
+  });
+  if (failure !== undefined) return Result.err(failure);
+  const parsed = ownershipSchema.safeParse(value);
   if (!parsed.success) {
-    const legacy = legacyOwnershipSchema.safeParse(json.value);
+    const legacy = legacyOwnershipSchema.safeParse(value);
     if (legacy.success) {
       const migrated = { formatVersion: WORKSPACE_HISTORY_FORMAT_VERSION, ...legacy.data };
       if (!ownershipMatches(migrated, input.expected)) {
@@ -313,12 +322,21 @@ export function decodeWorkspaceHistorySnapshotManifest(
 > {
   if (input.serialized === null) return Result.err(corrupt("snapshot-manifest", "record-absent"));
   const json = parseJson("snapshot-manifest", input.serialized);
-  if (json.status === "error") return Result.err(json.error);
-  const version = detectFormatVersion("snapshot-manifest", json.value);
-  if (version.status === "error") return Result.err(version.error);
-  const parsed = snapshotManifestSchema.safeParse(json.value);
+  let value: unknown;
+  let failure: WorkspaceHistoryPersistenceCodecError | undefined;
+  json.match({
+    ok: (decoded) => void (value = decoded),
+    err: (error) => void (failure = error),
+  });
+  if (failure !== undefined) return Result.err(failure);
+  detectFormatVersion("snapshot-manifest", value).match({
+    ok: () => {},
+    err: (error) => void (failure = error),
+  });
+  if (failure !== undefined) return Result.err(failure);
+  const parsed = snapshotManifestSchema.safeParse(value);
   if (!parsed.success) {
-    const legacy = legacySnapshotManifestSchema.safeParse(json.value);
+    const legacy = legacySnapshotManifestSchema.safeParse(value);
     if (legacy.success) {
       return Result.ok({
         value: {
@@ -350,8 +368,14 @@ export function decodeWorkspaceHistoryCaptureCache(
     return Result.ok({ value: undefined, provenance: "missing-defaulted" });
   }
   const json = parseJson("capture-cache", input.serialized);
-  if (json.status === "error") return Result.err(json.error);
-  const versioned = cacheVersionProbeSchema.safeParse(json.value);
+  let value: unknown;
+  let failure: WorkspaceHistoryPersistenceCodecError | undefined;
+  json.match({
+    ok: (decoded) => void (value = decoded),
+    err: (error) => void (failure = error),
+  });
+  if (failure !== undefined) return Result.err(failure);
+  const versioned = cacheVersionProbeSchema.safeParse(value);
   if (
     versioned.success &&
     (versioned.data.indexVersion !== WORKSPACE_HISTORY_INDEX_VERSION ||
@@ -366,9 +390,9 @@ export function decodeWorkspaceHistoryCaptureCache(
     else versionCategory = "index";
     return Result.err(unsupported("capture-cache", versionCategory));
   }
-  const parsed = captureCacheSchema.safeParse(json.value);
+  const parsed = captureCacheSchema.safeParse(value);
   if (!parsed.success) {
-    const legacy = legacyCaptureCacheSchema.safeParse(json.value);
+    const legacy = legacyCaptureCacheSchema.safeParse(value);
     if (!legacy.success) return Result.err(corrupt("capture-cache"));
     if (
       legacy.data.workspaceId !== input.workspaceId ||
@@ -411,12 +435,21 @@ export function decodeWorkspaceHistoryRestorePlan(
 > {
   if (input.serialized === null) return Result.err(corrupt("restore-plan", "record-absent"));
   const json = parseJson("restore-plan", input.serialized);
-  if (json.status === "error") return Result.err(json.error);
-  const version = detectFormatVersion("restore-plan", json.value);
-  if (version.status === "error") return Result.err(version.error);
-  const parsed = restorePlanSchema.safeParse(json.value);
+  let value: unknown;
+  let failure: WorkspaceHistoryPersistenceCodecError | undefined;
+  json.match({
+    ok: (decoded) => void (value = decoded),
+    err: (error) => void (failure = error),
+  });
+  if (failure !== undefined) return Result.err(failure);
+  detectFormatVersion("restore-plan", value).match({
+    ok: () => {},
+    err: (error) => void (failure = error),
+  });
+  if (failure !== undefined) return Result.err(failure);
+  const parsed = restorePlanSchema.safeParse(value);
   if (!parsed.success) {
-    const legacy = legacyRestorePlanSchema.safeParse(json.value);
+    const legacy = legacyRestorePlanSchema.safeParse(value);
     if (!legacy.success) return Result.err(corrupt("restore-plan"));
     const migrated = {
       formatVersion: WORKSPACE_HISTORY_FORMAT_VERSION,
@@ -464,12 +497,21 @@ export function decodeWorkspaceHistorySnapshotRefCreated(
     return Result.ok({ value: undefined, provenance: "missing-defaulted" });
   }
   const json = parseJson("snapshot-ref-created", input.serialized);
-  if (json.status === "error") return Result.err(json.error);
-  const version = detectFormatVersion("snapshot-ref-created", json.value);
-  if (version.status === "error") return Result.err(version.error);
-  const parsed = snapshotRefCreatedSchema.safeParse(json.value);
+  let value: unknown;
+  let failure: WorkspaceHistoryPersistenceCodecError | undefined;
+  json.match({
+    ok: (decoded) => void (value = decoded),
+    err: (error) => void (failure = error),
+  });
+  if (failure !== undefined) return Result.err(failure);
+  detectFormatVersion("snapshot-ref-created", value).match({
+    ok: () => {},
+    err: (error) => void (failure = error),
+  });
+  if (failure !== undefined) return Result.err(failure);
+  const parsed = snapshotRefCreatedSchema.safeParse(value);
   if (!parsed.success) {
-    const legacy = legacySnapshotRefCreatedSchema.safeParse(json.value);
+    const legacy = legacySnapshotRefCreatedSchema.safeParse(value);
     if (!legacy.success) return Result.err(corrupt("snapshot-ref-created"));
     if (legacy.data.rootTreeOid !== input.rootTreeOid || legacy.data.gitRef !== input.gitRef) {
       return Result.err(corrupt("snapshot-ref-created", "identity-mismatch"));
@@ -500,12 +542,21 @@ export function decodeWorkspaceHistoryRestoreOwnership(
     return Result.err(corrupt("restore-ownership", "record-absent"));
   }
   const json = parseJson("restore-ownership", input.serialized);
-  if (json.status === "error") return Result.err(json.error);
-  const version = detectFormatVersion("restore-ownership", json.value);
-  if (version.status === "error") return Result.err(version.error);
-  const parsed = restoreOwnershipSchema.safeParse(json.value);
+  let value: unknown;
+  let failure: WorkspaceHistoryPersistenceCodecError | undefined;
+  json.match({
+    ok: (decoded) => void (value = decoded),
+    err: (error) => void (failure = error),
+  });
+  if (failure !== undefined) return Result.err(failure);
+  detectFormatVersion("restore-ownership", value).match({
+    ok: () => {},
+    err: (error) => void (failure = error),
+  });
+  if (failure !== undefined) return Result.err(failure);
+  const parsed = restoreOwnershipSchema.safeParse(value);
   if (!parsed.success) {
-    const legacy = legacyRestoreOwnershipSchema.safeParse(json.value);
+    const legacy = legacyRestoreOwnershipSchema.safeParse(value);
     if (!legacy.success) return Result.err(corrupt("restore-ownership"));
     if (
       legacy.data.workspaceId !== input.workspaceId ||
