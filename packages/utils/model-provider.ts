@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 
+import { createCerebras } from "@ai-sdk/cerebras";
 import { createOpenAI } from "@ai-sdk/openai";
 import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
 import { createXai } from "@ai-sdk/xai";
@@ -57,6 +58,7 @@ function memoizedClaudeExecutable(): string | null {
 export type Providers =
   | "openai"
   | "openai-compatible"
+  | "cerebras"
   | "codex"
   | "xai"
   | "openrouter"
@@ -479,6 +481,9 @@ export function getModelProviders() {
         })
       : null,
 
+    cerebras: createCerebras({
+      apiKey: env.providers.cerebras.apiKey,
+    }),
     codex: createCodexOAuthProvider(),
     xai: env.providers.xai
       ? createXai({

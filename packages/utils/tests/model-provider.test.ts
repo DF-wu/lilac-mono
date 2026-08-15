@@ -22,6 +22,16 @@ describe("claude-code provider", () => {
   });
 });
 
+describe("cerebras provider", () => {
+  it("resolves native Cerebras models", () => {
+    const provider = getModelProviders().cerebras;
+    const model = provider("gpt-oss-120b");
+
+    expect(model.provider).toBe("cerebras.chat");
+    expect(model.modelId).toBe("gpt-oss-120b");
+  });
+});
+
 function jwt(claims: Record<string, unknown>): string {
   return `header.${Buffer.from(JSON.stringify(claims)).toString("base64url")}.signature`;
 }

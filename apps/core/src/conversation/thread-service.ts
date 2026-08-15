@@ -154,12 +154,12 @@ const queryAboutnessSchema = z.object({
 });
 
 const autoInjectSearchPlanSchema = z.object({
-  queries: z.array(z.string()).min(1).max(MULTI_QUERY_MAX),
+  queries: z.array(z.string()),
   aboutness: queryAboutnessSchema,
 });
 
-const autoInjectQueryPlanSchema = z.object({
-  searches: z.array(autoInjectSearchPlanSchema).min(1).max(MULTI_QUERY_MAX),
+export const autoInjectQueryPlanSchema = z.object({
+  searches: z.array(autoInjectSearchPlanSchema),
 });
 
 export type ConversationThreadQueryAboutness = z.infer<typeof queryAboutnessSchema>;
@@ -1568,7 +1568,7 @@ function buildQueryAboutnessInstructions(): string {
   ].join("\n");
 }
 
-function buildAutoInjectQueryPlanInstructions(): string {
+export function buildAutoInjectQueryPlanInstructions(): string {
   return [
     "You create retrieval queries for an automatic conversation-memory lookup.",
     "Return exactly one JSON object and nothing else.",
@@ -1576,8 +1576,8 @@ function buildAutoInjectQueryPlanInstructions(): string {
     "",
     "The input is a newly received user message, possibly a long article or essay.",
     "Do not summarize the article for the final answer. Instead, generate semantic search queries that would find prior conversation threads useful for responding to it.",
-    "Produce 1-3 searches, ordered by expected usefulness. Each search is one distinct retrieval category or intent.",
-    "Within each search, use 1-3 query variants/facets for the same intent. Prefer 1 query unless aliases, exact entities, or meaningfully different wording improve recall.",
+    "You must produce 1-3 searches, ordered by expected usefulness. Each search is one distinct retrieval category or intent.",
+    "Each search must contain 1-3 non-empty query variants/facets for the same intent. Prefer 1 query unless aliases, exact entities, or meaningfully different wording improve recall.",
     "Do not split near-duplicate phrasings into separate searches; keep them as query variants inside one search.",
     "Queries should name the durable subject, task, decision, complaint target, project, technology, entities, or situation.",
     "Avoid copying long passages. Preserve exact names, code identifiers, errors, and source-language phrases only when central.",

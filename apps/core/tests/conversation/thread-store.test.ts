@@ -6,8 +6,11 @@ import path from "node:path";
 import { createHash } from "node:crypto";
 import { parseCoreConfigV1ToUniversal, type CoreConfig } from "@stanley2058/lilac-utils";
 import { Panic, Result, type Result as ResultType } from "better-result";
+import { z } from "zod";
 
 import {
+  autoInjectQueryPlanSchema,
+  buildAutoInjectQueryPlanInstructions,
   buildThreadSummaryInstructions,
   buildThreadSummaryModelMessages,
   createConversationThreadToolService,
@@ -2608,6 +2611,21 @@ describe("conversation thread store", () => {
 
     searchStore.close();
     threadStore.close();
+  });
+
+  it("keeps auto-inject cardinality limits out of the structured-output schema", () => {
+    const jsonSchema = z.toJSONSchema(autoInjectQueryPlanSchema, {
+      target: "draft-7",
+      io: "input",
+      reused: "inline",
+    });
+    const serialized = JSON.stringify(jsonSchema);
+    const instructions = buildAutoInjectQueryPlanInstructions();
+
+    expect(serialized).not.toContain("minItems");
+    expect(serialized).not.toContain("maxItems");
+    expect(instructions).toContain("You must produce 1-3 searches");
+    expect(instructions).toContain("Each search must contain 1-3 non-empty query variants");
   });
 
   it("truncates overlong auto-inject search groups and query variants", async () => {
