@@ -24,7 +24,7 @@ import {
   decodeCoreConfigV1ToUniversal,
   parseCoreConfigV1,
   parseCoreConfigV1ToUniversal,
-  type CoreConfigV1Invalid,
+  CoreConfigV1Invalid,
 } from "./core-config/v1";
 import {
   CURRENT_CORE_CONFIG_VERSION,
@@ -35,7 +35,7 @@ import {
   decodeCoreConfigV2ToUniversal,
   parseCoreConfigV2,
   parseCoreConfigV2ToUniversal,
-  type CoreConfigV2Invalid,
+  CoreConfigV2Invalid,
 } from "./core-config/v2";
 import { formatCoreConfigKeyPath } from "./core-config/unknown-keys";
 import type {
@@ -212,8 +212,14 @@ export function readCoreConfigVersionResult(
 
 export function readCoreConfigVersion(raw: unknown): CoreConfigVersion {
   const result = readCoreConfigVersionResult(raw);
-  if (result.status === "error") throw new Error(result.error.message);
-  return result.value;
+  const resolved = result.match<
+    { readonly value: CoreConfigVersion } | { readonly error: CoreConfigVersionInvalid }
+  >({
+    ok: (value) => ({ value }),
+    err: (error) => ({ error }),
+  });
+  if ("error" in resolved) throw new Error(resolved.error.message);
+  return resolved.value;
 }
 
 function reportConfiguredModelOptionWarnings(
@@ -226,8 +232,11 @@ function reportConfiguredModelOptionWarnings(
     if (!modelSpec?.includes("/")) return;
 
     const parsedModel = parseModelSpecifierResult(modelSpec);
-    if (parsedModel.status === "error") return;
-    const provider = parsedModel.value.provider;
+    const provider = parsedModel.match({
+      ok: (value) => value.provider,
+      err: () => undefined,
+    });
+    if (provider === undefined) return;
     for (const warning of validateConfiguredModelProviderOptions(provider, options)) {
       report(warning, source);
     }
@@ -264,7 +273,11 @@ export function parseCoreConfigResult(
   CoreConfigVersionInvalid | CoreConfigMustBeObject | CoreConfigV1Invalid | CoreConfigV2Invalid
 > {
   const version = readCoreConfigVersionResult(raw);
-  if (version.status === "error") return Result.err(version.error);
+  const parsedVersion = version.match<CoreConfigVersion | CoreConfigVersionInvalid>({
+    ok: (value) => value,
+    err: (error) => error,
+  });
+  if (CoreConfigVersionInvalid.is(parsedVersion)) return Result.err(parsedVersion);
   if (!isRecord(raw)) {
     return Result.err(new CoreConfigMustBeObject({ message: "Core config must be an object" }));
   }
@@ -274,16 +287,23 @@ export function parseCoreConfigResult(
     ((path) => {
       logger.warn("unknown core-config key ignored", {
         path: formatCoreConfigKeyPath(path),
-        parserVersion: version.value,
+        parserVersion: parsedVersion,
       });
     });
 
   const parsed =
-    version.value === 1
+    parsedVersion === 1
       ? decodeCoreConfigV1ToUniversal(raw, { onUnknownKey })
       : decodeCoreConfigV2ToUniversal(raw, { onUnknownKey });
-  if (parsed.status === "error") return Result.err(parsed.error);
-  const cfg = parsed.value;
+  const cfg = Result.match<
+    CoreConfig,
+    CoreConfigV1Invalid | CoreConfigV2Invalid,
+    CoreConfig | CoreConfigV1Invalid | CoreConfigV2Invalid
+  >(parsed, {
+    ok: (value) => value,
+    err: (error) => error,
+  });
+  if (CoreConfigV1Invalid.is(cfg) || CoreConfigV2Invalid.is(cfg)) return Result.err(cfg);
   const onUnknownModelOption =
     options?.onUnknownModelOption ??
     ((warning, source) => logger.warn(formatModelProviderOptionWarning(warning, source)));
@@ -296,8 +316,21 @@ export async function parseCoreConfig(
   options?: CoreConfigParseOptions,
 ): Promise<CoreConfig> {
   const result = parseCoreConfigResult(raw, options);
-  if (result.status === "error") throw projectLegacyCoreConfigFailure(result.error);
-  return result.value;
+  const resolved = result.match<
+    | { readonly value: CoreConfig }
+    | {
+        readonly error:
+          | CoreConfigVersionInvalid
+          | CoreConfigMustBeObject
+          | CoreConfigV1Invalid
+          | CoreConfigV2Invalid;
+      }
+  >({
+    ok: (value) => ({ value }),
+    err: (error) => ({ error }),
+  });
+  if ("error" in resolved) throw projectLegacyCoreConfigFailure(resolved.error);
+  return resolved.value;
 }
 
 function projectLegacyCoreConfigFailure(
@@ -377,10 +410,23 @@ export async function getCoreConfig(options?: {
 
   const raw = await Bun.file(filePath).text();
   const decoded = decodeCoreConfigYaml(raw);
-  if (decoded.status === "error") throw new Error(decoded.error.message);
-  const parsed = parseCoreConfigResult(decoded.value);
-  if (parsed.status === "error") throw projectLegacyCoreConfigFailure(parsed.error);
-  const cfg = parsed.value;
+  const decodedValue = decoded.match<unknown | CoreConfigYamlInvalid>({
+    ok: (value) => value,
+    err: (error) => error,
+  });
+  if (CoreConfigYamlInvalid.is(decodedValue)) throw new Error(decodedValue.message);
+  const parsed = parseCoreConfigResult(decodedValue);
+  const cfg = parsed.match<
+    | CoreConfig
+    | CoreConfigVersionInvalid
+    | CoreConfigMustBeObject
+    | CoreConfigV1Invalid
+    | CoreConfigV2Invalid
+  >({
+    ok: (value) => value,
+    err: (error) => error,
+  });
+  if (TaggedError.is(cfg)) throw projectLegacyCoreConfigFailure(cfg);
 
   // Always use file-based system prompt (data/prompts/*).
   // This also ensures missing files are created from templates.
@@ -434,8 +480,14 @@ export function resolveDiscoveryDbPath(): string {
 
 export function resolveDiscordToken(cfg: CoreConfig): string {
   const result = resolveDiscordTokenResult(cfg);
-  if (result.status === "error") throw new Error(result.error.message);
-  return result.value;
+  const resolved = result.match<
+    { readonly value: string } | { readonly error: DiscordTokenMissing }
+  >({
+    ok: (value) => ({ value }),
+    err: (error) => ({ error }),
+  });
+  if ("error" in resolved) throw new Error(resolved.error.message);
+  return resolved.value;
 }
 
 export class DiscordTokenMissing extends TaggedError("DiscordTokenMissing")<{

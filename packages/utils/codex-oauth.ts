@@ -469,12 +469,26 @@ export async function readCodexTokens(
   storagePath: string = STORAGE_PATH,
 ): Promise<CodexOAuthTokens | null> {
   const result = await readCodexTokensResult(storagePath);
-  if (result.status === "ok") return result.value.value;
-  if (result.error._tag === "CodexTokensReadFailed") {
-    if (result.error.operation === "inspect") throw result.error.cause;
+  const resolved = result.match<
+    | { readonly value: CodexOAuthTokens | null }
+    | {
+        readonly error:
+          | CodexTokensReadFailed
+          | CodexTokensMalformed
+          | CodexTokensCorrupt
+          | CodexTokensUnsupportedVersion;
+      }
+  >({
+    ok: (value) => ({ value: value.value }),
+    err: (error) => ({ error }),
+  });
+  if ("error" in resolved) {
+    if (resolved.error._tag === "CodexTokensReadFailed" && resolved.error.operation === "inspect") {
+      throw resolved.error.cause;
+    }
     return null;
   }
-  return null;
+  return resolved.value;
 }
 
 export async function writeCodexTokensResult(
@@ -513,7 +527,20 @@ export async function writeCodexTokens(
   operations: CodexSecretFileOperations = CODEX_SECRET_FILE_OPERATIONS,
 ): Promise<void> {
   const result = await writeCodexTokensResult(tokens, storagePath, operations);
-  if (result.status === "error") throw projectLegacyCodexTokenWriteFailure(result.error);
+  const resolved = result.match<
+    | { readonly value: void }
+    | {
+        readonly error:
+          | CodexTokensWriteInvalid
+          | CodexTokensWriteFailed
+          | CodexTokensCleanupFailed
+          | CodexTokensWriteAndCleanupFailed;
+      }
+  >({
+    ok: (value) => ({ value }),
+    err: (error) => ({ error }),
+  });
+  if ("error" in resolved) throw projectLegacyCodexTokenWriteFailure(resolved.error);
 }
 
 export async function clearCodexTokensResult(
@@ -548,9 +575,23 @@ export async function clearCodexTokensResult(
 
 export async function clearCodexTokens(storagePath: string = STORAGE_PATH): Promise<void> {
   const result = await clearCodexTokensResult(storagePath);
-  if (result.status === "ok") return;
-  if (result.error._tag === "CodexTokensReadFailed") throw result.error.cause;
-  throw projectLegacyCodexTokenWriteFailure(result.error);
+  const resolved = result.match<
+    | { readonly value: void }
+    | {
+        readonly error:
+          | CodexTokensReadFailed
+          | CodexTokensWriteFailed
+          | CodexTokensCleanupFailed
+          | CodexTokensWriteAndCleanupFailed;
+      }
+  >({
+    ok: (value) => ({ value }),
+    err: (error) => ({ error }),
+  });
+  if ("error" in resolved) {
+    if (resolved.error._tag === "CodexTokensReadFailed") throw resolved.error.cause;
+    throw projectLegacyCodexTokenWriteFailure(resolved.error);
+  }
 }
 
 function projectLegacyCodexTokenWriteFailure(
@@ -714,8 +755,15 @@ export async function exchangeCodeForTokens(options: {
   signal?: AbortSignal;
 }): Promise<AuthorizationCodeTokenResponse> {
   const result = await exchangeCodeForTokensResult(options);
-  if (result.status === "error") throw projectLegacyCodexOAuthFailure(result.error);
-  return result.value;
+  const resolved = result.match<
+    | { readonly value: AuthorizationCodeTokenResponse }
+    | { readonly error: CodexOAuthRequestFailed | CodexOAuthResponseInvalid }
+  >({
+    ok: (value) => ({ value }),
+    err: (error) => ({ error }),
+  });
+  if ("error" in resolved) throw projectLegacyCodexOAuthFailure(resolved.error);
+  return resolved.value;
 }
 
 export async function refreshAccessTokenResult(
@@ -783,8 +831,15 @@ export async function refreshAccessToken(
   fetchFn: CodexOAuthFetch = fetch,
 ): Promise<RefreshTokenResponse> {
   const result = await refreshAccessTokenResult(refreshToken, fetchFn);
-  if (result.status === "error") throw projectLegacyCodexOAuthFailure(result.error);
-  return result.value;
+  const resolved = result.match<
+    | { readonly value: RefreshTokenResponse }
+    | { readonly error: CodexOAuthRequestFailed | CodexOAuthResponseInvalid }
+  >({
+    ok: (value) => ({ value }),
+    err: (error) => ({ error }),
+  });
+  if ("error" in resolved) throw projectLegacyCodexOAuthFailure(resolved.error);
+  return resolved.value;
 }
 
 function projectLegacyCodexOAuthFailure(
@@ -946,12 +1001,21 @@ export async function startCodexOAuthLogin(
       fetch: options.fetch,
       signal: exchangeController.signal,
     });
-    if (tokens.status === "error") {
+    const exchangedTokens = tokens.match<
+      AuthorizationCodeTokenResponse | CodexOAuthRequestFailed | CodexOAuthResponseInvalid
+    >({
+      ok: (value) => value,
+      err: (error) => error,
+    });
+    if (
+      CodexOAuthRequestFailed.is(exchangedTokens) ||
+      CodexOAuthResponseInvalid.is(exchangedTokens)
+    ) {
       return Result.err(
         new CodexOAuthLoginFailed({
           issue: "token-exchange",
-          cause: tokens.error,
-          message: tokens.error.message,
+          cause: exchangedTokens,
+          message: exchangedTokens.message,
         }),
       );
     }
@@ -960,16 +1024,16 @@ export async function startCodexOAuthLogin(
         new CodexOAuthLoginFailed({ issue: "closed", message: "Codex OAuth login closed" }),
       );
     }
-    const accountId = extractAccountId(tokens.value);
-    const expires = now() + (tokens.value.expires_in ?? 3600) * 1000;
+    const accountId = extractAccountId(exchangedTokens);
+    const expires = now() + (exchangedTokens.expires_in ?? 3600) * 1000;
     try {
       await (options.writeTokens ?? ((tokens) => writeCodexTokens(tokens, storagePath)))({
         type: "oauth",
-        access: tokens.value.access_token,
-        refresh: tokens.value.refresh_token,
+        access: exchangedTokens.access_token,
+        refresh: exchangedTokens.refresh_token,
         expires,
         accountId,
-        idToken: tokens.value.id_token,
+        idToken: exchangedTokens.id_token,
       });
     } catch (cause) {
       if (isPanic(cause)) throw cause;
@@ -1036,8 +1100,14 @@ export async function startCodexOAuthLogin(
 
   const exchange = async (input: CodexOAuthCallbackPayload): Promise<CodexOAuthLoginResult> => {
     const exchanged = await exchangeResult(input);
-    if (exchanged.status === "error") throw projectLegacyCodexOAuthLoginFailure(exchanged.error);
-    return exchanged.value;
+    const resolved = exchanged.match<
+      { readonly value: CodexOAuthLoginResult } | { readonly error: CodexOAuthLoginFailed }
+    >({
+      ok: (value) => ({ value }),
+      err: (error) => ({ error }),
+    });
+    if ("error" in resolved) throw projectLegacyCodexOAuthLoginFailure(resolved.error);
+    return resolved.value;
   };
 
   if (callbackServer !== "disabled") {
@@ -1059,22 +1129,26 @@ export async function startCodexOAuthLogin(
           }
 
           const exchanged = await exchangeResult({ callbackUrl: request.url });
-          if (exchanged.status === "error") {
-            const cause = projectLegacyCodexOAuthLoginFailure(exchanged.error);
-            if (!activeExchange && !settled) {
-              settled = true;
-              stopServer();
-              resultDeferred.reject(cause);
-            }
-            return new Response(
-              htmlError(opaqueErrorMessage(cause, "Unknown Codex OAuth callback failure")),
-              {
-                status: 400,
-                headers: { "Content-Type": "text/html" },
-              },
-            );
-          }
-          return new Response(HTML_SUCCESS, { headers: { "Content-Type": "text/html" } });
+          const respond = exchanged.match<() => Response>({
+            ok: () => () =>
+              new Response(HTML_SUCCESS, { headers: { "Content-Type": "text/html" } }),
+            err: (error) => () => {
+              const cause = projectLegacyCodexOAuthLoginFailure(error);
+              if (!activeExchange && !settled) {
+                settled = true;
+                stopServer();
+                resultDeferred.reject(cause);
+              }
+              return new Response(
+                htmlError(opaqueErrorMessage(cause, "Unknown Codex OAuth callback failure")),
+                {
+                  status: 400,
+                  headers: { "Content-Type": "text/html" },
+                },
+              );
+            },
+          });
+          return respond();
         },
       });
       redirectUri = `http://localhost:${server.port}/auth/callback`;

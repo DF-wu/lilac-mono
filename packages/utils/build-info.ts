@@ -53,8 +53,10 @@ function parseBooleanish(value: string | undefined): boolean | undefined {
 }
 
 function findWorkspaceRootSafe(startDir: string): string | undefined {
-  const result = findWorkspaceRootResult(startDir);
-  return result.status === "ok" ? result.value : undefined;
+  return findWorkspaceRootResult(startDir).match({
+    ok: (value) => value,
+    err: () => undefined,
+  });
 }
 
 function readBuildInfoFile(cwd: string): BuildInfo | null {

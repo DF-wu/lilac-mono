@@ -34,8 +34,10 @@ export function hasWorkspacesFieldResult(
 }
 
 export function hasWorkspacesField(pkgJsonPath: string): boolean {
-  const result = hasWorkspacesFieldResult(pkgJsonPath);
-  return result.status === "ok" && result.value;
+  return hasWorkspacesFieldResult(pkgJsonPath).match({
+    ok: (value) => value,
+    err: () => false,
+  });
 }
 
 export function findWorkspaceRootResult(
@@ -48,7 +50,11 @@ export function findWorkspaceRootResult(
 
     if (fs.existsSync(pkgJsonPath)) {
       const inspected = hasWorkspacesFieldResult(pkgJsonPath);
-      if (inspected.status === "ok" && inspected.value) return Result.ok(dir);
+      const hasWorkspaces = inspected.match({
+        ok: (value) => value,
+        err: () => false,
+      });
+      if (hasWorkspaces) return Result.ok(dir);
     }
 
     const parent = path.dirname(dir);
@@ -67,6 +73,12 @@ export function findWorkspaceRootResult(
 
 export function findWorkspaceRoot(startDir = process.cwd()): string {
   const result = findWorkspaceRootResult(startDir);
-  if (result.status === "error") throw new Error(result.error.message);
-  return result.value;
+  const resolved = result.match<
+    { readonly value: string } | { readonly error: WorkspaceRootNotFound }
+  >({
+    ok: (value) => ({ value }),
+    err: (error) => ({ error }),
+  });
+  if ("error" in resolved) throw new Error(resolved.error.message);
+  return resolved.value;
 }

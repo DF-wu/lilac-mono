@@ -194,8 +194,14 @@ export function normalizeCodexResponsesRequestRecord(
   record: Record<string, unknown>,
 ): Record<string, unknown> {
   const result = normalizeCodexResponsesRequestRecordResult(record);
-  if (result.status === "error") throw new Error(result.error.message);
-  return result.value;
+  const resolved = result.match<
+    { readonly value: Record<string, unknown> } | { readonly error: CodexRequestInvalid }
+  >({
+    ok: (value) => ({ value }),
+    err: (error) => ({ error }),
+  });
+  if ("error" in resolved) throw new Error(resolved.error.message);
+  return resolved.value;
 }
 
 export type RefreshCodexOAuthTokensOptions = {

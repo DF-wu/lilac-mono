@@ -846,8 +846,11 @@ export function decodeCoreConfigV1ToUniversal(
   options?: CoreConfigParseOptions,
 ): ResultType<UniversalCoreConfig, CoreConfigV1Invalid> {
   const parsed = decodeCoreConfigV1(raw);
-  if (parsed.status === "error") return Result.err(parsed.error);
-  return Result.ok(coreConfigV1ToUniversal(parsed.value, raw, options));
+  const continueDecode = parsed.match<() => ResultType<UniversalCoreConfig, CoreConfigV1Invalid>>({
+    ok: (value) => () => Result.ok(coreConfigV1ToUniversal(value, raw, options)),
+    err: (error) => () => Result.err(error),
+  });
+  return continueDecode();
 }
 
 export function parseCoreConfigV1ToUniversal(
@@ -855,8 +858,14 @@ export function parseCoreConfigV1ToUniversal(
   options?: CoreConfigParseOptions,
 ): UniversalCoreConfig {
   const result = decodeCoreConfigV1ToUniversal(raw, options);
-  if (result.status === "error") throw result.error.cause;
-  return result.value;
+  const resolved = result.match<
+    { readonly value: UniversalCoreConfig } | { readonly error: CoreConfigV1Invalid }
+  >({
+    ok: (value) => ({ value }),
+    err: (error) => ({ error }),
+  });
+  if ("error" in resolved) throw resolved.error.cause;
+  return resolved.value;
 }
 
 export class V1CoreConfigParser implements ConfigParser {

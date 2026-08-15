@@ -292,8 +292,14 @@ export function parseSkillMarkdownResult(
 
 export function parseSkillMarkdown(raw: string): ParsedSkillFile {
   const result = parseSkillMarkdownResult(raw);
-  if (result.status === "error") throw new Error(result.error.message);
-  return result.value;
+  const resolved = result.match<
+    { readonly value: ParsedSkillFile } | { readonly error: SkillMarkdownInvalid }
+  >({
+    ok: (value) => ({ value }),
+    err: (error) => ({ error }),
+  });
+  if ("error" in resolved) throw new Error(resolved.error.message);
+  return resolved.value;
 }
 
 export type SkillScanRoot = {
@@ -585,18 +591,25 @@ export async function discoverSkills(params: {
       // Progressive disclosure: discovery loads metadata only.
       // Read a prefix large enough to include YAML frontmatter.
       const rawPrefix = await readTextPrefixResult(skillPath, 64 * 1024);
-      if (rawPrefix.status === "error") {
-        warnings.push({ location: skillPath, message: `read failed: ${rawPrefix.error.message}` });
+      const raw = rawPrefix.match<string | SkillFilesystemError | SkillReadAndCleanupFailed>({
+        ok: (value) => value,
+        err: (error) => error,
+      });
+      if (SkillFilesystemError.is(raw) || SkillReadAndCleanupFailed.is(raw)) {
+        warnings.push({ location: skillPath, message: `read failed: ${raw.message}` });
         continue;
       }
 
       // Discovery only needs frontmatter; the bounded prefix is sufficient.
-      const parsedResult = parseSkillMarkdownResult(rawPrefix.value);
-      if (parsedResult.status === "error") {
-        warnings.push({ location: skillPath, message: parsedResult.error.message });
+      const parsedResult = parseSkillMarkdownResult(raw);
+      const parsed = parsedResult.match<ParsedSkillFile | SkillMarkdownInvalid>({
+        ok: (value) => value,
+        err: (error) => error,
+      });
+      if (SkillMarkdownInvalid.is(parsed)) {
+        warnings.push({ location: skillPath, message: parsed.message });
         continue;
       }
-      const parsed = parsedResult.value;
 
       const nameErrors = validateSkillName(parsed.name);
       for (const err of nameErrors) {

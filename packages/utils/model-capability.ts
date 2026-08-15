@@ -199,8 +199,14 @@ export function parseModelSpecifierResult(
 
 export function parseModelSpecifier(spec: string): ParsedModelSpecifier {
   const result = parseModelSpecifierResult(spec);
-  if (result.status === "error") throw new Error(result.error.message);
-  return result.value;
+  const resolved = result.match<
+    { readonly value: ParsedModelSpecifier } | { readonly error: ModelSpecifierInvalid }
+  >({
+    ok: (value) => ({ value }),
+    err: (error) => ({ error }),
+  });
+  if ("error" in resolved) throw new Error(resolved.error.message);
+  return resolved.value;
 }
 
 function listSomeKeys(input: Record<string, unknown>, max: number): string[] {
@@ -236,8 +242,10 @@ export class ModelCapability {
   }
 
   private parseNestedModelSpecifier(model: string): { provider: string; model: string } | null {
-    const parsed = parseModelSpecifierResult(model);
-    return parsed.status === "ok" ? parsed.value : null;
+    return parseModelSpecifierResult(model).match({
+      ok: (value) => value,
+      err: () => null,
+    });
   }
 
   private modelLookupCandidates(model: string): string[] {
@@ -537,28 +545,35 @@ export class ModelCapability {
     },
   ): Promise<ResultType<ModelCapabilityInfo, ModelCapabilityError>> {
     const parsed = parseModelSpecifierResult(spec);
-    if (parsed.status === "error") return Result.err(parsed.error);
-    const provider = this.normalizeProvider(parsed.value.provider);
+    const parsedSpec = parsed.match<ParsedModelSpecifier | ModelSpecifierInvalid>({
+      ok: (value) => value,
+      err: (error) => error,
+    });
+    if (ModelSpecifierInvalid.is(parsedSpec)) return Result.err(parsedSpec);
+    const provider = this.normalizeProvider(parsedSpec.provider);
     if (
       !options?.bypassForceUnknown &&
-      (this.forceUnknownProviders.has(parsed.value.provider.trim().toLowerCase()) ||
+      (this.forceUnknownProviders.has(parsedSpec.provider.trim().toLowerCase()) ||
         this.forceUnknownProviders.has(provider.toLowerCase()))
     ) {
       return Result.err(
         new ModelCapabilityResolutionFailed({
           spec,
-          message: `Model capability lookup intentionally disabled for provider '${parsed.value.provider}' (spec '${spec}').`,
+          message: `Model capability lookup intentionally disabled for provider '${parsedSpec.provider}' (spec '${spec}').`,
         }),
       );
     }
 
     const registryResult = await this.loadRegistryResult(options?.signal);
-    if (registryResult.status === "error") return Result.err(registryResult.error);
-    const registry = registryResult.value;
+    const registry = registryResult.match<ModelsDevRegistry | ModelCapabilityResolutionFailed>({
+      ok: (value) => value,
+      err: (error) => error,
+    });
+    if (ModelCapabilityResolutionFailed.is(registry)) return Result.err(registry);
     const lookedUp = this.lookupWithFallback({
       registry,
       provider,
-      model: parsed.value.model,
+      model: parsedSpec.model,
     });
 
     if (!lookedUp) {
@@ -577,7 +592,7 @@ export class ModelCapability {
       return Result.err(
         new ModelCapabilityResolutionFailed({
           spec,
-          message: `Unknown model '${parsed.value.model}' for provider '${provider}' (spec '${spec}'). Add an override, or ensure models.dev contains it. Available models (sample): ${available.join(", ")}`,
+          message: `Unknown model '${parsedSpec.model}' for provider '${provider}' (spec '${spec}'). Add an override, or ensure models.dev contains it. Available models (sample): ${available.join(", ")}`,
         }),
       );
     }
@@ -585,14 +600,14 @@ export class ModelCapability {
     const { providerEntry, modelEntry } = lookedUp;
     const cost = this.resolveModelCost({
       registry,
-      provider: parsed.value.provider,
-      model: parsed.value.model,
+      provider: parsedSpec.provider,
+      model: parsedSpec.model,
       modelEntry,
     });
 
     return Result.ok({
-      provider: parsed.value.provider,
-      model: parsed.value.model,
+      provider: parsedSpec.provider,
+      model: parsedSpec.model,
       name: modelEntry.name ?? providerEntry.name,
       family: modelEntry.family,
       env: providerEntry.env,
@@ -610,7 +625,11 @@ export class ModelCapability {
     options: { signal?: AbortSignal; stack: readonly string[] },
   ): Promise<ResultType<ModelCapabilityInfo, ModelCapabilityError>> {
     const parsed = parseModelSpecifierResult(spec);
-    if (parsed.status === "error") return Result.err(parsed.error);
+    const parsedSpec = parsed.match<ParsedModelSpecifier | ModelSpecifierInvalid>({
+      ok: (value) => value,
+      err: (error) => error,
+    });
+    if (ModelSpecifierInvalid.is(parsedSpec)) return Result.err(parsedSpec);
     const override = this.overrides[spec];
     if (!override) {
       return this.resolveFromRegistryResult(spec, { signal: options.signal });
@@ -632,8 +651,17 @@ export class ModelCapability {
         signal: options.signal,
         stack: [...options.stack, spec],
       });
-      if (inherited.status === "error") return Result.err(inherited.error);
-      base = inherited.value;
+      const inheritedValue = inherited.match<ModelCapabilityInfo | ModelCapabilityError>({
+        ok: (value) => value,
+        err: (error) => error,
+      });
+      if (
+        ModelSpecifierInvalid.is(inheritedValue) ||
+        ModelCapabilityResolutionFailed.is(inheritedValue)
+      ) {
+        return Result.err(inheritedValue);
+      }
+      base = inheritedValue;
     }
 
     const mergedContext = override.limit?.context ?? base?.limit.context;
@@ -651,29 +679,39 @@ export class ModelCapability {
       baseCost: base?.cost,
       patch: override.cost,
     });
-    if (mergedCost.status === "error") return Result.err(mergedCost.error);
+    const cost = mergedCost.match<ModelCost | undefined | ModelCapabilityResolutionFailed>({
+      ok: (value) => value,
+      err: (error) => error,
+    });
+    if (ModelCapabilityResolutionFailed.is(cost)) return Result.err(cost);
     const mergedModalities = this.mergeModalitiesPatchResult({
       spec,
       baseModalities: base?.modalities,
       patch: override.modalities,
     });
-    if (mergedModalities.status === "error") return Result.err(mergedModalities.error);
+    const modalities = mergedModalities.match<
+      ModelCapabilityInfo["modalities"] | ModelCapabilityResolutionFailed
+    >({
+      ok: (value) => value,
+      err: (error) => error,
+    });
+    if (ModelCapabilityResolutionFailed.is(modalities)) return Result.err(modalities);
 
     return Result.ok({
-      provider: parsed.value.provider,
-      model: parsed.value.model,
+      provider: parsedSpec.provider,
+      model: parsedSpec.model,
       name: base?.name,
       family: base?.family,
       env: base?.env,
       npm: base?.npm,
       doc: base?.doc,
       attachment: override.attachment ?? base?.attachment,
-      cost: mergedCost.value,
+      cost,
       limit: {
         context: mergedContext,
         output: override.limit?.output ?? base?.limit.output ?? 0,
       },
-      modalities: mergedModalities.value,
+      modalities,
     });
   }
 
@@ -692,16 +730,22 @@ export class ModelCapability {
     options?: { signal?: AbortSignal },
   ): Promise<ModelCapabilityInfo> {
     const result = await this.resolveResult(spec, options);
-    if (result.status === "error") {
+    const resolved = result.match<
+      { readonly value: ModelCapabilityInfo } | { readonly error: ModelCapabilityError }
+    >({
+      ok: (value) => ({ value }),
+      err: (error) => ({ error }),
+    });
+    if ("error" in resolved) {
       if (
-        result.error._tag === "ModelCapabilityResolutionFailed" &&
-        Object.hasOwn(result.error, "cause")
+        resolved.error._tag === "ModelCapabilityResolutionFailed" &&
+        Object.hasOwn(resolved.error, "cause")
       ) {
-        throw result.error.cause;
+        throw resolved.error.cause;
       }
-      throw new Error(result.error.message);
+      throw new Error(resolved.error.message);
     }
-    return result.value;
+    return resolved.value;
   }
 
   estimateCostUsd(

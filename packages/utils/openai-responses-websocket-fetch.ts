@@ -406,8 +406,11 @@ export function createOpenAIResponsesWebSocketFetch(
     }
 
     const decodedBody = decodeResponsesRequestBody(encodedBody);
-    if (decodedBody.status === "error") return forwardWithSseNormalization();
-    const parsedBody = decodedBody.value;
+    const parsedBody = decodedBody.match({
+      ok: (value) => value,
+      err: () => undefined,
+    });
+    if (parsedBody === undefined) return forwardWithSseNormalization();
 
     if (parsedBody.stream !== true) {
       return forwardWithSseNormalization();

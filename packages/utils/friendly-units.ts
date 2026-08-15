@@ -93,12 +93,24 @@ export function parseFriendlyDurationMsResult(
 
 export function parseFriendlyByteSize(value: unknown): number {
   const result = parseFriendlyByteSizeResult(value);
-  if (result.status === "error") throw new Error(result.error.message);
-  return result.value;
+  const resolved = result.match<
+    { readonly value: number } | { readonly error: FriendlyUnitInvalid }
+  >({
+    ok: (parsed) => ({ value: parsed }),
+    err: (error) => ({ error }),
+  });
+  if ("error" in resolved) throw new Error(resolved.error.message);
+  return resolved.value;
 }
 
 export function parseFriendlyDurationMs(value: unknown): number {
   const result = parseFriendlyDurationMsResult(value);
-  if (result.status === "error") throw new Error(result.error.message);
-  return result.value;
+  const resolved = result.match<
+    { readonly value: number } | { readonly error: FriendlyUnitInvalid }
+  >({
+    ok: (parsed) => ({ value: parsed }),
+    err: (error) => ({ error }),
+  });
+  if ("error" in resolved) throw new Error(resolved.error.message);
+  return resolved.value;
 }

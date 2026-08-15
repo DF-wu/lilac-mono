@@ -525,26 +525,22 @@ export async function discoverCustomCommands(params: {
       defPath,
       readText: dependencies.readText,
     });
-    if (definition.status === "ok") {
-      out.push({
-        type: "command",
-        command: {
-          def: definition.value,
-          dir,
-          defPath,
-          entrypointPath,
-        },
-      });
-    } else {
-      out.push({
-        type: "invalid",
-        invalid: {
-          dir,
-          defPath,
-          reason: `invalid def.json: ${formatTaggedErrorForLog(definition.error).errorMessage}`,
-        },
-      });
-    }
+    definition.match({
+      ok: (value) =>
+        out.push({
+          type: "command",
+          command: { def: value, dir, defPath, entrypointPath },
+        }),
+      err: (error) =>
+        out.push({
+          type: "invalid",
+          invalid: {
+            dir,
+            defPath,
+            reason: `invalid def.json: ${formatTaggedErrorForLog(error).errorMessage}`,
+          },
+        }),
+    });
   }
 
   return Result.ok(out);

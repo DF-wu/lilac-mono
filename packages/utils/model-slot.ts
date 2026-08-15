@@ -151,17 +151,22 @@ export function toDurableResolvedModelPlan(
 export function fromDurableResolvedModelRequestResult(
   request: DurableResolvedModelRequest,
 ): ResultType<ResolvedModelRef, ModelResolutionFailed> {
-  const parsed = parseModelSpecifierResult(request.spec);
-  if (parsed.status === "error") {
+  const parsed = parseModelSpecifierResult(request.spec).match<
+    { provider: string; model: string } | string
+  >({
+    ok: (value) => value,
+    err: (error) => error.message,
+  });
+  if (typeof parsed === "string") {
     return Result.err(
       new ModelResolutionFailed({
         issue: "invalid-spec",
         source: "durable model request",
-        message: parsed.error.message,
+        message: parsed,
       }),
     );
   }
-  if (parsed.value.provider !== request.provider || parsed.value.model !== request.modelId) {
+  if (parsed.provider !== request.provider || parsed.model !== request.modelId) {
     return Result.err(
       new ModelResolutionFailed({
         issue: "durable-mismatch",
@@ -212,30 +217,50 @@ export function fromDurableResolvedModelRequest(
   request: DurableResolvedModelRequest,
 ): ResolvedModelRef {
   const result = fromDurableResolvedModelRequestResult(request);
-  if (result.status === "error") throw new Error(result.error.message);
-  return result.value;
+  const resolved = result.match<
+    { readonly value: ResolvedModelRef } | { readonly error: ModelResolutionFailed }
+  >({
+    ok: (value) => ({ value }),
+    err: (error) => ({ error }),
+  });
+  if ("error" in resolved) throw new Error(resolved.error.message);
+  return resolved.value;
 }
 
 export function fromDurableResolvedModelPlan(
   request: DurableResolvedModelRequest,
 ): ResolvedModelPlan {
   const result = fromDurableResolvedModelPlanResult(request);
-  if (result.status === "error") throw new Error(result.error.message);
-  return result.value;
+  const resolved = result.match<
+    { readonly value: ResolvedModelPlan } | { readonly error: ModelResolutionFailed }
+  >({
+    ok: (value) => ({ value }),
+    err: (error) => ({ error }),
+  });
+  if ("error" in resolved) throw new Error(resolved.error.message);
+  return resolved.value;
 }
 
 export function fromDurableResolvedModelPlanResult(
   request: DurableResolvedModelRequest,
 ): ResultType<ResolvedModelPlan, ModelResolutionFailed> {
   const head = fromDurableResolvedModelRequestResult(request);
-  if (head.status === "error") return Result.err(head.error);
+  const headValue = head.match<ResolvedModelRef | ModelResolutionFailed>({
+    ok: (value) => value,
+    err: (error) => error,
+  });
+  if (ModelResolutionFailed.is(headValue)) return Result.err(headValue);
   const fallbacks: ResolvedModelRef[] = [];
   for (const fallback of request.fallbacks ?? []) {
     const resolved = fromDurableResolvedModelRequestResult(fallback);
-    if (resolved.status === "error") return Result.err(resolved.error);
-    fallbacks.push(resolved.value);
+    const fallbackValue = resolved.match<ResolvedModelRef | ModelResolutionFailed>({
+      ok: (value) => value,
+      err: (error) => error,
+    });
+    if (ModelResolutionFailed.is(fallbackValue)) return Result.err(fallbackValue);
+    fallbacks.push(fallbackValue);
   }
-  return Result.ok({ head: head.value, fallbacks });
+  return Result.ok({ head: headValue, fallbacks });
 }
 
 function cloneJson(value: JSONValue): JSONValue {
@@ -493,8 +518,19 @@ function resolveSlotSpecResult(
 > {
   const slotCfg = cfg.models[slot];
   const baseResult = resolveModelSpecFromRawResult(cfg, slotCfg.model, `models.${slot}.model`);
-  if (baseResult.status === "error") return Result.err(baseResult.error);
-  const base = baseResult.value;
+  const base = baseResult.match<
+    | {
+        spec: string;
+        alias?: string;
+        presetOptions?: JSONObject;
+        presetReasoning?: ModelReasoningEffort;
+      }
+    | ModelResolutionFailed
+  >({
+    ok: (value) => value,
+    err: (error) => error,
+  });
+  if (ModelResolutionFailed.is(base)) return Result.err(base);
 
   return Result.ok({
     spec: base.spec,
@@ -514,24 +550,40 @@ function resolveModelResult(params: {
   reasoning?: ModelReasoningEffort;
 }): ResultType<ResolvedModelRef, ModelResolutionFailed> {
   const parsed = parseModelSpecifierResult(params.spec);
-  if (parsed.status === "error") {
+  const parsedSpec = parsed.match<{ provider: string; model: string } | string>({
+    ok: (value) => value,
+    err: (error) => error.message,
+  });
+  if (typeof parsedSpec === "string") {
     return Result.err(
       new ModelResolutionFailed({
         issue: "invalid-spec",
         source: params.source,
-        message: parsed.error.message,
+        message: parsedSpec,
       }),
     );
   }
-  const provider = parsed.value.provider;
-  const modelId = parsed.value.model;
+  const provider = parsedSpec.provider;
+  const modelId = parsedSpec.model;
   const builtOptions = buildProviderOptionsResult({
     provider,
     options: params.options,
   });
-  if (builtOptions.status === "error") return Result.err(builtOptions.error);
+  const options = builtOptions.match<
+    | {
+        providerOptions?: { [x: string]: JSONObject };
+        responseCommentary?: boolean;
+        openaiServerCompaction?: true;
+        anthropicPromptCache?: boolean;
+      }
+    | ModelResolutionFailed
+  >({
+    ok: (value) => value,
+    err: (error) => error,
+  });
+  if (ModelResolutionFailed.is(options)) return Result.err(options);
   const { providerOptions, responseCommentary, openaiServerCompaction, anthropicPromptCache } =
-    builtOptions.value;
+    options;
 
   const p = providers[provider as Providers];
   const hasProvider = Object.prototype.hasOwnProperty.call(providers, provider);
@@ -582,13 +634,25 @@ export function resolveModelRefResult(
   source: string,
 ): ResultType<ResolvedModelRef, ModelResolutionFailed> {
   const base = resolveModelSpecFromRawResult(cfg, ref.model, source);
-  if (base.status === "error") return Result.err(base.error);
-  const mergedOptions = deepMergeObjects(base.value.presetOptions, ref.options);
-  const reasoning = ref.reasoning ?? base.value.presetReasoning;
+  const baseValue = base.match<
+    | {
+        spec: string;
+        alias?: string;
+        presetOptions?: JSONObject;
+        presetReasoning?: ModelReasoningEffort;
+      }
+    | ModelResolutionFailed
+  >({
+    ok: (value) => value,
+    err: (error) => error,
+  });
+  if (ModelResolutionFailed.is(baseValue)) return Result.err(baseValue);
+  const mergedOptions = deepMergeObjects(baseValue.presetOptions, ref.options);
+  const reasoning = ref.reasoning ?? baseValue.presetReasoning;
   return resolveModelResult({
     source,
-    spec: base.value.spec,
-    alias: base.value.alias,
+    spec: baseValue.spec,
+    alias: baseValue.alias,
     options: mergedOptions,
     reasoning,
   });
@@ -600,8 +664,14 @@ export function resolveModelRef(
   source: string,
 ): ResolvedModelRef {
   const result = resolveModelRefResult(cfg, ref, source);
-  if (result.status === "error") throw new Error(result.error.message);
-  return result.value;
+  const resolved = result.match<
+    { readonly value: ResolvedModelRef } | { readonly error: ModelResolutionFailed }
+  >({
+    ok: (value) => ({ value }),
+    err: (error) => ({ error }),
+  });
+  if ("error" in resolved) throw new Error(resolved.error.message);
+  return resolved.value;
 }
 
 export function resolveModelChain(
@@ -611,8 +681,14 @@ export function resolveModelChain(
   reasoningOverride?: ModelReasoningEffort,
 ): ResolvedModelRef[] {
   const result = resolveModelChainResult(cfg, entries, source, reasoningOverride);
-  if (result.status === "error") throw new Error(result.error.message);
-  return result.value;
+  const resolved = result.match<
+    { readonly value: ResolvedModelRef[] } | { readonly error: ModelResolutionFailed }
+  >({
+    ok: (value) => ({ value }),
+    err: (error) => ({ error }),
+  });
+  if ("error" in resolved) throw new Error(resolved.error.message);
+  return resolved.value;
 }
 
 export function resolveModelChainResult(
@@ -629,8 +705,12 @@ export function resolveModelChainResult(
       reasoningOverride === undefined ? ref : { ...ref, reasoning: reasoningOverride },
       `${source}[${index}]`,
     );
-    if (model.status === "error") return Result.err(model.error);
-    resolved.push(model.value);
+    const modelValue = model.match<ResolvedModelRef | ModelResolutionFailed>({
+      ok: (value) => value,
+      err: (error) => error,
+    });
+    if (ModelResolutionFailed.is(modelValue)) return Result.err(modelValue);
+    resolved.push(modelValue);
   }
   return Result.ok(resolved);
 }
@@ -660,16 +740,24 @@ export function resolveModelPlanResult(
       : { ...params.head, reasoning: params.reasoningOverride },
     params.headSource,
   );
-  if (head.status === "error") return Result.err(head.error);
+  const headValue = head.match<ResolvedModelRef | ModelResolutionFailed>({
+    ok: (value) => value,
+    err: (error) => error,
+  });
+  if (ModelResolutionFailed.is(headValue)) return Result.err(headValue);
   const fallbacks = resolveModelChainResult(
     cfg,
     fallback,
     fallbackSource,
     params.reasoningOverride,
   );
-  if (fallbacks.status === "error") return Result.err(fallbacks.error);
+  const fallbackValues = fallbacks.match<ResolvedModelRef[] | ModelResolutionFailed>({
+    ok: (value) => value,
+    err: (error) => error,
+  });
+  if (ModelResolutionFailed.is(fallbackValues)) return Result.err(fallbackValues);
 
-  return Result.ok({ head: head.value, fallbacks: fallbacks.value });
+  return Result.ok({ head: headValue, fallbacks: fallbackValues });
 }
 
 export function resolveModelPlan(
@@ -683,8 +771,14 @@ export function resolveModelPlan(
   },
 ): ResolvedModelPlan {
   const result = resolveModelPlanResult(cfg, params);
-  if (result.status === "error") throw new Error(result.error.message);
-  return result.value;
+  const resolved = result.match<
+    { readonly value: ResolvedModelPlan } | { readonly error: ModelResolutionFailed }
+  >({
+    ok: (value) => ({ value }),
+    err: (error) => ({ error }),
+  });
+  if ("error" in resolved) throw new Error(resolved.error.message);
+  return resolved.value;
 }
 
 export function withModelPlanReasoning(
@@ -702,9 +796,22 @@ export function resolveModelSlotResult(
   slot: ModelSlot,
 ): ResultType<ResolvedModelSlot, ModelResolutionFailed> {
   const slotSpec = resolveSlotSpecResult(cfg, slot);
-  if (slotSpec.status === "error") return Result.err(slotSpec.error);
-  const { spec, alias, presetOptions, presetReasoning, slotOptions, slotReasoning } =
-    slotSpec.value;
+  const slotSpecValue = slotSpec.match<
+    | {
+        spec: string;
+        alias?: string;
+        presetOptions?: JSONObject;
+        presetReasoning?: ModelReasoningEffort;
+        slotOptions?: JSONObject;
+        slotReasoning?: ModelReasoningEffort;
+      }
+    | ModelResolutionFailed
+  >({
+    ok: (value) => value,
+    err: (error) => error,
+  });
+  if (ModelResolutionFailed.is(slotSpecValue)) return Result.err(slotSpecValue);
+  const { spec, alias, presetOptions, presetReasoning, slotOptions, slotReasoning } = slotSpecValue;
   const mergedOptions = deepMergeObjects(presetOptions, slotOptions);
   const reasoning = slotReasoning ?? presetReasoning;
   const resolved = resolveModelResult({
@@ -714,18 +821,28 @@ export function resolveModelSlotResult(
     options: mergedOptions,
     reasoning,
   });
-  if (resolved.status === "error") return Result.err(resolved.error);
+  const resolvedValue = resolved.match<ResolvedModelRef | ModelResolutionFailed>({
+    ok: (value) => value,
+    err: (error) => error,
+  });
+  if (ModelResolutionFailed.is(resolvedValue)) return Result.err(resolvedValue);
 
   return Result.ok({
     slot,
-    ...resolved.value,
+    ...resolvedValue,
   });
 }
 
 export function resolveModelSlot(cfg: CoreConfig, slot: ModelSlot): ResolvedModelSlot {
   const result = resolveModelSlotResult(cfg, slot);
-  if (result.status === "error") throw new Error(result.error.message);
-  return result.value;
+  const resolved = result.match<
+    { readonly value: ResolvedModelSlot } | { readonly error: ModelResolutionFailed }
+  >({
+    ok: (value) => ({ value }),
+    err: (error) => ({ error }),
+  });
+  if ("error" in resolved) throw new Error(resolved.error.message);
+  return resolved.value;
 }
 
 export function resolveModelSlotPlanResult(

@@ -146,33 +146,39 @@ export async function prepareServerCompactionRequestResult(
     );
   }
   const parsed = decodeServerCompactionPayload(decoded);
-  if (parsed.status === "error") return Result.err(parsed.error);
-
-  const body = encodeServerCompactionPayload(parsed.value);
-  mergeRemoteCompactionFeature(headers);
-
-  return Result.ok({ input, init: { ...strippedInit, body } });
+  return parsed.map((value) => {
+    const body = encodeServerCompactionPayload(value);
+    mergeRemoteCompactionFeature(headers);
+    return { input, init: { ...strippedInit, body } };
+  });
 }
 
 /** Adds server compaction wire fields only to explicitly marked Responses requests. */
 export function withServerCompactionRequestFetch<T extends typeof globalThis.fetch>(fetchFn: T): T {
   const wrappedFetch = async (input: FetchInput, init?: FetchInit) => {
     const prepared = await prepareServerCompactionRequestResult(input, init);
-    if (prepared.status === "error") {
-      switch (prepared.error.issue) {
+    const resolved = prepared.match<
+      | { readonly value: PreparedServerCompactionRequest | null }
+      | { readonly error: ServerCompactionRequestInvalid }
+    >({
+      ok: (value) => ({ value }),
+      err: (error) => ({ error }),
+    });
+    if ("error" in resolved) {
+      switch (resolved.error.issue) {
         case "unreadable-body":
-          if (Object.hasOwn(prepared.error, "cause")) throw prepared.error.cause;
-          throw new Error(prepared.error.message);
+          if (Object.hasOwn(resolved.error, "cause")) throw resolved.error.cause;
+          throw new Error(resolved.error.message);
         case "malformed-json":
         case "invalid-body":
-          throw new Error(prepared.error.message, { cause: prepared.error.cause });
+          throw new Error(resolved.error.message, { cause: resolved.error.cause });
         case "invalid-target":
-          throw new Error(prepared.error.message);
+          throw new Error(resolved.error.message);
       }
     }
-    return prepared.value === null
+    return resolved.value === null
       ? fetchFn(input, init)
-      : fetchFn(prepared.value.input, prepared.value.init);
+      : fetchFn(resolved.value.input, resolved.value.init);
   };
 
   return Object.assign(wrappedFetch, fetchFn);

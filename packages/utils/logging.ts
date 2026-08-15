@@ -443,14 +443,18 @@ class OpenObserveJsonlStream implements WriteStream {
         try {
           const result = await this.postBatch(batch.body);
 
-          if (result.status === "ok") {
-            this.succeededBatches += 1;
-            this.lastSuccessAtMs = Date.now();
-            this.lastSuccessSequence = ++openObserveOutcomeSequence;
-          } else {
-            this.recordFailure(result.error);
-            reportOpenObserveDiagnostics();
-          }
+          const record = result.match<() => void>({
+            ok: () => () => {
+              this.succeededBatches += 1;
+              this.lastSuccessAtMs = Date.now();
+              this.lastSuccessSequence = ++openObserveOutcomeSequence;
+            },
+            err: (error) => () => {
+              this.recordFailure(error);
+              reportOpenObserveDiagnostics();
+            },
+          });
+          record();
         } finally {
           this.activeBatch = [];
           this.activeBytes = 0;
@@ -535,16 +539,19 @@ class OpenObserveJsonlStream implements WriteStream {
       }
 
       const response = outcome.result;
-      if (response.status === "error") return Result.err(response.error);
-      if (!response.value.ok) {
-        return Result.err(
-          new OpenObserveHttpFailed({
-            status: response.value.status,
-            message: "OpenObserve rejected a log batch",
-          }),
-        );
-      }
-      return Result.ok(undefined);
+      const finish = response.match<() => ResultType<void, OpenObserveDeliveryFailure>>({
+        err: (error) => () => Result.err(error),
+        ok: (value) => () =>
+          value.ok
+            ? Result.ok(undefined)
+            : Result.err(
+                new OpenObserveHttpFailed({
+                  status: value.status,
+                  message: "OpenObserve rejected a log batch",
+                }),
+              ),
+      });
+      return finish();
     } finally {
       if (timeoutId) clearTimeout(timeoutId);
     }
