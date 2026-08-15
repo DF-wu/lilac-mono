@@ -1893,7 +1893,7 @@ describe("Stage 6 persistence and SQLite architecture", () => {
     expect(findings.some(({ message }) => message.includes("missing-defaulted"))).toBeTrue();
   });
 
-  test("fails closed for unregistered persisted consumers and fixture catalogs", () => {
+  test("fails closed for aliased unregistered persisted consumers and fixture catalogs", () => {
     const codec = persistedCodec("decodeFixtureStringArray", "fixtureStringArrayCases");
     const unregisteredConsumerWorkspace = {
       ...realWorkspaceBase,

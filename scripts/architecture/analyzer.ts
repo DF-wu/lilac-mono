@@ -5107,13 +5107,6 @@ function assertPersistenceInfrastructureCallsResolve(
     value: adapter,
     identityRoot: packageRootByName.get(adapter.packageName),
   }));
-  const persistenceTargets = [...codecTargets, ...transactionTargets];
-  const persistenceTargetNames = new Set(
-    persistenceTargets.map(({ value }) => {
-      const parts = value.identity.exportName.split(".");
-      return parts[parts.length - 1] ?? value.identity.exportName;
-    }),
-  );
   const codecModules = new Set([
     ...registeredConsumers.map(({ identity }) => identity.module),
     ...workspace.boundaryDecoders.map(({ identity }) => identity.module),
@@ -5126,7 +5119,6 @@ function assertPersistenceInfrastructureCallsResolve(
 
   for (const sourceFile of productionSourceIndex(program, workspaceRoot).files) {
     const module = relativeModulePath(workspaceRoot, sourceFile);
-    const persistenceCallNames = aliasExpandedNames(sourceFile, persistenceTargetNames);
     const scanCodecCalls =
       codecTargets.length > 0 &&
       (active.scanAllProductionModules === true || codecModules.has(module));
@@ -5152,8 +5144,6 @@ function assertPersistenceInfrastructureCallsResolve(
 
     if (scanCodecCalls || scanTransactionCalls) {
       for (const node of sourceAnalysisIndex(sourceFile).calls) {
-        const called = expressionName(node.expression);
-        if (called && !persistenceCallNames.has(called)) continue;
         const declaration = resolvedSignature(checker, node)?.declaration;
         if (!declaration) {
           continue;
