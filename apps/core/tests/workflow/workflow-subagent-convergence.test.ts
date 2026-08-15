@@ -1,5 +1,6 @@
 import { workflowStoreValue } from "./workflow-store-test-helpers";
-import { afterEach, describe, expect, it, jest } from "bun:test";
+import { afterEach, describe, expect, it, jest, spyOn } from "bun:test";
+import { Logger } from "@stanley2058/simple-module-logger";
 import path from "node:path";
 import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -616,6 +617,48 @@ describe("workflow subagent convergence", () => {
     await bridge.stop();
     await bus.close();
     store.close();
+  });
+  it("logs live-parent publication failures with run context and redaction", async () => {
+    const { store, run } = await createRun("parent:publication-warning");
+    const bus = createLilacBus(createInMemoryRawBus());
+    const warning = spyOn(Logger.prototype, "warn").mockImplementation(() => {});
+    const bridge = new WorkflowLiveParentBridge({
+      bus,
+      store,
+      subscriptionId: "test-live-parent-publication-warning",
+    });
+    await bridge.start();
+    const parent = bridge.registerParent({
+      parentRequestId: "parent:publication-warning",
+      publishToolStatus: async () => {
+        throw new Error("token=secret-live-parent-publication");
+      },
+    });
+    try {
+      await parent.ready;
+      await bus.publish(
+        lilacEventTypes.EvtAgentOutputDeltaText,
+        { delta: "publishing activity" },
+        {
+          headers: {
+            request_id: "sub:child:1",
+            session_id: "sub:channel:1:named:audit",
+            request_client: "unknown",
+          },
+        },
+      );
+
+      const logged = JSON.stringify(warning.mock.calls);
+      expect(logged).toContain(run.runId);
+      expect(logged).toContain("token=<redacted>");
+      expect(logged).not.toContain("secret-live-parent-publication");
+    } finally {
+      await parent.close();
+      await bridge.stop();
+      await bus.close();
+      store.close();
+      warning.mockRestore();
+    }
   });
   it("reconciles pending terminal child output when the parent registers", async () => {
     const { store, run } = await createRun("parent:terminal-tree");

@@ -1461,124 +1461,127 @@ export function validateWorkflowSourceUnchecked(params: {
   name: string;
   source: string;
 }): ResultType<ValidatedWorkflowDefinition, WorkflowDefinitionInvalid> {
-  const invalid = (message: string): ResultType<never, WorkflowDefinitionInvalid> =>
-    Result.err(new WorkflowDefinitionInvalid({ message }));
-  const parsedName = workflowDefinitionNameSchema.safeParse(params.name);
-  if (!parsedName.success) {
-    return invalid(parsedName.error.issues[0]?.message ?? "Workflow name is invalid");
-  }
-  const name = parsedName.data;
-  const sourceBytes = Buffer.byteLength(params.source, "utf8");
-  if (sourceBytes > MAX_WORKFLOW_SOURCE_BYTES) {
-    return invalid(`Workflow source exceeds ${MAX_WORKFLOW_SOURCE_BYTES} bytes`);
-  }
-  const state: WorkflowValidationState = { error: null };
-  const definition = extractDefinitionObject(params.source, state);
-  if (!definition || state.error) return invalid(state.error ?? "Workflow definition is invalid");
-  const raw = extractStaticMetadata(definition, state);
-  if (!raw || state.error) return invalid(state.error ?? "Workflow metadata is invalid");
-  const parsedMetadata = workflowMetadataSchema.safeParse({
-    name: raw.name,
-    description: raw.description,
-  });
-  if (!parsedMetadata.success) {
-    return invalid(parsedMetadata.error.issues[0]?.message ?? "Workflow metadata is invalid");
-  }
-  const metadata = parsedMetadata.data;
-  if (metadata.name !== name) return invalid(`Workflow metadata name must match filename: ${name}`);
-  const inputResult = workflowJsonSchema.safeParse(raw.input);
-  if (!inputResult.success) {
-    return invalid(inputResult.error.issues[0]?.message ?? "Workflow input schema is invalid");
-  }
-  const parsedInput = inputResult.data;
-  if (parsedInput.type !== "object")
-    return invalid("Workflow input schema root must have type object");
-  assertSchemaBounds(parsedInput, state);
-  if (state.error) return invalid(state.error);
-  const normalizedInput = normalizeInputSchema(parsedInput, state);
-  if (!normalizedInput || state.error)
-    return invalid(state.error ?? "Workflow input schema is invalid");
-  const parsedInputSchema = jsonObjectSchema.safeParse(normalizedInput);
-  if (!parsedInputSchema.success) {
-    return invalid(
-      parsedInputSchema.error.issues[0]?.message ?? "Workflow input schema is invalid",
+  return Result.gen(function* () {
+    const invalid = (message: string): ResultType<never, WorkflowDefinitionInvalid> =>
+      Result.err(new WorkflowDefinitionInvalid({ message }));
+    const parsedName = workflowDefinitionNameSchema.safeParse(params.name);
+    if (!parsedName.success) {
+      return invalid(parsedName.error.issues[0]?.message ?? "Workflow name is invalid");
+    }
+    const name = parsedName.data;
+    const sourceBytes = Buffer.byteLength(params.source, "utf8");
+    if (sourceBytes > MAX_WORKFLOW_SOURCE_BYTES) {
+      return invalid(`Workflow source exceeds ${MAX_WORKFLOW_SOURCE_BYTES} bytes`);
+    }
+    const state: WorkflowValidationState = { error: null };
+    const definition = extractDefinitionObject(params.source, state);
+    if (!definition || state.error) return invalid(state.error ?? "Workflow definition is invalid");
+    const raw = extractStaticMetadata(definition, state);
+    if (!raw || state.error) return invalid(state.error ?? "Workflow metadata is invalid");
+    const parsedMetadata = workflowMetadataSchema.safeParse({
+      name: raw.name,
+      description: raw.description,
+    });
+    if (!parsedMetadata.success) {
+      return invalid(parsedMetadata.error.issues[0]?.message ?? "Workflow metadata is invalid");
+    }
+    const metadata = parsedMetadata.data;
+    if (metadata.name !== name)
+      return invalid(`Workflow metadata name must match filename: ${name}`);
+    const inputResult = workflowJsonSchema.safeParse(raw.input);
+    if (!inputResult.success) {
+      return invalid(inputResult.error.issues[0]?.message ?? "Workflow input schema is invalid");
+    }
+    const parsedInput = inputResult.data;
+    if (parsedInput.type !== "object")
+      return invalid("Workflow input schema root must have type object");
+    assertSchemaBounds(parsedInput, state);
+    if (state.error) return invalid(state.error);
+    const normalizedInput = normalizeInputSchema(parsedInput, state);
+    if (!normalizedInput || state.error)
+      return invalid(state.error ?? "Workflow input schema is invalid");
+    const parsedInputSchema = jsonObjectSchema.safeParse(normalizedInput);
+    if (!parsedInputSchema.success) {
+      return invalid(
+        parsedInputSchema.error.issues[0]?.message ?? "Workflow input schema is invalid",
+      );
+    }
+    const inputSchema = parsedInputSchema.data;
+    const rawResources = jsonObjectSchema.safeParse(raw.resources);
+    if (rawResources.success) {
+      if ("maxWallTimeMs" in rawResources.data) {
+        return invalid(
+          "Workflow revision field 'resources.maxWallTimeMs' was removed; workflows no longer have a wall-time limit",
+        );
+      }
+      if ("safety" in rawResources.data) {
+        return invalid(
+          "Workflow revision field 'resources.safety' was removed; delete it from the workflow definition",
+        );
+      }
+      const rawAgents = jsonObjectSchema.safeParse(rawResources.data["agents"]);
+      const removedAgentField = rawAgents.success
+        ? REMOVED_REVISION_AGENT_FIELDS.find((field) => field in rawAgents.data)
+        : undefined;
+      if (removedAgentField) {
+        return invalid(
+          `Workflow revision field 'agents.${removedAgentField}' was removed; migrate to profile-native agent() options`,
+        );
+      }
+      const removedTopLevel = ["level2", "surfaces"].find((field) => field in rawResources.data);
+      if (removedTopLevel) {
+        return invalid(
+          `Workflow revision field '${removedTopLevel}' was removed; profiles now own agent tool access`,
+        );
+      }
+    }
+    const rawLimits = jsonObjectSchema.safeParse(raw.limits ?? {});
+    if (rawLimits.success && "maxRuntimeMemoryBytes" in rawLimits.data) {
+      return invalid(
+        "Workflow revision field 'limits.maxRuntimeMemoryBytes' was removed; delete it from the workflow definition",
+      );
+    }
+    const sourceResources = sourceResourcePolicySchema.safeParse(raw.resources);
+    if (!sourceResources.success) {
+      return invalid(sourceResources.error.issues[0]?.message ?? "Workflow resources are invalid");
+    }
+    const resources = yield* normalizeWorkflowResourcePolicyResult(sourceResources.data).mapError(
+      (error) => new WorkflowDefinitionInvalid({ message: error.message }),
     );
-  }
-  const inputSchema = parsedInputSchema.data;
-  const rawResources = jsonObjectSchema.safeParse(raw.resources);
-  if (rawResources.success) {
-    if ("maxWallTimeMs" in rawResources.data) {
+    const limitsResult = sourceLimitsSchema.safeParse(raw.limits ?? {});
+    if (!limitsResult.success) {
+      return invalid(limitsResult.error.issues[0]?.message ?? "Workflow limits are invalid");
+    }
+    const limits = limitsResult.data;
+    if (sourceBytes > limits.maxSourceBytes) {
       return invalid(
-        "Workflow revision field 'resources.maxWallTimeMs' was removed; workflows no longer have a wall-time limit",
+        `Workflow source exceeds its declared maxSourceBytes (${limits.maxSourceBytes})`,
       );
     }
-    if ("safety" in rawResources.data) {
-      return invalid(
-        "Workflow revision field 'resources.safety' was removed; delete it from the workflow definition",
-      );
-    }
-    const rawAgents = jsonObjectSchema.safeParse(rawResources.data["agents"]);
-    const removedAgentField = rawAgents.success
-      ? REMOVED_REVISION_AGENT_FIELDS.find((field) => field in rawAgents.data)
-      : undefined;
-    if (removedAgentField) {
-      return invalid(
-        `Workflow revision field 'agents.${removedAgentField}' was removed; migrate to profile-native agent() options`,
-      );
-    }
-    const removedTopLevel = ["level2", "surfaces"].find((field) => field in rawResources.data);
-    if (removedTopLevel) {
-      return invalid(
-        `Workflow revision field '${removedTopLevel}' was removed; profiles now own agent tool access`,
-      );
-    }
-  }
-  const rawLimits = jsonObjectSchema.safeParse(raw.limits ?? {});
-  if (rawLimits.success && "maxRuntimeMemoryBytes" in rawLimits.data) {
-    return invalid(
-      "Workflow revision field 'limits.maxRuntimeMemoryBytes' was removed; delete it from the workflow definition",
-    );
-  }
-  const sourceResources = sourceResourcePolicySchema.safeParse(raw.resources);
-  if (!sourceResources.success) {
-    return invalid(sourceResources.error.issues[0]?.message ?? "Workflow resources are invalid");
-  }
-  const resourcesResult = normalizeWorkflowResourcePolicyResult(sourceResources.data);
-  if (resourcesResult.status === "error") return invalid(resourcesResult.error.message);
-  const resources = resourcesResult.value;
-  const limitsResult = sourceLimitsSchema.safeParse(raw.limits ?? {});
-  if (!limitsResult.success) {
-    return invalid(limitsResult.error.issues[0]?.message ?? "Workflow limits are invalid");
-  }
-  const limits = limitsResult.data;
-  if (sourceBytes > limits.maxSourceBytes) {
-    return invalid(
-      `Workflow source exceeds its declared maxSourceBytes (${limits.maxSourceBytes})`,
-    );
-  }
-  const sourceSha256 = sha256(params.source);
-  const inputSchemaSha256 = canonicalJsonSha256(inputSchema);
-  const policyJson = jsonObjectSchema.safeParse({ resources, limits });
-  if (!policyJson.success) return invalid("Workflow resource policy is not canonical JSON");
-  const resourcePolicySha256 = canonicalJsonSha256(policyJson.data);
-  const sensitiveFields = collectSensitiveFields(normalizedInput);
-  const validationSummary = [
-    `${metadata.name}: ${metadata.description}`,
-    `Agents: max=${resources.agents.maxConcurrent}/${resources.agents.maxTotal}`,
-    `Waits: ${resources.waits.join(",") || "none"}`,
-    `Limits: input=${limits.maxInputBytes} bytes`,
-    `Sensitive inputs: ${sensitiveFields.join(", ") || "none declared"}`,
-  ].join("\n");
+    const sourceSha256 = sha256(params.source);
+    const inputSchemaSha256 = canonicalJsonSha256(inputSchema);
+    const policyJson = jsonObjectSchema.safeParse({ resources, limits });
+    if (!policyJson.success) return invalid("Workflow resource policy is not canonical JSON");
+    const resourcePolicySha256 = canonicalJsonSha256(policyJson.data);
+    const sensitiveFields = collectSensitiveFields(normalizedInput);
+    const validationSummary = [
+      `${metadata.name}: ${metadata.description}`,
+      `Agents: max=${resources.agents.maxConcurrent}/${resources.agents.maxTotal}`,
+      `Waits: ${resources.waits.join(",") || "none"}`,
+      `Limits: input=${limits.maxInputBytes} bytes`,
+      `Sensitive inputs: ${sensitiveFields.join(", ") || "none declared"}`,
+    ].join("\n");
 
-  return Result.ok({
-    metadata,
-    inputSchema,
-    resources,
-    limits,
-    sensitiveFields,
-    sourceSha256,
-    inputSchemaSha256,
-    resourcePolicySha256,
-    validationSummary,
+    return Result.ok({
+      metadata,
+      inputSchema,
+      resources,
+      limits,
+      sensitiveFields,
+      sourceSha256,
+      inputSchemaSha256,
+      resourcePolicySha256,
+      validationSummary,
+    });
   });
 }

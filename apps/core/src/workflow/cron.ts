@@ -37,36 +37,42 @@ export function computeNextCronAtMsResult(
   input: CronScheduleInput,
   nowMs: number,
 ): ResultType<number, WorkflowCronInvalid> {
-  const expr = ensureFiveFieldCron(input.expr);
-  if (expr.status === "error") return Result.err(expr.error);
-  const tz = input.tz ?? "UTC";
+  const compute = ensureFiveFieldCron(input.expr).match<
+    () => ResultType<number, WorkflowCronInvalid>
+  >({
+    err: (error) => () => Result.err(error),
+    ok: (expression) => () => {
+      const tz = input.tz ?? "UTC";
+      const startAtMs =
+        typeof input.startAtMs === "number" && Number.isFinite(input.startAtMs)
+          ? Math.trunc(input.startAtMs)
+          : undefined;
+      const baseMs = startAtMs !== undefined ? Math.max(nowMs, startAtMs) : nowMs;
 
-  const startAtMs =
-    typeof input.startAtMs === "number" && Number.isFinite(input.startAtMs)
-      ? Math.trunc(input.startAtMs)
-      : undefined;
-
-  const baseMs = startAtMs !== undefined ? Math.max(nowMs, startAtMs) : nowMs;
-
-  // cron-parser's next() is strict (> currentDate). Subtract 1ms so boundary-aligned
-  // schedules can fire exactly at baseMs.
-  const currentDate = new Date(baseMs - 1);
-
-  const captured = Result.try({
-    try: () =>
-      CronExpressionParser.parse(expr.value, { currentDate, tz }).next().toDate().getTime(),
-    catch: projectRuntimeError("Opaque workflow cron failure"),
+      // cron-parser's next() is strict (> currentDate). Subtract 1ms so boundary-aligned
+      // schedules can fire exactly at baseMs.
+      const currentDate = new Date(baseMs - 1);
+      const parsed = Result.try({
+        try: () =>
+          CronExpressionParser.parse(expression, { currentDate, tz }).next().toDate().getTime(),
+        catch: projectRuntimeError("Opaque workflow cron failure"),
+      });
+      const finish = parsed.match<() => ResultType<number, WorkflowCronInvalid>>({
+        ok: (value) => () => Result.ok(value),
+        err: (error) => () => {
+          const cause = preserveToolPanic(error);
+          return Result.err(
+            new WorkflowCronInvalid({
+              expression: input.expr,
+              message: opaqueErrorMessage(cause, "Invalid workflow cron expression"),
+            }),
+          );
+        },
+      });
+      return finish();
+    },
   });
-  if (captured.status === "error") {
-    const cause = preserveToolPanic(captured.error);
-    return Result.err(
-      new WorkflowCronInvalid({
-        expression: input.expr,
-        message: opaqueErrorMessage(cause, "Invalid workflow cron expression"),
-      }),
-    );
-  }
-  return Result.ok(captured.value);
+  return compute();
 }
 
 export function computeNextCronAtMs(input: CronScheduleInput, nowMs: number): number {

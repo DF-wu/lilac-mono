@@ -102,12 +102,10 @@ function decodeWorkflowCallInput(input: {
   WorkflowAgentOperationInputInvalid | WorkflowCallInputInvalid
 > {
   if (input.call.kind === "agent") {
-    const resolved = resolveWorkflowAgentOperationInputResult({
+    return resolveWorkflowAgentOperationInputResult({
       value: input.call.input,
       canonicalWorkspaceRoot: input.canonicalWorkspaceRoot,
-    });
-    if (resolved.status === "error") return Result.err(resolved.error);
-    return Result.ok({ kind: "agent", input: resolved.value });
+    }).map((value) => ({ kind: "agent", input: value }));
   }
   const invalid = (message: string) =>
     Result.err(
@@ -351,8 +349,7 @@ function eventDeliveryDoneDetail(label: string, error: EventDeliveryDoneError): 
 function requireWorkflowEngineSubscriptionStart(
   started: ResultType<WorkflowEventSubscription, EventDeliveryStartFailed>,
 ): WorkflowEventSubscription {
-  if (started.status === "error") throw started.error;
-  return started.value;
+  return adaptToolResultToHost(started);
 }
 
 export async function runWorkflowTimerTick(
@@ -380,14 +377,15 @@ function fetchWorkflowTerminalReceipt(
   WorkflowTerminalReceiptMissing | DurableWorkflowReadError
 > {
   const receiptResult = store.getWorkflowRequestTerminalReceipt(requestId);
-  if (receiptResult.status === "error") return Result.err(receiptResult.error);
-  const receipt = receiptResult.value;
-  if (receipt) return Result.ok(receipt);
-  return Result.err(
-    new WorkflowTerminalReceiptMissing({
-      requestId,
-      message: "Workflow prompt publication was rejected without a terminal receipt",
-    }),
+  return receiptResult.andThen((receipt) =>
+    receipt
+      ? Result.ok(receipt)
+      : Result.err(
+          new WorkflowTerminalReceiptMissing({
+            requestId,
+            message: "Workflow prompt publication was rejected without a terminal receipt",
+          }),
+        ),
   );
 }
 
@@ -427,15 +425,15 @@ export async function captureWorkflowIdleCancellationPublication(
       },
     },
   );
-  if (published.status === "error") {
-    return Result.err(
-      new WorkflowIdleCancellationPublishFailed({
-        cause: published.error,
-        message: "Workflow idle cancellation publication failed",
-      }),
+  return published
+    .map(() => undefined)
+    .mapError(
+      (cause) =>
+        new WorkflowIdleCancellationPublishFailed({
+          cause,
+          message: "Workflow idle cancellation publication failed",
+        }),
     );
-  }
-  return Result.ok(undefined);
 }
 
 async function stopWorkflowEventSubscription(
@@ -444,9 +442,15 @@ async function stopWorkflowEventSubscription(
 ): Promise<readonly string[]> {
   const failures: string[] = [];
   const stopped = await subscription.stop();
-  if (stopped.status === "error") failures.push(`${label} stop failed: ${stopped.error.message}`);
+  stopped.match({
+    ok: () => undefined,
+    err: (error) => failures.push(`${label} stop failed: ${error.message}`),
+  });
   const done = await subscription.done;
-  if (done.status === "error") failures.push(eventDeliveryDoneDetail(label, done.error));
+  done.match({
+    ok: () => undefined,
+    err: (error) => failures.push(eventDeliveryDoneDetail(label, error)),
+  });
   return failures;
 }
 
@@ -558,13 +562,21 @@ export class WorkflowEngine {
       await this.startWakeSubscription(),
     );
     const runningRuns = this.input.store.listRuns({ state: "running", limit: 1_000 });
-    if (runningRuns.status === "error") signalDurableWorkflowReadErrorToHost(runningRuns.error);
-    for (const run of runningRuns.value) {
+    const readRunningRuns = runningRuns.match({
+      ok: (value) => () => value,
+      err: (error) => () => signalDurableWorkflowReadErrorToHost(error),
+    });
+    const running = readRunningRuns();
+    for (const run of running) {
       await this.claimAndLaunch(run, WORKFLOW_LEASE_STALE_MS);
     }
     const blockedRuns = this.input.store.listRuns({ state: "blocked", limit: 1_000 });
-    if (blockedRuns.status === "error") signalDurableWorkflowReadErrorToHost(blockedRuns.error);
-    for (const run of blockedRuns.value) {
+    const readBlockedRuns = blockedRuns.match({
+      ok: (value) => () => value,
+      err: (error) => () => signalDurableWorkflowReadErrorToHost(error),
+    });
+    const blocked = readBlockedRuns();
+    for (const run of blocked) {
       if (this.input.store.getManualReconciliationDetail(run.runId)) continue;
       this.input.store.transitionRun({
         runId: run.runId,
@@ -577,11 +589,13 @@ export class WorkflowEngine {
     await this.requestTick();
     this.timer = setInterval(() => {
       void runWorkflowTimerTick(() => this.requestTick()).then((tick) => {
-        if (tick.status === "error") {
-          this.logger.error("Workflow timer tick failed", {
-            ...formatTaggedErrorForLog(tick.error),
-          });
-        }
+        tick.match({
+          ok: () => undefined,
+          err: (error) =>
+            this.logger.error("Workflow timer tick failed", {
+              ...formatTaggedErrorForLog(error),
+            }),
+        });
       });
     }, this.input.pollMs ?? 250);
     this.timer.unref?.();
@@ -673,8 +687,11 @@ export class WorkflowEngine {
     const cancellations: Promise<void>[] = [];
     for (const [runId, active] of this.active) {
       const runResult = this.input.store.getRun(runId);
-      if (runResult.status === "error") signalDurableWorkflowReadErrorToHost(runResult.error);
-      const run = runResult.value;
+      const readRun = runResult.match({
+        ok: (value) => () => value,
+        err: (error) => () => signalDurableWorkflowReadErrorToHost(error),
+      });
+      const run = readRun();
       if (!run || run.state === "cancelled" || run.state === "paused") {
         active.controller.abort(run?.state ?? "run_missing");
         cancellations.push(
@@ -717,8 +734,12 @@ export class WorkflowEngine {
       );
     }
     const queuedRuns = this.input.store.listRuns({ state: "queued", limit: 1_000 });
-    if (queuedRuns.status === "error") signalDurableWorkflowReadErrorToHost(queuedRuns.error);
-    for (const run of queuedRuns.value) {
+    const readQueuedRuns = queuedRuns.match({
+      ok: (value) => () => value,
+      err: (error) => () => signalDurableWorkflowReadErrorToHost(error),
+    });
+    const queued = readQueuedRuns();
+    for (const run of queued) {
       await this.claimAndLaunch(run);
     }
   }
@@ -735,13 +756,20 @@ export class WorkflowEngine {
     if (!claimed) return;
     const controller = new AbortController();
     const sandboxResult = await this.createSandbox(claimed, controller.signal);
-    if (sandboxResult.status === "error") {
+    const sandboxOutcome = sandboxResult.match<
+      | { readonly kind: "ok"; readonly sandbox: WorkflowSandboxRun }
+      | { readonly kind: "error"; readonly error: WorkflowExecutionFailed }
+    >({
+      ok: (sandbox) => ({ kind: "ok", sandbox }),
+      err: (error) => ({ kind: "error", error }),
+    });
+    if (sandboxOutcome.kind === "error") {
       signalWorkflowExecutionFailureToHost(
-        await this.finishRun(claimed, "failed", null, sandboxResult.error.message),
+        await this.finishRun(claimed, "failed", null, sandboxOutcome.error.message),
       );
       return;
     }
-    const sandbox = sandboxResult.value;
+    const { sandbox } = sandboxOutcome;
     const promise = this.runSandbox(claimed, sandbox, controller.signal)
       .catch((error: unknown) => {
         if (Panic.is(error)) {
@@ -779,72 +807,103 @@ export class WorkflowEngine {
       const source = await fs.readFile(snapshotPath, "utf8");
       return { stats, source };
     });
-    if (loaded.status === "error") return Result.err(loaded.error);
-    if (!loaded.value.stats.isFile() || loaded.value.stats.isSymbolicLink()) {
-      return Result.err(workflowExecutionFailure("Invalid workflow snapshot file"));
-    }
-    const source = loaded.value.source;
-    if (sha256(source) !== revision.sourceSha256) {
-      return Result.err(workflowExecutionFailure("Workflow snapshot hash mismatch"));
-    }
-    if (revision.snapshotArtifactId !== `workflow-source:${revision.sourceSha256}`) {
-      return Result.err(workflowExecutionFailure("Workflow snapshot artifact identity mismatch"));
-    }
-    return Result.ok(source);
+    return loaded.andThen(({ stats, source }) => {
+      if (!stats.isFile() || stats.isSymbolicLink()) {
+        return Result.err(workflowExecutionFailure("Invalid workflow snapshot file"));
+      }
+      if (sha256(source) !== revision.sourceSha256) {
+        return Result.err(workflowExecutionFailure("Workflow snapshot hash mismatch"));
+      }
+      if (revision.snapshotArtifactId !== `workflow-source:${revision.sourceSha256}`) {
+        return Result.err(workflowExecutionFailure("Workflow snapshot artifact identity mismatch"));
+      }
+      return Result.ok(source);
+    });
   }
 
   private async createSandbox(
     run: WorkflowRun,
     signal: AbortSignal,
   ): Promise<WorkflowExecutionResult<WorkflowSandboxRun>> {
-    const revisionResult = this.input.store.getRevision(run.revisionId);
-    if (revisionResult.status === "error") {
-      return Result.err(workflowExecutionFailure(revisionResult.error.message));
-    }
-    const revision = revisionResult.value;
-    if (!revision) {
-      return Result.err(workflowExecutionFailure(`Workflow revision not found: ${run.revisionId}`));
-    }
-    const initialIntegrity = this.assertPersistedIntegrity(run, revision);
-    if (initialIntegrity.status === "error") return Result.err(initialIntegrity.error);
-    if (revision.runtimeVersion !== WORKFLOW_RUNTIME_VERSION) {
-      return Result.err(
-        workflowExecutionFailure(`Unsupported workflow runtime: ${revision.runtimeVersion}`),
-      );
-    }
-    const source = await this.loadSnapshot(revision);
-    if (source.status === "error") return Result.err(source.error);
-    const finalIntegrity = this.assertPersistedIntegrity(run, revision);
-    if (finalIntegrity.status === "error") return Result.err(finalIntegrity.error);
-    let compiled: WorkflowExecutionResult<string>;
-    if (this.input.compileSource) {
-      compiled = await captureWorkflowExternal(() =>
-        Promise.resolve(this.input.compileSource!(source.value, revision.sourceSha256)),
-      );
-    } else {
-      const result = compileWorkflowSourceResult(source.value, revision.sourceSha256);
-      compiled =
-        result.status === "error"
-          ? Result.err(workflowExecutionFailure(result.error.message))
-          : Result.ok(result.value);
-    }
-    if (compiled.status === "error") return Result.err(compiled.error);
-    const semaphore = new Semaphore(revision.resources.agents.maxConcurrent);
-    const sandbox = await captureWorkflowExternal(() =>
-      Promise.resolve(
-        startWorkflowSandbox({
-          source: compiled.value,
-          args: run.args,
-          signal,
-          reportFatalPanic: this.input.reportFatalPanic,
-          onCall: async (call) => {
-            const handled = await this.handleCall(run.runId, revision, call, semaphore, signal);
-            return handled;
+    const loadedRevision = this.input.store
+      .getRevision(run.revisionId)
+      .mapError((error) => workflowExecutionFailure(error.message));
+    const continueWithRevision = loadedRevision.match<
+      () => Promise<WorkflowExecutionResult<WorkflowSandboxRun>>
+    >({
+      err: (error) => async () => Result.err(error),
+      ok: (revision) => async () => {
+        if (!revision) {
+          return Result.err(
+            workflowExecutionFailure(`Workflow revision not found: ${run.revisionId}`),
+          );
+        }
+
+        const continueAfterInitialIntegrity = this.assertPersistedIntegrity(run, revision).match<
+          () => Promise<WorkflowExecutionResult<WorkflowSandboxRun>>
+        >({
+          err: (error) => async () => Result.err(error),
+          ok: () => async () => {
+            if (revision.runtimeVersion !== WORKFLOW_RUNTIME_VERSION) {
+              return Result.err(
+                workflowExecutionFailure(
+                  `Unsupported workflow runtime: ${revision.runtimeVersion}`,
+                ),
+              );
+            }
+
+            const loadedSource = await this.loadSnapshot(revision);
+            const continueWithSource = loadedSource.match<
+              () => Promise<WorkflowExecutionResult<WorkflowSandboxRun>>
+            >({
+              err: (error) => async () => Result.err(error),
+              ok: (source) => async () => {
+                const continueAfterFinalIntegrity = this.assertPersistedIntegrity(
+                  run,
+                  revision,
+                ).match<() => Promise<WorkflowExecutionResult<WorkflowSandboxRun>>>({
+                  err: (error) => async () => Result.err(error),
+                  ok: () => async () => {
+                    const compilation = this.input.compileSource
+                      ? await captureWorkflowExternal(() =>
+                          Promise.resolve(this.input.compileSource!(source, revision.sourceSha256)),
+                        )
+                      : compileWorkflowSourceResult(source, revision.sourceSha256).mapError(
+                          (error) => workflowExecutionFailure(error.message),
+                        );
+                    const continueWithCompilation = compilation.match<
+                      () => Promise<WorkflowExecutionResult<WorkflowSandboxRun>>
+                    >({
+                      err: (error) => async () => Result.err(error),
+                      ok: (compiled) => async () => {
+                        const semaphore = new Semaphore(revision.resources.agents.maxConcurrent);
+                        return await captureWorkflowExternal(() =>
+                          Promise.resolve(
+                            startWorkflowSandbox({
+                              source: compiled,
+                              args: run.args,
+                              signal,
+                              reportFatalPanic: this.input.reportFatalPanic,
+                              onCall: async (call) =>
+                                await this.handleCall(run.runId, revision, call, semaphore, signal),
+                            }),
+                          ),
+                        );
+                      },
+                    });
+                    return await continueWithCompilation();
+                  },
+                });
+                return await continueAfterFinalIntegrity();
+              },
+            });
+            return await continueWithSource();
           },
-        }),
-      ),
-    );
-    return sandbox;
+        });
+        return await continueAfterInitialIntegrity();
+      },
+    });
+    return await continueWithRevision();
   }
 
   private assertPersistedIntegrity(
@@ -884,9 +943,16 @@ export class WorkflowEngine {
       args: run.args,
       maxInputBytes: revision.limits.maxInputBytes,
     });
-    if (args.status === "error") return Result.err(workflowExecutionFailure(args.error.message));
+    const validatedArgs = args.match<
+      | { readonly kind: "ok"; readonly value: JsonValue }
+      | { readonly kind: "error"; readonly error: WorkflowExecutionFailed }
+    >({
+      ok: (value) => ({ kind: "ok", value }),
+      err: (error) => ({ kind: "error", error: workflowExecutionFailure(error.message) }),
+    });
+    if (validatedArgs.kind === "error") return Result.err(validatedArgs.error);
     if (
-      canonicalJsonSha256(args.value) !== run.argsSha256 ||
+      canonicalJsonSha256(validatedArgs.value) !== run.argsSha256 ||
       canonicalJsonSha256(run.inputSchemaSnapshot) !== revision.inputSchemaSha256
     ) {
       return Result.err(workflowExecutionFailure("Persisted workflow invocation hash mismatch"));
@@ -912,28 +978,46 @@ export class WorkflowEngine {
     const fail = async (detail: string): Promise<void> => {
       if (this.stopping) return;
       const currentResult = this.input.store.getRun(run.runId);
-      if (currentResult.status === "error")
-        signalDurableWorkflowReadErrorToHost(currentResult.error);
-      const current = currentResult.value;
+      const readCurrent = currentResult.match({
+        ok: (value) => () => value,
+        err: (error) => () => signalDurableWorkflowReadErrorToHost(error),
+      });
+      const current = readCurrent();
       if (!current || current.state === "cancelled" || current.state === "paused") return;
       signalWorkflowExecutionFailureToHost(await this.finishRun(run, "failed", null, detail));
     };
     const started = await captureWorkflowExternal(() => this.publishRun(run, "running", "queued"));
-    if (started.status === "error") return await fail(started.error.message);
+    const startError = started.match({ ok: () => null, err: (error) => error });
+    if (startError) return await fail(startError.message);
     const sandboxResult = await sandbox.result;
-    if (sandboxResult.status === "error") return await fail(sandboxResult.error.message);
+    const sandboxOutcome = sandboxResult.match<
+      | { readonly kind: "ok"; readonly value: JsonValue }
+      | { readonly kind: "error"; readonly message: string }
+    >({
+      ok: (value) => ({ kind: "ok", value }),
+      err: (error) => ({ kind: "error", message: error.message }),
+    });
+    if (sandboxOutcome.kind === "error") return await fail(sandboxOutcome.message);
     if (signal.aborted || this.stopping) return;
     const revisionResult = this.input.store.getRevision(run.revisionId);
-    if (revisionResult.status === "error") return await fail(revisionResult.error.message);
-    const revision = revisionResult.value;
+    const revisionOutcome = revisionResult.match<
+      | { readonly kind: "ok"; readonly revision: WorkflowRevision | null }
+      | { readonly kind: "error"; readonly message: string }
+    >({
+      ok: (revision) => ({ kind: "ok", revision }),
+      err: (error) => ({ kind: "error", message: error.message }),
+    });
+    if (revisionOutcome.kind === "error") return await fail(revisionOutcome.message);
+    const { revision } = revisionOutcome;
     if (!revision) return await fail("Workflow revision disappeared");
     if (
-      Buffer.byteLength(canonicalJson(sandboxResult.value), "utf8") > revision.limits.maxResultBytes
+      Buffer.byteLength(canonicalJson(sandboxOutcome.value), "utf8") >
+      revision.limits.maxResultBytes
     ) {
       return await fail(`Workflow result exceeds ${revision.limits.maxResultBytes} bytes`);
     }
     signalWorkflowExecutionFailureToHost(
-      await this.finishRun(run, "succeeded", sandboxResult.value, "Workflow completed"),
+      await this.finishRun(run, "succeeded", sandboxOutcome.value, "Workflow completed"),
     );
   }
 
@@ -945,10 +1029,15 @@ export class WorkflowEngine {
     signal: AbortSignal,
   ): Promise<WorkflowExecutionResult<JsonValue>> {
     const runResult = this.input.store.getRun(runId);
-    if (runResult.status === "error") {
-      return Result.err(workflowExecutionFailure(runResult.error.message));
-    }
-    const run = runResult.value;
+    const runOutcome = runResult.match<
+      | { readonly kind: "ok"; readonly run: WorkflowRun | null }
+      | { readonly kind: "error"; readonly error: WorkflowExecutionFailed }
+    >({
+      ok: (run) => ({ kind: "ok", run }),
+      err: (error) => ({ kind: "error", error: workflowExecutionFailure(error.message) }),
+    });
+    if (runOutcome.kind === "error") return Result.err(runOutcome.error);
+    const { run } = runOutcome;
     if (!run || run.state !== "running" || run.claimedBy !== this.workerId || signal.aborted)
       return Result.err(workflowExecutionFailure("Workflow is not running"));
     if (call.depth > revision.resources.maxNestingDepth) {
@@ -962,19 +1051,29 @@ export class WorkflowEngine {
       call,
       canonicalWorkspaceRoot: revision.canonicalWorkspaceRoot,
     });
-    if (decodedCallResult.status === "error") {
-      return Result.err(workflowExecutionFailure(decodedCallResult.error.message));
-    }
-    const decodedCall = decodedCallResult.value;
+    const decodedCallOutcome = decodedCallResult.match<
+      | { readonly kind: "ok"; readonly call: DecodedWorkflowCallInput }
+      | { readonly kind: "error"; readonly error: WorkflowExecutionFailed }
+    >({
+      ok: (call) => ({ kind: "ok", call }),
+      err: (error) => ({ kind: "error", error: workflowExecutionFailure(error.message) }),
+    });
+    if (decodedCallOutcome.kind === "error") return Result.err(decodedCallOutcome.error);
+    const decodedCall = decodedCallOutcome.call;
     const input = decodedCall.input;
     const inputSha256 = canonicalJsonSha256(input);
     const persistedKind =
       call.kind === "waitForReply" || call.kind === "sleep" ? "wait" : call.kind;
     const existingResult = this.input.store.getOperation(runId, id);
-    if (existingResult.status === "error") {
-      return Result.err(workflowExecutionFailure(existingResult.error.message));
-    }
-    const existing = existingResult.value;
+    const existingOutcome = existingResult.match<
+      | { readonly kind: "ok"; readonly operation: WorkflowOperation | null }
+      | { readonly kind: "error"; readonly error: WorkflowExecutionFailed }
+    >({
+      ok: (operation) => ({ kind: "ok", operation }),
+      err: (error) => ({ kind: "error", error: workflowExecutionFailure(error.message) }),
+    });
+    if (existingOutcome.kind === "error") return Result.err(existingOutcome.error);
+    const existing = existingOutcome.operation;
     if (existing) {
       if (
         existing.callSiteId !== call.callSiteId ||
@@ -992,9 +1091,7 @@ export class WorkflowEngine {
             artifactId: existing.resultArtifactId,
             maxBytes: revision.limits.maxOperationOutputBytes,
           });
-          return loaded.status === "error"
-            ? Result.err(workflowExecutionFailure(loaded.error.message))
-            : Result.ok(loaded.value);
+          return loaded.mapError((error) => workflowExecutionFailure(error.message));
         }
         return Result.ok(existing.output);
       }
@@ -1033,7 +1130,8 @@ export class WorkflowEngine {
             }),
           ),
         );
-        if (validated.status === "error") return Result.err(validated.error);
+        const validationError = validated.match({ ok: () => null, err: (error) => error });
+        if (validationError) return Result.err(validationError);
       }
     }
     let parsedLabel: string | null;
@@ -1083,7 +1181,8 @@ export class WorkflowEngine {
     const published = await captureWorkflowExternal(() =>
       this.publishOperation(revision, operation, "queued"),
     );
-    if (published.status === "error") return Result.err(published.error);
+    const publicationError = published.match({ ok: () => null, err: (error) => error });
+    if (publicationError) return Result.err(publicationError);
     if (decodedCall.kind === "waitForReply" || decodedCall.kind === "sleep") {
       return await this.waitDurably(run, revision, operation, decodedCall, signal);
     }
@@ -1111,10 +1210,15 @@ export class WorkflowEngine {
     const now = this.now();
     const operationCreatedAt = operation.createdAt;
     const initialWait = this.input.store.getWait(run.runId, operation.operationId);
-    if (initialWait.status === "error") {
-      return Result.err(workflowExecutionFailure(initialWait.error.message));
-    }
-    let wait: WorkflowWait | null = initialWait.value;
+    const initialWaitOutcome = initialWait.match<
+      | { readonly kind: "ok"; readonly wait: WorkflowWait | null }
+      | { readonly kind: "error"; readonly error: WorkflowExecutionFailed }
+    >({
+      ok: (wait) => ({ kind: "ok", wait }),
+      err: (error) => ({ kind: "error", error: workflowExecutionFailure(error.message) }),
+    });
+    if (initialWaitOutcome.kind === "error") return Result.err(initialWaitOutcome.error);
+    let wait = initialWaitOutcome.wait;
     if (!wait) {
       if (call.kind === "waitForReply") {
         const options = call.input;
@@ -1201,10 +1305,17 @@ export class WorkflowEngine {
           run.runId,
           operation.operationId,
         );
-        if (concurrentlyCreatedResult.status === "error") {
-          return Result.err(workflowExecutionFailure(concurrentlyCreatedResult.error.message));
+        const concurrentlyCreatedOutcome = concurrentlyCreatedResult.match<
+          | { readonly kind: "ok"; readonly wait: WorkflowWait | null }
+          | { readonly kind: "error"; readonly error: WorkflowExecutionFailed }
+        >({
+          ok: (wait) => ({ kind: "ok", wait }),
+          err: (error) => ({ kind: "error", error: workflowExecutionFailure(error.message) }),
+        });
+        if (concurrentlyCreatedOutcome.kind === "error") {
+          return Result.err(concurrentlyCreatedOutcome.error);
         }
-        const concurrentlyCreated = concurrentlyCreatedResult.value;
+        const concurrentlyCreated = concurrentlyCreatedOutcome.wait;
         if (!concurrentlyCreated) {
           return Result.err(
             workflowExecutionFailure(`Failed to journal workflow wait ${operation.operationId}`),
@@ -1222,10 +1333,15 @@ export class WorkflowEngine {
     }
 
     const initialOperation = this.input.store.getOperation(run.runId, operation.operationId);
-    if (initialOperation.status === "error") {
-      return Result.err(workflowExecutionFailure(initialOperation.error.message));
-    }
-    let current = initialOperation.value ?? operation;
+    const initialOperationOutcome = initialOperation.match<
+      | { readonly kind: "ok"; readonly operation: WorkflowOperation | null }
+      | { readonly kind: "error"; readonly error: WorkflowExecutionFailed }
+    >({
+      ok: (value) => ({ kind: "ok", operation: value }),
+      err: (error) => ({ kind: "error", error: workflowExecutionFailure(error.message) }),
+    });
+    if (initialOperationOutcome.kind === "error") return Result.err(initialOperationOutcome.error);
+    let current = initialOperationOutcome.operation ?? operation;
     for (const next of ["dispatched", "running", "blocked"] as const) {
       if (
         (next === "dispatched" && current.state !== "queued") ||
@@ -1245,26 +1361,42 @@ export class WorkflowEngine {
       const published = await captureWorkflowExternal(() =>
         this.publishOperation(revision, operation, next, current.state),
       );
-      if (published.status === "error") return Result.err(published.error);
+      const publicationError = published.match({ ok: () => null, err: (error) => error });
+      if (publicationError) return Result.err(publicationError);
       const transitionedOperation = this.input.store.getOperation(run.runId, operation.operationId);
-      if (transitionedOperation.status === "error") {
-        return Result.err(workflowExecutionFailure(transitionedOperation.error.message));
-      }
-      current = transitionedOperation.value ?? current;
+      const transitionOutcome = transitionedOperation.match<
+        | { readonly kind: "ok"; readonly operation: WorkflowOperation | null }
+        | { readonly kind: "error"; readonly error: WorkflowExecutionFailed }
+      >({
+        ok: (value) => ({ kind: "ok", operation: value }),
+        err: (error) => ({ kind: "error", error: workflowExecutionFailure(error.message) }),
+      });
+      if (transitionOutcome.kind === "error") return Result.err(transitionOutcome.error);
+      current = transitionOutcome.operation ?? current;
     }
     while (!signal.aborted) {
       const waitResult = this.input.store.getWait(run.runId, operation.operationId);
-      if (waitResult.status === "error") {
-        return Result.err(workflowExecutionFailure(waitResult.error.message));
-      }
-      wait = waitResult.value;
+      const waitOutcome = waitResult.match<
+        | { readonly kind: "ok"; readonly wait: WorkflowWait | null }
+        | { readonly kind: "error"; readonly error: WorkflowExecutionFailed }
+      >({
+        ok: (value) => ({ kind: "ok", wait: value }),
+        err: (error) => ({ kind: "error", error: workflowExecutionFailure(error.message) }),
+      });
+      if (waitOutcome.kind === "error") return Result.err(waitOutcome.error);
+      wait = waitOutcome.wait;
       if (!wait) return Result.err(workflowExecutionFailure("Durable workflow wait disappeared"));
       if (wait.state === "resolved" || wait.state === "expired" || wait.state === "cancelled") {
         const latestResult = this.input.store.getOperation(run.runId, operation.operationId);
-        if (latestResult.status === "error") {
-          return Result.err(workflowExecutionFailure(latestResult.error.message));
-        }
-        const latest = latestResult.value;
+        const latestOutcome = latestResult.match<
+          | { readonly kind: "ok"; readonly operation: WorkflowOperation | null }
+          | { readonly kind: "error"; readonly error: WorkflowExecutionFailed }
+        >({
+          ok: (value) => ({ kind: "ok", operation: value }),
+          err: (error) => ({ kind: "error", error: workflowExecutionFailure(error.message) }),
+        });
+        if (latestOutcome.kind === "error") return Result.err(latestOutcome.error);
+        const latest = latestOutcome.operation;
         if (wait.state === "resolved") {
           if (latest?.state === "blocked") {
             this.input.store.transitionOperation({
@@ -1279,7 +1411,8 @@ export class WorkflowEngine {
             const published = await captureWorkflowExternal(() =>
               this.publishOperation(revision, operation, "succeeded", "blocked"),
             );
-            if (published.status === "error") return Result.err(published.error);
+            const publicationError = published.match({ ok: () => null, err: (error) => error });
+            if (publicationError) return Result.err(publicationError);
           }
           return Result.ok(wait.result);
         }
@@ -1297,7 +1430,8 @@ export class WorkflowEngine {
           const published = await captureWorkflowExternal(() =>
             this.publishOperation(revision, operation, terminalState, "blocked"),
           );
-          if (published.status === "error") return Result.err(published.error);
+          const publicationError = published.match({ ok: () => null, err: (error) => error });
+          if (publicationError) return Result.err(publicationError);
         }
         return Result.err(
           workflowExecutionFailure(
@@ -1353,12 +1487,18 @@ export class WorkflowEngine {
       const published = await captureWorkflowExternal(() =>
         this.publishOperation(revision, operation, to, current.state),
       );
-      if (published.status === "error") return Result.err(published.error);
+      const publicationError = published.match({ ok: () => null, err: (error) => error });
+      if (publicationError) return Result.err(publicationError);
       const updated = this.input.store.getOperation(run.runId, operation.operationId);
-      if (updated.status === "error") {
-        return Result.err(workflowExecutionFailure(updated.error.message));
-      }
-      current = updated.value ?? current;
+      const updateOutcome = updated.match<
+        | { readonly kind: "ok"; readonly operation: WorkflowOperation | null }
+        | { readonly kind: "error"; readonly error: WorkflowExecutionFailed }
+      >({
+        ok: (value) => ({ kind: "ok", operation: value }),
+        err: (error) => ({ kind: "error", error: workflowExecutionFailure(error.message) }),
+      });
+      if (updateOutcome.kind === "error") return Result.err(updateOutcome.error);
+      current = updateOutcome.operation ?? current;
     }
     return Result.ok(null);
   }
@@ -1383,420 +1523,408 @@ export class WorkflowEngine {
       );
     }
     const reqId = expectedRequestId;
-    const currentResult = this.input.store.getOperation(run.runId, operation.operationId);
-    if (currentResult.status === "error") {
-      return Result.err(workflowExecutionFailure(currentResult.error.message));
-    }
-    let current = currentResult.value ?? operation;
-    const sessionId =
-      run.completionTarget.kind === "live_parent"
-        ? run.completionTarget.childSessionId
-        : `workflow:${run.runId}:${operation.operationId}`;
-    let adoptedTerminalReceipt = false;
-    let ambiguousTerminalResult = false;
-    const adoptReceipt = async (
-      receipt: WorkflowRequestTerminalReceipt,
-    ): Promise<WorkflowExecutionResult<AgentRequestResult>> => {
-      if (
-        receipt.requestId !== reqId ||
-        receipt.runId !== run.runId ||
-        receipt.operationId !== operation.operationId ||
-        current.requestId !== reqId
-      ) {
-        return Result.err(
-          workflowExecutionFailure(
-            "Workflow terminal receipt does not match its deterministic operation",
-          ),
-        );
-      }
-      adoptedTerminalReceipt = true;
-      return await captureWorkflowExternal(() => this.adoptTerminalReceipt(receipt, revision));
-    };
-    let result: AgentRequestResult;
-    const handoffResult = await captureWorkflowExternal(() =>
-      Promise.resolve(
-        this.input.store.getWorkflowRequestDispatchHandoff({
-          requestId: reqId,
-          now: this.now(),
-          staleAfterMs: WORKFLOW_REQUEST_LEASE_STALE_MS,
-        }),
-      ),
-    );
-    if (handoffResult.status === "error") return Result.err(handoffResult.error);
-    const handoff = handoffResult.value;
-    if (handoff.status === "receipt") {
-      const adopted = await adoptReceipt(handoff.receipt);
-      if (adopted.status === "error") return Result.err(adopted.error);
-      result = adopted.value;
-    } else {
-      const agentCwd = input.options.cwd;
-      const liveOwner = reconcile && handoff.status === "live";
-      const selectionInput = {
-        profile,
-        ...(model ? { model } : {}),
-        ...(reasoning ? { reasoning } : {}),
-      };
-      let currentSelection: void | ResolvedAgentSelection | undefined;
-      if (handoff.status === "fresh" && this.input.validateAgentSelection) {
-        const selected = await captureWorkflowExternal(() =>
-          Promise.resolve(this.input.validateAgentSelection!(selectionInput)),
-        );
-        if (selected.status === "error") return Result.err(selected.error);
-        currentSelection = selected.value;
-      }
-      let currentFallbacks: readonly DurableAgentFallback[] | undefined;
-      if (handoff.status === "stale" && this.input.resolveAgentFallbacks) {
-        const fallbacks = await captureWorkflowExternal(() =>
-          Promise.resolve(this.input.resolveAgentFallbacks!(selectionInput)),
-        );
-        if (fallbacks.status === "error") return Result.err(fallbacks.error);
-        currentFallbacks = fallbacks.value;
-      }
-      const currentConcreteSelection = currentSelection ?? {
-        model: model ?? `profile-native:${profile}`,
-        reasoning: reasoning ?? null,
-        request: {
-          spec: model ?? `profile-native:${profile}`,
-          provider: "unresolved",
-          modelId: model ?? `profile-native:${profile}`,
-          ...(reasoning ? { reasoning } : {}),
-          reasoningDisplay: "simple",
-        },
-      };
-      let concreteSelection: ResolvedAgentSelection;
-      switch (handoff.status) {
-        case "live":
-          concreteSelection = {
-            model: handoff.policy.resolvedModelRequest.spec,
-            reasoning: handoff.policy.resolvedModelRequest.reasoning ?? null,
-            request: handoff.policy.resolvedModelRequest,
-          };
-          break;
-        case "stale":
-          concreteSelection = {
-            model: handoff.policy.resolvedModelRequest.spec,
-            reasoning: handoff.policy.resolvedModelRequest.reasoning ?? null,
-            request: {
-              ...handoff.policy.resolvedModelRequest,
-              fallbacks: [...(currentFallbacks ?? [])],
-            },
-          };
-          break;
-        case "fresh":
-          concreteSelection = currentConcreteSelection;
-          break;
-      }
-      const dispatchEpoch = liveOwner
-        ? handoff.dispatchEpoch
-        : (this.input.createDispatchEpoch?.() ?? crypto.randomUUID());
-      const newlyResolvedPolicy = {
-        runId: run.runId,
-        operationId: operation.operationId,
-        dispatchEpoch,
-        profile,
-        model: model ?? null,
-        reasoning: reasoning ?? null,
-        resolvedModelRequest: concreteSelection.request,
-        cwd: agentCwd,
-        originSession: {
-          requestId: run.origin.requestId,
-          sessionId: run.origin.sessionId,
-          client: run.origin.client,
-          userId: run.origin.userId,
-        },
-        ...(run.completionTarget.kind === "live_parent" &&
-        run.completionTarget.stableNamedContinuation === true
-          ? {
-              stableNamedContinuation: {
-                sessionId: run.completionTarget.childSessionId,
-                requestClient: run.completionTarget.parentRequestClient,
-              },
-            }
-          : {}),
-      } satisfies WorkflowRequestPolicy;
-      let policy: WorkflowRequestPolicy;
-      switch (handoff.status) {
-        case "live":
-          policy = { ...handoff.policy, dispatchEpoch };
-          break;
-        case "stale":
-          policy = {
-            ...handoff.policy,
-            dispatchEpoch,
-            resolvedModelRequest: concreteSelection.request,
-          };
-          break;
-        case "fresh":
-          policy = newlyResolvedPolicy;
-          break;
-      }
-      if (
-        handoff.status === "live" &&
-        canonicalJson(workflowRequestPolicyIdentityProjection(policy)) !==
-          canonicalJson(workflowRequestPolicyIdentityProjection(handoff.policy))
-      ) {
-        return Result.err(
-          workflowExecutionFailure(
-            "Live workflow dispatch policy diverged from its durable operation identity",
-          ),
-        );
-      }
-      let racedReceipt: WorkflowRequestTerminalReceipt | null = null;
-      if (!liveOwner) {
-        const dispatched = this.input.store.authorizeAgentDispatch({
-          requestId: reqId,
-          runId: run.runId,
-          operationId: operation.operationId,
-          runOwnerId: this.workerId,
-          sessionId,
-          platform: "unknown",
-          policy,
-          now: this.now(),
-          staleOwnerBefore: this.now() - WORKFLOW_REQUEST_LEASE_STALE_MS,
-        });
-        if (!dispatched) {
-          const racedReceiptResult = this.input.store.getWorkflowRequestTerminalReceipt(reqId);
-          if (racedReceiptResult.status === "error") {
-            return Result.err(workflowExecutionFailure(racedReceiptResult.error.message));
-          }
-          racedReceipt = racedReceiptResult.value;
-          if (!racedReceipt) {
-            return Result.err(
-              workflowExecutionFailure("Workflow dispatch authorization was rejected"),
-            );
-          }
+    return Result.gen(async function* (this: WorkflowEngine) {
+      let current =
+        (yield* this.input.store
+          .getOperation(run.runId, operation.operationId)
+          .mapError((error) => workflowExecutionFailure(error.message))) ?? operation;
+      const sessionId =
+        run.completionTarget.kind === "live_parent"
+          ? run.completionTarget.childSessionId
+          : `workflow:${run.runId}:${operation.operationId}`;
+      let adoptedTerminalReceipt = false;
+      let ambiguousTerminalResult = false;
+      const adoptReceipt = async (
+        receipt: WorkflowRequestTerminalReceipt,
+      ): Promise<WorkflowExecutionResult<AgentRequestResult>> => {
+        if (
+          receipt.requestId !== reqId ||
+          receipt.runId !== run.runId ||
+          receipt.operationId !== operation.operationId ||
+          current.requestId !== reqId
+        ) {
+          return Result.err(
+            workflowExecutionFailure(
+              "Workflow terminal receipt does not match its deterministic operation",
+            ),
+          );
         }
-      }
-      if (racedReceipt) {
-        const adopted = await adoptReceipt(racedReceipt);
-        if (adopted.status === "error") return Result.err(adopted.error);
-        result = adopted.value;
+        adoptedTerminalReceipt = true;
+        return await captureWorkflowExternal(() => this.adoptTerminalReceipt(receipt, revision));
+      };
+      let result: AgentRequestResult;
+      const handoff = yield* Result.await(
+        captureWorkflowExternal(() =>
+          Promise.resolve(
+            this.input.store.getWorkflowRequestDispatchHandoff({
+              requestId: reqId,
+              now: this.now(),
+              staleAfterMs: WORKFLOW_REQUEST_LEASE_STALE_MS,
+            }),
+          ),
+        ),
+      );
+      if (handoff.status === "receipt") {
+        result = yield* Result.await(adoptReceipt(handoff.receipt));
       } else {
-        if (current.state === "queued") {
-          const published = await captureWorkflowExternal(() =>
-            this.publishOperation(revision, operation, "dispatched", "queued"),
-          );
-          if (published.status === "error") return Result.err(published.error);
-          const dispatchedOperation = this.input.store.getOperation(
-            run.runId,
-            operation.operationId,
-          );
-          if (dispatchedOperation.status === "error") {
-            return Result.err(workflowExecutionFailure(dispatchedOperation.error.message));
-          }
-          current = dispatchedOperation.value ?? current;
-        }
-        const request = {
-          run,
-          revision,
-          operation: current,
-          prompt: input.prompt,
+        const agentCwd = input.options.cwd;
+        const liveOwner = reconcile && handoff.status === "live";
+        const selectionInput = {
           profile,
-          model,
-          reasoning,
-          policy,
-          requestId: reqId,
-          agentCwd,
-          signal,
-          reconcile,
-          dispatchEpoch,
-          sessionId,
-          publishRequest: !liveOwner,
+          ...(model ? { model } : {}),
+          ...(reasoning ? { reasoning } : {}),
         };
-        const requested = await captureWorkflowExternal(() =>
-          this.input.dispatchAgentRequest
-            ? this.input.dispatchAgentRequest(request)
-            : this.waitForAgentRequest(request),
-        );
-        if (requested.status === "error") return Result.err(requested.error);
-        result = requested.value;
-      }
-      adoptedTerminalReceipt ||=
-        result.source === "receipt" || result.source === "terminal_receipt";
-      if (
-        result.source === "terminal_without_receipt" ||
-        (result.source === "terminal_receipt" && result.state === "cancelled")
-      ) {
-        ambiguousTerminalResult = true;
-        this.input.store.blockAmbiguousTerminalLifecycleOperation({
+        let currentSelection: void | ResolvedAgentSelection | undefined;
+        if (handoff.status === "fresh" && this.input.validateAgentSelection) {
+          currentSelection = yield* Result.await(
+            captureWorkflowExternal(() =>
+              Promise.resolve(this.input.validateAgentSelection!(selectionInput)),
+            ),
+          );
+        }
+        let currentFallbacks: readonly DurableAgentFallback[] | undefined;
+        if (handoff.status === "stale" && this.input.resolveAgentFallbacks) {
+          currentFallbacks = yield* Result.await(
+            captureWorkflowExternal(() =>
+              Promise.resolve(this.input.resolveAgentFallbacks!(selectionInput)),
+            ),
+          );
+        }
+        const currentConcreteSelection = currentSelection ?? {
+          model: model ?? `profile-native:${profile}`,
+          reasoning: reasoning ?? null,
+          request: {
+            spec: model ?? `profile-native:${profile}`,
+            provider: "unresolved",
+            modelId: model ?? `profile-native:${profile}`,
+            ...(reasoning ? { reasoning } : {}),
+            reasoningDisplay: "simple",
+          },
+        };
+        let concreteSelection: ResolvedAgentSelection;
+        switch (handoff.status) {
+          case "live":
+            concreteSelection = {
+              model: handoff.policy.resolvedModelRequest.spec,
+              reasoning: handoff.policy.resolvedModelRequest.reasoning ?? null,
+              request: handoff.policy.resolvedModelRequest,
+            };
+            break;
+          case "stale":
+            concreteSelection = {
+              model: handoff.policy.resolvedModelRequest.spec,
+              reasoning: handoff.policy.resolvedModelRequest.reasoning ?? null,
+              request: {
+                ...handoff.policy.resolvedModelRequest,
+                fallbacks: [...(currentFallbacks ?? [])],
+              },
+            };
+            break;
+          case "fresh":
+            concreteSelection = currentConcreteSelection;
+            break;
+        }
+        const dispatchEpoch = liveOwner
+          ? handoff.dispatchEpoch
+          : (this.input.createDispatchEpoch?.() ?? crypto.randomUUID());
+        const newlyResolvedPolicy = {
           runId: run.runId,
           operationId: operation.operationId,
-          requestId: reqId,
+          dispatchEpoch,
+          profile,
+          model: model ?? null,
+          reasoning: reasoning ?? null,
+          resolvedModelRequest: concreteSelection.request,
+          cwd: agentCwd,
+          originSession: {
+            requestId: run.origin.requestId,
+            sessionId: run.origin.sessionId,
+            client: run.origin.client,
+            userId: run.origin.userId,
+          },
+          ...(run.completionTarget.kind === "live_parent" &&
+          run.completionTarget.stableNamedContinuation === true
+            ? {
+                stableNamedContinuation: {
+                  sessionId: run.completionTarget.childSessionId,
+                  requestClient: run.completionTarget.parentRequestClient,
+                },
+              }
+            : {}),
+        } satisfies WorkflowRequestPolicy;
+        let policy: WorkflowRequestPolicy;
+        switch (handoff.status) {
+          case "live":
+            policy = { ...handoff.policy, dispatchEpoch };
+            break;
+          case "stale":
+            policy = {
+              ...handoff.policy,
+              dispatchEpoch,
+              resolvedModelRequest: concreteSelection.request,
+            };
+            break;
+          case "fresh":
+            policy = newlyResolvedPolicy;
+            break;
+        }
+        if (
+          handoff.status === "live" &&
+          canonicalJson(workflowRequestPolicyIdentityProjection(policy)) !==
+            canonicalJson(workflowRequestPolicyIdentityProjection(handoff.policy))
+        ) {
+          return Result.err(
+            workflowExecutionFailure(
+              "Live workflow dispatch policy diverged from its durable operation identity",
+            ),
+          );
+        }
+        let racedReceipt: WorkflowRequestTerminalReceipt | null = null;
+        if (!liveOwner) {
+          const dispatched = this.input.store.authorizeAgentDispatch({
+            requestId: reqId,
+            runId: run.runId,
+            operationId: operation.operationId,
+            runOwnerId: this.workerId,
+            sessionId,
+            platform: "unknown",
+            policy,
+            now: this.now(),
+            staleOwnerBefore: this.now() - WORKFLOW_REQUEST_LEASE_STALE_MS,
+          });
+          if (!dispatched) {
+            racedReceipt = yield* this.input.store
+              .getWorkflowRequestTerminalReceipt(reqId)
+              .mapError((error) => workflowExecutionFailure(error.message));
+            if (!racedReceipt) {
+              return Result.err(
+                workflowExecutionFailure("Workflow dispatch authorization was rejected"),
+              );
+            }
+          }
+        }
+        if (racedReceipt) {
+          result = yield* Result.await(adoptReceipt(racedReceipt));
+        } else {
+          if (current.state === "queued") {
+            yield* Result.await(
+              captureWorkflowExternal(() =>
+                this.publishOperation(revision, operation, "dispatched", "queued"),
+              ),
+            );
+            current =
+              (yield* this.input.store
+                .getOperation(run.runId, operation.operationId)
+                .mapError((error) => workflowExecutionFailure(error.message))) ?? current;
+          }
+          const request = {
+            run,
+            revision,
+            operation: current,
+            prompt: input.prompt,
+            profile,
+            model,
+            reasoning,
+            policy,
+            requestId: reqId,
+            agentCwd,
+            signal,
+            reconcile,
+            dispatchEpoch,
+            sessionId,
+            publishRequest: !liveOwner,
+          };
+          result = yield* Result.await(
+            captureWorkflowExternal(() =>
+              this.input.dispatchAgentRequest
+                ? this.input.dispatchAgentRequest(request)
+                : this.waitForAgentRequest(request),
+            ),
+          );
+        }
+        adoptedTerminalReceipt ||=
+          result.source === "receipt" || result.source === "terminal_receipt";
+        if (
+          result.source === "terminal_without_receipt" ||
+          (result.source === "terminal_receipt" && result.state === "cancelled")
+        ) {
+          ambiguousTerminalResult = true;
+          this.input.store.blockAmbiguousTerminalLifecycleOperation({
+            runId: run.runId,
+            operationId: operation.operationId,
+            requestId: reqId,
+            runOwnerId: this.workerId,
+            now: this.now(),
+          });
+        } else if (
+          adoptedTerminalReceipt &&
+          result.state === "cancelled" &&
+          this.input.store.blockAmbiguousPausedCancelledOperation({
+            runId: run.runId,
+            operationId: operation.operationId,
+            requestId: reqId,
+            runOwnerId: this.workerId,
+            now: this.now(),
+          })
+        ) {
+          ambiguousTerminalResult = true;
+        }
+      }
+      if (
+        ambiguousTerminalResult ||
+        (adoptedTerminalReceipt &&
+          result.state === "cancelled" &&
+          this.input.store.blockAmbiguousPausedCancelledOperation({
+            runId: run.runId,
+            operationId: operation.operationId,
+            requestId: reqId,
+            runOwnerId: this.workerId,
+            now: this.now(),
+          }))
+      ) {
+        return Result.err(
+          workflowExecutionFailure(
+            "Workflow terminal lifecycle is ambiguous and requires manual reconciliation",
+          ),
+        );
+      }
+      let latest = yield* this.input.store
+        .getOperation(run.runId, operation.operationId)
+        .mapError((error) => workflowExecutionFailure(error.message));
+      if (this.stopping) {
+        return Result.err(workflowExecutionFailure("Workflow engine stopped for durable recovery"));
+      }
+      const currentRun = yield* this.input.store
+        .getRun(run.runId)
+        .mapError((error) => workflowExecutionFailure(error.message));
+      if (signal.aborted && currentRun?.state === "paused") {
+        return Result.err(workflowExecutionFailure("Workflow operation paused for durable replay"));
+      }
+      if (currentRun?.claimedBy !== this.workerId) {
+        return Result.err(
+          workflowExecutionFailure("Workflow operation lease was lost before completion"),
+        );
+      }
+      if (!latest || isTerminalOperation(latest.state)) {
+        if (latest?.state === "succeeded") return Result.ok(latest.output);
+        return Result.err(workflowExecutionFailure(latest?.error ?? "Agent operation ended"));
+      }
+      if (latest.state === "queued" && adoptedTerminalReceipt) {
+        const transitioned = this.input.store.transitionOperation({
           runOwnerId: this.workerId,
+          runId: run.runId,
+          operationId: operation.operationId,
+          from: "queued",
+          to: "dispatched",
           now: this.now(),
         });
-      } else if (
-        adoptedTerminalReceipt &&
-        result.state === "cancelled" &&
-        this.input.store.blockAmbiguousPausedCancelledOperation({
-          runId: run.runId,
-          operationId: operation.operationId,
-          requestId: reqId,
-          runOwnerId: this.workerId,
-          now: this.now(),
-        })
-      ) {
-        ambiguousTerminalResult = true;
+        if (!transitioned) {
+          return Result.err(
+            workflowExecutionFailure("Receipt-backed operation could not resume its journal"),
+          );
+        }
+        yield* Result.await(
+          captureWorkflowExternal(() =>
+            this.publishOperation(revision, operation, "dispatched", "queued"),
+          ),
+        );
+        latest =
+          (yield* this.input.store
+            .getOperation(run.runId, operation.operationId)
+            .mapError((error) => workflowExecutionFailure(error.message))) ?? latest;
       }
-    }
-    if (
-      ambiguousTerminalResult ||
-      (adoptedTerminalReceipt &&
-        result.state === "cancelled" &&
-        this.input.store.blockAmbiguousPausedCancelledOperation({
-          runId: run.runId,
-          operationId: operation.operationId,
-          requestId: reqId,
-          runOwnerId: this.workerId,
-          now: this.now(),
-        }))
-    ) {
-      return Result.err(
-        workflowExecutionFailure(
-          "Workflow terminal lifecycle is ambiguous and requires manual reconciliation",
-        ),
-      );
-    }
-    const latestResult = this.input.store.getOperation(run.runId, operation.operationId);
-    if (latestResult.status === "error") {
-      return Result.err(workflowExecutionFailure(latestResult.error.message));
-    }
-    let latest = latestResult.value;
-    if (this.stopping) {
-      return Result.err(workflowExecutionFailure("Workflow engine stopped for durable recovery"));
-    }
-    const currentRunResult = this.input.store.getRun(run.runId);
-    if (currentRunResult.status === "error") {
-      return Result.err(workflowExecutionFailure(currentRunResult.error.message));
-    }
-    const currentRun = currentRunResult.value;
-    if (signal.aborted && currentRun?.state === "paused") {
-      return Result.err(workflowExecutionFailure("Workflow operation paused for durable replay"));
-    }
-    if (currentRun?.claimedBy !== this.workerId) {
-      return Result.err(
-        workflowExecutionFailure("Workflow operation lease was lost before completion"),
-      );
-    }
-    if (!latest || isTerminalOperation(latest.state)) {
-      if (latest?.state === "succeeded") return Result.ok(latest.output);
-      return Result.err(workflowExecutionFailure(latest?.error ?? "Agent operation ended"));
-    }
-    if (latest.state === "queued" && adoptedTerminalReceipt) {
-      const transitioned = this.input.store.transitionOperation({
-        runOwnerId: this.workerId,
-        runId: run.runId,
-        operationId: operation.operationId,
-        from: "queued",
-        to: "dispatched",
-        now: this.now(),
-      });
-      if (!transitioned) {
+      let nextState: "succeeded" | "failed" | "cancelled" | "timed_out";
+      switch (result.state) {
+        case "resolved":
+          nextState = "succeeded";
+          break;
+        case "failed":
+          nextState = "failed";
+          break;
+        case "cancelled":
+          nextState = "cancelled";
+          break;
+        case "timed_out":
+          nextState = "timed_out";
+          break;
+      }
+      if (result.state === "resolved" && !result.output) {
         return Result.err(
-          workflowExecutionFailure("Receipt-backed operation could not resume its journal"),
+          workflowExecutionFailure("Agent request resolved without captured final output"),
         );
       }
-      const published = await captureWorkflowExternal(() =>
-        this.publishOperation(revision, operation, "dispatched", "queued"),
-      );
-      if (published.status === "error") return Result.err(published.error);
-      const dispatched = this.input.store.getOperation(run.runId, operation.operationId);
-      if (dispatched.status === "error") {
-        return Result.err(workflowExecutionFailure(dispatched.error.message));
+      const outputBytes = Buffer.byteLength(canonicalJson(result.output), "utf8");
+      if (outputBytes > revision.limits.maxOperationOutputBytes) {
+        return Result.err(
+          workflowExecutionFailure(
+            `Agent output exceeds ${revision.limits.maxOperationOutputBytes} bytes`,
+          ),
+        );
       }
-      latest = dispatched.value ?? latest;
-    }
-    let nextState: "succeeded" | "failed" | "cancelled" | "timed_out";
-    switch (result.state) {
-      case "resolved":
-        nextState = "succeeded";
-        break;
-      case "failed":
-        nextState = "failed";
-        break;
-      case "cancelled":
-        nextState = "cancelled";
-        break;
-      case "timed_out":
-        nextState = "timed_out";
-        break;
-    }
-    if (result.state === "resolved" && !result.output) {
-      return Result.err(
-        workflowExecutionFailure("Agent request resolved without captured final output"),
-      );
-    }
-    const outputBytes = Buffer.byteLength(canonicalJson(result.output), "utf8");
-    if (outputBytes > revision.limits.maxOperationOutputBytes) {
-      return Result.err(
-        workflowExecutionFailure(
-          `Agent output exceeds ${revision.limits.maxOperationOutputBytes} bytes`,
-        ),
-      );
-    }
-    let resultArtifactId: string | null = null;
-    if (result.state === "resolved" && outputBytes > WORKFLOW_INLINE_VALUE_BYTES) {
-      const persisted = await writeWorkflowValueArtifact({
-        dataDir: this.input.dataDir,
-        value: result.output,
-        maxBytes: revision.limits.maxOperationOutputBytes,
-      });
-      if (persisted.status === "error") {
-        return Result.err(workflowExecutionFailure(persisted.error.message));
+      let resultArtifactId: string | null = null;
+      if (result.state === "resolved" && outputBytes > WORKFLOW_INLINE_VALUE_BYTES) {
+        resultArtifactId = yield* Result.await(
+          writeWorkflowValueArtifact({
+            dataDir: this.input.dataDir,
+            value: result.output,
+            maxBytes: revision.limits.maxOperationOutputBytes,
+          }).then((persisted) =>
+            persisted.mapError((error) => workflowExecutionFailure(error.message)),
+          ),
+        );
       }
-      resultArtifactId = persisted.value;
-    }
-    if (latest.state === "dispatched" && result.state === "resolved") {
-      this.input.store.transitionOperation({
+      if (latest.state === "dispatched" && result.state === "resolved") {
+        this.input.store.transitionOperation({
+          runOwnerId: this.workerId,
+          runId: run.runId,
+          operationId: operation.operationId,
+          from: "dispatched",
+          to: "running",
+          now: this.now(),
+        });
+        yield* Result.await(
+          captureWorkflowExternal(() =>
+            this.publishOperation(revision, operation, "running", "dispatched"),
+          ),
+        );
+      }
+      const terminalOperation = yield* this.input.store
+        .getOperation(run.runId, operation.operationId)
+        .mapError((error) => workflowExecutionFailure(error.message));
+      const terminalFrom = terminalOperation?.state ?? latest.state;
+      const terminalized = this.input.store.terminalizeOperationAndExpireRequest({
         runOwnerId: this.workerId,
         runId: run.runId,
         operationId: operation.operationId,
-        from: "dispatched",
-        to: "running",
+        requestId: reqId,
+        from: terminalFrom,
+        to: nextState,
         now: this.now(),
+        output: resultArtifactId ? null : result.output || null,
+        resultArtifactId,
+        error: result.state === "resolved" ? null : (result.detail ?? result.state),
+        usage: result.usage,
       });
-      const published = await captureWorkflowExternal(() =>
-        this.publishOperation(revision, operation, "running", "dispatched"),
+      if (!terminalized) {
+        return Result.err(
+          workflowExecutionFailure("Agent operation terminal transition lost its fenced lease"),
+        );
+      }
+      yield* Result.await(
+        captureWorkflowExternal(() =>
+          this.publishOperation(revision, operation, nextState, terminalFrom),
+        ),
       );
-      if (published.status === "error") return Result.err(published.error);
-    }
-    const terminalOperation = this.input.store.getOperation(run.runId, operation.operationId);
-    if (terminalOperation.status === "error") {
-      return Result.err(workflowExecutionFailure(terminalOperation.error.message));
-    }
-    const terminalFrom = terminalOperation.value?.state ?? latest.state;
-    const terminalized = this.input.store.terminalizeOperationAndExpireRequest({
-      runOwnerId: this.workerId,
-      runId: run.runId,
-      operationId: operation.operationId,
-      requestId: reqId,
-      from: terminalFrom,
-      to: nextState,
-      now: this.now(),
-      output: resultArtifactId ? null : result.output || null,
-      resultArtifactId,
-      error: result.state === "resolved" ? null : (result.detail ?? result.state),
-      usage: result.usage,
-    });
-    if (!terminalized) {
-      return Result.err(
-        workflowExecutionFailure("Agent operation terminal transition lost its fenced lease"),
-      );
-    }
-    const published = await captureWorkflowExternal(() =>
-      this.publishOperation(revision, operation, nextState, terminalFrom),
-    );
-    if (published.status === "error") return Result.err(published.error);
-    if (result.usage) {
-      const usagePublished = await captureWorkflowExternal(() =>
-        this.publishUsage(run, revision, operation.operationId),
-      );
-      if (usagePublished.status === "error") return Result.err(usagePublished.error);
-    }
-    if (nextState !== "succeeded") {
-      return Result.err(workflowExecutionFailure(result.detail ?? `Agent request ${nextState}`));
-    }
-    return Result.ok(result.output);
+      if (result.usage) {
+        yield* Result.await(
+          captureWorkflowExternal(() => this.publishUsage(run, revision, operation.operationId)),
+        );
+      }
+      if (nextState !== "succeeded") {
+        return Result.err(workflowExecutionFailure(result.detail ?? `Agent request ${nextState}`));
+      }
+      return Result.ok(result.output);
+    }, this);
   }
 
   private async dispatchAgentSafely(
@@ -1808,15 +1936,29 @@ export class WorkflowEngine {
     reconcile: boolean,
   ): Promise<WorkflowExecutionResult<JsonValue>> {
     const dispatched = await this.dispatchAgent(run, revision, operation, input, signal, reconcile);
-    if (dispatched.status === "ok" || this.stopping) return dispatched;
+    const dispatchError = dispatched.match({ ok: () => null, err: (error) => error });
+    if (!dispatchError || this.stopping) return dispatched;
     const currentRunResult = this.input.store.getRun(run.runId);
-    if (currentRunResult.status === "error") return dispatched;
-    const currentRun = currentRunResult.value;
+    const currentRunOutcome = currentRunResult.match<
+      { readonly kind: "ok"; readonly run: WorkflowRun | null } | { readonly kind: "error" }
+    >({
+      ok: (run) => ({ kind: "ok", run }),
+      err: () => ({ kind: "error" }),
+    });
+    if (currentRunOutcome.kind === "error") return dispatched;
+    const { run: currentRun } = currentRunOutcome;
     if (currentRun?.claimedBy !== this.workerId) return dispatched;
     if (signal.aborted && currentRun?.state === "paused") return dispatched;
     const currentResult = this.input.store.getOperation(run.runId, operation.operationId);
-    if (currentResult.status === "error") return dispatched;
-    const current = currentResult.value;
+    const currentOutcome = currentResult.match<
+      | { readonly kind: "ok"; readonly operation: WorkflowOperation | null }
+      | { readonly kind: "error" }
+    >({
+      ok: (value) => ({ kind: "ok", operation: value }),
+      err: () => ({ kind: "error" }),
+    });
+    if (currentOutcome.kind === "error") return dispatched;
+    const current = currentOutcome.operation;
     if (current && !isTerminalOperation(current.state)) {
       const state = signal.aborted ? "cancelled" : "failed";
       if (current.state === "queued" && state === "failed") {
@@ -1830,8 +1972,15 @@ export class WorkflowEngine {
         });
       }
       const latestOperation = this.input.store.getOperation(run.runId, operation.operationId);
-      if (latestOperation.status === "error") return dispatched;
-      const from = latestOperation.value?.state ?? current.state;
+      const latestOutcome = latestOperation.match<
+        | { readonly kind: "ok"; readonly operation: WorkflowOperation | null }
+        | { readonly kind: "error" }
+      >({
+        ok: (value) => ({ kind: "ok", operation: value }),
+        err: () => ({ kind: "error" }),
+      });
+      if (latestOutcome.kind === "error") return dispatched;
+      const from = latestOutcome.operation?.state ?? current.state;
       this.input.store.transitionOperation({
         runOwnerId: this.workerId,
         runId: run.runId,
@@ -1839,12 +1988,13 @@ export class WorkflowEngine {
         from,
         to: state,
         now: this.now(),
-        error: dispatched.error.message,
+        error: dispatchError.message,
       });
       const published = await captureWorkflowExternal(() =>
         this.publishOperation(revision, operation, state, from),
       );
-      if (published.status === "error") return Result.err(published.error);
+      const publicationError = published.match({ ok: () => null, err: (error) => error });
+      if (publicationError) return Result.err(publicationError);
     }
     return dispatched;
   }
@@ -1890,24 +2040,24 @@ export class WorkflowEngine {
       WorkflowTerminalReceiptReconciliationFailed
     > => {
       const receiptResult = this.input.store.getWorkflowRequestTerminalReceipt(input.requestId);
-      if (receiptResult.status === "error") {
-        return Result.err(toWorkflowTerminalReceiptReconciliationFailed(receiptResult.error));
-      }
-      const receipt = receiptResult.value;
-      if (!receipt) return Result.ok(null);
-      if (
-        receipt.requestId !== input.requestId ||
-        receipt.runId !== input.run.runId ||
-        receipt.operationId !== input.operation.operationId ||
-        receipt.dispatchEpoch !== input.dispatchEpoch
-      ) {
-        return Result.err(
-          new WorkflowTerminalReceiptReconciliationFailed({
-            message: "Terminal lifecycle receipt does not match its exact workflow dispatch",
-          }),
-        );
-      }
-      return Result.ok(receipt);
+      return receiptResult
+        .mapError(toWorkflowTerminalReceiptReconciliationFailed)
+        .andThen((receipt) => {
+          if (!receipt) return Result.ok(null);
+          if (
+            receipt.requestId !== input.requestId ||
+            receipt.runId !== input.run.runId ||
+            receipt.operationId !== input.operation.operationId ||
+            receipt.dispatchEpoch !== input.dispatchEpoch
+          ) {
+            return Result.err(
+              new WorkflowTerminalReceiptReconciliationFailed({
+                message: "Terminal lifecycle receipt does not match its exact workflow dispatch",
+              }),
+            );
+          }
+          return Result.ok(receipt);
+        });
     };
     const adoptReceipt = async (
       receipt: WorkflowRequestTerminalReceipt,
@@ -1916,19 +2066,19 @@ export class WorkflowEngine {
       const adopted = await captureWorkflowTerminalReceiptAdoption(() =>
         this.adoptTerminalReceipt(receipt, input.revision),
       );
-      if (adopted.status === "error") {
-        return Result.err(
-          new WorkflowTerminalReceiptReconciliationFailed({ message: adopted.error.message }),
-        );
-      }
-      finishResult({
-        ...adopted.value,
-        ...(idleTimedOut
-          ? { state: "timed_out" as const, detail: "Agent operation idle timeout" }
-          : {}),
-        source,
-      });
-      return Result.ok(undefined);
+      return adopted
+        .mapError(
+          (error) => new WorkflowTerminalReceiptReconciliationFailed({ message: error.message }),
+        )
+        .map((value) => {
+          finishResult({
+            ...value,
+            ...(idleTimedOut
+              ? { state: "timed_out" as const, detail: "Agent operation idle timeout" }
+              : {}),
+            source,
+          });
+        });
     };
     const finishReceiptFailure = (
       state: AgentRequestResult["state"],
@@ -1947,13 +2097,23 @@ export class WorkflowEngine {
       readingReceipt = true;
       try {
         const receipt = readExactReceipt();
-        if (receipt.status === "error") {
-          finishReceiptFailure("failed", receipt.error);
+        const receiptOutcome = receipt.match<
+          | { readonly kind: "ok"; readonly receipt: WorkflowRequestTerminalReceipt | null }
+          | { readonly kind: "error"; readonly error: WorkflowTerminalReceiptReconciliationFailed }
+        >({
+          ok: (value) => ({ kind: "ok", receipt: value }),
+          err: (error) => ({ kind: "error", error }),
+        });
+        if (receiptOutcome.kind === "error") {
+          finishReceiptFailure("failed", receiptOutcome.error);
           return;
         }
-        if (!receipt.value) return;
-        const adopted = await adoptReceipt(receipt.value, "receipt");
-        if (adopted.status === "error") finishReceiptFailure("failed", adopted.error);
+        if (!receiptOutcome.receipt) return;
+        const adopted = await adoptReceipt(receiptOutcome.receipt, "receipt");
+        adopted.match({
+          ok: () => undefined,
+          err: (error) => finishReceiptFailure("failed", error),
+        });
       } finally {
         readingReceipt = false;
       }
@@ -1977,7 +2137,8 @@ export class WorkflowEngine {
           sessionId: input.sessionId,
           dispatchEpoch: input.dispatchEpoch,
         });
-        if (published.status === "ok") return;
+        const publicationFailed = published.match({ ok: () => false, err: () => true });
+        if (!publicationFailed) return;
         await Bun.sleep(100);
       }
     };
@@ -2041,10 +2202,18 @@ export class WorkflowEngine {
         input.run.runId,
         input.operation.operationId,
       );
-      if (currentResult.status === "error") {
-        return Result.err(toWorkflowTerminalReceiptReconciliationFailed(currentResult.error));
-      }
-      const current = currentResult.value;
+      const currentOutcome = currentResult.match<
+        | { readonly kind: "ok"; readonly operation: WorkflowOperation | null }
+        | { readonly kind: "error"; readonly error: WorkflowTerminalReceiptReconciliationFailed }
+      >({
+        ok: (operation) => ({ kind: "ok", operation }),
+        err: (error) => ({
+          kind: "error",
+          error: toWorkflowTerminalReceiptReconciliationFailed(error),
+        }),
+      });
+      if (currentOutcome.kind === "error") return Result.err(currentOutcome.error);
+      const current = currentOutcome.operation;
       if (message.data.state === "running" && current?.state === "dispatched") {
         this.input.store.transitionOperation({
           runOwnerId: this.workerId,
@@ -2070,22 +2239,33 @@ export class WorkflowEngine {
         const deadline = Date.now() + TERMINAL_RECEIPT_WAIT_MS;
         while (!settled && !this.stopping) {
           const receipt = readExactReceipt();
-          if (receipt.status === "error") {
-            finishReceiptFailure(terminalState, receipt.error);
-            return Result.err(receipt.error);
+          const receiptOutcome = receipt.match<
+            | { readonly kind: "ok"; readonly receipt: WorkflowRequestTerminalReceipt | null }
+            | {
+                readonly kind: "error";
+                readonly error: WorkflowTerminalReceiptReconciliationFailed;
+              }
+          >({
+            ok: (value) => ({ kind: "ok", receipt: value }),
+            err: (error) => ({ kind: "error", error }),
+          });
+          if (receiptOutcome.kind === "error") {
+            finishReceiptFailure(terminalState, receiptOutcome.error);
+            return Result.err(receiptOutcome.error);
           }
-          if (receipt.value) {
-            if (receipt.value.state !== terminalState) {
+          if (receiptOutcome.receipt) {
+            if (receiptOutcome.receipt.state !== terminalState) {
               const mismatch = new WorkflowTerminalReceiptReconciliationFailed({
-                message: `Terminal lifecycle state ${terminalState} does not match durable receipt state ${receipt.value.state}`,
+                message: `Terminal lifecycle state ${terminalState} does not match durable receipt state ${receiptOutcome.receipt.state}`,
               });
               finishReceiptFailure(terminalState, mismatch);
               return Result.err(mismatch);
             }
-            const adopted = await adoptReceipt(receipt.value, "terminal_receipt");
-            if (adopted.status === "error") {
-              finishReceiptFailure(terminalState, adopted.error);
-              return Result.err(adopted.error);
+            const adopted = await adoptReceipt(receiptOutcome.receipt, "terminal_receipt");
+            const adoptionError = adopted.match({ ok: () => null, err: (error) => error });
+            if (adoptionError) {
+              finishReceiptFailure(terminalState, adoptionError);
+              return Result.err(adoptionError);
             }
             return Result.ok(undefined);
           }
@@ -2120,12 +2300,19 @@ export class WorkflowEngine {
       },
       applyWorkflowEventDeliveryPolicy,
     );
-    if (outSubscription.status === "error") {
+    const outSubscriptionOutcome = outSubscription.match<
+      | { readonly kind: "ok"; readonly subscription: WorkflowEventSubscription }
+      | { readonly kind: "error"; readonly error: EventDeliveryStartFailed }
+    >({
+      ok: (subscription) => ({ kind: "ok", subscription }),
+      err: (error) => ({ kind: "error", error }),
+    });
+    if (outSubscriptionOutcome.kind === "error") {
       return failedAgentRequest(
-        `Workflow output subscription failed: ${outSubscription.error.message}`,
+        `Workflow output subscription failed: ${outSubscriptionOutcome.error.message}`,
       );
     }
-    const outSub = outSubscription.value;
+    const outSub = outSubscriptionOutcome.subscription;
     const evtSubscription = await this.input.bus.subscribeTopic(
       "evt.request",
       {
@@ -2146,15 +2333,22 @@ export class WorkflowEngine {
       },
       applyWorkflowEventDeliveryPolicy,
     );
-    if (evtSubscription.status === "error") {
+    const evtSubscriptionOutcome = evtSubscription.match<
+      | { readonly kind: "ok"; readonly subscription: WorkflowEventSubscription }
+      | { readonly kind: "error"; readonly error: EventDeliveryStartFailed }
+    >({
+      ok: (subscription) => ({ kind: "ok", subscription }),
+      err: (error) => ({ kind: "error", error }),
+    });
+    if (evtSubscriptionOutcome.kind === "error") {
       const cleanupFailures = await stopWorkflowEventSubscription("workflow output", outSub);
       const detail = [
-        `Workflow lifecycle subscription failed: ${evtSubscription.error.message}`,
+        `Workflow lifecycle subscription failed: ${evtSubscriptionOutcome.error.message}`,
         ...cleanupFailures,
       ].join("; ");
       return failedAgentRequest(detail);
     }
-    const evtSub = evtSubscription.value;
+    const evtSub = evtSubscriptionOutcome.subscription;
     const abortStart = Promise.withResolvers<void>();
     let abortStarted = false;
     const abortCancellation = abortStart.promise.then(async (): Promise<AgentRequestResult> => {
@@ -2163,9 +2357,8 @@ export class WorkflowEngine {
           requestId: input.requestId,
           sessionId: input.sessionId,
         });
-        if (published.status === "error") {
-          return failedAgentRequest(published.error.message);
-        }
+        const publicationError = published.match({ ok: () => null, err: (error) => error });
+        if (publicationError) return failedAgentRequest(publicationError.message);
       }
       return { state: "cancelled", output: "", detail: "Agent request cancelled", usage };
     });
@@ -2190,16 +2383,30 @@ export class WorkflowEngine {
             offset: outputCursor ? { type: "cursor", cursor: outputCursor } : { type: "begin" },
             limit: 1_000,
           });
-          if (fetched.status === "error") {
-            const fetchFailure = toWorkflowReconciliationFetchFailed(fetched.error);
+          const fetchOutcome = fetched.match<
+            | {
+                readonly kind: "ok";
+                readonly messages: Array<{
+                  readonly msg: DecodedLilacMessageForTopic<ReturnType<typeof outReqTopic>>;
+                  readonly cursor: string;
+                }>;
+                readonly next?: string;
+              }
+            | { readonly kind: "error"; readonly error: WorkflowReconciliationFetchFailed }
+          >({
+            ok: ({ messages, next }) => ({ kind: "ok", messages, next }),
+            err: (error) => ({ kind: "error", error: toWorkflowReconciliationFetchFailed(error) }),
+          });
+          if (fetchOutcome.kind === "error") {
+            const fetchFailure = fetchOutcome.error;
             terminal = failedAgentRequest(fetchFailure.message);
             finishResult(terminal);
             break;
           }
-          for (const entry of fetched.value.messages) await handleOutputMessage(entry.msg);
+          for (const entry of fetchOutcome.messages) await handleOutputMessage(entry.msg);
           const previous = outputCursor;
-          outputCursor = fetched.value.next;
-          if (fetched.value.messages.length < 1_000 || !outputCursor || outputCursor === previous) {
+          outputCursor = fetchOutcome.next;
+          if (fetchOutcome.messages.length < 1_000 || !outputCursor || outputCursor === previous) {
             break;
           }
         } while (!settled);
@@ -2213,20 +2420,38 @@ export class WorkflowEngine {
                 : { type: "begin" },
               limit: 1_000,
             });
-            if (fetched.status === "error") {
-              const fetchFailure = toWorkflowReconciliationFetchFailed(fetched.error);
+            const fetchOutcome = fetched.match<
+              | {
+                  readonly kind: "ok";
+                  readonly messages: Array<{
+                    readonly msg: DecodedLilacMessageForTopic<"evt.request">;
+                    readonly cursor: string;
+                  }>;
+                  readonly next?: string;
+                }
+              | { readonly kind: "error"; readonly error: WorkflowReconciliationFetchFailed }
+            >({
+              ok: ({ messages, next }) => ({ kind: "ok", messages, next }),
+              err: (error) => ({
+                kind: "error",
+                error: toWorkflowReconciliationFetchFailed(error),
+              }),
+            });
+            if (fetchOutcome.kind === "error") {
+              const fetchFailure = fetchOutcome.error;
               terminal = failedAgentRequest(fetchFailure.message);
               finishResult(terminal);
               break;
             }
-            for (const entry of fetched.value.messages) {
+            for (const entry of fetchOutcome.messages) {
               const handled = await handleLifecycleMessage(entry.msg);
-              if (handled.status === "error") break;
+              const handlingFailed = handled.match({ ok: () => false, err: () => true });
+              if (handlingFailed) break;
             }
             const previous = lifecycleCursor;
-            lifecycleCursor = fetched.value.next;
+            lifecycleCursor = fetchOutcome.next;
             if (
-              fetched.value.messages.length < 1_000 ||
+              fetchOutcome.messages.length < 1_000 ||
               !lifecycleCursor ||
               lifecycleCursor === previous
             ) {
@@ -2252,12 +2477,14 @@ export class WorkflowEngine {
         });
         if (!publicationClaimed) {
           const fetchedReceipt = fetchWorkflowTerminalReceipt(this.input.store, input.requestId);
-          if (fetchedReceipt.status === "error") {
-            terminal = failedAgentRequest(fetchedReceipt.error.message);
-            finishResult(terminal);
-          } else {
-            terminal = await this.adoptTerminalReceipt(fetchedReceipt.value, input.revision);
-          }
+          terminal = await fetchedReceipt.match<Promise<AgentRequestResult>>({
+            ok: (receipt) => this.adoptTerminalReceipt(receipt, input.revision),
+            err: (error) => {
+              const failed = failedAgentRequest(error.message);
+              finishResult(failed);
+              return Promise.resolve(failed);
+            },
+          });
         } else {
           const liveParent =
             input.run.completionTarget.kind === "live_parent" ? input.run.completionTarget : null;
@@ -2306,18 +2533,21 @@ export class WorkflowEngine {
         abortCancellation,
         receiptPollingDefect,
         idleCancellationDefect,
-        outSub.done.then((done) => {
-          if (done.status === "error") {
-            return failedAgentRequest(eventDeliveryDoneDetail("Workflow output", done.error));
-          }
-          return failedAgentRequest("Workflow output delivery ended before request completion");
-        }),
-        evtSub.done.then((done) => {
-          if (done.status === "error") {
-            return failedAgentRequest(eventDeliveryDoneDetail("Workflow lifecycle", done.error));
-          }
-          return failedAgentRequest("Workflow lifecycle delivery ended before request completion");
-        }),
+        outSub.done.then((done) =>
+          done.match({
+            ok: () =>
+              failedAgentRequest("Workflow output delivery ended before request completion"),
+            err: (error) => failedAgentRequest(eventDeliveryDoneDetail("Workflow output", error)),
+          }),
+        ),
+        evtSub.done.then((done) =>
+          done.match({
+            ok: () =>
+              failedAgentRequest("Workflow lifecycle delivery ended before request completion"),
+            err: (error) =>
+              failedAgentRequest(eventDeliveryDoneDetail("Workflow lifecycle", error)),
+          }),
+        ),
       ]);
     } finally {
       input.signal.removeEventListener("abort", abort);
@@ -2369,16 +2599,29 @@ export class WorkflowEngine {
   }
 
   private async stopAgentRequests(runId: string): Promise<WorkflowExecutionResult<void>> {
-    const runResult = this.input.store.getRun(runId);
-    if (runResult.status === "error") {
-      return Result.err(workflowExecutionFailure(runResult.error.message));
-    }
-    const target = runResult.value?.completionTarget;
-    const operationsResult = this.input.store.listOperations(runId, { limit: 1_000 });
-    if (operationsResult.status === "error") {
-      return Result.err(workflowExecutionFailure(operationsResult.error.message));
-    }
-    const operations = operationsResult.value.filter(
+    const loaded = Result.gen(function* (this: WorkflowEngine) {
+      const run = yield* this.input.store
+        .getRun(runId)
+        .mapError((error) => workflowExecutionFailure(error.message));
+      const operations = yield* this.input.store
+        .listOperations(runId, { limit: 1_000 })
+        .mapError((error) => workflowExecutionFailure(error.message));
+      return Result.ok({ target: run?.completionTarget, operations });
+    }, this);
+    const loadOutcome = loaded.match<
+      | {
+          readonly kind: "ok";
+          readonly target: WorkflowRun["completionTarget"] | undefined;
+          readonly operations: WorkflowOperation[];
+        }
+      | { readonly kind: "error"; readonly error: WorkflowExecutionFailed }
+    >({
+      ok: ({ target, operations }) => ({ kind: "ok", target, operations }),
+      err: (error) => ({ kind: "error", error }),
+    });
+    if (loadOutcome.kind === "error") return Result.err(loadOutcome.error);
+    const { target } = loadOutcome;
+    const operations = loadOutcome.operations.filter(
       (operation) => operation.kind === "agent" && operation.requestId !== null,
     );
     const cancellations = await Promise.allSettled(
@@ -2416,8 +2659,11 @@ export class WorkflowEngine {
             ? cancellation.reason
             : new Error("Opaque workflow cancellation failure");
         failures.push(boundedError(cause));
-      } else if (cancellation.value.status === "error") {
-        failures.push(cancellation.value.error.message);
+      } else {
+        cancellation.value.match({
+          ok: () => undefined,
+          err: (error) => failures.push(error.message),
+        });
       }
     }
     if (failures.length > 0) {
@@ -2436,108 +2682,101 @@ export class WorkflowEngine {
     result: JsonValue,
     detail: string,
   ): Promise<WorkflowExecutionResult<void>> {
-    const currentResult = this.input.store.getRun(original.runId);
-    if (currentResult.status === "error") {
-      return Result.err(workflowExecutionFailure(currentResult.error.message));
-    }
-    const current = currentResult.value;
-    if (!current || current.state !== "running" || current.claimedBy !== this.workerId) {
-      return Result.ok(undefined);
-    }
-    const revisionResult = this.input.store.getRevision(current.revisionId);
-    if (revisionResult.status === "error") {
-      return Result.err(workflowExecutionFailure(revisionResult.error.message));
-    }
-    const revision = revisionResult.value;
-    if (!revision) {
-      return Result.err(
-        workflowExecutionFailure(`Workflow revision not found: ${current.revisionId}`),
-      );
-    }
-    let finalState = state;
-    let finalResult = result;
-    let finalDetail = detail;
-    const operations = this.input.store.listOperations(current.runId, { limit: 1_000 });
-    if (operations.status === "error") {
-      return Result.err(workflowExecutionFailure(operations.error.message));
-    }
-    const activeOperations = operations.value.filter(
-      (operation) => !isTerminalOperation(operation.state),
-    );
-    if (state === "succeeded" && activeOperations.length > 0) {
-      finalState = "failed";
-      finalResult = null;
-      finalDetail = "Workflow returned with outstanding unawaited host operations";
-    }
-    const resultBytes = Buffer.byteLength(canonicalJson(finalResult), "utf8");
-    let resultArtifactId: string | null = null;
-    if (finalState === "succeeded" && resultBytes > WORKFLOW_INLINE_VALUE_BYTES) {
-      const persisted = await writeWorkflowValueArtifact({
-        dataDir: this.input.dataDir,
-        value: finalResult,
-        maxBytes: revision.limits.maxResultBytes,
-      });
-      if (persisted.status === "error") {
-        return Result.err(workflowExecutionFailure(persisted.error.message));
+    return Result.gen(async function* (this: WorkflowEngine) {
+      const current = yield* this.input.store
+        .getRun(original.runId)
+        .mapError((error) => workflowExecutionFailure(error.message));
+      if (!current || current.state !== "running" || current.claimedBy !== this.workerId) {
+        return Result.ok(undefined);
       }
-      resultArtifactId = persisted.value;
-    }
-    const changed = this.input.store.terminalizeRun({
-      runId: current.runId,
-      from: "running",
-      to: finalState,
-      ownerId: this.workerId,
-      now: this.now(),
-      detail: finalDetail,
-      result: resultArtifactId ? null : finalResult,
-      resultArtifactId,
-    });
-    if (!changed) {
-      return Result.err(
-        workflowExecutionFailure("Workflow terminal transition lost its fenced lease"),
-      );
-    }
-    if (finalState === "failed") {
-      for (const operation of activeOperations) {
-        if (!operation.requestId) continue;
-        const cancelled = await this.input.bus.publish(
-          lilacEventTypes.CmdRequestMessage,
-          { queue: "interrupt", messages: [], raw: { cancel: true, cancelQueued: true } },
-          {
-            headers: {
-              request_id: operation.requestId,
-              session_id:
-                current.completionTarget.kind === "live_parent"
-                  ? current.completionTarget.childSessionId
-                  : `workflow:${current.runId}:${operation.operationId}`,
-              request_client: "unknown",
-            },
-          },
+      const revision = yield* this.input.store
+        .getRevision(current.revisionId)
+        .mapError((error) => workflowExecutionFailure(error.message));
+      if (!revision) {
+        return Result.err(
+          workflowExecutionFailure(`Workflow revision not found: ${current.revisionId}`),
         );
-        if (cancelled.status === "error") {
-          return Result.err(workflowExecutionFailure(cancelled.error.message));
+      }
+      let finalState = state;
+      let finalResult = result;
+      let finalDetail = detail;
+      const operations = yield* this.input.store
+        .listOperations(current.runId, { limit: 1_000 })
+        .mapError((error) => workflowExecutionFailure(error.message));
+      const activeOperations = operations.filter(
+        (operation) => !isTerminalOperation(operation.state),
+      );
+      if (state === "succeeded" && activeOperations.length > 0) {
+        finalState = "failed";
+        finalResult = null;
+        finalDetail = "Workflow returned with outstanding unawaited host operations";
+      }
+      const resultBytes = Buffer.byteLength(canonicalJson(finalResult), "utf8");
+      let resultArtifactId: string | null = null;
+      if (finalState === "succeeded" && resultBytes > WORKFLOW_INLINE_VALUE_BYTES) {
+        resultArtifactId = yield* Result.await(
+          writeWorkflowValueArtifact({
+            dataDir: this.input.dataDir,
+            value: finalResult,
+            maxBytes: revision.limits.maxResultBytes,
+          }).then((persisted) =>
+            persisted.mapError((error) => workflowExecutionFailure(error.message)),
+          ),
+        );
+      }
+      const changed = this.input.store.terminalizeRun({
+        runId: current.runId,
+        from: "running",
+        to: finalState,
+        ownerId: this.workerId,
+        now: this.now(),
+        detail: finalDetail,
+        result: resultArtifactId ? null : finalResult,
+        resultArtifactId,
+      });
+      if (!changed) {
+        return Result.err(
+          workflowExecutionFailure("Workflow terminal transition lost its fenced lease"),
+        );
+      }
+      if (finalState === "failed") {
+        for (const operation of activeOperations) {
+          if (!operation.requestId) continue;
+          const cancelled = await this.input.bus.publish(
+            lilacEventTypes.CmdRequestMessage,
+            { queue: "interrupt", messages: [], raw: { cancel: true, cancelQueued: true } },
+            {
+              headers: {
+                request_id: operation.requestId,
+                session_id:
+                  current.completionTarget.kind === "live_parent"
+                    ? current.completionTarget.childSessionId
+                    : `workflow:${current.runId}:${operation.operationId}`,
+                request_client: "unknown",
+              },
+            },
+          );
+          yield* cancelled.mapError((error) => workflowExecutionFailure(error.message));
         }
       }
-    }
-    const updatedResult = this.input.store.getRun(current.runId);
-    if (updatedResult.status === "error") {
-      return Result.err(workflowExecutionFailure(updatedResult.error.message));
-    }
-    const updated = updatedResult.value;
-    if (!updated) return Result.ok(undefined);
-    const runPublished = await captureWorkflowExternal(() =>
-      this.publishRun(updated, finalState, "running"),
-    );
-    if (runPublished.status === "error") return Result.err(runPublished.error);
-    const ready = await this.input.bus.publish(lilacEventTypes.EvtWorkflowResultReady, {
-      runId: updated.runId,
-      revisionId: updated.revisionId,
-      state: finalState,
-      summary: finalDetail.slice(0, 1_000),
-      ts: this.now(),
-    });
-    if (ready.status === "error") return Result.err(workflowExecutionFailure(ready.error.message));
-    return Result.ok(undefined);
+      const updated = yield* this.input.store
+        .getRun(current.runId)
+        .mapError((error) => workflowExecutionFailure(error.message));
+      if (!updated) return Result.ok(undefined);
+      yield* Result.await(
+        captureWorkflowExternal(() => this.publishRun(updated, finalState, "running")),
+      );
+      const ready = await this.input.bus.publish(lilacEventTypes.EvtWorkflowResultReady, {
+        runId: updated.runId,
+        revisionId: updated.revisionId,
+        state: finalState,
+        summary: finalDetail.slice(0, 1_000),
+        ts: this.now(),
+      });
+      return ready
+        .mapError((error) => workflowExecutionFailure(error.message))
+        .map(() => undefined);
+    }, this);
   }
 
   private async publishRun(
@@ -2591,8 +2830,12 @@ export class WorkflowEngine {
     operationIdValue: string,
   ): Promise<void> {
     const operations = this.input.store.listOperations(run.runId, { limit: 1_000 });
-    if (operations.status === "error") signalDurableWorkflowReadErrorToHost(operations.error);
-    const aggregate = operations.value.reduce(
+    const readEntries = operations.match({
+      ok: (value) => () => value,
+      err: (error) => () => signalDurableWorkflowReadErrorToHost(error),
+    });
+    const entries = readEntries();
+    const aggregate = entries.reduce(
       (usage, operation) => ({
         inputTokens: usage.inputTokens + (operation.usage?.inputTokens ?? 0),
         outputTokens: usage.outputTokens + (operation.usage?.outputTokens ?? 0),

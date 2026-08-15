@@ -1519,72 +1519,90 @@ export function applyWorkflowSchemaMigrations(
       }),
     );
   }
-  const timestamp = captureWorkflowMigrationTimestamp(now);
-  if (timestamp.status === "error") return Result.err(timestamp.error);
-
-  const inspected = runBunSqliteTransaction(
-    db,
-    () => {
-      db.run(`CREATE TABLE IF NOT EXISTS workflow_schema_migrations (
+  const capturedTimestamp = captureWorkflowMigrationTimestamp(now);
+  const apply = capturedTimestamp.match<() => ResultType<void, WorkflowMigrationError>>({
+    err: (error) => () => Result.err(error),
+    ok: (timestamp) => () => {
+      const inspected = runBunSqliteTransaction(
+        db,
+        () => {
+          db.run(`CREATE TABLE IF NOT EXISTS workflow_schema_migrations (
         version INTEGER PRIMARY KEY,
         name TEXT NOT NULL,
         applied_at INTEGER NOT NULL
       )`);
 
-      return Result.ok(
-        db
-          .query<{ version: number; name: string }, []>(
-            "SELECT version, name FROM workflow_schema_migrations ORDER BY version",
-          )
-          .all(),
+          return Result.ok(
+            db
+              .query<{ version: number; name: string }, []>(
+                "SELECT version, name FROM workflow_schema_migrations ORDER BY version",
+              )
+              .all(),
+          );
+        },
+        (cause) => classifyMigrationDriverFailure("inspect", cause),
       );
+      const continueAfterInspection = inspected.match<
+        () => ResultType<void, WorkflowMigrationError>
+      >({
+        err: (error) => () => Result.err(error),
+        ok: (rows) => () => {
+          const applied = new Map(rows.map((row) => [row.version, row.name]));
+          const knownVersions = new Set(WORKFLOW_MIGRATION_VERSIONS);
+          for (const version of applied.keys()) {
+            if (!knownVersions.has(version)) {
+              return Result.err(
+                new WorkflowMigrationUnsupportedVersion({
+                  version,
+                  message: `Workflow database migration ${version} is newer than this runtime`,
+                }),
+              );
+            }
+          }
+
+          const applyMigration = (index: number): ResultType<void, WorkflowMigrationError> => {
+            const migration = WORKFLOW_MIGRATIONS[index];
+            if (!migration || migration.version > throughVersion) return Result.ok(undefined);
+            const appliedName = applied.get(migration.version);
+            if (appliedName !== undefined) {
+              if (appliedName !== migration.name) {
+                return Result.err(
+                  new WorkflowMigrationNameMismatch({
+                    version: migration.version,
+                    expectedName: migration.name,
+                    storedName: appliedName,
+                    message: `Workflow migration ${migration.version} name mismatch`,
+                  }),
+                );
+              }
+              return applyMigration(index + 1);
+            }
+
+            const migrated = runBunSqliteTransaction(
+              db,
+              () => {
+                for (const statement of migration.statements) db.run(statement);
+                db.run(
+                  "INSERT INTO workflow_schema_migrations (version, name, applied_at) VALUES (?, ?, ?)",
+                  [migration.version, migration.name, timestamp],
+                );
+                return Result.ok(undefined);
+              },
+              (cause) => classifyMigrationDriverFailure(`apply-v${migration.version}`, cause),
+            );
+            const continueAfterMigration = migrated.match<
+              () => ResultType<void, WorkflowMigrationError>
+            >({
+              err: (error) => () => Result.err(error),
+              ok: () => () => applyMigration(index + 1),
+            });
+            return continueAfterMigration();
+          };
+          return applyMigration(0);
+        },
+      });
+      return continueAfterInspection();
     },
-    (cause) => classifyMigrationDriverFailure("inspect", cause),
-  );
-  if (inspected.status === "error") return Result.err(inspected.error);
-  const applied = new Map(inspected.value.map((row) => [row.version, row.name]));
-  const knownVersions = new Set(WORKFLOW_MIGRATION_VERSIONS);
-  for (const version of applied.keys()) {
-    if (!knownVersions.has(version)) {
-      return Result.err(
-        new WorkflowMigrationUnsupportedVersion({
-          version,
-          message: `Workflow database migration ${version} is newer than this runtime`,
-        }),
-      );
-    }
-  }
-
-  for (const migration of WORKFLOW_MIGRATIONS) {
-    if (migration.version > throughVersion) break;
-    const appliedName = applied.get(migration.version);
-    if (appliedName !== undefined) {
-      if (appliedName !== migration.name) {
-        return Result.err(
-          new WorkflowMigrationNameMismatch({
-            version: migration.version,
-            expectedName: migration.name,
-            storedName: appliedName,
-            message: `Workflow migration ${migration.version} name mismatch`,
-          }),
-        );
-      }
-      continue;
-    }
-
-    const migrated = runBunSqliteTransaction(
-      db,
-      () => {
-        for (const statement of migration.statements) db.run(statement);
-        db.run(
-          "INSERT INTO workflow_schema_migrations (version, name, applied_at) VALUES (?, ?, ?)",
-          [migration.version, migration.name, timestamp.value],
-        );
-        return Result.ok(undefined);
-      },
-      (cause) => classifyMigrationDriverFailure(`apply-v${migration.version}`, cause),
-    );
-    if (migrated.status === "error") return Result.err(migrated.error);
-  }
-  return Result.ok(undefined);
+  });
+  return apply();
 }

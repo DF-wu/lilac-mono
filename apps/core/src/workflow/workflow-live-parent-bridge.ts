@@ -113,14 +113,17 @@ async function captureRunEvent(
 ): Promise<ResultType<void, WorkflowLiveParentRunEventFailed>> {
   try {
     const handled = await handle();
-    if (handled?.status === "error") {
-      return Result.err(
-        new WorkflowLiveParentRunEventFailed({
-          cause: handled.error,
-          runId,
-          message: "Live-parent workflow event handling failed",
-        }),
-      );
+    if (handled) {
+      return handled
+        .map(() => undefined)
+        .mapError(
+          (cause) =>
+            new WorkflowLiveParentRunEventFailed({
+              cause,
+              runId,
+              message: "Live-parent workflow event handling failed",
+            }),
+        );
     }
     return Result.ok(undefined);
   } catch (cause) {
@@ -159,19 +162,17 @@ async function captureChildActivity(
 function requireSubscriptionStart(
   started: ResultType<ResultSubscription, EventDeliveryStartFailed>,
 ): ResultSubscription {
-  if (started.status === "error") throw started.error;
-  return started.value;
+  return adaptToolResultToHost(started);
 }
 
 function requireSubscriptionStop(stopped: ResultType<void, EventDeliveryStopFailed>): void {
-  if (stopped.status === "error") throw stopped.error;
+  adaptToolResultToHost(stopped);
 }
 
 function requireChildOutputBatch(
   fetched: ResultType<ChildOutputBatch, EventFetchContractInvalid | EventFetchTransportFailed>,
 ): ChildOutputBatch {
-  if (fetched.status === "error") throw fetched.error;
-  return fetched.value;
+  return adaptToolResultToHost(fetched);
 }
 
 type ChildActivityForwarding = {
@@ -227,8 +228,12 @@ function toCompletionIdentity(
     );
   }
   const operations = store.listOperations(run.runId, { limit: 1_000 });
-  if (operations.status === "error") signalDurableWorkflowReadErrorToHost(operations.error);
-  const timedOut = operations.value.some((operation) => operation.state === "timed_out");
+  const readEntries = operations.match({
+    ok: (value) => () => value,
+    err: (error) => () => signalDurableWorkflowReadErrorToHost(error),
+  });
+  const entries = readEntries();
+  const timedOut = entries.some((operation) => operation.state === "timed_out");
   const status = toCompletionStatus(run.state, timedOut);
   return {
     runId: run.runId,
@@ -260,9 +265,7 @@ async function toCompletion(
       ),
     );
   }
-  const revisionResult = store.getRevision(run.revisionId);
-  if (revisionResult.status === "error") signalDurableWorkflowReadErrorToHost(revisionResult.error);
-  const revision = revisionResult.value;
+  const revision = adaptToolResultToHost(store.getRevision(run.revisionId));
   let result = run.result;
   if (run.state === "succeeded" && run.resultArtifactId && revision) {
     const loaded = await readWorkflowValueArtifact({
@@ -402,8 +405,12 @@ export class WorkflowLiveParentBridge {
     this.notify(signal);
     const runsById = new Map<string, WorkflowRun>();
     const activeRuns = this.input.store.listActiveLiveParentRuns(input.parentRequestId);
-    if (activeRuns.status === "error") signalDurableWorkflowReadErrorToHost(activeRuns.error);
-    for (const run of activeRuns.value) {
+    const readActiveRuns = activeRuns.match({
+      ok: (value) => () => value,
+      err: (error) => () => signalDurableWorkflowReadErrorToHost(error),
+    });
+    const active = readActiveRuns();
+    for (const run of active) {
       runsById.set(run.runId, run);
     }
     const pendingRuns = this.input.store.listPendingLiveParentCompletions(
@@ -411,19 +418,27 @@ export class WorkflowLiveParentBridge {
       1_000,
       input.recoverSynchronousDeliveries,
     );
-    if (pendingRuns.status === "error") signalDurableWorkflowReadErrorToHost(pendingRuns.error);
-    for (const run of pendingRuns.value) {
+    const readPendingRuns = pendingRuns.match({
+      ok: (value) => () => value,
+      err: (error) => () => signalDurableWorkflowReadErrorToHost(error),
+    });
+    const pending = readPendingRuns();
+    for (const run of pending) {
       runsById.set(run.runId, run);
     }
     const ready = Promise.all(
       [...runsById.values()].map(async (run) => {
         if (isTerminalRun(run)) {
           const reconciled = await this.reconcileTerminalChildActivity(run, signal);
-          if (reconciled.status === "error") {
+          const reconciliationError = reconciled.match({
+            ok: () => null,
+            err: (error) => error,
+          });
+          if (reconciliationError) {
             adaptToolResultToHost(
               Result.err(
                 new WorkflowLiveParentRunEventFailed({
-                  cause: reconciled.error,
+                  cause: reconciliationError,
                   runId: run.runId,
                   message: "Live-parent terminal child activity reconciliation failed",
                 }),
@@ -454,8 +469,12 @@ export class WorkflowLiveParentBridge {
           1_000,
           input.recoverSynchronousDeliveries,
         );
-        if (listed.status === "error") signalDurableWorkflowReadErrorToHost(listed.error);
-        return listed.value.map((run) => {
+        const readRuns = listed.match({
+          ok: (value) => () => value,
+          err: (error) => () => signalDurableWorkflowReadErrorToHost(error),
+        });
+        const runs = readRuns();
+        return runs.map((run) => {
           if (run.resultArtifactId) {
             throw new Error("Artifact-backed completion requires listPendingAsync");
           }
@@ -492,9 +511,13 @@ export class WorkflowLiveParentBridge {
           1_000,
           input.recoverSynchronousDeliveries,
         );
-        if (listed.status === "error") signalDurableWorkflowReadErrorToHost(listed.error);
+        const readRuns = listed.match({
+          ok: (value) => () => value,
+          err: (error) => () => signalDurableWorkflowReadErrorToHost(error),
+        });
+        const runs = readRuns();
         return await Promise.all(
-          listed.value.map(
+          runs.map(
             async (run) =>
               await toCompletion(
                 run,
@@ -511,8 +534,12 @@ export class WorkflowLiveParentBridge {
           1_000,
           input.recoverSynchronousDeliveries,
         );
-        if (listed.status === "error") signalDurableWorkflowReadErrorToHost(listed.error);
-        return listed.value.map((run) => toCompletionIdentity(run, this.input.store));
+        const readRuns = listed.match({
+          ok: (value) => () => value,
+          err: (error) => () => signalDurableWorkflowReadErrorToHost(error),
+        });
+        const runs = readRuns();
+        return runs.map((run) => toCompletionIdentity(run, this.input.store));
       },
       isPending: (runId: string): boolean =>
         this.input.store.getLiveParentDeliveryState(runId) === "pending",
@@ -527,9 +554,13 @@ export class WorkflowLiveParentBridge {
           1_000,
           input.recoverSynchronousDeliveries,
         );
-        if (listed.status === "error") signalDurableWorkflowReadErrorToHost(listed.error);
+        const readRuns = listed.match({
+          ok: (value) => () => value,
+          err: (error) => () => signalDurableWorkflowReadErrorToHost(error),
+        });
+        const runs = readRuns();
         return await Promise.all(
-          listed.value.map(async (run) => {
+          runs.map(async (run) => {
             const identity = toCompletionIdentity(run, this.input.store);
             const [settled] = await Promise.allSettled([
               toCompletion(
@@ -593,7 +624,7 @@ export class WorkflowLiveParentBridge {
             transition.previousState,
             detail,
           );
-          if (published.status === "error") throw published.error;
+          adaptToolResultToHost(published);
         }
         this.notify(signal);
       },
@@ -613,6 +644,14 @@ export class WorkflowLiveParentBridge {
     return this.input.now?.() ?? Date.now();
   }
 
+  private logProgressPublicationFailure(runId: string, error: Error): void {
+    this.logger.warn(
+      "live-parent subagent progress publish failed",
+      { runId },
+      formatWorkflowErrorForLog(error),
+    );
+  }
+
   private notify(signal: ParentSignal): void {
     signal.version += 1;
     signal.onActivity?.();
@@ -625,14 +664,21 @@ export class WorkflowLiveParentBridge {
     runId: string,
   ): Promise<ResultType<void, WorkflowLiveParentTopicError>> {
     const runResult = this.input.store.getRun(runId);
-    if (runResult.status === "error") signalDurableWorkflowReadErrorToHost(runResult.error);
-    const run = runResult.value;
+    const readRun = runResult.match({
+      ok: (value) => () => value,
+      err: (error) => () => signalDurableWorkflowReadErrorToHost(error),
+    });
+    const run = readRun();
     if (!run || run.completionTarget.kind !== "live_parent") return Result.ok(undefined);
     const signal = this.parents.get(run.completionTarget.parentRequestId);
     if (signal) {
       if (isTerminalRun(run)) {
         const reconciled = await this.reconcileTerminalChildActivity(run, signal);
-        if (reconciled.status === "error") return Result.err(reconciled.error);
+        const reconciliationError = reconciled.match({
+          ok: () => null,
+          err: (error) => error,
+        });
+        if (reconciliationError) return Result.err(reconciliationError);
         this.notify(signal);
         return Result.ok(undefined);
       }
@@ -753,8 +799,12 @@ export class WorkflowLiveParentBridge {
   private resolveChildRequestIds(run: WorkflowRun, target: LiveParentTarget): string[] {
     const requestIds = new Set([target.childRequestId]);
     const operations = this.input.store.listOperations(run.runId, { limit: 1_000 });
-    if (operations.status === "error") signalDurableWorkflowReadErrorToHost(operations.error);
-    for (const operation of operations.value) {
+    const readEntries = operations.match({
+      ok: (value) => () => value,
+      err: (error) => () => signalDurableWorkflowReadErrorToHost(error),
+    });
+    const entries = readEntries();
+    for (const operation of entries) {
       if (operation.kind === "agent" && operation.requestId !== null) {
         requestIds.add(operation.requestId);
       }
@@ -896,12 +946,10 @@ export class WorkflowLiveParentBridge {
           },
         },
       );
-      if (published.status === "error") {
-        this.logger.warn("live-parent subagent progress publish failed", {
-          runId: forwarding.runId,
-          ...formatTaggedErrorForLog(published.error),
-        });
-      }
+      published.match({
+        ok: () => undefined,
+        err: (error) => this.logProgressPublicationFailure(forwarding.runId, error),
+      });
     });
     forwarding.publicationTail = (async () => {
       const [settled] = await Promise.allSettled([publish]);
@@ -911,11 +959,7 @@ export class WorkflowLiveParentBridge {
           settled.reason instanceof Error
             ? settled.reason
             : new Error("Opaque live-parent progress publication failure");
-        this.logger.warn(
-          "live-parent subagent progress publish failed",
-          { runId: forwarding.runId },
-          error,
-        );
+        this.logProgressPublicationFailure(forwarding.runId, error);
       }
     })();
     await forwarding.publicationTail;
@@ -928,16 +972,23 @@ export class WorkflowLiveParentBridge {
       }
     | undefined {
     const operations = this.input.store.listOperations(runId, { limit: 1_000 });
-    if (operations.status === "error") signalDurableWorkflowReadErrorToHost(operations.error);
-    const requestIds = operations.value
+    const readEntries = operations.match({
+      ok: (value) => () => value,
+      err: (error) => () => signalDurableWorkflowReadErrorToHost(error),
+    });
+    const entries = readEntries();
+    const requestIds = entries
       .flatMap((operation) =>
         operation.kind === "agent" && operation.requestId ? [operation.requestId] : [],
       )
       .reverse();
     for (const requestId of requestIds) {
       const policyResult = this.input.store.getWorkflowRequestDispatchPolicy(requestId);
-      if (policyResult.status === "error") signalDurableWorkflowReadErrorToHost(policyResult.error);
-      const policy = policyResult.value;
+      const readPolicy = policyResult.match({
+        ok: (value) => () => value,
+        err: (error) => () => signalDurableWorkflowReadErrorToHost(error),
+      });
+      const policy = readPolicy();
       if (!policy) continue;
       const reasoning = policy.resolvedModelRequest.reasoning;
       return {
@@ -983,8 +1034,15 @@ export class WorkflowLiveParentBridge {
       for (const childRequestId of this.resolveChildRequestIds(run, target)) {
         const topic = outReqTopic(childRequestId);
         const watermarkResult = await this.input.bus.getTopicWatermark(topic);
-        if (watermarkResult.status === "error") return Result.err(watermarkResult.error);
-        const watermark = watermarkResult.value;
+        const watermarkOutcome = watermarkResult.match<
+          | { readonly kind: "ok"; readonly watermark: string | null }
+          | { readonly kind: "error"; readonly error: WorkflowLiveParentTopicError }
+        >({
+          ok: (watermark) => ({ kind: "ok", watermark }),
+          err: (error) => ({ kind: "error", error }),
+        });
+        if (watermarkOutcome.kind === "error") return Result.err(watermarkOutcome.error);
+        const { watermark } = watermarkOutcome;
         if (!watermark) continue;
         let cursor: string | undefined;
         let reachedWatermark = false;
@@ -1037,12 +1095,14 @@ export class WorkflowLiveParentBridge {
       await Promise.all(
         [...forwarding.subscriptions.values()].map(async (subscription) => {
           const stopped = await subscription.stop();
-          if (stopped.status === "error") {
-            this.logger.warn("live-parent child activity subscription stop failed", {
-              runId: forwarding.runId,
-              ...formatTaggedErrorForLog(stopped.error),
-            });
-          }
+          stopped.match({
+            ok: () => undefined,
+            err: (error) =>
+              this.logger.warn("live-parent child activity subscription stop failed", {
+                runId: forwarding.runId,
+                ...formatTaggedErrorForLog(error),
+              }),
+          });
         }),
       );
       await forwarding.publicationTail;
@@ -1064,15 +1124,19 @@ export class WorkflowLiveParentBridge {
       | { readonly scope: "child"; readonly runId: string; readonly childRequestId: string },
   ): void {
     void subscription.done.then((done) => {
-      if (done.status === "ok") return;
-      switch (done.error._tag) {
-        case "EventDeliveryTransportFailed":
-        case "EventDeliveryStopped":
-          this.logger.warn("live-parent event subscription ended", {
-            ...context,
-            ...formatTaggedErrorForLog(done.error),
-          });
-      }
+      done.match({
+        ok: () => undefined,
+        err: (error) => {
+          switch (error._tag) {
+            case "EventDeliveryTransportFailed":
+            case "EventDeliveryStopped":
+              this.logger.warn("live-parent event subscription ended", {
+                ...context,
+                ...formatTaggedErrorForLog(error),
+              });
+          }
+        },
+      });
     });
   }
 
@@ -1101,12 +1165,14 @@ export class WorkflowLiveParentBridge {
         transition.previousState,
         transition.run.terminalDetail ?? "Orphaned subagent",
       );
-      if (published.status === "error") {
-        this.logger.warn("orphaned workflow cancellation event publication failed", {
-          runId: transition.run.runId,
-          ...formatTaggedErrorForLog(published.error),
-        });
-      }
+      published.match({
+        ok: () => undefined,
+        err: (error) =>
+          this.logger.warn("orphaned workflow cancellation event publication failed", {
+            runId: transition.run.runId,
+            ...formatTaggedErrorForLog(error),
+          }),
+      });
     }
     if (orphaned.length > 0) {
       this.logger.warn("orphaned live-parent subagent workflows", {
@@ -1124,7 +1190,7 @@ export class WorkflowLiveParentBridge {
     });
     if (cancelled?.state !== "cancelled") return;
     const published = await this.publishRunCancelled(cancelled, run.state, detail);
-    if (published.status === "error") throw published.error;
+    adaptToolResultToHost(published);
   }
 
   private async publishRunCancelled(
@@ -1132,23 +1198,27 @@ export class WorkflowLiveParentBridge {
     previousState: WorkflowRun["state"],
     detail: string,
   ): Promise<ResultType<void, WorkflowLiveParentPublishError>> {
-    const changed = await this.input.bus.publish(lilacEventTypes.EvtWorkflowRunChanged, {
-      runId: run.runId,
-      revisionId: run.revisionId,
-      state: "cancelled",
-      previousState,
-      detail,
-      ts: this.now(),
-    });
-    if (changed.status === "error") return Result.err(changed.error);
-    const ready = await this.input.bus.publish(lilacEventTypes.EvtWorkflowResultReady, {
-      runId: run.runId,
-      revisionId: run.revisionId,
-      state: "cancelled",
-      summary: detail,
-      ts: this.now(),
-    });
-    if (ready.status === "error") return Result.err(ready.error);
-    return Result.ok(undefined);
+    return Result.gen(async function* (this: WorkflowLiveParentBridge) {
+      yield* Result.await(
+        this.input.bus.publish(lilacEventTypes.EvtWorkflowRunChanged, {
+          runId: run.runId,
+          revisionId: run.revisionId,
+          state: "cancelled",
+          previousState,
+          detail,
+          ts: this.now(),
+        }),
+      );
+      yield* Result.await(
+        this.input.bus.publish(lilacEventTypes.EvtWorkflowResultReady, {
+          runId: run.runId,
+          revisionId: run.revisionId,
+          state: "cancelled",
+          summary: detail,
+          ts: this.now(),
+        }),
+      );
+      return Result.ok(undefined);
+    }, this);
   }
 }

@@ -24,11 +24,12 @@ export function shouldSuppressRouterForWorkflowReply(input: {
     };
   }
   const matchKey = workflowReplyMatchKey(input.event.platform, input.event.channelId);
-  const waits = input.store.listActiveWaitsByMatchKey("reply", matchKey);
-  if (waits.status === "error") signalDurableWorkflowReadErrorToHost(waits.error);
-  const wait = waits.value.find(
-    (candidate) => matchWorkflowReplyWait(candidate, input.event) !== null,
-  );
+  const readWaits = input.store.listActiveWaitsByMatchKey("reply", matchKey).match({
+    ok: (value) => () => value,
+    err: (error) => () => signalDurableWorkflowReadErrorToHost(error),
+  });
+  const waits = readWaits();
+  const wait = waits.find((candidate) => matchWorkflowReplyWait(candidate, input.event) !== null);
   return wait
     ? { suppress: true, reason: `workflow:${wait.runId}:${wait.operationId}:pending` }
     : { suppress: false };

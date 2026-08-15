@@ -165,13 +165,16 @@ function captureWorkflowRead<T>(
     try: read,
     catch: projectRuntimeError("Opaque durable workflow read failure"),
   });
-  if (captured.status === "error") {
-    const cause = preserveToolPanic(captured.error);
-    const failure = classifyWorkflowSqliteDriverFailure(operation, cause);
-    if (failure === undefined) return adaptToolResultToHost(Result.err(cause));
-    return Result.err(failure);
-  }
-  return captured.value;
+  const finishRead = captured.match<() => ResultType<T, DurableWorkflowReadError>>({
+    ok: (value) => () => value,
+    err: (error) => () => {
+      const cause = preserveToolPanic(error);
+      const failure = classifyWorkflowSqliteDriverFailure(operation, cause);
+      if (failure === undefined) return adaptToolResultToHost(Result.err(cause));
+      return Result.err(failure);
+    },
+  });
+  return finishRead();
 }
 
 function adaptWorkflowTransactionResultToStoreHost<T, TError extends Error>(
@@ -363,22 +366,23 @@ export class DurableWorkflowStore {
     decoder: WorkflowRowDecoder<T>,
   ): ResultType<T, PersistedDataError> {
     const decoded = decoder({ row, schemaVersion: WORKFLOW_SCHEMA_VERSION });
-    if (decoded.status === "ok") return Result.ok(decoded.value.value);
-    this.queuePersistenceDiagnostic(decoded.error);
-    return Result.err(decoded.error);
+    return decoded
+      .map((value) => value.value)
+      .mapError((error) => {
+        this.queuePersistenceDiagnostic(error);
+        return error;
+      });
   }
 
   private decodeRows<T>(
     rows: readonly WorkflowPersistedRow[],
     decoder: WorkflowRowDecoder<T>,
   ): ResultType<T[], PersistedDataError> {
-    const values: T[] = [];
-    for (const row of rows) {
-      const decoded = this.decodeRow(row, decoder);
-      if (decoded.status === "error") return Result.err(decoded.error);
-      values.push(decoded.value);
-    }
-    return Result.ok(values);
+    return Result.gen(function* (this: DurableWorkflowStore) {
+      const values: T[] = [];
+      for (const row of rows) values.push(yield* this.decodeRow(row, decoder));
+      return Result.ok(values);
+    }, this);
   }
 
   private quarantineAndPauseLegacyResolvedReceipts(now: number): void {
@@ -707,90 +711,142 @@ export class DurableWorkflowStore {
     return runBunSqliteTransaction(
       this.db,
       (): ResultType<CreateWorkflowInvocationResult, CreateWorkflowInvocationError> => {
-        if (input.idempotency) {
-          const receipt = this.db
-            .query<{ run_id: string; fingerprint_sha256: string }, [string]>(
-              "SELECT run_id, fingerprint_sha256 FROM workflow_invocation_receipts WHERE idempotency_key = ?",
-            )
-            .get(input.idempotency.key);
-          if (receipt) {
-            if (receipt.fingerprint_sha256 !== input.idempotency.fingerprintSha256) {
+        const acceptNewInvocation = (): ResultType<
+          CreateWorkflowInvocationResult,
+          CreateWorkflowInvocationError
+        > => {
+          const activeRuns = this.countActiveRuns();
+          if (activeRuns >= maxActiveRuns) {
+            return Result.ok<CreateWorkflowInvocationResult>({
+              status: "rejected_capacity",
+              activeRuns,
+              limit: maxActiveRuns,
+            });
+          }
+          const revisionCreated = this.createRevision(revision);
+          const storedRevisionRow = this.persistedRows(
+            `SELECT * FROM workflow_revisions WHERE
+              canonical_project_id = ? AND canonical_workspace_root = ? AND scope = ? AND
+              normalized_path = ? AND source_sha256 = ? AND input_schema_sha256 = ? AND
+              capability_sha256 = ? AND runtime_version = ?`,
+          ).get(...revisionIdentityValues(revision));
+          if (storedRevisionRow === null) {
+            return Result.err(
+              new WorkflowInvocationConflict({
+                recordId: revision.revisionId,
+                message: "Workflow revision was not persisted",
+              }),
+            );
+          }
+          const continueWithRevision = this.decodeRow(
+            storedRevisionRow,
+            decodeWorkflowRevisionRow,
+          ).match<() => ResultType<CreateWorkflowInvocationResult, CreateWorkflowInvocationError>>({
+            err: (error) => () => Result.err(error),
+            ok: (storedRevision) => () => {
+              if (storedRevision.revisionId !== revision.revisionId) {
+                return Result.err(
+                  new WorkflowInvocationConflict({
+                    recordId: revision.revisionId,
+                    message: "Workflow revision identity already belongs to another revision",
+                  }),
+                );
+              }
+              const run = requestedRun;
+              if (!this.createRun(run)) {
+                return Result.err(
+                  new WorkflowInvocationConflict({
+                    recordId: run.runId,
+                    message: "Workflow run already exists",
+                  }),
+                );
+              }
+              if (input.idempotency) {
+                this.db.run(
+                  `INSERT INTO workflow_invocation_receipts (
+             idempotency_key, run_id, fingerprint_sha256, created_at
+           ) VALUES (?, ?, ?, ?)`,
+                  [
+                    input.idempotency.key,
+                    run.runId,
+                    input.idempotency.fingerprintSha256,
+                    run.createdAt,
+                  ],
+                );
+              }
+              return Result.ok<CreateWorkflowInvocationResult>({
+                status: "accepted",
+                revision: storedRevision,
+                run,
+                revisionCreated,
+              });
+            },
+          });
+          return continueWithRevision();
+        };
+
+        if (!input.idempotency) return acceptNewInvocation();
+        const idempotency = input.idempotency;
+        const receipt = this.db
+          .query<{ run_id: string; fingerprint_sha256: string }, [string]>(
+            "SELECT run_id, fingerprint_sha256 FROM workflow_invocation_receipts WHERE idempotency_key = ?",
+          )
+          .get(idempotency.key);
+        if (!receipt) return acceptNewInvocation();
+        if (receipt.fingerprint_sha256 !== idempotency.fingerprintSha256) {
+          return Result.err(
+            new WorkflowInvocationConflict({
+              recordId: idempotency.key,
+              message: "Workflow idempotency key was reused with different invocation input",
+            }),
+          );
+        }
+        const existingRunRow = this.persistedRows(
+          "SELECT * FROM workflow_runs WHERE run_id = ?",
+        ).get(receipt.run_id);
+        if (existingRunRow === null) {
+          return Result.err(
+            new WorkflowInvocationConflict({
+              recordId: idempotency.key,
+              message: "Workflow invocation receipt references missing durable records",
+            }),
+          );
+        }
+        const continueWithRun = this.decodeRow(existingRunRow, decodeWorkflowRunRow).match<
+          () => ResultType<CreateWorkflowInvocationResult, CreateWorkflowInvocationError>
+        >({
+          err: (error) => () => Result.err(error),
+          ok: (existingRun) => () => {
+            const existingRevisionRow = this.persistedRows(
+              "SELECT * FROM workflow_revisions WHERE revision_id = ?",
+            ).get(existingRun.revisionId);
+            if (existingRevisionRow === null) {
               return Result.err(
                 new WorkflowInvocationConflict({
-                  recordId: input.idempotency.key,
-                  message: "Workflow idempotency key was reused with different invocation input",
-                }),
-              );
-            }
-            const existingRunResult = this.getRun(receipt.run_id);
-            if (existingRunResult.status === "error") return Result.err(existingRunResult.error);
-            const existingRun = existingRunResult.value;
-            const existingRevisionResult = existingRun
-              ? this.getRevision(existingRun.revisionId)
-              : Result.ok(null);
-            if (existingRevisionResult.status === "error") {
-              return Result.err(existingRevisionResult.error);
-            }
-            const existingRevision = existingRevisionResult.value;
-            if (!existingRun || !existingRevision) {
-              return Result.err(
-                new WorkflowInvocationConflict({
-                  recordId: input.idempotency.key,
+                  recordId: idempotency.key,
                   message: "Workflow invocation receipt references missing durable records",
                 }),
               );
             }
-            return Result.ok({
-              status: "accepted",
-              run: existingRun,
-              revision: existingRevision,
-              revisionCreated: false,
+            const continueWithExistingRevision = this.decodeRow(
+              existingRevisionRow,
+              decodeWorkflowRevisionRow,
+            ).match<
+              () => ResultType<CreateWorkflowInvocationResult, CreateWorkflowInvocationError>
+            >({
+              err: (error) => () => Result.err(error),
+              ok: (existingRevision) => () =>
+                Result.ok<CreateWorkflowInvocationResult>({
+                  status: "accepted",
+                  run: existingRun,
+                  revision: existingRevision,
+                  revisionCreated: false,
+                }),
             });
-          }
-        }
-        const activeRuns = this.countActiveRuns();
-        if (activeRuns >= maxActiveRuns) {
-          return Result.ok({ status: "rejected_capacity", activeRuns, limit: maxActiveRuns });
-        }
-        const revisionCreated = this.createRevision(revision);
-        const storedRevisionResult = this.findRevisionByIdentity(revision);
-        if (storedRevisionResult.status === "error") return Result.err(storedRevisionResult.error);
-        const storedRevision = storedRevisionResult.value;
-        if (!storedRevision) {
-          return Result.err(
-            new WorkflowInvocationConflict({
-              recordId: revision.revisionId,
-              message: "Workflow revision was not persisted",
-            }),
-          );
-        }
-        if (storedRevision.revisionId !== revision.revisionId) {
-          return Result.err(
-            new WorkflowInvocationConflict({
-              recordId: revision.revisionId,
-              message: "Workflow revision identity already belongs to another revision",
-            }),
-          );
-        }
-
-        const run = requestedRun;
-        if (!this.createRun(run)) {
-          return Result.err(
-            new WorkflowInvocationConflict({
-              recordId: run.runId,
-              message: "Workflow run already exists",
-            }),
-          );
-        }
-        if (input.idempotency) {
-          this.db.run(
-            `INSERT INTO workflow_invocation_receipts (
-             idempotency_key, run_id, fingerprint_sha256, created_at
-           ) VALUES (?, ?, ?, ?)`,
-            [input.idempotency.key, run.runId, input.idempotency.fingerprintSha256, run.createdAt],
-          );
-        }
-        return Result.ok({ status: "accepted", revision: storedRevision, run, revisionCreated });
+            return continueWithExistingRevision();
+          },
+        });
+        return continueWithRun();
       },
       (cause) => classifyWorkflowSqliteDriverFailure("create-invocation", cause),
     );
@@ -894,27 +950,32 @@ export class DurableWorkflowStore {
            WHERE workflow_completion_deliveries.state = 'pending'
            ORDER BY workflow_runs.created_at, workflow_runs.run_id`,
       ).all();
-      const pendingRunsResult = this.decodeRows(pendingRows, decodeWorkflowRunRow);
-      if (pendingRunsResult.status === "error") return Result.err(pendingRunsResult.error);
-      const pendingRuns = pendingRunsResult.value;
-      const resolvableRequestIds = new Set(input.resolvableParentRequestIds);
-      const retainedRunIds = new Set<string>();
+      const continueWithPendingRuns = this.decodeRows(pendingRows, decodeWorkflowRunRow).match<
+        () => ResultType<
+          OrphanedLiveParentRun[],
+          DurableWorkflowReadError | DurableWorkflowInvariantViolation
+        >
+      >({
+        err: (error) => () => Result.err(error),
+        ok: (pendingRuns) => () => {
+          const resolvableRequestIds = new Set(input.resolvableParentRequestIds);
+          const retainedRunIds = new Set<string>();
 
-      const durableRootRequestRows = this.db
-        .query<{ request_id: string }, []>(
-          `SELECT workflow_operations.request_id FROM workflow_operations
+          const durableRootRequestRows = this.db
+            .query<{ request_id: string }, []>(
+              `SELECT workflow_operations.request_id FROM workflow_operations
            JOIN workflow_runs ON workflow_runs.run_id = workflow_operations.run_id
            WHERE workflow_operations.kind = 'agent'
              AND workflow_operations.request_id IS NOT NULL
              AND workflow_operations.state NOT IN ('succeeded', 'failed', 'cancelled', 'timed_out')
              AND workflow_runs.state NOT IN ('succeeded', 'failed', 'cancelled')
              AND json_extract(workflow_runs.completion_target_json, '$.kind') <> 'live_parent'`,
-        )
-        .all();
-      for (const row of durableRootRequestRows) resolvableRequestIds.add(row.request_id);
-      const liveParentRequestRows = this.db
-        .query<{ run_id: string; request_id: string }, []>(
-          `SELECT workflow_operations.run_id, workflow_operations.request_id
+            )
+            .all();
+          for (const row of durableRootRequestRows) resolvableRequestIds.add(row.request_id);
+          const liveParentRequestRows = this.db
+            .query<{ run_id: string; request_id: string }, []>(
+              `SELECT workflow_operations.run_id, workflow_operations.request_id
            FROM workflow_operations
            JOIN workflow_completion_deliveries
              ON workflow_completion_deliveries.run_id = workflow_operations.run_id
@@ -922,86 +983,97 @@ export class DurableWorkflowStore {
              AND workflow_operations.kind = 'agent'
              AND workflow_operations.request_id IS NOT NULL
              AND workflow_operations.state NOT IN ('succeeded', 'failed', 'cancelled', 'timed_out')`,
-        )
-        .all();
-      const activeRequestIdsByRun = new Map<string, string[]>();
-      for (const row of liveParentRequestRows) {
-        const requestIds = activeRequestIdsByRun.get(row.run_id) ?? [];
-        requestIds.push(row.request_id);
-        activeRequestIdsByRun.set(row.run_id, requestIds);
-      }
-
-      let changed = true;
-      while (changed) {
-        changed = false;
-        for (const run of pendingRuns) {
-          if (
-            retainedRunIds.has(run.runId) ||
-            run.completionTarget.kind !== "live_parent" ||
-            !resolvableRequestIds.has(run.completionTarget.parentRequestId)
-          ) {
-            continue;
+            )
+            .all();
+          const activeRequestIdsByRun = new Map<string, string[]>();
+          for (const row of liveParentRequestRows) {
+            const requestIds = activeRequestIdsByRun.get(row.run_id) ?? [];
+            requestIds.push(row.request_id);
+            activeRequestIdsByRun.set(row.run_id, requestIds);
           }
-          retainedRunIds.add(run.runId);
-          changed = true;
-          if (["succeeded", "failed", "cancelled"].includes(run.state)) continue;
-          for (const requestId of activeRequestIdsByRun.get(run.runId) ?? []) {
-            resolvableRequestIds.add(requestId);
-          }
-        }
-      }
 
-      const orphaned: OrphanedLiveParentRun[] = [];
-      for (const run of pendingRuns) {
-        if (retainedRunIds.has(run.runId)) continue;
-        const terminal = ["succeeded", "failed", "cancelled"].includes(run.state);
-        if (!terminal) {
-          this.db.run(
-            `UPDATE workflow_operations SET state = 'cancelled', error = ?, terminal_at = ?,
+          let changed = true;
+          while (changed) {
+            changed = false;
+            for (const run of pendingRuns) {
+              if (
+                retainedRunIds.has(run.runId) ||
+                run.completionTarget.kind !== "live_parent" ||
+                !resolvableRequestIds.has(run.completionTarget.parentRequestId)
+              ) {
+                continue;
+              }
+              retainedRunIds.add(run.runId);
+              changed = true;
+              if (["succeeded", "failed", "cancelled"].includes(run.state)) continue;
+              for (const requestId of activeRequestIdsByRun.get(run.runId) ?? []) {
+                resolvableRequestIds.add(requestId);
+              }
+            }
+          }
+
+          const orphaned: OrphanedLiveParentRun[] = [];
+          for (const run of pendingRuns) {
+            if (retainedRunIds.has(run.runId)) continue;
+            const terminal = ["succeeded", "failed", "cancelled"].includes(run.state);
+            if (!terminal) {
+              this.db.run(
+                `UPDATE workflow_operations SET state = 'cancelled', error = ?, terminal_at = ?,
              claimed_by = NULL, claimed_at = NULL, updated_at = ?
              WHERE run_id = ? AND state IN ('queued', 'dispatched', 'running', 'blocked')`,
-            [input.detail, input.now, input.now, run.runId],
-          );
-          this.db.run(
-            `UPDATE workflow_waits SET state = 'cancelled', claimed_by = NULL, claimed_at = NULL,
+                [input.detail, input.now, input.now, run.runId],
+              );
+              this.db.run(
+                `UPDATE workflow_waits SET state = 'cancelled', claimed_by = NULL, claimed_at = NULL,
              resolved_at = ?, updated_at = ?
              WHERE run_id = ? AND state IN ('pending', 'claimed')`,
-            [input.now, input.now, run.runId],
-          );
-          this.db.run(
-            `UPDATE workflow_request_dispatches SET active = 0, owner_id = NULL,
+                [input.now, input.now, run.runId],
+              );
+              this.db.run(
+                `UPDATE workflow_request_dispatches SET active = 0, owner_id = NULL,
              owner_heartbeat_at = NULL, updated_at = ?
              WHERE run_id = ? AND active = 1`,
-            [input.now, run.runId],
-          );
-          this.db.run(
-            `UPDATE workflow_runs SET state = 'cancelled', terminal_detail = ?, terminal_at = ?,
+                [input.now, run.runId],
+              );
+              this.db.run(
+                `UPDATE workflow_runs SET state = 'cancelled', terminal_detail = ?, terminal_at = ?,
              claimed_by = NULL, claimed_at = NULL, updated_at = ?
              WHERE run_id = ? AND state = ?`,
-            [input.detail, input.now, input.now, run.runId, run.state],
-          );
-        }
-        const delivery = this.db
-          .query(
-            `UPDATE workflow_completion_deliveries
+                [input.detail, input.now, input.now, run.runId, run.state],
+              );
+            }
+            const delivery = this.db
+              .query(
+                `UPDATE workflow_completion_deliveries
              SET state = 'orphaned', delivered_at = ?, updated_at = ?
              WHERE run_id = ? AND state = 'pending'`,
-          )
-          .run(input.now, input.now, run.runId);
-        if (delivery.changes !== 1) continue;
-        const updatedResult = this.getRun(run.runId);
-        if (updatedResult.status === "error") return Result.err(updatedResult.error);
-        const updated = updatedResult.value;
-        if (!updated) {
-          return Result.err(
-            new DurableWorkflowInvariantViolation({
-              message: `Orphaned workflow run disappeared: ${run.runId}`,
-            }),
-          );
-        }
-        orphaned.push({ run: updated, previousState: run.state, cancelled: !terminal });
-      }
-      return Result.ok(orphaned);
+              )
+              .run(input.now, input.now, run.runId);
+            if (delivery.changes !== 1) continue;
+            const updatedRow = this.persistedRows(
+              "SELECT * FROM workflow_runs WHERE run_id = ?",
+            ).get(run.runId);
+            if (updatedRow === null) {
+              return Result.err(
+                new DurableWorkflowInvariantViolation({
+                  message: `Orphaned workflow run disappeared: ${run.runId}`,
+                }),
+              );
+            }
+            const updatedResult = this.decodeRow(updatedRow, decodeWorkflowRunRow);
+            const updateError = updatedResult.match({
+              err: (error) => error,
+              ok: (updated) => {
+                orphaned.push({ run: updated, previousState: run.state, cancelled: !terminal });
+                return null;
+              },
+            });
+            if (updateError) return Result.err(updateError);
+          }
+          return Result.ok(orphaned);
+        },
+      });
+      return continueWithPendingRuns();
     });
   }
 
@@ -1071,18 +1143,17 @@ export class DurableWorkflowStore {
     if (!canTransitionWorkflowRun(input.from, input.to)) {
       return false;
     }
-    const currentResult = this.getRun(input.runId);
-    if (currentResult.status === "error") signalDurableWorkflowReadErrorToHost(currentResult.error);
-    const current = currentResult.value;
+    const current = adaptToolResultToHost(this.getRun(input.runId));
     if (!current) return false;
     if (current.state === input.to) return true;
     if (current.state !== input.from) return false;
     if (input.from === "paused" && input.to === "queued") {
       return runWorkflowTransactionForStoreHost(this.db, "resume-run", () => {
-        const pausedResult = this.getRun(input.runId);
-        if (pausedResult.status === "error")
-          signalDurableWorkflowReadErrorToHost(pausedResult.error);
-        const paused = pausedResult.value;
+        const readPaused = this.getRun(input.runId).match({
+          ok: (value) => () => value,
+          err: (error) => () => signalDurableWorkflowReadErrorToHost(error),
+        });
+        const paused = readPaused();
         if (!paused || paused.state !== "paused") return false;
         if (!this.preparePausedOperationsForResume(input.runId, input.now)) return false;
         return (
@@ -1138,9 +1209,11 @@ export class DurableWorkflowStore {
     resultArtifactId: string | null;
   }): boolean {
     return runWorkflowTransactionForStoreHost(this.db, "terminalize-run", () => {
-      const runResult = this.getRun(input.runId);
-      if (runResult.status === "error") signalDurableWorkflowReadErrorToHost(runResult.error);
-      const run = runResult.value;
+      const readRun = this.getRun(input.runId).match({
+        ok: (value) => () => value,
+        err: (error) => () => signalDurableWorkflowReadErrorToHost(error),
+      });
+      const run = readRun();
       if (!run || run.state !== input.from || run.claimedBy !== input.ownerId) return false;
       const activeCount = this.db
         .query<{ count: number }, [string]>(
@@ -1208,9 +1281,11 @@ export class DurableWorkflowStore {
              AND workflow_runs.state NOT IN ('succeeded', 'failed', 'cancelled')
            ORDER BY workflow_runs.created_at, workflow_runs.run_id`,
       ).all(input.parentRequestId);
-      const runsResult = this.decodeRows(rows, decodeWorkflowRunRow);
-      if (runsResult.status === "error") signalDurableWorkflowReadErrorToHost(runsResult.error);
-      const runs = runsResult.value;
+      const readRuns = this.decodeRows(rows, decodeWorkflowRunRow).match({
+        ok: (value) => () => value,
+        err: (error) => () => signalDurableWorkflowReadErrorToHost(error),
+      });
+      const runs = readRuns();
       const cancelled: OrphanedLiveParentRun[] = [];
       for (const run of runs) {
         const updated = this.cancelRunAndChildrenInTransaction({
@@ -1237,9 +1312,11 @@ export class DurableWorkflowStore {
     now: number;
     detail: string;
   }): WorkflowRun | null {
-    const runResult = this.getRun(input.runId);
-    if (runResult.status === "error") signalDurableWorkflowReadErrorToHost(runResult.error);
-    const run = runResult.value;
+    const readRun = this.getRun(input.runId).match({
+      ok: (value) => () => value,
+      err: (error) => () => signalDurableWorkflowReadErrorToHost(error),
+    });
+    const run = readRun();
     if (!run || ["succeeded", "failed", "cancelled"].includes(run.state)) return run;
     this.db.run(
       `UPDATE workflow_operations SET state = 'cancelled', error = ?, terminal_at = ?,
@@ -1266,16 +1343,20 @@ export class DurableWorkflowStore {
       )
       .run(input.detail, input.now, input.now, input.runId, run.state);
     if (changed.changes !== 1) return null;
-    const updated = this.getRun(input.runId);
-    if (updated.status === "error") signalDurableWorkflowReadErrorToHost(updated.error);
-    return updated.value;
+    const readUpdatedRun = this.getRun(input.runId).match({
+      ok: (value) => () => value,
+      err: (error) => () => signalDurableWorkflowReadErrorToHost(error),
+    });
+    return readUpdatedRun();
   }
 
   pauseRunAndChildren(input: { runId: string; now: number; detail: string }): WorkflowRun | null {
     return runWorkflowTransactionForStoreHost(this.db, "pause-run-and-children", () => {
-      const runResult = this.getRun(input.runId);
-      if (runResult.status === "error") signalDurableWorkflowReadErrorToHost(runResult.error);
-      const run = runResult.value;
+      const readRun = this.getRun(input.runId).match({
+        ok: (value) => () => value,
+        err: (error) => () => signalDurableWorkflowReadErrorToHost(error),
+      });
+      const run = readRun();
       if (!run || !["queued", "running", "blocked"].includes(run.state)) return run;
       this.prepareOperationsForPause(input.runId, input.now, input.detail);
       const changed = this.db
@@ -1285,9 +1366,11 @@ export class DurableWorkflowStore {
         )
         .run(input.detail, input.now, input.runId, run.state);
       if (changed.changes !== 1) return null;
-      const updated = this.getRun(input.runId);
-      if (updated.status === "error") signalDurableWorkflowReadErrorToHost(updated.error);
-      return updated.value;
+      const readUpdatedRun = this.getRun(input.runId).match({
+        ok: (value) => () => value,
+        err: (error) => () => signalDurableWorkflowReadErrorToHost(error),
+      });
+      return readUpdatedRun();
     });
   }
 
@@ -1526,9 +1609,11 @@ export class DurableWorkflowStore {
       )
       .run(input.claimerId, input.now, input.now, input.now, input.runId, staleBefore);
     if (result.changes !== 1) return null;
-    const claimed = this.getRun(input.runId);
-    if (claimed.status === "error") signalDurableWorkflowReadErrorToHost(claimed.error);
-    return claimed.value;
+    const readRun = this.getRun(input.runId).match({
+      ok: (value) => () => value,
+      err: (error) => () => signalDurableWorkflowReadErrorToHost(error),
+    });
+    return readRun();
   }
 
   refreshRunClaim(runId: string, claimerId: string, now: number): boolean {
@@ -1685,13 +1770,16 @@ export class DurableWorkflowStore {
         )
         .get(input.requestId, input.runId, input.operationId, policy.dispatchEpoch);
       if (terminalReceipt) return null;
-      const runResult = this.getRun(input.runId);
-      if (runResult.status === "error") signalDurableWorkflowReadErrorToHost(runResult.error);
-      const operationResult = this.getOperation(input.runId, input.operationId);
-      if (operationResult.status === "error")
-        signalDurableWorkflowReadErrorToHost(operationResult.error);
-      const run = runResult.value;
-      const operation = operationResult.value;
+      const readRun = this.getRun(input.runId).match({
+        ok: (value) => () => value,
+        err: (error) => () => signalDurableWorkflowReadErrorToHost(error),
+      });
+      const run = readRun();
+      const readOperation = this.getOperation(input.runId, input.operationId).match({
+        ok: (value) => () => value,
+        err: (error) => () => signalDurableWorkflowReadErrorToHost(error),
+      });
+      const operation = readOperation();
       if (
         !run ||
         !operation ||
@@ -1709,13 +1797,15 @@ export class DurableWorkflowStore {
       const existingRow = this.persistedRows(
         "SELECT * FROM workflow_request_dispatches WHERE request_id = ?",
       ).get(input.requestId);
-      const existingResult =
+      const existingResult: ResultType<DecodedWorkflowRequestDispatch | null, PersistedDataError> =
         existingRow === null
           ? Result.ok(null)
           : this.decodeRow(existingRow, decodeWorkflowRequestDispatchRow);
-      if (existingResult.status === "error")
-        signalDurableWorkflowReadErrorToHost(existingResult.error);
-      const existing = existingResult.value;
+      const readExisting = existingResult.match({
+        ok: (value) => () => value,
+        err: (error) => () => signalDurableWorkflowReadErrorToHost(error),
+      });
+      const existing = readExisting();
       if (
         existing &&
         existing.active &&
@@ -1766,10 +1856,11 @@ export class DurableWorkflowStore {
           input.now,
         ],
       );
-      const updatedOperation = this.getOperation(input.runId, input.operationId);
-      if (updatedOperation.status === "error")
-        signalDurableWorkflowReadErrorToHost(updatedOperation.error);
-      return updatedOperation.value;
+      const readUpdatedOperation = this.getOperation(input.runId, input.operationId).match({
+        ok: (value) => () => value,
+        err: (error) => () => signalDurableWorkflowReadErrorToHost(error),
+      });
+      return readUpdatedOperation();
     });
   }
 
@@ -1796,18 +1887,23 @@ export class DurableWorkflowStore {
             )`,
         ).get(input.requestId, input.sessionId, input.platform);
         if (!raw) return null;
-        const rowResult = this.decodeRow(raw, decodeWorkflowRequestDispatchRow);
-        if (rowResult.status === "error") signalDurableWorkflowReadErrorToHost(rowResult.error);
-        const row = rowResult.value;
-        const runResult = this.getRun(row.runId);
-        if (runResult.status === "error") signalDurableWorkflowReadErrorToHost(runResult.error);
-        const run = runResult.value;
+        const readRow = this.decodeRow(raw, decodeWorkflowRequestDispatchRow).match({
+          ok: (value) => () => value,
+          err: (error) => () => signalDurableWorkflowReadErrorToHost(error),
+        });
+        const row = readRow();
+        const readRun = this.getRun(row.runId).match({
+          ok: (value) => () => value,
+          err: (error) => () => signalDurableWorkflowReadErrorToHost(error),
+        });
+        const run = readRun();
         if (!run) return null;
         const policy = row.policy;
-        const operationResult = this.getOperation(row.runId, row.operationId);
-        if (operationResult.status === "error")
-          signalDurableWorkflowReadErrorToHost(operationResult.error);
-        const operation = operationResult.value;
+        const readOperation = this.getOperation(row.runId, row.operationId).match({
+          ok: (value) => () => value,
+          err: (error) => () => signalDurableWorkflowReadErrorToHost(error),
+        });
+        const operation = readOperation();
         if (
           !operation ||
           run.state !== "running" ||
@@ -1934,9 +2030,7 @@ export class DurableWorkflowStore {
         "SELECT * FROM workflow_request_dispatches WHERE request_id = ?",
       ).get(requestId);
       if (!row) return Result.ok(null);
-      const decoded = this.decodeRow(row, decodeWorkflowRequestDispatchRow);
-      if (decoded.status === "error") return Result.err(decoded.error);
-      return Result.ok(decoded.value.policy);
+      return this.decodeRow(row, decodeWorkflowRequestDispatchRow).map((value) => value.policy);
     });
   }
 
@@ -1949,59 +2043,109 @@ export class DurableWorkflowStore {
       WorkflowRequestDispatchHandoff,
       DurableWorkflowReadError | DurableWorkflowInvariantViolation
     >(this.db, "get-workflow-request-dispatch-handoff", () => {
+      const staleBefore = input.now - (input.staleAfterMs ?? 60_000);
+      const continueWithDispatch = (
+        dispatch: DecodedWorkflowRequestDispatch,
+      ): ResultType<
+        WorkflowRequestDispatchHandoff,
+        DurableWorkflowReadError | DurableWorkflowInvariantViolation
+      > => {
+        const policy = dispatch.policy;
+        const runRow = this.persistedRows("SELECT * FROM workflow_runs WHERE run_id = ?").get(
+          dispatch.runId,
+        );
+        const operationRow = this.persistedRows(
+          "SELECT * FROM workflow_operations WHERE run_id = ? AND operation_id = ?",
+        ).get(dispatch.runId, dispatch.operationId);
+        const runResult: ResultType<WorkflowRun | null, PersistedDataError> =
+          runRow === null ? Result.ok(null) : this.decodeRow(runRow, decodeWorkflowRunRow);
+        const continueWithRun = runResult.match<
+          () => ResultType<
+            WorkflowRequestDispatchHandoff,
+            DurableWorkflowReadError | DurableWorkflowInvariantViolation
+          >
+        >({
+          err: (error) => () => Result.err(error),
+          ok: (run) => () => {
+            const operationResult: ResultType<WorkflowOperation | null, PersistedDataError> =
+              operationRow === null
+                ? Result.ok(null)
+                : this.decodeRow(operationRow, decodeWorkflowOperationRow);
+            const continueWithOperation = operationResult.match<
+              () => ResultType<
+                WorkflowRequestDispatchHandoff,
+                DurableWorkflowReadError | DurableWorkflowInvariantViolation
+              >
+            >({
+              err: (error) => () => Result.err(error),
+              ok: (operation) => () => {
+                if (
+                  dispatch.dispatchEpoch !== policy.dispatchEpoch ||
+                  run?.state !== "running" ||
+                  !operation ||
+                  !["dispatched", "running"].includes(operation.state) ||
+                  !this.matchesWorkflowRequestPolicyIdentity({ policy, run, operation })
+                ) {
+                  return Result.err(
+                    new DurableWorkflowInvariantViolation({
+                      message: "Live workflow dispatch has an invalid durable policy identity",
+                    }),
+                  );
+                }
+                return Result.ok<WorkflowRequestDispatchHandoff>({
+                  status:
+                    dispatch.ownerId !== null &&
+                    dispatch.ownerHeartbeatAt !== null &&
+                    dispatch.ownerHeartbeatAt > staleBefore
+                      ? "live"
+                      : "stale",
+                  dispatchEpoch: dispatch.dispatchEpoch,
+                  policy,
+                });
+              },
+            });
+            return continueWithOperation();
+          },
+        });
+        return continueWithRun();
+      };
+
       const receipt = this.persistedRows(
         "SELECT * FROM workflow_request_terminal_receipts WHERE request_id = ?",
       ).get(input.requestId);
       if (receipt !== null) {
-        const decoded = this.decodeRow(receipt, decodeWorkflowRequestTerminalReceiptRow);
-        if (decoded.status === "error") return Result.err(decoded.error);
-        return Result.ok({
-          status: "receipt",
-          receipt: decoded.value,
+        const continueWithReceipt = this.decodeRow(
+          receipt,
+          decodeWorkflowRequestTerminalReceiptRow,
+        ).match<
+          () => ResultType<
+            WorkflowRequestDispatchHandoff,
+            DurableWorkflowReadError | DurableWorkflowInvariantViolation
+          >
+        >({
+          err: (error) => () => Result.err(error),
+          ok: (decoded) => () =>
+            Result.ok<WorkflowRequestDispatchHandoff>({ status: "receipt", receipt: decoded }),
         });
+        return continueWithReceipt();
       }
-      const staleBefore = input.now - (input.staleAfterMs ?? 60_000);
       const dispatchRow = this.persistedRows(
         "SELECT * FROM workflow_request_dispatches WHERE request_id = ? AND active = 1",
       ).get(input.requestId);
-      if (!dispatchRow) return Result.ok({ status: "fresh" });
-      const dispatchResult = this.decodeRow(dispatchRow, decodeWorkflowRequestDispatchRow);
-      if (dispatchResult.status === "error") return Result.err(dispatchResult.error);
-      const dispatch = dispatchResult.value;
-      const policy = dispatch.policy;
-      const runResult = this.getRun(dispatch.runId);
-      if (runResult.status === "error") return Result.err(runResult.error);
-      const operationResult = this.getOperation(dispatch.runId, dispatch.operationId);
-      if (operationResult.status === "error") return Result.err(operationResult.error);
-      const run = runResult.value;
-      const operation = operationResult.value;
-      if (
-        dispatch.dispatchEpoch !== policy.dispatchEpoch ||
-        run?.state !== "running" ||
-        !operation ||
-        !["dispatched", "running"].includes(operation.state) ||
-        !this.matchesWorkflowRequestPolicyIdentity({
-          policy,
-          run,
-          operation,
-        })
-      ) {
-        return Result.err(
-          new DurableWorkflowInvariantViolation({
-            message: "Live workflow dispatch has an invalid durable policy identity",
-          }),
-        );
-      }
-      return Result.ok({
-        status:
-          dispatch.ownerId !== null &&
-          dispatch.ownerHeartbeatAt !== null &&
-          dispatch.ownerHeartbeatAt > staleBefore
-            ? "live"
-            : "stale",
-        dispatchEpoch: dispatch.dispatchEpoch,
-        policy,
+      if (!dispatchRow) return Result.ok<WorkflowRequestDispatchHandoff>({ status: "fresh" });
+      const continueDecodedDispatch = this.decodeRow(
+        dispatchRow,
+        decodeWorkflowRequestDispatchRow,
+      ).match<
+        () => ResultType<
+          WorkflowRequestDispatchHandoff,
+          DurableWorkflowReadError | DurableWorkflowInvariantViolation
+        >
+      >({
+        err: (error) => () => Result.err(error),
+        ok: (dispatch) => () => continueWithDispatch(dispatch),
       });
+      return continueDecodedDispatch();
     });
   }
 
@@ -2213,9 +2357,7 @@ export class DurableWorkflowStore {
     if (!canTransitionWorkflowOperation(input.from, input.to)) {
       return false;
     }
-    const currentResult = this.getOperation(input.runId, input.operationId);
-    if (currentResult.status === "error") signalDurableWorkflowReadErrorToHost(currentResult.error);
-    const current = currentResult.value;
+    const current = adaptToolResultToHost(this.getOperation(input.runId, input.operationId));
     if (!current) return false;
     if (current.state === input.to) return true;
     if (current.state !== input.from) return false;
@@ -2286,10 +2428,11 @@ export class DurableWorkflowStore {
       this.db,
       "terminalize-operation-and-expire-request",
       () => {
-        const currentResult = this.getOperation(input.runId, input.operationId);
-        if (currentResult.status === "error")
-          signalDurableWorkflowReadErrorToHost(currentResult.error);
-        const current = currentResult.value;
+        const readCurrent = this.getOperation(input.runId, input.operationId).match({
+          ok: (value) => () => value,
+          err: (error) => () => signalDurableWorkflowReadErrorToHost(error),
+        });
+        const current = readCurrent();
         if (!current || current.state !== input.from) return false;
         const changed = this.transitionOperation(input);
         if (!changed) return false;
@@ -2337,9 +2480,11 @@ export class DurableWorkflowStore {
         input.runOwnerId,
       );
     if (result.changes !== 1) return null;
-    const claimed = this.getOperation(input.runId, input.operationId);
-    if (claimed.status === "error") signalDurableWorkflowReadErrorToHost(claimed.error);
-    return claimed.value;
+    const readOperation = this.getOperation(input.runId, input.operationId).match({
+      ok: (value) => () => value,
+      err: (error) => () => signalDurableWorkflowReadErrorToHost(error),
+    });
+    return readOperation();
   }
 
   createWait(waitInput: WorkflowWait, runOwnerId: string): boolean {
@@ -2623,9 +2768,7 @@ export class DurableWorkflowStore {
     if (!canTransitionWorkflowWait(input.from, input.to)) {
       return false;
     }
-    const currentResult = this.getWait(input.runId, input.operationId);
-    if (currentResult.status === "error") signalDurableWorkflowReadErrorToHost(currentResult.error);
-    const current = currentResult.value;
+    const current = adaptToolResultToHost(this.getWait(input.runId, input.operationId));
     if (!current) return false;
     if (current.state === input.to) return true;
     if (current.state !== input.from) return false;
@@ -2677,12 +2820,16 @@ export class DurableWorkflowStore {
     now: number;
   }): WorkflowWait | null {
     return runWorkflowTransactionForStoreHost(this.db, "resolve-reply-wait", () => {
-      const waitResult = this.getWait(input.runId, input.operationId);
-      if (waitResult.status === "error") signalDurableWorkflowReadErrorToHost(waitResult.error);
-      const runResult = this.getRun(input.runId);
-      if (runResult.status === "error") signalDurableWorkflowReadErrorToHost(runResult.error);
-      const wait = waitResult.value;
-      const run = runResult.value;
+      const readWait = this.getWait(input.runId, input.operationId).match({
+        ok: (value) => () => value,
+        err: (error) => () => signalDurableWorkflowReadErrorToHost(error),
+      });
+      const wait = readWait();
+      const readRun = this.getRun(input.runId).match({
+        ok: (value) => () => value,
+        err: (error) => () => signalDurableWorkflowReadErrorToHost(error),
+      });
+      const run = readRun();
       if (
         !wait ||
         wait.match.kind !== "reply" ||
@@ -2721,9 +2868,11 @@ export class DurableWorkflowStore {
         operationId: input.operationId,
         now: input.now,
       });
-      const resolved = this.getWait(input.runId, input.operationId);
-      if (resolved.status === "error") signalDurableWorkflowReadErrorToHost(resolved.error);
-      return resolved.value;
+      const readResolvedWait = this.getWait(input.runId, input.operationId).match({
+        ok: (value) => () => value,
+        err: (error) => () => signalDurableWorkflowReadErrorToHost(error),
+      });
+      return readResolvedWait();
     });
   }
 
@@ -2757,9 +2906,11 @@ export class DurableWorkflowStore {
         input.runOwnerId,
       );
     if (result.changes !== 1) return null;
-    const claimed = this.getWait(input.runId, input.operationId);
-    if (claimed.status === "error") signalDurableWorkflowReadErrorToHost(claimed.error);
-    return claimed.value;
+    const readWait = this.getWait(input.runId, input.operationId).match({
+      ok: (value) => () => value,
+      err: (error) => () => signalDurableWorkflowReadErrorToHost(error),
+    });
+    return readWait();
   }
 
   recordAdapterEventSuppression(input: {
@@ -2867,17 +3018,26 @@ export class DurableWorkflowStore {
             }),
           );
         }
-        const existingResult = this.getTrigger(receipt.trigger_id);
-        if (existingResult.status === "error") return Result.err(existingResult.error);
-        const existing = existingResult.value;
-        if (!existing) {
+        const triggerRow = this.persistedRows(
+          "SELECT * FROM workflow_triggers WHERE trigger_id = ?",
+        ).get(receipt.trigger_id);
+        if (triggerRow === null) {
           return Result.err(
             new DurableWorkflowInvariantViolation({
               message: "Workflow trigger receipt references a missing trigger",
             }),
           );
         }
-        return Result.ok({ trigger: existing, created: false });
+        const continueWithTrigger = this.decodeRow(triggerRow, decodeWorkflowTriggerRow).match<
+          () => ResultType<
+            { trigger: WorkflowTrigger; created: boolean },
+            DurableWorkflowReadError | DurableWorkflowInvariantViolation
+          >
+        >({
+          err: (error) => () => Result.err(error),
+          ok: (existing) => () => Result.ok({ trigger: existing, created: false }),
+        });
+        return continueWithTrigger();
       }
       if (!this.createTrigger(trigger)) {
         return Result.err(
@@ -2981,9 +3141,11 @@ export class DurableWorkflowStore {
     if (!canTransitionWorkflowTrigger(input.from, input.to)) {
       return false;
     }
-    const currentResult = this.getTrigger(input.triggerId);
-    if (currentResult.status === "error") signalDurableWorkflowReadErrorToHost(currentResult.error);
-    const current = currentResult.value;
+    const readCurrent = this.getTrigger(input.triggerId).match({
+      ok: (value) => () => value,
+      err: (error) => () => signalDurableWorkflowReadErrorToHost(error),
+    });
+    const current = readCurrent();
     if (!current) return false;
     if (current.state !== input.from) return false;
     const result = this.db
@@ -3019,9 +3181,11 @@ export class DurableWorkflowStore {
       )
       .run(input.claimerId, input.now, input.now, input.triggerId, input.now, staleBefore);
     if (result.changes !== 1) return null;
-    const claimed = this.getTrigger(input.triggerId);
-    if (claimed.status === "error") signalDurableWorkflowReadErrorToHost(claimed.error);
-    return claimed.value;
+    const readTrigger = this.getTrigger(input.triggerId).match({
+      ok: (value) => () => value,
+      err: (error) => () => signalDurableWorkflowReadErrorToHost(error),
+    });
+    return readTrigger();
   }
 
   fireClaimedTrigger(input: {
@@ -3047,118 +3211,153 @@ export class DurableWorkflowStore {
       | null,
       DurableWorkflowReadError | DurableWorkflowInvariantViolation
     >(this.db, "fire-claimed-trigger", () => {
-      const triggerResult = this.getTrigger(input.triggerId);
-      if (triggerResult.status === "error") return Result.err(triggerResult.error);
-      const trigger = triggerResult.value;
-      if (
-        !trigger ||
-        trigger.state !== "active" ||
-        trigger.claimedBy !== input.claimerId ||
-        trigger.nextFireAt !== input.expectedFireAt ||
-        requestedRun.revisionId !== trigger.revisionId ||
-        requestedRun.state !== "queued" ||
-        requestedRun.origin.client !== trigger.origin.client ||
-        requestedRun.origin.sessionId !== trigger.origin.sessionId ||
-        requestedRun.origin.userId !== trigger.origin.userId ||
-        !sameWorkflowProgressTarget(requestedRun.progressTarget, trigger.progressTarget)
-      ) {
-        return Result.ok(null);
-      }
+      type FireClaimedTriggerResult =
+        | { status: "fired"; trigger: WorkflowTrigger; run: WorkflowRun }
+        | { status: "skipped"; trigger: WorkflowTrigger }
+        | null;
+      const readTriggerInTransaction = (
+        triggerId: string,
+      ): ResultType<WorkflowTrigger | null, PersistedDataError> => {
+        const row = this.persistedRows("SELECT * FROM workflow_triggers WHERE trigger_id = ?").get(
+          triggerId,
+        );
+        return row === null ? Result.ok(null) : this.decodeRow(row, decodeWorkflowTriggerRow);
+      };
+      const triggerResult = readTriggerInTransaction(input.triggerId);
+      const continueWithTrigger = triggerResult.match<
+        () => ResultType<
+          FireClaimedTriggerResult,
+          DurableWorkflowReadError | DurableWorkflowInvariantViolation
+        >
+      >({
+        err: (error) => () => Result.err(error),
+        ok: (trigger) => () => {
+          if (
+            !trigger ||
+            trigger.state !== "active" ||
+            trigger.claimedBy !== input.claimerId ||
+            trigger.nextFireAt !== input.expectedFireAt ||
+            requestedRun.revisionId !== trigger.revisionId ||
+            requestedRun.state !== "queued" ||
+            requestedRun.origin.client !== trigger.origin.client ||
+            requestedRun.origin.sessionId !== trigger.origin.sessionId ||
+            requestedRun.origin.userId !== trigger.origin.userId ||
+            !sameWorkflowProgressTarget(requestedRun.progressTarget, trigger.progressTarget)
+          ) {
+            return Result.ok(null);
+          }
 
-      const activeTriggerRuns = this.countActiveTriggerRuns(trigger.triggerId);
-      const activeRuns = this.countActiveRuns();
-      if (
-        (trigger.schedulingPolicy.overlap === "coalesce" && activeTriggerRuns > 0) ||
-        activeRuns >= maxActiveRuns
-      ) {
-        const retryAt =
-          trigger.definition.kind === "timestamp" && input.nextFireAt === null
-            ? input.expectedFireAt
-            : input.nextFireAt;
-        const lastFireAt =
-          trigger.definition.kind === "timestamp" && input.nextFireAt === null
-            ? trigger.lastFireAt
-            : input.expectedFireAt;
-        const skipped = this.db
-          .query(
-            `UPDATE workflow_triggers SET next_fire_at = ?, last_fire_at = ?,
+          const activeTriggerRuns = this.countActiveTriggerRuns(trigger.triggerId);
+          const activeRuns = this.countActiveRuns();
+          if (
+            (trigger.schedulingPolicy.overlap === "coalesce" && activeTriggerRuns > 0) ||
+            activeRuns >= maxActiveRuns
+          ) {
+            const retryAt =
+              trigger.definition.kind === "timestamp" && input.nextFireAt === null
+                ? input.expectedFireAt
+                : input.nextFireAt;
+            const lastFireAt =
+              trigger.definition.kind === "timestamp" && input.nextFireAt === null
+                ? trigger.lastFireAt
+                : input.expectedFireAt;
+            const skipped = this.db
+              .query(
+                `UPDATE workflow_triggers SET next_fire_at = ?, last_fire_at = ?,
              claimed_by = NULL, claimed_at = NULL, updated_at = ?
              WHERE trigger_id = ? AND claimed_by = ? AND next_fire_at = ?`,
-          )
-          .run(
-            retryAt,
-            lastFireAt,
-            input.now,
-            trigger.triggerId,
-            input.claimerId,
-            input.expectedFireAt,
-          );
-        if (skipped.changes !== 1) {
-          return Result.err(
-            new DurableWorkflowInvariantViolation({
-              message: `Lost workflow trigger claim: ${trigger.triggerId}`,
-            }),
-          );
-        }
-        const storedTriggerResult = this.getTrigger(trigger.triggerId);
-        if (storedTriggerResult.status === "error") return Result.err(storedTriggerResult.error);
-        const storedTrigger = storedTriggerResult.value;
-        if (!storedTrigger) {
-          return Result.err(
-            new DurableWorkflowInvariantViolation({
-              message: `Workflow trigger disappeared: ${trigger.triggerId}`,
-            }),
-          );
-        }
-        return Result.ok({ status: "skipped", trigger: storedTrigger });
-      }
+              )
+              .run(
+                retryAt,
+                lastFireAt,
+                input.now,
+                trigger.triggerId,
+                input.claimerId,
+                input.expectedFireAt,
+              );
+            if (skipped.changes !== 1) {
+              return Result.err(
+                new DurableWorkflowInvariantViolation({
+                  message: `Lost workflow trigger claim: ${trigger.triggerId}`,
+                }),
+              );
+            }
+            const storedTrigger = readTriggerInTransaction(trigger.triggerId);
+            const finishSkipped = storedTrigger.match<
+              () => ResultType<
+                FireClaimedTriggerResult,
+                DurableWorkflowReadError | DurableWorkflowInvariantViolation
+              >
+            >({
+              err: (error) => () => Result.err(error),
+              ok: (stored) => () =>
+                stored
+                  ? Result.ok<FireClaimedTriggerResult>({ status: "skipped", trigger: stored })
+                  : Result.err(
+                      new DurableWorkflowInvariantViolation({
+                        message: `Workflow trigger disappeared: ${trigger.triggerId}`,
+                      }),
+                    ),
+            });
+            return finishSkipped();
+          }
 
-      const run = requestedRun;
-      if (!this.createRun(run)) {
-        return Result.err(
-          new DurableWorkflowInvariantViolation({
-            message: `Scheduled workflow run already exists: ${run.runId}`,
-          }),
-        );
-      }
-      this.db.run(
-        `INSERT INTO workflow_trigger_runs (trigger_id, run_id, created_at)
+          const run = requestedRun;
+          if (!this.createRun(run)) {
+            return Result.err(
+              new DurableWorkflowInvariantViolation({
+                message: `Scheduled workflow run already exists: ${run.runId}`,
+              }),
+            );
+          }
+          this.db.run(
+            `INSERT INTO workflow_trigger_runs (trigger_id, run_id, created_at)
          VALUES (?, ?, ?)`,
-        [trigger.triggerId, run.runId, run.createdAt],
-      );
-      const updated = this.db
-        .query(
-          `UPDATE workflow_triggers SET next_fire_at = ?, last_fire_at = ?, last_run_id = ?,
+            [trigger.triggerId, run.runId, run.createdAt],
+          );
+          const updated = this.db
+            .query(
+              `UPDATE workflow_triggers SET next_fire_at = ?, last_fire_at = ?, last_run_id = ?,
            claimed_by = NULL, claimed_at = NULL, updated_at = ?
            WHERE trigger_id = ? AND claimed_by = ? AND next_fire_at = ?`,
-        )
-        .run(
-          input.nextFireAt,
-          input.expectedFireAt,
-          run.runId,
-          input.now,
-          trigger.triggerId,
-          input.claimerId,
-          input.expectedFireAt,
-        );
-      if (updated.changes !== 1) {
-        return Result.err(
-          new DurableWorkflowInvariantViolation({
-            message: `Lost workflow trigger claim: ${trigger.triggerId}`,
-          }),
-        );
-      }
-      const storedTriggerResult = this.getTrigger(trigger.triggerId);
-      if (storedTriggerResult.status === "error") return Result.err(storedTriggerResult.error);
-      const storedTrigger = storedTriggerResult.value;
-      if (!storedTrigger) {
-        return Result.err(
-          new DurableWorkflowInvariantViolation({
-            message: `Workflow trigger disappeared: ${trigger.triggerId}`,
-          }),
-        );
-      }
-      return Result.ok({ status: "fired", trigger: storedTrigger, run });
+            )
+            .run(
+              input.nextFireAt,
+              input.expectedFireAt,
+              run.runId,
+              input.now,
+              trigger.triggerId,
+              input.claimerId,
+              input.expectedFireAt,
+            );
+          if (updated.changes !== 1) {
+            return Result.err(
+              new DurableWorkflowInvariantViolation({
+                message: `Lost workflow trigger claim: ${trigger.triggerId}`,
+              }),
+            );
+          }
+          const storedTrigger = readTriggerInTransaction(trigger.triggerId);
+          const finishFired = storedTrigger.match<
+            () => ResultType<
+              FireClaimedTriggerResult,
+              DurableWorkflowReadError | DurableWorkflowInvariantViolation
+            >
+          >({
+            err: (error) => () => Result.err(error),
+            ok: (stored) => () =>
+              stored
+                ? Result.ok<FireClaimedTriggerResult>({ status: "fired", trigger: stored, run })
+                : Result.err(
+                    new DurableWorkflowInvariantViolation({
+                      message: `Workflow trigger disappeared: ${trigger.triggerId}`,
+                    }),
+                  ),
+          });
+          return finishFired();
+        },
+      });
+      return continueWithTrigger();
     });
   }
 
@@ -3382,15 +3581,30 @@ export class DurableWorkflowStore {
         const actionRow = this.persistedRows(
           "SELECT * FROM workflow_surface_actions WHERE token_sha256 = ?",
         ).get(input.tokenSha256);
-        if (actionRow === null) return Result.ok({ status: "not_found" });
+        if (actionRow === null)
+          return Result.ok<ApplyWorkflowSurfaceActionResult>({ status: "not_found" });
         const decodedAction = decodeWorkflowSurfaceActionRow({
           row: actionRow,
           schemaVersion: WORKFLOW_SCHEMA_VERSION,
         });
-        if (decodedAction.status === "error") return Result.err(decodedAction.error);
-        const action = decodedAction.value.value;
-        if (action.consumedAt !== null) return Result.ok({ status: "consumed" });
-        if (action.expiresAt <= input.now) return Result.ok({ status: "expired" });
+        const action = decodedAction.match({ ok: (value) => value.value, err: () => null });
+        if (!action) {
+          return decodedAction.match<ResultType<never, ApplyWorkflowSurfaceActionError>>({
+            err: (error) => Result.err(error),
+            ok: () =>
+              Result.err(
+                new WorkflowSurfaceActionAtomicityConflict({
+                  actionId: "unknown",
+                  stage: "load-updated-run",
+                  message: "Decoded workflow surface action is unexpectedly absent",
+                }),
+              ),
+          });
+        }
+        if (action.consumedAt !== null)
+          return Result.ok<ApplyWorkflowSurfaceActionResult>({ status: "consumed" });
+        if (action.expiresAt <= input.now)
+          return Result.ok<ApplyWorkflowSurfaceActionResult>({ status: "expired" });
         const expected = action.expectedMessageRef;
         if (
           action.expectedPlatform !== input.platform ||
@@ -3402,29 +3616,55 @@ export class DurableWorkflowStore {
           expected.channelId !== input.messageRef.channelId ||
           expected.messageId !== input.messageRef.messageId
         ) {
-          return Result.ok({ status: "unauthorized" });
+          return Result.ok<ApplyWorkflowSurfaceActionResult>({ status: "unauthorized" });
         }
 
         const runRow = this.persistedRows("SELECT * FROM workflow_runs WHERE run_id = ?").get(
           action.runId,
         );
-        if (runRow === null) return Result.ok({ status: "stale" });
+        if (runRow === null)
+          return Result.ok<ApplyWorkflowSurfaceActionResult>({ status: "stale" });
         const decodedRun = decodeWorkflowRunRow({
           row: runRow,
           schemaVersion: WORKFLOW_SCHEMA_VERSION,
         });
-        if (decodedRun.status === "error") return Result.err(decodedRun.error);
-        const run = decodedRun.value.value;
+        const run = decodedRun.match({ ok: (value) => value.value, err: () => null });
+        if (!run) {
+          return decodedRun.match<ResultType<never, ApplyWorkflowSurfaceActionError>>({
+            err: (error) => Result.err(error),
+            ok: () =>
+              Result.err(
+                new WorkflowSurfaceActionAtomicityConflict({
+                  actionId: action.actionId,
+                  stage: "load-updated-run",
+                  message: "Decoded workflow run is unexpectedly absent",
+                }),
+              ),
+          });
+        }
         const bindingRow = this.persistedRows(
           "SELECT * FROM workflow_surface_bindings WHERE run_id = ?",
         ).get(run.runId);
-        if (bindingRow === null) return Result.ok({ status: "unauthorized" });
+        if (bindingRow === null)
+          return Result.ok<ApplyWorkflowSurfaceActionResult>({ status: "unauthorized" });
         const decodedBinding = decodeWorkflowSurfaceBindingRow({
           row: bindingRow,
           schemaVersion: WORKFLOW_SCHEMA_VERSION,
         });
-        if (decodedBinding.status === "error") return Result.err(decodedBinding.error);
-        const binding = decodedBinding.value.value;
+        const binding = decodedBinding.match({ ok: (value) => value.value, err: () => null });
+        if (!binding) {
+          return decodedBinding.match<ResultType<never, ApplyWorkflowSurfaceActionError>>({
+            err: (error) => Result.err(error),
+            ok: () =>
+              Result.err(
+                new WorkflowSurfaceActionAtomicityConflict({
+                  actionId: action.actionId,
+                  stage: "load-updated-run",
+                  message: "Decoded workflow surface binding is unexpectedly absent",
+                }),
+              ),
+          });
+        }
         if (
           binding.permanentFailure !== null ||
           run.origin.client !== action.expectedPlatform ||
@@ -3438,7 +3678,7 @@ export class DurableWorkflowStore {
           binding.messageRef.channelId !== expected.channelId ||
           binding.messageRef.messageId !== expected.messageId
         ) {
-          return Result.ok({ status: "unauthorized" });
+          return Result.ok<ApplyWorkflowSurfaceActionResult>({ status: "unauthorized" });
         }
         let nextState: WorkflowRunState;
         let valid: boolean;
@@ -3456,13 +3696,13 @@ export class DurableWorkflowStore {
             valid = run.state === "paused";
             break;
         }
-        if (!valid) return Result.ok({ status: "stale" });
+        if (!valid) return Result.ok<ApplyWorkflowSurfaceActionResult>({ status: "stale" });
         const terminal = nextState === "cancelled";
         if (
           action.kind === "resume" &&
           !this.preparePausedOperationsForResume(run.runId, input.now)
         ) {
-          return Result.ok({ status: "stale" });
+          return Result.ok<ApplyWorkflowSurfaceActionResult>({ status: "stale" });
         }
         const result = this.db
           .query(
@@ -3479,7 +3719,8 @@ export class DurableWorkflowStore {
             run.runId,
             run.state,
           );
-        if (result.changes !== 1) return Result.ok({ status: "stale" });
+        if (result.changes !== 1)
+          return Result.ok<ApplyWorkflowSurfaceActionResult>({ status: "stale" });
         if (action.kind === "pause") {
           this.prepareOperationsForPause(run.runId, input.now, "Paused from surface control");
         } else if (action.kind === "cancel") {
@@ -3534,8 +3775,20 @@ export class DurableWorkflowStore {
           row: updatedRunRow,
           schemaVersion: WORKFLOW_SCHEMA_VERSION,
         });
-        if (decodedUpdatedRun.status === "error") return Result.err(decodedUpdatedRun.error);
-        const updatedRun = decodedUpdatedRun.value.value;
+        const updatedRun = decodedUpdatedRun.match({ ok: (value) => value.value, err: () => null });
+        if (!updatedRun) {
+          return decodedUpdatedRun.match<ResultType<never, ApplyWorkflowSurfaceActionError>>({
+            err: (error) => Result.err(error),
+            ok: () =>
+              Result.err(
+                new WorkflowSurfaceActionAtomicityConflict({
+                  actionId: action.actionId,
+                  stage: "load-updated-run",
+                  message: "Decoded updated workflow run is unexpectedly absent",
+                }),
+              ),
+          });
+        }
         const runEventInserted = this.insertActionOutboxEntry({
           outboxId: `${action.actionId}:run:${run.runId}`,
           actionId: action.actionId,
@@ -3581,7 +3834,11 @@ export class DurableWorkflowStore {
             }),
           );
         }
-        return Result.ok({ status: "applied", action, runIds: [run.runId] });
+        return Result.ok<ApplyWorkflowSurfaceActionResult>({
+          status: "applied",
+          action,
+          runIds: [run.runId],
+        });
       },
       (cause) => classifyWorkflowSqliteDriverFailure("apply-surface-action", cause),
     );
@@ -3697,9 +3954,11 @@ export class DurableWorkflowStore {
         input.userId,
       );
     if (result.changes !== 1) return null;
-    const consumed = this.getSurfaceActionByTokenSha256(input.tokenSha256);
-    if (consumed.status === "error") signalDurableWorkflowReadErrorToHost(consumed.error);
-    return consumed.value;
+    const readAction = this.getSurfaceActionByTokenSha256(input.tokenSha256).match({
+      ok: (value) => () => value,
+      err: (error) => () => signalDurableWorkflowReadErrorToHost(error),
+    });
+    return readAction();
   }
 
   deleteSurfaceAction(actionId: string): boolean {

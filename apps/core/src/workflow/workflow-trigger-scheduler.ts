@@ -18,6 +18,18 @@ import type { WorkflowProgressCardService } from "./workflow-progress-projector"
 
 const TERMINAL_RUN_STATES = new Set(["succeeded", "failed", "cancelled"]);
 
+function firedTriggerRun(
+  result: ReturnType<DurableWorkflowStore["fireClaimedTrigger"]>,
+): WorkflowRun | null {
+  if (!result) return null;
+  switch (result.status) {
+    case "fired":
+      return result.run;
+    case "skipped":
+      return null;
+  }
+}
+
 export class WorkflowTriggerScheduler {
   private readonly logger = createLogger({ module: "workflow-trigger-scheduler" });
   private readonly workerId = `workflow-trigger-scheduler:${process.pid}:${crypto.randomUUID()}`;
@@ -89,9 +101,14 @@ export class WorkflowTriggerScheduler {
   private async tickOnce(): Promise<void> {
     const now = this.input.now?.() ?? Date.now();
     this.reconcileTimestampCompletion(now);
-    const dueTriggers = this.input.store.listTriggers({ state: "active", dueBefore: now });
-    if (dueTriggers.status === "error") signalDurableWorkflowReadErrorToHost(dueTriggers.error);
-    for (const trigger of dueTriggers.value) {
+    const readDueTriggers = this.input.store
+      .listTriggers({ state: "active", dueBefore: now })
+      .match({
+        ok: (value) => () => value,
+        err: (error) => () => signalDurableWorkflowReadErrorToHost(error),
+      });
+    const dueTriggers = readDueTriggers();
+    for (const trigger of dueTriggers) {
       const claimed = this.input.store.tryClaimDueTrigger({
         triggerId: trigger.triggerId,
         claimerId: this.workerId,
@@ -102,10 +119,14 @@ export class WorkflowTriggerScheduler {
   }
 
   private reconcileTimestampCompletion(now: number): void {
-    const activeTriggers = this.input.store.listTriggers({ state: "active", limit: 1_000 });
-    if (activeTriggers.status === "error")
-      signalDurableWorkflowReadErrorToHost(activeTriggers.error);
-    for (const trigger of activeTriggers.value) {
+    const readActiveTriggers = this.input.store
+      .listTriggers({ state: "active", limit: 1_000 })
+      .match({
+        ok: (value) => () => value,
+        err: (error) => () => signalDurableWorkflowReadErrorToHost(error),
+      });
+    const activeTriggers = readActiveTriggers();
+    for (const trigger of activeTriggers) {
       if (
         trigger.definition.kind !== "timestamp" ||
         trigger.nextFireAt !== null ||
@@ -113,9 +134,11 @@ export class WorkflowTriggerScheduler {
       ) {
         continue;
       }
-      const runResult = this.input.store.getRun(trigger.lastRunId);
-      if (runResult.status === "error") signalDurableWorkflowReadErrorToHost(runResult.error);
-      const run = runResult.value;
+      const readRun = this.input.store.getRun(trigger.lastRunId).match({
+        ok: (value) => () => value,
+        err: (error) => () => signalDurableWorkflowReadErrorToHost(error),
+      });
+      const run = readRun();
       if (!run || !TERMINAL_RUN_STATES.has(run.state)) continue;
       this.input.store.transitionTrigger({
         triggerId: trigger.triggerId,
@@ -126,11 +149,20 @@ export class WorkflowTriggerScheduler {
     }
   }
 
+  private logInitialCardCreationFailure(runId: string, error: Error): void {
+    this.logger.warn(
+      "Scheduled workflow progress card creation failed",
+      { runId },
+      formatWorkflowErrorForLog(error),
+    );
+  }
+
   private async fire(trigger: WorkflowTrigger, now: number): Promise<void> {
-    const revisionResult = this.input.store.getRevision(trigger.revisionId);
-    if (revisionResult.status === "error")
-      signalDurableWorkflowReadErrorToHost(revisionResult.error);
-    const revision = revisionResult.value;
+    const readRevision = this.input.store.getRevision(trigger.revisionId).match({
+      ok: (value) => () => value,
+      err: (error) => () => signalDurableWorkflowReadErrorToHost(error),
+    });
+    const revision = readRevision();
     const fireAt = trigger.nextFireAt;
     if (!revision || fireAt === null) return;
     let nextFireAt: number | null = null;
@@ -142,8 +174,8 @@ export class WorkflowTriggerScheduler {
         },
         (trigger.schedulingPolicy.skipMissed ? now : fireAt) + 1,
       );
-      if (computed.status === "error") return;
-      nextFireAt = computed.value;
+      nextFireAt = computed.match({ ok: (value) => value, err: () => null });
+      if (nextFireAt === null) return;
     }
     const runId = `wfrun:${sha256(`${trigger.triggerId}:${fireAt}`)}`;
     const run: WorkflowRun = {
@@ -177,10 +209,11 @@ export class WorkflowTriggerScheduler {
       maxActiveRuns,
       now,
     });
-    if (!fired || fired.status === "skipped") return;
-    if (fired.run.progressTarget && this.input.progressCards) {
+    const firedRun = firedTriggerRun(fired);
+    if (!firedRun) return;
+    if (firedRun.progressTarget && this.input.progressCards) {
       const [created] = await Promise.allSettled([
-        this.input.progressCards.ensureInitialCard(fired.run.runId),
+        this.input.progressCards.ensureInitialCard(firedRun.runId),
       ]);
       if (created.status === "rejected") {
         if (isPanic(created.reason)) preserveToolPanic(created.reason);
@@ -188,24 +221,21 @@ export class WorkflowTriggerScheduler {
           created.reason instanceof Error
             ? created.reason
             : new Error("Opaque scheduled workflow progress card failure");
-        this.logger.warn("Scheduled workflow progress card creation failed", {
-          runId: fired.run.runId,
-          ...formatWorkflowErrorForLog(error),
-        });
+        this.logInitialCardCreationFailure(firedRun.runId, error);
       }
     }
     adaptEventPublishResultToHost(
       await this.input.bus.publish(lilacEventTypes.EvtWorkflowRunChanged, {
-        runId: fired.run.runId,
-        revisionId: fired.run.revisionId,
-        state: fired.run.state,
+        runId: firedRun.runId,
+        revisionId: firedRun.revisionId,
+        state: firedRun.state,
         ts: now,
       }),
     );
     adaptEventPublishResultToHost(
       await this.input.bus.publish(lilacEventTypes.EvtWorkflowProgressRequested, {
-        runId: fired.run.runId,
-        revisionId: fired.run.revisionId,
+        runId: firedRun.runId,
+        revisionId: firedRun.revisionId,
         reason: "created",
         ts: now,
       }),

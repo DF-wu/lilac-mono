@@ -15,7 +15,9 @@ import type {
   RegisteredSurfacePlatform,
   RegisteredSurfaceWorkflowProgressRegistration,
   WorkflowProgressOperationFailed,
+  WorkflowProgressSendFailure,
 } from "../surface/runtime-descriptor";
+import type { SurfaceRefInvalid } from "../surface/protocol";
 import { adaptToolResultToHost } from "../tools/tool-result-adapters";
 import {
   DurableWorkflowStore,
@@ -154,14 +156,13 @@ function workflowProgressProjectorDeliveryPolicy(
 function adaptWorkflowProgressSubscriptionStartResultToHost(
   started: ResultType<WorkflowProgressProjectorSubscription, EventDeliveryStartFailed>,
 ): WorkflowProgressProjectorSubscription {
-  if (started.status === "error") throw started.error;
-  return started.value;
+  return adaptToolResultToHost(started);
 }
 
 function adaptWorkflowProgressSubscriptionStopResultToHost(
   stopped: ResultType<void, EventDeliveryStopFailed>,
 ): void {
-  if (stopped.status === "error") throw stopped.error;
+  adaptToolResultToHost(stopped);
 }
 
 const WORKFLOW_CARD_TEXT_LIMIT = 4_000;
@@ -178,19 +179,33 @@ function correlateWorkflowProgressMessageRef(input: {
   ) {
     return { kind: "mismatch" };
   }
-  const decoded = input.registration.protocol.refs.decodeMessageRef({
-    ref: input.messageRef,
-    expectedSessionId: input.runTargetChannelId,
+  const decoded: ResultType<MsgRef, SurfaceRefInvalid> =
+    input.registration.protocol.refs.decodeMessageRef({
+      ref: input.messageRef,
+      expectedSessionId: input.runTargetChannelId,
+    });
+  return decoded.match<
+    { readonly kind: "correlated"; readonly ref: MsgRef } | { readonly kind: "mismatch" }
+  >({
+    ok: (ref) => ({ kind: "correlated", ref }),
+    err: () => ({ kind: "mismatch" }),
   });
-  return decoded.status === "ok"
-    ? { kind: "correlated", ref: decoded.value }
-    : { kind: "mismatch" };
 }
 
 function limitContentText(content: ContentOpts): ContentOpts {
   return content.text && content.text.length > WORKFLOW_CARD_TEXT_LIMIT
     ? { ...content, text: content.text.slice(0, WORKFLOW_CARD_TEXT_LIMIT) }
     : content;
+}
+
+function workflowProgressRenderSha256(content: ContentOpts, revisionSha256: string): string {
+  return sha256(
+    JSON.stringify({
+      text: content.text,
+      actions: content.actions,
+      revision: revisionSha256,
+    }),
+  );
 }
 
 function retryAt(now: number, retryCount: number, retryAfterMs?: number): number {
@@ -327,12 +342,17 @@ export class WorkflowProgressProjector implements WorkflowProgressCardService {
     this.superviseDetached(async () => {
       const done = await subscription.done;
       if (this.stopping) return;
-      this.logger.error(
-        "Workflow progress projector subscription terminated unexpectedly",
-        done.status === "error"
-          ? formatTaggedErrorForLog(done.error)
-          : { error: "Subscription completed without being stopped" },
-      );
+      done.match({
+        ok: () =>
+          this.logger.error("Workflow progress projector subscription terminated unexpectedly", {
+            error: "Subscription completed without being stopped",
+          }),
+        err: (error) =>
+          this.logger.error(
+            "Workflow progress projector subscription terminated unexpectedly",
+            formatTaggedErrorForLog(error),
+          ),
+      });
     }, "Workflow progress projector subscription observer failed");
 
     await this.drainActionOutboxProjections();
@@ -367,12 +387,17 @@ export class WorkflowProgressProjector implements WorkflowProgressCardService {
         await this.stopWorkflowProgressSubscriptionResult(subscription),
       );
       const done = await subscription.done;
-      if (done.status === "error" && done.error._tag !== "EventDeliveryStopped") {
-        this.logger.error(
-          "Workflow progress projector subscription terminated",
-          formatTaggedErrorForLog(done.error),
-        );
-      }
+      done.match({
+        ok: () => undefined,
+        err: (error) => {
+          if (error._tag !== "EventDeliveryStopped") {
+            this.logger.error(
+              "Workflow progress projector subscription terminated",
+              formatTaggedErrorForLog(error),
+            );
+          }
+        },
+      });
     }
     await this.actionOutboxDrain;
     await this.reconciliationDrain;
@@ -411,10 +436,13 @@ export class WorkflowProgressProjector implements WorkflowProgressCardService {
       this.timers.delete(runId);
       this.superviseDetached(async () => {
         const projected = await this.project(runId);
-        if (projected.status === "ok") return;
-        this.logger.warn("Workflow projection failed", {
-          runId,
-          ...formatTaggedErrorForLog(projected.error),
+        projected.match({
+          ok: () => undefined,
+          err: (error) =>
+            this.logger.warn("Workflow projection failed", {
+              runId,
+              ...formatTaggedErrorForLog(error),
+            }),
         });
       }, "Workflow projection timer failed");
     }, boundedDelayMs);
@@ -506,8 +534,11 @@ export class WorkflowProgressProjector implements WorkflowProgressCardService {
     const target = run.progressTarget;
     if (!target) return false;
     const bindingResult = this.input.store.getSurfaceBinding(run.runId);
-    if (bindingResult.status === "error") signalDurableWorkflowReadErrorToHost(bindingResult.error);
-    const binding = bindingResult.value;
+    const readBinding = bindingResult.match({
+      ok: (value) => () => value,
+      err: (error) => () => signalDurableWorkflowReadErrorToHost(error),
+    });
+    const binding = readBinding();
     if (!binding?.permanentFailure || !sameWorkflowProgressTarget(binding.target, target)) {
       return false;
     }
@@ -529,34 +560,41 @@ export class WorkflowProgressProjector implements WorkflowProgressCardService {
       limit: batchSize,
       ...(after === undefined ? {} : { after }),
     });
-    if (runs.status === "error") signalDurableWorkflowReadErrorToHost(runs.error);
-    for (const run of runs.value) {
+    const readPendingRuns = runs.match({
+      ok: (value) => () => value,
+      err: (error) => () => signalDurableWorkflowReadErrorToHost(error),
+    });
+    const pendingRuns = readPendingRuns();
+    for (const run of pendingRuns) {
       if (this.stopping) return undefined;
       if (this.hasMatchingPermanentGate(run)) continue;
       const projected = await this.project(run.runId, false, true);
-      if (projected.status === "error") {
-        this.logger.warn("Workflow projection reconciliation failed", {
-          runId: run.runId,
-          ...formatTaggedErrorForLog(projected.error),
-        });
-      }
+      projected.match({
+        ok: () => undefined,
+        err: (error) =>
+          this.logger.warn("Workflow projection reconciliation failed", {
+            runId: run.runId,
+            ...formatTaggedErrorForLog(error),
+          }),
+      });
     }
-    if (runs.value.length < batchSize) return undefined;
-    const last = runs.value.at(-1);
+    if (pendingRuns.length < batchSize) return undefined;
+    const last = pendingRuns.at(-1);
     return last ? { updatedAt: last.updatedAt, runId: last.runId } : undefined;
   }
 
   private retryDue(): void {
     const now = this.input.now?.() ?? Date.now();
     const bindings = this.input.store.listSurfaceBindings({ dueBefore: now, limit: 1_000 });
-    if (bindings.status === "error") {
-      this.logger.warn(
-        "Workflow projection retry read failed",
-        formatTaggedErrorForLog(bindings.error),
-      );
-      return;
-    }
-    for (const binding of bindings.value) {
+    const dueBindings = bindings.match({
+      ok: (value) => value,
+      err: (error) => {
+        this.logger.warn("Workflow projection retry read failed", formatTaggedErrorForLog(error));
+        return null;
+      },
+    });
+    if (!dueBindings) return;
+    for (const binding of dueBindings) {
       this.requestProjection(binding.runId);
     }
   }
@@ -574,20 +612,28 @@ export class WorkflowProgressProjector implements WorkflowProgressCardService {
 
   private async drainPendingActionOutboxProjections(): Promise<void> {
     const entries = this.input.store.listPendingActionOutboxProjections();
-    if (entries.status === "error") {
-      this.logger.warn(
-        "Workflow action outbox projection read failed",
-        formatTaggedErrorForLog(entries.error),
-      );
-      return;
-    }
-    for (const entry of entries.value) {
+    const pendingEntries = entries.match({
+      ok: (value) => value,
+      err: (error) => {
+        this.logger.warn(
+          "Workflow action outbox projection read failed",
+          formatTaggedErrorForLog(error),
+        );
+        return null;
+      },
+    });
+    if (!pendingEntries) return;
+    for (const entry of pendingEntries) {
       const projected = await this.project(entry.runId);
-      if (projected.status === "error") {
+      const projectionError = projected.match({
+        ok: () => null,
+        err: (error) => error,
+      });
+      if (projectionError) {
         this.logger.warn("Workflow action outbox projection failed", {
           outboxId: entry.outboxId,
           runId: entry.runId,
-          ...formatTaggedErrorForLog(projected.error),
+          ...formatTaggedErrorForLog(projectionError),
         });
         continue;
       }
@@ -747,10 +793,15 @@ export class WorkflowProgressProjector implements WorkflowProgressCardService {
     verifyExisting: boolean,
   ): Promise<WorkflowProgressProjectionResult<MsgRef | null>> {
     const runResult = this.input.store.getRun(runId);
-    if (runResult.status === "error") {
-      return Result.err(workflowProgressProjectionFailure(runResult.error.message));
-    }
-    const run = runResult.value;
+    const runOutcome = runResult.match<
+      | { readonly kind: "ok"; readonly run: WorkflowRun | null }
+      | { readonly kind: "error"; readonly error: WorkflowProgressProjectionFailed }
+    >({
+      ok: (run) => ({ kind: "ok", run }),
+      err: (error) => ({ kind: "error", error: workflowProgressProjectionFailure(error.message) }),
+    });
+    if (runOutcome.kind === "error") return Result.err(runOutcome.error);
+    const run = runOutcome.run;
     if (run?.progressTarget === null) {
       if (requireMessage) {
         return Result.err(
@@ -768,10 +819,15 @@ export class WorkflowProgressProjector implements WorkflowProgressCardService {
       runId,
       now,
     });
-    if (viewResult.status === "error") {
-      return Result.err(workflowProgressProjectionFailure(viewResult.error.message));
-    }
-    const view = viewResult.value;
+    const viewOutcome = viewResult.match<
+      | { readonly kind: "ok"; readonly view: WorkflowProgressView }
+      | { readonly kind: "error"; readonly error: WorkflowProgressProjectionFailed }
+    >({
+      ok: (view) => ({ kind: "ok", view }),
+      err: (error) => ({ kind: "error", error: workflowProgressProjectionFailure(error.message) }),
+    });
+    if (viewOutcome.kind === "error") return Result.err(viewOutcome.error);
+    const view = viewOutcome.view;
     const target = view.run.progressTarget;
     if (!target) {
       return Result.err(
@@ -782,10 +838,15 @@ export class WorkflowProgressProjector implements WorkflowProgressCardService {
     }
     const registration = findWorkflowProgressPort(this.input.ports, target.platform);
     const existingResult = this.input.store.getSurfaceBinding(runId);
-    if (existingResult.status === "error") {
-      return Result.err(workflowProgressProjectionFailure(existingResult.error.message));
-    }
-    let existing: WorkflowSurfaceBinding | null = existingResult.value;
+    const existingOutcome = existingResult.match<
+      | { readonly kind: "ok"; readonly binding: WorkflowSurfaceBinding | null }
+      | { readonly kind: "error"; readonly error: WorkflowProgressProjectionFailed }
+    >({
+      ok: (binding) => ({ kind: "ok", binding }),
+      err: (error) => ({ kind: "error", error: workflowProgressProjectionFailure(error.message) }),
+    });
+    if (existingOutcome.kind === "error") return Result.err(existingOutcome.error);
+    let existing = existingOutcome.binding;
     let messageRef: MsgRef | null = null;
     if (existing && !sameWorkflowProgressTarget(existing.target, target)) {
       existing = {
@@ -896,56 +957,45 @@ export class WorkflowProgressProjector implements WorkflowProgressCardService {
         channelId: messageRef.channelId,
         messageId: messageRef.messageId,
       });
-      let found: boolean;
-      switch (checked.status) {
-        case "error": {
-          switch (checked.error.kind) {
-            case "failed": {
-              const error = new WorkflowProgressSurfaceCallFailed({
-                failureKind: "failed",
-                createdRef: null,
-                failure: checked.error.error,
-                message: checked.error.error.message,
-              });
-              switch (error.failure.disposition) {
-                case "retryable":
-                  this.writeRetryableFailure(
-                    existing,
-                    error.message,
-                    now,
-                    error.failure.retryAfterMs,
-                  );
-                  break;
-                case "permanent":
-                  this.writePermanentFailure(
-                    existing,
-                    {
-                      operation: error.failure.operation,
-                      reason: error.failure.reason,
-                      configurationRevision: port.configurationRevision,
-                      message: error.message,
-                      failedAt: now,
-                    },
-                    now,
-                  );
-                  if (!requireMessage) return Result.ok(messageRef);
-                  break;
-              }
-              return Result.err(error);
-            }
-          }
+      const checkOutcome = checked.match<
+        | { readonly kind: "ok"; readonly found: boolean }
+        | { readonly kind: "error"; readonly error: WorkflowProgressSurfaceCallFailed }
+      >({
+        ok: (value) => ({ kind: "ok", found: value === "found" }),
+        err: (failure) => ({
+          kind: "error",
+          error: new WorkflowProgressSurfaceCallFailed({
+            failureKind: "failed",
+            createdRef: null,
+            failure: failure.error,
+            message: failure.error.message,
+          }),
+        }),
+      });
+      if (checkOutcome.kind === "error") {
+        const { error } = checkOutcome;
+        switch (error.failure.disposition) {
+          case "retryable":
+            this.writeRetryableFailure(existing, error.message, now, error.failure.retryAfterMs);
+            break;
+          case "permanent":
+            this.writePermanentFailure(
+              existing,
+              {
+                operation: error.failure.operation,
+                reason: error.failure.reason,
+                configurationRevision: port.configurationRevision,
+                message: error.message,
+                failedAt: now,
+              },
+              now,
+            );
+            if (!requireMessage) return Result.ok(messageRef);
+            break;
         }
-        case "ok":
-          switch (checked.value) {
-            case "found":
-              found = true;
-              break;
-            case "missing":
-              found = false;
-              break;
-          }
-          break;
+        return Result.err(error);
       }
+      const { found } = checkOutcome;
       existing = {
         ...existing,
         messageRef: found ? existing.messageRef : null,
@@ -968,13 +1018,7 @@ export class WorkflowProgressProjector implements WorkflowProgressCardService {
         actions: toSurfaceActions({ view, actionIds: issued.ids }),
       }),
     );
-    const renderedSha256 = sha256(
-      JSON.stringify({
-        text: content.text,
-        actions: content.actions,
-        revision: view.revision.sourceSha256,
-      }),
-    );
+    const renderedSha256 = workflowProgressRenderSha256(content, view.revision.sourceSha256);
     if (messageRef && existing.lastRenderedSha256 === renderedSha256) {
       return Result.ok(messageRef);
     }
@@ -985,96 +1029,93 @@ export class WorkflowProgressProjector implements WorkflowProgressCardService {
         { channelId: messageRef.channelId, messageId: messageRef.messageId },
         content,
       );
-      switch (edited.status) {
-        case "ok":
-          projected = Result.ok(messageRef);
-          break;
-        case "error":
-          switch (edited.error.kind) {
+      projected = edited.match<ResultType<MsgRef, WorkflowProgressSurfaceFailure>>({
+        ok: () => Result.ok(messageRef),
+        err: (error) => {
+          switch (error.kind) {
             case "not-found":
-              projected = Result.err(
+              return Result.err(
                 workflowProgressSurfaceCallFailure({
                   failureKind: "not-found",
                   createdRef: null,
                   message: "Workflow progress message was not found",
                 }),
               );
-              break;
             case "failed":
-              projected = Result.err(
+              return Result.err(
                 workflowProgressSurfaceCallFailure({
                   failureKind: "failed",
                   createdRef: null,
-                  failure: edited.error.error,
-                  message: edited.error.error.message,
+                  failure: error.error,
+                  message: error.error.message,
                 }),
               );
-              break;
           }
-          break;
-      }
+        },
+      });
     } else {
-      const sent = await port.send({
+      const sent: ResultType<
+        MsgRef,
+        WorkflowProgressSendFailure<RegisteredSurfacePlatform>
+      > = await port.send({
         channelId: target.channelId,
         content,
         ...(target.replyToMessageId ? { replyToMessageId: target.replyToMessageId } : {}),
         silent: true,
       });
-      switch (sent.status) {
-        case "ok":
-          projected = Result.ok(sent.value);
-          break;
-        case "error":
-          switch (sent.error.kind) {
+      projected = sent.match<ResultType<MsgRef, WorkflowProgressSurfaceFailure>>({
+        ok: (ref) => Result.ok(ref),
+        err: (error) => {
+          switch (error.kind) {
             case "created":
-              projected = Result.err(
+              return Result.err(
                 workflowProgressSurfaceCallFailure({
                   failureKind: "created",
-                  createdRef: sent.error.ref,
+                  createdRef: error.ref,
                   message: "Workflow progress message was created but could not be fully rendered",
                 }),
               );
-              break;
             case "failed":
-              projected = Result.err(
+              return Result.err(
                 workflowProgressSurfaceCallFailure({
                   failureKind: "failed",
                   createdRef: null,
-                  failure: sent.error.error,
-                  message: sent.error.error.message,
+                  failure: error.error,
+                  message: error.error.message,
                 }),
               );
-              break;
           }
-          break;
-      }
+        },
+      });
     }
-    let error: WorkflowProgressSurfaceFailure;
-    switch (projected.status) {
-      case "ok": {
-        const projectedRef = projected.value;
-        this.input.store.commitSurfaceProjection({
-          binding: {
-            ...existing,
-            target,
-            messageRef: projectedRef,
-            lastRenderedSha256: renderedSha256,
-            lastError: null,
-            retryCount: 0,
-            nextAttemptAt: null,
-            permanentFailure: null,
-            updatedAt: now,
-          },
-          actionIds: issued.recordIds,
-        });
-        this.lastEditAt.set(runId, now);
-        this.scheduleActionRotation(runId, issued, now);
-        return Result.ok(projectedRef);
-      }
-      case "error":
-        error = projected.error;
-        break;
+    const projectionOutcome = projected.match<
+      | { readonly kind: "ok"; readonly ref: MsgRef }
+      | { readonly kind: "error"; readonly error: WorkflowProgressSurfaceFailure }
+    >({
+      ok: (ref) => ({ kind: "ok", ref }),
+      err: (error) => ({ kind: "error", error }),
+    });
+    if (projectionOutcome.kind === "ok") {
+      const projectedRef = projectionOutcome.ref;
+      this.input.store.commitSurfaceProjection({
+        binding: {
+          ...existing,
+          target,
+          messageRef: projectedRef,
+          lastRenderedSha256: renderedSha256,
+          lastError: null,
+          retryCount: 0,
+          nextAttemptAt: null,
+          permanentFailure: null,
+          updatedAt: now,
+        },
+        actionIds: issued.recordIds,
+      });
+      this.lastEditAt.set(runId, now);
+      this.scheduleActionRotation(runId, issued, now);
+      return Result.ok(projectedRef);
     }
+    const { error } = projectionOutcome;
     switch (error._tag) {
       case "WorkflowProgressSurfaceCreated":
         this.writeRetryableFailure(existing, error.message, now, undefined, {

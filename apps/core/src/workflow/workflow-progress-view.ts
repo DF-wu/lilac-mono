@@ -185,109 +185,100 @@ export async function buildWorkflowProgressViewResult(input: {
   runId: string;
   now?: number;
 }): Promise<ResultType<WorkflowProgressView, WorkflowProgressViewFailed>> {
-  const runResult = input.store.getRun(input.runId);
-  if (runResult.status === "error") {
-    return Result.err(workflowProgressViewFailure(runResult.error.message));
-  }
-  const run = runResult.value;
-  if (!run)
-    return Result.err(workflowProgressViewFailure(`Workflow run not found: ${input.runId}`));
-  const revisionResult = input.store.getRevision(run.revisionId);
-  if (revisionResult.status === "error") {
-    return Result.err(workflowProgressViewFailure(revisionResult.error.message));
-  }
-  const revision = revisionResult.value;
-  if (!revision) {
-    return Result.err(
-      workflowProgressViewFailure(`Workflow revision not found: ${run.revisionId}`),
-    );
-  }
-  const operationSummaries = input.store.summarizeMeaningfulOperations(run.runId);
-  const recentOperationsResult = input.store.listRecentMeaningfulOperations(run.runId, 5);
-  if (recentOperationsResult.status === "error") {
-    return Result.err(workflowProgressViewFailure(recentOperationsResult.error.message));
-  }
-  const recentOperations = recentOperationsResult.value;
-  const triggerResult = input.store.getTriggerByLastRunId(run.runId);
-  if (triggerResult.status === "error") {
-    return Result.err(workflowProgressViewFailure(triggerResult.error.message));
-  }
-  const trigger = triggerResult.value;
-  const sensitive = schemaContainsSensitive(run.inputSchemaSnapshot);
-  const progress = emptyCounts();
-  for (const summary of operationSummaries) addOperationSummary(progress, summary);
-  const waits = [];
-  for (const options of [
-    { runId: run.runId, state: "pending", matchKind: "reply", limit: 5 },
-    { runId: run.runId, state: "claimed", matchKind: "reply", limit: 5 },
-    { runId: run.runId, state: "pending", matchKind: "sleep", limit: 5 },
-    { runId: run.runId, state: "claimed", matchKind: "sleep", limit: 5 },
-  ] satisfies Parameters<DurableWorkflowStore["listWaits"]>[0][]) {
-    const listed = input.store.listWaits(options);
-    if (listed.status === "error") {
-      return Result.err(workflowProgressViewFailure(listed.error.message));
+  return Result.gen(function* () {
+    const run = yield* input.store
+      .getRun(input.runId)
+      .mapError((error) => workflowProgressViewFailure(error.message));
+    if (!run)
+      return Result.err(workflowProgressViewFailure(`Workflow run not found: ${input.runId}`));
+    const revision = yield* input.store
+      .getRevision(run.revisionId)
+      .mapError((error) => workflowProgressViewFailure(error.message));
+    if (!revision) {
+      return Result.err(
+        workflowProgressViewFailure(`Workflow revision not found: ${run.revisionId}`),
+      );
     }
-    waits.push(...listed.value);
-  }
-  const renderedWaits: WorkflowProgressWait[] = [];
-  for (const wait of waits.sort((left, right) => left.createdAt - right.createdAt)) {
-    const operationResult = input.store.getOperation(run.runId, wait.operationId);
-    if (operationResult.status === "error") {
-      return Result.err(workflowProgressViewFailure(operationResult.error.message));
+    const operationSummaries = input.store.summarizeMeaningfulOperations(run.runId);
+    const recentOperations = yield* input.store
+      .listRecentMeaningfulOperations(run.runId, 5)
+      .mapError((error) => workflowProgressViewFailure(error.message));
+    const trigger = yield* input.store
+      .getTriggerByLastRunId(run.runId)
+      .mapError((error) => workflowProgressViewFailure(error.message));
+    const sensitive = schemaContainsSensitive(run.inputSchemaSnapshot);
+    const progress = emptyCounts();
+    for (const summary of operationSummaries) addOperationSummary(progress, summary);
+    const waits = [];
+    for (const options of [
+      { runId: run.runId, state: "pending", matchKind: "reply", limit: 5 },
+      { runId: run.runId, state: "claimed", matchKind: "reply", limit: 5 },
+      { runId: run.runId, state: "pending", matchKind: "sleep", limit: 5 },
+      { runId: run.runId, state: "claimed", matchKind: "sleep", limit: 5 },
+    ] satisfies Parameters<DurableWorkflowStore["listWaits"]>[0][]) {
+      const listed = yield* input.store
+        .listWaits(options)
+        .mapError((error) => workflowProgressViewFailure(error.message));
+      waits.push(...listed);
     }
-    const operation = operationResult.value;
-    let prompt: string;
-    switch (wait.match.kind) {
-      case "reply":
-        prompt = sensitive ? "Waiting for your reply" : (operation?.label ?? "Waiting for reply");
-        break;
-      case "sleep":
-        prompt = sensitive ? "Waiting" : (operation?.label ?? "Waiting");
-        break;
+    const renderedWaits: WorkflowProgressWait[] = [];
+    for (const wait of waits.sort((left, right) => left.createdAt - right.createdAt)) {
+      const operation = yield* input.store
+        .getOperation(run.runId, wait.operationId)
+        .mapError((error) => workflowProgressViewFailure(error.message));
+      let prompt: string;
+      switch (wait.match.kind) {
+        case "reply":
+          prompt = sensitive ? "Waiting for your reply" : (operation?.label ?? "Waiting for reply");
+          break;
+        case "sleep":
+          prompt = sensitive ? "Waiting" : (operation?.label ?? "Waiting");
+          break;
+      }
+      renderedWaits.push({
+        kind: wait.match.kind,
+        prompt,
+        dueAt: wait.dueAt,
+        deadlineAt: wait.deadlineAt,
+        requiresReplyToMessage: wait.match.kind === "reply" && wait.match.messageId !== null,
+        isCurrentChannel:
+          wait.match.kind === "reply" &&
+          run.progressTarget?.platform === wait.match.platform &&
+          run.progressTarget.channelId === wait.match.channelId,
+      });
     }
-    renderedWaits.push({
-      kind: wait.match.kind,
-      prompt,
-      dueAt: wait.dueAt,
-      deadlineAt: wait.deadlineAt,
-      requiresReplyToMessage: wait.match.kind === "reply" && wait.match.messageId !== null,
-      isCurrentChannel:
-        wait.match.kind === "reply" &&
-        run.progressTarget?.platform === wait.match.platform &&
-        run.progressTarget.channelId === wait.match.channelId,
+    const visibleOperations = recentOperations.map(({ label, phase, kind, state }) => ({
+      label: sensitive ? null : label,
+      phase: sensitive ? null : phase,
+      kind,
+      state,
+    }));
+    const agentSummaries = operationSummaries.filter((summary) => summary.kind === "agent");
+    const end = run.terminalAt ?? input.now ?? Date.now();
+    const manualReconciliationRequired =
+      input.store.getManualReconciliationDetail(run.runId) !== null;
+    return Result.ok({
+      run,
+      revision,
+      elapsedMs: Math.max(0, end - (run.startedAt ?? run.createdAt)),
+      progress,
+      phases: summarizePhases(operationSummaries, sensitive),
+      recentOperations: visibleOperations,
+      waits: renderedWaits,
+      agents: {
+        used: agentSummaries.reduce((total, summary) => total + agentUsageCount(summary), 0),
+        active: agentSummaries
+          .filter((summary) => ["dispatched", "running"].includes(summary.state))
+          .reduce((total, summary) => total + summary.count, 0),
+        queued: agentSummaries
+          .filter((summary) => summary.state === "queued")
+          .reduce((total, summary) => total + summary.count, 0),
+      },
+      nextTriggerAt: trigger?.nextFireAt ?? null,
+      availableActions: availableActions({ run, manualReconciliationRequired }),
+      manualReconciliationRequired,
+      sensitive,
     });
-  }
-  const visibleOperations = recentOperations.map(({ label, phase, kind, state }) => ({
-    label: sensitive ? null : label,
-    phase: sensitive ? null : phase,
-    kind,
-    state,
-  }));
-  const agentSummaries = operationSummaries.filter((summary) => summary.kind === "agent");
-  const end = run.terminalAt ?? input.now ?? Date.now();
-  const manualReconciliationRequired =
-    input.store.getManualReconciliationDetail(run.runId) !== null;
-  return Result.ok({
-    run,
-    revision,
-    elapsedMs: Math.max(0, end - (run.startedAt ?? run.createdAt)),
-    progress,
-    phases: summarizePhases(operationSummaries, sensitive),
-    recentOperations: visibleOperations,
-    waits: renderedWaits,
-    agents: {
-      used: agentSummaries.reduce((total, summary) => total + agentUsageCount(summary), 0),
-      active: agentSummaries
-        .filter((summary) => ["dispatched", "running"].includes(summary.state))
-        .reduce((total, summary) => total + summary.count, 0),
-      queued: agentSummaries
-        .filter((summary) => summary.state === "queued")
-        .reduce((total, summary) => total + summary.count, 0),
-    },
-    nextTriggerAt: trigger?.nextFireAt ?? null,
-    availableActions: availableActions({ run, manualReconciliationRequired }),
-    manualReconciliationRequired,
-    sensitive,
   });
 }
 

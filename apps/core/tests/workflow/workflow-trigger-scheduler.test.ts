@@ -1,5 +1,6 @@
 import { normalizeWorkflowResourcePolicy, workflowStoreValue } from "./workflow-store-test-helpers";
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, spyOn } from "bun:test";
+import { Logger } from "@stanley2058/simple-module-logger";
 import { rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -256,6 +257,50 @@ describe("workflow trigger scheduler", () => {
         storedTrigger?.lastRunId ? workflowStoreValue(store.getRun(storedTrigger.lastRunId)) : null,
       ).toMatchObject({ state: "queued", terminalAt: null });
     } finally {
+      await bus.close();
+      store.close();
+      rmSync(file, { force: true });
+    }
+  });
+  it("logs scheduled progress-card failures with run context and redaction", async () => {
+    const file = join(tmpdir(), `workflow-scheduler-card-log-${crypto.randomUUID()}.sqlite`);
+    const store = new DurableWorkflowStore(file);
+    const bus = createLilacBus(new CapturingRawBus());
+    const warning = spyOn(Logger.prototype, "warn").mockImplementation(() => {});
+    const progressCards: WorkflowProgressCardService = {
+      resolveTarget: () => "discord",
+      ensureInitialCard: async () => {
+        throw new Error("token=secret-scheduled-card");
+      },
+      requestProjection: () => {},
+    };
+    try {
+      createRevision(store);
+      store.createTrigger({
+        ...trigger(),
+        progressTarget: {
+          platform: "discord",
+          channelId: "scheduled-channel",
+          replyToMessageId: null,
+        },
+      });
+      const scheduler = new WorkflowTriggerScheduler({
+        bus,
+        store,
+        progressCards,
+        now: () => 100,
+      });
+
+      await scheduler.tick();
+
+      const runId = workflowStoreValue(store.getTrigger("trigger-1"))?.lastRunId;
+      const logged = JSON.stringify(warning.mock.calls);
+      expect(runId).toBeTruthy();
+      expect(logged).toContain(runId ?? "missing-run-id");
+      expect(logged).toContain("token=<redacted>");
+      expect(logged).not.toContain("secret-scheduled-card");
+    } finally {
+      warning.mockRestore();
       await bus.close();
       store.close();
       rmSync(file, { force: true });

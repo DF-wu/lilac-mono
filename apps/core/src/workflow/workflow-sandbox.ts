@@ -7,7 +7,10 @@ import { opaqueErrorMessage } from "@stanley2058/lilac-utils";
 import { projectRuntimeError } from "../runtime/error-format";
 import { preserveToolPanic } from "../tools/tool-result-adapters";
 import { jsonValueSchema, type JsonObject, type JsonValue } from "./workflow-domain";
-import { parseWorkflowCallSiteManifestUnchecked } from "./workflow-source-compiler";
+import {
+  parseWorkflowCallSiteManifestUnchecked,
+  type WorkflowCallSiteManifestEntry,
+} from "./workflow-source-compiler";
 
 const MAX_PROTOCOL_BYTES = 16 * 1024 * 1024;
 const MAX_STDERR_BYTES = 16 * 1024;
@@ -61,20 +64,24 @@ export async function decodeWorkflowSandboxOutputLine(
   line: string,
 ): Promise<ResultType<z.output<typeof sandboxOutputSchema>, WorkflowSandboxOutputInvalid>> {
   const parsed = await settleSandboxExternal(() => JSON.parse(line));
-  if (parsed.status === "error") {
-    return Result.err(
-      new WorkflowSandboxOutputInvalid({ message: "Workflow sandbox emitted malformed JSON" }),
-    );
-  }
-  const decoded = sandboxOutputSchema.safeParse(parsed.value);
-  if (!decoded.success) {
-    return Result.err(
-      new WorkflowSandboxOutputInvalid({
-        message: "Workflow sandbox emitted an invalid protocol message",
-      }),
-    );
-  }
-  return Result.ok(decoded.data);
+  return parsed
+    .mapError(
+      () =>
+        new WorkflowSandboxOutputInvalid({
+          message: "Workflow sandbox emitted malformed JSON",
+        }),
+    )
+    .andThen((value) => {
+      const decoded = sandboxOutputSchema.safeParse(value);
+      if (!decoded.success) {
+        return Result.err(
+          new WorkflowSandboxOutputInvalid({
+            message: "Workflow sandbox emitted an invalid protocol message",
+          }),
+        );
+      }
+      return Result.ok(decoded.data);
+    });
 }
 
 function boundedJsonLine(value: JsonObject): ResultType<string, WorkflowSandboxExecutionFailed> {
@@ -148,15 +155,13 @@ function captureSandboxTerminationSync<T>(
     try: effect,
     catch: projectRuntimeError(`Opaque ${operation}`),
   });
-  if (started.status === "error") {
-    if (Panic.is(started.error)) return Result.err(started.error);
-    return Result.err(
-      new WorkflowSandboxTerminationFailed({
-        message: `${operation}: ${started.error.message}`,
-      }),
-    );
-  }
-  return Result.ok(started.value);
+  return started.mapError((error) =>
+    Panic.is(error)
+      ? error
+      : new WorkflowSandboxTerminationFailed({
+          message: `${operation}: ${error.message}`,
+        }),
+  );
 }
 
 async function captureSandboxTerminationPromise<T>(
@@ -164,8 +169,18 @@ async function captureSandboxTerminationPromise<T>(
   effect: () => Promise<T>,
 ): Promise<ResultType<T, WorkflowSandboxTerminationFailed | Panic>> {
   const started = captureSandboxTerminationSync(operation, () => ({ promise: effect() }));
-  if (started.status === "error") return Result.err(started.error);
-  const [settled] = await Promise.allSettled([started.value.promise]);
+  const startedOutcome = started.match<
+    | { readonly kind: "ok"; readonly promise: Promise<T> }
+    | {
+        readonly kind: "error";
+        readonly error: WorkflowSandboxTerminationFailed | Panic;
+      }
+  >({
+    ok: ({ promise }) => ({ kind: "ok", promise }),
+    err: (error) => ({ kind: "error", error }),
+  });
+  if (startedOutcome.kind === "error") return Result.err(startedOutcome.error);
+  const [settled] = await Promise.allSettled([startedOutcome.promise]);
   if (settled.status === "fulfilled") return Result.ok(settled.value);
   if (Panic.is(settled.reason)) return Result.err(settled.reason);
   return Result.err(
@@ -192,17 +207,26 @@ export function startWorkflowSandbox(input: {
     return { result, cancel: () => cancelPromise };
   }
   const manifest = parseWorkflowCallSiteManifestUnchecked(input.source);
-  if (manifest.status === "error") {
+  const manifestOutcome = manifest.match<
+    | { readonly kind: "ok"; readonly entries: readonly WorkflowCallSiteManifestEntry[] }
+    | { readonly kind: "error"; readonly message: string }
+  >({
+    ok: (entries) => ({ kind: "ok", entries }),
+    err: (error) => ({ kind: "error", message: error.message }),
+  });
+  if (manifestOutcome.kind === "error") {
     const result = Promise.resolve(
       Result.err<JsonValue, WorkflowSandboxError>(
-        new WorkflowSandboxExecutionFailed({ message: manifest.error.message }),
+        new WorkflowSandboxExecutionFailed({ message: manifestOutcome.message }),
       ),
     );
     const cancelPromise: Promise<ResultType<void, WorkflowSandboxTerminationFailed>> =
       Promise.resolve(Result.ok(undefined));
     return { result, cancel: () => cancelPromise };
   }
-  const allowedCallSites = new Map(manifest.value.map((entry) => [entry.callSiteId, entry.kind]));
+  const allowedCallSites = new Map(
+    manifestOutcome.entries.map((entry) => [entry.callSiteId, entry.kind]),
+  );
   const runtime = input.runtimeProbes ?? defaultRuntimeProbes;
   const helperPath = path.join(import.meta.dir, "workflow-sandbox-child.js");
   const command = [process.execPath, "--smol", helperPath] as const;
@@ -240,14 +264,16 @@ export function startWorkflowSandbox(input: {
     ]);
     if (raced.type === "exit") {
       void delay.then((late) => {
-        if (late.status === "error" && Panic.is(late.error)) {
-          input.reportFatalPanic?.(late.error);
-        }
+        late.match({
+          ok: () => undefined,
+          err: (error) => {
+            if (Panic.is(error)) input.reportFatalPanic?.(error);
+          },
+        });
       });
       return Result.ok(true);
     }
-    if (raced.result.status === "error") return Result.err(raced.result.error);
-    return Result.ok(false);
+    return raced.result.map(() => false);
   };
 
   const performTermination = async (): Promise<
@@ -258,9 +284,13 @@ export function startWorkflowSandbox(input: {
     const record = (
       result: ResultType<unknown, WorkflowSandboxTerminationFailed | Panic>,
     ): void => {
-      if (result.status === "ok") return;
-      if (Panic.is(result.error)) cleanupPanic ??= result.error;
-      else failures.push(result.error);
+      result.match({
+        ok: () => undefined,
+        err: (error) => {
+          if (Panic.is(error)) cleanupPanic ??= error;
+          else failures.push(error);
+        },
+      });
     };
 
     record(
@@ -279,7 +309,11 @@ export function startWorkflowSandbox(input: {
         "Workflow sandbox SIGTERM grace wait failed",
       );
       record(grace);
-      if (grace.status === "error" || !grace.value) {
+      const exitedAfterGrace = grace.match({
+        ok: (exited) => exited,
+        err: () => false,
+      });
+      if (!exitedAfterGrace) {
         record(
           captureSandboxTerminationSync("Workflow sandbox SIGKILL failed", () =>
             subprocess.kill("SIGKILL"),
@@ -290,7 +324,11 @@ export function startWorkflowSandbox(input: {
           "Workflow sandbox SIGKILL exit wait failed",
         );
         record(killed);
-        if (killed.status === "ok" && !killed.value) {
+        const exitedAfterKill = killed.match({
+          ok: (exited) => exited,
+          err: () => true,
+        });
+        if (!exitedAfterKill) {
           failures.push(
             new WorkflowSandboxTerminationFailed({
               message: `Workflow sandbox process did not exit within ${KILL_EXIT_TIMEOUT_MS}ms after SIGKILL`,
@@ -327,9 +365,10 @@ export function startWorkflowSandbox(input: {
         return;
       }
       resolveTermination(
-        settled.value.status === "error"
-          ? new WorkflowSandboxTerminationSignal(settled.value.error.message)
-          : cause,
+        settled.value.match({
+          ok: () => cause,
+          err: (error) => new WorkflowSandboxTerminationSignal(error.message),
+        }),
       );
     });
     return terminationPromise;
@@ -365,17 +404,15 @@ export function startWorkflowSandbox(input: {
       if (!(cause instanceof Error)) throw cause;
       response = Result.err(cause);
     }
-    const encoded = boundedJsonLine(
-      response.status === "error"
-        ? { type: "reject", id: message.id, error: response.error.message }
-        : { type: "resolve", id: message.id, value: response.value },
-    );
-    if (encoded.status === "error") return Result.err(encoded.error);
-    const written = await settleSandboxExternal(() => subprocess.stdin.write(encoded.value));
-    if (written.status === "error") {
-      return Result.err(written.error);
-    }
-    return Result.ok(undefined);
+    const payload = response.match<JsonObject>({
+      ok: (value) => ({ type: "resolve", id: message.id, value }),
+      err: (error) => ({ type: "reject", id: message.id, error: error.message }),
+    });
+    return Result.gen(async function* () {
+      const encoded = yield* boundedJsonLine(payload);
+      yield* Result.await(settleSandboxExternal(() => subprocess.stdin.write(encoded)));
+      return Result.ok(undefined);
+    });
   };
 
   const executionResult = (async (): Promise<ResultType<JsonValue, WorkflowSandboxError>> => {
@@ -398,8 +435,15 @@ export function startWorkflowSandbox(input: {
     })();
 
     const startLine = boundedJsonLine({ type: "start", source: input.source, args: input.args });
-    if (startLine.status === "error") return Result.err(startLine.error);
-    subprocess.stdin.write(startLine.value);
+    const startOutcome = startLine.match<
+      | { readonly kind: "ok"; readonly line: string }
+      | { readonly kind: "error"; readonly error: WorkflowSandboxExecutionFailed }
+    >({
+      ok: (line) => ({ kind: "ok", line }),
+      err: (error) => ({ kind: "error", error }),
+    });
+    if (startOutcome.kind === "error") return Result.err(startOutcome.error);
+    subprocess.stdin.write(startOutcome.line);
 
     const decoder = new TextDecoder();
     let buffered = "";
@@ -433,11 +477,20 @@ export function startWorkflowSandbox(input: {
         buffered = buffered.slice(newline + 1);
         if (!line) continue;
         const decoded = await decodeWorkflowSandboxOutputLine(line);
-        if (decoded.status === "error") {
-          await terminate(decoded.error);
-          return Result.err(new WorkflowSandboxExecutionFailed({ message: decoded.error.message }));
+        const decodedOutcome = decoded.match<
+          | { readonly kind: "ok"; readonly message: z.output<typeof sandboxOutputSchema> }
+          | { readonly kind: "error"; readonly error: WorkflowSandboxOutputInvalid }
+        >({
+          ok: (message) => ({ kind: "ok", message }),
+          err: (error) => ({ kind: "error", error }),
+        });
+        if (decodedOutcome.kind === "error") {
+          await terminate(decodedOutcome.error);
+          return Result.err(
+            new WorkflowSandboxExecutionFailed({ message: decodedOutcome.error.message }),
+          );
         }
-        const message = decoded.value;
+        const message = decodedOutcome.message;
         if (message.type === "call") {
           if (allowedCallSites.get(message.callSiteId) !== message.kind) {
             const failure = new WorkflowSandboxExecutionFailed({
@@ -447,16 +500,18 @@ export function startWorkflowSandbox(input: {
             return Result.err(failure);
           }
           const hostCall = respondToHostCall(message).then(
-            async (outcome) => {
-              if (outcome.status === "error") {
-                if (!hasHostDefect) {
-                  hasHostDefect = true;
-                  firstHostDefect = outcome.error;
-                }
-                await terminate(outcome.error);
-              }
-              return outcome;
-            },
+            (outcome) =>
+              outcome.match<Promise<ResultType<void, WorkflowSandboxExecutionFailed>>>({
+                ok: () => Promise.resolve(outcome),
+                err: async (error) => {
+                  if (!hasHostDefect) {
+                    hasHostDefect = true;
+                    firstHostDefect = error;
+                  }
+                  await terminate(error);
+                  return outcome;
+                },
+              }),
             async (cause: unknown) => {
               if (!hasHostDefect) {
                 hasHostDefect = true;
@@ -491,8 +546,15 @@ export function startWorkflowSandbox(input: {
     }
     const exit = await launcherExited;
     const stderrResult = await stderrPromise;
-    if (stderrResult.status === "error") return Result.err(stderrResult.error);
-    const stderr = stderrResult.value.trim();
+    const stderrOutcome = stderrResult.match<
+      | { readonly kind: "ok"; readonly stderr: string }
+      | { readonly kind: "error"; readonly error: WorkflowSandboxExecutionFailed }
+    >({
+      ok: (stderr) => ({ kind: "ok", stderr: stderr.trim() }),
+      err: (error) => ({ kind: "error", error }),
+    });
+    if (stderrOutcome.kind === "error") return Result.err(stderrOutcome.error);
+    const stderr = stderrOutcome.stderr;
     const terminalError = currentTerminationError();
     if (terminalError) {
       if (terminalError === cancellationError) {

@@ -202,8 +202,9 @@ export class WorkflowDefinitionStore {
       }
       const canonicalWorkspaceRoot = await fs.realpath(params.workspaceRoot);
       const canonicalDataDir = await canonicalDirectory(params.dataDir, "create");
-      if (canonicalDataDir.status === "error") return Result.err(canonicalDataDir.error);
-      return Result.ok(new WorkflowDefinitionStore(canonicalWorkspaceRoot, canonicalDataDir.value));
+      return canonicalDataDir.map(
+        (dataDir) => new WorkflowDefinitionStore(canonicalWorkspaceRoot, dataDir),
+      );
     });
   }
 
@@ -252,13 +253,12 @@ export class WorkflowDefinitionStore {
     }
     const name = parsedName.data;
     const rootResult = await this.scopeRoot(scope, createRoot, operation);
-    if (rootResult.status === "error") return Result.err(rootResult.error);
-    const root = rootResult.value;
-    const candidate = path.join(root, `${name}.js`);
-    if (!isContained(root, candidate) || path.dirname(candidate) !== root) {
-      return Result.err(storeFailure(operation, `Workflow definition escapes scope root: ${name}`));
-    }
-    return Result.ok({ name, root, candidate });
+    return rootResult.andThen((root) => {
+      const candidate = path.join(root, `${name}.js`);
+      return !isContained(root, candidate) || path.dirname(candidate) !== root
+        ? Result.err(storeFailure(operation, `Workflow definition escapes scope root: ${name}`))
+        : Result.ok({ name, root, candidate });
+    });
   }
 
   private async validateSource(
@@ -268,10 +268,9 @@ export class WorkflowDefinitionStore {
     },
     operation: WorkflowDefinitionStoreOperation,
   ): Promise<ResultType<ValidatedWorkflowDefinition, WorkflowDefinitionStoreFailed>> {
-    const validated = validateWorkflowSourceUnchecked(input);
-    return validated.status === "error"
-      ? Result.err(storeFailure(operation, validated.error.message))
-      : Result.ok(validated.value);
+    return validateWorkflowSourceUnchecked(input).mapError((error) =>
+      storeFailure(operation, error.message),
+    );
   }
 
   private async getUnchecked(params: {
@@ -284,42 +283,70 @@ export class WorkflowDefinitionStore {
     }
     const scopes: readonly WorkflowScope[] =
       params.scope === "auto" ? ["project", "personal"] : [parsedScope.data!];
-    for (const scope of scopes) {
+    const resolveScope = async (
+      index: number,
+    ): Promise<ResultType<ResolvedWorkflowDefinition, WorkflowDefinitionStoreFailed>> => {
+      const scope = scopes[index];
+      if (!scope) {
+        return Result.err(
+          storeFailure(
+            "get",
+            `Workflow definition not found: ${params.name} (scope=${params.scope})`,
+          ),
+        );
+      }
       const locationResult = await this.definitionPath(scope, params.name, false, "get");
-      if (locationResult.status === "error") return Result.err(locationResult.error);
-      const location = locationResult.value;
-      const rootStats = await lstatOrNull(location.root);
-      if (!rootStats) continue;
-      if (rootStats.isSymbolicLink() || !rootStats.isDirectory()) {
-        return Result.err(
-          storeFailure("get", `Workflow scope root must be a real directory: ${location.root}`),
-        );
-      }
-      const root = await fs.realpath(location.root);
-      const fileStats = await lstatOrNull(location.candidate);
-      if (!fileStats) continue;
-      const file = await readBoundedRegularFile(location.candidate, "get");
-      if (file.status === "error") return Result.err(file.error);
-      const { source, canonicalPath } = file.value;
-      if (!isContained(root, canonicalPath) || path.dirname(canonicalPath) !== root) {
-        return Result.err(
-          storeFailure("get", `Workflow definition escapes canonical scope root: ${canonicalPath}`),
-        );
-      }
-      const validation = await this.validateSource({ name: location.name, source }, "get");
-      if (validation.status === "error") return Result.err(validation.error);
-      return Result.ok({
-        scope,
-        name: location.name,
-        normalizedPath: `${location.name}.js`,
-        canonicalPath,
-        source,
-        validation: validation.value,
+      const continueWithLocation = locationResult.match<
+        () => Promise<ResultType<ResolvedWorkflowDefinition, WorkflowDefinitionStoreFailed>>
+      >({
+        err: (error) => async () => Result.err(error),
+        ok: (location) => async () => {
+          const rootStats = await lstatOrNull(location.root);
+          if (!rootStats) return resolveScope(index + 1);
+          if (rootStats.isSymbolicLink() || !rootStats.isDirectory()) {
+            return Result.err(
+              storeFailure("get", `Workflow scope root must be a real directory: ${location.root}`),
+            );
+          }
+          const root = await fs.realpath(location.root);
+          const fileStats = await lstatOrNull(location.candidate);
+          if (!fileStats) return resolveScope(index + 1);
+          const fileResult = await readBoundedRegularFile(location.candidate, "get");
+          const continueWithFile = fileResult.match<
+            () => Promise<ResultType<ResolvedWorkflowDefinition, WorkflowDefinitionStoreFailed>>
+          >({
+            err: (error) => async () => Result.err(error),
+            ok:
+              ({ source, canonicalPath }) =>
+              async () => {
+                if (!isContained(root, canonicalPath) || path.dirname(canonicalPath) !== root) {
+                  return Result.err(
+                    storeFailure(
+                      "get",
+                      `Workflow definition escapes canonical scope root: ${canonicalPath}`,
+                    ),
+                  );
+                }
+                const validationResult = await this.validateSource(
+                  { name: location.name, source },
+                  "get",
+                );
+                return validationResult.map((validation) => ({
+                  scope,
+                  name: location.name,
+                  normalizedPath: `${location.name}.js`,
+                  canonicalPath,
+                  source,
+                  validation,
+                }));
+              },
+          });
+          return continueWithFile();
+        },
       });
-    }
-    return Result.err(
-      storeFailure("get", `Workflow definition not found: ${params.name} (scope=${params.scope})`),
-    );
+      return continueWithLocation();
+    };
+    return resolveScope(0);
   }
 
   async getResult(params: {
@@ -339,16 +366,43 @@ export class WorkflowDefinitionStore {
     if (!parsedScope.success) return Result.err(storeFailure("save", "Workflow scope is invalid"));
     const scope = parsedScope.data;
     const locationResult = await this.definitionPath(scope, params.name, true, "save");
-    if (locationResult.status === "error") return Result.err(locationResult.error);
-    const location = locationResult.value;
-    const validation = await this.validateSource(
-      {
-        name: location.name,
-        source: params.source,
-      },
-      "save",
-    );
-    if (validation.status === "error") return Result.err(validation.error);
+    const prepare = locationResult.match<
+      () => Promise<
+        ResultType<
+          {
+            location: { name: string; root: string; candidate: string };
+            validation: ValidatedWorkflowDefinition;
+          },
+          WorkflowDefinitionStoreFailed
+        >
+      >
+    >({
+      err: (error) => async () => Result.err(error),
+      ok: (location) => async () =>
+        (
+          await this.validateSource(
+            {
+              name: location.name,
+              source: params.source,
+            },
+            "save",
+          )
+        ).map((validation) => ({ location, validation })),
+    });
+    const prepared = await prepare();
+    const preparedOutcome = prepared.match<
+      | {
+          readonly kind: "ok";
+          readonly location: { name: string; root: string; candidate: string };
+          readonly validation: ValidatedWorkflowDefinition;
+        }
+      | { readonly kind: "error"; readonly error: WorkflowDefinitionStoreFailed }
+    >({
+      ok: ({ location, validation }) => ({ kind: "ok", location, validation }),
+      err: (error) => ({ kind: "error", error }),
+    });
+    if (preparedOutcome.kind === "error") return Result.err(preparedOutcome.error);
+    const { location, validation } = preparedOutcome;
     const lockPath = path.join(location.root, `.${location.name}.save.lock`);
     const [openedLock] = await Promise.allSettled([fs.open(lockPath, "wx", 0o600)]);
     if (openedLock.status === "rejected") {
@@ -365,8 +419,15 @@ export class WorkflowDefinitionStore {
       const existingStats = await lstatOrNull(location.candidate);
       if (existingStats) {
         const existingResult = await readBoundedRegularFile(location.candidate, "save");
-        if (existingResult.status === "error") return Result.err(existingResult.error);
-        const existing = existingResult.value;
+        const existingOutcome = existingResult.match<
+          | { readonly kind: "ok"; readonly source: string; readonly canonicalPath: string }
+          | { readonly kind: "error"; readonly error: WorkflowDefinitionStoreFailed }
+        >({
+          ok: (existing) => ({ kind: "ok", ...existing }),
+          err: (error) => ({ kind: "error", error }),
+        });
+        if (existingOutcome.kind === "error") return Result.err(existingOutcome.error);
+        const existing = existingOutcome;
         if (!isContained(location.root, existing.canonicalPath)) {
           return Result.err(
             storeFailure(
@@ -424,8 +485,15 @@ export class WorkflowDefinitionStore {
       }
 
       const saved = await readBoundedRegularFile(location.candidate, "save");
-      if (saved.status === "error") return Result.err(saved.error);
-      const { canonicalPath } = saved.value;
+      const savedOutcome = saved.match<
+        | { readonly kind: "ok"; readonly canonicalPath: string }
+        | { readonly kind: "error"; readonly error: WorkflowDefinitionStoreFailed }
+      >({
+        ok: ({ canonicalPath }) => ({ kind: "ok", canonicalPath }),
+        err: (error) => ({ kind: "error", error }),
+      });
+      if (savedOutcome.kind === "error") return Result.err(savedOutcome.error);
+      const { canonicalPath } = savedOutcome;
       if (!isContained(location.root, canonicalPath)) {
         return Result.err(
           storeFailure("save", `Saved workflow escapes canonical scope root: ${canonicalPath}`),
@@ -437,7 +505,7 @@ export class WorkflowDefinitionStore {
         normalizedPath: `${location.name}.js`,
         canonicalPath,
         source: params.source,
-        validation: validation.value,
+        validation,
       });
     } finally {
       await lock.close();
@@ -490,8 +558,15 @@ export class WorkflowDefinitionStore {
     > = [];
     for (const scope of scopes) {
       const rootResult = await this.scopeRoot(scope, false, "list");
-      if (rootResult.status === "error") return Result.err(rootResult.error);
-      const rootCandidate = rootResult.value;
+      const rootOutcome = rootResult.match<
+        | { readonly kind: "ok"; readonly root: string }
+        | { readonly kind: "error"; readonly error: WorkflowDefinitionStoreFailed }
+      >({
+        ok: (root) => ({ kind: "ok", root }),
+        err: (error) => ({ kind: "error", error }),
+      });
+      if (rootOutcome.kind === "error") return Result.err(rootOutcome.error);
+      const rootCandidate = rootOutcome.root;
       const rootStats = await lstatOrNull(rootCandidate);
       if (!rootStats) continue;
       if (rootStats.isSymbolicLink() || !rootStats.isDirectory()) {
@@ -507,25 +582,26 @@ export class WorkflowDefinitionStore {
         seen.add(name);
         const candidate = path.join(rootCandidate, entry.name);
         const resolved = await this.getResult({ scope, name });
-        if (resolved.status === "ok") {
-          results.push({
-            scope,
-            name,
-            normalizedPath: resolved.value.normalizedPath,
-            canonicalPath: resolved.value.canonicalPath,
-            validation: resolved.value.validation,
-            valid: true,
-          });
-        } else {
-          results.push({
-            scope,
-            name,
-            normalizedPath: entry.name,
-            canonicalPath: candidate,
-            valid: false,
-            error: resolved.error.message,
-          });
-        }
+        resolved.match({
+          ok: (definition) =>
+            results.push({
+              scope,
+              name,
+              normalizedPath: definition.normalizedPath,
+              canonicalPath: definition.canonicalPath,
+              validation: definition.validation,
+              valid: true,
+            }),
+          err: (error) =>
+            results.push({
+              scope,
+              name,
+              normalizedPath: entry.name,
+              canonicalPath: candidate,
+              valid: false,
+              error: error.message,
+            }),
+        });
       }
     }
     return Result.ok(results);
@@ -559,14 +635,28 @@ export class WorkflowDefinitionStore {
       ["workflow-snapshots"],
       "create-snapshot",
     );
-    if (rootResult.status === "error") return Result.err(rootResult.error);
-    const root = rootResult.value;
+    const rootOutcome = rootResult.match<
+      | { readonly kind: "ok"; readonly root: string }
+      | { readonly kind: "error"; readonly error: WorkflowDefinitionStoreFailed }
+    >({
+      ok: (root) => ({ kind: "ok", root }),
+      err: (error) => ({ kind: "error", error }),
+    });
+    if (rootOutcome.kind === "error") return Result.err(rootOutcome.error);
+    const root = rootOutcome.root;
     const snapshotPath = path.join(root, `${sourceSha256}.js`);
     const existing = await lstatOrNull(snapshotPath);
     if (existing) {
       const storedResult = await readBoundedRegularFile(snapshotPath, "create-snapshot");
-      if (storedResult.status === "error") return Result.err(storedResult.error);
-      const stored = storedResult.value;
+      const storedOutcome = storedResult.match<
+        | { readonly kind: "ok"; readonly source: string; readonly canonicalPath: string }
+        | { readonly kind: "error"; readonly error: WorkflowDefinitionStoreFailed }
+      >({
+        ok: (stored) => ({ kind: "ok", ...stored }),
+        err: (error) => ({ kind: "error", error }),
+      });
+      if (storedOutcome.kind === "error") return Result.err(storedOutcome.error);
+      const stored = storedOutcome;
       if (!isContained(root, stored.canonicalPath) || sha256(stored.source) !== sourceSha256) {
         return Result.err(
           storeFailure(
@@ -584,8 +674,11 @@ export class WorkflowDefinitionStore {
     if (opened.status === "rejected") {
       if (isPanic(opened.reason)) preserveToolPanic(opened.reason);
       const storedResult = await readBoundedRegularFile(snapshotPath, "create-snapshot");
-      if (storedResult.status === "ok") {
-        const stored = storedResult.value;
+      const stored = storedResult.match({
+        ok: (value) => value,
+        err: () => null,
+      });
+      if (stored) {
         if (isContained(root, stored.canonicalPath) && sha256(stored.source) === sourceSha256) {
           return Result.ok({
             artifactId: `workflow-source:${sourceSha256}`,
@@ -630,26 +723,35 @@ export class WorkflowDefinitionStore {
       return Result.err(storeFailure("read-snapshot", "Invalid workflow source hash"));
     }
     const rootResult = await this.scopeRootForSnapshots("read-snapshot");
-    if (rootResult.status === "error") return Result.err(rootResult.error);
-    const root = rootResult.value;
-    const snapshotPath = path.join(root, `${sourceSha256}.js`);
-    const storedResult = await readBoundedRegularFile(snapshotPath, "read-snapshot");
-    if (storedResult.status === "error") return Result.err(storedResult.error);
-    const stored = storedResult.value;
-    if (!isContained(root, stored.canonicalPath) || path.dirname(stored.canonicalPath) !== root) {
-      return Result.err(
-        storeFailure(
-          "read-snapshot",
-          `Workflow snapshot escapes canonical root: ${stored.canonicalPath}`,
-        ),
-      );
-    }
-    if (sha256(stored.source) !== sourceSha256) {
-      return Result.err(
-        storeFailure("read-snapshot", `Workflow snapshot hash mismatch: ${sourceSha256}`),
-      );
-    }
-    return Result.ok(stored.source);
+    const continueWithRoot = rootResult.match<
+      () => Promise<ResultType<string, WorkflowDefinitionStoreFailed>>
+    >({
+      err: (error) => async () => Result.err(error),
+      ok: (root) => async () => {
+        const snapshotPath = path.join(root, `${sourceSha256}.js`);
+        const storedResult = await readBoundedRegularFile(snapshotPath, "read-snapshot");
+        return storedResult.andThen((stored) => {
+          if (
+            !isContained(root, stored.canonicalPath) ||
+            path.dirname(stored.canonicalPath) !== root
+          ) {
+            return Result.err(
+              storeFailure(
+                "read-snapshot",
+                `Workflow snapshot escapes canonical root: ${stored.canonicalPath}`,
+              ),
+            );
+          }
+          if (sha256(stored.source) !== sourceSha256) {
+            return Result.err(
+              storeFailure("read-snapshot", `Workflow snapshot hash mismatch: ${sourceSha256}`),
+            );
+          }
+          return Result.ok(stored.source);
+        });
+      },
+    });
+    return continueWithRoot();
   }
 
   async readSnapshotResult(

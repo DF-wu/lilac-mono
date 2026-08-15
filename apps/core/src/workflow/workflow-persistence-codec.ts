@@ -7,11 +7,11 @@ import {
   type PersistedDataIssueCode,
   type PersistenceProvenance,
 } from "@stanley2058/lilac-utils";
-import { Result, type Result as ResultType } from "better-result";
+import { Panic, Result, type Result as ResultType } from "better-result";
 import { z } from "zod";
 
 import { projectRuntimeError } from "../runtime/error-format";
-import { preserveToolPanic } from "../tools/tool-result-adapters";
+import { adaptToolResultToHost } from "../tools/tool-result-adapters";
 import {
   jsonValueSchema,
   workflowOperationSchema,
@@ -369,26 +369,29 @@ function decodeJson(input: {
   readonly field: string;
   readonly version: number;
   readonly recordId: string;
-}): ResultType<unknown, MalformedSerialization> {
+}): ResultType<unknown, MalformedSerialization | Panic> {
   const parsed = Result.try({
     try: () => JSON.parse(input.raw),
     catch: projectRuntimeError("Opaque workflow persistence JSON failure"),
   });
-  if (parsed.status === "error") {
-    preserveToolPanic(parsed.error);
-    return Result.err(
-      new MalformedSerialization(
-        diagnostic({
-          table: input.table,
-          field: input.field,
-          version: input.version,
-          issueCode: "malformed-json",
-          recordId: input.recordId,
-        }),
-      ),
-    );
-  }
-  return Result.ok(parsed.value);
+  const finish = parsed.match<() => ResultType<unknown, MalformedSerialization | Panic>>({
+    ok: (value) => () => Result.ok(value),
+    err: (error) => () => {
+      if (Panic.is(error)) return Result.err(error);
+      return Result.err(
+        new MalformedSerialization(
+          diagnostic({
+            table: input.table,
+            field: input.field,
+            version: input.version,
+            issueCode: "malformed-json",
+            recordId: input.recordId,
+          }),
+        ),
+      );
+    },
+  });
+  return finish();
 }
 
 function decodeJsonField<T>(input: {
@@ -398,20 +401,20 @@ function decodeJsonField<T>(input: {
   readonly field: string;
   readonly version: number;
   readonly recordId: string;
-}): ResultType<T, MalformedSerialization | CorruptPersistedFields> {
-  const parsed = decodeJson(input);
-  if (parsed.status === "error") return Result.err(parsed.error);
-  const decoded = input.schema.safeParse(parsed.value);
-  if (decoded.success) return Result.ok(decoded.data);
-  return Result.err(
-    corrupt({
-      table: input.table,
-      field: input.field,
-      version: input.version,
-      issueCode: "invalid-row-field",
-      recordId: input.recordId,
-    }),
-  );
+}): ResultType<T, MalformedSerialization | CorruptPersistedFields | Panic> {
+  return decodeJson(input).andThen((parsed) => {
+    const decoded = input.schema.safeParse(parsed);
+    if (decoded.success) return Result.ok(decoded.data);
+    return Result.err(
+      corrupt({
+        table: input.table,
+        field: input.field,
+        version: input.version,
+        issueCode: "invalid-row-field",
+        recordId: input.recordId,
+      }),
+    );
+  });
 }
 
 function decodeNullableJsonField<T>(input: {
@@ -421,7 +424,7 @@ function decodeNullableJsonField<T>(input: {
   readonly field: string;
   readonly version: number;
   readonly recordId: string;
-}): ResultType<T | null, MalformedSerialization | CorruptPersistedFields> {
+}): ResultType<T | null, MalformedSerialization | CorruptPersistedFields | Panic> {
   if (input.raw === null) return Result.ok(null);
   return decodeJsonField({ ...input, raw: input.raw });
 }
@@ -440,589 +443,603 @@ function provenance<T>(value: T, version: DecodedWorkflowSchemaVersion): Decoded
   return { value, provenance: version.provenance };
 }
 
+type WorkflowPersistenceDecodeError = PersistedDataError | Panic;
+
+function adaptWorkflowPersistenceDecodeResult<T>(
+  result: ResultType<T, WorkflowPersistenceDecodeError>,
+): ResultType<T, PersistedDataError> {
+  const adapt = result.match<() => ResultType<T, PersistedDataError>>({
+    ok: (value) => () => Result.ok(value),
+    err: (error) => () => {
+      if (Panic.is(error)) return adaptToolResultToHost(Result.err(error));
+      return Result.err(error);
+    },
+  });
+  return adapt();
+}
+
 function decodeWorkflowRevisionRow(input: {
   readonly row: WorkflowPersistedRow;
   readonly schemaVersion: number;
-}): ResultType<DecodedPersistedValue<WorkflowRevision>, PersistedDataError> {
-  const table = "workflow_revisions";
-  const recordId = recordIdFromRow(input.row, "revision_id");
-  const version = decodeSchemaVersion(input.schemaVersion, table, recordId);
-  if (version.status === "error") return Result.err(version.error);
-  const row = revisionRowSchema.safeParse(input.row);
-  if (!row.success) return Result.err(invalidRow(table, version.value.version, recordId));
-  const fields = [
-    ["metadata_json", row.data.metadata_json],
-    ["input_schema_json", row.data.input_schema_json],
-    ["capabilities_json", row.data.capabilities_json],
-    ["limits_json", row.data.limits_json],
-  ] as const;
-  const decoded: JsonValue[] = [];
-  for (const [field, raw] of fields) {
-    const value = decodeJsonField({
-      raw,
-      schema: jsonValueSchema,
-      table,
-      field,
-      version: version.value.version,
-      recordId,
+}): ResultType<DecodedPersistedValue<WorkflowRevision>, WorkflowPersistenceDecodeError> {
+  return Result.gen(function* () {
+    const table = "workflow_revisions";
+    const recordId = recordIdFromRow(input.row, "revision_id");
+    const version = yield* decodeSchemaVersion(input.schemaVersion, table, recordId);
+    const row = revisionRowSchema.safeParse(input.row);
+    if (!row.success) return Result.err(invalidRow(table, version.version, recordId));
+    const fields = [
+      ["metadata_json", row.data.metadata_json],
+      ["input_schema_json", row.data.input_schema_json],
+      ["capabilities_json", row.data.capabilities_json],
+      ["limits_json", row.data.limits_json],
+    ] as const;
+    const decoded: JsonValue[] = [];
+    for (const [field, raw] of fields) {
+      const value = yield* decodeJsonField({
+        raw,
+        schema: jsonValueSchema,
+        table,
+        field,
+        version: version.version,
+        recordId,
+      });
+      decoded.push(value);
+    }
+    const value = workflowRevisionSchema.safeParse({
+      revisionId: row.data.revision_id,
+      canonicalProjectId: row.data.canonical_project_id,
+      canonicalWorkspaceRoot: row.data.canonical_workspace_root,
+      scope: row.data.scope,
+      normalizedPath: row.data.normalized_path,
+      name: row.data.name,
+      snapshotArtifactId: row.data.snapshot_artifact_id,
+      sourceSha256: row.data.source_sha256,
+      inputSchemaSha256: row.data.input_schema_sha256,
+      resourcePolicySha256: row.data.capability_sha256,
+      metadata: decoded[0],
+      inputSchema: decoded[1],
+      resources: decoded[2],
+      limits: decoded[3],
+      runtimeVersion: row.data.runtime_version,
+      createdAt: row.data.created_at,
     });
-    if (value.status === "error") return Result.err(value.error);
-    decoded.push(value.value);
-  }
-  const value = workflowRevisionSchema.safeParse({
-    revisionId: row.data.revision_id,
-    canonicalProjectId: row.data.canonical_project_id,
-    canonicalWorkspaceRoot: row.data.canonical_workspace_root,
-    scope: row.data.scope,
-    normalizedPath: row.data.normalized_path,
-    name: row.data.name,
-    snapshotArtifactId: row.data.snapshot_artifact_id,
-    sourceSha256: row.data.source_sha256,
-    inputSchemaSha256: row.data.input_schema_sha256,
-    resourcePolicySha256: row.data.capability_sha256,
-    metadata: decoded[0],
-    inputSchema: decoded[1],
-    resources: decoded[2],
-    limits: decoded[3],
-    runtimeVersion: row.data.runtime_version,
-    createdAt: row.data.created_at,
+    if (!value.success) return Result.err(invalidRow(table, version.version, recordId));
+    return Result.ok(provenance(value.data, version));
   });
-  if (!value.success) return Result.err(invalidRow(table, version.value.version, recordId));
-  return Result.ok(provenance(value.data, version.value));
 }
 
 function decodeWorkflowRunRow(input: {
   readonly row: WorkflowPersistedRow;
   readonly schemaVersion: number;
-}): ResultType<DecodedPersistedValue<WorkflowRun>, PersistedDataError> {
-  const table = "workflow_runs";
-  const recordId = recordIdFromRow(input.row, "run_id");
-  const version = decodeSchemaVersion(input.schemaVersion, table, recordId);
-  if (version.status === "error") return Result.err(version.error);
-  const row = runRowSchema.safeParse(input.row);
-  if (!row.success) return Result.err(invalidRow(table, version.value.version, recordId));
-  const required = [
-    ["input_schema_json", row.data.input_schema_json],
-    ["args_json", row.data.args_json],
-    ["completion_target_json", row.data.completion_target_json],
-  ] as const;
-  const decoded: JsonValue[] = [];
-  for (const [field, raw] of required) {
-    const value = decodeJsonField({
-      raw,
+}): ResultType<DecodedPersistedValue<WorkflowRun>, WorkflowPersistenceDecodeError> {
+  return Result.gen(function* () {
+    const table = "workflow_runs";
+    const recordId = recordIdFromRow(input.row, "run_id");
+    const version = yield* decodeSchemaVersion(input.schemaVersion, table, recordId);
+    const row = runRowSchema.safeParse(input.row);
+    if (!row.success) return Result.err(invalidRow(table, version.version, recordId));
+    const required = [
+      ["input_schema_json", row.data.input_schema_json],
+      ["args_json", row.data.args_json],
+      ["completion_target_json", row.data.completion_target_json],
+    ] as const;
+    const decoded: JsonValue[] = [];
+    for (const [field, raw] of required) {
+      const value = yield* decodeJsonField({
+        raw,
+        schema: jsonValueSchema,
+        table,
+        field,
+        version: version.version,
+        recordId,
+      });
+      decoded.push(value);
+    }
+    const progressTarget = yield* decodeNullableJsonField({
+      raw: row.data.progress_target_json,
       schema: jsonValueSchema,
       table,
-      field,
-      version: version.value.version,
+      field: "progress_target_json",
+      version: version.version,
       recordId,
     });
-    if (value.status === "error") return Result.err(value.error);
-    decoded.push(value.value);
-  }
-  const progressTarget = decodeNullableJsonField({
-    raw: row.data.progress_target_json,
-    schema: jsonValueSchema,
-    table,
-    field: "progress_target_json",
-    version: version.value.version,
-    recordId,
+    const result = yield* decodeNullableJsonField({
+      raw: row.data.result_json,
+      schema: jsonValueSchema,
+      table,
+      field: "result_json",
+      version: version.version,
+      recordId,
+    });
+    const value = workflowRunSchema.safeParse({
+      runId: row.data.run_id,
+      revisionId: row.data.revision_id,
+      state: row.data.state,
+      inputSchemaSnapshot: decoded[0],
+      args: decoded[1],
+      argsSha256: row.data.args_sha256,
+      origin: {
+        requestId: row.data.origin_request_id,
+        sessionId: row.data.origin_session_id,
+        client: row.data.origin_client,
+        userId: row.data.origin_user_id,
+        projectCwd: row.data.origin_project_cwd,
+      },
+      completionTarget: decoded[2],
+      progressTarget,
+      terminalDetail: row.data.terminal_detail,
+      result,
+      resultArtifactId: row.data.result_artifact_id,
+      claimedBy: row.data.claimed_by,
+      claimedAt: row.data.claimed_at,
+      createdAt: row.data.created_at,
+      startedAt: row.data.started_at,
+      updatedAt: row.data.updated_at,
+      terminalAt: row.data.terminal_at,
+    });
+    if (!value.success) return Result.err(invalidRow(table, version.version, recordId));
+    return Result.ok(provenance(value.data, version));
   });
-  if (progressTarget.status === "error") return Result.err(progressTarget.error);
-  const result = decodeNullableJsonField({
-    raw: row.data.result_json,
-    schema: jsonValueSchema,
-    table,
-    field: "result_json",
-    version: version.value.version,
-    recordId,
-  });
-  if (result.status === "error") return Result.err(result.error);
-  const value = workflowRunSchema.safeParse({
-    runId: row.data.run_id,
-    revisionId: row.data.revision_id,
-    state: row.data.state,
-    inputSchemaSnapshot: decoded[0],
-    args: decoded[1],
-    argsSha256: row.data.args_sha256,
-    origin: {
-      requestId: row.data.origin_request_id,
-      sessionId: row.data.origin_session_id,
-      client: row.data.origin_client,
-      userId: row.data.origin_user_id,
-      projectCwd: row.data.origin_project_cwd,
-    },
-    completionTarget: decoded[2],
-    progressTarget: progressTarget.value,
-    terminalDetail: row.data.terminal_detail,
-    result: result.value,
-    resultArtifactId: row.data.result_artifact_id,
-    claimedBy: row.data.claimed_by,
-    claimedAt: row.data.claimed_at,
-    createdAt: row.data.created_at,
-    startedAt: row.data.started_at,
-    updatedAt: row.data.updated_at,
-    terminalAt: row.data.terminal_at,
-  });
-  if (!value.success) return Result.err(invalidRow(table, version.value.version, recordId));
-  return Result.ok(provenance(value.data, version.value));
 }
 
 function decodeWorkflowOperationRow(input: {
   readonly row: WorkflowPersistedRow;
   readonly schemaVersion: number;
-}): ResultType<DecodedPersistedValue<WorkflowOperation>, PersistedDataError> {
-  const table = "workflow_operations";
-  const rowId = recordIdFromRow(input.row, "operation_id");
-  const runId = recordIdFromRow(input.row, "run_id");
-  const recordId = runId === "unknown-record" ? rowId : `${runId}:${rowId}`.slice(0, 256);
-  const version = decodeSchemaVersion(input.schemaVersion, table, recordId);
-  if (version.status === "error") return Result.err(version.error);
-  const row = operationRowSchema.safeParse(input.row);
-  if (!row.success) return Result.err(invalidRow(table, version.value.version, recordId));
-  const operationInput = decodeJsonField({
-    raw: row.data.input_json,
-    schema: jsonValueSchema,
-    table,
-    field: "input_json",
-    version: version.value.version,
-    recordId,
+}): ResultType<DecodedPersistedValue<WorkflowOperation>, WorkflowPersistenceDecodeError> {
+  return Result.gen(function* () {
+    const table = "workflow_operations";
+    const rowId = recordIdFromRow(input.row, "operation_id");
+    const runId = recordIdFromRow(input.row, "run_id");
+    const recordId = runId === "unknown-record" ? rowId : `${runId}:${rowId}`.slice(0, 256);
+    const version = yield* decodeSchemaVersion(input.schemaVersion, table, recordId);
+    const row = operationRowSchema.safeParse(input.row);
+    if (!row.success) return Result.err(invalidRow(table, version.version, recordId));
+    const operationInput = yield* decodeJsonField({
+      raw: row.data.input_json,
+      schema: jsonValueSchema,
+      table,
+      field: "input_json",
+      version: version.version,
+      recordId,
+    });
+    const output = yield* decodeNullableJsonField({
+      raw: row.data.output_json,
+      schema: jsonValueSchema,
+      table,
+      field: "output_json",
+      version: version.version,
+      recordId,
+    });
+    const usage = yield* decodeNullableJsonField({
+      raw: row.data.usage_json,
+      schema: workflowUsageSchema,
+      table,
+      field: "usage_json",
+      version: version.version,
+      recordId,
+    });
+    const value = workflowOperationSchema.safeParse({
+      runId: row.data.run_id,
+      operationId: row.data.operation_id,
+      callSiteId: row.data.call_site_id,
+      parentOperationId: row.data.parent_operation_id,
+      phase: row.data.phase,
+      label: row.data.label,
+      kind: row.data.kind,
+      input: operationInput,
+      inputSha256: row.data.input_sha256,
+      state: row.data.state,
+      attempt: row.data.attempt,
+      requestId: row.data.request_id,
+      output,
+      resultArtifactId: row.data.result_artifact_id,
+      error: row.data.error,
+      usage,
+      claimedBy: row.data.claimed_by,
+      claimedAt: row.data.claimed_at,
+      createdAt: row.data.created_at,
+      startedAt: row.data.started_at,
+      updatedAt: row.data.updated_at,
+      terminalAt: row.data.terminal_at,
+    });
+    if (!value.success) return Result.err(invalidRow(table, version.version, recordId));
+    return Result.ok(provenance(value.data, version));
   });
-  if (operationInput.status === "error") return Result.err(operationInput.error);
-  const output = decodeNullableJsonField({
-    raw: row.data.output_json,
-    schema: jsonValueSchema,
-    table,
-    field: "output_json",
-    version: version.value.version,
-    recordId,
-  });
-  if (output.status === "error") return Result.err(output.error);
-  const usage = decodeNullableJsonField({
-    raw: row.data.usage_json,
-    schema: workflowUsageSchema,
-    table,
-    field: "usage_json",
-    version: version.value.version,
-    recordId,
-  });
-  if (usage.status === "error") return Result.err(usage.error);
-  const value = workflowOperationSchema.safeParse({
-    runId: row.data.run_id,
-    operationId: row.data.operation_id,
-    callSiteId: row.data.call_site_id,
-    parentOperationId: row.data.parent_operation_id,
-    phase: row.data.phase,
-    label: row.data.label,
-    kind: row.data.kind,
-    input: operationInput.value,
-    inputSha256: row.data.input_sha256,
-    state: row.data.state,
-    attempt: row.data.attempt,
-    requestId: row.data.request_id,
-    output: output.value,
-    resultArtifactId: row.data.result_artifact_id,
-    error: row.data.error,
-    usage: usage.value,
-    claimedBy: row.data.claimed_by,
-    claimedAt: row.data.claimed_at,
-    createdAt: row.data.created_at,
-    startedAt: row.data.started_at,
-    updatedAt: row.data.updated_at,
-    terminalAt: row.data.terminal_at,
-  });
-  if (!value.success) return Result.err(invalidRow(table, version.value.version, recordId));
-  return Result.ok(provenance(value.data, version.value));
 }
 
 function decodeWorkflowWaitRow(input: {
   readonly row: WorkflowPersistedRow;
   readonly schemaVersion: number;
-}): ResultType<DecodedPersistedValue<WorkflowWait>, PersistedDataError> {
-  const table = "workflow_waits";
-  const recordId =
-    `${recordIdFromRow(input.row, "run_id")}:${recordIdFromRow(input.row, "operation_id")}`.slice(
-      0,
-      256,
-    );
-  const version = decodeSchemaVersion(input.schemaVersion, table, recordId);
-  if (version.status === "error") return Result.err(version.error);
-  const row = waitRowSchema.safeParse(input.row);
-  if (!row.success) return Result.err(invalidRow(table, version.value.version, recordId));
-  const match = decodeJsonField({
-    raw: row.data.match_json,
-    schema: jsonValueSchema,
-    table,
-    field: "match_json",
-    version: version.value.version,
-    recordId,
+}): ResultType<DecodedPersistedValue<WorkflowWait>, WorkflowPersistenceDecodeError> {
+  return Result.gen(function* () {
+    const table = "workflow_waits";
+    const recordId =
+      `${recordIdFromRow(input.row, "run_id")}:${recordIdFromRow(input.row, "operation_id")}`.slice(
+        0,
+        256,
+      );
+    const version = yield* decodeSchemaVersion(input.schemaVersion, table, recordId);
+    const row = waitRowSchema.safeParse(input.row);
+    if (!row.success) return Result.err(invalidRow(table, version.version, recordId));
+    const match = yield* decodeJsonField({
+      raw: row.data.match_json,
+      schema: jsonValueSchema,
+      table,
+      field: "match_json",
+      version: version.version,
+      recordId,
+    });
+    const result = yield* decodeNullableJsonField({
+      raw: row.data.result_json,
+      schema: jsonValueSchema,
+      table,
+      field: "result_json",
+      version: version.version,
+      recordId,
+    });
+    const value = workflowWaitSchema.safeParse({
+      runId: row.data.run_id,
+      operationId: row.data.operation_id,
+      state: row.data.state,
+      match,
+      matchKey: row.data.match_key,
+      dueAt: row.data.due_at,
+      deadlineAt: row.data.deadline_at,
+      resolverCursor: row.data.resolver_cursor,
+      result,
+      resolvedBy: row.data.resolved_by,
+      claimedBy: row.data.claimed_by,
+      claimedAt: row.data.claimed_at,
+      createdAt: row.data.created_at,
+      updatedAt: row.data.updated_at,
+      resolvedAt: row.data.resolved_at,
+    });
+    if (!value.success) return Result.err(invalidRow(table, version.version, recordId));
+    if (row.data.match_kind !== value.data.match.kind) {
+      return Result.err(invalidRow(table, version.version, recordId));
+    }
+    return Result.ok(provenance(value.data, version));
   });
-  if (match.status === "error") return Result.err(match.error);
-  const result = decodeNullableJsonField({
-    raw: row.data.result_json,
-    schema: jsonValueSchema,
-    table,
-    field: "result_json",
-    version: version.value.version,
-    recordId,
-  });
-  if (result.status === "error") return Result.err(result.error);
-  const value = workflowWaitSchema.safeParse({
-    runId: row.data.run_id,
-    operationId: row.data.operation_id,
-    state: row.data.state,
-    match: match.value,
-    matchKey: row.data.match_key,
-    dueAt: row.data.due_at,
-    deadlineAt: row.data.deadline_at,
-    resolverCursor: row.data.resolver_cursor,
-    result: result.value,
-    resolvedBy: row.data.resolved_by,
-    claimedBy: row.data.claimed_by,
-    claimedAt: row.data.claimed_at,
-    createdAt: row.data.created_at,
-    updatedAt: row.data.updated_at,
-    resolvedAt: row.data.resolved_at,
-  });
-  if (!value.success) return Result.err(invalidRow(table, version.value.version, recordId));
-  if (row.data.match_kind !== value.data.match.kind) {
-    return Result.err(invalidRow(table, version.value.version, recordId));
-  }
-  return Result.ok(provenance(value.data, version.value));
 }
 
 function decodeWorkflowTriggerRow(input: {
   readonly row: WorkflowPersistedRow;
   readonly schemaVersion: number;
-}): ResultType<DecodedPersistedValue<WorkflowTrigger>, PersistedDataError> {
-  const table = "workflow_triggers";
-  const recordId = recordIdFromRow(input.row, "trigger_id");
-  const version = decodeSchemaVersion(input.schemaVersion, table, recordId);
-  if (version.status === "error") return Result.err(version.error);
-  const row = triggerRowSchema.safeParse(input.row);
-  if (!row.success) return Result.err(invalidRow(table, version.value.version, recordId));
-  const required = [
-    ["definition_json", row.data.definition_json],
-    ["args_json", row.data.args_json],
-    ["scheduling_policy_json", row.data.scheduling_policy_json],
-    ["origin_json", row.data.origin_json],
-    ["completion_target_json", row.data.completion_target_json],
-  ] as const;
-  const decoded: JsonValue[] = [];
-  for (const [field, raw] of required) {
-    const value = decodeJsonField({
-      raw,
+}): ResultType<DecodedPersistedValue<WorkflowTrigger>, WorkflowPersistenceDecodeError> {
+  return Result.gen(function* () {
+    const table = "workflow_triggers";
+    const recordId = recordIdFromRow(input.row, "trigger_id");
+    const version = yield* decodeSchemaVersion(input.schemaVersion, table, recordId);
+    const row = triggerRowSchema.safeParse(input.row);
+    if (!row.success) return Result.err(invalidRow(table, version.version, recordId));
+    const required = [
+      ["definition_json", row.data.definition_json],
+      ["args_json", row.data.args_json],
+      ["scheduling_policy_json", row.data.scheduling_policy_json],
+      ["origin_json", row.data.origin_json],
+      ["completion_target_json", row.data.completion_target_json],
+    ] as const;
+    const decoded: JsonValue[] = [];
+    for (const [field, raw] of required) {
+      const value = yield* decodeJsonField({
+        raw,
+        schema: jsonValueSchema,
+        table,
+        field,
+        version: version.version,
+        recordId,
+      });
+      decoded.push(value);
+    }
+    const progressTarget = yield* decodeNullableJsonField({
+      raw: row.data.progress_target_json,
       schema: jsonValueSchema,
       table,
-      field,
-      version: version.value.version,
+      field: "progress_target_json",
+      version: version.version,
       recordId,
     });
-    if (value.status === "error") return Result.err(value.error);
-    decoded.push(value.value);
-  }
-  const progressTarget = decodeNullableJsonField({
-    raw: row.data.progress_target_json,
-    schema: jsonValueSchema,
-    table,
-    field: "progress_target_json",
-    version: version.value.version,
-    recordId,
+    const value = workflowTriggerSchema.safeParse({
+      triggerId: row.data.trigger_id,
+      revisionId: row.data.revision_id,
+      state: row.data.state,
+      definition: decoded[0],
+      args: decoded[1],
+      argsSha256: row.data.args_sha256,
+      schedulingPolicy: decoded[2],
+      origin: decoded[3],
+      completionTarget: decoded[4],
+      progressTarget,
+      nextFireAt: row.data.next_fire_at,
+      lastFireAt: row.data.last_fire_at,
+      lastRunId: row.data.last_run_id,
+      claimedBy: row.data.claimed_by,
+      claimedAt: row.data.claimed_at,
+      createdAt: row.data.created_at,
+      updatedAt: row.data.updated_at,
+    });
+    if (!value.success) return Result.err(invalidRow(table, version.version, recordId));
+    if (row.data.kind !== value.data.definition.kind) {
+      return Result.err(invalidRow(table, version.version, recordId));
+    }
+    return Result.ok(provenance(value.data, version));
   });
-  if (progressTarget.status === "error") return Result.err(progressTarget.error);
-  const value = workflowTriggerSchema.safeParse({
-    triggerId: row.data.trigger_id,
-    revisionId: row.data.revision_id,
-    state: row.data.state,
-    definition: decoded[0],
-    args: decoded[1],
-    argsSha256: row.data.args_sha256,
-    schedulingPolicy: decoded[2],
-    origin: decoded[3],
-    completionTarget: decoded[4],
-    progressTarget: progressTarget.value,
-    nextFireAt: row.data.next_fire_at,
-    lastFireAt: row.data.last_fire_at,
-    lastRunId: row.data.last_run_id,
-    claimedBy: row.data.claimed_by,
-    claimedAt: row.data.claimed_at,
-    createdAt: row.data.created_at,
-    updatedAt: row.data.updated_at,
-  });
-  if (!value.success) return Result.err(invalidRow(table, version.value.version, recordId));
-  if (row.data.kind !== value.data.definition.kind) {
-    return Result.err(invalidRow(table, version.value.version, recordId));
-  }
-  return Result.ok(provenance(value.data, version.value));
 }
 
 function decodeWorkflowSurfaceBindingRow(input: {
   readonly row: WorkflowPersistedRow;
   readonly schemaVersion: number;
-}): ResultType<DecodedPersistedValue<WorkflowSurfaceBinding>, PersistedDataError> {
-  const table = "workflow_surface_bindings";
-  const recordId = recordIdFromRow(input.row, "run_id");
-  const version = decodeSchemaVersion(input.schemaVersion, table, recordId);
-  if (version.status === "error") return Result.err(version.error);
-  const row = bindingRowSchema.safeParse(input.row);
-  if (!row.success) return Result.err(invalidRow(table, version.value.version, recordId));
-  const target = decodeJsonField({
-    raw: row.data.target_json,
-    schema: jsonValueSchema,
-    table,
-    field: "target_json",
-    version: version.value.version,
-    recordId,
+}): ResultType<DecodedPersistedValue<WorkflowSurfaceBinding>, WorkflowPersistenceDecodeError> {
+  return Result.gen(function* () {
+    const table = "workflow_surface_bindings";
+    const recordId = recordIdFromRow(input.row, "run_id");
+    const version = yield* decodeSchemaVersion(input.schemaVersion, table, recordId);
+    const row = bindingRowSchema.safeParse(input.row);
+    if (!row.success) return Result.err(invalidRow(table, version.version, recordId));
+    const target = yield* decodeJsonField({
+      raw: row.data.target_json,
+      schema: jsonValueSchema,
+      table,
+      field: "target_json",
+      version: version.version,
+      recordId,
+    });
+    const messageRef = yield* decodeNullableJsonField({
+      raw: row.data.message_ref_json,
+      schema: jsonValueSchema,
+      table,
+      field: "message_ref_json",
+      version: version.version,
+      recordId,
+    });
+    if (
+      version.version === WORKFLOW_SCHEMA_VERSION &&
+      row.data.permanent_failure_json === undefined
+    ) {
+      return Result.err(invalidRow(table, version.version, recordId));
+    }
+    const permanentFailure = yield* decodeNullableJsonField({
+      raw: row.data.permanent_failure_json ?? null,
+      schema: workflowProgressPermanentFailureSchema,
+      table,
+      field: "permanent_failure_json",
+      version: version.version,
+      recordId,
+    });
+    const value = workflowSurfaceBindingSchema.safeParse({
+      runId: row.data.run_id,
+      target,
+      messageRef,
+      lastRenderedSha256: row.data.last_rendered_sha256,
+      lastError: row.data.last_error,
+      retryCount: row.data.retry_count,
+      nextAttemptAt: row.data.next_attempt_at,
+      permanentFailure,
+      createdAt: row.data.created_at,
+      updatedAt: row.data.updated_at,
+    });
+    if (!value.success) return Result.err(invalidRow(table, version.version, recordId));
+    return Result.ok(provenance(value.data, version));
   });
-  if (target.status === "error") return Result.err(target.error);
-  const messageRef = decodeNullableJsonField({
-    raw: row.data.message_ref_json,
-    schema: jsonValueSchema,
-    table,
-    field: "message_ref_json",
-    version: version.value.version,
-    recordId,
-  });
-  if (messageRef.status === "error") return Result.err(messageRef.error);
-  if (
-    version.value.version === WORKFLOW_SCHEMA_VERSION &&
-    row.data.permanent_failure_json === undefined
-  ) {
-    return Result.err(invalidRow(table, version.value.version, recordId));
-  }
-  const permanentFailure = decodeNullableJsonField({
-    raw: row.data.permanent_failure_json ?? null,
-    schema: workflowProgressPermanentFailureSchema,
-    table,
-    field: "permanent_failure_json",
-    version: version.value.version,
-    recordId,
-  });
-  if (permanentFailure.status === "error") return Result.err(permanentFailure.error);
-  const value = workflowSurfaceBindingSchema.safeParse({
-    runId: row.data.run_id,
-    target: target.value,
-    messageRef: messageRef.value,
-    lastRenderedSha256: row.data.last_rendered_sha256,
-    lastError: row.data.last_error,
-    retryCount: row.data.retry_count,
-    nextAttemptAt: row.data.next_attempt_at,
-    permanentFailure: permanentFailure.value,
-    createdAt: row.data.created_at,
-    updatedAt: row.data.updated_at,
-  });
-  if (!value.success) return Result.err(invalidRow(table, version.value.version, recordId));
-  return Result.ok(provenance(value.data, version.value));
 }
 
 function decodeWorkflowSurfaceActionRow(input: {
   readonly row: WorkflowPersistedRow;
   readonly schemaVersion: number;
-}): ResultType<DecodedPersistedValue<WorkflowSurfaceAction>, PersistedDataError> {
-  const table = "workflow_surface_actions";
-  const recordId = recordIdFromRow(input.row, "action_id");
-  const version = decodeSchemaVersion(input.schemaVersion, table, recordId);
-  if (version.status === "error") return Result.err(version.error);
-  const row = actionRowSchema.safeParse(input.row);
-  if (!row.success) return Result.err(invalidRow(table, version.value.version, recordId));
-  const messageRef = decodeNullableJsonField({
-    raw: row.data.expected_message_ref_json,
-    schema: jsonValueSchema,
-    table,
-    field: "expected_message_ref_json",
-    version: version.value.version,
-    recordId,
-  });
-  if (messageRef.status === "error") return Result.err(messageRef.error);
-  const value = workflowSurfaceActionSchema.safeParse({
-    actionId: row.data.action_id,
-    tokenSha256: row.data.token_sha256,
-    runId: row.data.run_id,
-    kind: row.data.kind,
-    expectedPlatform: row.data.expected_platform,
-    expectedUserId: row.data.expected_user_id,
-    expectedMessageRef: messageRef.value,
-    expiresAt: row.data.expires_at,
-    consumedAt: row.data.consumed_at,
-    consumedByPlatform: row.data.consumed_by_platform,
-    consumedByUserId: row.data.consumed_by_user_id,
-    createdAt: row.data.created_at,
-  });
-  if (!value.success) return Result.err(invalidRow(table, version.value.version, recordId));
-  return Result.ok({
-    value: value.data,
-    provenance:
-      row.data.expected_message_ref_json === null ? "missing-defaulted" : version.value.provenance,
+}): ResultType<DecodedPersistedValue<WorkflowSurfaceAction>, WorkflowPersistenceDecodeError> {
+  return Result.gen(function* () {
+    const table = "workflow_surface_actions";
+    const recordId = recordIdFromRow(input.row, "action_id");
+    const version = yield* decodeSchemaVersion(input.schemaVersion, table, recordId);
+    const row = actionRowSchema.safeParse(input.row);
+    if (!row.success) return Result.err(invalidRow(table, version.version, recordId));
+    const messageRef = yield* decodeNullableJsonField({
+      raw: row.data.expected_message_ref_json,
+      schema: jsonValueSchema,
+      table,
+      field: "expected_message_ref_json",
+      version: version.version,
+      recordId,
+    });
+    const value = workflowSurfaceActionSchema.safeParse({
+      actionId: row.data.action_id,
+      tokenSha256: row.data.token_sha256,
+      runId: row.data.run_id,
+      kind: row.data.kind,
+      expectedPlatform: row.data.expected_platform,
+      expectedUserId: row.data.expected_user_id,
+      expectedMessageRef: messageRef,
+      expiresAt: row.data.expires_at,
+      consumedAt: row.data.consumed_at,
+      consumedByPlatform: row.data.consumed_by_platform,
+      consumedByUserId: row.data.consumed_by_user_id,
+      createdAt: row.data.created_at,
+    });
+    if (!value.success) return Result.err(invalidRow(table, version.version, recordId));
+    return Result.ok<DecodedPersistedValue<WorkflowSurfaceAction>>({
+      value: value.data,
+      provenance:
+        row.data.expected_message_ref_json === null ? "missing-defaulted" : version.provenance,
+    });
   });
 }
 
 function decodeWorkflowRequestDispatchRow(input: {
   readonly row: WorkflowPersistedRow;
   readonly schemaVersion: number;
-}): ResultType<DecodedPersistedValue<DecodedWorkflowRequestDispatch>, PersistedDataError> {
-  const table = "workflow_request_dispatches";
-  const recordId = recordIdFromRow(input.row, "request_id");
-  const version = decodeSchemaVersion(input.schemaVersion, table, recordId);
-  if (version.status === "error") return Result.err(version.error);
-  const row = requestDispatchRowSchema.safeParse(input.row);
-  if (!row.success || (row.success && row.data.active !== 0 && row.data.active !== 1)) {
-    return Result.err(invalidRow(table, version.value.version, recordId));
-  }
-  const policy = decodeJsonField({
-    raw: row.data.policy_json,
-    schema: workflowRequestPolicySchema,
-    table,
-    field: "policy_json",
-    version: version.value.version,
-    recordId,
+}): ResultType<
+  DecodedPersistedValue<DecodedWorkflowRequestDispatch>,
+  WorkflowPersistenceDecodeError
+> {
+  return Result.gen(function* () {
+    const table = "workflow_request_dispatches";
+    const recordId = recordIdFromRow(input.row, "request_id");
+    const version = yield* decodeSchemaVersion(input.schemaVersion, table, recordId);
+    const row = requestDispatchRowSchema.safeParse(input.row);
+    if (!row.success || (row.success && row.data.active !== 0 && row.data.active !== 1)) {
+      return Result.err(invalidRow(table, version.version, recordId));
+    }
+    const policy = yield* decodeJsonField({
+      raw: row.data.policy_json,
+      schema: workflowRequestPolicySchema,
+      table,
+      field: "policy_json",
+      version: version.version,
+      recordId,
+    });
+    return Result.ok(
+      provenance(
+        {
+          requestId: row.data.request_id,
+          runId: row.data.run_id,
+          operationId: row.data.operation_id,
+          dispatchEpoch: row.data.dispatch_epoch,
+          sessionId: row.data.session_id,
+          platform: row.data.platform,
+          policy,
+          ownerId: row.data.owner_id,
+          ownerHeartbeatAt: row.data.owner_heartbeat_at,
+          active: row.data.active === 1,
+          createdAt: row.data.created_at,
+          updatedAt: row.data.updated_at,
+          promptPublishedAt: row.data.prompt_published_at,
+        },
+        version,
+      ),
+    );
   });
-  if (policy.status === "error") return Result.err(policy.error);
-  return Result.ok(
-    provenance(
-      {
-        requestId: row.data.request_id,
-        runId: row.data.run_id,
-        operationId: row.data.operation_id,
-        dispatchEpoch: row.data.dispatch_epoch,
-        sessionId: row.data.session_id,
-        platform: row.data.platform,
-        policy: policy.value,
-        ownerId: row.data.owner_id,
-        ownerHeartbeatAt: row.data.owner_heartbeat_at,
-        active: row.data.active === 1,
-        createdAt: row.data.created_at,
-        updatedAt: row.data.updated_at,
-        promptPublishedAt: row.data.prompt_published_at,
-      },
-      version.value,
-    ),
-  );
 }
 
 function decodeWorkflowRequestTerminalReceiptRow(input: {
   readonly row: WorkflowPersistedRow;
   readonly schemaVersion: number;
-}): ResultType<DecodedPersistedValue<DecodedWorkflowRequestTerminalReceipt>, PersistedDataError> {
-  const table = "workflow_request_terminal_receipts";
-  const recordId = recordIdFromRow(input.row, "request_id");
-  const version = decodeSchemaVersion(input.schemaVersion, table, recordId);
-  if (version.status === "error") return Result.err(version.error);
-  const row = requestTerminalReceiptRowSchema.safeParse(input.row);
-  if (!row.success) return Result.err(invalidRow(table, version.value.version, recordId));
-  const output = decodeNullableJsonField({
-    raw: row.data.output_json,
-    schema: jsonValueSchema,
-    table,
-    field: "output_json",
-    version: version.value.version,
-    recordId,
+}): ResultType<
+  DecodedPersistedValue<DecodedWorkflowRequestTerminalReceipt>,
+  WorkflowPersistenceDecodeError
+> {
+  return Result.gen(function* () {
+    const table = "workflow_request_terminal_receipts";
+    const recordId = recordIdFromRow(input.row, "request_id");
+    const version = yield* decodeSchemaVersion(input.schemaVersion, table, recordId);
+    const row = requestTerminalReceiptRowSchema.safeParse(input.row);
+    if (!row.success) return Result.err(invalidRow(table, version.version, recordId));
+    const output = yield* decodeNullableJsonField({
+      raw: row.data.output_json,
+      schema: jsonValueSchema,
+      table,
+      field: "output_json",
+      version: version.version,
+      recordId,
+    });
+    const usage = yield* decodeNullableJsonField({
+      raw: row.data.usage_json,
+      schema: workflowUsageSchema,
+      table,
+      field: "usage_json",
+      version: version.version,
+      recordId,
+    });
+    if (row.data.state === "resolved" && output === null && row.data.result_artifact_id === null) {
+      return Result.err(invalidRow(table, version.version, recordId));
+    }
+    return Result.ok(
+      provenance(
+        {
+          requestId: row.data.request_id,
+          runId: row.data.run_id,
+          operationId: row.data.operation_id,
+          dispatchEpoch: row.data.dispatch_epoch,
+          state: row.data.state,
+          detail: row.data.detail,
+          output,
+          resultArtifactId: row.data.result_artifact_id,
+          usage,
+          createdAt: row.data.created_at,
+        },
+        version,
+      ),
+    );
   });
-  if (output.status === "error") return Result.err(output.error);
-  const usage = decodeNullableJsonField({
-    raw: row.data.usage_json,
-    schema: workflowUsageSchema,
-    table,
-    field: "usage_json",
-    version: version.value.version,
-    recordId,
-  });
-  if (usage.status === "error") return Result.err(usage.error);
-  if (
-    row.data.state === "resolved" &&
-    output.value === null &&
-    row.data.result_artifact_id === null
-  ) {
-    return Result.err(invalidRow(table, version.value.version, recordId));
-  }
-  return Result.ok(
-    provenance(
-      {
-        requestId: row.data.request_id,
-        runId: row.data.run_id,
-        operationId: row.data.operation_id,
-        dispatchEpoch: row.data.dispatch_epoch,
-        state: row.data.state,
-        detail: row.data.detail,
-        output: output.value,
-        resultArtifactId: row.data.result_artifact_id,
-        usage: usage.value,
-        createdAt: row.data.created_at,
-      },
-      version.value,
-    ),
-  );
 }
 
 function decodeWorkflowActionOutboxRow(input: {
   readonly row: WorkflowPersistedRow;
   readonly schemaVersion: number;
-}): ResultType<DecodedPersistedValue<DecodedWorkflowActionOutboxEntry>, PersistedDataError> {
-  const table = "workflow_action_outbox";
-  const recordId = recordIdFromRow(input.row, "outbox_id");
-  const version = decodeSchemaVersion(input.schemaVersion, table, recordId);
-  if (version.status === "error") return Result.err(version.error);
-  const row = actionOutboxRowSchema.safeParse(input.row);
-  if (!row.success) return Result.err(invalidRow(table, version.value.version, recordId));
-  const payload = decodeJsonField({
-    raw: row.data.payload_json,
-    schema: jsonValueSchema,
-    table,
-    field: "payload_json",
-    version: version.value.version,
-    recordId,
+}): ResultType<
+  DecodedPersistedValue<DecodedWorkflowActionOutboxEntry>,
+  WorkflowPersistenceDecodeError
+> {
+  return Result.gen(function* () {
+    const table = "workflow_action_outbox";
+    const recordId = recordIdFromRow(input.row, "outbox_id");
+    const version = yield* decodeSchemaVersion(input.schemaVersion, table, recordId);
+    const row = actionOutboxRowSchema.safeParse(input.row);
+    if (!row.success) return Result.err(invalidRow(table, version.version, recordId));
+    const payload = yield* decodeJsonField({
+      raw: row.data.payload_json,
+      schema: jsonValueSchema,
+      table,
+      field: "payload_json",
+      version: version.version,
+      recordId,
+    });
+    return Result.ok(
+      provenance(
+        {
+          outboxId: row.data.outbox_id,
+          actionId: row.data.action_id,
+          runId: row.data.run_id,
+          eventType: row.data.event_type,
+          payload,
+          publishedAt: row.data.published_at,
+          projectedAt: row.data.projected_at,
+          attemptCount: row.data.attempt_count,
+          nextAttemptAt: row.data.next_attempt_at,
+          lastError: row.data.last_error,
+          createdAt: row.data.created_at,
+          updatedAt: row.data.updated_at,
+        },
+        version,
+      ),
+    );
   });
-  if (payload.status === "error") return Result.err(payload.error);
-  return Result.ok(
-    provenance(
-      {
-        outboxId: row.data.outbox_id,
-        actionId: row.data.action_id,
-        runId: row.data.run_id,
-        eventType: row.data.event_type,
-        payload: payload.value,
-        publishedAt: row.data.published_at,
-        projectedAt: row.data.projected_at,
-        attemptCount: row.data.attempt_count,
-        nextAttemptAt: row.data.next_attempt_at,
-        lastError: row.data.last_error,
-        createdAt: row.data.created_at,
-        updatedAt: row.data.updated_at,
-      },
-      version.value,
-    ),
-  );
 }
 
 function decodeWorkflowLegacyAuditRow(input: {
   readonly row: WorkflowPersistedRow;
   readonly schemaVersion: number;
-}): ResultType<DecodedPersistedValue<DecodedWorkflowLegacyAuditRecord>, PersistedDataError> {
-  const table = "workflow_legacy_audit_records";
-  const recordId = recordIdFromRow(input.row, "record_id");
-  const version = decodeSchemaVersion(input.schemaVersion, table, recordId);
-  if (version.status === "error") return Result.err(version.error);
-  const row = legacyAuditRowSchema.safeParse(input.row);
-  if (!row.success) return Result.err(invalidRow(table, version.value.version, recordId));
-  const payload = decodeJsonField({
-    raw: row.data.payload_json,
-    schema: jsonValueSchema,
-    table,
-    field: "payload_json",
-    version: version.value.version,
-    recordId,
+}): ResultType<
+  DecodedPersistedValue<DecodedWorkflowLegacyAuditRecord>,
+  WorkflowPersistenceDecodeError
+> {
+  return Result.gen(function* () {
+    const table = "workflow_legacy_audit_records";
+    const recordId = recordIdFromRow(input.row, "record_id");
+    const version = yield* decodeSchemaVersion(input.schemaVersion, table, recordId);
+    const row = legacyAuditRowSchema.safeParse(input.row);
+    if (!row.success) return Result.err(invalidRow(table, version.version, recordId));
+    const payload = yield* decodeJsonField({
+      raw: row.data.payload_json,
+      schema: jsonValueSchema,
+      table,
+      field: "payload_json",
+      version: version.version,
+      recordId,
+    });
+    return Result.ok(
+      provenance(
+        {
+          recordKind: row.data.record_kind,
+          recordId: row.data.record_id,
+          reason: row.data.reason,
+          payload,
+          archivedAt: row.data.archived_at,
+        },
+        version,
+      ),
+    );
   });
-  if (payload.status === "error") return Result.err(payload.error);
-  return Result.ok(
-    provenance(
-      {
-        recordKind: row.data.record_kind,
-        recordId: row.data.record_id,
-        reason: row.data.reason,
-        payload: payload.value,
-        archivedAt: row.data.archived_at,
-      },
-      version.value,
-    ),
-  );
 }
 
 type WorkflowPersistenceRowInput<TKind extends string> = {
@@ -1096,27 +1113,27 @@ export function decodeWorkflowPersistenceRow(
 > {
   switch (input.kind) {
     case "revision":
-      return decodeWorkflowRevisionRow(input);
+      return adaptWorkflowPersistenceDecodeResult(decodeWorkflowRevisionRow(input));
     case "run":
-      return decodeWorkflowRunRow(input);
+      return adaptWorkflowPersistenceDecodeResult(decodeWorkflowRunRow(input));
     case "operation":
-      return decodeWorkflowOperationRow(input);
+      return adaptWorkflowPersistenceDecodeResult(decodeWorkflowOperationRow(input));
     case "wait":
-      return decodeWorkflowWaitRow(input);
+      return adaptWorkflowPersistenceDecodeResult(decodeWorkflowWaitRow(input));
     case "trigger":
-      return decodeWorkflowTriggerRow(input);
+      return adaptWorkflowPersistenceDecodeResult(decodeWorkflowTriggerRow(input));
     case "binding":
-      return decodeWorkflowSurfaceBindingRow(input);
+      return adaptWorkflowPersistenceDecodeResult(decodeWorkflowSurfaceBindingRow(input));
     case "action":
-      return decodeWorkflowSurfaceActionRow(input);
+      return adaptWorkflowPersistenceDecodeResult(decodeWorkflowSurfaceActionRow(input));
     case "dispatch":
-      return decodeWorkflowRequestDispatchRow(input);
+      return adaptWorkflowPersistenceDecodeResult(decodeWorkflowRequestDispatchRow(input));
     case "receipt":
-      return decodeWorkflowRequestTerminalReceiptRow(input);
+      return adaptWorkflowPersistenceDecodeResult(decodeWorkflowRequestTerminalReceiptRow(input));
     case "outbox":
-      return decodeWorkflowActionOutboxRow(input);
+      return adaptWorkflowPersistenceDecodeResult(decodeWorkflowActionOutboxRow(input));
     case "legacy-audit":
-      return decodeWorkflowLegacyAuditRow(input);
+      return adaptWorkflowPersistenceDecodeResult(decodeWorkflowLegacyAuditRow(input));
   }
 }
 

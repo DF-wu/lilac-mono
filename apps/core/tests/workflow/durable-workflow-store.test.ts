@@ -1,8 +1,7 @@
 import { normalizeWorkflowResourcePolicy, workflowStoreValue } from "./workflow-store-test-helpers";
 import { Database } from "bun:sqlite";
 import { describe, expect, it } from "bun:test";
-import { MalformedSerialization } from "@stanley2058/lilac-utils";
-import { Panic, Result } from "better-result";
+import { Panic } from "better-result";
 import { rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -28,14 +27,6 @@ function dbPath(label: string): string {
   return join(tmpdir(), `lilac-workflow-${label}-${crypto.randomUUID()}.sqlite`);
 }
 
-class InvocationReadFailureStore extends DurableWorkflowStore {
-  readFailure: MalformedSerialization | null = null;
-
-  override getRun(runId: string) {
-    if (this.readFailure) return Result.err(this.readFailure);
-    return super.getRun(runId);
-  }
-}
 function revision(id = "revision-1"): WorkflowRevision {
   const resources = normalizeWorkflowResourcePolicy({
     agents: { maxConcurrent: 2, maxTotal: 8 },
@@ -460,28 +451,26 @@ describe("durable workflow store minimal dispatch schema", () => {
       rmSync(file, { force: true });
     }
   });
-  it("returns the original invocation read error through the SQLite transaction", () => {
-    const file = dbPath("invocation-read-error");
-    const store = new InvocationReadFailureStore(file);
+  it("classifies the original SQLite driver error from invocation persistence", () => {
+    const file = dbPath("invocation-driver-error");
+    const store = new DurableWorkflowStore(file);
     try {
-      const input = {
-        revision: revision(),
-        run: run(),
-        idempotency: { key: "same-invocation", fingerprintSha256: "fingerprint" },
-      };
-      expect(store.createInvocation(input).status).toBe("ok");
-      const readFailure = new MalformedSerialization({
-        table: "workflow_runs",
-        field: "args_json",
-        version: WORKFLOW_SCHEMA_VERSION,
-        issueCode: "malformed-json",
-        recordId: "run-1",
-        message: "Workflow run args are malformed",
-      });
-      store.readFailure = readFailure;
-      const replayed = store.createInvocation(input);
-      expect(replayed.status).toBe("error");
-      if (replayed.status === "error") expect(replayed.error).toBe(readFailure);
+      const faultDb = new Database(file);
+      faultDb.run(`CREATE TRIGGER reject_workflow_revision
+        BEFORE INSERT ON workflow_revisions
+        BEGIN SELECT RAISE(ABORT, 'injected invocation failure'); END`);
+      faultDb.close();
+
+      const created = store.createInvocation({ revision: revision(), run: run() });
+      expect(created.status).toBe("error");
+      if (created.status === "error") {
+        expect(created.error._tag).toBe("DurableWorkflowSqliteDriverFailure");
+        if (created.error._tag === "DurableWorkflowSqliteDriverFailure") {
+          expect(created.error.code).toBe("SQLITE_CONSTRAINT_TRIGGER");
+          expect(created.error.operation).toBe("create-invocation");
+        }
+      }
+      expect(workflowStoreValue(store.getRun("run-1"))).toBeNull();
     } finally {
       store.close();
       rmSync(file, { force: true });

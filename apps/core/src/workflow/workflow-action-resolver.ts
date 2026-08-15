@@ -19,6 +19,8 @@ import type {
   ResolvedSurfaceProtocol,
   SurfaceProtocolResolver,
 } from "../surface/runtime-descriptor";
+import type { SurfaceRefInvalid } from "../surface/protocol";
+import { adaptToolResultToHost } from "../tools/tool-result-adapters";
 
 const surfaceActionEventSchema = z.strictObject({
   actionId: z.string().min(16).max(200),
@@ -167,11 +169,12 @@ function decodeWorkflowSurfaceAction(
 > {
   const decoded = surfaceActionEventSchema.safeParse(data);
   const resolved = surfaceProtocolResolver?.resolve(data.platform) ?? null;
-  const messageRef = resolved?.protocol.refs.decodeMessageRef({
-    ref: data.messageRef,
-    expectedSessionId: data.messageRef.channelId,
-  });
-  if (!decoded.success || !resolved || !messageRef || messageRef.status === "error") {
+  const messageRef: ResultType<MsgRef, SurfaceRefInvalid> | null =
+    resolved?.protocol.refs.decodeMessageRef({
+      ref: data.messageRef,
+      expectedSessionId: data.messageRef.channelId,
+    }) ?? null;
+  if (!decoded.success || !resolved || !messageRef) {
     return Result.err(
       new WorkflowActionMalformed({
         eventId,
@@ -179,11 +182,19 @@ function decodeWorkflowSurfaceAction(
       }),
     );
   }
-  return Result.ok({
-    ...decoded.data,
-    platform: resolved.platform,
-    messageRef: messageRef.value,
-  });
+  return messageRef
+    .map((value) => ({
+      ...decoded.data,
+      platform: resolved.platform,
+      messageRef: value,
+    }))
+    .mapError(
+      () =>
+        new WorkflowActionMalformed({
+          eventId,
+          message: "Rejected malformed authenticated surface action event",
+        }),
+    );
 }
 
 async function captureWorkflowActionOutboxPublication(
@@ -196,47 +207,45 @@ async function captureWorkflowActionOutboxPublication(
       const published = await bus.publish(event.type, event.data, {
         headers: { workflow_outbox_id: outboxId },
       });
-      if (published.status === "error") {
-        return Result.err(
-          new WorkflowActionOutboxPublishFailed({
-            outboxId,
-            cause: published.error,
-            message: "Workflow action outbox publication failed",
-          }),
+      return published
+        .map(() => undefined)
+        .mapError(
+          (cause) =>
+            new WorkflowActionOutboxPublishFailed({
+              outboxId,
+              cause,
+              message: "Workflow action outbox publication failed",
+            }),
         );
-      }
-      break;
     }
     case lilacEventTypes.EvtWorkflowProgressRequested: {
       const published = await bus.publish(event.type, event.data, {
         headers: { workflow_outbox_id: outboxId },
       });
-      if (published.status === "error") {
-        return Result.err(
-          new WorkflowActionOutboxPublishFailed({
-            outboxId,
-            cause: published.error,
-            message: "Workflow action outbox publication failed",
-          }),
+      return published
+        .map(() => undefined)
+        .mapError(
+          (cause) =>
+            new WorkflowActionOutboxPublishFailed({
+              outboxId,
+              cause,
+              message: "Workflow action outbox publication failed",
+            }),
         );
-      }
-      break;
     }
   }
-  return Result.ok(undefined);
 }
 
 function adaptWorkflowActionSubscriptionStartResultToHost(
   started: ResultType<WorkflowActionResolverSubscription, EventDeliveryStartFailed>,
 ): WorkflowActionResolverSubscription {
-  if (started.status === "error") throw started.error;
-  return started.value;
+  return adaptToolResultToHost(started);
 }
 
 function adaptWorkflowActionSubscriptionStopResultToHost(
   stopped: ResultType<void, EventDeliveryStopFailed>,
 ): void {
-  if (stopped.status === "error") throw stopped.error;
+  adaptToolResultToHost(stopped);
 }
 
 export async function startWorkflowActionResolver(input: {
@@ -255,49 +264,52 @@ export async function startWorkflowActionResolver(input: {
     try {
       const now = input.now?.() ?? Date.now();
       const entries = input.store.listPendingActionOutboxEvents(now);
-      if (entries.status === "error") {
-        logger.warn("Workflow action outbox read failed", formatTaggedErrorForLog(entries.error));
-        return;
-      }
-      for (const entry of entries.value) {
+      const pendingEntries = entries.match({
+        ok: (value) => value,
+        err: (error) => {
+          logger.warn("Workflow action outbox read failed", formatTaggedErrorForLog(error));
+          return null;
+        },
+      });
+      if (!pendingEntries) return;
+      for (const entry of pendingEntries) {
         const decoded = decodeWorkflowActionOutboxEvent(entry);
         const published: ResultType<
           void,
           WorkflowActionOutboxInvalid | WorkflowActionOutboxPublishFailed
-        > =
-          decoded.status === "error"
-            ? Result.err(decoded.error)
-            : await captureWorkflowActionOutboxPublication(
-                input.bus,
-                entry.outboxId,
-                decoded.value,
-              );
-        let completed: ResultType<void, WorkflowActionOutboxFailure> = published;
-        if (
-          completed.status === "ok" &&
-          !input.store.markActionOutboxPublished({
+        > = await decoded.match<
+          Promise<ResultType<void, WorkflowActionOutboxInvalid | WorkflowActionOutboxPublishFailed>>
+        >({
+          ok: (event) => captureWorkflowActionOutboxPublication(input.bus, entry.outboxId, event),
+          err: (error) => Promise.resolve(Result.err(error)),
+        });
+        const completed: ResultType<void, WorkflowActionOutboxFailure> = published.andThen(() =>
+          input.store.markActionOutboxPublished({
             outboxId: entry.outboxId,
             now: input.now?.() ?? Date.now(),
           })
-        ) {
-          completed = Result.err(
-            new WorkflowActionOutboxCompletionConflict({
+            ? Result.ok(undefined)
+            : Result.err(
+                new WorkflowActionOutboxCompletionConflict({
+                  outboxId: entry.outboxId,
+                  message: "Workflow action outbox publication was already completed",
+                }),
+              ),
+        );
+        completed.match({
+          ok: () => undefined,
+          err: (error) => {
+            input.store.recordActionOutboxFailure({
               outboxId: entry.outboxId,
-              message: "Workflow action outbox publication was already completed",
-            }),
-          );
-        }
-        if (completed.status === "error") {
-          input.store.recordActionOutboxFailure({
-            outboxId: entry.outboxId,
-            error: completed.error.message,
-            now: input.now?.() ?? Date.now(),
-          });
-          logger.warn("Workflow action outbox publication failed", {
-            outboxId: entry.outboxId,
-            ...formatTaggedErrorForLog(completed.error),
-          });
-        }
+              error: error.message,
+              now: input.now?.() ?? Date.now(),
+            });
+            logger.warn("Workflow action outbox publication failed", {
+              outboxId: entry.outboxId,
+              ...formatTaggedErrorForLog(error),
+            });
+          },
+        });
       }
     } finally {
       draining = false;
@@ -326,47 +338,52 @@ export async function startWorkflowActionResolver(input: {
           await drainOutbox();
           return Result.ok(undefined);
         }
-        const event = decodeWorkflowSurfaceAction(
-          message.id,
-          message.data,
-          input.surfaceProtocolResolver,
-        );
-        if (event.status === "error") {
-          logger.warn("Rejected malformed authenticated surface action event", {
-            eventId: message.id,
+        const handled = Result.gen(function* () {
+          const event = yield* decodeWorkflowSurfaceAction(
+            message.id,
+            message.data,
+            input.surfaceProtocolResolver,
+          ).mapError((error) => {
+            logger.warn("Rejected malformed authenticated surface action event", {
+              eventId: message.id,
+            });
+            return error;
           });
-          return Result.err(event.error);
-        }
-
-        const result = input.store.applySurfaceAction({
-          tokenSha256: sha256(event.value.actionId),
-          platform: event.value.platform,
-          userId: event.value.userId,
-          messageRef: event.value.messageRef,
-          sourceMessageId: event.value.sourceMessageId,
-          now: input.now?.() ?? Date.now(),
+          const action = yield* input.store
+            .applySurfaceAction({
+              tokenSha256: sha256(event.actionId),
+              platform: event.platform,
+              userId: event.userId,
+              messageRef: event.messageRef,
+              sourceMessageId: event.sourceMessageId,
+              now: input.now?.() ?? Date.now(),
+            })
+            .mapError((error) => {
+              logger.warn("Workflow surface action persistence failed", {
+                eventId: message.id,
+                ...formatTaggedErrorForLog(error),
+              });
+              return new WorkflowActionPersistenceFailed({
+                storeErrorTag: error._tag,
+                message: "Workflow surface action could not be persisted",
+              });
+            });
+          return Result.ok({ action, event });
         });
-        if (result.status === "error") {
-          logger.warn("Workflow surface action persistence failed", {
-            eventId: message.id,
-            ...formatTaggedErrorForLog(result.error),
-          });
-          return Result.err(
-            new WorkflowActionPersistenceFailed({
-              storeErrorTag: result.error._tag,
-              message: "Workflow surface action could not be persisted",
-            }),
-          );
-        }
-        if (result.value.status !== "applied") {
-          logger.info("Workflow surface action rejected", {
-            status: result.value.status,
-            platform: event.value.platform,
-            messageId: event.value.messageRef.messageId,
-          });
-        }
-        await drainOutbox();
-        return Result.ok(undefined);
+        return handled.match<Promise<ResultType<void, WorkflowActionResolverDeliveryError>>>({
+          err: (error) => Promise.resolve(Result.err(error)),
+          ok: async ({ action, event }) => {
+            if (action.status !== "applied") {
+              logger.info("Workflow surface action rejected", {
+                status: action.status,
+                platform: event.platform,
+                messageId: event.messageRef.messageId,
+              });
+            }
+            await drainOutbox();
+            return Result.ok(undefined);
+          },
+        });
       },
       workflowActionResolverDeliveryPolicy,
     );
@@ -382,12 +399,17 @@ export async function startWorkflowActionResolver(input: {
   }
   void subscription.done.then((done) => {
     if (stopping) return;
-    logger.error(
-      "Workflow action resolver subscription terminated unexpectedly",
-      done.status === "error"
-        ? formatTaggedErrorForLog(done.error)
-        : { error: "Subscription completed without being stopped" },
-    );
+    done.match({
+      ok: () =>
+        logger.error("Workflow action resolver subscription terminated unexpectedly", {
+          error: "Subscription completed without being stopped",
+        }),
+      err: (error) =>
+        logger.error(
+          "Workflow action resolver subscription terminated unexpectedly",
+          formatTaggedErrorForLog(error),
+        ),
+    });
   });
 
   await drainOutbox();
@@ -400,12 +422,17 @@ export async function startWorkflowActionResolver(input: {
       clearInterval(timer);
       adaptWorkflowActionSubscriptionStopResultToHost(await stopWorkflowActionSubscriptionResult());
       const done = await subscription.done;
-      if (done.status === "error" && done.error._tag !== "EventDeliveryStopped") {
-        logger.error(
-          "Workflow action resolver subscription terminated",
-          formatTaggedErrorForLog(done.error),
-        );
-      }
+      done.match({
+        ok: () => undefined,
+        err: (error) => {
+          if (error._tag !== "EventDeliveryStopped") {
+            logger.error(
+              "Workflow action resolver subscription terminated",
+              formatTaggedErrorForLog(error),
+            );
+          }
+        },
+      });
     },
   };
 }

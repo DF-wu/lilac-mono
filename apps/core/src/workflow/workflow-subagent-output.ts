@@ -11,15 +11,16 @@ export async function resolveWorkflowSubagentToolResult(input: {
   const match = TOOL_RESULT_ENVELOPE.exec(input.finalText);
   const uri = match?.groups?.["uri"];
   if (!uri) return input.finalText;
-  if (input.artifacts) {
-    const artifact = await input.artifacts.read(uri, input.childSessionId);
-    if (artifact.status === "ok") return artifact.value.content;
-  }
-  return [
+  const expired = [
     match.groups?.["head"] ?? "",
     "",
     "[The child tool result expired before it could be transferred to the parent.]",
     "",
     match.groups?.["tail"] ?? "",
   ].join("\n");
+  if (input.artifacts) {
+    const artifact = await input.artifacts.read(uri, input.childSessionId);
+    return artifact.match({ ok: (value) => value.content, err: () => expired });
+  }
+  return expired;
 }
