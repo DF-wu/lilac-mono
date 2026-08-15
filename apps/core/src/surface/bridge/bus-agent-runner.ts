@@ -125,7 +125,9 @@ import {
   type RequestIdentitySourceMissing,
   type RequestMessageCache,
   type RequestMessageCacheAdmissionError,
+  type RequestMessageCacheAliasOwner,
   type RequestMessageCacheOwner,
+  type RequestMessageCacheRestoreAttempt,
 } from "../../tool-server/request-message-cache";
 import {
   AuthenticatedRequestProjectionInvalid,
@@ -419,17 +421,21 @@ export function toIdleRetryDecision(
 ):
   | { readonly status: "retry"; readonly attempt: RetryBackoffAttempt }
   | { readonly status: "fail"; readonly reason: "aborted" | "delay-failed" | "exhausted" } {
-  if (backoff.status === "error") {
-    switch (backoff.error._tag) {
-      case "RetryBackoffAborted":
-        return { status: "fail", reason: "aborted" };
-      case "RetryBackoffDelayFailed":
-        return { status: "fail", reason: "delay-failed" };
-    }
-  }
-  return backoff.value === null
-    ? { status: "fail", reason: "exhausted" }
-    : { status: "retry", attempt: backoff.value };
+  return backoff.match<
+    | { readonly status: "retry"; readonly attempt: RetryBackoffAttempt }
+    | { readonly status: "fail"; readonly reason: "aborted" | "delay-failed" | "exhausted" }
+  >({
+    ok: (attempt) =>
+      attempt === null ? { status: "fail", reason: "exhausted" } : { status: "retry", attempt },
+    err: (error) => {
+      switch (error._tag) {
+        case "RetryBackoffAborted":
+          return { status: "fail", reason: "aborted" };
+        case "RetryBackoffDelayFailed":
+          return { status: "fail", reason: "delay-failed" };
+      }
+    },
+  });
 }
 
 export function signalBusAgentRunnerHostFailure(
@@ -439,11 +445,15 @@ export function signalBusAgentRunnerHostFailure(
 }
 
 function adaptModelResolutionToBusRunnerHost<T>(result: ResultType<T, ModelResolutionFailed>): T {
-  if (result.status === "ok") return result.value;
-  switch (result.error._tag) {
-    case "ModelResolutionFailed":
-      throw result.error;
-  }
+  return result.match({
+    ok: (value) => () => value,
+    err: (error) => () => {
+      switch (error._tag) {
+        case "ModelResolutionFailed":
+          throw error;
+      }
+    },
+  })();
 }
 
 type BusAgentRunnerErrorProjection = {
@@ -496,13 +506,16 @@ export function resolveCoreClaudeCompactionSummaryModel(input: {
   if (input.run === null) return input.fallback();
 
   const created = input.run.createUtilityModelResult();
-  if (created.status === "ok") return created.value;
-
-  switch (created.error._tag) {
-    case "ClaudeCodeRunExternalFailure":
-      input.onFailure(created.error);
-      return input.fallback();
-  }
+  return created.match({
+    ok: (model) => model,
+    err: (error) => {
+      switch (error._tag) {
+        case "ClaudeCodeRunExternalFailure":
+          input.onFailure(error);
+          return input.fallback();
+      }
+    },
+  });
 }
 
 export async function rethrowBusAgentRunnerCleanupDefect(
@@ -1567,13 +1580,14 @@ function persistHeartbeatSurfaceHandoffs(params: {
       finalText: handoff.finalText,
       modelLabel: params.modelLabel,
     });
-    if (saved.status === "error") {
+    const saveError = saved.match({ ok: () => null, err: (error) => error });
+    if (saveError) {
       params.logger.warn(
         "heartbeat handoff transcript persistence failed",
         formatBridgeLogContext({
           requestId: handoffRequestId,
-          errorTag: saved.error.name,
-          errorMessage: saved.error.message,
+          errorTag: saveError.name,
+          errorMessage: saveError.message,
         }),
       );
       continue;
@@ -1714,13 +1728,16 @@ export function isWorkflowAgentRecoveryEntry(entry: AgentRunnerRecoveryEntry): b
 
 function createFreshOnlyLineage(reason: string, currentCanonicalStart = 0): CorePrimaryLineageV1 {
   const created = createCorePrimaryLineageFreshOnlyV1(reason, currentCanonicalStart);
-  if (created.status === "ok") return created.value;
-  return {
-    state: "fresh-only",
-    lineageVersion: 1,
-    currentCanonicalStart: 0,
-    reason: "lineage-fallback-construction-failed",
-  };
+  const selectLineage = created.match<() => CorePrimaryLineageV1>({
+    ok: (lineage) => () => lineage,
+    err: () => () => ({
+      state: "fresh-only",
+      lineageVersion: 1,
+      currentCanonicalStart: 0,
+      reason: "lineage-fallback-construction-failed",
+    }),
+  });
+  return selectLineage();
 }
 
 export function validateCorePrimaryLineageAtRunnerIntake(input: {
@@ -1740,30 +1757,35 @@ export function validateCorePrimaryLineageAtRunnerIntake(input: {
     return createFreshOnlyLineage("missing-manifest", fallbackCurrentCanonicalStart);
   }
   const decoded = decodeCorePrimaryLineageV1(input.corePrimaryLineage, input.messages);
-  if (decoded.status === "error") {
-    return createFreshOnlyLineage("malformed-or-unaligned-manifest", fallbackCurrentCanonicalStart);
-  }
-  const lineage = decoded.value;
-  if (lineage.state !== "complete") return lineage;
-  if (!input.sessionId) {
-    return createFreshOnlyLineage("missing-lineage-scope", lineage.currentCanonicalStart);
-  }
-  if (!input.transcriptStore?.validateCorePrimaryLineageReferences) {
-    return createFreshOnlyLineage("lineage-store-unavailable", lineage.currentCanonicalStart);
-  }
-  const invalidReason = input.transcriptStore.validateCorePrimaryLineageReferences({
-    manifest: lineage,
-    requestClient: input.requestClient,
-    sessionId: input.sessionId,
-    surfaceId: `discord:${input.sessionId}`,
+  const continueDecoded = decoded.match<() => CorePrimaryLineageV1>({
+    err: () => () =>
+      createFreshOnlyLineage("malformed-or-unaligned-manifest", fallbackCurrentCanonicalStart),
+    ok: (lineage) => () => {
+      if (lineage.state !== "complete") return lineage;
+      if (!input.sessionId) {
+        return createFreshOnlyLineage("missing-lineage-scope", lineage.currentCanonicalStart);
+      }
+      if (!input.transcriptStore?.validateCorePrimaryLineageReferences) {
+        return createFreshOnlyLineage("lineage-store-unavailable", lineage.currentCanonicalStart);
+      }
+      const invalidReason = input.transcriptStore.validateCorePrimaryLineageReferences({
+        manifest: lineage,
+        requestClient: input.requestClient,
+        sessionId: input.sessionId,
+        surfaceId: `discord:${input.sessionId}`,
+      });
+      const continueValidation = invalidReason.match<() => CorePrimaryLineageV1>({
+        err: () => () =>
+          createFreshOnlyLineage("lineage-store-unavailable", lineage.currentCanonicalStart),
+        ok: (storedInvalidReason) => () =>
+          storedInvalidReason
+            ? createFreshOnlyLineage(storedInvalidReason, lineage.currentCanonicalStart)
+            : lineage,
+      });
+      return continueValidation();
+    },
   });
-  if (invalidReason.status === "error") {
-    return createFreshOnlyLineage("lineage-store-unavailable", lineage.currentCanonicalStart);
-  }
-  if (invalidReason.value) {
-    return createFreshOnlyLineage(invalidReason.value, lineage.currentCanonicalStart);
-  }
-  return lineage;
+  return continueDecoded();
 }
 
 export function degradeCorePrimaryLineageForMutation(
@@ -1794,43 +1816,60 @@ export function appendAutoInjectedThreadSearchLineage(input: {
     );
 
   const decoded = decodeCorePrimaryLineageV1(input.lineage, input.canonicalMessages);
-  if (decoded.status === "error") return failClosed();
-  const lineage = decoded.value;
-  if (lineage.state !== "complete" || input.injectedMessages.length === 0) return failClosed();
-  const previous = lineage.segments.at(-1);
-  if (!previous || previous.canonicalEnd !== input.canonicalMessages.length) return failClosed();
+  const continueDecoded = decoded.match<() => CorePrimaryLineageV1>({
+    err: () => failClosed,
+    ok: (lineage) => () => {
+      if (lineage.state !== "complete" || input.injectedMessages.length === 0) {
+        return failClosed();
+      }
+      const previous = lineage.segments.at(-1);
+      if (!previous || previous.canonicalEnd !== input.canonicalMessages.length) {
+        return failClosed();
+      }
 
-  const atom = {
-    kind: "synthetic" as const,
-    source: AUTO_INJECTED_THREAD_SEARCH_LINEAGE_SOURCE,
-    messageDigest: hashCanonicalMessagesV1(input.injectedMessages).hash,
-  };
-  const cumulativeAtomCount = previous.cumulativeAtomCount + 1;
-  const extended = extendCoreLineagePrefixDigestV1(
-    previous.cumulativePrefixDigest,
-    cumulativeAtomCount,
-    atom,
-  );
-  if (extended.status === "error") return failClosed();
-  const candidate = {
-    ...lineage,
-    segments: [
-      ...lineage.segments,
-      {
-        atoms: [atom],
-        canonicalMessages: [...input.injectedMessages],
-        canonicalStart: previous.canonicalEnd,
-        canonicalEnd: previous.canonicalEnd + input.injectedMessages.length,
+      const atom = {
+        kind: "synthetic" as const,
+        source: AUTO_INJECTED_THREAD_SEARCH_LINEAGE_SOURCE,
+        messageDigest: hashCanonicalMessagesV1(input.injectedMessages).hash,
+      };
+      const cumulativeAtomCount = previous.cumulativeAtomCount + 1;
+      const extended = extendCoreLineagePrefixDigestV1(
+        previous.cumulativePrefixDigest,
         cumulativeAtomCount,
-        cumulativePrefixDigest: extended.value,
-      },
-    ],
-  };
-  const parsed = decodeCorePrimaryLineageV1(candidate, [
-    ...input.canonicalMessages,
-    ...input.injectedMessages,
-  ]);
-  return parsed.status === "ok" && parsed.value.state === "complete" ? parsed.value : failClosed();
+        atom,
+      );
+      const continueExtended = extended.match<() => CorePrimaryLineageV1>({
+        err: () => failClosed,
+        ok: (cumulativePrefixDigest) => () => {
+          const candidate = {
+            ...lineage,
+            segments: [
+              ...lineage.segments,
+              {
+                atoms: [atom],
+                canonicalMessages: [...input.injectedMessages],
+                canonicalStart: previous.canonicalEnd,
+                canonicalEnd: previous.canonicalEnd + input.injectedMessages.length,
+                cumulativeAtomCount,
+                cumulativePrefixDigest,
+              },
+            ],
+          };
+          const parsed = decodeCorePrimaryLineageV1(candidate, [
+            ...input.canonicalMessages,
+            ...input.injectedMessages,
+          ]);
+          const continueParsed = parsed.match<() => CorePrimaryLineageV1>({
+            ok: (value) => () => (value.state === "complete" ? value : failClosed()),
+            err: () => failClosed,
+          });
+          return continueParsed();
+        },
+      });
+      return continueExtended();
+    },
+  });
+  return continueDecoded();
 }
 
 export function mapCorePrimaryCompactionCurrentCanonicalStart(input: {
@@ -1874,7 +1913,10 @@ export function resolveCorePrimaryTranscriptProviderState(input: {
         const transcript = input.transcriptStore?.getRequestTranscript?.({
           requestId: atom.requestId,
         });
-        const state = transcript?.status === "ok" ? transcript.value?.providerState : undefined;
+        const state = transcript?.match({
+          ok: (value) => value?.providerState,
+          err: () => undefined,
+        });
         if (
           !state ||
           state.lastFamily !== atom.providerFamily ||
@@ -1890,7 +1932,10 @@ export function resolveCorePrimaryTranscriptProviderState(input: {
         const transcript = input.transcriptStore?.getRequestTranscript?.({
           requestId: atom.requestId,
         });
-        const state = transcript?.status === "ok" ? transcript.value?.providerState : undefined;
+        const state = transcript?.match({
+          ok: (value) => value?.providerState,
+          err: () => undefined,
+        });
         if (!state || state.lastFamily !== input.targetFamily || state.containsCrossFamilyTurns) {
           containsCrossFamilyTurns = true;
         }
@@ -1986,15 +2031,11 @@ function groupQueueCancellationEntries(entries: readonly Enqueued[]): QueueCance
 
 async function maybeBuildSkillsSectionForPrimary(): Promise<string | null> {
   const workspaceRoot = findWorkspaceRootResult();
-  if (workspaceRoot.status === "error") {
-    switch (workspaceRoot.error._tag) {
-      case "WorkspaceRootNotFound":
-        return null;
-    }
-  }
+  const root = workspaceRoot.match({ ok: (value) => value, err: () => null });
+  if (root === null) return null;
   try {
     const { skills } = await discoverSkills({
-      workspaceRoot: workspaceRoot.value,
+      workspaceRoot: root,
       dataDir: env.dataDir,
     });
     return formatAvailableSkillsSection(skills);
@@ -2073,11 +2114,8 @@ export function resolveAgentRunModelResult(params: {
 
   if (params.resolvedModelRequest) {
     const plan = fromDurableResolvedModelPlanResult(params.resolvedModelRequest);
-    if (plan.status === "error") return plan;
-    return Result.ok(
-      params.reasoningOverride
-        ? withModelPlanReasoning(plan.value, params.reasoningOverride)
-        : plan.value,
+    return plan.map((value) =>
+      params.reasoningOverride ? withModelPlanReasoning(value, params.reasoningOverride) : value,
     );
   }
 
@@ -2119,13 +2157,11 @@ export function resolveAgentRunModelResult(params: {
       headSource: "cmd.request.message.modelOverride",
       fallbackSource: "cmd.request.message.modelOverride.fallback",
     });
-    if (resolved.status === "error") return resolved;
     const fallbacks = resolveAgentRunModelFallbacksResult(params);
-    if (fallbacks.status === "error") return fallbacks;
-    return Result.ok({
-      head: applyHeadReasoning(resolved.value.head),
-      fallbacks: fallbacks.value,
-    });
+    return Result.all([resolved, fallbacks]).map(([plan, fallbackValues]) => ({
+      head: applyHeadReasoning(plan.head),
+      fallbacks: fallbackValues,
+    }));
   }
 
   if (subagentProfileConfig?.model) {
@@ -2139,13 +2175,11 @@ export function resolveAgentRunModelResult(params: {
       headSource: `agent.subagents.profiles.${params.runProfile}.model`,
       fallbackSource: `agent.subagents.profiles.${params.runProfile}.fallback`,
     });
-    if (resolved.status === "error") return resolved;
     const fallbacks = resolveAgentRunModelFallbacksResult(params);
-    if (fallbacks.status === "error") return fallbacks;
-    return Result.ok({
-      head: applyHeadReasoning(resolved.value.head),
-      fallbacks: fallbacks.value,
-    });
+    return Result.all([resolved, fallbacks]).map(([plan, fallbackValues]) => ({
+      head: applyHeadReasoning(plan.head),
+      fallbacks: fallbackValues,
+    }));
   }
 
   const slot = subagentProfileConfig?.modelSlot ?? "main";
@@ -2155,13 +2189,11 @@ export function resolveAgentRunModelResult(params: {
     headSource: `models.${slot}.model`,
     fallbackSource: `models.${slot}.fallback`,
   });
-  if (resolved.status === "error") return resolved;
   const fallbacks = resolveAgentRunModelFallbacksResult(params);
-  if (fallbacks.status === "error") return fallbacks;
-  return Result.ok({
-    head: applyHeadReasoning(resolved.value.head),
-    fallbacks: fallbacks.value,
-  });
+  return Result.all([resolved, fallbacks]).map(([plan, fallbackValues]) => ({
+    head: applyHeadReasoning(plan.head),
+    fallbacks: fallbackValues,
+  }));
 }
 
 export function resolveAgentRunModel(params: {
@@ -2172,8 +2204,10 @@ export function resolveAgentRunModel(params: {
   resolvedModelRequest?: DurableResolvedModelRequest;
 }): ResolvedModelPlan {
   const resolved = resolveAgentRunModelResult(params);
-  if (resolved.status === "error") return signalBusAgentRunnerHostFailure(resolved.error);
-  return resolved.value;
+  return resolved.match({
+    ok: (value) => () => value,
+    err: (error) => () => signalBusAgentRunnerHostFailure(error),
+  })();
 }
 
 type AgentRunFallbackSource = {
@@ -2262,21 +2296,20 @@ export function resolveAgentRunModelFallbacksResult(params: {
     fallbackSource.entries,
     fallbackSource.source,
   );
-  if (resolved.status === "error") return resolved;
-  let fallbacks = resolved.value;
-  if (fallbackSource.profileReasoning) {
-    fallbacks = fallbacks.map((candidate, index) => {
-      const configured = fallbackSource.entries[index];
-      return typeof configured === "object" && configured.reasoning !== undefined
-        ? candidate
-        : { ...candidate, reasoning: fallbackSource.profileReasoning };
-    });
-  }
-  return Result.ok(
-    params.reasoningOverride
+  return resolved.map((values) => {
+    let fallbacks = values;
+    if (fallbackSource.profileReasoning) {
+      fallbacks = fallbacks.map((candidate, index) => {
+        const configured = fallbackSource.entries[index];
+        return typeof configured === "object" && configured.reasoning !== undefined
+          ? candidate
+          : { ...candidate, reasoning: fallbackSource.profileReasoning };
+      });
+    }
+    return params.reasoningOverride
       ? fallbacks.map((fallback) => ({ ...fallback, reasoning: params.reasoningOverride }))
-      : fallbacks,
-  );
+      : fallbacks;
+  });
 }
 
 export function resolveAgentRunModelFallbacks(params: {
@@ -2614,27 +2647,30 @@ export async function startBusAgentRunner(params: {
     if (params.config) return;
 
     const loaded = await captureBusAgentRunnerOperation("core config reload", getCoreConfig);
-    if (loaded.status === "error") {
-      const message = loaded.error.message;
-      if (!coreConfigReloadHadError || lastCoreConfigReloadError !== message) {
-        logger.warn(
-          "core-config reload failed; using last known config",
-          formatBridgeTaggedErrorForLog(loaded.error, { path: "core-config.yaml" }),
-        );
-      }
-      coreConfigReloadHadError = true;
-      lastCoreConfigReloadError = message;
-      return;
-    }
-
-    cfg = loaded.value;
-    if (coreConfigReloadHadError) {
-      logger.info("core-config reload recovered", {
-        path: "core-config.yaml",
-      });
-    }
-    coreConfigReloadHadError = false;
-    lastCoreConfigReloadError = null;
+    const applyLoadedConfig = loaded.match<() => void>({
+      err: (loadError) => () => {
+        const message = loadError.message;
+        if (!coreConfigReloadHadError || lastCoreConfigReloadError !== message) {
+          logger.warn(
+            "core-config reload failed; using last known config",
+            formatBridgeTaggedErrorForLog(loadError, { path: "core-config.yaml" }),
+          );
+        }
+        coreConfigReloadHadError = true;
+        lastCoreConfigReloadError = message;
+      },
+      ok: (loadedConfig) => () => {
+        cfg = loadedConfig;
+        if (coreConfigReloadHadError) {
+          logger.info("core-config reload recovered", {
+            path: "core-config.yaml",
+          });
+        }
+        coreConfigReloadHadError = false;
+        lastCoreConfigReloadError = null;
+      },
+    });
+    applyLoadedConfig();
   }
   const cwd = params.cwd ?? process.env.LILAC_WORKSPACE_DIR ?? process.cwd();
   const workflowRunnerOwnerId = `agent-runner:${process.pid}:${crypto.randomUUID()}`;
@@ -2788,16 +2824,25 @@ export async function startBusAgentRunner(params: {
     const projectedRequest = (params.projectAuthenticatedRequest ?? projectAuthenticatedRequest)(
       msg,
     );
-    if (projectedRequest.status === "error") {
-      if (!pendingAttempt) abandonQueueLifecycleAttempt(msg.id);
-      return Result.err(
-        new BusAgentRunnerAuthenticationProjectionInvalid({
-          cause: projectedRequest.error,
+    let projectionFailure: BusAgentRunnerAuthenticationProjectionInvalid | null = null;
+    const selectRequestProjection = projectedRequest.match<
+      () => AuthenticatedRequestProjection | undefined
+    >({
+      err: (error) => () => {
+        projectionFailure = new BusAgentRunnerAuthenticationProjectionInvalid({
+          cause: error,
           message: "cmd.request.message authentication projection is invalid",
-        }),
-      );
+        });
+        return undefined;
+      },
+      ok: (projection) => () => projection,
+    });
+    const requestProjection = selectRequestProjection();
+    if (projectionFailure) {
+      if (!pendingAttempt) abandonQueueLifecycleAttempt(msg.id);
+      return Result.err(projectionFailure);
     }
-    if (!projectedRequest.value) {
+    if (!requestProjection) {
       if (!pendingAttempt) abandonQueueLifecycleAttempt(msg.id);
       return Result.ok(undefined);
     }
@@ -2811,32 +2856,54 @@ export async function startBusAgentRunner(params: {
     let intakeError: BusAgentRunnerOperationFailed | undefined;
     let parkPending = false;
     try {
-      const cachedExternal = requestMessageCache.cacheMessage(msg, projectedRequest.value);
-      if (cachedExternal.status === "error") {
+      const cachedExternal = requestMessageCache.cacheMessage(msg, requestProjection);
+      let cachedExternalError: RequestMessageCacheAdmissionError | null = null;
+      const selectExternalProjection = cachedExternal.match<
+        () => AuthenticatedRequestProjection | undefined
+      >({
+        err: (error) => () => {
+          cachedExternalError = error;
+          return undefined;
+        },
+        ok: (projection) => () => projection,
+      });
+      const externalProjection = selectExternalProjection();
+      if (cachedExternalError) {
         return Result.err(
           new BusAgentRunnerAuthenticationProjectionInvalid({
-            cause: cachedExternal.error,
+            cause: cachedExternalError,
             message: "cmd.request.message cache admission is invalid",
           }),
         );
       }
-      if (!cachedExternal.value) return Result.ok(undefined);
+      if (!externalProjection) return Result.ok(undefined);
       cacheAdmitted = true;
       const trustedProjection = projectDurableWorkflowRequestIdentity({
-        projection: projectedRequest.value,
+        projection: requestProjection,
         raw,
         store: params.durableWorkflowStore,
       });
       const cachedTrusted = requestMessageCache.cacheMessage(msg, trustedProjection);
-      if (cachedTrusted.status === "error") {
+      let cachedTrustedError: RequestMessageCacheAdmissionError | null = null;
+      const selectAuthenticatedRequest = cachedTrusted.match<
+        () => AuthenticatedRequestProjection | undefined
+      >({
+        err: (error) => () => {
+          cachedTrustedError = error;
+          return undefined;
+        },
+        ok: (projection) => () => projection ?? externalProjection,
+      });
+      const authenticatedRequest = selectAuthenticatedRequest();
+      if (cachedTrustedError) {
         return Result.err(
           new BusAgentRunnerAuthenticationProjectionInvalid({
-            cause: cachedTrusted.error,
+            cause: cachedTrustedError,
             message: "cmd.request.message trusted cache admission is invalid",
           }),
         );
       }
-      const authenticatedRequest = cachedTrusted.value ?? cachedExternal.value;
+      if (!authenticatedRequest) return Result.ok(undefined);
       await (async () => {
         rethrowBusAgentRunnerPanic(terminalPanic);
         await params.beforeRequestIntake?.(msg);
@@ -2929,19 +2996,22 @@ export async function startBusAgentRunner(params: {
           reason?: string;
           activeRequestId?: string | null;
         }) => {
-          logger.debug("agent.queue.transition", {
-            requestId,
-            sessionId,
-            requestClient,
-            queueMode: entry.queue,
-            running: state.running,
-            queueDepthBefore: input.queueDepthBefore,
-            queueDepthAfter: input.queueDepthAfter,
-            action: input.action,
-            reason: input.reason,
-            activeRequestId: input.activeRequestId ?? state.activeRequestId,
-            draining,
-          });
+          logger.debug(
+            "agent.queue.transition",
+            formatBridgeLogContext({
+              requestId,
+              sessionId,
+              requestClient,
+              queueMode: entry.queue,
+              running: state.running,
+              queueDepthBefore: input.queueDepthBefore,
+              queueDepthAfter: input.queueDepthAfter,
+              action: input.action,
+              reason: input.reason,
+              activeRequestId: input.activeRequestId ?? state.activeRequestId,
+              draining,
+            }),
+          );
         };
         const logQueuedBehindActiveRun = (queuedRequestId: string) => {
           logger.info("request queued behind active run", {
@@ -2974,12 +3044,13 @@ export async function startBusAgentRunner(params: {
                 detail,
               }),
           );
-          if (published.status === "error") {
+          const publishError = published.match({ ok: () => null, err: (error) => error });
+          if (publishError) {
             removeQueuedEntriesByReference(state.queue, [queuedEntry]);
             if (queuedEntry.identityOwner) {
               requestMessageCache.releaseOwner(queuedEntry.identityOwner);
             }
-            return Result.err(published.error);
+            return Result.err(publishError);
           }
           return Result.ok(undefined);
         };
@@ -3029,13 +3100,16 @@ export async function startBusAgentRunner(params: {
         }
 
         const dropCancelNoTarget = async (reason: string) => {
-          logger.debug("dropping cancel request with no target", {
-            requestId,
-            sessionId,
-            queue: entry.queue,
-            activeRequestId: state.activeRequestId,
-            reason,
-          });
+          logger.debug(
+            "dropping cancel request with no target",
+            formatBridgeLogContext({
+              requestId,
+              sessionId,
+              queue: entry.queue,
+              activeRequestId: state.activeRequestId,
+              reason,
+            }),
+          );
           logQueueTransition({
             action: "drop",
             queueDepthBefore: state.queue.length,
@@ -3150,11 +3224,14 @@ export async function startBusAgentRunner(params: {
 
           // Some messages only make sense when a run is already active.
           if (requestControl.requiresActive && entry.queue !== "prompt") {
-            logger.debug("dropping request message (requires active run)", {
-              requestId,
-              sessionId,
-              queue: entry.queue,
-            });
+            logger.debug(
+              "dropping request message (requires active run)",
+              formatBridgeLogContext({
+                requestId,
+                sessionId,
+                queue: entry.queue,
+              }),
+            );
             logQueueTransition({
               action: "drop",
               queueDepthBefore: state.queue.length,
@@ -3166,11 +3243,16 @@ export async function startBusAgentRunner(params: {
 
           const queueDepthBefore = state.queue.length;
           const owner = requestMessageCache.acquireOwner(requestId);
-          if (owner.status === "error") {
-            identityError = owner.error;
-            return;
-          }
-          entry.identityOwner = owner.value;
+          const selectOwner = owner.match<() => RequestMessageCacheOwner | null>({
+            err: (error) => () => {
+              identityError = error;
+              return null;
+            },
+            ok: (identityOwner) => () => identityOwner,
+          });
+          const identityOwner = selectOwner();
+          if (!identityOwner) return;
+          entry.identityOwner = identityOwner;
           state.queue.push(entry);
           logQueueTransition({
             action: "enqueue",
@@ -3213,21 +3295,23 @@ export async function startBusAgentRunner(params: {
               activeRun.resolvedModelSpec !== null &&
               activeRun.resolvedProviderFamily !== null
             ) {
+              const activeSpec = activeRun.resolvedModelSpec;
+              const activeFamily = activeRun.resolvedProviderFamily;
               const requestedPlan = resolveAgentRunModelResult({
                 cfg,
                 runProfile: "primary",
                 requestModelOverride: incomingOverride,
               });
-              if (requestedPlan.status === "error") {
-                incompatible = true;
-              } else {
-                incompatible = shouldQueueIncompatibleActiveRuntimeModel({
-                  activeSpec: activeRun.resolvedModelSpec,
-                  activeReasoning: activeRun.resolvedReasoning,
-                  activeFamily: activeRun.resolvedProviderFamily,
-                  requested: requestedPlan.value.head,
-                });
-              }
+              incompatible = requestedPlan.match({
+                ok: (plan) =>
+                  shouldQueueIncompatibleActiveRuntimeModel({
+                    activeSpec,
+                    activeReasoning: activeRun.resolvedReasoning,
+                    activeFamily,
+                    requested: plan.head,
+                  }),
+                err: () => true,
+              });
             }
             if (incompatible) {
               const aliasRequestId = deriveModelChangingRequestId(entry);
@@ -3237,11 +3321,16 @@ export async function startBusAgentRunner(params: {
                 requestClient,
                 sessionId,
               });
-              if (aliased.status === "error") {
-                identityError = aliased.error;
-                return;
-              }
-              const aliasProjection = aliased.value.projection;
+              const selectAlias = aliased.match<() => RequestMessageCacheAliasOwner | null>({
+                err: (error) => () => {
+                  identityError = error;
+                  return null;
+                },
+                ok: (aliasOwner) => () => aliasOwner,
+              });
+              const alias = selectAlias();
+              if (!alias) return;
+              const aliasProjection = alias.projection;
               const queuedEntry: Enqueued = {
                 ...entry,
                 requestId: aliasProjection.requestId,
@@ -3251,8 +3340,8 @@ export async function startBusAgentRunner(params: {
                 authenticatedOrigin: aliasProjection.authenticatedOrigin,
                 verifiedIngress: aliasProjection.verifiedIngress,
                 identityOwner: {
-                  requestId: aliased.value.requestId,
-                  ownerId: aliased.value.ownerId,
+                  requestId: alias.requestId,
+                  ownerId: alias.ownerId,
                 },
               };
               const queueDepthBefore = state.queue.length;
@@ -3260,8 +3349,9 @@ export async function startBusAgentRunner(params: {
                 queuedEntry,
                 "queued for incompatible model or reasoning selection",
               );
-              if (enqueued.status === "error") {
-                intakeError = enqueued.error;
+              const enqueueError = enqueued.match({ ok: () => null, err: (error) => error });
+              if (enqueueError) {
+                intakeError = enqueueError;
                 return;
               }
               logQueueTransition({
@@ -3335,12 +3425,13 @@ export async function startBusAgentRunner(params: {
                     state.activeRun,
                   ),
               );
-              if (applied.status === "error") {
+              const applyError = applied.match({ ok: () => null, err: (error) => error });
+              if (applyError) {
                 for (const bufferedPrompt of bufferedPrompts) {
                   reservedQueueEntries.delete(bufferedPrompt);
                 }
                 queueLifecycleAttempts.delete(msg.id);
-                signalBusAgentRunnerHostFailure(applied.error);
+                signalBusAgentRunnerHostFailure(applyError);
               }
               attempt.controlApplied = true;
               await resumeQueueLifecycleAttempt(attempt, state);
@@ -3366,12 +3457,15 @@ export async function startBusAgentRunner(params: {
             // Prevent stale surface controls (e.g. Cancel button) from enqueueing behind
             // an unrelated active request.
             if (requestControl.requiresActive || requestControl.cancel) {
-              logger.debug("dropping request message (requires active request id)", {
-                requestId,
-                sessionId,
-                activeRequestId: state.activeRequestId,
-                queue: entry.queue,
-              });
+              logger.debug(
+                "dropping request message (requires active request id)",
+                formatBridgeLogContext({
+                  requestId,
+                  sessionId,
+                  activeRequestId: state.activeRequestId,
+                  queue: entry.queue,
+                }),
+              );
               logQueueTransition({
                 action: "drop",
                 queueDepthBefore: state.queue.length,
@@ -3384,14 +3478,20 @@ export async function startBusAgentRunner(params: {
             // No parallel runs: queue prompt messages for later.
             const queueDepthBefore = state.queue.length;
             const owner = requestMessageCache.acquireOwner(requestId);
-            if (owner.status === "error") {
-              identityError = owner.error;
-              return;
-            }
-            entry.identityOwner = owner.value;
+            const selectOwner = owner.match<() => RequestMessageCacheOwner | null>({
+              err: (error) => () => {
+                identityError = error;
+                return null;
+              },
+              ok: (identityOwner) => () => identityOwner,
+            });
+            const identityOwner = selectOwner();
+            if (!identityOwner) return;
+            entry.identityOwner = identityOwner;
             const enqueued = await enqueueWithLifecycle(entry, "queued behind active request");
-            if (enqueued.status === "error") {
-              intakeError = enqueued.error;
+            const enqueueError = enqueued.match({ ok: () => null, err: (error) => error });
+            if (enqueueError) {
+              intakeError = enqueueError;
               return;
             }
 
@@ -3473,17 +3573,19 @@ export async function startBusAgentRunner(params: {
         },
         busAgentRunnerDeliveryDisposition,
       );
-      if (startedSubscription.status === "error") {
-        signalBusAgentRunnerHostFailure(startedSubscription.error);
-      }
-      const sub = startedSubscription.value;
+      const sub = startedSubscription.match({
+        ok: (subscription) => () => subscription,
+        err: (error) => () => signalBusAgentRunnerHostFailure(error),
+      })();
       const subscriptionDone = sub.done.then((done) => {
-        if (
-          done.status === "error" &&
-          !(done.error instanceof EventDeliveryStopped && isRunnerAdmissionStop(done.error))
-        ) {
-          signalBusAgentRunnerHostFailure(done.error);
-        }
+        done.match({
+          ok: () => () => undefined,
+          err: (error) => () => {
+            if (!(error instanceof EventDeliveryStopped && isRunnerAdmissionStop(error))) {
+              signalBusAgentRunnerHostFailure(error);
+            }
+          },
+        })();
       });
       const supervisedSubscriptionDone = subscriptionDone.catch(
         superviseAgentRunnerBackgroundFailure,
@@ -3491,14 +3593,19 @@ export async function startBusAgentRunner(params: {
       void supervisedSubscriptionDone.catch(observeSupervisedSubscriptionDoneRejection);
       stopStartedSubscription = async () => {
         const stopped = await sub.stop();
-        if (stopped.status === "error") signalBusAgentRunnerHostFailure(stopped.error);
+        stopped.match({
+          ok: () => () => undefined,
+          err: (error) => () => signalBusAgentRunnerHostFailure(error),
+        })();
         const done = await sub.done;
-        if (
-          done.status === "error" &&
-          !(done.error instanceof EventDeliveryStopped && isRunnerAdmissionStop(done.error))
-        ) {
-          signalBusAgentRunnerHostFailure(done.error);
-        }
+        done.match({
+          ok: () => () => undefined,
+          err: (error) => () => {
+            if (!(error instanceof EventDeliveryStopped && isRunnerAdmissionStop(error))) {
+              signalBusAgentRunnerHostFailure(error);
+            }
+          },
+        })();
       };
     })();
     return subscriptionStart;
@@ -3872,14 +3979,21 @@ export async function startBusAgentRunner(params: {
         requestClient: entry.requestClient,
         identity: entry.identity,
       });
-      if (resolved.status === "error") return Result.err(resolved.error);
-      resolvedIdentities.set(queueEntryId, resolved.value);
-      if (resolved.value.projection) {
-        cacheRecords.push({
-          projection: resolved.value.projection,
-          parkedEventIds: resolved.value.parkedEventIds,
-        });
-      }
+      const continueResolved = resolved.match<() => AgentRecoveryUnavailable | null>({
+        err: (error) => () => error,
+        ok: (identity) => () => {
+          resolvedIdentities.set(queueEntryId, identity);
+          if (identity.projection) {
+            cacheRecords.push({
+              projection: identity.projection,
+              parkedEventIds: identity.parkedEventIds,
+            });
+          }
+          return null;
+        },
+      });
+      const resolveError = continueResolved();
+      if (resolveError) return Result.err(resolveError);
     }
 
     const reservedIds = new Set<string>();
@@ -3905,26 +4019,29 @@ export async function startBusAgentRunner(params: {
         requestClient: attempt.controlRequestClient,
         identity: attempt.controlIdentity,
       });
-      if (
-        control.status === "error" ||
-        !control.value.projection ||
-        !control.value.parkedEventIds.includes(attempt.eventId) ||
-        (attempt.kind === "queued-cancellation" && !attempt.controlApplied)
-      ) {
-        return Result.err(
-          control.status === "error"
-            ? control.error
-            : new AgentRecoveryUnavailable({
-                requestId: attempt.controlRequestId,
-                reason: "queue-attempt-conflict",
-                message: "Persisted control delivery ownership is incomplete",
-              }),
-        );
-      }
-      cacheRecords.push({
-        projection: control.value.projection,
-        parkedEventIds: control.value.parkedEventIds,
+      const continueControl = control.match<() => AgentRecoveryUnavailable | null>({
+        err: (error) => () => error,
+        ok: (controlIdentity) => () => {
+          if (
+            !controlIdentity.projection ||
+            !controlIdentity.parkedEventIds.includes(attempt.eventId) ||
+            (attempt.kind === "queued-cancellation" && !attempt.controlApplied)
+          ) {
+            return new AgentRecoveryUnavailable({
+              requestId: attempt.controlRequestId,
+              reason: "queue-attempt-conflict",
+              message: "Persisted control delivery ownership is incomplete",
+            });
+          }
+          cacheRecords.push({
+            projection: controlIdentity.projection,
+            parkedEventIds: controlIdentity.parkedEventIds,
+          });
+          return null;
+        },
       });
+      const controlError = continueControl();
+      if (controlError) return Result.err(controlError);
       for (const group of attempt.pendingGroups) {
         for (const queueEntryId of group.targetQueueEntryIds) {
           const target = queueEntries.get(queueEntryId);
@@ -3949,7 +4066,12 @@ export async function startBusAgentRunner(params: {
       }
     }
     const cacheAttempt = requestMessageCache.prepareRestore(cacheRecords);
-    if (cacheAttempt.status === "error") {
+    const selectRestoreCache = cacheAttempt.match<() => RequestMessageCacheRestoreAttempt | null>({
+      err: () => () => null,
+      ok: (attempt) => () => attempt,
+    });
+    const restoreCache = selectRestoreCache();
+    if (!restoreCache) {
       return Result.err(
         new AgentRecoveryUnavailable({
           requestId: recoveryState.entries[0]?.requestId ?? "recovery",
@@ -3972,7 +4094,7 @@ export async function startBusAgentRunner(params: {
       for (const queued of inserted.values()) reservedQueueEntries.delete(queued);
       for (const sessionId of sessions) bySession.delete(sessionId);
       for (const owner of owners) requestMessageCache.releaseOwner(owner);
-      cacheAttempt.value.rollback();
+      restoreCache.rollback();
       inserted.clear();
       owners.length = 0;
       sessions.clear();
@@ -3981,8 +4103,9 @@ export async function startBusAgentRunner(params: {
     return Result.ok({
       apply: () => {
         if (applied) return Result.ok(undefined);
-        const cached = cacheAttempt.value.apply();
-        if (cached.status === "error") {
+        const cached = restoreCache.apply();
+        const cacheError = cached.match({ ok: () => null, err: (error) => error });
+        if (cacheError) {
           return Result.err(
             new AgentRecoveryUnavailable({
               requestId: recoveryState.entries[0]?.requestId ?? "recovery",
@@ -3999,7 +4122,12 @@ export async function startBusAgentRunner(params: {
           let identityOwner: RequestMessageCacheOwner | undefined;
           if (identity?.projection) {
             const owner = requestMessageCache.acquireOwner(entry.requestId);
-            if (owner.status === "error") {
+            const selectOwner = owner.match<() => RequestMessageCacheOwner | null>({
+              err: () => () => null,
+              ok: (acquiredOwner) => () => acquiredOwner,
+            });
+            const acquiredOwner = selectOwner();
+            if (!acquiredOwner) {
               rollback();
               return Result.err(
                 new AgentRecoveryUnavailable({
@@ -4009,8 +4137,8 @@ export async function startBusAgentRunner(params: {
                 }),
               );
             }
-            identityOwner = owner.value;
-            owners.push(owner.value);
+            identityOwner = acquiredOwner;
+            owners.push(identityOwner);
           }
           const queued: Enqueued = {
             queueEntryId,
@@ -4191,14 +4319,18 @@ export async function startBusAgentRunner(params: {
       publish: () => Promise<void>,
     ): Promise<void> => {
       const published = await captureBusAgentRunnerOperation(operation, publish);
-      if (published.status === "ok") return;
-      logger.error(
-        operation,
-        formatBridgeTaggedErrorForLog(published.error, {
-          requestId: headers.request_id,
-          sessionId: headers.session_id,
-        }),
-      );
+      published.match({
+        ok: () => undefined,
+        err: (error) => {
+          logger.error(
+            operation,
+            formatBridgeTaggedErrorForLog(error, {
+              requestId: headers.request_id,
+              sessionId: headers.session_id,
+            }),
+          );
+        },
+      });
     };
     let auxiliaryOutputTail = Promise.resolve();
     const publishCurrentLifecycle = async (input: {
@@ -4264,17 +4396,26 @@ export async function startBusAgentRunner(params: {
       const retryResult = await captureBusAgentRunnerOperation("idle retry backoff", () =>
         idleRetryBudget.next(abortSignal),
       );
-      if (retryResult.status === "error") return "fail" as const;
-      const decision = toIdleRetryDecision(retryResult.value);
+      const selectDecision = retryResult.match<() => ReturnType<typeof toIdleRetryDecision> | null>(
+        {
+          err: () => () => null,
+          ok: (backoff) => () => toIdleRetryDecision(backoff),
+        },
+      );
+      const decision = selectDecision();
+      if (!decision) return "fail" as const;
       if (decision.status === "fail") return "fail" as const;
       const retry = decision.attempt;
-      logger.warn("agent idle timeout; retrying", {
-        requestId: headers.request_id,
-        sessionId: headers.session_id,
-        attempt: retry.attempt,
-        maxRetries: cfg.agent.retry.maxRetries,
-        delayMs: retry.delayMs,
-      });
+      logger.warn(
+        "agent idle timeout; retrying",
+        formatBridgeLogContext({
+          requestId: headers.request_id,
+          sessionId: headers.session_id,
+          attempt: retry.attempt,
+          maxRetries: cfg.agent.retry.maxRetries,
+          delayMs: retry.delayMs,
+        }),
+      );
       return "retry" as const;
     };
     const runIdleWatchdog =
@@ -4282,11 +4423,14 @@ export async function startBusAgentRunner(params: {
         ? createAgentRunIdleWatchdog({
             idleTimeoutMs: cfg.agent.idleTimeoutMs,
             onTimeout: (error) => {
-              logger.warn("agent run idle timeout", {
-                requestId: headers.request_id,
-                sessionId: headers.session_id,
-                idleTimeoutMs: cfg.agent.idleTimeoutMs,
-              });
+              logger.warn(
+                "agent run idle timeout",
+                formatBridgeLogContext({
+                  requestId: headers.request_id,
+                  sessionId: headers.session_id,
+                  idleTimeoutMs: cfg.agent.idleTimeoutMs,
+                }),
+              );
               customCommandAbortController?.abort();
               const agent = activeAgent;
               if (!agent) return;
@@ -4310,29 +4454,40 @@ export async function startBusAgentRunner(params: {
         const waited = await captureBusAgentRunnerOperation("agent idle watchdog wait", () =>
           runIdleWatchdog.waitFor(tracked),
         );
-        if (waited.status === "ok") return Result.ok(waited.value);
-        const recovery = idleRecoveryPromise;
-        if (waited.error.failureKind !== "idle-timeout" || !recovery) {
-          return Result.err(waited.error);
-        }
-        const result = await recovery;
-        if (idleRecoveryPromise === recovery) idleRecoveryPromise = null;
-        if (
-          result.status !== "retried" &&
-          !(
-            result.status === "superseded" &&
-            (result.reason === "cancel" || result.reason === "interrupt")
-          )
-        ) {
-          return Result.err(waited.error);
-        }
-        runIdleWatchdog.restart();
+        const continueWait = waited.match<
+          () => Promise<ResultType<T, BusAgentRunnerOperationFailed> | null>
+        >({
+          ok: (value) => async () => Result.ok(value),
+          err: (waitError) => async () => {
+            const recovery = idleRecoveryPromise;
+            if (waitError.failureKind !== "idle-timeout" || !recovery) {
+              return Result.err(waitError);
+            }
+            const result = await recovery;
+            if (idleRecoveryPromise === recovery) idleRecoveryPromise = null;
+            if (
+              result.status !== "retried" &&
+              !(
+                result.status === "superseded" &&
+                (result.reason === "cancel" || result.reason === "interrupt")
+              )
+            ) {
+              return Result.err(waitError);
+            }
+            runIdleWatchdog.restart();
+            return null;
+          },
+        });
+        const outcome = await continueWait();
+        if (outcome) return outcome;
       }
     };
     const waitForRunAtHost = async <T>(promise: Promise<T>): Promise<T> => {
       const waited = await waitForRun(promise);
-      if (waited.status === "error") return signalBusAgentRunnerHostFailure(waited.error);
-      return waited.value;
+      return waited.match({
+        ok: (value) => () => value,
+        err: (error) => () => signalBusAgentRunnerHostFailure(error),
+      })();
     };
     const getActiveRunOperation = (): Promise<unknown> | null => activeRunOperation;
     const waitForPreAgent = <T>(promise: Promise<T>): Promise<T> =>
@@ -4534,19 +4689,20 @@ export async function startBusAgentRunner(params: {
           }
           if (workflowPolicy) {
             const validatedPolicy = assertWorkflowDispatchPolicy(workflowPolicy, subagentMeta);
-            if (validatedPolicy.status === "error") {
-              return signalBusAgentRunnerHostFailure(validatedPolicy.error);
-            }
+            validatedPolicy.match({
+              ok: () => () => undefined,
+              err: (error) => () => signalBusAgentRunnerHostFailure(error),
+            })();
           }
           const resolvedStableNamedContinuation = resolveCoreStableNamedContinuation({
             runProfile,
             sessionId: next.sessionId,
             workflowPolicy,
           });
-          if (resolvedStableNamedContinuation.status === "error") {
-            return signalBusAgentRunnerHostFailure(resolvedStableNamedContinuation.error);
-          }
-          const stableNamedContinuation = resolvedStableNamedContinuation.value;
+          const stableNamedContinuation = resolvedStableNamedContinuation.match({
+            ok: (value) => () => value,
+            err: (error) => () => signalBusAgentRunnerHostFailure(error),
+          })();
           const maxSubagentDepth = subagents.maxDepth;
           if (subagentMeta.depth > maxSubagentDepth) {
             const detail = `subagent depth ${subagentMeta.depth} exceeds maxDepth=${maxSubagentDepth}`;
@@ -4588,9 +4744,10 @@ export async function startBusAgentRunner(params: {
             {},
             { headers },
           );
-          if (replyPublished.status === "error") {
-            return signalBusAgentRunnerHostFailure(replyPublished.error);
-          }
+          replyPublished.match({
+            ok: () => () => undefined,
+            err: (error) => () => signalBusAgentRunnerHostFailure(error),
+          })();
 
           if (parsedCustomCommand) {
             if (runProfile === "primary" && next.requestClient === "discord") {
@@ -4649,11 +4806,14 @@ export async function startBusAgentRunner(params: {
                     }),
                   ),
                 );
-                if (executed.status === "error") {
-                  customError = customCommandExecutionErrorText(executed.error);
-                } else {
-                  output = executed.value;
-                }
+                executed.match({
+                  ok: (value) => {
+                    output = value;
+                  },
+                  err: (error) => {
+                    customError = customCommandExecutionErrorText(error);
+                  },
+                });
               } finally {
                 runIdleWatchdog?.pause();
                 customCommandAbortController = null;
@@ -4732,14 +4892,15 @@ export async function startBusAgentRunner(params: {
                   finalText,
                   modelLabel: resolvedModelLabel,
                 });
-                if (persisted.status === "error") {
+                const persistError = persisted.match({ ok: () => null, err: (error) => error });
+                if (persistError) {
                   logger.error(
                     "failed to persist transcript after custom command error",
                     formatBridgeLogContext({
                       requestId: headers.request_id,
                       sessionId: headers.session_id,
-                      errorTag: persisted.error.name,
-                      errorMessage: persisted.error.message,
+                      errorTag: persistError.name,
+                      errorMessage: persistError.message,
                     }),
                   );
                 }
@@ -4786,10 +4947,10 @@ export async function startBusAgentRunner(params: {
             reasoningOverride: subagentMeta.reasoning,
             resolvedModelRequest: workflowPolicy?.resolvedModelRequest,
           });
-          if (resolvedModelPlan.status === "error") {
-            return signalBusAgentRunnerHostFailure(resolvedModelPlan.error);
-          }
-          const modelPlan = resolvedModelPlan.value;
+          const modelPlan = resolvedModelPlan.match({
+            ok: (value) => () => value,
+            err: (error) => () => signalBusAgentRunnerHostFailure(error),
+          })();
           const initialResolvedModel = modelPlan.head;
           resolvedModelLabel = initialResolvedModel.modelId;
           resolvedProviderFamily = classifyHistoryProviderFamily({
@@ -4967,35 +5128,46 @@ export async function startBusAgentRunner(params: {
                       sessionId: next.sessionId,
                     }),
             );
-            if (loadedTranscript.status === "ok" && loadedTranscript.value?.status === "ok") {
-              const latest = loadedTranscript.value.value;
-              if (latest && latest.messages.length > 0) {
-                seededSessionMessages = latest.messages;
-                seededSessionTranscript = latest;
-                logger.info("subagent continuation seeded from transcript", {
-                  requestId: next.requestId,
-                  sessionId: next.sessionId,
-                  fromRequestId: latest.requestId,
-                  messagesSeeded: latest.messages.length,
+            const applyLoadedTranscript = loadedTranscript.match<() => void>({
+              err: (loadError) => () => {
+                logger.warn(
+                  "failed to load subagent continuation transcript",
+                  formatBridgeTaggedErrorForLog(loadError, {
+                    requestId: next.requestId,
+                    sessionId: next.sessionId,
+                  }),
+                );
+              },
+              ok: (transcript) => () => {
+                const applyDecodedTranscript = transcript?.match<() => void>({
+                  ok: (latest) => () => {
+                    if (!latest || latest.messages.length === 0) return;
+                    seededSessionMessages = latest.messages;
+                    seededSessionTranscript = latest;
+                    logger.info(
+                      "subagent continuation seeded from transcript",
+                      formatBridgeLogContext({
+                        requestId: next.requestId,
+                        sessionId: next.sessionId,
+                        fromRequestId: latest.requestId,
+                        messagesSeeded: latest.messages.length,
+                      }),
+                    );
+                  },
+                  err: (error) => () => {
+                    logger.warn(
+                      "failed to decode subagent continuation transcript",
+                      formatBridgeTaggedErrorForLog(error, {
+                        requestId: next.requestId,
+                        sessionId: next.sessionId,
+                      }),
+                    );
+                  },
                 });
-              }
-            } else if (loadedTranscript.status === "error") {
-              logger.warn(
-                "failed to load subagent continuation transcript",
-                formatBridgeTaggedErrorForLog(loadedTranscript.error, {
-                  requestId: next.requestId,
-                  sessionId: next.sessionId,
-                }),
-              );
-            } else if (loadedTranscript.value?.status === "error") {
-              logger.warn(
-                "failed to decode subagent continuation transcript",
-                formatBridgeTaggedErrorForLog(loadedTranscript.value.error, {
-                  requestId: next.requestId,
-                  sessionId: next.sessionId,
-                }),
-              );
-            }
+                applyDecodedTranscript?.();
+              },
+            });
+            applyLoadedTranscript();
           }
 
           const fallbackSurfaceForDelegation = trustedFallbackSurface;
@@ -5014,18 +5186,24 @@ export async function startBusAgentRunner(params: {
               "model capability resolution",
               () => waitForPreAgent(modelCapability.resolve(resolved.spec)),
             );
-            if (capability.status === "ok") {
-              capabilityInfo = capability.value;
-              if (capabilityInfo.cost) {
-                bindingCostEstimateStatus = "estimated";
-              } else {
-                bindingCostEstimateReason = "model_cost_missing";
+            const applyCapability = capability.match<() => BusAgentRunnerOperationFailed | null>({
+              ok: (resolvedCapability) => () => {
+                capabilityInfo = resolvedCapability;
+                if (resolvedCapability.cost) {
+                  bindingCostEstimateStatus = "estimated";
+                } else {
+                  bindingCostEstimateReason = "model_cost_missing";
+                }
+                return null;
+              },
+              err: (error) => () => error,
+            });
+            const capabilityError = applyCapability();
+            if (capabilityError) {
+              if (capabilityError.failureKind === "pre-agent-cancelled") {
+                return Result.err(capabilityError);
               }
-            } else {
-              if (capability.error.failureKind === "pre-agent-cancelled") {
-                return Result.err(capability.error);
-              }
-              bindingCostEstimateReason = `capability_resolve_failed:${capability.error.message}`;
+              bindingCostEstimateReason = `capability_resolve_failed:${capabilityError.message}`;
             }
 
             const editingToolMode = resolveEditingToolMode({
@@ -5117,7 +5295,7 @@ export async function startBusAgentRunner(params: {
                     : undefined,
               },
             };
-            const builtToolset = await waitForPreAgent(
+            const toolsetResult = await waitForPreAgent(
               params.pluginManager.buildLevel1ToolsetResult({
                 cwd: executionCwd,
                 runProfile,
@@ -5136,30 +5314,36 @@ export async function startBusAgentRunner(params: {
                 },
               }),
             );
-            level1RequestContext.currentTurnUserId = currentTurnUserId;
-            if (builtToolset.status === "error") return Result.err(builtToolset.error);
-            const toolset = builtToolset.value;
-            return Result.ok({
-              resolved,
-              capabilityInfo,
-              costEstimateStatus: bindingCostEstimateStatus,
-              costEstimateReason: bindingCostEstimateReason,
-              editingToolMode,
-              anthropicPromptCachingEnabled,
-              providerOptionsForAgent,
-              agentSystem,
-              experimentalDownload,
-              toolset,
-              requestContext: level1RequestContext,
-              activeToolNames: selectedLevel1ToolNames(toolset, listSelectedCatalogIds()),
+            return toolsetResult.map((toolset) => {
+              level1RequestContext.currentTurnUserId = currentTurnUserId;
+              return {
+                resolved,
+                capabilityInfo,
+                costEstimateStatus: bindingCostEstimateStatus,
+                costEstimateReason: bindingCostEstimateReason,
+                editingToolMode,
+                anthropicPromptCachingEnabled,
+                providerOptionsForAgent,
+                agentSystem,
+                experimentalDownload,
+                toolset,
+                requestContext: level1RequestContext,
+                activeToolNames: selectedLevel1ToolNames(toolset, listSelectedCatalogIds()),
+              };
             });
           };
+          type BuildModelBindingResult = Awaited<ReturnType<typeof buildModelBinding>>;
+          type BuiltModelBinding =
+            BuildModelBindingResult extends ResultType<infer T, unknown> ? T : never;
+          type BuildModelBindingError =
+            BuildModelBindingResult extends ResultType<unknown, infer E> ? E : never;
 
-          const initialBinding = await waitForPreAgent(buildModelBinding(initialResolvedModel));
-          if (initialBinding.status === "error") {
-            return signalBusAgentRunnerHostFailure(initialBinding.error);
-          }
-          let activeBinding = initialBinding.value;
+          const initialBinding: ResultType<BuiltModelBinding, BuildModelBindingError> =
+            await waitForPreAgent(buildModelBinding(initialResolvedModel));
+          let activeBinding = initialBinding.match({
+            ok: (value) => () => value,
+            err: (error) => () => signalBusAgentRunnerHostFailure(error),
+          })();
           modelCapabilityInfo = activeBinding.capabilityInfo;
           costEstimateStatus = activeBinding.costEstimateStatus;
           costEstimateReason = activeBinding.costEstimateReason;
@@ -5198,11 +5382,12 @@ export async function startBusAgentRunner(params: {
             });
             if (!nextFallback) return { ok: false as const, reason: "model fallback exhausted" };
 
-            const builtNextBinding = await buildModelBinding(nextFallback.candidate);
-            if (builtNextBinding.status === "error") {
-              return signalBusAgentRunnerHostFailure(builtNextBinding.error);
-            }
-            const nextBinding = builtNextBinding.value;
+            const builtNextBinding: ResultType<BuiltModelBinding, BuildModelBindingError> =
+              await buildModelBinding(nextFallback.candidate);
+            const nextBinding = builtNextBinding.match({
+              ok: (value) => () => value,
+              err: (error) => () => signalBusAgentRunnerHostFailure(error),
+            })();
             nextBinding.toolset.updateActiveBatchTools(nextBinding.activeToolNames);
             agent.setModel(
               nextBinding.resolved.model,
@@ -5309,21 +5494,22 @@ export async function startBusAgentRunner(params: {
                   return await activeAgent.executeExternalToolCall(request);
                 },
               } satisfies Parameters<typeof materializeClaudeCodeRunResult>[0];
-              const materialized = params.materializeClaudeCodeRun
-                ? Result.ok(await params.materializeClaudeCodeRun(options))
-                : await materializeClaudeCodeRunResult(options);
-              if (materialized.status === "error") {
-                switch (materialized.error._tag) {
-                  case "ClaudeCodeRunInvalidConfiguration":
-                  case "ClaudeNativeSessionPreflightError":
-                  case "ClaudeCodeRunExternalFailure":
-                  case "ClaudeCodeBuiltInToolUnsupported":
-                  case "ClaudeCodeToolBridgeConfigurationFailed":
-                  case "ClaudeCodeRunOperationAndCleanupFailed":
-                    throw materialized.error;
-                }
-              }
-              const run = materialized.value;
+              const run = params.materializeClaudeCodeRun
+                ? await params.materializeClaudeCodeRun(options)
+                : (await materializeClaudeCodeRunResult(options)).match({
+                    ok: (value) => () => value,
+                    err: (error) => () => {
+                      switch (error._tag) {
+                        case "ClaudeCodeRunInvalidConfiguration":
+                        case "ClaudeNativeSessionPreflightError":
+                        case "ClaudeCodeRunExternalFailure":
+                        case "ClaudeCodeBuiltInToolUnsupported":
+                        case "ClaudeCodeToolBridgeConfigurationFailed":
+                        case "ClaudeCodeRunOperationAndCleanupFailed":
+                          throw error;
+                      }
+                    },
+                  })();
               if (state.activeRun) state.activeRun.claudeCodeControl = run.control;
               return run;
             };
@@ -5338,10 +5524,11 @@ export async function startBusAgentRunner(params: {
                 "Claude execution cwd canonicalization",
                 () => fs.realpath(executionCwd),
               );
-              const canonicalExecutionCwd =
-                canonicalCwdResult.status === "ok"
-                  ? canonicalCwdResult.value
-                  : path.resolve(executionCwd);
+              const selectCanonicalExecutionCwd = canonicalCwdResult.match<() => string>({
+                ok: (canonicalExecutionCwd) => () => canonicalExecutionCwd,
+                err: () => () => path.resolve(executionCwd),
+              });
+              const canonicalExecutionCwd = selectCanonicalExecutionCwd();
               const nativeStorageNamespace = path.resolve(
                 process.env["CLAUDE_CONFIG_DIR"] ?? path.join(homedir(), ".claude"),
               );
@@ -5429,10 +5616,10 @@ export async function startBusAgentRunner(params: {
                     }
                   },
                 });
-                if (createdPrimaryRuntime.status === "error") {
-                  return signalBusAgentRunnerHostFailure(createdPrimaryRuntime.error);
-                }
-                corePrimaryClaudeRuntime = createdPrimaryRuntime.value;
+                corePrimaryClaudeRuntime = createdPrimaryRuntime.match({
+                  ok: (value) => () => value,
+                  err: (error) => () => signalBusAgentRunnerHostFailure(error),
+                })();
               } else if (
                 stableNamedContinuation !== null &&
                 supportsCoreNamedContinuationStore(continuationStore)
@@ -5469,10 +5656,10 @@ export async function startBusAgentRunner(params: {
                     }
                   },
                 });
-                if (createdNamedRuntime.status === "error") {
-                  return signalBusAgentRunnerHostFailure(createdNamedRuntime.error);
-                }
-                coreNamedClaudeRuntime = createdNamedRuntime.value;
+                coreNamedClaudeRuntime = createdNamedRuntime.match({
+                  ok: (value) => () => value,
+                  err: (error) => () => signalBusAgentRunnerHostFailure(error),
+                })();
               } else {
                 claudeCodeRun = await waitForPreAgent(materializeClaude());
               }
@@ -5671,12 +5858,15 @@ export async function startBusAgentRunner(params: {
                 minimumTokens: cfg.tools.historicalResultPruning.minimumTokens,
               });
               if (estimatedPrunedTokens > 0) {
-                logger.info("agent.historical_result_pruned", {
-                  requestId: next.requestId,
-                  sessionId: next.sessionId,
-                  compactedToolCallCount: state.compactedToolCallIds.size,
-                  estimatedPrunedTokens,
-                });
+                logger.info(
+                  "agent.historical_result_pruned",
+                  formatBridgeLogContext({
+                    requestId: next.requestId,
+                    sessionId: next.sessionId,
+                    compactedToolCallCount: state.compactedToolCallIds.size,
+                    estimatedPrunedTokens,
+                  }),
+                );
               }
             }
 
@@ -5814,15 +6004,17 @@ export async function startBusAgentRunner(params: {
                   reasoning: agent.state.reasoning,
                   abortSignal,
                 });
-                if (compacted.status === "error") {
-                  switch (compacted.error._tag) {
-                    case "OpenAIServerCompactionAborted":
-                    case "OpenAIServerCompactionRequestFailed":
-                    case "OpenAIServerCompactionOutputInvalid":
-                      throw compacted.error;
-                  }
-                }
-                return compacted.value;
+                return compacted.match({
+                  ok: (value) => () => value,
+                  err: (error) => () => {
+                    switch (error._tag) {
+                      case "OpenAIServerCompactionAborted":
+                      case "OpenAIServerCompactionRequestFailed":
+                      case "OpenAIServerCompactionOutputInvalid":
+                        throw error;
+                    }
+                  },
+                })();
               },
               serverCompactionEnabled: () => {
                 if (!activeBinding.resolved.openaiServerCompaction) return false;
@@ -6008,17 +6200,27 @@ export async function startBusAgentRunner(params: {
               "workflow subagent completion query",
               () => liveParentSession.listPendingSettledAsync(),
             );
-            if (queried.status === "error") {
+            let queryError: BusAgentRunnerOperationFailed | null = null;
+            let settled: Awaited<ReturnType<typeof liveParentSession.listPendingSettledAsync>> = [];
+            const applyQuery = queried.match<() => void>({
+              ok: (results) => () => {
+                settled = results;
+              },
+              err: (error) => () => {
+                queryError = error;
+              },
+            });
+            applyQuery();
+            if (queryError) {
               logger.warn(
                 "workflow subagent completion query failed; delivery remains pending",
-                formatBridgeTaggedErrorForLog(queried.error, {
+                formatBridgeTaggedErrorForLog(queryError, {
                   requestId: headers.request_id,
                   sessionId: headers.session_id,
                 }),
               );
-              return Result.err(queried.error);
+              return Result.err(queryError);
             }
-            const settled = queried.value;
 
             if (input.abortSignal?.aborted) {
               return Result.ok({ append: [], forceNextTurn: false });
@@ -6038,17 +6240,16 @@ export async function startBusAgentRunner(params: {
                       toolCallId: buildSubagentResultToolCallId(result.completion.runId),
                     }),
                 );
-                if (normalized.status === "ok") {
-                  completion = {
-                    ...result.completion,
-                    finalText: normalized.value,
-                  };
-                } else {
-                  materializationError = {
-                    message: normalized.error.message,
-                    details: normalized.error.details,
-                  };
-                }
+                completion = normalized.match<WorkflowLiveParentCompletion | null>({
+                  ok: (finalText) => ({ ...result.completion, finalText }),
+                  err: (error) => {
+                    materializationError = {
+                      message: error.message,
+                      details: error.details,
+                    };
+                    return null;
+                  },
+                });
               } else {
                 materializationError = projectBusAgentRunnerError(
                   result,
@@ -6121,14 +6322,17 @@ export async function startBusAgentRunner(params: {
                       : (completion.detail ?? `subagent ${completion.status}`),
                   }),
               );
-              if (published.status === "ok") {
-                publishedDeferredCompletionRunIds.add(completion.runId);
-              } else {
-                logger.warn(
-                  "workflow subagent completion publish failed",
-                  formatBridgeTaggedErrorForLog(published.error, { runId: completion.runId }),
-                );
-              }
+              published.match({
+                ok: () => {
+                  publishedDeferredCompletionRunIds.add(completion.runId);
+                },
+                err: (error) => {
+                  logger.warn(
+                    "workflow subagent completion publish failed",
+                    formatBridgeTaggedErrorForLog(error, { runId: completion.runId }),
+                  );
+                },
+              });
             }
 
             if (provisionalPlan.consumedRunIds.length > 0 && !input.abortSignal?.aborted) {
@@ -6162,8 +6366,13 @@ export async function startBusAgentRunner(params: {
           const adaptDeferredDrainToHost = (
             drained: Awaited<ReturnType<typeof drainDeferredCompletions>>,
           ): { append: ModelMessage[]; forceNextTurn: boolean } => {
-            if (drained.status === "error") return { append: [], forceNextTurn: false };
-            return drained.value;
+            const selectDrain = drained.match<
+              () => { append: ModelMessage[]; forceNextTurn: boolean }
+            >({
+              ok: (plan) => () => plan,
+              err: () => () => ({ append: [], forceNextTurn: false }),
+            });
+            return selectDrain();
           };
           let pendingSilentTurnStartIndex: number | null = null;
           const removePendingSilentTurn = () => {
@@ -6323,22 +6532,25 @@ export async function startBusAgentRunner(params: {
               await fs.mkdir(contextDumpDir, { recursive: true });
               await fs.writeFile(filePath, debugJsonStringify(payload), "utf8");
             });
-            if (dumped.status === "ok") {
-              logger.debug("context dump wrote", {
-                requestId: headers.request_id,
-                sessionId: headers.session_id,
-                filePath,
-              });
-            } else {
-              logger.warn(
-                "context dump failed",
-                formatBridgeTaggedErrorForLog(dumped.error, {
+            dumped.match({
+              ok: () => {
+                logger.debug("context dump wrote", {
                   requestId: headers.request_id,
                   sessionId: headers.session_id,
                   filePath,
-                }),
-              );
-            }
+                });
+              },
+              err: (error) => {
+                logger.warn(
+                  "context dump failed",
+                  formatBridgeTaggedErrorForLog(error, {
+                    requestId: headers.request_id,
+                    sessionId: headers.session_id,
+                    filePath,
+                  }),
+                );
+              },
+            });
           };
 
           const estimateUsageCostUsd = (
@@ -7073,7 +7285,8 @@ export async function startBusAgentRunner(params: {
                     ? { stableNamedRequestClient: stableNamedContinuation.requestClient }
                     : {}),
                 });
-                if (savedTranscript.status === "error") {
+                const saveError = savedTranscript.match({ ok: () => null, err: (error) => error });
+                if (saveError) {
                   coreNamedClaudeRuntime?.markTerminalFailure(false);
                   corePrimaryClaudeRuntime?.markTerminalFailure(false);
                   logger.error(
@@ -7081,8 +7294,8 @@ export async function startBusAgentRunner(params: {
                     formatBridgeLogContext({
                       requestId: headers.request_id,
                       sessionId: headers.session_id,
-                      errorTag: savedTranscript.error.name,
-                      errorMessage: savedTranscript.error.message,
+                      errorTag: saveError.name,
+                      errorMessage: saveError.message,
                     }),
                   );
                   return;
@@ -7096,7 +7309,8 @@ export async function startBusAgentRunner(params: {
                   const verified = transcriptStore.getRequestTranscript?.({
                     requestId: headers.request_id,
                   });
-                  const verifiedTranscript = verified?.status === "ok" ? verified.value : null;
+                  const verifiedTranscript =
+                    verified?.match({ ok: (value) => value, err: () => null }) ?? null;
                   const expectedHash = hashCanonicalMessagesV1(persistedMessages).hash;
                   if (
                     !verifiedTranscript ||
@@ -7136,9 +7350,10 @@ export async function startBusAgentRunner(params: {
                   const verifiedManifest = transcriptStore.getCorePrimaryLineageManifest?.({
                     requestId: headers.request_id,
                   });
-                  const verifiedTranscript = verified?.status === "ok" ? verified.value : null;
+                  const verifiedTranscript =
+                    verified?.match({ ok: (value) => value, err: () => null }) ?? null;
                   const manifest =
-                    verifiedManifest?.status === "ok" ? verifiedManifest.value : null;
+                    verifiedManifest?.match({ ok: (value) => value, err: () => null }) ?? null;
                   const expectedHash = hashCanonicalMessagesV1(persistedMessages).hash;
                   const terminalCanonicalMessages = runStats.finalMessages ?? agent.state.messages;
                   if (
@@ -7185,12 +7400,16 @@ export async function startBusAgentRunner(params: {
                 }
               },
             );
-            if (persistedTranscript.status === "error") {
+            const persistError = persistedTranscript.match({
+              ok: () => null,
+              err: (error) => error,
+            });
+            if (persistError) {
               coreNamedClaudeRuntime?.markTerminalFailure(false);
               corePrimaryClaudeRuntime?.markTerminalFailure(false);
               logger.error(
                 "failed to persist transcript",
-                formatBridgeTaggedErrorForLog(persistedTranscript.error, {
+                formatBridgeTaggedErrorForLog(persistError, {
                   requestId: headers.request_id,
                   sessionId: headers.session_id,
                 }),
@@ -7233,10 +7452,11 @@ export async function startBusAgentRunner(params: {
                   responseMessages,
                 }),
             );
-            if (persistedHandoffs.status === "error") {
+            const handoffError = persistedHandoffs.match({ ok: () => null, err: (error) => error });
+            if (handoffError) {
               logger.error(
                 "failed to persist heartbeat handoff transcripts",
-                formatBridgeTaggedErrorForLog(persistedHandoffs.error, {
+                formatBridgeTaggedErrorForLog(handoffError, {
                   requestId: headers.request_id,
                   sessionId: headers.session_id,
                 }),
@@ -7330,8 +7550,9 @@ export async function startBusAgentRunner(params: {
           terminalPanic = panic;
         },
       );
-      if (runResult.status === "error") {
-        const failure = runResult.error;
+      const runFailure = runResult.match({ ok: () => null, err: (error) => error });
+      if (runFailure) {
+        const failure = runFailure;
         const failedCoreNamedRuntime = getCoreNamedClaudeRuntime();
         const failedCorePrimaryRuntime = getCorePrimaryClaudeRuntime();
         runIdleWatchdog?.stop();
@@ -7480,25 +7701,33 @@ export async function startBusAgentRunner(params: {
               });
             },
           );
-          if (persistedFailure.status === "error") {
-            logger.error(
-              "failed to persist transcript after error",
-              formatBridgeTaggedErrorForLog(persistedFailure.error, {
-                requestId: headers.request_id,
-                sessionId: headers.session_id,
-              }),
-            );
-          } else if (persistedFailure.value.status === "error") {
-            logger.error(
-              "failed to persist transcript after error",
-              formatBridgeLogContext({
-                requestId: headers.request_id,
-                sessionId: headers.session_id,
-                errorTag: persistedFailure.value.error.name,
-                errorMessage: persistedFailure.value.error.message,
-              }),
-            );
-          }
+          const reportPersistence = persistedFailure.match<() => void>({
+            err: (persistenceError) => () => {
+              logger.error(
+                "failed to persist transcript after error",
+                formatBridgeTaggedErrorForLog(persistenceError, {
+                  requestId: headers.request_id,
+                  sessionId: headers.session_id,
+                }),
+              );
+            },
+            ok: (saved) => () => {
+              const reportSave = saved.match<() => void>({
+                ok: () => () => undefined,
+                err: (saveError) => () => {
+                  logger.error(
+                    "failed to persist transcript after error",
+                    formatBridgeTaggedErrorForLog(saveError, {
+                      requestId: headers.request_id,
+                      sessionId: headers.session_id,
+                    }),
+                  );
+                },
+              });
+              reportSave();
+            },
+          });
+          reportPersistence();
         }
 
         if (liveParentSession) {
@@ -7506,10 +7735,14 @@ export async function startBusAgentRunner(params: {
             "deferred subagent cancellation after parent failure",
             () => liveParentSession.cancelAll(`parent run failed: ${msg}`),
           );
-          if (cancelledSubagents.status === "error") {
+          const cancellationError = cancelledSubagents.match({
+            ok: () => null,
+            err: (error) => error,
+          });
+          if (cancellationError) {
             logger.warn(
               "failed to cancel deferred subagents after parent failure",
-              formatBridgeTaggedErrorForLog(cancelledSubagents.error, {
+              formatBridgeTaggedErrorForLog(cancellationError, {
                 requestId: headers.request_id,
                 sessionId: headers.session_id,
               }),
@@ -7539,10 +7772,14 @@ export async function startBusAgentRunner(params: {
               });
             },
           );
-          if (persistedFailureHandoffs.status === "error") {
+          const handoffError = persistedFailureHandoffs.match({
+            ok: () => null,
+            err: (error) => error,
+          });
+          if (handoffError) {
             logger.error(
               "failed to persist heartbeat handoff transcripts after error",
-              formatBridgeTaggedErrorForLog(persistedFailureHandoffs.error, {
+              formatBridgeTaggedErrorForLog(handoffError, {
                 requestId: headers.request_id,
                 sessionId: headers.session_id,
               }),
@@ -7674,15 +7911,18 @@ export async function startBusAgentRunner(params: {
             "Core named Claude runtime retirement",
             () => runtime.retireAtRunEnd(),
           );
-          if (retired.status === "error") {
-            logger.warn(
-              "failed to retire Core named Claude runtime",
-              formatBridgeTaggedErrorForLog(retired.error, {
-                requestId: headers.request_id,
-                sessionId: headers.session_id,
-              }),
-            );
-          }
+          retired.match({
+            ok: () => undefined,
+            err: (error) => {
+              logger.warn(
+                "failed to retire Core named Claude runtime",
+                formatBridgeTaggedErrorForLog(error, {
+                  requestId: headers.request_id,
+                  sessionId: headers.session_id,
+                }),
+              );
+            },
+          });
         }
         if (cleanupCorePrimaryRuntime) {
           const runtime = cleanupCorePrimaryRuntime;
@@ -7690,30 +7930,36 @@ export async function startBusAgentRunner(params: {
             "Core primary Claude runtime retirement",
             () => runtime.retireAtRunEnd(),
           );
-          if (retired.status === "error") {
-            logger.warn(
-              "failed to retire Core primary Claude runtime",
-              formatBridgeTaggedErrorForLog(retired.error, {
-                requestId: headers.request_id,
-                sessionId: headers.session_id,
-              }),
-            );
-          }
+          retired.match({
+            ok: () => undefined,
+            err: (error) => {
+              logger.warn(
+                "failed to retire Core primary Claude runtime",
+                formatBridgeTaggedErrorForLog(error, {
+                  requestId: headers.request_id,
+                  sessionId: headers.session_id,
+                }),
+              );
+            },
+          });
         }
         if (cleanupClaudeCodeRun) {
           const run = cleanupClaudeCodeRun;
           const disposed = await captureBusAgentRunnerOperation("Claude Code run disposal", () =>
             run.dispose(),
           );
-          if (disposed.status === "error") {
-            logger.warn(
-              "failed to dispose Claude Code run resources",
-              formatBridgeTaggedErrorForLog(disposed.error, {
-                requestId: headers.request_id,
-                sessionId: headers.session_id,
-              }),
-            );
-          }
+          disposed.match({
+            ok: () => undefined,
+            err: (error) => {
+              logger.warn(
+                "failed to dispose Claude Code run resources",
+                formatBridgeTaggedErrorForLog(error, {
+                  requestId: headers.request_id,
+                  sessionId: headers.session_id,
+                }),
+              );
+            },
+          });
         }
         await liveParentSession?.close();
       }
@@ -7818,7 +8064,10 @@ async function publishLifecycle(params: {
     { state: params.state, detail: params.detail, ts: Date.now() },
     { headers: params.headers },
   );
-  if (published.status === "error") signalBusAgentRunnerHostFailure(published.error);
+  published.match({
+    ok: () => () => undefined,
+    err: (error) => () => signalBusAgentRunnerHostFailure(error),
+  })();
 }
 
 function mergeQueuedForSameRequest(

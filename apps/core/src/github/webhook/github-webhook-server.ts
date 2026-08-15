@@ -137,9 +137,13 @@ export function decodeGithubWebhookEvent(
     },
     catch: (cause) => cause,
   });
-  if (decoded.status === "ok") return decoded.value;
-  if (Panic.is(decoded.error)) return adaptToolResultToHost(Result.err(decoded.error));
-  return { kind: "unsupported", reason: "payload_invalid" };
+  return decoded.match<() => ProjectedGithubWebhookEvent>({
+    ok: (value) => () => value,
+    err: (error) => () => {
+      if (Panic.is(error)) return adaptToolResultToHost(Result.err(error));
+      return { kind: "unsupported", reason: "payload_invalid" };
+    },
+  })();
 }
 
 async function captureGithubWebhookOperation<T>(
@@ -479,52 +483,55 @@ export async function startGithubWebhookServer(options: GithubWebhookOptions): P
     const payload = await captureGithubWebhookOperation("decode JSON", async () =>
       JSON.parse(new TextDecoder().decode(raw)),
     );
-    if (payload.status === "error") {
-      logger.warn("github.webhook.rejected", {
-        event,
-        deliveryId,
-        reason: "invalid_json",
-        statusCode: 400,
-        durationMs: Date.now() - startedAt,
-      });
-      set.status = 400;
-      return { ok: false, error: "invalid json" };
-    }
-
-    const projected = decodeGithubWebhookEvent(event, payload.value);
-    const handled = await superviseGithubWebhookHandler({
-      reportFatalError: options.reportFatalError,
-      run: () =>
-        handleEvent({
-          bus: options.bus,
-          logger,
+    return payload.match({
+      err: () => async () => {
+        logger.warn("github.webhook.rejected", {
           event,
-          projected,
-          botLogins,
-        }),
-    });
-    if (handled.status === "ok") {
-      const result = handled.value;
-      logger.info("github.webhook.ingress", {
-        event,
-        deliveryId,
-        action: result.action,
-        repo: result.repoFullName,
-        handled: result.handled,
-        reason: result.reason,
-        requestIdOut: result.requestId,
-        statusCode: 200,
-        durationMs: Date.now() - startedAt,
-      });
-    } else {
-      const errorMessage = handled.error.message;
-      logger.error("webhook handler failed", formatTaggedErrorForLog(handled.error));
-      logger.error("github.webhook.rejected", formatTaggedErrorForLog(handled.error));
-      set.status = 500;
-      return { ok: false, error: errorMessage };
-    }
-
-    return { ok: true };
+          deliveryId,
+          reason: "invalid_json",
+          statusCode: 400,
+          durationMs: Date.now() - startedAt,
+        });
+        set.status = 400;
+        return { ok: false, error: "invalid json" };
+      },
+      ok: (payload) => async () => {
+        const projected = decodeGithubWebhookEvent(event, payload);
+        const handled = await superviseGithubWebhookHandler({
+          reportFatalError: options.reportFatalError,
+          run: () =>
+            handleEvent({
+              bus: options.bus,
+              logger,
+              event,
+              projected,
+              botLogins,
+            }),
+        });
+        return handled.match({
+          ok: (result) => () => {
+            logger.info("github.webhook.ingress", {
+              event,
+              deliveryId,
+              action: result.action,
+              repo: result.repoFullName,
+              handled: result.handled,
+              reason: result.reason,
+              requestIdOut: result.requestId,
+              statusCode: 200,
+              durationMs: Date.now() - startedAt,
+            });
+            return { ok: true };
+          },
+          err: (error) => () => {
+            logger.error("webhook handler failed", formatTaggedErrorForLog(error));
+            logger.error("github.webhook.rejected", formatTaggedErrorForLog(error));
+            set.status = 500;
+            return { ok: false, error: error.message };
+          },
+        })();
+      },
+    })();
   });
 
   const server = app.listen({ port });
@@ -708,14 +715,17 @@ async function onIssueCommentCreated(input: {
       commentId,
     }),
   );
-  if (ack.status === "ok") {
-    setGithubAck(requestId, {
-      target: { kind: "comment", commentId, issueNumber },
-      reactionId: ack.value,
-    });
-  } else {
-    input.logger.warn("failed to add eyes reaction", formatTaggedErrorForLog(ack.error));
-  }
+  ack.match({
+    ok: (reactionId) => {
+      setGithubAck(requestId, {
+        target: { kind: "comment", commentId, issueNumber },
+        reactionId,
+      });
+    },
+    err: (error) => {
+      input.logger.warn("failed to add eyes reaction", formatTaggedErrorForLog(error));
+    },
+  });
 
   const issueData = await getIssue({ owner, repo, number: issueNumber });
   const recent = await listIssueComments({ owner, repo, number: issueNumber, limit: 30 });
@@ -833,14 +843,17 @@ async function onReviewRequested(input: {
         const ack = await captureGithubWebhookOperation("review acknowledgement", () =>
           addEyesReactionToIssue({ owner, repo, issueNumber: prNumber }),
         );
-        if (ack.status === "ok") {
-          setGithubAck(requestId, {
-            target: { kind: "issue", issueNumber: prNumber },
-            reactionId: ack.value,
-          });
-        } else {
-          input.logger.warn("failed to add eyes reaction", formatTaggedErrorForLog(ack.error));
-        }
+        ack.match({
+          ok: (reactionId) => {
+            setGithubAck(requestId, {
+              target: { kind: "issue", issueNumber: prNumber },
+              reactionId,
+            });
+          },
+          err: (error) => {
+            input.logger.warn("failed to add eyes reaction", formatTaggedErrorForLog(error));
+          },
+        });
       }
 
       const prData = await getPullRequest({ owner, repo, number: prNumber });

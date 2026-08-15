@@ -6,6 +6,7 @@ import {
   extractAiErrorLogDetails,
   resolveModelSlotResult,
   type CoreConfig,
+  type ResolvedModelSlot,
 } from "@stanley2058/lilac-utils";
 import type { Logger } from "@stanley2058/simple-module-logger";
 import type { MsgRef } from "../../types";
@@ -81,26 +82,29 @@ export async function shouldForwardByGate(params: {
 
   try {
     const resolution = resolveModelSlotResult(params.cfg, "fast");
-    if (resolution.status === "error") {
-      switch (resolution.error._tag) {
-        case "ModelResolutionFailed": {
-          const failOpen = params.input.context?.mode === "direct-reply-mention-disambiguation";
-          params.logger.error(
-            "router gate model resolution failed",
-            formatBridgeTaggedErrorForLog(resolution.error, {
-              sessionId: params.input.sessionId,
-              mode: params.input.context?.mode ?? "active-batch",
-              failOpen,
-            }),
-          );
-          return {
-            forward: failOpen,
-            reason: failOpen ? "error-fail-open" : "error",
-          };
+    const resolved = resolution.match<() => ResolvedModelSlot | null>({
+      ok: (value) => () => value,
+      err: (error) => () => {
+        switch (error._tag) {
+          case "ModelResolutionFailed": {
+            const failOpen = params.input.context?.mode === "direct-reply-mention-disambiguation";
+            params.logger.error(
+              "router gate model resolution failed",
+              formatBridgeTaggedErrorForLog(error, {
+                sessionId: params.input.sessionId,
+                mode: params.input.context?.mode ?? "active-batch",
+                failOpen,
+              }),
+            );
+            return null;
+          }
         }
-      }
+      },
+    })();
+    if (!resolved) {
+      const failOpen = params.input.context?.mode === "direct-reply-mention-disambiguation";
+      return { forward: failOpen, reason: failOpen ? "error-fail-open" : "error" };
     }
-    const resolved = resolution.value;
 
     const prompt = (() => {
       if (params.input.context?.mode === "direct-reply-mention-disambiguation") {

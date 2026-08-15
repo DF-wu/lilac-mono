@@ -46,7 +46,7 @@ export async function resolveTextSendableChannel(
     try: () => client.channels.fetch(channelId),
     catch: surfaceExternalFallback(null),
   });
-  const channel = fetched.status === "ok" ? fetched.value : null;
+  const channel = fetched.unwrapOr(null);
   return isTextSendableChannel(channel) ? channel : null;
 }
 

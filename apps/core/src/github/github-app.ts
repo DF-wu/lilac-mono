@@ -96,14 +96,19 @@ export async function readGithubAppSecretResult(
         message: `Invalid GitHub App secret at ${jsonPath}`,
       }),
   );
-  if (loaded.status === "error") return Result.err(loaded.error);
-  return loaded.value === null ? Result.ok(null) : decodeGithubAppSecret(jsonPath, loaded.value);
+  return loaded.andThen((value) =>
+    value === null ? Result.ok(null) : decodeGithubAppSecret(jsonPath, value),
+  );
 }
 
 export async function readGithubAppSecret(dataDir: string): Promise<GithubAppSecret | null> {
   const read = await readGithubAppSecretResult(dataDir);
-  if (read.status === "error") throw read.error;
-  return read.value;
+  return read.match({
+    ok: (value) => () => value,
+    err: (error) => () => {
+      throw error;
+    },
+  })();
 }
 
 export async function writeGithubAppSecret(params: {
@@ -165,22 +170,26 @@ export async function readGithubAppPrivateKeyPemResult(
         message: `Failed to read GitHub App private key: ${secret.privateKeyPath}`,
       }),
   );
-  if (loaded.status === "error") return Result.err(loaded.error);
-  const raw = loaded.value;
-  if (!raw.trim()) {
-    return Result.err(
-      new GithubAppPrivateKeyReadError({
-        privateKeyPath: secret.privateKeyPath,
-        cause: new Error("GitHub App private key is empty"),
-        message: `GitHub App private key is empty: ${secret.privateKeyPath}`,
-      }),
-    );
-  }
-  return Result.ok(raw);
+  return loaded.andThen((raw) => {
+    if (!raw.trim()) {
+      return Result.err(
+        new GithubAppPrivateKeyReadError({
+          privateKeyPath: secret.privateKeyPath,
+          cause: new Error("GitHub App private key is empty"),
+          message: `GitHub App private key is empty: ${secret.privateKeyPath}`,
+        }),
+      );
+    }
+    return Result.ok(raw);
+  });
 }
 
 export async function readGithubAppPrivateKeyPem(secret: GithubAppSecret): Promise<string> {
   const loaded = await readGithubAppPrivateKeyPemResult(secret);
-  if (loaded.status === "error") throw loaded.error;
-  return loaded.value;
+  return loaded.match({
+    ok: (value) => () => value,
+    err: (error) => () => {
+      throw error;
+    },
+  })();
 }

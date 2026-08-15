@@ -46,20 +46,42 @@ function buttonStyle(style: SurfaceAction["style"]): ButtonStyle {
 export function buildDiscordActionComponentsResult(
   actions: readonly SurfaceAction[],
 ): ResultType<ActionRowBuilder<ButtonBuilder>[], DiscordActionCustomIdInvalid> {
-  const rows: ActionRowBuilder<ButtonBuilder>[] = [];
-  for (let index = 0; index < actions.length; index += 5) {
-    const buttons: ButtonBuilder[] = [];
-    for (const action of actions.slice(index, index + 5)) {
-      const customId = buildDiscordActionCustomIdResult(action.actionId);
-      if (customId.status === "error") return Result.err(customId.error);
-      buttons.push(
-        new ButtonBuilder()
-          .setCustomId(customId.value)
-          .setLabel(action.label)
-          .setStyle(buttonStyle(action.style)),
-      );
-    }
-    rows.push(new ActionRowBuilder<ButtonBuilder>().addComponents(buttons));
-  }
-  return Result.ok(rows);
+  const buildAt = (
+    index: number,
+    buttons: readonly ButtonBuilder[],
+  ): ResultType<ButtonBuilder[], DiscordActionCustomIdInvalid> => {
+    const action = actions[index];
+    if (!action) return Result.ok([...buttons]);
+    const customIdResult = buildDiscordActionCustomIdResult(action.actionId);
+    const continueCustomId = customIdResult.match<
+      () => ResultType<ButtonBuilder[], DiscordActionCustomIdInvalid>
+    >({
+      err: (error) => () => Result.err(error),
+      ok: (customId) => () =>
+        buildAt(index + 1, [
+          ...buttons,
+          new ButtonBuilder()
+            .setCustomId(customId)
+            .setLabel(action.label)
+            .setStyle(buttonStyle(action.style)),
+        ]),
+    });
+    return continueCustomId();
+  };
+  const built = buildAt(0, []);
+  const continueBuilt = built.match<
+    () => ResultType<ActionRowBuilder<ButtonBuilder>[], DiscordActionCustomIdInvalid>
+  >({
+    err: (error) => () => Result.err(error),
+    ok: (buttons) => () => {
+      const rows: ActionRowBuilder<ButtonBuilder>[] = [];
+      for (let index = 0; index < buttons.length; index += 5) {
+        rows.push(
+          new ActionRowBuilder<ButtonBuilder>().addComponents(buttons.slice(index, index + 5)),
+        );
+      }
+      return Result.ok(rows);
+    },
+  });
+  return continueBuilt();
 }

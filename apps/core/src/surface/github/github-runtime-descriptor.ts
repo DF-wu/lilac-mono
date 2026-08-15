@@ -33,6 +33,11 @@ import {
 } from "../runtime-descriptor";
 
 type GithubWorkflowProgressOperation = "check-message" | "send" | "edit";
+type GithubCheckMessageResult = Awaited<
+  ReturnType<SurfaceWorkflowProgressPort<"github">["checkMessage"]>
+>;
+type GithubSendResult = Awaited<ReturnType<SurfaceWorkflowProgressPort<"github">["send"]>>;
+type GithubEditResult = Awaited<ReturnType<SurfaceWorkflowProgressPort<"github">["edit"]>>;
 
 // Bump when the declared workflow operation contract or failure policy changes.
 export const GITHUB_WORKFLOW_PROGRESS_CONFIGURATION_REVISION = "github-workflow-progress-v1";
@@ -55,13 +60,13 @@ export function createGithubWorkflowProgressPort(
         channelId: target.channelId,
         messageId: target.messageId,
       });
-      if (checked.status === "error") {
-        if (checked.error._tag === "SurfaceMessageNotFound") {
-          return Result.ok("missing");
-        }
-        return Result.err(githubWorkflowError("check-message", checked.error));
-      }
-      return Result.ok(checked.value ? "found" : "missing");
+      return checked.match<GithubCheckMessageResult>({
+        err: (error) =>
+          error._tag === "SurfaceMessageNotFound"
+            ? Result.ok("missing")
+            : Result.err(githubWorkflowError("check-message", error)),
+        ok: (value) => Result.ok(value ? "found" : "missing"),
+      });
     },
     send: async (input) => {
       const content = input.replyToMessageId
@@ -75,23 +80,26 @@ export function createGithubWorkflowProgressPort(
         content,
         { silent: input.silent },
       );
-      if (sent.status === "error") {
-        if (sent.error._tag === "SurfaceOperationPartiallyCompleted") {
-          return Result.err({
-            kind: "created",
-            ref: {
-              platform: "github",
-              channelId: sent.error.created.channelId,
-              messageId: sent.error.created.messageId,
-            },
-          });
-        }
-        return Result.err(githubWorkflowError("send", sent.error));
-      }
-      return Result.ok({
-        platform: "github",
-        channelId: sent.value.channelId,
-        messageId: sent.value.messageId,
+      return sent.match<GithubSendResult>({
+        err: (error) => {
+          if (error._tag === "SurfaceOperationPartiallyCompleted") {
+            return Result.err({
+              kind: "created",
+              ref: {
+                platform: "github",
+                channelId: error.created.channelId,
+                messageId: error.created.messageId,
+              },
+            });
+          }
+          return Result.err(githubWorkflowError("send", error));
+        },
+        ok: (value) =>
+          Result.ok({
+            platform: "github",
+            channelId: value.channelId,
+            messageId: value.messageId,
+          }),
       });
     },
     edit: async (target, content) => {
@@ -106,11 +114,13 @@ export function createGithubWorkflowProgressPort(
           text: markGithubAgentComment(content.text ?? ""),
         },
       );
-      if (edited.status === "ok") return Result.ok(undefined);
-      if (edited.error._tag === "SurfaceMessageNotFound") {
-        return Result.err({ kind: "not-found" });
-      }
-      return Result.err(githubWorkflowError("edit", edited.error));
+      return edited.match<GithubEditResult>({
+        ok: () => Result.ok(undefined),
+        err: (error) =>
+          error._tag === "SurfaceMessageNotFound"
+            ? Result.err({ kind: "not-found" })
+            : Result.err(githubWorkflowError("edit", error)),
+      });
     },
   };
 }
@@ -204,13 +214,18 @@ async function clearGithubIngressAcknowledgement(
     clearGithubAck(input.requestId);
   }
 
-  if (deleted.status === "ok" || deleted.error.isNotFound) return Result.ok(undefined);
-  return Result.err(
-    new SurfaceIngressAcknowledgementCleanupFailed({
-      cause: formatTaggedErrorForLog(deleted.error),
-      message: "Failed to clear surface ingress acknowledgement",
-    }),
-  );
+  return deleted.match<ResultType<void, SurfaceIngressAcknowledgementCleanupFailed>>({
+    ok: () => Result.ok(undefined),
+    err: (error) =>
+      error.isNotFound
+        ? Result.ok(undefined)
+        : Result.err(
+            new SurfaceIngressAcknowledgementCleanupFailed({
+              cause: formatTaggedErrorForLog(error),
+              message: "Failed to clear surface ingress acknowledgement",
+            }),
+          ),
+  });
 }
 
 export function createGithubRelayPolicy(

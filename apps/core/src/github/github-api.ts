@@ -113,7 +113,7 @@ export async function decodeGithubApiErrorResponse(
       status: response.status,
       statusText: response.statusText,
       path,
-      body: body.status === "ok" ? body.value : "",
+      body: body.match({ ok: (value) => value, err: () => "" }),
       headers: response.headers,
     }),
   );
@@ -131,12 +131,13 @@ function headers(token: string, extra?: Record<string, string>): HeadersInit {
 
 async function captureGithubApiExternal<T, E>(
   run: () => Promise<T>,
-  mapError: (cause: unknown) => E,
+  mapError: (cause: Error) => E,
 ): Promise<ResultType<T, E>> {
   try {
     return Result.ok(await run());
   } catch (cause) {
     if (Panic.is(cause)) throw cause;
+    if (!(cause instanceof Error)) throw cause;
     return Result.err(mapError(cause));
   }
 }
@@ -150,17 +151,17 @@ async function captureGithubResponseText(response: Response): Promise<ResultType
 
 async function ctxResult(): Promise<ResultType<GithubApiCtx, GithubAuthFailed | GithubApiError>> {
   const auth = await getPreferredGithubAuthResult({ dataDir: env.dataDir });
-  if (auth.status === "error") return Result.err(auth.error);
-  if (!auth.value) {
-    return Result.err(
-      new GithubApiError(
-        401,
-        "auth",
-        "GitHub auth not configured. Configure outbound user auth or GitHub App auth.",
-      ),
-    );
-  }
-  return Result.ok({ apiBaseUrl: auth.value.apiBaseUrl, token: auth.value.token });
+  return auth.andThen((value) =>
+    value
+      ? Result.ok({ apiBaseUrl: value.apiBaseUrl, token: value.token })
+      : Result.err(
+          new GithubApiError(
+            401,
+            "auth",
+            "GitHub auth not configured. Configure outbound user auth or GitHub App auth.",
+          ),
+        ),
+  );
 }
 
 async function ctx(): Promise<GithubApiCtx> {
@@ -176,7 +177,7 @@ async function githubFetchJsonResult<T>(input: {
   schema: z.ZodType<T>;
 }): Promise<ResultType<T, GithubApiError>> {
   const url = `${input.apiBaseUrl.replace(/\/$/u, "")}${input.path}`;
-  const fetched = await captureGithubApiExternal(
+  const response = await captureGithubApiExternal(
     () =>
       fetch(url, {
         method: input.method ?? "GET",
@@ -188,34 +189,47 @@ async function githubFetchJsonResult<T>(input: {
       }),
     () => new GithubApiError(503, input.path, `GitHub request failed at ${input.path}`),
   );
-  if (fetched.status === "error") return Result.err(fetched.error);
-  const res = fetched.value;
-  if (!res.ok) {
-    return await decodeGithubApiErrorResponse(res, input.path);
-  }
-  const body = await captureGithubApiExternal(
-    async (): Promise<unknown> => await res.json(),
-    () => new GithubApiError(502, input.path, `GitHub API response unreadable at ${input.path}`),
-  );
-  if (body.status === "error") return Result.err(body.error);
-  const decoded = input.schema.safeParse(body.value);
-  if (!decoded.success) {
-    return Result.err(
-      new GithubApiError(
-        502,
-        input.path,
-        `GitHub API returned an invalid response at ${input.path}`,
-      ),
-    );
-  }
-  return Result.ok(decoded.data);
+  const continueResponse = response.match<() => Promise<ResultType<T, GithubApiError>>>({
+    err: (error) => async () => Result.err(error),
+    ok: (res) => async () => {
+      if (!res.ok) return await decodeGithubApiErrorResponse(res, input.path);
+
+      const body = await captureGithubApiExternal(
+        async (): Promise<unknown> => await res.json(),
+        () =>
+          new GithubApiError(502, input.path, `GitHub API response unreadable at ${input.path}`),
+      );
+      const continueBody = body.match<() => ResultType<T, GithubApiError>>({
+        err: (error) => () => Result.err(error),
+        ok: (value) => () => {
+          const decoded = input.schema.safeParse(value);
+          if (!decoded.success) {
+            return Result.err(
+              new GithubApiError(
+                502,
+                input.path,
+                `GitHub API returned an invalid response at ${input.path}`,
+              ),
+            );
+          }
+          return Result.ok(decoded.data);
+        },
+      });
+      return continueBody();
+    },
+  });
+  return await continueResponse();
 }
 
 function adaptGithubApiResultToHost<T>(
   result: ResultType<T, GithubApiError | GithubAuthFailed>,
 ): T {
-  if (result.status === "error") throw result.error;
-  return result.value;
+  return result.match({
+    ok: (value) => () => value,
+    err: (error) => () => {
+      throw error;
+    },
+  })();
 }
 
 async function githubFetchJson<T>(
@@ -231,7 +245,7 @@ async function githubFetchNoBodyResult(input: {
   method: string;
 }): Promise<ResultType<void, GithubApiError>> {
   const url = `${input.apiBaseUrl.replace(/\/$/u, "")}${input.path}`;
-  const fetched = await captureGithubApiExternal(
+  const response = await captureGithubApiExternal(
     () =>
       fetch(url, {
         method: input.method,
@@ -239,12 +253,14 @@ async function githubFetchNoBodyResult(input: {
       }),
     () => new GithubApiError(503, input.path, `GitHub request failed at ${input.path}`),
   );
-  if (fetched.status === "error") return Result.err(fetched.error);
-  const res = fetched.value;
-  if (!res.ok) {
-    return await decodeGithubApiErrorResponse(res, input.path);
-  }
-  return Result.ok(undefined);
+  const continueResponse = response.match<() => Promise<ResultType<void, GithubApiError>>>({
+    err: (error) => async () => Result.err(error),
+    ok: (value) => async () => {
+      if (!value.ok) return await decodeGithubApiErrorResponse(value, input.path);
+      return Result.ok(undefined);
+    },
+  });
+  return await continueResponse();
 }
 
 async function githubFetchNoBody(
@@ -541,42 +557,52 @@ export async function getGithubAppSlugOrNull(): Promise<string | null> {
 
   const apiBaseUrl = deriveApiBaseUrl({ host: secret.host, apiBaseUrl: secret.apiBaseUrl });
   const privateKey = await readGithubAppPrivateKeyPemResult(secret);
-  if (privateKey.status === "error") return null;
-
-  const authenticated = await captureGithubApiExternal(
-    async () => {
-      const auth = createAppAuth({
-        appId: secret.appId,
-        privateKey: privateKey.value,
-        baseUrl: apiBaseUrl,
-      });
-      return await auth({ type: "app" });
-    },
-    (cause) => new Error("GitHub App authentication failed", { cause }),
-  );
-  if (authenticated.status === "error") return null;
-  const jwt = authenticated.value;
-  if (!jwt || typeof jwt.token !== "string" || jwt.token.length === 0) {
-    return null;
-  }
-
-  const fetched = await captureGithubApiExternal(
-    () =>
-      fetch(`${apiBaseUrl.replace(/\/$/u, "")}/app`, {
-        headers: {
-          "User-Agent": "lilac",
-          Accept: "application/vnd.github+json",
-          "X-GitHub-Api-Version": "2022-11-28",
-          Authorization: `Bearer ${jwt.token}`,
+  return privateKey.match({
+    err: () => async () => null,
+    ok: (privateKey) => async () => {
+      const authenticated = await captureGithubApiExternal(
+        async () => {
+          const auth = createAppAuth({
+            appId: secret.appId,
+            privateKey,
+            baseUrl: apiBaseUrl,
+          });
+          return await auth({ type: "app" });
         },
-      }),
-    (cause) => new Error("GitHub App request failed", { cause }),
-  );
-  if (fetched.status === "error") return null;
-  const res = fetched.value;
-  if (!res.ok) return null;
-  const body = await captureGithubAppResponse(res);
-  return body.status === "ok" && body.value.success ? body.value.data.slug : null;
+        (cause) => new Error("GitHub App authentication failed", { cause }),
+      );
+      return authenticated.match({
+        err: () => async () => null,
+        ok: (jwt) => async () => {
+          if (!jwt || typeof jwt.token !== "string" || jwt.token.length === 0) return null;
+
+          const fetched = await captureGithubApiExternal(
+            () =>
+              fetch(`${apiBaseUrl.replace(/\/$/u, "")}/app`, {
+                headers: {
+                  "User-Agent": "lilac",
+                  Accept: "application/vnd.github+json",
+                  "X-GitHub-Api-Version": "2022-11-28",
+                  Authorization: `Bearer ${jwt.token}`,
+                },
+              }),
+            (cause) => new Error("GitHub App request failed", { cause }),
+          );
+          return fetched.match({
+            err: () => async () => null,
+            ok: (res) => async () => {
+              if (!res.ok) return null;
+              const body = await captureGithubAppResponse(res);
+              return body.match({
+                ok: (value) => (value.success ? value.data.slug : null),
+                err: () => null,
+              });
+            },
+          })();
+        },
+      })();
+    },
+  })();
 }
 
 async function captureGithubAppResponse(

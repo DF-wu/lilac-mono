@@ -23,6 +23,12 @@ export class DiscordEmbedPusherInvariant extends TaggedError("DiscordEmbedPusher
   readonly message: string;
 }> {}
 
+type EmbedPushStep =
+  | { readonly kind: "continue" }
+  | { readonly kind: "delay" }
+  | { readonly kind: "settled" }
+  | { readonly kind: "failed"; readonly error: DiscordEmbedPusherInvariant };
+
 function clampWithEllipsis(text: string, maxChars: number): string {
   if (maxChars <= 0) return "";
   if (text.length <= maxChars) return text;
@@ -294,36 +300,49 @@ export async function startEmbedPusher(params: {
     return Result.ok(didUpdate);
   };
 
-  while (true) {
-    const contentWasStreaming = streaming;
-    const content = params.getContent(contentWasStreaming);
-    const syncResult = await syncToDiscord(content);
-    if (syncResult.status === "error") return syncResult;
-    const didUpdate = syncResult.value;
+  const pushUntilSettled = async (): Promise<ResultType<void, DiscordEmbedPusherInvariant>> => {
+    while (true) {
+      const contentWasStreaming = streaming;
+      const content = params.getContent(contentWasStreaming);
+      const synced = await syncToDiscord(content);
+      const step = synced.match<EmbedPushStep>({
+        err: (error) => ({ kind: "failed", error }),
+        ok: (didUpdate) => {
+          if (!streaming) {
+            return contentWasStreaming || didUpdate ? { kind: "continue" } : { kind: "settled" };
+          }
+          return { kind: "delay" };
+        },
+      });
 
-    if (!streaming) {
-      if (contentWasStreaming) continue;
-      if (!didUpdate) {
-        break;
+      switch (step.kind) {
+        case "failed":
+          return Result.err(step.error);
+        case "settled":
+          return Result.ok(undefined);
+        case "delay":
+          await setTimeout(EDIT_DELAY_MS);
+          break;
+        case "continue":
+          break;
       }
-      continue;
     }
+  };
 
-    await setTimeout(EDIT_DELAY_MS);
-  }
-
-  const lastMsg = chunkMessages.at(-1);
-  if (!lastMsg) {
-    return Result.err(
-      new DiscordEmbedPusherInvariant({ message: "startEmbedPusher produced no messages" }),
-    );
-  }
-
-  return Result.ok({
-    lastMsg,
-    responseQueue,
-    discordMessageCreated,
+  const pushed = await pushUntilSettled();
+  const continuePushed = pushed.match({
+    err: (error) => () => Result.err(error),
+    ok: () => () => {
+      const lastMsg = chunkMessages.at(-1);
+      if (!lastMsg) {
+        return Result.err(
+          new DiscordEmbedPusherInvariant({ message: "startEmbedPusher produced no messages" }),
+        );
+      }
+      return Result.ok({ lastMsg, responseQueue, discordMessageCreated });
+    },
   });
+  return continuePushed();
 }
 
 export function getEmbedPusherConstants() {

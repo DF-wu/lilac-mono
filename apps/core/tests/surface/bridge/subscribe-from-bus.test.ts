@@ -54,7 +54,11 @@ import {
   SqliteGracefulRestartStore,
 } from "../../../src/runtime/graceful-restart-store";
 
-import { createLilacBus, lilacEventTypes } from "@stanley2058/lilac-event-bus";
+import {
+  createLilacBus,
+  EventDeliveryStopFailed,
+  lilacEventTypes,
+} from "@stanley2058/lilac-event-bus";
 import {
   clearGithubAck,
   getGithubAck,
@@ -304,6 +308,30 @@ async function bridgeBusToAdapter(
     platform: "github",
     policy: createGithubRelayPolicy(),
   });
+}
+
+function createInMemoryRawBusWithOutputStopFailure() {
+  const raw = createInMemoryRawBus();
+  const subscribe = raw.subscribe;
+  raw.subscribe = async (topic, options, handler) => {
+    const started = await subscribe(topic, options, handler);
+    return started.map((subscription) =>
+      topic.startsWith("out.req.")
+        ? {
+            ...subscription,
+            stop: async () =>
+              Result.err(
+                new EventDeliveryStopFailed({
+                  cause: new Error("forced output subscription stop failure"),
+                  topic,
+                  message: "Forced output subscription stop failure",
+                }),
+              ),
+          }
+        : subscription,
+    );
+  };
+  return raw;
 }
 
 async function applyAndActivateRelayRecovery<P extends "discord" | "github">(
@@ -2853,6 +2881,84 @@ describe("bridgeBusToAdapter", () => {
     const applied = await prepared.value.apply();
     expect(applied.status).toBe("error");
     expect(adapter.stream?.aborted).toBe("restore_start_failed");
+  });
+
+  it("fails paused restore rollback when output subscription stop returns Err", async () => {
+    const bus = createLilacBus(createInMemoryRawBusWithOutputStopFailure());
+    const adapter = new FakeAdapter();
+    const bridge = await bridgeBusToAdapter({
+      adapter,
+      bus,
+      platform: "discord",
+      subscriptionId: `restore-stop-result-failure-${crypto.randomUUID()}`,
+      idleTimeoutMs: 10_000,
+    });
+    const prepared = bridge.prepareRestoreRelays([
+      {
+        requestId: "req:restore-stop-result-failure",
+        sessionId: "chan",
+        requestClient: "discord",
+        platform: "discord",
+        createdOutputRefs: [],
+        visibleText: "",
+        toolStatus: [],
+      },
+    ]);
+    if (prepared.status === "error") throw prepared.error;
+
+    expect((await prepared.value.apply()).status).toBe("ok");
+    expect(await prepared.value.rollback()).toMatchObject({
+      status: "error",
+      error: { _tag: "SurfaceRelayRestoreRollbackFailed" },
+    });
+    expect(adapter.stream?.aborted).toBe("restore_rollback");
+
+    await bridge.stop();
+    await bus.close();
+  });
+
+  it("signals atomicity-unknown Panic when startup subscription stop returns Err", async () => {
+    const bus = createLilacBus(createInMemoryRawBusWithOutputStopFailure());
+    const startupPanic = new Panic({ message: "forced typing startup defect" });
+    class TypingPanicAdapter extends FakeAdapter {
+      override async startTyping(): Promise<never> {
+        throw startupPanic;
+      }
+    }
+    const adapter = new TypingPanicAdapter();
+    const bridge = await bridgeBusToAdapter({
+      adapter,
+      bus,
+      platform: "discord",
+      subscriptionId: `startup-stop-result-failure-${crypto.randomUUID()}`,
+      idleTimeoutMs: 10_000,
+    });
+    let failure: unknown;
+    try {
+      await bus.publish(
+        lilacEventTypes.EvtRequestReply,
+        {},
+        {
+          headers: {
+            request_id: "discord:chan:startup-stop-result-failure",
+            session_id: "chan",
+            request_client: "discord",
+          },
+        },
+      );
+    } catch (cause) {
+      failure = cause;
+    }
+
+    expect(Panic.is(failure)).toBe(true);
+    expect(failure).not.toBe(startupPanic);
+    expect(failure).toMatchObject({
+      message: "Relay startup cleanup left recovery atomicity unknown",
+    });
+    expect(adapter.stream?.aborted).toBe("restore_start_failed");
+
+    await bridge.stop();
+    await bus.close();
   });
 
   it("rolls back earlier paused restores when a later relay admission fails", async () => {

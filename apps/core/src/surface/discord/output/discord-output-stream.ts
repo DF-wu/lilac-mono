@@ -617,7 +617,16 @@ async function safeEdit(msg: Message, options: Parameters<Message["edit"]>[0]): 
     try: () => msg.edit(options),
     catch: surfaceExternalFallback(false),
   });
-  return edited.status === "ok";
+  return edited.match({ ok: () => true, err: () => false });
+}
+
+function adaptDiscordOutputResultToHost<T, E>(result: ResultType<T, E>): T {
+  return result.match<() => T>({
+    ok: (value) => () => value,
+    err: (error) => () => {
+      throw error;
+    },
+  })();
 }
 
 export class DiscordOutputStream implements SurfaceOutputStream {
@@ -786,7 +795,7 @@ export class DiscordOutputStream implements SurfaceOutputStream {
       try: () => client.channels.fetch(ref.channelId),
       catch: surfaceExternalFallback(null),
     });
-    const channel = fetchedChannel.status === "ok" ? fetchedChannel.value : null;
+    const channel = fetchedChannel.match({ ok: (value) => value, err: () => null });
     if (!channel || !("messages" in channel) || !channel.messages?.fetch) {
       return;
     }
@@ -795,7 +804,7 @@ export class DiscordOutputStream implements SurfaceOutputStream {
       try: () => channel.messages.fetch(ref.messageId),
       catch: surfaceExternalFallback(null),
     });
-    const msg = fetchedMessage.status === "ok" ? fetchedMessage.value : null;
+    const msg = fetchedMessage.match({ ok: (value) => value, err: () => null });
     if (!msg) return;
     await Result.tryPromise({
       try: () => msg.delete(),
@@ -912,12 +921,10 @@ export class DiscordOutputStream implements SurfaceOutputStream {
 
     const { client, sessionRef } = this.deps;
     const sessionResult = discordOutputSessionResult(sessionRef);
-    if (sessionResult.status === "error") throw sessionResult.error;
-    const discordSessionRef = sessionResult.value;
+    const discordSessionRef = adaptDiscordOutputResultToHost(sessionResult);
 
     const channelResult = await fetchTextChannelResult(client, discordSessionRef.channelId);
-    if (channelResult.status === "error") throw channelResult.error;
-    const channel = channelResult.value;
+    const channel = adaptDiscordOutputResultToHost(channelResult);
 
     // Delay creating the first message until either:
     // - we have something to display (text/action), or
@@ -1051,10 +1058,7 @@ export class DiscordOutputStream implements SurfaceOutputStream {
           components: isStreaming ? buildCancelComponents(true) : [],
         }),
       });
-      if (pushed.status === "error") {
-        throw pushed.error;
-      }
-      const res = pushed.value;
+      const res = adaptDiscordOutputResultToHost(pushed);
 
       // track created reply messages
       const seen = new Set(this.created.map((m) => m.messageId));
@@ -1239,12 +1243,10 @@ export class DiscordOutputStream implements SurfaceOutputStream {
   private async postFinalReplyEmbeds(): Promise<{ created: MsgRef[]; lastMsg: Message }> {
     const { client, sessionRef } = this.deps;
     const sessionResult = discordOutputSessionResult(sessionRef);
-    if (sessionResult.status === "error") throw sessionResult.error;
-    const discordSessionRef = sessionResult.value;
+    const discordSessionRef = adaptDiscordOutputResultToHost(sessionResult);
 
     const channelResult = await fetchTextChannelResult(client, discordSessionRef.channelId);
-    if (channelResult.status === "error") throw channelResult.error;
-    const channel = channelResult.value;
+    const channel = adaptDiscordOutputResultToHost(channelResult);
     const { CLOSING_TAG_BUFFER } = getEmbedPusherConstants();
     const fullText = this.getRenderedText("terminal");
     const content = fullText.length > 0 ? fullText : "*<empty_string>*";
@@ -1309,10 +1311,7 @@ export class DiscordOutputStream implements SurfaceOutputStream {
     const created = createdMsgs.map((msg) => asDiscordMsgRef(discordSessionRef.channelId, msg.id));
 
     const lastMessageResult = finalDiscordMessageResult(createdMsgs[createdMsgs.length - 1]);
-    if (lastMessageResult.status === "error") {
-      throw lastMessageResult.error;
-    }
-    const lastMsg = lastMessageResult.value;
+    const lastMsg = adaptDiscordOutputResultToHost(lastMessageResult);
 
     this.pendingAttachments = overflowAttachments;
     this.lastMsg = lastMsg;
@@ -1325,12 +1324,10 @@ export class DiscordOutputStream implements SurfaceOutputStream {
   private async postFinalReplyPlain(): Promise<{ created: MsgRef[]; lastMsg: Message }> {
     const { client, sessionRef } = this.deps;
     const sessionResult = discordOutputSessionResult(sessionRef);
-    if (sessionResult.status === "error") throw sessionResult.error;
-    const discordSessionRef = sessionResult.value;
+    const discordSessionRef = adaptDiscordOutputResultToHost(sessionResult);
 
     const channelResult = await fetchTextChannelResult(client, discordSessionRef.channelId);
-    if (channelResult.status === "error") throw channelResult.error;
-    const channel = channelResult.value;
+    const channel = adaptDiscordOutputResultToHost(channelResult);
     const { CLOSING_TAG_BUFFER } = getEmbedPusherConstants();
     const maxChunkLength =
       DISCORD_CONTENT_MAX_CHARS - (this.deps.useSmartSplitting ? CLOSING_TAG_BUFFER : 0);
@@ -1400,10 +1397,7 @@ export class DiscordOutputStream implements SurfaceOutputStream {
     const created = createdMsgs.map((msg) => asDiscordMsgRef(discordSessionRef.channelId, msg.id));
 
     const lastMessageResult = finalDiscordMessageResult(createdMsgs[createdMsgs.length - 1]);
-    if (lastMessageResult.status === "error") {
-      throw lastMessageResult.error;
-    }
-    const lastMsg = lastMessageResult.value;
+    const lastMsg = adaptDiscordOutputResultToHost(lastMessageResult);
 
     this.pendingAttachments = overflowAttachments;
     this.lastMsg = lastMsg;
@@ -1417,14 +1411,15 @@ export class DiscordOutputStream implements SurfaceOutputStream {
     const finished = await captureDiscordOutputOperation("finish-output", () =>
       this.finishOutput(),
     );
-    if (finished.status === "ok" || this.created.length === 0) return finished;
-    return Result.err(
-      new SurfaceOperationPartiallyCompleted({
-        platform: "discord",
-        operation: "finish-output",
-        created: this.created[this.created.length - 1]!,
-        message: `Discord output partially completed: ${finished.error.message}`,
-      }),
+    if (this.created.length === 0) return finished;
+    return finished.mapError(
+      (error) =>
+        new SurfaceOperationPartiallyCompleted({
+          platform: "discord",
+          operation: "finish-output",
+          created: this.created[this.created.length - 1]!,
+          message: `Discord output partially completed: ${error.message}`,
+        }),
     );
   }
 
@@ -1608,14 +1603,29 @@ export async function sendDiscordStyledMessage(params: {
     workingIndicators: ["Working"],
   });
 
-  for (const a of attachments) {
-    const pushed = await out.push({ type: "attachment.add", attachment: a });
-    if (pushed.status === "error") return pushed;
-  }
-  const pushed = await out.push({ type: "text.set", text });
-  if (pushed.status === "error") return pushed;
-
-  const res = await out.finish();
-  if (res.status === "error") return res;
-  return Result.ok(res.value.last);
+  const pushAttachmentAt = async (index: number): Promise<SurfaceOperationResult<MsgRef>> => {
+    const attachment = attachments[index];
+    if (attachment) {
+      const pushed = await out.push({ type: "attachment.add", attachment });
+      const continuePushed = pushed.match<() => Promise<SurfaceOperationResult<MsgRef>>>({
+        err: (error) => async () => Result.err(error),
+        ok: () => async () => await pushAttachmentAt(index + 1),
+      });
+      return await continuePushed();
+    }
+    const textPushed = await out.push({ type: "text.set", text });
+    const continueText = textPushed.match<() => Promise<SurfaceOperationResult<MsgRef>>>({
+      err: (error) => async () => Result.err(error),
+      ok: () => async () => {
+        const finished = await out.finish();
+        const continueFinished = finished.match<() => SurfaceOperationResult<MsgRef>>({
+          err: (error) => () => Result.err(error),
+          ok: (value) => () => Result.ok(value.last),
+        });
+        return continueFinished();
+      },
+    });
+    return await continueText();
+  };
+  return await pushAttachmentAt(0);
 }

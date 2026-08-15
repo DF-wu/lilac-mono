@@ -465,8 +465,12 @@ function renderCandidate(body: string, kind: MathKind, maxWidth: number): string
     },
     catch: surfaceExternalFallback(null),
   });
-  if (renderAttempt.status === "error") return null;
-  const { layout, output } = renderAttempt.value;
+  const rendered = renderAttempt.match({
+    err: () => null,
+    ok: (value) => value,
+  });
+  if (!rendered) return null;
+  const { layout, output } = rendered;
   if (
     output.length === 0 ||
     output.length > 8000 ||
@@ -508,8 +512,11 @@ export function renderDiscordMarkdownMath(
     try: () => collectCandidates(markdown),
     catch: surfaceExternalFallback(null),
   });
-  if (collectionAttempt.status === "error" || collectionAttempt.value === null) return markdown;
-  const candidates = collectionAttempt.value;
+  const candidates = collectionAttempt.match({
+    err: () => null,
+    ok: (value) => value,
+  });
+  if (candidates === null) return markdown;
   const replacements: Replacement[] = [];
 
   for (const candidate of candidates) {

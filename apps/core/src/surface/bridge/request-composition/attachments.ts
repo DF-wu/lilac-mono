@@ -197,12 +197,15 @@ function ownAttachmentBytes(input: {
     mediaType: input.mediaType,
     filename: input.filename ?? input.url.pathname.split("/").pop() ?? "attachment",
   });
-  if (reference.status === "error") {
-    input.state.ownershipError ??= reference.error;
-    return;
-  }
-  input.state.ownedBlobs.set(reference.value.sha256, reference.value);
-  input.state.currentBlobs.set(reference.value.sha256, reference.value);
+  reference.match({
+    err: (error) => () => {
+      input.state.ownershipError ??= error;
+    },
+    ok: (value) => () => {
+      input.state.ownedBlobs.set(value.sha256, value);
+      input.state.currentBlobs.set(value.sha256, value);
+    },
+  })();
 }
 
 async function resolveOwnedFileData(input: {

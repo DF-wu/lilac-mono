@@ -35,21 +35,28 @@ function toAgentOutputPublishResult(
   label: string,
   published: ResultType<object, EventPublishError>,
 ): ResultType<void, AgentOutputPublishFailed> {
-  if (published.status === "ok") return Result.ok(undefined);
-  return Result.err(
-    new AgentOutputPublishFailed({
-      label,
-      eventType: published.error.eventType,
-      errorTag: published.error._tag,
-      message: published.error.message,
-    }),
-  );
+  return published
+    .mapError(
+      (error) =>
+        new AgentOutputPublishFailed({
+          label,
+          eventType: error.eventType,
+          errorTag: error._tag,
+          message: error.message,
+        }),
+    )
+    .map(() => undefined);
 }
 
 export function adaptAgentOutputPublishResultToHost(
   result: ResultType<void, AgentOutputPublishFailed>,
 ): void {
-  if (result.status === "error") throw result.error;
+  result.match({
+    ok: () => () => undefined,
+    err: (error) => () => {
+      throw error;
+    },
+  })();
 }
 
 export type AgentOutputFlushScheduler = (callback: () => void, delayMs: number) => () => void;
@@ -91,7 +98,10 @@ export function createAgentOutputPublisher(params: {
     const publication = run();
     const settle = async (): Promise<ResultType<void, never>> => {
       const result = await publication;
-      if (result.status === "error") params.onError?.(label, result.error);
+      result.match({
+        ok: () => () => undefined,
+        err: (error) => () => params.onError?.(label, error),
+      })();
       return Result.ok(undefined);
     };
     const settlement = settle();

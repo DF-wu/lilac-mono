@@ -98,20 +98,33 @@ import {
   customCommandInvocationErrorText,
   type CustomCommandManager,
 } from "../../custom-commands/manager";
-import { formatBridgeTaggedErrorForLog } from "../bridge/bridge-log";
+import { formatBridgeLogContext, formatBridgeTaggedErrorForLog } from "../bridge/bridge-log";
+
+function continueResult<T, E, ROk, RErr>(
+  result: ResultType<T, E>,
+  branches: { ok: (value: T) => ROk; err: (error: E) => RErr },
+): ROk | RErr {
+  const continuation = result.match<() => ROk | RErr>({
+    ok: (value) => () => branches.ok(value),
+    err: (error) => () => branches.err(error),
+  });
+  return continuation();
+}
 
 function createFreshOnlyLineage(
   reason: string,
   currentCanonicalStart: number,
 ): CorePrimaryLineageV1 {
   const created = createCorePrimaryLineageFreshOnlyV1(reason, currentCanonicalStart);
-  if (created.status === "ok") return created.value;
-  return {
-    state: "fresh-only",
-    lineageVersion: 1,
-    currentCanonicalStart: 0,
-    reason: "lineage-fallback-construction-failed",
-  };
+  return created.match({
+    ok: (value) => value,
+    err: () => ({
+      state: "fresh-only",
+      lineageVersion: 1,
+      currentCanonicalStart: 0,
+      reason: "lineage-fallback-construction-failed",
+    }),
+  });
 }
 
 export type DiscordRequestCompositionFailurePolicy = {
@@ -444,16 +457,6 @@ async function captureRouterDebounceFlush(input: {
   }
 }
 
-type RouterSubscriptionStartOutcome =
-  | { readonly kind: "started"; readonly subscription: RouterDeliverySubscription }
-  | { readonly kind: "failure"; readonly failure: DiscordRequestRouterStartupFailure }
-  | { readonly kind: "panic"; readonly panic: Panic };
-
-type RouterSelfLookupOutcome =
-  | { readonly kind: "resolved"; readonly self: SurfaceSelf }
-  | { readonly kind: "failure"; readonly failure: DiscordRequestRouterAdapterSelfLookupRejected }
-  | { readonly kind: "panic"; readonly panic: Panic };
-
 type RouterSubscriptionRollbackOutcome = {
   readonly failures: readonly DiscordRequestRouterCleanupFailure[];
   readonly panics: readonly Panic[];
@@ -484,10 +487,13 @@ async function stopRouterSubscriptionsAllSettled(
       }
       continue;
     }
-    if (stopped.value.status === "error") {
-      residualSubscriptions.push(subscription);
-      failures.push(stopped.value.error);
-    }
+    stopped.value.match<() => void>({
+      ok: () => () => undefined,
+      err: (error) => () => {
+        residualSubscriptions.push(subscription);
+        failures.push(error);
+      },
+    })();
   }
 
   return { failures, panics, residualSubscriptions };
@@ -495,19 +501,17 @@ async function stopRouterSubscriptionsAllSettled(
 
 async function adaptRouterSelfLookup(
   operation: () => Promise<SurfaceSelf>,
-): Promise<RouterSelfLookupOutcome> {
-  const [settled] = await Promise.allSettled([Promise.resolve().then(operation)]);
-  if (settled.status === "rejected") {
-    if (isPanic(settled.reason)) return { kind: "panic", panic: settled.reason };
-    return {
-      kind: "failure",
-      failure: new DiscordRequestRouterAdapterSelfLookupRejected({
-        cause: settled.reason,
-        message: "Discord request router adapter self lookup rejected",
-      }),
-    };
-  }
-  return { kind: "resolved", self: settled.value };
+): Promise<ResultType<SurfaceSelf, DiscordRequestRouterAdapterSelfLookupRejected | Panic>> {
+  return Result.tryPromise({
+    try: operation,
+    catch: <T>(cause: T) =>
+      isPanic(cause)
+        ? cause
+        : new DiscordRequestRouterAdapterSelfLookupRejected({
+            cause,
+            message: "Discord request router adapter self lookup rejected",
+          }),
+  });
 }
 
 async function rollbackRouterSubscriptionStartup(
@@ -518,38 +522,34 @@ async function rollbackRouterSubscriptionStartup(
 
 async function adaptRouterSubscriptionStart(
   started: Promise<ResultType<RouterDeliverySubscription, EventDeliveryStartFailed>>,
-): Promise<RouterSubscriptionStartOutcome> {
-  const [settled] = await Promise.allSettled([started]);
-  if (settled.status === "rejected") {
-    if (isPanic(settled.reason)) return { kind: "panic", panic: settled.reason };
-    return {
-      kind: "failure",
-      failure: new DiscordRequestRouterSubscriptionStartRejected({
-        cause: settled.reason,
-        message: "Discord request router subscription start rejected",
-      }),
-    };
-  }
-  if (settled.value.status === "error") {
-    return { kind: "failure", failure: settled.value.error };
-  }
-  return { kind: "started", subscription: settled.value.value };
+): Promise<ResultType<RouterDeliverySubscription, DiscordRequestRouterStartupFailure | Panic>> {
+  const captured = await Result.tryPromise({
+    try: () => started,
+    catch: <T>(cause: T) =>
+      isPanic(cause)
+        ? cause
+        : new DiscordRequestRouterSubscriptionStartRejected({
+            cause,
+            message: "Discord request router subscription start rejected",
+          }),
+  });
+  return Result.flatten(captured);
 }
 
 function adaptRouterConfigResult(result: ReturnType<typeof withDefaultToolsConfig>): CoreConfig {
-  if (result.status === "ok") return result.value;
-  let failure: unknown;
-  switch (result.error._tag) {
-    case "CoreConfigV1Invalid":
-    case "CoreConfigV2Invalid":
-      failure = result.error.cause;
-      break;
-    case "CoreConfigVersionInvalid":
-    case "CoreConfigMustBeObject":
-      failure = new Error(result.error.message);
-      break;
-  }
-  throw failure;
+  return result.match<() => CoreConfig>({
+    ok: (value) => () => value,
+    err: (error) => () => {
+      switch (error._tag) {
+        case "CoreConfigV1Invalid":
+        case "CoreConfigV2Invalid":
+          throw error.cause;
+        case "CoreConfigVersionInvalid":
+        case "CoreConfigMustBeObject":
+          throw new Error(error.message);
+      }
+    },
+  })();
 }
 
 function superviseRouterSubscriptionsDone(
@@ -563,7 +563,12 @@ async function adaptRouterSubscriptionsStop(
 ): Promise<void> {
   const results = await Promise.all(subscriptions.map((subscription) => subscription.stop()));
   for (const result of results) {
-    if (result.status === "error") throw result.error;
+    result.match<() => void>({
+      ok: () => () => undefined,
+      err: (error) => () => {
+        throw error;
+      },
+    })();
   }
 }
 
@@ -680,8 +685,12 @@ export function adaptDiscordRequestRouterStartOutcomeToHost(
     });
     throw outcome.panic;
   }
-  if (outcome.result.status === "error") throw outcome.result.error;
-  return outcome.result.value;
+  return outcome.result.match<() => DiscordRequestRouter>({
+    ok: (value) => () => value,
+    err: (error) => () => {
+      throw error;
+    },
+  })();
 }
 
 function resolveTriggerType(input: {
@@ -748,15 +757,14 @@ export function signalDiscordRequestRouterPlatformMismatch(
 export async function startDiscordRequestRouter(
   params: StartDiscordRequestRouterInput,
 ): Promise<DiscordRequestRouterStartOutcome> {
+  const selfLookup = await adaptRouterSelfLookup(() => params.adapter.getSelf());
+  const selfOrFailure = continueResult(selfLookup, {
+    err: (error) => finishRouterSubscriptionStartFailure(error, []),
+    ok: (self) => self,
+  });
+  if (selfOrFailure instanceof Promise) return selfOrFailure;
+  const self = selfOrFailure;
   const { adapter, bus, subscriptionId, customCommands } = params;
-  const selfLookup = await adaptRouterSelfLookup(() => adapter.getSelf());
-  if (selfLookup.kind !== "resolved") {
-    return finishRouterSubscriptionStartFailure(
-      selfLookup.kind === "panic" ? selfLookup.panic : selfLookup.failure,
-      [],
-    );
-  }
-  const self = selfLookup.self;
   if (self.platform !== "discord") signalDiscordRequestRouterPlatformMismatch(self.platform);
 
   const logger =
@@ -1072,14 +1080,14 @@ export async function startDiscordRequestRouter(
       lifecycleDeliveryPolicy,
     ),
   );
-  if (lifecycleStarted.kind !== "started") {
-    return finishRouterSubscriptionStartFailure(
-      lifecycleStarted.kind === "panic" ? lifecycleStarted.panic : lifecycleStarted.failure,
-      startedSubscriptions,
-    );
-  }
-  const lifecycleSub = lifecycleStarted.subscription;
-  startedSubscriptions.push(lifecycleSub);
+  const lifecycleStartFailure = continueResult(lifecycleStarted, {
+    err: (error) => finishRouterSubscriptionStartFailure(error, startedSubscriptions),
+    ok: (subscription) => {
+      startedSubscriptions.push(subscription);
+      return null;
+    },
+  });
+  if (lifecycleStartFailure) return lifecycleStartFailure;
 
   const surfaceStarted = await adaptRouterSubscriptionStart(
     bus.subscribeTopic(
@@ -1136,14 +1144,14 @@ export async function startDiscordRequestRouter(
       surfaceDeliveryPolicy,
     ),
   );
-  if (surfaceStarted.kind !== "started") {
-    return finishRouterSubscriptionStartFailure(
-      surfaceStarted.kind === "panic" ? surfaceStarted.panic : surfaceStarted.failure,
-      startedSubscriptions,
-    );
-  }
-  const surfaceSub = surfaceStarted.subscription;
-  startedSubscriptions.push(surfaceSub);
+  const surfaceStartFailure = continueResult(surfaceStarted, {
+    err: (error) => finishRouterSubscriptionStartFailure(error, startedSubscriptions),
+    ok: (subscription) => {
+      startedSubscriptions.push(subscription);
+      return null;
+    },
+  });
+  if (surfaceStartFailure) return surfaceStartFailure;
 
   const adapterStarted = await adaptRouterSubscriptionStart(
     bus.subscribeTopic(
@@ -1310,20 +1318,7 @@ export async function startDiscordRequestRouter(
               }
 
               const parsed = customCommands?.parseText(msg.data.text);
-              if (!parsed || parsed.status === "error") {
-                return {
-                  customCommand: {
-                    name: customName,
-                    args: [],
-                    text: msg.data.text,
-                    source: "text",
-                    error: parsed
-                      ? customCommandInvocationErrorText(parsed.error)
-                      : `Unknown custom command '${customName}'.`,
-                  },
-                };
-              }
-              if (!parsed.value) {
+              if (!parsed) {
                 return {
                   customCommand: {
                     name: customName,
@@ -1334,16 +1329,37 @@ export async function startDiscordRequestRouter(
                   },
                 };
               }
-
-              return {
-                customCommand: {
-                  name: parsed.value.command.def.name,
-                  args: parsed.value.args,
-                  ...(parsed.value.prompt ? { prompt: parsed.value.prompt } : {}),
-                  text: parsed.value.text,
-                  source: parsed.value.source,
-                },
-              };
+              return parsed.match({
+                err: (error) => ({
+                  customCommand: {
+                    name: customName,
+                    args: [],
+                    text: msg.data.text,
+                    source: "text",
+                    error: customCommandInvocationErrorText(error),
+                  },
+                }),
+                ok: (value) =>
+                  value
+                    ? {
+                        customCommand: {
+                          name: value.command.def.name,
+                          args: value.args,
+                          ...(value.prompt ? { prompt: value.prompt } : {}),
+                          text: value.text,
+                          source: value.source,
+                        },
+                      }
+                    : {
+                        customCommand: {
+                          name: customName,
+                          args: [],
+                          text: msg.data.text,
+                          source: "text",
+                          error: `Unknown custom command '${customName}'.`,
+                        },
+                      },
+              });
             })();
 
             await publishSingleMessagePrompt({
@@ -1499,13 +1515,14 @@ export async function startDiscordRequestRouter(
       adapterDeliveryPolicy,
     ),
   );
-  if (adapterStarted.kind !== "started") {
-    return finishRouterSubscriptionStartFailure(
-      adapterStarted.kind === "panic" ? adapterStarted.panic : adapterStarted.failure,
-      startedSubscriptions,
-    );
-  }
-  const adapterSub = adapterStarted.subscription;
+  const adapterStartFailure = continueResult(adapterStarted, {
+    err: (error) => finishRouterSubscriptionStartFailure(error, startedSubscriptions),
+    ok: (subscription) => {
+      startedSubscriptions.unshift(subscription);
+      return null;
+    },
+  });
+  if (adapterStartFailure) return adapterStartFailure;
 
   function clearDebounceBuffer(sessionId: string) {
     const b = buffers.get(sessionId);
@@ -1532,7 +1549,8 @@ export async function startDiscordRequestRouter(
         sessionId: input.sessionId,
         sourceRequestId: existing.sourceRequestId,
       });
-      if (flushed.status === "error") return flushed;
+      const flushError = flushed.match({ ok: () => null, err: (error) => error });
+      if (flushError) return Result.err(flushError);
     }
     enqueuePendingMentionReplyBatchImpl({
       pendingMentionReplyBatchBySession,
@@ -1580,11 +1598,12 @@ export async function startDiscordRequestRouter(
         modelOverride: batch.modelOverride,
         transformUserText: transformPendingUserText(item),
       });
-      if (published.status === "error") {
+      const publishError = published.match({ ok: () => null, err: (error) => error });
+      if (publishError) {
         return Result.err(
           new BusRequestRouterRoutingError({
             topic: "evt.adapter",
-            cause: published.error,
+            cause: publishError,
             message: "Bus request router failed while handling evt.adapter",
           }),
         );
@@ -1629,11 +1648,13 @@ export async function startDiscordRequestRouter(
         msgRef: last.msgRef,
       },
     });
-    if (composed.status === "error") {
-      logDiscordRequestCompositionFailure(logger, requestId, input.sessionId, composed.error);
+    const compositionError = composed.match({ ok: () => null, err: (error) => error });
+    if (compositionError) {
+      logDiscordRequestCompositionFailure(logger, requestId, input.sessionId, compositionError);
       return;
     }
-    const composition = composed.value;
+    const composition = composed.match({ ok: (value) => value, err: () => null });
+    if (!composition) return;
 
     const chainMessageIds = new Set(composition.chainMessageIds);
     const extraCompositions: RequestCompositionResult[] = [];
@@ -1641,9 +1662,8 @@ export async function startDiscordRequestRouter(
 
     for (const item of batch.items) {
       const surfaceMessage = await adapter.readMsg(item.msgRef);
-      if (surfaceMessage.status === "ok" && surfaceMessage.value?.userId) {
-        batchParticipantUserIds.push(surfaceMessage.value.userId);
-      }
+      const userId = surfaceMessage.match({ ok: (value) => value?.userId, err: () => undefined });
+      if (userId) batchParticipantUserIds.push(userId);
       if (chainMessageIds.has(item.msgRef.messageId)) continue;
       const extra = await composeSingleMessageWithLineage(adapter, {
         platform: "discord",
@@ -1654,13 +1674,14 @@ export async function startDiscordRequestRouter(
         transcriptStore: params.transcriptStore,
         transformUserText: transformPendingUserText(item),
       });
-
-      if (extra.status === "error") {
-        logDiscordRequestCompositionFailure(logger, requestId, input.sessionId, extra.error);
+      const extraError = extra.match({ ok: () => null, err: (error) => error });
+      if (extraError) {
+        logDiscordRequestCompositionFailure(logger, requestId, input.sessionId, extraError);
         return;
       }
-      if (!extra.value) continue;
-      extraCompositions.push(extra.value);
+      const extraValue = extra.match({ ok: (value) => value, err: () => null });
+      if (!extraValue) continue;
+      extraCompositions.push(extraValue);
       chainMessageIds.add(item.msgRef.messageId);
     }
 
@@ -1735,12 +1756,14 @@ export async function startDiscordRequestRouter(
         })),
         { currentSegmentIndex },
       );
-      return built.status === "ok"
-        ? built.value
-        : createFreshOnlyLineage(
+      return built.match({
+        ok: (value) => value,
+        err: () =>
+          createFreshOnlyLineage(
             "deferred-batch-lineage-build-failed",
             composition.corePrimaryLineage.currentCanonicalStart,
-          );
+          ),
+      });
     })();
 
     await publishBusRequest({
@@ -2340,12 +2363,14 @@ export async function startDiscordRequestRouter(
       operation: () => flushDebounce(sessionId),
       reportFatalPanic: debounceDefect.reject,
     });
-    if (flushed.status === "error") {
-      logger.error(
-        "router flushDebounce failed",
-        formatBridgeTaggedErrorForLog(flushed.error, { sessionId }),
-      );
-    }
+    flushed.match<() => void>({
+      ok: () => () => undefined,
+      err: (error) => () =>
+        logger.error(
+          "router flushDebounce failed",
+          formatBridgeTaggedErrorForLog(error, { sessionId }),
+        ),
+    })();
   }
 
   async function flushDebounce(sessionId: string): Promise<void> {
@@ -2372,40 +2397,47 @@ export async function startDiscordRequestRouter(
           },
         }),
       );
-      if (evaluated.status === "error") {
-        logger.error(
-          "router gate failed; skipping",
-          formatBridgeTaggedErrorForLog(evaluated.error, {
-            sessionId,
-            ...extractAiErrorLogDetails(evaluated.error.cause),
-          }),
-        );
-        decision = { forward: false, reason: "error" };
-      } else {
-        decision = evaluated.value;
-      }
+      decision = evaluated.match<() => RouterGateDecision>({
+        ok: (value) => () => value,
+        err: (error) => () => {
+          logger.error(
+            "router gate failed; skipping",
+            formatBridgeTaggedErrorForLog(error, {
+              sessionId,
+              ...extractAiErrorLogDetails(error.cause),
+            }),
+          );
+          return { forward: false, reason: "error" };
+        },
+      })();
     }
 
     if (!decision.forward) {
-      logger.info("router.route.decision", {
-        sessionId,
-        mode: "active",
-        gateEnabled,
-        decision: "skip",
-        reason: `active_batch_gate:${decision.reason ?? "skip"}`,
-        messageCount: b.messages.length,
-      });
+      logger.info(
+        "router.route.decision",
+        formatBridgeLogContext({
+          sessionId,
+          mode: "active",
+          gateEnabled,
+          decision: "skip",
+          reason: `active_batch_gate:${decision.reason ?? "skip"}`,
+          messageCount: b.messages.length,
+        }),
+      );
       return;
     }
 
-    logger.info("router.route.decision", {
-      sessionId,
-      mode: "active",
-      gateEnabled,
-      decision: "forward",
-      reason: `active_batch_gate:${decision.reason ?? "forward"}`,
-      messageCount: b.messages.length,
-    });
+    logger.info(
+      "router.route.decision",
+      formatBridgeLogContext({
+        sessionId,
+        mode: "active",
+        gateEnabled,
+        decision: "forward",
+        reason: `active_batch_gate:${decision.reason ?? "forward"}`,
+        messageCount: b.messages.length,
+      }),
+    );
 
     const overrideCarrier = (() => {
       for (let i = b.messages.length - 1; i >= 0; i--) {
@@ -2686,14 +2718,11 @@ export async function startDiscordRequestRouter(
       logger,
       input: requestInput,
     });
-    if (published.status === "error") {
-      logDiscordRequestCompositionFailure(
-        logger,
-        input.requestId,
-        input.sessionId,
-        published.error,
-      );
-    }
+    published.match<() => void>({
+      ok: () => () => undefined,
+      err: (error) => () =>
+        logDiscordRequestCompositionFailure(logger, input.requestId, input.sessionId, error),
+    })();
   }
 
   type PublishActiveChannelPromptLocalInput = Parameters<
@@ -2715,13 +2744,9 @@ export async function startDiscordRequestRouter(
       logger,
       input: requestInput,
     });
-    if (published.status === "error") {
-      logDiscordRequestCompositionFailure(
-        logger,
-        input.requestId,
-        input.sessionId,
-        published.error,
-      );
+    const publishError = published.match({ ok: () => null, err: (error) => error });
+    if (publishError) {
+      logDiscordRequestCompositionFailure(logger, input.requestId, input.sessionId, publishError);
       return;
     }
 
@@ -2753,14 +2778,11 @@ export async function startDiscordRequestRouter(
       logger,
       input: requestInput,
     });
-    if (published.status === "error") {
-      logDiscordRequestCompositionFailure(
-        logger,
-        input.requestId,
-        input.sessionId,
-        published.error,
-      );
-    }
+    published.match<() => void>({
+      ok: () => () => undefined,
+      err: (error) => () =>
+        logDiscordRequestCompositionFailure(logger, input.requestId, input.sessionId, error),
+    })();
     return published;
   }
 
@@ -2782,14 +2804,11 @@ export async function startDiscordRequestRouter(
       logger,
       input: requestInput,
     });
-    if (published.status === "error") {
-      logDiscordRequestCompositionFailure(
-        logger,
-        input.requestId,
-        input.sessionId,
-        published.error,
-      );
-    }
+    published.match<() => void>({
+      ok: () => () => undefined,
+      err: (error) => () =>
+        logDiscordRequestCompositionFailure(logger, input.requestId, input.sessionId, error),
+    })();
   }
 
   async function publishSurfaceOutputReanchor(
@@ -2798,7 +2817,7 @@ export async function startDiscordRequestRouter(
     await publishSurfaceOutputReanchorImpl(input);
   }
 
-  const subscriptions = [adapterSub, lifecycleSub, surfaceSub] as const;
+  const subscriptions = startedSubscriptions;
   const done = Promise.race([
     superviseRouterSubscriptionsDone(subscriptions),
     debounceDefect.promise,

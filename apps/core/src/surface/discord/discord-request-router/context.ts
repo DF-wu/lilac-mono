@@ -12,10 +12,14 @@ export async function resolvePreviousMessageText(params: {
   };
 }): Promise<string | undefined> {
   const around = await params.adapter.getReplyContext(params.input.msgRef, { limit: 8 });
-  if (around.status === "error" || around.value.length === 0) return undefined;
+  const messages = around.match({
+    err: () => [] as readonly SurfaceMessage[],
+    ok: (value) => value,
+  });
+  if (messages.length === 0) return undefined;
 
   let prev: SurfaceMessage | null = null;
-  for (const candidate of around.value) {
+  for (const candidate of messages) {
     const cmp = compareMessagePosition(
       { ts: candidate.ts, messageId: candidate.ref.messageId },
       { ts: params.input.triggerTs, messageId: params.input.msgRef.messageId },
@@ -49,8 +53,12 @@ export async function resolveRepliedToMessageText(params: {
     channelId: params.input.sessionId,
     messageId: params.input.replyToMessageId,
   });
-
-  return normalizeGateText(repliedTo.status === "ok" ? repliedTo.value?.text : undefined);
+  return normalizeGateText(
+    repliedTo.match({
+      err: () => undefined,
+      ok: (value) => value?.text,
+    }),
+  );
 }
 
 export async function resolvePreviousBatchMessageText(params: {

@@ -81,18 +81,21 @@ export async function readGithubUserTokenSecretResult(
         message: `Invalid GitHub user token secret at ${jsonPath}`,
       }),
   );
-  if (loaded.status === "error") return Result.err(loaded.error);
-  return loaded.value === null
-    ? Result.ok(null)
-    : decodeGithubUserTokenSecret(jsonPath, loaded.value);
+  return loaded.andThen((value) =>
+    value === null ? Result.ok(null) : decodeGithubUserTokenSecret(jsonPath, value),
+  );
 }
 
 export async function readGithubUserTokenSecret(
   dataDir: string,
 ): Promise<GithubUserTokenSecret | null> {
   const read = await readGithubUserTokenSecretResult(dataDir);
-  if (read.status === "error") throw read.error;
-  return read.value;
+  return read.match({
+    ok: (value) => () => value,
+    err: (error) => () => {
+      throw error;
+    },
+  })();
 }
 
 export async function writeGithubUserTokenSecret(params: {
@@ -113,12 +116,20 @@ export async function writeGithubUserTokenSecret(params: {
     apiBaseUrl: params.apiBaseUrl,
     login: params.login,
   });
-  if (decoded.status === "error") throw decoded.error;
-
-  await fs.writeFile(jsonPath, JSON.stringify(decoded.value, null, 2), "utf8");
+  const secret = decoded.match({
+    ok: (value) => () => value,
+    err: (error) => () => {
+      throw error;
+    },
+  })();
+  await fs.writeFile(jsonPath, serializeGithubUserTokenSecret(secret), "utf8");
   await chmod0600(jsonPath);
 
   return { jsonPath, overwritten: existed };
+}
+
+function serializeGithubUserTokenSecret(secret: GithubUserTokenSecret): string {
+  return JSON.stringify(secret, null, 2);
 }
 
 export async function clearGithubUserTokenSecret(dataDir: string): Promise<void> {

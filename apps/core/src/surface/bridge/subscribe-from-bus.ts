@@ -50,11 +50,20 @@ import { isPossibleNoReplyPrefix, resolveReplyDeliveryFromFinalText } from "./re
 
 import type { TranscriptStore } from "../../transcript/transcript-store";
 import { adaptEventPublishResultToHost } from "../../shared/event-bus-result";
+import { adaptToolResultToHost } from "../../tools/tool-result-adapters";
 import { formatBridgeTaggedErrorForLog } from "./bridge-log";
 
 class CmdRequestRequiredHeadersMissing extends TaggedError("CmdRequestRequiredHeadersMissing")<{
   readonly message: string;
 }> {}
+
+function selectResultValue<T, E extends Error>(result: ResultType<T, E>): T {
+  const select = result.match<() => T>({
+    ok: (value) => () => value,
+    err: (error) => () => adaptToolResultToHost(Result.err(error)),
+  });
+  return select();
+}
 
 class CmdRequestCancelFailed extends TaggedError("CmdRequestCancelFailed")<{
   readonly cause: BusToAdapterEffectFailed;
@@ -275,21 +284,34 @@ export function adaptSurfaceOperationToRelay<T>(
   operation: BusToAdapterEffect,
   result: SurfaceOperationResult<T>,
 ): T {
-  if (result.status === "ok") return result.value;
-  throw classifySurfaceOperationForRelay(operation, result.error);
+  return result.match({
+    ok: (value) => () => value,
+    err: (error) => () => {
+      throw classifySurfaceOperationForRelay(operation, error);
+    },
+  })();
 }
 
 export function adaptBusToAdapterSubscriptionStart(
   started: ResultType<ResultSubscription, EventDeliveryStartFailed>,
 ): ResultSubscription {
-  if (started.status === "error") throw started.error;
-  return started.value;
+  return started.match({
+    ok: (subscription) => () => subscription,
+    err: (error) => () => {
+      throw error;
+    },
+  })();
 }
 
 export function adaptBusToAdapterSubscriptionStop(
   stopped: ResultType<void, EventDeliveryStopFailed>,
 ): void {
-  if (stopped.status === "error") throw stopped.error;
+  stopped.match({
+    ok: () => () => undefined,
+    err: (error) => () => {
+      throw error;
+    },
+  })();
 }
 
 export async function superviseBusToAdapterCleanup(
@@ -325,11 +347,16 @@ async function runBusToAdapterBestEffort(input: {
   context?: Readonly<Record<string, string | number | boolean | undefined>>;
 }): Promise<void> {
   const result = await captureBusToAdapterEffect(input.operation, input.effect);
-  if (result.status === "ok" || !input.logger || !input.logLevel || !input.logMessage) return;
-  input.logger[input.logLevel](
-    input.logMessage,
-    formatBridgeTaggedErrorForLog(result.error, input.context),
-  );
+  result.match({
+    ok: () => undefined,
+    err: (error) => {
+      if (!input.logger || !input.logLevel || !input.logMessage) return;
+      input.logger[input.logLevel](
+        input.logMessage,
+        formatBridgeTaggedErrorForLog(error, input.context),
+      );
+    },
+  });
 }
 
 export function logIngressAcknowledgementCleanupFailure(input: {
@@ -355,11 +382,12 @@ function observeSubscriptionDone(
   logger: Logger,
 ): void {
   void subscription.done.then((done) => {
-    if (done.status === "ok") return;
-    logger.error(
-      "event subscription stopped",
-      formatBridgeTaggedErrorForLog(done.error, { topic }),
-    );
+    done.match({
+      ok: () => undefined,
+      err: (error) => {
+        logger.error("event subscription stopped", formatBridgeTaggedErrorForLog(error, { topic }));
+      },
+    });
   });
 }
 
@@ -612,17 +640,21 @@ export async function bridgeBusToAdapter<P extends RegisteredSurfacePlatform>(pa
       const cancelled = await captureBusToAdapterEffect("cancel-active-relay", () =>
         relay.cancel(),
       );
-      if (cancelled.status === "ok") return Result.ok(undefined);
-      logger.error(
-        "failed to cancel active relay",
-        formatBridgeTaggedErrorForLog(cancelled.error, { requestId, sessionId }),
-      );
-      return Result.err(
-        new CmdRequestCancelFailed({
-          cause: cancelled.error,
-          message: "Failed to cancel active relay",
-        }),
-      );
+      return cancelled.match<ResultType<void, CmdRequestDeliveryError>>({
+        ok: () => Result.ok(undefined),
+        err: (error) => {
+          logger.error(
+            "failed to cancel active relay",
+            formatBridgeTaggedErrorForLog(error, { requestId, sessionId }),
+          );
+          return Result.err(
+            new CmdRequestCancelFailed({
+              cause: error,
+              message: "Failed to cancel active relay",
+            }),
+          );
+        },
+      });
     },
     applyCmdRequestDeliveryPolicy,
   );
@@ -688,19 +720,20 @@ export async function bridgeBusToAdapter<P extends RegisteredSurfacePlatform>(pa
           ref: msg.data.replyTo,
           expectedSessionId: sessionId,
         });
-        if (decoded.status === "error") {
+        const decodedError = decoded.match({ ok: () => null, err: (error) => error });
+        if (decodedError) {
           logger.warn(
             "relay reanchor target rejected",
-            formatBridgeTaggedErrorForLog(decoded.error, { requestId, sessionId, platform }),
+            formatBridgeTaggedErrorForLog(decodedError, { requestId, sessionId, platform }),
           );
           return Result.err(
             new CmdSurfaceReplyTargetInvalid({
-              cause: decoded.error,
+              cause: decodedError,
               message: "Output reanchor target is invalid",
             }),
           );
         }
-        replyTo = decoded.value;
+        replyTo = selectResultValue(decoded);
       }
 
       const reanchored = await captureBusToAdapterEffect("reanchor-output", () =>
@@ -710,21 +743,26 @@ export async function bridgeBusToAdapter<P extends RegisteredSurfacePlatform>(pa
           replyTo,
         }),
       );
-      if (reanchored.status === "ok") return Result.ok(undefined);
-      logger.error(
-        "reanchor failed",
-        formatBridgeTaggedErrorForLog(reanchored.error, { requestId, sessionId }),
-      );
-      return Result.err(
-        new CmdSurfaceReanchorFailed({
-          cause: reanchored.error,
-          message: "Output reanchor failed",
-        }),
-      );
+      return reanchored.match<ResultType<void, CmdSurfaceDeliveryError>>({
+        ok: () => Result.ok(undefined),
+        err: (error) => {
+          logger.error(
+            "reanchor failed",
+            formatBridgeTaggedErrorForLog(error, { requestId, sessionId }),
+          );
+          return Result.err(
+            new CmdSurfaceReanchorFailed({
+              cause: error,
+              message: "Output reanchor failed",
+            }),
+          );
+        },
+      });
     },
     applyCmdSurfaceDeliveryPolicy,
   );
-  if (cmdSurfaceStarted.status === "error") {
+  const cmdSurfaceStartError = cmdSurfaceStarted.match({ ok: () => null, err: (error) => error });
+  if (cmdSurfaceStartError) {
     await runBusToAdapterBestEffort({
       operation: "stop-output-subscription",
       effect: () => stopResultSubscription(cmdRequestSub),
@@ -823,10 +861,14 @@ export async function bridgeBusToAdapter<P extends RegisteredSurfacePlatform>(pa
             const stoppedTyping = await captureBusToAdapterEffect("stop-typing", () =>
               relay.stopTyping(),
             );
-            if (stoppedTyping.status === "error") {
+            const stoppedTypingError = stoppedTyping.match({
+              ok: () => null,
+              err: (error) => error,
+            });
+            if (stoppedTypingError) {
               logger.debug(
                 "failed to stop relay typing from lifecycle event",
-                formatBridgeTaggedErrorForLog(stoppedTyping.error, {
+                formatBridgeTaggedErrorForLog(stoppedTypingError, {
                   requestId,
                   sessionId,
                   lifecycleState: msg.data.state,
@@ -834,7 +876,7 @@ export async function bridgeBusToAdapter<P extends RegisteredSurfacePlatform>(pa
               );
               return Result.err(
                 new EvtRequestStopTypingFailed({
-                  cause: stoppedTyping.error,
+                  cause: stoppedTypingError,
                   message: "Failed to stop relay typing from lifecycle event",
                 }),
               );
@@ -926,14 +968,15 @@ export async function bridgeBusToAdapter<P extends RegisteredSurfacePlatform>(pa
         const stoppedTyping = await captureBusToAdapterEffect("stop-typing", () =>
           relay.stopTyping(),
         );
-        if (stoppedTyping.status === "error") {
+        const stoppedTypingError = stoppedTyping.match({ ok: () => null, err: (error) => error });
+        if (stoppedTypingError) {
           logger.debug(
             "failed to stop relay typing after delayed terminal lifecycle",
-            formatBridgeTaggedErrorForLog(stoppedTyping.error, { requestId, sessionId }),
+            formatBridgeTaggedErrorForLog(stoppedTypingError, { requestId, sessionId }),
           );
           return Result.err(
             new EvtRequestStopTypingFailed({
-              cause: stoppedTyping.error,
+              cause: stoppedTypingError,
               message: "Failed to stop relay typing after delayed terminal lifecycle",
             }),
           );
@@ -945,7 +988,8 @@ export async function bridgeBusToAdapter<P extends RegisteredSurfacePlatform>(pa
     },
     applyEvtRequestDeliveryPolicy,
   );
-  if (subStarted.status === "error") {
+  const subStartError = subStarted.match({ ok: () => null, err: (error) => error });
+  if (subStartError) {
     await superviseBusToAdapterCleanup([
       () =>
         runBusToAdapterBestEffort({
@@ -1354,17 +1398,18 @@ export async function bridgeBusToAdapter<P extends RegisteredSurfacePlatform>(pa
           ref,
           expectedSessionId: sessionId,
         });
-        if (decoded.status === "error") {
+        const decodedError = decoded.match({ ok: () => null, err: (error) => error });
+        if (decodedError) {
           logger.warn(
             "skipped output cleanup ref rejected",
-            formatBridgeTaggedErrorForLog(decoded.error, { requestId, sessionId, platform }),
+            formatBridgeTaggedErrorForLog(decodedError, { requestId, sessionId, platform }),
           );
           continue;
         }
         deletions.push(() =>
           runBusToAdapterBestEffort({
             operation: "cleanup-skipped-output",
-            effect: () => cleanup({ ref: decoded.value }),
+            effect: () => cleanup({ ref: selectResultValue(decoded) }),
             logger,
             logLevel: "debug",
             logMessage: "failed to delete skipped output message",
@@ -1381,17 +1426,20 @@ export async function bridgeBusToAdapter<P extends RegisteredSurfacePlatform>(pa
       const cleared = await captureBusToAdapterEffect("clear-ingress-acknowledgement", () =>
         clear({ requestId, sessionId }),
       );
-      if (cleared.status === "error") {
+      const clearError = cleared.match({ ok: () => null, err: (error) => error });
+      if (clearError) {
         logger.warn(
           "failed to clear ingress acknowledgement",
-          formatBridgeTaggedErrorForLog(cleared.error, { requestId, sessionId }),
+          formatBridgeTaggedErrorForLog(clearError, { requestId, sessionId }),
         );
         return;
       }
-      if (cleared.value.status === "error") {
+      const clearResult = selectResultValue(cleared);
+      const clearResultError = clearResult.match({ ok: () => null, err: (error) => error });
+      if (clearResultError) {
         logIngressAcknowledgementCleanupFailure({
           logger,
-          error: cleared.value.error,
+          error: clearResultError,
           requestId,
           sessionId,
         });
@@ -1401,19 +1449,22 @@ export async function bridgeBusToAdapter<P extends RegisteredSurfacePlatform>(pa
     const deleteUnlinkedCheckpointCandidate = async () => {
       const deleted = params.transcriptStore?.deleteUnlinkedCheckpointCandidate?.({ requestId });
       if (!deleted) return;
-      if (deleted.status === "ok") {
-        if (!deleted.value) return;
-        logger.info("compaction checkpoint deleted", {
-          requestId,
-          sessionId,
-          reason: "unlinked_candidate_cleanup",
-        });
-        return;
-      }
-      logger.warn(
-        "failed to delete unlinked transcript checkpoint",
-        formatBridgeTaggedErrorForLog(deleted.error, { requestId, sessionId }),
-      );
+      deleted.match({
+        ok: (wasDeleted) => {
+          if (!wasDeleted) return;
+          logger.info("compaction checkpoint deleted", {
+            requestId,
+            sessionId,
+            reason: "unlinked_candidate_cleanup",
+          });
+        },
+        err: (error) => {
+          logger.warn(
+            "failed to delete unlinked transcript checkpoint",
+            formatBridgeTaggedErrorForLog(error, { requestId, sessionId }),
+          );
+        },
+      });
     };
 
     const relayStop = async () => {
@@ -1458,32 +1509,30 @@ export async function bridgeBusToAdapter<P extends RegisteredSurfacePlatform>(pa
       part: SurfaceOutputPart,
     ): Promise<ResultType<SurfaceOutputPartDisposition, OutReqPushFailed>> => {
       const pushed = await out.push(part);
-      if (pushed.status === "ok") return Result.ok(pushed.value);
-      logger.error(
-        "failed to push relay output",
-        formatBridgeTaggedErrorForLog(pushed.error, { requestId, sessionId }),
-      );
-      return Result.err(
-        new OutReqPushFailed({
-          cause: classifySurfaceOperationForRelay("push-output", pushed.error),
+      return pushed.mapError((error) => {
+        logger.error(
+          "failed to push relay output",
+          formatBridgeTaggedErrorForLog(error, { requestId, sessionId }),
+        );
+        return new OutReqPushFailed({
+          cause: classifySurfaceOperationForRelay("push-output", error),
           message: "Failed to push relay output",
-        }),
-      );
+        });
+      });
     };
 
     const finishOutput = async (): Promise<ResultType<SurfaceOutputResult, OutReqFinishFailed>> => {
       const finished = await out.finish();
-      if (finished.status === "ok") return Result.ok(finished.value);
-      logger.error(
-        "failed to finish relay output",
-        formatBridgeTaggedErrorForLog(finished.error, { requestId, sessionId }),
-      );
-      return Result.err(
-        new OutReqFinishFailed({
-          cause: classifySurfaceOperationForRelay("finish-output", finished.error),
+      return finished.mapError((error) => {
+        logger.error(
+          "failed to finish relay output",
+          formatBridgeTaggedErrorForLog(error, { requestId, sessionId }),
+        );
+        return new OutReqFinishFailed({
+          cause: classifySurfaceOperationForRelay("finish-output", error),
           message: "Failed to finish relay output",
-        }),
-      );
+        });
+      });
     };
 
     const subStart = Date.now();
@@ -1826,8 +1875,12 @@ export async function bridgeBusToAdapter<P extends RegisteredSurfacePlatform>(pa
                     type: "meta.stats",
                     line: statsLine,
                   });
-                  if (pushedStats.status === "error") {
-                    processingError = pushedStats.error;
+                  const pushedStatsError = pushedStats.match({
+                    ok: () => undefined,
+                    err: (error) => error,
+                  });
+                  if (pushedStatsError) {
+                    processingError = pushedStatsError;
                     return;
                   }
                 }
@@ -1866,17 +1919,22 @@ export async function bridgeBusToAdapter<P extends RegisteredSurfacePlatform>(pa
                   text: streamFinalText,
                   ...(finalSegments === undefined ? {} : { finalSegments }),
                 });
-                if (pushedFinal.status === "error") {
-                  processingError = pushedFinal.error;
+                const pushedFinalError = pushedFinal.match({
+                  ok: () => undefined,
+                  err: (error) => error,
+                });
+                if (pushedFinalError) {
+                  processingError = pushedFinalError;
                   return;
                 }
-                recordOutputPartDisposition(pushedFinal.value);
+                recordOutputPartDisposition(selectResultValue(pushedFinal));
                 const finished = await finishOutput();
-                if (finished.status === "error") {
-                  processingError = finished.error;
+                const finishError = finished.match({ ok: () => undefined, err: (error) => error });
+                if (finishError) {
+                  processingError = finishError;
                   return;
                 }
-                const res = finished.value;
+                const res = selectResultValue(finished);
 
                 const transcriptStore = params.transcriptStore;
                 await superviseBusToAdapterCleanup([
@@ -1917,11 +1975,12 @@ export async function bridgeBusToAdapter<P extends RegisteredSurfacePlatform>(pa
 
             if (part) {
               const pushed = await pushOutputPart(part);
-              if (pushed.status === "error") {
-                processingError = pushed.error;
+              const pushError = pushed.match({ ok: () => undefined, err: (error) => error });
+              if (pushError) {
+                processingError = pushError;
                 return;
               }
-              recordOutputPartDisposition(pushed.value);
+              recordOutputPartDisposition(selectResultValue(pushed));
             }
           } finally {
             handlingOutputEvent = false;
@@ -1944,26 +2003,29 @@ export async function bridgeBusToAdapter<P extends RegisteredSurfacePlatform>(pa
       const captured = await captureBusToAdapterEffect("start-typing", () =>
         adapter.startTyping(sessionRef),
       );
-      if (captured.status === "error") {
+      const captureError = captured.match({ ok: () => null, err: (error) => error });
+      if (captureError) {
         logger.warn("surface typing indicator unavailable", {
           requestId,
           sessionId,
-          ...formatTaggedErrorForLog(captured.error),
+          ...formatTaggedErrorForLog(captureError),
         });
         return;
       }
-      const startedTyping = captured.value;
-      if (startedTyping.status === "ok") {
-        typing = startedTyping.value;
-        startupResources.typing = typing;
-      } else {
-        typing = null;
-        logger.warn("surface typing indicator unavailable", {
-          requestId,
-          sessionId,
-          ...formatTaggedErrorForLog(startedTyping.error),
-        });
-      }
+      selectResultValue(captured).match({
+        ok: (subscription) => {
+          typing = subscription;
+          startupResources.typing = typing;
+        },
+        err: (error) => {
+          typing = null;
+          logger.warn("surface typing indicator unavailable", {
+            requestId,
+            sessionId,
+            ...formatTaggedErrorForLog(error),
+          });
+        },
+      });
     }
     if (!input.paused) await startTyping();
 
@@ -2004,16 +2066,19 @@ export async function bridgeBusToAdapter<P extends RegisteredSurfacePlatform>(pa
       const typingToStop = typing;
       typing = null;
       const settled = await Promise.allSettled([
-        out.abort("restore_rollback").then((result) => result.status === "ok"),
+        out
+          .abort("restore_rollback")
+          .then((result) => result.match({ ok: () => true, err: () => false })),
         subToStop
           ? subToStop.stop().then(async (stoppedResult) => {
-              if (stoppedResult.status === "error") return false;
+              const stoppedCleanly = stoppedResult.match({ ok: () => true, err: () => false });
+              if (!stoppedCleanly) return false;
               const done = await subToStop.done;
-              return done.status === "ok";
+              return done.match({ ok: () => true, err: () => false });
             })
           : Promise.resolve(true),
         typingToStop
-          ? typingToStop.stop().then((result) => result.status === "ok")
+          ? typingToStop.stop().then((result) => result.match({ ok: () => true, err: () => false }))
           : Promise.resolve(true),
       ]);
       if (settled.some((result) => result.status === "rejected" || result.value === false)) {
@@ -2118,17 +2183,22 @@ export async function bridgeBusToAdapter<P extends RegisteredSurfacePlatform>(pa
     } catch (cause) {
       const settled = await Promise.allSettled([
         resources.output
-          ? resources.output.abort("restore_start_failed").then((result) => result.status === "ok")
+          ? resources.output
+              .abort("restore_start_failed")
+              .then((result) => result.match({ ok: () => true, err: () => false }))
           : Promise.resolve(true),
         resources.subscription
           ? resources.subscription.stop().then(async (stopped) => {
-              if (stopped.status === "error") return false;
+              const stoppedCleanly = stopped.match({ ok: () => true, err: () => false });
+              if (!stoppedCleanly) return false;
               const done = await resources.subscription?.done;
-              return done?.status === "ok";
+              return done?.match({ ok: () => true, err: () => false }) ?? false;
             })
           : Promise.resolve(true),
         resources.typing
-          ? resources.typing.stop().then((result) => result.status === "ok")
+          ? resources.typing
+              .stop()
+              .then((result) => result.match({ ok: () => true, err: () => false }))
           : Promise.resolve(true),
       ]);
       if (settled.some((result) => result.status === "rejected" || result.value === false)) {
@@ -2186,7 +2256,8 @@ export async function bridgeBusToAdapter<P extends RegisteredSurfacePlatform>(pa
             ref,
             expectedSessionId: snapshot.sessionId,
           });
-          if (decoded.status === "error") {
+          const decodeError = decoded.match({ ok: () => null, err: (error) => error });
+          if (decodeError) {
             return Result.err(
               new SurfaceRelayRestoreApplyFailed({
                 platform,
@@ -2195,7 +2266,7 @@ export async function bridgeBusToAdapter<P extends RegisteredSurfacePlatform>(pa
               }),
             );
           }
-          decodedRefs.push(decoded.value);
+          decodedRefs.push(selectResultValue(decoded));
         }
         return Result.ok(decodedRefs);
       };
@@ -2206,16 +2277,24 @@ export async function bridgeBusToAdapter<P extends RegisteredSurfacePlatform>(pa
       }> = [];
       for (const snapshot of snapshots) {
         const createdOutputRefs = decodeRecoveryRefs(snapshot, snapshot.createdOutputRefs);
-        if (createdOutputRefs.status === "error") return Result.err(createdOutputRefs.error);
+        const createdOutputRefsError = createdOutputRefs.match({
+          ok: () => null,
+          err: (error) => error,
+        });
+        if (createdOutputRefsError) return Result.err(createdOutputRefsError);
         const activeOutputRefs = snapshot.activeOutputRefs
           ? decodeRecoveryRefs(snapshot, snapshot.activeOutputRefs)
           : undefined;
-        if (activeOutputRefs?.status === "error") return Result.err(activeOutputRefs.error);
+        const activeOutputRefsError = activeOutputRefs?.match({
+          ok: () => null,
+          err: (error) => error,
+        });
+        if (activeOutputRefsError) return Result.err(activeOutputRefsError);
         const recoveryChain: SurfaceRestoredOutputChain<P> = {
           requestId: snapshot.requestId,
           sessionId: snapshot.sessionId,
-          createdOutputRefs: createdOutputRefs.value,
-          ...(activeOutputRefs ? { activeOutputRefs: activeOutputRefs.value } : {}),
+          createdOutputRefs: selectResultValue(createdOutputRefs),
+          ...(activeOutputRefs ? { activeOutputRefs: selectResultValue(activeOutputRefs) } : {}),
         };
         const existing =
           activeRelays.get(snapshot.requestId) ?? admittedRestoreRelays.get(snapshot.requestId);
@@ -2238,7 +2317,7 @@ export async function bridgeBusToAdapter<P extends RegisteredSurfacePlatform>(pa
             ref: snapshot.replyTo,
             expectedSessionId: snapshot.sessionId,
           });
-          if (decoded.status === "ok") initialReplyTo = decoded.value;
+          initialReplyTo = decoded.match({ ok: (value) => value, err: () => undefined });
         } else {
           const resolved = policy.refs.resolveInitialReplyTarget({
             requestId: snapshot.requestId,
@@ -2266,7 +2345,7 @@ export async function bridgeBusToAdapter<P extends RegisteredSurfacePlatform>(pa
           const relay = admittedRestoreRelays.get(requestId);
           if (!relay) continue;
           const stopped = await relay.rollbackRestore();
-          if (stopped.status === "error") failures.push(stopped.error);
+          stopped.match({ ok: () => undefined, err: (error) => failures.push(error) });
           admittedRestoreRelays.delete(requestId);
         }
         createdRequestIds.length = 0;
@@ -2303,10 +2382,12 @@ export async function bridgeBusToAdapter<P extends RegisteredSurfacePlatform>(pa
                 paused: true,
               }),
             );
-            if (started.status === "error") {
+            const startError = started.match({ ok: () => null, err: (error) => error });
+            if (startError) {
               const rolledBack = await rollbackCreated();
-              if (rolledBack.status === "error") {
-                signalSurfaceRelayRecoveryAtomicityUnknown(rolledBack.error);
+              const rollbackError = rolledBack.match({ ok: () => null, err: (error) => error });
+              if (rollbackError) {
+                signalSurfaceRelayRecoveryAtomicityUnknown(rollbackError);
               }
               return Result.err(
                 new SurfaceRelayRestoreApplyFailed({
@@ -2316,7 +2397,7 @@ export async function bridgeBusToAdapter<P extends RegisteredSurfacePlatform>(pa
                 }),
               );
             }
-            admittedRestoreRelays.set(item.snapshot.requestId, started.value);
+            admittedRestoreRelays.set(item.snapshot.requestId, selectResultValue(started));
             createdRequestIds.push(item.snapshot.requestId);
           }
           applied = true;

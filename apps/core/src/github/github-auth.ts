@@ -47,7 +47,7 @@ async function fetchViewerLoginFromGithub(input: {
   token: string;
 }): Promise<ResultType<string, GithubAuthFailed>> {
   const path = "/user";
-  const fetched = await captureGithubAuthExternal(
+  const response = await captureGithubAuthExternal(
     "viewer",
     "GitHub authenticated user request failed",
     () =>
@@ -60,41 +60,60 @@ async function fetchViewerLoginFromGithub(input: {
         },
       }),
   );
-  if (fetched.status === "error") return Result.err(fetched.error);
-  const res = fetched.value;
+  const continueResponse = response.match<() => Promise<ResultType<string, GithubAuthFailed>>>({
+    err: (error) => async () => Result.err(error),
+    ok: (res) => async () => {
+      if (!res.ok) {
+        const body = await captureGithubAuthExternal(
+          "viewer",
+          "GitHub authenticated user error response was unreadable",
+          () => res.text(),
+        );
+        const continueErrorBody = body.match<() => ResultType<string, GithubAuthFailed>>({
+          err: (error) => () =>
+            Result.err(
+              new GithubAuthFailed({
+                operation: "viewer",
+                cause: error,
+                message: `GitHub API error (${res.status} ${res.statusText}) at ${path}`,
+              }),
+            ),
+          ok: (value) => () =>
+            Result.err(
+              new GithubAuthFailed({
+                operation: "viewer",
+                message: `GitHub API error (${res.status} ${res.statusText}) at ${path}${value ? `: ${value}` : ""}`,
+              }),
+            ),
+        });
+        return continueErrorBody();
+      }
 
-  if (!res.ok) {
-    const body = await captureGithubAuthExternal(
-      "viewer",
-      "GitHub authenticated user error response was unreadable",
-      () => res.text(),
-    );
-    return Result.err(
-      new GithubAuthFailed({
-        operation: "viewer",
-        ...(body.status === "error" ? { cause: body.error } : {}),
-        message: `GitHub API error (${res.status} ${res.statusText}) at ${path}${body.status === "ok" && body.value ? `: ${body.value}` : ""}`,
-      }),
-    );
-  }
-
-  const body = await captureGithubAuthExternal(
-    "viewer",
-    "GitHub authenticated user response was unreadable",
-    async (): Promise<unknown> => await res.json(),
-  );
-  if (body.status === "error") return Result.err(body.error);
-  const parsed = githubViewerSchema.safeParse(body.value);
-  if (!parsed.success) {
-    return Result.err(
-      new GithubAuthFailed({
-        operation: "viewer",
-        cause: parsed.error,
-        message: "GitHub API returned an invalid authenticated user response at /user",
-      }),
-    );
-  }
-  return Result.ok(parsed.data.login);
+      const body = await captureGithubAuthExternal(
+        "viewer",
+        "GitHub authenticated user response was unreadable",
+        async (): Promise<unknown> => await res.json(),
+      );
+      const continueBody = body.match<() => ResultType<string, GithubAuthFailed>>({
+        err: (error) => () => Result.err(error),
+        ok: (value) => () => {
+          const parsed = githubViewerSchema.safeParse(value);
+          if (!parsed.success) {
+            return Result.err(
+              new GithubAuthFailed({
+                operation: "viewer",
+                cause: parsed.error,
+                message: "GitHub API returned an invalid authenticated user response at /user",
+              }),
+            );
+          }
+          return Result.ok(parsed.data.login);
+        },
+      });
+      return continueBody();
+    },
+  });
+  return await continueResponse();
 }
 
 export async function getGithubViewerLoginResult(input: {
@@ -111,12 +130,13 @@ export async function getGithubViewerLoginResult(input: {
 
   const request = (async () => {
     const login = await fetchViewerLoginFromGithub(input);
-    if (login.status === "error") return Result.err(login.error);
-    viewerLoginCache.set(key, {
-      login: login.value,
-      expiresAtMs: Date.now() + VIEWER_LOGIN_TTL_MS,
+    return login.map((value) => {
+      viewerLoginCache.set(key, {
+        login: value,
+        expiresAtMs: Date.now() + VIEWER_LOGIN_TTL_MS,
+      });
+      return value;
     });
-    return Result.ok(login.value);
   })();
   viewerLoginPending.set(key, request);
   try {
@@ -131,8 +151,12 @@ export async function getGithubViewerLoginOrThrow(input: {
   token: string;
 }): Promise<string> {
   const resolved = await getGithubViewerLoginResult(input);
-  if (resolved.status === "error") throw resolved.error;
-  return resolved.value;
+  return resolved.match({
+    ok: (value) => () => value,
+    err: (error) => () => {
+      throw error;
+    },
+  })();
 }
 
 export async function getGithubViewerLoginOrNull(input: {
@@ -140,7 +164,7 @@ export async function getGithubViewerLoginOrNull(input: {
   token: string;
 }): Promise<string | null> {
   const resolved = await getGithubViewerLoginResult(input);
-  return resolved.status === "ok" ? resolved.value : null;
+  return resolved.match({ ok: (value) => value, err: () => null });
 }
 
 function resolveApiBaseUrlFromSecret(input: { host?: string; apiBaseUrl?: string }): string {
@@ -166,100 +190,112 @@ export async function getGithubUserAuthOrNull(params: {
   dataDir: string;
 }): Promise<GithubResolvedAuth | null> {
   const resolved = await getGithubUserAuthResult(params);
-  return resolved.status === "ok" ? resolved.value : null;
+  return resolved.match({ ok: (value) => value, err: () => null });
 }
 
 export async function getGithubUserAuthResult(params: {
   dataDir: string;
 }): Promise<ResultType<GithubResolvedAuth | null, GithubAuthFailed>> {
   const loaded = await readGithubUserTokenSecretResult(params.dataDir);
-  if (loaded.status === "error") {
-    return Result.err(
-      new GithubAuthFailed({
-        operation: "read-user",
-        cause: loaded.error,
-        message: loaded.error.message,
-      }),
+  return loaded
+    .mapError(
+      (error) =>
+        new GithubAuthFailed({
+          operation: "read-user",
+          cause: error,
+          message: error.message,
+        }),
+    )
+    .map((secret) =>
+      secret
+        ? {
+            source: "user" as const,
+            token: secret.token,
+            host: secret.host,
+            apiBaseUrl: resolveApiBaseUrlFromSecret({
+              host: secret.host,
+              apiBaseUrl: secret.apiBaseUrl,
+            }),
+            login: secret.login,
+          }
+        : null,
     );
-  }
-  const secret = loaded.value;
-  if (!secret) return Result.ok(null);
-
-  return Result.ok({
-    source: "user",
-    token: secret.token,
-    host: secret.host,
-    apiBaseUrl: resolveApiBaseUrlFromSecret({
-      host: secret.host,
-      apiBaseUrl: secret.apiBaseUrl,
-    }),
-    login: secret.login,
-  });
 }
 
 export async function getGithubAppAuthOrNull(params: {
   dataDir: string;
 }): Promise<GithubResolvedAuth | null> {
   const resolved = await getGithubAppAuthResult(params);
-  return resolved.status === "ok" ? resolved.value : null;
+  return resolved.match({ ok: (value) => value, err: () => null });
 }
 
 export async function getGithubAppAuthResult(params: {
   dataDir: string;
 }): Promise<ResultType<GithubResolvedAuth | null, GithubAuthFailed>> {
   const loaded = await readGithubAppSecretResult(params.dataDir);
-  if (loaded.status === "error") {
-    return Result.err(
-      new GithubAuthFailed({
-        operation: "read-app",
-        cause: loaded.error,
-        message: loaded.error.message,
-      }),
-    );
-  }
-  const secret = loaded.value;
-  if (!secret) return Result.ok(null);
-
-  const token = await getGithubInstallationTokenResult({ dataDir: params.dataDir });
-  if (token.status === "error") {
-    return Result.err(
-      new GithubAuthFailed({
-        operation: "mint-app-token",
-        cause: token.error,
-        message: token.error.message,
-      }),
-    );
-  }
-  return Result.ok(toAppAuth(secret, token.value.token));
+  const continueLoaded = loaded.match<
+    () => Promise<ResultType<GithubResolvedAuth | null, GithubAuthFailed>>
+  >({
+    err: (error) => async () =>
+      Result.err(
+        new GithubAuthFailed({ operation: "read-app", cause: error, message: error.message }),
+      ),
+    ok: (secret) => async () => {
+      if (!secret) return Result.ok(null);
+      const token = await getGithubInstallationTokenResult({ dataDir: params.dataDir });
+      const continueToken = token.match<
+        () => ResultType<GithubResolvedAuth | null, GithubAuthFailed>
+      >({
+        err: (error) => () =>
+          Result.err(
+            new GithubAuthFailed({
+              operation: "mint-app-token",
+              cause: error,
+              message: error.message,
+            }),
+          ),
+        ok: (value) => () => Result.ok(toAppAuth(secret, value.token)),
+      });
+      return continueToken();
+    },
+  });
+  return await continueLoaded();
 }
 
 export async function getPreferredGithubAuthResult(params: {
   dataDir: string;
 }): Promise<ResultType<GithubResolvedAuth | null, GithubAuthFailed>> {
   const user = await getGithubUserAuthResult(params);
-  if (user.status === "error") return Result.err(user.error);
-  if (user.value) return Result.ok(user.value);
-  return await getGithubAppAuthResult(params);
+  return user.match({
+    err: (error) => async () => Result.err(error),
+    ok: (value) => async () => (value ? Result.ok(value) : await getGithubAppAuthResult(params)),
+  })();
 }
 
 export async function getPreferredGithubAuthOrNull(params: {
   dataDir: string;
 }): Promise<GithubResolvedAuth | null> {
   const resolved = await getPreferredGithubAuthResult(params);
-  return resolved.status === "ok" ? resolved.value : null;
+  return resolved.match({ ok: (value) => value, err: () => null });
 }
 
 export async function getPreferredGithubAuthOrThrow(params: {
   dataDir: string;
 }): Promise<GithubResolvedAuth> {
   const resolved = await getPreferredGithubAuthResult(params);
-  if (resolved.status === "error") throw resolved.error;
-  if (resolved.value) return resolved.value;
-  throw new GithubAuthFailed({
-    operation: "resolve",
-    message:
-      "GitHub auth not configured. Configure outbound user auth (onboarding.github_user_token mode=configure) or GitHub App auth (onboarding.github_app mode=configure).",
-  });
+  return resolved.match({
+    err: (error) => () => {
+      throw error;
+    },
+    ok: (value) => () => {
+      if (value) return value;
+      throw new GithubAuthFailed({
+        operation: "resolve",
+        message:
+          "GitHub auth not configured. Configure outbound user auth (onboarding.github_user_token mode=configure) or GitHub App auth (onboarding.github_app mode=configure).",
+      });
+    },
+  })();
 }
 
 export async function getGithubUserLoginOrNull(params: {
@@ -283,8 +319,8 @@ export async function getGithubEnvForBash(params: {
 }): Promise<Record<string, string>> {
   const userResult = await getGithubUserAuthResult({ dataDir: params.dataDir });
   const appResult = await getGithubAppAuthResult({ dataDir: params.dataDir });
-  const user = userResult.status === "ok" ? userResult.value : null;
-  const app = appResult.status === "ok" ? appResult.value : null;
+  const user = userResult.match({ ok: (value) => value, err: () => null });
+  const app = appResult.match({ ok: (value) => value, err: () => null });
 
   const preferred = user ?? app;
   if (!preferred) return {};

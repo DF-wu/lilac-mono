@@ -83,19 +83,21 @@ export class GithubOutputStream implements SurfaceOutputStream {
 
     const body = markGithubAgentComment(`${replyPrefix}${this.text}`);
     const res = await this.api.createComment(body);
-    if (res.status === "error") return res;
-
-    const ref: MsgRef = {
-      platform: "github",
-      channelId: this.sessionRef.channelId,
-      messageId: String(res.value.id),
-    };
-    this.created.push(ref);
-
-    return Result.ok({
-      created: this.created,
-      last: ref,
-    });
+    return res.match<() => SurfaceOperationResult<SurfaceOutputResult>>({
+      err: (error) => () => Result.err(error),
+      ok: (value) => () => {
+        const ref: MsgRef = {
+          platform: "github",
+          channelId: this.sessionRef.channelId,
+          messageId: String(value.id),
+        };
+        this.created.push(ref);
+        return Result.ok({
+          created: this.created,
+          last: ref,
+        });
+      },
+    })();
   }
 
   async abort(_reason?: string): Promise<SurfaceOperationResult<void>> {

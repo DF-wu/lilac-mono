@@ -84,113 +84,125 @@ export async function getGithubInstallationTokenResult(params: {
   dataDir: string;
 }): Promise<ResultType<Omit<InstallationToken, "fingerprint">, GithubAppTokenError>> {
   const secretResult = await readGithubAppSecretResult(params.dataDir);
-  if (secretResult.status === "error") {
-    return Result.err(
-      new GithubAppTokenUnavailable({
-        cause: secretResult.error,
-        message: secretResult.error.message,
-      }),
-    );
-  }
-  const secret = secretResult.value;
-  if (!secret) {
-    return Result.err(
-      new GithubAppTokenUnavailable({
-        message: "GitHub App not configured (run onboarding.github_app mode=configure)",
-      }),
-    );
-  }
-
-  const apiBaseUrl = deriveApiBaseUrl({
-    host: secret.host,
-    apiBaseUrl: secret.apiBaseUrl,
-  });
-  const fp = fingerprintSecret(secret);
-
-  const now = Date.now();
-  if (
-    cached &&
-    cached.fingerprint === fp &&
-    cached.apiBaseUrl === apiBaseUrl &&
-    cached.expiresAtMs - now > 60_000
-  ) {
-    return Result.ok({
-      token: cached.token,
-      expiresAtMs: cached.expiresAtMs,
-      host: cached.host,
-      apiBaseUrl: cached.apiBaseUrl,
-    });
-  }
-
-  if (pending) {
-    const resolved = await pending;
-    if (resolved.status === "error") return Result.err(resolved.error);
-    const t = resolved.value;
-    return Result.ok({
-      token: t.token,
-      expiresAtMs: t.expiresAtMs,
-      host: t.host,
-      apiBaseUrl: t.apiBaseUrl,
-    });
-  }
-
-  pending = (async () => {
-    const privateKey = await readGithubAppPrivateKeyPemResult(secret);
-    if (privateKey.status === "error") {
-      return Result.err(
-        new GithubAppTokenMintFailed({
-          cause: privateKey.error,
-          message: privateKey.error.message,
+  return secretResult.match<
+    () => Promise<ResultType<Omit<InstallationToken, "fingerprint">, GithubAppTokenError>>
+  >({
+    err: (error) => async () =>
+      Result.err(
+        new GithubAppTokenUnavailable({
+          cause: error,
+          message: error.message,
         }),
-      );
-    }
-    const auth = createAppAuth({
-      appId: secret.appId,
-      privateKey: privateKey.value,
-      installationId: secret.installationId,
-      baseUrl: apiBaseUrl,
-    });
+      ),
+    ok: (secret) => async () => {
+      if (!secret) {
+        return Result.err(
+          new GithubAppTokenUnavailable({
+            message: "GitHub App not configured (run onboarding.github_app mode=configure)",
+          }),
+        );
+      }
 
-    const authenticated = await captureGithubAppAuth(() => auth({ type: "installation" }));
-    if (authenticated.status === "error") return Result.err(authenticated.error);
-    const res = authenticated.value;
-    const token = res.token;
-    if (typeof token !== "string" || token.length === 0) {
-      return Result.err(
-        new GithubAppTokenMintFailed({
-          cause: new Error("GitHub App installation token missing"),
-          message: "Failed to mint GitHub App installation token",
-        }),
-      );
-    }
+      const apiBaseUrl = deriveApiBaseUrl({
+        host: secret.host,
+        apiBaseUrl: secret.apiBaseUrl,
+      });
+      const fp = fingerprintSecret(secret);
 
-    const expiresAtMs = parseExpiresAtMs(res.expiresAt);
-    if (expiresAtMs.status === "error") return Result.err(expiresAtMs.error);
+      const now = Date.now();
+      if (
+        cached &&
+        cached.fingerprint === fp &&
+        cached.apiBaseUrl === apiBaseUrl &&
+        cached.expiresAtMs - now > 60_000
+      ) {
+        return Result.ok({
+          token: cached.token,
+          expiresAtMs: cached.expiresAtMs,
+          host: cached.host,
+          apiBaseUrl: cached.apiBaseUrl,
+        });
+      }
 
-    const t: InstallationToken = {
-      token,
-      expiresAtMs: expiresAtMs.value,
-      host: secret.host,
-      apiBaseUrl,
-      fingerprint: fp,
-    };
-    cached = t;
-    return Result.ok(t);
+      if (pending) {
+        const resolved = await pending;
+        return resolved.map(({ token, expiresAtMs, host, apiBaseUrl }) => ({
+          token,
+          expiresAtMs,
+          host,
+          apiBaseUrl,
+        }));
+      }
+
+      pending = (async () => {
+        const privateKeyResult = await readGithubAppPrivateKeyPemResult(secret);
+        const continuePrivateKey = privateKeyResult.match<
+          () => Promise<ResultType<InstallationToken, GithubAppTokenError>>
+        >({
+          err: (error) => async () =>
+            Result.err(new GithubAppTokenMintFailed({ cause: error, message: error.message })),
+          ok: (privateKey) => async () => {
+            const auth = createAppAuth({
+              appId: secret.appId,
+              privateKey,
+              installationId: secret.installationId,
+              baseUrl: apiBaseUrl,
+            });
+            const response = await captureGithubAppAuth(() => auth({ type: "installation" }));
+            const continueResponse = response.match<
+              () => ResultType<InstallationToken, GithubAppTokenError>
+            >({
+              err: (error) => () => Result.err(error),
+              ok: (res) => () => {
+                const token = res.token;
+                if (typeof token !== "string" || token.length === 0) {
+                  return Result.err(
+                    new GithubAppTokenMintFailed({
+                      cause: new Error("GitHub App installation token missing"),
+                      message: "Failed to mint GitHub App installation token",
+                    }),
+                  );
+                }
+                const expiresAt = parseExpiresAtMs(res.expiresAt);
+                const continueExpiresAt = expiresAt.match<
+                  () => ResultType<InstallationToken, GithubAppTokenError>
+                >({
+                  err: (error) => () => Result.err(error),
+                  ok: (expiresAtMs) => () => {
+                    const value: InstallationToken = {
+                      token,
+                      expiresAtMs,
+                      host: secret.host,
+                      apiBaseUrl,
+                      fingerprint: fp,
+                    };
+                    cached = value;
+                    return Result.ok(value);
+                  },
+                });
+                return continueExpiresAt();
+              },
+            });
+            return continueResponse();
+          },
+        });
+        return await continuePrivateKey();
+      })();
+
+      try {
+        const pendingToken = pending;
+        const resolved = await pendingToken;
+        return resolved.map(({ token, expiresAtMs, host, apiBaseUrl }) => ({
+          token,
+          expiresAtMs,
+          host,
+          apiBaseUrl,
+        }));
+      } finally {
+        pending = null;
+      }
+    },
   })();
-
-  try {
-    const resolved = await pending;
-    if (resolved.status === "error") return Result.err(resolved.error);
-    const t = resolved.value;
-    return Result.ok({
-      token: t.token,
-      expiresAtMs: t.expiresAtMs,
-      host: t.host,
-      apiBaseUrl: t.apiBaseUrl,
-    });
-  } finally {
-    pending = null;
-  }
 }
 
 export async function getGithubInstallationTokenOrThrow(params: { dataDir: string }): Promise<{
@@ -200,6 +212,10 @@ export async function getGithubInstallationTokenOrThrow(params: { dataDir: strin
   apiBaseUrl: string;
 }> {
   const token = await getGithubInstallationTokenResult(params);
-  if (token.status === "error") throw token.error;
-  return token.value;
+  return token.match({
+    ok: (value) => () => value,
+    err: (error) => () => {
+      throw error;
+    },
+  })();
 }

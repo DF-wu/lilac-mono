@@ -42,21 +42,24 @@ export function selectNewestReachableCheckpoint<T>(input: {
       channelId: input.channelId,
       messageId,
     });
-    if (resolved.status === "error") {
-      logger.warn(
-        "compaction checkpoint transcript read failed",
-        formatBridgeTaggedErrorForLog(resolved.error),
-      );
-      resolvedSnapshotsBySurfaceMessageId.set(messageId, null);
-      return null;
-    }
-    const snapshot =
-      resolved.value?.requestClient === input.platform &&
-      resolved.value.sessionId === input.channelId
-        ? resolved.value
-        : null;
-    resolvedSnapshotsBySurfaceMessageId.set(messageId, snapshot);
-    return snapshot;
+    return resolved.match({
+      err: (error) => () => {
+        logger.warn(
+          "compaction checkpoint transcript read failed",
+          formatBridgeTaggedErrorForLog(error),
+        );
+        resolvedSnapshotsBySurfaceMessageId.set(messageId, null);
+        return null;
+      },
+      ok: (value) => () => {
+        const snapshot =
+          value?.requestClient === input.platform && value.sessionId === input.channelId
+            ? value
+            : null;
+        resolvedSnapshotsBySurfaceMessageId.set(messageId, snapshot);
+        return snapshot;
+      },
+    })();
   };
 
   const seenRequestIds = new Set<string>();

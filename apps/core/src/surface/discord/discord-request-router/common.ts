@@ -6,7 +6,6 @@ import {
   parseCoreConfigResult,
   type CoreConfig,
 } from "@stanley2058/lilac-utils";
-import { Result } from "better-result";
 import { z } from "zod";
 
 import type { MsgRefFor } from "../../runtime-descriptor";
@@ -387,18 +386,16 @@ export function withDefaultToolsConfig(
   config: RouterConfigOverride,
 ): ReturnType<typeof parseCoreConfigResult> {
   const parsedResult = parseCoreConfigResult(config);
-  if (parsedResult.status === "error") return parsedResult;
-  const parsed = parsedResult.value;
   const agent = isRecord(config.agent) ? config.agent : {};
   const systemPrompt = typeof agent.systemPrompt === "string" ? agent.systemPrompt : "";
 
-  return Result.ok({
+  return parsedResult.map((parsed) => ({
     ...parsed,
     agent: {
       ...parsed.agent,
       systemPrompt,
     },
-  });
+  }));
 }
 
 export type RouterAdapterMessage = EvtAdapterMessageCreatedData;

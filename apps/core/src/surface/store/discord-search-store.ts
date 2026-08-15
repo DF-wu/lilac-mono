@@ -655,24 +655,27 @@ export class DiscordSearchService {
       const messages = await this.params.adapter.listMsg(input.sessionRef, {
         limit,
       });
-      if (messages.status === "error") {
-        this.logger.error("search heal failed", {
-          channelId: input.sessionRef.channelId,
-          limit,
-          ...formatTaggedErrorForLog(messages.error),
-        });
-        return { attempted: true, skipped: false, limit, fetched: 0, indexed: 0 };
-      }
-      const indexed = this.params.store.upsertMessages(messages.value);
-      if (indexed > 0) this.params.onMessagesIndexed?.(input.sessionRef.channelId);
-
-      return {
-        attempted: true,
-        skipped: false,
-        limit,
-        fetched: messages.value.length,
-        indexed,
-      };
+      return messages.match({
+        err: (error) => () => {
+          this.logger.error("search heal failed", {
+            channelId: input.sessionRef.channelId,
+            limit,
+            ...formatTaggedErrorForLog(error),
+          });
+          return { attempted: true, skipped: false, limit, fetched: 0, indexed: 0 };
+        },
+        ok: (value) => () => {
+          const indexed = this.params.store.upsertMessages(value);
+          if (indexed > 0) this.params.onMessagesIndexed?.(input.sessionRef.channelId);
+          return {
+            attempted: true,
+            skipped: false,
+            limit,
+            fetched: value.length,
+            indexed,
+          };
+        },
+      })();
     } catch (e) {
       preserveSurfacePanic(e);
       this.logger.error("search heal failed", { channelId: input.sessionRef.channelId, limit }, e);

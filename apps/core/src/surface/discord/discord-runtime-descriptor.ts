@@ -16,6 +16,11 @@ import type {
 import { workflowProgressOperationFailure } from "../runtime-descriptor";
 
 type DiscordWorkflowProgressOperation = "check-message" | "send" | "edit";
+type DiscordCheckMessageResult = Awaited<
+  ReturnType<SurfaceWorkflowProgressPort<"discord">["checkMessage"]>
+>;
+type DiscordSendResult = Awaited<ReturnType<SurfaceWorkflowProgressPort<"discord">["send"]>>;
+type DiscordEditResult = Awaited<ReturnType<SurfaceWorkflowProgressPort<"discord">["edit"]>>;
 
 // Bump when the declared workflow operation contract or failure policy changes.
 export const DISCORD_WORKFLOW_PROGRESS_CONFIGURATION_REVISION = "discord-workflow-progress-v1";
@@ -38,13 +43,13 @@ export function createDiscordWorkflowProgressPort(
         channelId: target.channelId,
         messageId: target.messageId,
       });
-      if (checked.status === "error") {
-        if (checked.error._tag === "SurfaceMessageNotFound") {
-          return Result.ok("missing");
-        }
-        return Result.err(discordWorkflowError("check-message", checked.error));
-      }
-      return Result.ok(checked.value ? "found" : "missing");
+      return checked.match<DiscordCheckMessageResult>({
+        err: (error) =>
+          error._tag === "SurfaceMessageNotFound"
+            ? Result.ok("missing")
+            : Result.err(discordWorkflowError("check-message", error)),
+        ok: (value) => Result.ok(value ? "found" : "missing"),
+      });
     },
     send: async (input) => {
       const sent = await adapter.sendMsg(
@@ -61,26 +66,29 @@ export function createDiscordWorkflowProgressPort(
             }
           : { silent: input.silent },
       );
-      if (sent.status === "error") {
-        if (sent.error._tag === "SurfaceOperationPartiallyCompleted") {
-          const created = sent.error.created;
-          if (created.platform === "discord") {
-            return Result.err({
-              kind: "created",
-              ref: {
-                platform: "discord",
-                channelId: created.channelId,
-                messageId: created.messageId,
-              },
-            });
+      return sent.match<DiscordSendResult>({
+        err: (error) => {
+          if (error._tag === "SurfaceOperationPartiallyCompleted") {
+            const created = error.created;
+            if (created.platform === "discord") {
+              return Result.err({
+                kind: "created",
+                ref: {
+                  platform: "discord",
+                  channelId: created.channelId,
+                  messageId: created.messageId,
+                },
+              });
+            }
           }
-        }
-        return Result.err(discordWorkflowError("send", sent.error));
-      }
-      return Result.ok({
-        platform: "discord",
-        channelId: sent.value.channelId,
-        messageId: sent.value.messageId,
+          return Result.err(discordWorkflowError("send", error));
+        },
+        ok: (value) =>
+          Result.ok({
+            platform: "discord",
+            channelId: value.channelId,
+            messageId: value.messageId,
+          }),
       });
     },
     edit: async (target, content) => {
@@ -92,11 +100,13 @@ export function createDiscordWorkflowProgressPort(
         },
         content,
       );
-      if (edited.status === "ok") return Result.ok(undefined);
-      if (edited.error._tag === "SurfaceMessageNotFound") {
-        return Result.err({ kind: "not-found" });
-      }
-      return Result.err(discordWorkflowError("edit", edited.error));
+      return edited.match<DiscordEditResult>({
+        ok: () => Result.ok(undefined),
+        err: (error) =>
+          error._tag === "SurfaceMessageNotFound"
+            ? Result.err({ kind: "not-found" })
+            : Result.err(discordWorkflowError("edit", error)),
+      });
     },
   };
 }
@@ -106,7 +116,12 @@ async function adaptDiscordSkippedOutputCleanupResultToHost(
   ref: Parameters<SurfaceAdapter["deleteMsg"]>[0],
 ): Promise<void> {
   const deleted = await adapter.deleteMsg(ref);
-  if (deleted.status === "error") throw deleted.error;
+  deleted.match<() => void>({
+    ok: () => () => undefined,
+    err: (error) => () => {
+      throw error;
+    },
+  })();
 }
 
 export function createDiscordRelayPolicy(

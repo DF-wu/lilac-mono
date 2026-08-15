@@ -21,7 +21,7 @@ import {
 import { toBusDiscordCommandInvokedData } from "../discord/discord-command-projection";
 import type { TranscriptStore } from "../../transcript/transcript-store";
 import { adaptEventPublishResultToHost } from "../../shared/event-bus-result";
-import { formatBridgeLogContext } from "./bridge-log";
+import { formatBridgeLogContext, formatBridgeTaggedErrorForLog } from "./bridge-log";
 
 export async function bridgeAdapterToBus(params: {
   eventSource: SurfaceAdapterEventSource;
@@ -66,12 +66,13 @@ export async function bridgeAdapterToBus(params: {
     published: ResultType<T, EventPublishContractInvalid | EventPublishTransportFailed>,
     context: Omit<Parameters<typeof logPublish>[0], "errorClass" | "ok">,
   ): void => {
-    if (published.status === "error") {
-      logPublish({ ...context, ok: false, errorClass: published.error._tag });
-      adaptEventPublishResultToHost(published);
-      return;
-    }
-    logPublish({ ...context, ok: true });
+    published.match({
+      err: (error) => () => {
+        logPublish({ ...context, ok: false, errorClass: error._tag });
+        adaptEventPublishResultToHost(published);
+      },
+      ok: () => () => logPublish({ ...context, ok: true }),
+    })();
   };
 
   return await eventSource.subscribe(async (evt: AdapterEvent) => {
@@ -120,26 +121,31 @@ export async function bridgeAdapterToBus(params: {
             channelId: evt.messageRef.channelId,
             messageId: evt.messageRef.messageId,
           });
-          if (unlinkResult?.status === "error") {
-            logger.warn(
-              "failed to unlink deleted surface message",
-              formatBridgeLogContext({
-                platform: evt.messageRef.platform,
-                channelId: evt.messageRef.channelId,
-                messageId: evt.messageRef.messageId,
-                errorTag: unlinkResult.error.name,
-                errorMessage: unlinkResult.error.message,
-              }),
-            );
-          } else if (unlinkResult?.value.checkpointDeleted) {
-            logger.info("compaction checkpoint deleted", {
-              requestId: unlinkResult.value.requestId,
-              platform: evt.messageRef.platform,
-              channelId: evt.messageRef.channelId,
-              messageId: evt.messageRef.messageId,
-              reason: "last_surface_link_deleted",
-            });
-          }
+          unlinkResult?.match({
+            err: (error) => () =>
+              logger.warn(
+                "failed to unlink deleted surface message",
+                formatBridgeTaggedErrorForLog(error, {
+                  platform: evt.messageRef.platform,
+                  channelId: evt.messageRef.channelId,
+                  messageId: evt.messageRef.messageId,
+                }),
+              ),
+            ok: (value) => () => {
+              if (value.checkpointDeleted) {
+                logger.info(
+                  "compaction checkpoint deleted",
+                  formatBridgeLogContext({
+                    requestId: value.requestId,
+                    platform: evt.messageRef.platform,
+                    channelId: evt.messageRef.channelId,
+                    messageId: evt.messageRef.messageId,
+                    reason: "last_surface_link_deleted",
+                  }),
+                );
+              }
+            },
+          })();
         } catch (cause) {
           if (Panic.is(cause)) throw cause;
           logger.warn(

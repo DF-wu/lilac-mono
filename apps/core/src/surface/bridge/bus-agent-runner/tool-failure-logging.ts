@@ -223,7 +223,10 @@ export function summarizeToolFailure(params: {
       spec,
       value: { isError: false, result },
     });
-    if (summary.status === "ok" && summary.value) return summary.value;
+    return summary.match<ToolFailureSummary>({
+      ok: (value) => value ?? { ok: true },
+      err: () => ({ ok: true }),
+    });
   }
 
   return { ok: true };

@@ -8,16 +8,17 @@ import {
 } from "@stanley2058/lilac-event-bus";
 import type { CoreConfig } from "@stanley2058/lilac-utils";
 import type { Logger } from "@stanley2058/simple-module-logger";
-import { Result } from "better-result";
+import { Result, type Result as ResultType } from "better-result";
 
 import type { SurfaceAdapter } from "../../adapter";
-import type { MsgRef } from "../../types";
+import type { MsgRef, SurfaceMessage } from "../../types";
 import type { TranscriptStore } from "../../../transcript/transcript-store";
 import { adaptEventPublishResultToHost } from "../../../shared/event-bus-result";
 import {
   composeRecentChannelMessages,
   composeRequestMessages,
   composeSingleMessageWithLineage,
+  type RequestCompositionError,
 } from "../../bridge/request-composition";
 import { buildDiscordUserAliasById, previewText, type SessionMode } from "./common";
 
@@ -82,9 +83,7 @@ export async function publishBusRequest(params: {
         corePrimaryLineage: params.input.corePrimaryLineage,
         ...(params.input.modelOverride ? { modelOverride: params.input.modelOverride } : {}),
         raw: {
-          ...(params.input.raw && typeof params.input.raw === "object"
-            ? (params.input.raw as Record<string, unknown>)
-            : {}),
+          ...(params.input.raw && typeof params.input.raw === "object" ? params.input.raw : {}),
           sessionMode: params.input.sessionMode,
           sessionConfigId: params.input.sessionConfigId,
           ...(params.input.parentChannelId
@@ -125,7 +124,7 @@ export async function publishComposedRequest(params: {
     transformTriggerUserText?: (text: string) => string;
     transformUserTextForMessageId?: string;
   };
-}) {
+}): Promise<ResultType<void, RequestCompositionError>> {
   const self = await params.adapter.getSelf();
   const discordUserAliasById = buildDiscordUserAliasById(params.cfg);
 
@@ -144,40 +143,43 @@ export async function publishComposedRequest(params: {
       msgRef: params.input.msgRef,
     },
   });
-  if (composed.status === "error") return Result.err(composed.error);
-  const composition = composed.value;
-
-  await publishBusRequest({
-    logger: params.logger,
-    bus: params.bus,
-    input: {
-      requestId: params.input.requestId,
-      sessionId: params.input.sessionId,
-      sessionConfigId: params.input.sessionConfigId,
-      parentChannelId: params.input.parentChannelId,
-      queue: params.input.queue,
-      triggerType: params.input.triggerType,
-      sessionMode: params.input.sessionMode,
-      modelOverride: params.input.modelOverride,
-      messages: composition.messages,
-      corePrimaryLineage: composition.corePrimaryLineage,
-      raw: {
-        authenticatedOrigin: {
-          platform: "discord",
-          userId: params.input.userId,
-          messageRef: params.input.msgRef,
+  const continuePublish = composed.match<() => Promise<ResultType<void, RequestCompositionError>>>({
+    err: (error) => async () => Result.err(error),
+    ok: (composition) => async () => {
+      await publishBusRequest({
+        logger: params.logger,
+        bus: params.bus,
+        input: {
+          requestId: params.input.requestId,
+          sessionId: params.input.sessionId,
+          sessionConfigId: params.input.sessionConfigId,
+          parentChannelId: params.input.parentChannelId,
+          queue: params.input.queue,
+          triggerType: params.input.triggerType,
+          sessionMode: params.input.sessionMode,
+          modelOverride: params.input.modelOverride,
+          messages: composition.messages,
+          corePrimaryLineage: composition.corePrimaryLineage,
+          raw: {
+            authenticatedOrigin: {
+              platform: "discord",
+              userId: params.input.userId,
+              messageRef: params.input.msgRef,
+            },
+            triggerType: params.input.triggerType,
+            chainMessageIds: composition.chainMessageIds,
+            mergedGroups: composition.mergedGroups,
+            participantUserIds: uniqueNonEmptyStrings(
+              composition.mergedGroups.map((group) => group.authorId),
+              { exclude: self.userId },
+            ),
+          },
         },
-        triggerType: params.input.triggerType,
-        chainMessageIds: composition.chainMessageIds,
-        mergedGroups: composition.mergedGroups,
-        participantUserIds: uniqueNonEmptyStrings(
-          composition.mergedGroups.map((group) => group.authorId),
-          { exclude: self.userId },
-        ),
-      },
+      });
+      return Result.ok(undefined);
     },
   });
-  return Result.ok(undefined);
+  return continuePublish();
 }
 
 export async function publishActiveChannelPrompt(params: {
@@ -200,7 +202,7 @@ export async function publishActiveChannelPrompt(params: {
     transformTriggerUserText?: (text: string) => string;
     transformUserTextForMessageId?: string;
   };
-}) {
+}): Promise<ResultType<void, RequestCompositionError>> {
   const self = await params.adapter.getSelf();
   const discordUserAliasById = buildDiscordUserAliasById(params.cfg);
 
@@ -241,50 +243,61 @@ export async function publishActiveChannelPrompt(params: {
           triggerMsgRef: params.input.triggerMsgRef,
           triggerType: params.input.triggerType,
         });
-  if (composed.status === "error") return Result.err(composed.error);
-  const composition = composed.value;
-
-  const originMessageResult = params.input.triggerMsgRef
-    ? await params.adapter.readMsg(params.input.triggerMsgRef)
-    : null;
-  if (originMessageResult?.status === "error") return Result.err(originMessageResult.error);
-  const originMessage = originMessageResult?.status === "ok" ? originMessageResult.value : null;
-
-  await publishBusRequest({
-    logger: params.logger,
-    bus: params.bus,
-    input: {
-      requestId: params.input.requestId,
-      sessionId: params.input.sessionId,
-      sessionConfigId: params.input.sessionConfigId,
-      parentChannelId: params.input.parentChannelId,
-      queue: "prompt",
-      triggerType: params.input.triggerType ?? "active",
-      sessionMode: params.input.sessionMode,
-      modelOverride: params.input.modelOverride,
-      messages: composition.messages,
-      corePrimaryLineage: composition.corePrimaryLineage,
-      raw: {
-        ...(originMessage && params.input.triggerMsgRef
-          ? {
-              authenticatedOrigin: {
-                platform: "discord" as const,
-                userId: originMessage.userId,
-                messageRef: params.input.triggerMsgRef,
+  const continueComposition = composed.match<
+    () => Promise<ResultType<void, RequestCompositionError>>
+  >({
+    err: (error) => async () => Result.err(error),
+    ok: (composition) => async () => {
+      const originMessageResult: ResultType<SurfaceMessage | null, RequestCompositionError> = params
+        .input.triggerMsgRef
+        ? await params.adapter.readMsg(params.input.triggerMsgRef)
+        : Result.ok<SurfaceMessage | null>(null);
+      const continueOrigin = originMessageResult.match<
+        () => Promise<ResultType<void, RequestCompositionError>>
+      >({
+        err: (error) => async () => Result.err(error),
+        ok: (originMessage) => async () => {
+          await publishBusRequest({
+            logger: params.logger,
+            bus: params.bus,
+            input: {
+              requestId: params.input.requestId,
+              sessionId: params.input.sessionId,
+              sessionConfigId: params.input.sessionConfigId,
+              parentChannelId: params.input.parentChannelId,
+              queue: "prompt",
+              triggerType: params.input.triggerType ?? "active",
+              sessionMode: params.input.sessionMode,
+              modelOverride: params.input.modelOverride,
+              messages: composition.messages,
+              corePrimaryLineage: composition.corePrimaryLineage,
+              raw: {
+                ...(originMessage && params.input.triggerMsgRef
+                  ? {
+                      authenticatedOrigin: {
+                        platform: "discord",
+                        userId: originMessage.userId,
+                        messageRef: params.input.triggerMsgRef,
+                      },
+                    }
+                  : {}),
+                triggerType: params.input.triggerType ?? "active",
+                chainMessageIds: composition.chainMessageIds,
+                mergedGroups: composition.mergedGroups,
+                participantUserIds: uniqueNonEmptyStrings(
+                  composition.mergedGroups.map((group) => group.authorId),
+                  { exclude: self.userId },
+                ),
               },
-            }
-          : {}),
-        triggerType: params.input.triggerType ?? "active",
-        chainMessageIds: composition.chainMessageIds,
-        mergedGroups: composition.mergedGroups,
-        participantUserIds: uniqueNonEmptyStrings(
-          composition.mergedGroups.map((group) => group.authorId),
-          { exclude: self.userId },
-        ),
-      },
+            },
+          });
+          return Result.ok(undefined);
+        },
+      });
+      return continueOrigin();
     },
   });
-  return Result.ok(undefined);
+  return continueComposition();
 }
 
 export async function publishSingleMessageToActiveRequest(params: {
@@ -304,7 +317,7 @@ export async function publishSingleMessageToActiveRequest(params: {
     modelOverride?: string;
     transformUserText?: (text: string) => string;
   };
-}) {
+}): Promise<ResultType<void, RequestCompositionError>> {
   const self = await params.adapter.getSelf();
   const discordUserAliasById = buildDiscordUserAliasById(params.cfg);
 
@@ -317,47 +330,56 @@ export async function publishSingleMessageToActiveRequest(params: {
     transcriptStore: params.transcriptStore,
     transformUserText: params.input.transformUserText,
   });
-
-  if (composed.status === "error") return Result.err(composed.error);
-  if (!composed.value) return Result.ok(undefined);
-  const composition = composed.value;
-
-  const surfaceMessageResult = await params.adapter.readMsg(params.input.msgRef);
-  if (surfaceMessageResult.status === "error") return Result.err(surfaceMessageResult.error);
-  const surfaceMessage = surfaceMessageResult.status === "ok" ? surfaceMessageResult.value : null;
-
-  await publishBusRequest({
-    logger: params.logger,
-    bus: params.bus,
-    input: {
-      requestId: params.input.requestId,
-      sessionId: params.input.sessionId,
-      sessionConfigId: params.input.sessionConfigId,
-      parentChannelId: params.input.parentChannelId,
-      queue: params.input.queue,
-      triggerType: "active",
-      sessionMode: params.input.sessionMode,
-      modelOverride: params.input.modelOverride,
-      messages: composition.messages,
-      corePrimaryLineage: composition.corePrimaryLineage,
-      raw: {
-        ...(surfaceMessage
-          ? {
-              authenticatedOrigin: {
-                platform: "discord" as const,
-                userId: surfaceMessage.userId,
-                messageRef: params.input.msgRef,
+  const continueComposition = composed.match<
+    () => Promise<ResultType<void, RequestCompositionError>>
+  >({
+    err: (error) => async () => Result.err(error),
+    ok: (composition) => async () => {
+      if (!composition) return Result.ok(undefined);
+      const surfaceMessageResult = await params.adapter.readMsg(params.input.msgRef);
+      const continueMessage = surfaceMessageResult.match<
+        () => Promise<ResultType<void, RequestCompositionError>>
+      >({
+        err: (error) => async () => Result.err(error),
+        ok: (surfaceMessage) => async () => {
+          await publishBusRequest({
+            logger: params.logger,
+            bus: params.bus,
+            input: {
+              requestId: params.input.requestId,
+              sessionId: params.input.sessionId,
+              sessionConfigId: params.input.sessionConfigId,
+              parentChannelId: params.input.parentChannelId,
+              queue: params.input.queue,
+              triggerType: "active",
+              sessionMode: params.input.sessionMode,
+              modelOverride: params.input.modelOverride,
+              messages: composition.messages,
+              corePrimaryLineage: composition.corePrimaryLineage,
+              raw: {
+                ...(surfaceMessage
+                  ? {
+                      authenticatedOrigin: {
+                        platform: "discord",
+                        userId: surfaceMessage.userId,
+                        messageRef: params.input.msgRef,
+                      },
+                    }
+                  : {}),
+                triggerType: "active",
+                participantUserIds: uniqueNonEmptyStrings([surfaceMessage?.userId], {
+                  exclude: self.userId,
+                }),
               },
-            }
-          : {}),
-        triggerType: "active",
-        participantUserIds: uniqueNonEmptyStrings([surfaceMessage?.userId], {
-          exclude: self.userId,
-        }),
-      },
+            },
+          });
+          return Result.ok(undefined);
+        },
+      });
+      return continueMessage();
     },
   });
-  return Result.ok(undefined);
+  return continueComposition();
 }
 
 export async function publishSingleMessagePrompt(params: {
@@ -377,7 +399,7 @@ export async function publishSingleMessagePrompt(params: {
     transformUserText?: (text: string) => string;
     raw?: Record<string, unknown>;
   };
-}) {
+}): Promise<ResultType<void, RequestCompositionError>> {
   const self = await params.adapter.getSelf();
   const discordUserAliasById = buildDiscordUserAliasById(params.cfg);
 
@@ -390,49 +412,58 @@ export async function publishSingleMessagePrompt(params: {
     transcriptStore: params.transcriptStore,
     transformUserText: params.input.transformUserText,
   });
-
-  if (composed.status === "error") return Result.err(composed.error);
-  if (!composed.value) return Result.ok(undefined);
-  const composition = composed.value;
-
-  const surfaceMessageResult = await params.adapter.readMsg(params.input.msgRef);
-  if (surfaceMessageResult.status === "error") return Result.err(surfaceMessageResult.error);
-  const surfaceMessage = surfaceMessageResult.status === "ok" ? surfaceMessageResult.value : null;
-
-  await publishBusRequest({
-    logger: params.logger,
-    bus: params.bus,
-    input: {
-      requestId: params.input.requestId,
-      sessionId: params.input.sessionId,
-      sessionConfigId: params.input.sessionConfigId,
-      parentChannelId: params.input.parentChannelId,
-      queue: "prompt",
-      triggerType: "active",
-      sessionMode: params.input.sessionMode,
-      modelOverride: params.input.modelOverride,
-      messages: composition.messages,
-      corePrimaryLineage: composition.corePrimaryLineage,
-      raw: {
-        ...(surfaceMessage
-          ? {
-              authenticatedOrigin: {
-                platform: "discord" as const,
-                userId: surfaceMessage.userId,
-                messageRef: params.input.msgRef,
+  const continueComposition = composed.match<
+    () => Promise<ResultType<void, RequestCompositionError>>
+  >({
+    err: (error) => async () => Result.err(error),
+    ok: (composition) => async () => {
+      if (!composition) return Result.ok(undefined);
+      const surfaceMessageResult = await params.adapter.readMsg(params.input.msgRef);
+      const continueMessage = surfaceMessageResult.match<
+        () => Promise<ResultType<void, RequestCompositionError>>
+      >({
+        err: (error) => async () => Result.err(error),
+        ok: (surfaceMessage) => async () => {
+          await publishBusRequest({
+            logger: params.logger,
+            bus: params.bus,
+            input: {
+              requestId: params.input.requestId,
+              sessionId: params.input.sessionId,
+              sessionConfigId: params.input.sessionConfigId,
+              parentChannelId: params.input.parentChannelId,
+              queue: "prompt",
+              triggerType: "active",
+              sessionMode: params.input.sessionMode,
+              modelOverride: params.input.modelOverride,
+              messages: composition.messages,
+              corePrimaryLineage: composition.corePrimaryLineage,
+              raw: {
+                ...(surfaceMessage
+                  ? {
+                      authenticatedOrigin: {
+                        platform: "discord",
+                        userId: surfaceMessage.userId,
+                        messageRef: params.input.msgRef,
+                      },
+                    }
+                  : {}),
+                triggerType: "active",
+                chainMessageIds: [params.input.msgRef.messageId],
+                participantUserIds: uniqueNonEmptyStrings([surfaceMessage?.userId], {
+                  exclude: self.userId,
+                }),
+                ...params.input.raw,
               },
-            }
-          : {}),
-        triggerType: "active",
-        chainMessageIds: [params.input.msgRef.messageId],
-        participantUserIds: uniqueNonEmptyStrings([surfaceMessage?.userId], {
-          exclude: self.userId,
-        }),
-        ...params.input.raw,
-      },
+            },
+          });
+          return Result.ok(undefined);
+        },
+      });
+      return continueMessage();
     },
   });
-  return Result.ok(undefined);
+  return continueComposition();
 }
 
 export async function publishSurfaceOutputReanchor(input: {

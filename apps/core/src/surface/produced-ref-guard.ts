@@ -175,10 +175,13 @@ function requireOperationResult<T>(
   result: SurfaceOperationResult<T>,
   contract: string,
   expectedSessionId?: string,
+  onOk?: (value: T) => void,
 ): void {
-  if (result.status === "error") {
-    requireOperationError(descriptorPlatform, result.error, contract, expectedSessionId);
-  }
+  result.match<() => void>({
+    err: (error) => () =>
+      requireOperationError(descriptorPlatform, error, contract, expectedSessionId),
+    ok: (value) => () => onOk?.(value),
+  })();
 }
 
 function guardOutputStream(
@@ -204,15 +207,14 @@ function guardOutputStream(
         finished,
         "startOutput.stream.finish",
         expectedSessionId,
+        (value) =>
+          requireSurfaceOutputResult(
+            descriptorPlatform,
+            expectedSessionId,
+            value,
+            "startOutput.stream.finish",
+          ),
       );
-      if (finished.status === "ok") {
-        requireSurfaceOutputResult(
-          descriptorPlatform,
-          expectedSessionId,
-          finished.value,
-          "startOutput.stream.finish",
-        );
-      }
       return finished;
     },
     abort: async (reason) => {
@@ -286,16 +288,15 @@ class DescriptorBoundSurfaceAdapter implements SurfaceAdapter {
 
   async listSessions() {
     const listed = await this.adapter.listSessions();
-    requireOperationResult(this.descriptorPlatform, listed, "listSessions");
-    if (listed.status === "ok") {
-      for (const [index, session] of listed.value.entries()) {
+    requireOperationResult(this.descriptorPlatform, listed, "listSessions", undefined, (value) => {
+      for (const [index, session] of value.entries()) {
         requireProducedSessionRef(
           this.descriptorPlatform,
           session.ref,
           `listSessions[${index}].ref`,
         );
       }
-    }
+    });
     return listed;
   }
 
@@ -331,28 +332,32 @@ class DescriptorBoundSurfaceAdapter implements SurfaceAdapter {
       : undefined;
     const started = await this.adapter.startOutput(sessionRef, guardedOpts);
     requireOperationResult(this.descriptorPlatform, started, "startOutput", sessionRef.channelId);
-    if (started.status === "error") return started;
-    return Result.ok(
-      guardOutputStream(this.descriptorPlatform, sessionRef.channelId, started.value),
-    );
+    return started.match<() => Awaited<ReturnType<SurfaceAdapter["startOutput"]>>>({
+      err: (error) => () => Result.err(error),
+      ok: (value) => () =>
+        Result.ok(guardOutputStream(this.descriptorPlatform, sessionRef.channelId, value)),
+    })();
   }
 
   async startTyping(sessionRef: SessionRef) {
     const started = await this.adapter.startTyping(sessionRef);
     requireOperationResult(this.descriptorPlatform, started, "startTyping", sessionRef.channelId);
-    if (started.status === "error") return started;
-    return Result.ok({
-      stop: async () => {
-        const stopped = await started.value.stop();
-        requireOperationResult(
-          this.descriptorPlatform,
-          stopped,
-          "startTyping.stop",
-          sessionRef.channelId,
-        );
-        return stopped;
-      },
-    });
+    return started.match<() => Awaited<ReturnType<SurfaceAdapter["startTyping"]>>>({
+      err: (error) => () => Result.err(error),
+      ok: (value) => () =>
+        Result.ok({
+          stop: async () => {
+            const stopped = await value.stop();
+            requireOperationResult(
+              this.descriptorPlatform,
+              stopped,
+              "startTyping.stop",
+              sessionRef.channelId,
+            );
+            return stopped;
+          },
+        }),
+    })();
   }
 
   async prepareSendMsg(
@@ -376,43 +381,48 @@ class DescriptorBoundSurfaceAdapter implements SurfaceAdapter {
     opts?: Parameters<SurfaceAdapter["sendMsg"]>[2],
   ) {
     const sent = await this.adapter.sendMsg(sessionRef, content, opts);
-    requireOperationResult(this.descriptorPlatform, sent, "sendMsg", sessionRef.channelId);
-    if (sent.status === "ok") {
-      requireProducedMsgRef(
-        this.descriptorPlatform,
-        sent.value,
-        "sendMsg.result",
-        sessionRef.channelId,
-      );
-    }
+    requireOperationResult(
+      this.descriptorPlatform,
+      sent,
+      "sendMsg",
+      sessionRef.channelId,
+      (value) => {
+        requireProducedMsgRef(
+          this.descriptorPlatform,
+          value,
+          "sendMsg.result",
+          sessionRef.channelId,
+        );
+      },
+    );
     return sent;
   }
 
   async readMsg(msgRef: MsgRef) {
     const read = await this.adapter.readMsg(msgRef);
-    requireOperationResult(this.descriptorPlatform, read, "readMsg", msgRef.channelId);
-    if (read.status === "ok" && read.value) {
-      requireProducedMessage(
-        this.descriptorPlatform,
-        read.value,
-        "readMsg.result",
-        msgRef.channelId,
-      );
-    }
+    requireOperationResult(this.descriptorPlatform, read, "readMsg", msgRef.channelId, (value) => {
+      if (!value) return;
+      requireProducedMessage(this.descriptorPlatform, value, "readMsg.result", msgRef.channelId);
+    });
     return read;
   }
 
   async listMsg(sessionRef: SessionRef, opts?: Parameters<SurfaceAdapter["listMsg"]>[1]) {
     const listed = await this.adapter.listMsg(sessionRef, opts);
-    requireOperationResult(this.descriptorPlatform, listed, "listMsg", sessionRef.channelId);
-    if (listed.status === "ok") {
-      requireProducedMessages(
-        this.descriptorPlatform,
-        listed.value,
-        "listMsg.result",
-        sessionRef.channelId,
-      );
-    }
+    requireOperationResult(
+      this.descriptorPlatform,
+      listed,
+      "listMsg",
+      sessionRef.channelId,
+      (value) => {
+        requireProducedMessages(
+          this.descriptorPlatform,
+          value,
+          "listMsg.result",
+          sessionRef.channelId,
+        );
+      },
+    );
     return listed;
   }
 
@@ -430,31 +440,41 @@ class DescriptorBoundSurfaceAdapter implements SurfaceAdapter {
 
   async getReplyContext(msgRef: MsgRef, opts?: Parameters<SurfaceAdapter["getReplyContext"]>[1]) {
     const context = await this.adapter.getReplyContext(msgRef, opts);
-    requireOperationResult(this.descriptorPlatform, context, "getReplyContext", msgRef.channelId);
-    if (context.status === "ok") {
-      requireProducedMessages(
-        this.descriptorPlatform,
-        context.value,
-        "getReplyContext.result",
-        msgRef.channelId,
-      );
-    }
+    requireOperationResult(
+      this.descriptorPlatform,
+      context,
+      "getReplyContext",
+      msgRef.channelId,
+      (value) => {
+        requireProducedMessages(
+          this.descriptorPlatform,
+          value,
+          "getReplyContext.result",
+          msgRef.channelId,
+        );
+      },
+    );
     return context;
   }
 
   async planReplyChain(msgRef: MsgRef, opts?: Parameters<SurfaceAdapter["planReplyChain"]>[1]) {
     const planned = await this.adapter.planReplyChain(msgRef, opts);
-    requireOperationResult(this.descriptorPlatform, planned, "planReplyChain", msgRef.channelId);
-    if (planned.status === "ok") {
-      for (const [index, ref] of planned.value.entries()) {
-        requireProducedMsgRef(
-          this.descriptorPlatform,
-          ref,
-          `planReplyChain.result[${index}]`,
-          msgRef.channelId,
-        );
-      }
-    }
+    requireOperationResult(
+      this.descriptorPlatform,
+      planned,
+      "planReplyChain",
+      msgRef.channelId,
+      (value) => {
+        for (const [index, ref] of value.entries()) {
+          requireProducedMsgRef(
+            this.descriptorPlatform,
+            ref,
+            `planReplyChain.result[${index}]`,
+            msgRef.channelId,
+          );
+        }
+      },
+    );
     return planned;
   }
 
@@ -468,17 +488,17 @@ class DescriptorBoundSurfaceAdapter implements SurfaceAdapter {
       planned,
       "planMergeBlockEndingAt",
       msgRef.channelId,
+      (value) => {
+        for (const [index, ref] of value.entries()) {
+          requireProducedMsgRef(
+            this.descriptorPlatform,
+            ref,
+            `planMergeBlockEndingAt.result[${index}]`,
+            msgRef.channelId,
+          );
+        }
+      },
     );
-    if (planned.status === "ok") {
-      for (const [index, ref] of planned.value.entries()) {
-        requireProducedMsgRef(
-          this.descriptorPlatform,
-          ref,
-          `planMergeBlockEndingAt.result[${index}]`,
-          msgRef.channelId,
-        );
-      }
-    }
     return planned;
   }
 
@@ -513,15 +533,20 @@ class DescriptorBoundSurfaceAdapter implements SurfaceAdapter {
 
   async getUnRead(sessionRef: SessionRef) {
     const unread = await this.adapter.getUnRead(sessionRef);
-    requireOperationResult(this.descriptorPlatform, unread, "getUnRead", sessionRef.channelId);
-    if (unread.status === "ok") {
-      requireProducedMessages(
-        this.descriptorPlatform,
-        unread.value,
-        "getUnRead.result",
-        sessionRef.channelId,
-      );
-    }
+    requireOperationResult(
+      this.descriptorPlatform,
+      unread,
+      "getUnRead",
+      sessionRef.channelId,
+      (value) => {
+        requireProducedMessages(
+          this.descriptorPlatform,
+          value,
+          "getUnRead.result",
+          sessionRef.channelId,
+        );
+      },
+    );
     return unread;
   }
 
@@ -699,52 +724,66 @@ export function createDescriptorBoundWorkflowProgressPort<P extends RegisteredSu
     configurationRevision: port.configurationRevision,
     checkMessage: async (target) => {
       const checked = await port.checkMessage(target);
-      if (checked.status === "error" && checked.error.kind === "failed") {
-        requireWorkflowProgressOperationFailure(
-          descriptorPlatform,
-          "check-message",
-          checked.error.error,
-          "workflowProgress.checkMessage.result",
-        );
-      }
+      checked.match<() => void>({
+        ok: () => () => undefined,
+        err: (error) => () => {
+          if (error.kind === "failed") {
+            requireWorkflowProgressOperationFailure(
+              descriptorPlatform,
+              "check-message",
+              error.error,
+              "workflowProgress.checkMessage.result",
+            );
+          }
+        },
+      })();
       return checked;
     },
     send: async (input) => {
       const sent = await port.send(input);
-      if (sent.status === "ok") {
-        requireProducedMsgRef(
-          descriptorPlatform,
-          sent.value,
-          "workflowProgress.send.result",
-          input.channelId,
-        );
-      } else if (sent.error.kind === "created") {
-        requireProducedMsgRef(
-          descriptorPlatform,
-          sent.error.ref,
-          "workflowProgress.send.error.created",
-          input.channelId,
-        );
-      } else {
-        requireWorkflowProgressOperationFailure(
-          descriptorPlatform,
-          "send",
-          sent.error.error,
-          "workflowProgress.send.result",
-        );
-      }
+      sent.match<() => void>({
+        ok: (value) => () =>
+          requireProducedMsgRef(
+            descriptorPlatform,
+            value,
+            "workflowProgress.send.result",
+            input.channelId,
+          ),
+        err: (error) => () => {
+          if (error.kind === "created") {
+            requireProducedMsgRef(
+              descriptorPlatform,
+              error.ref,
+              "workflowProgress.send.error.created",
+              input.channelId,
+            );
+          } else {
+            requireWorkflowProgressOperationFailure(
+              descriptorPlatform,
+              "send",
+              error.error,
+              "workflowProgress.send.result",
+            );
+          }
+        },
+      })();
       return sent;
     },
     edit: async (target, content) => {
       const edited = await port.edit(target, content);
-      if (edited.status === "error" && edited.error.kind === "failed") {
-        requireWorkflowProgressOperationFailure(
-          descriptorPlatform,
-          "edit",
-          edited.error.error,
-          "workflowProgress.edit.result",
-        );
-      }
+      edited.match<() => void>({
+        ok: () => () => undefined,
+        err: (error) => () => {
+          if (error.kind === "failed") {
+            requireWorkflowProgressOperationFailure(
+              descriptorPlatform,
+              "edit",
+              error.error,
+              "workflowProgress.edit.result",
+            );
+          }
+        },
+      })();
       return edited;
     },
   };
@@ -782,14 +821,16 @@ export function requireSurfaceRelayPolicyRefs<P extends RegisteredSurfacePlatfor
       },
       decodeReanchorTarget: (input) => {
         const decoded = policy.refs.decodeReanchorTarget(input);
-        if (decoded.status === "ok") {
-          requireProducedMsgRef(
-            descriptorPlatform,
-            decoded.value,
-            "relay.refs.decodeReanchorTarget",
-            input.expectedSessionId,
-          );
-        }
+        decoded.match<() => void>({
+          err: () => () => undefined,
+          ok: (value) => () =>
+            requireProducedMsgRef(
+              descriptorPlatform,
+              value,
+              "relay.refs.decodeReanchorTarget",
+              input.expectedSessionId,
+            ),
+        })();
         return decoded;
       },
     },

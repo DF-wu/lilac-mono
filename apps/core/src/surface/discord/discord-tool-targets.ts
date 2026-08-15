@@ -3,7 +3,7 @@ import { Result, type Result as ResultType } from "better-result";
 
 import { hasSurfaceGuildIdResolver, type SurfaceAdapter } from "../adapter";
 import { SurfaceToolTargetInvalid, type SurfaceToolTargetRouting } from "../protocol";
-import type { SurfaceSession } from "../types";
+import type { SessionRefFor, SurfaceSession } from "../types";
 
 function invalid(message: string): ResultType<never, SurfaceToolTargetInvalid> {
   return Result.err(new SurfaceToolTargetInvalid({ message }));
@@ -72,8 +72,11 @@ async function tryGetCachedSession(
   channelId: string,
 ): Promise<SurfaceSession | null> {
   const sessions = await adapter.listSessions();
-  if (sessions.status === "error") return null;
-  for (const session of sessions.value) {
+  const chooseSessions = sessions.match<() => readonly SurfaceSession[]>({
+    ok: (value) => () => value,
+    err: () => () => [],
+  });
+  for (const session of chooseSessions()) {
     if (session.ref.platform === "discord" && session.ref.channelId === channelId) return session;
   }
   return null;
@@ -96,14 +99,13 @@ export function shouldAllowDiscordChannel(input: {
   channelId: string;
   guildId?: string | null;
 }): ResultType<boolean, SurfaceToolTargetInvalid> {
-  const discord = mustDiscordSurfaceConfig(input.cfg);
-  if (discord.status === "error") return discord;
-
-  const allowedChannelIds = new Set(discord.value.allowedChannelIds);
-  const allowedGuildIds = new Set(discord.value.allowedGuildIds);
-  if (allowedChannelIds.size === 0 && allowedGuildIds.size === 0) return Result.ok(false);
-  if (allowedChannelIds.has(input.channelId)) return Result.ok(true);
-  return Result.ok(Boolean(input.guildId && allowedGuildIds.has(input.guildId)));
+  return mustDiscordSurfaceConfig(input.cfg).map((discord) => {
+    const allowedChannelIds = new Set(discord.allowedChannelIds);
+    const allowedGuildIds = new Set(discord.allowedGuildIds);
+    if (allowedChannelIds.size === 0 && allowedGuildIds.size === 0) return false;
+    if (allowedChannelIds.has(input.channelId)) return true;
+    return Boolean(input.guildId && allowedGuildIds.has(input.guildId));
+  });
 }
 
 export const discordToolTargetRouting = {
@@ -144,24 +146,28 @@ export const discordToolTargetRouting = {
   }),
   resolveSession: async ({ selector, adapter, getConfig }) => {
     const config = await getConfig();
-    const channelId = decodeDiscordSessionId({ sessionId: selector, cfg: config });
-    if (channelId.status === "error") return channelId;
-    const guildId = await resolveGuildIdForChannel({ adapter, channelId: channelId.value });
-    const allowed = shouldAllowDiscordChannel({
-      cfg: config,
-      channelId: channelId.value,
-      guildId,
-    });
-    if (allowed.status === "error") return allowed;
-    if (!allowed.value) return invalid(`Not allowed: channelId '${channelId.value}'`);
-    return Result.ok({
-      sessionRef: {
-        platform: "discord",
-        channelId: channelId.value,
-        guildId: guildId ?? undefined,
-        parentChannelId: undefined,
+    const decoded = decodeDiscordSessionId({ sessionId: selector, cfg: config });
+    const continueDecoded = decoded.match({
+      err: (error) => async () => Result.err(error),
+      ok: (channelId) => async () => {
+        const guildId = await resolveGuildIdForChannel({ adapter, channelId });
+        const allowedResult = shouldAllowDiscordChannel({ cfg: config, channelId, guildId });
+        const continueAllowed = allowedResult.match({
+          err: (error) => () => Result.err(error),
+          ok: (allowed) => () => {
+            if (!allowed) return invalid(`Not allowed: channelId '${channelId}'`);
+            const sessionRef: SessionRefFor<"discord"> = {
+              platform: "discord",
+              channelId,
+              guildId: guildId ?? undefined,
+              parentChannelId: undefined,
+            };
+            return Result.ok({ sessionRef, config });
+          },
+        });
+        return continueAllowed();
       },
-      config,
     });
+    return await continueDecoded();
   },
 } satisfies SurfaceToolTargetRouting<"discord">;

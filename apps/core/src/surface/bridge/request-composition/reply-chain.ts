@@ -1,4 +1,4 @@
-import { Result } from "better-result";
+import { Result, type Result as ResultType } from "better-result";
 
 import type { MsgRef, SurfaceMessage } from "../../types";
 
@@ -12,6 +12,17 @@ import { splitByDiscordWindowOldestToNewest } from "../../discord/merge-window";
 import type { MergedChunk, ReplyChainMessage } from "./types";
 
 const DEFAULT_MENTION_BLOCK_LIMIT = 50;
+
+function continueResult<T, E, ROk, RErr>(
+  result: ResultType<T, E>,
+  branches: { ok: (value: T) => ROk; err: (error: E) => RErr },
+): ROk | RErr {
+  const continuation = result.match<() => ROk | RErr>({
+    ok: (value) => () => branches.ok(value),
+    err: (error) => () => branches.err(error),
+  });
+  return continuation();
+}
 
 function compareDiscordSnowflakeLike(a: string, b: string): number {
   try {
@@ -91,7 +102,7 @@ async function mapWithConcurrency<T, R>(input: {
   const { items, run } = input;
   const concurrency = Math.max(1, Math.floor(input.concurrency));
 
-  const out = Array.from({ length: items.length }) as R[];
+  const out: R[] = [];
   let nextIndex = 0;
 
   const workers = Array.from({ length: Math.min(concurrency, items.length) }, async () => {
@@ -124,22 +135,22 @@ async function readMessagesByRefs(input: {
     },
   });
 
-  const byKey = new Map<string, SurfaceMessage>();
-  for (const pair of pairs) {
-    if (pair.msg.status === "error") return Result.err(pair.msg.error);
-    if (!pair.msg.value) continue;
-    const key = `${pair.msg.value.ref.channelId}:${pair.msg.value.ref.messageId}`;
-    byKey.set(key, pair.msg.value);
-  }
+  return Result.all(pairs.map((pair) => pair.msg)).map((messages) => {
+    const byKey = new Map<string, SurfaceMessage>();
+    for (const msg of messages) {
+      if (!msg) continue;
+      const key = `${msg.ref.channelId}:${msg.ref.messageId}`;
+      byKey.set(key, msg);
+    }
 
-  const out: SurfaceMessage[] = [];
-  for (const ref of refs) {
-    const key = `${ref.channelId}:${ref.messageId}`;
-    const msg = byKey.get(key);
-    if (msg) out.push(msg);
-  }
-
-  return Result.ok(out);
+    const out: SurfaceMessage[] = [];
+    for (const ref of refs) {
+      const key = `${ref.channelId}:${ref.messageId}`;
+      const msg = byKey.get(key);
+      if (msg) out.push(msg);
+    }
+    return out;
+  });
 }
 
 export async function resolveMergeBlockEndingAt(
@@ -150,9 +161,8 @@ export async function resolveMergeBlockEndingAt(
   const limit = opts?.limit ?? DEFAULT_MENTION_BLOCK_LIMIT;
 
   const planned = await adapter.planMergeBlockEndingAt(triggerMsg.ref, { lookbackLimit: limit });
-  if (planned.status === "ok") {
-    const plannedRefs = planned.value;
-
+  const plannedRefs = continueResult(planned, { ok: (value) => value, err: () => [] });
+  if (plannedRefs.length > 0) {
     const refs = plannedRefs.filter((r) => r.channelId === triggerMsg.ref.channelId);
     if (refs.length > 0) {
       const listed = await readMessagesByRefs({
@@ -160,8 +170,8 @@ export async function resolveMergeBlockEndingAt(
         refs,
         concurrency: 8,
       });
-      if (listed.status === "error") return listed;
-      const list = listed.value;
+      const list = continueResult(listed, { ok: (value) => value, err: () => null });
+      if (list === null) return listed;
 
       const plannedRefKeys = new Set(refs.map((r) => `${r.channelId}:${r.messageId}`));
       const resolvedRefKeys = new Set(list.map((m) => `${m.ref.channelId}:${m.ref.messageId}`));
@@ -185,8 +195,7 @@ export async function resolveMergeBlockEndingAt(
   }
 
   const context = await adapter.getReplyContext(triggerMsg.ref, { limit });
-  if (context.status === "error") return Result.ok([triggerMsg]);
-  const ctx = context.value;
+  const ctx = continueResult(context, { ok: (value) => value, err: () => [triggerMsg] });
 
   const list = ctx.length > 0 ? ctx.slice() : [triggerMsg];
 
@@ -244,9 +253,8 @@ export async function fetchReplyChainFrom(
   const maxGroupCount = opts.maxDepth ?? 20;
 
   const planned = await adapter.planReplyChain(opts.startMsgRef, { maxDepth: maxGroupCount });
-  if (planned.status === "ok") {
-    const plannedRefs = planned.value;
-
+  const plannedRefs = continueResult(planned, { ok: (value) => value, err: () => [] });
+  if (plannedRefs.length > 0) {
     const inSessionRefs: MsgRef[] = [];
     for (const ref of plannedRefs) {
       if (ref.channelId !== opts.trigger.msgRef.channelId) break;
@@ -261,7 +269,10 @@ export async function fetchReplyChainFrom(
           const plannedBlock = await adapter.planMergeBlockEndingAt(cursorRef, {
             lookbackLimit: DEFAULT_MENTION_BLOCK_LIMIT,
           });
-          const blockRefs = plannedBlock.status === "ok" ? plannedBlock.value : [cursorRef];
+          const blockRefs = continueResult(plannedBlock, {
+            ok: (value) => value,
+            err: () => [cursorRef],
+          });
 
           const inChannelBlockRefs = blockRefs.filter(
             (ref) => ref.channelId === opts.trigger.msgRef.channelId,
@@ -274,81 +285,99 @@ export async function fetchReplyChainFrom(
             refs: refsToRead,
             concurrency: 8,
           });
-          if (messages.status === "error") return messages;
+          return continueResult(messages, {
+            err: (error) => Promise.resolve(Result.err(error)),
+            ok: async (messageValues) => {
+              const plannedRefKeys = new Set(
+                refsToRead.map((r) => `${r.channelId}:${r.messageId}`),
+              );
+              const resolvedRefKeys = new Set(
+                messageValues.map((m) => `${m.ref.channelId}:${m.ref.messageId}`),
+              );
+              const allResolved =
+                plannedRefKeys.size === resolvedRefKeys.size &&
+                [...plannedRefKeys].every((key) => resolvedRefKeys.has(key));
 
-          const plannedRefKeys = new Set(refsToRead.map((r) => `${r.channelId}:${r.messageId}`));
-          const resolvedRefKeys = new Set(
-            messages.value.map((m) => `${m.ref.channelId}:${m.ref.messageId}`),
-          );
-          const allResolved =
-            plannedRefKeys.size === resolvedRefKeys.size &&
-            [...plannedRefKeys].every((key) => resolvedRefKeys.has(key));
-
-          if (allResolved && messages.value.length > 0) return messages;
-
-          const cursor = await adapter.readMsg(cursorRef);
-          if (cursor.status === "error") return Result.err(cursor.error);
-          if (!cursor.value) return Result.ok([]);
-
-          return await resolveMergeBlockEndingAt(adapter, cursor.value);
+              if (allResolved && messageValues.length > 0) return Result.ok(messageValues);
+              const cursorResult = await adapter.readMsg(cursorRef);
+              const continueCursor = cursorResult.match<
+                () => Promise<SurfaceOperationResult<SurfaceMessage[]>>
+              >({
+                err: (error) => async () => Result.err(error),
+                ok: (cursor) => () =>
+                  cursor
+                    ? resolveMergeBlockEndingAt(adapter, cursor)
+                    : Promise.resolve(Result.ok([])),
+              });
+              return continueCursor();
+            },
+          });
         },
       });
 
-      for (const group of groups) {
-        if (group.status === "error") return Result.err(group.error);
-      }
-      const flattened = groups.flatMap((group) => (group.status === "ok" ? group.value : []));
-      if (flattened.length > 0) {
-        flattened.sort((a, b) => {
-          if (a.ts !== b.ts) return a.ts - b.ts;
-          return compareDiscordSnowflakeLike(a.ref.messageId, b.ref.messageId);
-        });
-
-        return Result.ok(dedupeByMessageId(flattened.map((m) => toReplyChainMessage(m))));
-      }
+      const plannedOutcome = continueResult(Result.all(groups), {
+        err: (error) => Result.err(error),
+        ok: (resolvedGroups) => {
+          const flattened = resolvedGroups.flat();
+          if (flattened.length === 0) return null;
+          flattened.sort((a, b) => {
+            if (a.ts !== b.ts) return a.ts - b.ts;
+            return compareDiscordSnowflakeLike(a.ref.messageId, b.ref.messageId);
+          });
+          return Result.ok(dedupeByMessageId(flattened.map((m) => toReplyChainMessage(m))));
+        },
+      });
+      if (plannedOutcome) return plannedOutcome;
     }
   }
 
   const groupsNewestToOldest: ReplyChainMessage[][] = [];
   const seenMessageIds = new Set<string>();
-
-  const initial = await adapter.readMsg(opts.startMsgRef);
-  if (initial.status === "error") return Result.err(initial.error);
-  let cur = initial.value;
-  if (!cur) return Result.ok([]);
-
-  for (let depth = 0; depth < maxGroupCount && cur; depth++) {
-    const cursor = cur;
-
-    if (seenMessageIds.has(cursor.ref.messageId)) break;
-
+  const finish = (): SurfaceOperationResult<ReplyChainMessage[]> =>
+    Result.ok(dedupeByMessageId(groupsNewestToOldest.slice().reverse().flat()));
+  const walk = async (
+    cursor: SurfaceMessage,
+    depth: number,
+  ): Promise<SurfaceOperationResult<ReplyChainMessage[]>> => {
+    if (depth >= maxGroupCount || seenMessageIds.has(cursor.ref.messageId)) return finish();
     const groupResult = await resolveMergeBlockEndingAt(adapter, cursor);
-    if (groupResult.status === "error") return Result.err(groupResult.error);
-    const group = groupResult.value;
-    if (group.length === 0) break;
+    const continueGroup = groupResult.match<
+      () => Promise<SurfaceOperationResult<ReplyChainMessage[]>>
+    >({
+      err: (error) => async () => Result.err(error),
+      ok: (group) => async () => {
+        const first = group[0];
+        if (!first) return finish();
+        for (const message of group) seenMessageIds.add(message.ref.messageId);
+        groupsNewestToOldest.push(group.map((message) => toReplyChainMessage(message)));
 
-    for (const m of group) {
-      seenMessageIds.add(m.ref.messageId);
-    }
+        const ref = toReplyChainMessage(first).replyReference;
+        if (!ref.messageId) return finish();
+        if (ref.channelId && ref.channelId !== opts.trigger.msgRef.channelId) return finish();
 
-    groupsNewestToOldest.push(group.map((m) => toReplyChainMessage(m)));
-
-    const ref = toReplyChainMessage(group[0]!).replyReference;
-    if (!ref.messageId) break;
-
-    // Stop if the reference crosses sessions.
-    if (ref.channelId && ref.channelId !== opts.trigger.msgRef.channelId) break;
-
-    const next = await adapter.readMsg({
-      platform: opts.platform,
-      channelId: opts.trigger.msgRef.channelId,
-      messageId: ref.messageId,
+        const next = await adapter.readMsg({
+          platform: opts.platform,
+          channelId: opts.trigger.msgRef.channelId,
+          messageId: ref.messageId,
+        });
+        const continueNext = next.match<() => Promise<SurfaceOperationResult<ReplyChainMessage[]>>>(
+          {
+            err: (error) => async () => Result.err(error),
+            ok: (value) => () => (value ? walk(value, depth + 1) : Promise.resolve(finish())),
+          },
+        );
+        return continueNext();
+      },
     });
-    if (next.status === "error") return Result.err(next.error);
-    cur = next.value;
-  }
+    return continueGroup();
+  };
 
-  return Result.ok(dedupeByMessageId(groupsNewestToOldest.slice().reverse().flat()));
+  const start = await adapter.readMsg(opts.startMsgRef);
+  const continueStart = start.match<() => Promise<SurfaceOperationResult<ReplyChainMessage[]>>>({
+    err: (error) => async () => Result.err(error),
+    ok: (value) => () => (value ? walk(value, 0) : Promise.resolve(Result.ok([]))),
+  });
+  return continueStart();
 }
 
 export async function fetchMentionThreadContext(
@@ -362,35 +391,36 @@ export async function fetchMentionThreadContext(
   },
 ): Promise<SurfaceOperationResult<ReplyChainMessage[]>> {
   const blockResult = await resolveMergeBlockEndingAt(adapter, params.triggerMsg);
-  if (blockResult.status === "error") return Result.err(blockResult.error);
-  const block = blockResult.value;
-  const anchor = findEarliestReplyAnchor(block);
-
-  const startMsgRef = anchor?.ref ?? params.triggerMsg.ref;
-
-  const chain = await fetchReplyChainFrom(adapter, {
-    platform: params.platform,
-    botUserId: params.botUserId,
-    botName: params.botName,
-    trigger: { type: "mention", msgRef: params.triggerMsg.ref },
-    startMsgRef,
-    maxDepth: params.maxDepth,
+  const continueBlock = blockResult.match<
+    () => Promise<SurfaceOperationResult<ReplyChainMessage[]>>
+  >({
+    err: (error) => async () => Result.err(error),
+    ok: (block) => async () => {
+      const anchor = findEarliestReplyAnchor(block);
+      const startMsgRef = anchor?.ref ?? params.triggerMsg.ref;
+      const chainResult = await fetchReplyChainFrom(adapter, {
+        platform: params.platform,
+        botUserId: params.botUserId,
+        botName: params.botName,
+        trigger: { type: "mention", msgRef: params.triggerMsg.ref },
+        startMsgRef,
+        maxDepth: params.maxDepth,
+      });
+      return continueResult(chainResult, {
+        err: (error) => Result.err(error),
+        ok: (chain) => {
+          const blockMessages = block.map((message) => toReplyChainMessage(message));
+          const combined = dedupeByMessageId([...chain, ...blockMessages]);
+          combined.sort((a, b) => {
+            if (a.ts !== b.ts) return a.ts - b.ts;
+            return a.messageId.localeCompare(b.messageId);
+          });
+          return Result.ok(combined);
+        },
+      });
+    },
   });
-  if (chain.status === "error") return Result.err(chain.error);
-
-  const blockMessages = block.map((m) => {
-    return toReplyChainMessage(m);
-  });
-
-  const combined = dedupeByMessageId([...chain.value, ...blockMessages]);
-
-  combined.sort((a, b) => {
-    if (a.ts !== b.ts) return a.ts - b.ts;
-    // Stable-ish tie-breaker.
-    return a.messageId.localeCompare(b.messageId);
-  });
-
-  return Result.ok(combined);
+  return continueBlock();
 }
 
 export function mergeChainByDiscordWindow(

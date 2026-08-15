@@ -83,13 +83,15 @@ const ACTIVE_REQUEST_READ_SCOPE = Symbol("active-request-read-scope");
 
 function createFreshOnlyLineage(reason: string, currentCanonicalStart = 0): CorePrimaryLineageV1 {
   const created = createCorePrimaryLineageFreshOnlyV1(reason, currentCanonicalStart);
-  if (created.status === "ok") return created.value;
-  return {
-    state: "fresh-only",
-    lineageVersion: 1,
-    currentCanonicalStart: 0,
-    reason: "lineage-fallback-construction-failed",
-  };
+  return created.match<CorePrimaryLineageV1>({
+    ok: (value) => value,
+    err: () => ({
+      state: "fresh-only",
+      lineageVersion: 1,
+      currentCanonicalStart: 0,
+      reason: "lineage-fallback-construction-failed",
+    }),
+  });
 }
 
 type ProjectionCapableStore = TranscriptStore &
@@ -206,9 +208,8 @@ function collectStoredBoundaryBreaks(input: {
     const stored = input.transcriptStore?.getLatestCoreSurfaceSegment?.(
       surfaceProjectionKey(input.sessionId, message.messageId),
     );
-    if (stored?.status === "ok" && stored.value) {
-      return `${stored.value.requestId}:${stored.value.segmentIndex}`;
-    }
+    const storedValue = stored?.match({ ok: (value) => value, err: () => null });
+    if (storedValue) return `${storedValue.requestId}:${storedValue.segmentIndex}`;
     const admittedIds = storedProjectionSegmentIds(
       input.projections.get(message.messageId) ?? null,
     );
@@ -233,15 +234,14 @@ function appendPersistedSyntheticSuffix(input: {
   const manifest = input.transcriptStore?.getCorePrimaryLineageManifest?.({
     requestId: input.requestId,
   });
+  if (!manifest) return true;
+  const manifestValue = manifest.match({ ok: (value) => value, err: () => null });
   if (
-    !manifest ||
-    manifest.status === "error" ||
-    !manifest.value ||
-    !manifest.value.segments.some((segment) => segment.atoms[0]?.kind === "synthetic")
+    !manifestValue ||
+    !manifestValue.segments.some((segment) => segment.atoms[0]?.kind === "synthetic")
   ) {
     return true;
   }
-  const manifestValue = manifest.value;
   if (input.segmentInputs.length > manifestValue.segments.length) return false;
 
   const prefixMatches = input.segmentInputs.every((segment, index) => {
@@ -348,7 +348,10 @@ async function composeSelectedDiscordChain(input: {
       const stored = projectionStore?.getCoreSurfaceProjection(
         surfaceProjectionKey(input.sessionId, message.messageId),
       );
-      projections.set(message.messageId, stored?.status === "ok" ? stored.value : null);
+      projections.set(
+        message.messageId,
+        stored?.match({ ok: (value) => value, err: () => null }) ?? null,
+      );
     }
     const immutableChain = input.chain.map((message) => {
       const projection = projections.get(message.messageId) ?? null;
@@ -389,9 +392,12 @@ async function composeSelectedDiscordChain(input: {
       adapter: input.adapter,
       refs: unknownUserRefs,
     });
-    if (reactionsByMessageId.status === "error") {
-      return Result.err(reactionsByMessageId.error);
-    }
+    const reactionsError = reactionsByMessageId.match({ ok: () => null, err: (error) => error });
+    if (reactionsError) return Result.err(reactionsError);
+    const reactionValues = reactionsByMessageId.match({
+      ok: (value) => value,
+      err: () => new Map<string, readonly string[]>(),
+    });
     const projectedByMessageId = new Map<string, readonly ModelMessage[]>();
     const candidateOwnedBlobsByMessageId = new Map<string, readonly CoreOwnedBlobReference[]>();
     let lineageComplete = Boolean(projectionStore);
@@ -433,7 +439,7 @@ async function composeSelectedDiscordChain(input: {
           message: source,
           isBot: source.authorId === input.botUserId,
           sessionId: input.sessionId,
-          reactions: reactionsByMessageId.value.get(messageId) ?? [],
+          reactions: reactionValues.get(messageId) ?? [],
           discordUserAliasById: input.discordUserAliasById,
           attachmentState,
         });
@@ -482,18 +488,19 @@ async function composeSelectedDiscordChain(input: {
             authorId: source.authorId,
             authorName: source.authorName,
             messageTs: source.ts,
-            reactions: [...(reactionsByMessageId.value.get(messageId) ?? [])],
+            reactions: [...(reactionValues.get(messageId) ?? [])],
             attachments: source.attachments.map((attachment) => ({ ...attachment })),
             segmentMessageIds: [...segmentMessageIds],
             segmentDigest: hashCanonicalMessagesV1(segmentMessages).hash,
           },
           ownedBlobs: candidateOwnedBlobsByMessageId.get(messageId) ?? [],
         });
-        if (admitted.status === "error") {
+        const admittedValue = admitted.match({ ok: (value) => value, err: () => null });
+        if (!admittedValue) {
           lineageComplete = false;
           continue;
         }
-        projectedByMessageId.set(messageId, admitted.value.canonicalMessages);
+        projectedByMessageId.set(messageId, admittedValue.canonicalMessages);
       }
     }
 
@@ -553,7 +560,7 @@ async function composeSelectedDiscordChain(input: {
         const metadata = input.transcriptStore?.getCoreRequestAtomMetadata?.({
           requestId: snapshot.requestId,
         });
-        const metadataValue = metadata?.status === "ok" ? metadata.value : null;
+        const metadataValue = metadata?.match({ ok: (value) => value, err: () => null }) ?? null;
         if (!metadataValue) lineageComplete = false;
         const requestAtom: CoreLineageAtomV1 = {
           kind: "request",
@@ -608,10 +615,10 @@ async function composeSelectedDiscordChain(input: {
     let corePrimaryLineage: CorePrimaryLineageV1;
     if (lineageComplete && segmentInputs.length > 0 && !hasEmptyLineageSegment) {
       const built = buildCoreLineageManifestV1(segmentInputs, { currentSegmentIndex });
-      corePrimaryLineage =
-        built.status === "ok"
-          ? built.value
-          : createFreshOnlyLineage("lineage-manifest-build-failed", currentCanonicalStart);
+      corePrimaryLineage = built.match({
+        ok: (value) => value,
+        err: () => createFreshOnlyLineage("lineage-manifest-build-failed", currentCanonicalStart),
+      });
     } else {
       let reason: Parameters<typeof createCorePrimaryLineageFreshOnlyV1>[0];
       if (hasEmptyLineageSegment) {
@@ -660,7 +667,7 @@ function resolveTranscriptSnapshot(input: {
     channelId: input.channelId,
     messageId: input.messageId,
   });
-  return transcript.status === "ok" ? transcript.value : null;
+  return transcript.match({ ok: (value) => value, err: () => null });
 }
 
 function shouldIncludeInModelContext(msg: SurfaceMessage): boolean {
@@ -821,8 +828,10 @@ async function listRecentMessagesEndingAt(params: {
         limit: Math.min(100, remaining, target - fetchedPreviousMessages),
         beforeMessageId: cursor,
       });
-      if (page.status === "error") return page;
-      if (page.value.length === 0) {
+      const pageError = page.match({ ok: () => null, err: (error) => error });
+      if (pageError) return Result.err(pageError);
+      const pageValues = page.match({ ok: (value) => value, err: () => [] });
+      if (pageValues.length === 0) {
         exhausted = true;
         cursor = undefined;
         break;
@@ -831,7 +840,7 @@ async function listRecentMessagesEndingAt(params: {
       let oldestInPage: SurfaceMessage | null = null;
       let addedAny = false;
 
-      for (const message of page.value) {
+      for (const message of pageValues) {
         if (message.session.channelId !== params.sessionId) continue;
         if (seen.has(message.ref.messageId)) continue;
         seen.add(message.ref.messageId);
@@ -1109,12 +1118,14 @@ async function findLastDiscordSessionDividerBefore(params: {
       limit: Math.min(pageSize, maxMessages - scanned),
       beforeMessageId: cursor,
     });
-    if (page.status === "error") return Result.err(page.error);
-    if (page.value.length === 0) return Result.ok(null);
-    scanned += page.value.length;
+    const pageError = page.match({ ok: () => null, err: (error) => error });
+    if (pageError) return Result.err(pageError);
+    const pageValues = page.match({ ok: (value) => value, err: () => [] });
+    if (pageValues.length === 0) return Result.ok(null);
+    scanned += pageValues.length;
 
     let newestDivider: { ts: number; messageId: string } | null = null;
-    for (const message of page.value) {
+    for (const message of pageValues) {
       if (!isDiscordSessionDividerSurfaceMessage(message, params.botUserId)) continue;
       const position = { ts: message.ts, messageId: message.ref.messageId };
       if (!newestDivider || compareDiscordMsgPosition(newestDivider, position) < 0) {
@@ -1124,13 +1135,13 @@ async function findLastDiscordSessionDividerBefore(params: {
     if (newestDivider) return Result.ok(newestDivider);
     if (
       params.stopAtMessageId &&
-      page.value.some((message) => message.ref.messageId === params.stopAtMessageId)
+      pageValues.some((message) => message.ref.messageId === params.stopAtMessageId)
     ) {
       return Result.ok(null);
     }
 
-    let oldest = page.value[0]!;
-    for (const message of page.value) {
+    let oldest = pageValues[0]!;
+    for (const message of pageValues) {
       if (
         compareDiscordMsgPosition(
           { ts: message.ts, messageId: message.ref.messageId },
@@ -1190,22 +1201,7 @@ async function getReactionsByMessageId(input: {
   });
 
   for (const row of rows) {
-    if (row.reactions.status === "error") {
-      switch (row.reactions.error._tag) {
-        case "SurfaceOperationUnsupported":
-        case "SurfacePlatformMismatch":
-        case "SurfaceSessionMismatch":
-        case "SurfaceInvalidInput":
-        case "SurfaceOperationPartiallyCompleted":
-        case "SurfaceMessageNotFound":
-        case "SurfacePermissionDenied":
-        case "SurfaceRateLimited":
-        case "SurfaceUnavailable":
-          out.set(row.messageId, []);
-          continue;
-      }
-    }
-    out.set(row.messageId, row.reactions.value);
+    out.set(row.messageId, row.reactions.match({ ok: (value) => value, err: () => [] }));
   }
 
   return Result.ok(out);
@@ -1230,8 +1226,10 @@ export async function composeRequestMessages(
   // Step 1: fetch reply chain from the adapter store / platform.
   // Mention triggers get merge-window parity even if messages are not linked via reply references.
   const triggerMsg = await adapter.readMsg(opts.trigger.msgRef);
-  if (triggerMsg.status === "error") return Result.err(triggerMsg.error);
-  if (!triggerMsg.value) {
+  const triggerError = triggerMsg.match({ ok: () => null, err: (error) => error });
+  if (triggerError) return Result.err(triggerError);
+  const triggerValue = triggerMsg.match({ ok: (value) => value, err: () => null });
+  if (!triggerValue) {
     return Result.ok({
       messages: [],
       chainMessageIds: [],
@@ -1246,7 +1244,7 @@ export async function composeRequestMessages(
           platform: opts.platform,
           botUserId: opts.botUserId,
           botName: opts.botName,
-          triggerMsg: triggerMsg.value,
+          triggerMsg: triggerValue,
           maxDepth: opts.maxDepth,
         })
       : await fetchReplyChainFrom(adapter, {
@@ -1257,8 +1255,9 @@ export async function composeRequestMessages(
           startMsgRef: opts.trigger.msgRef,
           maxDepth: opts.maxDepth,
         });
-  if (chainResult.status === "error") return Result.err(chainResult.error);
-  const chain = chainResult.value;
+  const chainError = chainResult.match({ ok: () => null, err: (error) => error });
+  if (chainError) return Result.err(chainError);
+  const chain = chainResult.match({ ok: (value) => value, err: () => [] });
 
   const filteredChain = chain.filter((m) => {
     const isChat = m.isChat;
@@ -1307,14 +1306,12 @@ export async function composeRequestMessages(
     transcriptStore: opts.transcriptStore,
     discordUserAliasById: opts.discordUserAliasById,
   });
-
-  if (composed.status === "error") return Result.err(composed.error);
-  return Result.ok({
-    messages: composed.value.messages,
+  return composed.map((value) => ({
+    messages: value.messages,
     chainMessageIds: transformedChain.map((m) => m.messageId),
-    mergedGroups: composed.value.mergedGroups,
-    corePrimaryLineage: composed.value.corePrimaryLineage,
-  });
+    mergedGroups: value.mergedGroups,
+    corePrimaryLineage: value.corePrimaryLineage,
+  }));
 }
 
 export async function composeRecentChannelMessages(
@@ -1335,15 +1332,17 @@ export async function composeRecentChannelMessages(
   // A reply is a strong "continue" signal.
   if (opts.triggerMsgRef && opts.triggerType === "mention") {
     const triggerMsgResult = await adapter.readMsg(opts.triggerMsgRef);
-    if (triggerMsgResult.status === "error") return Result.err(triggerMsgResult.error);
-    const triggerMsg = triggerMsgResult.value;
+    const triggerError = triggerMsgResult.match({ ok: () => null, err: (error) => error });
+    if (triggerError) return Result.err(triggerError);
+    const triggerMsg = triggerMsgResult.match({ ok: (value) => value, err: () => null });
     if (triggerMsg) {
       // "Merge block" = a user's short burst of consecutive messages.
       // If ANY message in the burst is a reply, treat the entire burst as a
       // continuation of that reply thread.
       const blockResult = await resolveMergeBlockEndingAt(adapter, triggerMsg);
-      if (blockResult.status === "error") return Result.err(blockResult.error);
-      const block = blockResult.value;
+      const blockError = blockResult.match({ ok: () => null, err: (error) => error });
+      if (blockError) return Result.err(blockError);
+      const block = blockResult.match({ ok: (value) => value, err: () => [] });
       const anchor = findEarliestReplyAnchor(block);
       if (anchor) {
         const anchoredResult = await fetchMentionThreadContext(adapter, {
@@ -1352,8 +1351,9 @@ export async function composeRecentChannelMessages(
           botName: opts.botName,
           triggerMsg,
         });
-        if (anchoredResult.status === "error") return Result.err(anchoredResult.error);
-        const anchored = anchoredResult.value;
+        const anchoredError = anchoredResult.match({ ok: () => null, err: (error) => error });
+        if (anchoredError) return Result.err(anchoredError);
+        const anchored = anchoredResult.match({ ok: (value) => value, err: () => [] });
 
         const oldestAnchoredMessageId = anchored[0]?.messageId;
         const dividerResult = oldestAnchoredMessageId
@@ -1365,7 +1365,7 @@ export async function composeRecentChannelMessages(
               stopAtMessageId: oldestAnchoredMessageId,
             })
           : Result.ok(null);
-        const divider = dividerResult.status === "ok" ? dividerResult.value : null;
+        const divider = dividerResult.match({ ok: (value) => value, err: () => null });
         const anchoredAfterDivider = divider
           ? anchored.filter(
               (message) =>
@@ -1415,14 +1415,12 @@ export async function composeRecentChannelMessages(
           transcriptStore: opts.transcriptStore,
           discordUserAliasById: opts.discordUserAliasById,
         });
-
-        if (composed.status === "error") return Result.err(composed.error);
-        return Result.ok({
-          messages: composed.value.messages,
+        return composed.map((value) => ({
+          messages: value.messages,
           chainMessageIds: transformedAnchored.map((m) => m.messageId),
-          mergedGroups: composed.value.mergedGroups,
-          corePrimaryLineage: composed.value.corePrimaryLineage,
-        });
+          mergedGroups: value.mergedGroups,
+          corePrimaryLineage: value.corePrimaryLineage,
+        }));
       }
     }
   }
@@ -1442,8 +1440,9 @@ export async function composeRecentChannelMessages(
 
   if (shouldApplyActiveBurstRules && opts.triggerMsgRef) {
     const triggerMsgResult = await adapter.readMsg(opts.triggerMsgRef);
-    if (triggerMsgResult.status === "error") return Result.err(triggerMsgResult.error);
-    const triggerMsg = triggerMsgResult.value;
+    const triggerError = triggerMsgResult.match({ ok: () => null, err: (error) => error });
+    if (triggerError) return Result.err(triggerError);
+    const triggerMsg = triggerMsgResult.match({ ok: (value) => value, err: () => null });
     if (triggerMsg) {
       const recent = await listRecentMessagesEndingAt({
         adapter,
@@ -1478,24 +1477,26 @@ export async function composeRecentChannelMessages(
           });
         },
       });
-      if (recent.status === "error") return Result.err(recent.error);
-      orderedList = recent.value;
+      const recentError = recent.match({ ok: () => null, err: (error) => error });
+      if (recentError) return Result.err(recentError);
+      orderedList = recent.match({ ok: (value) => value, err: () => [] });
     } else {
       orderedList = [];
     }
   } else {
     const listed = await adapter.listMsg(sessionRef, { limit: opts.limit });
-    if (listed.status === "error") return Result.err(listed.error);
-    orderedList = [...listed.value];
+    const listError = listed.match({ ok: () => null, err: (error) => error });
+    if (listError) return Result.err(listError);
+    orderedList = [...listed.match({ ok: (value) => value, err: () => [] })];
 
     if (opts.triggerMsgRef) {
       const exists = orderedList.some((m) => m.ref.messageId === opts.triggerMsgRef!.messageId);
       if (!exists) {
         const fetchedTrigger = await adapter.readMsg(opts.triggerMsgRef);
-        if (fetchedTrigger.status === "error") return Result.err(fetchedTrigger.error);
-        if (fetchedTrigger.value) {
-          orderedList.push(fetchedTrigger.value);
-        }
+        const fetchError = fetchedTrigger.match({ ok: () => null, err: (error) => error });
+        if (fetchError) return Result.err(fetchError);
+        const fetchedValue = fetchedTrigger.match({ ok: (value) => value, err: () => null });
+        if (fetchedValue) orderedList.push(fetchedValue);
       }
     }
 
@@ -1602,14 +1603,12 @@ export async function composeRecentChannelMessages(
     transcriptStore: opts.transcriptStore,
     discordUserAliasById: opts.discordUserAliasById,
   });
-
-  if (composed.status === "error") return Result.err(composed.error);
-  return Result.ok({
-    messages: composed.value.messages,
+  return composed.map((value) => ({
+    messages: value.messages,
     chainMessageIds: chain.map((m) => m.messageId),
-    mergedGroups: composed.value.mergedGroups,
-    corePrimaryLineage: composed.value.corePrimaryLineage,
-  });
+    mergedGroups: value.mergedGroups,
+    corePrimaryLineage: value.corePrimaryLineage,
+  }));
 }
 
 export async function composeSingleMessage(
@@ -1617,8 +1616,7 @@ export async function composeSingleMessage(
   opts: ComposeSingleMessageOpts,
 ): Promise<ResultType<ModelMessage | null, RequestCompositionError>> {
   const composed = await composeSingleMessageWithLineage(adapter, opts);
-  if (composed.status === "error") return Result.err(composed.error);
-  return Result.ok(composed.value?.messages[0] ?? null);
+  return composed.map((value) => value?.messages[0] ?? null);
 }
 
 export async function composeSingleMessageWithLineage(
@@ -1632,9 +1630,10 @@ export async function composeSingleMessageWithLineage(
     );
   }
   const m = await adapter.readMsg(opts.msgRef);
-  if (m.status === "error") return Result.err(m.error);
-  if (!m.value) return Result.ok(null);
-  const message = m.value;
+  const readError = m.match({ ok: () => null, err: (error) => error });
+  if (readError) return Result.err(readError);
+  const message = m.match({ ok: (value) => value, err: () => null });
+  if (!message) return Result.ok(null);
 
   if (!shouldIncludeInModelContext(message)) return Result.ok(null);
 
@@ -1676,11 +1675,10 @@ export async function composeSingleMessageWithLineage(
     transcriptStore: opts.transcriptStore,
     discordUserAliasById: opts.discordUserAliasById,
   });
-  if (composed.status === "error") return Result.err(composed.error);
-  return Result.ok({
-    messages: composed.value.messages,
+  return composed.map((value) => ({
+    messages: value.messages,
     chainMessageIds: [message.ref.messageId],
-    mergedGroups: composed.value.mergedGroups,
-    corePrimaryLineage: composed.value.corePrimaryLineage,
-  });
+    mergedGroups: value.mergedGroups,
+    corePrimaryLineage: value.corePrimaryLineage,
+  }));
 }

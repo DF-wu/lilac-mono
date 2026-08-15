@@ -7,6 +7,7 @@ import { getBuiltinSurfaceProtocol } from "./builtin-surface-protocols";
 import type {
   CorrelatedSurfaceRequestMetadata,
   GithubTriggerProjection,
+  SurfaceProtocolRequestMetadata,
   SurfaceProtocolRouting,
 } from "./protocol";
 import type {
@@ -239,85 +240,104 @@ function projectRegisteredRequest<P extends RegisteredSurfacePlatform>(
   raw: RequestRaw,
   messageType: string,
 ): ResultType<AuthenticatedRequestProjection, AuthenticatedRequestProjectionInvalid> {
-  const claimsValid = validateSurfaceClaims(protocol.platform, route.sessionId, raw, messageType);
-  if (claimsValid.status === "error") return Result.err(claimsValid.error);
-  const actor = raw.authenticatedActor;
-  const origin = raw.authenticatedOrigin;
-  const common = {
-    ...(actor ? { actor: { platform: protocol.platform, userId: actor.userId } } : {}),
-    ...(origin
-      ? {
-          origin: {
-            platform: protocol.platform,
-            userId: origin.userId,
-            messageId: origin.messageRef.messageId,
-          },
-        }
-      : {}),
-    ...(raw.github ? { github: raw.github } : {}),
-  } satisfies CorrelatedSurfaceRequestMetadata<P>;
-  const sessionRef = protocol.refs.createSessionRef(route.sessionId);
-  if (raw.github && !protocol.requestProjection?.acceptsGithubMetadata) {
-    return invalidProjection(
-      messageType,
-      "GitHub trigger metadata does not match the request platform",
-    );
-  }
-  const protocolMetadata = protocol.requestProjection?.projectProtocolMetadata?.({
-    requestId: route.requestId,
-    sessionRef,
-    common,
-    messageType,
-    invalidProjection: (message) => invalidProjection(messageType, message),
-  });
-  if (protocolMetadata?.status === "error") return Result.err(protocolMetadata.error);
-
-  let messageRef: MsgRefFor<P> | undefined;
-  if (origin) {
-    messageRef = protocol.refs.createMessageRef(sessionRef, origin.messageRef.messageId);
-  } else if (protocolMetadata?.value.inferredMessageId) {
-    messageRef = protocol.refs.createMessageRef(
-      sessionRef,
-      protocolMetadata.value.inferredMessageId,
-    );
-  } else if (protocol.requestProjection?.inferRequestMessageRef) {
-    const inferred = protocol.refs.resolveRequestMessageRef({
-      requestId: route.requestId,
-      sessionRef,
-    });
-    if (inferred.kind === "target") messageRef = inferred.ref;
-  }
-
-  const userId = origin?.userId ?? actor?.userId;
-  const authenticatedOrigin: AuthenticatedSurfaceOriginFor<P> | undefined = userId
-    ? {
-        platform: protocol.platform,
-        userId,
-        sessionRef,
-        ...(messageRef ? { messageRef } : {}),
+  const claims = validateSurfaceClaims(protocol.platform, route.sessionId, raw, messageType);
+  const continueClaims = claims.match<
+    () => ResultType<AuthenticatedRequestProjection, AuthenticatedRequestProjectionInvalid>
+  >({
+    err: (error) => () => Result.err(error),
+    ok: () => () => {
+      const actor = raw.authenticatedActor;
+      const origin = raw.authenticatedOrigin;
+      const common = {
+        ...(actor ? { actor: { platform: protocol.platform, userId: actor.userId } } : {}),
+        ...(origin
+          ? {
+              origin: {
+                platform: protocol.platform,
+                userId: origin.userId,
+                messageId: origin.messageRef.messageId,
+              },
+            }
+          : {}),
+        ...(raw.github ? { github: raw.github } : {}),
+      } satisfies CorrelatedSurfaceRequestMetadata<P>;
+      const sessionRef = protocol.refs.createSessionRef(route.sessionId);
+      if (raw.github && !protocol.requestProjection?.acceptsGithubMetadata) {
+        return invalidProjection(
+          messageType,
+          "GitHub trigger metadata does not match the request platform",
+        );
       }
-    : undefined;
-  const githubTrigger = protocolMetadata?.value.githubTrigger;
-  const projection = {
-    requestId: route.requestId,
-    requestClient: route.requestClient,
-    sessionId: route.sessionId,
-    source: "external",
-    platform: protocol.platform,
-    sessionRef,
-    ...(messageRef ? { messageRef } : {}),
-    ...(actor ? { authenticatedActor: { platform: protocol.platform, userId: actor.userId } } : {}),
-    ...(authenticatedOrigin ? { authenticatedOrigin } : {}),
-    authenticationMetadataKind: metadataKind({
-      actor: actor !== undefined,
-      origin: origin !== undefined,
-      githubTrigger: githubTrigger !== undefined,
-    }),
-    ...(githubTrigger ? { githubTrigger } : {}),
-    verifiedIngress:
-      protocolMetadata?.value.verifiedIngress ?? (actor !== undefined || origin !== undefined),
-  } as AuthenticatedRequestProjection;
-  return Result.ok(projection);
+      const projectedProtocolMetadata: ResultType<
+        SurfaceProtocolRequestMetadata | undefined,
+        AuthenticatedRequestProjectionInvalid
+      > =
+        protocol.requestProjection?.projectProtocolMetadata?.({
+          requestId: route.requestId,
+          sessionRef,
+          common,
+          messageType,
+          invalidProjection: (message) => invalidProjection(messageType, message),
+        }) ?? Result.ok(undefined);
+      const continueProtocolMetadata = projectedProtocolMetadata.match<
+        () => ResultType<AuthenticatedRequestProjection, AuthenticatedRequestProjectionInvalid>
+      >({
+        err: (error) => () => Result.err(error),
+        ok: (protocolMetadata) => () => {
+          let messageRef: MsgRefFor<P> | undefined;
+          if (origin) {
+            messageRef = protocol.refs.createMessageRef(sessionRef, origin.messageRef.messageId);
+          } else if (protocolMetadata?.inferredMessageId) {
+            messageRef = protocol.refs.createMessageRef(
+              sessionRef,
+              protocolMetadata.inferredMessageId,
+            );
+          } else if (protocol.requestProjection?.inferRequestMessageRef) {
+            const inferred = protocol.refs.resolveRequestMessageRef({
+              requestId: route.requestId,
+              sessionRef,
+            });
+            if (inferred.kind === "target") messageRef = inferred.ref;
+          }
+
+          const userId = origin?.userId ?? actor?.userId;
+          const authenticatedOrigin: AuthenticatedSurfaceOriginFor<P> | undefined = userId
+            ? {
+                platform: protocol.platform,
+                userId,
+                sessionRef,
+                ...(messageRef ? { messageRef } : {}),
+              }
+            : undefined;
+          const githubTrigger = protocolMetadata?.githubTrigger;
+          const projection = {
+            requestId: route.requestId,
+            requestClient: route.requestClient,
+            sessionId: route.sessionId,
+            source: "external",
+            platform: protocol.platform,
+            sessionRef,
+            ...(messageRef ? { messageRef } : {}),
+            ...(actor
+              ? { authenticatedActor: { platform: protocol.platform, userId: actor.userId } }
+              : {}),
+            ...(authenticatedOrigin ? { authenticatedOrigin } : {}),
+            authenticationMetadataKind: metadataKind({
+              actor: actor !== undefined,
+              origin: origin !== undefined,
+              githubTrigger: githubTrigger !== undefined,
+            }),
+            ...(githubTrigger ? { githubTrigger } : {}),
+            verifiedIngress:
+              protocolMetadata?.verifiedIngress ?? (actor !== undefined || origin !== undefined),
+          } as AuthenticatedRequestProjection;
+          return Result.ok(projection);
+        },
+      });
+      return continueProtocolMetadata();
+    },
+  });
+  return continueClaims();
 }
 
 function hasConsistentMetadataState(projection: AuthenticatedRequestProjection): boolean {
@@ -473,11 +493,13 @@ function requireSemanticallyValidProjection(
   projected: ResultType<AuthenticatedRequestProjection, AuthenticatedRequestProjectionInvalid>,
   messageType: string,
 ): ResultType<AuthenticatedRequestProjection, AuthenticatedRequestProjectionInvalid> {
-  if (projected.status === "error") return Result.err(projected.error);
-  if (isAuthenticatedRequestProjectionSemanticallyValid(projected.value)) return projected;
-  return invalidProjection(
-    messageType,
-    "cmd.request.message authentication projection is semantically inconsistent",
+  return projected.andThen((projection) =>
+    isAuthenticatedRequestProjectionSemanticallyValid(projection)
+      ? Result.ok(projection)
+      : invalidProjection(
+          messageType,
+          "cmd.request.message authentication projection is semantically inconsistent",
+        ),
   );
 }
 
