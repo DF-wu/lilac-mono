@@ -35,9 +35,11 @@ import {
   type ConversationThreadSearchFilters,
   type ConversationThreadSearchAllowlist,
   type ConversationThreadSearchHit,
+  type ConversationThreadSqliteDriverFailure,
   type ConversationThreadStore,
   type ConversationThreadSummary,
   type ConversationThreadSummaryInput,
+  type ConversationThreadSummaryWriteResult,
   type ConversationThreadSummarizationEligibility,
   type ConversationThreadSummarizationEligibilityReason,
 } from "./thread-store";
@@ -66,6 +68,22 @@ const SUMMARY_TAIL_MESSAGES = 160;
 const SUMMARY_MAX_MESSAGES = SUMMARY_HEAD_MESSAGES + SUMMARY_TAIL_MESSAGES;
 const DEFAULT_READ_LIMIT = 50;
 const DEFAULT_SEARCH_MIN_SCORE = 0.1;
+
+function resultErrorOrNull<T, E>(result: ResultType<T, E>): E | null {
+  const select = result.match<() => E | null>({
+    ok: () => () => null,
+    err: (error) => () => error,
+  });
+  return select();
+}
+
+function selectResultValue<T, E extends Error>(result: ResultType<T, E>): T {
+  const select = result.match<() => T>({
+    ok: (value) => () => value,
+    err: (error) => () => adaptToolResultToHost(Result.err(error)),
+  });
+  return select();
+}
 const SUMMARY_PARSE_MAX_ATTEMPTS = 3;
 const SUMMARY_FAILURE_RETRY_MS = 60 * 60 * 1000;
 const HYBRID_LEXICAL_WEIGHT = 0.35;
@@ -616,11 +634,15 @@ function captureConversationThreadSqliteOperation(
     try: run,
     catch: (cause) => projectRuntimeError(cause, "Conversation thread SQLite operation defect"),
   });
-  if (captured.status === "ok") return Result.ok(captured.value);
-  if (captured.error instanceof Error && classifyBunSqliteError(captured.error) !== undefined) {
-    return Result.err(conversationThreadOperationFailed(operation, message));
-  }
-  return signalConversationThreadDefect(captured.error);
+  return captured.match<() => ResultType<void, ConversationThreadOperationFailed>>({
+    ok: (value) => () => Result.ok(value),
+    err: (error) => () => {
+      if (error instanceof Error && classifyBunSqliteError(error) !== undefined) {
+        return Result.err(conversationThreadOperationFailed(operation, message));
+      }
+      return signalConversationThreadDefect(error);
+    },
+  })();
 }
 
 function formatTime(ts: number): string {
@@ -749,7 +771,7 @@ async function resolveUtilityModelCapability(
     overrides: config?.overrides ?? {},
   });
   const resolved = await capability.resolveResult(modelSpec);
-  return resolved.status === "ok" ? resolved.value : null;
+  return resolved.match({ ok: (value) => value, err: () => null });
 }
 
 function stableHash(input: string): string {
@@ -1117,25 +1139,32 @@ function parseConversationThreadJson(
     try: (): unknown => JSON.parse(extractJsonObject(text)),
     catch: (cause) => cause,
   });
-  if (parsed.status === "ok") return Result.ok(parsed.value);
-  if (!(parsed.error instanceof SyntaxError)) return signalConversationThreadDefect(parsed.error);
-  return Result.err(new ConversationThreadSummaryParseError(message, truncateErrorDetail(text)));
+  return parsed.match<() => ResultType<unknown, ConversationThreadSummaryParseError>>({
+    ok: (value) => () => Result.ok(value),
+    err: (error) => () => {
+      if (!(error instanceof SyntaxError)) return signalConversationThreadDefect(error);
+      return Result.err(
+        new ConversationThreadSummaryParseError(message, truncateErrorDetail(text)),
+      );
+    },
+  })();
 }
 
 function parseSummaryJson(
   text: string,
 ): ResultType<ConversationThreadSummaryInput, ConversationThreadSummaryParseError> {
   const parsed = parseConversationThreadJson(text, "summary JSON parse failed: malformed JSON");
-  if (parsed.status === "error") return Result.err(parsed.error);
-  const decoded = threadSummarySchema.safeParse(parsed.value);
-  return decoded.success
-    ? Result.ok(decoded.data)
-    : Result.err(
-        new ConversationThreadSummaryParseError(
-          `summary JSON parse failed: ${decoded.error.message}`,
-          truncateErrorDetail(text),
-        ),
-      );
+  return parsed.andThen((value) => {
+    const decoded = threadSummarySchema.safeParse(value);
+    return decoded.success
+      ? Result.ok(decoded.data)
+      : Result.err(
+          new ConversationThreadSummaryParseError(
+            `summary JSON parse failed: ${decoded.error.message}`,
+            truncateErrorDetail(text),
+          ),
+        );
+  });
 }
 
 function parseQueryAboutnessJson(
@@ -1145,16 +1174,17 @@ function parseQueryAboutnessJson(
     text,
     "query aboutness JSON parse failed: malformed JSON",
   );
-  if (parsed.status === "error") return Result.err(parsed.error);
-  const decoded = queryAboutnessSchema.safeParse(parsed.value);
-  return decoded.success
-    ? Result.ok(normalizeQueryAboutness(decoded.data))
-    : Result.err(
-        new ConversationThreadSummaryParseError(
-          `query aboutness JSON parse failed: ${decoded.error.message}`,
-          truncateErrorDetail(text),
-        ),
-      );
+  return parsed.andThen((value) => {
+    const decoded = queryAboutnessSchema.safeParse(value);
+    return decoded.success
+      ? Result.ok(normalizeQueryAboutness(decoded.data))
+      : Result.err(
+          new ConversationThreadSummaryParseError(
+            `query aboutness JSON parse failed: ${decoded.error.message}`,
+            truncateErrorDetail(text),
+          ),
+        );
+  });
 }
 
 function parseAutoInjectQueryPlanJson(
@@ -1164,16 +1194,17 @@ function parseAutoInjectQueryPlanJson(
     text,
     "auto-inject query plan JSON parse failed: malformed JSON",
   );
-  if (parsed.status === "error") return Result.err(parsed.error);
-  const decoded = autoInjectQueryPlanSchema.safeParse(parsed.value);
-  return decoded.success
-    ? Result.ok(normalizeAutoInjectQueryPlan(decoded.data))
-    : Result.err(
-        new ConversationThreadSummaryParseError(
-          `auto-inject query plan JSON parse failed: ${decoded.error.message}`,
-          truncateErrorDetail(text),
-        ),
-      );
+  return parsed.andThen((value) => {
+    const decoded = autoInjectQueryPlanSchema.safeParse(value);
+    return decoded.success
+      ? Result.ok(normalizeAutoInjectQueryPlan(decoded.data))
+      : Result.err(
+          new ConversationThreadSummaryParseError(
+            `auto-inject query plan JSON parse failed: ${decoded.error.message}`,
+            truncateErrorDetail(text),
+          ),
+        );
+  });
 }
 
 function resolveSummarizationModel(cfg: CoreConfig) {
@@ -1295,9 +1326,10 @@ async function defaultSummarizer(input: {
   messages: readonly ConversationThreadSummaryMessage[];
   omittedMessages?: number;
 }): Promise<ResultType<ConversationThreadSummaryInput, ConversationThreadGenerationError>> {
-  const resolution = resolveSummarizationModel(input.cfg);
-  if (resolution.status === "error") return Result.err(resolution.error);
-  const resolved = resolution.value;
+  const resolvedResult = resolveSummarizationModel(input.cfg);
+  const resolvedError = resultErrorOrNull(resolvedResult);
+  if (resolvedError) return Result.err(resolvedError);
+  const resolved = selectResultValue(resolvedResult);
   const previous = input.previousSummary
     ? [
         `Previous title: ${input.previousSummary.title}`,
@@ -1362,10 +1394,7 @@ async function defaultSummarizer(input: {
       "summarize-thread",
       "Summary generation failed",
     );
-    if (text.status === "error") {
-      return Result.err(text.error);
-    }
-    return parseSummaryJson(text.value);
+    return text.andThen(parseSummaryJson);
   }
 
   const generated = await captureConversationThreadGeneration(
@@ -1383,18 +1412,17 @@ async function defaultSummarizer(input: {
     "summarize-thread",
     "Summary generation failed",
   );
-  return generated.status === "ok"
-    ? Result.ok(generated.value.output)
-    : Result.err(generated.error);
+  return generated.map((value) => value.output);
 }
 
 async function defaultQueryAboutnessSummarizer(input: {
   cfg: CoreConfig;
   queries: readonly string[];
 }): Promise<ResultType<ConversationThreadQueryAboutness, ConversationThreadGenerationError>> {
-  const resolution = resolveSummarizationModel(input.cfg);
-  if (resolution.status === "error") return Result.err(resolution.error);
-  const resolved = resolution.value;
+  const resolvedResult = resolveSummarizationModel(input.cfg);
+  const resolvedError = resultErrorOrNull(resolvedResult);
+  if (resolvedError) return Result.err(resolvedError);
+  const resolved = selectResultValue(resolvedResult);
   const messages = [
     {
       role: "user",
@@ -1428,7 +1456,7 @@ async function defaultQueryAboutnessSummarizer(input: {
       "capture-query-aboutness",
       "Query aboutness generation failed",
     );
-    return text.status === "ok" ? parseQueryAboutnessJson(text.value) : Result.err(text.error);
+    return text.andThen(parseQueryAboutnessJson);
   }
 
   const generated = await captureConversationThreadGeneration(
@@ -1446,9 +1474,7 @@ async function defaultQueryAboutnessSummarizer(input: {
     "capture-query-aboutness",
     "Query aboutness generation failed",
   );
-  return generated.status === "ok"
-    ? Result.ok(normalizeQueryAboutness(generated.value.output))
-    : Result.err(generated.error);
+  return generated.map((value) => normalizeQueryAboutness(value.output));
 }
 
 async function defaultAutoInjectQueryPlanner(input: {
@@ -1456,9 +1482,10 @@ async function defaultAutoInjectQueryPlanner(input: {
   text: string;
   content?: UserContent;
 }): Promise<ResultType<ConversationThreadAutoInjectQueryPlan, ConversationThreadGenerationError>> {
-  const resolution = resolveAutoInjectPlannerModel(input.cfg);
-  if (resolution.status === "error") return Result.err(resolution.error);
-  const resolved = resolution.value;
+  const resolvedResult = resolveAutoInjectPlannerModel(input.cfg);
+  const resolvedError = resultErrorOrNull(resolvedResult);
+  if (resolvedError) return Result.err(resolvedError);
+  const resolved = selectResultValue(resolvedResult);
   const plannerPrefix = [
     "Create compact conversation-memory search queries for this new user message.",
     "Do not answer the message. Extract what prior conversation threads would be relevant context for responding.",
@@ -1501,7 +1528,7 @@ async function defaultAutoInjectQueryPlanner(input: {
       "summarize-thread",
       "Query planning failed",
     );
-    return text.status === "ok" ? parseAutoInjectQueryPlanJson(text.value) : Result.err(text.error);
+    return text.andThen(parseAutoInjectQueryPlanJson);
   }
 
   const generated = await captureConversationThreadGeneration(
@@ -1519,9 +1546,7 @@ async function defaultAutoInjectQueryPlanner(input: {
     "summarize-thread",
     "Query planning failed",
   );
-  return generated.status === "ok"
-    ? Result.ok(normalizeAutoInjectQueryPlan(generated.value.output))
-    : Result.err(generated.error);
+  return generated.map((value) => normalizeAutoInjectQueryPlan(value.output));
 }
 
 function buildQueryAboutnessInstructions(): string {
@@ -1682,19 +1707,22 @@ export class ConversationThreadService {
       allowlist: buildSearchAllowlist(cfg),
       onEmbeddingUsage: usage.record,
     });
-    if (recallHits.status === "error") {
+    const recalledResult = recallHits.mapError((error) => {
       usage.log({ status: "failed", mode, queryCount: queries.length });
-      return Result.err(recallHits.error);
-    }
+      return error;
+    });
+    const recallError = resultErrorOrNull(recalledResult);
+    if (recallError) return Result.err(recallError);
+    const recalled = selectResultValue(recalledResult);
     const { aboutness: queryAboutness, error: queryAboutnessError } = input.queryAboutness
       ? { aboutness: normalizeQueryAboutness(input.queryAboutness), error: undefined }
       : await this.captureQueryAboutness({
           queries,
           cfg,
           mode,
-          candidateCount: recallHits.value.length,
+          candidateCount: recalled.length,
         });
-    const hits = this.applyAboutnessCoverage(recallHits.value, queryAboutness)
+    const hits = this.applyAboutnessCoverage(recalled, queryAboutness)
       .filter((hit) => hit.score >= minScore)
       .slice(0, limit);
     const result = {
@@ -1744,9 +1772,7 @@ export class ConversationThreadService {
           "Query planning failed",
         )
       : await defaultAutoInjectQueryPlanner({ cfg, text, content: input.content });
-    return planned.status === "ok"
-      ? Result.ok(normalizeAutoInjectQueryPlan(planned.value))
-      : Result.err(planned.error);
+    return planned.map(normalizeAutoInjectQueryPlan);
   }
 
   async read(input: {
@@ -1758,58 +1784,59 @@ export class ConversationThreadService {
     const offset = Math.max(0, Math.floor(input.offset ?? 0));
     const limit = Math.min(200, Math.max(1, Math.floor(input.limit ?? DEFAULT_READ_LIMIT)));
     const result = this.params.store.readThread(input.threadId, offset, limit);
-    if (result.status === "error") return Result.err(result.error);
-    if (!result.value) {
-      return Result.err(
-        new ConversationThreadNotFound({
-          threadId: input.threadId,
-          message: `conversation thread not found: ${input.threadId}`,
-        }),
-      );
-    }
-    if (
-      !shouldAllowDiscordThread(cfg, {
-        channelId: result.value.thread.channel_id,
-        parentChannelId: result.value.thread.parent_channel_id,
-        guildId: result.value.thread.guild_id,
-      })
-    ) {
-      return Result.err(
-        new ConversationThreadAccessDenied({
-          threadId: input.threadId,
-          message: `Not allowed: conversation thread '${input.threadId}'`,
-        }),
-      );
-    }
+    return result.andThen((value) => {
+      if (!value) {
+        return Result.err(
+          new ConversationThreadNotFound({
+            threadId: input.threadId,
+            message: `conversation thread not found: ${input.threadId}`,
+          }),
+        );
+      }
+      if (
+        !shouldAllowDiscordThread(cfg, {
+          channelId: value.thread.channel_id,
+          parentChannelId: value.thread.parent_channel_id,
+          guildId: value.thread.guild_id,
+        })
+      ) {
+        return Result.err(
+          new ConversationThreadAccessDenied({
+            threadId: input.threadId,
+            message: `Not allowed: conversation thread '${input.threadId}'`,
+          }),
+        );
+      }
 
-    const nextOffset = offset + result.value.messages.length;
-    const hasMore = nextOffset < result.value.totalMessages;
-    const botMentionNames = resolveThreadBotMentionNames(cfg);
-    return Result.ok({
-      thread: this.formatMetadataThread({
-        thread: result.value.thread,
-        summary: result.value.summary,
-        messageCount: result.value.totalMessages,
-      }),
-      page: {
-        offset,
-        limit,
-        total: result.value.totalMessages,
-        nextOffset: hasMore ? nextOffset : undefined,
-        hasMore,
-      },
-      messages: result.value.messages.map((message) => ({
-        ordinal: message.ordinal,
-        messageId: message.messageId,
-        userId: message.userId,
-        userName: message.userName,
-        time: formatTime(message.ts),
-        content: stripUserThreadContinueDirective({
-          message,
-          cfg,
-          botMentionNames,
+      const nextOffset = offset + value.messages.length;
+      const hasMore = nextOffset < value.totalMessages;
+      const botMentionNames = resolveThreadBotMentionNames(cfg);
+      return Result.ok({
+        thread: this.formatMetadataThread({
+          thread: value.thread,
+          summary: value.summary,
+          messageCount: value.totalMessages,
         }),
-      })),
+        page: {
+          offset,
+          limit,
+          total: value.totalMessages,
+          nextOffset: hasMore ? nextOffset : undefined,
+          hasMore,
+        },
+        messages: value.messages.map((message) => ({
+          ordinal: message.ordinal,
+          messageId: message.messageId,
+          userId: message.userId,
+          userName: message.userName,
+          time: formatTime(message.ts),
+          content: stripUserThreadContinueDirective({
+            message,
+            cfg,
+            botMentionNames,
+          }),
+        })),
+      });
     });
   }
 
@@ -1851,12 +1878,14 @@ export class ConversationThreadService {
         );
       }
 
-      const summary = this.params.store.getSummary(threadId);
-      if (summary.status === "error") return Result.err(summary.error);
+      const summaryResult = this.params.store.getSummary(threadId);
+      const summaryError = resultErrorOrNull(summaryResult);
+      if (summaryError) return Result.err(summaryError);
+      const summary = selectResultValue(summaryResult);
       threads.push(
         this.formatMetadataThread({
           thread,
-          summary: summary.value,
+          summary,
           messageCount: this.params.store.countThreadMessages(threadId),
         }),
       );
@@ -2023,13 +2052,15 @@ export class ConversationThreadService {
           "persist-summary-failure",
           "Summary failure backoff persistence failed",
         );
-        if (failureState.status === "error") {
-          this.logger.warn("thread summarization failure backoff could not be persisted", {
-            jobId,
-            threadId: thread.thread_id,
-            ...formatTaggedErrorForLog(failureState.error),
-          });
-        }
+        failureState.match({
+          ok: () => undefined,
+          err: (error) =>
+            this.logger.warn("thread summarization failure backoff could not be persisted", {
+              jobId,
+              threadId: thread.thread_id,
+              ...formatTaggedErrorForLog(error),
+            }),
+        });
       };
       const processed = await captureConversationThreadGeneration(
         async () => {
@@ -2066,10 +2097,18 @@ export class ConversationThreadService {
           }
           const summaryIsStale = item.summaryIsStale;
           const previousSummary = this.params.store.getSummary(thread.thread_id);
-          if (previousSummary.status === "error") {
-            recordFailure(previousSummary.error.message);
+          const previousSummaryError = previousSummary.match({
+            ok: () => null,
+            err: (error) => error,
+          });
+          if (previousSummaryError) {
+            recordFailure(previousSummaryError.message);
             return;
           }
+          const previousSummaryValue = previousSummary.match({
+            ok: (value) => value,
+            err: () => null,
+          });
           if (summaryRead.omittedMessages > 0) {
             this.logger.debug("thread summarization transcript truncated", {
               jobId,
@@ -2079,11 +2118,21 @@ export class ConversationThreadService {
               omittedMessages: summaryRead.omittedMessages,
             });
           }
-          const summaryWrite = summaryIsStale
-            ? await (async () => {
+          const summaryWriteResult = summaryIsStale
+            ? await (async (): Promise<
+                ResultType<
+                  ConversationThreadSummaryWriteResult | null,
+                  ConversationThreadGenerationError | ConversationThreadSqliteDriverFailure
+                >
+              > => {
                 const hydrated = await this.hydrateMessagesForSummarization(summaryRead.messages);
-                if (hydrated.status === "error") return Result.err(hydrated.error);
-                const summaryMessages = this.normalizeMessagesForSummarization(hydrated.value, cfg);
+                const hydrationError = hydrated.match({ ok: () => null, err: (error) => error });
+                if (hydrationError) return Result.err(hydrationError);
+                const hydratedMessages = hydrated.match({ ok: (value) => value, err: () => [] });
+                const summaryMessages = this.normalizeMessagesForSummarization(
+                  hydratedMessages,
+                  cfg,
+                );
                 this.logger.debug("thread summary generation started", {
                   jobId,
                   threadId: thread.thread_id,
@@ -2096,17 +2145,18 @@ export class ConversationThreadService {
                   summarize,
                   cfg,
                   promptContext,
-                  previousSummary: previousSummary.value,
+                  previousSummary: previousSummaryValue,
                   messages: summaryMessages,
                   omittedMessages: summaryRead.omittedMessages,
                 });
-                if (summary.status === "error") return Result.err(summary.error);
-                return this.params.store.upsertSummary(
-                  thread.thread_id,
-                  thread.summary_input_hash ?? "",
-                  summary.value ?? buildFallbackSummary(summaryMessages),
-                  promptContext?.hash ?? null,
-                  { ifCurrent: true },
+                return summary.andThen((value) =>
+                  this.params.store.upsertSummary(
+                    thread.thread_id,
+                    thread.summary_input_hash ?? "",
+                    value ?? buildFallbackSummary(summaryMessages),
+                    promptContext?.hash ?? null,
+                    { ifCurrent: true },
+                  ),
                 );
               })()
             : Result.ok({
@@ -2114,11 +2164,18 @@ export class ConversationThreadService {
                 embeddingInputHash:
                   this.params.store.computeEmbeddingInputHash(thread.thread_id) ?? "",
               });
-          if (summaryWrite.status === "error") {
-            recordFailure(summaryWrite.error.message);
+          const summaryWriteError = summaryWriteResult.match({
+            ok: () => null,
+            err: (error) => error,
+          });
+          if (summaryWriteError) {
+            recordFailure(summaryWriteError.message);
             return;
           }
-          const writtenSummary = summaryWrite.value;
+          const writtenSummary = summaryWriteResult.match({
+            ok: (value) => value,
+            err: () => null,
+          });
           if (!writtenSummary) {
             this.logger.debug("thread summary generation discarded after concurrent update", {
               jobId,
@@ -2140,10 +2197,14 @@ export class ConversationThreadService {
             embeddingInputHash: writtenSummary.embeddingInputHash,
             facets: writtenSummary.facets,
           });
-          if (embedded.status === "error") {
-            recordFailure(embedded.error.message);
-            return;
-          }
+          const embeddingFailed = embedded.match({
+            ok: () => false,
+            err: (error) => {
+              recordFailure(error.message);
+              return true;
+            },
+          });
+          if (embeddingFailed) return;
           this.params.store.clearMaintenanceFailure({
             threadId: thread.thread_id,
             summaryInputHash: thread.summary_input_hash,
@@ -2160,42 +2221,17 @@ export class ConversationThreadService {
         "summarize-thread",
         "Thread summarization failed",
       );
-      if (processed.status === "error") {
-        const e = processed.error;
-        const aiError = extractAiErrorLogDetails(e);
-        const message = e instanceof Error ? e.message : String(e);
-        const failureMessage = aiError?.providerMessage
-          ? `${message}: ${aiError.providerMessage}`
-          : message;
-        this.logger.error("thread summarization failed", {
-          jobId,
-          threadId: thread.thread_id,
-          ...formatTaggedErrorForLog(
-            conversationThreadOperationFailed(
-              "summarize-thread",
-              e instanceof Error ? e.message : String(e),
-            ),
-          ),
-        });
-        recordFailure(failureMessage);
-        if (e instanceof ConversationThreadSummaryParseError) {
-          this.logger.warn("thread summarization continuing after parse failure", {
+      processed.match({
+        ok: () => undefined,
+        err: (e) => {
+          const aiError = extractAiErrorLogDetails(e);
+          const message = e instanceof Error ? e.message : String(e);
+          const failureMessage = aiError?.providerMessage
+            ? `${message}: ${aiError.providerMessage}`
+            : message;
+          this.logger.error("thread summarization failed", {
             jobId,
             threadId: thread.thread_id,
-            eligible: result.eligible,
-            summarized: result.summarized,
-            failed: result.failed,
-          });
-          return;
-        }
-
-        if (isSqliteBusyError(e)) {
-          this.logger.warn("thread summarization continuing after sqlite busy failure", {
-            jobId,
-            threadId: thread.thread_id,
-            eligible: result.eligible,
-            summarized: result.summarized,
-            failed: result.failed,
             ...formatTaggedErrorForLog(
               conversationThreadOperationFailed(
                 "summarize-thread",
@@ -2203,18 +2239,45 @@ export class ConversationThreadService {
               ),
             ),
           });
-          return;
-        }
+          recordFailure(failureMessage);
+          if (e instanceof ConversationThreadSummaryParseError) {
+            this.logger.warn("thread summarization continuing after parse failure", {
+              jobId,
+              threadId: thread.thread_id,
+              eligible: result.eligible,
+              summarized: result.summarized,
+              failed: result.failed,
+            });
+            return;
+          }
 
-        this.logger.error("thread summarization continuing after hard failure", {
-          jobId,
-          threadId: thread.thread_id,
-          eligible: result.eligible,
-          summarized: result.summarized,
-          failed: result.failed,
-        });
-        return;
-      }
+          if (isSqliteBusyError(e)) {
+            this.logger.warn("thread summarization continuing after sqlite busy failure", {
+              jobId,
+              threadId: thread.thread_id,
+              eligible: result.eligible,
+              summarized: result.summarized,
+              failed: result.failed,
+              ...formatTaggedErrorForLog(
+                conversationThreadOperationFailed(
+                  "summarize-thread",
+                  e instanceof Error ? e.message : String(e),
+                ),
+              ),
+            });
+            return;
+          }
+
+          this.logger.error("thread summarization continuing after hard failure", {
+            jobId,
+            threadId: thread.thread_id,
+            eligible: result.eligible,
+            summarized: result.summarized,
+            failed: result.failed,
+          });
+          return;
+        },
+      });
     };
 
     const workerCount = Math.min(concurrency, eligible.length);
@@ -2269,22 +2332,30 @@ export class ConversationThreadService {
             "Summary generation failed",
           )
         : await defaultSummarizer(generationInput);
-      if (summary.status === "ok") return Result.ok(summary.value);
-      if (!(summary.error instanceof ConversationThreadSummaryParseError)) {
-        if (ConversationThreadOperationFailed.is(summary.error)) return Result.err(summary.error);
-        if (ModelResolutionFailed.is(summary.error)) return Result.err(summary.error);
-        return Result.err(
-          conversationThreadOperationFailed("summarize-thread", "Summary generation failed"),
-        );
-      }
-      lastError = summary.error;
-      this.logger.warn("thread summary parse failed", {
-        jobId: input.jobId,
-        threadId: input.threadId,
-        attempt,
-        maxAttempts: SUMMARY_PARSE_MAX_ATTEMPTS,
-        ...formatTaggedErrorForLog(summary.error),
-      });
+      const completed = summary.match<
+        () => ResultType<ConversationThreadSummaryInput, ConversationThreadGenerationError> | null
+      >({
+        ok: (value) => () => Result.ok(value),
+        err: (error) => () => {
+          if (!(error instanceof ConversationThreadSummaryParseError)) {
+            if (ConversationThreadOperationFailed.is(error)) return Result.err(error);
+            if (ModelResolutionFailed.is(error)) return Result.err(error);
+            return Result.err(
+              conversationThreadOperationFailed("summarize-thread", "Summary generation failed"),
+            );
+          }
+          lastError = error;
+          this.logger.warn("thread summary parse failed", {
+            jobId: input.jobId,
+            threadId: input.threadId,
+            attempt,
+            maxAttempts: SUMMARY_PARSE_MAX_ATTEMPTS,
+            ...formatTaggedErrorForLog(error),
+          });
+          return null;
+        },
+      })();
+      if (completed) return completed;
     }
 
     return Result.err(
@@ -2332,40 +2403,41 @@ export class ConversationThreadService {
       );
     }
     const hydrated = await this.params.attachmentHydrator({ refs });
-    if (hydrated.status === "error") return hydrated;
-    const byRef = new Map(
-      hydrated.value.map((item) => [`${item.ref.channelId}\u001f${item.ref.messageId}`, item]),
-    );
-    const output: ConversationThreadSummaryMessage[] = [];
-    for (const message of messages) {
-      if (message.attachments.length === 0) {
-        output.push({ ...message, attachments: [] });
-        continue;
-      }
-      const item = byRef.get(`${message.channelId}\u001f${message.messageId}`);
-      if (!item) {
-        return Result.err(
-          conversationThreadOperationFailed(
-            "summarize-thread",
-            `Thread attachment hydration omitted message ${message.messageId}`,
-          ),
-        );
-      }
-      const expectedHash = hashIndexedDiscordAttachments(message.attachments);
-      const actualHash = hashIndexedDiscordAttachments(
-        toIndexedDiscordAttachments(item.attachments),
+    return hydrated.andThen((items) => {
+      const byRef = new Map(
+        items.map((item) => [`${item.ref.channelId}\u001f${item.ref.messageId}`, item]),
       );
-      if (expectedHash !== actualHash) {
-        return Result.err(
-          conversationThreadOperationFailed(
-            "summarize-thread",
-            `Thread attachments changed while summarizing message ${message.messageId}`,
-          ),
+      const output: ConversationThreadSummaryMessage[] = [];
+      for (const message of messages) {
+        if (message.attachments.length === 0) {
+          output.push({ ...message, attachments: [] });
+          continue;
+        }
+        const item = byRef.get(`${message.channelId}\u001f${message.messageId}`);
+        if (!item) {
+          return Result.err(
+            conversationThreadOperationFailed(
+              "summarize-thread",
+              `Thread attachment hydration omitted message ${message.messageId}`,
+            ),
+          );
+        }
+        const expectedHash = hashIndexedDiscordAttachments(message.attachments);
+        const actualHash = hashIndexedDiscordAttachments(
+          toIndexedDiscordAttachments(item.attachments),
         );
+        if (expectedHash !== actualHash) {
+          return Result.err(
+            conversationThreadOperationFailed(
+              "summarize-thread",
+              `Thread attachments changed while summarizing message ${message.messageId}`,
+            ),
+          );
+        }
+        output.push({ ...message, attachments: item.attachments });
       }
-      output.push({ ...message, attachments: item.attachments });
-    }
-    return Result.ok(output);
+      return Result.ok(output);
+    });
   }
 
   private async tryEmbedThread(input: {
@@ -2410,18 +2482,20 @@ export class ConversationThreadService {
         "search-embedding",
         "Thread embedding failed",
       );
-      if (embedded.status === "error") {
+      const embeddingResult = embedded.mapError((error) => {
         usage.log({
           status: "failed",
           jobId: input.jobId,
           threadId: input.threadId,
           dimensions: dimensions ?? undefined,
           persistedEmbeddings: embeddings.length,
-          error: embedded.error.message,
+          error: error.message,
         });
-        return Result.err(embedded.error);
-      }
-      const embedding = embedded.value;
+        return error;
+      });
+      const embeddingError = resultErrorOrNull(embeddingResult);
+      if (embeddingError) return Result.err(embeddingError);
+      const embedding = selectResultValue(embeddingResult);
       dimensions ??= embedding.length;
       if (embedding.length !== dimensions) {
         const error = conversationThreadOperationFailed(
@@ -2464,17 +2538,19 @@ export class ConversationThreadService {
       "persist-summary-failure",
       "Thread embedding persistence failed",
     );
-    if (persisted.status === "error") {
+    const persistedResult = persisted.mapError((error) => {
       usage.log({
         status: "failed",
         jobId: input.jobId,
         threadId: input.threadId,
         dimensions,
         persistedEmbeddings: embeddings.length,
-        error: persisted.error.message,
+        error: error.message,
       });
-      return Result.err(persisted.error);
-    }
+      return error;
+    });
+    const persistenceError = resultErrorOrNull(persistedResult);
+    if (persistenceError) return Result.err(persistenceError);
     this.logger.debug("thread embedding generation completed", {
       jobId: input.jobId,
       threadId: input.threadId,
@@ -2511,21 +2587,21 @@ export class ConversationThreadService {
           "Query aboutness generation failed",
         )
       : await defaultQueryAboutnessSummarizer({ cfg: input.cfg, queries: input.queries });
-    if (captured.status === "ok") {
-      const aboutness = normalizeQueryAboutness(captured.value);
-      return { aboutness };
-    }
-    const message =
-      captured.error instanceof Error ? captured.error.message : String(captured.error);
-    this.logger.warn("thread query aboutness capture failed; using fallback coverage", {
-      ...formatTaggedErrorForLog(
-        conversationThreadOperationFailed("capture-query-aboutness", message),
-      ),
+    return captured.match({
+      ok: (value) => ({ aboutness: normalizeQueryAboutness(value) }),
+      err: (error) => {
+        const message = error instanceof Error ? error.message : String(error);
+        this.logger.warn("thread query aboutness capture failed; using fallback coverage", {
+          ...formatTaggedErrorForLog(
+            conversationThreadOperationFailed("capture-query-aboutness", message),
+          ),
+        });
+        return {
+          aboutness: buildFallbackQueryAboutness(input.queries),
+          error: message,
+        };
+      },
     });
-    return {
-      aboutness: buildFallbackQueryAboutness(input.queries),
-      error: message,
-    };
   }
 
   private applyAboutnessCoverage(
@@ -2590,8 +2666,10 @@ export class ConversationThreadService {
         filters: input.filters,
         allowlist: input.allowlist,
       });
-      if (lexical.status === "error") return Result.err(lexical.error);
-      for (const hit of lexical.value) {
+      const lexicalError = resultErrorOrNull(lexical);
+      if (lexicalError) return Result.err(lexicalError);
+      const lexicalHits = selectResultValue(lexical);
+      for (const hit of lexicalHits) {
         hit.score = applyImportanceNudge(
           hit,
           hit.lexicalScore * (input.mode === "lexical" ? 1 : HYBRID_LEXICAL_WEIGHT),
@@ -2612,34 +2690,40 @@ export class ConversationThreadService {
         "search-embedding",
         "Search embedding failed",
       );
-      if (embedded.status === "ok") {
-        const queryEmbedding = embedded.value;
-        const semantic = this.params.store.searchSemantic({
-          embedding: queryEmbedding,
-          modelId: adapter.modelId,
-          dimensions: queryEmbedding.length,
-          limit: input.limit * 5,
-          filters: input.filters,
-          allowlist: input.allowlist,
-        });
-        if (semantic.status === "error") return Result.err(semantic.error);
-        for (const hit of semantic.value) {
-          hit.score = applyImportanceNudge(
-            hit,
-            hit.semanticScore + hit.lexicalScore * HYBRID_LEXICAL_WEIGHT,
-          );
-          add(hit);
-        }
-      } else {
-        this.logger.warn("thread semantic search failed; using lexical fallback", {
-          ...formatTaggedErrorForLog(
-            conversationThreadOperationFailed(
-              "search-embedding",
-              embedded.error instanceof Error ? embedded.error.message : String(embedded.error),
+      const semantic = await embedded.match({
+        err: (error) => async () => {
+          this.logger.warn("thread semantic search failed; using lexical fallback", {
+            ...formatTaggedErrorForLog(
+              conversationThreadOperationFailed(
+                "search-embedding",
+                error instanceof Error ? error.message : String(error),
+              ),
             ),
-          ),
-        });
-      }
+          });
+          return Result.ok(undefined);
+        },
+        ok: (queryEmbedding) => async () =>
+          this.params.store
+            .searchSemantic({
+              embedding: queryEmbedding,
+              modelId: adapter.modelId,
+              dimensions: queryEmbedding.length,
+              limit: input.limit * 5,
+              filters: input.filters,
+              allowlist: input.allowlist,
+            })
+            .map((hits) => {
+              for (const hit of hits) {
+                hit.score = applyImportanceNudge(
+                  hit,
+                  hit.semanticScore + hit.lexicalScore * HYBRID_LEXICAL_WEIGHT,
+                );
+                add(hit);
+              }
+            }),
+      })();
+      const semanticError = resultErrorOrNull(semantic);
+      if (semanticError) return Result.err(semanticError);
     }
 
     return Result.ok(
@@ -2692,10 +2776,6 @@ export class ConversationThreadService {
       })),
     );
 
-    for (const result of queryResults) {
-      if (result.hits.status === "error") return Result.err(result.hits.error);
-    }
-
     const queryCount = input.queries.length;
     const candidates = new Map<
       string,
@@ -2703,8 +2783,10 @@ export class ConversationThreadService {
     >();
 
     for (const { query, hits } of queryResults) {
-      if (hits.status === "error") continue;
-      hits.value.forEach((hit, index) => {
+      const hitError = resultErrorOrNull(hits);
+      if (hitError) return Result.err(hitError);
+      const values = selectResultValue(hits);
+      values.forEach((hit, index) => {
         const selfScore = hit.score;
         const contribution = selfScore / queryCount;
         const attribution: ConversationThreadQueryAttribution = {
@@ -2843,8 +2925,12 @@ export function createConversationThreadToolService(
     operation: Promise<ResultType<T, { readonly message: string }>>,
   ): Promise<T> => {
     const result = await operation;
-    if (result.status === "error") throw new Error(result.error.message);
-    return result.value;
+    return result.match({
+      ok: (value) => () => value,
+      err: (error) => () => {
+        throw new Error(error.message);
+      },
+    })();
   };
   return {
     search: (input) => resolvePersistenceOperation(service.search(input)),

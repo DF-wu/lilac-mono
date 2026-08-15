@@ -105,11 +105,12 @@ let requestQueue = Promise.resolve();
 
 self.addEventListener("message", (event: MessageEvent<unknown>) => {
   const decoded = decodeThreadMaterializerWorkerRequest(event.data);
-  if (decoded.status === "error") {
-    respond({ id: "unknown", ok: false, error: "invalid materializer worker request" });
-    return;
-  }
-
-  const request = decoded.value;
-  requestQueue = requestQueue.then(() => runRequest(request));
+  decoded.match({
+    err: () => {
+      respond({ id: "unknown", ok: false, error: "invalid materializer worker request" });
+    },
+    ok: (request) => {
+      requestQueue = requestQueue.then(() => runRequest(request));
+    },
+  });
 });

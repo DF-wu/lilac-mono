@@ -76,6 +76,7 @@ export async function runThreadSummarizationWorkerOperation(params: {
     try: params.run,
     catch: captureThreadSummarizationWorkerOperationFailure,
   });
+  const operationError = operation.match({ ok: () => null, err: (error) => error });
   let cleanupPanic: Panic | null = null;
 
   for (const cleanup of params.cleanups) {
@@ -83,21 +84,21 @@ export async function runThreadSummarizationWorkerOperation(params: {
       try: cleanup.close,
       catch: captureThreadSummarizationWorkerCleanupFailure,
     });
-    if (closed.status === "error") {
-      if (Panic.is(closed.error)) {
-        cleanupPanic ??= closed.error;
-        params.onCleanupFailure({ cleanup, kind: "panic", panic: closed.error });
-      } else {
-        params.onCleanupFailure({
-          cleanup,
-          kind: "ordinary",
-          message: closed.error.message,
-        });
-      }
-    }
+    const reportCleanup = closed.match<() => void>({
+      ok: () => () => undefined,
+      err: (error) => () => {
+        if (Panic.is(error)) {
+          cleanupPanic ??= error;
+          params.onCleanupFailure({ cleanup, kind: "panic", panic: error });
+        } else {
+          params.onCleanupFailure({ cleanup, kind: "ordinary", message: error.message });
+        }
+      },
+    });
+    reportCleanup();
   }
 
-  if (operation.status === "error") return Result.err(operation.error);
+  if (operationError) return Result.err(operationError);
   if (cleanupPanic) return Result.err(cleanupPanic);
   return Result.ok(undefined);
 }
@@ -231,15 +232,18 @@ async function runJob(request: ThreadSummarizationWorkerRequest): Promise<void> 
       });
     },
   });
-  if (operation.status === "error") {
-    if (Panic.is(operation.error)) throw operation.error;
-    logger.error("conversation thread summarization worker job failed", {
-      jobId: request.id,
-      durationMs: Date.now() - startedAt,
-      ...formatTaggedErrorForLog(operation.error),
-    });
-    respond({ id: request.id, ok: false, error: operation.error.message });
-  }
+  operation.match({
+    ok: () => () => undefined,
+    err: (error) => () => {
+      if (Panic.is(error)) throw error;
+      logger.error("conversation thread summarization worker job failed", {
+        jobId: request.id,
+        durationMs: Date.now() - startedAt,
+        ...formatTaggedErrorForLog(error),
+      });
+      respond({ id: request.id, ok: false, error: error.message });
+    },
+  })();
 }
 
 const jobQueue = createSerialJobQueue<ThreadSummarizationWorkerRequest>({
@@ -251,28 +255,29 @@ const jobQueue = createSerialJobQueue<ThreadSummarizationWorkerRequest>({
 
 self.addEventListener("message", (event: MessageEvent<unknown>) => {
   const decoded = decodeThreadSummarizationParentMessage(event.data);
-  if (decoded.status === "error") {
-    respond({ id: "unknown", ok: false, error: "invalid worker request" });
-    return;
-  }
-
-  const request = decoded.value;
-  if ("type" in request) {
-    const pending = pendingHydrations.get(request.id);
-    if (!pending) {
-      logger.warn("conversation thread hydration response had no pending request", {
-        hydrationId: request.id,
+  decoded.match({
+    err: () => {
+      respond({ id: "unknown", ok: false, error: "invalid worker request" });
+    },
+    ok: (request) => {
+      if ("type" in request) {
+        const pending = pendingHydrations.get(request.id);
+        if (!pending) {
+          logger.warn("conversation thread hydration response had no pending request", {
+            hydrationId: request.id,
+          });
+          return;
+        }
+        pendingHydrations.delete(request.id);
+        pending.resolve(request);
+        return;
+      }
+      jobQueue.enqueue(request);
+      logger.debug("conversation thread summarization worker job enqueued", {
+        jobId: request.id,
+        queueDepth: jobQueue.depth,
+        running: jobQueue.running,
       });
-      return;
-    }
-    pendingHydrations.delete(request.id);
-    pending.resolve(request);
-    return;
-  }
-  jobQueue.enqueue(request);
-  logger.debug("conversation thread summarization worker job enqueued", {
-    jobId: request.id,
-    queueDepth: jobQueue.depth,
-    running: jobQueue.running,
+    },
   });
 });

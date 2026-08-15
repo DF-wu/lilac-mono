@@ -122,9 +122,9 @@ function createConversationThreadEmbeddingAdapterFromResolved(
 export function createConversationThreadEmbeddingAdapter(
   cfg: CoreConfig,
 ): ResultType<ConversationThreadEmbeddingAdapter | null, ModelResolutionFailed> {
-  const resolved = resolveConversationThreadEmbeddingModel(cfg);
-  if (resolved.status === "error") return Result.err(resolved.error);
-  return Result.ok(createConversationThreadEmbeddingAdapterFromResolved(resolved.value));
+  return resolveConversationThreadEmbeddingModel(cfg).map(
+    createConversationThreadEmbeddingAdapterFromResolved,
+  );
 }
 
 export function createConversationThreadEmbeddingAdapterResolver(
@@ -138,23 +138,20 @@ export function createConversationThreadEmbeddingAdapterResolver(
 
   const resolve = async (): Promise<ConversationThreadEmbeddingAdapter | null> => {
     const config = await getConfig();
-    const resolved = resolveConversationThreadEmbeddingModel(config);
-    if (resolved.status === "error") {
-      switch (resolved.error._tag) {
-        case "ModelResolutionFailed":
-          logger.warn(
-            "conversation thread embeddings disabled",
-            formatTaggedErrorForLog(resolved.error),
-          );
-          return null;
-      }
-    }
-    const key = embeddingAdapterCacheKey(resolved.value);
-    if (cached?.key === key) return cached.adapter;
+    return resolveConversationThreadEmbeddingModel(config).match({
+      err: (error) => () => {
+        logger.warn("conversation thread embeddings disabled", formatTaggedErrorForLog(error));
+        return null;
+      },
+      ok: (resolved) => () => {
+        const key = embeddingAdapterCacheKey(resolved);
+        if (cached?.key === key) return cached.adapter;
 
-    const adapter = createConversationThreadEmbeddingAdapterFromResolved(resolved.value);
-    cached = { key, adapter };
-    return adapter;
+        const adapter = createConversationThreadEmbeddingAdapterFromResolved(resolved);
+        cached = { key, adapter };
+        return adapter;
+      },
+    })();
   };
 
   return async () => {

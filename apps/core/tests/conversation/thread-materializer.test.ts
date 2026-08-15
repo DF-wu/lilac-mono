@@ -227,6 +227,40 @@ describe("conversation thread materializer coalescer", () => {
     expect(failures).toEqual([failure]);
   });
 
+  it("preserves onError Panic identity", async () => {
+    const callbackPanic = new Panic({ message: "materializer error observer failed" });
+    const materializer = createThreadMaterializer({
+      schedule: manualScheduler().schedule,
+      listChannelIds: async () => [],
+      async repairChannel() {
+        throw new ThreadMaterializerOperationFailed({
+          operation: "repair-channel",
+          message: "repair failed",
+        });
+      },
+      onError() {
+        throw callbackPanic;
+      },
+    });
+
+    materializer.markDirty({ channelId: "a", kind: "topology" });
+    await expect(materializer.flush()).rejects.toBe(callbackPanic);
+  });
+
+  it("preserves scheduler Panic identity after listing channels", async () => {
+    const schedulerPanic = new Panic({ message: "materializer scheduler failed" });
+    const materializer = createThreadMaterializer({
+      schedule() {
+        throw schedulerPanic;
+      },
+      listChannelIds: async () => ["a"],
+      async repairChannel() {},
+    });
+
+    materializer.markAllDirty();
+    await expect(materializer.flush()).rejects.toBe(schedulerPanic);
+  });
+
   it("preserves repair Panic identity", async () => {
     const panic = new Panic({ message: "repair invariant failed" });
     const materializer = createThreadMaterializer({

@@ -24,6 +24,7 @@ import {
   type CoreClaudeAttemptMutationError,
   type CoreClaudeBindingReadError,
   SqliteTranscriptStore,
+  TranscriptStoreSqliteDriverFailure,
 } from "../../src/transcript/transcript-store";
 import { selectCorePrimaryClaudePrefix } from "../../src/surface/bridge/bus-agent-runner/core-primary-continuation";
 
@@ -328,7 +329,11 @@ function seedPrimaryBinding(store: SqliteTranscriptStore, requestId: string, ses
   return { binding, canonicalMessages: [...inputMessages, ...responseMessages], manifest };
 }
 
-function seedNamedBinding(store: SqliteTranscriptStore, requestId: string, sessionId: string) {
+function prepareNamedBindingPromotion(
+  store: SqliteTranscriptStore,
+  requestId: string,
+  sessionId: string,
+) {
   const messages = [
     { role: "user", content: `input:${requestId}` },
     { role: "assistant", content: `response:${requestId}` },
@@ -373,14 +378,18 @@ function seedNamedBinding(store: SqliteTranscriptStore, requestId: string, sessi
       lastReasoning: "medium",
     }),
   );
+  return {
+    providerId: "claude-code",
+    requestClient: "discord",
+    lilacSessionId: sessionId,
+    requestId,
+    attemptIndex: 0,
+  } as const;
+}
+
+function seedNamedBinding(store: SqliteTranscriptStore, requestId: string, sessionId: string) {
   expect(
-    promoteNamedBinding(store, {
-      providerId: "claude-code",
-      requestClient: "discord",
-      lilacSessionId: sessionId,
-      requestId,
-      attemptIndex: 0,
-    }),
+    promoteNamedBinding(store, prepareNamedBindingPromotion(store, requestId, sessionId)),
   ).toBe(true);
 }
 
@@ -1179,6 +1188,35 @@ describe("SqliteTranscriptStore", () => {
     await fs.rm(dir, { recursive: true, force: true });
   });
 
+  it("preserves direct persistence diagnostic Panic identity", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-transcript-diagnostic-panic-"));
+    const dbPath = path.join(dir, "transcripts.db");
+    const callbackPanic = new Panic({ message: "transcript diagnostic callback failed" });
+    const store = new SqliteTranscriptStore(dbPath, undefined, () => {
+      throw callbackPanic;
+    });
+    resultValue(
+      store.saveRequestTranscript({
+        requestId: "corrupt-diagnostic-row",
+        sessionId: "session",
+        requestClient: "discord",
+        messages: [{ role: "user", content: "secret" }],
+      }),
+    );
+    const mutation = new Database(dbPath);
+    mutation.run("UPDATE request_transcripts SET messages_json = '{' WHERE request_id = ?", [
+      "corrupt-diagnostic-row",
+    ]);
+    mutation.close();
+
+    expect(() => store.getRequestTranscript({ requestId: "corrupt-diagnostic-row" })).toThrow(
+      callbackPanic,
+    );
+
+    store.close();
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+
   it("emits save and lineage diagnostics only after their transaction outcome is fixed", async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-save-diagnostics-"));
     const dbPath = path.join(dir, "transcripts.db");
@@ -1946,6 +1984,77 @@ describe("SqliteTranscriptStore", () => {
     await fs.rm(dir, { recursive: true, force: true });
   });
 
+  it("classifies a named promotion SQLite failure and rolls back trigger effects", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-named-promotion-rollback-"));
+    const dbPath = path.join(dir, "transcripts.db");
+    const store = new SqliteTranscriptStore(dbPath);
+    const promotion = prepareNamedBindingPromotion(store, "promotion-failure", "named-session");
+    const raw = new Database(dbPath);
+    raw.exec(`
+      CREATE TABLE named_promotion_probe (marker TEXT NOT NULL);
+      CREATE TRIGGER reject_named_promotion
+      BEFORE INSERT ON core_named_claude_bindings
+      BEGIN
+        INSERT INTO named_promotion_probe (marker) VALUES ('touched');
+        SELECT RAISE(ABORT, 'reject named promotion');
+      END;
+    `);
+
+    const promoted = store.promoteCoreNamedClaudeSessionBinding(promotion);
+
+    expect(promoted.status).toBe("error");
+    if (promoted.status === "error") {
+      expect(promoted.error).toBeInstanceOf(TranscriptStoreSqliteDriverFailure);
+      if (TranscriptStoreSqliteDriverFailure.is(promoted.error)) {
+        expect(promoted.error.operation).toBe("promote-core-named-claude-binding");
+      }
+    }
+    expect(raw.query("SELECT * FROM named_promotion_probe").all()).toEqual([]);
+    expect(raw.query("SELECT * FROM core_named_claude_bindings").all()).toEqual([]);
+    expect(
+      raw
+        .query<{ state: string }, [string]>(
+          "SELECT state FROM core_named_claude_attempts WHERE request_id = ?",
+        )
+        .get("promotion-failure"),
+    ).toEqual({ state: "succeeded" });
+
+    raw.close();
+    store.close();
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+
+  it("preserves lifecycle Panic identity after a named recovery promotion failure", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-named-recovery-panic-"));
+    const dbPath = path.join(dir, "transcripts.db");
+    const first = new SqliteTranscriptStore(dbPath);
+    prepareNamedBindingPromotion(first, "named-recovery-panic", "named-recovery-session");
+    first.close();
+    const raw = new Database(dbPath);
+    raw.exec(`
+      CREATE TRIGGER reject_named_recovery_promotion
+      BEFORE INSERT ON core_named_claude_bindings
+      BEGIN
+        SELECT RAISE(ABORT, 'reject named recovery promotion');
+      END;
+    `);
+    raw.close();
+    const panic = new Panic({ message: "named recovery lifecycle invariant" });
+    let caught: unknown;
+
+    try {
+      new SqliteTranscriptStore(dbPath, (_level, event) => {
+        expect(event).toBe("core_named_claude.promotion_recovery_failed");
+        throw panic;
+      });
+    } catch (cause) {
+      caught = cause;
+    }
+
+    expect(caught).toBe(panic);
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+
   it("recovers succeeded promotions, marks crash-left attempts uncertain, and cascades deleted heads", async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-transcripts-stage5-"));
     const dbPath = path.join(dir, "transcripts.db");
@@ -2379,6 +2488,64 @@ describe("SqliteTranscriptStore", () => {
         .all(),
     ).toContainEqual({ name: "core_primary_lineage_manifests" });
     migrated.close();
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+
+  it("rolls back the schema-v1 migration when a transcript is corrupt", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-transcripts-migration-rollback-"));
+    const dbPath = path.join(dir, "transcripts.db");
+    const db = new Database(dbPath);
+    db.run(`CREATE TABLE transcript_schema_migrations (
+      version INTEGER PRIMARY KEY, applied_ts INTEGER NOT NULL
+    )`);
+    db.run("INSERT INTO transcript_schema_migrations VALUES (1, 1)");
+    db.run(`CREATE TABLE request_transcripts (
+      request_id TEXT PRIMARY KEY,
+      session_id TEXT NOT NULL,
+      request_client TEXT NOT NULL,
+      created_ts INTEGER NOT NULL,
+      updated_ts INTEGER NOT NULL,
+      model_label TEXT,
+      final_text TEXT,
+      messages_json TEXT NOT NULL,
+      context_meta_json TEXT,
+      provider_state_json TEXT,
+      stable_named_request_client TEXT
+    )`);
+    db.run("INSERT INTO request_transcripts VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", [
+      "corrupt-v1",
+      "session",
+      "discord",
+      1,
+      1,
+      null,
+      null,
+      "not-superjson",
+      null,
+      null,
+      null,
+    ]);
+    db.close();
+
+    expect(() => new SqliteTranscriptStore(dbPath)).toThrow(
+      "Cannot migrate corrupt transcript messages to schema v2",
+    );
+
+    const rolledBack = new Database(dbPath);
+    expect(
+      rolledBack.query("SELECT version FROM transcript_schema_migrations ORDER BY version").all(),
+    ).toEqual([{ version: 1 }]);
+    expect(
+      rolledBack
+        .query("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'core_owned_blobs'")
+        .all(),
+    ).toEqual([]);
+    expect(
+      rolledBack
+        .query("SELECT name FROM pragma_table_info('request_transcripts') WHERE name = ?")
+        .all("transcript_digest"),
+    ).toEqual([]);
+    rolledBack.close();
     await fs.rm(dir, { recursive: true, force: true });
   });
 
@@ -3272,6 +3439,92 @@ describe("SqliteTranscriptStore", () => {
       })?.state,
     ).toBe("uncertain");
     recovered.close();
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+
+  it("preserves lifecycle Panic identity after a primary recovery promotion failure", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-primary-recovery-panic-"));
+    const dbPath = path.join(dir, "transcripts.db");
+    const requestId = "primary-recovery-panic";
+    const sessionId = "primary-recovery-session";
+    const inputMessages = [{ role: "user", content: "recover" }] satisfies ModelMessage[];
+    const responseMessages = [{ role: "assistant", content: "ready" }] satisfies ModelMessage[];
+    const manifest = buildCoreLineageManifestV1([syntheticManifestSegment(inputMessages)]);
+    const providerState = {
+      lastFamily: "claude-code",
+      containsCrossFamilyTurns: false,
+    } as const;
+    const first = new SqliteTranscriptStore(dbPath);
+    reservePrimaryAttempt(first, {
+      providerId: "claude-code",
+      requestClient: "discord",
+      lilacSessionId: sessionId,
+      executionScopeHashVersion: 1,
+      executionScopeHash: "scope",
+      requestId,
+      attemptIndex: 0,
+      candidateSessionId: crypto.randomUUID(),
+      sourceSessionId: null,
+      expectedBindingRevision: null,
+    });
+    first.saveRequestTranscript({
+      requestId,
+      sessionId,
+      requestClient: "discord",
+      messages: responseMessages,
+      corePrimaryLineage: manifest,
+    });
+    const transcript = getRequestTranscript(first, { requestId });
+    if (!transcript?.transcriptDigest) throw new Error("primary recovery transcript missing");
+    const head = computeCorePrimaryClaudeTerminalHead({
+      manifest,
+      requestId,
+      transcriptDigest: transcript.transcriptDigest,
+      responseMessageCount: responseMessages.length,
+      providerState,
+    });
+    first.publishCorePrimaryClaudeSuccess({
+      providerId: "claude-code",
+      requestClient: "discord",
+      lilacSessionId: sessionId,
+      requestId,
+      attemptIndex: 0,
+      terminalRequestId: requestId,
+      terminalLineageVersion: 1,
+      terminalAtomCount: head.atomCount,
+      terminalPrefixDigest: head.prefixDigest,
+      terminalCanonicalMessageCount: head.canonicalMessageCount,
+      providerState,
+      nativeCwd: "/workspace",
+      nativeLastModified: 10,
+      nativeContextTokens: 100,
+      nativeContextMaxTokens: 1_000,
+      lastModelSpecifier: "claude-code/sonnet",
+      lastReasoning: "medium",
+    });
+    first.close();
+    const raw = new Database(dbPath);
+    raw.exec(`
+      CREATE TRIGGER reject_primary_recovery_promotion
+      BEFORE INSERT ON core_primary_claude_bindings
+      BEGIN
+        SELECT RAISE(ABORT, 'reject primary recovery promotion');
+      END;
+    `);
+    raw.close();
+    const panic = new Panic({ message: "primary recovery lifecycle invariant" });
+    let caught: unknown;
+
+    try {
+      new SqliteTranscriptStore(dbPath, (_level, event) => {
+        expect(event).toBe("core_primary_claude.promotion_recovery_failed");
+        throw panic;
+      });
+    } catch (cause) {
+      caught = cause;
+    }
+
+    expect(caught).toBe(panic);
     await fs.rm(dir, { recursive: true, force: true });
   });
 

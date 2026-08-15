@@ -183,133 +183,156 @@ function nonEmptyStrings(values: readonly string[]): string[] {
   return values.filter((value) => value.length > 0);
 }
 
+function continuePersisted<T, U>(
+  result: ResultType<T, PersistedDataError>,
+  onOk: (value: T) => ResultType<U, PersistedDataError>,
+): ResultType<U, PersistedDataError> {
+  const continuation = result.match<() => ResultType<U, PersistedDataError>>({
+    err: (error) => () => Result.err(error),
+    ok: (value) => () => onOk(value),
+  });
+  return continuation();
+}
+
 export function decodeConversationThreadStringArray(
   input: ConversationThreadStringArrayCodecInput,
 ): ResultType<DecodedPersistedValue<string[]>, PersistedDataError> {
-  const version = decodeSummaryVersion(input.version, input.recordId);
-  if (version.status === "error") return Result.err(version.error);
-  if (input.raw === null) {
-    if (input.field === "topics_json") {
+  const versionResult = decodeSummaryVersion(input.version, input.recordId);
+  return continuePersisted(versionResult, (version) => {
+    if (input.raw === null) {
+      if (input.field === "topics_json") {
+        return Result.err(
+          corrupt({
+            field: input.field,
+            version: version.version,
+            issueCode: "missing-required-field",
+            recordId: input.recordId,
+          }),
+        );
+      }
+      return Result.ok<DecodedPersistedValue<string[]>>({
+        value: [],
+        provenance: "missing-defaulted",
+      });
+    }
+    if (typeof input.raw !== "string") {
       return Result.err(
         corrupt({
           field: input.field,
-          version: version.value.version,
-          issueCode: "missing-required-field",
+          version: version.version,
+          issueCode: "invalid-string-array",
           recordId: input.recordId,
         }),
       );
     }
-    return Result.ok({ value: [], provenance: "missing-defaulted" });
-  }
-  if (typeof input.raw !== "string") {
-    return Result.err(
-      corrupt({
-        field: input.field,
-        version: version.value.version,
-        issueCode: "invalid-string-array",
-        recordId: input.recordId,
-      }),
-    );
-  }
-  const parsed = parseJson({
-    raw: input.raw,
-    field: input.field,
-    version: version.value.version,
-    recordId: input.recordId,
-  });
-  if (parsed.status === "error") return Result.err(parsed.error);
-  const decoded = stringArraySchema.safeParse(parsed.value);
-  if (decoded.success) {
-    return Result.ok({
-      value: nonEmptyStrings(decoded.data),
-      provenance: version.value.provenance,
-    });
-  }
-  return Result.err(
-    corrupt({
+    const parsed = parseJson({
+      raw: input.raw,
       field: input.field,
-      version: version.value.version,
-      issueCode: Array.isArray(parsed.value) ? "mixed-string-array" : "invalid-string-array",
+      version: version.version,
       recordId: input.recordId,
-    }),
-  );
+    });
+    return continuePersisted(parsed, (parsedValue) => {
+      const decoded = stringArraySchema.safeParse(parsedValue);
+      if (decoded.success) {
+        return Result.ok<DecodedPersistedValue<string[]>>({
+          value: nonEmptyStrings(decoded.data),
+          provenance: version.provenance,
+        });
+      }
+      return Result.err(
+        corrupt({
+          field: input.field,
+          version: version.version,
+          issueCode: Array.isArray(parsedValue) ? "mixed-string-array" : "invalid-string-array",
+          recordId: input.recordId,
+        }),
+      );
+    });
+  });
 }
 
 export function decodeConversationThreadImportance(
   input: ConversationThreadImportanceCodecInput,
 ): ResultType<DecodedPersistedValue<ConversationThreadImportance>, PersistedDataError> {
-  const version = decodeSummaryVersion(input.version, input.recordId);
-  if (version.status === "error") return Result.err(version.error);
-  if (input.raw === null) {
-    return Result.ok({ value: "medium", provenance: "missing-defaulted" });
-  }
-  const decoded = importanceSchema.safeParse(input.raw);
-  if (!decoded.success) {
-    return Result.err(
-      corrupt({
-        field: "importance",
-        version: version.value.version,
-        issueCode: "invalid-importance",
-        recordId: input.recordId,
-      }),
-    );
-  }
-  return Result.ok({ value: decoded.data, provenance: version.value.provenance });
+  return decodeSummaryVersion(input.version, input.recordId).andThen((version) => {
+    if (input.raw === null) {
+      return Result.ok({ value: "medium", provenance: "missing-defaulted" });
+    }
+    const decoded = importanceSchema.safeParse(input.raw);
+    if (!decoded.success) {
+      return Result.err(
+        corrupt({
+          field: "importance",
+          version: version.version,
+          issueCode: "invalid-importance",
+          recordId: input.recordId,
+        }),
+      );
+    }
+    return Result.ok({ value: decoded.data, provenance: version.provenance });
+  });
 }
 
 export function decodeConversationThreadAboutness(
   input: ConversationThreadAboutnessCodecInput,
 ): ResultType<DecodedPersistedValue<ConversationThreadAboutness>, PersistedDataError> {
-  const version = decodeSummaryVersion(input.version, input.recordId);
-  if (version.status === "error") return Result.err(version.error);
-  const empty: ConversationThreadAboutness = {
-    domains: [],
-    situations: [],
-    complaintTargets: [],
-    entities: [],
-    userWouldAskForThisAs: [],
-  };
-  if (input.raw === null) return Result.ok({ value: empty, provenance: "missing-defaulted" });
-  if (typeof input.raw !== "string") {
-    return Result.err(
-      corrupt({
-        field: "aboutness_json",
-        version: version.value.version,
-        issueCode: "invalid-aboutness",
-        recordId: input.recordId,
-      }),
-    );
-  }
-  const parsed = parseJson({
-    raw: input.raw,
-    field: "aboutness_json",
-    version: version.value.version,
-    recordId: input.recordId,
-  });
-  if (parsed.status === "error") return Result.err(parsed.error);
-  const decoded =
-    version.value.version === 0
-      ? legacyAboutnessSchema.safeParse(parsed.value)
-      : currentAboutnessSchema.safeParse(parsed.value);
-  if (!decoded.success) {
-    return Result.err(
-      corrupt({
-        field: "aboutness_json",
-        version: version.value.version,
-        issueCode: "invalid-aboutness",
-        recordId: input.recordId,
-      }),
-    );
-  }
-  return Result.ok({
-    value: {
-      domains: nonEmptyStrings(decoded.data.domains ?? []),
-      situations: nonEmptyStrings(decoded.data.situations ?? []),
-      complaintTargets: nonEmptyStrings(decoded.data.complaintTargets ?? []),
-      entities: nonEmptyStrings(decoded.data.entities ?? []),
-      userWouldAskForThisAs: nonEmptyStrings(decoded.data.userWouldAskForThisAs ?? []),
-    },
-    provenance: version.value.provenance,
+  const versionResult = decodeSummaryVersion(input.version, input.recordId);
+  return continuePersisted(versionResult, (version) => {
+    const empty: ConversationThreadAboutness = {
+      domains: [],
+      situations: [],
+      complaintTargets: [],
+      entities: [],
+      userWouldAskForThisAs: [],
+    };
+    if (input.raw === null) {
+      return Result.ok<DecodedPersistedValue<ConversationThreadAboutness>>({
+        value: empty,
+        provenance: "missing-defaulted",
+      });
+    }
+    if (typeof input.raw !== "string") {
+      return Result.err(
+        corrupt({
+          field: "aboutness_json",
+          version: version.version,
+          issueCode: "invalid-aboutness",
+          recordId: input.recordId,
+        }),
+      );
+    }
+    const parsed = parseJson({
+      raw: input.raw,
+      field: "aboutness_json",
+      version: version.version,
+      recordId: input.recordId,
+    });
+    return continuePersisted(parsed, (parsedValue) => {
+      const decoded =
+        version.version === 0
+          ? legacyAboutnessSchema.safeParse(parsedValue)
+          : currentAboutnessSchema.safeParse(parsedValue);
+      if (!decoded.success) {
+        return Result.err(
+          corrupt({
+            field: "aboutness_json",
+            version: version.version,
+            issueCode: "invalid-aboutness",
+            recordId: input.recordId,
+          }),
+        );
+      }
+      return Result.ok<DecodedPersistedValue<ConversationThreadAboutness>>({
+        value: {
+          domains: nonEmptyStrings(decoded.data.domains ?? []),
+          situations: nonEmptyStrings(decoded.data.situations ?? []),
+          complaintTargets: nonEmptyStrings(decoded.data.complaintTargets ?? []),
+          entities: nonEmptyStrings(decoded.data.entities ?? []),
+          userWouldAskForThisAs: nonEmptyStrings(decoded.data.userWouldAskForThisAs ?? []),
+        },
+        provenance: version.provenance,
+      });
+    });
   });
 }
 
@@ -351,98 +374,132 @@ export function decodeConversationThreadSummaryRow(
   row: PersistedConversationThreadSummaryRow,
 ): ResultType<DecodedPersistedValue<DecodedConversationThreadSummaryRow>, PersistedDataError> {
   const recordId = typeof row.thread_id === "string" ? row.thread_id : "unknown-record";
-  const version = decodeSummaryVersion(row.summary_format_version, recordId);
-  if (version.status === "error") return Result.err(version.error);
-  const threadId = requiredString({
-    raw: row.thread_id,
-    field: "thread_id",
-    version: version.value.version,
-    recordId,
-  });
-  if (threadId.status === "error") return Result.err(threadId.error);
-  const title = requiredString({
-    raw: row.title,
-    field: "title",
-    version: version.value.version,
-    recordId,
-  });
-  if (title.status === "error") return Result.err(title.error);
-  const brief = requiredString({
-    raw: row.brief,
-    field: "brief",
-    version: version.value.version,
-    recordId,
-  });
-  if (brief.status === "error") return Result.err(brief.error);
-  const topics = decodeConversationThreadStringArray({
-    raw: row.topics_json,
-    version: row.summary_format_version,
-    field: "topics_json",
-    recordId,
-  });
-  if (topics.status === "error") return Result.err(topics.error);
-  const retrievalHints = decodeConversationThreadStringArray({
-    raw: row.retrieval_hints_json,
-    version: row.summary_format_version,
-    field: "retrieval_hints_json",
-    recordId,
-  });
-  if (retrievalHints.status === "error") return Result.err(retrievalHints.error);
-  const aboutness = decodeConversationThreadAboutness({
-    raw: row.aboutness_json,
-    version: row.summary_format_version,
-    recordId,
-  });
-  if (aboutness.status === "error") return Result.err(aboutness.error);
-  const importance = decodeConversationThreadImportance({
-    raw: row.importance,
-    version: row.summary_format_version,
-    recordId,
-  });
-  if (importance.status === "error") return Result.err(importance.error);
-  const importanceReasons = decodeConversationThreadStringArray({
-    raw: row.importance_reasons_json,
-    version: row.summary_format_version,
-    field: "importance_reasons_json",
-    recordId,
-  });
-  if (importanceReasons.status === "error") return Result.err(importanceReasons.error);
-  const createdAt = requiredTimestamp({
-    raw: row.created_at,
-    field: "created_at",
-    version: version.value.version,
-    recordId,
-  });
-  if (createdAt.status === "error") return Result.err(createdAt.error);
-  const updatedAt = requiredTimestamp({
-    raw: row.updated_at,
-    field: "updated_at",
-    version: version.value.version,
-    recordId,
-  });
-  if (updatedAt.status === "error") return Result.err(updatedAt.error);
-
-  const defaulted = [topics, retrievalHints, aboutness, importance, importanceReasons].some(
-    (decoded) => decoded.value.provenance === "missing-defaulted",
+  const versionResult = decodeSummaryVersion(row.summary_format_version, recordId);
+  return continuePersisted(versionResult, (version) =>
+    continuePersisted(
+      requiredString({
+        raw: row.thread_id,
+        field: "thread_id",
+        version: version.version,
+        recordId,
+      }),
+      (threadId) =>
+        continuePersisted(
+          requiredString({
+            raw: row.title,
+            field: "title",
+            version: version.version,
+            recordId,
+          }),
+          (title) =>
+            continuePersisted(
+              requiredString({
+                raw: row.brief,
+                field: "brief",
+                version: version.version,
+                recordId,
+              }),
+              (brief) =>
+                continuePersisted(
+                  decodeConversationThreadStringArray({
+                    raw: row.topics_json,
+                    version: row.summary_format_version,
+                    field: "topics_json",
+                    recordId,
+                  }),
+                  (topics) =>
+                    continuePersisted(
+                      decodeConversationThreadStringArray({
+                        raw: row.retrieval_hints_json,
+                        version: row.summary_format_version,
+                        field: "retrieval_hints_json",
+                        recordId,
+                      }),
+                      (retrievalHints) =>
+                        continuePersisted(
+                          decodeConversationThreadAboutness({
+                            raw: row.aboutness_json,
+                            version: row.summary_format_version,
+                            recordId,
+                          }),
+                          (aboutness) =>
+                            continuePersisted(
+                              decodeConversationThreadImportance({
+                                raw: row.importance,
+                                version: row.summary_format_version,
+                                recordId,
+                              }),
+                              (importance) =>
+                                continuePersisted(
+                                  decodeConversationThreadStringArray({
+                                    raw: row.importance_reasons_json,
+                                    version: row.summary_format_version,
+                                    field: "importance_reasons_json",
+                                    recordId,
+                                  }),
+                                  (importanceReasons) =>
+                                    continuePersisted(
+                                      requiredTimestamp({
+                                        raw: row.created_at,
+                                        field: "created_at",
+                                        version: version.version,
+                                        recordId,
+                                      }),
+                                      (createdAt) =>
+                                        continuePersisted(
+                                          requiredTimestamp({
+                                            raw: row.updated_at,
+                                            field: "updated_at",
+                                            version: version.version,
+                                            recordId,
+                                          }),
+                                          (updatedAt) => {
+                                            const defaulted = [
+                                              topics,
+                                              retrievalHints,
+                                              aboutness,
+                                              importance,
+                                              importanceReasons,
+                                            ].some(
+                                              (decoded) =>
+                                                decoded.provenance === "missing-defaulted",
+                                            );
+                                            let provenance:
+                                              | "current"
+                                              | "migrated"
+                                              | "missing-defaulted" = "current";
+                                            if (version.provenance === "migrated") {
+                                              provenance = "migrated";
+                                            } else if (defaulted) {
+                                              provenance = "missing-defaulted";
+                                            }
+                                            return Result.ok({
+                                              value: {
+                                                threadId,
+                                                title,
+                                                brief,
+                                                topics: topics.value,
+                                                retrievalHints: retrievalHints.value,
+                                                aboutness: aboutness.value,
+                                                importance: importance.value,
+                                                importanceReasons: importanceReasons.value,
+                                                createdAt,
+                                                updatedAt,
+                                              },
+                                              provenance,
+                                            });
+                                          },
+                                        ),
+                                    ),
+                                ),
+                            ),
+                        ),
+                    ),
+                ),
+            ),
+        ),
+    ),
   );
-  let provenance: "current" | "migrated" | "missing-defaulted" = "current";
-  if (version.value.provenance === "migrated") provenance = "migrated";
-  else if (defaulted) provenance = "missing-defaulted";
-  return Result.ok({
-    value: {
-      threadId: threadId.value,
-      title: title.value,
-      brief: brief.value,
-      topics: topics.value.value,
-      retrievalHints: retrievalHints.value.value,
-      aboutness: aboutness.value.value,
-      importance: importance.value.value,
-      importanceReasons: importanceReasons.value.value,
-      createdAt: createdAt.value,
-      updatedAt: updatedAt.value,
-    },
-    provenance,
-  });
 }
 
 const fixtureCurrentRow = {

@@ -35,6 +35,22 @@ const SEARCH_LIMIT_MAX = 50;
 const THREAD_DISCOVERY_GAP_MS = 60 * 60 * 1000;
 const threadStoreLogger = createLogger({ module: "conversation-thread-store" });
 
+function resultErrorOrNull<T, E>(result: ResultType<T, E>): E | null {
+  const select = result.match<() => E | null>({
+    ok: () => () => null,
+    err: (error) => () => error,
+  });
+  return select();
+}
+
+function selectResultValue<T, E extends Error>(result: ResultType<T, E>): T {
+  const select = result.match<() => T>({
+    ok: (value) => () => value,
+    err: (error) => () => adaptToolResultToHost(Result.err(error)),
+  });
+  return select();
+}
+
 export const CONVERSATION_THREAD_SUMMARY_VERSION = 5;
 export const CONVERSATION_THREAD_EMBEDDING_VERSION = 1;
 
@@ -679,20 +695,22 @@ export class ConversationThreadStore {
       try: () => sqliteVec.load(this.db),
       catch: (cause) => cause,
     });
-    if (loaded.status === "ok") {
-      this.vectorLoaded = true;
-      this.vectorLoadError = null;
-    } else {
-      if (!(loaded.error instanceof Error))
-        return signalConversationThreadStoreDefect(loaded.error);
-      const sqliteFailure = classifyConversationThreadSqliteDriverFailure(
-        loaded.error,
-        "load-vector-extension",
-      );
-      if (!sqliteFailure) return signalConversationThreadStoreDefect(loaded.error);
-      this.vectorLoaded = false;
-      this.vectorLoadError = sqliteFailure.message;
-    }
+    loaded.match({
+      ok: () => () => {
+        this.vectorLoaded = true;
+        this.vectorLoadError = null;
+      },
+      err: (error) => () => {
+        if (!(error instanceof Error)) return signalConversationThreadStoreDefect(error);
+        const sqliteFailure = classifyConversationThreadSqliteDriverFailure(
+          error,
+          "load-vector-extension",
+        );
+        if (!sqliteFailure) return signalConversationThreadStoreDefect(error);
+        this.vectorLoaded = false;
+        this.vectorLoadError = sqliteFailure.message;
+      },
+    })();
   }
 
   private attachSurfaceDb(): boolean {
@@ -709,13 +727,16 @@ export class ConversationThreadStore {
       },
       catch: (cause) => cause,
     });
-    if (attached.status === "ok") return attached.value;
-    if (!(attached.error instanceof Error))
-      return signalConversationThreadStoreDefect(attached.error);
-    if (!classifyConversationThreadSqliteDriverFailure(attached.error, "attach-surface-db")) {
-      return signalConversationThreadStoreDefect(attached.error);
-    }
-    return false;
+    return attached.match({
+      ok: (value) => () => value,
+      err: (error) => () => {
+        if (!(error instanceof Error)) return signalConversationThreadStoreDefect(error);
+        if (!classifyConversationThreadSqliteDriverFailure(error, "attach-surface-db")) {
+          return signalConversationThreadStoreDefect(error);
+        }
+        return false;
+      },
+    })();
   }
 
   private hasRequiredSurfaceTables(): boolean {
@@ -735,13 +756,16 @@ export class ConversationThreadStore {
       },
       catch: (cause) => cause,
     });
-    if (checked.status === "ok") return checked.value;
-    if (!(checked.error instanceof Error))
-      return signalConversationThreadStoreDefect(checked.error);
-    if (!classifyConversationThreadSqliteDriverFailure(checked.error, "inspect-surface-db")) {
-      return signalConversationThreadStoreDefect(checked.error);
-    }
-    return false;
+    return checked.match({
+      ok: (value) => () => value,
+      err: (error) => () => {
+        if (!(error instanceof Error)) return signalConversationThreadStoreDefect(error);
+        if (!classifyConversationThreadSqliteDriverFailure(error, "inspect-surface-db")) {
+          return signalConversationThreadStoreDefect(error);
+        }
+        return false;
+      },
+    })();
   }
 
   private ensureSurfaceDb(): boolean {
@@ -1308,11 +1332,16 @@ export class ConversationThreadStore {
       .get(threadId);
     if (!row) return Result.ok(null);
     const decoded = decodeConversationThreadSummaryRow(row);
-    if (decoded.status === "error") {
-      this.reportPersistenceError(decoded.error);
-      return Result.err(decoded.error);
-    }
-    return Result.ok(summaryFromDecodedRow(decoded.value.value));
+    const finish = decoded.match<
+      () => ResultType<ConversationThreadSummary | null, PersistedDataError>
+    >({
+      ok: (value) => () => Result.ok(summaryFromDecodedRow(value.value)),
+      err: (error) => () => {
+        this.reportPersistenceError(error);
+        return Result.err(error);
+      },
+    });
+    return finish();
   }
 
   listMessages(threadId: string, offset = 0, limit = 50): ConversationThreadMessage[] {
@@ -1416,13 +1445,12 @@ export class ConversationThreadStore {
     const thread = this.getThread(threadId);
     if (!thread) return Result.ok(null);
     const summary = this.getSummary(threadId);
-    if (summary.status === "error") return Result.err(summary.error);
-    return Result.ok({
+    return summary.map((value) => ({
       thread,
-      summary: summary.value,
+      summary: value,
       messages: this.listMessages(threadId, offset, limit),
       totalMessages: this.countThreadMessages(threadId),
-    });
+    }));
   }
 
   listThreadsForSummarizationClear(input?: {
@@ -1832,13 +1860,13 @@ export class ConversationThreadStore {
       },
       classifyConversationThreadSqliteDriverFailure,
     );
-
-    if (transaction.status === "error") return Result.err(transaction.error);
-    if (!transaction.value) return Result.ok(null);
-    const filteredFacets = facets.filter((facet) => facet.text.trim().length > 0);
-    return Result.ok({
-      facets: filteredFacets,
-      embeddingInputHash: computeFacetHash(filteredFacets) || embeddingHash,
+    return transaction.map((written) => {
+      if (!written) return null;
+      const filteredFacets = facets.filter((facet) => facet.text.trim().length > 0);
+      return {
+        facets: filteredFacets,
+        embeddingInputHash: computeFacetHash(filteredFacets) || embeddingHash,
+      };
     });
   }
 
@@ -1953,11 +1981,12 @@ export class ConversationThreadStore {
     const hits: ConversationThreadSearchHit[] = [];
     for (const row of rows) {
       const decoded = decodeConversationThreadSummaryRow(row);
-      if (decoded.status === "error") {
-        this.reportPersistenceError(decoded.error);
-        return Result.err(decoded.error);
+      const decodeError = resultErrorOrNull(decoded);
+      if (decodeError) {
+        this.reportPersistenceError(decodeError);
+        return Result.err(decodeError);
       }
-      const summary = decoded.value.value;
+      const summary = selectResultValue(decoded).value;
       const summarized =
         row.last_summarized_at !== null &&
         row.last_summarized_at >= row.updated_at &&
@@ -2050,11 +2079,12 @@ export class ConversationThreadStore {
     const hits: ConversationThreadSearchHit[] = [];
     for (const row of rows) {
       const decoded = decodeConversationThreadSummaryRow(row);
-      if (decoded.status === "error") {
-        this.reportPersistenceError(decoded.error);
-        return Result.err(decoded.error);
+      const decodeError = resultErrorOrNull(decoded);
+      if (decodeError) {
+        this.reportPersistenceError(decodeError);
+        return Result.err(decodeError);
       }
-      const summary = decoded.value.value;
+      const summary = selectResultValue(decoded).value;
       const summarized =
         row.last_summarized_at !== null &&
         row.last_summarized_at >= row.updated_at &&

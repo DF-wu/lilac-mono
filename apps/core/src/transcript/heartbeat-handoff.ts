@@ -226,7 +226,7 @@ function safeStringify(value: HeartbeatInputValue): string {
     try: () => JSON.stringify(value) ?? String(value),
     catch: () => "[unserializable heartbeat input]",
   });
-  return serialized.status === "ok" ? serialized.value : serialized.error;
+  return serialized.match({ ok: (value) => value, err: (error) => error });
 }
 
 function extractAssistantSummary(messages: readonly ModelMessage[]): string | undefined {

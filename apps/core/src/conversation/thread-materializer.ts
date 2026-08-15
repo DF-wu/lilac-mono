@@ -101,13 +101,16 @@ export function createThreadMaterializer(params: {
             : { channelId, kind: "content", messageIds: [...repair.messageIds] },
         ),
       );
-      if (repaired.status === "error") {
-        reportError(repaired.error, {
-          operation: "repair-channel",
-          channelId,
-          kind: repair.kind,
-        });
-      }
+      const finishRepair = repaired.match<() => void>({
+        ok: () => () => undefined,
+        err: (error) => () =>
+          reportError(error, {
+            operation: "repair-channel",
+            channelId,
+            kind: repair.kind,
+          }),
+      });
+      finishRepair();
     }
   };
 
@@ -180,13 +183,15 @@ export function createThreadMaterializer(params: {
       let listingTask: Promise<void>;
       listingTask = (async () => {
         const listed = await captureMaterializerOperation(params.listChannelIds);
-        if (listed.status === "error") {
-          reportError(listed.error, { operation: "list-channels" });
-          return;
-        }
-        for (const channelId of listed.value) {
-          enqueueDirty({ channelId, kind: "topology" });
-        }
+        const finishListing = listed.match<() => void>({
+          err: (error) => () => reportError(error, { operation: "list-channels" }),
+          ok: (channelIds) => () => {
+            for (const channelId of channelIds) {
+              enqueueDirty({ channelId, kind: "topology" });
+            }
+          },
+        });
+        finishListing();
       })().finally(() => {
         listingTasks.delete(listingTask);
       });

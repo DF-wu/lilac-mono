@@ -695,7 +695,7 @@ function decodeSerialized(input: {
   readonly field: string;
   readonly version: number;
   readonly recordId: string;
-}): ResultType<unknown, MalformedSerialization> {
+}): ResultType<unknown, MalformedSerialization | Panic> {
   const decoded = Result.try({
     try: () => {
       const json: unknown = globalThis.JSON.parse(input.raw);
@@ -707,19 +707,39 @@ function decodeSerialized(input: {
     },
     catch: (cause) => cause,
   });
-  if (decoded.status === "ok") return Result.ok(decoded.value);
-  if (Panic.is(decoded.error)) return adaptToolResultToHost(Result.err(decoded.error));
-  return Result.err(
-    new MalformedSerialization(
-      context({
-        table: input.table,
-        field: input.field,
-        version: input.version,
-        issueCode: "malformed-json",
-        recordId: input.recordId,
-      }),
-    ),
-  );
+  const finish = decoded.match<() => ResultType<unknown, MalformedSerialization | Panic>>({
+    ok: (value) => () => Result.ok(value),
+    err: (error) => () => {
+      if (Panic.is(error)) return Result.err(error);
+      return Result.err(
+        new MalformedSerialization(
+          context({
+            table: input.table,
+            field: input.field,
+            version: input.version,
+            issueCode: "malformed-json",
+            recordId: input.recordId,
+          }),
+        ),
+      );
+    },
+  });
+  return finish();
+}
+
+type TranscriptPersistenceDecodeError = PersistedDataError | Panic;
+
+function adaptTranscriptPersistenceDecodeResult<T>(
+  result: ResultType<T, TranscriptPersistenceDecodeError>,
+): ResultType<T, PersistedDataError> {
+  const adapt = result.match<() => ResultType<T, PersistedDataError>>({
+    ok: (value) => () => Result.ok(value),
+    err: (error) => () => {
+      if (Panic.is(error)) return adaptToolResultToHost(Result.err(error));
+      return Result.err(error);
+    },
+  });
+  return adapt();
 }
 
 function decodeNormalizedMessagesValue(
@@ -777,35 +797,40 @@ export function decodeTranscriptMessages(input: {
   readonly schemaVersion: number;
   readonly recordId: string;
 }): ResultType<DecodedPersistedValue<DecodedModelMessage[]>, PersistedDataError> {
-  const version = decodeSchemaVersion(input.schemaVersion, TRANSCRIPT_TABLE, input.recordId);
-  if (version.status === "error") return Result.err(version.error);
-  if (typeof input.raw !== "string") {
-    return Result.err(
-      corrupt({
+  return adaptTranscriptPersistenceDecodeResult(
+    Result.gen(function* () {
+      const version = yield* decodeSchemaVersion(
+        input.schemaVersion,
+        TRANSCRIPT_TABLE,
+        input.recordId,
+      );
+      if (typeof input.raw !== "string") {
+        return Result.err(
+          corrupt({
+            table: TRANSCRIPT_TABLE,
+            field: "messages_json",
+            version: version.version,
+            issueCode: "missing-required-field",
+            recordId: input.recordId,
+          }),
+        );
+      }
+      const serialized = yield* decodeSerialized({
+        raw: input.raw,
         table: TRANSCRIPT_TABLE,
         field: "messages_json",
-        version: version.value.version,
-        issueCode: "missing-required-field",
+        version: version.version,
         recordId: input.recordId,
-      }),
-    );
-  }
-  const serialized = decodeSerialized({
-    raw: input.raw,
-    table: TRANSCRIPT_TABLE,
-    field: "messages_json",
-    version: version.value.version,
-    recordId: input.recordId,
-  });
-  if (serialized.status === "error") return Result.err(serialized.error);
-  const messages = decodeNormalizedMessagesValue(serialized.value, {
-    table: TRANSCRIPT_TABLE,
-    field: "messages_json",
-    version: version.value.version,
-    recordId: input.recordId,
-  });
-  if (messages.status === "error") return Result.err(messages.error);
-  return Result.ok({ value: messages.value, provenance: version.value.provenance });
+      });
+      const messages = yield* decodeNormalizedMessagesValue(serialized, {
+        table: TRANSCRIPT_TABLE,
+        field: "messages_json",
+        version: version.version,
+        recordId: input.recordId,
+      });
+      return Result.ok({ value: messages, provenance: version.provenance });
+    }),
+  );
 }
 
 export function decodeTranscriptCompactionContext(input: {
@@ -813,30 +838,40 @@ export function decodeTranscriptCompactionContext(input: {
   readonly schemaVersion: number;
   readonly recordId: string;
 }): ResultType<DecodedPersistedValue<CompactionCheckpointMeta | undefined>, PersistedDataError> {
-  const version = decodeSchemaVersion(input.schemaVersion, TRANSCRIPT_TABLE, input.recordId);
-  if (version.status === "error") return Result.err(version.error);
-  if (input.raw === null) return Result.ok({ value: undefined, provenance: "missing-defaulted" });
-  const serialized = decodeSerialized({
-    raw: input.raw,
-    table: TRANSCRIPT_TABLE,
-    field: "context_meta_json",
-    version: version.value.version,
-    recordId: input.recordId,
-  });
-  if (serialized.status === "error") return Result.err(serialized.error);
-  const decoded = compactionCheckpointMetaSchema.safeParse(serialized.value);
-  if (!decoded.success) {
-    return Result.err(
-      corrupt({
+  return adaptTranscriptPersistenceDecodeResult(
+    Result.gen(function* () {
+      const version = yield* decodeSchemaVersion(
+        input.schemaVersion,
+        TRANSCRIPT_TABLE,
+        input.recordId,
+      );
+      if (input.raw === null)
+        return Result.ok<DecodedPersistedValue<CompactionCheckpointMeta | undefined>>({
+          value: undefined,
+          provenance: "missing-defaulted",
+        });
+      const serialized = yield* decodeSerialized({
+        raw: input.raw,
         table: TRANSCRIPT_TABLE,
         field: "context_meta_json",
-        version: version.value.version,
-        issueCode: "invalid-compaction-context",
+        version: version.version,
         recordId: input.recordId,
-      }),
-    );
-  }
-  return Result.ok({ value: decoded.data, provenance: version.value.provenance });
+      });
+      const decoded = compactionCheckpointMetaSchema.safeParse(serialized);
+      if (!decoded.success) {
+        return Result.err(
+          corrupt({
+            table: TRANSCRIPT_TABLE,
+            field: "context_meta_json",
+            version: version.version,
+            issueCode: "invalid-compaction-context",
+            recordId: input.recordId,
+          }),
+        );
+      }
+      return Result.ok({ value: decoded.data, provenance: version.provenance });
+    }),
+  );
 }
 
 export function decodeTranscriptProviderState(input: {
@@ -844,30 +879,40 @@ export function decodeTranscriptProviderState(input: {
   readonly schemaVersion: number;
   readonly recordId: string;
 }): ResultType<DecodedPersistedValue<HistoryProviderState | null>, PersistedDataError> {
-  const version = decodeSchemaVersion(input.schemaVersion, TRANSCRIPT_TABLE, input.recordId);
-  if (version.status === "error") return Result.err(version.error);
-  if (input.raw === null) return Result.ok({ value: null, provenance: "missing-defaulted" });
-  const serialized = decodeSerialized({
-    raw: input.raw,
-    table: TRANSCRIPT_TABLE,
-    field: "provider_state_json",
-    version: version.value.version,
-    recordId: input.recordId,
-  });
-  if (serialized.status === "error") return Result.err(serialized.error);
-  const decoded = historyProviderStateSchema.safeParse(serialized.value);
-  if (!decoded.success) {
-    return Result.err(
-      corrupt({
+  return adaptTranscriptPersistenceDecodeResult(
+    Result.gen(function* () {
+      const version = yield* decodeSchemaVersion(
+        input.schemaVersion,
+        TRANSCRIPT_TABLE,
+        input.recordId,
+      );
+      if (input.raw === null)
+        return Result.ok<DecodedPersistedValue<HistoryProviderState | null>>({
+          value: null,
+          provenance: "missing-defaulted",
+        });
+      const serialized = yield* decodeSerialized({
+        raw: input.raw,
         table: TRANSCRIPT_TABLE,
         field: "provider_state_json",
-        version: version.value.version,
-        issueCode: "invalid-provider-state",
+        version: version.version,
         recordId: input.recordId,
-      }),
-    );
-  }
-  return Result.ok({ value: decoded.data, provenance: version.value.provenance });
+      });
+      const decoded = historyProviderStateSchema.safeParse(serialized);
+      if (!decoded.success) {
+        return Result.err(
+          corrupt({
+            table: TRANSCRIPT_TABLE,
+            field: "provider_state_json",
+            version: version.version,
+            issueCode: "invalid-provider-state",
+            recordId: input.recordId,
+          }),
+        );
+      }
+      return Result.ok({ value: decoded.data, provenance: version.provenance });
+    }),
+  );
 }
 
 function aggregateProvenance(
@@ -885,28 +930,33 @@ export function decodeSurfaceMessageLinkRow(input: {
   readonly schemaVersion: number;
   readonly recordId: string;
 }): ResultType<DecodedRequiredPersistedValue<DecodedSurfaceMessageLinkRow>, PersistedDataError> {
-  const version = decodeSchemaVersion(input.schemaVersion, SURFACE_LINK_TABLE, input.recordId);
-  if (version.status === "error") return Result.err(version.error);
-  const decoded = surfaceMessageLinkRowSchema.safeParse(input.row);
-  if (!decoded.success) {
-    return Result.err(
-      corrupt({
-        table: SURFACE_LINK_TABLE,
-        field: "surface-message-link-row",
-        version: version.value.version,
-        issueCode: "invalid-transcript-row",
-        recordId: input.recordId,
-      }),
+  return Result.gen(function* () {
+    const version = yield* decodeSchemaVersion(
+      input.schemaVersion,
+      SURFACE_LINK_TABLE,
+      input.recordId,
     );
-  }
-  return Result.ok({
-    value: {
-      requestId: decoded.data.request_id,
-      platform: decoded.data.platform,
-      channelId: decoded.data.channel_id,
-      messageId: decoded.data.message_id,
-    },
-    provenance: version.value.provenance,
+    const decoded = surfaceMessageLinkRowSchema.safeParse(input.row);
+    if (!decoded.success) {
+      return Result.err(
+        corrupt({
+          table: SURFACE_LINK_TABLE,
+          field: "surface-message-link-row",
+          version: version.version,
+          issueCode: "invalid-transcript-row",
+          recordId: input.recordId,
+        }),
+      );
+    }
+    return Result.ok({
+      value: {
+        requestId: decoded.data.request_id,
+        platform: decoded.data.platform,
+        channelId: decoded.data.channel_id,
+        messageId: decoded.data.message_id,
+      },
+      provenance: version.provenance,
+    });
   });
 }
 
@@ -915,30 +965,35 @@ export function decodeRecentAgentWriteRow(input: {
   readonly schemaVersion: number;
   readonly recordId: string;
 }): ResultType<DecodedRequiredPersistedValue<DecodedRecentAgentWriteRow>, PersistedDataError> {
-  const version = decodeSchemaVersion(input.schemaVersion, SURFACE_LINK_TABLE, input.recordId);
-  if (version.status === "error") return Result.err(version.error);
-  const decoded = recentAgentWriteRowSchema.safeParse(input.row);
-  if (!decoded.success) {
-    return Result.err(
-      corrupt({
-        table: SURFACE_LINK_TABLE,
-        field: "recent-agent-write-row",
-        version: version.value.version,
-        issueCode: "invalid-transcript-row",
-        recordId: input.recordId,
-      }),
+  return Result.gen(function* () {
+    const version = yield* decodeSchemaVersion(
+      input.schemaVersion,
+      SURFACE_LINK_TABLE,
+      input.recordId,
     );
-  }
-  return Result.ok({
-    value: {
-      requestId: decoded.data.request_id,
-      platform: decoded.data.platform,
-      channelId: decoded.data.channel_id,
-      messageId: decoded.data.message_id,
-      updatedTs: decoded.data.updated_ts,
-      finalText: decoded.data.final_text,
-    },
-    provenance: version.value.provenance,
+    const decoded = recentAgentWriteRowSchema.safeParse(input.row);
+    if (!decoded.success) {
+      return Result.err(
+        corrupt({
+          table: SURFACE_LINK_TABLE,
+          field: "recent-agent-write-row",
+          version: version.version,
+          issueCode: "invalid-transcript-row",
+          recordId: input.recordId,
+        }),
+      );
+    }
+    return Result.ok({
+      value: {
+        requestId: decoded.data.request_id,
+        platform: decoded.data.platform,
+        channelId: decoded.data.channel_id,
+        messageId: decoded.data.message_id,
+        updatedTs: decoded.data.updated_ts,
+        finalText: decoded.data.final_text,
+      },
+      provenance: version.provenance,
+    });
   });
 }
 
@@ -947,57 +1002,62 @@ export function decodeDiscoveryRecordRow(input: {
   readonly schemaVersion: number;
   readonly recordId: string;
 }): ResultType<DecodedRequiredPersistedValue<DecodedDiscoveryRecordRow>, PersistedDataError> {
-  const version = decodeSchemaVersion(input.schemaVersion, TRANSCRIPT_TABLE, input.recordId);
-  if (version.status === "error") return Result.err(version.error);
-  const decoded = discoveryRecordRowSchema.safeParse(input.row);
-  if (!decoded.success) {
-    return Result.err(
-      corrupt({
-        table: TRANSCRIPT_TABLE,
-        field: "discovery-record-row",
-        version: version.value.version,
-        issueCode: "invalid-transcript-row",
-        recordId: input.recordId,
-      }),
+  return Result.gen(function* () {
+    const version = yield* decodeSchemaVersion(
+      input.schemaVersion,
+      TRANSCRIPT_TABLE,
+      input.recordId,
     );
-  }
-  const linkedValues = [
-    decoded.data.surface_platform,
-    decoded.data.surface_channel_id,
-    decoded.data.surface_message_id,
-    decoded.data.surface_created_ts,
-  ];
-  const hasLinkedValue = linkedValues.some((value) => value !== null);
-  if (hasLinkedValue && linkedValues.some((value) => value === null)) {
-    return Result.err(
-      corrupt({
-        table: TRANSCRIPT_TABLE,
-        field: "discovery-record-row",
-        version: version.value.version,
-        issueCode: "invalid-transcript-row",
-        recordId: input.recordId,
-      }),
-    );
-  }
-  return Result.ok({
-    value: {
-      requestId: decoded.data.request_id,
-      sessionId: decoded.data.session_id,
-      requestClient: decoded.data.request_client,
-      updatedTs: decoded.data.updated_ts,
-      finalText: decoded.data.final_text,
-      surfaceRef:
-        decoded.data.surface_platform === null ||
-        decoded.data.surface_channel_id === null ||
-        decoded.data.surface_message_id === null
-          ? null
-          : {
-              platform: decoded.data.surface_platform,
-              channelId: decoded.data.surface_channel_id,
-              messageId: decoded.data.surface_message_id,
-            },
-    },
-    provenance: version.value.provenance,
+    const decoded = discoveryRecordRowSchema.safeParse(input.row);
+    if (!decoded.success) {
+      return Result.err(
+        corrupt({
+          table: TRANSCRIPT_TABLE,
+          field: "discovery-record-row",
+          version: version.version,
+          issueCode: "invalid-transcript-row",
+          recordId: input.recordId,
+        }),
+      );
+    }
+    const linkedValues = [
+      decoded.data.surface_platform,
+      decoded.data.surface_channel_id,
+      decoded.data.surface_message_id,
+      decoded.data.surface_created_ts,
+    ];
+    const hasLinkedValue = linkedValues.some((value) => value !== null);
+    if (hasLinkedValue && linkedValues.some((value) => value === null)) {
+      return Result.err(
+        corrupt({
+          table: TRANSCRIPT_TABLE,
+          field: "discovery-record-row",
+          version: version.version,
+          issueCode: "invalid-transcript-row",
+          recordId: input.recordId,
+        }),
+      );
+    }
+    return Result.ok({
+      value: {
+        requestId: decoded.data.request_id,
+        sessionId: decoded.data.session_id,
+        requestClient: decoded.data.request_client,
+        updatedTs: decoded.data.updated_ts,
+        finalText: decoded.data.final_text,
+        surfaceRef:
+          decoded.data.surface_platform === null ||
+          decoded.data.surface_channel_id === null ||
+          decoded.data.surface_message_id === null
+            ? null
+            : {
+                platform: decoded.data.surface_platform,
+                channelId: decoded.data.surface_channel_id,
+                messageId: decoded.data.surface_message_id,
+              },
+      },
+      provenance: version.provenance,
+    });
   });
 }
 
@@ -1073,290 +1133,328 @@ export function decodeTranscriptRow(
   PersistedDataError
 > {
   if ("storeKind" in input) {
-    const version = decodeSchemaVersion(input.schemaVersion, TRANSCRIPT_TABLE, input.recordId);
-    if (version.status === "error") return Result.err(version.error);
-    const invalidRow = () =>
-      Result.err(
-        corrupt({
-          table: TRANSCRIPT_TABLE,
-          field: input.storeKind,
-          version: version.value.version,
-          issueCode: "invalid-transcript-row",
-          recordId: input.recordId,
-        }),
-      );
-    switch (input.storeKind) {
-      case "migration-version": {
-        const decoded = transcriptMigrationVersionRowSchema.safeParse(input.row);
-        return decoded.success
-          ? Result.ok({ value: decoded.data, provenance: version.value.provenance })
-          : invalidRow();
-      }
-      case "foreign-key-failure": {
-        const decoded = transcriptForeignKeyFailureRowSchema.safeParse(input.row);
-        return decoded.success
-          ? Result.ok({ value: decoded.data, provenance: version.value.provenance })
-          : invalidRow();
-      }
-      case "count": {
-        const decoded = transcriptCountRowSchema.safeParse(input.row);
-        return decoded.success
-          ? Result.ok({ value: decoded.data, provenance: version.value.provenance })
-          : invalidRow();
-      }
-      case "blob-metrics": {
-        const decoded = transcriptBlobMetricsRowSchema.safeParse(input.row);
-        return decoded.success
-          ? Result.ok({
-              value: {
-                ownedBytes: decoded.data.owned_bytes,
-                unreferencedCount: decoded.data.unreferenced_count,
-                unreferencedBytes: decoded.data.unreferenced_bytes,
-              },
-              provenance: version.value.provenance,
-            })
-          : invalidRow();
-      }
-      case "owned-blob": {
-        const decoded = coreOwnedBlobRowSchema.safeParse(input.row);
-        if (!decoded.success) return invalidRow();
-        if (decoded.data.bytes.byteLength !== decoded.data.byte_length) return invalidRow();
-        const digest = createHash("sha256").update(decoded.data.bytes).digest("hex");
-        if (digest !== decoded.data.sha256) return invalidRow();
-        return Result.ok({
-          value: {
-            sha256: decoded.data.sha256,
-            mediaType: decoded.data.media_type,
-            filename: decoded.data.filename,
-            byteLength: decoded.data.byte_length,
-            bytes: new Uint8Array(decoded.data.bytes),
-            createdAt: decoded.data.created_ts,
-          },
-          provenance: version.value.provenance,
-        });
-      }
-      case "named-binding": {
-        const decoded = coreNamedClaudeBindingRowSchema.safeParse(input.row);
-        if (!decoded.success) return invalidRow();
-        return Result.ok({
-          value: {
-            bindingProtocolVersion: decoded.data.binding_protocol_version,
-            providerId: decoded.data.provider_id,
-            providerFamily: decoded.data.provider_family,
-            requestClient: decoded.data.request_client,
-            lilacSessionId: decoded.data.session_id,
-            terminalRequestId: decoded.data.terminal_request_id,
-            canonicalHashVersion: decoded.data.canonical_hash_version,
-            canonicalHeadHash: decoded.data.canonical_head_hash,
-            canonicalMessageCount: decoded.data.canonical_message_count,
-            executionScopeHashVersion: decoded.data.execution_scope_hash_version,
-            executionScopeHash: decoded.data.execution_scope_hash,
-            claudeSessionId: decoded.data.claude_session_id,
-            nativeCwd: decoded.data.native_cwd,
-            nativeLastModified: decoded.data.native_last_modified,
-            nativeContextTokens: decoded.data.native_context_tokens,
-            nativeContextMaxTokens: decoded.data.native_context_max_tokens,
-            lastModelSpecifier: decoded.data.last_model_specifier,
-            lastReasoning: decoded.data.last_reasoning,
-            revision: decoded.data.revision,
-            updatedAt: decoded.data.updated_ts,
-          },
-          provenance: version.value.provenance,
-        });
-      }
-      case "named-attempt": {
-        const decoded = coreNamedClaudeAttemptRowSchema.safeParse(input.row);
-        if (!decoded.success) return invalidRow();
-        return Result.ok({
-          value: {
-            product: decoded.data.product,
-            providerId: decoded.data.provider_id,
-            requestClient: decoded.data.request_client,
-            lilacSessionId: decoded.data.session_id,
-            sourceTerminalRequestId: decoded.data.source_terminal_request_id,
-            sourceCanonicalHeadHash: decoded.data.source_canonical_head_hash,
-            sourceCanonicalMessageCount: decoded.data.source_canonical_message_count,
-            executionScopeHashVersion: decoded.data.execution_scope_hash_version,
-            executionScopeHash: decoded.data.execution_scope_hash,
-            requestId: decoded.data.request_id,
-            attemptIndex: decoded.data.attempt_index,
-            candidateSessionId: decoded.data.candidate_session_id,
-            sourceSessionId: decoded.data.source_session_id,
-            expectedBindingRevision: decoded.data.expected_binding_revision,
-            state: decoded.data.state,
-            terminalRequestId: decoded.data.terminal_request_id,
-            terminalCanonicalHeadHash: decoded.data.terminal_canonical_head_hash,
-            terminalCanonicalMessageCount: decoded.data.terminal_canonical_message_count,
-            nativeCwd: decoded.data.native_cwd,
-            nativeLastModified: decoded.data.native_last_modified,
-            nativeContextTokens: decoded.data.native_context_tokens,
-            nativeContextMaxTokens: decoded.data.native_context_max_tokens,
-            lastModelSpecifier: decoded.data.last_model_specifier,
-            lastReasoning: decoded.data.last_reasoning,
-            createdAt: decoded.data.created_ts,
-            updatedAt: decoded.data.updated_ts,
-          },
-          provenance: version.value.provenance,
-        });
-      }
-      case "primary-binding": {
-        const decoded = corePrimaryClaudeBindingRowSchema.safeParse(input.row);
-        if (!decoded.success) return invalidRow();
-        return Result.ok({
-          value: {
-            bindingProtocolVersion: decoded.data.binding_protocol_version,
-            providerId: decoded.data.provider_id,
-            providerFamily: decoded.data.provider_family,
-            requestClient: decoded.data.request_client,
-            lilacSessionId: decoded.data.session_id,
-            terminalRequestId: decoded.data.terminal_request_id,
-            lineageVersion: decoded.data.lineage_version,
-            atomCount: decoded.data.atom_count,
-            prefixDigest: decoded.data.prefix_digest,
-            canonicalMessageCount: decoded.data.canonical_message_count,
-            executionScopeHashVersion: decoded.data.execution_scope_hash_version,
-            executionScopeHash: decoded.data.execution_scope_hash,
-            claudeSessionId: decoded.data.claude_session_id,
-            nativeCwd: decoded.data.native_cwd,
-            nativeLastModified: decoded.data.native_last_modified,
-            nativeContextTokens: decoded.data.native_context_tokens,
-            nativeContextMaxTokens: decoded.data.native_context_max_tokens,
-            lastModelSpecifier: decoded.data.last_model_specifier,
-            lastReasoning: decoded.data.last_reasoning,
-            revision: decoded.data.revision,
-            updatedAt: decoded.data.updated_ts,
-          },
-          provenance: version.value.provenance,
-        });
-      }
-      case "primary-attempt": {
-        const decoded = corePrimaryClaudeAttemptRowSchema.safeParse(input.row);
-        if (!decoded.success) return invalidRow();
-        return Result.ok({
-          value: {
-            product: decoded.data.product,
-            providerId: decoded.data.provider_id,
-            requestClient: decoded.data.request_client,
-            lilacSessionId: decoded.data.session_id,
-            sourceLineageVersion: decoded.data.source_lineage_version,
-            sourceAtomCount: decoded.data.source_atom_count,
-            sourcePrefixDigest: decoded.data.source_prefix_digest,
-            sourceCanonicalMessageCount: decoded.data.source_canonical_message_count,
-            executionScopeHashVersion: decoded.data.execution_scope_hash_version,
-            executionScopeHash: decoded.data.execution_scope_hash,
-            requestId: decoded.data.request_id,
-            attemptIndex: decoded.data.attempt_index,
-            candidateSessionId: decoded.data.candidate_session_id,
-            sourceSessionId: decoded.data.source_session_id,
-            expectedBindingRevision: decoded.data.expected_binding_revision,
-            state: decoded.data.state,
-            terminalRequestId: decoded.data.terminal_request_id,
-            terminalLineageVersion: decoded.data.terminal_lineage_version,
-            terminalAtomCount: decoded.data.terminal_atom_count,
-            terminalPrefixDigest: decoded.data.terminal_prefix_digest,
-            terminalCanonicalMessageCount: decoded.data.terminal_canonical_message_count,
-            nativeCwd: decoded.data.native_cwd,
-            nativeLastModified: decoded.data.native_last_modified,
-            nativeContextTokens: decoded.data.native_context_tokens,
-            nativeContextMaxTokens: decoded.data.native_context_max_tokens,
-            lastModelSpecifier: decoded.data.last_model_specifier,
-            lastReasoning: decoded.data.last_reasoning,
-            createdAt: decoded.data.created_ts,
-            updatedAt: decoded.data.updated_ts,
-          },
-          provenance: version.value.provenance,
-        });
-      }
-    }
+    const decodeStoreRow = decodeSchemaVersion(
+      input.schemaVersion,
+      TRANSCRIPT_TABLE,
+      input.recordId,
+    ).match<() => ResultType<DecodedPersistedValue<DecodedTranscriptStoreRow>, PersistedDataError>>(
+      {
+        err: (error) => () => Result.err(error),
+        ok: (version) => () => {
+          const invalidRow = () =>
+            Result.err(
+              corrupt({
+                table: TRANSCRIPT_TABLE,
+                field: input.storeKind,
+                version: version.version,
+                issueCode: "invalid-transcript-row",
+                recordId: input.recordId,
+              }),
+            );
+          switch (input.storeKind) {
+            case "migration-version": {
+              const decoded = transcriptMigrationVersionRowSchema.safeParse(input.row);
+              return decoded.success
+                ? Result.ok({ value: decoded.data, provenance: version.provenance })
+                : invalidRow();
+            }
+            case "foreign-key-failure": {
+              const decoded = transcriptForeignKeyFailureRowSchema.safeParse(input.row);
+              return decoded.success
+                ? Result.ok({ value: decoded.data, provenance: version.provenance })
+                : invalidRow();
+            }
+            case "count": {
+              const decoded = transcriptCountRowSchema.safeParse(input.row);
+              return decoded.success
+                ? Result.ok({ value: decoded.data, provenance: version.provenance })
+                : invalidRow();
+            }
+            case "blob-metrics": {
+              const decoded = transcriptBlobMetricsRowSchema.safeParse(input.row);
+              return decoded.success
+                ? Result.ok({
+                    value: {
+                      ownedBytes: decoded.data.owned_bytes,
+                      unreferencedCount: decoded.data.unreferenced_count,
+                      unreferencedBytes: decoded.data.unreferenced_bytes,
+                    },
+                    provenance: version.provenance,
+                  })
+                : invalidRow();
+            }
+            case "owned-blob": {
+              const decoded = coreOwnedBlobRowSchema.safeParse(input.row);
+              if (!decoded.success) return invalidRow();
+              if (decoded.data.bytes.byteLength !== decoded.data.byte_length) return invalidRow();
+              const digest = createHash("sha256").update(decoded.data.bytes).digest("hex");
+              if (digest !== decoded.data.sha256) return invalidRow();
+              return Result.ok({
+                value: {
+                  sha256: decoded.data.sha256,
+                  mediaType: decoded.data.media_type,
+                  filename: decoded.data.filename,
+                  byteLength: decoded.data.byte_length,
+                  bytes: new Uint8Array(decoded.data.bytes),
+                  createdAt: decoded.data.created_ts,
+                },
+                provenance: version.provenance,
+              });
+            }
+            case "named-binding": {
+              const decoded = coreNamedClaudeBindingRowSchema.safeParse(input.row);
+              if (!decoded.success) return invalidRow();
+              return Result.ok({
+                value: {
+                  bindingProtocolVersion: decoded.data.binding_protocol_version,
+                  providerId: decoded.data.provider_id,
+                  providerFamily: decoded.data.provider_family,
+                  requestClient: decoded.data.request_client,
+                  lilacSessionId: decoded.data.session_id,
+                  terminalRequestId: decoded.data.terminal_request_id,
+                  canonicalHashVersion: decoded.data.canonical_hash_version,
+                  canonicalHeadHash: decoded.data.canonical_head_hash,
+                  canonicalMessageCount: decoded.data.canonical_message_count,
+                  executionScopeHashVersion: decoded.data.execution_scope_hash_version,
+                  executionScopeHash: decoded.data.execution_scope_hash,
+                  claudeSessionId: decoded.data.claude_session_id,
+                  nativeCwd: decoded.data.native_cwd,
+                  nativeLastModified: decoded.data.native_last_modified,
+                  nativeContextTokens: decoded.data.native_context_tokens,
+                  nativeContextMaxTokens: decoded.data.native_context_max_tokens,
+                  lastModelSpecifier: decoded.data.last_model_specifier,
+                  lastReasoning: decoded.data.last_reasoning,
+                  revision: decoded.data.revision,
+                  updatedAt: decoded.data.updated_ts,
+                },
+                provenance: version.provenance,
+              });
+            }
+            case "named-attempt": {
+              const decoded = coreNamedClaudeAttemptRowSchema.safeParse(input.row);
+              if (!decoded.success) return invalidRow();
+              return Result.ok({
+                value: {
+                  product: decoded.data.product,
+                  providerId: decoded.data.provider_id,
+                  requestClient: decoded.data.request_client,
+                  lilacSessionId: decoded.data.session_id,
+                  sourceTerminalRequestId: decoded.data.source_terminal_request_id,
+                  sourceCanonicalHeadHash: decoded.data.source_canonical_head_hash,
+                  sourceCanonicalMessageCount: decoded.data.source_canonical_message_count,
+                  executionScopeHashVersion: decoded.data.execution_scope_hash_version,
+                  executionScopeHash: decoded.data.execution_scope_hash,
+                  requestId: decoded.data.request_id,
+                  attemptIndex: decoded.data.attempt_index,
+                  candidateSessionId: decoded.data.candidate_session_id,
+                  sourceSessionId: decoded.data.source_session_id,
+                  expectedBindingRevision: decoded.data.expected_binding_revision,
+                  state: decoded.data.state,
+                  terminalRequestId: decoded.data.terminal_request_id,
+                  terminalCanonicalHeadHash: decoded.data.terminal_canonical_head_hash,
+                  terminalCanonicalMessageCount: decoded.data.terminal_canonical_message_count,
+                  nativeCwd: decoded.data.native_cwd,
+                  nativeLastModified: decoded.data.native_last_modified,
+                  nativeContextTokens: decoded.data.native_context_tokens,
+                  nativeContextMaxTokens: decoded.data.native_context_max_tokens,
+                  lastModelSpecifier: decoded.data.last_model_specifier,
+                  lastReasoning: decoded.data.last_reasoning,
+                  createdAt: decoded.data.created_ts,
+                  updatedAt: decoded.data.updated_ts,
+                },
+                provenance: version.provenance,
+              });
+            }
+            case "primary-binding": {
+              const decoded = corePrimaryClaudeBindingRowSchema.safeParse(input.row);
+              if (!decoded.success) return invalidRow();
+              return Result.ok({
+                value: {
+                  bindingProtocolVersion: decoded.data.binding_protocol_version,
+                  providerId: decoded.data.provider_id,
+                  providerFamily: decoded.data.provider_family,
+                  requestClient: decoded.data.request_client,
+                  lilacSessionId: decoded.data.session_id,
+                  terminalRequestId: decoded.data.terminal_request_id,
+                  lineageVersion: decoded.data.lineage_version,
+                  atomCount: decoded.data.atom_count,
+                  prefixDigest: decoded.data.prefix_digest,
+                  canonicalMessageCount: decoded.data.canonical_message_count,
+                  executionScopeHashVersion: decoded.data.execution_scope_hash_version,
+                  executionScopeHash: decoded.data.execution_scope_hash,
+                  claudeSessionId: decoded.data.claude_session_id,
+                  nativeCwd: decoded.data.native_cwd,
+                  nativeLastModified: decoded.data.native_last_modified,
+                  nativeContextTokens: decoded.data.native_context_tokens,
+                  nativeContextMaxTokens: decoded.data.native_context_max_tokens,
+                  lastModelSpecifier: decoded.data.last_model_specifier,
+                  lastReasoning: decoded.data.last_reasoning,
+                  revision: decoded.data.revision,
+                  updatedAt: decoded.data.updated_ts,
+                },
+                provenance: version.provenance,
+              });
+            }
+            case "primary-attempt": {
+              const decoded = corePrimaryClaudeAttemptRowSchema.safeParse(input.row);
+              if (!decoded.success) return invalidRow();
+              return Result.ok({
+                value: {
+                  product: decoded.data.product,
+                  providerId: decoded.data.provider_id,
+                  requestClient: decoded.data.request_client,
+                  lilacSessionId: decoded.data.session_id,
+                  sourceLineageVersion: decoded.data.source_lineage_version,
+                  sourceAtomCount: decoded.data.source_atom_count,
+                  sourcePrefixDigest: decoded.data.source_prefix_digest,
+                  sourceCanonicalMessageCount: decoded.data.source_canonical_message_count,
+                  executionScopeHashVersion: decoded.data.execution_scope_hash_version,
+                  executionScopeHash: decoded.data.execution_scope_hash,
+                  requestId: decoded.data.request_id,
+                  attemptIndex: decoded.data.attempt_index,
+                  candidateSessionId: decoded.data.candidate_session_id,
+                  sourceSessionId: decoded.data.source_session_id,
+                  expectedBindingRevision: decoded.data.expected_binding_revision,
+                  state: decoded.data.state,
+                  terminalRequestId: decoded.data.terminal_request_id,
+                  terminalLineageVersion: decoded.data.terminal_lineage_version,
+                  terminalAtomCount: decoded.data.terminal_atom_count,
+                  terminalPrefixDigest: decoded.data.terminal_prefix_digest,
+                  terminalCanonicalMessageCount: decoded.data.terminal_canonical_message_count,
+                  nativeCwd: decoded.data.native_cwd,
+                  nativeLastModified: decoded.data.native_last_modified,
+                  nativeContextTokens: decoded.data.native_context_tokens,
+                  nativeContextMaxTokens: decoded.data.native_context_max_tokens,
+                  lastModelSpecifier: decoded.data.last_model_specifier,
+                  lastReasoning: decoded.data.last_reasoning,
+                  createdAt: decoded.data.created_ts,
+                  updatedAt: decoded.data.updated_ts,
+                },
+                provenance: version.provenance,
+              });
+            }
+          }
+        },
+      },
+    );
+    return decodeStoreRow();
   }
   const recordId =
     typeof input.row.request_id === "string" ? input.row.request_id : "unknown-record";
-  const version = decodeSchemaVersion(input.schemaVersion, TRANSCRIPT_TABLE, recordId);
-  if (version.status === "error") return Result.err(version.error);
-  const rowSchema = z
-    .object({
-      request_id: z.string().min(1),
-      session_id: z.string().min(1),
-      request_client: adapterPlatformSchema,
-      created_ts: nonNegativeIntegerSchema,
-      updated_ts: nonNegativeIntegerSchema,
-      model_label: z.string().nullable(),
-      final_text: z.string().nullable(),
-      messages_json: z.string(),
-      context_meta_json: z.string().nullable(),
-      provider_state_json: z.string().nullable(),
-      stable_named_request_client: adapterPlatformSchema.nullable(),
-      transcript_digest: z.string().nullable(),
-    })
-    .safeParse(input.row);
-  if (!rowSchema.success) {
-    return Result.err(
-      corrupt({
-        table: TRANSCRIPT_TABLE,
-        field: "row",
-        version: version.value.version,
-        issueCode: "invalid-transcript-row",
+  const decodeRow = decodeSchemaVersion(input.schemaVersion, TRANSCRIPT_TABLE, recordId).match<
+    () => ResultType<DecodedPersistedValue<DecodedTranscriptRow>, PersistedDataError>
+  >({
+    err: (error) => () => Result.err(error),
+    ok: (version) => () => {
+      const rowSchema = z
+        .object({
+          request_id: z.string().min(1),
+          session_id: z.string().min(1),
+          request_client: adapterPlatformSchema,
+          created_ts: nonNegativeIntegerSchema,
+          updated_ts: nonNegativeIntegerSchema,
+          model_label: z.string().nullable(),
+          final_text: z.string().nullable(),
+          messages_json: z.string(),
+          context_meta_json: z.string().nullable(),
+          provider_state_json: z.string().nullable(),
+          stable_named_request_client: adapterPlatformSchema.nullable(),
+          transcript_digest: z.string().nullable(),
+        })
+        .safeParse(input.row);
+      if (!rowSchema.success) {
+        return Result.err(
+          corrupt({
+            table: TRANSCRIPT_TABLE,
+            field: "row",
+            version: version.version,
+            issueCode: "invalid-transcript-row",
+            recordId,
+          }),
+        );
+      }
+      const continueWithMessages = decodeTranscriptMessages({
+        raw: rowSchema.data.messages_json,
+        schemaVersion: version.version,
         recordId,
-      }),
-    );
-  }
-  const messages = decodeTranscriptMessages({
-    raw: rowSchema.data.messages_json,
-    schemaVersion: version.value.version,
-    recordId,
-  });
-  if (messages.status === "error") return Result.err(messages.error);
-  const contextMeta = decodeTranscriptCompactionContext({
-    raw: rowSchema.data.context_meta_json,
-    schemaVersion: version.value.version,
-    recordId,
-  });
-  if (contextMeta.status === "error") return Result.err(contextMeta.error);
-  const providerState = decodeTranscriptProviderState({
-    raw: rowSchema.data.provider_state_json,
-    schemaVersion: version.value.version,
-    recordId,
-  });
-  if (providerState.status === "error") return Result.err(providerState.error);
-  const computedDigest = hashCanonicalMessagesV1(messages.value.value).hash;
-  if (rowSchema.data.transcript_digest !== null) {
-    const digest = sha256HexSchema.safeParse(rowSchema.data.transcript_digest);
-    if (!digest.success || digest.data !== computedDigest) {
-      return Result.err(
-        corrupt({
-          table: TRANSCRIPT_TABLE,
-          field: "transcript_digest",
-          version: version.value.version,
-          issueCode: "digest-mismatch",
-          recordId,
-        }),
-      );
-    }
-  }
-  return Result.ok({
-    value: {
-      requestId: rowSchema.data.request_id,
-      sessionId: rowSchema.data.session_id,
-      requestClient: rowSchema.data.request_client,
-      createdTs: rowSchema.data.created_ts,
-      updatedTs: rowSchema.data.updated_ts,
-      messages: messages.value.value,
-      ...(rowSchema.data.final_text === null ? {} : { finalText: rowSchema.data.final_text }),
-      ...(rowSchema.data.model_label === null ? {} : { modelLabel: rowSchema.data.model_label }),
-      ...(contextMeta.value.value === undefined ? {} : { contextMeta: contextMeta.value.value }),
-      providerState: providerState.value.value,
-      ...(rowSchema.data.stable_named_request_client === null
-        ? {}
-        : { stableNamedRequestClient: rowSchema.data.stable_named_request_client }),
-      canonicalHashVersion: CORE_TRANSCRIPT_DIGEST_VERSION,
-      transcriptDigest: computedDigest,
+      }).match<() => ResultType<DecodedPersistedValue<DecodedTranscriptRow>, PersistedDataError>>({
+        err: (error) => () => Result.err(error),
+        ok: (messages) => () => {
+          const continueWithContextMeta = decodeTranscriptCompactionContext({
+            raw: rowSchema.data.context_meta_json,
+            schemaVersion: version.version,
+            recordId,
+          }).match<
+            () => ResultType<DecodedPersistedValue<DecodedTranscriptRow>, PersistedDataError>
+          >({
+            err: (error) => () => Result.err(error),
+            ok: (contextMeta) => () => {
+              const continueWithProviderState = decodeTranscriptProviderState({
+                raw: rowSchema.data.provider_state_json,
+                schemaVersion: version.version,
+                recordId,
+              }).match<
+                () => ResultType<DecodedPersistedValue<DecodedTranscriptRow>, PersistedDataError>
+              >({
+                err: (error) => () => Result.err(error),
+                ok: (providerState) => () => {
+                  const computedDigest = hashCanonicalMessagesV1(messages.value).hash;
+                  if (rowSchema.data.transcript_digest !== null) {
+                    const digest = sha256HexSchema.safeParse(rowSchema.data.transcript_digest);
+                    if (!digest.success || digest.data !== computedDigest) {
+                      return Result.err(
+                        corrupt({
+                          table: TRANSCRIPT_TABLE,
+                          field: "transcript_digest",
+                          version: version.version,
+                          issueCode: "digest-mismatch",
+                          recordId,
+                        }),
+                      );
+                    }
+                  }
+                  return Result.ok({
+                    value: {
+                      requestId: rowSchema.data.request_id,
+                      sessionId: rowSchema.data.session_id,
+                      requestClient: rowSchema.data.request_client,
+                      createdTs: rowSchema.data.created_ts,
+                      updatedTs: rowSchema.data.updated_ts,
+                      messages: messages.value,
+                      ...(rowSchema.data.final_text === null
+                        ? {}
+                        : { finalText: rowSchema.data.final_text }),
+                      ...(rowSchema.data.model_label === null
+                        ? {}
+                        : { modelLabel: rowSchema.data.model_label }),
+                      ...(contextMeta.value === undefined
+                        ? {}
+                        : { contextMeta: contextMeta.value }),
+                      providerState: providerState.value,
+                      ...(rowSchema.data.stable_named_request_client === null
+                        ? {}
+                        : { stableNamedRequestClient: rowSchema.data.stable_named_request_client }),
+                      canonicalHashVersion: CORE_TRANSCRIPT_DIGEST_VERSION,
+                      transcriptDigest: computedDigest,
+                    },
+                    provenance: aggregateProvenance(version, [
+                      messages,
+                      contextMeta,
+                      providerState,
+                    ]),
+                  });
+                },
+              });
+              return continueWithProviderState();
+            },
+          });
+          return continueWithContextMeta();
+        },
+      });
+      return continueWithMessages();
     },
-    provenance: aggregateProvenance(version.value, [
-      messages.value,
-      contextMeta.value,
-      providerState.value,
-    ]),
   });
+  return decodeRow();
 }
 
 export function decodeCoreSurfaceProjectionRow(input: {
@@ -1371,81 +1469,85 @@ export function decodeCoreSurfaceProjectionRow(input: {
   readonly row: PersistedCoreSurfaceProjectionRow | null;
   readonly schemaVersion: number;
 }): ResultType<DecodedPersistedValue<DecodedCoreSurfaceProjectionRow | null>, PersistedDataError> {
-  if (input.row === null) return Result.ok({ value: null, provenance: "missing-defaulted" });
-  const recordId = `${input.row.request_client}:${input.row.surface_id}:${input.row.session_id}:${input.row.message_id}`;
-  const version = decodeSchemaVersion(input.schemaVersion, PROJECTION_TABLE, recordId);
-  if (version.status === "error") return Result.err(version.error);
-  const row = z
-    .object({
-      request_client: adapterPlatformSchema,
-      surface_id: z.string().min(1),
-      session_id: z.string().min(1),
-      message_id: z.string().min(1),
-      projection_format_version: z.literal(CORE_SURFACE_PROJECTION_FORMAT_VERSION),
-      canonical_messages_json: z.string(),
-      source_facts_json: z.string(),
-      created_ts: nonNegativeIntegerSchema,
-    })
-    .safeParse(input.row);
-  if (!row.success) {
-    return Result.err(
-      corrupt({
+  return adaptTranscriptPersistenceDecodeResult(
+    Result.gen(function* () {
+      if (input.row === null)
+        return Result.ok<DecodedPersistedValue<DecodedCoreSurfaceProjectionRow | null>>({
+          value: null,
+          provenance: "missing-defaulted",
+        });
+      const recordId = `${input.row.request_client}:${input.row.surface_id}:${input.row.session_id}:${input.row.message_id}`;
+      const version = yield* decodeSchemaVersion(input.schemaVersion, PROJECTION_TABLE, recordId);
+      const row = z
+        .object({
+          request_client: adapterPlatformSchema,
+          surface_id: z.string().min(1),
+          session_id: z.string().min(1),
+          message_id: z.string().min(1),
+          projection_format_version: z.literal(CORE_SURFACE_PROJECTION_FORMAT_VERSION),
+          canonical_messages_json: z.string(),
+          source_facts_json: z.string(),
+          created_ts: nonNegativeIntegerSchema,
+        })
+        .safeParse(input.row);
+      if (!row.success) {
+        return Result.err(
+          corrupt({
+            table: PROJECTION_TABLE,
+            field: "row",
+            version: version.version,
+            issueCode: "invalid-surface-projection",
+            recordId,
+          }),
+        );
+      }
+      const canonicalSerialized = yield* decodeSerialized({
+        raw: row.data.canonical_messages_json,
         table: PROJECTION_TABLE,
-        field: "row",
-        version: version.value.version,
-        issueCode: "invalid-surface-projection",
+        field: "canonical_messages_json",
+        version: version.version,
         recordId,
-      }),
-    );
-  }
-  const canonicalSerialized = decodeSerialized({
-    raw: row.data.canonical_messages_json,
-    table: PROJECTION_TABLE,
-    field: "canonical_messages_json",
-    version: version.value.version,
-    recordId,
-  });
-  if (canonicalSerialized.status === "error") return Result.err(canonicalSerialized.error);
-  const canonicalMessages = decodeNormalizedMessagesValue(canonicalSerialized.value, {
-    table: PROJECTION_TABLE,
-    field: "canonical_messages_json",
-    version: version.value.version,
-    recordId,
-  });
-  if (canonicalMessages.status === "error") return Result.err(canonicalMessages.error);
-  const factsSerialized = decodeSerialized({
-    raw: row.data.source_facts_json,
-    table: PROJECTION_TABLE,
-    field: "source_facts_json",
-    version: version.value.version,
-    recordId,
-  });
-  if (factsSerialized.status === "error") return Result.err(factsSerialized.error);
-  const sourceFacts = coreProjectionSourceFactsSchema.safeParse(factsSerialized.value);
-  if (!sourceFacts.success) {
-    return Result.err(
-      corrupt({
+      });
+      const canonicalMessages = yield* decodeNormalizedMessagesValue(canonicalSerialized, {
+        table: PROJECTION_TABLE,
+        field: "canonical_messages_json",
+        version: version.version,
+        recordId,
+      });
+      const factsSerialized = yield* decodeSerialized({
+        raw: row.data.source_facts_json,
         table: PROJECTION_TABLE,
         field: "source_facts_json",
-        version: version.value.version,
-        issueCode: "invalid-surface-projection",
+        version: version.version,
         recordId,
-      }),
-    );
-  }
-  return Result.ok({
-    value: {
-      requestClient: row.data.request_client,
-      surfaceId: row.data.surface_id,
-      sessionId: row.data.session_id,
-      messageId: row.data.message_id,
-      projectionFormatVersion: row.data.projection_format_version,
-      canonicalMessages: canonicalMessages.value,
-      sourceFacts: sourceFacts.data,
-      createdAt: row.data.created_ts,
-    },
-    provenance: version.value.provenance,
-  });
+      });
+      const sourceFacts = coreProjectionSourceFactsSchema.safeParse(factsSerialized);
+      if (!sourceFacts.success) {
+        return Result.err(
+          corrupt({
+            table: PROJECTION_TABLE,
+            field: "source_facts_json",
+            version: version.version,
+            issueCode: "invalid-surface-projection",
+            recordId,
+          }),
+        );
+      }
+      return Result.ok({
+        value: {
+          requestClient: row.data.request_client,
+          surfaceId: row.data.surface_id,
+          sessionId: row.data.session_id,
+          messageId: row.data.message_id,
+          projectionFormatVersion: row.data.projection_format_version,
+          canonicalMessages,
+          sourceFacts: sourceFacts.data,
+          createdAt: row.data.created_ts,
+        },
+        provenance: version.provenance,
+      });
+    }),
+  );
 }
 
 export function decodeCoreLineageManifestRow(input: {
@@ -1460,70 +1562,86 @@ export function decodeCoreLineageManifestRow(input: {
   readonly row: PersistedCoreLineageManifestRow | null;
   readonly schemaVersion: number;
 }): ResultType<DecodedPersistedValue<DecodedCoreLineageManifestV1 | null>, PersistedDataError> {
-  if (input.row === null) return Result.ok({ value: null, provenance: "missing-defaulted" });
-  const recordId =
-    typeof input.row.request_id === "string" ? input.row.request_id : "unknown-record";
-  const version = decodeSchemaVersion(input.schemaVersion, LINEAGE_TABLE, recordId);
-  if (version.status === "error") return Result.err(version.error);
-  if (input.row.lineage_version !== 1 || typeof input.row.manifest_json !== "string") {
-    return Result.err(
-      corrupt({
-        table: LINEAGE_TABLE,
-        field: "row",
-        version: version.value.version,
-        issueCode: "invalid-lineage-manifest",
-        recordId,
-      }),
-    );
-  }
-  const serialized = decodeSerialized({
-    raw: input.row.manifest_json,
-    table: LINEAGE_TABLE,
-    field: "manifest_json",
-    version: version.value.version,
-    recordId,
-  });
-  if (serialized.status === "error") return Result.err(serialized.error);
-  const parsed = coreLineageManifestV1Schema.safeParse(serialized.value);
-  if (!parsed.success) {
-    return Result.err(
-      corrupt({
+  return adaptTranscriptPersistenceDecodeResult(
+    Result.gen(function* () {
+      if (input.row === null)
+        return Result.ok<DecodedPersistedValue<DecodedCoreLineageManifestV1 | null>>({
+          value: null,
+          provenance: "missing-defaulted",
+        });
+      const recordId =
+        typeof input.row.request_id === "string" ? input.row.request_id : "unknown-record";
+      const version = yield* decodeSchemaVersion(input.schemaVersion, LINEAGE_TABLE, recordId);
+      if (input.row.lineage_version !== 1 || typeof input.row.manifest_json !== "string") {
+        return Result.err(
+          corrupt({
+            table: LINEAGE_TABLE,
+            field: "row",
+            version: version.version,
+            issueCode: "invalid-lineage-manifest",
+            recordId,
+          }),
+        );
+      }
+      const serialized = yield* decodeSerialized({
+        raw: input.row.manifest_json,
         table: LINEAGE_TABLE,
         field: "manifest_json",
-        version: version.value.version,
-        issueCode: "invalid-lineage-manifest",
+        version: version.version,
         recordId,
-      }),
-    );
-  }
-  const segments: DecodedCoreLineageSegmentV1[] = [];
-  for (const segment of parsed.data.segments) {
-    const canonicalMessages = decodeNormalizedMessagesValue(segment.canonicalMessages, {
-      table: LINEAGE_TABLE,
-      field: "manifest_json",
-      version: version.value.version,
-      recordId,
-    });
-    if (canonicalMessages.status === "error") return Result.err(canonicalMessages.error);
-    segments.push({ ...segment, canonicalMessages: canonicalMessages.value });
-  }
-  const decodedManifest: DecodedCoreLineageManifestV1 = { ...parsed.data, segments };
-  const canonicalMessages = decodedManifest.segments.flatMap(
-    (segment) => segment.canonicalMessages,
+      });
+      const parsed = coreLineageManifestV1Schema.safeParse(serialized);
+      if (!parsed.success) {
+        return Result.err(
+          corrupt({
+            table: LINEAGE_TABLE,
+            field: "manifest_json",
+            version: version.version,
+            issueCode: "invalid-lineage-manifest",
+            recordId,
+          }),
+        );
+      }
+      const segments: DecodedCoreLineageSegmentV1[] = [];
+      for (const segment of parsed.data.segments) {
+        const canonicalMessages = yield* decodeNormalizedMessagesValue(segment.canonicalMessages, {
+          table: LINEAGE_TABLE,
+          field: "manifest_json",
+          version: version.version,
+          recordId,
+        });
+        segments.push({ ...segment, canonicalMessages });
+      }
+      const decodedManifest: DecodedCoreLineageManifestV1 = { ...parsed.data, segments };
+      const canonicalMessages = decodedManifest.segments.flatMap(
+        (segment) => segment.canonicalMessages,
+      );
+      const lineage = yield* decodeCorePrimaryLineageV1(
+        decodedManifest,
+        canonicalMessages,
+      ).mapError(() =>
+        corrupt({
+          table: LINEAGE_TABLE,
+          field: "manifest_json",
+          version: version.version,
+          issueCode: "invalid-lineage-manifest",
+          recordId,
+        }),
+      );
+      if (lineage.state !== "complete") {
+        return Result.err(
+          corrupt({
+            table: LINEAGE_TABLE,
+            field: "manifest_json",
+            version: version.version,
+            issueCode: "invalid-lineage-manifest",
+            recordId,
+          }),
+        );
+      }
+      return Result.ok({ value: decodedManifest, provenance: version.provenance });
+    }),
   );
-  const lineage = decodeCorePrimaryLineageV1(decodedManifest, canonicalMessages);
-  if (lineage.status === "error" || lineage.value.state !== "complete") {
-    return Result.err(
-      corrupt({
-        table: LINEAGE_TABLE,
-        field: "manifest_json",
-        version: version.value.version,
-        issueCode: "invalid-lineage-manifest",
-        recordId,
-      }),
-    );
-  }
-  return Result.ok({ value: decodedManifest, provenance: version.value.provenance });
 }
 
 const fixtureMessages = '[{"role":"assistant","content":"fixture"}]';

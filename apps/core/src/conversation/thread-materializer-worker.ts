@@ -95,59 +95,60 @@ export function startConversationThreadMaterializer(params: {
     target.setMessageHandler((event) => {
       if (target !== worker) return;
       const decoded = decodeThreadMaterializerWorkerResponse(event.data);
-      if (decoded.status === "error") {
-        const error = new ThreadMaterializerOperationFailed({
-          operation: "worker-protocol",
-          message: "conversation thread materializer worker sent an invalid response",
-        });
-        logger.error(
-          "conversation thread materializer worker protocol error",
-          formatTaggedErrorForLog(error),
-        );
-        restartWorker(error);
-        return;
-      }
+      decoded.match({
+        err: () => {
+          const error = new ThreadMaterializerOperationFailed({
+            operation: "worker-protocol",
+            message: "conversation thread materializer worker sent an invalid response",
+          });
+          logger.error(
+            "conversation thread materializer worker protocol error",
+            formatTaggedErrorForLog(error),
+          );
+          restartWorker(error);
+        },
+        ok: (response) => {
+          const request = pending.get(response.id);
+          if (!request) {
+            const error = new ThreadMaterializerOperationFailed({
+              operation: "worker-protocol",
+              message: "conversation thread materializer worker response had no pending request",
+            });
+            logger.warn("conversation thread materializer worker response had no pending request", {
+              requestId: response.id,
+            });
+            restartWorker(error);
+            return;
+          }
+          pending.delete(response.id);
 
-      const response = decoded.value;
-      const request = pending.get(response.id);
-      if (!request) {
-        const error = new ThreadMaterializerOperationFailed({
-          operation: "worker-protocol",
-          message: "conversation thread materializer worker response had no pending request",
-        });
-        logger.warn("conversation thread materializer worker response had no pending request", {
-          requestId: response.id,
-        });
-        restartWorker(error);
-        return;
-      }
-      pending.delete(response.id);
+          if (!response.ok) {
+            request.reject(
+              new ThreadMaterializerOperationFailed({
+                operation: request.type === "list-channels" ? "list-channels" : "repair-channel",
+                message: response.error,
+              }),
+            );
+            scheduleRecovery();
+            return;
+          }
+          if (request.type === "list-channels" && response.type === "list-channels") {
+            request.resolve(response.channelIds);
+            return;
+          }
+          if (request.type === "repair-channel" && response.type === "repair-channel") {
+            request.resolve();
+            return;
+          }
 
-      if (!response.ok) {
-        request.reject(
-          new ThreadMaterializerOperationFailed({
-            operation: request.type === "list-channels" ? "list-channels" : "repair-channel",
-            message: response.error,
-          }),
-        );
-        scheduleRecovery();
-        return;
-      }
-      if (request.type === "list-channels" && response.type === "list-channels") {
-        request.resolve(response.channelIds);
-        return;
-      }
-      if (request.type === "repair-channel" && response.type === "repair-channel") {
-        request.resolve();
-        return;
-      }
-
-      const error = new ThreadMaterializerOperationFailed({
-        operation: "worker-protocol",
-        message: "conversation thread materializer worker response type mismatch",
+          const error = new ThreadMaterializerOperationFailed({
+            operation: "worker-protocol",
+            message: "conversation thread materializer worker response type mismatch",
+          });
+          request.reject(error);
+          restartWorker(error);
+        },
       });
-      request.reject(error);
-      restartWorker(error);
     });
 
     target.setErrorHandler((event) => {
@@ -177,22 +178,25 @@ export function startConversationThreadMaterializer(params: {
       try: () => worker.postMessage(request),
       catch: (cause) => cause,
     });
-    if (posted.status === "error") {
-      pending.delete(request.id);
-      if (Panic.is(posted.error)) return adaptToolResultToHost(Result.err(posted.error));
-      if (!(posted.error instanceof Error)) {
-        return adaptToolResultToHost(
-          Result.err(
-            new Panic({
-              message: "Conversation thread materializer worker postMessage defect",
-              cause: posted.error,
-            }),
-          ),
-        );
-      }
-      pendingRequest.reject(posted.error);
-      scheduleRecovery();
-    }
+    posted.match({
+      ok: () => () => undefined,
+      err: (error) => () => {
+        pending.delete(request.id);
+        if (Panic.is(error)) return adaptToolResultToHost(Result.err(error));
+        if (!(error instanceof Error)) {
+          return adaptToolResultToHost(
+            Result.err(
+              new Panic({
+                message: "Conversation thread materializer worker postMessage defect",
+                cause: error,
+              }),
+            ),
+          );
+        }
+        pendingRequest.reject(error);
+        scheduleRecovery();
+      },
+    })();
   };
 
   const listChannelIds = () =>

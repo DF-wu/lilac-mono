@@ -135,4 +135,18 @@ describe("conversation thread summarization worker cleanup", () => {
       expect(operation.error).toHaveProperty("cause", defect);
     }
   });
+
+  it("preserves onCleanupFailure Panic identity", async () => {
+    const callbackPanic = new Panic({ message: "cleanup observer failed" });
+
+    await expect(
+      runThreadSummarizationWorkerOperation({
+        run: async () => {},
+        cleanups: cleanupsThatFail("thread-store", new Error("close failed"), []),
+        onCleanupFailure() {
+          throw callbackPanic;
+        },
+      }),
+    ).rejects.toBe(callbackPanic);
+  });
 });
