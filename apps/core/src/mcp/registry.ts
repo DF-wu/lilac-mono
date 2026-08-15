@@ -325,25 +325,27 @@ export class McpRegistry implements McpRegistryApi {
       if (this.initialized) return;
 
       const read = await this.readConfig(this.configPath);
-      if (read.status === "error") {
-        this.configStatus = configErrorStatus(read.error);
-        this.initialized = true;
-        return;
-      }
-      const snapshot = read.value;
-      this.configStatus = Object.freeze({ status: "valid" });
-      const definitions = Object.values(snapshot.config.servers).sort((left, right) =>
-        left.id.localeCompare(right.id),
-      );
-      await Promise.all(
-        definitions.map(async (definition) => {
-          const result = await this.initializeCandidate(definition);
-          this.entries.set(definition.id, this.entryFromResult(definition, result));
+      await read.match({
+        err: (error) => async () => {
+          this.configStatus = configErrorStatus(error);
+          this.initialized = true;
+        },
+        ok: (snapshot) => async () => {
+          this.configStatus = Object.freeze({ status: "valid" });
+          const definitions = Object.values(snapshot.config.servers).sort((left, right) =>
+            left.id.localeCompare(right.id),
+          );
+          await Promise.all(
+            definitions.map(async (definition) => {
+              const result = await this.initializeCandidate(definition);
+              this.entries.set(definition.id, this.entryFromResult(definition, result));
+              this.publishSnapshots();
+            }),
+          );
+          this.initialized = true;
           this.publishSnapshots();
-        }),
-      );
-      this.initialized = true;
-      this.publishSnapshots();
+        },
+      })();
     });
   }
 
@@ -358,34 +360,40 @@ export class McpRegistry implements McpRegistryApi {
   ): Promise<ResultType<readonly McpReloadOutcome[], McpRegistryReloadFailure>> {
     return this.runLifecycle(async () => {
       const running = this.runningResult();
-      if (running.status === "error") return Result.err(running.error);
+      const stateFailure = running.match({ ok: () => null, err: (error) => Result.err(error) });
+      if (stateFailure) return stateFailure;
       const read = await this.readConfig(this.configPath);
-      if (read.status === "error") {
-        const configStatus = configErrorStatus(read.error);
-        this.configStatus = configStatus;
-        return Result.err(
-          new McpRegistryReloadError({
-            configPath: this.configPath,
-            cause: read.error,
-            message: configStatus.error,
-          }),
-        );
-      }
-      const snapshot = read.value;
-      this.configStatus = Object.freeze({ status: "valid" });
-      const ids = new Set<string>();
-      if (serverId === undefined) {
-        for (const id of this.entries.keys()) ids.add(id);
-        for (const id of Object.keys(snapshot.config.servers)) ids.add(id);
-      } else {
-        ids.add(serverId);
-      }
+      return read.match<
+        () => Promise<ResultType<readonly McpReloadOutcome[], McpRegistryReloadFailure>>
+      >({
+        err: (error) => async () => {
+          const configStatus = configErrorStatus(error);
+          this.configStatus = configStatus;
+          return Result.err(
+            new McpRegistryReloadError({
+              configPath: this.configPath,
+              cause: error,
+              message: configStatus.error,
+            }),
+          );
+        },
+        ok: (snapshot) => async () => {
+          this.configStatus = Object.freeze({ status: "valid" });
+          const ids = new Set<string>();
+          if (serverId === undefined) {
+            for (const id of this.entries.keys()) ids.add(id);
+            for (const id of Object.keys(snapshot.config.servers)) ids.add(id);
+          } else {
+            ids.add(serverId);
+          }
 
-      const outcomes = await Promise.all(
-        [...ids].sort().map((id) => this.reconcileServer(id, snapshot.config.servers[id])),
-      );
-      this.publishSnapshots();
-      return Result.ok(Object.freeze(outcomes));
+          const outcomes = await Promise.all(
+            [...ids].sort().map((id) => this.reconcileServer(id, snapshot.config.servers[id])),
+          );
+          this.publishSnapshots();
+          return Result.ok(Object.freeze(outcomes));
+        },
+      })();
     });
   }
 
@@ -477,16 +485,23 @@ export class McpRegistry implements McpRegistryApi {
     let resolvedTransport: ResolvedTransport | undefined;
     if (reconciliation === "unchanged" && current) {
       const resolution = await this.resolveTransport(definition);
-      if (resolution.status === "error") {
-        return freezeOutcome({
-          serverId,
-          reconciliation,
-          result: "retained",
-          error: safeErrorText(resolution.error, current.sensitiveValues),
-        });
-      }
-      resolvedTransport = resolution.value;
-      if (current.transportFingerprint !== transportFingerprint(resolvedTransport.input)) {
+      const resolutionFailure = resolution.match<() => McpReloadOutcome | null>({
+        err: (error) => () =>
+          freezeOutcome({
+            serverId,
+            reconciliation,
+            result: "retained",
+            error: safeErrorText(error, current.sensitiveValues),
+          }),
+        ok: () => () => null,
+      })();
+      if (resolutionFailure) return resolutionFailure;
+      resolvedTransport = resolution.match({ ok: (value) => value, err: () => undefined });
+      const fingerprintChanged = resolution.match({
+        ok: (value) => current.transportFingerprint !== transportFingerprint(value.input),
+        err: () => false,
+      });
+      if (fingerprintChanged) {
         reconciliation = "changed";
       }
     }
@@ -504,15 +519,19 @@ export class McpRegistry implements McpRegistryApi {
         const discovered = await this.withDeadline(definition.id, (signal) =>
           this.discoverTools(definition, retainedClient, signal),
         );
-        if (discovered.status === "error") {
-          return freezeOutcome({
-            serverId,
-            reconciliation,
-            result: "retained",
-            error: discovered.error.message,
-          });
-        }
-        const tools = discovered.value;
+        const discoveryFailure = discovered.match<() => McpReloadOutcome | null>({
+          err: (error) => () =>
+            freezeOutcome({
+              serverId,
+              reconciliation,
+              result: "retained",
+              error: error.message,
+            }),
+          ok: () => () => null,
+        });
+        const failed = discoveryFailure();
+        if (failed) return failed;
+        const tools = discovered.match({ ok: (value) => value, err: () => [] });
         if (this.entries.get(serverId) !== current || current.status.status !== "available") {
           return freezeOutcome({
             serverId,
@@ -632,78 +651,83 @@ export class McpRegistry implements McpRegistryApi {
       const resolution = prefetchedTransport
         ? Result.ok(prefetchedTransport)
         : await this.resolveTransport(definition);
-      if (resolution.status === "error") {
-        return {
+      return await resolution.match<() => Promise<CandidateResult>>({
+        err: (error) => async () => ({
           ok: false,
-          status: this.failureStatus(definition, resolution.error),
+          status: this.failureStatus(definition, error),
           phase,
-          error: safeErrorText(resolution.error),
-        };
-      }
-      const resolved = resolution.value;
-      sensitiveValues = resolved.sensitiveValues;
-      const transport = observeHttpSessionExpiration(this.createTransport(resolved.input), () => {
-        holder.sessionExpired = true;
-      });
-      phase = "connection";
-
-      const candidate = await this.withDeadline(
-        definition.id,
-        async (signal) => {
-          const createdClient = await this.createClient({
-            transport,
-            clientName: `lilac-mcp-${definition.id}`,
-            maxRetries: 0,
-            onUncaughtError: (error) => {
-              if (
-                isOptionalHttpInboundSseError(definition, holder.sessionExpired === true, error)
-              ) {
-                return;
-              }
-              rethrowPanic(error);
-              const failure = new McpRegistryTerminalFailure({
-                status: this.failureStatus(definition, error),
-                message: safeErrorText(error, sensitiveValues),
-              });
-              holder.terminalFailure = failure;
-              if (holder.client) this.handleTerminalFailure(definition.id, holder.client, failure);
+          error: safeErrorText(error),
+        }),
+        ok: (resolved) => async () => {
+          sensitiveValues = resolved.sensitiveValues;
+          const transport = observeHttpSessionExpiration(
+            this.createTransport(resolved.input),
+            () => {
+              holder.sessionExpired = true;
             },
+          );
+          phase = "connection";
+
+          const candidate = await this.withDeadline(
+            definition.id,
+            async (signal) => {
+              const createdClient = await this.createClient({
+                transport,
+                clientName: `lilac-mcp-${definition.id}`,
+                maxRetries: 0,
+                onUncaughtError: <TError>(error: TError) => {
+                  if (
+                    isOptionalHttpInboundSseError(definition, holder.sessionExpired === true, error)
+                  ) {
+                    return;
+                  }
+                  rethrowPanic(error);
+                  const failure = new McpRegistryTerminalFailure({
+                    status: this.failureStatus(definition, error),
+                    message: safeErrorText(error, sensitiveValues),
+                  });
+                  holder.terminalFailure = failure;
+                  if (holder.client)
+                    this.handleTerminalFailure(definition.id, holder.client, failure);
+                },
+              });
+              client = createdClient;
+              holder.client = createdClient;
+              this.observeTransportClose(definition.id, createdClient, transport);
+              if (signal.aborted) this.closeClientInBackground(createdClient);
+              signal.throwIfAborted();
+              if (holder.terminalFailure) return Result.err(holder.terminalFailure);
+
+              phase = "discovery";
+              const tools = await this.discoverTools(definition, createdClient, signal, holder);
+              return tools.map(
+                (value) =>
+                  ({
+                    client: createdClient,
+                    sensitiveValues: Object.freeze([...sensitiveValues]),
+                    transportFingerprint: transportFingerprint(resolved.input),
+                    tools: value,
+                  }) satisfies InitializedCandidate,
+              );
+            },
+            () => {
+              if (isCustomTransport(transport)) this.closeTransportInBackground(transport);
+            },
+          );
+          return candidate.match<CandidateResult>({
+            err: (error) => {
+              if (client) this.closeClientInBackground(client);
+              return {
+                ok: false,
+                status: error._tag === "McpRegistryTerminalFailure" ? error.status : "unavailable",
+                phase,
+                error: error.message,
+              };
+            },
+            ok: (value) => ({ ok: true, candidate: value }),
           });
-          client = createdClient;
-          holder.client = createdClient;
-          this.observeTransportClose(definition.id, createdClient, transport);
-          if (signal.aborted) this.closeClientInBackground(createdClient);
-          signal.throwIfAborted();
-          if (holder.terminalFailure) return Result.err(holder.terminalFailure);
-
-          phase = "discovery";
-          const tools = await this.discoverTools(definition, createdClient, signal, holder);
-          if (tools.status === "error") return tools;
-          return Result.ok({
-            client: createdClient,
-            sensitiveValues: Object.freeze([...sensitiveValues]),
-            transportFingerprint: transportFingerprint(resolved.input),
-            tools: tools.value,
-          } satisfies InitializedCandidate);
         },
-        () => {
-          if (isCustomTransport(transport)) this.closeTransportInBackground(transport);
-        },
-      );
-
-      if (candidate.status === "error") {
-        if (client) this.closeClientInBackground(client);
-        return {
-          ok: false,
-          status:
-            candidate.error._tag === "McpRegistryTerminalFailure"
-              ? candidate.error.status
-              : "unavailable",
-          phase,
-          error: candidate.error.message,
-        };
-      }
-      return { ok: true, candidate: candidate.value };
+      })();
     } catch (error) {
       if (client) {
         this.closeClientInBackground(client);
@@ -724,98 +748,114 @@ export class McpRegistry implements McpRegistryApi {
     const config = definition.transportConfig;
     if (config.transport === "stdio") {
       const resolved = await resolveMcpValueSourceMap(config.env, this.valueContext);
-      if (resolved.status === "error") {
-        return Result.err(
-          new McpRegistryTransportConfigurationError({
-            serverId: definition.id,
-            cause: resolved.error,
-            message: `Failed to resolve stdio environment: ${resolved.error.message}`,
-          }),
-        );
-      }
-      return Result.ok({
-        input: {
-          transport: "stdio",
-          command: config.command,
-          args: config.args,
-          ...(config.cwd === undefined ? {} : { cwd: config.cwd }),
-          env: resolved.value,
-        },
-        sensitiveValues: Object.freeze(Object.values(resolved.value)),
-      });
+      return resolved
+        .mapError(
+          (error) =>
+            new McpRegistryTransportConfigurationError({
+              serverId: definition.id,
+              cause: error,
+              message: `Failed to resolve stdio environment: ${error.message}`,
+            }),
+        )
+        .map<ResolvedTransport>((env) => ({
+          input: {
+            transport: "stdio",
+            command: config.command,
+            args: config.args,
+            ...(config.cwd === undefined ? {} : { cwd: config.cwd }),
+            env,
+          },
+          sensitiveValues: Object.freeze(Object.values(env)),
+        }));
     }
 
     const resolved = await resolveMcpValueSourceMap(config.headers, this.valueContext);
-    if (resolved.status === "error") {
-      return Result.err(
+    const headersResult = resolved.mapError(
+      (error) =>
         new McpRegistryTransportConfigurationError({
           serverId: definition.id,
-          cause: resolved.error,
-          message: `Failed to resolve HTTP headers: ${resolved.error.message}`,
+          cause: error,
+          message: `Failed to resolve HTTP headers: ${error.message}`,
         }),
-      );
-    }
-    const validHeaders = validateHttpHeaders(resolved.value);
-    if (validHeaders.status === "error") {
-      return Result.err(
-        new McpRegistryTransportConfigurationError({
-          serverId: definition.id,
-          cause: validHeaders.error,
-          message: `Invalid HTTP headers: ${validHeaders.error.message}`,
-        }),
-      );
-    }
+    );
+    return headersResult.match({
+      err: (error) => async () => Result.err(error),
+      ok: (headers) => async () => {
+        const validHeaders = validateHttpHeaders(headers).mapError(
+          (error) =>
+            new McpRegistryTransportConfigurationError({
+              serverId: definition.id,
+              cause: error,
+              message: `Invalid HTTP headers: ${error.message}`,
+            }),
+        );
+        const headerFailure = validHeaders.match({
+          ok: () => null,
+          err: (error) => Result.err(error),
+        });
+        if (headerFailure) return headerFailure;
 
-    let authProvider;
-    if (config.auth) {
-      const providerResult = await Result.tryPromise({
-        try: async () =>
-          await this.createAuthProvider?.({
-            server: definition,
-            configPath: this.configPath,
-            valueContext: this.valueContext,
-          }),
-        catch: (cause) => {
-          rethrowPanic(cause);
-          return new McpRegistryAuthProviderCreateError({
-            serverId: definition.id,
-            cause,
-            message: `Failed to create OAuth provider for MCP server ${JSON.stringify(definition.id)}`,
+        let authProvider;
+        if (config.auth) {
+          const providerResult = await Result.tryPromise({
+            try: async () =>
+              await this.createAuthProvider?.({
+                server: definition,
+                configPath: this.configPath,
+                valueContext: this.valueContext,
+              }),
+            catch: <TCause>(cause: TCause) => {
+              rethrowPanic(cause);
+              return new McpRegistryAuthProviderCreateError({
+                serverId: definition.id,
+                cause,
+                message: `Failed to create OAuth provider for MCP server ${JSON.stringify(definition.id)}`,
+              });
+            },
           });
-        },
-      });
-      if (providerResult.status === "error") return providerResult;
-      authProvider = providerResult.value;
-      if (!authProvider) {
-        return Result.err(new McpAuthenticationRequiredError(definition.id));
-      }
-      const provider = authProvider;
-      const tokensResult = await Result.tryPromise({
-        try: async () => await provider.tokens(),
-        catch: (cause) => {
-          rethrowPanic(cause);
-          return new McpRegistryAuthTokensReadError({
-            serverId: definition.id,
-            cause,
-            message: `Failed to read OAuth tokens for MCP server ${JSON.stringify(definition.id)}`,
+          const providerFailure = providerResult.match({
+            ok: () => null,
+            err: (error) => Result.err(error),
           });
-        },
-      });
-      if (tokensResult.status === "error") return tokensResult;
-      if (!tokensResult.value) {
-        return Result.err(new McpAuthenticationRequiredError(definition.id));
-      }
-    }
+          if (providerFailure) return providerFailure;
+          authProvider = providerResult.match({ ok: (value) => value, err: () => undefined });
+          if (!authProvider) {
+            return Result.err(new McpAuthenticationRequiredError(definition.id));
+          }
+          const provider = authProvider;
+          const tokensResult = await Result.tryPromise({
+            try: async () => await provider.tokens(),
+            catch: <TCause>(cause: TCause) => {
+              rethrowPanic(cause);
+              return new McpRegistryAuthTokensReadError({
+                serverId: definition.id,
+                cause,
+                message: `Failed to read OAuth tokens for MCP server ${JSON.stringify(definition.id)}`,
+              });
+            },
+          });
+          const tokenFailure = tokensResult.match({
+            ok: () => null,
+            err: (error) => Result.err(error),
+          });
+          if (tokenFailure) return tokenFailure;
+          const tokens = tokensResult.match({ ok: (value) => value, err: () => undefined });
+          if (!tokens) {
+            return Result.err(new McpAuthenticationRequiredError(definition.id));
+          }
+        }
 
-    return Result.ok({
-      input: {
-        transport: "http",
-        url: config.url,
-        headers: resolved.value,
-        ...(authProvider === undefined ? {} : { authProvider }),
+        return Result.ok<ResolvedTransport>({
+          input: {
+            transport: "http",
+            url: config.url,
+            headers,
+            ...(authProvider === undefined ? {} : { authProvider }),
+          },
+          sensitiveValues: Object.freeze(Object.values(headers)),
+        });
       },
-      sensitiveValues: Object.freeze(Object.values(resolved.value)),
-    });
+    })();
   }
 
   private async listAllTools(
@@ -861,53 +901,54 @@ export class McpRegistry implements McpRegistryApi {
     holder: { readonly terminalFailure?: McpRegistryTerminalFailure } = {},
   ): Promise<ResultType<readonly McpCatalogTool[], McpRegistryDiscoveryError>> {
     const definitions = await this.listAllTools(client, signal, holder);
-    if (definitions.status === "error") return definitions;
-    const names = new Set<string>();
-    for (const toolDefinition of definitions.value.tools) {
-      if (names.has(toolDefinition.name)) {
-        return Result.err(
-          new McpRegistryDiscoveryInvalid({
-            reason: "duplicate-tool",
-            message: `MCP tools/list returned duplicate tool name ${JSON.stringify(toolDefinition.name)}`,
-          }),
-        );
+    return definitions.andThen((value) => {
+      const names = new Set<string>();
+      for (const toolDefinition of value.tools) {
+        if (names.has(toolDefinition.name)) {
+          return Result.err(
+            new McpRegistryDiscoveryInvalid({
+              reason: "duplicate-tool",
+              message: `MCP tools/list returned duplicate tool name ${JSON.stringify(toolDefinition.name)}`,
+            }),
+          );
+        }
+        names.add(toolDefinition.name);
       }
-      names.add(toolDefinition.name);
-    }
 
-    const sdkTools = client.toolsFromDefinitions(definitions.value);
-    const tools: McpCatalogTool[] = [];
-    for (const toolDefinition of definitions.value.tools) {
-      const sdkTool = sdkTools[toolDefinition.name];
-      if (!sdkTool) {
-        return Result.err(
-          new McpRegistryDiscoveryInvalid({
-            reason: "missing-conversion",
-            message: `MCP tool conversion omitted ${JSON.stringify(toolDefinition.name)}`,
-          }),
+      const sdkTools = client.toolsFromDefinitions(value);
+      const tools: McpCatalogTool[] = [];
+      for (const toolDefinition of value.tools) {
+        const sdkTool = sdkTools[toolDefinition.name];
+        if (!sdkTool) {
+          return Result.err(
+            new McpRegistryDiscoveryInvalid({
+              reason: "missing-conversion",
+              message: `MCP tool conversion omitted ${JSON.stringify(toolDefinition.name)}`,
+            }),
+          );
+        }
+        const identity = Object.freeze({
+          source: "mcp",
+          sourceId: definition.id,
+          rawToolName: toolDefinition.name,
+        } satisfies CatalogToolIdentity);
+        const title = toolDefinition.title ?? toolDefinition.annotations?.title;
+        tools.push(
+          Object.freeze({
+            serverId: definition.id,
+            rawName: toolDefinition.name,
+            ...(title === undefined ? {} : { title }),
+            ...(toolDefinition.description === undefined
+              ? {}
+              : { description: toolDefinition.description }),
+            identity,
+            stableId: catalogToolStableId(identity),
+            tool: this.wrapToolExecution(definition.id, client, sdkTool),
+          } satisfies McpCatalogTool),
         );
       }
-      const identity = Object.freeze({
-        source: "mcp",
-        sourceId: definition.id,
-        rawToolName: toolDefinition.name,
-      } satisfies CatalogToolIdentity);
-      const title = toolDefinition.title ?? toolDefinition.annotations?.title;
-      tools.push(
-        Object.freeze({
-          serverId: definition.id,
-          rawName: toolDefinition.name,
-          ...(title === undefined ? {} : { title }),
-          ...(toolDefinition.description === undefined
-            ? {}
-            : { description: toolDefinition.description }),
-          identity,
-          stableId: catalogToolStableId(identity),
-          tool: this.wrapToolExecution(definition.id, client, sdkTool),
-        } satisfies McpCatalogTool),
-      );
-    }
-    return Result.ok(Object.freeze(tools));
+      return Result.ok(Object.freeze(tools));
+    });
   }
 
   private wrapToolExecution(

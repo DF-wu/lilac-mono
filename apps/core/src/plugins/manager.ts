@@ -40,6 +40,7 @@ import {
   baseCatalogToolName,
   catalogToolStableId,
 } from "../mcp/catalog-identity";
+import { adaptToolResultToHost } from "../tools/tool-result-adapters";
 import {
   hasBoundedBuiltinOutput,
   isAggregateOutputBudgetExempt,
@@ -138,6 +139,22 @@ export class Level1ToolsetAssemblyFailed extends TaggedError("Level1ToolsetAssem
   readonly message: string;
 }> {}
 
+function selectResultValue<T, E extends Error>(result: ResultType<T, E>): T {
+  const select = result.match<() => T>({
+    ok: (value) => () => value,
+    err: (error) => () => adaptToolResultToHost(Result.err(error)),
+  });
+  return select();
+}
+
+function resultErrorOrNull<T, E>(result: ResultType<T, E>): E | null {
+  const select = result.match<() => E | null>({
+    ok: () => () => null,
+    err: (error) => () => error,
+  });
+  return select();
+}
+
 type CreatedCoreToolPluginManager = ReturnType<typeof createCoreToolPluginManager>;
 export type CoreToolPluginManager = Omit<CreatedCoreToolPluginManager, "getLevel2Capabilities"> &
   Partial<Pick<CreatedCoreToolPluginManager, "getLevel2Capabilities">>;
@@ -152,10 +169,6 @@ export function assignOpaqueTool(target: ToolSet, name: string, executable: unkn
 
 export function readOpaqueTool(target: ToolSet, name: string): unknown {
   return (target as Record<string, unknown>)[name];
-}
-
-function successfulResultValue<T>(result: { readonly status: "ok"; readonly value: T }): T {
-  return result.value;
 }
 
 export function createCoreToolPluginManager(params: {
@@ -182,8 +195,12 @@ export function createCoreToolPluginManager(params: {
     operation: string,
     result: ResultType<T, import("@stanley2058/lilac-plugin-runtime").ToolPluginManagerError>,
   ): T => {
-    if (result.status === "ok") return result.value;
-    throw new Error(logPluginOperation(operation, result.error));
+    return result.match({
+      ok: (value) => () => value,
+      err: (error) => () => {
+        throw new Error(logPluginOperation(operation, error));
+      },
+    })();
   };
 
   const pluginOperationFailure = (
@@ -205,13 +222,14 @@ export function createCoreToolPluginManager(params: {
     >
   > {
     const fresh = await manager.ensureFresh();
-    if (fresh.status === "error") {
-      if (fresh.error._tag !== "ToolPluginReloadCommittedCleanupError") {
-        return Result.err(pluginOperationFailure("ensureFresh", fresh.error));
+    const freshError = resultErrorOrNull(fresh);
+    if (freshError) {
+      if (freshError._tag !== "ToolPluginReloadCommittedCleanupError") {
+        return Result.err(pluginOperationFailure("ensureFresh", freshError));
       }
       logger.error("tool plugin refresh committed with cleanup failure", {
         operation: "ensureFresh",
-        ...formatTaggedErrorForLog(fresh.error),
+        ...formatTaggedErrorForLog(freshError),
       });
     }
     const resolvedConfig = await resolveConfig();
@@ -275,11 +293,13 @@ export function createCoreToolPluginManager(params: {
         capability: capabilityForSpec(spec),
         context: runContext,
       });
-      if (enabled.status === "error") {
-        return Result.err(pluginOperationFailure("level1.isEnabled", enabled.error));
+      const enabledError = resultErrorOrNull(enabled);
+      if (enabledError) {
+        return Result.err(pluginOperationFailure("level1.isEnabled", enabledError));
       }
+      const enabledValue = selectResultValue(enabled);
       if (
-        enabled.value &&
+        enabledValue &&
         isStructurallyAllowed(specName, contribution, buildParams, resolvedConfig)
       ) {
         enabledSpecs.push(spec);
@@ -408,10 +428,11 @@ export function createCoreToolPluginManager(params: {
         capability: capabilityForSpec(spec),
         context: buildContext,
       });
-      if (executable.status === "error") {
-        return Result.err(pluginOperationFailure("level1.createTool", executable.error));
+      const executableError = resultErrorOrNull(executable);
+      if (executableError) {
+        return Result.err(pluginOperationFailure("level1.createTool", executableError));
       }
-      const executableValue = successfulResultValue(executable);
+      const executableValue = selectResultValue(executable);
       assignOpaqueTool(tools, specName, executableValue);
       assignOpaqueTool(batchTools, specName, executableValue);
     }
@@ -432,20 +453,23 @@ export function createCoreToolPluginManager(params: {
         capability: capabilityForSpec(spec),
         context: buildContext,
       });
-      if (executable.status === "error") {
-        return Result.err(pluginOperationFailure("level1.createTool", executable.error));
+      const executableError = resultErrorOrNull(executable);
+      if (executableError) {
+        return Result.err(pluginOperationFailure("level1.createTool", executableError));
       }
-      const executableValue = successfulResultValue(executable);
+      const executableValue = selectResultValue(executable);
       const metadata = decodeLevel1ExecutableMetadata(contribution.pluginId, executableValue);
-      if (metadata.status === "error") {
-        return Result.err(pluginOperationFailure("level1.executableMetadata", metadata.error));
+      const metadataError = resultErrorOrNull(metadata);
+      if (metadataError) {
+        return Result.err(pluginOperationFailure("level1.executableMetadata", metadataError));
       }
+      const metadataValue = selectResultValue(metadata);
       candidates.push({
         identity,
-        ...(metadata.value.title === undefined ? {} : { title: metadata.value.title }),
-        ...(metadata.value.description === undefined
+        ...(metadataValue.title === undefined ? {} : { title: metadataValue.title }),
+        ...(metadataValue.description === undefined
           ? {}
-          : { description: metadata.value.description }),
+          : { description: metadataValue.description }),
         tool: executableValue,
       });
     }
@@ -468,31 +492,39 @@ export function createCoreToolPluginManager(params: {
       candidates,
       reservedNames: catalogReservedNames,
     });
-    if (catalogResult.status === "error") {
+    const catalogError = resultErrorOrNull(catalogResult);
+    if (catalogError) {
       return Result.err(
         new Level1ToolsetAssemblyFailed({
-          cause: catalogResult.error,
-          message: catalogResult.error.message,
+          cause: catalogError,
+          message: catalogError.message,
         }),
       );
     }
-    const catalog = catalogResult.value;
+    const catalog = selectResultValue(catalogResult);
     for (const entry of catalog.entries) {
       assignOpaqueTool(tools, entry.modelName, catalogCandidateExecutable(entry));
     }
     if (catalog.entries.length > 0) {
       directToolNames.add("tool_search");
-      const search = createPortableToolSearchResult({
-        catalog: catalog.entries,
-        transcriptStore: params.runtime.transcriptStore,
-        requestContext: buildParams.requestContext,
-      });
-      if (search.status === "error") {
+      const search: ResultType<unknown, PortableToolSearchInvalid> = createPortableToolSearchResult(
+        {
+          catalog: catalog.entries,
+          transcriptStore: params.runtime.transcriptStore,
+          requestContext: buildParams.requestContext,
+        },
+      );
+      const searchError = resultErrorOrNull(search);
+      if (searchError) {
         return Result.err(
-          new Level1ToolsetAssemblyFailed({ cause: search.error, message: search.error.message }),
+          new Level1ToolsetAssemblyFailed({
+            cause: searchError,
+            message: searchError.message,
+          }),
         );
       }
-      assignOpaqueTool(tools, "tool_search", search.value);
+      const searchTool = selectResultValue(search);
+      assignOpaqueTool(tools, "tool_search", searchTool);
     }
 
     let batchAuthorityKey = [...directSpecs.keys()].sort().join("\0");

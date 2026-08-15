@@ -9,7 +9,6 @@ import {
   mutateMcpConfigFile,
   parseMcpConfigDocument,
   readMcpConfigFile,
-  type McpConfigFileSnapshot,
   type McpOAuthCallbackControl,
   type McpOAuthProviderService,
   type McpRegistryApi,
@@ -79,9 +78,13 @@ class McpToolFailure extends TaggedError("McpToolFailure")<{
 }> {}
 
 function resultToMcpToolValue<T, E extends Error>(result: ResultType<T, E>): T {
-  if (result.status === "ok") return result.value;
-  // ServerTool reports failures through the host's exception channel; never throw the TaggedError.
-  throw new Error(result.error.message);
+  return result.match({
+    ok: (value) => () => value,
+    err: (error) => () => {
+      // ServerTool reports failures through the host's exception channel; never throw the TaggedError.
+      throw new Error(error.message);
+    },
+  })();
 }
 
 function signalMcpFailureToToolHost(message: string): never {
@@ -294,12 +297,13 @@ export class McpManagement implements ServerTool {
     return await this.enqueueManagementOperation(async () => {
       await this.waitUntilRegistryInitialized();
       const read = await readMcpConfigFile(this.params.configPath);
-      if (read.status === "error") {
-        const reload = resultToMcpToolValue(await this.params.registry.reload(serverId));
-        return { reload: safeReloadOutcomes(reload) };
+      const snapshot = read.match({
+        err: () => null,
+        ok: (value) => value,
+      });
+      if (snapshot) {
+        this.params.providers.reconcile(snapshot.config);
       }
-      const snapshot: McpConfigFileSnapshot = read.value;
-      this.params.providers.reconcile(snapshot.config);
       const reload = resultToMcpToolValue(await this.params.registry.reload(serverId));
       return { reload: safeReloadOutcomes(reload) };
     });
@@ -316,8 +320,9 @@ export class McpManagement implements ServerTool {
     if (!waitUntilInitialized)
       return signalMcpFailureToToolHost("MCP registry initialization barrier is unavailable");
     const initialized = await waitUntilInitialized.call(this.params.registry);
-    if (initialized.status === "error") {
-      return signalMcpFailureToToolHost(initialized.error.message);
-    }
+    initialized.match({
+      ok: () => () => undefined,
+      err: (error) => () => signalMcpFailureToToolHost(error.message),
+    })();
   }
 }

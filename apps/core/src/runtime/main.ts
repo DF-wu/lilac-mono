@@ -48,14 +48,20 @@ const started = await Result.tryPromise({
         handlers.handleUncaughtException(new Error("runtime watchdog detected unhealthy state"));
       },
     });
-    if (created.kind === "panic" || created.result.status === "error") return false;
-    runtime = created.result.value;
-    const startup = await runtime.start();
-    return startup.kind === "result" && startup.result.status === "ok";
+    if (created.kind === "panic") return false;
+    return created.result.match({
+      err: () => async () => false,
+      ok: (createdRuntime) => async () => {
+        runtime = createdRuntime;
+        const startup = await runtime.start();
+        if (startup.kind !== "result") return false;
+        return startup.result.match({ ok: () => true, err: () => false });
+      },
+    })();
   },
   catch: (cause) => safeRuntimeErrorText(cause, "Opaque core startup failure"),
 });
-const runtimeStarted = started.status === "ok" && started.value;
+const runtimeStarted = started.match({ ok: (value) => value, err: () => false });
 if (!runtimeStarted) {
   logger.error("Failed to start core runtime");
   process.exit(1);
@@ -66,9 +72,10 @@ async function handleProcessSignal(signal: "SIGINT" | "SIGTERM"): Promise<void> 
     try: () => handlers.handleSignal(signal),
     catch: (cause) => safeRuntimeErrorText(cause, "Opaque shutdown handler failure"),
   });
-  if (handled.status === "error") {
-    logger.error(`Shutdown handler failed for ${signal}`);
-  }
+  handled.match({
+    ok: () => undefined,
+    err: () => logger.error(`Shutdown handler failed for ${signal}`),
+  });
 }
 
 process.on("SIGINT", () => {

@@ -34,6 +34,7 @@ import {
 } from "@stanley2058/lilac-coding-tools/schemas";
 import { fileTypeFromBuffer } from "file-type";
 import path from "node:path";
+import { Result, type Result as ResultType } from "better-result";
 
 import {
   adaptToolResultArtifactReadToUnavailablePolicy,
@@ -43,6 +44,7 @@ import {
 } from "../../artifacts/tool-result-artifact-store";
 import type { ToolResultOutput } from "../../artifacts/tool-result-output-normalizer";
 import { inferMimeTypeFromFilename } from "../../shared/attachment-utils";
+import { adaptToolResultToHost } from "../tool-result-adapters";
 import { parseSshCwdTarget } from "../../ssh/ssh-cwd";
 import {
   remoteFuzzySearch,
@@ -67,6 +69,14 @@ const warningZod = z.object({
 
 const REMOTE_DENY_PATHS = ["~/.ssh", "~/.aws", "~/.gnupg"] as const;
 const FFF_CACHE_DIR = path.join(env.dataDir, ".cache", "fff");
+
+function selectResultValue<T, E extends Error>(result: ResultType<T, E>): T {
+  const select = result.match<() => T>({
+    ok: (value) => () => value,
+    err: (error) => () => adaptToolResultToHost(Result.err(error)),
+  });
+  return select();
+}
 
 function resolveRemoteDenyPaths(dangerouslyAllow?: boolean): readonly string[] {
   return dangerouslyAllow === true ? [] : REMOTE_DENY_PATHS;
@@ -965,15 +975,15 @@ export function fsTool(
                 maxBytes: maxInlineMediaBytesPerPart,
                 signal: options.abortSignal,
               });
-
-              if (bytesRes.status === "error") {
+              const bytesError = bytesRes.match({ ok: () => null, err: (error) => error });
+              if (bytesError) {
                 return {
                   success: false,
                   resolvedPath: toRemoteDebugPath(cwdTarget.host, input.path),
-                  error: { code: "UNKNOWN", message: bytesRes.error.message },
+                  error: { code: "UNKNOWN", message: bytesError.message },
                 };
               }
-              const bytesOutput = bytesRes.value;
+              const bytesOutput = selectResultValue(bytesRes);
               if (!bytesOutput.ok) {
                 const filename = path.basename(input.path);
                 const mimeType = inferMimeTypeFromFilename(filename);
@@ -1130,14 +1140,15 @@ export function fsTool(
               denyPaths: remoteDenyPaths,
               signal: options.abortSignal,
             });
-            if (remoteRes.status === "error") {
+            const remoteError = remoteRes.match({ ok: () => null, err: (error) => error });
+            if (remoteError) {
               return {
                 success: false,
                 resolvedPath: input.path,
-                error: { code: "UNKNOWN", message: remoteRes.error.message },
+                error: { code: "UNKNOWN", message: remoteError.message },
               };
             }
-            const remoteOutput = remoteRes.value;
+            const remoteOutput = selectResultValue(remoteRes);
             if (remoteOutput.success) {
               recordRemoteFileAccess({
                 host: cwdTarget.host,
@@ -1322,13 +1333,13 @@ export function fsTool(
             fsBackend,
             signal: options.abortSignal,
           });
-          const res = (() => {
-            if (remoteResult.status === "ok") return remoteResult.value;
-            if (mode === "default") {
-              return { mode, truncated: false, paths: [], error: remoteResult.error.message };
-            }
-            return { mode, truncated: false, entries: [], error: remoteResult.error.message };
-          })();
+          const res = remoteResult.match({
+            ok: (value) => value,
+            err: (error) =>
+              mode === "default"
+                ? { mode, truncated: false, paths: [], error: error.message }
+                : { mode, truncated: false, entries: [], error: error.message },
+          });
 
           const output = stripGlobMetadata(res);
           return boundSearchOutput(
@@ -1401,18 +1412,16 @@ export function fsTool(
                   denyPaths: remoteDenyPaths,
                   signal: options.abortSignal,
                 });
-                let res: RemoteFuzzySearchOutput;
-                if (remoteResult.status === "ok") {
-                  res = remoteResult.value;
-                } else {
-                  res = {
+                const res = remoteResult.match<RemoteFuzzySearchOutput>({
+                  ok: (value) => value,
+                  err: (error) => ({
                     results: [],
                     totalMatched: 0,
                     totalFiles: 0,
                     truncated: false,
-                    error: `remote fuzzy_search unavailable: ${remoteResult.error.message}`,
-                  };
-                }
+                    error: `remote fuzzy_search unavailable: ${error.message}`,
+                  }),
+                });
 
                 return boundSearchOutput(stripFuzzySearchMetadata(res), "results", maxOutputBytes);
               }
@@ -1484,15 +1493,17 @@ export function fsTool(
             regex: input.regex,
             maxMatches: input.maxResults ?? 100,
           });
-          if (searched.status === "error") {
-            return boundGrepOutput(grepFailure(mode, searched.error.message), maxOutputBytes);
+          const searchError = searched.match({ ok: () => null, err: (error) => error });
+          if (searchError) {
+            return boundGrepOutput(grepFailure(mode, searchError.message), maxOutputBytes);
           }
+          const searchValue = selectResultValue(searched);
           if (mode === "default") {
             return boundGrepOutput(
               {
                 mode,
-                truncated: searched.value.truncated,
-                results: searched.value.matches.map(({ file, line, text }) => ({
+                truncated: searchValue.truncated,
+                results: searchValue.matches.map(({ file, line, text }) => ({
                   file,
                   line,
                   text,
@@ -1502,7 +1513,11 @@ export function fsTool(
             );
           }
           return boundGrepOutput(
-            { mode, truncated: searched.value.truncated, results: searched.value.matches },
+            {
+              mode,
+              truncated: searchValue.truncated,
+              results: searchValue.matches,
+            },
             maxOutputBytes,
           );
         }
@@ -1536,32 +1551,19 @@ export function fsTool(
             fsBackend,
             signal: options.abortSignal,
           });
-          const res = (() => {
-            if (remoteResult.status === "ok") return remoteResult.value;
-            switch (mode) {
-              case "default":
-                return {
-                  mode,
-                  truncated: false,
-                  results: [],
-                  error: remoteResult.error.message,
-                };
-              case "detailed":
-                return {
-                  mode,
-                  truncated: false,
-                  results: [],
-                  error: remoteResult.error.message,
-                };
-              case "hashline":
-                return {
-                  mode,
-                  truncated: false,
-                  results: [],
-                  error: remoteResult.error.message,
-                };
-            }
-          })();
+          const res = remoteResult.match({
+            ok: (value) => value,
+            err: (error) => {
+              switch (mode) {
+                case "default":
+                  return { mode, truncated: false, results: [], error: error.message };
+                case "detailed":
+                  return { mode, truncated: false, results: [], error: error.message };
+                case "hashline":
+                  return { mode, truncated: false, results: [], error: error.message };
+              }
+            },
+          });
 
           if (res.mode === "hashline") {
             for (const match of res.results) {
@@ -1678,7 +1680,8 @@ export function fsTool(
                   denyPaths: remoteDenyPaths,
                   signal: options.abortSignal,
                 });
-                if (remoteRes.status === "error") {
+                const remoteError = remoteRes.match({ ok: () => null, err: (error) => error });
+                if (remoteError) {
                   if (resolvedPathHint) {
                     remoteResolvedPathByLookup.set(
                       remoteLookupKey(cwdTarget.host, cwdTarget.cwd, hashlineInput.path),
@@ -1688,10 +1691,10 @@ export function fsTool(
                   return normalizeEditOutput({
                     success: false,
                     resolvedPath: toRemoteDebugPath(cwdTarget.host, hashlineInput.path),
-                    error: { code: "UNKNOWN", message: remoteRes.error.message },
+                    error: { code: "UNKNOWN", message: remoteError.message },
                   });
                 }
-                const remoteOutput = remoteRes.value;
+                const remoteOutput = selectResultValue(remoteRes);
                 if (remoteOutput.success) {
                   recordRemoteFileAccess({
                     host: cwdTarget.host,
@@ -1782,7 +1785,8 @@ export function fsTool(
                   denyPaths: remoteDenyPaths,
                   signal: options.abortSignal,
                 });
-                if (remoteRes.status === "error") {
+                const remoteError = remoteRes.match({ ok: () => null, err: (error) => error });
+                if (remoteError) {
                   if (resolvedPathHint) {
                     remoteResolvedPathByLookup.set(
                       remoteLookupKey(cwdTarget.host, cwdTarget.cwd, legacyInput.path),
@@ -1792,10 +1796,10 @@ export function fsTool(
                   return normalizeEditOutput({
                     success: false,
                     resolvedPath: toRemoteDebugPath(cwdTarget.host, legacyInput.path),
-                    error: { code: "UNKNOWN", message: remoteRes.error.message },
+                    error: { code: "UNKNOWN", message: remoteError.message },
                   });
                 }
-                const remoteOutput = remoteRes.value;
+                const remoteOutput = selectResultValue(remoteRes);
 
                 if (remoteOutput.success) {
                   recordRemoteFileAccess({

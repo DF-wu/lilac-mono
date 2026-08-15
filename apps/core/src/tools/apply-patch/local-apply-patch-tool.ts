@@ -72,14 +72,13 @@ function decodeOptionalToolContext(context: unknown): Partial<ToolContext> | und
 }
 
 function parsePatchResult(patchText: string): ResultType<PatchHunk[], ApplyPatchError> {
-  const parsed = parseCorePatchResult(patchText);
-  if (parsed.status === "ok") return Result.ok(parsed.value);
-  return Result.err(
-    new ApplyPatchOperationError({
-      operation: "parsing the patch",
-      cause: parsed.error,
-      message: parsed.error.message,
-    }),
+  return parseCorePatchResult(patchText).mapError(
+    (error) =>
+      new ApplyPatchOperationError({
+        operation: "parsing the patch",
+        cause: error,
+        message: error.message,
+      }),
   );
 }
 
@@ -92,8 +91,11 @@ async function executeApplyPatchResult(params: {
   const cwd = params.input.cwd ?? params.defaultCwd;
   const cwdTarget = parseSshCwdTarget(cwd);
   const parsed = parsePatchResult(params.input.patchText);
-  if (parsed.status === "error") return parsed;
-  const hunks = parsed.value;
+  const hunks = parsed.match({
+    ok: (value) => value,
+    err: () => null,
+  });
+  if (!hunks) return parsed.map(() => ({ output: "", hunkCount: 0 }));
 
   if (cwdTarget.kind === "ssh") {
     if (!params.input.dangerouslyAllow) {
@@ -134,8 +136,7 @@ async function executeApplyPatchResult(params: {
     denyPaths: params.denyPaths,
     signal: params.abortSignal,
   });
-  if (applied.status === "error") return applied;
-  return Result.ok({ output: applied.value, hunkCount: hunks.length });
+  return applied.map((output) => ({ output, hunkCount: hunks.length }));
 }
 
 export function localApplyPatchTool(
@@ -159,7 +160,7 @@ export function localApplyPatchTool(
         const ctx = decodeOptionalToolContext(context);
         const cwd = input.cwd ?? defaultCwd;
         const parsed = parsePatchResult(input.patchText);
-        const hunks = parsed.status === "ok" ? parsed.value : [];
+        const hunks = parsed.match({ ok: (value) => value, err: () => [] });
         logger.info("apply_patch start", {
           requestId: ctx?.requestId,
           sessionId: ctx?.sessionId,
@@ -180,30 +181,36 @@ export function localApplyPatchTool(
           denyPaths: options?.denyPaths,
           abortSignal,
         });
-        if (applied.status === "error") {
-          logger.error("apply_patch failed", {
-            requestId: ctx?.requestId,
-            sessionId: ctx?.sessionId,
-            ok: false,
-            ...formatTaggedErrorForLog(applied.error),
-          });
-          return { status: "failed" as const, output: applied.error.message };
-        }
-
-        const outputLines = applied.value.output.split("\n");
-        const changedLines = outputLines
-          .slice(1)
-          .map((line) => line.trim())
-          .filter(Boolean);
-        logger.info("apply_patch done", {
-          requestId: ctx?.requestId,
-          sessionId: ctx?.sessionId,
-          ok: true,
-          changedCount: changedLines.length,
-          changed: changedLines.slice(0, 20),
-          changedTruncated: changedLines.length > 20,
-        });
-        return { status: "completed" as const, output: applied.value.output };
+        return applied.match<
+          | (() => { readonly status: "failed"; readonly output: string })
+          | (() => { readonly status: "completed"; readonly output: string })
+        >({
+          err: (error) => () => {
+            logger.error("apply_patch failed", {
+              requestId: ctx?.requestId,
+              sessionId: ctx?.sessionId,
+              ok: false,
+              ...formatTaggedErrorForLog(error),
+            });
+            return { status: "failed" as const, output: error.message };
+          },
+          ok: (value) => () => {
+            const outputLines = value.output.split("\n");
+            const changedLines = outputLines
+              .slice(1)
+              .map((line) => line.trim())
+              .filter(Boolean);
+            logger.info("apply_patch done", {
+              requestId: ctx?.requestId,
+              sessionId: ctx?.sessionId,
+              ok: true,
+              changedCount: changedLines.length,
+              changed: changedLines.slice(0, 20),
+              changedTruncated: changedLines.length > 20,
+            });
+            return { status: "completed" as const, output: value.output };
+          },
+        })();
       },
     }),
   };

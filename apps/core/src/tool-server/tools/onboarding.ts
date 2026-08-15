@@ -42,8 +42,12 @@ class OnboardingToolFailure extends TaggedError("OnboardingToolFailure")<{
 function adaptOnboardingResultToToolHost<TValue>(
   result: ResultType<TValue, OnboardingToolFailure>,
 ): TValue {
-  if (result.status === "ok") return result.value;
-  throw new Error(result.error.message);
+  return result.match({
+    ok: (value) => () => value,
+    err: (error) => () => {
+      throw new Error(error.message);
+    },
+  })();
 }
 
 function signalOnboardingFailureToToolHost(message: string): never {
@@ -52,13 +56,15 @@ function signalOnboardingFailureToToolHost(message: string): never {
 
 function requireWorkspaceRoot(): string {
   const root = findWorkspaceRootResult();
-  if (root.status === "error") {
-    switch (root.error._tag) {
-      case "WorkspaceRootNotFound":
-        return signalOnboardingFailureToToolHost(root.error.message);
-    }
-  }
-  return root.value;
+  return root.match({
+    ok: (value) => () => value,
+    err: (error) => () => {
+      switch (error._tag) {
+        case "WorkspaceRootNotFound":
+          return signalOnboardingFailureToToolHost(error.message);
+      }
+    },
+  })();
 }
 
 const githubBashEnvDocs = {
@@ -559,8 +565,10 @@ async function fetchGithubLatestRelease(repo: string): Promise<GithubRelease> {
   }
   const raw: unknown = await res.json();
   const decoded = decodeGithubReleaseResponse(raw);
-  if (decoded.status === "ok") return decoded.value;
-  return signalOnboardingFailureToToolHost(`${decoded.error.message} for ${repo}`);
+  return decoded.match({
+    ok: (value) => () => value,
+    err: (error) => () => signalOnboardingFailureToToolHost(`${error.message} for ${repo}`),
+  })();
 }
 
 function stripLeadingV(tag: string): string {

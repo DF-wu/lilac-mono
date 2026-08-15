@@ -132,6 +132,17 @@ export function customCommandInvocationErrorText(error: CustomCommandInvocationE
   }
 }
 
+function continueInvocation<T, U>(
+  result: ResultType<T, CustomCommandInvocationError>,
+  onOk: (value: T) => ResultType<U, CustomCommandInvocationError>,
+): ResultType<U, CustomCommandInvocationError> {
+  const continuation = result.match<() => ResultType<U, CustomCommandInvocationError>>({
+    err: (error) => () => Result.err(error),
+    ok: (value) => () => onOk(value),
+  });
+  return continuation();
+}
+
 function decodeCustomCommandModule(value: unknown): CustomCommandModule | null {
   if (!isRecord(value) || typeof value["execute"] !== "function") return null;
   const execute = value["execute"];
@@ -384,29 +395,29 @@ export class CustomCommandManager {
       dataDir: this.dataDir,
       dependencies: this.discoveryDependencies,
     });
-    if (discovered.status === "error") return discovered;
-    for (const entry of discovered.value) {
-      if (entry.type === "invalid") {
-        this.warnings.push(`${entry.invalid.dir}: ${entry.invalid.reason}`);
-        continue;
-      }
+    return discovered.map((entries) => {
+      for (const entry of entries) {
+        if (entry.type === "invalid") {
+          this.warnings.push(`${entry.invalid.dir}: ${entry.invalid.reason}`);
+          continue;
+        }
 
-      const cmd = entry.command;
-      if (this.reserved.has(cmd.def.name)) {
-        this.warnings.push(`${cmd.dir}: command name '${cmd.def.name}' is reserved`);
-        continue;
-      }
-      if (this.byName.has(cmd.def.name)) {
-        this.warnings.push(`${cmd.dir}: duplicate command name '${cmd.def.name}'`);
-        continue;
-      }
+        const cmd = entry.command;
+        if (this.reserved.has(cmd.def.name)) {
+          this.warnings.push(`${cmd.dir}: command name '${cmd.def.name}' is reserved`);
+          continue;
+        }
+        if (this.byName.has(cmd.def.name)) {
+          this.warnings.push(`${cmd.dir}: duplicate command name '${cmd.def.name}'`);
+          continue;
+        }
 
-      this.byName.set(cmd.def.name, {
-        ...cmd,
-        textName: buildCustomCommandTextName(cmd.def.name),
-      });
-    }
-    return Result.ok(undefined);
+        this.byName.set(cmd.def.name, {
+          ...cmd,
+          textName: buildCustomCommandTextName(cmd.def.name),
+        });
+      }
+    });
   }
 
   list(): LoadedCustomCommand[] {
@@ -437,23 +448,23 @@ export class CustomCommandManager {
     if (!trimmed.startsWith(`/${CUSTOM_COMMAND_TEXT_PREFIX}`)) return Result.ok(null);
 
     const tokenized = tokenize(trimmed.slice(1));
-    if (tokenized.status === "error") return tokenized;
-    const tokens = tokenized.value;
-    const head = tokens.shift();
-    if (!head || !head.startsWith(CUSTOM_COMMAND_TEXT_PREFIX)) return Result.ok(null);
+    return continueInvocation(tokenized, (tokens) => {
+      const head = tokens.shift();
+      if (!head || !head.startsWith(CUSTOM_COMMAND_TEXT_PREFIX)) return Result.ok(null);
 
-    const name = head.slice(CUSTOM_COMMAND_TEXT_PREFIX.length);
-    const command = this.get(name);
-    if (!command) return Result.ok(null);
-    const parsed = this.parseArgsAndPrompt(command, tokens);
-    if (parsed.status === "error") return parsed;
-
-    return Result.ok({
-      command,
-      args: parsed.value.args,
-      prompt: parsed.value.prompt,
-      text: trimmed,
-      source: "text",
+      const name = head.slice(CUSTOM_COMMAND_TEXT_PREFIX.length);
+      const command = this.get(name);
+      if (!command) return Result.ok(null);
+      const parsed = this.parseArgsAndPrompt(command, tokens);
+      return continueInvocation(parsed, (value) =>
+        Result.ok({
+          command,
+          args: value.args,
+          prompt: value.prompt,
+          text: trimmed,
+          source: "text",
+        }),
+      );
     });
   }
 
@@ -474,7 +485,9 @@ export class CustomCommandManager {
     }
 
     const args: ParsedCustomCommandArgument[] = [];
-    for (const arg of command.def.args) {
+    const parseAt = (index: number): ResultType<void, CustomCommandInvocationError> => {
+      const arg = command.def.args[index];
+      if (!arg) return Result.ok(undefined);
       const value = rawArgs[arg.key];
       if (value === undefined || value === null) {
         if (arg.required) {
@@ -486,28 +499,31 @@ export class CustomCommandManager {
           );
         }
         args.push(undefined);
-        continue;
+        return parseAt(index + 1);
       }
       const choice = validateArgChoice(arg, value);
-      if (choice.status === "error") return choice;
-      args.push(choice.value);
-    }
-
-    return Result.ok({
-      command,
-      args,
-      prompt: params.prompt?.trim() ? params.prompt.trim() : null,
-      text: this.formatText(
+      return continueInvocation(choice, (parsed) => {
+        args.push(parsed);
+        return parseAt(index + 1);
+      });
+    };
+    return continueInvocation(parseAt(0), () =>
+      Result.ok({
         command,
-        command.def.args.flatMap((arg, index) => {
-          const value = args[index];
-          if (value === undefined) return [];
-          return [`${arg.key}=${String(value)}`];
-        }),
-        params.prompt ?? null,
-      ),
-      source: "discord-slash",
-    });
+        args,
+        prompt: params.prompt?.trim() ? params.prompt.trim() : null,
+        text: this.formatText(
+          command,
+          command.def.args.flatMap((arg, index) => {
+            const value = args[index];
+            if (value === undefined) return [];
+            return [`${arg.key}=${String(value)}`];
+          }),
+          params.prompt ?? null,
+        ),
+        source: "discord-slash",
+      }),
+    );
   }
 
   async execute(params: {
@@ -518,16 +534,24 @@ export class CustomCommandManager {
     const commandName = params.command.def.name;
     const entrypointPath = params.command.entrypointPath;
     const imported = await importCustomCommandModule({ commandName, entrypointPath });
-    if (imported.status === "error") return imported;
-
-    const commandModule = imported.value;
-    const execution = invokeCustomCommand({
-      commandName,
-      entrypointPath,
-      run: () => commandModule.execute(params.args, params.context),
-    });
-    if (execution.status === "error") return execution;
-    return execution.value;
+    return imported.match<
+      () => Promise<ResultType<CustomCommandResult, CustomCommandExecutionError>>
+    >({
+      err: (error) => async () => Result.err(error),
+      ok: (commandModule) => async () => {
+        const invoked = invokeCustomCommand({
+          commandName,
+          entrypointPath,
+          run: () => commandModule.execute(params.args, params.context),
+        });
+        return invoked.match<
+          () => Promise<ResultType<CustomCommandResult, CustomCommandExecutionError>>
+        >({
+          err: (error) => async () => Result.err(error),
+          ok: (execution) => async () => execution,
+        })();
+      },
+    })();
   }
 
   formatPreview(invocation: ParsedCustomCommandInvocation): string {
@@ -566,8 +590,9 @@ export class CustomCommandManager {
     let pos = 0;
     let promptStartIndex: number | null = null;
 
-    for (let i = 0; i < tokens.length; i += 1) {
-      const token = tokens[i]!;
+    const parseAt = (i: number): ResultType<void, CustomCommandInvocationError> => {
+      const token = tokens[i];
+      if (token === undefined) return Result.ok(undefined);
       const eq = token.indexOf("=");
       if (eq > 0) {
         const key = token.slice(0, eq);
@@ -584,11 +609,13 @@ export class CustomCommandManager {
         }
         const arg = command.def.args[index]!;
         const parsedValue = parseArgValue(arg.type, raw);
-        if (parsedValue.status === "error") return parsedValue;
-        const choice = validateArgChoice(arg, parsedValue.value);
-        if (choice.status === "error") return choice;
-        out[index] = choice.value;
-        continue;
+        return continueInvocation(parsedValue, (value) => {
+          const choice = validateArgChoice(arg, value);
+          return continueInvocation(choice, (selected) => {
+            out[index] = selected;
+            return parseAt(i + 1);
+          });
+        });
       }
 
       while (pos < command.def.args.length && out[pos] !== undefined) {
@@ -597,24 +624,39 @@ export class CustomCommandManager {
       const arg = command.def.args[pos];
       if (!arg) {
         promptStartIndex = i;
-        break;
+        return Result.ok(undefined);
       }
 
       const parsedValue = parseArgValue(arg.type, token);
-      if (parsedValue.status === "error") {
-        if (arg.required) return parsedValue;
-        promptStartIndex = i;
-        break;
-      }
-      const choice = validateArgChoice(arg, parsedValue.value);
-      if (choice.status === "error") return choice;
-      out[pos] = choice.value;
-      pos += 1;
-    }
+      const continueParsed = parsedValue.match<
+        () => ResultType<void, CustomCommandInvocationError>
+      >({
+        err: (error) => () => {
+          if (arg.required) return Result.err(error);
+          promptStartIndex = i;
+          return Result.ok(undefined);
+        },
+        ok: (value) => () =>
+          continueInvocation(validateArgChoice(arg, value), (selected) => {
+            out[pos] = selected;
+            pos += 1;
+            return parseAt(i + 1);
+          }),
+      });
+      return continueParsed();
+    };
 
-    for (let i = 0; i < command.def.args.length; i += 1) {
-      const arg = command.def.args[i]!;
-      if (arg.required && out[i] === undefined) {
+    const validateRequiredAt = (
+      index: number,
+    ): ResultType<ParsedArgsAndPrompt, CustomCommandInvocationError> => {
+      const arg = command.def.args[index];
+      if (!arg) {
+        return Result.ok({
+          args: out,
+          prompt: promptStartIndex === null ? null : tokens.slice(promptStartIndex).join(" "),
+        });
+      }
+      if (arg.required && out[index] === undefined) {
         return Result.err(
           new CustomCommandRequiredArgumentError({
             argumentKey: arg.key,
@@ -622,12 +664,9 @@ export class CustomCommandManager {
           }),
         );
       }
-    }
-
-    return Result.ok({
-      args: out,
-      prompt: promptStartIndex === null ? null : tokens.slice(promptStartIndex).join(" "),
-    });
+      return validateRequiredAt(index + 1);
+    };
+    return continueInvocation(parseAt(0), () => validateRequiredAt(0));
   }
 }
 

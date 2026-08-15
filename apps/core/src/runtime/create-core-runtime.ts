@@ -59,6 +59,7 @@ import { createDiscordEntityMapper } from "../entity/entity-mapper";
 import { DiscoveryService } from "../discovery/discovery-service";
 import {
   createConversationThreadToolService,
+  type ConversationThreadAttachmentHydrator,
   ConversationThreadOperationFailed,
   ConversationThreadService,
   type ConversationThreadRunSummarizationInput,
@@ -124,6 +125,8 @@ import { projectRuntimeError, safeRuntimeErrorText } from "./error-format";
 import {
   GRACEFUL_RESTART_SNAPSHOT_VERSION,
   SqliteGracefulRestartStore,
+  type GracefulRestartLoadError,
+  type GracefulRestartLoadOutcome,
 } from "./graceful-restart-store";
 import {
   applySurfaceRecovery,
@@ -164,6 +167,7 @@ import {
   rethrowPanic,
   resolveMcpConfigPath,
   type McpOAuthCallbackListenerStatus,
+  type McpRegistry,
   type McpRegistryOptionsInvalid,
   type UniversalMcpConfig,
 } from "../mcp";
@@ -373,13 +377,13 @@ export function superviseCoreRouterDone(params: {
       params.reportFatalError(normalizeRouterDoneDefect(settled.reason));
       return;
     }
-    if (settled.value.status === "error") {
-      params.reportFatalError(settled.value.error);
-      return;
-    }
-    params.reportFatalError(
-      new Panic({ message: "Discord request router subscriptions completed unexpectedly" }),
-    );
+    settled.value.match({
+      err: (error) => params.reportFatalError(error),
+      ok: () =>
+        params.reportFatalError(
+          new Panic({ message: "Discord request router subscriptions completed unexpectedly" }),
+        ),
+    });
   }
 }
 
@@ -481,11 +485,13 @@ export async function stopCoreResidualDiscordRequestRouter(params: {
     }
     return outcome.residualRouter;
   }
-  if (outcome.result.status === "error") {
-    params.cleanup.record("residualRouter.stop", outcome.result.error);
-    return outcome.residualRouter ?? params.router;
-  }
-  return outcome.residualRouter;
+  return outcome.result.match({
+    ok: () => outcome.residualRouter,
+    err: (error) => {
+      params.cleanup.record("residualRouter.stop", error);
+      return outcome.residualRouter ?? params.router;
+    },
+  });
 }
 
 export function settleCoreResidualDiscordRequestRouterDone(params: {
@@ -529,9 +535,10 @@ export function settleCoreResidualDiscordRequestRouterDone(params: {
       params.cleanup.record("residualRouter.done", outcome.panic);
       return;
     }
-    if (outcome.result.status === "error") {
-      params.cleanup.record("residualRouter.done", outcome.result.error);
-    }
+    outcome.result.match({
+      ok: () => undefined,
+      err: (error) => params.cleanup.record("residualRouter.done", error),
+    });
 
     async function reportLatePanic(): Promise<void> {
       const [late] = await Promise.allSettled([params.supervision]);
@@ -742,14 +749,16 @@ export async function captureCoreEventBusCleanup(
   try {
     if (ownership.bus) {
       const closed = await ownership.bus.close();
-      if (closed.status === "error") {
-        return Result.err(
-          new CoreEventBusCleanupFailed({
-            cause: closed.error,
-            message: "Core event bus cleanup failed",
-          }),
-        );
-      }
+      return closed.match<ResultType<void, CoreEventBusCleanupFailed>>({
+        ok: () => Result.ok(undefined),
+        err: (error) =>
+          Result.err(
+            new CoreEventBusCleanupFailed({
+              cause: error,
+              message: "Core event bus cleanup failed",
+            }),
+          ),
+      });
     } else if (ownership.raw) {
       await ownership.raw.close();
     } else {
@@ -772,14 +781,17 @@ async function coreEventBusSetupFailureWithCleanup(
   ownership: CoreEventBusOwnership,
 ): Promise<ResultType<never, CoreEventBusSetupError>> {
   const cleanup = await captureCoreEventBusCleanup(ownership);
-  if (cleanup.status === "ok") return Result.err(setup);
-  return Result.err(
-    new CoreEventBusSetupAndCleanupFailed({
-      setup,
-      cleanup: cleanup.error,
-      message: `${setup.message}; cleanup also failed`,
-    }),
-  );
+  return cleanup.match<ResultType<never, CoreEventBusSetupError>>({
+    ok: () => Result.err(setup),
+    err: (cleanupError) =>
+      Result.err(
+        new CoreEventBusSetupAndCleanupFailed({
+          setup,
+          cleanup: cleanupError,
+          message: `${setup.message}; cleanup also failed`,
+        }),
+      ),
+  });
 }
 
 export async function setupCoreEventBusResources(params: {
@@ -800,98 +812,145 @@ export async function setupCoreEventBusResources(params: {
   let bus: LilacBus | null = null;
   let cleanupAttempted = false;
 
+  const setupWithCleanup = async <T>(
+    result: ResultType<T, CoreEventBusSetupFailed>,
+    ownedRedis: Redis,
+  ): Promise<ResultType<T, CoreEventBusSetupError>> =>
+    result.match<() => Promise<ResultType<T, CoreEventBusSetupError>>>({
+      ok: (value) => async () => Result.ok(value),
+      err: (error) => async () => {
+        cleanupAttempted = true;
+        return coreEventBusSetupFailureWithCleanup(error, { redis: ownedRedis, raw, bus });
+      },
+    })();
+
   const setup = await Result.tryPromise({
     try: async () => {
       const redisCreated = (
         params.dependencies?.captureRedisConstruction ?? captureCoreRedisConstruction
       )(params.redisUrl);
-      if (redisCreated.status === "error") return Result.err(redisCreated.error);
-      redis = redisCreated.value;
+      return redisCreated.match({
+        err: (error) => async () => Result.err(error),
+        ok: (ownedRedis) => async () => {
+          redis = ownedRedis;
 
-      const workspacePrepared = await captureCoreWorkspacePreparation(params.cwd);
-      if (workspacePrepared.status === "error") {
-        cleanupAttempted = true;
-        return await coreEventBusSetupFailureWithCleanup(workspacePrepared.error, {
-          redis,
-          raw,
-          bus,
-        });
-      }
+          const workspacePrepared = await captureCoreWorkspacePreparation(params.cwd);
+          const workspaceResult = await setupWithCleanup(workspacePrepared, ownedRedis);
+          const workspaceFailure = workspaceResult.match({
+            ok: () => null,
+            err: (error) => Result.err(error),
+          });
+          if (workspaceFailure) return workspaceFailure;
+          const canonicalWorkspaceRoot = workspaceResult.match({
+            ok: (value) => value,
+            err: () => "",
+          });
 
-      const deadLetterKey = await (
-        params.dependencies?.loadDeadLetterKey ?? loadOrCreateCoreDeadLetterKey
-      )({ dataDir: params.dataDir });
-      if (deadLetterKey.status === "error") {
-        const setupError = new CoreEventBusSetupFailed({
-          operation: "load-dead-letter-key",
-          cause: deadLetterKey.error,
-          message: "Core event bus setup failed during load-dead-letter-key",
-        });
-        cleanupAttempted = true;
-        return await coreEventBusSetupFailureWithCleanup(setupError, { redis, raw, bus });
-      }
+          const deadLetterKeyResult = await (
+            params.dependencies?.loadDeadLetterKey ?? loadOrCreateCoreDeadLetterKey
+          )({ dataDir: params.dataDir });
+          const deadLetterKeyResultWithCleanup = await setupWithCleanup(
+            deadLetterKeyResult.mapError(
+              (error) =>
+                new CoreEventBusSetupFailed({
+                  operation: "load-dead-letter-key",
+                  cause: error,
+                  message: "Core event bus setup failed during load-dead-letter-key",
+                }),
+            ),
+            ownedRedis,
+          );
+          const deadLetterKeyFailure = deadLetterKeyResultWithCleanup.match({
+            ok: () => null,
+            err: (error) => Result.err(error),
+          });
+          if (deadLetterKeyFailure) return deadLetterKeyFailure;
+          const deadLetterKey = deadLetterKeyResultWithCleanup.match({
+            ok: (value) => value,
+            err: () => new Uint8Array(),
+          });
 
-      const redisConnected = await captureCoreRedisConnection(redis);
-      if (redisConnected.status === "error") {
-        cleanupAttempted = true;
-        return await coreEventBusSetupFailureWithCleanup(redisConnected.error, { redis, raw, bus });
-      }
+          const redisConnected = await captureCoreRedisConnection(ownedRedis);
+          const connectionResult = await setupWithCleanup(redisConnected, ownedRedis);
+          const connectionFailure = connectionResult.match({
+            ok: () => null,
+            err: (error) => Result.err(error),
+          });
+          if (connectionFailure) return connectionFailure;
 
-      const rawCreated = captureCoreRawBusConstruction(redis);
-      if (rawCreated.status === "error") {
-        cleanupAttempted = true;
-        return await coreEventBusSetupFailureWithCleanup(rawCreated.error, { redis, raw, bus });
-      }
-      raw = rawCreated.value;
+          const rawCreated = captureCoreRawBusConstruction(ownedRedis);
+          const rawResult = await setupWithCleanup(rawCreated, ownedRedis);
+          const rawFailure = rawResult.match({ ok: () => null, err: (error) => Result.err(error) });
+          if (rawFailure) return rawFailure;
+          raw = rawResult.match({
+            ok: (value) => () => value,
+            err: (error) => () => {
+              throw error;
+            },
+          })();
 
-      const busCreated = captureCoreLilacBusConstruction({
-        redis,
-        raw,
-        deadLetterEncryptionKey: deadLetterKey.value,
-        logger: params.logger,
-        reportFatalError: params.reportFatalError,
-      });
-      if (busCreated.status === "error") {
-        cleanupAttempted = true;
-        return await coreEventBusSetupFailureWithCleanup(busCreated.error, { redis, raw, bus });
-      }
-      bus = busCreated.value;
+          const busCreated = captureCoreLilacBusConstruction({
+            redis: ownedRedis,
+            raw,
+            deadLetterEncryptionKey: deadLetterKey,
+            logger: params.logger,
+            reportFatalError: params.reportFatalError,
+          });
+          const busResult = await setupWithCleanup(busCreated, ownedRedis);
+          const busFailure = busResult.match({ ok: () => null, err: (error) => Result.err(error) });
+          if (busFailure) return busFailure;
+          bus = busResult.match({
+            ok: (value) => () => value,
+            err: (error) => () => {
+              throw error;
+            },
+          })();
 
-      return Result.ok({
-        redis,
-        raw,
-        bus,
-        canonicalWorkspaceRoot: workspacePrepared.value,
-      });
+          return Result.ok({
+            redis: ownedRedis,
+            raw,
+            bus,
+            canonicalWorkspaceRoot,
+          });
+        },
+      })();
     },
     catch: projectRuntimeError("Unexpected Core event bus setup rejection"),
   });
-  if (setup.status === "ok") return { kind: "result", result: setup.value };
-
-  const cause = isPanic(setup.error)
-    ? setup.error
-    : new Panic({ message: "Unexpected Core event bus setup rejection" });
-  if (!redis || cleanupAttempted) return { kind: "panic", panic: cause };
-  const ownedRedis = redis;
-  const cleanup = createCoreRuntimeCleanupSupervisor(cause);
-  await cleanup.run("eventBus.setup.close", async () => {
-    adaptCoreEventBusCleanupResultToHost(
-      await captureCoreEventBusCleanup({ redis: ownedRedis, raw, bus }),
-    );
-  });
-  if (cleanup.failures.length > 0) {
-    params.logger.error("event_bus.setup_cleanup_failed", {
-      failureCount: cleanup.failures.length,
-    });
-  }
-  cleanup.finish();
-  return { kind: "panic", panic: cause };
+  return setup.match<() => Promise<CoreEventBusSetupOutcome>>({
+    ok: (value) => async () => ({ kind: "result", result: value }),
+    err: (error) => async () => {
+      const cause = isPanic(error)
+        ? error
+        : new Panic({ message: "Unexpected Core event bus setup rejection" });
+      if (!redis || cleanupAttempted) return { kind: "panic", panic: cause };
+      const ownedRedis = redis;
+      const cleanup = createCoreRuntimeCleanupSupervisor(cause);
+      await cleanup.run("eventBus.setup.close", async () => {
+        adaptCoreEventBusCleanupResultToHost(
+          await captureCoreEventBusCleanup({ redis: ownedRedis, raw, bus }),
+        );
+      });
+      if (cleanup.failures.length > 0) {
+        params.logger.error("event_bus.setup_cleanup_failed", {
+          failureCount: cleanup.failures.length,
+        });
+      }
+      cleanup.finish();
+      return { kind: "panic", panic: cause };
+    },
+  })();
 }
 
 export function adaptCoreEventBusCleanupResultToHost(
   result: ResultType<void, CoreEventBusCleanupFailed>,
 ): void {
-  if (result.status === "error") throw new Error(result.error.message);
+  result.match({
+    ok: () => () => undefined,
+    err: (error) => () => {
+      throw new Error(error.message);
+    },
+  })();
 }
 
 export type CoreRuntimeCleanupFailure = {
@@ -917,11 +976,11 @@ export type CoreRuntimeCleanupSupervisor = {
   readonly panics: readonly Panic[];
   record(label: string, cause: Error): void;
   run(label: string, cleanup: (() => Promise<void>) | undefined): Promise<void>;
-  runOutcome(
+  runOutcome<E extends Error>(
     label: string,
     cleanup:
       | (() => Promise<
-          | { readonly kind: "result"; readonly result: ResultType<void, unknown> }
+          | { readonly kind: "result"; readonly result: ResultType<void, E> }
           | { readonly kind: "panic"; readonly panic: Panic }
         >)
       | undefined,
@@ -954,11 +1013,11 @@ export function createCoreRuntimeCleanupSupervisor(
     }
   }
 
-  async function runOutcome(
+  async function runOutcome<E extends Error>(
     label: string,
     cleanup:
       | (() => Promise<
-          | { readonly kind: "result"; readonly result: ResultType<void, unknown> }
+          | { readonly kind: "result"; readonly result: ResultType<void, E> }
           | { readonly kind: "panic"; readonly panic: Panic }
         >)
       | undefined,
@@ -969,12 +1028,11 @@ export function createCoreRuntimeCleanupSupervisor(
       record(label, outcome.panic, "Opaque cleanup panic");
       return;
     }
-    if (outcome.result.status === "error") {
-      record(
-        label,
-        new Error(safeRuntimeErrorText(outcome.result.error, "Opaque cleanup failure")),
-      );
-    }
+    const recordOutcome = outcome.result.match<() => void>({
+      ok: () => () => undefined,
+      err: (error) => () => record(label, error),
+    });
+    recordOutcome();
   }
 
   function finish(): void {
@@ -1005,14 +1063,17 @@ export async function startCoreMcpServices(
 ): Promise<{ readonly registryInit: Promise<void> }> {
   let config = createEmptyMcpConfig();
   const configResult = await (options.readConfig ?? readMcpConfigFile)(options.configPath);
-  if (configResult.status === "ok") {
-    config = configResult.value.config;
-  } else {
-    options.logger.warn("MCP OAuth providers reconciled to empty configuration", {
-      path: options.configPath,
-      error: formatTaggedErrorForLog(configResult.error).errorMessage,
-    });
-  }
+  configResult.match({
+    ok: (value) => {
+      config = value.config;
+    },
+    err: (error) => {
+      options.logger.warn("MCP OAuth providers reconciled to empty configuration", {
+        path: options.configPath,
+        error: formatTaggedErrorForLog(error).errorMessage,
+      });
+    },
+  });
   options.providers.reconcile(config);
 
   const callbackStatus = options.callback.start();
@@ -1037,6 +1098,22 @@ export async function startCoreMcpServices(
 
 function subId(prefix: string, name: string): string {
   return `${prefix}:${name}`;
+}
+
+function surfaceAdapterLogContext(registry: SurfaceRuntimeRegistry) {
+  return { platforms: registry.entries().map((descriptor) => descriptor.platform) };
+}
+
+function staleRestartLogContext(input: {
+  readonly createdAt: number;
+  readonly ageMs: number;
+  readonly deadlineMs: number;
+}) {
+  return { createdAt: input.createdAt, ageMs: input.ageMs, deadlineMs: input.deadlineMs };
+}
+
+function agentRunnerLogContext(subscriptionId: string, cwd: string) {
+  return { subscriptionId, cwd };
 }
 
 function runtimeFsDenyPaths(): readonly string[] {
@@ -1098,35 +1175,57 @@ export async function createCoreRuntime(
     });
   }
   if (eventBusSetup.kind === "panic") return eventBusSetup;
-  if (eventBusSetup.result.status === "error") {
+  const eventBusSetupError = eventBusSetup.result.match({ err: (error) => error, ok: () => null });
+  if (eventBusSetupError) {
     return {
       kind: "result",
       result: Result.err(
         new CoreRuntimeCreateFailed({
           operation: "event-bus",
-          cause: eventBusSetup.result.error,
-          message: eventBusSetup.result.error.message,
+          cause: eventBusSetupError,
+          message: eventBusSetupError.message,
         }),
       ),
     };
   }
-  const eventBusResources = eventBusSetup.result.value;
-  const { redis, raw, bus, canonicalWorkspaceRoot } = eventBusResources;
-
-  const customCommandManager = new CustomCommandManager(env.dataDir);
-  const customCommandsInitialized = await customCommandManager.init();
-  if (customCommandsInitialized.status === "error") {
+  const eventBusResources = eventBusSetup.result.match({ ok: (value) => value, err: () => null });
+  if (!eventBusResources) {
+    const missingResources = new CoreEventBusSetupFailed({
+      operation: "create-lilac-bus",
+      cause: undefined,
+      message: "Core event bus setup returned no resources",
+    });
     return {
       kind: "result",
       result: Result.err(
         new CoreRuntimeCreateFailed({
-          operation: "custom-commands",
-          cause: customCommandsInitialized.error,
-          message: customCommandsInitialized.error.message,
+          operation: "event-bus",
+          cause: missingResources,
+          message: "Core event bus setup returned no resources",
         }),
       ),
     };
   }
+  const { redis, raw, bus, canonicalWorkspaceRoot } = eventBusResources;
+
+  const customCommandManager = new CustomCommandManager(env.dataDir);
+  const customCommandsInitialized = await customCommandManager.init();
+  const customCommandFailure = customCommandsInitialized.match<
+    () => CoreRuntimeCreateOutcome | null
+  >({
+    ok: () => () => null,
+    err: (error) => () => ({
+      kind: "result",
+      result: Result.err(
+        new CoreRuntimeCreateFailed({
+          operation: "custom-commands",
+          cause: error,
+          message: error.message,
+        }),
+      ),
+    }),
+  })();
+  if (customCommandFailure) return customCommandFailure;
   const customCommands = customCommandManager;
   const loadedCustomCommands = customCommands.list();
   const customCommandWarnings = customCommands.listWarnings();
@@ -1206,19 +1305,24 @@ export async function createCoreRuntime(
       createAuthProvider: ({ server }) => mcpOAuthProviders.getProvider(server.id),
     },
   });
-  if (mcpRegistryCreated.status === "error") {
-    return {
+  let mcpRegistry: McpRegistry;
+  const mcpRegistryFailure = mcpRegistryCreated.match<() => CoreRuntimeCreateOutcome | null>({
+    ok: (value) => () => {
+      mcpRegistry = value;
+      return null;
+    },
+    err: (error) => () => ({
       kind: "result",
       result: Result.err(
         new CoreRuntimeCreateFailed({
           operation: "mcp-registry",
-          cause: mcpRegistryCreated.error,
-          message: mcpRegistryCreated.error.message,
+          cause: error,
+          message: error.message,
         }),
       ),
-    };
-  }
-  const mcpRegistry = mcpRegistryCreated.value;
+    }),
+  })();
+  if (mcpRegistryFailure) return mcpRegistryFailure;
   let surfaceRuntimeRegistry: SurfaceRuntimeRegistry | null = null;
   let pendingSurfaceRecovery: PausedSurfaceRecoveryOwnership | null = null;
   let runtimeFullyStarted = false;
@@ -1235,15 +1339,20 @@ export async function createCoreRuntime(
         const version = readCoreConfigVersionResult(
           Bun.YAML.parse(await fs.readFile(configPath, "utf8")),
         );
-        return version.status === "ok" ? version.value : "unknown";
+        return version.match<number | "unknown">({
+          ok: (value) => value,
+          err: () => "unknown",
+        });
       },
       catch: projectRuntimeError("Core config version read failed"),
     });
-    if (loaded.status === "error") {
-      if (isPanic(loaded.error)) throw loaded.error;
-      return "unknown";
-    }
-    return loaded.value;
+    return loaded.match<() => number | "unknown">({
+      ok: (value) => () => value,
+      err: (error) => () => {
+        if (isPanic(error)) throw error;
+        return "unknown";
+      },
+    })();
   }
 
   let toolServer: {
@@ -1279,18 +1388,17 @@ export async function createCoreRuntime(
       catch: projectRuntimeError("Redis health probe failed"),
     });
     if (timer) clearTimeout(timer);
-    if (pinged.status === "ok") {
-      return {
-        ok: true,
-        durationMs: Date.now() - startedAt,
-      };
-    }
-    if (isPanic(pinged.error)) throw pinged.error;
-    return {
-      ok: false,
-      durationMs: Date.now() - startedAt,
-      error: errorMessage(pinged.error),
-    };
+    return pinged.match({
+      ok: () => () => ({ ok: true, durationMs: Date.now() - startedAt }),
+      err: (error) => () => {
+        if (isPanic(error)) throw error;
+        return {
+          ok: false,
+          durationMs: Date.now() - startedAt,
+          error: errorMessage(error),
+        };
+      },
+    })();
   }
 
   async function getRuntimeHealthReport(
@@ -1370,50 +1478,50 @@ export async function createCoreRuntime(
       try: () => getCoreConfig({ forceReload: true }),
       catch: projectRuntimeError("Core config reload failed"),
     });
-    if (loaded.status === "ok") {
-      const config = loaded.value;
+    await loaded.match({
+      ok: (config) => async () => {
+        if (coreConfigValidationHadError) {
+          logger.info("core-config hot-reload validation recovered", {
+            reason,
+            path: configPath,
+            parserVersion: config.configVersion,
+          });
+        } else {
+          logger.info("core-config hot-reload validation succeeded", {
+            reason,
+            path: configPath,
+            parserVersion: config.configVersion,
+          });
+        }
 
-      if (coreConfigValidationHadError) {
-        logger.info("core-config hot-reload validation recovered", {
-          reason,
-          path: configPath,
-          parserVersion: config.configVersion,
+        coreConfigValidationHadError = false;
+        lastCoreConfigValidationError = null;
+        await adapter.refreshCoreConfig();
+        conversationThreadMaterializer?.markAllDirty();
+      },
+      err: (error) => async () => {
+        if (isPanic(error)) throw error;
+        const failure = new CoreRuntimeExternalFailure({
+          operation: "reload-config",
+          cause: error,
+          message: "Core config reload failed",
         });
-      } else {
-        logger.info("core-config hot-reload validation succeeded", {
-          reason,
-          path: configPath,
-          parserVersion: config.configVersion,
-        });
-      }
+        const logError = formatTaggedErrorForLog(failure);
+        const msg = logError.errorMessage;
+        if (!coreConfigValidationHadError || lastCoreConfigValidationError !== msg) {
+          const parserVersion = await readCoreConfigParserVersion(configPath);
+          logger.warn("core-config hot-reload validation failed", {
+            reason,
+            path: configPath,
+            parserVersion,
+            error: msg,
+          });
+        }
 
-      coreConfigValidationHadError = false;
-      lastCoreConfigValidationError = null;
-      await adapter.refreshCoreConfig();
-      conversationThreadMaterializer?.markAllDirty();
-    } else {
-      const e = loaded.error;
-      if (isPanic(e)) throw e;
-      const failure = new CoreRuntimeExternalFailure({
-        operation: "reload-config",
-        cause: e,
-        message: "Core config reload failed",
-      });
-      const logError = formatTaggedErrorForLog(failure);
-      const msg = logError.errorMessage;
-      if (!coreConfigValidationHadError || lastCoreConfigValidationError !== msg) {
-        const parserVersion = await readCoreConfigParserVersion(configPath);
-        logger.warn("core-config hot-reload validation failed", {
-          reason,
-          path: configPath,
-          parserVersion,
-          error: msg,
-        });
-      }
-
-      coreConfigValidationHadError = true;
-      lastCoreConfigValidationError = msg;
-    }
+        coreConfigValidationHadError = true;
+        lastCoreConfigValidationError = msg;
+      },
+    })();
   }
 
   function scheduleCoreConfigValidation(reason: "watch"): void {
@@ -1466,20 +1574,22 @@ export async function createCoreRuntime(
       },
       catch: projectRuntimeError("Core config watcher startup failed"),
     });
-    if (startedWatcher.status === "error") {
-      const e = startedWatcher.error;
-      if (isPanic(e)) throw e;
-      const failure = new CoreRuntimeExternalFailure({
-        operation: "start-config-watcher",
-        cause: e,
-        message: "Core config watcher startup failed",
-      });
-      logger.warn("Core config hot-reload validator disabled", {
-        path: configPath,
-        ...formatTaggedErrorForLog(failure),
-      });
-      coreConfigWatcher = null;
-    }
+    startedWatcher.match({
+      ok: () => () => undefined,
+      err: (error) => () => {
+        if (isPanic(error)) throw error;
+        const failure = new CoreRuntimeExternalFailure({
+          operation: "start-config-watcher",
+          cause: error,
+          message: "Core config watcher startup failed",
+        });
+        logger.warn("Core config hot-reload validator disabled", {
+          path: configPath,
+          ...formatTaggedErrorForLog(failure),
+        });
+        coreConfigWatcher = null;
+      },
+    })();
   }
 
   function stopCoreConfigWatcher(): void {
@@ -1519,14 +1629,22 @@ export async function createCoreRuntime(
 
         const startupConfig = await getCoreConfig();
         const githubAppSecret = await readGithubAppSecretResult(env.dataDir);
-        if (githubAppSecret.status === "error") {
+        let githubAppCredentialsAvailable = false;
+        const githubAppSecretError = githubAppSecret.match({
+          err: (error) => error,
+          ok: (value) => {
+            githubAppCredentialsAvailable = value !== null;
+            return null;
+          },
+        });
+        if (githubAppSecretError) {
           return {
             kind: "result",
             result: Result.err(
               new CoreRuntimeStartFailed({
                 operation: "startup",
-                cause: githubAppSecret.error,
-                message: githubAppSecret.error.message,
+                cause: githubAppSecretError,
+                message: githubAppSecretError.message,
               }),
             ),
           };
@@ -1539,26 +1657,39 @@ export async function createCoreRuntime(
           bus,
           subscriptionPrefix,
           webhookSecret: env.github.webhookSecret,
-          githubAppCredentialsAvailable: githubAppSecret.value !== null,
+          githubAppCredentialsAvailable,
           getTranscriptStore: () => transcriptStore ?? undefined,
           activateRestoredDiscordOutputChains: (generation, chains) =>
             stopRouter?.restoreActiveOutputChains(generation, chains),
           logger,
           reportFatalError,
         });
-        if (registryCreated.status === "error") {
+        const registryError = registryCreated.match({ err: (error) => error, ok: () => null });
+        if (registryError) {
           return {
             kind: "result",
             result: Result.err(
               new CoreRuntimeStartFailed({
                 operation: "startup",
-                cause: registryCreated.error,
-                message: registryCreated.error.message,
+                cause: registryError,
+                message: registryError.message,
               }),
             ),
           };
         }
-        const registry = registryCreated.value;
+        const registry = registryCreated.match({ ok: (value) => value, err: () => null });
+        if (!registry) {
+          return {
+            kind: "result",
+            result: Result.err(
+              new CoreRuntimeStartFailed({
+                operation: "startup",
+                cause: undefined,
+                message: "Surface runtime composition returned no registry",
+              }),
+            ),
+          };
+        }
         surfaceRuntimeRegistry = registry;
         const surfaceAdapter = registry
           .entries()
@@ -1608,34 +1739,47 @@ export async function createCoreRuntime(
             conversationThreadMaterializer?.markDirty({ channelId, kind: "topology" });
           },
         });
-        const hydrateThreadAttachments = async (input: {
-          refs: readonly { channelId: string; messageId: string }[];
-        }) => {
-          const hydrated = [];
-          for (const ref of input.refs) {
+        const hydrateThreadAttachments: ConversationThreadAttachmentHydrator = async (input) => {
+          const hydrated: Awaited<
+            ReturnType<ConversationThreadAttachmentHydrator>
+          > extends ResultType<infer Value, ConversationThreadOperationFailed>
+            ? Value
+            : never = [];
+          const hydrateAt = async (
+            index: number,
+          ): Promise<ResultType<typeof hydrated, ConversationThreadOperationFailed>> => {
+            const ref = input.refs[index];
+            if (!ref) return Result.ok(hydrated);
             const read = await surfaceAdapter.readMsg({ platform: "discord", ...ref });
-            if (read.status === "error") {
-              return Result.err(
-                new ConversationThreadOperationFailed({
-                  operation: "summarize-thread",
-                  message: read.error.message,
-                }),
-              );
-            }
-            if (!read.value) {
-              return Result.err(
-                new ConversationThreadOperationFailed({
-                  operation: "summarize-thread",
-                  message: `Surface message not found: ${ref.messageId}`,
-                }),
-              );
-            }
-            hydrated.push({
-              ref,
-              attachments: toReplyChainMessage(read.value).attachments,
+            const continueRead = read.match<
+              () => Promise<ResultType<typeof hydrated, ConversationThreadOperationFailed>>
+            >({
+              err: (error) => async () =>
+                Result.err(
+                  new ConversationThreadOperationFailed({
+                    operation: "summarize-thread",
+                    message: error.message,
+                  }),
+                ),
+              ok: (message) => async () => {
+                if (!message) {
+                  return Result.err(
+                    new ConversationThreadOperationFailed({
+                      operation: "summarize-thread",
+                      message: `Surface message not found: ${ref.messageId}`,
+                    }),
+                  );
+                }
+                hydrated.push({
+                  ref,
+                  attachments: toReplyChainMessage(message).attachments,
+                });
+                return await hydrateAt(index + 1);
+              },
             });
-          }
-          return Result.ok(hydrated);
+            return await continueRead();
+          };
+          return await hydrateAt(0);
         };
         const threadService = new ConversationThreadService({
           store: conversationThreadStore,
@@ -1688,39 +1832,49 @@ export async function createCoreRuntime(
                 await conversationThreadMaterializer?.flush();
               },
             );
-            if (flushed.status === "error") return Result.err(flushed.error);
-            if (conversationThreadSummarizationStopping) {
-              return Result.err(
-                new ConversationThreadSummarizationTransportError({
-                  operation: "stopped",
-                  message: "conversation thread summarization is stopping",
-                }),
-              );
-            }
-            if (trigger === "periodic") {
-              const config = await captureSummarizationRuntimeOperation("configuration", () =>
-                getCoreConfig(),
-              );
-              if (config.status === "error") return Result.err(config.error);
-              if (config.value.conversation.thread.summarization.enabled !== true) {
-                return Result.ok({
-                  dryRun: false,
-                  refreshed: { channels: 0, threads: 0, messages: 0 },
-                  eligible: 0,
-                  eligibleTotal: 0,
-                  eligibility: { summary: 0, embeddingOnly: 0, reasons: {} },
-                  cleared: 0,
-                  summarized: 0,
-                  failed: 0,
-                  failures: [],
-                  threadIds: [],
+            const continueRun = () =>
+              input?.dryRun === true || !stopConversationThreadSummarizationWorker
+                ? runInProcessSummarization(input)
+                : stopConversationThreadSummarizationWorker.runSummarization(input);
+            const continueFlushed = flushed.match({
+              err: (error) => async () => Result.err(error),
+              ok: () => async () => {
+                if (conversationThreadSummarizationStopping) {
+                  return Result.err(
+                    new ConversationThreadSummarizationTransportError({
+                      operation: "stopped",
+                      message: "conversation thread summarization is stopping",
+                    }),
+                  );
+                }
+                if (trigger !== "periodic") return continueRun();
+                const config = await captureSummarizationRuntimeOperation("configuration", () =>
+                  getCoreConfig(),
+                );
+                const continueConfig = config.match({
+                  err: (error) => async () => Result.err(error),
+                  ok: (value) => async () => {
+                    if (value.conversation.thread.summarization.enabled === true) {
+                      return continueRun();
+                    }
+                    return Result.ok({
+                      dryRun: false,
+                      refreshed: { channels: 0, threads: 0, messages: 0 },
+                      eligible: 0,
+                      eligibleTotal: 0,
+                      eligibility: { summary: 0, embeddingOnly: 0, reasons: {} },
+                      cleared: 0,
+                      summarized: 0,
+                      failed: 0,
+                      failures: [],
+                      threadIds: [],
+                    });
+                  },
                 });
-              }
-            }
-            if (input?.dryRun === true || !stopConversationThreadSummarizationWorker) {
-              return await runInProcessSummarization(input);
-            }
-            return await stopConversationThreadSummarizationWorker.runSummarization(input);
+                return await continueConfig();
+              },
+            });
+            return await continueFlushed();
           },
         };
         discoveryService = new DiscoveryService({
@@ -1774,9 +1928,7 @@ export async function createCoreRuntime(
           connected: connectedSurfaceAdapters,
         });
 
-        logger.debug("Surface adapters connected", {
-          platforms: registry.entries().map((descriptor) => descriptor.platform),
-        });
+        logger.debug("Surface adapters connected", surfaceAdapterLogContext(registry));
 
         workflowProgressProjector = new WorkflowProgressProjector({
           bus,
@@ -1978,14 +2130,19 @@ export async function createCoreRuntime(
         });
 
         const restartLoadResult = gracefulRestartStore?.readCompletedSnapshot();
+        const missingRestartLoad: GracefulRestartLoadOutcome = {
+          state: "absent",
+          provenance: "missing-defaulted",
+        };
+        const restartLoadError: GracefulRestartLoadError | null =
+          restartLoadResult?.match({ err: (error) => error, ok: () => null }) ?? null;
         const restartLoad =
-          restartLoadResult?.status === "ok"
-            ? restartLoadResult.value
-            : ({ state: "absent", provenance: "missing-defaulted" } as const);
-        if (restartLoadResult?.status === "error") {
+          restartLoadResult?.match({ ok: (value) => value, err: () => missingRestartLoad }) ??
+          missingRestartLoad;
+        if (restartLoadError) {
           logger.warn(
             "Graceful restart snapshot load failed",
-            formatTaggedErrorForLog(restartLoadResult.error),
+            formatTaggedErrorForLog(restartLoadError),
           );
         }
         const restartSnapshot = restartLoad.state === "loaded" ? restartLoad.snapshot : null;
@@ -1995,23 +2152,24 @@ export async function createCoreRuntime(
           | undefined;
 
         if (restartLoad.state === "stale") {
-          logger.warn("Graceful restart snapshot discarded (stale)", {
-            createdAt: restartLoad.createdAt,
-            ageMs: restartLoad.ageMs,
-            deadlineMs: restartLoad.deadlineMs,
-          });
+          logger.warn(
+            "Graceful restart snapshot discarded (stale)",
+            staleRestartLogContext(restartLoad),
+          );
         }
         if (restartLoad.state === "empty" || restartLoad.state === "stale") {
           const consumed = gracefulRestartStore?.consumeCompletedSnapshot(restartLoad.rowToken);
-          if (consumed?.status === "error") {
-            logger.warn(
-              "Graceful restart snapshot disposition failed",
-              formatTaggedErrorForLog(consumed.error),
-            );
-          }
+          consumed?.match({
+            ok: () => undefined,
+            err: (error) =>
+              logger.warn(
+                "Graceful restart snapshot disposition failed",
+                formatTaggedErrorForLog(error),
+              ),
+          });
         }
         // Start agent runner last so it can't publish replies before relay is online.
-        stopAgentRunner = await startBusAgentRunner({
+        const startedAgentRunner = await startBusAgentRunner({
           bus,
           subscriptionId: subId(subscriptionPrefix, "agent-runner"),
           reportFatalPanic: reportFatalError,
@@ -2079,36 +2237,45 @@ export async function createCoreRuntime(
             return session ? session.parent_channel_id : undefined;
           },
         });
+        stopAgentRunner = startedAgentRunner;
 
-        logger.debug("Bus agent runner started", {
-          subscriptionId: subId(subscriptionPrefix, "agent-runner"),
-          cwd: canonicalWorkspaceRoot,
-        });
+        logger.debug(
+          "Bus agent runner started",
+          agentRunnerLogContext(subId(subscriptionPrefix, "agent-runner"), canonicalWorkspaceRoot),
+        );
 
         if (restartSnapshot && restartLoad.state === "loaded") {
           const prepared = prepareSurfaceRecovery({
             registry,
             snapshot: restartSnapshot,
             relays: surfaceRelayHandles,
-            agentRunner: stopAgentRunner,
+            agentRunner: startedAgentRunner,
           });
-          if (prepared.status === "error") {
-            logger.warn(
-              "Graceful restart snapshot retained because recovery is unavailable",
-              formatTaggedErrorForLog(prepared.error),
-            );
-          } else {
-            recoveryPlan = prepared.value;
-            const applied = await applySurfaceRecovery(recoveryPlan);
-            if (applied.status === "error") {
+          const plan = prepared.match({
+            err: (error) => {
               logger.warn(
-                "Graceful restart snapshot retained after paused admission failure",
-                formatTaggedErrorForLog(applied.error),
+                "Graceful restart snapshot retained because recovery is unavailable",
+                formatTaggedErrorForLog(error),
               );
-              recoveryPlan = null;
-            } else {
-              pendingSurfaceRecovery = createPausedSurfaceRecoveryOwnership(recoveryPlan);
-            }
+              return null;
+            },
+            ok: (value) => value,
+          });
+          if (plan) {
+            recoveryPlan = plan;
+            const applied = await applySurfaceRecovery(plan);
+            applied.match({
+              err: (error) => {
+                logger.warn(
+                  "Graceful restart snapshot retained after paused admission failure",
+                  formatTaggedErrorForLog(error),
+                );
+                recoveryPlan = null;
+              },
+              ok: () => {
+                pendingSurfaceRecovery = createPausedSurfaceRecoveryOwnership(plan);
+              },
+            });
           }
         }
 
@@ -2183,19 +2350,21 @@ export async function createCoreRuntime(
           subscriptionId: subId(subscriptionPrefix, "heartbeat"),
           initialExternalState: initialHeartbeatExternalState,
         });
-        if (heartbeatStarted.status === "error") {
-          return {
+        const heartbeatFailure = heartbeatStarted.match<() => CoreRuntimeStartOutcome | null>({
+          ok: () => () => null,
+          err: (error) => () => ({
             kind: "result",
             result: Result.err(
               new CoreRuntimeStartFailed({
                 operation: "heartbeat",
-                cause: heartbeatStarted.error,
+                cause: error,
                 message: "Core runtime heartbeat startup failed",
               }),
             ),
-          };
-        }
-        stopHeartbeat = heartbeatStarted.value;
+          }),
+        })();
+        if (heartbeatFailure) return heartbeatFailure;
+        stopHeartbeat = heartbeatStarted.match({ ok: (heartbeat) => heartbeat, err: () => null });
 
         logger.debug("Heartbeat service started", {
           subscriptionId: subId(subscriptionPrefix, "heartbeat"),
@@ -2210,29 +2379,39 @@ export async function createCoreRuntime(
         }
 
         if (recoveryPlan && restartLoad.state === "loaded") {
+          const recoveryBeingCommitted = recoveryPlan;
           const consumed = gracefulRestartStore?.consumeCompletedSnapshot(restartLoad.rowToken);
-          if (!consumed || consumed.status === "error") {
+          if (!consumed) {
             await pendingSurfaceRecovery?.rollback();
             pendingSurfaceRecovery = null;
-            logger.warn(
-              "Graceful restart snapshot retained after conditional disposition failure",
-              consumed?.status === "error"
-                ? formatTaggedErrorForLog(consumed.error)
-                : { reason: "store-unavailable" },
-            );
+            logger.warn("Graceful restart snapshot retained because the store is unavailable");
             recoveryPlan = null;
-            stopAgentRunner.activate();
+            startedAgentRunner.activate();
           } else {
-            const recoveryOwnership = pendingSurfaceRecovery;
-            pendingSurfaceRecovery = null;
-            recoveryOwnership?.activate();
-            logger.info("Graceful restart snapshot restored", {
-              agentEntries: recoveryPlan.snapshot.agent.length,
-              relayEntries: recoveryPlan.snapshot.relays.length,
-            });
+            await consumed.match({
+              err: (error) => async () => {
+                await pendingSurfaceRecovery?.rollback();
+                pendingSurfaceRecovery = null;
+                logger.warn(
+                  "Graceful restart snapshot retained after conditional disposition failure",
+                  formatTaggedErrorForLog(error),
+                );
+                recoveryPlan = null;
+                startedAgentRunner.activate();
+              },
+              ok: () => async () => {
+                const recoveryOwnership = pendingSurfaceRecovery;
+                pendingSurfaceRecovery = null;
+                recoveryOwnership?.activate();
+                logger.info("Graceful restart snapshot restored", {
+                  agentEntries: recoveryBeingCommitted.snapshot.agent.length,
+                  relayEntries: recoveryBeingCommitted.snapshot.relays.length,
+                });
+              },
+            })();
           }
         } else if (restartSnapshot) {
-          stopAgentRunner.activate();
+          startedAgentRunner.activate();
         }
 
         runtimeFullyStarted = routerSubscriptionHealthy;
@@ -2244,34 +2423,37 @@ export async function createCoreRuntime(
       },
       catch: projectRuntimeError("Core runtime startup failed"),
     });
-    let outcome: CoreRuntimeStartOutcome;
-    if (startup.status === "ok") {
-      outcome = startup.value;
-    } else if (isPanic(startup.error)) {
-      outcome = { kind: "panic", panic: startup.error };
-    } else {
-      outcome = {
-        kind: "result",
-        result: Result.err(
-          new CoreRuntimeStartFailed({
-            operation: "startup",
-            cause: startup.error,
-            message: startup.error.message,
-          }),
-        ),
-      };
-    }
+    const outcome: CoreRuntimeStartOutcome = startup.match({
+      ok: (value) => value,
+      err: (error) =>
+        isPanic(error)
+          ? { kind: "panic", panic: error }
+          : {
+              kind: "result",
+              result: Result.err(
+                new CoreRuntimeStartFailed({
+                  operation: "startup",
+                  cause: error,
+                  message: error.message,
+                }),
+              ),
+            },
+    });
     if (outcome.kind === "panic") {
       logger.error("Core runtime start failed with Panic");
       await stop(outcome.panic);
       return outcome;
     }
-    if (outcome.result.status === "ok") return outcome;
-    logger.error("Core runtime start failed", {
-      ...formatTaggedErrorForLog(outcome.result.error),
-    });
-    await stop();
-    return outcome;
+    return outcome.result.match({
+      ok: () => async () => outcome,
+      err: (error) => async () => {
+        logger.error("Core runtime start failed", {
+          ...formatTaggedErrorForLog(error),
+        });
+        await stop();
+        return outcome;
+      },
+    })();
   }
 
   async function stop(priorPanic: Panic | null = null): Promise<void> {
@@ -2396,30 +2578,28 @@ export async function createCoreRuntime(
             queueAttempts,
             relays: relayRecoverables,
           });
-          if (saved?.status === "error") {
-            logger.warn(
-              "Graceful restart snapshot save failed",
-              formatTaggedErrorForLog(saved.error),
-            );
-            return;
-          }
-
-          logGracefulRestartSnapshotSaved(logger, {
-            drainDeadlineMs: GRACEFUL_DRAIN_DEADLINE_MS,
-            snapshotTtlMs: GRACEFUL_SNAPSHOT_TTL_MS,
-            agentEntries: agentRecoverables.length,
-            relayEntries: relayRecoverables.length,
+          saved?.match({
+            err: (error) => {
+              logger.warn("Graceful restart snapshot save failed", formatTaggedErrorForLog(error));
+            },
+            ok: () => {
+              logGracefulRestartSnapshotSaved(logger, {
+                drainDeadlineMs: GRACEFUL_DRAIN_DEADLINE_MS,
+                snapshotTtlMs: GRACEFUL_SNAPSHOT_TTL_MS,
+                agentEntries: agentRecoverables.length,
+                relayEntries: relayRecoverables.length,
+              });
+            },
           });
         });
       } else {
         await safe("graceful.store.clear", async () => {
           const cleared = gracefulRestartStore?.clear();
-          if (cleared?.status === "error") {
-            logger.warn(
-              "Graceful restart snapshot clear failed",
-              formatTaggedErrorForLog(cleared.error),
-            );
-          }
+          cleared?.match({
+            ok: () => undefined,
+            err: (error) =>
+              logger.warn("Graceful restart snapshot clear failed", formatTaggedErrorForLog(error)),
+          });
         });
       }
     }

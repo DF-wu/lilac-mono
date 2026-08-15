@@ -104,9 +104,12 @@ export function resolveToolPathForRequestContextResult(params: {
 export function resolveToolPathForRequestContext(
   params: Parameters<typeof resolveToolPathForRequestContextResult>[0],
 ): string {
-  const resolved = resolveToolPathForRequestContextResult(params);
-  if (resolved.status === "ok") return resolved.value;
-  throw resolved.error;
+  return resolveToolPathForRequestContextResult(params).match({
+    ok: (value) => () => value,
+    err: (error) => () => {
+      throw error;
+    },
+  })();
 }
 
 export function formatToolPathForRequestContext(params: {
@@ -243,9 +246,12 @@ export function decodeDataUrlResult(
 }
 
 export function decodeDataUrl(s: string): { bytes: Buffer; mimeType?: string } {
-  const decoded = decodeDataUrlResult(s);
-  if (decoded.status === "ok") return decoded.value;
-  throw decoded.error;
+  return decodeDataUrlResult(s).match({
+    ok: (value) => () => value,
+    err: (error) => () => {
+      throw error;
+    },
+  })();
 }
 
 export function sanitizeExtension(ext: string): string {

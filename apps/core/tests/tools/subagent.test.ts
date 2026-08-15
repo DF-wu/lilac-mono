@@ -1,5 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import { asSchema } from "ai";
+import { Panic } from "better-result";
 
 import { BUILTIN_SURFACE_PROTOCOLS } from "../../src/surface/builtin-surface-protocols";
 import { subagentTools } from "../../src/tools/subagent";
@@ -448,6 +449,37 @@ describe("subagent_delegate tool", () => {
     expect(res).not.toHaveProperty("childSessionId");
     expect(res).not.toHaveProperty("timeoutMs");
     expect(res).not.toHaveProperty("durationMs");
+  });
+
+  it("preserves exact Panic identity from child completion", async () => {
+    const panic = new Panic({ message: "subagent completion invariant failed" });
+    const tools = subagentTools({
+      idleTimeoutMs: 2_000,
+      maxDepth: 1,
+      onDelegate: async () => ({
+        runId: "run:panic",
+        completion: Promise.reject(panic),
+        cancel: async () => {},
+      }),
+    });
+
+    await expect(
+      resolveExecuteResult(
+        tools.subagent_delegate.execute!(
+          { profile: "explore", task: "Fail exactly", mode: "sync" },
+          {
+            toolCallId: "tool-panic",
+            messages: [],
+            context: {
+              requestId: "r:panic",
+              sessionId: "s:panic",
+              requestClient: "discord",
+              subagentDepth: 0,
+            },
+          },
+        ),
+      ),
+    ).rejects.toBe(panic);
   });
 
   it("times out after the configured period without child activity", async () => {

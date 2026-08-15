@@ -123,13 +123,15 @@ export async function readConfiguredSshHosts(
   readError?: string;
 }> {
   const read = await readConfiguredSshHostsResult(dependencies);
-  if (read.status === "ok") return read.value;
-  return {
-    configPath: read.error.configPath,
-    hosts: [],
-    exists: read.error.exists,
-    readError: read.error.message,
-  };
+  return read.match({
+    ok: (value) => value,
+    err: (error) => ({
+      configPath: error.configPath,
+      hosts: [],
+      exists: error.exists,
+      readError: error.message,
+    }),
+  });
 }
 
 export async function requireConfiguredSshHostResult(
@@ -137,27 +139,27 @@ export async function requireConfiguredSshHostResult(
   dependencies: SshConfigReadDependencies = DEFAULT_SSH_CONFIG_READ_DEPENDENCIES,
 ): Promise<ResultType<void, SshHostRequirementError>> {
   const configured = await readConfiguredSshHostsResult(dependencies);
-  if (configured.status === "error") return configured;
+  return configured.andThen((value) => {
+    if (value.hosts.length === 0) {
+      return Result.err(
+        new SshHostsMissingError({
+          configPath: value.configPath,
+          message: `No SSH hosts are configured. Add host aliases to ${value.configPath} (and ensure known_hosts + keys are configured), then retry.`,
+        }),
+      );
+    }
 
-  if (configured.value.hosts.length === 0) {
-    return Result.err(
-      new SshHostsMissingError({
-        configPath: configured.value.configPath,
-        message: `No SSH hosts are configured. Add host aliases to ${configured.value.configPath} (and ensure known_hosts + keys are configured), then retry.`,
-      }),
-    );
-  }
-
-  if (!configured.value.hosts.includes(host)) {
-    return Result.err(
-      new SshHostUnknownError({
-        configPath: configured.value.configPath,
-        host,
-        message: `Unknown SSH host alias '${host}'. Add a Host entry to ${configured.value.configPath} or use ssh.hosts to see configured aliases.`,
-      }),
-    );
-  }
-  return Result.ok(undefined);
+    if (!value.hosts.includes(host)) {
+      return Result.err(
+        new SshHostUnknownError({
+          configPath: value.configPath,
+          host,
+          message: `Unknown SSH host alias '${host}'. Add a Host entry to ${value.configPath} or use ssh.hosts to see configured aliases.`,
+        }),
+      );
+    }
+    return Result.ok(undefined);
+  });
 }
 
 export async function requireConfiguredSshHost(
@@ -165,6 +167,10 @@ export async function requireConfiguredSshHost(
   dependencies: SshConfigReadDependencies = DEFAULT_SSH_CONFIG_READ_DEPENDENCIES,
 ): Promise<void> {
   const required = await requireConfiguredSshHostResult(host, dependencies);
-  if (required.status === "ok") return;
-  throw required.error;
+  required.match({
+    ok: () => () => undefined,
+    err: (error) => () => {
+      throw error;
+    },
+  })();
 }

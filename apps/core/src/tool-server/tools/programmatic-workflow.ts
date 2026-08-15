@@ -13,6 +13,7 @@ import {
   signalDurableWorkflowReadErrorToHost,
   type CreateWorkflowInvocationError,
   type CreateWorkflowInvocationResult,
+  type DurableWorkflowReadError,
 } from "../../workflow/durable-workflow-store";
 import {
   canonicalJsonSha256,
@@ -50,8 +51,12 @@ import type { RegisteredSurfacePlatform } from "../../surface/types";
 function adaptWorkflowInvocationResultToToolHost(
   result: ResultType<CreateWorkflowInvocationResult, CreateWorkflowInvocationError>,
 ): CreateWorkflowInvocationResult {
-  if (result.status === "error") throw new Error(result.error.message);
-  return result.value;
+  return result.match<() => CreateWorkflowInvocationResult>({
+    ok: (value) => () => value,
+    err: (error) => () => {
+      throw new Error(error.message);
+    },
+  })();
 }
 
 class WorkflowToolFailure extends TaggedError("WorkflowToolFailure")<{
@@ -61,8 +66,12 @@ class WorkflowToolFailure extends TaggedError("WorkflowToolFailure")<{
 function adaptWorkflowToolResultToHost<TValue>(
   result: ResultType<TValue, WorkflowToolFailure>,
 ): TValue {
-  if (result.status === "ok") return result.value;
-  throw new Error(result.error.message);
+  return result.match<() => TValue>({
+    ok: (value) => () => value,
+    err: (error) => () => {
+      throw new Error(error.message);
+    },
+  })();
 }
 
 function signalWorkflowToolFailureToHost(message: string): never {
@@ -73,15 +82,28 @@ function validateWorkflowArgsToToolHost(
   input: Parameters<typeof validateWorkflowArgsUnchecked>[0],
 ): JsonObject {
   const validated = validateWorkflowArgsUnchecked(input);
-  if (validated.status === "error") signalWorkflowToolFailureToHost(validated.error.message);
-  return validated.value;
+  return validated.match<() => JsonObject>({
+    ok: (value) => () => value,
+    err: (error) => () => signalWorkflowToolFailureToHost(error.message),
+  })();
 }
 
 function adaptWorkflowDefinitionResultToToolHost<T>(
   result: ResultType<T, WorkflowDefinitionStoreFailed>,
 ): T {
-  if (result.status === "error") signalWorkflowToolFailureToHost(result.error.message);
-  return result.value;
+  return result.match<() => T>({
+    ok: (value) => () => value,
+    err: (error) => () => signalWorkflowToolFailureToHost(error.message),
+  })();
+}
+
+function adaptDurableWorkflowReadResultToHost<T>(
+  result: ResultType<T, DurableWorkflowReadError>,
+): T {
+  return result.match<() => T>({
+    ok: (value) => () => value,
+    err: (error) => () => signalDurableWorkflowReadErrorToHost(error),
+  })();
 }
 
 export class WorkflowJsonProjectionInvalid extends TaggedError("WorkflowJsonProjectionInvalid")<{
@@ -101,8 +123,12 @@ export function decodeWorkflowJsonObject(
 function adaptWorkflowJsonProjectionResultToToolHost(
   result: ResultType<JsonObject, WorkflowJsonProjectionInvalid>,
 ): JsonObject {
-  if (result.status === "ok") return result.value;
-  throw result.error;
+  return result.match<() => JsonObject>({
+    ok: (value) => () => value,
+    err: (error) => () => {
+      throw error;
+    },
+  })();
 }
 
 function projectWorkflowJsonObject(value: unknown): JsonObject {
@@ -750,9 +776,7 @@ export class ProgrammaticWorkflow implements ServerTool {
     };
     store.createRevision(revision);
     const storedRevisionResult = store.findRevisionByIdentity(revisionIdentity);
-    if (storedRevisionResult.status === "error")
-      signalDurableWorkflowReadErrorToHost(storedRevisionResult.error);
-    const storedRevision = storedRevisionResult.value;
+    const storedRevision = adaptDurableWorkflowReadResultToHost(storedRevisionResult);
     if (!storedRevision || storedRevision.revisionId !== revisionId) {
       return signalWorkflowToolFailureToHost("Scheduled workflow revision identity collision");
     }
@@ -839,14 +863,11 @@ export class ProgrammaticWorkflow implements ServerTool {
   ) {
     const { store, projectScope } = await this.workflowCallContext(opts);
     const triggerResult = store.getTrigger(input.triggerId);
-    if (triggerResult.status === "error") signalDurableWorkflowReadErrorToHost(triggerResult.error);
-    const trigger = triggerResult.value;
+    const trigger = adaptDurableWorkflowReadResultToHost(triggerResult);
     if (!trigger)
       return signalWorkflowToolFailureToHost(`Workflow trigger not found: ${input.triggerId}`);
     const revisionResult = store.getRevision(trigger.revisionId);
-    if (revisionResult.status === "error")
-      signalDurableWorkflowReadErrorToHost(revisionResult.error);
-    const revision = revisionResult.value;
+    const revision = adaptDurableWorkflowReadResultToHost(revisionResult);
     if (!revision)
       return signalWorkflowToolFailureToHost(`Workflow revision not found: ${trigger.revisionId}`);
     adaptWorkflowToolResultToHost(
@@ -855,9 +876,8 @@ export class ProgrammaticWorkflow implements ServerTool {
     let lastRun = null;
     if (trigger.lastRunId) {
       const lastRunResult = store.getRun(trigger.lastRunId);
-      if (lastRunResult.status === "error")
-        signalDurableWorkflowReadErrorToHost(lastRunResult.error);
-      lastRun = lastRunResult.value ? redactRun(lastRunResult.value) : null;
+      const lastRunValue = adaptDurableWorkflowReadResultToHost(lastRunResult);
+      lastRun = lastRunValue ? redactRun(lastRunValue) : null;
     }
     return {
       ok: true as const,
@@ -875,24 +895,18 @@ export class ProgrammaticWorkflow implements ServerTool {
       ...input,
       canonicalProjectId: projectScope.canonicalProjectId,
     });
-    if (triggersResult.status === "error")
-      signalDurableWorkflowReadErrorToHost(triggersResult.error);
-    const triggers = triggersResult.value;
+    const triggers = adaptDurableWorkflowReadResultToHost(triggersResult);
     return {
       ok: true as const,
       triggers: triggers.map((trigger) => {
         const revisionResult = store.getRevision(trigger.revisionId);
-        if (revisionResult.status === "error")
-          signalDurableWorkflowReadErrorToHost(revisionResult.error);
-        const revision = revisionResult.value;
+        const revision = adaptDurableWorkflowReadResultToHost(revisionResult);
         if (!revision)
           return signalWorkflowToolFailureToHost(
             `Workflow revision not found: ${trigger.revisionId}`,
           );
         const lastRunResult = trigger.lastRunId ? store.getRun(trigger.lastRunId) : Result.ok(null);
-        if (lastRunResult.status === "error")
-          signalDurableWorkflowReadErrorToHost(lastRunResult.error);
-        const lastRun = lastRunResult.value;
+        const lastRun = adaptDurableWorkflowReadResultToHost(lastRunResult);
         return {
           trigger: redactTrigger(trigger, revision),
           lastRun: lastRun ? redactRun(lastRun) : null,
@@ -907,14 +921,11 @@ export class ProgrammaticWorkflow implements ServerTool {
   ) {
     const { store, projectScope } = await this.workflowCallContext(opts);
     const triggerResult = store.getTrigger(input.triggerId);
-    if (triggerResult.status === "error") signalDurableWorkflowReadErrorToHost(triggerResult.error);
-    const trigger = triggerResult.value;
+    const trigger = adaptDurableWorkflowReadResultToHost(triggerResult);
     if (!trigger)
       return signalWorkflowToolFailureToHost(`Workflow trigger not found: ${input.triggerId}`);
     const revisionResult = store.getRevision(trigger.revisionId);
-    if (revisionResult.status === "error")
-      signalDurableWorkflowReadErrorToHost(revisionResult.error);
-    const revision = revisionResult.value;
+    const revision = adaptDurableWorkflowReadResultToHost(revisionResult);
     if (!revision)
       return signalWorkflowToolFailureToHost(`Workflow revision not found: ${trigger.revisionId}`);
     adaptWorkflowToolResultToHost(
@@ -935,8 +946,7 @@ export class ProgrammaticWorkflow implements ServerTool {
       nextFireAt: null,
     });
     const updatedResult = store.getTrigger(trigger.triggerId);
-    if (updatedResult.status === "error") signalDurableWorkflowReadErrorToHost(updatedResult.error);
-    const updated = updatedResult.value;
+    const updated = adaptDurableWorkflowReadResultToHost(updatedResult);
     return {
       ok: true as const,
       trigger: updated ? redactTrigger(updated, revision) : null,
@@ -1113,13 +1123,10 @@ export class ProgrammaticWorkflow implements ServerTool {
   ) {
     const { store, projectScope } = await this.workflowCallContext(opts);
     const runResult = store.getRun(input.runId);
-    if (runResult.status === "error") signalDurableWorkflowReadErrorToHost(runResult.error);
-    const run = runResult.value;
+    const run = adaptDurableWorkflowReadResultToHost(runResult);
     if (!run) return signalWorkflowToolFailureToHost(`Workflow run not found: ${input.runId}`);
     const revisionResult = store.getRevision(run.revisionId);
-    if (revisionResult.status === "error")
-      signalDurableWorkflowReadErrorToHost(revisionResult.error);
-    const revision = revisionResult.value;
+    const revision = adaptDurableWorkflowReadResultToHost(revisionResult);
     if (!revision)
       return signalWorkflowToolFailureToHost(`Workflow revision not found: ${run.revisionId}`);
     adaptWorkflowToolResultToHost(
@@ -1159,10 +1166,10 @@ export class ProgrammaticWorkflow implements ServerTool {
       ...input,
       canonicalProjectId: projectScope.canonicalProjectId,
     });
-    if (runs.status === "error") signalDurableWorkflowReadErrorToHost(runs.error);
+    const runValues = adaptDurableWorkflowReadResultToHost(runs);
     return {
       ok: true as const,
-      runs: runs.value.map(redactRun),
+      runs: runValues.map(redactRun),
     };
   }
 
@@ -1172,13 +1179,10 @@ export class ProgrammaticWorkflow implements ServerTool {
   ) {
     const { store, projectScope } = await this.workflowCallContext(opts);
     const runResult = store.getRun(input.runId);
-    if (runResult.status === "error") signalDurableWorkflowReadErrorToHost(runResult.error);
-    const run = runResult.value;
+    const run = adaptDurableWorkflowReadResultToHost(runResult);
     if (!run) return signalWorkflowToolFailureToHost(`Workflow run not found: ${input.runId}`);
     const revisionResult = store.getRevision(run.revisionId);
-    if (revisionResult.status === "error")
-      signalDurableWorkflowReadErrorToHost(revisionResult.error);
-    const revision = revisionResult.value;
+    const revision = adaptDurableWorkflowReadResultToHost(revisionResult);
     if (!revision)
       return signalWorkflowToolFailureToHost(`Workflow revision not found: ${run.revisionId}`);
     adaptWorkflowToolResultToHost(
@@ -1188,8 +1192,8 @@ export class ProgrammaticWorkflow implements ServerTool {
     if (terminal) return { ok: true as const, run: redactRun(run), changed: false };
     const now = this.params.now?.() ?? Date.now();
     const operations = store.listOperations(run.runId, { limit: 1_000 });
-    if (operations.status === "error") signalDurableWorkflowReadErrorToHost(operations.error);
-    const activeRequests = operations.value.flatMap((operation) =>
+    const operationValues = adaptDurableWorkflowReadResultToHost(operations);
+    const activeRequests = operationValues.flatMap((operation) =>
       operation.requestId ? [operation.requestId] : [],
     );
     const cancelled = store.cancelRunAndChildren({
@@ -1258,13 +1262,10 @@ export class ProgrammaticWorkflow implements ServerTool {
   ) {
     const { store, projectScope } = await this.workflowCallContext(opts);
     const runResult = store.getRun(input.runId);
-    if (runResult.status === "error") signalDurableWorkflowReadErrorToHost(runResult.error);
-    const run = runResult.value;
+    const run = adaptDurableWorkflowReadResultToHost(runResult);
     if (!run) return signalWorkflowToolFailureToHost(`Workflow run not found: ${input.runId}`);
     const revisionResult = store.getRevision(run.revisionId);
-    if (revisionResult.status === "error")
-      signalDurableWorkflowReadErrorToHost(revisionResult.error);
-    const revision = revisionResult.value;
+    const revision = adaptDurableWorkflowReadResultToHost(revisionResult);
     if (!revision)
       return signalWorkflowToolFailureToHost(`Workflow revision not found: ${run.revisionId}`);
     adaptWorkflowToolResultToHost(
@@ -1294,8 +1295,7 @@ export class ProgrammaticWorkflow implements ServerTool {
             now,
           });
     const updatedResult = paused === null ? store.getRun(run.runId) : Result.ok(paused);
-    if (updatedResult.status === "error") signalDurableWorkflowReadErrorToHost(updatedResult.error);
-    const updated = updatedResult.value;
+    const updated = adaptDurableWorkflowReadResultToHost(updatedResult);
     if (to === "queued" && !changed) {
       const ambiguity = store.getManualReconciliationDetail(run.runId);
       if (ambiguity) return signalWorkflowToolFailureToHost(ambiguity);

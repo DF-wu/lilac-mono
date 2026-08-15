@@ -31,8 +31,12 @@ class GenerateToolFailure extends TaggedError("GenerateToolFailure")<{
 function adaptGenerateResultToToolHost<TValue>(
   result: ResultType<TValue, GenerateToolFailure>,
 ): TValue {
-  if (result.status === "ok") return result.value;
-  throw new Error(result.error.message);
+  return result.match({
+    ok: (value) => () => value,
+    err: (error) => () => {
+      throw new Error(error.message);
+    },
+  })();
 }
 
 function signalGenerateFailureToToolHost(message: string): never {

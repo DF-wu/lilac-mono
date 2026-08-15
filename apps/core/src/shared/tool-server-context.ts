@@ -52,7 +52,13 @@ export function requireToolServerHeaders(
   ctx: RequestContext | undefined,
   label: string,
 ): RequiredToolServerHeaders {
-  const decoded = decodeToolServerHeaders(ctx, label);
-  if (decoded.status === "ok") return decoded.value;
-  throw decoded.error;
+  const outcome = decodeToolServerHeaders(ctx, label).match<
+    | { readonly kind: "ok"; readonly value: RequiredToolServerHeaders }
+    | { readonly kind: "error"; readonly error: ToolServerContextInvalidError }
+  >({
+    ok: (value) => ({ kind: "ok", value }),
+    err: (error) => ({ kind: "error", error }),
+  });
+  if (outcome.kind === "ok") return outcome.value;
+  throw outcome.error;
 }

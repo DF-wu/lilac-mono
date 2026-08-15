@@ -144,9 +144,12 @@ export function resolveMcpOAuthCredentialPath(options: {
   readonly dataDir: string;
   readonly serverId: string;
 }): string {
-  const resolved = resolveMcpOAuthCredentialPathResult(options);
-  if (resolved.status === "error") throw resolved.error;
-  return resolved.value;
+  return resolveMcpOAuthCredentialPathResult(options).match({
+    ok: (value) => () => value,
+    err: (error) => () => {
+      throw error;
+    },
+  })();
 }
 
 export async function readMcpOAuthCredentialFileResult(options: {
@@ -154,26 +157,29 @@ export async function readMcpOAuthCredentialFileResult(options: {
   readonly serverId: string;
 }): Promise<ResultType<McpOAuthCredential | undefined, McpOAuthCredentialError>> {
   const resolvedPath = resolveMcpOAuthCredentialPathResult(options);
-  if (resolvedPath.status === "error") return resolvedPath;
-  const credentialPath = resolvedPath.value;
-  let source: string;
-  try {
-    source = await readFile(credentialPath, "utf8");
-  } catch (cause) {
-    if (isPanic(cause)) throw cause;
-    const parsed = fileErrorSchema.safeParse(cause);
-    if (parsed.success && (parsed.data.code === "ENOENT" || parsed.data.code === "ENOTDIR")) {
-      return Result.ok(undefined);
-    }
-    return Result.err(credentialError(credentialPath, "read", cause));
-  }
+  return resolvedPath.match({
+    err: (error) => async () => Result.err(error),
+    ok: (credentialPath) => async () => {
+      let source: string;
+      try {
+        source = await readFile(credentialPath, "utf8");
+      } catch (cause) {
+        if (isPanic(cause)) throw cause;
+        const parsed = fileErrorSchema.safeParse(cause);
+        if (parsed.success && (parsed.data.code === "ENOENT" || parsed.data.code === "ENOTDIR")) {
+          return Result.ok(undefined);
+        }
+        return Result.err(credentialError(credentialPath, "read", cause));
+      }
 
-  try {
-    return Result.ok(mcpOAuthCredentialSchema.parse(JSON.parse(source)));
-  } catch (cause) {
-    if (isPanic(cause)) throw cause;
-    return Result.err(credentialError(credentialPath, "read", cause));
-  }
+      try {
+        return Result.ok(mcpOAuthCredentialSchema.parse(JSON.parse(source)));
+      } catch (cause) {
+        if (isPanic(cause)) throw cause;
+        return Result.err(credentialError(credentialPath, "read", cause));
+      }
+    },
+  })();
 }
 
 export async function readMcpOAuthCredentialFile(options: {
@@ -181,8 +187,12 @@ export async function readMcpOAuthCredentialFile(options: {
   readonly serverId: string;
 }): Promise<McpOAuthCredential | undefined> {
   const read = await readMcpOAuthCredentialFileResult(options);
-  if (read.status === "error") throw read.error;
-  return read.value;
+  return read.match({
+    ok: (value) => () => value,
+    err: (error) => () => {
+      throw error;
+    },
+  })();
 }
 
 export async function writeMcpOAuthCredentialFileAtomicResult(options: {
@@ -192,83 +202,86 @@ export async function writeMcpOAuthCredentialFileAtomicResult(options: {
   readonly dependencies?: McpOAuthCredentialFileDependencies;
 }): Promise<ResultType<void, McpOAuthCredentialWriteError>> {
   const resolvedPath = resolveMcpOAuthCredentialPathResult(options);
-  if (resolvedPath.status === "error") return resolvedPath;
-  const credentialPath = resolvedPath.value;
-  const decoded = mcpOAuthCredentialSchema.safeParse(options.credential);
-  if (!decoded.success) return Result.err(credentialError(credentialPath, "write"));
-  const credential = decoded.data;
-  const directory = path.dirname(credentialPath);
-  const dependencies = options.dependencies ?? DEFAULT_FILE_DEPENDENCIES;
-  let panic: Panic | undefined;
-  let failure: McpOAuthCredentialWriteError | undefined;
+  return resolvedPath.match({
+    err: (error) => async () => Result.err(error),
+    ok: (credentialPath) => async () => {
+      const decoded = mcpOAuthCredentialSchema.safeParse(options.credential);
+      if (!decoded.success) return Result.err(credentialError(credentialPath, "write"));
+      const credential = decoded.data;
+      const directory = path.dirname(credentialPath);
+      const dependencies = options.dependencies ?? DEFAULT_FILE_DEPENDENCIES;
+      let panic: Panic | undefined;
+      let failure: McpOAuthCredentialWriteError | undefined;
 
-  const recordFailure = (cause: unknown, operation: "write" | "cleanup"): void => {
-    if (isPanic(cause)) {
-      panic ??= cause;
-      return;
-    }
-    const next = credentialError(credentialPath, operation, cause);
-    failure = failure ? combineCredentialWriteFailures(credentialPath, failure, next) : next;
-  };
-  const finish = (): ResultType<void, McpOAuthCredentialWriteError> => {
-    if (panic) throw panic;
-    return failure ? Result.err(failure) : Result.ok();
-  };
+      const recordFailure = (cause: unknown, operation: "write" | "cleanup"): void => {
+        if (isPanic(cause)) {
+          panic ??= cause;
+          return;
+        }
+        const next = credentialError(credentialPath, operation, cause);
+        failure = failure ? combineCredentialWriteFailures(credentialPath, failure, next) : next;
+      };
+      const finish = (): ResultType<void, McpOAuthCredentialWriteError> => {
+        if (panic) throw panic;
+        return failure ? Result.err(failure) : Result.ok();
+      };
 
-  let temporaryPath: string;
-  try {
-    await dependencies.mkdir(directory, { recursive: true, mode: 0o700 });
-    await dependencies.chmod(directory, 0o700);
-    temporaryPath = path.join(
-      directory,
-      `.${path.basename(credentialPath)}.${dependencies.randomUUID()}.tmp`,
-    );
-  } catch (cause) {
-    recordFailure(cause, "write");
-    return finish();
-  }
+      let temporaryPath: string;
+      try {
+        await dependencies.mkdir(directory, { recursive: true, mode: 0o700 });
+        await dependencies.chmod(directory, 0o700);
+        temporaryPath = path.join(
+          directory,
+          `.${path.basename(credentialPath)}.${dependencies.randomUUID()}.tmp`,
+        );
+      } catch (cause) {
+        recordFailure(cause, "write");
+        return finish();
+      }
 
-  let handle: McpOAuthCredentialFileHandle | undefined;
-  try {
-    handle = await dependencies.open(temporaryPath, "wx", 0o600);
-  } catch (cause) {
-    recordFailure(cause, "write");
-  }
+      let handle: McpOAuthCredentialFileHandle | undefined;
+      try {
+        handle = await dependencies.open(temporaryPath, "wx", 0o600);
+      } catch (cause) {
+        recordFailure(cause, "write");
+      }
 
-  if (handle) {
-    try {
-      await handle.writeFile(`${JSON.stringify(credential, null, 2)}\n`, "utf8");
-      await handle.chmod(0o600);
-      await handle.sync();
-    } catch (cause) {
-      recordFailure(cause, "write");
-    }
-    try {
-      await handle.close();
-    } catch (cause) {
-      recordFailure(cause, "cleanup");
-    }
-  }
+      if (handle) {
+        try {
+          await handle.writeFile(`${JSON.stringify(credential, null, 2)}\n`, "utf8");
+          await handle.chmod(0o600);
+          await handle.sync();
+        } catch (cause) {
+          recordFailure(cause, "write");
+        }
+        try {
+          await handle.close();
+        } catch (cause) {
+          recordFailure(cause, "cleanup");
+        }
+      }
 
-  let renamed = false;
-  if (!panic && !failure) {
-    try {
-      await dependencies.rename(temporaryPath, credentialPath);
-      renamed = true;
-    } catch (cause) {
-      recordFailure(cause, "write");
-    }
-  }
+      let renamed = false;
+      if (!panic && !failure) {
+        try {
+          await dependencies.rename(temporaryPath, credentialPath);
+          renamed = true;
+        } catch (cause) {
+          recordFailure(cause, "write");
+        }
+      }
 
-  if (!renamed) {
-    try {
-      await dependencies.rm(temporaryPath, { force: true });
-    } catch (cause) {
-      recordFailure(cause, "cleanup");
-    }
-  }
+      if (!renamed) {
+        try {
+          await dependencies.rm(temporaryPath, { force: true });
+        } catch (cause) {
+          recordFailure(cause, "cleanup");
+        }
+      }
 
-  return finish();
+      return finish();
+    },
+  })();
 }
 
 export async function writeMcpOAuthCredentialFileAtomic(options: {
@@ -278,7 +291,12 @@ export async function writeMcpOAuthCredentialFileAtomic(options: {
   readonly dependencies?: McpOAuthCredentialFileDependencies;
 }): Promise<void> {
   const written = await writeMcpOAuthCredentialFileAtomicResult(options);
-  if (written.status === "error") throw written.error;
+  written.match({
+    ok: () => () => undefined,
+    err: (error) => () => {
+      throw error;
+    },
+  })();
 }
 
 export function updateMcpOAuthCredentialFileResult(options: {
@@ -288,41 +306,47 @@ export function updateMcpOAuthCredentialFileResult(options: {
   readonly update: (credential: McpOAuthCredential) => McpOAuthCredential;
 }): Promise<ResultType<void, McpOAuthCredentialWriteError>> {
   const resolvedPath = resolveMcpOAuthCredentialPathResult(options);
-  if (resolvedPath.status === "error") return Promise.resolve(resolvedPath);
-  const credentialPath = resolvedPath.value;
-  const previous = updateQueues.get(credentialPath) ?? Promise.resolve();
-  const result = previous.then(async () => {
-    const read = await readMcpOAuthCredentialFileResult(options);
-    if (read.status === "error") return read;
-    const existing = read.value;
-    const credential =
-      existing?.serverUrl === options.serverUrl
-        ? existing
-        : {
-            version: MCP_OAUTH_CREDENTIAL_VERSION,
-            serverUrl: options.serverUrl,
-          };
-    let updatedCredential: McpOAuthCredential;
-    try {
-      updatedCredential = options.update(credential);
-    } catch (cause) {
-      if (isPanic(cause)) throw cause;
-      return Result.err(credentialError(credentialPath, "update", cause));
-    }
-    return writeMcpOAuthCredentialFileAtomicResult({
-      ...options,
-      credential: updatedCredential,
-    });
-  });
-  const settled = result.then(
-    () => undefined,
-    () => undefined,
-  );
-  updateQueues.set(credentialPath, settled);
+  return resolvedPath.match({
+    err: (error) => async () => Result.err(error),
+    ok: (credentialPath) => async () => {
+      const previous = updateQueues.get(credentialPath) ?? Promise.resolve();
+      const result = previous.then(async () => {
+        const read = await readMcpOAuthCredentialFileResult(options);
+        return read.match({
+          err: (error) => async () => Result.err(error),
+          ok: (existing) => async () => {
+            const credential =
+              existing?.serverUrl === options.serverUrl
+                ? existing
+                : {
+                    version: MCP_OAUTH_CREDENTIAL_VERSION,
+                    serverUrl: options.serverUrl,
+                  };
+            let updatedCredential: McpOAuthCredential;
+            try {
+              updatedCredential = options.update(credential);
+            } catch (cause) {
+              if (isPanic(cause)) throw cause;
+              return Result.err(credentialError(credentialPath, "update", cause));
+            }
+            return writeMcpOAuthCredentialFileAtomicResult({
+              ...options,
+              credential: updatedCredential,
+            });
+          },
+        })();
+      });
+      const settled = result.then(
+        () => undefined,
+        () => undefined,
+      );
+      updateQueues.set(credentialPath, settled);
 
-  return result.finally(() => {
-    if (updateQueues.get(credentialPath) === settled) updateQueues.delete(credentialPath);
-  });
+      return result.finally(() => {
+        if (updateQueues.get(credentialPath) === settled) updateQueues.delete(credentialPath);
+      });
+    },
+  })();
 }
 
 export async function updateMcpOAuthCredentialFile(options: {
@@ -332,5 +356,10 @@ export async function updateMcpOAuthCredentialFile(options: {
   readonly update: (credential: McpOAuthCredential) => McpOAuthCredential;
 }): Promise<void> {
   const updated = await updateMcpOAuthCredentialFileResult(options);
-  if (updated.status === "error") throw updated.error;
+  updated.match({
+    ok: () => () => undefined,
+    err: (error) => () => {
+      throw error;
+    },
+  })();
 }

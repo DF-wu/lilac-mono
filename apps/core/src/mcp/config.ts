@@ -272,24 +272,27 @@ export function serializeMcpConfigYamlResult(
       }),
     );
   }
-  const input = toConfigInputV1(config);
-  if (input.status === "error") return input;
-  const source = `${Bun.YAML.stringify(input.value, null, 2)}\n`;
-  const reparsed = parseMcpConfigYaml(source);
-  if (!reparsed.ok) {
-    return Result.err(
-      new McpConfigSerializationFailed({
-        reason: "invalid-output",
-        message: `Serialized MCP configuration is invalid: ${reparsed.issues.join("; ")}`,
-      }),
-    );
-  }
-  return Result.ok(source);
+  return toConfigInputV1(config).andThen((input) => {
+    const source = `${Bun.YAML.stringify(input, null, 2)}\n`;
+    const reparsed = parseMcpConfigYaml(source);
+    if (!reparsed.ok) {
+      return Result.err(
+        new McpConfigSerializationFailed({
+          reason: "invalid-output",
+          message: `Serialized MCP configuration is invalid: ${reparsed.issues.join("; ")}`,
+        }),
+      );
+    }
+    return Result.ok(source);
+  });
 }
 
 /** Framework compatibility adapter for callers that require a throwing serializer. */
 export function serializeMcpConfigYaml(config: McpConfigSerializationInput): string {
-  const serialized = serializeMcpConfigYamlResult(config);
-  if (serialized.status === "error") throw serialized.error;
-  return serialized.value;
+  return serializeMcpConfigYamlResult(config).match({
+    ok: (value) => () => value,
+    err: (error) => () => {
+      throw error;
+    },
+  })();
 }

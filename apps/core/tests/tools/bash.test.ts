@@ -432,6 +432,29 @@ rmdir "$media_dir"`,
     }
   });
 
+  it("captures synchronous spill removal throws and attempts every cleanup", async () => {
+    const attempted: string[] = [];
+    const result = await executeBash(
+      { command: "printf output" },
+      {
+        spillFileOperations: {
+          remove(target) {
+            attempted.push(target);
+            if (attempted.length === 1) throw new Error("synchronous cleanup failure");
+            return Promise.resolve();
+          },
+        },
+      },
+    );
+
+    expect(attempted).toHaveLength(2);
+    expect(result.executionError).toEqual({
+      type: "exception",
+      phase: "unknown",
+      message: "Bash temporary output cleanup failed",
+    });
+  });
+
   it("surfaces operation and spill cleanup failure without leaking either cause", async () => {
     const invalidCwd = "/private/workspace-secret/does-not-exist";
     const result = await executeBash(

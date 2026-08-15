@@ -208,18 +208,30 @@ type DiscoveryTimeInputError = DiscoverySearchInputError;
 function adaptDiscoverySearchInputResultToHost<T>(
   result: ResultType<T, DiscoverySearchInputError>,
 ): T {
-  if (result.status === "ok") return result.value;
-  throw result.error;
+  return result.match({
+    ok: (value) => () => value,
+    err: (error) => () => {
+      throw error;
+    },
+  })();
 }
 
 function adaptDiscoverySearchResultToHost<T>(result: ResultType<T, DiscoverySearchError>): T {
-  if (result.status === "ok") return result.value;
-  throw result.error;
+  return result.match({
+    ok: (value) => () => value,
+    err: (error) => () => {
+      throw error;
+    },
+  })();
 }
 
 function adaptDiscoveryCloseResultToHost(result: ResultType<void, DiscoveryCloseError>): void {
-  if (result.status === "ok") return;
-  throw result.error;
+  result.match({
+    ok: () => () => undefined,
+    err: (error) => () => {
+      throw error;
+    },
+  })();
 }
 
 const RELATIVE_DURATION_RE = /^(?:\d+(?:ms|s|m|h|d|w))+$/u;
@@ -388,9 +400,7 @@ function resolveOffsetTimeMs(
 ): ResultType<number, DiscoveryTimeInputError> {
   if (input === undefined) return Result.ok(nowMs);
   if (typeof input === "number") {
-    const parsed = parseEpochMs(input);
-    if (parsed.status === "error") return parsed;
-    return Result.ok(parsed.value === 0 ? nowMs : parsed.value);
+    return parseEpochMs(input).map((value) => (value === 0 ? nowMs : value));
   }
 
   const raw = input.trim();
@@ -399,9 +409,7 @@ function resolveOffsetTimeMs(
     return resolveOffsetTimeMs(Number(raw), nowMs);
   }
   if (RELATIVE_DURATION_RE.test(raw)) {
-    const duration = parseRelativeDurationMs(raw, "offsetTime");
-    if (duration.status === "error") return duration;
-    return Result.ok(nowMs - duration.value);
+    return parseRelativeDurationMs(raw, "offsetTime").map((duration) => nowMs - duration);
   }
 
   const parsed = Date.parse(raw);
@@ -445,24 +453,24 @@ function resolveTimeWindow(
   input: DiscoverySearchInput,
   nowMs: number,
 ): ResultType<TimeWindow | undefined, DiscoveryTimeInputError> {
-  const lookbackMs = resolveLookbackDurationMs(input.lookbackTime);
-  if (lookbackMs.status === "error") return lookbackMs;
-  if (lookbackMs.value === undefined) {
-    if (input.offsetTime !== undefined) {
-      return Result.err(
-        new DiscoverySearchInputError({
-          field: "offsetTime",
-          message: "offsetTime requires lookbackTime.",
-        }),
-      );
+  return resolveLookbackDurationMs(input.lookbackTime).andThen((lookbackMs) => {
+    if (lookbackMs === undefined) {
+      if (input.offsetTime !== undefined) {
+        return Result.err(
+          new DiscoverySearchInputError({
+            field: "offsetTime",
+            message: "offsetTime requires lookbackTime.",
+          }),
+        );
+      }
+      return Result.ok(undefined);
     }
-    return Result.ok(undefined);
-  }
 
-  const endTs = resolveOffsetTimeMs(input.offsetTime, nowMs);
-  if (endTs.status === "error") return endTs;
-  const startTs = endTs.value - lookbackMs.value;
-  return Result.ok({ startTs, endTs: endTs.value });
+    return resolveOffsetTimeMs(input.offsetTime, nowMs).map((endTs) => ({
+      startTs: endTs - lookbackMs,
+      endTs,
+    }));
+  });
 }
 
 function isTextFile(filePath: string): boolean {

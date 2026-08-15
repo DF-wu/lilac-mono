@@ -27,8 +27,12 @@ class ContentInspectFailure extends TaggedError("ContentInspectFailure")<{
 function adaptContentInspectResultToToolHost<TValue>(
   result: ResultType<TValue, ContentInspectFailure>,
 ): TValue {
-  if (result.status === "ok") return result.value;
-  throw new Error(result.error.message);
+  return result.match({
+    ok: (value) => () => value,
+    err: (error) => () => {
+      throw new Error(error.message);
+    },
+  })();
 }
 
 function signalContentInspectFailureToToolHost(message: string): never {

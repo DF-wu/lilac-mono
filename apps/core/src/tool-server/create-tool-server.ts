@@ -304,15 +304,19 @@ function authenticateRequestContext(
 type SafetyMode = "trusted" | "restricted";
 
 type ToolCallSuccess = {
-  readonly kind: "success";
   toResponse(): { readonly isError: false; readonly output: unknown };
 };
 
 function projectToolCallSuccess<TOutput>(output: TOutput): ToolCallSuccess {
   return {
-    kind: "success",
     toResponse: () => ({ isError: false, output }),
   };
+}
+
+function projectToolCallSuccessResult<TOutput>(
+  output: TOutput,
+): () => ResultType<ToolCallSuccess, Error> {
+  return () => Result.ok(projectToolCallSuccess(output));
 }
 
 const RESTRICTED_LEVEL2_ALLOWED = new Set([
@@ -413,6 +417,15 @@ export type ToolServerOptions = {
 const DEFAULT_TOOL_CALL_TIMEOUT_MS = 5 * 60 * 1000;
 const MODULE_DIR = dirname(fileURLToPath(import.meta.url));
 
+function adaptResultToHost<T, E>(result: ResultType<T, E>, toError: (error: E) => unknown): T {
+  return result.match<() => T>({
+    ok: (value) => () => value,
+    err: (error) => () => {
+      throw toError(error);
+    },
+  })();
+}
+
 function validateToolServerOptions(
   options: ToolServerOptions,
 ): ResultType<string | undefined, ToolServerOptionsInvalid> {
@@ -430,60 +443,56 @@ function validateToolServerOptions(
 function adaptToolServerOptionsResultToHost(
   result: ResultType<string | undefined, ToolServerOptionsInvalid>,
 ): string | undefined {
-  if (result.status === "ok") return result.value;
-  throw new Error(result.error.message);
+  return adaptResultToHost(result, (error) => new Error(error.message));
 }
 
 function adaptToolAuthenticationResultToElysia(
   result: ResultType<AuthenticatedToolRequest, ToolRequestAuthenticationError>,
 ): AuthenticatedToolRequest {
-  if (result.status === "ok") return result.value;
-  throw new Error(result.error.message);
+  return adaptResultToHost(result, (error) => new Error(error.message));
 }
 
 function adaptToolRequestHeadersResultToElysia(
   result: ResultType<ToolRequestHeaders, ToolRequestHeadersInvalid>,
 ): ToolRequestHeaders {
-  if (result.status === "ok") return result.value;
-  throw new Error(result.error.message);
+  return adaptResultToHost(result, (error) => new Error(error.message));
 }
 
 function adaptToolPayloadResultToElysia(
   result: ResultType<ToolJsonObject, ToolPayloadInvalid>,
 ): ToolJsonObject {
-  if (result.status === "ok") return result.value;
-  throw new Error(result.error.message);
+  return adaptResultToHost(result, (error) => new Error(error.message));
 }
 
 function adaptSafetyModeResultToElysia(
   result: ResultType<SafetyMode, ToolSafetyModeResolutionError>,
 ): SafetyMode {
-  if (result.status === "ok") return result.value;
-  throw new Error(result.error.message);
+  return adaptResultToHost(result, (error) => new Error(error.message));
 }
 
 function adaptToolRouteResultToElysia<TValue>(
   result: ResultType<TValue, ToolRouteNotFound>,
 ): TValue {
-  if (result.status === "ok") return result.value;
-  throw new NotFoundError(result.error.message);
+  return adaptResultToHost(result, (error) => new NotFoundError(error.message));
 }
 
 function adaptPluginLifecycleResultToHost(
   operation: string,
   result: ResultType<void, ToolPluginManagerError | ToolPluginCleanupError>,
 ): void {
-  if (result.status === "ok") return;
-  const formatted = formatTaggedErrorForLog(result.error);
-  throw new Error(`Tool plugin ${operation} failed: ${formatted.errorMessage}`);
+  adaptResultToHost(result, (error) => {
+    const formatted = formatTaggedErrorForLog(error);
+    return new Error(`Tool plugin ${operation} failed: ${formatted.errorMessage}`);
+  });
 }
 
 function adaptPluginListResultToElysia(
   result: ResultType<ServerToolListResult, ToolPluginInvocationError | ToolPluginCapabilityError>,
 ): ServerToolListResult {
-  if (result.status === "ok") return result.value;
-  const formatted = formatTaggedErrorForLog(result.error);
-  throw new Error(`Tool plugin level2.list failed: ${formatted.errorMessage}`);
+  return adaptResultToHost(result, (error) => {
+    const formatted = formatTaggedErrorForLog(error);
+    return new Error(`Tool plugin level2.list failed: ${formatted.errorMessage}`);
+  });
 }
 
 function adaptPanicToToolServerHost(panic: Panic): never {
@@ -615,10 +624,13 @@ export function createToolServer(options: ToolServerOptions) {
     run: () => Promise<Result<void, ToolPluginManagerError>>,
   ): Promise<ResultType<void, ToolPluginManagerError>> {
     const result = await run();
-    if (result.status === "ok") return result;
-    logPluginError(operation, result.error);
-    if (result.error._tag === "ToolPluginReloadCommittedCleanupError") return Result.ok();
-    return result;
+    return result.match<() => ResultType<void, ToolPluginManagerError>>({
+      ok: () => () => result,
+      err: (error) => () => {
+        logPluginError(operation, error);
+        return error._tag === "ToolPluginReloadCommittedCleanupError" ? Result.ok() : result;
+      },
+    })();
   }
 
   function contributionForTool(tool: ServerTool): Level2ContributionInfo {
@@ -671,8 +683,11 @@ export function createToolServer(options: ToolServerOptions) {
           );
         }
         if (panic === undefined) panic = settled.reason;
-      } else if (settled.value.status === "error") {
-        logPluginError(operation, settled.value.error);
+      } else {
+        settled.value.match<() => void>({
+          ok: () => () => undefined,
+          err: (error) => () => logPluginError(operation, error),
+        })();
       }
     }
     if (panic) return adaptPanicToToolServerHost(panic);
@@ -697,11 +712,13 @@ export function createToolServer(options: ToolServerOptions) {
     const contributionByTool = options.pluginManager?.getLevel2ContributionInfo?.();
     for (const tool of activeTools) {
       const listed = await listTool(tool);
-      if (listed.status === "error") {
-        logPluginError("level2.list", listed.error, { toolId: toolId(tool) });
+      const listError = listed.match({ ok: () => null, err: (error) => error });
+      if (listError) {
+        logPluginError("level2.list", listError, { toolId: toolId(tool) });
         continue;
       }
-      for (const { callableId } of listed.value) {
+      const entries = listed.match({ ok: (value) => value, err: () => [] });
+      for (const { callableId } of entries) {
         nextCallMapping.set(callableId, tool);
         const contribution = contributionByTool?.get(tool);
         if (contribution) nextContributionMapping.set(callableId, contribution);
@@ -763,15 +780,17 @@ export function createToolServer(options: ToolServerOptions) {
         const resolved = await captureSafetyModeProvider(ctx, "server-provider", () =>
           serverSafetyModeProvider(ctx),
         );
-        if (resolved.status === "error") return resolved;
-        assertedSafetyMode = resolved.value;
+        const resolvedValue = resolved.match({ ok: (value) => value, err: () => null });
+        if (!resolvedValue) return resolved;
+        assertedSafetyMode = resolvedValue;
       } else {
         const sessionId = ctx.sessionId;
         if (!sessionId || !options.getConfig) return Result.ok("restricted");
         const loaded = await captureSafetyModeProvider(ctx, "config", options.getConfig);
-        if (loaded.status === "error") return loaded;
+        const loadedValue = loaded.match({ ok: (value) => value, err: () => null });
+        if (!loadedValue) return loaded.map(() => "restricted");
         assertedSafetyMode =
-          loaded.value.surface.router.sessionModes[sessionId]?.safetyMode ?? "trusted";
+          loadedValue.surface.router.sessionModes[sessionId]?.safetyMode ?? "trusted";
       }
     }
     return Result.ok(
@@ -790,15 +809,17 @@ export function createToolServer(options: ToolServerOptions) {
   function resolveSafetyModeFailClosed(
     result: ResultType<SafetyMode, ToolSafetyModeResolutionError>,
   ): SafetyMode {
-    if (result.status === "ok") return result.value;
-    if (result.error.source === "server-provider") {
-      return adaptSafetyModeResultToElysia(result);
-    }
-    logger.warn(
-      "failed to resolve tool request safety mode",
-      toolServerTaggedErrorLogProjection(result.error),
-    );
-    return "restricted";
+    return result.match<() => SafetyMode>({
+      ok: (value) => () => value,
+      err: (error) => () => {
+        if (error.source === "server-provider") return adaptSafetyModeResultToElysia(result);
+        logger.warn(
+          "failed to resolve tool request safety mode",
+          toolServerTaggedErrorLogProjection(error),
+        );
+        return "restricted";
+      },
+    })();
   }
 
   async function listToolsForContext(ctx: RequestContext) {
@@ -815,11 +836,13 @@ export function createToolServer(options: ToolServerOptions) {
       hidden?: boolean;
     }> = [];
     for (const result of toolDescs) {
-      if (result.status === "error") {
-        logPluginError("level2.list", result.error);
+      const listError = result.match({ ok: () => null, err: (error) => error });
+      if (listError) {
+        logPluginError("level2.list", listError);
         continue;
       }
-      for (const entry of result.value) {
+      const entries = result.match({ ok: (value) => value, err: () => [] });
+      for (const entry of entries) {
         if (!isCallableAllowedForControlCapability(entry.callableId, ctx)) continue;
         if (!(await isCallableAllowedForNativeProfile(entry.callableId, ctx))) continue;
         if (
@@ -901,8 +924,9 @@ export function createToolServer(options: ToolServerOptions) {
     const cachedMessages = await captureAuthenticationOperation(() =>
       authenticateRequestContext(context, options.requestMessageCache),
     );
-    if (cachedMessages.status === "error") return cachedMessages;
-    const messages = cachedMessages.value;
+    const cacheError = cachedMessages.match({ ok: () => null, err: (error) => error });
+    if (cacheError) return Result.err(cacheError);
+    const messages = cachedMessages.match({ ok: (value) => value, err: () => undefined });
     if (options.authorizeControlRequest) {
       const authorizeControlRequest = options.authorizeControlRequest;
       if (
@@ -931,8 +955,9 @@ export function createToolServer(options: ToolServerOptions) {
           now: Date.now(),
         }),
       );
-      if (authorization.status === "error") return authorization;
-      const authorized = authorization.value;
+      const authorizationError = authorization.match({ ok: () => null, err: (error) => error });
+      if (authorizationError) return Result.err(authorizationError);
+      const authorized = authorization.match({ ok: (value) => value, err: () => null });
       if (!authorized) {
         return Result.err(
           new ToolRequestAuthenticationError({
@@ -1152,9 +1177,10 @@ export function createToolServer(options: ToolServerOptions) {
       await lookupHelpTool({ callableId: params.callableId, context: ctx, safetyMode }),
     );
     const listed = await listTool(tool);
-    if (listed.status === "error") {
-      logPluginError("level2.list", listed.error, { toolId: toolId(tool) });
-    }
+    listed.match<() => void>({
+      ok: () => () => undefined,
+      err: (error) => () => logPluginError("level2.list", error, { toolId: toolId(tool) }),
+    })();
     const desc = adaptPluginListResultToElysia(listed);
     const output = desc.find(
       (entry: Awaited<ReturnType<ServerTool["list"]>>[number]) =>
@@ -1318,18 +1344,18 @@ export function createToolServer(options: ToolServerOptions) {
           }),
         )
         .then((output) => {
-          const success = output.map(projectToolCallSuccess);
-          if (success.status === "ok") return success.value;
-          if (body.callableId !== "mcp.add") {
-            logPluginError("level2.call", success.error, {
-              toolId: capturedToolId,
-              callableId: body.callableId,
-            });
-          }
-          return {
-            kind: "error" as const,
-            error: pluginCallCompatibilityError(success.error),
-          };
+          return output.match<() => ResultType<ToolCallSuccess, Error>>({
+            ok: projectToolCallSuccessResult,
+            err: (error) => () => {
+              if (body.callableId !== "mcp.add") {
+                logPluginError("level2.call", error, {
+                  toolId: capturedToolId,
+                  callableId: body.callableId,
+                });
+              }
+              return Result.err(pluginCallCompatibilityError(error));
+            },
+          })();
         })
         .finally(() => {
           healthState.endToolCall(callToken, {
@@ -1345,12 +1371,12 @@ export function createToolServer(options: ToolServerOptions) {
         report: options.reportFatalToolCallDefect ?? signalFatalToolCallDefectToProcess,
       });
 
-      const timeoutResult = new Promise<{ kind: "timeout" }>((resolve) => {
+      const timeoutResult = new Promise<"timeout">((resolve) => {
         timeoutSignal.signal.addEventListener(
           "abort",
           () => {
             toolCallTimedOut = true;
-            resolve({ kind: "timeout" });
+            resolve("timeout");
           },
           { once: true },
         );
@@ -1358,7 +1384,7 @@ export function createToolServer(options: ToolServerOptions) {
 
       const result = await Promise.race([callResult, timeoutResult]);
 
-      if (result.kind === "timeout") {
+      if (result === "timeout") {
         healthState.endToolCall(callToken, {
           settled: false,
           timedOut: true,
@@ -1382,22 +1408,26 @@ export function createToolServer(options: ToolServerOptions) {
         };
       }
 
-      if (result.kind === "error") {
-        return toolErrorResponse(result.error);
-      }
-
-      logger.info("tool.call.result", {
-        callableId: body.callableId,
-        requestId: ctx.requestId,
-        sessionId: ctx.sessionId,
-        requestClient: ctx.requestClient,
-        hasMessagesContext: Array.isArray(messages) && messages.length > 0,
-        inputBytes,
-        durationMs: Date.now() - startedAt,
-        timeoutMs,
-        ok: true,
-      });
-      return result.toResponse();
+      const completed: ResultType<ToolCallSuccess, Error> = result;
+      return completed.match<
+        () => ReturnType<ToolCallSuccess["toResponse"]> | ReturnType<typeof toolErrorResponse>
+      >({
+        ok: (success) => () => {
+          logger.info("tool.call.result", {
+            callableId: body.callableId,
+            requestId: ctx.requestId,
+            sessionId: ctx.sessionId,
+            requestClient: ctx.requestClient,
+            hasMessagesContext: Array.isArray(messages) && messages.length > 0,
+            inputBytes,
+            durationMs: Date.now() - startedAt,
+            timeoutMs,
+            ok: true,
+          });
+          return success.toResponse();
+        },
+        err: (error) => () => toolErrorResponse(error),
+      })();
     },
     {
       body: BridgeFnRequest,
@@ -1445,7 +1475,10 @@ export function createToolServer(options: ToolServerOptions) {
       try {
         if (options.pluginManager) {
           const destroyed = await options.pluginManager.destroy();
-          if (destroyed.status === "error") logPluginError("destroy", destroyed.error);
+          destroyed.match<() => void>({
+            ok: () => () => undefined,
+            err: (error) => () => logPluginError("destroy", error),
+          })();
         } else {
           await runStaticToolLifecycle("level2.destroy");
         }

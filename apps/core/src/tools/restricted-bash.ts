@@ -62,17 +62,19 @@ async function captureRestrictedBashOperation<T>(params: {
     try: params.run,
     catch: projectRuntimeError(`Opaque restricted Bash ${params.operation} failure`),
   });
-  if (captured.status === "error") {
-    const cause = preserveToolPanic(captured.error);
-    return Result.err(
-      new RestrictedBashOperationError({
-        operation: params.operation,
-        cause,
-        message: opaqueErrorMessage(cause, `Restricted Bash failed while ${params.operation}`),
-      }),
-    );
-  }
-  return Result.ok(captured.value);
+  return captured.match<() => ResultType<T, RestrictedBashOperationError>>({
+    ok: (value) => () => Result.ok(value),
+    err: (error) => () => {
+      const cause = preserveToolPanic(error);
+      return Result.err(
+        new RestrictedBashOperationError({
+          operation: params.operation,
+          cause,
+          message: opaqueErrorMessage(cause, `Restricted Bash failed while ${params.operation}`),
+        }),
+      );
+    },
+  })();
 }
 
 function captureRestrictedBashSync<T>(params: {
@@ -83,17 +85,19 @@ function captureRestrictedBashSync<T>(params: {
     try: params.run,
     catch: projectRuntimeError(`Opaque restricted Bash ${params.operation} failure`),
   });
-  if (captured.status === "error") {
-    const cause = preserveToolPanic(captured.error);
-    return Result.err(
-      new RestrictedBashOperationError({
-        operation: params.operation,
-        cause,
-        message: opaqueErrorMessage(cause, `Restricted Bash failed while ${params.operation}`),
-      }),
-    );
-  }
-  return Result.ok(captured.value);
+  return captured.match<() => ResultType<T, RestrictedBashOperationError>>({
+    ok: (value) => () => Result.ok(value),
+    err: (error) => () => {
+      const cause = preserveToolPanic(error);
+      return Result.err(
+        new RestrictedBashOperationError({
+          operation: params.operation,
+          cause,
+          message: opaqueErrorMessage(cause, `Restricted Bash failed while ${params.operation}`),
+        }),
+      );
+    },
+  })();
 }
 
 function signalRestrictedBashFailure(operation: string, message: string): never {
@@ -203,15 +207,17 @@ class RestrictedReadFs implements IFileSystem {
       signalRestrictedBashFailure("authorize_read", accessDenied(pathName).message);
     }
     const inspected = await captureRestrictedHostPromise(() => fs.lstat(candidate));
-    if (inspected.status === "error") {
-      const cause = preserveToolPanic(inspected.error);
+    const inspectError = inspected.match({ ok: () => null, err: (error) => error });
+    if (inspectError) {
+      const cause = preserveToolPanic(inspectError);
       if (restrictedHostErrorCode(cause) === "ENOENT") return;
       signalRestrictedBashFailure(
         "inspect_read_target",
         opaqueErrorMessage(cause, "Failed to inspect restricted read target"),
       );
     }
-    if (inspected.value.isFile() && inspected.value.nlink > 1) {
+    const stat = inspected.match({ ok: (value) => value, err: () => null });
+    if (stat?.isFile() && stat.nlink > 1) {
       signalRestrictedBashFailure("authorize_read", accessDenied(pathName).message);
     }
   }
@@ -230,15 +236,17 @@ class RestrictedReadFs implements IFileSystem {
       signalRestrictedBashFailure("authorize_write", accessDenied(pathName).message);
     }
     const inspected = await captureRestrictedHostPromise(() => fs.lstat(candidate));
-    if (inspected.status === "error") {
-      const cause = preserveToolPanic(inspected.error);
+    const inspectError = inspected.match({ ok: () => null, err: (error) => error });
+    if (inspectError) {
+      const cause = preserveToolPanic(inspectError);
       if (restrictedHostErrorCode(cause) === "ENOENT") return;
       signalRestrictedBashFailure(
         "inspect_write_target",
         opaqueErrorMessage(cause, "Failed to inspect restricted write target"),
       );
     }
-    if (inspected.value.isFile() && inspected.value.nlink > 1) {
+    const stat = inspected.match({ ok: (value) => value, err: () => null });
+    if (stat?.isFile() && stat.nlink > 1) {
       signalRestrictedBashFailure("authorize_write", accessDenied(pathName).message);
     }
   }
@@ -281,8 +289,9 @@ class RestrictedReadFs implements IFileSystem {
   async exists(pathName: string) {
     if (this.denyOutsideMount && normalizeVirtualPath(pathName) !== "/") return false;
     const readable = await captureRestrictedHostPromise(() => this.assertReadable(pathName));
-    if (readable.status === "error") {
-      const cause = preserveToolPanic(readable.error);
+    const readError = readable.match({ ok: () => null, err: (error) => error });
+    if (readError) {
+      const cause = preserveToolPanic(readError);
       const message = opaqueErrorMessage(cause, "Restricted path is unavailable");
       if (message.startsWith("Access denied in restricted mode:")) return false;
       signalRestrictedBashFailure("authorize_exists", message);
@@ -406,17 +415,19 @@ function decodeRestrictedJson(source: string): ResultType<unknown, RestrictedBas
     try: () => JSON.parse(source),
     catch: projectRuntimeError("Opaque restricted Bash JSON parse failure"),
   });
-  if (decoded.status === "error") {
-    const cause = preserveToolPanic(decoded.error);
-    return Result.err(
-      new RestrictedBashOperationError({
-        operation: "parse_json",
-        cause,
-        message: opaqueErrorMessage(cause, "Invalid JSON input"),
-      }),
-    );
-  }
-  return Result.ok(decoded.value);
+  return decoded.match<() => ResultType<unknown, RestrictedBashOperationError>>({
+    ok: (value) => () => Result.ok(value),
+    err: (error) => () => {
+      const cause = preserveToolPanic(error);
+      return Result.err(
+        new RestrictedBashOperationError({
+          operation: "parse_json",
+          cause,
+          message: opaqueErrorMessage(cause, "Invalid JSON input"),
+        }),
+      );
+    },
+  })();
 }
 
 function decodeNestedToolInput(
@@ -466,14 +477,15 @@ async function readHttpErrorMessage(res: Response): Promise<string> {
     operation: "read_http_error",
     run: () => res.text(),
   });
-  const body = read.status === "ok" ? read.value : "";
+  const body = read.match({ ok: (value) => value, err: () => "" });
   if (body.trim().length === 0) return `${res.status} ${res.statusText}`.trim();
   const parsed = decodeRestrictedJson(body);
-  if (parsed.status === "ok") {
+  const parsedValue = parsed.match({ ok: (value) => value, err: () => null });
+  if (parsedValue !== null) {
     const decoded = z
       .object({ message: z.string().optional(), output: z.string().optional() })
       .passthrough()
-      .safeParse(parsed.value);
+      .safeParse(parsedValue);
     if (decoded.success) {
       if (decoded.data.message) return decoded.data.message;
       if (decoded.data.output) return decoded.data.output;
@@ -657,8 +669,10 @@ function createToolsCommand(context: RestrictedBashContext) {
       operation: "run_tools_command",
       run: runToolsCommand,
     });
-    if (executed.status === "ok") return executed.value;
-    return { stdout: "", stderr: `${executed.error.message}\n`, exitCode: 1 };
+    return executed.match({
+      ok: (value) => value,
+      err: (error) => ({ stdout: "", stderr: `${error.message}\n`, exitCode: 1 }),
+    });
   });
 }
 
@@ -842,18 +856,20 @@ export async function executeRestrictedBash(
     operation: "resolve_cwd",
     run: () => resolveRestrictedCwd({ cwd, workspaceRoot, sessionTmpDir }),
   });
-  if (resolvedCwd.status === "error") {
-    return {
+  const blockedCwd = resolvedCwd.match<BashToolOutput | null>({
+    ok: () => null,
+    err: (error) => ({
       stdout: "",
-      stderr: resolvedCwd.error.message,
+      stderr: error.message,
       exitCode: -1,
       executionError: {
         type: "blocked",
         reason: "restricted_bash_cwd",
       },
-    };
-  }
-  const restrictedCwd = resolvedCwd.value;
+    }),
+  });
+  if (blockedCwd) return blockedCwd;
+  const restrictedCwd = resolvedCwd.match({ ok: (value) => value, err: () => WORKSPACE_MOUNT });
 
   const wallClockTimeoutMs = Math.min(
     timeoutMs ?? RESTRICTED_BASH_WALL_TIMEOUT_MS,
@@ -943,19 +959,22 @@ export async function executeRestrictedBash(
             maxBytesPerSession: outputConfig.artifactMaxBytesPerSession,
           }),
       });
-      if (created.status === "error") {
+      const createError = created.match({ ok: () => null, err: (error) => error });
+      if (createError) {
         logger.warn("tool.artifact.write_failed", {
           toolName: "bash",
-          ...formatTaggedErrorForLog(created.error),
+          ...formatTaggedErrorForLog(createError),
         });
       } else {
-        const artifact = created.value;
-        if (artifact.status === "ok") artifactUri = artifact.value.uri;
-        else {
+        const artifact = created.match({ ok: (value) => value, err: () => null });
+        const artifactError = artifact?.match({ ok: () => null, err: (error) => error });
+        if (artifactError) {
           logger.warn("tool.artifact.write_failed", {
             toolName: "bash",
-            ...formatTaggedErrorForLog(artifact.error),
+            ...formatTaggedErrorForLog(artifactError),
           });
+        } else {
+          artifactUri = artifact?.match({ ok: (value) => value.uri, err: () => undefined });
         }
       }
     }
@@ -977,18 +996,20 @@ export async function executeRestrictedBash(
     clearTimeout(timeout);
     options.abortSignal?.removeEventListener("abort", abortListener);
   }
-  if (executed.status === "error") {
-    const executionError = toRestrictedTerminationError(termination, wallClockTimeoutMs) ?? {
-      type: "exception" as const,
-      phase: "unknown" as const,
-      message: executed.error.message,
-    };
-    return {
-      stdout: "",
-      stderr: executed.error.message,
-      exitCode: -1,
-      executionError,
-    };
-  }
-  return executed.value;
+  return executed.match<() => BashToolOutput>({
+    err: (error) => () => {
+      const executionError = toRestrictedTerminationError(termination, wallClockTimeoutMs) ?? {
+        type: "exception" as const,
+        phase: "unknown" as const,
+        message: error.message,
+      };
+      return {
+        stdout: "",
+        stderr: error.message,
+        exitCode: -1,
+        executionError,
+      };
+    },
+    ok: (value) => () => value,
+  })();
 }

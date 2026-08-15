@@ -16,8 +16,12 @@ class CodexToolFailure extends TaggedError("CodexToolFailure")<{
 }> {}
 
 function adaptCodexResultToToolHost<TValue>(result: ResultType<TValue, CodexToolFailure>): TValue {
-  if (result.status === "ok") return result.value;
-  throw new Error(result.error.message);
+  return result.match({
+    ok: (value) => () => value,
+    err: (error) => () => {
+      throw new Error(error.message);
+    },
+  })();
 }
 
 function signalCodexFailureToToolHost(message: string): never {
@@ -237,21 +241,20 @@ export class Codex implements ServerTool {
     if (callableId === "codex.status") {
       parseToolInput({ callableId, input, schema: statusInputSchema });
       const loaded = await this.dependencies.readTokens();
-      let tokens = null;
-      if (loaded.status === "ok") {
-        tokens = loaded.value.value;
-      } else {
-        switch (loaded.error._tag) {
-          case "CodexTokensReadFailed":
-            if (loaded.error.operation === "inspect")
-              return signalCodexFailureToToolHost(loaded.error.message);
-            break;
-          case "CodexTokensMalformed":
-          case "CodexTokensCorrupt":
-          case "CodexTokensUnsupportedVersion":
-            break;
-        }
-      }
+      const tokens = loaded.match({
+        ok: (value) => () => value.value,
+        err: (error) => () => {
+          switch (error._tag) {
+            case "CodexTokensReadFailed":
+              if (error.operation === "inspect") return signalCodexFailureToToolHost(error.message);
+              return null;
+            case "CodexTokensMalformed":
+            case "CodexTokensCorrupt":
+            case "CodexTokensUnsupportedVersion":
+              return null;
+          }
+        },
+      })();
       return {
         configured: tokens !== null,
         storagePath: this.dependencies.storagePath(),
@@ -268,16 +271,19 @@ export class Codex implements ServerTool {
         pending = null;
         await login?.close();
         const cleared = await this.dependencies.clearTokens();
-        if (cleared.status === "error") {
-          switch (cleared.error._tag) {
-            case "CodexTokensReadFailed":
-              return signalCodexFailureToToolHost(cleared.error.message);
-            case "CodexTokensWriteFailed":
-            case "CodexTokensCleanupFailed":
-            case "CodexTokensWriteAndCleanupFailed":
-              return signalCodexFailureToToolHost(cleared.error.message);
-          }
-        }
+        cleared.match({
+          ok: () => () => undefined,
+          err: (error) => () => {
+            switch (error._tag) {
+              case "CodexTokensReadFailed":
+                return signalCodexFailureToToolHost(error.message);
+              case "CodexTokensWriteFailed":
+              case "CodexTokensCleanupFailed":
+              case "CodexTokensWriteAndCleanupFailed":
+                return signalCodexFailureToToolHost(error.message);
+            }
+          },
+        })();
         return { ok: true as const, storagePath: this.dependencies.storagePath() };
       });
     }

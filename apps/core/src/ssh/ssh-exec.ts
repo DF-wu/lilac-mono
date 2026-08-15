@@ -156,10 +156,6 @@ type OverflowCapture = {
 
 type SshStreamReadChunk = Awaited<ReturnType<ReadableStreamDefaultReader<Uint8Array>["read"]>>;
 
-type SshOverflowSettled<T> =
-  | { readonly status: "result"; readonly result: ResultType<T, SshOverflowOperationError> }
-  | { readonly status: "panic"; readonly panic: Panic };
-
 type SshOverflowCleanupOutcome = {
   readonly result: ResultType<void, SshOverflowCleanupError>;
   readonly panic?: Panic;
@@ -178,10 +174,10 @@ function captureSshOperation<T, E extends Error>(params: {
     try: params.run,
     catch: projectRuntimeError(params.fallback),
   });
-  if (captured.status === "error") {
-    return Result.err(params.mapError(rethrowSshPanic(captured.error)));
-  }
-  return Result.ok(captured.value);
+  return captured.match<() => ResultType<T, E>>({
+    ok: (value) => () => Result.ok(value),
+    err: (error) => () => Result.err(params.mapError(rethrowSshPanic(error))),
+  })();
 }
 
 async function captureSshPromise<T, E extends Error>(params: {
@@ -193,10 +189,10 @@ async function captureSshPromise<T, E extends Error>(params: {
     try: params.run,
     catch: projectRuntimeError(params.fallback),
   });
-  if (captured.status === "error") {
-    return Result.err(params.mapError(rethrowSshPanic(captured.error)));
-  }
-  return Result.ok(captured.value);
+  return captured.match<() => ResultType<T, E>>({
+    ok: (value) => () => Result.ok(value),
+    err: (error) => () => Result.err(params.mapError(rethrowSshPanic(error))),
+  })();
 }
 
 export function serializeRemoteRunnerRequestJson(
@@ -371,17 +367,16 @@ function removeOverflowFile(target: string): Promise<ResultType<void, SshOverflo
 
 async function settleOverflowOperation<T>(
   run: () => Promise<ResultType<T, SshOverflowOperationError>>,
-): Promise<SshOverflowSettled<T>> {
+): Promise<ResultType<ResultType<T, SshOverflowOperationError>, Panic>> {
   const settled = await Result.tryPromise({
     try: run,
     catch: projectRuntimeError("Opaque SSH overflow Result rejection"),
   });
-  if (settled.status === "ok") return { status: "result", result: settled.value };
-  if (isPanic(settled.error)) return { status: "panic", panic: settled.error };
-  return {
-    status: "panic",
-    panic: new Panic({ message: "SSH overflow Result API rejected with an ordinary error" }),
-  };
+  return settled.mapError((error) =>
+    isPanic(error)
+      ? error
+      : new Panic({ message: "SSH overflow Result API rejected with an ordinary error" }),
+  );
 }
 
 async function cleanupOverflowCaptureOutcome(
@@ -393,13 +388,33 @@ async function cleanupOverflowCaptureOutcome(
   capture.sink = undefined;
   if (sink) {
     const aborted = await settleOverflowOperation(() => abortOverflowSink(sink));
-    if (aborted.status === "panic") deferredPanic = aborted.panic;
-    else if (aborted.result.status === "error") failures.push(aborted.result.error);
+    aborted.match({
+      err: (panic) => {
+        deferredPanic = panic;
+      },
+      ok: (result) =>
+        result.match({
+          ok: () => undefined,
+          err: (error) => {
+            failures.push(error);
+          },
+        }),
+    });
   }
   if (capture.fileCreated) {
     const removed = await settleOverflowOperation(() => removeOverflowFile(capture.target));
-    if (removed.status === "panic") deferredPanic ??= removed.panic;
-    else if (removed.result.status === "error") failures.push(removed.result.error);
+    removed.match({
+      err: (panic) => {
+        deferredPanic ??= panic;
+      },
+      ok: (result) =>
+        result.match({
+          ok: () => undefined,
+          err: (error) => {
+            failures.push(error);
+          },
+        }),
+    });
   }
   capture.fileCreated = false;
   capture.bufferedRawChunks.length = 0;
@@ -437,9 +452,10 @@ async function disableOverflowCapture(
   capture.disabled = true;
   logger.debug("SSH overflow retention unavailable", formatTaggedErrorForLog(failure));
   const cleanup = await cleanupOverflowCapture(capture);
-  if (cleanup.status === "error") {
-    logger.debug("SSH overflow cleanup incomplete", formatTaggedErrorForLog(cleanup.error));
-  }
+  cleanup.match({
+    ok: () => undefined,
+    err: (error) => logger.debug("SSH overflow cleanup incomplete", formatTaggedErrorForLog(error)),
+  });
 }
 
 async function writeOverflowChunk(
@@ -450,15 +466,30 @@ async function writeOverflowChunk(
   let sink = capture.sink;
   if (!sink) {
     const opened = await settleOverflowOperation(() => openOverflowSink(capture.target));
-    if (opened.status === "panic") return propagateOverflowPanic(capture, opened.panic);
-    if (opened.result.status === "error") return Result.err(opened.result.error);
-    sink = opened.result.value;
-    capture.sink = sink;
-    capture.fileCreated = true;
+    return opened.match({
+      err: (panic) => async () => propagateOverflowPanic(capture, panic),
+      ok: (result) => async () =>
+        result.match({
+          err: (error) => async () => Result.err(error),
+          ok: (openedSink) => async () => {
+            capture.sink = openedSink;
+            capture.fileCreated = true;
+            const written = await settleOverflowOperation(() =>
+              writeOverflowSink(openedSink, chunk),
+            );
+            return written.match({
+              err: (panic) => async () => propagateOverflowPanic(capture, panic),
+              ok: (value) => async () => value,
+            })();
+          },
+        })(),
+    })();
   }
   const written = await settleOverflowOperation(() => writeOverflowSink(sink, chunk));
-  if (written.status === "panic") return propagateOverflowPanic(capture, written.panic);
-  return written.result;
+  return written.match({
+    err: (panic) => async () => propagateOverflowPanic(capture, panic),
+    ok: (result) => async () => result,
+  })();
 }
 
 async function activateOverflowCapture(
@@ -466,7 +497,8 @@ async function activateOverflowCapture(
 ): Promise<ResultType<void, SshOverflowOperationError>> {
   for (const chunk of capture.bufferedRawChunks) {
     const written = await writeOverflowChunk(capture, chunk);
-    if (written.status === "error") return Result.err(written.error);
+    const failure = written.match({ ok: () => null, err: (error) => Result.err(error) });
+    if (failure) return failure;
   }
   capture.bufferedRawChunks.length = 0;
   return Result.ok();
@@ -476,18 +508,21 @@ function combineStreamReadAndCleanup(
   primary: ResultType<StreamTextResult, SshStreamReadError>,
   cleanup: ResultType<void, SshStreamCleanupError>,
 ): ResultType<StreamTextResult, SshStreamTextError> {
-  if (primary.status === "ok") {
-    if (cleanup.status === "error") return Result.err(cleanup.error);
-    return primary;
-  }
-  if (cleanup.status === "ok") return primary;
-  return Result.err(
-    new SshStreamReadAndCleanupError({
-      primary: primary.error,
-      cleanup: cleanup.error,
-      message: `${primary.error.message}; cleanup also failed: ${cleanup.error.message}`,
-    }),
-  );
+  return primary.match<ResultType<StreamTextResult, SshStreamTextError>>({
+    ok: (value) => cleanup.map(() => value),
+    err: (primaryError) =>
+      cleanup.match<ResultType<StreamTextResult, SshStreamTextError>>({
+        ok: () => Result.err(primaryError),
+        err: (cleanupError) =>
+          Result.err(
+            new SshStreamReadAndCleanupError({
+              primary: primaryError,
+              cleanup: cleanupError,
+              message: `${primaryError.message}; cleanup also failed: ${cleanupError.message}`,
+            }),
+          ),
+      }),
+  });
 }
 
 async function readReadableStreamTextCapped(
@@ -496,125 +531,138 @@ async function readReadableStreamTextCapped(
   options?: { overflowFilePath?: string; onActivity?: () => void },
 ): Promise<ResultType<StreamTextResult, SshStreamTextError>> {
   const acquired = acquireStreamReader(stream);
-  if (acquired.status === "error") return Result.err(acquired.error);
-  const reader = acquired.value;
-  let releaseAttempted = false;
+  return acquired.match({
+    err: (error) => async () => Result.err(error),
+    ok: (reader) => async () => {
+      let releaseAttempted = false;
 
-  try {
-    const decoder = new TextDecoder();
-    let text = "";
-    let totalChars = 0;
-    let capped = false;
-    let overflowFilePath: string | undefined;
-    const overflowCapture: OverflowCapture | undefined = options?.overflowFilePath
-      ? {
-          target: options.overflowFilePath,
-          bufferedRawChunks: [],
-          fileCreated: false,
-          disabled: false,
-        }
-      : undefined;
+      try {
+        const decoder = new TextDecoder();
+        let text = "";
+        let totalChars = 0;
+        let capped = false;
+        let overflowFilePath: string | undefined;
+        const overflowCapture: OverflowCapture | undefined = options?.overflowFilePath
+          ? {
+              target: options.overflowFilePath,
+              bufferedRawChunks: [],
+              fileCreated: false,
+              disabled: false,
+            }
+          : undefined;
 
-    const consumeChunkText = async (
-      chunkText: string,
-    ): Promise<ResultType<void, SshOverflowOperationError>> => {
-      if (chunkText.length === 0) return Result.ok();
-      totalChars += chunkText.length;
-      if (capped) return Result.ok();
+        const consumeChunkText = async (
+          chunkText: string,
+        ): Promise<ResultType<void, SshOverflowOperationError>> => {
+          if (chunkText.length === 0) return Result.ok();
+          totalChars += chunkText.length;
+          if (capped) return Result.ok();
 
-      const previousText = text;
-      const nextLen = previousText.length + chunkText.length;
-      if (nextLen <= maxChars) {
-        text = previousText + chunkText;
-        return Result.ok();
-      }
-
-      capped = true;
-      const remaining = Math.max(0, maxChars - previousText.length);
-      text = previousText + chunkText.slice(0, remaining);
-      if (!overflowCapture) return Result.ok();
-      return activateOverflowCapture(overflowCapture);
-    };
-
-    let primary: ResultType<StreamTextResult, SshStreamReadError>;
-    while (true) {
-      const read = await readStreamChunk(reader);
-      if (read.status === "error") {
-        if (overflowCapture) {
-          const cleanup = await cleanupOverflowCapture(overflowCapture);
-          if (cleanup.status === "error") {
-            logger.debug("SSH overflow cleanup incomplete", formatTaggedErrorForLog(cleanup.error));
+          const previousText = text;
+          const nextLen = previousText.length + chunkText.length;
+          if (nextLen <= maxChars) {
+            text = previousText + chunkText;
+            return Result.ok();
           }
-        }
-        primary = Result.err(read.error);
-        break;
-      }
-      const { done, value } = read.value;
-      if (done) {
-        const tail = decoder.decode();
-        if (tail.length > 0) {
-          const consumed = await consumeChunkText(tail);
-          if (consumed.status === "error" && overflowCapture) {
-            await disableOverflowCapture(overflowCapture, consumed.error);
-          }
-        }
-        if (overflowCapture?.sink) {
-          const overflowSink = overflowCapture.sink;
-          const closed = await settleOverflowOperation(() => closeOverflowSink(overflowSink));
-          if (closed.status === "panic") {
-            await propagateOverflowPanic(overflowCapture, closed.panic);
-          } else if (closed.result.status === "error") {
-            await disableOverflowCapture(overflowCapture, closed.result.error);
-          } else {
-            overflowCapture.sink = undefined;
-            overflowFilePath = overflowCapture.target;
-          }
-        }
-        primary = Result.ok({ text, totalChars, capped, overflowFilePath });
-        break;
-      }
-      if (!value || value.byteLength === 0) continue;
 
-      if (options?.onActivity) {
-        const activity = reportStreamActivity(options.onActivity);
-        if (activity.status === "error") {
-          if (overflowCapture) {
-            const cleanup = await cleanupOverflowCapture(overflowCapture);
-            if (cleanup.status === "error") {
-              logger.debug(
-                "SSH overflow cleanup incomplete",
-                formatTaggedErrorForLog(cleanup.error),
-              );
+          capped = true;
+          const remaining = Math.max(0, maxChars - previousText.length);
+          text = previousText + chunkText.slice(0, remaining);
+          if (!overflowCapture) return Result.ok();
+          return activateOverflowCapture(overflowCapture);
+        };
+
+        let primary: ResultType<StreamTextResult, SshStreamReadError>;
+        while (true) {
+          const read = await readStreamChunk(reader);
+          const readFailure = read.match({ ok: () => null, err: (error) => error });
+          if (readFailure) {
+            if (overflowCapture) {
+              const cleanup = await cleanupOverflowCapture(overflowCapture);
+              cleanup.match({
+                ok: () => undefined,
+                err: (error) =>
+                  logger.debug("SSH overflow cleanup incomplete", formatTaggedErrorForLog(error)),
+              });
+            }
+            primary = Result.err(readFailure);
+            break;
+          }
+          const chunk = read.match<SshStreamReadChunk>({
+            ok: (value) => value,
+            err: () => ({ done: true }),
+          });
+          const { done, value } = chunk;
+          if (done) {
+            const tail = decoder.decode();
+            if (tail.length > 0) {
+              const consumed = await consumeChunkText(tail);
+              const failure = consumed.match({ ok: () => null, err: (error) => error });
+              if (failure && overflowCapture)
+                await disableOverflowCapture(overflowCapture, failure);
+            }
+            if (overflowCapture?.sink) {
+              const overflowSink = overflowCapture.sink;
+              const closed = await settleOverflowOperation(() => closeOverflowSink(overflowSink));
+              await closed.match({
+                err: (panic) => async () => propagateOverflowPanic(overflowCapture, panic),
+                ok: (result) => async () =>
+                  result.match({
+                    err: (error) => async () => disableOverflowCapture(overflowCapture, error),
+                    ok: () => async () => {
+                      overflowCapture.sink = undefined;
+                      overflowFilePath = overflowCapture.target;
+                    },
+                  })(),
+              })();
+            }
+            primary = Result.ok({ text, totalChars, capped, overflowFilePath });
+            break;
+          }
+          if (!value || value.byteLength === 0) continue;
+
+          if (options?.onActivity) {
+            const activity = reportStreamActivity(options.onActivity);
+            const activityFailure = activity.match({ ok: () => null, err: (error) => error });
+            if (activityFailure) {
+              if (overflowCapture) {
+                const cleanup = await cleanupOverflowCapture(overflowCapture);
+                cleanup.match({
+                  ok: () => undefined,
+                  err: (error) =>
+                    logger.debug("SSH overflow cleanup incomplete", formatTaggedErrorForLog(error)),
+                });
+              }
+              primary = Result.err(activityFailure);
+              break;
             }
           }
-          primary = Result.err(activity.error);
-          break;
+          if (capped && overflowCapture) {
+            const written = await writeOverflowChunk(overflowCapture, value);
+            const failure = written.match({ ok: () => null, err: (error) => error });
+            if (failure) await disableOverflowCapture(overflowCapture, failure);
+          } else if (overflowCapture) {
+            overflowCapture.bufferedRawChunks.push(Buffer.from(value));
+          }
+          const consumed = await consumeChunkText(decoder.decode(value, { stream: true }));
+          const failure = consumed.match({ ok: () => null, err: (error) => error });
+          if (failure && overflowCapture) await disableOverflowCapture(overflowCapture, failure);
         }
-      }
-      if (capped && overflowCapture) {
-        const written = await writeOverflowChunk(overflowCapture, value);
-        if (written.status === "error") {
-          await disableOverflowCapture(overflowCapture, written.error);
-        }
-      } else if (overflowCapture) {
-        overflowCapture.bufferedRawChunks.push(Buffer.from(value));
-      }
-      const consumed = await consumeChunkText(decoder.decode(value, { stream: true }));
-      if (consumed.status === "error" && overflowCapture) {
-        await disableOverflowCapture(overflowCapture, consumed.error);
-      }
-    }
 
-    releaseAttempted = true;
-    return combineStreamReadAndCleanup(primary, releaseStreamReader(reader));
-  } finally {
-    if (!releaseAttempted) {
-      const released = releaseStreamReader(reader);
-      if (released.status === "error") {
-        logger.debug("SSH stream reader cleanup failed", formatTaggedErrorForLog(released.error));
+        releaseAttempted = true;
+        return combineStreamReadAndCleanup(primary, releaseStreamReader(reader));
+      } finally {
+        if (!releaseAttempted) {
+          const released = releaseStreamReader(reader);
+          released.match({
+            ok: () => undefined,
+            err: (error) =>
+              logger.debug("SSH stream reader cleanup failed", formatTaggedErrorForLog(error)),
+          });
+        }
       }
-    }
-  }
+    },
+  })();
 }
 
 async function readBodyTextCapped(
@@ -623,41 +671,48 @@ async function readBodyTextCapped(
   overflowFilePath?: string,
 ): Promise<ResultType<StreamTextResult, SshStreamReadError>> {
   const read = await readResponseBody(body);
-  if (read.status === "error") return Result.err(read.error);
-  const fullBytes = read.value;
-  const full = new TextDecoder().decode(fullBytes);
-  const capped = full.length > maxChars;
-  let retainedOverflowPath: string | undefined;
-  if (capped && overflowFilePath) {
-    const capture: OverflowCapture = {
-      target: overflowFilePath,
-      bufferedRawChunks: [],
-      fileCreated: false,
-      disabled: false,
-    };
-    const written = await writeOverflowChunk(capture, fullBytes);
-    if (written.status === "error") {
-      await disableOverflowCapture(capture, written.error);
-    } else if (capture.sink) {
-      const overflowSink = capture.sink;
-      const closed = await settleOverflowOperation(() => closeOverflowSink(overflowSink));
-      if (closed.status === "panic") {
-        await propagateOverflowPanic(capture, closed.panic);
-      } else if (closed.result.status === "error") {
-        await disableOverflowCapture(capture, closed.result.error);
-      } else {
-        capture.sink = undefined;
-        retainedOverflowPath = overflowFilePath;
+  return read.match<() => Promise<ResultType<StreamTextResult, SshStreamReadError>>>({
+    err: (error) => async () => Result.err(error),
+    ok: (fullBytes) => async () => {
+      const full = new TextDecoder().decode(fullBytes);
+      const capped = full.length > maxChars;
+      let retainedOverflowPath: string | undefined;
+      if (capped && overflowFilePath) {
+        const capture: OverflowCapture = {
+          target: overflowFilePath,
+          bufferedRawChunks: [],
+          fileCreated: false,
+          disabled: false,
+        };
+        const written = await writeOverflowChunk(capture, fullBytes);
+        const writeFailure = written.match({ ok: () => null, err: (error) => error });
+        if (writeFailure) {
+          await disableOverflowCapture(capture, writeFailure);
+        } else if (capture.sink) {
+          const overflowSink = capture.sink;
+          const closed = await settleOverflowOperation(() => closeOverflowSink(overflowSink));
+          await closed.match({
+            err: (panic) => async () => propagateOverflowPanic(capture, panic),
+            ok: (result) => async () =>
+              result.match({
+                err: (error) => async () => disableOverflowCapture(capture, error),
+                ok: () => async () => {
+                  capture.sink = undefined;
+                  retainedOverflowPath = overflowFilePath;
+                },
+              })(),
+          })();
+        }
       }
-    }
-  }
 
-  return Result.ok({
-    text: full.length > maxChars ? full.slice(0, maxChars) : full,
-    totalChars: full.length,
-    capped,
-    overflowFilePath: retainedOverflowPath,
-  });
+      return Result.ok({
+        text: full.length > maxChars ? full.slice(0, maxChars) : full,
+        totalChars: full.length,
+        capped,
+        overflowFilePath: retainedOverflowPath,
+      });
+    },
+  })();
 }
 
 export async function readStreamTextCapped(
@@ -782,9 +837,9 @@ function killProcessGroupBestEffort(
 ): ResultType<void, SshProcessCleanupError> {
   const failures: SshProcessSignalError[] = [];
   const group = signalSshProcess(pid, signal, "group");
-  if (group.status === "error") failures.push(group.error);
+  group.match({ ok: () => undefined, err: (error) => failures.push(error) });
   const processResult = signalSshProcess(pid, signal, "process");
-  if (processResult.status === "error") failures.push(processResult.error);
+  processResult.match({ ok: () => undefined, err: (error) => failures.push(error) });
   if (failures.length === 0) return Result.ok();
   return Result.err(
     new SshProcessCleanupError({
@@ -795,9 +850,11 @@ function killProcessGroupBestEffort(
 }
 
 function observeBestEffortProcessCleanup(cleanup: ResultType<void, SshProcessCleanupError>): void {
-  if (cleanup.status === "error") {
-    logger.debug("SSH process-group cleanup incomplete", formatTaggedErrorForLog(cleanup.error));
-  }
+  cleanup.match({
+    ok: () => undefined,
+    err: (error) =>
+      logger.debug("SSH process-group cleanup incomplete", formatTaggedErrorForLog(error)),
+  });
 }
 
 function waitForSshExit(exit: Promise<number>): Promise<ResultType<number, SshExitWaitError>> {
@@ -816,9 +873,13 @@ function projectStreamCapture(
   streamName: "stdout" | "stderr",
   captured: ResultType<StreamTextResult, SshStreamTextError>,
 ): StreamTextResult {
-  if (captured.status === "ok") return captured.value;
-  logger.debug(`SSH ${streamName} capture failed`, formatTaggedErrorForLog(captured.error));
-  return { text: "", totalChars: 0, capped: false };
+  return captured.match({
+    ok: (value) => value,
+    err: (error) => {
+      logger.debug(`SSH ${streamName} capture failed`, formatTaggedErrorForLog(error));
+      return { text: "", totalChars: 0, capped: false };
+    },
+  });
 }
 
 export async function sshExecBash(params: {
@@ -963,12 +1024,14 @@ export async function sshExecBash(params: {
 
     const stdoutResult = projectStreamCapture("stdout", stdoutCapture);
     const stderrResult = projectStreamCapture("stderr", stderrCapture);
-    if (exitResult.status === "error") {
-      logger.debug("SSH subprocess exit wait failed", formatTaggedErrorForLog(exitResult.error));
-    }
+    exitResult.match({
+      ok: () => undefined,
+      err: (error) =>
+        logger.debug("SSH subprocess exit wait failed", formatTaggedErrorForLog(error)),
+    });
     const stdout = stdoutResult.text;
     const stderr = stderrResult.text;
-    const exitCode = exitResult.status === "ok" ? exitResult.value : -1;
+    const exitCode = exitResult.match({ ok: (value) => value, err: () => -1 });
 
     const transportError = exitCode === 255 ? inferTransportError(stderr) : undefined;
 
@@ -1009,8 +1072,12 @@ export async function sshExecScriptJson<T, TDecodeError>(params: {
     return Result.err(new SshExecutionCancelledError({ message: "aborted" }));
   }
   const serializedInput = serializeRemoteRunnerRequestJson(params.input);
-  if (serializedInput.status === "error") return Result.err(serializedInput.error);
-  const inputJson = serializedInput.value;
+  const serializationFailure = serializedInput.match({
+    ok: () => null,
+    err: (error) => Result.err(error),
+  });
+  if (serializationFailure) return serializationFailure;
+  const inputJson = serializedInput.match({ ok: (value) => value, err: () => "" });
 
   const script = `#!/usr/bin/env bash
 set -euo pipefail
@@ -1089,8 +1156,14 @@ exit 0
     mapError: (cause) =>
       new SshExecutionAdapterError({ cause, message: "SSH execution adapter failed" }),
   });
-  if (executed.status === "error") return Result.err(executed.error);
-  const res = executed.value;
+  const executionFailure = executed.match({ ok: () => null, err: (error) => Result.err(error) });
+  if (executionFailure) return executionFailure;
+  const res = executed.match({
+    ok: (value) => () => value,
+    err: (error) => () => {
+      throw error;
+    },
+  })();
 
   if (res.aborted) {
     return Result.err(new SshExecutionCancelledError({ message: "aborted" }));
@@ -1129,9 +1202,5 @@ exit 0
     );
   }
 
-  const decoded = params.decodeResponse(res.stdout.trim());
-  if (decoded.status === "error") {
-    return Result.err(decoded.error);
-  }
-  return Result.ok(decoded.value);
+  return params.decodeResponse(res.stdout.trim());
 }

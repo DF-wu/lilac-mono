@@ -49,17 +49,19 @@ async function captureAttachmentOperation<T>(params: {
     try: params.run,
     catch: projectRuntimeError(`Opaque attachment ${params.operation} failure`),
   });
-  if (captured.status === "error") {
-    const cause = preserveToolPanic(captured.error);
-    return Result.err(
-      new AttachmentOperationError({
-        operation: params.operation,
-        cause,
-        message: opaqueErrorMessage(cause, `Attachment ${params.operation} failed`),
-      }),
-    );
-  }
-  return Result.ok(captured.value);
+  return captured.match<() => ResultType<T, AttachmentOperationError>>({
+    ok: (value) => () => Result.ok(value),
+    err: (error) => () => {
+      const cause = preserveToolPanic(error);
+      return Result.err(
+        new AttachmentOperationError({
+          operation: params.operation,
+          cause,
+          message: opaqueErrorMessage(cause, `Attachment ${params.operation} failed`),
+        }),
+      );
+    },
+  })();
 }
 
 function signalAttachmentFailure(operation: string, message: string): never {
@@ -141,6 +143,7 @@ const attachmentAddOutputSchema = z.object({
     }),
   ),
 });
+type AttachmentAddFilesOutput = z.infer<typeof attachmentAddOutputSchema>;
 
 type DetectedAttachment =
   | {
@@ -385,18 +388,20 @@ export function attachmentTools(params: { bus: LilacBus; cwd: string }) {
           operation: "add_files",
           run: runAddFiles,
         });
-        if (added.status === "error") {
-          logger.error("attachment.add_files failed", {
-            requestId: ctx.requestId,
-            sessionId: ctx.sessionId,
-            requestClient: ctx.requestClient,
-            durationMs: Date.now() - startedAt,
-            pathCount: input.paths.length,
-            ...formatTaggedErrorForLog(added.error),
-          });
-          return adaptToolResultToHost(added);
-        }
-        return added.value;
+        return added.match<() => AttachmentAddFilesOutput>({
+          ok: (value) => () => value,
+          err: (error) => () => {
+            logger.error("attachment.add_files failed", {
+              requestId: ctx.requestId,
+              sessionId: ctx.sessionId,
+              requestClient: ctx.requestClient,
+              durationMs: Date.now() - startedAt,
+              pathCount: input.paths.length,
+              ...formatTaggedErrorForLog(error),
+            });
+            return adaptToolResultToHost(added);
+          },
+        })();
       },
     }),
 
@@ -492,7 +497,7 @@ export function attachmentTools(params: { bus: LilacBus; cwd: string }) {
               operation: "inspect_download_target",
               run: () => fs.access(target),
             });
-            const exists = accessed.status === "ok";
+            const exists = accessed.match({ ok: () => true, err: () => false });
 
             if (!exists) {
               await fs.writeFile(target, downloaded.bytes);
@@ -525,18 +530,20 @@ export function attachmentTools(params: { bus: LilacBus; cwd: string }) {
           operation: "download",
           run: runDownload,
         });
-        if (downloaded.status === "error") {
-          logger.error("attachment.download failed", {
-            requestId,
-            sessionId,
-            requestClient,
-            durationMs: Date.now() - startedAt,
-            downloadDir,
-            ...formatTaggedErrorForLog(downloaded.error),
-          });
-          return adaptToolResultToHost(downloaded);
-        }
-        return downloaded.value;
+        return downloaded.match<() => AttachmentDownloadOutput>({
+          ok: (value) => () => value,
+          err: (error) => () => {
+            logger.error("attachment.download failed", {
+              requestId,
+              sessionId,
+              requestClient,
+              durationMs: Date.now() - startedAt,
+              downloadDir,
+              ...formatTaggedErrorForLog(error),
+            });
+            return adaptToolResultToHost(downloaded);
+          },
+        })();
       },
     }),
   };

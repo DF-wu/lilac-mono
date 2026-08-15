@@ -209,16 +209,22 @@ function combineOperationAndCleanup(
   primary: ResultType<void, McpConfigWriteError>,
   cleanup: ResultType<void, McpConfigFileOperationError>,
 ): ResultType<void, McpConfigWriteError> {
-  if (primary.status === "ok") return cleanup;
-  if (cleanup.status === "ok") return primary;
-  return Result.err(
-    new McpConfigFileOperationAndCleanupError({
-      configPath,
-      primary: primary.error,
-      cleanup: cleanup.error,
-      message: `${primary.error.message}; cleanup also failed: ${cleanup.error.message}`,
-    }),
-  );
+  return primary.match<ResultType<void, McpConfigWriteError>>({
+    ok: () => cleanup,
+    err: (primaryError) =>
+      cleanup.match<ResultType<void, McpConfigWriteError>>({
+        ok: () => Result.err(primaryError),
+        err: (cleanupError) =>
+          Result.err(
+            new McpConfigFileOperationAndCleanupError({
+              configPath,
+              primary: primaryError,
+              cleanup: cleanupError,
+              message: `${primaryError.message}; cleanup also failed: ${cleanupError.message}`,
+            }),
+          ),
+      }),
+  });
 }
 
 function validateMutationServerId(
@@ -271,8 +277,15 @@ export async function writeMcpConfigFileAtomic(
   config: UniversalMcpConfig,
   dependencies: McpConfigFileDependencies = DEFAULT_FILE_DEPENDENCIES,
 ): Promise<ResultType<void, McpConfigWriteError>> {
-  const source = serializeConfig(configPath, config);
-  if (source.status === "error") return source;
+  const serialized = serializeConfig(configPath, config);
+  const serializationFailure = serialized.match<() => ResultType<void, McpConfigWriteError> | null>(
+    {
+      ok: () => () => null,
+      err: (error) => () => Result.err(error),
+    },
+  )();
+  if (serializationFailure) return serializationFailure;
+  const source = serialized.match({ ok: (value) => value, err: () => "" });
 
   const parent = path.dirname(configPath);
   const parentResult = await captureFileOperation({
@@ -280,7 +293,11 @@ export async function writeMcpConfigFileAtomic(
     operation: "create_parent",
     run: () => dependencies.mkdir(parent, { recursive: true }).then(() => undefined),
   });
-  if (parentResult.status === "error") return parentResult;
+  const parentFailure = parentResult.match<() => ResultType<void, McpConfigWriteError> | null>({
+    ok: () => () => null,
+    err: (error) => () => Result.err(error),
+  })();
+  if (parentFailure) return parentFailure;
 
   const temporaryPath = path.join(
     parent,
@@ -304,11 +321,20 @@ export async function writeMcpConfigFileAtomic(
       await removeTemporary();
     },
   );
-  if (opened.status === "error") {
-    return combineOperationAndCleanup(configPath, opened, await removeTemporary());
-  }
-
-  const handle = opened.value;
+  const openFailure = await opened.match<
+    () => Promise<ResultType<void, McpConfigWriteError> | null>
+  >({
+    ok: () => async () => null,
+    err: (error) => async () =>
+      combineOperationAndCleanup(configPath, Result.err(error), await removeTemporary()),
+  })();
+  if (openFailure) return openFailure;
+  const handle = opened.match({
+    ok: (value) => () => value,
+    err: (error) => () => {
+      throw error;
+    },
+  })();
   const closeTemporary = () =>
     captureFileOperation({
       configPath,
@@ -320,9 +346,10 @@ export async function writeMcpConfigFileAtomic(
       let result = await captureFileOperation({
         configPath,
         operation: "write_temporary",
-        run: () => handle.writeFile(source.value, "utf8"),
+        run: () => handle.writeFile(source, "utf8"),
       });
-      if (result.status === "ok") {
+      const writeSucceeded = result.match({ ok: () => true, err: () => false });
+      if (writeSucceeded) {
         result = await captureFileOperation({
           configPath,
           operation: "sync_temporary",
@@ -344,9 +371,14 @@ export async function writeMcpConfigFileAtomic(
     await removeTemporary();
   });
   const prepared = combineOperationAndCleanup(configPath, written, closed);
-  if (prepared.status === "error") {
-    return combineOperationAndCleanup(configPath, prepared, await removeTemporary());
-  }
+  const preparationFailure = await prepared.match<
+    () => Promise<ResultType<void, McpConfigWriteError> | null>
+  >({
+    ok: () => async () => null,
+    err: () => async () =>
+      combineOperationAndCleanup(configPath, prepared, await removeTemporary()),
+  })();
+  if (preparationFailure) return preparationFailure;
 
   const renamed = await superviseMcpConfigFilePanicCleanup(
     () =>
@@ -359,9 +391,13 @@ export async function writeMcpConfigFileAtomic(
       await removeTemporary();
     },
   );
-  if (renamed.status === "error") {
-    return combineOperationAndCleanup(configPath, renamed, await removeTemporary());
-  }
+  const renameFailure = await renamed.match<
+    () => Promise<ResultType<void, McpConfigWriteError> | null>
+  >({
+    ok: () => async () => null,
+    err: () => async () => combineOperationAndCleanup(configPath, renamed, await removeTemporary()),
+  })();
+  if (renameFailure) return renameFailure;
   return Result.ok();
 }
 
@@ -377,48 +413,82 @@ export function mutateMcpConfigFile(options: {
   return enqueueMutation<McpConfigMutationResult, McpConfigMutationError>(
     options.configPath,
     async () => {
-      const snapshot = await readMcpConfigFile(options.configPath);
-      if (snapshot.status === "error") return Result.err(snapshot.error);
-      const previousConfig = snapshot.value.config;
-      const servers = { ...previousConfig.servers };
+      const read = await readMcpConfigFile(options.configPath);
+      return read.match<() => Promise<ResultType<McpConfigMutationResult, McpConfigMutationError>>>(
+        {
+          err: (error) => async () => Result.err(error),
+          ok: (snapshot) => async () => {
+            const previousConfig = snapshot.config;
+            const servers = { ...previousConfig.servers };
 
-      switch (options.mutation.type) {
-        case "upsert": {
-          const validated = validateMutationServerId(
-            options.configPath,
-            options.mutation.server.id,
-          );
-          if (validated.status === "error") return Result.err(validated.error);
-          servers[options.mutation.server.id] = options.mutation.server;
-          break;
-        }
-        case "remove": {
-          const validated = validateMutationServerId(options.configPath, options.mutation.serverId);
-          if (validated.status === "error") return Result.err(validated.error);
-          delete servers[options.mutation.serverId];
-          break;
-        }
-      }
+            switch (options.mutation.type) {
+              case "upsert": {
+                const validated = validateMutationServerId(
+                  options.configPath,
+                  options.mutation.server.id,
+                );
+                const failure = validated.match({
+                  ok: () => null,
+                  err: (error) => Result.err(error),
+                });
+                if (failure) return failure;
+                servers[options.mutation.server.id] = options.mutation.server;
+                break;
+              }
+              case "remove": {
+                const validated = validateMutationServerId(
+                  options.configPath,
+                  options.mutation.serverId,
+                );
+                const failure = validated.match({
+                  ok: () => null,
+                  err: (error) => Result.err(error),
+                });
+                if (failure) return failure;
+                delete servers[options.mutation.serverId];
+                break;
+              }
+            }
 
-      const config: UniversalMcpConfig = {
-        configVersion: previousConfig.configVersion,
-        servers,
-      };
-      const previousSource = serializeConfig(options.configPath, previousConfig);
-      if (previousSource.status === "error") return Result.err(previousSource.error);
-      const nextSource = serializeConfig(options.configPath, config);
-      if (nextSource.status === "error") return Result.err(nextSource.error);
-      const changed = previousSource.value !== nextSource.value;
-      if (changed) {
-        const written = await writeMcpConfigFileAtomic(
-          options.configPath,
-          config,
-          options.fileDependencies,
-        );
-        if (written.status === "error") return Result.err(written.error);
-      }
+            const config: UniversalMcpConfig = {
+              configVersion: previousConfig.configVersion,
+              servers,
+            };
+            const previousSerialized = serializeConfig(options.configPath, previousConfig);
+            const previousFailure = previousSerialized.match({
+              ok: () => null,
+              err: (error) => Result.err(error),
+            });
+            if (previousFailure) return previousFailure;
+            const previousSource = previousSerialized.match({
+              ok: (value) => value,
+              err: () => "",
+            });
+            const nextSerialized = serializeConfig(options.configPath, config);
+            const nextFailure = nextSerialized.match({
+              ok: () => null,
+              err: (error) => Result.err(error),
+            });
+            if (nextFailure) return nextFailure;
+            const nextSource = nextSerialized.match({ ok: (value) => value, err: () => "" });
+            const changed = previousSource !== nextSource;
+            if (changed) {
+              const written = await writeMcpConfigFileAtomic(
+                options.configPath,
+                config,
+                options.fileDependencies,
+              );
+              const writeFailure = written.match({
+                ok: () => null,
+                err: (error) => Result.err(error),
+              });
+              if (writeFailure) return writeFailure;
+            }
 
-      return Result.ok({ configPath: options.configPath, changed, previousConfig, config });
+            return Result.ok({ configPath: options.configPath, changed, previousConfig, config });
+          },
+        },
+      )();
     },
   );
 }

@@ -9,6 +9,7 @@ import {
 } from "@stanley2058/lilac-event-bus";
 import {
   createLogger,
+  formatTaggedErrorForLog,
   getCoreConfig,
   isPanic,
   opaqueErrorCause,
@@ -162,8 +163,18 @@ export async function startHeartbeatServiceResult(params: {
     cfg = params.config;
   } else {
     const loaded = await reloadHeartbeatCoreConfig();
-    if (loaded.status === "error") return Result.err(loaded.error);
-    cfg = loaded.value;
+    const loadError = loaded.match({ err: (error) => error, ok: () => null });
+    if (loadError) return Result.err(loadError);
+    const loadedConfig = loaded.match({ ok: (value) => value, err: () => null });
+    if (!loadedConfig) {
+      return Result.err(
+        new HeartbeatConfigReloadError({
+          cause: null,
+          message: "Core config reload returned no configuration",
+        }),
+      );
+    }
+    cfg = loadedConfig;
   }
   let coreConfigReloadHadError = false;
   let lastCoreConfigReloadError: string | null = null;
@@ -182,15 +193,21 @@ export async function startHeartbeatServiceResult(params: {
     if (params.config) return;
 
     const reloaded = await reloadHeartbeatCoreConfig();
-    if (reloaded.status === "ok") {
-      cfg = reloaded.value;
+    const reloadError = reloaded.match({
+      err: (error) => error,
+      ok: (value) => {
+        cfg = value;
+        return null;
+      },
+    });
+    if (!reloadError) {
       if (coreConfigReloadHadError) {
         logger.info("core-config reload recovered", { path: "core-config.yaml" });
       }
       coreConfigReloadHadError = false;
       lastCoreConfigReloadError = null;
     } else {
-      const message = reloaded.error.message;
+      const message = reloadError.message;
       if (!coreConfigReloadHadError || lastCoreConfigReloadError !== message) {
         logger.warn("core-config reload failed; using last known config", {
           path: "core-config.yaml",
@@ -211,21 +228,31 @@ export async function startHeartbeatServiceResult(params: {
 
   function resolveNextScheduledWakeAtMs(baseNowMs: number): number {
     const currentMs = Math.min(Number.MAX_SAFE_INTEGER, baseNowMs + 1);
-    const scheduled = computeHeartbeatCronAtMs(cfg.surface.heartbeat.cron, currentMs);
-    if (scheduled.status === "ok") return scheduled.value;
-    logger.warn("invalid heartbeat cron; falling back to */30 * * * *", {
-      cron: cfg.surface.heartbeat.cron,
-      outcome: "using-default-cron",
+    const configuredCron = cfg.surface.heartbeat.cron;
+    const scheduled = computeHeartbeatCronAtMs(configuredCron, currentMs);
+    const resolveScheduled = scheduled.match<() => number>({
+      ok: (value) => () => value,
+      err: (error) => () => {
+        logger.warn("invalid heartbeat cron; falling back to */30 * * * *", {
+          cron: configuredCron,
+          ...formatTaggedErrorForLog(error),
+          outcome: "using-default-cron",
+        });
+        const fallback = computeHeartbeatCronAtMs(DEFAULT_HEARTBEAT_CRON, currentMs);
+        const resolveFallback = fallback.match<() => number>({
+          ok: (value) => () => value,
+          err: () => () => {
+            logger.error("default heartbeat cron unexpectedly failed; using a 30-minute delay", {
+              cron: DEFAULT_HEARTBEAT_CRON,
+              outcome: "using-fixed-delay",
+            });
+            return Math.min(Number.MAX_SAFE_INTEGER, currentMs + 30 * 60 * 1000);
+          },
+        });
+        return resolveFallback();
+      },
     });
-    const fallback = computeHeartbeatCronAtMs(DEFAULT_HEARTBEAT_CRON, currentMs);
-    if (fallback.status === "error") {
-      logger.error("default heartbeat cron unexpectedly failed; using a 30-minute delay", {
-        cron: DEFAULT_HEARTBEAT_CRON,
-        outcome: "using-fixed-delay",
-      });
-      return Math.min(Number.MAX_SAFE_INTEGER, currentMs + 30 * 60 * 1000);
-    }
-    return fallback.value;
+    return resolveScheduled();
   }
 
   function clearScheduledWakeTimer(): void {
@@ -341,14 +368,12 @@ export async function startHeartbeatServiceResult(params: {
         return;
       }
 
-      if (
-        lastExternalActivityAt > 0 &&
-        now() - lastExternalActivityAt < heartbeat.quietAfterActivityMs
-      ) {
+      const quietAfterActivityMs = heartbeat.quietAfterActivityMs;
+      if (lastExternalActivityAt > 0 && now() - lastExternalActivityAt < quietAfterActivityMs) {
         logger.info("heartbeat wake suppressed", {
           reason,
           suppression: "recent_external_activity",
-          quietAfterActivityMs: heartbeat.quietAfterActivityMs,
+          quietAfterActivityMs,
           ageMs: now() - lastExternalActivityAt,
         });
         scheduleRetry();
@@ -441,17 +466,32 @@ export async function startHeartbeatServiceResult(params: {
   }
 
   const lifecycleStarted = await startHeartbeatLifecycleResult();
-  if (lifecycleStarted.status === "error") return Result.err(lifecycleStarted.error);
-  const lifecycleSub = lifecycleStarted.value;
+  const lifecycleStartError = lifecycleStarted.match({ err: (error) => error, ok: () => null });
+  if (lifecycleStartError) return Result.err(lifecycleStartError);
+  const lifecycleSub: HeartbeatLifecycleSubscription | null = lifecycleStarted.match({
+    ok: (value) => value,
+    err: () => null,
+  });
+  if (!lifecycleSub) {
+    return Result.err(
+      new HeartbeatConfigReloadError({
+        cause: null,
+        message: "Heartbeat lifecycle startup returned no subscription",
+      }),
+    );
+  }
+  const activeLifecycleSub = lifecycleSub;
 
   async function stopHeartbeatLifecycleResult(): Promise<
     ResultType<void, EventDeliveryStopFailed | EventDeliveryDoneError>
   > {
-    const lifecycleStopped = await lifecycleSub.stop();
-    if (lifecycleStopped.status === "error") return Result.err(lifecycleStopped.error);
+    const lifecycleStopped = await activeLifecycleSub.stop();
+    const lifecycleStopError = lifecycleStopped.match({ err: (error) => error, ok: () => null });
+    if (lifecycleStopError) return Result.err(lifecycleStopError);
 
-    const lifecycleDone = await lifecycleSub.done;
-    if (lifecycleDone.status === "error") return Result.err(lifecycleDone.error);
+    const lifecycleDone = await activeLifecycleSub.done;
+    const lifecycleDoneError = lifecycleDone.match({ err: (error) => error, ok: () => null });
+    if (lifecycleDoneError) return Result.err(lifecycleDoneError);
     return Result.ok(undefined);
   }
 
@@ -494,9 +534,11 @@ export async function startHeartbeatServiceResult(params: {
         ),
       };
     }
-    if (lifecycleStop.value.status === "error") {
-      return { kind: "result", result: Result.err(lifecycleStop.value.error) };
-    }
+    const lifecycleStopError = lifecycleStop.value.match({
+      err: (error) => error,
+      ok: () => null,
+    });
+    if (lifecycleStopError) return { kind: "result", result: Result.err(lifecycleStopError) };
     if (tickSettled.status === "rejected") {
       return {
         kind: "result",

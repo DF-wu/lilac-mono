@@ -73,16 +73,19 @@ export function createProcessHandlers(params: ProcessHandlerParams): ProcessHand
       try: () => params.stop(fatalError),
       catch: projectRuntimeError("Opaque shutdown failure"),
     });
-    if (stopped.status === "error") {
-      const failure = new ProcessShutdownFailed({
-        cause: stopped.error,
-        message: "Process shutdown failed",
-      });
-      params.logger.error("Shutdown failed", {
-        ...formatTaggedErrorForLog(failure),
-      });
-      setExitCode(1);
-    }
+    stopped.match({
+      ok: () => undefined,
+      err: (error) => {
+        const failure = new ProcessShutdownFailed({
+          cause: error,
+          message: "Process shutdown failed",
+        });
+        params.logger.error("Shutdown failed", {
+          ...formatTaggedErrorForLog(failure),
+        });
+        setExitCode(1);
+      },
+    });
     clearForceExitTimer();
     const currentExitCode = getExitCode();
     const exitCode = typeof currentExitCode === "number" ? currentExitCode : 0;
@@ -122,13 +125,17 @@ export function createProcessHandlers(params: ProcessHandlerParams): ProcessHand
       try: () => handleFatal(trigger, error),
       catch: (cause) => new Error(safeRuntimeErrorText(cause, "Opaque fatal shutdown rejection")),
     });
-    if (handled.status === "ok") return;
-    params.logger.error("Fatal shutdown promise rejected", {
-      trigger,
-      error: handled.error.message,
+    handled.match({
+      ok: () => undefined,
+      err: (error) => {
+        params.logger.error("Fatal shutdown promise rejected", {
+          trigger,
+          error: error.message,
+        });
+        clearForceExitTimer();
+        exit(1);
+      },
     });
-    clearForceExitTimer();
-    exit(1);
   }
 
   return {

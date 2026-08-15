@@ -41,7 +41,13 @@ export function decodeRequiredRequestContext(
 }
 
 export function requireRequestContext(ctx: unknown, label: string): RequiredRequestContext {
-  const decoded = decodeRequiredRequestContext(ctx, label);
-  if (decoded.status === "ok") return decoded.value;
-  throw decoded.error;
+  const outcome = decodeRequiredRequestContext(ctx, label).match<
+    | { readonly kind: "ok"; readonly value: RequiredRequestContext }
+    | { readonly kind: "error"; readonly error: RequestContextInvalidError }
+  >({
+    ok: (value) => ({ kind: "ok", value }),
+    err: (error) => ({ kind: "error", error }),
+  });
+  if (outcome.kind === "ok") return outcome.value;
+  throw outcome.error;
 }

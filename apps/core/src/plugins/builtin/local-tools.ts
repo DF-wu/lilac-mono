@@ -172,38 +172,48 @@ async function canonicalizeAsFarAsExists(
   const followedSymlinks = new Set<string>();
   let symlinkHops = 0;
 
-  while (true) {
+  const resolveCurrent = async (): Promise<ResultType<string, LocalApplyPatchGuardFailed>> => {
     const canonical = await captureLocalApplyPatchFs(() => fs.realpath(current));
-    if (canonical.status === "ok") {
-      return Result.ok(path.resolve(canonical.value, ...missingSegments));
-    }
-    const code = canonical.error.code;
-    if (code !== "ENOENT" && code !== "ENOTDIR") return Result.err(canonical.error);
+    return canonical.match({
+      ok: (value) => async () => Result.ok(path.resolve(value, ...missingSegments)),
+      err: (error) => async () => {
+        if (error.code !== "ENOENT" && error.code !== "ENOTDIR") return Result.err(error);
 
-    const statsResult = await captureLocalApplyPatchFs(() => fs.lstat(current));
-    const stats = statsResult.status === "ok" ? statsResult.value : undefined;
-    if (stats?.isSymbolicLink()) {
-      if (followedSymlinks.has(current) || ++symlinkHops > 40) {
-        return Result.err(
-          new LocalApplyPatchGuardFailed({
-            message: `Too many symbolic links resolving '${inputPath}'`,
-          }),
-        );
-      }
-      followedSymlinks.add(current);
-      const target = await captureLocalApplyPatchFs(() => fs.readlink(current));
-      if (target.status === "error") return Result.err(target.error);
-      current = path.isAbsolute(target.value)
-        ? path.resolve(target.value)
-        : path.resolve(path.dirname(current), target.value);
-      continue;
-    }
+        const stats = (await captureLocalApplyPatchFs(() => fs.lstat(current))).match({
+          ok: (value) => value,
+          err: () => undefined,
+        });
+        if (stats?.isSymbolicLink()) {
+          if (followedSymlinks.has(current) || ++symlinkHops > 40) {
+            return Result.err(
+              new LocalApplyPatchGuardFailed({
+                message: `Too many symbolic links resolving '${inputPath}'`,
+              }),
+            );
+          }
+          followedSymlinks.add(current);
+          const target = await captureLocalApplyPatchFs(() => fs.readlink(current));
+          return target.match({
+            err: (error) => async () => Result.err(error),
+            ok: (value) => async () => {
+              current = path.isAbsolute(value)
+                ? path.resolve(value)
+                : path.resolve(path.dirname(current), value);
+              return resolveCurrent();
+            },
+          })();
+        }
 
-    const parent = path.dirname(current);
-    if (parent === current) return Result.ok(path.resolve(current, ...missingSegments));
-    missingSegments.unshift(path.basename(current));
-    current = parent;
-  }
+        const parent = path.dirname(current);
+        if (parent === current) return Result.ok(path.resolve(current, ...missingSegments));
+        missingSegments.unshift(path.basename(current));
+        current = parent;
+        return resolveCurrent();
+      },
+    })();
+  };
+
+  return resolveCurrent();
 }
 
 async function assertLocalApplyPatchPathsAllowed(params: {
@@ -217,37 +227,50 @@ async function assertLocalApplyPatchPathsAllowed(params: {
   const baseDir = path.resolve(expandTilde(cwdTarget.cwd || params.defaultCwd));
   const denyResolved = path.resolve(expandTilde(params.denyPath));
   const denyCanonicalResult = await captureLocalApplyPatchFs(() => fs.realpath(denyResolved));
-  const denyCanonical =
-    denyCanonicalResult.status === "ok" ? denyCanonicalResult.value : denyResolved;
+  const denyCanonical = denyCanonicalResult.match({
+    ok: (value) => value,
+    err: () => denyResolved,
+  });
   const parsed = parsePatchResult(params.input.patchText);
-  if (parsed.status === "error") return Result.err(parsed.error);
-  const hunks = parsed.value;
-  const targets = hunks.flatMap((hunk) => [
-    hunk.path,
-    ...(hunk.type === "update" && hunk.movePath ? [hunk.movePath] : []),
-  ]);
-
-  // This closes ordinary lexical and symlink aliases, but remains a best-effort guardrail rather
-  // than filesystem isolation: another process can still race path resolution and patch writes.
-  for (const target of targets) {
-    const resolved = path.isAbsolute(target) ? path.resolve(target) : path.resolve(baseDir, target);
-    const canonicalResult = await canonicalizeAsFarAsExists(resolved);
-    if (canonicalResult.status === "error") return Result.err(canonicalResult.error);
-    const canonical = canonicalResult.value;
-    if (
-      isPathWithin(resolved, denyResolved) ||
-      isPathWithin(resolved, denyCanonical) ||
-      isPathWithin(canonical, denyResolved) ||
-      isPathWithin(canonical, denyCanonical)
-    ) {
-      return Result.err(
-        new LocalApplyPatchGuardFailed({
-          message: `Access denied: '${resolved}' is blocked for patch`,
-        }),
-      );
-    }
-  }
-  return Result.ok(undefined);
+  const continueParsed = parsed.match<() => Promise<ResultType<void, Error>>>({
+    err: (error) => async () => Result.err(error),
+    ok: (hunks) => async () => {
+      const targets = hunks.flatMap((hunk) => [
+        hunk.path,
+        ...(hunk.type === "update" && hunk.movePath ? [hunk.movePath] : []),
+      ]);
+      // This closes lexical and symlink aliases but cannot prevent another process racing resolution.
+      const checkAt = async (index: number): Promise<ResultType<void, Error>> => {
+        const target = targets[index];
+        if (!target) return Result.ok(undefined);
+        const resolved = path.isAbsolute(target)
+          ? path.resolve(target)
+          : path.resolve(baseDir, target);
+        const canonical = await canonicalizeAsFarAsExists(resolved);
+        const continueCanonical = canonical.match<() => Promise<ResultType<void, Error>>>({
+          err: (error) => async () => Result.err(error),
+          ok: (canonicalPath) => async () => {
+            if (
+              isPathWithin(resolved, denyResolved) ||
+              isPathWithin(resolved, denyCanonical) ||
+              isPathWithin(canonicalPath, denyResolved) ||
+              isPathWithin(canonicalPath, denyCanonical)
+            ) {
+              return Result.err(
+                new LocalApplyPatchGuardFailed({
+                  message: `Access denied: '${resolved}' is blocked for patch`,
+                }),
+              );
+            }
+            return await checkAt(index + 1);
+          },
+        });
+        return await continueCanonical();
+      };
+      return await checkAt(0);
+    },
+  });
+  return await continueParsed();
 }
 
 function signalBuiltinToolHostError(message: string): never {
@@ -281,13 +304,13 @@ function getApplyPatchTool(context: CoreToolBuildContext) {
         defaultCwd: context.cwd,
         denyPath,
       });
-      if (allowed.status === "error") {
-        return {
+      return allowed.match({
+        err: (error) => async () => ({
           status: "failed" as const,
-          output: allowed.error.message,
-        };
-      }
-      return guardedExecute(...args);
+          output: error.message,
+        }),
+        ok: () => async () => guardedExecute(...args),
+      })();
     },
   };
 }

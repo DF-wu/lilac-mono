@@ -91,6 +91,10 @@ const jsonValueSchema: z.ZodType<JsonValue> = z.lazy(() =>
   ]),
 );
 
+function quoteJsonPointerSegment(segment: string): string {
+  return JSON.stringify(segment);
+}
+
 function decodeJsonPointerSegment(
   segment: string,
   pointer: string,
@@ -120,70 +124,61 @@ export function resolveJsonPointer(
     );
   }
 
-  let current: JsonValue = document;
-  for (const rawSegment of pointer.slice(1).split("/")) {
+  const rawSegments = pointer.slice(1).split("/");
+  const resolveAt = (
+    current: JsonValue,
+    segmentIndex: number,
+  ): ResultType<JsonValue, McpJsonPointerError> => {
+    const rawSegment = rawSegments[segmentIndex];
+    if (rawSegment === undefined) return Result.ok(current);
     const decodedSegment = decodeJsonPointerSegment(rawSegment, pointer);
-    if (decodedSegment.status === "error") return decodedSegment;
-    const segment = decodedSegment.value;
-    if (Array.isArray(current)) {
-      if (!/^(0|[1-9][0-9]*)$/.test(segment)) {
+    const continueSegment = decodedSegment.match<() => ResultType<JsonValue, McpJsonPointerError>>({
+      err: (error) => () => Result.err(error),
+      ok: (segment) => () => {
+        if (Array.isArray(current)) {
+          if (!/^(0|[1-9][0-9]*)$/.test(segment)) {
+            return Result.err(
+              new McpJsonPointerError({
+                pointer,
+                message: `JSON pointer segment ${quoteJsonPointerSegment(segment)} is not an array index`,
+              }),
+            );
+          }
+          const index = Number(segment);
+          const value = current[index];
+          if (index >= current.length || value === undefined) {
+            return Result.err(
+              new McpJsonPointerError({
+                pointer,
+                message: `JSON pointer array index ${segment} is out of bounds`,
+              }),
+            );
+          }
+          return resolveAt(value, segmentIndex + 1);
+        }
+        if (isRecord(current)) {
+          const value = current[segment];
+          if (!Object.hasOwn(current, segment) || value === undefined) {
+            return Result.err(
+              new McpJsonPointerError({
+                pointer,
+                message: `JSON pointer segment ${quoteJsonPointerSegment(segment)} does not exist`,
+              }),
+            );
+          }
+          return resolveAt(value, segmentIndex + 1);
+        }
         return Result.err(
           new McpJsonPointerError({
             pointer,
-            message: `JSON pointer segment ${JSON.stringify(segment)} is not an array index`,
+            message: `JSON pointer segment ${quoteJsonPointerSegment(segment)} has no parent object`,
           }),
         );
-      }
-      const index = Number(segment);
-      if (index >= current.length) {
-        return Result.err(
-          new McpJsonPointerError({
-            pointer,
-            message: `JSON pointer array index ${segment} is out of bounds`,
-          }),
-        );
-      }
-      const value = current[index];
-      if (value === undefined) {
-        return Result.err(
-          new McpJsonPointerError({
-            pointer,
-            message: `JSON pointer array index ${segment} is out of bounds`,
-          }),
-        );
-      }
-      current = value;
-      continue;
-    }
-    if (isRecord(current)) {
-      if (!Object.hasOwn(current, segment)) {
-        return Result.err(
-          new McpJsonPointerError({
-            pointer,
-            message: `JSON pointer segment ${JSON.stringify(segment)} does not exist`,
-          }),
-        );
-      }
-      const value = current[segment];
-      if (value === undefined) {
-        return Result.err(
-          new McpJsonPointerError({
-            pointer,
-            message: `JSON pointer segment ${JSON.stringify(segment)} does not exist`,
-          }),
-        );
-      }
-      current = value;
-      continue;
-    }
-    return Result.err(
-      new McpJsonPointerError({
-        pointer,
-        message: `JSON pointer segment ${JSON.stringify(segment)} has no parent object`,
-      }),
-    );
-  }
-  return Result.ok(current);
+      },
+    });
+    return continueSegment();
+  };
+  return resolveAt(document, 0);
 }
 
 async function captureTextFileRead(
@@ -223,19 +218,19 @@ function decodeJsonValue(
       });
     },
   });
-  if (json.status === "error") return json;
-
-  const parsed = jsonValueSchema.safeParse(json.value);
-  if (!parsed.success) {
-    return Result.err(
-      new McpValueJsonParseError({
-        source,
-        cause: parsed.error,
-        message: `failed to parse ${source} as JSON: ${parsed.error.message}`,
-      }),
-    );
-  }
-  return Result.ok(parsed.data);
+  return json.andThen((value) => {
+    const parsed = jsonValueSchema.safeParse(value);
+    if (!parsed.success) {
+      return Result.err(
+        new McpValueJsonParseError({
+          source,
+          cause: parsed.error,
+          message: `failed to parse ${source} as JSON: ${parsed.error.message}`,
+        }),
+      );
+    }
+    return Result.ok(parsed.data);
+  });
 }
 
 export async function resolveMcpValueSource(
@@ -260,35 +255,36 @@ export async function resolveMcpValueSource(
     ? source.file
     : path.resolve(context.baseDir, source.file);
   const read = await captureTextFileRead(filePath, source.file, context);
-  if (read.status === "error") return read;
-  const text = read.value;
-
-  if (source.pointer === undefined) return Result.ok(text.trim());
-
-  const document = decodeJsonValue(source.file, text);
-  if (document.status === "error") return document;
-
-  const resolved = resolveJsonPointer(document.value, source.pointer);
-  if (resolved.status === "error") {
-    return Result.err(
-      new McpValuePointerError({
-        source: source.file,
-        pointer: source.pointer,
-        cause: resolved.error,
-        message: `${source.file}: ${resolved.error.message}`,
-      }),
-    );
-  }
-
-  return typeof resolved.value === "string"
-    ? Result.ok(resolved.value)
-    : Result.err(
-        new McpValueNotStringError({
-          source: source.file,
-          pointer: source.pointer,
-          message: `${source.file}: pointer ${source.pointer} did not resolve to a string`,
-        }),
+  return read.match<() => Promise<McpValueResolution>>({
+    err: (error) => async () => Result.err(error),
+    ok: (text) => async () => {
+      if (source.pointer === undefined) return Result.ok(text.trim());
+      const pointer = source.pointer;
+      return decodeJsonValue(source.file, text).andThen((document) =>
+        resolveJsonPointer(document, pointer)
+          .mapError(
+            (error) =>
+              new McpValuePointerError({
+                source: source.file,
+                pointer,
+                cause: error,
+                message: `${source.file}: ${error.message}`,
+              }),
+          )
+          .andThen((resolved) =>
+            typeof resolved === "string"
+              ? Result.ok(resolved)
+              : Result.err(
+                  new McpValueNotStringError({
+                    source: source.file,
+                    pointer,
+                    message: `${source.file}: pointer ${pointer} did not resolve to a string`,
+                  }),
+                ),
+          ),
       );
+    },
+  })();
 }
 
 async function resolveMcpValueSourceEntry(
@@ -297,13 +293,13 @@ async function resolveMcpValueSourceEntry(
   context: McpValueResolutionContext,
 ): Promise<ResultType<string, McpValueMapResolutionError>> {
   const resolution = await resolveMcpValueSource(source, context);
-  if (resolution.status === "ok") return Result.ok(resolution.value);
-  return Result.err(
-    new McpValueMapResolutionError({
-      key,
-      cause: resolution.error,
-      message: `${key}: ${resolution.error.message}`,
-    }),
+  return resolution.mapError(
+    (error) =>
+      new McpValueMapResolutionError({
+        key,
+        cause: error,
+        message: `${key}: ${error.message}`,
+      }),
   );
 }
 
@@ -316,8 +312,9 @@ export async function resolveMcpValueSourceMap(
     const source = sources[key];
     if (source === undefined) continue;
     const resolved = await resolveMcpValueSourceEntry(key, source, context);
-    if (resolved.status === "error") return resolved;
-    values[key] = resolved.value;
+    const failure = resolved.match({ ok: () => null, err: (error) => Result.err(error) });
+    if (failure) return failure;
+    values[key] = resolved.match({ ok: (value) => value, err: () => "" });
   }
   return Result.ok(values);
 }

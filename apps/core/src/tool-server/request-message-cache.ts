@@ -218,54 +218,78 @@ export function createRequestMessageCache(
     const projected = trustedProjection
       ? Result.ok(trustedProjection)
       : projectAuthenticatedRequest(msg);
-    if (projected.status === "error") return Result.err(projected.error);
-    if (!projected.value) return Result.ok(undefined);
+    const continueProjected = projected.match<
+      () => ResultType<AuthenticatedRequestOrigin | undefined, RequestMessageCacheAdmissionError>
+    >({
+      err: (error) => () => Result.err(error),
+      ok: (projection) => () => {
+        if (!projection) return Result.ok(undefined);
 
-    pruneExpired();
-    const at = now();
-    const existing = entries.get(requestId);
-    if (existing) {
-      const trustedDelegatedUpgrade =
-        trustedProjection?.source === "internal-delegated" &&
-        existing.projection.source === "external" &&
-        existing.projection.requestId === trustedProjection.requestId &&
-        existing.projection.requestClient === "unknown" &&
-        existing.projection.requestClient === trustedProjection.requestClient &&
-        existing.projection.sessionId === trustedProjection.sessionId;
-      if (trustedDelegatedUpgrade) {
-        existing.projection = trustedProjection;
-      } else {
-        const latched = latchAuthenticatedRequest(existing.projection, projected.value, msg.type);
-        if (latched.status === "error") return Result.err(latched.error);
-        existing.projection = latched.value;
-      }
-      const alreadyPending =
-        existing.intakeEventIds.has(msg.id) || existing.parkedEventIds.has(msg.id);
-      existing.intakeEventIds.add(msg.id);
-      if (!alreadyPending) {
-        existing.messages = projectCachedRequestMessageLineage(
-          existing.messages,
-          msg.data.messages,
-          maxMessagesPerRequest,
-        );
-      }
-      existing.expiresAt = at + ttlMs;
-      existing.updatedAt = at;
-      return Result.ok(existing.projection);
-    }
+        pruneExpired();
+        const at = now();
+        const existing = entries.get(requestId);
+        if (existing) {
+          const updateExisting = (
+            nextProjection: AuthenticatedRequestProjection,
+          ): ResultType<
+            AuthenticatedRequestOrigin | undefined,
+            RequestMessageCacheAdmissionError
+          > => {
+            existing.projection = nextProjection;
+            const alreadyPending =
+              existing.intakeEventIds.has(msg.id) || existing.parkedEventIds.has(msg.id);
+            existing.intakeEventIds.add(msg.id);
+            if (!alreadyPending) {
+              existing.messages = projectCachedRequestMessageLineage(
+                existing.messages,
+                msg.data.messages,
+                maxMessagesPerRequest,
+              );
+            }
+            existing.expiresAt = at + ttlMs;
+            existing.updatedAt = at;
+            return Result.ok(existing.projection);
+          };
+          const trustedDelegatedUpgrade =
+            trustedProjection?.source === "internal-delegated" &&
+            existing.projection.source === "external" &&
+            existing.projection.requestId === trustedProjection.requestId &&
+            existing.projection.requestClient === "unknown" &&
+            existing.projection.requestClient === trustedProjection.requestClient &&
+            existing.projection.sessionId === trustedProjection.sessionId;
+          if (trustedDelegatedUpgrade) return updateExisting(trustedProjection);
+          const latched = latchAuthenticatedRequest(existing.projection, projection, msg.type);
+          const continueLatched = latched.match<
+            () => ResultType<
+              AuthenticatedRequestOrigin | undefined,
+              RequestMessageCacheAdmissionError
+            >
+          >({
+            err: (error) => () => Result.err(error),
+            ok: (nextProjection) => () => updateExisting(nextProjection),
+          });
+          return continueLatched();
+        }
 
-    const entry: CacheEntry = {
-      messages: projectCachedRequestMessageLineage(msg.data.messages, [], maxMessagesPerRequest),
-      projection: projected.value,
-      intakeEventIds: new Set([msg.id]),
-      parkedEventIds: new Set(),
-      owners: new Set(),
-      expiresAt: at + ttlMs,
-      updatedAt: at,
-    };
-    entries.set(requestId, entry);
-    pruneMax();
-    return Result.ok(entry.projection);
+        const entry: CacheEntry = {
+          messages: projectCachedRequestMessageLineage(
+            msg.data.messages,
+            [],
+            maxMessagesPerRequest,
+          ),
+          projection,
+          intakeEventIds: new Set([msg.id]),
+          parkedEventIds: new Set(),
+          owners: new Set(),
+          expiresAt: at + ttlMs,
+          updatedAt: at,
+        };
+        entries.set(requestId, entry);
+        pruneMax();
+        return Result.ok(entry.projection);
+      },
+    });
+    return continueProjected();
   }
 
   function cloneCacheEntry(entry: CacheEntry): CacheEntry {
@@ -299,7 +323,11 @@ export function createRequestMessageCache(
       string,
       { projection: AuthenticatedRequestProjection; parkedEventIds: Set<string> }
     >();
-    for (const record of input) {
+    const mergeInputAt = (
+      index: number,
+    ): ResultType<void, AuthenticatedRequestIdentityConflict> => {
+      const record = input[index];
+      if (!record) return Result.ok(undefined);
       const current = proposed.get(record.projection.requestId);
       if (current) {
         const latched = latchAuthenticatedRequest(
@@ -307,75 +335,129 @@ export function createRequestMessageCache(
           record.projection,
           "graceful-restart",
         );
-        if (latched.status === "error") return Result.err(latched.error);
-        current.projection = latched.value;
-        for (const eventId of record.parkedEventIds) current.parkedEventIds.add(eventId);
-      } else {
-        proposed.set(record.projection.requestId, {
-          projection: record.projection,
-          parkedEventIds: new Set(record.parkedEventIds),
+        const continueLatched = latched.match<
+          () => ResultType<void, AuthenticatedRequestIdentityConflict>
+        >({
+          err: (error) => () => Result.err(error),
+          ok: (projection) => () => {
+            current.projection = projection;
+            for (const eventId of record.parkedEventIds) current.parkedEventIds.add(eventId);
+            return mergeInputAt(index + 1);
+          },
         });
+        return continueLatched();
       }
-    }
-    for (const [requestId, record] of proposed) {
+      proposed.set(record.projection.requestId, {
+        projection: record.projection,
+        parkedEventIds: new Set(record.parkedEventIds),
+      });
+      return mergeInputAt(index + 1);
+    };
+    const proposedEntries = () => [...proposed];
+    const mergeExistingAt = (
+      records: ReturnType<typeof proposedEntries>,
+      index: number,
+    ): ResultType<void, AuthenticatedRequestIdentityConflict> => {
+      const pair = records[index];
+      if (!pair) return Result.ok(undefined);
+      const [requestId, record] = pair;
       const existing = entries.get(requestId);
-      if (!existing) continue;
+      if (!existing) return mergeExistingAt(records, index + 1);
       const latched = latchAuthenticatedRequest(
         existing.projection,
         record.projection,
         "graceful-restart",
       );
-      if (latched.status === "error") return Result.err(latched.error);
-      record.projection = latched.value;
-    }
+      const continueLatched = latched.match<
+        () => ResultType<void, AuthenticatedRequestIdentityConflict>
+      >({
+        err: (error) => () => Result.err(error),
+        ok: (projection) => () => {
+          record.projection = projection;
+          return mergeExistingAt(records, index + 1);
+        },
+      });
+      return continueLatched();
+    };
 
     let before = new Map<string, CacheEntry>();
     let applied = false;
-    return Result.ok({
-      apply: () => {
-        if (applied) return Result.ok(undefined);
-        const at = now();
-        const staged = cloneEntries(entries);
-        for (const [requestId, record] of proposed) {
-          const existing = staged.get(requestId);
-          if (existing) {
-            const latched = latchAuthenticatedRequest(
-              existing.projection,
-              record.projection,
-              "graceful-restart",
-            );
-            if (latched.status === "error") return Result.err(latched.error);
-            const next = cloneCacheEntry(existing);
-            next.projection = latched.value;
-            for (const eventId of record.parkedEventIds) next.parkedEventIds.add(eventId);
-            next.expiresAt = at + ttlMs;
-            next.updatedAt = at;
-            staged.set(requestId, next);
-          } else {
-            staged.set(requestId, {
-              messages: [],
-              projection: record.projection,
-              intakeEventIds: new Set(),
-              parkedEventIds: new Set(record.parkedEventIds),
-              owners: new Set(),
-              expiresAt: at + ttlMs,
-              updatedAt: at,
+    const merged = mergeInputAt(0).andThen(() => mergeExistingAt(proposedEntries(), 0));
+    const continueMerged = merged.match<
+      () => ResultType<RequestMessageCacheRestoreAttempt, AuthenticatedRequestIdentityConflict>
+    >({
+      err: (error) => () => Result.err(error),
+      ok: () => () =>
+        Result.ok({
+          apply: () => {
+            if (applied) return Result.ok(undefined);
+            const at = now();
+            const staged = cloneEntries(entries);
+            const stagedRecords = proposedEntries();
+            const stageAt = (
+              index: number,
+            ): ResultType<void, AuthenticatedRequestIdentityConflict> => {
+              const pair = stagedRecords[index];
+              if (!pair) return Result.ok(undefined);
+              const [requestId, record] = pair;
+              const existing = staged.get(requestId);
+              if (existing) {
+                const latched = latchAuthenticatedRequest(
+                  existing.projection,
+                  record.projection,
+                  "graceful-restart",
+                );
+                const continueLatched = latched.match<
+                  () => ResultType<void, AuthenticatedRequestIdentityConflict>
+                >({
+                  err: (error) => () => Result.err(error),
+                  ok: (projection) => () => {
+                    const next = cloneCacheEntry(existing);
+                    next.projection = projection;
+                    for (const eventId of record.parkedEventIds) next.parkedEventIds.add(eventId);
+                    next.expiresAt = at + ttlMs;
+                    next.updatedAt = at;
+                    staged.set(requestId, next);
+                    return stageAt(index + 1);
+                  },
+                });
+                return continueLatched();
+              }
+              staged.set(requestId, {
+                messages: [],
+                projection: record.projection,
+                intakeEventIds: new Set(),
+                parkedEventIds: new Set(record.parkedEventIds),
+                owners: new Set(),
+                expiresAt: at + ttlMs,
+                updatedAt: at,
+              });
+              return stageAt(index + 1);
+            };
+            const stagedResult = stageAt(0);
+            const continueStaged = stagedResult.match<
+              () => ResultType<void, AuthenticatedRequestIdentityConflict>
+            >({
+              err: (error) => () => Result.err(error),
+              ok: () => () => {
+                const evicted = pruneMapToCapacity(staged);
+                before = cloneEntries(entries);
+                replaceEntries(staged);
+                applied = true;
+                logCapacityEvictions(evicted, entries.size);
+                return Result.ok(undefined);
+              },
             });
-          }
-        }
-        const evicted = pruneMapToCapacity(staged);
-        before = cloneEntries(entries);
-        replaceEntries(staged);
-        applied = true;
-        logCapacityEvictions(evicted, entries.size);
-        return Result.ok(undefined);
-      },
-      rollback: () => {
-        if (!applied) return;
-        replaceEntries(before);
-        applied = false;
-      },
+            return continueStaged();
+          },
+          rollback: () => {
+            if (!applied) return;
+            replaceEntries(before);
+            applied = false;
+          },
+        }),
     });
+    return continueMerged();
   }
 
   return {

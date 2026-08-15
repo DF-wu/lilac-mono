@@ -73,8 +73,12 @@ export function decodeFirecrawlSearchResponse(
 function adaptFirecrawlSearchResultToProviderHost<TValue>(
   result: ResultType<TValue, FirecrawlSearchFailure>,
 ): TValue {
-  if (result.status === "ok") return result.value;
-  throw new Error(result.error.message);
+  return result.match({
+    ok: (value) => () => value,
+    err: (error) => () => {
+      throw new Error(error.message);
+    },
+  })();
 }
 
 function decodeFirecrawlApiKey(
@@ -301,17 +305,15 @@ export class FirecrawlWebSearchProvider implements WebSearchProvider {
       await captureFirecrawlResponseJson(response),
     );
     const payload = decodeFirecrawlSearchResponse(rawPayload);
-    if (payload.status === "error") {
-      return adaptFirecrawlSearchResultToProviderHost(
-        Result.err(
-          new FirecrawlSearchFailure({
-            message: `Firecrawl search failed (${response.status}): invalid response contract.`,
-          }),
-        ),
-      );
-    }
     return adaptFirecrawlSearchResultToProviderHost(
-      decodeFirecrawlSearchOutcome(response, payload.value),
+      payload
+        .mapError(
+          () =>
+            new FirecrawlSearchFailure({
+              message: `Firecrawl search failed (${response.status}): invalid response contract.`,
+            }),
+        )
+        .andThen((value) => decodeFirecrawlSearchOutcome(response, value)),
     );
   }
 }

@@ -19,8 +19,12 @@ class SkillsToolFailure extends TaggedError("SkillsToolFailure")<{
 function adaptSkillsResultToToolHost<TValue>(
   result: ResultType<TValue, SkillsToolFailure>,
 ): TValue {
-  if (result.status === "ok") return result.value;
-  throw new Error(result.error.message);
+  return result.match({
+    ok: (value) => () => value,
+    err: (error) => () => {
+      throw new Error(error.message);
+    },
+  })();
 }
 
 function signalSkillsFailureToToolHost(message: string): never {
@@ -129,15 +133,18 @@ function requireSkillByName(skills: DiscoveredSkill[], name: string): Discovered
 
 async function loadSkillsForToolHost() {
   const workspaceRootResult = findWorkspaceRootResult();
-  if (workspaceRootResult.status === "error") {
-    switch (workspaceRootResult.error._tag) {
-      case "WorkspaceRootNotFound":
-        return signalSkillsFailureToToolHost(workspaceRootResult.error.message);
-    }
-  }
+  const workspaceRoot = workspaceRootResult.match({
+    ok: (value) => () => value,
+    err: (error) => () => {
+      switch (error._tag) {
+        case "WorkspaceRootNotFound":
+          return signalSkillsFailureToToolHost(error.message);
+      }
+    },
+  })();
 
   return await discoverSkills({
-    workspaceRoot: workspaceRootResult.value,
+    workspaceRoot,
     dataDir: env.dataDir,
   });
 }
@@ -151,13 +158,15 @@ async function readSkillForToolHost(
 
   const raw = await Bun.file(found.location).text();
   const parsedResult = parseSkillMarkdownResult(raw);
-  if (parsedResult.status === "error") {
-    switch (parsedResult.error._tag) {
-      case "SkillMarkdownInvalid":
-        return signalSkillsFailureToToolHost(parsedResult.error.message);
-    }
-  }
-  const parsed = parsedResult.value;
+  const parsed = parsedResult.match({
+    ok: (value) => () => value,
+    err: (error) => () => {
+      switch (error._tag) {
+        case "SkillMarkdownInvalid":
+          return signalSkillsFailureToToolHost(error.message);
+      }
+    },
+  })();
 
   // Keep returned frontmatter stable + minimal-ish.
   const frontmatter = parsed.frontmatter;

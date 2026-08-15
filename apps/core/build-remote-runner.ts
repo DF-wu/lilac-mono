@@ -40,53 +40,66 @@ export async function buildRemoteRunner(): Promise<ResultType<void, RemoteRunner
   const prepared = await captureBuildOperation("prepare", async () => {
     await mkdir(outdir, { recursive: true });
   });
-  if (prepared.status === "error") return prepared;
-
-  const built = await captureBuildOperation("build", () =>
-    Bun.build({
-      entrypoints: [sourceEntrypoint],
-      outdir,
-      target: "node",
-      format: "cjs",
-      sourcemap: "none",
-      minify: true,
-      plugins: [
-        {
-          name: "remote-runner-utils",
-          setup(build) {
-            build.onResolve({ filter: /^@stanley2058\/lilac-utils$/u }, () => ({
-              path: remoteRunnerUtilsPath,
-            }));
-          },
+  const continuePrepared = prepared.match<() => Promise<ResultType<void, RemoteRunnerBuildError>>>({
+    err: (error) => async () => Result.err(error),
+    ok: () => async () => {
+      const built = await captureBuildOperation("build", () =>
+        Bun.build({
+          entrypoints: [sourceEntrypoint],
+          outdir,
+          target: "node",
+          format: "cjs",
+          sourcemap: "none",
+          minify: true,
+          plugins: [
+            {
+              name: "remote-runner-utils",
+              setup(build) {
+                build.onResolve({ filter: /^@stanley2058\/lilac-utils$/u }, () => ({
+                  path: remoteRunnerUtilsPath,
+                }));
+              },
+            },
+          ],
+        }),
+      );
+      const continueBuilt = built.match<() => Promise<ResultType<void, RemoteRunnerBuildError>>>({
+        err: (error) => async () => Result.err(error),
+        ok: (output) => async () => {
+          if (!output.success) {
+            for (const log of output.logs) console.error(log);
+            return Result.err(
+              new RemoteRunnerBuildError({
+                operation: "build",
+                cause: new Error("Bun.build returned success=false"),
+                message: "Remote runner build failed",
+              }),
+            );
+          }
+          const replaced = await captureBuildOperation("replace", async () => {
+            await rm(targetCjsPath, { force: true });
+            await rename(generatedJsPath, targetCjsPath);
+          });
+          const continueReplaced = replaced.match<() => ResultType<void, RemoteRunnerBuildError>>({
+            err: (error) => () => Result.err(error),
+            ok: () => () => Result.ok(undefined),
+          });
+          return continueReplaced();
         },
-      ],
-    }),
-  );
-  if (built.status === "error") return built;
-
-  if (!built.value.success) {
-    for (const log of built.value.logs) console.error(log);
-    return Result.err(
-      new RemoteRunnerBuildError({
-        operation: "build",
-        cause: new Error("Bun.build returned success=false"),
-        message: "Remote runner build failed",
-      }),
-    );
-  }
-
-  const replaced = await captureBuildOperation("replace", async () => {
-    await rm(targetCjsPath, { force: true });
-    await rename(generatedJsPath, targetCjsPath);
+      });
+      return await continueBuilt();
+    },
   });
-  if (replaced.status === "error") return replaced;
-  return Result.ok(undefined);
+  return await continuePrepared();
 }
 
 if (import.meta.main) {
   const built = await buildRemoteRunner();
-  if (built.status === "error") {
-    console.error(built.error.message);
-    process.exitCode = 1;
-  }
+  built.match({
+    ok: () => undefined,
+    err: (error) => () => {
+      console.error(error.message);
+      process.exitCode = 1;
+    },
+  })?.();
 }

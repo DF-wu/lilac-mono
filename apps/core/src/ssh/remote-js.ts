@@ -23,16 +23,18 @@ export async function getRemoteRunnerJsText(): Promise<
     try: () => Bun.file(filePath).text(),
     catch: projectRuntimeError("Opaque bundled remote runner read failure"),
   });
-  if (loaded.status === "error") {
-    const cause = preserveToolPanic(loaded.error);
-    return Result.err(
-      new RemoteRunnerSourceReadError({
-        filePath,
-        cause,
-        message: `Failed to read bundled remote runner: ${filePath}`,
-      }),
-    );
-  }
-  cached = loaded.value;
-  return Result.ok(loaded.value);
+  return loaded.match<() => ResultType<string, RemoteRunnerSourceReadError>>({
+    ok: (value) => () => {
+      cached = value;
+      return Result.ok(value);
+    },
+    err: (error) => () =>
+      Result.err(
+        new RemoteRunnerSourceReadError({
+          filePath,
+          cause: preserveToolPanic(error),
+          message: `Failed to read bundled remote runner: ${filePath}`,
+        }),
+      ),
+  })();
 }

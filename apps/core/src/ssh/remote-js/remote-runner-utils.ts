@@ -5,7 +5,7 @@ export function isPanic(cause: unknown): cause is Panic {
     try: (): Panic | undefined => (Panic.is(cause) ? cause : undefined),
     catch: () => undefined,
   });
-  return inspected.status === "ok" && inspected.value !== undefined;
+  return inspected.match({ ok: (value) => value !== undefined, err: () => false });
 }
 
 export function opaqueErrorCause(fallback: string): (cause: unknown) => Error | Panic;
@@ -24,7 +24,7 @@ export function opaqueErrorCause(
     try: () => (causeOrFallback instanceof Error ? causeOrFallback : new Error(fallback)),
     catch: () => new Error(fallback),
   });
-  return projected.status === "ok" ? projected.value : projected.error;
+  return projected.match({ ok: (value) => value, err: (error) => error });
 }
 
 export function opaqueErrorMessage(cause: unknown, fallback: string): string {

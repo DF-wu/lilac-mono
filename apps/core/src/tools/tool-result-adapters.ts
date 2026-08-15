@@ -10,6 +10,10 @@ export function preserveToolPanic(cause: Error | Panic): Error {
 
 /** Translate an internal Result back to a host API whose contract requires rejection. */
 export function adaptToolResultToHost<T, E extends Error>(result: ResultType<T, E>): T {
-  if (result.status === "ok") return result.value;
-  throw result.error;
+  return result.match<() => T>({
+    ok: (value) => () => value,
+    err: (error) => () => {
+      throw error;
+    },
+  })();
 }

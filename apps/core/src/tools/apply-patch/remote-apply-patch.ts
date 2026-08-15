@@ -16,24 +16,29 @@ export async function remoteApplyPatch(params: {
   dangerouslyAllow?: boolean;
 }): Promise<{ ok: true; output: string } | { ok: false; error: string }> {
   const source = await getRemoteRunnerJsText();
-  if (source.status === "error") return { ok: false, error: source.error.message };
-  const res = await sshExecScriptJson({
-    host: params.host,
-    cwd: params.cwd,
-    js: source.value,
-    input: {
-      op: "apply_patch",
-      denyPaths: [
-        ...(params.dangerouslyAllow === true ? REMOTE_ALLOW_ALL_PATHS : REMOTE_DENY_PATHS),
-      ],
-      input: { patchText: params.patchText },
+  return source.match<() => Promise<{ ok: true; output: string } | { ok: false; error: string }>>({
+    err: (error) => async () => ({ ok: false, error: error.message }),
+    ok: (js) => async () => {
+      const res = await sshExecScriptJson({
+        host: params.host,
+        cwd: params.cwd,
+        js,
+        input: {
+          op: "apply_patch",
+          denyPaths: [
+            ...(params.dangerouslyAllow === true ? REMOTE_ALLOW_ALL_PATHS : REMOTE_DENY_PATHS),
+          ],
+          input: { patchText: params.patchText },
+        },
+        timeoutMs: params.timeoutMs ?? DEFAULT_TIMEOUT_MS,
+        signal: params.signal,
+        maxOutputChars: 1_000_000,
+        decodeResponse: decodeRemoteApplyPatchResponseJson,
+      });
+      return res.match<{ ok: true; output: string } | { ok: false; error: string }>({
+        err: (error) => ({ ok: false, error: error.message }),
+        ok: (output) => ({ ok: true, output }),
+      });
     },
-    timeoutMs: params.timeoutMs ?? DEFAULT_TIMEOUT_MS,
-    signal: params.signal,
-    maxOutputChars: 1_000_000,
-    decodeResponse: decodeRemoteApplyPatchResponseJson,
-  });
-
-  if (res.status === "error") return { ok: false, error: res.error.message };
-  return { ok: true, output: res.value };
+  })();
 }

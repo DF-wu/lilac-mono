@@ -38,8 +38,12 @@ class AttachmentToolFailure extends TaggedError("AttachmentToolFailure")<{
 function adaptAttachmentResultToToolHost<TValue>(
   result: ResultType<TValue, AttachmentToolFailure>,
 ): TValue {
-  if (result.status === "ok") return result.value;
-  throw new Error(result.error.message);
+  return result.match({
+    ok: (value) => () => value,
+    err: (error) => () => {
+      throw new Error(error.message);
+    },
+  })();
 }
 
 function signalAttachmentFailureToToolHost(message: string): never {

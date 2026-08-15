@@ -149,17 +149,19 @@ async function captureSubagentOperation<T>(params: {
     try: params.run,
     catch: projectRuntimeError(`Opaque subagent ${params.operation} failure`),
   });
-  if (captured.status === "error") {
-    const cause = preserveToolPanic(captured.error);
-    return Result.err(
-      new SubagentDelegationError({
-        operation: params.operation,
-        cause,
-        message: opaqueErrorMessage(cause, `Subagent ${params.operation} failed`),
-      }),
-    );
-  }
-  return Result.ok(captured.value);
+  return captured.match<() => ResultType<T, SubagentDelegationError>>({
+    ok: (value) => () => Result.ok(value),
+    err: (error) => () => {
+      const cause = preserveToolPanic(error);
+      return Result.err(
+        new SubagentDelegationError({
+          operation: params.operation,
+          cause,
+          message: opaqueErrorMessage(cause, `Subagent ${params.operation} failed`),
+        }),
+      );
+    },
+  })();
 }
 
 function decodeRequestContext(
@@ -574,46 +576,48 @@ export function subagentTools(params: {
         } finally {
           abortListener?.();
         }
-        if (completed.status === "error") {
-          logger.error("subagent delegate failed", {
-            requestId: ctx.requestId,
-            sessionId: ctx.sessionId,
-            parentToolCallId: toolCallId,
-            childRequestId,
-            childSessionId,
-            profile,
-            idleTimeoutMs,
-            ...formatTaggedErrorForLog(completed.error),
-          });
-          return adaptToolResultToHost<never, SubagentDelegationError>(Result.err(completed.error));
-        }
-        const outcome = completed.value;
-        const status = outcome.status;
-        const ok = status === "resolved";
-
-        logger.info("subagent delegate done", {
-          requestId: ctx.requestId,
-          sessionId: ctx.sessionId,
-          parentToolCallId: toolCallId,
-          childRequestId,
-          childSessionId,
-          profile,
-          status,
-          ok,
-          idleTimeoutMs,
-          workflowRunId: handle.runId,
+        const complete = completed.match<() => SubagentDelegateOutput>({
+          err: (error) => () => {
+            logger.error("subagent delegate failed", {
+              requestId: ctx.requestId,
+              sessionId: ctx.sessionId,
+              parentToolCallId: toolCallId,
+              childRequestId,
+              childSessionId,
+              profile,
+              idleTimeoutMs,
+              ...formatTaggedErrorForLog(error),
+            });
+            return adaptToolResultToHost<never, SubagentDelegationError>(Result.err(error));
+          },
+          ok: (outcome) => () => {
+            const status = outcome.status;
+            const ok = status === "resolved";
+            logger.info("subagent delegate done", {
+              requestId: ctx.requestId,
+              sessionId: ctx.sessionId,
+              parentToolCallId: toolCallId,
+              childRequestId,
+              childSessionId,
+              profile,
+              status,
+              ok,
+              idleTimeoutMs,
+              workflowRunId: handle.runId,
+            });
+            return {
+              ok,
+              mode: "sync",
+              status,
+              workflowRunId: handle.runId,
+              profile,
+              sessionName,
+              finalText: outcome.finalText,
+              detail: outcome.detail,
+            };
+          },
         });
-
-        return {
-          ok,
-          mode: "sync",
-          status,
-          workflowRunId: handle.runId,
-          profile,
-          sessionName,
-          finalText: outcome.finalText,
-          detail: outcome.detail,
-        };
+        return complete();
       },
     }),
   };

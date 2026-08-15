@@ -94,46 +94,42 @@ function parseBackend(
 export function parseBenchmarkArgs(
   argv: readonly string[],
 ): ResultType<BenchmarkOptions | "help", BenchmarkArgumentError> {
-  let root = process.cwd();
-  let runs = 20;
-  let warmups = 3;
-  let backend: BackendSelection = "all";
+  return Result.gen(function* () {
+    let root = process.cwd();
+    let runs = 20;
+    let warmups = 3;
+    let backend: BackendSelection = "all";
 
-  for (let i = 0; i < argv.length; i++) {
-    const arg = argv[i];
-    if (arg === "--root") {
-      root = argv[++i] ?? "";
-      continue;
+    for (let i = 0; i < argv.length; i++) {
+      const arg = argv[i];
+      if (arg === "--root") {
+        root = argv[++i] ?? "";
+        continue;
+      }
+      if (arg === "--runs") {
+        runs = yield* parsePositiveInt(argv[++i], "runs");
+        continue;
+      }
+      if (arg === "--warmups") {
+        warmups = yield* parsePositiveInt(argv[++i], "warmups");
+        continue;
+      }
+      if (arg === "--backend") {
+        backend = yield* parseBackend(argv[++i]);
+        continue;
+      }
+      if (arg === "--help" || arg === "-h") {
+        return Result.ok<"help">("help");
+      }
+      return Result.err(new BenchmarkArgumentError({ message: `Unknown argument: ${arg}` }));
     }
-    if (arg === "--runs") {
-      const parsed = parsePositiveInt(argv[++i], "runs");
-      if (parsed.status === "error") return parsed;
-      runs = parsed.value;
-      continue;
-    }
-    if (arg === "--warmups") {
-      const parsed = parsePositiveInt(argv[++i], "warmups");
-      if (parsed.status === "error") return parsed;
-      warmups = parsed.value;
-      continue;
-    }
-    if (arg === "--backend") {
-      const parsed = parseBackend(argv[++i]);
-      if (parsed.status === "error") return parsed;
-      backend = parsed.value;
-      continue;
-    }
-    if (arg === "--help" || arg === "-h") {
-      return Result.ok("help");
-    }
-    return Result.err(new BenchmarkArgumentError({ message: `Unknown argument: ${arg}` }));
-  }
 
-  return Result.ok({
-    root: resolve(expandTilde(root)),
-    runs,
-    warmups,
-    backend,
+    return Result.ok({
+      root: resolve(expandTilde(root)),
+      runs,
+      warmups,
+      backend,
+    });
   });
 }
 
@@ -202,48 +198,46 @@ async function runCase(
 export async function runBenchmark(
   options: BenchmarkOptions,
 ): Promise<ResultType<void, BenchmarkSearchError>> {
-  process.stdout.write(
-    `fs-search benchmark root=${options.root} warmups=${options.warmups} runs=${options.runs}\n`,
-  );
+  return Result.gen(async function* () {
+    process.stdout.write(
+      `fs-search benchmark root=${options.root} warmups=${options.warmups} runs=${options.runs}\n`,
+    );
 
-  for (const backend of selectedBackends(options.backend)) {
-    const fsTool = new FileSystem(options.root, { fsBackend: backend });
-    process.stdout.write(`\nbackend=${backend}\n`);
+    for (const backend of selectedBackends(options.backend)) {
+      const fsTool = new FileSystem(options.root, { fsBackend: backend });
+      process.stdout.write(`\nbackend=${backend}\n`);
 
-    for (const benchmarkCase of CASES) {
-      let lastCount = 0;
-      const warmupStart = performance.now();
-      for (let i = 0; i < options.warmups; i++) {
-        const count = await runCase(fsTool, benchmarkCase);
-        if (count.status === "error") return count;
-        lastCount = count.value;
+      for (const benchmarkCase of CASES) {
+        let lastCount = 0;
+        const warmupStart = performance.now();
+        for (let i = 0; i < options.warmups; i++) {
+          lastCount = yield* Result.await(runCase(fsTool, benchmarkCase));
+        }
+        const warmupMs = elapsedMs(warmupStart);
+
+        const samples: number[] = [];
+        for (let i = 0; i < options.runs; i++) {
+          const start = performance.now();
+          lastCount = yield* Result.await(runCase(fsTool, benchmarkCase));
+          samples.push(elapsedMs(start));
+        }
+
+        process.stdout.write(
+          [
+            `case=${benchmarkCase.name}`,
+            `kind=${benchmarkCase.kind}`,
+            `count=${lastCount}`,
+            `warmup_ms=${formatMs(warmupMs)}`,
+            `median_ms=${formatMs(median(samples))}`,
+            `mean_ms=${formatMs(mean(samples))}`,
+            `min_ms=${formatMs(Math.min(...samples))}`,
+            `max_ms=${formatMs(Math.max(...samples))}`,
+          ].join(" ") + "\n",
+        );
       }
-      const warmupMs = elapsedMs(warmupStart);
-
-      const samples: number[] = [];
-      for (let i = 0; i < options.runs; i++) {
-        const start = performance.now();
-        const count = await runCase(fsTool, benchmarkCase);
-        if (count.status === "error") return count;
-        lastCount = count.value;
-        samples.push(elapsedMs(start));
-      }
-
-      process.stdout.write(
-        [
-          `case=${benchmarkCase.name}`,
-          `kind=${benchmarkCase.kind}`,
-          `count=${lastCount}`,
-          `warmup_ms=${formatMs(warmupMs)}`,
-          `median_ms=${formatMs(median(samples))}`,
-          `mean_ms=${formatMs(mean(samples))}`,
-          `min_ms=${formatMs(Math.min(...samples))}`,
-          `max_ms=${formatMs(Math.max(...samples))}`,
-        ].join(" ") + "\n",
-      );
     }
-  }
-  return Result.ok(undefined);
+    return Result.ok(undefined);
+  });
 }
 
 const HELP_TEXT = [
@@ -256,16 +250,25 @@ const HELP_TEXT = [
 
 if (import.meta.main) {
   const parsed = parseBenchmarkArgs(process.argv.slice(2));
-  if (parsed.status === "error") {
-    process.stderr.write(`${parsed.error.message}\n`);
-    process.exitCode = 1;
-  } else if (parsed.value === "help") {
-    process.stdout.write(`${HELP_TEXT}\n`);
-  } else {
-    const benchmark = await runBenchmark(parsed.value);
-    if (benchmark.status === "error") {
-      process.stderr.write(`${benchmark.error.message}\n`);
+  const run = parsed.match({
+    ok: (options) => async () => {
+      if (options === "help") {
+        process.stdout.write(`${HELP_TEXT}\n`);
+        return;
+      }
+      const benchmark = await runBenchmark(options);
+      benchmark.match({
+        ok: () => undefined,
+        err: (error) => () => {
+          process.stderr.write(`${error.message}\n`);
+          process.exitCode = 1;
+        },
+      })?.();
+    },
+    err: (error) => async () => {
+      process.stderr.write(`${error.message}\n`);
       process.exitCode = 1;
-    }
-  }
+    },
+  });
+  await run();
 }

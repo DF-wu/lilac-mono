@@ -358,61 +358,75 @@ const DEFAULT_OVERFLOW_OPERATIONS: BashOutputOverflowOperations = {
   remove: (target) => fs.rm(target, { force: true }),
 };
 
-type BashOutputCleanupAttempt =
-  | { readonly status: "ok" }
-  | { readonly status: "error"; readonly cause: unknown }
-  | { readonly status: "panic"; readonly panic: Panic };
+function settleBashOutputCleanup(
+  operation: string,
+  run: () => Promise<void>,
+): Promise<ResultType<void, BashOutputStreamError | Panic>> {
+  return Result.tryPromise({
+    try: run,
+    catch: <TCaught>(caught: TCaught) =>
+      isPanic(caught)
+        ? caught
+        : new BashOutputStreamError({
+            operation,
+            cause: caught,
+            message: `Bash output failed while ${operation}`,
+          }),
+  });
+}
 
-function settleBashOutputCleanup(run: () => Promise<void>): Promise<BashOutputCleanupAttempt> {
-  return Promise.resolve()
-    .then(run)
-    .then(
-      () => ({ status: "ok" }),
-      (caught: unknown) =>
-        isPanic(caught) ? { status: "panic", panic: caught } : { status: "error", cause: caught },
-    );
+function selectResultValue<T, E extends Error>(result: ResultType<T, E>): T {
+  const select = result.match<() => T>({
+    ok: (value) => () => value,
+    err: (error) => () => adaptToolResultToHost(Result.err(error)),
+  });
+  return select();
 }
 
 function captureBashOutputOperation<T>(params: {
   readonly operation: string;
   readonly run: () => Awaited<T>;
-}): ResultType<T, BashOutputStreamError> {
+}): ResultType<T, BashOutputStreamError | Panic> {
   const captured = Result.try({
     try: params.run,
     catch: projectRuntimeError(`Opaque Bash output ${params.operation} failure`),
   });
-  if (captured.status === "error") {
-    const cause = preserveToolPanic(captured.error);
-    return Result.err(
-      new BashOutputStreamError({
-        operation: params.operation,
-        cause,
-        message: `Bash output failed while ${params.operation}`,
-      }),
-    );
-  }
-  return Result.ok(captured.value);
+  return captured.match<() => ResultType<T, BashOutputStreamError | Panic>>({
+    ok: (value) => () => Result.ok(value),
+    err: (error) => () =>
+      Result.err(
+        isPanic(error)
+          ? error
+          : new BashOutputStreamError({
+              operation: params.operation,
+              cause: error,
+              message: `Bash output failed while ${params.operation}`,
+            }),
+      ),
+  })();
 }
 
 async function captureBashOutputPromise<T>(params: {
   readonly operation: string;
   readonly run: () => Promise<T>;
-}): Promise<ResultType<T, BashOutputStreamError>> {
+}): Promise<ResultType<T, BashOutputStreamError | Panic>> {
   const captured = await Result.tryPromise({
     try: params.run,
     catch: projectRuntimeError(`Opaque Bash output ${params.operation} failure`),
   });
-  if (captured.status === "error") {
-    const cause = preserveToolPanic(captured.error);
-    return Result.err(
-      new BashOutputStreamError({
-        operation: params.operation,
-        cause,
-        message: `Bash output failed while ${params.operation}`,
-      }),
-    );
-  }
-  return Result.ok(captured.value);
+  return captured.match<() => ResultType<T, BashOutputStreamError | Panic>>({
+    ok: (value) => () => Result.ok(value),
+    err: (error) => () =>
+      Result.err(
+        isPanic(error)
+          ? error
+          : new BashOutputStreamError({
+              operation: params.operation,
+              cause: error,
+              message: `Bash output failed while ${params.operation}`,
+            }),
+      ),
+  })();
 }
 
 function combineBashOutputAndCleanup(
@@ -456,25 +470,25 @@ export async function readSanitizedStreamTextCappedResult(
   const overflowOperations = options?.overflowOperations ?? DEFAULT_OVERFLOW_OPERATIONS;
   const cleanupFailures: BashOutputStreamError[] = [];
   let overflowOperationError: BashOutputStreamError | undefined;
+  let deferredPanic: Panic | undefined;
 
   const recordCleanupAttempt = async (operation: string, run: () => Promise<void>) => {
-    const attempt = await settleBashOutputCleanup(run);
-    if (attempt.status === "error") {
-      cleanupFailures.push(
-        new BashOutputStreamError({
-          operation,
-          cause: attempt.cause,
-          message: `Bash output failed while ${operation}`,
-        }),
-      );
-    }
-    return attempt.status === "panic" ? attempt.panic : undefined;
+    const attempt = await settleBashOutputCleanup(operation, run);
+    const continueAttempt = attempt.match<() => Panic | undefined>({
+      ok: () => () => undefined,
+      err: (error) => () => {
+        if (isPanic(error)) return error;
+        cleanupFailures.push(error);
+        return undefined;
+      },
+    });
+    return continueAttempt();
   };
 
   const failOverflow = async (params?: {
     primary?: BashOutputStreamError;
     cleanup?: BashOutputStreamError;
-    panic?: unknown;
+    panic?: Panic;
   }) => {
     if (params?.primary && !overflowOperationError) overflowOperationError = params.primary;
     if (params?.cleanup) cleanupFailures.push(params.cleanup);
@@ -482,8 +496,7 @@ export async function readSanitizedStreamTextCappedResult(
     overflowFilePath = undefined;
     const sink = overflowSink;
     overflowSink = undefined;
-    let deferredPanic: Panic | undefined;
-    if (params?.panic && isPanic(params.panic)) deferredPanic = params.panic;
+    if (params?.panic && !deferredPanic) deferredPanic = params.panic;
     if (sink) {
       const abortPanic = await recordCleanupAttempt("aborting overflow output", () => sink.abort());
       if (!deferredPanic) deferredPanic = abortPanic;
@@ -497,7 +510,6 @@ export async function readSanitizedStreamTextCappedResult(
     overflowFileCreated = false;
     bufferedRawChunks.length = 0;
     bufferedRawBytes = 0;
-    if (deferredPanic) preserveToolPanic(deferredPanic);
   };
 
   const writeOverflowChunk = async (chunk: Uint8Array) => {
@@ -507,29 +519,26 @@ export async function readSanitizedStreamTextCappedResult(
         operation: "opening overflow output",
         run: () => overflowOperations.open(options.overflowFilePath!),
       });
-      if (opened.status === "error") {
-        await failOverflow({ primary: opened.error });
+      const openError = opened.match({ ok: () => null, err: (error) => error });
+      if (openError) {
+        await failOverflow(isPanic(openError) ? { panic: openError } : { primary: openError });
         return;
       }
-      overflowSink = opened.value;
+      overflowSink = opened.match({ ok: (value) => value, err: () => undefined });
       overflowFileCreated = true;
     }
-    const written = await settleBashOutputCleanup(() => overflowSink!.write(chunk));
-    if (written.status === "error") {
-      await failOverflow({
-        primary: new BashOutputStreamError({
-          operation: "writing overflow output",
-          cause: written.cause,
-          message: "Bash output failed while writing overflow output",
-        }),
-      });
-      return;
-    }
-    if (written.status === "panic") {
-      await failOverflow({ panic: written.panic });
-      return;
-    }
-    overflowFilePath = options.overflowFilePath;
+    const written = await settleBashOutputCleanup("writing overflow output", () =>
+      overflowSink!.write(chunk),
+    );
+    const continueWritten = written.match<() => Promise<void>>({
+      ok: () => () => {
+        overflowFilePath = options.overflowFilePath;
+        return Promise.resolve();
+      },
+      err: (error) => () =>
+        isPanic(error) ? failOverflow({ panic: error }) : failOverflow({ primary: error }),
+    });
+    await continueWritten();
   };
 
   const flushBufferedRaw = async () => {
@@ -585,19 +594,29 @@ export async function readSanitizedStreamTextCappedResult(
       operation: "acquiring the stream reader",
       run: () => stream.getReader(),
     });
-    if (acquired.status === "error") return acquired;
-    const reader = acquired.value;
+    const acquireError = acquired.match({ ok: () => null, err: (error) => error });
+    if (acquireError) {
+      if (isPanic(acquireError)) preserveToolPanic(acquireError);
+      return Result.err(acquireError);
+    }
+    const reader = selectResultValue(acquired);
     let primaryError: BashOutputStreamError | undefined;
     while (true) {
       const read = await captureBashOutputPromise({
         operation: "reading the output stream",
         run: () => reader.read(),
       });
-      if (read.status === "error") {
-        primaryError = read.error;
+      const readError = read.match({ ok: () => null, err: (error) => error });
+      if (readError) {
+        if (isPanic(readError)) deferredPanic = readError;
+        else primaryError = readError;
         break;
       }
-      const { done, value } = read.value;
+      const readValue = read.match<Awaited<ReturnType<typeof reader.read>>>({
+        ok: (value) => value,
+        err: () => ({ done: true, value: undefined }),
+      });
+      const { done, value } = readValue;
       if (done) break;
       if (value && value.byteLength > 0) {
         const activity = options?.onActivity
@@ -606,8 +625,10 @@ export async function readSanitizedStreamTextCappedResult(
               run: options.onActivity,
             })
           : Result.ok();
-        if (activity.status === "error") {
-          primaryError = activity.error;
+        const activityError = activity.match({ ok: () => null, err: (error) => error });
+        if (activityError) {
+          if (isPanic(activityError)) deferredPanic = activityError;
+          else primaryError = activityError;
           break;
         }
         if (options?.outputBudget) {
@@ -619,8 +640,10 @@ export async function readSanitizedStreamTextCappedResult(
                 operation: "reporting the exceeded output budget",
                 run: options.outputBudget.onExceeded,
               });
-              if (exceeded.status === "error") {
-                primaryError = exceeded.error;
+              const exceededError = exceeded.match({ ok: () => null, err: (error) => error });
+              if (exceededError) {
+                if (isPanic(exceededError)) deferredPanic = exceededError;
+                else primaryError = exceededError;
                 break;
               }
             }
@@ -633,40 +656,44 @@ export async function readSanitizedStreamTextCappedResult(
           }
         }
         await retainRawChunk(value);
+        if (deferredPanic) break;
         const sanitized = captureBashOutputOperation({
           operation: "sanitizing output",
           run: () => sanitizer.write(value),
         });
-        if (sanitized.status === "error") {
-          primaryError = sanitized.error;
+        const sanitizeError = sanitized.match({ ok: () => null, err: (error) => error });
+        if (sanitizeError) {
+          if (isPanic(sanitizeError)) deferredPanic = sanitizeError;
+          else primaryError = sanitizeError;
           break;
         }
-        await consumeSanitizedText(sanitized.value);
+        await consumeSanitizedText(sanitized.match({ ok: (output) => output, err: () => "" }));
         if (capped && !overflowSink) await flushBufferedRaw();
       }
     }
-    if (!primaryError) {
+    if (!primaryError && !deferredPanic) {
       const ended = captureBashOutputOperation({
         operation: "finishing output sanitization",
         run: () => sanitizer.end(),
       });
-      if (ended.status === "error") primaryError = ended.error;
-      else await consumeSanitizedText(ended.value);
-      if (capped && !overflowSink) await flushBufferedRaw();
-      if (overflowSink) {
-        const closed = await settleBashOutputCleanup(() => overflowSink!.close());
-        if (closed.status === "error") {
-          await failOverflow({
-            cleanup: new BashOutputStreamError({
-              operation: "closing overflow output",
-              cause: closed.cause,
-              message: "Bash output failed while closing overflow output",
-            }),
-          });
-        } else if (closed.status === "panic") {
-          await failOverflow({ panic: closed.panic });
-        }
+      const endError = ended.match({ ok: () => null, err: (error) => error });
+      if (endError) {
+        if (isPanic(endError)) deferredPanic = endError;
+        else primaryError = endError;
+      } else await consumeSanitizedText(ended.match({ ok: (value) => value, err: () => "" }));
+      if (!primaryError && !deferredPanic && capped && !overflowSink) await flushBufferedRaw();
+      if (!primaryError && !deferredPanic && overflowSink) {
+        const closed = await settleBashOutputCleanup("closing overflow output", () =>
+          overflowSink!.close(),
+        );
+        const continueClosed = closed.match<() => Promise<void>>({
+          ok: () => () => Promise.resolve(),
+          err: (error) => () =>
+            isPanic(error) ? failOverflow({ panic: error }) : failOverflow({ cleanup: error }),
+        });
+        await continueClosed();
       }
+      if (primaryError || deferredPanic) await failOverflow();
     } else {
       await failOverflow();
     }
@@ -675,7 +702,18 @@ export async function readSanitizedStreamTextCappedResult(
       operation: "releasing the stream reader",
       run: () => reader.releaseLock(),
     });
-    if (released.status === "error") cleanupFailures.push(released.error);
+    released.match({
+      ok: () => undefined,
+      err: (error) => {
+        if (isPanic(error)) {
+          if (!deferredPanic) deferredPanic = error;
+        } else {
+          cleanupFailures.push(error);
+        }
+      },
+    });
+
+    if (deferredPanic) preserveToolPanic(deferredPanic);
 
     const cleanupError =
       cleanupFailures.length > 0
@@ -726,16 +764,20 @@ export function createBashOutputSanitizerTransform(literalSecrets: readonly stri
         operation: "sanitizing a transform chunk",
         run: () => sanitizer.write(chunk),
       });
-      if (transformed.status === "error") callback(transformed.error);
-      else callback(null, transformed.value);
+      transformed.match<() => void>({
+        err: (error) => () => (isPanic(error) ? preserveToolPanic(error) : callback(error)),
+        ok: (value) => () => callback(null, value),
+      })();
     },
     flush(callback: TransformCallback) {
       const flushed = captureBashOutputOperation({
         operation: "flushing the sanitizer transform",
         run: () => sanitizer.end(),
       });
-      if (flushed.status === "error") callback(flushed.error);
-      else callback(null, flushed.value);
+      flushed.match<() => void>({
+        err: (error) => () => (isPanic(error) ? preserveToolPanic(error) : callback(error)),
+        ok: (value) => () => callback(null, value),
+      })();
     },
   });
 }

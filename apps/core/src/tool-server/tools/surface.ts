@@ -17,6 +17,7 @@ import type {
   ResolvedSurfaceAdapter,
   SurfaceAdapterResolver,
 } from "../../surface/runtime-descriptor";
+import { SurfaceToolTargetInvalid } from "../../surface/protocol";
 import type {
   MsgRef,
   RegisteredSurfacePlatform,
@@ -59,8 +60,12 @@ class SurfaceToolFailure extends TaggedError("SurfaceToolFailure")<{
 function adaptSurfaceResultToToolHost<TValue>(
   result: ResultType<TValue, SurfaceToolFailure>,
 ): TValue {
-  if (result.status === "ok") return result.value;
-  throw new Error(result.error.message);
+  return result.match({
+    ok: (value) => () => value,
+    err: (error) => () => {
+      throw new Error(error.message);
+    },
+  })();
 }
 
 function signalSurfaceFailureToToolHost(message: string): never {
@@ -70,24 +75,30 @@ function signalSurfaceFailureToToolHost(message: string): never {
 function adaptSurfaceTargetResultToToolHost<T>(
   result: ResultType<T, { readonly message: string }>,
 ): T {
-  if (result.status === "ok") return result.value;
-  signalSurfaceFailureToToolHost(result.error.message);
+  return result.match({
+    ok: (value) => () => value,
+    err: (error) => () => signalSurfaceFailureToToolHost(error.message),
+  })();
 }
 
 function adaptSurfaceOperationToToolHost<T>(result: ResultType<T, SurfaceOperationError>): T {
-  if (result.status === "ok") return result.value;
-  switch (result.error._tag) {
-    case "SurfaceOperationUnsupported":
-    case "SurfacePlatformMismatch":
-    case "SurfaceSessionMismatch":
-    case "SurfaceInvalidInput":
-    case "SurfaceOperationPartiallyCompleted":
-    case "SurfaceMessageNotFound":
-    case "SurfacePermissionDenied":
-    case "SurfaceRateLimited":
-    case "SurfaceUnavailable":
-      signalSurfaceFailureToToolHost(result.error.message);
-  }
+  return result.match({
+    ok: (value) => () => value,
+    err: (error) => () => {
+      switch (error._tag) {
+        case "SurfaceOperationUnsupported":
+        case "SurfacePlatformMismatch":
+        case "SurfaceSessionMismatch":
+        case "SurfaceInvalidInput":
+        case "SurfaceOperationPartiallyCompleted":
+        case "SurfaceMessageNotFound":
+        case "SurfacePermissionDenied":
+        case "SurfaceRateLimited":
+        case "SurfaceUnavailable":
+          return signalSurfaceFailureToToolHost(error.message);
+      }
+    },
+  })();
 }
 
 function createSurfaceMessageRef<P extends RegisteredSurfacePlatform>(
@@ -595,7 +606,7 @@ async function resolveDiscordReferencedMessage(input: {
         channelId: refChannelId,
         messageId: ref.messageId,
       })
-      .then((result) => (result.status === "ok" ? result.value : null));
+      .then((result) => result.match({ ok: (value) => value, err: () => null }));
     input.fetchedReferenceByKey?.set(targetKey, referencedPromise);
   }
 
@@ -1343,16 +1354,19 @@ export class Surface implements ServerTool {
         `surface tool: client '${params.resolved.platform}' does not provide target routing`,
       );
     }
-    const target = await routing.resolveSession({
+    const target: ResultType<
+      { readonly sessionRef: SessionRef; readonly config?: CoreConfig },
+      SurfaceToolTargetInvalid
+    > = await routing.resolveSession({
       selector: params.sessionId,
       adapter: params.resolved.adapter,
       getConfig: () => this.getCfg(),
     });
-    if (target.status === "error") signalSurfaceFailureToToolHost(target.error.message);
+    const targetValue = adaptSurfaceTargetResultToToolHost(target);
     return {
       resolved: params.resolved,
-      sessionRef: target.value.sessionRef,
-      cfg: target.value.config,
+      sessionRef: targetValue.sessionRef,
+      cfg: targetValue.config,
     };
   }
 
@@ -1388,7 +1402,10 @@ export class Surface implements ServerTool {
         row.messageId,
       ),
     );
-    return msg.status === "ok" ? (msg.value?.text ?? row.finalText ?? "") : (row.finalText ?? "");
+    return msg.match({
+      ok: (value) => value?.text ?? row.finalText ?? "",
+      err: () => row.finalText ?? "",
+    });
   }
 
   private linkSentMessageToTranscript(ref: MsgRef, ctx: RequestContext | undefined): void {
@@ -1766,7 +1783,7 @@ export class Surface implements ServerTool {
       hits.map(async (hit) => {
         try {
           const read = await target.resolved.adapter.readMsg(hit.ref);
-          const msg = read.status === "ok" ? read.value : null;
+          const msg = read.match({ ok: (value) => value, err: () => null });
           const attachments = msg ? getMessageAttachmentMeta(msg) : [];
           attachmentHintsByMessageId.set(hit.ref.messageId, buildAttachmentHints(attachments));
         } catch (cause) {

@@ -448,8 +448,14 @@ export class SSH implements ServerTool {
 
       if (exitCode === 0 && !timedOut) {
         const decodedProbe = decodeSshProbeOutput(stdout.trim());
-        if (decodedProbe.status === "ok") probe = decodedProbe.value;
-        else parseError = decodedProbe.error.message;
+        decodedProbe.match({
+          ok: (value) => {
+            probe = value;
+          },
+          err: (error) => {
+            parseError = error.message;
+          },
+        });
       }
 
       return {

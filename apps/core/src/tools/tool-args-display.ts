@@ -33,9 +33,13 @@ function safeValidateSync(
     },
     catch: projectRuntimeError("Opaque tool argument validation failure"),
   });
-  if (validated.status === "ok") return validated.value;
-  preserveToolPanic(validated.error);
-  return undefined;
+  return validated.match({
+    ok: (value) => () => value,
+    err: (error) => () => {
+      preserveToolPanic(error);
+      return undefined;
+    },
+  })();
 }
 
 function truncateEnd(input: string, maxLen: number): string {
@@ -305,7 +309,10 @@ export function formatToolArgsForDisplayWithSpecs(
       spec,
       args,
     });
-    return formatted.status === "ok" ? (formatted.value ?? "") : "";
+    return formatted.match({
+      ok: (value) => value ?? "",
+      err: () => "",
+    });
   }
 
   return formatToolArgsForDisplay(toolName, args);

@@ -172,8 +172,12 @@ class WebToolFailure extends TaggedError("WebToolFailure")<{
 }> {}
 
 function adaptWebResultToToolHost<TValue>(result: ResultType<TValue, WebToolFailure>): TValue {
-  if (result.status === "ok") return result.value;
-  throw new Error(result.error.message);
+  return result.match({
+    ok: (value) => () => value,
+    err: (error) => () => {
+      throw new Error(error.message);
+    },
+  })();
 }
 
 function signalWebFailureToToolHost(message: string): never {
@@ -1178,13 +1182,16 @@ export class Web implements ServerTool {
           };
         }
         const decodedPayload = decodeFirecrawlScrapeResponse(rawPayload);
-        if (decodedPayload.status === "error") {
+        const payload = decodedPayload.match({
+          err: () => null,
+          ok: (value) => value,
+        });
+        if (!payload) {
           return {
             isError: true,
             error: `Firecrawl scrape failed (${response.status}): invalid response contract.`,
           };
         }
-        const payload = decodedPayload.value;
 
         if (!response.ok || payload.success === false) {
           return {

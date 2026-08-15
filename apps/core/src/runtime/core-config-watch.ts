@@ -64,36 +64,36 @@ export async function handleCoreConfigWatchEvent(
   const read = await captureCoreConfigWatchRead(params.configPath, () =>
     readFile(params.configPath, "utf8"),
   );
-  if (read.status === "ok") {
-    const current = read.value;
-    if (current === params.state.lastContent) return;
+  read.match({
+    ok: (current) => {
+      if (current === params.state.lastContent) return;
 
-    params.state.lastContent = current;
-    params.logger.debug("core-config file change detected", {
-      eventType: params.eventType,
-      changed,
-      path: params.configPath,
-    });
-    params.scheduleValidation("watch");
-    return;
-  }
+      params.state.lastContent = current;
+      params.logger.debug("core-config file change detected", {
+        eventType: params.eventType,
+        changed,
+        path: params.configPath,
+      });
+      params.scheduleValidation("watch");
+    },
+    err: (error) => {
+      if (error.code === "ENOENT") {
+        params.logger.debug("core-config file temporarily unavailable during watch update", {
+          eventType: params.eventType,
+          changed,
+          path: params.configPath,
+        });
+        params.scheduleValidation("watch");
+        return;
+      }
 
-  const code = read.error.code;
-  if (code === "ENOENT") {
-    params.logger.debug("core-config file temporarily unavailable during watch update", {
-      eventType: params.eventType,
-      changed,
-      path: params.configPath,
-    });
-    params.scheduleValidation("watch");
-    return;
-  }
-
-  params.logger.warn("core-config watcher read failed", {
-    eventType: params.eventType,
-    changed,
-    path: params.configPath,
-    ...formatTaggedErrorForLog(read.error),
+      params.logger.warn("core-config watcher read failed", {
+        eventType: params.eventType,
+        changed,
+        path: params.configPath,
+        ...formatTaggedErrorForLog(error),
+      });
+      params.scheduleValidation("watch");
+    },
   });
-  params.scheduleValidation("watch");
 }

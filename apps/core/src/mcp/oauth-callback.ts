@@ -130,15 +130,17 @@ export class McpOAuthCallbackService {
     if (!provider) return invalidCallbackResponse();
 
     const completed = await provider.completeAuthorizationResult(codes[0], states[0]);
-    if (completed.status === "ok") {
-      return new Response("OAuth authorization completed.\n", {
-        status: 200,
-        headers: { "Content-Type": "text/plain; charset=utf-8" },
-      });
-    }
-    return new Response("OAuth authorization failed.\n", {
-      status: 400,
-      headers: { "Content-Type": "text/plain; charset=utf-8" },
+    return completed.match({
+      ok: () =>
+        new Response("OAuth authorization completed.\n", {
+          status: 200,
+          headers: { "Content-Type": "text/plain; charset=utf-8" },
+        }),
+      err: () =>
+        new Response("OAuth authorization failed.\n", {
+          status: 400,
+          headers: { "Content-Type": "text/plain; charset=utf-8" },
+        }),
     });
   }
 }

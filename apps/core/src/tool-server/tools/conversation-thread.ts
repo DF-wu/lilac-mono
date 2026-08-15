@@ -104,8 +104,12 @@ const CONVERSATION_THREAD_CALLABLE_IDS = {
 function adaptConversationThreadResultToToolHost<TValue>(
   result: ResultType<TValue, { readonly message: string }>,
 ): TValue {
-  if (result.status === "ok") return result.value;
-  throw new Error(result.error.message);
+  return result.match({
+    ok: (value) => () => value,
+    err: (error) => () => {
+      throw new Error(error.message);
+    },
+  })();
 }
 
 export async function resolveConversationThreadSummarizationToolOperation(

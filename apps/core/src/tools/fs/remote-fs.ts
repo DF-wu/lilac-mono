@@ -41,9 +41,17 @@ import {
   sshExecScriptJson,
 } from "../../ssh/ssh-exec";
 import { getRemoteRunnerJsText, type RemoteRunnerSourceReadError } from "../../ssh/remote-js";
-import { preserveToolPanic } from "../tool-result-adapters";
+import { adaptToolResultToHost, preserveToolPanic } from "../tool-result-adapters";
 
 const requirePackageJson = createRequire(import.meta.url);
+
+function selectResultValue<T, E extends Error>(result: ResultType<T, E>): T {
+  const select = result.match<() => T>({
+    ok: (value) => () => value,
+    err: (error) => () => adaptToolResultToHost(Result.err(error)),
+  });
+  return select();
+}
 
 export type RemoteReadTextInput = {
   path: string;
@@ -153,25 +161,28 @@ function decodeRemoteFsRunnerPackageSpec(): ResultType<string, RemoteFsRunnerSet
     try: (): unknown => requirePackageJson("@stanley2058/lilac-remote-fs-runner/package.json"),
     catch: projectRuntimeError("Opaque remote fs runner setup failure"),
   });
-  if (loaded.status === "error") {
-    const cause = preserveToolPanic(loaded.error);
-    return Result.err(
-      new RemoteFsRunnerSetupError({
-        cause,
-        message: "remote fs runner package.json could not be loaded",
-      }),
-    );
-  }
-  const packageJson = remoteFsRunnerPackageSchema.safeParse(loaded.value);
-  if (!packageJson.success) {
-    return Result.err(
-      new RemoteFsRunnerSetupError({
-        cause: packageJson.error,
-        message: "remote fs runner package.json is invalid",
-      }),
-    );
-  }
-  return Result.ok(`${packageJson.data.name}@${packageJson.data.version}`);
+  return loaded.match<() => ResultType<string, RemoteFsRunnerSetupError>>({
+    err: (error) => () => {
+      const cause = preserveToolPanic(error);
+      return Result.err(
+        new RemoteFsRunnerSetupError({
+          cause,
+          message: "remote fs runner package.json could not be loaded",
+        }),
+      );
+    },
+    ok: (value) => () => {
+      const packageJson = remoteFsRunnerPackageSchema.safeParse(value);
+      return packageJson.success
+        ? Result.ok(`${packageJson.data.name}@${packageJson.data.version}`)
+        : Result.err(
+            new RemoteFsRunnerSetupError({
+              cause: packageJson.error,
+              message: "remote fs runner package.json is invalid",
+            }),
+          );
+    },
+  })();
 }
 
 function shellSingleQuote(value: string): string {
@@ -198,11 +209,14 @@ function buildRemoteFsRunnerCommand(): ResultType<string, RemoteFsRunnerSetupErr
   let packageSpecValue = process.env.LILAC_REMOTE_FS_RUNNER_PACKAGE;
   if (!packageSpecValue) {
     const decoded = decodeRemoteFsRunnerPackageSpec();
-    if (decoded.status === "error") return Result.err(decoded.error);
-    packageSpecValue = decoded.value;
+    return decoded.map((value) => buildRemoteFsRunnerCommandForPackage(value));
   }
+  return Result.ok(buildRemoteFsRunnerCommandForPackage(packageSpecValue));
+}
+
+function buildRemoteFsRunnerCommandForPackage(packageSpecValue: string): string {
   const packageSpec = shellSingleQuote(packageSpecValue);
-  return Result.ok(`if command -v bunx >/dev/null 2>&1; then
+  return `if command -v bunx >/dev/null 2>&1; then
   LILAC_RUNNER_CACHE_DIR="\${XDG_CACHE_HOME:-$HOME/.cache}/lilac/remote-fs-runner"
   LILAC_BUNX_TMPDIR="$LILAC_RUNNER_CACHE_DIR/bunx"
   LILAC_RUNNER_INSTALL_LOCK="$LILAC_RUNNER_CACHE_DIR/package-launch.lock"
@@ -236,7 +250,7 @@ elif command -v npx >/dev/null 2>&1; then
   npx --no-workspaces -y ${packageSpec} request
 else
   echo '{"ok":false,"error":"Remote host has neither npx nor bunx in PATH"}'
-fi`);
+fi`;
 }
 
 async function sshExecRemoteFsRunnerJson<T>(params: {
@@ -249,11 +263,13 @@ async function sshExecRemoteFsRunnerJson<T>(params: {
   decodeResponse: (text: string) => ResultType<T, RemoteRunnerResponseDecodeError>;
 }): Promise<ResultType<T, RemoteFsExecutionError>> {
   const serializedInput = serializeRemoteRunnerRequestJson(params.input);
-  if (serializedInput.status === "error") return Result.err(serializedInput.error);
-  const inputJson = serializedInput.value;
+  const serializationError = serializedInput.match({ ok: () => null, err: (error) => error });
+  if (serializationError) return Result.err(serializationError);
+  const inputJson = selectResultValue(serializedInput);
   const runnerCommandResult = buildRemoteFsRunnerCommand();
-  if (runnerCommandResult.status === "error") return Result.err(runnerCommandResult.error);
-  const runnerCommand = runnerCommandResult.value;
+  const runnerCommandError = runnerCommandResult.match({ ok: () => null, err: (error) => error });
+  if (runnerCommandError) return Result.err(runnerCommandError);
+  const runnerCommand = selectResultValue(runnerCommandResult);
 
   const script = `#!/usr/bin/env bash
 set -euo pipefail
@@ -301,8 +317,9 @@ __LILAC_INPUT__
       }),
     catch: projectRuntimeError("Opaque remote fs SSH adapter failure"),
   });
-  if (executed.status === "error") {
-    const cause = preserveToolPanic(executed.error);
+  const executionError = executed.match({ ok: () => null, err: (error) => error });
+  if (executionError) {
+    const cause = preserveToolPanic(executionError);
     return Result.err(
       new SshExecutionAdapterError({
         cause,
@@ -310,7 +327,7 @@ __LILAC_INPUT__
       }),
     );
   }
-  const res = executed.value;
+  const res = selectResultValue(executed);
 
   if (res.aborted) return Result.err(new SshExecutionCancelledError({ message: "aborted" }));
   if (res.timedOut) {
@@ -346,7 +363,6 @@ __LILAC_INPUT__
       }),
     );
   }
-
   return params.decodeResponse(res.stdout.trim());
 }
 
@@ -359,11 +375,12 @@ export async function remoteReadTextFile(params: {
   signal?: AbortSignal;
 }): Promise<ResultType<RemoteReadTextOutput, RemoteFsExecutionError>> {
   const source = await getRemoteRunnerJsText();
-  if (source.status === "error") return Result.err(source.error);
-  const res = await sshExecScriptJson({
+  const sourceError = source.match({ ok: () => null, err: (error) => error });
+  if (sourceError) return Result.err(sourceError);
+  return await sshExecScriptJson({
     host: params.host,
     cwd: params.cwd,
-    js: source.value,
+    js: selectResultValue(source),
     input: {
       op: "fs.read_text",
       denyPaths: [...params.denyPaths],
@@ -374,8 +391,6 @@ export async function remoteReadTextFile(params: {
     maxOutputChars: DEFAULT_MAX_OUTPUT_CHARS,
     decodeResponse: decodeRemoteReadTextResponseJson,
   });
-
-  return res;
 }
 
 export async function remoteReadFileBytes(params: {
@@ -391,11 +406,12 @@ export async function remoteReadFileBytes(params: {
   const maxOutputChars = Math.max(500_000, Math.ceil(params.maxBytes * 1.5) + 10_000);
 
   const source = await getRemoteRunnerJsText();
-  if (source.status === "error") return Result.err(source.error);
-  const res = await sshExecScriptJson({
+  const sourceError = source.match({ ok: () => null, err: (error) => error });
+  if (sourceError) return Result.err(sourceError);
+  return await sshExecScriptJson({
     host: params.host,
     cwd: params.cwd,
-    js: source.value,
+    js: selectResultValue(source),
     input: {
       op: "fs.read_bytes",
       denyPaths: [...params.denyPaths],
@@ -406,8 +422,6 @@ export async function remoteReadFileBytes(params: {
     maxOutputChars,
     decodeResponse: decodeRemoteReadBytesResponseJson,
   });
-
-  return res;
 }
 
 export async function remoteGlob(params: {
@@ -442,24 +456,23 @@ export async function remoteGlob(params: {
       signal: params.signal,
       decodeResponse: decodeRemoteGlobResponseJson,
     });
-    if (runnerRes.status === "ok") return runnerRes;
-    if (runnerRes.error._tag === "SshExecutionCancelledError") return runnerRes;
+    const runnerError = runnerRes.match({ ok: () => null, err: (error) => error });
+    if (!runnerError || runnerError._tag === "SshExecutionCancelledError") return runnerRes;
   }
 
   const source = await getRemoteRunnerJsText();
-  if (source.status === "error") return Result.err(source.error);
-  const res = await sshExecScriptJson({
+  const sourceError = source.match({ ok: () => null, err: (error) => error });
+  if (sourceError) return Result.err(sourceError);
+  return await sshExecScriptJson({
     host: params.host,
     cwd: params.cwd,
-    js: source.value,
+    js: selectResultValue(source),
     input,
     timeoutMs: params.timeoutMs ?? DEFAULT_TIMEOUT_MS,
     signal: params.signal,
     maxOutputChars: DEFAULT_MAX_OUTPUT_CHARS,
     decodeResponse: decodeRemoteGlobResponseJson,
   });
-
-  return res;
 }
 
 export async function remoteGrep(params: {
@@ -505,24 +518,23 @@ export async function remoteGrep(params: {
       signal: params.signal,
       decodeResponse: decodeRemoteGrepResponseJson,
     });
-    if (runnerRes.status === "ok") return runnerRes;
-    if (runnerRes.error._tag === "SshExecutionCancelledError") return runnerRes;
+    const runnerError = runnerRes.match({ ok: () => null, err: (error) => error });
+    if (!runnerError || runnerError._tag === "SshExecutionCancelledError") return runnerRes;
   }
 
   const source = await getRemoteRunnerJsText();
-  if (source.status === "error") return Result.err(source.error);
-  const res = await sshExecScriptJson({
+  const sourceError = source.match({ ok: () => null, err: (error) => error });
+  if (sourceError) return Result.err(sourceError);
+  return await sshExecScriptJson({
     host: params.host,
     cwd: target.launchCwd,
-    js: source.value,
+    js: selectResultValue(source),
     input,
     timeoutMs: params.timeoutMs ?? DEFAULT_TIMEOUT_MS,
     signal: params.signal,
     maxOutputChars: DEFAULT_MAX_OUTPUT_CHARS,
     decodeResponse: decodeRemoteGrepResponseJson,
   });
-
-  return res;
 }
 
 export async function remoteFuzzySearch(params: {
@@ -566,19 +578,18 @@ export async function remoteEditFile(params: {
   signal?: AbortSignal;
 }): Promise<ResultType<RemoteEditOutput, RemoteFsExecutionError>> {
   const source = await getRemoteRunnerJsText();
-  if (source.status === "error") return Result.err(source.error);
-  const res = await sshExecScriptJson({
+  const sourceError = source.match({ ok: () => null, err: (error) => error });
+  if (sourceError) return Result.err(sourceError);
+  return await sshExecScriptJson({
     host: params.host,
     cwd: params.cwd,
-    js: source.value,
+    js: selectResultValue(source),
     input: toBundledRemoteEditRequest(params.input, params.denyPaths),
     timeoutMs: params.timeoutMs ?? DEFAULT_TIMEOUT_MS,
     signal: params.signal,
     maxOutputChars: DEFAULT_MAX_OUTPUT_CHARS,
     decodeResponse: decodeRemoteEditResponseJson,
   });
-
-  return res;
 }
 
 // For unit tests and future callsites.

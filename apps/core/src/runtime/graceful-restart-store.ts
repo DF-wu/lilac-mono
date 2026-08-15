@@ -854,7 +854,7 @@ function validateSnapshotCorrelation(
     if (!validateRecoveryIdentity(entry, entry.identity, requireDurableProof)) return false;
     if (entry.corePrimaryLineage) {
       const lineage = decodeCorePrimaryLineageV1(entry.corePrimaryLineage, entry.messages);
-      if (lineage.status === "error") return false;
+      if (!lineage.match({ ok: () => true, err: () => false })) return false;
     }
   }
 
@@ -960,61 +960,90 @@ function normalizeSnapshotV3(
 export function decodeGracefulRestartSnapshot(
   row: PersistedGracefulRestartRow | null,
 ): ResultType<DecodedPersistedValue<GracefulRestartSnapshot | null>, PersistedDataError> {
-  if (row === null) return Result.ok({ value: null, provenance: "missing-defaulted" });
-  if (row.status !== "completed") return Result.err(corruptSnapshot(-1, "status"));
-
-  const parsed = parsePersistedPayload(row.payload_json);
-  if (parsed.status === "error") return Result.err(parsed.error);
-
-  const versionValue = isRecord(parsed.value) ? parsed.value["version"] : undefined;
-  const version =
-    typeof versionValue === "number" && Number.isInteger(versionValue) ? versionValue : undefined;
-  if (version === undefined) return Result.err(corruptSnapshot(-1, "payload_json"));
-  if (
-    version !== 1 &&
-    version !== 2 &&
-    version !== 3 &&
-    version !== GRACEFUL_RESTART_SNAPSHOT_VERSION
-  ) {
-    return Result.err(
-      new UnsupportedVersion(
-        persistenceContext({
-          field: "payload_json",
-          version,
-          issueCode: "unsupported-version",
-        }),
-      ),
-    );
-  }
-
-  if (version === 1 || version === 2) {
-    const decoded =
-      version === 1
-        ? legacySnapshotV1Schema.safeParse(parsed.value)
-        : legacySnapshotV2Schema.safeParse(parsed.value);
-    if (!decoded.success) return Result.err(corruptSnapshot(version, "payload_json"));
-    const normalized = normalizeLegacySnapshot(decoded.data);
-    if (normalized.status === "error") return Result.err(normalized.error);
-    return Result.ok({
-      value: normalized.value,
-      provenance: "migrated",
+  if (row === null) {
+    return Result.ok<DecodedPersistedValue<GracefulRestartSnapshot | null>>({
+      value: null,
+      provenance: "missing-defaulted",
     });
   }
+  if (row.status !== "completed") return Result.err(corruptSnapshot(-1, "status"));
 
-  if (version === 3) {
-    const decoded = snapshotV3Schema.safeParse(parsed.value);
-    if (!decoded.success) return Result.err(corruptSnapshot(version, "payload_json"));
-    const normalized = normalizeSnapshotV3(decoded.data);
-    if (normalized.status === "error") return Result.err(normalized.error);
-    return Result.ok({ value: normalized.value, provenance: "migrated" });
-  }
+  const parsedResult = parsePersistedPayload(row.payload_json);
+  const continueParsed = parsedResult.match<
+    () => ResultType<DecodedPersistedValue<GracefulRestartSnapshot | null>, PersistedDataError>
+  >({
+    err: (error) => () => Result.err(error),
+    ok: (parsed) => () => {
+      const versionValue = isRecord(parsed) ? parsed["version"] : undefined;
+      const version =
+        typeof versionValue === "number" && Number.isInteger(versionValue)
+          ? versionValue
+          : undefined;
+      if (version === undefined) return Result.err(corruptSnapshot(-1, "payload_json"));
+      if (
+        version !== 1 &&
+        version !== 2 &&
+        version !== 3 &&
+        version !== GRACEFUL_RESTART_SNAPSHOT_VERSION
+      ) {
+        return Result.err(
+          new UnsupportedVersion(
+            persistenceContext({
+              field: "payload_json",
+              version,
+              issueCode: "unsupported-version",
+            }),
+          ),
+        );
+      }
 
-  const decoded = currentSnapshotSchema.safeParse(parsed.value);
-  if (!decoded.success) return Result.err(corruptSnapshot(version, "payload_json"));
-  if (!validateSnapshotCorrelation(decoded.data, true)) {
-    return Result.err(corruptSnapshot(version, "payload_json"));
-  }
-  return Result.ok({ value: decoded.data, provenance: "current" });
+      if (version === 1 || version === 2) {
+        const decoded =
+          version === 1
+            ? legacySnapshotV1Schema.safeParse(parsed)
+            : legacySnapshotV2Schema.safeParse(parsed);
+        if (!decoded.success) return Result.err(corruptSnapshot(version, "payload_json"));
+        const normalizedResult = normalizeLegacySnapshot(decoded.data);
+        const continueNormalized = normalizedResult.match<
+          () => ResultType<
+            DecodedPersistedValue<GracefulRestartSnapshot | null>,
+            PersistedDataError
+          >
+        >({
+          err: (error) => () => Result.err(error),
+          ok: (value) => () => Result.ok({ value, provenance: "migrated" }),
+        });
+        return continueNormalized();
+      }
+
+      if (version === 3) {
+        const decoded = snapshotV3Schema.safeParse(parsed);
+        if (!decoded.success) return Result.err(corruptSnapshot(version, "payload_json"));
+        const normalizedResult = normalizeSnapshotV3(decoded.data);
+        const continueNormalized = normalizedResult.match<
+          () => ResultType<
+            DecodedPersistedValue<GracefulRestartSnapshot | null>,
+            PersistedDataError
+          >
+        >({
+          err: (error) => () => Result.err(error),
+          ok: (value) => () => Result.ok({ value, provenance: "migrated" }),
+        });
+        return continueNormalized();
+      }
+
+      const decoded = currentSnapshotSchema.safeParse(parsed);
+      if (!decoded.success) return Result.err(corruptSnapshot(version, "payload_json"));
+      if (!validateSnapshotCorrelation(decoded.data, true)) {
+        return Result.err(corruptSnapshot(version, "payload_json"));
+      }
+      return Result.ok<DecodedPersistedValue<GracefulRestartSnapshot | null>>({
+        value: decoded.data,
+        provenance: "current",
+      });
+    },
+  });
+  return continueParsed();
 }
 
 function encodeGracefulRestartSnapshot(
@@ -1024,7 +1053,7 @@ function encodeGracefulRestartSnapshot(
     for (const entry of snapshot.agent) {
       if (entry.raw === undefined) continue;
       const opaque = decodeOpaqueSuperJsonValue(entry.raw);
-      if (opaque.status === "error") {
+      if (!opaque.match({ ok: () => true, err: () => false })) {
         return Result.err(corruptSnapshot(GRACEFUL_RESTART_SNAPSHOT_VERSION, "payload_json"));
       }
     }
@@ -1033,17 +1062,19 @@ function encodeGracefulRestartSnapshot(
       status: "completed",
       payload_json: payloadJson,
     });
-    if (validated.status === "error") {
-      if (validated.error instanceof CorruptPersistedFields) return Result.err(validated.error);
-      throw new Panic({
-        message: "Graceful restart current snapshot encoding produced an invalid envelope",
-        cause: validated.error,
-      });
-    }
-    if (!isDeepStrictEqual(validated.value.value, snapshot)) {
-      return Result.err(corruptSnapshot(GRACEFUL_RESTART_SNAPSHOT_VERSION, "payload_json"));
-    }
-    return Result.ok(payloadJson);
+    return validated.match({
+      err: (error) => () => {
+        if (error instanceof CorruptPersistedFields) return Result.err(error);
+        throw new Panic({
+          message: "Graceful restart current snapshot encoding produced an invalid envelope",
+          cause: error,
+        });
+      },
+      ok: (value) => () =>
+        isDeepStrictEqual(value.value, snapshot)
+          ? Result.ok(payloadJson)
+          : Result.err(corruptSnapshot(GRACEFUL_RESTART_SNAPSHOT_VERSION, "payload_json")),
+    })();
   } catch (cause) {
     if (Panic.is(cause)) throw cause;
     if (!(cause instanceof Error)) throw cause;
@@ -1142,14 +1173,12 @@ export class SqliteGracefulRestartStore {
   saveCompletedSnapshot(
     snapshot: GracefulRestartSnapshotInput,
   ): ResultType<void, GracefulRestartSaveError> {
-    const encoded = encodeGracefulRestartSnapshot(snapshot);
-    if (encoded.status === "error") return Result.err(encoded.error);
-
-    return runBunSqliteTransaction(
-      this.db,
-      () => {
-        this.db.run(
-          `
+    return encodeGracefulRestartSnapshot(snapshot).andThen((encoded) =>
+      runBunSqliteTransaction(
+        this.db,
+        () => {
+          this.db.run(
+            `
           INSERT INTO graceful_restart_state (
             singleton_id,
             status,
@@ -1161,11 +1190,12 @@ export class SqliteGracefulRestartStore {
             updated_ts=excluded.updated_ts,
             payload_json=excluded.payload_json
           `,
-          [1, "completed", Date.now(), encoded.value],
-        );
-        return Result.ok(undefined);
-      },
-      (cause) => classifySqliteFailure("save", cause),
+            [1, "completed", Date.now(), encoded],
+          );
+          return Result.ok(undefined);
+        },
+        (cause) => classifySqliteFailure("save", cause),
+      ),
     );
   }
 
@@ -1184,13 +1214,24 @@ export class SqliteGracefulRestartStore {
       },
       (cause) => classifySqliteFailure("read", cause),
     );
-    if (read.status === "error") return Result.err(read.error);
-
-    const token = read.value ? rowToken(read.value) : undefined;
-    if (read.value && !token) return Result.err(corruptSnapshot(-1, "payload_json"));
-    const decoded = decodeGracefulRestartSnapshot(read.value);
-    if (decoded.status === "error") return Result.err(decoded.error);
-    return Result.ok(loadOutcome(decoded.value, nowMs, token ?? undefined));
+    const continueRead = read.match<
+      () => ResultType<GracefulRestartLoadOutcome, GracefulRestartLoadError>
+    >({
+      err: (error) => () => Result.err(error),
+      ok: (row) => () => {
+        const token = row ? rowToken(row) : undefined;
+        if (row && !token) return Result.err(corruptSnapshot(-1, "payload_json"));
+        const decoded = decodeGracefulRestartSnapshot(row);
+        const continueDecoded = decoded.match<
+          () => ResultType<GracefulRestartLoadOutcome, GracefulRestartLoadError>
+        >({
+          err: (error) => () => Result.err(error),
+          ok: (value) => () => Result.ok(loadOutcome(value, nowMs, token ?? undefined)),
+        });
+        return continueDecoded();
+      },
+    });
+    return continueRead();
   }
 
   consumeCompletedSnapshot(

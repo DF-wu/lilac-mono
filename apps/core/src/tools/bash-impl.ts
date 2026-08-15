@@ -35,7 +35,7 @@ import {
 import { loadToolEnv } from "./tool-env";
 import type { ToolResultArtifactStore } from "../artifacts/tool-result-artifact-store";
 import { projectRuntimeError } from "../runtime/error-format";
-import { preserveToolPanic } from "./tool-result-adapters";
+import { adaptToolResultToHost, preserveToolPanic } from "./tool-result-adapters";
 
 export const BASH_NO_OUTPUT_TIMEOUT_MS = 3 * 60 * 1000;
 const DEFAULT_KILL_SIGNAL = "SIGTERM";
@@ -165,78 +165,64 @@ const DEFAULT_SPILL_FILE_OPERATIONS: BashSpillFileOperations = {
   remove: (target) => fs.rm(target, { force: true }),
 };
 
-type BashExecutionAttempt =
-  | { readonly status: "ok"; readonly output: BashToolOutput }
-  | { readonly status: "error"; readonly error: BashAdapterError }
-  | { readonly status: "panic"; readonly panic: Panic };
-
-type BashSpillCleanupOutcome = {
-  readonly result: ResultType<void, BashSpillCleanupError>;
-  readonly panic?: Panic;
-};
-
-function settleBashExecution(run: () => Promise<BashToolOutput>): Promise<BashExecutionAttempt> {
-  return Promise.resolve()
-    .then(run)
-    .then(
-      (output) => ({ status: "ok", output }),
-      (caught: unknown) => {
-        if (isPanic(caught)) return { status: "panic", panic: caught };
-        return {
-          status: "error",
-          error: new BashAdapterError({
+function settleBashExecution(
+  run: () => Promise<BashToolOutput>,
+): Promise<ResultType<BashToolOutput, BashAdapterError | Panic>> {
+  return Result.tryPromise({
+    try: run,
+    catch: <TCaught>(caught: TCaught) =>
+      isPanic(caught)
+        ? caught
+        : new BashAdapterError({
             operation: "execute",
             cause: caught,
             message: "Bash execution failed",
           }),
-        };
-      },
-    );
+  });
+}
+
+function selectResultValue<T, E extends Error>(result: ResultType<T, E>): T {
+  const select = result.match<() => T>({
+    ok: (value) => () => value,
+    err: (error) => () => adaptToolResultToHost(Result.err(error)),
+  });
+  return select();
 }
 
 async function cleanupBashSpills(
   paths: readonly string[],
   operations: BashSpillFileOperations,
-): Promise<BashSpillCleanupOutcome> {
+): Promise<ResultType<void, BashSpillCleanupError | Panic>> {
   const failures: BashAdapterError[] = [];
   let deferredPanic: Panic | undefined;
   for (const target of new Set(paths)) {
-    const attempt = await Promise.resolve()
-      .then(() => operations.remove(target))
-      .then(
-        () => ({ status: "ok" as const }),
-        (caught: unknown) =>
-          isPanic(caught)
-            ? { status: "panic" as const, panic: caught }
-            : { status: "error" as const, cause: caught },
-      );
-    if (attempt.status === "panic") {
-      if (!deferredPanic) deferredPanic = attempt.panic;
-      continue;
-    }
-    if (attempt.status === "error") {
+    const [attempt] = await Promise.allSettled([
+      Promise.resolve().then(() => operations.remove(target)),
+    ]);
+    if (attempt?.status === "rejected") {
+      if (isPanic(attempt.reason)) {
+        deferredPanic ??= attempt.reason;
+        continue;
+      }
       failures.push(
         new BashAdapterError({
           operation: "remove_temporary_spill",
-          cause: attempt.cause,
+          cause: attempt.reason,
           message: "Failed to remove temporary Bash output spill",
         }),
       );
     }
   }
 
-  return {
-    result:
-      failures.length === 0
-        ? Result.ok()
-        : Result.err(
-            new BashSpillCleanupError({
-              failures,
-              message: "Bash temporary output cleanup failed",
-            }),
-          ),
-    ...(deferredPanic ? { panic: deferredPanic } : {}),
-  };
+  if (deferredPanic) return Result.err(deferredPanic);
+  return failures.length === 0
+    ? Result.ok()
+    : Result.err(
+        new BashSpillCleanupError({
+          failures,
+          message: "Bash temporary output cleanup failed",
+        }),
+      );
 }
 
 function appendCleanupNotice(stderr: string): string {
@@ -460,11 +446,12 @@ async function overflowStreamBytes(captured: string, overflowPath?: string): Pro
     try: () => fs.stat(overflowPath),
     catch: projectRuntimeError("Opaque Bash overflow stat failure"),
   });
-  if (inspected.status === "error") {
-    preserveToolPanic(inspected.error);
+  const inspectError = inspected.match({ ok: () => null, err: (error) => error });
+  if (inspectError) {
+    preserveToolPanic(inspectError);
     return Buffer.byteLength(captured, "utf8");
   }
-  return inspected.value.size;
+  return inspected.match({ ok: (value) => value.size, err: () => 0 });
 }
 
 async function readOverflowTail(
@@ -475,17 +462,18 @@ async function readOverflowTail(
     try: () => fs.open(overflowPath, "r"),
     catch: projectRuntimeError("Opaque Bash overflow open failure"),
   });
-  if (opened.status === "error") {
+  const openError = opened.match({ ok: () => null, err: (error) => error });
+  if (openError) {
     return Result.err(
       new BashAdapterError({
         operation: "open_overflow",
-        cause: preserveToolPanic(opened.error),
+        cause: preserveToolPanic(openError),
         message: "Failed to open Bash overflow output",
       }),
     );
   }
 
-  const handle = opened.value;
+  const handle = selectResultValue(opened);
   const readTail = async () => {
     const stat = await handle.stat();
     const readBytes = Math.min(stat.size, Math.max(4096, contentBudget * 4));
@@ -501,19 +489,21 @@ async function readOverflowTail(
     try: () => handle.close(),
     catch: projectRuntimeError("Opaque Bash overflow close failure"),
   });
-  if (read.status === "error" && isPanic(read.error)) preserveToolPanic(read.error);
-  if (closed.status === "error" && isPanic(closed.error)) preserveToolPanic(closed.error);
+  const readCause = read.match({ ok: () => null, err: (error) => error });
+  const closeCause = closed.match({ ok: () => null, err: (error) => error });
+  if (readCause && isPanic(readCause)) preserveToolPanic(readCause);
+  if (closeCause && isPanic(closeCause)) preserveToolPanic(closeCause);
 
-  if (read.status === "error") {
+  if (readCause) {
     const readError = new BashAdapterError({
       operation: "read_overflow",
-      cause: read.error,
+      cause: readCause,
       message: "Failed to read Bash overflow output",
     });
-    if (closed.status === "ok") return Result.err(readError);
+    if (!closeCause) return Result.err(readError);
     const closeError = new BashAdapterError({
       operation: "close_overflow",
-      cause: closed.error,
+      cause: closeCause,
       message: "Failed to close Bash overflow output",
     });
     return Result.err(
@@ -527,16 +517,16 @@ async function readOverflowTail(
       }),
     );
   }
-  if (closed.status === "error") {
+  if (closeCause) {
     return Result.err(
       new BashAdapterError({
         operation: "close_overflow",
-        cause: closed.error,
+        cause: closeCause,
         message: "Failed to close Bash overflow output",
       }),
     );
   }
-  return Result.ok(read.value);
+  return Result.ok(read.match({ ok: (value) => value, err: () => Buffer.alloc(0) }));
 }
 
 async function buildOverflowStreamPreview(params: {
@@ -550,9 +540,10 @@ async function buildOverflowStreamPreview(params: {
   const contentBudget = Math.max(0, params.maxBytes - Buffer.byteLength(marker, "utf8"));
   const head = takeUtf8Edge(params.captured, Math.ceil(contentBudget / 2), false);
   const read = await readOverflowTail(params.overflowPath, contentBudget);
-  if (read.status === "error") return previewStream(params.captured, params.maxBytes);
+  const readValue = read.match({ ok: (value) => value, err: () => null });
+  if (!readValue) return previewStream(params.captured, params.maxBytes);
   const sanitized = redactSecrets(
-    stripAnsiEscapeSequences(read.value.toString("utf8")),
+    stripAnsiEscapeSequences(readValue.toString("utf8")),
     params.literalSecrets,
   );
   const tail = takeUtf8Edge(sanitized, Math.floor(contentBudget / 2), true);
@@ -738,8 +729,9 @@ async function persistTruncatedOutput(params: {
     catch: projectRuntimeError("Opaque Bash artifact persistence failure"),
   });
   let result: { uri?: string } = {};
-  if (created.status === "error") {
-    const cause = preserveToolPanic(created.error);
+  const createError = created.match({ ok: () => null, err: (error) => error });
+  if (createError) {
+    const cause = preserveToolPanic(createError);
     logger.warn("tool.artifact.write_failed", {
       toolName: "bash",
       ...formatTaggedErrorForLog(
@@ -751,14 +743,15 @@ async function persistTruncatedOutput(params: {
       ),
     });
   } else {
-    const artifact = created.value;
-    if (artifact.status === "error") {
+    const artifact = selectResultValue(created);
+    const artifactError = artifact.match({ ok: () => null, err: (error) => error });
+    if (artifactError) {
       logger.warn("tool.artifact.write_failed", {
         toolName: "bash",
-        ...formatTaggedErrorForLog(artifact.error),
+        ...formatTaggedErrorForLog(artifactError),
       });
     } else {
-      result = { uri: artifact.value.uri };
+      result = artifact.match({ ok: (value) => ({ uri: value.uri }), err: () => ({}) });
     }
   }
   return result;
@@ -930,8 +923,14 @@ export async function executeBash(
       try: () => process.kill(pid, signal),
       catch: projectRuntimeError("Opaque Bash process termination failure"),
     });
-    if (groupKill.status === "error") preserveToolPanic(groupKill.error);
-    if (processKill.status === "error") preserveToolPanic(processKill.error);
+    groupKill.match<() => void>({
+      ok: () => () => undefined,
+      err: (error) => () => preserveToolPanic(error),
+    })();
+    processKill.match<() => void>({
+      ok: () => () => undefined,
+      err: (error) => () => preserveToolPanic(error),
+    })();
   };
 
   const HARD_KILL_DELAY_MS = 2000;
@@ -1539,17 +1538,17 @@ export async function executeBash(
   );
   stopWatchingExecution();
 
-  if (executed.status === "panic") {
-    preserveToolPanic(executed.panic);
-  }
-  if (cleanup.panic) preserveToolPanic(cleanup.panic);
+  const executionFailure = executed.match({ ok: () => null, err: (error) => error });
+  const cleanupFailure = cleanup.match({ ok: () => null, err: (error) => error });
+  if (executionFailure && isPanic(executionFailure)) preserveToolPanic(executionFailure);
+  if (cleanupFailure && isPanic(cleanupFailure)) preserveToolPanic(cleanupFailure);
 
-  if (executed.status === "error") {
+  if (executionFailure) {
     const durationMs = Date.now() - startedAt;
-    if (cleanup.result.status === "error") {
+    if (cleanupFailure) {
       const combined = new BashOperationAndCleanupError({
-        primary: executed.error,
-        cleanup: cleanup.result.error,
+        primary: executionFailure,
+        cleanup: cleanupFailure,
         message: "Bash execution failed and temporary output cleanup also failed",
       });
       logger.error("bash spawn and cleanup failed", {
@@ -1574,10 +1573,10 @@ export async function executeBash(
       durationMs,
       requestId: context?.requestId,
       toolCallId,
-      ...formatTaggedErrorForLog(executed.error),
+      ...formatTaggedErrorForLog(executionFailure),
     });
 
-    const executionError = toFailedExecutionError(termination, executed.error.message);
+    const executionError = toFailedExecutionError(termination, executionFailure.message);
     return {
       stdout: "",
       stderr: "",
@@ -1585,8 +1584,9 @@ export async function executeBash(
       executionError,
     };
   }
-  if (cleanup.result.status === "error") {
-    return surfaceBashCleanupFailure(executed.output, cleanup.result.error);
+  const output = selectResultValue(executed);
+  if (cleanupFailure) {
+    return surfaceBashCleanupFailure(output, cleanupFailure);
   }
-  return executed.output;
+  return output;
 }

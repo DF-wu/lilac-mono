@@ -18,8 +18,12 @@ class ExaProviderConfigurationInvalid extends TaggedError("ExaProviderConfigurat
 function adaptExaProviderResultToHost<TValue>(
   result: ResultType<TValue, ExaProviderConfigurationInvalid>,
 ): TValue {
-  if (result.status === "ok") return result.value;
-  throw new Error(result.error.message);
+  return result.match({
+    ok: (value) => () => value,
+    err: (error) => () => {
+      throw new Error(error.message);
+    },
+  })();
 }
 
 function mapTopicToExaCategory(topic: WebSearchInput["topic"]): ExaCategory | undefined {
