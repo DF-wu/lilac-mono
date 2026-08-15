@@ -619,7 +619,7 @@ export async function readSanitizedStreamTextCappedResult(
       const { done, value } = readValue;
       if (done) break;
       if (value && value.byteLength > 0) {
-        const activity = options?.onActivity
+        const activity: ResultType<void, BashOutputStreamError | Panic> = options?.onActivity
           ? captureBashOutputOperation({
               operation: "reporting output activity",
               run: options.onActivity,

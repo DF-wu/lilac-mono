@@ -648,9 +648,10 @@ export class McpRegistry implements McpRegistryApi {
     } = {};
 
     try {
-      const resolution = prefetchedTransport
-        ? Result.ok(prefetchedTransport)
-        : await this.resolveTransport(definition);
+      const resolution: ResultType<ResolvedTransport, McpRegistryTransportError> =
+        prefetchedTransport
+          ? Result.ok(prefetchedTransport)
+          : await this.resolveTransport(definition);
       return await resolution.match<() => Promise<CandidateResult>>({
         err: (error) => async () => ({
           ok: false,
