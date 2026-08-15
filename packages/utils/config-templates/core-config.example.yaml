@@ -8,6 +8,10 @@ tools:
       providers: [tavily]
     fetch:
       mode: auto
+    # Optional independent process-local limits for Firecrawl fetch and search calls.
+    # firecrawl:
+    #   maxConcurrency: 2
+    #   queueTtl: 3s
   inspect:
     # Must start with google/.
     model: google/gemini-3.5-flash

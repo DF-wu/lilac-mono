@@ -57,6 +57,9 @@ New v2 fields:
 - `agent.idleTimeoutMs`: primary agent inactivity timeout; defaults to `900000` (15 minutes). Active runs
   have no total runtime cap. Frozen v1 configs receive the same universal fallback but cannot override it.
 - `tools.inspect.model`: configurable Gemini model for `content.inspect`; must start with `google/`.
+- `tools.web.firecrawl`: optional process-local concurrency policy applied independently to Firecrawl
+  fetch and search calls. When present, `maxConcurrency` defaults to `2` and `queueTtl` defaults to `3s`;
+  when absent, Firecrawl calls remain unlimited.
 - `models.capability.overrides.<provider/model>.attachment`: optional manual override for model attachment
   input support.
 - `conversation.thread.summarization.enabled`: default-false gate for background conversation thread

@@ -12,9 +12,11 @@ import {
   modelCapabilityCostPatchSchema,
   modelCapabilityLimitPatchSchema,
   modelCapabilityModalitiesPatchSchema,
+  migrateWebConfigValue,
   routerSchema,
   statsForNerdsSchema,
-  webExtractConfigSchema,
+  webExtractConfigValueSchema,
+  webFetchModeSchema,
 } from "./v1";
 import { collectUnknownConfigKeyPaths } from "./unknown-keys";
 import { MODEL_REASONING_EFFORTS } from "./types";
@@ -329,10 +331,41 @@ const discordSurfaceSchema = z
 const byteSizeSchema = z.preprocess(parseFriendlyByteSize, z.number().int().positive());
 const durationMsSchema = z.preprocess(parseFriendlyDurationMs, z.number().int().positive());
 
+const webConfigSchemaV2 = z
+  .preprocess(
+    migrateWebConfigValue,
+    z.object({
+      extract: webExtractConfigValueSchema.default({
+        providers: ["tavily"],
+      }),
+      fetch: z
+        .object({
+          mode: webFetchModeSchema,
+        })
+        .default({
+          mode: "auto",
+        }),
+      firecrawl: z
+        .object({
+          maxConcurrency: z.number().int().positive().default(2),
+          queueTtl: durationMsSchema.default(3_000),
+        })
+        .optional(),
+    }),
+  )
+  .default({
+    extract: {
+      providers: ["tavily"],
+    },
+    fetch: {
+      mode: "auto",
+    },
+  });
+
 const toolsSchema = z
   .object({
     fsBackend: z.enum(["fff", "node-rg"]).default("fff"),
-    web: webExtractConfigSchema,
+    web: webConfigSchemaV2,
     inspect: z
       .object({
         model: z.string().trim().min(1).default("google/gemini-3.5-flash"),
@@ -726,11 +759,21 @@ function coreConfigV2ToUniversal(
     }
   }
   const { artifactTtl, ...output } = parsed.tools.output;
+  const { firecrawl, ...web } = parsed.tools.web;
 
   return {
     ...parsed,
     tools: {
       ...parsed.tools,
+      web: firecrawl
+        ? {
+            ...web,
+            firecrawl: {
+              maxConcurrency: firecrawl.maxConcurrency,
+              queueTtlMs: firecrawl.queueTtl,
+            },
+          }
+        : web,
       output: {
         ...output,
         artifactTtlMs: artifactTtl,

@@ -8265,6 +8265,10 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
               exportName: "decodeFirecrawlSearchResponse",
             },
             {
+              module: "src/tool-server/tools/web-search/firecrawl-permit-pool.ts",
+              exportName: "FirecrawlPermitPool.acquire",
+            },
+            {
               module: "src/tool-server/tools/web.ts",
               exportName: "decodeFirecrawlScrapeResponse",
             },

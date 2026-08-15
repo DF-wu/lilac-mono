@@ -1,13 +1,15 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, jest } from "bun:test";
 import { env } from "@stanley2058/lilac-utils";
 
 import { Web } from "../../src/tool-server/tools/web";
+import { FirecrawlPermitPool } from "../../src/tool-server/tools/web-search/firecrawl-permit-pool";
 
 const servers: Array<{ stop(force?: boolean): void }> = [];
 const originalFirecrawlApiKey = env.tools.web.firecrawl.apiKey;
 const originalFirecrawlApiBaseUrl = env.tools.web.firecrawl.apiBaseUrl;
 
 afterEach(() => {
+  jest.useRealTimers();
   while (servers.length > 0) {
     servers.pop()?.stop(true);
   }
@@ -19,6 +21,10 @@ afterEach(() => {
   mutableFirecrawlEnv.apiKey = originalFirecrawlApiKey;
   mutableFirecrawlEnv.apiBaseUrl = originalFirecrawlApiBaseUrl;
 });
+
+function deferred<T = void>() {
+  return Promise.withResolvers<T>();
+}
 
 function startServer(handler: (req: Request) => Response | Promise<Response>) {
   const server = Bun.serve({
@@ -835,5 +841,331 @@ describe("web tool fetch", () => {
       content: "Recovered after timeout fallback.",
     });
     expect(calls).toEqual(["exa", "tavily"]);
+  });
+
+  it("queues Firecrawl search calls and falls back when the queue TTL expires", async () => {
+    jest.useFakeTimers({ now: 0 });
+    const tool = new Web();
+    const pool = new FirecrawlPermitPool("search");
+    pool.configure({ maxConcurrency: 2, queueTtlMs: 3_000 });
+    const twoStarted = deferred();
+    const releaseActive = deferred();
+    const thirdAcquireStarted = deferred();
+    let firecrawlCalls = 0;
+    let exaCalls = 0;
+    let acquisitions = 0;
+    const acquire = pool.acquire.bind(pool);
+    pool.acquire = (signal) => {
+      acquisitions += 1;
+      if (acquisitions === 3) thirdAcquireStarted.resolve();
+      return acquire(signal);
+    };
+
+    stubWeb(tool, {
+      refreshWebConfig: async () => {},
+      firecrawlSearchPermits: pool,
+      webSearchProviders: [
+        {
+          id: "firecrawl",
+          isConfigured: () => true,
+          search: async () => {
+            firecrawlCalls += 1;
+            if (firecrawlCalls === 2) twoStarted.resolve();
+            await releaseActive.promise;
+            return [];
+          },
+        },
+        {
+          id: "exa",
+          isConfigured: () => true,
+          search: async () => {
+            exaCalls += 1;
+            return [
+              {
+                url: "https://example.com/fallback",
+                title: "Fallback",
+                content: "Search fallback",
+                score: null,
+              },
+            ];
+          },
+        },
+      ],
+    });
+
+    const first = tool.call("search", { query: "first" });
+    const second = tool.call("search", { query: "second" });
+    await twoStarted.promise;
+
+    const third = tool.call("search", { query: "third" });
+    await thirdAcquireStarted.promise;
+    jest.advanceTimersByTime(3_000);
+
+    await expect(third).resolves.toEqual([
+      {
+        url: "https://example.com/fallback",
+        title: "Fallback",
+        content: "Search fallback",
+        score: null,
+      },
+    ]);
+    expect(firecrawlCalls).toBe(2);
+    expect(exaCalls).toBe(1);
+
+    releaseActive.resolve();
+    await Promise.all([first, second]);
+  });
+
+  it("shares Firecrawl permit pools across Web instances", () => {
+    const first = new Web() as unknown as Record<string, unknown>;
+    const second = new Web() as unknown as Record<string, unknown>;
+
+    expect(first.firecrawlFetchPermits).toBe(second.firecrawlFetchPermits);
+    expect(first.firecrawlSearchPermits).toBe(second.firecrawlSearchPermits);
+  });
+
+  it("preserves the active Firecrawl policy when config refresh fails", async () => {
+    const tool = new Web();
+    const fetchPool = new FirecrawlPermitPool("fetch");
+    const searchPool = new FirecrawlPermitPool("search");
+    fetchPool.configure({ maxConcurrency: 1, queueTtlMs: 3_000 });
+    searchPool.configure({ maxConcurrency: 1, queueTtlMs: 3_000 });
+    const active = (await fetchPool.acquire()).match({
+      ok: (permit) => permit,
+      err: (error) => {
+        throw new Error(error.message);
+      },
+    });
+    let queuedAdmitted = false;
+    const queued = fetchPool.acquire().then((result) =>
+      result.match({
+        ok: (permit) => {
+          queuedAdmitted = true;
+          return permit;
+        },
+        err: (error) => {
+          throw new Error(error.message);
+        },
+      }),
+    );
+
+    stubWeb(tool, {
+      firecrawlFetchPermits: fetchPool,
+      firecrawlSearchPermits: searchPool,
+      loadWebToolConfigFromCoreConfig: async () => {
+        throw new Error("config unavailable");
+      },
+    });
+    const refresh = tool as unknown as { refreshWebConfig(): Promise<void> };
+    await refresh.refreshWebConfig();
+    await Promise.resolve();
+    expect(queuedAdmitted).toBe(false);
+
+    active.release();
+    const admitted = await queued;
+    admitted.release();
+  });
+
+  it("does not call Firecrawl or a fallback provider for an aborted search waiter", async () => {
+    const tool = new Web();
+    const pool = new FirecrawlPermitPool("search");
+    pool.configure({ maxConcurrency: 1, queueTtlMs: 3_000 });
+    const firstStarted = deferred();
+    const releaseFirst = deferred();
+    const secondAcquireStarted = deferred();
+    let firecrawlCalls = 0;
+    let exaCalls = 0;
+    let acquisitions = 0;
+    const acquire = pool.acquire.bind(pool);
+    pool.acquire = (signal) => {
+      acquisitions += 1;
+      if (acquisitions === 2) secondAcquireStarted.resolve();
+      return acquire(signal);
+    };
+
+    stubWeb(tool, {
+      refreshWebConfig: async () => {},
+      firecrawlSearchPermits: pool,
+      webSearchProviders: [
+        {
+          id: "firecrawl",
+          isConfigured: () => true,
+          search: async () => {
+            firecrawlCalls += 1;
+            firstStarted.resolve();
+            await releaseFirst.promise;
+            return [];
+          },
+        },
+        {
+          id: "exa",
+          isConfigured: () => true,
+          search: async () => {
+            exaCalls += 1;
+            return [];
+          },
+        },
+      ],
+    });
+
+    const first = tool.call("search", { query: "first" });
+    await firstStarted.promise;
+
+    const controller = new AbortController();
+    const second = tool.call("search", { query: "second" }, { signal: controller.signal });
+    await secondAcquireStarted.promise;
+    controller.abort();
+
+    await expect(second).resolves.toMatchObject({
+      isError: true,
+      error: expect.stringMatching(/aborted/i),
+    });
+    expect(firecrawlCalls).toBe(1);
+    expect(exaCalls).toBe(0);
+
+    releaseFirst.resolve();
+    await first;
+  });
+
+  it("does not enter browser fallback for an aborted Firecrawl fetch waiter", async () => {
+    const mutableFirecrawlEnv = env.tools.web.firecrawl as {
+      apiKey?: string;
+      apiBaseUrl?: string;
+    };
+    mutableFirecrawlEnv.apiKey = "firecrawl-test-key";
+
+    const tool = new Web();
+    const pool = new FirecrawlPermitPool("fetch");
+    pool.configure({ maxConcurrency: 1, queueTtlMs: 3_000 });
+    const active = (await pool.acquire()).match({
+      ok: (permit) => permit,
+      err: (error) => {
+        throw new Error(error.message);
+      },
+    });
+    const queuedAcquireStarted = deferred();
+    let acquisitions = 1;
+    const acquire = pool.acquire.bind(pool);
+    pool.acquire = (signal) => {
+      acquisitions += 1;
+      if (acquisitions === 2) queuedAcquireStarted.resolve();
+      return acquire(signal);
+    };
+    let browserCalls = 0;
+
+    stubWeb(tool, {
+      refreshWebConfig: async () => {},
+      firecrawlFetchPermits: pool,
+      webSearchProviders: [{ id: "firecrawl", isConfigured: () => true, search: async () => [] }],
+      getPageBrowser: async () => {
+        browserCalls += 1;
+        return { isError: true, error: "browser fallback ran" };
+      },
+    });
+
+    const controller = new AbortController();
+    const request = tool.call(
+      "fetch",
+      {
+        url: "https://example.com/queued",
+        mode: "extract",
+      },
+      { signal: controller.signal },
+    );
+    await queuedAcquireStarted.promise;
+    controller.abort();
+
+    await expect(request).resolves.toMatchObject({
+      isError: true,
+      error: expect.stringMatching(/aborted/i),
+    });
+    expect(browserCalls).toBe(0);
+
+    active.release();
+  });
+
+  it("queues Firecrawl fetch calls and falls back when the queue TTL expires", async () => {
+    jest.useFakeTimers({ now: 0 });
+    const requestsStarted = deferred();
+    const releaseRequests = deferred();
+    let firecrawlRequests = 0;
+    const server = startServer(async () => {
+      firecrawlRequests += 1;
+      if (firecrawlRequests === 2) requestsStarted.resolve();
+      await releaseRequests.promise;
+      return Response.json({
+        success: true,
+        data: {
+          markdown: "Firecrawl content",
+          metadata: { sourceURL: "https://example.com/firecrawl" },
+        },
+      });
+    });
+
+    const mutableFirecrawlEnv = env.tools.web.firecrawl as {
+      apiKey?: string;
+      apiBaseUrl?: string;
+    };
+    mutableFirecrawlEnv.apiKey = "firecrawl-test-key";
+    mutableFirecrawlEnv.apiBaseUrl = `http://127.0.0.1:${server.port}`;
+
+    const tool = new Web();
+    const pool = new FirecrawlPermitPool("fetch");
+    pool.configure({ maxConcurrency: 2, queueTtlMs: 3_000 });
+    const thirdAcquireStarted = deferred();
+    let acquisitions = 0;
+    const acquire = pool.acquire.bind(pool);
+    pool.acquire = (signal) => {
+      acquisitions += 1;
+      if (acquisitions === 3) thirdAcquireStarted.resolve();
+      return acquire(signal);
+    };
+
+    stubWeb(tool, {
+      refreshWebConfig: async () => {},
+      firecrawlFetchPermits: pool,
+      webSearchProviders: [
+        { id: "firecrawl", isConfigured: () => true, search: async () => [] },
+        { id: "tavily", isConfigured: () => true, search: async () => [] },
+      ],
+      getTavilyClient: () => ({
+        extract: async () => ({
+          results: [
+            {
+              url: "https://example.com/fallback",
+              title: "Fallback",
+              rawContent: "Fetch fallback",
+            },
+          ],
+        }),
+      }),
+    });
+
+    const first = tool.call("fetch", {
+      url: "https://example.com/first",
+      mode: "provider-only",
+    });
+    const second = tool.call("fetch", {
+      url: "https://example.com/second",
+      mode: "provider-only",
+    });
+    await requestsStarted.promise;
+
+    const third = tool.call("fetch", {
+      url: "https://example.com/third",
+      mode: "provider-only",
+    });
+    await thirdAcquireStarted.promise;
+    jest.advanceTimersByTime(3_000);
+
+    await expect(third).resolves.toMatchObject({
+      isError: false,
+      title: "Fallback",
+      content: "Fetch fallback",
+    });
+    expect(firecrawlRequests).toBe(2);
+
+    releaseRequests.resolve();
+    await Promise.all([first, second]);
   });
 });

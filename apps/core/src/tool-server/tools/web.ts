@@ -11,6 +11,7 @@ import {
   createLogger,
   env,
   errorMessage as getErrorMessage,
+  formatTaggedErrorForLog,
   getCoreConfig,
   isRecord,
 } from "@stanley2058/lilac-utils";
@@ -26,6 +27,14 @@ import {
   type WebSearchProvider,
 } from "./web-search";
 import type { RequestContext } from "../types";
+import {
+  FirecrawlPermitPool,
+  FirecrawlPermitQueueAborted,
+  FirecrawlPermitQueueTimedOut,
+  type FirecrawlPermitFailure,
+  type FirecrawlPermit,
+  type FirecrawlPermitPolicy,
+} from "./web-search/firecrawl-permit-pool";
 
 const getPageModeSchema = z.enum(["auto", "fetch", "browser", "extract", "provider-only"]);
 
@@ -128,6 +137,7 @@ type PageContentSuccess = {
 type PageContentError = {
   isError: true;
   error: string;
+  aborted?: true;
   status?: number;
   contentType?: string | null;
   contentLength?: number | null;
@@ -137,6 +147,9 @@ type WebProviderFailure = {
   providerId: WebSearchProviderId;
   message: string;
 };
+
+const firecrawlFetchPermits = new FirecrawlPermitPool("fetch");
+const firecrawlSearchPermits = new FirecrawlPermitPool("search");
 
 const firecrawlScrapeResponseSchema = z.object({
   success: z.boolean().optional(),
@@ -552,6 +565,8 @@ export class Web implements ServerTool {
   private webSearchProviderError: string | null = null;
   private webSearchProviderKey: string | null = null;
   private webFetchDefaultMode: GetPageMode = "auto";
+  private readonly firecrawlFetchPermits = firecrawlFetchPermits;
+  private readonly firecrawlSearchPermits = firecrawlSearchPermits;
   private turndown = new TurndownService();
   private browserContext: { browser: Browser; context: BrowserContext } | null = null;
   private browserInit: Promise<{
@@ -592,21 +607,27 @@ export class Web implements ServerTool {
   private async loadWebToolConfigFromCoreConfig(): Promise<{
     extractProviders: readonly WebSearchProviderId[];
     fetchMode: GetPageMode;
+    firecrawlPolicy: FirecrawlPermitPolicy | undefined;
   }> {
     const cfg = await getCoreConfig();
     return {
       extractProviders: cfg.tools.web.extract.providers,
       fetchMode: cfg.tools.web.fetch.mode,
+      firecrawlPolicy: cfg.tools.web.firecrawl,
     };
   }
 
   private async refreshWebConfig(): Promise<void> {
     let extractProvidersFromConfig: readonly string[] = [];
     let fetchModeFromConfig: GetPageMode = "auto";
+    let firecrawlPolicyFromConfig: FirecrawlPermitPolicy | undefined;
+    let configReadSucceeded = false;
     try {
       const config = await this.loadWebToolConfigFromCoreConfig();
       extractProvidersFromConfig = config.extractProviders;
       fetchModeFromConfig = config.fetchMode;
+      firecrawlPolicyFromConfig = config.firecrawlPolicy;
+      configReadSucceeded = true;
     } catch (e) {
       const msg = getErrorMessage(e);
       this.logger.logError(`Failed to read core-config.yaml for web tool config: ${msg}`);
@@ -627,6 +648,7 @@ export class Web implements ServerTool {
     const nextKey = JSON.stringify({
       requested: normalizedRequested,
       fetchMode: fetchModeFromConfig,
+      firecrawlPolicy: firecrawlPolicyFromConfig ?? null,
       firecrawlApiBaseUrl: firecrawlApiBaseUrl ?? null,
       hasFirecrawlApiKey: Boolean(firecrawlApiKey),
       exaBaseUrl: exaBaseUrl ?? null,
@@ -636,6 +658,10 @@ export class Web implements ServerTool {
     });
     if (nextKey === this.webSearchProviderKey) return;
     this.webSearchProviderKey = nextKey;
+    if (configReadSucceeded) {
+      this.firecrawlFetchPermits.configure(firecrawlPolicyFromConfig);
+      this.firecrawlSearchPermits.configure(firecrawlPolicyFromConfig);
+    }
 
     const prevIds = this.webSearchProviders.map((provider) => provider.id).join(" -> ") || null;
     const prevFetchMode = this.webFetchDefaultMode;
@@ -796,10 +822,41 @@ export class Web implements ServerTool {
     const failures: WebProviderFailure[] = [];
 
     for (const [index, provider] of this.webSearchProviders.entries()) {
-      try {
-        if (index > 0) {
-          this.logger.logInfo(`web.search retrying with fallback provider '${provider.id}'.`);
+      if (index > 0) {
+        this.logger.logInfo(`web.search retrying with fallback provider '${provider.id}'.`);
+      }
+
+      let permit: FirecrawlPermit | undefined;
+      if (provider.id === "firecrawl") {
+        const acquired = (await this.firecrawlSearchPermits.acquire(opts?.signal)).match<
+          { permit: FirecrawlPermit } | { error: FirecrawlPermitFailure; timedOut: boolean }
+        >({
+          ok: (value) => ({ permit: value }),
+          err: (error) => ({
+            error,
+            timedOut: FirecrawlPermitQueueTimedOut.is(error),
+          }),
+        });
+        if ("error" in acquired) {
+          failures.push({ providerId: provider.id, message: acquired.error.message });
+          if (acquired.timedOut && index < this.webSearchProviders.length - 1) {
+            this.logger.logInfo(
+              `web.search retryable failure (${provider.id}); falling back to next provider.`,
+              formatTaggedErrorForLog(acquired.error),
+            );
+            continue;
+          }
+
+          this.logger.logError(
+            `web.search failed (${provider.id}).`,
+            formatTaggedErrorForLog(acquired.error),
+          );
+          break;
         }
+        permit = acquired.permit;
+      }
+
+      try {
         return await provider.search(input, { signal: opts?.signal });
       } catch (e) {
         const msg = getErrorMessage(e);
@@ -815,6 +872,8 @@ export class Web implements ServerTool {
 
         this.logger.logError(`web.search failed (${provider.id}): ${msg}`);
         break;
+      } finally {
+        permit?.release();
       }
     }
 
@@ -1092,6 +1151,7 @@ export class Web implements ServerTool {
         if (!result.isError) {
           return result;
         }
+        if (result.aborted) return result;
 
         failures.push({ providerId: provider.id, message: result.error });
 
@@ -1153,106 +1213,126 @@ export class Web implements ServerTool {
         const apiBaseUrl = apiBaseUrlRaw
           ? normalizeBaseUrl(apiBaseUrlRaw)
           : "https://api.firecrawl.dev";
-        const timeoutSignal = AbortSignal.timeout(timeout);
-        const signal = AbortSignal.any([timeoutSignal, ...(opts?.signal ? [opts.signal] : [])]);
         const requestedFormats = format === "html" ? ["html"] : ["markdown"];
-
-        const response = await fetch(`${apiBaseUrl}/v2/scrape`, {
-          method: "POST",
-          headers: {
-            Authorization: `Bearer ${apiKey}`,
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({
-            url,
-            formats: requestedFormats,
-            onlyMainContent: true,
-            timeout,
+        const acquired = (await this.firecrawlFetchPermits.acquire(opts?.signal)).match<
+          { permit: FirecrawlPermit } | { error: FirecrawlPermitFailure; aborted: boolean }
+        >({
+          ok: (value) => ({ permit: value }),
+          err: (error) => ({
+            error,
+            aborted: FirecrawlPermitQueueAborted.is(error),
           }),
-          signal,
         });
+        if ("error" in acquired) {
+          return {
+            isError: true,
+            error: acquired.error.message,
+            ...(acquired.aborted ? { aborted: true as const } : {}),
+          };
+        }
 
-        let rawPayload: unknown;
         try {
-          rawPayload = await response.json();
-        } catch {
-          return {
-            isError: true,
-            error: `Firecrawl scrape failed (${response.status}): invalid JSON response.`,
-          };
-        }
-        const decodedPayload = decodeFirecrawlScrapeResponse(rawPayload);
-        const payload = decodedPayload.match({
-          err: () => null,
-          ok: (value) => value,
-        });
-        if (!payload) {
-          return {
-            isError: true,
-            error: `Firecrawl scrape failed (${response.status}): invalid response contract.`,
-          };
-        }
+          const timeoutSignal = AbortSignal.timeout(timeout);
+          const signal = AbortSignal.any([timeoutSignal, ...(opts?.signal ? [opts.signal] : [])]);
+          const response = await fetch(`${apiBaseUrl}/v2/scrape`, {
+            method: "POST",
+            headers: {
+              Authorization: `Bearer ${apiKey}`,
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify({
+              url,
+              formats: requestedFormats,
+              onlyMainContent: true,
+              timeout,
+            }),
+            signal,
+          });
 
-        if (!response.ok || payload.success === false) {
-          return {
-            isError: true,
-            error: `Firecrawl scrape failed (${response.status}): ${response.statusText || "request failed"}`,
-          };
-        }
-
-        if (!payload.data) {
-          return {
-            isError: true,
-            error: "Firecrawl scrape returned no content.",
-          };
-        }
-
-        const resultUrl =
-          payload.data.metadata?.sourceURL?.trim() || payload.data.url?.trim() || url;
-        const title = getFirecrawlTitle(payload, resultUrl);
-
-        if (format === "html") {
-          const html = payload.data.html?.trim();
-          if (!html) {
+          let rawPayload: unknown;
+          try {
+            rawPayload = await response.json();
+          } catch {
             return {
               isError: true,
-              error: "Firecrawl scrape returned no html content.",
+              error: `Firecrawl scrape failed (${response.status}): invalid JSON response.`,
+            };
+          }
+          const decodedPayload = decodeFirecrawlScrapeResponse(rawPayload);
+          const payload = decodedPayload.match({
+            err: () => null,
+            ok: (value) => value,
+          });
+          if (!payload) {
+            return {
+              isError: true,
+              error: `Firecrawl scrape failed (${response.status}): invalid response contract.`,
             };
           }
 
-          const text = simpleHtmlToText(html);
+          if (!response.ok || payload.success === false) {
+            return {
+              isError: true,
+              error: `Firecrawl scrape failed (${response.status}): ${response.statusText || "request failed"}`,
+            };
+          }
+
+          if (!payload.data) {
+            return {
+              isError: true,
+              error: "Firecrawl scrape returned no content.",
+            };
+          }
+
+          const resultUrl =
+            payload.data.metadata?.sourceURL?.trim() || payload.data.url?.trim() || url;
+          const title = getFirecrawlTitle(payload, resultUrl);
+
+          if (format === "html") {
+            const html = payload.data.html?.trim();
+            if (!html) {
+              return {
+                isError: true,
+                error: "Firecrawl scrape returned no html content.",
+              };
+            }
+
+            const text = simpleHtmlToText(html);
+            return {
+              isError: false,
+              content: {
+                url: resultUrl,
+                title,
+                markdown: text,
+                text,
+                raw: html,
+              },
+            };
+          }
+
+          const markdown = payload.data.markdown?.trim() ?? payload.data.content?.trim();
+          if (!markdown) {
+            return {
+              isError: true,
+              error: "Firecrawl scrape returned no content.",
+            };
+          }
+
+          const text = format === "text" ? markdownToText(markdown) : markdown;
+
           return {
             isError: false,
-            content: {
+            content: buildTextContent({
               url: resultUrl,
               title,
-              markdown: text,
               text,
-              raw: html,
-            },
+              markdown,
+              raw: markdown,
+            }),
           };
+        } finally {
+          acquired.permit.release();
         }
-
-        const markdown = payload.data.markdown?.trim() ?? payload.data.content?.trim();
-        if (!markdown) {
-          return {
-            isError: true,
-            error: "Firecrawl scrape returned no content.",
-          };
-        }
-
-        const text = format === "text" ? markdownToText(markdown) : markdown;
-
-        return {
-          isError: false,
-          content: buildTextContent({
-            url: resultUrl,
-            title,
-            text,
-            markdown,
-            raw: markdown,
-          }),
-        };
       }
       case "tavily": {
         if (format === "html") {
@@ -1387,6 +1467,7 @@ export class Web implements ServerTool {
   ) {
     const result = await this.extractPageContent({ ...rest, format }, opts);
     if (result.isError) {
+      if (result.aborted) return result;
       this.logger.logError(`${result.error} Falling back to browser mode.`);
       return await this.getPageBrowser({ ...rest, format, mode: "browser" }, opts);
     }
@@ -1521,6 +1602,8 @@ export class Web implements ServerTool {
         },
         opts,
       );
+
+      if (extractResult.isError && extractResult.aborted) return extractResult;
 
       if (!extractResult.isError && normalizeWhitespace(extractResult.content.text).length > 0) {
         return this.toOutputFormat({

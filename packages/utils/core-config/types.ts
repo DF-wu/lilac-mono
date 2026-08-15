@@ -118,6 +118,10 @@ export type UniversalCoreConfig = {
       fetch: {
         mode: "auto" | "fetch" | "browser" | "extract" | "provider-only";
       };
+      firecrawl?: {
+        maxConcurrency: number;
+        queueTtlMs: number;
+      };
     };
     inspect: {
       model: string;

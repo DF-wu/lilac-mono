@@ -1,6 +1,10 @@
 import { describe, expect, it } from "bun:test";
 
-import { coreConfigSchema } from "../core-config";
+import {
+  coreConfigSchema,
+  parseCoreConfigV1ToUniversal,
+  parseCoreConfigV2ToUniversal,
+} from "../core-config";
 
 describe("coreConfigSchema tools.web.extract.providers", () => {
   it("defaults to tavily", () => {
@@ -120,6 +124,81 @@ describe("coreConfigSchema tools.web.fetch.mode", () => {
     });
 
     expect(parsed.tools.web.extract.providers).toEqual(["firecrawl"]);
+  });
+});
+
+describe("core config tools.web.firecrawl", () => {
+  it("leaves Firecrawl concurrency disabled when the v2 block is absent", () => {
+    const parsed = parseCoreConfigV2ToUniversal({ configVersion: 2 });
+
+    expect(parsed.tools.web.firecrawl).toBeUndefined();
+  });
+
+  it("defaults and parses the opt-in v2 Firecrawl concurrency policy", () => {
+    const defaults = parseCoreConfigV2ToUniversal({
+      configVersion: 2,
+      tools: { web: { firecrawl: {} } },
+    });
+    expect(defaults.tools.web.firecrawl).toEqual({
+      maxConcurrency: 2,
+      queueTtlMs: 3_000,
+    });
+
+    const configured = parseCoreConfigV2ToUniversal({
+      configVersion: 2,
+      tools: {
+        web: {
+          firecrawl: {
+            maxConcurrency: 4,
+            queueTtl: "1500ms",
+          },
+        },
+      },
+    });
+    expect(configured.tools.web.firecrawl).toEqual({
+      maxConcurrency: 4,
+      queueTtlMs: 1_500,
+    });
+  });
+
+  it("rejects invalid v2 Firecrawl concurrency values", () => {
+    for (const firecrawl of [
+      { maxConcurrency: 0, queueTtl: "3s" },
+      { maxConcurrency: 1.5, queueTtl: "3s" },
+      { maxConcurrency: 2, queueTtl: 0 },
+    ]) {
+      expect(() =>
+        parseCoreConfigV2ToUniversal({
+          configVersion: 2,
+          tools: { web: { firecrawl } },
+        }),
+      ).toThrow();
+    }
+  });
+
+  it("keeps Firecrawl concurrency out of the frozen v1 input shape", () => {
+    const unknownKeys: string[][] = [];
+    const parsed = parseCoreConfigV1ToUniversal(
+      {
+        configVersion: 1,
+        tools: {
+          web: {
+            firecrawl: {
+              maxConcurrency: 2,
+              queueTtl: "3s",
+            },
+          },
+        },
+      },
+      {
+        onUnknownKey(path) {
+          unknownKeys.push([...path] as string[]);
+        },
+      },
+    );
+
+    expect(unknownKeys).toEqual([["tools", "web", "firecrawl"]]);
+    expect(parsed.tools.web.firecrawl).toBeUndefined();
   });
 });
 

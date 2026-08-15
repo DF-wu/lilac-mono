@@ -233,8 +233,8 @@ const discordSurfaceSchema = z
     },
   });
 
-const webExtractProviderSchema = z.enum(["tavily", "exa", "firecrawl"]);
-const webFetchModeSchema = z
+export const webExtractProviderSchema = z.enum(["tavily", "exa", "firecrawl"]);
+export const webFetchModeSchema = z
   .enum(["auto", "fetch", "browser", "extract", "provider-only"])
   .default("auto");
 
@@ -249,7 +249,7 @@ function uniqueItems<T>(items: readonly T[]): T[] {
   return unique;
 }
 
-const webExtractProvidersSchema = z
+export const webExtractProvidersSchema = z
   .array(webExtractProviderSchema)
   .min(1)
   .transform((providers) => uniqueItems(providers))
@@ -263,7 +263,7 @@ export function migrateWebExtractConfigValue(value: unknown): unknown {
   return { ...value, providers: [provider] };
 }
 
-const webExtractConfigValueSchema = z.preprocess(
+export const webExtractConfigValueSchema = z.preprocess(
   migrateWebExtractConfigValue,
   z.object({
     providers: webExtractProvidersSchema,
