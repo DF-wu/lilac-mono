@@ -1,310 +1,300 @@
 import { afterEach, describe, expect, it, jest } from "bun:test";
-import { env } from "@stanley2058/lilac-utils";
+import { createLogger } from "@stanley2058/lilac-utils";
 
-import { Web } from "../../src/tool-server/tools/web";
+import { Web, type WebDependencies } from "../../src/tool-server/tools/web";
+import {
+  createDefaultWebSearchProviders,
+  type WebSearchProvider,
+} from "../../src/tool-server/tools/web-search";
 import { FirecrawlPermitPool } from "../../src/tool-server/tools/web-search/firecrawl-permit-pool";
+import {
+  createBrowserPageAcquisition,
+  type BrowserPageAcquisition,
+} from "../../src/tool-server/tools/web/browser-page-acquisition";
+import {
+  createDirectHttpPageAcquisition,
+  type DirectHttpPageAcquisition,
+} from "../../src/tool-server/tools/web/direct-http-page-acquisition";
+import { PageContent, type PageContentResult } from "../../src/tool-server/tools/web/page-content";
+import {
+  DefaultProviderPageExtractor,
+  createProviderPageExtractor,
+  type ProviderPageExtractor,
+  type WebProviderEnvironment,
+} from "../../src/tool-server/tools/web/provider-page-extraction";
 
 const servers: Array<{ stop(force?: boolean): void }> = [];
-const originalFirecrawlApiKey = env.tools.web.firecrawl.apiKey;
-const originalFirecrawlApiBaseUrl = env.tools.web.firecrawl.apiBaseUrl;
 
 afterEach(() => {
   jest.useRealTimers();
-  while (servers.length > 0) {
-    servers.pop()?.stop(true);
-  }
-
-  const mutableFirecrawlEnv = env.tools.web.firecrawl as {
-    apiKey?: string;
-    apiBaseUrl?: string;
-  };
-  mutableFirecrawlEnv.apiKey = originalFirecrawlApiKey;
-  mutableFirecrawlEnv.apiBaseUrl = originalFirecrawlApiBaseUrl;
+  while (servers.length > 0) servers.pop()?.stop(true);
 });
 
 function deferred<T = void>() {
   return Promise.withResolvers<T>();
 }
 
-function startServer(handler: (req: Request) => Response | Promise<Response>) {
-  const server = Bun.serve({
-    port: 0,
-    hostname: "127.0.0.1",
-    fetch: handler,
-  });
+function startServer(handler: (request: Request) => Response | Promise<Response>) {
+  const server = Bun.serve({ port: 0, hostname: "127.0.0.1", fetch: handler });
   servers.push(server);
   return server;
 }
 
-function stubWeb(tool: Web, stub: Record<string, unknown>): void {
-  Object.assign(tool as unknown as Record<string, unknown>, stub);
-}
-
-function callExtractPageContent(
-  tool: Web,
-  input: Record<string, unknown>,
-  opts?: { signal?: AbortSignal },
-): Promise<unknown> {
-  const privateApi = tool as unknown as {
-    extractPageContent: (
-      input: Record<string, unknown>,
-      opts?: { signal?: AbortSignal },
-    ) => Promise<unknown>;
+function content(
+  text: string,
+  params: { title?: string; raw?: string; markdown?: string; url?: string } = {},
+) {
+  return {
+    url: params.url ?? "https://example.com",
+    title: params.title ?? "Example",
+    markdown: params.markdown ?? text,
+    text,
+    raw: params.raw ?? params.markdown ?? text,
   };
-
-  return privateApi.extractPageContent(input, opts);
 }
 
-function callExtractPageContentWithProvider(
-  tool: Web,
-  providerId: string,
-  input: Record<string, unknown>,
-  opts?: { signal?: AbortSignal },
-): Promise<unknown> {
-  const privateApi = tool as unknown as {
-    extractPageContentWithProvider: (
-      providerId: string,
-      input: Record<string, unknown>,
-      opts?: { signal?: AbortSignal },
-    ) => Promise<unknown>;
+const emptyEnvironment: WebProviderEnvironment = {
+  firecrawl: {},
+  exa: {},
+  tavily: {},
+};
+
+const baseWebDependencies: WebDependencies = {
+  createLogger,
+  loadWebToolConfig: async () => ({
+    extractProviders: [],
+    fetchMode: "auto",
+    firecrawlPolicy: undefined,
+  }),
+  getProviderEnvironment: () => emptyEnvironment,
+  createSearchProviders: createDefaultWebSearchProviders,
+  createPageContent: () => new PageContent(),
+  createDirectPageAcquisition: createDirectHttpPageAcquisition,
+  createBrowserPageAcquisition,
+  createProviderPageExtractor,
+  firecrawlFetchPermits: new FirecrawlPermitPool("fetch"),
+  firecrawlSearchPermits: new FirecrawlPermitPool("search"),
+};
+
+function createTool(
+  params: {
+    mode?: "auto" | "fetch" | "browser" | "extract" | "provider-only";
+    providers?: readonly WebSearchProvider[];
+    direct?: DirectHttpPageAcquisition["acquire"];
+    browser?: BrowserPageAcquisition["acquire"];
+    extract?: ProviderPageExtractor["extract"];
+    fetchPermits?: FirecrawlPermitPool;
+    searchPermits?: FirecrawlPermitPool;
+    firecrawlPolicy?: { maxConcurrency: number; queueTtlMs: number };
+    loadWebToolConfig?: WebDependencies["loadWebToolConfig"];
+    getProviderEnvironment?: WebDependencies["getProviderEnvironment"];
+  } = {},
+): Web {
+  const providers = params.providers ?? [];
+  const dependencies: WebDependencies = {
+    ...baseWebDependencies,
+    loadWebToolConfig:
+      params.loadWebToolConfig ??
+      (async () => ({
+        extractProviders: providers.map((provider) => provider.id),
+        fetchMode: params.mode ?? "auto",
+        firecrawlPolicy: params.firecrawlPolicy,
+      })),
+    getProviderEnvironment: params.getProviderEnvironment ?? (() => emptyEnvironment),
+    createSearchProviders: () => providers,
+    createDirectPageAcquisition: () => ({
+      acquire:
+        params.direct ??
+        (async () => ({ isError: true, error: "direct acquisition was not configured" })),
+    }),
+    createBrowserPageAcquisition: () => ({
+      acquire:
+        params.browser ??
+        (async () => ({ isError: true, error: "browser acquisition was not configured" })),
+      destroy: async () => {},
+    }),
+    createProviderPageExtractor: () => ({
+      extract:
+        params.extract ??
+        (async () => ({ isError: true, error: "provider extraction was not configured" })),
+    }),
+    firecrawlFetchPermits: params.fetchPermits ?? new FirecrawlPermitPool("fetch"),
+    firecrawlSearchPermits: params.searchPermits ?? new FirecrawlPermitPool("search"),
   };
-
-  return privateApi.extractPageContentWithProvider(providerId, input, opts);
+  return new Web(dependencies);
 }
 
-describe("web tool fetch", () => {
+function configuredProvider(
+  id: WebSearchProvider["id"],
+  search: WebSearchProvider["search"] = async () => [],
+): WebSearchProvider {
+  return { id, isConfigured: () => true, search };
+}
+
+describe("web tool direct fetch", () => {
   it("propagates abort signals through fetch mode", async () => {
     const server = startServer(async () => {
       // test-wait-justification: keeps the real local HTTP response pending so abort propagation wins the race
       await Bun.sleep(200);
-      return new Response("hello", {
-        headers: {
-          "content-type": "text/plain; charset=utf-8",
-        },
-      });
+      return new Response("hello", { headers: { "content-type": "text/plain; charset=utf-8" } });
     });
-    const tool = new Web();
+    const pageContent = new PageContent();
+    const direct = createDirectHttpPageAcquisition({ pageContent });
+    const tool = createTool({ mode: "fetch", direct: direct.acquire.bind(direct) });
     const controller = new AbortController();
-
-    const promise = tool.call(
+    const pending = tool.call(
       "fetch",
-      {
-        url: `http://127.0.0.1:${server.port}/slow`,
-        mode: "fetch",
-      },
+      { url: `http://127.0.0.1:${server.port}/slow`, mode: "fetch" },
       { signal: controller.signal },
     );
     setTimeout(() => controller.abort(), 10);
 
-    await expect(promise).resolves.toMatchObject({
+    await expect(pending).resolves.toMatchObject({
       isError: true,
       error: expect.stringMatching(/abort/i),
     });
   });
 
   it("rejects unsupported binary content types", async () => {
-    const server = startServer(() => {
-      return new Response("%PDF-1.7", {
-        headers: {
-          "content-type": "application/pdf",
-        },
-      });
+    const server = startServer(
+      () => new Response("%PDF-1.7", { headers: { "content-type": "application/pdf" } }),
+    );
+    const direct = createDirectHttpPageAcquisition({
+      pageContent: new PageContent(),
     });
-    const tool = new Web();
 
     await expect(
-      tool.call("fetch", {
-        url: `http://127.0.0.1:${server.port}/binary`,
-        mode: "fetch",
-      }),
-    ).resolves.toMatchObject({
-      isError: true,
-      contentType: "application/pdf",
-    });
+      direct.acquire({ url: `http://127.0.0.1:${server.port}/binary` }),
+    ).resolves.toMatchObject({ isError: true, contentType: "application/pdf" });
   });
 
   it("rejects oversized responses before buffering them", async () => {
     const oversized = "x".repeat(5 * 1024 * 1024 + 10);
-    const server = startServer(() => {
-      return new Response(oversized, {
-        headers: {
-          "content-type": "text/plain",
-        },
-      });
+    const server = startServer(
+      () => new Response(oversized, { headers: { "content-type": "text/plain" } }),
+    );
+    const direct = createDirectHttpPageAcquisition({
+      pageContent: new PageContent(),
     });
-    const tool = new Web();
+    const browser = jest.fn(
+      async (): Promise<PageContentResult> => ({ isError: true, error: "browser ran" }),
+    );
+    const tool = createTool({ direct: direct.acquire.bind(direct), browser });
 
     await expect(
-      tool.call("fetch", {
-        url: `http://127.0.0.1:${server.port}/oversized`,
-        mode: "fetch",
-      }),
+      tool.call("fetch", { url: `http://127.0.0.1:${server.port}/oversized`, mode: "auto" }),
     ).resolves.toMatchObject({
       isError: true,
       error: expect.stringContaining("response too large"),
     });
+    expect(browser).not.toHaveBeenCalled();
   });
 
   it("falls back to simple extraction for large html pages", async () => {
-    const repeatedScript = "<script>" + "x".repeat(800_000) + "</script>";
     const html = [
-      "<!doctype html>",
-      "<html><head><title>Large Page</title></head><body>",
-      repeatedScript,
-      "<main><h1>Important content</h1><p>Readable fallback text.</p></main>",
-      "</body></html>",
+      "<!doctype html><html><head><title>Large Page</title></head><body>",
+      `<script>${"x".repeat(800_000)}</script>`,
+      "<main><h1>Important content</h1><p>Readable fallback text.</p></main></body></html>",
     ].join("");
-    const server = startServer(() => {
-      return new Response(html, {
-        headers: {
-          "content-type": "text/html; charset=utf-8",
-        },
-      });
+    const server = startServer(
+      () => new Response(html, { headers: { "content-type": "text/html; charset=utf-8" } }),
+    );
+    const direct = createDirectHttpPageAcquisition({
+      pageContent: new PageContent(),
     });
-    const tool = new Web();
 
     await expect(
-      tool.call("fetch", {
-        url: `http://127.0.0.1:${server.port}/large`,
-        mode: "fetch",
-        format: "text",
-      }),
+      direct.acquire({ url: `http://127.0.0.1:${server.port}/large`, format: "text" }),
     ).resolves.toMatchObject({
       isError: false,
-      title: "Large Page",
-      content: expect.stringContaining("Important content"),
+      content: { title: "Large Page", text: expect.stringContaining("Important content") },
     });
   });
+});
 
-  it("auto returns direct markdown from fetch without extra fallbacks", async () => {
-    const tool = new Web();
-    stubWeb(tool, {
-      refreshWebConfig: async () => {},
-      webFetchDefaultMode: "auto",
-      fetchPageContent: async () => ({
-        isError: false,
-        content: {
-          url: "https://example.com",
-          title: "Example",
-          markdown: "# Hello",
-          text: "# Hello",
-          raw: "# Hello",
-        },
-        sourceTruncated: false,
-      }),
-      renderPageContent: async () => {
-        throw new Error("browser fallback should not run");
-      },
-      extractPageContent: async () => {
-        throw new Error("extract fallback should not run");
-      },
+describe("web tool mode orchestration", () => {
+  it("auto returns direct markdown without extra fallbacks", async () => {
+    const browser = jest.fn(async (): Promise<PageContentResult> => {
+      throw new Error("browser fallback should not run");
+    });
+    const extract = jest.fn(async (): Promise<PageContentResult> => {
+      throw new Error("extract fallback should not run");
+    });
+    const tool = createTool({
+      direct: async () => ({ isError: false, content: content("# Hello") }),
+      browser,
+      extract,
     });
 
     await expect(
-      tool.call("fetch", {
-        url: "https://example.com",
-        mode: "auto",
-      }),
+      tool.call("fetch", { url: "https://example.com", mode: "auto" }),
     ).resolves.toMatchObject({
       isError: false,
       title: "Example",
       content: "# Hello",
     });
+    expect(browser).not.toHaveBeenCalled();
+    expect(extract).not.toHaveBeenCalled();
   });
 
-  it("auto escalates from weak fetched html to browser rendering", async () => {
-    const tool = new Web();
-    stubWeb(tool, {
-      refreshWebConfig: async () => {},
-      webFetchDefaultMode: "auto",
-      fetchPageContent: async () => ({
+  it("auto escalates from weak fetched html to strong browser rendering", async () => {
+    const rendered =
+      "Rendered article with useful details and enough substance to keep. It has several sentences and useful context for an agent.\n\nA second paragraph adds even more concrete information so the auto flow treats the rendered page as strong content.";
+    const extract = jest.fn(async (): Promise<PageContentResult> => {
+      throw new Error("extract fallback should not run");
+    });
+    const tool = createTool({
+      direct: async () => ({
         isError: false,
-        content: {
-          url: "https://example.com",
-          title: "Example",
-          markdown: "Loading...",
-          text: "Loading...",
-          raw: '<div id="__next">Loading...</div>',
-        },
+        content: content("Loading...", { raw: '<div id="__next">Loading...</div>' }),
         rawHtml:
           '<html><body><div id="__next">Loading...</div><script>webpack</script></body></html>',
-        sourceTruncated: false,
       }),
-      renderPageContent: async () => ({
+      browser: async () => ({
         isError: false,
-        content: {
-          url: "https://example.com",
+        content: content(rendered, {
           title: "Rendered Example",
-          markdown:
-            "Rendered article with useful details and enough substance to keep. It has several sentences and useful context for an agent.\n\nA second paragraph adds even more concrete information so the auto flow treats the rendered page as strong content.",
-          text: "Rendered article with useful details and enough substance to keep. It has several sentences and useful context for an agent. A second paragraph adds even more concrete information so the auto flow treats the rendered page as strong content.",
-          raw: "<article><p>Rendered article with useful details and enough substance to keep. It has several sentences and useful context for an agent.</p><p>A second paragraph adds even more concrete information so the auto flow treats the rendered page as strong content.</p></article>",
-        },
-        rawHtml:
-          "<html><body><article><p>Rendered article with useful details and enough substance to keep. It has several sentences and useful context for an agent.</p><p>A second paragraph adds even more concrete information so the auto flow treats the rendered page as strong content.</p></article></body></html>",
+          raw: `<article><p>${rendered}</p></article>`,
+        }),
+        rawHtml: `<html><body><article><p>${rendered}</p></article></body></html>`,
       }),
-      extractPageContent: async () => {
-        throw new Error("extract fallback should not run");
-      },
+      extract,
     });
 
     await expect(
-      tool.call("fetch", {
-        url: "https://example.com",
-        mode: "auto",
-        format: "text",
-      }),
+      tool.call("fetch", { url: "https://example.com", mode: "auto", format: "text" }),
     ).resolves.toMatchObject({
       isError: false,
       title: "Rendered Example",
       content: expect.stringContaining("Rendered article"),
     });
+    expect(extract).not.toHaveBeenCalled();
   });
 
-  it("auto escalates to extract after weak browser rendering", async () => {
-    const tool = new Web();
-    stubWeb(tool, {
-      refreshWebConfig: async () => {},
-      webFetchDefaultMode: "auto",
-      fetchPageContent: async () => ({
+  it("auto escalates to a provider after weak browser rendering", async () => {
+    const providers = [configuredProvider("exa")];
+    const tool = createTool({
+      providers,
+      direct: async () => ({
         isError: false,
-        content: {
-          url: "https://example.com",
-          title: "Example",
-          markdown: "Loading...",
-          text: "Loading...",
-          raw: '<div id="__next">Loading...</div>',
-        },
+        content: content("Loading..."),
         rawHtml: '<html><body><div id="__next">Loading...</div></body></html>',
       }),
-      renderPageContent: async () => ({
+      browser: async () => ({
         isError: false,
-        content: {
-          url: "https://example.com",
-          title: "Rendered Example",
-          markdown: "Sign in",
-          text: "Sign in",
-          raw: "<main>Sign in</main>",
-        },
+        content: content("Sign in", { title: "Rendered Example" }),
         rawHtml: "<html><body><main>Sign in</main></body></html>",
       }),
-      extractPageContent: async () => ({
+      extract: async () => ({
         isError: false,
-        content: {
-          url: "https://example.com",
+        content: content("Useful extracted content from the provider.", {
           title: "Extracted Example",
-          markdown: "Useful extracted content from the provider.",
-          text: "Useful extracted content from the provider.",
-          raw: "Useful extracted content from the provider.",
-        },
+        }),
       }),
     });
 
     await expect(
-      tool.call("fetch", {
-        url: "https://example.com",
-        mode: "auto",
-      }),
+      tool.call("fetch", { url: "https://example.com", mode: "auto" }),
     ).resolves.toMatchObject({
       isError: false,
       title: "Extracted Example",
@@ -312,47 +302,28 @@ describe("web tool fetch", () => {
     });
   });
 
-  it("auto prefers parsed browser content when extract is unavailable", async () => {
-    const tool = new Web();
-
-    stubWeb(tool, {
-      refreshWebConfig: async () => {},
-      webFetchDefaultMode: "auto",
-      fetchPageContent: async () => ({
+  it("auto prefers parsed browser content when provider extraction is unavailable", async () => {
+    const rawHtml =
+      '<html><body><main><img src="data:image/svg+xml;base64,abc"><p>Play the kana quiz and review your progress.</p></main></body></html>';
+    const tool = createTool({
+      direct: async () => ({
         isError: false,
-        content: {
-          url: "https://example.com",
-          title: "Example",
-          markdown: "Loading...",
-          text: "Loading...",
-          raw: '<div id="__next">Loading...</div>',
-        },
+        content: content("Loading..."),
         rawHtml: '<html><body><div id="__next">Loading...</div></body></html>',
       }),
-      renderPageContent: async () => ({
+      browser: async () => ({
         isError: false,
-        content: {
-          url: "https://example.com",
+        content: content("Play the kana quiz and review your progress.", {
           title: "Rendered Example",
           markdown:
             "![icon](data:image/svg+xml;base64,abc)\n\nPlay the kana quiz and review your progress.",
-          text: "Play the kana quiz and review your progress.",
-          raw: '<main><img src="data:image/svg+xml;base64,abc"><p>Play the kana quiz and review your progress.</p></main>',
-        },
-        rawHtml:
-          '<html><body><main><img src="data:image/svg+xml;base64,abc"><p>Play the kana quiz and review your progress.</p></main></body></html>',
-      }),
-      extractPageContent: async () => ({
-        isError: true,
-        error: "web.extract is unavailable: no provider configured.",
+        }),
+        rawHtml,
       }),
     });
 
     await expect(
-      tool.call("fetch", {
-        url: "https://example.com",
-        mode: "auto",
-      }),
+      tool.call("fetch", { url: "https://example.com", mode: "auto" }),
     ).resolves.toMatchObject({
       isError: false,
       title: "Rendered Example",
@@ -360,91 +331,85 @@ describe("web tool fetch", () => {
     });
   });
 
-  it("uses configured fetch mode when mode is omitted", async () => {
-    const tool = new Web();
-    stubWeb(tool, {
-      refreshWebConfig: async function (this: Record<string, unknown>) {
-        this.webFetchDefaultMode = "extract";
-      },
-      getPageExtract: async () => ({
+  it("uses the configured mode when mode is omitted", async () => {
+    const direct = jest.fn(
+      async (): Promise<PageContentResult> => ({
         isError: false,
-        title: "Configured Extract",
-        content: "Configured extract content",
-        length: 24,
-        rearTruncated: false,
-        sourceTruncated: false,
+        content: content("direct"),
       }),
-      getPageAuto: async () => {
-        throw new Error("auto mode should not run");
-      },
-      getPageFetch: async () => {
-        throw new Error("fetch mode should not run");
-      },
-      getPageBrowser: async () => {
-        throw new Error("browser mode should not run");
-      },
+    );
+    const extract = jest.fn(
+      async (): Promise<PageContentResult> => ({
+        isError: false,
+        content: content("Configured extract content", { title: "Configured Extract" }),
+      }),
+    );
+    const tool = createTool({
+      mode: "extract",
+      providers: [configuredProvider("exa")],
+      direct,
+      extract,
     });
 
-    await expect(
-      tool.call("fetch", {
-        url: "https://example.com",
-      }),
-    ).resolves.toMatchObject({
+    await expect(tool.call("fetch", { url: "https://example.com" })).resolves.toMatchObject({
       isError: false,
       title: "Configured Extract",
       content: "Configured extract content",
     });
-  });
-
-  it("uses configured provider-only mode when mode is omitted", async () => {
-    const tool = new Web();
-    stubWeb(tool, {
-      refreshWebConfig: async function (this: Record<string, unknown>) {
-        this.webFetchDefaultMode = "provider-only";
-      },
-      getPageProviderOnly: async () => ({
-        isError: false,
-        title: "Configured Provider",
-        content: "Configured provider content",
-        length: 25,
-        rearTruncated: false,
-        sourceTruncated: false,
-      }),
-      getPageAuto: async () => {
-        throw new Error("auto mode should not run");
-      },
-      getPageFetch: async () => {
-        throw new Error("fetch mode should not run");
-      },
-      getPageBrowser: async () => {
-        throw new Error("browser mode should not run");
-      },
-      getPageExtract: async () => {
-        throw new Error("extract mode should not run");
-      },
-    });
-
-    await expect(
-      tool.call("fetch", {
-        url: "https://example.com",
-      }),
-    ).resolves.toMatchObject({
-      isError: false,
-      title: "Configured Provider",
-      content: "Configured provider content",
-    });
+    expect(direct).not.toHaveBeenCalled();
   });
 
   it("provider-only returns provider errors without browser fallback", async () => {
-    const tool = new Web();
-    stubWeb(tool, {
-      refreshWebConfig: async () => {},
-      extractPageContent: async () => ({
+    const browser = jest.fn(
+      async (): Promise<PageContentResult> => ({
         isError: true,
-        error: "provider unavailable",
+        error: "browser fallback ran",
       }),
-      getPageBrowser: async () => {
-        throw new Error("browser fallback should not run");
+    );
+    const tool = createTool({
+      providers: [configuredProvider("exa")],
+      browser,
+      extract: async () => ({ isError: true, error: "provider unavailable" }),
+    });
+
+    await expect(
+      tool.call("fetch", { url: "https://example.com", mode: "provider-only" }),
+    ).resolves.toEqual({ isError: true, error: "provider unavailable" });
+    expect(browser).not.toHaveBeenCalled();
+  });
+
+  it("extract mode falls back to browser after provider failure", async () => {
+    const tool = createTool({
+      providers: [configuredProvider("exa")],
+      extract: async () => ({ isError: true, error: "provider unavailable" }),
+      browser: async () => ({
+        isError: false,
+        content: content("Browser fallback", { title: "Browser" }),
+      }),
+    });
+
+    await expect(
+      tool.call("fetch", { url: "https://example.com", mode: "extract" }),
+    ).resolves.toMatchObject({ isError: false, title: "Browser", content: "Browser fallback" });
+  });
+});
+
+describe("web provider extraction", () => {
+  it("falls through unsupported html providers to Firecrawl", async () => {
+    const calls: string[] = [];
+    const tool = createTool({
+      providers: [configuredProvider("tavily"), configuredProvider("firecrawl")],
+      extract: async (providerId) => {
+        calls.push(providerId);
+        return providerId === "tavily"
+          ? { isError: true, error: "Tavily extract does not support format=html." }
+          : {
+              isError: false,
+              content: content("Firecrawl HTML", {
+                title: "Firecrawl HTML",
+                raw: "<main>Firecrawl HTML</main>",
+              }),
+            };
       },
     });
 
@@ -452,52 +417,6 @@ describe("web tool fetch", () => {
       tool.call("fetch", {
         url: "https://example.com",
         mode: "provider-only",
-      }),
-    ).resolves.toMatchObject({
-      isError: true,
-      error: "provider unavailable",
-    });
-  });
-
-  it("extract html can fall through unsupported providers to Firecrawl", async () => {
-    const tool = new Web();
-    const calls: string[] = [];
-
-    stubWeb(tool, {
-      refreshWebConfig: async () => {},
-      webSearchProviders: [
-        { id: "tavily", isConfigured: () => true, search: async () => [] },
-        { id: "firecrawl", isConfigured: () => true, search: async () => [] },
-      ],
-      extractPageContentWithProvider: async (providerId: string) => {
-        calls.push(providerId);
-        if (providerId === "tavily") {
-          return {
-            isError: true,
-            error: "Tavily extract does not support format=html.",
-          };
-        }
-
-        return {
-          isError: false,
-          content: {
-            url: "https://example.com",
-            title: "Firecrawl HTML",
-            markdown: "Firecrawl HTML",
-            text: "Firecrawl HTML",
-            raw: "<main>Firecrawl HTML</main>",
-          },
-        };
-      },
-      getPageBrowser: async () => {
-        throw new Error("browser fallback should not run");
-      },
-    });
-
-    await expect(
-      tool.call("fetch", {
-        url: "https://example.com",
-        mode: "extract",
         format: "html",
       }),
     ).resolves.toMatchObject({
@@ -509,41 +428,39 @@ describe("web tool fetch", () => {
   });
 
   it("maps Firecrawl scrape payloads for html extraction", async () => {
-    const server = startServer(async (req) => {
-      expect(req.method).toBe("POST");
-      expect(req.headers.get("authorization")).toBe("Bearer firecrawl-test-key");
-
-      const body = (await req.json()) as Record<string, unknown>;
-      expect(body.url).toBe("https://example.com/article");
-      expect(body.formats).toEqual(["html"]);
-      expect(body.timeout).toBe(10000);
-
-      return new Response(
-        JSON.stringify({
-          success: true,
-          data: {
-            html: "<html><body><main>Rendered Firecrawl article</main></body></html>",
-            metadata: {
-              title: "Firecrawl Article",
-              sourceURL: "https://example.com/final-article",
-            },
+    const server = startServer(async (request) => {
+      expect(request.method).toBe("POST");
+      expect(request.headers.get("authorization")).toBe("Bearer firecrawl-test-key");
+      const body = (await request.json()) as Record<string, unknown>;
+      expect(body).toMatchObject({
+        url: "https://example.com/article",
+        formats: ["html"],
+        timeout: 10_000,
+      });
+      return Response.json({
+        success: true,
+        data: {
+          html: "<html><body><main>Rendered Firecrawl article</main></body></html>",
+          metadata: {
+            title: "Firecrawl Article",
+            sourceURL: "https://example.com/final-article",
           },
-        }),
-        { headers: { "content-type": "application/json" } },
-      );
+        },
+      });
+    });
+    const extractor = createProviderPageExtractor({
+      getEnvironment: () => ({
+        ...emptyEnvironment,
+        firecrawl: {
+          apiKey: "firecrawl-test-key",
+          apiBaseUrl: `http://127.0.0.1:${server.port}`,
+        },
+      }),
+      firecrawlPermits: new FirecrawlPermitPool("fetch"),
     });
 
-    const mutableFirecrawlEnv = env.tools.web.firecrawl as {
-      apiKey?: string;
-      apiBaseUrl?: string;
-    };
-    mutableFirecrawlEnv.apiKey = "firecrawl-test-key";
-    mutableFirecrawlEnv.apiBaseUrl = `http://127.0.0.1:${server.port}`;
-
-    const tool = new Web();
-
     await expect(
-      callExtractPageContentWithProvider(tool, "firecrawl", {
+      extractor.extract("firecrawl", {
         url: "https://example.com/article",
         format: "html",
       }),
@@ -557,34 +474,32 @@ describe("web tool fetch", () => {
     });
   });
 
-  it("maps Firecrawl markdown to plain text for text extraction", async () => {
-    const server = startServer(async () => {
-      return new Response(
-        JSON.stringify({
-          success: true,
-          data: {
-            markdown: "# Firecrawl Article\n\n[Useful link](https://example.com)\n\n- Bullet point",
-            metadata: {
-              title: "Firecrawl Text Article",
-              sourceURL: "https://example.com/text-article",
-            },
+  it("maps Firecrawl markdown to plain text", async () => {
+    const server = startServer(() =>
+      Response.json({
+        success: true,
+        data: {
+          markdown: "# Firecrawl Article\n\n[Useful link](https://example.com)\n\n- Bullet point",
+          metadata: {
+            title: "Firecrawl Text Article",
+            sourceURL: "https://example.com/text-article",
           },
-        }),
-        { headers: { "content-type": "application/json" } },
-      );
+        },
+      }),
+    );
+    const extractor = createProviderPageExtractor({
+      getEnvironment: () => ({
+        ...emptyEnvironment,
+        firecrawl: {
+          apiKey: "firecrawl-test-key",
+          apiBaseUrl: `http://127.0.0.1:${server.port}`,
+        },
+      }),
+      firecrawlPermits: new FirecrawlPermitPool("fetch"),
     });
 
-    const mutableFirecrawlEnv = env.tools.web.firecrawl as {
-      apiKey?: string;
-      apiBaseUrl?: string;
-    };
-    mutableFirecrawlEnv.apiKey = "firecrawl-test-key";
-    mutableFirecrawlEnv.apiBaseUrl = `http://127.0.0.1:${server.port}`;
-
-    const tool = new Web();
-
     await expect(
-      callExtractPageContentWithProvider(tool, "firecrawl", {
+      extractor.extract("firecrawl", {
         url: "https://example.com/article",
         format: "text",
       }),
@@ -594,265 +509,175 @@ describe("web tool fetch", () => {
         url: "https://example.com/text-article",
         title: "Firecrawl Text Article",
         text: "Firecrawl Article Useful link Bullet point",
-        markdown: "# Firecrawl Article\n\n[Useful link](https://example.com)\n\n- Bullet point",
       },
     });
   });
 
-  it("preserves sourceTruncated for Exa extract when content is capped by budget", async () => {
-    const tool = new Web();
-    const extractedText = "x".repeat(50_000);
-
-    stubWeb(tool, {
-      refreshWebConfig: async () => {},
-      webSearchProviders: [{ id: "exa", isConfigured: () => true, search: async () => [] }],
-      getExaClient: () => ({
-        getContents: async () => ({
-          results: [
-            {
-              url: "https://example.com",
-              title: "Example",
-              text: extractedText,
-            },
-          ],
-        }),
+  it("preserves provider source truncation in exact output slicing", async () => {
+    const extracted = "x".repeat(50_000);
+    const tool = createTool({
+      providers: [configuredProvider("exa")],
+      extract: async () => ({
+        isError: false,
+        sourceTruncated: true,
+        content: content(extracted),
       }),
     });
 
     await expect(
       tool.call("fetch", {
         url: "https://example.com",
-        mode: "extract",
+        mode: "provider-only",
         maxCharacters: 60_000,
       }),
     ).resolves.toMatchObject({
       isError: false,
-      title: "Example",
       length: 50_000,
       sourceTruncated: true,
     });
   });
 
-  it("applies timeout to Exa extract mode", async () => {
-    const tool = new Web();
-
-    stubWeb(tool, {
-      refreshWebConfig: async () => {},
-      webSearchProviders: [{ id: "exa", isConfigured: () => true, search: async () => [] }],
-      getExaClient: () => ({
-        getContents: async () => {
-          // test-wait-justification: keeps the fake Exa request pending beyond the configured extract timeout
-          await Bun.sleep(50);
-          return {
-            results: [
-              {
-                url: "https://example.com",
-                title: "Example",
-                text: "slow",
-              },
-            ],
-          };
-        },
-      }),
+  it("applies the Exa character budget and reports source truncation", async () => {
+    const requestedBudgets: number[] = [];
+    const extracted = "x".repeat(50_000);
+    const extractor = new DefaultProviderPageExtractor({
+      getEnvironment: () => ({ ...emptyEnvironment, exa: { apiKey: "exa-test-key" } }),
+      firecrawlPermits: new FirecrawlPermitPool("fetch"),
+      fetch,
+      createTavilyClient: () => {
+        throw new Error("Tavily client should not be created");
+      },
+      createExaClient: () =>
+        ({
+          getContents: async (_urls: string[], options: { text: { maxCharacters: number } }) => {
+            requestedBudgets.push(options.text.maxCharacters);
+            return {
+              results: [{ url: "https://example.com", title: "Example", text: extracted }],
+            };
+          },
+        }) as never,
     });
 
     await expect(
-      callExtractPageContent(tool, {
+      extractor.extract("exa", {
         url: "https://example.com",
-        timeout: 10,
+        startOffset: 20_000,
+        maxCharacters: 60_000,
       }),
     ).resolves.toMatchObject({
-      isError: true,
-      error: expect.stringMatching(/abort|timeout|timed out/i),
+      isError: false,
+      sourceTruncated: true,
+      content: { text: extracted },
     });
+    expect(requestedBudgets).toEqual([50_000]);
   });
 
-  it("falls back to the next search provider on retriable errors", async () => {
-    const tool = new Web();
-    const calls: string[] = [];
-
-    stubWeb(tool, {
-      refreshWebConfig: async () => {},
-      webSearchProviders: [
-        {
-          id: "tavily",
-          isConfigured: () => true,
-          search: async () => {
-            calls.push("tavily");
-            throw new Error("credits exhausted for current billing period");
-          },
-        },
-        {
-          id: "exa",
-          isConfigured: () => true,
-          search: async () => {
-            calls.push("exa");
-            return [
-              {
-                url: "https://example.com",
-                title: "Example",
-                content: "Recovered from fallback provider.",
-                score: null,
-              },
-            ];
-          },
-        },
-      ],
-    });
-
-    await expect(tool.call("search", { query: "fallback test" })).resolves.toEqual([
-      {
-        url: "https://example.com",
-        title: "Example",
-        content: "Recovered from fallback provider.",
-        score: null,
+  it("applies timeout to Exa extraction", async () => {
+    const extractor = new DefaultProviderPageExtractor({
+      getEnvironment: () => ({ ...emptyEnvironment, exa: { apiKey: "exa-test-key" } }),
+      firecrawlPermits: new FirecrawlPermitPool("fetch"),
+      fetch,
+      createTavilyClient: () => {
+        throw new Error("Tavily client should not be created");
       },
-    ]);
-    expect(calls).toEqual(["tavily", "exa"]);
-  });
-
-  it("does not fall back on non-retriable search errors", async () => {
-    const tool = new Web();
-    const calls: string[] = [];
-
-    stubWeb(tool, {
-      refreshWebConfig: async () => {},
-      webSearchProviders: [
-        {
-          id: "tavily",
-          isConfigured: () => true,
-          search: async () => {
-            calls.push("tavily");
-            throw new Error("401 unauthorized");
+      createExaClient: () =>
+        ({
+          getContents: async () => {
+            // test-wait-justification: keeps the fake Exa request pending beyond the extraction timeout
+            await Bun.sleep(50);
+            return { results: [] };
           },
-        },
-        {
-          id: "exa",
-          isConfigured: () => true,
-          search: async () => {
-            calls.push("exa");
-            return [];
-          },
-        },
-      ],
+        }) as never,
     });
 
-    await expect(tool.call("search", { query: "no retry" })).resolves.toMatchObject({
+    await expect(
+      extractor.extract("exa", { url: "https://example.com", timeout: 10 }),
+    ).rejects.toThrow(/abort|timeout|timed out/i);
+  });
+
+  it("falls back on retriable extraction errors but not terminal errors", async () => {
+    const calls: string[] = [];
+    const providers = [configuredProvider("tavily"), configuredProvider("exa")];
+    const retriable = createTool({
+      providers,
+      extract: async (providerId) => {
+        calls.push(providerId);
+        if (providerId === "tavily")
+          throw new Error("credits exhausted for current billing period");
+        return { isError: false, content: content("Recovered from fallback provider.") };
+      },
+    });
+    await expect(
+      retriable.call("fetch", { url: "https://example.com", mode: "provider-only" }),
+    ).resolves.toMatchObject({ isError: false, content: "Recovered from fallback provider." });
+    expect(calls).toEqual(["tavily", "exa"]);
+
+    calls.length = 0;
+    const terminal = createTool({
+      providers,
+      extract: async (providerId) => {
+        calls.push(providerId);
+        throw new Error("401 unauthorized");
+      },
+    });
+    await expect(
+      terminal.call("fetch", { url: "https://example.com", mode: "provider-only" }),
+    ).resolves.toEqual({ isError: true, error: "401 unauthorized" });
+    expect(calls).toEqual(["tavily"]);
+  });
+});
+
+describe("web search and permits", () => {
+  it("falls back to the next search provider only on retriable errors", async () => {
+    const calls: string[] = [];
+    const fallback = configuredProvider("exa", async () => {
+      calls.push("exa");
+      return [
+        {
+          url: "https://example.com",
+          title: "Example",
+          content: "Recovered from fallback provider.",
+          score: null,
+        },
+      ];
+    });
+    const retriable = createTool({
+      providers: [
+        configuredProvider("tavily", async () => {
+          calls.push("tavily");
+          throw new Error("credits exhausted for current billing period");
+        }),
+        fallback,
+      ],
+    });
+    await expect(retriable.call("search", { query: "fallback test" })).resolves.toHaveLength(1);
+    expect(calls).toEqual(["tavily", "exa"]);
+
+    calls.length = 0;
+    const terminal = createTool({
+      providers: [
+        configuredProvider("tavily", async () => {
+          calls.push("tavily");
+          throw new Error("401 unauthorized");
+        }),
+        fallback,
+      ],
+    });
+    await expect(terminal.call("search", { query: "no retry" })).resolves.toEqual({
       isError: true,
       error: "401 unauthorized",
     });
     expect(calls).toEqual(["tavily"]);
   });
 
-  it("falls back to the next extract provider on retriable errors", async () => {
-    const tool = new Web();
-    const calls: string[] = [];
-
-    stubWeb(tool, {
-      refreshWebConfig: async () => {},
-      webSearchProviders: [
-        { id: "tavily", isConfigured: () => true, search: async () => [] },
-        { id: "exa", isConfigured: () => true, search: async () => [] },
-      ],
-      getTavilyClient: () => ({
-        extract: async () => {
-          calls.push("tavily");
-          throw new Error("credits exhausted for current billing period");
-        },
-      }),
-      getExaClient: () => ({
-        getContents: async () => {
-          calls.push("exa");
-          return {
-            results: [
-              {
-                url: "https://example.com",
-                title: "Example",
-                text: "Recovered from fallback provider.",
-              },
-            ],
-          };
-        },
-      }),
-      getPageBrowser: async () => {
-        throw new Error("browser fallback should not run");
-      },
-    });
-
-    await expect(
-      tool.call("fetch", {
-        url: "https://example.com",
-        mode: "extract",
-      }),
-    ).resolves.toMatchObject({
-      isError: false,
-      title: "Example",
-      content: "Recovered from fallback provider.",
-    });
-    expect(calls).toEqual(["tavily", "exa"]);
-  });
-
-  it("falls back to the next extract provider on timeout errors", async () => {
-    const tool = new Web();
-    const calls: string[] = [];
-
-    stubWeb(tool, {
-      refreshWebConfig: async () => {},
-      webSearchProviders: [
-        { id: "exa", isConfigured: () => true, search: async () => [] },
-        { id: "tavily", isConfigured: () => true, search: async () => [] },
-      ],
-      getExaClient: () => ({
-        getContents: async () => {
-          calls.push("exa");
-          // test-wait-justification: makes the first extract provider exceed its timeout so fallback is exercised
-          await Bun.sleep(50);
-          return { results: [] };
-        },
-      }),
-      getTavilyClient: () => ({
-        extract: async () => {
-          calls.push("tavily");
-          return {
-            results: [
-              {
-                url: "https://example.com",
-                title: "Example",
-                rawContent: "Recovered after timeout fallback.",
-              },
-            ],
-          };
-        },
-      }),
-      getPageBrowser: async () => {
-        throw new Error("browser fallback should not run");
-      },
-    });
-
-    await expect(
-      tool.call("fetch", {
-        url: "https://example.com",
-        mode: "extract",
-        timeout: 10,
-      }),
-    ).resolves.toMatchObject({
-      isError: false,
-      title: "Example",
-      content: "Recovered after timeout fallback.",
-    });
-    expect(calls).toEqual(["exa", "tavily"]);
-  });
-
-  it("queues Firecrawl search calls and falls back when the queue TTL expires", async () => {
+  it("queues Firecrawl searches and falls back when queue TTL expires", async () => {
     jest.useFakeTimers({ now: 0 });
-    const tool = new Web();
     const pool = new FirecrawlPermitPool("search");
     pool.configure({ maxConcurrency: 2, queueTtlMs: 3_000 });
     const twoStarted = deferred();
     const releaseActive = deferred();
     const thirdAcquireStarted = deferred();
     let firecrawlCalls = 0;
-    let exaCalls = 0;
     let acquisitions = 0;
     const acquire = pool.acquire.bind(pool);
     pool.acquire = (signal) => {
@@ -860,76 +685,182 @@ describe("web tool fetch", () => {
       if (acquisitions === 3) thirdAcquireStarted.resolve();
       return acquire(signal);
     };
-
-    stubWeb(tool, {
-      refreshWebConfig: async () => {},
-      firecrawlSearchPermits: pool,
-      webSearchProviders: [
-        {
-          id: "firecrawl",
-          isConfigured: () => true,
-          search: async () => {
-            firecrawlCalls += 1;
-            if (firecrawlCalls === 2) twoStarted.resolve();
-            await releaseActive.promise;
-            return [];
+    const tool = createTool({
+      searchPermits: pool,
+      firecrawlPolicy: { maxConcurrency: 2, queueTtlMs: 3_000 },
+      providers: [
+        configuredProvider("firecrawl", async () => {
+          firecrawlCalls += 1;
+          if (firecrawlCalls === 2) twoStarted.resolve();
+          await releaseActive.promise;
+          return [];
+        }),
+        configuredProvider("exa", async () => [
+          {
+            url: "https://example.com",
+            title: "Fallback",
+            content: "Search fallback",
+            score: null,
           },
-        },
-        {
-          id: "exa",
-          isConfigured: () => true,
-          search: async () => {
-            exaCalls += 1;
-            return [
-              {
-                url: "https://example.com/fallback",
-                title: "Fallback",
-                content: "Search fallback",
-                score: null,
-              },
-            ];
-          },
-        },
+        ]),
       ],
     });
 
     const first = tool.call("search", { query: "first" });
     const second = tool.call("search", { query: "second" });
     await twoStarted.promise;
-
     const third = tool.call("search", { query: "third" });
     await thirdAcquireStarted.promise;
     jest.advanceTimersByTime(3_000);
-
     await expect(third).resolves.toEqual([
-      {
-        url: "https://example.com/fallback",
-        title: "Fallback",
-        content: "Search fallback",
-        score: null,
-      },
+      { url: "https://example.com", title: "Fallback", content: "Search fallback", score: null },
     ]);
     expect(firecrawlCalls).toBe(2);
-    expect(exaCalls).toBe(1);
-
     releaseActive.resolve();
     await Promise.all([first, second]);
   });
 
-  it("shares Firecrawl permit pools across Web instances", () => {
-    const first = new Web() as unknown as Record<string, unknown>;
-    const second = new Web() as unknown as Record<string, unknown>;
+  it("does not invoke providers for an aborted Firecrawl search waiter", async () => {
+    const pool = new FirecrawlPermitPool("search");
+    pool.configure({ maxConcurrency: 1, queueTtlMs: 3_000 });
+    const firstStarted = deferred();
+    const releaseFirst = deferred();
+    let firecrawlCalls = 0;
+    let fallbackCalls = 0;
+    const tool = createTool({
+      searchPermits: pool,
+      firecrawlPolicy: { maxConcurrency: 1, queueTtlMs: 3_000 },
+      providers: [
+        configuredProvider("firecrawl", async () => {
+          firecrawlCalls += 1;
+          firstStarted.resolve();
+          await releaseFirst.promise;
+          return [];
+        }),
+        configuredProvider("exa", async () => {
+          fallbackCalls += 1;
+          return [];
+        }),
+      ],
+    });
 
-    expect(first.firecrawlFetchPermits).toBe(second.firecrawlFetchPermits);
-    expect(first.firecrawlSearchPermits).toBe(second.firecrawlSearchPermits);
+    const first = tool.call("search", { query: "first" });
+    await firstStarted.promise;
+    const controller = new AbortController();
+    const second = tool.call("search", { query: "second" }, { signal: controller.signal });
+    controller.abort();
+    await expect(second).resolves.toMatchObject({
+      isError: true,
+      error: expect.stringMatching(/aborted/i),
+    });
+    expect(firecrawlCalls).toBe(1);
+    expect(fallbackCalls).toBe(0);
+    releaseFirst.resolve();
+    await first;
   });
 
-  it("preserves the active Firecrawl policy when config refresh fails", async () => {
-    const tool = new Web();
+  it("falls back after a Firecrawl fetch queue timeout", async () => {
+    jest.useFakeTimers({ now: 0 });
+    const pool = new FirecrawlPermitPool("fetch");
+    pool.configure({ maxConcurrency: 1, queueTtlMs: 3_000 });
+    const active = (await pool.acquire()).match({
+      ok: (permit) => permit,
+      err: (error) => {
+        throw new Error(error.message);
+      },
+    });
+    const acquireStarted = deferred();
+    const acquire = pool.acquire.bind(pool);
+    pool.acquire = (signal) => {
+      acquireStarted.resolve();
+      return acquire(signal);
+    };
+    const extractor = createProviderPageExtractor({
+      getEnvironment: () => ({
+        ...emptyEnvironment,
+        firecrawl: { apiKey: "firecrawl-test-key" },
+      }),
+      firecrawlPermits: pool,
+    });
+    const calls: string[] = [];
+    const tool = createTool({
+      fetchPermits: pool,
+      firecrawlPolicy: { maxConcurrency: 1, queueTtlMs: 3_000 },
+      providers: [configuredProvider("firecrawl"), configuredProvider("exa")],
+      extract: async (providerId, input, opts) => {
+        calls.push(providerId);
+        if (providerId === "firecrawl") return extractor.extract(providerId, input, opts);
+        return { isError: false, content: content("Fetch fallback", { title: "Fallback" }) };
+      },
+    });
+
+    const pending = tool.call("fetch", {
+      url: "https://example.com",
+      mode: "provider-only",
+    });
+    await acquireStarted.promise;
+    jest.advanceTimersByTime(3_000);
+    await expect(pending).resolves.toMatchObject({
+      isError: false,
+      title: "Fallback",
+      content: "Fetch fallback",
+    });
+    expect(calls).toEqual(["firecrawl", "exa"]);
+    active.release();
+  });
+
+  it("does not enter browser fallback for an aborted Firecrawl fetch waiter", async () => {
+    const pool = new FirecrawlPermitPool("fetch");
+    pool.configure({ maxConcurrency: 1, queueTtlMs: 3_000 });
+    const active = (await pool.acquire()).match({
+      ok: (permit) => permit,
+      err: (error) => {
+        throw new Error(error.message);
+      },
+    });
+    const acquireStarted = deferred();
+    const acquire = pool.acquire.bind(pool);
+    pool.acquire = (signal) => {
+      acquireStarted.resolve();
+      return acquire(signal);
+    };
+    const extractor = createProviderPageExtractor({
+      getEnvironment: () => ({
+        ...emptyEnvironment,
+        firecrawl: { apiKey: "firecrawl-test-key" },
+      }),
+      firecrawlPermits: pool,
+    });
+    const browser = jest.fn(
+      async (): Promise<PageContentResult> => ({ isError: true, error: "browser ran" }),
+    );
+    const tool = createTool({
+      fetchPermits: pool,
+      firecrawlPolicy: { maxConcurrency: 1, queueTtlMs: 3_000 },
+      providers: [configuredProvider("firecrawl")],
+      browser,
+      extract: (providerId, input, opts) => extractor.extract(providerId, input, opts),
+    });
+    const controller = new AbortController();
+    const pending = tool.call(
+      "fetch",
+      { url: "https://example.com", mode: "extract" },
+      { signal: controller.signal },
+    );
+    await acquireStarted.promise;
+    controller.abort();
+
+    await expect(pending).resolves.toMatchObject({
+      isError: true,
+      error: expect.stringMatching(/aborted/i),
+    });
+    expect(browser).not.toHaveBeenCalled();
+    active.release();
+  });
+
+  it("preserves active Firecrawl policy when config refresh fails", async () => {
     const fetchPool = new FirecrawlPermitPool("fetch");
-    const searchPool = new FirecrawlPermitPool("search");
     fetchPool.configure({ maxConcurrency: 1, queueTtlMs: 3_000 });
-    searchPool.configure({ maxConcurrency: 1, queueTtlMs: 3_000 });
     const active = (await fetchPool.acquire()).match({
       ok: (permit) => permit,
       err: (error) => {
@@ -948,224 +879,53 @@ describe("web tool fetch", () => {
         },
       }),
     );
-
-    stubWeb(tool, {
-      firecrawlFetchPermits: fetchPool,
-      firecrawlSearchPermits: searchPool,
-      loadWebToolConfigFromCoreConfig: async () => {
+    const tool = createTool({
+      fetchPermits: fetchPool,
+      loadWebToolConfig: async () => {
         throw new Error("config unavailable");
       },
     });
-    const refresh = tool as unknown as { refreshWebConfig(): Promise<void> };
-    await refresh.refreshWebConfig();
+
+    await tool.call("fetch", { url: "https://example.com", mode: "fetch" });
     await Promise.resolve();
     expect(queuedAdmitted).toBe(false);
-
     active.release();
     const admitted = await queued;
     admitted.release();
   });
 
-  it("does not call Firecrawl or a fallback provider for an aborted search waiter", async () => {
-    const tool = new Web();
-    const pool = new FirecrawlPermitPool("search");
-    pool.configure({ maxConcurrency: 1, queueTtlMs: 3_000 });
-    const firstStarted = deferred();
-    const releaseFirst = deferred();
-    const secondAcquireStarted = deferred();
-    let firecrawlCalls = 0;
-    let exaCalls = 0;
-    let acquisitions = 0;
-    const acquire = pool.acquire.bind(pool);
-    pool.acquire = (signal) => {
-      acquisitions += 1;
-      if (acquisitions === 2) secondAcquireStarted.resolve();
-      return acquire(signal);
-    };
-
-    stubWeb(tool, {
-      refreshWebConfig: async () => {},
-      firecrawlSearchPermits: pool,
-      webSearchProviders: [
-        {
-          id: "firecrawl",
-          isConfigured: () => true,
-          search: async () => {
-            firecrawlCalls += 1;
-            firstStarted.resolve();
-            await releaseFirst.promise;
-            return [];
-          },
-        },
-        {
-          id: "exa",
-          isConfigured: () => true,
-          search: async () => {
-            exaCalls += 1;
-            return [];
-          },
-        },
-      ],
-    });
-
-    const first = tool.call("search", { query: "first" });
-    await firstStarted.promise;
-
-    const controller = new AbortController();
-    const second = tool.call("search", { query: "second" }, { signal: controller.signal });
-    await secondAcquireStarted.promise;
-    controller.abort();
-
-    await expect(second).resolves.toMatchObject({
-      isError: true,
-      error: expect.stringMatching(/aborted/i),
-    });
-    expect(firecrawlCalls).toBe(1);
-    expect(exaCalls).toBe(0);
-
-    releaseFirst.resolve();
-    await first;
-  });
-
-  it("does not enter browser fallback for an aborted Firecrawl fetch waiter", async () => {
-    const mutableFirecrawlEnv = env.tools.web.firecrawl as {
-      apiKey?: string;
-      apiBaseUrl?: string;
-    };
-    mutableFirecrawlEnv.apiKey = "firecrawl-test-key";
-
-    const tool = new Web();
-    const pool = new FirecrawlPermitPool("fetch");
-    pool.configure({ maxConcurrency: 1, queueTtlMs: 3_000 });
-    const active = (await pool.acquire()).match({
-      ok: (permit) => permit,
-      err: (error) => {
-        throw new Error(error.message);
+  it("creates browser and provider state per Web while sharing injected permit pools", () => {
+    const browsers: BrowserPageAcquisition[] = [];
+    const extractors: ProviderPageExtractor[] = [];
+    const observedPools: FirecrawlPermitPool[] = [];
+    const sharedFetchPermits = new FirecrawlPermitPool("fetch");
+    const dependencies: WebDependencies = {
+      ...baseWebDependencies,
+      firecrawlFetchPermits: sharedFetchPermits,
+      createBrowserPageAcquisition: () => {
+        const browser = {
+          acquire: async (): Promise<PageContentResult> => ({ isError: true, error: "unused" }),
+          destroy: async () => {},
+        };
+        browsers.push(browser);
+        return browser;
       },
-    });
-    const queuedAcquireStarted = deferred();
-    let acquisitions = 1;
-    const acquire = pool.acquire.bind(pool);
-    pool.acquire = (signal) => {
-      acquisitions += 1;
-      if (acquisitions === 2) queuedAcquireStarted.resolve();
-      return acquire(signal);
-    };
-    let browserCalls = 0;
-
-    stubWeb(tool, {
-      refreshWebConfig: async () => {},
-      firecrawlFetchPermits: pool,
-      webSearchProviders: [{ id: "firecrawl", isConfigured: () => true, search: async () => [] }],
-      getPageBrowser: async () => {
-        browserCalls += 1;
-        return { isError: true, error: "browser fallback ran" };
+      createProviderPageExtractor: ({ firecrawlPermits }) => {
+        const extractor = {
+          extract: async (): Promise<PageContentResult> => ({ isError: true, error: "unused" }),
+        };
+        observedPools.push(firecrawlPermits);
+        extractors.push(extractor);
+        return extractor;
       },
-    });
-
-    const controller = new AbortController();
-    const request = tool.call(
-      "fetch",
-      {
-        url: "https://example.com/queued",
-        mode: "extract",
-      },
-      { signal: controller.signal },
-    );
-    await queuedAcquireStarted.promise;
-    controller.abort();
-
-    await expect(request).resolves.toMatchObject({
-      isError: true,
-      error: expect.stringMatching(/aborted/i),
-    });
-    expect(browserCalls).toBe(0);
-
-    active.release();
-  });
-
-  it("queues Firecrawl fetch calls and falls back when the queue TTL expires", async () => {
-    jest.useFakeTimers({ now: 0 });
-    const requestsStarted = deferred();
-    const releaseRequests = deferred();
-    let firecrawlRequests = 0;
-    const server = startServer(async () => {
-      firecrawlRequests += 1;
-      if (firecrawlRequests === 2) requestsStarted.resolve();
-      await releaseRequests.promise;
-      return Response.json({
-        success: true,
-        data: {
-          markdown: "Firecrawl content",
-          metadata: { sourceURL: "https://example.com/firecrawl" },
-        },
-      });
-    });
-
-    const mutableFirecrawlEnv = env.tools.web.firecrawl as {
-      apiKey?: string;
-      apiBaseUrl?: string;
-    };
-    mutableFirecrawlEnv.apiKey = "firecrawl-test-key";
-    mutableFirecrawlEnv.apiBaseUrl = `http://127.0.0.1:${server.port}`;
-
-    const tool = new Web();
-    const pool = new FirecrawlPermitPool("fetch");
-    pool.configure({ maxConcurrency: 2, queueTtlMs: 3_000 });
-    const thirdAcquireStarted = deferred();
-    let acquisitions = 0;
-    const acquire = pool.acquire.bind(pool);
-    pool.acquire = (signal) => {
-      acquisitions += 1;
-      if (acquisitions === 3) thirdAcquireStarted.resolve();
-      return acquire(signal);
     };
 
-    stubWeb(tool, {
-      refreshWebConfig: async () => {},
-      firecrawlFetchPermits: pool,
-      webSearchProviders: [
-        { id: "firecrawl", isConfigured: () => true, search: async () => [] },
-        { id: "tavily", isConfigured: () => true, search: async () => [] },
-      ],
-      getTavilyClient: () => ({
-        extract: async () => ({
-          results: [
-            {
-              url: "https://example.com/fallback",
-              title: "Fallback",
-              rawContent: "Fetch fallback",
-            },
-          ],
-        }),
-      }),
-    });
-
-    const first = tool.call("fetch", {
-      url: "https://example.com/first",
-      mode: "provider-only",
-    });
-    const second = tool.call("fetch", {
-      url: "https://example.com/second",
-      mode: "provider-only",
-    });
-    await requestsStarted.promise;
-
-    const third = tool.call("fetch", {
-      url: "https://example.com/third",
-      mode: "provider-only",
-    });
-    await thirdAcquireStarted.promise;
-    jest.advanceTimersByTime(3_000);
-
-    await expect(third).resolves.toMatchObject({
-      isError: false,
-      title: "Fallback",
-      content: "Fetch fallback",
-    });
-    expect(firecrawlRequests).toBe(2);
-
-    releaseRequests.resolve();
-    await Promise.all([first, second]);
+    new Web(dependencies);
+    new Web(dependencies);
+    expect(browsers).toHaveLength(2);
+    expect(browsers[0]).not.toBe(browsers[1]);
+    expect(extractors).toHaveLength(2);
+    expect(extractors[0]).not.toBe(extractors[1]);
+    expect(observedPools).toEqual([sharedFetchPermits, sharedFetchPermits]);
   });
 });

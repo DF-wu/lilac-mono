@@ -1013,14 +1013,21 @@ const CORE_TOOL_SERVER_BOUNDARY_DECODERS = [
     category: "wire",
   },
   ...[
+    "captureWebConfigFailure",
     "getNumericField",
     "getErrorStatus",
     "isRetriableWebProviderError",
-    "decodeFirecrawlScrapeResponse",
   ].map((exportName) => ({
     identity: { module: "src/tool-server/tools/web.ts", exportName },
     category: "projection" as const,
   })),
+  {
+    identity: {
+      module: "src/tool-server/tools/web/provider-page-extraction.ts",
+      exportName: "decodeFirecrawlScrapeResponse",
+    },
+    category: "projection",
+  },
   {
     identity: {
       module: "src/tool-server/tools/onboarding.ts",
@@ -8269,7 +8276,7 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
               exportName: "FirecrawlPermitPool.acquire",
             },
             {
-              module: "src/tool-server/tools/web.ts",
+              module: "src/tool-server/tools/web/provider-page-extraction.ts",
               exportName: "decodeFirecrawlScrapeResponse",
             },
             {
@@ -8737,7 +8744,7 @@ function approvedExceptionAdapterCatalogSha256(
 }
 
 export const APPROVED_EXCEPTION_ADAPTER_CATALOG_SHA256 =
-  "ac14885c848d8774ee1457f55a7a3b827c3f1d755df12017a67b1897b4ce462d";
+  "c8fb58d1fe9c5b9314b7c8feaceacf12d8322d3a940415e56c55d38b07e04334";
 
 export const architectureManifest = {
   version: 1,
