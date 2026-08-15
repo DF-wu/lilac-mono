@@ -67,6 +67,9 @@ conversation:
       # inherits conversation.thread.summarization.model. Accepts main, fast,
       # a models.def alias, or a direct provider/model ref.
       plannerModel: fast
+      # Optional model used instead of plannerModel when the composed user input
+      # contains only text. Accepts the same model values as plannerModel.
+      # textPlannerModel: fast
       # Minimum authored text mass after removing URLs, Discord syntax, punctuation,
       # and discounting code blocks. 80 is a moderate Discord default.
       minTextUnits: 80

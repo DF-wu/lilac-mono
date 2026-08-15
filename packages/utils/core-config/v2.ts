@@ -446,6 +446,7 @@ const conversationSchemaV2 = z
           .object({
             enabled: z.boolean().default(false),
             plannerModel: z.string().trim().min(1).optional(),
+            textPlannerModel: z.string().trim().min(1).optional(),
             minTextUnits: z.number().int().positive().default(80),
             followUpMinTextUnits: z.number().int().positive().default(110),
             limit: z.number().int().positive().max(10).default(3),

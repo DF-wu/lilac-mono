@@ -76,6 +76,9 @@ New v2 fields:
   metadata injection.
 - `conversation.thread.autoInject.plannerModel`: optional model used for request-time auto-inject query
   planning; when unset, it inherits `conversation.thread.summarization.model`.
+- `conversation.thread.autoInject.textPlannerModel`: optional model used instead of `plannerModel` when
+  the composed request input contains only text. Image, PDF, and other non-text input continues to use
+  `plannerModel`; when unset, all requests retain the existing planner selection.
 - `conversation.thread.autoInject.minTextUnits`: minimum authored text mass before auto-injecting
   conversation thread metadata; defaults to `80`.
 - `conversation.thread.autoInject.followUpMinTextUnits`: higher text-mass threshold after prior

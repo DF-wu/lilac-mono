@@ -18,6 +18,7 @@ import {
   ConversationThreadService as RuntimeConversationThreadService,
   ConversationThreadSummaryParseError,
   filterUtilityModelAttachments,
+  selectAutoInjectPlannerModel,
 } from "../../src/conversation/thread-service";
 import { ConversationThreadSummarizationRemoteError } from "../../src/conversation/thread-worker";
 import type { ConversationThreadEmbeddingAdapter } from "../../src/conversation/thread-embedding";
@@ -2626,6 +2627,60 @@ describe("conversation thread store", () => {
     expect(serialized).not.toContain("maxItems");
     expect(instructions).toContain("You must produce 1-3 searches");
     expect(instructions).toContain("Each search must contain 1-3 non-empty query variants");
+  });
+
+  it("uses the text planner only for text-only auto-inject input", () => {
+    const cfg = testConfig();
+    cfg.conversation.thread.autoInject = {
+      ...cfg.conversation.thread.autoInject,
+      plannerModel: "openai/gpt-5.6-luna",
+      textPlannerModel: "openai/gpt-5.3-codex-spark",
+    };
+
+    expect(selectAutoInjectPlannerModel(cfg)).toEqual({
+      model: "openai/gpt-5.3-codex-spark",
+      source: "conversation.thread.autoInject.textPlannerModel",
+    });
+    expect(selectAutoInjectPlannerModel(cfg, "plain text")).toEqual({
+      model: "openai/gpt-5.3-codex-spark",
+      source: "conversation.thread.autoInject.textPlannerModel",
+    });
+    expect(
+      selectAutoInjectPlannerModel(cfg, [
+        { type: "text", text: "multipart text" },
+        { type: "text", text: "more text" },
+      ]),
+    ).toEqual({
+      model: "openai/gpt-5.3-codex-spark",
+      source: "conversation.thread.autoInject.textPlannerModel",
+    });
+    expect(
+      selectAutoInjectPlannerModel(cfg, [
+        { type: "text", text: "see image" },
+        {
+          type: "file",
+          data: new Uint8Array([1, 2, 3]),
+          filename: "diagram.png",
+          mediaType: "image/png",
+        },
+      ]),
+    ).toEqual({
+      model: "openai/gpt-5.6-luna",
+      source: "conversation.thread.autoInject.plannerModel",
+    });
+  });
+
+  it("retains plannerModel for text input when textPlannerModel is unset", () => {
+    const cfg = testConfig();
+    cfg.conversation.thread.autoInject = {
+      ...cfg.conversation.thread.autoInject,
+      plannerModel: "openai/gpt-5.6-luna",
+    };
+
+    expect(selectAutoInjectPlannerModel(cfg, "plain text")).toEqual({
+      model: "openai/gpt-5.6-luna",
+      source: "conversation.thread.autoInject.plannerModel",
+    });
   });
 
   it("truncates overlong auto-inject search groups and query variants", async () => {

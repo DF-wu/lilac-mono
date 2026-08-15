@@ -165,6 +165,7 @@ export type UniversalCoreConfig = {
       autoInject: {
         enabled: boolean;
         plannerModel?: string;
+        textPlannerModel?: string;
         minTextUnits: number;
         followUpMinTextUnits: number;
         limit: number;

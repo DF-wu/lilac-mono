@@ -1215,15 +1215,41 @@ function resolveSummarizationModel(cfg: CoreConfig) {
   return resolveModelRefResult(cfg, { model }, "conversation.thread.summarization.model");
 }
 
-function resolveAutoInjectPlannerModel(cfg: CoreConfig) {
-  const plannerModel = cfg.conversation.thread.autoInject.plannerModel?.trim();
-  if (!plannerModel) return resolveSummarizationModel(cfg);
+export function selectAutoInjectPlannerModel(
+  cfg: CoreConfig,
+  content?: UserContent,
+): { model: string; source: string } | null {
+  const autoInject = cfg.conversation.thread.autoInject;
+  const isTextOnly =
+    content === undefined ||
+    typeof content === "string" ||
+    content.every((part) => part.type === "text");
+  const textPlannerModel = isTextOnly ? autoInject.textPlannerModel?.trim() : undefined;
+  if (textPlannerModel) {
+    return {
+      model: textPlannerModel,
+      source: "conversation.thread.autoInject.textPlannerModel",
+    };
+  }
 
-  const model = plannerModel;
+  const plannerModel = autoInject.plannerModel?.trim();
+  return plannerModel
+    ? {
+        model: plannerModel,
+        source: "conversation.thread.autoInject.plannerModel",
+      }
+    : null;
+}
+
+function resolveAutoInjectPlannerModel(cfg: CoreConfig, content?: UserContent) {
+  const selected = selectAutoInjectPlannerModel(cfg, content);
+  if (!selected) return resolveSummarizationModel(cfg);
+
+  const { model } = selected;
   if (model === "main" || model === "fast") {
     return resolveModelSlotResult(cfg, model);
   }
-  return resolveModelRefResult(cfg, { model }, "conversation.thread.autoInject.plannerModel");
+  return resolveModelRefResult(cfg, { model }, selected.source);
 }
 
 function shouldAllowDiscordThread(
@@ -1482,7 +1508,7 @@ async function defaultAutoInjectQueryPlanner(input: {
   text: string;
   content?: UserContent;
 }): Promise<ResultType<ConversationThreadAutoInjectQueryPlan, ConversationThreadGenerationError>> {
-  const resolvedResult = resolveAutoInjectPlannerModel(input.cfg);
+  const resolvedResult = resolveAutoInjectPlannerModel(input.cfg, input.content);
   const resolvedError = resultErrorOrNull(resolvedResult);
   if (resolvedError) return Result.err(resolvedError);
   const resolved = selectResultValue(resolvedResult);

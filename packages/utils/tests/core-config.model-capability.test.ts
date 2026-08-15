@@ -52,7 +52,7 @@ describe("coreConfigSchema models.capability", () => {
     });
   });
 
-  it("accepts conversation thread auto inject planner model override", () => {
+  it("accepts conversation thread auto inject planner model overrides", () => {
     const parsed = coreConfigInputSchemaV2.parse({
       configVersion: 2,
       conversation: {
@@ -60,6 +60,7 @@ describe("coreConfigSchema models.capability", () => {
           autoInject: {
             enabled: true,
             plannerModel: "openrouter/openai/gpt-4o-mini",
+            textPlannerModel: "openai/gpt-5.3-codex-spark",
             minTextUnits: 120,
             followUpMinTextUnits: 150,
             limit: 4,
@@ -74,6 +75,7 @@ describe("coreConfigSchema models.capability", () => {
     expect(parsed.conversation.thread.autoInject).toEqual({
       enabled: true,
       plannerModel: "openrouter/openai/gpt-4o-mini",
+      textPlannerModel: "openai/gpt-5.3-codex-spark",
       minTextUnits: 120,
       followUpMinTextUnits: 150,
       limit: 4,
