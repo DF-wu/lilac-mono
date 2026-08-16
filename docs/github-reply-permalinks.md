@@ -65,22 +65,17 @@ correct issue or pull request without emitting an invalid anchor.
 
 ## Validation
 
-The implementation is covered by `apps/core/tests/github/github-ids.test.ts`,
-including comment permalinks, issue and pull request body permalinks, and the
-missing-body-ID fallback. The tool-server surface fixture also includes the
-new `getIssue().id` field.
+The URL helper is covered by `apps/core/tests/github/github-ids.test.ts`.
+`apps/core/tests/surface/github/github-output-stream.test.ts` additionally
+covers the production output path: body replies look up the issue database ID,
+comment replies avoid that lookup, and failed body lookups fall back to the
+thread URL. The adapter contract suite verifies the injected GitHub API boundary.
 
-Validated on the feature branch:
+Current validation on `main`:
 
-- `bun test ./apps/core/tests/github/github-ids.test.ts ./apps/core/tests/tool-server-surface.test.ts` — 49 passed
+- focused GitHub helper, output-stream, and adapter tests — 36 passed
 - `bunx tsc -p apps/core/tsconfig.json --noEmit` — passed
 - `bun run fmt:check` — passed
-- Earlier focused validation — 61 passed; Oxlint reported 0 warnings and 0 errors
-
-A later lint rerun was blocked before source analysis because the local Node
-runtime could not load `scripts/oxlint-plugins/test-waits.mts`
-(`ERR_UNKNOWN_FILE_EXTENSION`). This is an environment/tooling limitation, not
-a source diagnostic.
 
 ## Future Schema Option
 

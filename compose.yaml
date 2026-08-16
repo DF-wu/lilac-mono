@@ -33,7 +33,7 @@ services:
       NPM_CONFIG_PREFIX: ${NPM_CONFIG_PREFIX:-/data/.npm-global}
       XDG_CONFIG_HOME: ${LILAC_XDG_CONFIG_HOME:-/data/.config}
     ports:
-      - "8080:8080"
+      - "127.0.0.1:8080:8080"
     volumes:
       - ./data:/data
       - ./home/agents:/home/lilac/.agents
