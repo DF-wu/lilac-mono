@@ -31,6 +31,14 @@ type AsyncCaptureFailure = {
   readonly cause: unknown;
 };
 
+type CallbackFailureA = {
+  readonly _tag: "CallbackFailureA";
+};
+
+type CallbackFailureB = {
+  readonly _tag: "CallbackFailureB";
+};
+
 class MissingValue extends TaggedError("MissingValue")<{
   key: string;
   message: string;
@@ -103,6 +111,16 @@ function mapSyncCaptureFailure(cause: unknown): SyncCaptureFailure {
 
 function mapAsyncCaptureFailure(cause: unknown): AsyncCaptureFailure {
   return { _tag: "AsyncCaptureFailure", cause };
+}
+
+function widenedError<E>(error: E): ResultType<never, E> {
+  return Result.err(error);
+}
+
+function callbackFailure(value: number) {
+  return value > 0
+    ? widenedError<CallbackFailureA>({ _tag: "CallbackFailureA" })
+    : widenedError<CallbackFailureB>({ _tag: "CallbackFailureB" });
 }
 
 function superviseDefect(operation: () => void, observe: (defect: Panic) => void): void {
@@ -197,6 +215,29 @@ describe("better-result compatibility preflight", () => {
 
     expect(asyncInference).toBe(true);
     expect(asyncResult).toEqual(Result.ok(42));
+  });
+
+  it("preserves widened callback Result lanes across composition", async () => {
+    const chainable = (): ResultType<number, ReadFailure> => Result.ok(1);
+    const chained = chainable().andThen(callbackFailure);
+    const chainedAsync = chainable().andThenAsync(async (value) => callbackFailure(value));
+
+    type ChainedInference = Expect<
+      Equal<typeof chained, ResultType<never, ReadFailure | CallbackFailureA | CallbackFailureB>>
+    >;
+    type ChainedAsyncInference = Expect<
+      Equal<
+        typeof chainedAsync,
+        Promise<ResultType<never, ReadFailure | CallbackFailureA | CallbackFailureB>>
+      >
+    >;
+    const chainedInference: ChainedInference = true;
+    const chainedAsyncInference: ChainedAsyncInference = true;
+
+    expect(chainedInference).toBe(true);
+    expect(chainedAsyncInference).toBe(true);
+    expect(chained).toEqual(Result.err({ _tag: "CallbackFailureA" }));
+    expect(await chainedAsync).toEqual(Result.err({ _tag: "CallbackFailureA" }));
   });
 
   it("narrows TaggedError instances with generic, class, and discriminant guards", () => {

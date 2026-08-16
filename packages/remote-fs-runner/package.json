@@ -40,6 +40,6 @@
   },
   "dependencies": {
     "@ff-labs/fff-node": "^0.9.4",
-    "better-result": "^3.0.0"
+    "better-result": "^3.0.1"
   }
 }

@@ -256,7 +256,10 @@ export function decodeConversationThreadImportance(
 ): ResultType<DecodedPersistedValue<ConversationThreadImportance>, PersistedDataError> {
   return decodeSummaryVersion(input.version, input.recordId).andThen((version) => {
     if (input.raw === null) {
-      return Result.ok({ value: "medium", provenance: "missing-defaulted" });
+      return Result.ok<DecodedPersistedValue<ConversationThreadImportance>>({
+        value: "medium",
+        provenance: "missing-defaulted",
+      });
     }
     const decoded = importanceSchema.safeParse(input.raw);
     if (!decoded.success) {
@@ -269,7 +272,10 @@ export function decodeConversationThreadImportance(
         }),
       );
     }
-    return Result.ok({ value: decoded.data, provenance: version.provenance });
+    return Result.ok<DecodedPersistedValue<ConversationThreadImportance>>({
+      value: decoded.data,
+      provenance: version.provenance,
+    });
   });
 }
 
