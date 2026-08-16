@@ -4,7 +4,7 @@
 
 本文件描述 [`DF-wu/lilac-mono`](https://github.com/DF-wu/lilac-mono) 相對於 [`stanley2058/lilac-mono`](https://github.com/stanley2058/lilac-mono) 的現行差異。
 
-比較基準為 2026-08-03 的 `main`：本 fork 已包含 upstream commit [`8f5fdec`](https://github.com/stanley2058/lilac-mono/commit/8f5fdec8266402560563885e901a4ffa6f40272b)，並在其上保留下列功能與維運修改。
+比較基準為 2026-08-16 的 `main`：本 fork 已包含 upstream commit [`29100734`](https://github.com/stanley2058/lilac-mono/commit/291007344693f52cfccab392e642fe30ac2f04a0)，並在其上保留下列功能與維運修改。
 
 > [!IMPORTANT]
 > 這是維護文件，不是永久相容性承諾。Upstream sync 後，已被上游接收或不再存在的差異必須從本表移除或重新分類。

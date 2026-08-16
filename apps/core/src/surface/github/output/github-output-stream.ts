@@ -10,7 +10,11 @@ import type {
 } from "../../adapter";
 
 import { markGithubAgentComment } from "../../../github/github-comment-marker";
-import { githubMessageUrl } from "../../../github/github-ids";
+import {
+  githubMessageUrl,
+  isGithubIssueTriggerId,
+  parseGithubSessionId,
+} from "../../../github/github-ids";
 
 export class GithubOutputStream implements SurfaceOutputStream {
   private text = "";
@@ -20,6 +24,11 @@ export class GithubOutputStream implements SurfaceOutputStream {
     private readonly sessionRef: GithubSessionRef,
     private readonly api: {
       createComment(body: string): Promise<SurfaceOperationResult<{ readonly id: number }>>;
+      getIssue(input: {
+        owner: string;
+        repo: string;
+        number: number;
+      }): Promise<SurfaceOperationResult<{ readonly id: number }>>;
     },
     private readonly opts?: { replyTo?: MsgRef },
   ) {}
@@ -76,14 +85,21 @@ export class GithubOutputStream implements SurfaceOutputStream {
   }
 
   async finish(): Promise<SurfaceOperationResult<SurfaceOutputResult>> {
-    const replyPrefix = (() => {
-      const replyTo = this.opts?.replyTo;
-      if (!replyTo || replyTo.platform !== "github") return "";
-      return `In reply to ${githubMessageUrl({
+    const replyTo = this.opts?.replyTo;
+    let replyPrefix = "";
+    if (replyTo?.platform === "github") {
+      let issueId: number | undefined;
+      if (isGithubIssueTriggerId({ sessionId: replyTo.channelId, triggerId: replyTo.messageId })) {
+        const thread = parseGithubSessionId(replyTo.channelId);
+        const issue = await this.api.getIssue(thread);
+        issueId = issue.match({ ok: (value) => value.id, err: () => undefined });
+      }
+      replyPrefix = `In reply to ${githubMessageUrl({
         sessionId: replyTo.channelId,
         messageId: replyTo.messageId,
+        issueId,
       })}:\n\n`;
-    })();
+    }
 
     const body = markGithubAgentComment(`${replyPrefix}${this.text}`);
     const res = await this.api.createComment(body);

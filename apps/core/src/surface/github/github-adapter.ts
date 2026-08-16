@@ -509,6 +509,12 @@ export class GithubAdapter implements SurfaceAdapter {
                         );
                         return created.map((value) => ({ id: value.id }));
                       },
+                      getIssue: async (input) => {
+                        const issue = await captureGithubOperation("read-message", () =>
+                          this.api.getIssue(input),
+                        );
+                        return issue.map((value) => ({ id: value.id }));
+                      },
                     },
                     opts?.replyTo ? { replyTo: opts.replyTo } : undefined,
                   ),
