@@ -3,11 +3,18 @@ import { afterEach, describe, expect, it } from "bun:test";
 import { parseEnv } from "../env";
 
 const ORIGINAL_ENV = {
+  CEREBRAS_API_KEY: process.env.CEREBRAS_API_KEY,
   DATA_DIR: process.env.DATA_DIR,
   SQLITE_URL: process.env.SQLITE_URL,
 };
 
 afterEach(() => {
+  if (ORIGINAL_ENV.CEREBRAS_API_KEY === undefined) {
+    delete process.env.CEREBRAS_API_KEY;
+  } else {
+    process.env.CEREBRAS_API_KEY = ORIGINAL_ENV.CEREBRAS_API_KEY;
+  }
+
   if (ORIGINAL_ENV.DATA_DIR === undefined) {
     delete process.env.DATA_DIR;
   } else {
@@ -39,5 +46,11 @@ describe("parseEnv", () => {
     const env = parseEnv();
 
     expect(env.sqliteUrl).toBe("/tmp/custom/workflows.sqlite3");
+  });
+
+  it("loads Cerebras credentials", () => {
+    process.env.CEREBRAS_API_KEY = "test-cerebras-key";
+
+    expect(parseEnv().providers.cerebras.apiKey).toBe("test-cerebras-key");
   });
 });

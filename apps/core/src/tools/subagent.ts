@@ -1,7 +1,6 @@
-import type { SurfacePrincipalPlatform } from "../surface/types";
 import { tool, type ModelMessage } from "ai";
 import { z } from "zod";
-import { type AdapterPlatform, type LilacBus } from "@stanley2058/lilac-event-bus";
+import type { AdapterPlatform } from "@stanley2058/lilac-event-bus";
 import {
   subagentDelegateBaseInputSchema,
   subagentDelegateOutputSchema,
@@ -12,10 +11,23 @@ import {
 } from "@stanley2058/lilac-coding-tools/schemas";
 import {
   createLogger,
+  formatTaggedErrorForLog,
+  opaqueErrorMessage,
   MODEL_REASONING_EFFORTS,
   type ModelReasoningEffort,
 } from "@stanley2058/lilac-utils";
-import { requireRequestContext } from "../shared/req-context";
+import { Result, TaggedError, type Result as ResultType } from "better-result";
+
+import { projectRuntimeError } from "../runtime/error-format";
+import { getBuiltinSurfaceProtocol } from "../surface/builtin-surface-protocols";
+import type { SurfaceProtocolRouting } from "../surface/protocol";
+import type {
+  AuthenticatedSurfaceOrigin,
+  AuthenticatedSurfaceOriginFor,
+  RegisteredSurfacePlatform,
+  SurfacePrincipal,
+} from "../surface/types";
+import { adaptToolResultToHost, preserveToolPanic } from "./tool-result-adapters";
 
 const modelReasoningEffortSchema = z.enum(MODEL_REASONING_EFFORTS);
 
@@ -50,11 +62,16 @@ function createSubagentDelegateInputSchema(
       : `${preset.model}${preset.reasoning ? `; default reasoning: ${preset.reasoning}` : ""}`;
     return `- ${alias}: ${detail}`;
   });
+  let configuredAliasDescription =
+    "No agent-selectable model aliases are configured; omit this field.";
+  if (selectableModels.length > 0) {
+    const qualifier =
+      selectableModels.length > 5 ? " (first 5 documented; all aliases are in the enum)" : "";
+    configuredAliasDescription = `Configured aliases${qualifier}:\n${documentedModels.join("\n")}`;
+  }
   const modelDescription = [
     "Optional agent-selectable alias from models.def. Direct provider/model values are not accepted.",
-    selectableModels.length > 0
-      ? `Configured aliases${selectableModels.length > 5 ? " (first 5 documented; all aliases are in the enum)" : ""}:\n${documentedModels.join("\n")}`
-      : "No agent-selectable model aliases are configured; omit this field.",
+    configuredAliasDescription,
   ].join("\n");
 
   if (selectableModels.length === 0) {
@@ -77,7 +94,6 @@ function createSubagentDelegateInputSchema(
 
 type SubagentTerminalStatus = z.infer<typeof subagentTerminalStatusSchema>;
 export type { SubagentDelegateOutput, SubagentMode, SubagentProfile };
-export { subagentDelegateBaseInputSchema, subagentDelegateOutputSchema };
 
 type ChildToolStatus = "running" | "done";
 
@@ -93,15 +109,103 @@ type RequestContextLike = {
   requestId: string;
   sessionId: string;
   requestClient: string;
-  subagentDepth?: number;
+  subagentDepth?: number | string;
   subagentProfile?: string;
+  requestInitiator?: SurfacePrincipal;
+  requestInitiatorSessionId?: string;
 };
 
 type CurrentRunProfile = SubagentProfile | "primary";
 
-function parseDepth(ctx: unknown): number {
-  if (!ctx || typeof ctx !== "object") return 0;
-  const raw = (ctx as Record<string, unknown>)["subagentDepth"];
+const requestContextSchema = z.object({
+  requestId: z.string(),
+  sessionId: z.string(),
+  requestClient: z.string(),
+  subagentDepth: z.union([z.number(), z.string()]).optional(),
+  subagentProfile: z.string().optional(),
+  requestInitiator: z
+    .object({ platform: z.string().trim().min(1), userId: z.string().trim().min(1) })
+    .optional(),
+  requestInitiatorSessionId: z.string().trim().min(1).optional(),
+});
+
+class SubagentDelegationError extends TaggedError("SubagentDelegationError")<{
+  readonly operation: string;
+  readonly cause: unknown;
+  readonly message: string;
+}> {}
+
+function signalSubagentFailure(operation: string, message: string): never {
+  return adaptToolResultToHost(
+    Result.err(new SubagentDelegationError({ operation, cause: new Error(message), message })),
+  );
+}
+
+async function captureSubagentOperation<T>(params: {
+  readonly operation: string;
+  readonly run: () => Promise<T>;
+}): Promise<ResultType<T, SubagentDelegationError>> {
+  const captured = await Result.tryPromise({
+    try: params.run,
+    catch: projectRuntimeError(`Opaque subagent ${params.operation} failure`),
+  });
+  return captured.match<() => ResultType<T, SubagentDelegationError>>({
+    ok: (value) => () => Result.ok(value),
+    err: (error) => () => {
+      const cause = preserveToolPanic(error);
+      return Result.err(
+        new SubagentDelegationError({
+          operation: params.operation,
+          cause,
+          message: opaqueErrorMessage(cause, `Subagent ${params.operation} failed`),
+        }),
+      );
+    },
+  })();
+}
+
+function decodeRequestContext(
+  context: unknown,
+): ResultType<RequestContextLike, SubagentDelegationError> {
+  const decoded = requestContextSchema.safeParse(context);
+  if (decoded.success) {
+    const initiator = decoded.data.requestInitiator;
+    const { requestInitiator: _, ...common } = decoded.data;
+    if (!initiator) return Result.ok(common);
+    const protocol = getBuiltinSurfaceProtocol(initiator.platform);
+    if (protocol) {
+      return Result.ok({
+        ...common,
+        requestInitiator: {
+          platform: protocol.platform,
+          userId: initiator.userId,
+        },
+      });
+    }
+  }
+  return Result.err(
+    new SubagentDelegationError({
+      operation: "decode_context",
+      cause: decoded.error,
+      message: "subagent_delegate requires request context",
+    }),
+  );
+}
+
+function createAuthenticatedSurfaceOrigin<P extends RegisteredSurfacePlatform>(
+  protocol: SurfaceProtocolRouting<P>,
+  userId: string,
+  sessionId: string,
+): AuthenticatedSurfaceOriginFor<P> {
+  return {
+    platform: protocol.platform,
+    userId,
+    sessionRef: protocol.refs.createSessionRef(sessionId),
+  };
+}
+
+function parseDepth(ctx: RequestContextLike): number {
+  const raw = ctx.subagentDepth;
   if (typeof raw === "number" && Number.isFinite(raw)) {
     return Math.max(0, Math.trunc(raw));
   }
@@ -114,9 +218,8 @@ function parseDepth(ctx: unknown): number {
   return 0;
 }
 
-function parseCurrentRunProfile(ctx: unknown): CurrentRunProfile {
-  if (!ctx || typeof ctx !== "object") return "primary";
-  const raw = (ctx as Record<string, unknown>)["subagentProfile"];
+function parseCurrentRunProfile(ctx: RequestContextLike): CurrentRunProfile {
+  const raw = ctx.subagentProfile;
   if (raw === "primary") return "primary";
   if (raw === "explore" || raw === "general" || raw === "self") return raw;
   return "primary";
@@ -171,9 +274,10 @@ export function renderSubagentDisplay(params: {
   const children = Array.from(params.children.values());
   const total = children.length;
   const done = children.filter((c) => c.status === "done").length;
-  const model = params.model
-    ? `${params.model}${params.reasoning ? ` [${params.reasoning}]` : ""}`
-    : null;
+  let model: string | null = null;
+  if (params.model) {
+    model = params.reasoning ? `${params.model} [${params.reasoning}]` : params.model;
+  }
   const header = `subagent (${[params.profile, model, `${done}/${total} done`]
     .filter((part): part is string => part !== null)
     .join("; ")})`;
@@ -197,7 +301,7 @@ export function renderSubagentDisplay(params: {
   return [header, ...lines].join("\n");
 }
 
-export function buildDelegatedTaskPrompt(task: string): ModelMessage {
+function buildDelegatedTaskPrompt(task: string): ModelMessage {
   return {
     role: "user",
     content: task,
@@ -235,12 +339,13 @@ export type SubagentDelegationRegistration = {
   initialMessages: ModelMessage[];
   modelOverride?: string;
   reasoningOverride?: ModelReasoningEffort;
+  authenticatedOrigin?: AuthenticatedSurfaceOrigin;
 };
 
 export type TrustedSubagentDelegationRegistration = SubagentDelegationRegistration & {
   projectRoot: string;
   fallbackSurface: {
-    platform: SurfacePrincipalPlatform;
+    platform: SurfacePrincipal["platform"];
     sessionId: string;
     userId: string;
   };
@@ -259,13 +364,11 @@ export type SubagentDelegationHandle = {
 };
 
 export function subagentTools(params: {
-  bus: LilacBus;
   idleTimeoutMs: number;
   maxDepth: number;
   modelPresets?: Readonly<Record<string, AgentSelectableModelPreset>>;
   delegatePromptOverlay?: string;
   onDelegate?: (registration: SubagentDelegationRegistration) => Promise<SubagentDelegationHandle>;
-  onActivity?: () => void;
 }) {
   const selectableModels = Object.entries(params.modelPresets ?? {}).filter(
     isSelectableModelPreset,
@@ -273,11 +376,16 @@ export function subagentTools(params: {
   const selectableModelAliases = new Set(selectableModels.map(([alias]) => alias));
   const inputSchema = createSubagentDelegateInputSchema(selectableModels);
   const description = [
-    "Delegate work to a subagent profile (explore, general, self).",
-    "Deferred is the default and should be used for parallelizable work. In deferred mode, acceptance confirms that the child started, not that it finished. Continue any useful work that does not depend on the child. If you finish that work first, send a brief progress update saying that you are waiting for subagent results, then stop the current step; the runtime keeps the request open and resumes you automatically when results arrive. Give the final answer only after every launched deferred subagent has returned a terminal subagent_result and you have incorporated those results.",
-    "Use sync only when the child result is immediately required before any meaningful next step.",
-    "Prefer deferred for: repository exploration, independent evidence gathering, parallel investigations, or work whose result can be incorporated later.",
-    "Prefer sync for: child answers that determine the next edit or decision, child results needed before responding, or the one blocking computation.",
+    "Delegate a task to an explore, general, or self subagent.",
+    "Use deferred mode by default.",
+    "Use sync mode only when you need the result before the next useful action.",
+    "Deferred acceptance means that the subagent started. It does not mean that the task is complete.",
+    "After a deferred launch, do all work that does not need the subagent result.",
+    "When no such work remains, reply with exactly NO_REPLY and end the turn.",
+    "Do not call tools only to wait or check the subagent status.",
+    "The runtime keeps the request open. It resumes you when a subagent_result arrives.",
+    "Wait for all deferred results before you send the final response to the user.",
+    "Use all relevant subagent results in the final response.",
     params.delegatePromptOverlay?.trim(),
   ]
     .filter((part): part is string => Boolean(part))
@@ -294,28 +402,48 @@ export function subagentTools(params: {
       execute: async (input: SubagentDelegateInput, { abortSignal, context, toolCallId }) => {
         const requestedModel = input.model;
         if (requestedModel !== undefined && !selectableModelAliases.has(requestedModel)) {
-          throw new Error(`Model alias '${requestedModel}' is not available for agent selection`);
+          signalSubagentFailure(
+            "validate_input",
+            `Model alias '${requestedModel}' is not available for agent selection`,
+          );
         }
         if (input.reasoning !== undefined && selectableModels.length === 0) {
-          throw new Error("Reasoning override requires an agent-selectable model alias");
+          signalSubagentFailure(
+            "validate_input",
+            "Reasoning override requires an agent-selectable model alias",
+          );
         }
-        const parsed = inputSchema.parse(input);
-        const ctx = requireRequestContext(context, "subagent_delegate") as RequestContextLike;
+        const decodedInput = inputSchema.safeParse(input);
+        if (!decodedInput.success) {
+          signalSubagentFailure("decode_input", decodedInput.error.message);
+        }
+        const parsed = decodedInput.data;
+        const decodedContext = decodeRequestContext(context);
+        const ctx = adaptToolResultToHost(decodedContext);
         const profile = parsed.profile;
         const mode = parsed.mode;
-        const depth = parseDepth(context);
+        const depth = parseDepth(ctx);
 
-        const currentRunProfile = parseCurrentRunProfile(context);
+        const currentRunProfile = parseCurrentRunProfile(ctx);
         if (currentRunProfile === "explore" || currentRunProfile === "general") {
-          throw new Error(`subagent_delegate is disabled in ${currentRunProfile} subagent runs`);
+          signalSubagentFailure(
+            "authorize_delegation",
+            `subagent_delegate is disabled in ${currentRunProfile} subagent runs`,
+          );
         }
 
         if (currentRunProfile === "self" && profile === "self") {
-          throw new Error("self subagent cannot delegate to self profile");
+          signalSubagentFailure(
+            "authorize_delegation",
+            "self subagent cannot delegate to self profile",
+          );
         }
 
         if (depth >= params.maxDepth) {
-          throw new Error("subagent_delegate is disabled in subagent runs (depth limit reached)");
+          signalSubagentFailure(
+            "authorize_delegation",
+            "subagent_delegate is disabled in subagent runs (depth limit reached)",
+          );
         }
 
         const idleTimeoutMs = params.idleTimeoutMs;
@@ -339,6 +467,15 @@ export function subagentTools(params: {
           session_id: ctx.sessionId,
           request_client: toAdapterPlatform(ctx.requestClient),
         };
+        let authenticatedOrigin: AuthenticatedSurfaceOrigin | undefined;
+        if (ctx.requestInitiator && ctx.requestInitiatorSessionId) {
+          const protocol = getBuiltinSurfaceProtocol(ctx.requestInitiator.platform);
+          authenticatedOrigin = createAuthenticatedSurfaceOrigin(
+            protocol,
+            ctx.requestInitiator.userId,
+            ctx.requestInitiatorSessionId,
+          );
+        }
         logger.info("subagent delegate start", {
           requestId: ctx.requestId,
           sessionId: ctx.sessionId,
@@ -355,30 +492,40 @@ export function subagentTools(params: {
           reasoningOverride: parsed.reasoning,
         });
 
-        if (!params.onDelegate) {
-          throw new Error("subagent delegation is unavailable in this runtime");
+        const onDelegate = params.onDelegate;
+        if (!onDelegate) {
+          signalSubagentFailure(
+            "start_delegation",
+            "subagent delegation is unavailable in this runtime",
+          );
         }
 
-        const handle = await params.onDelegate({
-          mode,
-          profile,
-          sessionName,
-          stableNamedContinuation,
-          task: parsed.task,
-          idleTimeoutMs,
-          depth: depth + 1,
-          parentRequestId: ctx.requestId,
-          parentSessionId: ctx.sessionId,
-          parentRequestClient: ctx.requestClient,
-          parentToolCallId: toolCallId,
-          childRequestId,
-          childSessionId,
-          parentHeaders,
-          childHeaders,
-          initialMessages: [buildDelegatedTaskPrompt(parsed.task)],
-          modelOverride: parsed.model,
-          reasoningOverride: parsed.reasoning,
+        const started = await captureSubagentOperation({
+          operation: "start_delegation",
+          run: () =>
+            onDelegate({
+              mode,
+              profile,
+              sessionName,
+              stableNamedContinuation,
+              task: parsed.task,
+              idleTimeoutMs,
+              depth: depth + 1,
+              parentRequestId: ctx.requestId,
+              parentSessionId: ctx.sessionId,
+              parentRequestClient: ctx.requestClient,
+              parentToolCallId: toolCallId,
+              childRequestId,
+              childSessionId,
+              parentHeaders,
+              childHeaders,
+              initialMessages: [buildDelegatedTaskPrompt(parsed.task)],
+              ...(authenticatedOrigin ? { authenticatedOrigin } : {}),
+              modelOverride: parsed.model,
+              reasoningOverride: parsed.reasoning,
+            }),
         });
+        const handle = adaptToolResultToHost(started);
 
         if (mode === "deferred") {
           logger.info("subagent delegate accepted", {
@@ -406,46 +553,32 @@ export function subagentTools(params: {
         let abortListener: (() => void) | null = null;
         if (abortSignal) {
           const onAbort = () => {
-            void handle.cancel("parent request aborted");
+            void captureSubagentOperation({
+              operation: "cancel_delegation",
+              run: () => handle.cancel("parent request aborted"),
+            });
           };
-          abortSignal.addEventListener("abort", onAbort, { once: true });
-          abortListener = () => {
-            abortSignal.removeEventListener("abort", onAbort);
-          };
+          if (abortSignal.aborted) onAbort();
+          else {
+            abortSignal.addEventListener("abort", onAbort, { once: true });
+            abortListener = () => {
+              abortSignal.removeEventListener("abort", onAbort);
+            };
+          }
         }
 
+        let completed: ResultType<SubagentDelegationOutcome, SubagentDelegationError>;
         try {
-          const outcome = await handle.completion;
-          const status = outcome.status;
-          const ok = status === "resolved";
-
-          logger.info("subagent delegate done", {
-            requestId: ctx.requestId,
-            sessionId: ctx.sessionId,
-            parentToolCallId: toolCallId,
-            childRequestId,
-            childSessionId,
-            profile,
-            status,
-            ok,
-            idleTimeoutMs,
-            workflowRunId: handle.runId,
+          completed = await captureSubagentOperation({
+            operation: "await_completion",
+            run: () => handle.completion,
           });
-
-          return {
-            ok,
-            mode: "sync",
-            status,
-            workflowRunId: handle.runId,
-            profile,
-            sessionName,
-            finalText: outcome.finalText,
-            detail: outcome.detail,
-          };
-        } catch (e: unknown) {
-          logger.error(
-            "subagent delegate failed",
-            {
+        } finally {
+          abortListener?.();
+        }
+        const complete = completed.match<() => SubagentDelegateOutput>({
+          err: (error) => () => {
+            logger.error("subagent delegate failed", {
               requestId: ctx.requestId,
               sessionId: ctx.sessionId,
               parentToolCallId: toolCallId,
@@ -453,13 +586,38 @@ export function subagentTools(params: {
               childSessionId,
               profile,
               idleTimeoutMs,
-            },
-            e,
-          );
-          throw e;
-        } finally {
-          abortListener?.();
-        }
+              ...formatTaggedErrorForLog(error),
+            });
+            return adaptToolResultToHost<never, SubagentDelegationError>(Result.err(error));
+          },
+          ok: (outcome) => () => {
+            const status = outcome.status;
+            const ok = status === "resolved";
+            logger.info("subagent delegate done", {
+              requestId: ctx.requestId,
+              sessionId: ctx.sessionId,
+              parentToolCallId: toolCallId,
+              childRequestId,
+              childSessionId,
+              profile,
+              status,
+              ok,
+              idleTimeoutMs,
+              workflowRunId: handle.runId,
+            });
+            return {
+              ok,
+              mode: "sync",
+              status,
+              workflowRunId: handle.runId,
+              profile,
+              sessionName,
+              finalText: outcome.finalText,
+              detail: outcome.detail,
+            };
+          },
+        });
+        return complete();
       },
     }),
   };

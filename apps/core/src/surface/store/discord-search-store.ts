@@ -1,11 +1,19 @@
 import { Database } from "bun:sqlite";
-import { createLogger } from "@stanley2058/lilac-utils";
+import { createLogger, formatTaggedErrorForLog } from "@stanley2058/lilac-utils";
 import {
+  preserveSurfacePanic,
   type SurfaceCacheBurstProvider,
   type SurfaceAdapter,
   type SurfaceBurstCacheInput,
 } from "../adapter";
 import { getDiscordSurfaceDisplayText } from "../discord/discord-surface-display-text";
+import {
+  selectVisibleDiscordAttachments,
+  hashIndexedDiscordAttachments,
+  toIndexedDiscordAttachments,
+  type DiscordIndexedAttachmentMeta,
+} from "../discord/discord-attachment";
+import { normalizeDiscordRaw } from "../discord/discord-raw-normalizer";
 import type { DiscordMsgRef, DiscordSessionRef, SurfaceMessage, SurfacePlatform } from "../types";
 import { configureSqliteConnection } from "../../shared/sqlite";
 
@@ -37,6 +45,7 @@ export type DiscordSearchIndexedMessage = {
   editedTs?: number;
   deleted: boolean;
   updatedTs: number;
+  attachments: DiscordIndexedAttachmentMeta[];
 };
 
 export type DiscordSearchMessageMutation = {
@@ -111,9 +120,20 @@ type RawIndexedRow = {
   edited_ts: number | null;
   deleted: number;
   updated_ts: number;
+  attachments_hash: string | null;
 };
 
-function asDiscordSearchIndexedMessage(row: RawIndexedRow): DiscordSearchIndexedMessage {
+type RawIndexedAttachmentRow = {
+  attachment_id: string | null;
+  filename: string | null;
+  mime_type: string | null;
+  size: number | null;
+};
+
+function asDiscordSearchIndexedMessage(
+  row: RawIndexedRow,
+  attachments: DiscordIndexedAttachmentMeta[],
+): DiscordSearchIndexedMessage {
   return {
     ref: asDiscordMsgRef(row.channel_id, row.message_id),
     session: asDiscordSessionRef({
@@ -127,6 +147,7 @@ function asDiscordSearchIndexedMessage(row: RawIndexedRow): DiscordSearchIndexed
     editedTs: row.edited_ts ?? undefined,
     deleted: row.deleted !== 0,
     updatedTs: row.updated_ts,
+    attachments,
   };
 }
 
@@ -156,7 +177,31 @@ export class DiscordSearchStore {
         edited_ts INTEGER,
         deleted INTEGER NOT NULL DEFAULT 0,
         updated_ts INTEGER NOT NULL,
+        attachments_hash TEXT,
         PRIMARY KEY (channel_id, message_id)
+      );
+    `);
+
+    const columns = this.db
+      .query<{ name: string }, []>("PRAGMA table_info(discord_search_messages)")
+      .all();
+    if (!columns.some((column) => column.name === "attachments_hash")) {
+      this.db.run("ALTER TABLE discord_search_messages ADD COLUMN attachments_hash TEXT;");
+    }
+
+    this.db.run(`
+      CREATE TABLE IF NOT EXISTS discord_search_message_attachments (
+        channel_id TEXT NOT NULL,
+        message_id TEXT NOT NULL,
+        ordinal INTEGER NOT NULL,
+        attachment_id TEXT,
+        filename TEXT,
+        mime_type TEXT,
+        size INTEGER,
+        PRIMARY KEY (channel_id, message_id, ordinal),
+        FOREIGN KEY (channel_id, message_id)
+          REFERENCES discord_search_messages(channel_id, message_id)
+          ON DELETE CASCADE
       );
     `);
 
@@ -205,11 +250,11 @@ export class DiscordSearchStore {
     `);
 
     const rowCountRow = this.db
-      .query("SELECT COUNT(1) AS c FROM discord_search_messages")
-      .get() as { c: number };
+      .query<{ c: number }, []>("SELECT COUNT(1) AS c FROM discord_search_messages")
+      .get();
     const ftsCountRow = this.db
-      .query("SELECT COUNT(1) AS c FROM discord_search_messages_fts")
-      .get() as { c: number };
+      .query<{ c: number }, []>("SELECT COUNT(1) AS c FROM discord_search_messages_fts")
+      .get();
 
     const rowCount = typeof rowCountRow?.c === "number" ? rowCountRow.c : 0;
     const ftsCount = typeof ftsCountRow?.c === "number" ? ftsCountRow.c : 0;
@@ -227,6 +272,10 @@ export class DiscordSearchStore {
     const tx = this.db.transaction((input: readonly SurfaceMessage[]) => {
       for (const message of input) {
         if (!isDiscordMessage(message)) continue;
+        const attachments = toIndexedDiscordAttachments(
+          selectVisibleDiscordAttachments(normalizeDiscordRaw(message.raw)),
+        );
+        const attachmentsHash = hashIndexedDiscordAttachments(attachments);
 
         const result = this.db.run(
           `
@@ -240,8 +289,9 @@ export class DiscordSearchStore {
             ts,
             edited_ts,
             deleted,
-            updated_ts
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            updated_ts,
+            attachments_hash
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
           ON CONFLICT(channel_id, message_id) DO UPDATE SET
             guild_id=excluded.guild_id,
             user_id=excluded.user_id,
@@ -250,14 +300,16 @@ export class DiscordSearchStore {
             ts=excluded.ts,
             edited_ts=excluded.edited_ts,
             deleted=excluded.deleted,
-            updated_ts=excluded.updated_ts
+            updated_ts=excluded.updated_ts,
+            attachments_hash=excluded.attachments_hash
           WHERE discord_search_messages.guild_id IS NOT excluded.guild_id
              OR discord_search_messages.user_id IS NOT excluded.user_id
              OR discord_search_messages.user_name IS NOT excluded.user_name
              OR discord_search_messages.text IS NOT excluded.text
              OR discord_search_messages.ts IS NOT excluded.ts
              OR discord_search_messages.edited_ts IS NOT excluded.edited_ts
-             OR discord_search_messages.deleted IS NOT excluded.deleted;
+             OR discord_search_messages.deleted IS NOT excluded.deleted
+             OR discord_search_messages.attachments_hash IS NOT excluded.attachments_hash;
           `,
           [
             message.session.channelId,
@@ -273,8 +325,33 @@ export class DiscordSearchStore {
             message.editedTs ?? null,
             message.deleted ? 1 : 0,
             now,
+            attachmentsHash,
           ],
         );
+        if (result.changes > 0) {
+          this.db.run(
+            "DELETE FROM discord_search_message_attachments WHERE channel_id = ? AND message_id = ?",
+            [message.session.channelId, message.ref.messageId],
+          );
+          attachments.forEach((attachment, ordinal) => {
+            this.db.run(
+              `
+              INSERT INTO discord_search_message_attachments (
+                channel_id, message_id, ordinal, attachment_id, filename, mime_type, size
+              ) VALUES (?, ?, ?, ?, ?, ?, ?)
+              `,
+              [
+                message.session.channelId,
+                message.ref.messageId,
+                ordinal,
+                attachment.id ?? null,
+                attachment.filename ?? null,
+                attachment.mimeType ?? null,
+                attachment.size ?? null,
+              ],
+            );
+          });
+        }
         // FTS trigger writes are included in SQLite's change count, but each upsert affects one message.
         wrote += result.changes > 0 ? 1 : 0;
       }
@@ -297,8 +374,10 @@ export class DiscordSearchStore {
 
   countMessagesByChannel(channelId: string): number {
     const row = this.db
-      .query("SELECT COUNT(1) AS c FROM discord_search_messages WHERE channel_id = ?")
-      .get(channelId) as { c: number };
+      .query<{ c: number }, [string]>(
+        "SELECT COUNT(1) AS c FROM discord_search_messages WHERE channel_id = ?",
+      )
+      .get(channelId);
     return typeof row?.c === "number" ? row.c : 0;
   }
 
@@ -307,7 +386,7 @@ export class DiscordSearchStore {
     messageId: string;
   }): DiscordSearchIndexedMessage | null {
     const row = this.db
-      .query(
+      .query<RawIndexedRow, [string, string]>(
         `
         SELECT
           channel_id,
@@ -320,20 +399,26 @@ export class DiscordSearchStore {
           edited_ts,
           deleted,
           updated_ts
+          , attachments_hash
         FROM discord_search_messages
         WHERE channel_id = ? AND message_id = ?
         `,
       )
-      .get(input.channelId, input.messageId) as RawIndexedRow | null;
+      .get(input.channelId, input.messageId);
 
-    return row ? asDiscordSearchIndexedMessage(row) : null;
+    return row
+      ? asDiscordSearchIndexedMessage(
+          row,
+          this.listMessageAttachments(row.channel_id, row.message_id),
+        )
+      : null;
   }
 
   listMessagesForDiscovery(sinceUpdatedTs?: number): DiscordSearchIndexedMessage[] {
-    const rows = (
+    const rows =
       sinceUpdatedTs === undefined
         ? this.db
-            .query(
+            .query<RawIndexedRow, []>(
               `
             SELECT
               channel_id,
@@ -346,13 +431,14 @@ export class DiscordSearchStore {
               edited_ts,
               deleted,
               updated_ts
+              , attachments_hash
             FROM discord_search_messages
             ORDER BY updated_ts ASC, channel_id ASC, message_id ASC
             `,
             )
             .all()
         : this.db
-            .query(
+            .query<RawIndexedRow, [number]>(
               `
             SELECT
               channel_id,
@@ -365,15 +451,39 @@ export class DiscordSearchStore {
               edited_ts,
               deleted,
               updated_ts
+              , attachments_hash
             FROM discord_search_messages
             WHERE updated_ts >= ?
             ORDER BY updated_ts ASC, channel_id ASC, message_id ASC
             `,
             )
-            .all(sinceUpdatedTs)
-    ) as RawIndexedRow[];
+            .all(sinceUpdatedTs);
 
-    return rows.map(asDiscordSearchIndexedMessage);
+    return rows.map((row) =>
+      asDiscordSearchIndexedMessage(
+        row,
+        this.listMessageAttachments(row.channel_id, row.message_id),
+      ),
+    );
+  }
+
+  listMessageAttachments(channelId: string, messageId: string): DiscordIndexedAttachmentMeta[] {
+    const rows = this.db
+      .query<RawIndexedAttachmentRow, [string, string]>(
+        `
+        SELECT attachment_id, filename, mime_type, size
+        FROM discord_search_message_attachments
+        WHERE channel_id = ? AND message_id = ?
+        ORDER BY ordinal ASC
+        `,
+      )
+      .all(channelId, messageId);
+    return rows.map((row) => ({
+      ...(row.attachment_id ? { id: row.attachment_id } : {}),
+      ...(row.filename ? { filename: row.filename } : {}),
+      ...(row.mime_type ? { mimeType: row.mime_type } : {}),
+      ...(row.size !== null ? { size: row.size } : {}),
+    }));
   }
 
   searchChannel(input: { channelId: string; query: string; limit?: number }): DiscordSearchHit[] {
@@ -383,7 +493,7 @@ export class DiscordSearchStore {
     const limit = Math.min(SEARCH_LIMIT_MAX, Math.max(1, Math.floor(input.limit ?? 20)));
 
     const rows = this.db
-      .query(
+      .query<RawSearchRow, [string, string, number]>(
         `
         SELECT
           m.channel_id,
@@ -404,7 +514,7 @@ export class DiscordSearchStore {
         LIMIT ?
         `,
       )
-      .all(ftsQuery, input.channelId, limit) as RawSearchRow[];
+      .all(ftsQuery, input.channelId, limit);
 
     return rows.map((row) => ({
       ref: asDiscordMsgRef(row.channel_id, row.message_id),
@@ -535,7 +645,8 @@ export class DiscordSearchService {
       };
       try {
         await this.params.adapter.burstCache(cacheInput);
-      } catch {
+      } catch (cause) {
+        preserveSurfacePanic(cause);
         // ignore cache invalidation errors
       }
     }
@@ -544,17 +655,29 @@ export class DiscordSearchService {
       const messages = await this.params.adapter.listMsg(input.sessionRef, {
         limit,
       });
-      const indexed = this.params.store.upsertMessages(messages);
-      if (indexed > 0) this.params.onMessagesIndexed?.(input.sessionRef.channelId);
-
-      return {
-        attempted: true,
-        skipped: false,
-        limit,
-        fetched: messages.length,
-        indexed,
-      };
+      return messages.match({
+        err: (error) => () => {
+          this.logger.error("search heal failed", {
+            channelId: input.sessionRef.channelId,
+            limit,
+            ...formatTaggedErrorForLog(error),
+          });
+          return { attempted: true, skipped: false, limit, fetched: 0, indexed: 0 };
+        },
+        ok: (value) => () => {
+          const indexed = this.params.store.upsertMessages(value);
+          if (indexed > 0) this.params.onMessagesIndexed?.(input.sessionRef.channelId);
+          return {
+            attempted: true,
+            skipped: false,
+            limit,
+            fetched: value.length,
+            indexed,
+          };
+        },
+      })();
     } catch (e) {
+      preserveSurfacePanic(e);
       this.logger.error("search heal failed", { channelId: input.sessionRef.channelId, limit }, e);
       return {
         attempted: true,

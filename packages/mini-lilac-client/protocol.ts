@@ -1,4 +1,4 @@
-import type { UIMessage } from "ai";
+import type { UIMessage, UIMessageChunk } from "ai";
 import { z } from "zod";
 
 export const MINI_LILAC_PROTOCOL_VERSION = 1 as const;
@@ -452,6 +452,19 @@ export const miniLilacStreamCursorChunkSchema = z
   .strict();
 export type MiniLilacStreamCursorChunk = z.infer<typeof miniLilacStreamCursorChunkSchema>;
 
+export const MINI_LILAC_UNSUPPORTED_UI_MESSAGE_CHUNK_TYPE =
+  "data-miniLilacUnsupportedUIMessageChunk" as const;
+export const miniLilacUnsupportedUIMessageChunkSchema = z.strictObject({
+  type: z.literal(MINI_LILAC_UNSUPPORTED_UI_MESSAGE_CHUNK_TYPE),
+  data: z.strictObject({
+    chunkType: z.string().min(1).max(128),
+  }),
+  transient: z.literal(true),
+}) satisfies z.ZodType<UIMessageChunk>;
+export type MiniLilacUnsupportedUIMessageChunk = z.infer<
+  typeof miniLilacUnsupportedUIMessageChunkSchema
+>;
+
 export const miniLilacTodoSchema = z.strictObject({
   content: z.string().max(500),
   status: z.enum(["pending", "in_progress", "completed", "cancelled"]),
@@ -473,29 +486,38 @@ export const miniLilacTodosSchema = z
     }
   });
 
+function refineTodoStateSerializedSize(
+  todos: z.output<typeof miniLilacTodosSchema>,
+  context: z.RefinementCtx,
+): void {
+  // Explicit field ordering keeps the byte limit independent of input object key order.
+  const serialized = JSON.stringify({
+    // Reserve the maximum revision width so a schema-valid list stays writable at every revision.
+    revision: Number.MAX_SAFE_INTEGER,
+    todos: todos.map((todo) => ({
+      content: todo.content,
+      status: todo.status,
+      priority: todo.priority,
+    })),
+  });
+  if (new TextEncoder().encode(serialized).byteLength > MAX_TODO_STATE_BYTES) {
+    context.addIssue({
+      code: "custom",
+      message: `Serialized todo state may not exceed ${MAX_TODO_STATE_BYTES} bytes`,
+    });
+  }
+}
+
+export const miniLilacTodoWriteInputSchema = z
+  .strictObject({ todos: miniLilacTodosSchema })
+  .superRefine((input, context) => refineTodoStateSerializedSize(input.todos, context));
+
 export const miniLilacTodoStateSchema = z
   .strictObject({
     revision: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
     todos: miniLilacTodosSchema,
   })
-  .superRefine((state, context) => {
-    // Explicit field ordering keeps the byte limit independent of input object key order.
-    const serialized = JSON.stringify({
-      // Reserve the maximum revision width so a schema-valid list stays writable at every revision.
-      revision: Number.MAX_SAFE_INTEGER,
-      todos: state.todos.map((todo) => ({
-        content: todo.content,
-        status: todo.status,
-        priority: todo.priority,
-      })),
-    });
-    if (new TextEncoder().encode(serialized).byteLength > MAX_TODO_STATE_BYTES) {
-      context.addIssue({
-        code: "custom",
-        message: `Serialized todo state may not exceed ${MAX_TODO_STATE_BYTES} bytes`,
-      });
-    }
-  });
+  .superRefine((state, context) => refineTodoStateSerializedSize(state.todos, context));
 export type MiniLilacTodoState = z.infer<typeof miniLilacTodoStateSchema>;
 
 export const miniLilacTodoChunkSchema = z.strictObject({
@@ -607,16 +629,11 @@ const reasoningFilePartSchema = z.strictObject({
 
 const customPartSchema = z.strictObject({
   type: z.literal("custom"),
-  kind: z.custom<`${string}.${string}`>(
-    (value): value is `${string}.${string}` => typeof value === "string" && value.includes("."),
-  ),
+  kind: z.templateLiteral([z.string(), ".", z.string()]),
   ...standardPartMetadataFields,
 });
 
-const toolTypeSchema = z.custom<`tool-${string}`>(
-  (value): value is `tool-${string}` =>
-    typeof value === "string" && value.startsWith("tool-") && value.length > "tool-".length,
-);
+const toolTypeSchema = z.templateLiteral(["tool-", z.string().min(1)]);
 
 const toolPartBaseFields = {
   toolCallId: z.string(),

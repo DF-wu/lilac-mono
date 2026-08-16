@@ -1,3 +1,4 @@
+import { Result, TaggedError, type Result as ResultType } from "better-result";
 import { z } from "zod";
 
 import { cloneDefaultWorkingIndicators } from "../working-indicators";
@@ -11,9 +12,11 @@ import {
   modelCapabilityCostPatchSchema,
   modelCapabilityLimitPatchSchema,
   modelCapabilityModalitiesPatchSchema,
+  migrateWebConfigValue,
   routerSchema,
   statsForNerdsSchema,
-  webExtractConfigSchema,
+  webExtractConfigValueSchema,
+  webFetchModeSchema,
 } from "./v1";
 import { collectUnknownConfigKeyPaths } from "./unknown-keys";
 import {
@@ -76,7 +79,7 @@ const profileLevel2Schema = z.object({
 const EXPLORE_PROFILE_DEFAULT: SubagentProfileConfig = {
   modelSlot: "main",
   level1: {
-    tools: ["read_file", "glob", "grep", "fuzzy_search", "batch"],
+    tools: ["bash", "read", "glob", "grep", "fuzzy_search", "batch"],
     plugins: ["builtin-local-tools"],
   },
   level2: {
@@ -101,7 +104,7 @@ const EXPLORE_PROFILE_DEFAULT: SubagentProfileConfig = {
   },
   network: true,
   workspaceWrites: false,
-  execution: false,
+  execution: "restricted",
   delegation: false,
 };
 
@@ -111,7 +114,7 @@ const GENERAL_PROFILE_DEFAULT: SubagentProfileConfig = {
   level2: { callables: ["*"], plugins: ["*"] },
   network: true,
   workspaceWrites: true,
-  execution: true,
+  execution: "native",
   delegation: false,
 };
 
@@ -119,6 +122,27 @@ const SELF_PROFILE_DEFAULT: SubagentProfileConfig = {
   ...GENERAL_PROFILE_DEFAULT,
   delegation: true,
 };
+
+function normalizeProfileToolNames(profile: SubagentProfileConfig): SubagentProfileConfig {
+  return {
+    ...profile,
+    level1: {
+      ...profile.level1,
+      tools: profile.level1.tools.map((name) => {
+        switch (name) {
+          case "read_file":
+            return "read";
+          case "edit_file":
+            return "edit";
+          case "apply_patch":
+            return "patch";
+          default:
+            return name;
+        }
+      }),
+    },
+  };
+}
 
 function subagentProfileSchemaV2(defaults: SubagentProfileConfig) {
   return z
@@ -137,7 +161,9 @@ function subagentProfileSchemaV2(defaults: SubagentProfileConfig) {
       level2: profileLevel2Schema.default(defaults.level2),
       network: z.boolean().default(defaults.network),
       workspaceWrites: z.boolean().default(defaults.workspaceWrites),
-      execution: z.boolean().default(defaults.execution),
+      execution: z
+        .union([z.literal(false), z.enum(["restricted", "native"])])
+        .default(defaults.execution),
       delegation: z.boolean().default(defaults.delegation),
     })
     .superRefine((input, ctx) => {
@@ -249,6 +275,18 @@ const discordMarkdownTableRenderSchema = z
     fallbackMode: "list",
   });
 
+const discordMarkdownMathRenderSchema = z
+  .object({
+    enabled: z.boolean().default(false),
+    maxWidth: z.number().int().min(40).max(240).default(50),
+    fallbackMode: z.enum(["source", "passthrough"]).default("source"),
+  })
+  .default({
+    enabled: false,
+    maxWidth: 50,
+    fallbackMode: "source",
+  });
+
 const discordSurfaceSchema = z
   .object({
     tokenEnv: z.string().min(1).default("DISCORD_TOKEN"),
@@ -270,6 +308,7 @@ const discordSurfaceSchema = z
       .min(1)
       .default(cloneDefaultWorkingIndicators()),
     markdownTableRender: discordMarkdownTableRenderSchema,
+    markdownMathRender: discordMarkdownMathRenderSchema,
   })
   .default({
     tokenEnv: "DISCORD_TOKEN",
@@ -286,12 +325,23 @@ const discordSurfaceSchema = z
       maxWidth: 50,
       fallbackMode: "list",
     },
+    markdownMathRender: {
+      enabled: false,
+      maxWidth: 50,
+      fallbackMode: "source",
+    },
   });
 
 const telegramSurfaceSchema = z
   .object({
     enabled: z.boolean().default(TELEGRAM_SURFACE_DEFAULTS.enabled),
     token: z.string().trim().min(1).optional(),
+    tokenEnv: z
+      .never({
+        error:
+          "surface.telegram.tokenEnv was removed; copy the token to surface.telegram.token and remove tokenEnv",
+      })
+      .optional(),
     botName: z
       .string()
       .min(1)
@@ -331,6 +381,37 @@ const telegramSurfaceSchema = z
 const byteSizeSchema = z.preprocess(parseFriendlyByteSize, z.number().int().positive());
 const durationMsSchema = z.preprocess(parseFriendlyDurationMs, z.number().int().positive());
 
+const webConfigSchemaV2 = z
+  .preprocess(
+    migrateWebConfigValue,
+    z.object({
+      extract: webExtractConfigValueSchema.default({
+        providers: ["tavily"],
+      }),
+      fetch: z
+        .object({
+          mode: webFetchModeSchema,
+        })
+        .default({
+          mode: "auto",
+        }),
+      firecrawl: z
+        .object({
+          maxConcurrency: z.number().int().positive().default(2),
+          queueTtl: durationMsSchema.default(3_000),
+        })
+        .optional(),
+    }),
+  )
+  .default({
+    extract: {
+      providers: ["tavily"],
+    },
+    fetch: {
+      mode: "auto",
+    },
+  });
+
 const toolsSchema = z
   .object({
     fsBackend: z.enum(["fff", "node-rg"]).default("fff"),
@@ -343,7 +424,7 @@ const toolsSchema = z
           .default({ provider: "default" }),
       })
       .default({ image: { provider: "default" } }),
-    web: webExtractConfigSchema,
+    web: webConfigSchemaV2,
     inspect: z
       .object({
         model: z.string().trim().min(1).default("google/gemini-3.5-flash"),
@@ -462,6 +543,7 @@ const conversationSchemaV2 = z
           .object({
             enabled: z.boolean().default(false),
             plannerModel: z.string().trim().min(1).optional(),
+            textPlannerModel: z.string().trim().min(1).optional(),
             minTextUnits: z.number().int().positive().default(80),
             followUpMinTextUnits: z.number().int().positive().default(110),
             limit: z.number().int().positive().max(10).default(3),
@@ -646,6 +728,11 @@ export const coreConfigInputSchemaV2 = z.object({
           maxWidth: 50,
           fallbackMode: "list" as const,
         },
+        markdownMathRender: {
+          enabled: false,
+          maxWidth: 50,
+          fallbackMode: "source" as const,
+        },
       },
       telegram: cloneDefaultTelegramSurface(),
       heartbeat: {
@@ -706,26 +793,55 @@ export const coreConfigInputSchemaV2 = z.object({
 
 export type ParsedCoreConfigV2 = z.infer<typeof coreConfigInputSchemaV2>;
 
+export class CoreConfigV2Invalid extends TaggedError("CoreConfigV2Invalid")<{
+  readonly cause: z.ZodError;
+  readonly message: string;
+}> {}
+
+export function decodeCoreConfigV2(
+  raw: unknown,
+): ResultType<ParsedCoreConfigV2, CoreConfigV2Invalid> {
+  const parsed = coreConfigInputSchemaV2.safeParse(raw);
+  return parsed.success
+    ? Result.ok(parsed.data)
+    : Result.err(
+        new CoreConfigV2Invalid({
+          cause: parsed.error,
+          message: parsed.error.issues.map((issue) => issue.message).join("; "),
+        }),
+      );
+}
+
 export function parseCoreConfigV2(raw: unknown): ParsedCoreConfigV2 {
   return coreConfigInputSchemaV2.parse(raw);
 }
 
-export function parseCoreConfigV2ToUniversal(
+function coreConfigV2ToUniversal(
+  parsed: ParsedCoreConfigV2,
   raw: unknown,
   options?: CoreConfigParseOptions,
 ): UniversalCoreConfig {
-  const parsed = parseCoreConfigV2(raw);
   if (options?.onUnknownKey) {
     for (const path of collectUnknownConfigKeyPaths(raw, parsed)) {
       options.onUnknownKey(path);
     }
   }
   const { artifactTtl, ...output } = parsed.tools.output;
+  const { firecrawl, ...web } = parsed.tools.web;
 
   return {
     ...parsed,
     tools: {
       ...parsed.tools,
+      web: firecrawl
+        ? {
+            ...web,
+            firecrawl: {
+              maxConcurrency: firecrawl.maxConcurrency,
+              queueTtlMs: firecrawl.queueTtl,
+            },
+          }
+        : web,
       output: {
         ...output,
         artifactTtlMs: artifactTtl,
@@ -733,9 +849,44 @@ export function parseCoreConfigV2ToUniversal(
     },
     agent: {
       ...parsed.agent,
+      subagents: {
+        ...parsed.agent.subagents,
+        profiles: {
+          explore: normalizeProfileToolNames(parsed.agent.subagents.profiles.explore),
+          general: normalizeProfileToolNames(parsed.agent.subagents.profiles.general),
+          self: normalizeProfileToolNames(parsed.agent.subagents.profiles.self),
+        },
+      },
       systemPrompt: "",
     },
   };
+}
+
+export function decodeCoreConfigV2ToUniversal(
+  raw: unknown,
+  options?: CoreConfigParseOptions,
+): ResultType<UniversalCoreConfig, CoreConfigV2Invalid> {
+  const parsed = decodeCoreConfigV2(raw);
+  const continueDecode = parsed.match<() => ResultType<UniversalCoreConfig, CoreConfigV2Invalid>>({
+    ok: (value) => () => Result.ok(coreConfigV2ToUniversal(value, raw, options)),
+    err: (error) => () => Result.err(error),
+  });
+  return continueDecode();
+}
+
+export function parseCoreConfigV2ToUniversal(
+  raw: unknown,
+  options?: CoreConfigParseOptions,
+): UniversalCoreConfig {
+  const result = decodeCoreConfigV2ToUniversal(raw, options);
+  const resolved = result.match<
+    { readonly value: UniversalCoreConfig } | { readonly error: CoreConfigV2Invalid }
+  >({
+    ok: (value) => ({ value }),
+    err: (error) => ({ error }),
+  });
+  if ("error" in resolved) throw resolved.error.cause;
+  return resolved.value;
 }
 
 export class V2CoreConfigParser implements ConfigParser {

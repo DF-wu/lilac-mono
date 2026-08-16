@@ -1,4 +1,5 @@
 import { describe, expect, it } from "bun:test";
+import { z } from "zod";
 import {
   APICallError,
   jsonSchema,
@@ -4298,12 +4299,13 @@ describe("AiSdkPiAgent turn boundaries", () => {
       ],
     });
     let appendedToolResults = 0;
+    const executedToolNames: string[] = [];
     const firstBoundary: { executed: number; appended: number }[] = [];
     const agent = new AiSdkPiAgent({
       system: "test",
       model,
       tools: {
-        read_file: tool({
+        read: tool({
           description: "read",
           inputSchema: jsonSchema({ type: "object", additionalProperties: false }),
           execute: async () => {
@@ -4329,6 +4331,7 @@ describe("AiSdkPiAgent turn boundaries", () => {
       },
     });
     agent.subscribe((event) => {
+      if (event.type === "tool_execution_start") executedToolNames.push(event.toolName);
       if (event.type === "message_end" && event.message.role === "tool") {
         appendedToolResults += 1;
       }
@@ -4337,6 +4340,121 @@ describe("AiSdkPiAgent turn boundaries", () => {
     await agent.prompt("start");
 
     expect(firstBoundary).toEqual([{ executed: 2, appended: 2 }]);
+    expect(executedToolNames).toEqual(["read", "glob"]);
+  });
+
+  it("executes provider-originated legacy tool names through canonical tools", async () => {
+    let executions = 0;
+    const agent = new AiSdkPiAgent({
+      system: "test",
+      model: fakeModel(),
+      tools: {
+        patch: tool({
+          inputSchema: jsonSchema({ type: "object", additionalProperties: false }),
+          execute: () => {
+            executions += 1;
+            return "patched";
+          },
+        }),
+      },
+    });
+
+    const outcome = await agent.executeExternalToolCall({
+      toolCallId: "legacy-patch",
+      toolName: "apply_patch",
+      input: {},
+    });
+
+    expect(executions).toBe(1);
+    expect(outcome.isError).toBe(false);
+    expect(outcome.result).toBe("patched");
+  });
+
+  it("does not alias an exact legacy-named tool", async () => {
+    const executions: string[] = [];
+    const agent = new AiSdkPiAgent({
+      system: "test",
+      model: fakeModel(),
+      tools: {
+        read: tool({
+          inputSchema: jsonSchema({ type: "object", additionalProperties: false }),
+          execute: () => executions.push("read"),
+        }),
+        read_file: tool({
+          inputSchema: jsonSchema({ type: "object", additionalProperties: false }),
+          execute: () => executions.push("read_file"),
+        }),
+      },
+    });
+
+    await agent.executeExternalToolCall({
+      toolCallId: "exact-legacy-read",
+      toolName: "read_file",
+      input: {},
+    });
+
+    expect(executions).toEqual(["read_file"]);
+  });
+
+  it("repairs legacy batch child names before provider schema validation", async () => {
+    const inputs: unknown[] = [];
+    const model = new MockLanguageModelV4({
+      doStream: [
+        {
+          stream: simulateReadableStream({
+            chunks: [
+              {
+                type: "tool-call",
+                toolCallId: "legacy-batch",
+                toolName: "batch",
+                input: '{"tool_calls":[{"tool":"read_file","parameters":{}}]}',
+              },
+              {
+                type: "finish",
+                finishReason: { unified: "tool-calls", raw: "tool-calls" },
+                usage: zeroUsage(),
+              },
+            ],
+          }),
+        },
+        {
+          stream: simulateReadableStream({
+            chunks: [
+              {
+                type: "finish",
+                finishReason: { unified: "stop", raw: "stop" },
+                usage: zeroUsage(),
+              },
+            ],
+          }),
+        },
+      ],
+    });
+    const agent = new AiSdkPiAgent({
+      system: "test",
+      model,
+      tools: {
+        read: tool({
+          inputSchema: z.object({}),
+          execute: () => "read",
+        }),
+        batch: tool({
+          inputSchema: z.object({
+            tool_calls: z.array(
+              z.object({ tool: z.literal("read"), parameters: z.record(z.string(), z.unknown()) }),
+            ),
+          }),
+          execute: (input) => {
+            inputs.push(input);
+            return "accepted";
+          },
+        }),
+      },
+    });
+
+    await agent.prompt("start");
+
+    expect(inputs).toEqual([{ tool_calls: [{ tool: "read", parameters: {} }] }]);
   });
 
   it("rejects other calls in a turn containing an exclusive tool", async () => {

@@ -185,8 +185,6 @@ function markdownSyntaxStyles(colors: ThemeColors) {
   } satisfies Record<string, StyleDefinitionInput>;
 }
 
-export const MARKDOWN_SYNTAX_STYLES = markdownSyntaxStyles(COLORS);
-
 export function createMarkdownSyntaxStyle(colors: ThemeColors = COLORS): SyntaxStyle {
   return SyntaxStyle.fromStyles(markdownSyntaxStyles(colors));
 }

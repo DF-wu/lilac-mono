@@ -3,6 +3,7 @@ import type { ModelMessage } from "ai";
 import type { CorePrimaryLineageV1 } from "@stanley2058/lilac-event-bus";
 
 import type { MsgRef } from "../../types";
+import type { DiscordAttachmentMeta } from "../../discord/discord-attachment";
 
 import type { TranscriptStore } from "../../../transcript/transcript-store";
 
@@ -61,13 +62,6 @@ export type ComposeRequestOpts = {
   transformUserText?: (text: string) => string;
 };
 
-export type DiscordAttachmentMeta = {
-  url: string;
-  filename?: string;
-  mimeType?: string;
-  size?: number;
-};
-
 export type ReplyChainMessage = {
   messageId: string;
   authorId: string;
@@ -75,7 +69,11 @@ export type ReplyChainMessage = {
   ts: number;
   text: string;
   attachments: DiscordAttachmentMeta[];
-  raw?: unknown;
+  isChat?: boolean;
+  replyReference: {
+    messageId?: string;
+    channelId?: string;
+  };
 };
 
 export type MergedChunk = {

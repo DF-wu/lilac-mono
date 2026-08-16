@@ -2,6 +2,7 @@ import { performance } from "node:perf_hooks";
 import { resolve } from "node:path";
 
 import { FileSystem, expandTilde, type FsBackend } from "@stanley2058/lilac-fs";
+import { Result, TaggedError, type Result as ResultType } from "better-result";
 
 type BackendSelection = FsBackend | "all";
 
@@ -27,6 +28,15 @@ type BenchmarkOptions = {
   warmups: number;
   backend: BackendSelection;
 };
+
+export class BenchmarkArgumentError extends TaggedError("BenchmarkArgumentError")<{
+  readonly message: string;
+}> {}
+
+export class BenchmarkSearchError extends TaggedError("BenchmarkSearchError")<{
+  readonly operation: "glob" | "grep";
+  readonly message: string;
+}> {}
 
 const CASES = [
   {
@@ -58,65 +68,69 @@ const CASES = [
   },
 ] satisfies readonly BenchmarkCase[];
 
-function parsePositiveInt(raw: string | undefined, label: string): number {
+function parsePositiveInt(
+  raw: string | undefined,
+  label: string,
+): ResultType<number, BenchmarkArgumentError> {
   const value = Number(raw);
   if (!Number.isInteger(value) || value <= 0) {
-    throw new Error(`${label} must be a positive integer`);
+    return Result.err(
+      new BenchmarkArgumentError({ message: `${label} must be a positive integer` }),
+    );
   }
-  return value;
+  return Result.ok(value);
 }
 
-function parseBackend(raw: string | undefined): BackendSelection {
-  if (raw === undefined || raw === "all") return "all";
-  if (raw === "fff" || raw === "node-rg") return raw;
-  throw new Error("backend must be one of: all, fff, node-rg");
+function parseBackend(
+  raw: string | undefined,
+): ResultType<BackendSelection, BenchmarkArgumentError> {
+  if (raw === undefined || raw === "all") return Result.ok("all");
+  if (raw === "fff" || raw === "node-rg") return Result.ok(raw);
+  return Result.err(
+    new BenchmarkArgumentError({ message: "backend must be one of: all, fff, node-rg" }),
+  );
 }
 
-function parseArgs(argv: readonly string[]): BenchmarkOptions {
-  let root = process.cwd();
-  let runs = 20;
-  let warmups = 3;
-  let backend: BackendSelection = "all";
+export function parseBenchmarkArgs(
+  argv: readonly string[],
+): ResultType<BenchmarkOptions | "help", BenchmarkArgumentError> {
+  return Result.gen(function* () {
+    let root = process.cwd();
+    let runs = 20;
+    let warmups = 3;
+    let backend: BackendSelection = "all";
 
-  for (let i = 0; i < argv.length; i++) {
-    const arg = argv[i];
-    if (arg === "--root") {
-      root = argv[++i] ?? "";
-      continue;
+    for (let i = 0; i < argv.length; i++) {
+      const arg = argv[i];
+      if (arg === "--root") {
+        root = argv[++i] ?? "";
+        continue;
+      }
+      if (arg === "--runs") {
+        runs = yield* parsePositiveInt(argv[++i], "runs");
+        continue;
+      }
+      if (arg === "--warmups") {
+        warmups = yield* parsePositiveInt(argv[++i], "warmups");
+        continue;
+      }
+      if (arg === "--backend") {
+        backend = yield* parseBackend(argv[++i]);
+        continue;
+      }
+      if (arg === "--help" || arg === "-h") {
+        return Result.ok<"help">("help");
+      }
+      return Result.err(new BenchmarkArgumentError({ message: `Unknown argument: ${arg}` }));
     }
-    if (arg === "--runs") {
-      runs = parsePositiveInt(argv[++i], "runs");
-      continue;
-    }
-    if (arg === "--warmups") {
-      warmups = parsePositiveInt(argv[++i], "warmups");
-      continue;
-    }
-    if (arg === "--backend") {
-      backend = parseBackend(argv[++i]);
-      continue;
-    }
-    if (arg === "--help" || arg === "-h") {
-      process.stdout.write(
-        [
-          "Usage: bun scripts/bench-fs-search.ts [--root PATH] [--backend all|fff|node-rg] [--warmups N] [--runs N]",
-          "",
-          "Examples:",
-          "  bun run bench:fs-search",
-          "  bun run bench:fs-search -- --root ../.. --runs 50",
-        ].join("\n") + "\n",
-      );
-      process.exit(0);
-    }
-    throw new Error(`Unknown argument: ${arg}`);
-  }
 
-  return {
-    root: resolve(expandTilde(root)),
-    runs,
-    warmups,
-    backend,
-  };
+    return Result.ok({
+      root: resolve(expandTilde(root)),
+      runs,
+      warmups,
+      backend,
+    });
+  });
 }
 
 function selectedBackends(selection: BackendSelection): FsBackend[] {
@@ -142,17 +156,28 @@ function formatMs(value: number): string {
   return value.toFixed(2);
 }
 
-function countGlobResult(result: Awaited<ReturnType<FileSystem["glob"]>>): number {
-  if (result.error) throw new Error(result.error);
-  return result.mode === "default" ? result.paths.length : result.entries.length;
+function countGlobResult(
+  result: Awaited<ReturnType<FileSystem["glob"]>>,
+): ResultType<number, BenchmarkSearchError> {
+  if (result.error) {
+    return Result.err(new BenchmarkSearchError({ operation: "glob", message: result.error }));
+  }
+  return Result.ok(result.mode === "default" ? result.paths.length : result.entries.length);
 }
 
-function countGrepResult(result: Awaited<ReturnType<FileSystem["grep"]>>): number {
-  if (result.error) throw new Error(result.error);
-  return result.results.length;
+function countGrepResult(
+  result: Awaited<ReturnType<FileSystem["grep"]>>,
+): ResultType<number, BenchmarkSearchError> {
+  if (result.error) {
+    return Result.err(new BenchmarkSearchError({ operation: "grep", message: result.error }));
+  }
+  return Result.ok(result.results.length);
 }
 
-async function runCase(fsTool: FileSystem, benchmarkCase: BenchmarkCase): Promise<number> {
+async function runCase(
+  fsTool: FileSystem,
+  benchmarkCase: BenchmarkCase,
+): Promise<ResultType<number, BenchmarkSearchError>> {
   if (benchmarkCase.kind === "glob") {
     const result = await fsTool.glob({
       patterns: benchmarkCase.patterns,
@@ -170,50 +195,80 @@ async function runCase(fsTool: FileSystem, benchmarkCase: BenchmarkCase): Promis
   return countGrepResult(result);
 }
 
-async function runBenchmark(options: BenchmarkOptions): Promise<void> {
-  process.stdout.write(
-    `fs-search benchmark root=${options.root} warmups=${options.warmups} runs=${options.runs}\n`,
-  );
+export async function runBenchmark(
+  options: BenchmarkOptions,
+): Promise<ResultType<void, BenchmarkSearchError>> {
+  return Result.gen(async function* () {
+    process.stdout.write(
+      `fs-search benchmark root=${options.root} warmups=${options.warmups} runs=${options.runs}\n`,
+    );
 
-  for (const backend of selectedBackends(options.backend)) {
-    const fsTool = new FileSystem(options.root, { fsBackend: backend });
-    process.stdout.write(`\nbackend=${backend}\n`);
+    for (const backend of selectedBackends(options.backend)) {
+      const fsTool = new FileSystem(options.root, { fsBackend: backend });
+      process.stdout.write(`\nbackend=${backend}\n`);
 
-    for (const benchmarkCase of CASES) {
-      let lastCount = 0;
-      const warmupStart = performance.now();
-      for (let i = 0; i < options.warmups; i++) {
-        lastCount = await runCase(fsTool, benchmarkCase);
+      for (const benchmarkCase of CASES) {
+        let lastCount = 0;
+        const warmupStart = performance.now();
+        for (let i = 0; i < options.warmups; i++) {
+          lastCount = yield* Result.await(runCase(fsTool, benchmarkCase));
+        }
+        const warmupMs = elapsedMs(warmupStart);
+
+        const samples: number[] = [];
+        for (let i = 0; i < options.runs; i++) {
+          const start = performance.now();
+          lastCount = yield* Result.await(runCase(fsTool, benchmarkCase));
+          samples.push(elapsedMs(start));
+        }
+
+        process.stdout.write(
+          [
+            `case=${benchmarkCase.name}`,
+            `kind=${benchmarkCase.kind}`,
+            `count=${lastCount}`,
+            `warmup_ms=${formatMs(warmupMs)}`,
+            `median_ms=${formatMs(median(samples))}`,
+            `mean_ms=${formatMs(mean(samples))}`,
+            `min_ms=${formatMs(Math.min(...samples))}`,
+            `max_ms=${formatMs(Math.max(...samples))}`,
+          ].join(" ") + "\n",
+        );
       }
-      const warmupMs = elapsedMs(warmupStart);
-
-      const samples: number[] = [];
-      for (let i = 0; i < options.runs; i++) {
-        const start = performance.now();
-        lastCount = await runCase(fsTool, benchmarkCase);
-        samples.push(elapsedMs(start));
-      }
-
-      process.stdout.write(
-        [
-          `case=${benchmarkCase.name}`,
-          `kind=${benchmarkCase.kind}`,
-          `count=${lastCount}`,
-          `warmup_ms=${formatMs(warmupMs)}`,
-          `median_ms=${formatMs(median(samples))}`,
-          `mean_ms=${formatMs(mean(samples))}`,
-          `min_ms=${formatMs(Math.min(...samples))}`,
-          `max_ms=${formatMs(Math.max(...samples))}`,
-        ].join(" ") + "\n",
-      );
     }
-  }
+    return Result.ok(undefined);
+  });
 }
 
-try {
-  await runBenchmark(parseArgs(process.argv.slice(2)));
-} catch (e) {
-  const message = e instanceof Error ? e.message : String(e);
-  process.stderr.write(`${message}\n`);
-  process.exitCode = 1;
+const HELP_TEXT = [
+  "Usage: bun scripts/bench-fs-search.ts [--root PATH] [--backend all|fff|node-rg] [--warmups N] [--runs N]",
+  "",
+  "Examples:",
+  "  bun run bench:fs-search",
+  "  bun run bench:fs-search -- --root ../.. --runs 50",
+].join("\n");
+
+if (import.meta.main) {
+  const parsed = parseBenchmarkArgs(process.argv.slice(2));
+  const run = parsed.match({
+    ok: (options) => async () => {
+      if (options === "help") {
+        process.stdout.write(`${HELP_TEXT}\n`);
+        return;
+      }
+      const benchmark = await runBenchmark(options);
+      benchmark.match({
+        ok: () => undefined,
+        err: (error) => () => {
+          process.stderr.write(`${error.message}\n`);
+          process.exitCode = 1;
+        },
+      })?.();
+    },
+    err: (error) => async () => {
+      process.stderr.write(`${error.message}\n`);
+      process.exitCode = 1;
+    },
+  });
+  await run();
 }

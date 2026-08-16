@@ -1,6 +1,6 @@
 import { addDefaultParsers, type FiletypeParserOptions } from "@opentui/core";
 
-export const CODE_BLOCK_PARSERS = [
+const CODE_BLOCK_PARSERS = [
   {
     filetype: "python",
     aliases: ["py"],

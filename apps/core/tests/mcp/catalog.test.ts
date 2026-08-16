@@ -3,8 +3,8 @@ import { tool } from "ai";
 import { z } from "zod";
 
 import {
-  buildUnifiedToolCatalog,
-  createPortableToolSearch,
+  buildUnifiedToolCatalogResult,
+  createPortableToolSearchResult,
   type CatalogToolCandidate,
 } from "../../src/mcp/catalog";
 import {
@@ -12,6 +12,18 @@ import {
   baseCatalogToolName,
   catalogToolStableId,
 } from "../../src/mcp/catalog-identity";
+
+function buildUnifiedToolCatalog(params: Parameters<typeof buildUnifiedToolCatalogResult>[0]) {
+  const catalog = buildUnifiedToolCatalogResult(params);
+  if (catalog.status === "error") throw catalog.error;
+  return catalog.value;
+}
+
+function createPortableToolSearch(params: Parameters<typeof createPortableToolSearchResult>[0]) {
+  const search = createPortableToolSearchResult(params);
+  if (search.status === "error") throw search.error;
+  return search.value;
+}
 
 function executable(description = "fixture description") {
   return tool({
@@ -88,12 +100,17 @@ describe("unified deferred tool catalog", () => {
     );
     if (!hashedName) throw new Error("fixture identity did not receive a hashed name");
 
-    expect(() =>
-      buildUnifiedToolCatalog({
-        candidates: [entry],
-        reservedNames: new Set([baseName, hashedName]),
-      }),
-    ).toThrow("Unable to assign unique deferred catalog tool names");
+    const built = buildUnifiedToolCatalogResult({
+      candidates: [entry],
+      reservedNames: new Set([baseName, hashedName]),
+    });
+    expect(built.status).toBe("error");
+    if (built.status === "error") {
+      expect(built.error).toMatchObject({
+        _tag: "UnifiedToolCatalogInvalid",
+        reason: "name-collision",
+      });
+    }
   });
 
   it("searches one MCP and plugin catalog across source, raw name, title, and full description", async () => {
@@ -181,6 +198,18 @@ describe("unified deferred tool catalog", () => {
       matches: [{ stableId: expect.any(String) }, { stableId: expect.any(String) }],
     });
   });
+
+  it.each(["discord", "github", "slack", "telegram", "unknown", "web", "whatsapp"] as const)(
+    "keeps the broad portable MCP request-client reader for %s",
+    (requestClient) => {
+      const created = createPortableToolSearchResult({
+        catalog: [],
+        requestContext: { requestClient, sessionId: "session-1" },
+      });
+
+      expect(created.status).toBe("ok");
+    },
+  );
 
   it("ranks name matches above metadata-only matches and supports fuzzy keywords", async () => {
     const catalog = buildUnifiedToolCatalog({
@@ -304,15 +333,17 @@ describe("unified deferred tool catalog", () => {
       candidates: [candidate({ source: "mcp", sourceId: "one", rawName: "search-one" })],
     });
 
-    expect(() =>
-      createPortableToolSearch({
-        catalog: catalog.entries,
-        transcriptStore: {
-          selectSessionToolIds: () => undefined,
-        },
-        requestContext: { requestClient: "desktop", sessionId: "session-1" },
-      }),
-    ).toThrow();
+    const search = createPortableToolSearchResult({
+      catalog: catalog.entries,
+      transcriptStore: {
+        selectSessionToolIds: () => undefined,
+      },
+      requestContext: { requestClient: "desktop", sessionId: "session-1" },
+    });
+    expect(search.status).toBe("error");
+    if (search.status === "error") {
+      expect(search.error._tag).toBe("PortableToolSearchInvalid");
+    }
   });
 
   it("retains and can explicitly return all 5,000 catalog entries", async () => {

@@ -1,4 +1,5 @@
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, spyOn } from "bun:test";
+import { Logger } from "@stanley2058/simple-module-logger";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -67,6 +68,26 @@ describe("tool env", () => {
       });
       expect(await loadToolEnv(dataDir)).toEqual({});
     } finally {
+      await fs.rm(dataDir, { recursive: true, force: true });
+    }
+  });
+
+  it("reports successful JSON null as a schema validation warning", async () => {
+    const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-tool-env-"));
+    const secretDir = path.join(dataDir, "secret");
+    const warning = spyOn(Logger.prototype, "warn").mockImplementation(() => {});
+    await fs.mkdir(secretDir);
+
+    try {
+      await fs.writeFile(path.join(secretDir, "tool-env.jsonc"), "null", { mode: 0o600 });
+
+      expect(await loadToolEnv(dataDir)).toEqual({});
+      expect(warning).toHaveBeenCalledWith(
+        "tool env ignored: failed to read or validate file",
+        expect.objectContaining({ errorTag: "ToolEnvInvalidError" }),
+      );
+    } finally {
+      warning.mockRestore();
       await fs.rm(dataDir, { recursive: true, force: true });
     }
   });

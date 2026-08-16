@@ -1,39 +1,36 @@
-import type { LilacBus } from "@stanley2058/lilac-event-bus";
+import type {
+  EventPublishContractInvalid,
+  EventPublishTransportFailed,
+  LilacBus,
+} from "@stanley2058/lilac-event-bus";
 import { lilacEventTypes } from "@stanley2058/lilac-event-bus";
 import { createLogger } from "@stanley2058/lilac-utils";
+import { Panic, type Result as ResultType } from "better-result";
 
-import type { SurfaceAdapter } from "../adapter";
+import type { SurfaceAdapterEventSource } from "../adapter";
 import type { AdapterEvent } from "../events";
+import { requireDescriptorBoundAdapterEvent } from "../produced-ref-guard";
+import type { RegisteredSurfacePlatform } from "../types";
 import {
   toBusEvtAdapterMessageCreated,
   toBusEvtAdapterMessageDeleted,
   toBusEvtAdapterMessageUpdated,
   toBusEvtAdapterReactionAdded,
   toBusEvtAdapterReactionRemoved,
-} from "../discord/discord-adapter";
-import { escapeSurfaceMetadataTags, formatSurfaceMetadataLine } from "./surface-metadata";
+} from "./adapter-event-projection";
+import { toBusDiscordCommandInvokedData } from "../discord/discord-command-projection";
 import type { TranscriptStore } from "../../transcript/transcript-store";
-
-function buildSlashCommandUserMessageContent(
-  evt: Extract<AdapterEvent, { type: "adapter.command.invoked" }>,
-) {
-  const header = formatSurfaceMetadataLine({
-    platform: evt.platform,
-    ...(evt.userId ? { user_id: evt.userId } : {}),
-    ...(evt.userName ? { user_name: evt.userName } : {}),
-    message_time: new Date(evt.ts).toISOString(),
-  });
-
-  return `${header}\n${escapeSurfaceMetadataTags(evt.text)}`.trimEnd();
-}
+import { adaptEventPublishResultToHost } from "../../shared/event-bus-result";
+import { formatBridgeLogContext, formatBridgeTaggedErrorForLog } from "./bridge-log";
 
 export async function bridgeAdapterToBus(params: {
-  adapter: SurfaceAdapter;
+  eventSource: SurfaceAdapterEventSource;
+  platform: RegisteredSurfacePlatform;
   bus: LilacBus;
   subscriptionId: string;
   transcriptStore?: TranscriptStore;
 }) {
-  const { adapter, bus } = params;
+  const { eventSource, bus } = params;
   const logger = createLogger({
     module: "bridge:adapter-to-bus",
   });
@@ -65,80 +62,55 @@ export async function bridgeAdapterToBus(params: {
       errorClass: input.errorClass,
     });
   };
+  const finishPublish = <T>(
+    published: ResultType<T, EventPublishContractInvalid | EventPublishTransportFailed>,
+    context: Omit<Parameters<typeof logPublish>[0], "errorClass" | "ok">,
+  ): void => {
+    published.match({
+      err: (error) => () => {
+        logPublish({ ...context, ok: false, errorClass: error._tag });
+        adaptEventPublishResultToHost(published);
+      },
+      ok: () => () => logPublish({ ...context, ok: true }),
+    })();
+  };
 
-  return await adapter.subscribe(async (evt: AdapterEvent) => {
+  return await eventSource.subscribe(async (evt: AdapterEvent) => {
+    requireDescriptorBoundAdapterEvent(params.platform, evt);
     const startedAt = Date.now();
 
     switch (evt.type) {
       case "adapter.message.created": {
-        try {
-          await bus.publish(
-            lilacEventTypes.EvtAdapterMessageCreated,
-            toBusEvtAdapterMessageCreated({
-              message: evt.message,
-              channelName: evt.channelName,
-            }),
-          );
-          logPublish({
-            adapterEventType: evt.type,
-            busType: lilacEventTypes.EvtAdapterMessageCreated,
-            platform: evt.message.ref.platform,
-            channelId: evt.message.ref.channelId,
-            messageId: evt.message.ref.messageId,
-            userId: evt.message.userId,
-            startedAt,
-            ok: true,
-          });
-        } catch (e) {
-          logPublish({
-            adapterEventType: evt.type,
-            busType: lilacEventTypes.EvtAdapterMessageCreated,
-            platform: evt.message.ref.platform,
-            channelId: evt.message.ref.channelId,
-            messageId: evt.message.ref.messageId,
-            userId: evt.message.userId,
-            startedAt,
-            ok: false,
-            errorClass: e instanceof Error ? e.name : "unknown",
-          });
-          throw e;
-        }
+        const published = await bus.publish(
+          lilacEventTypes.EvtAdapterMessageCreated,
+          toBusEvtAdapterMessageCreated(evt),
+        );
+        finishPublish(published, {
+          adapterEventType: evt.type,
+          busType: lilacEventTypes.EvtAdapterMessageCreated,
+          platform: evt.message.ref.platform,
+          channelId: evt.message.ref.channelId,
+          messageId: evt.message.ref.messageId,
+          userId: evt.message.userId,
+          startedAt,
+        });
         break;
       }
 
       case "adapter.message.updated": {
-        try {
-          await bus.publish(
-            lilacEventTypes.EvtAdapterMessageUpdated,
-            toBusEvtAdapterMessageUpdated({
-              message: evt.message,
-              channelName: evt.channelName,
-            }),
-          );
-          logPublish({
-            adapterEventType: evt.type,
-            busType: lilacEventTypes.EvtAdapterMessageUpdated,
-            platform: evt.message.ref.platform,
-            channelId: evt.message.ref.channelId,
-            messageId: evt.message.ref.messageId,
-            userId: evt.message.userId,
-            startedAt,
-            ok: true,
-          });
-        } catch (e) {
-          logPublish({
-            adapterEventType: evt.type,
-            busType: lilacEventTypes.EvtAdapterMessageUpdated,
-            platform: evt.message.ref.platform,
-            channelId: evt.message.ref.channelId,
-            messageId: evt.message.ref.messageId,
-            userId: evt.message.userId,
-            startedAt,
-            ok: false,
-            errorClass: e instanceof Error ? e.name : "unknown",
-          });
-          throw e;
-        }
+        const published = await bus.publish(
+          lilacEventTypes.EvtAdapterMessageUpdated,
+          toBusEvtAdapterMessageUpdated(evt),
+        );
+        finishPublish(published, {
+          adapterEventType: evt.type,
+          busType: lilacEventTypes.EvtAdapterMessageUpdated,
+          platform: evt.message.ref.platform,
+          channelId: evt.message.ref.channelId,
+          messageId: evt.message.ref.messageId,
+          userId: evt.message.userId,
+          startedAt,
+        });
         break;
       }
 
@@ -149,144 +121,90 @@ export async function bridgeAdapterToBus(params: {
             channelId: evt.messageRef.channelId,
             messageId: evt.messageRef.messageId,
           });
-          if (unlinkResult?.checkpointDeleted) {
-            logger.info("compaction checkpoint deleted", {
-              requestId: unlinkResult.requestId,
-              platform: evt.messageRef.platform,
-              channelId: evt.messageRef.channelId,
-              messageId: evt.messageRef.messageId,
-              reason: "last_surface_link_deleted",
-            });
-          }
-        } catch (e) {
+          unlinkResult?.match({
+            err: (error) => () =>
+              logger.warn(
+                "failed to unlink deleted surface message",
+                formatBridgeTaggedErrorForLog(error, {
+                  platform: evt.messageRef.platform,
+                  channelId: evt.messageRef.channelId,
+                  messageId: evt.messageRef.messageId,
+                }),
+              ),
+            ok: (value) => () => {
+              if (value.checkpointDeleted) {
+                logger.info(
+                  "compaction checkpoint deleted",
+                  formatBridgeLogContext({
+                    requestId: value.requestId,
+                    platform: evt.messageRef.platform,
+                    channelId: evt.messageRef.channelId,
+                    messageId: evt.messageRef.messageId,
+                    reason: "last_surface_link_deleted",
+                  }),
+                );
+              }
+            },
+          })();
+        } catch (cause) {
+          if (Panic.is(cause)) throw cause;
           logger.warn(
             "failed to unlink deleted surface message",
-            {
+            formatBridgeLogContext({
               platform: evt.messageRef.platform,
               channelId: evt.messageRef.channelId,
               messageId: evt.messageRef.messageId,
-            },
-            e,
+              errorMessage: cause instanceof Error ? cause.message : "Unknown unlink failure",
+            }),
           );
         }
 
-        try {
-          await bus.publish(
-            lilacEventTypes.EvtAdapterMessageDeleted,
-            toBusEvtAdapterMessageDeleted({
-              messageRef: evt.messageRef,
-              session: evt.session,
-              channelName: evt.channelName,
-              ts: evt.ts,
-              raw: evt.raw,
-            }),
-          );
-          logPublish({
-            adapterEventType: evt.type,
-            busType: lilacEventTypes.EvtAdapterMessageDeleted,
-            platform: evt.messageRef.platform,
-            channelId: evt.messageRef.channelId,
-            messageId: evt.messageRef.messageId,
-            startedAt,
-            ok: true,
-          });
-        } catch (e) {
-          logPublish({
-            adapterEventType: evt.type,
-            busType: lilacEventTypes.EvtAdapterMessageDeleted,
-            platform: evt.messageRef.platform,
-            channelId: evt.messageRef.channelId,
-            messageId: evt.messageRef.messageId,
-            startedAt,
-            ok: false,
-            errorClass: e instanceof Error ? e.name : "unknown",
-          });
-          throw e;
-        }
+        const published = await bus.publish(
+          lilacEventTypes.EvtAdapterMessageDeleted,
+          toBusEvtAdapterMessageDeleted(evt),
+        );
+        finishPublish(published, {
+          adapterEventType: evt.type,
+          busType: lilacEventTypes.EvtAdapterMessageDeleted,
+          platform: evt.messageRef.platform,
+          channelId: evt.messageRef.channelId,
+          messageId: evt.messageRef.messageId,
+          startedAt,
+        });
         break;
       }
 
       case "adapter.reaction.added": {
-        try {
-          await bus.publish(
-            lilacEventTypes.EvtAdapterReactionAdded,
-            toBusEvtAdapterReactionAdded({
-              messageRef: evt.messageRef,
-              session: evt.session,
-              channelName: evt.channelName,
-              reaction: evt.reaction,
-              userId: evt.userId,
-              userName: evt.userName,
-              ts: evt.ts,
-              raw: evt.raw,
-            }),
-          );
-          logPublish({
-            adapterEventType: evt.type,
-            busType: lilacEventTypes.EvtAdapterReactionAdded,
-            platform: evt.messageRef.platform,
-            channelId: evt.messageRef.channelId,
-            messageId: evt.messageRef.messageId,
-            userId: evt.userId,
-            startedAt,
-            ok: true,
-          });
-        } catch (e) {
-          logPublish({
-            adapterEventType: evt.type,
-            busType: lilacEventTypes.EvtAdapterReactionAdded,
-            platform: evt.messageRef.platform,
-            channelId: evt.messageRef.channelId,
-            messageId: evt.messageRef.messageId,
-            userId: evt.userId,
-            startedAt,
-            ok: false,
-            errorClass: e instanceof Error ? e.name : "unknown",
-          });
-          throw e;
-        }
+        const published = await bus.publish(
+          lilacEventTypes.EvtAdapterReactionAdded,
+          toBusEvtAdapterReactionAdded(evt),
+        );
+        finishPublish(published, {
+          adapterEventType: evt.type,
+          busType: lilacEventTypes.EvtAdapterReactionAdded,
+          platform: evt.messageRef.platform,
+          channelId: evt.messageRef.channelId,
+          messageId: evt.messageRef.messageId,
+          userId: evt.userId,
+          startedAt,
+        });
         break;
       }
 
       case "adapter.reaction.removed": {
-        try {
-          await bus.publish(
-            lilacEventTypes.EvtAdapterReactionRemoved,
-            toBusEvtAdapterReactionRemoved({
-              messageRef: evt.messageRef,
-              session: evt.session,
-              channelName: evt.channelName,
-              reaction: evt.reaction,
-              userId: evt.userId,
-              userName: evt.userName,
-              ts: evt.ts,
-              raw: evt.raw,
-            }),
-          );
-          logPublish({
-            adapterEventType: evt.type,
-            busType: lilacEventTypes.EvtAdapterReactionRemoved,
-            platform: evt.messageRef.platform,
-            channelId: evt.messageRef.channelId,
-            messageId: evt.messageRef.messageId,
-            userId: evt.userId,
-            startedAt,
-            ok: true,
-          });
-        } catch (e) {
-          logPublish({
-            adapterEventType: evt.type,
-            busType: lilacEventTypes.EvtAdapterReactionRemoved,
-            platform: evt.messageRef.platform,
-            channelId: evt.messageRef.channelId,
-            messageId: evt.messageRef.messageId,
-            userId: evt.userId,
-            startedAt,
-            ok: false,
-            errorClass: e instanceof Error ? e.name : "unknown",
-          });
-          throw e;
-        }
+        const published = await bus.publish(
+          lilacEventTypes.EvtAdapterReactionRemoved,
+          toBusEvtAdapterReactionRemoved(evt),
+        );
+        finishPublish(published, {
+          adapterEventType: evt.type,
+          busType: lilacEventTypes.EvtAdapterReactionRemoved,
+          platform: evt.messageRef.platform,
+          channelId: evt.messageRef.channelId,
+          messageId: evt.messageRef.messageId,
+          userId: evt.userId,
+          startedAt,
+        });
         break;
       }
 
@@ -294,127 +212,75 @@ export async function bridgeAdapterToBus(params: {
         const cancelScope = evt.cancelScope ?? "active_only";
         const cancelQueued = cancelScope === "active_or_queued";
 
-        try {
-          await bus.publish(
-            lilacEventTypes.CmdRequestMessage,
-            {
-              queue: "interrupt",
-              messages: [],
-              raw: {
-                cancel: true,
-                cancelQueued,
-                requiresActive: !cancelQueued,
-                source:
-                  evt.source ??
-                  (cancelQueued ? "discord_cancel_context_menu" : "discord_cancel_button"),
-                ...(evt.userId ? { userId: evt.userId } : {}),
-                ...(evt.messageId ? { messageId: evt.messageId } : {}),
-              },
+        const published = await bus.publish(
+          lilacEventTypes.CmdRequestMessage,
+          {
+            queue: "interrupt",
+            messages: [],
+            raw: {
+              cancel: true,
+              cancelQueued,
+              requiresActive: !cancelQueued,
+              source: evt.source ?? (cancelQueued ? "context_menu" : "button"),
+              ...(evt.userId ? { userId: evt.userId } : {}),
+              ...(evt.messageId ? { messageId: evt.messageId } : {}),
             },
-            {
-              headers: {
-                request_id: evt.requestId,
-                session_id: evt.sessionId,
-                request_client: evt.platform,
-              },
+          },
+          {
+            headers: {
+              request_id: evt.requestId,
+              session_id: evt.sessionId,
+              request_client: evt.platform,
             },
-          );
-          logPublish({
-            adapterEventType: evt.type,
-            busType: lilacEventTypes.CmdRequestMessage,
-            platform: evt.platform,
-            messageId: evt.messageId,
-            userId: evt.userId,
-            requestId: evt.requestId,
-            sessionId: evt.sessionId,
-            startedAt,
-            ok: true,
-          });
-        } catch (e) {
-          logPublish({
-            adapterEventType: evt.type,
-            busType: lilacEventTypes.CmdRequestMessage,
-            platform: evt.platform,
-            messageId: evt.messageId,
-            userId: evt.userId,
-            requestId: evt.requestId,
-            sessionId: evt.sessionId,
-            startedAt,
-            ok: false,
-            errorClass: e instanceof Error ? e.name : "unknown",
-          });
-          throw e;
-        }
+          },
+        );
+        finishPublish(published, {
+          adapterEventType: evt.type,
+          busType: lilacEventTypes.CmdRequestMessage,
+          platform: evt.platform,
+          messageId: evt.messageId,
+          userId: evt.userId,
+          requestId: evt.requestId,
+          sessionId: evt.sessionId,
+          startedAt,
+        });
         break;
       }
 
       case "adapter.command.invoked": {
-        try {
-          await bus.publish(
-            lilacEventTypes.CmdRequestMessage,
-            {
-              queue: "prompt",
-              messages: [{ role: "user", content: buildSlashCommandUserMessageContent(evt) }],
-              ...(evt.modelOverride ? { modelOverride: evt.modelOverride } : {}),
-              raw: {
-                authenticatedActor: {
-                  platform: evt.platform,
-                  userId: evt.userId,
-                },
-                sessionMode: evt.sessionMode,
-                sessionConfigId: evt.sessionConfigId,
-                ...(evt.modelOverride ? { modelOverride: evt.modelOverride } : {}),
-                customCommand: {
-                  name: evt.commandName,
-                  args: evt.args,
-                  ...(evt.prompt ? { prompt: evt.prompt } : {}),
-                  text: evt.text,
-                  source: "discord-slash",
-                },
-              },
+        const published = await bus.publish(
+          lilacEventTypes.CmdRequestMessage,
+          toBusDiscordCommandInvokedData(evt),
+          {
+            headers: {
+              request_id: evt.requestId,
+              session_id: evt.sessionId,
+              request_client: evt.platform,
             },
-            {
-              headers: {
-                request_id: evt.requestId,
-                session_id: evt.sessionId,
-                request_client: evt.platform,
-              },
-            },
-          );
-          logPublish({
-            adapterEventType: evt.type,
-            busType: lilacEventTypes.CmdRequestMessage,
-            platform: evt.platform,
-            requestId: evt.requestId,
-            sessionId: evt.sessionId,
-            startedAt,
-            ok: true,
-          });
-        } catch (e) {
-          logPublish({
-            adapterEventType: evt.type,
-            busType: lilacEventTypes.CmdRequestMessage,
-            platform: evt.platform,
-            requestId: evt.requestId,
-            sessionId: evt.sessionId,
-            startedAt,
-            ok: false,
-            errorClass: e instanceof Error ? e.name : "unknown",
-          });
-          throw e;
-        }
+          },
+        );
+        finishPublish(published, {
+          adapterEventType: evt.type,
+          busType: lilacEventTypes.CmdRequestMessage,
+          platform: evt.platform,
+          requestId: evt.requestId,
+          sessionId: evt.sessionId,
+          startedAt,
+        });
         break;
       }
 
       case "adapter.action.invoked": {
-        await bus.publish(lilacEventTypes.EvtAdapterActionInvoked, {
-          actionId: evt.actionId,
-          platform: evt.platform,
-          userId: evt.userId,
-          messageRef: evt.messageRef,
-          sourceMessageId: evt.sourceMessageId,
-          ts: evt.ts,
-        });
+        adaptEventPublishResultToHost(
+          await bus.publish(lilacEventTypes.EvtAdapterActionInvoked, {
+            actionId: evt.actionId,
+            platform: evt.platform,
+            userId: evt.userId,
+            messageRef: evt.messageRef,
+            sourceMessageId: evt.sourceMessageId,
+            ts: evt.ts,
+          }),
+        );
         break;
       }
 

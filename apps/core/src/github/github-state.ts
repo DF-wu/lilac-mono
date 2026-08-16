@@ -21,16 +21,54 @@ export type GithubAckState = {
   reactionId: number;
 };
 
+export type GithubAcknowledgementClaim =
+  | { kind: "unclaimed" }
+  | {
+      kind: "already-owned";
+      requestId: string;
+      acknowledgement: GithubAckState;
+    }
+  | {
+      kind: "transferred";
+      previousRequestId: string;
+      requestId: string;
+      acknowledgement: GithubAckState;
+    };
+
+export type GithubLatestRequestTransition = {
+  sessionId: string;
+  requestId: string;
+  previousRequestId: string | undefined;
+};
+
 const latestBySession = new Map<string, string>();
 const metaByRequest = new Map<string, GithubRequestMeta>();
 const ackByRequest = new Map<string, GithubAckState>();
 
-export function setGithubLatestRequestForSession(sessionId: string, requestId: string) {
+export function setGithubLatestRequestForSession(
+  sessionId: string,
+  requestId: string,
+): GithubLatestRequestTransition {
+  const previousRequestId = latestBySession.get(sessionId);
   latestBySession.set(sessionId, requestId);
+  return { sessionId, requestId, previousRequestId };
 }
 
 export function getGithubLatestRequestForSession(sessionId: string): string | undefined {
   return latestBySession.get(sessionId);
+}
+
+export function restoreGithubLatestRequestForSession(
+  transition: GithubLatestRequestTransition,
+): boolean {
+  if (latestBySession.get(transition.sessionId) !== transition.requestId) return false;
+
+  if (transition.previousRequestId) {
+    latestBySession.set(transition.sessionId, transition.previousRequestId);
+  } else {
+    latestBySession.delete(transition.sessionId);
+  }
+  return true;
 }
 
 export function setGithubRequestMeta(meta: GithubRequestMeta) {
@@ -51,4 +89,41 @@ export function getGithubAck(requestId: string): GithubAckState | undefined {
 
 export function clearGithubAck(requestId: string) {
   ackByRequest.delete(requestId);
+}
+
+export function claimGithubAcknowledgement(
+  previousRequestId: string | undefined,
+  requestId: string,
+): GithubAcknowledgementClaim {
+  const existing = ackByRequest.get(requestId);
+  if (existing) {
+    return {
+      kind: "already-owned",
+      requestId,
+      acknowledgement: existing,
+    };
+  }
+  if (!previousRequestId || previousRequestId === requestId) return { kind: "unclaimed" };
+
+  const acknowledgement = ackByRequest.get(previousRequestId);
+  if (!acknowledgement) return { kind: "unclaimed" };
+
+  ackByRequest.set(requestId, acknowledgement);
+  ackByRequest.delete(previousRequestId);
+  return {
+    kind: "transferred",
+    previousRequestId,
+    requestId,
+    acknowledgement,
+  };
+}
+
+export function rollbackGithubAcknowledgementClaim(claim: GithubAcknowledgementClaim): boolean {
+  if (claim.kind !== "transferred") return false;
+  if (ackByRequest.get(claim.requestId) !== claim.acknowledgement) return false;
+  if (ackByRequest.has(claim.previousRequestId)) return false;
+
+  ackByRequest.delete(claim.requestId);
+  ackByRequest.set(claim.previousRequestId, claim.acknowledgement);
+  return true;
 }

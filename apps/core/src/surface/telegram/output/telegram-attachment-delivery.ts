@@ -1,10 +1,20 @@
+import { Result } from "better-result";
 import { InputFile } from "grammy";
 import type { Bot } from "grammy";
 
 import type { MsgRef, SurfaceAttachment } from "../../types";
-import type { SurfaceFinalTextMode, SurfaceOutputResult, SurfaceOutputStream } from "../../adapter";
+import {
+  SurfaceOperationPartiallyCompleted,
+  type SurfaceFinalTextMode,
+  type SurfaceOperationResult,
+  type SurfaceOutputPart,
+  type SurfaceOutputPartDisposition,
+  type SurfaceOutputResult,
+  type SurfaceOutputStream,
+} from "../../adapter";
 import { parseTelegramSessionId, telegramMsgRef } from "../telegram-ids";
 import type { TelegramSessionRef } from "../../types";
+import { projectTelegramError, type TelegramErrorProjection } from "../telegram-error-projection";
 import type { TelegramSurplusDeletionFailure } from "./telegram-output-stream";
 
 /**
@@ -77,7 +87,13 @@ export type TelegramAttachmentDeliveryResult = {
    * attempted. `attachment` is absent when the failure could not be attributed
    * to a particular upload.
    */
-  failure?: { error: unknown; attachment?: SurfaceAttachment };
+  failure?: { error: TelegramErrorProjection; attachment?: SurfaceAttachment };
+};
+
+export type TelegramAttachmentFailureContext = {
+  readonly filename?: string;
+  readonly uploaded?: number;
+  readonly total?: number;
 };
 
 /**
@@ -123,20 +139,28 @@ export async function deliverTelegramAttachments(input: {
   const uploaded: TelegramAttachmentUpload[] = [];
   for (const attachment of input.attachments) {
     const file = new InputFile(attachment.bytes, attachment.filename);
-
-    try {
-      const sent = shouldSendAsPhoto(attachment)
-        ? await input.api.sendPhoto(chatId, file, opts)
-        : await input.api.sendDocument(chatId, file, opts);
-
-      uploaded.push({
-        ref: telegramMsgRef({ chatId, threadId, messageId: sent.message_id }),
-        messageId: sent.message_id,
-        attachment,
-      });
-    } catch (error: unknown) {
-      return { uploaded, failure: { error, attachment } };
+    const attempted = await Result.tryPromise({
+      try: () =>
+        shouldSendAsPhoto(attachment)
+          ? input.api.sendPhoto(chatId, file, opts)
+          : input.api.sendDocument(chatId, file, opts),
+      catch: projectTelegramError("Telegram attachment delivery failed"),
+    });
+    const outcome = attempted.match<
+      | { readonly kind: "sent"; readonly messageId: number }
+      | { readonly kind: "failed"; readonly error: TelegramErrorProjection }
+    >({
+      ok: (sent) => ({ kind: "sent", messageId: sent.message_id }),
+      err: (error) => ({ kind: "failed", error }),
+    });
+    if (outcome.kind === "failed") {
+      return { uploaded, failure: { error: outcome.error, attachment } };
     }
+    uploaded.push({
+      ref: telegramMsgRef({ chatId, threadId, messageId: outcome.messageId }),
+      messageId: outcome.messageId,
+      attachment,
+    });
   }
 
   return { uploaded };
@@ -156,7 +180,7 @@ export class TelegramOutputStreamWithAttachments implements SurfaceOutputStream 
       api: TelegramAttachmentApi;
       sessionRef: TelegramSessionRef;
       silent: boolean;
-      onError: (error: unknown, context?: Record<string, unknown>) => void;
+      onError: (error: Error, context?: TelegramAttachmentFailureContext) => void;
       /**
        * Records what was delivered. Telegram does not echo the bot's own
        * messages back as updates, so this is the only chance to index them.
@@ -177,77 +201,97 @@ export class TelegramOutputStreamWithAttachments implements SurfaceOutputStream 
     },
   ) {}
 
-  push(part: Parameters<SurfaceOutputStream["push"]>[0]): Promise<void> {
+  push(part: SurfaceOutputPart): Promise<SurfaceOperationResult<SurfaceOutputPartDisposition>> {
     return this.stream.push(part);
   }
 
-  async finish(): Promise<SurfaceOutputResult> {
-    const result = await this.stream.finish();
+  async finish(): Promise<SurfaceOperationResult<SurfaceOutputResult>> {
+    const finished = await this.stream.finish();
+    const continueFinish = finished.match<
+      () => Promise<SurfaceOperationResult<SurfaceOutputResult>>
+    >({
+      err: (error) => async () => Result.err(error),
+      ok: (result) => async () => {
+        this.report(() => {
+          this.deps.onDelivered(this.stream.getDeliveredMessages());
 
-    this.report(() => {
-      this.deps.onDelivered(this.stream.getDeliveredMessages());
+          const unreconciled = this.stream.getSurplusDeletionFailures();
+          if (unreconciled.length > 0) this.deps.onUnreconciled(unreconciled);
+        });
 
-      const unreconciled = this.stream.getSurplusDeletionFailures();
-      if (unreconciled.length > 0) this.deps.onUnreconciled(unreconciled);
+        const attachments = this.stream.takePendingAttachments();
+        if (attachments.length === 0) return Result.ok(result);
+
+        const deliveryAttempt = await Result.tryPromise({
+          try: () =>
+            deliverTelegramAttachments({
+              api: this.deps.api,
+              sessionRef: this.deps.sessionRef,
+              attachments,
+              silent: this.deps.silent,
+            }),
+          catch: projectTelegramError("Telegram attachment delivery failed"),
+        });
+        const delivery = deliveryAttempt.match<TelegramAttachmentDeliveryResult>({
+          ok: (value) => value,
+          err: (error) => ({ uploaded: [], failure: { error } }),
+        });
+
+        // Index before reporting the failure: every upload here is visible in the
+        // chat, so a reply to one has to resolve even when a later upload failed.
+        if (delivery.uploaded.length > 0) {
+          this.report(() =>
+            this.deps.onDelivered(
+              delivery.uploaded.map((upload) => ({
+                messageId: upload.messageId,
+                text: telegramAttachmentIndexText(upload.attachment),
+              })),
+            ),
+          );
+        }
+
+        if (delivery.failure) {
+          this.deps.onError(delivery.failure.error.error, {
+            filename: delivery.failure.attachment?.filename,
+            uploaded: delivery.uploaded.length,
+            total: attachments.length,
+          });
+          const created = delivery.uploaded.at(-1)?.ref ?? result.last;
+          return Result.err(
+            new SurfaceOperationPartiallyCompleted({
+              platform: "telegram",
+              operation: "finish-output",
+              created,
+              message: `Telegram attachment delivery partially completed: ${delivery.failure.error.message}`,
+            }),
+          );
+        }
+
+        if (delivery.uploaded.length === 0) return Result.ok(result);
+
+        const created = delivery.uploaded.map((upload) => upload.ref);
+        const last = created[created.length - 1];
+        return Result.ok({
+          created: [...result.created, ...created],
+          last: last ?? result.last,
+        });
+      },
     });
-
-    const attachments = this.stream.takePendingAttachments();
-    if (attachments.length === 0) return result;
-
-    const delivery = await deliverTelegramAttachments({
-      api: this.deps.api,
-      sessionRef: this.deps.sessionRef,
-      attachments,
-      silent: this.deps.silent,
-    }).catch((error: unknown): TelegramAttachmentDeliveryResult => {
-      // The upload loop reports its own failures through the result, so the
-      // only throw that can reach here comes from resolving the session ref,
-      // before anything has been sent. Folding it into a result keeps an
-      // already-delivered text reply from being lost to it.
-      return { uploaded: [], failure: { error } };
-    });
-
-    // Index before reporting the failure: every upload here is visible in the
-    // chat, so a reply to one has to resolve even when a later upload failed.
-    if (delivery.uploaded.length > 0) {
-      this.report(() =>
-        this.deps.onDelivered(
-          delivery.uploaded.map((upload) => ({
-            messageId: upload.messageId,
-            text: telegramAttachmentIndexText(upload.attachment),
-          })),
-        ),
-      );
-    }
-
-    if (delivery.failure) {
-      this.deps.onError(delivery.failure.error, {
-        filename: delivery.failure.attachment?.filename,
-        uploaded: delivery.uploaded.length,
-        total: attachments.length,
-      });
-    }
-
-    if (delivery.uploaded.length === 0) return result;
-
-    const created = delivery.uploaded.map((upload) => upload.ref);
-    const last = created[created.length - 1];
-    return {
-      created: [...result.created, ...created],
-      last: last ?? result.last,
-    };
+    return await continueFinish();
   }
 
   /** Reporting is best-effort; it must never fail a reply that was delivered. */
   private report(fn: () => void): void {
-    try {
-      fn();
-    } catch (error: unknown) {
-      this.deps.onError(error);
-    }
+    Result.try({
+      try: fn,
+      catch: projectTelegramError("Telegram output reporting failed"),
+    }).match({
+      ok: () => undefined,
+      err: (error) => this.deps.onError(error.error),
+    });
   }
 
-  abort(reason?: string): Promise<void> {
+  abort(reason?: string): Promise<SurfaceOperationResult<void>> {
     return this.stream.abort(reason);
   }
 

@@ -15,12 +15,9 @@ function toBase64Url(input: string): string {
 }
 
 function fromBase64Url(b64url: string): string | null {
-  if (!b64url || typeof b64url !== "string") return null;
-  try {
-    return Buffer.from(b64url, "base64url").toString("utf8");
-  } catch {
-    return null;
-  }
+  if (!b64url || !/^[A-Za-z0-9_-]+$/u.test(b64url)) return null;
+  const decoded = Buffer.from(b64url, "base64url").toString("utf8");
+  return toBase64Url(decoded) === b64url ? decoded : null;
 }
 
 export function buildCancelCustomId(input: {

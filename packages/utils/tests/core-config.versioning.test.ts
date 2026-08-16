@@ -1,10 +1,14 @@
 import { describe, expect, it } from "bun:test";
 
+import { ZodError } from "zod";
+
 import {
   parseCoreConfig,
+  parseCoreConfigResult,
   parseCoreConfigV1ToUniversal,
   parseCoreConfigV2ToUniversal,
   readCoreConfigVersion,
+  readCoreConfigVersionResult,
 } from "../core-config";
 import { deriveSubagentIdleTimeoutMs } from "../subagent-idle-timeout";
 
@@ -128,6 +132,48 @@ describe("core config versioning", () => {
     expect(parsed.agent.systemPrompt).toBe("");
   });
 
+  it("returns typed version and schema failures", () => {
+    const unsupported = readCoreConfigVersionResult({ configVersion: 99 });
+    expect(unsupported.status).toBe("error");
+    if (unsupported.status === "error") {
+      expect(unsupported.error._tag).toBe("CoreConfigVersionInvalid");
+    }
+
+    const invalid = parseCoreConfigResult({ configVersion: 2, tools: { output: null } });
+    expect(invalid.status).toBe("error");
+    if (invalid.status === "error") expect(invalid.error._tag).toBe("CoreConfigV2Invalid");
+
+    const deprecated = parseCoreConfigResult({
+      configVersion: 2,
+      surface: { telegram: { tokenEnv: "TELEGRAM_BOT_TOKEN" } },
+    });
+    expect(deprecated.status).toBe("error");
+    if (deprecated.status === "error") {
+      expect(deprecated.error._tag).toBe("CoreConfigDeprecatedField");
+    }
+  });
+
+  it("keeps legacy config exceptions as Error and ZodError", async () => {
+    let versionError: unknown;
+    try {
+      readCoreConfigVersion({ configVersion: 99 });
+    } catch (cause) {
+      versionError = cause;
+    }
+    expect(versionError).toBeInstanceOf(Error);
+    if (versionError instanceof Error) expect(versionError.constructor).toBe(Error);
+
+    await expect(
+      parseCoreConfig({ configVersion: 2, tools: { output: null } }),
+    ).rejects.toBeInstanceOf(ZodError);
+    await expect(
+      parseCoreConfig({
+        configVersion: 2,
+        surface: { telegram: { tokenEnv: "TELEGRAM_BOT_TOKEN" } },
+      }),
+    ).rejects.toThrow("surface.telegram.tokenEnv was removed");
+  });
+
   it("parses explicit v1 configs with current defaults", async () => {
     const parsed = await parseCoreConfig({ configVersion: 1 });
 
@@ -135,6 +181,11 @@ describe("core config versioning", () => {
     expect(parsed.surface.discord.outputMode).toBe("inline");
     expect(parsed.surface.discord.outputPreviewModeFinalStyle).toBe("embed");
     expect(parsed.surface.discord.markdownTableRender.enabled).toBe(false);
+    expect(parsed.surface.discord.markdownMathRender).toEqual({
+      enabled: false,
+      maxWidth: 50,
+      fallbackMode: "source",
+    });
     expect(parsed.agent.reasoningDisplay).toBe("simple");
     expect(parsed.agent.idleTimeoutMs).toBe(15 * 60 * 1000);
     expect(parsed.agent.retry).toEqual({
@@ -147,6 +198,16 @@ describe("core config versioning", () => {
     expect(parsed.tools.web.fetch.mode).toBe("auto");
     expect(parsed.tools.inspect.model).toBe("google/gemini-3-flash");
     expect(parsed.tools.editFile.hashline).toBe(false);
+    expect(parsed.agent.subagents.profiles.explore.level1.tools).toEqual([
+      "read",
+      "glob",
+      "grep",
+      "fuzzy_search",
+      "batch",
+    ]);
+    expect(parsed.agent.subagents.profiles.explore.execution).toBe(false);
+    expect(parsed.agent.subagents.profiles.general.execution).toBe("native");
+    expect(parsed.agent.subagents.profiles.self.execution).toBe("native");
     expect("idleTimeoutMs" in parsed.agent.subagents).toBe(false);
     expect(parsed.workflows.maxActiveRuns).toBe(64);
   });
@@ -156,6 +217,17 @@ describe("core config versioning", () => {
 
     expect(parsed.configVersion).toBe(2);
     expect(parsed.tools.fsBackend).toBe("fff");
+    expect(parsed.agent.subagents.profiles.explore.level1.tools).toEqual([
+      "bash",
+      "read",
+      "glob",
+      "grep",
+      "fuzzy_search",
+      "batch",
+    ]);
+    expect(parsed.agent.subagents.profiles.explore.execution).toBe("restricted");
+    expect(parsed.agent.subagents.profiles.general.execution).toBe("native");
+    expect(parsed.agent.subagents.profiles.self.execution).toBe("native");
     expect(parsed.tools.inspect.model).toBe("google/gemini-3.5-flash");
     expect(parsed.tools.editFile.hashline).toBe(true);
     expect(parsed.surface.discord.outputMode).toBe("preview");
@@ -166,6 +238,11 @@ describe("core config versioning", () => {
       style: "unicode",
       maxWidth: 50,
       fallbackMode: "list",
+    });
+    expect(parsed.surface.discord.markdownMathRender).toEqual({
+      enabled: false,
+      maxWidth: 50,
+      fallbackMode: "source",
     });
     expect(parsed.agent.reasoningDisplay).toBe("detailed");
     expect(parsed.agent.idleTimeoutMs).toBe(15 * 60 * 1000);
@@ -196,6 +273,73 @@ describe("core config versioning", () => {
     });
 
     expect(parsed.workflows.maxActiveRuns).toBe(64);
+  });
+
+  it("parses v2 Discord markdown math rendering settings", () => {
+    const parsed = parseCoreConfigV2ToUniversal({
+      configVersion: 2,
+      surface: {
+        discord: {
+          markdownMathRender: {
+            enabled: true,
+            maxWidth: 240,
+            fallbackMode: "passthrough",
+          },
+        },
+      },
+    });
+
+    expect(parsed.surface.discord.markdownMathRender).toEqual({
+      enabled: true,
+      maxWidth: 240,
+      fallbackMode: "passthrough",
+    });
+  });
+
+  it("rejects invalid v2 Discord markdown math rendering settings", () => {
+    for (const markdownMathRender of [
+      { enabled: true, maxWidth: 39, fallbackMode: "source" },
+      { enabled: true, maxWidth: 241, fallbackMode: "source" },
+      { enabled: true, maxWidth: 50.5, fallbackMode: "source" },
+      { enabled: true, maxWidth: 50, fallbackMode: "invalid" },
+    ]) {
+      expect(() =>
+        parseCoreConfigV2ToUniversal({
+          configVersion: 2,
+          surface: { discord: { markdownMathRender } },
+        }),
+      ).toThrow();
+    }
+  });
+
+  it("keeps Discord markdown math rendering out of the frozen v1 input shape", () => {
+    const unknownKeys: string[][] = [];
+    const parsed = parseCoreConfigV1ToUniversal(
+      {
+        surface: {
+          discord: {
+            botName: "lilac",
+            markdownMathRender: {
+              enabled: true,
+              maxWidth: 240,
+              fallbackMode: "passthrough",
+            },
+          },
+        },
+      },
+      {
+        onUnknownKey(path) {
+          unknownKeys.push([...path] as string[]);
+        },
+      },
+    );
+
+    expect(unknownKeys).toEqual([["surface", "discord", "markdownMathRender"]]);
+    expect(parsed.surface.discord.markdownMathRender).toEqual({
+      enabled: false,
+      maxWidth: 50,
+      fallbackMode: "source",
+    });
   });
 
   it("parses v2 portable model reasoning fields", async () => {
@@ -500,9 +644,14 @@ describe("core config versioning", () => {
       enabled: true,
       maxDepth: 2,
       profiles: {
-        explore: { modelSlot: "main", execution: false, workspaceWrites: false },
-        general: { modelSlot: "main", execution: true, workspaceWrites: true },
-        self: { modelSlot: "main", execution: true, workspaceWrites: true, delegation: true },
+        explore: { modelSlot: "main", execution: "restricted", workspaceWrites: false },
+        general: { modelSlot: "main", execution: "native", workspaceWrites: true },
+        self: {
+          modelSlot: "main",
+          execution: "native",
+          workspaceWrites: true,
+          delegation: true,
+        },
       },
     });
     expect("idleTimeoutMs" in parsed.agent.subagents).toBe(false);

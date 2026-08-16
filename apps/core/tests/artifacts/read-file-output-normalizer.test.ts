@@ -6,7 +6,7 @@ import path from "node:path";
 import { createToolResultArtifactStore } from "../../src/artifacts/tool-result-artifact-store";
 import { createToolResultOutputNormalizer } from "../../src/artifacts/tool-result-output-normalizer";
 
-describe("Core read_file output normalization", () => {
+describe("Core read output normalization", () => {
   let root: string;
 
   beforeEach(async () => {
@@ -39,7 +39,7 @@ describe("Core read_file output normalization", () => {
     };
     const trustedContext = {
       toolCallId: "read-a",
-      toolName: "read_file",
+      toolName: "read",
       bypassGenericOutputNormalizer: true,
       aggregateOutputBudgetExempt: true,
     };

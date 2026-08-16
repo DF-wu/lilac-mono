@@ -1,26 +1,24 @@
-import { posix } from "node:path";
-import { inspect } from "node:util";
-
-import { getToolName, isToolUIPart, type UIMessageChunk } from "ai";
-import { z } from "zod";
-
 import { parseReasoningSummary } from "@stanley2058/lilac-utils/reasoning-summary";
 
-import {
-  miniLilacTodoChunkSchema,
-  miniLilacTodosSchema,
-  miniLilacUIMessageDataPartSchema,
-  type MiniLilacCompactionEvent,
-  type MiniLilacControlResult,
-  type MiniLilacOutputRollback,
-  type MiniLilacSessionSnapshot,
-  type MiniLilacSubagentStatus,
-  type MiniLilacTodoState,
-  type MiniLilacTranscriptReset,
-  type MiniLilacUIMessage,
+import type {
+  MiniLilacCompactionEvent,
+  MiniLilacControlResult,
+  MiniLilacOutputRollback,
+  MiniLilacSessionSnapshot,
+  MiniLilacSubagentStatus,
+  MiniLilacTodoState,
+  MiniLilacTranscriptReset,
 } from "@stanley2058/mini-lilac-client";
 
-export type TranscriptKind =
+import type { ToolProjection, ToolProjectionState } from "./tool-observation-projection";
+import type {
+  ProjectedDataChunk,
+  ProjectedInitialMessage,
+  ProjectedUIMessageChunk,
+  RenderedUIMessageChunk,
+} from "./ui-message-chunk-projection";
+
+type TranscriptKind =
   | "user"
   | "assistant"
   | "reasoning"
@@ -79,7 +77,7 @@ export interface ShellTranscript {
   readonly output?: string;
 }
 
-export interface ShellTranscriptPreview {
+interface ShellTranscriptPreview {
   readonly command: string;
   readonly output?: string;
 }
@@ -116,9 +114,6 @@ export interface TranscriptRenderOptions {
   readonly cwd?: string;
 }
 
-const DEFAULT_SHELL_OUTPUT_LINES = 8;
-const DEFAULT_SHELL_OUTPUT_CHARACTERS = 2_000;
-
 export interface ChunkOutputSink {
   append(entry: Omit<TranscriptEntry, "id">): string;
   update(id: string, entry: Omit<TranscriptEntry, "id">): void;
@@ -135,15 +130,24 @@ export interface ChunkRendererHooks {
   onOutputRollback?(rollback: MiniLilacOutputRollback): void;
 }
 
-function previewText(value: string, max = 120): string {
-  const singleLine = value.replace(/\s+/g, " ").trim();
-  return singleLine.length > max ? `${singleLine.slice(0, max - 3)}...` : singleLine;
-}
+type ExplorationState = {
+  id: string;
+  reads: number;
+  searches: number;
+  failures: number;
+  errors: number;
+  cancellations: number;
+  operations: ExplorationOperation[];
+  toolCallIds: string[];
+  pending: Set<string>;
+};
 
-function toolErrorSummary(summary: string, errorText: string): string {
-  const trimmed = errorText.trimStart();
-  if (trimmed.startsWith("{") || trimmed.startsWith("[")) return `${summary} failed`;
-  return `${summary}: ${previewText(errorText, 180)}`;
+const DEFAULT_SHELL_OUTPUT_LINES = 8;
+const DEFAULT_SHELL_OUTPUT_CHARACTERS = 2_000;
+
+function previewText(value: string, max = 120): string {
+  const singleLine = value.replace(/\s+/gu, " ").trim();
+  return singleLine.length > max ? `${singleLine.slice(0, max - 3)}...` : singleLine;
 }
 
 function controlSummary(result: MiniLilacControlResult): string {
@@ -161,6 +165,31 @@ function controlSummary(result: MiniLilacControlResult): string {
   }
 }
 
+function subagentTone(state: SubagentTranscript["state"]): TranscriptTone {
+  switch (state) {
+    case "pending":
+    case "running":
+      return "accent";
+    case "completed":
+      return "success";
+    case "cancelled":
+      return "muted";
+    case "denied":
+      return "warning";
+    case "error":
+    case "rejected":
+      return "danger";
+  }
+}
+
+function humanizeToolName(name: string): string {
+  return name
+    .split(/[_-]+/u)
+    .filter(Boolean)
+    .map((word) => word.charAt(0).toUpperCase() + word.slice(1))
+    .join(" ");
+}
+
 function subagentEntry(subagent: SubagentTranscript): Omit<TranscriptEntry, "id"> {
   const running = subagent.state === "pending" || subagent.state === "running";
   const profile = humanizeToolName(subagent.profile);
@@ -176,19 +205,12 @@ function subagentEntry(subagent: SubagentTranscript): Omit<TranscriptEntry, "id"
   } else if (subagent.toolCount > 0) {
     lines.push(`  ↳ ${subagent.toolCount} tool call${subagent.toolCount === 1 ? "" : "s"}`);
   }
-  if (subagent.sessionId !== undefined && lines.length === 1)
+  if (subagent.sessionId !== undefined && lines.length === 1) {
     lines.push("  ↳ Click to view transcript");
+  }
   return {
     kind: "subagent",
-    tone: running
-      ? "accent"
-      : subagent.state === "completed"
-        ? "success"
-        : subagent.state === "cancelled"
-          ? "muted"
-          : subagent.state === "denied"
-            ? "warning"
-            : "danger",
+    tone: subagentTone(subagent.state),
     text: lines.join("\n"),
     ...(running ? { running: true } : {}),
     subagent,
@@ -210,15 +232,7 @@ function formatCompactionDuration(ms: number | undefined): string | undefined {
   return `${Math.floor(seconds / 60)}m${String(seconds % 60).padStart(2, "0")}s`;
 }
 
-/**
- * Header line for a compaction entry.
- *
- * The entry is updated in place across the lifecycle, so this covers the live
- * phases as well as every terminal one. `noop`/`empty` deliberately get their
- * own wording: reporting a saving when nothing was compacted is worse than
- * saying nothing, which is what the UI used to do.
- */
-export function compactionHeadline(event: MiniLilacCompactionEvent): string {
+function compactionHeadline(event: MiniLilacCompactionEvent): string {
   const elapsed = formatCompactionDuration(event.durationMs ?? event.elapsedMs);
   switch (event.phase) {
     case "started":
@@ -261,184 +275,21 @@ export function compactionEntry(event: MiniLilacCompactionEvent): Omit<Transcrip
   return {
     kind: "compaction",
     tone: event.phase === "failed" ? "danger" : "warning",
-    // The summary is the thing the user cannot otherwise see; carrying it on the
-    // entry lets the transcript show what compaction actually kept.
     text: summary ? `${compactionHeadline(event)}\n${summary}` : compactionHeadline(event),
     ...(live ? { running: true, streaming: true } : {}),
   };
 }
 
-const pathInputSchema = z.object({ path: z.string() });
-const readInputSchema = z.object({
-  path: z.string(),
-  start: z
-    .union([
-      z.object({ offset: z.number().int().nonnegative() }),
-      z.object({
-        line: z.number().int().positive(),
-        column: z.number().int().nonnegative().optional(),
-      }),
-    ])
-    .optional(),
-  maxLines: z.number().int().positive().optional(),
-  maxCharacters: z.number().int().positive().optional(),
-});
-const bashInputSchema = z.object({ command: z.string(), cwd: z.string().optional() });
-const globInputSchema = z.object({ patterns: z.array(z.string()), cwd: z.string().optional() });
-const grepInputSchema = z.object({ pattern: z.string(), cwd: z.string().optional() });
-const fuzzyInputSchema = z.object({ query: z.string(), cwd: z.string().optional() });
-const patchInputSchema = z.object({ patchText: z.string(), cwd: z.string().optional() });
-const editInputSchema = z.object({
-  path: z.string(),
-  oldText: z.string().optional(),
-  newText: z.string().optional(),
-  edits: z
-    .array(
-      z.object({
-        op: z.enum(["replace", "append", "prepend"]),
-        pos: z.string(),
-        end: z.string().optional(),
-        lines: z.union([z.string(), z.array(z.string()), z.null()]).optional(),
-      }),
-    )
-    .optional(),
-});
-const editOutputSchema = z.object({ replacementsMade: z.number().int().nonnegative().optional() });
-const bashExecutionErrorSchema = z.discriminatedUnion("type", [
-  z.object({ type: z.literal("blocked"), reason: z.string() }),
-  z.object({ type: z.literal("aborted"), signal: z.literal("SIGTERM") }),
-  z.object({
-    type: z.literal("timeout"),
-    timeoutMs: z.number().nonnegative(),
-    timeoutKind: z.enum(["no_output", "wall_clock"]).optional().default("wall_clock"),
-    signal: z.literal("SIGTERM"),
-  }),
-  z.object({ type: z.literal("exception"), message: z.string() }),
-]);
-const bashOutputSchema = z
-  .object({
-    stdout: z.string().optional(),
-    stderr: z.string().optional(),
-    exitCode: z.number().int().optional(),
-    stdoutTruncated: z.boolean().optional(),
-    stderrTruncated: z.boolean().optional(),
-    executionError: bashExecutionErrorSchema.optional(),
-  })
-  .strict()
-  .refine(
-    (output) =>
-      output.stdout !== undefined ||
-      output.stderr !== undefined ||
-      output.exitCode !== undefined ||
-      output.stdoutTruncated !== undefined ||
-      output.stderrTruncated !== undefined ||
-      output.executionError !== undefined,
-  );
-const bashOutputDeltaSchema = z.object({
-  type: z.literal("output-delta"),
-  delta: z.string(),
-});
-const subagentInputSchema = z.object({
-  profile: z.string().optional(),
-  prompt: z.string().optional(),
-  task: z.string().optional(),
-  mode: z.enum(["sync", "deferred"]).optional(),
-  sessionName: z.string().optional(),
-});
-const subagentResultSchema = z.object({
-  status: z.enum(["accepted", "completed", "cancelled", "error", "rejected"]),
-  childRunId: z.string().optional(),
-  childSessionId: z.string().optional(),
-  sessionName: z.string().optional(),
-  profile: z.string().optional(),
-  text: z.string().optional(),
-  error: z.string().optional(),
-  reason: z.string().optional(),
-});
-
-function subagentFromTool(
-  toolCallId: string,
-  input: unknown,
-  output?: unknown,
-): SubagentTranscript {
-  const parsedInput = subagentInputSchema.safeParse(input);
-  const parsedOutput = subagentResultSchema.safeParse(output);
-  const profile = parsedOutput.success
-    ? (parsedOutput.data.profile ?? parsedInput.data?.profile)
-    : parsedInput.data?.profile;
-  const prompt = parsedInput.success
-    ? (parsedInput.data.prompt ?? parsedInput.data.task ?? "Delegated task")
-    : "Delegated task";
-  const mode = parsedInput.success ? (parsedInput.data.mode ?? "sync") : "sync";
-  if (!parsedOutput.success) {
-    return {
-      toolCallId,
-      profile: profile ?? "subagent",
-      prompt,
-      mode,
-      state: "pending",
-      toolCount: 0,
-    };
-  }
-  const state = parsedOutput.data.status === "accepted" ? "running" : parsedOutput.data.status;
-  return {
-    toolCallId,
-    ...(parsedOutput.data.childRunId ? { runId: parsedOutput.data.childRunId } : {}),
-    ...(parsedOutput.data.childSessionId ? { sessionId: parsedOutput.data.childSessionId } : {}),
-    ...(parsedOutput.data.sessionName || parsedInput.data?.sessionName
-      ? { sessionName: parsedOutput.data.sessionName ?? parsedInput.data?.sessionName }
-      : {}),
-    profile: profile ?? "subagent",
-    prompt,
-    mode,
-    state,
-    toolCount: 0,
-    ...(parsedOutput.data.text ? { text: parsedOutput.data.text } : {}),
-    ...(parsedOutput.data.error || parsedOutput.data.reason
-      ? { error: parsedOutput.data.error ?? parsedOutput.data.reason }
-      : {}),
-  };
-}
-
-function subagentFromStatus(status: MiniLilacSubagentStatus): SubagentTranscript {
-  return { ...status };
-}
-const skillInputSchema = z.object({ name: z.string().trim().min(1) });
-const todoWriteInputSchema = z.strictObject({ todos: miniLilacTodosSchema });
-const batchInputSchema = z.object({ tool_calls: z.array(z.unknown()) });
-const webfetchInputSchema = z.object({ url: z.string().trim().min(1) });
-const websearchInputSchema = z.object({ query: z.string().trim().min(1) });
-const websearchOutputSchema = z.object({
-  action: z.object({ query: z.string().trim().min(1) }),
-});
-
-type ToolRenderState =
-  | { readonly status: "active"; readonly output?: unknown }
-  | { readonly status: "success"; readonly output: unknown }
-  | { readonly status: "error"; readonly errorText: string }
-  | { readonly status: "denied" }
-  | { readonly status: "cancelled"; readonly reason?: string; readonly output?: unknown };
-
-type ExplorationState = {
-  id: string;
-  reads: number;
-  searches: number;
-  failures: number;
-  errors: number;
-  cancellations: number;
-  operations: ExplorationOperation[];
-  toolCallIds: string[];
-  pending: Set<string>;
-};
-
-function explorationCategory(name: string): "read" | "search" | undefined {
-  if (name === "read_file") return "read";
-  if (name === "glob" || name === "grep" || name === "fuzzy_search") return "search";
-  return undefined;
-}
-
 function plural(count: number, singular: string): string {
   return `${count} ${singular}${count === 1 ? "" : "s"}`;
+}
+
+function explorationTone(state: ExplorationState): TranscriptTone {
+  if (state.errors > 0) return "danger";
+  if (state.failures > 0) return "warning";
+  if (state.cancellations > 0) return "muted";
+  if (state.pending.size > 0) return "accent";
+  return "normal";
 }
 
 export function explorationTranscriptText(
@@ -472,152 +323,11 @@ function explorationEntry(state: ExplorationState): Omit<TranscriptEntry, "id"> 
   } satisfies ExplorationTranscript;
   return {
     kind: "exploration",
-    tone:
-      state.errors > 0
-        ? "danger"
-        : state.failures > 0
-          ? "warning"
-          : state.cancellations > 0
-            ? "muted"
-            : running
-              ? "accent"
-              : "normal",
+    tone: explorationTone(state),
     text: explorationTranscriptText(exploration, running),
     ...(running ? { running: true } : {}),
     exploration,
   };
-}
-
-function explorationOperation(
-  name: string,
-  input: unknown,
-  options: TranscriptRenderOptions = {},
-  status: ExplorationOperation["status"] = "pending",
-  error?: string,
-): ExplorationOperation {
-  const outcome = { status, ...(error === undefined ? {} : { error: previewText(error, 180) }) };
-  if (name === "read_file") {
-    const parsed = readInputSchema.safeParse(input);
-    if (parsed.success) {
-      const start = parsed.data.start;
-      const details = [
-        start && "offset" in start ? `offset ${start.offset}` : undefined,
-        start && "line" in start
-          ? `line ${start.line}${start.column === undefined ? "" : `:${start.column}`}`
-          : undefined,
-        parsed.data.maxLines === undefined ? undefined : plural(parsed.data.maxLines, "line"),
-        parsed.data.maxCharacters === undefined
-          ? undefined
-          : plural(parsed.data.maxCharacters, "character"),
-      ].filter((value) => value !== undefined);
-      return {
-        action: "Read",
-        detail: [explorationPath(parsed.data.path, options.cwd), ...details].join(" · "),
-        ...outcome,
-      };
-    }
-    return { action: "Read", detail: rawExplorationInput(input), ...outcome };
-  }
-  if (name === "grep") {
-    const parsed = grepInputSchema.safeParse(input);
-    if (parsed.success) {
-      return {
-        action: "Grep",
-        detail: [
-          explorationScope(parsed.data.cwd, options.cwd),
-          JSON.stringify(parsed.data.pattern),
-        ]
-          .filter((value) => value !== undefined)
-          .join(" · "),
-        ...outcome,
-      };
-    }
-    return { action: "Grep", detail: rawExplorationInput(input), ...outcome };
-  }
-  if (name === "glob") {
-    const parsed = globInputSchema.safeParse(input);
-    if (parsed.success) {
-      return {
-        action: "Glob",
-        detail: [explorationScope(parsed.data.cwd, options.cwd), parsed.data.patterns.join(", ")]
-          .filter((value) => value !== undefined)
-          .join(" · "),
-        ...outcome,
-      };
-    }
-    return { action: "Glob", detail: rawExplorationInput(input), ...outcome };
-  }
-  const parsed = fuzzyInputSchema.safeParse(input);
-  return {
-    action: "Find",
-    detail: parsed.success
-      ? [explorationScope(parsed.data.cwd, options.cwd), JSON.stringify(parsed.data.query)]
-          .filter((value) => value !== undefined)
-          .join(" · ")
-      : rawExplorationInput(input),
-    ...outcome,
-  };
-}
-
-function rawExplorationInput(input: unknown): string {
-  try {
-    return previewText(
-      `input: ${inspect(input, {
-        breakLength: Infinity,
-        compact: true,
-        customInspect: false,
-        depth: 2,
-        getters: false,
-        maxArrayLength: 8,
-        maxStringLength: 120,
-      })}`,
-      180,
-    );
-  } catch {
-    return "input: <unavailable>";
-  }
-}
-
-function explorationPath(value: string, cwd: string | undefined): string {
-  if (cwd === undefined) return value;
-  const normalizedValue = value.replaceAll("\\", "/").replace(/\/+$/u, "");
-  const normalizedCwd = cwd.replaceAll("\\", "/").replace(/\/+$/u, "");
-  if (normalizedValue === normalizedCwd) return ".";
-  if (normalizedValue.startsWith(`${normalizedCwd}/`)) {
-    return normalizedValue.slice(normalizedCwd.length + 1);
-  }
-  return value;
-}
-
-function explorationScope(value: string | undefined, cwd: string | undefined): string | undefined {
-  if (value === undefined || sameCwd(value, cwd)) return undefined;
-  return explorationPath(value, cwd);
-}
-
-function lineCount(value: string): number {
-  if (value.length === 0) return 0;
-  const lines = value.split("\n").length;
-  return value.endsWith("\n") ? lines - 1 : lines;
-}
-
-function replacementLineCount(value: string | readonly string[] | null | undefined): number {
-  if (value === undefined || value === null) return 0;
-  return typeof value === "string" ? lineCount(value) : value.length;
-}
-
-function hashlineNumber(value: string | undefined): number | undefined {
-  if (value === undefined) return undefined;
-  const match = /^(\d+)#[0-9a-f]+\b/iu.exec(value.trim());
-  if (!match) return undefined;
-  const line = Number(match[1]);
-  return Number.isInteger(line) && line > 0 ? line : undefined;
-}
-
-function editPath(value: string, cwd: string | undefined): string {
-  const normalized = posix.normalize(value.replaceAll("\\", "/"));
-  if (cwd === undefined || !normalized.startsWith("/")) return normalized;
-  const normalizedCwd = posix.normalize(cwd.replaceAll("\\", "/"));
-  return posix.relative(normalizedCwd, normalized) || ".";
 }
 
 export function editTranscriptAction(edit: EditTranscript): "Patch" | "Edit" {
@@ -625,13 +335,13 @@ export function editTranscriptAction(edit: EditTranscript): "Patch" | "Edit" {
   return edit.operations.every((operation) => operation.action === first) ? first : "Edit";
 }
 
-export function editOperationText(edit: EditOperation): string {
+function editOperationText(edit: EditOperation): string {
   const additions = edit.added > 0 ? ` +${edit.added}` : "";
   const removals = edit.removed > 0 ? ` -${edit.removed}` : "";
   return `${edit.action} ${edit.path}${additions}${removals}${edit.detail ?? ""}`;
 }
 
-export function editTranscriptText(edit: EditTranscript): string {
+function editTranscriptText(edit: EditTranscript): string {
   if (edit.operations.length === 1) {
     const operation = edit.operations[0];
     return operation === undefined ? "Edit" : editOperationText(operation);
@@ -652,14 +362,7 @@ export function groupNearbyEdits(entries: readonly TranscriptEntry[]): Transcrip
     } satisfies EditTranscript;
     grouped[grouped.length - 1] = {
       ...previous,
-      tone:
-        previous.tone === "danger" || entry.tone === "danger"
-          ? "danger"
-          : previous.tone === "warning" || entry.tone === "warning"
-            ? "warning"
-            : previous.tone === "muted" || entry.tone === "muted"
-              ? "muted"
-              : "normal",
+      tone: combinedEditTone(previous.tone, entry.tone),
       running: previous.running === true || entry.running === true ? true : undefined,
       text: editTranscriptText(edit),
       edit,
@@ -668,128 +371,31 @@ export function groupNearbyEdits(entries: readonly TranscriptEntry[]): Transcrip
   return grouped;
 }
 
-function patchEdits(input: unknown, cwd: string | undefined): EditOperation[] | undefined {
-  const parsed = patchInputSchema.safeParse(input);
-  if (!parsed.success) return undefined;
-  const edits: Array<{ path: string; added: number; removed: number }> = [];
-  let current: { path: string; added: number; removed: number } | undefined;
-  for (const line of parsed.data.patchText.split("\n")) {
-    const header = /^\*\*\* (?:Add|Update|Delete) File: (.+)$/u.exec(line);
-    if (header?.[1] !== undefined) {
-      current = { path: header[1], added: 0, removed: 0 };
-      edits.push(current);
-      continue;
-    }
-    const move = /^\*\*\* Move to: (.+)$/u.exec(line);
-    if (move?.[1] !== undefined && current !== undefined) {
-      current.path = move[1];
-      continue;
-    }
-    if (current === undefined) continue;
-    if (line.startsWith("+")) current.added += 1;
-    else if (line.startsWith("-")) current.removed += 1;
+function combinedEditTone(left: TranscriptTone, right: TranscriptTone): TranscriptTone {
+  const leftGroup = groupedEditTone(left);
+  const rightGroup = groupedEditTone(right);
+  if (leftGroup === "danger" || rightGroup === "danger") return "danger";
+  if (leftGroup === "warning" || rightGroup === "warning") return "warning";
+  if (leftGroup === "muted" || rightGroup === "muted") return "muted";
+  return "normal";
+}
+
+function groupedEditTone(tone: TranscriptTone): "normal" | "muted" | "warning" | "danger" {
+  switch (tone) {
+    case "danger":
+      return "danger";
+    case "warning":
+      return "warning";
+    case "muted":
+      return "muted";
+    case "normal":
+    case "accent":
+    case "success":
+      return "normal";
   }
-  return edits.map((edit) => ({
-    action: "Patch",
-    path: editPath(edit.path, parsed.data.cwd ?? cwd),
-    added: edit.added,
-    removed: edit.removed,
-    tone: "normal",
-  }));
 }
 
-function fileEdits(
-  input: unknown,
-  output: unknown,
-  cwd: string | undefined,
-): EditOperation[] | undefined {
-  const parsed = editInputSchema.safeParse(input);
-  if (!parsed.success) return undefined;
-  const replacements = editOutputSchema.safeParse(output);
-  const multiplier = replacements.success ? (replacements.data.replacementsMade ?? 1) : 1;
-  if (parsed.data.oldText !== undefined && parsed.data.newText !== undefined) {
-    return [
-      {
-        action: "Edit",
-        path: editPath(parsed.data.path, cwd),
-        added: lineCount(parsed.data.newText) * multiplier,
-        removed: lineCount(parsed.data.oldText) * multiplier,
-        tone: "normal",
-      },
-    ];
-  }
-  if (parsed.data.edits !== undefined) {
-    let added = 0;
-    let removed = 0;
-    for (const edit of parsed.data.edits) {
-      added += replacementLineCount(edit.lines);
-      if (edit.op !== "replace") continue;
-      const start = hashlineNumber(edit.pos);
-      const end = hashlineNumber(edit.end) ?? start;
-      if (start !== undefined && end !== undefined && end >= start) removed += end - start + 1;
-    }
-    return [
-      {
-        action: "Edit",
-        path: editPath(parsed.data.path, cwd),
-        added,
-        removed,
-        tone: "normal",
-      },
-    ];
-  }
-  return [
-    {
-      action: "Edit",
-      path: editPath(parsed.data.path, cwd),
-      added: 0,
-      removed: 0,
-      tone: "normal",
-    },
-  ];
-}
-
-function shellOutput(output: unknown): string | undefined {
-  if (typeof output === "string") return output.trimEnd() || undefined;
-  const parsed = bashOutputSchema.safeParse(output);
-  if (!parsed.success) return undefined;
-  const executionError = parsed.data.executionError;
-  const executionErrorText =
-    executionError?.type === "blocked"
-      ? executionError.reason
-      : executionError?.type === "timeout"
-        ? executionError.timeoutKind === "no_output"
-          ? `Command terminated after ${executionError.timeoutMs}ms without output`
-          : `Command timed out after ${executionError.timeoutMs}ms`
-        : executionError?.type === "aborted"
-          ? "Command aborted"
-          : executionError?.type === "exception"
-            ? executionError.message
-            : undefined;
-  const chunks = [
-    parsed.data.stdout?.trimEnd(),
-    parsed.data.stderr?.trimEnd(),
-    executionErrorText,
-  ].filter((value) => value !== undefined && value.length > 0);
-  if (parsed.data.exitCode !== undefined && parsed.data.exitCode !== 0 && chunks.length === 0) {
-    chunks.push(`Process exited with code ${parsed.data.exitCode}`);
-  }
-  return chunks.join("\n") || undefined;
-}
-
-function shellOutputTone(output: unknown): "normal" | "muted" | "danger" {
-  const parsed = bashOutputSchema.safeParse(output);
-  if (!parsed.success || parsed.data.executionError === undefined) return "normal";
-  return parsed.data.executionError.type === "aborted" ? "muted" : "danger";
-}
-
-function sameCwd(commandCwd: string, clientCwd: string | undefined): boolean {
-  if (clientCwd === undefined) return false;
-  const normalize = (value: string) => value.replaceAll("\\", "/").replace(/\/+$/u, "");
-  return normalize(commandCwd) === normalize(clientCwd);
-}
-
-export function shellTranscriptText(
+function shellTranscriptText(
   shell: ShellTranscript,
   expanded = false,
   lineLimit = DEFAULT_SHELL_OUTPUT_LINES,
@@ -797,6 +403,8 @@ export function shellTranscriptText(
 ): string {
   const collapsible = isShellTranscriptCollapsible(shell, lineLimit, characterLimit);
   const preview = shellTranscriptPreview(shell, expanded, lineLimit, characterLimit);
+  let disclosure: string | undefined;
+  if (collapsible) disclosure = expanded ? "Click to collapse" : "Click to expand";
   const lines = [
     shell.cwd === undefined ? undefined : `# Running in ${shell.cwd}`,
     shell.cwd === undefined ? undefined : "",
@@ -804,7 +412,7 @@ export function shellTranscriptText(
     preview.output === undefined ? undefined : "",
     preview.output,
     collapsible ? "" : undefined,
-    collapsible ? (expanded ? "Click to collapse" : "Click to expand") : undefined,
+    disclosure,
   ].filter((value) => value !== undefined);
   return lines.join("\n");
 }
@@ -832,7 +440,6 @@ export function shellTranscriptPreview(
   if (expanded || !isShellTranscriptCollapsible(shell, lineLimit, characterLimit)) {
     return { command: shell.command, ...(output === undefined ? {} : { output }) };
   }
-
   const visible = truncateShellTranscript(shellTranscriptContent(shell), lineLimit, characterLimit);
   const outputPrefix = `${shell.command}\n`;
   if (!visible.startsWith(outputPrefix)) return { command: visible };
@@ -854,236 +461,239 @@ export function isShellTranscriptCollapsible(
   );
 }
 
-function toolEntry(
-  name: string,
-  input: unknown,
-  state: ToolRenderState,
-  options: TranscriptRenderOptions = {},
-): Omit<TranscriptEntry, "id"> | undefined {
-  if (name === "subagent_result") return undefined;
-  if (name === "batch" && state.status !== "error") return undefined;
-  if (name === "bash") {
-    const parsed = bashInputSchema.safeParse(input);
-    if (parsed.success) {
-      const cancellation =
-        state.status === "cancelled"
-          ? `Cancelled${state.reason === undefined ? "" : `: ${previewText(state.reason, 180)}`}`
-          : undefined;
-      const cancelledOutput =
-        state.status === "cancelled"
-          ? [shellOutput(state.output), cancellation]
-              .filter((value) => value !== undefined)
-              .join("\n")
-          : undefined;
-      const output =
-        state.status === "success" || (state.status === "active" && state.output !== undefined)
-          ? shellOutput(state.output)
-          : state.status === "error"
-            ? /^[[{]/u.test(state.errorText.trimStart())
-              ? "Command failed"
-              : state.errorText
-            : state.status === "denied"
-              ? "Denied"
-              : cancelledOutput;
-      const shell = {
-        command: parsed.data.command,
-        ...(parsed.data.cwd === undefined || sameCwd(parsed.data.cwd, options.cwd)
-          ? {}
-          : { cwd: parsed.data.cwd }),
-        ...(output === undefined ? {} : { output }),
-      } satisfies ShellTranscript;
-      return {
-        kind: "shell",
-        tone:
-          state.status === "error"
-            ? "danger"
-            : state.status === "denied"
-              ? "warning"
-              : state.status === "cancelled"
-                ? "muted"
-                : state.status === "success"
-                  ? shellOutputTone(state.output)
-                  : "normal",
-        text: shellTranscriptText(shell),
-        ...(state.status === "active" ? { running: true } : {}),
-        shell,
-      };
+function stateDetail(state: ToolProjectionState): string | undefined {
+  switch (state.status) {
+    case "pending":
+    case "active":
+    case "approval":
+    case "success":
+      return undefined;
+    case "error":
+      return `: ${previewText(state.errorText, 180)}`;
+    case "denied":
+      return ": denied";
+    case "cancelled":
+      return `: cancelled${state.reason === undefined ? "" : ` (${previewText(state.reason, 160)})`}`;
+  }
+}
+
+function bashOutput(projection: Extract<ToolProjection, { kind: "bash" }>): string | undefined {
+  switch (projection.state.status) {
+    case "pending":
+    case "approval":
+      return undefined;
+    case "active":
+      return projection.outputDelta?.trimEnd() || undefined;
+    case "success":
+    case "denied":
+      return projection.resultText;
+    case "error":
+      return [projection.outputDelta?.trimEnd(), projection.resultText]
+        .filter((value) => value !== undefined && value.length > 0)
+        .join("\n");
+    case "cancelled":
+      return [projection.outputDelta?.trimEnd(), projection.resultText]
+        .filter((value) => value !== undefined && value.length > 0)
+        .join("\n");
+  }
+}
+
+function subagentState(
+  projection: Extract<ToolProjection, { kind: "subagent-delegate" }>,
+): SubagentTranscript["state"] {
+  if (projection.resultStatus !== undefined) {
+    switch (projection.resultStatus) {
+      case "accepted":
+        return "running";
+      case "completed":
+        return "completed";
+      case "cancelled":
+        return "cancelled";
+      case "error":
+        return "error";
+      case "rejected":
+        return "rejected";
     }
   }
-  if (name === "skill") {
-    const parsed = skillInputSchema.safeParse(input);
-    if (parsed.success && (state.status === "active" || state.status === "success")) {
-      return {
-        kind: "tool",
-        tone: state.status === "success" ? "success" : "accent",
-        text: `${state.status === "success" ? "Loaded" : "Loading"} skill ${parsed.data.name}`,
-        ...(state.status === "active" ? { running: true } : {}),
-      };
-    }
+  switch (projection.state.status) {
+    case "pending":
+      return "pending";
+    case "active":
+    case "approval":
+      return "running";
+    case "success":
+      return "completed";
+    case "error":
+      return "error";
+    case "denied":
+      return "denied";
+    case "cancelled":
+      return "cancelled";
   }
-  const edits =
-    name === "apply_patch"
-      ? patchEdits(input, options.cwd)
-      : name === "edit_file"
-        ? fileEdits(input, state.status === "success" ? state.output : undefined, options.cwd)
-        : undefined;
-  if (edits !== undefined && edits.length > 0) {
-    const detail =
-      state.status === "error"
-        ? `: ${previewText(state.errorText, 180)}`
-        : state.status === "denied"
-          ? ": denied"
-          : state.status === "cancelled"
-            ? `: cancelled${state.reason === undefined ? "" : ` (${previewText(state.reason, 160)})`}`
-            : undefined;
-    const tone =
-      state.status === "error"
-        ? "danger"
-        : state.status === "denied"
-          ? "warning"
-          : state.status === "cancelled"
-            ? "muted"
-            : "normal";
-    const edit = {
-      operations: edits.map((operation, index) => ({
-        ...operation,
-        tone,
-        ...(index === 0 && detail !== undefined ? { detail } : {}),
-      })),
-    } satisfies EditTranscript;
-    return {
-      kind: "edit",
-      tone,
-      text: editTranscriptText(edit),
-      singleLine: true,
-      ...(state.status === "active" ? { running: true } : {}),
-      edit,
-    };
-  }
-  const summary =
-    name === "batch"
-      ? "Parallel tools"
-      : toolSummary(
-          name,
-          input,
-          state.status === "success" || state.status === "active" ? state.output : undefined,
-        );
-  const singleLine =
-    name === "webfetch" || name === "websearch" || name === "apply_patch" || name === "edit_file";
-  if (state.status === "error") {
-    return {
-      kind: "tool",
-      tone: "danger",
-      text: toolErrorSummary(summary, state.errorText),
-      ...(singleLine ? { singleLine: true } : {}),
-    };
-  }
-  if (state.status === "denied") {
-    return {
-      kind: "tool",
-      tone: "warning",
-      text: `${summary}: denied`,
-      ...(singleLine ? { singleLine: true } : {}),
-    };
-  }
-  if (state.status === "cancelled") {
-    return {
-      kind: "tool",
-      tone: "muted",
-      text: `${summary}: cancelled${state.reason === undefined ? "" : ` (${previewText(state.reason, 160)})`}`,
-      ...(singleLine ? { singleLine: true } : {}),
-    };
+}
+
+function subagentFromProjection(
+  toolCallId: string,
+  projection: Extract<ToolProjection, { kind: "subagent-delegate" }>,
+): SubagentTranscript {
+  const state = subagentState(projection);
+  let stateError: string | undefined;
+  switch (projection.state.status) {
+    case "error":
+      stateError = projection.state.errorText;
+      break;
+    case "denied":
+      stateError = "Denied";
+      break;
+    case "cancelled":
+      stateError = `Cancelled${projection.state.reason === undefined ? "" : `: ${projection.state.reason}`}`;
+      break;
+    case "pending":
+    case "active":
+    case "approval":
+    case "success":
+      break;
   }
   return {
-    kind: "tool",
-    tone: state.status === "success" ? "success" : "accent",
-    text: state.status === "active" ? `${summary} · running` : summary,
-    ...(singleLine ? { singleLine: true } : {}),
-    ...(state.status === "active" ? { running: true } : {}),
+    toolCallId,
+    ...(projection.childRunId === undefined ? {} : { runId: projection.childRunId }),
+    ...(projection.childSessionId === undefined ? {} : { sessionId: projection.childSessionId }),
+    ...(projection.sessionName === undefined ? {} : { sessionName: projection.sessionName }),
+    profile: projection.profile,
+    prompt: projection.prompt,
+    mode: projection.mode,
+    state,
+    toolCount: 0,
+    ...(projection.resultText === undefined ? {} : { text: projection.resultText }),
+    ...((projection.error ?? stateError) === undefined
+      ? {}
+      : { error: projection.error ?? stateError }),
   };
 }
 
-function humanizeToolName(name: string): string {
-  return name
-    .split(/[_-]+/u)
-    .filter(Boolean)
-    .map((word) => word.charAt(0).toUpperCase() + word.slice(1))
-    .join(" ");
+function projectionEntry(
+  toolCallId: string,
+  projection: ToolProjection,
+): Omit<TranscriptEntry, "id"> | undefined {
+  switch (projection.kind) {
+    case "bash": {
+      if (projection.command === undefined && projection.resultText === undefined) {
+        return {
+          kind: "tool",
+          tone: projection.tone,
+          text: projection.headline,
+          ...(projection.running ? { running: true } : {}),
+        };
+      }
+      const output = bashOutput(projection);
+      const shell = {
+        command: projection.command ?? "Bash",
+        ...(projection.cwd === undefined ? {} : { cwd: projection.cwd }),
+        ...(output === undefined || output.length === 0 ? {} : { output }),
+      } satisfies ShellTranscript;
+      return {
+        kind: "shell",
+        tone: projection.tone,
+        text: shellTranscriptText(shell),
+        ...(projection.running ? { running: true } : {}),
+        shell,
+      };
+    }
+    case "exploration":
+      return undefined;
+    case "edit": {
+      if (projection.operations.length === 0) {
+        return {
+          kind: "tool",
+          tone: projection.tone,
+          text: projection.headline,
+          ...(projection.singleLine ? { singleLine: true } : {}),
+          ...(projection.running ? { running: true } : {}),
+        };
+      }
+      const detail = stateDetail(projection.state);
+      const edit = {
+        operations: projection.operations.map((operation, index) => ({
+          ...operation,
+          tone: projection.tone,
+          ...(index === 0 && detail !== undefined ? { detail } : {}),
+        })),
+      } satisfies EditTranscript;
+      return {
+        kind: "edit",
+        tone: projection.tone,
+        text: editTranscriptText(edit),
+        singleLine: true,
+        ...(projection.running ? { running: true } : {}),
+        edit,
+      };
+    }
+    case "subagent-delegate":
+      return subagentEntry(subagentFromProjection(toolCallId, projection));
+    case "subagent-result":
+      return undefined;
+    case "batch":
+      return projection.visibility === "hidden"
+        ? undefined
+        : {
+            kind: "tool",
+            tone: projection.tone,
+            text: projection.headline,
+            ...(projection.running ? { running: true } : {}),
+          };
+    case "skill":
+    case "todo":
+    case "webfetch":
+    case "websearch":
+      return projection.visibility === "hidden"
+        ? undefined
+        : {
+            kind: "tool",
+            tone: projection.tone,
+            text: projection.headline,
+            ...(projection.singleLine ? { singleLine: true } : {}),
+            ...(projection.running ? { running: true } : {}),
+          };
+    case "malformed-known-tool":
+      return {
+        kind: "tool",
+        tone: projection.tone,
+        text: `${projection.headline} · malformed ${projection.malformedField}: ${projection.payloadPreview}`,
+        ...(projection.running ? { running: true } : {}),
+      };
+    case "unknown-tool":
+      return {
+        kind: "tool",
+        tone: projection.tone,
+        text: projection.headline,
+        ...(projection.running ? { running: true } : {}),
+      };
+  }
 }
 
-export function toolSummary(name: string, input: unknown, output?: unknown): string {
-  if (name === "bash") {
-    const parsed = bashInputSchema.safeParse(input);
-    if (parsed.success) return `$ ${previewText(parsed.data.command, 160)}`;
+function explorationCategory(
+  projection: Extract<ToolProjection, { kind: "exploration" }>,
+): "read" | "search" {
+  switch (projection.toolName) {
+    case "read":
+      return "read";
+    case "glob":
+    case "grep":
+    case "fuzzy_search":
+      return "search";
   }
-  if (name === "read_file") {
-    const parsed = pathInputSchema.safeParse(input);
-    if (parsed.success) return `Read ${parsed.data.path}`;
-  }
-  if (name === "edit_file") {
-    const parsed = pathInputSchema.safeParse(input);
-    if (parsed.success) return `Edit ${parsed.data.path}`;
-  }
-  if (name === "glob") {
-    const parsed = globInputSchema.safeParse(input);
-    if (parsed.success) return `Glob ${parsed.data.patterns.join(", ")}`;
-  }
-  if (name === "grep") {
-    const parsed = grepInputSchema.safeParse(input);
-    if (parsed.success) return `Grep "${previewText(parsed.data.pattern)}"`;
-  }
-  if (name === "fuzzy_search") {
-    const parsed = fuzzyInputSchema.safeParse(input);
-    if (parsed.success) return `Find "${previewText(parsed.data.query)}"`;
-  }
-  if (name === "apply_patch") {
-    const parsed = patchInputSchema.safeParse(input);
-    if (parsed.success) {
-      const paths = [
-        ...parsed.data.patchText.matchAll(/^\*\*\* (?:Add|Update|Delete) File: (.+)$/gmu),
-      ].map((match) => match[1]);
-      if (paths[0] !== undefined) {
-        return `Patch ${paths[0]}${paths.length > 1 ? ` (+${paths.length - 1})` : ""}`;
-      }
-    }
-  }
-  if (name === "subagent_delegate") {
-    const parsed = subagentInputSchema.safeParse(input);
-    if (parsed.success) {
-      const prompt = parsed.data.prompt ?? parsed.data.task;
-      if (prompt !== undefined) {
-        return `${humanizeToolName(parsed.data.profile ?? "subagent")}: ${previewText(prompt)}`;
-      }
-    }
-  }
-  if (name === "skill") {
-    const parsed = skillInputSchema.safeParse(input);
-    if (parsed.success) return `Skill ${parsed.data.name}`;
-  }
-  if (name === "todowrite") {
-    const parsed = todoWriteInputSchema.safeParse(input);
-    if (parsed.success) {
-      const count = parsed.data.todos.length;
-      return `Update todos: ${count} item${count === 1 ? "" : "s"}`;
-    }
-  }
-  if (name === "batch") {
-    const parsed = batchInputSchema.safeParse(input);
-    if (parsed.success) return `Batch ${parsed.data.tool_calls.length} tools`;
-  }
-  if (name === "webfetch") {
-    const parsed = webfetchInputSchema.safeParse(input);
-    if (parsed.success) return `Fetch ${parsed.data.url}`;
-  }
-  if (name === "websearch") {
-    const parsed = websearchInputSchema.safeParse(input);
-    if (parsed.success) return `Search "${parsed.data.query.replace(/\s+/gu, " ")}"`;
-    const parsedOutput = websearchOutputSchema.safeParse(output);
-    if (parsedOutput.success) {
-      return `Search "${parsedOutput.data.action.query.replace(/\s+/gu, " ")}"`;
-    }
-  }
-  return humanizeToolName(name);
+}
+
+function explorationOperation(
+  projection: Extract<ToolProjection, { kind: "exploration" }>,
+): ExplorationOperation | undefined {
+  if (projection.detail === undefined) return undefined;
+  return {
+    action: projection.action,
+    detail: projection.detail,
+    status: projection.operationStatus,
+    ...(projection.error === undefined ? {} : { error: projection.error }),
+  };
 }
 
 function fileEntry(mediaType: string, filename?: string): Omit<TranscriptEntry, "id"> {
@@ -1104,40 +714,6 @@ function sourceDocumentEntry(
   return { kind: "source", tone: "muted", text: `${title}: ${detail}` };
 }
 
-function dataEntry(
-  part: MiniLilacUIMessage["parts"][number],
-): Omit<TranscriptEntry, "id"> | undefined {
-  const parsed = miniLilacUIMessageDataPartSchema.safeParse(part);
-  if (!parsed.success) return undefined;
-  switch (parsed.data.type) {
-    case "data-session":
-      return undefined;
-    case "data-control":
-      return { kind: "status", tone: "muted", text: controlSummary(parsed.data.data) };
-    case "data-transcriptReset":
-      return {
-        kind: "status",
-        tone: "warning",
-        text: `transcript rewound (${parsed.data.data.reason})`,
-      };
-    case "data-outputRollback":
-      return undefined;
-    case "data-subagentStatus":
-      return undefined;
-    case "data-compaction":
-      return compactionEntry(parsed.data.data);
-  }
-}
-
-/**
- * Render a provider reasoning summary as a muted transcript entry.
- *
- * Follows OpenCode's convention: a leading `**Title**` block separated by a
- * blank line becomes the header, the remainder renders inline as the body. The
- * header reads `Thinking: <title>` while streaming and `Thought: <title>` once
- * finalized; a missing title falls back to `Thinking`/`Thought`. Summaries
- * without the title convention keep the full text as the body.
- */
 function reasoningEntry(text: string, finalized: boolean): Omit<TranscriptEntry, "id"> {
   const summary = parseReasoningSummary(text);
   const verb = finalized ? "Thought" : "Thinking";
@@ -1149,12 +725,74 @@ function reasoningEntry(text: string, finalized: boolean): Omit<TranscriptEntry,
   };
 }
 
-/** Convert a canonical startup transcript into the same model used by live output. */
+function transcriptKindForRole(role: ProjectedInitialMessage["role"]): TranscriptKind {
+  switch (role) {
+    case "user":
+      return "user";
+    case "assistant":
+      return "assistant";
+    case "system":
+      return "status";
+  }
+}
+
+function dataEntry(chunk: ProjectedDataChunk): Omit<TranscriptEntry, "id"> | undefined {
+  switch (chunk.type) {
+    case "session":
+    case "todos":
+    case "output-rollback":
+    case "subagent-status":
+      return undefined;
+    case "control":
+      return { kind: "status", tone: "muted", text: controlSummary(chunk.result) };
+    case "transcript-reset":
+      return {
+        kind: "status",
+        tone: "warning",
+        text: `transcript rewound (${chunk.reset.reason})`,
+      };
+    case "compaction":
+      return compactionEntry(chunk.event);
+  }
+}
+
+function addExplorationProjection(
+  state: ExplorationState | undefined,
+  toolCallId: string,
+  projection: Extract<ToolProjection, { kind: "exploration" }>,
+): ExplorationState | undefined {
+  const operation = explorationOperation(projection);
+  if (operation === undefined) return state;
+  const target =
+    state ??
+    ({
+      id: "",
+      reads: 0,
+      searches: 0,
+      failures: 0,
+      errors: 0,
+      cancellations: 0,
+      operations: [],
+      toolCallIds: [],
+      pending: new Set(),
+    } satisfies ExplorationState);
+  const category = explorationCategory(projection);
+  if (category === "read") target.reads += 1;
+  else target.searches += 1;
+  target.operations.push(operation);
+  target.toolCallIds.push(toolCallId);
+  if (operation.status === "pending") target.pending.add(toolCallId);
+  if (operation.status === "error" || operation.status === "denied") target.failures += 1;
+  if (operation.status === "error") target.errors += 1;
+  if (operation.status === "cancelled") target.cancellations += 1;
+  return target;
+}
+
+/** Render canonical messages after the SDK/tool boundary has projected every part. */
 export function renderInitialMessages(
-  messages: readonly MiniLilacUIMessage[],
-  options: TranscriptRenderOptions = {},
+  messages: readonly ProjectedInitialMessage[],
 ): TranscriptEntry[] {
-  const rendered = messages.flatMap((message) => {
+  return messages.flatMap((message) => {
     const entries: TranscriptEntry[] = [];
     const subagentIndexes = new Map<string, number>();
     let exploration: ExplorationState | undefined;
@@ -1164,136 +802,82 @@ export function renderInitialMessages(
     };
     message.parts.forEach((part, index) => {
       const id = `message:${message.id}:${index}`;
-      if (part.type === "text") {
-        const kind =
-          message.role === "user" ? "user" : message.role === "assistant" ? "assistant" : "status";
-        append({ id, kind, tone: kind === "user" ? "accent" : "normal", text: part.text });
-        return;
-      }
-      if (part.type === "reasoning") {
-        append({ id, ...reasoningEntry(part.text, part.state !== "streaming") });
-        return;
-      }
-      if (isToolUIPart(part)) {
-        const name = getToolName(part);
-        const input =
-          part.state === "output-error" && "rawInput" in part ? part.rawInput : part.input;
-        const category = explorationCategory(name);
-        if (name === "subagent_delegate") {
-          let subagent = subagentFromTool(
-            part.toolCallId,
-            input,
-            part.state === "output-available" ? part.output : undefined,
-          );
-          if (part.state === "output-error") {
-            subagent = { ...subagent, state: "error", error: part.errorText };
-          } else if (part.state === "output-denied") {
-            subagent = { ...subagent, state: "denied", error: "Denied" };
-          }
-          append({ id, ...subagentEntry(subagent) });
-          subagentIndexes.set(part.toolCallId, entries.length - 1);
+      switch (part.kind) {
+        case "text": {
+          const kind = transcriptKindForRole(message.role);
+          append({ id, kind, tone: kind === "user" ? "accent" : "normal", text: part.text });
           return;
         }
-        if (category !== undefined) {
-          if (exploration === undefined) {
-            exploration = {
-              id,
-              reads: 0,
-              searches: 0,
-              failures: 0,
-              errors: 0,
-              cancellations: 0,
-              operations: [],
-              toolCallIds: [],
-              pending: new Set(),
-            };
-            entries.push({ id, ...explorationEntry(exploration) });
-          }
-          if (category === "read") exploration.reads += 1;
-          else exploration.searches += 1;
-          const operationStatus =
-            part.state === "output-available"
-              ? "success"
-              : part.state === "output-error"
-                ? "error"
-                : part.state === "output-denied"
-                  ? "denied"
-                  : "pending";
-          exploration.operations.push(
-            explorationOperation(
-              name,
-              input,
-              options,
-              operationStatus,
-              part.state === "output-error" ? part.errorText : undefined,
-            ),
-          );
-          exploration.toolCallIds.push(part.toolCallId);
-          if (operationStatus === "error" || operationStatus === "denied") {
-            exploration.failures += 1;
-            if (operationStatus === "error") exploration.errors += 1;
-          } else if (operationStatus === "pending") {
-            exploration.pending.add(part.toolCallId);
-          }
-          const entryIndex = entries.findIndex((entry) => entry.id === exploration?.id);
-          if (entryIndex >= 0)
-            entries[entryIndex] = { id: exploration.id, ...explorationEntry(exploration) };
+        case "reasoning":
+          append({ id, ...reasoningEntry(part.text, part.finalized) });
           return;
-        }
-        const state: ToolRenderState =
-          part.state === "output-available"
-            ? { status: "success", output: part.output }
-            : part.state === "output-error"
-              ? { status: "error", errorText: part.errorText }
-              : part.state === "output-denied"
-                ? { status: "denied" }
-                : { status: "active" };
-        const entry = toolEntry(name, input, state, options);
-        if (entry !== undefined) append({ id, ...entry });
-        return;
-      }
-      if (part.type.startsWith("data-")) {
-        const parsed = miniLilacUIMessageDataPartSchema.safeParse(part);
-        if (parsed.success && parsed.data.type === "data-subagentStatus") {
-          const subagent = subagentFromStatus(parsed.data.data);
-          const entryIndex = subagentIndexes.get(subagent.toolCallId);
-          if (entryIndex !== undefined) {
-            entries[entryIndex] = { id: entries[entryIndex]?.id ?? id, ...subagentEntry(subagent) };
-          } else {
+        case "tool": {
+          if (part.projection.kind === "exploration") {
+            const previous = exploration;
+            exploration = addExplorationProjection(exploration, part.toolCallId, part.projection);
+            if (exploration === undefined) return;
+            if (previous === undefined) {
+              exploration.id = id;
+              entries.push({ id, ...explorationEntry(exploration) });
+            } else {
+              const entryIndex = entries.findIndex((entry) => entry.id === exploration?.id);
+              if (entryIndex >= 0) {
+                entries[entryIndex] = { id: exploration.id, ...explorationEntry(exploration) };
+              }
+            }
+            return;
+          }
+          if (part.projection.kind === "subagent-delegate") {
+            const subagent = subagentFromProjection(part.toolCallId, part.projection);
             append({ id, ...subagentEntry(subagent) });
-            subagentIndexes.set(subagent.toolCallId, entries.length - 1);
+            subagentIndexes.set(part.toolCallId, entries.length - 1);
+            return;
           }
+          const entry = projectionEntry(part.toolCallId, part.projection);
+          if (entry !== undefined) append({ id, ...entry });
           return;
         }
-        const entry = dataEntry(part);
-        if (entry !== undefined) append({ id, ...entry });
-        return;
-      }
-      if (part.type === "file") {
-        append({ id, ...fileEntry(part.mediaType, part.filename) });
-        return;
-      }
-      if (part.type === "source-url") {
-        append({ id, ...sourceUrlEntry(part.title, part.url) });
-        return;
-      }
-      if (part.type === "source-document") {
-        append({ id, ...sourceDocumentEntry(part.title, part.mediaType, part.filename) });
+        case "data":
+          if (part.chunk.type === "subagent-status") {
+            const subagent = { ...part.chunk.status };
+            const entryIndex = subagentIndexes.get(subagent.toolCallId);
+            if (entryIndex === undefined) {
+              append({ id, ...subagentEntry(subagent) });
+              subagentIndexes.set(subagent.toolCallId, entries.length - 1);
+            } else {
+              entries[entryIndex] = {
+                id: entries[entryIndex]?.id ?? id,
+                ...subagentEntry(subagent),
+              };
+            }
+            return;
+          }
+          {
+            const entry = dataEntry(part.chunk);
+            if (entry !== undefined) append({ id, ...entry });
+          }
+          return;
+        case "file":
+          append({ id, ...fileEntry(part.mediaType, part.filename) });
+          return;
+        case "source-url":
+          append({ id, ...sourceUrlEntry(part.title, part.url) });
+          return;
+        case "source-document":
+          append({ id, ...sourceDocumentEntry(part.title, part.mediaType, part.filename) });
+          return;
+        case "ignored":
+          return;
       }
     });
     return entries;
   });
-  return rendered;
 }
 
-/** Maps AI SDK chunks to plain semantic transcript entries for a UI adapter. */
+/** Consumes only closed SDK and tool projections. */
 export class ChunkRenderer {
-  private readonly toolNames = new Map<string, string>();
   private readonly toolEntryIds = new Map<string, string>();
-  private readonly toolSummaries = new Map<string, string>();
-  private readonly toolInputs = new Map<string, unknown>();
-  private readonly bashOutputByToolId = new Map<string, string>();
-  private readonly flattenedBatchToolIds = new Set<string>();
+  private readonly toolProjections = new Map<string, ToolProjection>();
   private readonly activeToolIds = new Set<string>();
   private readonly explorationByToolId = new Map<string, ExplorationState>();
   private readonly subagents = new Map<string, SubagentTranscript>();
@@ -1305,19 +889,47 @@ export class ChunkRenderer {
   constructor(
     private readonly output: ChunkOutputSink,
     private readonly hooks: ChunkRendererHooks,
-    private readonly options: TranscriptRenderOptions = {},
+    _options: TranscriptRenderOptions = {},
   ) {}
 
   startRun(): void {
     this.resetTransientState();
   }
 
-  handle(chunk: UIMessageChunk): void {
-    if (chunk.type.startsWith("data-")) {
-      this.handleData(chunk);
-      return;
+  handleProjected(projected: ProjectedUIMessageChunk): void {
+    switch (projected.kind) {
+      case "rendered":
+        this.handleRendered(projected.chunk);
+        return;
+      case "tool":
+        this.renderToolProjection(projected.toolCallId, projected.projection);
+        return;
+      case "abort":
+        this.finishOpenText();
+        this.finalizeReasoning();
+        for (const tool of projected.cancelledTools) {
+          this.renderToolProjection(tool.toolCallId, tool.projection);
+        }
+        this.cancelStatusOnlySubagents(
+          new Set(projected.cancelledTools.map((tool) => tool.toolCallId)),
+          projected.reason,
+        );
+        this.append({
+          kind: "status",
+          tone: "muted",
+          text: `aborted${projected.reason === undefined ? "" : `: ${projected.reason}`}`,
+        });
+        return;
+      case "data":
+        this.handleData(projected.chunk);
+        return;
+      case "ignored":
+      case "unsupported":
+        return;
     }
+  }
 
+  private handleRendered(chunk: RenderedUIMessageChunk): void {
     switch (chunk.type) {
       case "text-start":
         this.finalizeReasoning();
@@ -1348,27 +960,6 @@ export class ChunkRenderer {
       case "reasoning-end":
         this.endReasoning(chunk.id);
         return;
-      case "tool-input-start":
-        this.renderToolStart(chunk.toolCallId, chunk.toolName);
-        return;
-      case "tool-input-delta":
-        return;
-      case "tool-input-available":
-        this.renderToolStart(chunk.toolCallId, chunk.toolName, chunk.input, true);
-        return;
-      case "tool-input-error":
-        this.renderToolStart(chunk.toolCallId, chunk.toolName, chunk.input, true);
-        this.renderToolError(chunk.toolCallId, chunk.errorText);
-        return;
-      case "tool-output-available":
-        this.renderToolOutput(chunk.toolCallId, chunk.output, chunk.preliminary === true);
-        return;
-      case "tool-output-error":
-        this.renderToolError(chunk.toolCallId, chunk.errorText);
-        return;
-      case "tool-output-denied":
-        this.renderToolDenied(chunk.toolCallId);
-        return;
       case "file":
         this.append(fileEntry(chunk.mediaType));
         return;
@@ -1383,65 +974,43 @@ export class ChunkRenderer {
         this.finalizeReasoning();
         this.append({ kind: "error", tone: "danger", text: chunk.errorText });
         return;
-      case "abort":
-        this.finishOpenText();
-        this.finalizeReasoning();
-        this.cancelActiveTools(chunk.reason);
-        this.append({
-          kind: "status",
-          tone: "muted",
-          text: `aborted${chunk.reason !== undefined ? `: ${chunk.reason}` : ""}`,
-        });
-        return;
-      default:
-        return;
     }
   }
 
-  private handleData(chunk: UIMessageChunk): void {
-    const todos = miniLilacTodoChunkSchema.safeParse(chunk);
-    if (todos.success) {
-      this.hooks.onTodos?.(todos.data.data);
-      return;
-    }
-    const parsed = miniLilacUIMessageDataPartSchema.safeParse(chunk);
-    if (!parsed.success) return;
-    const part = parsed.data;
-    switch (part.type) {
-      case "data-session":
-        this.hooks.onSnapshot(part.data);
+  private handleData(chunk: ProjectedDataChunk): void {
+    switch (chunk.type) {
+      case "session":
+        this.hooks.onSnapshot(chunk.snapshot);
         return;
-      case "data-control":
-        this.hooks.onControl?.(part.data);
-        this.append({ kind: "status", tone: "muted", text: controlSummary(part.data) });
+      case "control":
+        this.hooks.onControl?.(chunk.result);
+        this.append({ kind: "status", tone: "muted", text: controlSummary(chunk.result) });
         return;
-      case "data-transcriptReset":
+      case "todos":
+        this.hooks.onTodos?.(chunk.todos);
+        return;
+      case "transcript-reset":
         this.resetTransientState();
-        this.hooks.onTranscriptReset(part.data);
+        this.hooks.onTranscriptReset(chunk.reset);
         this.append({
           kind: "status",
           tone: "warning",
-          text: `transcript rewound (${part.data.reason}); canonical transcript will be reconciled`,
+          text: `transcript rewound (${chunk.reset.reason}); canonical transcript will be reconciled`,
         });
         return;
-      case "data-outputRollback":
-        this.rollbackOutput(part.data);
-        this.hooks.onOutputRollback?.(part.data);
+      case "output-rollback":
+        this.rollbackOutput(chunk.rollback);
+        this.hooks.onOutputRollback?.(chunk.rollback);
         return;
-      case "data-subagentStatus":
-        this.renderSubagentStatus(part.data);
+      case "subagent-status":
+        this.renderSubagentStatus(chunk.status);
         return;
-      case "data-compaction":
-        this.renderCompaction(part.id, part.data);
+      case "compaction":
+        this.renderCompaction(chunk.id, chunk.event);
         return;
     }
   }
 
-  /**
-   * Compaction publishes its whole lifecycle under one chunk id, so the entry is
-   * updated in place. Appending each phase instead would turn a single
-   * compaction into a wall of started/progress/summary lines.
-   */
   private renderCompaction(chunkId: string | undefined, event: MiniLilacCompactionEvent): void {
     const key = chunkId ?? "compaction";
     const existing = this.compactionEntryIds.get(key);
@@ -1455,8 +1024,7 @@ export class ChunkRenderer {
   }
 
   private renderSubagentStatus(status: MiniLilacSubagentStatus): void {
-    const subagent = subagentFromStatus(status);
-    this.toolNames.set(status.toolCallId, "subagent_delegate");
+    const subagent = { ...status };
     this.subagents.set(status.toolCallId, subagent);
     let id = this.toolEntryIds.get(status.toolCallId);
     if (id === undefined) {
@@ -1470,289 +1038,126 @@ export class ChunkRenderer {
     else this.activeToolIds.delete(status.toolCallId);
   }
 
-  private renderToolStart(
-    toolCallId: string,
-    toolName: string,
-    input?: unknown,
-    inputAvailable = false,
+  private cancelStatusOnlySubagents(
+    cancelledToolIds: ReadonlySet<string>,
+    reason: string | undefined,
   ): void {
-    this.toolNames.set(toolCallId, toolName);
-    this.activeToolIds.add(toolCallId);
-    if (inputAvailable) this.toolInputs.set(toolCallId, input);
-    this.finalizeReasoning();
-    if (toolName === "subagent_result") return;
-    if (toolName === "subagent_delegate") {
-      const parsed = subagentFromTool(toolCallId, input);
+    for (const toolCallId of this.activeToolIds) {
+      if (cancelledToolIds.has(toolCallId)) continue;
       const existing = this.subagents.get(toolCallId);
+      if (existing === undefined) continue;
+      const subagent = {
+        ...existing,
+        state: "cancelled" as const,
+        error: `Cancelled${reason === undefined ? "" : `: ${reason}`}`,
+      };
+      this.subagents.set(toolCallId, subagent);
+      const id = this.toolEntryIds.get(toolCallId);
+      if (id === undefined) this.toolEntryIds.set(toolCallId, this.append(subagentEntry(subagent)));
+      else this.output.update(id, subagentEntry(subagent));
+      this.activeToolIds.delete(toolCallId);
+    }
+  }
+
+  private renderToolProjection(toolCallId: string, projection: ToolProjection): void {
+    this.finalizeReasoning();
+    this.toolProjections.set(toolCallId, projection);
+    if (projection.running) this.activeToolIds.add(toolCallId);
+    else this.activeToolIds.delete(toolCallId);
+
+    if (projection.kind === "exploration") {
+      this.renderExplorationProjection(toolCallId, projection);
+      return;
+    }
+    if (projection.kind === "subagent-delegate") {
+      const projected = subagentFromProjection(toolCallId, projection);
+      const existing = this.subagents.get(toolCallId);
+      const existingIsTerminal =
+        existing !== undefined && existing.state !== "pending" && existing.state !== "running";
+      const preserveExistingState =
+        existing !== undefined && (existingIsTerminal || projection.running);
       const subagent =
         existing === undefined
-          ? parsed
-          : { ...existing, profile: parsed.profile, prompt: parsed.prompt, mode: parsed.mode };
-      this.subagents.set(toolCallId, subagent);
-      if (subagent.state !== "pending" && subagent.state !== "running") {
-        this.activeToolIds.delete(toolCallId);
-      }
-      const existingId = this.toolEntryIds.get(toolCallId);
-      if (existingId === undefined) {
-        this.toolEntryIds.set(toolCallId, this.append(subagentEntry(subagent)));
-      } else if (inputAvailable) {
-        this.output.update(existingId, subagentEntry(subagent));
-      }
-      return;
-    }
-    if (toolName === "batch") {
-      this.flattenedBatchToolIds.add(toolCallId);
-      return;
-    }
-    const category = explorationCategory(toolName);
-    if (category !== undefined) {
-      if (!inputAvailable) return;
-      const existingExploration = this.explorationByToolId.get(toolCallId);
-      if (existingExploration !== undefined) {
-        const index = existingExploration.toolCallIds.indexOf(toolCallId);
-        if (existingExploration.operations[index]?.status !== "pending") {
-          this.activeToolIds.delete(toolCallId);
-        }
-        return;
-      }
-      if (this.exploration === undefined) {
-        const state: ExplorationState = {
-          id: "",
-          reads: category === "read" ? 1 : 0,
-          searches: category === "search" ? 1 : 0,
-          failures: 0,
-          errors: 0,
-          cancellations: 0,
-          operations: [explorationOperation(toolName, input, this.options)],
-          toolCallIds: [toolCallId],
-          pending: new Set([toolCallId]),
-        };
-        state.id = this.output.append(explorationEntry(state));
-        this.exploration = state;
-      } else {
-        if (category === "read") this.exploration.reads += 1;
-        else this.exploration.searches += 1;
-        this.exploration.operations.push(explorationOperation(toolName, input, this.options));
-        this.exploration.toolCallIds.push(toolCallId);
-        this.exploration.pending.add(toolCallId);
-        this.output.update(this.exploration.id, explorationEntry(this.exploration));
-      }
-      this.explorationByToolId.set(toolCallId, this.exploration);
-      this.toolEntryIds.set(toolCallId, this.exploration.id);
-      return;
-    }
-    const summary = toolSummary(toolName, input);
-    if (inputAvailable || !this.toolSummaries.has(toolCallId)) {
-      this.toolSummaries.set(toolCallId, summary);
-    }
-    const existingId = this.toolEntryIds.get(toolCallId);
-    if (existingId !== undefined) {
-      if (inputAvailable) {
-        this.output.update(
-          existingId,
-          toolEntry(toolName, input, { status: "active" }, this.options) ?? {
-            kind: "tool",
-            tone: "accent",
-            text: summary,
-            running: true,
-          },
-        );
-      }
-      return;
-    }
-    const entry = toolEntry(toolName, input, { status: "active" }, this.options) ?? {
-      kind: "tool" as const,
-      tone: "accent" as const,
-      text: summary,
-      running: true,
-    };
-    const id = this.append(entry);
-    this.toolEntryIds.set(toolCallId, id);
-  }
-
-  private renderToolOutput(toolCallId: string, output: unknown, preliminary: boolean): void {
-    const name = this.toolNames.get(toolCallId) ?? "tool";
-    if (name === "subagent_result") {
-      if (!preliminary) this.activeToolIds.delete(toolCallId);
-      return;
-    }
-    if (name === "subagent_delegate") {
-      if (preliminary) return;
-      const existing = this.subagents.get(toolCallId);
-      if (existing?.state === "completed" || existing?.state === "cancelled") {
-        this.activeToolIds.delete(toolCallId);
-        return;
-      }
-      const subagent = subagentFromTool(toolCallId, this.toolInputs.get(toolCallId), output);
-      const merged = { ...subagent, toolCount: existing?.toolCount ?? subagent.toolCount };
-      this.subagents.set(toolCallId, merged);
-      if (merged.state === "pending" || merged.state === "running") {
-        this.activeToolIds.add(toolCallId);
-      } else {
-        this.activeToolIds.delete(toolCallId);
-      }
-      const id = this.toolEntryIds.get(toolCallId);
-      if (id === undefined) this.toolEntryIds.set(toolCallId, this.append(subagentEntry(merged)));
-      else this.output.update(id, subagentEntry(merged));
-      return;
-    }
-    if (preliminary) {
-      if (name !== "bash") return;
-      const parsed = bashOutputDeltaSchema.safeParse(output);
-      if (!parsed.success) return;
-      const partial = `${this.bashOutputByToolId.get(toolCallId) ?? ""}${parsed.data.delta}`;
-      this.bashOutputByToolId.set(toolCallId, partial);
-      let id = this.toolEntryIds.get(toolCallId);
-      if (id === undefined) {
-        this.renderToolStart(toolCallId, name);
-        id = this.toolEntryIds.get(toolCallId);
-      }
-      if (id === undefined) return;
-      this.output.update(
-        id,
-        toolEntry(
-          name,
-          this.toolInputs.get(toolCallId),
-          { status: "active", output: { stdout: partial } },
-          this.options,
-        ) ?? {
-          kind: "tool",
-          tone: "accent",
-          text: this.toolSummaries.get(toolCallId) ?? "Bash",
-          running: true,
-        },
-      );
-      return;
-    }
-    this.activeToolIds.delete(toolCallId);
-    const partial = this.bashOutputByToolId.get(toolCallId);
-    this.bashOutputByToolId.delete(toolCallId);
-    if (this.flattenedBatchToolIds.has(toolCallId)) return;
-    if (this.explorationByToolId.has(toolCallId)) {
-      this.settleExploration(toolCallId);
-      return;
-    }
-    const id = this.toolEntryIds.get(toolCallId);
-    if (id === undefined) {
-      this.renderToolStart(toolCallId, name);
-      return this.renderToolOutput(toolCallId, output, false);
-    }
-    this.output.update(
-      id,
-      toolEntry(
-        name,
-        this.toolInputs.get(toolCallId),
-        {
-          status: "success",
-          output:
-            name === "bash" && !bashOutputSchema.safeParse(output).success && partial !== undefined
-              ? { stdout: partial }
-              : output,
-        },
-        this.options,
-      ) ?? {
-        kind: "tool",
-        tone: "success",
-        text: this.toolSummaries.get(toolCallId) ?? toolSummary(name, undefined),
-      },
-    );
-  }
-
-  private renderToolError(toolCallId: string, errorText: string): void {
-    this.activeToolIds.delete(toolCallId);
-    this.bashOutputByToolId.delete(toolCallId);
-    const name = this.toolNames.get(toolCallId) ?? "tool";
-    if (name === "subagent_result") return;
-    if (name === "subagent_delegate") {
-      const existing = this.subagents.get(toolCallId);
-      const subagent: SubagentTranscript = {
-        ...(existing ?? subagentFromTool(toolCallId, this.toolInputs.get(toolCallId))),
-        state: "error",
-        error: errorText,
-      };
+          ? projected
+          : {
+              ...projected,
+              ...(existing.runId === undefined ? {} : { runId: existing.runId }),
+              ...(existing.sessionId === undefined ? {} : { sessionId: existing.sessionId }),
+              ...(existing.sessionName === undefined ? {} : { sessionName: existing.sessionName }),
+              toolCount: existing.toolCount,
+              ...(existing.activity === undefined ? {} : { activity: existing.activity }),
+              ...(existing.text === undefined ? {} : { text: existing.text }),
+              ...(existing.error === undefined ? {} : { error: existing.error }),
+              ...(preserveExistingState ? { state: existing.state } : {}),
+            };
       this.subagents.set(toolCallId, subagent);
       const id = this.toolEntryIds.get(toolCallId);
       if (id === undefined) this.toolEntryIds.set(toolCallId, this.append(subagentEntry(subagent)));
       else this.output.update(id, subagentEntry(subagent));
       return;
     }
-    if (this.explorationByToolId.has(toolCallId)) {
-      this.settleExploration(toolCallId, "error", errorText);
-      return;
-    }
-    if (this.flattenedBatchToolIds.has(toolCallId)) {
-      const id = this.append(
-        toolEntry(
-          name,
-          this.toolInputs.get(toolCallId),
-          { status: "error", errorText },
-          this.options,
-        ) ?? {
-          kind: "tool",
-          tone: "danger",
-          text: toolErrorSummary("Parallel tools", errorText),
-        },
-      );
-      this.toolEntryIds.set(toolCallId, id);
-      return;
-    }
+
+    const entry = projectionEntry(toolCallId, projection);
     const id = this.toolEntryIds.get(toolCallId);
-    const entry = toolEntry(
-      name,
-      this.toolInputs.get(toolCallId),
-      {
-        status: "error",
-        errorText,
-      },
-      this.options,
-    ) ?? {
-      kind: "tool" as const,
-      tone: "danger" as const,
-      text: toolErrorSummary(
-        this.toolSummaries.get(toolCallId) ?? toolSummary(name, undefined),
-        errorText,
-      ),
-    };
-    if (id === undefined) this.append(entry);
+    if (entry === undefined) {
+      if (id !== undefined && projection.visibility === "hidden") this.output.remove(id);
+      return;
+    }
+    if (id === undefined) this.toolEntryIds.set(toolCallId, this.append(entry));
     else this.output.update(id, entry);
   }
 
-  private renderToolDenied(toolCallId: string): void {
-    this.activeToolIds.delete(toolCallId);
-    this.bashOutputByToolId.delete(toolCallId);
-    const name = this.toolNames.get(toolCallId) ?? "tool";
-    if (name === "subagent_result") return;
-    if (name === "subagent_delegate") {
-      const existing = this.subagents.get(toolCallId);
-      const subagent: SubagentTranscript = {
-        ...(existing ?? subagentFromTool(toolCallId, this.toolInputs.get(toolCallId))),
-        state: "denied",
-        error: "Denied",
-      };
-      this.subagents.set(toolCallId, subagent);
-      const id = this.toolEntryIds.get(toolCallId);
-      if (id === undefined) this.toolEntryIds.set(toolCallId, this.append(subagentEntry(subagent)));
-      else this.output.update(id, subagentEntry(subagent));
+  private renderExplorationProjection(
+    toolCallId: string,
+    projection: Extract<ToolProjection, { kind: "exploration" }>,
+  ): void {
+    const existing = this.explorationByToolId.get(toolCallId);
+    if (existing !== undefined) {
+      const index = existing.toolCallIds.indexOf(toolCallId);
+      const operation = explorationOperation(projection);
+      if (index >= 0 && operation !== undefined) {
+        const previous = existing.operations[index];
+        if (previous !== undefined) this.removeExplorationOutcome(existing, toolCallId, previous);
+        existing.operations[index] = operation;
+        this.addExplorationOutcome(existing, toolCallId, operation);
+        this.output.update(existing.id, explorationEntry(existing));
+      }
       return;
     }
-    if (this.explorationByToolId.has(toolCallId)) {
-      this.settleExploration(toolCallId, "denied");
-      return;
+
+    const previous = this.exploration;
+    const next = addExplorationProjection(previous, toolCallId, projection);
+    if (next === undefined) return;
+    if (previous === undefined) {
+      next.id = this.output.append(explorationEntry(next));
+      this.exploration = next;
+    } else {
+      this.output.update(next.id, explorationEntry(next));
     }
-    if (this.flattenedBatchToolIds.has(toolCallId)) return;
-    const id = this.toolEntryIds.get(toolCallId);
-    const entry = toolEntry(
-      name,
-      this.toolInputs.get(toolCallId),
-      { status: "denied" },
-      this.options,
-    ) ?? {
-      kind: "tool" as const,
-      tone: "warning" as const,
-      text: `${this.toolSummaries.get(toolCallId) ?? toolSummary(name, undefined)}: denied`,
-    };
-    if (id === undefined) this.append(entry);
-    else this.output.update(id, entry);
+    this.explorationByToolId.set(toolCallId, next);
+    this.toolEntryIds.set(toolCallId, next.id);
+  }
+
+  private removeExplorationOutcome(
+    state: ExplorationState,
+    toolCallId: string,
+    operation: ExplorationOperation,
+  ): void {
+    state.pending.delete(toolCallId);
+    if (operation.status === "error" || operation.status === "denied") state.failures -= 1;
+    if (operation.status === "error") state.errors -= 1;
+    if (operation.status === "cancelled") state.cancellations -= 1;
+  }
+
+  private addExplorationOutcome(
+    state: ExplorationState,
+    toolCallId: string,
+    operation: ExplorationOperation,
+  ): void {
+    if (operation.status === "pending") state.pending.add(toolCallId);
+    if (operation.status === "error" || operation.status === "denied") state.failures += 1;
+    if (operation.status === "error") state.errors += 1;
+    if (operation.status === "cancelled") state.cancellations += 1;
   }
 
   private append(entry: Omit<TranscriptEntry, "id">): string {
@@ -1761,76 +1166,6 @@ export class ChunkRenderer {
       this.exploration = undefined;
     }
     return this.output.append(entry);
-  }
-
-  private settleExploration(
-    toolCallId: string,
-    status: Exclude<ExplorationOperation["status"], "pending"> = "success",
-    errorText?: string,
-  ): void {
-    const state = this.explorationByToolId.get(toolCallId);
-    if (state === undefined) return;
-    const index = state.toolCallIds.indexOf(toolCallId);
-    const operation = state.operations[index];
-    if (operation === undefined || operation.status !== "pending") return;
-    state.pending.delete(toolCallId);
-    state.operations[index] = {
-      ...operation,
-      status,
-      ...(status === "error" && errorText !== undefined
-        ? { error: previewText(errorText, 180) }
-        : {}),
-    };
-    if (status === "error" || status === "denied") state.failures += 1;
-    if (status === "error") state.errors += 1;
-    if (status === "cancelled") state.cancellations += 1;
-    this.output.update(state.id, explorationEntry(state));
-  }
-
-  private cancelActiveTools(reason: string | undefined): void {
-    for (const toolCallId of this.activeToolIds) {
-      const name = this.toolNames.get(toolCallId) ?? "tool";
-      if (name === "subagent_result" || this.flattenedBatchToolIds.has(toolCallId)) continue;
-      if (name === "subagent_delegate") {
-        const existing = this.subagents.get(toolCallId);
-        const subagent: SubagentTranscript = {
-          ...(existing ?? subagentFromTool(toolCallId, this.toolInputs.get(toolCallId))),
-          state: "cancelled",
-          error: `Cancelled${reason === undefined ? "" : `: ${reason}`}`,
-        };
-        this.subagents.set(toolCallId, subagent);
-        const id = this.toolEntryIds.get(toolCallId);
-        if (id === undefined)
-          this.toolEntryIds.set(toolCallId, this.append(subagentEntry(subagent)));
-        else this.output.update(id, subagentEntry(subagent));
-        continue;
-      }
-      if (this.explorationByToolId.has(toolCallId)) {
-        this.settleExploration(toolCallId, "cancelled");
-        continue;
-      }
-      const id = this.toolEntryIds.get(toolCallId);
-      if (id === undefined) continue;
-      const partial = this.bashOutputByToolId.get(toolCallId);
-      this.output.update(
-        id,
-        toolEntry(
-          name,
-          this.toolInputs.get(toolCallId),
-          {
-            status: "cancelled",
-            ...(reason === undefined ? {} : { reason }),
-            ...(name === "bash" && partial !== undefined ? { output: { stdout: partial } } : {}),
-          },
-          this.options,
-        ) ?? {
-          kind: "tool",
-          tone: "muted",
-          text: `${this.toolSummaries.get(toolCallId) ?? toolSummary(name, undefined)}: cancelled`,
-        },
-      );
-    }
-    this.activeToolIds.clear();
   }
 
   private rollbackOutput(rollback: MiniLilacOutputRollback): void {
@@ -1848,18 +1183,16 @@ export class ChunkRenderer {
       const exploration = this.explorationByToolId.get(toolCallId);
       if (exploration !== undefined) {
         const index = exploration.toolCallIds.indexOf(toolCallId);
-        if (index >= 0) {
-          const status = exploration.operations[index]?.status;
-          exploration.toolCallIds.splice(index, 1);
-          const category = explorationCategory(this.toolNames.get(toolCallId) ?? "");
+        const operation = exploration.operations[index];
+        const projection = this.toolProjections.get(toolCallId);
+        if (index >= 0 && operation !== undefined && projection?.kind === "exploration") {
+          this.removeExplorationOutcome(exploration, toolCallId, operation);
+          const category = explorationCategory(projection);
           if (category === "read") exploration.reads -= 1;
-          if (category === "search") exploration.searches -= 1;
-          if (status === "error" || status === "denied") exploration.failures -= 1;
-          if (status === "error") exploration.errors -= 1;
-          if (status === "cancelled") exploration.cancellations -= 1;
+          else exploration.searches -= 1;
+          exploration.toolCallIds.splice(index, 1);
           exploration.operations.splice(index, 1);
         }
-        exploration.pending.delete(toolCallId);
         this.explorationByToolId.delete(toolCallId);
         if (exploration.toolCallIds.length === 0) {
           this.output.remove(exploration.id);
@@ -1872,12 +1205,8 @@ export class ChunkRenderer {
         if (id !== undefined) this.output.remove(id);
       }
       this.activeToolIds.delete(toolCallId);
-      this.toolNames.delete(toolCallId);
       this.toolEntryIds.delete(toolCallId);
-      this.toolSummaries.delete(toolCallId);
-      this.toolInputs.delete(toolCallId);
-      this.bashOutputByToolId.delete(toolCallId);
-      this.flattenedBatchToolIds.delete(toolCallId);
+      this.toolProjections.delete(toolCallId);
       this.subagents.delete(toolCallId);
     }
   }
@@ -1889,7 +1218,6 @@ export class ChunkRenderer {
   }
 
   private appendReasoning(chunkId: string, delta: string): void {
-    // Codex may stream deltas without an explicit reasoning-start; open lazily.
     const existing = this.reasoningEntries.get(chunkId);
     if (existing === undefined && delta.length === 0) return;
     const entry = existing ?? { id: this.append(reasoningEntry("", false)), text: "" };
@@ -1905,9 +1233,6 @@ export class ChunkRenderer {
     this.reasoningEntries.delete(chunkId);
   }
 
-  // Codex may omit reasoning-end, so finalize any open entries when a text,
-  // tool, or finish boundary is reached. Each chunk keeps its own entry so
-  // separate reasoning blocks never merge.
   private finalizeReasoning(): void {
     for (const entry of this.reasoningEntries.values()) {
       this.output.update(entry.id, reasoningEntry(entry.text, true));
@@ -1938,12 +1263,8 @@ export class ChunkRenderer {
   }
 
   private resetTransientState(): void {
-    this.toolNames.clear();
     this.toolEntryIds.clear();
-    this.toolSummaries.clear();
-    this.toolInputs.clear();
-    this.bashOutputByToolId.clear();
-    this.flattenedBatchToolIds.clear();
+    this.toolProjections.clear();
     this.activeToolIds.clear();
     this.explorationByToolId.clear();
     this.subagents.clear();

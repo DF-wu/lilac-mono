@@ -1,6 +1,5 @@
-import { createCliRenderer } from "@opentui/core";
-import { render } from "@opentui/solid";
 import { Show, createSignal } from "solid-js";
+import { Result, type Result as ResultType } from "better-result";
 
 import { MiniLilacTransport } from "@stanley2058/mini-lilac-client";
 
@@ -15,11 +14,34 @@ import {
   saveBindingPreferences,
   type BindingPreferences,
 } from "./preferences";
-import { loadExistingSession, resolveStartupSession, type StartupSession } from "./startup";
-import { COLORS, createTerminalTheme } from "./theme";
+import {
+  loadExistingSession,
+  resolveStartupSession,
+  type ExistingSessionLoadError,
+  type StartupSession,
+} from "./startup";
+import {
+  createTerminalRenderer,
+  readTerminalTheme,
+  renderTerminalApp,
+  requestTerminalRendererShutdown,
+  resolveTerminalShutdownOutcome,
+  runWithOwnedTerminalRenderer,
+  runTerminalEntrypoint,
+  setTerminalBackground,
+  type TerminalShutdownOutcome,
+} from "./terminal-runtime-adapter";
 
 export async function main(argv: readonly string[]): Promise<number> {
-  const options = parseCliOptions({ argv, env: process.env, cwd: process.cwd() });
+  const parsedOptions = parseCliOptions({ argv, env: process.env, cwd: process.cwd() });
+  const options = parsedOptions.match({
+    ok: (value) => value,
+    err: (error) => {
+      process.stderr.write(`${error.message}\n`);
+      return undefined;
+    },
+  });
+  if (options === undefined) return 1;
 
   if (options.help) {
     process.stdout.write(HELP_TEXT);
@@ -40,29 +62,32 @@ export async function main(argv: readonly string[]): Promise<number> {
   const preferencesPath = bindingPreferencesPath(process.env);
   const preferenceServer = bindingPreferenceServerKey(options.server);
   let preferences: BindingPreferences = { version: 1, servers: {} };
-  try {
-    preferences = await loadBindingPreferences(preferencesPath);
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    process.stderr.write(`Warning: could not load TUI preferences: ${message}\n`);
-  }
+  const loadedPreferences = await loadBindingPreferences(preferencesPath);
+  loadedPreferences.match({
+    ok: (value) => {
+      preferences = value.preferences;
+    },
+    err: (error) => {
+      process.stderr.write(`Warning: could not load TUI preferences: ${error.message}\n`);
+    },
+  });
 
   const io = createReadlinePreflightIO();
-  let startup: StartupSession;
-  try {
-    startup = await resolveStartupSession(
-      baseTransport,
-      options,
-      io,
-      preferences.servers[preferenceServer],
-    );
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    process.stderr.write(`Failed to start: ${message}\n`);
-    return 1;
-  } finally {
-    io.close();
-  }
+  const resolvedStartup = await resolveStartupSession(
+    baseTransport,
+    options,
+    io,
+    preferences.servers[preferenceServer],
+  );
+  io.close();
+  const startup = resolvedStartup.match({
+    ok: (value) => value,
+    err: (error) => {
+      process.stderr.write(`Failed to start: ${error.message}\n`);
+      return undefined;
+    },
+  });
+  if (startup === undefined) return 1;
 
   const transport = new MiniLilacTransport({
     baseUrl: options.server,
@@ -78,7 +103,7 @@ export async function main(argv: readonly string[]): Promise<number> {
   const destroyed = new Promise<void>((resolve) => {
     resolveDestroyed = resolve;
   });
-  const renderer = await createCliRenderer({
+  const createdRenderer = await createTerminalRenderer({
     exitOnCtrlC: false,
     clearOnShutdown: true,
     targetFps: 30,
@@ -88,62 +113,76 @@ export async function main(argv: readonly string[]): Promise<number> {
     backgroundColor: "transparent",
     onDestroy: () => resolveDestroyed?.(),
   });
-  const terminalColors = await renderer.getPalette({ size: 16 }).catch(() => undefined);
-  const theme = terminalColors === undefined ? COLORS : createTerminalTheme(terminalColors);
-  renderer.setBackgroundColor(theme.background);
+  const renderer = createdRenderer.match({
+    ok: (value) => value,
+    err: (error) => {
+      process.stderr.write(`Failed to start: ${error.message}\n`);
+      return undefined;
+    },
+  });
+  if (renderer === undefined) return 1;
   let continuationRequested = false;
   let currentSessionId = startup.sessionId;
-  let preferenceWrite = Promise.resolve();
-  const rememberBindings = (bindings: {
-    readonly model: string | undefined;
-    readonly profile: string | undefined;
-    readonly reasoning: StartupSession["reasoning"];
-  }) => {
-    preferences = {
-      ...preferences,
-      servers: { ...preferences.servers, [preferenceServer]: bindings },
-    };
-    preferenceWrite = preferenceWrite
-      .then(() => saveBindingPreferences(preferencesPath, preferences))
-      .catch((error: unknown) => {
-        const message = error instanceof Error ? error.message : String(error);
-        process.stderr.write(`Warning: could not save TUI preferences: ${message}\n`);
-      });
-  };
+  let shutdownOutcome: TerminalShutdownOutcome = { kind: "success" };
+  const deferredWarnings: string[] = [];
+  let preferenceWrite: Promise<void> = Promise.resolve();
+  const terminalRun = await runWithOwnedTerminalRenderer(renderer, async () => {
+    const theme = await readTerminalTheme(renderer);
+    const background = setTerminalBackground(renderer, theme.background);
+    const backgroundError = background.match({ ok: () => undefined, err: (error) => error });
+    if (backgroundError !== undefined) return Result.err(backgroundError);
 
-  try {
-    await render(() => {
-      const [current, setCurrent] = createSignal(startup);
-      const switchSession = async (sessionId: string): Promise<void> => {
-        const { snapshot, messages, todos, replayCursor } = await loadExistingSession(
-          transport,
-          sessionId,
-          options.cwd,
-        );
-        transport.setSessionBindings({
-          model: snapshot.model ?? undefined,
-          profile: snapshot.profile ?? undefined,
-          reasoning: snapshot.reasoning ?? undefined,
+    const rememberBindings = (bindings: {
+      readonly model: string | undefined;
+      readonly profile: string | undefined;
+      readonly reasoning: StartupSession["reasoning"];
+    }) => {
+      preferences = {
+        ...preferences,
+        servers: { ...preferences.servers, [preferenceServer]: bindings },
+      };
+      preferenceWrite = preferenceWrite.then(async () => {
+        const saved = await saveBindingPreferences(preferencesPath, preferences);
+        saved.match({
+          ok: () => {},
+          err: (error) => {
+            deferredWarnings.push(`Warning: could not save TUI preferences: ${error.message}\n`);
+          },
         });
-        currentSessionId = snapshot.id;
-        setCurrent({
-          sessionId: snapshot.id,
-          model: snapshot.model ?? undefined,
-          profile: snapshot.profile ?? undefined,
-          reasoning: snapshot.reasoning ?? undefined,
-          snapshot,
-          messages,
-          todos,
-          replayCursor,
-          models: startup.models,
-          profiles: startup.profiles,
+      });
+    };
+    const rendered = await renderTerminalApp(() => {
+      const [current, setCurrent] = createSignal(startup);
+      const switchSession = async (
+        sessionId: string,
+      ): Promise<ResultType<void, ExistingSessionLoadError>> => {
+        const loaded = await loadExistingSession(transport, sessionId, options.cwd);
+        return loaded.map(({ snapshot, messages, todos, replayCursor }) => {
+          transport.setSessionBindings({
+            model: snapshot.model ?? undefined,
+            profile: snapshot.profile ?? undefined,
+            reasoning: snapshot.reasoning ?? undefined,
+          });
+          currentSessionId = snapshot.id;
+          setCurrent({
+            sessionId: snapshot.id,
+            model: snapshot.model ?? undefined,
+            profile: snapshot.profile ?? undefined,
+            reasoning: snapshot.reasoning ?? undefined,
+            snapshot,
+            messages,
+            todos,
+            replayCursor,
+            models: startup.models,
+            profiles: startup.profiles,
+          });
         });
       };
-      const newSession = async (bindings: {
+      const newSession = (bindings: {
         readonly model: string | undefined;
         readonly profile: string | undefined;
         readonly reasoning: StartupSession["reasoning"];
-      }): Promise<void> => {
+      }): void => {
         const sessionId = crypto.randomUUID();
         transport.setSessionBindings(bindings);
         currentSessionId = sessionId;
@@ -179,42 +218,54 @@ export async function main(argv: readonly string[]): Promise<number> {
               onSessionSelect={switchSession}
               onExit={() => {
                 continuationRequested = true;
-                renderer.destroy();
+                shutdownOutcome = requestTerminalRendererShutdown(renderer, () =>
+                  resolveDestroyed?.(),
+                );
               }}
             />
           )}
         </Show>
       );
     }, renderer);
+    const renderError = rendered.match({ ok: () => undefined, err: (error) => error });
+    if (renderError !== undefined) return Result.err(renderError);
     await destroyed;
-    if (continuationRequested) {
-      process.stdout.write(
-        `To continue this session, run: ${continuationCommand(options.server, currentSessionId)}\n`,
-      );
-      const usedCliToken = argv.some(
-        (argument) => argument === "--token" || argument.startsWith("--token="),
-      );
-      if (usedCliToken) {
-        process.stdout.write(
-          "Re-supply --token or set MINI_LILAC_TOKEN; tokens are never printed to scrollback.\n",
-        );
-      }
-    }
-    return 0;
-  } finally {
-    if (!renderer.isDestroyed) renderer.destroy();
+    const shutdown = resolveTerminalShutdownOutcome(shutdownOutcome);
+    const shutdownError = shutdown.match({ ok: () => undefined, err: (error) => error });
+    if (shutdownError !== undefined) return Result.err(shutdownError);
     await preferenceWrite;
+    return Result.ok(undefined);
+  });
+
+  for (const warning of deferredWarnings) process.stderr.write(warning);
+  const terminalError = terminalRun.match({ ok: () => undefined, err: (error) => error });
+  if (terminalError !== undefined) {
+    process.stderr.write(`${terminalError.message}\n`);
+    return 1;
   }
+  if (continuationRequested) {
+    process.stdout.write(
+      `To continue this session, run: ${continuationCommand(options.server, currentSessionId)}\n`,
+    );
+    const usedCliToken = argv.some(
+      (argument) => argument === "--token" || argument.startsWith("--token="),
+    );
+    if (usedCliToken) {
+      process.stdout.write(
+        "Re-supply --token or set MINI_LILAC_TOKEN; tokens are never printed to scrollback.\n",
+      );
+    }
+  }
+  return 0;
 }
 
 if (import.meta.main) {
-  main(process.argv.slice(2))
-    .then((code) => {
-      process.exitCode = code;
-    })
-    .catch((error: unknown) => {
-      const message = error instanceof Error ? error.message : String(error);
-      process.stderr.write(`${message}\n`);
-      process.exitCode = 1;
-    });
+  const outcome = await runTerminalEntrypoint(() => main(process.argv.slice(2)));
+  process.exitCode = outcome.match({
+    ok: (value) => value,
+    err: (error) => {
+      process.stderr.write(`${error.message}\n`);
+      return 1;
+    },
+  });
 }

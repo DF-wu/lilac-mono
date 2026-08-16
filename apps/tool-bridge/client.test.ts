@@ -1,9 +1,10 @@
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, spyOn } from "bun:test";
 import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { stripVTControlCharacters } from "node:util";
+import { Panic } from "better-result";
 
 import {
   buildToolInput,
@@ -15,6 +16,25 @@ import {
 } from "./client";
 
 const CLIENT_ENTRY = path.join(import.meta.dir, "client.ts");
+
+function expectOk<T>(
+  result: { readonly status: "ok"; readonly value: T } | { readonly status: "error" },
+): T {
+  expect(result.status).toBe("ok");
+  if (result.status === "error") throw new Error("expected Ok result");
+  return result.value;
+}
+
+function expectErrorMessage(
+  result:
+    | { readonly status: "ok" }
+    | { readonly status: "error"; readonly error: { readonly message: string } },
+  message: string,
+): void {
+  expect(result.status).toBe("error");
+  if (result.status === "ok") throw new Error("expected Err result");
+  expect(result.error.message).toContain(message);
+}
 
 async function runToolBridgeCli(params: {
   args: readonly string[];
@@ -92,6 +112,18 @@ describe("tool-bridge entrypoint detection", () => {
 });
 
 describe("tool-bridge build id", () => {
+  it("preserves Panic identity from captured filesystem operations", async () => {
+    const panic = new Panic({ message: "build artifact invariant" });
+    const stat = spyOn(fs, "stat").mockRejectedValueOnce(panic);
+    try {
+      await expect(resolveBuildId("/workspace/apps/tool-bridge/dist/client.js")).rejects.toBe(
+        panic,
+      );
+    } finally {
+      stat.mockRestore();
+    }
+  });
+
   it("hashes the built client artifact and trims to 8 characters", async () => {
     const root = await fs.mkdtemp(path.join(tmpdir(), "tool-bridge-"));
 
@@ -189,6 +221,28 @@ describe("tool-bridge CLI runtime", () => {
     }
   });
 
+  it("reports the owned network failure after loading the operator token", async () => {
+    const root = await fs.mkdtemp(path.join(tmpdir(), "tool-bridge-operator-network-"));
+    const tokenPath = path.join(root, "operator-token");
+    await fs.writeFile(tokenPath, "abcdefghijklmnopqrstuvwxyzABCDEFGH012345678\n", { mode: 0o600 });
+
+    try {
+      const result = await runToolBridgeCli({
+        args: ["--operator", "--list"],
+        backendUrl: "http://127.0.0.1:1",
+        env: { LILAC_OPERATOR_TOKEN_FILE: tokenPath },
+      });
+
+      expect(result).toEqual({
+        stdout: "",
+        stderr: "Error: fetch tools list failed\n",
+        exitCode: 1,
+      });
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("forwards generic control capability but not workflow capability", async () => {
     const requests: Request[] = [];
     const server = Bun.serve({
@@ -216,6 +270,7 @@ describe("tool-bridge CLI runtime", () => {
       LILAC_CWD: "/approved",
       LILAC_TOOL_CALL_ID: "tool-call-1",
       LILAC_CONTROL_CAPABILITY: "control-capability",
+      LILAC_CURRENT_TURN_USER_ID: "user-2",
       LILAC_WORKFLOW_CAPABILITY: "server-capability",
     };
     try {
@@ -242,6 +297,7 @@ describe("tool-bridge CLI runtime", () => {
         expect(request.headers.get("x-lilac-request-id")).toBe("wfr:request");
         expect(request.headers.get("x-lilac-tool-call-id")).toBe("tool-call-1");
         expect(request.headers.get("x-lilac-control-capability")).toBe("control-capability");
+        expect(request.headers.get("x-lilac-current-turn-user-id")).toBe("user-2");
         expect(request.headers.get("x-lilac-workflow-capability")).toBeNull();
       }
     } finally {
@@ -277,7 +333,7 @@ describe("tool-bridge CLI runtime", () => {
 
     try {
       const result = await runToolBridgeCli({
-        args: ["demo.echo", "--stdin", "--output=json"],
+        args: ["demo.echo", "--stdin"],
         backendUrl: `http://127.0.0.1:${server.port}`,
         stdin: JSON.stringify({ message: "hello", nested: { count: 2 } }),
         env: {
@@ -291,7 +347,7 @@ describe("tool-bridge CLI runtime", () => {
 
       expect(result.exitCode).toBe(0);
       expect(result.stderr).toBe("");
-      expect(JSON.parse(result.stdout) as unknown).toEqual({ ok: true, value: 42 });
+      expect(result.stdout).toBe('{"ok":true,"value":42}\n');
 
       expect(requests).toHaveLength(1);
       const request = requests[0];
@@ -317,6 +373,110 @@ describe("tool-bridge CLI runtime", () => {
     }
   });
 
+  it("supports explicit pretty JSON output", async () => {
+    const server = Bun.serve({
+      port: 0,
+      hostname: "127.0.0.1",
+      fetch() {
+        return Response.json({ isError: false, output: { ok: true, nested: { value: 42 } } });
+      },
+    });
+
+    try {
+      const pretty = await runToolBridgeCli({
+        args: ["demo.echo", "--input={}", "--output=json-pretty"],
+        backendUrl: `http://127.0.0.1:${server.port}`,
+      });
+
+      expect(pretty).toEqual({
+        stdout: '{\n  "ok": true,\n  "nested": {\n    "value": 42\n  }\n}\n',
+        stderr: "",
+        exitCode: 0,
+      });
+    } finally {
+      server.stop(true);
+    }
+  });
+
+  it("orchestrates non-interactive onboarding", async () => {
+    const calls: Array<{ callableId: string; input: Record<string, unknown> }> = [];
+    const server = Bun.serve({
+      port: 0,
+      hostname: "127.0.0.1",
+      async fetch(req) {
+        const body = (await req.json()) as { callableId: string; input: Record<string, unknown> };
+        calls.push(body);
+        if (body.callableId === "onboarding.bootstrap") {
+          return Response.json({ isError: false, output: { bootstrapped: true } });
+        }
+        if (body.callableId === "onboarding.vcs_env") {
+          return Response.json({ isError: false, output: { GIT_CONFIG_GLOBAL: "/tmp/gitconfig" } });
+        }
+        if (body.callableId === "onboarding.git_identity" && body.input.mode === "test") {
+          return Response.json({ isError: false, output: { ok: true } });
+        }
+        return Response.json({ isError: false, output: { configured: true } });
+      },
+    });
+
+    try {
+      const result = await runToolBridgeCli({
+        args: ["onboard", "--yes", "--no-sign", "--output=json"],
+        backendUrl: `http://127.0.0.1:${server.port}`,
+      });
+
+      expect(result.exitCode).toBe(0);
+      expect(result.stderr).toBe("");
+      const output = JSON.parse(result.stdout) as Record<string, unknown>;
+      expect(output.ok).toBe(true);
+      expect(output.userName).toBe("lilac-agent[bot]");
+      expect(output.userEmail).toBe("lilac-agent[bot]@users.noreply.github.com");
+      expect(output.signing).toEqual({ enabled: false });
+      expect(output.vcsEnv).toEqual({ GIT_CONFIG_GLOBAL: "/tmp/gitconfig" });
+      expect(output.gitTest).toEqual({ ok: true });
+      expect(calls).toEqual([
+        { callableId: "onboarding.bootstrap", input: {} },
+        { callableId: "onboarding.vcs_env", input: {} },
+        {
+          callableId: "onboarding.git_identity",
+          input: {
+            mode: "configure",
+            userName: "lilac-agent[bot]",
+            userEmail: "lilac-agent[bot]@users.noreply.github.com",
+            enableSigning: false,
+          },
+        },
+        { callableId: "onboarding.git_identity", input: { mode: "test" } },
+      ]);
+    } finally {
+      server.stop(true);
+    }
+  });
+
+  it("advertises JSON output modes without compact output", async () => {
+    const server = Bun.serve({
+      port: 0,
+      hostname: "127.0.0.1",
+      fetch() {
+        return Response.json({ ok: true, version: "dev", commit: "unknown", dirty: false });
+      },
+    });
+
+    try {
+      const result = await runToolBridgeCli({
+        args: ["--help"],
+        backendUrl: `http://127.0.0.1:${server.port}`,
+      });
+
+      expect(result.exitCode).toBe(0);
+      expect(result.stderr).toBe("");
+      expect(result.stdout).toContain('--output=<"json" | "json-pretty"> (default: "json")');
+      expect(result.stdout).not.toContain("compact");
+    } finally {
+      server.stop(true);
+    }
+  });
+
   it("treats mcp.add as an opaque callable ID and flattens positional and flag input", async () => {
     const requests: Array<{ pathname: string; body?: unknown }> = [];
     const server = Bun.serve({
@@ -326,7 +486,14 @@ describe("tool-bridge CLI runtime", () => {
         const pathname = new URL(req.url).pathname;
         if (pathname === "/help/mcp.add") {
           requests.push({ pathname });
-          return Response.json({ primaryPositional: { field: "serverId" } });
+          return Response.json({
+            callableId: "mcp.add",
+            name: "Add MCP server",
+            description: "Add an MCP server",
+            shortInput: [],
+            input: [],
+            primaryPositional: { field: "serverId" },
+          });
         }
 
         requests.push({ pathname, body: (await req.json()) as unknown });
@@ -376,7 +543,14 @@ describe("tool-bridge CLI runtime", () => {
         const pathname = new URL(req.url).pathname;
         if (pathname === "/help/mcp.reload") {
           requests.push({ pathname });
-          return Response.json({ primaryPositional: { field: "serverId" } });
+          return Response.json({
+            callableId: "mcp.reload",
+            name: "Reload MCP server",
+            description: "Reload MCP servers",
+            shortInput: [],
+            input: [],
+            primaryPositional: { field: "serverId" },
+          });
         }
 
         requests.push({ pathname, body: (await req.json()) as unknown });
@@ -409,40 +583,6 @@ describe("tool-bridge CLI runtime", () => {
           body: { callableId: "mcp.reload", input: {} },
         },
       ]);
-    } finally {
-      server.stop(true);
-    }
-  });
-
-  it("forwards structured mcp.add stdin JSON unchanged", async () => {
-    const bodies: unknown[] = [];
-    const server = Bun.serve({
-      port: 0,
-      hostname: "127.0.0.1",
-      async fetch(req) {
-        bodies.push((await req.json()) as unknown);
-        return Response.json({ isError: false, output: { ok: true } });
-      },
-    });
-    const input = {
-      serverId: "local-docs",
-      transport: "stdio",
-      command: "bun",
-      args: ["run", "server.ts"],
-      cwd: "/workspace",
-      env: { DOCS_TOKEN: { env: "DOCS_TOKEN" } },
-    };
-
-    try {
-      const result = await runToolBridgeCli({
-        args: ["mcp.add", "--stdin", "--output=json"],
-        backendUrl: `http://127.0.0.1:${server.port}`,
-        stdin: JSON.stringify(input),
-      });
-
-      expect(result.exitCode).toBe(0);
-      expect(result.stderr).toBe("");
-      expect(bodies).toEqual([{ callableId: "mcp.add", input }]);
     } finally {
       server.stop(true);
     }
@@ -518,21 +658,130 @@ describe("tool-bridge CLI runtime", () => {
       server.stop(true);
     }
   });
+
+  it("rejects malformed tool-call responses without leaking their payload", async () => {
+    const secret = "secret-api-key-value";
+    const server = Bun.serve({
+      port: 0,
+      hostname: "127.0.0.1",
+      fetch() {
+        return Response.json({ isError: secret, output: { token: secret } });
+      },
+    });
+
+    try {
+      const result = await runToolBridgeCli({
+        args: ["demo.echo", "--input={}"],
+        backendUrl: `http://127.0.0.1:${server.port}`,
+      });
+
+      expect(result.exitCode).toBe(1);
+      expect(result.stdout).toBe("");
+      expect(result.stderr).toContain("Backend returned an invalid tool call response");
+      expect(result.stderr).not.toContain(secret);
+    } finally {
+      server.stop(true);
+    }
+  });
+
+  it("rejects malformed stdin JSON without leaking parser input", async () => {
+    const secret = "secret-token-in-malformed-json";
+    const result = await runToolBridgeCli({
+      args: ["demo.echo", "--stdin"],
+      backendUrl: "http://127.0.0.1:1",
+      stdin: `{"token":"${secret}"`,
+    });
+
+    expect(result.exitCode).toBe(1);
+    expect(result.stdout).toBe("");
+    expect(result.stderr).toContain("--input/--stdin is not valid JSON");
+    expect(result.stderr).not.toContain(secret);
+  });
+
+  it("rejects incomplete help responses before using positional metadata", async () => {
+    const server = Bun.serve({
+      port: 0,
+      hostname: "127.0.0.1",
+      fetch() {
+        return Response.json({ primaryPositional: { field: "url" } });
+      },
+    });
+
+    try {
+      const result = await runToolBridgeCli({
+        args: ["fetch", "https://example.com"],
+        backendUrl: `http://127.0.0.1:${server.port}`,
+      });
+
+      expect(result.exitCode).toBe(1);
+      expect(result.stdout).toBe("");
+      expect(result.stderr).toContain("Backend returned an invalid tool help response");
+    } finally {
+      server.stop(true);
+    }
+  });
+
+  it("preserves process signal cancellation while a tool call is in flight", async () => {
+    const requestStarted = Promise.withResolvers<void>();
+    const server = Bun.serve({
+      port: 0,
+      hostname: "127.0.0.1",
+      fetch() {
+        requestStarted.resolve();
+        return new Promise<Response>(() => {});
+      },
+    });
+    const proc = Bun.spawn(["bun", CLIENT_ENTRY, "demo.wait", "--input={}"], {
+      cwd: import.meta.dir,
+      env: {
+        ...process.env,
+        TOOL_SERVER_BACKEND_URL: `http://127.0.0.1:${server.port}`,
+        NO_COLOR: "1",
+      },
+      stdin: "ignore",
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const guard = setTimeout(
+      () => requestStarted.reject(new Error("request did not start")),
+      5_000,
+    );
+
+    try {
+      await requestStarted.promise;
+      clearTimeout(guard);
+      proc.kill("SIGTERM");
+      const [stdout, stderr, exitCode] = await Promise.all([
+        new Response(proc.stdout).text(),
+        new Response(proc.stderr).text(),
+        proc.exited,
+      ]);
+      expect(exitCode).toBe(143);
+      expect(stdout).toBe("");
+      expect(stderr).toBe("");
+    } finally {
+      clearTimeout(guard);
+      proc.kill();
+      server.stop(true);
+    }
+  });
 });
 
 describe("tool-bridge positional input", () => {
   it("builds workflow trigger input from JSON argument and progress flags", async () => {
-    const parsed = parseArgs([
-      "workflow.run.trigger",
-      "--scope=auto",
-      "--name=audit-routes",
-      '--args:json={"directory":"src"}',
-      '--progress:json={"requestOrigin":true}',
-    ]);
+    const parsed = expectOk(
+      parseArgs([
+        "workflow.run.trigger",
+        "--scope=auto",
+        "--name=audit-routes",
+        '--args:json={"directory":"src"}',
+        '--progress:json={"requestOrigin":true}',
+      ]),
+    );
     expect(parsed.type).toBe("call");
     if (parsed.type !== "call") return;
 
-    await expect(buildToolInput(parsed)).resolves.toEqual({
+    expect(expectOk(await buildToolInput(parsed))).toEqual({
       scope: "auto",
       name: "audit-routes",
       args: { directory: "src" },
@@ -541,7 +790,7 @@ describe("tool-bridge positional input", () => {
   });
 
   it("parses a bare positional argument for tool calls", () => {
-    const parsed = parseArgs(["fetch", "https://example.com", "--mode=browser"]);
+    const parsed = expectOk(parseArgs(["fetch", "https://example.com", "--mode=browser"]));
 
     expect(parsed.type).toBe("call");
     if (parsed.type !== "call") return;
@@ -552,7 +801,7 @@ describe("tool-bridge positional input", () => {
   });
 
   it("treats bare tool flags as boolean true without consuming the next token", () => {
-    const parsed = parseArgs(["search", "query", "--case-sensitive", "next"]);
+    const parsed = expectOk(parseArgs(["search", "query", "--case-sensitive", "next"]));
 
     expect(parsed.type).toBe("call");
     if (parsed.type !== "call") return;
@@ -562,16 +811,36 @@ describe("tool-bridge positional input", () => {
   });
 
   it("requires equals syntax for value-required control flags", () => {
-    expect(() => parseArgs(["fetch", "--output", "json"])).toThrow(
-      "--output requires a value: --output=compact|json",
+    expectErrorMessage(
+      parseArgs(["fetch", "--output", "json"]),
+      "--output requires a value: --output=json|json-pretty",
     );
-    expect(() => parseArgs(["fetch", "--input", "payload.json"])).toThrow(
-      "--input requires a value",
+    expectErrorMessage(parseArgs(["fetch", "--input", "payload.json"]), "--input requires a value");
+  });
+
+  it("defaults to JSON and rejects removed compact output", () => {
+    const parsed = expectOk(parseArgs(["fetch"]));
+    expect(parsed.type).toBe("call");
+    if (parsed.type !== "call") return;
+    expect(parsed.outputMode).toBe("json");
+
+    const onboarded = expectOk(parseArgs(["onboard", "--yes", "--no-sign"]));
+    expect(onboarded.type).toBe("onboard");
+    if (onboarded.type !== "onboard") return;
+    expect(onboarded.outputMode).toBe("json");
+
+    expectErrorMessage(
+      parseArgs(["fetch", "--output=compact"]),
+      "Invalid --output value 'compact' (expected json|json-pretty)",
+    );
+    expectErrorMessage(
+      parseArgs(["onboard", "--output=compact"]),
+      "Invalid --output value 'compact' (expected json|json-pretty)",
     );
   });
 
   it("supports `--` for positional values that begin with dashes", () => {
-    const parsed = parseArgs(["fetch", "--", "--literal-value"]);
+    const parsed = expectOk(parseArgs(["fetch", "--", "--literal-value"]));
 
     expect(parsed.type).toBe("call");
     if (parsed.type !== "call") return;
@@ -580,88 +849,89 @@ describe("tool-bridge positional input", () => {
   });
 
   it("maps the primary positional argument into tool input", async () => {
-    const parsed = parseArgs(["fetch", "https://example.com", "--format=text"]);
+    const parsed = expectOk(parseArgs(["fetch", "https://example.com", "--format=text"]));
     expect(parsed.type).toBe("call");
     if (parsed.type !== "call") return;
 
-    await expect(buildToolInput(parsed, { field: "url" })).resolves.toEqual({
+    expect(expectOk(await buildToolInput(parsed, { field: "url" }))).toEqual({
       url: "https://example.com",
       format: "text",
     });
   });
 
   it("keeps scalar primary positionals limited to one argument", async () => {
-    const parsed = parseArgs(["fetch", "https://example.com", "extra"]);
+    const parsed = expectOk(parseArgs(["fetch", "https://example.com", "extra"]));
     expect(parsed.type).toBe("call");
     if (parsed.type !== "call") return;
 
-    await expect(buildToolInput(parsed, { field: "url" })).rejects.toThrow(
+    expectErrorMessage(
+      await buildToolInput(parsed, { field: "url" }),
       "Tool 'fetch' accepts at most one positional argument: <url>.",
     );
   });
 
-  it("maps variadic primary positionals into an array", async () => {
-    const parsed = parseArgs(["attachment.add_files", "a.png", "b.png"]);
-    expect(parsed.type).toBe("call");
-    if (parsed.type !== "call") return;
-
-    await expect(buildToolInput(parsed, { field: "paths", variadic: true })).resolves.toEqual({
-      paths: ["a.png", "b.png"],
-    });
-  });
-
   it("allows flags alongside variadic primary positionals", async () => {
-    const parsed = parseArgs([
-      "attachment.add_files",
-      "a.png",
-      "b.png",
-      '--filenames:json=["renamed-a.png","renamed-b.png"]',
-    ]);
+    const parsed = expectOk(
+      parseArgs([
+        "attachment.add_files",
+        "a.png",
+        "b.png",
+        '--filenames:json=["renamed-a.png","renamed-b.png"]',
+      ]),
+    );
     expect(parsed.type).toBe("call");
     if (parsed.type !== "call") return;
 
-    await expect(buildToolInput(parsed, { field: "paths", variadic: true })).resolves.toEqual({
+    expect(expectOk(await buildToolInput(parsed, { field: "paths", variadic: true }))).toEqual({
       paths: ["a.png", "b.png"],
       filenames: ["renamed-a.png", "renamed-b.png"],
     });
   });
 
   it("rejects duplicate variadic positional and named input for the same field", async () => {
-    const parsed = parseArgs(["attachment.add_files", "a.png", '--input={"paths":["b.png"]}']);
+    const parsed = expectOk(
+      parseArgs(["attachment.add_files", "a.png", '--input={"paths":["b.png"]}']),
+    );
     expect(parsed.type).toBe("call");
     if (parsed.type !== "call") return;
 
-    await expect(buildToolInput(parsed, { field: "paths", variadic: true })).rejects.toThrow(
+    expectErrorMessage(
+      await buildToolInput(parsed, { field: "paths", variadic: true }),
       "Primary positional <paths...> conflicts with an existing 'paths' value",
     );
   });
 
   it("rejects positional input for tools without primary positional metadata", async () => {
-    const parsed = parseArgs(["search", "llms"]);
+    const parsed = expectOk(parseArgs(["search", "llms"]));
     expect(parsed.type).toBe("call");
     if (parsed.type !== "call") return;
 
-    await expect(buildToolInput(parsed)).rejects.toThrow(
+    expectErrorMessage(
+      await buildToolInput(parsed),
       "Tool 'search' does not support positional input.",
     );
   });
 
   it("explains that space-separated tool flag values are not supported", async () => {
-    const parsed = parseArgs(["surface.messages.list", "--session-id", "#meeting-room"]);
+    const parsed = expectOk(parseArgs(["surface.messages.list", "--session-id", "#meeting-room"]));
     expect(parsed.type).toBe("call");
     if (parsed.type !== "call") return;
 
-    await expect(buildToolInput(parsed)).rejects.toThrow(
+    expectErrorMessage(
+      await buildToolInput(parsed),
       "Bare --session-id was parsed as boolean true; if you meant to pass a value, use --session-id=<value>.",
     );
   });
 
   it("rejects duplicate positional and named input for the same field", async () => {
-    const parsed = parseArgs(["fetch", "https://example.com", "--url=https://other.example.com"]);
+    const parsed = expectOk(
+      parseArgs(["fetch", "https://example.com", "--url=https://other.example.com"]),
+    );
     expect(parsed.type).toBe("call");
     if (parsed.type !== "call") return;
 
-    await expect(buildToolInput(parsed, { field: "url" })).rejects.toThrow(
+    expectErrorMessage(
+      await buildToolInput(parsed, { field: "url" }),
       "Primary positional <url> conflicts with an existing 'url' value",
     );
   });

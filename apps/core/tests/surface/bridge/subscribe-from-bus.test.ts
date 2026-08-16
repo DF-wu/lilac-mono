@@ -1,15 +1,38 @@
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, spyOn } from "bun:test";
+import { Panic, Result } from "better-result";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
-import { bridgeBusToAdapter } from "../../../src/surface/bridge/subscribe-from-bus";
+import {
+  adaptSurfaceOperationToRelay,
+  bridgeBusToAdapter as bridgeBusToAdapterImpl,
+  BusToAdapterEffectFailed,
+  captureBusToAdapterEffect,
+  logIngressAcknowledgementCleanupFailure,
+  type BusToAdapterRelaySnapshot,
+} from "../../../src/surface/bridge/subscribe-from-bus";
+import {
+  SurfaceInvalidInput,
+  SurfaceMessageNotFound,
+  SurfaceOperationPartiallyCompleted,
+  SurfaceOperationUnsupported,
+  SurfacePermissionDenied,
+  SurfacePlatformMismatch,
+  SurfaceRateLimited,
+  SurfaceSessionMismatch,
+  SurfaceUnavailable,
+  type SurfaceOperationError,
+} from "../../../src/surface/adapter";
 import type {
   SurfaceFinalTextMode,
-  SurfaceAdapter,
+  SurfaceOperationResult,
   SurfaceOutputPart,
+  SurfaceOutputPartDisposition,
   SurfaceOutputResult,
   StartOutputOpts,
 } from "../../../src/surface/adapter";
 import type {
-  AdapterCapabilities,
   ContentOpts,
   LimitOpts,
   SendOpts,
@@ -18,264 +41,125 @@ import type {
   SurfaceSession,
 } from "../../../src/surface/types";
 import type { MsgRef, SessionRef } from "../../../src/surface/types";
+import { createDiscordRelayPolicy } from "../../../src/surface/discord/discord-runtime-descriptor";
+import { createGithubRelayPolicy } from "../../../src/surface/github/github-runtime-descriptor";
+import {
+  SurfaceIngressAcknowledgementCleanupFailed,
+  SurfaceRelayRestoreApplyFailed,
+  type SurfaceRelayHandle,
+  type SurfaceRelayPolicy,
+  type SurfaceRelaySnapshotFor,
+} from "../../../src/surface/runtime-descriptor";
+import { SurfaceRefInvalid } from "../../../src/surface/protocol";
+import {
+  GRACEFUL_RESTART_SNAPSHOT_VERSION,
+  SqliteGracefulRestartStore,
+} from "../../../src/runtime/graceful-restart-store";
 
 import {
   createLilacBus,
-  type RawBus,
+  EventDeliveryStopFailed,
   lilacEventTypes,
-  type Message,
-  type SubscriptionOptions,
-  type HandleContext,
-  type FetchOptions,
-  type PublishOptions,
 } from "@stanley2058/lilac-event-bus";
-import { setGithubLatestRequestForSession } from "../../../src/github/github-state";
-import type { TranscriptStore } from "../../../src/transcript/transcript-store";
-
-function createInMemoryRawBus(): RawBus {
-  const topics = new Map<string, Array<Message<unknown>>>();
-  let sequence = 0;
-  const subs = new Set<{
-    topic: string;
-    opts: SubscriptionOptions;
-    handler: (msg: Message<unknown>, ctx: HandleContext) => Promise<void>;
-  }>();
-
-  return {
-    publish: async <TData>(msg: Omit<Message<TData>, "id" | "ts">, opts: PublishOptions) => {
-      const id = `${Date.now()}-${sequence}`;
-      sequence += 1;
-      const stored: Message<unknown> = {
-        topic: opts.topic,
-        id,
-        type: opts.type,
-        ts: Date.now(),
-        key: opts.key,
-        headers: opts.headers,
-        data: msg.data as unknown,
-      };
-
-      const list = topics.get(opts.topic) ?? [];
-      list.push(stored);
-      topics.set(opts.topic, list);
-
-      for (const s of subs) {
-        if (s.topic !== opts.topic) continue;
-        if (s.opts.mode === "tail" && s.opts.offset?.type === "now") {
-          // For our tests we always use begin/now explicitly; ignore edge.
-        }
-        await s.handler(stored, { cursor: id, commit: async () => {} });
-      }
-
-      return { id, cursor: id };
-    },
-
-    subscribe: async <TData>(
-      topic: string,
-      opts: SubscriptionOptions,
-      handler: (msg: Message<TData>, ctx: HandleContext) => Promise<void>,
-    ) => {
-      const entry = {
-        topic,
-        opts,
-        handler: handler as unknown as (msg: Message<unknown>, ctx: HandleContext) => Promise<void>,
-      };
-      subs.add(entry);
-
-      if (opts.mode === "tail") {
-        const existing = topics.get(topic) ?? [];
-        if (opts.offset?.type === "begin") {
-          for (const m of existing) {
-            await handler(m as unknown as Message<TData>, {
-              cursor: m.id,
-              commit: async () => {},
-            });
-          }
-        } else if (opts.offset?.type === "cursor") {
-          let seenCursor = false;
-          for (const m of existing) {
-            if (!seenCursor) {
-              if (m.id === opts.offset.cursor) {
-                seenCursor = true;
-              }
-              continue;
-            }
-            await handler(m as unknown as Message<TData>, {
-              cursor: m.id,
-              commit: async () => {},
-            });
-          }
-        }
-      }
-
-      return {
-        stop: async () => {
-          subs.delete(entry);
-        },
-      };
-    },
-
-    fetch: async <TData>(topic: string, _opts: FetchOptions) => {
-      const existing = topics.get(topic) ?? [];
-      return {
-        messages: existing.map((m) => ({
-          msg: m as unknown as Message<TData>,
-          cursor: m.id,
-        })),
-        next: existing.length > 0 ? existing[existing.length - 1]!.id : undefined,
-      };
-    },
-
-    close: async () => {},
-  };
-}
-
-function createInMemoryRawBusWithBlockingTailStop(): {
-  raw: RawBus;
-  releaseTailStops(): void;
-} {
-  const topics = new Map<string, Array<Message<unknown>>>();
-  const subs = new Set<{
-    topic: string;
-    opts: SubscriptionOptions;
-    handler: (msg: Message<unknown>, ctx: HandleContext) => Promise<void>;
-  }>();
-
-  let tailStopGatePromise: Promise<void> | null = null;
-  let tailStopGateResolve: (() => void) | null = null;
-
-  const ensureTailStopGate = () => {
-    if (tailStopGatePromise) return tailStopGatePromise;
-    tailStopGatePromise = new Promise<void>((resolve) => {
-      tailStopGateResolve = resolve;
-    });
-    return tailStopGatePromise;
-  };
-
-  const raw: RawBus = {
-    publish: async <TData>(msg: Omit<Message<TData>, "id" | "ts">, opts: PublishOptions) => {
-      const id = String(Date.now()) + "-0";
-      const stored: Message<unknown> = {
-        topic: opts.topic,
-        id,
-        type: opts.type,
-        ts: Date.now(),
-        key: opts.key,
-        headers: opts.headers,
-        data: msg.data as unknown,
-      };
-
-      const list = topics.get(opts.topic) ?? [];
-      list.push(stored);
-      topics.set(opts.topic, list);
-
-      for (const s of subs) {
-        if (s.topic !== opts.topic) continue;
-        await s.handler(stored, { cursor: id, commit: async () => {} });
-      }
-
-      return { id, cursor: id };
-    },
-
-    subscribe: async <TData>(
-      topic: string,
-      opts: SubscriptionOptions,
-      handler: (msg: Message<TData>, ctx: HandleContext) => Promise<void>,
-    ) => {
-      const entry = {
-        topic,
-        opts,
-        handler: handler as unknown as (msg: Message<unknown>, ctx: HandleContext) => Promise<void>,
-      };
-      subs.add(entry);
-
-      if (opts.mode === "tail") {
-        const existing = topics.get(topic) ?? [];
-        if (opts.offset?.type === "begin") {
-          for (const m of existing) {
-            await handler(m as unknown as Message<TData>, {
-              cursor: m.id,
-              commit: async () => {},
-            });
-          }
-        } else if (opts.offset?.type === "cursor") {
-          let seenCursor = false;
-          for (const m of existing) {
-            if (!seenCursor) {
-              if (m.id === opts.offset.cursor) {
-                seenCursor = true;
-              }
-              continue;
-            }
-            await handler(m as unknown as Message<TData>, {
-              cursor: m.id,
-              commit: async () => {},
-            });
-          }
-        }
-      }
-
-      return {
-        stop: async () => {
-          subs.delete(entry);
-          if (opts.mode === "tail") {
-            await ensureTailStopGate();
-          }
-        },
-      };
-    },
-
-    fetch: async <TData>(topic: string, _opts: FetchOptions) => {
-      const existing = topics.get(topic) ?? [];
-      return {
-        messages: existing.map((m) => ({
-          msg: m as unknown as Message<TData>,
-          cursor: m.id,
-        })),
-        next: existing.length > 0 ? existing[existing.length - 1]!.id : undefined,
-      };
-    },
-
-    close: async () => {},
-  };
-
-  return {
-    raw,
-    releaseTailStops: () => {
-      tailStopGateResolve?.();
-      tailStopGateResolve = null;
-      tailStopGatePromise = null;
-    },
-  };
-}
+import {
+  clearGithubAck,
+  getGithubAck,
+  setGithubAck,
+  setGithubLatestRequestForSession,
+  type GithubAckState,
+} from "../../../src/github/github-state";
+import {
+  TranscriptStoreSqliteDriverFailure,
+  type TranscriptStore,
+} from "../../../src/transcript/transcript-store";
+import { SurfaceAdapterTestBase } from "../../helpers/surface-adapter-test-base";
+import {
+  createInMemoryDeliveryBus as createInMemoryRawBus,
+  createInMemoryDeliveryBusWithBlockingTailStop as createInMemoryRawBusWithBlockingTailStop,
+  type DeliveryObservation,
+} from "../../helpers/in-memory-delivery-bus";
 
 class FakeOutputStream {
   public readonly parts: SurfaceOutputPart[] = [];
+  public readonly hydratedParts: SurfaceOutputPart[] = [];
   public finished = false;
   public aborted: string | undefined;
+  public nextPushFailure: Error | null = null;
+  public nextAbortFailure: Error | null = null;
   private created = false;
 
   constructor(
     private readonly onFirstPush?: () => void,
     private readonly finalTextMode: SurfaceFinalTextMode = "continuation",
+    private readonly platform: "discord" | "github" | "telegram" = "discord",
+    private readonly terminalPartTypes: ReadonlySet<SurfaceOutputPart["type"]> = new Set(),
   ) {}
 
-  async push(part: SurfaceOutputPart): Promise<void> {
+  hydrateRecovery(parts: readonly SurfaceOutputPart[]): SurfaceOutputPartDisposition {
+    this.hydratedParts.push(...parts);
+    if (parts.some((part) => part.type === "text.delta" || part.type === "text.set")) {
+      return "visible";
+    }
+    if (
+      this.platform === "github" &&
+      parts.some((part) => part.type === "tool.status" || part.type === "attachment.add")
+    ) {
+      return "terminal";
+    }
+    return this.platform !== "github" && parts.length > 0 ? "visible" : "ignored";
+  }
+
+  async push(
+    part: SurfaceOutputPart,
+  ): Promise<SurfaceOperationResult<SurfaceOutputPartDisposition>> {
+    if (this.nextPushFailure) {
+      const failure = this.nextPushFailure;
+      this.nextPushFailure = null;
+      if (Panic.is(failure)) throw failure;
+      return Result.err(
+        new SurfaceUnavailable({
+          platform: this.platform,
+          operation: "push-output",
+          message: failure.message,
+        }),
+      );
+    }
     if (!this.created) {
       this.created = true;
       this.onFirstPush?.();
     }
     this.parts.push(part);
+    if (this.terminalPartTypes.has(part.type)) return Result.ok("terminal");
+    if (this.platform === "github" && part.type !== "text.delta" && part.type !== "text.set") {
+      if (part.type === "tool.status" || part.type === "attachment.add") {
+        return Result.ok("terminal");
+      }
+      return Result.ok("ignored");
+    }
+    return Result.ok("visible");
   }
 
-  async finish(): Promise<SurfaceOutputResult> {
+  async finish(): Promise<SurfaceOperationResult<SurfaceOutputResult>> {
     this.finished = true;
-    const last: MsgRef = { platform: "discord", channelId: "chan", messageId: "m_out" };
-    return { created: [last], last };
+    const last: MsgRef = { platform: this.platform, channelId: "chan", messageId: "m_out" };
+    return Result.ok({ created: [last], last });
   }
 
-  async abort(reason?: string): Promise<void> {
+  async abort(reason?: string): Promise<SurfaceOperationResult<void>> {
+    if (this.nextAbortFailure) {
+      const failure = this.nextAbortFailure;
+      this.nextAbortFailure = null;
+      if (Panic.is(failure)) throw failure;
+      return Result.err(
+        new SurfaceUnavailable({
+          platform: this.platform,
+          operation: "abort-output",
+          message: failure.message,
+        }),
+      );
+    }
     this.aborted = reason;
+    return Result.ok(undefined);
   }
 
   getFinalTextMode(): SurfaceFinalTextMode {
@@ -283,7 +167,7 @@ class FakeOutputStream {
   }
 }
 
-class FakeAdapter implements SurfaceAdapter {
+class FakeAdapter extends SurfaceAdapterTestBase {
   public lastStart: { sessionRef: SessionRef; opts?: StartOutputOpts } | null = null;
   public stream: FakeOutputStream | null = null;
   public starts: Array<{ sessionRef: SessionRef; opts?: StartOutputOpts }> = [];
@@ -293,6 +177,9 @@ class FakeAdapter implements SurfaceAdapter {
   public deletedMsgs: MsgRef[] = [];
   public outputFinalTextMode: SurfaceFinalTextMode = "continuation";
   public outputFinalTextModesByStart: SurfaceFinalTextMode[] = [];
+  public terminalPartTypes = new Set<SurfaceOutputPart["type"]>();
+  public failNextStart = false;
+  public nextStreamPushFailure: Error | null = null;
   private nextOutputMessageId = 1;
 
   async connect(): Promise<void> {
@@ -304,66 +191,92 @@ class FakeAdapter implements SurfaceAdapter {
   async getSelf(): Promise<SurfaceSelf> {
     throw new Error("not implemented");
   }
-  async getCapabilities(): Promise<AdapterCapabilities> {
-    throw new Error("not implemented");
-  }
-  async listSessions(): Promise<SurfaceSession[]> {
+  async listSessions(): Promise<SurfaceOperationResult<SurfaceSession[]>> {
     throw new Error("not implemented");
   }
 
   async startOutput(sessionRef: SessionRef, opts?: StartOutputOpts) {
+    if (this.failNextStart) {
+      this.failNextStart = false;
+      return Result.err(
+        new SurfaceUnavailable({
+          platform: sessionRef.platform,
+          operation: "start-output",
+          message: "forced output start failure",
+        }),
+      );
+    }
     this.lastStart = { sessionRef, opts };
     this.starts.push({ sessionRef, opts });
     const outputMessageId = `m_out_${this.nextOutputMessageId++}`;
     const mode = this.outputFinalTextModesByStart.shift() ?? this.outputFinalTextMode;
-    const s = new FakeOutputStream(() => {
-      if (sessionRef.platform !== "discord") return;
-      opts?.onMessageCreated?.({
-        platform: "discord",
-        channelId: sessionRef.channelId,
-        messageId: outputMessageId,
-      });
-    }, mode);
+    const s = new FakeOutputStream(
+      () => {
+        if (sessionRef.platform !== "discord") return;
+        opts?.onMessageCreated?.({
+          platform: "discord",
+          channelId: sessionRef.channelId,
+          messageId: outputMessageId,
+        });
+      },
+      mode,
+      sessionRef.platform,
+      this.terminalPartTypes,
+    );
     this.stream = s;
     this.streams.push(s);
-    return s;
+    s.nextPushFailure = this.nextStreamPushFailure;
+    this.nextStreamPushFailure = null;
+    return Result.ok(s);
   }
 
-  async startTyping(sessionRef: SessionRef): Promise<{ stop(): Promise<void> }> {
+  override async startTyping(sessionRef: SessionRef) {
     this.typingStarts.push(sessionRef);
-    return {
+    return Result.ok({
       stop: async () => {
         this.typingStops += 1;
+        return Result.ok(undefined);
       },
-    };
+    });
   }
 
-  async sendMsg(_sessionRef: SessionRef, _content: ContentOpts, _opts?: SendOpts): Promise<MsgRef> {
+  async sendMsg(
+    _sessionRef: SessionRef,
+    _content: ContentOpts,
+    _opts?: SendOpts,
+  ): Promise<SurfaceOperationResult<MsgRef>> {
     throw new Error("not implemented");
   }
-  async readMsg(_msgRef: MsgRef): Promise<SurfaceMessage | null> {
+  async readMsg(_msgRef: MsgRef): Promise<SurfaceOperationResult<SurfaceMessage | null>> {
     throw new Error("not implemented");
   }
-  async listMsg(_sessionRef: SessionRef, _opts?: LimitOpts): Promise<SurfaceMessage[]> {
+  async listMsg(
+    _sessionRef: SessionRef,
+    _opts?: LimitOpts,
+  ): Promise<SurfaceOperationResult<SurfaceMessage[]>> {
     throw new Error("not implemented");
   }
-  async editMsg(_msgRef: MsgRef, _content: ContentOpts): Promise<void> {
+  async editMsg(_msgRef: MsgRef, _content: ContentOpts): Promise<SurfaceOperationResult<void>> {
     throw new Error("not implemented");
   }
-  async deleteMsg(msgRef: MsgRef): Promise<void> {
+  async deleteMsg(msgRef: MsgRef): Promise<SurfaceOperationResult<void>> {
     this.deletedMsgs.push(msgRef);
+    return Result.ok(undefined);
   }
-  async getReplyContext(_msgRef: MsgRef, _opts?: LimitOpts): Promise<SurfaceMessage[]> {
+  async getReplyContext(
+    _msgRef: MsgRef,
+    _opts?: LimitOpts,
+  ): Promise<SurfaceOperationResult<SurfaceMessage[]>> {
     throw new Error("not implemented");
   }
 
-  async addReaction(_msgRef: MsgRef, _reaction: string): Promise<void> {
+  async addReaction(_msgRef: MsgRef, _reaction: string): Promise<SurfaceOperationResult<void>> {
     throw new Error("not implemented");
   }
-  async removeReaction(_msgRef: MsgRef, _reaction: string): Promise<void> {
+  async removeReaction(_msgRef: MsgRef, _reaction: string): Promise<SurfaceOperationResult<void>> {
     throw new Error("not implemented");
   }
-  async listReactions(_msgRef: MsgRef): Promise<string[]> {
+  async listReactions(_msgRef: MsgRef): Promise<SurfaceOperationResult<string[]>> {
     throw new Error("not implemented");
   }
 
@@ -371,13 +284,233 @@ class FakeAdapter implements SurfaceAdapter {
     throw new Error("not implemented");
   }
 
-  async getUnRead(_sessionRef: SessionRef): Promise<SurfaceMessage[]> {
+  async getUnRead(_sessionRef: SessionRef): Promise<SurfaceOperationResult<SurfaceMessage[]>> {
     throw new Error("not implemented");
   }
-  async markRead(_sessionRef: SessionRef, _upToMsgRef?: MsgRef): Promise<void> {
+  async markRead(
+    _sessionRef: SessionRef,
+    _upToMsgRef?: MsgRef,
+  ): Promise<SurfaceOperationResult<void>> {
     throw new Error("not implemented");
   }
 }
+
+function createTelegramRelayPolicy(): SurfaceRelayPolicy<"telegram"> {
+  return {
+    refs: {
+      createSessionRef: (sessionId) => ({ platform: "telegram", channelId: sessionId }),
+      resolveInitialReplyTarget: ({ requestId, sessionId }) => {
+        const prefix = `telegram:${sessionId}:`;
+        return requestId.startsWith(prefix)
+          ? {
+              kind: "target",
+              ref: {
+                platform: "telegram",
+                channelId: sessionId,
+                messageId: requestId.slice(prefix.length),
+              },
+            }
+          : { kind: "none" };
+      },
+      decodeReanchorTarget: ({ ref, expectedSessionId }) => {
+        if (ref.platform !== "telegram" || ref.channelId !== expectedSessionId) {
+          return Result.err(
+            new SurfaceRefInvalid({
+              reason: ref.platform === "telegram" ? "session-mismatch" : "platform-mismatch",
+              expectedPlatform: "telegram",
+              expectedSessionId,
+              message: "Telegram relay reference does not match the selected session",
+            }),
+          );
+        }
+        return Result.ok({
+          platform: "telegram",
+          channelId: ref.channelId,
+          messageId: ref.messageId,
+        });
+      },
+    },
+  };
+}
+
+type TestBridgeParams = Omit<Parameters<typeof bridgeBusToAdapterImpl>[0], "policy">;
+
+function bridgeBusToAdapter<P extends "discord" | "github" | "telegram">(
+  params: TestBridgeParams & { readonly platform: P },
+): Promise<SurfaceRelayHandle<P>>;
+async function bridgeBusToAdapter(params: TestBridgeParams): Promise<unknown> {
+  if (params.platform === "discord") {
+    return bridgeBusToAdapterImpl({
+      ...params,
+      platform: "discord",
+      policy: createDiscordRelayPolicy(params.adapter),
+    });
+  }
+  if (params.platform === "telegram") {
+    return bridgeBusToAdapterImpl({
+      ...params,
+      platform: "telegram",
+      policy: createTelegramRelayPolicy(),
+    });
+  }
+  return bridgeBusToAdapterImpl({
+    ...params,
+    platform: "github",
+    policy: createGithubRelayPolicy(),
+  });
+}
+
+function createInMemoryRawBusWithOutputStopFailure() {
+  const raw = createInMemoryRawBus();
+  const subscribe = raw.subscribe;
+  raw.subscribe = async (topic, options, handler) => {
+    const started = await subscribe(topic, options, handler);
+    return started.map((subscription) =>
+      topic.startsWith("out.req.")
+        ? {
+            ...subscription,
+            stop: async () =>
+              Result.err(
+                new EventDeliveryStopFailed({
+                  cause: new Error("forced output subscription stop failure"),
+                  topic,
+                  message: "Forced output subscription stop failure",
+                }),
+              ),
+          }
+        : subscription,
+    );
+  };
+  return raw;
+}
+
+async function applyAndActivateRelayRecovery<P extends "discord" | "github" | "telegram">(
+  bridge: Pick<SurfaceRelayHandle<P>, "prepareRestoreRelays">,
+  snapshots: readonly SurfaceRelaySnapshotFor<P>[],
+): Promise<void> {
+  const prepared = bridge.prepareRestoreRelays(snapshots);
+  if (prepared.status === "error") throw prepared.error;
+  const applied = await prepared.value.apply();
+  if (applied.status === "error") throw applied.error;
+  prepared.value.activate();
+}
+
+function relayFailure(error: SurfaceOperationError): BusToAdapterEffectFailed {
+  try {
+    adaptSurfaceOperationToRelay("push-output", Result.err(error));
+    throw new Error("expected relay adaptation failure");
+  } catch (cause) {
+    expect(cause).toBeInstanceOf(BusToAdapterEffectFailed);
+    if (!(cause instanceof BusToAdapterEffectFailed)) throw cause;
+    return cause;
+  }
+}
+
+describe("surface operation relay adaptation", () => {
+  it.each([
+    new SurfaceOperationUnsupported({
+      platform: "discord",
+      operation: "push-output",
+      message: "unsupported secret=hidden",
+    }),
+    new SurfacePlatformMismatch({
+      operation: "push-output",
+      refRole: "sessionRef",
+      expectedPlatform: "discord",
+      receivedPlatform: "github",
+      message: "platform mismatch secret=hidden",
+    }),
+    new SurfaceSessionMismatch({
+      operation: "push-output",
+      refRole: "replyTo",
+      expectedSessionId: "expected",
+      receivedSessionId: "received",
+      message: "session mismatch secret=hidden",
+    }),
+    new SurfaceInvalidInput({
+      platform: "discord",
+      operation: "push-output",
+      field: "content",
+      message: "invalid secret=hidden",
+    }),
+    new SurfaceMessageNotFound({
+      platform: "discord",
+      operation: "push-output",
+      message: "missing secret=hidden",
+    }),
+    new SurfacePermissionDenied({
+      platform: "discord",
+      operation: "push-output",
+      message: "forbidden secret=hidden",
+    }),
+  ])("classifies $error._tag as a safe permanent failure", (error) => {
+    const failure = relayFailure(error);
+
+    expect(failure).toMatchObject({
+      operation: "push-output",
+      failureKind: "permanent",
+      surfaceErrorTag: error._tag,
+      created: null,
+      cause: { errorTag: error._tag },
+    });
+    expect(JSON.stringify(failure)).not.toContain("secret=hidden");
+  });
+
+  it.each([
+    new SurfaceRateLimited({
+      platform: "discord",
+      operation: "push-output",
+      retryAfterMs: 2500,
+      message: "rate limited secret=hidden",
+    }),
+    new SurfaceUnavailable({
+      platform: "discord",
+      operation: "push-output",
+      message: "unavailable secret=hidden",
+    }),
+  ])("classifies $error._tag as a safe transient failure", (error) => {
+    const failure = relayFailure(error);
+
+    expect(failure).toMatchObject({
+      operation: "push-output",
+      failureKind: "transient",
+      surfaceErrorTag: error._tag,
+      created: null,
+      cause: { errorTag: error._tag },
+    });
+    expect(JSON.stringify(failure)).not.toContain("secret=hidden");
+  });
+
+  it("preserves partial-completion context without exposing the provider message", () => {
+    const created = { platform: "discord" as const, channelId: "channel", messageId: "message" };
+    const failure = relayFailure(
+      new SurfaceOperationPartiallyCompleted({
+        platform: "discord",
+        operation: "push-output",
+        created,
+        message: "partial secret=hidden",
+      }),
+    );
+
+    expect(failure).toMatchObject({
+      operation: "push-output",
+      failureKind: "partial-completion",
+      surfaceErrorTag: "SurfaceOperationPartiallyCompleted",
+      created,
+      cause: { errorTag: "SurfaceOperationPartiallyCompleted" },
+    });
+    expect(JSON.stringify(failure)).not.toContain("secret=hidden");
+  });
+
+  it("does not wrap Panic from relay effects", async () => {
+    const panic = new Panic({ message: "relay invariant" });
+    await expect(
+      captureBusToAdapterEffect("push-output", async () => {
+        throw panic;
+      }),
+    ).rejects.toBe(panic);
+  });
+});
 
 describe("bridgeBusToAdapter", () => {
   it("keeps an idle relay alive with invisible agent activity", async () => {
@@ -446,7 +579,13 @@ describe("bridgeBusToAdapter", () => {
     await bus.publish(
       lilacEventTypes.EvtAgentOutputDeltaText,
       { delta: "hello" },
-      { headers: { request_id: requestId } },
+      {
+        headers: {
+          request_id: requestId,
+          session_id: "chan",
+          request_client: "discord",
+        },
+      },
     );
 
     const bridge = await bridgeBusToAdapter({
@@ -515,6 +654,145 @@ describe("bridgeBusToAdapter", () => {
     expect(adapter.typingStarts).toEqual([{ platform: "discord", channelId: "chan" }]);
     expect(adapter.typingStops).toBe(1);
 
+    await bridge.stop();
+  });
+
+  it.each([
+    ["discord:chan", "malformed"],
+    ["github:octo/repo#1:10", "cross-platform"],
+    ["discord:other:message", "cross-session"],
+  ] as const)(
+    "dead-letters an invalid initial %s target instead of starting top-level",
+    async (requestId) => {
+      const deliveries: DeliveryObservation[] = [];
+      const bus = createLilacBus(createInMemoryRawBus((delivery) => deliveries.push(delivery)));
+      const adapter = new FakeAdapter();
+      const bridge = await bridgeBusToAdapter({
+        adapter,
+        bus,
+        platform: "discord",
+        subscriptionId: `invalid-initial-${crypto.randomUUID()}`,
+        idleTimeoutMs: 10_000,
+      });
+
+      await bus.publish(
+        lilacEventTypes.EvtRequestReply,
+        {},
+        {
+          headers: {
+            request_id: requestId,
+            session_id: "chan",
+            request_client: "discord",
+          },
+        },
+      );
+
+      expect(adapter.streams).toHaveLength(0);
+      expect(deliveries.at(-1)?.disposition).toBe("dead-letter");
+      await bridge.stop();
+    },
+  );
+
+  it.each([
+    { platform: "github" as const, channelId: "chan", messageId: "other-platform" },
+    { platform: "discord" as const, channelId: "other", messageId: "other-session" },
+  ])(
+    "commits invalid reanchor target $messageId without switching output lanes",
+    async (replyTo) => {
+      const deliveries: DeliveryObservation[] = [];
+      const bus = createLilacBus(createInMemoryRawBus((delivery) => deliveries.push(delivery)));
+      const adapter = new FakeAdapter();
+      const requestId = `discord:chan:${crypto.randomUUID()}`;
+      const bridge = await bridgeBusToAdapter({
+        adapter,
+        bus,
+        platform: "discord",
+        subscriptionId: `invalid-reanchor-${crypto.randomUUID()}`,
+        idleTimeoutMs: 10_000,
+      });
+
+      await bus.publish(
+        lilacEventTypes.EvtRequestReply,
+        {},
+        {
+          headers: {
+            request_id: requestId,
+            session_id: "chan",
+            request_client: "discord",
+          },
+        },
+      );
+      await bus.publish(
+        lilacEventTypes.CmdSurfaceOutputReanchor,
+        { inheritReplyTo: false, replyTo },
+        {
+          headers: {
+            request_id: requestId,
+            session_id: "chan",
+            request_client: "discord",
+          },
+        },
+      );
+
+      expect(adapter.streams).toHaveLength(1);
+      expect(adapter.streams[0]?.aborted).toBeUndefined();
+      expect(deliveries.at(-1)?.disposition).toBe("commit");
+      await bridge.stop();
+    },
+  );
+
+  it("pushes normalized optional presentation parts to the GitHub output stream", async () => {
+    const bus = createLilacBus(createInMemoryRawBus());
+    const adapter = new FakeAdapter();
+    const sessionId = `octo/optional-${crypto.randomUUID()}#1`;
+    const requestId = `github:${sessionId}:10`;
+    const bridge = await bridgeBusToAdapter({
+      adapter,
+      bus,
+      platform: "github",
+      subscriptionId: `github-optional-${crypto.randomUUID()}`,
+      idleTimeoutMs: 10_000,
+    });
+
+    await bus.publish(
+      lilacEventTypes.EvtRequestReply,
+      {},
+      {
+        headers: {
+          request_id: requestId,
+          session_id: sessionId,
+          request_client: "github",
+        },
+      },
+    );
+    await bus.publish(
+      lilacEventTypes.EvtAgentOutputDeltaReasoning,
+      { delta: "thinking", seq: 1 },
+      { headers: { request_id: requestId } },
+    );
+    await bus.publish(
+      lilacEventTypes.EvtAgentOutputToolCall,
+      { toolCallId: "tool", status: "start", display: "bash pwd" },
+      { headers: { request_id: requestId } },
+    );
+    await bus.publish(
+      lilacEventTypes.EvtAgentOutputResponseBinary,
+      { mimeType: "text/plain", dataBase64: "aGk=", filename: "result.txt" },
+      { headers: { request_id: requestId } },
+    );
+    await bus.publish(
+      lilacEventTypes.EvtAgentOutputResponseText,
+      { finalText: "finished", statsForNerdsLine: "stats" },
+      { headers: { request_id: requestId } },
+    );
+
+    expect(adapter.stream?.parts.map((part) => part.type)).toEqual([
+      "reasoning.status",
+      "tool.status",
+      "attachment.add",
+      "meta.stats",
+      "text.set",
+    ]);
     await bridge.stop();
   });
 
@@ -1789,6 +2067,60 @@ describe("bridgeBusToAdapter", () => {
     await bridge.stop();
   });
 
+  it("does not cancel an active relay for inherited or accessor raw controls", async () => {
+    const bus = createLilacBus(createInMemoryRawBus());
+    const adapter = new FakeAdapter();
+    const requestId = "discord:chan:msg_hostile_cancel";
+    const bridge = await bridgeBusToAdapter({
+      adapter,
+      bus,
+      platform: "discord",
+      subscriptionId: "discord-adapter",
+      idleTimeoutMs: 10_000,
+    });
+    await bus.publish(
+      lilacEventTypes.EvtRequestReply,
+      {},
+      {
+        headers: {
+          request_id: requestId,
+          session_id: "chan",
+          request_client: "discord",
+        },
+      },
+    );
+
+    let getterCalls = 0;
+    const hostileRaw = Object.setPrototypeOf({}, { cancel: true });
+    Object.defineProperty(hostileRaw, "cancel", {
+      enumerable: true,
+      get() {
+        getterCalls += 1;
+        throw new Error("hostile cancel getter must not run");
+      },
+    });
+    await bus.publish(
+      lilacEventTypes.CmdRequestMessage,
+      {
+        queue: "interrupt",
+        messages: [],
+        raw: hostileRaw,
+      },
+      {
+        headers: {
+          request_id: requestId,
+          session_id: "chan",
+          request_client: "discord",
+        },
+      },
+    );
+
+    expect(adapter.stream?.aborted).toBeUndefined();
+    expect(adapter.typingStops).toBe(0);
+    expect(getterCalls).toBe(0);
+    await bridge.stop();
+  });
+
   it("stops typing on failed lifecycle and still delivers final output", async () => {
     const raw = createInMemoryRawBus();
     const bus = createLilacBus(raw);
@@ -1914,13 +2246,21 @@ describe("bridgeBusToAdapter", () => {
     const adapter = new FakeAdapter();
     const requestId = "discord:chan:msg_skip_cleanup_failure";
     const transcriptStore: TranscriptStore = {
-      saveRequestTranscript() {},
+      saveRequestTranscript() {
+        return Result.ok(undefined);
+      },
       linkSurfaceMessagesToRequest() {},
       getTranscriptBySurfaceMessage() {
-        return null;
+        return Result.ok(null);
       },
       deleteUnlinkedCheckpointCandidate() {
-        throw new Error("cleanup failed");
+        return Result.err(
+          new TranscriptStoreSqliteDriverFailure({
+            operation: "delete-unlinked-checkpoint-candidate",
+            code: "SQLITE_IOERR",
+            message: "cleanup failed",
+          }),
+        );
       },
       close() {},
     };
@@ -2269,7 +2609,7 @@ describe("bridgeBusToAdapter", () => {
       idleTimeoutMs: 10_000,
     });
 
-    await bridge.restoreRelays([
+    await applyAndActivateRelayRecovery(bridge, [
       {
         requestId,
         sessionId: "chan",
@@ -2287,7 +2627,9 @@ describe("bridgeBusToAdapter", () => {
     ]);
 
     const reasoningUpdates =
-      adapter.stream?.parts.filter((p) => p.type === "reasoning.status").map((p) => p.update) ?? [];
+      adapter.stream?.hydratedParts
+        .filter((p) => p.type === "reasoning.status")
+        .map((p) => p.update) ?? [];
     expect(reasoningUpdates).toHaveLength(1);
     expect(reasoningUpdates[0]).toEqual({
       startedAtMs: 10_000,
@@ -2295,6 +2637,798 @@ describe("bridgeBusToAdapter", () => {
       detailText: "**Summary**\nitem",
     });
 
+    await bridge.stop();
+  });
+
+  it.each([
+    ["discord", "discord", true, false],
+    ["discord reasoningDisplayMode none", "discord", true, true],
+    ["github", "github", false, false],
+  ] as const)(
+    "uses %s live reasoning completion disposition when final output is empty",
+    async (_case, platform, shouldFinish, terminalReasoning) => {
+      const bus = createLilacBus(createInMemoryRawBus());
+      const adapter = new FakeAdapter();
+      if (terminalReasoning) adapter.terminalPartTypes.add("reasoning.status");
+      const sessionId = platform === "discord" ? "chan" : `octo/live-${crypto.randomUUID()}#1`;
+      const requestId =
+        platform === "discord"
+          ? `discord:${sessionId}:reasoning-only`
+          : `github:${sessionId}:reasoning-only`;
+      const bridge = await bridgeBusToAdapter({
+        adapter,
+        bus,
+        platform,
+        subscriptionId: `${platform}-live-reasoning-${crypto.randomUUID()}`,
+        idleTimeoutMs: 10_000,
+      });
+
+      await bus.publish(
+        lilacEventTypes.EvtRequestReply,
+        {},
+        {
+          headers: {
+            request_id: requestId,
+            session_id: sessionId,
+            request_client: platform,
+          },
+        },
+      );
+      await bus.publish(
+        lilacEventTypes.EvtAgentOutputDeltaReasoning,
+        { delta: "thinking", seq: 1 },
+        { headers: { request_id: requestId } },
+      );
+      await bus.publish(
+        lilacEventTypes.EvtAgentOutputResponseText,
+        { finalText: "" },
+        { headers: { request_id: requestId, session_id: sessionId, request_client: platform } },
+      );
+
+      expect(adapter.stream?.finished).toBe(shouldFinish);
+      expect(adapter.stream?.aborted).toBe(shouldFinish ? undefined : "skip");
+      expect(bridge.snapshotRelays()).toEqual([]);
+      await bridge.stop();
+    },
+  );
+
+  it.each(["tool.status", "attachment.add"] as const)(
+    "finishes live GitHub %s-only output when final text is empty",
+    async (partType) => {
+      const bus = createLilacBus(createInMemoryRawBus());
+      const adapter = new FakeAdapter();
+      const sessionId = `octo/live-terminal-${crypto.randomUUID()}#1`;
+      const requestId = `github:${sessionId}:terminal-only`;
+      const bridge = await bridgeBusToAdapter({
+        adapter,
+        bus,
+        platform: "github",
+        subscriptionId: `github-live-terminal-${crypto.randomUUID()}`,
+        idleTimeoutMs: 10_000,
+      });
+
+      await bus.publish(
+        lilacEventTypes.EvtRequestReply,
+        {},
+        {
+          headers: {
+            request_id: requestId,
+            session_id: sessionId,
+            request_client: "github",
+          },
+        },
+      );
+      if (partType === "tool.status") {
+        await bus.publish(
+          lilacEventTypes.EvtAgentOutputToolCall,
+          { toolCallId: "tool-1", display: "bash pwd", status: "end", ok: true },
+          { headers: { request_id: requestId } },
+        );
+      } else {
+        await bus.publish(
+          lilacEventTypes.EvtAgentOutputResponseBinary,
+          {
+            mimeType: "text/plain",
+            dataBase64: Buffer.from("result").toString("base64"),
+            filename: "result.txt",
+          },
+          { headers: { request_id: requestId } },
+        );
+      }
+      await bus.publish(
+        lilacEventTypes.EvtAgentOutputResponseText,
+        { finalText: "" },
+        { headers: { request_id: requestId, session_id: sessionId, request_client: "github" } },
+      );
+
+      expect(adapter.stream?.finished).toBe(true);
+      expect(adapter.stream?.aborted).toBeUndefined();
+      expect(bridge.snapshotRelays()).toEqual([]);
+      await bridge.stop();
+    },
+  );
+
+  it.each([
+    ["discord", "discord", true, false],
+    ["discord reasoningDisplayMode none", "discord", true, true],
+    ["github", "github", false, false],
+  ] as const)(
+    "uses %s restored reasoning completion disposition when final output is empty",
+    async (_case, platform, shouldFinish, terminalReasoning) => {
+      const bus = createLilacBus(createInMemoryRawBus());
+      const adapter = new FakeAdapter();
+      if (terminalReasoning) adapter.terminalPartTypes.add("reasoning.status");
+      const sessionId = platform === "discord" ? "chan" : `octo/restore-${crypto.randomUUID()}#1`;
+      const requestId =
+        platform === "discord"
+          ? `discord:${sessionId}:reasoning-only`
+          : `github:${sessionId}:reasoning-only`;
+      const bridge = await bridgeBusToAdapter({
+        adapter,
+        bus,
+        platform,
+        subscriptionId: `${platform}-restored-reasoning-${crypto.randomUUID()}`,
+        idleTimeoutMs: 10_000,
+      });
+
+      await applyAndActivateRelayRecovery(bridge, [
+        {
+          requestId,
+          sessionId,
+          requestClient: platform,
+          platform,
+          createdOutputRefs: [],
+          visibleText: "",
+          reasoning: { startedAtMs: 10, detailText: "thinking" },
+          toolStatus: [],
+        },
+      ]);
+      expect(adapter.starts[0]?.opts?.replyTo).toEqual({
+        platform,
+        channelId: sessionId,
+        messageId: "reasoning-only",
+      });
+
+      await bus.publish(
+        lilacEventTypes.EvtAgentOutputResponseText,
+        { finalText: "" },
+        { headers: { request_id: requestId, session_id: sessionId, request_client: platform } },
+      );
+
+      expect(adapter.stream?.finished).toBe(shouldFinish);
+      expect(adapter.stream?.aborted).toBe(shouldFinish ? undefined : "skip");
+      expect(bridge.snapshotRelays()).toEqual([]);
+      await bridge.stop();
+    },
+  );
+
+  it("finishes restored GitHub tool-only output when final text is empty", async () => {
+    const bus = createLilacBus(createInMemoryRawBus());
+    const adapter = new FakeAdapter();
+    const sessionId = `octo/restored-terminal-${crypto.randomUUID()}#1`;
+    const requestId = `github:${sessionId}:terminal-only`;
+    const bridge = await bridgeBusToAdapter({
+      adapter,
+      bus,
+      platform: "github",
+      subscriptionId: `github-restored-terminal-${crypto.randomUUID()}`,
+      idleTimeoutMs: 10_000,
+    });
+
+    await applyAndActivateRelayRecovery(bridge, [
+      {
+        requestId,
+        sessionId,
+        requestClient: "github",
+        platform: "github",
+        createdOutputRefs: [],
+        visibleText: "",
+        toolStatus: [{ toolCallId: "tool-1", display: "bash pwd", status: "end", ok: true }],
+      },
+    ]);
+    await bus.publish(
+      lilacEventTypes.EvtAgentOutputResponseText,
+      { finalText: "" },
+      { headers: { request_id: requestId, session_id: sessionId, request_client: "github" } },
+    );
+
+    expect(adapter.stream?.finished).toBe(true);
+    expect(adapter.stream?.aborted).toBeUndefined();
+    expect(bridge.snapshotRelays()).toEqual([]);
+    await bridge.stop();
+  });
+
+  it.each([
+    ["GitHub tool status", "github"],
+    ["Discord hidden reasoning", "discord"],
+  ] as const)(
+    "roundtrips a real %s terminal-only relay snapshot through the restart store",
+    async (_case, platform) => {
+      const raw = createInMemoryRawBus();
+      const bus = createLilacBus(raw);
+      const sourceAdapter = new FakeAdapter();
+      const restoredAdapter = new FakeAdapter();
+      if (platform === "discord") {
+        sourceAdapter.terminalPartTypes.add("reasoning.status");
+        restoredAdapter.terminalPartTypes.add("reasoning.status");
+      }
+      const sessionId = platform === "github" ? `octo/codec-${crypto.randomUUID()}#1` : "chan";
+      const requestId = `${platform}:${sessionId}:terminal-only`;
+      const tempDir = mkdtempSync(join(tmpdir(), "lilac-relay-restart-codec-"));
+      const store = new SqliteGracefulRestartStore(join(tempDir, "graceful-restart.db"));
+      const sourceBridge = await bridgeBusToAdapter({
+        adapter: sourceAdapter,
+        bus,
+        platform,
+        subscriptionId: `${platform}-terminal-source-${crypto.randomUUID()}`,
+        idleTimeoutMs: 10_000,
+      });
+      let restoredBridge: Awaited<ReturnType<typeof bridgeBusToAdapter>> | null = null;
+
+      try {
+        await bus.publish(
+          lilacEventTypes.EvtRequestReply,
+          {},
+          {
+            headers: {
+              request_id: requestId,
+              session_id: sessionId,
+              request_client: platform,
+            },
+          },
+        );
+        if (platform === "github") {
+          await bus.publish(
+            lilacEventTypes.EvtAgentOutputToolCall,
+            { toolCallId: "tool-1", display: "bash pwd", status: "end", ok: true },
+            { headers: { request_id: requestId } },
+          );
+        } else {
+          await bus.publish(
+            lilacEventTypes.EvtAgentOutputDeltaReasoning,
+            { delta: "thinking", seq: 1 },
+            { headers: { request_id: requestId } },
+          );
+        }
+
+        const relaySnapshot = sourceBridge.snapshotRelays()[0];
+        if (!relaySnapshot) throw new Error("Expected a terminal-only relay snapshot");
+        expect(Object.keys(relaySnapshot)).not.toContain("streamHasTerminalOutput");
+        const saved = store.saveCompletedSnapshot({
+          version: GRACEFUL_RESTART_SNAPSHOT_VERSION,
+          createdAt: Date.now(),
+          deadlineMs: 10_000,
+          queueAttemptProof: "complete",
+          agent: [],
+          queueAttempts: [],
+          relays: [relaySnapshot],
+        });
+        expect(saved.status).toBe("ok");
+
+        const loaded = store.readCompletedSnapshot();
+        expect(loaded.status).toBe("ok");
+        if (loaded.status !== "ok" || loaded.value.state !== "loaded") {
+          throw new Error("Expected the restart store to load the terminal-only relay snapshot");
+        }
+        expect(Object.keys(loaded.value.snapshot.relays[0] ?? {})).not.toContain(
+          "streamHasTerminalOutput",
+        );
+
+        await sourceBridge.stop();
+        restoredBridge = await bridgeBusToAdapter({
+          adapter: restoredAdapter,
+          bus,
+          platform,
+          subscriptionId: `${platform}-terminal-restored-${crypto.randomUUID()}`,
+          idleTimeoutMs: 10_000,
+        });
+        await applyAndActivateRelayRecovery(restoredBridge, loaded.value.snapshot.relays);
+        await bus.publish(
+          lilacEventTypes.EvtAgentOutputResponseText,
+          { finalText: "" },
+          { headers: { request_id: requestId } },
+        );
+
+        expect(restoredAdapter.stream?.finished).toBe(true);
+        expect(restoredAdapter.stream?.aborted).toBeUndefined();
+        expect(restoredBridge.snapshotRelays()).toEqual([]);
+      } finally {
+        await sourceBridge.stop();
+        await restoredBridge?.stop();
+        await bus.close();
+        store.close();
+        rmSync(tempDir, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it("restores top-level output for a no-target request when replyTo is absent", async () => {
+    const bus = createLilacBus(createInMemoryRawBus());
+    const adapter = new FakeAdapter();
+    const bridge = await bridgeBusToAdapter({
+      adapter,
+      bus,
+      platform: "discord",
+      subscriptionId: `restore-no-target-${crypto.randomUUID()}`,
+      idleTimeoutMs: 10_000,
+    });
+
+    const snapshot = {
+      requestId: "req:generic-restore",
+      sessionId: "chan",
+      requestClient: "discord",
+      platform: "discord",
+      createdOutputRefs: [],
+      visibleText: "partial",
+      toolStatus: [],
+    } satisfies BusToAdapterRelaySnapshot;
+    await applyAndActivateRelayRecovery(bridge, [snapshot]);
+    await applyAndActivateRelayRecovery(bridge, [snapshot]);
+
+    expect(adapter.starts).toHaveLength(1);
+    expect(adapter.starts[0]?.opts?.replyTo).toBeUndefined();
+    await bridge.stop();
+  });
+
+  it("cleans an output stream when restore subscription setup fails after startOutput", async () => {
+    const bus = createLilacBus(
+      createInMemoryRawBus(undefined, undefined, true, (topic) => topic.startsWith("out.req.")),
+    );
+    const adapter = new FakeAdapter();
+    const bridge = await bridgeBusToAdapter({
+      adapter,
+      bus,
+      platform: "discord",
+      subscriptionId: `restore-subscription-failure-${crypto.randomUUID()}`,
+      idleTimeoutMs: 10_000,
+    });
+    const prepared = bridge.prepareRestoreRelays([
+      {
+        requestId: "req:subscription-failure",
+        sessionId: "chan",
+        requestClient: "discord",
+        platform: "discord",
+        createdOutputRefs: [],
+        visibleText: "",
+        toolStatus: [],
+      },
+    ]);
+    if (prepared.status === "error") throw prepared.error;
+    const applied = await prepared.value.apply();
+    expect(applied.status).toBe("error");
+    expect(adapter.stream?.aborted).toBe("restore_start_failed");
+  });
+
+  it("fails paused restore rollback when output subscription stop returns Err", async () => {
+    const bus = createLilacBus(createInMemoryRawBusWithOutputStopFailure());
+    const adapter = new FakeAdapter();
+    const bridge = await bridgeBusToAdapter({
+      adapter,
+      bus,
+      platform: "discord",
+      subscriptionId: `restore-stop-result-failure-${crypto.randomUUID()}`,
+      idleTimeoutMs: 10_000,
+    });
+    const prepared = bridge.prepareRestoreRelays([
+      {
+        requestId: "req:restore-stop-result-failure",
+        sessionId: "chan",
+        requestClient: "discord",
+        platform: "discord",
+        createdOutputRefs: [],
+        visibleText: "",
+        toolStatus: [],
+      },
+    ]);
+    if (prepared.status === "error") throw prepared.error;
+
+    expect((await prepared.value.apply()).status).toBe("ok");
+    expect(await prepared.value.rollback()).toMatchObject({
+      status: "error",
+      error: { _tag: "SurfaceRelayRestoreRollbackFailed" },
+    });
+    expect(adapter.stream?.aborted).toBe("restore_rollback");
+
+    await bridge.stop();
+    await bus.close();
+  });
+
+  it("signals atomicity-unknown Panic when startup subscription stop returns Err", async () => {
+    const bus = createLilacBus(createInMemoryRawBusWithOutputStopFailure());
+    const startupPanic = new Panic({ message: "forced typing startup defect" });
+    class TypingPanicAdapter extends FakeAdapter {
+      override async startTyping(): Promise<never> {
+        throw startupPanic;
+      }
+    }
+    const adapter = new TypingPanicAdapter();
+    const bridge = await bridgeBusToAdapter({
+      adapter,
+      bus,
+      platform: "discord",
+      subscriptionId: `startup-stop-result-failure-${crypto.randomUUID()}`,
+      idleTimeoutMs: 10_000,
+    });
+    let failure: unknown;
+    try {
+      await bus.publish(
+        lilacEventTypes.EvtRequestReply,
+        {},
+        {
+          headers: {
+            request_id: "discord:chan:startup-stop-result-failure",
+            session_id: "chan",
+            request_client: "discord",
+          },
+        },
+      );
+    } catch (cause) {
+      failure = cause;
+    }
+
+    expect(Panic.is(failure)).toBe(true);
+    expect(failure).not.toBe(startupPanic);
+    expect(failure).toMatchObject({
+      message: "Relay startup cleanup left recovery atomicity unknown",
+    });
+    expect(adapter.stream?.aborted).toBe("restore_start_failed");
+
+    await bridge.stop();
+    await bus.close();
+  });
+
+  it("rolls back earlier paused restores when a later relay admission fails", async () => {
+    let outputSubscriptionStarts = 0;
+    const bus = createLilacBus(
+      createInMemoryRawBus(undefined, undefined, true, (topic) => {
+        if (!topic.startsWith("out.req.")) return false;
+        outputSubscriptionStarts += 1;
+        return outputSubscriptionStarts === 2;
+      }),
+    );
+    const adapter = new FakeAdapter();
+    const bridge = await bridgeBusToAdapter({
+      adapter,
+      bus,
+      platform: "discord",
+      subscriptionId: `restore-direct-partial-${crypto.randomUUID()}`,
+      idleTimeoutMs: 10_000,
+    });
+
+    await expect(
+      applyAndActivateRelayRecovery(bridge, [
+        {
+          requestId: "discord:chan:restore-first",
+          sessionId: "chan",
+          requestClient: "discord",
+          platform: "discord",
+          createdOutputRefs: [],
+          visibleText: "",
+          toolStatus: [],
+        },
+        {
+          requestId: "discord:chan:restore-second",
+          sessionId: "chan",
+          requestClient: "discord",
+          platform: "discord",
+          createdOutputRefs: [],
+          visibleText: "",
+          toolStatus: [],
+        },
+      ]),
+    ).rejects.toBeInstanceOf(SurfaceRelayRestoreApplyFailed);
+    expect(adapter.streams).toHaveLength(2);
+    expect(adapter.streams.map((stream) => stream.aborted)).toEqual([
+      "restore_rollback",
+      "restore_start_failed",
+    ]);
+    expect(adapter.typingStarts).toEqual([]);
+    expect(bridge.snapshotRelays()).toEqual([]);
+    await bridge.stop();
+    await bus.close();
+  });
+
+  it("signals atomicity-unknown Panic when paused restore cleanup fails", async () => {
+    let outputSubscriptionStarts = 0;
+    const bus = createLilacBus(
+      createInMemoryRawBus(undefined, undefined, true, (topic) => {
+        if (!topic.startsWith("out.req.")) return false;
+        outputSubscriptionStarts += 1;
+        return outputSubscriptionStarts === 2;
+      }),
+    );
+    class RollbackFailureAdapter extends FakeAdapter {
+      override async startOutput(sessionRef: SessionRef, opts?: StartOutputOpts) {
+        const started = await super.startOutput(sessionRef, opts);
+        if (started.status === "ok" && this.streams.length === 1) {
+          started.value.nextAbortFailure = new Error("forced rollback failure");
+        }
+        return started;
+      }
+    }
+    const adapter = new RollbackFailureAdapter();
+    const bridge = await bridgeBusToAdapter({
+      adapter,
+      bus,
+      platform: "discord",
+      subscriptionId: `restore-direct-rollback-failure-${crypto.randomUUID()}`,
+      idleTimeoutMs: 10_000,
+    });
+    let failure: unknown;
+    try {
+      await applyAndActivateRelayRecovery(bridge, [
+        {
+          requestId: "discord:chan:restore-first",
+          sessionId: "chan",
+          requestClient: "discord",
+          platform: "discord",
+          createdOutputRefs: [],
+          visibleText: "",
+          toolStatus: [],
+        },
+        {
+          requestId: "discord:chan:restore-second",
+          sessionId: "chan",
+          requestClient: "discord",
+          platform: "discord",
+          createdOutputRefs: [],
+          visibleText: "",
+          toolStatus: [],
+        },
+      ]);
+    } catch (cause) {
+      failure = cause;
+    }
+    expect(Panic.is(failure)).toBe(true);
+    expect(adapter.streams).toHaveLength(2);
+    expect(adapter.streams[1]?.aborted).toBe("restore_start_failed");
+    expect(bridge.snapshotRelays()).toEqual([]);
+    await bridge.stop();
+    await bus.close();
+  });
+
+  it("hydrates restored output locally without invoking the provider push path", async () => {
+    const bus = createLilacBus(createInMemoryRawBus());
+    const adapter = new FakeAdapter();
+    const bridge = await bridgeBusToAdapter({
+      adapter,
+      bus,
+      platform: "discord",
+      subscriptionId: `restore-prime-failure-${crypto.randomUUID()}`,
+      idleTimeoutMs: 10_000,
+    });
+    const prepared = bridge.prepareRestoreRelays([
+      {
+        requestId: "req:prime-failure",
+        sessionId: "chan",
+        requestClient: "discord",
+        platform: "discord",
+        createdOutputRefs: [],
+        visibleText: "restored text",
+        toolStatus: [],
+      },
+    ]);
+    if (prepared.status === "error") throw prepared.error;
+    adapter.nextStreamPushFailure = new Error("priming failed");
+    expect((await prepared.value.apply()).status).toBe("ok");
+    if (!adapter.stream) throw new Error("Expected admitted output stream");
+    expect(adapter.starts[0]?.opts?.preparationMode).toBe("paused-recovery");
+    expect(adapter.stream.parts).toEqual([]);
+    expect(adapter.stream.hydratedParts).toEqual([{ type: "text.set", text: "restored text" }]);
+    expect(adapter.typingStarts).toEqual([]);
+    expect((await prepared.value.rollback()).status).toBe("ok");
+    expect(adapter.stream.aborted).toBe("restore_rollback");
+    await bridge.stop();
+    await bus.close();
+  });
+
+  it("does not start typing during paused admission", async () => {
+    const bus = createLilacBus(createInMemoryRawBus());
+    class TypingFailureAdapter extends FakeAdapter {
+      override async startTyping(): Promise<never> {
+        throw new Error("typing setup failed");
+      }
+    }
+    const adapter = new TypingFailureAdapter();
+    const bridge = await bridgeBusToAdapter({
+      adapter,
+      bus,
+      platform: "discord",
+      subscriptionId: `restore-typing-failure-${crypto.randomUUID()}`,
+      idleTimeoutMs: 10_000,
+    });
+    const prepared = bridge.prepareRestoreRelays([
+      {
+        requestId: "req:typing-failure",
+        sessionId: "chan",
+        requestClient: "discord",
+        platform: "discord",
+        createdOutputRefs: [],
+        visibleText: "",
+        toolStatus: [],
+      },
+    ]);
+    if (prepared.status === "error") throw prepared.error;
+    expect((await prepared.value.apply()).status).toBe("ok");
+    expect(adapter.typingStarts).toEqual([]);
+    expect(adapter.stream?.aborted).toBeUndefined();
+    expect((await prepared.value.rollback()).status).toBe("ok");
+    await bridge.stop();
+    await bus.close();
+  });
+
+  it("rollback aborts and removes every resource created by paused relay admission", async () => {
+    const bus = createLilacBus(createInMemoryRawBus());
+    const adapter = new FakeAdapter();
+    const bridge = await bridgeBusToAdapter({
+      adapter,
+      bus,
+      platform: "discord",
+      subscriptionId: `restore-rollback-resources-${crypto.randomUUID()}`,
+      idleTimeoutMs: 10_000,
+    });
+    const prepared = bridge.prepareRestoreRelays([
+      {
+        requestId: "req:rollback-resources",
+        sessionId: "chan",
+        requestClient: "discord",
+        platform: "discord",
+        createdOutputRefs: [],
+        visibleText: "",
+        toolStatus: [],
+      },
+    ]);
+    if (prepared.status === "error") throw prepared.error;
+    expect((await prepared.value.apply()).status).toBe("ok");
+    expect(adapter.typingStarts).toHaveLength(0);
+    expect(adapter.stream?.parts).toEqual([]);
+    expect((await prepared.value.rollback()).status).toBe("ok");
+    expect(adapter.stream?.aborted).toBe("restore_rollback");
+    expect(bridge.snapshotRelays()).toEqual([]);
+    await bridge.stop();
+    await bus.close();
+  });
+
+  it("retains output events without effects until total synchronous activation", async () => {
+    const bus = createLilacBus(createInMemoryRawBus());
+    const adapter = new FakeAdapter();
+    const bridge = await bridgeBusToAdapter({
+      adapter,
+      bus,
+      platform: "discord",
+      subscriptionId: `restore-paused-events-${crypto.randomUUID()}`,
+      idleTimeoutMs: 10_000,
+    });
+    const requestId = "req:paused-events";
+    const prepared = bridge.prepareRestoreRelays([
+      {
+        requestId,
+        sessionId: "chan",
+        requestClient: "discord",
+        platform: "discord",
+        createdOutputRefs: [],
+        visibleText: "",
+        toolStatus: [],
+      },
+    ]);
+    if (prepared.status === "error") throw prepared.error;
+    expect((await prepared.value.apply()).status).toBe("ok");
+    const publication = bus.publish(
+      lilacEventTypes.EvtAgentOutputDeltaText,
+      { delta: "retained" },
+      {
+        headers: {
+          request_id: requestId,
+          session_id: "chan",
+          request_client: "discord",
+        },
+      },
+    );
+    await Promise.resolve();
+    expect(adapter.stream?.parts).toEqual([]);
+
+    expect(prepared.value.activate()).toBeUndefined();
+    await publication;
+    expect(adapter.stream?.parts).toEqual([{ type: "text.delta", delta: "retained" }]);
+    await bridge.stop();
+    await bus.close();
+  });
+
+  it.each([
+    ["discord:chan", "malformed"],
+    ["github:octo/repo#1:10", "cross-platform"],
+    ["discord:other:message", "cross-session"],
+  ] as const)(
+    "restores absent-replyTo snapshot with invalid %s request identity",
+    async (requestId) => {
+      const bus = createLilacBus(createInMemoryRawBus());
+      const adapter = new FakeAdapter();
+      const bridge = await bridgeBusToAdapter({
+        adapter,
+        bus,
+        platform: "discord",
+        subscriptionId: `restore-invalid-request-${crypto.randomUUID()}`,
+        idleTimeoutMs: 10_000,
+      });
+
+      await applyAndActivateRelayRecovery(bridge, [
+        {
+          requestId,
+          sessionId: "chan",
+          requestClient: "discord",
+          platform: "discord",
+          createdOutputRefs: [],
+          visibleText: "partial",
+          toolStatus: [],
+        },
+      ]);
+
+      expect(adapter.starts).toHaveLength(1);
+      expect(adapter.starts[0]?.opts?.replyTo).toBeUndefined();
+      expect(bridge.snapshotRelays()).toHaveLength(1);
+      await bridge.stop();
+    },
+  );
+
+  it("prefers a valid persisted replyTo over malformed request identity during restore", async () => {
+    const bus = createLilacBus(createInMemoryRawBus());
+    const adapter = new FakeAdapter();
+    const bridge = await bridgeBusToAdapter({
+      adapter,
+      bus,
+      platform: "discord",
+      subscriptionId: `restore-persisted-target-${crypto.randomUUID()}`,
+      idleTimeoutMs: 10_000,
+    });
+    const replyTo = { platform: "discord" as const, channelId: "chan", messageId: "persisted" };
+
+    await applyAndActivateRelayRecovery(bridge, [
+      {
+        requestId: "discord:malformed",
+        sessionId: "chan",
+        requestClient: "discord",
+        platform: "discord",
+        replyTo,
+        createdOutputRefs: [],
+        visibleText: "partial",
+        toolStatus: [],
+      },
+    ]);
+
+    expect(adapter.starts[0]?.opts?.replyTo).toEqual(replyTo);
+    await bridge.stop();
+  });
+
+  it.each([
+    { platform: "github" as const, channelId: "chan", messageId: "cross-platform" },
+    { platform: "discord" as const, channelId: "other", messageId: "cross-session" },
+  ])("restores invalid persisted target $messageId without a reply target", async (replyTo) => {
+    const bus = createLilacBus(createInMemoryRawBus());
+    const adapter = new FakeAdapter();
+    const bridge = await bridgeBusToAdapter({
+      adapter,
+      bus,
+      platform: "discord",
+      subscriptionId: `restore-invalid-target-${crypto.randomUUID()}`,
+      idleTimeoutMs: 10_000,
+    });
+
+    await applyAndActivateRelayRecovery(bridge, [
+      {
+        requestId: "discord:chan:valid-request",
+        sessionId: "chan",
+        requestClient: "discord",
+        platform: "discord",
+        replyTo,
+        createdOutputRefs: [],
+        visibleText: "partial",
+        toolStatus: [],
+      },
+    ]);
+
+    expect(adapter.starts).toHaveLength(1);
+    expect(adapter.starts[0]?.opts?.replyTo).toBeUndefined();
+    expect(bridge.snapshotRelays()).toHaveLength(1);
     await bridge.stop();
   });
 
@@ -2309,7 +3443,7 @@ describe("bridgeBusToAdapter", () => {
       idleTimeoutMs: 10_000,
     });
 
-    await bridge.restoreRelays([
+    await applyAndActivateRelayRecovery(bridge, [
       {
         requestId: "telegram:1001:42",
         sessionId: "1001",
@@ -2326,7 +3460,7 @@ describe("bridgeBusToAdapter", () => {
       },
     ]);
 
-    expect(adapter.stream?.parts).toContainEqual({
+    expect(adapter.stream?.hydratedParts).toContainEqual({
       type: "reasoning.status",
       update: {
         startedAtMs: 10_000,
@@ -2395,7 +3529,7 @@ describe("bridgeBusToAdapter", () => {
       idleTimeoutMs: 10_000,
     });
 
-    await bridgeB.restoreRelays([snapshot]);
+    await applyAndActivateRelayRecovery(bridgeB, [snapshot]);
 
     expect(adapterB.starts).toHaveLength(1);
     expect(adapterB.starts[0]?.opts?.resume?.created).toEqual(snapshot.createdOutputRefs);
@@ -2415,9 +3549,9 @@ describe("bridgeBusToAdapter", () => {
     // test-wait-justification: drains the output relay's in-memory bus callbacks triggered above
     await new Promise((r) => setTimeout(r, 0));
 
-    expect(adapterB.stream?.parts[0]).toEqual({ type: "text.set", text: "a" });
+    expect(adapterB.stream?.hydratedParts[0]).toEqual({ type: "text.set", text: "a" });
     expect(
-      adapterB.stream?.parts.some(
+      adapterB.stream?.hydratedParts.some(
         (p) =>
           p.type === "tool.status" &&
           p.update.toolCallId === "tool-2" &&
@@ -2447,7 +3581,7 @@ describe("bridgeBusToAdapter", () => {
       idleTimeoutMs: 10_000,
     });
 
-    await bridge.restoreRelays([
+    await applyAndActivateRelayRecovery(bridge, [
       {
         requestId,
         sessionId: "chan",
@@ -2470,20 +3604,24 @@ describe("bridgeBusToAdapter", () => {
     await bus.publish(
       lilacEventTypes.EvtAgentOutputDeltaText,
       { delta: "b" },
-      { headers: { request_id: requestId } },
+      {
+        headers: { request_id: requestId, session_id: "chan", request_client: "discord" },
+      },
     );
 
     // Resume run may only emit the continuation suffix.
     await bus.publish(
       lilacEventTypes.EvtAgentOutputResponseText,
       { finalText: "b" },
-      { headers: { request_id: requestId } },
+      {
+        headers: { request_id: requestId, session_id: "chan", request_client: "discord" },
+      },
     );
 
     // test-wait-justification: drains the output relay's in-memory bus callbacks triggered above
     await new Promise((r) => setTimeout(r, 0));
 
-    expect(adapter.stream?.parts[0]).toEqual({ type: "text.set", text: "a" });
+    expect(adapter.stream?.hydratedParts[0]).toEqual({ type: "text.set", text: "a" });
     expect(adapter.stream?.parts.some((p) => p.type === "text.delta" && p.delta === "b")).toBe(
       true,
     );
@@ -2505,7 +3643,7 @@ describe("bridgeBusToAdapter", () => {
       idleTimeoutMs: 10_000,
     });
 
-    await bridge.restoreRelays([
+    await applyAndActivateRelayRecovery(bridge, [
       {
         requestId,
         sessionId: "chan",
@@ -2523,7 +3661,9 @@ describe("bridgeBusToAdapter", () => {
     await bus.publish(
       lilacEventTypes.EvtAgentOutputResponseText,
       { finalText: "!" },
-      { headers: { request_id: requestId } },
+      {
+        headers: { request_id: requestId, session_id: "chan", request_client: "discord" },
+      },
     );
 
     // test-wait-justification: drains the output relay's in-memory bus callbacks triggered above
@@ -2550,7 +3690,7 @@ describe("bridgeBusToAdapter", () => {
       idleTimeoutMs: 10_000,
     });
 
-    await bridge.restoreRelays([
+    await applyAndActivateRelayRecovery(bridge, [
       {
         requestId,
         sessionId: "chan",
@@ -2571,7 +3711,9 @@ describe("bridgeBusToAdapter", () => {
     await bus.publish(
       lilacEventTypes.EvtAgentOutputResponseText,
       { finalText: "Corrected response." },
-      { headers: { request_id: requestId } },
+      {
+        headers: { request_id: requestId, session_id: "chan", request_client: "discord" },
+      },
     );
 
     // test-wait-justification: drains the output relay's in-memory bus callbacks triggered above
@@ -2597,7 +3739,7 @@ describe("bridgeBusToAdapter", () => {
       idleTimeoutMs: 10_000,
     });
 
-    await bridge.restoreRelays([
+    await applyAndActivateRelayRecovery(bridge, [
       {
         requestId,
         sessionId: "chan",
@@ -2614,7 +3756,9 @@ describe("bridgeBusToAdapter", () => {
     await bus.publish(
       lilacEventTypes.EvtAgentOutputResponseText,
       { finalText: "Corrected response." },
-      { headers: { request_id: requestId } },
+      {
+        headers: { request_id: requestId, session_id: "chan", request_client: "discord" },
+      },
     );
 
     // test-wait-justification: drains the output relay's in-memory bus callbacks triggered above
@@ -2642,7 +3786,7 @@ describe("bridgeBusToAdapter", () => {
       idleTimeoutMs: 10_000,
     });
 
-    await bridge.restoreRelays([
+    await applyAndActivateRelayRecovery(bridge, [
       {
         requestId,
         sessionId: "chan",
@@ -2658,13 +3802,17 @@ describe("bridgeBusToAdapter", () => {
     await bus.publish(
       lilacEventTypes.EvtAgentOutputDeltaText,
       { delta: "def" },
-      { headers: { request_id: requestId } },
+      {
+        headers: { request_id: requestId, session_id: "chan", request_client: "discord" },
+      },
     );
 
     await bus.publish(
       lilacEventTypes.EvtAgentOutputResponseText,
       { finalText: "cdef!" },
-      { headers: { request_id: requestId } },
+      {
+        headers: { request_id: requestId, session_id: "chan", request_client: "discord" },
+      },
     );
 
     // test-wait-justification: drains the output relay's in-memory bus callbacks triggered above
@@ -2690,7 +3838,7 @@ describe("bridgeBusToAdapter", () => {
       idleTimeoutMs: 10_000,
     });
 
-    await bridge.restoreRelays([
+    await applyAndActivateRelayRecovery(bridge, [
       {
         requestId,
         sessionId: "chan",
@@ -2706,13 +3854,17 @@ describe("bridgeBusToAdapter", () => {
     await bus.publish(
       lilacEventTypes.EvtAgentOutputDeltaText,
       { delta: "def" },
-      { headers: { request_id: requestId } },
+      {
+        headers: { request_id: requestId, session_id: "chan", request_client: "discord" },
+      },
     );
 
     await bus.publish(
       lilacEventTypes.EvtAgentOutputResponseText,
       { finalText: "XYZ" },
-      { headers: { request_id: requestId } },
+      {
+        headers: { request_id: requestId, session_id: "chan", request_client: "discord" },
+      },
     );
 
     // test-wait-justification: drains the output relay's in-memory bus callbacks triggered above
@@ -2738,7 +3890,7 @@ describe("bridgeBusToAdapter", () => {
       idleTimeoutMs: 10_000,
     });
 
-    await bridge.restoreRelays([
+    await applyAndActivateRelayRecovery(bridge, [
       {
         requestId,
         sessionId: "chan",
@@ -2755,7 +3907,9 @@ describe("bridgeBusToAdapter", () => {
     await bus.publish(
       lilacEventTypes.EvtAgentOutputResponseText,
       { finalText: "abcdefg" },
-      { headers: { request_id: requestId } },
+      {
+        headers: { request_id: requestId, session_id: "chan", request_client: "discord" },
+      },
     );
 
     // test-wait-justification: drains the output relay's in-memory bus callbacks triggered above
@@ -2781,7 +3935,7 @@ describe("bridgeBusToAdapter", () => {
       idleTimeoutMs: 10_000,
     });
 
-    await bridge.restoreRelays([
+    await applyAndActivateRelayRecovery(bridge, [
       {
         requestId,
         sessionId: "chan",
@@ -2800,7 +3954,9 @@ describe("bridgeBusToAdapter", () => {
     await bus.publish(
       lilacEventTypes.EvtAgentOutputResponseText,
       { finalText: "!" },
-      { headers: { request_id: requestId } },
+      {
+        headers: { request_id: requestId, session_id: "chan", request_client: "discord" },
+      },
     );
 
     // test-wait-justification: drains the output relay's in-memory bus callbacks triggered above
@@ -2859,7 +4015,7 @@ describe("bridgeBusToAdapter", () => {
       idleTimeoutMs: 10_000,
     });
 
-    await bridgeB.restoreRelays([snapshot]);
+    await applyAndActivateRelayRecovery(bridgeB, [snapshot]);
 
     // No new deltas were published after restore; only final arrives.
     await bus.publish(
@@ -2894,7 +4050,7 @@ describe("bridgeBusToAdapter", () => {
       idleTimeoutMs: 10_000,
     });
 
-    await bridge.restoreRelays([
+    await applyAndActivateRelayRecovery(bridge, [
       {
         requestId,
         sessionId: "chan",
@@ -2921,7 +4077,9 @@ describe("bridgeBusToAdapter", () => {
     await bus.publish(
       lilacEventTypes.EvtAgentOutputResponseText,
       { finalText: "ignored", delivery: "skip" },
-      { headers: { request_id: requestId } },
+      {
+        headers: { request_id: requestId, session_id: "chan", request_client: "discord" },
+      },
     );
 
     // test-wait-justification: drains the output relay's in-memory bus callbacks triggered above
@@ -2929,7 +4087,7 @@ describe("bridgeBusToAdapter", () => {
 
     expect(adapter.stream?.aborted).toBe("skip");
     expect(adapter.stream?.finished).toBe(false);
-    expect(adapter.deletedMsgs.map((m) => m.messageId)).toEqual(["m_out_1", "m_old_2", "m_old_1"]);
+    expect(adapter.deletedMsgs.map((m) => m.messageId)).toEqual(["m_old_2", "m_old_1"]);
     expect(bridge.snapshotRelays()).toHaveLength(0);
 
     await bridge.stop();
@@ -3004,7 +4162,7 @@ describe("bridgeBusToAdapter", () => {
       idleTimeoutMs: 10_000,
     });
 
-    await bridge.restoreRelays([
+    await applyAndActivateRelayRecovery(bridge, [
       {
         requestId,
         sessionId: "chan",
@@ -3071,7 +4229,7 @@ describe("bridgeBusToAdapter", () => {
     await bridge.stop();
   });
 
-  it("ignores cmd.request and cmd.surface events when request_client mismatches platform", async () => {
+  it("requires an exact request_client match across relay-consumed event paths", async () => {
     const raw = createInMemoryRawBus();
     const bus = createLilacBus(raw);
     const adapter = new FakeAdapter();
@@ -3085,6 +4243,20 @@ describe("bridgeBusToAdapter", () => {
       subscriptionId: "discord-adapter",
       idleTimeoutMs: 10_000,
     });
+
+    await bus.publish(
+      lilacEventTypes.EvtRequestReply,
+      {},
+      {
+        headers: {
+          request_id: requestId,
+          session_id: "chan",
+          request_client: "github",
+        },
+      },
+    );
+
+    expect(adapter.streams).toHaveLength(0);
 
     await bus.publish(
       lilacEventTypes.EvtRequestReply,
@@ -3137,6 +4309,597 @@ describe("bridgeBusToAdapter", () => {
 
     expect(adapter.streams[0]?.aborted).toBeUndefined();
 
+    await bus.publish(
+      lilacEventTypes.CmdSurfaceOutputReanchor,
+      { inheritReplyTo: true },
+      {
+        headers: {
+          request_id: requestId,
+          session_id: "chan",
+          request_client: "discord",
+        },
+      },
+    );
+    expect(adapter.streams).toHaveLength(2);
+
+    await bus.publish(
+      lilacEventTypes.CmdRequestMessage,
+      {
+        queue: "interrupt",
+        messages: [],
+        raw: { cancel: true, requiresActive: true },
+      },
+      {
+        headers: {
+          request_id: requestId,
+          session_id: "chan",
+          request_client: "discord",
+        },
+      },
+    );
+    expect(adapter.streams[1]?.aborted).toBe("cancel");
+
+    await bridge.stop();
+  });
+
+  it("dead-letters relay mutations with conflicting active correlation", async () => {
+    const deliveries: DeliveryObservation[] = [];
+    const bus = createLilacBus(createInMemoryRawBus((delivery) => deliveries.push(delivery)));
+    const adapter = new FakeAdapter();
+    const requestId = "discord:chan:correlated";
+    const bridge = await bridgeBusToAdapter({
+      adapter,
+      bus,
+      platform: "discord",
+      subscriptionId: "active-correlation",
+      idleTimeoutMs: 10_000,
+    });
+    await bus.publish(
+      lilacEventTypes.EvtRequestReply,
+      {},
+      {
+        headers: {
+          request_id: requestId,
+          session_id: "chan",
+          request_client: "discord",
+        },
+      },
+    );
+    await bus.publish(
+      lilacEventTypes.CmdSurfaceOutputReanchor,
+      { inheritReplyTo: true },
+      {
+        headers: {
+          request_id: requestId,
+          session_id: "other",
+          request_client: "discord",
+        },
+      },
+    );
+    await bus.publish(
+      lilacEventTypes.CmdRequestMessage,
+      { queue: "interrupt", messages: [], raw: { cancel: true } },
+      {
+        headers: {
+          request_id: requestId,
+          session_id: "other",
+          request_client: "discord",
+        },
+      },
+    );
+    await bus.publish(
+      lilacEventTypes.EvtRequestLifecycleChanged,
+      { state: "failed" },
+      {
+        headers: {
+          request_id: requestId,
+          session_id: "chan",
+          request_client: "github",
+        },
+      },
+    );
+    await bus.publish(
+      lilacEventTypes.EvtAgentOutputDeltaText,
+      { delta: "must not render" },
+      {
+        headers: {
+          request_id: requestId,
+          session_id: "other",
+          request_client: "discord",
+        },
+      },
+    );
+    await bus.publish(
+      lilacEventTypes.CmdRequestMessage,
+      { queue: "interrupt", messages: [], raw: { cancel: true } },
+      { headers: { request_id: requestId, request_client: "discord" } },
+    );
+    await bus.publish(
+      lilacEventTypes.CmdSurfaceOutputReanchor,
+      { inheritReplyTo: true },
+      { headers: { request_id: requestId, session_id: "chan" } },
+    );
+    await bus.publish(
+      lilacEventTypes.EvtRequestLifecycleChanged,
+      { state: "failed" },
+      { headers: { request_id: requestId, request_client: "discord" } },
+    );
+
+    expect(deliveries.slice(-7).map((delivery) => delivery.disposition)).toEqual([
+      "dead-letter",
+      "dead-letter",
+      "dead-letter",
+      "dead-letter",
+      "dead-letter",
+      "dead-letter",
+      "dead-letter",
+    ]);
+    expect(adapter.streams).toHaveLength(1);
+    expect(adapter.stream?.aborted).toBeUndefined();
+    expect(adapter.stream?.parts).toEqual([]);
+    expect(adapter.typingStops).toBe(0);
+    await bridge.stop();
+  });
+
+  it("preserves terminal-before-relay platform and session correlation", async () => {
+    const deliveries: DeliveryObservation[] = [];
+    const bus = createLilacBus(createInMemoryRawBus((delivery) => deliveries.push(delivery)));
+    const adapter = new FakeAdapter();
+    const requestId = "discord:chan:terminal-first";
+    const bridge = await bridgeBusToAdapter({
+      adapter,
+      bus,
+      platform: "discord",
+      subscriptionId: "terminal-first-correlation",
+      idleTimeoutMs: 10_000,
+    });
+    await bus.publish(
+      lilacEventTypes.EvtRequestLifecycleChanged,
+      { state: "resolved" },
+      {
+        headers: {
+          request_id: requestId,
+          session_id: "chan",
+          request_client: "discord",
+        },
+      },
+    );
+    await bus.publish(
+      lilacEventTypes.EvtRequestReply,
+      {},
+      {
+        headers: {
+          request_id: requestId,
+          session_id: "other",
+          request_client: "discord",
+        },
+      },
+    );
+    expect(deliveries.at(-1)?.disposition).toBe("dead-letter");
+    expect(adapter.streams).toHaveLength(0);
+
+    await bus.publish(
+      lilacEventTypes.EvtRequestReply,
+      {},
+      {
+        headers: {
+          request_id: requestId,
+          session_id: "chan",
+          request_client: "discord",
+        },
+      },
+    );
+    expect(adapter.streams).toHaveLength(1);
+    expect(adapter.typingStarts).toHaveLength(1);
+    expect(adapter.typingStops).toBe(1);
+    await bridge.stop();
+  });
+
+  it("dead-letters incomplete headers only after an output becomes surface-bound", async () => {
+    const deliveries: DeliveryObservation[] = [];
+    const bus = createLilacBus(
+      createInMemoryRawBus((delivery) => deliveries.push(delivery), undefined, false),
+    );
+    const adapter = new FakeAdapter();
+    const requestId = "discord:chan:missing-output-correlation";
+    const bridge = await bridgeBusToAdapter({
+      adapter,
+      bus,
+      platform: "discord",
+      subscriptionId: "missing-output-correlation",
+      idleTimeoutMs: 10_000,
+    });
+    await bus.publish(
+      lilacEventTypes.EvtAgentOutputDeltaText,
+      { delta: "not surface-bound yet" },
+      { headers: { request_id: requestId } },
+    );
+    expect(deliveries).toEqual([]);
+
+    await bus.publish(
+      lilacEventTypes.EvtRequestReply,
+      {},
+      {
+        headers: {
+          request_id: requestId,
+          session_id: "chan",
+          request_client: "discord",
+        },
+      },
+    );
+    await bus.publish(
+      lilacEventTypes.EvtAgentOutputResponseText,
+      { finalText: "must not finalize" },
+      { headers: { request_id: requestId } },
+    );
+    expect(deliveries.at(-1)?.disposition).toBe("dead-letter");
+    expect(adapter.stream?.parts).toEqual([]);
+    expect(adapter.stream?.finished).toBe(false);
+    expect(adapter.typingStops).toBe(0);
+    await bridge.stop();
+  });
+
+  it("dead-letters missing request_client headers in every relay consumer", async () => {
+    const deliveries: DeliveryObservation[] = [];
+    const bus = createLilacBus(createInMemoryRawBus((delivery) => deliveries.push(delivery)));
+    const bridge = await bridgeBusToAdapter({
+      adapter: new FakeAdapter(),
+      bus,
+      platform: "discord",
+      subscriptionId: "discord-adapter",
+      idleTimeoutMs: 10_000,
+    });
+
+    await bus.publish(
+      lilacEventTypes.CmdRequestMessage,
+      { queue: "prompt", messages: [] },
+      { headers: { request_id: "missing-client-cmd", session_id: "chan" } },
+    );
+    await bus.publish(
+      lilacEventTypes.CmdSurfaceOutputReanchor,
+      { inheritReplyTo: true },
+      { headers: { request_id: "missing-client-surface", session_id: "chan" } },
+    );
+    await bus.publish(
+      lilacEventTypes.EvtRequestReply,
+      {},
+      { headers: { request_id: "missing-client-event", session_id: "chan" } },
+    );
+
+    expect(deliveries.map(({ topic, disposition }) => ({ topic, disposition }))).toEqual([
+      { topic: "cmd.request", disposition: "dead-letter" },
+      { topic: "cmd.surface", disposition: "dead-letter" },
+      { topic: "evt.request", disposition: "dead-letter" },
+    ]);
+    expect(deliveries.every((delivery) => !delivery.contextHasCommit)).toBe(true);
+
+    await bridge.stop();
+  });
+
+  it.each([
+    [
+      "skip",
+      { finalText: "ignored", delivery: "skip" as const },
+      { kind: "issue", issueNumber: 12 },
+    ],
+    ["empty output", { finalText: "" }, { kind: "issue", issueNumber: 12 }],
+    ["finish", { finalText: "finished" }, { kind: "issue", issueNumber: 12 }],
+    [
+      "finish for a comment reaction",
+      { finalText: "finished" },
+      { kind: "comment", commentId: 55, issueNumber: 12 },
+    ],
+  ] satisfies ReadonlyArray<
+    readonly [string, { finalText: string; delivery?: "skip" }, GithubAckState["target"]]
+  >)("clears the GitHub acknowledgement on %s", async (_terminal, response, target) => {
+    const warning = spyOn(console, "warn").mockImplementation(() => {});
+    const bus = createLilacBus(createInMemoryRawBus());
+    const adapter = new FakeAdapter();
+    const sessionId = `octo/relay-ack-${crypto.randomUUID()}#12`;
+    const requestId = `github:${sessionId}:12`;
+    setGithubAck(requestId, {
+      target,
+      reactionId: 42,
+    });
+    const bridge = await bridgeBusToAdapter({
+      adapter,
+      bus,
+      platform: "github",
+      subscriptionId: `github-ack-${crypto.randomUUID()}`,
+      idleTimeoutMs: 10_000,
+    });
+
+    try {
+      await bus.publish(
+        lilacEventTypes.EvtRequestReply,
+        {},
+        {
+          headers: {
+            request_id: requestId,
+            session_id: sessionId,
+            request_client: "github",
+          },
+        },
+      );
+      await bus.publish(lilacEventTypes.EvtAgentOutputResponseText, response, {
+        headers: { request_id: requestId },
+      });
+
+      expect(getGithubAck(requestId)).toBeUndefined();
+    } finally {
+      clearGithubAck(requestId);
+      await bridge.stop();
+      await bus.close();
+      warning.mockRestore();
+    }
+  });
+
+  it("logs a narrow GitHub acknowledgement failure and completes relay cleanup", async () => {
+    const bus = createLilacBus(createInMemoryRawBus());
+    const adapter = new FakeAdapter();
+    const sessionId = `octo/relay-ack-failure-${crypto.randomUUID()}#12`;
+    const requestId = `github:${sessionId}:12`;
+    setGithubAck(requestId, {
+      target: { kind: "issue", issueNumber: 12 },
+      reactionId: 42,
+    });
+    const policy = createGithubRelayPolicy({
+      acknowledgementApi: {
+        deleteIssueReactionById: async () => {
+          throw new Error("GitHub API unavailable");
+        },
+        deleteIssueCommentReactionById: async () => undefined,
+      },
+    });
+    const bridge = await bridgeBusToAdapterImpl({
+      adapter,
+      bus,
+      platform: "github",
+      policy,
+      subscriptionId: `github-ack-failure-${crypto.randomUUID()}`,
+      idleTimeoutMs: 10_000,
+    });
+
+    try {
+      await bus.publish(
+        lilacEventTypes.EvtRequestReply,
+        {},
+        {
+          headers: {
+            request_id: requestId,
+            session_id: sessionId,
+            request_client: "github",
+          },
+        },
+      );
+      await bus.publish(
+        lilacEventTypes.EvtAgentOutputResponseText,
+        { finalText: "finished" },
+        { headers: { request_id: requestId } },
+      );
+
+      expect(adapter.stream?.finished).toBe(true);
+      expect(bridge.snapshotRelays()).toEqual([]);
+      expect(getGithubAck(requestId)).toBeUndefined();
+    } finally {
+      clearGithubAck(requestId);
+      await bridge.stop();
+      await bus.close();
+    }
+  });
+
+  it("logs the redacted narrow acknowledgement cleanup envelope", () => {
+    const calls: Array<{ message: string; context: unknown }> = [];
+    const requestId = "github:octo/repo#12:12";
+    logIngressAcknowledgementCleanupFailure({
+      logger: {
+        warn: (message, context) => calls.push({ message, context }),
+      },
+      error: new SurfaceIngressAcknowledgementCleanupFailed({
+        cause: {
+          errorTag: "GithubAcknowledgementDeleteFailed",
+          errorMessage: "Failed to delete GitHub acknowledgement reaction",
+        },
+        message: "Failed to clear surface ingress acknowledgement",
+      }),
+      requestId,
+      sessionId: "octo/repo#12",
+    });
+
+    expect(calls).toEqual([
+      {
+        message: "failed to clear ingress acknowledgement",
+        context: {
+          requestId,
+          sessionId: "octo/repo#12",
+          errorTag: "SurfaceIngressAcknowledgementCleanupFailed",
+          errorMessage: "Failed to clear surface ingress acknowledgement",
+          causeErrorTag: "GithubAcknowledgementDeleteFailed",
+          causeErrorMessage: "Failed to delete GitHub acknowledgement reaction",
+        },
+      },
+    ]);
+  });
+
+  it("commits a previously swallowed reanchor side-effect failure", async () => {
+    const deliveries: DeliveryObservation[] = [];
+    const bus = createLilacBus(createInMemoryRawBus((delivery) => deliveries.push(delivery)));
+    const adapter = new FakeAdapter();
+    const requestId = "discord:chan:reanchor_failure";
+    const bridge = await bridgeBusToAdapter({
+      adapter,
+      bus,
+      platform: "discord",
+      subscriptionId: "discord-adapter",
+      idleTimeoutMs: 10_000,
+    });
+
+    await bus.publish(
+      lilacEventTypes.EvtRequestReply,
+      {},
+      {
+        headers: {
+          request_id: requestId,
+          session_id: "chan",
+          request_client: "discord",
+        },
+      },
+    );
+    adapter.failNextStart = true;
+    await bus.publish(
+      lilacEventTypes.CmdSurfaceOutputReanchor,
+      { inheritReplyTo: true },
+      {
+        headers: {
+          request_id: requestId,
+          session_id: "chan",
+          request_client: "discord",
+        },
+      },
+    );
+
+    expect(deliveries.at(-1)).toMatchObject({
+      topic: "cmd.surface",
+      disposition: "commit",
+      contextHasCommit: false,
+    });
+
+    await bridge.stop();
+  });
+
+  it("stops failed tail processing without advancing the relay cursor", async () => {
+    const deliveries: DeliveryObservation[] = [];
+    const bus = createLilacBus(createInMemoryRawBus((delivery) => deliveries.push(delivery)));
+    const adapter = new FakeAdapter();
+    const requestId = "discord:chan:tail_failure";
+    const bridge = await bridgeBusToAdapter({
+      adapter,
+      bus,
+      platform: "discord",
+      subscriptionId: "discord-adapter",
+      idleTimeoutMs: 10_000,
+    });
+
+    await bus.publish(
+      lilacEventTypes.EvtRequestReply,
+      {},
+      {
+        headers: {
+          request_id: requestId,
+          session_id: "chan",
+          request_client: "discord",
+        },
+      },
+    );
+    const acceptedResult = await bus.publish(
+      lilacEventTypes.EvtAgentOutputDeltaText,
+      { delta: "accepted" },
+      { headers: { request_id: requestId } },
+    );
+    if (acceptedResult.status === "error") throw acceptedResult.error;
+    const accepted = acceptedResult.value;
+    expect(bridge.snapshotRelays()[0]?.outCursor).toBe(accepted.cursor);
+
+    if (!adapter.stream) throw new Error("relay output stream was not started");
+    adapter.stream.nextPushFailure = new Error("forced output push failure");
+    const failedResult = await bus.publish(
+      lilacEventTypes.EvtAgentOutputDeltaText,
+      { delta: " rejected" },
+      { headers: { request_id: requestId } },
+    );
+    if (failedResult.status === "error") throw failedResult.error;
+    const failed = failedResult.value;
+
+    expect(deliveries.find((delivery) => delivery.cursor === failed.cursor)).toMatchObject({
+      disposition: "stop",
+      contextHasCommit: false,
+    });
+    expect(bridge.snapshotRelays()[0]?.outCursor).toBe(accepted.cursor);
+
+    await bridge.stop();
+  });
+
+  it("propagates a tail Panic instead of applying a delivery policy", async () => {
+    const bus = createLilacBus(createInMemoryRawBus());
+    const adapter = new FakeAdapter();
+    const requestId = "discord:chan:tail_panic";
+    const bridge = await bridgeBusToAdapter({
+      adapter,
+      bus,
+      platform: "discord",
+      subscriptionId: "discord-adapter",
+      idleTimeoutMs: 10_000,
+    });
+
+    await bus.publish(
+      lilacEventTypes.EvtRequestReply,
+      {},
+      {
+        headers: {
+          request_id: requestId,
+          session_id: "chan",
+          request_client: "discord",
+        },
+      },
+    );
+    if (!adapter.stream) throw new Error("relay output stream was not started");
+    const panic = new Panic({ message: "forced output invariant failure" });
+    adapter.stream.nextPushFailure = panic;
+
+    await expect(
+      bus.publish(
+        lilacEventTypes.EvtAgentOutputDeltaText,
+        { delta: "panic" },
+        { headers: { request_id: requestId } },
+      ),
+    ).rejects.toBe(panic);
+
+    await bridge.stop();
+  });
+
+  it("finishes terminal relay cleanup before rethrowing the original Panic", async () => {
+    const bus = createLilacBus(createInMemoryRawBus());
+    const adapter = new FakeAdapter();
+    const requestId = "discord:chan:terminal_cleanup_panic";
+    const bridge = await bridgeBusToAdapter({
+      adapter,
+      bus,
+      platform: "discord",
+      subscriptionId: "discord-adapter",
+      idleTimeoutMs: 10_000,
+    });
+
+    await bus.publish(
+      lilacEventTypes.EvtRequestReply,
+      {},
+      {
+        headers: {
+          request_id: requestId,
+          session_id: "chan",
+          request_client: "discord",
+        },
+      },
+    );
+    await bus.publish(
+      lilacEventTypes.EvtAgentOutputDeltaText,
+      { delta: "preview" },
+      { headers: { request_id: requestId } },
+    );
+    if (!adapter.stream) throw new Error("relay output stream was not started");
+    const panic = new Panic({ message: "forced abort invariant failure" });
+    adapter.stream.nextAbortFailure = panic;
+
+    await expect(
+      bus.publish(
+        lilacEventTypes.EvtAgentOutputResponseText,
+        { finalText: "ignored", delivery: "skip" },
+        { headers: { request_id: requestId } },
+      ),
+    ).rejects.toBe(panic);
+
+    expect(bridge.snapshotRelays()).toHaveLength(0);
+    expect(adapter.deletedMsgs.map((message) => message.messageId)).toEqual(["m_out_1"]);
+
     await bridge.stop();
   });
 
@@ -3149,6 +4912,10 @@ describe("bridgeBusToAdapter", () => {
     const staleRequestId = `github:${sessionId}:old`;
     const latestRequestId = `github:${sessionId}:new`;
     setGithubLatestRequestForSession(sessionId, latestRequestId);
+    setGithubAck(staleRequestId, {
+      target: { kind: "issue", issueNumber: 12 },
+      reactionId: 43,
+    });
 
     const bridge = await bridgeBusToAdapter({
       adapter,
@@ -3190,7 +4957,12 @@ describe("bridgeBusToAdapter", () => {
 
     expect(adapter.streams[0]?.aborted).toBe("superseded");
     expect(adapter.streams[0]?.finished).toBe(false);
+    expect(getGithubAck(staleRequestId)).toEqual({
+      target: { kind: "issue", issueNumber: 12 },
+      reactionId: 43,
+    });
 
+    clearGithubAck(staleRequestId);
     await bridge.stop();
   });
 });

@@ -1,19 +1,57 @@
 import type {
-  EffectiveSearchBackend,
+  BundledRemoteRunnerRequest,
   FileEdit,
   FsBackend,
-  FuzzySearchResult,
   HashlineEdit,
-  HashlineWarning,
   ReadFileStart,
+  RemoteFsRequest,
+  RemoteEditResponse as ProtocolRemoteEditResponse,
+  RemoteFuzzySearchResponse as ProtocolRemoteFuzzySearchResponse,
+  RemoteGlobResponse as ProtocolRemoteGlobResponse,
+  RemoteGrepResponse as ProtocolRemoteGrepResponse,
+  RemoteReadBytesResponse as ProtocolRemoteReadBytesResponse,
+  RemoteReadTextResponse as ProtocolRemoteReadTextResponse,
+  RemoteRunnerResponseDecodeError,
+} from "@stanley2058/lilac-fs";
+import {
+  decodeRemoteEditResponseJson,
+  decodeRemoteFuzzySearchResponseJson,
+  decodeRemoteGlobResponseJson,
+  decodeRemoteGrepResponseJson,
+  decodeRemoteReadBytesResponseJson,
+  decodeRemoteReadTextResponseJson,
 } from "@stanley2058/lilac-fs";
 import { createRequire } from "node:module";
 import path from "node:path";
 
-import { sshExecBash, sshExecScriptJson } from "../../ssh/ssh-exec";
-import { getRemoteRunnerJsText } from "../../ssh/remote-js";
+import { Result, TaggedError, type Result as ResultType } from "better-result";
+import { z } from "zod";
+
+import { projectRuntimeError } from "../../runtime/error-format";
+import {
+  SshExecutionAdapterError,
+  SshExecutionCancelledError,
+  SshExecutionOutputCappedError,
+  SshExecutionTimedOutError,
+  SshExecutionTransportError,
+  type SshJsonExecutionError,
+  SshSubprocessExitError,
+  serializeRemoteRunnerRequestJson,
+  sshExecBash,
+  sshExecScriptJson,
+} from "../../ssh/ssh-exec";
+import { getRemoteRunnerJsText, type RemoteRunnerSourceReadError } from "../../ssh/remote-js";
+import { adaptToolResultToHost, preserveToolPanic } from "../tool-result-adapters";
 
 const requirePackageJson = createRequire(import.meta.url);
+
+function selectResultValue<T, E extends Error>(result: ResultType<T, E>): T {
+  const select = result.match<() => T>({
+    ok: (value) => () => value,
+    err: (error) => () => adaptToolResultToHost(Result.err(error)),
+  });
+  return select();
+}
 
 export type RemoteReadTextInput = {
   path: string;
@@ -24,153 +62,19 @@ export type RemoteReadTextInput = {
   format?: "raw" | "numbered" | "hashline";
 };
 
-export type RemoteReadTextOutput =
-  | {
-      success: true;
-      resolvedPath: string;
-      fileHash: string;
-      startLine: number;
-      endLine: number;
-      totalLines: number;
-      hasMoreLines: boolean;
-      truncatedByChars: boolean;
-      nextStart?: ReadFileStart;
-      warnings?: HashlineWarning[];
-      degradedFromHashline?: boolean;
-      format: "raw";
-      content: string;
-    }
-  | {
-      success: true;
-      resolvedPath: string;
-      fileHash: string;
-      startLine: number;
-      endLine: number;
-      totalLines: number;
-      hasMoreLines: boolean;
-      truncatedByChars: boolean;
-      nextStart?: ReadFileStart;
-      warnings?: HashlineWarning[];
-      degradedFromHashline?: boolean;
-      format: "numbered";
-      numberedContent: string;
-    }
-  | {
-      success: true;
-      resolvedPath: string;
-      fileHash: string;
-      startLine: number;
-      endLine: number;
-      totalLines: number;
-      hasMoreLines: boolean;
-      truncatedByChars: boolean;
-      nextStart?: ReadFileStart;
-      warnings?: HashlineWarning[];
-      degradedFromHashline?: boolean;
-      format: "hashline";
-      hashlineContent: string;
-    }
-  | {
-      success: false;
-      resolvedPath: string;
-      error: {
-        code: "NOT_FOUND" | "PERMISSION" | "UNKNOWN";
-        message: string;
-      };
-    };
-
-export type RemoteReadBytesResult =
-  | {
-      ok: true;
-      resolvedPath: string;
-      fileHash: string;
-      bytesLength: number;
-      base64: string;
-    }
-  | {
-      ok: false;
-      resolvedPath?: string;
-      error: string;
-    };
-
-export type RemoteGlobEntry = {
-  path: string;
-  type:
-    | "symlink"
-    | "file"
-    | "directory"
-    | "socket"
-    | "block_device"
-    | "character_device"
-    | "fifo"
-    | "unknown";
-  size: number;
-};
-
-export type RemoteGlobOutput =
-  | {
-      mode: "default";
-      truncated: boolean;
-      paths: string[];
-      effectiveBackend?: EffectiveSearchBackend;
-      error?: string;
-    }
-  | {
-      mode: "detailed";
-      truncated: boolean;
-      entries: RemoteGlobEntry[];
-      effectiveBackend?: EffectiveSearchBackend;
-      error?: string;
-    };
-
-export type RemoteGrepMatch = {
-  file: string;
-  line: number;
-  column: number;
-  text: string;
-  submatches?: { match: string; start: number; end: number }[];
-};
-
-export type RemoteGrepOutput =
-  | {
-      mode: "default";
-      truncated: boolean;
-      warnings?: HashlineWarning[];
-      degradedFromHashline?: boolean;
-      effectiveBackend?: EffectiveSearchBackend;
-      results: {
-        file: string;
-        line: number;
-        text: string;
-      }[];
-      error?: string;
-    }
-  | {
-      mode: "detailed";
-      truncated: boolean;
-      warnings?: HashlineWarning[];
-      degradedFromHashline?: boolean;
-      effectiveBackend?: EffectiveSearchBackend;
-      results: RemoteGrepMatch[];
-      error?: string;
-    }
-  | {
-      mode: "hashline";
-      truncated: boolean;
-      warnings?: HashlineWarning[];
-      degradedFromHashline?: boolean;
-      effectiveBackend?: EffectiveSearchBackend;
-      results: {
-        file: string;
-        resolvedPath: string;
-        fileHash: string;
-        line: number;
-        text: string;
-      }[];
-      error?: string;
-    };
-
-export type RemoteFuzzySearchOutput = FuzzySearchResult;
+export type RemoteReadTextOutput = ProtocolRemoteReadTextResponse;
+export type RemoteReadBytesResult = ProtocolRemoteReadBytesResponse;
+export type RemoteGlobEntry = Extract<
+  ProtocolRemoteGlobResponse,
+  { mode: "detailed" }
+>["entries"][number];
+export type RemoteGlobOutput = ProtocolRemoteGlobResponse;
+export type RemoteGrepMatch = Extract<
+  ProtocolRemoteGrepResponse,
+  { mode: "detailed" }
+>["results"][number];
+export type RemoteGrepOutput = ProtocolRemoteGrepResponse;
+export type RemoteFuzzySearchOutput = ProtocolRemoteFuzzySearchResponse;
 
 export type RemoteEditInput =
   | {
@@ -186,58 +90,99 @@ export type RemoteEditInput =
       expectedHash?: string;
     };
 
-export type RemoteEditOutput =
-  | {
-      success: true;
-      resolvedPath: string;
-      oldHash: string;
-      newHash: string;
-      changesMade: boolean;
-      replacementsMade: number;
-    }
-  | {
-      success: false;
-      resolvedPath: string;
-      currentHash?: string;
-      error: {
-        code:
-          | "NOT_FOUND"
-          | "PERMISSION"
-          | "UNKNOWN"
-          | "NOT_READ"
-          | "HASH_MISMATCH"
-          | "INVALID_RANGE"
-          | "RANGE_MISMATCH"
-          | "NO_MATCHES"
-          | "TOO_MANY_MATCHES"
-          | "NOT_ENOUGH_MATCHES"
-          | "INVALID_REGEX"
-          | "INVALID_EDIT"
-          | "STALE_ANCHOR";
-        message: string;
-      };
-    };
+export type RemoteEditOutput = ProtocolRemoteEditResponse;
+export class RemoteFsRunnerSetupError extends TaggedError("RemoteFsRunnerSetupError")<{
+  readonly cause: unknown;
+  readonly message: string;
+}> {}
+
+export type RemoteFsExecutionError =
+  | SshJsonExecutionError
+  | RemoteRunnerResponseDecodeError
+  | RemoteRunnerSourceReadError
+  | RemoteFsRunnerSetupError;
 
 const DEFAULT_TIMEOUT_MS = 2 * 60 * 1000;
 const DEFAULT_MAX_OUTPUT_CHARS = 500_000;
+const remoteFsRunnerPackageSchema = z.object({
+  name: z.string().min(1),
+  version: z.string().min(1),
+});
 
-function readRemoteFsRunnerPackageSpec(): string {
-  const rawPackageJson = requirePackageJson(
-    "@stanley2058/lilac-remote-fs-runner/package.json",
-  ) as unknown;
-  if (!rawPackageJson || typeof rawPackageJson !== "object" || Array.isArray(rawPackageJson)) {
-    throw new Error("remote fs runner package.json must be an object");
-  }
+function toMutableHashlineLines(
+  lines: HashlineEdit["lines"],
+): string | string[] | null | undefined {
+  if (typeof lines === "string" || lines === null || lines === undefined) return lines;
+  return [...lines];
+}
 
-  const { name, version } = rawPackageJson as { name?: unknown; version?: unknown };
-  if (typeof name !== "string" || name.length === 0) {
-    throw new Error("remote fs runner package.json name must be a non-empty string");
+function toBundledRemoteEditRequest(
+  input: RemoteEditInput,
+  denyPaths: readonly string[],
+): Extract<BundledRemoteRunnerRequest, { op: "fs.edit" }> {
+  if (input.mode === "hashline") {
+    return {
+      op: "fs.edit",
+      denyPaths: [...denyPaths],
+      input: {
+        ...input,
+        edits: input.edits.map((edit) => ({
+          ...edit,
+          lines: toMutableHashlineLines(edit.lines),
+        })),
+      },
+    };
   }
-  if (typeof version !== "string" || version.length === 0) {
-    throw new Error("remote fs runner package.json version must be a non-empty string");
+  if (input.mode === "legacy") {
+    return {
+      op: "fs.edit",
+      denyPaths: [...denyPaths],
+      input: {
+        path: input.path,
+        edits: [...input.edits],
+        expectedHash: input.expectedHash,
+        mode: "legacy",
+      },
+    };
   }
+  return {
+    op: "fs.edit",
+    denyPaths: [...denyPaths],
+    input: {
+      path: input.path,
+      edits: [...input.edits],
+      expectedHash: input.expectedHash,
+    },
+  };
+}
 
-  return `${name}@${version}`;
+function decodeRemoteFsRunnerPackageSpec(): ResultType<string, RemoteFsRunnerSetupError> {
+  const loaded = Result.try({
+    try: (): unknown => requirePackageJson("@stanley2058/lilac-remote-fs-runner/package.json"),
+    catch: projectRuntimeError("Opaque remote fs runner setup failure"),
+  });
+  return loaded.match<() => ResultType<string, RemoteFsRunnerSetupError>>({
+    err: (error) => () => {
+      const cause = preserveToolPanic(error);
+      return Result.err(
+        new RemoteFsRunnerSetupError({
+          cause,
+          message: "remote fs runner package.json could not be loaded",
+        }),
+      );
+    },
+    ok: (value) => () => {
+      const packageJson = remoteFsRunnerPackageSchema.safeParse(value);
+      return packageJson.success
+        ? Result.ok(`${packageJson.data.name}@${packageJson.data.version}`)
+        : Result.err(
+            new RemoteFsRunnerSetupError({
+              cause: packageJson.error,
+              message: "remote fs runner package.json is invalid",
+            }),
+          );
+    },
+  })();
 }
 
 function shellSingleQuote(value: string): string {
@@ -257,49 +202,50 @@ function splitRemoteGrepTarget(cwd: string): {
   };
 }
 
-function parseJsonEnvelope<T>(
-  stdout: string,
-): { ok: true; value: T } | { ok: false; error: string } {
-  const stdoutTrim = stdout.trim();
-  try {
-    const parsed = JSON.parse(stdoutTrim) as unknown;
-    if (
-      parsed &&
-      typeof parsed === "object" &&
-      "ok" in parsed &&
-      (parsed as { ok?: unknown }).ok === true &&
-      "value" in parsed
-    ) {
-      return { ok: true, value: (parsed as { value: T }).value };
-    }
-    if (
-      parsed &&
-      typeof parsed === "object" &&
-      "ok" in parsed &&
-      (parsed as { ok?: unknown }).ok === false
-    ) {
-      const err =
-        (parsed as { error?: unknown }).error !== undefined
-          ? String((parsed as { error?: unknown }).error)
-          : "remote fs runner error";
-      return { ok: false, error: err };
-    }
-    return { ok: false, error: "remote fs runner returned unexpected JSON" };
-  } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e);
-    return { ok: false, error: `failed to parse remote fs runner JSON: ${msg}` };
+function buildRemoteFsRunnerCommand(): ResultType<string, RemoteFsRunnerSetupError> {
+  const override = process.env.LILAC_REMOTE_FS_RUNNER_COMMAND;
+  if (override && override.trim().length > 0) return Result.ok(override);
+
+  let packageSpecValue = process.env.LILAC_REMOTE_FS_RUNNER_PACKAGE;
+  if (!packageSpecValue) {
+    const decoded = decodeRemoteFsRunnerPackageSpec();
+    return decoded.map((value) => buildRemoteFsRunnerCommandForPackage(value));
   }
+  return Result.ok(buildRemoteFsRunnerCommandForPackage(packageSpecValue));
 }
 
-function buildRemoteFsRunnerCommand(): string {
-  const override = process.env.LILAC_REMOTE_FS_RUNNER_COMMAND;
-  if (override && override.trim().length > 0) return override;
-
-  const packageSpec = shellSingleQuote(
-    process.env.LILAC_REMOTE_FS_RUNNER_PACKAGE ?? readRemoteFsRunnerPackageSpec(),
-  );
+function buildRemoteFsRunnerCommandForPackage(packageSpecValue: string): string {
+  const packageSpec = shellSingleQuote(packageSpecValue);
   return `if command -v bunx >/dev/null 2>&1; then
-  bunx ${packageSpec} request
+  LILAC_RUNNER_CACHE_DIR="\${XDG_CACHE_HOME:-$HOME/.cache}/lilac/remote-fs-runner"
+  LILAC_BUNX_TMPDIR="$LILAC_RUNNER_CACHE_DIR/bunx"
+  LILAC_RUNNER_INSTALL_LOCK="$LILAC_RUNNER_CACHE_DIR/package-launch.lock"
+  mkdir -p "$LILAC_BUNX_TMPDIR"
+
+  run_lilac_bunx() {
+    TMPDIR="$LILAC_BUNX_TMPDIR" bunx "$@"
+  }
+
+  if command -v flock >/dev/null 2>&1; then
+    if ! run_lilac_bunx --no-install ${packageSpec} --version >/dev/null 2>&1; then
+      (
+        flock -x 9
+        if ! run_lilac_bunx --no-install ${packageSpec} --version >/dev/null 2>&1; then
+          run_lilac_bunx ${packageSpec} --version >/dev/null
+        fi
+      ) 9> "$LILAC_RUNNER_INSTALL_LOCK"
+    fi
+    run_lilac_bunx --no-install ${packageSpec} request
+  else
+    if command -v mktemp >/dev/null 2>&1; then
+      LILAC_BUNX_ISOLATED_TMPDIR=$(mktemp -d "\${TMPDIR:-/tmp}/lilac-bunx.XXXXXX")
+    else
+      LILAC_BUNX_ISOLATED_TMPDIR="\${TMPDIR:-/tmp}/lilac-bunx.$$.$RANDOM"
+      mkdir "$LILAC_BUNX_ISOLATED_TMPDIR"
+    fi
+    trap 'rm -rf "$LILAC_BUNX_ISOLATED_TMPDIR" >/dev/null 2>&1 || true' EXIT
+    TMPDIR="$LILAC_BUNX_ISOLATED_TMPDIR" bunx ${packageSpec} request
+  fi
 elif command -v npx >/dev/null 2>&1; then
   npx --no-workspaces -y ${packageSpec} request
 else
@@ -310,12 +256,20 @@ fi`;
 async function sshExecRemoteFsRunnerJson<T>(params: {
   host: string;
   cwd: string;
-  input: Record<string, unknown>;
+  input: RemoteFsRequest;
   timeoutMs: number;
   maxOutputChars: number;
-}): Promise<{ ok: true; value: T } | { ok: false; error: string }> {
-  const inputJson = JSON.stringify(params.input);
-  const runnerCommand = buildRemoteFsRunnerCommand();
+  signal?: AbortSignal;
+  decodeResponse: (text: string) => ResultType<T, RemoteRunnerResponseDecodeError>;
+}): Promise<ResultType<T, RemoteFsExecutionError>> {
+  const serializedInput = serializeRemoteRunnerRequestJson(params.input);
+  const serializationError = serializedInput.match({ ok: () => null, err: (error) => error });
+  if (serializationError) return Result.err(serializationError);
+  const inputJson = selectResultValue(serializedInput);
+  const runnerCommandResult = buildRemoteFsRunnerCommand();
+  const runnerCommandError = runnerCommandResult.match({ ok: () => null, err: (error) => error });
+  if (runnerCommandError) return Result.err(runnerCommandError);
+  const runnerCommand = selectResultValue(runnerCommandResult);
 
   const script = `#!/usr/bin/env bash
 set -euo pipefail
@@ -352,28 +306,64 @@ ${inputJson}
 __LILAC_INPUT__
 `;
 
-  const res = await sshExecBash({
-    host: params.host,
-    cmd: script,
-    timeoutMs: params.timeoutMs,
-    maxOutputChars: params.maxOutputChars,
+  const executed = await Result.tryPromise({
+    try: () =>
+      sshExecBash({
+        host: params.host,
+        cmd: script,
+        timeoutMs: params.timeoutMs,
+        signal: params.signal,
+        maxOutputChars: params.maxOutputChars,
+      }),
+    catch: projectRuntimeError("Opaque remote fs SSH adapter failure"),
   });
+  const executionError = executed.match({ ok: () => null, err: (error) => error });
+  if (executionError) {
+    const cause = preserveToolPanic(executionError);
+    return Result.err(
+      new SshExecutionAdapterError({
+        cause,
+        message: "remote fs runner SSH execution adapter failed",
+      }),
+    );
+  }
+  const res = selectResultValue(executed);
 
-  if (res.aborted) return { ok: false, error: "aborted" };
-  if (res.timedOut) return { ok: false, error: `timeout:${params.timeoutMs}` };
+  if (res.aborted) return Result.err(new SshExecutionCancelledError({ message: "aborted" }));
+  if (res.timedOut) {
+    return Result.err(
+      new SshExecutionTimedOutError({
+        timeoutMs: params.timeoutMs,
+        message: `timeout:${params.timeoutMs}`,
+      }),
+    );
+  }
   if (res.capped.stdout || res.capped.stderr) {
-    return { ok: false, error: "remote fs runner output capped (response too large)" };
+    return Result.err(
+      new SshExecutionOutputCappedError({
+        message: "remote fs runner output capped (response too large)",
+      }),
+    );
+  }
+  if (res.transportError) {
+    return Result.err(
+      new SshExecutionTransportError({
+        transportType: res.transportError.type,
+        message: res.transportError.message,
+      }),
+    );
   }
   if (res.exitCode !== 0) {
     const detail = res.stderr.trim().length > 0 ? `: ${res.stderr.trim()}` : "";
-    return { ok: false, error: `remote fs runner exited with code ${res.exitCode}${detail}` };
+    return Result.err(
+      new SshSubprocessExitError({
+        exitCode: res.exitCode,
+        stderr: res.stderr,
+        message: `remote fs runner exited with code ${res.exitCode}${detail}`,
+      }),
+    );
   }
-
-  const parsed = parseJsonEnvelope<T>(res.stdout);
-  if (!parsed.ok && res.stderr.trim().length > 0) {
-    return { ok: false, error: `${parsed.error}\n${res.stderr.trim()}` };
-  }
-  return parsed;
+  return params.decodeResponse(res.stdout.trim());
 }
 
 export async function remoteReadTextFile(params: {
@@ -382,30 +372,25 @@ export async function remoteReadTextFile(params: {
   input: RemoteReadTextInput;
   denyPaths: readonly string[];
   timeoutMs?: number;
-}): Promise<RemoteReadTextOutput> {
-  const js = await getRemoteRunnerJsText();
-  const res = await sshExecScriptJson<RemoteReadTextOutput>({
+  signal?: AbortSignal;
+}): Promise<ResultType<RemoteReadTextOutput, RemoteFsExecutionError>> {
+  const source = await getRemoteRunnerJsText();
+  const sourceError = source.match({ ok: () => null, err: (error) => error });
+  if (sourceError) return Result.err(sourceError);
+  return await sshExecScriptJson({
     host: params.host,
     cwd: params.cwd,
-    js,
+    js: selectResultValue(source),
     input: {
       op: "fs.read_text",
-      denyPaths: params.denyPaths,
+      denyPaths: [...params.denyPaths],
       input: params.input,
     },
     timeoutMs: params.timeoutMs ?? DEFAULT_TIMEOUT_MS,
+    signal: params.signal,
     maxOutputChars: DEFAULT_MAX_OUTPUT_CHARS,
+    decodeResponse: decodeRemoteReadTextResponseJson,
   });
-
-  if (!res.ok) {
-    return {
-      success: false,
-      resolvedPath: params.input.path,
-      error: { code: "UNKNOWN", message: res.error },
-    };
-  }
-
-  return res.value;
 }
 
 export async function remoteReadFileBytes(params: {
@@ -415,29 +400,28 @@ export async function remoteReadFileBytes(params: {
   denyPaths: readonly string[];
   maxBytes: number;
   timeoutMs?: number;
-}): Promise<RemoteReadBytesResult> {
+  signal?: AbortSignal;
+}): Promise<ResultType<RemoteReadBytesResult, RemoteFsExecutionError>> {
   // Base64 output can be large (1.33x bytes). Keep a generous cap.
   const maxOutputChars = Math.max(500_000, Math.ceil(params.maxBytes * 1.5) + 10_000);
 
-  const js = await getRemoteRunnerJsText();
-  const res = await sshExecScriptJson<RemoteReadBytesResult>({
+  const source = await getRemoteRunnerJsText();
+  const sourceError = source.match({ ok: () => null, err: (error) => error });
+  if (sourceError) return Result.err(sourceError);
+  return await sshExecScriptJson({
     host: params.host,
     cwd: params.cwd,
-    js,
+    js: selectResultValue(source),
     input: {
       op: "fs.read_bytes",
-      denyPaths: params.denyPaths,
+      denyPaths: [...params.denyPaths],
       input: { path: params.filePath, maxBytes: params.maxBytes },
     },
     timeoutMs: params.timeoutMs ?? DEFAULT_TIMEOUT_MS,
+    signal: params.signal,
     maxOutputChars,
+    decodeResponse: decodeRemoteReadBytesResponseJson,
   });
-
-  if (!res.ok) {
-    return { ok: false, error: res.error };
-  }
-
-  return res.value;
 }
 
 export async function remoteGlob(params: {
@@ -449,47 +433,46 @@ export async function remoteGlob(params: {
   denyPaths: readonly string[];
   fsBackend?: FsBackend;
   timeoutMs?: number;
-}): Promise<RemoteGlobOutput> {
+  signal?: AbortSignal;
+}): Promise<ResultType<RemoteGlobOutput, RemoteFsExecutionError>> {
   const mode = params.mode ?? "default";
-  const input = {
+  const input: RemoteFsRequest = {
     op: "fs.glob",
-    denyPaths: params.denyPaths,
+    denyPaths: [...params.denyPaths],
     input: {
-      patterns: params.patterns,
+      patterns: [...params.patterns],
       maxEntries: params.maxEntries,
       mode,
     },
   };
 
   if (params.fsBackend === "fff") {
-    const runnerRes = await sshExecRemoteFsRunnerJson<RemoteGlobOutput>({
+    const runnerRes = await sshExecRemoteFsRunnerJson({
       host: params.host,
       cwd: params.cwd,
       input,
       timeoutMs: params.timeoutMs ?? DEFAULT_TIMEOUT_MS,
       maxOutputChars: DEFAULT_MAX_OUTPUT_CHARS,
+      signal: params.signal,
+      decodeResponse: decodeRemoteGlobResponseJson,
     });
-    if (runnerRes.ok) return runnerRes.value;
+    const runnerError = runnerRes.match({ ok: () => null, err: (error) => error });
+    if (!runnerError || runnerError._tag === "SshExecutionCancelledError") return runnerRes;
   }
 
-  const js = await getRemoteRunnerJsText();
-  const res = await sshExecScriptJson<RemoteGlobOutput>({
+  const source = await getRemoteRunnerJsText();
+  const sourceError = source.match({ ok: () => null, err: (error) => error });
+  if (sourceError) return Result.err(sourceError);
+  return await sshExecScriptJson({
     host: params.host,
     cwd: params.cwd,
-    js,
+    js: selectResultValue(source),
     input,
     timeoutMs: params.timeoutMs ?? DEFAULT_TIMEOUT_MS,
+    signal: params.signal,
     maxOutputChars: DEFAULT_MAX_OUTPUT_CHARS,
+    decodeResponse: decodeRemoteGlobResponseJson,
   });
-
-  if (!res.ok) {
-    if (mode === "default") {
-      return { mode, truncated: false, paths: [], error: res.error };
-    }
-    return { mode, truncated: false, entries: [], error: res.error };
-  }
-
-  return res.value;
 }
 
 export async function remoteGrep(params: {
@@ -506,17 +489,18 @@ export async function remoteGrep(params: {
   denyPaths: readonly string[];
   fsBackend?: FsBackend;
   timeoutMs?: number;
-}): Promise<RemoteGrepOutput> {
+  signal?: AbortSignal;
+}): Promise<ResultType<RemoteGrepOutput, RemoteFsExecutionError>> {
   const mode = params.input.mode ?? "default";
   const target = splitRemoteGrepTarget(params.cwd);
-  const input = {
+  const input: RemoteFsRequest = {
     op: "fs.grep",
-    denyPaths: params.denyPaths,
+    denyPaths: [...params.denyPaths],
     input: {
       pattern: params.input.pattern,
       regex: params.input.regex,
       maxResults: params.input.maxResults,
-      fileExtensions: params.input.fileExtensions,
+      fileExtensions: params.input.fileExtensions ? [...params.input.fileExtensions] : undefined,
       includeContextLines: params.input.includeContextLines,
       mode,
       baseDir: target.baseDir,
@@ -525,37 +509,32 @@ export async function remoteGrep(params: {
   };
 
   if (params.fsBackend === "fff") {
-    const runnerRes = await sshExecRemoteFsRunnerJson<RemoteGrepOutput>({
+    const runnerRes = await sshExecRemoteFsRunnerJson({
       host: params.host,
       cwd: target.launchCwd,
       input,
       timeoutMs: params.timeoutMs ?? DEFAULT_TIMEOUT_MS,
       maxOutputChars: DEFAULT_MAX_OUTPUT_CHARS,
+      signal: params.signal,
+      decodeResponse: decodeRemoteGrepResponseJson,
     });
-    if (runnerRes.ok) return runnerRes.value;
+    const runnerError = runnerRes.match({ ok: () => null, err: (error) => error });
+    if (!runnerError || runnerError._tag === "SshExecutionCancelledError") return runnerRes;
   }
 
-  const js = await getRemoteRunnerJsText();
-  const res = await sshExecScriptJson<RemoteGrepOutput>({
+  const source = await getRemoteRunnerJsText();
+  const sourceError = source.match({ ok: () => null, err: (error) => error });
+  if (sourceError) return Result.err(sourceError);
+  return await sshExecScriptJson({
     host: params.host,
     cwd: target.launchCwd,
-    js,
+    js: selectResultValue(source),
     input,
     timeoutMs: params.timeoutMs ?? DEFAULT_TIMEOUT_MS,
+    signal: params.signal,
     maxOutputChars: DEFAULT_MAX_OUTPUT_CHARS,
+    decodeResponse: decodeRemoteGrepResponseJson,
   });
-
-  if (!res.ok) {
-    if (mode === "default") {
-      return { mode, truncated: false, results: [], error: res.error };
-    }
-    if (mode === "hashline") {
-      return { mode, truncated: false, results: [], error: res.error };
-    }
-    return { mode, truncated: false, results: [], error: res.error };
-  }
-
-  return res.value;
 }
 
 export async function remoteFuzzySearch(params: {
@@ -567,32 +546,27 @@ export async function remoteFuzzySearch(params: {
   };
   denyPaths: readonly string[];
   timeoutMs?: number;
-}): Promise<RemoteFuzzySearchOutput> {
-  const input = {
+  signal?: AbortSignal;
+}): Promise<ResultType<RemoteFuzzySearchOutput, RemoteFsExecutionError>> {
+  const input: RemoteFsRequest = {
     op: "fs.fuzzy_search",
-    denyPaths: params.denyPaths,
+    denyPaths: [...params.denyPaths],
     input: {
       query: params.input.query,
       maxResults: params.input.maxResults,
     },
   };
 
-  const runnerRes = await sshExecRemoteFsRunnerJson<RemoteFuzzySearchOutput>({
+  const runnerRes = await sshExecRemoteFsRunnerJson({
     host: params.host,
     cwd: params.cwd,
     input,
     timeoutMs: params.timeoutMs ?? DEFAULT_TIMEOUT_MS,
     maxOutputChars: DEFAULT_MAX_OUTPUT_CHARS,
+    signal: params.signal,
+    decodeResponse: decodeRemoteFuzzySearchResponseJson,
   });
-  if (runnerRes.ok) return runnerRes.value;
-
-  return {
-    results: [],
-    totalMatched: 0,
-    totalFiles: 0,
-    truncated: false,
-    error: `remote fff fuzzy_search unavailable: ${runnerRes.error}`,
-  };
+  return runnerRes;
 }
 
 export async function remoteEditFile(params: {
@@ -601,34 +575,26 @@ export async function remoteEditFile(params: {
   input: RemoteEditInput;
   denyPaths: readonly string[];
   timeoutMs?: number;
-}): Promise<RemoteEditOutput> {
-  const js = await getRemoteRunnerJsText();
-  const res = await sshExecScriptJson<RemoteEditOutput>({
+  signal?: AbortSignal;
+}): Promise<ResultType<RemoteEditOutput, RemoteFsExecutionError>> {
+  const source = await getRemoteRunnerJsText();
+  const sourceError = source.match({ ok: () => null, err: (error) => error });
+  if (sourceError) return Result.err(sourceError);
+  return await sshExecScriptJson({
     host: params.host,
     cwd: params.cwd,
-    js,
-    input: {
-      op: "fs.edit",
-      denyPaths: params.denyPaths,
-      input: params.input,
-    },
+    js: selectResultValue(source),
+    input: toBundledRemoteEditRequest(params.input, params.denyPaths),
     timeoutMs: params.timeoutMs ?? DEFAULT_TIMEOUT_MS,
+    signal: params.signal,
     maxOutputChars: DEFAULT_MAX_OUTPUT_CHARS,
+    decodeResponse: decodeRemoteEditResponseJson,
   });
-
-  if (!res.ok) {
-    return {
-      success: false,
-      resolvedPath: params.input.path,
-      error: { code: "UNKNOWN", message: res.error },
-    };
-  }
-
-  return res.value;
 }
 
 // For unit tests and future callsites.
 export function toRemoteDebugPath(host: string, resolvedPath: string): string {
+  if (resolvedPath.startsWith("ssh://")) return resolvedPath;
   const p = resolvedPath.startsWith("/") ? resolvedPath : `/${resolvedPath}`;
   return `ssh://${host}${p}`;
 }

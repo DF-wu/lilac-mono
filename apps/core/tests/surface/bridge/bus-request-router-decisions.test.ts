@@ -1,6 +1,6 @@
 import { describe, expect, it } from "bun:test";
 
-import { decideActiveRequestRoute } from "../../../src/surface/bridge/bus-request-router/decisions";
+import { decideActiveRequestRoute } from "../../../src/surface/discord/discord-request-router/decisions";
 
 const botNames = ["lilac"];
 

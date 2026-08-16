@@ -1,6 +1,11 @@
 import { RuleTester } from "oxlint/plugins-dev";
 
 import { noFixedTestWaitRule } from "./test-waits.mts";
+import {
+  noExceptionFlowRule,
+  noInlineAsyncResultCallbackRule,
+  noLocalIsRecordRule,
+} from "./production-syntax.mts";
 
 const ruleTester = new RuleTester({
   languageOptions: { sourceType: "module" },
@@ -15,6 +20,46 @@ ruleTester.run("lilac/no-fixed-test-wait", noFixedTestWaitRule, {
     {
       code: "await Bun.sleep(5);",
       errors: [{ message: /fixed Bun\.sleep progression delay/u, line: 1, column: 6 }],
+    },
+  ],
+});
+
+const productionFile = "apps/example/src/example.ts";
+
+ruleTester.run("lilac/no-exception-flow", noExceptionFlowRule, {
+  valid: [{ code: "try { operation(); } finally { cleanup(); }", filename: productionFile }],
+  invalid: [
+    {
+      code: "function run() { throw new Error('bad'); }",
+      filename: productionFile,
+      errors: [{ message: /Return a typed Result error/u, line: 1, column: 17 }],
+    },
+  ],
+});
+
+ruleTester.run("lilac/no-local-is-record", noLocalIsRecordRule, {
+  valid: [
+    {
+      code: 'export function isRecord(value: unknown) { return typeof value === "object" && value !== null && !Array.isArray(value); }',
+      filename: "packages/utils/runtime-utils.ts",
+    },
+  ],
+  invalid: [
+    {
+      code: 'function asRecord(value: unknown) { return typeof value === "object" && value !== null && !Array.isArray(value); }',
+      filename: productionFile,
+      errors: [{ message: /Import the canonical isRecord utility/u, line: 1, column: 0 }],
+    },
+  ],
+});
+
+ruleTester.run("lilac/no-inline-async-result-callback", noInlineAsyncResultCallbackRule, {
+  valid: [{ code: "values.map(async (value) => value);", filename: productionFile }],
+  invalid: [
+    {
+      code: 'import { Result } from "better-result"; Result.andThenAsync(async (value) => Result.ok(value));',
+      filename: productionFile,
+      errors: [{ message: /named Result-returning adapter/u, line: 1, column: 60 }],
     },
   ],
 });

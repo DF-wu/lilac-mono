@@ -53,7 +53,7 @@ export function bashTool() {
   return {
     bash: tool({
       description:
-        "Execute command in bash. Commands are terminated after 3 minutes without stdout or stderr; timeoutMs optionally adds an independent wall-clock deadline. Safety guardrails may block destructive commands unless dangerouslyAllow=true. When output is truncated, use read_file with truncation.artifactUri to inspect the complete transient result.",
+        "Execute command in bash. Commands are terminated after 3 minutes without stdout or stderr; timeoutMs optionally adds an independent wall-clock deadline. Safety guardrails may block destructive commands unless dangerouslyAllow=true. When output is truncated, use read with truncation.artifactUri to inspect the complete transient result.",
       inputSchema: bashInputSchema,
       outputSchema: bashOutputSchema,
       execute: (input, { context, abortSignal, toolCallId }) =>
@@ -66,6 +66,7 @@ export function bashTool() {
             requestId: string;
             sessionId: string;
             requestClient: string;
+            currentTurnUserId?: string;
           };
           abortSignal?: AbortSignal;
           toolCallId?: string;
@@ -87,7 +88,7 @@ export function bashToolWithCwd(
   return {
     bash: tool({
       description:
-        "Execute command in bash. Commands are terminated after 3 minutes without stdout or stderr; timeoutMs optionally adds an independent wall-clock deadline. Safety guardrails may block destructive commands unless dangerouslyAllow=true. When output is truncated, use read_file with truncation.artifactUri to inspect the complete transient result.",
+        "Execute command in bash. Commands are terminated after 3 minutes without stdout or stderr; timeoutMs optionally adds an independent wall-clock deadline. Safety guardrails may block destructive commands unless dangerouslyAllow=true. When output is truncated, use read with truncation.artifactUri to inspect the complete transient result.",
       inputSchema: bashInputSchema,
       outputSchema: bashOutputSchema,
       execute: (input, { context, abortSignal, toolCallId }) => {
@@ -97,11 +98,15 @@ export function bashToolWithCwd(
               sessionId?: string;
               requestClient?: string;
               safetyMode?: "trusted" | "restricted";
+              currentTurnUserId?: string;
             }
           | undefined;
         const suppliedCwd = "cwd" in input && typeof input.cwd === "string" ? input.cwd : undefined;
         const payload = { ...input, cwd: suppliedCwd ?? defaultCwd };
-        if (typedContext?.safetyMode === "restricted") {
+        if (
+          typedContext?.safetyMode === "restricted" ||
+          opts?.nativeProfile?.execution === "restricted"
+        ) {
           return executeRestrictedBash(payload, {
             workspaceRoot: defaultCwd,
             context: {
@@ -130,6 +135,7 @@ export function bashToolWithCwd(
             requestId: string;
             sessionId: string;
             requestClient: string;
+            currentTurnUserId?: string;
           };
           abortSignal?: AbortSignal;
           toolCallId?: string;

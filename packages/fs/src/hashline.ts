@@ -1,5 +1,7 @@
 import { createHash } from "node:crypto";
 
+import { Result, TaggedError, type Result as ResultType } from "better-result";
+
 export const HASHLINE_MAX_LINE_CHARS = 2_048;
 export const HASHLINE_ID_LENGTH = 4;
 
@@ -44,6 +46,23 @@ type NormalizedHashlineEdit =
       lines: string[];
       originalIndex: number;
     };
+
+export class HashlineEditFailed extends TaggedError("HashlineEditFailed")<{
+  readonly code: "INVALID_EDIT" | "STALE_ANCHOR";
+  readonly message: string;
+}> {}
+
+export type AppliedHashlineEdits = {
+  readonly content: string;
+  readonly appliedEditCount: number;
+};
+
+function hashlineEditFailure(
+  code: "INVALID_EDIT" | "STALE_ANCHOR",
+  message: string,
+): ResultType<never, HashlineEditFailed> {
+  return Result.err(new HashlineEditFailed({ code, message }));
+}
 
 function hashlinePrefixPattern() {
   return new RegExp(`^(\\d+)#([0-9a-f]{${HASHLINE_ID_LENGTH}}):(.*)$`, "i");
@@ -137,74 +156,86 @@ function formatNearbyAnchors(lines: readonly string[], targetLine: number): stri
   return window.join("\n");
 }
 
-function validateHashlineRef(lines: readonly string[], ref: HashlineRef): number {
+function validateHashlineRef(
+  lines: readonly string[],
+  ref: HashlineRef,
+): ResultType<number, HashlineEditFailed> {
   const actual = lines[ref.line - 1];
   if (actual === undefined) {
-    throw Object.assign(
-      new Error(`Stale anchor ${ref.raw}: file now has only ${lines.length} lines.`),
-      { code: "STALE_ANCHOR" },
+    return hashlineEditFailure(
+      "STALE_ANCHOR",
+      `Stale anchor ${ref.raw}: file now has only ${lines.length} lines.`,
     );
   }
 
   const actualHash = computeHashlineId(ref.line, actual);
   if (actualHash !== ref.hash) {
-    throw Object.assign(
-      new Error(
-        `Stale anchor ${ref.raw}. Re-read the file and use the current anchors.\n${formatNearbyAnchors(lines, ref.line)}`,
-      ),
-      { code: "STALE_ANCHOR" },
+    return hashlineEditFailure(
+      "STALE_ANCHOR",
+      `Stale anchor ${ref.raw}. Re-read the file and use the current anchors.\n${formatNearbyAnchors(lines, ref.line)}`,
     );
   }
 
-  return ref.line;
+  return Result.ok(ref.line);
 }
 
 function normalizeEdit(
   edit: HashlineEdit,
   lines: readonly string[],
   originalIndex: number,
-): NormalizedHashlineEdit {
+): ResultType<NormalizedHashlineEdit, HashlineEditFailed> {
   const pos = parseHashlineRef(edit.pos);
   if (!pos) {
-    throw Object.assign(new Error(`Invalid hashline anchor: ${edit.pos}`), {
-      code: "INVALID_EDIT",
-    });
+    return hashlineEditFailure("INVALID_EDIT", `Invalid hashline anchor: ${edit.pos}`);
   }
-  const posLine = validateHashlineRef(lines, pos);
+  const validatedPos = validateHashlineRef(lines, pos).match<
+    { value: number } | { error: HashlineEditFailed }
+  >({
+    ok: (value) => ({ value }),
+    err: (error) => ({ error }),
+  });
+  if ("error" in validatedPos) return Result.err(validatedPos.error);
+  const posLine = validatedPos.value;
 
   if (edit.op === "replace") {
-    const endLine = (() => {
-      if (!edit.end) return posLine;
+    let endLine = posLine;
+    if (edit.end) {
       const end = parseHashlineRef(edit.end);
       if (!end) {
-        throw Object.assign(new Error(`Invalid hashline anchor: ${edit.end}`), {
-          code: "INVALID_EDIT",
-        });
+        return hashlineEditFailure("INVALID_EDIT", `Invalid hashline anchor: ${edit.end}`);
       }
-      return validateHashlineRef(lines, end);
-    })();
-
-    if (endLine < posLine) {
-      throw Object.assign(new Error(`Invalid hashline range ${edit.pos} -> ${edit.end}`), {
-        code: "INVALID_EDIT",
+      const validatedEnd = validateHashlineRef(lines, end).match<
+        { value: number } | { error: HashlineEditFailed }
+      >({
+        ok: (value) => ({ value }),
+        err: (error) => ({ error }),
       });
+      if ("error" in validatedEnd) return Result.err(validatedEnd.error);
+      endLine = validatedEnd.value;
     }
 
-    return {
+    if (endLine < posLine) {
+      return hashlineEditFailure(
+        "INVALID_EDIT",
+        `Invalid hashline range ${edit.pos} -> ${edit.end}`,
+      );
+    }
+
+    return Result.ok({
       kind: "replace",
       startLine: posLine,
       endLine,
       lines: normalizeReplacementLines(edit.lines),
       originalIndex,
-    };
+    } satisfies NormalizedHashlineEdit);
   }
 
-  return {
+  return Result.ok({
     kind: edit.op,
     line: posLine,
     lines: normalizeReplacementLines(edit.lines),
     originalIndex,
-  };
+  } satisfies NormalizedHashlineEdit);
 }
 
 function editsOverlap(a: NormalizedHashlineEdit, b: NormalizedHashlineEdit): boolean {
@@ -235,20 +266,21 @@ function editsOverlap(a: NormalizedHashlineEdit, b: NormalizedHashlineEdit): boo
   return false;
 }
 
-function validateNoOverlaps(edits: readonly NormalizedHashlineEdit[]): void {
+function validateNoOverlaps(
+  edits: readonly NormalizedHashlineEdit[],
+): ResultType<void, HashlineEditFailed> {
   for (let i = 0; i < edits.length; i++) {
     for (let j = i + 1; j < edits.length; j++) {
       const left = edits[i]!;
       const right = edits[j]!;
       if (!editsOverlap(left, right)) continue;
-      throw Object.assign(
-        new Error(
-          `Overlapping hashline edits are not supported (edits ${left.originalIndex + 1} and ${right.originalIndex + 1}).`,
-        ),
-        { code: "INVALID_EDIT" },
+      return hashlineEditFailure(
+        "INVALID_EDIT",
+        `Overlapping hashline edits are not supported (edits ${left.originalIndex + 1} and ${right.originalIndex + 1}).`,
       );
     }
   }
+  return Result.ok(undefined);
 }
 
 function precedence(edit: NormalizedHashlineEdit): number {
@@ -261,14 +293,32 @@ function anchorLine(edit: NormalizedHashlineEdit): number {
   return edit.kind === "replace" ? edit.startLine : edit.line;
 }
 
-export function applyHashlineEdits(params: { content: string; edits: readonly HashlineEdit[] }): {
+export function applyHashlineEdits(params: {
   content: string;
-  appliedEditCount: number;
-} {
+  edits: readonly HashlineEdit[];
+}): ResultType<AppliedHashlineEdits, HashlineEditFailed> {
   const originalLines = params.content.split("\n");
-  const normalized = params.edits.map((edit, index) => normalizeEdit(edit, originalLines, index));
+  const normalized: NormalizedHashlineEdit[] = [];
+  for (let index = 0; index < params.edits.length; index++) {
+    const edit = params.edits[index];
+    if (!edit) continue;
+    const decoded = normalizeEdit(edit, originalLines, index).match<
+      { value: NormalizedHashlineEdit } | { error: HashlineEditFailed }
+    >({
+      ok: (value) => ({ value }),
+      err: (error) => ({ error }),
+    });
+    if ("error" in decoded) return Result.err(decoded.error);
+    normalized.push(decoded.value);
+  }
 
-  validateNoOverlaps(normalized);
+  const overlaps = validateNoOverlaps(normalized).match<
+    { value: void } | { error: HashlineEditFailed }
+  >({
+    ok: (value) => ({ value }),
+    err: (error) => ({ error }),
+  });
+  if ("error" in overlaps) return Result.err(overlaps.error);
 
   const nextLines = [...originalLines];
   const sorted = [...normalized].sort((a, b) => {
@@ -291,8 +341,8 @@ export function applyHashlineEdits(params: { content: string; edits: readonly Ha
     nextLines.splice(edit.line - 1, 0, ...edit.lines);
   }
 
-  return {
+  return Result.ok({
     content: nextLines.join("\n"),
     appliedEditCount: normalized.length,
-  };
+  });
 }

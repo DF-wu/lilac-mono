@@ -1,9 +1,6 @@
-export type GithubRepoRef = {
+export type GithubThreadRef = {
   owner: string;
   repo: string;
-};
-
-export type GithubThreadRef = GithubRepoRef & {
   number: number;
 };
 
@@ -60,8 +57,4 @@ export function githubMessageUrl(input: {
   }
 
   return `${threadUrl}#issuecomment-${encodeURIComponent(input.messageId)}`;
-}
-
-export function repoFullName(ref: GithubRepoRef): string {
-  return `${ref.owner}/${ref.repo}`;
 }

@@ -25,7 +25,7 @@ describe("binding preferences", () => {
     const directory = await mkdtemp(path.join(tmpdir(), "mini-lilac-preferences-"));
     temporaryDirectories.push(directory);
     const filePath = path.join(directory, "nested", "preferences.json");
-    await saveBindingPreferences(filePath, {
+    const saved = await saveBindingPreferences(filePath, {
       version: 1,
       servers: {
         "http://server-a/api": {
@@ -35,17 +35,25 @@ describe("binding preferences", () => {
         },
       },
     });
+    expect(saved.status).toBe("ok");
 
-    expect(await loadBindingPreferences(filePath)).toEqual({
-      version: 1,
-      servers: {
-        "http://server-a/api": {
-          model: "openai/gpt-test",
-          profile: "coding",
-          reasoning: "high",
+    const loaded = await loadBindingPreferences(filePath);
+    expect(loaded.status).toBe("ok");
+    if (loaded.status === "ok") {
+      expect(loaded.value).toEqual({
+        provenance: "current",
+        preferences: {
+          version: 1,
+          servers: {
+            "http://server-a/api": {
+              model: "openai/gpt-test",
+              profile: "coding",
+              reasoning: "high",
+            },
+          },
         },
-      },
-    });
+      });
+    }
   });
 
   it("uses XDG_STATE_HOME and treats a missing file as empty", async () => {
@@ -54,7 +62,14 @@ describe("binding preferences", () => {
     const filePath = bindingPreferencesPath({ XDG_STATE_HOME: directory });
 
     expect(filePath).toBe(path.join(directory, "mini-lilac", "preferences.json"));
-    expect(await loadBindingPreferences(filePath)).toEqual({ version: 1, servers: {} });
+    const loaded = await loadBindingPreferences(filePath);
+    expect(loaded.status).toBe("ok");
+    if (loaded.status === "ok") {
+      expect(loaded.value).toEqual({
+        provenance: "missing-defaulted",
+        preferences: { version: 1, servers: {} },
+      });
+    }
   });
 
   it("uses one preference key for equivalent trailing-slash URLs", () => {

@@ -2,6 +2,8 @@ import { realpathSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { normalize, resolve } from "node:path";
 
+import { Panic, Result, TaggedError, type Result as ResultType } from "better-result";
+
 import { hasRecursiveForceFlags } from "./analyze/rm-flags";
 
 const REASON_RM_RF =
@@ -32,6 +34,36 @@ type TargetClassification =
   | { kind: "within_anchored_cwd" }
   | { kind: "outside_anchored_cwd" }
   | { kind: "unknown" };
+
+class RmPathResolutionFailed extends TaggedError("RmPathResolutionFailed")<{
+  readonly cwd: string;
+  readonly target: string;
+  readonly cause: unknown;
+  readonly message: string;
+}> {}
+
+interface ResolvedRmPaths {
+  readonly cwd: string;
+  readonly target: string;
+}
+
+function resolveRmPaths(
+  cwd: string,
+  target: string,
+): ResultType<ResolvedRmPaths, RmPathResolutionFailed> {
+  return Result.try({
+    try: () => ({ cwd: realpathSync(cwd), target: realpathSync(resolve(cwd, target)) }),
+    catch: (cause) => {
+      if (Panic.is(cause)) throw cause;
+      return new RmPathResolutionFailed({
+        cwd,
+        target,
+        cause,
+        message: "rm target paths could not be resolved",
+      });
+    },
+  });
+}
 
 export function analyzeRm(tokens: string[], options: AnalyzeRmOptions = {}): string | null {
   const {
@@ -215,13 +247,9 @@ function getHomeDirForRmPolicy(): string {
 }
 
 function isCwdHomeForRmPolicy(cwd: string, homeDir: string): boolean {
-  try {
-    const normalizedCwd = normalize(cwd);
-    const normalizedHome = normalize(homeDir);
-    return normalizedCwd === normalizedHome;
-  } catch {
-    return false;
-  }
+  const normalizedCwd = normalize(cwd);
+  const normalizedHome = normalize(homeDir);
+  return normalizedCwd === normalizedHome;
 }
 
 function isCwdSelfTarget(target: string, cwd: string): boolean {
@@ -229,22 +257,16 @@ function isCwdSelfTarget(target: string, cwd: string): boolean {
     return true;
   }
 
-  try {
-    const resolved = resolve(cwd, target);
-    const realCwd = realpathSync(cwd);
-    const realResolved = realpathSync(resolved);
-    return realResolved === realCwd;
-  } catch {
-    // realpathSync throws if the path doesn't exist; fall back to a
-    // normalize/resolve based comparison.
-    try {
+  const resolvedPaths = resolveRmPaths(cwd, target);
+  return resolvedPaths.match({
+    ok: (paths) => paths.target === paths.cwd,
+    err: () => {
+      // Missing paths cannot be canonicalized, so preserve the lexical fallback.
       const resolved = resolve(cwd, target);
       const normalizedCwd = normalize(cwd);
       return resolved === normalizedCwd;
-    } catch {
-      return false;
-    }
-  }
+    },
+  });
 }
 
 function isTargetWithinCwd(target: string, originalCwd: string, effectiveCwd?: string): boolean {
@@ -259,46 +281,29 @@ function isTargetWithinCwd(target: string, originalCwd: string, effectiveCwd?: s
   }
 
   if (target.startsWith("/")) {
-    try {
-      const normalizedTarget = normalize(target);
-      const normalizedCwd = `${normalize(originalCwd)}/`;
-      return normalizedTarget.startsWith(normalizedCwd);
-    } catch {
-      return false;
-    }
+    const normalizedTarget = normalize(target);
+    const normalizedCwd = `${normalize(originalCwd)}/`;
+    return normalizedTarget.startsWith(normalizedCwd);
   }
 
   if (target.startsWith("./") || !target.includes("/")) {
-    try {
-      const resolved = resolve(resolveCwd, target);
-      const normalizedOriginalCwd = normalize(originalCwd);
-      return resolved.startsWith(`${normalizedOriginalCwd}/`) || resolved === normalizedOriginalCwd;
-    } catch {
-      return false;
-    }
+    const resolved = resolve(resolveCwd, target);
+    const normalizedOriginalCwd = normalize(originalCwd);
+    return resolved.startsWith(`${normalizedOriginalCwd}/`) || resolved === normalizedOriginalCwd;
   }
 
   if (target.startsWith("../")) {
     return false;
   }
 
-  try {
-    const resolved = resolve(resolveCwd, target);
-    const normalizedCwd = normalize(originalCwd);
-    return resolved.startsWith(`${normalizedCwd}/`) || resolved === normalizedCwd;
-  } catch {
-    return false;
-  }
+  const resolved = resolve(resolveCwd, target);
+  const normalizedCwd = normalize(originalCwd);
+  return resolved.startsWith(`${normalizedCwd}/`) || resolved === normalizedCwd;
 }
 
 export function isHomeDirectory(cwd: string): boolean {
   const home = process.env.HOME ?? homedir();
-
-  try {
-    const normalizedCwd = normalize(cwd);
-    const normalizedHome = normalize(home);
-    return normalizedCwd === normalizedHome;
-  } catch {
-    return false;
-  }
+  const normalizedCwd = normalize(cwd);
+  const normalizedHome = normalize(home);
+  return normalizedCwd === normalizedHome;
 }

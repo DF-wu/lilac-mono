@@ -1,0 +1,15 @@
+{
+  "compilerOptions": {
+    "strict": true,
+    "target": "ESNext",
+    "module": "Preserve",
+    "moduleResolution": "bundler",
+    "baseUrl": ".",
+    "paths": {
+      "better-result": ["../../../../../apps/core/node_modules/better-result"]
+    },
+    "ignoreDeprecations": "6.0",
+    "noEmit": true
+  },
+  "include": ["fixture.ts"]
+}

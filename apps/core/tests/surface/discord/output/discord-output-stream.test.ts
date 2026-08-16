@@ -1,5 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import type { Client } from "discord.js";
+import { Panic, Result, type Result as ResultType } from "better-result";
 import type { SurfaceAttachment } from "../../../../src/surface/types";
 
 import {
@@ -14,6 +15,11 @@ import {
 } from "../../../../src/surface/discord/output/discord-output-stream";
 import type { SurfaceToolStatusUpdate } from "../../../../src/surface/adapter";
 import { buildProgressFieldValue } from "../../../../src/surface/discord/output/embed-pusher";
+
+function resultValue<T, E>(result: ResultType<T, E>): T {
+  if (result.status === "error") throw result.error;
+  return result.value;
+}
 
 describe("escapeDiscordMarkdown", () => {
   it("escapes emphasis markers in glob-like patterns", () => {
@@ -65,14 +71,14 @@ describe("compact subagent progress", () => {
           entry("tool-1", 1, { status: "end", display: "glob src", ok: true }),
           entry("tool-2", 2, { status: "end", display: "grep auth", ok: true }),
           entry("tool-3", 3, { status: "start", display: "bash bun test" }),
-          entry("tool-4", 4, { status: "start", display: "read_file failing.test.ts" }),
+          entry("tool-4", 4, { status: "start", display: "read failing.test.ts" }),
         ],
         subagents: [
           entry("agent-1", 5, {
             status: "update",
             display: [
               "subagent (general; claude-fable-5 [high]; 1/2 done)",
-              "|- + read_file package.json",
+              "|- + read package.json",
               "`- > bash bunx tsc --noEmit",
             ].join("\n"),
           }),
@@ -82,9 +88,9 @@ describe("compact subagent progress", () => {
 
     expect(lines).toEqual([
       "▶ bash bun test",
-      "▶ read_file failing.test.ts",
+      "▶ read failing.test.ts",
       "… general (cl...fable-5 [hi]; 1/2)",
-      "|- + read_file package.json",
+      "|- + read package.json",
       "`- > bash bunx tsc --noEmit",
     ]);
   });
@@ -121,12 +127,11 @@ describe("compact subagent progress", () => {
         subagents: [
           entry("agent-1", 1, {
             status: "update",
-            display:
-              "subagent (general; claude-fable-5 [high]; 12/13 done)\n`- > read_file src/a.ts",
+            display: "subagent (general; claude-fable-5 [high]; 12/13 done)\n`- > read src/a.ts",
           }),
           entry("agent-2", 2, {
             status: "update",
-            display: "subagent (self; gpt-5.6-sol [medium]; 1/2 done)\n`- > apply_patch src/b.ts",
+            display: "subagent (self; gpt-5.6-sol [medium]; 1/2 done)\n`- > patch src/b.ts",
           }),
           entry("agent-3", 3, {
             status: "update",
@@ -150,8 +155,8 @@ describe("compact subagent progress", () => {
       "✓ explore (3/3)",
       "✓ general (4/4)",
       "… explore (grok-4.5 [xh]; 8/10; batch)",
-      "… self (gpt-5.6-sol [md]; 1/2; apply_patch)",
-      "… general (cl...fable-5 [hi]; 12/13; read_file)",
+      "… self (gpt-5.6-sol [md]; 1/2; patch)",
+      "… general (cl...fable-5 [hi]; 12/13; read)",
     ]);
   });
 
@@ -305,7 +310,7 @@ describe("compact subagent progress", () => {
             status: "update",
             display: [
               "batch (3 tools; 2/3 done)",
-              "|- ✓ read_file a.ts",
+              "|- ✓ read a.ts",
               "|- ✓ grep auth",
               "`- ▶ bash bun test",
             ].join("\n"),
@@ -332,10 +337,68 @@ describe("compact subagent progress", () => {
     expect(lines.slice(0, 2)).toEqual(["… batch (3 tools; 2/3 done)", "`- ▶ bash bun test"]);
     expect(lines.slice(2).every((line) => line.includes("gpt-5.6-sol"))).toBe(true);
   });
+
+  it("normalizes restored builtin prefixes without rewriting plugin or batch displays", () => {
+    const lines = visible(
+      buildDiscordProgressLines({
+        tools: [
+          entry("read", 1, { status: "start", display: "read_file restored.ts" }),
+          entry("plugin", 2, { status: "start", display: "read_file_plugin restored.ts" }),
+          entry("batch", 3, {
+            status: "update",
+            display: "batch (1 tools)\n`- ▶ read_file restored.ts",
+          }),
+        ],
+        subagents: [
+          entry("agent", 4, {
+            status: "update",
+            display: "subagent (explore; 1/2 done)\n`- > apply_patch restored.ts",
+          }),
+        ],
+      }),
+    );
+
+    expect(lines).toContain("▶ read_file_plugin restored.ts");
+    expect(lines).toContain("… batch (1 tools)");
+    expect(lines).toContain("`- ▶ read restored.ts");
+    expect(lines).toContain("`- > patch restored.ts");
+  });
+
+  it("normalizes restored builtin names in compact subagent headers", () => {
+    const lines = visible(
+      buildDiscordProgressLines({
+        tools: [],
+        subagents: [
+          entry("one", 1, {
+            status: "update",
+            display: "subagent (explore; 1/2 done)\n`- > read_file one.ts",
+          }),
+          entry("two", 2, {
+            status: "update",
+            display: "subagent (general; 1/2 done)\n`- > apply_patch two.ts",
+          }),
+          entry("three", 3, {
+            status: "update",
+            display: "subagent (self; 1/2 done)\n`- > edit_file three.ts",
+          }),
+        ],
+      }),
+    );
+
+    expect(lines.some((line) => line.includes("; read)"))).toBe(true);
+    expect(lines.some((line) => line.includes("; patch)"))).toBe(true);
+    expect(lines.some((line) => line.includes("; edit)"))).toBe(true);
+  });
 });
 
 function createFakeDiscordClient(opts?: {
+  failEdit?: boolean;
+  editFailure?: unknown;
   failEditWithFiles?: boolean;
+  failReplyAt?: number;
+  replyFailure?: unknown;
+  failResumeFetch?: boolean;
+  resumeFetchFailure?: unknown;
   onEdit?: (options: unknown) => void;
 }): {
   client: Client;
@@ -370,6 +433,7 @@ function createFakeDiscordClient(opts?: {
   const messages = new Map<string, FakeMessage>();
   let nextMessageId = 1;
   let nextAttachmentId = 1;
+  let replyAttempts = 0;
   const channelId = "chan";
 
   const fileCountFromOptions = (options: unknown): number => {
@@ -435,6 +499,8 @@ function createFakeDiscordClient(opts?: {
       edit: async (options) => {
         operations.push({ kind: "edit", messageId: id, options });
         opts?.onEdit?.(options);
+        if (opts?.editFailure) throw opts.editFailure;
+        if (opts?.failEdit) throw new Error("edit failed");
         if (opts?.failEditWithFiles && fileCountFromOptions(options) > 0) {
           throw new Error("edit failed");
         }
@@ -442,6 +508,10 @@ function createFakeDiscordClient(opts?: {
         return message;
       },
       reply: async (options) => {
+        replyAttempts += 1;
+        if (replyAttempts === opts?.failReplyAt) {
+          throw opts.replyFailure ?? new Error("reply failed");
+        }
         return createMessage({ operation: "reply", parentId: id, options });
       },
       delete: async () => {
@@ -467,7 +537,11 @@ function createFakeDiscordClient(opts?: {
   const channel = {
     send: async (options: unknown) => createMessage({ operation: "send", options }),
     messages: {
-      fetch: async (messageId: string) => messages.get(messageId) ?? null,
+      fetch: async (messageId: string) => {
+        if (opts?.resumeFetchFailure) throw opts.resumeFetchFailure;
+        if (opts?.failResumeFetch) throw new Error("resume fetch failed");
+        return messages.get(messageId) ?? null;
+      },
     },
   };
 
@@ -501,6 +575,23 @@ function hasEmbeds(options: unknown): boolean {
   if (!options || typeof options !== "object") return false;
   const embeds = (options as { embeds?: unknown }).embeds;
   return Array.isArray(embeds) && embeds.length > 0;
+}
+
+function embedDescriptionsFromOptions(options: unknown): string[] {
+  if (!options || typeof options !== "object") return [];
+  const embeds = (options as { embeds?: unknown }).embeds;
+  if (!Array.isArray(embeds)) return [];
+
+  return embeds.flatMap((embed) => {
+    let serialized: unknown = embed;
+    if (embed && typeof embed === "object") {
+      const toJSON = (embed as { toJSON?: unknown }).toJSON;
+      if (typeof toJSON === "function") serialized = toJSON.call(embed);
+    }
+    if (!serialized || typeof serialized !== "object") return [];
+    const description = (serialized as { description?: unknown }).description;
+    return typeof description === "string" ? [description] : [];
+  });
 }
 
 function embedFieldValuesFromOptions(options: unknown): string[] {
@@ -571,6 +662,38 @@ function makeAttachment(index: number): SurfaceAttachment {
     bytes: new Uint8Array([index]),
   };
 }
+
+describe("Discord recovery hydration", () => {
+  it("applies restored state without provider calls before the first live part", async () => {
+    const { client, createdMessageIds, operations } = createFakeDiscordClient();
+    const out = new DiscordOutputStream({
+      client,
+      sessionRef: { platform: "discord", channelId: "chan" },
+      useSmartSplitting: false,
+      outputMode: "inline",
+      reasoningDisplayMode: "simple",
+      workingIndicators: ["Working"],
+    });
+
+    expect(
+      out.hydrateRecovery([
+        { type: "text.set", text: "restored" },
+        {
+          type: "reasoning.status",
+          update: { startedAtMs: 1, frozenAtMs: 2, detailText: "reasoning" },
+        },
+      ]),
+    ).toBe("visible");
+    expect(createdMessageIds).toEqual([]);
+    expect(operations).toEqual([]);
+
+    await expect(out.push({ type: "text.delta", delta: " live" })).resolves.toEqual(
+      Result.ok("visible"),
+    );
+    expect(createdMessageIds).toEqual(["m_1"]);
+    expect(operations.map((operation) => operation.kind)).toEqual(["send", "edit"]);
+  });
+});
 
 describe("Discord compact progress integration", () => {
   it("moves a completed agent into history before newer tool activity", async () => {
@@ -690,7 +813,7 @@ describe("Discord compact progress integration", () => {
         status: "update",
         display: [
           "subagent (general; claude-fable-5 [high]; 1/2 done)",
-          "|- + read_file package.json",
+          "|- + read package.json",
           "`- > bash bun test",
         ].join("\n"),
       },
@@ -705,7 +828,7 @@ describe("Discord compact progress integration", () => {
       "▶ bash command-3",
       "▶ bash command-4",
       "… general (cl...fable-5 [hi]; 1/2)",
-      "|- + read_file package.json",
+      "|- + read package.json",
       "`- > bash bun test",
     ]);
 
@@ -716,6 +839,26 @@ describe("Discord compact progress integration", () => {
 });
 
 describe("preview reanchor behavior", () => {
+  it("reports hidden reasoning as terminal without rendering it", async () => {
+    const { client, operations } = createFakeDiscordClient();
+    const out = new DiscordOutputStream({
+      client,
+      sessionRef: { platform: "discord", channelId: "chan" },
+      useSmartSplitting: false,
+      outputMode: "inline",
+      reasoningDisplayMode: "none",
+      workingIndicators: ["Working"],
+    });
+
+    await expect(
+      out.push({
+        type: "reasoning.status",
+        update: { startedAtMs: 1, detailText: "hidden" },
+      }),
+    ).resolves.toEqual(Result.ok("terminal"));
+    expect(operations).toEqual([]);
+  });
+
   it("keeps frozen placeholder lane messages on reanchor", async () => {
     const { client, createdMessageIds, deletedMessageIds } = createFakeDiscordClient();
 
@@ -771,6 +914,109 @@ describe("preview reanchor behavior", () => {
   });
 });
 
+describe("output operation failures", () => {
+  it("raises a Panic when final output rejects with an impossible non-Error value", async () => {
+    const { client } = createFakeDiscordClient({
+      failReplyAt: 1,
+      replyFailure: "invalid non-Error rejection",
+    });
+    const out = new DiscordOutputStream({
+      client,
+      sessionRef: { platform: "discord", channelId: "chan" },
+      useSmartSplitting: false,
+      outputMode: "preview",
+      outputPreviewModeFinalStyle: "plain",
+      reasoningDisplayMode: "none",
+      workingIndicators: ["Working"],
+    });
+
+    await out.push({ type: "text.delta", delta: "x".repeat(4500) });
+
+    try {
+      await out.finish();
+      throw new Error("expected Discord output invariant Panic");
+    } catch (cause) {
+      expect(Panic.is(cause)).toBe(true);
+      if (!Panic.is(cause)) throw cause;
+      expect(cause.message).toBe("Discord output invariant violated");
+    }
+  });
+
+  it("does not finish successfully when embed synchronization fails", async () => {
+    const { client } = createFakeDiscordClient({ editFailure: { status: 503 } });
+    const out = new DiscordOutputStream({
+      client,
+      sessionRef: { platform: "discord", channelId: "chan" },
+      useSmartSplitting: false,
+      outputMode: "inline",
+      reasoningDisplayMode: "none",
+      workingIndicators: ["Working"],
+    });
+
+    await out.push({ type: "text.delta", delta: "hello" });
+    await expect(out.finish()).rejects.toMatchObject({
+      _tag: "DiscordEmbedPusherInvariant",
+    });
+  });
+
+  it("classifies resume fetch failures instead of creating a duplicate chain", async () => {
+    const { client, createdMessageIds } = createFakeDiscordClient({
+      resumeFetchFailure: { status: 403 },
+    });
+    const out = new DiscordOutputStream({
+      client,
+      sessionRef: { platform: "discord", channelId: "chan" },
+      opts: {
+        resume: {
+          created: [{ platform: "discord", channelId: "chan", messageId: "existing" }],
+        },
+      },
+      useSmartSplitting: false,
+      outputMode: "inline",
+      reasoningDisplayMode: "none",
+      workingIndicators: ["Working"],
+    });
+
+    const result = await out.push({ type: "text.delta", delta: "hello" });
+
+    expect(result.status).toBe("error");
+    if (result.status === "ok") throw new Error("expected push failure");
+    expect(result.error).toMatchObject({
+      _tag: "SurfacePermissionDenied",
+      operation: "push-output",
+    });
+    expect(createdMessageIds).toEqual([]);
+  });
+
+  it("returns partial completion when a later final chunk fails", async () => {
+    const replyFailure = Object.assign(new Error("reply unavailable"), { status: 503 });
+    const { client } = createFakeDiscordClient({
+      failReplyAt: 1,
+      replyFailure,
+    });
+    const out = new DiscordOutputStream({
+      client,
+      sessionRef: { platform: "discord", channelId: "chan" },
+      useSmartSplitting: false,
+      outputMode: "preview",
+      outputPreviewModeFinalStyle: "plain",
+      reasoningDisplayMode: "none",
+      workingIndicators: ["Working"],
+    });
+
+    await out.push({ type: "text.delta", delta: "x".repeat(4500) });
+    const result = await out.finish();
+
+    expect(result.status).toBe("error");
+    if (result.status === "ok") throw new Error("expected finish failure");
+    expect(result.error).toMatchObject({
+      _tag: "SurfaceOperationPartiallyCompleted",
+      operation: "finish-output",
+      created: { platform: "discord", channelId: "chan" },
+    });
+  });
+});
+
 describe("attachment finalization", () => {
   it("inline mode edits attachments onto the final split message", async () => {
     const { client, operations } = createFakeDiscordClient();
@@ -786,7 +1032,7 @@ describe("attachment finalization", () => {
 
     await out.push({ type: "text.delta", delta: "a".repeat(9000) });
     await out.push({ type: "attachment.add", attachment: makeAttachment(1) });
-    const res = await out.finish();
+    const res = resultValue(await out.finish());
 
     expect(res.created.length).toBeGreaterThan(1);
 
@@ -813,7 +1059,7 @@ describe("attachment finalization", () => {
 
     await out.push({ type: "text.delta", delta: "b".repeat(9000) });
     await out.push({ type: "attachment.add", attachment: makeAttachment(1) });
-    const res = await out.finish();
+    const res = resultValue(await out.finish());
 
     expect(res.created.length).toBeGreaterThan(1);
 
@@ -842,7 +1088,7 @@ describe("attachment finalization", () => {
 
     await out.push({ type: "text.delta", delta: "hello" });
     await out.push({ type: "attachment.add", attachment: makeAttachment(1) });
-    const res = await out.finish();
+    const res = resultValue(await out.finish());
 
     const replyWithFiles = operations.filter((op) => op.kind === "reply" && hasFiles(op.options));
     expect(replyWithFiles.length).toBe(1);
@@ -870,7 +1116,7 @@ describe("attachment finalization", () => {
       await out.push({ type: "attachment.add", attachment: makeAttachment(i) });
     }
 
-    const res = await out.finish();
+    const res = resultValue(await out.finish());
 
     const editsWithFiles = operations.filter((op) => op.kind === "edit" && hasFiles(op.options));
     expect(editsWithFiles.length).toBe(1);
@@ -907,7 +1153,7 @@ describe("preview final output style", () => {
       text: "Commentary.\n\nFinal answer.",
       finalSegments: ["Commentary.", "Final answer."],
     });
-    const res = await out.finish();
+    const res = resultValue(await out.finish());
 
     const plainFinalOps = operations.filter(
       (operation) =>
@@ -928,6 +1174,34 @@ describe("preview final output style", () => {
     expect(res.last.messageId).toBe(finalPlainOperation.messageId);
   });
 
+  it("renders each final segment in the terminal phase", async () => {
+    const { client, operations } = createFakeDiscordClient();
+    const out = new DiscordOutputStream({
+      client,
+      sessionRef: { platform: "discord", channelId: "chan" },
+      useSmartSplitting: false,
+      outputMode: "preview",
+      outputPreviewModeFinalStyle: "plain",
+      reasoningDisplayMode: "none",
+      workingIndicators: ["Working"],
+      markdownMathRender: { fallbackMode: "passthrough" },
+    });
+
+    await out.push({
+      type: "text.set",
+      text: "combined",
+      finalSegments: ["first \\(partial", "second \\(x+1\\)"],
+    });
+    await out.finish();
+
+    const finalContents = operations
+      .filter((operation) => operation.kind === "send" || operation.kind === "reply")
+      .map((operation) => contentFromOptions(operation.options))
+      .filter((content): content is string => content !== undefined);
+    expect(finalContents).toContain("first \\(partial");
+    expect(finalContents).toContain("second `x + 1`");
+  });
+
   it("posts preview final output as content and stats as metadata when configured", async () => {
     const { client, operations, deletedMessageIds } = createFakeDiscordClient();
 
@@ -943,7 +1217,7 @@ describe("preview final output style", () => {
 
     await out.push({ type: "text.delta", delta: "preview text" });
     await out.push({ type: "meta.stats", line: "nerd stats" });
-    const res = await out.finish();
+    const res = resultValue(await out.finish());
 
     const finalSend = operations.find(
       (op) =>
@@ -977,7 +1251,7 @@ describe("preview final output style", () => {
 
     await out.push({ type: "text.delta", delta: "x".repeat(4500) });
     await out.push({ type: "meta.stats", line: "nerd stats" });
-    const res = await out.finish();
+    const res = resultValue(await out.finish());
 
     const plainFinalOps = operations.filter(
       (op) =>
@@ -1014,7 +1288,7 @@ describe("preview final output style", () => {
     });
 
     await out.push({ type: "text.delta", delta: "x".repeat(4500) });
-    const res = await out.finish();
+    const res = resultValue(await out.finish());
 
     const plainFinalOps = operations.filter(
       (op) =>
@@ -1105,7 +1379,7 @@ describe("discord blockquote normalization", () => {
     if (typeof method !== "function") {
       throw new Error("getRenderedText is unavailable");
     }
-    return method.call(stream) as string;
+    return method.call(stream, "terminal") as string;
   }
 
   it("normalizes bare blockquote continuation lines before rendering", () => {
@@ -1155,7 +1429,7 @@ describe("experimental markdown table rendering", () => {
     if (typeof method !== "function") {
       throw new Error("getRenderedText is unavailable");
     }
-    return method.call(stream) as string;
+    return method.call(stream, "terminal") as string;
   }
 
   it("rewrites markdown tables into fixed-width blocks when enabled", () => {
@@ -1195,6 +1469,94 @@ describe("experimental markdown table rendering", () => {
 
     const rendered = getRenderedText(out);
     expect(rendered).toBe(markdownTable);
+  });
+});
+
+describe("Discord markdown math integration", () => {
+  function getRenderedText(stream: DiscordOutputStream, phase: "streaming" | "terminal"): string {
+    const method = Reflect.get(stream as object, "getRenderedText");
+    if (typeof method !== "function") throw new Error("getRenderedText is unavailable");
+    return method.call(stream, phase) as string;
+  }
+
+  function createMathStream(options?: {
+    markdownMathRender?: { maxWidth?: number; fallbackMode?: "source" | "passthrough" };
+    rewriteText?: (text: string) => string;
+    markdownTableRender?: { style?: "unicode" | "ascii"; maxWidth?: number };
+  }): DiscordOutputStream {
+    const { client } = createFakeDiscordClient();
+    return new DiscordOutputStream({
+      client,
+      sessionRef: { platform: "discord", channelId: "chan" },
+      useSmartSplitting: false,
+      outputMode: "inline",
+      reasoningDisplayMode: "none",
+      workingIndicators: ["Working"],
+      ...options,
+    });
+  }
+
+  it("renders inline and display math when enabled", () => {
+    const out = createMathStream({ markdownMathRender: { maxWidth: 50 } });
+    Reflect.set(out as object, "textAcc", "inline \\(x+1\\)\n\n$$y^2$$");
+
+    expect(getRenderedText(out, "terminal")).toBe("inline `x + 1`\n\n```text\ny²\n```");
+  });
+
+  it("leaves math source byte-for-byte unchanged when options are omitted", () => {
+    const out = createMathStream();
+    const source = "inline \\(x+1\\)\r\n\r\n$$y^2$$";
+    Reflect.set(out as object, "textAcc", source);
+
+    expect(getRenderedText(out, "streaming")).toBe(source);
+    expect(getRenderedText(out, "terminal")).toBe(source);
+  });
+
+  it("runs rewrite, blockquote normalization, tables, then math", () => {
+    const out = createMathStream({
+      rewriteText: () =>
+        [">", "", "| Formula |", "| --- |", "| $$x+1$$ |", "", "outside \\(y+1\\)"].join("\n"),
+      markdownTableRender: { style: "ascii", maxWidth: 40 },
+      markdownMathRender: { maxWidth: 50 },
+    });
+    Reflect.set(out as object, "textAcc", "unrewritten \\(z\\)");
+
+    const rendered = getRenderedText(out, "terminal");
+    expect(rendered).toStartWith("> \n\n```text\n");
+    expect(rendered).toContain("| $$x+1$$ |");
+    expect(rendered).not.toContain("```text\nx + 1\n```");
+    expect(rendered).toEndWith("outside `y + 1`");
+    expect(rendered).not.toContain("unrewritten");
+  });
+
+  it("withholds incomplete math while streaming and restores it at terminal", () => {
+    const out = createMathStream({ markdownMathRender: { fallbackMode: "passthrough" } });
+    Reflect.set(out as object, "textAcc", "before \\(partial");
+
+    expect(getRenderedText(out, "streaming")).toBe("before ");
+    expect(getRenderedText(out, "terminal")).toBe("before \\(partial");
+  });
+
+  it("uses terminal rendering for the final embed-pusher sync", async () => {
+    const { client, operations } = createFakeDiscordClient();
+    const out = new DiscordOutputStream({
+      client,
+      sessionRef: { platform: "discord", channelId: "chan" },
+      useSmartSplitting: false,
+      outputMode: "inline",
+      reasoningDisplayMode: "none",
+      workingIndicators: ["Working"],
+      markdownMathRender: { fallbackMode: "passthrough" },
+    });
+
+    await out.push({ type: "text.delta", delta: "before \\(partial" });
+    await out.finish();
+
+    const descriptions = operations.flatMap((operation) =>
+      embedDescriptionsFromOptions(operation.options),
+    );
+    expect(descriptions.some((description) => description.includes("\\(partial"))).toBe(true);
+    expect(descriptions.at(-1)).toBe("before \\(partial");
   });
 });
 

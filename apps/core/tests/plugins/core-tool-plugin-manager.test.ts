@@ -4,14 +4,22 @@ import os from "node:os";
 import path from "node:path";
 import { asSchema, jsonSchema, tool } from "ai";
 import type { LilacBus } from "@stanley2058/lilac-event-bus";
-import { parseCoreConfigV1ToUniversal, type CoreConfig } from "@stanley2058/lilac-utils";
+import {
+  parseCoreConfigV1ToUniversal,
+  parseCoreConfigV2ToUniversal,
+  type CoreConfig,
+} from "@stanley2058/lilac-utils";
+import { Panic, Result } from "better-result";
 
-import { createCoreToolPluginManager } from "../../src/plugins";
+import { createCoreToolPluginManager as createCoreToolPluginManagerResult } from "../../src/plugins";
+import { decodeCoreToolRequestMetadata } from "../../src/plugins/builtin/local-tools";
 import { McpRegistry } from "../../src/mcp";
 import { catalogToolStableId } from "../../src/mcp/catalog-identity";
-import type { ConversationThreadService } from "../../src/conversation/thread-service";
+import type { ConversationThreadToolService } from "../../src/conversation/thread-service";
 import type { DiscoveryService } from "../../src/discovery/discovery-service";
 import type { SurfaceAdapter } from "../../src/surface/adapter";
+import { BUILTIN_SURFACE_PROTOCOLS } from "../../src/surface/builtin-surface-protocols";
+import { SurfaceRuntimeRegistry } from "../../src/surface/runtime-descriptor";
 import {
   configSnapshot,
   FakeClientFactory,
@@ -20,6 +28,27 @@ import {
   mcpToolDefinition,
   stdioDefinition,
 } from "../mcp/fixtures/registry-fixture";
+
+function createCoreToolPluginManager(
+  params: Parameters<typeof createCoreToolPluginManagerResult>[0],
+) {
+  const manager = createCoreToolPluginManagerResult(params);
+  return {
+    ...manager,
+    async buildLevel1Toolset(buildParams: Parameters<typeof manager.buildLevel1ToolsetResult>[0]) {
+      const built = await manager.buildLevel1ToolsetResult(buildParams);
+      if (built.status === "error") throw new Error(built.error.message, { cause: built.error });
+      return built.value;
+    },
+  };
+}
+
+const TEST_SURFACE_REGISTRY = SurfaceRuntimeRegistry.create([
+  { protocol: BUILTIN_SURFACE_PROTOCOLS.discord, adapter: {} as SurfaceAdapter },
+  { protocol: BUILTIN_SURFACE_PROTOCOLS.github, adapter: {} as SurfaceAdapter },
+]);
+if (TEST_SURFACE_REGISTRY.status === "error") throw TEST_SURFACE_REGISTRY.error;
+const TEST_SURFACE_ADAPTER_RESOLVER = TEST_SURFACE_REGISTRY.value.adapterResolver();
 
 function isAsyncIterable(value: unknown): value is AsyncIterable<unknown> {
   return (
@@ -148,6 +177,11 @@ function testConfig(input: unknown): CoreConfig {
   return { ...cfg, agent: { ...cfg.agent, systemPrompt: "(test)" } };
 }
 
+function testConfigV2(input: unknown): CoreConfig {
+  const cfg = parseCoreConfigV2ToUniversal(input);
+  return { ...cfg, agent: { ...cfg.agent, systemPrompt: "(test)" } };
+}
+
 async function writeExternalPlugin(params: {
   dataDir: string;
   pluginId: string;
@@ -182,17 +216,58 @@ describe("core tool plugin manager", () => {
     tmpRoot = null;
   });
 
+  it("preserves request metadata when direct attachment support is false", () => {
+    const onSubagentDelegate = async () => ({
+      runId: "run:metadata-decode",
+      completion: Promise.resolve({ status: "resolved" as const, finalText: "" }),
+      cancel: async () => {},
+    });
+    const onActivity = () => {};
+
+    const decoded = decodeCoreToolRequestMetadata({
+      readFileDirectAttachmentSupported: false,
+      controlCapability: "level-2-control-capability",
+      onSubagentDelegate,
+      onActivity,
+    });
+
+    expect(decoded.readFileDirectAttachmentSupported).toBe(false);
+    expect(decoded.controlCapability).toBe("level-2-control-capability");
+    expect(decoded.onSubagentDelegate).toBe(onSubagentDelegate);
+    expect(decoded.onActivity).toBe(onActivity);
+  });
+
   it("preserves built-in Level 1 tool exposure across profiles and edit modes", async () => {
     tmpRoot = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-core-plugin-manager-"));
     const dataDir = path.join(tmpRoot, "data");
-    const cfg = testConfig({});
+    const baseCfg = testConfig({});
+    const cfg: CoreConfig = {
+      ...baseCfg,
+      agent: {
+        ...baseCfg.agent,
+        subagents: {
+          ...baseCfg.agent.subagents,
+          profiles: {
+            ...baseCfg.agent.subagents.profiles,
+            explore: {
+              ...baseCfg.agent.subagents.profiles.explore,
+              level1: {
+                ...baseCfg.agent.subagents.profiles.explore.level1,
+                tools: ["bash", ...baseCfg.agent.subagents.profiles.explore.level1.tools],
+              },
+              execution: "restricted",
+            },
+          },
+        },
+      },
+    };
 
     const manager = createCoreToolPluginManager({
       runtime: {
         bus: {} as LilacBus,
-        adapter: {} as SurfaceAdapter,
+        surfaceAdapterResolver: TEST_SURFACE_ADAPTER_RESOLVER,
         discovery: {} as DiscoveryService,
-        conversationThreads: {} as ConversationThreadService,
+        conversationThreads: {} as ConversationThreadToolService,
         config: cfg,
       },
       dataDir,
@@ -208,29 +283,30 @@ describe("core tool plugin manager", () => {
       subagentConfig: cfg.agent.subagents!,
     });
     expect([...applyPatchTools.specs.keys()].sort()).toEqual([
-      "apply_patch",
       "bash",
       "batch",
       "glob",
       "grep",
-      "read_file",
+      "patch",
+      "read",
       "subagent_delegate",
     ]);
     expect([...applyPatchTools.genericOutputNormalizerBypassTools].sort()).toEqual([
-      "apply_patch",
       "bash",
       "batch",
-      "read_file",
+      "grep",
+      "patch",
+      "read",
       "subagent_delegate",
     ]);
-    expect([...applyPatchTools.aggregateOutputBudgetExemptTools]).toEqual(["read_file"]);
+    expect([...applyPatchTools.aggregateOutputBudgetExemptTools]).toEqual(["read", "grep"]);
     expect([...applyPatchTools.directToolNames].sort()).toEqual([
-      "apply_patch",
       "bash",
       "batch",
       "glob",
       "grep",
-      "read_file",
+      "patch",
+      "read",
       "subagent_delegate",
     ]);
     expect(applyPatchTools.tools).not.toHaveProperty("tool_search");
@@ -245,10 +321,10 @@ describe("core tool plugin manager", () => {
     expect([...editFileTools.specs.keys()].sort()).toEqual([
       "bash",
       "batch",
-      "edit_file",
+      "edit",
       "glob",
       "grep",
-      "read_file",
+      "read",
       "subagent_delegate",
     ]);
 
@@ -259,7 +335,13 @@ describe("core tool plugin manager", () => {
       subagentDepth: 1,
       subagentConfig: cfg.agent.subagents!,
     });
-    expect([...exploreTools.specs.keys()].sort()).toEqual(["batch", "glob", "grep", "read_file"]);
+    expect([...exploreTools.specs.keys()].sort()).toEqual([
+      "bash",
+      "batch",
+      "glob",
+      "grep",
+      "read",
+    ]);
 
     const generalTools = await manager.buildLevel1Toolset({
       cwd: dataDir,
@@ -269,12 +351,12 @@ describe("core tool plugin manager", () => {
       subagentConfig: cfg.agent.subagents!,
     });
     expect(Object.keys(generalTools.tools).sort()).toEqual([
-      "apply_patch",
       "bash",
       "batch",
       "glob",
       "grep",
-      "read_file",
+      "patch",
+      "read",
     ]);
 
     const selfTools = await manager.buildLevel1Toolset({
@@ -285,13 +367,50 @@ describe("core tool plugin manager", () => {
       subagentConfig: cfg.agent.subagents!,
     });
     expect(Object.keys(selfTools.tools).sort()).toEqual([
-      "apply_patch",
       "bash",
       "batch",
       "glob",
       "grep",
-      "read_file",
+      "patch",
+      "read",
       "subagent_delegate",
+    ]);
+  });
+
+  it("omits Bash when a profile disables execution", async () => {
+    tmpRoot = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-core-plugin-manager-"));
+    const dataDir = path.join(tmpRoot, "data");
+    const cfg = testConfigV2({
+      configVersion: 2,
+      agent: { subagents: { profiles: { explore: { execution: false } } } },
+    });
+    const manager = createCoreToolPluginManager({
+      runtime: {
+        bus: {} as LilacBus,
+        surfaceAdapterResolver: TEST_SURFACE_ADAPTER_RESOLVER,
+        discovery: {} as DiscoveryService,
+        conversationThreads: {} as ConversationThreadToolService,
+        config: cfg,
+      },
+      dataDir,
+    });
+    await manager.init();
+
+    const exploreTools = await manager.buildLevel1Toolset({
+      cwd: dataDir,
+      runProfile: "explore",
+      editingToolMode: "none",
+      subagentDepth: 1,
+      subagentConfig: cfg.agent.subagents,
+    });
+
+    expect(exploreTools.specs.has("bash")).toBe(false);
+    expect([...exploreTools.specs.keys()].sort()).toEqual([
+      "batch",
+      "fuzzy_search",
+      "glob",
+      "grep",
+      "read",
     ]);
   });
 
@@ -303,9 +422,9 @@ describe("core tool plugin manager", () => {
     const manager = createCoreToolPluginManager({
       runtime: {
         bus: {} as LilacBus,
-        adapter: {} as SurfaceAdapter,
+        surfaceAdapterResolver: TEST_SURFACE_ADAPTER_RESOLVER,
         discovery: {} as DiscoveryService,
-        conversationThreads: {} as ConversationThreadService,
+        conversationThreads: {} as ConversationThreadToolService,
         config: cfg,
       },
       dataDir,
@@ -329,10 +448,10 @@ describe("core tool plugin manager", () => {
       },
     });
 
-    expect([...restrictedTools.specs.keys()].sort()).toEqual(["bash", "batch", "read_file"]);
+    expect([...restrictedTools.specs.keys()].sort()).toEqual(["bash", "batch", "read"]);
   });
 
-  it("threads direct attachment support metadata into read_file description", async () => {
+  it("threads direct attachment support metadata into read description", async () => {
     tmpRoot = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-core-plugin-manager-"));
     const dataDir = path.join(tmpRoot, "data");
     const cfg = testConfig({});
@@ -340,7 +459,7 @@ describe("core tool plugin manager", () => {
     const manager = createCoreToolPluginManager({
       runtime: {
         bus: {} as LilacBus,
-        adapter: {} as SurfaceAdapter,
+        surfaceAdapterResolver: TEST_SURFACE_ADAPTER_RESOLVER,
         discovery: {} as DiscoveryService,
         config: cfg,
       },
@@ -367,12 +486,92 @@ describe("core tool plugin manager", () => {
       },
     });
 
-    expect(getToolDescription(toolset.tools, "read_file")).toContain(
-      "calling read_file attaches the original file to your context for native visual or document analysis",
+    expect(getToolDescription(toolset.tools, "read")).toContain(
+      "calling read attaches the original file to your context for native visual or document analysis",
     );
   });
 
-  it("shares local read state between read_file and edit_file within one toolset", async () => {
+  it("retains delegation and Level 2 metadata when direct attachment support is false", async () => {
+    tmpRoot = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-core-plugin-manager-"));
+    const dataDir = path.join(tmpRoot, "data");
+    const cfg = testConfig({});
+    let delegationCount = 0;
+    const activitySources: string[] = [];
+    const requestContext = {
+      requestId: "req:false-attachment-metadata",
+      sessionId: "test-session",
+      requestClient: "test",
+      subagentDepth: 0,
+      subagentProfile: "primary" as const,
+      metadata: {
+        readFileDirectAttachmentSupported: false,
+        controlCapability: "level-2-control-capability",
+        onSubagentDelegate: async () => {
+          delegationCount += 1;
+          return {
+            runId: "run:false-attachment-metadata",
+            completion: Promise.resolve({ status: "resolved" as const, finalText: "" }),
+            cancel: async () => {},
+          };
+        },
+        onActivity: (source: "tool" | "subagent") => {
+          activitySources.push(source);
+        },
+      },
+    };
+    const manager = createCoreToolPluginManager({
+      runtime: {
+        bus: {} as LilacBus,
+        config: cfg,
+      },
+      dataDir,
+    });
+
+    await manager.init();
+    await fs.mkdir(dataDir, { recursive: true });
+    const toolset = await manager.buildLevel1Toolset({
+      cwd: dataDir,
+      runProfile: "primary",
+      editingToolMode: "none",
+      subagentDepth: 0,
+      subagentConfig: cfg.agent.subagents!,
+      requestContext,
+    });
+    const executableTools = toolset.tools as Record<
+      string,
+      { execute?: (...args: readonly unknown[]) => unknown }
+    >;
+
+    const bashResult = await resolveExecuteResult(
+      getExecutableTool(executableTools, "bash").execute(
+        { command: 'printf "%s" "$LILAC_CONTROL_CAPABILITY"' },
+        { context: requestContext, toolCallId: "bash-metadata", messages: [] },
+      ),
+    );
+    expect(bashResult).toMatchObject({
+      stdout: "level-2-control-capability",
+      exitCode: 0,
+    });
+    expect(activitySources).toContain("tool");
+
+    const delegationResult = await resolveExecuteResult(
+      getExecutableTool(executableTools, "subagent_delegate").execute(
+        { profile: "explore", task: "Check metadata", mode: "deferred" },
+        { context: requestContext, toolCallId: "delegate-metadata", messages: [] },
+      ),
+    );
+    expect(delegationResult).toMatchObject({
+      ok: true,
+      status: "accepted",
+      workflowRunId: "run:false-attachment-metadata",
+    });
+    expect(delegationCount).toBe(1);
+    expect(getToolDescription(toolset.tools, "read")).not.toContain(
+      "calling read attaches the original file to your context for native visual or document analysis",
+    );
+  });
+
+  it("shares local read state between read and edit within one toolset", async () => {
     tmpRoot = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-core-plugin-manager-"));
     const dataDir = path.join(tmpRoot, "data");
     const cfg = testConfig({});
@@ -380,7 +579,7 @@ describe("core tool plugin manager", () => {
     const manager = createCoreToolPluginManager({
       runtime: {
         bus: {} as LilacBus,
-        adapter: {} as SurfaceAdapter,
+        surfaceAdapterResolver: TEST_SURFACE_ADAPTER_RESOLVER,
         discovery: {} as DiscoveryService,
         config: cfg,
       },
@@ -403,8 +602,8 @@ describe("core tool plugin manager", () => {
       string,
       { execute?: (...args: readonly unknown[]) => unknown }
     >;
-    const readFile = getExecutableTool(tools, "read_file");
-    const editFile = getExecutableTool(tools, "edit_file");
+    const readFile = getExecutableTool(tools, "read");
+    const editFile = getExecutableTool(tools, "edit");
 
     const readRes = await resolveExecuteResult(
       readFile.execute!({ path: "note.txt" }, { toolCallId: "read-1", messages: [] }),
@@ -435,7 +634,7 @@ describe("core tool plugin manager", () => {
     const manager = createCoreToolPluginManager({
       runtime: {
         bus: {} as LilacBus,
-        adapter: {} as SurfaceAdapter,
+        surfaceAdapterResolver: TEST_SURFACE_ADAPTER_RESOLVER,
         discovery: {} as DiscoveryService,
         config: cfg,
       },
@@ -458,8 +657,8 @@ describe("core tool plugin manager", () => {
       string,
       { execute?: (...args: readonly unknown[]) => unknown }
     >;
-    const readFile = getExecutableTool(tools, "read_file");
-    const editFile = getExecutableTool(tools, "edit_file");
+    const readFile = getExecutableTool(tools, "read");
+    const editFile = getExecutableTool(tools, "edit");
 
     const readRes = await resolveExecuteResult(
       readFile.execute!(
@@ -497,7 +696,7 @@ describe("core tool plugin manager", () => {
     const manager = createCoreToolPluginManager({
       runtime: {
         bus: {} as LilacBus,
-        adapter: {} as SurfaceAdapter,
+        surfaceAdapterResolver: TEST_SURFACE_ADAPTER_RESOLVER,
         discovery: {} as DiscoveryService,
         config: cfg,
       },
@@ -520,8 +719,8 @@ describe("core tool plugin manager", () => {
       string,
       { execute?: (...args: readonly unknown[]) => unknown }
     >;
-    const readFile = getExecutableTool(tools, "read_file");
-    const editFile = getExecutableTool(tools, "edit_file");
+    const readFile = getExecutableTool(tools, "read");
+    const editFile = getExecutableTool(tools, "edit");
 
     const readRes = await resolveExecuteResult(
       readFile.execute!(
@@ -550,7 +749,7 @@ describe("core tool plugin manager", () => {
     expect((editRes as { error?: { code?: string } }).error?.code).toBe("HASH_MISMATCH");
   });
 
-  it("preserves built-in Level 2 callable ids", async () => {
+  it("preserves built-in Level 2, discovery, and conversation-thread callables", async () => {
     tmpRoot = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-core-plugin-manager-"));
     const dataDir = path.join(tmpRoot, "data");
     const cfg = testConfig({});
@@ -558,9 +757,9 @@ describe("core tool plugin manager", () => {
     const manager = createCoreToolPluginManager({
       runtime: {
         bus: {} as LilacBus,
-        adapter: {} as SurfaceAdapter,
+        surfaceAdapterResolver: TEST_SURFACE_ADAPTER_RESOLVER,
         discovery: {} as DiscoveryService,
-        conversationThreads: {} as ConversationThreadService,
+        conversationThreads: {} as ConversationThreadToolService,
         config: cfg,
       },
       dataDir,
@@ -586,6 +785,13 @@ describe("core tool plugin manager", () => {
         .filter((id) => OPTIONAL_DYNAMIC_LEVEL2_CALLABLE_IDS.has(id))
         .every((id) => OPTIONAL_DYNAMIC_LEVEL2_CALLABLE_IDS.has(id)),
     ).toBe(true);
+    expect(callableIds.filter((id) => id.startsWith("discovery."))).toEqual(["discovery.search"]);
+    expect(callableIds.filter((id) => id.startsWith("conversation.thread."))).toEqual([
+      "conversation.thread.metadata",
+      "conversation.thread.read",
+      "conversation.thread.runSummarization",
+      "conversation.thread.search",
+    ]);
 
     const contributionByTool = manager.getLevel2ContributionInfo();
     const webTool = manager.getLevel2Tools().find((tool) => tool.id === "web");
@@ -625,24 +831,30 @@ describe("core tool plugin manager", () => {
     await writeExternalPlugin({
       dataDir,
       pluginId: "fixture-plugin",
-      entryBody: `import { markBoundedBuiltinOutput } from ${JSON.stringify(new URL("../../src/plugins/types.ts", import.meta.url).href)};
+      entryBody: `import { z } from ${JSON.stringify(import.meta.resolve("zod"))};
+import { defineServerTool } from ${JSON.stringify(new URL("../../../../packages/plugin-runtime/index.ts", import.meta.url).href)};
+import { markAggregateOutputBudgetExempt, markBoundedBuiltinOutput } from ${JSON.stringify(new URL("../../src/plugins/types.ts", import.meta.url).href)};
 export default {
   meta: { id: "fixture-plugin" },
   create() {
     return {
-      level1: [markBoundedBuiltinOutput({
+      level1: [markAggregateOutputBudgetExempt(markBoundedBuiltinOutput({
         name: "fixture_level1",
         createTool() { return { title: "Fixture Level 1", description: "Complete external fixture description", execute() { return { ok: true }; } }; },
         isEnabled() { return true; },
         formatArgs() { return " fixture"; },
-      })],
-      level2: [{
+      }))],
+      level2: [defineServerTool({
         id: "fixture",
-        async init() {},
-        async destroy() {},
-        async list() { return [{ callableId: "fixture.echo", name: "Fixture Echo", description: "Fixture", shortInput: [], input: [] }]; },
-        async call(_callableId, input) { return { echo: input }; },
-      }],
+        callables: ({ callable }) => ({
+          "fixture.echo": callable({
+            name: "Fixture Echo",
+            description: "Fixture",
+            inputSchema: z.object({ text: z.string() }),
+            run: ({ text }) => ({ echo: text }),
+          }),
+        }),
+      })],
     };
   },
 };`,
@@ -651,7 +863,7 @@ export default {
     const manager = createCoreToolPluginManager({
       runtime: {
         bus: {} as LilacBus,
-        adapter: {} as SurfaceAdapter,
+        surfaceAdapterResolver: TEST_SURFACE_ADAPTER_RESOLVER,
         discovery: {} as DiscoveryService,
         config: cfg,
       },
@@ -687,10 +899,13 @@ export default {
       title: "Fixture Level 1",
       description: "Complete external fixture description",
     });
-    expect(level1.genericOutputNormalizerBypassTools).toContain(
+    expect(level1.genericOutputNormalizerBypassTools).not.toContain(
       "plugin_fixture_plugin_fixture_level1",
     );
     expect(level1.genericOutputNormalizerBypassTools.has("fixture_level1")).toBe(false);
+    expect(level1.aggregateOutputBudgetExemptTools).not.toContain(
+      "plugin_fixture_plugin_fixture_level1",
+    );
     expect(getBatchToolNames(level1.tools)).not.toContain("plugin_fixture_plugin_fixture_level1");
     expect(getBatchToolNames(level1.tools)).not.toContain("batch");
 
@@ -702,6 +917,59 @@ export default {
       )
     ).flat();
     expect(callableIds).toContain("fixture.echo");
+    const fixtureTool = manager.getLevel2Tools().find((tool) => tool.id === "fixture");
+    if (!fixtureTool) throw new Error("missing fixture Level 2 tool");
+    expect(await fixtureTool.call("fixture.echo", { text: "hello" })).toEqual({ echo: "hello" });
+    await expect(fixtureTool.call("fixture.echo", { text: 42 })).rejects.toThrow(
+      "fixture.echo has invalid input.",
+    );
+  });
+
+  it("captures hostile executable metadata getters at the plugin boundary", async () => {
+    tmpRoot = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-core-plugin-manager-"));
+    const dataDir = path.join(tmpRoot, "data");
+    const cfg = testConfig({});
+    await writeExternalPlugin({
+      dataDir,
+      pluginId: "hostile-metadata",
+      entryBody: `const hostile = new Proxy({}, {
+  getPrototypeOf() { throw new Error("hostile prototype trap"); },
+  get() { throw new Error("hostile property trap"); },
+});
+export default {
+  meta: { id: "hostile-metadata" },
+  create() {
+    return { level1: [{
+      name: "hostile_metadata",
+      createTool() {
+        const executable = { execute() {} };
+        Object.defineProperty(executable, "title", { get() { throw hostile; } });
+        return executable;
+      },
+      isEnabled() { return true; },
+    }] };
+  },
+};`,
+    });
+    const manager = createCoreToolPluginManager({ runtime: { config: cfg }, dataDir });
+    const initialized = await manager.init();
+    expect(initialized.status).toBe("ok");
+
+    const built = await manager.buildLevel1ToolsetResult({
+      cwd: dataDir,
+      runProfile: "primary",
+      editingToolMode: "none",
+      subagentDepth: 0,
+      subagentConfig: cfg.agent.subagents!,
+    });
+    expect(built.status).toBe("error");
+    if (built.status === "error") {
+      expect(built.error._tag).toBe("Level1ToolsetBuildFailed");
+      if (built.error._tag === "Level1ToolsetBuildFailed") {
+        expect(built.error.operation).toBe("level1.executableMetadata");
+        expect(built.error.message).toContain("level1.executableMetadata");
+      }
+    }
   });
 
   it("qualifies external registration keys by plugin while preserving raw status names", async () => {
@@ -729,7 +997,7 @@ export default {
     await writeExternalPlugin({
       dataDir,
       pluginId: "builtin-name",
-      entryBody: pluginBody("builtin-name", ["read_file"]),
+      entryBody: pluginBody("builtin-name", ["read"]),
     });
     await writeExternalPlugin({
       dataDir,
@@ -756,7 +1024,7 @@ export default {
         expect.objectContaining({
           pluginId: "builtin-name",
           state: "loaded",
-          level1Names: ["read_file"],
+          level1Names: ["read"],
         }),
         expect.objectContaining({ pluginId: "duplicate-own", state: "failed" }),
       ]),
@@ -776,7 +1044,7 @@ export default {
     ).toEqual(["same-a", "same-b"]);
     expect(
       toolset.catalog.some(
-        (entry) => entry.sourceId === "builtin-name" && entry.rawName === "read_file",
+        (entry) => entry.sourceId === "builtin-name" && entry.rawName === "read",
       ),
     ).toBe(true);
   });
@@ -829,7 +1097,7 @@ export default {
         mcpRegistry: {
           async init() {},
           async reload() {
-            return [];
+            return Result.ok([]);
           },
           getConfigStatus: () => ({ status: "valid" }),
           list: () => [],
@@ -876,6 +1144,9 @@ export default {
     factory.enqueue("shared", client);
     const registry = new McpRegistry({
       configPath: path.join(dataDir, "mcp-config.yaml"),
+      reportFatalError: (error) => {
+        throw error;
+      },
       dependencies: {
         readConfig: async () => configSnapshot(mcpConfig([stdioDefinition("shared")])),
         createClient: factory.create,
@@ -945,7 +1216,7 @@ export default {
         mcpRegistry: {
           async init() {},
           async reload() {
-            return [];
+            return Result.ok([]);
           },
           getConfigStatus: () => ({ status: "valid" }),
           list: () => [],
@@ -1085,5 +1356,71 @@ export default {
     });
     expect(direct.specs.has("plugin_profile_fixture_fixture_write")).toBe(true);
     await enabled.destroy();
+  });
+
+  it("turns malformed Level 1 hook results into a plain Core boundary failure", async () => {
+    tmpRoot = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-core-plugin-manager-"));
+    const dataDir = path.join(tmpRoot, "data");
+    await writeExternalPlugin({
+      dataDir,
+      pluginId: "malformed-level1",
+      entryBody: `export default {
+  meta: { id: "malformed-level1" },
+  create() { return { level1: [{
+    name: "malformed",
+    createTool() { return {}; },
+    isEnabled() { return "yes"; },
+  }] }; },
+};`,
+    });
+    const cfg = testConfig({});
+    const manager = createCoreToolPluginManager({ runtime: { config: cfg }, dataDir });
+    const initialized = await manager.init();
+    expect(initialized.status).toBe("ok");
+
+    await expect(
+      manager.buildLevel1Toolset({
+        cwd: dataDir,
+        runProfile: "primary",
+        editingToolMode: "none",
+        subagentDepth: 0,
+        subagentConfig: cfg.agent.subagents,
+      }),
+    ).rejects.toThrow("Invalid hook result for plugin 'malformed-level1'");
+  });
+
+  it("propagates Panic from a Level 1 hook", async () => {
+    tmpRoot = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-core-plugin-manager-"));
+    const dataDir = path.join(tmpRoot, "data");
+    await writeExternalPlugin({
+      dataDir,
+      pluginId: "panic-level1",
+      entryBody: `import { Panic } from ${JSON.stringify(import.meta.resolve("better-result"))};
+export default {
+  meta: { id: "panic-level1" },
+  create() { return { level1: [{
+    name: "panic",
+    createTool() { return {}; },
+    isEnabled() { throw new Panic({ message: "level1 invariant" }); },
+  }] }; },
+};`,
+    });
+    const cfg = testConfig({});
+    const manager = createCoreToolPluginManager({ runtime: { config: cfg }, dataDir });
+    const initialized = await manager.init();
+    expect(initialized.status).toBe("ok");
+
+    try {
+      await manager.buildLevel1Toolset({
+        cwd: dataDir,
+        runProfile: "primary",
+        editingToolMode: "none",
+        subagentDepth: 0,
+        subagentConfig: cfg.agent.subagents,
+      });
+      throw new Error("expected Panic");
+    } catch (cause) {
+      expect(Panic.is(cause)).toBe(true);
+    }
   });
 });

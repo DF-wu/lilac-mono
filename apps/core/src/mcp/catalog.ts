@@ -1,6 +1,8 @@
 import { tool } from "ai";
+import { Result, TaggedError, type Result as ResultType } from "better-result";
 import { z } from "zod";
 import type { ClaudeCodeToolCatalogMetadataMap } from "@stanley2058/lilac-claude-code-bridge";
+import type { AdapterPlatform } from "@stanley2058/lilac-event-bus";
 
 import type { TranscriptStore } from "../transcript/transcript-store";
 import {
@@ -36,19 +38,39 @@ export type UnifiedToolCatalog = {
   readonly catalogMetadata: ClaudeCodeToolCatalogMetadataMap;
 };
 
+export class UnifiedToolCatalogInvalid extends TaggedError("UnifiedToolCatalogInvalid")<{
+  readonly reason: "duplicate-identity" | "name-collision" | "name-missing";
+  readonly message: string;
+}> {}
+
+export class PortableToolSearchInvalid extends TaggedError("PortableToolSearchInvalid")<{
+  readonly message: string;
+}> {}
+
 function compareText(left: string, right: string): number {
-  return left < right ? -1 : left > right ? 1 : 0;
+  if (left < right) return -1;
+  if (left > right) return 1;
+  return 0;
 }
 
-export function buildUnifiedToolCatalog(params: {
+export function catalogCandidateExecutable(candidate: CatalogToolCandidate): unknown {
+  return candidate.tool;
+}
+
+export function buildUnifiedToolCatalogResult(params: {
   candidates: readonly CatalogToolCandidate[];
   reservedNames?: ReadonlySet<string>;
-}): UnifiedToolCatalog {
+}): ResultType<UnifiedToolCatalog, UnifiedToolCatalogInvalid> {
   const candidatesByStableId = new Map<string, CatalogToolCandidate>();
   for (const candidate of params.candidates) {
     const stableId = catalogToolStableId(candidate.identity);
     if (candidatesByStableId.has(stableId)) {
-      throw new Error(`Duplicate deferred catalog tool identity: ${stableId}`);
+      return Result.err(
+        new UnifiedToolCatalogInvalid({
+          reason: "duplicate-identity",
+          message: `Duplicate deferred catalog tool identity: ${stableId}`,
+        }),
+      );
     }
     candidatesByStableId.set(stableId, candidate);
   }
@@ -66,7 +88,12 @@ export function buildUnifiedToolCatalog(params: {
             .join(", ")}`,
       )
       .join("; ");
-    throw new Error(`Unable to assign unique deferred catalog tool names: ${details}`);
+    return Result.err(
+      new UnifiedToolCatalogInvalid({
+        reason: "name-collision",
+        message: `Unable to assign unique deferred catalog tool names: ${details}`,
+      }),
+    );
   }
 
   const entries: CatalogToolEntry[] = [];
@@ -79,7 +106,12 @@ export function buildUnifiedToolCatalog(params: {
   )) {
     const modelName = assignment.byStableId.get(stableId);
     if (!modelName) {
-      throw new Error(`Deferred catalog tool did not receive a model name: ${stableId}`);
+      return Result.err(
+        new UnifiedToolCatalogInvalid({
+          reason: "name-missing",
+          message: `Deferred catalog tool did not receive a model name: ${stableId}`,
+        }),
+      );
     }
     const identity = Object.freeze({ ...candidate.identity });
     const entry = Object.freeze({
@@ -91,7 +123,7 @@ export function buildUnifiedToolCatalog(params: {
       ...(candidate.description === undefined ? {} : { description: candidate.description }),
       identity,
       stableId,
-      tool: candidate.tool,
+      tool: catalogCandidateExecutable(candidate),
     } satisfies CatalogToolEntry);
     entries.push(entry);
     byStableId.set(stableId, entry);
@@ -104,12 +136,14 @@ export function buildUnifiedToolCatalog(params: {
     });
   }
 
-  return Object.freeze({
-    entries: Object.freeze(entries),
-    byStableId,
-    byModelName,
-    catalogMetadata: Object.freeze(catalogMetadata),
-  });
+  return Result.ok(
+    Object.freeze({
+      entries: Object.freeze(entries),
+      byStableId,
+      byModelName,
+      catalogMetadata: Object.freeze(catalogMetadata),
+    }),
+  );
 }
 
 const toolSearchInputSchema = z.object({
@@ -303,17 +337,22 @@ function exactToolMatches(
   return { matches, missing };
 }
 
-const adapterPlatformSchema = z.enum([
-  "discord",
-  "github",
-  "whatsapp",
-  "slack",
-  "telegram",
-  "web",
-  "unknown",
-]);
+function portableRequestClient(value: string): AdapterPlatform | null {
+  switch (value) {
+    case "discord":
+    case "github":
+    case "slack":
+    case "telegram":
+    case "unknown":
+    case "web":
+    case "whatsapp":
+      return value;
+    default:
+      return null;
+  }
+}
 
-export function createPortableToolSearch(params: {
+export function createPortableToolSearchResult(params: {
   catalog: readonly CatalogToolEntry[];
   transcriptStore?: Pick<TranscriptStore, "selectSessionToolIds">;
   requestContext?: {
@@ -321,50 +360,63 @@ export function createPortableToolSearch(params: {
     readonly sessionId: string;
   };
 }) {
-  const requestContext = params.requestContext
-    ? {
-        requestClient: adapterPlatformSchema.parse(params.requestContext.requestClient),
-        sessionId: params.requestContext.sessionId,
-      }
-    : undefined;
+  const requestClient = params.requestContext
+    ? portableRequestClient(params.requestContext.requestClient)
+    : null;
+  if (params.requestContext && !requestClient) {
+    return Result.err(
+      new PortableToolSearchInvalid({
+        message: "Unsupported portable tool search request client",
+      }),
+    );
+  }
+  const requestContext =
+    params.requestContext && requestClient
+      ? {
+          requestClient,
+          sessionId: params.requestContext.sessionId,
+        }
+      : undefined;
 
-  return tool({
-    description:
-      "Search deferred plugin and MCP tools. Use keywords for ranked search, select:name,... for exact model-facing names, or +term to require a term in tool names. Returned tools become available on the next model step.",
-    inputSchema: toolSearchInputSchema,
-    execute: ({ query, max_results }) => {
-      const parsedQuery = parseToolSearchQuery(query);
-      const exact =
-        parsedQuery.type === "select"
-          ? exactToolMatches(params.catalog, parsedQuery.names)
-          : undefined;
-      const allMatches =
-        parsedQuery.type === "select"
-          ? (exact?.matches ?? [])
-          : rankedToolMatches(params.catalog, parsedQuery);
-      const matches = allMatches.slice(0, max_results ?? 5);
+  return Result.ok(
+    tool({
+      description:
+        "Search deferred plugin and MCP tools. Use keywords for ranked search, select:name,... for exact model-facing names, or +term to require a term in tool names. Returned tools become available on the next model step.",
+      inputSchema: toolSearchInputSchema,
+      execute: ({ query, max_results }) => {
+        const parsedQuery = parseToolSearchQuery(query);
+        const exact =
+          parsedQuery.type === "select"
+            ? exactToolMatches(params.catalog, parsedQuery.names)
+            : undefined;
+        const allMatches =
+          parsedQuery.type === "select"
+            ? (exact?.matches ?? [])
+            : rankedToolMatches(params.catalog, parsedQuery);
+        const matches = allMatches.slice(0, max_results ?? 5);
 
-      if (requestContext) {
-        params.transcriptStore?.selectSessionToolIds?.({
-          requestClient: requestContext.requestClient,
-          sessionId: requestContext.sessionId,
-          catalogIds: matches.map((entry) => entry.stableId),
-        });
-      }
+        if (requestContext) {
+          params.transcriptStore?.selectSessionToolIds?.({
+            requestClient: requestContext.requestClient,
+            sessionId: requestContext.sessionId,
+            catalogIds: matches.map((entry) => entry.stableId),
+          });
+        }
 
-      return {
-        query,
-        queryType: parsedQuery.type,
-        matches: matches.map((entry) => ({
-          name: entry.modelName,
-          stableId: entry.stableId,
-          source: entry.source,
-          sourceId: entry.sourceId,
-          rawName: entry.rawName,
-          ...(entry.title === undefined ? {} : { title: entry.title }),
-        })),
-        ...(exact?.missing.length ? { missing: exact.missing } : {}),
-      };
-    },
-  });
+        return {
+          query,
+          queryType: parsedQuery.type,
+          matches: matches.map((entry) => ({
+            name: entry.modelName,
+            stableId: entry.stableId,
+            source: entry.source,
+            sourceId: entry.sourceId,
+            rawName: entry.rawName,
+            ...(entry.title === undefined ? {} : { title: entry.title }),
+          })),
+          ...(exact?.missing.length ? { missing: exact.missing } : {}),
+        };
+      },
+    }),
+  );
 }

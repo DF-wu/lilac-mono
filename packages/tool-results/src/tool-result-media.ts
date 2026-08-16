@@ -1,12 +1,19 @@
 import type { ModelMessage, ToolContent } from "ai";
+import { Result, TaggedError } from "better-result";
 
 import type { ToolResultOutput } from "./tool-result-output-normalizer";
 
 type ContentOutput = Extract<ToolResultOutput, { type: "content" }>;
 type ContentItem = ContentOutput["value"][number];
 
+class ToolResultDataUrlDecodeFailed extends TaggedError("ToolResultDataUrlDecodeFailed")<{
+  readonly message: string;
+}> {}
+
 function decodedBase64Bytes(data: string): number {
-  const padding = data.endsWith("==") ? 2 : data.endsWith("=") ? 1 : 0;
+  let padding = 0;
+  if (data.endsWith("==")) padding = 2;
+  else if (data.endsWith("=")) padding = 1;
   return Math.max(0, Math.floor((data.length * 3) / 4) - padding);
 }
 
@@ -23,11 +30,13 @@ function inlineDataUrl(value: string | URL): { bytes: number; mediaType: string 
   if (metadata.toLowerCase().split(";").includes("base64")) {
     return { bytes: decodedBase64Bytes(payload), mediaType };
   }
-  try {
-    return { bytes: Buffer.byteLength(decodeURIComponent(payload), "utf8"), mediaType };
-  } catch {
-    return { bytes: Buffer.byteLength(payload, "utf8"), mediaType };
-  }
+  const decoded = Result.try({
+    try: () => decodeURIComponent(payload),
+    catch: () =>
+      new ToolResultDataUrlDecodeFailed({ message: "Inline data URL payload is malformed" }),
+  });
+  const decodedPayload = decoded.match({ ok: (value) => value, err: () => payload });
+  return { bytes: Buffer.byteLength(decodedPayload, "utf8"), mediaType };
 }
 
 function inlineMedia(
@@ -35,12 +44,7 @@ function inlineMedia(
 ): { bytes: number; filename?: string; mediaType: string } | undefined {
   if (item.type === "file" && item.data.type === "data") {
     const data = item.data.data;
-    const bytes =
-      typeof data === "string"
-        ? decodedBase64Bytes(data)
-        : data instanceof ArrayBuffer
-          ? data.byteLength
-          : data.byteLength;
+    const bytes = typeof data === "string" ? decodedBase64Bytes(data) : data.byteLength;
     return {
       bytes,
       ...(item.filename === undefined ? {} : { filename: item.filename }),

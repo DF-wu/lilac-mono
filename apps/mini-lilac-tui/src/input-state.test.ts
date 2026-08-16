@@ -1,9 +1,7 @@
 import { describe, expect, it } from "bun:test";
 
 import {
-  hasSteering,
   initialInputState,
-  isEditorDirty,
   reduceInput,
   type InputEffect,
   type InputEvent,
@@ -27,13 +25,12 @@ describe("reduceInput editing", () => {
     expect(state.editor).toBe("first line\nsecond line");
   });
 
-  it("appends inserted text to a dirty editor and reports dirtiness", () => {
+  it("appends inserted text", () => {
     const typed = run(initialInputState(), [
       { type: "insert", text: "he" },
       { type: "insert", text: "llo" },
     ]);
     expect(typed.editor).toBe("hello");
-    expect(isEditorDirty(typed)).toBe(true);
     expect(effectsOf(typed, { type: "insert", text: "!" })).toEqual([]);
   });
 
@@ -45,7 +42,6 @@ describe("reduceInput editing", () => {
 
   it("treats a whitespace-only editor as not dirty", () => {
     const spaced = run(initialInputState(), [{ type: "insert", text: "   " }]);
-    expect(isEditorDirty(spaced)).toBe(false);
     expect(effectsOf(spaced, { type: "submit" })).toEqual([]);
   });
 
@@ -174,8 +170,6 @@ describe("reduceInput active submit", () => {
       { type: "insert", text: "steer once" },
       { type: "submit" },
     ]);
-    expect(hasSteering(queued)).toBe(true);
-
     const { state, effects } = reduceInput(queued, { type: "submit" });
     expect(effects).toEqual([{ type: "interrupt-queued-steering" }]);
     // Queue display is preserved until the server reconciles admissions.
@@ -332,19 +326,17 @@ describe("reduceInput escape and Ctrl-C", () => {
 });
 
 describe("reduceInput slash commands and files", () => {
-  it("dispatches idle /undo without sending it to the model", () => {
-    const state = run(initialInputState(), [{ type: "insert", text: "/undo" }]);
-    const transition = reduceInput(state, { type: "submit" });
-    expect(transition.effects).toEqual([{ type: "undo" }]);
-    expect(transition.state.phase).toBe("submitting");
-  });
-
-  it("dispatches idle /redo without sending it to the model", () => {
-    const state = run(initialInputState(), [{ type: "insert", text: "/redo" }]);
-    const transition = reduceInput(state, { type: "submit" });
-    expect(transition.effects).toEqual([{ type: "redo" }]);
-    expect(transition.state.editor).toBe("");
-    expect(transition.state.phase).toBe("submitting");
+  it("dispatches idle history commands without sending them to the model", () => {
+    for (const [command, effect] of [
+      ["/undo", "undo"],
+      ["/redo", "redo"],
+    ] as const) {
+      const state = run(initialInputState(), [{ type: "insert", text: command }]);
+      const transition = reduceInput(state, { type: "submit" });
+      expect(transition.effects).toEqual([{ type: effect }]);
+      expect(transition.state.editor).toBe("");
+      expect(transition.state.phase).toBe("submitting");
+    }
   });
 
   it("never steers /redo during active work, including with an attachment", () => {

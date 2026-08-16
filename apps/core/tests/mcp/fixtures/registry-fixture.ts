@@ -1,8 +1,9 @@
 import type { CallToolResult, ListToolsResult, MCPClient, MCPClientConfig } from "@ai-sdk/mcp";
 import { jsonSchema, tool } from "ai";
+import { Result } from "better-result";
 
 import type {
-  McpConfigFileSnapshot,
+  McpConfigFileResult,
   McpRegistryClient,
   McpServerDefinition,
   UniversalMcpConfig,
@@ -47,8 +48,8 @@ export function mcpConfig(definitions: readonly McpServerDefinition[]): Universa
 export function configSnapshot(
   config: UniversalMcpConfig,
   configPath = "/tmp/lilac/mcp-config.yaml",
-): McpConfigFileSnapshot {
-  return { configPath, exists: true, config };
+): McpConfigFileResult {
+  return Result.ok({ configPath, exists: true, config });
 }
 
 export class FakeMcpClient implements McpRegistryClient {

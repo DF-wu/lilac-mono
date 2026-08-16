@@ -20,7 +20,7 @@ export const SURFACE_REF_PLATFORMS = ["discord", "github", "telegram"] as const;
 
 export type SurfaceRefPlatform = (typeof SURFACE_REF_PLATFORMS)[number];
 
-export function isSurfaceRefPlatform(x: unknown): x is SurfaceRefPlatform {
+export function isSurfaceRefPlatform(x: AdapterPlatform): x is SurfaceRefPlatform {
   return SURFACE_REF_PLATFORMS.some((platform) => platform === x);
 }
 
@@ -32,10 +32,6 @@ export function isSurfaceRefPlatform(x: unknown): x is SurfaceRefPlatform {
  * reuses `SurfaceRefPlatform` instead of repeating the literal list.
  */
 export type SurfacePrincipalPlatform = SurfaceRefPlatform;
-
-export function isSurfacePrincipalPlatform(x: unknown): x is SurfacePrincipalPlatform {
-  return isSurfaceRefPlatform(x);
-}
 
 export type DiscordSessionRef = {
   platform: "discord";
@@ -95,6 +91,40 @@ export type TelegramMsgRef = {
 
 export type SessionRef = DiscordSessionRef | GithubSessionRef | TelegramSessionRef;
 export type MsgRef = DiscordMsgRef | GithubMsgRef | TelegramMsgRef;
+
+export type RegisteredSurfacePlatform = SessionRef["platform"];
+
+export type SurfacePrincipal = {
+  readonly platform: RegisteredSurfacePlatform;
+  readonly userId: string;
+};
+
+export type SessionRefFor<P extends RegisteredSurfacePlatform> = Extract<
+  SessionRef,
+  { platform: P }
+>;
+
+export type MsgRefFor<P extends RegisteredSurfacePlatform> = Extract<MsgRef, { platform: P }>;
+
+export type AuthenticatedSurfaceOriginFor<P extends RegisteredSurfacePlatform> = {
+  [Platform in P]: {
+    readonly platform: Platform;
+    readonly userId: string;
+    readonly sessionRef: SessionRefFor<Platform>;
+    readonly messageRef?: MsgRefFor<Platform>;
+  };
+}[P];
+
+export type AuthenticatedSurfaceOrigin = AuthenticatedSurfaceOriginFor<RegisteredSurfacePlatform>;
+
+type SurfacePlatformSetsEqual = [SessionRef["platform"]] extends [MsgRef["platform"]]
+  ? [MsgRef["platform"]] extends [SessionRef["platform"]]
+    ? true
+    : false
+  : false;
+type AssertSurfacePlatformSetsEqual<T extends true> = T;
+export type SurfaceRefPlatformSetsExactlyEqual =
+  AssertSurfacePlatformSetsEqual<SurfacePlatformSetsEqual>;
 
 export type SurfaceSelf = {
   platform: SurfacePlatform;
@@ -200,15 +230,4 @@ export type SendOpts = {
   replyTo?: MsgRef;
   /** Suppress surface notifications for this send (mentions + reply ping). */
   silent?: boolean;
-};
-
-export type AdapterCapabilities = {
-  platform: SurfacePlatform;
-  send: boolean;
-  edit: boolean;
-  delete: boolean;
-  reactions: boolean;
-  readHistory: boolean;
-  threads: boolean;
-  markRead: boolean;
 };

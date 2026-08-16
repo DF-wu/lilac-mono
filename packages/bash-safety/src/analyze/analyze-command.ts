@@ -1,9 +1,30 @@
 import { parse, type ScriptNode } from "just-bash";
+import { Panic, Result, TaggedError, type Result as ResultType } from "better-result";
 
 import { type AnalyzeOptions, type AnalyzeResult, MAX_RECURSION_DEPTH } from "../types";
 
 import { analyzeScript } from "./ast-walker";
 import { dangerousReasonInText } from "./dangerous-text";
+
+class BashCommandParseFailed extends TaggedError("BashCommandParseFailed")<{
+  readonly command: string;
+  readonly cause: unknown;
+  readonly message: string;
+}> {}
+
+function parseBashCommand(command: string): ResultType<ScriptNode, BashCommandParseFailed> {
+  return Result.try({
+    try: () => parse(command),
+    catch: (cause) => {
+      if (Panic.is(cause)) throw cause;
+      return new BashCommandParseFailed({
+        command,
+        cause,
+        message: "Bash command could not be parsed",
+      });
+    },
+  });
+}
 
 export function analyzeCommandInternal(
   command: string,
@@ -23,23 +44,23 @@ function analyzeCommandAtCwd(
     return null;
   }
 
-  let script: ScriptNode;
-  try {
-    script = parse(command);
-  } catch {
-    const reason = dangerousReasonInText(command);
-    return reason ? { reason, segment: command } : null;
-  }
-
-  return analyzeScript(
-    script,
-    {
-      depth,
-      options,
-      originalCwd: options.cwd,
-      analyzeNestedCommand: (nestedCommand, nestedDepth, nestedCwd) =>
-        analyzeCommandAtCwd(nestedCommand, nestedDepth, options, nestedCwd),
+  const parsed = parseBashCommand(command);
+  return parsed.match({
+    ok: (script) =>
+      analyzeScript(
+        script,
+        {
+          depth,
+          options,
+          originalCwd: options.cwd,
+          analyzeNestedCommand: (nestedCommand, nestedDepth, nestedCwd) =>
+            analyzeCommandAtCwd(nestedCommand, nestedDepth, options, nestedCwd),
+        },
+        { cwd: effectiveCwd },
+      ),
+    err: () => {
+      const reason = dangerousReasonInText(command);
+      return reason ? { reason, segment: command } : null;
     },
-    { cwd: effectiveCwd },
-  );
+  });
 }

@@ -1,18 +1,20 @@
 const TOOL_EXPANSION_BRAND = Symbol("lilac.tool-expansion");
 
+import type { OpaqueAgentValue } from "./failure-adapters";
+
 export type ExpandedToolCall = {
   toolCallId: string;
   toolName: string;
-  input: unknown;
+  input: OpaqueAgentValue;
   invalid?: boolean;
-  error?: unknown;
+  error?: OpaqueAgentValue;
 };
 
 export class ToolExpansion {
   readonly [TOOL_EXPANSION_BRAND] = true;
 
   constructor(
-    readonly result: unknown,
+    readonly result: OpaqueAgentValue,
     readonly children: readonly ExpandedToolCall[],
   ) {}
 }

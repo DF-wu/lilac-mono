@@ -1,12 +1,16 @@
 import { Buffer } from "node:buffer";
 
 import type { UserContent } from "ai";
+import type { Result as ResultType } from "better-result";
 import { fileTypeFromBuffer } from "file-type";
 
 import { inferMimeTypeFromFilename } from "../../../shared/attachment-utils";
-import type { CoreOwnedBlobReference } from "../../../transcript/transcript-store";
+import type {
+  CoreOwnedBlobIntegrityError,
+  CoreOwnedBlobReference,
+} from "../../../transcript/transcript-store";
 
-import type { DiscordAttachmentMeta } from "./types";
+import type { DiscordAttachmentMeta } from "../../discord/discord-attachment";
 
 const DEFAULT_INBOUND_MAX_FILE_BYTES = 25 * 1024 * 1024;
 const DEFAULT_INBOUND_MAX_TOTAL_BYTES = 50 * 1024 * 1024;
@@ -15,24 +19,29 @@ const DISCORD_CDN_HOSTS = new Set(["cdn.discordapp.com", "media.discordapp.net"]
 
 type DiscordAttachmentState = {
   downloadedTotalBytes: number;
+  inlineFileData: boolean;
   // URL -> downloaded bytes + inferred mime type
   cache: Map<string, { bytes: Uint8Array; mimeType?: string }>;
   ownBlob?: (input: {
     bytes: Uint8Array;
     mediaType: string;
     filename: string;
-  }) => CoreOwnedBlobReference;
+  }) => ResultType<CoreOwnedBlobReference, CoreOwnedBlobIntegrityError>;
+  ownershipError: CoreOwnedBlobIntegrityError | null;
   ownedBlobs: Map<string, CoreOwnedBlobReference>;
   currentBlobs: Map<string, CoreOwnedBlobReference>;
 };
 
 export function createDiscordAttachmentState(input?: {
   ownBlob?: DiscordAttachmentState["ownBlob"];
+  inlineFileData?: boolean;
 }): DiscordAttachmentState {
   return {
     downloadedTotalBytes: 0,
+    inlineFileData: input?.inlineFileData === true,
     cache: new Map(),
     ownBlob: input?.ownBlob,
+    ownershipError: null,
     ownedBlobs: new Map(),
     currentBlobs: new Map(),
   };
@@ -50,6 +59,12 @@ export function takeDiscordCurrentBlobReferences(
   const references = [...state.currentBlobs.values()];
   state.currentBlobs.clear();
   return references;
+}
+
+export function getDiscordAttachmentOwnershipError(
+  state: DiscordAttachmentState,
+): CoreOwnedBlobIntegrityError | null {
+  return state.ownershipError;
 }
 
 function normalizeMimeType(mimeType: string | undefined): string | undefined {
@@ -182,8 +197,15 @@ function ownAttachmentBytes(input: {
     mediaType: input.mediaType,
     filename: input.filename ?? input.url.pathname.split("/").pop() ?? "attachment",
   });
-  input.state.ownedBlobs.set(reference.sha256, reference);
-  input.state.currentBlobs.set(reference.sha256, reference);
+  reference.match({
+    err: (error) => () => {
+      input.state.ownershipError ??= error;
+    },
+    ok: (value) => () => {
+      input.state.ownedBlobs.set(value.sha256, value);
+      input.state.currentBlobs.set(value.sha256, value);
+    },
+  })();
 }
 
 async function resolveOwnedFileData(input: {
@@ -192,7 +214,7 @@ async function resolveOwnedFileData(input: {
   mediaType: string;
   filename?: string;
 }): Promise<URL | Uint8Array> {
-  if (!input.state.ownBlob) return input.url;
+  if (!input.state.ownBlob && !input.state.inlineFileData) return input.url;
   const cacheKey = input.url.toString();
   const cached = input.state.cache.get(cacheKey);
   const downloaded = cached ? null : await downloadDiscordAttachment(input.url);

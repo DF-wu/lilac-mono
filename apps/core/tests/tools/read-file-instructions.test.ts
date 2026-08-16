@@ -47,7 +47,7 @@ function getInstructionFields(output: unknown): {
   };
 }
 
-describe("read_file auto-loads AGENTS.md instructions", () => {
+describe("read auto-loads AGENTS.md instructions", () => {
   let baseDir: string;
 
   beforeEach(async () => {
@@ -66,7 +66,7 @@ describe("read_file auto-loads AGENTS.md instructions", () => {
     await writeFile(path.join(baseDir, "sub", "nested", "file.txt"), "hello\n");
 
     const tools = fsTool(baseDir);
-    const readFile = tools.read_file;
+    const readFile = tools.read;
 
     const out = await resolveExecuteResult(
       readFile.execute!({ path: path.join("sub", "nested", "file.txt") }, toolOptions("t1")),
@@ -90,7 +90,7 @@ describe("read_file auto-loads AGENTS.md instructions", () => {
     await writeFile(path.join(baseDir, "b", "file.txt"), "hello\n");
 
     const tools = fsTool(baseDir);
-    const readFile = tools.read_file;
+    const readFile = tools.read;
 
     const out = await resolveExecuteResult(
       readFile.execute!(
@@ -111,14 +111,14 @@ describe("read_file auto-loads AGENTS.md instructions", () => {
     expect(instructions.instructionsText).toContain("Root rules.");
   });
 
-  it("does not reload AGENTS.md that were already loaded in prior read_file tool results", async () => {
+  it("does not reload AGENTS.md that were already loaded in prior read tool results", async () => {
     await mkdir(path.join(baseDir, "sub", "nested"), { recursive: true });
     await writeFile(path.join(baseDir, "AGENTS.md"), "# Root\n\nRoot rules.");
     await writeFile(path.join(baseDir, "sub", "AGENTS.md"), "# Sub\n\nSub rules.");
     await writeFile(path.join(baseDir, "sub", "nested", "file.txt"), "hello\n");
 
     const tools = fsTool(baseDir);
-    const readFile = tools.read_file;
+    const readFile = tools.read;
 
     const first = await resolveExecuteResult(
       readFile.execute!({ path: path.join("sub", "nested", "file.txt") }, toolOptions("t3")),
@@ -139,7 +139,7 @@ describe("read_file auto-loads AGENTS.md instructions", () => {
         {
           type: "tool-result",
           toolCallId: "t3",
-          toolName: "read_file",
+          toolName: "read",
           output: toolOutput,
         },
       ],
@@ -165,7 +165,7 @@ describe("read_file auto-loads AGENTS.md instructions", () => {
     await writeFile(path.join(baseDir, "sub", "AGENTS.md"), "# Sub\n\nSub rules.");
 
     const tools = fsTool(baseDir);
-    const readFile = tools.read_file;
+    const readFile = tools.read;
 
     const out = await resolveExecuteResult(
       readFile.execute!({ path: path.join("sub", "AGENTS.md") }, toolOptions("t5")),

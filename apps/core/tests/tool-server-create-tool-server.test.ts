@@ -1,25 +1,85 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, jest } from "bun:test";
 import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { z } from "zod";
 import {
+  ToolPluginCleanupError,
+  ToolPluginHookError,
   ToolPluginManager,
   type Level1ToolSpec,
   type RequestContext,
 } from "@stanley2058/lilac-plugin-runtime";
 import { createLogger, parseCoreConfigV2ToUniversal } from "@stanley2058/lilac-utils";
+import { Panic, Result, TaggedError } from "better-result";
 
 import {
-  createToolServer,
+  createToolServer as createToolServerImpl,
+  type ToolServerOptions,
   type ToolServerHealthSnapshot,
 } from "../src/tool-server/create-tool-server";
 import type { ServerTool } from "../src/tool-server/types";
 import { RequestControlAuthority } from "../src/tool-server/request-control-authority";
 import { parseToolInput } from "../src/tool-server/validation-error-message";
+import type { AuthenticatedRequestProjection } from "../src/surface/authenticated-request";
 
 const originalMemoryUsage = process.memoryUsage;
+const TEST_OPERATOR_TOKEN = "tool-server-test-operator";
+
+function createToolServer(options: ToolServerOptions) {
+  const hasExplicitAuthority =
+    options.authorizeControlRequest !== undefined ||
+    options.requestMessageCache !== undefined ||
+    options.getConfig !== undefined ||
+    options.resolveServerSafetyMode !== undefined ||
+    options.operatorTokenSha256 !== undefined;
+  if (hasExplicitAuthority) return createToolServerImpl(options);
+  const server = createToolServerImpl({
+    ...options,
+    canonicalWorkspaceRoot: options.canonicalWorkspaceRoot ?? "/workspace",
+    operatorTokenSha256: createHash("sha256").update(TEST_OPERATOR_TOKEN).digest("hex"),
+  });
+  const handle = server.app.handle.bind(server.app);
+  server.app.handle = (request: Request) => {
+    const hasLilacHeader = Array.from(request.headers.keys()).some((key) =>
+      key.startsWith("x-lilac-"),
+    );
+    if (hasLilacHeader) return handle(request);
+    const headers = new Headers(request.headers);
+    headers.set("x-lilac-operator-token", TEST_OPERATOR_TOKEN);
+    return handle(new Request(request, { headers }));
+  };
+  return server;
+}
+
+function discordRequestProjection(input: {
+  readonly requestId: string;
+  readonly sessionId: string;
+  readonly userId?: string;
+  readonly verifiedIngress?: boolean;
+}): AuthenticatedRequestProjection {
+  const sessionRef = { platform: "discord" as const, channelId: input.sessionId };
+  return {
+    requestId: input.requestId,
+    requestClient: "discord",
+    sessionId: input.sessionId,
+    source: "external",
+    platform: "discord",
+    sessionRef,
+    ...(input.userId
+      ? {
+          authenticatedOrigin: {
+            platform: "discord" as const,
+            userId: input.userId,
+            sessionRef,
+          },
+        }
+      : {}),
+    authenticationMetadataKind: input.userId ? "origin" : "absent",
+    verifiedIngress: input.verifiedIngress ?? input.userId !== undefined,
+  };
+}
 
 type BuildEnvSnapshot = {
   LILAC_BUILD_VERSION: string | undefined;
@@ -96,20 +156,109 @@ async function writePluginServerTool(params: {
 }
 
 describe("createToolServer", () => {
+  it("rejects an invalid operator-token digest through the host option adapter", () => {
+    expect(() => createToolServer({ operatorTokenSha256: "not-a-sha256-digest" })).toThrow(
+      "operatorTokenSha256 must be a SHA-256 hex digest",
+    );
+  });
+
+  it("redacts nested sensitive JSON fields before ordinary tool-input logging", async () => {
+    const chunks: string[] = [];
+    const secret = "ordinary-tool-secret";
+    const tool: ServerTool = {
+      id: "preview-redaction",
+      async init() {},
+      async destroy() {},
+      async list() {
+        return [
+          {
+            callableId: "preview.redaction",
+            name: "Preview redaction",
+            description: "Tests input logging",
+            shortInput: [],
+          },
+        ];
+      },
+      async call() {
+        return { ok: true };
+      },
+    };
+    const output = { write: (chunk: string) => chunks.push(chunk) };
+    const server = createToolServer({
+      tools: [tool],
+      logger: createLogger({
+        module: "tool-preview-redaction-test",
+        logLevel: "debug",
+        outputFormat: "jsonl",
+        stdout: output,
+        stderr: output,
+      }),
+    });
+    await server.init();
+    try {
+      const response = await server.app.handle(
+        new Request("http://localhost/call", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            callableId: "preview.redaction",
+            input: { nested: { authorization: secret }, visible: "retained" },
+          }),
+        }),
+      );
+      expect(await response.json()).toEqual({ isError: false, output: { ok: true } });
+      const logged = chunks.join("\n");
+      expect(logged).toContain("<redacted>");
+      expect(logged).toContain("retained");
+      expect(logged).not.toContain(secret);
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it("projects opaque unhandled rejections without serializing TaggedError fields", async () => {
+    class SecretUnhandledRejection extends TaggedError("SecretUnhandledRejection")<{
+      readonly token: string;
+      readonly message: string;
+    }> {}
+    const secret = "unhandled-rejection-secret";
+    const server = createToolServer({ tools: [] });
+    await server.init();
+    try {
+      server.recordUnhandledRejection(
+        new SecretUnhandledRejection({ token: secret, message: `token=${secret}` }),
+      );
+      const snapshot = await server.getHealthSnapshot();
+      expect(snapshot.info.unhandledRejection).toMatchObject({
+        count: 1,
+        lastReason: "External tagged error",
+      });
+      expect(JSON.stringify(snapshot.info.unhandledRejection)).not.toContain(secret);
+    } finally {
+      await server.stop();
+    }
+  });
+
   it("uses the same request capability and native profile context for direct and workflow children", async () => {
     const contexts: RequestContext[] = [];
     const authority = new RequestControlAuthority();
     const capabilities = new Map<string, string>();
     for (const requestId of ["sub:direct", "wfr:workflow"] as const) {
+      const workflowChild = requestId === "wfr:workflow";
       capabilities.set(
         requestId,
         authority.issue({
           kind: "primary",
           requestId,
-          sessionId: `session:${requestId}`,
+          sessionId: workflowChild ? "workflow-child-session" : "origin-session",
           originSessionId: `origin:${requestId}`,
-          platform: "unknown",
+          platform: workflowChild ? "unknown" : "discord",
           principal: { platform: "discord", userId: "user-1" },
+          authenticatedOrigin: {
+            platform: "discord",
+            userId: "user-1",
+            sessionRef: { platform: "discord", channelId: "origin-session" },
+          },
           allowedCallables: null,
           profile: "general",
           canonicalCwd: "/selected/child/cwd",
@@ -139,6 +288,29 @@ describe("createToolServer", () => {
     };
     const server = createToolServer({
       tools: [tool],
+      requestMessageCache: {
+        get: () => [{ role: "user", content: "cached" }],
+        getOrigin: (requestId) =>
+          requestId === "wfr:workflow"
+            ? {
+                requestId,
+                requestClient: "unknown",
+                sessionId: "workflow-child-session",
+                source: "internal-delegated",
+                authenticatedOrigin: {
+                  platform: "discord",
+                  userId: "user-1",
+                  sessionRef: { platform: "discord", channelId: "origin-session" },
+                },
+                authenticationMetadataKind: "origin",
+                verifiedIngress: false,
+              }
+            : discordRequestProjection({
+                requestId,
+                sessionId: "origin-session",
+                userId: "user-1",
+              }),
+      },
       authorizeControlRequest: (input) => authority.authorize(input),
     });
     await server.init();
@@ -146,13 +318,15 @@ describe("createToolServer", () => {
       for (const requestId of ["sub:direct", "wfr:workflow"] as const) {
         const capability = capabilities.get(requestId);
         if (!capability) throw new Error(`missing test capability for ${requestId}`);
+        const workflowChild = requestId === "wfr:workflow";
         const headers = {
           "x-lilac-request-id": requestId,
-          "x-lilac-session-id": `session:${requestId}`,
+          "x-lilac-session-id": workflowChild ? "workflow-child-session" : "origin-session",
           "x-lilac-origin-session-id": "caller-controlled-origin",
-          "x-lilac-request-client": "unknown",
+          "x-lilac-request-client": workflowChild ? "unknown" : "discord",
           "x-lilac-cwd": "/selected/child/cwd",
           "x-lilac-control-capability": capability,
+          "x-lilac-current-turn-user-id": "user-2",
         };
         const list = await server.app.handle(new Request("http://localhost/list", { headers }));
         expect(await list.json()).toMatchObject({ tools: [{ callableId: "workflow.test" }] });
@@ -170,24 +344,47 @@ describe("createToolServer", () => {
         expect(await call.json()).toMatchObject({ isError: false, output: { ok: true } });
       }
       expect(
-        contexts.map(({ cwd, originSessionId, subagentProfile, controlPolicy }) => ({
-          cwd,
-          originSessionId,
-          subagentProfile,
-          controlPolicy,
-        })),
+        contexts.map(
+          ({
+            cwd,
+            originSessionId,
+            subagentProfile,
+            controlPolicy,
+            requestInitiator,
+            requestInitiatorSessionId,
+            currentTurnUserId,
+            safetyMode,
+          }) => ({
+            cwd,
+            originSessionId,
+            subagentProfile,
+            controlPolicy,
+            requestInitiator,
+            requestInitiatorSessionId,
+            currentTurnUserId,
+            safetyMode,
+          }),
+        ),
       ).toEqual([
         {
           cwd: "/selected/child/cwd",
           originSessionId: "origin:sub:direct",
           subagentProfile: "general",
           controlPolicy: { kind: "primary", allowedCallables: null },
+          requestInitiator: { platform: "discord", userId: "user-1" },
+          requestInitiatorSessionId: "origin-session",
+          currentTurnUserId: "user-2",
+          safetyMode: "trusted",
         },
         {
           cwd: "/selected/child/cwd",
           originSessionId: "origin:wfr:workflow",
           subagentProfile: "general",
           controlPolicy: { kind: "primary", allowedCallables: null },
+          requestInitiator: { platform: "discord", userId: "user-1" },
+          requestInitiatorSessionId: "origin-session",
+          currentTurnUserId: "user-2",
+          safetyMode: "trusted",
         },
       ]);
     } finally {
@@ -207,6 +404,11 @@ describe("createToolServer", () => {
       originSessionId,
       platform: "unknown",
       principal: { platform: "telegram", userId: "user-7" },
+      authenticatedOrigin: {
+        platform: "telegram",
+        userId: "user-7",
+        sessionRef: { platform: "telegram", channelId: originSessionId },
+      },
       allowedCallables: null,
       profile: "general",
       canonicalCwd: "/workspace",
@@ -235,6 +437,22 @@ describe("createToolServer", () => {
     };
     const server = createToolServer({
       tools: [tool],
+      requestMessageCache: {
+        get: () => [{ role: "user", content: "cached" }],
+        getOrigin: () => ({
+          requestId,
+          requestClient: "unknown",
+          sessionId,
+          source: "internal-delegated",
+          authenticatedOrigin: {
+            platform: "telegram",
+            userId: "user-7",
+            sessionRef: { platform: "telegram", channelId: originSessionId },
+          },
+          authenticationMetadataKind: "origin",
+          verifiedIngress: false,
+        }),
+      },
       authorizeControlRequest: (input) => authority.authorize(input),
     });
     const headers = {
@@ -258,7 +476,10 @@ describe("createToolServer", () => {
         }),
       );
       expect(await allowed.json()).toMatchObject({ isError: false, output: { ok: true } });
-      expect(calls[0]?.originSessionId).toBe(originSessionId);
+      expect(calls[0]).toMatchObject({
+        requestInitiator: { platform: "telegram", userId: "user-7" },
+        requestInitiatorSessionId: originSessionId,
+      });
 
       const blocked = await server.app.handle(
         new Request("http://localhost/call", {
@@ -286,8 +507,9 @@ describe("createToolServer", () => {
       kind: "primary",
       requestId: "native-profile-capability",
       sessionId: "native-profile-session",
-      platform: "unknown",
+      platform: "discord",
       principal: null,
+      authenticatedOrigin: null,
       allowedCallables: null,
       profile: "general",
       canonicalCwd: "/workspace",
@@ -313,10 +535,18 @@ describe("createToolServer", () => {
       },
     };
     const pluginManager = {
-      async init() {},
-      async destroy() {},
-      async reload() {},
-      async ensureFresh() {},
+      async init() {
+        return Result.ok();
+      },
+      async destroy() {
+        return Result.ok();
+      },
+      async reload() {
+        return Result.ok();
+      },
+      async ensureFresh() {
+        return Result.ok();
+      },
       getLevel2Tools: () => [tool],
       getLevel2ContributionInfo: () =>
         new Map([[tool, { pluginId: "profile-plugin", source: "builtin" as const }]]),
@@ -339,13 +569,18 @@ describe("createToolServer", () => {
     const server = createToolServer({
       pluginManager,
       getConfig: async () => config,
+      requestMessageCache: {
+        get: () => [{ role: "user", content: "cached" }],
+        getOrigin: (requestId) =>
+          discordRequestProjection({ requestId, sessionId: "native-profile-session" }),
+      },
       authorizeControlRequest: (input) => authority.authorize(input),
     });
     await server.init();
     const headers = {
       "x-lilac-request-id": "native-profile-capability",
       "x-lilac-session-id": "native-profile-session",
-      "x-lilac-request-client": "unknown",
+      "x-lilac-request-client": "discord",
       "x-lilac-cwd": "/workspace",
       "x-lilac-control-capability": capability,
     };
@@ -393,6 +628,11 @@ describe("createToolServer", () => {
     const server = createToolServer({
       tools: [tool],
       canonicalWorkspaceRoot: "/workspace",
+      requestMessageCache: {
+        get: () => [{ role: "user", content: "cached" }],
+        getOrigin: (requestId) =>
+          discordRequestProjection({ requestId, sessionId: "channel-1", userId: "user-1" }),
+      },
       authorizeControlRequest: (input) =>
         input.token === "unguessable-primary-token" &&
         input.requestId === "request-1" &&
@@ -401,6 +641,11 @@ describe("createToolServer", () => {
           ? {
               kind: "primary" as const,
               principal: { platform: "discord" as const, userId: "user-1" },
+              authenticatedOrigin: {
+                platform: "discord" as const,
+                userId: "user-1",
+                sessionRef: { platform: "discord" as const, channelId: "channel-1" },
+              },
               allowedCallables: null,
               profile: "primary" as const,
               canonicalCwd: "/workspace",
@@ -447,6 +692,288 @@ describe("createToolServer", () => {
           )
         ).status,
       ).toBe(500);
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it("rejects a control capability whose principal conflicts with the cached origin", async () => {
+    const server = createToolServer({
+      tools: [],
+      requestMessageCache: {
+        get: () => [{ role: "user", content: "cached" }],
+        getOrigin: (requestId) => ({
+          requestId,
+          requestClient: "discord",
+          sessionId: "channel-1",
+          source: "external",
+          platform: "discord",
+          sessionRef: { platform: "discord", channelId: "channel-1" },
+          authenticatedOrigin: {
+            platform: "discord",
+            userId: "user-1",
+            sessionRef: { platform: "discord", channelId: "channel-1" },
+          },
+          authenticationMetadataKind: "origin",
+          verifiedIngress: true,
+        }),
+      },
+      authorizeControlRequest: () => ({
+        kind: "primary",
+        principal: { platform: "discord", userId: "user-2" },
+        authenticatedOrigin: {
+          platform: "discord",
+          userId: "user-2",
+          sessionRef: { platform: "discord", channelId: "channel-1" },
+        },
+        allowedCallables: null,
+        profile: "primary",
+        canonicalCwd: "/workspace",
+        safetyMode: "trusted",
+      }),
+    });
+    await server.init();
+    try {
+      const response = await server.app.handle(
+        new Request("http://localhost/list", {
+          headers: {
+            "x-lilac-request-id": "request-1",
+            "x-lilac-session-id": "channel-1",
+            "x-lilac-request-client": "discord",
+            "x-lilac-cwd": "/workspace",
+            "x-lilac-control-capability": "capability",
+          },
+        }),
+      );
+      expect(response.status).toBe(500);
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it("rejects primary capabilities after their cached projection is missing or expired", async () => {
+    const authority = new RequestControlAuthority();
+    const capability = authority.issue({
+      kind: "primary",
+      requestId: "expired-cache-request",
+      sessionId: "channel-1",
+      platform: "discord",
+      principal: { platform: "discord", userId: "user-1" },
+      authenticatedOrigin: {
+        platform: "discord",
+        userId: "user-1",
+        sessionRef: { platform: "discord", channelId: "channel-1" },
+      },
+      allowedCallables: null,
+      profile: "primary",
+      canonicalCwd: "/workspace",
+      safetyMode: "trusted",
+      expiresAt: Date.now() + 60_000,
+    });
+    const server = createToolServer({
+      tools: [],
+      requestMessageCache: { get: () => undefined, getOrigin: () => undefined },
+      authorizeControlRequest: (input) => authority.authorize(input),
+    });
+    await server.init();
+    try {
+      const response = await server.app.handle(
+        new Request("http://localhost/list", {
+          headers: {
+            "x-lilac-request-id": "expired-cache-request",
+            "x-lilac-session-id": "channel-1",
+            "x-lilac-request-client": "discord",
+            "x-lilac-cwd": "/workspace",
+            "x-lilac-control-capability": capability,
+          },
+        }),
+      );
+      expect(response.status).toBe(500);
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it("keeps standalone non-operator requests restricted", async () => {
+    const tool: ServerTool = {
+      id: "standalone-restricted",
+      async init() {},
+      async destroy() {},
+      async list() {
+        return [
+          {
+            callableId: "workflow.standalone-restricted",
+            name: "restricted",
+            description: "restricted",
+            shortInput: [],
+          },
+        ];
+      },
+      async call() {
+        return { ok: true };
+      },
+    };
+    const server = createToolServerImpl({ tools: [tool] });
+    await server.init();
+    try {
+      const listed = await server.app.handle(new Request("http://localhost/list"));
+      expect(await listed.json()).toEqual({ tools: [] });
+      const called = await server.app.handle(
+        new Request("http://localhost/call", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ callableId: "workflow.standalone-restricted", input: {} }),
+        }),
+      );
+      expect(await called.json()).toMatchObject({
+        isError: true,
+        output: expect.stringContaining("restricted public-session mode"),
+      });
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it("applies verified GitHub and validated Discord safety precedence without inventing principals", async () => {
+    const contexts: RequestContext[] = [];
+    let discordPolicyCalls = 0;
+    const tool: ServerTool = {
+      id: "safety-precedence",
+      async init() {},
+      async destroy() {},
+      async list() {
+        return [
+          {
+            callableId: "workflow.safety-precedence",
+            name: "safety",
+            description: "safety",
+            shortInput: [],
+          },
+        ];
+      },
+      async call(_callableId, _input, options) {
+        if (options?.context) contexts.push(options.context);
+        return { ok: true };
+      },
+    };
+    const server = createToolServer({
+      tools: [tool],
+      requestMessageCache: {
+        get: () => [{ role: "user", content: "cached" }],
+        getOrigin: (requestId) => {
+          const github = requestId === "github-request";
+          if (github) {
+            return {
+              requestId,
+              requestClient: "github",
+              sessionId: "owner/repo#1",
+              source: "external",
+              platform: "github",
+              sessionRef: { platform: "github", channelId: "owner/repo#1" },
+              authenticationMetadataKind: "github-trigger",
+              verifiedIngress: true,
+            };
+          }
+          return {
+            requestId,
+            requestClient: "discord",
+            sessionId: "channel-1",
+            source: "external",
+            platform: "discord",
+            sessionRef: { platform: "discord", channelId: "channel-1" },
+            authenticationMetadataKind: "origin",
+            verifiedIngress: true,
+          };
+        },
+      },
+      resolveServerSafetyMode: async () => {
+        discordPolicyCalls += 1;
+        return "trusted";
+      },
+    });
+    await server.init();
+    try {
+      for (const [requestId, sessionId, requestClient] of [
+        ["github-request", "owner/repo#1", "github"],
+        ["discord-request", "channel-1", "discord"],
+      ] as const) {
+        const response = await server.app.handle(
+          new Request("http://localhost/call", {
+            method: "POST",
+            headers: {
+              "content-type": "application/json",
+              "x-lilac-request-id": requestId,
+              "x-lilac-session-id": sessionId,
+              "x-lilac-request-client": requestClient,
+            },
+            body: JSON.stringify({ callableId: "workflow.safety-precedence", input: {} }),
+          }),
+        );
+        expect(await response.json()).toMatchObject({ isError: false });
+      }
+      expect(discordPolicyCalls).toBe(1);
+      expect(contexts.map((context) => context.requestInitiator)).toEqual([undefined, undefined]);
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it("keeps actor-only GitHub principals restricted without verified trigger metadata", async () => {
+    const contexts: RequestContext[] = [];
+    const tool: ServerTool = {
+      id: "github-actor-only",
+      async init() {},
+      async destroy() {},
+      async list() {
+        return [{ callableId: "fetch", name: "fetch", description: "fetch", shortInput: [] }];
+      },
+      async call(_callableId, _input, options) {
+        if (options?.context) contexts.push(options.context);
+        return { ok: true };
+      },
+    };
+    const server = createToolServer({
+      tools: [tool],
+      requestMessageCache: {
+        get: () => [{ role: "user", content: "cached" }],
+        getOrigin: (requestId) => ({
+          requestId,
+          requestClient: "github",
+          sessionId: "owner/repo#1",
+          source: "external",
+          platform: "github",
+          sessionRef: { platform: "github", channelId: "owner/repo#1" },
+          authenticatedOrigin: {
+            platform: "github",
+            userId: "octocat",
+            sessionRef: { platform: "github", channelId: "owner/repo#1" },
+          },
+          authenticationMetadataKind: "actor",
+          verifiedIngress: false,
+        }),
+      },
+    });
+    await server.init();
+    try {
+      const response = await server.app.handle(
+        new Request("http://localhost/call", {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            "x-lilac-request-id": "github-actor-only",
+            "x-lilac-session-id": "owner/repo#1",
+            "x-lilac-request-client": "github",
+          },
+          body: JSON.stringify({ callableId: "fetch", input: {} }),
+        }),
+      );
+      expect(await response.json()).toMatchObject({ isError: false });
+      expect(contexts[0]).toMatchObject({
+        safetyMode: "restricted",
+        serverOwnedRequest: false,
+        requestInitiator: { platform: "github", userId: "octocat" },
+        requestInitiatorSessionId: "owner/repo#1",
+      });
     } finally {
       await server.stop();
     }
@@ -577,7 +1104,7 @@ describe("createToolServer", () => {
       async call(callableId, _input, options) {
         called.push(callableId);
         expect(options?.context?.cwd).toBe("/canonical-workspace");
-        expect(options?.context?.authenticatedPrincipal).toBeUndefined();
+        expect(options?.context?.requestInitiator).toBeUndefined();
         return { ok: true };
       },
     };
@@ -592,6 +1119,7 @@ describe("createToolServer", () => {
           ? {
               kind: "heartbeat" as const,
               principal: null,
+              authenticatedOrigin: null,
               allowedCallables: ["surface.messages.send"],
               profile: "primary" as const,
               canonicalCwd: "/canonical-workspace",
@@ -720,9 +1248,24 @@ describe("createToolServer", () => {
         },
         getOrigin: (requestId) =>
           requestId === "req:1"
-            ? { sessionId: "chan", platform: "discord", actorUserId: "user-1" }
+            ? {
+                requestId,
+                requestClient: "discord",
+                sessionId: "chan",
+                source: "external",
+                platform: "discord",
+                sessionRef: { platform: "discord", channelId: "chan" },
+                authenticatedOrigin: {
+                  platform: "discord",
+                  userId: "user-1",
+                  sessionRef: { platform: "discord", channelId: "chan" },
+                },
+                authenticationMetadataKind: "origin",
+                verifiedIngress: true,
+              }
             : undefined,
       },
+      resolveServerSafetyMode: async () => "trusted",
     });
 
     await server.init();
@@ -1141,7 +1684,21 @@ describe("createToolServer", () => {
           requestId === "request-1" ? [{ role: "user", content: "run workflow" }] : undefined,
         getOrigin: (requestId) =>
           requestId === "request-1"
-            ? { sessionId: "channel-1", platform: "discord", actorUserId: "user-1" }
+            ? {
+                requestId,
+                requestClient: "discord",
+                sessionId: "channel-1",
+                source: "external",
+                platform: "discord",
+                sessionRef: { platform: "discord", channelId: "channel-1" },
+                authenticatedOrigin: {
+                  platform: "discord",
+                  userId: "user-1",
+                  sessionRef: { platform: "discord", channelId: "channel-1" },
+                },
+                authenticationMetadataKind: "origin",
+                verifiedIngress: true,
+              }
             : undefined,
       },
       getConfig: async () => {
@@ -1190,8 +1747,8 @@ describe("createToolServer", () => {
     >({
       runtime: {},
       dataDir,
-      getLevel1Name: (spec) => spec.name,
-      getLevel2CallableIds: async (tool) => (await tool.list()).map((entry) => entry.callableId),
+      adaptLevel1Item: (spec) => spec,
+      adaptLevel2Item: (tool) => tool,
     });
 
     const server = createToolServer({
@@ -1268,6 +1825,132 @@ describe("createToolServer", () => {
     await server.stop();
   });
 
+  it("reads initialization-dependent and dynamic Level 2 catalogs at runtime", async () => {
+    let listCalls = 0;
+    let initialized = false;
+    let callableId = "dynamic.call.v1";
+    const tool: ServerTool = {
+      id: "stateful-list",
+      async init() {
+        initialized = true;
+      },
+      async destroy() {},
+      async list() {
+        if (!initialized) throw new Error("list called before init");
+        listCalls += 1;
+        return [{ callableId, name: callableId, description: callableId, shortInput: [] }];
+      },
+      async call(callableId) {
+        return { callableId };
+      },
+    };
+    const pluginManager = new ToolPluginManager<
+      Record<string, never>,
+      Level1ToolSpec<Record<string, never>>,
+      ServerTool
+    >({
+      runtime: {},
+      dataDir: "/tmp/tool-server-stateful-list-unused",
+      builtinPlugins: [{ meta: { id: "stateful-list" }, create: () => ({ level2: [tool] }) }],
+      adaptLevel1Item: (spec) => spec,
+      adaptLevel2Item: (item) => item,
+    });
+    const server = createToolServer({ pluginManager });
+
+    await server.init();
+    expect(listCalls).toBe(2);
+    callableId = "dynamic.call.v2";
+    const listed = await server.app.handle(new Request("http://localhost/list"));
+    expect(await listed.json()).toMatchObject({ tools: [{ callableId: "dynamic.call.v2" }] });
+    expect(
+      (await server.app.handle(new Request("http://localhost/help/dynamic.call.v2"))).status,
+    ).toBe(200);
+    const called = await server.app.handle(
+      new Request("http://localhost/call", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ callableId: "dynamic.call.v2", input: {} }),
+      }),
+    );
+    expect(await called.json()).toEqual({
+      isError: false,
+      output: { callableId: "dynamic.call.v2" },
+    });
+    expect(listCalls).toBe(7);
+    await server.stop();
+  });
+
+  it("refreshes routing after a committed reload whose previous-state cleanup fails", async () => {
+    const chunks: string[] = [];
+    let generation = 0;
+    const pluginManager = new ToolPluginManager<
+      Record<string, never>,
+      Level1ToolSpec<Record<string, never>>,
+      ServerTool
+    >({
+      runtime: {},
+      dataDir: "/tmp/tool-server-committed-cleanup-unused",
+      builtinPlugins: [
+        {
+          meta: { id: "committed-cleanup" },
+          create() {
+            generation += 1;
+            const current = generation;
+            const callableId = `committed.call.${current}`;
+            return {
+              level2: [
+                {
+                  id: `committed-${current}`,
+                  async init() {},
+                  async destroy() {},
+                  async list() {
+                    return [
+                      { callableId, name: callableId, description: callableId, shortInput: [] },
+                    ];
+                  },
+                  async call() {
+                    return { generation: current };
+                  },
+                },
+              ],
+              async destroy() {
+                if (current === 1) throw new Error("previous cleanup failed");
+              },
+            };
+          },
+        },
+      ],
+      adaptLevel1Item: (spec) => spec,
+      adaptLevel2Item: (item) => item,
+    });
+    const output = { write: (chunk: string) => chunks.push(chunk) };
+    const server = createToolServer({
+      pluginManager,
+      logger: createLogger({
+        module: "committed-cleanup-test",
+        outputFormat: "jsonl",
+        stdout: output,
+        stderr: output,
+      }),
+    });
+
+    await server.init();
+    const reload = await server.app.handle(
+      new Request("http://localhost/reload", { method: "POST" }),
+    );
+    expect(await reload.json()).toEqual({ ok: true });
+    const called = await server.app.handle(
+      new Request("http://localhost/call", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ callableId: "committed.call.2", input: {} }),
+      }),
+    );
+    expect(await called.json()).toEqual({ isError: false, output: { generation: 2 } });
+    expect(chunks.join("\n")).toContain("reload committed");
+    await server.stop();
+  });
+
   it("refreshes plugin-backed call mapping on list/help/call without explicit reload", async () => {
     tmpRoot = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-tool-server-plugin-"));
     const dataDir = path.join(tmpRoot, "data");
@@ -1286,14 +1969,8 @@ describe("createToolServer", () => {
     >({
       runtime: {},
       dataDir,
-      getLevel1Name: (spec) => spec.name,
-      getLevel2CallableIds: async (tool) => (await tool.list()).map((entry) => entry.callableId),
-      initLevel2Item: async (tool) => {
-        await tool.init();
-      },
-      destroyLevel2Item: async (tool) => {
-        await tool.destroy();
-      },
+      adaptLevel1Item: (spec) => spec,
+      adaptLevel2Item: (tool) => tool,
     });
 
     const server = createToolServer({ pluginManager });
@@ -1362,14 +2039,8 @@ describe("createToolServer", () => {
     >({
       runtime: {},
       dataDir,
-      getLevel1Name: (spec) => spec.name,
-      getLevel2CallableIds: async (tool) => (await tool.list()).map((entry) => entry.callableId),
-      initLevel2Item: async (tool) => {
-        await tool.init();
-      },
-      destroyLevel2Item: async (tool) => {
-        await tool.destroy();
-      },
+      adaptLevel1Item: (spec) => spec,
+      adaptLevel2Item: (tool) => tool,
     });
 
     const server = createToolServer({ pluginManager });
@@ -1528,6 +2199,7 @@ describe("createToolServer", () => {
   });
 
   it("times out tool calls and marks wedged calls unhealthy", async () => {
+    const started = Promise.withResolvers<void>();
     const tool: ServerTool = {
       id: "hang",
       async init() {},
@@ -1544,53 +2216,368 @@ describe("createToolServer", () => {
         ];
       },
       async call() {
+        started.resolve();
         return await new Promise(() => {});
       },
     };
 
+    jest.useFakeTimers({ now: 0 });
+    let server: ReturnType<typeof createToolServer> | undefined;
+    try {
+      server = createToolServer({
+        tools: [tool],
+        toolCallTimeouts: {
+          defaultTimeoutMs: 20,
+        },
+        healthConfig: {
+          eventLoopLagFailMs: 60_000,
+          maxRssBytes: Number.MAX_SAFE_INTEGER,
+          toolCallOverdueGraceMs: 10,
+        },
+      });
+      await server.init();
+      await server.start(0);
+
+      const callResponse = server.app.handle(
+        new Request("http://localhost/call", {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+          },
+          body: JSON.stringify({
+            callableId: "hang.forever",
+            input: {},
+          }),
+        }),
+      );
+      await started.promise;
+      jest.advanceTimersByTime(20);
+
+      const callRes = await callResponse;
+      expect(callRes.status).toBe(200);
+      expect(await callRes.json()).toEqual({
+        isError: true,
+        output: "Tool call timed out after 20ms",
+      });
+
+      jest.advanceTimersByTime(11);
+
+      const healthRes = await server.app.handle(new Request("http://localhost/healthz"));
+      expect(healthRes.status).toBe(503);
+      const healthBody = (await healthRes.json()) as {
+        checks: Array<{ name: string; ok: boolean }>;
+      };
+      expect(healthBody.checks.find((check) => check.name === "tool-calls.overdue")?.ok).toBe(
+        false,
+      );
+    } finally {
+      try {
+        await server?.stop();
+      } finally {
+        jest.useRealTimers();
+      }
+    }
+  });
+
+  it("reports an immediate Level 2 Panic to the fatal supervisor", async () => {
+    const panic = new Panic({ message: "immediate tool invariant" });
+    const observed = Promise.withResolvers<unknown>();
+    const chunks: string[] = [];
+    const output = { write: (chunk: string) => chunks.push(chunk) };
+    const tool: ServerTool = {
+      id: "immediate-panic",
+      async init() {},
+      async destroy() {},
+      async list() {
+        return [
+          {
+            callableId: "immediate-panic.call",
+            name: "Immediate Panic",
+            description: "rejects immediately with Panic",
+            shortInput: [],
+          },
+        ];
+      },
+      async call() {
+        throw panic;
+      },
+    };
     const server = createToolServer({
       tools: [tool],
-      toolCallTimeouts: {
-        defaultTimeoutMs: 20,
-      },
-      healthConfig: {
-        eventLoopLagFailMs: 60_000,
-        maxRssBytes: Number.MAX_SAFE_INTEGER,
-        toolCallOverdueGraceMs: 10,
-      },
+      logger: createLogger({
+        module: "immediate-panic-test",
+        outputFormat: "jsonl",
+        stdout: output,
+        stderr: output,
+      }),
+      reportFatalToolCallDefect: observed.resolve,
     });
 
     await server.init();
-    await server.start(0);
-
-    const callRes = await server.app.handle(
+    const response = await server.app.handle(
       new Request("http://localhost/call", {
         method: "POST",
-        headers: {
-          "content-type": "application/json",
-        },
-        body: JSON.stringify({
-          callableId: "hang.forever",
-          input: {},
-        }),
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ callableId: "immediate-panic.call", input: {} }),
       }),
     );
-    expect(callRes.status).toBe(200);
-    expect(await callRes.json()).toEqual({
-      isError: true,
-      output: "Tool call timed out after 20ms",
-    });
+    expect(response.status).toBe(500);
+    expect(await observed.promise).toBe(panic);
+    await server.stop();
+  });
 
-    // test-wait-justification: crosses the overdue grace period after the real tool-call timeout fires
-    await Bun.sleep(20);
-
-    const healthRes = await server.app.handle(new Request("http://localhost/healthz"));
-    expect(healthRes.status).toBe(503);
-    const healthBody = (await healthRes.json()) as {
-      checks: Array<{ name: string; ok: boolean }>;
+  it("invokes the fatal supervisor for a late Panic without changing the timeout response", async () => {
+    const panic = new Panic({ message: "late tool invariant" });
+    const started = Promise.withResolvers<void>();
+    const observed = Promise.withResolvers<Panic>();
+    let fatalReports = 0;
+    const tool: ServerTool = {
+      id: "late-panic",
+      async init() {},
+      async destroy() {},
+      async list() {
+        return [
+          {
+            callableId: "late-panic.call",
+            name: "Late Panic",
+            description: "rejects with Panic after cancellation",
+            shortInput: [],
+          },
+        ];
+      },
+      async call(_callableId, _input, options) {
+        return await new Promise((_resolve, reject) => {
+          options?.signal?.addEventListener("abort", () => reject(panic), { once: true });
+          started.resolve();
+        });
+      },
     };
-    expect(healthBody.checks.find((check) => check.name === "tool-calls.overdue")?.ok).toBe(false);
+    jest.useFakeTimers({ now: 0 });
+    let server: ReturnType<typeof createToolServer> | undefined;
+    try {
+      server = createToolServer({
+        tools: [tool],
+        toolCallTimeouts: { defaultTimeoutMs: 10 },
+        reportFatalToolCallDefect: (reported) => {
+          fatalReports += 1;
+          if (Panic.is(reported)) observed.resolve(reported);
+        },
+      });
+      await server.init();
+      const responsePromise = server.app.handle(
+        new Request("http://localhost/call", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ callableId: "late-panic.call", input: {} }),
+        }),
+      );
+      await started.promise;
+      jest.advanceTimersByTime(10);
 
+      const response = await responsePromise;
+      expect(await response.json()).toEqual({
+        isError: true,
+        output: "Tool call timed out after 10ms",
+      });
+      expect(await observed.promise).toBe(panic);
+      expect(fatalReports).toBe(1);
+    } finally {
+      try {
+        await server?.stop();
+      } finally {
+        jest.useRealTimers();
+      }
+    }
+  });
+
+  it("reports a late non-Panic rejection to the fatal supervisor", async () => {
+    const defect = new Error("late logging defect");
+    const started = Promise.withResolvers<void>();
+    const observed = Promise.withResolvers<unknown>();
+    const chunks: string[] = [];
+    const output = { write: (chunk: string) => chunks.push(chunk) };
+    const logger = createLogger({
+      module: "late-error-test",
+      outputFormat: "jsonl",
+      stdout: output,
+      stderr: output,
+    });
+    Object.defineProperty(logger, "error", {
+      value(message: string) {
+        if (message === "tool plugin operation failed") throw defect;
+      },
+    });
+    const tool: ServerTool = {
+      id: "late-error",
+      async init() {},
+      async destroy() {},
+      async list() {
+        return [
+          {
+            callableId: "late-error.call",
+            name: "Late Error",
+            description: "settles through a broken logger after cancellation",
+            shortInput: [],
+          },
+        ];
+      },
+      async call(_callableId, _input, options) {
+        return await new Promise((_resolve, reject) => {
+          options?.signal?.addEventListener(
+            "abort",
+            () => reject(new Error("expected plugin cancellation failure")),
+            { once: true },
+          );
+          started.resolve();
+        });
+      },
+    };
+    jest.useFakeTimers({ now: 0 });
+    let server: ReturnType<typeof createToolServer> | undefined;
+    try {
+      server = createToolServer({
+        tools: [tool],
+        logger,
+        toolCallTimeouts: { defaultTimeoutMs: 10 },
+        reportFatalToolCallDefect: observed.resolve,
+      });
+      await server.init();
+      const responsePromise = server.app.handle(
+        new Request("http://localhost/call", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ callableId: "late-error.call", input: {} }),
+        }),
+      );
+      await started.promise;
+      jest.advanceTimersByTime(10);
+
+      const response = await responsePromise;
+      expect(await response.json()).toEqual({
+        isError: true,
+        output: "Tool call timed out after 10ms",
+      });
+      expect(await observed.promise).toMatchObject({ message: defect.message });
+    } finally {
+      try {
+        await server?.stop();
+      } finally {
+        jest.useRealTimers();
+      }
+    }
+  });
+
+  it("does not report an ordinary Level 2 completion after timeout", async () => {
+    const started = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    const settled = Promise.withResolvers<void>();
+    let fatalReports = 0;
+    const tool: ServerTool = {
+      id: "late-success",
+      async init() {},
+      async destroy() {},
+      async list() {
+        return [
+          {
+            callableId: "late-success.call",
+            name: "Late Success",
+            description: "resolves after the caller deadline",
+            shortInput: [],
+          },
+        ];
+      },
+      async call() {
+        started.resolve();
+        await release.promise;
+        settled.resolve();
+        return { late: true };
+      },
+    };
+    jest.useFakeTimers({ now: 0 });
+    let server: ReturnType<typeof createToolServer> | undefined;
+    try {
+      server = createToolServer({
+        tools: [tool],
+        toolCallTimeouts: { defaultTimeoutMs: 10 },
+        reportFatalToolCallDefect: () => {
+          fatalReports += 1;
+        },
+      });
+      await server.init();
+      const responsePromise = server.app.handle(
+        new Request("http://localhost/call", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ callableId: "late-success.call", input: {} }),
+        }),
+      );
+      await started.promise;
+      jest.advanceTimersByTime(10);
+
+      const response = await responsePromise;
+      expect(await response.json()).toEqual({
+        isError: true,
+        output: "Tool call timed out after 10ms",
+      });
+      release.resolve();
+      await settled.promise;
+      await Promise.resolve();
+      expect(fatalReports).toBe(0);
+    } finally {
+      release.resolve();
+      try {
+        await server?.stop();
+      } finally {
+        jest.useRealTimers();
+      }
+    }
+  });
+
+  it("leaves internal result-orchestration defects on the framework error path", async () => {
+    const defect = new Error("result logging defect");
+    const chunks: string[] = [];
+    const output = { write: (chunk: string) => chunks.push(chunk) };
+    const logger = createLogger({
+      module: "result-orchestration-defect-test",
+      outputFormat: "jsonl",
+      stdout: output,
+      stderr: output,
+    });
+    Object.defineProperty(logger, "info", {
+      value(message: string) {
+        if (message === "tool.call.result") throw defect;
+      },
+    });
+    const tool: ServerTool = {
+      id: "orchestration-defect",
+      async init() {},
+      async destroy() {},
+      async list() {
+        return [
+          {
+            callableId: "orchestration-defect.call",
+            name: "Orchestration Defect",
+            description: "completes before internal result logging fails",
+            shortInput: [],
+          },
+        ];
+      },
+      async call() {
+        return { ok: true };
+      },
+    };
+    const server = createToolServer({ tools: [tool], logger });
+
+    await server.init();
+    const response = await server.app.handle(
+      new Request("http://localhost/call", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ callableId: "orchestration-defect.call", input: {} }),
+      }),
+    );
+    expect(response.status).toBe(500);
+    expect(await response.text()).not.toContain('"isError":true');
     await server.stop();
   });
 
@@ -1615,53 +2602,109 @@ describe("createToolServer", () => {
       },
     };
 
+    jest.useFakeTimers({ now: 0 });
+    let server: ReturnType<typeof createToolServer> | undefined;
+    try {
+      server = createToolServer({
+        tools: [tool],
+        toolCallTimeouts: {
+          defaultTimeoutMs: 20,
+        },
+        healthConfig: {
+          eventLoopLagFailMs: 60_000,
+          maxRssBytes: Number.MAX_SAFE_INTEGER,
+          toolCallOverdueGraceMs: 10,
+        },
+      });
+      await server.init();
+      await server.start(0);
+
+      const callRes = await server.app.handle(
+        new Request("http://localhost/call", {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+          },
+          body: JSON.stringify({
+            callableId: "sync-throw.fail",
+            input: {},
+          }),
+        }),
+      );
+      expect(await callRes.json()).toEqual({
+        isError: true,
+        output: "sync boom",
+      });
+
+      jest.advanceTimersByTime(31);
+
+      const healthRes = await server.app.handle(new Request("http://localhost/healthz"));
+      const healthBody = (await healthRes.json()) as {
+        checks: Array<{ name: string; ok: boolean }>;
+        info: {
+          toolServer: {
+            activeCalls: unknown[];
+          };
+        };
+      };
+      expect(healthBody.checks.find((check) => check.name === "tool-calls.overdue")?.ok).toBe(true);
+      expect(healthBody.info.toolServer.activeCalls).toEqual([]);
+    } finally {
+      try {
+        await server?.stop();
+      } finally {
+        jest.useRealTimers();
+      }
+    }
+  });
+
+  it("wraps external TaggedErrors without returning or logging their causes or secrets", async () => {
+    class ExternalPluginSecretError extends TaggedError("ExternalPluginSecretError")<{
+      readonly token: string;
+      readonly message: string;
+    }> {}
+    const chunks: string[] = [];
+    const secret = "plugin-tagged-secret-value";
+    const tool: ServerTool = {
+      id: "tagged-secret",
+      async init() {},
+      async destroy() {},
+      async list() {
+        return [
+          {
+            callableId: "tagged-secret.fail",
+            name: "Tagged Secret",
+            description: "throws an external TaggedError",
+            shortInput: [],
+          },
+        ];
+      },
+      async call() {
+        throw new ExternalPluginSecretError({ token: secret, message: `token=${secret}` });
+      },
+    };
+    const output = { write: (chunk: string) => chunks.push(chunk) };
     const server = createToolServer({
       tools: [tool],
-      toolCallTimeouts: {
-        defaultTimeoutMs: 20,
-      },
-      healthConfig: {
-        eventLoopLagFailMs: 60_000,
-        maxRssBytes: Number.MAX_SAFE_INTEGER,
-        toolCallOverdueGraceMs: 10,
-      },
+      logger: createLogger({
+        module: "tagged-plugin-error-test",
+        outputFormat: "jsonl",
+        stdout: output,
+        stderr: output,
+      }),
     });
 
     await server.init();
-    await server.start(0);
-
-    const callRes = await server.app.handle(
+    const response = await server.app.handle(
       new Request("http://localhost/call", {
         method: "POST",
-        headers: {
-          "content-type": "application/json",
-        },
-        body: JSON.stringify({
-          callableId: "sync-throw.fail",
-          input: {},
-        }),
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ callableId: "tagged-secret.fail", input: {} }),
       }),
     );
-    expect(await callRes.json()).toEqual({
-      isError: true,
-      output: "sync boom",
-    });
-
-    // test-wait-justification: crosses the timeout and overdue grace window to detect leaked synchronous failures
-    await Bun.sleep(40);
-
-    const healthRes = await server.app.handle(new Request("http://localhost/healthz"));
-    const healthBody = (await healthRes.json()) as {
-      checks: Array<{ name: string; ok: boolean }>;
-      info: {
-        toolServer: {
-          activeCalls: unknown[];
-        };
-      };
-    };
-    expect(healthBody.checks.find((check) => check.name === "tool-calls.overdue")?.ok).toBe(true);
-    expect(healthBody.info.toolServer.activeCalls).toEqual([]);
-
+    const body = await response.json();
+    expect(body).toEqual({ isError: true, output: "External tagged error" });
+    expect(`${JSON.stringify(body)}\n${chunks.join("\n")}`).not.toContain(secret);
     await server.stop();
   });
 
@@ -1902,6 +2945,137 @@ describe("createToolServer", () => {
     expect(body.output).not.toContain("validate.runtime has invalid input.");
 
     await server.stop();
+  });
+
+  it("keeps plugin startup failure fatal without leaking TaggedError", async () => {
+    const failure = new ToolPluginHookError({
+      pluginId: "startup",
+      source: "builtin",
+      hook: "plugin.create",
+      cause: new Error("startup boom"),
+      message: "startup boom",
+    });
+    const pluginManager = {
+      init: async () => Result.err(failure),
+      destroy: async () => Result.ok(),
+      reload: async () => Result.ok(),
+      ensureFresh: async () => Result.ok(),
+      getLevel2Tools: () => [],
+      getStatuses: () => [],
+    };
+    const server = createToolServer({ pluginManager });
+
+    try {
+      await server.init();
+      throw new Error("expected startup failure");
+    } catch (cause) {
+      expect(cause).toBeInstanceOf(Error);
+      expect(cause).not.toBe(failure);
+      expect(cause instanceof Error ? cause.message : "").toContain("startup boom");
+    }
+  });
+
+  it("omits tools whose list hook fails while retaining healthy tools", async () => {
+    const healthy: ServerTool = {
+      id: "healthy",
+      async init() {},
+      async destroy() {},
+      async list() {
+        return [
+          { callableId: "healthy.call", name: "Healthy", description: "Healthy", shortInput: [] },
+        ];
+      },
+      async call() {},
+    };
+    const broken: ServerTool = {
+      id: "broken",
+      async init() {},
+      async destroy() {},
+      async list() {
+        throw new Error("list boom");
+      },
+      async call() {},
+    };
+    const server = createToolServer({ tools: [healthy, broken] });
+    await server.init();
+    const response = await server.app.handle(new Request("http://localhost/list"));
+    expect(await response.json()).toEqual({
+      tools: [
+        {
+          callableId: "healthy.call",
+          name: "Healthy",
+          description: "Healthy",
+          shortInput: [],
+          hidden: undefined,
+        },
+      ],
+    });
+    await server.stop();
+  });
+
+  it("propagates Panic from Level 2 hooks", async () => {
+    const panic = new Panic({ message: "list invariant" });
+    const tool: ServerTool = {
+      id: "panic",
+      async init() {},
+      async destroy() {},
+      async list() {
+        throw panic;
+      },
+      async call() {},
+    };
+    const server = createToolServer({ tools: [tool] });
+    try {
+      await server.init();
+      throw new Error("expected Panic");
+    } catch (cause) {
+      expect(Panic.is(cause)).toBe(true);
+    }
+  });
+
+  it("continues shutdown after aggregated plugin cleanup failure", async () => {
+    const hookFailure = new ToolPluginHookError({
+      pluginId: "cleanup",
+      source: "builtin",
+      hook: "instance.destroy",
+      cause: new Error("cleanup boom"),
+      message: "cleanup boom",
+    });
+    const cleanupFailure = new ToolPluginCleanupError({
+      failures: [hookFailure],
+      message: "cleanup boom",
+    });
+    const pluginManager = {
+      init: async () => Result.ok(),
+      destroy: async () => Result.err(cleanupFailure),
+      reload: async () => Result.ok(),
+      ensureFresh: async () => Result.ok(),
+      getLevel2Tools: () => [],
+      getStatuses: () => [],
+    };
+    const server = createToolServer({ pluginManager });
+    await server.init();
+    await expect(server.stop()).resolves.toBeUndefined();
+  });
+
+  it("stops the host and surfaces plugin cleanup Panic identity", async () => {
+    const panic = new Panic({ message: "plugin cleanup invariant" });
+    const pluginManager = {
+      init: async () => Result.ok(),
+      destroy: async () => {
+        throw panic;
+      },
+      reload: async () => Result.ok(),
+      ensureFresh: async () => Result.ok(),
+      getLevel2Tools: () => [],
+      getStatuses: () => [],
+    };
+    const server = createToolServer({ pluginManager });
+    await server.init();
+    await server.start(0);
+
+    await expect(server.stop()).rejects.toBe(panic);
+    expect(server.app.server).toBeNull();
   });
 
   it("invokes the unhealthy watchdog after repeated live failures", async () => {

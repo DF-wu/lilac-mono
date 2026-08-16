@@ -14,8 +14,8 @@ export type Offset = { type: "begin" } | { type: "now" } | { type: "cursor"; cur
 /** Delivery model for subscriptions. */
 export type Mode = "work" | "fanout" | "tail";
 
-/** Envelope stored in / read from the bus. */
-export type Message<TData = unknown> = {
+/** A completely decoded envelope stored in / read from the bus. */
+export type DecodedMessage<TData = unknown> = {
   topic: Topic;
   id: string;
   type: string;
@@ -24,6 +24,73 @@ export type Message<TData = unknown> = {
   headers?: Record<string, string>;
   data: TData;
 };
+
+/** A bounded projection of one value from the flat Redis stream field array. */
+export type RedisWireValueEvidence =
+  | { kind: "string"; value: string; truncated: boolean }
+  | {
+      kind: "non-string";
+      valueType:
+        | "array"
+        | "bigint"
+        | "boolean"
+        | "function"
+        | "null"
+        | "number"
+        | "object"
+        | "symbol"
+        | "undefined";
+    };
+
+/** Why a Redis stream entry could not be decoded as a message envelope. */
+export type RedisMessageDecodeIssue =
+  | {
+      field: "entry";
+      reason: "fields_not_array" | "odd_field_count" | "non_string_field";
+      index?: number;
+    }
+  | { field: "type"; reason: "missing" | "empty" }
+  | { field: "ts"; reason: "missing" | "invalid_number" }
+  | { field: "data"; reason: "missing" | "invalid_superjson" }
+  | { field: "headers"; reason: "invalid_superjson" | "not_string_record" };
+
+/**
+ * Explicit raw transport outcome for an entry that cannot form a valid message.
+ *
+ * Evidence is intentionally bounded and belongs in controlled recovery/dead-letter
+ * handling, not ordinary logs.
+ */
+export type RedisMessageDecodeFailure = {
+  _tag: "RedisMessageDecodeFailure";
+  topic: Topic;
+  id: string;
+  /** Absent; declared only so legacy raw-inspection callsites can narrow without a flag day. */
+  type?: never;
+  /** Absent; declared only so legacy raw-inspection callsites can narrow without a flag day. */
+  data?: never;
+  error: {
+    source: {
+      transport: "redis-streams";
+      streamKey: string;
+      topic: Topic;
+      messageId: string;
+    };
+    issues: readonly RedisMessageDecodeIssue[];
+    evidence: {
+      fields: readonly RedisWireValueEvidence[];
+      omittedValueCount: number;
+    };
+  };
+};
+
+/** Envelope stored in / read from the bus after successful transport decoding. */
+export type Message<TData = unknown> = DecodedMessage<TData>;
+
+/** Raw receive outcome: either an unknown-payload message or bounded decode-failure evidence. */
+export type RawMessageDecodeOutcome = Message<unknown> | RedisMessageDecodeFailure;
+
+/** Valid envelope accepted by publish; Redis assigns `id` and `ts`. */
+export type PublishMessage<TData> = Omit<DecodedMessage<TData>, "id" | "ts">;
 
 /** Low-level publish options (mostly transport-focused). */
 export type PublishOptions = {
@@ -35,16 +102,18 @@ export type PublishOptions = {
   key?: string;
   /** Optional metadata (string->string). */
   headers?: Record<string, string>;
-  /** Best-effort retention hint (e.g. approximate MAXLEN). */
-  retention?: { maxLenApprox?: number };
 };
 
-/** Flow control options for read loops. */
-export type BatchOptions = {
-  /** Max messages per poll. */
-  maxMessages?: number;
+/** Flow control options shared by subscription read loops. */
+export type SubscriptionWaitOptions = {
   /** Max time to block waiting for messages. */
   maxWaitMs?: number;
+};
+
+/** Flow control options for non-durable tail reads. */
+export type BatchOptions = SubscriptionWaitOptions & {
+  /** Max messages per poll. */
+  maxMessages?: number;
 };
 
 /** Durable subscription (consumer group) options. */
@@ -60,12 +129,7 @@ export type WorkOrFanoutSubscriptionOptions = {
   consumerId?: string;
   /** Destroy this consumer group when the subscription stops. */
   ephemeral?: boolean;
-  /**
-   * Only applied if the consumer group needs to be created.
-   * If the group already exists, the offset is ignored.
-   */
-  offset?: Exclude<Offset, { type: "cursor" }>;
-  batch?: BatchOptions;
+  batch?: SubscriptionWaitOptions;
 };
 
 /** Non-durable streaming read options (no consumer group). */
@@ -78,23 +142,8 @@ export type TailSubscriptionOptions = {
 /** Options shared by `subscribe()` variants. */
 export type SubscriptionOptions = WorkOrFanoutSubscriptionOptions | TailSubscriptionOptions;
 
-/** Handle for a live subscription. */
-export type BusSubscription = {
-  stop(): Promise<void>;
-  /** Settles when the underlying subscription loop exits, if exposed by the transport. */
-  done?: Promise<void>;
-};
-
 /** Manual pull API options for `fetch()`. */
 export type FetchOptions = {
   offset: Offset;
   limit?: number;
-};
-
-/** Context passed to subscription handlers. */
-export type HandleContext = {
-  /** Cursor of the current message. */
-  cursor: Cursor;
-  /** Acknowledge the message for durable modes (work/fanout). */
-  commit(): Promise<void>;
 };

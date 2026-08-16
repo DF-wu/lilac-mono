@@ -7,14 +7,18 @@ import { isToolExpansion } from "@stanley2058/lilac-agent";
 import {
   createToolResultArtifactStore,
   TOOL_RESULT_UNAVAILABLE_MESSAGE,
+  ToolResultArtifactStorageFailure,
   type ToolResultArtifactStore,
   type ToolResultOutput,
 } from "@stanley2058/lilac-tool-results";
 import { asSchema, tool, type ToolExecutionOptions, type ToolSet } from "ai";
+import { Panic, Result } from "better-result";
 import { z } from "zod";
 
 import {
   BASH_NO_OUTPUT_TIMEOUT_MS,
+  applyPatchResult,
+  createBatchToolResult,
   createCodingToolset,
   createEditFileInputSchema,
   createGrepInputSchema,
@@ -238,7 +242,7 @@ describe("coding tools", () => {
     expect(await readdir(cwd)).not.toContain("expanded-target");
     await expect(
       Promise.resolve().then(() =>
-        executable(tools, "read_file").execute(
+        executable(tools, "read").execute(
           { path: "marker.txt", dangerouslyAllow: true },
           options("filesystem-bypass-disabled"),
         ),
@@ -246,7 +250,7 @@ describe("coding tools", () => {
     ).rejects.toThrow("dangerouslyAllow is disabled");
     await expect(
       Promise.resolve().then(() =>
-        executable(tools, "edit_file").execute(
+        executable(tools, "edit").execute(
           {
             path: "marker.txt",
             oldText: "before",
@@ -259,7 +263,7 @@ describe("coding tools", () => {
     ).rejects.toThrow("dangerouslyAllow is disabled");
     await expect(
       Promise.resolve().then(() =>
-        executable(tools, "apply_patch").execute(
+        executable(tools, "patch").execute(
           {
             patchText: [
               "*** Begin Patch",
@@ -320,6 +324,112 @@ describe("coding tools", () => {
     });
   });
 
+  it("settles streaming Bash for hostile rejections and terminates on Panic", async () => {
+    const artifacts = createToolResultArtifactStore(path.join(cwd, "stream-settlement-artifacts"));
+    await artifacts.init();
+    const hostileTarget: object = Object.create(null);
+    const hostileProxy = new Proxy(hostileTarget, {
+      get() {
+        throw new Error("proxy get trap must stay contained");
+      },
+      getPrototypeOf() {
+        throw new Error("proxy prototype trap must stay contained");
+      },
+    });
+    const hostileString = {
+      [Symbol.toPrimitive]() {
+        throw new Error("String coercion must stay contained");
+      },
+      toString() {
+        throw new Error("toString must stay contained");
+      },
+    };
+    const hostileCauses: readonly unknown[] = [Object.create(null), hostileProxy, hostileString];
+
+    for (const [index, cause] of hostileCauses.entries()) {
+      const failingArtifacts: ToolResultArtifactStore = {
+        ...artifacts,
+        async createFromStream() {
+          throw cause;
+        },
+      };
+      const execution = executable(
+        createCodingToolset({
+          cwd,
+          bashStreamOutput: true,
+          bashMaxOutputBytes: 32,
+          artifactIntegration: {
+            artifacts: failingArtifacts,
+            scopeId: "scope-hostile-stream",
+            requestId: `request-hostile-stream-${index}`,
+            maxSpoolBytes: 1024 * 1024,
+          },
+        }),
+        "bash",
+      ).execute({ command: "printf '%0100d' 0" }, options(`bash-hostile-stream-${index}`));
+      if (!isAsyncIterable(execution)) throw new Error("expected streaming Bash output");
+      const consume = async () => {
+        const iterator = execution[Symbol.asyncIterator]();
+        while (true) {
+          const next = await iterator.next();
+          if (next.done) return next.value;
+        }
+      };
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const timeout = new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => reject(new Error("streaming Bash completion hung")), 5_000);
+      });
+      try {
+        await expect(Promise.race([consume(), timeout])).resolves.toMatchObject({
+          exitCode: 0,
+          truncation: {
+            completeOutputRetained: false,
+            retentionStatus: "artifact-write-failed",
+          },
+        });
+      } finally {
+        if (timer !== undefined) clearTimeout(timer);
+      }
+    }
+
+    const panic = new Panic({ message: "streaming artifact invariant failed" });
+    const panickingArtifacts: ToolResultArtifactStore = {
+      ...artifacts,
+      async createFromStream() {
+        throw panic;
+      },
+    };
+    const panickingExecution = executable(
+      createCodingToolset({
+        cwd,
+        bashStreamOutput: true,
+        bashMaxOutputBytes: 32,
+        artifactIntegration: {
+          artifacts: panickingArtifacts,
+          scopeId: "scope-panic-stream",
+          requestId: "request-panic-stream",
+          maxSpoolBytes: 1024 * 1024,
+        },
+      }),
+      "bash",
+    ).execute({ command: "printf '%0100d' 0" }, options("bash-panic-stream"));
+    if (!isAsyncIterable(panickingExecution)) throw new Error("expected streaming Bash output");
+    const consumePanic = async () => {
+      for await (const _update of panickingExecution) {
+        // Consume until the terminal rejection.
+      }
+    };
+    let panicTimer: ReturnType<typeof setTimeout> | undefined;
+    const panicTimeout = new Promise<never>((_resolve, reject) => {
+      panicTimer = setTimeout(() => reject(new Error("streaming Bash Panic hung")), 5_000);
+    });
+    try {
+      await expect(Promise.race([consumePanic(), panicTimeout])).rejects.toBe(panic);
+    } finally {
+      if (panicTimer !== undefined) clearTimeout(panicTimer);
+    }
+  });
+
   it("retains sanitized complete Bash output behind a bounded head/tail preview", async () => {
     const artifacts = createToolResultArtifactStore(path.join(cwd, "artifacts"));
     await artifacts.init();
@@ -371,7 +481,7 @@ describe("coding tools", () => {
     expect(result.truncation.originalStdoutBytes).toBeGreaterThan(300);
     expect(result.truncation.originalStderrBytes).toBeGreaterThan(200);
 
-    const read = executable(tools, "read_file");
+    const read = executable(tools, "read");
     const pages: string[] = [];
     let start: { type: "offset"; offset: number } = { type: "offset", offset: 0 };
     for (let page = 0; page < 100; page += 1) {
@@ -524,7 +634,7 @@ describe("coding tools", () => {
     ).rejects.toThrow("artifactIntegration.maxSpoolBytes must be a non-negative finite number");
   });
 
-  it("cleans Bash spools after timeout, abort, and artifact persistence failure", async () => {
+  it("cleans Bash spools after timeout, abort, and rejected artifact persistence", async () => {
     const artifacts = createToolResultArtifactStore(path.join(cwd, "cleanup-artifacts"));
     await artifacts.init();
     const before = await bashSpoolDirectories();
@@ -575,11 +685,85 @@ describe("coding tools", () => {
     ).execute({ command: "printf '%0100d' 0" }, options("bash-artifact-failure"));
     expect(failedPersistence).toMatchObject({
       exitCode: 0,
+      stdout: expect.stringContaining("0"),
       truncation: {
         completeOutputRetained: false,
         retentionStatus: "artifact-write-failed",
       },
     });
+    expect(failedPersistence).not.toHaveProperty("executionError");
+    expect(await bashSpoolDirectories()).toEqual(before);
+  });
+
+  it("maps an artifact Result Err to truncation retention failure", async () => {
+    const artifacts = createToolResultArtifactStore(path.join(cwd, "result-error-artifacts"));
+    await artifacts.init();
+    const before = await bashSpoolDirectories();
+    const failingArtifacts: ToolResultArtifactStore = {
+      ...artifacts,
+      async createFromStream() {
+        return Result.err(
+          new ToolResultArtifactStorageFailure({
+            operation: "write-content",
+            code: "ENOSPC",
+            message: "Tool result artifact write-content failed",
+          }),
+        );
+      },
+    };
+
+    const result = await executable(
+      createCodingToolset({
+        cwd,
+        bashMaxOutputBytes: 32,
+        artifactIntegration: {
+          artifacts: failingArtifacts,
+          scopeId: "scope-result-error",
+          requestId: "request-result-error",
+          maxSpoolBytes: 1024 * 1024,
+        },
+      }),
+      "bash",
+    ).execute({ command: "printf '%0100d' 0" }, options("bash-artifact-result-error"));
+
+    expect(result).toMatchObject({
+      exitCode: 0,
+      stdout: expect.stringContaining("0"),
+      truncation: {
+        completeOutputRetained: false,
+        retentionStatus: "artifact-write-failed",
+      },
+    });
+    expect(result).not.toHaveProperty("executionError");
+    expect(await bashSpoolDirectories()).toEqual(before);
+  });
+
+  it("preserves artifact Panic identity after cleaning the Bash spool", async () => {
+    const artifacts = createToolResultArtifactStore(path.join(cwd, "panic-artifacts"));
+    await artifacts.init();
+    const before = await bashSpoolDirectories();
+    const panic = new Panic({ message: "artifact invariant failed" });
+    const failingArtifacts: ToolResultArtifactStore = {
+      ...artifacts,
+      async createFromStream() {
+        throw panic;
+      },
+    };
+    const execution = executable(
+      createCodingToolset({
+        cwd,
+        bashMaxOutputBytes: 32,
+        artifactIntegration: {
+          artifacts: failingArtifacts,
+          scopeId: "scope-panic",
+          requestId: "request-panic",
+          maxSpoolBytes: 1024 * 1024,
+        },
+      }),
+      "bash",
+    ).execute({ command: "printf '%0100d' 0" }, options("bash-artifact-panic"));
+
+    await expect(Promise.resolve(execution)).rejects.toBe(panic);
     expect(await bashSpoolDirectories()).toEqual(before);
   });
 
@@ -590,7 +774,7 @@ describe("coding tools", () => {
     const tools = createCodingToolset({ cwd });
     await expect(
       Promise.resolve().then(() =>
-        executable(tools, "read_file").execute(
+        executable(tools, "read").execute(
           { path: "a.txt", cwd: "host:/repo" },
           options("read-ssh"),
         ),
@@ -598,7 +782,7 @@ describe("coding tools", () => {
     ).rejects.toThrow("local coding-tools adapter does not support SSH cwd target");
     await expect(
       Promise.resolve().then(() =>
-        executable(tools, "apply_patch").execute(
+        executable(tools, "patch").execute(
           {
             cwd: "host:/repo",
             patchText: "*** Begin Patch\n*** Delete File: a.txt\n*** End Patch",
@@ -615,6 +799,9 @@ describe("coding tools", () => {
     const editSchema = createEditFileInputSchema(true);
     expect(readSchema.safeParse({ path: "a.ts", format: "hashline" }).success).toBe(true);
     expect(grepSchema.safeParse({ pattern: "needle", mode: "hashline" }).success).toBe(true);
+    expect(grepSchema.safeParse({ pattern: "needle", path: "src" }).success).toBe(true);
+    expect(grepSchema.safeParse({ pattern: "needle", cwd: "src" }).success).toBe(false);
+    expect(grepSchema.safeParse({ pattern: "needle", includeContextLines: 1 }).success).toBe(false);
     expect(
       editSchema.safeParse({
         path: "a.ts",
@@ -627,7 +814,7 @@ describe("coding tools", () => {
     const serialized = JSON.stringify(readJsonSchema);
     expect(serialized).toContain('"hashline"');
     expect(serialized).toContain("runtime adapter has SSH configured");
-    const localEditSchema = createCodingToolset({ cwd }).edit_file?.inputSchema;
+    const localEditSchema = createCodingToolset({ cwd }).edit?.inputSchema;
     const localHashlineValidation = await asSchema(localEditSchema).validate?.({
       path: "a.ts",
       edits: [{ op: "replace", pos: "1#abcd", lines: ["next"] }],
@@ -635,9 +822,9 @@ describe("coding tools", () => {
     expect(localHashlineValidation?.success).toBe(false);
   });
 
-  it("read_file reads text and denies protected paths by default", async () => {
+  it("read reads text and denies protected paths by default", async () => {
     await writeFile(path.join(cwd, "hello.txt"), "hello\nworld\n");
-    const read = executable(createCodingToolset({ cwd }), "read_file");
+    const read = executable(createCodingToolset({ cwd }), "read");
     const result = await read.execute(
       { path: "hello.txt", format: "numbered", maxLines: 1 },
       options("read"),
@@ -655,7 +842,7 @@ describe("coding tools", () => {
         denyPaths: [protectedPath],
         allowGuardrailBypass: true,
       }),
-      "read_file",
+      "read",
     );
     const allowed = await protectedRead.execute(
       { path: protectedPath, dangerouslyAllow: true },
@@ -678,7 +865,7 @@ describe("coding tools", () => {
     await symlink(realDeniedDirectory, deniedDirectoryAlias);
     const symlinkedRootRead = executable(
       createCodingToolset({ cwd, denyPaths: [deniedDirectoryAlias] }),
-      "read_file",
+      "read",
     );
     expect(
       await symlinkedRootRead.execute(
@@ -690,7 +877,7 @@ describe("coding tools", () => {
 
   it("applies the configured UTF-8 payload cap independently of maxCharacters", async () => {
     await writeFile(path.join(cwd, "unicode.txt"), "A😀BéC");
-    const read = executable(createCodingToolset({ cwd, maxOutputBytes: 5 }), "read_file");
+    const read = executable(createCodingToolset({ cwd, maxOutputBytes: 5 }), "read");
 
     const result = await read.execute(
       { path: "unicode.txt", start: { type: "offset", offset: 0 }, maxCharacters: 100 },
@@ -705,41 +892,120 @@ describe("coding tools", () => {
     });
   });
 
-  it("read_file keeps image and PDF bytes out of its canonical result and attaches them for models", async () => {
-    const image = Buffer.from(
-      "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMB/axh8h0AAAAASUVORK5CYII=",
-      "base64",
+  it("read keeps image and PDF bytes out of its canonical result and attaches them for models", async () => {
+    const attachments = [
+      {
+        filename: "pixel.png",
+        mimeType: "image/png",
+        data: Buffer.from(
+          "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMB/axh8h0AAAAASUVORK5CYII=",
+          "base64",
+        ),
+      },
+      { filename: "photo.jpg", mimeType: "image/jpeg", data: Buffer.from([0xff, 0xd8, 0xff]) },
+      {
+        filename: "photo.jpeg",
+        mimeType: "image/jpeg",
+        data: Buffer.from([0xff, 0xd8, 0xff]),
+      },
+      { filename: "old.gif", mimeType: "image/gif", data: Buffer.from("GIF87a") },
+      { filename: "new.gif", mimeType: "image/gif", data: Buffer.from("GIF89a") },
+      {
+        filename: "image.webp",
+        mimeType: "image/webp",
+        data: Buffer.from([0x52, 0x49, 0x46, 0x46, 0, 0, 0, 0, 0x57, 0x45, 0x42, 0x50]),
+      },
+      { filename: "notes.pdf", mimeType: "application/pdf", data: Buffer.from("%PDF-1.4") },
+    ] as const;
+    await Promise.all(
+      attachments.map(({ filename, data }) => writeFile(path.join(cwd, filename), data)),
     );
-    const pdf = Buffer.from("%PDF-1.4\n%%EOF\n");
-    await Promise.all([
-      writeFile(path.join(cwd, "pixel.png"), image),
-      writeFile(path.join(cwd, "notes.pdf"), pdf),
-    ]);
     const tools = createCodingToolset({
       cwd,
       readFileDirectAttachmentSupported: true,
       maxInlineMediaBytesPerPart: 128,
     });
-    const read = executable(tools, "read_file");
+    const read = executable(tools, "read");
 
-    const imageResult = await read.execute({ path: "pixel.png" }, options("image-read"));
-    expect(imageResult).toMatchObject({
-      success: true,
-      kind: "attachment",
-      filename: "pixel.png",
-      mimeType: "image/png",
-      bytes: image.byteLength,
-    });
-    expect(JSON.stringify(imageResult)).not.toContain(image.toString("base64"));
+    for (const [index, attachment] of attachments.entries()) {
+      const toolCallId = `attachment-${index}`;
+      const result = await read.execute({ path: attachment.filename }, options(toolCallId));
+      expect(result).toMatchObject({
+        success: true,
+        kind: "attachment",
+        filename: attachment.filename,
+        mimeType: attachment.mimeType,
+        bytes: attachment.data.byteLength,
+      });
+      expect(JSON.stringify(result)).not.toContain(attachment.data.toString("base64"));
+      expect(
+        await toModelOutput(tools, "read", toolCallId, { path: attachment.filename }, result),
+      ).toEqual({
+        type: "content",
+        value: [
+          {
+            type: "text",
+            text: `Attached file from read: ${attachment.filename} (${attachment.mimeType}, ${attachment.data.byteLength} bytes).`,
+          },
+          {
+            type: "file",
+            mediaType: attachment.mimeType,
+            filename: attachment.filename,
+            data: { type: "data", data: attachment.data.toString("base64") },
+          },
+        ],
+      });
+    }
+    expect(tools.read?.description).toContain("native visual or document analysis");
+  });
+
+  it("read preserves attachment instructions and reports consumed attachment bytes", async () => {
+    const nestedDirectory = path.join(cwd, "nested");
+    const image = Buffer.from(
+      "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMB/axh8h0AAAAASUVORK5CYII=",
+      "base64",
+    );
+    await mkdir(nestedDirectory);
+    await Promise.all([
+      writeFile(path.join(nestedDirectory, "AGENTS.md"), "Inspect images carefully.\n"),
+      writeFile(path.join(nestedDirectory, "pixel.png"), image),
+    ]);
+    const tools = createCodingToolset({ cwd, readFileDirectAttachmentSupported: true });
+    const attachment = z
+      .object({
+        success: z.literal(true),
+        kind: z.literal("attachment"),
+        filename: z.string(),
+        mimeType: z.string(),
+        bytes: z.number(),
+        loadedInstructions: z.array(z.string()),
+        instructionsText: z.string(),
+      })
+      .passthrough()
+      .parse(
+        await executable(tools, "read").execute(
+          { path: "nested/pixel.png" },
+          options("attachment-instructions"),
+        ),
+      );
+
+    expect(attachment.loadedInstructions).toEqual([path.join(nestedDirectory, "AGENTS.md")]);
     expect(
-      await toModelOutput(tools, "read_file", "image-read", { path: "pixel.png" }, imageResult),
+      await toModelOutput(
+        tools,
+        "read",
+        "attachment-instructions",
+        { path: "nested/pixel.png" },
+        attachment,
+      ),
     ).toEqual({
       type: "content",
       value: [
         {
           type: "text",
-          text: `Attached file from read_file: pixel.png (image/png, ${image.byteLength} bytes).`,
+          text: `Attached file from read: pixel.png (image/png, ${image.byteLength} bytes).`,
         },
+        { type: "text", text: attachment.instructionsText.trim() },
         {
           type: "file",
           mediaType: "image/png",
@@ -748,36 +1014,98 @@ describe("coding tools", () => {
         },
       ],
     });
-
-    const pdfResult = await read.execute({ path: "notes.pdf" }, options("pdf-read"));
     expect(
-      await toModelOutput(tools, "read_file", "pdf-read", { path: "notes.pdf" }, pdfResult),
-    ).toMatchObject({
-      type: "content",
-      value: [
-        expect.anything(),
-        {
-          type: "file",
-          mediaType: "application/pdf",
-          filename: "notes.pdf",
-          data: { type: "data", data: pdf.toString("base64") },
-        },
-      ],
+      await toModelOutput(
+        tools,
+        "read",
+        "attachment-instructions",
+        { path: "nested/pixel.png" },
+        attachment,
+      ),
+    ).toEqual({
+      type: "error-text",
+      value: "Failed to read attachment bytes for 'pixel.png'.",
     });
-    expect(tools.read_file?.description).toContain("native visual or document analysis");
   });
 
-  it("read_file rejects mislabeled attachments and projects structured failures as errors", async () => {
+  it("read does not access or consume attachment state for malformed callback outputs", async () => {
+    const image = Buffer.from(
+      "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMB/axh8h0AAAAASUVORK5CYII=",
+      "base64",
+    );
+    await writeFile(path.join(cwd, "pixel.png"), image);
+    const tools = createCodingToolset({
+      cwd,
+      loadInstructions: false,
+      readFileDirectAttachmentSupported: true,
+    });
+    const read = executable(tools, "read");
+    const validOutput = {
+      success: true as const,
+      kind: "attachment" as const,
+      resolvedPath: path.join(cwd, "pixel.png"),
+      fileHash: "hash",
+      filename: "pixel.png",
+      mimeType: "image/png" as const,
+      bytes: image.byteLength,
+    };
+    const malformedOutputs = [
+      { ...validOutput, success: "true" },
+      { ...validOutput, kind: "file" },
+      { ...validOutput, resolvedPath: 1 },
+      { ...validOutput, fileHash: 1 },
+      { ...validOutput, filename: 1 },
+      { ...validOutput, mimeType: "application/octet-stream" },
+      { ...validOutput, bytes: `${image.byteLength}` },
+      { ...validOutput, loadedInstructions: [1] },
+      { ...validOutput, instructionsText: 1 },
+      { ...validOutput, unexpected: true },
+    ];
+
+    for (const [index, malformedOutput] of malformedOutputs.entries()) {
+      const toolCallId = `malformed-attachment-${index}`;
+      await read.execute({ path: "pixel.png" }, options(toolCallId));
+      expect(
+        await toModelOutput(tools, "read", toolCallId, { path: "pixel.png" }, malformedOutput),
+      ).toEqual({ type: "json", value: malformedOutput });
+      expect(
+        await toModelOutput(tools, "read", toolCallId, { path: "pixel.png" }, validOutput),
+      ).toMatchObject({
+        type: "content",
+        value: [
+          expect.anything(),
+          { type: "file", data: { type: "data", data: image.toString("base64") } },
+        ],
+      });
+    }
+
+    const malformedFailure = {
+      success: false,
+      resolvedPath: path.join(cwd, "missing.txt"),
+      error: { code: "INVALID", message: "missing" },
+    };
+    expect(
+      await toModelOutput(
+        tools,
+        "read",
+        "malformed-failure",
+        { path: "missing.txt" },
+        malformedFailure,
+      ),
+    ).toEqual({ type: "json", value: malformedFailure });
+  });
+
+  it("read rejects mislabeled attachments and projects structured failures as errors", async () => {
     await writeFile(path.join(cwd, "fake.png"), "not an image");
     const tools = createCodingToolset({ cwd, readFileDirectAttachmentSupported: true });
-    const read = executable(tools, "read_file");
+    const read = executable(tools, "read");
     const mislabeled = await read.execute({ path: "fake.png" }, options("fake-image"));
     expect(mislabeled).toMatchObject({ success: false });
     expect(JSON.stringify(mislabeled)).toContain("not a supported image or PDF");
 
     const missing = await read.execute({ path: "missing.txt" }, options("missing-read"));
     expect(
-      await toModelOutput(tools, "read_file", "missing-read", { path: "missing.txt" }, missing),
+      await toModelOutput(tools, "read", "missing-read", { path: "missing.txt" }, missing),
     ).toMatchObject({ type: "error-json", value: { success: false } });
   });
 
@@ -790,10 +1118,10 @@ describe("coding tools", () => {
     }
   });
 
-  it("read_file enables media explicitly and enforces the decoded per-part byte limit", async () => {
+  it("read enables media explicitly and enforces the decoded per-part byte limit", async () => {
     await writeFile(path.join(cwd, "large.webp"), Buffer.alloc(17));
     const textOnly = createCodingToolset({ cwd });
-    expect(textOnly.read_file?.description).not.toContain("native visual or document analysis");
+    expect(textOnly.read?.description).not.toContain("native visual or document analysis");
 
     const read = executable(
       createCodingToolset({
@@ -801,7 +1129,7 @@ describe("coding tools", () => {
         readFileDirectAttachmentSupported: true,
         maxInlineMediaBytesPerPart: 16,
       }),
-      "read_file",
+      "read",
     );
     const result = await read.execute({ path: "large.webp" }, options("large-image"));
     expect(result).toMatchObject({ success: false });
@@ -822,6 +1150,7 @@ describe("coding tools", () => {
       ttlMs: 60_000,
       maxBytesPerScope: 1024,
     });
+    if (created.status === "error") throw created.error;
     const read = executable(
       createCodingToolset({
         cwd,
@@ -832,11 +1161,11 @@ describe("coding tools", () => {
           requestId: "request-read",
         },
       }),
-      "read_file",
+      "read",
     );
     const first = await read.execute(
       {
-        path: created.uri,
+        path: created.value.uri,
         cwd: "ignored-host:/not-a-local-path",
         start: { type: "offset", offset: 2 },
         maxCharacters: 3,
@@ -847,7 +1176,7 @@ describe("coding tools", () => {
     expect(first).toEqual({
       success: true,
       kind: "artifact",
-      resolvedPath: created.uri,
+      resolvedPath: created.value.uri,
       content: "😀c",
       startOffset: 2,
       endOffset: 4,
@@ -867,16 +1196,16 @@ describe("coding tools", () => {
           requestId: "request-foreign",
         },
       }),
-      "read_file",
-    ).execute({ path: created.uri }, options("read-artifact-foreign"));
+      "read",
+    ).execute({ path: created.value.uri }, options("read-artifact-foreign"));
     expect(foreign).toMatchObject({
       success: false,
-      resolvedPath: created.uri,
+      resolvedPath: created.value.uri,
       error: { code: "UNKNOWN", message: TOOL_RESULT_UNAVAILABLE_MESSAGE },
     });
 
-    const unavailable = await executable(createCodingToolset({ cwd }), "read_file").execute(
-      { path: created.uri },
+    const unavailable = await executable(createCodingToolset({ cwd }), "read").execute(
+      { path: created.value.uri },
       options("read-artifact-no-authority"),
     );
     expect(unavailable).toMatchObject({
@@ -885,7 +1214,97 @@ describe("coding tools", () => {
     });
   });
 
-  it("preloads workspace AGENTS.md and adds only nested instructions to read_file", async () => {
+  it("searches scoped artifact URIs with a bounded inline result", async () => {
+    const artifacts = createToolResultArtifactStore(path.join(cwd, "grep-artifacts"));
+    await artifacts.init();
+    const created = await artifacts.create({
+      scopeId: "scope-grep",
+      requestId: "request-grep",
+      toolCallId: "producer",
+      toolName: "bash",
+      content: `first\n${"x".repeat(8_000)}:needle\nlast`,
+      ttlMs: 60_000,
+      maxBytesPerScope: 16 * 1024,
+    });
+    if (created.status === "error") throw created.error;
+    const filesBefore = await readdir(artifacts.rootDir);
+    const grep = executable(
+      createCodingToolset({
+        cwd,
+        maxOutputBytes: 512,
+        artifactIntegration: {
+          artifacts,
+          scopeId: "scope-grep",
+          requestId: "request-grep",
+        },
+      }),
+      "grep",
+    );
+
+    const output = await grep.execute(
+      { pattern: "needle", path: created.value.uri, fileExtensions: ["ts"] },
+      options("grep-artifact"),
+    );
+    expect(output).toMatchObject({
+      mode: "default",
+      truncated: true,
+      results: [{ file: created.value.uri, line: 2 }],
+    });
+    expect(JSON.stringify(output)).toContain("[truncated]");
+    expect(JSON.stringify(output)).toContain("needle");
+    expect(Buffer.byteLength(JSON.stringify(output, null, 2), "utf8")).toBeLessThanOrEqual(512);
+    expect(await readdir(artifacts.rootDir)).toEqual(filesBefore);
+
+    const foreign = await executable(
+      createCodingToolset({
+        cwd,
+        artifactIntegration: {
+          artifacts,
+          scopeId: "scope-foreign",
+          requestId: "request-foreign",
+        },
+      }),
+      "grep",
+    ).execute({ pattern: "needle", path: created.value.uri }, options("grep-artifact-foreign"));
+    expect(foreign).toMatchObject({ error: TOOL_RESULT_UNAVAILABLE_MESSAGE, results: [] });
+    expect(await readdir(artifacts.rootDir)).toEqual(filesBefore);
+  });
+
+  it("maintains expired artifacts after an unavailable artifact read", async () => {
+    const artifacts = createToolResultArtifactStore(path.join(cwd, "expired-read-artifacts"));
+    expect((await artifacts.init()).status).toBe("ok");
+    const created = await artifacts.create({
+      scopeId: "scope-read",
+      requestId: "request-read",
+      toolCallId: "producer",
+      toolName: "bash",
+      content: "expired",
+      ttlMs: -1,
+      maxBytesPerScope: 1024,
+    });
+    if (created.status === "error") throw created.error;
+    expect(await readdir(artifacts.rootDir)).toHaveLength(2);
+
+    const result = await executable(
+      createCodingToolset({
+        cwd,
+        artifactIntegration: {
+          artifacts,
+          scopeId: "scope-read",
+          requestId: "request-read",
+        },
+      }),
+      "read",
+    ).execute({ path: created.value.uri }, options("read-expired-artifact"));
+
+    expect(result).toMatchObject({
+      success: false,
+      error: { code: "UNKNOWN", message: TOOL_RESULT_UNAVAILABLE_MESSAGE },
+    });
+    expect(await readdir(artifacts.rootDir)).toEqual([]);
+  });
+
+  it("preloads workspace AGENTS.md and adds only nested instructions to read", async () => {
     const packageDirectory = path.join(cwd, "packages", "widget");
     const nestedDirectory = path.join(packageDirectory, "src");
     await mkdir(path.join(cwd, ".git"));
@@ -907,8 +1326,8 @@ describe("coding tools", () => {
       cwd: packageDirectory,
       preloadedInstructionPaths: workspace?.loaded,
     });
-    expect(tools.read_file?.description).toContain("AGENTS.md");
-    const read = executable(tools, "read_file");
+    expect(tools.read?.description).toContain("AGENTS.md");
+    const read = executable(tools, "read");
     const first = z
       .object({
         success: z.literal(true),
@@ -933,7 +1352,7 @@ describe("coding tools", () => {
           content: [
             {
               type: "tool-result",
-              toolName: "read_file",
+              toolName: "read",
               output: { type: "json", value: first },
             },
           ],
@@ -952,7 +1371,7 @@ describe("coding tools", () => {
           content: [
             {
               type: "tool-result",
-              toolName: "read_file",
+              toolName: "read",
               output: {
                 type: "content",
                 value: [{ type: "text", text: first.instructionsText }],
@@ -969,7 +1388,7 @@ describe("coding tools", () => {
         cwd: packageDirectory,
         preloadedInstructionPaths: workspace?.loaded,
       }),
-      "read_file",
+      "read",
     );
     const concurrentOptions = options("read-concurrent-1");
     const concurrent = await Promise.all([
@@ -1013,7 +1432,7 @@ describe("coding tools", () => {
       const aliasedInstructions = path.join(nestedDirectory, "rules.md");
       await writeFile(aliasedInstructions, "Aliased rules.\n");
       await symlink(aliasedInstructions, path.join(nestedDirectory, "AGENTS.md"));
-      const direct = await executable(createCodingToolset({ cwd }), "read_file").execute(
+      const direct = await executable(createCodingToolset({ cwd }), "read").execute(
         { path: "nested/AGENTS.md" },
         options("read-symlinked-agents"),
       );
@@ -1057,17 +1476,17 @@ describe("coding tools", () => {
     expect(result).toMatchObject({ results: expect.any(Array) });
   });
 
-  it("edit_file requires read_file and uses legacy replace-snippet semantics", async () => {
+  it("edit requires read and uses legacy replace-snippet semantics", async () => {
     await writeFile(path.join(cwd, "edit.txt"), "before\n");
     const tools = createCodingToolset({ cwd });
-    const edit = executable(tools, "edit_file");
+    const edit = executable(tools, "edit");
     const notRead = await edit.execute(
       { path: "edit.txt", oldText: "before", newText: "after" },
       options("edit-not-read"),
     );
     expect(notRead).toMatchObject({ success: false, error: { code: "NOT_READ" } });
 
-    await executable(tools, "read_file").execute({ path: "edit.txt" }, options("edit-read"));
+    await executable(tools, "read").execute({ path: "edit.txt" }, options("edit-read"));
     const edited = await edit.execute(
       { path: "edit.txt", oldText: "before", newText: "after" },
       options("edit"),
@@ -1076,7 +1495,7 @@ describe("coding tools", () => {
     expect(await readFile(path.join(cwd, "edit.txt"), "utf8")).toBe("after\n");
   });
 
-  it("apply_patch supports add, update, move, delete and refuses directory deletes", async () => {
+  it("patch supports add, update, move, delete and refuses directory deletes", async () => {
     await writeFile(path.join(cwd, "old.txt"), "old\n");
     const blockedPath = path.join(cwd, "blocked.txt");
     const applyPatch = executable(
@@ -1085,7 +1504,7 @@ describe("coding tools", () => {
         denyPaths: [blockedPath],
         allowGuardrailBypass: true,
       }),
-      "apply_patch",
+      "patch",
     );
     const patchText = [
       "*** Begin Patch",
@@ -1147,13 +1566,13 @@ describe("coding tools", () => {
     expect(await readFile(path.join(cwd, "trailing-empty.txt"), "utf8")).toBe("changed\n");
   });
 
-  it("apply_patch rejects add, update, and delete through a symlink into a denied directory", async () => {
+  it("patch rejects add, update, and delete through a symlink into a denied directory", async () => {
     const denied = path.join(cwd, "denied");
     await mkdir(denied);
     await writeFile(path.join(denied, "update.txt"), "before\n");
     await writeFile(path.join(denied, "delete.txt"), "keep\n");
     await symlink(denied, path.join(cwd, "workspace-link"), "dir");
-    const applyPatch = executable(createCodingToolset({ cwd, denyPaths: [denied] }), "apply_patch");
+    const applyPatch = executable(createCodingToolset({ cwd, denyPaths: [denied] }), "patch");
     const patches = [
       ["*** Begin Patch", "*** Add File: workspace-link/added.txt", "+blocked", "*** End Patch"],
       [
@@ -1182,7 +1601,7 @@ describe("coding tools", () => {
     expect(await readFile(path.join(denied, "delete.txt"), "utf8")).toBe("keep\n");
   });
 
-  it("apply_patch honors AbortSignal before starting later hunks", async () => {
+  it("patch honors AbortSignal before starting later hunks", async () => {
     const controller = new AbortController();
     let abortedReads = 0;
     const abortSignal = new Proxy(controller.signal, {
@@ -1206,14 +1625,128 @@ describe("coding tools", () => {
 
     await expect(
       Promise.resolve().then(() =>
-        executable(createCodingToolset({ cwd }), "apply_patch").execute(
+        executable(createCodingToolset({ cwd }), "patch").execute(
           { patchText },
           options("patch-abort", abortSignal),
         ),
       ),
-    ).rejects.toThrow("apply_patch aborted");
+    ).rejects.toMatchObject({
+      _tag: "PatchAbortedAfterCommit",
+      retrySafe: false,
+      message: expect.stringContaining("patch aborted"),
+      committedMutations: expect.arrayContaining([
+        { type: "file-written", path: path.join(cwd, "first.txt") },
+      ]),
+    });
     expect(await readFile(path.join(cwd, "first.txt"), "utf8")).toBe("first");
     expect(Bun.file(path.join(cwd, "later.txt")).size).toBe(0);
+  });
+
+  it("applyPatchResult distinguishes cancellation before mutation from cancellation after commit", async () => {
+    const preCommitController = new AbortController();
+    preCommitController.abort();
+    const beforeCommit = await applyPatchResult({
+      cwd,
+      denyPaths: [],
+      patchText: ["*** Begin Patch", "*** Add File: never.txt", "+never", "*** End Patch"].join(
+        "\n",
+      ),
+      abortSignal: preCommitController.signal,
+    });
+    expect(beforeCommit).toMatchObject({ status: "error", error: { _tag: "PatchAborted" } });
+    expect(Bun.file(path.join(cwd, "never.txt")).size).toBe(0);
+
+    const postCommitController = new AbortController();
+    let abortedReads = 0;
+    const abortSignal = new Proxy(postCommitController.signal, {
+      get(target, property) {
+        if (property === "aborted") {
+          abortedReads++;
+          if (abortedReads === 6) postCommitController.abort();
+        }
+        const value = Reflect.get(target, property, target);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+    const afterCommit = await applyPatchResult({
+      cwd,
+      denyPaths: [],
+      patchText: [
+        "*** Begin Patch",
+        "*** Add File: committed.txt",
+        "+committed",
+        "*** Add File: not-started.txt",
+        "+not started",
+        "*** End Patch",
+      ].join("\n"),
+      abortSignal,
+    });
+    expect(afterCommit).toMatchObject({
+      status: "error",
+      error: {
+        _tag: "PatchAbortedAfterCommit",
+        retrySafe: false,
+        committedMutations: expect.arrayContaining([
+          { type: "file-written", path: path.join(cwd, "committed.txt") },
+        ]),
+      },
+    });
+    expect(await readFile(path.join(cwd, "committed.txt"), "utf8")).toBe("committed");
+    expect(Bun.file(path.join(cwd, "not-started.txt")).size).toBe(0);
+  });
+
+  it("a filesystem-root deny path blocks every local coding-tool path", async () => {
+    await writeFile(path.join(cwd, "blocked.txt"), "blocked\n");
+    const filesystemRoot = path.parse(cwd).root;
+    const tools = createCodingToolset({ cwd, denyPaths: [filesystemRoot] });
+
+    const read = await executable(tools, "read").execute(
+      { path: "blocked.txt" },
+      options("root-deny-read"),
+    );
+    expect(read).toMatchObject({ success: false, error: { code: "PERMISSION" } });
+
+    const glob = await executable(tools, "glob").execute(
+      { patterns: ["**/*"] },
+      options("root-deny-glob"),
+    );
+    expect(glob).toMatchObject({ paths: [], error: expect.stringContaining("Access denied") });
+
+    const grep = await executable(tools, "grep").execute(
+      { pattern: "blocked" },
+      options("root-deny-grep"),
+    );
+    expect(grep).toMatchObject({ results: [], error: expect.stringContaining("Access denied") });
+
+    const edit = await executable(tools, "edit").execute(
+      { path: "blocked.txt", oldText: "blocked", newText: "changed" },
+      options("root-deny-edit"),
+    );
+    expect(edit).toMatchObject({ success: false, error: { code: "PERMISSION" } });
+
+    const bash = await executable(tools, "bash").execute(
+      { command: "true" },
+      options("root-deny-bash"),
+    );
+    expect(bash).toMatchObject({ executionError: { type: "blocked" } });
+
+    await expect(
+      Promise.resolve(
+        executable(tools, "patch").execute(
+          {
+            patchText: [
+              "*** Begin Patch",
+              "*** Add File: root-denied.txt",
+              "+denied",
+              "*** End Patch",
+            ].join("\n"),
+          },
+          options("root-deny-patch"),
+        ),
+      ),
+    ).rejects.toThrow("Access denied");
+    expect(await readFile(path.join(cwd, "blocked.txt"), "utf8")).toBe("blocked\n");
+    expect(Bun.file(path.join(cwd, "root-denied.txt")).size).toBe(0);
   });
 
   it("batch expands every enabled tool including delegation and rejects edit overlap", async () => {
@@ -1257,11 +1790,11 @@ describe("coding tools", () => {
           {
             tool_calls: [
               {
-                tool: "edit_file",
+                tool: "edit",
                 parameters: { path: "same.txt", oldText: "a", newText: "b" },
               },
               {
-                tool: "edit_file",
+                tool: "edit",
                 parameters: { path: "same.txt", oldText: "b", newText: "c" },
               },
             ],
@@ -1305,10 +1838,107 @@ describe("coding tools", () => {
     ).rejects.toThrow("at most 8");
   });
 
+  it("preserves Panic identity from batch child validation", async () => {
+    const panic = new Panic({ message: "batch schema invariant failed" });
+    const panickingSchema = z.unknown().transform((): Record<string, never> => {
+      throw panic;
+    });
+    const tools = createCodingToolset({
+      cwd,
+      extraTools: {
+        panicking: tool({ inputSchema: panickingSchema, execute: () => "unused" }),
+      },
+    });
+
+    await expect(
+      executable(tools, "batch").execute(
+        { tool_calls: [{ tool: "panicking", parameters: {} }] },
+        options("batch-validation-panic"),
+      ),
+    ).rejects.toBe(panic);
+  });
+
+  it("projects hostile batch validation causes without invoking object coercion", async () => {
+    const nullPrototypeCause: unknown = Object.create(null);
+    const hostileTarget: object = Object.create(null);
+    const hostileCause: unknown = new Proxy(hostileTarget, {
+      get() {
+        throw new Error("proxy get trap must stay contained");
+      },
+      getPrototypeOf() {
+        throw new Error("proxy prototype trap must stay contained");
+      },
+    });
+
+    for (const [index, cause] of [nullPrototypeCause, hostileCause].entries()) {
+      const hostileSchema = z.unknown().transform((): Record<string, never> => {
+        throw cause;
+      });
+      const tools = createCodingToolset({
+        cwd,
+        extraTools: {
+          hostile: tool({ inputSchema: hostileSchema, execute: () => "unused" }),
+        },
+      });
+
+      const expansion = await executable(tools, "batch").execute(
+        { tool_calls: [{ tool: "hostile", parameters: {} }] },
+        options(`batch-hostile-validation-${index}`),
+      );
+
+      expect(isToolExpansion(expansion)).toBe(true);
+      if (!isToolExpansion(expansion)) throw new Error("expected ToolExpansion");
+      expect(expansion.children[0]).toMatchObject({
+        invalid: true,
+        error: expect.stringContaining("Batch child input validation failed"),
+      });
+    }
+  });
+
+  it("projects hostile synchronous edit-target failures before rejecting the batch", async () => {
+    const hostileTarget: object = Object.create(null);
+    const hostileCause: unknown = new Proxy(hostileTarget, {
+      get() {
+        throw new Error("proxy get trap must stay contained");
+      },
+      getPrototypeOf() {
+        throw new Error("proxy prototype trap must stay contained");
+      },
+    });
+    const childTool = tool({
+      inputSchema: z.object({ path: z.string() }),
+      execute: () => "unused",
+    });
+    const batch = createBatchToolResult({
+      cwd,
+      getTools: () => ({ hostile_edit: childTool }),
+      getToolSpecs: () =>
+        new Map([
+          [
+            "hostile_edit",
+            {
+              name: "hostile_edit",
+              editTargets: () => {
+                throw hostileCause;
+              },
+            },
+          ],
+        ]),
+    });
+    if (batch.status === "error") throw batch.error;
+
+    await expect(
+      executable(batch.value, "batch").execute(
+        { tool_calls: [{ tool: "hostile_edit", parameters: { path: "file.txt" } }] },
+        options("batch-hostile-edit-targets"),
+      ),
+    ).rejects.toThrow("Batch edit-target resolution failed");
+  });
+
   it("keeps filtered tools out of a read-only profile and its batch", async () => {
     const tools = createCodingToolset({
       cwd,
-      enabledTools: ["read_file", "glob", "grep", "batch"],
+      enabledTools: ["read", "glob", "grep", "batch"],
       extraTools: {
         custom_tool: tool({
           inputSchema: z.object({ value: z.string() }),
@@ -1316,8 +1946,8 @@ describe("coding tools", () => {
         }),
       },
     });
-    expect(Object.keys(tools).sort()).toEqual(["batch", "glob", "grep", "read_file"]);
-    expect(createCodingToolset({ cwd, enabledTools: ["read_file"] }).batch).toBeUndefined();
+    expect(Object.keys(tools).sort()).toEqual(["batch", "glob", "grep", "read"]);
+    expect(createCodingToolset({ cwd, enabledTools: ["read"] }).batch).toBeUndefined();
 
     const wildcardTools = createCodingToolset({
       cwd,
@@ -1335,7 +1965,7 @@ describe("coding tools", () => {
 
     const excludedFromBatch = createCodingToolset({
       cwd,
-      enabledTools: ["read_file", "custom_tool", "batch"],
+      enabledTools: ["read", "custom_tool", "batch"],
       batchExcludedTools: ["custom_tool"],
       extraTools: {
         custom_tool: tool({
@@ -1367,11 +1997,11 @@ describe("coding tools", () => {
       };
     };
     const exposedNames = schemaShape.properties?.tool_calls?.items?.properties?.tool?.enum ?? [];
-    expect(exposedNames.sort()).toEqual(["glob", "grep", "read_file"]);
+    expect(exposedNames.sort()).toEqual(["glob", "grep", "read"]);
 
     const expansion = await executable(tools, "batch").execute(
       {
-        tool_calls: ["bash", "edit_file", "apply_patch"].map((name) => ({
+        tool_calls: ["bash", "edit", "patch"].map((name) => ({
           tool: name,
           parameters: {},
         })),
@@ -1384,7 +2014,40 @@ describe("coding tools", () => {
     expect(expansion.children.every((child) => child.invalid === true)).toBe(true);
   });
 
-  it("rejects dangerouslyAllow by default for bash, filesystem, edit, and apply_patch", async () => {
+  it("normalizes legacy child names without advertising them in batch", async () => {
+    const tools = createCodingToolset({ cwd, enabledTools: ["read", "batch"] });
+    const schema = JSON.stringify(await asSchema(tools.batch?.inputSchema).jsonSchema);
+    expect(schema).toContain('"read"');
+    expect(schema).not.toContain("read_file");
+
+    const expansion = await executable(tools, "batch").execute(
+      { tool_calls: [{ tool: "read_file", parameters: { path: "missing.txt" } }] },
+      options("legacy-read-child"),
+    );
+    expect(isToolExpansion(expansion)).toBe(true);
+    if (!isToolExpansion(expansion)) throw new Error("expected ToolExpansion");
+    expect(expansion.children[0]?.toolName).toBe("read");
+  });
+
+  it("prefers an exact legacy-named batch child over the compatibility alias", async () => {
+    const tools = createCodingToolset({
+      cwd,
+      enabledTools: ["read", "read_file", "batch"],
+      extraTools: {
+        read_file: tool({ inputSchema: z.object({}), execute: () => "legacy" }),
+      },
+    });
+
+    const expansion = await executable(tools, "batch").execute(
+      { tool_calls: [{ tool: "read_file", parameters: {} }] },
+      options("exact-legacy-read-child"),
+    );
+    expect(isToolExpansion(expansion)).toBe(true);
+    if (!isToolExpansion(expansion)) throw new Error("expected ToolExpansion");
+    expect(expansion.children[0]?.toolName).toBe("read_file");
+  });
+
+  it("rejects dangerouslyAllow by default for bash, filesystem, edit, and patch", async () => {
     await writeFile(path.join(cwd, "guarded.txt"), "before\n");
     const tools = createCodingToolset({ cwd });
     const calls = [
@@ -1394,12 +2057,12 @@ describe("coding tools", () => {
           options("bypass-bash"),
         ),
       () =>
-        executable(tools, "read_file").execute(
+        executable(tools, "read").execute(
           { path: "guarded.txt", dangerouslyAllow: true },
           options("bypass-read"),
         ),
       () =>
-        executable(tools, "edit_file").execute(
+        executable(tools, "edit").execute(
           {
             path: "guarded.txt",
             oldText: "before",
@@ -1409,7 +2072,7 @@ describe("coding tools", () => {
           options("bypass-edit"),
         ),
       () =>
-        executable(tools, "apply_patch").execute(
+        executable(tools, "patch").execute(
           {
             patchText: [
               "*** Begin Patch",

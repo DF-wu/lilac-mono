@@ -7,15 +7,61 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { ExternalToolExecutionOutcome, ToolResultOutput } from "@stanley2058/lilac-agent";
-import { isRecord } from "@stanley2058/lilac-utils";
+import { isRecord, opaqueErrorMessage } from "@stanley2058/lilac-utils";
 import { asSchema, type ToolSet } from "ai";
 import type { ClaudeCodeSettings } from "ai-sdk-provider-claude-code";
+import { Panic, Result, TaggedError, type Result as ResultType } from "better-result";
 import path from "node:path";
+import { z } from "zod";
 
 const SERVER_NAME = "lilac";
 const NAMESPACED_PREFIX = `mcp__${SERVER_NAME}__`;
 const CORRELATION_TTL_MS = 5 * 60_000;
 const MAX_PENDING_CORRELATIONS = 256;
+
+function canonicalLilacToolName(name: string): string {
+  switch (name) {
+    case "read_file":
+      return "read";
+    case "edit_file":
+      return "edit";
+    case "apply_patch":
+      return "patch";
+    default:
+      return name;
+  }
+}
+
+const legacyBatchArgumentsSchema = z.object({
+  tool_calls: z.array(
+    z.object({
+      tool: z.string(),
+      parameters: z.record(z.string(), z.unknown()).optional(),
+    }),
+  ),
+});
+
+export function normalizeLegacyBatchArguments(
+  input: Record<string, unknown>,
+  exposedNames: ReadonlySet<string>,
+): Record<string, unknown> {
+  const decoded = legacyBatchArgumentsSchema.safeParse(input);
+  if (!decoded.success) return input;
+  let changed = false;
+  const toolCalls = decoded.data.tool_calls.map((call) => {
+    const requestedName = call.tool;
+    const toolName = exposedNames.has(requestedName)
+      ? requestedName
+      : canonicalLilacToolName(requestedName);
+    if (toolName === requestedName || !exposedNames.has(toolName)) return call;
+    changed = true;
+    return {
+      tool: toolName,
+      ...(call.parameters === undefined ? {} : { parameters: call.parameters }),
+    };
+  });
+  return changed ? { ...decoded.data, tool_calls: toolCalls } : input;
+}
 
 type CanUseTool = NonNullable<ClaudeCodeSettings["canUseTool"]>;
 type McpServers = NonNullable<ClaudeCodeSettings["mcpServers"]>;
@@ -39,8 +85,66 @@ export type ClaudeCodeToolBridge = {
   canUseTool: CanUseTool;
   exposedToolNames: readonly string[];
   clear(): void;
+  closeResult(): Promise<ResultType<void, ClaudeCodeToolBridgeCleanupFailed>>;
   close(): Promise<void>;
 };
+
+export class ClaudeCodeBuiltInToolUnsupported extends TaggedError(
+  "ClaudeCodeBuiltInToolUnsupported",
+)<{
+  readonly toolName: string;
+  readonly message: string;
+}> {}
+
+export class ClaudeCodeToolBridgeConfigurationFailed extends TaggedError(
+  "ClaudeCodeToolBridgeConfigurationFailed",
+)<{
+  readonly toolName: string;
+  readonly cause?: unknown;
+  readonly message: string;
+}> {}
+
+export class ClaudeCodeToolOutputMappingFailed extends TaggedError(
+  "ClaudeCodeToolOutputMappingFailed",
+)<{
+  readonly outputType: string;
+  readonly cause?: unknown;
+  readonly message: string;
+}> {}
+
+export class ClaudeCodeToolExecutionFailed extends TaggedError("ClaudeCodeToolExecutionFailed")<{
+  readonly toolName: string;
+  readonly cause: unknown;
+  readonly message: string;
+}> {}
+
+export class ClaudeCodeToolExecutionCancelled extends TaggedError(
+  "ClaudeCodeToolExecutionCancelled",
+)<{
+  readonly toolName: string;
+  readonly cause: unknown;
+  readonly message: string;
+}> {}
+
+export class ClaudeCodeToolBridgeCleanupFailed extends TaggedError(
+  "ClaudeCodeToolBridgeCleanupFailed",
+)<{
+  readonly cause: unknown;
+  readonly message: string;
+}> {}
+
+export type ClaudeCodeToolBridgeCreateError =
+  | ClaudeCodeBuiltInToolUnsupported
+  | ClaudeCodeToolBridgeConfigurationFailed;
+
+function resultOutcome<T, E>(
+  result: ResultType<T, E>,
+): { ok: true; value: T } | { ok: false; error: E } {
+  return result.match<{ ok: true; value: T } | { ok: false; error: E }>({
+    ok: (value) => ({ ok: true, value }),
+    err: (error) => ({ ok: false, error }),
+  });
+}
 
 export type ClaudeCodeToolCatalogMetadata = {
   readonly sourceId: string;
@@ -64,39 +168,56 @@ export type ClaudeCodeBuiltInTool = (typeof CLAUDE_CODE_BUILT_IN_TOOLS)[number];
 const SUPPORTED_BUILT_IN_TOOLS: ReadonlySet<string> = new Set(CLAUDE_CODE_BUILT_IN_TOOLS);
 
 /** Fail closed on any built-in Lilac has not vetted, however it was supplied. */
-export function validateClaudeCodeBuiltInTools(
+export function validateClaudeCodeBuiltInToolsResult(
   names: readonly string[] = [],
-): ClaudeCodeBuiltInTool[] {
+): ResultType<ClaudeCodeBuiltInTool[], ClaudeCodeBuiltInToolUnsupported> {
   for (const name of names) {
     if (!SUPPORTED_BUILT_IN_TOOLS.has(name)) {
-      throw new Error(
-        `Claude built-in tool '${name}' is not supported; allowed: ${CLAUDE_CODE_BUILT_IN_TOOLS.join(", ")}`,
+      return Result.err(
+        new ClaudeCodeBuiltInToolUnsupported({
+          toolName: name,
+          message: `Claude built-in tool '${name}' is not supported; allowed: ${CLAUDE_CODE_BUILT_IN_TOOLS.join(", ")}`,
+        }),
       );
     }
   }
-  return [...names] as ClaudeCodeBuiltInTool[];
+  return Result.ok(
+    names.filter((name): name is ClaudeCodeBuiltInTool => SUPPORTED_BUILT_IN_TOOLS.has(name)),
+  );
+}
+
+/** Compatibility adapter for callers that still consume configuration failures as exceptions. */
+export function validateClaudeCodeBuiltInTools(
+  names: readonly string[] = [],
+): ClaudeCodeBuiltInTool[] {
+  const validated = resultOutcome(validateClaudeCodeBuiltInToolsResult(names));
+  if (!validated.ok) throw validated.error;
+  return validated.value;
 }
 
 function toolError(message: string): CallToolResult {
   return { isError: true, content: [{ type: "text", text: message }] };
 }
 
-function stringifyJson(value: unknown): string {
+function stringifyJson(value: unknown): ResultType<string, ClaudeCodeToolOutputMappingFailed> {
   try {
-    return JSON.stringify(value) ?? "null";
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    throw new Error(`Tool output is not JSON-serializable: ${message}`, { cause: error });
+    return Result.ok(JSON.stringify(value) ?? "null");
+  } catch (cause) {
+    if (Panic.is(cause)) throw cause;
+    return Result.err(
+      new ClaudeCodeToolOutputMappingFailed({
+        outputType: "json",
+        cause,
+        message: `Tool output is not JSON-serializable: ${opaqueErrorMessage(cause, "opaque serialization failure")}`,
+      }),
+    );
   }
 }
 
 function resourceName(url: string, fallback: string): string {
-  try {
-    const parsed = new URL(url);
-    return path.posix.basename(parsed.pathname) || parsed.hostname || fallback;
-  } catch {
-    return fallback;
-  }
+  if (!URL.canParse(url)) return fallback;
+  const parsed = new URL(url);
+  return path.posix.basename(parsed.pathname) || parsed.hostname || fallback;
 }
 
 function toBase64(data: string | Uint8Array | ArrayBuffer): string {
@@ -105,7 +226,9 @@ function toBase64(data: string | Uint8Array | ArrayBuffer): string {
   return Buffer.from(data).toString("base64");
 }
 
-function mapContentOutput(output: Extract<ToolResultOutput, { type: "content" }>): CallToolResult {
+function mapContentOutput(
+  output: Extract<ToolResultOutput, { type: "content" }>,
+): ResultType<CallToolResult, ClaudeCodeToolOutputMappingFailed> {
   const content: CallToolResult["content"] = [];
 
   for (const part of output.value) {
@@ -189,10 +312,15 @@ function mapContentOutput(output: Extract<ToolResultOutput, { type: "content" }>
             });
             break;
           case "reference":
-            throw new Error("Claude MCP cannot represent provider file references");
+            return Result.err(
+              new ClaudeCodeToolOutputMappingFailed({
+                outputType: "file-reference",
+                message: "Claude MCP cannot represent provider file references",
+              }),
+            );
           default: {
             const _exhaustive: never = part.data;
-            throw new Error(`Unsupported file data: ${String(_exhaustive)}`);
+            return _exhaustive;
           }
         }
         break;
@@ -209,47 +337,63 @@ function mapContentOutput(output: Extract<ToolResultOutput, { type: "content" }>
       case "image-file-id":
       case "image-file-reference":
       case "custom":
-        throw new Error(`Claude MCP cannot represent tool output content type '${part.type}'`);
+        return Result.err(
+          new ClaudeCodeToolOutputMappingFailed({
+            outputType: part.type,
+            message: `Claude MCP cannot represent tool output content type '${part.type}'`,
+          }),
+        );
       default: {
         const _exhaustive: never = part;
-        throw new Error(`Unsupported tool output content: ${String(_exhaustive)}`);
+        return _exhaustive;
       }
     }
   }
 
-  return { content };
+  return Result.ok({ content });
 }
 
+export function mapToolResultOutputToMcpResult(
+  output: ToolResultOutput,
+  isError: boolean,
+): ResultType<CallToolResult, ClaudeCodeToolOutputMappingFailed> {
+  switch (output.type) {
+    case "text":
+      return Result.ok({ isError, content: [{ type: "text", text: output.value }] });
+    case "json": {
+      return stringifyJson(output.value).map((text) => ({
+        isError,
+        content: [{ type: "text", text }],
+        ...(isRecord(output.value) ? { structuredContent: output.value } : {}),
+      }));
+    }
+    case "execution-denied":
+      return Result.ok(toolError(output.reason ?? "Tool execution was denied."));
+    case "error-text":
+      return Result.ok(toolError(output.value));
+    case "error-json": {
+      return stringifyJson(output.value).map(toolError);
+    }
+    case "content": {
+      return mapContentOutput(output).map((result) =>
+        isError ? { ...result, isError: true } : result,
+      );
+    }
+    default: {
+      const _exhaustive: never = output;
+      return _exhaustive;
+    }
+  }
+}
+
+/** Compatibility adapter for the established synchronous MCP mapping API. */
 export function mapToolResultOutputToMcp(
   output: ToolResultOutput,
   isError: boolean,
 ): CallToolResult {
-  switch (output.type) {
-    case "text":
-      return { isError, content: [{ type: "text", text: output.value }] };
-    case "json": {
-      const text = stringifyJson(output.value);
-      return {
-        isError,
-        content: [{ type: "text", text }],
-        ...(isRecord(output.value) ? { structuredContent: output.value } : {}),
-      };
-    }
-    case "execution-denied":
-      return toolError(output.reason ?? "Tool execution was denied.");
-    case "error-text":
-      return toolError(output.value);
-    case "error-json":
-      return toolError(stringifyJson(output.value));
-    case "content": {
-      const result = mapContentOutput(output);
-      return isError ? { ...result, isError: true } : result;
-    }
-    default: {
-      const _exhaustive: never = output;
-      throw new Error(`Unsupported tool result output: ${String(_exhaustive)}`);
-    }
-  }
+  const mapped = resultOutcome(mapToolResultOutputToMcpResult(output, isError));
+  if (!mapped.ok) throw mapped.error;
+  return mapped.value;
 }
 
 function mapExecutedExpansionToMcp(
@@ -267,13 +411,15 @@ function mapExecutedExpansionToMcp(
       text: `[${index}/${children.length}] tool=${child.toolName} id=${child.toolCallId} outcome=${child.outcome} isError=${child.isError}`,
     });
 
-    try {
-      const mapped = mapToolResultOutputToMcp(child.toolOutput, child.isError);
-      content.push(...mapped.content);
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      content.push({ type: "text", text: `Failed to map child tool output: ${message}` });
-    }
+    const mapped = mapToolResultOutputToMcpResult(child.toolOutput, child.isError);
+    mapped.match({
+      ok: (value) => content.push(...value.content),
+      err: (error) =>
+        content.push({
+          type: "text",
+          text: `Failed to map child tool output: ${error.message}`,
+        }),
+    });
 
     return {
       index,
@@ -319,7 +465,7 @@ function catalogSearchHint(metadata: ClaudeCodeToolCatalogMetadata): string {
   ].join("\n");
 }
 
-export async function createClaudeCodeToolBridge(options: {
+export async function createClaudeCodeToolBridgeResult(options: {
   tools: ToolSet;
   /**
    * Deferred catalog tools keyed by model-facing name. Exposed tools absent
@@ -334,7 +480,7 @@ export async function createClaudeCodeToolBridge(options: {
    */
   builtInTools?: readonly ClaudeCodeBuiltInTool[];
   now?: () => number;
-}): Promise<ClaudeCodeToolBridge> {
+}): Promise<ResultType<ClaudeCodeToolBridge, ClaudeCodeToolBridgeCreateError>> {
   // Provider-executed tools are run by the model, not Lilac, so there is
   // nothing to expose through MCP. A tool that is merely missing `execute`
   // still fails loudly below, because that is a toolset bug rather than a
@@ -343,17 +489,31 @@ export async function createClaudeCodeToolBridge(options: {
     ([name, definition]) => name !== "tool_search" && definition.isProviderExecuted !== true,
   );
   const exposedNames = new Set(exposedEntries.map(([name]) => name));
-  const allowedBuiltIns = new Set<string>(validateClaudeCodeBuiltInTools(options.builtInTools));
+  const validatedBuiltIns = resultOutcome(
+    validateClaudeCodeBuiltInToolsResult(options.builtInTools),
+  );
+  if (!validatedBuiltIns.ok) return Result.err(validatedBuiltIns.error);
+  const allowedBuiltIns = new Set<string>(validatedBuiltIns.value);
   const validators = new Map<string, NonNullable<ReturnType<typeof asSchema>["validate"]>>();
   const declarations: McpTool[] = [];
 
   for (const [toolName, definition] of exposedEntries) {
     if (typeof definition.execute !== "function") {
-      throw new Error(`Cannot expose Claude MCP tool '${toolName}': execute is missing`);
+      return Result.err(
+        new ClaudeCodeToolBridgeConfigurationFailed({
+          toolName,
+          message: `Cannot expose Claude MCP tool '${toolName}': execute is missing`,
+        }),
+      );
     }
     const schema = asSchema(definition.inputSchema);
     if (!schema.validate) {
-      throw new Error(`Cannot expose Claude MCP tool '${toolName}': input validation is missing`);
+      return Result.err(
+        new ClaudeCodeToolBridgeConfigurationFailed({
+          toolName,
+          message: `Cannot expose Claude MCP tool '${toolName}': input validation is missing`,
+        }),
+      );
     }
     validators.set(toolName, schema.validate);
     const catalogMetadata = options.catalogMetadata?.[toolName];
@@ -371,8 +531,14 @@ export async function createClaudeCodeToolBridge(options: {
         }),
       );
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      throw new Error(`Cannot expose Claude MCP tool '${toolName}': ${message}`, { cause: error });
+      if (Panic.is(error)) throw error;
+      return Result.err(
+        new ClaudeCodeToolBridgeConfigurationFailed({
+          toolName,
+          cause: error,
+          message: `Cannot expose Claude MCP tool '${toolName}': ${opaqueErrorMessage(error, "opaque schema failure")}`,
+        }),
+      );
     }
   }
 
@@ -386,12 +552,15 @@ export async function createClaudeCodeToolBridge(options: {
 
   server.server.setRequestHandler(ListToolsRequestSchema, () => ({ tools: declarations }));
   server.server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
-    const toolName = request.params.name;
+    const requestedName = request.params.name;
+    const toolName = exposedNames.has(requestedName)
+      ? requestedName
+      : canonicalLilacToolName(requestedName);
     const validate = validators.get(toolName);
     if (!validate || !exposedNames.has(toolName))
       return toolError(`Unknown Lilac tool '${toolName}'`);
 
-    const rawInput = { ...request.params.arguments };
+    let rawInput = { ...request.params.arguments };
     const nonce = rawInput[nonceKey];
     delete rawInput[nonceKey];
     if (typeof nonce !== "string") {
@@ -406,6 +575,7 @@ export async function createClaudeCodeToolBridge(options: {
     if (now() - correlation.createdAt > CORRELATION_TTL_MS) {
       return toolError(`Lilac tool '${toolName}' has expired execution correlation`);
     }
+    if (toolName === "batch") rawInput = normalizeLegacyBatchArguments(rawInput, exposedNames);
 
     const validation = await validate(rawInput);
     if (!validation.success) {
@@ -426,9 +596,22 @@ export async function createClaudeCodeToolBridge(options: {
       if (outcome.expansion) {
         return toolError(`Lilac tool '${toolName}' returned an unsupported tool-call expansion`);
       }
-      return mapToolResultOutputToMcp(outcome.toolOutput, outcome.isError);
-    } catch (error) {
-      return toolError(error instanceof Error ? error.message : String(error));
+      const mapped = mapToolResultOutputToMcpResult(outcome.toolOutput, outcome.isError);
+      return mapped.match({ ok: (value) => value, err: (error) => toolError(error.message) });
+    } catch (cause) {
+      if (Panic.is(cause)) throw cause;
+      const error = extra.signal.aborted
+        ? new ClaudeCodeToolExecutionCancelled({
+            toolName,
+            cause,
+            message: opaqueErrorMessage(cause, `Lilac tool '${toolName}' execution was cancelled`),
+          })
+        : new ClaudeCodeToolExecutionFailed({
+            toolName,
+            cause,
+            message: opaqueErrorMessage(cause, `Lilac tool '${toolName}' execution failed`),
+          });
+      return toolError(error.message);
     }
   });
 
@@ -439,7 +622,10 @@ export async function createClaudeCodeToolBridge(options: {
       if (allowedBuiltIns.has(toolName)) return { behavior: "allow", updatedInput: input };
       return { behavior: "deny", message: `Claude built-in tool '${toolName}' is disabled` };
     }
-    const localName = toolName.slice(NAMESPACED_PREFIX.length);
+    const requestedName = toolName.slice(NAMESPACED_PREFIX.length);
+    const localName = exposedNames.has(requestedName)
+      ? requestedName
+      : canonicalLilacToolName(requestedName);
     if (!exposedNames.has(localName)) {
       return { behavior: "deny", message: `Unknown Lilac tool '${localName}'` };
     }
@@ -458,22 +644,47 @@ export async function createClaudeCodeToolBridge(options: {
     };
   };
 
-  return {
+  const closeResult = async (): Promise<ResultType<void, ClaudeCodeToolBridgeCleanupFailed>> => {
+    pending.clear();
+    try {
+      await server.close();
+      return Result.ok();
+    } catch (cause) {
+      if (Panic.is(cause)) throw cause;
+      return Result.err(
+        new ClaudeCodeToolBridgeCleanupFailed({
+          cause,
+          message: "Claude MCP bridge cleanup failed",
+        }),
+      );
+    }
+  };
+  return Result.ok({
     mcpServers: {
       [SERVER_NAME]: { type: "sdk", name: SERVER_NAME, instance: server },
     },
     canUseTool,
     exposedToolNames: [...exposedNames],
     clear: () => pending.clear(),
+    closeResult,
     close: async () => {
-      pending.clear();
-      await server.close();
+      const closed = resultOutcome(await closeResult());
+      if (!closed.ok) throw closed.error;
     },
-  };
+  });
+}
+
+/** Compatibility adapter for the established bridge construction rejection contract. */
+export async function createClaudeCodeToolBridge(
+  options: Parameters<typeof createClaudeCodeToolBridgeResult>[0],
+): Promise<ClaudeCodeToolBridge> {
+  const created = resultOutcome(await createClaudeCodeToolBridgeResult(options));
+  if (!created.ok) throw created.error;
+  return created.value;
 }
 
 export function displayClaudeCodeToolName(toolName: string): string {
   return toolName.startsWith(NAMESPACED_PREFIX)
-    ? toolName.slice(NAMESPACED_PREFIX.length)
+    ? canonicalLilacToolName(toolName.slice(NAMESPACED_PREFIX.length))
     : toolName;
 }

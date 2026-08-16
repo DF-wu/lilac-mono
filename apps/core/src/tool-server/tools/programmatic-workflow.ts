@@ -3,35 +3,139 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { env, type CoreConfig } from "@stanley2058/lilac-utils";
 import { lilacEventTypes, type LilacBus } from "@stanley2058/lilac-event-bus";
+import { Result, TaggedError, type Result as ResultType } from "better-result";
+import { defineServerTool } from "../types";
 
+import { isAdapterPlatform } from "../../shared/is-adapter-platform";
 import {
   DEFAULT_MAX_ACTIVE_WORKFLOW_RUNS,
   DurableWorkflowStore,
+  signalDurableWorkflowReadErrorToHost,
+  type CreateWorkflowInvocationError,
+  type CreateWorkflowInvocationResult,
+  type DurableWorkflowReadError,
 } from "../../workflow/durable-workflow-store";
 import {
   canonicalJsonSha256,
   sha256,
-  validateWorkflowArgs,
+  validateWorkflowArgsUnchecked,
   workflowDefinitionNameSchema,
   WORKFLOW_RUNTIME_VERSION,
 } from "../../workflow/workflow-definition";
 import { WorkflowDefinitionStore } from "../../workflow/workflow-definition-store";
+import type {
+  ResolvedWorkflowDefinition,
+  WorkflowDefinitionStoreFailed,
+} from "../../workflow/workflow-definition-store";
 import { computeNextCronAtMs } from "../../workflow/cron";
 import {
   jsonObjectSchema,
   workflowRunStateSchema,
+  type JsonObject,
   type WorkflowRevision,
   type WorkflowRun,
   type WorkflowTrigger,
 } from "../../workflow/workflow-domain";
 import type { RequestContext, ServerTool } from "../types";
 import type { WorkflowProgressCardService } from "../../workflow/workflow-progress-projector";
-import { parseToolInput } from "../validation-error-message";
 import { zodObjectToCliLines } from "./zod-cli";
-import { readWorkflowValueArtifact } from "../../workflow/workflow-artifact-store";
+import {
+  adaptWorkflowArtifactResultToException,
+  readWorkflowValueArtifact,
+} from "../../workflow/workflow-artifact-store";
 import { redactWorkflowValue } from "../../workflow/workflow-progress-view";
+import { adaptEventPublishResultToHost } from "../../shared/event-bus-result";
+import { getBuiltinSurfaceProtocol } from "../../surface/builtin-surface-protocols";
+import type { RegisteredSurfacePlatform } from "../../surface/types";
 import { isTelegramChatAllowed } from "../../surface/telegram/telegram-guards";
 import { parseTelegramSessionId } from "../../surface/telegram/telegram-ids";
+
+function adaptWorkflowInvocationResultToToolHost(
+  result: ResultType<CreateWorkflowInvocationResult, CreateWorkflowInvocationError>,
+): CreateWorkflowInvocationResult {
+  return result.match<() => CreateWorkflowInvocationResult>({
+    ok: (value) => () => value,
+    err: (error) => () => {
+      throw new Error(error.message);
+    },
+  })();
+}
+
+class WorkflowToolFailure extends TaggedError("WorkflowToolFailure")<{
+  readonly message: string;
+}> {}
+
+function adaptWorkflowToolResultToHost<TValue>(
+  result: ResultType<TValue, WorkflowToolFailure>,
+): TValue {
+  return result.match<() => TValue>({
+    ok: (value) => () => value,
+    err: (error) => () => {
+      throw new Error(error.message);
+    },
+  })();
+}
+
+function signalWorkflowToolFailureToHost(message: string): never {
+  return adaptWorkflowToolResultToHost(Result.err(new WorkflowToolFailure({ message })));
+}
+
+function validateWorkflowArgsToToolHost(
+  input: Parameters<typeof validateWorkflowArgsUnchecked>[0],
+): JsonObject {
+  const validated = validateWorkflowArgsUnchecked(input);
+  return validated.match<() => JsonObject>({
+    ok: (value) => () => value,
+    err: (error) => () => signalWorkflowToolFailureToHost(error.message),
+  })();
+}
+
+function adaptWorkflowDefinitionResultToToolHost<T>(
+  result: ResultType<T, WorkflowDefinitionStoreFailed>,
+): T {
+  return result.match<() => T>({
+    ok: (value) => () => value,
+    err: (error) => () => signalWorkflowToolFailureToHost(error.message),
+  })();
+}
+
+function adaptDurableWorkflowReadResultToHost<T>(
+  result: ResultType<T, DurableWorkflowReadError>,
+): T {
+  return result.match<() => T>({
+    ok: (value) => () => value,
+    err: (error) => () => signalDurableWorkflowReadErrorToHost(error),
+  })();
+}
+
+export class WorkflowJsonProjectionInvalid extends TaggedError("WorkflowJsonProjectionInvalid")<{
+  readonly message: string;
+}> {}
+
+export function decodeWorkflowJsonObject(
+  value: unknown,
+): ResultType<JsonObject, WorkflowJsonProjectionInvalid> {
+  const decoded = jsonObjectSchema.safeParse(value);
+  if (decoded.success) return Result.ok(decoded.data);
+  return Result.err(
+    new WorkflowJsonProjectionInvalid({ message: "Workflow value is not a JSON object" }),
+  );
+}
+
+function adaptWorkflowJsonProjectionResultToToolHost(
+  result: ResultType<JsonObject, WorkflowJsonProjectionInvalid>,
+): JsonObject {
+  return result.match<() => JsonObject>({
+    ok: (value) => () => value,
+    err: (error) => () => {
+      throw error;
+    },
+  })();
+}
+
+function projectWorkflowJsonObject(value: unknown): JsonObject {
+  return adaptWorkflowJsonProjectionResultToToolHost(decodeWorkflowJsonObject(value));
+}
 
 const definitionScopeSchema = z.enum(["project", "personal", "auto"]);
 const hashSchema = z.string().regex(/^[a-f0-9]{64}$/);
@@ -64,7 +168,7 @@ const definitionListInputSchema = z.strictObject({
 const progressInputSchema = z
   .strictObject({
     requestOrigin: z.literal(true).optional(),
-    client: z.enum(["discord", "github", "telegram"]).optional(),
+    client: z.string().min(1).max(200).optional(),
     sessionId: z.string().min(1).max(200).optional(),
   })
   .superRefine((progress, ctx) => {
@@ -133,68 +237,193 @@ const runCancelInputSchema = z.strictObject({
 });
 const runPauseInputSchema = z.strictObject({ runId: z.string().min(1).max(200) });
 const runResumeInputSchema = z.strictObject({ runId: z.string().min(1).max(200) });
+
+type WorkflowCallOptions = {
+  readonly signal?: AbortSignal;
+  readonly context?: RequestContext;
+  readonly messages?: readonly unknown[];
+};
+
 function requestProgressTarget(context: RequestContext) {
-  const requestClient =
-    context.requestClient === "discord" ||
-    context.requestClient === "github" ||
-    context.requestClient === "telegram"
-      ? context.requestClient
-      : null;
-  const principalClient = context.authenticatedPrincipal?.platform ?? null;
-  if (requestClient && principalClient && requestClient !== principalClient) {
-    throw new Error(
-      `Workflow request client '${requestClient}' does not match authenticated principal '${principalClient}'`,
-    );
-  }
-  const platform = requestClient ?? principalClient;
-  const sessionId = context.originSessionId ?? context.sessionId;
-  if (!platform || !sessionId) return null;
+  const requestProtocol = context.requestClient
+    ? getBuiltinSurfaceProtocol(context.requestClient)
+    : null;
+  const principal = context.requestInitiator ?? context.authenticatedPrincipal;
+  const protocol =
+    requestProtocol ?? (principal ? getBuiltinSurfaceProtocol(principal.platform) : null);
+  if (!protocol) return null;
+  const sessionId =
+    context.requestInitiatorSessionId ?? context.originSessionId ?? context.sessionId;
+  if (!sessionId) return null;
+  const principalMatchesRequest =
+    principal !== undefined &&
+    principal.platform === protocol.platform &&
+    (context.requestInitiatorSessionId ?? context.originSessionId ?? context.sessionId) ===
+      sessionId;
   return {
-    platform,
-    userId: context.authenticatedPrincipal?.userId ?? null,
-    sessionRef: { platform, channelId: sessionId },
+    platform: protocol.platform,
+    userId: principalMatchesRequest ? principal.userId : null,
+    sessionRef: protocol.refs.createSessionRef(sessionId),
     originMessageRef: null,
   } as const;
 }
 
 async function assertProgressTargetAllowed(input: {
-  requestTarget: ReturnType<typeof requestProgressTarget>;
-  progressTarget: { platform: "discord" | "github" | "telegram"; channelId: string } | null;
-  getConfig?: () => CoreConfig | Promise<CoreConfig>;
+  readonly requestTarget: ReturnType<typeof requestProgressTarget>;
+  readonly progressTarget: { readonly platform: string; readonly channelId: string } | null;
+  readonly getConfig?: () => CoreConfig | Promise<CoreConfig>;
 }): Promise<void> {
-  const requestTarget = input.requestTarget;
-  const progressTarget = input.progressTarget;
-  const requestIsTelegram = requestTarget?.platform === "telegram";
-  const targetIsTelegram = progressTarget?.platform === "telegram";
+  const requestIsTelegram = input.requestTarget?.platform === "telegram";
+  const targetIsTelegram = input.progressTarget?.platform === "telegram";
   if (!requestIsTelegram && !targetIsTelegram) return;
   if (
-    !requestTarget ||
-    requestTarget.platform !== "telegram" ||
-    !progressTarget ||
-    progressTarget.platform !== "telegram" ||
-    progressTarget.channelId !== requestTarget.sessionRef.channelId
+    !input.requestTarget ||
+    input.requestTarget.platform !== "telegram" ||
+    !input.progressTarget ||
+    input.progressTarget.platform !== "telegram" ||
+    input.progressTarget.channelId !== input.requestTarget.sessionRef.channelId
   ) {
-    throw new Error("Telegram workflow progress targets must use the current Telegram session");
+    signalWorkflowToolFailureToHost(
+      "Telegram workflow progress targets must use the current Telegram session",
+    );
   }
   if (!input.getConfig) {
-    throw new Error("Telegram workflow progress targets require current config access");
+    signalWorkflowToolFailureToHost(
+      "Telegram workflow progress targets require current config access",
+    );
   }
   const cfg = await input.getConfig();
-  const { chatId } = parseTelegramSessionId(progressTarget.channelId);
+  const { chatId } = parseTelegramSessionId(input.progressTarget.channelId);
   if (!isTelegramChatAllowed({ cfg, chatId })) {
-    throw new Error(
-      `Not allowed: Telegram workflow progress session '${progressTarget.channelId}' is not in allowedChatIds`,
+    signalWorkflowToolFailureToHost(
+      `Not allowed: Telegram workflow progress session '${input.progressTarget.channelId}' is not in allowedChatIds`,
     );
   }
 }
 
-function assertProjectScope(input: {
+function resolveRequestedWorkflowProgressTarget(
+  progress: z.output<typeof progressInputSchema> | undefined,
+  requestTarget: ReturnType<typeof requestProgressTarget>,
+): { readonly platform: string; readonly channelId: string } | null {
+  if (progress?.client && progress.sessionId) {
+    return { platform: progress.client, channelId: progress.sessionId };
+  }
+  if (!requestTarget) return null;
+  return {
+    platform: requestTarget.platform,
+    channelId: requestTarget.sessionRef.channelId,
+  };
+}
+
+function validateWorkflowRequestIdentity(
+  context: RequestContext,
+): ResultType<void, WorkflowToolFailure> {
+  const principal = context.requestInitiator;
+  if (!principal && context.requestInitiatorSessionId === undefined) {
+    return Result.ok(undefined);
+  }
+  if (
+    !principal ||
+    principal.platform !== context.requestClient ||
+    !context.sessionId ||
+    context.requestInitiatorSessionId !== context.sessionId
+  ) {
+    return Result.err(
+      new WorkflowToolFailure({
+        message: "Workflow authenticated identity does not match the request origin",
+      }),
+    );
+  }
+  return Result.ok(undefined);
+}
+
+function resolveWorkflowProgressTarget(
+  progress: z.output<typeof progressInputSchema> | undefined,
+  requestTarget: ReturnType<typeof requestProgressTarget>,
+  explicitPlatform: RegisteredSurfacePlatform | null,
+  requestPlatform: RegisteredSurfacePlatform | null,
+): WorkflowRun["progressTarget"] {
+  if (progress?.client && explicitPlatform) {
+    return {
+      platform: explicitPlatform,
+      channelId: progress.sessionId!,
+      replyToMessageId: null,
+    };
+  }
+  if (!requestTarget || !requestPlatform) return null;
+  return {
+    platform: requestPlatform,
+    channelId: requestTarget.sessionRef.channelId,
+    replyToMessageId: null,
+  };
+}
+
+function resolveRequestWorkflowProgressPlatform(
+  progress: z.output<typeof progressInputSchema> | undefined,
+  requestTarget: ReturnType<typeof requestProgressTarget>,
+  progressCards: WorkflowProgressCardService | undefined,
+): RegisteredSurfacePlatform | null {
+  if (!requestTarget) return null;
+  const platform = progressCards?.resolveTarget(requestTarget.platform) ?? null;
+  if (platform === requestTarget.platform) return platform;
+  if (progress?.requestOrigin) {
+    return signalWorkflowToolFailureToHost(
+      `Workflow request-origin surface is not registered with a progress port: ${requestTarget.platform}`,
+    );
+  }
+  return null;
+}
+
+function resolveExplicitWorkflowProgressPlatform(
+  progress: z.output<typeof progressInputSchema> | undefined,
+  progressCards: WorkflowProgressCardService | undefined,
+): RegisteredSurfacePlatform | null {
+  if (!progress?.client) return null;
+  const platform = progressCards?.resolveTarget(progress.client) ?? null;
+  if (!platform || platform !== progress.client) {
+    return signalWorkflowToolFailureToHost(
+      `Workflow progress surface is not registered with a progress port: ${progress.client}`,
+    );
+  }
+  return platform;
+}
+
+function resolveScheduleTiming(
+  schedule: z.output<typeof scheduledTriggerDefinitionSchema>,
+  now: number,
+): { timestampAt: number | null; nextFireAt: number } {
+  switch (schedule.kind) {
+    case "timestamp": {
+      const timestampAt = typeof schedule.at === "number" ? schedule.at : Date.parse(schedule.at);
+      return { timestampAt, nextFireAt: timestampAt };
+    }
+    case "cron":
+      return {
+        timestampAt: null,
+        nextFireAt: computeNextCronAtMs(
+          {
+            expr: schedule.expression,
+            tz: schedule.timezone,
+            startAtMs: schedule.startAt,
+          },
+          now,
+        ),
+      };
+  }
+}
+
+function validateProjectScope(input: {
   canonicalProjectId: string;
   revision: WorkflowRevision;
-}): void {
+}): ResultType<void, WorkflowToolFailure> {
   if (input.revision.canonicalProjectId !== input.canonicalProjectId) {
-    throw new Error("Workflow record is outside the current project scope");
+    return Result.err(
+      new WorkflowToolFailure({
+        message: "Workflow record is outside the current project scope",
+      }),
+    );
   }
+  return Result.ok(undefined);
 }
 
 function hasSensitiveSchema(schema: WorkflowRun["inputSchemaSnapshot"]): boolean {
@@ -213,7 +442,7 @@ function redactRun(run: WorkflowRun) {
   return {
     ...safeRun,
     ...(sensitive ? {} : { argsSha256 }),
-    args: jsonObjectSchema.parse(redactWorkflowValue(run.args, run.inputSchemaSnapshot)),
+    args: projectWorkflowJsonObject(redactWorkflowValue(run.args, run.inputSchemaSnapshot)),
   };
 }
 
@@ -223,18 +452,24 @@ function redactTrigger(trigger: WorkflowTrigger, revision: WorkflowRevision) {
   return {
     ...safeTrigger,
     ...(sensitive ? {} : { argsSha256 }),
-    args: jsonObjectSchema.parse(redactWorkflowValue(trigger.args, revision.inputSchema)),
+    args: projectWorkflowJsonObject(redactWorkflowValue(trigger.args, revision.inputSchema)),
   };
 }
 
-function requireTriggerContext(context: RequestContext | undefined): RequestContext & {
-  cwd: string;
-} {
-  if (!context?.cwd) throw new Error("workflow.run.trigger requires server-resolved request cwd");
-  return { ...context, cwd: context.cwd };
+function decodeTriggerContext(
+  context: RequestContext | undefined,
+): ResultType<RequestContext & { cwd: string }, WorkflowToolFailure> {
+  if (!context?.cwd) {
+    return Result.err(
+      new WorkflowToolFailure({
+        message: "workflow.run.trigger requires server-resolved request cwd",
+      }),
+    );
+  }
+  return Result.ok({ ...context, cwd: context.cwd });
 }
 
-function validationResult(definition: Awaited<ReturnType<WorkflowDefinitionStore["get"]>>) {
+function validationResult(definition: ResolvedWorkflowDefinition) {
   return {
     scope: definition.scope,
     name: definition.name,
@@ -255,6 +490,7 @@ function validationResult(definition: Awaited<ReturnType<WorkflowDefinitionStore
 
 export class ProgrammaticWorkflow implements ServerTool {
   id = "workflow-programmatic";
+  private readonly serverTool: ServerTool;
   private durableStore: DurableWorkflowStore | null = null;
   private ownsStore = false;
   private readonly definitionsStores = new Map<string, Promise<WorkflowDefinitionStore>>();
@@ -270,178 +506,195 @@ export class ProgrammaticWorkflow implements ServerTool {
       getMaxActiveRuns?: () => number | Promise<number>;
       getConfig?: () => CoreConfig | Promise<CoreConfig>;
     } = {},
-  ) {}
+  ) {
+    this.serverTool = defineServerTool({
+      id: this.id,
+      init: () => this.initialize(),
+      destroy: () => this.destroyResources(),
+      callables: ({ callable }) => ({
+        "workflow.definition.save": callable({
+          name: "Workflow Definition Save",
+          description:
+            "Statically validate and atomically save a project or personal JavaScript workflow.",
+          inputSchema: definitionSaveInputSchema,
+          cli: {
+            input: [
+              ...zodObjectToCliLines(definitionSaveInputSchema),
+              "Example: tools workflow.definition.save --input=@save-workflow.json",
+            ],
+          },
+          run: (input, opts) => this.callDefinitionSave(input, opts),
+        }),
+        "workflow.definition.validate": callable({
+          name: "Workflow Definition Validate",
+          description:
+            "Resolve and statically validate a workflow, optionally validating concrete arguments.",
+          inputSchema: definitionValidateInputSchema,
+          cli: {
+            input: [
+              ...zodObjectToCliLines(definitionValidateInputSchema),
+              'Example: tools workflow.definition.validate --scope=auto --name=audit-routes --args:json=\'{"directory":"src"}\'',
+            ],
+          },
+          run: (input, opts) => this.callDefinitionValidate(input, opts),
+        }),
+        "workflow.definition.get": callable({
+          name: "Workflow Definition Get",
+          description:
+            "Inspect validated definition metadata and hashes; source is opt-in and bounded.",
+          inputSchema: definitionGetInputSchema,
+          run: (input, opts) => this.callDefinitionGet(input, opts),
+        }),
+        "workflow.definition.list": callable({
+          name: "Workflow Definition List",
+          description:
+            "List statically validated workflow definitions without importing or executing them.",
+          inputSchema: definitionListInputSchema,
+          run: (input, opts) => this.callDefinitionList(input, opts),
+        }),
+        "workflow.run.trigger": callable({
+          name: "Workflow Run Trigger",
+          description:
+            "Persist an immutable trusted workflow invocation for immediate durable execution.",
+          inputSchema: runTriggerInputSchema,
+          cli: {
+            input: [
+              ...zodObjectToCliLines(runTriggerInputSchema),
+              'Example: tools workflow.run.trigger --scope=auto --name=audit-routes --args:json=\'{"directory":"src"}\'',
+            ],
+          },
+          run: (input, opts) => this.callRunTrigger(input, opts),
+        }),
+        "workflow.trigger.create": callable({
+          name: "Workflow Trigger Create",
+          description:
+            "Pin a validated immutable workflow revision to a durable timestamp or cron trigger.",
+          inputSchema: scheduledTriggerCreateInputSchema,
+          run: (input, opts) => this.callTriggerCreate(input, opts),
+        }),
+        "workflow.trigger.get": callable({
+          name: "Workflow Trigger Get",
+          description: "Inspect a durable trigger and the actual state of its most recent run.",
+          inputSchema: scheduledTriggerGetInputSchema,
+          primaryPositional: "triggerId",
+          run: (input, opts) => this.callTriggerGet(input, opts),
+        }),
+        "workflow.trigger.list": callable({
+          name: "Workflow Trigger List",
+          description: "List durable timestamp and cron triggers.",
+          inputSchema: scheduledTriggerListInputSchema,
+          run: (input, opts) => this.callTriggerList(input, opts),
+        }),
+        "workflow.trigger.cancel": callable({
+          name: "Workflow Trigger Cancel",
+          description: "Cancel a durable trigger without changing runs it already created.",
+          inputSchema: scheduledTriggerCancelInputSchema,
+          primaryPositional: "triggerId",
+          run: (input, opts) => this.callTriggerCancel(input, opts),
+        }),
+        "workflow.run.get": callable({
+          name: "Workflow Run Get",
+          description: "Inspect one durable workflow run and its immutable revision.",
+          inputSchema: runGetInputSchema,
+          primaryPositional: "runId",
+          run: (input, opts) => this.callRunGet(input, opts),
+        }),
+        "workflow.run.list": callable({
+          name: "Workflow Run List",
+          description: "List durable workflow runs, optionally filtered by state.",
+          inputSchema: runListInputSchema,
+          run: (input, opts) => this.callRunList(input, opts),
+        }),
+        "workflow.run.cancel": callable({
+          name: "Workflow Run Cancel",
+          description:
+            "Durably cancel a non-terminal workflow run before execution or while active.",
+          inputSchema: runCancelInputSchema,
+          primaryPositional: "runId",
+          run: (input, opts) => this.callRunCancel(input, opts),
+        }),
+        "workflow.run.pause": callable({
+          name: "Workflow Run Pause",
+          description: "Durably pause a queued or active workflow run.",
+          inputSchema: runPauseInputSchema,
+          primaryPositional: "runId",
+          run: (input, opts) => this.callRunPause(input, opts),
+        }),
+        "workflow.run.resume": callable({
+          name: "Workflow Run Resume",
+          description: "Return a paused workflow run to the durable queue.",
+          inputSchema: runResumeInputSchema,
+          primaryPositional: "runId",
+          run: (input, opts) => this.callRunResume(input, opts),
+        }),
+      }),
+    });
+  }
 
-  async init(): Promise<void> {
+  private async initialize(): Promise<void> {
     if (!this.durableStore) {
       this.durableStore = this.params.store ?? new DurableWorkflowStore(this.params.dbPath);
       this.ownsStore = !this.params.store;
     }
   }
 
-  async destroy(): Promise<void> {
+  private async destroyResources(): Promise<void> {
     if (this.ownsStore) this.durableStore?.close();
     this.durableStore = null;
     this.ownsStore = false;
     this.definitionsStores.clear();
   }
 
+  async init(): Promise<void> {
+    await this.serverTool.init();
+  }
+
+  async destroy(): Promise<void> {
+    await this.serverTool.destroy();
+  }
+
   async list() {
-    return [
-      {
-        callableId: "workflow.definition.save",
-        name: "Workflow Definition Save",
-        description:
-          "Statically validate and atomically save a project or personal JavaScript workflow.",
-        shortInput: zodObjectToCliLines(definitionSaveInputSchema, { mode: "required" }),
-        input: [
-          ...zodObjectToCliLines(definitionSaveInputSchema),
-          "Example: tools workflow.definition.save --input=@save-workflow.json",
-        ],
-      },
-      {
-        callableId: "workflow.definition.validate",
-        name: "Workflow Definition Validate",
-        description:
-          "Resolve and statically validate a workflow, optionally validating concrete arguments.",
-        shortInput: zodObjectToCliLines(definitionValidateInputSchema, { mode: "required" }),
-        input: [
-          ...zodObjectToCliLines(definitionValidateInputSchema),
-          'Example: tools workflow.definition.validate --scope=auto --name=audit-routes --args:json=\'{"directory":"src"}\'',
-        ],
-      },
-      {
-        callableId: "workflow.definition.get",
-        name: "Workflow Definition Get",
-        description:
-          "Inspect validated definition metadata and hashes; source is opt-in and bounded.",
-        shortInput: zodObjectToCliLines(definitionGetInputSchema, { mode: "required" }),
-        input: zodObjectToCliLines(definitionGetInputSchema),
-      },
-      {
-        callableId: "workflow.definition.list",
-        name: "Workflow Definition List",
-        description:
-          "List statically validated workflow definitions without importing or executing them.",
-        shortInput: zodObjectToCliLines(definitionListInputSchema, { mode: "required" }),
-        input: zodObjectToCliLines(definitionListInputSchema),
-      },
-      {
-        callableId: "workflow.run.trigger",
-        name: "Workflow Run Trigger",
-        description:
-          "Persist an immutable trusted workflow invocation for immediate durable execution.",
-        shortInput: zodObjectToCliLines(runTriggerInputSchema, { mode: "required" }),
-        input: [
-          ...zodObjectToCliLines(runTriggerInputSchema),
-          'Example: tools workflow.run.trigger --scope=auto --name=audit-routes --args:json=\'{"directory":"src"}\'',
-        ],
-      },
-      {
-        callableId: "workflow.trigger.create",
-        name: "Workflow Trigger Create",
-        description:
-          "Pin a validated immutable workflow revision to a durable timestamp or cron trigger.",
-        shortInput: zodObjectToCliLines(scheduledTriggerCreateInputSchema, { mode: "required" }),
-        input: zodObjectToCliLines(scheduledTriggerCreateInputSchema),
-      },
-      {
-        callableId: "workflow.trigger.get",
-        name: "Workflow Trigger Get",
-        description: "Inspect a durable trigger and the actual state of its most recent run.",
-        shortInput: zodObjectToCliLines(scheduledTriggerGetInputSchema, { mode: "required" }),
-        input: zodObjectToCliLines(scheduledTriggerGetInputSchema),
-        primaryPositional: { field: "triggerId" },
-      },
-      {
-        callableId: "workflow.trigger.list",
-        name: "Workflow Trigger List",
-        description: "List durable timestamp and cron triggers.",
-        shortInput: zodObjectToCliLines(scheduledTriggerListInputSchema, { mode: "required" }),
-        input: zodObjectToCliLines(scheduledTriggerListInputSchema),
-      },
-      {
-        callableId: "workflow.trigger.cancel",
-        name: "Workflow Trigger Cancel",
-        description: "Cancel a durable trigger without changing runs it already created.",
-        shortInput: zodObjectToCliLines(scheduledTriggerCancelInputSchema, { mode: "required" }),
-        input: zodObjectToCliLines(scheduledTriggerCancelInputSchema),
-        primaryPositional: { field: "triggerId" },
-      },
-      {
-        callableId: "workflow.run.get",
-        name: "Workflow Run Get",
-        description: "Inspect one durable workflow run and its immutable revision.",
-        shortInput: zodObjectToCliLines(runGetInputSchema, { mode: "required" }),
-        input: zodObjectToCliLines(runGetInputSchema),
-        primaryPositional: { field: "runId" },
-      },
-      {
-        callableId: "workflow.run.list",
-        name: "Workflow Run List",
-        description: "List durable workflow runs, optionally filtered by state.",
-        shortInput: zodObjectToCliLines(runListInputSchema, { mode: "required" }),
-        input: zodObjectToCliLines(runListInputSchema),
-      },
-      {
-        callableId: "workflow.run.cancel",
-        name: "Workflow Run Cancel",
-        description: "Durably cancel a non-terminal workflow run before execution or while active.",
-        shortInput: zodObjectToCliLines(runCancelInputSchema, { mode: "required" }),
-        input: zodObjectToCliLines(runCancelInputSchema),
-        primaryPositional: { field: "runId" },
-      },
-      {
-        callableId: "workflow.run.pause",
-        name: "Workflow Run Pause",
-        description: "Durably pause a queued or active workflow run.",
-        shortInput: zodObjectToCliLines(runPauseInputSchema, { mode: "required" }),
-        input: zodObjectToCliLines(runPauseInputSchema),
-        primaryPositional: { field: "runId" },
-      },
-      {
-        callableId: "workflow.run.resume",
-        name: "Workflow Run Resume",
-        description: "Return a paused workflow run to the durable queue.",
-        shortInput: zodObjectToCliLines(runResumeInputSchema, { mode: "required" }),
-        input: zodObjectToCliLines(runResumeInputSchema),
-        primaryPositional: { field: "runId" },
-      },
-    ];
+    return this.serverTool.list();
   }
 
-  private store(): DurableWorkflowStore {
-    if (!this.durableStore) throw new Error("Programmatic workflow tool is not initialized");
-    return this.durableStore;
+  private storeResult(): ResultType<DurableWorkflowStore, WorkflowToolFailure> {
+    if (this.durableStore) return Result.ok(this.durableStore);
+    return Result.err(
+      new WorkflowToolFailure({ message: "Programmatic workflow tool is not initialized" }),
+    );
   }
 
-  private async projectScope(context: RequestContext | undefined): Promise<{
-    canonicalRoot: string;
-    canonicalProjectId: string;
-  }> {
-    this.store();
+  private async projectScope(
+    context: RequestContext | undefined,
+  ): Promise<
+    ResultType<{ canonicalRoot: string; canonicalProjectId: string }, WorkflowToolFailure>
+  > {
     if (!context?.cwd) {
-      throw new Error("Workflow request lacks a cwd");
+      return Result.err(new WorkflowToolFailure({ message: "Workflow request lacks a cwd" }));
     }
     const requestedRoot = path.resolve(context.cwd);
     const stats = await fs.lstat(requestedRoot);
     if (stats.isSymbolicLink() || !stats.isDirectory()) {
-      throw new Error(`Workflow project root must be a real directory: ${requestedRoot}`);
+      return Result.err(
+        new WorkflowToolFailure({
+          message: `Workflow project root must be a real directory: ${requestedRoot}`,
+        }),
+      );
     }
     const canonicalRoot = await fs.realpath(requestedRoot);
-    return {
+    return Result.ok({
       canonicalRoot,
       canonicalProjectId: `project:${sha256(canonicalRoot)}`,
-    };
+    });
   }
 
   private async definitions(canonicalRoot: string): Promise<WorkflowDefinitionStore> {
     let definitions = this.definitionsStores.get(canonicalRoot);
     if (!definitions) {
-      definitions = WorkflowDefinitionStore.create({
+      definitions = WorkflowDefinitionStore.createResult({
         workspaceRoot: canonicalRoot,
         dataDir: this.params.dataDir ?? env.dataDir,
-      });
+      }).then(adaptWorkflowDefinitionResultToToolHost);
       this.definitionsStores.set(canonicalRoot, definitions);
       definitions.catch(() => this.definitionsStores.delete(canonicalRoot));
     }
@@ -453,603 +706,685 @@ export class ProgrammaticWorkflow implements ServerTool {
     rawInput: Record<string, unknown>,
     opts?: { signal?: AbortSignal; context?: RequestContext; messages?: readonly unknown[] },
   ): Promise<unknown> {
-    const projectScope = await this.projectScope(opts?.context);
-    if (callableId === "workflow.definition.save") {
-      const definitions = await this.definitions(projectScope.canonicalRoot);
-      const input = parseToolInput({
-        callableId,
-        input: rawInput,
-        schema: definitionSaveInputSchema,
-      });
-      const saved = await definitions.save(input);
-      return { ok: true as const, ...validationResult(saved) };
+    return this.serverTool.call(callableId, rawInput, opts);
+  }
+
+  private async workflowCallContext(opts: WorkflowCallOptions | undefined) {
+    const store = adaptWorkflowToolResultToHost(this.storeResult());
+    const projectScope = adaptWorkflowToolResultToHost(await this.projectScope(opts?.context));
+    return { store, projectScope };
+  }
+
+  private async callDefinitionSave(
+    input: z.output<typeof definitionSaveInputSchema>,
+    opts: WorkflowCallOptions | undefined,
+  ) {
+    const { projectScope } = await this.workflowCallContext(opts);
+    const definitions = await this.definitions(projectScope.canonicalRoot);
+    const saved = adaptWorkflowDefinitionResultToToolHost(await definitions.saveResult(input));
+    return { ok: true as const, ...validationResult(saved) };
+  }
+
+  private async callDefinitionValidate(
+    input: z.output<typeof definitionValidateInputSchema>,
+    opts: WorkflowCallOptions | undefined,
+  ) {
+    const { projectScope } = await this.workflowCallContext(opts);
+    const definitions = await this.definitions(projectScope.canonicalRoot);
+    const definition = adaptWorkflowDefinitionResultToToolHost(await definitions.getResult(input));
+    const args = input.args
+      ? validateWorkflowArgsToToolHost({
+          inputSchema: definition.validation.inputSchema,
+          args: input.args,
+          maxInputBytes: definition.validation.limits.maxInputBytes,
+        })
+      : undefined;
+    return {
+      ok: true as const,
+      ...validationResult(definition),
+      argsValid: args ? true : undefined,
+    };
+  }
+
+  private async callDefinitionGet(
+    input: z.output<typeof definitionGetInputSchema>,
+    opts: WorkflowCallOptions | undefined,
+  ) {
+    const { projectScope } = await this.workflowCallContext(opts);
+    const definitions = await this.definitions(projectScope.canonicalRoot);
+    const definition = adaptWorkflowDefinitionResultToToolHost(await definitions.getResult(input));
+    return {
+      ok: true as const,
+      ...validationResult(definition),
+      source: input.includeSource ? definition.source : undefined,
+    };
+  }
+
+  private async callDefinitionList(
+    input: z.output<typeof definitionListInputSchema>,
+    opts: WorkflowCallOptions | undefined,
+  ) {
+    const { projectScope } = await this.workflowCallContext(opts);
+    const definitions = await this.definitions(projectScope.canonicalRoot);
+    const entries = adaptWorkflowDefinitionResultToToolHost(
+      await definitions.listResult({ scope: input.scope }),
+    );
+    return {
+      ok: true as const,
+      definitions: entries.map((entry) =>
+        entry.valid
+          ? { valid: true as const, ...validationResult({ ...entry, source: "" }) }
+          : entry,
+      ),
+    };
+  }
+
+  private async callTriggerCreate(
+    input: z.output<typeof scheduledTriggerCreateInputSchema>,
+    opts: WorkflowCallOptions | undefined,
+  ) {
+    const { store, projectScope } = await this.workflowCallContext(opts);
+    const definitions = await this.definitions(projectScope.canonicalRoot);
+    const context = adaptWorkflowToolResultToHost(decodeTriggerContext(opts?.context));
+    adaptWorkflowToolResultToHost(validateWorkflowRequestIdentity(context));
+    const requestTarget = requestProgressTarget(context);
+    await assertProgressTargetAllowed({
+      requestTarget,
+      progressTarget: resolveRequestedWorkflowProgressTarget(input.progress, requestTarget),
+      getConfig: this.params.getConfig,
+    });
+    const explicitProgressPlatform = resolveExplicitWorkflowProgressPlatform(
+      input.progress,
+      this.params.progressCards,
+    );
+    const requestProgressPlatform = resolveRequestWorkflowProgressPlatform(
+      input.progress,
+      requestTarget,
+      this.params.progressCards,
+    );
+    const definition = adaptWorkflowDefinitionResultToToolHost(
+      await definitions.getResult({ scope: input.scope, name: input.name }),
+    );
+    const args = validateWorkflowArgsToToolHost({
+      inputSchema: definition.validation.inputSchema,
+      args: input.args,
+      maxInputBytes: definition.validation.limits.maxInputBytes,
+    });
+    const snapshot = adaptWorkflowDefinitionResultToToolHost(
+      await definitions.createSnapshotResult(definition.source, definition.validation.sourceSha256),
+    );
+    const now = this.params.now?.() ?? Date.now();
+    const revisionIdentity = {
+      canonicalProjectId: definitions.canonicalProjectId,
+      canonicalWorkspaceRoot: definitions.canonicalWorkspaceRoot,
+      scope: definition.scope,
+      normalizedPath: definition.normalizedPath,
+      sourceSha256: definition.validation.sourceSha256,
+      inputSchemaSha256: definition.validation.inputSchemaSha256,
+      resourcePolicySha256: definition.validation.resourcePolicySha256,
+      runtimeVersion: WORKFLOW_RUNTIME_VERSION,
+    } as const;
+    const revisionId = `wfr:${canonicalJsonSha256(projectWorkflowJsonObject(revisionIdentity))}`;
+    const revision: WorkflowRevision = {
+      ...revisionIdentity,
+      revisionId,
+      name: definition.name,
+      snapshotArtifactId: snapshot.artifactId,
+      metadata: definition.validation.metadata,
+      inputSchema: definition.validation.inputSchema,
+      resources: definition.validation.resources,
+      limits: definition.validation.limits,
+      createdAt: now,
+    };
+    store.createRevision(revision);
+    const storedRevisionResult = store.findRevisionByIdentity(revisionIdentity);
+    const storedRevision = adaptDurableWorkflowReadResultToHost(storedRevisionResult);
+    if (!storedRevision || storedRevision.revisionId !== revisionId) {
+      return signalWorkflowToolFailureToHost("Scheduled workflow revision identity collision");
     }
-    if (callableId === "workflow.definition.validate") {
-      const definitions = await this.definitions(projectScope.canonicalRoot);
-      const input = parseToolInput({
-        callableId,
-        input: rawInput,
-        schema: definitionValidateInputSchema,
-      });
-      const definition = await definitions.get(input);
-      const args = input.args
-        ? validateWorkflowArgs({
-            inputSchema: definition.validation.inputSchema,
-            args: input.args,
-            maxInputBytes: definition.validation.limits.maxInputBytes,
-          })
-        : undefined;
-      return {
-        ok: true as const,
-        ...validationResult(definition),
-        argsValid: args ? true : undefined,
-      };
-    }
-    if (callableId === "workflow.definition.get") {
-      const definitions = await this.definitions(projectScope.canonicalRoot);
-      const input = parseToolInput({
-        callableId,
-        input: rawInput,
-        schema: definitionGetInputSchema,
-      });
-      const definition = await definitions.get(input);
-      return {
-        ok: true as const,
-        ...validationResult(definition),
-        source: input.includeSource ? definition.source : undefined,
-      };
-    }
-    if (callableId === "workflow.definition.list") {
-      const definitions = await this.definitions(projectScope.canonicalRoot);
-      const input = parseToolInput({
-        callableId,
-        input: rawInput,
-        schema: definitionListInputSchema,
-      });
-      const entries = await definitions.list({ scope: input.scope });
-      return {
-        ok: true as const,
-        definitions: entries.map((entry) =>
-          entry.valid
-            ? { valid: true as const, ...validationResult({ ...entry, source: "" }) }
-            : entry,
-        ),
-      };
-    }
-    if (callableId === "workflow.trigger.create") {
-      const definitions = await this.definitions(projectScope.canonicalRoot);
-      const context = requireTriggerContext(opts?.context);
-      const requestTarget = requestProgressTarget(context);
-      const input = parseToolInput({
-        callableId,
-        input: rawInput,
-        schema: scheduledTriggerCreateInputSchema,
-      });
-      const progressTarget = input.progress?.client
-        ? {
-            platform: input.progress.client,
-            channelId: input.progress.sessionId!,
-            replyToMessageId: null,
-          }
-        : requestTarget
-          ? {
-              platform: requestTarget.platform,
-              channelId: requestTarget.sessionRef.channelId,
-              replyToMessageId: null,
-            }
-          : null;
-      await assertProgressTargetAllowed({
-        requestTarget,
-        progressTarget,
-        getConfig: this.params.getConfig,
-      });
-      const definition = await definitions.get({
-        scope: input.scope,
-        name: input.name,
-      });
-      const args = validateWorkflowArgs({
-        inputSchema: definition.validation.inputSchema,
-        args: input.args,
-        maxInputBytes: definition.validation.limits.maxInputBytes,
-      });
-      const snapshot = await definitions.createSnapshot(
-        definition.source,
-        definition.validation.sourceSha256,
-      );
-      const now = this.params.now?.() ?? Date.now();
-      const revisionIdentity = {
-        canonicalProjectId: definitions.canonicalProjectId,
-        canonicalWorkspaceRoot: definitions.canonicalWorkspaceRoot,
-        scope: definition.scope,
-        normalizedPath: definition.normalizedPath,
-        sourceSha256: definition.validation.sourceSha256,
-        inputSchemaSha256: definition.validation.inputSchemaSha256,
-        resourcePolicySha256: definition.validation.resourcePolicySha256,
-        runtimeVersion: WORKFLOW_RUNTIME_VERSION,
-      } as const;
-      const revisionId = `wfr:${canonicalJsonSha256(jsonObjectSchema.parse(revisionIdentity))}`;
-      const revision: WorkflowRevision = {
-        ...revisionIdentity,
+    const idempotencyKey =
+      input.idempotencyKey ??
+      `tool:${context.requestId ?? "missing"}:${context.toolCallId ?? canonicalJsonSha256(args)}`;
+    const triggerFingerprint = canonicalJsonSha256(
+      projectWorkflowJsonObject({
         revisionId,
-        name: definition.name,
-        snapshotArtifactId: snapshot.artifactId,
-        metadata: definition.validation.metadata,
-        inputSchema: definition.validation.inputSchema,
-        resources: definition.validation.resources,
-        limits: definition.validation.limits,
-        createdAt: now,
-      };
-      this.store().createRevision(revision);
-      const storedRevision = this.store().findRevisionByIdentity(revisionIdentity);
-      if (!storedRevision || storedRevision.revisionId !== revisionId) {
-        throw new Error("Scheduled workflow revision identity collision");
-      }
-      const idempotencyKey =
-        input.idempotencyKey ??
-        `tool:${context.requestId ?? "missing"}:${context.toolCallId ?? canonicalJsonSha256(args)}`;
-      const triggerFingerprint = canonicalJsonSha256(
-        jsonObjectSchema.parse({
-          revisionId,
-          args,
-          schedule: input.schedule,
-          progress: input.progress ?? null,
-        }),
-      );
-      const triggerId = `wftrigger:${canonicalJsonSha256(
-        jsonObjectSchema.parse({ idempotencyKey, triggerFingerprint }),
-      )}`;
-      const schedule = input.schedule;
-      const timestampAt =
-        schedule.kind === "timestamp"
-          ? typeof schedule.at === "number"
-            ? schedule.at
-            : Date.parse(schedule.at)
-          : null;
-      if (schedule.kind === "timestamp" && !Number.isFinite(timestampAt)) {
-        throw new Error(`Invalid workflow trigger timestamp: ${schedule.at}`);
-      }
-      const nextFireAt =
-        schedule.kind === "timestamp"
-          ? (timestampAt ?? now)
-          : computeNextCronAtMs(
-              {
-                expr: schedule.expression,
-                tz: schedule.timezone,
-                startAtMs: schedule.startAt,
-              },
-              now,
-            );
-      const trigger: WorkflowTrigger = {
-        triggerId,
-        revisionId,
-        state: "active",
-        definition:
-          schedule.kind === "timestamp"
-            ? { kind: "timestamp", at: nextFireAt }
-            : {
-                kind: "cron",
-                expression: schedule.expression,
-                timezone: schedule.timezone ?? null,
-              },
         args,
-        argsSha256: canonicalJsonSha256(args),
-        schedulingPolicy: {
-          skipMissed: schedule.kind === "cron" ? schedule.skipMissed : true,
-          overlap: schedule.kind === "cron" ? schedule.overlap : "coalesce",
-        },
-        origin: {
-          requestId: context.requestId ?? null,
-          sessionId: requestTarget?.sessionRef.channelId ?? null,
-          client: requestTarget?.platform ?? null,
-          userId: requestTarget?.userId ?? null,
-          projectCwd: definitions.canonicalWorkspaceRoot,
-        },
-        completionTarget: progressTarget ? { kind: "durable_surface" } : { kind: "detached" },
-        progressTarget,
-        nextFireAt,
-        lastFireAt: null,
-        lastRunId: null,
-        claimedBy: null,
-        claimedAt: null,
-        createdAt: now,
-        updatedAt: now,
-      };
-      const stored = this.store().createTriggerInvocation({
-        trigger,
-        idempotency: { key: idempotencyKey, fingerprintSha256: triggerFingerprint },
-      });
-      return {
-        ok: true as const,
-        trigger: redactTrigger(stored.trigger, revision),
-        created: stored.created,
-        revisionId,
-        sourceSha256: revision.sourceSha256,
-        message: "The immutable revision is pinned. Every fire creates a distinct queued run.",
-      };
+        schedule: input.schedule,
+        progress: input.progress ?? null,
+      }),
+    );
+    const triggerId = `wftrigger:${canonicalJsonSha256(
+      projectWorkflowJsonObject({ idempotencyKey, triggerFingerprint }),
+    )}`;
+    const schedule = input.schedule;
+    const { timestampAt, nextFireAt } = resolveScheduleTiming(schedule, now);
+    if (schedule.kind === "timestamp" && !Number.isFinite(timestampAt)) {
+      return signalWorkflowToolFailureToHost(`Invalid workflow trigger timestamp: ${schedule.at}`);
     }
-    if (callableId === "workflow.trigger.get") {
-      const input = parseToolInput({
-        callableId,
-        input: rawInput,
-        schema: scheduledTriggerGetInputSchema,
-      });
-      const trigger = this.store().getTrigger(input.triggerId);
-      if (!trigger) throw new Error(`Workflow trigger not found: ${input.triggerId}`);
-      const revision = this.store().getRevision(trigger.revisionId);
-      if (!revision) throw new Error(`Workflow revision not found: ${trigger.revisionId}`);
-      assertProjectScope({
-        canonicalProjectId: projectScope.canonicalProjectId,
-        revision,
-      });
+    const progressTarget = resolveWorkflowProgressTarget(
+      input.progress,
+      requestTarget,
+      explicitProgressPlatform,
+      requestProgressPlatform,
+    );
+    const trigger: WorkflowTrigger = {
+      triggerId,
+      revisionId,
+      state: "active",
+      definition:
+        schedule.kind === "timestamp"
+          ? { kind: "timestamp", at: nextFireAt }
+          : {
+              kind: "cron",
+              expression: schedule.expression,
+              timezone: schedule.timezone ?? null,
+            },
+      args,
+      argsSha256: canonicalJsonSha256(args),
+      schedulingPolicy: {
+        skipMissed: schedule.kind === "cron" ? schedule.skipMissed : true,
+        overlap: schedule.kind === "cron" ? schedule.overlap : "coalesce",
+      },
+      origin: {
+        requestId: context.requestId ?? null,
+        sessionId: context.sessionId ?? null,
+        client:
+          context.requestClient && isAdapterPlatform(context.requestClient)
+            ? context.requestClient
+            : null,
+        userId: requestTarget?.userId ?? null,
+        projectCwd: definitions.canonicalWorkspaceRoot,
+      },
+      completionTarget: progressTarget ? { kind: "durable_surface" } : { kind: "detached" },
+      progressTarget,
+      nextFireAt,
+      lastFireAt: null,
+      lastRunId: null,
+      claimedBy: null,
+      claimedAt: null,
+      createdAt: now,
+      updatedAt: now,
+    };
+    const stored = store.createTriggerInvocation({
+      trigger,
+      idempotency: { key: idempotencyKey, fingerprintSha256: triggerFingerprint },
+    });
+    return {
+      ok: true as const,
+      trigger: redactTrigger(stored.trigger, revision),
+      created: stored.created,
+      revisionId,
+      sourceSha256: revision.sourceSha256,
+      message: "The immutable revision is pinned. Every fire creates a distinct queued run.",
+    };
+  }
+
+  private async callTriggerGet(
+    input: z.output<typeof scheduledTriggerGetInputSchema>,
+    opts: WorkflowCallOptions | undefined,
+  ) {
+    const { store, projectScope } = await this.workflowCallContext(opts);
+    const triggerResult = store.getTrigger(input.triggerId);
+    const trigger = adaptDurableWorkflowReadResultToHost(triggerResult);
+    if (!trigger)
+      return signalWorkflowToolFailureToHost(`Workflow trigger not found: ${input.triggerId}`);
+    const revisionResult = store.getRevision(trigger.revisionId);
+    const revision = adaptDurableWorkflowReadResultToHost(revisionResult);
+    if (!revision)
+      return signalWorkflowToolFailureToHost(`Workflow revision not found: ${trigger.revisionId}`);
+    adaptWorkflowToolResultToHost(
+      validateProjectScope({ canonicalProjectId: projectScope.canonicalProjectId, revision }),
+    );
+    let lastRun = null;
+    if (trigger.lastRunId) {
+      const lastRunResult = store.getRun(trigger.lastRunId);
+      const lastRunValue = adaptDurableWorkflowReadResultToHost(lastRunResult);
+      lastRun = lastRunValue ? redactRun(lastRunValue) : null;
+    }
+    return {
+      ok: true as const,
+      trigger: redactTrigger(trigger, revision),
+      lastRun,
+    };
+  }
+
+  private async callTriggerList(
+    input: z.output<typeof scheduledTriggerListInputSchema>,
+    opts: WorkflowCallOptions | undefined,
+  ) {
+    const { store, projectScope } = await this.workflowCallContext(opts);
+    const triggersResult = store.listTriggers({
+      ...input,
+      canonicalProjectId: projectScope.canonicalProjectId,
+    });
+    const triggers = adaptDurableWorkflowReadResultToHost(triggersResult);
+    return {
+      ok: true as const,
+      triggers: triggers.map((trigger) => {
+        const revisionResult = store.getRevision(trigger.revisionId);
+        const revision = adaptDurableWorkflowReadResultToHost(revisionResult);
+        if (!revision)
+          return signalWorkflowToolFailureToHost(
+            `Workflow revision not found: ${trigger.revisionId}`,
+          );
+        const lastRunResult = trigger.lastRunId ? store.getRun(trigger.lastRunId) : Result.ok(null);
+        const lastRun = adaptDurableWorkflowReadResultToHost(lastRunResult);
+        return {
+          trigger: redactTrigger(trigger, revision),
+          lastRun: lastRun ? redactRun(lastRun) : null,
+        };
+      }),
+    };
+  }
+
+  private async callTriggerCancel(
+    input: z.output<typeof scheduledTriggerCancelInputSchema>,
+    opts: WorkflowCallOptions | undefined,
+  ) {
+    const { store, projectScope } = await this.workflowCallContext(opts);
+    const triggerResult = store.getTrigger(input.triggerId);
+    const trigger = adaptDurableWorkflowReadResultToHost(triggerResult);
+    if (!trigger)
+      return signalWorkflowToolFailureToHost(`Workflow trigger not found: ${input.triggerId}`);
+    const revisionResult = store.getRevision(trigger.revisionId);
+    const revision = adaptDurableWorkflowReadResultToHost(revisionResult);
+    if (!revision)
+      return signalWorkflowToolFailureToHost(`Workflow revision not found: ${trigger.revisionId}`);
+    adaptWorkflowToolResultToHost(
+      validateProjectScope({ canonicalProjectId: projectScope.canonicalProjectId, revision }),
+    );
+    if (trigger.state === "completed" || trigger.state === "cancelled") {
       return {
         ok: true as const,
         trigger: redactTrigger(trigger, revision),
-        lastRun: trigger.lastRunId
-          ? ((run) => (run ? redactRun(run) : null))(this.store().getRun(trigger.lastRunId))
-          : null,
+        changed: false,
       };
     }
-    if (callableId === "workflow.trigger.list") {
-      const input = parseToolInput({
-        callableId,
-        input: rawInput,
-        schema: scheduledTriggerListInputSchema,
-      });
-      const triggers = this.store().listTriggers({
-        ...input,
-        canonicalProjectId: projectScope.canonicalProjectId,
-      });
-      return {
-        ok: true as const,
-        triggers: triggers.map((trigger) => {
-          const revision = this.store().getRevision(trigger.revisionId);
-          if (!revision) throw new Error(`Workflow revision not found: ${trigger.revisionId}`);
-          const lastRun = trigger.lastRunId ? this.store().getRun(trigger.lastRunId) : null;
-          return {
-            trigger: redactTrigger(trigger, revision),
-            lastRun: lastRun ? redactRun(lastRun) : null,
-          };
-        }),
-      };
-    }
-    if (callableId === "workflow.trigger.cancel") {
-      const input = parseToolInput({
-        callableId,
-        input: rawInput,
-        schema: scheduledTriggerCancelInputSchema,
-      });
-      const trigger = this.store().getTrigger(input.triggerId);
-      if (!trigger) throw new Error(`Workflow trigger not found: ${input.triggerId}`);
-      const revision = this.store().getRevision(trigger.revisionId);
-      if (!revision) throw new Error(`Workflow revision not found: ${trigger.revisionId}`);
-      assertProjectScope({
-        canonicalProjectId: projectScope.canonicalProjectId,
-        revision,
-      });
-      if (trigger.state === "completed" || trigger.state === "cancelled") {
-        return {
-          ok: true as const,
-          trigger: redactTrigger(trigger, revision),
-          changed: false,
-        };
-      }
-      const changed = this.store().transitionTrigger({
-        triggerId: trigger.triggerId,
-        from: trigger.state,
-        to: "cancelled",
-        now: this.params.now?.() ?? Date.now(),
-        nextFireAt: null,
-      });
-      const updated = this.store().getTrigger(trigger.triggerId);
-      return {
-        ok: true as const,
-        trigger: updated ? redactTrigger(updated, revision) : null,
-        changed,
-      };
-    }
-    if (callableId === "workflow.run.trigger") {
-      const definitions = await this.definitions(projectScope.canonicalRoot);
-      const context = requireTriggerContext(opts?.context);
-      const requestTarget = requestProgressTarget(context);
-      const input = parseToolInput({ callableId, input: rawInput, schema: runTriggerInputSchema });
-      const progressTarget = input.progress?.client
-        ? {
-            platform: input.progress.client,
-            channelId: input.progress.sessionId!,
-            replyToMessageId: null,
-          }
-        : requestTarget
-          ? {
-              platform: requestTarget.platform,
-              channelId: requestTarget.sessionRef.channelId,
-              replyToMessageId: null,
-            }
-          : null;
-      await assertProgressTargetAllowed({
-        requestTarget,
-        progressTarget,
-        getConfig: this.params.getConfig,
-      });
-      const definition = await definitions.get({
-        scope: input.scope,
-        name: input.name,
-      });
-      const args = validateWorkflowArgs({
-        inputSchema: definition.validation.inputSchema,
-        args: input.args,
-        maxInputBytes: definition.validation.limits.maxInputBytes,
-      });
-      const snapshot = await definitions.createSnapshot(
-        definition.source,
-        definition.validation.sourceSha256,
-      );
-      const now = this.params.now?.() ?? Date.now();
-      const revisionIdentity = {
-        canonicalProjectId: definitions.canonicalProjectId,
-        canonicalWorkspaceRoot: definitions.canonicalWorkspaceRoot,
-        scope: definition.scope,
-        normalizedPath: definition.normalizedPath,
-        sourceSha256: definition.validation.sourceSha256,
-        inputSchemaSha256: definition.validation.inputSchemaSha256,
-        resourcePolicySha256: definition.validation.resourcePolicySha256,
-        runtimeVersion: WORKFLOW_RUNTIME_VERSION,
-      } as const;
-      const revisionId = `wfr:${canonicalJsonSha256(jsonObjectSchema.parse(revisionIdentity))}`;
-      const revision: WorkflowRevision = {
-        ...revisionIdentity,
+    const changed = store.transitionTrigger({
+      triggerId: trigger.triggerId,
+      from: trigger.state,
+      to: "cancelled",
+      now: this.params.now?.() ?? Date.now(),
+      nextFireAt: null,
+    });
+    const updatedResult = store.getTrigger(trigger.triggerId);
+    const updated = adaptDurableWorkflowReadResultToHost(updatedResult);
+    return {
+      ok: true as const,
+      trigger: updated ? redactTrigger(updated, revision) : null,
+      changed,
+    };
+  }
+
+  private async callRunTrigger(
+    input: z.output<typeof runTriggerInputSchema>,
+    opts: WorkflowCallOptions | undefined,
+  ) {
+    const { store, projectScope } = await this.workflowCallContext(opts);
+    const definitions = await this.definitions(projectScope.canonicalRoot);
+    const context = adaptWorkflowToolResultToHost(decodeTriggerContext(opts?.context));
+    adaptWorkflowToolResultToHost(validateWorkflowRequestIdentity(context));
+    const requestTarget = requestProgressTarget(context);
+    await assertProgressTargetAllowed({
+      requestTarget,
+      progressTarget: resolveRequestedWorkflowProgressTarget(input.progress, requestTarget),
+      getConfig: this.params.getConfig,
+    });
+    const explicitProgressPlatform = resolveExplicitWorkflowProgressPlatform(
+      input.progress,
+      this.params.progressCards,
+    );
+    const requestProgressPlatform = resolveRequestWorkflowProgressPlatform(
+      input.progress,
+      requestTarget,
+      this.params.progressCards,
+    );
+    const definition = adaptWorkflowDefinitionResultToToolHost(
+      await definitions.getResult({ scope: input.scope, name: input.name }),
+    );
+    const args = validateWorkflowArgsToToolHost({
+      inputSchema: definition.validation.inputSchema,
+      args: input.args,
+      maxInputBytes: definition.validation.limits.maxInputBytes,
+    });
+    const snapshot = adaptWorkflowDefinitionResultToToolHost(
+      await definitions.createSnapshotResult(definition.source, definition.validation.sourceSha256),
+    );
+    const now = this.params.now?.() ?? Date.now();
+    const revisionIdentity = {
+      canonicalProjectId: definitions.canonicalProjectId,
+      canonicalWorkspaceRoot: definitions.canonicalWorkspaceRoot,
+      scope: definition.scope,
+      normalizedPath: definition.normalizedPath,
+      sourceSha256: definition.validation.sourceSha256,
+      inputSchemaSha256: definition.validation.inputSchemaSha256,
+      resourcePolicySha256: definition.validation.resourcePolicySha256,
+      runtimeVersion: WORKFLOW_RUNTIME_VERSION,
+    } as const;
+    const revisionId = `wfr:${canonicalJsonSha256(projectWorkflowJsonObject(revisionIdentity))}`;
+    const revision: WorkflowRevision = {
+      ...revisionIdentity,
+      revisionId,
+      name: definition.name,
+      snapshotArtifactId: snapshot.artifactId,
+      metadata: definition.validation.metadata,
+      inputSchema: definition.validation.inputSchema,
+      resources: definition.validation.resources,
+      limits: definition.validation.limits,
+      createdAt: now,
+    };
+    const idempotencyKey =
+      input.idempotencyKey ??
+      `tool:${context.requestId ?? "missing"}:${context.toolCallId ?? canonicalJsonSha256(args)}`;
+    const invocationFingerprint = canonicalJsonSha256(
+      projectWorkflowJsonObject({
         revisionId,
-        name: definition.name,
-        snapshotArtifactId: snapshot.artifactId,
-        metadata: definition.validation.metadata,
-        inputSchema: definition.validation.inputSchema,
-        resources: definition.validation.resources,
-        limits: definition.validation.limits,
-        createdAt: now,
-      };
-      const idempotencyKey =
-        input.idempotencyKey ??
-        `tool:${context.requestId ?? "missing"}:${context.toolCallId ?? canonicalJsonSha256(args)}`;
-      const invocationFingerprint = canonicalJsonSha256(
-        jsonObjectSchema.parse({
-          revisionId,
-          args,
-          progress: input.progress ?? null,
-        }),
-      );
-      const runId = `wfrun:${canonicalJsonSha256(
-        jsonObjectSchema.parse({ idempotencyKey, invocationFingerprint }),
-      )}`;
-      const run: WorkflowRun = {
-        runId,
-        revisionId,
-        state: "queued",
-        inputSchemaSnapshot: definition.validation.inputSchema,
         args,
-        argsSha256: canonicalJsonSha256(args),
-        origin: {
-          requestId: context.requestId ?? null,
-          sessionId: requestTarget?.sessionRef.channelId ?? null,
-          client: requestTarget?.platform ?? null,
-          userId: requestTarget?.userId ?? null,
-          projectCwd: definitions.canonicalWorkspaceRoot,
-        },
-        completionTarget: progressTarget ? { kind: "durable_surface" } : { kind: "detached" },
-        progressTarget,
-        terminalDetail: null,
-        result: null,
-        resultArtifactId: null,
-        claimedBy: null,
-        claimedAt: null,
-        createdAt: now,
-        startedAt: null,
-        updatedAt: now,
-        terminalAt: null,
-      };
-      const invocation = this.store().createInvocation({
+        progress: input.progress ?? null,
+      }),
+    );
+    const runId = `wfrun:${canonicalJsonSha256(
+      projectWorkflowJsonObject({ idempotencyKey, invocationFingerprint }),
+    )}`;
+    const progressTarget = resolveWorkflowProgressTarget(
+      input.progress,
+      requestTarget,
+      explicitProgressPlatform,
+      requestProgressPlatform,
+    );
+    const run: WorkflowRun = {
+      runId,
+      revisionId,
+      state: "queued",
+      inputSchemaSnapshot: definition.validation.inputSchema,
+      args,
+      argsSha256: canonicalJsonSha256(args),
+      origin: {
+        requestId: context.requestId ?? null,
+        sessionId: context.sessionId ?? null,
+        client:
+          context.requestClient && isAdapterPlatform(context.requestClient)
+            ? context.requestClient
+            : null,
+        userId: requestTarget?.userId ?? null,
+        projectCwd: definitions.canonicalWorkspaceRoot,
+      },
+      completionTarget: progressTarget ? { kind: "durable_surface" } : { kind: "detached" },
+      progressTarget,
+      terminalDetail: null,
+      result: null,
+      resultArtifactId: null,
+      claimedBy: null,
+      claimedAt: null,
+      createdAt: now,
+      startedAt: null,
+      updatedAt: now,
+      terminalAt: null,
+    };
+    const invocation = adaptWorkflowInvocationResultToToolHost(
+      store.createInvocation({
         revision,
         run,
         idempotency: { key: idempotencyKey, fingerprintSha256: invocationFingerprint },
         maxActiveRuns: (await this.params.getMaxActiveRuns?.()) ?? DEFAULT_MAX_ACTIVE_WORKFLOW_RUNS,
-      });
-      if (invocation.status === "rejected_capacity") {
-        return {
-          ok: false as const,
-          error: {
-            code: "workflow_capacity_exceeded" as const,
-            message: `Global workflow capacity is full (${invocation.activeRuns}/${invocation.limit} active runs). Wait for a workflow to finish or cancel one, then retry with the same idempotency key.`,
-            activeRuns: invocation.activeRuns,
-            limit: invocation.limit,
-            retryable: true as const,
-          },
-        };
-      }
-      let card: { platform: string; channelId: string; messageId: string } | null = null;
-      if (invocation.run.progressTarget) {
-        if (!this.params.progressCards) {
-          throw new Error(
-            `Workflow run ${invocation.run.runId} was persisted, but no progress card service is available`,
-          );
-        }
-        card = await this.params.progressCards.ensureInitialCard(invocation.run.runId);
-      }
-      await this.params.bus?.publish(lilacEventTypes.EvtWorkflowRunChanged, {
-        runId: invocation.run.runId,
-        revisionId: invocation.revision.revisionId,
-        state: invocation.run.state,
-        ts: now,
-      });
-      await this.params.bus?.publish(lilacEventTypes.EvtWorkflowProgressRequested, {
-        runId: invocation.run.runId,
-        revisionId: invocation.revision.revisionId,
-        reason: "created",
-        ts: now,
-      });
+      }),
+    );
+    if (invocation.status === "rejected_capacity") {
       return {
-        ok: true as const,
-        runId: invocation.run.runId,
-        state: invocation.run.state,
-        resolvedScope: definition.scope,
-        path: definition.canonicalPath,
-        revisionId: invocation.revision.revisionId,
-        sourceSha256: invocation.revision.sourceSha256,
-        inputSchemaSha256: invocation.revision.inputSchemaSha256,
-        resourcePolicySha256: invocation.revision.resourcePolicySha256,
-        argsSha256: invocation.run.argsSha256,
-        progressCard: card,
-        message: "Workflow invocation is queued for durable execution.",
+        ok: false as const,
+        error: {
+          code: "workflow_capacity_exceeded" as const,
+          message: `Global workflow capacity is full (${invocation.activeRuns}/${invocation.limit} active runs). Wait for a workflow to finish or cancel one, then retry with the same idempotency key.`,
+          activeRuns: invocation.activeRuns,
+          limit: invocation.limit,
+          retryable: true as const,
+        },
       };
     }
-    if (callableId === "workflow.run.get") {
-      const input = parseToolInput({ callableId, input: rawInput, schema: runGetInputSchema });
-      const run = this.store().getRun(input.runId);
-      if (!run) throw new Error(`Workflow run not found: ${input.runId}`);
-      const revision = this.store().getRevision(run.revisionId);
-      if (!revision) throw new Error(`Workflow revision not found: ${run.revisionId}`);
-      assertProjectScope({
-        canonicalProjectId: projectScope.canonicalProjectId,
-        revision,
-      });
-      return {
-        ok: true as const,
-        run: redactRun(run),
-        revision,
-        source:
-          input.includeSource && revision
-            ? await (
-                await this.definitions(projectScope.canonicalRoot)
-              ).readSnapshot(revision.sourceSha256)
-            : undefined,
-        resultArtifact:
-          input.includeResultArtifact && run.resultArtifactId
-            ? await readWorkflowValueArtifact({
-                dataDir: this.params.dataDir ?? env.dataDir,
-                artifactId: run.resultArtifactId,
-                maxBytes: revision.limits.maxResultBytes,
-              })
-            : undefined,
-      };
-    }
-    if (callableId === "workflow.run.list") {
-      const input = parseToolInput({ callableId, input: rawInput, schema: runListInputSchema });
-      return {
-        ok: true as const,
-        runs: this.store()
-          .listRuns({
-            ...input,
-            canonicalProjectId: projectScope.canonicalProjectId,
-          })
-          .map(redactRun),
-      };
-    }
-    if (callableId === "workflow.run.cancel") {
-      const input = parseToolInput({ callableId, input: rawInput, schema: runCancelInputSchema });
-      const run = this.store().getRun(input.runId);
-      if (!run) throw new Error(`Workflow run not found: ${input.runId}`);
-      const revision = this.store().getRevision(run.revisionId);
-      if (!revision) throw new Error(`Workflow revision not found: ${run.revisionId}`);
-      assertProjectScope({
-        canonicalProjectId: projectScope.canonicalProjectId,
-        revision,
-      });
-      const terminal = ["succeeded", "failed", "cancelled"].includes(run.state);
-      if (terminal) return { ok: true as const, run: redactRun(run), changed: false };
-      const now = this.params.now?.() ?? Date.now();
-      const activeRequests = this.store()
-        .listOperations(run.runId, { limit: 1_000 })
-        .flatMap((operation) => (operation.requestId ? [operation.requestId] : []));
-      const cancelled = this.store().cancelRunAndChildren({
-        runId: run.runId,
-        now,
-        detail: input.reason ?? "Cancelled through workflow.run.cancel",
-      });
-      const changed = cancelled?.state === "cancelled";
-      for (const requestId of activeRequests) {
-        await this.params.bus?.publish(
-          lilacEventTypes.CmdRequestMessage,
-          { queue: "interrupt", messages: [], raw: { cancel: true, cancelQueued: true } },
-          {
-            headers: {
-              request_id: requestId,
-              session_id: `workflow:${run.runId}:cancel`,
-              request_client: "unknown",
-            },
-          },
+    let card: { platform: string; channelId: string; messageId: string } | null = null;
+    if (invocation.run.progressTarget) {
+      if (!this.params.progressCards) {
+        return signalWorkflowToolFailureToHost(
+          `Workflow run ${invocation.run.runId} was persisted, but no progress card service is available`,
         );
       }
-      if (changed && cancelled) {
-        await this.params.bus?.publish(lilacEventTypes.EvtWorkflowRunChanged, {
-          runId: cancelled.runId,
-          revisionId: cancelled.revisionId,
-          state: cancelled.state,
-          previousState: run.state,
-          detail: cancelled.terminalDetail ?? undefined,
-          ts: now,
-        });
-        this.params.progressCards?.requestProjection(cancelled.runId);
-      }
-      return {
-        ok: true as const,
-        run: cancelled ? redactRun(cancelled) : null,
-        changed,
-      };
+      card = await this.params.progressCards.ensureInitialCard(invocation.run.runId);
     }
-    if (callableId === "workflow.run.pause" || callableId === "workflow.run.resume") {
-      const schema =
-        callableId === "workflow.run.pause" ? runPauseInputSchema : runResumeInputSchema;
-      const input = parseToolInput({ callableId, input: rawInput, schema });
-      const run = this.store().getRun(input.runId);
-      if (!run) throw new Error(`Workflow run not found: ${input.runId}`);
-      const revision = this.store().getRevision(run.revisionId);
-      if (!revision) throw new Error(`Workflow revision not found: ${run.revisionId}`);
-      assertProjectScope({
-        canonicalProjectId: projectScope.canonicalProjectId,
-        revision,
+    if (this.params.bus) {
+      adaptEventPublishResultToHost(
+        await this.params.bus.publish(lilacEventTypes.EvtWorkflowRunChanged, {
+          runId: invocation.run.runId,
+          revisionId: invocation.revision.revisionId,
+          state: invocation.run.state,
+          ts: now,
+        }),
+      );
+      adaptEventPublishResultToHost(
+        await this.params.bus.publish(lilacEventTypes.EvtWorkflowProgressRequested, {
+          runId: invocation.run.runId,
+          revisionId: invocation.revision.revisionId,
+          reason: "created",
+          ts: now,
+        }),
+      );
+    }
+    return {
+      ok: true as const,
+      runId: invocation.run.runId,
+      state: invocation.run.state,
+      resolvedScope: definition.scope,
+      path: definition.canonicalPath,
+      revisionId: invocation.revision.revisionId,
+      sourceSha256: invocation.revision.sourceSha256,
+      inputSchemaSha256: invocation.revision.inputSchemaSha256,
+      resourcePolicySha256: invocation.revision.resourcePolicySha256,
+      argsSha256: invocation.run.argsSha256,
+      progressCard: card,
+      message: "Workflow invocation is queued for durable execution.",
+    };
+  }
+
+  private async callRunGet(
+    input: z.output<typeof runGetInputSchema>,
+    opts: WorkflowCallOptions | undefined,
+  ) {
+    const { store, projectScope } = await this.workflowCallContext(opts);
+    const runResult = store.getRun(input.runId);
+    const run = adaptDurableWorkflowReadResultToHost(runResult);
+    if (!run) return signalWorkflowToolFailureToHost(`Workflow run not found: ${input.runId}`);
+    const revisionResult = store.getRevision(run.revisionId);
+    const revision = adaptDurableWorkflowReadResultToHost(revisionResult);
+    if (!revision)
+      return signalWorkflowToolFailureToHost(`Workflow revision not found: ${run.revisionId}`);
+    adaptWorkflowToolResultToHost(
+      validateProjectScope({ canonicalProjectId: projectScope.canonicalProjectId, revision }),
+    );
+    let resultArtifact;
+    if (input.includeResultArtifact && run.resultArtifactId) {
+      const loaded = await readWorkflowValueArtifact({
+        dataDir: this.params.dataDir ?? env.dataDir,
+        artifactId: run.resultArtifactId,
+        maxBytes: revision.limits.maxResultBytes,
       });
-      const to = callableId === "workflow.run.pause" ? "paused" : "queued";
-      const allowed =
-        to === "paused"
-          ? ["queued", "running", "blocked"].includes(run.state)
-          : run.state === "paused";
-      if (!allowed) return { ok: true as const, run: redactRun(run), changed: false };
-      const now = this.params.now?.() ?? Date.now();
-      const paused =
-        to === "paused"
-          ? this.store().pauseRunAndChildren({
-              runId: run.runId,
-              now,
-              detail: "Paused through workflow.run.pause",
-            })
-          : null;
-      const changed =
-        to === "paused"
-          ? paused?.state === "paused"
-          : this.store().transitionRun({
-              runId: run.runId,
-              from: run.state,
-              to,
-              now,
-            });
-      const updated = paused ?? this.store().getRun(run.runId);
-      if (to === "queued" && !changed) {
-        const ambiguity = this.store().getManualReconciliationDetail(run.runId);
-        if (ambiguity) throw new Error(ambiguity);
-      }
-      if (changed && updated) {
-        await this.params.bus?.publish(lilacEventTypes.EvtWorkflowRunChanged, {
-          runId: updated.runId,
-          revisionId: updated.revisionId,
-          state: updated.state,
-          previousState: run.state,
-          ts: now,
-        });
-        this.params.progressCards?.requestProjection(updated.runId);
-      }
-      return {
-        ok: true as const,
-        run: updated ? redactRun(updated) : null,
-        changed,
-      };
+      resultArtifact = adaptWorkflowArtifactResultToException(loaded);
     }
-    throw new Error(`Invalid callable ID '${callableId}'`);
+    return {
+      ok: true as const,
+      run: redactRun(run),
+      revision,
+      source:
+        input.includeSource && revision
+          ? adaptWorkflowDefinitionResultToToolHost(
+              await (
+                await this.definitions(projectScope.canonicalRoot)
+              ).readSnapshotResult(revision.sourceSha256),
+            )
+          : undefined,
+      resultArtifact,
+    };
+  }
+
+  private async callRunList(
+    input: z.output<typeof runListInputSchema>,
+    opts: WorkflowCallOptions | undefined,
+  ) {
+    const { store, projectScope } = await this.workflowCallContext(opts);
+    const runs = store.listRuns({
+      ...input,
+      canonicalProjectId: projectScope.canonicalProjectId,
+    });
+    const runValues = adaptDurableWorkflowReadResultToHost(runs);
+    return {
+      ok: true as const,
+      runs: runValues.map(redactRun),
+    };
+  }
+
+  private async callRunCancel(
+    input: z.output<typeof runCancelInputSchema>,
+    opts: WorkflowCallOptions | undefined,
+  ) {
+    const { store, projectScope } = await this.workflowCallContext(opts);
+    const runResult = store.getRun(input.runId);
+    const run = adaptDurableWorkflowReadResultToHost(runResult);
+    if (!run) return signalWorkflowToolFailureToHost(`Workflow run not found: ${input.runId}`);
+    const revisionResult = store.getRevision(run.revisionId);
+    const revision = adaptDurableWorkflowReadResultToHost(revisionResult);
+    if (!revision)
+      return signalWorkflowToolFailureToHost(`Workflow revision not found: ${run.revisionId}`);
+    adaptWorkflowToolResultToHost(
+      validateProjectScope({ canonicalProjectId: projectScope.canonicalProjectId, revision }),
+    );
+    const terminal = ["succeeded", "failed", "cancelled"].includes(run.state);
+    if (terminal) return { ok: true as const, run: redactRun(run), changed: false };
+    const now = this.params.now?.() ?? Date.now();
+    const operations = store.listOperations(run.runId, { limit: 1_000 });
+    const operationValues = adaptDurableWorkflowReadResultToHost(operations);
+    const activeRequests = operationValues.flatMap((operation) =>
+      operation.requestId ? [operation.requestId] : [],
+    );
+    const cancelled = store.cancelRunAndChildren({
+      runId: run.runId,
+      now,
+      detail: input.reason ?? "Cancelled through workflow.run.cancel",
+    });
+    const changed = cancelled?.state === "cancelled";
+    for (const requestId of activeRequests) {
+      if (this.params.bus) {
+        adaptEventPublishResultToHost(
+          await this.params.bus.publish(
+            lilacEventTypes.CmdRequestMessage,
+            { queue: "interrupt", messages: [], raw: { cancel: true, cancelQueued: true } },
+            {
+              headers: {
+                request_id: requestId,
+                session_id: `workflow:${run.runId}:cancel`,
+                request_client: "unknown",
+              },
+            },
+          ),
+        );
+      }
+    }
+    if (changed && cancelled) {
+      if (this.params.bus) {
+        adaptEventPublishResultToHost(
+          await this.params.bus.publish(lilacEventTypes.EvtWorkflowRunChanged, {
+            runId: cancelled.runId,
+            revisionId: cancelled.revisionId,
+            state: cancelled.state,
+            previousState: run.state,
+            detail: cancelled.terminalDetail ?? undefined,
+            ts: now,
+          }),
+        );
+      }
+      this.params.progressCards?.requestProjection(cancelled.runId);
+    }
+    return {
+      ok: true as const,
+      run: cancelled ? redactRun(cancelled) : null,
+      changed,
+    };
+  }
+
+  private callRunPause(
+    input: z.output<typeof runPauseInputSchema>,
+    opts: WorkflowCallOptions | undefined,
+  ) {
+    return this.callRunPauseState(input, opts, "paused");
+  }
+
+  private callRunResume(
+    input: z.output<typeof runResumeInputSchema>,
+    opts: WorkflowCallOptions | undefined,
+  ) {
+    return this.callRunPauseState(input, opts, "queued");
+  }
+
+  private async callRunPauseState(
+    input: z.output<typeof runPauseInputSchema>,
+    opts: WorkflowCallOptions | undefined,
+    to: "paused" | "queued",
+  ) {
+    const { store, projectScope } = await this.workflowCallContext(opts);
+    const runResult = store.getRun(input.runId);
+    const run = adaptDurableWorkflowReadResultToHost(runResult);
+    if (!run) return signalWorkflowToolFailureToHost(`Workflow run not found: ${input.runId}`);
+    const revisionResult = store.getRevision(run.revisionId);
+    const revision = adaptDurableWorkflowReadResultToHost(revisionResult);
+    if (!revision)
+      return signalWorkflowToolFailureToHost(`Workflow revision not found: ${run.revisionId}`);
+    adaptWorkflowToolResultToHost(
+      validateProjectScope({ canonicalProjectId: projectScope.canonicalProjectId, revision }),
+    );
+    const allowed =
+      to === "paused"
+        ? ["queued", "running", "blocked"].includes(run.state)
+        : run.state === "paused";
+    if (!allowed) return { ok: true as const, run: redactRun(run), changed: false };
+    const now = this.params.now?.() ?? Date.now();
+    const paused =
+      to === "paused"
+        ? store.pauseRunAndChildren({
+            runId: run.runId,
+            now,
+            detail: "Paused through workflow.run.pause",
+          })
+        : null;
+    const changed =
+      to === "paused"
+        ? paused?.state === "paused"
+        : store.transitionRun({
+            runId: run.runId,
+            from: run.state,
+            to,
+            now,
+          });
+    const updatedResult = paused === null ? store.getRun(run.runId) : Result.ok(paused);
+    const updated = adaptDurableWorkflowReadResultToHost(updatedResult);
+    if (to === "queued" && !changed) {
+      const ambiguity = store.getManualReconciliationDetail(run.runId);
+      if (ambiguity) return signalWorkflowToolFailureToHost(ambiguity);
+    }
+    if (changed && updated) {
+      if (this.params.bus) {
+        adaptEventPublishResultToHost(
+          await this.params.bus.publish(lilacEventTypes.EvtWorkflowRunChanged, {
+            runId: updated.runId,
+            revisionId: updated.revisionId,
+            state: updated.state,
+            previousState: run.state,
+            ts: now,
+          }),
+        );
+      }
+      this.params.progressCards?.requestProjection(updated.runId);
+    }
+    return {
+      ok: true as const,
+      run: updated ? redactRun(updated) : null,
+      changed,
+    };
   }
 }

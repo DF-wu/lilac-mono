@@ -18,6 +18,10 @@ import {
 } from "../../tool-server/tools";
 import type { CoreToolPlugin } from "../types";
 
+function signalBuiltinPluginSkip(reason: string): never {
+  throw new ToolPluginSkipError(reason);
+}
+
 function singletonLevel2(pluginId: string, createTool: () => ServerTool): CoreToolPlugin {
   return {
     meta: {
@@ -46,7 +50,7 @@ export function createBuiltinMcpPlugin(): CoreToolPlugin {
     },
     create({ runtime }) {
       if (!runtime.mcpRegistry || !runtime.mcpOAuthProviders || !runtime.mcpConfigPath) {
-        throw new ToolPluginSkipError(
+        return signalBuiltinPluginSkip(
           "mcp requires registry, OAuth provider service, and config path",
         );
       }
@@ -71,7 +75,7 @@ export function createBuiltinDiscoveryPlugin(): CoreToolPlugin {
     },
     create({ runtime }) {
       if (!runtime.discovery) {
-        throw new ToolPluginSkipError("discovery requires discovery service");
+        return signalBuiltinPluginSkip("discovery requires discovery service");
       }
       return {
         level2: [new Discovery({ discovery: runtime.discovery })],
@@ -87,7 +91,7 @@ export function createBuiltinConversationThreadPlugin(): CoreToolPlugin {
     },
     create({ runtime }) {
       if (!runtime.conversationThreads) {
-        throw new ToolPluginSkipError("conversation.thread requires conversation thread service");
+        return signalBuiltinPluginSkip("conversation.thread requires conversation thread service");
       }
       return {
         level2: [new ConversationThread({ service: runtime.conversationThreads })],
@@ -111,10 +115,6 @@ export function createBuiltinGeneratePlugin(): CoreToolPlugin {
     },
     create({ runtime }) {
       const config = runtime.config;
-      // Fall back to reading core-config from disk instead of leaving this
-      // undefined: an undefined getConfig makes Generate assume the "default"
-      // provider, which would silently route prompts to the built-in providers
-      // even when core-config.yaml selects "openai-compatible".
       const getConfig = runtime.getConfig ?? (config ? async () => config : () => getCoreConfig());
       return {
         level2: [new Generate({ getConfig })],
@@ -149,7 +149,7 @@ export function createBuiltinAttachmentPlugin(): CoreToolPlugin {
     },
     create({ runtime }) {
       if (!runtime.bus) {
-        throw new ToolPluginSkipError("attachment requires bus");
+        return signalBuiltinPluginSkip("attachment requires bus");
       }
       return {
         level2: [new Attachment({ bus: runtime.bus })],
@@ -165,10 +165,16 @@ export function createBuiltinWorkflowPlugin(): CoreToolPlugin {
     },
     create({ runtime, dataDir }) {
       if (!runtime.bus) {
-        throw new ToolPluginSkipError("workflow requires bus");
+        return signalBuiltinPluginSkip("workflow requires bus");
       }
       const getConfig = runtime.getConfig;
       const config = runtime.config;
+      let getMaxActiveRuns: (() => Promise<number>) | (() => number) | undefined;
+      if (getConfig) {
+        getMaxActiveRuns = async () => (await getConfig()).workflows.maxActiveRuns;
+      } else if (config) {
+        getMaxActiveRuns = () => config.workflows.maxActiveRuns;
+      }
       return {
         level2: [
           new ProgrammaticWorkflow({
@@ -177,11 +183,7 @@ export function createBuiltinWorkflowPlugin(): CoreToolPlugin {
             bus: runtime.bus,
             progressCards: runtime.workflowProgressCards,
             getConfig: getConfig ?? (config ? async () => config : undefined),
-            getMaxActiveRuns: getConfig
-              ? async () => (await getConfig()).workflows.maxActiveRuns
-              : config
-                ? () => config.workflows.maxActiveRuns
-                : undefined,
+            getMaxActiveRuns,
           }),
         ],
       };
@@ -195,14 +197,13 @@ export function createBuiltinSurfacePlugin(): CoreToolPlugin {
       id: "surface",
     },
     create({ runtime }) {
-      if (!runtime.adapter || !(runtime.config || runtime.getConfig)) {
-        throw new ToolPluginSkipError("surface requires adapter and config access");
+      if (!runtime.surfaceAdapterResolver || !(runtime.config || runtime.getConfig)) {
+        return signalBuiltinPluginSkip("surface requires an adapter resolver and config access");
       }
       return {
         level2: [
           new Surface({
-            adapter: runtime.adapter,
-            adapters: runtime.surfaceAdapters,
+            adapterResolver: runtime.surfaceAdapterResolver,
             config: runtime.config,
             getConfig: runtime.getConfig,
             discordSearch: runtime.discordSearch,

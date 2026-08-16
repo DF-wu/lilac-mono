@@ -1,4 +1,4 @@
-import type { AgentRunProfile, SubagentProfile } from "./raw";
+import type { SubagentProfile } from "./raw";
 import type { SubagentProfileConfig } from "@stanley2058/lilac-utils";
 
 function buildExploreOverlay(config: SubagentProfileConfig, extra?: string): string {
@@ -6,9 +6,9 @@ function buildExploreOverlay(config: SubagentProfileConfig, extra?: string): str
     "You are running in explore subagent mode.",
     "Focus on repository exploration and evidence-backed findings.",
     "Treat the delegated user message as the full task input.",
-    "Prefer high-parallel search/read using glob, grep, read_file, and batch.",
+    "Prefer high-parallel search/read using glob, grep, read, and batch.",
   ];
-  if (!config.execution) lines.push("Do not use bash.");
+  if (config.execution === false) lines.push("Do not use bash.");
   if (!config.network) lines.push("Do not use network access or network-backed tools.");
   if (!config.workspaceWrites) lines.push("Do not edit files.");
   if (!config.delegation) lines.push("Do not delegate to another subagent.");
@@ -80,16 +80,19 @@ function subagentModeTitle(profile: SubagentProfile): string {
   return "Explore";
 }
 
-export function buildSystemPromptForProfile(params: {
+type SystemPromptProfileParams = {
   baseSystemPrompt: string;
-  profile: AgentRunProfile;
   exploreOverlay?: string;
   generalOverlay?: string;
   selfOverlay?: string;
   skillsSection?: string | null;
   activeEditingTool?: "apply_patch" | "edit_file" | null;
-  profileConfig?: SubagentProfileConfig;
-}): string {
+} & (
+  | { readonly profile: "primary"; readonly profileConfig?: never }
+  | { readonly profile: SubagentProfile; readonly profileConfig: SubagentProfileConfig }
+);
+
+export function buildSystemPromptForProfile(params: SystemPromptProfileParams): string {
   if (params.profile === "primary") {
     const parts = [params.baseSystemPrompt];
     if (params.skillsSection && params.skillsSection.trim().length > 0) {
@@ -103,9 +106,6 @@ export function buildSystemPromptForProfile(params: {
     baseParts.push(params.skillsSection.trim());
   }
 
-  if (!params.profileConfig) {
-    throw new Error(`Missing native profile configuration for ${params.profile}`);
-  }
   const overlay = buildOverlayForProfile({
     profile: params.profile,
     config: params.profileConfig,

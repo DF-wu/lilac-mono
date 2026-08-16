@@ -1,0 +1,22 @@
+import beginFresh from "./lua/begin-fresh.lua" with { type: "text" };
+import beginInvocation from "./lua/begin-invocation.lua" with { type: "text" };
+import beginTerminal from "./lua/begin-terminal.lua" with { type: "text" };
+import claimRecoverable from "./lua/claim-recoverable.lua" with { type: "text" };
+import commit from "./lua/commit.lua" with { type: "text" };
+import common from "./lua/common.lua" with { type: "text" };
+import finalizeTerminal from "./lua/finalize-terminal.lua" with { type: "text" };
+import heartbeat from "./lua/heartbeat.lua" with { type: "text" };
+import park from "./lua/park.lua" with { type: "text" };
+import scheduleRetry from "./lua/schedule-retry.lua" with { type: "text" };
+import stageTerminal from "./lua/stage-terminal.lua" with { type: "text" };
+
+export const BEGIN_FRESH_SCRIPT = [common, beginFresh].join("\n");
+export const BEGIN_INVOCATION_SCRIPT = [common, beginInvocation].join("\n");
+export const HEARTBEAT_SCRIPT = [common, heartbeat].join("\n");
+export const COMMIT_SCRIPT = [common, commit].join("\n");
+export const SCHEDULE_RETRY_SCRIPT = [common, scheduleRetry].join("\n");
+export const PARK_SCRIPT = [common, park].join("\n");
+export const CLAIM_RECOVERABLE_SCRIPT = [common, claimRecoverable].join("\n");
+export const BEGIN_TERMINAL_SCRIPT = [common, beginTerminal].join("\n");
+export const STAGE_TERMINAL_SCRIPT = [common, stageTerminal].join("\n");
+export const FINALIZE_TERMINAL_SCRIPT = [common, finalizeTerminal].join("\n");

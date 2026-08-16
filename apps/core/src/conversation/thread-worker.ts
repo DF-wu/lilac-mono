@@ -1,46 +1,151 @@
-import { createLogger, type CoreConfig } from "@stanley2058/lilac-utils";
+import {
+  createLogger,
+  formatTaggedErrorForLog,
+  isPanic,
+  opaqueErrorMessage,
+  type CoreConfig,
+} from "@stanley2058/lilac-utils";
+import { Panic, Result, TaggedError, type Result as ResultType } from "better-result";
 
-import type {
-  ConversationThreadRunSummarizationInput,
-  ConversationThreadRunSummarizationResult,
-} from "./thread-service";
+import {
+  decodeThreadSummarizationWorkerMessage,
+  ThreadSummarizationWorkerMessageDecodeError,
+  type ThreadSummarizationParentMessage,
+  type ThreadSummarizationResult,
+  type ThreadSummarizationHydrationRequest,
+  type ThreadSummarizationHydrationResponse,
+  type ThreadSummarizationWorkerRequest,
+} from "./thread-summarization-worker-protocol";
+import type { ConversationThreadRunSummarizationInput } from "./thread-service";
+import type { SurfaceAdapter } from "../surface/adapter";
+import { toReplyChainMessage } from "../surface/bridge/request-composition/reply-chain";
 
 const CHECK_INTERVAL_MS = 10 * 60 * 1000;
 const INITIAL_CHECK_DELAY_MS = 10_000;
 
-export type ConversationThreadWorkerScheduler = (task: () => void, delayMs: number) => () => void;
+export type ConversationThreadWorkerScheduler = (
+  task: () => void | Promise<void>,
+  delayMs: number,
+) => () => void;
 
-function defaultScheduler(task: () => void, delayMs: number): () => void {
+export type ConversationThreadWorkerFatalReporter = (panic: Panic) => void;
+
+const fatalReportOwners = new WeakSet<Panic>();
+
+function reportConversationThreadWorkerPanicOnce(
+  panic: Panic,
+  reportFatalPanic: ConversationThreadWorkerFatalReporter,
+): void {
+  if (fatalReportOwners.has(panic)) return;
+  fatalReportOwners.add(panic);
+  reportFatalPanic(panic);
+}
+
+function defaultScheduler(task: () => void | Promise<void>, delayMs: number): () => void {
   const timer = setTimeout(task, delayMs);
   timer.unref?.();
   return () => clearTimeout(timer);
 }
 
+export function signalConversationThreadWorkerPanicToProcess(panic: Panic): void {
+  queueMicrotask(() => {
+    throw panic;
+  });
+}
+
 export type ConversationThreadSummarizationRunner = {
   runSummarization(
     input?: ConversationThreadRunSummarizationInput,
-  ): Promise<ConversationThreadRunSummarizationResult>;
+  ): Promise<ResultType<ThreadSummarizationResult, ConversationThreadSummarizationError>>;
 };
 
-type WorkerResponse =
-  | {
-      id: string;
-      ok: true;
-      result: ConversationThreadRunSummarizationResult;
-    }
-  | {
-      id: string;
-      ok: false;
-      error: string;
-    };
+export class ConversationThreadSummarizationRemoteError extends TaggedError(
+  "ConversationThreadSummarizationRemoteError",
+)<{
+  readonly jobId: string;
+  readonly remoteMessage: string;
+  readonly message: string;
+}> {}
 
-function isWorkerResponse(input: unknown): input is WorkerResponse {
-  if (!input || typeof input !== "object") return false;
-  const record = input as Record<string, unknown>;
-  return typeof record.id === "string" && typeof record.ok === "boolean";
+export type ConversationThreadSummarizationTransportOperation = "post-message" | "stopped";
+
+export class ConversationThreadSummarizationTransportError extends TaggedError(
+  "ConversationThreadSummarizationTransportError",
+)<{
+  readonly operation: ConversationThreadSummarizationTransportOperation;
+  readonly cause?: unknown;
+  readonly message: string;
+}> {}
+
+export type ConversationThreadSummarizationRuntimeOperation =
+  | "materializer-flush"
+  | "configuration"
+  | "in-process";
+
+export class ConversationThreadSummarizationRuntimeError extends TaggedError(
+  "ConversationThreadSummarizationRuntimeError",
+)<{
+  readonly operation: ConversationThreadSummarizationRuntimeOperation;
+  readonly cause: unknown;
+  readonly message: string;
+}> {}
+
+export type ConversationThreadSummarizationWorkerError =
+  | ThreadSummarizationWorkerMessageDecodeError
+  | ConversationThreadSummarizationRemoteError
+  | ConversationThreadSummarizationTransportError;
+
+export type ConversationThreadSummarizationError =
+  | ConversationThreadSummarizationWorkerError
+  | ConversationThreadSummarizationRuntimeError;
+
+export type ConversationThreadSummarizationWorkerTransport = {
+  postMessage(request: ThreadSummarizationParentMessage): void;
+  terminate(): void;
+  onMessage(listener: (event: MessageEvent<unknown>) => void): void;
+  onError(listener: (panic: Panic) => void): void;
+};
+
+export function rethrowConversationThreadWorkerPanic(
+  cause: Panic | null,
+  beforeRethrow?: (panic: Panic) => void,
+): void {
+  if (!cause) return;
+  beforeRethrow?.(cause);
+  throw cause;
 }
 
-function queuedResult(jobId: string): ConversationThreadRunSummarizationResult {
+export function normalizeConversationThreadWorkerPanic(cause: Panic | string): Panic {
+  if (Panic.is(cause)) return cause;
+  return new Panic({
+    message: cause || "Conversation thread summarization worker failed with an opaque error",
+  });
+}
+
+function createSummarizationWorkerTransport(): ConversationThreadSummarizationWorkerTransport {
+  const worker = new Worker(new URL("./thread-summarization-worker.ts", import.meta.url), {
+    type: "module",
+  });
+  return {
+    postMessage(request) {
+      worker.postMessage(request);
+    },
+    terminate() {
+      worker.terminate();
+    },
+    onMessage(listener) {
+      worker.onmessage = listener;
+    },
+    onError(listener) {
+      worker.onerror = (event) => {
+        const cause = Panic.is(event.error) ? event.error : event.message;
+        listener(normalizeConversationThreadWorkerPanic(cause));
+      };
+    },
+  };
+}
+
+function queuedResult(jobId: string): ThreadSummarizationResult {
   return {
     dryRun: false,
     refreshed: { channels: 0, threads: 0, messages: 0 },
@@ -60,17 +165,21 @@ function queuedResult(jobId: string): ConversationThreadRunSummarizationResult {
 export function startConversationThreadSummarizationWorker(params: {
   searchDbPath: string;
   surfaceDbPath?: string;
+  adapter?: Pick<SurfaceAdapter, "readMsg">;
+  createWorker?: () => ConversationThreadSummarizationWorkerTransport;
+  reportFatalPanic?: ConversationThreadWorkerFatalReporter;
 }): ConversationThreadSummarizationRunner & { stop(): Promise<void> } {
   const logger = createLogger({ module: "conversation-thread-worker-client" });
-  const worker = new Worker(new URL("./thread-summarization-worker.ts", import.meta.url), {
-    type: "module",
-  });
+  const worker = params.createWorker?.() ?? createSummarizationWorkerTransport();
+  const reportFatalPanic = params.reportFatalPanic ?? signalConversationThreadWorkerPanicToProcess;
   logger.debug("conversation thread summarization worker client started");
   const pending = new Map<
     string,
     {
-      resolve: (result: ConversationThreadRunSummarizationResult) => void;
-      reject: (error: Error) => void;
+      resolve: (
+        result: ResultType<ThreadSummarizationResult, ConversationThreadSummarizationWorkerError>,
+      ) => void;
+      reject: (panic: Panic) => void;
     }
   >();
   const jobs = new Map<
@@ -83,60 +192,208 @@ export function startConversationThreadSummarizationWorker(params: {
       threadId?: string;
     }
   >();
+  let stopped = false;
+  let terminated = false;
+  let terminalFailure: ThreadSummarizationWorkerMessageDecodeError | null = null;
+  let terminalPanic: Panic | null = null;
 
-  worker.onmessage = (event: MessageEvent<unknown>) => {
-    const response = event.data;
-    if (!isWorkerResponse(response)) {
-      logger.warn("conversation thread worker sent invalid response");
-      return;
-    }
-
-    const waiter = pending.get(response.id);
-    pending.delete(response.id);
-    const job = jobs.get(response.id);
-    jobs.delete(response.id);
-    const durationMs = job ? Date.now() - job.startedAt : undefined;
-
-    if (response.ok) {
-      logger.debug("conversation thread summarization job completed", {
-        jobId: response.id,
-        wait: job?.wait,
-        dryRun: job?.dryRun,
-        threadId: job?.threadId,
-        durationMs,
-        eligible: response.result.eligible,
-        summarized: response.result.summarized,
-        failed: response.result.failed,
-      });
-      if (waiter) waiter.resolve(response.result);
-      return;
-    }
-
-    const error = new Error(response.error);
-    logger.error(
-      "conversation thread summarization job failed",
-      {
-        jobId: response.id,
-        wait: job?.wait,
-        dryRun: job?.dryRun,
-        threadId: job?.threadId,
-        durationMs,
-      },
-      error,
-    );
-    if (waiter) waiter.reject(error);
+  const terminateWorker = () => {
+    if (terminated) return;
+    terminated = true;
+    worker.terminate();
   };
 
-  worker.onerror = (event) => {
-    const error = new Error(event.message || "conversation thread worker failed");
-    for (const waiter of pending.values()) waiter.reject(error);
+  const settlePending = (error: ConversationThreadSummarizationWorkerError) => {
+    const waiters = [...pending.values()];
     pending.clear();
     jobs.clear();
-    logger.error("conversation thread worker error", error);
+    for (const waiter of waiters) waiter.resolve(Result.err(error));
   };
+
+  const rejectPending = (panic: Panic) => {
+    const waiters = [...pending.values()];
+    pending.clear();
+    jobs.clear();
+    for (const waiter of waiters) waiter.reject(panic);
+  };
+
+  const postRequest = (
+    request: ThreadSummarizationParentMessage,
+  ): ResultType<void, ConversationThreadSummarizationTransportError> => {
+    try {
+      worker.postMessage(request);
+      return Result.ok(undefined);
+    } catch (cause) {
+      pending.delete(request.id);
+      jobs.delete(request.id);
+      if (Panic.is(cause)) rethrowConversationThreadWorkerPanic(cause);
+      return Result.err(
+        new ConversationThreadSummarizationTransportError({
+          operation: "post-message",
+          cause,
+          message: "Could not post conversation thread summarization worker request",
+        }),
+      );
+    }
+  };
+
+  const handleHydrationRequest = async (request: ThreadSummarizationHydrationRequest) => {
+    const results: ThreadSummarizationHydrationResponse["results"] = [];
+    for (const ref of request.refs) {
+      if (!params.adapter) {
+        results.push({ ref, ok: false, error: "surface adapter unavailable" });
+        continue;
+      }
+      const [settled] = await Promise.allSettled([
+        params.adapter.readMsg({ platform: "discord", ...ref }),
+      ]);
+      if (settled.status === "rejected") {
+        const panic = Panic.is(settled.reason)
+          ? settled.reason
+          : new Panic({
+              message: "Conversation thread attachment hydration defect",
+              cause: settled.reason,
+            });
+        handleWorkerPanic(panic);
+        return;
+      }
+      const read = settled.value;
+      read.match({
+        err: (error) => {
+          results.push({ ref, ok: false, error: error.message });
+        },
+        ok: (message) => {
+          if (!message) {
+            results.push({ ref, ok: false, error: "surface message not found" });
+            return;
+          }
+          results.push({
+            ref,
+            ok: true,
+            attachments: toReplyChainMessage(message).attachments,
+          });
+        },
+      });
+    }
+    if (stopped || terminalFailure || terminalPanic) return;
+    const response: ThreadSummarizationParentMessage = {
+      type: "hydrate-discord-attachments-result",
+      id: request.id,
+      results,
+    };
+    const [posted] = await Promise.allSettled([
+      Promise.resolve().then(() => postRequest(response)),
+    ]);
+    if (posted.status === "rejected") {
+      handleWorkerPanic(
+        Panic.is(posted.reason)
+          ? posted.reason
+          : new Panic({
+              message: "Conversation thread hydration response failed",
+              cause: posted.reason,
+            }),
+      );
+      return;
+    }
+    posted.value.match({
+      ok: () => undefined,
+      err: (error) =>
+        handleWorkerPanic(
+          new Panic({
+            message: "Conversation thread hydration response failed",
+            cause: error,
+          }),
+        ),
+    });
+  };
+
+  worker.onMessage((event) => {
+    if (stopped || terminalFailure || terminalPanic) return;
+    const decoded = decodeThreadSummarizationWorkerMessage(event.data);
+    decoded.match({
+      err: (error) => {
+        terminalFailure = error;
+        settlePending(terminalFailure);
+        logger.warn(
+          "conversation thread worker sent invalid response",
+          formatTaggedErrorForLog(terminalFailure),
+        );
+        terminateWorker();
+      },
+      ok: (response) => {
+        if ("type" in response) {
+          void handleHydrationRequest(response);
+          return;
+        }
+        const waiter = pending.get(response.id);
+        const job = jobs.get(response.id);
+        if (!waiter && !job) {
+          logger.warn("conversation thread worker response had no pending job", {
+            jobId: response.id,
+          });
+          return;
+        }
+
+        pending.delete(response.id);
+        jobs.delete(response.id);
+        const durationMs = job ? Date.now() - job.startedAt : undefined;
+
+        if (response.ok) {
+          logger.debug("conversation thread summarization job completed", {
+            jobId: response.id,
+            wait: job?.wait,
+            dryRun: job?.dryRun,
+            threadId: job?.threadId,
+            durationMs,
+            eligible: response.result.eligible,
+            summarized: response.result.summarized,
+            failed: response.result.failed,
+          });
+          waiter?.resolve(
+            Result.ok({ ...response.result, jobId: response.id, status: "completed" as const }),
+          );
+          return;
+        }
+
+        const error = new ConversationThreadSummarizationRemoteError({
+          jobId: response.id,
+          remoteMessage: response.error,
+          message: response.error,
+        });
+        logger.error("conversation thread summarization job failed", {
+          jobId: response.id,
+          wait: job?.wait,
+          dryRun: job?.dryRun,
+          threadId: job?.threadId,
+          durationMs,
+        });
+        waiter?.resolve(Result.err(error));
+      },
+    });
+  });
+
+  const handleWorkerPanic = (panic: Panic) => {
+    if (stopped || terminalFailure || terminalPanic) return;
+    terminalPanic = panic;
+    rejectPending(terminalPanic);
+    terminateWorker();
+    reportConversationThreadWorkerPanicOnce(terminalPanic, reportFatalPanic);
+    logger.error("conversation thread worker defect", formatTaggedErrorForLog(terminalPanic));
+  };
+  worker.onError(handleWorkerPanic);
 
   return {
     async runSummarization(input = {}) {
+      rethrowConversationThreadWorkerPanic(terminalPanic);
+      if (terminalFailure) return Result.err(terminalFailure);
+      if (stopped) {
+        return Result.err(
+          new ConversationThreadSummarizationTransportError({
+            operation: "stopped",
+            message: "Conversation thread summarization worker is stopped",
+          }),
+        );
+      }
       const jobId = crypto.randomUUID();
       const wait = input.wait === true;
       jobs.set(jobId, {
@@ -157,39 +414,35 @@ export function startConversationThreadSummarizationWorker(params: {
         limit: input.limit,
         trigger: input.trigger ?? "manual",
       });
-      if (wait) {
-        const result = await new Promise<ConversationThreadRunSummarizationResult>(
-          (resolve, reject) => {
-            pending.set(jobId, { resolve, reject });
-            worker.postMessage({
-              id: jobId,
-              input,
-              searchDbPath: params.searchDbPath,
-              surfaceDbPath: params.surfaceDbPath,
-            });
-          },
-        );
-        return { ...result, jobId, status: "completed" as const };
-      }
-
-      worker.postMessage({
+      const request = {
         id: jobId,
         input,
         searchDbPath: params.searchDbPath,
         surfaceDbPath: params.surfaceDbPath,
-      });
-      return queuedResult(jobId);
+      } satisfies ThreadSummarizationWorkerRequest;
+      if (wait) {
+        return await new Promise<
+          ResultType<ThreadSummarizationResult, ConversationThreadSummarizationWorkerError>
+        >((resolve, reject) => {
+          pending.set(jobId, { resolve, reject });
+          const posted = postRequest(request);
+          posted.match({ ok: () => undefined, err: (error) => resolve(Result.err(error)) });
+        });
+      }
+
+      const posted = postRequest(request);
+      return posted.map(() => queuedResult(jobId));
     },
     async stop() {
-      logger.debug("conversation thread summarization worker client stopping", {
-        pendingJobs: jobs.size,
-        waiters: pending.size,
-      });
-      worker.terminate();
-      const error = new Error("conversation thread worker stopped");
-      for (const waiter of pending.values()) waiter.reject(error);
-      pending.clear();
-      jobs.clear();
+      logger.debug("conversation thread summarization worker client stopping");
+      stopped = true;
+      settlePending(
+        new ConversationThreadSummarizationTransportError({
+          operation: "stopped",
+          message: "Conversation thread summarization worker is stopped",
+        }),
+      );
+      terminateWorker();
       logger.debug("conversation thread summarization worker client stopped");
     },
   };
@@ -201,10 +454,12 @@ export function startConversationThreadWorker(params: {
   schedule?: ConversationThreadWorkerScheduler;
   checkIntervalMs?: number;
   initialCheckDelayMs?: number;
+  reportFatalPanic?: ConversationThreadWorkerFatalReporter;
 }): { stop(): Promise<void> } {
   const logger = createLogger({ module: "conversation-thread-worker" });
   const scheduler = params.schedule ?? defaultScheduler;
   const checkIntervalMs = params.checkIntervalMs ?? CHECK_INTERVAL_MS;
+  const reportFatalPanic = params.reportFatalPanic ?? signalConversationThreadWorkerPanicToProcess;
   logger.debug("conversation thread periodic worker started", {
     checkIntervalMs,
   });
@@ -212,6 +467,7 @@ export function startConversationThreadWorker(params: {
   let running = false;
   let cancelScheduledTick: (() => void) | null = null;
   let tickPromise: Promise<void> | null = null;
+  let terminalPanic: Panic | null = null;
 
   const schedule = (delayMs: number) => {
     if (stopped) return;
@@ -219,9 +475,7 @@ export function startConversationThreadWorker(params: {
       cancelScheduledTick = null;
       const current = tick();
       tickPromise = current;
-      void current.finally(() => {
-        if (tickPromise === current) tickPromise = null;
-      });
+      return current;
     }, delayMs);
   };
 
@@ -242,23 +496,44 @@ export function startConversationThreadWorker(params: {
       }
 
       logger.debug("conversation thread summarization tick started");
-      const result = await params.runner.runSummarization({
+      const run = await params.runner.runSummarization({
         wait: true,
         limit: cfg.conversation.thread.summarization.batchSize,
         trigger: "periodic",
       });
-      logger.debug("conversation thread summarization tick completed", {
-        eligible: result.eligible,
-        eligibleTotal: result.eligibleTotal,
-        summarized: result.summarized,
-        failed: result.failed,
-        refreshed: result.refreshed,
+      run.match({
+        err: (error) => {
+          logger.error(
+            "conversation thread summarization tick failed",
+            formatTaggedErrorForLog(error),
+          );
+        },
+        ok: (result) => {
+          logger.debug("conversation thread summarization tick completed", {
+            eligible: result.eligible,
+            eligibleTotal: result.eligibleTotal,
+            summarized: result.summarized,
+            failed: result.failed,
+            refreshed: result.refreshed,
+          });
+        },
       });
-    } catch (e) {
-      logger.error("conversation thread summarization tick failed", e);
+    } catch (error) {
+      if (isPanic(error)) {
+        terminalPanic = error;
+        reportConversationThreadWorkerPanicOnce(error, reportFatalPanic);
+        logger.error(
+          "conversation thread summarization tick panicked",
+          formatTaggedErrorForLog(error),
+        );
+      } else {
+        logger.error("conversation thread summarization tick failed", {
+          error: opaqueErrorMessage(error, "Opaque conversation thread worker failure"),
+        });
+      }
     } finally {
       running = false;
-      schedule(checkIntervalMs);
+      if (!terminalPanic) schedule(checkIntervalMs);
     }
   };
 
@@ -271,6 +546,7 @@ export function startConversationThreadWorker(params: {
       cancelScheduledTick?.();
       cancelScheduledTick = null;
       await tickPromise;
+      rethrowConversationThreadWorkerPanic(terminalPanic);
       logger.debug("conversation thread periodic worker stopped");
     },
   };

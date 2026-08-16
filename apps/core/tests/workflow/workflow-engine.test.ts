@@ -1,42 +1,70 @@
+import { normalizeWorkflowResourcePolicy, workflowStoreValue } from "./workflow-store-test-helpers";
 import { describe, expect, it } from "bun:test";
 import { rmSync } from "node:fs";
 import fs from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
+import { Panic } from "better-result";
 import { z } from "zod";
 import {
   createLilacBus,
   lilacEventTypes,
   outReqTopic,
+  type DeliveryDisposition,
   type FetchOptions,
-  type HandleContext,
   type Message,
   type PublishOptions,
   type RawBus,
   type SubscriptionOptions,
 } from "@stanley2058/lilac-event-bus";
-
+import {
+  okResultForTest,
+  startResultForTest,
+  stopResultForTest,
+  subscribeForTest,
+  type TestRawMessageHandler,
+  type TestRawSubscription,
+} from "../helpers/result-raw-bus";
 import { DurableWorkflowStore } from "../../src/workflow/durable-workflow-store";
-import { WorkflowEngine, workflowAgentRequestId } from "../../src/workflow/workflow-engine";
+import {
+  applyWorkflowEventDeliveryPolicy,
+  captureWorkflowIdleCancellationPublication,
+  captureWorkflowTerminalReceiptAdoption,
+  WorkflowEngine,
+  WorkflowLifecycleDeliveryFailed,
+  WorkflowOutputDeliveryFailed,
+  WorkflowWakeDeliveryFailed,
+  runWorkflowTimerTick,
+  workflowAgentRequestId,
+} from "../../src/workflow/workflow-engine";
 import type { WorkflowRequestPolicy } from "../../src/workflow/workflow-request-authority";
 import { canonicalJsonSha256, sha256 } from "../../src/workflow/workflow-definition";
 import {
-  normalizeWorkflowResourcePolicy,
   WORKFLOW_MANUAL_RECONCILIATION_DETAIL,
   type WorkflowCompletionTarget,
 } from "../../src/workflow/workflow-domain";
 import { WorkflowWaitResolver } from "../../src/workflow/workflow-wait-resolver";
+import { workflowConsumerId } from "../../src/workflow/workflow-consumer-id";
 import { readWorkflowValueArtifact } from "../../src/workflow/workflow-artifact-store";
 import {
-  compileWorkflowSource,
-  parseWorkflowCallSiteManifest,
+  compileWorkflowSourceResult,
+  parseWorkflowCallSiteManifestUnchecked,
 } from "../../src/workflow/workflow-source-compiler";
 
-const HASH_A = "a".repeat(64);
+function compileWorkflowSource(source: string, sourceSha256: string): string {
+  const result = compileWorkflowSourceResult(source, sourceSha256);
+  if (result.status === "error") throw result.error;
+  return result.value;
+}
 
+function parseWorkflowCallSiteManifest(source: string) {
+  const result = parseWorkflowCallSiteManifestUnchecked(source);
+  if (result.status === "error") throw result.error;
+  return result.value;
+}
+const HASH_A = "a".repeat(64);
 class HandoffInterceptStore extends DurableWorkflowStore {
   beforeHandoff: (() => void) | null = null;
-
   override getWorkflowRequestDispatchHandoff(
     input: Parameters<DurableWorkflowStore["getWorkflowRequestDispatchHandoff"]>[0],
   ) {
@@ -46,17 +74,17 @@ class HandoffInterceptStore extends DurableWorkflowStore {
     return super.getWorkflowRequestDispatchHandoff(input);
   }
 }
-
 class HeartbeatTrackingWorkflowStore extends DurableWorkflowStore {
   readonly runClaimRefreshes: number[] = [];
-  private queuedScanObserver: { resolve: () => void; error?: Error } | null = null;
-
+  private queuedScanObserver: {
+    resolve: () => void;
+    error?: Error;
+  } | null = null;
   observeNextQueuedScan(error?: Error): Promise<void> {
     return new Promise((resolve) => {
       this.queuedScanObserver = { resolve, ...(error ? { error } : {}) };
     });
   }
-
   override listRuns(options?: Parameters<DurableWorkflowStore["listRuns"]>[0]) {
     const runs = super.listRuns(options);
     if (options?.state === "queued" && this.queuedScanObserver) {
@@ -67,88 +95,92 @@ class HeartbeatTrackingWorkflowStore extends DurableWorkflowStore {
     }
     return runs;
   }
-
   override refreshRunClaim(runId: string, claimerId: string, now: number): boolean {
     this.runClaimRefreshes.push(now);
     return super.refreshRunClaim(runId, claimerId, now);
   }
 }
-
 class CapturingRawBus implements RawBus {
   readonly messages: Array<Omit<Message<unknown>, "id" | "ts">> = [];
   readonly history: Message<unknown>[] = [];
-
+  readonly subscriptionOptions: Array<{ topic: string; options: SubscriptionOptions }> = [];
+  subscribe = subscribeForTest;
   async publish<TData>(message: Omit<Message<TData>, "id" | "ts">, _options: PublishOptions) {
     this.messages.push(message);
     return { id: `${this.messages.length}-0`, cursor: `${this.messages.length}-0` };
   }
-  async subscribe<TData>(
-    _topic: string,
-    _options: SubscriptionOptions,
-    _handler: (message: Message<TData>, context: HandleContext) => Promise<void>,
+  async openTestSubscription(
+    topic: string,
+    options: SubscriptionOptions,
+    _handler: TestRawMessageHandler,
   ) {
+    this.subscriptionOptions.push({ topic, options });
     return { stop: async () => {} };
   }
-  async fetch<TData>(topic: string, _options: FetchOptions) {
+  async fetch(topic: string, _options: FetchOptions) {
     return {
       messages: this.history
         .filter((message) => message.topic === topic)
-        .map((msg) => ({ msg: msg as Message<TData>, cursor: msg.id })),
+        .map((msg) => ({ msg, cursor: msg.id })),
     };
   }
   async watermark(topic: string) {
     return this.history.filter((message) => message.topic === topic).at(-1)?.id ?? null;
   }
+  async trimBeforeCheckpoint() {
+    return 0;
+  }
+  async retireConsumerGroup() {
+    return "absent" as const;
+  }
   async close() {}
 }
-
 class LiveCapturingRawBus implements RawBus {
   readonly messages: Array<Omit<Message<unknown>, "id" | "ts">> = [];
+  readonly subscriptionOptions: Array<{ topic: string; options: SubscriptionOptions }> = [];
+  subscribe = subscribeForTest;
   private sequence = 0;
   private readonly subscriptions = new Set<{
     topic: string;
-    handler: (message: Message<unknown>, context: HandleContext) => Promise<void>;
+    handler: TestRawMessageHandler;
   }>();
-
   async publish<TData>(message: Omit<Message<TData>, "id" | "ts">, options: PublishOptions) {
     this.messages.push(message);
     const id = `${++this.sequence}-0`;
     const stored: Message<TData> = { ...message, id, ts: Date.now(), topic: options.topic };
     for (const subscription of this.subscriptions) {
       if (subscription.topic === options.topic) {
-        await subscription.handler(stored, { cursor: id, commit: async () => {} });
+        await subscription.handler(stored, id);
       }
     }
     return { id, cursor: id };
   }
-
-  async subscribe<TData>(
+  async openTestSubscription(
     topic: string,
-    _options: SubscriptionOptions,
-    handler: (message: Message<TData>, context: HandleContext) => Promise<void>,
+    options: SubscriptionOptions,
+    handler: TestRawMessageHandler,
   ) {
-    const subscription = {
-      topic,
-      handler: (message: Message<unknown>, context: HandleContext) =>
-        handler(message as Message<TData>, context),
-    };
+    this.subscriptionOptions.push({ topic, options });
+    const subscription = { topic, handler };
     this.subscriptions.add(subscription);
     return { stop: async () => void this.subscriptions.delete(subscription) };
   }
-
-  async fetch<TData>(_topic: string, _options: FetchOptions) {
-    return { messages: [] as Array<{ msg: Message<TData>; cursor: string }> };
+  async fetch(_topic: string, _options: FetchOptions) {
+    return { messages: [] };
   }
-
+  async trimBeforeCheckpoint() {
+    return 0;
+  }
+  async retireConsumerGroup() {
+    return "absent" as const;
+  }
   async close() {
     this.subscriptions.clear();
   }
 }
-
 class FailingWorkflowRunPublishRawBus extends LiveCapturingRawBus {
   runPublishFailures = 0;
   readonly durableFailurePublishAttempted = Promise.withResolvers<void>();
-
   override async publish<TData>(
     message: Omit<Message<TData>, "id" | "ts">,
     options: PublishOptions,
@@ -161,17 +193,59 @@ class FailingWorkflowRunPublishRawBus extends LiveCapturingRawBus {
     return await super.publish(message, options);
   }
 }
-
+class DeferredInterruptFailureRawBus extends LiveCapturingRawBus {
+  readonly interruptStarted = Promise.withResolvers<void>();
+  readonly releaseInterrupt = Promise.withResolvers<void>();
+  requestSubscriptionStops = 0;
+  interruptDispatchEpoch: string | undefined;
+  override async publish<TData>(
+    message: Omit<Message<TData>, "id" | "ts">,
+    options: PublishOptions,
+  ) {
+    if (message.type === lilacEventTypes.CmdRequestMessage) {
+      const data = message.data;
+      if (
+        typeof data === "object" &&
+        data !== null &&
+        "queue" in data &&
+        data.queue === "interrupt"
+      ) {
+        this.interruptDispatchEpoch = message.headers?.workflow_dispatch_epoch;
+        this.interruptStarted.resolve();
+        await this.releaseInterrupt.promise;
+        throw new Error("interrupt publication unavailable");
+      }
+    }
+    return await super.publish(message, options);
+  }
+  override async openTestSubscription(
+    topic: string,
+    options: SubscriptionOptions,
+    handler: TestRawMessageHandler,
+  ) {
+    const subscription = await super.openTestSubscription(topic, options, handler);
+    if (topic === "evt.workflow") return subscription;
+    return {
+      stop: async () => {
+        this.requestSubscriptionStops += 1;
+        return await subscription.stop();
+      },
+    };
+  }
+}
 function createTrustedRun(
   store: DurableWorkflowStore,
   runId = "run-1",
   args: Record<string, boolean> = {},
-  outputLimits: { operation: number; result: number } = { operation: 10_000, result: 10_000 },
+  outputLimits: {
+    operation: number;
+    result: number;
+  } = { operation: 10000, result: 10000 },
   completionTarget: WorkflowCompletionTarget = { kind: "detached" },
   editing = false,
   canonicalWorkspaceRoot = process.cwd(),
   mixedEditing = false,
-  operationIdleTimeoutMs = 2_000,
+  operationIdleTimeoutMs = 2000,
   originUserId: string | null = "user-1",
   origin: { client: "discord" | "telegram"; sessionId: string } = {
     client: "discord",
@@ -193,8 +267,8 @@ function createTrustedRun(
     waits: ["reply", "sleep"],
   });
   const limits = {
-    maxSourceBytes: 100_000,
-    maxInputBytes: 10_000,
+    maxSourceBytes: 100000,
+    maxInputBytes: 10000,
     maxOperationOutputBytes: outputLimits.operation,
     maxResultBytes: outputLimits.result,
   };
@@ -247,18 +321,15 @@ function createTrustedRun(
   });
   return invocation;
 }
-
 const createApprovedRun = createTrustedRun;
-
 async function waitFor(predicate: () => boolean): Promise<void> {
-  const deadline = Date.now() + 3_000;
+  const deadline = Date.now() + 3000;
   while (!predicate()) {
     if (Date.now() > deadline) throw new Error("Timed out waiting for workflow state");
     // test-wait-justification: polls workflow state produced by the engine's independently scheduled worker loop
     await Bun.sleep(10);
   }
 }
-
 function persistedAgentInput(prompt: string, editing = false, cwd = process.cwd()) {
   return {
     prompt,
@@ -268,7 +339,6 @@ function persistedAgentInput(prompt: string, editing = false, cwd = process.cwd(
     },
   };
 }
-
 function workflowSource(bindings: string, body: string): string {
   return `import { defineWorkflow } from "@lilac/workflow";
 export default defineWorkflow({
@@ -278,22 +348,174 @@ export default defineWorkflow({
 });
 `;
 }
-
 function compileTestWorkflow(source: string): string {
   return compileWorkflowSource(source, sha256(source));
 }
-
 function agentWorkflowSource(prompt = "inspect", options = '{ profile: "explore" }'): string {
   return workflowSource("agent", `return await agent(${JSON.stringify(prompt)}, ${options});`);
 }
-
 function firstOperationId(source: string): string {
   const callSite = parseWorkflowCallSiteManifest(compileTestWorkflow(source))[0];
   if (!callSite) throw new Error("Test workflow has no host call");
   return `wfop:${sha256(`root:${callSite.callSiteId}:0`).slice(0, 40)}`;
 }
-
 describe("WorkflowEngine", () => {
+  it("creates boot-unique workflow consumer identities", () => {
+    const first = workflowConsumerId("core:workflow");
+    const second = workflowConsumerId("core:workflow");
+    expect(first).toStartWith(`core:workflow:${process.pid}:`);
+    expect(second).toStartWith(`core:workflow:${process.pid}:`);
+    expect(first).not.toBe(second);
+  });
+  it("maps owned delivery failures to the required subscription dispositions", () => {
+    const cases: readonly [
+      WorkflowWakeDeliveryFailed | WorkflowOutputDeliveryFailed | WorkflowLifecycleDeliveryFailed,
+      DeliveryDisposition,
+    ][] = [
+      [new WorkflowWakeDeliveryFailed({ message: "wake failed" }), "park-pending"],
+      [new WorkflowOutputDeliveryFailed({ message: "output failed" }), "park-pending"],
+      [new WorkflowLifecycleDeliveryFailed({ message: "lifecycle failed" }), "stop"],
+    ];
+    for (const [error, disposition] of cases) {
+      expect(applyWorkflowEventDeliveryPolicy(error)).toBe(disposition);
+    }
+  });
+  it("adapts wake subscription start failure to the engine host contract", async () => {
+    const dbPath = join(tmpdir(), `workflow-start-failure-${crypto.randomUUID()}.sqlite`);
+    const store = new DurableWorkflowStore(dbPath);
+    class StartFailingRawBus extends CapturingRawBus {
+      override async openTestSubscription(
+        _topic: string,
+        _options: SubscriptionOptions,
+        _handler: TestRawMessageHandler,
+      ): Promise<TestRawSubscription> {
+        throw new Error("workflow subscription unavailable");
+      }
+    }
+    const bus = createLilacBus(new StartFailingRawBus());
+    const engine = new WorkflowEngine({
+      bus,
+      store,
+      dataDir: dirname(dbPath),
+      subscriptionId: "start-failure",
+    });
+    try {
+      await expect(engine.start()).rejects.toThrow("Test subscription start failed");
+    } finally {
+      await engine.stop();
+      await bus.close();
+      store.close();
+      rmSync(dbPath, { force: true });
+    }
+  });
+  it("preserves compiler Panic without terminalizing the claimed run", async () => {
+    const dbPath = join(tmpdir(), `workflow-compiler-panic-${crypto.randomUUID()}.sqlite`);
+    const store = new DurableWorkflowStore(dbPath);
+    const raw = new CapturingRawBus();
+    const bus = createLilacBus(raw);
+    const panic = new Panic({ message: "workflow compiler defect" });
+    createApprovedRun(store);
+    const engine = new WorkflowEngine({
+      bus,
+      store,
+      dataDir: dirname(dbPath),
+      subscriptionId: "compiler-panic",
+      loadSnapshot: async () => agentWorkflowSource(),
+      compileSource: () => {
+        throw panic;
+      },
+    });
+    try {
+      await expect(engine.start()).rejects.toBe(panic);
+      expect(workflowStoreValue(store.getRun("run-1"))).toMatchObject({
+        state: "running",
+        terminalAt: null,
+        terminalDetail: null,
+      });
+      expect(
+        raw.messages.some(
+          (message) =>
+            message.type === lilacEventTypes.EvtWorkflowRunChanged &&
+            typeof message.data === "object" &&
+            message.data !== null &&
+            "state" in message.data &&
+            message.data.state === "failed",
+        ),
+      ).toBe(false);
+    } finally {
+      await engine.stop();
+      await bus.close();
+      store.close();
+      rmSync(dbPath, { force: true });
+    }
+  });
+  it("returns timer failures as values and preserves Panic", async () => {
+    const failed = await runWorkflowTimerTick(async () => {
+      throw new Error("timer operation failed");
+    });
+    expect(failed.status).toBe("error");
+    if (failed.status === "error") {
+      expect(failed.error.message).toContain("timer operation failed");
+    }
+    const panic = new Panic({ message: "timer panic" });
+    await expect(
+      runWorkflowTimerTick(async () => {
+        throw panic;
+      }),
+    ).rejects.toBe(panic);
+  });
+  it("returns terminal receipt adoption failures as values and preserves Panic", async () => {
+    const failed = await captureWorkflowTerminalReceiptAdoption(async () => {
+      throw new Error("receipt artifact unavailable");
+    });
+    expect(failed.status).toBe("error");
+    if (failed.status === "error") {
+      expect(failed.error.message).toContain("receipt artifact unavailable");
+    }
+    const panic = new Panic({ message: "receipt adoption defect" });
+    await expect(
+      captureWorkflowTerminalReceiptAdoption(async () => {
+        throw panic;
+      }),
+    ).rejects.toBe(panic);
+  });
+  it("returns idle cancellation publication failures as values and preserves Panic", async () => {
+    class CancellationFailingRawBus extends CapturingRawBus {
+      constructor(private readonly cause: Error) {
+        super();
+      }
+      override async publish<TData>(
+        _message: Omit<Message<TData>, "id" | "ts">,
+        _options: PublishOptions,
+      ): Promise<{
+        id: string;
+        cursor: string;
+      }> {
+        throw this.cause;
+      }
+    }
+    const failedBus = createLilacBus(
+      new CancellationFailingRawBus(new Error("cancellation transport unavailable")),
+    );
+    const failed = await captureWorkflowIdleCancellationPublication(failedBus, {
+      requestId: "request-1",
+      sessionId: "session-1",
+      dispatchEpoch: "epoch-1",
+    });
+    expect(failed.status).toBe("error");
+    if (failed.status === "error") {
+      expect(failed.error.message).toBe("Workflow idle cancellation publication failed");
+    }
+    const panic = new Panic({ message: "idle cancellation defect" });
+    const panicBus = createLilacBus(new CancellationFailingRawBus(panic));
+    await expect(
+      captureWorkflowIdleCancellationPublication(panicBus, {
+        requestId: "request-2",
+        sessionId: "session-2",
+        dispatchEpoch: "epoch-2",
+      }),
+    ).rejects.toBe(panic);
+  });
   it("paces active run heartbeats independently of polling and event-triggered ticks", async () => {
     const dbPath = join(tmpdir(), `workflow-heartbeat-pacing-${crypto.randomUUID()}.sqlite`);
     const store = new HeartbeatTrackingWorkflowStore(dbPath);
@@ -306,8 +528,8 @@ describe("WorkflowEngine", () => {
       dataDir: dirname(dbPath),
       subscriptionId: "heartbeat-pacing",
       now: () => now,
-      pollMs: 1_000_000,
-      runClaimHeartbeatMs: 20_000,
+      pollMs: 1000000,
+      runClaimHeartbeatMs: 20000,
       loadSnapshot: async () => agentWorkflowSource("hold the run open"),
       compileSource: compileTestWorkflow,
       dispatchAgentRequest: async ({ signal }) =>
@@ -321,35 +543,33 @@ describe("WorkflowEngine", () => {
     });
     const triggerTick = async (): Promise<void> => {
       const scanned = store.observeNextQueuedScan();
-      await bus.publish(lilacEventTypes.EvtWorkflowProgressRequested, {
-        runId: "run-1",
-        revisionId: "revision-1",
-        reason: "operation_changed",
-        ts: now,
-      });
+      await startResultForTest(
+        bus.publish(lilacEventTypes.EvtWorkflowProgressRequested, {
+          runId: "run-1",
+          revisionId: "revision-1",
+          reason: "operation_changed",
+          ts: now,
+        }),
+      );
       await scanned;
     };
     try {
       await engine.start();
-      expect(store.getRun("run-1")?.claimedAt).toBe(100);
-
-      now = 20_099;
+      expect(workflowStoreValue(store.getRun("run-1"))?.claimedAt).toBe(100);
+      now = 20099;
       await triggerTick();
       await triggerTick();
       expect(store.runClaimRefreshes).toEqual([]);
-
-      now = 20_100;
+      now = 20100;
       await triggerTick();
       await triggerTick();
-      expect(store.runClaimRefreshes).toEqual([20_100]);
-
-      now = 40_099;
+      expect(store.runClaimRefreshes).toEqual([20100]);
+      now = 40099;
       await triggerTick();
-      expect(store.runClaimRefreshes).toEqual([20_100]);
-
-      now = 40_100;
+      expect(store.runClaimRefreshes).toEqual([20100]);
+      now = 40100;
       await triggerTick();
-      expect(store.runClaimRefreshes).toEqual([20_100, 40_100]);
+      expect(store.runClaimRefreshes).toEqual([20100, 40100]);
     } finally {
       await engine.stop();
       await bus.close();
@@ -357,7 +577,6 @@ describe("WorkflowEngine", () => {
       rmSync(dbPath, { force: true });
     }
   });
-
   it("awaits a wake-triggered tick failure before acknowledging the event", async () => {
     const dbPath = join(tmpdir(), `workflow-wake-tick-failure-${crypto.randomUUID()}.sqlite`);
     const store = new HeartbeatTrackingWorkflowStore(dbPath);
@@ -367,28 +586,34 @@ describe("WorkflowEngine", () => {
       store,
       dataDir: dirname(dbPath),
       subscriptionId: "wake-tick-failure",
-      pollMs: 1_000_000,
+      pollMs: 1000000,
     });
     try {
       await engine.start();
       const scan = store.observeNextQueuedScan(new Error("wake tick failed"));
-      await expect(
-        bus.publish(lilacEventTypes.EvtWorkflowProgressRequested, {
-          runId: "missing-run",
-          revisionId: "missing-revision",
-          reason: "operation_changed",
-          ts: 1,
-        }),
-      ).rejects.toThrow("wake tick failed");
+      const published = await bus.publish(lilacEventTypes.EvtWorkflowProgressRequested, {
+        runId: "missing-run",
+        revisionId: "missing-revision",
+        reason: "operation_changed",
+        ts: 1,
+      });
+      expect(published.status).toBe("error");
+      if (published.status === "error") {
+        expect(published.error).toMatchObject({
+          _tag: "EventPublishTransportFailed",
+          cause: expect.objectContaining({ message: "wake tick failed" }),
+        });
+      }
       await scan;
     } finally {
-      await engine.stop();
+      await expect(engine.stop()).rejects.toThrow(
+        "Workflow engine stop failed while cancelling active work",
+      );
       await bus.close();
       store.close();
       rmSync(dbPath, { force: true });
     }
   });
-
   it("contains timer tick failures and continues polling", async () => {
     const dbPath = join(tmpdir(), `workflow-timer-tick-failure-${crypto.randomUUID()}.sqlite`);
     const store = new HeartbeatTrackingWorkflowStore(dbPath);
@@ -411,7 +636,6 @@ describe("WorkflowEngine", () => {
       rmSync(dbPath, { force: true });
     }
   });
-
   it("durably fails a run when its initial publication fails without leaking the run rejection", async () => {
     const dbPath = join(tmpdir(), `workflow-initial-publish-failure-${crypto.randomUUID()}.sqlite`);
     const store = new DurableWorkflowStore(dbPath);
@@ -423,14 +647,16 @@ describe("WorkflowEngine", () => {
       store,
       dataDir: dirname(dbPath),
       subscriptionId: "initial-publish-failure",
-      pollMs: 1_000_000,
+      pollMs: 1000000,
       loadSnapshot: async () => workflowSource("", 'return "unused";'),
       compileSource: compileTestWorkflow,
     });
     try {
       await engine.start();
       await raw.durableFailurePublishAttempted.promise;
-      expect(store.getRun("run-1")?.terminalDetail).toBe("workflow run publication failed");
+      expect(workflowStoreValue(store.getRun("run-1"))?.terminalDetail).toBe(
+        "Event publish failed",
+      );
       expect(raw.runPublishFailures).toBe(2);
     } finally {
       await engine.stop();
@@ -439,7 +665,6 @@ describe("WorkflowEngine", () => {
       rmSync(dbPath, { force: true });
     }
   });
-
   it("allows concurrent shared profile-native writers", async () => {
     const dbPath = join(tmpdir(), `workflow-mixed-authority-${crypto.randomUUID()}.sqlite`);
     const store = new DurableWorkflowStore(dbPath);
@@ -448,7 +673,7 @@ describe("WorkflowEngine", () => {
       store,
       "run-1",
       {},
-      { operation: 10_000, result: 10_000 },
+      { operation: 10000, result: 10000 },
       { kind: "detached" },
       true,
       process.cwd(),
@@ -488,7 +713,7 @@ describe("WorkflowEngine", () => {
         if (policy.profile !== "explore") {
           await Promise.race([
             editorsOverlapped,
-            Bun.sleep(1_000).then(() => {
+            Bun.sleep(1000).then(() => {
               throw new Error("shared writers did not overlap");
             }),
           ]);
@@ -503,9 +728,11 @@ describe("WorkflowEngine", () => {
     });
     try {
       await engine.start();
-      await waitFor(() => store.getRun("run-1")?.state === "succeeded");
+      await waitFor(() => workflowStoreValue(store.getRun("run-1"))?.state === "succeeded");
       expect(
-        store.listOperations("run-1").filter((operation) => operation.kind === "agent"),
+        workflowStoreValue(store.listOperations("run-1")).filter(
+          (operation) => operation.kind === "agent",
+        ),
       ).toHaveLength(4);
       expect(maxActive).toBeGreaterThan(1);
       expect(maxEditors).toBe(2);
@@ -516,7 +743,6 @@ describe("WorkflowEngine", () => {
       rmSync(dbPath, { force: true });
     }
   });
-
   it("uses the engine data directory while resolving cwd before dispatch", async () => {
     const root = await fs.mkdtemp(join(tmpdir(), "workflow-engine-data-dir-"));
     const workspace = join(root, "workspace");
@@ -531,7 +757,7 @@ describe("WorkflowEngine", () => {
       store,
       "run-1",
       {},
-      { operation: 10_000, result: 10_000 },
+      { operation: 10000, result: 10000 },
       { kind: "detached" },
       true,
       workspace,
@@ -556,7 +782,7 @@ describe("WorkflowEngine", () => {
     });
     try {
       await engine.start();
-      await waitFor(() => store.getRun("run-1")?.state === "failed");
+      await waitFor(() => workflowStoreValue(store.getRun("run-1"))?.state === "failed");
       expect(dispatchedCwds).toEqual([requestedCwd]);
     } finally {
       await engine.stop();
@@ -565,7 +791,6 @@ describe("WorkflowEngine", () => {
       await fs.rm(root, { recursive: true, force: true });
     }
   });
-
   it("refreshes or clears only fallbacks while preserving the pinned head on stale redispatch", async () => {
     const scenarios = [
       {
@@ -586,7 +811,6 @@ describe("WorkflowEngine", () => {
       },
       { model: "removed-head-alias", currentFallbacks: [] },
     ];
-
     for (const scenario of scenarios) {
       const dbPath = join(tmpdir(), `workflow-stale-policy-${crypto.randomUUID()}.sqlite`);
       const store = new DurableWorkflowStore(dbPath);
@@ -595,7 +819,7 @@ describe("WorkflowEngine", () => {
         store,
         "run-1",
         {},
-        { operation: 10_000, result: 10_000 },
+        { operation: 10000, result: 10000 },
         { kind: "detached" },
         true,
       );
@@ -676,10 +900,10 @@ describe("WorkflowEngine", () => {
       try {
         await first.start();
         await waitFor(() => firstDispatched);
-        const pinnedRun = store.getRun("run-1");
-        const pinnedOperation = store
-          .listOperations("run-1")
-          .find((operation) => operation.kind === "agent");
+        const pinnedRun = workflowStoreValue(store.getRun("run-1"));
+        const pinnedOperation = workflowStoreValue(store.listOperations("run-1")).find(
+          (operation) => operation.kind === "agent",
+        );
         if (!pinnedRun || !pinnedOperation) throw new Error("initial workflow dispatch is missing");
         const pinnedRequestId = pinnedOperation.requestId;
         if (!pinnedRequestId) throw new Error("initial workflow request ID is missing");
@@ -687,7 +911,7 @@ describe("WorkflowEngine", () => {
           "paused",
         );
         await first.stop();
-        now = 40_100;
+        now = 40100;
         expect(store.transitionRun({ runId: "run-1", from: "paused", to: "queued", now })).toBe(
           true,
         );
@@ -707,8 +931,10 @@ describe("WorkflowEngine", () => {
           reasoningDisplay: "detailed",
           fallbacks: scenario.currentFallbacks,
         });
-        const recoveredRun = store.getRun("run-1");
-        const recoveredOperation = store.getOperation("run-1", pinnedOperation.operationId);
+        const recoveredRun = workflowStoreValue(store.getRun("run-1"));
+        const recoveredOperation = workflowStoreValue(
+          store.getOperation("run-1", pinnedOperation.operationId),
+        );
         expect(recoveredRun?.revisionId).toBe(pinnedRun.revisionId);
         expect(recoveredRun?.argsSha256).toBe(pinnedRun.argsSha256);
         expect(recoveredOperation?.operationId).toBe(pinnedOperation.operationId);
@@ -723,7 +949,6 @@ describe("WorkflowEngine", () => {
       }
     }
   });
-
   it("fails closed for every receiptless terminal request outcome", async () => {
     for (const terminalState of ["resolved", "failed", "cancelled"] as const) {
       const dbPath = join(
@@ -750,6 +975,7 @@ describe("WorkflowEngine", () => {
           id: "1-0",
           ts: 10,
           type: lilacEventTypes.EvtAgentOutputResponseText,
+          key: requestId,
           headers,
           data: { finalText: "historical result" },
         },
@@ -758,6 +984,7 @@ describe("WorkflowEngine", () => {
           id: "2-0",
           ts: 11,
           type: lilacEventTypes.EvtRequestLifecycleChanged,
+          key: requestId,
           headers,
           data: { state: terminalState, ts: 11 },
         },
@@ -774,9 +1001,11 @@ describe("WorkflowEngine", () => {
       });
       try {
         await engine.start();
-        await waitFor(() => store.getRun("run-1")?.state === "paused");
-        expect(store.getRun("run-1")?.terminalDetail).toBe(WORKFLOW_MANUAL_RECONCILIATION_DETAIL);
-        expect(store.listOperations("run-1")[0]).toMatchObject({
+        await waitFor(() => workflowStoreValue(store.getRun("run-1"))?.state === "paused");
+        expect(workflowStoreValue(store.getRun("run-1"))?.terminalDetail).toBe(
+          WORKFLOW_MANUAL_RECONCILIATION_DETAIL,
+        );
+        expect(workflowStoreValue(store.listOperations("run-1"))[0]).toMatchObject({
           state: "blocked",
           attempt: 0,
           requestId,
@@ -804,7 +1033,87 @@ describe("WorkflowEngine", () => {
       }
     }
   });
-
+  it("fails both reconciliation fetches on contract-invalid events without exposing payloads", async () => {
+    for (const invalidTopic of ["output", "lifecycle"] as const) {
+      const dbPath = join(
+        tmpdir(),
+        `workflow-engine-invalid-${invalidTopic}-fetch-${crypto.randomUUID()}.sqlite`,
+      );
+      const store = new DurableWorkflowStore(dbPath);
+      class ContractInvalidFetchRawBus extends CapturingRawBus {
+        readonly fetchedTopics: string[] = [];
+        override async fetch(topic: string, options: FetchOptions) {
+          this.fetchedTopics.push(topic);
+          return await super.fetch(topic, options);
+        }
+      }
+      const raw = new ContractInvalidFetchRawBus();
+      const bus = createLilacBus(raw);
+      createApprovedRun(store);
+      const source = agentWorkflowSource();
+      const operationId = firstOperationId(source);
+      const requestId = workflowAgentRequestId("run-1", operationId, 0);
+      const topic = invalidTopic === "output" ? outReqTopic(requestId) : "evt.request";
+      raw.history.push({
+        topic,
+        id: `invalid-${invalidTopic}-1`,
+        ts: 10,
+        type:
+          invalidTopic === "output"
+            ? lilacEventTypes.EvtAgentOutputResponseText
+            : lilacEventTypes.EvtRequestLifecycleChanged,
+        key: requestId,
+        headers: {
+          request_id: requestId,
+          session_id: `workflow:run-1:${operationId}`,
+          request_client: "unknown",
+          workflow_dispatch_epoch: "invalid-fetch-epoch",
+        },
+        data:
+          invalidTopic === "output"
+            ? { finalText: { secretUndecodedPayload: "must-not-escape" } }
+            : { state: { secretUndecodedPayload: "must-not-escape" } },
+      });
+      const engine = new WorkflowEngine({
+        bus,
+        store,
+        dataDir: dirname(dbPath),
+        subscriptionId: `invalid-${invalidTopic}-fetch`,
+        pollMs: 5,
+        loadSnapshot: async () => source,
+        compileSource: compileTestWorkflow,
+        createDispatchEpoch: () => "invalid-fetch-epoch",
+      });
+      try {
+        await engine.start();
+        await waitFor(() => workflowStoreValue(store.getRun("run-1"))?.state === "failed");
+        expect(raw.fetchedTopics).toEqual(
+          invalidTopic === "output" ? [outReqTopic(requestId)] : [outReqTopic(requestId), topic],
+        );
+        expect(workflowStoreValue(store.getRun("run-1"))?.terminalDetail).toContain(
+          `Workflow reconciliation rejected an invalid ${topic} event`,
+        );
+        expect(workflowStoreValue(store.getRun("run-1"))?.terminalDetail).not.toContain(
+          "secretUndecodedPayload",
+        );
+        expect(
+          raw.messages.some(
+            (message) =>
+              message.type === lilacEventTypes.CmdRequestMessage &&
+              typeof message.data === "object" &&
+              message.data !== null &&
+              "queue" in message.data &&
+              message.data.queue === "prompt",
+          ),
+        ).toBe(false);
+      } finally {
+        await engine.stop();
+        await bus.close();
+        store.close();
+        rmSync(dbPath, { force: true });
+      }
+    }
+  });
   it("fails closed for every terminal lifecycle state that mismatches its exact receipt", async () => {
     const cases = [
       { lifecycleState: "resolved", receiptState: "failed" },
@@ -820,62 +1129,65 @@ describe("WorkflowEngine", () => {
       const raw = new LiveCapturingRawBus();
       const bus = createLilacBus(raw);
       createApprovedRun(store);
-      const responder = await bus.subscribeTopic(
-        "cmd.request",
-        { mode: "fanout", subscriptionId: `mismatch-${lifecycleState}`, offset: { type: "now" } },
-        async (message, context) => {
-          if (
-            message.type === lilacEventTypes.CmdRequestMessage &&
-            message.data.queue === "prompt"
-          ) {
-            const requestId = message.headers?.request_id;
-            const sessionId = message.headers?.session_id;
-            if (!requestId || !sessionId) throw new Error("Missing workflow request identity");
-            const workflow = z
-              .object({
-                workflow: z.strictObject({
-                  runId: z.string(),
-                  operationId: z.string(),
-                  dispatchEpoch: z.string(),
+      const responder = await startResultForTest(
+        bus.subscribeTopic(
+          "cmd.request",
+          { mode: "fanout", subscriptionId: `mismatch-${lifecycleState}` },
+          async (message) => {
+            if (
+              message.type === lilacEventTypes.CmdRequestMessage &&
+              message.data.queue === "prompt"
+            ) {
+              const requestId = message.headers?.request_id;
+              const sessionId = message.headers?.session_id;
+              if (!requestId || !sessionId) throw new Error("Missing workflow request identity");
+              const workflow = z
+                .object({
+                  workflow: z.strictObject({
+                    runId: z.string(),
+                    operationId: z.string(),
+                    dispatchEpoch: z.string(),
+                  }),
+                })
+                .parse(message.data.raw).workflow;
+              expect(
+                store.authorizeWorkflowRequest({
+                  requestId,
+                  sessionId,
+                  platform: "unknown",
+                })?.policy,
+              ).toMatchObject(workflow);
+              expect(
+                store.claimWorkflowRequest({
+                  requestId,
+                  dispatchEpoch: workflow.dispatchEpoch,
+                  ownerId: "mismatch-runner",
+                  now: 10,
                 }),
-              })
-              .parse(message.data.raw).workflow;
-            expect(
-              store.authorizeWorkflowRequest({
-                requestId,
-                sessionId,
-                platform: "unknown",
-              })?.policy,
-            ).toMatchObject(workflow);
-            expect(
-              store.claimWorkflowRequest({
-                requestId,
-                dispatchEpoch: workflow.dispatchEpoch,
-                ownerId: "mismatch-runner",
-                now: 10,
-              }),
-            ).toBe(true);
-            expect(
-              store.recordWorkflowRequestTerminal({
-                requestId,
-                runId: workflow.runId,
-                operationId: workflow.operationId,
-                dispatchEpoch: workflow.dispatchEpoch,
-                ownerId: "mismatch-runner",
-                state: receiptState,
-                detail: `receipt ${receiptState}`,
-                ...(receiptState === "resolved" ? { output: "receipt output" } : {}),
-                now: 11,
-              }),
-            ).toBe(true);
-            await bus.publish(
-              lilacEventTypes.EvtRequestLifecycleChanged,
-              { state: lifecycleState, ts: 12 },
-              { headers: message.headers },
-            );
-          }
-          await context.commit();
-        },
+              ).toBe(true);
+              expect(
+                store.recordWorkflowRequestTerminal({
+                  requestId,
+                  runId: workflow.runId,
+                  operationId: workflow.operationId,
+                  dispatchEpoch: workflow.dispatchEpoch,
+                  ownerId: "mismatch-runner",
+                  state: receiptState,
+                  detail: `receipt ${receiptState}`,
+                  ...(receiptState === "resolved" ? { output: "receipt output" } : {}),
+                  now: 11,
+                }),
+              ).toBe(true);
+              await bus.publish(
+                lilacEventTypes.EvtRequestLifecycleChanged,
+                { state: lifecycleState, ts: 12 },
+                { headers: message.headers },
+              );
+            }
+            return okResultForTest();
+          },
+          () => "commit",
+        ),
       );
       const engine = new WorkflowEngine({
         bus,
@@ -883,16 +1195,18 @@ describe("WorkflowEngine", () => {
         dataDir: dirname(dbPath),
         subscriptionId: `mismatched-${lifecycleState}`,
         pollMs: 5,
-        receiptPollMs: 10_000,
+        receiptPollMs: 10000,
         now: () => 10,
         loadSnapshot: async () => agentWorkflowSource(),
         compileSource: compileTestWorkflow,
       });
       try {
         await engine.start();
-        await waitFor(() => store.getRun("run-1")?.state === "paused");
-        expect(store.getRun("run-1")?.terminalDetail).toBe(WORKFLOW_MANUAL_RECONCILIATION_DETAIL);
-        expect(store.listOperations("run-1")[0]).toMatchObject({
+        await waitFor(() => workflowStoreValue(store.getRun("run-1"))?.state === "paused");
+        expect(workflowStoreValue(store.getRun("run-1"))?.terminalDetail).toBe(
+          WORKFLOW_MANUAL_RECONCILIATION_DETAIL,
+        );
+        expect(workflowStoreValue(store.listOperations("run-1"))[0]).toMatchObject({
           state: "blocked",
           attempt: 0,
           requestId: expect.stringMatching(/^wfr:/u),
@@ -903,14 +1217,13 @@ describe("WorkflowEngine", () => {
         );
       } finally {
         await engine.stop();
-        await responder.stop();
+        await stopResultForTest(responder.stop());
         await bus.close();
         store.close();
         rmSync(dbPath, { force: true });
       }
     }
   });
-
   it("does not auto-resume a blocked run marked for manual reconciliation", async () => {
     const dbPath = join(tmpdir(), `workflow-engine-manual-block-${crypto.randomUUID()}.sqlite`);
     const store = new DurableWorkflowStore(dbPath);
@@ -939,7 +1252,7 @@ describe("WorkflowEngine", () => {
       await engine.start();
       // test-wait-justification: crosses several engine poll intervals to prove manual blocks are not reclaimed
       await Bun.sleep(25);
-      expect(store.getRun("run-1")).toMatchObject({
+      expect(workflowStoreValue(store.getRun("run-1"))).toMatchObject({
         state: "blocked",
         terminalDetail: WORKFLOW_MANUAL_RECONCILIATION_DETAIL,
       });
@@ -950,7 +1263,6 @@ describe("WorkflowEngine", () => {
       rmSync(dbPath, { force: true });
     }
   });
-
   it("does not publish when a durable terminal receipt wins after history scan", async () => {
     const dbPath = join(tmpdir(), `workflow-engine-terminal-race-${crypto.randomUUID()}.sqlite`);
     const store = new DurableWorkflowStore(dbPath);
@@ -1005,9 +1317,11 @@ describe("WorkflowEngine", () => {
     });
     try {
       await engine.start();
-      await waitFor(() => receiptRecorded && store.getRun("run-1")?.state === "succeeded");
-      expect(store.getRun("run-1")?.result).toBe("receipt result");
-      expect(store.listOperations("run-1")[0]).toMatchObject({
+      await waitFor(
+        () => receiptRecorded && workflowStoreValue(store.getRun("run-1"))?.state === "succeeded",
+      );
+      expect(workflowStoreValue(store.getRun("run-1"))?.result).toBe("receipt result");
+      expect(workflowStoreValue(store.listOperations("run-1"))[0]).toMatchObject({
         state: "succeeded",
         output: "receipt result",
         usage: { inputTokens: 4, outputTokens: 2, totalTokens: 6 },
@@ -1029,7 +1343,55 @@ describe("WorkflowEngine", () => {
       rmSync(dbPath, { force: true });
     }
   });
-
+  it("fails as a value when prompt publication loses without a terminal receipt", async () => {
+    const dbPath = join(tmpdir(), `workflow-engine-missing-receipt-${crypto.randomUUID()}.sqlite`);
+    const store = new DurableWorkflowStore(dbPath);
+    const raw = new CapturingRawBus();
+    const bus = createLilacBus(raw);
+    createApprovedRun(store);
+    const engine = new WorkflowEngine({
+      bus,
+      store,
+      dataDir: dirname(dbPath),
+      subscriptionId: "missing-terminal-receipt",
+      pollMs: 5,
+      loadSnapshot: async () => agentWorkflowSource(),
+      compileSource: compileTestWorkflow,
+      beforePromptPublication: async ({ requestId, runId, operationId, runOwnerId }) => {
+        expect(
+          store.claimWorkflowRequestPromptPublication({
+            requestId,
+            runId,
+            operationId,
+            runOwnerId,
+            now: 19,
+          }),
+        ).toBe(true);
+      },
+    });
+    try {
+      await engine.start();
+      await waitFor(() => workflowStoreValue(store.getRun("run-1"))?.state === "failed");
+      expect(workflowStoreValue(store.getRun("run-1"))?.terminalDetail).toBe(
+        "Workflow prompt publication was rejected without a terminal receipt",
+      );
+      expect(
+        raw.messages.some(
+          (message) =>
+            message.type === lilacEventTypes.CmdRequestMessage &&
+            typeof message.data === "object" &&
+            message.data !== null &&
+            "queue" in message.data &&
+            message.data.queue === "prompt",
+        ),
+      ).toBe(false);
+    } finally {
+      await engine.stop();
+      await bus.close();
+      store.close();
+      rmSync(dbPath, { force: true });
+    }
+  });
   it("adopts a post-publication receipt when the runner crashes before terminal streams", async () => {
     const dbPath = join(tmpdir(), `workflow-engine-live-receipt-${crypto.randomUUID()}.sqlite`);
     const store = new DurableWorkflowStore(dbPath);
@@ -1039,7 +1401,7 @@ describe("WorkflowEngine", () => {
       store,
       "run-1",
       {},
-      { operation: 10_000, result: 10_000 },
+      { operation: 10000, result: 10000 },
       {
         kind: "live_parent",
         parentRequestId: "parent-crash",
@@ -1070,14 +1432,7 @@ describe("WorkflowEngine", () => {
     try {
       await engine.start();
       await waitFor(() =>
-        raw.messages.some(
-          (message) =>
-            message.type === lilacEventTypes.CmdRequestMessage &&
-            typeof message.data === "object" &&
-            message.data !== null &&
-            "queue" in message.data &&
-            message.data.queue === "prompt",
-        ),
+        raw.messages.some((message) => message.type === lilacEventTypes.CmdRequestMessage),
       );
       const command = raw.messages.find(
         (message) => message.type === lilacEventTypes.CmdRequestMessage,
@@ -1128,18 +1483,20 @@ describe("WorkflowEngine", () => {
           now: Date.now(),
         }),
       ).toBe(true);
-      await waitFor(() => store.getRun("run-1")?.state === "succeeded");
-      expect(store.getRun("run-1")?.result).toBe("durable crash result");
-      expect(store.listOperations("run-1")[0]).toMatchObject({
+      await waitFor(() => workflowStoreValue(store.getRun("run-1"))?.state === "succeeded");
+      expect(workflowStoreValue(store.getRun("run-1"))?.result).toBe("durable crash result");
+      expect(workflowStoreValue(store.listOperations("run-1"))[0]).toMatchObject({
         state: "succeeded",
         output: "durable crash result",
         usage: { inputTokens: 5, outputTokens: 3, totalTokens: 8 },
       });
-      expect(store.listPendingLiveParentCompletions("parent-crash", 100, true)).toMatchObject([
-        { runId: "run-1", result: "durable crash result" },
-      ]);
+      expect([
+        ...workflowStoreValue(store.listPendingLiveParentCompletions("parent-crash", 100, true)),
+      ]).toMatchObject([{ runId: "run-1", result: "durable crash result" }]);
       expect(store.markLiveParentCompletionDelivered("run-1", Date.now())).toBe(true);
-      expect(store.listPendingLiveParentCompletions("parent-crash", 100, true)).toEqual([]);
+      expect([
+        ...workflowStoreValue(store.listPendingLiveParentCompletions("parent-crash", 100, true)),
+      ]).toEqual([]);
     } finally {
       await engine.stop();
       await bus.close();
@@ -1147,7 +1504,6 @@ describe("WorkflowEngine", () => {
       rmSync(dbPath, { force: true });
     }
   });
-
   it("lets a replacement engine adopt a tombstoned receipt before redispatch", async () => {
     const dbPath = join(
       tmpdir(),
@@ -1159,7 +1515,7 @@ describe("WorkflowEngine", () => {
       store,
       "run-1",
       {},
-      { operation: 10_000, result: 10_000 },
+      { operation: 10000, result: 10000 },
       {
         kind: "live_parent",
         parentRequestId: "parent-replacement",
@@ -1189,7 +1545,7 @@ describe("WorkflowEngine", () => {
       loadSnapshot: async () => agentWorkflowSource(),
       compileSource: compileTestWorkflow,
       dispatchAgentRequest: async (request) => {
-        const runOwnerId = store.getRun(request.run.runId)?.claimedBy;
+        const runOwnerId = workflowStoreValue(store.getRun(request.run.runId))?.claimedBy;
         if (!runOwnerId) throw new Error("Missing initial run owner");
         expect(
           store.claimWorkflowRequestPromptPublication({
@@ -1237,7 +1593,7 @@ describe("WorkflowEngine", () => {
       dataDir: dirname(dbPath),
       subscriptionId: "replacement-receipt-second",
       pollMs: 5,
-      now: () => 100_000,
+      now: () => 100000,
       loadSnapshot: async () => agentWorkflowSource(),
       compileSource: compileTestWorkflow,
       dispatchAgentRequest: async () => {
@@ -1249,21 +1605,22 @@ describe("WorkflowEngine", () => {
       await first.start();
       await waitFor(() => receiptCommitted);
       await first.stop();
-      expect(store.getRun("run-1")?.state).toBe("running");
-      expect(store.listOperations("run-1")[0]?.state).toBe("dispatched");
-
+      expect(workflowStoreValue(store.getRun("run-1"))?.state).toBe("running");
+      expect(workflowStoreValue(store.listOperations("run-1"))[0]?.state).toBe("dispatched");
       await replacement.start();
-      await waitFor(() => store.getRun("run-1")?.state === "succeeded");
+      await waitFor(() => workflowStoreValue(store.getRun("run-1"))?.state === "succeeded");
       expect(replacementDispatches).toBe(0);
-      expect(store.getRun("run-1")?.result).toBe("replacement receipt result");
-      expect(store.listOperations("run-1")[0]).toMatchObject({
+      expect(workflowStoreValue(store.getRun("run-1"))?.result).toBe("replacement receipt result");
+      expect(workflowStoreValue(store.listOperations("run-1"))[0]).toMatchObject({
         state: "succeeded",
         output: "replacement receipt result",
         usage: { inputTokens: 7, outputTokens: 5, totalTokens: 12 },
       });
-      expect(store.listPendingLiveParentCompletions("parent-replacement", 100, true)).toMatchObject(
-        [{ runId: "run-1", result: "replacement receipt result" }],
-      );
+      expect([
+        ...workflowStoreValue(
+          store.listPendingLiveParentCompletions("parent-replacement", 100, true),
+        ),
+      ]).toMatchObject([{ runId: "run-1", result: "replacement receipt result" }]);
     } finally {
       await first.stop();
       await replacement.stop();
@@ -1272,7 +1629,6 @@ describe("WorkflowEngine", () => {
       rmSync(dbPath, { force: true });
     }
   });
-
   for (const raceWindow of ["handoff", "authorization"] as const) {
     it(`adopts a receipt committed during the ${raceWindow} dispatch window`, async () => {
       const dbPath = join(
@@ -1285,7 +1641,7 @@ describe("WorkflowEngine", () => {
         store,
         "run-1",
         {},
-        { operation: 10_000, result: 10_000 },
+        { operation: 10000, result: 10000 },
         { kind: "detached" },
       );
       let captured:
@@ -1306,7 +1662,7 @@ describe("WorkflowEngine", () => {
         loadSnapshot: async () => agentWorkflowSource(),
         compileSource: compileTestWorkflow,
         dispatchAgentRequest: async (request) => {
-          const runOwnerId = store.getRun(request.run.runId)?.claimedBy;
+          const runOwnerId = workflowStoreValue(store.getRun(request.run.runId))?.claimedBy;
           if (!runOwnerId) throw new Error("Missing initial run owner");
           expect(
             store.claimWorkflowRequestPromptPublication({
@@ -1349,7 +1705,7 @@ describe("WorkflowEngine", () => {
             ownerId: "handoff-runner",
             state: "resolved",
             output: `${raceWindow} receipt result`,
-            now: 70_000,
+            now: 70000,
           }),
         ).toBe(true);
       };
@@ -1359,7 +1715,7 @@ describe("WorkflowEngine", () => {
         dataDir: dirname(dbPath),
         subscriptionId: `${raceWindow}-receipt-second`,
         pollMs: 5,
-        now: () => 70_000,
+        now: () => 70000,
         loadSnapshot: async () => agentWorkflowSource(),
         compileSource: compileTestWorkflow,
         createDispatchEpoch:
@@ -1380,10 +1736,14 @@ describe("WorkflowEngine", () => {
         await first.stop();
         if (raceWindow === "handoff") store.beforeHandoff = commitReceipt;
         await replacement.start();
-        await waitFor(() => ["succeeded", "failed"].includes(store.getRun("run-1")?.state ?? ""));
-        expect(store.getRun("run-1")?.state).toBe("succeeded");
+        await waitFor(() =>
+          ["succeeded", "failed"].includes(workflowStoreValue(store.getRun("run-1"))?.state ?? ""),
+        );
+        expect(workflowStoreValue(store.getRun("run-1"))?.state).toBe("succeeded");
         expect(replacementDispatches).toBe(0);
-        expect(store.getRun("run-1")?.result).toBe(`${raceWindow} receipt result`);
+        expect(workflowStoreValue(store.getRun("run-1"))?.result).toBe(
+          `${raceWindow} receipt result`,
+        );
       } finally {
         await first.stop();
         await replacement.stop();
@@ -1393,7 +1753,6 @@ describe("WorkflowEngine", () => {
       }
     });
   }
-
   it("keeps the exact dispatch alive when its receipt commits immediately after pause", async () => {
     const dbPath = join(tmpdir(), `workflow-engine-pause-receipt-${crypto.randomUUID()}.sqlite`);
     const store = new DurableWorkflowStore(dbPath);
@@ -1411,7 +1770,12 @@ describe("WorkflowEngine", () => {
       | undefined;
     const capturedByRun = new Map<
       string,
-      { requestId: string; runId: string; operationId: string; dispatchEpoch: string }
+      {
+        requestId: string;
+        runId: string;
+        operationId: string;
+        dispatchEpoch: string;
+      }
     >();
     const engine = new WorkflowEngine({
       bus,
@@ -1424,7 +1788,7 @@ describe("WorkflowEngine", () => {
       compileSource: compileTestWorkflow,
       dispatchAgentRequest: async (request) => {
         dispatches += 1;
-        const runOwnerId = store.getRun(request.run.runId)?.claimedBy;
+        const runOwnerId = workflowStoreValue(store.getRun(request.run.runId))?.claimedBy;
         if (!runOwnerId) throw new Error("Missing run owner");
         expect(
           store.claimWorkflowRequestPromptPublication({
@@ -1477,23 +1841,26 @@ describe("WorkflowEngine", () => {
           now,
         }),
       ).toBe(true);
-      await waitFor(() => store.listOperations("run-1")[0]?.state === "dispatched");
-      expect(store.listOperations("run-1")[0]).toMatchObject({
+      await waitFor(
+        () => workflowStoreValue(store.listOperations("run-1"))[0]?.state === "dispatched",
+      );
+      expect(workflowStoreValue(store.listOperations("run-1"))[0]).toMatchObject({
         attempt: 0,
         requestId: captured.requestId,
       });
       now += 1;
       expect(store.transitionRun({ runId: "run-1", from: "paused", to: "queued", now })).toBe(true);
-      await waitFor(() => ["succeeded", "failed"].includes(store.getRun("run-1")?.state ?? ""));
-      expect(store.getRun("run-1")?.state).toBe("succeeded");
+      await waitFor(() =>
+        ["succeeded", "failed"].includes(workflowStoreValue(store.getRun("run-1"))?.state ?? ""),
+      );
+      expect(workflowStoreValue(store.getRun("run-1"))?.state).toBe("succeeded");
       expect(dispatches).toBe(1);
-      expect(store.getRun("run-1")?.result).toBe("receipt survived pause");
-      expect(store.listOperations("run-1")[0]).toMatchObject({
+      expect(workflowStoreValue(store.getRun("run-1"))?.result).toBe("receipt survived pause");
+      expect(workflowStoreValue(store.listOperations("run-1"))[0]).toMatchObject({
         state: "succeeded",
         output: "receipt survived pause",
         usage: { inputTokens: 3, outputTokens: 2, totalTokens: 5 },
       });
-
       createApprovedRun(store, "run-cancelled-receipt");
       await waitFor(() => capturedByRun.has("run-cancelled-receipt"));
       now += 1;
@@ -1524,11 +1891,11 @@ describe("WorkflowEngine", () => {
           now,
         }),
       ).toBe(false);
-      expect(store.getRun("run-cancelled-receipt")).toMatchObject({
+      expect(workflowStoreValue(store.getRun("run-cancelled-receipt"))).toMatchObject({
         state: "paused",
         terminalDetail: WORKFLOW_MANUAL_RECONCILIATION_DETAIL,
       });
-      expect(store.listOperations("run-cancelled-receipt")[0]).toMatchObject({
+      expect(workflowStoreValue(store.listOperations("run-cancelled-receipt"))[0]).toMatchObject({
         state: "blocked",
         attempt: 0,
         requestId: cancelledCapture.requestId,
@@ -1544,7 +1911,6 @@ describe("WorkflowEngine", () => {
       rmSync(dbPath, { force: true });
     }
   });
-
   it("stops only the local sandbox after lease loss without interrupting successor requests", async () => {
     const dbPath = join(tmpdir(), `workflow-engine-lease-loss-${crypto.randomUUID()}.sqlite`);
     const store = new DurableWorkflowStore(dbPath);
@@ -1572,7 +1938,10 @@ describe("WorkflowEngine", () => {
     });
     try {
       await engine.start();
-      await waitFor(() => store.listOperations("run-1", { state: "dispatched" }).length === 1);
+      await waitFor(
+        () =>
+          workflowStoreValue(store.listOperations("run-1", { state: "dispatched" })).length === 1,
+      );
       expect(
         store.tryClaimRun({
           runId: "run-1",
@@ -1582,7 +1951,7 @@ describe("WorkflowEngine", () => {
         })?.claimedBy,
       ).toBe("successor");
       now = 101;
-      await waitFor(() => store.getRun("run-1")?.claimedBy === "successor");
+      await waitFor(() => workflowStoreValue(store.getRun("run-1"))?.claimedBy === "successor");
       // test-wait-justification: crosses several engine poll intervals to detect an incorrect successor interrupt
       await Bun.sleep(25);
       expect(
@@ -1602,7 +1971,6 @@ describe("WorkflowEngine", () => {
       rmSync(dbPath, { force: true });
     }
   });
-
   it("journals deterministic operations and captures usage and output", async () => {
     const dbPath = join(tmpdir(), `workflow-engine-${crypto.randomUUID()}.sqlite`);
     const store = new DurableWorkflowStore(dbPath);
@@ -1639,15 +2007,15 @@ describe("WorkflowEngine", () => {
     });
     try {
       await engine.start();
-      await waitFor(() => store.getRun("run-1")?.state === "succeeded");
-      await waitFor(() => store.getRun("run-2")?.state === "succeeded");
+      await waitFor(() => workflowStoreValue(store.getRun("run-1"))?.state === "succeeded");
+      await waitFor(() => workflowStoreValue(store.getRun("run-2"))?.state === "succeeded");
       expect(dispatches).toBe(2);
-      expect(store.getRun("run-1")?.result).toEqual({
+      expect(workflowStoreValue(store.getRun("run-1"))?.result).toEqual({
         first: "agent output",
         cached: "agent output",
       });
-      const operations = store.listOperations("run-1", { limit: 100 });
-      const secondOperations = store.listOperations("run-2", { limit: 100 });
+      const operations = workflowStoreValue(store.listOperations("run-1", { limit: 100 }));
+      const secondOperations = workflowStoreValue(store.listOperations("run-2", { limit: 100 }));
       expect(operations.map((operation) => operation.kind)).toEqual(["phase", "agent"]);
       expect(operations[1]).toMatchObject({
         operationId: expect.stringMatching(/^wfop:/u),
@@ -1672,7 +2040,6 @@ describe("WorkflowEngine", () => {
       rmSync(dbPath, { force: true });
     }
   });
-
   it("reclaims a crashed running run and replays completed operations without dispatch", async () => {
     const dbPath = join(tmpdir(), `workflow-engine-restart-${crypto.randomUUID()}.sqlite`);
     const store = new DurableWorkflowStore(dbPath);
@@ -1724,8 +2091,8 @@ describe("WorkflowEngine", () => {
     });
     try {
       await engine.start();
-      await waitFor(() => store.getRun("run-1")?.state === "succeeded");
-      expect(store.getRun("run-1")?.result).toBe("cached");
+      await waitFor(() => workflowStoreValue(store.getRun("run-1"))?.state === "succeeded");
+      expect(workflowStoreValue(store.getRun("run-1"))?.result).toBe("cached");
       expect(dispatches).toBe(0);
     } finally {
       await engine.stop();
@@ -1734,7 +2101,6 @@ describe("WorkflowEngine", () => {
       rmSync(dbPath, { force: true });
     }
   });
-
   it("fails operations that exceed configured output limits", async () => {
     const dbPath = join(tmpdir(), `workflow-engine-limits-${crypto.randomUUID()}.sqlite`);
     const store = new DurableWorkflowStore(dbPath);
@@ -1759,18 +2125,22 @@ describe("WorkflowEngine", () => {
             }
           : {
               state: "resolved",
-              output: "x".repeat(10_001),
+              output: "x".repeat(10001),
               detail: null,
               usage: null,
             },
     });
     try {
       await engine.start();
-      await waitFor(() => store.getRun("run-1")?.state === "failed");
-      await waitFor(() => store.getRun("run-failure")?.state === "failed");
-      expect(store.getRun("run-1")?.terminalDetail).toContain("output exceeds 10000 bytes");
-      expect(store.listOperations("run-1")[0]).toMatchObject({ state: "failed" });
-      expect(store.listOperations("run-failure")[0]).toMatchObject({
+      await waitFor(() => workflowStoreValue(store.getRun("run-1"))?.state === "failed");
+      await waitFor(() => workflowStoreValue(store.getRun("run-failure"))?.state === "failed");
+      expect(workflowStoreValue(store.getRun("run-1"))?.terminalDetail).toContain(
+        "output exceeds 10000 bytes",
+      );
+      expect(workflowStoreValue(store.listOperations("run-1"))[0]).toMatchObject({
+        state: "failed",
+      });
+      expect(workflowStoreValue(store.listOperations("run-failure"))[0]).toMatchObject({
         state: "failed",
         error: "provider failed",
         output: "Error: provider failed",
@@ -1782,15 +2152,14 @@ describe("WorkflowEngine", () => {
       rmSync(dbPath, { force: true });
     }
   });
-
   it("persists large operation output and terminal results as bounded durable artifacts", async () => {
     const root = join(tmpdir(), `workflow-engine-artifacts-${crypto.randomUUID()}`);
     const dbPath = `${root}.sqlite`;
     const store = new DurableWorkflowStore(dbPath);
     const bus = createLilacBus(new CapturingRawBus());
-    const largeOutput = "x".repeat(70_000);
+    const largeOutput = "x".repeat(70000);
     await fs.mkdir(root);
-    createApprovedRun(store, "run-artifact", {}, { operation: 100_000, result: 100_000 });
+    createApprovedRun(store, "run-artifact", {}, { operation: 100000, result: 100000 });
     const engine = new WorkflowEngine({
       bus,
       store,
@@ -1808,31 +2177,30 @@ describe("WorkflowEngine", () => {
     });
     try {
       await engine.start();
-      await waitFor(() => store.getRun("run-artifact")?.state === "succeeded");
-      const operation = store.listOperations("run-artifact")[0];
-      const run = store.getRun("run-artifact");
+      await waitFor(() => workflowStoreValue(store.getRun("run-artifact"))?.state === "succeeded");
+      const operation = workflowStoreValue(store.listOperations("run-artifact"))[0];
+      const run = workflowStoreValue(store.getRun("run-artifact"));
       expect(operation).toMatchObject({ output: null, resultArtifactId: expect.any(String) });
       expect(run).toMatchObject({ result: null, resultArtifactId: expect.any(String) });
       await engine.stop();
       store.close();
-
       const reopened = new DurableWorkflowStore(dbPath);
-      const persistedOperation = reopened.listOperations("run-artifact")[0]!;
-      const persistedRun = reopened.getRun("run-artifact")!;
-      await expect(
-        readWorkflowValueArtifact({
-          dataDir: root,
-          artifactId: persistedOperation.resultArtifactId!,
-          maxBytes: 100_000,
-        }),
-      ).resolves.toBe(largeOutput);
-      await expect(
-        readWorkflowValueArtifact({
-          dataDir: root,
-          artifactId: persistedRun.resultArtifactId!,
-          maxBytes: 100_000,
-        }),
-      ).resolves.toBe(largeOutput);
+      const persistedOperation = workflowStoreValue(reopened.listOperations("run-artifact"))[0]!;
+      const persistedRun = workflowStoreValue(reopened.getRun("run-artifact"))!;
+      const operationArtifact = await readWorkflowValueArtifact({
+        dataDir: root,
+        artifactId: persistedOperation.resultArtifactId!,
+        maxBytes: 100000,
+      });
+      expect(operationArtifact.status).toBe("ok");
+      if (operationArtifact.status === "ok") expect(operationArtifact.value).toBe(largeOutput);
+      const runArtifact = await readWorkflowValueArtifact({
+        dataDir: root,
+        artifactId: persistedRun.resultArtifactId!,
+        maxBytes: 100000,
+      });
+      expect(runArtifact.status).toBe("ok");
+      if (runArtifact.status === "ok") expect(runArtifact.value).toBe(largeOutput);
       reopened.close();
     } finally {
       await engine.stop();
@@ -1841,7 +2209,6 @@ describe("WorkflowEngine", () => {
       rmSync(dbPath, { force: true });
     }
   });
-
   it("durably pauses, requeues active operations, resumes, and cascades cancellation", async () => {
     const dbPath = join(tmpdir(), `workflow-engine-controls-${crypto.randomUUID()}.sqlite`);
     const store = new DurableWorkflowStore(dbPath);
@@ -1882,21 +2249,30 @@ describe("WorkflowEngine", () => {
     });
     try {
       await engine.start();
-      await waitFor(() => store.listOperations("run-1", { state: "dispatched" }).length === 1);
+      await waitFor(
+        () =>
+          workflowStoreValue(store.listOperations("run-1", { state: "dispatched" })).length === 1,
+      );
       expect(
         store.pauseRunAndChildren({ runId: "run-1", now: 10, detail: "test pause" })?.state,
       ).toBe("paused");
-      await waitFor(() => store.listOperations("run-1", { state: "dispatched" }).length === 1);
-      expect(store.listOperations("run-1")[0]?.attempt).toBe(0);
+      await waitFor(
+        () =>
+          workflowStoreValue(store.listOperations("run-1", { state: "dispatched" })).length === 1,
+      );
+      expect(workflowStoreValue(store.listOperations("run-1"))[0]?.attempt).toBe(0);
       expect(store.transitionRun({ runId: "run-1", from: "paused", to: "queued", now: 11 })).toBe(
         true,
       );
-      await waitFor(() => store.getRun("run-1")?.state === "succeeded");
-      expect(store.getRun("run-1")?.result).toBe("resumed");
+      await waitFor(() => workflowStoreValue(store.getRun("run-1"))?.state === "succeeded");
+      expect(workflowStoreValue(store.getRun("run-1"))?.result).toBe("resumed");
       expect(launches).toBe(2);
-
       createApprovedRun(store, "run-cancel");
-      await waitFor(() => store.listOperations("run-cancel", { state: "dispatched" }).length === 1);
+      await waitFor(
+        () =>
+          workflowStoreValue(store.listOperations("run-cancel", { state: "dispatched" })).length ===
+          1,
+      );
       expect(
         store.cancelRunAndChildren({
           runId: "run-cancel",
@@ -1904,7 +2280,11 @@ describe("WorkflowEngine", () => {
           detail: "test cancellation",
         })?.state,
       ).toBe("cancelled");
-      await waitFor(() => store.listOperations("run-cancel", { state: "cancelled" }).length === 1);
+      await waitFor(
+        () =>
+          workflowStoreValue(store.listOperations("run-cancel", { state: "cancelled" })).length ===
+          1,
+      );
       await waitFor(() =>
         raw.messages.some(
           (message) =>
@@ -1932,7 +2312,65 @@ describe("WorkflowEngine", () => {
       rmSync(dbPath, { force: true });
     }
   });
+  it("awaits abort cancellation publication failure before request subscription cleanup", async () => {
+    const dbPath = join(
+      tmpdir(),
+      `workflow-engine-abort-publication-${crypto.randomUUID()}.sqlite`,
+    );
+    const store = new DurableWorkflowStore(dbPath);
+    const raw = new DeferredInterruptFailureRawBus();
+    const bus = createLilacBus(raw);
+    createApprovedRun(store);
+    const engine = new WorkflowEngine({
+      bus,
+      store,
+      dataDir: dirname(dbPath),
+      subscriptionId: "test-workflow-abort-publication",
+      pollMs: 5,
+      loadSnapshot: async () => agentWorkflowSource(),
+      compileSource: compileTestWorkflow,
+    });
+    try {
+      await engine.start();
+      await waitFor(() =>
+        raw.messages.some(
+          (message) =>
+            message.type === lilacEventTypes.CmdRequestMessage &&
+            typeof message.data === "object" &&
+            message.data !== null &&
+            "queue" in message.data &&
+            message.data.queue === "prompt",
+        ),
+      );
+      const lifecycleSubscription = raw.subscriptionOptions.find(
+        ({ topic, options }) => topic === "evt.request" && options.mode === "tail",
+      );
+      expect(lifecycleSubscription?.options).toEqual({
+        mode: "tail",
+        offset: { type: "begin" },
+        batch: { maxWaitMs: 100 },
+      });
+      expect(
+        store.cancelRunAndChildren({ runId: "run-1", now: 10, detail: "test cancellation" })?.state,
+      ).toBe("cancelled");
+      await raw.interruptStarted.promise;
+      expect(raw.requestSubscriptionStops).toBe(0);
+      expect(raw.interruptDispatchEpoch).toBeUndefined();
 
+      raw.releaseInterrupt.resolve();
+      await waitFor(() => raw.requestSubscriptionStops === 2);
+      expect(workflowStoreValue(store.getRun("run-1"))).toMatchObject({ state: "cancelled" });
+      expect(workflowStoreValue(store.listOperations("run-1"))[0]).toMatchObject({
+        state: "cancelled",
+      });
+    } finally {
+      raw.releaseInterrupt.resolve();
+      await engine.stop();
+      await bus.close();
+      store.close();
+      rmSync(dbPath, { force: true });
+    }
+  });
   it("cancels the exact idle request and waits for its fenced terminal receipt", async () => {
     const dbPath = join(tmpdir(), `workflow-engine-idle-receipt-${crypto.randomUUID()}.sqlite`);
     const store = new DurableWorkflowStore(dbPath);
@@ -1940,7 +2378,8 @@ describe("WorkflowEngine", () => {
       cancelledRequestId: string | null = null;
       stateBeforeReceipt: string | null = null;
       interruptAttempts = 0;
-
+      readonly receiptRecordingStarted = Promise.withResolvers<void>();
+      readonly releaseReceiptRecording = Promise.withResolvers<void>();
       override async publish<TData>(
         message: Omit<Message<TData>, "id" | "ts">,
         options: PublishOptions,
@@ -1983,6 +2422,7 @@ describe("WorkflowEngine", () => {
               {
                 topic: "evt.request",
                 type: lilacEventTypes.EvtRequestLifecycleChanged,
+                key: requestId,
                 data: { state: "running" },
                 headers: {
                   request_id: requestId,
@@ -1998,15 +2438,16 @@ describe("WorkflowEngine", () => {
             this.interruptAttempts += 1;
             if (this.interruptAttempts === 1) throw new Error("transient cancel publish failure");
             this.cancelledRequestId = requestId;
-            this.stateBeforeReceipt = store.getOperationByRequestId(requestId)?.state ?? null;
-            // test-wait-justification: holds terminal receipt recording open to exercise idle-cancellation ordering
-            await Bun.sleep(50);
-            const operation = store.getOperationByRequestId(requestId);
+            this.stateBeforeReceipt =
+              workflowStoreValue(store.getOperationByRequestId(requestId))?.state ?? null;
+            this.receiptRecordingStarted.resolve();
+            await this.releaseReceiptRecording.promise;
+            const operation = workflowStoreValue(store.getOperationByRequestId(requestId));
             if (!operation) throw new Error("Missing idle operation");
             const dispatch = store.getWorkflowRequestDispatchHandoff({
               requestId,
               now: Date.now(),
-              staleAfterMs: 60_000,
+              staleAfterMs: 60000,
             });
             if (dispatch.status !== "live") throw new Error("Missing live idle dispatch");
             const recorded = store.recordWorkflowRequestTerminal({
@@ -2024,6 +2465,7 @@ describe("WorkflowEngine", () => {
               {
                 topic: "evt.request",
                 type: lilacEventTypes.EvtRequestLifecycleChanged,
+                key: requestId,
                 data: { state: "cancelled", detail: "idle process tree quiesced" },
                 headers: {
                   request_id: requestId,
@@ -2045,12 +2487,12 @@ describe("WorkflowEngine", () => {
       store,
       "run-idle-receipt",
       {},
-      { operation: 10_000, result: 10_000 },
+      { operation: 10000, result: 10000 },
       { kind: "detached" },
       false,
       process.cwd(),
       false,
-      1_000,
+      1000,
     );
     const engine = new WorkflowEngine({
       bus,
@@ -2064,8 +2506,15 @@ describe("WorkflowEngine", () => {
     });
     try {
       await engine.start();
-      await waitFor(() => store.getRun("run-idle-receipt")?.state === "failed");
-      const operation = store.listOperations("run-idle-receipt")[0];
+      await raw.receiptRecordingStarted.promise;
+      const runningOperation = workflowStoreValue(store.listOperations("run-idle-receipt"))[0];
+      expect(raw.cancelledRequestId).toBe(runningOperation?.requestId ?? null);
+      expect(raw.interruptAttempts).toBe(2);
+      expect(raw.stateBeforeReceipt).toBe("running");
+      expect(runningOperation?.state).toBe("running");
+      raw.releaseReceiptRecording.resolve();
+      await waitFor(() => workflowStoreValue(store.getRun("run-idle-receipt"))?.state === "failed");
+      const operation = workflowStoreValue(store.listOperations("run-idle-receipt"))[0];
       expect(raw.cancelledRequestId).toBe(operation?.requestId ?? null);
       expect(raw.interruptAttempts).toBe(2);
       expect(raw.stateBeforeReceipt).toBe("running");
@@ -2073,18 +2522,20 @@ describe("WorkflowEngine", () => {
         state: "timed_out",
         error: "Agent operation idle timeout",
       });
-      expect(store.getWorkflowRequestTerminalReceipt(raw.cancelledRequestId!)).toMatchObject({
+      expect(
+        workflowStoreValue(store.getWorkflowRequestTerminalReceipt(raw.cancelledRequestId!)),
+      ).toMatchObject({
         state: "cancelled",
         detail: "idle process tree quiesced",
       });
     } finally {
+      raw.releaseReceiptRecording.resolve();
       await engine.stop();
       await bus.close();
       store.close();
       rmSync(dbPath, { force: true });
     }
   });
-
   it("resolves sleep and reply-timeout host operations through the durable wait journal", async () => {
     const dbPath = join(tmpdir(), `workflow-engine-waits-${crypto.randomUUID()}.sqlite`);
     const store = new DurableWorkflowStore(dbPath);
@@ -2117,11 +2568,15 @@ describe("WorkflowEngine", () => {
     try {
       await resolver.start();
       await engine.start();
-      await waitFor(() => store.listOperations("run-sleep")[0]?.state === "blocked");
-      await waitFor(() => store.listOperations("run-timeout")[0]?.state === "blocked");
+      await waitFor(
+        () => workflowStoreValue(store.listOperations("run-sleep"))[0]?.state === "blocked",
+      );
+      await waitFor(
+        () => workflowStoreValue(store.listOperations("run-timeout"))[0]?.state === "blocked",
+      );
       now = 110;
       await resolver.reconcileTimers();
-      const timeoutOperation = store.listOperations("run-timeout")[0];
+      const timeoutOperation = workflowStoreValue(store.listOperations("run-timeout"))[0];
       if (!timeoutOperation) throw new Error("Missing timeout operation");
       const barrier = store.prepareWaitExpiryBarrier({
         runId: "run-timeout",
@@ -2133,13 +2588,13 @@ describe("WorkflowEngine", () => {
       if (!barrier) throw new Error("Missing timeout barrier");
       store.markWaitExpiryBarrierProcessed(barrier.barrierId, "1-0", now);
       await resolver.reconcileTimers();
-      await waitFor(() => store.getRun("run-sleep")?.state === "succeeded");
-      await waitFor(() => store.getRun("run-timeout")?.state === "failed");
-      expect(store.listOperations("run-sleep")[0]).toMatchObject({
+      await waitFor(() => workflowStoreValue(store.getRun("run-sleep"))?.state === "succeeded");
+      await waitFor(() => workflowStoreValue(store.getRun("run-timeout"))?.state === "failed");
+      expect(workflowStoreValue(store.listOperations("run-sleep"))[0]).toMatchObject({
         kind: "wait",
         state: "succeeded",
       });
-      expect(store.listOperations("run-timeout")[0]).toMatchObject({
+      expect(workflowStoreValue(store.listOperations("run-timeout"))[0]).toMatchObject({
         kind: "wait",
         state: "timed_out",
       });
@@ -2151,7 +2606,6 @@ describe("WorkflowEngine", () => {
       rmSync(dbPath, { force: true });
     }
   });
-
   it("replays a reply received while the engine is offline without duplicating the wait", async () => {
     const dbPath = join(tmpdir(), `workflow-engine-reply-restart-${crypto.randomUUID()}.sqlite`);
     const store = new DurableWorkflowStore(dbPath);
@@ -2183,10 +2637,17 @@ describe("WorkflowEngine", () => {
     let engine = makeEngine();
     try {
       await engine.start();
-      await waitFor(() => store.listOperations("run-reply")[0]?.state === "blocked");
+      await waitFor(
+        () => workflowStoreValue(store.listOperations("run-reply"))[0]?.state === "blocked",
+      );
       await engine.stop();
       expect(
-        store.getWait("run-reply", store.listOperations("run-reply")[0]!.operationId)?.state,
+        workflowStoreValue(
+          store.getWait(
+            "run-reply",
+            workflowStoreValue(store.listOperations("run-reply"))[0]!.operationId,
+          ),
+        )?.state,
       ).toBe("pending");
       await resolver.start();
       await resolver.resolveAdapterEvent(
@@ -2201,12 +2662,14 @@ describe("WorkflowEngine", () => {
         },
         "offline-cursor",
       );
-      now = 60_011;
+      now = 60011;
       engine = makeEngine();
       await engine.start();
-      await waitFor(() => store.getRun("run-reply")?.state === "succeeded");
-      expect(store.getRun("run-reply")?.result).toMatchObject({ text: "continue" });
-      expect(store.listOperations("run-reply")).toHaveLength(1);
+      await waitFor(() => workflowStoreValue(store.getRun("run-reply"))?.state === "succeeded");
+      expect(workflowStoreValue(store.getRun("run-reply"))?.result).toMatchObject({
+        text: "continue",
+      });
+      expect(workflowStoreValue(store.listOperations("run-reply"))).toHaveLength(1);
     } finally {
       await engine.stop();
       await resolver.stop();
@@ -2215,7 +2678,6 @@ describe("WorkflowEngine", () => {
       rmSync(dbPath, { force: true });
     }
   });
-
   it("rejects reply waits without an authenticated Discord origin user", async () => {
     const dbPath = join(
       tmpdir(),
@@ -2227,12 +2689,12 @@ describe("WorkflowEngine", () => {
       store,
       "run-unauthenticated-reply",
       {},
-      { operation: 10_000, result: 10_000 },
+      { operation: 10000, result: 10000 },
       { kind: "detached" },
       false,
       process.cwd(),
       false,
-      2_000,
+      2000,
       null,
     );
     const engine = new WorkflowEngine({
@@ -2247,10 +2709,12 @@ describe("WorkflowEngine", () => {
     });
     try {
       await engine.start();
-      await waitFor(() => store.getRun("run-unauthenticated-reply")?.state === "failed");
-      expect(store.getRun("run-unauthenticated-reply")?.terminalDetail).toContain(
-        "authenticated originating Discord or Telegram session and user",
+      await waitFor(
+        () => workflowStoreValue(store.getRun("run-unauthenticated-reply"))?.state === "failed",
       );
+      expect(
+        workflowStoreValue(store.getRun("run-unauthenticated-reply"))?.terminalDetail,
+      ).toContain("authenticated originating Discord or Telegram session and user");
     } finally {
       await engine.stop();
       await bus.close();
@@ -2291,10 +2755,15 @@ describe("WorkflowEngine", () => {
     });
     try {
       await engine.start();
-      await waitFor(() => store.listOperations("run-telegram-reply")[0]?.state === "blocked");
-      const operation = store.listOperations("run-telegram-reply")[0];
+      await waitFor(
+        () =>
+          workflowStoreValue(store.listOperations("run-telegram-reply"))?.[0]?.state === "blocked",
+      );
+      const operation = workflowStoreValue(store.listOperations("run-telegram-reply"))?.[0];
       if (!operation) throw new Error("Missing Telegram wait operation");
-      expect(store.getWait("run-telegram-reply", operation.operationId)?.match).toEqual({
+      expect(
+        workflowStoreValue(store.getWait("run-telegram-reply", operation.operationId))?.match,
+      ).toEqual({
         kind: "reply",
         platform: "telegram",
         channelId: "-100123:7",

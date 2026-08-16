@@ -4,6 +4,7 @@ import {
   REMOTE_COMPACTION_BETA_FEATURE,
   SERVER_COMPACTION_REQUEST_HEADER,
   SERVER_COMPACTION_REQUEST_MARKER,
+  prepareServerCompactionRequestResult,
   withServerCompactionRequestFetch,
 } from "../server-compaction-request";
 
@@ -121,6 +122,37 @@ describe("withServerCompactionRequestFetch", () => {
         body: JSON.stringify({ messages: [] }),
       }),
     ).rejects.toThrow("must target POST /responses");
+
+    const result = await prepareServerCompactionRequestResult(
+      "https://api.openai.com/v1/responses",
+      {
+        method: "POST",
+        headers: { [SERVER_COMPACTION_REQUEST_HEADER]: SERVER_COMPACTION_REQUEST_MARKER },
+        body: "not-json",
+      },
+    );
+    expect(result.status).toBe("error");
+    if (result.status === "error") expect(result.error.issue).toBe("malformed-json");
+  });
+
+  it("keeps malformed JSON compatibility errors as plain Error with the parser cause", async () => {
+    const wrapped = withServerCompactionRequestFetch(capturingFetch([]));
+    let caught: unknown;
+    try {
+      await wrapped("https://api.openai.com/v1/responses", {
+        method: "POST",
+        headers: { [SERVER_COMPACTION_REQUEST_HEADER]: SERVER_COMPACTION_REQUEST_MARKER },
+        body: "not-json",
+      });
+    } catch (cause) {
+      caught = cause;
+    }
+
+    expect(caught).toBeInstanceOf(Error);
+    if (caught instanceof Error) {
+      expect(caught.constructor).toBe(Error);
+      expect(caught.cause).toBeInstanceOf(SyntaxError);
+    }
   });
 
   it("preserves properties on an existing WebSocket fetch adapter", () => {

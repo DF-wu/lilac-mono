@@ -5,20 +5,20 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 
 import type { ModelMessage } from "ai";
+import { Result, type Result as ResultType } from "better-result";
 import { hashCanonicalMessagesV1 } from "@stanley2058/lilac-agent";
 import {
-  buildCoreLineageManifestV1,
-  parseCorePrimaryLineageV1,
+  buildCoreLineageManifestV1 as buildCoreLineageManifestResultV1,
+  decodeCorePrimaryLineageV1,
 } from "@stanley2058/lilac-event-bus";
 
 import {
-  composeRecentChannelMessages,
-  composeRequestMessages,
-  composeSingleMessageWithLineage,
+  composeRecentChannelMessages as composeRecentChannelMessagesResult,
+  composeRequestMessages as composeRequestMessagesResult,
+  composeSingleMessageWithLineage as composeSingleMessageWithLineageResult,
 } from "../../../src/surface/bridge/request-composition";
-import type { SurfaceAdapter, SurfaceOutputStream } from "../../../src/surface/adapter";
+import type { SurfaceOperationResult, SurfaceOutputStream } from "../../../src/surface/adapter";
 import type {
-  AdapterCapabilities,
   ContentOpts,
   LimitOpts,
   MsgRef,
@@ -29,9 +29,35 @@ import type {
   SurfaceSession,
 } from "../../../src/surface/types";
 import { SqliteTranscriptStore } from "../../../src/transcript/transcript-store";
+import { SurfaceAdapterTestBase } from "../../helpers/surface-adapter-test-base";
 
 const tempDirs: string[] = [];
 const originalFetch = globalThis.fetch;
+
+function resultValue<T, E>(result: ResultType<T, E>): T {
+  if (result.status === "error") throw result.error;
+  return result.value;
+}
+
+async function composeRecentChannelMessages(
+  ...args: Parameters<typeof composeRecentChannelMessagesResult>
+) {
+  return resultValue(await composeRecentChannelMessagesResult(...args));
+}
+
+async function composeRequestMessages(...args: Parameters<typeof composeRequestMessagesResult>) {
+  return resultValue(await composeRequestMessagesResult(...args));
+}
+
+async function composeSingleMessageWithLineage(
+  ...args: Parameters<typeof composeSingleMessageWithLineageResult>
+) {
+  return resultValue(await composeSingleMessageWithLineageResult(...args));
+}
+
+function buildCoreLineageManifestV1(...args: Parameters<typeof buildCoreLineageManifestResultV1>) {
+  return resultValue(buildCoreLineageManifestResultV1(...args));
+}
 
 afterEach(async () => {
   globalThis.fetch = originalFetch;
@@ -48,25 +74,30 @@ async function createStore(): Promise<{ dbPath: string; store: SqliteTranscriptS
   return { dbPath, store: new SqliteTranscriptStore(dbPath) };
 }
 
-class MutableAdapter implements SurfaceAdapter {
+class MutableAdapter extends SurfaceAdapterTestBase {
   readonly reactions = new Map<string, string[]>();
 
-  constructor(readonly messages: SurfaceMessage[]) {}
+  constructor(readonly messages: SurfaceMessage[]) {
+    super();
+  }
 
   async getSelf(): Promise<SurfaceSelf> {
     return { platform: "discord", userId: "bot", userName: "lilac" };
   }
 
-  async readMsg(ref: MsgRef): Promise<SurfaceMessage | null> {
-    return (
+  async readMsg(ref: MsgRef): Promise<SurfaceOperationResult<SurfaceMessage | null>> {
+    return Result.ok(
       this.messages.find(
         (message) =>
           message.session.channelId === ref.channelId && message.ref.messageId === ref.messageId,
-      ) ?? null
+      ) ?? null,
     );
   }
 
-  async listMsg(session: SessionRef, opts?: LimitOpts): Promise<SurfaceMessage[]> {
+  async listMsg(
+    session: SessionRef,
+    opts?: LimitOpts,
+  ): Promise<SurfaceOperationResult<SurfaceMessage[]>> {
     const before = opts?.beforeMessageId;
     const beforeMessage = before
       ? this.messages.find((message) => message.ref.messageId === before)
@@ -75,43 +106,55 @@ class MutableAdapter implements SurfaceAdapter {
       .filter((message) => message.session.channelId === session.channelId)
       .filter((message) => !beforeMessage || message.ts < beforeMessage.ts)
       .toSorted((left, right) => left.ts - right.ts);
-    return messages.slice(-Math.max(1, opts?.limit ?? 50));
+    return Result.ok(messages.slice(-Math.max(1, opts?.limit ?? 50)));
   }
 
-  async getReplyContext(ref: MsgRef): Promise<SurfaceMessage[]> {
-    const message = await this.readMsg(ref);
-    return message ? [message] : [];
+  async getReplyContext(ref: MsgRef): Promise<SurfaceOperationResult<SurfaceMessage[]>> {
+    const messageResult = await this.readMsg(ref);
+    if (messageResult.status === "error") return Result.err(messageResult.error);
+    return Result.ok(messageResult.value ? [messageResult.value] : []);
   }
 
-  async listReactions(ref: MsgRef): Promise<string[]> {
-    return [...(this.reactions.get(ref.messageId) ?? [])];
+  async listReactions(ref: MsgRef): Promise<SurfaceOperationResult<string[]>> {
+    return Result.ok([...(this.reactions.get(ref.messageId) ?? [])]);
   }
 
   async connect(): Promise<void> {}
   async disconnect(): Promise<void> {}
-  async getCapabilities(): Promise<AdapterCapabilities> {
+  async listSessions(): Promise<SurfaceOperationResult<SurfaceSession[]>> {
     throw new Error("not used");
   }
-  async listSessions(): Promise<SurfaceSession[]> {
+  async startOutput(): Promise<SurfaceOperationResult<SurfaceOutputStream>> {
     throw new Error("not used");
   }
-  async startOutput(): Promise<SurfaceOutputStream> {
+  async sendMsg(
+    _sessionRef: SessionRef,
+    _content: ContentOpts,
+    _opts?: SendOpts,
+  ): Promise<SurfaceOperationResult<MsgRef>> {
     throw new Error("not used");
   }
-  async sendMsg(_sessionRef: SessionRef, _content: ContentOpts, _opts?: SendOpts): Promise<MsgRef> {
-    throw new Error("not used");
+  async editMsg(): Promise<SurfaceOperationResult<void>> {
+    return Result.ok(undefined);
   }
-  async editMsg(): Promise<void> {}
-  async deleteMsg(): Promise<void> {}
-  async addReaction(): Promise<void> {}
-  async removeReaction(): Promise<void> {}
+  async deleteMsg(): Promise<SurfaceOperationResult<void>> {
+    return Result.ok(undefined);
+  }
+  async addReaction(): Promise<SurfaceOperationResult<void>> {
+    return Result.ok(undefined);
+  }
+  async removeReaction(): Promise<SurfaceOperationResult<void>> {
+    return Result.ok(undefined);
+  }
   async subscribe(): Promise<{ stop(): Promise<void> }> {
     throw new Error("not used");
   }
-  async getUnRead(): Promise<SurfaceMessage[]> {
-    return [];
+  async getUnRead(): Promise<SurfaceOperationResult<SurfaceMessage[]>> {
+    return Result.ok([]);
   }
-  async markRead(): Promise<void> {}
+  async markRead(): Promise<SurfaceOperationResult<void>> {
+    return Result.ok(undefined);
+  }
 }
 
 function surfaceMessage(input: {
@@ -468,9 +511,9 @@ describe("Core primary lineage composition", () => {
         segment.atoms.filter((atom) => atom.kind === "request"),
       ),
     ).toEqual([]);
-    expect(() =>
-      parseCorePrimaryLineageV1(composed.corePrimaryLineage, composed.messages),
-    ).not.toThrow();
+    expect(decodeCorePrimaryLineageV1(composed.corePrimaryLineage, composed.messages).status).toBe(
+      "ok",
+    );
     store.close();
   });
 
@@ -575,9 +618,9 @@ describe("Core primary lineage composition", () => {
     expect(composed.corePrimaryLineage.currentCanonicalStart).toBe(
       first.messages.length + injected.length + response.length,
     );
-    expect(() =>
-      parseCorePrimaryLineageV1(composed.corePrimaryLineage, composed.messages),
-    ).not.toThrow();
+    expect(decodeCorePrimaryLineageV1(composed.corePrimaryLineage, composed.messages).status).toBe(
+      "ok",
+    );
     store.close();
   });
 
@@ -727,9 +770,9 @@ describe("Core primary lineage composition", () => {
     });
     for (const composition of [replyComposition, mentionComposition, windowComposition]) {
       expect(composition.corePrimaryLineage.state).toBe("complete");
-      expect(() =>
-        parseCorePrimaryLineageV1(composition.corePrimaryLineage, composition.messages),
-      ).not.toThrow();
+      expect(
+        decodeCorePrimaryLineageV1(composition.corePrimaryLineage, composition.messages).status,
+      ).toBe("ok");
     }
     expect(windowComposition.chainMessageIds).toEqual(["after"]);
 
@@ -776,12 +819,12 @@ describe("Core primary lineage composition", () => {
         checkpointMessages,
       );
     }
-    expect(() =>
-      parseCorePrimaryLineageV1(
+    expect(
+      decodeCorePrimaryLineageV1(
         checkpointComposition.corePrimaryLineage,
         checkpointComposition.messages,
-      ),
-    ).not.toThrow();
+      ).status,
+    ).toBe("ok");
     store.close();
   });
 });

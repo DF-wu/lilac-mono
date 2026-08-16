@@ -2,12 +2,12 @@ import { z } from "zod";
 
 export const LEVEL1_TOOL_NAMES = [
   "bash",
-  "read_file",
+  "read",
   "glob",
   "grep",
   "fuzzy_search",
-  "edit_file",
-  "apply_patch",
+  "edit",
+  "patch",
   "subagent_delegate",
   "batch",
 ] as const;
@@ -102,7 +102,7 @@ export function createReadFileInputSchema(options?: {
       .optional()
       .describe(
         hashlineEnabled
-          ? "Text files only. Output format. Default is raw. Use 'hashline' before edit_file when you need stable edit anchors."
+          ? "Text files only. Output format. Default is raw. Use 'hashline' before edit when you need stable edit anchors."
           : "Text files only. Output format. Default is raw (no line numbers). 'numbered' is for display only.",
       ),
     dangerouslyAllow: z.boolean().optional().describe("Bypass filesystem denylist guardrails."),
@@ -163,13 +163,13 @@ export const fuzzySearchInputSchema = z.object({
 });
 
 export function createGrepInputSchema(hashlineEnabled = false) {
-  return z.object({
+  return z.strictObject({
     pattern: z.string().min(1).describe("Search pattern. Literal by default unless regex=true."),
-    cwd: z
+    path: z
       .string()
       .optional()
       .describe(
-        "Optional file or base directory to search (supports ~). Also supports ssh-style '<host>:<path>' when the runtime adapter has SSH configured. Defaults to the tool root.",
+        "Optional file, directory, or tool-result:// resource to search (supports ~). Also supports ssh-style '<host>:<path>' when the runtime adapter has SSH configured. Defaults to the tool root.",
       ),
     regex: z
       .boolean()
@@ -187,13 +187,6 @@ export function createGrepInputSchema(hashlineEnabled = false) {
       .max(100)
       .optional()
       .describe('Optional file extension filters (e.g. ["ts", "tsx"]).'),
-    includeContextLines: z
-      .number()
-      .int()
-      .nonnegative()
-      .max(100)
-      .optional()
-      .describe("Include N context lines around each match."),
     mode: (hashlineEnabled
       ? z.enum(["default", "detailed", "hashline"])
       : z.enum(["default", "detailed"])
@@ -215,10 +208,7 @@ const expectedMatchesSchema = z.union([z.literal("any"), z.number().int().positi
 const hashlineEditSchema = z.discriminatedUnion("op", [
   z.object({
     op: z.literal("replace"),
-    pos: z
-      .string()
-      .min(1)
-      .describe("Starting hashline anchor from read_file/grep hashline output."),
+    pos: z.string().min(1).describe("Starting hashline anchor from read/grep hashline output."),
     end: z
       .string()
       .min(1)
@@ -260,7 +250,7 @@ const hashlineEditFileInputSchema = z.object({
     .string()
     .optional()
     .describe(
-      "Optional optimistic concurrency hash from read_file. If omitted, edit_file requires a prior read in the same tool session.",
+      "Optional optimistic concurrency hash from read. If omitted, edit requires a prior read in the same tool session.",
     ),
   dangerouslyAllow: z.boolean().optional().describe("Bypass filesystem denylist guardrails."),
 });
@@ -286,10 +276,7 @@ const legacyEditFileInputSchema = z.object({
   expectedMatches: expectedMatchesSchema
     .optional()
     .describe("Expected number of matches. Default: 1 when replaceAll=false, otherwise 'any'."),
-  expectedHash: z
-    .string()
-    .optional()
-    .describe("Optional optimistic concurrency hash from read_file."),
+  expectedHash: z.string().optional().describe("Optional optimistic concurrency hash from read."),
   dangerouslyAllow: z.boolean().optional().describe("Bypass filesystem denylist guardrails."),
 });
 
@@ -342,7 +329,7 @@ export const subagentDelegateBaseInputSchema = z.object({
   sessionName: subagentSessionNameSchema
     .optional()
     .describe(
-      "Optional stable short slug for continuing a subagent session within this parent session/channel. When omitted, a reusable short name is generated and returned.",
+      "Optional stable name for subagent continuation. Reuse starts a new invocation. If the session is active, the new invocation waits in the queue. Reuse does not check or join the active invocation. When omitted, a reusable name is generated and returned.",
     ),
 });
 

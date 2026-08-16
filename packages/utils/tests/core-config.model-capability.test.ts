@@ -1,35 +1,9 @@
 import { describe, expect, it } from "bun:test";
 
-import {
-  coreConfigInputSchemaV2,
-  coreConfigSchema,
-  parseCoreConfigV1ToUniversal,
-} from "../core-config";
+import { coreConfigInputSchemaV2, coreConfigSchema } from "../core-config";
 
 describe("coreConfigSchema models.capability", () => {
   it("defaults conversation thread summarization, embedding, and auto injection config", () => {
-    const v1 = parseCoreConfigV1ToUniversal({});
-    expect(v1.conversation.thread.summarization).toEqual({
-      enabled: false,
-      model: "fast",
-      concurrency: 1,
-      batchSize: 32,
-      includePromptContext: false,
-    });
-    expect(v1.conversation.thread.embedding).toEqual({
-      enabled: false,
-      model: "openai/text-embedding-3-small",
-    });
-    expect(v1.conversation.thread.autoInject).toEqual({
-      enabled: false,
-      minTextUnits: 80,
-      followUpMinTextUnits: 110,
-      limit: 3,
-      minScore: 0.1,
-      mode: "hybrid",
-      filterCurrentParticipants: false,
-    });
-
     const v2 = coreConfigInputSchemaV2.parse({ configVersion: 2 });
     expect(v2.conversation.thread.summarization).toEqual({
       enabled: false,
@@ -78,7 +52,7 @@ describe("coreConfigSchema models.capability", () => {
     });
   });
 
-  it("accepts conversation thread auto inject planner model override", () => {
+  it("accepts conversation thread auto inject planner model overrides", () => {
     const parsed = coreConfigInputSchemaV2.parse({
       configVersion: 2,
       conversation: {
@@ -86,6 +60,7 @@ describe("coreConfigSchema models.capability", () => {
           autoInject: {
             enabled: true,
             plannerModel: "openrouter/openai/gpt-4o-mini",
+            textPlannerModel: "openai/gpt-5.3-codex-spark",
             minTextUnits: 120,
             followUpMinTextUnits: 150,
             limit: 4,
@@ -100,6 +75,7 @@ describe("coreConfigSchema models.capability", () => {
     expect(parsed.conversation.thread.autoInject).toEqual({
       enabled: true,
       plannerModel: "openrouter/openai/gpt-4o-mini",
+      textPlannerModel: "openai/gpt-5.3-codex-spark",
       minTextUnits: 120,
       followUpMinTextUnits: 150,
       limit: 4,

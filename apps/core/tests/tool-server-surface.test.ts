@@ -1,38 +1,179 @@
 import { describe, expect, it } from "bun:test";
+import { Panic, Result } from "better-result";
 import { parseCoreConfigV1ToUniversal, type CoreConfig } from "@stanley2058/lilac-utils";
-import { Surface } from "../src/tool-server/tools/surface";
-import type { GithubSurfaceApi } from "../src/tool-server/tools/surface";
+import { Surface as ProductionSurface } from "../src/tool-server/tools/surface";
+import {
+  SurfaceUnavailable,
+  type SurfaceAdapter,
+  type SurfaceOperationResult,
+} from "../src/surface/adapter";
+import { BUILTIN_SURFACE_PROTOCOLS } from "../src/surface/builtin-surface-protocols";
+import {
+  GithubAdapter,
+  type GithubAdapterApi as GithubSurfaceApi,
+} from "../src/surface/github/github-adapter";
+import { createDescriptorBoundSurfaceAdapter } from "../src/surface/produced-ref-guard";
+import { SurfaceRuntimeRegistry } from "../src/surface/runtime-descriptor";
+import {
+  SurfaceRefInvalid,
+  SurfaceToolTargetInvalid,
+  type SurfaceProtocolRouting,
+} from "../src/surface/protocol";
 import { GITHUB_AGENT_COMMENT_MARKER } from "../src/github/github-comment-marker";
 import {
   DiscordSearchService,
   DiscordSearchStore,
 } from "../src/surface/store/discord-search-store";
 import type { RequestContext } from "../src/tool-server/types";
-import type { SurfaceAdapter } from "../src/surface/adapter";
 import { SqliteTranscriptStore, type TranscriptStore } from "../src/transcript/transcript-store";
 import fs from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type {
-  AdapterCapabilities,
   ContentOpts,
   LimitOpts,
   MsgRef,
   SendOpts,
   SessionRef,
   SurfaceMessage,
-  SurfaceReactionDetail,
   SurfaceSelf,
   SurfaceSessionParticipantsResult,
   SurfaceSession,
 } from "../src/surface/types";
+import { SurfaceAdapterTestBase } from "./helpers/surface-adapter-test-base";
 
 function testConfig(input: unknown): CoreConfig {
   const cfg = parseCoreConfigV1ToUniversal(input);
   return { ...cfg, agent: { ...cfg.agent, systemPrompt: "(test)" } };
 }
 
-class FakeAdapter implements SurfaceAdapter {
+function createGithubTestAdapter(api: GithubSurfaceApi) {
+  return createDescriptorBoundSurfaceAdapter("github", new GithubAdapter({ api }));
+}
+
+const TEST_TELEGRAM_PROTOCOL: SurfaceProtocolRouting<"telegram"> = {
+  platform: "telegram",
+  displayName: "Telegram",
+  ownsRequestId: (requestId) => requestId.startsWith("telegram:"),
+  refs: {
+    createSessionRef: (channelId) => ({ platform: "telegram", channelId }),
+    createMessageRef: (sessionRef, messageId) => ({ ...sessionRef, messageId }),
+    resolveRequestMessageRef: ({ requestId, sessionRef }) => {
+      const prefix = `telegram:${sessionRef.channelId}:`;
+      return requestId.startsWith(prefix)
+        ? {
+            kind: "target",
+            ref: {
+              platform: "telegram",
+              channelId: sessionRef.channelId,
+              messageId: requestId.slice(prefix.length),
+            },
+          }
+        : { kind: "none" };
+    },
+    decodeMessageRef: ({ ref, expectedSessionId }) => {
+      if (ref.platform !== "telegram" || ref.channelId !== expectedSessionId) {
+        return Result.err(
+          new SurfaceRefInvalid({
+            reason: ref.platform === "telegram" ? "session-mismatch" : "platform-mismatch",
+            expectedPlatform: "telegram",
+            expectedSessionId,
+            message: "Telegram message reference does not match the selected session",
+          }),
+        );
+      }
+      return Result.ok({
+        platform: "telegram",
+        channelId: ref.channelId,
+        messageId: ref.messageId,
+      });
+    },
+  },
+  toolTargets: {
+    helpFallbackPriority: 30,
+    inferRequestTarget: (requestId) => {
+      if (!requestId?.startsWith("telegram:")) return null;
+      const separator = requestId.lastIndexOf(":");
+      if (separator <= "telegram:".length) return null;
+      return {
+        sessionId: requestId.slice("telegram:".length, separator),
+        messageId: requestId.slice(separator + 1),
+      };
+    },
+    describeSessionIds: () => ({
+      sessionIdFormats: {
+        client: "telegram",
+        accepted: [{ format: "<chat_id>[:<thread_id>]", meaning: "Telegram chat or topic" }],
+        notes: [],
+      },
+    }),
+    resolveSession: async ({ selector, getConfig }) => {
+      const config = await getConfig();
+      const topicSeparator = selector.indexOf(":");
+      const chatId = topicSeparator < 0 ? selector : selector.slice(0, topicSeparator);
+      if (!config.surface.telegram.allowedChatIds.includes(chatId)) {
+        return Result.err(
+          new SurfaceToolTargetInvalid({
+            message: `Not allowed: Telegram sessionId '${selector}'`,
+          }),
+        );
+      }
+      return Result.ok({
+        sessionRef: { platform: "telegram", channelId: selector },
+        config,
+      });
+    },
+  },
+};
+
+function createTestAdapterResolver(
+  descriptors: Parameters<typeof SurfaceRuntimeRegistry.create>[0],
+) {
+  const created = SurfaceRuntimeRegistry.create(descriptors);
+  if (created.status === "error") throw created.error;
+  return created.value.adapterResolver();
+}
+
+const DEFAULT_GITHUB_TEST_ADAPTER = createDescriptorBoundSurfaceAdapter(
+  "github",
+  new GithubAdapter(),
+);
+
+type TestSurfaceParams = Omit<
+  ConstructorParameters<typeof ProductionSurface>[0],
+  "adapterResolver"
+> & {
+  readonly adapter: SurfaceAdapter;
+  readonly githubAdapter?: SurfaceAdapter;
+  readonly telegramAdapter?: SurfaceAdapter;
+};
+
+class Surface extends ProductionSurface {
+  constructor(params: TestSurfaceParams) {
+    const {
+      adapter: _adapter,
+      githubAdapter: _githubAdapter,
+      telegramAdapter: _telegramAdapter,
+      ...surfaceParams
+    } = params;
+    const descriptors: Array<Parameters<typeof SurfaceRuntimeRegistry.create>[0][number]> = [
+      { protocol: BUILTIN_SURFACE_PROTOCOLS.discord, adapter: params.adapter },
+      {
+        protocol: BUILTIN_SURFACE_PROTOCOLS.github,
+        adapter: params.githubAdapter ?? DEFAULT_GITHUB_TEST_ADAPTER,
+      },
+    ];
+    if (params.telegramAdapter) {
+      descriptors.push({ protocol: TEST_TELEGRAM_PROTOCOL, adapter: params.telegramAdapter });
+    }
+    super({
+      ...surfaceParams,
+      adapterResolver: createTestAdapterResolver(descriptors),
+    });
+  }
+}
+
+class FakeAdapter extends SurfaceAdapterTestBase {
   public sendCalls: Array<{
     sessionRef: SessionRef;
     content: ContentOpts;
@@ -48,7 +189,9 @@ class FakeAdapter implements SurfaceAdapter {
     private readonly messagesByChannelId: Record<string, SurfaceMessage[]>,
     private readonly guildIdByChannelId: Record<string, string> = {},
     private readonly participantsByChannelId: Record<string, SurfaceSessionParticipantsResult> = {},
-  ) {}
+  ) {
+    super();
+  }
 
   async fetchGuildIdForChannel(channelId: string): Promise<string | null> {
     return this.guildIdByChannelId[channelId] ?? null;
@@ -65,43 +208,45 @@ class FakeAdapter implements SurfaceAdapter {
     return { platform: "discord", userId: "bot", userName: "lilac" };
   }
 
-  async getCapabilities(): Promise<AdapterCapabilities> {
-    return {
-      platform: "discord",
-      send: true,
-      edit: true,
-      delete: true,
-      reactions: true,
-      readHistory: true,
-      threads: true,
-      markRead: true,
-    };
+  async listSessions() {
+    return Result.ok(this.sessions);
   }
 
-  async listSessions(): Promise<SurfaceSession[]> {
-    return this.sessions;
+  async startOutput() {
+    return Result.ok({
+      push: async () => Result.ok("visible" as const),
+      finish: async () => {
+        const ref = { platform: "discord" as const, channelId: "channel", messageId: "message" };
+        return Result.ok({ created: [ref], last: ref });
+      },
+      abort: async () => Result.ok(undefined),
+    });
   }
 
-  async startOutput(): Promise<any> {
-    throw new Error("not implemented");
+  override async startTyping() {
+    return Result.ok({ stop: async () => Result.ok(undefined) });
   }
 
-  async sendMsg(sessionRef: SessionRef, content: ContentOpts, opts?: SendOpts): Promise<MsgRef> {
+  async sendMsg(
+    sessionRef: SessionRef,
+    content: ContentOpts,
+    opts?: SendOpts,
+  ): Promise<SurfaceOperationResult<MsgRef>> {
     this.sendCalls.push({ sessionRef, content, opts });
-    return {
+    return Result.ok({
       platform: "discord",
       channelId: sessionRef.channelId,
       messageId: "sent",
-    };
+    } as const);
   }
 
-  async readMsg(msgRef: MsgRef): Promise<SurfaceMessage | null> {
+  async readMsg(msgRef: MsgRef) {
     this.readCalls.push(msgRef);
     const msgs = this.messagesByChannelId[msgRef.channelId] ?? [];
-    return msgs.find((m) => m.ref.messageId === msgRef.messageId) ?? null;
+    return Result.ok(msgs.find((m) => m.ref.messageId === msgRef.messageId) ?? null);
   }
 
-  async listMsg(sessionRef: SessionRef, opts?: LimitOpts): Promise<SurfaceMessage[]> {
+  async listMsg(sessionRef: SessionRef, opts?: LimitOpts) {
     this.listCalls.push({ sessionRef, opts });
 
     const msgs = this.messagesByChannelId[sessionRef.channelId] ?? [];
@@ -111,35 +256,45 @@ class FakeAdapter implements SurfaceAdapter {
     void opts?.beforeMessageId;
     void opts?.afterMessageId;
 
-    return msgs.slice(0, limit);
+    return Result.ok(msgs.slice(0, limit));
   }
 
-  async editMsg(_msgRef: MsgRef, _content: ContentOpts): Promise<void> {
-    throw new Error("not implemented");
+  async editMsg(_msgRef: MsgRef, _content: ContentOpts): Promise<SurfaceOperationResult<void>> {
+    return Result.ok(undefined);
   }
 
-  async deleteMsg(_msgRef: MsgRef): Promise<void> {
-    throw new Error("not implemented");
+  async deleteMsg(_msgRef: MsgRef): Promise<SurfaceOperationResult<void>> {
+    return Result.ok(undefined);
   }
 
-  async getReplyContext(): Promise<SurfaceMessage[]> {
-    throw new Error("not implemented");
+  async getReplyContext() {
+    return Result.ok([]);
   }
 
-  async addReaction(msgRef: MsgRef, reaction: string): Promise<void> {
+  override async planReplyChain() {
+    return Result.ok([]);
+  }
+
+  override async planMergeBlockEndingAt() {
+    return Result.ok([]);
+  }
+
+  async addReaction(msgRef: MsgRef, reaction: string) {
     this.addReactionCalls.push({ msgRef, reaction });
+    return Result.ok(undefined);
   }
 
-  async removeReaction(msgRef: MsgRef, reaction: string): Promise<void> {
+  async removeReaction(msgRef: MsgRef, reaction: string) {
     this.removeReactionCalls.push({ msgRef, reaction });
+    return Result.ok(undefined);
   }
 
-  async listReactions(_msgRef: MsgRef): Promise<string[]> {
-    return ["👍"];
+  async listReactions(_msgRef: MsgRef) {
+    return Result.ok(["👍"]);
   }
 
-  async listReactionDetails(_msgRef: MsgRef): Promise<SurfaceReactionDetail[]> {
-    return [
+  override async listReactionDetails(_msgRef: MsgRef) {
+    return Result.ok([
       {
         emoji: "👍",
         count: 2,
@@ -148,13 +303,10 @@ class FakeAdapter implements SurfaceAdapter {
           { userId: "u2", userName: "bob" },
         ],
       },
-    ];
+    ]);
   }
 
-  async listSessionParticipants(
-    sessionRef: SessionRef,
-    opts?: { limit?: number },
-  ): Promise<SurfaceSessionParticipantsResult> {
+  override async listSessionParticipants(sessionRef: SessionRef, opts?: { limit?: number }) {
     const row = this.participantsByChannelId[sessionRef.channelId];
     const base: SurfaceSessionParticipantsResult = row ?? {
       source: "guild_members",
@@ -163,22 +315,18 @@ class FakeAdapter implements SurfaceAdapter {
 
     const limit = Math.min(2000, Math.max(1, Math.floor(opts?.limit ?? 200)));
 
-    return {
+    return Result.ok({
       source: base.source,
       participants: base.participants.slice(0, limit),
-    };
+    });
   }
 
-  async subscribe(): Promise<any> {
-    throw new Error("not implemented");
+  async getUnRead() {
+    return Result.ok([]);
   }
 
-  async getUnRead(): Promise<SurfaceMessage[]> {
-    throw new Error("not implemented");
-  }
-
-  async markRead(): Promise<void> {
-    throw new Error("not implemented");
+  async markRead() {
+    return Result.ok(undefined);
   }
 }
 
@@ -190,25 +338,30 @@ class FakeTelegramToolAdapter extends FakeAdapter {
     return { platform: "telegram", userId: "bot", userName: "lilac" };
   }
 
-  override async getCapabilities(): Promise<AdapterCapabilities> {
-    return { ...(await super.getCapabilities()), platform: "telegram" };
-  }
-
   override async sendMsg(
     sessionRef: SessionRef,
     content: ContentOpts,
     opts?: SendOpts,
-  ): Promise<MsgRef> {
+  ): Promise<SurfaceOperationResult<MsgRef>> {
     this.sendCalls.push({ sessionRef, content, opts });
-    return { platform: "telegram", channelId: sessionRef.channelId, messageId: "sent" };
+    return Result.ok({
+      platform: "telegram",
+      channelId: sessionRef.channelId,
+      messageId: "sent",
+    });
   }
 
-  override async editMsg(msgRef: MsgRef, content: ContentOpts): Promise<void> {
+  override async editMsg(
+    msgRef: MsgRef,
+    content: ContentOpts,
+  ): Promise<SurfaceOperationResult<void>> {
     this.editCalls.push({ msgRef, content });
+    return Result.ok(undefined);
   }
 
-  override async deleteMsg(msgRef: MsgRef): Promise<void> {
+  override async deleteMsg(msgRef: MsgRef): Promise<SurfaceOperationResult<void>> {
     this.deleteCalls.push(msgRef);
+    return Result.ok(undefined);
   }
 }
 
@@ -246,16 +399,16 @@ describe("tool-server surface", () => {
     );
     const tool = new Surface({
       adapter: discordAdapter,
-      adapters: new Map([
-        ["discord", discordAdapter],
-        ["telegram", telegramAdapter],
-      ]),
+      telegramAdapter,
       config: cfg,
     });
     const ctx = {
       requestClient: "telegram",
       sessionId: "1001",
       requestId: "telegram:1001:42",
+      requestInitiator: { platform: "telegram" as const, userId: "7" },
+      requestInitiatorSessionId: "1001",
+      safetyMode: "restricted" as const,
     } as RequestContext;
 
     expect(await tool.call("surface.sessions.list", {}, { context: ctx })).toEqual([
@@ -311,15 +464,15 @@ describe("tool-server surface", () => {
     const telegramAdapter = new FakeTelegramToolAdapter([], {});
     const tool = new Surface({
       adapter: discordAdapter,
-      adapters: new Map([
-        ["discord", discordAdapter],
-        ["telegram", telegramAdapter],
-      ]),
+      telegramAdapter,
       config: cfg,
     });
     const ctx = {
       requestClient: "telegram",
       requestId: "telegram:-100123:7:42",
+      requestInitiator: { platform: "telegram" as const, userId: "7" },
+      requestInitiatorSessionId: "-100123:7",
+      safetyMode: "restricted" as const,
     } as RequestContext;
 
     await tool.call("surface.reactions.add", { reaction: "👀" }, { context: ctx });
@@ -334,7 +487,7 @@ describe("tool-server surface", () => {
         { sessionId: "-100999", text: "denied" },
         { context: ctx },
       ),
-    ).rejects.toThrow("Not allowed: Telegram sessionId '-100999'");
+    ).rejects.toThrow("outside request origin '-100123:7'");
     await expect(
       tool.call("surface.messages.send", { client: "discord", text: "cross" }, { context: ctx }),
     ).rejects.toThrow("Client mismatch");
@@ -359,7 +512,7 @@ describe("tool-server surface", () => {
 
     await expect(
       tool.call("surface.messages.send", { text: "unavailable" }, { context: ctx }),
-    ).rejects.toThrow("Telegram adapter is unavailable");
+    ).rejects.toThrow("has no registered executable adapter");
   });
 
   it("uses the server-issued Telegram origin for workflow surface defaults and checks", async () => {
@@ -379,17 +532,15 @@ describe("tool-server surface", () => {
     const telegramAdapter = new FakeTelegramToolAdapter([], {});
     const tool = new Surface({
       adapter,
-      adapters: new Map([
-        ["discord", adapter],
-        ["telegram", telegramAdapter],
-      ]),
+      telegramAdapter,
       config: cfg,
     });
     const context = {
       requestClient: "unknown",
       sessionId: "workflow:run-1:operation-1",
-      originSessionId: "-100123:7",
-      authenticatedPrincipal: { platform: "telegram" as const, userId: "user-7" },
+      requestInitiator: { platform: "telegram" as const, userId: "user-7" },
+      requestInitiatorSessionId: "-100123:7",
+      safetyMode: "restricted" as const,
     } satisfies RequestContext;
 
     await tool.call("surface.messages.send", { text: "origin-default" }, { context });
@@ -403,7 +554,7 @@ describe("tool-server surface", () => {
         { sessionId: "-100123:8", text: "cross-topic" },
         { context },
       ),
-    ).rejects.toThrow("Not allowed: Telegram sessionId '-100123:8'");
+    ).rejects.toThrow("outside request origin '-100123:7'");
     await expect(
       tool.call(
         "surface.messages.send",
@@ -596,6 +747,193 @@ describe("tool-server surface", () => {
 
     expect(out.context.sessionId).toBe("c1");
     expect(out.context.alias).toBe("ops");
+  });
+
+  it("uses a registered request context as authoritative and rejects an explicit conflict", async () => {
+    const tool = new Surface({ adapter: new FakeAdapter([], {}), config: testConfig({}) });
+
+    await expect(
+      tool.call(
+        "surface.messages.read",
+        { client: "discord", sessionId: "channel-1", messageId: "message-1" },
+        { context: { requestClient: "github" } },
+      ),
+    ).rejects.toThrow(
+      "Client mismatch: context requestClient is 'github' but input client is 'discord'",
+    );
+  });
+
+  it("distinguishes unregistered wire clients from malformed context values", async () => {
+    const tool = new Surface({ adapter: new FakeAdapter([], {}), config: testConfig({}) });
+
+    await expect(tool.call("surface.sessions.list", { client: "slack" })).rejects.toThrow(
+      "client 'slack' is recognized but has no registered executable adapter",
+    );
+    await expect(
+      tool.call("surface.sessions.list", {}, { context: { requestClient: "desktop" } }),
+    ).rejects.toThrow("context requestClient 'desktop' is not a valid surface wire value");
+  });
+
+  it("does not route an unregistered wire client target operation through Discord", async () => {
+    const adapter = new FakeAdapter([], {});
+    const tool = new Surface({ adapter, config: testConfig({}) });
+
+    await expect(
+      tool.call("surface.messages.list", { client: "slack", sessionId: "channel-1" }),
+    ).rejects.toThrow("client 'slack' is recognized but has no registered executable adapter");
+    expect(adapter.listCalls).toEqual([]);
+  });
+
+  it("lists only registered executable platforms in help without operation support metadata", async () => {
+    const adapter = new FakeAdapter([], {});
+    const tool = new ProductionSurface({
+      adapterResolver: createTestAdapterResolver([
+        { protocol: BUILTIN_SURFACE_PROTOCOLS.discord, adapter },
+      ]),
+      config: testConfig({}),
+    });
+
+    const out = (await tool.call("surface.help", {})) as {
+      supportedClients: readonly string[];
+      sessionIdFormats: { client?: string };
+    };
+    expect(out.supportedClients).toEqual(["discord"]);
+    expect(out.sessionIdFormats.client).toBe("discord");
+    expect(JSON.stringify(out)).not.toContain("not implemented");
+    expect(JSON.stringify(out)).not.toContain("supportMatrix");
+  });
+
+  it("shows GitHub session syntax for a GitHub-only registry", async () => {
+    const tool = new ProductionSurface({
+      adapterResolver: createTestAdapterResolver([
+        { protocol: BUILTIN_SURFACE_PROTOCOLS.github, adapter: DEFAULT_GITHUB_TEST_ADAPTER },
+      ]),
+      config: testConfig({}),
+    });
+
+    const out = (await tool.call("surface.help", {})) as {
+      supportedClients: readonly string[];
+      sessionIdFormats: { client: string; accepted: Array<{ format: string; meaning: string }> };
+    };
+    expect(out.supportedClients).toEqual(["github"]);
+    expect(out.sessionIdFormats.client).toBe("github");
+    expect(out.sessionIdFormats.accepted).toContainEqual({
+      format: "OWNER/REPO#123",
+      meaning: "GitHub issue/PR thread",
+    });
+  });
+
+  it("preserves the normal no-context Discord help fixture with both adapters registered", async () => {
+    const tool = new Surface({ adapter: new FakeAdapter([], {}), config: testConfig({}) });
+
+    const out = (await tool.call("surface.help", {})) as {
+      supportedClients: readonly string[];
+      sessionIdFormats: {
+        client: string;
+        accepted: Array<{ format: string; meaning: string }>;
+        notes: string[];
+      };
+    };
+    expect(out.supportedClients).toEqual(["discord", "github"]);
+    expect(out.sessionIdFormats).toEqual({
+      client: "discord",
+      accepted: [
+        { format: "123456789012345678", meaning: "Raw Discord channel id" },
+        { format: "<#123456789012345678>", meaning: "Discord channel mention" },
+        {
+          format: "dev-chat",
+          meaning:
+            "Configured session alias (cfg.entity.sessions.discord maps alias -> channelId or { discord, comment })",
+        },
+        {
+          format: "#dev-chat",
+          meaning: "Configured session alias with optional leading # prefix",
+        },
+      ],
+      notes: [
+        "If the request has no session context, you must pass --session-id (or set LILAC_SESSION_ID). Some requests also allow inferring sessionId/messageId from requestId when it is 'discord:<sessionId>:<messageId>'.",
+      ],
+    });
+  });
+
+  it("uses GitHub session syntax for GitHub context with both adapters registered", async () => {
+    const tool = new Surface({ adapter: new FakeAdapter([], {}), config: testConfig({}) });
+
+    const out = (await tool.call("surface.help", {}, { context: { requestClient: "github" } })) as {
+      supportedClients: readonly string[];
+      sessionIdFormats: { client: string; accepted: Array<{ format: string; meaning: string }> };
+    };
+
+    expect(out.supportedClients).toEqual(["discord", "github"]);
+    expect(out.sessionIdFormats.client).toBe("github");
+    expect(out.sessionIdFormats.accepted).toContainEqual({
+      format: "OWNER/REPO#123",
+      meaning: "GitHub issue/PR thread",
+    });
+  });
+
+  it("uses the registered Discord default for unregistered context without inventing support", async () => {
+    const both = new Surface({ adapter: new FakeAdapter([], {}), config: testConfig({}) });
+    const unregistered = (await both.call(
+      "surface.help",
+      {},
+      { context: { requestClient: "slack" } },
+    )) as { supportedClients: readonly string[]; sessionIdFormats: { client: string } };
+    expect(unregistered.supportedClients).toEqual(["discord", "github"]);
+    expect(unregistered.sessionIdFormats.client).toBe("discord");
+  });
+
+  it("returns neutral help syntax for an empty executable registry", async () => {
+    const empty = new ProductionSurface({
+      adapterResolver: createTestAdapterResolver([]),
+      config: testConfig({}),
+    });
+    const emptyOutput = (await empty.call("surface.help", {})) as {
+      supportedClients: readonly string[];
+      sessionIdFormats: unknown;
+    };
+    expect(emptyOutput.supportedClients).toEqual([]);
+    expect(emptyOutput.sessionIdFormats).toBeNull();
+
+    const unregistered = (await empty.call(
+      "surface.help",
+      {},
+      { context: { requestClient: "slack" } },
+    )) as { sessionIdFormats: unknown };
+    expect(unregistered.sessionIdFormats).toBeNull();
+  });
+
+  it("does not import or construct protocol operation clients in the generic surface tool", async () => {
+    const source = await fs.readFile(
+      join(import.meta.dir, "../src/tool-server/tools/surface.ts"),
+      "utf8",
+    );
+
+    expect(source).not.toMatch(/github-(?:api|auth|app-token|rest)/u);
+    expect(source).not.toContain("GithubAdapter");
+    expect(source).not.toContain("DiscordAdapter");
+    expect(source).not.toContain("githubAdapter:");
+  });
+
+  it("keeps generic target and help routing free of explicit platform selection", async () => {
+    const source = await fs.readFile(
+      join(import.meta.dir, "../src/tool-server/tools/surface.ts"),
+      "utf8",
+    );
+    const defaultSection = source.slice(
+      source.indexOf("function withDefaultSessionId"),
+      source.indexOf("function mustPresentString"),
+    );
+    const targetSection = source.slice(
+      source.indexOf("private async callHelp"),
+      source.indexOf("private async resolveMessageTarget"),
+    );
+    const routingSection = `${defaultSection}\n${targetSection}`;
+
+    expect(routingSection).not.toMatch(/platform === ["'](?:discord|github)["']/u);
+    expect(routingSection).not.toMatch(/switch \([^)]*platform/u);
+    expect(routingSection).not.toContain("inferDiscordOrigin");
+    expect(routingSection).not.toContain("inferGithubOrigin");
   });
 
   it("lists session participants", async () => {
@@ -868,6 +1206,68 @@ describe("tool-server surface", () => {
     expect(adapter.listCalls.length).toBe(1);
 
     searchStore.close();
+  });
+
+  it("degrades ordinary search enrichment failures but preserves guarded produced-ref Panic", async () => {
+    const channelId = "c1";
+    const message: SurfaceMessage = {
+      ref: { platform: "discord", channelId, messageId: "m1" },
+      session: { platform: "discord", channelId },
+      userId: "user",
+      text: "deploy result",
+      ts: 1,
+    };
+    const adapter: SurfaceAdapter = new FakeAdapter([], { [channelId]: [message] });
+    adapter.readMsg = async () =>
+      Result.err(
+        new SurfaceUnavailable({
+          platform: "discord",
+          operation: "read-message",
+          message: "attachment enrichment unavailable",
+        }),
+      );
+    const searchStore = new DiscordSearchStore(":memory:");
+    const search = new DiscordSearchService({ adapter, store: searchStore });
+    const tool = new Surface({
+      adapter,
+      discordSearch: search,
+      config: testConfig({
+        surface: {
+          discord: {
+            tokenEnv: "DISCORD_TOKEN",
+            allowedChannelIds: [channelId],
+            allowedGuildIds: [],
+            botName: "lilac",
+          },
+        },
+        entity: { sessions: { discord: { ops: channelId } } },
+      }),
+    });
+    try {
+      const ordinary = (await tool.call("surface.messages.search", {
+        client: "discord",
+        sessionId: "#ops",
+        query: "deploy",
+      })) as { hits: Array<{ hasAttachments?: boolean }> };
+      expect(ordinary.hits[0]?.hasAttachments).toBe(false);
+
+      adapter.readMsg = async () =>
+        Result.ok({
+          ...message,
+          ref: { platform: "github", channelId, messageId: "m1" },
+        });
+      const [settled] = await Promise.allSettled([
+        tool.call("surface.messages.search", {
+          client: "discord",
+          sessionId: "#ops",
+          query: "deploy",
+        }),
+      ]);
+      expect(settled?.status).toBe("rejected");
+      if (settled?.status === "rejected") expect(Panic.is(settled.reason)).toBe(true);
+    } finally {
+      searchStore.close();
+    }
   });
 
   it("defaults sessionId and messageId from discord requestId", async () => {
@@ -2037,6 +2437,61 @@ describe("tool-server surface", () => {
         client: "discord",
       }),
     ).rejects.toThrow("paths");
+    expect(adapter.sendCalls.length).toBe(1);
+  });
+
+  it.each(["paths", "filenames", "mimeTypes"] as const)(
+    "keeps the callable schema max of 10 for %s before adapter resolution",
+    async (field) => {
+      let resolveCalls = 0;
+      const tool = new ProductionSurface({
+        adapterResolver: {
+          registeredPlatforms: () => [],
+          resolve: () => {
+            resolveCalls += 1;
+            return null;
+          },
+        },
+        config: testConfig({}),
+      });
+
+      await expect(
+        tool.call("surface.messages.send", {
+          client: "github",
+          sessionId: "octo/repo#12",
+          text: "oversized",
+          [field]: Array.from({ length: 11 }, (_, index) => `${field}-${index}`),
+        }),
+      ).rejects.toThrow(field);
+      expect(resolveCalls).toBe(0);
+    },
+  );
+
+  it("keeps Discord attachment path validation before sending", async () => {
+    const channelId = "123456789012345678";
+    const cfg = testConfig({
+      surface: {
+        discord: {
+          tokenEnv: "DISCORD_TOKEN",
+          allowedChannelIds: [channelId],
+          allowedGuildIds: [],
+          botName: "lilac",
+        },
+      },
+    });
+    const adapter = new FakeAdapter([], {});
+    const tool = new Surface({ adapter, config: cfg });
+    const missingPath = join(tmpdir(), `missing-surface-attachment-${crypto.randomUUID()}.txt`);
+
+    await expect(
+      tool.call("surface.messages.send", {
+        client: "discord",
+        sessionId: channelId,
+        text: "attachment",
+        paths: missingPath,
+      }),
+    ).rejects.toThrow("ENOENT");
+    expect(adapter.sendCalls).toEqual([]);
   });
 
   it("forwards silent=true for send", async () => {
@@ -2082,12 +2537,14 @@ describe("tool-server surface", () => {
 
     const linked: Array<{ requestId: string; created: readonly MsgRef[]; last: MsgRef }> = [];
     const transcriptStore: TranscriptStore = {
-      saveRequestTranscript() {},
+      saveRequestTranscript() {
+        return Result.ok(undefined);
+      },
       linkSurfaceMessagesToRequest(input) {
         linked.push(input);
       },
       getTranscriptBySurfaceMessage() {
-        return null;
+        return Result.ok(null);
       },
       close() {},
     };
@@ -2136,12 +2593,14 @@ describe("tool-server surface", () => {
 
     const linked: Array<{ requestId: string; created: readonly MsgRef[]; last: MsgRef }> = [];
     const transcriptStore: TranscriptStore = {
-      saveRequestTranscript() {},
+      saveRequestTranscript() {
+        return Result.ok(undefined);
+      },
       linkSurfaceMessagesToRequest(input) {
         linked.push(input);
       },
       getTranscriptBySurfaceMessage() {
-        return null;
+        return Result.ok(null);
       },
       close() {},
     };
@@ -2382,6 +2841,112 @@ describe("tool-server surface", () => {
     );
   });
 
+  it.each([
+    ["ordinary read rejection", "rejection"],
+    ["expected read Result", "result"],
+  ] as const)("falls back to persisted recent-write text after an %s", async (_label, mode) => {
+    const adapter: SurfaceAdapter = new FakeAdapter([], {});
+    adapter.readMsg = async () => {
+      if (mode === "rejection") throw new Error("message provider unavailable");
+      return Result.err(
+        new SurfaceUnavailable({
+          platform: "discord",
+          operation: "read-message",
+          message: "message provider unavailable",
+        }),
+      );
+    };
+    const tmp = await fs.mkdtemp(join(tmpdir(), "lilac-surface-fallback-"));
+    const transcriptStore = new SqliteTranscriptStore(join(tmp, "transcripts.sqlite"));
+    try {
+      transcriptStore.saveRequestTranscript({
+        requestId: "heartbeat:fallback",
+        sessionId: "__heartbeat__",
+        requestClient: "unknown",
+        messages: [],
+        finalText: "persisted fallback",
+      });
+      transcriptStore.linkSurfaceMessagesToRequest({
+        requestId: "heartbeat:fallback",
+        created: [{ platform: "discord", channelId: "c1", messageId: "m1" }],
+        last: { platform: "discord", channelId: "c1", messageId: "m1" },
+      });
+      const tool = new Surface({
+        adapter,
+        transcriptStore,
+        config: testConfig({
+          surface: {
+            discord: {
+              tokenEnv: "DISCORD_TOKEN",
+              allowedChannelIds: ["c1"],
+              allowedGuildIds: [],
+              botName: "lilac",
+            },
+          },
+        }),
+      });
+
+      const output = (await tool.call("surface.activities.recentAgentWrites", {})) as Array<{
+        preview: string;
+      }>;
+      expect(output[0]?.preview).toBe("persisted fallback");
+    } finally {
+      transcriptStore.close();
+      await fs.rm(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("preserves a guarded produced-ref Panic through recent-write fallback", async () => {
+    const adapter = new FakeAdapter([], {});
+    adapter.readMsg = async () =>
+      Result.ok({
+        ref: { platform: "github", channelId: "c1", messageId: "m1" },
+        session: { platform: "discord", channelId: "c1" },
+        userId: "bot",
+        text: "invalid",
+        ts: 1,
+      });
+    const tmp = await fs.mkdtemp(join(tmpdir(), "lilac-surface-panic-"));
+    const transcriptStore = new SqliteTranscriptStore(join(tmp, "transcripts.sqlite"));
+    try {
+      transcriptStore.saveRequestTranscript({
+        requestId: "heartbeat:panic",
+        sessionId: "__heartbeat__",
+        requestClient: "unknown",
+        messages: [],
+        finalText: "must not hide panic",
+      });
+      transcriptStore.linkSurfaceMessagesToRequest({
+        requestId: "heartbeat:panic",
+        created: [{ platform: "discord", channelId: "c1", messageId: "m1" }],
+        last: { platform: "discord", channelId: "c1", messageId: "m1" },
+      });
+      const tool = new Surface({
+        adapter,
+        transcriptStore,
+        config: testConfig({
+          surface: {
+            discord: {
+              tokenEnv: "DISCORD_TOKEN",
+              allowedChannelIds: ["c1"],
+              allowedGuildIds: [],
+              botName: "lilac",
+            },
+          },
+        }),
+      });
+
+      const [settled] = await Promise.allSettled([
+        tool.call("surface.activities.recentAgentWrites", {}),
+      ]);
+      expect(settled?.status).toBe("rejected");
+      if (settled?.status === "rejected") expect(Panic.is(settled.reason)).toBe(true);
+    } finally {
+      transcriptStore.close();
+      await fs.rm(tmp, { recursive: true, force: true });
+    }
+  });
+
   it("allows guild allowlist when channel is not cached", async () => {
     const cfg = testConfig({
       surface: {
@@ -2411,6 +2976,36 @@ describe("tool-server surface", () => {
     if (ref.platform === "discord") {
       expect(ref.guildId).toBe("g1");
     }
+  });
+
+  it("preserves Panic from guild resolution instead of degrading it to a cache miss", async () => {
+    const cfg = testConfig({
+      surface: {
+        discord: {
+          tokenEnv: "DISCORD_TOKEN",
+          allowedChannelIds: [],
+          allowedGuildIds: ["g1"],
+          botName: "lilac",
+        },
+      },
+      entity: { sessions: { discord: { ops: "c1" } } },
+    });
+    const panic = new Panic({ message: "guild resolver invariant" });
+    const rawAdapter = new FakeAdapter([], {});
+    rawAdapter.fetchGuildIdForChannel = async () => {
+      throw panic;
+    };
+    const adapter = createDescriptorBoundSurfaceAdapter("discord", rawAdapter);
+    const tool = new Surface({ adapter, config: cfg });
+
+    await expect(
+      tool.call("surface.messages.send", {
+        sessionId: "ops",
+        text: "hi",
+        client: "discord",
+      }),
+    ).rejects.toBe(panic);
+    expect(rawAdapter.sendCalls).toEqual([]);
   });
 
   it("adds reaction", async () => {
@@ -2446,7 +3041,7 @@ describe("tool-server surface", () => {
     expect(adapter.addReactionCalls[0]!.reaction).toBe("👍");
   });
 
-  it("errors for github sessions.list and points to gh", async () => {
+  it("returns the GitHub adapter's stable unsupported sessions.list output", async () => {
     const cfg = testConfig({
       surface: {
         discord: {
@@ -2461,10 +3056,12 @@ describe("tool-server surface", () => {
     const adapter = new FakeAdapter([], {});
     const tool = new Surface({ adapter, config: cfg });
 
-    await expect(tool.call("surface.sessions.list", { client: "github" })).rejects.toThrow("gh");
+    await expect(tool.call("surface.sessions.list", { client: "github" })).rejects.toThrow(
+      "GitHub session discovery is not supported; use GitHub issue/PR discovery",
+    );
   });
 
-  it("errors for github sessions.listParticipants", async () => {
+  it("returns the GitHub adapter's stable unsupported participant output", async () => {
     const cfg = testConfig({
       surface: {
         discord: {
@@ -2484,7 +3081,49 @@ describe("tool-server surface", () => {
         client: "github",
         sessionId: "OWNER/REPO#1",
       }),
-    ).rejects.toThrow("Discord-only");
+    ).rejects.toThrow("GitHub session participant listing is not supported");
+  });
+
+  it("returns GitHub attachment unsupported before reading a nonexistent path", async () => {
+    const tool = new Surface({ adapter: new FakeAdapter([], {}), config: testConfig({}) });
+    const missingPath = join(tmpdir(), `missing-github-attachment-${crypto.randomUUID()}.txt`);
+
+    await expect(
+      tool.call("surface.messages.send", {
+        client: "github",
+        sessionId: "octo/repo#12",
+        text: "attachment",
+        paths: missingPath,
+      }),
+    ).rejects.toThrow("GitHub message attachments are not supported");
+  });
+
+  it("keeps oversized GitHub paths as a callable schema rejection", async () => {
+    const tool = new Surface({ adapter: new FakeAdapter([], {}), config: testConfig({}) });
+
+    await expect(
+      tool.call("surface.messages.send", {
+        client: "github",
+        sessionId: "octo/repo#12",
+        text: "attachments",
+        paths: Array.from({ length: 11 }, (_, index) => `/missing-${index}.txt`),
+      }),
+    ).rejects.toThrow("paths");
+  });
+
+  it("preserves GitHub reply precedence over an invalid attachment path", async () => {
+    const tool = new Surface({ adapter: new FakeAdapter([], {}), config: testConfig({}) });
+    const missingPath = join(tmpdir(), `missing-github-reply-${crypto.randomUUID()}.txt`);
+
+    await expect(
+      tool.call("surface.messages.send", {
+        client: "github",
+        sessionId: "octo/repo#12",
+        text: "reply",
+        replyToMessageId: "345",
+        paths: missingPath,
+      }),
+    ).rejects.toThrow("GitHub message replies are not supported by sendMsg");
   });
 
   it("marks github surface send comments as agent-authored", async () => {
@@ -2524,7 +3163,11 @@ describe("tool-server surface", () => {
     };
 
     const adapter = new FakeAdapter([], {});
-    const tool = new Surface({ adapter, config: cfg, githubApi });
+    const tool = new Surface({
+      adapter,
+      config: cfg,
+      githubAdapter: createGithubTestAdapter(githubApi),
+    });
 
     const res = (await tool.call("surface.messages.send", {
       client: "github",
@@ -2541,6 +3184,130 @@ describe("tool-server surface", () => {
         repo: "repo",
         issueNumber: 12,
         body: `${GITHUB_AGENT_COMMENT_MARKER}\nhello from lilac`,
+      },
+    ]);
+  });
+
+  it("routes GitHub list, edit, and delete through the selected adapter", async () => {
+    const listed: Array<Parameters<GithubSurfaceApi["listIssueComments"]>[0]> = [];
+    const edited: Array<Parameters<GithubSurfaceApi["editIssueComment"]>[0]> = [];
+    const deleted: Array<Parameters<GithubSurfaceApi["deleteIssueComment"]>[0]> = [];
+    const githubApi: GithubSurfaceApi = {
+      getIssue: async () => {
+        throw new Error("not implemented");
+      },
+      listIssueComments: async (input) => {
+        listed.push(input);
+        return [
+          {
+            id: 345,
+            body: "existing comment",
+            user: { login: "alice", id: 1 },
+            created_at: "2020-01-01T00:00:00Z",
+          },
+        ];
+      },
+      createIssueComment: async () => ({ id: 0 }),
+      getIssueComment: async () => ({ id: 345 }),
+      editIssueComment: async (input) => {
+        edited.push(input);
+      },
+      deleteIssueComment: async (input) => {
+        deleted.push(input);
+      },
+      createIssueReaction: async () => ({ id: 0 }),
+      createIssueCommentReaction: async () => ({ id: 0 }),
+      listIssueReactions: async () => [],
+      listIssueCommentReactions: async () => [],
+      deleteIssueReactionById: async () => undefined,
+      deleteIssueCommentReactionById: async () => undefined,
+      getGithubAppSlugOrNull: async () => null,
+    };
+    const tool = new Surface({
+      adapter: new FakeAdapter([], {}),
+      githubAdapter: createGithubTestAdapter(githubApi),
+      config: testConfig({}),
+    });
+
+    const listOutput = (await tool.call("surface.messages.list", {
+      client: "github",
+      sessionId: "octo/repo#12",
+      limit: 5,
+    })) as { messages: Array<{ messageId: string; richText: string }> };
+    expect(listOutput.messages).toEqual([
+      expect.objectContaining({ messageId: "345", richText: "existing comment" }),
+    ]);
+
+    expect(
+      await tool.call("surface.messages.edit", {
+        client: "github",
+        sessionId: "octo/repo#12",
+        messageId: "345",
+        text: "updated comment",
+      }),
+    ).toEqual({ ok: true });
+    expect(
+      await tool.call("surface.messages.delete", {
+        client: "github",
+        sessionId: "octo/repo#12",
+        messageId: "345",
+      }),
+    ).toEqual({ ok: true });
+
+    expect(listed).toEqual([
+      { owner: "octo", repo: "repo", number: 12, limit: 5, page: undefined },
+    ]);
+    expect(edited).toEqual([
+      { owner: "octo", repo: "repo", commentId: 345, body: "updated comment" },
+    ]);
+    expect(deleted).toEqual([{ owner: "octo", repo: "repo", commentId: 345 }]);
+  });
+
+  it("passes a non-empty arbitrary GitHub session selector to the GitHub adapter unchanged", async () => {
+    const githubAdapter = new FakeAdapter([], {});
+    const tool = new Surface({
+      adapter: new FakeAdapter([], {}),
+      githubAdapter,
+      config: testConfig({}),
+    });
+
+    await tool.call("surface.messages.list", {
+      client: "github",
+      sessionId: "arbitrary selector",
+    });
+
+    expect(githubAdapter.listCalls).toEqual([
+      {
+        sessionRef: { platform: "github", channelId: "arbitrary selector" },
+        opts: { limit: 50, beforeMessageId: undefined, afterMessageId: undefined },
+      },
+    ]);
+  });
+
+  it("defaults selected GitHub targets from a Discord-form requestId", async () => {
+    const githubAdapter = new FakeAdapter([], {});
+    const tool = new Surface({
+      adapter: new FakeAdapter([], {}),
+      githubAdapter,
+      config: testConfig({}),
+    });
+
+    await tool.call(
+      "surface.messages.read",
+      { client: "github" },
+      {
+        context: {
+          requestClient: "github",
+          requestId: "discord:discord-channel:discord-message",
+        },
+      },
+    );
+
+    expect(githubAdapter.readCalls).toEqual([
+      {
+        platform: "github",
+        channelId: "discord-channel",
+        messageId: "discord-message",
       },
     ]);
   });
@@ -2586,7 +3353,11 @@ describe("tool-server surface", () => {
     };
 
     const adapter = new FakeAdapter([], {});
-    const tool = new Surface({ adapter, config: cfg, githubApi });
+    const tool = new Surface({
+      adapter,
+      config: cfg,
+      githubAdapter: createGithubTestAdapter(githubApi),
+    });
     const ctx: RequestContext = {
       requestId: "github:octo/repo#12:345",
       requestClient: "github",
@@ -2641,7 +3412,11 @@ describe("tool-server surface", () => {
     };
 
     const adapter = new FakeAdapter([], {});
-    const tool = new Surface({ adapter, config: cfg, githubApi });
+    const tool = new Surface({
+      adapter,
+      config: cfg,
+      githubAdapter: createGithubTestAdapter(githubApi),
+    });
     const ctx: RequestContext = {
       requestId: "github:octo/repo#12:12:deadbeef",
       requestClient: "github",
@@ -2693,7 +3468,11 @@ describe("tool-server surface", () => {
     };
 
     const adapter = new FakeAdapter([], {});
-    const tool = new Surface({ adapter, config: cfg, githubApi });
+    const tool = new Surface({
+      adapter,
+      config: cfg,
+      githubAdapter: createGithubTestAdapter(githubApi),
+    });
 
     const res = await tool.call("surface.reactions.add", {
       client: "github",
@@ -2750,7 +3529,11 @@ describe("tool-server surface", () => {
     };
 
     const adapter = new FakeAdapter([], {});
-    const tool = new Surface({ adapter, config: cfg, githubApi });
+    const tool = new Surface({
+      adapter,
+      config: cfg,
+      githubAdapter: createGithubTestAdapter(githubApi),
+    });
 
     const res = await tool.call("surface.reactions.remove", {
       client: "github",
@@ -2802,7 +3585,11 @@ describe("tool-server surface", () => {
     };
 
     const adapter = new FakeAdapter([], {});
-    const tool = new Surface({ adapter, config: cfg, githubApi });
+    const tool = new Surface({
+      adapter,
+      config: cfg,
+      githubAdapter: createGithubTestAdapter(githubApi),
+    });
 
     const res = await tool.call("surface.reactions.remove", {
       client: "github",
@@ -2855,7 +3642,11 @@ describe("tool-server surface", () => {
     };
 
     const adapter = new FakeAdapter([], {});
-    const tool = new Surface({ adapter, config: cfg, githubApi });
+    const tool = new Surface({
+      adapter,
+      config: cfg,
+      githubAdapter: createGithubTestAdapter(githubApi),
+    });
 
     await expect(
       tool.call("surface.reactions.remove", {

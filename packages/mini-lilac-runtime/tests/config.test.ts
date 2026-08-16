@@ -1,11 +1,73 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, spyOn } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
-import { loadRuntimeConfig, runtimeConfigSchema } from "../src/config";
+import { Panic } from "better-result";
+
+import { LEVEL1_TOOL_NAMES } from "@stanley2058/lilac-coding-tools";
+import {
+  MINI_LILAC_EXECUTABLE_TOOL_NAMES,
+  MINI_LILAC_SYNTHETIC_TOOL_NAMES,
+} from "@stanley2058/mini-lilac-client";
+
+import {
+  decodeRuntimeConfig,
+  decodeRuntimeConfigYaml,
+  loadRuntimeConfig,
+  loadRuntimeConfigResult,
+  RuntimeConfigAuthTokenMissing,
+  runtimeConfigSchema,
+} from "../src/config";
+import * as runtimeRoot from "../src/index";
 
 const directories: string[] = [];
+
+describe("Mini Lilac tool catalog", () => {
+  it("stays aligned with Level 1 and runtime-owned tools", () => {
+    expect(new Set(MINI_LILAC_EXECUTABLE_TOOL_NAMES)).toEqual(
+      new Set([...LEVEL1_TOOL_NAMES, "skill", "todowrite", "webfetch", "websearch"]),
+    );
+    expect(MINI_LILAC_SYNTHETIC_TOOL_NAMES).toEqual(["subagent_result"]);
+  });
+});
+
+describe("package root exports", () => {
+  it("exports Result APIs and owned error contracts without removing legacy APIs", () => {
+    for (const exportName of [
+      "loadRuntimeConfig",
+      "loadRuntimeConfigResult",
+      "decodeRuntimeConfig",
+      "decodeRuntimeConfigYaml",
+      "loadProviderConfig",
+      "loadProviderConfigResult",
+      "loadProviderAuth",
+      "loadProviderAuthResult",
+      "writeProviderAuth",
+      "writeProviderAuthResult",
+      "createAiProviderRegistry",
+      "createAiProviderRegistryResult",
+      "loadProviderRegistry",
+      "loadProviderRegistryResult",
+      "ModelCatalog",
+      "createModelCatalogResult",
+      "parseModelRef",
+      "parseModelRefResult",
+      "resolveLanguageModel",
+      "resolveLanguageModelResult",
+      "RuntimeConfigInvalid",
+      "ProviderAuthInvalid",
+      "ProviderCodexTokensReadFailed",
+      "ModelCatalogRequestAndCleanupFailed",
+      "ModelCatalogResponseCleanupFailed",
+      "MiniLilacSkillUnavailable",
+    ]) {
+      expect(Object.hasOwn(runtimeRoot, exportName)).toBe(true);
+    }
+    expect(runtimeRoot.MiniLilacSkillCatalogSnapshot.prototype.loadResult).toBeFunction();
+    expect(runtimeRoot.MiniLilacSkillCatalog.prototype.discoverResult).toBeFunction();
+  });
+});
 
 async function tempDirectory(): Promise<string> {
   const directory = await mkdtemp(path.join(tmpdir(), "mini-lilac-config-"));
@@ -37,6 +99,48 @@ const baseConfig = {
 } as const;
 
 describe("runtime config", () => {
+  it("propagates the exact Panic from YAML decoding", () => {
+    const panic = new Panic({ message: "runtime config parser invariant" });
+    const parse = spyOn(Bun.YAML, "parse").mockImplementation(() => {
+      throw panic;
+    });
+
+    let thrown: unknown;
+    try {
+      decodeRuntimeConfigYaml("configVersion: 1", "fixture.yaml");
+    } catch (cause) {
+      thrown = cause;
+    } finally {
+      parse.mockRestore();
+    }
+
+    expect(thrown).toBe(panic);
+  });
+
+  it("redacts malformed YAML parser payloads", () => {
+    const secret = "runtime-config-parser-secret";
+    const malformed = decodeRuntimeConfigYaml(`server: [${secret}`, "fixture.yaml");
+
+    expect(malformed.status).toBe("error");
+    if (malformed.status === "error") {
+      expect(Object.hasOwn(malformed.error, "cause")).toBe(false);
+      expect(JSON.stringify(malformed.error)).not.toContain(secret);
+    }
+  });
+
+  it("returns typed decode and load failures without exposing config contents", async () => {
+    const invalid = decodeRuntimeConfig({ ...baseConfig, secret: "must-not-leak" }, "fixture.yaml");
+    expect(invalid.status).toBe("error");
+    if (invalid.status === "error") {
+      expect(invalid.error._tag).toBe("RuntimeConfigInvalid");
+      expect(JSON.stringify(invalid.error)).not.toContain("must-not-leak");
+    }
+
+    const missing = await loadRuntimeConfigResult("/definitely/missing/mini-lilac.yaml");
+    expect(missing.status).toBe("error");
+    if (missing.status === "error") expect(missing.error._tag).toBe("RuntimeConfigReadFailed");
+  });
+
   it("loads strict config, defaults profile fields, and resolves sibling paths", async () => {
     const directory = await tempDirectory();
     const file = path.join(directory, "config.yaml");
@@ -125,7 +229,13 @@ describe("runtime config", () => {
         server: { host: "0.0.0.0", port: 8080, authTokenEnv: "MINI_TOKEN" },
       }),
     );
-    await expect(loadRuntimeConfig(file, { env: {} })).rejects.toThrow("missing or empty");
+    let missingToken: unknown;
+    try {
+      await loadRuntimeConfig(file, { env: {} });
+    } catch (cause) {
+      missingToken = cause;
+    }
+    expect(missingToken).toBeInstanceOf(RuntimeConfigAuthTokenMissing);
     expect((await loadRuntimeConfig(file, { env: { MINI_TOKEN: "secret" } })).server.host).toBe(
       "0.0.0.0",
     );
@@ -195,11 +305,39 @@ describe("runtime config", () => {
           profiles: {
             main: {
               ...baseConfig.agent.profiles.main,
-              tools: ["skill", "todowrite", "webfetch", "websearch"],
+              tools: [...MINI_LILAC_EXECUTABLE_TOOL_NAMES],
             },
           },
         },
       }).agent.profiles.main?.tools,
-    ).toEqual(["skill", "todowrite", "webfetch", "websearch"]);
+    ).toEqual([...MINI_LILAC_EXECUTABLE_TOOL_NAMES]);
+    expect(() =>
+      runtimeConfigSchema.parse({
+        ...baseConfig,
+        agent: {
+          ...baseConfig.agent,
+          profiles: {
+            main: { ...baseConfig.agent.profiles.main, tools: ["subagent_result"] },
+          },
+        },
+      }),
+    ).toThrow("unknown tool");
+  });
+
+  it("accepts legacy configured tool names and normalizes them to canonical names", () => {
+    const parsed = runtimeConfigSchema.parse({
+      ...baseConfig,
+      agent: {
+        ...baseConfig.agent,
+        profiles: {
+          main: {
+            ...baseConfig.agent.profiles.main,
+            tools: ["read_file", "edit_file", "apply_patch"],
+          },
+        },
+      },
+    });
+
+    expect(parsed.agent.profiles.main?.tools).toEqual(["read", "edit", "patch"]);
   });
 });

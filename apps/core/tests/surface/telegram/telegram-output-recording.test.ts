@@ -1,7 +1,11 @@
 import { describe, expect, it } from "bun:test";
+import { Panic, Result, type Result as ResultType } from "better-result";
 
 import type { SurfaceAttachment, TelegramSessionRef } from "../../../src/surface/types";
-import type { SurfaceOutputResult } from "../../../src/surface/adapter";
+import {
+  SurfaceOperationPartiallyCompleted,
+  type SurfaceOutputResult,
+} from "../../../src/surface/adapter";
 import {
   TelegramOutputStreamWithAttachments,
   type TelegramAttachmentApi,
@@ -16,6 +20,11 @@ const RESULT: SurfaceOutputResult = {
   last: { platform: "telegram", channelId: "1001", messageId: "7" },
 };
 
+function resultValue<T, E>(result: ResultType<T, E>): T {
+  if (result.status === "error") throw result.error;
+  return result.value;
+}
+
 /**
  * A stand-in for the real stream. Only the three members the wrapper touches
  * after `finish()` matter here, so this stays a structural double rather than a
@@ -25,18 +34,22 @@ function fakeStream(input: {
   delivered?: { messageId: number; text: string }[];
   attachments?: SurfaceAttachment[];
   deliveredThrows?: boolean;
+  finishThrows?: unknown;
   unreconciled?: TelegramSurplusDeletionFailure[];
 }): TelegramDeliverableStream {
   const stream: TelegramDeliverableStream = {
-    finish: async () => RESULT,
+    finish: async () => {
+      if (input.finishThrows) throw input.finishThrows;
+      return Result.ok(RESULT);
+    },
     getDeliveredMessages: () => {
       if (input.deliveredThrows) throw new Error("index unavailable");
       return input.delivered ?? [];
     },
     takePendingAttachments: () => input.attachments ?? [],
     getSurplusDeletionFailures: () => input.unreconciled ?? [],
-    push: async () => undefined,
-    abort: async () => undefined,
+    push: async () => Result.ok("visible"),
+    abort: async () => Result.ok(undefined),
     getFinalTextMode: () => "full" as const,
   };
 
@@ -102,7 +115,7 @@ describe("recording the bot's own delivered output", () => {
     const stream = fakeStream({ deliveredThrows: true });
     const { wrapper, errors } = wrap(stream);
 
-    const result = await wrapper.finish();
+    const result = resultValue(await wrapper.finish());
 
     expect(result).toEqual(RESULT);
     expect(errors).toHaveLength(1);
@@ -136,8 +149,10 @@ describe("recording the bot's own delivered output", () => {
     const result = await wrapper.finish();
 
     expect(order).toEqual(["indexed", "uploaded"]);
-    // The text reply was already delivered; a failed upload must not discard it.
-    expect(result).toEqual(RESULT);
+    expect(result.status).toBe("error");
+    if (result.status === "ok") throw new Error("expected partial attachment delivery");
+    expect(result.error).toBeInstanceOf(SurfaceOperationPartiallyCompleted);
+    expect(result.error).toMatchObject({ operation: "finish-output", created: RESULT.last });
   });
 
   it("indexes an uploaded attachment so a reply to it can resolve", async () => {
@@ -188,14 +203,13 @@ describe("recording the bot's own delivered output", () => {
     const result = await wrapper.finish();
 
     expect(delivered.flat()).toContainEqual({ messageId: 50, text: "[image] a.png" });
-    // The surviving upload is still a real message, so its ref belongs in the
-    // result even though the batch as a whole failed.
-    expect(result.created).toContainEqual({
-      platform: "telegram",
-      channelId: "1001",
-      messageId: "50",
+    expect(result.status).toBe("error");
+    if (result.status === "ok") throw new Error("expected partial attachment delivery");
+    expect(result.error).toBeInstanceOf(SurfaceOperationPartiallyCompleted);
+    expect(result.error).toMatchObject({
+      operation: "finish-output",
+      created: { platform: "telegram", channelId: "1001", messageId: "50" },
     });
-    expect(result.last).toEqual({ platform: "telegram", channelId: "1001", messageId: "50" });
     expect(errors).toHaveLength(1);
   });
 
@@ -246,7 +260,12 @@ describe("recording the bot's own delivered output", () => {
     const result = await wrapper.finish();
 
     expect(delivered.flat()).toEqual([{ messageId: 7, text: "answer" }]);
-    expect(result).toEqual(RESULT);
+    expect(result.status).toBe("error");
+    if (result.status === "ok") throw new Error("expected partial attachment delivery");
+    expect(result.error).toMatchObject({
+      _tag: "SurfaceOperationPartiallyCompleted",
+      created: RESULT.last,
+    });
   });
 
   it("keeps the reply when indexing the attachments throws", async () => {
@@ -269,7 +288,7 @@ describe("recording the bot's own delivered output", () => {
       },
     });
 
-    const result = await wrapper.finish();
+    const result = resultValue(await wrapper.finish());
 
     expect(errors).toHaveLength(1);
     expect(result.created).toHaveLength(2);
@@ -294,10 +313,17 @@ describe("recording the bot's own delivered output", () => {
       },
     });
 
-    const result = await wrapper.finish();
+    const result = resultValue(await wrapper.finish());
 
     expect(result.created).toHaveLength(2);
     expect(result.last).toEqual({ platform: "telegram", channelId: "1001", messageId: "42" });
+  });
+
+  it("preserves Panic identity from the wrapped output stream", async () => {
+    const panic = new Panic({ message: "output invariant failed" });
+    const { wrapper } = wrap(fakeStream({ finishThrows: panic }));
+
+    expect(wrapper.finish()).rejects.toBe(panic);
   });
 });
 

@@ -1,14 +1,32 @@
 import {
-  clearCodexTokens,
+  clearCodexTokensResult,
   getCodexAuthStoragePath,
-  readCodexTokens,
+  readCodexTokensResult,
   startCodexOAuthLogin,
   type CodexOAuthLogin,
 } from "@stanley2058/lilac-utils";
+import { defineServerTool, type ServerTool, type ServerToolCallOptions } from "../types";
 import { z } from "zod";
+import { Result, TaggedError, type Result as ResultType } from "better-result";
 
-import type { ServerTool } from "../types";
-import { zodObjectToCliLines } from "./zod-cli";
+import { parseToolInputPreservingZodError as parseToolInput } from "../validation-error-message";
+
+class CodexToolFailure extends TaggedError("CodexToolFailure")<{
+  readonly message: string;
+}> {}
+
+function adaptCodexResultToToolHost<TValue>(result: ResultType<TValue, CodexToolFailure>): TValue {
+  return result.match({
+    ok: (value) => () => value,
+    err: (error) => () => {
+      throw new Error(error.message);
+    },
+  })();
+}
+
+function signalCodexFailureToToolHost(message: string): never {
+  return adaptCodexResultToToolHost(Result.err(new CodexToolFailure({ message })));
+}
 
 const loginInputSchema = z
   .object({
@@ -74,86 +92,114 @@ async function runPendingTransition<T>(operation: () => Promise<T>): Promise<T> 
 
 export type CodexDependencies = {
   startLogin: typeof startCodexOAuthLogin;
-  readTokens: typeof readCodexTokens;
-  clearTokens: typeof clearCodexTokens;
+  readTokens: typeof readCodexTokensResult;
+  clearTokens: typeof clearCodexTokensResult;
   storagePath: typeof getCodexAuthStoragePath;
 };
 
 const defaultDependencies: CodexDependencies = {
   startLogin: startCodexOAuthLogin,
-  readTokens: readCodexTokens,
-  clearTokens: clearCodexTokens,
+  readTokens: readCodexTokensResult,
+  clearTokens: clearCodexTokensResult,
   storagePath: getCodexAuthStoragePath,
 };
 
 export class Codex implements ServerTool {
   id = "codex";
 
-  constructor(private readonly dependencies: CodexDependencies = defaultDependencies) {}
-
-  async init(): Promise<void> {}
-
-  async destroy(): Promise<void> {
-    pendingGeneration += 1;
-    await runPendingTransition(async () => {
-      const login = pending;
-      pending = null;
-      await login?.close();
-    });
-  }
-
-  async list() {
-    return [
-      {
-        callableId: "codex.login",
+  private readonly tool = defineServerTool({
+    id: this.id,
+    destroy: async () => {
+      pendingGeneration += 1;
+      await runPendingTransition(async () => {
+        const login = pending;
+        pending = null;
+        await login?.close();
+      });
+    },
+    callables: ({ callable }) => ({
+      "codex.login": callable({
         name: "Codex Login",
         description: [
           "Authenticate to OpenAI Codex via ChatGPT OAuth.",
           "Use mode=start to get a browser URL. If the localhost callback doesn't work, use mode=exchange and paste the callback URL.",
         ].join("\n"),
-        shortInput: zodObjectToCliLines(loginInputSchema, { mode: "required" }),
-        input: zodObjectToCliLines(loginInputSchema),
+        inputSchema: loginInputSchema,
+        validation: "zod",
         hidden: true,
-      },
-      {
-        callableId: "codex.status",
+        run: (input) => this.runCallable("codex.login", input),
+      }),
+      "codex.status": callable({
         name: "Codex Status",
         description: "Show whether Codex OAuth tokens are configured.",
-        shortInput: [],
-        input: zodObjectToCliLines(statusInputSchema),
+        inputSchema: statusInputSchema,
+        validation: "zod",
         hidden: true,
-      },
-      {
-        callableId: "codex.logout",
+        run: (input) => this.runCallable("codex.status", input),
+      }),
+      "codex.logout": callable({
         name: "Codex Logout",
         description: "Clear stored Codex OAuth tokens.",
-        shortInput: [],
-        input: zodObjectToCliLines(logoutInputSchema),
+        inputSchema: logoutInputSchema,
+        validation: "zod",
         hidden: true,
-      },
-    ];
+        run: (input) => this.runCallable("codex.logout", input),
+      }),
+    }),
+  });
+
+  constructor(private readonly dependencies: CodexDependencies = defaultDependencies) {}
+
+  async init(): Promise<void> {
+    await this.tool.init();
   }
 
-  async call(callableId: string, input: Record<string, unknown>): Promise<unknown> {
+  async destroy(): Promise<void> {
+    await this.tool.destroy();
+  }
+
+  async list() {
+    return this.tool.list();
+  }
+
+  async call(
+    callableId: string,
+    input: Record<string, unknown>,
+    opts?: ServerToolCallOptions,
+  ): Promise<unknown> {
+    if (
+      callableId !== "codex.login" &&
+      callableId !== "codex.status" &&
+      callableId !== "codex.logout"
+    ) {
+      return signalCodexFailureToToolHost("Invalid callable ID");
+    }
+    return this.tool.call(callableId, input, opts);
+  }
+
+  private async runCallable(
+    callableId: "codex.login" | "codex.status" | "codex.logout",
+    input: Record<string, unknown>,
+  ): Promise<unknown> {
     if (callableId === "codex.login") {
-      const payload = loginInputSchema.parse(input);
+      const payload = parseToolInput({ callableId, input, schema: loginInputSchema });
       if (payload.mode === "start") {
         const generation = ++pendingGeneration;
         return runPendingTransition(async () => {
           if (generation !== pendingGeneration) {
-            throw new Error("Codex OAuth login was superseded");
+            signalCodexFailureToToolHost("Codex OAuth login was superseded");
           }
           const previous = pending;
           pending = null;
           await previous?.close();
           if (generation !== pendingGeneration) {
-            throw new Error("Codex OAuth login was superseded");
+            signalCodexFailureToToolHost("Codex OAuth login was superseded");
           }
 
           const login = await this.dependencies.startLogin({ callbackServer: "optional" });
           if (generation !== pendingGeneration) {
             await login.close();
-            throw new Error("Codex OAuth login was superseded");
+            signalCodexFailureToToolHost("Codex OAuth login was superseded");
           }
           pending = login;
           void login.result.then(
@@ -182,7 +228,7 @@ export class Codex implements ServerTool {
       }
 
       if (!pending) {
-        throw new Error(
+        return signalCodexFailureToToolHost(
           "Missing PKCE challenge. Re-run codex.login mode=start before manual exchange.",
         );
       }
@@ -193,8 +239,22 @@ export class Codex implements ServerTool {
     }
 
     if (callableId === "codex.status") {
-      statusInputSchema.parse(input);
-      const tokens = await this.dependencies.readTokens();
+      parseToolInput({ callableId, input, schema: statusInputSchema });
+      const loaded = await this.dependencies.readTokens();
+      const tokens = loaded.match({
+        ok: (value) => () => value.value,
+        err: (error) => () => {
+          switch (error._tag) {
+            case "CodexTokensReadFailed":
+              if (error.operation === "inspect") return signalCodexFailureToToolHost(error.message);
+              return null;
+            case "CodexTokensMalformed":
+            case "CodexTokensCorrupt":
+            case "CodexTokensUnsupportedVersion":
+              return null;
+          }
+        },
+      })();
       return {
         configured: tokens !== null,
         storagePath: this.dependencies.storagePath(),
@@ -204,17 +264,28 @@ export class Codex implements ServerTool {
     }
 
     if (callableId === "codex.logout") {
-      logoutInputSchema.parse(input);
+      parseToolInput({ callableId, input, schema: logoutInputSchema });
       pendingGeneration += 1;
       return runPendingTransition(async () => {
         const login = pending;
         pending = null;
         await login?.close();
-        await this.dependencies.clearTokens();
+        const cleared = await this.dependencies.clearTokens();
+        cleared.match({
+          ok: () => () => undefined,
+          err: (error) => () => {
+            switch (error._tag) {
+              case "CodexTokensReadFailed":
+                return signalCodexFailureToToolHost(error.message);
+              case "CodexTokensWriteFailed":
+              case "CodexTokensCleanupFailed":
+              case "CodexTokensWriteAndCleanupFailed":
+                return signalCodexFailureToToolHost(error.message);
+            }
+          },
+        })();
         return { ok: true as const, storagePath: this.dependencies.storagePath() };
       });
     }
-
-    throw new Error("Invalid callable ID");
   }
 }

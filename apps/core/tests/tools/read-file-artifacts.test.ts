@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
@@ -9,7 +9,16 @@ import {
 } from "../../src/artifacts/tool-result-artifact-store";
 import { fsTool } from "../../src/tools/fs/fs";
 
-describe("read_file tool-result resources", () => {
+function resultValue<T>(
+  result:
+    | { readonly status: "ok"; readonly value: T }
+    | { readonly status: "error"; readonly error: Error },
+): T {
+  if (result.status === "error") throw result.error;
+  return result.value;
+}
+
+describe("read tool-result resources", () => {
   let baseDir: string;
 
   beforeEach(async () => {
@@ -23,19 +32,21 @@ describe("read_file tool-result resources", () => {
   it("pages artifacts by Unicode character offset independent of cwd", async () => {
     const store = createToolResultArtifactStore(path.join(baseDir, "tool-results"));
     await store.init();
-    const created = await store.create({
-      sessionId: "session-a",
-      requestId: "request-a",
-      toolCallId: "call-a",
-      toolName: "bash",
-      content: "ab😀cd",
-      ttlMs: 60_000,
-      maxBytesPerSession: 1024,
-    });
+    const created = resultValue(
+      await store.create({
+        sessionId: "session-a",
+        requestId: "request-a",
+        toolCallId: "call-a",
+        toolName: "bash",
+        content: "ab😀cd",
+        ttlMs: 60_000,
+        maxBytesPerSession: 1024,
+      }),
+    );
     const readFile = fsTool(baseDir, {
       toolResultArtifacts: store,
       requestContext: { requestId: "request-a", sessionId: "session-a" },
-    }).read_file;
+    }).read;
 
     const output = await readFile.execute!(
       {
@@ -68,19 +79,21 @@ describe("read_file tool-result resources", () => {
   it("supports line starts for artifacts and offset starts for ordinary files", async () => {
     const store = createToolResultArtifactStore(path.join(baseDir, "tool-results"));
     await store.init();
-    const created = await store.create({
-      sessionId: "session-a",
-      requestId: "request-a",
-      toolCallId: "call-a",
-      toolName: "bash",
-      content: "first\nab😀cd",
-      ttlMs: 60_000,
-      maxBytesPerSession: 1024,
-    });
+    const created = resultValue(
+      await store.create({
+        sessionId: "session-a",
+        requestId: "request-a",
+        toolCallId: "call-a",
+        toolName: "bash",
+        content: "first\nab😀cd",
+        ttlMs: 60_000,
+        maxBytesPerSession: 1024,
+      }),
+    );
     const readFile = fsTool(baseDir, {
       toolResultArtifacts: store,
       requestContext: { requestId: "request-a", sessionId: "session-a" },
-    }).read_file;
+    }).read;
 
     await writeFile(path.join(baseDir, "ordinary.txt"), "ab😀\ncd");
 
@@ -116,20 +129,22 @@ describe("read_file tool-result resources", () => {
   it("allows artifact reads but rejects filesystem paths in artifact-only mode", async () => {
     const store = createToolResultArtifactStore(path.join(baseDir, "tool-results"));
     await store.init();
-    const created = await store.create({
-      sessionId: "session-a",
-      requestId: "request-a",
-      toolCallId: "call-a",
-      toolName: "bash",
-      content: "restricted artifact",
-      ttlMs: 60_000,
-      maxBytesPerSession: 1024,
-    });
+    const created = resultValue(
+      await store.create({
+        sessionId: "session-a",
+        requestId: "request-a",
+        toolCallId: "call-a",
+        toolName: "bash",
+        content: "restricted artifact",
+        ttlMs: 60_000,
+        maxBytesPerSession: 1024,
+      }),
+    );
     const readFile = fsTool(baseDir, {
       artifactOnly: true,
       toolResultArtifacts: store,
       requestContext: { requestId: "request-a", sessionId: "session-a" },
-    }).read_file;
+    }).read;
 
     const artifact = await readFile.execute!(
       { path: created.uri },
@@ -145,7 +160,7 @@ describe("read_file tool-result resources", () => {
       success: false,
       error: {
         code: "PERMISSION",
-        message: "Restricted sessions can use read_file only with tool-result:// artifacts.",
+        message: "Restricted sessions can use read only with tool-result:// artifacts.",
       },
     });
   });
@@ -153,19 +168,21 @@ describe("read_file tool-result resources", () => {
   it("does not reveal foreign or missing artifact existence", async () => {
     const store = createToolResultArtifactStore(path.join(baseDir, "tool-results"));
     await store.init();
-    const created = await store.create({
-      sessionId: "session-a",
-      requestId: "request-a",
-      toolCallId: "call-a",
-      toolName: "bash",
-      content: "secret",
-      ttlMs: 60_000,
-      maxBytesPerSession: 1024,
-    });
+    const created = resultValue(
+      await store.create({
+        sessionId: "session-a",
+        requestId: "request-a",
+        toolCallId: "call-a",
+        toolName: "bash",
+        content: "secret",
+        ttlMs: 60_000,
+        maxBytesPerSession: 1024,
+      }),
+    );
     const readFile = fsTool(baseDir, {
       toolResultArtifacts: store,
       requestContext: { requestId: "request-b", sessionId: "session-b" },
-    }).read_file;
+    }).read;
 
     const foreign = await readFile.execute!(
       { path: created.uri },
@@ -186,15 +203,17 @@ describe("read_file tool-result resources", () => {
   it("reports evicted artifacts as unavailable", async () => {
     const store = createToolResultArtifactStore(path.join(baseDir, "tool-results"));
     await store.init();
-    const first = await store.create({
-      sessionId: "session-a",
-      requestId: "request-a",
-      toolCallId: "call-a",
-      toolName: "bash",
-      content: "123456",
-      ttlMs: 60_000,
-      maxBytesPerSession: 8,
-    });
+    const first = resultValue(
+      await store.create({
+        sessionId: "session-a",
+        requestId: "request-a",
+        toolCallId: "call-a",
+        toolName: "bash",
+        content: "123456",
+        ttlMs: 60_000,
+        maxBytesPerSession: 8,
+      }),
+    );
     await store.create({
       sessionId: "session-a",
       requestId: "request-a",
@@ -207,7 +226,7 @@ describe("read_file tool-result resources", () => {
     const readFile = fsTool(baseDir, {
       toolResultArtifacts: store,
       requestContext: { requestId: "request-a", sessionId: "session-a" },
-    }).read_file;
+    }).read;
     const output = await readFile.execute!(
       { path: first.uri },
       { toolCallId: "read-evicted", messages: [], context: {} },
@@ -216,5 +235,61 @@ describe("read_file tool-result resources", () => {
       success: false,
       error: { message: TOOL_RESULT_UNAVAILABLE_MESSAGE },
     });
+  });
+
+  it("greps artifacts inline without creating another artifact", async () => {
+    const store = createToolResultArtifactStore(path.join(baseDir, "tool-results"));
+    await store.init();
+    const created = resultValue(
+      await store.create({
+        sessionId: "session-a",
+        requestId: "request-a",
+        toolCallId: "call-a",
+        toolName: "bash",
+        content: `first\n${"x".repeat(8_000)}:needle\nlast`,
+        ttlMs: 60_000,
+        maxBytesPerSession: 16 * 1024,
+      }),
+    );
+    const filesBefore = await readdir(store.rootDir);
+    const tools = fsTool(baseDir, {
+      experimentalHashlineEdit: true,
+      maxOutputBytes: 512,
+      toolResultArtifacts: store,
+      requestContext: { requestId: "request-a", sessionId: "session-a" },
+    });
+
+    const output = await tools.grep.execute!(
+      { pattern: "needle", path: created.uri },
+      { toolCallId: "grep-artifact", messages: [], context: {} },
+    );
+    expect(output).toMatchObject({
+      mode: "default",
+      truncated: true,
+      results: [{ file: created.uri, line: 2 }],
+    });
+    expect(Buffer.byteLength(JSON.stringify(output, null, 2), "utf8")).toBeLessThanOrEqual(512);
+    expect(await readdir(store.rootDir)).toEqual(filesBefore);
+
+    const hashline = await tools.grep.execute!(
+      { pattern: "needle", path: created.uri, mode: "hashline" },
+      { toolCallId: "grep-artifact-hashline", messages: [], context: {} },
+    );
+    expect(hashline).toMatchObject({
+      mode: "hashline",
+      error: expect.stringContaining("unavailable for tool-result://"),
+    });
+
+    const foreignTools = fsTool(baseDir, {
+      experimentalHashlineEdit: true,
+      toolResultArtifacts: store,
+      requestContext: { requestId: "request-b", sessionId: "session-b" },
+    });
+    const foreignHashline = await foreignTools.grep.execute!(
+      { pattern: "needle", path: created.uri, mode: "hashline" },
+      { toolCallId: "grep-artifact-foreign", messages: [], context: {} },
+    );
+    expect(foreignHashline).toMatchObject({ error: TOOL_RESULT_UNAVAILABLE_MESSAGE });
+    expect(await readdir(store.rootDir)).toEqual(filesBefore);
   });
 });

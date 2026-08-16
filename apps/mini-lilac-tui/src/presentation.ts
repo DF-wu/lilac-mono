@@ -1,14 +1,6 @@
-import { z } from "zod";
+import type { MiniLilacSessionSnapshot } from "@stanley2058/mini-lilac-client";
 
 const MAX_TITLE_LENGTH = 100;
-
-const snapshotPresentationSchema = z.object({
-  title: z.string().optional(),
-  inputTokens: z.number().nonnegative().nullable().optional(),
-  inputTokensEstimated: z.boolean().optional(),
-  contextWindow: z.number().positive().nullable().optional(),
-  compactionThreshold: z.number().positive().max(1).optional(),
-});
 
 export interface SessionPresentation {
   readonly title: string;
@@ -28,15 +20,21 @@ const EMPTY_PRESENTATION: SessionPresentation = {
   compactionThreshold: null,
 };
 
-export function sessionPresentation(snapshot: unknown): SessionPresentation {
-  const parsed = snapshotPresentationSchema.safeParse(snapshot);
-  if (!parsed.success) return EMPTY_PRESENTATION;
+export function sessionPresentation(
+  snapshot:
+    | Pick<
+        MiniLilacSessionSnapshot,
+        "title" | "inputTokens" | "inputTokensEstimated" | "contextWindow" | "compactionThreshold"
+      >
+    | undefined,
+): SessionPresentation {
+  if (snapshot === undefined) return EMPTY_PRESENTATION;
   return {
-    title: parsed.data.title ?? "Mini Lilac",
-    inputTokens: parsed.data.inputTokens ?? null,
-    inputTokensEstimated: parsed.data.inputTokensEstimated ?? false,
-    contextWindow: parsed.data.contextWindow ?? null,
-    compactionThreshold: parsed.data.compactionThreshold ?? null,
+    title: snapshot.title ?? "Mini Lilac",
+    inputTokens: snapshot.inputTokens ?? null,
+    inputTokensEstimated: snapshot.inputTokensEstimated ?? false,
+    contextWindow: snapshot.contextWindow ?? null,
+    compactionThreshold: snapshot.compactionThreshold ?? null,
   };
 }
 
@@ -46,7 +44,7 @@ export function formatSessionTitle(title: string): string {
   return `${characters.slice(0, MAX_TITLE_LENGTH - 3).join("")}...`;
 }
 
-export function formatTokenCount(tokens: number): string {
+function formatTokenCount(tokens: number): string {
   if (tokens < 1_000) return String(Math.round(tokens));
   const divisor = tokens < 1_000_000 ? 1_000 : 1_000_000;
   const suffix = divisor === 1_000 ? "K" : "M";

@@ -1,5 +1,4 @@
-function toInt(value: unknown): number | null {
-  if (typeof value === "number" && Number.isFinite(value)) return Math.trunc(value);
+function toInt(value: string | boolean): number | null {
   if (typeof value === "string" && value.trim().length > 0) {
     const parsed = Number(value);
     return Number.isFinite(parsed) ? Math.trunc(parsed) : null;
@@ -7,7 +6,7 @@ function toInt(value: unknown): number | null {
   return null;
 }
 
-function toBool(value: unknown): boolean | null {
+function toBool(value: string | boolean): boolean | null {
   if (typeof value === "boolean") return value;
   if (typeof value === "string") {
     const normalized = value.trim().toLowerCase();

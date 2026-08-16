@@ -4,21 +4,24 @@ import {
   createLilacBus,
   lilacEventTypes,
   type AdapterPlatform,
-  type HandleContext,
-  type Message,
-  type PublishOptions,
-  type RawBus,
-  type SubscriptionOptions,
 } from "@stanley2058/lilac-event-bus";
 import { parseCoreConfigV1ToUniversal } from "@stanley2058/lilac-utils";
+import { AiSdkPiAgent } from "@stanley2058/lilac-agent";
+import { MockLanguageModelV4, simulateReadableStream } from "ai/test";
+import { Result } from "better-result";
 
 import { startBusAgentRunner } from "../../../src/surface/bridge/bus-agent-runner";
+import { getBuiltinSurfaceProtocol } from "../../../src/surface/builtin-surface-protocols";
 import type { BuildLevel1ToolsetParams, CoreToolPluginManager } from "../../../src/plugins";
 import { RequestControlAuthority } from "../../../src/tool-server/request-control-authority";
-import type { SurfacePrincipalPlatform } from "../../../src/surface/types";
+import type {
+  ResolvedSurfaceProtocol,
+  SurfaceProtocolResolver,
+} from "../../../src/surface/runtime-descriptor";
 import type { TrustedSubagentDelegationRegistration } from "../../../src/tools/subagent";
 import type { WorkflowLiveParentBridge } from "../../../src/workflow/workflow-live-parent-bridge";
 import type { WorkflowSubagentDispatcher } from "../../../src/workflow/workflow-subagent-dispatcher";
+import { createInMemoryDeliveryBus } from "../../helpers/in-memory-delivery-bus";
 
 /**
  * Capability issuance used to be gated on `discord | github`, so a Telegram
@@ -36,57 +39,39 @@ import type { WorkflowSubagentDispatcher } from "../../../src/workflow/workflow-
 const TELEGRAM_CHAT = "1001";
 const TELEGRAM_REQUEST_ID = `telegram:${TELEGRAM_CHAT}:10`;
 const TELEGRAM_ACTOR_ID = "8792842071";
+const TELEGRAM_AUTHENTICATED_ORIGIN = {
+  platform: "telegram" as const,
+  userId: TELEGRAM_ACTOR_ID,
+  messageRef: {
+    platform: "telegram" as const,
+    channelId: TELEGRAM_CHAT,
+    messageId: "10",
+  },
+};
+const TEST_SURFACE_PROTOCOL_RESOLVER: SurfaceProtocolResolver = {
+  resolve: (platform) => {
+    const protocol = getBuiltinSurfaceProtocol(platform);
+    return protocol ? ({ platform: protocol.platform, protocol } as ResolvedSurfaceProtocol) : null;
+  },
+};
 
-function createInMemoryRawBus(): RawBus {
-  const topics = new Map<string, Array<Message<unknown>>>();
-  const subs = new Set<{
-    topic: string;
-    handler: (msg: Message<unknown>, ctx: HandleContext) => Promise<void>;
-  }>();
-
+function completedTextStep() {
   return {
-    publish: async <TData>(msg: Omit<Message<TData>, "id" | "ts">, opts: PublishOptions) => {
-      const id = `${Date.now()}-${topics.get(opts.topic)?.length ?? 0}`;
-      const stored: Message<unknown> = {
-        topic: opts.topic,
-        id,
-        type: opts.type,
-        ts: Date.now(),
-        key: opts.key,
-        headers: opts.headers,
-        data: msg.data as unknown,
-      };
-
-      topics.set(opts.topic, [...(topics.get(opts.topic) ?? []), stored]);
-      for (const s of subs) {
-        if (s.topic !== opts.topic) continue;
-        await s.handler(stored, { cursor: id, commit: async () => {} });
-      }
-      return { id, cursor: id };
-    },
-
-    subscribe: async <TData>(
-      topic: string,
-      _opts: SubscriptionOptions,
-      handler: (msg: Message<TData>, ctx: HandleContext) => Promise<void>,
-    ) => {
-      const entry = {
-        topic,
-        handler: handler as (msg: Message<unknown>, ctx: HandleContext) => Promise<void>,
-      };
-      subs.add(entry);
-      return { stop: async () => void subs.delete(entry) };
-    },
-
-    fetch: async <TData>(topic: string) => {
-      const existing = topics.get(topic) ?? [];
-      return {
-        messages: existing.map((m) => ({ msg: m as unknown as Message<TData>, cursor: m.id })),
-        ...(existing.length > 0 ? { next: existing[existing.length - 1]?.id } : {}),
-      };
-    },
-
-    close: async () => {},
+    stream: simulateReadableStream({
+      chunks: [
+        { type: "text-start" as const, id: "text" },
+        { type: "text-delta" as const, id: "text", delta: "done" },
+        { type: "text-end" as const, id: "text" },
+        {
+          type: "finish" as const,
+          finishReason: { unified: "stop" as const, raw: "stop" },
+          usage: {
+            inputTokens: { total: 0, noCache: 0, cacheRead: 0, cacheWrite: 0 },
+            outputTokens: { total: 0, text: 0, reasoning: 0 },
+          },
+        },
+      ],
+    }),
   };
 }
 
@@ -112,18 +97,19 @@ function recordingPluginManager(
     getStatuses: unexpectedCall("getStatuses"),
     getLevel2Tools: unexpectedCall("getLevel2Tools"),
     getLevel2ContributionInfo: unexpectedCall("getLevel2ContributionInfo"),
-    buildLevel1Toolset: async (params) => {
+    buildLevel1ToolsetResult: async (params) => {
       onBuild(params);
-      return {
+      return Result.ok({
         tools: {},
         specs: new Map(),
+        contributionInfo: new Map(),
         directToolNames: new Set<string>(),
         catalog: [],
         catalogMetadata: {},
         updateActiveBatchTools: () => {},
         genericOutputNormalizerBypassTools: new Set<string>(),
         aggregateOutputBudgetExemptTools: new Set<string>(),
-      };
+      });
     },
   };
 }
@@ -159,14 +145,9 @@ function stubLiveParentBridge(): WorkflowLiveParentBridge {
   return bridge as WorkflowLiveParentBridge;
 }
 
-type IssuedCapabilityCall = {
-  requestId: string;
-  sessionId: string;
-  originSessionId?: string;
-  requestClient: AdapterPlatform;
-  canonicalCwd: string;
-  principal?: { platform: SurfacePrincipalPlatform; userId: string };
-};
+type IssuedCapabilityCall = Parameters<
+  NonNullable<Parameters<typeof startBusAgentRunner>[0]["issueControlCapability"]>
+>[0];
 
 type RunObservation = {
   issued: IssuedCapabilityCall[];
@@ -187,14 +168,15 @@ async function runRequest(input: {
   requestClient: AdapterPlatform;
   requestId: string;
   sessionId: string;
-  /** When set, the runner is told the request has an authenticated actor. */
-  principal?: { platform: SurfacePrincipalPlatform; userId: string };
+  authenticatedOrigin?: typeof TELEGRAM_AUTHENTICATED_ORIGIN;
 }): Promise<RunObservation> {
-  const bus = createLilacBus(createInMemoryRawBus());
+  const bus = createLilacBus(createInMemoryDeliveryBus());
   const authority = new RequestControlAuthority();
   const issued: IssuedCapabilityCall[] = [];
   const builds: BuildLevel1ToolsetParams[] = [];
   const delegations: TrustedSubagentDelegationRegistration[] = [];
+  const config = parseCoreConfigV1ToUniversal({});
+  config.models.main = { model: "openai/telegram-authority" };
 
   const dispatcher: Pick<WorkflowSubagentDispatcher, "delegate"> = {
     delegate: async (registration) => {
@@ -208,31 +190,48 @@ async function runRequest(input: {
   const runner = await startBusAgentRunner({
     bus,
     subscriptionId: `telegram-authority-${input.requestClient}`,
-    config: parseCoreConfigV1ToUniversal({}),
+    config,
     pluginManager: recordingPluginManager((params) => builds.push(params)),
     cwd: "/workspace",
+    surfaceProtocolResolver: TEST_SURFACE_PROTOCOL_RESOLVER,
     workflowLiveParentBridge: stubLiveParentBridge(),
     workflowSubagentDispatcher: dispatcher as WorkflowSubagentDispatcher,
+    reportFatalPanic: () => undefined,
     issueControlCapability: (callInput) => {
       issued.push(callInput);
-      // Issue through the real authority so the token is a genuine one and the
-      // principal is whatever the server would actually record.
-      const principal = callInput.principal ?? input.principal ?? null;
+      const authenticatedOrigin = callInput.authenticatedOrigin ?? null;
+      const principal = authenticatedOrigin
+        ? { platform: authenticatedOrigin.platform, userId: authenticatedOrigin.userId }
+        : null;
       const capability = authority.issue({
         kind: "primary",
         requestId: callInput.requestId,
         sessionId: callInput.sessionId,
-        originSessionId: callInput.originSessionId,
+        originSessionId: authenticatedOrigin?.sessionRef.channelId,
         platform: callInput.requestClient,
         principal,
+        authenticatedOrigin,
         allowedCallables: null,
         profile: callInput.profile,
         canonicalCwd: callInput.canonicalCwd,
         safetyMode: callInput.safetyMode,
         expiresAt: callInput.expiresAt,
       });
-      return { capability, originSessionId: callInput.originSessionId, principal };
+      return {
+        capability,
+        principal,
+        authenticatedOrigin,
+        safetyMode: callInput.safetyMode,
+      };
     },
+    createAgent: (options) =>
+      new AiSdkPiAgent({
+        ...options,
+        model: new MockLanguageModelV4({
+          modelId: "telegram-authority",
+          doStream: async () => completedTextStep(),
+        }),
+      }),
   });
 
   try {
@@ -241,7 +240,7 @@ async function runRequest(input: {
       {
         queue: "prompt",
         messages: [{ role: "user", content: "who am I talking to?" }],
-        raw: {},
+        raw: input.authenticatedOrigin ? { authenticatedOrigin: input.authenticatedOrigin } : {},
       },
       {
         headers: {
@@ -252,13 +251,7 @@ async function runRequest(input: {
       },
     );
 
-    // Rejection-only guard; it never delays the successful path. The run is
-    // complete once the toolset has been built, which is strictly after the
-    // capability decision.
-    const deadline = Date.now() + 10_000;
-    while (builds.length === 0 && Date.now() < deadline) {
-      await new Promise((resolve) => setImmediate(resolve));
-    }
+    await runner.getActiveDrainOperation();
 
     // The delegation hook is what a `subagent_delegate` call would reach. The
     // model never gets that far here, so invoke it directly to read back the
@@ -296,6 +289,7 @@ describe("level-2 control authority for a telegram primary request", () => {
       requestClient: "telegram",
       requestId: TELEGRAM_REQUEST_ID,
       sessionId: TELEGRAM_CHAT,
+      authenticatedOrigin: TELEGRAM_AUTHENTICATED_ORIGIN,
     });
 
     expect(issued).toHaveLength(1);
@@ -303,8 +297,12 @@ describe("level-2 control authority for a telegram primary request", () => {
       requestClient: "telegram",
       requestId: TELEGRAM_REQUEST_ID,
       sessionId: TELEGRAM_CHAT,
-      originSessionId: TELEGRAM_CHAT,
       canonicalCwd: "/workspace",
+      authenticatedOrigin: {
+        platform: "telegram",
+        userId: TELEGRAM_ACTOR_ID,
+        sessionRef: { platform: "telegram", channelId: TELEGRAM_CHAT },
+      },
     });
   });
 
@@ -315,6 +313,7 @@ describe("level-2 control authority for a telegram primary request", () => {
       requestClient: "telegram",
       requestId: TELEGRAM_REQUEST_ID,
       sessionId: TELEGRAM_CHAT,
+      authenticatedOrigin: TELEGRAM_AUTHENTICATED_ORIGIN,
     });
 
     expect(builds).toHaveLength(1);
@@ -325,7 +324,8 @@ describe("level-2 control authority for a telegram primary request", () => {
     expect(builds[0]?.requestContext).toMatchObject({
       requestClient: "telegram",
       sessionId: TELEGRAM_CHAT,
-      originSessionId: TELEGRAM_CHAT,
+      requestInitiator: { platform: "telegram", userId: TELEGRAM_ACTOR_ID },
+      requestInitiatorSessionId: TELEGRAM_CHAT,
       safetyMode: "trusted",
     });
   });
@@ -338,7 +338,7 @@ describe("level-2 control authority for a telegram primary request", () => {
       requestClient: "telegram",
       requestId: TELEGRAM_REQUEST_ID,
       sessionId: TELEGRAM_CHAT,
-      principal: { platform: "telegram", userId: TELEGRAM_ACTOR_ID },
+      authenticatedOrigin: TELEGRAM_AUTHENTICATED_ORIGIN,
     });
 
     const capability = controlCapabilityOf(builds[0]);
@@ -357,6 +357,16 @@ describe("level-2 control authority for a telegram primary request", () => {
     expect(policy).not.toBeNull();
     expect(policy?.kind).toBe("primary");
     expect(policy?.principal).toEqual({ platform: "telegram", userId: TELEGRAM_ACTOR_ID });
+    expect(policy?.authenticatedOrigin).toEqual({
+      platform: "telegram",
+      userId: TELEGRAM_ACTOR_ID,
+      sessionRef: { platform: "telegram", channelId: TELEGRAM_CHAT },
+      messageRef: {
+        platform: "telegram",
+        channelId: TELEGRAM_CHAT,
+        messageId: "10",
+      },
+    });
     // A capability is scoped to its platform; the same token must not authorize
     // a Discord-labelled call.
     expect(
@@ -375,7 +385,7 @@ describe("level-2 control authority for a telegram primary request", () => {
       requestClient: "telegram",
       requestId: TELEGRAM_REQUEST_ID,
       sessionId: TELEGRAM_CHAT,
-      principal: { platform: "telegram", userId: TELEGRAM_ACTOR_ID },
+      authenticatedOrigin: TELEGRAM_AUTHENTICATED_ORIGIN,
     });
 
     // The principal returned by issuance is recorded as the run's trusted

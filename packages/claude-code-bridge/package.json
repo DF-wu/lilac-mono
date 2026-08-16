@@ -17,6 +17,7 @@
     "@stanley2058/lilac-utils": "workspace:*",
     "ai": "^7.0.22",
     "ai-sdk-provider-claude-code": "^4.0.1",
+    "better-result": "catalog:",
     "zod": "^4.3.6"
   }
 }

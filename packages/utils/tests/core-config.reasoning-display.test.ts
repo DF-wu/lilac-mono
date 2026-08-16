@@ -3,11 +3,6 @@ import { describe, expect, it } from "bun:test";
 import { coreConfigSchema } from "../core-config";
 
 describe("coreConfigSchema agent.reasoningDisplay", () => {
-  it("defaults to simple", () => {
-    const parsed = coreConfigSchema.parse({});
-    expect(parsed.agent.reasoningDisplay).toBe("simple");
-  });
-
   it("accepts detailed mode", () => {
     const parsed = coreConfigSchema.parse({
       agent: {

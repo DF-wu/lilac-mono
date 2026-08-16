@@ -1,14 +1,127 @@
-import { isRecord } from "@stanley2058/lilac-utils";
+import { Result, TaggedError, type Result as ResultType } from "better-result";
+import { z } from "zod";
 
 import { normalizeBaseUrl } from "./shared";
 import type { WebSearchInput, WebSearchProvider, WebSearchResult } from "./types";
 
-type FirecrawlSearchResponse = {
-  success?: boolean;
-  error?: string;
-  message?: string;
-  data?: unknown;
-};
+const firecrawlSearchItemSchema = z.object({
+  url: z.string().nullable().optional(),
+  sourceURL: z.string().nullable().optional(),
+  title: z.string().nullable().optional(),
+  markdown: z.string().nullable().optional(),
+  content: z.string().nullable().optional(),
+  description: z.string().nullable().optional(),
+  snippet: z.string().nullable().optional(),
+  score: z.number().nullable().optional(),
+  metadata: z
+    .object({
+      sourceURL: z.string().nullable().optional(),
+      title: z.string().nullable().optional(),
+    })
+    .nullable()
+    .optional(),
+});
+
+type FirecrawlSearchItemInput = z.output<typeof firecrawlSearchItemSchema>;
+
+function decodeFirecrawlSearchItems(values: readonly unknown[]): FirecrawlSearchItemInput[] {
+  return values.flatMap((value) => {
+    const decoded = firecrawlSearchItemSchema.safeParse(value);
+    return decoded.success ? [decoded.data] : [];
+  });
+}
+
+const firecrawlSearchItemsSchema = z.array(z.unknown()).transform(decodeFirecrawlSearchItems);
+const firecrawlSearchCollectionSchema = z.object({
+  web: firecrawlSearchItemsSchema.optional(),
+  news: firecrawlSearchItemsSchema.optional(),
+  results: firecrawlSearchItemsSchema.optional(),
+});
+const firecrawlSearchDataSchema = z
+  .union([firecrawlSearchItemsSchema, firecrawlSearchCollectionSchema])
+  .nullable();
+const firecrawlSearchResponseSchema = z.object({
+  success: z.boolean().optional(),
+  error: z.string().optional(),
+  message: z.string().optional(),
+  data: firecrawlSearchDataSchema.optional(),
+  web: firecrawlSearchItemsSchema.optional(),
+  news: firecrawlSearchItemsSchema.optional(),
+  results: firecrawlSearchItemsSchema.optional(),
+});
+
+type FirecrawlSearchResponse = z.output<typeof firecrawlSearchResponseSchema>;
+
+export class FirecrawlSearchResponseInvalid extends TaggedError("FirecrawlSearchResponseInvalid")<{
+  readonly message: string;
+}> {}
+
+class FirecrawlSearchFailure extends TaggedError("FirecrawlSearchFailure")<{
+  readonly message: string;
+}> {}
+
+export function decodeFirecrawlSearchResponse(
+  value: unknown,
+): ResultType<FirecrawlSearchResponse, FirecrawlSearchResponseInvalid> {
+  const decoded = firecrawlSearchResponseSchema.safeParse(value);
+  if (decoded.success) return Result.ok(decoded.data);
+  return Result.err(
+    new FirecrawlSearchResponseInvalid({ message: "Firecrawl returned an invalid response" }),
+  );
+}
+
+function adaptFirecrawlSearchResultToProviderHost<TValue>(
+  result: ResultType<TValue, FirecrawlSearchFailure>,
+): TValue {
+  return result.match({
+    ok: (value) => () => value,
+    err: (error) => () => {
+      throw new Error(error.message);
+    },
+  })();
+}
+
+function decodeFirecrawlApiKey(
+  apiKey: string | undefined,
+): ResultType<string, FirecrawlSearchFailure> {
+  if (apiKey) return Result.ok(apiKey);
+  return Result.err(
+    new FirecrawlSearchFailure({ message: "FIRECRAWL_API_KEY is not configured." }),
+  );
+}
+
+async function captureFirecrawlResponseJson(
+  response: Response,
+): Promise<ResultType<unknown, FirecrawlSearchFailure>> {
+  return Result.tryPromise({
+    try: () => response.json(),
+    catch: () =>
+      new FirecrawlSearchFailure({
+        message: `Firecrawl search failed (${response.status}): invalid JSON response.`,
+      }),
+  });
+}
+
+function decodeFirecrawlSearchOutcome(
+  response: Response,
+  payload: FirecrawlSearchResponse,
+): ResultType<readonly WebSearchResult[], FirecrawlSearchFailure> {
+  if (!response.ok || payload.success === false) {
+    return Result.err(
+      new FirecrawlSearchFailure({
+        message: `Firecrawl search failed (${response.status}): ${response.statusText || "request failed"}`,
+      }),
+    );
+  }
+  return Result.ok(
+    toFirecrawlItems(payload).map((item) => ({
+      url: item.url,
+      title: item.title,
+      content: item.content,
+      score: item.score,
+    })),
+  );
+}
 
 type FirecrawlSearchItem = {
   url: string;
@@ -17,12 +130,15 @@ type FirecrawlSearchItem = {
   score: number | null;
 };
 
-function getString(record: Record<string, unknown>, key: string): string | null {
+function getString(
+  record: FirecrawlSearchItemInput,
+  key: keyof FirecrawlSearchItemInput,
+): string | null {
   const value = record[key];
   return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
 }
 
-function getNumber(record: Record<string, unknown>, key: string): number | null {
+function getNumber(record: FirecrawlSearchItemInput, key: "score"): number | null {
   const value = record[key];
   return typeof value === "number" && Number.isFinite(value) ? value : null;
 }
@@ -77,22 +193,17 @@ function mapTopicToSources(topic: WebSearchInput["topic"]): readonly string[] | 
   }
 }
 
-function toFirecrawlItems(payload: unknown): FirecrawlSearchItem[] {
+function toFirecrawlItems(payload: FirecrawlSearchResponse): FirecrawlSearchItem[] {
   const items: FirecrawlSearchItem[] = [];
 
-  const appendItem = (value: unknown) => {
-    if (!isRecord(value)) return;
-
+  const appendItem = (value: FirecrawlSearchItemInput) => {
     const url =
       getString(value, "url") ??
       getString(value, "sourceURL") ??
-      (isRecord(value.metadata) ? getString(value.metadata, "sourceURL") : null);
+      (value.metadata?.sourceURL?.trim() || null);
     if (!url) return;
 
-    const title =
-      getString(value, "title") ??
-      (isRecord(value.metadata) ? getString(value.metadata, "title") : null) ??
-      url;
+    const title = getString(value, "title") ?? (value.metadata?.title?.trim() || null) ?? url;
     const content =
       getString(value, "markdown") ??
       getString(value, "content") ??
@@ -108,25 +219,16 @@ function toFirecrawlItems(payload: unknown): FirecrawlSearchItem[] {
     });
   };
 
-  const appendMany = (value: unknown) => {
-    if (!Array.isArray(value)) return;
+  const appendMany = (value: readonly FirecrawlSearchItemInput[] | undefined) => {
+    if (!value) return;
     for (const entry of value) {
       appendItem(entry);
     }
   };
 
-  if (Array.isArray(payload)) {
-    appendMany(payload);
-    return items;
-  }
-
-  if (!isRecord(payload)) {
-    return items;
-  }
-
-  appendMany(payload.data);
-
-  if (isRecord(payload.data)) {
+  if (Array.isArray(payload.data)) {
+    appendMany(payload.data);
+  } else if (payload.data) {
     appendMany(payload.data.web);
     appendMany(payload.data.news);
     appendMany(payload.data.results);
@@ -165,12 +267,16 @@ export class FirecrawlWebSearchProvider implements WebSearchProvider {
       signal?: AbortSignal;
     },
   ): Promise<readonly WebSearchResult[]> {
-    const apiKey = this.config.apiKey;
-    if (!apiKey) {
-      throw new Error("FIRECRAWL_API_KEY is not configured.");
-    }
+    const apiKey = adaptFirecrawlSearchResultToProviderHost(
+      decodeFirecrawlApiKey(this.config.apiKey),
+    );
 
-    const body: Record<string, unknown> = {
+    const body: {
+      query: string;
+      limit: number;
+      sources?: readonly string[];
+      tbs?: string;
+    } = {
       query: input.query,
       limit: Math.min(20, Math.max(1, input.maxResults)),
     };
@@ -195,27 +301,19 @@ export class FirecrawlWebSearchProvider implements WebSearchProvider {
       signal: opts?.signal,
     });
 
-    let payload: FirecrawlSearchResponse;
-    try {
-      payload = (await response.json()) as FirecrawlSearchResponse;
-    } catch {
-      throw new Error(`Firecrawl search failed (${response.status}): invalid JSON response.`);
-    }
-
-    if (!response.ok || payload.success === false) {
-      const detail =
-        (typeof payload.error === "string" && payload.error) ||
-        (typeof payload.message === "string" && payload.message) ||
-        response.statusText ||
-        "unknown error";
-      throw new Error(`Firecrawl search failed (${response.status}): ${detail}`);
-    }
-
-    return toFirecrawlItems(payload).map((item) => ({
-      url: item.url,
-      title: item.title,
-      content: item.content,
-      score: item.score,
-    }));
+    const rawPayload = adaptFirecrawlSearchResultToProviderHost(
+      await captureFirecrawlResponseJson(response),
+    );
+    const payload = decodeFirecrawlSearchResponse(rawPayload);
+    return adaptFirecrawlSearchResultToProviderHost(
+      payload
+        .mapError(
+          () =>
+            new FirecrawlSearchFailure({
+              message: `Firecrawl search failed (${response.status}): invalid response contract.`,
+            }),
+        )
+        .andThen((value) => decodeFirecrawlSearchOutcome(response, value)),
+    );
   }
 }

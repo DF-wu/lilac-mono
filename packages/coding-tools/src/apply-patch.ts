@@ -1,14 +1,22 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 
-import { expandTilde } from "@stanley2058/lilac-fs";
+import {
+  captureFilesystemOperation,
+  expandTilde,
+  type FileSystemOperationFailed,
+} from "@stanley2058/lilac-fs";
 import { tool, type ToolSet } from "ai";
+import { Result, TaggedError, type Result as ResultType } from "better-result";
 
 import {
-  assertCanonicalPathAllowed,
-  assertGuardrailBypassAllowed,
-  assertLocalCwd,
+  canonicalPathAllowed,
+  guardrailBypassAllowed,
+  validateLocalCwd,
+  type CanonicalPathError,
+  type CodingToolGuardrailViolation,
 } from "./guardrails";
+import { adaptCodingToolResultToHost } from "./host-compatibility";
 import { applyPatchInputSchema } from "./schemas";
 
 export type UpdateFileChunk = {
@@ -22,6 +30,41 @@ export type PatchHunk =
   | { type: "add"; path: string; contents: string }
   | { type: "delete"; path: string }
   | { type: "update"; path: string; movePath?: string; chunks: UpdateFileChunk[] };
+
+export class PatchRejected extends TaggedError("PatchRejected")<{
+  readonly message: string;
+}> {}
+
+export class PatchAborted extends TaggedError("PatchAborted")<{
+  readonly message: string;
+}> {}
+
+export type CommittedPatchMutation = {
+  readonly type: "directory-created" | "file-written" | "path-removed";
+  readonly path: string;
+};
+
+export class PatchAbortedAfterCommit extends TaggedError("PatchAbortedAfterCommit")<{
+  readonly committedMutations: readonly CommittedPatchMutation[];
+  readonly message: string;
+  readonly retrySafe: false;
+}> {}
+
+export type ApplyPatchError =
+  | PatchRejected
+  | PatchAborted
+  | PatchAbortedAfterCommit
+  | CodingToolGuardrailViolation
+  | FileSystemOperationFailed;
+
+function resultOutcome<T, E>(
+  result: ResultType<T, E>,
+): { ok: true; value: T } | { ok: false; error: E } {
+  return result.match<{ ok: true; value: T } | { ok: false; error: E }>({
+    ok: (value) => ({ ok: true, value }),
+    err: (error) => ({ ok: false, error }),
+  });
+}
 
 function stripHeredoc(input: string): string {
   const match = input.match(/^(?:cat\s+)?<<['"]?(\w+)['"]?\s*\n([\s\S]*?)\n\1\s*$/);
@@ -124,12 +167,14 @@ function parseUpdateChunks(
   return { chunks, nextIndex: index };
 }
 
-export function parsePatch(patchText: string): PatchHunk[] {
+export function parsePatchResult(patchText: string): ResultType<PatchHunk[], PatchRejected> {
   const lines = stripHeredoc(patchText.trim()).split("\n");
   const begin = lines.findIndex((line) => line.trim() === "*** Begin Patch");
   const end = lines.findIndex((line) => line.trim() === "*** End Patch");
   if (begin < 0 || end < 0 || begin >= end) {
-    throw new Error("Invalid patch format: missing Begin/End markers");
+    return Result.err(
+      new PatchRejected({ message: "Invalid patch format: missing Begin/End markers" }),
+    );
   }
 
   const hunks: PatchHunk[] = [];
@@ -162,8 +207,14 @@ export function parsePatch(patchText: string): PatchHunk[] {
     index = parsed.nextIndex;
   }
 
-  if (hunks.length === 0) throw new Error("patch rejected: empty patch");
-  return hunks;
+  if (hunks.length === 0) {
+    return Result.err(new PatchRejected({ message: "patch rejected: empty patch" }));
+  }
+  return Result.ok(hunks);
+}
+
+export function parsePatch(patchText: string): PatchHunk[] {
+  return adaptCodingToolResultToHost(parsePatchResult(patchText));
 }
 
 function normalizeUnicode(value: string): string {
@@ -203,7 +254,7 @@ function applyUpdateChunks(
   original: string,
   filePath: string,
   chunks: readonly UpdateFileChunk[],
-): string {
+): ResultType<string, PatchRejected> {
   const hadTrailingNewline = original.endsWith("\n");
   const lines = original.split("\n");
   if (hadTrailingNewline) lines.pop();
@@ -213,7 +264,11 @@ function applyUpdateChunks(
     if (chunk.changeContext) {
       const contextIndex = findSequence(lines, [chunk.changeContext], searchFrom);
       if (contextIndex < 0) {
-        throw new Error(`Failed to find context '${chunk.changeContext}' in ${filePath}`);
+        return Result.err(
+          new PatchRejected({
+            message: `Failed to find context '${chunk.changeContext}' in ${filePath}`,
+          }),
+        );
       }
       searchFrom = contextIndex + 1;
     }
@@ -233,8 +288,10 @@ function applyUpdateChunks(
       found = findSequence(lines, oldLines, searchFrom, chunk.isEndOfFile);
     }
     if (found < 0) {
-      throw new Error(
-        `Failed to find expected lines in ${filePath}:\n${chunk.oldLines.join("\n")}`,
+      return Result.err(
+        new PatchRejected({
+          message: `Failed to find expected lines in ${filePath}:\n${chunk.oldLines.join("\n")}`,
+        }),
       );
     }
     lines.splice(found, oldLines.length, ...newLines);
@@ -242,7 +299,7 @@ function applyUpdateChunks(
   }
 
   const updated = lines.join("\n");
-  return hadTrailingNewline || chunks.length > 0 ? `${updated}\n` : updated;
+  return Result.ok(hadTrailingNewline || chunks.length > 0 ? `${updated}\n` : updated);
 }
 
 function resolvePatchPath(cwd: string, target: string): string {
@@ -250,8 +307,233 @@ function resolvePatchPath(cwd: string, target: string): string {
   return path.isAbsolute(expanded) ? path.resolve(expanded) : path.resolve(cwd, expanded);
 }
 
-function throwIfAborted(abortSignal?: AbortSignal): void {
-  if (abortSignal?.aborted) throw new Error("apply_patch aborted");
+function checkAborted(
+  abortSignal: AbortSignal | undefined,
+  committedMutations: readonly CommittedPatchMutation[],
+): ResultType<void, PatchAborted | PatchAbortedAfterCommit> {
+  if (!abortSignal?.aborted) return Result.ok(undefined);
+  if (committedMutations.length === 0) {
+    return Result.err(new PatchAborted({ message: "patch aborted" }));
+  }
+  return Result.err(
+    new PatchAbortedAfterCommit({
+      committedMutations: [...committedMutations],
+      message:
+        "patch aborted after filesystem changes were committed; do not retry the patch without inspecting the listed mutations",
+      retrySafe: false,
+    }),
+  );
+}
+
+function patchPathAllowed(params: {
+  targetPath: string;
+  denyPaths: readonly string[];
+  operation: string;
+  dangerouslyAllow?: boolean;
+}): Promise<ResultType<void, CanonicalPathError>> {
+  return canonicalPathAllowed(params);
+}
+
+export async function applyPatchResult(params: {
+  cwd: string;
+  patchText: string;
+  denyPaths: readonly string[];
+  dangerouslyAllow?: boolean;
+  allowGuardrailBypass?: boolean;
+  abortSignal?: AbortSignal;
+}): Promise<ResultType<string, ApplyPatchError>> {
+  const bypass = resultOutcome(
+    guardrailBypassAllowed(params.dangerouslyAllow, params.allowGuardrailBypass ?? false),
+  );
+  if (!bypass.ok) return Result.err(bypass.error);
+  const localCwd = resultOutcome(validateLocalCwd(params.cwd));
+  if (!localCwd.ok) return Result.err(localCwd.error);
+  const committedMutations: CommittedPatchMutation[] = [];
+  const initialAbort = resultOutcome(checkAborted(params.abortSignal, committedMutations));
+  if (!initialAbort.ok) return Result.err(initialAbort.error);
+  const cwd = path.resolve(expandTilde(params.cwd));
+  const parsed = resultOutcome(parsePatchResult(params.patchText));
+  if (!parsed.ok) return Result.err(parsed.error);
+  const touched: string[] = [];
+
+  for (const hunk of parsed.value) {
+    const beforeHunk = resultOutcome(checkAborted(params.abortSignal, committedMutations));
+    if (!beforeHunk.ok) return Result.err(beforeHunk.error);
+    const source = resolvePatchPath(cwd, hunk.path);
+    if (hunk.type === "add") {
+      const allowed = resultOutcome(
+        await patchPathAllowed({
+          targetPath: source,
+          denyPaths: params.denyPaths,
+          operation: "patch add",
+          dangerouslyAllow: params.dangerouslyAllow,
+        }),
+      );
+      if (!allowed.ok) return Result.err(allowed.error);
+      const beforeCreate = resultOutcome(checkAborted(params.abortSignal, committedMutations));
+      if (!beforeCreate.ok) return Result.err(beforeCreate.error);
+      const createDirectory = resultOutcome(
+        await captureFilesystemOperation("create patch directory", () =>
+          fs.mkdir(path.dirname(source), { recursive: true }),
+        ),
+      );
+      if (!createDirectory.ok) return Result.err(createDirectory.error);
+      if (createDirectory.value !== undefined) {
+        committedMutations.push({ type: "directory-created", path: createDirectory.value });
+      }
+      const afterCreate = resultOutcome(checkAborted(params.abortSignal, committedMutations));
+      if (!afterCreate.ok) return Result.err(afterCreate.error);
+      const allowedAfterCreate = resultOutcome(
+        await patchPathAllowed({
+          targetPath: source,
+          denyPaths: params.denyPaths,
+          operation: "patch add",
+          dangerouslyAllow: params.dangerouslyAllow,
+        }),
+      );
+      if (!allowedAfterCreate.ok) return Result.err(allowedAfterCreate.error);
+      const beforeWrite = resultOutcome(checkAborted(params.abortSignal, committedMutations));
+      if (!beforeWrite.ok) return Result.err(beforeWrite.error);
+      const written = resultOutcome(
+        await captureFilesystemOperation("write added patch file", () =>
+          fs.writeFile(source, hunk.contents, "utf8"),
+        ),
+      );
+      if (!written.ok) return Result.err(written.error);
+      committedMutations.push({ type: "file-written", path: source });
+      const afterWrite = resultOutcome(checkAborted(params.abortSignal, committedMutations));
+      if (!afterWrite.ok) return Result.err(afterWrite.error);
+      touched.push(`A ${path.relative(cwd, source) || path.basename(source)}`);
+      continue;
+    }
+    if (hunk.type === "delete") {
+      const allowed = resultOutcome(
+        await patchPathAllowed({
+          targetPath: source,
+          denyPaths: params.denyPaths,
+          operation: "patch delete",
+          dangerouslyAllow: params.dangerouslyAllow,
+        }),
+      );
+      if (!allowed.ok) return Result.err(allowed.error);
+      const inspected = resultOutcome(
+        await captureFilesystemOperation("inspect patch deletion target", () => fs.stat(source)),
+      );
+      if (!inspected.ok && inspected.error.code !== "ENOENT") return Result.err(inspected.error);
+      const stats = inspected.ok ? inspected.value : null;
+      if (stats?.isDirectory()) {
+        return Result.err(
+          new PatchRejected({ message: `Refusing to delete directory: ${hunk.path}` }),
+        );
+      }
+      const allowedBeforeDelete = resultOutcome(
+        await patchPathAllowed({
+          targetPath: source,
+          denyPaths: params.denyPaths,
+          operation: "patch delete",
+          dangerouslyAllow: params.dangerouslyAllow,
+        }),
+      );
+      if (!allowedBeforeDelete.ok) return Result.err(allowedBeforeDelete.error);
+      const beforeDelete = resultOutcome(checkAborted(params.abortSignal, committedMutations));
+      if (!beforeDelete.ok) return Result.err(beforeDelete.error);
+      const removed = resultOutcome(
+        await captureFilesystemOperation("delete patch file", () => fs.rm(source, { force: true })),
+      );
+      if (!removed.ok) return Result.err(removed.error);
+      if (stats !== null) committedMutations.push({ type: "path-removed", path: source });
+      const afterDelete = resultOutcome(checkAborted(params.abortSignal, committedMutations));
+      if (!afterDelete.ok) return Result.err(afterDelete.error);
+      touched.push(`D ${path.relative(cwd, source) || path.basename(source)}`);
+      continue;
+    }
+
+    const destination = hunk.movePath ? resolvePatchPath(cwd, hunk.movePath) : source;
+    const sourceAllowed = resultOutcome(
+      await patchPathAllowed({
+        targetPath: source,
+        denyPaths: params.denyPaths,
+        operation: "patch update read",
+        dangerouslyAllow: params.dangerouslyAllow,
+      }),
+    );
+    if (!sourceAllowed.ok) return Result.err(sourceAllowed.error);
+    const original = resultOutcome(
+      await captureFilesystemOperation("read patch source", () => fs.readFile(source, "utf8")),
+    );
+    if (!original.ok) return Result.err(original.error);
+    const updated = resultOutcome(applyUpdateChunks(original.value, hunk.path, hunk.chunks));
+    if (!updated.ok) return Result.err(updated.error);
+    const destinationAllowed = resultOutcome(
+      await patchPathAllowed({
+        targetPath: destination,
+        denyPaths: params.denyPaths,
+        operation: "patch update write",
+        dangerouslyAllow: params.dangerouslyAllow,
+      }),
+    );
+    if (!destinationAllowed.ok) return Result.err(destinationAllowed.error);
+    const beforeCreate = resultOutcome(checkAborted(params.abortSignal, committedMutations));
+    if (!beforeCreate.ok) return Result.err(beforeCreate.error);
+    const createDirectory = resultOutcome(
+      await captureFilesystemOperation("create patch destination", () =>
+        fs.mkdir(path.dirname(destination), { recursive: true }),
+      ),
+    );
+    if (!createDirectory.ok) return Result.err(createDirectory.error);
+    if (createDirectory.value !== undefined) {
+      committedMutations.push({ type: "directory-created", path: createDirectory.value });
+    }
+    const afterCreate = resultOutcome(checkAborted(params.abortSignal, committedMutations));
+    if (!afterCreate.ok) return Result.err(afterCreate.error);
+    const destinationAllowedAfterCreate = resultOutcome(
+      await patchPathAllowed({
+        targetPath: destination,
+        denyPaths: params.denyPaths,
+        operation: "patch update write",
+        dangerouslyAllow: params.dangerouslyAllow,
+      }),
+    );
+    if (!destinationAllowedAfterCreate.ok) return Result.err(destinationAllowedAfterCreate.error);
+    const beforeWrite = resultOutcome(checkAborted(params.abortSignal, committedMutations));
+    if (!beforeWrite.ok) return Result.err(beforeWrite.error);
+    const written = resultOutcome(
+      await captureFilesystemOperation("write patched file", () =>
+        fs.writeFile(destination, updated.value, "utf8"),
+      ),
+    );
+    if (!written.ok) return Result.err(written.error);
+    committedMutations.push({ type: "file-written", path: destination });
+    const afterWrite = resultOutcome(checkAborted(params.abortSignal, committedMutations));
+    if (!afterWrite.ok) return Result.err(afterWrite.error);
+    if (destination !== source) {
+      const sourceDeleteAllowed = resultOutcome(
+        await patchPathAllowed({
+          targetPath: source,
+          denyPaths: params.denyPaths,
+          operation: "patch move delete",
+          dangerouslyAllow: params.dangerouslyAllow,
+        }),
+      );
+      if (!sourceDeleteAllowed.ok) return Result.err(sourceDeleteAllowed.error);
+      const beforeSourceDelete = resultOutcome(
+        checkAborted(params.abortSignal, committedMutations),
+      );
+      if (!beforeSourceDelete.ok) return Result.err(beforeSourceDelete.error);
+      const removed = resultOutcome(
+        await captureFilesystemOperation("remove moved patch source", () =>
+          fs.rm(source, { force: true }),
+        ),
+      );
+      if (!removed.ok) return Result.err(removed.error);
+      committedMutations.push({ type: "path-removed", path: source });
+    }
+    const afterUpdate = resultOutcome(checkAborted(params.abortSignal, committedMutations));
+    if (!afterUpdate.ok) return Result.err(afterUpdate.error);
+    touched.push(`M ${path.relative(cwd, destination) || path.basename(destination)}`);
+  }
+
+  return Result.ok(`Success. Updated the following files:\n${touched.join("\n")}`);
 }
 
 export async function applyPatch(params: {
@@ -262,106 +544,7 @@ export async function applyPatch(params: {
   allowGuardrailBypass?: boolean;
   abortSignal?: AbortSignal;
 }): Promise<string> {
-  assertGuardrailBypassAllowed(params.dangerouslyAllow, params.allowGuardrailBypass ?? false);
-  assertLocalCwd(params.cwd);
-  throwIfAborted(params.abortSignal);
-  const cwd = path.resolve(expandTilde(params.cwd));
-  const hunks = parsePatch(params.patchText);
-  const touched: string[] = [];
-
-  for (const hunk of hunks) {
-    throwIfAborted(params.abortSignal);
-    const source = resolvePatchPath(cwd, hunk.path);
-    if (hunk.type === "add") {
-      await assertCanonicalPathAllowed(
-        source,
-        params.denyPaths,
-        "apply_patch add",
-        params.dangerouslyAllow,
-      );
-      throwIfAborted(params.abortSignal);
-      await fs.mkdir(path.dirname(source), { recursive: true });
-      throwIfAborted(params.abortSignal);
-      await assertCanonicalPathAllowed(
-        source,
-        params.denyPaths,
-        "apply_patch add",
-        params.dangerouslyAllow,
-      );
-      throwIfAborted(params.abortSignal);
-      await fs.writeFile(source, hunk.contents, "utf8");
-      throwIfAborted(params.abortSignal);
-      touched.push(`A ${path.relative(cwd, source) || path.basename(source)}`);
-      continue;
-    }
-    if (hunk.type === "delete") {
-      await assertCanonicalPathAllowed(
-        source,
-        params.denyPaths,
-        "apply_patch delete",
-        params.dangerouslyAllow,
-      );
-      throwIfAborted(params.abortSignal);
-      const stats = await fs.stat(source).catch(() => undefined);
-      throwIfAborted(params.abortSignal);
-      if (stats?.isDirectory()) throw new Error(`Refusing to delete directory: ${hunk.path}`);
-      await assertCanonicalPathAllowed(
-        source,
-        params.denyPaths,
-        "apply_patch delete",
-        params.dangerouslyAllow,
-      );
-      throwIfAborted(params.abortSignal);
-      await fs.rm(source, { force: true });
-      throwIfAborted(params.abortSignal);
-      touched.push(`D ${path.relative(cwd, source) || path.basename(source)}`);
-      continue;
-    }
-
-    const destination = hunk.movePath ? resolvePatchPath(cwd, hunk.movePath) : source;
-    await assertCanonicalPathAllowed(
-      source,
-      params.denyPaths,
-      "apply_patch update read",
-      params.dangerouslyAllow,
-    );
-    throwIfAborted(params.abortSignal);
-    const original = await fs.readFile(source, "utf8");
-    throwIfAborted(params.abortSignal);
-    const updated = applyUpdateChunks(original, hunk.path, hunk.chunks);
-    await assertCanonicalPathAllowed(
-      destination,
-      params.denyPaths,
-      "apply_patch update write",
-      params.dangerouslyAllow,
-    );
-    throwIfAborted(params.abortSignal);
-    await fs.mkdir(path.dirname(destination), { recursive: true });
-    throwIfAborted(params.abortSignal);
-    await assertCanonicalPathAllowed(
-      destination,
-      params.denyPaths,
-      "apply_patch update write",
-      params.dangerouslyAllow,
-    );
-    throwIfAborted(params.abortSignal);
-    await fs.writeFile(destination, updated, "utf8");
-    throwIfAborted(params.abortSignal);
-    if (destination !== source) {
-      await assertCanonicalPathAllowed(
-        source,
-        params.denyPaths,
-        "apply_patch move delete",
-        params.dangerouslyAllow,
-      );
-      throwIfAborted(params.abortSignal);
-      await fs.rm(source, { force: true });
-      throwIfAborted(params.abortSignal);
-    }
-    touched.push(`M ${path.relative(cwd, destination) || path.basename(destination)}`);
-  }
-
-  return `Success. Updated the following files:\n${touched.join("\n")}`;
+  return adaptCodingToolResultToHost(await applyPatchResult(params));
 }
 
 export function createApplyPatchTool(params: {
@@ -370,7 +553,7 @@ export function createApplyPatchTool(params: {
   allowGuardrailBypass?: boolean;
 }): ToolSet {
   return {
-    apply_patch: tool({
+    patch: tool({
       description:
         "Apply a local *** Begin Patch with Add, Delete, Update, and optional Move to sections. Directory deletion is refused.",
       inputSchema: applyPatchInputSchema,

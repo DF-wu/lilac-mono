@@ -3,30 +3,24 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
-import {
-  createLilacBus,
-  lilacEventTypes,
-  type HandleContext,
-  type Message,
-  type PublishOptions,
-  type RawBus,
-  type SubscriptionOptions,
-} from "@stanley2058/lilac-event-bus";
+import { createLilacBus, lilacEventTypes, type Message } from "@stanley2058/lilac-event-bus";
+import { Result } from "better-result";
 import { parseCoreConfigV2ToUniversal } from "@stanley2058/lilac-utils/core-config/v2";
 import type { CoreConfig } from "@stanley2058/lilac-utils";
 import type { Message as TelegramMessage, Update } from "grammy/types";
 
 import { CustomCommandManager } from "../../../src/custom-commands/manager";
-import { TelegramAdapter } from "../../../src/surface/telegram/telegram-adapter";
 import { bridgeAdapterToBus } from "../../../src/surface/bridge/publish-to-bus";
-import { startBusRequestRouter } from "../../../src/surface/bridge/bus-request-router";
+import { TelegramAdapter } from "../../../src/surface/telegram/telegram-adapter";
+import { startTelegramRequestRouter } from "../../../src/surface/telegram/telegram-request-router";
+import { createInMemoryDeliveryBus } from "../../helpers/in-memory-delivery-bus";
 import { FakeBotApiServer } from "./fake-bot-api-server";
 import { BOT_USER_ID, BOT_USERNAME, makeMessage, makeSupergroupChat } from "./telegram-fixtures";
 
 /**
  * The whole inbound chain, with only the Bot API faked:
  *
- *   TelegramAdapter -> bridgeAdapterToBus -> bus -> startBusRequestRouter
+ *   TelegramAdapter -> bridgeAdapterToBus -> bus -> startTelegramRequestRouter
  *
  * This is the seam that shipped broken. The adapter integration suite stops at
  * the emitted `AdapterEvent`, and the router suite starts by publishing bus
@@ -41,55 +35,6 @@ let adapter: TelegramAdapter | null = null;
 let stopBridge: { stop(): Promise<void> } | null = null;
 let stopRouter: { stop(): Promise<void> } | null = null;
 let scratchDir = "";
-
-function createInMemoryRawBus(): RawBus {
-  const topics = new Map<string, Array<Message<unknown>>>();
-  const subs = new Set<{
-    topic: string;
-    handler: (msg: Message<unknown>, ctx: HandleContext) => Promise<void>;
-  }>();
-
-  return {
-    publish: async <TData>(msg: Omit<Message<TData>, "id" | "ts">, opts: PublishOptions) => {
-      const id = `${Date.now()}-${topics.get(opts.topic)?.length ?? 0}`;
-      const stored: Message<unknown> = {
-        topic: opts.topic,
-        id,
-        type: opts.type,
-        ts: Date.now(),
-        key: opts.key,
-        headers: opts.headers,
-        data: msg.data as unknown,
-      };
-      topics.set(opts.topic, [...(topics.get(opts.topic) ?? []), stored]);
-      for (const s of subs) {
-        if (s.topic !== opts.topic) continue;
-        await s.handler(stored, { cursor: id, commit: async () => {} });
-      }
-      return { id, cursor: id };
-    },
-    subscribe: async <TData>(
-      topic: string,
-      _opts: SubscriptionOptions,
-      handler: (msg: Message<TData>, ctx: HandleContext) => Promise<void>,
-    ) => {
-      const entry = {
-        topic,
-        handler: handler as (msg: Message<unknown>, ctx: HandleContext) => Promise<void>,
-      };
-      subs.add(entry);
-      return { stop: async () => void subs.delete(entry) };
-    },
-    fetch: async <TData>(topic: string) => {
-      const existing = topics.get(topic) ?? [];
-      return {
-        messages: existing.map((m) => ({ msg: m as unknown as Message<TData>, cursor: m.id })),
-        ...(existing.length > 0 ? { next: existing[existing.length - 1]?.id } : {}),
-      };
-    },
-    close: async () => {},
-  };
-}
 
 function testConfig(telegram: Record<string, unknown> = {}): CoreConfig {
   const cfg = parseCoreConfigV2ToUniversal({
@@ -148,16 +93,17 @@ async function loadRegistry(
 }
 
 async function startChain(cfg: CoreConfig = testConfig(), customCommands?: CustomCommandManager) {
-  const bus = createLilacBus(createInMemoryRawBus());
+  const bus = createLilacBus(createInMemoryDeliveryBus());
   const requests: Array<Message<unknown>> = [];
 
   await bus.subscribeTopic(
     "cmd.request",
-    { mode: "fanout", subscriptionId: "sink", consumerId: "sink-1", offset: { type: "now" } },
-    async (msg, ctx) => {
+    { mode: "fanout", subscriptionId: "sink", consumerId: "sink-1" },
+    async (msg) => {
       if (msg.type === lilacEventTypes.CmdRequestMessage) requests.push(msg);
-      await ctx.commit();
+      return Result.ok(undefined);
     },
+    () => "park-pending",
   );
 
   const created = new TelegramAdapter({
@@ -173,11 +119,15 @@ async function startChain(cfg: CoreConfig = testConfig(), customCommands?: Custo
   });
 
   // Exactly the runtime's order: both subscriptions live before polling starts.
-  stopBridge = await bridgeAdapterToBus({ adapter: created, bus, subscriptionId: "e2e-bridge" });
-  stopRouter = await startBusRequestRouter({
+  stopBridge = await bridgeAdapterToBus({
+    eventSource: created,
+    platform: "telegram",
+    bus,
+    subscriptionId: "e2e-bridge",
+  });
+  stopRouter = await startTelegramRequestRouter({
     adapter: created,
     bus,
-    platform: "telegram",
     subscriptionId: "e2e-router",
     ...(customCommands ? { customCommands } : {}),
     config: {

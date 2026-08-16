@@ -20,53 +20,42 @@ function aliasedTargetKey(path: CoreConfigKeyPath, sourceKey: string): string | 
   return undefined;
 }
 
-function collectUnknownConfigKeyPathsInto(
-  source: unknown,
-  target: unknown,
-  path: CoreConfigKeyPath,
-  unknownPaths: CoreConfigKeyPath[],
-): void {
-  if (Array.isArray(source) && Array.isArray(target)) {
-    const commonLength = Math.min(source.length, target.length);
-    for (let index = 0; index < commonLength; index += 1) {
-      collectUnknownConfigKeyPathsInto(
-        source[index],
-        target[index],
-        [...path, index],
-        unknownPaths,
-      );
-    }
-    return;
-  }
-
-  if (!isRecord(source) || !isRecord(target)) return;
-
-  for (const sourceKey of Object.keys(source)) {
-    const targetKey = Object.hasOwn(target, sourceKey)
-      ? sourceKey
-      : aliasedTargetKey(path, sourceKey);
-    const sourcePath = [...path, sourceKey];
-
-    if (targetKey === undefined || !Object.hasOwn(target, targetKey)) {
-      unknownPaths.push(sourcePath);
-      continue;
-    }
-
-    collectUnknownConfigKeyPathsInto(
-      source[sourceKey],
-      target[targetKey],
-      sourcePath,
-      unknownPaths,
-    );
-  }
-}
-
 export function collectUnknownConfigKeyPaths(
   source: unknown,
   target: unknown,
 ): CoreConfigKeyPath[] {
   const unknownPaths: CoreConfigKeyPath[] = [];
-  collectUnknownConfigKeyPathsInto(source, target, [], unknownPaths);
+  const collectInto = (
+    sourceValue: unknown,
+    targetValue: unknown,
+    path: CoreConfigKeyPath,
+  ): void => {
+    if (Array.isArray(sourceValue) && Array.isArray(targetValue)) {
+      const commonLength = Math.min(sourceValue.length, targetValue.length);
+      for (let index = 0; index < commonLength; index += 1) {
+        collectInto(sourceValue[index], targetValue[index], [...path, index]);
+      }
+      return;
+    }
+
+    if (!isRecord(sourceValue) || !isRecord(targetValue)) return;
+
+    for (const sourceKey of Object.keys(sourceValue)) {
+      const targetKey = Object.hasOwn(targetValue, sourceKey)
+        ? sourceKey
+        : aliasedTargetKey(path, sourceKey);
+      const sourcePath = [...path, sourceKey];
+
+      if (targetKey === undefined || !Object.hasOwn(targetValue, targetKey)) {
+        unknownPaths.push(sourcePath);
+        continue;
+      }
+
+      collectInto(sourceValue[sourceKey], targetValue[targetKey], sourcePath);
+    }
+  };
+
+  collectInto(source, target, []);
   return unknownPaths;
 }
 

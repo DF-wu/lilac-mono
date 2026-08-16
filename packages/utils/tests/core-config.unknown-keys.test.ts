@@ -1,6 +1,11 @@
 import { describe, expect, it } from "bun:test";
+import { Panic } from "better-result";
 
-import { parseCoreConfig } from "../core-config";
+import {
+  decodeCoreConfigV1ToUniversal,
+  decodeCoreConfigV2ToUniversal,
+  parseCoreConfig,
+} from "../core-config";
 
 import type { CoreConfigKeyPath } from "../core-config";
 
@@ -18,6 +23,33 @@ function collectWarnings(): {
 }
 
 describe("core config unknown keys", () => {
+  for (const [version, decode] of [
+    [1, decodeCoreConfigV1ToUniversal],
+    [2, decodeCoreConfigV2ToUniversal],
+  ] as const) {
+    it(`preserves exact v${version} onUnknownKey callback exceptions`, () => {
+      for (const sentinel of [
+        new Error(`v${version} unknown-key callback failed`),
+        new Panic({ message: `v${version} unknown-key callback invariant` }),
+      ]) {
+        let caught: unknown;
+        try {
+          decode(
+            { configVersion: version, unknownKey: true },
+            {
+              onUnknownKey() {
+                throw sentinel;
+              },
+            },
+          );
+        } catch (cause) {
+          caught = cause;
+        }
+        expect(caught).toBe(sentinel);
+      }
+    });
+  }
+
   it("reports unknown top-level and nested keys after successful validation", async () => {
     const warnings = collectWarnings();
     const parsed = await parseCoreConfig(

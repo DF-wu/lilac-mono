@@ -54,6 +54,15 @@ export type DbDiscordMessageRelation = {
   updated_ts: number;
 };
 
+export type DiscordSessionRaw = {
+  channel: {
+    id: string;
+    name?: string;
+    guildId?: string | null;
+    parentChannelId?: string | null;
+  };
+};
+
 export class DiscordSurfaceStore {
   private readonly db: Database;
 
@@ -172,7 +181,7 @@ export class DiscordSurfaceStore {
     name?: string;
     type: "channel" | "thread" | "dm";
     updatedTs: number;
-    raw?: unknown;
+    raw?: DiscordSessionRaw;
   }) {
     const rawJson = input.raw ? JSON.stringify(input.raw) : null;
     this.db.run(
@@ -202,14 +211,16 @@ export class DiscordSurfaceStore {
 
   getSession(channelId: string): DbDiscordSession | null {
     return this.db
-      .query("SELECT * FROM discord_sessions WHERE channel_id = ?")
-      .get(channelId) as DbDiscordSession | null;
+      .query<DbDiscordSession, [string]>("SELECT * FROM discord_sessions WHERE channel_id = ?")
+      .get(channelId);
   }
 
   listSessions(limit = 500): DbDiscordSession[] {
     return this.db
-      .query("SELECT * FROM discord_sessions ORDER BY updated_ts DESC LIMIT ?")
-      .all(limit) as DbDiscordSession[];
+      .query<DbDiscordSession, [number]>(
+        "SELECT * FROM discord_sessions ORDER BY updated_ts DESC LIMIT ?",
+      )
+      .all(limit);
   }
 
   upsertUserName(input: {
@@ -257,15 +268,17 @@ export class DiscordSurfaceStore {
 
   getUserIdByUsername(username: string): string | null {
     const row = this.db
-      .query("SELECT user_id FROM discord_user_ids_by_username WHERE username_lc = ?")
-      .get(username.toLowerCase()) as { user_id: string } | null;
+      .query<{ user_id: string }, [string]>(
+        "SELECT user_id FROM discord_user_ids_by_username WHERE username_lc = ?",
+      )
+      .get(username.toLowerCase());
     return row?.user_id ?? null;
   }
 
   getUserName(userId: string): DbDiscordUserName | null {
     return this.db
-      .query("SELECT * FROM discord_user_names WHERE user_id = ?")
-      .get(userId) as DbDiscordUserName | null;
+      .query<DbDiscordUserName, [string]>("SELECT * FROM discord_user_names WHERE user_id = ?")
+      .get(userId);
   }
 
   upsertChannelName(input: { channelId: string; name?: string; updatedTs: number }) {
@@ -283,8 +296,10 @@ export class DiscordSurfaceStore {
 
   getChannelName(channelId: string): DbDiscordChannelName | null {
     return this.db
-      .query("SELECT * FROM discord_channel_names WHERE channel_id = ?")
-      .get(channelId) as DbDiscordChannelName | null;
+      .query<DbDiscordChannelName, [string]>(
+        "SELECT * FROM discord_channel_names WHERE channel_id = ?",
+      )
+      .get(channelId);
   }
 
   upsertRoleName(input: { guildId: string; roleId: string; name?: string; updatedTs: number }) {
@@ -302,8 +317,10 @@ export class DiscordSurfaceStore {
 
   getRoleName(guildId: string, roleId: string): DbDiscordRoleName | null {
     return this.db
-      .query("SELECT * FROM discord_role_names WHERE guild_id = ? AND role_id = ?")
-      .get(guildId, roleId) as DbDiscordRoleName | null;
+      .query<DbDiscordRoleName, [string, string]>(
+        "SELECT * FROM discord_role_names WHERE guild_id = ? AND role_id = ?",
+      )
+      .get(guildId, roleId);
   }
 
   upsertMessageRelation(input: {
@@ -363,8 +380,10 @@ export class DiscordSurfaceStore {
 
   getMessageRelation(channelId: string, messageId: string): DbDiscordMessageRelation | null {
     return this.db
-      .query("SELECT * FROM discord_message_relations WHERE channel_id = ? AND message_id = ?")
-      .get(channelId, messageId) as DbDiscordMessageRelation | null;
+      .query<DbDiscordMessageRelation, [string, string]>(
+        "SELECT * FROM discord_message_relations WHERE channel_id = ? AND message_id = ?",
+      )
+      .get(channelId, messageId);
   }
 
   listMessageRelationsBeforeOrAt(input: {
@@ -375,7 +394,7 @@ export class DiscordSurfaceStore {
     const safeLimit = Math.min(500, Math.max(1, Math.floor(input.limit)));
 
     const rows = this.db
-      .query(
+      .query<DbDiscordMessageRelation, [string, string, number]>(
         `
         SELECT r.*
         FROM discord_message_relations r
@@ -393,7 +412,7 @@ export class DiscordSurfaceStore {
         LIMIT ?
         `,
       )
-      .all(input.channelId, input.messageId, safeLimit) as DbDiscordMessageRelation[];
+      .all(input.channelId, input.messageId, safeLimit);
 
     rows.reverse();
     return rows;
@@ -414,8 +433,8 @@ export class DiscordSurfaceStore {
 
   getOrInitReadState(channelId: string): DbDiscordReadState {
     const existing = this.db
-      .query("SELECT * FROM discord_read_state WHERE channel_id = ?")
-      .get(channelId) as DbDiscordReadState | null;
+      .query<DbDiscordReadState, [string]>("SELECT * FROM discord_read_state WHERE channel_id = ?")
+      .get(channelId);
 
     if (existing) return existing;
 

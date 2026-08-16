@@ -16,6 +16,7 @@ import {
   type MiniLilacUIMessageMetadata,
   type MiniLilacUndoRequest,
   type MiniLilacUpdateSessionBindingsRequest,
+  MINI_LILAC_UNSUPPORTED_UI_MESSAGE_CHUNK_TYPE,
   miniLilacCompactionEventSchema,
   miniLilacCompactRequestSchema,
   miniLilacCompactResultSchema,
@@ -30,9 +31,11 @@ import {
   miniLilacTodoChunkSchema,
   miniLilacTodoSchema,
   miniLilacTodoStateSchema,
+  miniLilacTodoWriteInputSchema,
   miniLilacUIMessageDataPartSchema,
   miniLilacUIMessageMetadataSchema,
   miniLilacUIMessageSchema,
+  miniLilacUnsupportedUIMessageChunkSchema,
   miniLilacUndoRequestSchema,
   miniLilacUndoResultSchema,
   miniLilacUpdateSessionBindingsRequestSchema,
@@ -41,6 +44,42 @@ import {
 function messageWith(part: unknown): unknown {
   return { id: "message-1", role: "assistant", parts: [part] };
 }
+
+describe("unsupported UI message chunk sentinel", () => {
+  it("keeps only a bounded future chunk type in a strict transient data envelope", () => {
+    expect(
+      miniLilacUnsupportedUIMessageChunkSchema.parse({
+        type: MINI_LILAC_UNSUPPORTED_UI_MESSAGE_CHUNK_TYPE,
+        data: { chunkType: "future-observation" },
+        transient: true,
+      }),
+    ).toEqual({
+      type: MINI_LILAC_UNSUPPORTED_UI_MESSAGE_CHUNK_TYPE,
+      data: { chunkType: "future-observation" },
+      transient: true,
+    });
+
+    for (const malformed of [
+      {
+        type: MINI_LILAC_UNSUPPORTED_UI_MESSAGE_CHUNK_TYPE,
+        data: { chunkType: "" },
+        transient: true,
+      },
+      {
+        type: MINI_LILAC_UNSUPPORTED_UI_MESSAGE_CHUNK_TYPE,
+        data: { chunkType: "x".repeat(129) },
+        transient: true,
+      },
+      {
+        type: MINI_LILAC_UNSUPPORTED_UI_MESSAGE_CHUNK_TYPE,
+        data: { chunkType: "future-observation", payload: true },
+        transient: true,
+      },
+    ]) {
+      expect(miniLilacUnsupportedUIMessageChunkSchema.safeParse(malformed).success).toBe(false);
+    }
+  });
+});
 
 const pendingTodo = {
   content: "Implement durable todos",
@@ -157,6 +196,21 @@ describe("miniLilacUIMessageSchema", () => {
     ]) {
       expect(miniLilacTodoStateSchema.safeParse(malformed).success).toBe(false);
     }
+  });
+
+  it("applies the exact serialized todo-state byte limit to tool input", () => {
+    const oversizedTodos = Array.from({ length: 50 }, (_, index) => ({
+      content: `${index}-${"\u754c".repeat(497)}`,
+      status: "pending" as const,
+      priority: "medium" as const,
+    }));
+    expect(oversizedTodos.every((todo) => todo.content.length <= 500)).toBe(true);
+    expect(miniLilacTodoWriteInputSchema.safeParse({ todos: oversizedTodos }).success).toBe(false);
+    expect(
+      miniLilacTodoWriteInputSchema.safeParse({
+        todos: [{ content: "", status: "cancelled", priority: "low" }],
+      }).success,
+    ).toBe(true);
   });
 
   it("enforces the deterministic serialized todo state UTF-8 byte limit", () => {

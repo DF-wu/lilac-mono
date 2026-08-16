@@ -1,5 +1,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
+import { Result, TaggedError, type Result as ResultType } from "better-result";
+import { isPanic, opaqueErrorMessage } from "@stanley2058/lilac-utils";
 
 import type {
   SubagentDelegationHandle,
@@ -8,18 +10,54 @@ import type {
   TrustedSubagentDelegationRegistration,
 } from "../tools/subagent";
 import type { ToolResultArtifactStore } from "../artifacts/tool-result-artifact-store";
+import { adaptToolResultToHost, preserveToolPanic } from "../tools/tool-result-adapters";
 import { DEFAULT_MAX_ACTIVE_WORKFLOW_RUNS, DurableWorkflowStore } from "./durable-workflow-store";
 import {
   canonicalJsonSha256,
   sha256,
-  validateWorkflowSource,
-  validateWorkflowArgs,
+  validateWorkflowSourceUnchecked,
+  validateWorkflowArgsUnchecked,
   WORKFLOW_RUNTIME_VERSION,
 } from "./workflow-definition";
 import { WorkflowDefinitionStore } from "./workflow-definition-store";
 import type { WorkflowCompletionTarget, WorkflowRevision, WorkflowRun } from "./workflow-domain";
 import { readWorkflowValueArtifact } from "./workflow-artifact-store";
 import { resolveWorkflowSubagentToolResult } from "./workflow-subagent-output";
+
+class WorkflowSubagentDispatchFailed extends TaggedError("WorkflowSubagentDispatchFailed")<{
+  readonly message: string;
+}> {}
+
+type WorkflowSubagentDispatchResult<T> = ResultType<T, WorkflowSubagentDispatchFailed>;
+
+function subagentDispatchFailure(message: string): WorkflowSubagentDispatchFailed {
+  return new WorkflowSubagentDispatchFailed({ message });
+}
+
+function workflowSubagentFinalText(result: WorkflowRun["result"]): string {
+  return typeof result === "string" ? result : JSON.stringify(result);
+}
+
+async function captureSubagentExternal<T>(
+  effect: () => T | Promise<T>,
+): Promise<WorkflowSubagentDispatchResult<T>> {
+  const [settled] = await Promise.allSettled([Promise.resolve().then(effect)]);
+  if (settled.status === "rejected") {
+    if (isPanic(settled.reason)) preserveToolPanic(settled.reason);
+    const cause =
+      settled.reason instanceof Error
+        ? settled.reason
+        : new Error("Opaque workflow subagent dispatch failure");
+    return Result.err(
+      subagentDispatchFailure(opaqueErrorMessage(cause, "Workflow subagent dispatch failed")),
+    );
+  }
+  return Result.ok(settled.value);
+}
+
+function adaptWorkflowSubagentResultToHost<T>(result: WorkflowSubagentDispatchResult<T>): T {
+  return adaptToolResultToHost(result);
+}
 
 const GENERATED_WORKFLOW_NAME = "subagent-delegate";
 
@@ -79,47 +117,69 @@ async function completionStatus(
   store: DurableWorkflowStore,
   dataDir: string,
   toolResultArtifacts?: ToolResultArtifactStore,
-): Promise<SubagentDelegationOutcome> {
+): Promise<WorkflowSubagentDispatchResult<SubagentDelegationOutcome>> {
   if (run.state === "succeeded") {
-    const revision = store.getRevision(run.revisionId);
-    if (!revision) throw new Error(`Subagent workflow revision disappeared: ${run.revisionId}`);
-    const result = run.resultArtifactId
-      ? await readWorkflowValueArtifact({
-          dataDir,
-          artifactId: run.resultArtifactId,
-          maxBytes: revision.limits.maxResultBytes,
-        })
-      : run.result;
-    const rawFinalText = typeof result === "string" ? result : JSON.stringify(result);
-    const finalText =
-      run.completionTarget.kind === "live_parent"
-        ? await resolveWorkflowSubagentToolResult({
-            finalText: rawFinalText,
-            childSessionId: run.completionTarget.childSessionId,
-            artifacts: toolResultArtifacts,
-          })
-        : rawFinalText;
-    return { status: "resolved", finalText };
+    return Result.gen(async function* () {
+      const revision = yield* store
+        .getRevision(run.revisionId)
+        .mapError((error) => subagentDispatchFailure(error.message));
+      if (!revision) {
+        return Result.err(
+          subagentDispatchFailure(`Subagent workflow revision disappeared: ${run.revisionId}`),
+        );
+      }
+      let result = run.result;
+      if (run.resultArtifactId) {
+        result = yield* Result.await(
+          readWorkflowValueArtifact({
+            dataDir,
+            artifactId: run.resultArtifactId,
+            maxBytes: revision.limits.maxResultBytes,
+          }).then((loaded) => loaded.mapError((error) => subagentDispatchFailure(error.message))),
+        );
+      }
+      const rawFinalText = workflowSubagentFinalText(result);
+      let finalText = rawFinalText;
+      if (run.completionTarget.kind === "live_parent") {
+        const childSessionId = run.completionTarget.childSessionId;
+        finalText = yield* Result.await(
+          captureSubagentExternal(() =>
+            resolveWorkflowSubagentToolResult({
+              finalText: rawFinalText,
+              childSessionId,
+              artifacts: toolResultArtifacts,
+            }),
+          ),
+        );
+      }
+      return Result.ok({ status: "resolved" as const, finalText });
+    });
   }
   if (run.state === "cancelled") {
-    return {
+    return Result.ok({
       status: "cancelled",
       finalText: "",
       detail: run.terminalDetail ?? "subagent cancelled",
-    };
+    });
   }
-  const timedOut = store
-    .listOperations(run.runId, { limit: 1_000 })
-    .some((operation) => operation.state === "timed_out");
-  return {
-    status: timedOut ? "timeout" : "failed",
-    finalText: "",
-    detail: run.terminalDetail ?? (timedOut ? "subagent timed out" : "subagent failed"),
-  };
+  const operations = store.listOperations(run.runId, { limit: 1_000 });
+  return operations
+    .mapError((error) => subagentDispatchFailure(error.message))
+    .map((entries) => {
+      const timedOut = entries.some((operation) => operation.state === "timed_out");
+      return {
+        status: timedOut ? ("timeout" as const) : ("failed" as const),
+        finalText: "",
+        detail: run.terminalDetail ?? (timedOut ? "subagent timed out" : "subagent failed"),
+      };
+    });
 }
 
 export class WorkflowSubagentDispatcher {
-  private readonly definitionsStores = new Map<string, Promise<WorkflowDefinitionStore>>();
+  private readonly definitionsStores = new Map<
+    string,
+    Promise<WorkflowSubagentDispatchResult<WorkflowDefinitionStore>>
+  >();
 
   private constructor(
     private readonly input: {
@@ -147,206 +207,287 @@ export class WorkflowSubagentDispatcher {
     return new WorkflowSubagentDispatcher(input);
   }
 
-  private async definitions(projectRoot: string): Promise<WorkflowDefinitionStore> {
+  private async definitions(
+    projectRoot: string,
+  ): Promise<WorkflowSubagentDispatchResult<WorkflowDefinitionStore>> {
     const requestedRoot = path.resolve(projectRoot);
-    const stats = await fs.lstat(requestedRoot);
-    if (stats.isSymbolicLink() || !stats.isDirectory()) {
-      throw new Error(`Subagent workflow project root must be a real directory: ${requestedRoot}`);
-    }
-    const canonicalRoot = await fs.realpath(requestedRoot);
-    let definitions = this.definitionsStores.get(canonicalRoot);
-    if (!definitions) {
-      definitions = WorkflowDefinitionStore.create({
-        workspaceRoot: canonicalRoot,
-        dataDir: this.input.dataDir,
-      });
-      this.definitionsStores.set(canonicalRoot, definitions);
-      definitions.catch(() => this.definitionsStores.delete(canonicalRoot));
-    }
-    return await definitions;
+    const inspected = await captureSubagentExternal(async () => ({
+      stats: await fs.lstat(requestedRoot),
+      canonicalRoot: await fs.realpath(requestedRoot),
+    }));
+    return Result.gen(async function* (this: WorkflowSubagentDispatcher) {
+      const { stats, canonicalRoot } = yield* inspected;
+      if (stats.isSymbolicLink() || !stats.isDirectory()) {
+        return Result.err(
+          subagentDispatchFailure(
+            `Subagent workflow project root must be a real directory: ${requestedRoot}`,
+          ),
+        );
+      }
+      let definitions = this.definitionsStores.get(canonicalRoot);
+      if (!definitions) {
+        definitions = WorkflowDefinitionStore.createResult({
+          workspaceRoot: canonicalRoot,
+          dataDir: this.input.dataDir,
+        }).then((created) =>
+          created.mapError((error) => {
+            this.definitionsStores.delete(canonicalRoot);
+            return subagentDispatchFailure(error.message);
+          }),
+        );
+        this.definitionsStores.set(canonicalRoot, definitions);
+      }
+      return Result.ok(yield* Result.await(definitions));
+    }, this);
   }
 
   async delegate(
     registration: TrustedSubagentDelegationRegistration,
   ): Promise<SubagentDelegationHandle> {
-    const definitions = await this.definitions(registration.projectRoot);
-    const now = this.input.now?.() ?? Date.now();
-    const source = generatedSource({
-      profile: registration.profile,
-      ...(registration.modelOverride ? { model: registration.modelOverride } : {}),
-      ...(registration.reasoningOverride ? { reasoning: registration.reasoningOverride } : {}),
-      idleTimeoutMs: registration.idleTimeoutMs,
-    });
-    const validation = validateWorkflowSource({
-      name: GENERATED_WORKFLOW_NAME,
-      source,
-    });
-    const snapshot = await definitions.createSnapshot(source, validation.sourceSha256);
-    const revisionId = `wfrev:subagent:${sha256(
-      [
-        definitions.canonicalProjectId,
-        validation.sourceSha256,
-        validation.inputSchemaSha256,
-        validation.resourcePolicySha256,
-        WORKFLOW_RUNTIME_VERSION,
-      ].join(":"),
-    ).slice(0, 48)}`;
-    const revision: WorkflowRevision = {
-      revisionId,
-      canonicalProjectId: definitions.canonicalProjectId,
-      canonicalWorkspaceRoot: definitions.canonicalWorkspaceRoot,
-      scope: "project",
-      normalizedPath: ".lilac/internal/subagent-delegate.js",
-      name: GENERATED_WORKFLOW_NAME,
-      snapshotArtifactId: snapshot.artifactId,
-      sourceSha256: validation.sourceSha256,
-      inputSchemaSha256: validation.inputSchemaSha256,
-      resourcePolicySha256: validation.resourcePolicySha256,
-      metadata: validation.metadata,
-      inputSchema: validation.inputSchema,
-      resources: validation.resources,
-      limits: validation.limits,
-      runtimeVersion: WORKFLOW_RUNTIME_VERSION,
-      createdAt: now,
-    };
-    const args = validateWorkflowArgs({
-      inputSchema: revision.inputSchema,
-      args: { task: registration.task, profile: registration.profile },
-      maxInputBytes: revision.limits.maxInputBytes,
-    });
-    const runId = `wfrun:subagent:${crypto.randomUUID()}`;
-    const completionTarget: WorkflowCompletionTarget = {
-      kind: "live_parent",
-      parentRequestId: registration.parentRequestId,
-      parentSessionId: registration.parentSessionId,
-      parentRequestClient: registration.fallbackSurface.platform,
-      parentToolCallId: registration.parentToolCallId,
-      childRequestId: registration.childRequestId,
-      childSessionId: registration.childSessionId,
-      profile: registration.profile,
-      sessionName: registration.sessionName,
-      stableNamedContinuation: registration.stableNamedContinuation,
-      depth: registration.depth,
-      reasoning: registration.reasoningOverride ?? null,
-      fallbackToSurface: false,
-      fallbackProgressTarget: null,
-      deferredDelivery: registration.mode === "deferred",
-    };
-    const requestedRun: WorkflowRun = {
-      runId,
-      revisionId,
-      state: "queued",
-      inputSchemaSnapshot: revision.inputSchema,
-      args,
-      argsSha256: canonicalJsonSha256(args),
-      origin: {
-        requestId: registration.parentRequestId,
-        sessionId: registration.fallbackSurface.sessionId,
-        client: registration.fallbackSurface.platform,
-        userId: registration.fallbackSurface.userId,
-        projectCwd: definitions.canonicalWorkspaceRoot,
-      },
-      completionTarget,
-      progressTarget: null,
-      terminalDetail: null,
-      result: null,
-      resultArtifactId: null,
-      claimedBy: null,
-      claimedAt: null,
-      createdAt: now,
-      startedAt: null,
-      updatedAt: now,
-      terminalAt: null,
-    };
-    const invocation = this.input.store.createInvocation({
-      revision,
-      run: requestedRun,
-      maxActiveRuns: (await this.input.getMaxActiveRuns?.()) ?? DEFAULT_MAX_ACTIVE_WORKFLOW_RUNS,
-    });
-    if (invocation.status === "rejected_capacity") {
-      throw new Error(
-        `Subagent delegation was not created because global workflow capacity is full (${invocation.activeRuns}/${invocation.limit} active runs); wait for a workflow to finish or cancel one, then retry`,
-      );
-    }
-    const { run } = invocation;
-    await this.input.onRunCreated?.(run);
-    const waitForCompletion = () => this.waitForCompletion(runId, registration.mode === "sync");
+    return adaptWorkflowSubagentResultToHost(await this.delegateResult(registration));
+  }
 
-    return {
-      runId,
-      get completion() {
-        return waitForCompletion();
-      },
-      cancel: async (detail) => {
-        const current = this.input.store.getRun(runId);
-        if (!current || ["succeeded", "failed", "cancelled"].includes(current.state)) {
-          return;
-        }
-        const cancelled = this.input.store.cancelRunAndChildren({
-          runId,
-          now: this.input.now?.() ?? Date.now(),
-          detail,
-        });
-        if (cancelled?.state === "cancelled") {
-          await this.input.onRunCancelled?.(cancelled, current.state);
-        }
-      },
-    };
+  private async delegateResult(
+    registration: TrustedSubagentDelegationRegistration,
+  ): Promise<WorkflowSubagentDispatchResult<SubagentDelegationHandle>> {
+    return Result.gen(async function* (this: WorkflowSubagentDispatcher) {
+      const definitions = yield* Result.await(this.definitions(registration.projectRoot));
+      const now = this.input.now?.() ?? Date.now();
+      const source = generatedSource({
+        profile: registration.profile,
+        ...(registration.modelOverride ? { model: registration.modelOverride } : {}),
+        ...(registration.reasoningOverride ? { reasoning: registration.reasoningOverride } : {}),
+        idleTimeoutMs: registration.idleTimeoutMs,
+      });
+      const validation = yield* validateWorkflowSourceUnchecked({
+        name: GENERATED_WORKFLOW_NAME,
+        source,
+      }).mapError((error) => subagentDispatchFailure(error.message));
+      const snapshot = yield* Result.await(
+        definitions
+          .createSnapshotResult(source, validation.sourceSha256)
+          .then((created) => created.mapError((error) => subagentDispatchFailure(error.message))),
+      );
+      const revisionId = `wfrev:subagent:${sha256(
+        [
+          definitions.canonicalProjectId,
+          validation.sourceSha256,
+          validation.inputSchemaSha256,
+          validation.resourcePolicySha256,
+          WORKFLOW_RUNTIME_VERSION,
+        ].join(":"),
+      ).slice(0, 48)}`;
+      const revision: WorkflowRevision = {
+        revisionId,
+        canonicalProjectId: definitions.canonicalProjectId,
+        canonicalWorkspaceRoot: definitions.canonicalWorkspaceRoot,
+        scope: "project",
+        normalizedPath: ".lilac/internal/subagent-delegate.js",
+        name: GENERATED_WORKFLOW_NAME,
+        snapshotArtifactId: snapshot.artifactId,
+        sourceSha256: validation.sourceSha256,
+        inputSchemaSha256: validation.inputSchemaSha256,
+        resourcePolicySha256: validation.resourcePolicySha256,
+        metadata: validation.metadata,
+        inputSchema: validation.inputSchema,
+        resources: validation.resources,
+        limits: validation.limits,
+        runtimeVersion: WORKFLOW_RUNTIME_VERSION,
+        createdAt: now,
+      };
+      const args = yield* validateWorkflowArgsUnchecked({
+        inputSchema: revision.inputSchema,
+        args: { task: registration.task, profile: registration.profile },
+        maxInputBytes: revision.limits.maxInputBytes,
+      }).mapError((error) => subagentDispatchFailure(error.message));
+      const runId = `wfrun:subagent:${crypto.randomUUID()}`;
+      const completionTarget: WorkflowCompletionTarget = {
+        kind: "live_parent",
+        parentRequestId: registration.parentRequestId,
+        parentSessionId: registration.parentSessionId,
+        parentRequestClient: registration.fallbackSurface.platform,
+        parentToolCallId: registration.parentToolCallId,
+        childRequestId: registration.childRequestId,
+        childSessionId: registration.childSessionId,
+        profile: registration.profile,
+        sessionName: registration.sessionName,
+        stableNamedContinuation: registration.stableNamedContinuation,
+        depth: registration.depth,
+        reasoning: registration.reasoningOverride ?? null,
+        fallbackToSurface: false,
+        fallbackProgressTarget: null,
+        deferredDelivery: registration.mode === "deferred",
+      };
+      const requestedRun: WorkflowRun = {
+        runId,
+        revisionId,
+        state: "queued",
+        inputSchemaSnapshot: revision.inputSchema,
+        args,
+        argsSha256: canonicalJsonSha256(args),
+        origin: {
+          requestId: registration.parentRequestId,
+          sessionId: registration.fallbackSurface.sessionId,
+          client: registration.fallbackSurface.platform,
+          userId: registration.fallbackSurface.userId,
+          projectCwd: definitions.canonicalWorkspaceRoot,
+        },
+        completionTarget,
+        progressTarget: null,
+        terminalDetail: null,
+        result: null,
+        resultArtifactId: null,
+        claimedBy: null,
+        claimedAt: null,
+        createdAt: now,
+        startedAt: null,
+        updatedAt: now,
+        terminalAt: null,
+      };
+      const maxActiveRuns = yield* Result.await(
+        captureSubagentExternal(
+          async () => (await this.input.getMaxActiveRuns?.()) ?? DEFAULT_MAX_ACTIVE_WORKFLOW_RUNS,
+        ),
+      );
+      const invocation = yield* this.input.store
+        .createInvocation({
+          revision,
+          run: requestedRun,
+          maxActiveRuns,
+        })
+        .mapError((error) => subagentDispatchFailure(error.message));
+      if (invocation.status === "rejected_capacity") {
+        return Result.err(
+          subagentDispatchFailure(
+            `Subagent delegation was not created because global workflow capacity is full (${invocation.activeRuns}/${invocation.limit} active runs); wait for a workflow to finish or cancel one, then retry`,
+          ),
+        );
+      }
+      const { run } = invocation;
+      yield* Result.await(captureSubagentExternal(async () => this.input.onRunCreated?.(run)));
+      const waitForCompletion = async () =>
+        adaptWorkflowSubagentResultToHost(
+          await this.waitForCompletion(runId, registration.mode === "sync"),
+        );
+
+      return Result.ok({
+        runId,
+        get completion() {
+          return waitForCompletion();
+        },
+        cancel: async (detail: string) => {
+          adaptWorkflowSubagentResultToHost(await this.cancel(runId, detail));
+        },
+      });
+    }, this);
   }
 
   private async waitForCompletion(
     runId: string,
     acknowledgeSynchronousDelivery: boolean,
-  ): Promise<SubagentDelegationOutcome> {
-    const initialRun = this.input.store.getRun(runId);
-    if (!initialRun) throw new Error(`Subagent workflow run disappeared: ${runId}`);
-    const revision = this.input.store.getRevision(initialRun.revisionId);
-    if (!revision)
-      throw new Error(`Subagent workflow revision disappeared: ${initialRun.revisionId}`);
-    const preDispatchDeadline = initialRun.createdAt + revision.resources.operationIdleTimeoutMs;
-
-    while (true) {
-      const run = this.input.store.getRun(runId);
-      if (!run) throw new Error(`Subagent workflow run disappeared: ${runId}`);
-      if (["succeeded", "failed", "cancelled"].includes(run.state)) {
-        const completion = await completionStatus(
-          run,
-          this.input.store,
-          this.input.dataDir,
-          this.input.toolResultArtifacts,
+  ): Promise<WorkflowSubagentDispatchResult<SubagentDelegationOutcome>> {
+    return Result.gen(async function* (this: WorkflowSubagentDispatcher) {
+      const initialRun = yield* this.input.store
+        .getRun(runId)
+        .mapError((error) => subagentDispatchFailure(error.message));
+      if (!initialRun) {
+        return Result.err(subagentDispatchFailure(`Subagent workflow run disappeared: ${runId}`));
+      }
+      const revision = yield* this.input.store
+        .getRevision(initialRun.revisionId)
+        .mapError((error) => subagentDispatchFailure(error.message));
+      if (!revision) {
+        return Result.err(
+          subagentDispatchFailure(
+            `Subagent workflow revision disappeared: ${initialRun.revisionId}`,
+          ),
         );
-        if (acknowledgeSynchronousDelivery) {
-          this.input.store.markLiveParentCompletionDelivered(
-            runId,
-            this.input.now?.() ?? Date.now(),
-          );
-        }
-        return completion;
       }
+      const preDispatchDeadline = initialRun.createdAt + revision.resources.operationIdleTimeoutMs;
 
-      const hasDispatchedAgentOperation = this.input.store
-        .listOperations(runId, { limit: 1_000 })
-        .some((operation) => operation.kind === "agent" && operation.state !== "queued");
-      if (
-        !hasDispatchedAgentOperation &&
-        (this.input.now?.() ?? Date.now()) >= preDispatchDeadline
-      ) {
-        const cancelled = this.input.store.cancelRunAndChildren({
-          runId,
-          now: this.input.now?.() ?? Date.now(),
-          detail: "Subagent idle timeout before agent dispatch",
-        });
-        if (cancelled?.state === "cancelled") {
-          await this.input.onRunCancelled?.(cancelled, run.state);
-          return {
-            status: "timeout",
-            finalText: "",
-            detail: "Subagent idle timeout before agent dispatch",
-          };
+      while (true) {
+        const run = yield* this.input.store
+          .getRun(runId)
+          .mapError((error) => subagentDispatchFailure(error.message));
+        if (!run) {
+          return Result.err(subagentDispatchFailure(`Subagent workflow run disappeared: ${runId}`));
         }
-        continue;
+        if (["succeeded", "failed", "cancelled"].includes(run.state)) {
+          const completion = yield* Result.await(
+            completionStatus(
+              run,
+              this.input.store,
+              this.input.dataDir,
+              this.input.toolResultArtifacts,
+            ),
+          );
+          if (acknowledgeSynchronousDelivery) {
+            this.input.store.markLiveParentCompletionDelivered(
+              runId,
+              this.input.now?.() ?? Date.now(),
+            );
+          }
+          return Result.ok(completion);
+        }
+
+        const operations = yield* this.input.store
+          .listOperations(runId, { limit: 1_000 })
+          .mapError((error) => subagentDispatchFailure(error.message));
+        const hasDispatchedAgentOperation = operations.some(
+          (operation) => operation.kind === "agent" && operation.state !== "queued",
+        );
+        if (
+          !hasDispatchedAgentOperation &&
+          (this.input.now?.() ?? Date.now()) >= preDispatchDeadline
+        ) {
+          const cancelled = this.input.store.cancelRunAndChildren({
+            runId,
+            now: this.input.now?.() ?? Date.now(),
+            detail: "Subagent idle timeout before agent dispatch",
+          });
+          if (cancelled?.state === "cancelled") {
+            yield* Result.await(
+              captureSubagentExternal(async () =>
+                this.input.onRunCancelled?.(cancelled, run.state),
+              ),
+            );
+            return Result.ok({
+              status: "timeout" as const,
+              finalText: "",
+              detail: "Subagent idle timeout before agent dispatch",
+            });
+          }
+          continue;
+        }
+        await Bun.sleep(this.input.pollMs ?? 100);
       }
-      await Bun.sleep(this.input.pollMs ?? 100);
-    }
+    }, this);
+  }
+
+  private async cancel(
+    runId: string,
+    detail: string,
+  ): Promise<WorkflowSubagentDispatchResult<void>> {
+    return Result.gen(async function* (this: WorkflowSubagentDispatcher) {
+      const current = yield* this.input.store
+        .getRun(runId)
+        .mapError((error) => subagentDispatchFailure(error.message));
+      if (!current || ["succeeded", "failed", "cancelled"].includes(current.state)) {
+        return Result.ok(undefined);
+      }
+      const cancelled = this.input.store.cancelRunAndChildren({
+        runId,
+        now: this.input.now?.() ?? Date.now(),
+        detail,
+      });
+      if (cancelled?.state === "cancelled") {
+        yield* Result.await(
+          captureSubagentExternal(async () =>
+            this.input.onRunCancelled?.(cancelled, current.state),
+          ),
+        );
+      }
+      return Result.ok(undefined);
+    }, this);
   }
 }

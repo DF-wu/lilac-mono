@@ -4,10 +4,12 @@ import {
   env,
   isRecord,
   parseCoreConfigV1ToUniversal,
+  parseCoreConfigV2ToUniversal,
   resolveNativeSubagentProfile,
 } from "@stanley2058/lilac-utils";
 import fs from "node:fs/promises";
 import path from "node:path";
+import { Panic } from "better-result";
 
 import {
   BASH_NO_OUTPUT_TIMEOUT_MS,
@@ -350,21 +352,21 @@ rmdir "$media_dir"`,
       expect(res.truncation?.completeOutputRetained).toBe(true);
       expect(res.truncation?.originalStdoutBytes).toBe(210_030);
       expect(res.truncation?.originalStderrBytes).toBe(0);
-      expect(res.truncation?.message).toContain("Use read_file with this URI");
+      expect(res.truncation?.message).toContain("Use read with this URI");
       expect(persistenceTempEntries).toHaveLength(1);
       expect(persistenceTempEntries[0]).toEndWith(".stdout.part");
       expect(persistenceTempEntries.some((entry) => entry.endsWith(".sanitized"))).toBe(false);
       const uri = res.truncation?.artifactUri;
       if (!uri) throw new Error("expected truncated output artifact URI");
       const artifact = await artifacts.read(uri, sessionId);
-      expect(artifact.ok).toBe(true);
-      if (artifact.ok) {
-        expect(artifact.content).toContain("<bash_tool_full_output>");
-        expect(artifact.content).toContain("--- stdout ---");
-        expect(artifact.content).toContain("--- stderr ---");
-        expect(artifact.content).toContain("API_TOKEN=<redacted>");
-        expect(artifact.content).not.toContain("secret-value");
-        expect(artifact.content).toContain("END");
+      expect(artifact.status).toBe("ok");
+      if (artifact.status === "ok") {
+        expect(artifact.value.content).toContain("<bash_tool_full_output>");
+        expect(artifact.value.content).toContain("--- stdout ---");
+        expect(artifact.value.content).toContain("--- stderr ---");
+        expect(artifact.value.content).toContain("API_TOKEN=<redacted>");
+        expect(artifact.value.content).not.toContain("secret-value");
+        expect(artifact.value.content).toContain("END");
       }
     } finally {
       await fs.rm(artifactDir, { recursive: true, force: true });
@@ -386,6 +388,118 @@ rmdir "$media_dir"`,
     expect(res.truncation?.message).toContain("could not be retained");
     const tmpEntries = await fs.readdir(await fs.realpath("/tmp"));
     expect(tmpEntries.some((entry) => entry.startsWith(`${requestId}-${toolCallId}-`))).toBe(false);
+  });
+
+  it("surfaces spill cleanup failure without exposing injected raw output or paths", async () => {
+    const rawSecret = "RAW_TOKEN=spill-secret";
+    const removed: string[] = [];
+    try {
+      const result = await executeBash(
+        { command: "head -c 100000 /dev/zero | tr '\\0' x" },
+        {
+          context: {
+            requestId: "bash-cleanup-only",
+            sessionId: "bash-cleanup-only",
+            requestClient: "test",
+          },
+          toolCallId: "bash-cleanup-only",
+          outputConfig: {
+            maxPreviewBytes: 64,
+            artifactTtlMs: 60_000,
+            artifactMaxBytesPerSession: 1024 * 1024,
+          },
+          spillFileOperations: {
+            async remove(target) {
+              removed.push(target);
+              throw new Error(`${rawSecret} ${target}`);
+            },
+          },
+        },
+      );
+
+      expect(removed).toHaveLength(2);
+      expect(result.executionError).toEqual({
+        type: "exception",
+        phase: "unknown",
+        message: "Bash temporary output cleanup failed",
+      });
+      expect(result.exitCode).toBe(-1);
+      const wire = JSON.stringify(result);
+      expect(wire).not.toContain(rawSecret);
+      for (const target of removed) expect(wire).not.toContain(target);
+    } finally {
+      await Promise.all(removed.map((target) => fs.rm(target, { force: true })));
+    }
+  });
+
+  it("captures synchronous spill removal throws and attempts every cleanup", async () => {
+    const attempted: string[] = [];
+    const result = await executeBash(
+      { command: "printf output" },
+      {
+        spillFileOperations: {
+          remove(target) {
+            attempted.push(target);
+            if (attempted.length === 1) throw new Error("synchronous cleanup failure");
+            return Promise.resolve();
+          },
+        },
+      },
+    );
+
+    expect(attempted).toHaveLength(2);
+    expect(result.executionError).toEqual({
+      type: "exception",
+      phase: "unknown",
+      message: "Bash temporary output cleanup failed",
+    });
+  });
+
+  it("surfaces operation and spill cleanup failure without leaking either cause", async () => {
+    const invalidCwd = "/private/workspace-secret/does-not-exist";
+    const result = await executeBash(
+      { command: "printf unreachable", cwd: invalidCwd },
+      {
+        spillFileOperations: {
+          async remove(target) {
+            throw new Error(`RAW_TOKEN=cleanup-secret ${target}`);
+          },
+        },
+      },
+    );
+
+    expect(result.executionError).toEqual({
+      type: "exception",
+      phase: "spawn",
+      message: "Bash execution failed and temporary output cleanup also failed",
+    });
+    const wire = JSON.stringify(result);
+    expect(wire).not.toContain("cleanup-secret");
+    expect(wire).not.toContain(invalidCwd);
+  });
+
+  it("attempts all spill cleanup before propagating the exact cleanup Panic", async () => {
+    const panic = new Panic({ message: "spill cleanup invariant" });
+    const attempted: string[] = [];
+    let caught: unknown;
+    try {
+      await executeBash(
+        { command: "printf unreachable", cwd: "/does/not/exist" },
+        {
+          spillFileOperations: {
+            async remove(target) {
+              attempted.push(target);
+              if (attempted.length === 1) throw panic;
+            },
+          },
+        },
+      );
+    } catch (error) {
+      caught = error;
+    }
+
+    expect(attempted).toHaveLength(2);
+    expect(caught).toBe(panic);
   });
 
   it("reports incomplete retention after bounded pre-cap ANSI output", async () => {
@@ -427,7 +541,7 @@ rmdir "$media_dir"`,
     }
   });
 
-  it("forwards generic control capability and profile context through ordinary Bash", async () => {
+  it("forwards control capability, profile, and current user through ordinary Bash", async () => {
     const config = parseCoreConfigV1ToUniversal({});
     const bash = bashToolWithCwd(process.cwd(), {
       nativeProfile: resolveNativeSubagentProfile(config, "general"),
@@ -435,19 +549,58 @@ rmdir "$media_dir"`,
     }).bash;
     const result = await executeTool(
       bash,
-      { command: 'printf "%s|%s" "$LILAC_CONTROL_CAPABILITY" "$LILAC_SUBAGENT_PROFILE"' },
+      {
+        command:
+          'printf "%s|%s|%s" "$LILAC_CONTROL_CAPABILITY" "$LILAC_SUBAGENT_PROFILE" "$LILAC_CURRENT_TURN_USER_ID"',
+      },
       {
         requestId: "native-profile-bash",
         sessionId: "native-profile-bash",
         requestClient: "test",
         safetyMode: "trusted",
+        currentTurnUserId: "user-2",
       },
     );
 
     expect(result).toMatchObject({
-      stdout: "generic-control-capability|general",
+      stdout: "generic-control-capability|general|user-2",
       exitCode: 0,
     });
+  });
+
+  it("selects Bash mode from the profile without weakening restricted sessions", async () => {
+    const workspace = await fs.mkdtemp(
+      path.join(await fs.realpath("/tmp"), "lilac-profile-bash-workspace-"),
+    );
+    const config = parseCoreConfigV2ToUniversal({ configVersion: 2 });
+    const cases = [
+      { profile: "explore" as const, safetyMode: "trusted" as const, expected: "1" },
+      { profile: "general" as const, safetyMode: "trusted" as const, expected: "native" },
+      { profile: "general" as const, safetyMode: "restricted" as const, expected: "1" },
+    ];
+
+    try {
+      for (const [index, testCase] of cases.entries()) {
+        const sessionId = `profile-bash-mode-${index}-${crypto.randomUUID()}`;
+        const result = await executeTool(
+          bashToolWithCwd(workspace, {
+            nativeProfile: resolveNativeSubagentProfile(config, testCase.profile),
+          }).bash,
+          { command: 'printf "%s" "${LILAC_RESTRICTED:-native}"' },
+          {
+            requestId: sessionId,
+            sessionId,
+            requestClient: "test",
+            safetyMode: testCase.safetyMode,
+          },
+        );
+
+        expect(result).toMatchObject({ stdout: testCase.expected, exitCode: 0 });
+        await fs.rm(resolveRestrictedSessionTmpDir(sessionId), { recursive: true, force: true });
+      }
+    } finally {
+      await fs.rm(workspace, { recursive: true, force: true });
+    }
   });
 });
 
@@ -556,11 +709,11 @@ describe("executeRestrictedBash", () => {
         result.truncation?.artifactUri ?? "",
         "restricted-sanitize-session",
       );
-      expect(stored.ok).toBe(true);
-      if (stored.ok) {
-        expect(stored.content).not.toContain("\u001b");
-        expect(stored.content).not.toContain("abcdefghijklmnopqrstuvwxyz1234567890");
-        expect(stored.content).toContain("<redacted>");
+      expect(stored.status).toBe("ok");
+      if (stored.status === "ok") {
+        expect(stored.value.content).not.toContain("\u001b");
+        expect(stored.value.content).not.toContain("abcdefghijklmnopqrstuvwxyz1234567890");
+        expect(stored.value.content).toContain("<redacted>");
       }
     } finally {
       await fs.rm(workspace, { recursive: true, force: true });

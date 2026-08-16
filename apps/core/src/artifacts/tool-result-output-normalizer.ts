@@ -11,8 +11,6 @@ import type { CoreConfig } from "@stanley2058/lilac-utils";
 import type { ToolResultArtifactStore } from "./tool-result-artifact-store";
 import { redactSecrets } from "../tools/bash-safety/format";
 
-export { createOverflowReferenceNormalizer } from "@stanley2058/lilac-tool-results/tool-result-output-normalizer";
-
 export function createToolResultOutputNormalizer(params: {
   artifacts?: ToolResultArtifactStore;
   owner: ToolResultOutputNormalizerOwner;

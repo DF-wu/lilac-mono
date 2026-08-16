@@ -1,6 +1,6 @@
 import { describe, expect, it } from "bun:test";
 
-import { findTestWaitViolations, formatTestWaitViolation } from "./test-waits.mts";
+import { findTestWaitViolations } from "./test-waits.mts";
 
 describe("test wait policy", () => {
   it("flags fixed Bun.sleep delays, including aliases and zero-duration yields", () => {
@@ -140,9 +140,12 @@ describe("test wait policy", () => {
   it("reports source locations and actionable diagnostics", () => {
     const [violation] = findTestWaitViolations("\nawait Bun.sleep(0);", "sample.test.ts");
 
-    expect(violation).toMatchObject({ filePath: "sample.test.ts", line: 2, column: 7 });
-    expect(violation && formatTestWaitViolation(violation)).toContain(
-      "sample.test.ts:2:7 [bun-sleep]",
-    );
+    expect(violation).toMatchObject({
+      filePath: "sample.test.ts",
+      line: 2,
+      column: 7,
+      kind: "bun-sleep",
+      message: expect.stringContaining("fixed Bun.sleep progression delay"),
+    });
   });
 });

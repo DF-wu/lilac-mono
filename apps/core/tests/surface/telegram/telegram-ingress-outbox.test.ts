@@ -181,6 +181,21 @@ describe("ingress dedupe keys", () => {
         messageRef: { platform: "telegram", channelId: "1001", messageId: "10" },
       }),
     ).toBeNull();
+
+    expect(
+      telegramIngressDedupeKey({
+        type: "adapter.command.invoked",
+        platform: "discord",
+        ts: 1,
+        requestId: "discord:1001:10",
+        sessionId: "1001",
+        commandName: "inspect",
+        args: [],
+        text: "/inspect",
+        sessionMode: "mention",
+        sessionConfigId: "1001",
+      }),
+    ).toBeNull();
   });
 });
 
@@ -200,27 +215,31 @@ describe("stored payload parsing", () => {
       },
     };
 
-    const parsed = parseStoredAdapterEvent(JSON.parse(JSON.stringify(evt)));
+    const parsed = parseStoredAdapterEvent(JSON.stringify(evt));
     expect(parsed).toEqual(evt);
   });
 
   it("rejects a payload that is not a usable event", () => {
     // A row written by an older build must not reach subscribers half-built.
-    expect(parseStoredAdapterEvent(null)).toBeNull();
-    expect(parseStoredAdapterEvent({ type: "adapter.message.created" })).toBeNull();
+    expect(parseStoredAdapterEvent("null")).toBeNull();
+    expect(parseStoredAdapterEvent(JSON.stringify({ type: "adapter.message.created" }))).toBeNull();
     expect(
-      parseStoredAdapterEvent({ type: "adapter.request.cancel", platform: "telegram", ts: 1 }),
+      parseStoredAdapterEvent(
+        JSON.stringify({ type: "adapter.request.cancel", platform: "telegram", ts: 1 }),
+      ),
     ).toBeNull();
     expect(
-      parseStoredAdapterEvent({
-        type: "adapter.message.created",
-        platform: "discord",
-        ts: 1,
-        message: {
-          ref: { platform: "discord", channelId: "c", messageId: "m" },
-          session: { platform: "discord", channelId: "c" },
-        },
-      }),
+      parseStoredAdapterEvent(
+        JSON.stringify({
+          type: "adapter.message.created",
+          platform: "discord",
+          ts: 1,
+          message: {
+            ref: { platform: "discord", channelId: "c", messageId: "m" },
+            session: { platform: "discord", channelId: "c" },
+          },
+        }),
+      ),
     ).toBeNull();
   });
 });
@@ -394,7 +413,7 @@ describe("durable ingress", () => {
     const store = new TelegramSurfaceStore(dbPath());
     store.enqueueIngress({
       dedupeKey: "created:1001:99",
-      payload: {
+      payloadJson: JSON.stringify({
         type: "adapter.message.created",
         platform: "telegram",
         ts: 1,
@@ -405,7 +424,7 @@ describe("durable ingress", () => {
           text: "orphan",
           ts: 1,
         },
-      },
+      }),
       ts: 1,
     });
     store.close();
@@ -421,7 +440,11 @@ describe("durable ingress", () => {
 
   it("drops an entry it can never parse rather than blocking the queue", async () => {
     const store = new TelegramSurfaceStore(dbPath());
-    store.enqueueIngress({ dedupeKey: "corrupt:1", payload: { type: "nonsense" }, ts: 1 });
+    store.enqueueIngress({
+      dedupeKey: "corrupt:1",
+      payloadJson: JSON.stringify({ type: "nonsense" }),
+      ts: 1,
+    });
     store.close();
 
     adapter = makeAdapter();
@@ -441,7 +464,7 @@ describe("durable ingress", () => {
     for (const [index, messageId] of ["10", "11", "12"].entries()) {
       store.enqueueIngress({
         dedupeKey: `created:1001:${messageId}`,
-        payload: {
+        payloadJson: JSON.stringify({
           type: "adapter.message.created",
           platform: "telegram",
           ts: 1_000 + index,
@@ -452,7 +475,7 @@ describe("durable ingress", () => {
             text: `m${messageId}`,
             ts: 1_000 + index,
           },
-        },
+        }),
         ts: 1_000 + index,
       });
     }
@@ -487,14 +510,16 @@ describe("ingress quiescing for graceful restart", () => {
 
     // The relay drain happens after this point and needs the send path alive;
     // a full disconnect() here would strand every in-flight reply.
-    const ref = await adapter.sendMsg(
+    const sent = await adapter.sendMsg(
       { platform: "telegram", channelId: String(CHAT) },
       { text: "drained reply" },
     );
+    if (sent.status === "error") throw sent.error;
+    const ref = sent.value;
     expect(ref.platform).toBe("telegram");
 
-    const sent = server.callsOf("sendMessage").at(-1);
-    expect(String(sent?.params.text)).toContain("drained reply");
+    const sentCall = server.callsOf("sendMessage").at(-1);
+    expect(String(sentCall?.params.text)).toContain("drained reply");
   });
 
   it("reports not-ready once ingress is quiesced, without claiming failure", async () => {

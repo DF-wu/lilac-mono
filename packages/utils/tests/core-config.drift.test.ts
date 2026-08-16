@@ -2,10 +2,7 @@ import { describe, expect, it } from "bun:test";
 import path from "node:path";
 
 import { parseCoreConfig } from "../core-config";
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
+import { isRecord } from "../runtime-utils";
 
 function collectDefaultShapePaths(value: unknown, prefix = ""): string[] {
   if (Array.isArray(value)) {
@@ -102,8 +99,16 @@ describe("core config drift coverage", () => {
       maxWidth: 50,
       fallbackMode: "list",
     });
+    expect(cfg.surface.discord.markdownMathRender).toEqual({
+      enabled: false,
+      maxWidth: 50,
+      fallbackMode: "source",
+    });
     expect(cfg.agent.reasoningDisplay).toBe("detailed");
     expect(cfg.agent.idleTimeoutMs).toBe(15 * 60 * 1000);
+    expect(cfg.agent.subagents.profiles.explore.execution).toBe("restricted");
+    expect(cfg.agent.subagents.profiles.general.execution).toBe("native");
+    expect(cfg.agent.subagents.profiles.self.execution).toBe("native");
     expect(cfg.agent.retry).toEqual({
       enabled: true,
       maxRetries: 3,

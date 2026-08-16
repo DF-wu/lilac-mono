@@ -1,7 +1,7 @@
 import { describe, expect, it } from "bun:test";
 import { parseCoreConfigV1ToUniversal, type CoreConfig } from "@stanley2058/lilac-utils";
 
-import type { SurfaceAdapter, AdapterEventHandler } from "../../../src/surface/adapter";
+import type { AdapterEventHandler } from "../../../src/surface/adapter";
 import type { AdapterEvent } from "../../../src/surface/events";
 import { startDiscordSearchIndexer } from "../../../src/surface/bridge/discord-search-indexer";
 import type {
@@ -53,6 +53,7 @@ function indexedMessage(text: string): DiscordSearchIndexedMessage {
     ts: 1,
     deleted: false,
     updatedTs: 1,
+    attachments: [],
   };
 }
 
@@ -68,7 +69,7 @@ describe("discord search indexer", () => {
     const dirties: DirtyInput[] = [];
 
     await startDiscordSearchIndexer({
-      adapter: adapter as unknown as SurfaceAdapter,
+      eventSource: adapter,
       search: {
         async onMessageCreated(message) {
           createdMessages.push(message);
@@ -107,7 +108,7 @@ describe("discord search indexer", () => {
     const mutation: DiscordSearchMessageMutation = { before, after, changed: true };
 
     await startDiscordSearchIndexer({
-      adapter: adapter as unknown as SurfaceAdapter,
+      eventSource: adapter,
       search: {
         async onMessageCreated() {},
         onMessageUpdated() {
@@ -144,7 +145,7 @@ describe("discord search indexer", () => {
     };
 
     await startDiscordSearchIndexer({
-      adapter: adapter as unknown as SurfaceAdapter,
+      eventSource: adapter,
       search: {
         async onMessageCreated() {},
         onMessageUpdated() {

@@ -67,6 +67,9 @@ export function parseEnv() {
         baseUrl: env.OPENAI_COMPATIBLE_BASE_URL,
         apiKey: env.OPENAI_COMPATIBLE_API_KEY,
       },
+      cerebras: {
+        apiKey: env.CEREBRAS_API_KEY,
+      },
       xai: {
         baseUrl: env.XAI_BASE_URL,
         apiKey: env.XAI_API_KEY,

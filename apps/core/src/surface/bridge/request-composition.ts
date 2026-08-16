@@ -1,6 +1,7 @@
 import { isDeepStrictEqual } from "node:util";
 
 import type { ModelMessage, UserContent } from "ai";
+import { Result, type Result as ResultType } from "better-result";
 import { hashCanonicalMessagesV1 } from "@stanley2058/lilac-agent";
 import {
   buildCoreLineageManifestV1,
@@ -9,22 +10,28 @@ import {
   type CoreLineageSegmentInputV1,
   type CorePrimaryLineageV1,
 } from "@stanley2058/lilac-event-bus";
-import type { SurfaceAdapter } from "../adapter";
-import type { MsgRef, RoutedSurfacePlatform, SessionRef, SurfaceMessage } from "../types";
+import {
+  withSurfaceRequestReadScope,
+  type SurfaceAdapter,
+  type SurfaceOperationError,
+  type SurfaceOperationResult,
+} from "../adapter";
+import type { MsgRef, RoutedSurfacePlatform, SurfaceMessage } from "../types";
 
 import {
   parseLeadingContinueDirective,
   stripLeadingContinueDirective,
-  isRoutedSurfacePlatform,
-} from "./bus-request-router/common";
+} from "../discord/discord-request-router/common";
 import {
   isDiscordSessionDividerSurfaceMessageAnyAuthor,
   isDiscordSessionDividerSurfaceMessage,
   isDiscordSessionDividerText,
 } from "../discord/discord-session-divider";
+import { normalizeDiscordRaw } from "../discord/discord-raw-normalizer";
 
 import {
   CORE_SURFACE_PROJECTION_FORMAT_VERSION,
+  type CoreOwnedBlobIntegrityError,
   type CoreOwnedBlobReference,
   type CoreSurfaceProjection,
   type TranscriptSnapshot,
@@ -33,6 +40,7 @@ import {
 import {
   appendDiscordAttachmentsToUserContent,
   createDiscordAttachmentState,
+  getDiscordAttachmentOwnershipError,
   getDiscordOwnedBlobReferences,
   takeDiscordCurrentBlobReferences,
 } from "./request-composition/attachments";
@@ -48,7 +56,6 @@ import {
   fetchReplyChainFrom,
   findEarliestReplyAnchor,
   getForwardSnapshotTextFromRaw,
-  hasReplyTargetInRaw,
   mergeChainByDiscordWindow,
   resolveMergeBlockEndingAt,
   toReplyChainMessage,
@@ -68,6 +75,23 @@ export type {
   ReplyChainMessage,
   RequestCompositionResult,
 } from "./request-composition/types";
+
+export type RequestCompositionError = CoreOwnedBlobIntegrityError | SurfaceOperationError;
+
+const ACTIVE_REQUEST_READ_SCOPE = Symbol("active-request-read-scope");
+
+function createFreshOnlyLineage(reason: string, currentCanonicalStart = 0): CorePrimaryLineageV1 {
+  const created = createCorePrimaryLineageFreshOnlyV1(reason, currentCanonicalStart);
+  return created.match<CorePrimaryLineageV1>({
+    ok: (value) => value,
+    err: () => ({
+      state: "fresh-only",
+      lineageVersion: 1,
+      currentCanonicalStart: 0,
+      reason: "lineage-fallback-construction-failed",
+    }),
+  });
+}
 
 type ProjectionCapableStore = TranscriptStore &
   Required<
@@ -188,7 +212,8 @@ function collectStoredBoundaryBreaks(input: {
     const stored = input.transcriptStore?.getLatestCoreSurfaceSegment?.(
       surfaceProjectionKey(input.platform, input.sessionId, message.messageId),
     );
-    if (stored) return `${stored.requestId}:${stored.segmentIndex}`;
+    const storedValue = stored?.match({ ok: (value) => value, err: () => null });
+    if (storedValue) return `${storedValue.requestId}:${storedValue.segmentIndex}`;
     const admittedIds = storedProjectionSegmentIds(
       input.projections.get(message.messageId) ?? null,
     );
@@ -213,13 +238,18 @@ function appendPersistedSyntheticSuffix(input: {
   const manifest = input.transcriptStore?.getCorePrimaryLineageManifest?.({
     requestId: input.requestId,
   });
-  if (!manifest || !manifest.segments.some((segment) => segment.atoms[0]?.kind === "synthetic")) {
+  if (!manifest) return true;
+  const manifestValue = manifest.match({ ok: (value) => value, err: () => null });
+  if (
+    !manifestValue ||
+    !manifestValue.segments.some((segment) => segment.atoms[0]?.kind === "synthetic")
+  ) {
     return true;
   }
-  if (input.segmentInputs.length > manifest.segments.length) return false;
+  if (input.segmentInputs.length > manifestValue.segments.length) return false;
 
   const prefixMatches = input.segmentInputs.every((segment, index) => {
-    const stored = manifest.segments[index];
+    const stored = manifestValue.segments[index];
     return (
       stored !== undefined &&
       isDeepStrictEqual(segment.atoms, stored.atoms) &&
@@ -227,7 +257,7 @@ function appendPersistedSyntheticSuffix(input: {
       isDeepStrictEqual(segment.requestSource, stored.requestSource)
     );
   });
-  const suffix = manifest.segments.slice(input.segmentInputs.length);
+  const suffix = manifestValue.segments.slice(input.segmentInputs.length);
   if (!prefixMatches || suffix.some((segment) => segment.atoms[0]?.kind !== "synthetic")) {
     return false;
   }
@@ -292,7 +322,7 @@ async function renderSurfaceProjectionCandidate(input: {
   };
 }
 
-async function composeSelectedSurfaceChain(input: {
+async function composeSelectedDiscordChain(input: {
   adapter: SurfaceAdapter;
   platform: RoutedSurfacePlatform;
   sessionId: string;
@@ -302,28 +332,35 @@ async function composeSelectedSurfaceChain(input: {
   currentMessageIds: readonly string[];
   transcriptStore?: TranscriptStore;
   discordUserAliasById?: ReadonlyMap<string, string>;
-}): Promise<{
-  messages: ModelMessage[];
-  mergedGroups: Array<{ authorId: string; messageIds: string[] }>;
-  corePrimaryLineage: CorePrimaryLineageV1;
-}> {
+}): Promise<
+  ResultType<
+    {
+      messages: ModelMessage[];
+      mergedGroups: Array<{ authorId: string; messageIds: string[] }>;
+      corePrimaryLineage: CorePrimaryLineageV1;
+    },
+    RequestCompositionError
+  >
+> {
   const projectionStore = isProjectionCapableStore(input.transcriptStore)
     ? input.transcriptStore
     : undefined;
   const attachmentState = createDiscordAttachmentState({
     ownBlob: projectionStore
-      ? ({ bytes, mediaType, filename }) =>
-          projectionStore.putCoreOwnedBlob({ bytes, mediaType, filename })
+      ? ({ bytes, mediaType, filename }) => {
+          return projectionStore.putCoreOwnedBlob({ bytes, mediaType, filename });
+        }
       : undefined,
   });
   try {
     const projections = new Map<string, CoreSurfaceProjection | null>();
     for (const message of input.chain) {
+      const stored = projectionStore?.getCoreSurfaceProjection(
+        surfaceProjectionKey(input.platform, input.sessionId, message.messageId),
+      );
       projections.set(
         message.messageId,
-        projectionStore?.getCoreSurfaceProjection(
-          surfaceProjectionKey(input.platform, input.sessionId, message.messageId),
-        ) ?? null,
+        stored?.match({ ok: (value) => value, err: () => null }) ?? null,
       );
     }
     const immutableChain = input.chain.map((message) => {
@@ -366,6 +403,12 @@ async function composeSelectedSurfaceChain(input: {
       adapter: input.adapter,
       refs: unknownUserRefs,
     });
+    const reactionsError = reactionsByMessageId.match({ ok: () => null, err: (error) => error });
+    if (reactionsError) return Result.err(reactionsError);
+    const reactionValues = reactionsByMessageId.match({
+      ok: (value) => value,
+      err: () => new Map<string, readonly string[]>(),
+    });
     const projectedByMessageId = new Map<string, readonly ModelMessage[]>();
     const candidateOwnedBlobsByMessageId = new Map<string, readonly CoreOwnedBlobReference[]>();
     let lineageComplete = Boolean(projectionStore);
@@ -401,15 +444,14 @@ async function composeSelectedSurfaceChain(input: {
           projectedByMessageId.set(messageId, stored.canonicalMessages);
           continue;
         }
-        const source = messageById.get(messageId);
-        if (!source)
-          throw new Error(`Selected ${input.platform} message '${messageId}' was not found`);
+        // `merged` is derived from `immutableChain`, so every selected ID has this source entry.
+        const source = messageById.get(messageId)!;
         const candidate = await renderSurfaceProjectionCandidate({
           platform: input.platform,
           message: source,
           isBot: source.authorId === input.botUserId,
           sessionId: input.sessionId,
-          reactions: reactionsByMessageId.get(messageId) ?? [],
+          reactions: reactionValues.get(messageId) ?? [],
           discordUserAliasById: input.discordUserAliasById,
           attachmentState,
         });
@@ -446,9 +488,7 @@ async function composeSelectedSurfaceChain(input: {
       }
       for (const messageId of chunk.messageIds) {
         if (projections.get(messageId) || !projectionStore) continue;
-        const source = messageById.get(messageId);
-        if (!source)
-          throw new Error(`Selected ${input.platform} message '${messageId}' was not found`);
+        const source = messageById.get(messageId)!;
         const segmentMessageIds = projectionSegmentIdsByMessageId.get(messageId) ?? [messageId];
         const segmentMessages = mergeProjectedSurfaceMessages(
           segmentMessageIds.flatMap((id) => projectedByMessageId.get(id) ?? []),
@@ -460,14 +500,19 @@ async function composeSelectedSurfaceChain(input: {
             authorId: source.authorId,
             authorName: source.authorName,
             messageTs: source.ts,
-            reactions: [...(reactionsByMessageId.get(messageId) ?? [])],
+            reactions: [...(reactionValues.get(messageId) ?? [])],
             attachments: source.attachments.map((attachment) => ({ ...attachment })),
             segmentMessageIds: [...segmentMessageIds],
             segmentDigest: hashCanonicalMessagesV1(segmentMessages).hash,
           },
           ownedBlobs: candidateOwnedBlobsByMessageId.get(messageId) ?? [],
         });
-        projectedByMessageId.set(messageId, admitted.canonicalMessages);
+        const admittedValue = admitted.match({ ok: (value) => value, err: () => null });
+        if (!admittedValue) {
+          lineageComplete = false;
+          continue;
+        }
+        projectedByMessageId.set(messageId, admittedValue.canonicalMessages);
       }
     }
 
@@ -527,18 +572,19 @@ async function composeSelectedSurfaceChain(input: {
         const metadata = input.transcriptStore?.getCoreRequestAtomMetadata?.({
           requestId: snapshot.requestId,
         });
-        if (!metadata) lineageComplete = false;
+        const metadataValue = metadata?.match({ ok: (value) => value, err: () => null }) ?? null;
+        if (!metadataValue) lineageComplete = false;
         const requestAtom: CoreLineageAtomV1 = {
           kind: "request",
           requestId: snapshot.requestId,
           transcriptDigest:
-            metadata?.transcriptDigest ??
+            metadataValue?.transcriptDigest ??
             snapshot.transcriptDigest ??
             hashCanonicalMessagesV1(snapshot.messages).hash,
           providerFamily:
-            metadata?.providerFamily ?? snapshot.providerState?.lastFamily ?? "ai-sdk",
+            metadataValue?.providerFamily ?? snapshot.providerState?.lastFamily ?? "ai-sdk",
           containsCrossFamilyTurns:
-            metadata?.containsCrossFamilyTurns ??
+            metadataValue?.containsCrossFamilyTurns ??
             snapshot.providerState?.containsCrossFamilyTurns ??
             true,
         };
@@ -578,27 +624,36 @@ async function composeSelectedSurfaceChain(input: {
     const hasEmptyLineageSegment = segmentInputs.some(
       (segment) => segment.canonicalMessages.length === 0,
     );
-    const corePrimaryLineage =
-      lineageComplete && segmentInputs.length > 0 && !hasEmptyLineageSegment
-        ? buildCoreLineageManifestV1(segmentInputs, { currentSegmentIndex })
-        : createCorePrimaryLineageFreshOnlyV1(
-            hasEmptyLineageSegment
-              ? "empty-lineage-segment"
-              : currentSegmentIndex < 0
-                ? "current-input-boundary-unreachable"
-                : projectionStore
-                  ? "incomplete-request-metadata"
-                  : "projection-store-unavailable",
-            currentCanonicalStart,
-          );
-    return {
+    let corePrimaryLineage: CorePrimaryLineageV1;
+    if (lineageComplete && segmentInputs.length > 0 && !hasEmptyLineageSegment) {
+      const built = buildCoreLineageManifestV1(segmentInputs, { currentSegmentIndex });
+      corePrimaryLineage = built.match({
+        ok: (value) => value,
+        err: () => createFreshOnlyLineage("lineage-manifest-build-failed", currentCanonicalStart),
+      });
+    } else {
+      let reason: Parameters<typeof createCorePrimaryLineageFreshOnlyV1>[0];
+      if (hasEmptyLineageSegment) {
+        reason = "empty-lineage-segment";
+      } else if (currentSegmentIndex < 0) {
+        reason = "current-input-boundary-unreachable";
+      } else if (projectionStore) {
+        reason = "incomplete-request-metadata";
+      } else {
+        reason = "projection-store-unavailable";
+      }
+      corePrimaryLineage = createFreshOnlyLineage(reason, currentCanonicalStart);
+    }
+    const ownershipError = getDiscordAttachmentOwnershipError(attachmentState);
+    if (ownershipError) return Result.err(ownershipError);
+    return Result.ok({
       messages,
       mergedGroups: merged.map((chunk) => ({
         authorId: chunk.authorId,
         messageIds: [...chunk.messageIds],
       })),
       corePrimaryLineage,
-    };
+    });
   } finally {
     if (projectionStore) {
       for (const reference of getDiscordOwnedBlobReferences(attachmentState)) {
@@ -619,23 +674,12 @@ function resolveTranscriptSnapshot(input: {
     return input.resolvedSnapshotsBySurfaceMessageId.get(input.messageId) ?? null;
   }
 
-  return input.transcriptStore.getTranscriptBySurfaceMessage({
+  const transcript = input.transcriptStore.getTranscriptBySurfaceMessage({
     platform: input.platform,
     channelId: input.channelId,
     messageId: input.messageId,
   });
-}
-
-function getDiscordIsChatFromRaw(raw: unknown): boolean | undefined {
-  if (!raw || typeof raw !== "object") return undefined;
-  const o = raw as Record<string, unknown>;
-  const discord =
-    "discord" in o && o.discord && typeof o.discord === "object"
-      ? (o.discord as Record<string, unknown>)
-      : null;
-  if (!discord) return undefined;
-  const isChat = discord["isChat"];
-  return typeof isChat === "boolean" ? isChat : undefined;
+  return transcript.match({ ok: (value) => value, err: () => null });
 }
 
 function shouldIncludeInModelContext(msg: SurfaceMessage): boolean {
@@ -643,7 +687,7 @@ function shouldIncludeInModelContext(msg: SurfaceMessage): boolean {
   // thread-created notices). By default, do not send those to the model.
   if (msg.session.platform !== "discord") return true;
 
-  const isChat = getDiscordIsChatFromRaw(msg.raw);
+  const isChat = normalizeDiscordRaw(msg.raw)?.isChat;
   return isChat ?? true;
 }
 
@@ -687,7 +731,7 @@ function getSurfaceMessageContextText(message: SurfaceMessage): string {
 }
 
 function shouldApplyContinueDirectiveToSurfaceMessage(message: SurfaceMessage): boolean {
-  return !hasReplyTargetInRaw(message.raw);
+  return normalizeDiscordRaw(message.raw)?.replyReference === undefined;
 }
 
 function stripContinueDirectiveFromReplyChainMessage(input: {
@@ -750,10 +794,11 @@ async function listRecentMessagesEndingAt(params: {
     exhausted: boolean;
     fetchedPreviousMessages: number;
   }) => boolean;
-}): Promise<SurfaceMessage[]> {
-  // The anchor already carries the session it belongs to; rebuilding a ref
-  // here would hardcode a platform.
-  const sessionRef = params.anchor.session;
+}): Promise<SurfaceOperationResult<SurfaceMessage[]>> {
+  const sessionRef = {
+    platform: "discord",
+    channelId: params.sessionId,
+  } as const;
 
   const previousMessageTargets = (() => {
     const requested = params.previousMessageTargets ?? [params.maxPreviousMessages];
@@ -795,7 +840,10 @@ async function listRecentMessagesEndingAt(params: {
         limit: Math.min(100, remaining, target - fetchedPreviousMessages),
         beforeMessageId: cursor,
       });
-      if (!page || page.length === 0) {
+      const pageError = page.match({ ok: () => null, err: (error) => error });
+      if (pageError) return Result.err(pageError);
+      const pageValues = page.match({ ok: (value) => value, err: () => [] });
+      if (pageValues.length === 0) {
         exhausted = true;
         cursor = undefined;
         break;
@@ -804,7 +852,7 @@ async function listRecentMessagesEndingAt(params: {
       let oldestInPage: SurfaceMessage | null = null;
       let addedAny = false;
 
-      for (const message of page) {
+      for (const message of pageValues) {
         if (message.session.channelId !== params.sessionId) continue;
         if (seen.has(message.ref.messageId)) continue;
         seen.add(message.ref.messageId);
@@ -847,13 +895,13 @@ async function listRecentMessagesEndingAt(params: {
         fetchedPreviousMessages,
       })
     ) {
-      return getSortedCollected();
+      return Result.ok(getSortedCollected());
     }
 
     if (exhausted || remaining <= 0) break;
   }
 
-  return getSortedCollected();
+  return Result.ok(getSortedCollected());
 }
 
 function compareDiscordSnowflakeLike(a: string, b: string): number {
@@ -1052,80 +1100,74 @@ function applyDiscordSessionDividerCutoffToReplyChain(params: {
   chainOldestToNewest: readonly ReplyChainMessage[];
   botUserId: string;
 }): ReplyChainMessage[] {
-  const { chainOldestToNewest, botUserId } = params;
-
   let lastDividerIndex = -1;
-  for (let i = 0; i < chainOldestToNewest.length; i++) {
-    const m = chainOldestToNewest[i]!;
-    if (m.authorId === botUserId && isDiscordSessionDividerText(m.text)) {
+  for (let i = 0; i < params.chainOldestToNewest.length; i++) {
+    const message = params.chainOldestToNewest[i]!;
+    if (message.authorId === params.botUserId && isDiscordSessionDividerText(message.text)) {
       lastDividerIndex = i;
     }
   }
-  if (lastDividerIndex < 0) return [...chainOldestToNewest];
-  return chainOldestToNewest.slice(lastDividerIndex + 1);
+  return lastDividerIndex < 0
+    ? [...params.chainOldestToNewest]
+    : params.chainOldestToNewest.slice(lastDividerIndex + 1);
 }
 
 async function findLastDiscordSessionDividerBefore(params: {
   adapter: SurfaceAdapter;
-  platform: RoutedSurfacePlatform;
   channelId: string;
   botUserId: string;
   beforeMessageId: string;
-  /** Optional: stop scanning once we see this message id. */
   stopAtMessageId?: string;
-}): Promise<{ ts: number; messageId: string } | null> {
-  const { adapter, platform, channelId, botUserId, beforeMessageId, stopAtMessageId } = params;
-
-  const sessionRef: SessionRef = { platform, channelId };
-
-  let cursor: string | undefined = beforeMessageId;
+}): Promise<SurfaceOperationResult<{ ts: number; messageId: string } | null>> {
+  const sessionRef = { platform: "discord", channelId: params.channelId } as const;
+  let cursor: string | undefined = params.beforeMessageId;
   let scanned = 0;
-  const MAX_MESSAGES = 2000;
-  const PAGE_SIZE = 200;
+  const maxMessages = 2000;
+  const pageSize = 200;
 
-  while (cursor && scanned < MAX_MESSAGES) {
-    const page = await adapter.listMsg(sessionRef, {
-      limit: Math.min(PAGE_SIZE, MAX_MESSAGES - scanned),
+  while (cursor && scanned < maxMessages) {
+    const page = await params.adapter.listMsg(sessionRef, {
+      limit: Math.min(pageSize, maxMessages - scanned),
       beforeMessageId: cursor,
     });
+    const pageError = page.match({ ok: () => null, err: (error) => error });
+    if (pageError) return Result.err(pageError);
+    const pageValues = page.match({ ok: (value) => value, err: () => [] });
+    if (pageValues.length === 0) return Result.ok(null);
+    scanned += pageValues.length;
 
-    if (!page || page.length === 0) return null;
-    scanned += page.length;
-
-    // listMsg order is adapter-specific; treat it as an unordered window for detection.
     let newestDivider: { ts: number; messageId: string } | null = null;
-    for (const m of page) {
-      if (!isDiscordSessionDividerSurfaceMessage(m, botUserId)) continue;
-      const pos = { ts: m.ts, messageId: m.ref.messageId };
-      if (!newestDivider || compareDiscordMsgPosition(newestDivider, pos) < 0) {
-        newestDivider = pos;
+    for (const message of pageValues) {
+      if (!isDiscordSessionDividerSurfaceMessage(message, params.botUserId)) continue;
+      const position = { ts: message.ts, messageId: message.ref.messageId };
+      if (!newestDivider || compareDiscordMsgPosition(newestDivider, position) < 0) {
+        newestDivider = position;
       }
     }
-    if (newestDivider) return newestDivider;
-
-    if (stopAtMessageId && page.some((m) => m.ref.messageId === stopAtMessageId)) {
-      return null;
+    if (newestDivider) return Result.ok(newestDivider);
+    if (
+      params.stopAtMessageId &&
+      pageValues.some((message) => message.ref.messageId === params.stopAtMessageId)
+    ) {
+      return Result.ok(null);
     }
 
-    // Advance cursor to the oldest message id we saw.
-    let oldest = page[0]!;
-    for (const m of page) {
+    let oldest = pageValues[0]!;
+    for (const message of pageValues) {
       if (
         compareDiscordMsgPosition(
-          { ts: m.ts, messageId: m.ref.messageId },
+          { ts: message.ts, messageId: message.ref.messageId },
           { ts: oldest.ts, messageId: oldest.ref.messageId },
         ) < 0
       ) {
-        oldest = m;
+        oldest = message;
       }
     }
-
-    // Prevent infinite loops if the adapter returns a stable page.
-    if (oldest.ref.messageId === cursor) return null;
+    if (oldest.ref.messageId === cursor) return Result.ok(null);
     cursor = oldest.ref.messageId;
   }
 
-  return null;
+  return Result.ok(null);
 }
 
 async function mapWithConcurrency<T, R>(input: {
@@ -1153,36 +1195,28 @@ async function mapWithConcurrency<T, R>(input: {
   return out;
 }
 
-async function safeListReactions(adapter: SurfaceAdapter, msgRef: MsgRef): Promise<string[]> {
-  try {
-    return await adapter.listReactions(msgRef);
-  } catch {
-    return [];
-  }
-}
-
 async function getReactionsByMessageId(input: {
   adapter: SurfaceAdapter;
   refs: readonly MsgRef[];
   concurrency?: number;
-}): Promise<Map<string, readonly string[]>> {
+}): Promise<SurfaceOperationResult<Map<string, readonly string[]>>> {
   const out = new Map<string, readonly string[]>();
-  if (input.refs.length === 0) return out;
+  if (input.refs.length === 0) return Result.ok(out);
 
   const rows = await mapWithConcurrency({
     items: input.refs,
     concurrency: input.concurrency ?? 8,
     run: async (ref) => {
-      const reactions = await safeListReactions(input.adapter, ref);
+      const reactions = await input.adapter.listReactions(ref);
       return { messageId: ref.messageId, reactions };
     },
   });
 
   for (const row of rows) {
-    out.set(row.messageId, row.reactions);
+    out.set(row.messageId, row.reactions.match({ ok: (value) => value, err: () => [] }));
   }
 
-  return out;
+  return Result.ok(out);
 }
 
 /**
@@ -1194,43 +1228,51 @@ async function getReactionsByMessageId(input: {
 export async function composeRequestMessages(
   adapter: SurfaceAdapter,
   opts: ComposeRequestOpts,
-): Promise<RequestCompositionResult> {
-  if (!isRoutedSurfacePlatform(opts.platform)) {
-    throw new Error(`Unsupported platform '${opts.platform}'`);
+  requestReadScope?: typeof ACTIVE_REQUEST_READ_SCOPE,
+): Promise<ResultType<RequestCompositionResult, RequestCompositionError>> {
+  if (requestReadScope !== ACTIVE_REQUEST_READ_SCOPE) {
+    return withSurfaceRequestReadScope(adapter, () =>
+      composeRequestMessages(adapter, opts, ACTIVE_REQUEST_READ_SCOPE),
+    );
   }
-
   // Step 1: fetch reply chain from the adapter store / platform.
   // Mention triggers get merge-window parity even if messages are not linked via reply references.
   const triggerMsg = await adapter.readMsg(opts.trigger.msgRef);
-  if (!triggerMsg) {
-    return {
+  const triggerError = triggerMsg.match({ ok: () => null, err: (error) => error });
+  if (triggerError) return Result.err(triggerError);
+  const triggerValue = triggerMsg.match({ ok: (value) => value, err: () => null });
+  if (!triggerValue) {
+    return Result.ok({
       messages: [],
       chainMessageIds: [],
       mergedGroups: [],
-      corePrimaryLineage: createCorePrimaryLineageFreshOnlyV1("empty-selection"),
-    };
+      corePrimaryLineage: createFreshOnlyLineage("empty-selection"),
+    });
   }
 
-  const chain =
+  const chainResult =
     opts.trigger.type === "mention"
       ? await fetchMentionThreadContext(adapter, {
-          platform: opts.platform,
+          platform: "discord",
           botUserId: opts.botUserId,
           botName: opts.botName,
-          triggerMsg,
+          triggerMsg: triggerValue,
           maxDepth: opts.maxDepth,
         })
       : await fetchReplyChainFrom(adapter, {
-          platform: opts.platform,
+          platform: "discord",
           botUserId: opts.botUserId,
           botName: opts.botName,
           trigger: opts.trigger,
           startMsgRef: opts.trigger.msgRef,
           maxDepth: opts.maxDepth,
         });
+  const chainError = chainResult.match({ ok: () => null, err: (error) => error });
+  if (chainError) return Result.err(chainError);
+  const chain = chainResult.match({ ok: (value) => value, err: () => [] });
 
   const filteredChain = chain.filter((m) => {
-    const isChat = getDiscordIsChatFromRaw(m.raw);
+    const isChat = m.isChat;
     if (!(isChat ?? true)) return false;
     return !isDiscordSessionDividerText(m.text);
   });
@@ -1266,7 +1308,7 @@ export async function composeRequestMessages(
     getMessageId: (message) => message.messageId,
   });
 
-  const composed = await composeSelectedSurfaceChain({
+  const composed = await composeSelectedDiscordChain({
     adapter,
     platform: opts.platform,
     sessionId: opts.trigger.msgRef.channelId,
@@ -1277,23 +1319,24 @@ export async function composeRequestMessages(
     transcriptStore: opts.transcriptStore,
     discordUserAliasById: opts.discordUserAliasById,
   });
-
-  return {
-    messages: composed.messages,
+  return composed.map((value) => ({
+    messages: value.messages,
     chainMessageIds: transformedChain.map((m) => m.messageId),
-    mergedGroups: composed.mergedGroups,
-    corePrimaryLineage: composed.corePrimaryLineage,
-  };
+    mergedGroups: value.mergedGroups,
+    corePrimaryLineage: value.corePrimaryLineage,
+  }));
 }
 
 export async function composeRecentChannelMessages(
   adapter: SurfaceAdapter,
   opts: ComposeRecentChannelMessagesOpts,
-): Promise<RequestCompositionResult> {
-  if (!isRoutedSurfacePlatform(opts.platform)) {
-    throw new Error(`Unsupported platform '${opts.platform}'`);
+  requestReadScope?: typeof ACTIVE_REQUEST_READ_SCOPE,
+): Promise<ResultType<RequestCompositionResult, RequestCompositionError>> {
+  if (requestReadScope !== ACTIVE_REQUEST_READ_SCOPE) {
+    return withSurfaceRequestReadScope(adapter, () =>
+      composeRecentChannelMessages(adapter, opts, ACTIVE_REQUEST_READ_SCOPE),
+    );
   }
-
   // Reply precedence: if the trigger is a Discord reply (even when the router
   // classified it as a "mention" trigger because it wasn't a reply-to-bot),
   // treat it as an explicit reply-chain continuation.
@@ -1301,48 +1344,54 @@ export async function composeRecentChannelMessages(
   // IMPORTANT: this bypasses active-burst guardrails (age/gap/transcript-age).
   // A reply is a strong "continue" signal.
   if (opts.triggerMsgRef && opts.triggerType === "mention") {
-    const triggerMsg = await adapter.readMsg(opts.triggerMsgRef);
+    const triggerMsgResult = await adapter.readMsg(opts.triggerMsgRef);
+    const triggerError = triggerMsgResult.match({ ok: () => null, err: (error) => error });
+    if (triggerError) return Result.err(triggerError);
+    const triggerMsg = triggerMsgResult.match({ ok: (value) => value, err: () => null });
     if (triggerMsg) {
       // "Merge block" = a user's short burst of consecutive messages.
       // If ANY message in the burst is a reply, treat the entire burst as a
       // continuation of that reply thread.
-      const block = await resolveMergeBlockEndingAt(adapter, triggerMsg);
+      const blockResult = await resolveMergeBlockEndingAt(adapter, triggerMsg);
+      const blockError = blockResult.match({ ok: () => null, err: (error) => error });
+      if (blockError) return Result.err(blockError);
+      const block = blockResult.match({ ok: (value) => value, err: () => [] });
       const anchor = findEarliestReplyAnchor(block);
       if (anchor) {
-        const anchored = await fetchMentionThreadContext(adapter, {
-          platform: opts.platform,
+        const anchoredResult = await fetchMentionThreadContext(adapter, {
+          platform: "discord",
           botUserId: opts.botUserId,
           botName: opts.botName,
           triggerMsg,
         });
+        const anchoredError = anchoredResult.match({ ok: () => null, err: (error) => error });
+        if (anchoredError) return Result.err(anchoredError);
+        const anchored = anchoredResult.match({ ok: (value) => value, err: () => [] });
 
         const oldestAnchoredMessageId = anchored[0]?.messageId;
-
-        const divider = oldestAnchoredMessageId
+        const dividerResult = oldestAnchoredMessageId
           ? await findLastDiscordSessionDividerBefore({
               adapter,
-              platform: opts.platform,
               channelId: opts.sessionId,
               botUserId: opts.botUserId,
               beforeMessageId: triggerMsg.ref.messageId,
               stopAtMessageId: oldestAnchoredMessageId,
-            }).catch(() => null)
-          : null;
-
+            })
+          : Result.ok(null);
+        const divider = dividerResult.match({ ok: (value) => value, err: () => null });
         const anchoredAfterDivider = divider
           ? anchored.filter(
-              (m) => compareDiscordMsgPosition({ ts: m.ts, messageId: m.messageId }, divider) > 0,
+              (message) =>
+                compareDiscordMsgPosition(
+                  { ts: message.ts, messageId: message.messageId },
+                  divider,
+                ) > 0,
             )
           : anchored;
-
-        const anchoredCutChain = applyDiscordSessionDividerCutoffToReplyChain({
+        const anchoredNoDivider = applyDiscordSessionDividerCutoffToReplyChain({
           chainOldestToNewest: anchoredAfterDivider,
           botUserId: opts.botUserId,
-        });
-
-        const anchoredNoDivider = anchoredCutChain.filter(
-          (m) => !isDiscordSessionDividerText(m.text),
-        );
+        }).filter((m) => !isDiscordSessionDividerText(m.text));
 
         const transformedAnchored = anchoredNoDivider.map((m) => {
           const targetMessageId = opts.transformUserTextForMessageId ?? triggerMsg.ref.messageId;
@@ -1369,7 +1418,7 @@ export async function composeRecentChannelMessages(
           getAuthorId: (message) => message.authorId,
           getMessageId: (message) => message.messageId,
         });
-        const composed = await composeSelectedSurfaceChain({
+        const composed = await composeSelectedDiscordChain({
           adapter,
           platform: opts.platform,
           sessionId: opts.sessionId,
@@ -1380,21 +1429,20 @@ export async function composeRecentChannelMessages(
           transcriptStore: opts.transcriptStore,
           discordUserAliasById: opts.discordUserAliasById,
         });
-
-        return {
-          messages: composed.messages,
+        return composed.map((value) => ({
+          messages: value.messages,
           chainMessageIds: transformedAnchored.map((m) => m.messageId),
-          mergedGroups: composed.mergedGroups,
-          corePrimaryLineage: composed.corePrimaryLineage,
-        };
+          mergedGroups: value.mergedGroups,
+          corePrimaryLineage: value.corePrimaryLineage,
+        }));
       }
     }
   }
 
-  const sessionRef: SessionRef = {
-    platform: opts.platform,
+  const sessionRef = {
+    platform: "discord",
     channelId: opts.sessionId,
-  };
+  } as const;
   const continueDirectiveBotNames = opts.botMentionNames ?? [opts.botName];
 
   // Active-burst rules are intended for "latest view" prompts, including
@@ -1405,50 +1453,64 @@ export async function composeRecentChannelMessages(
   let orderedList: SurfaceMessage[];
 
   if (shouldApplyActiveBurstRules && opts.triggerMsgRef) {
-    const triggerMsg = await adapter.readMsg(opts.triggerMsgRef);
-    orderedList = triggerMsg
-      ? await listRecentMessagesEndingAt({
-          adapter,
-          sessionId: opts.sessionId,
-          anchor: triggerMsg,
-          maxPreviousMessages: ACTIVE_BURST_HISTORY_CAP,
-          previousMessageTargets: ACTIVE_BURST_HISTORY_TARGETS,
-          shouldContinue: ({ collected, exhausted }) => {
-            const activeContextList = collected.filter(shouldIncludeInModelContext);
-            const activeTriggerMsg =
-              activeContextList.find(
-                (message) => message.ref.messageId === opts.triggerMsgRef!.messageId,
-              ) ?? null;
-            const activeAnchor =
-              activeTriggerMsg ??
-              (activeContextList.length > 0
-                ? activeContextList[activeContextList.length - 1]!
-                : null);
+    const triggerMsgResult = await adapter.readMsg(opts.triggerMsgRef);
+    const triggerError = triggerMsgResult.match({ ok: () => null, err: (error) => error });
+    if (triggerError) return Result.err(triggerError);
+    const triggerMsg = triggerMsgResult.match({ ok: (value) => value, err: () => null });
+    if (triggerMsg) {
+      const recent = await listRecentMessagesEndingAt({
+        adapter,
+        sessionId: opts.sessionId,
+        anchor: triggerMsg,
+        maxPreviousMessages: ACTIVE_BURST_HISTORY_CAP,
+        previousMessageTargets: ACTIVE_BURST_HISTORY_TARGETS,
+        shouldContinue: ({ collected, exhausted }) => {
+          const activeContextList = collected.filter(shouldIncludeInModelContext);
+          const activeTriggerMsg =
+            activeContextList.find(
+              (message) => message.ref.messageId === opts.triggerMsgRef!.messageId,
+            ) ?? null;
+          const activeAnchor =
+            activeTriggerMsg ??
+            (activeContextList.length > 0
+              ? activeContextList[activeContextList.length - 1]!
+              : null);
 
-            if (!activeAnchor) return !exhausted;
+          if (!activeAnchor) return !exhausted;
 
-            return shouldContinueLoadingActiveBurstHistory({
-              selection: selectActiveBurstMessages({
-                contextList: activeContextList,
-                activeAnchor,
-                limit: opts.limit,
-                botUserId: opts.botUserId,
-                botMentionNames: continueDirectiveBotNames,
-              }),
-              exhausted,
+          return shouldContinueLoadingActiveBurstHistory({
+            selection: selectActiveBurstMessages({
+              contextList: activeContextList,
+              activeAnchor,
               limit: opts.limit,
-            });
-          },
-        })
-      : [];
+              botUserId: opts.botUserId,
+              botMentionNames: continueDirectiveBotNames,
+            }),
+            exhausted,
+            limit: opts.limit,
+          });
+        },
+      });
+      const recentError = recent.match({ ok: () => null, err: (error) => error });
+      if (recentError) return Result.err(recentError);
+      orderedList = recent.match({ ok: (value) => value, err: () => [] });
+    } else {
+      orderedList = [];
+    }
   } else {
-    orderedList = [...(await adapter.listMsg(sessionRef, { limit: opts.limit }))];
+    const listed = await adapter.listMsg(sessionRef, { limit: opts.limit });
+    const listError = listed.match({ ok: () => null, err: (error) => error });
+    if (listError) return Result.err(listError);
+    orderedList = [...listed.match({ ok: (value) => value, err: () => [] })];
 
     if (opts.triggerMsgRef) {
       const exists = orderedList.some((m) => m.ref.messageId === opts.triggerMsgRef!.messageId);
       if (!exists) {
         const fetchedTrigger = await adapter.readMsg(opts.triggerMsgRef);
-        if (fetchedTrigger) orderedList.push(fetchedTrigger);
+        const fetchError = fetchedTrigger.match({ ok: () => null, err: (error) => error });
+        if (fetchError) return Result.err(fetchError);
+        const fetchedValue = fetchedTrigger.match({ ok: (value) => value, err: () => null });
+        if (fetchedValue) orderedList.push(fetchedValue);
       }
     }
 
@@ -1467,9 +1529,13 @@ export async function composeRecentChannelMessages(
     ? (contextList.find((m) => m.ref.messageId === opts.triggerMsgRef!.messageId) ?? null)
     : null;
 
-  const activeAnchor = shouldApplyActiveBurstRules
-    ? (triggerMsg ?? (contextList.length > 0 ? contextList[contextList.length - 1]! : null))
-    : null;
+  let activeAnchor: SurfaceMessage | null = null;
+  if (shouldApplyActiveBurstRules) {
+    activeAnchor = triggerMsg;
+    if (activeAnchor === null && contextList.length > 0) {
+      activeAnchor = contextList[contextList.length - 1]!;
+    }
+  }
 
   const dividerCutContextList =
     shouldApplyActiveBurstRules && activeAnchor
@@ -1531,67 +1597,78 @@ export async function composeRecentChannelMessages(
     getAuthorId: (message) => message.authorId,
     getMessageId: (message) => message.messageId,
   });
-  const composed = await composeSelectedSurfaceChain({
+  let currentMessageIds = opts.currentMessageIds;
+  if (currentMessageIds === undefined) {
+    if (opts.triggerMsgRef) {
+      currentMessageIds = [opts.triggerMsgRef.messageId];
+    } else if (selectedNoDivider.length > 0) {
+      currentMessageIds = [selectedNoDivider[selectedNoDivider.length - 1]!.ref.messageId];
+    } else {
+      currentMessageIds = [];
+    }
+  }
+  const composed = await composeSelectedDiscordChain({
     adapter,
     platform: opts.platform,
     sessionId: opts.sessionId,
     botUserId: opts.botUserId,
     chain: checkpointSelection.descendants,
     checkpointSelection,
-    currentMessageIds:
-      opts.currentMessageIds ??
-      (opts.triggerMsgRef
-        ? [opts.triggerMsgRef.messageId]
-        : selectedNoDivider.length > 0
-          ? [selectedNoDivider[selectedNoDivider.length - 1]!.ref.messageId]
-          : []),
+    currentMessageIds,
     transcriptStore: opts.transcriptStore,
     discordUserAliasById: opts.discordUserAliasById,
   });
-
-  return {
-    messages: composed.messages,
+  return composed.map((value) => ({
+    messages: value.messages,
     chainMessageIds: chain.map((m) => m.messageId),
-    mergedGroups: composed.mergedGroups,
-    corePrimaryLineage: composed.corePrimaryLineage,
-  };
+    mergedGroups: value.mergedGroups,
+    corePrimaryLineage: value.corePrimaryLineage,
+  }));
 }
 
 export async function composeSingleMessage(
   adapter: SurfaceAdapter,
   opts: ComposeSingleMessageOpts,
-): Promise<ModelMessage | null> {
+): Promise<ResultType<ModelMessage | null, RequestCompositionError>> {
   const composed = await composeSingleMessageWithLineage(adapter, opts);
-  return composed?.messages[0] ?? null;
+  return composed.map((value) => value?.messages[0] ?? null);
 }
 
 export async function composeSingleMessageWithLineage(
   adapter: SurfaceAdapter,
   opts: ComposeSingleMessageOpts,
-): Promise<RequestCompositionResult | null> {
-  if (!isRoutedSurfacePlatform(opts.platform)) {
-    throw new Error(`Unsupported platform '${opts.platform}'`);
+  requestReadScope?: typeof ACTIVE_REQUEST_READ_SCOPE,
+): Promise<ResultType<RequestCompositionResult | null, RequestCompositionError>> {
+  if (requestReadScope !== ACTIVE_REQUEST_READ_SCOPE) {
+    return withSurfaceRequestReadScope(adapter, () =>
+      composeSingleMessageWithLineage(adapter, opts, ACTIVE_REQUEST_READ_SCOPE),
+    );
   }
-
   const m = await adapter.readMsg(opts.msgRef);
-  if (!m) return null;
+  const readError = m.match({ ok: () => null, err: (error) => error });
+  if (readError) return Result.err(readError);
+  const message = m.match({ ok: (value) => value, err: () => null });
+  if (!message) return Result.ok(null);
 
-  if (!shouldIncludeInModelContext(m)) return null;
+  if (!shouldIncludeInModelContext(message)) return Result.ok(null);
 
   // Never include session divider markers in model context.
-  if (isDiscordSessionDividerSurfaceMessageAnyAuthor(m)) return null;
+  if (isDiscordSessionDividerSurfaceMessageAnyAuthor(message)) return Result.ok(null);
 
-  let text = m.text.trim().length > 0 ? m.text : (getForwardSnapshotTextFromRaw(m.raw) ?? m.text);
-  const contentTransform = m.userId !== opts.botUserId ? opts.transformUserText : undefined;
+  let text =
+    message.text.trim().length > 0
+      ? message.text
+      : (getForwardSnapshotTextFromRaw(message.raw) ?? message.text);
+  const contentTransform = message.userId !== opts.botUserId ? opts.transformUserText : undefined;
 
   if (contentTransform) {
     text = contentTransform(text);
   }
 
   const chain = [
-    toReplyChainMessage(m, {
+    toReplyChainMessage(message, {
       overrideText: text,
-      authorNameFallback: `user_${m.userId}`,
+      authorNameFallback: `user_${message.userId}`,
     }),
   ];
   const checkpointSelection = selectNewestReachableCheckpoint({
@@ -1603,21 +1680,21 @@ export async function composeSingleMessageWithLineage(
     getAuthorId: (message) => message.authorId,
     getMessageId: (message) => message.messageId,
   });
-  const composed = await composeSelectedSurfaceChain({
+  const composed = await composeSelectedDiscordChain({
     adapter,
     platform: opts.platform,
     sessionId: opts.msgRef.channelId,
     botUserId: opts.botUserId,
     chain: checkpointSelection.descendants,
     checkpointSelection,
-    currentMessageIds: opts.currentMessageIds ?? [m.ref.messageId],
+    currentMessageIds: opts.currentMessageIds ?? [message.ref.messageId],
     transcriptStore: opts.transcriptStore,
     discordUserAliasById: opts.discordUserAliasById,
   });
-  return {
-    messages: composed.messages,
-    chainMessageIds: [m.ref.messageId],
-    mergedGroups: composed.mergedGroups,
-    corePrimaryLineage: composed.corePrimaryLineage,
-  };
+  return composed.map((value) => ({
+    messages: value.messages,
+    chainMessageIds: [message.ref.messageId],
+    mergedGroups: value.mergedGroups,
+    corePrimaryLineage: value.corePrimaryLineage,
+  }));
 }

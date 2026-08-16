@@ -16,6 +16,8 @@ type BatchPreflightMissingFieldErrorParams = {
   parameters?: unknown;
 };
 
+type BatchParameters = Readonly<Record<string, unknown>> | null;
+
 function oneLine(input: string): string {
   return input.replace(/\s+/g, " ").trim();
 }
@@ -26,8 +28,12 @@ function truncate(input: string, maxChars: number): string {
   return `${input.slice(0, maxChars - 3)}...`;
 }
 
-function summarizeProvidedKeys(parameters: unknown): string {
-  if (!isRecord(parameters)) return "(parameters is not an object)";
+function decodeBatchParameters(parameters: unknown): BatchParameters {
+  return isRecord(parameters) ? parameters : null;
+}
+
+function summarizeProvidedKeys(parameters: BatchParameters): string {
+  if (!parameters) return "(parameters is not an object)";
 
   const keys = Object.keys(parameters);
   if (keys.length === 0) return "(none)";
@@ -36,8 +42,8 @@ function summarizeProvidedKeys(parameters: unknown): string {
   return keys.length > 6 ? `${shown}, ...` : shown;
 }
 
-function isEmptyObjectParameters(parameters: unknown): boolean {
-  if (!isRecord(parameters)) return false;
+function isEmptyObjectParameters(parameters: BatchParameters): boolean {
+  if (!parameters) return false;
   return Object.keys(parameters).length === 0;
 }
 
@@ -54,14 +60,15 @@ function collectLikelyFieldPaths(error: ZodError): string[] {
 export function formatBatchPreflightMissingFieldError(
   params: BatchPreflightMissingFieldErrorParams,
 ): string {
-  const providedKeys = summarizeProvidedKeys(params.parameters);
+  const parameters = decodeBatchParameters(params.parameters);
+  const providedKeys = summarizeProvidedKeys(parameters);
   const lines = [
     `batch child #${params.childIndex} (${params.toolName}) is missing required parameter: ${params.field} (${params.expectedType}).`,
     `Provided keys: ${providedKeys}`,
     `Fix: include all required ${params.toolName} fields and retry this batch call.`,
   ];
 
-  if (isEmptyObjectParameters(params.parameters)) {
+  if (isEmptyObjectParameters(parameters)) {
     lines.splice(2, 0, "Hint: parameters object is empty.");
   }
 
@@ -70,7 +77,8 @@ export function formatBatchPreflightMissingFieldError(
 
 export function formatBatchChildValidationError(params: BatchChildValidationErrorParams): string {
   const prefix = `batch child #${params.childIndex} (${params.toolName}) has invalid parameters.`;
-  const providedKeys = summarizeProvidedKeys(params.parameters);
+  const parameters = decodeBatchParameters(params.parameters);
+  const providedKeys = summarizeProvidedKeys(parameters);
 
   if (params.error instanceof ZodError) {
     const fields = collectLikelyFieldPaths(params.error);
@@ -80,7 +88,7 @@ export function formatBatchChildValidationError(params: BatchChildValidationErro
       prefix,
       `Missing or invalid fields: ${fieldSummary}`,
       `Provided keys: ${providedKeys}`,
-      ...(isEmptyObjectParameters(params.parameters) ? ["Hint: parameters object is empty."] : []),
+      ...(isEmptyObjectParameters(parameters) ? ["Hint: parameters object is empty."] : []),
       `Fix: include all required ${params.toolName} fields and retry this batch call.`,
     ].join("\n");
   }
@@ -89,7 +97,7 @@ export function formatBatchChildValidationError(params: BatchChildValidationErro
   return [
     prefix,
     `Provided keys: ${providedKeys}`,
-    ...(isEmptyObjectParameters(params.parameters) ? ["Hint: parameters object is empty."] : []),
+    ...(isEmptyObjectParameters(parameters) ? ["Hint: parameters object is empty."] : []),
     `Fix: include all required ${params.toolName} fields and retry this batch call.`,
     `Details: ${detail}`,
   ].join("\n");

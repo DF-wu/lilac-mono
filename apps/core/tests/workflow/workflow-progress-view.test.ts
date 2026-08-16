@@ -4,15 +4,15 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { DurableWorkflowStore } from "../../src/workflow/durable-workflow-store";
+import { normalizeWorkflowResourcePolicy } from "./workflow-store-test-helpers";
 import { canonicalJsonSha256 } from "../../src/workflow/workflow-definition";
 import {
-  normalizeWorkflowResourcePolicy,
   type WorkflowOperation,
   type WorkflowRevision,
   type WorkflowRun,
 } from "../../src/workflow/workflow-domain";
 import {
-  buildWorkflowProgressView,
+  buildWorkflowProgressViewResult,
   renderWorkflowProgressView,
   type WorkflowProgressView,
 } from "../../src/workflow/workflow-progress-view";
@@ -402,11 +402,14 @@ describe("workflow progress view", () => {
         ),
       ).toBe(true);
 
-      const built = await buildWorkflowProgressView({
+      const builtResult = await buildWorkflowProgressViewResult({
         store,
         runId: "run-internal",
         now: 3_000,
       });
+      expect(builtResult.status).toBe("ok");
+      if (builtResult.status === "error") return;
+      const built = builtResult.value;
       expect(built.progress).toEqual({
         completed: 1,
         queued: 1,

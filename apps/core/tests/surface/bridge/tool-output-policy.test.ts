@@ -70,7 +70,7 @@ describe("tool output model-view policy", () => {
         {
           type: "tool-result",
           toolCallId: id,
-          toolName: "read_file",
+          toolName: "read",
           output: {
             type: "content",
             value: [
@@ -115,7 +115,7 @@ describe("tool output model-view policy", () => {
         {
           type: "tool-result",
           toolCallId: "pdf",
-          toolName: "read_file",
+          toolName: "read",
           output: {
             type: "content",
             value: [

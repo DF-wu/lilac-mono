@@ -3,9 +3,11 @@ import { describe, expect, it } from "bun:test";
 import { CODEX_BASE_INSTRUCTIONS } from "../codex-instructions";
 import type { CodexOAuthTokens } from "../codex-oauth";
 import {
+  CodexRequestInvalid,
   createCodexResponsesEventNormalizer,
   getModelProviders,
   normalizeCodexResponsesRequestRecord,
+  normalizeCodexResponsesRequestRecordResult,
   refreshCodexOAuthTokens,
   shouldRefreshCodexOAuthTokens,
 } from "../model-provider";
@@ -17,6 +19,16 @@ describe("claude-code provider", () => {
 
     expect(model.provider).toBe("claude-code");
     expect(model.modelId).toBe("sonnet");
+  });
+});
+
+describe("cerebras provider", () => {
+  it("resolves native Cerebras models", () => {
+    const provider = getModelProviders().cerebras;
+    const model = provider("gpt-oss-120b");
+
+    expect(model.provider).toBe("cerebras.chat");
+    expect(model.modelId).toBe("gpt-oss-120b");
   });
 });
 
@@ -144,6 +156,13 @@ describe("normalizeCodexResponsesRequestRecord", () => {
     expect(() => normalizeCodexResponsesRequestRecord({ stream: false, input: [] })).toThrow(
       "requires streaming",
     );
+
+    const result = normalizeCodexResponsesRequestRecordResult({ input: [] });
+    expect(result.status).toBe("error");
+    if (result.status === "error") {
+      expect(result.error).toBeInstanceOf(CodexRequestInvalid);
+      expect(result.error.issue).toBe("streaming-required");
+    }
   });
 
   it("keeps compaction triggers while stripping replay item IDs from the wire", () => {

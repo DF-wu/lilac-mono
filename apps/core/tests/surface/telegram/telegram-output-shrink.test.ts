@@ -1,4 +1,5 @@
 import { describe, expect, it } from "bun:test";
+import type { Result as ResultType } from "better-result";
 
 import {
   TelegramOutputStream,
@@ -6,9 +7,15 @@ import {
   type TelegramOutputStreamDeps,
 } from "../../../src/surface/telegram/output/telegram-output-stream";
 import { classifySurplusDeletionFailure } from "../../../src/surface/telegram/output/telegram-output-stream";
+import { projectTelegramError } from "../../../src/surface/telegram/telegram-error-projection";
 import type { MsgRef, TelegramSessionRef } from "../../../src/surface/types";
 
 const SESSION: TelegramSessionRef = { platform: "telegram", channelId: "1001" };
+
+function resultValue<T, E>(result: ResultType<T, E>): T {
+  if (result.status === "error") throw result.error;
+  return result.value;
+}
 
 type Recorded = { method: string; messageId?: number; text?: string };
 
@@ -77,14 +84,14 @@ describe("a shrinking answer must not leave stale messages behind", () => {
     const stream = makeStream(api);
 
     // Grow well past the 4096-char limit, then replace with a short answer.
-    await stream.push({ type: "text.set", text: "x".repeat(9000) });
+    resultValue(await stream.push({ type: "text.set", text: "x".repeat(9000) }));
     await stream.settled();
 
     const created = calls.filter((c) => c.method === "sendMessage").length;
     expect(created).toBeGreaterThan(1);
 
-    await stream.push({ type: "text.set", text: "short" });
-    const result = await stream.finish();
+    resultValue(await stream.push({ type: "text.set", text: "short" }));
+    const result = resultValue(await stream.finish());
 
     expect(calls.some((c) => c.method === "deleteMessage")).toBe(true);
     expect(live.size).toBe(1);
@@ -96,10 +103,10 @@ describe("a shrinking answer must not leave stale messages behind", () => {
     const { api, live } = harness();
     const stream = makeStream(api);
 
-    await stream.push({ type: "text.set", text: "y".repeat(9000) });
+    resultValue(await stream.push({ type: "text.set", text: "y".repeat(9000) }));
     await stream.settled();
-    await stream.push({ type: "text.set", text: "brief" });
-    const result = await stream.finish();
+    resultValue(await stream.push({ type: "text.set", text: "brief" }));
+    const result = resultValue(await stream.finish());
 
     const surviving = [...live.keys()].map(String);
     expect(result.created.map((ref) => ref.messageId)).toEqual(surviving);
@@ -110,9 +117,9 @@ describe("a shrinking answer must not leave stale messages behind", () => {
     const { api, calls, live } = harness();
     const stream = makeStream(api);
 
-    await stream.push({ type: "text.set", text: "z".repeat(9000) });
+    resultValue(await stream.push({ type: "text.set", text: "z".repeat(9000) }));
     await stream.settled();
-    const result = await stream.finish();
+    const result = resultValue(await stream.finish());
 
     expect(calls.some((c) => c.method === "deleteMessage")).toBe(false);
     expect(result.created.length).toBe(live.size);
@@ -127,8 +134,8 @@ describe("output mode only governs cancellation, not successful completion", () 
       const { api, live } = harness();
       const stream = makeStream(api, mode);
 
-      await stream.push({ type: "text.set", text: "the answer" });
-      const result = await stream.finish();
+      resultValue(await stream.push({ type: "text.set", text: "the answer" }));
+      const result = resultValue(await stream.finish());
 
       expect(live.size).toBe(1);
       expect([...live.values()][0]).toContain("the answer");
@@ -140,9 +147,9 @@ describe("output mode only governs cancellation, not successful completion", () 
     const { api, live } = harness();
     const stream = makeStream(api, "preview");
 
-    await stream.push({ type: "text.set", text: "partial thought" });
+    resultValue(await stream.push({ type: "text.set", text: "partial thought" }));
     await stream.settled();
-    await stream.abort("cancelled");
+    resultValue(await stream.abort("cancelled"));
 
     expect(live.size).toBe(0);
   });
@@ -151,9 +158,9 @@ describe("output mode only governs cancellation, not successful completion", () 
     const { api, live } = harness();
     const stream = makeStream(api, "inline");
 
-    await stream.push({ type: "text.set", text: "partial thought" });
+    resultValue(await stream.push({ type: "text.set", text: "partial thought" }));
     await stream.settled();
-    await stream.abort("cancelled");
+    resultValue(await stream.abort("cancelled"));
 
     expect(live.size).toBe(1);
   });
@@ -172,10 +179,10 @@ describe("a surplus message that cannot be deleted must stay tracked", () => {
     });
     const stream = makeStream(api);
 
-    await stream.push({ type: "text.set", text: "x".repeat(9000) });
+    resultValue(await stream.push({ type: "text.set", text: "x".repeat(9000) }));
     await stream.settled();
-    await stream.push({ type: "text.set", text: "short" });
-    const result = await stream.finish();
+    resultValue(await stream.push({ type: "text.set", text: "short" }));
+    const result = resultValue(await stream.finish());
 
     expect(attempts).toBeGreaterThan(0);
     // The message is still in the chat, so it is still reported.
@@ -192,10 +199,10 @@ describe("a surplus message that cannot be deleted must stay tracked", () => {
     });
     const stream = makeStream(api);
 
-    await stream.push({ type: "text.set", text: "x".repeat(9000) });
+    resultValue(await stream.push({ type: "text.set", text: "x".repeat(9000) }));
     await stream.settled();
-    await stream.push({ type: "text.set", text: "short" });
-    const result = await stream.finish();
+    resultValue(await stream.push({ type: "text.set", text: "short" }));
+    const result = resultValue(await stream.finish());
 
     expect(result.created).toHaveLength(1);
     expect(stream.getSurplusDeletionFailures()).toHaveLength(0);
@@ -205,7 +212,9 @@ describe("a surplus message that cannot be deleted must stay tracked", () => {
 describe("classifying why a surplus message survived", () => {
   it("treats a genuine not-found as absent", () => {
     expect(
-      classifySurplusDeletionFailure(new Error("Bad Request: message to delete not found")),
+      classifySurplusDeletionFailure(
+        projectTelegramError(new Error("Bad Request: message to delete not found"), "test failure"),
+      ),
     ).toBe("absent");
   });
 
@@ -213,19 +222,27 @@ describe("classifying why a surplus message survived", () => {
     // Telegram returns this when the message still exists but the bot may not
     // remove it — an expired 48h window, or missing rights. Calling it absent
     // reports a clean reconciliation while stale text stays in the chat.
-    expect(classifySurplusDeletionFailure(new Error("Bad Request: message can't be deleted"))).toBe(
-      "unreconciled",
-    );
+    expect(
+      classifySurplusDeletionFailure(
+        projectTelegramError(new Error("Bad Request: message can't be deleted"), "test failure"),
+      ),
+    ).toBe("unreconciled");
   });
 
   it("treats missing rights as unreconciled rather than retryable", () => {
     expect(
-      classifySurplusDeletionFailure(new Error("Bad Request: not enough rights to delete")),
+      classifySurplusDeletionFailure(
+        projectTelegramError(new Error("Bad Request: not enough rights to delete"), "test failure"),
+      ),
     ).toBe("unreconciled");
   });
 
   it("treats a transport failure as retryable", () => {
-    expect(classifySurplusDeletionFailure(new Error("network unreachable"))).toBe("retryable");
+    expect(
+      classifySurplusDeletionFailure(
+        projectTelegramError(new Error("network unreachable"), "test failure"),
+      ),
+    ).toBe("retryable");
   });
 });
 
@@ -238,10 +255,10 @@ describe("an unremovable surplus message is reported, not silently kept", () => 
     });
     const stream = makeStream(api);
 
-    await stream.push({ type: "text.set", text: "x".repeat(9000) });
+    resultValue(await stream.push({ type: "text.set", text: "x".repeat(9000) }));
     await stream.settled();
-    await stream.push({ type: "text.set", text: "short" });
-    const result = await stream.finish();
+    resultValue(await stream.push({ type: "text.set", text: "short" }));
+    const result = resultValue(await stream.finish());
 
     const failures = stream.getSurplusDeletionFailures();
     expect(failures.length).toBeGreaterThan(0);
@@ -262,8 +279,8 @@ describe("an unremovable surplus message is reported, not silently kept", () => 
     });
     const stream = makeStream(api, "inline", { resume: { created: resumed } });
 
-    await stream.push({ type: "text.set", text: "replacement" });
-    await stream.finish();
+    resultValue(await stream.push({ type: "text.set", text: "replacement" }));
+    resultValue(await stream.finish());
 
     expect(stream.getSurplusDeletionFailures().length).toBeGreaterThan(0);
     expect(stream.getDeliveredMessages()).toEqual([{ messageId: 10, text: "replacement" }]);
@@ -273,10 +290,10 @@ describe("an unremovable surplus message is reported, not silently kept", () => 
     const { api } = harness({ failDelete: () => new Error("socket hang up") });
     const stream = makeStream(api);
 
-    await stream.push({ type: "text.set", text: "x".repeat(9000) });
+    resultValue(await stream.push({ type: "text.set", text: "x".repeat(9000) }));
     await stream.settled();
-    await stream.push({ type: "text.set", text: "short" });
-    await stream.finish();
+    resultValue(await stream.push({ type: "text.set", text: "short" }));
+    resultValue(await stream.finish());
 
     expect(stream.getSurplusDeletionFailures().every((f) => f.outcome === "retryable")).toBe(true);
   });

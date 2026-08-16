@@ -1,9 +1,7 @@
 import { createInterface, type Interface } from "node:readline";
 
-import type {
-  MiniLilacModelSummary,
-  MiniLilacProfileSummary,
-} from "@stanley2058/mini-lilac-client";
+import type { MiniLilacModelSummary } from "@stanley2058/mini-lilac-client";
+import { Result, TaggedError, type Result as ResultType } from "better-result";
 
 export interface Choice {
   readonly id: string;
@@ -13,13 +11,13 @@ export interface Choice {
 }
 
 /** Index of the default choice, or 0 when none is marked. Pure. */
-export function defaultChoiceIndex(choices: readonly Choice[]): number {
+function defaultChoiceIndex(choices: readonly Choice[]): number {
   const index = choices.findIndex((choice) => choice.isDefault);
   return index >= 0 ? index : 0;
 }
 
 /** Resolve a numbered-selection input to a choice, or `undefined` if invalid. Pure. */
-export function resolveChoiceInput(
+function resolveChoiceInput(
   input: string,
   choices: readonly Choice[],
   defaultIndex: number,
@@ -41,23 +39,7 @@ export function modelChoices(models: readonly MiniLilacModelSummary[]): Choice[]
   }));
 }
 
-/** Profiles usable interactively (subagent-only profiles are filtered out). */
-export function selectableProfileChoices(profiles: readonly MiniLilacProfileSummary[]): Choice[] {
-  return profiles
-    .filter((profile) => !profile.subagentOnly)
-    .map((profile) => ({
-      id: profile.id,
-      label: profile.label,
-      hint: profile.description,
-      isDefault: profile.isDefault === true,
-    }));
-}
-
-export function renderChoiceList(
-  title: string,
-  choices: readonly Choice[],
-  defaultIndex: number,
-): string {
+function renderChoiceList(title: string, choices: readonly Choice[], defaultIndex: number): string {
   const lines = [title];
   choices.forEach((choice, index) => {
     const marker = index === defaultIndex ? "*" : " ";
@@ -72,6 +54,19 @@ export interface PreflightIO {
   write(text: string): void;
   question(prompt: string): Promise<string>;
 }
+
+export class PreflightSelectionUnavailable extends TaggedError("PreflightSelectionUnavailable")<{
+  readonly title: string;
+  readonly message: string;
+}> {}
+
+export class PreflightSelectionUnknown extends TaggedError("PreflightSelectionUnknown")<{
+  readonly title: string;
+  readonly selection: string;
+  readonly message: string;
+}> {}
+
+export type PreflightSelectionError = PreflightSelectionUnavailable | PreflightSelectionUnknown;
 
 export function createReadlinePreflightIO(
   input: NodeJS.ReadableStream = process.stdin,
@@ -94,15 +89,28 @@ export async function selectChoice(
   title: string,
   choices: readonly Choice[],
   preselectedId: string | undefined,
-): Promise<Choice> {
-  if (choices.length === 0) throw new Error(`No ${title.toLowerCase()} available`);
+): Promise<ResultType<Choice, PreflightSelectionError>> {
+  if (choices.length === 0) {
+    return Result.err(
+      new PreflightSelectionUnavailable({
+        title,
+        message: `No ${title.toLowerCase()} available`,
+      }),
+    );
+  }
 
   if (preselectedId !== undefined) {
     const match = choices.find((choice) => choice.id === preselectedId);
     if (match === undefined) {
-      throw new Error(`Unknown selection '${preselectedId}' for ${title.toLowerCase()}`);
+      return Result.err(
+        new PreflightSelectionUnknown({
+          title,
+          selection: preselectedId,
+          message: `Unknown selection '${preselectedId}' for ${title.toLowerCase()}`,
+        }),
+      );
     }
-    return match;
+    return Result.ok(match);
   }
 
   const defaultIndex = defaultChoiceIndex(choices);
@@ -111,7 +119,7 @@ export async function selectChoice(
   for (;;) {
     const answer = await io.question(`Select 1-${choices.length} [${defaultIndex + 1}]: `);
     const choice = resolveChoiceInput(answer, choices, defaultIndex);
-    if (choice !== undefined) return choice;
+    if (choice !== undefined) return Result.ok(choice);
     io.write("Invalid selection, try again.\n");
   }
 }

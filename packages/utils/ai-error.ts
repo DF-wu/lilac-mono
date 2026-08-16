@@ -139,7 +139,11 @@ function locateAiErrors(
 
 export function extractAiErrorLogDetails(error: unknown): AiErrorLogDetails | undefined {
   const located: LocatedAiErrors = {};
-  locateAiErrors(error, located, new Set<unknown>(), 0);
+  try {
+    locateAiErrors(error, located, new Set<unknown>(), 0);
+  } catch {
+    return undefined;
+  }
 
   const apiCallError = located.apiCallError;
   const retryError = located.retryError;
@@ -153,8 +157,8 @@ export function extractAiErrorLogDetails(error: unknown): AiErrorLogDetails | un
 
   return {
     aiErrorName: primaryError.name,
-    aiErrorMessage: primaryError.message,
-    retryReason: retryError?.reason,
+    aiErrorMessage: sanitizeProviderText(primaryError.message),
+    retryReason: retryError ? sanitizeProviderText(retryError.reason) : undefined,
     retryAttempts: retryError?.errors.length,
     statusCode: apiCallError?.statusCode,
     requestUrl: apiCallError ? sanitizeRequestUrl(apiCallError.url) : undefined,
