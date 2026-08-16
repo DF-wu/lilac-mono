@@ -11,6 +11,7 @@ import {
   isFatalTelegramPollingExit,
   TelegramAdapter,
 } from "../../../src/surface/telegram/telegram-adapter";
+import { projectTelegramError } from "../../../src/surface/telegram/telegram-error-projection";
 import { FakeBotApiServer } from "./fake-bot-api-server";
 import { BOT_USER_ID, BOT_USERNAME } from "./telegram-fixtures";
 
@@ -97,16 +98,33 @@ describe("fatal polling exit classification", () => {
     // so they are the only ones that can terminate polling by themselves.
     expect(
       isFatalTelegramPollingExit(
-        grammyError(409, "Conflict: terminated by other getUpdates request"),
+        projectTelegramError(
+          grammyError(409, "Conflict: terminated by other getUpdates request"),
+          "test failure",
+        ),
       ),
     ).toBe(true);
-    expect(isFatalTelegramPollingExit(grammyError(401, "Unauthorized"))).toBe(true);
+    expect(
+      isFatalTelegramPollingExit(
+        projectTelegramError(grammyError(401, "Unauthorized"), "test failure"),
+      ),
+    ).toBe(true);
   });
 
   it("does not treat retryable failures as fatal", () => {
-    expect(isFatalTelegramPollingExit(grammyError(429, "Too Many Requests"))).toBe(false);
-    expect(isFatalTelegramPollingExit(grammyError(500, "Internal Server Error"))).toBe(false);
-    expect(isFatalTelegramPollingExit(new Error("socket hang up"))).toBe(false);
+    expect(
+      isFatalTelegramPollingExit(
+        projectTelegramError(grammyError(429, "Too Many Requests"), "test failure"),
+      ),
+    ).toBe(false);
+    expect(
+      isFatalTelegramPollingExit(
+        projectTelegramError(grammyError(500, "Internal Server Error"), "test failure"),
+      ),
+    ).toBe(false);
+    expect(
+      isFatalTelegramPollingExit(projectTelegramError(new Error("socket hang up"), "test failure")),
+    ).toBe(false);
     expect(isFatalTelegramPollingExit(null)).toBe(false);
   });
 });

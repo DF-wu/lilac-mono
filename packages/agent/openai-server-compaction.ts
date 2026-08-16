@@ -6,6 +6,7 @@ import {
   type ToolSet,
 } from "ai";
 import { z } from "zod";
+import { Result, TaggedError, type Result as ResultType } from "better-result";
 
 import {
   SERVER_COMPACTION_REQUEST_HEADER,
@@ -16,6 +17,7 @@ import {
 } from "@stanley2058/lilac-utils";
 
 import { stripToolExecuteForModel, type SystemPrompt } from "./ai-sdk-pi-agent";
+import { rethrowAgentPanic } from "./failure-adapters";
 
 const SERVER_COMPACTION_FORMAT_VERSION = 1 as const;
 const SERVER_COMPACTION_PROTOCOL = "openai-responses-v2" as const;
@@ -94,6 +96,32 @@ export type OpenAIServerCompactionRequest = {
   readonly abortSignal?: AbortSignal;
 };
 
+export class OpenAIServerCompactionAborted extends TaggedError("OpenAIServerCompactionAborted")<{
+  readonly cause: unknown;
+  readonly message: string;
+}> {}
+
+export class OpenAIServerCompactionRequestFailed extends TaggedError(
+  "OpenAIServerCompactionRequestFailed",
+)<{
+  readonly cause: unknown;
+  readonly message: string;
+}> {}
+
+export class OpenAIServerCompactionOutputInvalid extends TaggedError(
+  "OpenAIServerCompactionOutputInvalid",
+)<{
+  readonly reason: "output-count" | "generated-artifact";
+  readonly outputCount: number;
+  readonly issues?: readonly string[];
+  readonly message: string;
+}> {}
+
+export type OpenAIServerCompactionError =
+  | OpenAIServerCompactionAborted
+  | OpenAIServerCompactionRequestFailed
+  | OpenAIServerCompactionOutputInvalid;
+
 function estimateTokensFromText(text: string): number {
   return Math.max(1, Math.ceil(text.length / 4));
 }
@@ -142,9 +170,22 @@ export function readOpenAIServerCompactionArtifact(
 ): OpenAIServerCompactionArtifact | null {
   const parsed = persistedOpenAICompactionPartSchema.safeParse(value);
   if (!parsed.success) return null;
+  const metadata = parsed.data.providerOptions.lilac.serverCompaction;
+  const part = {
+    type: "custom",
+    kind: "openai.compaction",
+    providerOptions: {
+      openai: {
+        type: "compaction",
+        itemId: parsed.data.providerOptions.openai.itemId,
+        encryptedContent: parsed.data.providerOptions.openai.encryptedContent,
+      },
+      lilac: { serverCompaction: metadata },
+    },
+  } as const satisfies AssistantContentPart;
   return {
-    part: parsed.data as AssistantContentPart,
-    metadata: parsed.data.providerOptions.lilac.serverCompaction,
+    part,
+    metadata,
   };
 }
 
@@ -159,7 +200,7 @@ export function materializeOpenAIServerCompaction(
           (part) =>
             !isOpenAICompactionPart(part) || readOpenAIServerCompactionArtifact(part) !== null,
         )
-        .map((part) => ({ ...part }));
+        .map((part) => Object.assign({}, part));
       return content.length === 0 ? [] : [{ ...message, content }];
     }
     if (message.role === "tool") {
@@ -220,28 +261,49 @@ export function hasOpenAIServerCompaction(messages: readonly ModelMessage[]): bo
   );
 }
 
-export async function compactWithOpenAIResponses(
+export async function compactWithOpenAIResponsesResult(
   request: OpenAIServerCompactionRequest,
-): Promise<OpenAIServerCompactionArtifact> {
-  request.abortSignal?.throwIfAborted();
-  const result = streamText({
-    model: request.model,
-    instructions: request.system,
-    messages: [...request.messages],
-    ...(request.tools ? { tools: declarationOnlyServerCompactionTools(request.tools) } : {}),
-    providerOptions: serverCompactionProviderOptions(request.providerOptions),
-    reasoning: request.reasoning,
-    headers: {
-      [SERVER_COMPACTION_REQUEST_HEADER]: SERVER_COMPACTION_REQUEST_MARKER,
-    },
-    abortSignal: request.abortSignal,
-  });
-
-  for await (const _part of result.stream) {
+): Promise<ResultType<OpenAIServerCompactionArtifact, OpenAIServerCompactionError>> {
+  let response: Awaited<ReturnType<typeof streamText>["response"]>;
+  let usage: Awaited<ReturnType<typeof streamText>["usage"]>;
+  try {
     request.abortSignal?.throwIfAborted();
+    const result = streamText({
+      model: request.model,
+      instructions: request.system,
+      messages: [...request.messages],
+      ...(request.tools ? { tools: declarationOnlyServerCompactionTools(request.tools) } : {}),
+      providerOptions: serverCompactionProviderOptions(request.providerOptions),
+      reasoning: request.reasoning,
+      headers: {
+        [SERVER_COMPACTION_REQUEST_HEADER]: SERVER_COMPACTION_REQUEST_MARKER,
+      },
+      abortSignal: request.abortSignal,
+    });
+
+    for await (const _part of result.stream) {
+      request.abortSignal?.throwIfAborted();
+    }
+
+    [response, usage] = await Promise.all([result.response, result.usage]);
+  } catch (cause) {
+    rethrowAgentPanic(cause);
+    if (request.abortSignal?.aborted) {
+      return Result.err(
+        new OpenAIServerCompactionAborted({
+          cause,
+          message: "OpenAI server compaction was aborted",
+        }),
+      );
+    }
+    return Result.err(
+      new OpenAIServerCompactionRequestFailed({
+        cause,
+        message: "OpenAI server compaction request failed",
+      }),
+    );
   }
 
-  const [response, usage] = await Promise.all([result.response, result.usage]);
   const compactionParts = response.messages.flatMap((message) =>
     message.role === "assistant" && Array.isArray(message.content)
       ? message.content.flatMap((part) => {
@@ -252,8 +314,12 @@ export async function compactWithOpenAIResponses(
   );
 
   if (compactionParts.length !== 1) {
-    throw new Error(
-      `OpenAI server compaction expected exactly one compaction output item, got ${compactionParts.length}`,
+    return Result.err(
+      new OpenAIServerCompactionOutputInvalid({
+        reason: "output-count",
+        outputCount: compactionParts.length,
+        message: `OpenAI server compaction expected exactly one compaction output item, got ${compactionParts.length}`,
+      }),
     );
   }
 
@@ -270,13 +336,24 @@ export async function compactWithOpenAIResponses(
       ),
     ),
   );
-  const metadata = openAIServerCompactionMetadataSchema.parse({
+  const decodedMetadata = openAIServerCompactionMetadataSchema.safeParse({
     formatVersion: SERVER_COMPACTION_FORMAT_VERSION,
     protocol: SERVER_COMPACTION_PROTOCOL,
     replayKey: request.replayKey,
     portableSummary: request.portableSummary,
     estimatedTokens,
   });
+  if (!decodedMetadata.success) {
+    return Result.err(
+      new OpenAIServerCompactionOutputInvalid({
+        reason: "generated-artifact",
+        outputCount: compactionParts.length,
+        issues: decodedMetadata.error.issues.map((issue) => issue.message),
+        message: "OpenAI server compaction generated invalid artifact metadata",
+      }),
+    );
+  }
+  const metadata = decodedMetadata.data;
   const part = {
     type: "custom",
     kind: "openai.compaction",
@@ -290,5 +367,33 @@ export async function compactWithOpenAIResponses(
     },
   } as const satisfies AssistantContentPart;
 
-  return { part, metadata };
+  const artifact = readOpenAIServerCompactionArtifact(part);
+  if (!artifact) {
+    return Result.err(
+      new OpenAIServerCompactionOutputInvalid({
+        reason: "generated-artifact",
+        outputCount: compactionParts.length,
+        message: "OpenAI server compaction generated an invalid artifact",
+      }),
+    );
+  }
+  return Result.ok(artifact);
+}
+
+/** Compatibility adapter for provider integrations that use rejection as their failure contract. */
+export async function compactWithOpenAIResponses(
+  request: OpenAIServerCompactionRequest,
+): Promise<OpenAIServerCompactionArtifact> {
+  const result = await compactWithOpenAIResponsesResult(request);
+  const outcome = result.match<
+    | { type: "ok"; value: OpenAIServerCompactionArtifact }
+    | { type: "error"; error: OpenAIServerCompactionError }
+  >({
+    ok: (value) => ({ type: "ok" as const, value }),
+    err: (error) => ({ type: "error" as const, error }),
+  });
+  if (outcome.type === "error") {
+    throw new Error(outcome.error.message, { cause: outcome.error });
+  }
+  return outcome.value;
 }

@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 
 import {
+  ClaudeCodeRunExternalFailure,
   ClaudeNativeSessionPreflightError,
   type ClaudeNativeSessionStart,
   type MaterializedClaudeCodeRun,
@@ -12,6 +13,7 @@ import {
 import type { MiniLilacUIMessage } from "@stanley2058/mini-lilac-client";
 import type { LanguageModel } from "ai";
 import { MockLanguageModelV4, simulateReadableStream } from "ai/test";
+import { Result } from "better-result";
 
 import type { RuntimeConfig } from "../src/config";
 import {
@@ -23,6 +25,7 @@ import {
   SessionService,
   type MiniLilacRuntimeChunk,
   type SessionServiceOptions,
+  resolveMiniClaudeCompactionSummaryModel,
 } from "../src/session-service";
 
 const temporaryDirectories: string[] = [];
@@ -214,7 +217,7 @@ function userMessage(text: string): MiniLilacUIMessage {
   return { id: crypto.randomUUID(), role: "user", parts: [{ type: "text", text }] };
 }
 
-function config(profileTools: readonly string[] = ["read_file", "websearch"]): RuntimeConfig {
+function config(profileTools: readonly string[] = ["read", "websearch"]): RuntimeConfig {
   return {
     configVersion: 1,
     server: { host: "127.0.0.1", port: 3000 },
@@ -249,7 +252,7 @@ function config(profileTools: readonly string[] = ["read_file", "websearch"]): R
         child: {
           description: "Named child",
           subagentOnly: true,
-          tools: ["read_file"],
+          tools: ["read"],
           execution: false,
           workspaceWrites: false,
           delegation: false,
@@ -329,9 +332,13 @@ function fakeClaudeCode(options: {
       reasoning: input.reasoning,
     });
     if (options.rejectForks && input.nativeSession?.mode === "fork") {
-      throw new ClaudeNativeSessionPreflightError([
-        { code: "source-preflight-missing", message: "test source is missing" },
-      ]);
+      const issues = [
+        { code: "source-preflight-missing" as const, message: "test source is missing" },
+      ];
+      throw new ClaudeNativeSessionPreflightError({
+        issues,
+        message: "Claude native fork preflight requires a fresh start: test source is missing",
+      });
     }
     const requestedSessionId =
       input.nativeSession?.mode === "ephemeral" ? null : (input.nativeSession?.sessionId ?? null);
@@ -339,10 +346,13 @@ function fakeClaudeCode(options: {
     const sourceSessionId =
       input.nativeSession?.mode === "fork" ? input.nativeSession.baseSessionId : null;
     let disposed = false;
+    const createUtilityModel = () => options.utilityModel ?? new MockLanguageModelV4({});
     const run: FakeClaudeRun = {
       agentModel: options.agentModel,
       continuationModel: options.agentModel,
-      createUtilityModel: () => options.utilityModel ?? new MockLanguageModelV4({}),
+      createUtilityModelResult: () =>
+        Result.ok(options.utilityModel ?? new MockLanguageModelV4({})),
+      createUtilityModel,
       injected: [],
       interrupts: 0,
       disposals: 0,
@@ -356,7 +366,14 @@ function fakeClaudeCode(options: {
           run.interrupts += 1;
           return true;
         },
+        async interruptResult() {
+          return Result.ok(await this.interrupt());
+        },
         clear() {},
+        clearResult() {
+          this.clear();
+          return Result.ok();
+        },
       },
       nativeSession: {
         getObservation: () => ({
@@ -425,11 +442,18 @@ function fakeClaudeCode(options: {
                   },
           };
         },
+        async finalizeResult() {
+          return Result.ok(await this.finalize());
+        },
       },
       dispose: async () => {
         if (disposed) return;
         disposed = true;
         run.disposals += 1;
+      },
+      async disposeResult() {
+        await this.dispose();
+        return Result.ok();
       },
     };
     options.runs?.push(run);
@@ -513,6 +537,60 @@ async function collect(stream: ReadableStream<MiniLilacRuntimeChunk>) {
 }
 
 describe("claude-code sessions", () => {
+  it("uses the utility-model Result without calling the throwing compatibility adapter", () => {
+    const utilityModel = new MockLanguageModelV4({ modelId: "utility" });
+    const fallbackModel = new MockLanguageModelV4({ modelId: "fallback" });
+    let compatibilityCalls = 0;
+    let fallbackCalls = 0;
+    const run = {
+      createUtilityModelResult: () => Result.ok(utilityModel),
+      createUtilityModel: () => {
+        compatibilityCalls += 1;
+        return fallbackModel;
+      },
+    };
+
+    const model = resolveMiniClaudeCompactionSummaryModel({
+      run,
+      fallback: () => {
+        fallbackCalls += 1;
+        return fallbackModel;
+      },
+      onFailure: () => {
+        throw new Error("unexpected utility model failure");
+      },
+    });
+
+    expect(model).toBe(utilityModel);
+    expect(compatibilityCalls).toBe(0);
+    expect(fallbackCalls).toBe(0);
+  });
+
+  it("falls back from an owned utility-model failure without rejection flow", () => {
+    const fallbackModel = new MockLanguageModelV4({ modelId: "fallback" });
+    const reported: ClaudeCodeRunExternalFailure[] = [];
+    const failure = new ClaudeCodeRunExternalFailure({
+      operation: "Claude utility model construction",
+      cause: new Error("construction failed"),
+      message: "Claude utility model construction failed",
+    });
+    const run = {
+      createUtilityModelResult: () => Result.err(failure),
+      createUtilityModel: () => {
+        throw failure;
+      },
+    };
+
+    const model = resolveMiniClaudeCompactionSummaryModel({
+      run,
+      fallback: () => fallbackModel,
+      onFailure: (error) => reported.push(error),
+    });
+
+    expect(model).toBe(fallbackModel);
+    expect(reported).toEqual([failure]);
+  });
+
   it("runs on the materialized model, withholds tool declarations, and disposes on completion", async () => {
     const model = new MockLanguageModelV4({ doStream: [textResult("answer", "done")] });
     const calls: MaterializeCall[] = [];
@@ -524,7 +602,7 @@ describe("claude-code sessions", () => {
     expect(calls).toHaveLength(1);
     expect(calls[0]?.modelId).toBe("claude-sonnet-4-6");
     expect(calls[0]?.cwd).toBe(directory);
-    expect(calls[0]?.toolNames).toContain("read_file");
+    expect(calls[0]?.toolNames).toContain("read");
     // Claude ignores AI SDK tool declarations; the toolset reaches it via MCP.
     expect(model.doStreamCalls[0]?.tools ?? []).toEqual([]);
     expect(runs[0]?.disposals).toBe(1);
@@ -1223,7 +1301,7 @@ describe("claude-code sessions", () => {
 
     const second = await temporaryRuntime({
       model: new MockLanguageModelV4({ doStream: [textResult("b", "done")] }),
-      profileTools: ["read_file"],
+      profileTools: ["read"],
       calls: withoutSearch,
     });
     await collect((await second.service.startPrompt(second.session.id, userMessage("hi"))).stream);
@@ -1290,7 +1368,7 @@ describe("claude-code sessions", () => {
       ),
     ).toEqual([
       expect.objectContaining({
-        toolName: "read_file",
+        toolName: "read",
         input: { path: "README.md" },
       }),
     ]);

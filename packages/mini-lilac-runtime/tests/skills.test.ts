@@ -65,6 +65,9 @@ describe("MiniLilacSkillCatalog", () => {
       resourceListingTruncated: false,
     });
     await expect(snapshot.load("missing")).rejects.toThrow("is not available");
+    const missing = await snapshot.loadResult("missing");
+    expect(missing.status).toBe("error");
+    if (missing.status === "error") expect(missing.error._tag).toBe("MiniLilacSkillUnavailable");
   });
 
   it("discovers only Mini Lilac state and local or global .agents skills", async () => {
@@ -111,6 +114,16 @@ describe("MiniLilacSkillCatalog", () => {
     await expect(snapshot.load("frontend-design")).rejects.toThrow(
       "instructions exceed 32000 characters",
     );
+    expect((await snapshot.loadResult("frontend-design")).status).toBe("error");
+  });
+
+  it("exposes successful discovery through the Result API", async () => {
+    const { dataDir, homeDir, cwd } = await fixture();
+    const discovered = await new MiniLilacSkillCatalog({ dataDir, homeDir }).discoverResult(cwd);
+    expect(discovered.status).toBe("ok");
+    if (discovered.status === "ok") {
+      expect(discovered.value.summaries.map((skill) => skill.name)).toEqual(["frontend-design"]);
+    }
   });
 
   it("bounds skill file reads by bytes", async () => {

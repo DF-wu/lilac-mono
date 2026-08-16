@@ -1,31 +1,59 @@
-import { z } from "zod";
 import type { Logger } from "@stanley2058/simple-module-logger";
-import { JSDOM } from "jsdom";
-import { Readability } from "@mozilla/readability";
-import { chromium, type Browser, type BrowserContext, type Page } from "playwright";
-import Exa from "exa-js";
-import type { ServerTool } from "../types";
-import { zodObjectToCliLines } from "./zod-cli";
-import { tavily, type TavilyClient } from "@tavily/core";
-import TurndownService from "turndown";
 import {
   createLogger,
   env,
   errorMessage as getErrorMessage,
+  formatTaggedErrorForLog,
   getCoreConfig,
   isRecord,
 } from "@stanley2058/lilac-utils";
-import fs from "node:fs/promises";
-import { constants as fsConstants } from "node:fs";
+import { Result } from "better-result";
+import { z } from "zod";
 
+import { defineServerTool, type RequestContext, type ServerTool } from "../types";
 import {
   createDefaultWebSearchProviders,
   resolveWebSearchProvider,
   webSearchInputSchema,
-  type WebSearchProviderId,
   type WebSearchProvider,
+  type WebSearchProviderId,
 } from "./web-search";
-import type { RequestContext } from "../types";
+import {
+  FirecrawlPermitPool,
+  FirecrawlPermitQueueTimedOut,
+  type FirecrawlPermit,
+  type FirecrawlPermitFailure,
+  type FirecrawlPermitPolicy,
+} from "./web-search/firecrawl-permit-pool";
+import {
+  createBrowserPageAcquisition,
+  type BrowserPageAcquisition,
+} from "./web/browser-page-acquisition";
+import {
+  createDirectHttpPageAcquisition,
+  type DirectHttpPageAcquisition,
+} from "./web/direct-http-page-acquisition";
+import {
+  assessPageContent,
+  buildSimpleHtmlContent,
+  normalizePageWhitespace,
+  PageContent,
+  slicePageContent,
+  type PageAcquisitionInput,
+  type PageContentResult,
+  type PageFormat,
+  type ParsedPageContent,
+} from "./web/page-content";
+import {
+  createProviderPageExtractor,
+  type ProviderPageExtractor,
+  type WebProviderEnvironment,
+} from "./web/provider-page-extraction";
+
+export {
+  decodeFirecrawlScrapeResponse,
+  FirecrawlScrapeResponseInvalid,
+} from "./web/provider-page-extraction";
 
 const getPageModeSchema = z.enum(["auto", "fetch", "browser", "extract", "provider-only"]);
 
@@ -58,39 +86,15 @@ const getPageSchema = z.object({
     ),
 });
 
-const MAX_FETCH_RESPONSE_BYTES = 5 * 1024 * 1024;
-const MAX_ERROR_RESPONSE_BYTES = 64 * 1024;
-const MAX_FULL_DOM_PARSE_BYTES = 750 * 1024;
-const EXA_MAX_EXTRACT_CHARACTERS = 50_000;
-const MIN_EXTRACT_USEFUL_CHARACTERS = 200;
-const STRONG_EXTRACT_CHARACTERS = 600;
-const TAVILY_MAX_TIMEOUT_SECONDS = 60;
-const SUPPORTED_TEXT_MEDIA_TYPES = new Set([
-  "text/html",
-  "text/plain",
-  "text/markdown",
-  "application/xhtml+xml",
-]);
-const WEAK_CONTENT_PATTERNS = [
-  /enable javascript/i,
-  /javascript (is )?required/i,
-  /please wait/i,
-  /loading/i,
-  /sign in/i,
-  /log in/i,
-  /cookie/i,
-  /privacy policy/i,
-  /terms of service/i,
-] as const;
-const SPA_SHELL_MARKERS = [
-  "__next",
-  "__nuxt",
-  "data-reactroot",
-  'id="root"',
-  'id="app"',
-  "webpack",
-  "hydration",
-] as const;
+type GetPageMode = z.infer<typeof getPageModeSchema>;
+type GetPageInput = z.infer<typeof getPageSchema>;
+type WebProviderFailure = { providerId: WebSearchProviderId; message: string };
+type WebToolConfig = {
+  extractProviders: readonly WebSearchProviderId[];
+  fetchMode: GetPageMode;
+  firecrawlPolicy: FirecrawlPermitPolicy | undefined;
+};
+
 const RETRIABLE_WEB_PROVIDER_ERROR_PATTERNS = [
   /credits? (are )?(exhausted|depleted|insufficient|used up)/i,
   /quota (is )?(exhausted|depleted|exceeded|reached)/i,
@@ -110,56 +114,69 @@ const RETRIABLE_WEB_PROVIDER_ERROR_PATTERNS = [
   /fetch failed/i,
 ] as const;
 
-type GetPageMode = z.infer<typeof getPageModeSchema>;
-type GetPageInput = z.infer<typeof getPageSchema>;
-type ParsedPageContent = {
-  url: string;
-  title: string;
-  markdown: string;
-  text: string;
-  raw: string;
-};
-type PageContentSuccess = {
-  isError: false;
-  content: ParsedPageContent;
-  sourceTruncated?: boolean;
-  rawHtml?: string;
-};
-type PageContentError = {
-  isError: true;
-  error: string;
-  status?: number;
-  contentType?: string | null;
-  contentLength?: number | null;
-};
-type PageContentResult = PageContentSuccess | PageContentError;
-type WebProviderFailure = {
-  providerId: WebSearchProviderId;
-  message: string;
-};
+const sharedFirecrawlFetchPermits = new FirecrawlPermitPool("fetch");
+const sharedFirecrawlSearchPermits = new FirecrawlPermitPool("search");
 
-type FirecrawlScrapeResponse = {
-  success?: boolean;
-  error?: string;
-  message?: string;
-  data?: unknown;
-};
-
-function createAbortError(message = "request aborted"): Error {
-  const error = new Error(message);
-  error.name = "AbortError";
-  return error;
+async function loadDefaultWebToolConfig(): Promise<WebToolConfig> {
+  const config = await getCoreConfig();
+  return {
+    extractProviders: config.tools.web.extract.providers,
+    fetchMode: config.tools.web.fetch.mode,
+    firecrawlPolicy: config.tools.web.firecrawl,
+  };
 }
 
-function getAbortReasonError(signal: AbortSignal): Error {
-  const reason = signal.reason;
-  if (reason instanceof Error) {
-    return reason;
-  }
-  if (typeof reason === "string" && reason.length > 0) {
-    return createAbortError(reason);
-  }
-  return createAbortError();
+function getDefaultWebProviderEnvironment(): WebProviderEnvironment {
+  return {
+    firecrawl: {
+      apiKey: env.tools.web.firecrawl.apiKey,
+      apiBaseUrl: env.tools.web.firecrawl.apiBaseUrl,
+    },
+    exa: {
+      apiKey: env.tools.web.exa.apiKey,
+      baseUrl: env.tools.web.exa.baseUrl,
+    },
+    tavily: {
+      apiKey: env.tools.web.tavilyApiKey,
+      apiBaseUrl: env.tools.web.tavilyApiBaseUrl,
+    },
+  };
+}
+
+export type WebDependencies = {
+  createLogger: typeof createLogger;
+  loadWebToolConfig: () => Promise<WebToolConfig>;
+  getProviderEnvironment: () => WebProviderEnvironment;
+  createSearchProviders: typeof createDefaultWebSearchProviders;
+  createPageContent: () => PageContent;
+  createDirectPageAcquisition: (params: { pageContent: PageContent }) => DirectHttpPageAcquisition;
+  createBrowserPageAcquisition: (params: {
+    pageContent: PageContent;
+    logger: Logger;
+  }) => BrowserPageAcquisition;
+  createProviderPageExtractor: (params: {
+    getEnvironment: () => WebProviderEnvironment;
+    firecrawlPermits: FirecrawlPermitPool;
+  }) => ProviderPageExtractor;
+  firecrawlFetchPermits: FirecrawlPermitPool;
+  firecrawlSearchPermits: FirecrawlPermitPool;
+};
+
+const defaultWebDependencies: WebDependencies = {
+  createLogger,
+  loadWebToolConfig: loadDefaultWebToolConfig,
+  getProviderEnvironment: getDefaultWebProviderEnvironment,
+  createSearchProviders: createDefaultWebSearchProviders,
+  createPageContent: () => new PageContent(),
+  createDirectPageAcquisition: createDirectHttpPageAcquisition,
+  createBrowserPageAcquisition,
+  createProviderPageExtractor,
+  firecrawlFetchPermits: sharedFirecrawlFetchPermits,
+  firecrawlSearchPermits: sharedFirecrawlSearchPermits,
+};
+
+function captureWebConfigFailure(error: unknown): string {
+  return getErrorMessage(error);
 }
 
 function getNumericField(record: Record<string, unknown>, key: string): number | null {
@@ -169,7 +186,6 @@ function getNumericField(record: Record<string, unknown>, key: string): number |
 
 function getErrorStatus(error: unknown): number | null {
   if (!isRecord(error)) return null;
-
   const directStatus = getNumericField(error, "status") ?? getNumericField(error, "statusCode");
   if (directStatus !== null) return directStatus;
 
@@ -182,10 +198,8 @@ function getErrorStatus(error: unknown): number | null {
 
   const cause = error.cause;
   if (isRecord(cause)) {
-    const causeStatus = getNumericField(cause, "status") ?? getNumericField(cause, "statusCode");
-    if (causeStatus !== null) return causeStatus;
+    return getNumericField(cause, "status") ?? getNumericField(cause, "statusCode");
   }
-
   return null;
 }
 
@@ -200,7 +214,6 @@ function isRetriableWebProviderError(error: unknown): boolean {
   ) {
     return true;
   }
-
   const message = getErrorMessage(error);
   return RETRIABLE_WEB_PROVIDER_ERROR_PATTERNS.some((pattern) => pattern.test(message));
 }
@@ -209,483 +222,82 @@ function formatWebProviderFailureMessage(
   operation: "search" | "extract",
   failures: readonly WebProviderFailure[],
 ): string {
-  if (failures.length === 0) {
-    return `web.${operation} failed.`;
-  }
-
-  if (failures.length === 1) {
-    return failures[0]!.message;
-  }
-
+  if (failures.length === 0) return `web.${operation} failed.`;
+  if (failures.length === 1) return failures[0]!.message;
   return `web.${operation} failed across fallback providers: ${failures
     .map((failure) => `${failure.providerId}: ${failure.message}`)
     .join(" | ")}`;
-}
-
-function parseMediaType(contentType: string | null): string | null {
-  if (!contentType) return null;
-  const mediaType = contentType.split(";")[0]?.trim().toLowerCase();
-  return mediaType && mediaType.length > 0 ? mediaType : null;
-}
-
-function isTextMediaType(mediaType: string | null): boolean {
-  if (!mediaType) return false;
-  if (SUPPORTED_TEXT_MEDIA_TYPES.has(mediaType)) return true;
-  return mediaType.startsWith("text/");
-}
-
-function isHtmlMediaType(mediaType: string | null): boolean {
-  return mediaType === "text/html" || mediaType === "application/xhtml+xml";
-}
-
-function contentLengthFromHeaders(headers: Headers): number | null {
-  const raw = headers.get("content-length");
-  if (!raw) return null;
-  const parsed = Number(raw);
-  if (!Number.isFinite(parsed) || parsed < 0) return null;
-  return parsed;
-}
-
-function checkSignal(signal?: AbortSignal) {
-  if (signal?.aborted) throw getAbortReasonError(signal);
-}
-
-function normalizeBaseUrl(baseUrl: string): string {
-  return baseUrl.endsWith("/") ? baseUrl.slice(0, -1) : baseUrl;
-}
-
-function normalizeWhitespace(text: string): string {
-  return text.replace(/\s+/g, " ").trim();
-}
-
-function withAbortSignal<T>(signal: AbortSignal | undefined, run: () => Promise<T>): Promise<T> {
-  checkSignal(signal);
-
-  const pending = run();
-  if (!signal) {
-    return pending;
-  }
-
-  return new Promise<T>((resolve, reject) => {
-    const onAbort = () => {
-      reject(getAbortReasonError(signal));
-    };
-
-    signal.addEventListener("abort", onAbort, { once: true });
-
-    pending.then(
-      (value) => {
-        signal.removeEventListener("abort", onAbort);
-        resolve(value);
-      },
-      (error) => {
-        signal.removeEventListener("abort", onAbort);
-        reject(error);
-      },
-    );
-  });
-}
-
-function buildTextContent(input: {
-  url: string;
-  title?: string | null;
-  text: string;
-  markdown?: string;
-  raw?: string;
-}): ParsedPageContent {
-  const text = input.text.trim();
-  const markdown = input.markdown ?? text;
-  return {
-    url: input.url,
-    title: input.title?.trim() || input.url,
-    markdown,
-    text,
-    raw: input.raw ?? markdown,
-  };
-}
-
-function countUniqueWords(text: string): number {
-  return new Set(text.toLowerCase().match(/[a-z0-9]{3,}/g) ?? []).size;
-}
-
-function countSubstantiveParagraphs(markdown: string): number {
-  return markdown
-    .split(/\n{2,}/)
-    .map((paragraph) => normalizeWhitespace(paragraph.replace(/[#>*`\-_[\]()]/g, " ")))
-    .filter((paragraph) => paragraph.length >= 80).length;
-}
-
-function assessExtractedContent(params: { content: ParsedPageContent; rawHtml?: string }): {
-  isWeak: boolean;
-  reasons: readonly string[];
-} {
-  const text = normalizeWhitespace(params.content.text);
-  const uniqueWordCount = countUniqueWords(text);
-  const paragraphCount = countSubstantiveParagraphs(params.content.markdown);
-  const boilerplateHits = WEAK_CONTENT_PATTERNS.filter((pattern) => pattern.test(text)).length;
-  const normalizedHtml = params.rawHtml?.toLowerCase() ?? "";
-  const hasSpaShell = SPA_SHELL_MARKERS.some((marker) => normalizedHtml.includes(marker));
-  const reasons: string[] = [];
-
-  if (text.length === 0) {
-    reasons.push("empty text");
-  }
-  if (text.length < MIN_EXTRACT_USEFUL_CHARACTERS) {
-    reasons.push("too short");
-  }
-  if (uniqueWordCount < 40) {
-    reasons.push("low vocabulary");
-  }
-  if (paragraphCount === 0) {
-    reasons.push("no substantive paragraphs");
-  }
-  if (boilerplateHits > 0) {
-    reasons.push("boilerplate text");
-  }
-  if (hasSpaShell && text.length < STRONG_EXTRACT_CHARACTERS) {
-    reasons.push("spa shell");
-  }
-  if (text.length > 0 && normalizeWhitespace(params.content.title) === text) {
-    reasons.push("title only");
-  }
-
-  const suspicious = boilerplateHits > 0 || hasSpaShell || paragraphCount === 0;
-  const isWeak =
-    text.length === 0 ||
-    text.length < 120 ||
-    (text.length < MIN_EXTRACT_USEFUL_CHARACTERS && suspicious) ||
-    (text.length < STRONG_EXTRACT_CHARACTERS && reasons.length >= 3);
-
-  return {
-    isWeak,
-    reasons,
-  };
-}
-
-function toTavilyTimeoutSeconds(timeoutMs: number): number {
-  return Math.max(1, Math.min(TAVILY_MAX_TIMEOUT_SECONDS, Math.ceil(timeoutMs / 1000)));
-}
-
-function buildExaExtractCharacterBudget(input: GetPageInput): {
-  requestedCharacters: number;
-  truncatedByBudget: boolean;
-} {
-  const desiredCharacters = Math.max(
-    1,
-    (input.startOffset ?? 0) + (input.maxCharacters ?? 200_000),
-  );
-  const requestedCharacters = Math.min(desiredCharacters, EXA_MAX_EXTRACT_CHARACTERS);
-
-  return {
-    requestedCharacters,
-    truncatedByBudget: desiredCharacters > requestedCharacters,
-  };
 }
 
 function supportsHtmlExtractFormat(providerId: WebSearchProviderId): boolean {
   return providerId === "firecrawl";
 }
 
-function getRecordString(record: Record<string, unknown>, key: string): string | null {
-  const value = record[key];
-  return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
-}
-
-function getFirecrawlTitle(payload: FirecrawlScrapeResponse, fallbackUrl: string): string {
-  if (isRecord(payload.data) && isRecord(payload.data.metadata)) {
-    const metadataTitle = getRecordString(payload.data.metadata, "title");
-    if (metadataTitle) return metadataTitle;
-  }
-
-  if (isRecord(payload.data)) {
-    const payloadTitle = getRecordString(payload.data, "title");
-    if (payloadTitle) return payloadTitle;
-  }
-
-  return fallbackUrl;
-}
-
-async function readResponseTextWithLimit(params: {
-  res: Response;
-  maxBytes: number;
-  signal?: AbortSignal;
-}): Promise<{ text: string; bytesRead: number; truncated: boolean }> {
-  checkSignal(params.signal);
-
-  const contentLength = contentLengthFromHeaders(params.res.headers);
-  if (contentLength !== null && contentLength > params.maxBytes) {
-    throw new Error(`response too large (${contentLength} bytes > ${params.maxBytes} byte limit)`);
-  }
-
-  if (!params.res.body) {
-    const fallback = await params.res.text();
-    const bytes = Buffer.byteLength(fallback, "utf8");
-    if (bytes > params.maxBytes) {
-      return {
-        text: fallback.slice(0, params.maxBytes),
-        bytesRead: params.maxBytes,
-        truncated: true,
-      };
-    }
-    return { text: fallback, bytesRead: bytes, truncated: false };
-  }
-
-  const reader = params.res.body.getReader();
-  const decoder = new TextDecoder();
-  let bytesRead = 0;
-  let text = "";
-  let truncated = false;
-
-  const onAbort = () => {
-    void reader.cancel(createAbortError()).catch(() => null);
-  };
-  params.signal?.addEventListener("abort", onAbort, { once: true });
-
-  try {
-    while (true) {
-      checkSignal(params.signal);
-      const chunk = await reader.read();
-      if (chunk.done) break;
-      const value = chunk.value;
-      bytesRead += value.byteLength;
-      if (bytesRead > params.maxBytes) {
-        truncated = true;
-        const allowedBytes = value.byteLength - (bytesRead - params.maxBytes);
-        if (allowedBytes > 0) {
-          text += decoder.decode(value.subarray(0, allowedBytes), { stream: true });
-        }
-        await reader.cancel("response byte limit reached").catch(() => null);
-        break;
-      }
-      text += decoder.decode(value, { stream: true });
-    }
-    text += decoder.decode();
-    return { text, bytesRead: Math.min(bytesRead, params.maxBytes), truncated };
-  } finally {
-    params.signal?.removeEventListener("abort", onAbort);
-  }
-}
-
-function extractTitleFromHtml(html: string, url: string): string {
-  const match = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
-  const title = match?.[1]?.replace(/\s+/g, " ").trim();
-  return title && title.length > 0 ? title : url;
-}
-
-function simpleHtmlToText(html: string): string {
-  return html
-    .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, " ")
-    .replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, " ")
-    .replace(/<noscript\b[^>]*>[\s\S]*?<\/noscript>/gi, " ")
-    .replace(/<[^>]+>/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-function markdownToText(markdown: string): string {
-  return markdown
-    .replace(/!\[[^\]]*\]\([^)]+\)/g, "")
-    .replace(/\[([^\]]+)]\([^)]+\)/g, "$1")
-    .replace(/```[\s\S]*?```/g, (block) => block.replace(/```[^\n]*\n?/g, "").replace(/```/g, ""))
-    .replace(/`([^`]+)`/g, "$1")
-    .replace(/^#{1,6}\s+/gm, "")
-    .replace(/^\s*[-*+]\s+/gm, "")
-    .replace(/^\s*\d+\.\s+/gm, "")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-function buildSimpleHtmlContent(html: string, url: string) {
-  const text = simpleHtmlToText(html);
-  return {
-    url,
-    title: extractTitleFromHtml(html, url),
-    markdown: text,
-    text,
-    raw: html,
-  };
-}
-
 export class Web implements ServerTool {
   id = "web";
-
-  private tavily: TavilyClient | null = null;
-  private exa: Exa | null = null;
+  private readonly serverTool: ServerTool;
+  private readonly logger: Logger;
+  private readonly pageContent: PageContent;
+  private readonly directPageAcquisition: DirectHttpPageAcquisition;
+  private readonly browserPageAcquisition: BrowserPageAcquisition;
+  private readonly providerPageExtractor: ProviderPageExtractor;
   private webSearchProviders: readonly WebSearchProvider[] = [];
   private webSearchProviderError: string | null = null;
   private webSearchProviderKey: string | null = null;
   private webFetchDefaultMode: GetPageMode = "auto";
-  private turndown = new TurndownService();
-  private browserContext: { browser: Browser; context: BrowserContext } | null = null;
-  private browserInit: Promise<{
-    browser: Browser;
-    context: BrowserContext;
-  }> | null = null;
-  private logger: Logger;
 
-  constructor() {
-    this.logger = createLogger({
-      module: "server-tool:web",
+  constructor(private readonly dependencies: WebDependencies = defaultWebDependencies) {
+    this.logger = dependencies.createLogger({ module: "server-tool:web" });
+    this.pageContent = dependencies.createPageContent();
+    this.directPageAcquisition = dependencies.createDirectPageAcquisition({
+      pageContent: this.pageContent,
     });
-  }
-
-  private async loadWebToolConfigFromCoreConfig(): Promise<{
-    extractProviders: readonly WebSearchProviderId[];
-    fetchMode: GetPageMode;
-  }> {
-    const cfg = await getCoreConfig();
-    return {
-      extractProviders: cfg.tools.web.extract.providers,
-      fetchMode: cfg.tools.web.fetch.mode,
-    };
-  }
-
-  private async refreshWebConfig(): Promise<void> {
-    let extractProvidersFromConfig: readonly string[] = [];
-    let fetchModeFromConfig: GetPageMode = "auto";
-    try {
-      const config = await this.loadWebToolConfigFromCoreConfig();
-      extractProvidersFromConfig = config.extractProviders;
-      fetchModeFromConfig = config.fetchMode;
-    } catch (e) {
-      const msg = getErrorMessage(e);
-      this.logger.logError(`Failed to read core-config.yaml for web tool config: ${msg}`);
-      extractProvidersFromConfig = [];
-    }
-
-    const normalizedRequested = extractProvidersFromConfig.map((providerId) =>
-      providerId.trim().toLowerCase(),
-    );
-
-    const exaBaseUrl = env.tools.web.exa.baseUrl;
-    const exaApiKey = env.tools.web.exa.apiKey;
-    const firecrawlApiKey = env.tools.web.firecrawl.apiKey;
-    const firecrawlApiBaseUrl = env.tools.web.firecrawl.apiBaseUrl;
-    const tavilyApiKey = env.tools.web.tavilyApiKey;
-    const tavilyApiBaseUrl = env.tools.web.tavilyApiBaseUrl;
-
-    const nextKey = JSON.stringify({
-      requested: normalizedRequested,
-      fetchMode: fetchModeFromConfig,
-      firecrawlApiBaseUrl: firecrawlApiBaseUrl ?? null,
-      hasFirecrawlApiKey: Boolean(firecrawlApiKey),
-      exaBaseUrl: exaBaseUrl ?? null,
-      hasExaApiKey: Boolean(exaApiKey),
-      hasTavilyApiKey: Boolean(tavilyApiKey),
-      tavilyApiBaseUrl: tavilyApiBaseUrl ?? null,
+    this.browserPageAcquisition = dependencies.createBrowserPageAcquisition({
+      pageContent: this.pageContent,
+      logger: this.logger,
     });
-    if (nextKey === this.webSearchProviderKey) return;
-    this.webSearchProviderKey = nextKey;
-
-    const prevIds = this.webSearchProviders.map((provider) => provider.id).join(" -> ") || null;
-    const prevFetchMode = this.webFetchDefaultMode;
-
-    const providers = createDefaultWebSearchProviders({
-      firecrawl: {
-        apiKey: firecrawlApiKey,
-        apiBaseUrl: firecrawlApiBaseUrl,
-      },
-      exa: {
-        baseUrl: exaBaseUrl,
-        apiKey: exaApiKey,
-      },
-      tavilyApiKey,
-      tavilyApiBaseUrl,
+    this.providerPageExtractor = dependencies.createProviderPageExtractor({
+      getEnvironment: dependencies.getProviderEnvironment,
+      firecrawlPermits: dependencies.firecrawlFetchPermits,
     });
-
-    const resolved = resolveWebSearchProvider({
-      requested: extractProvidersFromConfig,
-      providers,
-    });
-
-    this.webSearchProviders = resolved.providers;
-    this.webSearchProviderError = resolved.error;
-    this.webFetchDefaultMode = fetchModeFromConfig;
-
-    const nextIds = this.webSearchProviders.map((provider) => provider.id).join(" -> ") || null;
-    if (resolved.warning) {
-      this.logger.logInfo(resolved.warning);
-    }
-    if (nextIds && nextIds !== prevIds) {
-      this.logger.logInfo(`web.extract providers: ${nextIds}`);
-    }
-    if (prevFetchMode !== this.webFetchDefaultMode) {
-      this.logger.logInfo(`web.fetch mode: ${this.webFetchDefaultMode}`);
-    }
-    if (!nextIds && this.webSearchProviderError) {
-      this.logger.logError(this.webSearchProviderError);
-    }
-  }
-
-  private getTavilyClient(): TavilyClient {
-    if (this.tavily) return this.tavily;
-
-    const apiKey = env.tools.web.tavilyApiKey;
-    if (!apiKey) {
-      throw new Error("TAVILY_API_KEY is not configured.");
-    }
-
-    const apiBaseUrlRaw = env.tools.web.tavilyApiBaseUrl?.trim();
-    this.tavily = tavily({
-      apiKey,
-      apiBaseURL: apiBaseUrlRaw ? normalizeBaseUrl(apiBaseUrlRaw) : undefined,
-    });
-    return this.tavily;
-  }
-
-  private getExaClient(): Exa {
-    if (this.exa) return this.exa;
-
-    const apiKey = env.tools.web.exa.apiKey;
-    if (!apiKey) {
-      throw new Error("EXA_API_KEY is not configured.");
-    }
-
-    const baseUrlRaw = env.tools.web.exa.baseUrl?.trim();
-    this.exa = baseUrlRaw ? new Exa(apiKey, normalizeBaseUrl(baseUrlRaw)) : new Exa(apiKey);
-    return this.exa;
-  }
-
-  async init() {
-    await this.refreshWebConfig();
-
-    this.logger.logInfo("Web extension initialized");
-  }
-
-  async destroy() {
-    await this.browserContext?.browser.close();
-    this.browserContext = null;
-    this.browserInit = null;
-  }
-
-  async list() {
-    return [
-      {
-        callableId: "fetch",
-        name: "Fetch",
-        description: "Fetch a web page",
-        shortInput: zodObjectToCliLines(getPageSchema, { mode: "required" }),
-        input: zodObjectToCliLines(getPageSchema),
-        primaryPositional: {
-          field: "url",
-        },
-      },
-      {
-        callableId: "search",
-        name: "Web Search",
-        description: "Search the web",
-        shortInput: zodObjectToCliLines(webSearchInputSchema, {
-          mode: "required",
+    this.serverTool = defineServerTool({
+      id: this.id,
+      init: () => this.initialize(),
+      destroy: () => this.browserPageAcquisition.destroy(),
+      callables: ({ callable }) => ({
+        fetch: callable({
+          name: "Fetch",
+          description: "Fetch a web page",
+          inputSchema: getPageSchema,
+          validation: "zod",
+          primaryPositional: "url",
+          run: (input, opts) => this.callFetch(input, opts),
         }),
-        input: zodObjectToCliLines(webSearchInputSchema),
-        primaryPositional: {
-          field: "query",
-        },
-      },
-    ];
+        search: callable({
+          name: "Web Search",
+          description: "Search the web",
+          inputSchema: webSearchInputSchema,
+          validation: "zod",
+          primaryPositional: "query",
+          run: (input, opts) => this.callSearch(input, opts),
+        }),
+      }),
+    });
   }
 
-  async call(
+  init(): Promise<void> {
+    return this.serverTool.init();
+  }
+
+  destroy(): Promise<void> {
+    return this.serverTool.destroy();
+  }
+
+  list() {
+    return this.serverTool.list();
+  }
+
+  call(
     callableId: string,
     rawInput: Record<string, unknown>,
     opts?: {
@@ -694,58 +306,117 @@ export class Web implements ServerTool {
       messages?: readonly unknown[];
     },
   ): Promise<unknown> {
-    if (callableId === "fetch") return this.callFetch(rawInput, opts);
-    if (callableId === "search") return this.callSearch(rawInput, opts);
-    throw new Error("Invalid callable ID");
+    return this.serverTool.call(callableId, rawInput, opts);
+  }
+
+  private async initialize(): Promise<void> {
+    await this.refreshWebConfig();
+    this.logger.logDebug("Web extension initialized");
+  }
+
+  private async refreshWebConfig(): Promise<void> {
+    const loaded = await Result.tryPromise({
+      try: this.dependencies.loadWebToolConfig,
+      catch: captureWebConfigFailure,
+    });
+    const configState = loaded.match<
+      | { succeeded: true; config: WebToolConfig }
+      | { succeeded: false; config: WebToolConfig; error: string }
+    >({
+      ok: (config) => ({ succeeded: true, config }),
+      err: (error) => ({
+        succeeded: false,
+        config: { extractProviders: [], fetchMode: "auto", firecrawlPolicy: undefined },
+        error,
+      }),
+    });
+    if (!configState.succeeded) {
+      this.logger.logError(
+        `Failed to read core-config.yaml for web tool config: ${configState.error}`,
+      );
+    }
+
+    const normalizedRequested = configState.config.extractProviders.map((providerId) =>
+      providerId.trim().toLowerCase(),
+    );
+    const environment = this.dependencies.getProviderEnvironment();
+    const nextKey = JSON.stringify({
+      requested: normalizedRequested,
+      fetchMode: configState.config.fetchMode,
+      firecrawlPolicy: configState.config.firecrawlPolicy ?? null,
+      firecrawlApiBaseUrl: environment.firecrawl.apiBaseUrl ?? null,
+      hasFirecrawlApiKey: Boolean(environment.firecrawl.apiKey),
+      exaBaseUrl: environment.exa.baseUrl ?? null,
+      hasExaApiKey: Boolean(environment.exa.apiKey),
+      hasTavilyApiKey: Boolean(environment.tavily.apiKey),
+      tavilyApiBaseUrl: environment.tavily.apiBaseUrl ?? null,
+    });
+    if (nextKey === this.webSearchProviderKey) return;
+    this.webSearchProviderKey = nextKey;
+    if (configState.succeeded) {
+      this.dependencies.firecrawlFetchPermits.configure(configState.config.firecrawlPolicy);
+      this.dependencies.firecrawlSearchPermits.configure(configState.config.firecrawlPolicy);
+    }
+
+    const previousIds = this.webSearchProviders.map((provider) => provider.id).join(" -> ") || null;
+    const previousFetchMode = this.webFetchDefaultMode;
+    const providers = this.dependencies.createSearchProviders({
+      firecrawl: {
+        apiKey: environment.firecrawl.apiKey,
+        apiBaseUrl: environment.firecrawl.apiBaseUrl,
+      },
+      exa: { baseUrl: environment.exa.baseUrl, apiKey: environment.exa.apiKey },
+      tavilyApiKey: environment.tavily.apiKey,
+      tavilyApiBaseUrl: environment.tavily.apiBaseUrl,
+    });
+    const resolved = resolveWebSearchProvider({
+      requested: configState.config.extractProviders,
+      providers,
+    });
+    this.webSearchProviders = resolved.providers;
+    this.webSearchProviderError = resolved.error;
+    this.webFetchDefaultMode = configState.config.fetchMode;
+
+    const nextIds = this.webSearchProviders.map((provider) => provider.id).join(" -> ") || null;
+    if (resolved.warning) this.logger.logInfo(resolved.warning);
+    if (nextIds && nextIds !== previousIds) {
+      this.logger.logDebug(`web.extract providers: ${nextIds}`);
+    }
+    if (previousFetchMode !== this.webFetchDefaultMode) {
+      this.logger.logDebug(`web.fetch mode: ${this.webFetchDefaultMode}`);
+    }
+    if (!nextIds && this.webSearchProviderError) this.logger.logError(this.webSearchProviderError);
   }
 
   private async callFetch(
-    rawInput: unknown,
-    opts?: {
-      signal?: AbortSignal;
-      context?: RequestContext;
-    },
+    input: GetPageInput,
+    opts?: { signal?: AbortSignal; context?: RequestContext },
   ) {
-    const input = getPageSchema.parse(rawInput);
     await this.refreshWebConfig();
-
     const mode = input.mode ?? this.webFetchDefaultMode;
     try {
       switch (mode) {
-        case "auto": {
-          return await this.getPageAuto({ ...input, mode }, opts);
-        }
-        case "fetch": {
-          return await this.getPageFetch({ ...input, mode }, opts);
-        }
-        case "browser": {
-          return await this.getPageBrowser({ ...input, mode }, opts);
-        }
-        case "extract": {
-          return await this.getPageExtract({ ...input, mode }, opts);
-        }
-        case "provider-only": {
-          return await this.getPageProviderOnly({ ...input, mode }, opts);
-        }
+        case "auto":
+          return await this.getPageAuto(input, opts);
+        case "fetch":
+          return await this.getPageFetch(input, opts);
+        case "browser":
+          return await this.getPageBrowser(input, opts);
+        case "extract":
+          return await this.getPageExtract(input, opts);
+        case "provider-only":
+          return await this.getPageProviderOnly(input, opts);
       }
-    } catch (e) {
-      return {
-        isError: true,
-        error: getErrorMessage(e),
-      } as const;
+    } catch (error) {
+      return { isError: true, error: getErrorMessage(error) } as const;
     }
   }
 
   private async callSearch(
-    rawInput: unknown,
-    opts?: {
-      signal?: AbortSignal;
-    },
+    input: z.output<typeof webSearchInputSchema>,
+    opts?: { signal?: AbortSignal },
   ) {
-    const input = webSearchInputSchema.parse(rawInput);
-
     await this.refreshWebConfig();
-
     if (this.webSearchProviders.length === 0) {
       return {
         isError: true as const,
@@ -754,281 +425,64 @@ export class Web implements ServerTool {
     }
 
     const failures: WebProviderFailure[] = [];
-
     for (const [index, provider] of this.webSearchProviders.entries()) {
-      try {
-        if (index > 0) {
-          this.logger.logInfo(`web.search retrying with fallback provider '${provider.id}'.`);
-        }
-        return await provider.search(input, { signal: opts?.signal });
-      } catch (e) {
-        const msg = getErrorMessage(e);
-        failures.push({ providerId: provider.id, message: msg });
+      if (index > 0) {
+        this.logger.logInfo(`web.search retrying with fallback provider '${provider.id}'.`);
+      }
 
-        const retriable = isRetriableWebProviderError(e);
-        if (retriable && index < this.webSearchProviders.length - 1) {
+      let permit: FirecrawlPermit | undefined;
+      if (provider.id === "firecrawl") {
+        const acquired = (
+          await this.dependencies.firecrawlSearchPermits.acquire(opts?.signal)
+        ).match<{ permit: FirecrawlPermit } | { error: FirecrawlPermitFailure; timedOut: boolean }>(
+          {
+            ok: (value) => ({ permit: value }),
+            err: (error) => ({ error, timedOut: FirecrawlPermitQueueTimedOut.is(error) }),
+          },
+        );
+        if ("error" in acquired) {
+          failures.push({ providerId: provider.id, message: acquired.error.message });
+          if (acquired.timedOut && index < this.webSearchProviders.length - 1) {
+            this.logger.logInfo(
+              `web.search retryable failure (${provider.id}); falling back to next provider.`,
+              formatTaggedErrorForLog(acquired.error),
+            );
+            continue;
+          }
+          this.logger.logError(
+            `web.search failed (${provider.id}).`,
+            formatTaggedErrorForLog(acquired.error),
+          );
+          break;
+        }
+        permit = acquired.permit;
+      }
+
+      try {
+        return await provider.search(input, { signal: opts?.signal });
+      } catch (error) {
+        const message = getErrorMessage(error);
+        failures.push({ providerId: provider.id, message });
+        if (isRetriableWebProviderError(error) && index < this.webSearchProviders.length - 1) {
           this.logger.logInfo(
-            `web.search retryable failure (${provider.id}): ${msg}. Falling back to next provider.`,
+            `web.search retryable failure (${provider.id}): ${message}. Falling back to next provider.`,
           );
           continue;
         }
-
-        this.logger.logError(`web.search failed (${provider.id}): ${msg}`);
+        this.logger.logError(`web.search failed (${provider.id}): ${message}`);
         break;
+      } finally {
+        permit?.release();
       }
     }
-
-    return {
-      isError: true as const,
-      error: formatWebProviderFailureMessage("search", failures),
-    };
-  }
-
-  private async findSystemChromiumExecutable(): Promise<string | null> {
-    const fromEnv = process.env.LILAC_CHROMIUM_PATH ?? process.env.CHROMIUM_PATH ?? null;
-    if (fromEnv && (await this.pathExecutable(fromEnv))) return fromEnv;
-
-    const fromWhich =
-      Bun.which("chromium") ??
-      Bun.which("chromium-browser") ??
-      Bun.which("google-chrome") ??
-      Bun.which("google-chrome-stable") ??
-      null;
-
-    if (fromWhich && (await this.pathExecutable(fromWhich))) return fromWhich;
-
-    const candidates = [
-      "/usr/bin/chromium",
-      "/usr/bin/chromium-browser",
-      "/usr/bin/google-chrome",
-      "/usr/bin/google-chrome-stable",
-    ];
-    for (const c of candidates) {
-      if (await this.pathExecutable(c)) return c;
-    }
-
-    return null;
-  }
-
-  private async pathExecutable(p: string): Promise<boolean> {
-    try {
-      await fs.access(p, fsConstants.X_OK);
-      return true;
-    } catch {
-      return false;
-    }
-  }
-
-  private async resolveChromiumLaunchOptions(): Promise<{
-    executablePath?: string;
-    strategy: "system" | "playwright";
-  }> {
-    const system = await this.findSystemChromiumExecutable();
-    if (system) return { strategy: "system", executablePath: system };
-
-    const pwPath = chromium.executablePath();
-    const pwExists = await Bun.file(pwPath).exists();
-    if (!pwExists) {
-      throw new Error(
-        "Chromium is not available. Install system chromium, or run: tools onboarding.playwright",
-      );
-    }
-
-    return { strategy: "playwright" };
-  }
-
-  private async ensureBrowserContext(): Promise<{
-    browser: Browser;
-    context: BrowserContext;
-  }> {
-    if (this.browserContext) return this.browserContext;
-    if (this.browserInit) return this.browserInit;
-
-    this.browserInit = this.launchBrowser()
-      .then((ctx) => {
-        this.browserContext = ctx;
-        return ctx;
-      })
-      .finally(() => {
-        this.browserInit = null;
-      });
-
-    return this.browserInit;
-  }
-
-  private async launchBrowser() {
-    const launch = await this.resolveChromiumLaunchOptions();
-
-    this.logger.logDebug("Launching browser...");
-    const browser = await chromium.launch({
-      headless: true,
-      executablePath: launch.executablePath,
-    });
-    this.logger.logInfo(`Chrome launched (${launch.strategy})`, browser.version());
-    const context = await browser.newContext({
-      viewport: { width: 1080, height: 1920 },
-    });
-    return { browser, context };
-  }
-
-  private async fetchPageContent(
-    { url, format = "markdown", timeout = 10_000, preprocessor = "none" }: GetPageInput,
-    opts?: {
-      signal?: AbortSignal;
-    },
-  ): Promise<PageContentResult> {
-    let acceptHeader = "text/markdown, text/html;q=0.8, */*;q=0.1";
-    switch (format) {
-      case "markdown":
-        acceptHeader = "text/markdown, text/html;q=0.8, */*;q=0.1";
-        break;
-      case "text":
-        acceptHeader = "text/plain, text/html;q=0.8, */*;q=0.1";
-        break;
-      case "html":
-        acceptHeader = "text/html, */*;q=0.1";
-        break;
-    }
-
-    const requestSignal = opts?.signal;
-    const timeoutSignal = AbortSignal.timeout(timeout);
-    const signal = AbortSignal.any([timeoutSignal, ...(requestSignal ? [requestSignal] : [])]);
-    const res = await fetch(url, {
-      headers: { Accept: acceptHeader },
-      signal,
-    });
-
-    if (timeoutSignal.aborted && !requestSignal?.aborted) {
-      return {
-        isError: true,
-        error: "timeout fetching page",
-      } as const;
-    }
-
-    checkSignal(requestSignal);
-
-    if (!res.ok) {
-      const errorBody = await readResponseTextWithLimit({
-        res,
-        maxBytes: MAX_ERROR_RESPONSE_BYTES,
-        signal: requestSignal,
-      });
-      return {
-        isError: true,
-        error: errorBody.truncated
-          ? `${errorBody.text}\n\n[truncated after ${errorBody.bytesRead} bytes]`
-          : errorBody.text,
-        status: res.status,
-      } as const;
-    }
-
-    const mediaType = parseMediaType(res.headers.get("content-type"));
-    if (!isTextMediaType(mediaType)) {
-      return {
-        isError: true,
-        error: `Unsupported content-type for text extraction: ${mediaType ?? "unknown"}`,
-        contentType: mediaType,
-        contentLength: contentLengthFromHeaders(res.headers),
-      } as const;
-    }
-
-    const body = await readResponseTextWithLimit({
-      res,
-      maxBytes: MAX_FETCH_RESPONSE_BYTES,
-      signal: requestSignal,
-    });
-
-    if (mediaType === "text/markdown" || mediaType === "text/plain") {
-      return {
-        isError: false,
-        content: buildTextContent({
-          url,
-          title: url,
-          text: body.text,
-          markdown: body.text,
-          raw: body.text,
-        }),
-        sourceTruncated: body.truncated,
-      };
-    }
-
-    checkSignal(requestSignal);
-
-    const content = isHtmlMediaType(mediaType)
-      ? body.bytesRead > MAX_FULL_DOM_PARSE_BYTES
-        ? buildSimpleHtmlContent(body.text, url)
-        : await this.parsePage(body.text, url, {
-            preprocessor,
-            signal: requestSignal,
-          })
-      : {
-          url,
-          title: url,
-          markdown: body.text,
-          text: body.text,
-          raw: body.text,
-        };
-    return {
-      isError: false,
-      content,
-      sourceTruncated: body.truncated,
-      rawHtml: isHtmlMediaType(mediaType) ? body.text : undefined,
-    };
-  }
-
-  private async renderPageContent(
-    { url, timeout = 10_000, preprocessor = "none" }: GetPageInput,
-    opts?: {
-      signal?: AbortSignal;
-    },
-  ): Promise<PageContentResult> {
-    const timeoutSignal = AbortSignal.timeout(timeout);
-    const signal = AbortSignal.any([timeoutSignal, ...(opts?.signal ? [opts.signal] : [])]);
-    checkSignal(signal);
-    const { context } = await this.ensureBrowserContext();
-
-    this.logger.logDebug("Launching in new page...");
-    const page = await context.newPage();
-    const onAbort = () => {
-      void page.close().catch(() => null);
-    };
-    signal.addEventListener("abort", onAbort, { once: true });
-    try {
-      checkSignal(signal);
-      this.logger.logDebug("Navigating to page:", url);
-      await page.goto(url, { waitUntil: "domcontentloaded", timeout });
-      checkSignal(signal);
-      await this.fastAutoScroll(page);
-
-      this.logger.logDebug("Getting page content...");
-      const html = await page.content();
-      checkSignal(signal);
-      const content =
-        Buffer.byteLength(html, "utf8") > MAX_FULL_DOM_PARSE_BYTES
-          ? buildSimpleHtmlContent(html, url)
-          : await this.parsePage(html, url, {
-              preprocessor,
-              signal,
-            });
-      return {
-        isError: false,
-        content,
-        rawHtml: html,
-      };
-    } finally {
-      signal.removeEventListener("abort", onAbort);
-      await page.close().catch(() => null);
-    }
+    return { isError: true as const, error: formatWebProviderFailureMessage("search", failures) };
   }
 
   private async extractPageContent(
-    input: GetPageInput,
-    opts?: {
-      signal?: AbortSignal;
-    },
+    input: PageAcquisitionInput,
+    opts?: { signal?: AbortSignal },
   ): Promise<PageContentResult> {
     const { format = "markdown" } = input;
-
     if (this.webSearchProviders.length === 0) {
       return {
         isError: true,
@@ -1037,25 +491,20 @@ export class Web implements ServerTool {
     }
 
     const failures: WebProviderFailure[] = [];
-
     for (const [index, provider] of this.webSearchProviders.entries()) {
       if (index > 0) {
         this.logger.logInfo(`web.extract retrying with fallback provider '${provider.id}'.`);
       }
-
       try {
-        const result = await this.extractPageContentWithProvider(provider.id, input, opts);
-        if (!result.isError) {
-          return result;
-        }
-
+        const result = await this.providerPageExtractor.extract(provider.id, input, opts);
+        if (!result.isError) return result;
+        if (result.aborted) return result;
         failures.push({ providerId: provider.id, message: result.error });
 
-        const retriable = isRetriableWebProviderError(result.error);
         const canTryNextProviderForFormat =
           format === "html" && !supportsHtmlExtractFormat(provider.id);
         if (
-          (retriable || canTryNextProviderForFormat) &&
+          (isRetriableWebProviderError(result.error) || canTryNextProviderForFormat) &&
           index < this.webSearchProviders.length - 1
         ) {
           this.logger.logInfo(
@@ -1063,351 +512,96 @@ export class Web implements ServerTool {
           );
           continue;
         }
-
         this.logger.logError(`web.extract failed (${provider.id}): ${result.error}`);
         break;
-      } catch (e) {
-        const msg = getErrorMessage(e);
-        failures.push({ providerId: provider.id, message: msg });
-
-        const retriable = isRetriableWebProviderError(e);
-        if (retriable && index < this.webSearchProviders.length - 1) {
+      } catch (error) {
+        const message = getErrorMessage(error);
+        failures.push({ providerId: provider.id, message });
+        if (isRetriableWebProviderError(error) && index < this.webSearchProviders.length - 1) {
           this.logger.logInfo(
-            `web.extract retryable failure (${provider.id}): ${msg}. Falling back to next provider.`,
+            `web.extract retryable failure (${provider.id}): ${message}. Falling back to next provider.`,
           );
           continue;
         }
-
-        this.logger.logError(`web.extract failed (${provider.id}): ${msg}`);
+        this.logger.logError(`web.extract failed (${provider.id}): ${message}`);
         break;
       }
     }
-
-    return {
-      isError: true,
-      error: formatWebProviderFailureMessage("extract", failures),
-    };
+    return { isError: true, error: formatWebProviderFailureMessage("extract", failures) };
   }
 
-  private async extractPageContentWithProvider(
-    providerId: WebSearchProviderId,
-    input: GetPageInput,
-    opts?: {
-      signal?: AbortSignal;
-    },
-  ): Promise<PageContentResult> {
-    const { url, format = "markdown", timeout = 10_000 } = input;
-
-    switch (providerId) {
-      case "firecrawl": {
-        const apiKey = env.tools.web.firecrawl.apiKey;
-        if (!apiKey) {
-          throw new Error("FIRECRAWL_API_KEY is not configured.");
-        }
-
-        const apiBaseUrlRaw = env.tools.web.firecrawl.apiBaseUrl?.trim();
-        const apiBaseUrl = apiBaseUrlRaw
-          ? normalizeBaseUrl(apiBaseUrlRaw)
-          : "https://api.firecrawl.dev";
-        const timeoutSignal = AbortSignal.timeout(timeout);
-        const signal = AbortSignal.any([timeoutSignal, ...(opts?.signal ? [opts.signal] : [])]);
-        const requestedFormats = format === "html" ? ["html"] : ["markdown"];
-
-        const response = await fetch(`${apiBaseUrl}/v2/scrape`, {
-          method: "POST",
-          headers: {
-            Authorization: `Bearer ${apiKey}`,
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({
-            url,
-            formats: requestedFormats,
-            onlyMainContent: true,
-            timeout,
-          }),
-          signal,
-        });
-
-        let payload: FirecrawlScrapeResponse;
-        try {
-          payload = (await response.json()) as FirecrawlScrapeResponse;
-        } catch {
-          return {
-            isError: true,
-            error: `Firecrawl scrape failed (${response.status}): invalid JSON response.`,
-          };
-        }
-
-        if (!response.ok || payload.success === false) {
-          const detail =
-            (typeof payload.error === "string" && payload.error) ||
-            (typeof payload.message === "string" && payload.message) ||
-            response.statusText ||
-            "unknown error";
-          return {
-            isError: true,
-            error: `Firecrawl scrape failed (${response.status}): ${detail}`,
-          };
-        }
-
-        if (!isRecord(payload.data)) {
-          return {
-            isError: true,
-            error: "Firecrawl scrape returned no content.",
-          };
-        }
-
-        const resultUrl =
-          (isRecord(payload.data.metadata) &&
-            getRecordString(payload.data.metadata, "sourceURL")) ||
-          getRecordString(payload.data, "url") ||
-          url;
-        const title = getFirecrawlTitle(payload, resultUrl);
-
-        if (format === "html") {
-          const html = getRecordString(payload.data, "html");
-          if (!html) {
-            return {
-              isError: true,
-              error: "Firecrawl scrape returned no html content.",
-            };
-          }
-
-          const text = simpleHtmlToText(html);
-          return {
-            isError: false,
-            content: {
-              url: resultUrl,
-              title,
-              markdown: text,
-              text,
-              raw: html,
-            },
-          };
-        }
-
-        const markdown =
-          getRecordString(payload.data, "markdown") ?? getRecordString(payload.data, "content");
-        if (!markdown) {
-          return {
-            isError: true,
-            error: "Firecrawl scrape returned no content.",
-          };
-        }
-
-        const text = format === "text" ? markdownToText(markdown) : markdown;
-
-        return {
-          isError: false,
-          content: buildTextContent({
-            url: resultUrl,
-            title,
-            text,
-            markdown,
-            raw: markdown,
-          }),
-        };
-      }
-      case "tavily": {
-        if (format === "html") {
-          return {
-            isError: true,
-            error: "Tavily extract does not support format=html.",
-          };
-        }
-
-        const client = this.getTavilyClient();
-        const response = await withAbortSignal(opts?.signal, () =>
-          client.extract([url], {
-            extractDepth: "advanced",
-            format: format === "text" ? "text" : "markdown",
-            timeout: toTavilyTimeoutSeconds(timeout),
-          }),
-        );
-
-        const result = response.results[0];
-        if (!result) {
-          return {
-            isError: true,
-            error: "No extracted content returned.",
-          };
-        }
-
-        return {
-          isError: false,
-          content: buildTextContent({
-            url: result.url,
-            title:
-              "title" in result && typeof result.title === "string" ? result.title : result.url,
-            text: result.rawContent,
-            markdown: result.rawContent,
-            raw: result.rawContent,
-          }),
-        };
-      }
-      case "exa": {
-        if (format === "html") {
-          return {
-            isError: true,
-            error: "Exa extract does not support format=html.",
-          };
-        }
-
-        const client = this.getExaClient();
-        const timeoutSignal = AbortSignal.timeout(timeout);
-        const signal = AbortSignal.any([timeoutSignal, ...(opts?.signal ? [opts.signal] : [])]);
-        const exaBudget = buildExaExtractCharacterBudget(input);
-
-        const response = await withAbortSignal(signal, () =>
-          client.getContents([url], {
-            text: {
-              maxCharacters: exaBudget.requestedCharacters,
-            },
-          }),
-        );
-
-        const result = response.results[0];
-        if (!result) {
-          return {
-            isError: true,
-            error: "No extracted content returned.",
-          };
-        }
-
-        const text = "text" in result && typeof result.text === "string" ? result.text : "";
-        return {
-          isError: false,
-          sourceTruncated:
-            exaBudget.truncatedByBudget || text.length >= exaBudget.requestedCharacters,
-          content: buildTextContent({
-            url: result.url,
-            title: typeof result.title === "string" ? result.title : result.url,
-            text,
-            markdown: text,
-            raw: text,
-          }),
-        };
-      }
-      default: {
-        return {
-          isError: true,
-          error: `web.extract provider '${providerId}' is not supported.`,
-        };
-      }
-    }
+  private async getPageFetch(input: GetPageInput, opts?: { signal?: AbortSignal }) {
+    const { format = "markdown", startOffset = 0, maxCharacters = 200_000 } = input;
+    const result = await this.directPageAcquisition.acquire(input, opts);
+    return this.formatPageResult(result, format, startOffset, maxCharacters);
   }
 
-  private async getPageFetch(
-    { format = "markdown", startOffset = 0, maxCharacters = 200_000, ...rest }: GetPageInput,
-    opts?: {
-      signal?: AbortSignal;
-    },
-  ) {
-    const result = await this.fetchPageContent({ ...rest, format }, opts);
-    if (result.isError) return result;
-
-    return this.toOutputFormat({
-      content: result.content,
-      format,
-      startOffset,
-      maxCharacters,
-      sourceTruncated: result.sourceTruncated,
-    });
+  private async getPageBrowser(input: GetPageInput, opts?: { signal?: AbortSignal }) {
+    const { format = "markdown", startOffset = 0, maxCharacters = 200_000 } = input;
+    const result = await this.browserPageAcquisition.acquire(input, opts);
+    return this.formatPageResult(result, format, startOffset, maxCharacters);
   }
 
-  private async getPageBrowser(
-    { format = "markdown", startOffset = 0, maxCharacters = 200_000, ...rest }: GetPageInput,
-    opts?: {
-      signal?: AbortSignal;
-    },
-  ) {
-    const result = await this.renderPageContent({ ...rest, format }, opts);
-    if (result.isError) return result;
-
-    return this.toOutputFormat({
-      content: result.content,
-      format,
-      startOffset,
-      maxCharacters,
-      sourceTruncated: result.sourceTruncated,
-    });
-  }
-
-  private async getPageExtract(
-    { format = "markdown", ...rest }: GetPageInput,
-    opts?: {
-      signal?: AbortSignal;
-    },
-  ) {
-    const result = await this.extractPageContent({ ...rest, format }, opts);
+  private async getPageExtract(input: GetPageInput, opts?: { signal?: AbortSignal }) {
+    const { format = "markdown", startOffset = 0, maxCharacters = 200_000 } = input;
+    const result = await this.extractPageContent(input, opts);
     if (result.isError) {
+      if (result.aborted) return result;
       this.logger.logError(`${result.error} Falling back to browser mode.`);
-      return await this.getPageBrowser({ ...rest, format, mode: "browser" }, opts);
+      return this.getPageBrowser({ ...input, format, mode: "browser" }, opts);
     }
-
-    return this.toOutputFormat({
+    return slicePageContent({
       content: result.content,
       format,
-      startOffset: rest.startOffset ?? 0,
-      maxCharacters: rest.maxCharacters ?? 200_000,
+      startOffset,
+      maxCharacters,
       sourceTruncated: result.sourceTruncated,
     });
   }
 
-  private async getPageProviderOnly(
-    { format = "markdown", ...rest }: GetPageInput,
-    opts?: {
-      signal?: AbortSignal;
-    },
+  private async getPageProviderOnly(input: GetPageInput, opts?: { signal?: AbortSignal }) {
+    const { format = "markdown", startOffset = 0, maxCharacters = 200_000 } = input;
+    const result = await this.extractPageContent(input, opts);
+    return this.formatPageResult(result, format, startOffset, maxCharacters);
+  }
+
+  private formatPageResult(
+    result: PageContentResult,
+    format: PageFormat,
+    startOffset: number,
+    maxCharacters: number,
   ) {
-    const result = await this.extractPageContent({ ...rest, format }, opts);
-    if (result.isError) {
-      return result;
-    }
-
-    return this.toOutputFormat({
+    if (result.isError) return result;
+    return slicePageContent({
       content: result.content,
       format,
-      startOffset: rest.startOffset ?? 0,
-      maxCharacters: rest.maxCharacters ?? 200_000,
+      startOffset,
+      maxCharacters,
       sourceTruncated: result.sourceTruncated,
     });
   }
 
-  private async getPageAuto(
-    {
+  private async getPageAuto(input: GetPageInput, opts?: { signal?: AbortSignal }) {
+    const {
       url,
       format = "markdown",
       startOffset = 0,
       maxCharacters = 200_000,
       timeout = 10_000,
-    }: GetPageInput,
-    opts?: {
-      signal?: AbortSignal;
-    },
-  ) {
-    const autoPreprocessor = "readability" as const;
-
-    const fetchResult = await this.fetchPageContent(
-      {
-        url,
-        format,
-        timeout,
-        preprocessor: autoPreprocessor,
-      },
-      opts,
-    );
-
+    } = input;
+    const acquisitionInput = {
+      url,
+      format,
+      timeout,
+      preprocessor: "readability" as const,
+    };
+    const fetchResult = await this.directPageAcquisition.acquire(acquisitionInput, opts);
     if (!fetchResult.isError) {
-      const fetchAssessment = fetchResult.rawHtml
-        ? assessExtractedContent({
-            content: fetchResult.content,
-            rawHtml: fetchResult.rawHtml,
-          })
+      const assessment = fetchResult.rawHtml
+        ? assessPageContent({ content: fetchResult.content, rawHtml: fetchResult.rawHtml })
         : { isWeak: false, reasons: [] as const };
-
-      if (!fetchResult.rawHtml || !fetchAssessment.isWeak) {
-        return this.toOutputFormat({
+      if (!fetchResult.rawHtml || !assessment.isWeak) {
+        return slicePageContent({
           content: fetchResult.content,
           format,
           startOffset,
@@ -1415,29 +609,19 @@ export class Web implements ServerTool {
           sourceTruncated: fetchResult.sourceTruncated,
         });
       }
-
       this.logger.logDebug(
-        `web.fetch auto escalating to browser after weak fetch extraction: ${fetchAssessment.reasons.join(", ")}`,
+        `web.fetch auto escalating to browser after weak fetch extraction: ${assessment.reasons.join(", ")}`,
       );
     }
 
-    const browserResult = await this.renderPageContent(
-      {
-        url,
-        format,
-        timeout,
-        preprocessor: autoPreprocessor,
-      },
-      opts,
-    );
-
+    const browserResult = await this.browserPageAcquisition.acquire(acquisitionInput, opts);
     let browserParsedFallbackContent: ParsedPageContent | null = null;
     let browserWholePageFallbackContent: ParsedPageContent | null = null;
     let browserRawFallbackContent: ParsedPageContent | null = null;
     if (!browserResult.isError) {
       browserParsedFallbackContent = browserResult.content;
       if (browserResult.rawHtml) {
-        browserWholePageFallbackContent = await this.parsePage(browserResult.rawHtml, url, {
+        browserWholePageFallbackContent = this.pageContent.parse(browserResult.rawHtml, url, {
           preprocessor: "none",
           signal: opts?.signal,
         });
@@ -1445,13 +629,12 @@ export class Web implements ServerTool {
       browserRawFallbackContent = browserResult.rawHtml
         ? buildSimpleHtmlContent(browserResult.rawHtml, url)
         : browserResult.content;
-      const browserAssessment = assessExtractedContent({
+      const assessment = assessPageContent({
         content: browserResult.content,
         rawHtml: browserResult.rawHtml,
       });
-
-      if (!browserAssessment.isWeak) {
-        return this.toOutputFormat({
+      if (!assessment.isWeak) {
+        return slicePageContent({
           content: browserResult.content,
           format,
           startOffset,
@@ -1459,25 +642,22 @@ export class Web implements ServerTool {
           sourceTruncated: browserResult.sourceTruncated,
         });
       }
-
       this.logger.logDebug(
-        `web.fetch auto escalating to extract after weak browser extraction: ${browserAssessment.reasons.join(", ")}`,
+        `web.fetch auto escalating to extract after weak browser extraction: ${assessment.reasons.join(", ")}`,
       );
     }
 
     if (format !== "html") {
       const extractResult = await this.extractPageContent(
-        {
-          url,
-          format,
-          preprocessor: "none",
-          timeout,
-        },
+        { url, format, preprocessor: "none", timeout },
         opts,
       );
-
-      if (!extractResult.isError && normalizeWhitespace(extractResult.content.text).length > 0) {
-        return this.toOutputFormat({
+      if (extractResult.isError && extractResult.aborted) return extractResult;
+      if (
+        !extractResult.isError &&
+        normalizePageWhitespace(extractResult.content.text).length > 0
+      ) {
+        return slicePageContent({
           content: extractResult.content,
           format,
           startOffset,
@@ -1488,16 +668,15 @@ export class Web implements ServerTool {
 
       const preferredBrowserFallback =
         browserWholePageFallbackContent &&
-        normalizeWhitespace(browserWholePageFallbackContent.text).length >
-          normalizeWhitespace(browserParsedFallbackContent?.text ?? "").length
+        normalizePageWhitespace(browserWholePageFallbackContent.text).length >
+          normalizePageWhitespace(browserParsedFallbackContent?.text ?? "").length
           ? browserWholePageFallbackContent
           : browserParsedFallbackContent;
-
       if (
         preferredBrowserFallback &&
-        normalizeWhitespace(preferredBrowserFallback.text).length > 0
+        normalizePageWhitespace(preferredBrowserFallback.text).length > 0
       ) {
-        return this.toOutputFormat({
+        return slicePageContent({
           content: preferredBrowserFallback,
           format,
           startOffset,
@@ -1508,7 +687,7 @@ export class Web implements ServerTool {
     }
 
     if (browserRawFallbackContent) {
-      return this.toOutputFormat({
+      return slicePageContent({
         content: browserRawFallbackContent,
         format,
         startOffset,
@@ -1516,9 +695,8 @@ export class Web implements ServerTool {
         sourceTruncated: browserResult.isError ? false : browserResult.sourceTruncated,
       });
     }
-
     if (!fetchResult.isError) {
-      return this.toOutputFormat({
+      return slicePageContent({
         content: fetchResult.content,
         format,
         startOffset,
@@ -1526,132 +704,6 @@ export class Web implements ServerTool {
         sourceTruncated: fetchResult.sourceTruncated,
       });
     }
-
     return browserResult.isError ? browserResult : fetchResult;
-  }
-
-  private async fastAutoScroll(page: Page, { step = 1920, maxScrolls = 5, idleMs = 100 } = {}) {
-    await page.evaluate(
-      async ({ step, maxScrolls, idleMs }) => {
-        const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
-
-        let lastHeight = document.body.scrollHeight;
-        let sameHeightSince = performance.now();
-        let scrolls = 0;
-
-        while (true) {
-          window.scrollBy(0, step);
-          scrolls++;
-
-          if (scrolls >= maxScrolls) break;
-
-          await sleep(50);
-
-          const newHeight = document.body.scrollHeight;
-          const now = performance.now();
-
-          if (newHeight > lastHeight) {
-            lastHeight = newHeight;
-            sameHeightSince = now;
-          } else if (now - sameHeightSince >= idleMs) {
-            break;
-          }
-        }
-
-        window.scrollTo(0, document.body.scrollHeight);
-      },
-      { step, maxScrolls, idleMs },
-    );
-  }
-
-  private toOutputFormat({
-    content,
-    format,
-    startOffset,
-    maxCharacters,
-    sourceTruncated = false,
-  }: {
-    content: ParsedPageContent;
-    format: z.infer<typeof getPageSchema>["format"];
-    startOffset: number;
-    maxCharacters: number;
-    sourceTruncated?: boolean;
-  }) {
-    switch (format) {
-      case "markdown": {
-        return {
-          isError: false,
-          title: content.title,
-          content: content.markdown.slice(startOffset, startOffset + maxCharacters),
-          length: content.markdown.length,
-          rearTruncated: content.markdown.length > startOffset + maxCharacters,
-          sourceTruncated,
-        } as const;
-      }
-      case "text": {
-        return {
-          isError: false,
-          title: content.title,
-          content: content.text.slice(startOffset, startOffset + maxCharacters),
-          length: content.text.length,
-          rearTruncated: content.text.length > startOffset + maxCharacters,
-          sourceTruncated,
-        } as const;
-      }
-      case "html": {
-        return {
-          isError: false,
-          title: content.title,
-          content: content.raw.slice(startOffset, startOffset + maxCharacters),
-          length: content.raw.length,
-          rearTruncated: content.raw.length > startOffset + maxCharacters,
-          sourceTruncated,
-        } as const;
-      }
-    }
-  }
-
-  private async parsePage(
-    html: string,
-    url: string,
-    {
-      preprocessor,
-      signal,
-    }: {
-      preprocessor: z.infer<typeof getPageSchema>["preprocessor"];
-      signal?: AbortSignal;
-    },
-  ): Promise<ParsedPageContent> {
-    checkSignal(signal);
-    const dom = new JSDOM(html, { url });
-
-    if (preprocessor === "readability") {
-      checkSignal(signal);
-      const reader = new Readability(dom.window.document);
-      const article = reader.parse();
-
-      if (article) {
-        const markdown = this.turndown.turndown(article.content || "");
-        return {
-          url,
-          title: article.title || dom.window.document.title || url,
-          markdown,
-          text: article.textContent ?? "",
-          raw: article.content ?? "",
-        };
-      }
-    }
-
-    // Fallback: whole document body
-    checkSignal(signal);
-    const body = dom.window.document.body?.innerHTML ?? "";
-    const fallbackMarkdown = this.turndown.turndown(body);
-    return {
-      url,
-      title: dom.window.document.title || url,
-      markdown: fallbackMarkdown,
-      text: dom.window.document.body?.textContent ?? "",
-      raw: body,
-    };
   }
 }

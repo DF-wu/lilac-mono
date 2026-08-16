@@ -1,10 +1,18 @@
 import { tool } from "ai";
 import { z } from "zod";
-import { createLogger } from "@stanley2058/lilac-utils";
+import { createLogger, formatTaggedErrorForLog } from "@stanley2058/lilac-utils";
 import { applyPatchInputSchema } from "@stanley2058/lilac-coding-tools/schemas";
+import { Result, type Result as ResultType } from "better-result";
 
 import { parseSshCwdTarget } from "../../ssh/ssh-cwd";
-import { applyHunks, parsePatch } from "./apply-patch-core";
+import {
+  ApplyPatchAccessDenied,
+  ApplyPatchOperationError,
+  applyHunksResult,
+  parsePatchResult as parseCorePatchResult,
+  type PatchHunk,
+  type ApplyPatchError,
+} from "./apply-patch-core";
 import { remoteApplyPatch } from "./remote-apply-patch";
 
 const REMOTE_DENY_RELATIVE_DIRS = [".ssh", ".aws", ".gnupg"] as const;
@@ -27,6 +35,18 @@ function isDeniedRemotePatchPath(remoteCwd: string, patchPath: string): boolean 
   return false;
 }
 
+function deniedRemoteHunkPath(remoteCwd: string, hunk: PatchHunk): string | undefined {
+  if (isDeniedRemotePatchPath(remoteCwd, hunk.path)) return hunk.path;
+  if (
+    hunk.type === "update" &&
+    hunk.movePath &&
+    isDeniedRemotePatchPath(remoteCwd, hunk.movePath)
+  ) {
+    return hunk.movePath;
+  }
+  return undefined;
+}
+
 const outputSchema = z.object({
   status: z.enum(["completed", "failed"]),
   output: z.string().optional(),
@@ -40,7 +60,84 @@ type ToolContext = {
   requestClient: string;
 };
 
-export { parsePatch };
+const toolContextSchema = z.object({
+  requestId: z.string().optional(),
+  sessionId: z.string().optional(),
+  requestClient: z.string().optional(),
+});
+
+function decodeOptionalToolContext(context: unknown): Partial<ToolContext> | undefined {
+  const decoded = toolContextSchema.safeParse(context);
+  return decoded.success ? decoded.data : undefined;
+}
+
+function parsePatchResult(patchText: string): ResultType<PatchHunk[], ApplyPatchError> {
+  return parseCorePatchResult(patchText).mapError(
+    (error) =>
+      new ApplyPatchOperationError({
+        operation: "parsing the patch",
+        cause: error,
+        message: error.message,
+      }),
+  );
+}
+
+async function executeApplyPatchResult(params: {
+  readonly input: PatchInput;
+  readonly defaultCwd: string;
+  readonly denyPaths?: readonly string[];
+  readonly abortSignal?: AbortSignal;
+}): Promise<ResultType<{ output: string; hunkCount: number }, ApplyPatchError>> {
+  const cwd = params.input.cwd ?? params.defaultCwd;
+  const cwdTarget = parseSshCwdTarget(cwd);
+  const parsed = parsePatchResult(params.input.patchText);
+  const hunks = parsed.match({
+    ok: (value) => value,
+    err: () => null,
+  });
+  if (!hunks) return parsed.map(() => ({ output: "", hunkCount: 0 }));
+
+  if (cwdTarget.kind === "ssh") {
+    if (!params.input.dangerouslyAllow) {
+      for (const hunk of hunks) {
+        const deniedPath = deniedRemoteHunkPath(cwdTarget.cwd, hunk);
+        if (deniedPath) {
+          return Result.err(
+            new ApplyPatchAccessDenied({
+              resolvedPath: deniedPath,
+              operation: "apply_patch",
+              message: `Access denied: '${deniedPath}' is blocked for patch when cwd=${cwdTarget.cwd}`,
+            }),
+          );
+        }
+      }
+    }
+
+    const remote = await remoteApplyPatch({
+      host: cwdTarget.host,
+      cwd: cwdTarget.cwd,
+      patchText: params.input.patchText,
+      dangerouslyAllow: params.input.dangerouslyAllow,
+      signal: params.abortSignal,
+    });
+    if (!remote.ok) {
+      return Result.err(
+        new ApplyPatchOperationError({
+          operation: "applying the remote patch",
+          cause: new Error(remote.error),
+          message: remote.error,
+        }),
+      );
+    }
+    return Result.ok({ output: remote.output, hunkCount: hunks.length });
+  }
+
+  const applied = await applyHunksResult(cwd, hunks, {
+    denyPaths: params.denyPaths,
+    signal: params.abortSignal,
+  });
+  return applied.map((output) => ({ output, hunkCount: hunks.length }));
+}
 
 export function localApplyPatchTool(
   defaultCwd: string,
@@ -56,62 +153,53 @@ export function localApplyPatchTool(
         "Apply a patch in '*** Begin Patch' format (*** Add/Update/Delete File, optional *** Move to:, @@ context blocks). Remote denylisted paths require dangerouslyAllow=true.",
       inputSchema: applyPatchInputSchema,
       outputSchema,
-      execute: async (input: PatchInput, { context }: { context?: unknown }) => {
-        const ctx =
-          context && typeof context === "object" ? (context as Partial<ToolContext>) : undefined;
-        try {
-          const cwd = input.cwd ?? defaultCwd;
-          const cwdTarget = parseSshCwdTarget(cwd);
-          const hunks = parsePatch(input.patchText);
+      execute: async (
+        input: PatchInput,
+        { context, abortSignal }: { context?: unknown; abortSignal?: AbortSignal },
+      ) => {
+        const ctx = decodeOptionalToolContext(context);
+        const cwd = input.cwd ?? defaultCwd;
+        const parsed = parsePatchResult(input.patchText);
+        const hunks = parsed.match({ ok: (value) => value, err: () => [] });
+        logger.info("apply_patch start", {
+          requestId: ctx?.requestId,
+          sessionId: ctx?.sessionId,
+          requestClient: ctx?.requestClient,
+          cwd,
+          dangerouslyAllow: input.dangerouslyAllow === true,
+          hunkCount: hunks.length,
+          added: hunks.filter((hunk) => hunk.type === "add").length,
+          deleted: hunks.filter((hunk) => hunk.type === "delete").length,
+          updated: hunks.filter((hunk) => hunk.type === "update").length,
+          paths: hunks.map((hunk) => hunk.path).slice(0, 20),
+          pathsTruncated: hunks.length > 20,
+        });
 
-          logger.info("apply_patch start", {
-            requestId: ctx?.requestId,
-            sessionId: ctx?.sessionId,
-            requestClient: ctx?.requestClient,
-            cwd,
-            dangerouslyAllow: input.dangerouslyAllow === true,
-            hunkCount: hunks.length,
-            added: hunks.filter((h) => h.type === "add").length,
-            deleted: hunks.filter((h) => h.type === "delete").length,
-            updated: hunks.filter((h) => h.type === "update").length,
-            paths: hunks.map((h) => h.path).slice(0, 20),
-            pathsTruncated: hunks.length > 20,
-          });
-
-          if (cwdTarget.kind === "ssh") {
-            if (!input.dangerouslyAllow) {
-              for (const h of hunks) {
-                if (isDeniedRemotePatchPath(cwdTarget.cwd, h.path)) {
-                  throw new Error(
-                    `Access denied: '${h.path}' is blocked for apply_patch when cwd=${cwdTarget.cwd}`,
-                  );
-                }
-                if (h.type === "update" && h.movePath) {
-                  if (isDeniedRemotePatchPath(cwdTarget.cwd, h.movePath)) {
-                    throw new Error(
-                      `Access denied: '${h.movePath}' is blocked for apply_patch when cwd=${cwdTarget.cwd}`,
-                    );
-                  }
-                }
-              }
-            }
-
-            const remoteRes = await remoteApplyPatch({
-              host: cwdTarget.host,
-              cwd: cwdTarget.cwd,
-              patchText: input.patchText,
-              dangerouslyAllow: input.dangerouslyAllow,
+        const applied = await executeApplyPatchResult({
+          input,
+          defaultCwd,
+          denyPaths: options?.denyPaths,
+          abortSignal,
+        });
+        return applied.match<
+          | (() => { readonly status: "failed"; readonly output: string })
+          | (() => { readonly status: "completed"; readonly output: string })
+        >({
+          err: (error) => () => {
+            logger.error("apply_patch failed", {
+              requestId: ctx?.requestId,
+              sessionId: ctx?.sessionId,
+              ok: false,
+              ...formatTaggedErrorForLog(error),
             });
-            if (!remoteRes.ok) {
-              throw new Error(remoteRes.error);
-            }
-
-            const outputLines = remoteRes.output.split("\n");
+            return { status: "failed" as const, output: error.message };
+          },
+          ok: (value) => () => {
+            const outputLines = value.output.split("\n");
             const changedLines = outputLines
               .slice(1)
-              .map((l) => l.trim())
+              .map((line) => line.trim())
               .filter(Boolean);
-
             logger.info("apply_patch done", {
               requestId: ctx?.requestId,
               sessionId: ctx?.sessionId,
@@ -120,42 +208,9 @@ export function localApplyPatchTool(
               changed: changedLines.slice(0, 20),
               changedTruncated: changedLines.length > 20,
             });
-
-            return { status: "completed" as const, output: remoteRes.output };
-          }
-
-          const output = await applyHunks(cwd, hunks, { denyPaths: options?.denyPaths });
-
-          const outputLines = output.split("\n");
-          const changedLines = outputLines
-            .slice(1)
-            .map((l) => l.trim())
-            .filter(Boolean);
-
-          logger.info("apply_patch done", {
-            requestId: ctx?.requestId,
-            sessionId: ctx?.sessionId,
-            ok: true,
-            changedCount: changedLines.length,
-            changed: changedLines.slice(0, 20),
-            changedTruncated: changedLines.length > 20,
-          });
-
-          return { status: "completed" as const, output };
-        } catch (e) {
-          const msg = e instanceof Error ? e.message : String(e);
-          logger.error(
-            "apply_patch failed",
-            {
-              requestId: ctx?.requestId,
-              sessionId: ctx?.sessionId,
-              ok: false,
-              message: msg,
-            },
-            e,
-          );
-          return { status: "failed" as const, output: msg };
-        }
+            return { status: "completed" as const, output: value.output };
+          },
+        })();
       },
     }),
   };

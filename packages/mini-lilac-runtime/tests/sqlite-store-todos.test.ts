@@ -182,13 +182,21 @@ describe("MiniLilacSqliteStore todos", () => {
     createSession(store, "session-1");
     createActiveRootRun(store, "session-1", "run-1");
 
-    expect(() =>
-      store.replaceTodosForRun({
-        sessionId: "session-1",
-        runId: "run-1",
-        todos: [FIRST_TODO, { ...SECOND_TODO, status: "in_progress" }],
-      }),
-    ).toThrow("Todo list may contain at most one in-progress todo");
+    const invalidUpdate = {
+      sessionId: "session-1",
+      runId: "run-1",
+      todos: [FIRST_TODO, { ...SECOND_TODO, status: "in_progress" }],
+    } as const;
+    expect(store.replaceTodosForRunResult(invalidUpdate)).toMatchObject({
+      status: "error",
+      error: {
+        _tag: "MiniLilacStoreOperationRejected",
+        operation: "replaceTodosForRun",
+      },
+    });
+    expect(() => store.replaceTodosForRun(invalidUpdate)).toThrow(
+      "Todo list may contain at most one in-progress todo",
+    );
     expect(store.getTodos("session-1")).toEqual({ revision: 0, todos: [] });
 
     store.close();
@@ -260,7 +268,7 @@ describe("MiniLilacSqliteStore todos", () => {
         runId: "run-1",
         todos: [SECOND_TODO],
       }),
-    ).toThrow("rejected session update");
+    ).toThrow("Mini Lilac SQLite operation failed");
     expect(store.getTodos("session-1")).toEqual(beforeState);
     expect(store.getSession("session-1").updatedAt).toBe(beforeUpdatedAt);
 

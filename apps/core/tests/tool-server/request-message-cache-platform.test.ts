@@ -1,9 +1,8 @@
 import { describe, expect, it } from "bun:test";
-
-import { resolveAuthenticatedOrigin } from "../../src/tool-server/request-message-cache";
 import type { AdapterPlatform } from "@stanley2058/lilac-event-bus";
 
-import type { SurfacePrincipalPlatform } from "../../src/surface/types";
+import { resolveAuthenticatedOrigin } from "../../src/tool-server/request-message-cache";
+import { isSurfaceRefPlatform, type SurfacePrincipalPlatform } from "../../src/surface/types";
 
 /**
  * Widening the TypeScript union was not enough here.
@@ -21,6 +20,7 @@ function message(platform: AdapterPlatform): CacheMessage {
     ts: 1_700_000_000_000,
     topic: "cmd.request",
     type: "cmd.request.message",
+    key: `${platform}:1:2`,
     headers: {
       request_id: `${platform}:1:2`,
       session_id: "1",
@@ -45,12 +45,20 @@ function message(platform: AdapterPlatform): CacheMessage {
 const PRINCIPAL_PLATFORMS: SurfacePrincipalPlatform[] = ["discord", "github", "telegram"];
 
 describe("authenticated request origin accepts every principal surface", () => {
+  it("narrows a decoded adapter platform to referenceable surfaces", () => {
+    const referenceable: AdapterPlatform = "telegram";
+    const nonReferenceable: AdapterPlatform = "slack";
+
+    expect(isSurfaceRefPlatform(referenceable)).toBe(true);
+    expect(isSurfaceRefPlatform(nonReferenceable)).toBe(false);
+  });
+
   for (const platform of PRINCIPAL_PLATFORMS) {
     it(`resolves a ${platform} origin`, () => {
-      const origin = resolveAuthenticatedOrigin(message(platform));
+      const origin = resolveAuthenticatedOrigin(message(platform)).unwrap();
 
       expect(origin?.platform).toBe(platform);
-      expect(origin?.actorUserId).toBe("7");
+      expect(origin?.authenticatedOrigin?.userId).toBe("7");
       expect(origin?.messageRef?.platform).toBe(platform);
     });
   }
@@ -58,7 +66,9 @@ describe("authenticated request origin accepts every principal surface", () => {
   it("still rejects a surface that cannot act as a principal", () => {
     // slack is a valid AdapterPlatform but deliberately not a principal one,
     // so this proves the check is real rather than accepting anything.
-    expect(resolveAuthenticatedOrigin(message("slack"))).toBeUndefined();
+    const origin = resolveAuthenticatedOrigin(message("slack"));
+    expect(origin.status).toBe("error");
+    expect(origin.match({ ok: (value) => value, err: () => undefined })).toBeUndefined();
   });
 
   it("rejects an origin whose envelope disagrees with the request client", () => {
@@ -66,6 +76,8 @@ describe("authenticated request origin accepts every principal surface", () => {
     const data = mismatched.data as { raw: { authenticatedOrigin: { platform: string } } };
     data.raw.authenticatedOrigin.platform = "discord";
 
-    expect(resolveAuthenticatedOrigin(mismatched)).toBeUndefined();
+    const origin = resolveAuthenticatedOrigin(mismatched);
+    expect(origin.status).toBe("error");
+    expect(origin.match({ ok: (value) => value, err: () => undefined })).toBeUndefined();
   });
 });

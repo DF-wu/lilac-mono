@@ -1,60 +1,63 @@
-import { describe, expect, it } from "bun:test";
+import { normalizeWorkflowResourcePolicy, workflowStoreValue } from "./workflow-store-test-helpers";
+import { describe, expect, it, spyOn } from "bun:test";
+import { Logger } from "@stanley2058/simple-module-logger";
 import { rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { Panic, Result, TaggedError } from "better-result";
 import {
   createLilacBus,
   type FetchOptions,
-  type HandleContext,
   type Message,
   type PublishOptions,
   type RawBus,
+  type RawDeliveryHandler,
   type SubscriptionOptions,
 } from "@stanley2058/lilac-event-bus";
-
 import { DurableWorkflowStore } from "../../src/workflow/durable-workflow-store";
+import { computeNextCronAtMs, computeNextCronAtMsResult } from "../../src/workflow/cron";
 import {
   canonicalJsonSha256,
   WORKFLOW_RUNTIME_VERSION,
 } from "../../src/workflow/workflow-definition";
-import {
-  normalizeWorkflowResourcePolicy,
-  type WorkflowTrigger,
-} from "../../src/workflow/workflow-domain";
-import { WorkflowTriggerScheduler } from "../../src/workflow/workflow-trigger-scheduler";
+import type { WorkflowTrigger } from "../../src/workflow/workflow-domain";
 import type { WorkflowProgressCardService } from "../../src/workflow/workflow-progress-projector";
+import { formatWorkflowErrorForLog } from "../../src/workflow/workflow-error-log";
+import { WorkflowTriggerScheduler } from "../../src/workflow/workflow-trigger-scheduler";
 
+class SchedulerLogFailure extends TaggedError("SchedulerLogFailure")<{
+  readonly cause: unknown;
+  readonly message: string;
+}> {}
 class CapturingRawBus implements RawBus {
   readonly messages: Array<Omit<Message<unknown>, "id" | "ts">> = [];
   async publish<TData>(message: Omit<Message<TData>, "id" | "ts">, _options: PublishOptions) {
     this.messages.push(message);
     return { id: `${this.messages.length}-0`, cursor: `${this.messages.length}-0` };
   }
-  async subscribe<TData>(
-    _topic: string,
-    _options: SubscriptionOptions,
-    _handler: (message: Message<TData>, context: HandleContext) => Promise<void>,
-  ) {
-    return { stop: async () => {} };
+  async subscribe(_topic: string, _options: SubscriptionOptions, _handler: RawDeliveryHandler) {
+    return Result.ok({
+      done: Promise.resolve(Result.ok(undefined)),
+      stop: async () => Result.ok(undefined),
+    });
   }
-  async fetch<TData>(_topic: string, _options: FetchOptions) {
-    return { messages: [] as Array<{ msg: Message<TData>; cursor: string }> };
+  async fetch(_topic: string, _options: FetchOptions) {
+    return { messages: [] };
   }
   async close() {}
 }
-
 function createRevision(store: DurableWorkflowStore): void {
   const resources = normalizeWorkflowResourcePolicy({
     agents: { maxConcurrent: 1, maxTotal: 1 },
     maxNestingDepth: 2,
-    operationIdleTimeoutMs: 10_000,
+    operationIdleTimeoutMs: 10000,
     waits: [],
   });
   const limits = {
-    maxSourceBytes: 10_000,
-    maxInputBytes: 10_000,
-    maxOperationOutputBytes: 10_000,
-    maxResultBytes: 10_000,
+    maxSourceBytes: 10000,
+    maxInputBytes: 10000,
+    maxOperationOutputBytes: 10000,
+    maxResultBytes: 10000,
   };
   store.createRevision({
     revisionId: "revision-1",
@@ -75,7 +78,6 @@ function createRevision(store: DurableWorkflowStore): void {
     createdAt: 1,
   });
 }
-
 function trigger(): WorkflowTrigger {
   return {
     triggerId: "trigger-1",
@@ -103,8 +105,67 @@ function trigger(): WorkflowTrigger {
     updatedAt: 1,
   };
 }
-
 describe("workflow trigger scheduler", () => {
+  it("redacts TaggedError catch-all logging without exposing cause", () => {
+    const projected = formatWorkflowErrorForLog(
+      new SchedulerLogFailure({
+        cause: new Error("private cause"),
+        message: "token=secret-scheduler-token",
+      }),
+    );
+    expect(projected).toEqual({
+      errorTag: "SchedulerLogFailure",
+      errorMessage: "token=<redacted>",
+    });
+    expect(JSON.stringify(projected)).not.toContain("private cause");
+    expect(JSON.stringify(projected)).not.toContain("secret-scheduler-token");
+  });
+
+  it("keeps workflow error logging total for hostile Error values", () => {
+    const hostileMessage = new Error("unused");
+    Object.defineProperty(hostileMessage, "message", {
+      get() {
+        throw new Panic({ message: "message getter must stay contained" });
+      },
+    });
+    expect(formatWorkflowErrorForLog(hostileMessage)).toEqual({
+      errorMessage: "Unknown workflow failure",
+    });
+
+    const hostileTagged = new Proxy(
+      new SchedulerLogFailure({ cause: undefined, message: "unused" }),
+      {
+        get() {
+          throw new Error("tagged property trap must stay contained");
+        },
+        getPrototypeOf() {
+          throw new Error("tagged prototype trap must stay contained");
+        },
+      },
+    );
+    expect(formatWorkflowErrorForLog(hostileTagged)).toEqual({
+      errorMessage: "Unknown workflow failure",
+    });
+
+    const revoked = Proxy.revocable(new Error("unused"), {});
+    revoked.revoke();
+    expect(formatWorkflowErrorForLog(revoked.proxy)).toEqual({
+      errorMessage: "Unknown workflow failure",
+    });
+  });
+
+  it("keeps cron compatibility output and returns invalid schedules as values", () => {
+    const now = Date.UTC(2026, 0, 1, 12, 0, 0);
+    const computed = computeNextCronAtMsResult({ expr: "*/5 * * * *" }, now);
+    expect(computed.status).toBe("ok");
+    if (computed.status === "ok") {
+      expect(computed.value).toBe(computeNextCronAtMs({ expr: "*/5 * * * *" }, now));
+    }
+    const invalid = computeNextCronAtMsResult({ expr: "* * *" }, now);
+    expect(invalid.status).toBe("error");
+    if (invalid.status === "error") expect(invalid.error._tag).toBe("WorkflowCronInvalid");
+  });
+
   it("fires the immutable trusted owner snapshot directly into the queue", async () => {
     const file = join(tmpdir(), `workflow-scheduler-${crypto.randomUUID()}.sqlite`);
     const store = new DurableWorkflowStore(file);
@@ -115,8 +176,10 @@ describe("workflow trigger scheduler", () => {
       store.createTrigger(trigger());
       const scheduler = new WorkflowTriggerScheduler({ bus, store, now: () => 100 });
       await scheduler.tick();
-      const storedTrigger = store.getTrigger("trigger-1");
-      const fired = storedTrigger?.lastRunId ? store.getRun(storedTrigger.lastRunId) : null;
+      const storedTrigger = workflowStoreValue(store.getTrigger("trigger-1"));
+      const fired = storedTrigger?.lastRunId
+        ? workflowStoreValue(store.getRun(storedTrigger.lastRunId))
+        : null;
       expect(fired).toMatchObject({
         state: "queued",
         revisionId: "revision-1",
@@ -131,7 +194,146 @@ describe("workflow trigger scheduler", () => {
       rmSync(file, { force: true });
     }
   });
+  it("preserves scheduler Panic instead of logging and swallowing it", async () => {
+    const file = join(tmpdir(), `workflow-scheduler-panic-${crypto.randomUUID()}.sqlite`);
+    const store = new DurableWorkflowStore(file);
+    const bus = createLilacBus(new CapturingRawBus());
+    const panic = new Panic({ message: "scheduler capacity defect" });
+    try {
+      createRevision(store);
+      store.createTrigger(trigger());
+      const scheduler = new WorkflowTriggerScheduler({
+        bus,
+        store,
+        now: () => 100,
+        getMaxActiveRuns: () => {
+          throw panic;
+        },
+      });
+      await expect(scheduler.tick()).rejects.toBe(panic);
+      expect(workflowStoreValue(store.getTrigger("trigger-1"))).toMatchObject({
+        state: "active",
+        nextFireAt: 100,
+        lastRunId: null,
+      });
+    } finally {
+      await bus.close();
+      store.close();
+      rmSync(file, { force: true });
+    }
+  });
+  it("preserves progress-card Panic after atomically firing the trigger", async () => {
+    const file = join(tmpdir(), `workflow-scheduler-card-panic-${crypto.randomUUID()}.sqlite`);
+    const store = new DurableWorkflowStore(file);
+    const bus = createLilacBus(new CapturingRawBus());
+    const panic = new Panic({ message: "progress card defect" });
+    const progressCards: WorkflowProgressCardService = {
+      resolveTarget: () => "discord",
+      ensureInitialCard: async () => {
+        throw panic;
+      },
+      requestProjection: () => {},
+    };
+    try {
+      createRevision(store);
+      store.createTrigger({
+        ...trigger(),
+        progressTarget: {
+          platform: "discord",
+          channelId: "scheduled-channel",
+          replyToMessageId: null,
+        },
+      });
+      const scheduler = new WorkflowTriggerScheduler({
+        bus,
+        store,
+        progressCards,
+        now: () => 100,
+      });
+      await expect(scheduler.tick()).rejects.toBe(panic);
+      const storedTrigger = workflowStoreValue(store.getTrigger("trigger-1"));
+      expect(storedTrigger).toMatchObject({ state: "active", nextFireAt: null });
+      expect(
+        storedTrigger?.lastRunId ? workflowStoreValue(store.getRun(storedTrigger.lastRunId)) : null,
+      ).toMatchObject({ state: "queued", terminalAt: null });
+    } finally {
+      await bus.close();
+      store.close();
+      rmSync(file, { force: true });
+    }
+  });
+  it("logs scheduled progress-card failures with run context and redaction", async () => {
+    const file = join(tmpdir(), `workflow-scheduler-card-log-${crypto.randomUUID()}.sqlite`);
+    const store = new DurableWorkflowStore(file);
+    const bus = createLilacBus(new CapturingRawBus());
+    const warning = spyOn(Logger.prototype, "warn").mockImplementation(() => {});
+    const progressCards: WorkflowProgressCardService = {
+      resolveTarget: () => "discord",
+      ensureInitialCard: async () => {
+        throw new Error("token=secret-scheduled-card");
+      },
+      requestProjection: () => {},
+    };
+    try {
+      createRevision(store);
+      store.createTrigger({
+        ...trigger(),
+        progressTarget: {
+          platform: "discord",
+          channelId: "scheduled-channel",
+          replyToMessageId: null,
+        },
+      });
+      const scheduler = new WorkflowTriggerScheduler({
+        bus,
+        store,
+        progressCards,
+        now: () => 100,
+      });
 
+      await scheduler.tick();
+
+      const runId = workflowStoreValue(store.getTrigger("trigger-1"))?.lastRunId;
+      const logged = JSON.stringify(warning.mock.calls);
+      expect(runId).toBeTruthy();
+      expect(logged).toContain(runId ?? "missing-run-id");
+      expect(logged).toContain("token=<redacted>");
+      expect(logged).not.toContain("secret-scheduled-card");
+    } finally {
+      warning.mockRestore();
+      await bus.close();
+      store.close();
+      rmSync(file, { force: true });
+    }
+  });
+  it("reports detached timer Panic to the fatal supervisor", async () => {
+    const file = join(tmpdir(), `workflow-scheduler-detached-panic-${crypto.randomUUID()}.sqlite`);
+    const store = new DurableWorkflowStore(file);
+    const bus = createLilacBus(new CapturingRawBus());
+    const panic = new Panic({ message: "detached scheduler defect" });
+    const reported = Promise.withResolvers<Panic>();
+    let failClock = false;
+    const scheduler = new WorkflowTriggerScheduler({
+      bus,
+      store,
+      pollMs: 1,
+      now: () => {
+        if (failClock) throw panic;
+        return 0;
+      },
+      reportFatalPanic: reported.resolve,
+    });
+    try {
+      await scheduler.start();
+      failClock = true;
+      await expect(reported.promise).resolves.toBe(panic);
+    } finally {
+      await scheduler.stop();
+      await bus.close();
+      store.close();
+      rmSync(file, { force: true });
+    }
+  });
   it("defers a timestamp trigger at global capacity and fires after capacity is released", async () => {
     const file = join(tmpdir(), `workflow-scheduler-cap-${crypto.randomUUID()}.sqlite`);
     const store = new DurableWorkflowStore(file);
@@ -166,16 +368,14 @@ describe("workflow trigger scheduler", () => {
         now: () => 100,
         getMaxActiveRuns: () => 1,
       });
-
       await scheduler.tick();
-      expect(store.getTrigger("trigger-1")).toMatchObject({
+      expect(workflowStoreValue(store.getTrigger("trigger-1"))).toMatchObject({
         state: "active",
         nextFireAt: 100,
         lastFireAt: null,
         lastRunId: null,
       });
-      expect(store.listRuns()).toHaveLength(1);
-
+      expect(workflowStoreValue(store.listRuns())).toHaveLength(1);
       expect(
         store.transitionRun({
           runId: "ordinary-active-run",
@@ -185,7 +385,7 @@ describe("workflow trigger scheduler", () => {
         }),
       ).toBe(true);
       await scheduler.tick();
-      const storedTrigger = store.getTrigger("trigger-1");
+      const storedTrigger = workflowStoreValue(store.getTrigger("trigger-1"));
       expect(storedTrigger).toMatchObject({ state: "active", nextFireAt: null });
       expect(storedTrigger?.lastRunId).toBeTruthy();
       expect(store.countActiveRuns()).toBe(1);
@@ -205,6 +405,7 @@ describe("workflow trigger scheduler", () => {
     const raw = new CapturingRawBus();
     const bus = createLilacBus(raw);
     const progressCards: WorkflowProgressCardService = {
+      resolveTarget: (platform) => (platform === "telegram" ? "telegram" : null),
       ensureInitialCard: async () => {
         throw new Error("must not create a card for a revoked target");
       },
@@ -231,14 +432,14 @@ describe("workflow trigger scheduler", () => {
 
       await scheduler.tick();
 
-      expect(store.getTrigger("trigger-1")).toMatchObject({
+      expect(workflowStoreValue(store.getTrigger("trigger-1"))).toMatchObject({
         state: "active",
         nextFireAt: 100,
         lastFireAt: null,
         lastRunId: null,
         claimedBy: null,
       });
-      expect(store.listRuns()).toHaveLength(0);
+      expect(workflowStoreValue(store.listRuns())).toHaveLength(0);
       expect(raw.messages).toHaveLength(0);
     } finally {
       await bus.close();
@@ -257,6 +458,7 @@ describe("workflow trigger scheduler", () => {
     const bus = createLilacBus(raw);
     let authorizationChecks = 0;
     const progressCards: WorkflowProgressCardService = {
+      resolveTarget: (platform) => (platform === "telegram" ? "telegram" : null),
       ensureInitialCard: async () => {
         throw new Error("must not create a card for a revoked target");
       },
@@ -284,14 +486,14 @@ describe("workflow trigger scheduler", () => {
       await scheduler.tick();
 
       expect(authorizationChecks).toBe(2);
-      expect(store.getTrigger("trigger-1")).toMatchObject({
+      expect(workflowStoreValue(store.getTrigger("trigger-1"))).toMatchObject({
         state: "active",
         nextFireAt: 100,
         lastRunId: null,
         claimedBy: null,
         claimedAt: null,
       });
-      expect(store.listRuns()).toHaveLength(0);
+      expect(workflowStoreValue(store.listRuns())).toHaveLength(0);
       expect(raw.messages).toHaveLength(0);
     } finally {
       await bus.close();

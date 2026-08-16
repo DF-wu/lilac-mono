@@ -3,12 +3,20 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
+import { formatTaggedErrorForLog } from "@stanley2058/lilac-utils";
+import { Panic } from "better-result";
+
 import {
   resolveJsonPointer,
   resolveMcpValueSource,
   resolveMcpValueSourceMap,
   validateHttpHeaders,
 } from "../../src/mcp";
+
+function expectOk<T, E extends Error>(result: import("better-result").Result<T, E>): T {
+  if (result.status === "error") throw new Error(result.error.message);
+  return result.value;
+}
 
 const temporaryDirectories: string[] = [];
 
@@ -37,21 +45,18 @@ describe("MCP value sources", () => {
     );
     const context = { baseDir, env: { TOKEN: "environment-token" } };
 
-    expect(await resolveMcpValueSource("inline", context)).toEqual({
-      ok: true,
-      value: "inline",
-    });
-    expect(await resolveMcpValueSource({ env: "TOKEN" }, context)).toEqual({
-      ok: true,
-      value: "environment-token",
-    });
-    expect(await resolveMcpValueSource({ file: "token.txt" }, context)).toEqual({
-      ok: true,
-      value: "file-token",
-    });
+    expect(expectOk(await resolveMcpValueSource("inline", context))).toBe("inline");
+    expect(expectOk(await resolveMcpValueSource({ env: "TOKEN" }, context))).toBe(
+      "environment-token",
+    );
+    expect(expectOk(await resolveMcpValueSource({ file: "token.txt" }, context))).toBe(
+      "file-token",
+    );
     expect(
-      await resolveMcpValueSource({ file: "values.json", pointer: "/a~1b/c~0d/1" }, context),
-    ).toEqual({ ok: true, value: "selected" });
+      expectOk(
+        await resolveMcpValueSource({ file: "values.json", pointer: "/a~1b/c~0d/1" }, context),
+      ),
+    ).toBe("selected");
   });
 
   it("returns contextual failures without exposing other resolved values", async () => {
@@ -60,16 +65,23 @@ describe("MCP value sources", () => {
       { GOOD: "secret-good", BAD: { env: "MISSING" } },
       { baseDir, env: {} },
     );
-    expect(result).toEqual({
-      ok: false,
-      error: "BAD: environment variable MISSING is not set",
-    });
+    expect(result.status).toBe("error");
+    if (result.status === "error") {
+      expect(result.error._tag).toBe("McpValueMapResolutionError");
+      expect(result.error.message).toBe("BAD: environment variable MISSING is not set");
+    }
     expect(JSON.stringify(result)).not.toContain("secret-good");
   });
 
   it("rejects invalid pointers, non-string targets, and unsafe headers", async () => {
-    expect(() => resolveJsonPointer({ value: "x" }, "/missing")).toThrow("does not exist");
-    expect(() => resolveJsonPointer({ value: "x" }, "/bad~2escape")).toThrow("invalid escaping");
+    const missing = resolveJsonPointer({ value: "x" }, "/missing");
+    expect(missing.status).toBe("error");
+    if (missing.status === "error") expect(missing.error.message).toContain("does not exist");
+    const invalidEscape = resolveJsonPointer({ value: "x" }, "/bad~2escape");
+    expect(invalidEscape.status).toBe("error");
+    if (invalidEscape.status === "error") {
+      expect(invalidEscape.error.message).toContain("invalid escaping");
+    }
 
     const baseDir = await createTemporaryDirectory();
     await writeFile(path.join(baseDir, "values.json"), JSON.stringify({ count: 1 }), "utf8");
@@ -79,11 +91,81 @@ describe("MCP value sources", () => {
           { file: "values.json", pointer: "/count" },
           { baseDir, env: {} },
         )
-      ).ok,
-    ).toBe(false);
+      ).status,
+    ).toBe("error");
 
-    expect(validateHttpHeaders({ "X-Valid": "value" })).toEqual({ ok: true });
-    expect(validateHttpHeaders({ "Bad Header": "value" }).ok).toBe(false);
-    expect(validateHttpHeaders({ "X-Unsafe": "first\r\nsecond" }).ok).toBe(false);
+    expect(validateHttpHeaders({ "X-Valid": "value" }).status).toBe("ok");
+    expect(validateHttpHeaders({ "Bad Header": "value" }).status).toBe("error");
+    expect(validateHttpHeaders({ "X-Unsafe": "first\r\nsecond" }).status).toBe("error");
+  });
+
+  it("redacts tagged errors and propagates Panic from the file adapter", async () => {
+    const result = await resolveMcpValueSource(
+      { file: "token.txt" },
+      {
+        baseDir: "/data",
+        env: {},
+        readTextFile: async () => {
+          throw new Error("token=top-secret");
+        },
+      },
+    );
+    expect(result.status).toBe("error");
+    if (result.status === "error") {
+      expect(formatTaggedErrorForLog(result.error)).toEqual({
+        errorTag: "McpValueFileReadError",
+        errorMessage: "failed to read token.txt: token=<redacted>",
+      });
+    }
+
+    const panic = new Panic({ message: "broken invariant" });
+    await expect(
+      resolveMcpValueSource(
+        { file: "panic.txt" },
+        { baseDir: "/data", env: {}, readTextFile: () => Promise.reject(panic) },
+      ),
+    ).rejects.toBe(panic);
+    await expect(
+      resolveMcpValueSourceMap(
+        { TOKEN: { file: "panic.txt" } },
+        { baseDir: "/data", env: {}, readTextFile: () => Promise.reject(panic) },
+      ),
+    ).rejects.toBe(panic);
+
+    const hostileCause = {
+      toString: () => {
+        throw new Error("must not coerce rejection");
+      },
+      [Symbol.toPrimitive]: () => {
+        throw new Error("must not coerce rejection");
+      },
+    };
+    const hostileResult = await resolveMcpValueSource(
+      { file: "hostile.txt" },
+      { baseDir: "/data", env: {}, readTextFile: () => Promise.reject(hostileCause) },
+    );
+    expect(hostileResult.status).toBe("error");
+    if (hostileResult.status === "error") {
+      expect(hostileResult.error).toMatchObject({ cause: hostileCause });
+      expect(hostileResult.error.message).toBe("failed to read hostile.txt: Unknown error");
+    }
+
+    const hostileError = new Error("hidden");
+    Object.defineProperty(hostileError, "message", {
+      get: () => {
+        throw new Error("message getter must stay contained");
+      },
+    });
+    const hostileErrorResult = await resolveMcpValueSource(
+      { file: "hostile-error.txt" },
+      { baseDir: "/data", env: {}, readTextFile: () => Promise.reject(hostileError) },
+    );
+    expect(hostileErrorResult.status).toBe("error");
+    if (hostileErrorResult.status === "error") {
+      expect(hostileErrorResult.error.cause).toBe(hostileError);
+      expect(hostileErrorResult.error.message).toBe(
+        "failed to read hostile-error.txt: Unknown error",
+      );
+    }
   });
 });

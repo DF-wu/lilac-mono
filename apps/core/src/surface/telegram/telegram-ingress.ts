@@ -1,3 +1,4 @@
+import { Result } from "better-result";
 import { z } from "zod";
 
 import type { AdapterEvent } from "../events";
@@ -41,6 +42,10 @@ const storedTelegramEventSchema = z.union([
     .passthrough(),
 ]);
 
+const storedTelegramRawSchema = z.json();
+
+export type TelegramStoredRaw = z.output<typeof storedTelegramRawSchema>;
+
 /**
  * Narrows a stored payload back to an `AdapterEvent`, or `null` if it cannot
  * be trusted.
@@ -49,14 +54,38 @@ const storedTelegramEventSchema = z.union([
  * zod cannot express `AdapterEvent`'s full union without duplicating it, but
  * it can prove the discriminant and the fields replay depends on.
  */
-export function parseStoredAdapterEvent(payload: unknown): AdapterEvent | null {
-  const parsed = storedTelegramEventSchema.safeParse(payload);
-  if (!parsed.success) return null;
+export function parseStoredAdapterEvent(serialized: string): AdapterEvent | null {
+  const decoded = Result.try({
+    try: () => JSON.parse(serialized),
+    catch: () => null,
+  });
+  return decoded.match({
+    err: () => null,
+    ok: (value) => {
+      const parsed = storedTelegramEventSchema.safeParse(value);
+      if (!parsed.success) return null;
 
-  const candidate = parsed.data as AdapterEvent;
-  // Re-deriving the key proves the parsed value is one this module recognises,
-  // rather than trusting the schema alone.
-  return telegramIngressDedupeKey(candidate) === null ? null : candidate;
+      const candidate = parsed.data as AdapterEvent;
+      // Re-deriving the key proves the parsed value is one this module recognises,
+      // rather than trusting the schema alone.
+      return telegramIngressDedupeKey(candidate) === null ? null : candidate;
+    },
+  });
+}
+
+export function parseStoredTelegramRaw(serialized: string | null): TelegramStoredRaw | undefined {
+  if (serialized === null) return undefined;
+  const decoded = Result.try({
+    try: () => JSON.parse(serialized),
+    catch: () => undefined,
+  });
+  return decoded.match({
+    err: () => undefined,
+    ok: (value) => {
+      const parsed = storedTelegramRawSchema.safeParse(value);
+      return parsed.success ? parsed.data : undefined;
+    },
+  });
 }
 
 /**
@@ -116,7 +145,14 @@ export function telegramIngressDedupeKey(evt: AdapterEvent): string | null {
         evt.reaction,
       ].join(":");
 
-    default:
+    case "adapter.request.cancel":
+    case "adapter.command.invoked":
+    case "adapter.action.invoked":
       return null;
+
+    default: {
+      const exhaustive: never = evt;
+      return exhaustive;
+    }
   }
 }

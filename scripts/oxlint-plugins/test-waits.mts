@@ -652,10 +652,6 @@ export function findTestWaitViolations(
   return violations;
 }
 
-export function formatTestWaitViolation(violation: TestWaitViolation): string {
-  return `${violation.filePath}:${violation.line}:${violation.column} [${violation.kind}] ${violation.message}`;
-}
-
 export const noFixedTestWaitRule = defineRule({
   meta: {
     type: "problem",

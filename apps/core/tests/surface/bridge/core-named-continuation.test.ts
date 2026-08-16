@@ -5,6 +5,7 @@ import path from "node:path";
 
 import type { ModelMessage } from "ai";
 import { MockLanguageModelV4 } from "ai/test";
+import { Result, type Result as ResultType } from "better-result";
 import type {
   ClaudeNativeAttemptObservation,
   ClaudeNativeSessionStart,
@@ -12,13 +13,59 @@ import type {
 } from "@stanley2058/lilac-claude-code-bridge";
 
 import {
-  createCoreNamedClaudeRuntime,
+  coreProfileExecutionScopeAuthority,
+  createCoreNamedClaudeRuntime as createCoreNamedClaudeRuntimeResult,
   hashCoreNamedExecutionScope,
   prepareCoreNamedHistoryView,
 } from "../../../src/surface/bridge/bus-agent-runner/core-named-continuation";
-import { SqliteTranscriptStore } from "../../../src/transcript/transcript-store";
+import {
+  type CoreClaudeBindingReadError,
+  SqliteTranscriptStore,
+  TranscriptStoreSqliteDriverFailure,
+} from "../../../src/transcript/transcript-store";
 
 const directories: string[] = [];
+
+function resultValue<T, E>(result: ResultType<T, E>): T {
+  if (result.status === "error") throw result.error;
+  return result.value;
+}
+
+function createCoreNamedClaudeRuntime(
+  input: Parameters<typeof createCoreNamedClaudeRuntimeResult>[0],
+) {
+  return resultValue(createCoreNamedClaudeRuntimeResult(input));
+}
+
+function bindingValue<T>(result: ResultType<T, CoreClaudeBindingReadError>): T {
+  if (result.status === "ok") return result.value;
+  switch (result.error._tag) {
+    case "CoreClaudeBindingCorrupt":
+    case "TranscriptStoreSqliteDriverFailure":
+      throw result.error;
+  }
+}
+
+function getNamedBinding(
+  store: SqliteTranscriptStore,
+  input: Parameters<SqliteTranscriptStore["getCoreNamedClaudeSessionBinding"]>[0],
+) {
+  return bindingValue(store.getCoreNamedClaudeSessionBinding(input));
+}
+
+function getRequestTranscript(
+  store: SqliteTranscriptStore,
+  input: Parameters<SqliteTranscriptStore["getRequestTranscript"]>[0],
+) {
+  return resultValue(store.getRequestTranscript(input));
+}
+
+function getLatestCompleteNamedTranscript(
+  store: SqliteTranscriptStore,
+  input: Parameters<SqliteTranscriptStore["getLatestCompleteNamedTranscript"]>[0],
+) {
+  return resultValue(store.getLatestCompleteNamedTranscript(input));
+}
 
 function deferred<T>() {
   let resolve: (value: T) => void = () => {};
@@ -62,11 +109,19 @@ function fakeMaterializedRun(
   return {
     agentModel: model,
     continuationModel: model,
+    createUtilityModelResult: () => Result.ok(model),
     createUtilityModel: () => model,
     control: {
       inject: () => false,
       interrupt: async () => false,
+      async interruptResult() {
+        return Result.ok(await this.interrupt());
+      },
       clear: () => {},
+      clearResult() {
+        this.clear();
+        return Result.ok();
+      },
     },
     nativeSession: {
       getObservation: () => observation,
@@ -86,8 +141,15 @@ function fakeMaterializedRun(
             ? { sessionId: start.baseSessionId, cwd: "/workspace", lastModified: 50 }
             : null,
       }),
+      async finalizeResult() {
+        return Result.ok(await this.finalize());
+      },
     },
     dispose: async () => {},
+    async disposeResult() {
+      await this.dispose();
+      return Result.ok();
+    },
   };
 }
 
@@ -121,7 +183,7 @@ async function commitRuntime(input: {
     requestClient: "unknown",
     messages: input.messages,
   });
-  const terminal = input.store.getRequestTranscript({ requestId: input.requestId });
+  const terminal = getRequestTranscript(input.store, { requestId: input.requestId });
   if (!terminal) throw new Error("terminal transcript missing");
   return await input.runtime.finalize({
     terminalTranscript: terminal,
@@ -173,7 +235,7 @@ describe("Core named Claude continuation", () => {
     ).toBe(true);
     await firstRuntime.retireAtRunEnd();
 
-    const source = store.getLatestCompleteNamedTranscript({
+    const source = getLatestCompleteNamedTranscript(store, {
       requestClient: "discord",
       sessionId,
     });
@@ -282,7 +344,7 @@ describe("Core named Claude continuation", () => {
     ).toBe(true);
 
     for (const mismatch of ["scope", "head"] as const) {
-      const source = store.getLatestCompleteNamedTranscript({
+      const source = getLatestCompleteNamedTranscript(store, {
         requestClient: "discord",
         sessionId,
       });
@@ -323,7 +385,7 @@ describe("Core named Claude continuation", () => {
       await runtime.retireAtRunEnd();
     }
     expect(
-      store.getCoreNamedClaudeSessionBinding({
+      getNamedBinding(store, {
         providerId: "claude-code",
         requestClient: "discord",
         lilacSessionId: sessionId,
@@ -362,7 +424,7 @@ describe("Core named Claude continuation", () => {
         messages: baseMessages,
       }),
     ).toBe(true);
-    const clean = store.getCoreNamedClaudeSessionBinding({
+    const clean = getNamedBinding(store, {
       providerId: "claude-code",
       requestClient: "discord",
       lilacSessionId: sessionId,
@@ -377,7 +439,7 @@ describe("Core named Claude continuation", () => {
       reasoning: "high",
       executionScopeHash: "scope",
       executionCwd: "/workspace",
-      sourceTranscript: store.getLatestCompleteNamedTranscript({
+      sourceTranscript: getLatestCompleteNamedTranscript(store, {
         requestClient: "discord",
         sessionId,
       }),
@@ -390,7 +452,7 @@ describe("Core named Claude continuation", () => {
     await cancelled.retireAtRunEnd();
 
     expect(
-      store.getCoreNamedClaudeSessionBinding({
+      getNamedBinding(store, {
         providerId: "claude-code",
         requestClient: "discord",
         lilacSessionId: sessionId,
@@ -438,7 +500,7 @@ describe("Core named Claude continuation", () => {
         messages: baseMessages,
       }),
     ).toBe(true);
-    const clean = store.getCoreNamedClaudeSessionBinding({
+    const clean = getNamedBinding(store, {
       providerId: "claude-code",
       requestClient: "discord",
       lilacSessionId: sessionId,
@@ -456,7 +518,7 @@ describe("Core named Claude continuation", () => {
       reasoning: "high",
       executionScopeHash: "scope",
       executionCwd: "/workspace",
-      sourceTranscript: store.getLatestCompleteNamedTranscript({
+      sourceTranscript: getLatestCompleteNamedTranscript(store, {
         requestClient: "discord",
         sessionId,
       }),
@@ -474,6 +536,9 @@ describe("Core named Claude continuation", () => {
               finalizationStarted.resolve();
               await releaseFinalization.promise;
               return await lifecycle.finalize();
+            },
+            async finalizeResult() {
+              return Result.ok(await this.finalize());
             },
           },
         };
@@ -495,7 +560,7 @@ describe("Core named Claude continuation", () => {
       requestClient: "unknown",
       messages: terminalMessages,
     });
-    const terminal = store.getRequestTranscript({ requestId: "cancel-during-finalize" });
+    const terminal = getRequestTranscript(store, { requestId: "cancel-during-finalize" });
     if (!terminal) throw new Error("terminal transcript missing");
     const promotion = runtime.finalize({
       terminalTranscript: terminal,
@@ -509,7 +574,7 @@ describe("Core named Claude continuation", () => {
 
     expect(await promotion).toBe(false);
     expect(
-      store.getCoreNamedClaudeSessionBinding({
+      getNamedBinding(store, {
         providerId: "claude-code",
         requestClient: "discord",
         lilacSessionId: sessionId,
@@ -558,11 +623,16 @@ describe("Core named Claude continuation", () => {
       requestClient: "unknown",
       messages: terminalMessages,
     });
-    const terminal = store.getRequestTranscript({ requestId: "promotion-error" });
+    const terminal = getRequestTranscript(store, { requestId: "promotion-error" });
     if (!terminal) throw new Error("terminal transcript missing");
-    store.promoteCoreNamedClaudeSessionBinding = () => {
-      throw new Error("simulated promotion database failure");
-    };
+    store.promoteCoreNamedClaudeSessionBinding = () =>
+      Result.err(
+        new TranscriptStoreSqliteDriverFailure({
+          operation: "promote named binding",
+          code: "SQLITE_IOERR",
+          message: "simulated promotion database failure",
+        }),
+      );
 
     expect(
       await runtime.finalize({
@@ -693,7 +763,7 @@ describe("Core named Claude continuation", () => {
       reasoning: "medium",
       executionScopeHash: "scope",
       executionCwd: "/workspace",
-      sourceTranscript: store.getLatestCompleteNamedTranscript({
+      sourceTranscript: getLatestCompleteNamedTranscript(store, {
         requestClient: "discord",
         sessionId,
       }),
@@ -713,6 +783,7 @@ describe("Core named Claude continuation", () => {
             waitForObservation: async () => observation,
             recordWarning: lifecycle.recordWarning,
             finalize: lifecycle.finalize,
+            finalizeResult: lifecycle.finalizeResult,
           },
         };
       },
@@ -764,7 +835,7 @@ describe("Core named Claude continuation", () => {
       pluginAuthority: { disabled: [] },
       workflowAuthority: { cwd: "/workspace" },
       systemPolicy: { base: "system" },
-      directToolNames: ["bash", "read_file", "apply_patch", "subagent_delegate"],
+      directToolNames: ["bash", "read", "patch", "subagent_delegate"],
       externalToolAuthority: [{ stableId: "mcp:search" }],
       subagentAuthority: { enabled: true, maxDepth: 2, currentDepth: 1 },
     } as const;
@@ -772,13 +843,28 @@ describe("Core named Claude continuation", () => {
     expect(
       hashCoreNamedExecutionScope({
         ...base,
-        directToolNames: ["bash", "read_file", "edit_file", "subagent_delegate"],
+        directToolNames: ["bash", "read", "edit", "subagent_delegate"],
       }).hash,
     ).toBe(baseline);
     expect(
       hashCoreNamedExecutionScope({
         ...base,
-        directToolNames: ["bash", "read_file", "apply_patch"],
+        profileAuthority: {
+          execution: coreProfileExecutionScopeAuthority("native"),
+          workspaceWrites: true,
+        },
+      }).hash,
+    ).toBe(baseline);
+    expect(
+      hashCoreNamedExecutionScope({
+        ...base,
+        profileAuthority: { execution: "restricted", workspaceWrites: true },
+      }).hash,
+    ).not.toBe(baseline);
+    expect(
+      hashCoreNamedExecutionScope({
+        ...base,
+        directToolNames: ["bash", "read", "patch"],
       }).hash,
     ).not.toBe(baseline);
     expect(
@@ -796,6 +882,12 @@ describe("Core named Claude continuation", () => {
     expect(hashCoreNamedExecutionScope({ ...base, safetyMode: "restricted" }).hash).not.toBe(
       baseline,
     );
+  });
+
+  it("preserves native execution authority while distinguishing restricted mode", () => {
+    expect(coreProfileExecutionScopeAuthority(false)).toBe(false);
+    expect(coreProfileExecutionScopeAuthority("restricted")).toBe("restricted");
+    expect(coreProfileExecutionScopeAuthority("native")).toBe(true);
   });
 
   it("uses text-only history replay for cross-family, mixed, and legacy heads", () => {

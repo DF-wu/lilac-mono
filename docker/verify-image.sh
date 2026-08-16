@@ -85,7 +85,7 @@ operator_status=0
 operator_output=$(docker exec \
   --env TOOL_SERVER_BACKEND_URL=http://127.0.0.1:1 \
   "$container_name" /usr/local/bin/tools --operator --list 2>&1) || operator_status=$?
-[[ $operator_status -ne 0 && $operator_output == *"Unable to connect"* ]] ||
+[[ $operator_status -ne 0 && $operator_output == "Error: fetch tools list failed" ]] ||
   fail "operator CLI did not load its token before the expected connection failure"
 docker exec --user lilac "$container_name" /usr/local/bin/bun --version >/dev/null ||
   fail "Bun smoke failed"

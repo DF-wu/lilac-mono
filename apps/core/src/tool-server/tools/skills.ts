@@ -1,16 +1,35 @@
 import fs from "node:fs/promises";
 import { z } from "zod";
 import { Fzf } from "fzf";
+import { Result, TaggedError, type Result as ResultType } from "better-result";
+import { defineServerTool, type ServerTool, type ServerToolCallOptions } from "../types";
 
-import type { ServerTool } from "../types";
 import {
   discoverSkills,
-  parseSkillMarkdown,
+  parseSkillMarkdownResult,
   type DiscoveredSkill,
   env,
-  findWorkspaceRoot,
+  findWorkspaceRootResult,
 } from "@stanley2058/lilac-utils";
-import { zodObjectToCliLines } from "./zod-cli";
+
+class SkillsToolFailure extends TaggedError("SkillsToolFailure")<{
+  readonly message: string;
+}> {}
+
+function adaptSkillsResultToToolHost<TValue>(
+  result: ResultType<TValue, SkillsToolFailure>,
+): TValue {
+  return result.match({
+    ok: (value) => () => value,
+    err: (error) => () => {
+      throw new Error(error.message);
+    },
+  })();
+}
+
+function signalSkillsFailureToToolHost(message: string): never {
+  return adaptSkillsResultToToolHost(Result.err(new SkillsToolFailure({ message })));
+}
 
 const listInputSchema = z.object({
   query: z
@@ -105,110 +124,142 @@ function scoreAndFilter(
 function requireSkillByName(skills: DiscoveredSkill[], name: string): DiscoveredSkill {
   const found = skills.find((s) => s.name === name);
   if (!found) {
-    throw new Error(`Skill not found: '${name}'. Use skills.list to see available skills.`);
+    return signalSkillsFailureToToolHost(
+      `Skill not found: '${name}'. Use skills.list to see available skills.`,
+    );
   }
   return found;
 }
 
+async function loadSkillsForToolHost() {
+  const workspaceRootResult = findWorkspaceRootResult();
+  const workspaceRoot = workspaceRootResult.match({
+    ok: (value) => () => value,
+    err: (error) => () => {
+      switch (error._tag) {
+        case "WorkspaceRootNotFound":
+          return signalSkillsFailureToToolHost(error.message);
+      }
+    },
+  })();
+
+  return await discoverSkills({
+    workspaceRoot,
+    dataDir: env.dataDir,
+  });
+}
+
+async function readSkillForToolHost(
+  input: z.output<typeof readInputSchema>,
+  mode: "brief" | "full",
+) {
+  const { skills } = await loadSkillsForToolHost();
+  const found = requireSkillByName(skills, input.name);
+
+  const raw = await Bun.file(found.location).text();
+  const parsedResult = parseSkillMarkdownResult(raw);
+  const parsed = parsedResult.match({
+    ok: (value) => () => value,
+    err: (error) => () => {
+      switch (error._tag) {
+        case "SkillMarkdownInvalid":
+          return signalSkillsFailureToToolHost(error.message);
+      }
+    },
+  })();
+
+  // Keep returned frontmatter stable + minimal-ish.
+  const frontmatter = parsed.frontmatter;
+  const defaultCap = mode === "brief" ? 8000 : 50_000;
+  const { text, truncated } = truncateText(parsed.body, input.maxChars ?? defaultCap);
+
+  const includes = await listTopLevelEntries(found.baseDir);
+
+  return {
+    name: found.name,
+    description: found.description,
+    source: found.source,
+    location: found.location,
+    baseDir: found.baseDir,
+    frontmatter,
+    body: text,
+    truncated,
+    includes: mode === "full" ? includes : undefined,
+  };
+}
+
 export class Skills implements ServerTool {
-  id = "skills";
-
-  async init(): Promise<void> {}
-  async destroy(): Promise<void> {}
-
-  async list() {
-    return [
-      {
-        callableId: "skills.list",
+  private readonly tool = defineServerTool({
+    id: "skills",
+    callables: ({ callable }) => ({
+      "skills.list": callable({
         name: "Skills List",
         description: "List and search skills discovered from common directories.",
-        shortInput: zodObjectToCliLines(listInputSchema, { mode: "required" }),
-        input: zodObjectToCliLines(listInputSchema),
-        primaryPositional: {
-          field: "query",
+        inputSchema: listInputSchema,
+        validation: "zod",
+        primaryPositional: "query",
+        async run(input) {
+          const { skills, warnings } = await loadSkillsForToolHost();
+
+          let filtered = skills;
+          if (input.sources && input.sources.length > 0) {
+            const allowed = new Set(input.sources);
+            filtered = filtered.filter((skill) => allowed.has(skill.source));
+          }
+
+          const ranked = scoreAndFilter(filtered, input.query, input.limit);
+          return {
+            skills: ranked.map((skill) => ({
+              name: skill.name,
+              description: skill.description,
+              source: skill.source,
+              location: skill.location,
+            })),
+            warnings,
+          };
         },
-      },
-      {
-        callableId: "skills.brief",
+      }),
+      "skills.brief": callable({
         name: "Skills Brief",
         description: "Load a skill's frontmatter + a truncated SKILL.md body.",
-        shortInput: zodObjectToCliLines(readInputSchema, { mode: "required" }),
-        input: zodObjectToCliLines(readInputSchema),
-        primaryPositional: {
-          field: "name",
-        },
-      },
-      {
-        callableId: "skills.full",
+        inputSchema: readInputSchema,
+        validation: "zod",
+        primaryPositional: "name",
+        run: (input) => readSkillForToolHost(input, "brief"),
+      }),
+      "skills.full": callable({
         name: "Skills Full",
         description:
           "Load a skill's frontmatter + a larger SKILL.md body, plus a top-level directory listing.",
-        shortInput: zodObjectToCliLines(readInputSchema, { mode: "required" }),
-        input: zodObjectToCliLines(readInputSchema),
-        primaryPositional: {
-          field: "name",
-        },
-      },
-    ];
+        inputSchema: readInputSchema,
+        validation: "zod",
+        primaryPositional: "name",
+        run: (input) => readSkillForToolHost(input, "full"),
+      }),
+    }),
+  });
+
+  get id(): string {
+    return this.tool.id;
   }
 
-  async call(callableId: string, rawInput: Record<string, unknown>): Promise<unknown> {
-    const workspaceRoot = findWorkspaceRoot();
+  init(): Promise<void> {
+    return this.tool.init();
+  }
 
-    const { skills, warnings } = await discoverSkills({
-      workspaceRoot,
-      dataDir: env.dataDir,
-    });
+  destroy(): Promise<void> {
+    return this.tool.destroy();
+  }
 
-    if (callableId === "skills.list") {
-      const input = listInputSchema.parse(rawInput);
+  list() {
+    return this.tool.list();
+  }
 
-      let filtered = skills;
-      if (input.sources && input.sources.length > 0) {
-        const allowed = new Set(input.sources);
-        filtered = filtered.filter((s) => allowed.has(s.source));
-      }
-
-      const ranked = scoreAndFilter(filtered, input.query, input.limit);
-
-      return {
-        skills: ranked.map((s) => ({
-          name: s.name,
-          description: s.description,
-          source: s.source,
-          location: s.location,
-        })),
-        warnings,
-      };
-    }
-
-    if (callableId === "skills.brief" || callableId === "skills.full") {
-      const input = readInputSchema.parse(rawInput);
-      const found = requireSkillByName(skills, input.name);
-
-      const raw = await Bun.file(found.location).text();
-      const parsed = parseSkillMarkdown(raw);
-
-      // Keep returned frontmatter stable + minimal-ish.
-      const frontmatter = parsed.frontmatter;
-      const defaultCap = callableId === "skills.brief" ? 8000 : 50_000;
-      const { text, truncated } = truncateText(parsed.body, input.maxChars ?? defaultCap);
-
-      const includes = await listTopLevelEntries(found.baseDir);
-
-      return {
-        name: found.name,
-        description: found.description,
-        source: found.source,
-        location: found.location,
-        baseDir: found.baseDir,
-        frontmatter,
-        body: text,
-        truncated,
-        includes: callableId === "skills.full" ? includes : undefined,
-      };
-    }
-
-    throw new Error(`Invalid callable ID '${callableId}'`);
+  call(
+    callableId: string,
+    input: Record<string, unknown>,
+    opts?: ServerToolCallOptions,
+  ): Promise<unknown> {
+    return this.tool.call(callableId, input, opts);
   }
 }

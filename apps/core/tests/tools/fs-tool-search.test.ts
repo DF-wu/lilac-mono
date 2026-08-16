@@ -57,12 +57,12 @@ describe("fs tool search wrappers", () => {
     );
   });
 
-  it("exposes edit_file only when enabled", async () => {
+  it("exposes edit only when enabled", async () => {
     const defaultTools = fsTool(baseDir);
     const editEnabledTools = fsTool(baseDir, { includeEditFile: true });
 
-    expect("edit_file" in defaultTools).toBe(false);
-    expect("edit_file" in editEnabledTools).toBe(true);
+    expect("edit" in defaultTools).toBe(false);
+    expect("edit" in editEnabledTools).toBe(true);
   });
 
   it("glob lists matching paths", async () => {
@@ -151,7 +151,7 @@ describe("fs tool search wrappers", () => {
     expect(out.error).toBeDefined();
     expect(out.error).toContain("rg");
     expect(out.truncationHint).toContain("Narrow the query");
-    expect(out.truncationHint).toContain("read_file");
+    expect(out.truncationHint).toContain("read");
     expect(Buffer.byteLength(JSON.stringify(out), "utf8")).toBeGreaterThan(64);
     expect(Buffer.byteLength(JSON.stringify(out), "utf8")).toBeLessThanOrEqual(512);
   });
@@ -171,7 +171,7 @@ describe("fs tool search wrappers", () => {
     expect(Buffer.byteLength(JSON.stringify(out), "utf8")).toBeLessThanOrEqual(300);
   });
 
-  it("caps read_file pages at 40 KiB characters", () => {
+  it("caps read pages at 40 KiB characters", () => {
     expect(readFileInputZod.safeParse({ path: "a.txt", maxCharacters: 40 * 1024 }).success).toBe(
       true,
     );
@@ -594,5 +594,22 @@ describe("fs tool search wrappers", () => {
     const result = out as { results: { path: string }[]; error?: string };
     expect(result.error).toBeUndefined();
     expect(Array.isArray(result.results)).toBe(true);
+  });
+
+  it("falls back to fzf when a denied descendant prevents FFF indexing", async () => {
+    const deniedDir = path.join(baseDir, "denied");
+    await mkdir(deniedDir);
+    await writeFile(path.join(deniedDir, "denied-target.ts"), "denied\n");
+    await writeFile(path.join(baseDir, "src", "allowed-target.ts"), "allowed\n");
+    const tools = fsTool(baseDir, { fsBackend: "fff", denyPaths: [deniedDir] });
+    const fuzzySearch = tools.fuzzy_search;
+    if (!fuzzySearch?.execute) throw new Error("expected fuzzy_search execute");
+
+    const out = await resolveExecuteResult(
+      fuzzySearch.execute({ query: "target", maxResults: 10 }, toolOptions("fuzzy-fallback")),
+    );
+
+    expect(out.error).toBeUndefined();
+    expect(out.results.map((entry) => entry.path)).toEqual(["src/allowed-target.ts"]);
   });
 });

@@ -1,9 +1,11 @@
 import { z } from "zod";
+import type { Result as ResultType } from "better-result";
+import { defineServerTool, type ServerTool, type ServerToolCallOptions } from "../types";
 
-import type { ServerTool } from "../types";
-import type { ConversationThreadToolService } from "../../conversation/thread-service";
-import { parseToolInput } from "../validation-error-message";
-import { zodObjectToCliLines } from "./zod-cli";
+import type {
+  ConversationThreadRunSummarizationResult,
+  ConversationThreadToolService,
+} from "../../conversation/thread-service";
 
 const searchInputSchema = z.object({
   query: z
@@ -92,91 +94,99 @@ const runSummarizationInputSchema = z.object({
     .describe("Only include threads ending at or after this epoch ms."),
 });
 
+const CONVERSATION_THREAD_CALLABLE_IDS = {
+  search: "conversation.thread.search",
+  metadata: "conversation.thread.metadata",
+  read: "conversation.thread.read",
+  runSummarization: "conversation.thread.runSummarization",
+} as const;
+
+function adaptConversationThreadResultToToolHost<TValue>(
+  result: ResultType<TValue, { readonly message: string }>,
+): TValue {
+  return result.match({
+    ok: (value) => () => value,
+    err: (error) => () => {
+      throw new Error(error.message);
+    },
+  })();
+}
+
+export async function resolveConversationThreadSummarizationToolOperation(
+  operation: Promise<
+    ResultType<ConversationThreadRunSummarizationResult, { readonly message: string }>
+  >,
+): Promise<ConversationThreadRunSummarizationResult> {
+  return adaptConversationThreadResultToToolHost(await operation);
+}
+
 export class ConversationThread implements ServerTool {
-  id = "conversation.thread";
+  private readonly tool: ServerTool;
 
   constructor(
     private readonly params: {
       service: ConversationThreadToolService;
     },
-  ) {}
-
-  async init(): Promise<void> {}
-  async destroy(): Promise<void> {}
-
-  async list() {
-    return [
-      {
-        callableId: "conversation.thread.search",
-        name: "Conversation Thread Search",
-        description:
-          "Search summarized conversation threads. Returns compact threadId, title, and brief by default; use verbose for metadata/diagnostics or conversation.thread.read to expand a result. Multi-query combines variants of one intent into one merged ranking.",
-        shortInput: zodObjectToCliLines(searchInputSchema, { mode: "required" }),
-        input: zodObjectToCliLines(searchInputSchema),
-        primaryPositional: {
-          field: "query",
-          variadic: true,
-        },
-      },
-      {
-        callableId: "conversation.thread.metadata",
-        name: "Conversation Thread Metadata",
-        description:
-          "Read conversation thread summary metadata by ids without loading transcript messages. Supports up to 20 threadIds for candidate comparison.",
-        shortInput: zodObjectToCliLines(metadataInputSchema, { mode: "required" }),
-        input: zodObjectToCliLines(metadataInputSchema),
-        primaryPositional: {
-          field: "threadIds",
-          variadic: true,
-        },
-      },
-      {
-        callableId: "conversation.thread.read",
-        name: "Conversation Thread Read",
-        description:
-          "Read a conversation thread transcript by id with offset/limit pagination. Output messages use content for message text.",
-        shortInput: zodObjectToCliLines(readInputSchema, { mode: "required" }),
-        input: zodObjectToCliLines(readInputSchema),
-        primaryPositional: {
-          field: "threadId",
-        },
-      },
-      {
-        callableId: "conversation.thread.runSummarization",
-        name: "Conversation Thread Run Summarization",
-        description: "Hidden admin runner for conversation thread refresh and summarization.",
-        shortInput: zodObjectToCliLines(runSummarizationInputSchema, { mode: "required" }),
-        input: zodObjectToCliLines(runSummarizationInputSchema),
-        hidden: true,
-      },
-    ];
+  ) {
+    this.tool = defineServerTool({
+      id: "conversation.thread",
+      callables: ({ callable }) => ({
+        [CONVERSATION_THREAD_CALLABLE_IDS.search]: callable({
+          name: "Conversation Thread Search",
+          description:
+            "Search summarized conversation threads. Returns compact threadId, title, and brief by default; use verbose for metadata/diagnostics or conversation.thread.read to expand a result. Multi-query combines variants of one intent into one merged ranking.",
+          inputSchema: searchInputSchema,
+          primaryPositional: { field: "query", variadic: true },
+          run: (input) => this.params.service.search(input),
+        }),
+        [CONVERSATION_THREAD_CALLABLE_IDS.metadata]: callable({
+          name: "Conversation Thread Metadata",
+          description:
+            "Read conversation thread summary metadata by ids without loading transcript messages. Supports up to 20 threadIds for candidate comparison.",
+          inputSchema: metadataInputSchema,
+          primaryPositional: { field: "threadIds", variadic: true },
+          run: (input) => this.params.service.metadata(input),
+        }),
+        [CONVERSATION_THREAD_CALLABLE_IDS.read]: callable({
+          name: "Conversation Thread Read",
+          description:
+            "Read a conversation thread transcript by id with offset/limit pagination. Output messages use content for message text.",
+          inputSchema: readInputSchema,
+          primaryPositional: "threadId",
+          run: (input) => this.params.service.read(input),
+        }),
+        [CONVERSATION_THREAD_CALLABLE_IDS.runSummarization]: callable({
+          name: "Conversation Thread Run Summarization",
+          description: "Hidden admin runner for conversation thread refresh and summarization.",
+          inputSchema: runSummarizationInputSchema,
+          hidden: true,
+          run: (input) => this.params.service.runSummarization(input),
+        }),
+      }),
+    });
   }
 
-  async call(callableId: string, rawInput: Record<string, unknown>): Promise<unknown> {
-    if (callableId === "conversation.thread.search") {
-      const input = parseToolInput({ callableId, input: rawInput, schema: searchInputSchema });
-      return await this.params.service.search(input);
-    }
+  get id(): string {
+    return this.tool.id;
+  }
 
-    if (callableId === "conversation.thread.read") {
-      const input = parseToolInput({ callableId, input: rawInput, schema: readInputSchema });
-      return await this.params.service.read(input);
-    }
+  init(): Promise<void> {
+    return this.tool.init();
+  }
 
-    if (callableId === "conversation.thread.metadata") {
-      const input = parseToolInput({ callableId, input: rawInput, schema: metadataInputSchema });
-      return await this.params.service.metadata(input);
-    }
+  destroy(): Promise<void> {
+    return this.tool.destroy();
+  }
 
-    if (callableId === "conversation.thread.runSummarization") {
-      const input = parseToolInput({
-        callableId,
-        input: rawInput,
-        schema: runSummarizationInputSchema,
-      });
-      return await this.params.service.runSummarization(input);
-    }
+  list() {
+    return this.tool.list();
+  }
 
-    throw new Error(`Invalid callable ID '${callableId}'`);
+  call(
+    callableId: string,
+    input: Record<string, unknown>,
+    opts?: ServerToolCallOptions,
+  ): Promise<unknown> {
+    return this.tool.call(callableId, input, opts);
   }
 }

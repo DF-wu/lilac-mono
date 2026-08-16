@@ -4,7 +4,15 @@ import { chmodSync, existsSync, lstatSync, realpathSync } from "node:fs";
 import path from "node:path";
 
 import { hashCanonicalMessagesV1 } from "@stanley2058/lilac-agent";
-import { createLogger } from "@stanley2058/lilac-utils";
+import {
+  CorruptPersistedFields,
+  createLogger,
+  MalformedSerialization,
+  runBunSqliteTransaction,
+  UnsupportedVersion,
+  type DecodedPersistedValue,
+  type PersistedDataError,
+} from "@stanley2058/lilac-utils";
 import type {
   MiniLilacTodo,
   MiniLilacTodoState,
@@ -21,37 +29,139 @@ import type {
 } from "@stanley2058/mini-lilac-client";
 import {
   miniLilacControlResultSchema,
-  miniLilacCompactResultSchema,
   miniLilacCompactionEventSchema,
-  miniLilacHistoryFilesystemResultSchema,
-  miniLilacMessagesSchema,
   miniLilacOutputRollbackSchema,
   miniLilacProviderMetadataSchema,
   miniLilacRedoResultSchema,
-  miniLilacReasoningSchema,
   miniLilacSessionSnapshotSchema,
   miniLilacSessionStatusSchema,
   miniLilacSteeringCommittedChunkSchema,
   miniLilacSteeringChunkSchema,
   miniLilacSubagentStatusSchema,
   miniLilacTodoChunkSchema,
-  miniLilacTodoStateSchema,
-  miniLilacTodosSchema,
   miniLilacTranscriptResetSchema,
   miniLilacUIMessageMetadataSchema,
   miniLilacUndoResultSchema,
-  miniLilacUserUIMessageSchema,
 } from "@stanley2058/mini-lilac-client";
 import type { ModelMessage } from "ai";
+import { Panic, Result, TaggedError, type Result as ResultType } from "better-result";
 import superjson from "superjson";
 import { z } from "zod";
 
+import {
+  decodeMiniLilacMigrationRunRow,
+  decodeMiniLilacStructuralHistoryRow,
+  decodeMiniLilacStructuralHistoryRows,
+  type MiniLilacMigrationRunRowProjection,
+  type MiniLilacStructuralHistoryRecordKind,
+  type MiniLilacStructuralHistoryValueFor,
+} from "./sqlite-history-persistence-codec";
+import {
+  decodeMiniLilacDatabaseVersion,
+  decodeMiniLilacMigrationModelPrefix,
+  decodeMiniLilacMigrationTranscriptRows,
+  decodeMiniLilacMigrationUiPrefix,
+  decodeMiniLilacMigrationUiTranscript,
+  decodeMiniLilacMigrationUserUiMessage,
+  decodeMiniLilacModelTranscript as decodePersistedMiniLilacModelTranscript,
+  decodeMiniLilacSteeringCommandRequest,
+  decodeMiniLilacSuperJsonPayload,
+  decodeMiniLilacTranscriptChain,
+  decodeMiniLilacUiTranscript as decodePersistedMiniLilacUiTranscript,
+} from "./sqlite-persistence-codec";
+import {
+  MiniLilacHistoryRecordMissing,
+  MiniLilacSchemaMigrationFailure,
+  MiniLilacSchemaInitializationCombinedFailure,
+  MiniLilacSqliteDriverFailure,
+  classifyMiniLilacSqliteDriverFailure,
+} from "./sqlite-persistence-errors";
+import {
+  decodeMiniLilacTodos as decodePersistedMiniLilacTodos,
+  readMiniLilacTodos,
+} from "./sqlite-todo-persistence-codec";
+import {
+  adaptPersistedModelMessagesToSdk,
+  adaptPersistedUiMessagesToSdk,
+} from "./sqlite-transcript-representation-adapter";
+
+export { MiniLilacSqliteDriverFailure } from "./sqlite-persistence-errors";
+
 const sessionStatusSchema = miniLilacSessionStatusSchema;
 const runStatusSchema = z.enum(["active", "completed", "cancelled", "error"]);
+const reasoningSchema = z.enum([
+  "provider-default",
+  "none",
+  "minimal",
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+]);
 export const MINI_LILAC_DATABASE_SCHEMA_VERSION = 8;
 export const MINI_MAIN_CLAUDE_ATTEMPT_RETENTION_LIMIT = 100;
 export const MINI_NAMED_CLAUDE_ATTEMPT_RETENTION_LIMIT = 100;
 const logger = createLogger({ module: "mini-lilac-runtime:sqlite-store" });
+
+function decodeMiniLilacModelTranscript(
+  input: Parameters<typeof decodePersistedMiniLilacModelTranscript>[0],
+) {
+  const decoded = decodePersistedMiniLilacModelTranscript(input);
+  let $decodedResultValue3588!: import("better-result").InferOk<NonNullable<typeof decoded>>;
+  let $decodedResultError3588!: import("better-result").InferErr<NonNullable<typeof decoded>>;
+  const $decodedResultOk3588 = Result.match<
+    import("better-result").InferOk<NonNullable<typeof decoded>>,
+    import("better-result").InferErr<NonNullable<typeof decoded>>,
+    boolean
+  >(decoded, {
+    ok: (value) => {
+      $decodedResultValue3588 = value;
+      return true;
+    },
+    err: (error) => {
+      $decodedResultError3588 = error;
+      return false;
+    },
+  });
+  if (($decodedResultOk3588 ? "ok" : "error") === "error")
+    return Result.err($decodedResultError3588);
+  return Result.ok({
+    value: adaptPersistedModelMessagesToSdk($decodedResultValue3588.value),
+    provenance: $decodedResultValue3588.provenance,
+  });
+}
+
+function decodeMiniLilacUiTranscript(
+  input: Parameters<typeof decodePersistedMiniLilacUiTranscript>[0],
+) {
+  const decoded = decodePersistedMiniLilacUiTranscript(input);
+  let $decodedResultValue3971!: import("better-result").InferOk<NonNullable<typeof decoded>>;
+  let $decodedResultError3971!: import("better-result").InferErr<NonNullable<typeof decoded>>;
+  const $decodedResultOk3971 = Result.match<
+    import("better-result").InferOk<NonNullable<typeof decoded>>,
+    import("better-result").InferErr<NonNullable<typeof decoded>>,
+    boolean
+  >(decoded, {
+    ok: (value) => {
+      $decodedResultValue3971 = value;
+      return true;
+    },
+    err: (error) => {
+      $decodedResultError3971 = error;
+      return false;
+    },
+  });
+  if (($decodedResultOk3971 ? "ok" : "error") === "error")
+    return Result.err($decodedResultError3971);
+  return Result.ok({
+    value: adaptPersistedUiMessagesToSdk($decodedResultValue3971.value),
+    provenance: $decodedResultValue3971.provenance,
+  });
+}
+
+function decodeMiniLilacTodos(input: Parameters<typeof decodePersistedMiniLilacTodos>[0]) {
+  return decodePersistedMiniLilacTodos(input);
+}
 
 export class MiniLilacDatabaseVersionError extends Error {
   constructor(
@@ -65,6 +175,144 @@ export class MiniLilacDatabaseVersionError extends Error {
   }
 }
 
+export type MiniLilacPersistenceError =
+  | PersistedDataError
+  | MiniLilacSqliteDriverFailure
+  | MiniLilacHistoryRecordMissing;
+export class MiniLilacStoreOperationRejected extends TaggedError(
+  "MiniLilacStoreOperationRejected",
+)<{
+  readonly operation: string;
+  readonly message: string;
+}> {}
+export type MiniLilacStoreOperationError =
+  | MiniLilacPersistenceError
+  | MiniLilacStoreOperationRejected;
+
+function rejectMiniLilacStoreOperation(
+  operation: string,
+  message: string,
+): MiniLilacStoreOperationRejected {
+  return new MiniLilacStoreOperationRejected({ operation, message });
+}
+export type MiniLilacPersistenceDiagnostic = {
+  readonly table: string;
+  readonly field: string;
+  readonly version: number;
+  readonly issueCode: string;
+  readonly recordId: string;
+  readonly message: string;
+};
+export type MiniLilacCleanupDefectReport = {
+  readonly operation:
+    | "initializeSchema.restorePragmas"
+    | "constructor.closeAfterInitializationFailure"
+    | "readHistoryRecovery.close";
+  readonly cleanupFailure: unknown;
+};
+export type MiniLilacSqliteStoreOptions = {
+  readonly onPersistenceDiagnostic?: (diagnostic: MiniLilacPersistenceDiagnostic) => void;
+  readonly onCleanupDefect?: (report: MiniLilacCleanupDefectReport) => void;
+};
+type MiniLilacSchemaInitializationError =
+  | MiniLilacDatabaseVersionError
+  | MiniLilacPersistenceError
+  | MiniLilacSchemaMigrationFailure
+  | MiniLilacSchemaInitializationCombinedFailure;
+
+type MiniLilacCleanupOutcome =
+  | { readonly status: "ok" }
+  | { readonly status: "expected-error"; readonly error: MiniLilacSqliteDriverFailure }
+  | {
+      readonly status: "defect";
+      readonly report: (
+        reporter: (report: MiniLilacCleanupDefectReport) => void,
+        operation: MiniLilacCleanupDefectReport["operation"],
+      ) => void;
+      readonly rethrow: () => never;
+    };
+type MiniLilacCaughtDefect =
+  | { readonly kind: "panic"; readonly cause: Panic }
+  | { readonly kind: "error"; readonly cause: Error }
+  | { readonly kind: "hostile"; readonly cause: unknown };
+
+function captureMiniLilacCleanup(
+  cleanup: () => ResultType<void, MiniLilacSqliteDriverFailure>,
+): MiniLilacCleanupOutcome {
+  try {
+    const result = cleanup();
+    return result.match<MiniLilacCleanupOutcome>({
+      ok: () => ({ status: "ok" }),
+      err: (error) => ({ status: "expected-error", error }),
+    });
+  } catch (cause) {
+    return {
+      status: "defect",
+      report: (reporter, operation) =>
+        reportMiniLilacCleanupFailure(reporter, { operation, cleanupFailure: cause }),
+      rethrow: () => {
+        throw cause;
+      },
+    };
+  }
+}
+
+function reportMiniLilacCleanupFailure(
+  reporter: (report: MiniLilacCleanupDefectReport) => void,
+  report: MiniLilacCleanupDefectReport,
+): void {
+  try {
+    reporter(report);
+  } catch {
+    try {
+      logger.error("Mini Lilac cleanup defect reporter failed", { operation: report.operation });
+    } catch {
+      // A reporter failure must never replace the defect whose cleanup it was reporting.
+    }
+  }
+}
+
+function throwPrimaryAfterCleanup(
+  primary: MiniLilacCaughtDefect,
+  operation: MiniLilacCleanupDefectReport["operation"],
+  cleanup: MiniLilacCleanupOutcome,
+  reporter: (report: MiniLilacCleanupDefectReport) => void,
+): never {
+  switch (cleanup.status) {
+    case "ok":
+      break;
+    case "expected-error":
+      reportMiniLilacCleanupFailure(reporter, { operation, cleanupFailure: cleanup.error });
+      break;
+    case "defect":
+      cleanup.report(reporter, operation);
+      break;
+  }
+  throw primary.cause;
+}
+
+function defaultMiniLilacCleanupDefectReporter(report: MiniLilacCleanupDefectReport): void {
+  logger.error("Mini Lilac cleanup failed while preserving a prior defect", {
+    operation: report.operation,
+  });
+}
+
+function isExpectedSchemaInitializationFailure(cause: Error): boolean {
+  if (Panic.is(cause)) return false;
+  if (
+    cause instanceof MiniLilacDatabaseVersionError ||
+    cause instanceof CorruptPersistedFields ||
+    cause instanceof MalformedSerialization ||
+    cause instanceof UnsupportedVersion ||
+    cause instanceof MiniLilacSchemaMigrationFailure ||
+    cause instanceof MiniLilacSqliteDriverFailure ||
+    cause instanceof MiniLilacSchemaInitializationCombinedFailure
+  ) {
+    return true;
+  }
+  return classifyMiniLilacSqliteDriverFailure("constructor.initializeSchema", cause) !== undefined;
+}
+
 const sessionRowSchema = z.object({
   id: z.string(),
   active_run_id: z.string().nullable(),
@@ -72,7 +320,7 @@ const sessionRowSchema = z.object({
   cwd: z.string(),
   model: z.string(),
   profile: z.string(),
-  reasoning: z.string(),
+  reasoning: reasoningSchema,
   title: z.string(),
   input_tokens: z.number().int().nonnegative().nullable(),
   input_tokens_estimated: z.number().int().min(0).max(1),
@@ -96,11 +344,6 @@ const runRowSchema = z.object({
   finished_at: z.string().nullable(),
 });
 
-const jsonRowSchema = z.object({ value_json: z.string() });
-const todosRowSchema = z.object({
-  revision: z.number().int().nonnegative(),
-  todos_json: z.string(),
-});
 const transcriptNodeRowSchema = z.object({
   id: z.number().int().positive(),
   parent_id: z.number().int().positive().nullable(),
@@ -177,45 +420,6 @@ const workspaceHistoryOwnerSchema = z.discriminatedUnion("kind", [
   z.strictObject({ kind: z.literal("history-operation"), operationId: z.string().min(1) }),
   z.strictObject({ kind: z.literal("pending-run-finalization"), runId: z.string().min(1) }),
 ]);
-const historyWorkspaceOutcomeSchema = z.discriminatedUnion("workspaceStatus", [
-  z.strictObject({
-    workspaceSnapshotId: z.string().min(1),
-    workspaceStatus: z.literal("captured"),
-    workspaceUnavailableReason: z.null(),
-  }),
-  z.strictObject({
-    workspaceSnapshotId: z.null(),
-    workspaceStatus: z.literal("unavailable"),
-    workspaceUnavailableReason: z.enum([
-      "git-unavailable",
-      "capture-failed",
-      "non-git-workspace",
-      "platform-unsupported",
-    ]),
-  }),
-]);
-
-const workspaceRowSchema = z.object({
-  id: z.string(),
-  canonical_cwd: z.string(),
-  health_status: z.enum(["healthy", "corrupt"]),
-  health_detail: z.string().nullable(),
-  created_at: z.string(),
-});
-const historyStoreMetadataRowSchema = z.object({
-  namespace_id: z.string().min(1),
-  created_at: z.string(),
-});
-const workspaceSnapshotRowSchema = z.object({
-  id: z.string(),
-  workspace_id: z.string(),
-  root_tree_oid: z.string(),
-  git_ref: z.string(),
-  format_version: z.number().int().positive(),
-  availability: z.enum(["available", "missing", "corrupt"]),
-  availability_detail: z.string().nullable(),
-  created_at: z.string(),
-});
 const workspaceSnapshotAvailabilityUpdateSchema = z.discriminatedUnion("availability", [
   z.strictObject({
     snapshotId: z.string().min(1),
@@ -228,20 +432,6 @@ const workspaceSnapshotAvailabilityUpdateSchema = z.discriminatedUnion("availabi
     detail: z.string().min(1),
   }),
 ]);
-const historyStateRowSchema = z.object({
-  id: z.string(),
-  session_id: z.string(),
-  workspace_id: z.string(),
-  model_head_id: z.number().int().positive().nullable(),
-  ui_head_id: z.number().int().positive().nullable(),
-  workspace_snapshot_id: z.string().nullable(),
-  workspace_status: historyWorkspaceStatusSchema,
-  workspace_unavailable_reason: historyWorkspaceUnavailableReasonSchema.nullable(),
-  origin: historyStateOriginSchema,
-  last_provider_family: historyProviderFamilySchema.nullable(),
-  contains_cross_family_turns: z.number().int().min(0).max(1).nullable(),
-  created_at: z.string(),
-});
 const miniMainClaudeBindingRowSchema = z.object({
   session_id: z.string().min(1),
   history_state_id: z.string().min(1),
@@ -281,165 +471,6 @@ const miniMainClaudeAttemptRowSchema = z.object({
   created_at: z.string(),
   updated_at: z.string(),
 });
-const miniNamedClaudeBindingRowSchema = miniMainClaudeBindingRowSchema;
-const miniNamedClaudeAttemptRowSchema = miniMainClaudeAttemptRowSchema;
-const miniMainClaudeStateLookupSchema = z.strictObject({
-  sessionId: z.string().min(1),
-  historyStateId: z.string().min(1),
-  providerId: z.string().min(1),
-});
-const miniNamedSessionIdSchema = z
-  .string()
-  .min(1)
-  .refine(
-    (value) => value.startsWith("sub:") && value.lastIndexOf(":named:") > "sub:".length,
-    "Expected a named delegated Mini session ID",
-  );
-const reserveMiniMainClaudeSessionAttemptSchema = z.strictObject({
-  providerId: z.string().min(1),
-  requestClient: z.string().min(1),
-  lilacSessionId: z.string().min(1),
-  sourceHistoryStateId: z.string().min(1),
-  executionScopeHashVersion: z.literal(1),
-  executionScopeHash: z.string().min(1),
-  requestId: z.string().min(1),
-  attemptIndex: z.number().int().nonnegative(),
-  candidateSessionId: z.string().uuid(),
-  sourceSessionId: z.string().uuid().nullable(),
-  expectedBindingRevision: z.number().int().positive().nullable(),
-});
-const miniMainClaudeSessionAttemptKeySchema = z.strictObject({
-  providerId: z.string().min(1),
-  lilacSessionId: z.string().min(1),
-  requestId: z.string().min(1),
-  attemptIndex: z.number().int().nonnegative(),
-});
-const recordMiniMainClaudeSessionAttemptOutcomeSchema =
-  miniMainClaudeSessionAttemptKeySchema.extend({
-    state: miniMainClaudeAttemptStateSchema.exclude(["active"]),
-  });
-const promoteMiniMainClaudeSessionBindingSchema = z.strictObject({
-  providerId: z.string().min(1),
-  requestId: z.string().min(1),
-  attemptIndex: z.number().int().nonnegative(),
-  nativeCwd: z.string().min(1),
-  nativeLastModified: z.number().finite().nonnegative(),
-  nativeContextTokens: z.number().int().nonnegative(),
-  nativeContextMaxTokens: z.number().int().positive(),
-  lastModelSpecifier: z.string().min(1),
-  lastReasoning: z.string().min(1),
-});
-const miniNamedClaudeStateLookupSchema = z.strictObject({
-  sessionId: miniNamedSessionIdSchema,
-  providerId: z.string().min(1),
-});
-const reserveMiniNamedClaudeSessionAttemptSchema = z.strictObject({
-  providerId: z.string().min(1),
-  requestClient: z.string().min(1),
-  lilacSessionId: miniNamedSessionIdSchema,
-  sourceHistoryStateId: z.string().min(1),
-  executionScopeHashVersion: z.literal(1),
-  executionScopeHash: z.string().min(1),
-  requestId: z.string().min(1),
-  attemptIndex: z.number().int().nonnegative(),
-  candidateSessionId: z.string().uuid(),
-  sourceSessionId: z.string().uuid().nullable(),
-  expectedBindingRevision: z.number().int().positive().nullable(),
-});
-const miniNamedClaudeSessionAttemptKeySchema = z.strictObject({
-  providerId: z.string().min(1),
-  lilacSessionId: miniNamedSessionIdSchema,
-  requestId: z.string().min(1),
-  attemptIndex: z.number().int().nonnegative(),
-});
-const recordMiniNamedClaudeSessionAttemptOutcomeSchema =
-  miniNamedClaudeSessionAttemptKeySchema.extend({
-    state: miniMainClaudeAttemptStateSchema.exclude(["active"]),
-  });
-const promoteMiniNamedClaudeSessionBindingSchema = promoteMiniMainClaudeSessionBindingSchema.extend(
-  {
-    canonicalMessageCount: z.number().int().nonnegative(),
-    canonicalHeadHash: z.string().min(1),
-  },
-);
-const historyTransitionRowSchema = z.object({
-  id: z.string(),
-  session_id: z.string(),
-  from_state_id: z.string(),
-  to_state_id: z.string().nullable(),
-  kind: historyTransitionKindSchema,
-  delivery: historyDeliverySchema.nullable(),
-  command_id: z.string().nullable(),
-  user_message_json: z.string().nullable(),
-  root_run_id: z.string().nullable(),
-  replay_after_seq: z.number().int().nonnegative().nullable(),
-  created_at: z.string(),
-  completed_at: z.string().nullable(),
-});
-const sessionHistoryRowSchema = z.object({
-  session_id: z.string(),
-  root_state_id: z.string(),
-  current_state_id: z.string(),
-  undo_floor_state_id: z.string(),
-  updated_at: z.string(),
-});
-const historyRedoRowSchema = z.object({
-  session_id: z.string(),
-  position: z.number().int().nonnegative(),
-  target_state_id: z.string(),
-  user_transition_id: z.string(),
-  created_at: z.string(),
-});
-const historyOperationRowSchema = z.object({
-  id: z.string(),
-  session_id: z.string(),
-  workspace_id: z.string(),
-  command_id: z.string(),
-  kind: z.literal("navigate"),
-  requested_action: historyOperationActionSchema,
-  source_state_id: z.string(),
-  observed_source_state_id: z.string().nullable(),
-  target_state_id: z.string(),
-  user_transition_id: z.string(),
-  filesystem_mode: historyFilesystemModeSchema,
-  skip_reason: historySkipReasonSchema.nullable(),
-  phase: historyOperationPhaseSchema,
-  prepared_at: z.string(),
-  updated_at: z.string(),
-});
-const pendingRunFinalizationRowSchema = z.object({
-  run_id: z.string(),
-  session_id: z.string(),
-  workspace_id: z.string(),
-  open_transition_id: z.string(),
-  model_head_id: z.number().int().positive().nullable(),
-  ui_head_id: z.number().int().positive().nullable(),
-  run_status: z.enum(["completed", "cancelled", "error"]),
-  session_status: z.enum(["idle", "error"]),
-  error: z.string().nullable(),
-  terminal_result_json: z.string().nullable(),
-  input_tokens: z.number().int().nonnegative().nullable(),
-  last_provider_family: historyProviderFamilySchema.nullable(),
-  contains_cross_family_turns: z.number().int().min(0).max(1).nullable(),
-  claude_binding_promotion_json: z.string().nullable(),
-  named_claude_binding_promotion_json: z.string().nullable(),
-  prepared_at: z.string(),
-});
-const historyAccountingRowSchema = z.object({
-  state_count: z.number().int().nonnegative(),
-  transition_count: z.number().int().nonnegative(),
-  branch_tip_count: z.number().int().nonnegative(),
-  snapshot_count: z.number().int().nonnegative(),
-  redo_stack_count: z.number().int().nonnegative(),
-  active_operation_count: z.number().int().nonnegative(),
-  pending_finalization_count: z.number().int().nonnegative(),
-});
-const historyRecoveryOperationRowSchema = historyOperationRowSchema.extend({
-  canonical_cwd: z.string(),
-});
-const historyRecoveryPendingFinalizationRowSchema = pendingRunFinalizationRowSchema.extend({
-  canonical_cwd: z.string(),
-});
 const migrationSessionRowSchema = z.object({
   id: z.string(),
   active_run_id: z.string().nullable(),
@@ -470,127 +501,306 @@ const migrationRunRowSchema = z.object({
   status: runStatusSchema,
   parent_run_id: z.string().nullable(),
 });
-const migrationIdentifierSchema = z.string().trim().min(1);
-const migrationSessionSnapshotV4Schema = z.strictObject({
-  id: migrationIdentifierSchema,
-  activeRunId: migrationIdentifierSchema.nullable(),
-  activeCompactionCommandId: migrationIdentifierSchema.nullable().optional(),
-  status: z.enum(["idle", "streaming", "compacting", "cancelling", "error"]),
-  cwd: z.string().min(1),
-  model: migrationIdentifierSchema.nullable(),
-  profile: migrationIdentifierSchema.nullable(),
-  reasoning: miniLilacReasoningSchema.nullable(),
-  title: z.string().max(100).optional(),
-  inputTokens: z.number().int().nonnegative().nullable().optional(),
-  inputTokensEstimated: z.boolean().optional(),
-  contextWindow: z.number().int().positive().nullable().optional(),
-  compactionThreshold: z.number().positive().max(1).optional(),
-  queuedSteeringCount: z.number().int().nonnegative(),
-  createdAt: z.string().datetime({ offset: true }).optional(),
-  updatedAt: z.string().datetime({ offset: true }).optional(),
+const migrationHistorySessionRowSchema = z.object({
+  id: z.string(),
+  workspace_id: z.string(),
+  active_run_id: z.string().nullable(),
+  status: sessionStatusSchema,
+  created_at: z.string(),
+  updated_at: z.string(),
 });
-const migrationSessionDataPartV4Schema = z.strictObject({
-  type: z.literal("data-session"),
-  id: migrationIdentifierSchema.optional(),
-  data: migrationSessionSnapshotV4Schema,
+const idRowSchema = z.object({ id: z.string() });
+const countRowSchema = z.object({ count: z.number().int().nonnegative() });
+const positionRowSchema = z.object({ position: z.number().int().nonnegative() });
+const depthRowSchema = z.object({ depth: z.number().int().positive() });
+const rootPromptSourceRowSchema = z.object({ from_state_id: z.string().min(1) });
+const historyOperationOwnerRowSchema = z.object({ id: z.string(), session_id: z.string() });
+const pendingFinalizationOwnerRowSchema = z.object({
+  run_id: z.string(),
+  session_id: z.string(),
 });
-const migrationCompactionMetricsV4Schema = {
-  status: z.enum(["completed", "failed"]),
-  messageCountBefore: z.number().int().nonnegative(),
-  messageCountAfter: z.number().int().nonnegative().optional(),
-  estimatedInputTokensBefore: z.number().int().nonnegative().optional(),
-  estimatedInputTokensAfter: z.number().int().nonnegative().optional(),
-  error: z.string().optional(),
-} as const;
-const migrationCompactionEventV4Schema = z.discriminatedUnion("source", [
-  z.strictObject({
-    source: z.literal("automatic"),
-    reason: z.enum(["threshold", "overflow"]),
-    ...migrationCompactionMetricsV4Schema,
-  }),
-  z.strictObject({
-    source: z.literal("manual"),
-    reason: z.literal("manual"),
-    ...migrationCompactionMetricsV4Schema,
-  }),
-]);
-const migrationCompactionDataPartV4Schema = z.strictObject({
-  type: z.literal("data-compaction"),
-  id: migrationIdentifierSchema.optional(),
-  data: migrationCompactionEventV4Schema,
+const claudeAttemptOwnerRowSchema = z.object({
+  session_id: z.string(),
+  provider_id: z.string(),
 });
-const migrationUiMessageEnvelopeSchema = z.looseObject({
-  role: z.enum(["system", "user", "assistant"]),
-  parts: z.array(z.unknown()),
+const rootRunParentRowSchema = z.object({ parent_run_id: z.null() });
+const interruptedClaudeAttemptRowSchema = z.object({
+  product: z.enum(["main", "named"]),
+  request_id: z.string(),
+  session_id: z.string(),
+  provider_id: z.string(),
+  request_client: z.string(),
+  source_history_state_id: z.string(),
+  expected_binding_revision: z.number().int().positive().nullable(),
+  model: z.string(),
+  reasoning: z.string(),
 });
 
-type MigratedUiMessages = {
-  readonly messages: MiniLilacUIMessage[];
-  readonly changed: boolean;
+const miniLilacStoreRowCodecRegistry = {
+  session: {
+    schema: sessionRowSchema,
+    versions: [8],
+    table: "sessions",
+  },
+  run: {
+    schema: runRowSchema,
+    versions: [8],
+    table: "runs",
+  },
+  "transcript-node": {
+    schema: transcriptNodeRowSchema,
+    versions: [3, 4, 5, 6, 7, 8],
+    table: "transcript_nodes",
+  },
+  "transcript-node-id": {
+    schema: transcriptNodeRowSchema.pick({ id: true }),
+    versions: [3, 4, 5, 6, 7, 8],
+    table: "transcript_nodes",
+  },
+  "transcript-head": {
+    schema: transcriptHeadRowSchema,
+    versions: [3, 4, 5, 6, 7, 8],
+    table: "session_transcript_heads",
+  },
+  "legacy-positioned-json": {
+    schema: legacyPositionedJsonRowSchema,
+    versions: [2],
+    table: "model_transcript",
+  },
+  "legacy-checkpoint": {
+    schema: legacyCheckpointRowSchema,
+    versions: [2],
+    table: "user_checkpoints",
+  },
+  command: {
+    schema: commandRowSchema,
+    versions: [5, 6, 7, 8],
+    table: "commands",
+  },
+  "claude-binding": {
+    schema: miniMainClaudeBindingRowSchema,
+    versions: [7, 8],
+    table: "mini_main_claude_bindings",
+  },
+  "claude-attempt": {
+    schema: miniMainClaudeAttemptRowSchema,
+    versions: [7, 8],
+    table: "mini_main_claude_attempts",
+  },
+  "migration-session": {
+    schema: migrationSessionRowSchema,
+    versions: [4],
+    table: "sessions",
+  },
+  "migration-history-session": {
+    schema: migrationHistorySessionRowSchema,
+    versions: [4],
+    table: "sessions",
+  },
+  "migration-checkpoint": {
+    schema: migrationCheckpointRowSchema,
+    versions: [4],
+    table: "user_checkpoints",
+  },
+  "migration-run": {
+    schema: migrationRunRowSchema,
+    versions: [4],
+    table: "runs",
+  },
+  id: {
+    schema: idRowSchema,
+    versions: [2, 3, 4, 5, 6, 7, 8],
+    table: "sqlite-query",
+  },
+  count: {
+    schema: countRowSchema,
+    versions: [4, 5, 6, 7, 8],
+    table: "sqlite-query",
+  },
+  position: {
+    schema: positionRowSchema,
+    versions: [5, 6, 7, 8],
+    table: "history_redo_stack",
+  },
+  depth: {
+    schema: depthRowSchema,
+    versions: [5, 6, 7, 8],
+    table: "transcript_nodes",
+  },
+  "root-prompt-source": {
+    schema: rootPromptSourceRowSchema,
+    versions: [5, 6, 7, 8],
+    table: "history_transitions",
+  },
+  "history-operation-owner": {
+    schema: historyOperationOwnerRowSchema,
+    versions: [5, 6, 7, 8],
+    table: "history_operations",
+  },
+  "pending-finalization-owner": {
+    schema: pendingFinalizationOwnerRowSchema,
+    versions: [5, 6, 7, 8],
+    table: "pending_run_finalizations",
+  },
+  "claude-attempt-owner": {
+    schema: claudeAttemptOwnerRowSchema,
+    versions: [7, 8],
+    table: "mini_claude_attempts",
+  },
+  "root-run-parent": {
+    schema: rootRunParentRowSchema,
+    versions: [5, 6, 7, 8],
+    table: "runs",
+  },
+  "interrupted-claude-attempt": {
+    schema: interruptedClaudeAttemptRowSchema,
+    versions: [7, 8],
+    table: "mini_claude_attempts",
+  },
+} as const;
+
+type MiniLilacStoreRowKind = keyof typeof miniLilacStoreRowCodecRegistry;
+type MiniLilacStoreRowValueByKind = {
+  [K in MiniLilacStoreRowKind]: z.output<(typeof miniLilacStoreRowCodecRegistry)[K]["schema"]>;
 };
 
-function parseMigratedUiMessage(value: unknown): {
-  readonly message: MiniLilacUIMessage | null;
-  readonly changed: boolean;
-} {
-  const envelope = migrationUiMessageEnvelopeSchema.parse(value);
-  const parts: unknown[] = [];
-  let changed = false;
-  for (const part of envelope.parts) {
-    if (migrationSessionDataPartV4Schema.safeParse(part).success) {
-      changed = true;
-      continue;
-    }
-    const legacyCompaction = migrationCompactionDataPartV4Schema.safeParse(part);
-    if (legacyCompaction.success) {
-      const { status, ...data } = legacyCompaction.data.data;
-      parts.push({
-        type: legacyCompaction.data.type,
-        ...(legacyCompaction.data.id === undefined ? {} : { id: legacyCompaction.data.id }),
-        data: {
-          ...data,
-          phase: status,
-          ...(status === "completed" ? { outcome: "compacted" as const } : {}),
-        },
-      });
-      changed = true;
-      continue;
-    }
-    parts.push(part);
+export function decodeMiniLilacStoreRow<K extends MiniLilacStoreRowKind>(input: {
+  readonly kind: K;
+  readonly row: unknown;
+  readonly schemaVersion: number;
+  readonly recordId: string;
+}): ResultType<DecodedPersistedValue<MiniLilacStoreRowValueByKind[K] | null>, PersistedDataError> {
+  const codec = miniLilacStoreRowCodecRegistry[input.kind];
+  if (!codec.versions.some((version) => version === input.schemaVersion)) {
+    return Result.err(
+      new UnsupportedVersion({
+        table: codec.table,
+        field: "row",
+        version: input.schemaVersion,
+        issueCode: "unsupported-version",
+        recordId: input.recordId,
+        message: `Unsupported Mini Lilac ${input.kind} row version`,
+      }),
+    );
   }
-  if (!changed) {
-    return { message: miniLilacMessagesSchema.element.parse(value), changed: false };
+  if (input.row === null || input.row === undefined) {
+    return Result.ok({ value: null, provenance: "missing-defaulted" });
   }
-  if (parts.length === 0) {
-    if (envelope.role === "user") {
-      throw new Error("Legacy user UI message contains only session snapshot parts");
-    }
-    return { message: null, changed: true };
+  const decoded = codec.schema.safeParse(input.row);
+  if (!decoded.success) {
+    return Result.err(
+      new CorruptPersistedFields({
+        table: codec.table,
+        field: "row",
+        version: input.schemaVersion,
+        issueCode: "invalid-row-field",
+        recordId: input.recordId,
+        message: `Stored Mini Lilac ${input.kind} row is invalid`,
+      }),
+    );
   }
-  return {
-    message: miniLilacMessagesSchema.element.parse({ ...envelope, parts }),
-    changed: true,
-  };
+  // The registry key selects this schema; TypeScript cannot retain that
+  // correlation through indexed access to the heterogeneous schema map.
+  const value = decoded.data as MiniLilacStoreRowValueByKind[K];
+  return Result.ok({
+    value,
+    provenance: input.schemaVersion === MINI_LILAC_DATABASE_SCHEMA_VERSION ? "current" : "migrated",
+  });
 }
 
-function parseMigratedUiMessages(values: readonly unknown[]): MigratedUiMessages {
-  const messages: MiniLilacUIMessage[] = [];
-  let changed = false;
-  for (const value of values) {
-    const migrated = parseMigratedUiMessage(value);
-    changed ||= migrated.changed;
-    if (migrated.message !== null) messages.push(migrated.message);
+export function decodeMiniLilacStoreRows<K extends MiniLilacStoreRowKind>(input: {
+  readonly kind: K;
+  readonly rows: readonly unknown[];
+  readonly schemaVersion: number;
+  readonly recordId: string;
+}): ResultType<
+  DecodedPersistedValue<readonly MiniLilacStoreRowValueByKind[K][]>,
+  PersistedDataError
+> {
+  const values: MiniLilacStoreRowValueByKind[K][] = [];
+  for (const [index, row] of input.rows.entries()) {
+    const decoded = decodeMiniLilacStoreRow({
+      kind: input.kind,
+      row,
+      schemaVersion: input.schemaVersion,
+      recordId: `${input.recordId}:${index}`,
+    });
+    let $decodedResultValue22079!: import("better-result").InferOk<NonNullable<typeof decoded>>;
+    let $decodedResultError22079!: import("better-result").InferErr<NonNullable<typeof decoded>>;
+    const $decodedResultOk22079 = Result.match<
+      import("better-result").InferOk<NonNullable<typeof decoded>>,
+      import("better-result").InferErr<NonNullable<typeof decoded>>,
+      boolean
+    >(decoded, {
+      ok: (value) => {
+        $decodedResultValue22079 = value;
+        return true;
+      },
+      err: (error) => {
+        $decodedResultError22079 = error;
+        return false;
+      },
+    });
+    if (($decodedResultOk22079 ? "ok" : "error") === "error")
+      return Result.err($decodedResultError22079);
+    if ($decodedResultValue22079.value === null) {
+      return Result.err(
+        new CorruptPersistedFields({
+          table: miniLilacStoreRowCodecRegistry[input.kind].table,
+          field: "row",
+          version: input.schemaVersion,
+          issueCode: "missing-required-field",
+          recordId: `${input.recordId}:${index}`,
+          message: `Mini Lilac ${input.kind} row is missing`,
+        }),
+      );
+    }
+    values.push($decodedResultValue22079.value);
   }
-  return { messages, changed };
+  return Result.ok({
+    value: values,
+    provenance: input.schemaVersion === MINI_LILAC_DATABASE_SCHEMA_VERSION ? "current" : "migrated",
+  });
 }
 
-function parseMigratedUserUiMessage(value: unknown): MiniLilacUserUIMessage {
-  const migrated = parseMigratedUiMessage(value);
-  if (migrated.message === null) {
-    throw new Error("Legacy user UI message cannot be empty after migration");
-  }
-  return miniLilacUserUIMessageSchema.parse(migrated.message);
+function decodeRequiredMiniLilacStoreRow<K extends MiniLilacStoreRowKind>(input: {
+  readonly kind: K;
+  readonly row: unknown;
+  readonly schemaVersion: number;
+  readonly recordId: string;
+}): ResultType<
+  MiniLilacStoreRowValueByKind[K],
+  PersistedDataError | MiniLilacHistoryRecordMissing
+> {
+  const decoded = decodeMiniLilacStoreRow(input);
+  let $decodedResultValue23234!: import("better-result").InferOk<NonNullable<typeof decoded>>;
+  let $decodedResultError23234!: import("better-result").InferErr<NonNullable<typeof decoded>>;
+  const $decodedResultOk23234 = Result.match<
+    import("better-result").InferOk<NonNullable<typeof decoded>>,
+    import("better-result").InferErr<NonNullable<typeof decoded>>,
+    boolean
+  >(decoded, {
+    ok: (value) => {
+      $decodedResultValue23234 = value;
+      return true;
+    },
+    err: (error) => {
+      $decodedResultError23234 = error;
+      return false;
+    },
+  });
+  if (($decodedResultOk23234 ? "ok" : "error") === "error")
+    return Result.err($decodedResultError23234);
+  if ($decodedResultValue23234.value !== null) return Result.ok($decodedResultValue23234.value);
+  return Result.err(
+    new MiniLilacHistoryRecordMissing({
+      recordKind: input.kind,
+      recordId: input.recordId.slice(0, 128),
+      message: `Mini Lilac ${input.kind} record was not found`,
+    }),
+  );
 }
+
 export const storedHistoryCommandErrorSchema = z.strictObject({
   type: z.literal("history-command-error"),
   code: z.literal("history-recovery-abandoned"),
@@ -603,13 +813,19 @@ export const storedHistoryNavigationResultSchema = z.union([
   storedUndoHistoryResultSchema,
   storedRedoHistoryResultSchema,
 ]);
-const storedSteeringCommandPayloadSchema = z.object({
-  message: miniLilacUserUIMessageSchema,
-  sessionId: z.string().optional(),
-  runId: z.string().optional(),
-  clientCommandId: z.string().optional(),
-});
 
+export function decodeStoredHistoryNavigationResult(
+  value: unknown,
+): ResultType<StoredHistoryNavigationResult, MiniLilacStoreOperationRejected> {
+  const decoded = storedHistoryNavigationResultSchema.safeParse(value);
+  if (decoded.success) return Result.ok(decoded.data);
+  return Result.err(
+    new MiniLilacStoreOperationRejected({
+      operation: "decodeStoredHistoryNavigationResult",
+      message: "Stored history navigation result is invalid",
+    }),
+  );
+}
 const providerMetadataFields = {
   providerMetadata: miniLilacProviderMetadataSchema.optional(),
 };
@@ -655,9 +871,7 @@ const standardChunkSchema = z.discriminatedUnion("type", [
   }),
   z.strictObject({
     type: z.literal("custom"),
-    kind: z.custom<`${string}.${string}`>(
-      (value): value is `${string}.${string}` => typeof value === "string" && value.includes("."),
-    ),
+    kind: z.templateLiteral([z.string(), ".", z.string()]),
     ...providerMetadataFields,
   }),
   z.strictObject({
@@ -771,22 +985,40 @@ const standardChunkSchema = z.discriminatedUnion("type", [
 export type StoredUIMessageChunk = z.infer<typeof standardChunkSchema>;
 export type StoredRunChunk = { seq: number; chunk: StoredUIMessageChunk };
 
-export function parseStoredUIMessageChunk(value: unknown): StoredUIMessageChunk {
-  return standardChunkSchema.parse(value);
+export function decodeStoredUIMessageChunk(
+  value: unknown,
+): ResultType<StoredUIMessageChunk, MiniLilacStoreOperationRejected> {
+  const decoded = standardChunkSchema.safeParse(value);
+  if (decoded.success) return Result.ok(decoded.data);
+  return Result.err(
+    new MiniLilacStoreOperationRejected({
+      operation: "decodeStoredUIMessageChunk",
+      message: "Stored UI message chunk is invalid",
+    }),
+  );
 }
 
-const modelMessagesSchema = z.custom<ModelMessage[]>(
-  (value) =>
-    Array.isArray(value) &&
-    value.every(
-      (message) =>
-        typeof message === "object" &&
-        message !== null &&
-        "role" in message &&
-        ["system", "user", "assistant", "tool"].includes(String(message.role)),
-    ),
-  "Invalid canonical model transcript",
-);
+function decodeStoredSessionSnapshot(
+  value: unknown,
+): ResultType<MiniLilacSessionSnapshot | undefined, PersistedDataError> {
+  if (value === undefined) return Result.ok(undefined);
+  const decoded = miniLilacSessionSnapshotSchema.safeParse(value);
+  if (decoded.success) return Result.ok(decoded.data);
+  return Result.err(
+    new CorruptPersistedFields({
+      table: "commands",
+      field: "command_result",
+      version: MINI_LILAC_DATABASE_SCHEMA_VERSION,
+      issueCode: "invalid-row-field",
+      recordId: "session-snapshot-command",
+      message: "Stored session snapshot command result is invalid",
+    }),
+  );
+}
+
+export function parseStoredUIMessageChunk(value: unknown): StoredUIMessageChunk {
+  return storeResultToLegacy(decodeStoredUIMessageChunk(value));
+}
 
 export type MiniLilacRunStatus = z.infer<typeof runStatusSchema>;
 
@@ -1327,8 +1559,42 @@ function serialize(value: unknown): string {
   return superjson.stringify(value);
 }
 
-function deserialize(value: string): unknown {
-  return superjson.parse(value);
+function serializeStoreValueResult(
+  value: unknown,
+  operation: string,
+): ResultType<string, MiniLilacStoreOperationRejected> {
+  try {
+    return Result.ok(serialize(value));
+  } catch (cause) {
+    if (Panic.is(cause)) throw cause;
+    return Result.err(
+      new MiniLilacStoreOperationRejected({
+        operation,
+        message: "Store value is not serializable",
+      }),
+    );
+  }
+}
+
+function storeResultToLegacy<T, E>(result: ResultType<T, E>): T {
+  let $resultResultValue48249!: import("better-result").InferOk<NonNullable<typeof result>>;
+  let $resultResultError48249!: import("better-result").InferErr<NonNullable<typeof result>>;
+  const $resultResultOk48249 = Result.match<
+    import("better-result").InferOk<NonNullable<typeof result>>,
+    import("better-result").InferErr<NonNullable<typeof result>>,
+    boolean
+  >(result, {
+    ok: (value) => {
+      $resultResultValue48249 = value;
+      return true;
+    },
+    err: (error) => {
+      $resultResultError48249 = error;
+      return false;
+    },
+  });
+  if (($resultResultOk48249 ? "ok" : "error") === "error") throw $resultResultError48249;
+  return $resultResultValue48249;
 }
 
 function canonicalJsonValue(value: unknown): unknown {
@@ -1336,22 +1602,198 @@ function canonicalJsonValue(value: unknown): unknown {
   if (value !== null && typeof value === "object") {
     return Object.fromEntries(
       Object.entries(value)
-        .sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))
+        .sort(([left], [right]) => {
+          if (left < right) return -1;
+          if (left > right) return 1;
+          return 0;
+        })
         .map(([key, nested]) => [key, canonicalJsonValue(nested)]),
     );
   }
   return value;
 }
 
-function canonicalCommandPayload(payload: unknown): { json: string; fingerprint: string } {
-  const normalized: unknown = JSON.parse(JSON.stringify(payload));
-  const json = JSON.stringify(canonicalJsonValue(z.json().parse(normalized)));
+function storedProviderStateFlag(providerState: HistoryProviderState | null): number | null {
+  if (providerState === null) return null;
+  if (providerState.containsCrossFamilyTurns) return 1;
+  return 0;
+}
+
+function canonicalCommandPayloadResult(
+  payload: unknown,
+): ResultType<
+  { readonly json: string; readonly fingerprint: string },
+  MiniLilacStoreOperationRejected
+> {
+  let serialized: string | undefined;
+  try {
+    serialized = JSON.stringify(payload);
+  } catch (cause) {
+    if (Panic.is(cause)) throw cause;
+    return Result.err(
+      new MiniLilacStoreOperationRejected({
+        operation: "canonicalCommandPayload",
+        message: "Command payload is not serializable JSON",
+      }),
+    );
+  }
+  if (serialized === undefined) {
+    return Result.err(
+      new MiniLilacStoreOperationRejected({
+        operation: "canonicalCommandPayload",
+        message: "Command payload is not serializable JSON",
+      }),
+    );
+  }
+  const parsedJson: unknown = JSON.parse(serialized);
+  const jsonValue = z.json().safeParse(parsedJson);
+  if (!jsonValue.success) {
+    return Result.err(
+      new MiniLilacStoreOperationRejected({
+        operation: "canonicalCommandPayload",
+        message: "Command payload is not valid JSON",
+      }),
+    );
+  }
+  const json = JSON.stringify(canonicalJsonValue(jsonValue.data));
   const fingerprint = new Bun.CryptoHasher("sha256").update(json).digest("hex");
-  return { json, fingerprint };
+  return Result.ok({ json, fingerprint });
+}
+
+function decodeCanonicalStoredCommandRequest(request: StoredCommandRequest): ResultType<
+  {
+    readonly kind: string;
+    readonly runId: string | null;
+    readonly json: string;
+    readonly fingerprint: string;
+  },
+  MiniLilacStoreOperationRejected
+> {
+  const payload = canonicalCommandPayloadResult(request.payload);
+  let $payloadResultValue50568!: import("better-result").InferOk<NonNullable<typeof payload>>;
+  let $payloadResultError50568!: import("better-result").InferErr<NonNullable<typeof payload>>;
+  const $payloadResultOk50568 = Result.match<
+    import("better-result").InferOk<NonNullable<typeof payload>>,
+    import("better-result").InferErr<NonNullable<typeof payload>>,
+    boolean
+  >(payload, {
+    ok: (value) => {
+      $payloadResultValue50568 = value;
+      return true;
+    },
+    err: (error) => {
+      $payloadResultError50568 = error;
+      return false;
+    },
+  });
+  if (($payloadResultOk50568 ? "ok" : "error") === "error")
+    return Result.err($payloadResultError50568);
+  return Result.ok({ kind: request.kind, runId: request.runId, ...$payloadResultValue50568 });
+}
+
+function decodeCanonicalRootPromptCommand(
+  input: AdmitStoredRootPromptHistory,
+): ResultType<
+  { readonly json: string; readonly fingerprint: string },
+  MiniLilacStoreOperationRejected
+> {
+  return canonicalCommandPayloadResult(input.commandPayload);
+}
+
+function serializeOptionalTerminalResult(
+  input: { readonly terminalResult?: unknown },
+  operation: string,
+): ResultType<string | null, MiniLilacStoreOperationRejected> {
+  if (input.terminalResult === undefined) return Result.ok(null);
+  return serializeStoreValueResult(input.terminalResult, operation);
 }
 
 function canonicalValuesEqual(left: unknown, right: unknown): boolean {
   return JSON.stringify(canonicalJsonValue(left)) === JSON.stringify(canonicalJsonValue(right));
+}
+
+function validateSteeringHistoryBoundaryInput(
+  input: CommitStoredSteeringBoundary,
+): ResultType<
+  { readonly firstUiPosition: number; readonly firstModelPosition: number },
+  MiniLilacStoreOperationRejected
+> {
+  if (input.entries.length === 0) {
+    return Result.err(
+      rejectMiniLilacStoreOperation(
+        "commitSteeringHistoryBoundary",
+        "A steering boundary requires at least one entry",
+      ),
+    );
+  }
+  for (const [index, entry] of input.entries.entries()) {
+    if (entry.modelMessage.role !== "user") {
+      return Result.err(
+        rejectMiniLilacStoreOperation(
+          "commitSteeringHistoryBoundary",
+          "Every steering entry requires one canonical model user message",
+        ),
+      );
+    }
+    if (!Number.isInteger(entry.replayAfterSeq) || entry.replayAfterSeq < 0) {
+      return Result.err(
+        rejectMiniLilacStoreOperation(
+          "commitSteeringHistoryBoundary",
+          "Every steering entry requires a non-negative replay sequence",
+        ),
+      );
+    }
+    if (index < input.entries.length - 1 !== (entry.intermediateStateId !== undefined)) {
+      return Result.err(
+        rejectMiniLilacStoreOperation(
+          "commitSteeringHistoryBoundary",
+          "Every non-final steering entry requires exactly one intermediate state ID",
+        ),
+      );
+    }
+  }
+  const firstUiPosition = input.uiMessages.length - input.entries.length;
+  if (firstUiPosition < 0) {
+    return Result.err(
+      rejectMiniLilacStoreOperation(
+        "commitSteeringHistoryBoundary",
+        "Steering UI messages do not contain every entry",
+      ),
+    );
+  }
+  const firstModelPosition = input.mergedModelMessages.length - input.entries.length;
+  if (firstModelPosition < 0) {
+    return Result.err(
+      rejectMiniLilacStoreOperation(
+        "commitSteeringHistoryBoundary",
+        "Steering model messages do not contain every entry",
+      ),
+    );
+  }
+  for (const [index, entry] of input.entries.entries()) {
+    if (!canonicalValuesEqual(input.uiMessages[firstUiPosition + index], entry.message)) {
+      return Result.err(
+        rejectMiniLilacStoreOperation(
+          "commitSteeringHistoryBoundary",
+          "Steering entries must be the exact final canonical UI suffix",
+        ),
+      );
+    }
+    if (
+      !canonicalValuesEqual(
+        input.mergedModelMessages[firstModelPosition + index],
+        entry.modelMessage,
+      )
+    ) {
+      return Result.err(
+        rejectMiniLilacStoreOperation(
+          "commitSteeringHistoryBoundary",
+          "Steering entries must be the exact final canonical model suffix",
+        ),
+      );
+    }
+  }
+  return Result.ok({ firstUiPosition, firstModelPosition });
 }
 
 function canonicalizeStoredCwd(cwd: string): string {
@@ -1366,22 +1808,11 @@ function canonicalizeStoredCwd(cwd: string): string {
 }
 
 function isCanonicalPrefix(prefix: readonly unknown[], values: readonly unknown[]): boolean {
-  return (
-    prefix.length <= values.length &&
-    prefix.every((value, index) => canonicalValuesEqual(value, values[index]))
-  );
-}
-
-function parseHistoryWorkspaceOutcome(input: {
-  readonly workspaceSnapshotId: unknown;
-  readonly workspaceStatus: unknown;
-  readonly workspaceUnavailableReason: unknown;
-}): z.infer<typeof historyWorkspaceOutcomeSchema> {
-  return historyWorkspaceOutcomeSchema.parse({
-    workspaceSnapshotId: input.workspaceSnapshotId,
-    workspaceStatus: input.workspaceStatus,
-    workspaceUnavailableReason: input.workspaceUnavailableReason,
-  });
+  if (prefix.length > values.length) return false;
+  for (let index = 0; index < prefix.length; index += 1) {
+    if (!canonicalValuesEqual(prefix[index], values[index])) return false;
+  }
+  return true;
 }
 
 type StoredSessionRowSnapshot = Omit<
@@ -1389,8 +1820,9 @@ type StoredSessionRowSnapshot = Omit<
   "historyStateId" | "canUndo" | "canRedo"
 >;
 
-function toSnapshot(rowValue: unknown): StoredSessionRowSnapshot {
-  const row = sessionRowSchema.parse(rowValue);
+function projectSessionRowSnapshot(
+  row: MiniLilacStoreRowValueByKind["session"],
+): StoredSessionRowSnapshot {
   return {
     id: row.id,
     activeRunId: row.active_run_id,
@@ -1398,9 +1830,7 @@ function toSnapshot(rowValue: unknown): StoredSessionRowSnapshot {
     cwd: row.cwd,
     model: row.model,
     profile: row.profile,
-    reasoning: z
-      .enum(["provider-default", "none", "minimal", "low", "medium", "high", "xhigh"])
-      .parse(row.reasoning),
+    reasoning: row.reasoning,
     title: row.title,
     inputTokens: row.input_tokens,
     inputTokensEstimated: row.input_tokens_estimated === 1,
@@ -1411,9 +1841,97 @@ function toSnapshot(rowValue: unknown): StoredSessionRowSnapshot {
   };
 }
 
-function toRun(rowValue: unknown): StoredRun {
-  const row = runRowSchema.parse(rowValue);
-  return {
+function decodeSessionRowSnapshot(
+  rowValue: unknown,
+  recordId: string,
+): ResultType<StoredSessionRowSnapshot, PersistedDataError | MiniLilacHistoryRecordMissing> {
+  const decoded = decodeRequiredMiniLilacStoreRow({
+    kind: "session",
+    row: rowValue,
+    schemaVersion: MINI_LILAC_DATABASE_SCHEMA_VERSION,
+    recordId,
+  });
+  let $decodedResultValue55735!: import("better-result").InferOk<NonNullable<typeof decoded>>;
+  let $decodedResultError55735!: import("better-result").InferErr<NonNullable<typeof decoded>>;
+  const $decodedResultOk55735 = Result.match<
+    import("better-result").InferOk<NonNullable<typeof decoded>>,
+    import("better-result").InferErr<NonNullable<typeof decoded>>,
+    boolean
+  >(decoded, {
+    ok: (value) => {
+      $decodedResultValue55735 = value;
+      return true;
+    },
+    err: (error) => {
+      $decodedResultError55735 = error;
+      return false;
+    },
+  });
+  if (($decodedResultOk55735 ? "ok" : "error") === "error")
+    return Result.err($decodedResultError55735);
+  return Result.ok(projectSessionRowSnapshot($decodedResultValue55735));
+}
+
+function decodeRunRow(
+  rowValue: unknown,
+  recordId: string,
+): ResultType<StoredRun, PersistedDataError | MiniLilacHistoryRecordMissing> {
+  const decodedRow = decodeRequiredMiniLilacStoreRow({
+    kind: "run",
+    row: rowValue,
+    schemaVersion: MINI_LILAC_DATABASE_SCHEMA_VERSION,
+    recordId,
+  });
+  let $decodedRowResultValue56178!: import("better-result").InferOk<NonNullable<typeof decodedRow>>;
+  let $decodedRowResultError56178!: import("better-result").InferErr<
+    NonNullable<typeof decodedRow>
+  >;
+  const $decodedRowResultOk56178 = Result.match<
+    import("better-result").InferOk<NonNullable<typeof decodedRow>>,
+    import("better-result").InferErr<NonNullable<typeof decodedRow>>,
+    boolean
+  >(decodedRow, {
+    ok: (value) => {
+      $decodedRowResultValue56178 = value;
+      return true;
+    },
+    err: (error) => {
+      $decodedRowResultError56178 = error;
+      return false;
+    },
+  });
+  if (($decodedRowResultOk56178 ? "ok" : "error") === "error")
+    return Result.err($decodedRowResultError56178);
+  const row = $decodedRowResultValue56178;
+  const terminalResult = decodeMiniLilacSuperJsonPayload({
+    raw: row.terminal_result_json,
+    schemaVersion: MINI_LILAC_DATABASE_SCHEMA_VERSION,
+    recordId: row.id,
+    field: "terminal_result",
+  });
+  let $terminalResultResultValue56450!: import("better-result").InferOk<
+    NonNullable<typeof terminalResult>
+  >;
+  let $terminalResultResultError56450!: import("better-result").InferErr<
+    NonNullable<typeof terminalResult>
+  >;
+  const $terminalResultResultOk56450 = Result.match<
+    import("better-result").InferOk<NonNullable<typeof terminalResult>>,
+    import("better-result").InferErr<NonNullable<typeof terminalResult>>,
+    boolean
+  >(terminalResult, {
+    ok: (value) => {
+      $terminalResultResultValue56450 = value;
+      return true;
+    },
+    err: (error) => {
+      $terminalResultResultError56450 = error;
+      return false;
+    },
+  });
+  if (($terminalResultResultOk56450 ? "ok" : "error") === "error")
+    return Result.err($terminalResultResultError56450);
+  return Result.ok({
     id: row.id,
     sessionId: row.session_id,
     parentRunId: row.parent_run_id,
@@ -1421,66 +1939,42 @@ function toRun(rowValue: unknown): StoredRun {
     depth: row.depth,
     status: row.status,
     error: row.error,
-    terminalResult: row.terminal_result_json ? deserialize(row.terminal_result_json) : undefined,
+    terminalResult: $terminalResultResultValue56450.value ?? undefined,
     startedAt: row.started_at,
     finishedAt: row.finished_at,
-  };
+  });
 }
 
-function toWorkspace(rowValue: unknown): StoredWorkspace {
-  const row = workspaceRowSchema.parse(rowValue);
-  return {
-    id: row.id,
-    canonicalCwd: row.canonical_cwd,
-    healthStatus: row.health_status,
-    healthDetail: row.health_detail,
-    createdAt: row.created_at,
-  };
-}
-
-function toWorkspaceSnapshot(rowValue: unknown): StoredWorkspaceSnapshot {
-  const row = workspaceSnapshotRowSchema.parse(rowValue);
-  return {
-    id: row.id,
-    workspaceId: row.workspace_id,
-    rootTreeOid: row.root_tree_oid,
-    gitRef: row.git_ref,
-    formatVersion: row.format_version,
-    availability: row.availability,
-    availabilityDetail: row.availability_detail,
-    createdAt: row.created_at,
-  };
-}
-
-function toHistoryState(rowValue: unknown): StoredHistoryState {
-  const row = historyStateRowSchema.parse(rowValue);
-  if ((row.last_provider_family === null) !== (row.contains_cross_family_turns === null)) {
-    throw new Error(`History state '${row.id}' has incomplete provider metadata`);
-  }
-  return {
-    id: row.id,
-    sessionId: row.session_id,
-    workspaceId: row.workspace_id,
-    modelHeadId: row.model_head_id,
-    uiHeadId: row.ui_head_id,
-    workspaceSnapshotId: row.workspace_snapshot_id,
-    workspaceStatus: row.workspace_status,
-    workspaceUnavailableReason: row.workspace_unavailable_reason,
-    origin: row.origin,
-    providerState:
-      row.last_provider_family === null || row.contains_cross_family_turns === null
-        ? null
-        : historyProviderStateSchema.parse({
-            lastFamily: row.last_provider_family,
-            containsCrossFamilyTurns: row.contains_cross_family_turns === 1,
-          }),
-    createdAt: row.created_at,
-  };
-}
-
-function toMiniMainClaudeBinding(rowValue: unknown): MiniMainClaudeSessionBinding {
-  const row = miniMainClaudeBindingRowSchema.parse(rowValue);
-  return {
+function decodeMiniMainClaudeBindingRow(
+  rowValue: unknown,
+  recordId: string,
+): ResultType<MiniMainClaudeSessionBinding, PersistedDataError | MiniLilacHistoryRecordMissing> {
+  const decoded = decodeRequiredMiniLilacStoreRow({
+    kind: "claude-binding",
+    row: rowValue,
+    schemaVersion: MINI_LILAC_DATABASE_SCHEMA_VERSION,
+    recordId,
+  });
+  let $decodedResultValue57251!: import("better-result").InferOk<NonNullable<typeof decoded>>;
+  let $decodedResultError57251!: import("better-result").InferErr<NonNullable<typeof decoded>>;
+  const $decodedResultOk57251 = Result.match<
+    import("better-result").InferOk<NonNullable<typeof decoded>>,
+    import("better-result").InferErr<NonNullable<typeof decoded>>,
+    boolean
+  >(decoded, {
+    ok: (value) => {
+      $decodedResultValue57251 = value;
+      return true;
+    },
+    err: (error) => {
+      $decodedResultError57251 = error;
+      return false;
+    },
+  });
+  if (($decodedResultOk57251 ? "ok" : "error") === "error")
+    return Result.err($decodedResultError57251);
+  const row = $decodedResultValue57251;
+  return Result.ok({
     bindingProtocolVersion: row.binding_protocol_version,
     providerId: row.provider_id,
     providerFamily: row.provider_family,
@@ -1499,12 +1993,39 @@ function toMiniMainClaudeBinding(rowValue: unknown): MiniMainClaudeSessionBindin
     lastReasoning: row.last_reasoning,
     revision: row.revision,
     updatedAt: row.updated_at,
-  };
+  });
 }
 
-function toMiniMainClaudeAttempt(rowValue: unknown): MiniMainClaudeSessionAttempt {
-  const row = miniMainClaudeAttemptRowSchema.parse(rowValue);
-  return {
+function decodeMiniMainClaudeAttemptRow(
+  rowValue: unknown,
+  recordId: string,
+): ResultType<MiniMainClaudeSessionAttempt, PersistedDataError | MiniLilacHistoryRecordMissing> {
+  const decoded = decodeRequiredMiniLilacStoreRow({
+    kind: "claude-attempt",
+    row: rowValue,
+    schemaVersion: MINI_LILAC_DATABASE_SCHEMA_VERSION,
+    recordId,
+  });
+  let $decodedResultValue58536!: import("better-result").InferOk<NonNullable<typeof decoded>>;
+  let $decodedResultError58536!: import("better-result").InferErr<NonNullable<typeof decoded>>;
+  const $decodedResultOk58536 = Result.match<
+    import("better-result").InferOk<NonNullable<typeof decoded>>,
+    import("better-result").InferErr<NonNullable<typeof decoded>>,
+    boolean
+  >(decoded, {
+    ok: (value) => {
+      $decodedResultValue58536 = value;
+      return true;
+    },
+    err: (error) => {
+      $decodedResultError58536 = error;
+      return false;
+    },
+  });
+  if (($decodedResultOk58536 ? "ok" : "error") === "error")
+    return Result.err($decodedResultError58536);
+  const row = $decodedResultValue58536;
+  return Result.ok({
     product: row.product,
     providerId: row.provider_id,
     requestClient: row.request_client,
@@ -1521,117 +2042,7 @@ function toMiniMainClaudeAttempt(rowValue: unknown): MiniMainClaudeSessionAttemp
     state: row.state,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
-  };
-}
-
-function toMiniNamedClaudeBinding(rowValue: unknown): MiniNamedClaudeSessionBinding {
-  return toMiniMainClaudeBinding(miniNamedClaudeBindingRowSchema.parse(rowValue));
-}
-
-function toMiniNamedClaudeAttempt(rowValue: unknown): MiniNamedClaudeSessionAttempt {
-  return toMiniMainClaudeAttempt(miniNamedClaudeAttemptRowSchema.parse(rowValue));
-}
-
-function toHistoryTransition(rowValue: unknown): StoredHistoryTransition {
-  const row = historyTransitionRowSchema.parse(rowValue);
-  return {
-    id: row.id,
-    sessionId: row.session_id,
-    fromStateId: row.from_state_id,
-    toStateId: row.to_state_id,
-    kind: row.kind,
-    delivery: row.delivery,
-    commandId: row.command_id,
-    userMessage:
-      row.user_message_json === null
-        ? null
-        : miniLilacUserUIMessageSchema.parse(deserialize(row.user_message_json)),
-    rootRunId: row.root_run_id,
-    replayAfterSeq: row.replay_after_seq,
-    createdAt: row.created_at,
-    completedAt: row.completed_at,
-  };
-}
-
-function toSessionHistory(rowValue: unknown): StoredSessionHistory {
-  const row = sessionHistoryRowSchema.parse(rowValue);
-  return {
-    sessionId: row.session_id,
-    rootStateId: row.root_state_id,
-    currentStateId: row.current_state_id,
-    undoFloorStateId: row.undo_floor_state_id,
-    updatedAt: row.updated_at,
-  };
-}
-
-function toHistoryRedoEntry(rowValue: unknown): StoredHistoryRedoEntry {
-  const row = historyRedoRowSchema.parse(rowValue);
-  return {
-    sessionId: row.session_id,
-    position: row.position,
-    targetStateId: row.target_state_id,
-    userTransitionId: row.user_transition_id,
-    createdAt: row.created_at,
-  };
-}
-
-function toHistoryOperation(rowValue: unknown): StoredHistoryOperation {
-  const row = historyOperationRowSchema.parse(rowValue);
-  return {
-    id: row.id,
-    sessionId: row.session_id,
-    workspaceId: row.workspace_id,
-    commandId: row.command_id,
-    kind: row.kind,
-    requestedAction: row.requested_action,
-    sourceStateId: row.source_state_id,
-    observedSourceStateId: row.observed_source_state_id,
-    targetStateId: row.target_state_id,
-    userTransitionId: row.user_transition_id,
-    filesystemMode: row.filesystem_mode,
-    skipReason: row.skip_reason,
-    phase: row.phase,
-    preparedAt: row.prepared_at,
-    updatedAt: row.updated_at,
-  };
-}
-
-function toPendingRunFinalization(rowValue: unknown): PendingStoredRunFinalization {
-  const row = pendingRunFinalizationRowSchema.parse(rowValue);
-  return {
-    runId: row.run_id,
-    sessionId: row.session_id,
-    workspaceId: row.workspace_id,
-    openTransitionId: row.open_transition_id,
-    modelHeadId: row.model_head_id,
-    uiHeadId: row.ui_head_id,
-    runStatus: row.run_status,
-    sessionStatus: row.session_status,
-    error: row.error,
-    terminalResult:
-      row.terminal_result_json === null ? undefined : deserialize(row.terminal_result_json),
-    inputTokens: row.input_tokens,
-    providerState:
-      row.last_provider_family === null || row.contains_cross_family_turns === null
-        ? null
-        : historyProviderStateSchema.parse({
-            lastFamily: row.last_provider_family,
-            containsCrossFamilyTurns: row.contains_cross_family_turns === 1,
-          }),
-    claudeBindingPromotion:
-      row.claude_binding_promotion_json === null
-        ? null
-        : promoteMiniMainClaudeSessionBindingSchema.parse(
-            deserialize(row.claude_binding_promotion_json),
-          ),
-    namedClaudeBindingPromotion:
-      row.named_claude_binding_promotion_json === null
-        ? null
-        : promoteMiniNamedClaudeSessionBindingSchema.parse(
-            deserialize(row.named_claude_binding_promotion_json),
-          ),
-    preparedAt: row.prepared_at,
-  };
+  });
 }
 
 export type ReadonlyStoredHistoryRecoveryStatus = {
@@ -1657,57 +2068,344 @@ export class MiniLilacHistoryRecoveryVersionError extends Error {
   }
 }
 
+export class MiniLilacHistoryRecoveryPathFailure extends TaggedError(
+  "MiniLilacHistoryRecoveryPathFailure",
+)<{
+  readonly filename: string;
+  readonly message: string;
+}> {}
+
+export type MiniLilacHistoryRecoveryReadError =
+  | PersistedDataError
+  | MiniLilacSqliteDriverFailure
+  | MiniLilacHistoryRecoveryVersionError
+  | MiniLilacHistoryRecoveryPathFailure
+  | MiniLilacHistoryRecordMissing;
+
 export function readMiniLilacHistoryRecoveryStatus(
   filename: string,
 ): ReadonlyStoredHistoryRecoveryStatus {
+  return storeResultToLegacy(readMiniLilacHistoryRecoveryStatusResult(filename));
+}
+
+function closeMiniLilacHistoryRecoveryDatabase(
+  database: Database,
+): ResultType<void, MiniLilacSqliteDriverFailure> {
+  try {
+    database.close();
+    return Result.ok(undefined);
+  } catch (cause) {
+    if (Panic.is(cause)) throw cause;
+    if (!(cause instanceof Error)) throw cause;
+    const failure = classifyMiniLilacSqliteDriverFailure("readHistoryRecovery.close", cause);
+    if (failure !== undefined) return Result.err(failure);
+    throw cause;
+  }
+}
+
+export function readMiniLilacHistoryRecoveryStatusResult(
+  filename: string,
+  options: MiniLilacSqliteStoreOptions = {},
+): ResultType<ReadonlyStoredHistoryRecoveryStatus, MiniLilacHistoryRecoveryReadError> {
   const resolvedFilename = path.resolve(filename);
   if (existsSync(resolvedFilename) && lstatSync(resolvedFilename).isSymbolicLink()) {
-    throw new Error(`Mini Lilac database path '${resolvedFilename}' must not be a symbolic link`);
+    return Result.err(
+      new MiniLilacHistoryRecoveryPathFailure({
+        filename: resolvedFilename,
+        message: `Mini Lilac database path '${resolvedFilename}' must not be a symbolic link`,
+      }),
+    );
   }
-  const database = new Database(resolvedFilename, { readonly: true, strict: true });
+  let database: Database;
   try {
-    const version = z
-      .object({ user_version: z.number().int() })
-      .parse(database.query("PRAGMA user_version").get()).user_version;
-    if (version !== MINI_LILAC_DATABASE_SCHEMA_VERSION) {
-      throw new MiniLilacHistoryRecoveryVersionError(version);
-    }
-    const navigation = z
-      .array(historyRecoveryOperationRowSchema)
-      .parse(
-        database
-          .query(
-            `SELECT history_operations.*, workspaces.canonical_cwd
-             FROM history_operations
-             JOIN workspaces ON workspaces.id = history_operations.workspace_id
-             ORDER BY history_operations.prepared_at, history_operations.rowid`,
-          )
-          .all(),
-      )
-      .map((row) => ({
-        canonicalCwd: row.canonical_cwd,
-        operation: toHistoryOperation(row),
-      }));
-    const pendingFinalizations = z
-      .array(historyRecoveryPendingFinalizationRowSchema)
-      .parse(
-        database
-          .query(
-            `SELECT pending_run_finalizations.*, workspaces.canonical_cwd
-             FROM pending_run_finalizations
-             JOIN workspaces ON workspaces.id = pending_run_finalizations.workspace_id
-             ORDER BY pending_run_finalizations.prepared_at, pending_run_finalizations.rowid`,
-          )
-          .all(),
-      )
-      .map((row) => ({
-        canonicalCwd: row.canonical_cwd,
-        finalization: toPendingRunFinalization(row),
-      }));
-    return { navigation, pendingFinalizations };
-  } finally {
-    database.close();
+    database = new Database(resolvedFilename, { readonly: true, strict: true });
+  } catch (cause) {
+    if (Panic.is(cause)) throw cause;
+    if (!(cause instanceof Error)) throw cause;
+    const failure = classifyMiniLilacSqliteDriverFailure("readHistoryRecovery.open", cause);
+    if (failure !== undefined) return Result.err(failure);
+    throw cause;
   }
+  const diagnostics: MiniLilacPersistenceDiagnostic[] = [];
+  let outcome:
+    | ResultType<ReadonlyStoredHistoryRecoveryStatus, MiniLilacHistoryRecoveryReadError>
+    | undefined;
+  let readDefect: MiniLilacCaughtDefect | undefined;
+  try {
+    const decodedVersion = decodeMiniLilacDatabaseVersion(
+      database.query("PRAGMA user_version").get(),
+    );
+    let $decodedVersionResultValue62612!: import("better-result").InferOk<
+      NonNullable<typeof decodedVersion>
+    >;
+    let $decodedVersionResultError62612!: import("better-result").InferErr<
+      NonNullable<typeof decodedVersion>
+    >;
+    const $decodedVersionResultOk62612 = Result.match<
+      import("better-result").InferOk<NonNullable<typeof decodedVersion>>,
+      import("better-result").InferErr<NonNullable<typeof decodedVersion>>,
+      boolean
+    >(decodedVersion, {
+      ok: (value) => {
+        $decodedVersionResultValue62612 = value;
+        return true;
+      },
+      err: (error) => {
+        $decodedVersionResultError62612 = error;
+        return false;
+      },
+    });
+    if (($decodedVersionResultOk62612 ? "ok" : "error") === "error") {
+      diagnostics.push({
+        table: $decodedVersionResultError62612.table,
+        field: $decodedVersionResultError62612.field,
+        version: $decodedVersionResultError62612.version,
+        issueCode: $decodedVersionResultError62612.issueCode,
+        recordId: $decodedVersionResultError62612.recordId,
+        message: $decodedVersionResultError62612.message,
+      });
+      outcome = Result.err($decodedVersionResultError62612);
+    } else if ($decodedVersionResultValue62612 !== MINI_LILAC_DATABASE_SCHEMA_VERSION) {
+      outcome = Result.err(
+        new MiniLilacHistoryRecoveryVersionError($decodedVersionResultValue62612),
+      );
+    } else {
+      const navigation: Array<{
+        readonly canonicalCwd: string;
+        readonly operation: StoredHistoryOperation;
+      }> = [];
+      const operations = decodeMiniLilacStructuralHistoryRows({
+        kind: "operation",
+        rows: database.query("SELECT * FROM history_operations ORDER BY prepared_at, rowid").all(),
+        schemaVersion: MINI_LILAC_DATABASE_SCHEMA_VERSION,
+        recordId: "recovery-operation",
+      });
+      let $operationsResultValue63462!: import("better-result").InferOk<
+        NonNullable<typeof operations>
+      >;
+      let $operationsResultError63462!: import("better-result").InferErr<
+        NonNullable<typeof operations>
+      >;
+      const $operationsResultOk63462 = Result.match<
+        import("better-result").InferOk<NonNullable<typeof operations>>,
+        import("better-result").InferErr<NonNullable<typeof operations>>,
+        boolean
+      >(operations, {
+        ok: (value) => {
+          $operationsResultValue63462 = value;
+          return true;
+        },
+        err: (error) => {
+          $operationsResultError63462 = error;
+          return false;
+        },
+      });
+      if (($operationsResultOk63462 ? "ok" : "error") === "error") {
+        diagnostics.push({
+          table: $operationsResultError63462.table,
+          field: $operationsResultError63462.field,
+          version: $operationsResultError63462.version,
+          issueCode: $operationsResultError63462.issueCode,
+          recordId: $operationsResultError63462.recordId,
+          message: $operationsResultError63462.message,
+        });
+        outcome = Result.err($operationsResultError63462);
+      } else {
+        for (const operation of $operationsResultValue63462.value) {
+          const workspace = decodeMiniLilacStructuralHistoryRow({
+            kind: "workspace",
+            row: database.query("SELECT * FROM workspaces WHERE id = ?").get(operation.workspaceId),
+            schemaVersion: MINI_LILAC_DATABASE_SCHEMA_VERSION,
+            recordId: operation.workspaceId,
+          });
+          let $workspaceResultValue64237!: import("better-result").InferOk<
+            NonNullable<typeof workspace>
+          >;
+          let $workspaceResultError64237!: import("better-result").InferErr<
+            NonNullable<typeof workspace>
+          >;
+          const $workspaceResultOk64237 = Result.match<
+            import("better-result").InferOk<NonNullable<typeof workspace>>,
+            import("better-result").InferErr<NonNullable<typeof workspace>>,
+            boolean
+          >(workspace, {
+            ok: (value) => {
+              $workspaceResultValue64237 = value;
+              return true;
+            },
+            err: (error) => {
+              $workspaceResultError64237 = error;
+              return false;
+            },
+          });
+          if (($workspaceResultOk64237 ? "ok" : "error") === "error") {
+            diagnostics.push({
+              table: $workspaceResultError64237.table,
+              field: $workspaceResultError64237.field,
+              version: $workspaceResultError64237.version,
+              issueCode: $workspaceResultError64237.issueCode,
+              recordId: $workspaceResultError64237.recordId,
+              message: $workspaceResultError64237.message,
+            });
+            outcome = Result.err($workspaceResultError64237);
+            break;
+          }
+          if ($workspaceResultValue64237.value?.kind !== "workspace") {
+            outcome = Result.err(
+              new MiniLilacHistoryRecordMissing({
+                recordKind: "workspace",
+                recordId: operation.workspaceId,
+                message: "Mini Lilac recovery workspace was not found",
+              }),
+            );
+            break;
+          }
+          navigation.push({
+            canonicalCwd: $workspaceResultValue64237.value.value.canonicalCwd,
+            operation,
+          });
+        }
+      }
+
+      if (outcome === undefined) {
+        const pendingFinalizations: Array<{
+          readonly canonicalCwd: string;
+          readonly finalization: PendingStoredRunFinalization;
+        }> = [];
+        const finalizations = decodeMiniLilacStructuralHistoryRows({
+          kind: "pending-finalization",
+          rows: database
+            .query("SELECT * FROM pending_run_finalizations ORDER BY prepared_at, rowid")
+            .all(),
+          schemaVersion: MINI_LILAC_DATABASE_SCHEMA_VERSION,
+          recordId: "recovery-finalization",
+        });
+        let $finalizationsResultValue65739!: import("better-result").InferOk<
+          NonNullable<typeof finalizations>
+        >;
+        let $finalizationsResultError65739!: import("better-result").InferErr<
+          NonNullable<typeof finalizations>
+        >;
+        const $finalizationsResultOk65739 = Result.match<
+          import("better-result").InferOk<NonNullable<typeof finalizations>>,
+          import("better-result").InferErr<NonNullable<typeof finalizations>>,
+          boolean
+        >(finalizations, {
+          ok: (value) => {
+            $finalizationsResultValue65739 = value;
+            return true;
+          },
+          err: (error) => {
+            $finalizationsResultError65739 = error;
+            return false;
+          },
+        });
+        if (($finalizationsResultOk65739 ? "ok" : "error") === "error") {
+          diagnostics.push({
+            table: $finalizationsResultError65739.table,
+            field: $finalizationsResultError65739.field,
+            version: $finalizationsResultError65739.version,
+            issueCode: $finalizationsResultError65739.issueCode,
+            recordId: $finalizationsResultError65739.recordId,
+            message: $finalizationsResultError65739.message,
+          });
+          outcome = Result.err($finalizationsResultError65739);
+        } else {
+          for (const finalization of $finalizationsResultValue65739.value) {
+            const workspace = decodeMiniLilacStructuralHistoryRow({
+              kind: "workspace",
+              row: database
+                .query("SELECT * FROM workspaces WHERE id = ?")
+                .get(finalization.workspaceId),
+              schemaVersion: MINI_LILAC_DATABASE_SCHEMA_VERSION,
+              recordId: finalization.workspaceId,
+            });
+            let $workspaceResultValue66630!: import("better-result").InferOk<
+              NonNullable<typeof workspace>
+            >;
+            let $workspaceResultError66630!: import("better-result").InferErr<
+              NonNullable<typeof workspace>
+            >;
+            const $workspaceResultOk66630 = Result.match<
+              import("better-result").InferOk<NonNullable<typeof workspace>>,
+              import("better-result").InferErr<NonNullable<typeof workspace>>,
+              boolean
+            >(workspace, {
+              ok: (value) => {
+                $workspaceResultValue66630 = value;
+                return true;
+              },
+              err: (error) => {
+                $workspaceResultError66630 = error;
+                return false;
+              },
+            });
+            if (($workspaceResultOk66630 ? "ok" : "error") === "error") {
+              diagnostics.push({
+                table: $workspaceResultError66630.table,
+                field: $workspaceResultError66630.field,
+                version: $workspaceResultError66630.version,
+                issueCode: $workspaceResultError66630.issueCode,
+                recordId: $workspaceResultError66630.recordId,
+                message: $workspaceResultError66630.message,
+              });
+              outcome = Result.err($workspaceResultError66630);
+              break;
+            }
+            if ($workspaceResultValue66630.value?.kind !== "workspace") {
+              outcome = Result.err(
+                new MiniLilacHistoryRecordMissing({
+                  recordKind: "workspace",
+                  recordId: finalization.workspaceId,
+                  message: "Mini Lilac recovery workspace was not found",
+                }),
+              );
+              break;
+            }
+            pendingFinalizations.push({
+              canonicalCwd: $workspaceResultValue66630.value.value.canonicalCwd,
+              finalization,
+            });
+          }
+        }
+        if (outcome === undefined) outcome = Result.ok({ navigation, pendingFinalizations });
+      }
+    }
+  } catch (cause) {
+    if (Panic.is(cause)) {
+      readDefect = { kind: "panic", cause };
+    } else if (cause instanceof Error) {
+      const failure = classifyMiniLilacSqliteDriverFailure("readHistoryRecovery", cause);
+      if (failure === undefined) readDefect = { kind: "error", cause };
+      else outcome = Result.err(failure);
+    } else {
+      readDefect = { kind: "hostile", cause };
+    }
+  }
+  const closed = captureMiniLilacCleanup(() => closeMiniLilacHistoryRecoveryDatabase(database));
+  if (readDefect !== undefined) {
+    throwPrimaryAfterCleanup(
+      readDefect,
+      "readHistoryRecovery.close",
+      closed,
+      options.onCleanupDefect ?? defaultMiniLilacCleanupDefectReporter,
+    );
+  }
+  for (const diagnostic of diagnostics) {
+    (
+      options.onPersistenceDiagnostic ??
+      ((value) => logger.warn("Mini Lilac persisted data is invalid", value))
+    )(diagnostic);
+  }
+  if (closed.status === "expected-error") return Result.err(closed.error);
+  if (closed.status === "defect") closed.rethrow();
+  if (outcome === undefined) {
+    throw new Panic({
+      message: "Mini Lilac history recovery read completed without an outcome",
+      cause: resolvedFilename,
+    });
+  }
+  return outcome;
 }
 
 export class MiniLilacSqliteStore {
@@ -1715,8 +2413,16 @@ export class MiniLilacSqliteStore {
   readonly filename: string;
   private closeBlockers = 0;
   private closed = false;
+  private transactionDepth = 0;
+  private readonly pendingPersistenceDiagnostics: MiniLilacPersistenceDiagnostic[] = [];
+  private readonly onPersistenceDiagnostic: (diagnostic: MiniLilacPersistenceDiagnostic) => void;
+  private readonly onCleanupDefect: (report: MiniLilacCleanupDefectReport) => void;
 
-  constructor(filename: string) {
+  constructor(filename: string, options: MiniLilacSqliteStoreOptions = {}) {
+    this.onPersistenceDiagnostic =
+      options.onPersistenceDiagnostic ??
+      ((diagnostic) => logger.warn("Mini Lilac persisted data is invalid", diagnostic));
+    this.onCleanupDefect = options.onCleanupDefect ?? defaultMiniLilacCleanupDefectReporter;
     this.filename = filename === ":memory:" ? filename : path.resolve(filename);
     if (this.filename !== ":memory:" && existsSync(this.filename)) {
       if (lstatSync(this.filename).isSymbolicLink()) {
@@ -1728,9 +2434,53 @@ export class MiniLilacSqliteStore {
       this.database.exec("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;");
       this.secureDatabaseFiles();
       this.initializeSchema();
-    } catch (error) {
+    } catch (primary) {
+      let primaryFailure: MiniLilacCaughtDefect;
+      if (Panic.is(primary)) {
+        primaryFailure = { kind: "panic", cause: primary };
+      } else if (primary instanceof Error) {
+        primaryFailure = { kind: "error", cause: primary };
+      } else {
+        primaryFailure = { kind: "hostile", cause: primary };
+      }
+      const cleanup = captureMiniLilacCleanup(() => this.closeAfterInitializationFailure());
+      if (
+        primaryFailure.kind !== "error" ||
+        !isExpectedSchemaInitializationFailure(primaryFailure.cause)
+      ) {
+        throwPrimaryAfterCleanup(
+          primaryFailure,
+          "constructor.closeAfterInitializationFailure",
+          cleanup,
+          this.onCleanupDefect,
+        );
+      }
+      if (cleanup.status === "expected-error") {
+        throw new MiniLilacSchemaInitializationCombinedFailure({
+          operation: "closeAfterInitializationFailure",
+          primary: primaryFailure.cause,
+          cleanup: cleanup.error,
+          message: "Mini Lilac schema initialization and database cleanup both failed",
+        });
+      }
+      if (cleanup.status === "defect") cleanup.rethrow();
+      throw primaryFailure.cause;
+    }
+  }
+
+  private closeAfterInitializationFailure(): ResultType<void, MiniLilacSqliteDriverFailure> {
+    try {
       this.database.close();
-      throw error;
+      return Result.ok(undefined);
+    } catch (cause) {
+      if (Panic.is(cause)) throw cause;
+      if (!(cause instanceof Error)) throw cause;
+      const failure = classifyMiniLilacSqliteDriverFailure(
+        "closeAfterInitializationFailure",
+        cause,
+      );
+      if (failure !== undefined) return Result.err(failure);
+      throw cause;
     }
   }
 
@@ -1747,53 +2497,194 @@ export class MiniLilacSqliteStore {
   }
 
   private initializeSchema(): void {
-    const version = z
-      .object({ user_version: z.number().int() })
-      .parse(this.database.query("PRAGMA user_version").get()).user_version;
-    if (version === MINI_LILAC_DATABASE_SCHEMA_VERSION) return;
-    if (
-      version !== 0 &&
-      version !== 2 &&
-      version !== 3 &&
-      version !== 4 &&
-      version !== 5 &&
-      version !== 6 &&
-      version !== 7
-    ) {
-      throw new MiniLilacDatabaseVersionError(version);
-    }
+    storeResultToLegacy(this.initializeSchemaResult());
+  }
 
-    // Session and run composite ownership require SQLite's documented table
-    // rebuild. These pragmas cannot be changed from inside the transaction.
-    this.database.exec("PRAGMA foreign_keys = OFF; PRAGMA legacy_alter_table = ON;");
+  private initializeSchemaResult(): ResultType<void, MiniLilacSchemaInitializationError> {
     try {
-      this.database.transaction(() => {
-        if (version === 0) {
-          this.createSchemaV6();
+      const decodedVersion = decodeMiniLilacDatabaseVersion(
+        this.database.query("PRAGMA user_version").get(),
+      );
+      let $decodedVersionResultValue72988!: import("better-result").InferOk<
+        NonNullable<typeof decodedVersion>
+      >;
+      let $decodedVersionResultError72988!: import("better-result").InferErr<
+        NonNullable<typeof decodedVersion>
+      >;
+      const $decodedVersionResultOk72988 = Result.match<
+        import("better-result").InferOk<NonNullable<typeof decodedVersion>>,
+        import("better-result").InferErr<NonNullable<typeof decodedVersion>>,
+        boolean
+      >(decodedVersion, {
+        ok: (value) => {
+          $decodedVersionResultValue72988 = value;
+          return true;
+        },
+        err: (error) => {
+          $decodedVersionResultError72988 = error;
+          return false;
+        },
+      });
+      if (($decodedVersionResultOk72988 ? "ok" : "error") === "error")
+        return Result.err($decodedVersionResultError72988);
+      const version = $decodedVersionResultValue72988;
+      if (version === MINI_LILAC_DATABASE_SCHEMA_VERSION) return Result.ok(undefined);
+      if (
+        version !== 0 &&
+        version !== 2 &&
+        version !== 3 &&
+        version !== 4 &&
+        version !== 5 &&
+        version !== 6 &&
+        version !== 7
+      ) {
+        return Result.err(new MiniLilacDatabaseVersionError(version));
+      }
+
+      // Session and run composite ownership require SQLite's documented table
+      // rebuild. These pragmas cannot be changed from inside the transaction.
+      this.database.exec("PRAGMA foreign_keys = OFF; PRAGMA legacy_alter_table = ON;");
+      let migrated: ResultType<
+        void,
+        MiniLilacSchemaMigrationFailure | MiniLilacSqliteDriverFailure | PersistedDataError
+      >;
+      let migrationDefect: MiniLilacCaughtDefect | undefined;
+      try {
+        migrated = runBunSqliteTransaction(
+          this.database,
+          () => {
+            if (version === 0) {
+              this.createSchemaV6();
+            } else {
+              if (version === 2) {
+                const migration = this.migrateSchemaV2ToV3();
+                const migrationError = migration.match({ ok: () => null, err: (error) => error });
+                if (migrationError !== null) return Result.err(migrationError);
+              }
+              if (version === 2 || version === 3) this.migrateSchemaV3ToV4();
+              if (version === 2 || version === 3 || version === 4) {
+                const migration = this.migrateSchemaV4ToV5();
+                const migrationError = migration.match({ ok: () => null, err: (error) => error });
+                if (migrationError !== null) return Result.err(migrationError);
+              }
+              if (version === 5) this.migrateSchemaV5ToV6();
+            }
+            if (version <= 6) this.migrateSchemaV6ToV7();
+            this.migrateSchemaV7ToV8();
+            const violations = this.database.query("PRAGMA foreign_key_check").all();
+            if (violations.length > 0) {
+              return Result.err(
+                new MiniLilacSchemaMigrationFailure({
+                  operation: "initializeSchema",
+                  message: `Mini Lilac schema migration left ${violations.length} foreign key violation(s)`,
+                }),
+              );
+            }
+            this.database.exec(`PRAGMA user_version = ${MINI_LILAC_DATABASE_SCHEMA_VERSION};`);
+            return Result.ok(undefined);
+          },
+          (cause) => classifyMiniLilacSqliteDriverFailure("initializeSchema", cause),
+        );
+      } catch (cause) {
+        if (cause instanceof z.ZodError) {
+          migrated = Result.err(
+            new MiniLilacSchemaMigrationFailure({
+              operation: "initializeSchema",
+              message: "Mini Lilac schema migration encountered corrupt structural fields",
+            }),
+          );
+        } else if (
+          cause instanceof MiniLilacSchemaMigrationFailure ||
+          cause instanceof MiniLilacSqliteDriverFailure ||
+          cause instanceof CorruptPersistedFields ||
+          cause instanceof MalformedSerialization ||
+          cause instanceof UnsupportedVersion
+        ) {
+          migrated = Result.err(cause);
         } else {
-          if (version === 2) this.migrateSchemaV2ToV3();
-          if (version === 2 || version === 3) this.migrateSchemaV3ToV4();
-          if (version === 2 || version === 3 || version === 4) this.migrateSchemaV4ToV5();
-          if (version === 5) this.migrateSchemaV5ToV6();
+          if (Panic.is(cause)) {
+            migrationDefect = { kind: "panic", cause };
+          } else if (cause instanceof Error) {
+            migrationDefect = { kind: "error", cause };
+          } else {
+            migrationDefect = { kind: "hostile", cause };
+          }
+          migrated = Result.ok(undefined);
         }
-        if (version <= 6) this.migrateSchemaV6ToV7();
-        this.migrateSchemaV7ToV8();
-        const violations = this.database.query("PRAGMA foreign_key_check").all();
-        if (violations.length > 0) {
-          throw new Error(
-            `Mini Lilac schema migration to v${MINI_LILAC_DATABASE_SCHEMA_VERSION} left ${violations.length} foreign key violation(s)`,
+      }
+      const migrationError = migrated.match({ ok: () => null, err: (error) => error });
+      const cleanup = captureMiniLilacCleanup(() => this.restoreSchemaMigrationPragmas());
+      if (migrationDefect !== undefined) {
+        throwPrimaryAfterCleanup(
+          migrationDefect,
+          "initializeSchema.restorePragmas",
+          cleanup,
+          this.onCleanupDefect,
+        );
+      }
+      if (cleanup.status === "expected-error") {
+        if (migrationError !== null) {
+          return Result.err(
+            new MiniLilacSchemaInitializationCombinedFailure({
+              operation: "initializeSchema",
+              primary: migrationError,
+              cleanup: cleanup.error,
+              message: "Mini Lilac schema migration and cleanup both failed",
+            }),
           );
         }
-        this.database.exec(`PRAGMA user_version = ${MINI_LILAC_DATABASE_SCHEMA_VERSION};`);
-      })();
-    } finally {
-      this.database.exec("PRAGMA legacy_alter_table = OFF; PRAGMA foreign_keys = ON;");
+        return Result.err(cleanup.error);
+      }
+      if (cleanup.status === "defect") cleanup.rethrow();
+      if (migrationError !== null) return Result.err(migrationError);
+      const violations = this.database.query("PRAGMA foreign_key_check").all();
+      if (violations.length > 0) {
+        return Result.err(
+          new MiniLilacSchemaMigrationFailure({
+            operation: "initializeSchema",
+            message: `Mini Lilac migrated schema has ${violations.length} foreign key violation(s)`,
+          }),
+        );
+      }
+      return Result.ok(undefined);
+    } catch (cause) {
+      if (Panic.is(cause)) throw cause;
+      if (
+        cause instanceof MiniLilacDatabaseVersionError ||
+        cause instanceof CorruptPersistedFields ||
+        cause instanceof MalformedSerialization ||
+        cause instanceof UnsupportedVersion ||
+        cause instanceof MiniLilacSchemaMigrationFailure ||
+        cause instanceof MiniLilacSqliteDriverFailure ||
+        cause instanceof MiniLilacSchemaInitializationCombinedFailure
+      ) {
+        return Result.err(cause);
+      }
+      if (cause instanceof z.ZodError) {
+        return Result.err(
+          new MiniLilacSchemaMigrationFailure({
+            operation: "initializeSchema",
+            message: "Mini Lilac schema migration encountered corrupt structural fields",
+          }),
+        );
+      }
+      if (!(cause instanceof Error)) throw cause;
+      const driverFailure = classifyMiniLilacSqliteDriverFailure("initializeSchema", cause);
+      if (driverFailure !== undefined) return Result.err(driverFailure);
+      throw cause;
     }
-    const violations = this.database.query("PRAGMA foreign_key_check").all();
-    if (violations.length > 0) {
-      throw new Error(
-        `Mini Lilac schema migration to v${MINI_LILAC_DATABASE_SCHEMA_VERSION} left ${violations.length} foreign key violation(s)`,
-      );
+  }
+
+  private restoreSchemaMigrationPragmas(): ResultType<void, MiniLilacSqliteDriverFailure> {
+    try {
+      this.database.exec("PRAGMA legacy_alter_table = OFF; PRAGMA foreign_keys = ON;");
+      return Result.ok(undefined);
+    } catch (cause) {
+      if (Panic.is(cause)) throw cause;
+      if (!(cause instanceof Error)) throw cause;
+      const failure = classifyMiniLilacSqliteDriverFailure("initializeSchema.cleanup", cause);
+      if (failure !== undefined) return Result.err(failure);
+      throw cause;
     }
   }
 
@@ -2322,16 +3213,51 @@ export class MiniLilacSqliteStore {
     `);
   }
 
-  private migrateSchemaV4ToV5(): void {
+  private migrateSchemaV4ToV5(): ResultType<
+    void,
+    MiniLilacSchemaMigrationFailure | PersistedDataError
+  > {
     const existingViolations = this.database.query("PRAGMA foreign_key_check").all();
     if (existingViolations.length > 0) {
-      throw new Error(
-        `Mini Lilac v4 database has ${existingViolations.length} structural foreign key violation(s)`,
+      return Result.err(
+        new MiniLilacSchemaMigrationFailure({
+          operation: "migrateSchemaV4ToV5",
+          message: `Mini Lilac v4 database has ${existingViolations.length} structural foreign key violation(s)`,
+        }),
       );
     }
-    const sessions = z
-      .array(migrationSessionRowSchema)
-      .parse(this.database.query("SELECT * FROM sessions ORDER BY rowid").all());
+    const rehashed = this.rehashTranscriptNodesForMigration();
+    const rehashError = rehashed.match({ ok: () => null, err: (error) => error });
+    if (rehashError !== null) return Result.err(rehashError);
+    const decodedSessions = decodeMiniLilacStoreRows({
+      kind: "migration-session",
+      rows: this.database.query("SELECT * FROM sessions ORDER BY rowid").all(),
+      schemaVersion: 4,
+      recordId: "v4-sessions",
+    });
+    let $decodedSessionsResultValue105674!: import("better-result").InferOk<
+      NonNullable<typeof decodedSessions>
+    >;
+    let $decodedSessionsResultError105674!: import("better-result").InferErr<
+      NonNullable<typeof decodedSessions>
+    >;
+    const $decodedSessionsResultOk105674 = Result.match<
+      import("better-result").InferOk<NonNullable<typeof decodedSessions>>,
+      import("better-result").InferErr<NonNullable<typeof decodedSessions>>,
+      boolean
+    >(decodedSessions, {
+      ok: (value) => {
+        $decodedSessionsResultValue105674 = value;
+        return true;
+      },
+      err: (error) => {
+        $decodedSessionsResultError105674 = error;
+        return false;
+      },
+    });
+    if (($decodedSessionsResultOk105674 ? "ok" : "error") === "error")
+      return Result.err($decodedSessionsResultError105674);
+    const sessions = $decodedSessionsResultValue105674.value;
     const now = new Date().toISOString();
     this.database.exec(`
       CREATE TABLE history_store_metadata (
@@ -2396,8 +3322,14 @@ export class MiniLilacSqliteStore {
     for (const session of sessions) {
       const canonicalCwd = canonicalizeStoredCwd(session.cwd);
       const workspaceId = workspaceIds.get(canonicalCwd);
-      if (workspaceId === undefined)
-        throw new Error(`Workspace for '${canonicalCwd}' was not created`);
+      if (workspaceId === undefined) {
+        return Result.err(
+          new MiniLilacSchemaMigrationFailure({
+            operation: "migrateSchemaV4ToV5",
+            message: `Workspace for '${canonicalCwd}' was not created`,
+          }),
+        );
+      }
       insertSession.run(
         session.id,
         session.active_run_id,
@@ -2446,73 +3378,314 @@ export class MiniLilacSqliteStore {
       CREATE UNIQUE INDEX one_active_root_run_per_session
         ON runs(session_id) WHERE status = 'active' AND parent_run_id IS NULL;
     `);
-    const workspaceMismatchCount = z.object({ count: z.number().int().nonnegative() }).parse(
-      this.database
+    const decodedWorkspaceMismatchCount = decodeRequiredMiniLilacStoreRow({
+      kind: "count",
+      row: this.database
         .query(
           `SELECT COUNT(*) AS count FROM sessions
              JOIN workspaces ON workspaces.id = sessions.workspace_id
              WHERE sessions.cwd <> workspaces.canonical_cwd`,
         )
         .get(),
-    ).count;
+      schemaVersion: 4,
+      recordId: "v4-workspace-mismatch-count",
+    });
+    let $decodedWorkspaceMismatchCountResultValue110684!: import("better-result").InferOk<
+      NonNullable<typeof decodedWorkspaceMismatchCount>
+    >;
+    let $decodedWorkspaceMismatchCountResultError110684!: import("better-result").InferErr<
+      NonNullable<typeof decodedWorkspaceMismatchCount>
+    >;
+    const $decodedWorkspaceMismatchCountResultOk110684 = Result.match(
+      decodedWorkspaceMismatchCount,
+      {
+        ok: (value) => {
+          $decodedWorkspaceMismatchCountResultValue110684 = value;
+          return true;
+        },
+        err: (error) => {
+          $decodedWorkspaceMismatchCountResultError110684 = error;
+          return false;
+        },
+      },
+    );
+    if (($decodedWorkspaceMismatchCountResultOk110684 ? "ok" : "error") === "error") {
+      if (
+        $decodedWorkspaceMismatchCountResultError110684._tag === "MiniLilacHistoryRecordMissing"
+      ) {
+        return Result.err(
+          new MiniLilacSchemaMigrationFailure({
+            operation: "migrateSchemaV4ToV5",
+            message: "Mini Lilac v4 migration workspace mismatch count was not returned",
+          }),
+        );
+      }
+      return Result.err($decodedWorkspaceMismatchCountResultError110684);
+    }
+    const workspaceMismatchCount = $decodedWorkspaceMismatchCountResultValue110684.count;
     if (workspaceMismatchCount > 0) {
-      throw new Error(
-        `Mini Lilac v4 migration produced ${workspaceMismatchCount} workspace mismatch(es)`,
+      return Result.err(
+        new MiniLilacSchemaMigrationFailure({
+          operation: "migrateSchemaV4ToV5",
+          message: `Mini Lilac v4 migration produced ${workspaceMismatchCount} workspace mismatch(es)`,
+        }),
       );
     }
     this.createHistorySchemaTables();
-    for (const session of sessions) this.migrateSessionHistoryV4(session.id);
+    for (const session of sessions) {
+      const migrated = this.migrateSessionHistoryV4(session.id);
+      const migrationError = migrated.match({ ok: () => null, err: (error) => error });
+      if (migrationError !== null) return Result.err(migrationError);
+    }
     this.database.exec("DROP TABLE user_checkpoints;");
+    return Result.ok(undefined);
   }
 
-  private migrateSessionHistoryV4(sessionId: string): void {
-    const session = z
-      .object({
-        id: z.string(),
-        workspace_id: z.string(),
-        active_run_id: z.string().nullable(),
-        status: sessionStatusSchema,
-        created_at: z.string(),
-        updated_at: z.string(),
-      })
-      .parse(
-        this.database
-          .query(
-            `SELECT id, workspace_id, active_run_id, status, created_at, updated_at
+  private rehashTranscriptNodesForMigration(): ResultType<
+    void,
+    PersistedDataError | MiniLilacSchemaMigrationFailure
+  > {
+    const decodedRows = decodeMiniLilacMigrationTranscriptRows({
+      schemaVersion: MINI_LILAC_DATABASE_SCHEMA_VERSION,
+      recordId: "v4-transcript-migration",
+      rows: this.database
+        .query(
+          `SELECT id, session_id AS sessionId, lane, parent_id AS parentId, depth,
+                  value_json AS valueJson, hash
+           FROM transcript_nodes ORDER BY session_id, lane, depth, id`,
+        )
+        .all(),
+    });
+    let $decodedRowsResultValue112380!: import("better-result").InferOk<
+      NonNullable<typeof decodedRows>
+    >;
+    let $decodedRowsResultError112380!: import("better-result").InferErr<
+      NonNullable<typeof decodedRows>
+    >;
+    const $decodedRowsResultOk112380 = Result.match<
+      import("better-result").InferOk<NonNullable<typeof decodedRows>>,
+      import("better-result").InferErr<NonNullable<typeof decodedRows>>,
+      boolean
+    >(decodedRows, {
+      ok: (value) => {
+        $decodedRowsResultValue112380 = value;
+        return true;
+      },
+      err: (error) => {
+        $decodedRowsResultError112380 = error;
+        return false;
+      },
+    });
+    if (($decodedRowsResultOk112380 ? "ok" : "error") === "error")
+      return Result.err($decodedRowsResultError112380);
+    const rows = $decodedRowsResultValue112380.value;
+    const migrationNonce = randomUUID();
+    const updateHash = this.database.query("UPDATE transcript_nodes SET hash = ? WHERE id = ?");
+    for (const row of rows) updateHash.run(`${migrationNonce}:${row.id}`, row.id);
+
+    const migrated = new Map<
+      number,
+      {
+        readonly sessionId: string;
+        readonly lane: "model" | "ui";
+        readonly depth: number;
+        readonly hash: string;
+      }
+    >();
+    for (const row of rows) {
+      const parent = row.parentId === null ? null : migrated.get(row.parentId);
+      if (
+        (row.parentId !== null && parent === undefined) ||
+        (parent !== null &&
+          parent !== undefined &&
+          (parent.sessionId !== row.sessionId ||
+            parent.lane !== row.lane ||
+            row.depth !== parent.depth + 1)) ||
+        (parent === null && row.depth !== 1)
+      ) {
+        return Result.err(
+          new MiniLilacSchemaMigrationFailure({
+            operation: "rehashTranscriptNodesForMigration",
+            message: `Mini Lilac legacy transcript '${row.sessionId}' lane '${row.lane}' has an invalid parent`,
+          }),
+        );
+      }
+      const hash = new Bun.CryptoHasher("sha256")
+        .update(parent?.hash ?? "root")
+        .update("\0")
+        .update(row.valueJson)
+        .digest("hex");
+      updateHash.run(hash, row.id);
+      migrated.set(row.id, {
+        sessionId: row.sessionId,
+        lane: row.lane,
+        depth: row.depth,
+        hash,
+      });
+    }
+    return Result.ok(undefined);
+  }
+
+  private migrateSessionHistoryV4(
+    sessionId: string,
+  ): ResultType<void, MiniLilacSchemaMigrationFailure | PersistedDataError> {
+    const decodedSession = decodeRequiredMiniLilacStoreRow({
+      kind: "migration-history-session",
+      row: this.database
+        .query(
+          `SELECT id, workspace_id, active_run_id, status, created_at, updated_at
              FROM sessions WHERE id = ?`,
-          )
-          .get(sessionId),
-      );
+        )
+        .get(sessionId),
+      schemaVersion: 4,
+      recordId: sessionId,
+    });
+    let $decodedSessionResultValue114608!: import("better-result").InferOk<
+      NonNullable<typeof decodedSession>
+    >;
+    let $decodedSessionResultError114608!: import("better-result").InferErr<
+      NonNullable<typeof decodedSession>
+    >;
+    const $decodedSessionResultOk114608 = Result.match<
+      import("better-result").InferOk<NonNullable<typeof decodedSession>>,
+      import("better-result").InferErr<NonNullable<typeof decodedSession>>,
+      boolean
+    >(decodedSession, {
+      ok: (value) => {
+        $decodedSessionResultValue114608 = value;
+        return true;
+      },
+      err: (error) => {
+        $decodedSessionResultError114608 = error;
+        return false;
+      },
+    });
+    if (($decodedSessionResultOk114608 ? "ok" : "error") === "error") {
+      if ($decodedSessionResultError114608._tag === "MiniLilacHistoryRecordMissing") {
+        return Result.err(
+          new MiniLilacSchemaMigrationFailure({
+            operation: "migrateSessionHistoryV4",
+            message: `Mini Lilac v4 session '${sessionId}' disappeared during migration`,
+          }),
+        );
+      }
+      return Result.err($decodedSessionResultError114608);
+    }
+    const session = $decodedSessionResultValue114608;
     let currentHeads = this.getTranscriptHeads(sessionId);
-    modelMessagesSchema.parse(
-      this.readSerializedChain(sessionId, "model", currentHeads.model_head_id).map(deserialize),
-    );
-    const migratedCurrentUi = parseMigratedUiMessages(
-      this.readSerializedChain(sessionId, "ui", currentHeads.ui_head_id).map(deserialize),
-    );
+    const currentModel = decodeMiniLilacModelTranscript({
+      rawValues: this.readSerializedChain(sessionId, "model", currentHeads.model_head_id),
+      schemaVersion: 4,
+      recordId: sessionId,
+    });
+    const currentModelError = Result.match(currentModel, {
+      ok: () => null,
+      err: (error) => error,
+    });
+    if (currentModelError !== null) return Result.err(currentModelError);
+    const decodedCurrentUi = decodeMiniLilacMigrationUiTranscript({
+      rawValues: this.readSerializedChain(sessionId, "ui", currentHeads.ui_head_id),
+      schemaVersion: 4,
+      recordId: sessionId,
+    });
+    let $decodedCurrentUiResultValue115779!: import("better-result").InferOk<
+      NonNullable<typeof decodedCurrentUi>
+    >;
+    let $decodedCurrentUiResultError115779!: import("better-result").InferErr<
+      NonNullable<typeof decodedCurrentUi>
+    >;
+    const $decodedCurrentUiResultOk115779 = Result.match<
+      import("better-result").InferOk<NonNullable<typeof decodedCurrentUi>>,
+      import("better-result").InferErr<NonNullable<typeof decodedCurrentUi>>,
+      boolean
+    >(decodedCurrentUi, {
+      ok: (value) => {
+        $decodedCurrentUiResultValue115779 = value;
+        return true;
+      },
+      err: (error) => {
+        $decodedCurrentUiResultError115779 = error;
+        return false;
+      },
+    });
+    if (($decodedCurrentUiResultOk115779 ? "ok" : "error") === "error")
+      return Result.err($decodedCurrentUiResultError115779);
+    const migratedCurrentUi = $decodedCurrentUiResultValue115779.value;
     const currentUi = migratedCurrentUi.messages;
     if (migratedCurrentUi.changed) {
-      const uiHeadId = this.internChain(sessionId, "ui", currentUi);
+      const uiHeadId = this.internChain(sessionId, "ui", currentUi, false);
       this.setTranscriptHeads(sessionId, currentHeads.model_head_id, uiHeadId);
       currentHeads = { ...currentHeads, ui_head_id: uiHeadId };
     }
-    const checkpoints = z.array(migrationCheckpointRowSchema).parse(
-      this.database
+    const decodedCheckpoints = decodeMiniLilacStoreRows({
+      kind: "migration-checkpoint",
+      rows: this.database
         .query(
           `SELECT session_id, ui_position, user_message_json, model_head_id, ui_head_id,
                     root_run_id, replay_after_seq
              FROM user_checkpoints WHERE session_id = ? ORDER BY ui_position`,
         )
         .all(sessionId),
-    );
-    const activeRootRuns = z.array(migrationRunRowSchema).parse(
-      this.database
+      schemaVersion: 4,
+      recordId: `${sessionId}:checkpoints`,
+    });
+    let $decodedCheckpointsResultValue116452!: import("better-result").InferOk<
+      NonNullable<typeof decodedCheckpoints>
+    >;
+    let $decodedCheckpointsResultError116452!: import("better-result").InferErr<
+      NonNullable<typeof decodedCheckpoints>
+    >;
+    const $decodedCheckpointsResultOk116452 = Result.match<
+      import("better-result").InferOk<NonNullable<typeof decodedCheckpoints>>,
+      import("better-result").InferErr<NonNullable<typeof decodedCheckpoints>>,
+      boolean
+    >(decodedCheckpoints, {
+      ok: (value) => {
+        $decodedCheckpointsResultValue116452 = value;
+        return true;
+      },
+      err: (error) => {
+        $decodedCheckpointsResultError116452 = error;
+        return false;
+      },
+    });
+    if (($decodedCheckpointsResultOk116452 ? "ok" : "error") === "error")
+      return Result.err($decodedCheckpointsResultError116452);
+    const checkpoints = $decodedCheckpointsResultValue116452.value;
+    const decodedActiveRootRuns = decodeMiniLilacStoreRows({
+      kind: "migration-run",
+      rows: this.database
         .query(
           `SELECT id, status, parent_run_id FROM runs
              WHERE session_id = ? AND parent_run_id IS NULL AND status = 'active'`,
         )
         .all(sessionId),
-    );
+      schemaVersion: 4,
+      recordId: `${sessionId}:active-root-runs`,
+    });
+    let $decodedActiveRootRunsResultValue117065!: import("better-result").InferOk<
+      NonNullable<typeof decodedActiveRootRuns>
+    >;
+    let $decodedActiveRootRunsResultError117065!: import("better-result").InferErr<
+      NonNullable<typeof decodedActiveRootRuns>
+    >;
+    const $decodedActiveRootRunsResultOk117065 = Result.match<
+      import("better-result").InferOk<NonNullable<typeof decodedActiveRootRuns>>,
+      import("better-result").InferErr<NonNullable<typeof decodedActiveRootRuns>>,
+      boolean
+    >(decodedActiveRootRuns, {
+      ok: (value) => {
+        $decodedActiveRootRunsResultValue117065 = value;
+        return true;
+      },
+      err: (error) => {
+        $decodedActiveRootRunsResultError117065 = error;
+        return false;
+      },
+    });
+    if (($decodedActiveRootRunsResultOk117065 ? "ok" : "error") === "error")
+      return Result.err($decodedActiveRootRunsResultError117065);
+    const activeRootRuns = $decodedActiveRootRunsResultValue117065.value;
     const hasActiveLifecycle = session.active_run_id !== null;
     if (
       (hasActiveLifecycle &&
@@ -2522,36 +3695,132 @@ export class MiniLilacSqliteStore {
       (!hasActiveLifecycle && activeRootRuns.length > 0) ||
       (!hasActiveLifecycle && ["streaming", "cancelling"].includes(session.status))
     ) {
-      throw new Error(`Session '${sessionId}' has an invalid active root run during v4 migration`);
+      return Result.err(
+        new MiniLilacSchemaMigrationFailure({
+          operation: "migrateSessionHistoryV4",
+          message: `Session '${sessionId}' has an invalid active root run during v4 migration`,
+        }),
+      );
     }
 
-    const parsedCheckpoints = checkpoints.map((checkpoint) => {
-      const run = migrationRunRowSchema.parse(
-        this.database
+    const parsedCheckpoints: Array<{
+      readonly row: z.output<typeof migrationCheckpointRowSchema>;
+      readonly run: MiniLilacMigrationRunRowProjection;
+      readonly message: MiniLilacUserUIMessage;
+      readonly uiPrefix: MiniLilacUIMessage[];
+    }> = [];
+    for (const checkpoint of checkpoints) {
+      const decodedRun = decodeMiniLilacMigrationRunRow({
+        row: this.database
           .query("SELECT id, status, parent_run_id FROM runs WHERE id = ? AND session_id = ?")
           .get(checkpoint.root_run_id, sessionId),
-      );
-      if (run.parent_run_id !== null) {
-        throw new Error(
-          `Checkpoint ${checkpoint.ui_position} for session '${sessionId}' references a child run`,
+        recordId: checkpoint.root_run_id,
+      });
+      let $decodedRunResultValue118591!: import("better-result").InferOk<
+        NonNullable<typeof decodedRun>
+      >;
+      let $decodedRunResultError118591!: import("better-result").InferErr<
+        NonNullable<typeof decodedRun>
+      >;
+      const $decodedRunResultOk118591 = Result.match<
+        import("better-result").InferOk<NonNullable<typeof decodedRun>>,
+        import("better-result").InferErr<NonNullable<typeof decodedRun>>,
+        boolean
+      >(decodedRun, {
+        ok: (value) => {
+          $decodedRunResultValue118591 = value;
+          return true;
+        },
+        err: (error) => {
+          $decodedRunResultError118591 = error;
+          return false;
+        },
+      });
+      if (($decodedRunResultOk118591 ? "ok" : "error") === "error")
+        return Result.err($decodedRunResultError118591);
+      if ($decodedRunResultValue118591.parent_run_id !== null) {
+        return Result.err(
+          new MiniLilacSchemaMigrationFailure({
+            operation: "migrateSessionHistoryV4",
+            message: `Checkpoint ${checkpoint.ui_position} for session '${sessionId}' references a child run`,
+          }),
         );
       }
-      modelMessagesSchema.parse(
-        this.readSerializedChain(sessionId, "model", checkpoint.model_head_id).map(deserialize),
-      );
-      const migratedUiPrefix = parseMigratedUiMessages(
-        this.readSerializedChain(sessionId, "ui", checkpoint.ui_head_id).map(deserialize),
-      );
+      const modelPrefix = decodeMiniLilacModelTranscript({
+        rawValues: this.readSerializedChain(sessionId, "model", checkpoint.model_head_id),
+        schemaVersion: 4,
+        recordId: `${sessionId}:${checkpoint.ui_position}:model`,
+      });
+      const modelPrefixError = Result.match(modelPrefix, {
+        ok: () => null,
+        err: (error) => error,
+      });
+      if (modelPrefixError !== null) return Result.err(modelPrefixError);
+      const decodedUiPrefix = decodeMiniLilacMigrationUiTranscript({
+        rawValues: this.readSerializedChain(sessionId, "ui", checkpoint.ui_head_id),
+        schemaVersion: 4,
+        recordId: `${sessionId}:${checkpoint.ui_position}:ui`,
+      });
+      let $decodedUiPrefixResultValue119606!: import("better-result").InferOk<
+        NonNullable<typeof decodedUiPrefix>
+      >;
+      let $decodedUiPrefixResultError119606!: import("better-result").InferErr<
+        NonNullable<typeof decodedUiPrefix>
+      >;
+      const $decodedUiPrefixResultOk119606 = Result.match<
+        import("better-result").InferOk<NonNullable<typeof decodedUiPrefix>>,
+        import("better-result").InferErr<NonNullable<typeof decodedUiPrefix>>,
+        boolean
+      >(decodedUiPrefix, {
+        ok: (value) => {
+          $decodedUiPrefixResultValue119606 = value;
+          return true;
+        },
+        err: (error) => {
+          $decodedUiPrefixResultError119606 = error;
+          return false;
+        },
+      });
+      if (($decodedUiPrefixResultOk119606 ? "ok" : "error") === "error")
+        return Result.err($decodedUiPrefixResultError119606);
+      const migratedUiPrefix = $decodedUiPrefixResultValue119606.value;
       const uiHeadId = migratedUiPrefix.changed
-        ? this.internChain(sessionId, "ui", migratedUiPrefix.messages)
+        ? this.internChain(sessionId, "ui", migratedUiPrefix.messages, false)
         : checkpoint.ui_head_id;
-      return {
+      const decodedMessage = decodeMiniLilacMigrationUserUiMessage({
+        raw: checkpoint.user_message_json,
+        schemaVersion: 4,
+        recordId: `${sessionId}:${checkpoint.ui_position}:user`,
+      });
+      let $decodedMessageResultValue120166!: import("better-result").InferOk<
+        NonNullable<typeof decodedMessage>
+      >;
+      let $decodedMessageResultError120166!: import("better-result").InferErr<
+        NonNullable<typeof decodedMessage>
+      >;
+      const $decodedMessageResultOk120166 = Result.match<
+        import("better-result").InferOk<NonNullable<typeof decodedMessage>>,
+        import("better-result").InferErr<NonNullable<typeof decodedMessage>>,
+        boolean
+      >(decodedMessage, {
+        ok: (value) => {
+          $decodedMessageResultValue120166 = value;
+          return true;
+        },
+        err: (error) => {
+          $decodedMessageResultError120166 = error;
+          return false;
+        },
+      });
+      if (($decodedMessageResultOk120166 ? "ok" : "error") === "error")
+        return Result.err($decodedMessageResultError120166);
+      parsedCheckpoints.push({
         row: { ...checkpoint, ui_head_id: uiHeadId },
-        run,
-        message: parseMigratedUserUiMessage(deserialize(checkpoint.user_message_json)),
+        run: $decodedRunResultValue118591,
+        message: $decodedMessageResultValue120166.value,
         uiPrefix: migratedUiPrefix.messages,
-      };
-    });
+      });
+    }
     if (hasActiveLifecycle) {
       const activeCheckpointIndex = parsedCheckpoints.findIndex(
         (checkpoint) => checkpoint.run.id === session.active_run_id,
@@ -2567,7 +3836,12 @@ export class MiniLilacSqliteStore {
           .slice(0, activeCheckpointIndex)
           .some((checkpoint) => checkpoint.run.status === "active")
       ) {
-        throw new Error(`Session '${sessionId}' cannot recover its active run from v4 checkpoints`);
+        return Result.err(
+          new MiniLilacSchemaMigrationFailure({
+            operation: "migrateSessionHistoryV4",
+            message: `Session '${sessionId}' cannot recover its active run from v4 checkpoints`,
+          }),
+        );
       }
     }
 
@@ -2595,8 +3869,11 @@ export class MiniLilacSqliteStore {
 
     if (!orderingIsLinear) {
       if (hasActiveLifecycle || !["idle", "error", "compacting"].includes(session.status)) {
-        throw new Error(
-          `Session '${sessionId}' has unusual checkpoint ordering while its run is active`,
+        return Result.err(
+          new MiniLilacSchemaMigrationFailure({
+            operation: "migrateSessionHistoryV4",
+            message: `Session '${sessionId}' has unusual checkpoint ordering while its run is active`,
+          }),
         );
       }
       console.warn(
@@ -2604,22 +3881,32 @@ export class MiniLilacSqliteStore {
           "preserved its readable transcript as a single migration state with undo disabled",
       );
       this.insertMigratedSingleState(session, currentHeads);
-      return;
+      return Result.ok(undefined);
     }
 
     if (parsedCheckpoints.length === 0) {
       if (hasActiveLifecycle) {
-        throw new Error(`Session '${sessionId}' has an active run without a v4 checkpoint`);
+        return Result.err(
+          new MiniLilacSchemaMigrationFailure({
+            operation: "migrateSessionHistoryV4",
+            message: `Session '${sessionId}' has an active run without a v4 checkpoint`,
+          }),
+        );
       }
       this.insertMigratedSingleState(session, currentHeads);
-      return;
+      return Result.ok(undefined);
     }
 
     const stateIds = parsedCheckpoints.map(() => randomUUID());
     for (const [index, checkpoint] of parsedCheckpoints.entries()) {
       const stateId = stateIds[index];
       if (stateId === undefined) {
-        throw new Error(`Session '${sessionId}' history migration lost checkpoint state ${index}`);
+        return Result.err(
+          new MiniLilacSchemaMigrationFailure({
+            operation: "migrateSessionHistoryV4",
+            message: `Session '${sessionId}' history migration lost checkpoint state ${index}`,
+          }),
+        );
       }
       this.insertHistoryStateRow({
         id: stateId,
@@ -2665,7 +3952,12 @@ export class MiniLilacSqliteStore {
       const fromStateId = stateIds[index];
       const toStateId = isLast ? finalStateId : stateIds[index + 1];
       if (fromStateId === undefined || toStateId === undefined) {
-        throw new Error(`Session '${sessionId}' history migration produced an incomplete edge`);
+        return Result.err(
+          new MiniLilacSchemaMigrationFailure({
+            operation: "migrateSessionHistoryV4",
+            message: `Session '${sessionId}' history migration produced an incomplete edge`,
+          }),
+        );
       }
       insertTransition.run(
         randomUUID(),
@@ -2683,7 +3975,12 @@ export class MiniLilacSqliteStore {
     const rootStateId = stateIds[0];
     const currentStateId = finalIsOpen ? stateIds.at(-1) : finalStateId;
     if (rootStateId === undefined || currentStateId === undefined || currentStateId === null) {
-      throw new Error(`Session '${sessionId}' history migration did not produce a cursor`);
+      return Result.err(
+        new MiniLilacSchemaMigrationFailure({
+          operation: "migrateSessionHistoryV4",
+          message: `Session '${sessionId}' history migration did not produce a cursor`,
+        }),
+      );
     }
     this.database
       .query(
@@ -2693,6 +3990,7 @@ export class MiniLilacSqliteStore {
       )
       .run(sessionId, rootStateId, currentStateId, rootStateId, session.updated_at);
     this.assertStateConnectedToRoot(sessionId, currentStateId);
+    return Result.ok(undefined);
   }
 
   private insertMigratedSingleState(
@@ -2760,7 +4058,7 @@ export class MiniLilacSqliteStore {
     `);
   }
 
-  private migrateSchemaV2ToV3(): void {
+  private migrateSchemaV2ToV3(): ResultType<void, PersistedDataError> {
     this.database.exec(`
       CREATE TABLE transcript_nodes (
         id INTEGER PRIMARY KEY,
@@ -2805,24 +4103,140 @@ export class MiniLilacSqliteStore {
       );
     `);
 
-    const sessionIds = z
-      .array(z.object({ id: z.string() }))
-      .parse(this.database.query("SELECT id FROM sessions ORDER BY rowid").all());
+    const decodedSessionIds = decodeMiniLilacStoreRows({
+      kind: "id",
+      rows: this.database.query("SELECT id FROM sessions ORDER BY rowid").all(),
+      schemaVersion: 2,
+      recordId: "v2-sessions",
+    });
+    let $decodedSessionIdsResultValue132013!: import("better-result").InferOk<
+      NonNullable<typeof decodedSessionIds>
+    >;
+    let $decodedSessionIdsResultError132013!: import("better-result").InferErr<
+      NonNullable<typeof decodedSessionIds>
+    >;
+    const $decodedSessionIdsResultOk132013 = Result.match<
+      import("better-result").InferOk<NonNullable<typeof decodedSessionIds>>,
+      import("better-result").InferErr<NonNullable<typeof decodedSessionIds>>,
+      boolean
+    >(decodedSessionIds, {
+      ok: (value) => {
+        $decodedSessionIdsResultValue132013 = value;
+        return true;
+      },
+      err: (error) => {
+        $decodedSessionIdsResultError132013 = error;
+        return false;
+      },
+    });
+    if (($decodedSessionIdsResultOk132013 ? "ok" : "error") === "error")
+      return Result.err($decodedSessionIdsResultError132013);
+    const sessionIds = $decodedSessionIdsResultValue132013.value;
     for (const { id: sessionId } of sessionIds) {
-      const modelValues = this.database
-        .query(
-          "SELECT session_id, position, value_json FROM model_transcript WHERE session_id = ? ORDER BY position",
-        )
-        .all(sessionId)
-        .map((value) => legacyPositionedJsonRowSchema.parse(value).value_json);
-      const uiValues = this.database
-        .query(
-          "SELECT session_id, position, value_json FROM ui_messages WHERE session_id = ? ORDER BY position",
-        )
-        .all(sessionId)
-        .map((value) => legacyPositionedJsonRowSchema.parse(value).value_json);
-      modelMessagesSchema.parse(modelValues.map(deserialize));
-      const migratedUi = parseMigratedUiMessages(uiValues.map(deserialize));
+      const decodedModelRows = decodeMiniLilacStoreRows({
+        kind: "legacy-positioned-json",
+        rows: this.database
+          .query(
+            "SELECT session_id, position, value_json FROM model_transcript WHERE session_id = ? ORDER BY position",
+          )
+          .all(sessionId),
+        schemaVersion: 2,
+        recordId: `${sessionId}:model-transcript`,
+      });
+      let $decodedModelRowsResultValue132428!: import("better-result").InferOk<
+        NonNullable<typeof decodedModelRows>
+      >;
+      let $decodedModelRowsResultError132428!: import("better-result").InferErr<
+        NonNullable<typeof decodedModelRows>
+      >;
+      const $decodedModelRowsResultOk132428 = Result.match<
+        import("better-result").InferOk<NonNullable<typeof decodedModelRows>>,
+        import("better-result").InferErr<NonNullable<typeof decodedModelRows>>,
+        boolean
+      >(decodedModelRows, {
+        ok: (value) => {
+          $decodedModelRowsResultValue132428 = value;
+          return true;
+        },
+        err: (error) => {
+          $decodedModelRowsResultError132428 = error;
+          return false;
+        },
+      });
+      if (($decodedModelRowsResultOk132428 ? "ok" : "error") === "error")
+        return Result.err($decodedModelRowsResultError132428);
+      const modelValues = $decodedModelRowsResultValue132428.value.map((row) => row.value_json);
+      const decodedUiRows = decodeMiniLilacStoreRows({
+        kind: "legacy-positioned-json",
+        rows: this.database
+          .query(
+            "SELECT session_id, position, value_json FROM ui_messages WHERE session_id = ? ORDER BY position",
+          )
+          .all(sessionId),
+        schemaVersion: 2,
+        recordId: `${sessionId}:ui-transcript`,
+      });
+      let $decodedUiRowsResultValue132989!: import("better-result").InferOk<
+        NonNullable<typeof decodedUiRows>
+      >;
+      let $decodedUiRowsResultError132989!: import("better-result").InferErr<
+        NonNullable<typeof decodedUiRows>
+      >;
+      const $decodedUiRowsResultOk132989 = Result.match<
+        import("better-result").InferOk<NonNullable<typeof decodedUiRows>>,
+        import("better-result").InferErr<NonNullable<typeof decodedUiRows>>,
+        boolean
+      >(decodedUiRows, {
+        ok: (value) => {
+          $decodedUiRowsResultValue132989 = value;
+          return true;
+        },
+        err: (error) => {
+          $decodedUiRowsResultError132989 = error;
+          return false;
+        },
+      });
+      if (($decodedUiRowsResultOk132989 ? "ok" : "error") === "error")
+        return Result.err($decodedUiRowsResultError132989);
+      const uiValues = $decodedUiRowsResultValue132989.value.map((row) => row.value_json);
+      const modelTranscript = decodeMiniLilacModelTranscript({
+        rawValues: modelValues,
+        schemaVersion: 2,
+        recordId: sessionId,
+      });
+      const modelTranscriptError = Result.match(modelTranscript, {
+        ok: () => null,
+        err: (error) => error,
+      });
+      if (modelTranscriptError !== null) return Result.err(modelTranscriptError);
+      const decodedUi = decodeMiniLilacMigrationUiTranscript({
+        rawValues: uiValues,
+        schemaVersion: 2,
+        recordId: sessionId,
+      });
+      let $decodedUiResultValue133775!: import("better-result").InferOk<
+        NonNullable<typeof decodedUi>
+      >;
+      let $decodedUiResultError133775!: import("better-result").InferErr<
+        NonNullable<typeof decodedUi>
+      >;
+      const $decodedUiResultOk133775 = Result.match<
+        import("better-result").InferOk<NonNullable<typeof decodedUi>>,
+        import("better-result").InferErr<NonNullable<typeof decodedUi>>,
+        boolean
+      >(decodedUi, {
+        ok: (value) => {
+          $decodedUiResultValue133775 = value;
+          return true;
+        },
+        err: (error) => {
+          $decodedUiResultError133775 = error;
+          return false;
+        },
+      });
+      if (($decodedUiResultOk133775 ? "ok" : "error") === "error")
+        return Result.err($decodedUiResultError133775);
+      const migratedUi = $decodedUiResultValue133775.value;
       const modelHeadId = this.internSerializedChain(sessionId, "model", modelValues);
       const uiHeadId = migratedUi.changed
         ? this.internChain(sessionId, "ui", migratedUi.messages)
@@ -2830,25 +4244,133 @@ export class MiniLilacSqliteStore {
       this.setTranscriptHeads(sessionId, modelHeadId, uiHeadId);
     }
 
-    const checkpoints = this.database
-      .query(
-        `SELECT session_id, ui_position, user_message_json, model_prefix_json,
+    const decodedLegacyCheckpoints = decodeMiniLilacStoreRows({
+      kind: "legacy-checkpoint",
+      rows: this.database
+        .query(
+          `SELECT session_id, ui_position, user_message_json, model_prefix_json,
                 ui_prefix_json, root_run_id, replay_after_seq
          FROM user_checkpoints ORDER BY session_id, ui_position`,
-      )
-      .all()
-      .map((value) => legacyCheckpointRowSchema.parse(value));
+        )
+        .all(),
+      schemaVersion: 2,
+      recordId: "v2-checkpoints",
+    });
+    let $decodedLegacyCheckpointsResultValue134385!: import("better-result").InferOk<
+      NonNullable<typeof decodedLegacyCheckpoints>
+    >;
+    let $decodedLegacyCheckpointsResultError134385!: import("better-result").InferErr<
+      NonNullable<typeof decodedLegacyCheckpoints>
+    >;
+    const $decodedLegacyCheckpointsResultOk134385 = Result.match<
+      import("better-result").InferOk<NonNullable<typeof decodedLegacyCheckpoints>>,
+      import("better-result").InferErr<NonNullable<typeof decodedLegacyCheckpoints>>,
+      boolean
+    >(decodedLegacyCheckpoints, {
+      ok: (value) => {
+        $decodedLegacyCheckpointsResultValue134385 = value;
+        return true;
+      },
+      err: (error) => {
+        $decodedLegacyCheckpointsResultError134385 = error;
+        return false;
+      },
+    });
+    if (($decodedLegacyCheckpointsResultOk134385 ? "ok" : "error") === "error") {
+      return Result.err($decodedLegacyCheckpointsResultError134385);
+    }
+    const checkpoints = $decodedLegacyCheckpointsResultValue134385.value;
     const insertCheckpoint = this.database.query(
       `INSERT INTO user_checkpoints_v3
         (session_id, ui_position, user_message_json, model_head_id, ui_head_id, root_run_id, replay_after_seq)
        VALUES (?, ?, ?, ?, ?, ?, ?)`,
     );
     for (const checkpoint of checkpoints) {
-      const message = parseMigratedUserUiMessage(deserialize(checkpoint.user_message_json));
-      const modelPrefix = modelMessagesSchema.parse(deserialize(checkpoint.model_prefix_json));
-      const uiPrefix = parseMigratedUiMessages(
-        z.array(z.unknown()).parse(deserialize(checkpoint.ui_prefix_json)),
-      ).messages;
+      const recordId = `${checkpoint.session_id}:${checkpoint.ui_position}`;
+      const decodedMessage = decodeMiniLilacMigrationUserUiMessage({
+        raw: checkpoint.user_message_json,
+        schemaVersion: 2,
+        recordId: `${recordId}:user`,
+      });
+      let $decodedMessageResultValue135373!: import("better-result").InferOk<
+        NonNullable<typeof decodedMessage>
+      >;
+      let $decodedMessageResultError135373!: import("better-result").InferErr<
+        NonNullable<typeof decodedMessage>
+      >;
+      const $decodedMessageResultOk135373 = Result.match<
+        import("better-result").InferOk<NonNullable<typeof decodedMessage>>,
+        import("better-result").InferErr<NonNullable<typeof decodedMessage>>,
+        boolean
+      >(decodedMessage, {
+        ok: (value) => {
+          $decodedMessageResultValue135373 = value;
+          return true;
+        },
+        err: (error) => {
+          $decodedMessageResultError135373 = error;
+          return false;
+        },
+      });
+      if (($decodedMessageResultOk135373 ? "ok" : "error") === "error")
+        return Result.err($decodedMessageResultError135373);
+      const decodedModelPrefix = decodeMiniLilacMigrationModelPrefix({
+        raw: checkpoint.model_prefix_json,
+        schemaVersion: 2,
+        recordId: `${recordId}:model`,
+      });
+      let $decodedModelPrefixResultValue135645!: import("better-result").InferOk<
+        NonNullable<typeof decodedModelPrefix>
+      >;
+      let $decodedModelPrefixResultError135645!: import("better-result").InferErr<
+        NonNullable<typeof decodedModelPrefix>
+      >;
+      const $decodedModelPrefixResultOk135645 = Result.match<
+        import("better-result").InferOk<NonNullable<typeof decodedModelPrefix>>,
+        import("better-result").InferErr<NonNullable<typeof decodedModelPrefix>>,
+        boolean
+      >(decodedModelPrefix, {
+        ok: (value) => {
+          $decodedModelPrefixResultValue135645 = value;
+          return true;
+        },
+        err: (error) => {
+          $decodedModelPrefixResultError135645 = error;
+          return false;
+        },
+      });
+      if (($decodedModelPrefixResultOk135645 ? "ok" : "error") === "error")
+        return Result.err($decodedModelPrefixResultError135645);
+      const decodedUiPrefix = decodeMiniLilacMigrationUiPrefix({
+        raw: checkpoint.ui_prefix_json,
+        schemaVersion: 2,
+        recordId: `${recordId}:ui`,
+      });
+      let $decodedUiPrefixResultValue135928!: import("better-result").InferOk<
+        NonNullable<typeof decodedUiPrefix>
+      >;
+      let $decodedUiPrefixResultError135928!: import("better-result").InferErr<
+        NonNullable<typeof decodedUiPrefix>
+      >;
+      const $decodedUiPrefixResultOk135928 = Result.match<
+        import("better-result").InferOk<NonNullable<typeof decodedUiPrefix>>,
+        import("better-result").InferErr<NonNullable<typeof decodedUiPrefix>>,
+        boolean
+      >(decodedUiPrefix, {
+        ok: (value) => {
+          $decodedUiPrefixResultValue135928 = value;
+          return true;
+        },
+        err: (error) => {
+          $decodedUiPrefixResultError135928 = error;
+          return false;
+        },
+      });
+      if (($decodedUiPrefixResultOk135928 ? "ok" : "error") === "error")
+        return Result.err($decodedUiPrefixResultError135928);
+      const message = $decodedMessageResultValue135373.value;
+      const modelPrefix = $decodedModelPrefixResultValue135645.value;
+      const uiPrefix = $decodedUiPrefixResultValue135928.value.messages;
       const modelHeadId = this.internChain(checkpoint.session_id, "model", modelPrefix);
       const uiHeadId = this.internChain(checkpoint.session_id, "ui", uiPrefix);
       insertCheckpoint.run(
@@ -2869,6 +4391,7 @@ export class MiniLilacSqliteStore {
       DROP TABLE ui_messages;
       ALTER TABLE user_checkpoints_v3 RENAME TO user_checkpoints;
     `);
+    return Result.ok(undefined);
   }
 
   close(): void {
@@ -2894,18 +4417,51 @@ export class MiniLilacSqliteStore {
   }
 
   createSession(input: CreateStoredSession): MiniLilacSessionSnapshot {
+    return storeResultToLegacy(this.createSessionResult(input));
+  }
+
+  createSessionResult(
+    input: CreateStoredSession,
+  ): ResultType<MiniLilacSessionSnapshot, MiniLilacStoreOperationError> {
     const now = new Date().toISOString();
     const canonicalCwd = canonicalizeStoredCwd(input.cwd);
-    this.database.transaction(() => {
+    const created = this.runStoreTransactionResult("createSession", () => {
       this.database
         .query(
           `INSERT INTO workspaces (id, canonical_cwd, created_at)
            VALUES (?, ?, ?) ON CONFLICT(canonical_cwd) DO NOTHING`,
         )
         .run(randomUUID(), canonicalCwd, now);
-      const workspace = workspaceRowSchema.parse(
-        this.database.query("SELECT * FROM workspaces WHERE canonical_cwd = ?").get(canonicalCwd),
-      );
+      const decodedWorkspace = this.decodeRequiredStructuralHistoryRow({
+        kind: "workspace",
+        row: this.database
+          .query("SELECT * FROM workspaces WHERE canonical_cwd = ?")
+          .get(canonicalCwd),
+        recordId: input.id,
+      });
+      let $decodedWorkspaceResultValue138299!: import("better-result").InferOk<
+        NonNullable<typeof decodedWorkspace>
+      >;
+      let $decodedWorkspaceResultError138299!: import("better-result").InferErr<
+        NonNullable<typeof decodedWorkspace>
+      >;
+      const $decodedWorkspaceResultOk138299 = Result.match<
+        import("better-result").InferOk<NonNullable<typeof decodedWorkspace>>,
+        import("better-result").InferErr<NonNullable<typeof decodedWorkspace>>,
+        boolean
+      >(decodedWorkspace, {
+        ok: (value) => {
+          $decodedWorkspaceResultValue138299 = value;
+          return true;
+        },
+        err: (error) => {
+          $decodedWorkspaceResultError138299 = error;
+          return false;
+        },
+      });
+      if (($decodedWorkspaceResultOk138299 ? "ok" : "error") === "error")
+        return Result.err($decodedWorkspaceResultError138299);
+      const workspace = $decodedWorkspaceResultValue138299;
       this.database
         .query(
           `INSERT INTO sessions
@@ -2944,37 +4500,96 @@ export class MiniLilacSqliteStore {
            VALUES (?, ?, ?, ?, ?)`,
         )
         .run(input.id, rootStateId, rootStateId, rootStateId, now);
-    })();
-    return this.getSession(input.id);
+      return Result.ok(undefined);
+    });
+    const creationError = created.match({ ok: () => null, err: (error) => error });
+    if (creationError !== null) return Result.err(creationError);
+    return this.getSessionResult(input.id);
   }
 
   getSession(sessionId: string): MiniLilacSessionSnapshot {
-    const row = this.database.query("SELECT * FROM sessions WHERE id = ?").get(sessionId);
-    if (!row) throw new Error(`Session '${sessionId}' was not found`);
-    const snapshot = toSnapshot(row);
-    const navigation = this.getHistoryNavigation(sessionId);
-    return {
-      ...snapshot,
-      historyStateId: navigation.currentStateId,
-      canUndo: navigation.canUndo,
-      canRedo: navigation.canRedo,
-    };
+    return storeResultToLegacy(this.getSessionResult(sessionId));
+  }
+
+  getSessionResult(
+    sessionId: string,
+  ): ResultType<MiniLilacSessionSnapshot, MiniLilacPersistenceError> {
+    return this.runHistoryReadResult("getSession", () => {
+      const row = this.database.query("SELECT * FROM sessions WHERE id = ?").get(sessionId);
+      const snapshot = decodeSessionRowSnapshot(row, sessionId);
+      let $snapshotResultValue140497!: import("better-result").InferOk<
+        NonNullable<typeof snapshot>
+      >;
+      let $snapshotResultError140497!: import("better-result").InferErr<
+        NonNullable<typeof snapshot>
+      >;
+      const $snapshotResultOk140497 = Result.match<
+        import("better-result").InferOk<NonNullable<typeof snapshot>>,
+        import("better-result").InferErr<NonNullable<typeof snapshot>>,
+        boolean
+      >(snapshot, {
+        ok: (value) => {
+          $snapshotResultValue140497 = value;
+          return true;
+        },
+        err: (error) => {
+          $snapshotResultError140497 = error;
+          return false;
+        },
+      });
+      if (($snapshotResultOk140497 ? "ok" : "error") === "error")
+        return Result.err($snapshotResultError140497);
+      const navigation = this.getHistoryNavigationResult(sessionId);
+      let $navigationResultValue140636!: import("better-result").InferOk<
+        NonNullable<typeof navigation>
+      >;
+      let $navigationResultError140636!: import("better-result").InferErr<
+        NonNullable<typeof navigation>
+      >;
+      const $navigationResultOk140636 = Result.match<
+        import("better-result").InferOk<NonNullable<typeof navigation>>,
+        import("better-result").InferErr<NonNullable<typeof navigation>>,
+        boolean
+      >(navigation, {
+        ok: (value) => {
+          $navigationResultValue140636 = value;
+          return true;
+        },
+        err: (error) => {
+          $navigationResultError140636 = error;
+          return false;
+        },
+      });
+      if (($navigationResultOk140636 ? "ok" : "error") === "error")
+        return Result.err($navigationResultError140636);
+      return Result.ok({
+        ...$snapshotResultValue140497,
+        historyStateId: $navigationResultValue140636.currentStateId,
+        canUndo: $navigationResultValue140636.canUndo,
+        canRedo: $navigationResultValue140636.canRedo,
+      });
+    });
   }
 
   listSessions(): MiniLilacSessionSnapshot[] {
-    return this.database
-      .query("SELECT * FROM sessions ORDER BY created_at")
-      .all()
-      .map((row) => {
-        const snapshot = toSnapshot(row);
-        const navigation = this.getHistoryNavigation(snapshot.id);
-        return {
-          ...snapshot,
-          historyStateId: navigation.currentStateId,
-          canUndo: navigation.canUndo,
-          canRedo: navigation.canRedo,
-        };
-      });
+    const decoded = storeResultToLegacy(
+      decodeMiniLilacStoreRows({
+        kind: "session",
+        rows: this.database.query("SELECT * FROM sessions ORDER BY created_at").all(),
+        schemaVersion: MINI_LILAC_DATABASE_SCHEMA_VERSION,
+        recordId: "sessions",
+      }),
+    );
+    return decoded.value.map((row) => {
+      const snapshot = projectSessionRowSnapshot(row);
+      const navigation = this.getHistoryNavigation(snapshot.id);
+      return {
+        ...snapshot,
+        historyStateId: navigation.currentStateId,
+        canUndo: navigation.canUndo,
+        canRedo: navigation.canRedo,
+      };
+    });
   }
 
   updateSessionState(
@@ -2996,22 +4611,63 @@ export class MiniLilacSqliteStore {
     runId: string,
     inputTokens: number,
   ): MiniLilacSessionSnapshot {
-    z.number().int().nonnegative().parse(inputTokens);
-    const updated = this.database
-      .query(
-        // Reported usage supersedes any post-compaction estimate. The estimate
-        // flag has to clear even when the reported count happens to equal the
-        // estimate, so a matching count is not treated as "nothing changed".
-        `UPDATE sessions SET input_tokens = ?, input_tokens_estimated = 0, updated_at = ?
-         WHERE id = ? AND active_run_id = ?
-           AND (input_tokens IS NOT ? OR input_tokens_estimated = 1)`,
-      )
-      .run(inputTokens, new Date().toISOString(), sessionId, runId, inputTokens);
-    const snapshot = this.getSession(sessionId);
-    if (updated.changes === 0 && snapshot.activeRunId !== runId) {
-      throw new Error(`Run '${runId}' is not active for session '${sessionId}'`);
-    }
-    return snapshot;
+    return storeResultToLegacy(
+      this.updateActiveRunInputTokensResult(sessionId, runId, inputTokens),
+    );
+  }
+
+  updateActiveRunInputTokensResult(
+    sessionId: string,
+    runId: string,
+    inputTokens: number,
+  ): ResultType<MiniLilacSessionSnapshot, MiniLilacStoreOperationError> {
+    return this.runStoreTransactionResult<MiniLilacSessionSnapshot, MiniLilacStoreOperationError>(
+      "updateActiveRunInputTokens",
+      () => {
+        const updated = this.database
+          .query(
+            // Reported usage supersedes any post-compaction estimate. The estimate
+            // flag has to clear even when the reported count happens to equal the
+            // estimate, so a matching count is not treated as "nothing changed".
+            `UPDATE sessions SET input_tokens = ?, input_tokens_estimated = 0, updated_at = ?
+           WHERE id = ? AND active_run_id = ?
+             AND (input_tokens IS NOT ? OR input_tokens_estimated = 1)`,
+          )
+          .run(inputTokens, new Date().toISOString(), sessionId, runId, inputTokens);
+        const snapshot = this.getSessionResult(sessionId);
+        let $snapshotResultValue143399!: import("better-result").InferOk<
+          NonNullable<typeof snapshot>
+        >;
+        let $snapshotResultError143399!: import("better-result").InferErr<
+          NonNullable<typeof snapshot>
+        >;
+        const $snapshotResultOk143399 = Result.match<
+          import("better-result").InferOk<NonNullable<typeof snapshot>>,
+          import("better-result").InferErr<NonNullable<typeof snapshot>>,
+          boolean
+        >(snapshot, {
+          ok: (value) => {
+            $snapshotResultValue143399 = value;
+            return true;
+          },
+          err: (error) => {
+            $snapshotResultError143399 = error;
+            return false;
+          },
+        });
+        if (($snapshotResultOk143399 ? "ok" : "error") === "error")
+          return Result.err($snapshotResultError143399);
+        if (updated.changes === 0 && $snapshotResultValue143399.activeRunId !== runId) {
+          return Result.err(
+            new MiniLilacStoreOperationRejected({
+              operation: "updateActiveRunInputTokens",
+              message: `Run '${runId}' is not active for session '${sessionId}'`,
+            }),
+          );
+        }
+        return Result.ok($snapshotResultValue143399);
+      },
+    );
   }
 
   updateSessionTitle(
@@ -3031,27 +4687,134 @@ export class MiniLilacSqliteStore {
     request: StoredCommandRequest,
     bindings: StoredSessionBindingUpdate,
   ): MiniLilacSessionSnapshot {
-    const command = canonicalCommandPayload(request.payload);
-    return this.database.transaction(() => {
-      const previous = this.getCommandResult(sessionId, commandId, request);
-      if (previous !== undefined) return miniLilacSessionSnapshotSchema.parse(previous);
-      const snapshot = this.getSession(sessionId);
-      const activeRunCount = z
-        .object({ count: z.number().int().nonnegative() })
-        .parse(
-          this.database
-            .query("SELECT COUNT(*) AS count FROM runs WHERE session_id = ? AND status = 'active'")
-            .get(sessionId),
-        ).count;
+    return storeResultToLegacy(
+      this.updateSessionBindingsResult(sessionId, commandId, request, bindings),
+    );
+  }
+
+  updateSessionBindingsResult(
+    sessionId: string,
+    commandId: string,
+    request: StoredCommandRequest,
+    bindings: StoredSessionBindingUpdate,
+  ): ResultType<MiniLilacSessionSnapshot, MiniLilacStoreOperationError> {
+    const command = decodeCanonicalStoredCommandRequest(request);
+    let $commandResultValue144803!: import("better-result").InferOk<NonNullable<typeof command>>;
+    let $commandResultError144803!: import("better-result").InferErr<NonNullable<typeof command>>;
+    const $commandResultOk144803 = Result.match<
+      import("better-result").InferOk<NonNullable<typeof command>>,
+      import("better-result").InferErr<NonNullable<typeof command>>,
+      boolean
+    >(command, {
+      ok: (value) => {
+        $commandResultValue144803 = value;
+        return true;
+      },
+      err: (error) => {
+        $commandResultError144803 = error;
+        return false;
+      },
+    });
+    if (($commandResultOk144803 ? "ok" : "error") === "error")
+      return Result.err($commandResultError144803);
+    return this.runStoreTransactionResult("updateSessionBindings", () => {
+      const previous = this.getCommandResultResult(sessionId, commandId, request);
+      const decodedPrevious = previous.andThen(decodeStoredSessionSnapshot);
+      let $decodedPreviousResultValue145099!: import("better-result").InferOk<
+        NonNullable<typeof decodedPrevious>
+      >;
+      let $decodedPreviousResultError145099!: import("better-result").InferErr<
+        NonNullable<typeof decodedPrevious>
+      >;
+      const $decodedPreviousResultOk145099 = Result.match<
+        import("better-result").InferOk<NonNullable<typeof decodedPrevious>>,
+        import("better-result").InferErr<NonNullable<typeof decodedPrevious>>,
+        boolean
+      >(decodedPrevious, {
+        ok: (value) => {
+          $decodedPreviousResultValue145099 = value;
+          return true;
+        },
+        err: (error) => {
+          $decodedPreviousResultError145099 = error;
+          return false;
+        },
+      });
+      if (($decodedPreviousResultOk145099 ? "ok" : "error") === "error")
+        return Result.err($decodedPreviousResultError145099);
+      if ($decodedPreviousResultValue145099 !== undefined)
+        return Result.ok($decodedPreviousResultValue145099);
+      const snapshot = this.getSessionResult(sessionId);
+      let $snapshotResultValue145352!: import("better-result").InferOk<
+        NonNullable<typeof snapshot>
+      >;
+      let $snapshotResultError145352!: import("better-result").InferErr<
+        NonNullable<typeof snapshot>
+      >;
+      const $snapshotResultOk145352 = Result.match<
+        import("better-result").InferOk<NonNullable<typeof snapshot>>,
+        import("better-result").InferErr<NonNullable<typeof snapshot>>,
+        boolean
+      >(snapshot, {
+        ok: (value) => {
+          $snapshotResultValue145352 = value;
+          return true;
+        },
+        err: (error) => {
+          $snapshotResultError145352 = error;
+          return false;
+        },
+      });
+      if (($snapshotResultOk145352 ? "ok" : "error") === "error")
+        return Result.err($snapshotResultError145352);
+      const activeRunCount = decodeRequiredMiniLilacStoreRow({
+        kind: "count",
+        row: this.database
+          .query("SELECT COUNT(*) AS count FROM runs WHERE session_id = ? AND status = 'active'")
+          .get(sessionId),
+        schemaVersion: MINI_LILAC_DATABASE_SCHEMA_VERSION,
+        recordId: `${sessionId}:active-run-count`,
+      });
+      let $activeRunCountResultValue145483!: import("better-result").InferOk<
+        NonNullable<typeof activeRunCount>
+      >;
+      let $activeRunCountResultError145483!: import("better-result").InferErr<
+        NonNullable<typeof activeRunCount>
+      >;
+      const $activeRunCountResultOk145483 = Result.match<
+        import("better-result").InferOk<NonNullable<typeof activeRunCount>>,
+        import("better-result").InferErr<NonNullable<typeof activeRunCount>>,
+        boolean
+      >(activeRunCount, {
+        ok: (value) => {
+          $activeRunCountResultValue145483 = value;
+          return true;
+        },
+        err: (error) => {
+          $activeRunCountResultError145483 = error;
+          return false;
+        },
+      });
+      if (($activeRunCountResultOk145483 ? "ok" : "error") === "error")
+        return Result.err($activeRunCountResultError145483);
       if (
-        !["idle", "error"].includes(snapshot.status) ||
-        snapshot.activeRunId !== null ||
-        activeRunCount > 0
+        !["idle", "error"].includes($snapshotResultValue145352.status) ||
+        $snapshotResultValue145352.activeRunId !== null ||
+        $activeRunCountResultValue145483.count > 0
       ) {
-        throw new Error(`Session '${sessionId}' must be quiescent to update bindings`);
+        return Result.err(
+          new MiniLilacStoreOperationRejected({
+            operation: "updateSessionBindings",
+            message: `Session '${sessionId}' must be quiescent to update bindings`,
+          }),
+        );
       }
 
       const now = new Date().toISOString();
+      let inputTokensEstimated = 0;
+      if (bindings.model === undefined && $snapshotResultValue145352.inputTokensEstimated) {
+        inputTokensEstimated = 1;
+      }
       this.database
         .query(
           `UPDATE sessions
@@ -3060,20 +4823,64 @@ export class MiniLilacSqliteStore {
            WHERE id = ?`,
         )
         .run(
-          bindings.model ?? snapshot.model,
-          bindings.profile ?? snapshot.profile,
-          bindings.reasoning ?? snapshot.reasoning,
+          bindings.model ?? $snapshotResultValue145352.model,
+          bindings.profile ?? $snapshotResultValue145352.profile,
+          bindings.reasoning ?? $snapshotResultValue145352.reasoning,
           bindings.model === undefined
-            ? (snapshot.contextWindow ?? null)
+            ? ($snapshotResultValue145352.contextWindow ?? null)
             : (bindings.contextWindow ?? null),
-          bindings.model === undefined ? (snapshot.inputTokens ?? null) : null,
+          bindings.model === undefined ? ($snapshotResultValue145352.inputTokens ?? null) : null,
           // Clearing the count must clear the flag with it: an estimate marker
           // left on a null count renders as an estimate of nothing.
-          bindings.model === undefined ? (snapshot.inputTokensEstimated ? 1 : 0) : 0,
+          inputTokensEstimated,
           now,
           sessionId,
         );
-      const result = this.getSession(sessionId);
+      const result = this.getSessionResult(sessionId);
+      let $resultResultValue147419!: import("better-result").InferOk<NonNullable<typeof result>>;
+      let $resultResultError147419!: import("better-result").InferErr<NonNullable<typeof result>>;
+      const $resultResultOk147419 = Result.match<
+        import("better-result").InferOk<NonNullable<typeof result>>,
+        import("better-result").InferErr<NonNullable<typeof result>>,
+        boolean
+      >(result, {
+        ok: (value) => {
+          $resultResultValue147419 = value;
+          return true;
+        },
+        err: (error) => {
+          $resultResultError147419 = error;
+          return false;
+        },
+      });
+      if (($resultResultOk147419 ? "ok" : "error") === "error")
+        return Result.err($resultResultError147419);
+      const serializedResult = serializeStoreValueResult(
+        $resultResultValue147419,
+        "updateSessionBindings",
+      );
+      let $serializedResultResultValue147544!: import("better-result").InferOk<
+        NonNullable<typeof serializedResult>
+      >;
+      let $serializedResultResultError147544!: import("better-result").InferErr<
+        NonNullable<typeof serializedResult>
+      >;
+      const $serializedResultResultOk147544 = Result.match<
+        import("better-result").InferOk<NonNullable<typeof serializedResult>>,
+        import("better-result").InferErr<NonNullable<typeof serializedResult>>,
+        boolean
+      >(serializedResult, {
+        ok: (value) => {
+          $serializedResultResultValue147544 = value;
+          return true;
+        },
+        err: (error) => {
+          $serializedResultResultError147544 = error;
+          return false;
+        },
+      });
+      if (($serializedResultResultOk147544 ? "ok" : "error") === "error")
+        return Result.err($serializedResultResultError147544);
       this.database
         .query(
           `INSERT INTO commands
@@ -3083,37 +4890,52 @@ export class MiniLilacSqliteStore {
         .run(
           sessionId,
           commandId,
-          request.kind,
-          command.fingerprint,
-          command.json,
-          serialize(result),
+          $commandResultValue144803.kind,
+          $commandResultValue144803.fingerprint,
+          $commandResultValue144803.json,
+          $serializedResultResultValue147544,
           now,
         );
-      return result;
-    })();
+      return Result.ok($resultResultValue147419);
+    });
   }
 
   createRun(input: CreateStoredRun): StoredRun {
+    return storeResultToLegacy(this.createRunResult(input));
+  }
+
+  createRunResult(input: CreateStoredRun): ResultType<StoredRun, MiniLilacStoreOperationError> {
     if (input.parentRunId === undefined) {
-      throw new Error(
-        "Root runs must be created through admitRootPromptHistory so their open transition is atomic",
+      return Result.err(
+        new MiniLilacStoreOperationRejected({
+          operation: "createRun",
+          message:
+            "Root runs must be created through admitRootPromptHistory so their open transition is atomic",
+        }),
       );
     }
     const now = new Date().toISOString();
-    this.database
-      .query(
-        `INSERT INTO runs
-          (id, session_id, parent_run_id, profile, depth, status, started_at)
-         VALUES (?, ?, ?, ?, ?, 'active', ?)`,
-      )
-      .run(input.id, input.sessionId, input.parentRunId ?? null, input.profile, input.depth, now);
-    return this.getRun(input.id);
+    return this.runStoreTransactionResult("createRun", () => {
+      this.database
+        .query(
+          `INSERT INTO runs
+            (id, session_id, parent_run_id, profile, depth, status, started_at)
+           VALUES (?, ?, ?, ?, ?, 'active', ?)`,
+        )
+        .run(input.id, input.sessionId, input.parentRunId ?? null, input.profile, input.depth, now);
+      return this.getRunResult(input.id);
+    });
   }
 
   getRun(runId: string): StoredRun {
-    const row = this.database.query("SELECT * FROM runs WHERE id = ?").get(runId);
-    if (!row) throw new Error(`Run '${runId}' was not found`);
-    return toRun(row);
+    return storeResultToLegacy(this.getRunResult(runId));
+  }
+
+  getRunResult(runId: string): ResultType<StoredRun, MiniLilacPersistenceError> {
+    return this.runHistoryReadResult("getRun", () => {
+      const row = this.database.query("SELECT * FROM runs WHERE id = ?").get(runId);
+      return decodeRunRow(row, runId);
+    });
   }
 
   getActiveRootRun(sessionId: string): StoredRun | null {
@@ -3124,7 +4946,7 @@ export class MiniLilacSqliteStore {
          WHERE sessions.id = ? AND runs.parent_run_id IS NULL AND runs.status = 'active'`,
       )
       .get(sessionId);
-    return row ? toRun(row) : null;
+    return row ? storeResultToLegacy(decodeRunRow(row, `${sessionId}:active-root`)) : null;
   }
 
   getLatestSelectedRootRun(sessionId: string): StoredRun | null {
@@ -3149,7 +4971,7 @@ export class MiniLilacSqliteStore {
          LIMIT 1`,
       )
       .get(sessionId, sessionId, sessionId, sessionId);
-    return row ? toRun(row) : null;
+    return row ? storeResultToLegacy(decodeRunRow(row, `${sessionId}:selected-root`)) : null;
   }
 
   finishRun(
@@ -3157,68 +4979,172 @@ export class MiniLilacSqliteStore {
     status: Exclude<MiniLilacRunStatus, "active">,
     options: { error?: string; terminalResult?: unknown } = {},
   ): void {
-    const run = this.getRun(runId);
-    if (run.parentRunId === null) {
-      throw new Error(
-        "Root runs must be terminalized through pending finalization so history closes atomically",
-      );
-    }
-    this.database
-      .query(
-        "UPDATE runs SET status = ?, error = ?, terminal_result_json = ?, finished_at = ? WHERE id = ?",
-      )
-      .run(
-        status,
-        options.error ?? null,
-        options.terminalResult === undefined ? null : serialize(options.terminalResult),
-        new Date().toISOString(),
-        runId,
-      );
+    storeResultToLegacy(this.finishRunResult(runId, status, options));
   }
 
-  getTodos(sessionId: string): MiniLilacTodoState {
-    const session = this.database.query("SELECT 1 FROM sessions WHERE id = ?").get(sessionId);
-    if (!session) throw new Error(`Session '${sessionId}' was not found`);
-    const value = this.database
-      .query("SELECT revision, todos_json FROM session_todos WHERE session_id = ?")
-      .get(sessionId);
-    if (!value) return miniLilacTodoStateSchema.parse({ revision: 0, todos: [] });
-    const row = todosRowSchema.parse(value);
-    return miniLilacTodoStateSchema.parse({
-      revision: row.revision,
-      todos: JSON.parse(row.todos_json),
+  finishRunResult(
+    runId: string,
+    status: Exclude<MiniLilacRunStatus, "active">,
+    options: { error?: string; terminalResult?: unknown } = {},
+  ): ResultType<void, MiniLilacStoreOperationError> {
+    const run = this.getRunResult(runId);
+    let $runResultValue151575!: import("better-result").InferOk<NonNullable<typeof run>>;
+    let $runResultError151575!: import("better-result").InferErr<NonNullable<typeof run>>;
+    const $runResultOk151575 = Result.match<
+      import("better-result").InferOk<NonNullable<typeof run>>,
+      import("better-result").InferErr<NonNullable<typeof run>>,
+      boolean
+    >(run, {
+      ok: (value) => {
+        $runResultValue151575 = value;
+        return true;
+      },
+      err: (error) => {
+        $runResultError151575 = error;
+        return false;
+      },
+    });
+    if (($runResultOk151575 ? "ok" : "error") === "error") return Result.err($runResultError151575);
+    if ($runResultValue151575.parentRunId === null) {
+      return Result.err(
+        new MiniLilacStoreOperationRejected({
+          operation: "finishRun",
+          message:
+            "Root runs must be terminalized through pending finalization so history closes atomically",
+        }),
+      );
+    }
+    const terminalResult = serializeOptionalTerminalResult(options, "finishRun");
+    let $terminalResultResultValue151976!: import("better-result").InferOk<
+      NonNullable<typeof terminalResult>
+    >;
+    let $terminalResultResultError151976!: import("better-result").InferErr<
+      NonNullable<typeof terminalResult>
+    >;
+    const $terminalResultResultOk151976 = Result.match<
+      import("better-result").InferOk<NonNullable<typeof terminalResult>>,
+      import("better-result").InferErr<NonNullable<typeof terminalResult>>,
+      boolean
+    >(terminalResult, {
+      ok: (value) => {
+        $terminalResultResultValue151976 = value;
+        return true;
+      },
+      err: (error) => {
+        $terminalResultResultError151976 = error;
+        return false;
+      },
+    });
+    if (($terminalResultResultOk151976 ? "ok" : "error") === "error")
+      return Result.err($terminalResultResultError151976);
+    return this.runStoreTransactionResult("finishRun", () => {
+      this.database
+        .query(
+          "UPDATE runs SET status = ?, error = ?, terminal_result_json = ?, finished_at = ? WHERE id = ?",
+        )
+        .run(
+          status,
+          options.error ?? null,
+          $terminalResultResultValue151976,
+          new Date().toISOString(),
+          runId,
+        );
+      return Result.ok(undefined);
     });
   }
 
-  replaceTodosForRun(input: ReplaceTodosForRun): ReplaceTodosForRunResult {
-    const todos = miniLilacTodosSchema.parse(input.todos);
-    const todosJson = JSON.stringify(canonicalJsonValue(todos));
+  getTodos(sessionId: string): MiniLilacTodoState {
+    return storeResultToLegacy(this.getTodosResult(sessionId));
+  }
 
-    return this.database.transaction(() => {
-      const activeRun = this.database
-        .query(
-          `SELECT 1
+  getTodosResult(sessionId: string): ResultType<MiniLilacTodoState, MiniLilacPersistenceError> {
+    return readMiniLilacTodos(this.database, sessionId);
+  }
+
+  replaceTodosForRun(input: ReplaceTodosForRun): ReplaceTodosForRunResult {
+    return storeResultToLegacy(this.replaceTodosForRunResult(input));
+  }
+
+  replaceTodosForRunResult(
+    input: ReplaceTodosForRun,
+  ): ResultType<ReplaceTodosForRunResult, MiniLilacStoreOperationError> {
+    if (input.todos.length > 50 || input.todos.some((todo) => todo.content.length > 500)) {
+      return Result.err(
+        new MiniLilacStoreOperationRejected({
+          operation: "replaceTodosForRun",
+          message: "Todo list exceeds its persisted size limits",
+        }),
+      );
+    }
+    if (input.todos.filter((todo) => todo.status === "in_progress").length > 1) {
+      return Result.err(
+        new MiniLilacStoreOperationRejected({
+          operation: "replaceTodosForRun",
+          message: "Todo list may contain at most one in-progress todo",
+        }),
+      );
+    }
+    const todosJson = JSON.stringify(canonicalJsonValue(input.todos));
+
+    return this.runStoreTransactionResult<ReplaceTodosForRunResult, MiniLilacStoreOperationError>(
+      "replaceTodosForRun",
+      () => {
+        const activeRun = this.database
+          .query(
+            `SELECT 1
            FROM sessions
            JOIN runs ON runs.id = ? AND runs.session_id = sessions.id
            WHERE sessions.id = ? AND sessions.active_run_id = runs.id
              AND runs.parent_run_id IS NULL AND runs.status = 'active'`,
-        )
-        .get(input.runId, input.sessionId);
-      if (!activeRun) {
-        throw new Error(`Run '${input.runId}' is not active for session '${input.sessionId}'`);
-      }
+          )
+          .get(input.runId, input.sessionId);
+        if (!activeRun) {
+          return Result.err(
+            new MiniLilacStoreOperationRejected({
+              operation: "replaceTodosForRun",
+              message: `Run '${input.runId}' is not active for session '${input.sessionId}'`,
+            }),
+          );
+        }
 
-      const current = this.getTodos(input.sessionId);
-      const currentJson = JSON.stringify(canonicalJsonValue(current.todos));
-      if (currentJson === todosJson) return { state: current };
-      if (current.revision === Number.MAX_SAFE_INTEGER) {
-        throw new Error(`Session '${input.sessionId}' todo revision is exhausted`);
-      }
+        const current = this.getTodosResult(input.sessionId);
+        let $currentResultValue154544!: import("better-result").InferOk<
+          NonNullable<typeof current>
+        >;
+        let $currentResultError154544!: import("better-result").InferErr<
+          NonNullable<typeof current>
+        >;
+        const $currentResultOk154544 = Result.match<
+          import("better-result").InferOk<NonNullable<typeof current>>,
+          import("better-result").InferErr<NonNullable<typeof current>>,
+          boolean
+        >(current, {
+          ok: (value) => {
+            $currentResultValue154544 = value;
+            return true;
+          },
+          err: (error) => {
+            $currentResultError154544 = error;
+            return false;
+          },
+        });
+        if (($currentResultOk154544 ? "ok" : "error") === "error")
+          return Result.err($currentResultError154544);
+        const currentJson = JSON.stringify(canonicalJsonValue($currentResultValue154544.todos));
+        if (currentJson === todosJson) return Result.ok({ state: $currentResultValue154544 });
+        if ($currentResultValue154544.revision === Number.MAX_SAFE_INTEGER) {
+          return Result.err(
+            new MiniLilacStoreOperationRejected({
+              operation: "replaceTodosForRun",
+              message: `Session '${input.sessionId}' todo revision is exhausted`,
+            }),
+          );
+        }
 
-      const now = new Date().toISOString();
-      const updatedValue = this.database
-        .query(
-          `INSERT INTO session_todos (session_id, revision, todos_json, updated_at)
+        const now = new Date().toISOString();
+        const updatedValue = this.database
+          .query(
+            `INSERT INTO session_todos (session_id, revision, todos_json, updated_at)
            VALUES (?, 1, ?, ?)
            ON CONFLICT(session_id) DO UPDATE SET
              revision = session_todos.revision + 1,
@@ -3226,83 +5152,421 @@ export class MiniLilacSqliteStore {
              updated_at = excluded.updated_at
            WHERE session_todos.todos_json <> excluded.todos_json
            RETURNING revision, todos_json`,
-        )
-        .get(input.sessionId, todosJson, now);
-      if (!updatedValue) return { state: this.getTodos(input.sessionId) };
+          )
+          .get(input.sessionId, todosJson, now);
+        if (!updatedValue) {
+          const unchanged = this.getTodosResult(input.sessionId);
+          let $unchangedResultValue155781!: import("better-result").InferOk<
+            NonNullable<typeof unchanged>
+          >;
+          let $unchangedResultError155781!: import("better-result").InferErr<
+            NonNullable<typeof unchanged>
+          >;
+          const $unchangedResultOk155781 = Result.match<
+            import("better-result").InferOk<NonNullable<typeof unchanged>>,
+            import("better-result").InferErr<NonNullable<typeof unchanged>>,
+            boolean
+          >(unchanged, {
+            ok: (value) => {
+              $unchangedResultValue155781 = value;
+              return true;
+            },
+            err: (error) => {
+              $unchangedResultError155781 = error;
+              return false;
+            },
+          });
+          return ($unchangedResultOk155781 ? "ok" : "error") === "error"
+            ? Result.err($unchangedResultError155781)
+            : Result.ok({ state: $unchangedResultValue155781 });
+        }
 
-      const updated = todosRowSchema.parse(updatedValue);
-      const state = miniLilacTodoStateSchema.parse({
-        revision: updated.revision,
-        todos: JSON.parse(updated.todos_json),
-      });
-      this.database
-        .query("UPDATE sessions SET updated_at = ? WHERE id = ?")
-        .run(now, input.sessionId);
-      return { state };
-    })();
+        const decodedState = decodeMiniLilacTodos({
+          row: updatedValue,
+          schemaVersion: MINI_LILAC_DATABASE_SCHEMA_VERSION,
+          recordId: input.sessionId,
+        });
+        let $decodedStateResultValue155997!: import("better-result").InferOk<
+          NonNullable<typeof decodedState>
+        >;
+        let $decodedStateResultError155997!: import("better-result").InferErr<
+          NonNullable<typeof decodedState>
+        >;
+        const $decodedStateResultOk155997 = Result.match<
+          import("better-result").InferOk<NonNullable<typeof decodedState>>,
+          import("better-result").InferErr<NonNullable<typeof decodedState>>,
+          boolean
+        >(decodedState, {
+          ok: (value) => {
+            $decodedStateResultValue155997 = value;
+            return true;
+          },
+          err: (error) => {
+            $decodedStateResultError155997 = error;
+            return false;
+          },
+        });
+        if (($decodedStateResultOk155997 ? "ok" : "error") === "error")
+          return Result.err($decodedStateResultError155997);
+        const state = $decodedStateResultValue155997.value;
+        this.database
+          .query("UPDATE sessions SET updated_at = ? WHERE id = ?")
+          .run(now, input.sessionId);
+        return Result.ok({ state });
+      },
+    );
   }
 
-  private runImmediateTransaction<T>(operation: () => T): T {
-    return this.database.transaction(operation).immediate();
+  private runStoreTransaction<T>(operationName: string, operation: () => T): T {
+    return storeResultToLegacy(
+      this.runStoreTransactionResult(operationName, () => Result.ok(operation())),
+    );
+  }
+
+  private runStoreTransactionResult<T, E>(
+    operationName: string,
+    operation: () => ResultType<T, E>,
+  ): ResultType<T, E | MiniLilacSqliteDriverFailure> {
+    this.transactionDepth += 1;
+    try {
+      return runBunSqliteTransaction(this.database, operation, (cause) =>
+        classifyMiniLilacSqliteDriverFailure(operationName, cause),
+      );
+    } finally {
+      this.transactionDepth -= 1;
+      if (this.transactionDepth === 0) this.flushPersistenceDiagnostics();
+    }
+  }
+
+  private decodeStructuralHistoryRow<K extends MiniLilacStructuralHistoryRecordKind>(input: {
+    readonly kind: K;
+    readonly row: unknown;
+    readonly recordId: string;
+  }): ResultType<MiniLilacStructuralHistoryValueFor<K> | null, PersistedDataError> {
+    const decoded = decodeMiniLilacStructuralHistoryRow({
+      ...input,
+      schemaVersion: MINI_LILAC_DATABASE_SCHEMA_VERSION,
+    });
+    let $decodedResultValue157462!: import("better-result").InferOk<NonNullable<typeof decoded>>;
+    let $decodedResultError157462!: import("better-result").InferErr<NonNullable<typeof decoded>>;
+    const $decodedResultOk157462 = Result.match<
+      import("better-result").InferOk<NonNullable<typeof decoded>>,
+      import("better-result").InferErr<NonNullable<typeof decoded>>,
+      boolean
+    >(decoded, {
+      ok: (value) => {
+        $decodedResultValue157462 = value;
+        return true;
+      },
+      err: (error) => {
+        $decodedResultError157462 = error;
+        return false;
+      },
+    });
+    if (($decodedResultOk157462 ? "ok" : "error") === "error") {
+      this.queuePersistenceDiagnostic($decodedResultError157462);
+      return Result.err($decodedResultError157462);
+    }
+    if ($decodedResultValue157462.value === null) return Result.ok(null);
+    // The codec preserves the input kind; this bridges that correlation, which
+    // TypeScript cannot retain through the generic Extract-based predicate.
+    return Result.ok(
+      $decodedResultValue157462.value.value as MiniLilacStructuralHistoryValueFor<K>,
+    );
+  }
+
+  private decodeRequiredStructuralHistoryRow<
+    K extends MiniLilacStructuralHistoryRecordKind,
+  >(input: {
+    readonly kind: K;
+    readonly row: unknown;
+    readonly recordId: string;
+  }): ResultType<
+    MiniLilacStructuralHistoryValueFor<K>,
+    PersistedDataError | MiniLilacHistoryRecordMissing
+  > {
+    const decoded = this.decodeStructuralHistoryRow(input);
+    let $decodedResultValue158366!: import("better-result").InferOk<NonNullable<typeof decoded>>;
+    let $decodedResultError158366!: import("better-result").InferErr<NonNullable<typeof decoded>>;
+    const $decodedResultOk158366 = Result.match<
+      import("better-result").InferOk<NonNullable<typeof decoded>>,
+      import("better-result").InferErr<NonNullable<typeof decoded>>,
+      boolean
+    >(decoded, {
+      ok: (value) => {
+        $decodedResultValue158366 = value;
+        return true;
+      },
+      err: (error) => {
+        $decodedResultError158366 = error;
+        return false;
+      },
+    });
+    if (($decodedResultOk158366 ? "ok" : "error") === "error")
+      return Result.err($decodedResultError158366);
+    if ($decodedResultValue158366 !== null) return Result.ok($decodedResultValue158366);
+    return Result.err(
+      new MiniLilacHistoryRecordMissing({
+        recordKind: input.kind,
+        recordId: input.recordId.slice(0, 128),
+        message: `Mini Lilac ${input.kind} record was not found`,
+      }),
+    );
+  }
+
+  private decodeStructuralHistoryRows<K extends MiniLilacStructuralHistoryRecordKind>(input: {
+    readonly kind: K;
+    readonly rows: readonly unknown[];
+    readonly recordId: string;
+  }): ResultType<readonly MiniLilacStructuralHistoryValueFor<K>[], PersistedDataError> {
+    const decoded = decodeMiniLilacStructuralHistoryRows({
+      ...input,
+      schemaVersion: MINI_LILAC_DATABASE_SCHEMA_VERSION,
+    });
+    let $decodedResultValue159070!: import("better-result").InferOk<NonNullable<typeof decoded>>;
+    let $decodedResultError159070!: import("better-result").InferErr<NonNullable<typeof decoded>>;
+    const $decodedResultOk159070 = Result.match<
+      import("better-result").InferOk<NonNullable<typeof decoded>>,
+      import("better-result").InferErr<NonNullable<typeof decoded>>,
+      boolean
+    >(decoded, {
+      ok: (value) => {
+        $decodedResultValue159070 = value;
+        return true;
+      },
+      err: (error) => {
+        $decodedResultError159070 = error;
+        return false;
+      },
+    });
+    if (($decodedResultOk159070 ? "ok" : "error") === "error") {
+      this.queuePersistenceDiagnostic($decodedResultError159070);
+      return Result.err($decodedResultError159070);
+    }
+    return Result.ok($decodedResultValue159070.value);
+  }
+
+  private runHistoryReadResult<T, E>(
+    operationName: string,
+    operation: () => ResultType<T, E>,
+  ): ResultType<T, E | MiniLilacSqliteDriverFailure> {
+    try {
+      return operation();
+    } catch (cause) {
+      if (Panic.is(cause)) throw cause;
+      if (!(cause instanceof Error)) throw cause;
+      const failure = classifyMiniLilacSqliteDriverFailure(operationName, cause);
+      if (failure !== undefined) return Result.err(failure);
+      throw cause;
+    } finally {
+      if (this.transactionDepth === 0) this.flushPersistenceDiagnostics();
+    }
+  }
+
+  private flushPersistenceDiagnostics(): void {
+    for (const diagnostic of this.pendingPersistenceDiagnostics.splice(0)) {
+      this.onPersistenceDiagnostic(diagnostic);
+    }
+  }
+
+  private queuePersistenceDiagnostic(error: PersistedDataError): void {
+    this.pendingPersistenceDiagnostics.push({
+      table: error.table,
+      field: error.field,
+      version: error.version,
+      issueCode: error.issueCode,
+      recordId: error.recordId,
+      message: error.message,
+    });
   }
 
   getHistoryStoreMetadata(): StoredHistoryStoreMetadata {
-    const row = historyStoreMetadataRowSchema.parse(
-      this.database
-        .query("SELECT namespace_id, created_at FROM history_store_metadata WHERE singleton = 1")
-        .get(),
+    return storeResultToLegacy(this.getHistoryStoreMetadataResult());
+  }
+
+  getHistoryStoreMetadataResult(): ResultType<
+    StoredHistoryStoreMetadata,
+    MiniLilacPersistenceError
+  > {
+    return this.runHistoryReadResult("getHistoryStoreMetadata", () =>
+      this.decodeRequiredStructuralHistoryRow({
+        kind: "store-metadata",
+        row: this.database
+          .query("SELECT namespace_id, created_at FROM history_store_metadata WHERE singleton = 1")
+          .get(),
+        recordId: "singleton",
+      }),
     );
-    return { namespaceId: row.namespace_id, createdAt: row.created_at };
   }
 
   getWorkspaceForSession(sessionId: string): StoredWorkspace {
-    const row = this.database
-      .query(
-        `SELECT workspaces.* FROM sessions
-         JOIN workspaces ON workspaces.id = sessions.workspace_id
-         WHERE sessions.id = ?`,
-      )
-      .get(sessionId);
-    if (!row) throw new Error(`Session '${sessionId}' was not found`);
-    return toWorkspace(row);
+    return storeResultToLegacy(this.getWorkspaceForSessionResult(sessionId));
+  }
+
+  getWorkspaceForSessionResult(
+    sessionId: string,
+  ): ResultType<StoredWorkspace, MiniLilacPersistenceError> {
+    return this.runHistoryReadResult("getWorkspaceForSession", () =>
+      this.decodeRequiredStructuralHistoryRow({
+        kind: "workspace",
+        row: this.database
+          .query(
+            `SELECT workspaces.* FROM sessions
+             JOIN workspaces ON workspaces.id = sessions.workspace_id
+             WHERE sessions.id = ?`,
+          )
+          .get(sessionId),
+        recordId: sessionId,
+      }),
+    );
   }
 
   listWorkspaces(): readonly StoredWorkspace[] {
-    return this.database
-      .query("SELECT * FROM workspaces ORDER BY created_at, rowid")
-      .all()
-      .map(toWorkspace);
+    return storeResultToLegacy(this.listWorkspacesResult());
+  }
+
+  listWorkspacesResult(): ResultType<readonly StoredWorkspace[], MiniLilacPersistenceError> {
+    return this.runHistoryReadResult("listWorkspaces", () => {
+      return this.decodeStructuralHistoryRows({
+        kind: "workspace",
+        rows: this.database.query("SELECT * FROM workspaces ORDER BY created_at, rowid").all(),
+        recordId: "workspace",
+      });
+    });
   }
 
   listWorkspaceSnapshots(workspaceId: string): readonly StoredWorkspaceSnapshot[] {
-    z.string().min(1).parse(workspaceId);
-    return this.database
-      .query(
-        `SELECT * FROM workspace_snapshots
-         WHERE workspace_id = ? ORDER BY created_at, rowid`,
-      )
-      .all(workspaceId)
-      .map(toWorkspaceSnapshot);
+    return storeResultToLegacy(this.listWorkspaceSnapshotsResult(workspaceId));
+  }
+
+  listWorkspaceSnapshotsResult(
+    workspaceId: string,
+  ): ResultType<readonly StoredWorkspaceSnapshot[], MiniLilacPersistenceError> {
+    return this.runHistoryReadResult("listWorkspaceSnapshots", () => {
+      return this.decodeStructuralHistoryRows({
+        kind: "workspace-snapshot",
+        rows: this.database
+          .query(
+            `SELECT * FROM workspace_snapshots
+           WHERE workspace_id = ? ORDER BY created_at, rowid`,
+          )
+          .all(workspaceId),
+        recordId: workspaceId,
+      });
+    });
   }
 
   listWorkspaceSnapshotGroups(): readonly StoredWorkspaceSnapshotGroup[] {
-    return this.listWorkspaces().map((workspace) => ({
-      workspace,
-      snapshots: this.listWorkspaceSnapshots(workspace.id),
-    }));
+    return storeResultToLegacy(this.listWorkspaceSnapshotGroupsResult());
+  }
+
+  listWorkspaceSnapshotGroupsResult(): ResultType<
+    readonly StoredWorkspaceSnapshotGroup[],
+    MiniLilacPersistenceError
+  > {
+    const workspaces = this.listWorkspacesResult();
+    let $workspacesResultValue163248!: import("better-result").InferOk<
+      NonNullable<typeof workspaces>
+    >;
+    let $workspacesResultError163248!: import("better-result").InferErr<
+      NonNullable<typeof workspaces>
+    >;
+    const $workspacesResultOk163248 = Result.match<
+      import("better-result").InferOk<NonNullable<typeof workspaces>>,
+      import("better-result").InferErr<NonNullable<typeof workspaces>>,
+      boolean
+    >(workspaces, {
+      ok: (value) => {
+        $workspacesResultValue163248 = value;
+        return true;
+      },
+      err: (error) => {
+        $workspacesResultError163248 = error;
+        return false;
+      },
+    });
+    if (($workspacesResultOk163248 ? "ok" : "error") === "error")
+      return Result.err($workspacesResultError163248);
+    const groups: StoredWorkspaceSnapshotGroup[] = [];
+    for (const workspace of $workspacesResultValue163248) {
+      const snapshots = this.listWorkspaceSnapshotsResult(workspace.id);
+      let $snapshotsResultValue163481!: import("better-result").InferOk<
+        NonNullable<typeof snapshots>
+      >;
+      let $snapshotsResultError163481!: import("better-result").InferErr<
+        NonNullable<typeof snapshots>
+      >;
+      const $snapshotsResultOk163481 = Result.match<
+        import("better-result").InferOk<NonNullable<typeof snapshots>>,
+        import("better-result").InferErr<NonNullable<typeof snapshots>>,
+        boolean
+      >(snapshots, {
+        ok: (value) => {
+          $snapshotsResultValue163481 = value;
+          return true;
+        },
+        err: (error) => {
+          $snapshotsResultError163481 = error;
+          return false;
+        },
+      });
+      if (($snapshotsResultOk163481 ? "ok" : "error") === "error")
+        return Result.err($snapshotsResultError163481);
+      groups.push({ workspace, snapshots: $snapshotsResultValue163481 });
+    }
+    return Result.ok(groups);
   }
 
   setWorkspaceSnapshotAvailability(input: SetStoredWorkspaceSnapshotAvailability): void {
-    z.string().min(1).parse(input.workspaceId);
-    const updates = z.array(workspaceSnapshotAvailabilityUpdateSchema).parse(input.updates);
-    if (new Set(updates.map((update) => update.snapshotId)).size !== updates.length) {
-      throw new Error("Workspace snapshot availability updates contain duplicate snapshot IDs");
+    storeResultToLegacy(this.setWorkspaceSnapshotAvailabilityResult(input));
+  }
+
+  setWorkspaceSnapshotAvailabilityResult(
+    input: SetStoredWorkspaceSnapshotAvailability,
+  ): ResultType<void, MiniLilacStoreOperationError> {
+    if (input.workspaceId.length === 0) {
+      return Result.err(
+        new MiniLilacStoreOperationRejected({
+          operation: "setWorkspaceSnapshotAvailability",
+          message: "Workspace ID must not be empty",
+        }),
+      );
     }
-    this.runImmediateTransaction(() => {
+    if (
+      input.updates.some(
+        (update) =>
+          update.snapshotId.length === 0 ||
+          (update.availability !== "available" && update.detail.length === 0),
+      )
+    ) {
+      return Result.err(
+        new MiniLilacStoreOperationRejected({
+          operation: "setWorkspaceSnapshotAvailability",
+          message: "Workspace snapshot availability update is invalid",
+        }),
+      );
+    }
+    const updates = input.updates;
+    if (new Set(updates.map((update) => update.snapshotId)).size !== updates.length) {
+      return Result.err(
+        new MiniLilacStoreOperationRejected({
+          operation: "setWorkspaceSnapshotAvailability",
+          message: "Workspace snapshot availability updates contain duplicate snapshot IDs",
+        }),
+      );
+    }
+    return this.runStoreTransactionResult("setWorkspaceSnapshotAvailability", () => {
       const workspace = this.database
         .query("SELECT 1 FROM workspaces WHERE id = ?")
         .get(input.workspaceId);
-      if (!workspace) throw new Error(`Workspace '${input.workspaceId}' was not found`);
+      if (!workspace) {
+        return Result.err(
+          new MiniLilacStoreOperationRejected({
+            operation: "setWorkspaceSnapshotAvailability",
+            message: `Workspace '${input.workspaceId}' was not found`,
+          }),
+        );
+      }
       for (const update of updates) {
         const changed = this.database
           .query(
@@ -3312,34 +5576,95 @@ export class MiniLilacSqliteStore {
           )
           .run(update.availability, update.detail, update.snapshotId, input.workspaceId);
         if (changed.changes !== 1) {
-          throw new Error(
-            `Workspace snapshot '${update.snapshotId}' was not found in workspace '${input.workspaceId}'`,
+          return Result.err(
+            new MiniLilacStoreOperationRejected({
+              operation: "setWorkspaceSnapshotAvailability",
+              message: `Workspace snapshot '${update.snapshotId}' was not found in workspace '${input.workspaceId}'`,
+            }),
           );
         }
       }
+      return Result.ok(undefined);
     });
   }
 
   deleteUnreferencedWorkspaceSnapshots(
     input: DeleteUnreferencedStoredWorkspaceSnapshots,
   ): readonly StoredWorkspaceSnapshot[] {
-    z.string().min(1).parse(input.workspaceId);
-    const snapshotIds = input.snapshotIds
-      ? z.array(z.string().min(1)).parse(input.snapshotIds)
-      : undefined;
-    if (snapshotIds && new Set(snapshotIds).size !== snapshotIds.length) {
-      throw new Error("Unreferenced workspace snapshot deletion contains duplicate snapshot IDs");
+    return storeResultToLegacy(this.deleteUnreferencedWorkspaceSnapshotsResult(input));
+  }
+
+  deleteUnreferencedWorkspaceSnapshotsResult(
+    input: DeleteUnreferencedStoredWorkspaceSnapshots,
+  ): ResultType<readonly StoredWorkspaceSnapshot[], MiniLilacStoreOperationError> {
+    if (input.workspaceId.length === 0) {
+      return Result.err(
+        new MiniLilacStoreOperationRejected({
+          operation: "deleteUnreferencedWorkspaceSnapshots",
+          message: "Workspace ID must not be empty",
+        }),
+      );
     }
-    return this.runImmediateTransaction(() => {
+    if (input.snapshotIds?.some((snapshotId) => snapshotId.length === 0)) {
+      return Result.err(
+        new MiniLilacStoreOperationRejected({
+          operation: "deleteUnreferencedWorkspaceSnapshots",
+          message: "Workspace snapshot deletion contains an invalid snapshot ID",
+        }),
+      );
+    }
+    const snapshotIds = input.snapshotIds;
+    if (snapshotIds && new Set(snapshotIds).size !== snapshotIds.length) {
+      return Result.err(
+        new MiniLilacStoreOperationRejected({
+          operation: "deleteUnreferencedWorkspaceSnapshots",
+          message: "Unreferenced workspace snapshot deletion contains duplicate snapshot IDs",
+        }),
+      );
+    }
+    return this.runStoreTransactionResult<
+      readonly StoredWorkspaceSnapshot[],
+      MiniLilacStoreOperationRejected | MiniLilacPersistenceError
+    >("deleteUnreferencedWorkspaceSnapshots", () => {
       const workspace = this.database
         .query("SELECT 1 FROM workspaces WHERE id = ?")
         .get(input.workspaceId);
-      if (!workspace) throw new Error(`Workspace '${input.workspaceId}' was not found`);
-      const candidates = this.listWorkspaceSnapshots(input.workspaceId).filter(
+      if (!workspace) {
+        return Result.err(
+          new MiniLilacStoreOperationRejected({
+            operation: "deleteUnreferencedWorkspaceSnapshots",
+            message: `Workspace '${input.workspaceId}' was not found`,
+          }),
+        );
+      }
+      const candidates = this.listWorkspaceSnapshotsResult(input.workspaceId);
+      let $candidatesResultValue168258!: import("better-result").InferOk<
+        NonNullable<typeof candidates>
+      >;
+      let $candidatesResultError168258!: import("better-result").InferErr<
+        NonNullable<typeof candidates>
+      >;
+      const $candidatesResultOk168258 = Result.match<
+        import("better-result").InferOk<NonNullable<typeof candidates>>,
+        import("better-result").InferErr<NonNullable<typeof candidates>>,
+        boolean
+      >(candidates, {
+        ok: (value) => {
+          $candidatesResultValue168258 = value;
+          return true;
+        },
+        err: (error) => {
+          $candidatesResultError168258 = error;
+          return false;
+        },
+      });
+      if (($candidatesResultOk168258 ? "ok" : "error") === "error")
+        return Result.err($candidatesResultError168258);
+      const selectedCandidates = $candidatesResultValue168258.filter(
         (snapshot) => snapshotIds === undefined || snapshotIds.includes(snapshot.id),
       );
       const deleted: StoredWorkspaceSnapshot[] = [];
-      for (const snapshot of candidates) {
+      for (const snapshot of selectedCandidates) {
         const result = this.database
           .query(
             `DELETE FROM workspace_snapshots
@@ -3353,7 +5678,7 @@ export class MiniLilacSqliteStore {
           .run(snapshot.id, input.workspaceId);
         if (result.changes === 1) deleted.push(snapshot);
       }
-      return deleted;
+      return Result.ok(deleted);
     });
   }
 
@@ -3361,10 +5686,8 @@ export class MiniLilacSqliteStore {
     sessionId: string,
     ownerValue?: WorkspaceHistoryAvailabilityOwner,
   ): void {
-    const owner =
-      ownerValue === undefined ? undefined : workspaceHistoryOwnerSchema.parse(ownerValue);
     const workspace = this.getWorkspaceForSession(sessionId);
-    this.assertWorkspaceHistoryAvailableForOwner(workspace.id, sessionId, owner);
+    this.assertWorkspaceHistoryAvailableForOwner(workspace.id, sessionId, ownerValue);
   }
 
   createOrReuseWorkspaceSnapshot(input: {
@@ -3375,12 +5698,33 @@ export class MiniLilacSqliteStore {
     readonly formatVersion: number;
     readonly createdAt?: string;
   }): StoredWorkspaceSnapshot {
-    z.string().min(1).parse(input.id);
-    z.string().min(1).parse(input.workspaceId);
-    z.string().min(1).parse(input.rootTreeOid);
-    z.string().min(1).parse(input.gitRef);
-    z.number().int().positive().parse(input.formatVersion);
-    return this.database.transaction(() => {
+    return storeResultToLegacy(this.createOrReuseWorkspaceSnapshotResult(input));
+  }
+
+  createOrReuseWorkspaceSnapshotResult(input: {
+    readonly id: string;
+    readonly workspaceId: string;
+    readonly rootTreeOid: string;
+    readonly gitRef: string;
+    readonly formatVersion: number;
+    readonly createdAt?: string;
+  }): ResultType<StoredWorkspaceSnapshot, MiniLilacStoreOperationError> {
+    if (
+      input.id.length === 0 ||
+      input.workspaceId.length === 0 ||
+      input.rootTreeOid.length === 0 ||
+      input.gitRef.length === 0 ||
+      !Number.isInteger(input.formatVersion) ||
+      input.formatVersion <= 0
+    ) {
+      return Result.err(
+        new MiniLilacStoreOperationRejected({
+          operation: "createOrReuseWorkspaceSnapshot",
+          message: "Workspace snapshot input is invalid",
+        }),
+      );
+    }
+    return this.runStoreTransactionResult("createOrReuseWorkspaceSnapshot", () => {
       this.database
         .query(
           `INSERT INTO workspace_snapshots
@@ -3410,49 +5754,260 @@ export class MiniLilacSqliteStore {
            WHERE workspace_id = ? AND root_tree_oid = ? AND format_version = ?`,
         )
         .get(input.workspaceId, input.rootTreeOid, input.formatVersion);
-      return toWorkspaceSnapshot(row);
-    })();
+      const snapshot = this.decodeRequiredStructuralHistoryRow({
+        kind: "workspace-snapshot",
+        row,
+        recordId: input.id,
+      });
+      let $snapshotResultValue171884!: import("better-result").InferOk<
+        NonNullable<typeof snapshot>
+      >;
+      let $snapshotResultError171884!: import("better-result").InferErr<
+        NonNullable<typeof snapshot>
+      >;
+      const $snapshotResultOk171884 = Result.match<
+        import("better-result").InferOk<NonNullable<typeof snapshot>>,
+        import("better-result").InferErr<NonNullable<typeof snapshot>>,
+        boolean
+      >(snapshot, {
+        ok: (value) => {
+          $snapshotResultValue171884 = value;
+          return true;
+        },
+        err: (error) => {
+          $snapshotResultError171884 = error;
+          return false;
+        },
+      });
+      if (($snapshotResultOk171884 ? "ok" : "error") === "error")
+        return Result.err($snapshotResultError171884);
+      return Result.ok($snapshotResultValue171884);
+    });
   }
 
   getWorkspaceSnapshot(snapshotId: string): StoredWorkspaceSnapshot | null {
-    z.string().min(1).parse(snapshotId);
-    const row = this.database
-      .query("SELECT * FROM workspace_snapshots WHERE id = ?")
-      .get(snapshotId);
-    return row ? toWorkspaceSnapshot(row) : null;
+    return storeResultToLegacy(this.getWorkspaceSnapshotResult(snapshotId));
+  }
+
+  getWorkspaceSnapshotResult(
+    snapshotId: string,
+  ): ResultType<StoredWorkspaceSnapshot | null, MiniLilacPersistenceError> {
+    return this.runHistoryReadResult("getWorkspaceSnapshot", () =>
+      this.decodeStructuralHistoryRow({
+        kind: "workspace-snapshot",
+        row: this.database.query("SELECT * FROM workspace_snapshots WHERE id = ?").get(snapshotId),
+        recordId: snapshotId,
+      }),
+    );
   }
 
   getHistoryState(stateId: string): StoredHistoryState {
-    const row = this.database.query("SELECT * FROM history_states WHERE id = ?").get(stateId);
-    if (!row) throw new Error(`History state '${stateId}' was not found`);
-    return toHistoryState(row);
+    return storeResultToLegacy(this.getHistoryStateResult(stateId));
+  }
+
+  getHistoryStateResult(
+    stateId: string,
+  ): ResultType<StoredHistoryState, MiniLilacPersistenceError> {
+    return this.runHistoryReadResult("getHistoryState", () =>
+      this.decodeRequiredStructuralHistoryRow({
+        kind: "state",
+        row: this.database.query("SELECT * FROM history_states WHERE id = ?").get(stateId),
+        recordId: stateId,
+      }),
+    );
   }
 
   getHistoryStateModelMessages(stateId: string): ModelMessage[] {
-    const state = this.getHistoryState(stateId);
-    return modelMessagesSchema.parse(
-      this.readSerializedChain(state.sessionId, "model", state.modelHeadId).map(deserialize),
-    );
+    return storeResultToLegacy(this.getHistoryStateModelMessagesResult(stateId));
+  }
+
+  getHistoryStateModelMessagesResult(
+    stateId: string,
+  ): ResultType<ModelMessage[], MiniLilacPersistenceError> {
+    const state = this.getHistoryStateResult(stateId);
+    let $stateResultValue173535!: import("better-result").InferOk<NonNullable<typeof state>>;
+    let $stateResultError173535!: import("better-result").InferErr<NonNullable<typeof state>>;
+    const $stateResultOk173535 = Result.match<
+      import("better-result").InferOk<NonNullable<typeof state>>,
+      import("better-result").InferErr<NonNullable<typeof state>>,
+      boolean
+    >(state, {
+      ok: (value) => {
+        $stateResultValue173535 = value;
+        return true;
+      },
+      err: (error) => {
+        $stateResultError173535 = error;
+        return false;
+      },
+    });
+    if (($stateResultOk173535 ? "ok" : "error") === "error")
+      return Result.err($stateResultError173535);
+    return this.runHistoryReadResult("getHistoryStateModelMessages", () => {
+      const rawValues = this.readSerializedChainResult(
+        $stateResultValue173535.sessionId,
+        "model",
+        $stateResultValue173535.modelHeadId,
+      );
+      let $rawValuesResultValue173735!: import("better-result").InferOk<
+        NonNullable<typeof rawValues>
+      >;
+      let $rawValuesResultError173735!: import("better-result").InferErr<
+        NonNullable<typeof rawValues>
+      >;
+      const $rawValuesResultOk173735 = Result.match<
+        import("better-result").InferOk<NonNullable<typeof rawValues>>,
+        import("better-result").InferErr<NonNullable<typeof rawValues>>,
+        boolean
+      >(rawValues, {
+        ok: (value) => {
+          $rawValuesResultValue173735 = value;
+          return true;
+        },
+        err: (error) => {
+          $rawValuesResultError173735 = error;
+          return false;
+        },
+      });
+      if (($rawValuesResultOk173735 ? "ok" : "error") === "error") {
+        this.queuePersistenceDiagnostic($rawValuesResultError173735);
+        return Result.err($rawValuesResultError173735);
+      }
+      const decoded = decodeMiniLilacModelTranscript({
+        rawValues: $rawValuesResultValue173735,
+        schemaVersion: MINI_LILAC_DATABASE_SCHEMA_VERSION,
+        recordId: $stateResultValue173535.id,
+      });
+      let $decodedResultValue174033!: import("better-result").InferOk<NonNullable<typeof decoded>>;
+      let $decodedResultError174033!: import("better-result").InferErr<NonNullable<typeof decoded>>;
+      const $decodedResultOk174033 = Result.match<
+        import("better-result").InferOk<NonNullable<typeof decoded>>,
+        import("better-result").InferErr<NonNullable<typeof decoded>>,
+        boolean
+      >(decoded, {
+        ok: (value) => {
+          $decodedResultValue174033 = value;
+          return true;
+        },
+        err: (error) => {
+          $decodedResultError174033 = error;
+          return false;
+        },
+      });
+      if (($decodedResultOk174033 ? "ok" : "error") === "error") {
+        this.queuePersistenceDiagnostic($decodedResultError174033);
+        return Result.err($decodedResultError174033);
+      }
+      return Result.ok($decodedResultValue174033.value);
+    });
   }
 
   getHistoryStateUiMessages(stateId: string): MiniLilacUIMessage[] {
-    const state = this.getHistoryState(stateId);
-    return miniLilacMessagesSchema.parse(
-      this.readSerializedChain(state.sessionId, "ui", state.uiHeadId).map(deserialize),
-    );
+    return storeResultToLegacy(this.getHistoryStateUiMessagesResult(stateId));
+  }
+
+  getHistoryStateUiMessagesResult(
+    stateId: string,
+  ): ResultType<MiniLilacUIMessage[], MiniLilacPersistenceError> {
+    const state = this.getHistoryStateResult(stateId);
+    let $stateResultValue174705!: import("better-result").InferOk<NonNullable<typeof state>>;
+    let $stateResultError174705!: import("better-result").InferErr<NonNullable<typeof state>>;
+    const $stateResultOk174705 = Result.match<
+      import("better-result").InferOk<NonNullable<typeof state>>,
+      import("better-result").InferErr<NonNullable<typeof state>>,
+      boolean
+    >(state, {
+      ok: (value) => {
+        $stateResultValue174705 = value;
+        return true;
+      },
+      err: (error) => {
+        $stateResultError174705 = error;
+        return false;
+      },
+    });
+    if (($stateResultOk174705 ? "ok" : "error") === "error")
+      return Result.err($stateResultError174705);
+    return this.runHistoryReadResult("getHistoryStateUiMessages", () => {
+      const rawValues = this.readSerializedChainResult(
+        $stateResultValue174705.sessionId,
+        "ui",
+        $stateResultValue174705.uiHeadId,
+      );
+      let $rawValuesResultValue174902!: import("better-result").InferOk<
+        NonNullable<typeof rawValues>
+      >;
+      let $rawValuesResultError174902!: import("better-result").InferErr<
+        NonNullable<typeof rawValues>
+      >;
+      const $rawValuesResultOk174902 = Result.match<
+        import("better-result").InferOk<NonNullable<typeof rawValues>>,
+        import("better-result").InferErr<NonNullable<typeof rawValues>>,
+        boolean
+      >(rawValues, {
+        ok: (value) => {
+          $rawValuesResultValue174902 = value;
+          return true;
+        },
+        err: (error) => {
+          $rawValuesResultError174902 = error;
+          return false;
+        },
+      });
+      if (($rawValuesResultOk174902 ? "ok" : "error") === "error") {
+        this.queuePersistenceDiagnostic($rawValuesResultError174902);
+        return Result.err($rawValuesResultError174902);
+      }
+      const decoded = decodeMiniLilacUiTranscript({
+        rawValues: $rawValuesResultValue174902,
+        schemaVersion: MINI_LILAC_DATABASE_SCHEMA_VERSION,
+        recordId: $stateResultValue174705.id,
+      });
+      let $decodedResultValue175194!: import("better-result").InferOk<NonNullable<typeof decoded>>;
+      let $decodedResultError175194!: import("better-result").InferErr<NonNullable<typeof decoded>>;
+      const $decodedResultOk175194 = Result.match<
+        import("better-result").InferOk<NonNullable<typeof decoded>>,
+        import("better-result").InferErr<NonNullable<typeof decoded>>,
+        boolean
+      >(decoded, {
+        ok: (value) => {
+          $decodedResultValue175194 = value;
+          return true;
+        },
+        err: (error) => {
+          $decodedResultError175194 = error;
+          return false;
+        },
+      });
+      if (($decodedResultOk175194 ? "ok" : "error") === "error") {
+        this.queuePersistenceDiagnostic($decodedResultError175194);
+        return Result.err($decodedResultError175194);
+      }
+      return Result.ok($decodedResultValue175194.value);
+    });
   }
 
   getCurrentHistoryState(sessionId: string): StoredHistoryState {
-    const row = this.database
-      .query(
-        `SELECT state.* FROM session_history AS history
-         JOIN history_states AS state
-           ON state.id = history.current_state_id AND state.session_id = history.session_id
-         WHERE history.session_id = ?`,
-      )
-      .get(sessionId);
-    if (!row) throw new Error(`Session '${sessionId}' has no history cursor`);
-    return toHistoryState(row);
+    return storeResultToLegacy(this.getCurrentHistoryStateResult(sessionId));
+  }
+
+  getCurrentHistoryStateResult(
+    sessionId: string,
+  ): ResultType<StoredHistoryState, MiniLilacPersistenceError> {
+    return this.runHistoryReadResult("getCurrentHistoryState", () =>
+      this.decodeRequiredStructuralHistoryRow({
+        kind: "state",
+        row: this.database
+          .query(
+            `SELECT state.* FROM session_history AS history
+             JOIN history_states AS state
+               ON state.id = history.current_state_id AND state.session_id = history.session_id
+             WHERE history.session_id = ?`,
+          )
+          .get(sessionId),
+        recordId: sessionId,
+      }),
+    );
   }
 
   getMiniMainClaudeState(inputValue: {
@@ -3460,29 +6015,97 @@ export class MiniLilacSqliteStore {
     readonly historyStateId: string;
     readonly providerId: string;
   }): MiniMainClaudeState {
-    const input = miniMainClaudeStateLookupSchema.parse(inputValue);
-    return this.database.transaction(() => {
+    return storeResultToLegacy(this.getMiniMainClaudeStateResult(inputValue));
+  }
+
+  getMiniMainClaudeStateResult(inputValue: {
+    readonly sessionId: string;
+    readonly historyStateId: string;
+    readonly providerId: string;
+  }): ResultType<MiniMainClaudeState, MiniLilacStoreOperationError> {
+    const input = inputValue;
+    return this.runStoreTransactionResult("getMiniMainClaudeState", () => {
       const row = this.database
         .query("SELECT * FROM history_states WHERE id = ? AND session_id = ?")
         .get(input.historyStateId, input.sessionId);
       if (!row) {
-        throw new Error(
-          `History state '${input.historyStateId}' does not belong to session '${input.sessionId}'`,
+        return Result.err(
+          new MiniLilacStoreOperationRejected({
+            operation: "getMiniMainClaudeState",
+            message: `History state '${input.historyStateId}' does not belong to session '${input.sessionId}'`,
+          }),
         );
       }
-      const historyState = toHistoryState(row);
+      const decodedState = this.decodeRequiredStructuralHistoryRow({
+        kind: "state",
+        row,
+        recordId: input.historyStateId,
+      });
+      let $decodedStateResultValue177402!: import("better-result").InferOk<
+        NonNullable<typeof decodedState>
+      >;
+      let $decodedStateResultError177402!: import("better-result").InferErr<
+        NonNullable<typeof decodedState>
+      >;
+      const $decodedStateResultOk177402 = Result.match<
+        import("better-result").InferOk<NonNullable<typeof decodedState>>,
+        import("better-result").InferErr<NonNullable<typeof decodedState>>,
+        boolean
+      >(decodedState, {
+        ok: (value) => {
+          $decodedStateResultValue177402 = value;
+          return true;
+        },
+        err: (error) => {
+          $decodedStateResultError177402 = error;
+          return false;
+        },
+      });
+      if (($decodedStateResultOk177402 ? "ok" : "error") === "error")
+        return Result.err($decodedStateResultError177402);
+      const historyState = $decodedStateResultValue177402;
       const bindingRow = this.database
         .query(
           `SELECT * FROM mini_main_claude_bindings
            WHERE session_id = ? AND history_state_id = ? AND provider_id = ?`,
         )
         .get(input.sessionId, input.historyStateId, input.providerId);
-      return {
+      let binding: MiniMainClaudeSessionBinding | null = null;
+      if (bindingRow) {
+        const decodedBinding = decodeMiniMainClaudeBindingRow(
+          bindingRow,
+          `${input.sessionId}:${input.providerId}`,
+        );
+        let $decodedBindingResultValue178041!: import("better-result").InferOk<
+          NonNullable<typeof decodedBinding>
+        >;
+        let $decodedBindingResultError178041!: import("better-result").InferErr<
+          NonNullable<typeof decodedBinding>
+        >;
+        const $decodedBindingResultOk178041 = Result.match<
+          import("better-result").InferOk<NonNullable<typeof decodedBinding>>,
+          import("better-result").InferErr<NonNullable<typeof decodedBinding>>,
+          boolean
+        >(decodedBinding, {
+          ok: (value) => {
+            $decodedBindingResultValue178041 = value;
+            return true;
+          },
+          err: (error) => {
+            $decodedBindingResultError178041 = error;
+            return false;
+          },
+        });
+        if (($decodedBindingResultOk178041 ? "ok" : "error") === "error")
+          return Result.err($decodedBindingResultError178041);
+        binding = $decodedBindingResultValue178041;
+      }
+      return Result.ok({
         historyState,
         providerState: historyState.providerState,
-        binding: bindingRow ? toMiniMainClaudeBinding(bindingRow) : null,
-      };
-    })();
+        binding,
+      });
+    });
   }
 
   getMiniMainClaudeSessionAttempt(inputValue: {
@@ -3491,31 +6114,76 @@ export class MiniLilacSqliteStore {
     readonly requestId: string;
     readonly attemptIndex: number;
   }): MiniMainClaudeSessionAttempt | null {
-    const input = miniMainClaudeSessionAttemptKeySchema.parse(inputValue);
-    const row = this.database
-      .query(
-        `SELECT * FROM mini_main_claude_attempts
-         WHERE session_id = ? AND provider_id = ? AND request_id = ? AND attempt_index = ?`,
-      )
-      .get(input.lilacSessionId, input.providerId, input.requestId, input.attemptIndex);
-    return row ? toMiniMainClaudeAttempt(row) : null;
+    return storeResultToLegacy(this.getMiniMainClaudeSessionAttemptResult(inputValue));
+  }
+
+  getMiniMainClaudeSessionAttemptResult(inputValue: {
+    readonly providerId: string;
+    readonly lilacSessionId: string;
+    readonly requestId: string;
+    readonly attemptIndex: number;
+  }): ResultType<MiniMainClaudeSessionAttempt | null, MiniLilacPersistenceError> {
+    const input = inputValue;
+    return this.runHistoryReadResult("getMiniMainClaudeSessionAttempt", () => {
+      const row = this.database
+        .query(
+          `SELECT * FROM mini_main_claude_attempts
+           WHERE session_id = ? AND provider_id = ? AND request_id = ? AND attempt_index = ?`,
+        )
+        .get(input.lilacSessionId, input.providerId, input.requestId, input.attemptIndex);
+      return row
+        ? decodeMiniMainClaudeAttemptRow(
+            row,
+            `${input.lilacSessionId}:${input.providerId}:${input.requestId}:${input.attemptIndex}`,
+          )
+        : Result.ok(null);
+    });
   }
 
   reserveMiniMainClaudeSessionAttempt(
     inputValue: ReserveMiniMainClaudeSessionAttempt,
   ): MiniMainClaudeSessionAttempt {
-    const input = reserveMiniMainClaudeSessionAttemptSchema.parse(inputValue);
+    return storeResultToLegacy(this.reserveMiniMainClaudeSessionAttemptResult(inputValue));
+  }
+
+  reserveMiniMainClaudeSessionAttemptResult(
+    inputValue: ReserveMiniMainClaudeSessionAttempt,
+  ): ResultType<MiniMainClaudeSessionAttempt, MiniLilacStoreOperationError> {
+    const input = inputValue;
     if ((input.sourceSessionId === null) !== (input.expectedBindingRevision === null)) {
-      throw new Error("A Claude fork attempt requires both source session and binding revision");
+      return Result.err(
+        new MiniLilacStoreOperationRejected({
+          operation: "reserveMiniMainClaudeSessionAttempt",
+          message: "A Claude fork attempt requires both source session and binding revision",
+        }),
+      );
     }
-    return this.runImmediateTransaction(() => {
-      const source = this.getMiniMainClaudeState({
+    return this.runStoreTransactionResult("reserveMiniMainClaudeSessionAttempt", () => {
+      const source = this.getMiniMainClaudeStateResult({
         sessionId: input.lilacSessionId,
         historyStateId: input.sourceHistoryStateId,
         providerId: input.providerId,
       });
+      let $sourceResultValue180551!: import("better-result").InferOk<NonNullable<typeof source>>;
+      let $sourceResultError180551!: import("better-result").InferErr<NonNullable<typeof source>>;
+      const $sourceResultOk180551 = Result.match<
+        import("better-result").InferOk<NonNullable<typeof source>>,
+        import("better-result").InferErr<NonNullable<typeof source>>,
+        boolean
+      >(source, {
+        ok: (value) => {
+          $sourceResultValue180551 = value;
+          return true;
+        },
+        err: (error) => {
+          $sourceResultError180551 = error;
+          return false;
+        },
+      });
+      if (($sourceResultOk180551 ? "ok" : "error") === "error")
+        return Result.err($sourceResultError180551);
       if (input.expectedBindingRevision !== null) {
-        const binding = source.binding;
+        const binding = $sourceResultValue180551.binding;
         if (
           binding === null ||
           binding.revision !== input.expectedBindingRevision ||
@@ -3524,19 +6192,54 @@ export class MiniLilacSqliteStore {
           binding.executionScopeHashVersion !== input.executionScopeHashVersion ||
           binding.executionScopeHash !== input.executionScopeHash
         ) {
-          throw new Error("Claude attempt source binding changed before reservation");
+          return Result.err(
+            new MiniLilacStoreOperationRejected({
+              operation: "reserveMiniMainClaudeSessionAttempt",
+              message: "Claude attempt source binding changed before reservation",
+            }),
+          );
         }
       }
-      const activeCount = z.object({ count: z.number().int().nonnegative() }).parse(
-        this.database
+      const activeCount = decodeRequiredMiniLilacStoreRow({
+        kind: "count",
+        row: this.database
           .query(
             `SELECT COUNT(*) AS count FROM mini_main_claude_attempts
-             WHERE session_id = ? AND provider_id = ? AND state = 'active'`,
+               WHERE session_id = ? AND provider_id = ? AND state = 'active'`,
           )
           .get(input.lilacSessionId, input.providerId),
-      ).count;
-      if (activeCount >= MINI_MAIN_CLAUDE_ATTEMPT_RETENTION_LIMIT) {
-        throw new Error("Too many active Mini main Claude attempts are retained");
+        schemaVersion: MINI_LILAC_DATABASE_SCHEMA_VERSION,
+        recordId: `${input.lilacSessionId}:${input.providerId}:active-main-attempt-count`,
+      });
+      let $activeCountResultValue181580!: import("better-result").InferOk<
+        NonNullable<typeof activeCount>
+      >;
+      let $activeCountResultError181580!: import("better-result").InferErr<
+        NonNullable<typeof activeCount>
+      >;
+      const $activeCountResultOk181580 = Result.match<
+        import("better-result").InferOk<NonNullable<typeof activeCount>>,
+        import("better-result").InferErr<NonNullable<typeof activeCount>>,
+        boolean
+      >(activeCount, {
+        ok: (value) => {
+          $activeCountResultValue181580 = value;
+          return true;
+        },
+        err: (error) => {
+          $activeCountResultError181580 = error;
+          return false;
+        },
+      });
+      if (($activeCountResultOk181580 ? "ok" : "error") === "error")
+        return Result.err($activeCountResultError181580);
+      if ($activeCountResultValue181580.count >= MINI_MAIN_CLAUDE_ATTEMPT_RETENTION_LIMIT) {
+        return Result.err(
+          new MiniLilacStoreOperationRejected({
+            operation: "reserveMiniMainClaudeSessionAttempt",
+            message: "Too many active Mini main Claude attempts are retained",
+          }),
+        );
       }
       const now = new Date().toISOString();
       this.database
@@ -3565,34 +6268,97 @@ export class MiniLilacSqliteStore {
           now,
         );
       this.pruneMiniMainClaudeAttempts(input.lilacSessionId, input.providerId);
-      const attempt = this.getMiniMainClaudeSessionAttempt({
+      const attempt = this.getMiniMainClaudeSessionAttemptResult({
         providerId: input.providerId,
         lilacSessionId: input.lilacSessionId,
         requestId: input.requestId,
         attemptIndex: input.attemptIndex,
       });
-      if (attempt === null) throw new Error("Reserved Claude attempt was not retained");
-      return attempt;
+      let $attemptResultValue183642!: import("better-result").InferOk<NonNullable<typeof attempt>>;
+      let $attemptResultError183642!: import("better-result").InferErr<NonNullable<typeof attempt>>;
+      const $attemptResultOk183642 = Result.match<
+        import("better-result").InferOk<NonNullable<typeof attempt>>,
+        import("better-result").InferErr<NonNullable<typeof attempt>>,
+        boolean
+      >(attempt, {
+        ok: (value) => {
+          $attemptResultValue183642 = value;
+          return true;
+        },
+        err: (error) => {
+          $attemptResultError183642 = error;
+          return false;
+        },
+      });
+      if (($attemptResultOk183642 ? "ok" : "error") === "error")
+        return Result.err($attemptResultError183642);
+      if ($attemptResultValue183642 === null) {
+        return Result.err(
+          new MiniLilacStoreOperationRejected({
+            operation: "reserveMiniMainClaudeSessionAttempt",
+            message: "Reserved Claude attempt was not retained",
+          }),
+        );
+      }
+      return Result.ok($attemptResultValue183642);
     });
   }
 
   recordMiniMainClaudeSessionAttemptOutcome(
     inputValue: RecordMiniMainClaudeSessionAttemptOutcome,
   ): MiniMainClaudeSessionAttempt {
-    const input = recordMiniMainClaudeSessionAttemptOutcomeSchema.parse(inputValue);
-    return this.runImmediateTransaction(() => {
+    return storeResultToLegacy(this.recordMiniMainClaudeSessionAttemptOutcomeResult(inputValue));
+  }
+
+  recordMiniMainClaudeSessionAttemptOutcomeResult(
+    inputValue: RecordMiniMainClaudeSessionAttemptOutcome,
+  ): ResultType<MiniMainClaudeSessionAttempt, MiniLilacStoreOperationError> {
+    const input = inputValue;
+    return this.runStoreTransactionResult<
+      MiniMainClaudeSessionAttempt,
+      MiniLilacStoreOperationError
+    >("recordMiniMainClaudeSessionAttemptOutcome", () => {
       const attemptKey = {
         providerId: input.providerId,
         lilacSessionId: input.lilacSessionId,
         requestId: input.requestId,
         attemptIndex: input.attemptIndex,
       };
-      const current = this.getMiniMainClaudeSessionAttempt(attemptKey);
-      if (current === null) throw new Error(`Claude attempt '${input.requestId}' was not found`);
-      if (current.state !== "active") {
-        if (current.state === input.state) return current;
-        throw new Error(
-          `Claude attempt '${input.requestId}' is already terminal as '${current.state}'`,
+      const current = this.getMiniMainClaudeSessionAttemptResult(attemptKey);
+      let $currentResultValue185108!: import("better-result").InferOk<NonNullable<typeof current>>;
+      let $currentResultError185108!: import("better-result").InferErr<NonNullable<typeof current>>;
+      const $currentResultOk185108 = Result.match<
+        import("better-result").InferOk<NonNullable<typeof current>>,
+        import("better-result").InferErr<NonNullable<typeof current>>,
+        boolean
+      >(current, {
+        ok: (value) => {
+          $currentResultValue185108 = value;
+          return true;
+        },
+        err: (error) => {
+          $currentResultError185108 = error;
+          return false;
+        },
+      });
+      if (($currentResultOk185108 ? "ok" : "error") === "error")
+        return Result.err($currentResultError185108);
+      if ($currentResultValue185108 === null) {
+        return Result.err(
+          new MiniLilacStoreOperationRejected({
+            operation: "recordMiniMainClaudeSessionAttemptOutcome",
+            message: `Claude attempt '${input.requestId}' was not found`,
+          }),
+        );
+      }
+      if ($currentResultValue185108.state !== "active") {
+        if ($currentResultValue185108.state === input.state)
+          return Result.ok($currentResultValue185108);
+        return Result.err(
+          new MiniLilacStoreOperationRejected({
+            operation: "recordMiniMainClaudeSessionAttemptOutcome",
+            message: `Claude attempt '${input.requestId}' is already terminal as '${$currentResultValue185108.state}'`,
+          }),
         );
       }
       const updated = this.database
@@ -3609,12 +6375,43 @@ export class MiniLilacSqliteStore {
           input.requestId,
           input.attemptIndex,
         );
-      if (updated.changes !== 1) throw new Error("Claude attempt outcome lost its active fence");
+      if (updated.changes !== 1) {
+        return Result.err(
+          new MiniLilacStoreOperationRejected({
+            operation: "recordMiniMainClaudeSessionAttemptOutcome",
+            message: "Claude attempt outcome lost its active fence",
+          }),
+        );
+      }
       this.pruneMiniMainClaudeAttempts(input.lilacSessionId, input.providerId);
-      const attempt = this.getMiniMainClaudeSessionAttempt(attemptKey);
-      if (attempt === null)
-        throw new Error("Updated Claude attempt exceeded retention immediately");
-      return attempt;
+      const attempt = this.getMiniMainClaudeSessionAttemptResult(attemptKey);
+      let $attemptResultValue186782!: import("better-result").InferOk<NonNullable<typeof attempt>>;
+      let $attemptResultError186782!: import("better-result").InferErr<NonNullable<typeof attempt>>;
+      const $attemptResultOk186782 = Result.match<
+        import("better-result").InferOk<NonNullable<typeof attempt>>,
+        import("better-result").InferErr<NonNullable<typeof attempt>>,
+        boolean
+      >(attempt, {
+        ok: (value) => {
+          $attemptResultValue186782 = value;
+          return true;
+        },
+        err: (error) => {
+          $attemptResultError186782 = error;
+          return false;
+        },
+      });
+      if (($attemptResultOk186782 ? "ok" : "error") === "error")
+        return Result.err($attemptResultError186782);
+      if ($attemptResultValue186782 === null) {
+        return Result.err(
+          new MiniLilacStoreOperationRejected({
+            operation: "recordMiniMainClaudeSessionAttemptOutcome",
+            message: "Updated Claude attempt exceeded retention immediately",
+          }),
+        );
+      }
+      return Result.ok($attemptResultValue186782);
     });
   }
 
@@ -3622,16 +6419,55 @@ export class MiniLilacSqliteStore {
     readonly sessionId: string;
     readonly providerId: string;
   }): MiniNamedClaudeState {
-    const input = miniNamedClaudeStateLookupSchema.parse(inputValue);
-    const session = this.database.query("SELECT 1 FROM sessions WHERE id = ?").get(input.sessionId);
-    if (!session) throw new Error(`Session '${input.sessionId}' was not found`);
-    const row = this.database
-      .query(
-        `SELECT * FROM mini_named_claude_bindings
-         WHERE session_id = ? AND provider_id = ?`,
-      )
-      .get(input.sessionId, input.providerId);
-    return { binding: row ? toMiniNamedClaudeBinding(row) : null };
+    return storeResultToLegacy(this.getMiniNamedClaudeStateResult(inputValue));
+  }
+
+  getMiniNamedClaudeStateResult(inputValue: {
+    readonly sessionId: string;
+    readonly providerId: string;
+  }): ResultType<MiniNamedClaudeState, MiniLilacStoreOperationError> {
+    const input = inputValue;
+    return this.runHistoryReadResult("getMiniNamedClaudeState", () => {
+      const session = this.database
+        .query("SELECT 1 FROM sessions WHERE id = ?")
+        .get(input.sessionId);
+      if (!session) {
+        return Result.err(
+          new MiniLilacHistoryRecordMissing({
+            recordKind: "session",
+            recordId: input.sessionId,
+            message: `Session '${input.sessionId}' was not found`,
+          }),
+        );
+      }
+      const row = this.database
+        .query(
+          `SELECT * FROM mini_named_claude_bindings
+           WHERE session_id = ? AND provider_id = ?`,
+        )
+        .get(input.sessionId, input.providerId);
+      if (!row) return Result.ok({ binding: null });
+      const binding = decodeMiniMainClaudeBindingRow(row, `${input.sessionId}:${input.providerId}`);
+      let $bindingResultValue188433!: import("better-result").InferOk<NonNullable<typeof binding>>;
+      let $bindingResultError188433!: import("better-result").InferErr<NonNullable<typeof binding>>;
+      const $bindingResultOk188433 = Result.match<
+        import("better-result").InferOk<NonNullable<typeof binding>>,
+        import("better-result").InferErr<NonNullable<typeof binding>>,
+        boolean
+      >(binding, {
+        ok: (value) => {
+          $bindingResultValue188433 = value;
+          return true;
+        },
+        err: (error) => {
+          $bindingResultError188433 = error;
+          return false;
+        },
+      });
+      return ($bindingResultOk188433 ? "ok" : "error") === "error"
+        ? Result.err($bindingResultError188433)
+        : Result.ok({ binding: $bindingResultValue188433 });
+    });
   }
 
   getMiniNamedClaudeSessionAttempt(inputValue: {
@@ -3640,76 +6476,308 @@ export class MiniLilacSqliteStore {
     readonly requestId: string;
     readonly attemptIndex: number;
   }): MiniNamedClaudeSessionAttempt | null {
-    const input = miniNamedClaudeSessionAttemptKeySchema.parse(inputValue);
-    const row = this.database
-      .query(
-        `SELECT * FROM mini_named_claude_attempts
-         WHERE session_id = ? AND provider_id = ? AND request_id = ? AND attempt_index = ?`,
-      )
-      .get(input.lilacSessionId, input.providerId, input.requestId, input.attemptIndex);
-    return row ? toMiniNamedClaudeAttempt(row) : null;
+    return storeResultToLegacy(this.getMiniNamedClaudeSessionAttemptResult(inputValue));
+  }
+
+  getMiniNamedClaudeSessionAttemptResult(inputValue: {
+    readonly providerId: string;
+    readonly lilacSessionId: string;
+    readonly requestId: string;
+    readonly attemptIndex: number;
+  }): ResultType<MiniNamedClaudeSessionAttempt | null, MiniLilacPersistenceError> {
+    const input = inputValue;
+    return this.runHistoryReadResult("getMiniNamedClaudeSessionAttempt", () => {
+      const row = this.database
+        .query(
+          `SELECT * FROM mini_named_claude_attempts
+           WHERE session_id = ? AND provider_id = ? AND request_id = ? AND attempt_index = ?`,
+        )
+        .get(input.lilacSessionId, input.providerId, input.requestId, input.attemptIndex);
+      return row
+        ? decodeMiniMainClaudeAttemptRow(
+            row,
+            `${input.lilacSessionId}:${input.providerId}:${input.requestId}:${input.attemptIndex}`,
+          )
+        : Result.ok(null);
+    });
   }
 
   getMiniClaudeRetentionDiagnostics(): MiniClaudeRetentionDiagnostics {
-    const count = (sql: string) =>
-      z.object({ count: z.number().int().nonnegative() }).parse(this.database.query(sql).get())
-        .count;
-    return {
-      mainBindingCount: count("SELECT COUNT(*) AS count FROM mini_main_claude_bindings"),
-      namedBindingCount: count("SELECT COUNT(*) AS count FROM mini_named_claude_bindings"),
-      activeAttemptCount: count(
+    return storeResultToLegacy(this.getMiniClaudeRetentionDiagnosticsResult());
+  }
+
+  getMiniClaudeRetentionDiagnosticsResult(): ResultType<
+    MiniClaudeRetentionDiagnostics,
+    MiniLilacPersistenceError
+  > {
+    return this.runHistoryReadResult("getMiniClaudeRetentionDiagnostics", () => {
+      const count = (sql: string, recordId: string) =>
+        decodeRequiredMiniLilacStoreRow({
+          kind: "count",
+          row: this.database.query(sql).get(),
+          schemaVersion: MINI_LILAC_DATABASE_SCHEMA_VERSION,
+          recordId,
+        });
+      const mainBindingCount = count(
+        "SELECT COUNT(*) AS count FROM mini_main_claude_bindings",
+        "main-binding-count",
+      );
+      let $mainBindingCountResultValue190538!: import("better-result").InferOk<
+        NonNullable<typeof mainBindingCount>
+      >;
+      let $mainBindingCountResultError190538!: import("better-result").InferErr<
+        NonNullable<typeof mainBindingCount>
+      >;
+      const $mainBindingCountResultOk190538 = Result.match<
+        import("better-result").InferOk<NonNullable<typeof mainBindingCount>>,
+        import("better-result").InferErr<NonNullable<typeof mainBindingCount>>,
+        boolean
+      >(mainBindingCount, {
+        ok: (value) => {
+          $mainBindingCountResultValue190538 = value;
+          return true;
+        },
+        err: (error) => {
+          $mainBindingCountResultError190538 = error;
+          return false;
+        },
+      });
+      if (($mainBindingCountResultOk190538 ? "ok" : "error") === "error")
+        return Result.err($mainBindingCountResultError190538);
+      const namedBindingCount = count(
+        "SELECT COUNT(*) AS count FROM mini_named_claude_bindings",
+        "named-binding-count",
+      );
+      let $namedBindingCountResultValue190772!: import("better-result").InferOk<
+        NonNullable<typeof namedBindingCount>
+      >;
+      let $namedBindingCountResultError190772!: import("better-result").InferErr<
+        NonNullable<typeof namedBindingCount>
+      >;
+      const $namedBindingCountResultOk190772 = Result.match<
+        import("better-result").InferOk<NonNullable<typeof namedBindingCount>>,
+        import("better-result").InferErr<NonNullable<typeof namedBindingCount>>,
+        boolean
+      >(namedBindingCount, {
+        ok: (value) => {
+          $namedBindingCountResultValue190772 = value;
+          return true;
+        },
+        err: (error) => {
+          $namedBindingCountResultError190772 = error;
+          return false;
+        },
+      });
+      if (($namedBindingCountResultOk190772 ? "ok" : "error") === "error")
+        return Result.err($namedBindingCountResultError190772);
+      const activeAttemptCount = count(
         `SELECT
            (SELECT COUNT(*) FROM mini_main_claude_attempts WHERE state = 'active') +
            (SELECT COUNT(*) FROM mini_named_claude_attempts WHERE state = 'active') AS count`,
-      ),
-      terminalAttemptCount: count(
+        "active-attempt-count",
+      );
+      let $activeAttemptCountResultValue191011!: import("better-result").InferOk<
+        NonNullable<typeof activeAttemptCount>
+      >;
+      let $activeAttemptCountResultError191011!: import("better-result").InferErr<
+        NonNullable<typeof activeAttemptCount>
+      >;
+      const $activeAttemptCountResultOk191011 = Result.match<
+        import("better-result").InferOk<NonNullable<typeof activeAttemptCount>>,
+        import("better-result").InferErr<NonNullable<typeof activeAttemptCount>>,
+        boolean
+      >(activeAttemptCount, {
+        ok: (value) => {
+          $activeAttemptCountResultValue191011 = value;
+          return true;
+        },
+        err: (error) => {
+          $activeAttemptCountResultError191011 = error;
+          return false;
+        },
+      });
+      if (($activeAttemptCountResultOk191011 ? "ok" : "error") === "error")
+        return Result.err($activeAttemptCountResultError191011);
+      const terminalAttemptCount = count(
         `SELECT
            (SELECT COUNT(*) FROM mini_main_claude_attempts WHERE state <> 'active') +
            (SELECT COUNT(*) FROM mini_named_claude_attempts WHERE state <> 'active') AS count`,
-      ),
-      orphanBindingCount: count(
+        "terminal-attempt-count",
+      );
+      let $terminalAttemptCountResultValue191382!: import("better-result").InferOk<
+        NonNullable<typeof terminalAttemptCount>
+      >;
+      let $terminalAttemptCountResultError191382!: import("better-result").InferErr<
+        NonNullable<typeof terminalAttemptCount>
+      >;
+      const $terminalAttemptCountResultOk191382 = Result.match<
+        import("better-result").InferOk<NonNullable<typeof terminalAttemptCount>>,
+        import("better-result").InferErr<NonNullable<typeof terminalAttemptCount>>,
+        boolean
+      >(terminalAttemptCount, {
+        ok: (value) => {
+          $terminalAttemptCountResultValue191382 = value;
+          return true;
+        },
+        err: (error) => {
+          $terminalAttemptCountResultError191382 = error;
+          return false;
+        },
+      });
+      if (($terminalAttemptCountResultOk191382 ? "ok" : "error") === "error")
+        return Result.err($terminalAttemptCountResultError191382);
+      const orphanBindingCount = count(
         `SELECT
            (SELECT COUNT(*) FROM mini_main_claude_bindings AS binding
             LEFT JOIN history_states AS state
               ON state.id = binding.history_state_id AND state.session_id = binding.session_id
             WHERE state.id IS NULL) +
            (SELECT COUNT(*) FROM mini_named_claude_bindings AS binding
-            LEFT JOIN history_states AS state
-              ON state.id = binding.history_state_id AND state.session_id = binding.session_id
-            WHERE state.id IS NULL) AS count`,
-      ),
-      orphanAttemptCount: count(
+             LEFT JOIN history_states AS state
+               ON state.id = binding.history_state_id AND state.session_id = binding.session_id
+             WHERE state.id IS NULL) AS count`,
+        "orphan-binding-count",
+      );
+      let $orphanBindingCountResultValue191763!: import("better-result").InferOk<
+        NonNullable<typeof orphanBindingCount>
+      >;
+      let $orphanBindingCountResultError191763!: import("better-result").InferErr<
+        NonNullable<typeof orphanBindingCount>
+      >;
+      const $orphanBindingCountResultOk191763 = Result.match<
+        import("better-result").InferOk<NonNullable<typeof orphanBindingCount>>,
+        import("better-result").InferErr<NonNullable<typeof orphanBindingCount>>,
+        boolean
+      >(orphanBindingCount, {
+        ok: (value) => {
+          $orphanBindingCountResultValue191763 = value;
+          return true;
+        },
+        err: (error) => {
+          $orphanBindingCountResultError191763 = error;
+          return false;
+        },
+      });
+      if (($orphanBindingCountResultOk191763 ? "ok" : "error") === "error")
+        return Result.err($orphanBindingCountResultError191763);
+      const orphanAttemptCount = count(
         `SELECT
            (SELECT COUNT(*) FROM mini_main_claude_attempts AS attempt
             LEFT JOIN history_states AS state
               ON state.id = attempt.source_history_state_id AND state.session_id = attempt.session_id
             WHERE state.id IS NULL) +
            (SELECT COUNT(*) FROM mini_named_claude_attempts AS attempt
-            LEFT JOIN history_states AS state
-              ON state.id = attempt.source_history_state_id AND state.session_id = attempt.session_id
-            WHERE state.id IS NULL) AS count`,
-      ),
-    };
+             LEFT JOIN history_states AS state
+               ON state.id = attempt.source_history_state_id AND state.session_id = attempt.session_id
+             WHERE state.id IS NULL) AS count`,
+        "orphan-attempt-count",
+      );
+      let $orphanAttemptCountResultValue192465!: import("better-result").InferOk<
+        NonNullable<typeof orphanAttemptCount>
+      >;
+      let $orphanAttemptCountResultError192465!: import("better-result").InferErr<
+        NonNullable<typeof orphanAttemptCount>
+      >;
+      const $orphanAttemptCountResultOk192465 = Result.match<
+        import("better-result").InferOk<NonNullable<typeof orphanAttemptCount>>,
+        import("better-result").InferErr<NonNullable<typeof orphanAttemptCount>>,
+        boolean
+      >(orphanAttemptCount, {
+        ok: (value) => {
+          $orphanAttemptCountResultValue192465 = value;
+          return true;
+        },
+        err: (error) => {
+          $orphanAttemptCountResultError192465 = error;
+          return false;
+        },
+      });
+      if (($orphanAttemptCountResultOk192465 ? "ok" : "error") === "error")
+        return Result.err($orphanAttemptCountResultError192465);
+      return Result.ok({
+        mainBindingCount: $mainBindingCountResultValue190538.count,
+        namedBindingCount: $namedBindingCountResultValue190772.count,
+        activeAttemptCount: $activeAttemptCountResultValue191011.count,
+        terminalAttemptCount: $terminalAttemptCountResultValue191382.count,
+        orphanBindingCount: $orphanBindingCountResultValue191763.count,
+        orphanAttemptCount: $orphanAttemptCountResultValue192465.count,
+      });
+    });
   }
 
   reserveMiniNamedClaudeSessionAttempt(
     inputValue: ReserveMiniNamedClaudeSessionAttempt,
   ): MiniNamedClaudeSessionAttempt {
-    const input = reserveMiniNamedClaudeSessionAttemptSchema.parse(inputValue);
-    return this.runImmediateTransaction(() => {
-      const source = this.getHistoryState(input.sourceHistoryStateId);
-      if (source.sessionId !== input.lilacSessionId) {
-        throw new Error(
-          `History state '${input.sourceHistoryStateId}' does not belong to session '${input.lilacSessionId}'`,
+    return storeResultToLegacy(this.reserveMiniNamedClaudeSessionAttemptResult(inputValue));
+  }
+
+  reserveMiniNamedClaudeSessionAttemptResult(
+    inputValue: ReserveMiniNamedClaudeSessionAttempt,
+  ): ResultType<MiniNamedClaudeSessionAttempt, MiniLilacStoreOperationError> {
+    const input = inputValue;
+    return this.runStoreTransactionResult("reserveMiniNamedClaudeSessionAttempt", () => {
+      const source = this.getHistoryStateResult(input.sourceHistoryStateId);
+      let $sourceResultValue194115!: import("better-result").InferOk<NonNullable<typeof source>>;
+      let $sourceResultError194115!: import("better-result").InferErr<NonNullable<typeof source>>;
+      const $sourceResultOk194115 = Result.match<
+        import("better-result").InferOk<NonNullable<typeof source>>,
+        import("better-result").InferErr<NonNullable<typeof source>>,
+        boolean
+      >(source, {
+        ok: (value) => {
+          $sourceResultValue194115 = value;
+          return true;
+        },
+        err: (error) => {
+          $sourceResultError194115 = error;
+          return false;
+        },
+      });
+      if (($sourceResultOk194115 ? "ok" : "error") === "error")
+        return Result.err($sourceResultError194115);
+      if ($sourceResultValue194115.sessionId !== input.lilacSessionId) {
+        return Result.err(
+          new MiniLilacStoreOperationRejected({
+            operation: "reserveMiniNamedClaudeSessionAttempt",
+            message: `History state '${input.sourceHistoryStateId}' does not belong to session '${input.lilacSessionId}'`,
+          }),
         );
       }
-      const binding = this.getMiniNamedClaudeState({
+      const namedState = this.getMiniNamedClaudeStateResult({
         sessionId: input.lilacSessionId,
         providerId: input.providerId,
-      }).binding;
+      });
+      let $namedStateResultValue194617!: import("better-result").InferOk<
+        NonNullable<typeof namedState>
+      >;
+      let $namedStateResultError194617!: import("better-result").InferErr<
+        NonNullable<typeof namedState>
+      >;
+      const $namedStateResultOk194617 = Result.match<
+        import("better-result").InferOk<NonNullable<typeof namedState>>,
+        import("better-result").InferErr<NonNullable<typeof namedState>>,
+        boolean
+      >(namedState, {
+        ok: (value) => {
+          $namedStateResultValue194617 = value;
+          return true;
+        },
+        err: (error) => {
+          $namedStateResultError194617 = error;
+          return false;
+        },
+      });
+      if (($namedStateResultOk194617 ? "ok" : "error") === "error")
+        return Result.err($namedStateResultError194617);
+      const binding = $namedStateResultValue194617.binding;
       if (input.expectedBindingRevision === null) {
         if (binding !== null) {
-          throw new Error("Named Claude attempt source binding changed before reservation");
+          return Result.err(
+            new MiniLilacStoreOperationRejected({
+              operation: "reserveMiniNamedClaudeSessionAttempt",
+              message: "Named Claude attempt source binding changed before reservation",
+            }),
+          );
         }
       } else if (
         binding === null ||
@@ -3721,18 +6789,53 @@ export class MiniLilacSqliteStore {
             binding.executionScopeHashVersion !== input.executionScopeHashVersion ||
             binding.executionScopeHash !== input.executionScopeHash))
       ) {
-        throw new Error("Named Claude attempt source binding changed before reservation");
+        return Result.err(
+          new MiniLilacStoreOperationRejected({
+            operation: "reserveMiniNamedClaudeSessionAttempt",
+            message: "Named Claude attempt source binding changed before reservation",
+          }),
+        );
       }
-      const activeCount = z.object({ count: z.number().int().nonnegative() }).parse(
-        this.database
+      const activeCount = decodeRequiredMiniLilacStoreRow({
+        kind: "count",
+        row: this.database
           .query(
             `SELECT COUNT(*) AS count FROM mini_named_claude_attempts
-             WHERE session_id = ? AND provider_id = ? AND state = 'active'`,
+               WHERE session_id = ? AND provider_id = ? AND state = 'active'`,
           )
           .get(input.lilacSessionId, input.providerId),
-      ).count;
-      if (activeCount >= MINI_NAMED_CLAUDE_ATTEMPT_RETENTION_LIMIT) {
-        throw new Error("Too many active Mini named Claude attempts are retained");
+        schemaVersion: MINI_LILAC_DATABASE_SCHEMA_VERSION,
+        recordId: `${input.lilacSessionId}:${input.providerId}:active-named-attempt-count`,
+      });
+      let $activeCountResultValue196014!: import("better-result").InferOk<
+        NonNullable<typeof activeCount>
+      >;
+      let $activeCountResultError196014!: import("better-result").InferErr<
+        NonNullable<typeof activeCount>
+      >;
+      const $activeCountResultOk196014 = Result.match<
+        import("better-result").InferOk<NonNullable<typeof activeCount>>,
+        import("better-result").InferErr<NonNullable<typeof activeCount>>,
+        boolean
+      >(activeCount, {
+        ok: (value) => {
+          $activeCountResultValue196014 = value;
+          return true;
+        },
+        err: (error) => {
+          $activeCountResultError196014 = error;
+          return false;
+        },
+      });
+      if (($activeCountResultOk196014 ? "ok" : "error") === "error")
+        return Result.err($activeCountResultError196014);
+      if ($activeCountResultValue196014.count >= MINI_NAMED_CLAUDE_ATTEMPT_RETENTION_LIMIT) {
+        return Result.err(
+          new MiniLilacStoreOperationRejected({
+            operation: "reserveMiniNamedClaudeSessionAttempt",
+            message: "Too many active Mini named Claude attempts are retained",
+          }),
+        );
       }
       const now = new Date().toISOString();
       this.database
@@ -3761,35 +6864,97 @@ export class MiniLilacSqliteStore {
           now,
         );
       this.pruneMiniNamedClaudeAttempts(input.lilacSessionId, input.providerId);
-      const attempt = this.getMiniNamedClaudeSessionAttempt({
+      const attempt = this.getMiniNamedClaudeSessionAttemptResult({
         providerId: input.providerId,
         lilacSessionId: input.lilacSessionId,
         requestId: input.requestId,
         attemptIndex: input.attemptIndex,
       });
-      if (attempt === null) throw new Error("Reserved named Claude attempt was not retained");
-      return attempt;
+      let $attemptResultValue198083!: import("better-result").InferOk<NonNullable<typeof attempt>>;
+      let $attemptResultError198083!: import("better-result").InferErr<NonNullable<typeof attempt>>;
+      const $attemptResultOk198083 = Result.match<
+        import("better-result").InferOk<NonNullable<typeof attempt>>,
+        import("better-result").InferErr<NonNullable<typeof attempt>>,
+        boolean
+      >(attempt, {
+        ok: (value) => {
+          $attemptResultValue198083 = value;
+          return true;
+        },
+        err: (error) => {
+          $attemptResultError198083 = error;
+          return false;
+        },
+      });
+      if (($attemptResultOk198083 ? "ok" : "error") === "error")
+        return Result.err($attemptResultError198083);
+      if ($attemptResultValue198083 === null) {
+        return Result.err(
+          new MiniLilacStoreOperationRejected({
+            operation: "reserveMiniNamedClaudeSessionAttempt",
+            message: "Reserved named Claude attempt was not retained",
+          }),
+        );
+      }
+      return Result.ok($attemptResultValue198083);
     });
   }
 
   recordMiniNamedClaudeSessionAttemptOutcome(
     inputValue: RecordMiniNamedClaudeSessionAttemptOutcome,
   ): MiniNamedClaudeSessionAttempt {
-    const input = recordMiniNamedClaudeSessionAttemptOutcomeSchema.parse(inputValue);
-    return this.runImmediateTransaction(() => {
+    return storeResultToLegacy(this.recordMiniNamedClaudeSessionAttemptOutcomeResult(inputValue));
+  }
+
+  recordMiniNamedClaudeSessionAttemptOutcomeResult(
+    inputValue: RecordMiniNamedClaudeSessionAttemptOutcome,
+  ): ResultType<MiniNamedClaudeSessionAttempt, MiniLilacStoreOperationError> {
+    const input = inputValue;
+    return this.runStoreTransactionResult<
+      MiniNamedClaudeSessionAttempt,
+      MiniLilacStoreOperationError
+    >("recordMiniNamedClaudeSessionAttemptOutcome", () => {
       const attemptKey = {
         providerId: input.providerId,
         lilacSessionId: input.lilacSessionId,
         requestId: input.requestId,
         attemptIndex: input.attemptIndex,
       };
-      const current = this.getMiniNamedClaudeSessionAttempt(attemptKey);
-      if (current === null)
-        throw new Error(`Named Claude attempt '${input.requestId}' was not found`);
-      if (current.state !== "active") {
-        if (current.state === input.state) return current;
-        throw new Error(
-          `Named Claude attempt '${input.requestId}' is already terminal as '${current.state}'`,
+      const current = this.getMiniNamedClaudeSessionAttemptResult(attemptKey);
+      let $currentResultValue199566!: import("better-result").InferOk<NonNullable<typeof current>>;
+      let $currentResultError199566!: import("better-result").InferErr<NonNullable<typeof current>>;
+      const $currentResultOk199566 = Result.match<
+        import("better-result").InferOk<NonNullable<typeof current>>,
+        import("better-result").InferErr<NonNullable<typeof current>>,
+        boolean
+      >(current, {
+        ok: (value) => {
+          $currentResultValue199566 = value;
+          return true;
+        },
+        err: (error) => {
+          $currentResultError199566 = error;
+          return false;
+        },
+      });
+      if (($currentResultOk199566 ? "ok" : "error") === "error")
+        return Result.err($currentResultError199566);
+      if ($currentResultValue199566 === null) {
+        return Result.err(
+          new MiniLilacStoreOperationRejected({
+            operation: "recordMiniNamedClaudeSessionAttemptOutcome",
+            message: `Named Claude attempt '${input.requestId}' was not found`,
+          }),
+        );
+      }
+      if ($currentResultValue199566.state !== "active") {
+        if ($currentResultValue199566.state === input.state)
+          return Result.ok($currentResultValue199566);
+        return Result.err(
+          new MiniLilacStoreOperationRejected({
+            operation: "recordMiniNamedClaudeSessionAttemptOutcome",
+            message: `Named Claude attempt '${input.requestId}' is already terminal as '${$currentResultValue199566.state}'`,
+          }),
         );
       }
       const updated = this.database
@@ -3806,37 +6971,148 @@ export class MiniLilacSqliteStore {
           input.requestId,
           input.attemptIndex,
         );
-      if (updated.changes !== 1)
-        throw new Error("Named Claude attempt outcome lost its active fence");
+      if (updated.changes !== 1) {
+        return Result.err(
+          new MiniLilacStoreOperationRejected({
+            operation: "recordMiniNamedClaudeSessionAttemptOutcome",
+            message: "Named Claude attempt outcome lost its active fence",
+          }),
+        );
+      }
       this.pruneMiniNamedClaudeAttempts(input.lilacSessionId, input.providerId);
-      const attempt = this.getMiniNamedClaudeSessionAttempt(attemptKey);
-      if (attempt === null)
-        throw new Error("Updated named Claude attempt exceeded retention immediately");
-      return attempt;
+      const attempt = this.getMiniNamedClaudeSessionAttemptResult(attemptKey);
+      let $attemptResultValue201264!: import("better-result").InferOk<NonNullable<typeof attempt>>;
+      let $attemptResultError201264!: import("better-result").InferErr<NonNullable<typeof attempt>>;
+      const $attemptResultOk201264 = Result.match<
+        import("better-result").InferOk<NonNullable<typeof attempt>>,
+        import("better-result").InferErr<NonNullable<typeof attempt>>,
+        boolean
+      >(attempt, {
+        ok: (value) => {
+          $attemptResultValue201264 = value;
+          return true;
+        },
+        err: (error) => {
+          $attemptResultError201264 = error;
+          return false;
+        },
+      });
+      if (($attemptResultOk201264 ? "ok" : "error") === "error")
+        return Result.err($attemptResultError201264);
+      if ($attemptResultValue201264 === null) {
+        return Result.err(
+          new MiniLilacStoreOperationRejected({
+            operation: "recordMiniNamedClaudeSessionAttemptOutcome",
+            message: "Updated named Claude attempt exceeded retention immediately",
+          }),
+        );
+      }
+      return Result.ok($attemptResultValue201264);
     });
   }
 
   getSessionHistory(sessionId: string): StoredSessionHistory {
-    const row = this.database
-      .query("SELECT * FROM session_history WHERE session_id = ?")
-      .get(sessionId);
-    if (!row) throw new Error(`Session '${sessionId}' has no history cursor`);
-    return toSessionHistory(row);
+    return storeResultToLegacy(this.getSessionHistoryResult(sessionId));
+  }
+
+  getSessionHistoryResult(
+    sessionId: string,
+  ): ResultType<StoredSessionHistory, MiniLilacPersistenceError> {
+    return this.runHistoryReadResult("getSessionHistory", () =>
+      this.decodeRequiredStructuralHistoryRow({
+        kind: "session-history",
+        row: this.database
+          .query("SELECT * FROM session_history WHERE session_id = ?")
+          .get(sessionId),
+        recordId: sessionId,
+      }),
+    );
   }
 
   getHistoryNavigation(sessionId: string): StoredHistoryNavigation {
-    const history = this.getSessionHistory(sessionId);
-    return {
-      currentStateId: history.currentStateId,
-      canUndo: this.findLatestUndoableUserTransition(sessionId) !== null,
-      canRedo: this.peekHistoryRedo(sessionId) !== null,
-    };
+    return storeResultToLegacy(this.getHistoryNavigationResult(sessionId));
+  }
+
+  getHistoryNavigationResult(
+    sessionId: string,
+  ): ResultType<StoredHistoryNavigation, MiniLilacPersistenceError> {
+    const history = this.getSessionHistoryResult(sessionId);
+    let $historyResultValue202614!: import("better-result").InferOk<NonNullable<typeof history>>;
+    let $historyResultError202614!: import("better-result").InferErr<NonNullable<typeof history>>;
+    const $historyResultOk202614 = Result.match<
+      import("better-result").InferOk<NonNullable<typeof history>>,
+      import("better-result").InferErr<NonNullable<typeof history>>,
+      boolean
+    >(history, {
+      ok: (value) => {
+        $historyResultValue202614 = value;
+        return true;
+      },
+      err: (error) => {
+        $historyResultError202614 = error;
+        return false;
+      },
+    });
+    if (($historyResultOk202614 ? "ok" : "error") === "error")
+      return Result.err($historyResultError202614);
+    const undo = this.findLatestUndoableUserTransitionResult(sessionId);
+    let $undoResultValue202745!: import("better-result").InferOk<NonNullable<typeof undo>>;
+    let $undoResultError202745!: import("better-result").InferErr<NonNullable<typeof undo>>;
+    const $undoResultOk202745 = Result.match<
+      import("better-result").InferOk<NonNullable<typeof undo>>,
+      import("better-result").InferErr<NonNullable<typeof undo>>,
+      boolean
+    >(undo, {
+      ok: (value) => {
+        $undoResultValue202745 = value;
+        return true;
+      },
+      err: (error) => {
+        $undoResultError202745 = error;
+        return false;
+      },
+    });
+    if (($undoResultOk202745 ? "ok" : "error") === "error")
+      return Result.err($undoResultError202745);
+    const redo = this.peekHistoryRedoResult(sessionId);
+    let $redoResultValue202882!: import("better-result").InferOk<NonNullable<typeof redo>>;
+    let $redoResultError202882!: import("better-result").InferErr<NonNullable<typeof redo>>;
+    const $redoResultOk202882 = Result.match<
+      import("better-result").InferOk<NonNullable<typeof redo>>,
+      import("better-result").InferErr<NonNullable<typeof redo>>,
+      boolean
+    >(redo, {
+      ok: (value) => {
+        $redoResultValue202882 = value;
+        return true;
+      },
+      err: (error) => {
+        $redoResultError202882 = error;
+        return false;
+      },
+    });
+    if (($redoResultOk202882 ? "ok" : "error") === "error")
+      return Result.err($redoResultError202882);
+    return Result.ok({
+      currentStateId: $historyResultValue202614.currentStateId,
+      canUndo: $undoResultValue202745 !== null,
+      canRedo: $redoResultValue202882 !== null,
+    });
   }
 
   findLatestUndoableUserTransition(sessionId: string): StoredHistoryTransition | null {
-    const row = this.database
-      .query(
-        `WITH RECURSIVE ancestry(state_id, distance, floor_state_id) AS (
+    return storeResultToLegacy(this.findLatestUndoableUserTransitionResult(sessionId));
+  }
+
+  findLatestUndoableUserTransitionResult(
+    sessionId: string,
+  ): ResultType<StoredHistoryTransition | null, MiniLilacPersistenceError> {
+    return this.runHistoryReadResult("findLatestUndoableUserTransition", () =>
+      this.decodeStructuralHistoryRow({
+        kind: "transition",
+        row: this.database
+          .query(
+            `WITH RECURSIVE ancestry(state_id, distance, floor_state_id) AS (
            SELECT current_state_id, 0, undo_floor_state_id
            FROM session_history WHERE session_id = ?
            UNION ALL
@@ -3854,51 +7130,181 @@ export class MiniLilacSqliteStore {
            AND transition.kind = 'user-message'
          ORDER BY ancestry.distance
          LIMIT 1`,
-      )
-      .get(sessionId, sessionId, sessionId);
-    return row ? toHistoryTransition(row) : null;
+          )
+          .get(sessionId, sessionId, sessionId),
+        recordId: sessionId,
+      }),
+    );
   }
 
   peekHistoryRedo(sessionId: string): StoredHistoryRedoEntry | null {
-    const row = this.database
-      .query(
-        `SELECT * FROM history_redo_stack
-         WHERE session_id = ? ORDER BY position DESC LIMIT 1`,
-      )
-      .get(sessionId);
-    return row ? toHistoryRedoEntry(row) : null;
+    return storeResultToLegacy(this.peekHistoryRedoResult(sessionId));
+  }
+
+  peekHistoryRedoResult(
+    sessionId: string,
+  ): ResultType<StoredHistoryRedoEntry | null, MiniLilacPersistenceError> {
+    return this.runHistoryReadResult("peekHistoryRedo", () =>
+      this.decodeStructuralHistoryRow({
+        kind: "redo",
+        row: this.database
+          .query(
+            `SELECT * FROM history_redo_stack
+             WHERE session_id = ? ORDER BY position DESC LIMIT 1`,
+          )
+          .get(sessionId),
+        recordId: sessionId,
+      }),
+    );
   }
 
   listHistoryTopology(sessionId: string): StoredHistoryTopology {
-    return {
-      history: this.getSessionHistory(sessionId),
-      states: this.database
-        .query("SELECT * FROM history_states WHERE session_id = ? ORDER BY created_at, rowid")
-        .all(sessionId)
-        .map(toHistoryState),
-      transitions: this.database
-        .query("SELECT * FROM history_transitions WHERE session_id = ? ORDER BY created_at, rowid")
-        .all(sessionId)
-        .map(toHistoryTransition),
-      redoStack: this.database
-        .query("SELECT * FROM history_redo_stack WHERE session_id = ? ORDER BY position")
-        .all(sessionId)
-        .map(toHistoryRedoEntry),
-    };
+    return storeResultToLegacy(this.listHistoryTopologyResult(sessionId));
+  }
+
+  listHistoryTopologyResult(
+    sessionId: string,
+  ): ResultType<StoredHistoryTopology, MiniLilacPersistenceError> {
+    return this.runHistoryReadResult("listHistoryTopology", () => {
+      const history = this.getSessionHistoryResult(sessionId);
+      let $historyResultValue205656!: import("better-result").InferOk<NonNullable<typeof history>>;
+      let $historyResultError205656!: import("better-result").InferErr<NonNullable<typeof history>>;
+      const $historyResultOk205656 = Result.match<
+        import("better-result").InferOk<NonNullable<typeof history>>,
+        import("better-result").InferErr<NonNullable<typeof history>>,
+        boolean
+      >(history, {
+        ok: (value) => {
+          $historyResultValue205656 = value;
+          return true;
+        },
+        err: (error) => {
+          $historyResultError205656 = error;
+          return false;
+        },
+      });
+      if (($historyResultOk205656 ? "ok" : "error") === "error")
+        return Result.err($historyResultError205656);
+      const states = this.decodeStructuralHistoryRows({
+        kind: "state",
+        rows: this.database
+          .query("SELECT * FROM history_states WHERE session_id = ? ORDER BY created_at, rowid")
+          .all(sessionId),
+        recordId: `${sessionId}:state`,
+      });
+      let $statesResultValue205791!: import("better-result").InferOk<NonNullable<typeof states>>;
+      let $statesResultError205791!: import("better-result").InferErr<NonNullable<typeof states>>;
+      const $statesResultOk205791 = Result.match<
+        import("better-result").InferOk<NonNullable<typeof states>>,
+        import("better-result").InferErr<NonNullable<typeof states>>,
+        boolean
+      >(states, {
+        ok: (value) => {
+          $statesResultValue205791 = value;
+          return true;
+        },
+        err: (error) => {
+          $statesResultError205791 = error;
+          return false;
+        },
+      });
+      if (($statesResultOk205791 ? "ok" : "error") === "error")
+        return Result.err($statesResultError205791);
+      const transitions = this.decodeStructuralHistoryRows({
+        kind: "transition",
+        rows: this.database
+          .query(
+            "SELECT * FROM history_transitions WHERE session_id = ? ORDER BY created_at, rowid",
+          )
+          .all(sessionId),
+        recordId: `${sessionId}:transition`,
+      });
+      let $transitionsResultValue206142!: import("better-result").InferOk<
+        NonNullable<typeof transitions>
+      >;
+      let $transitionsResultError206142!: import("better-result").InferErr<
+        NonNullable<typeof transitions>
+      >;
+      const $transitionsResultOk206142 = Result.match<
+        import("better-result").InferOk<NonNullable<typeof transitions>>,
+        import("better-result").InferErr<NonNullable<typeof transitions>>,
+        boolean
+      >(transitions, {
+        ok: (value) => {
+          $transitionsResultValue206142 = value;
+          return true;
+        },
+        err: (error) => {
+          $transitionsResultError206142 = error;
+          return false;
+        },
+      });
+      if (($transitionsResultOk206142 ? "ok" : "error") === "error")
+        return Result.err($transitionsResultError206142);
+      const redoStack = this.decodeStructuralHistoryRows({
+        kind: "redo",
+        rows: this.database
+          .query("SELECT * FROM history_redo_stack WHERE session_id = ? ORDER BY position")
+          .all(sessionId),
+        recordId: `${sessionId}:redo`,
+      });
+      let $redoStackResultValue206548!: import("better-result").InferOk<
+        NonNullable<typeof redoStack>
+      >;
+      let $redoStackResultError206548!: import("better-result").InferErr<
+        NonNullable<typeof redoStack>
+      >;
+      const $redoStackResultOk206548 = Result.match<
+        import("better-result").InferOk<NonNullable<typeof redoStack>>,
+        import("better-result").InferErr<NonNullable<typeof redoStack>>,
+        boolean
+      >(redoStack, {
+        ok: (value) => {
+          $redoStackResultValue206548 = value;
+          return true;
+        },
+        err: (error) => {
+          $redoStackResultError206548 = error;
+          return false;
+        },
+      });
+      if (($redoStackResultOk206548 ? "ok" : "error") === "error")
+        return Result.err($redoStackResultError206548);
+      return Result.ok({
+        history: $historyResultValue205656,
+        states: $statesResultValue205791,
+        transitions: $transitionsResultValue206142,
+        redoStack: $redoStackResultValue206548,
+      });
+    });
   }
 
   getHistoryAccounting(workspaceId?: string): StoredHistoryAccounting {
-    const filter = workspaceId === undefined ? null : z.string().min(1).parse(workspaceId);
+    return storeResultToLegacy(this.getHistoryAccountingResult(workspaceId));
+  }
+
+  getHistoryAccountingResult(
+    workspaceId?: string,
+  ): ResultType<StoredHistoryAccounting, MiniLilacPersistenceError> {
+    const filter = workspaceId ?? null;
     if (
       filter !== null &&
       !this.database.query("SELECT 1 FROM workspaces WHERE id = ?").get(filter)
     ) {
-      throw new Error(`Workspace '${filter}' was not found`);
+      return Result.err(
+        new MiniLilacHistoryRecordMissing({
+          recordKind: "workspace",
+          recordId: filter,
+          message: `Workspace '${filter}' was not found`,
+        }),
+      );
     }
-    const row = historyAccountingRowSchema.parse(
-      this.database
-        .query(
-          `WITH workspace_filter(workspace_id) AS (VALUES (?))
+    return this.runHistoryReadResult("getHistoryAccounting", () =>
+      this.decodeRequiredStructuralHistoryRow({
+        kind: "accounting",
+        row: this.database
+          .query(
+            `WITH workspace_filter(workspace_id) AS (VALUES (?))
            SELECT
              (SELECT COUNT(*) FROM history_states AS state, workspace_filter AS filter
               WHERE filter.workspace_id IS NULL OR state.workspace_id = filter.workspace_id)
@@ -3934,18 +7340,11 @@ export class MiniLilacSqliteStore {
               WHERE filter.workspace_id IS NULL
                 OR finalization.workspace_id = filter.workspace_id)
                AS pending_finalization_count`,
-        )
-        .get(filter),
+          )
+          .get(filter),
+        recordId: filter ?? "all",
+      }),
     );
-    return {
-      stateCount: row.state_count,
-      transitionCount: row.transition_count,
-      branchTipCount: row.branch_tip_count,
-      snapshotCount: row.snapshot_count,
-      redoStackCount: row.redo_stack_count,
-      activeOperationCount: row.active_operation_count,
-      pendingFinalizationCount: row.pending_finalization_count,
-    };
   }
 
   internHistoryTranscriptHeads(
@@ -3953,32 +7352,119 @@ export class MiniLilacSqliteStore {
     modelMessages: readonly ModelMessage[],
     uiMessages: readonly MiniLilacUIMessage[],
   ): InternedStoredTranscriptHeads {
-    modelMessagesSchema.parse(modelMessages);
-    miniLilacMessagesSchema.parse(uiMessages);
     this.getSession(sessionId);
-    return this.database.transaction(() => ({
+    return this.runStoreTransaction("internHistoryTranscriptHeads", () => ({
       modelHeadId: this.internChain(sessionId, "model", modelMessages),
       uiHeadId: this.internChain(sessionId, "ui", uiMessages),
-    }))();
+    }));
   }
 
   admitRootPromptHistory(input: AdmitStoredRootPromptHistory): AdmittedStoredRootPromptHistory {
+    return storeResultToLegacy(this.admitRootPromptHistoryResult(input));
+  }
+
+  admitRootPromptHistoryResult(
+    input: AdmitStoredRootPromptHistory,
+  ): ResultType<AdmittedStoredRootPromptHistory, MiniLilacStoreOperationError> {
     if (input.run.parentRunId !== undefined) {
-      throw new Error("Root prompt history admission requires a root run");
+      return Result.err(
+        rejectMiniLilacStoreOperation(
+          "admitRootPromptHistory",
+          "Root prompt history admission requires a root run",
+        ),
+      );
     }
-    modelMessagesSchema.parse(input.modelMessages);
-    miniLilacMessagesSchema.parse(input.uiMessages);
-    if (input.observation !== undefined) parseHistoryWorkspaceOutcome(input.observation);
-    const userMessage = miniLilacUserUIMessageSchema.parse(input.uiMessages.at(-1));
+    const lastUiMessage = input.uiMessages.at(-1);
+    if (lastUiMessage?.role !== "user") {
+      return Result.err(
+        rejectMiniLilacStoreOperation(
+          "admitRootPromptHistory",
+          "Root prompt history admission requires a final UI user message",
+        ),
+      );
+    }
+    const userMessage: MiniLilacUserUIMessage = { ...lastUiMessage, role: "user" };
     if (input.modelMessages.at(-1)?.role !== "user") {
-      throw new Error("Root prompt history admission requires a final model user message");
+      return Result.err(
+        rejectMiniLilacStoreOperation(
+          "admitRootPromptHistory",
+          "Root prompt history admission requires a final model user message",
+        ),
+      );
     }
-    const command = canonicalCommandPayload(input.commandPayload);
-    return this.runImmediateTransaction(() => {
-      this.requireQuiescentHistorySession(input.run.sessionId, input.expectedCurrentStateId);
-      const workspace = this.getWorkspaceForSession(input.run.sessionId);
-      this.assertWorkspaceHasNoHistoryJournal(workspace.id);
-      const current = this.getCurrentHistoryState(input.run.sessionId);
+    const command = decodeCanonicalRootPromptCommand(input);
+    let $commandResultValue211874!: import("better-result").InferOk<NonNullable<typeof command>>;
+    let $commandResultError211874!: import("better-result").InferErr<NonNullable<typeof command>>;
+    const $commandResultOk211874 = Result.match<
+      import("better-result").InferOk<NonNullable<typeof command>>,
+      import("better-result").InferErr<NonNullable<typeof command>>,
+      boolean
+    >(command, {
+      ok: (value) => {
+        $commandResultValue211874 = value;
+        return true;
+      },
+      err: (error) => {
+        $commandResultError211874 = error;
+        return false;
+      },
+    });
+    if (($commandResultOk211874 ? "ok" : "error") === "error")
+      return Result.err($commandResultError211874);
+    return this.runStoreTransactionResult("admitRootPromptHistory", () => {
+      const quiescent = this.requireQuiescentHistorySessionResult(
+        input.run.sessionId,
+        input.expectedCurrentStateId,
+      );
+      const quiescenceError = quiescent.match({ ok: () => null, err: (error) => error });
+      if (quiescenceError !== null) return Result.err(quiescenceError);
+      const workspace = this.getWorkspaceForSessionResult(input.run.sessionId);
+      let $workspaceResultValue212302!: import("better-result").InferOk<
+        NonNullable<typeof workspace>
+      >;
+      let $workspaceResultError212302!: import("better-result").InferErr<
+        NonNullable<typeof workspace>
+      >;
+      const $workspaceResultOk212302 = Result.match<
+        import("better-result").InferOk<NonNullable<typeof workspace>>,
+        import("better-result").InferErr<NonNullable<typeof workspace>>,
+        boolean
+      >(workspace, {
+        ok: (value) => {
+          $workspaceResultValue212302 = value;
+          return true;
+        },
+        err: (error) => {
+          $workspaceResultError212302 = error;
+          return false;
+        },
+      });
+      if (($workspaceResultOk212302 ? "ok" : "error") === "error")
+        return Result.err($workspaceResultError212302);
+      const available = this.assertWorkspaceHasNoHistoryJournalResult(
+        $workspaceResultValue212302.id,
+      );
+      const availabilityError = available.match({ ok: () => null, err: (error) => error });
+      if (availabilityError !== null) return Result.err(availabilityError);
+      const current = this.getCurrentHistoryStateResult(input.run.sessionId);
+      let $currentResultValue212625!: import("better-result").InferOk<NonNullable<typeof current>>;
+      let $currentResultError212625!: import("better-result").InferErr<NonNullable<typeof current>>;
+      const $currentResultOk212625 = Result.match<
+        import("better-result").InferOk<NonNullable<typeof current>>,
+        import("better-result").InferErr<NonNullable<typeof current>>,
+        boolean
+      >(current, {
+        ok: (value) => {
+          $currentResultValue212625 = value;
+          return true;
+        },
+        err: (error) => {
+          $currentResultError212625 = error;
+          return false;
+        },
+      });
+      if (($currentResultOk212625 ? "ok" : "error") === "error")
+        return Result.err($currentResultError212625);
       const prefixHeads = {
         modelHeadId: this.internChain(
           input.run.sessionId,
@@ -3987,34 +7473,101 @@ export class MiniLilacSqliteStore {
         ),
         uiHeadId: this.internChain(input.run.sessionId, "ui", input.uiMessages.slice(0, -1)),
       };
-      this.assertHeadsEqualState(input.run.sessionId, prefixHeads, current);
-      if (current.workspaceStatus === "capture-deferred" && input.observation === undefined) {
-        throw new Error("A deferred history root requires an observed workspace boundary");
+      const equalHeads = this.assertHeadsEqualStateResult(
+        input.run.sessionId,
+        prefixHeads,
+        $currentResultValue212625,
+      );
+      const headsError = equalHeads.match({ ok: () => null, err: (error) => error });
+      if (headsError !== null) return Result.err(headsError);
+      if (
+        $currentResultValue212625.workspaceStatus === "capture-deferred" &&
+        input.observation === undefined
+      ) {
+        return Result.err(
+          rejectMiniLilacStoreOperation(
+            "admitRootPromptHistory",
+            "A deferred history root requires an observed workspace boundary",
+          ),
+        );
       }
-      let fromState = current;
+      let fromState = $currentResultValue212625;
       if (input.observation !== undefined) {
-        fromState = this.insertWorkspaceObservation(
+        const observed = this.insertWorkspaceObservationResult(
           input.run.sessionId,
-          current,
+          $currentResultValue212625,
           prefixHeads,
           input.observation,
         );
-        this.moveHistoryCursor(input.run.sessionId, fromState);
+        let $observedResultValue213671!: import("better-result").InferOk<
+          NonNullable<typeof observed>
+        >;
+        let $observedResultError213671!: import("better-result").InferErr<
+          NonNullable<typeof observed>
+        >;
+        const $observedResultOk213671 = Result.match<
+          import("better-result").InferOk<NonNullable<typeof observed>>,
+          import("better-result").InferErr<NonNullable<typeof observed>>,
+          boolean
+        >(observed, {
+          ok: (value) => {
+            $observedResultValue213671 = value;
+            return true;
+          },
+          err: (error) => {
+            $observedResultError213671 = error;
+            return false;
+          },
+        });
+        if (($observedResultOk213671 ? "ok" : "error") === "error")
+          return Result.err($observedResultError213671);
+        fromState = $observedResultValue213671;
+        const moved = this.moveHistoryCursorResult(input.run.sessionId, fromState);
+        const moveError = moved.match({ ok: () => null, err: (error) => error });
+        if (moveError !== null) return Result.err(moveError);
       }
       const fullHeads = {
         modelHeadId: this.internChain(input.run.sessionId, "model", input.modelMessages),
         uiHeadId: this.internChain(input.run.sessionId, "ui", input.uiMessages),
       };
-      const commandRow = this.getStoredCommand(input.run.sessionId, input.commandId);
+      const commandRow = this.getStoredCommandResult(input.run.sessionId, input.commandId);
+      let $commandRowResultValue214332!: import("better-result").InferOk<
+        NonNullable<typeof commandRow>
+      >;
+      let $commandRowResultError214332!: import("better-result").InferErr<
+        NonNullable<typeof commandRow>
+      >;
+      const $commandRowResultOk214332 = Result.match<
+        import("better-result").InferOk<NonNullable<typeof commandRow>>,
+        import("better-result").InferErr<NonNullable<typeof commandRow>>,
+        boolean
+      >(commandRow, {
+        ok: (value) => {
+          $commandRowResultValue214332 = value;
+          return true;
+        },
+        err: (error) => {
+          $commandRowResultError214332 = error;
+          return false;
+        },
+      });
+      if (($commandRowResultOk214332 ? "ok" : "error") === "error")
+        return Result.err($commandRowResultError214332);
       if (
-        commandRow.kind !== "prompt" ||
-        commandRow.run_id !== null ||
-        commandRow.side_effect_started !== 0 ||
-        commandRow.result_json !== null ||
-        commandRow.request_fingerprint !== command.fingerprint ||
-        commandRow.request_json !== command.json
+        $commandRowResultValue214332.kind !== "prompt" ||
+        $commandRowResultValue214332.run_id !== null ||
+        $commandRowResultValue214332.side_effect_started !== 0 ||
+        $commandRowResultValue214332.result_json !== null ||
+        $commandRowResultValue214332.request_fingerprint !==
+          $commandResultValue211874.fingerprint ||
+        $commandRowResultValue214332.request_json !== $commandResultValue211874.json
       ) {
-        throw new Error(`Prompt command '${input.commandId}' is not an admissible reservation`);
+        return Result.err(
+          rejectMiniLilacStoreOperation(
+            "admitRootPromptHistory",
+            `Prompt command '${input.commandId}' is not an admissible reservation`,
+          ),
+        );
       }
       const now = new Date().toISOString();
       this.database
@@ -4037,9 +7590,14 @@ export class MiniLilacSqliteStore {
           input.commandId,
         );
       if (assigned.changes !== 1) {
-        throw new Error(`Prompt command '${input.commandId}' could not be assigned atomically`);
+        return Result.err(
+          rejectMiniLilacStoreOperation(
+            "admitRootPromptHistory",
+            `Prompt command '${input.commandId}' could not be assigned atomically`,
+          ),
+        );
       }
-      this.insertHistoryTransitionRow({
+      const insertedTransition = this.insertHistoryTransitionRowResult({
         id: input.transitionId,
         sessionId: input.run.sessionId,
         fromStateId: fromState.id,
@@ -4051,6 +7609,11 @@ export class MiniLilacSqliteStore {
         replayAfterSeq: 0,
         createdAt: now,
       });
+      const transitionError = insertedTransition.match({
+        ok: () => null,
+        err: (error) => error,
+      });
+      if (transitionError !== null) return Result.err(transitionError);
       this.setTranscriptHeads(input.run.sessionId, fullHeads.modelHeadId, fullHeads.uiHeadId);
       this.clearHistoryRedo(input.run.sessionId);
       const updated = this.database
@@ -4061,79 +7624,214 @@ export class MiniLilacSqliteStore {
         )
         .run(input.run.id, input.title ?? null, now, input.run.sessionId);
       if (updated.changes !== 1) {
-        throw new Error(
-          `Session '${input.run.sessionId}' could not admit root run '${input.run.id}'`,
+        return Result.err(
+          rejectMiniLilacStoreOperation(
+            "admitRootPromptHistory",
+            `Session '${input.run.sessionId}' could not admit root run '${input.run.id}'`,
+          ),
         );
       }
-      return {
-        snapshot: this.getSession(input.run.sessionId),
+      const snapshot = this.getSessionResult(input.run.sessionId);
+      let $snapshotResultValue217400!: import("better-result").InferOk<
+        NonNullable<typeof snapshot>
+      >;
+      let $snapshotResultError217400!: import("better-result").InferErr<
+        NonNullable<typeof snapshot>
+      >;
+      const $snapshotResultOk217400 = Result.match<
+        import("better-result").InferOk<NonNullable<typeof snapshot>>,
+        import("better-result").InferErr<NonNullable<typeof snapshot>>,
+        boolean
+      >(snapshot, {
+        ok: (value) => {
+          $snapshotResultValue217400 = value;
+          return true;
+        },
+        err: (error) => {
+          $snapshotResultError217400 = error;
+          return false;
+        },
+      });
+      if (($snapshotResultOk217400 ? "ok" : "error") === "error")
+        return Result.err($snapshotResultError217400);
+      const transition = this.getHistoryTransitionResult(input.transitionId);
+      let $transitionResultValue217541!: import("better-result").InferOk<
+        NonNullable<typeof transition>
+      >;
+      let $transitionResultError217541!: import("better-result").InferErr<
+        NonNullable<typeof transition>
+      >;
+      const $transitionResultOk217541 = Result.match<
+        import("better-result").InferOk<NonNullable<typeof transition>>,
+        import("better-result").InferErr<NonNullable<typeof transition>>,
+        boolean
+      >(transition, {
+        ok: (value) => {
+          $transitionResultValue217541 = value;
+          return true;
+        },
+        err: (error) => {
+          $transitionResultError217541 = error;
+          return false;
+        },
+      });
+      if (($transitionResultOk217541 ? "ok" : "error") === "error")
+        return Result.err($transitionResultError217541);
+      return Result.ok({
+        snapshot: $snapshotResultValue217400,
         fromState,
-        transition: this.getHistoryTransition(input.transitionId),
-      };
+        transition: $transitionResultValue217541,
+      });
     });
   }
 
   commitSteeringHistoryBoundary(
     input: CommitStoredSteeringBoundary,
   ): CommittedStoredSteeringBoundary {
-    if (input.entries.length === 0)
-      throw new Error("A steering boundary requires at least one entry");
-    parseHistoryWorkspaceOutcome(input.workspace);
-    modelMessagesSchema.parse(input.mergedModelMessages);
-    miniLilacMessagesSchema.parse(input.uiMessages);
-    input.entries.forEach((entry, index) => {
-      miniLilacUserUIMessageSchema.parse(entry.message);
-      modelMessagesSchema.parse([entry.modelMessage]);
-      if (entry.modelMessage.role !== "user") {
-        throw new Error("Every steering entry requires one canonical model user message");
-      }
-      z.number().int().nonnegative().parse(entry.replayAfterSeq);
-      if (index < input.entries.length - 1 !== (entry.intermediateStateId !== undefined)) {
-        throw new Error(
-          "Every non-final steering entry requires exactly one intermediate state ID",
-        );
-      }
+    return storeResultToLegacy(this.commitSteeringHistoryBoundaryResult(input));
+  }
+
+  commitSteeringHistoryBoundaryResult(
+    input: CommitStoredSteeringBoundary,
+  ): ResultType<CommittedStoredSteeringBoundary, MiniLilacStoreOperationError> {
+    const validated = validateSteeringHistoryBoundaryInput(input);
+    let $validatedResultValue218194!: import("better-result").InferOk<
+      NonNullable<typeof validated>
+    >;
+    let $validatedResultError218194!: import("better-result").InferErr<
+      NonNullable<typeof validated>
+    >;
+    const $validatedResultOk218194 = Result.match<
+      import("better-result").InferOk<NonNullable<typeof validated>>,
+      import("better-result").InferErr<NonNullable<typeof validated>>,
+      boolean
+    >(validated, {
+      ok: (value) => {
+        $validatedResultValue218194 = value;
+        return true;
+      },
+      err: (error) => {
+        $validatedResultError218194 = error;
+        return false;
+      },
     });
-    const firstUiPosition = input.uiMessages.length - input.entries.length;
-    if (firstUiPosition < 0) throw new Error("Steering UI messages do not contain every entry");
-    const firstModelPosition = input.mergedModelMessages.length - input.entries.length;
-    if (firstModelPosition < 0) {
-      throw new Error("Steering model messages do not contain every entry");
-    }
-    input.entries.forEach((entry, index) => {
-      if (!canonicalValuesEqual(input.uiMessages[firstUiPosition + index], entry.message)) {
-        throw new Error("Steering entries must be the exact final canonical UI suffix");
-      }
-      if (
-        !canonicalValuesEqual(
-          input.mergedModelMessages[firstModelPosition + index],
-          entry.modelMessage,
-        )
-      ) {
-        throw new Error("Steering entries must be the exact final canonical model suffix");
-      }
-    });
-    return this.runImmediateTransaction(() => {
-      const session = this.getSession(input.sessionId);
+    if (($validatedResultOk218194 ? "ok" : "error") === "error")
+      return Result.err($validatedResultError218194);
+    const { firstUiPosition, firstModelPosition } = $validatedResultValue218194;
+    return this.runStoreTransactionResult("commitSteeringHistoryBoundary", () => {
+      const session = this.getSessionResult(input.sessionId);
+      let $sessionResultValue218489!: import("better-result").InferOk<NonNullable<typeof session>>;
+      let $sessionResultError218489!: import("better-result").InferErr<NonNullable<typeof session>>;
+      const $sessionResultOk218489 = Result.match<
+        import("better-result").InferOk<NonNullable<typeof session>>,
+        import("better-result").InferErr<NonNullable<typeof session>>,
+        boolean
+      >(session, {
+        ok: (value) => {
+          $sessionResultValue218489 = value;
+          return true;
+        },
+        err: (error) => {
+          $sessionResultError218489 = error;
+          return false;
+        },
+      });
+      if (($sessionResultOk218489 ? "ok" : "error") === "error")
+        return Result.err($sessionResultError218489);
       const activeRun = this.getActiveRootRun(input.sessionId);
       if (
-        session.status !== "streaming" ||
+        $sessionResultValue218489.status !== "streaming" ||
         activeRun?.id !== input.rootRunId ||
         activeRun.parentRunId !== null
       ) {
-        throw new Error(`Run '${input.rootRunId}' is not the active root run`);
+        return Result.err(
+          rejectMiniLilacStoreOperation(
+            "commitSteeringHistoryBoundary",
+            `Run '${input.rootRunId}' is not the active root run`,
+          ),
+        );
       }
-      const workspace = this.getWorkspaceForSession(input.sessionId);
-      this.assertWorkspaceHasNoHistoryJournal(workspace.id);
-      const previous = this.getHistoryTransition(input.previousOpenTransitionId);
+      const workspace = this.getWorkspaceForSessionResult(input.sessionId);
+      let $workspaceResultValue219052!: import("better-result").InferOk<
+        NonNullable<typeof workspace>
+      >;
+      let $workspaceResultError219052!: import("better-result").InferErr<
+        NonNullable<typeof workspace>
+      >;
+      const $workspaceResultOk219052 = Result.match<
+        import("better-result").InferOk<NonNullable<typeof workspace>>,
+        import("better-result").InferErr<NonNullable<typeof workspace>>,
+        boolean
+      >(workspace, {
+        ok: (value) => {
+          $workspaceResultValue219052 = value;
+          return true;
+        },
+        err: (error) => {
+          $workspaceResultError219052 = error;
+          return false;
+        },
+      });
+      if (($workspaceResultOk219052 ? "ok" : "error") === "error")
+        return Result.err($workspaceResultError219052);
+      const available = this.assertWorkspaceHasNoHistoryJournalResult(
+        $workspaceResultValue219052.id,
+      );
+      const availabilityError = available.match({ ok: () => null, err: (error) => error });
+      if (availabilityError !== null) return Result.err(availabilityError);
+      const previous = this.getHistoryTransitionResult(input.previousOpenTransitionId);
+      let $previousResultValue219371!: import("better-result").InferOk<
+        NonNullable<typeof previous>
+      >;
+      let $previousResultError219371!: import("better-result").InferErr<
+        NonNullable<typeof previous>
+      >;
+      const $previousResultOk219371 = Result.match<
+        import("better-result").InferOk<NonNullable<typeof previous>>,
+        import("better-result").InferErr<NonNullable<typeof previous>>,
+        boolean
+      >(previous, {
+        ok: (value) => {
+          $previousResultValue219371 = value;
+          return true;
+        },
+        err: (error) => {
+          $previousResultError219371 = error;
+          return false;
+        },
+      });
+      if (($previousResultOk219371 ? "ok" : "error") === "error")
+        return Result.err($previousResultError219371);
+      const history = this.getSessionHistoryResult(input.sessionId);
+      let $historyResultValue219533!: import("better-result").InferOk<NonNullable<typeof history>>;
+      let $historyResultError219533!: import("better-result").InferErr<NonNullable<typeof history>>;
+      const $historyResultOk219533 = Result.match<
+        import("better-result").InferOk<NonNullable<typeof history>>,
+        import("better-result").InferErr<NonNullable<typeof history>>,
+        boolean
+      >(history, {
+        ok: (value) => {
+          $historyResultValue219533 = value;
+          return true;
+        },
+        err: (error) => {
+          $historyResultError219533 = error;
+          return false;
+        },
+      });
+      if (($historyResultOk219533 ? "ok" : "error") === "error")
+        return Result.err($historyResultError219533);
       if (
-        previous.sessionId !== input.sessionId ||
-        previous.toStateId !== null ||
-        previous.rootRunId !== input.rootRunId ||
-        this.getSessionHistory(input.sessionId).currentStateId !== previous.fromStateId
+        $previousResultValue219371.sessionId !== input.sessionId ||
+        $previousResultValue219371.toStateId !== null ||
+        $previousResultValue219371.rootRunId !== input.rootRunId ||
+        $historyResultValue219533.currentStateId !== $previousResultValue219371.fromStateId
       ) {
-        throw new Error(
-          `Transition '${input.previousOpenTransitionId}' is not the active boundary`,
+        return Result.err(
+          rejectMiniLilacStoreOperation(
+            "commitSteeringHistoryBoundary",
+            `Transition '${input.previousOpenTransitionId}' is not the active boundary`,
+          ),
         );
       }
       const baseHeads = {
@@ -4148,59 +7846,253 @@ export class MiniLilacSqliteStore {
           input.uiMessages.slice(0, firstUiPosition),
         ),
       };
-      const canonicalUiMessages = this.getUiMessages(input.sessionId);
+      const canonicalUiMessages = this.getUiMessagesResult(input.sessionId);
+      let $canonicalUiMessagesResultValue220495!: import("better-result").InferOk<
+        NonNullable<typeof canonicalUiMessages>
+      >;
+      let $canonicalUiMessagesResultError220495!: import("better-result").InferErr<
+        NonNullable<typeof canonicalUiMessages>
+      >;
+      const $canonicalUiMessagesResultOk220495 = Result.match<
+        import("better-result").InferOk<NonNullable<typeof canonicalUiMessages>>,
+        import("better-result").InferErr<NonNullable<typeof canonicalUiMessages>>,
+        boolean
+      >(canonicalUiMessages, {
+        ok: (value) => {
+          $canonicalUiMessagesResultValue220495 = value;
+          return true;
+        },
+        err: (error) => {
+          $canonicalUiMessagesResultError220495 = error;
+          return false;
+        },
+      });
+      if (($canonicalUiMessagesResultOk220495 ? "ok" : "error") === "error")
+        return Result.err($canonicalUiMessagesResultError220495);
       const baseUiMessages = input.uiMessages.slice(0, firstUiPosition);
-      if (!isCanonicalPrefix(canonicalUiMessages, baseUiMessages)) {
-        throw new Error("Steering UI boundary does not extend the canonical live transcript");
-      }
-      const fromState = this.getHistoryState(previous.fromStateId);
-      const providerState =
-        input.providerState === undefined
-          ? fromState.providerState
-          : historyProviderStateSchema.parse(input.providerState);
-      if (input.providerState !== undefined) {
-        this.assertConservativeProviderTransition(
-          fromState.id,
-          historyProviderStateSchema.parse(input.providerState),
+      if (!isCanonicalPrefix($canonicalUiMessagesResultValue220495, baseUiMessages)) {
+        return Result.err(
+          rejectMiniLilacStoreOperation(
+            "commitSteeringHistoryBoundary",
+            "Steering UI boundary does not extend the canonical live transcript",
+          ),
         );
       }
-      const fromUiMessages = miniLilacMessagesSchema.parse(
-        this.readSerializedChain(input.sessionId, "ui", fromState.uiHeadId).map(deserialize),
+      const fromState = this.getHistoryStateResult($previousResultValue219371.fromStateId);
+      let $fromStateResultValue221043!: import("better-result").InferOk<
+        NonNullable<typeof fromState>
+      >;
+      let $fromStateResultError221043!: import("better-result").InferErr<
+        NonNullable<typeof fromState>
+      >;
+      const $fromStateResultOk221043 = Result.match<
+        import("better-result").InferOk<NonNullable<typeof fromState>>,
+        import("better-result").InferErr<NonNullable<typeof fromState>>,
+        boolean
+      >(fromState, {
+        ok: (value) => {
+          $fromStateResultValue221043 = value;
+          return true;
+        },
+        err: (error) => {
+          $fromStateResultError221043 = error;
+          return false;
+        },
+      });
+      if (($fromStateResultOk221043 ? "ok" : "error") === "error")
+        return Result.err($fromStateResultError221043);
+      const providerState =
+        input.providerState === undefined
+          ? $fromStateResultValue221043.providerState
+          : input.providerState;
+      if (input.providerState !== undefined) {
+        const conservative = this.assertConservativeProviderTransitionResult(
+          $fromStateResultValue221043.id,
+          input.providerState,
+        );
+        const transitionError = conservative.match({ ok: () => null, err: (error) => error });
+        if (transitionError !== null) return Result.err(transitionError);
+      }
+      const rawFromUiMessages = this.readSerializedChainResult(
+        input.sessionId,
+        "ui",
+        $fromStateResultValue221043.uiHeadId,
       );
+      let $rawFromUiMessagesResultValue221613!: import("better-result").InferOk<
+        NonNullable<typeof rawFromUiMessages>
+      >;
+      let $rawFromUiMessagesResultError221613!: import("better-result").InferErr<
+        NonNullable<typeof rawFromUiMessages>
+      >;
+      const $rawFromUiMessagesResultOk221613 = Result.match<
+        import("better-result").InferOk<NonNullable<typeof rawFromUiMessages>>,
+        import("better-result").InferErr<NonNullable<typeof rawFromUiMessages>>,
+        boolean
+      >(rawFromUiMessages, {
+        ok: (value) => {
+          $rawFromUiMessagesResultValue221613 = value;
+          return true;
+        },
+        err: (error) => {
+          $rawFromUiMessagesResultError221613 = error;
+          return false;
+        },
+      });
+      if (($rawFromUiMessagesResultOk221613 ? "ok" : "error") === "error")
+        return Result.err($rawFromUiMessagesResultError221613);
+      const decodedFromUiMessages = decodeMiniLilacUiTranscript({
+        rawValues: $rawFromUiMessagesResultValue221613,
+        schemaVersion: MINI_LILAC_DATABASE_SCHEMA_VERSION,
+        recordId: $fromStateResultValue221043.id,
+      });
+      let $decodedFromUiMessagesResultValue221851!: import("better-result").InferOk<
+        NonNullable<typeof decodedFromUiMessages>
+      >;
+      let $decodedFromUiMessagesResultError221851!: import("better-result").InferErr<
+        NonNullable<typeof decodedFromUiMessages>
+      >;
+      const $decodedFromUiMessagesResultOk221851 = Result.match<
+        import("better-result").InferOk<NonNullable<typeof decodedFromUiMessages>>,
+        import("better-result").InferErr<NonNullable<typeof decodedFromUiMessages>>,
+        boolean
+      >(decodedFromUiMessages, {
+        ok: (value) => {
+          $decodedFromUiMessagesResultValue221851 = value;
+          return true;
+        },
+        err: (error) => {
+          $decodedFromUiMessagesResultError221851 = error;
+          return false;
+        },
+      });
+      if (($decodedFromUiMessagesResultOk221851 ? "ok" : "error") === "error")
+        return Result.err($decodedFromUiMessagesResultError221851);
+      const fromUiMessages = $decodedFromUiMessagesResultValue221851.value;
       if (
-        previous.userMessage === null ||
-        !canonicalValuesEqual(canonicalUiMessages[fromUiMessages.length], previous.userMessage) ||
-        !canonicalValuesEqual(baseUiMessages[fromUiMessages.length], previous.userMessage)
+        $previousResultValue219371.userMessage === null ||
+        !canonicalValuesEqual(
+          $canonicalUiMessagesResultValue220495[fromUiMessages.length],
+          $previousResultValue219371.userMessage,
+        ) ||
+        !canonicalValuesEqual(
+          baseUiMessages[fromUiMessages.length],
+          $previousResultValue219371.userMessage,
+        )
       ) {
-        throw new Error("Steering boundary does not retain the active user message");
+        return Result.err(
+          rejectMiniLilacStoreOperation(
+            "commitSteeringHistoryBoundary",
+            "Steering boundary does not retain the active user message",
+          ),
+        );
       }
       const boundaryState: CreateStoredHistoryState = {
         id: input.boundaryStateId,
         sessionId: input.sessionId,
-        workspaceId: workspace.id,
+        workspaceId: $workspaceResultValue219052.id,
         modelHeadId: baseHeads.modelHeadId,
         uiHeadId: baseHeads.uiHeadId,
         ...input.workspace,
         origin: "turn-boundary",
         providerState,
       };
-      this.closeHistoryTransition(input.previousOpenTransitionId, boundaryState, { select: true });
-      let currentState = this.getHistoryState(input.boundaryStateId);
+      const closedBoundary = this.closeHistoryTransitionResult(
+        input.previousOpenTransitionId,
+        boundaryState,
+        { select: true },
+      );
+      const boundaryError = closedBoundary.match({ ok: () => null, err: (error) => error });
+      if (boundaryError !== null) return Result.err(boundaryError);
+      const boundary = this.getHistoryStateResult(input.boundaryStateId);
+      let $boundaryResultValue223348!: import("better-result").InferOk<
+        NonNullable<typeof boundary>
+      >;
+      let $boundaryResultError223348!: import("better-result").InferErr<
+        NonNullable<typeof boundary>
+      >;
+      const $boundaryResultOk223348 = Result.match<
+        import("better-result").InferOk<NonNullable<typeof boundary>>,
+        import("better-result").InferErr<NonNullable<typeof boundary>>,
+        boolean
+      >(boundary, {
+        ok: (value) => {
+          $boundaryResultValue223348 = value;
+          return true;
+        },
+        err: (error) => {
+          $boundaryResultError223348 = error;
+          return false;
+        },
+      });
+      if (($boundaryResultOk223348 ? "ok" : "error") === "error")
+        return Result.err($boundaryResultError223348);
+      let currentState = $boundaryResultValue223348;
       for (const [index, entry] of input.entries.entries()) {
-        const commandRow = this.getStoredCommand(input.sessionId, entry.commandId);
+        const commandRow = this.getStoredCommandResult(input.sessionId, entry.commandId);
+        let $commandRowResultValue223601!: import("better-result").InferOk<
+          NonNullable<typeof commandRow>
+        >;
+        let $commandRowResultError223601!: import("better-result").InferErr<
+          NonNullable<typeof commandRow>
+        >;
+        const $commandRowResultOk223601 = Result.match<
+          import("better-result").InferOk<NonNullable<typeof commandRow>>,
+          import("better-result").InferErr<NonNullable<typeof commandRow>>,
+          boolean
+        >(commandRow, {
+          ok: (value) => {
+            $commandRowResultValue223601 = value;
+            return true;
+          },
+          err: (error) => {
+            $commandRowResultError223601 = error;
+            return false;
+          },
+        });
+        if (($commandRowResultOk223601 ? "ok" : "error") === "error")
+          return Result.err($commandRowResultError223601);
         if (
-          commandRow.kind !== "steer" ||
-          commandRow.run_id !== input.rootRunId ||
-          commandRow.side_effect_started !== 1 ||
-          commandRow.result_json === null
+          $commandRowResultValue223601.kind !== "steer" ||
+          $commandRowResultValue223601.run_id !== input.rootRunId ||
+          $commandRowResultValue223601.side_effect_started !== 1 ||
+          $commandRowResultValue223601.result_json === null
         ) {
-          throw new Error(
-            `Steering command '${entry.commandId}' is not admitted for this root run`,
+          return Result.err(
+            rejectMiniLilacStoreOperation(
+              "commitSteeringHistoryBoundary",
+              `Steering command '${entry.commandId}' is not admitted for this root run`,
+            ),
           );
         }
-        const commandPayload = storedSteeringCommandPayloadSchema.parse(
-          z.json().parse(JSON.parse(commandRow.request_json)),
-        );
+        const decodedCommandPayload = decodeMiniLilacSteeringCommandRequest({
+          raw: $commandRowResultValue223601.request_json,
+          schemaVersion: MINI_LILAC_DATABASE_SCHEMA_VERSION,
+          recordId: entry.commandId,
+        });
+        let $decodedCommandPayloadResultValue224250!: import("better-result").InferOk<
+          NonNullable<typeof decodedCommandPayload>
+        >;
+        let $decodedCommandPayloadResultError224250!: import("better-result").InferErr<
+          NonNullable<typeof decodedCommandPayload>
+        >;
+        const $decodedCommandPayloadResultOk224250 = Result.match<
+          import("better-result").InferOk<NonNullable<typeof decodedCommandPayload>>,
+          import("better-result").InferErr<NonNullable<typeof decodedCommandPayload>>,
+          boolean
+        >(decodedCommandPayload, {
+          ok: (value) => {
+            $decodedCommandPayloadResultValue224250 = value;
+            return true;
+          },
+          err: (error) => {
+            $decodedCommandPayloadResultError224250 = error;
+            return false;
+          },
+        });
+        if (($decodedCommandPayloadResultOk224250 ? "ok" : "error") === "error") {
+          return Result.err($decodedCommandPayloadResultError224250);
+        }
+        const commandPayload = $decodedCommandPayloadResultValue224250.value;
         if (
           !canonicalValuesEqual(commandPayload.message, entry.message) ||
           (commandPayload.sessionId !== undefined &&
@@ -4209,11 +8101,14 @@ export class MiniLilacSqliteStore {
           (commandPayload.clientCommandId !== undefined &&
             commandPayload.clientCommandId !== entry.commandId)
         ) {
-          throw new Error(
-            `Steering command '${entry.commandId}' request does not match its boundary entry`,
+          return Result.err(
+            rejectMiniLilacStoreOperation(
+              "commitSteeringHistoryBoundary",
+              `Steering command '${entry.commandId}' request does not match its boundary entry`,
+            ),
           );
         }
-        this.insertHistoryTransitionRow({
+        const insertedTransition = this.insertHistoryTransitionRowResult({
           id: entry.transitionId,
           sessionId: input.sessionId,
           fromStateId: currentState.id,
@@ -4224,6 +8119,11 @@ export class MiniLilacSqliteStore {
           rootRunId: input.rootRunId,
           replayAfterSeq: entry.replayAfterSeq,
         });
+        const transitionError = insertedTransition.match({
+          ok: () => null,
+          err: (error) => error,
+        });
+        if (transitionError !== null) return Result.err(transitionError);
         if (entry.intermediateStateId !== undefined) {
           const nextModelHeadId = this.internChain(
             input.sessionId,
@@ -4235,12 +8135,12 @@ export class MiniLilacSqliteStore {
             "ui",
             input.uiMessages.slice(0, firstUiPosition + index + 1),
           );
-          this.closeHistoryTransition(
+          const closed = this.closeHistoryTransitionResult(
             entry.transitionId,
             {
               id: entry.intermediateStateId,
               sessionId: input.sessionId,
-              workspaceId: workspace.id,
+              workspaceId: $workspaceResultValue219052.id,
               modelHeadId: nextModelHeadId,
               uiHeadId: nextUiHeadId,
               ...input.workspace,
@@ -4249,11 +8149,43 @@ export class MiniLilacSqliteStore {
             },
             { select: true },
           );
-          currentState = this.getHistoryState(entry.intermediateStateId);
+          const closeError = closed.match({ ok: () => null, err: (error) => error });
+          if (closeError !== null) return Result.err(closeError);
+          const intermediateState = this.getHistoryStateResult(entry.intermediateStateId);
+          let $intermediateStateResultValue226861!: import("better-result").InferOk<
+            NonNullable<typeof intermediateState>
+          >;
+          let $intermediateStateResultError226861!: import("better-result").InferErr<
+            NonNullable<typeof intermediateState>
+          >;
+          const $intermediateStateResultOk226861 = Result.match<
+            import("better-result").InferOk<NonNullable<typeof intermediateState>>,
+            import("better-result").InferErr<NonNullable<typeof intermediateState>>,
+            boolean
+          >(intermediateState, {
+            ok: (value) => {
+              $intermediateStateResultValue226861 = value;
+              return true;
+            },
+            err: (error) => {
+              $intermediateStateResultError226861 = error;
+              return false;
+            },
+          });
+          if (($intermediateStateResultOk226861 ? "ok" : "error") === "error")
+            return Result.err($intermediateStateResultError226861);
+          currentState = $intermediateStateResultValue226861;
         }
       }
       const finalEntry = input.entries.at(-1);
-      if (finalEntry === undefined) throw new Error("Steering boundary lost its final entry");
+      if (finalEntry === undefined) {
+        return Result.err(
+          rejectMiniLilacStoreOperation(
+            "commitSteeringHistoryBoundary",
+            "Steering boundary lost its final entry",
+          ),
+        );
+      }
       const fullHeads = {
         modelHeadId: this.internChain(input.sessionId, "model", input.mergedModelMessages),
         uiHeadId: this.internChain(input.sessionId, "ui", input.uiMessages),
@@ -4268,24 +8200,67 @@ export class MiniLilacSqliteStore {
         )
         .run(input.entries.length, new Date().toISOString(), input.sessionId, input.entries.length);
       if (updated.changes !== 1) {
-        throw new Error("Steering boundary consumed more entries than the session has queued");
+        return Result.err(
+          rejectMiniLilacStoreOperation(
+            "commitSteeringHistoryBoundary",
+            "Steering boundary consumed more entries than the session has queued",
+          ),
+        );
       }
-      return {
+      const openTransition = this.getHistoryTransitionResult(finalEntry.transitionId);
+      let $openTransitionResultValue228328!: import("better-result").InferOk<
+        NonNullable<typeof openTransition>
+      >;
+      let $openTransitionResultError228328!: import("better-result").InferErr<
+        NonNullable<typeof openTransition>
+      >;
+      const $openTransitionResultOk228328 = Result.match<
+        import("better-result").InferOk<NonNullable<typeof openTransition>>,
+        import("better-result").InferErr<NonNullable<typeof openTransition>>,
+        boolean
+      >(openTransition, {
+        ok: (value) => {
+          $openTransitionResultValue228328 = value;
+          return true;
+        },
+        err: (error) => {
+          $openTransitionResultError228328 = error;
+          return false;
+        },
+      });
+      if (($openTransitionResultOk228328 ? "ok" : "error") === "error")
+        return Result.err($openTransitionResultError228328);
+      return Result.ok({
         currentState,
-        openTransition: this.getHistoryTransition(finalEntry.transitionId),
-      };
+        openTransition: $openTransitionResultValue228328,
+      });
     });
   }
 
   commitHistoryCompaction(input: CommitStoredHistoryCompaction): CommittedStoredHistoryCompaction {
-    modelMessagesSchema.parse(input.modelMessages);
+    return storeResultToLegacy(this.commitHistoryCompactionResult(input));
+  }
+
+  commitHistoryCompactionResult(
+    input: CommitStoredHistoryCompaction,
+  ): ResultType<CommittedStoredHistoryCompaction, MiniLilacStoreOperationError> {
     if (Object.prototype.hasOwnProperty.call(input, "uiMessages")) {
-      throw new Error("Manual history compaction does not accept a replacement UI transcript");
+      return Result.err(
+        rejectMiniLilacStoreOperation(
+          "commitHistoryCompaction",
+          "Manual history compaction does not accept a replacement UI transcript",
+        ),
+      );
     }
-    const result = miniLilacCompactResultSchema.parse(input.result);
-    const compactionEvent = miniLilacCompactionEventSchema.parse(input.compactionEvent);
+    const result = input.result;
+    const compactionEvent = input.compactionEvent;
     if (result.clientCommandId !== input.commandId) {
-      throw new Error(`Compaction result does not belong to command '${input.commandId}'`);
+      return Result.err(
+        rejectMiniLilacStoreOperation(
+          "commitHistoryCompaction",
+          `Compaction result does not belong to command '${input.commandId}'`,
+        ),
+      );
     }
     if (
       compactionEvent.source !== "manual" ||
@@ -4298,32 +8273,114 @@ export class MiniLilacSqliteStore {
       compactionEvent.estimatedInputTokensAfter !== result.estimatedInputTokensAfter ||
       compactionEvent.error !== undefined
     ) {
-      throw new Error("Manual compaction event does not match its compact result");
+      return Result.err(
+        rejectMiniLilacStoreOperation(
+          "commitHistoryCompaction",
+          "Manual compaction event does not match its compact result",
+        ),
+      );
     }
-    parseHistoryWorkspaceOutcome(input);
-    if (input.observation !== undefined) parseHistoryWorkspaceOutcome(input.observation);
     if (input.request.kind !== "compact" || input.request.runId !== null) {
-      throw new Error("History compaction requires a session-scoped compact command");
+      return Result.err(
+        rejectMiniLilacStoreOperation(
+          "commitHistoryCompaction",
+          "History compaction requires a session-scoped compact command",
+        ),
+      );
     }
-    const command = canonicalCommandPayload(input.request.payload);
-    return this.runImmediateTransaction(() => {
-      this.requireQuiescentHistorySession(input.sessionId, input.expectedCurrentStateId, [
-        "idle",
-        "error",
-        "compacting",
-      ]);
-      const workspace = this.getWorkspaceForSession(input.sessionId);
-      this.assertWorkspaceHasNoHistoryJournal(workspace.id);
-      const commandRow = this.getStoredCommand(input.sessionId, input.commandId);
+    const command = decodeCanonicalStoredCommandRequest(input.request);
+    let $commandResultValue230621!: import("better-result").InferOk<NonNullable<typeof command>>;
+    let $commandResultError230621!: import("better-result").InferErr<NonNullable<typeof command>>;
+    const $commandResultOk230621 = Result.match<
+      import("better-result").InferOk<NonNullable<typeof command>>,
+      import("better-result").InferErr<NonNullable<typeof command>>,
+      boolean
+    >(command, {
+      ok: (value) => {
+        $commandResultValue230621 = value;
+        return true;
+      },
+      err: (error) => {
+        $commandResultError230621 = error;
+        return false;
+      },
+    });
+    if (($commandResultOk230621 ? "ok" : "error") === "error")
+      return Result.err($commandResultError230621);
+    return this.runStoreTransactionResult("commitHistoryCompaction", () => {
+      const quiescent = this.requireQuiescentHistorySessionResult(
+        input.sessionId,
+        input.expectedCurrentStateId,
+        ["idle", "error", "compacting"],
+      );
+      const quiescenceError = quiescent.match({ ok: () => null, err: (error) => error });
+      if (quiescenceError !== null) return Result.err(quiescenceError);
+      const workspace = this.getWorkspaceForSessionResult(input.sessionId);
+      let $workspaceResultValue231098!: import("better-result").InferOk<
+        NonNullable<typeof workspace>
+      >;
+      let $workspaceResultError231098!: import("better-result").InferErr<
+        NonNullable<typeof workspace>
+      >;
+      const $workspaceResultOk231098 = Result.match<
+        import("better-result").InferOk<NonNullable<typeof workspace>>,
+        import("better-result").InferErr<NonNullable<typeof workspace>>,
+        boolean
+      >(workspace, {
+        ok: (value) => {
+          $workspaceResultValue231098 = value;
+          return true;
+        },
+        err: (error) => {
+          $workspaceResultError231098 = error;
+          return false;
+        },
+      });
+      if (($workspaceResultOk231098 ? "ok" : "error") === "error")
+        return Result.err($workspaceResultError231098);
+      const available = this.assertWorkspaceHasNoHistoryJournalResult(
+        $workspaceResultValue231098.id,
+      );
+      const availabilityError = available.match({ ok: () => null, err: (error) => error });
+      if (availabilityError !== null) return Result.err(availabilityError);
+      const commandRow = this.getStoredCommandResult(input.sessionId, input.commandId);
+      let $commandRowResultValue231417!: import("better-result").InferOk<
+        NonNullable<typeof commandRow>
+      >;
+      let $commandRowResultError231417!: import("better-result").InferErr<
+        NonNullable<typeof commandRow>
+      >;
+      const $commandRowResultOk231417 = Result.match<
+        import("better-result").InferOk<NonNullable<typeof commandRow>>,
+        import("better-result").InferErr<NonNullable<typeof commandRow>>,
+        boolean
+      >(commandRow, {
+        ok: (value) => {
+          $commandRowResultValue231417 = value;
+          return true;
+        },
+        err: (error) => {
+          $commandRowResultError231417 = error;
+          return false;
+        },
+      });
+      if (($commandRowResultOk231417 ? "ok" : "error") === "error")
+        return Result.err($commandRowResultError231417);
       if (
-        commandRow.kind !== input.request.kind ||
-        commandRow.run_id !== null ||
-        commandRow.side_effect_started !== 0 ||
-        commandRow.result_json !== null ||
-        commandRow.request_fingerprint !== command.fingerprint ||
-        commandRow.request_json !== command.json
+        $commandRowResultValue231417.kind !== input.request.kind ||
+        $commandRowResultValue231417.run_id !== null ||
+        $commandRowResultValue231417.side_effect_started !== 0 ||
+        $commandRowResultValue231417.result_json !== null ||
+        $commandRowResultValue231417.request_fingerprint !==
+          $commandResultValue230621.fingerprint ||
+        $commandRowResultValue231417.request_json !== $commandResultValue230621.json
       ) {
-        throw new Error(`Compaction command '${input.commandId}' is not an admissible reservation`);
+        return Result.err(
+          rejectMiniLilacStoreOperation(
+            "commitHistoryCompaction",
+            `Compaction command '${input.commandId}' is not an admissible reservation`,
+          ),
+        );
       }
       const now = new Date().toISOString();
       if (result.status !== "compacted") {
@@ -4335,7 +8392,12 @@ export class MiniLilacSqliteStore {
           )
           .run(serialize(result), input.sessionId, input.commandId);
         if (saved.changes !== 1) {
-          throw new Error(`Compaction command '${input.commandId}' could not be saved atomically`);
+          return Result.err(
+            rejectMiniLilacStoreOperation(
+              "commitHistoryCompaction",
+              `Compaction command '${input.commandId}' could not be saved atomically`,
+            ),
+          );
         }
         this.database
           .query(
@@ -4343,31 +8405,139 @@ export class MiniLilacSqliteStore {
                queued_steering_count = 0, updated_at = ? WHERE id = ?`,
           )
           .run(now, input.sessionId);
-        return {
-          state: this.getCurrentHistoryState(input.sessionId),
-          snapshot: this.getSession(input.sessionId),
-        };
+        const state = this.getCurrentHistoryStateResult(input.sessionId);
+        let $stateResultValue233100!: import("better-result").InferOk<NonNullable<typeof state>>;
+        let $stateResultError233100!: import("better-result").InferErr<NonNullable<typeof state>>;
+        const $stateResultOk233100 = Result.match<
+          import("better-result").InferOk<NonNullable<typeof state>>,
+          import("better-result").InferErr<NonNullable<typeof state>>,
+          boolean
+        >(state, {
+          ok: (value) => {
+            $stateResultValue233100 = value;
+            return true;
+          },
+          err: (error) => {
+            $stateResultError233100 = error;
+            return false;
+          },
+        });
+        if (($stateResultOk233100 ? "ok" : "error") === "error")
+          return Result.err($stateResultError233100);
+        const snapshot = this.getSessionResult(input.sessionId);
+        let $snapshotResultValue233244!: import("better-result").InferOk<
+          NonNullable<typeof snapshot>
+        >;
+        let $snapshotResultError233244!: import("better-result").InferErr<
+          NonNullable<typeof snapshot>
+        >;
+        const $snapshotResultOk233244 = Result.match<
+          import("better-result").InferOk<NonNullable<typeof snapshot>>,
+          import("better-result").InferErr<NonNullable<typeof snapshot>>,
+          boolean
+        >(snapshot, {
+          ok: (value) => {
+            $snapshotResultValue233244 = value;
+            return true;
+          },
+          err: (error) => {
+            $snapshotResultError233244 = error;
+            return false;
+          },
+        });
+        if (($snapshotResultOk233244 ? "ok" : "error") === "error")
+          return Result.err($snapshotResultError233244);
+        return Result.ok({ state: $stateResultValue233100, snapshot: $snapshotResultValue233244 });
       }
-      let fromState = this.getCurrentHistoryState(input.sessionId);
+      const current = this.getCurrentHistoryStateResult(input.sessionId);
+      let $currentResultValue233467!: import("better-result").InferOk<NonNullable<typeof current>>;
+      let $currentResultError233467!: import("better-result").InferErr<NonNullable<typeof current>>;
+      const $currentResultOk233467 = Result.match<
+        import("better-result").InferOk<NonNullable<typeof current>>,
+        import("better-result").InferErr<NonNullable<typeof current>>,
+        boolean
+      >(current, {
+        ok: (value) => {
+          $currentResultValue233467 = value;
+          return true;
+        },
+        err: (error) => {
+          $currentResultError233467 = error;
+          return false;
+        },
+      });
+      if (($currentResultOk233467 ? "ok" : "error") === "error")
+        return Result.err($currentResultError233467);
+      let fromState = $currentResultValue233467;
       if (input.observation !== undefined) {
-        fromState = this.insertWorkspaceObservation(
+        const observed = this.insertWorkspaceObservationResult(
           input.sessionId,
           fromState,
           { modelHeadId: fromState.modelHeadId, uiHeadId: fromState.uiHeadId },
           input.observation,
         );
-        this.moveHistoryCursor(input.sessionId, fromState);
+        let $observedResultValue233697!: import("better-result").InferOk<
+          NonNullable<typeof observed>
+        >;
+        let $observedResultError233697!: import("better-result").InferErr<
+          NonNullable<typeof observed>
+        >;
+        const $observedResultOk233697 = Result.match<
+          import("better-result").InferOk<NonNullable<typeof observed>>,
+          import("better-result").InferErr<NonNullable<typeof observed>>,
+          boolean
+        >(observed, {
+          ok: (value) => {
+            $observedResultValue233697 = value;
+            return true;
+          },
+          err: (error) => {
+            $observedResultError233697 = error;
+            return false;
+          },
+        });
+        if (($observedResultOk233697 ? "ok" : "error") === "error")
+          return Result.err($observedResultError233697);
+        fromState = $observedResultValue233697;
+        const moved = this.moveHistoryCursorResult(input.sessionId, fromState);
+        const moveError = moved.match({ ok: () => null, err: (error) => error });
+        if (moveError !== null) return Result.err(moveError);
       }
       if (input.providerState !== undefined) {
-        this.assertConservativeProviderTransition(
+        const conservative = this.assertConservativeProviderTransitionResult(
           fromState.id,
-          historyProviderStateSchema.parse(input.providerState),
+          input.providerState,
         );
+        const transitionError = conservative.match({ ok: () => null, err: (error) => error });
+        if (transitionError !== null) return Result.err(transitionError);
       }
+      const uiMessages = this.getUiMessagesResult(input.sessionId);
+      let $uiMessagesResultValue234480!: import("better-result").InferOk<
+        NonNullable<typeof uiMessages>
+      >;
+      let $uiMessagesResultError234480!: import("better-result").InferErr<
+        NonNullable<typeof uiMessages>
+      >;
+      const $uiMessagesResultOk234480 = Result.match<
+        import("better-result").InferOk<NonNullable<typeof uiMessages>>,
+        import("better-result").InferErr<NonNullable<typeof uiMessages>>,
+        boolean
+      >(uiMessages, {
+        ok: (value) => {
+          $uiMessagesResultValue234480 = value;
+          return true;
+        },
+        err: (error) => {
+          $uiMessagesResultError234480 = error;
+          return false;
+        },
+      });
+      if (($uiMessagesResultOk234480 ? "ok" : "error") === "error")
+        return Result.err($uiMessagesResultError234480);
       const heads = {
         modelHeadId: this.internChain(input.sessionId, "model", input.modelMessages),
         uiHeadId: this.internChain(input.sessionId, "ui", [
-          ...this.getUiMessages(input.sessionId),
+          ...$uiMessagesResultValue234480,
           {
             id: `compaction:${input.commandId}`,
             role: "assistant",
@@ -4381,11 +8551,11 @@ export class MiniLilacSqliteStore {
           },
         ]),
       };
-      const appended = this.appendHistoryTransition({
+      const appended = this.appendHistoryTransitionResult({
         state: {
           id: input.stateId,
           sessionId: input.sessionId,
-          workspaceId: workspace.id,
+          workspaceId: $workspaceResultValue231098.id,
           modelHeadId: heads.modelHeadId,
           uiHeadId: heads.uiHeadId,
           workspaceSnapshotId: input.workspaceSnapshotId,
@@ -4403,7 +8573,34 @@ export class MiniLilacSqliteStore {
         select: true,
         clearRedo: true,
       });
-      this.setHistoryUndoFloor(input.sessionId, appended.state.id);
+      let $appendedResultValue235137!: import("better-result").InferOk<
+        NonNullable<typeof appended>
+      >;
+      let $appendedResultError235137!: import("better-result").InferErr<
+        NonNullable<typeof appended>
+      >;
+      const $appendedResultOk235137 = Result.match<
+        import("better-result").InferOk<NonNullable<typeof appended>>,
+        import("better-result").InferErr<NonNullable<typeof appended>>,
+        boolean
+      >(appended, {
+        ok: (value) => {
+          $appendedResultValue235137 = value;
+          return true;
+        },
+        err: (error) => {
+          $appendedResultError235137 = error;
+          return false;
+        },
+      });
+      if (($appendedResultOk235137 ? "ok" : "error") === "error")
+        return Result.err($appendedResultError235137);
+      const floor = this.setHistoryUndoFloorResult(
+        input.sessionId,
+        $appendedResultValue235137.state.id,
+      );
+      const floorError = floor.match({ ok: () => null, err: (error) => error });
+      if (floorError !== null) return Result.err(floorError);
       const saved = this.database
         .query(
           `UPDATE commands SET side_effect_started = 1, result_json = ?
@@ -4412,7 +8609,12 @@ export class MiniLilacSqliteStore {
         )
         .run(serialize(result), input.sessionId, input.commandId);
       if (saved.changes !== 1) {
-        throw new Error(`Compaction command '${input.commandId}' could not be saved atomically`);
+        return Result.err(
+          rejectMiniLilacStoreOperation(
+            "commitHistoryCompaction",
+            `Compaction command '${input.commandId}' could not be saved atomically`,
+          ),
+        );
       }
       this.database
         .query(
@@ -4426,7 +8628,33 @@ export class MiniLilacSqliteStore {
           now,
           input.sessionId,
         );
-      return { state: appended.state, snapshot: this.getSession(input.sessionId) };
+      const snapshot = this.getSessionResult(input.sessionId);
+      let $snapshotResultValue237140!: import("better-result").InferOk<
+        NonNullable<typeof snapshot>
+      >;
+      let $snapshotResultError237140!: import("better-result").InferErr<
+        NonNullable<typeof snapshot>
+      >;
+      const $snapshotResultOk237140 = Result.match<
+        import("better-result").InferOk<NonNullable<typeof snapshot>>,
+        import("better-result").InferErr<NonNullable<typeof snapshot>>,
+        boolean
+      >(snapshot, {
+        ok: (value) => {
+          $snapshotResultValue237140 = value;
+          return true;
+        },
+        err: (error) => {
+          $snapshotResultError237140 = error;
+          return false;
+        },
+      });
+      if (($snapshotResultOk237140 ? "ok" : "error") === "error")
+        return Result.err($snapshotResultError237140);
+      return Result.ok({
+        state: $appendedResultValue235137.state,
+        snapshot: $snapshotResultValue237140,
+      });
     });
   }
 
@@ -4441,9 +8669,34 @@ export class MiniLilacSqliteStore {
     readonly select?: boolean;
     readonly clearRedo?: boolean;
   }): { readonly state: StoredHistoryState; readonly transition: StoredHistoryTransition } {
-    return this.database.transaction(() => {
+    return storeResultToLegacy(this.appendHistoryTransitionResult(input));
+  }
+
+  private appendHistoryTransitionResult(input: {
+    readonly state: CreateStoredHistoryState;
+    readonly transition:
+      | Omit<Extract<CreateStoredHistoryTransition, { kind: "user-message" }>, "toStateId">
+      | Omit<
+          Extract<CreateStoredHistoryTransition, { kind: "workspace-observation" | "compaction" }>,
+          "toStateId"
+        >;
+    readonly select?: boolean;
+    readonly clearRedo?: boolean;
+  }): ResultType<
+    { readonly state: StoredHistoryState; readonly transition: StoredHistoryTransition },
+    MiniLilacStoreOperationError
+  > {
+    return this.runStoreTransactionResult<
+      { readonly state: StoredHistoryState; readonly transition: StoredHistoryTransition },
+      MiniLilacStoreOperationError
+    >("appendHistoryTransition", () => {
       if (input.state.sessionId !== input.transition.sessionId) {
-        throw new Error(`History transition '${input.transition.id}' crosses sessions`);
+        return Result.err(
+          rejectMiniLilacStoreOperation(
+            "appendHistoryTransition",
+            `History transition '${input.transition.id}' crosses sessions`,
+          ),
+        );
       }
       this.insertHistoryStateRow(input.state);
       this.insertHistoryTransitionRow({ ...input.transition, toStateId: input.state.id });
@@ -4453,11 +8706,42 @@ export class MiniLilacSqliteStore {
           .run(input.state.sessionId);
       }
       if (input.select) {
-        const history = this.getSessionHistory(input.state.sessionId);
+        const history = this.getSessionHistoryResult(input.state.sessionId);
+        let $historyResultValue239363!: import("better-result").InferOk<
+          NonNullable<typeof history>
+        >;
+        let $historyResultError239363!: import("better-result").InferErr<
+          NonNullable<typeof history>
+        >;
+        const $historyResultOk239363 = Result.match<
+          import("better-result").InferOk<NonNullable<typeof history>>,
+          import("better-result").InferErr<NonNullable<typeof history>>,
+          boolean
+        >(history, {
+          ok: (value) => {
+            $historyResultValue239363 = value;
+            return true;
+          },
+          err: (error) => {
+            $historyResultError239363 = error;
+            return false;
+          },
+        });
+        if (($historyResultOk239363 ? "ok" : "error") === "error")
+          return Result.err($historyResultError239363);
         if (
-          !this.isStateInAncestry(input.state.sessionId, input.state.id, history.undoFloorStateId)
+          !this.isStateInAncestry(
+            input.state.sessionId,
+            input.state.id,
+            $historyResultValue239363.undoFloorStateId,
+          )
         ) {
-          throw new Error(`History state '${input.state.id}' is below the current undo floor`);
+          return Result.err(
+            rejectMiniLilacStoreOperation(
+              "appendHistoryTransition",
+              `History state '${input.state.id}' is below the current undo floor`,
+            ),
+          );
         }
         this.setTranscriptHeads(
           input.state.sessionId,
@@ -4471,14 +8755,61 @@ export class MiniLilacSqliteStore {
           )
           .run(input.state.id, new Date().toISOString(), input.state.sessionId);
         if (updated.changes !== 1) {
-          throw new Error(`Session '${input.state.sessionId}' has no history cursor`);
+          return Result.err(
+            rejectMiniLilacStoreOperation(
+              "appendHistoryTransition",
+              `Session '${input.state.sessionId}' has no history cursor`,
+            ),
+          );
         }
       }
-      return {
-        state: this.getHistoryState(input.state.id),
-        transition: this.getHistoryTransition(input.transition.id),
-      };
-    })();
+      const state = this.getHistoryStateResult(input.state.id);
+      let $stateResultValue240601!: import("better-result").InferOk<NonNullable<typeof state>>;
+      let $stateResultError240601!: import("better-result").InferErr<NonNullable<typeof state>>;
+      const $stateResultOk240601 = Result.match<
+        import("better-result").InferOk<NonNullable<typeof state>>,
+        import("better-result").InferErr<NonNullable<typeof state>>,
+        boolean
+      >(state, {
+        ok: (value) => {
+          $stateResultValue240601 = value;
+          return true;
+        },
+        err: (error) => {
+          $stateResultError240601 = error;
+          return false;
+        },
+      });
+      if (($stateResultOk240601 ? "ok" : "error") === "error")
+        return Result.err($stateResultError240601);
+      const transition = this.getHistoryTransitionResult(input.transition.id);
+      let $transitionResultValue240733!: import("better-result").InferOk<
+        NonNullable<typeof transition>
+      >;
+      let $transitionResultError240733!: import("better-result").InferErr<
+        NonNullable<typeof transition>
+      >;
+      const $transitionResultOk240733 = Result.match<
+        import("better-result").InferOk<NonNullable<typeof transition>>,
+        import("better-result").InferErr<NonNullable<typeof transition>>,
+        boolean
+      >(transition, {
+        ok: (value) => {
+          $transitionResultValue240733 = value;
+          return true;
+        },
+        err: (error) => {
+          $transitionResultError240733 = error;
+          return false;
+        },
+      });
+      if (($transitionResultOk240733 ? "ok" : "error") === "error")
+        return Result.err($transitionResultError240733);
+      return Result.ok({
+        state: $stateResultValue240601,
+        transition: $transitionResultValue240733,
+      });
+    });
   }
 
   private closeHistoryTransition(
@@ -4486,25 +8817,77 @@ export class MiniLilacSqliteStore {
     destination: CreateStoredHistoryState,
     options: { readonly select?: boolean; readonly clearRedo?: boolean } = {},
   ): StoredHistoryTransition {
-    return this.database.transaction(() => {
-      const transition = this.getHistoryTransition(transitionId);
-      if (transition.toStateId !== null || transition.kind !== "user-message") {
-        throw new Error(`History transition '${transitionId}' is not an open user transition`);
+    return storeResultToLegacy(
+      this.closeHistoryTransitionResult(transitionId, destination, options),
+    );
+  }
+
+  private closeHistoryTransitionResult(
+    transitionId: string,
+    destination: CreateStoredHistoryState,
+    options: { readonly select?: boolean; readonly clearRedo?: boolean } = {},
+  ): ResultType<StoredHistoryTransition, MiniLilacStoreOperationError> {
+    return this.runStoreTransactionResult("closeHistoryTransition", () => {
+      const transition = this.getHistoryTransitionResult(transitionId);
+      let $transitionResultValue241652!: import("better-result").InferOk<
+        NonNullable<typeof transition>
+      >;
+      let $transitionResultError241652!: import("better-result").InferErr<
+        NonNullable<typeof transition>
+      >;
+      const $transitionResultOk241652 = Result.match<
+        import("better-result").InferOk<NonNullable<typeof transition>>,
+        import("better-result").InferErr<NonNullable<typeof transition>>,
+        boolean
+      >(transition, {
+        ok: (value) => {
+          $transitionResultValue241652 = value;
+          return true;
+        },
+        err: (error) => {
+          $transitionResultError241652 = error;
+          return false;
+        },
+      });
+      if (($transitionResultOk241652 ? "ok" : "error") === "error")
+        return Result.err($transitionResultError241652);
+      if (
+        $transitionResultValue241652.toStateId !== null ||
+        $transitionResultValue241652.kind !== "user-message"
+      ) {
+        return Result.err(
+          rejectMiniLilacStoreOperation(
+            "closeHistoryTransition",
+            `History transition '${transitionId}' is not an open user transition`,
+          ),
+        );
       }
       if (
-        destination.sessionId !== transition.sessionId ||
+        destination.sessionId !== $transitionResultValue241652.sessionId ||
         destination.origin !== "turn-boundary"
       ) {
-        throw new Error(`History transition '${transitionId}' has an invalid destination state`);
+        return Result.err(
+          rejectMiniLilacStoreOperation(
+            "closeHistoryTransition",
+            `History transition '${transitionId}' has an invalid destination state`,
+          ),
+        );
       }
-      this.assertStateConnectedToRoot(transition.sessionId, transition.fromStateId);
-      this.insertHistoryStateRow(destination);
-      this.validateHistoryTransitionDestination(
-        transition.sessionId,
-        transition.fromStateId,
-        destination.id,
-        transition.kind,
+      const connected = this.assertStateConnectedToRootResult(
+        $transitionResultValue241652.sessionId,
+        $transitionResultValue241652.fromStateId,
       );
+      const connectionError = connected.match({ ok: () => null, err: (error) => error });
+      if (connectionError !== null) return Result.err(connectionError);
+      this.insertHistoryStateRow(destination);
+      const validDestination = this.validateHistoryTransitionDestinationResult(
+        $transitionResultValue241652.sessionId,
+        $transitionResultValue241652.fromStateId,
+        destination.id,
+        $transitionResultValue241652.kind,
+      );
+      const destinationError = validDestination.match({ ok: () => null, err: (error) => error });
+      if (destinationError !== null) return Result.err(destinationError);
       const completedAt = new Date().toISOString();
       const updated = this.database
         .query(
@@ -4513,22 +8896,58 @@ export class MiniLilacSqliteStore {
         )
         .run(destination.id, completedAt, transitionId);
       if (updated.changes !== 1) {
-        throw new Error(`History transition '${transitionId}' could not be closed`);
+        return Result.err(
+          rejectMiniLilacStoreOperation(
+            "closeHistoryTransition",
+            `History transition '${transitionId}' could not be closed`,
+          ),
+        );
       }
       if (options.clearRedo) {
         this.database
           .query("DELETE FROM history_redo_stack WHERE session_id = ?")
-          .run(transition.sessionId);
+          .run($transitionResultValue241652.sessionId);
       }
       if (options.select) {
-        const history = this.getSessionHistory(transition.sessionId);
+        const history = this.getSessionHistoryResult($transitionResultValue241652.sessionId);
+        let $historyResultValue243822!: import("better-result").InferOk<
+          NonNullable<typeof history>
+        >;
+        let $historyResultError243822!: import("better-result").InferErr<
+          NonNullable<typeof history>
+        >;
+        const $historyResultOk243822 = Result.match<
+          import("better-result").InferOk<NonNullable<typeof history>>,
+          import("better-result").InferErr<NonNullable<typeof history>>,
+          boolean
+        >(history, {
+          ok: (value) => {
+            $historyResultValue243822 = value;
+            return true;
+          },
+          err: (error) => {
+            $historyResultError243822 = error;
+            return false;
+          },
+        });
+        if (($historyResultOk243822 ? "ok" : "error") === "error")
+          return Result.err($historyResultError243822);
         if (
-          !this.isStateInAncestry(transition.sessionId, destination.id, history.undoFloorStateId)
+          !this.isStateInAncestry(
+            $transitionResultValue241652.sessionId,
+            destination.id,
+            $historyResultValue243822.undoFloorStateId,
+          )
         ) {
-          throw new Error(`History state '${destination.id}' is below the current undo floor`);
+          return Result.err(
+            rejectMiniLilacStoreOperation(
+              "closeHistoryTransition",
+              `History state '${destination.id}' is below the current undo floor`,
+            ),
+          );
         }
         this.setTranscriptHeads(
-          transition.sessionId,
+          $transitionResultValue241652.sessionId,
           destination.modelHeadId,
           destination.uiHeadId,
         );
@@ -4537,31 +8956,102 @@ export class MiniLilacSqliteStore {
             `UPDATE session_history SET current_state_id = ?, updated_at = ?
              WHERE session_id = ?`,
           )
-          .run(destination.id, new Date().toISOString(), transition.sessionId);
+          .run(destination.id, new Date().toISOString(), $transitionResultValue241652.sessionId);
       }
-      return this.getHistoryTransition(transitionId);
-    })();
+      return this.getHistoryTransitionResult(transitionId);
+    });
   }
 
   private setHistoryUndoFloor(sessionId: string, stateId: string): void {
-    this.database.transaction(() => {
-      const state = this.getHistoryState(stateId);
-      if (state.sessionId !== sessionId) {
-        throw new Error(`History state '${stateId}' does not belong to session '${sessionId}'`);
-      }
-      this.assertStateConnectedToRoot(sessionId, stateId);
-      const currentStateId = this.getSessionHistory(sessionId).currentStateId;
-      if (!this.isStateInAncestry(sessionId, currentStateId, stateId)) {
-        throw new Error(`History state '${stateId}' is not an ancestor of the current state`);
-      }
-      const updated = this.database
-        .query(
-          `UPDATE session_history SET undo_floor_state_id = ?, updated_at = ?
+    storeResultToLegacy(this.setHistoryUndoFloorResult(sessionId, stateId));
+  }
+
+  private setHistoryUndoFloorResult(
+    sessionId: string,
+    stateId: string,
+  ): ResultType<void, MiniLilacStoreOperationError> {
+    return this.runStoreTransactionResult<void, MiniLilacStoreOperationError>(
+      "setHistoryUndoFloor",
+      () => {
+        const state = this.getHistoryStateResult(stateId);
+        let $stateResultValue245289!: import("better-result").InferOk<NonNullable<typeof state>>;
+        let $stateResultError245289!: import("better-result").InferErr<NonNullable<typeof state>>;
+        const $stateResultOk245289 = Result.match<
+          import("better-result").InferOk<NonNullable<typeof state>>,
+          import("better-result").InferErr<NonNullable<typeof state>>,
+          boolean
+        >(state, {
+          ok: (value) => {
+            $stateResultValue245289 = value;
+            return true;
+          },
+          err: (error) => {
+            $stateResultError245289 = error;
+            return false;
+          },
+        });
+        if (($stateResultOk245289 ? "ok" : "error") === "error")
+          return Result.err($stateResultError245289);
+        if ($stateResultValue245289.sessionId !== sessionId) {
+          return Result.err(
+            rejectMiniLilacStoreOperation(
+              "setHistoryUndoFloor",
+              `History state '${stateId}' does not belong to session '${sessionId}'`,
+            ),
+          );
+        }
+        const connected = this.assertStateConnectedToRootResult(sessionId, stateId);
+        const connectionError = connected.match({ ok: () => null, err: (error) => error });
+        if (connectionError !== null) return Result.err(connectionError);
+        const history = this.getSessionHistoryResult(sessionId);
+        let $historyResultValue245865!: import("better-result").InferOk<
+          NonNullable<typeof history>
+        >;
+        let $historyResultError245865!: import("better-result").InferErr<
+          NonNullable<typeof history>
+        >;
+        const $historyResultOk245865 = Result.match<
+          import("better-result").InferOk<NonNullable<typeof history>>,
+          import("better-result").InferErr<NonNullable<typeof history>>,
+          boolean
+        >(history, {
+          ok: (value) => {
+            $historyResultValue245865 = value;
+            return true;
+          },
+          err: (error) => {
+            $historyResultError245865 = error;
+            return false;
+          },
+        });
+        if (($historyResultOk245865 ? "ok" : "error") === "error")
+          return Result.err($historyResultError245865);
+        const currentStateId = $historyResultValue245865.currentStateId;
+        if (!this.isStateInAncestry(sessionId, currentStateId, stateId)) {
+          return Result.err(
+            rejectMiniLilacStoreOperation(
+              "setHistoryUndoFloor",
+              `History state '${stateId}' is not an ancestor of the current state`,
+            ),
+          );
+        }
+        const updated = this.database
+          .query(
+            `UPDATE session_history SET undo_floor_state_id = ?, updated_at = ?
            WHERE session_id = ?`,
-        )
-        .run(stateId, new Date().toISOString(), sessionId);
-      if (updated.changes !== 1) throw new Error(`Session '${sessionId}' has no history cursor`);
-    })();
+          )
+          .run(stateId, new Date().toISOString(), sessionId);
+        if (updated.changes !== 1) {
+          return Result.err(
+            rejectMiniLilacStoreOperation(
+              "setHistoryUndoFloor",
+              `Session '${sessionId}' has no history cursor`,
+            ),
+          );
+        }
+        return Result.ok(undefined);
+      },
+    );
   }
 
   private pushHistoryRedo(
@@ -4569,49 +9059,192 @@ export class MiniLilacSqliteStore {
     targetStateId: string,
     userTransitionId: string,
   ): StoredHistoryRedoEntry {
-    return this.database.transaction(() => {
-      const target = this.getHistoryState(targetStateId);
-      const transition = this.getHistoryTransition(userTransitionId);
-      if (
-        target.sessionId !== sessionId ||
-        transition.sessionId !== sessionId ||
-        transition.kind !== "user-message" ||
-        transition.toStateId === null ||
-        !this.isStateInAncestry(sessionId, targetStateId, transition.toStateId)
-      ) {
-        throw new Error(`Invalid redo entry for session '${sessionId}'`);
-      }
-      this.assertStateConnectedToRoot(sessionId, targetStateId);
-      const position = z.object({ position: z.number().int().nonnegative() }).parse(
+    return storeResultToLegacy(
+      this.pushHistoryRedoResult(sessionId, targetStateId, userTransitionId),
+    );
+  }
+
+  private pushHistoryRedoResult(
+    sessionId: string,
+    targetStateId: string,
+    userTransitionId: string,
+  ): ResultType<StoredHistoryRedoEntry, MiniLilacStoreOperationError> {
+    return this.runStoreTransactionResult<StoredHistoryRedoEntry, MiniLilacStoreOperationError>(
+      "pushHistoryRedo",
+      () => {
+        const target = this.getHistoryStateResult(targetStateId);
+        let $targetResultValue247499!: import("better-result").InferOk<NonNullable<typeof target>>;
+        let $targetResultError247499!: import("better-result").InferErr<NonNullable<typeof target>>;
+        const $targetResultOk247499 = Result.match<
+          import("better-result").InferOk<NonNullable<typeof target>>,
+          import("better-result").InferErr<NonNullable<typeof target>>,
+          boolean
+        >(target, {
+          ok: (value) => {
+            $targetResultValue247499 = value;
+            return true;
+          },
+          err: (error) => {
+            $targetResultError247499 = error;
+            return false;
+          },
+        });
+        if (($targetResultOk247499 ? "ok" : "error") === "error")
+          return Result.err($targetResultError247499);
+        const transition = this.getHistoryTransitionResult(userTransitionId);
+        let $transitionResultValue247637!: import("better-result").InferOk<
+          NonNullable<typeof transition>
+        >;
+        let $transitionResultError247637!: import("better-result").InferErr<
+          NonNullable<typeof transition>
+        >;
+        const $transitionResultOk247637 = Result.match<
+          import("better-result").InferOk<NonNullable<typeof transition>>,
+          import("better-result").InferErr<NonNullable<typeof transition>>,
+          boolean
+        >(transition, {
+          ok: (value) => {
+            $transitionResultValue247637 = value;
+            return true;
+          },
+          err: (error) => {
+            $transitionResultError247637 = error;
+            return false;
+          },
+        });
+        if (($transitionResultOk247637 ? "ok" : "error") === "error")
+          return Result.err($transitionResultError247637);
+        if (
+          $targetResultValue247499.sessionId !== sessionId ||
+          $transitionResultValue247637.sessionId !== sessionId ||
+          $transitionResultValue247637.kind !== "user-message" ||
+          $transitionResultValue247637.toStateId === null ||
+          !this.isStateInAncestry(sessionId, targetStateId, $transitionResultValue247637.toStateId)
+        ) {
+          return Result.err(
+            rejectMiniLilacStoreOperation(
+              "pushHistoryRedo",
+              `Invalid redo entry for session '${sessionId}'`,
+            ),
+          );
+        }
+        const connected = this.assertStateConnectedToRootResult(sessionId, targetStateId);
+        const connectionError = connected.match({ ok: () => null, err: (error) => error });
+        if (connectionError !== null) return Result.err(connectionError);
+        const position = decodeRequiredMiniLilacStoreRow({
+          kind: "position",
+          row: this.database
+            .query(
+              `SELECT COALESCE(MAX(position), -1) + 1 AS position
+                 FROM history_redo_stack WHERE session_id = ?`,
+            )
+            .get(sessionId),
+          schemaVersion: MINI_LILAC_DATABASE_SCHEMA_VERSION,
+          recordId: `${sessionId}:next-redo-position`,
+        });
+        let $positionResultValue248490!: import("better-result").InferOk<
+          NonNullable<typeof position>
+        >;
+        let $positionResultError248490!: import("better-result").InferErr<
+          NonNullable<typeof position>
+        >;
+        const $positionResultOk248490 = Result.match<
+          import("better-result").InferOk<NonNullable<typeof position>>,
+          import("better-result").InferErr<NonNullable<typeof position>>,
+          boolean
+        >(position, {
+          ok: (value) => {
+            $positionResultValue248490 = value;
+            return true;
+          },
+          err: (error) => {
+            $positionResultError248490 = error;
+            return false;
+          },
+        });
+        if (($positionResultOk248490 ? "ok" : "error") === "error")
+          return Result.err($positionResultError248490);
         this.database
           .query(
-            `SELECT COALESCE(MAX(position), -1) + 1 AS position
-               FROM history_redo_stack WHERE session_id = ?`,
-          )
-          .get(sessionId),
-      ).position;
-      this.database
-        .query(
-          `INSERT INTO history_redo_stack
+            `INSERT INTO history_redo_stack
             (session_id, position, target_state_id, user_transition_id, created_at)
            VALUES (?, ?, ?, ?, ?)`,
-        )
-        .run(sessionId, position, targetStateId, userTransitionId, new Date().toISOString());
-      const entry = this.peekHistoryRedo(sessionId);
-      if (entry === null) throw new Error(`Redo entry for session '${sessionId}' was not created`);
-      return entry;
-    })();
+          )
+          .run(
+            sessionId,
+            $positionResultValue248490.position,
+            targetStateId,
+            userTransitionId,
+            new Date().toISOString(),
+          );
+        const entry = this.peekHistoryRedoResult(sessionId);
+        let $entryResultValue249403!: import("better-result").InferOk<NonNullable<typeof entry>>;
+        let $entryResultError249403!: import("better-result").InferErr<NonNullable<typeof entry>>;
+        const $entryResultOk249403 = Result.match<
+          import("better-result").InferOk<NonNullable<typeof entry>>,
+          import("better-result").InferErr<NonNullable<typeof entry>>,
+          boolean
+        >(entry, {
+          ok: (value) => {
+            $entryResultValue249403 = value;
+            return true;
+          },
+          err: (error) => {
+            $entryResultError249403 = error;
+            return false;
+          },
+        });
+        if (($entryResultOk249403 ? "ok" : "error") === "error")
+          return Result.err($entryResultError249403);
+        if ($entryResultValue249403 === null) {
+          return Result.err(
+            rejectMiniLilacStoreOperation(
+              "pushHistoryRedo",
+              `Redo entry for session '${sessionId}' was not created`,
+            ),
+          );
+        }
+        return Result.ok($entryResultValue249403);
+      },
+    );
   }
 
   private popHistoryRedo(sessionId: string): StoredHistoryRedoEntry | null {
-    return this.database.transaction(() => {
-      const entry = this.peekHistoryRedo(sessionId);
-      if (entry === null) return null;
+    return storeResultToLegacy(this.popHistoryRedoResult(sessionId));
+  }
+
+  private popHistoryRedoResult(
+    sessionId: string,
+  ): ResultType<StoredHistoryRedoEntry | null, MiniLilacStoreOperationError> {
+    return this.runStoreTransactionResult<
+      StoredHistoryRedoEntry | null,
+      MiniLilacStoreOperationError
+    >("popHistoryRedo", () => {
+      const entry = this.peekHistoryRedoResult(sessionId);
+      let $entryResultValue250275!: import("better-result").InferOk<NonNullable<typeof entry>>;
+      let $entryResultError250275!: import("better-result").InferErr<NonNullable<typeof entry>>;
+      const $entryResultOk250275 = Result.match<
+        import("better-result").InferOk<NonNullable<typeof entry>>,
+        import("better-result").InferErr<NonNullable<typeof entry>>,
+        boolean
+      >(entry, {
+        ok: (value) => {
+          $entryResultValue250275 = value;
+          return true;
+        },
+        err: (error) => {
+          $entryResultError250275 = error;
+          return false;
+        },
+      });
+      if (($entryResultOk250275 ? "ok" : "error") === "error")
+        return Result.err($entryResultError250275);
+      if ($entryResultValue250275 === null) return Result.ok(null);
       this.database
         .query("DELETE FROM history_redo_stack WHERE session_id = ? AND position = ?")
-        .run(sessionId, entry.position);
-      return entry;
-    })();
+        .run(sessionId, $entryResultValue250275.position);
+      return Result.ok($entryResultValue250275);
+    });
   }
 
   private clearHistoryRedo(sessionId: string): void {
@@ -4621,64 +9254,351 @@ export class MiniLilacSqliteStore {
   commitEmptyHistoryNavigation(
     input: CommitEmptyStoredHistoryNavigation,
   ): CommittedEmptyStoredHistoryNavigation {
+    return storeResultToLegacy(this.commitEmptyHistoryNavigationResult(input));
+  }
+
+  commitEmptyHistoryNavigationResult(
+    input: CommitEmptyStoredHistoryNavigation,
+  ): ResultType<CommittedEmptyStoredHistoryNavigation, MiniLilacStoreOperationError> {
     if (input.request.kind !== input.requestedAction || input.request.runId !== null) {
-      throw new Error("Empty history navigation requires a matching session-scoped command");
+      return Result.err(
+        rejectMiniLilacStoreOperation(
+          "commitEmptyHistoryNavigation",
+          "Empty history navigation requires a matching session-scoped command",
+        ),
+      );
     }
-    if (
-      z.object({ status: z.enum(["undone", "redone", "empty"]) }).parse(input.result).status !==
-      "empty"
-    ) {
-      throw new Error("Empty history navigation must persist an empty result");
+    if (input.result.status !== "empty") {
+      return Result.err(
+        rejectMiniLilacStoreOperation(
+          "commitEmptyHistoryNavigation",
+          "Empty history navigation must persist an empty result",
+        ),
+      );
     }
-    const result = this.parseHistoryNavigationResult(
+    const decodedInputResult = decodeStoredHistoryNavigationResult(input.result);
+    let $decodedInputResultResultValue251738!: import("better-result").InferOk<
+      NonNullable<typeof decodedInputResult>
+    >;
+    let $decodedInputResultResultError251738!: import("better-result").InferErr<
+      NonNullable<typeof decodedInputResult>
+    >;
+    const $decodedInputResultResultOk251738 = Result.match<
+      import("better-result").InferOk<NonNullable<typeof decodedInputResult>>,
+      import("better-result").InferErr<NonNullable<typeof decodedInputResult>>,
+      boolean
+    >(decodedInputResult, {
+      ok: (value) => {
+        $decodedInputResultResultValue251738 = value;
+        return true;
+      },
+      err: (error) => {
+        $decodedInputResultResultError251738 = error;
+        return false;
+      },
+    });
+    if (($decodedInputResultResultOk251738 ? "ok" : "error") === "error")
+      return Result.err($decodedInputResultResultError251738);
+    const result = this.validateHistoryNavigationResult(
       input.requestedAction,
-      input.result,
+      $decodedInputResultResultValue251738,
       input.commandId,
       null,
     );
-    if (result.status !== "empty") {
-      throw new Error("Empty history navigation must persist an empty result");
+    let $resultResultValue251912!: import("better-result").InferOk<NonNullable<typeof result>>;
+    let $resultResultError251912!: import("better-result").InferErr<NonNullable<typeof result>>;
+    const $resultResultOk251912 = Result.match<
+      import("better-result").InferOk<NonNullable<typeof result>>,
+      import("better-result").InferErr<NonNullable<typeof result>>,
+      boolean
+    >(result, {
+      ok: (value) => {
+        $resultResultValue251912 = value;
+        return true;
+      },
+      err: (error) => {
+        $resultResultError251912 = error;
+        return false;
+      },
+    });
+    if (($resultResultOk251912 ? "ok" : "error") === "error")
+      return Result.err($resultResultError251912);
+    if ($resultResultValue251912.status !== "empty") {
+      return Result.err(
+        rejectMiniLilacStoreOperation(
+          "commitEmptyHistoryNavigation",
+          "Empty history navigation must persist an empty result",
+        ),
+      );
     }
-    const canonicalCommand = canonicalCommandPayload(input.request.payload);
-    return this.runImmediateTransaction(() => {
-      const command = this.getStoredCommand(input.sessionId, input.commandId);
+    const emptyResult = $resultResultValue251912;
+    const canonicalCommand = decodeCanonicalStoredCommandRequest(input.request);
+    let $canonicalCommandResultValue252420!: import("better-result").InferOk<
+      NonNullable<typeof canonicalCommand>
+    >;
+    let $canonicalCommandResultError252420!: import("better-result").InferErr<
+      NonNullable<typeof canonicalCommand>
+    >;
+    const $canonicalCommandResultOk252420 = Result.match<
+      import("better-result").InferOk<NonNullable<typeof canonicalCommand>>,
+      import("better-result").InferErr<NonNullable<typeof canonicalCommand>>,
+      boolean
+    >(canonicalCommand, {
+      ok: (value) => {
+        $canonicalCommandResultValue252420 = value;
+        return true;
+      },
+      err: (error) => {
+        $canonicalCommandResultError252420 = error;
+        return false;
+      },
+    });
+    if (($canonicalCommandResultOk252420 ? "ok" : "error") === "error")
+      return Result.err($canonicalCommandResultError252420);
+    return this.runStoreTransactionResult("commitEmptyHistoryNavigation", () => {
+      const command = this.getStoredCommandResult(input.sessionId, input.commandId);
+      let $commandResultValue252673!: import("better-result").InferOk<NonNullable<typeof command>>;
+      let $commandResultError252673!: import("better-result").InferErr<NonNullable<typeof command>>;
+      const $commandResultOk252673 = Result.match<
+        import("better-result").InferOk<NonNullable<typeof command>>,
+        import("better-result").InferErr<NonNullable<typeof command>>,
+        boolean
+      >(command, {
+        ok: (value) => {
+          $commandResultValue252673 = value;
+          return true;
+        },
+        err: (error) => {
+          $commandResultError252673 = error;
+          return false;
+        },
+      });
+      if (($commandResultOk252673 ? "ok" : "error") === "error")
+        return Result.err($commandResultError252673);
       if (
-        command.kind !== input.requestedAction ||
-        command.run_id !== null ||
-        command.request_fingerprint !== canonicalCommand.fingerprint ||
-        command.request_json !== canonicalCommand.json
+        $commandResultValue252673.kind !== input.requestedAction ||
+        $commandResultValue252673.run_id !== null ||
+        $commandResultValue252673.request_fingerprint !==
+          $canonicalCommandResultValue252420.fingerprint ||
+        $commandResultValue252673.request_json !== $canonicalCommandResultValue252420.json
       ) {
-        throw new Error(`Command '${input.commandId}' does not own this history navigation`);
+        return Result.err(
+          rejectMiniLilacStoreOperation(
+            "commitEmptyHistoryNavigation",
+            `Command '${input.commandId}' does not own this history navigation`,
+          ),
+        );
       }
-      if (command.result_json !== null) {
-        const replayed = this.parseHistoryNavigationResult(
+      if ($commandResultValue252673.result_json !== null) {
+        const decodedResult = decodeMiniLilacSuperJsonPayload({
+          raw: $commandResultValue252673.result_json,
+          schemaVersion: MINI_LILAC_DATABASE_SCHEMA_VERSION,
+          recordId: input.commandId,
+          field: "command_result",
+        });
+        let $decodedResultResultValue253374!: import("better-result").InferOk<
+          NonNullable<typeof decodedResult>
+        >;
+        let $decodedResultResultError253374!: import("better-result").InferErr<
+          NonNullable<typeof decodedResult>
+        >;
+        const $decodedResultResultOk253374 = Result.match<
+          import("better-result").InferOk<NonNullable<typeof decodedResult>>,
+          import("better-result").InferErr<NonNullable<typeof decodedResult>>,
+          boolean
+        >(decodedResult, {
+          ok: (value) => {
+            $decodedResultResultValue253374 = value;
+            return true;
+          },
+          err: (error) => {
+            $decodedResultResultError253374 = error;
+            return false;
+          },
+        });
+        if (($decodedResultResultOk253374 ? "ok" : "error") === "error")
+          return Result.err($decodedResultResultError253374);
+        const decodedReplay = decodeStoredHistoryNavigationResult(
+          $decodedResultResultValue253374.value,
+        );
+        let $decodedReplayResultValue253711!: import("better-result").InferOk<
+          NonNullable<typeof decodedReplay>
+        >;
+        let $decodedReplayResultError253711!: import("better-result").InferErr<
+          NonNullable<typeof decodedReplay>
+        >;
+        const $decodedReplayResultOk253711 = Result.match<
+          import("better-result").InferOk<NonNullable<typeof decodedReplay>>,
+          import("better-result").InferErr<NonNullable<typeof decodedReplay>>,
+          boolean
+        >(decodedReplay, {
+          ok: (value) => {
+            $decodedReplayResultValue253711 = value;
+            return true;
+          },
+          err: (error) => {
+            $decodedReplayResultError253711 = error;
+            return false;
+          },
+        });
+        if (($decodedReplayResultOk253711 ? "ok" : "error") === "error")
+          return Result.err($decodedReplayResultError253711);
+        const replayed = this.validateHistoryNavigationResult(
           input.requestedAction,
-          deserialize(command.result_json),
+          $decodedReplayResultValue253711,
           input.commandId,
           null,
         );
-        if (replayed.status !== "empty") {
-          throw new Error(`Command '${input.commandId}' already has a non-empty result`);
+        let $replayedResultValue253891!: import("better-result").InferOk<
+          NonNullable<typeof replayed>
+        >;
+        let $replayedResultError253891!: import("better-result").InferErr<
+          NonNullable<typeof replayed>
+        >;
+        const $replayedResultOk253891 = Result.match<
+          import("better-result").InferOk<NonNullable<typeof replayed>>,
+          import("better-result").InferErr<NonNullable<typeof replayed>>,
+          boolean
+        >(replayed, {
+          ok: (value) => {
+            $replayedResultValue253891 = value;
+            return true;
+          },
+          err: (error) => {
+            $replayedResultError253891 = error;
+            return false;
+          },
+        });
+        if (($replayedResultOk253891 ? "ok" : "error") === "error")
+          return Result.err($replayedResultError253891);
+        if ($replayedResultValue253891.status !== "empty") {
+          return Result.err(
+            rejectMiniLilacStoreOperation(
+              "commitEmptyHistoryNavigation",
+              `Command '${input.commandId}' already has a non-empty result`,
+            ),
+          );
         }
-        return {
-          result: replayed,
+        const navigation = this.getHistoryNavigationResult(input.sessionId);
+        let $navigationResultValue254430!: import("better-result").InferOk<
+          NonNullable<typeof navigation>
+        >;
+        let $navigationResultError254430!: import("better-result").InferErr<
+          NonNullable<typeof navigation>
+        >;
+        const $navigationResultOk254430 = Result.match<
+          import("better-result").InferOk<NonNullable<typeof navigation>>,
+          import("better-result").InferErr<NonNullable<typeof navigation>>,
+          boolean
+        >(navigation, {
+          ok: (value) => {
+            $navigationResultValue254430 = value;
+            return true;
+          },
+          err: (error) => {
+            $navigationResultError254430 = error;
+            return false;
+          },
+        });
+        if (($navigationResultOk254430 ? "ok" : "error") === "error")
+          return Result.err($navigationResultError254430);
+        return Result.ok({
+          result: $replayedResultValue253891,
           replayed: true,
-          navigation: this.getHistoryNavigation(input.sessionId),
-        };
+          navigation: $navigationResultValue254430,
+        });
       }
-      if (command.side_effect_started !== 0) {
-        throw new Error(`Command '${input.commandId}' has an incomplete history side effect`);
+      if ($commandResultValue252673.side_effect_started !== 0) {
+        return Result.err(
+          rejectMiniLilacStoreOperation(
+            "commitEmptyHistoryNavigation",
+            `Command '${input.commandId}' has an incomplete history side effect`,
+          ),
+        );
       }
-      const history = this.getSessionHistory(input.sessionId);
-      this.requireQuiescentHistorySession(input.sessionId, history.currentStateId);
-      const workspace = this.getWorkspaceForSession(input.sessionId);
-      this.assertWorkspaceHasNoHistoryJournal(workspace.id);
-      const hasTarget =
+      const history = this.getSessionHistoryResult(input.sessionId);
+      let $historyResultValue255011!: import("better-result").InferOk<NonNullable<typeof history>>;
+      let $historyResultError255011!: import("better-result").InferErr<NonNullable<typeof history>>;
+      const $historyResultOk255011 = Result.match<
+        import("better-result").InferOk<NonNullable<typeof history>>,
+        import("better-result").InferErr<NonNullable<typeof history>>,
+        boolean
+      >(history, {
+        ok: (value) => {
+          $historyResultValue255011 = value;
+          return true;
+        },
+        err: (error) => {
+          $historyResultError255011 = error;
+          return false;
+        },
+      });
+      if (($historyResultOk255011 ? "ok" : "error") === "error")
+        return Result.err($historyResultError255011);
+      const quiescent = this.requireQuiescentHistorySessionResult(
+        input.sessionId,
+        $historyResultValue255011.currentStateId,
+      );
+      const quiescenceError = quiescent.match({ ok: () => null, err: (error) => error });
+      if (quiescenceError !== null) return Result.err(quiescenceError);
+      const workspace = this.getWorkspaceForSessionResult(input.sessionId);
+      let $workspaceResultValue255367!: import("better-result").InferOk<
+        NonNullable<typeof workspace>
+      >;
+      let $workspaceResultError255367!: import("better-result").InferErr<
+        NonNullable<typeof workspace>
+      >;
+      const $workspaceResultOk255367 = Result.match<
+        import("better-result").InferOk<NonNullable<typeof workspace>>,
+        import("better-result").InferErr<NonNullable<typeof workspace>>,
+        boolean
+      >(workspace, {
+        ok: (value) => {
+          $workspaceResultValue255367 = value;
+          return true;
+        },
+        err: (error) => {
+          $workspaceResultError255367 = error;
+          return false;
+        },
+      });
+      if (($workspaceResultOk255367 ? "ok" : "error") === "error")
+        return Result.err($workspaceResultError255367);
+      const available = this.assertWorkspaceHasNoHistoryJournalResult(
+        $workspaceResultValue255367.id,
+      );
+      const availabilityError = available.match({ ok: () => null, err: (error) => error });
+      if (availabilityError !== null) return Result.err(availabilityError);
+      const target =
         input.requestedAction === "undo"
-          ? this.findLatestUndoableUserTransition(input.sessionId) !== null
-          : this.peekHistoryRedo(input.sessionId) !== null;
+          ? this.findLatestUndoableUserTransitionResult(input.sessionId)
+          : this.peekHistoryRedoResult(input.sessionId);
+      let $targetResultValue255686!: import("better-result").InferOk<NonNullable<typeof target>>;
+      let $targetResultError255686!: import("better-result").InferErr<NonNullable<typeof target>>;
+      const $targetResultOk255686 = Result.match<
+        import("better-result").InferOk<NonNullable<typeof target>>,
+        import("better-result").InferErr<NonNullable<typeof target>>,
+        boolean
+      >(target, {
+        ok: (value) => {
+          $targetResultValue255686 = value;
+          return true;
+        },
+        err: (error) => {
+          $targetResultError255686 = error;
+          return false;
+        },
+      });
+      if (($targetResultOk255686 ? "ok" : "error") === "error")
+        return Result.err($targetResultError255686);
+      const hasTarget = $targetResultValue255686 !== null;
       if (hasTarget) {
-        throw new Error(`History ${input.requestedAction} is no longer empty`);
+        return Result.err(
+          rejectMiniLilacStoreOperation(
+            "commitEmptyHistoryNavigation",
+            `History ${input.requestedAction} is no longer empty`,
+          ),
+        );
       }
       const saved = this.database
         .query(
@@ -4686,85 +9606,310 @@ export class MiniLilacSqliteStore {
            WHERE session_id = ? AND command_id = ? AND kind = ? AND run_id IS NULL
              AND side_effect_started = 0 AND result_json IS NULL`,
         )
-        .run(serialize(result), input.sessionId, input.commandId, input.requestedAction);
+        .run(serialize(emptyResult), input.sessionId, input.commandId, input.requestedAction);
       if (saved.changes !== 1) {
-        throw new Error(`Command '${input.commandId}' empty result could not be saved atomically`);
+        return Result.err(
+          rejectMiniLilacStoreOperation(
+            "commitEmptyHistoryNavigation",
+            `Command '${input.commandId}' empty result could not be saved atomically`,
+          ),
+        );
       }
-      return {
-        result,
+      const navigation = this.getHistoryNavigationResult(input.sessionId);
+      let $navigationResultValue256870!: import("better-result").InferOk<
+        NonNullable<typeof navigation>
+      >;
+      let $navigationResultError256870!: import("better-result").InferErr<
+        NonNullable<typeof navigation>
+      >;
+      const $navigationResultOk256870 = Result.match<
+        import("better-result").InferOk<NonNullable<typeof navigation>>,
+        import("better-result").InferErr<NonNullable<typeof navigation>>,
+        boolean
+      >(navigation, {
+        ok: (value) => {
+          $navigationResultValue256870 = value;
+          return true;
+        },
+        err: (error) => {
+          $navigationResultError256870 = error;
+          return false;
+        },
+      });
+      if (($navigationResultOk256870 ? "ok" : "error") === "error")
+        return Result.err($navigationResultError256870);
+      return Result.ok({
+        result: emptyResult,
         replayed: false,
-        navigation: this.getHistoryNavigation(input.sessionId),
-      };
+        navigation: $navigationResultValue256870,
+      });
     });
   }
 
   reserveHistoryOperation(input: ReserveStoredHistoryOperation): ReservedStoredHistoryOperation {
-    historyOperationActionSchema.parse(input.requestedAction);
-    historyFilesystemModeSchema.parse(input.filesystemMode);
+    return storeResultToLegacy(this.reserveHistoryOperationResult(input));
+  }
+
+  reserveHistoryOperationResult(
+    input: ReserveStoredHistoryOperation,
+  ): ResultType<ReservedStoredHistoryOperation, MiniLilacStoreOperationError> {
     if (input.filesystemMode === "restore" && input.skipReason !== null) {
-      throw new Error("Restore-mode history operations cannot have a skip reason");
+      return Result.err(
+        rejectMiniLilacStoreOperation(
+          "reserveHistoryOperation",
+          "Restore-mode history operations cannot have a skip reason",
+        ),
+      );
     }
-    if (input.filesystemMode === "skip") historySkipReasonSchema.parse(input.skipReason);
-    if (input.observation !== undefined) parseHistoryWorkspaceOutcome(input.observation);
-    return this.runImmediateTransaction(() => {
-      this.requireQuiescentHistorySession(input.sessionId, input.expectedSourceStateId);
-      const workspace = this.getWorkspaceForSession(input.sessionId);
-      this.assertWorkspaceHasNoHistoryJournal(workspace.id);
-      const command = this.getStoredCommand(input.sessionId, input.commandId);
+    return this.runStoreTransactionResult("reserveHistoryOperation", () => {
+      const quiescent = this.requireQuiescentHistorySessionResult(
+        input.sessionId,
+        input.expectedSourceStateId,
+      );
+      const quiescenceError = quiescent.match({ ok: () => null, err: (error) => error });
+      if (quiescenceError !== null) return Result.err(quiescenceError);
+      const workspace = this.getWorkspaceForSessionResult(input.sessionId);
+      let $workspaceResultValue258060!: import("better-result").InferOk<
+        NonNullable<typeof workspace>
+      >;
+      let $workspaceResultError258060!: import("better-result").InferErr<
+        NonNullable<typeof workspace>
+      >;
+      const $workspaceResultOk258060 = Result.match<
+        import("better-result").InferOk<NonNullable<typeof workspace>>,
+        import("better-result").InferErr<NonNullable<typeof workspace>>,
+        boolean
+      >(workspace, {
+        ok: (value) => {
+          $workspaceResultValue258060 = value;
+          return true;
+        },
+        err: (error) => {
+          $workspaceResultError258060 = error;
+          return false;
+        },
+      });
+      if (($workspaceResultOk258060 ? "ok" : "error") === "error")
+        return Result.err($workspaceResultError258060);
+      const available = this.assertWorkspaceHasNoHistoryJournalResult(
+        $workspaceResultValue258060.id,
+      );
+      const availabilityError = available.match({ ok: () => null, err: (error) => error });
+      if (availabilityError !== null) return Result.err(availabilityError);
+      const command = this.getStoredCommandResult(input.sessionId, input.commandId);
+      let $commandResultValue258379!: import("better-result").InferOk<NonNullable<typeof command>>;
+      let $commandResultError258379!: import("better-result").InferErr<NonNullable<typeof command>>;
+      const $commandResultOk258379 = Result.match<
+        import("better-result").InferOk<NonNullable<typeof command>>,
+        import("better-result").InferErr<NonNullable<typeof command>>,
+        boolean
+      >(command, {
+        ok: (value) => {
+          $commandResultValue258379 = value;
+          return true;
+        },
+        err: (error) => {
+          $commandResultError258379 = error;
+          return false;
+        },
+      });
+      if (($commandResultOk258379 ? "ok" : "error") === "error")
+        return Result.err($commandResultError258379);
       if (
-        command.kind !== input.requestedAction ||
-        command.run_id !== null ||
-        command.result_json !== null ||
-        command.side_effect_started !== 0
+        $commandResultValue258379.kind !== input.requestedAction ||
+        $commandResultValue258379.run_id !== null ||
+        $commandResultValue258379.result_json !== null ||
+        $commandResultValue258379.side_effect_started !== 0
       ) {
-        throw new Error(`Command '${input.commandId}' cannot reserve a history operation`);
-      }
-      const source = this.getCurrentHistoryState(input.sessionId);
-      const transition = this.getHistoryTransition(input.userTransitionId);
-      if (
-        transition.sessionId !== input.sessionId ||
-        transition.kind !== "user-message" ||
-        transition.toStateId === null
-      ) {
-        throw new Error(
-          `History operation transition '${input.userTransitionId}' is not completed`,
+        return Result.err(
+          rejectMiniLilacStoreOperation(
+            "reserveHistoryOperation",
+            `Command '${input.commandId}' cannot reserve a history operation`,
+          ),
         );
       }
-      this.assertStateConnectedToRoot(input.sessionId, input.targetStateId);
+      const source = this.getCurrentHistoryStateResult(input.sessionId);
+      let $sourceResultValue258966!: import("better-result").InferOk<NonNullable<typeof source>>;
+      let $sourceResultError258966!: import("better-result").InferErr<NonNullable<typeof source>>;
+      const $sourceResultOk258966 = Result.match<
+        import("better-result").InferOk<NonNullable<typeof source>>,
+        import("better-result").InferErr<NonNullable<typeof source>>,
+        boolean
+      >(source, {
+        ok: (value) => {
+          $sourceResultValue258966 = value;
+          return true;
+        },
+        err: (error) => {
+          $sourceResultError258966 = error;
+          return false;
+        },
+      });
+      if (($sourceResultOk258966 ? "ok" : "error") === "error")
+        return Result.err($sourceResultError258966);
+      const transition = this.getHistoryTransitionResult(input.userTransitionId);
+      let $transitionResultValue259109!: import("better-result").InferOk<
+        NonNullable<typeof transition>
+      >;
+      let $transitionResultError259109!: import("better-result").InferErr<
+        NonNullable<typeof transition>
+      >;
+      const $transitionResultOk259109 = Result.match<
+        import("better-result").InferOk<NonNullable<typeof transition>>,
+        import("better-result").InferErr<NonNullable<typeof transition>>,
+        boolean
+      >(transition, {
+        ok: (value) => {
+          $transitionResultValue259109 = value;
+          return true;
+        },
+        err: (error) => {
+          $transitionResultError259109 = error;
+          return false;
+        },
+      });
+      if (($transitionResultOk259109 ? "ok" : "error") === "error")
+        return Result.err($transitionResultError259109);
+      if (
+        $transitionResultValue259109.sessionId !== input.sessionId ||
+        $transitionResultValue259109.kind !== "user-message" ||
+        $transitionResultValue259109.toStateId === null
+      ) {
+        return Result.err(
+          rejectMiniLilacStoreOperation(
+            "reserveHistoryOperation",
+            `History operation transition '${input.userTransitionId}' is not completed`,
+          ),
+        );
+      }
+      const connected = this.assertStateConnectedToRootResult(input.sessionId, input.targetStateId);
+      const connectionError = connected.match({ ok: () => null, err: (error) => error });
+      if (connectionError !== null) return Result.err(connectionError);
       let observedState: StoredHistoryState | null = null;
       if (input.observation !== undefined) {
-        observedState = this.insertWorkspaceObservation(
+        const observed = this.insertWorkspaceObservationResult(
           input.sessionId,
-          source,
-          { modelHeadId: source.modelHeadId, uiHeadId: source.uiHeadId },
+          $sourceResultValue258966,
+          {
+            modelHeadId: $sourceResultValue258966.modelHeadId,
+            uiHeadId: $sourceResultValue258966.uiHeadId,
+          },
           input.observation,
         );
-      }
-      if (input.requestedAction === "undo" && transition.fromStateId !== input.targetStateId) {
-        throw new Error("Undo history operation target must be its user transition source");
+        let $observedResultValue259955!: import("better-result").InferOk<
+          NonNullable<typeof observed>
+        >;
+        let $observedResultError259955!: import("better-result").InferErr<
+          NonNullable<typeof observed>
+        >;
+        const $observedResultOk259955 = Result.match<
+          import("better-result").InferOk<NonNullable<typeof observed>>,
+          import("better-result").InferErr<NonNullable<typeof observed>>,
+          boolean
+        >(observed, {
+          ok: (value) => {
+            $observedResultValue259955 = value;
+            return true;
+          },
+          err: (error) => {
+            $observedResultError259955 = error;
+            return false;
+          },
+        });
+        if (($observedResultOk259955 ? "ok" : "error") === "error")
+          return Result.err($observedResultError259955);
+        observedState = $observedResultValue259955;
       }
       if (
         input.requestedAction === "undo" &&
-        this.findLatestUndoableUserTransition(input.sessionId)?.id !== input.userTransitionId
+        $transitionResultValue259109.fromStateId !== input.targetStateId
       ) {
-        throw new Error(
-          "Undo history operation must use the latest transition above the undo floor",
+        return Result.err(
+          rejectMiniLilacStoreOperation(
+            "reserveHistoryOperation",
+            "Undo history operation target must be its user transition source",
+          ),
         );
       }
-      const redo = this.peekHistoryRedo(input.sessionId);
+      if (input.requestedAction === "undo") {
+        const undoable = this.findLatestUndoableUserTransitionResult(input.sessionId);
+        let $undoableResultValue260711!: import("better-result").InferOk<
+          NonNullable<typeof undoable>
+        >;
+        let $undoableResultError260711!: import("better-result").InferErr<
+          NonNullable<typeof undoable>
+        >;
+        const $undoableResultOk260711 = Result.match<
+          import("better-result").InferOk<NonNullable<typeof undoable>>,
+          import("better-result").InferErr<NonNullable<typeof undoable>>,
+          boolean
+        >(undoable, {
+          ok: (value) => {
+            $undoableResultValue260711 = value;
+            return true;
+          },
+          err: (error) => {
+            $undoableResultError260711 = error;
+            return false;
+          },
+        });
+        if (($undoableResultOk260711 ? "ok" : "error") === "error")
+          return Result.err($undoableResultError260711);
+        if ($undoableResultValue260711?.id !== input.userTransitionId) {
+          return Result.err(
+            rejectMiniLilacStoreOperation(
+              "reserveHistoryOperation",
+              "Undo history operation must use the latest transition above the undo floor",
+            ),
+          );
+        }
+      }
+      const redo = this.peekHistoryRedoResult(input.sessionId);
+      let $redoResultValue261184!: import("better-result").InferOk<NonNullable<typeof redo>>;
+      let $redoResultError261184!: import("better-result").InferErr<NonNullable<typeof redo>>;
+      const $redoResultOk261184 = Result.match<
+        import("better-result").InferOk<NonNullable<typeof redo>>,
+        import("better-result").InferErr<NonNullable<typeof redo>>,
+        boolean
+      >(redo, {
+        ok: (value) => {
+          $redoResultValue261184 = value;
+          return true;
+        },
+        err: (error) => {
+          $redoResultError261184 = error;
+          return false;
+        },
+      });
+      if (($redoResultOk261184 ? "ok" : "error") === "error")
+        return Result.err($redoResultError261184);
       if (
         input.requestedAction === "redo" &&
-        (redo?.targetStateId !== input.targetStateId ||
-          redo.userTransitionId !== input.userTransitionId)
+        ($redoResultValue261184?.targetStateId !== input.targetStateId ||
+          $redoResultValue261184.userTransitionId !== input.userTransitionId)
       ) {
-        throw new Error("Redo history operation target must match the top redo entry");
+        return Result.err(
+          rejectMiniLilacStoreOperation(
+            "reserveHistoryOperation",
+            "Redo history operation target must match the top redo entry",
+          ),
+        );
       }
       if (
         input.requestedAction === "redo" &&
-        transition.toStateId !== null &&
-        !this.isStateInAncestry(input.sessionId, input.targetStateId, transition.toStateId)
+        $transitionResultValue259109.toStateId !== null &&
+        !this.isStateInAncestry(
+          input.sessionId,
+          input.targetStateId,
+          $transitionResultValue259109.toStateId,
+        )
       ) {
-        throw new Error("Redo target must descend from its user transition destination");
+        return Result.err(
+          rejectMiniLilacStoreOperation(
+            "reserveHistoryOperation",
+            "Redo target must descend from its user transition destination",
+          ),
+        );
       }
       const now = new Date().toISOString();
       const marked = this.database
@@ -4775,7 +9920,12 @@ export class MiniLilacSqliteStore {
         )
         .run(input.sessionId, input.commandId);
       if (marked.changes !== 1) {
-        throw new Error(`Command '${input.commandId}' could not begin its history operation`);
+        return Result.err(
+          rejectMiniLilacStoreOperation(
+            "reserveHistoryOperation",
+            `Command '${input.commandId}' could not begin its history operation`,
+          ),
+        );
       }
       this.database
         .query(
@@ -4788,10 +9938,10 @@ export class MiniLilacSqliteStore {
         .run(
           input.id,
           input.sessionId,
-          workspace.id,
+          $workspaceResultValue258060.id,
           input.commandId,
           input.requestedAction,
-          source.id,
+          $sourceResultValue258966.id,
           observedState?.id ?? null,
           input.targetStateId,
           input.userTransitionId,
@@ -4800,313 +9950,1277 @@ export class MiniLilacSqliteStore {
           now,
           now,
         );
-      const operation = this.getHistoryOperation(input.id);
-      if (operation === null) throw new Error(`History operation '${input.id}' was not created`);
-      return { operation, observedState };
+      const operation = this.getHistoryOperationResult(input.id);
+      let $operationResultValue263528!: import("better-result").InferOk<
+        NonNullable<typeof operation>
+      >;
+      let $operationResultError263528!: import("better-result").InferErr<
+        NonNullable<typeof operation>
+      >;
+      const $operationResultOk263528 = Result.match<
+        import("better-result").InferOk<NonNullable<typeof operation>>,
+        import("better-result").InferErr<NonNullable<typeof operation>>,
+        boolean
+      >(operation, {
+        ok: (value) => {
+          $operationResultValue263528 = value;
+          return true;
+        },
+        err: (error) => {
+          $operationResultError263528 = error;
+          return false;
+        },
+      });
+      if (($operationResultOk263528 ? "ok" : "error") === "error")
+        return Result.err($operationResultError263528);
+      if ($operationResultValue263528 === null) {
+        return Result.err(
+          rejectMiniLilacStoreOperation(
+            "reserveHistoryOperation",
+            `History operation '${input.id}' was not created`,
+          ),
+        );
+      }
+      return Result.ok({ operation: $operationResultValue263528, observedState });
     });
   }
 
   getHistoryOperation(operationId: string): StoredHistoryOperation | null {
-    const row = this.database
-      .query("SELECT * FROM history_operations WHERE id = ?")
-      .get(operationId);
-    return row ? toHistoryOperation(row) : null;
+    return storeResultToLegacy(this.getHistoryOperationResult(operationId));
+  }
+
+  getHistoryOperationResult(
+    operationId: string,
+  ): ResultType<StoredHistoryOperation | null, MiniLilacPersistenceError> {
+    return this.runHistoryReadResult("getHistoryOperation", () =>
+      this.decodeStructuralHistoryRow({
+        kind: "operation",
+        row: this.database.query("SELECT * FROM history_operations WHERE id = ?").get(operationId),
+        recordId: operationId,
+      }),
+    );
   }
 
   listHistoryOperations(): readonly StoredHistoryOperation[] {
-    return this.database
-      .query("SELECT * FROM history_operations ORDER BY prepared_at, rowid")
-      .all()
-      .map(toHistoryOperation);
+    return storeResultToLegacy(this.listHistoryOperationsResult());
+  }
+
+  listHistoryOperationsResult(): ResultType<
+    readonly StoredHistoryOperation[],
+    MiniLilacPersistenceError
+  > {
+    return this.runHistoryReadResult("listHistoryOperations", () => {
+      return this.decodeStructuralHistoryRows({
+        kind: "operation",
+        rows: this.database
+          .query("SELECT * FROM history_operations ORDER BY prepared_at, rowid")
+          .all(),
+        recordId: "operation",
+      });
+    });
   }
 
   skipPreparedHistoryRestore(
     operationId: string,
     reasonValue: z.infer<typeof historySkipReasonSchema>,
   ): StoredHistoryOperation {
-    const reason = historySkipReasonSchema.parse(reasonValue);
-    return this.runImmediateTransaction(() => {
-      const operation = this.getHistoryOperation(operationId);
-      if (operation === null) throw new Error(`History operation '${operationId}' was not found`);
-      if (operation.filesystemMode !== "restore" || operation.phase !== "prepared") {
-        throw new Error(`History operation '${operationId}' cannot skip its prepared restore`);
-      }
-      const updated = this.database
-        .query(
-          `UPDATE history_operations
+    return storeResultToLegacy(this.skipPreparedHistoryRestoreResult(operationId, reasonValue));
+  }
+
+  skipPreparedHistoryRestoreResult(
+    operationId: string,
+    reasonValue: z.infer<typeof historySkipReasonSchema>,
+  ): ResultType<StoredHistoryOperation, MiniLilacStoreOperationError> {
+    return this.runStoreTransactionResult<StoredHistoryOperation, MiniLilacStoreOperationError>(
+      "skipPreparedHistoryRestore",
+      () => {
+        const operation = this.getHistoryOperationResult(operationId);
+        let $operationResultValue265735!: import("better-result").InferOk<
+          NonNullable<typeof operation>
+        >;
+        let $operationResultError265735!: import("better-result").InferErr<
+          NonNullable<typeof operation>
+        >;
+        const $operationResultOk265735 = Result.match<
+          import("better-result").InferOk<NonNullable<typeof operation>>,
+          import("better-result").InferErr<NonNullable<typeof operation>>,
+          boolean
+        >(operation, {
+          ok: (value) => {
+            $operationResultValue265735 = value;
+            return true;
+          },
+          err: (error) => {
+            $operationResultError265735 = error;
+            return false;
+          },
+        });
+        if (($operationResultOk265735 ? "ok" : "error") === "error")
+          return Result.err($operationResultError265735);
+        if ($operationResultValue265735 === null) {
+          return Result.err(
+            rejectMiniLilacStoreOperation(
+              "skipPreparedHistoryRestore",
+              `History operation '${operationId}' was not found`,
+            ),
+          );
+        }
+        if (
+          $operationResultValue265735.filesystemMode !== "restore" ||
+          $operationResultValue265735.phase !== "prepared"
+        ) {
+          return Result.err(
+            rejectMiniLilacStoreOperation(
+              "skipPreparedHistoryRestore",
+              `History operation '${operationId}' cannot skip its prepared restore`,
+            ),
+          );
+        }
+        const updated = this.database
+          .query(
+            `UPDATE history_operations
            SET filesystem_mode = 'skip', skip_reason = ?, updated_at = ?
            WHERE id = ? AND filesystem_mode = 'restore' AND phase = 'prepared'`,
-        )
-        .run(reason, new Date().toISOString(), operationId);
-      if (updated.changes !== 1) {
-        throw new Error(`History operation '${operationId}' could not skip its prepared restore`);
-      }
-      const skipped = this.getHistoryOperation(operationId);
-      if (skipped === null) throw new Error(`History operation '${operationId}' disappeared`);
-      return skipped;
-    });
+          )
+          .run(reasonValue, new Date().toISOString(), operationId);
+        if (updated.changes !== 1) {
+          return Result.err(
+            rejectMiniLilacStoreOperation(
+              "skipPreparedHistoryRestore",
+              `History operation '${operationId}' could not skip its prepared restore`,
+            ),
+          );
+        }
+        const skipped = this.getHistoryOperationResult(operationId);
+        let $skippedResultValue267091!: import("better-result").InferOk<
+          NonNullable<typeof skipped>
+        >;
+        let $skippedResultError267091!: import("better-result").InferErr<
+          NonNullable<typeof skipped>
+        >;
+        const $skippedResultOk267091 = Result.match<
+          import("better-result").InferOk<NonNullable<typeof skipped>>,
+          import("better-result").InferErr<NonNullable<typeof skipped>>,
+          boolean
+        >(skipped, {
+          ok: (value) => {
+            $skippedResultValue267091 = value;
+            return true;
+          },
+          err: (error) => {
+            $skippedResultError267091 = error;
+            return false;
+          },
+        });
+        if (($skippedResultOk267091 ? "ok" : "error") === "error")
+          return Result.err($skippedResultError267091);
+        if ($skippedResultValue267091 === null) {
+          return Result.err(
+            rejectMiniLilacStoreOperation(
+              "skipPreparedHistoryRestore",
+              `History operation '${operationId}' disappeared`,
+            ),
+          );
+        }
+        return Result.ok($skippedResultValue267091);
+      },
+    );
   }
 
   updateHistoryOperationPhase(
     operationId: string,
     phaseValue: z.infer<typeof historyOperationPhaseSchema>,
   ): StoredHistoryOperation {
-    const phase = historyOperationPhaseSchema.parse(phaseValue);
-    return this.runImmediateTransaction(() => {
-      const operation = this.getHistoryOperation(operationId);
-      if (operation === null) throw new Error(`History operation '${operationId}' was not found`);
-      const allowed =
-        operation.phase === phase ||
-        (operation.filesystemMode === "restore" &&
-          ((operation.phase === "prepared" && phase === "restoring") ||
-            (operation.phase === "restoring" && phase === "verified"))) ||
-        (operation.filesystemMode === "skip" &&
-          operation.phase === "prepared" &&
-          phase === "verified");
-      if (!allowed) {
-        throw new Error(
-          `History operation '${operationId}' cannot move from '${operation.phase}' to '${phase}'`,
-        );
-      }
-      this.database
-        .query("UPDATE history_operations SET phase = ?, updated_at = ? WHERE id = ?")
-        .run(phase, new Date().toISOString(), operationId);
-      const updated = this.getHistoryOperation(operationId);
-      if (updated === null) throw new Error(`History operation '${operationId}' was not found`);
-      return updated;
-    });
+    return storeResultToLegacy(this.updateHistoryOperationPhaseResult(operationId, phaseValue));
+  }
+
+  updateHistoryOperationPhaseResult(
+    operationId: string,
+    phaseValue: z.infer<typeof historyOperationPhaseSchema>,
+  ): ResultType<StoredHistoryOperation, MiniLilacStoreOperationError> {
+    const phase = phaseValue;
+    return this.runStoreTransactionResult<StoredHistoryOperation, MiniLilacStoreOperationError>(
+      "updateHistoryOperationPhase",
+      () => {
+        const operation = this.getHistoryOperationResult(operationId);
+        let $operationResultValue268174!: import("better-result").InferOk<
+          NonNullable<typeof operation>
+        >;
+        let $operationResultError268174!: import("better-result").InferErr<
+          NonNullable<typeof operation>
+        >;
+        const $operationResultOk268174 = Result.match<
+          import("better-result").InferOk<NonNullable<typeof operation>>,
+          import("better-result").InferErr<NonNullable<typeof operation>>,
+          boolean
+        >(operation, {
+          ok: (value) => {
+            $operationResultValue268174 = value;
+            return true;
+          },
+          err: (error) => {
+            $operationResultError268174 = error;
+            return false;
+          },
+        });
+        if (($operationResultOk268174 ? "ok" : "error") === "error")
+          return Result.err($operationResultError268174);
+        if ($operationResultValue268174 === null) {
+          return Result.err(
+            rejectMiniLilacStoreOperation(
+              "updateHistoryOperationPhase",
+              `History operation '${operationId}' was not found`,
+            ),
+          );
+        }
+        const allowed =
+          $operationResultValue268174.phase === phase ||
+          ($operationResultValue268174.filesystemMode === "restore" &&
+            (($operationResultValue268174.phase === "prepared" && phase === "restoring") ||
+              ($operationResultValue268174.phase === "restoring" && phase === "verified"))) ||
+          ($operationResultValue268174.filesystemMode === "skip" &&
+            $operationResultValue268174.phase === "prepared" &&
+            phase === "verified");
+        if (!allowed) {
+          return Result.err(
+            rejectMiniLilacStoreOperation(
+              "updateHistoryOperationPhase",
+              `History operation '${operationId}' cannot move from '${$operationResultValue268174.phase}' to '${phase}'`,
+            ),
+          );
+        }
+        this.database
+          .query("UPDATE history_operations SET phase = ?, updated_at = ? WHERE id = ?")
+          .run(phase, new Date().toISOString(), operationId);
+        const updated = this.getHistoryOperationResult(operationId);
+        let $updatedResultValue269480!: import("better-result").InferOk<
+          NonNullable<typeof updated>
+        >;
+        let $updatedResultError269480!: import("better-result").InferErr<
+          NonNullable<typeof updated>
+        >;
+        const $updatedResultOk269480 = Result.match<
+          import("better-result").InferOk<NonNullable<typeof updated>>,
+          import("better-result").InferErr<NonNullable<typeof updated>>,
+          boolean
+        >(updated, {
+          ok: (value) => {
+            $updatedResultValue269480 = value;
+            return true;
+          },
+          err: (error) => {
+            $updatedResultError269480 = error;
+            return false;
+          },
+        });
+        if (($updatedResultOk269480 ? "ok" : "error") === "error")
+          return Result.err($updatedResultError269480);
+        if ($updatedResultValue269480 === null) {
+          return Result.err(
+            rejectMiniLilacStoreOperation(
+              "updateHistoryOperationPhase",
+              `History operation '${operationId}' was not found`,
+            ),
+          );
+        }
+        return Result.ok($updatedResultValue269480);
+      },
+    );
   }
 
   commitHistoryNavigation(input: CommitStoredHistoryNavigation): CommittedStoredHistoryNavigation {
-    return this.runImmediateTransaction(() => {
-      const operation = this.getHistoryOperation(input.operationId);
-      if (operation === null)
-        throw new Error(`History operation '${input.operationId}' was not found`);
-      if (
-        (operation.filesystemMode === "restore" && operation.phase !== "verified") ||
-        (operation.filesystemMode === "skip" && !["prepared", "verified"].includes(operation.phase))
-      ) {
-        throw new Error(`History operation '${input.operationId}' is not ready to commit`);
-      }
-      this.assertWorkspaceHistoryAvailableForOwner(operation.workspaceId, operation.sessionId, {
-        kind: "history-operation",
-        operationId: operation.id,
+    return storeResultToLegacy(this.commitHistoryNavigationResult(input));
+  }
+
+  commitHistoryNavigationResult(
+    input: CommitStoredHistoryNavigation,
+  ): ResultType<CommittedStoredHistoryNavigation, MiniLilacStoreOperationError> {
+    return this.runStoreTransactionResult("commitHistoryNavigation", () => {
+      const operation = this.getHistoryOperationResult(input.operationId);
+      let $operationResultValue270356!: import("better-result").InferOk<
+        NonNullable<typeof operation>
+      >;
+      let $operationResultError270356!: import("better-result").InferErr<
+        NonNullable<typeof operation>
+      >;
+      const $operationResultOk270356 = Result.match<
+        import("better-result").InferOk<NonNullable<typeof operation>>,
+        import("better-result").InferErr<NonNullable<typeof operation>>,
+        boolean
+      >(operation, {
+        ok: (value) => {
+          $operationResultValue270356 = value;
+          return true;
+        },
+        err: (error) => {
+          $operationResultError270356 = error;
+          return false;
+        },
       });
-      this.requireQuiescentHistorySession(operation.sessionId, operation.sourceStateId);
-      const source = this.getHistoryState(operation.sourceStateId);
-      const target = this.getHistoryState(operation.targetStateId);
-      const transition = this.getHistoryTransition(operation.userTransitionId);
-      if (
-        source.sessionId !== operation.sessionId ||
-        target.sessionId !== operation.sessionId ||
-        transition.sessionId !== operation.sessionId ||
-        transition.kind !== "user-message" ||
-        transition.toStateId === null
-      ) {
-        throw new Error(`History operation '${input.operationId}' has incoherent ownership`);
-      }
-      const result = this.parseHistoryNavigationResult(
-        operation.requestedAction,
-        input.result,
-        operation.commandId,
-        transition.userMessage,
-      );
-      const expectedStatus = operation.requestedAction === "undo" ? "undone" : "redone";
-      if (result.status === "empty" || result.status !== expectedStatus) {
-        throw new Error(
-          `History operation '${input.operationId}' requires a '${expectedStatus}' result`,
+      if (($operationResultOk270356 ? "ok" : "error") === "error")
+        return Result.err($operationResultError270356);
+      if ($operationResultValue270356 === null) {
+        return Result.err(
+          rejectMiniLilacStoreOperation(
+            "commitHistoryNavigation",
+            `History operation '${input.operationId}' was not found`,
+          ),
         );
       }
-      if (result.historyStateId !== operation.targetStateId) {
-        throw new Error(`History operation '${input.operationId}' result names the wrong state`);
+      if (
+        ($operationResultValue270356.filesystemMode === "restore" &&
+          $operationResultValue270356.phase !== "verified") ||
+        ($operationResultValue270356.filesystemMode === "skip" &&
+          !["prepared", "verified"].includes($operationResultValue270356.phase))
+      ) {
+        return Result.err(
+          rejectMiniLilacStoreOperation(
+            "commitHistoryNavigation",
+            `History operation '${input.operationId}' is not ready to commit`,
+          ),
+        );
+      }
+      const available = this.assertWorkspaceHistoryAvailableForOwnerResult(
+        $operationResultValue270356.workspaceId,
+        $operationResultValue270356.sessionId,
+        { kind: "history-operation", operationId: $operationResultValue270356.id },
+      );
+      const availabilityError = available.match({ ok: () => null, err: (error) => error });
+      if (availabilityError !== null) return Result.err(availabilityError);
+      const quiescent = this.requireQuiescentHistorySessionResult(
+        $operationResultValue270356.sessionId,
+        $operationResultValue270356.sourceStateId,
+      );
+      const quiescenceError = quiescent.match({ ok: () => null, err: (error) => error });
+      if (quiescenceError !== null) return Result.err(quiescenceError);
+      const source = this.getHistoryStateResult($operationResultValue270356.sourceStateId);
+      let $sourceResultValue271745!: import("better-result").InferOk<NonNullable<typeof source>>;
+      let $sourceResultError271745!: import("better-result").InferErr<NonNullable<typeof source>>;
+      const $sourceResultOk271745 = Result.match<
+        import("better-result").InferOk<NonNullable<typeof source>>,
+        import("better-result").InferErr<NonNullable<typeof source>>,
+        boolean
+      >(source, {
+        ok: (value) => {
+          $sourceResultValue271745 = value;
+          return true;
+        },
+        err: (error) => {
+          $sourceResultError271745 = error;
+          return false;
+        },
+      });
+      if (($sourceResultOk271745 ? "ok" : "error") === "error")
+        return Result.err($sourceResultError271745);
+      const target = this.getHistoryStateResult($operationResultValue270356.targetStateId);
+      let $targetResultValue271895!: import("better-result").InferOk<NonNullable<typeof target>>;
+      let $targetResultError271895!: import("better-result").InferErr<NonNullable<typeof target>>;
+      const $targetResultOk271895 = Result.match<
+        import("better-result").InferOk<NonNullable<typeof target>>,
+        import("better-result").InferErr<NonNullable<typeof target>>,
+        boolean
+      >(target, {
+        ok: (value) => {
+          $targetResultValue271895 = value;
+          return true;
+        },
+        err: (error) => {
+          $targetResultError271895 = error;
+          return false;
+        },
+      });
+      if (($targetResultOk271895 ? "ok" : "error") === "error")
+        return Result.err($targetResultError271895);
+      const transition = this.getHistoryTransitionResult(
+        $operationResultValue270356.userTransitionId,
+      );
+      let $transitionResultValue272045!: import("better-result").InferOk<
+        NonNullable<typeof transition>
+      >;
+      let $transitionResultError272045!: import("better-result").InferErr<
+        NonNullable<typeof transition>
+      >;
+      const $transitionResultOk272045 = Result.match<
+        import("better-result").InferOk<NonNullable<typeof transition>>,
+        import("better-result").InferErr<NonNullable<typeof transition>>,
+        boolean
+      >(transition, {
+        ok: (value) => {
+          $transitionResultValue272045 = value;
+          return true;
+        },
+        err: (error) => {
+          $transitionResultError272045 = error;
+          return false;
+        },
+      });
+      if (($transitionResultOk272045 ? "ok" : "error") === "error")
+        return Result.err($transitionResultError272045);
+      if (
+        $sourceResultValue271745.sessionId !== $operationResultValue270356.sessionId ||
+        $targetResultValue271895.sessionId !== $operationResultValue270356.sessionId ||
+        $transitionResultValue272045.sessionId !== $operationResultValue270356.sessionId ||
+        $transitionResultValue272045.kind !== "user-message" ||
+        $transitionResultValue272045.toStateId === null
+      ) {
+        return Result.err(
+          rejectMiniLilacStoreOperation(
+            "commitHistoryNavigation",
+            `History operation '${input.operationId}' has incoherent ownership`,
+          ),
+        );
+      }
+      const decodedInputResult = decodeStoredHistoryNavigationResult(input.result);
+      let $decodedInputResultResultValue272748!: import("better-result").InferOk<
+        NonNullable<typeof decodedInputResult>
+      >;
+      let $decodedInputResultResultError272748!: import("better-result").InferErr<
+        NonNullable<typeof decodedInputResult>
+      >;
+      const $decodedInputResultResultOk272748 = Result.match<
+        import("better-result").InferOk<NonNullable<typeof decodedInputResult>>,
+        import("better-result").InferErr<NonNullable<typeof decodedInputResult>>,
+        boolean
+      >(decodedInputResult, {
+        ok: (value) => {
+          $decodedInputResultResultValue272748 = value;
+          return true;
+        },
+        err: (error) => {
+          $decodedInputResultResultError272748 = error;
+          return false;
+        },
+      });
+      if (($decodedInputResultResultOk272748 ? "ok" : "error") === "error")
+        return Result.err($decodedInputResultResultError272748);
+      const result = this.validateHistoryNavigationResult(
+        $operationResultValue270356.requestedAction,
+        $decodedInputResultResultValue272748,
+        $operationResultValue270356.commandId,
+        $transitionResultValue272045.userMessage,
+      );
+      let $resultResultValue272926!: import("better-result").InferOk<NonNullable<typeof result>>;
+      let $resultResultError272926!: import("better-result").InferErr<NonNullable<typeof result>>;
+      const $resultResultOk272926 = Result.match<
+        import("better-result").InferOk<NonNullable<typeof result>>,
+        import("better-result").InferErr<NonNullable<typeof result>>,
+        boolean
+      >(result, {
+        ok: (value) => {
+          $resultResultValue272926 = value;
+          return true;
+        },
+        err: (error) => {
+          $resultResultError272926 = error;
+          return false;
+        },
+      });
+      if (($resultResultOk272926 ? "ok" : "error") === "error")
+        return Result.err($resultResultError272926);
+      const expectedStatus =
+        $operationResultValue270356.requestedAction === "undo" ? "undone" : "redone";
+      if (
+        $resultResultValue272926.status === "empty" ||
+        $resultResultValue272926.status !== expectedStatus
+      ) {
+        return Result.err(
+          rejectMiniLilacStoreOperation(
+            "commitHistoryNavigation",
+            `History operation '${input.operationId}' requires a '${expectedStatus}' result`,
+          ),
+        );
+      }
+      if ($resultResultValue272926.historyStateId !== $operationResultValue270356.targetStateId) {
+        return Result.err(
+          rejectMiniLilacStoreOperation(
+            "commitHistoryNavigation",
+            `History operation '${input.operationId}' result names the wrong state`,
+          ),
+        );
       }
       let expectedFilesystem: MiniLilacHistoryFilesystemResult;
-      if (operation.filesystemMode === "restore") {
-        expectedFilesystem = miniLilacHistoryFilesystemResultSchema.parse({ status: "restored" });
+      if ($operationResultValue270356.filesystemMode === "restore") {
+        expectedFilesystem = { status: "restored" };
       } else {
-        if (operation.skipReason === null) {
-          throw new Error(`History operation '${input.operationId}' has no filesystem skip reason`);
+        if ($operationResultValue270356.skipReason === null) {
+          return Result.err(
+            rejectMiniLilacStoreOperation(
+              "commitHistoryNavigation",
+              `History operation '${input.operationId}' has no filesystem skip reason`,
+            ),
+          );
         }
-        expectedFilesystem = miniLilacHistoryFilesystemResultSchema.parse({
+        expectedFilesystem = {
           status: "skipped",
-          reason: operation.skipReason,
+          reason: $operationResultValue270356.skipReason,
+        };
+      }
+      if (!canonicalValuesEqual($resultResultValue272926.filesystem, expectedFilesystem)) {
+        return Result.err(
+          rejectMiniLilacStoreOperation(
+            "commitHistoryNavigation",
+            `History operation '${input.operationId}' result has the wrong filesystem outcome`,
+          ),
+        );
+      }
+      let redoTarget = $sourceResultValue271745;
+      if ($operationResultValue270356.observedSourceStateId !== null) {
+        const observed = this.getHistoryStateResult(
+          $operationResultValue270356.observedSourceStateId,
+        );
+        let $observedResultValue274945!: import("better-result").InferOk<
+          NonNullable<typeof observed>
+        >;
+        let $observedResultError274945!: import("better-result").InferErr<
+          NonNullable<typeof observed>
+        >;
+        const $observedResultOk274945 = Result.match<
+          import("better-result").InferOk<NonNullable<typeof observed>>,
+          import("better-result").InferErr<NonNullable<typeof observed>>,
+          boolean
+        >(observed, {
+          ok: (value) => {
+            $observedResultValue274945 = value;
+            return true;
+          },
+          err: (error) => {
+            $observedResultError274945 = error;
+            return false;
+          },
         });
-      }
-      if (!canonicalValuesEqual(result.filesystem, expectedFilesystem)) {
-        throw new Error(
-          `History operation '${input.operationId}' result has the wrong filesystem outcome`,
+        if (($observedResultOk274945 ? "ok" : "error") === "error")
+          return Result.err($observedResultError274945);
+        const incoming = this.getIncomingHistoryTransitionResult(
+          $operationResultValue270356.sessionId,
+          $operationResultValue270356.observedSourceStateId,
         );
-      }
-      let redoTarget = source;
-      if (operation.observedSourceStateId !== null) {
-        const observed = this.getHistoryState(operation.observedSourceStateId);
-        const incoming = this.getIncomingHistoryTransition(
-          operation.sessionId,
-          operation.observedSourceStateId,
-        );
+        let $incomingResultValue275113!: import("better-result").InferOk<
+          NonNullable<typeof incoming>
+        >;
+        let $incomingResultError275113!: import("better-result").InferErr<
+          NonNullable<typeof incoming>
+        >;
+        const $incomingResultOk275113 = Result.match<
+          import("better-result").InferOk<NonNullable<typeof incoming>>,
+          import("better-result").InferErr<NonNullable<typeof incoming>>,
+          boolean
+        >(incoming, {
+          ok: (value) => {
+            $incomingResultValue275113 = value;
+            return true;
+          },
+          err: (error) => {
+            $incomingResultError275113 = error;
+            return false;
+          },
+        });
+        if (($incomingResultOk275113 ? "ok" : "error") === "error")
+          return Result.err($incomingResultError275113);
         if (
-          observed.modelHeadId !== source.modelHeadId ||
-          observed.uiHeadId !== source.uiHeadId ||
-          incoming?.kind !== "workspace-observation" ||
-          incoming.fromStateId !== source.id
+          $observedResultValue274945.modelHeadId !== $sourceResultValue271745.modelHeadId ||
+          $observedResultValue274945.uiHeadId !== $sourceResultValue271745.uiHeadId ||
+          $incomingResultValue275113?.kind !== "workspace-observation" ||
+          $incomingResultValue275113.fromStateId !== $sourceResultValue271745.id
         ) {
-          throw new Error(`History operation '${input.operationId}' has an invalid observation`);
-        }
-        redoTarget = observed;
-      }
-      if (operation.requestedAction === "undo") {
-        if (
-          transition.fromStateId !== target.id ||
-          this.findLatestUndoableUserTransition(operation.sessionId)?.id !== transition.id ||
-          !this.isStateInAncestry(operation.sessionId, redoTarget.id, transition.toStateId)
-        ) {
-          throw new Error(
-            `History operation '${input.operationId}' no longer matches undo topology`,
+          return Result.err(
+            rejectMiniLilacStoreOperation(
+              "commitHistoryNavigation",
+              `History operation '${input.operationId}' has an invalid observation`,
+            ),
           );
         }
-        this.pushHistoryRedo(operation.sessionId, redoTarget.id, transition.id);
+        redoTarget = $observedResultValue274945;
+      }
+      if ($operationResultValue270356.requestedAction === "undo") {
+        const undoable = this.findLatestUndoableUserTransitionResult(
+          $operationResultValue270356.sessionId,
+        );
+        let $undoableResultValue275965!: import("better-result").InferOk<
+          NonNullable<typeof undoable>
+        >;
+        let $undoableResultError275965!: import("better-result").InferErr<
+          NonNullable<typeof undoable>
+        >;
+        const $undoableResultOk275965 = Result.match<
+          import("better-result").InferOk<NonNullable<typeof undoable>>,
+          import("better-result").InferErr<NonNullable<typeof undoable>>,
+          boolean
+        >(undoable, {
+          ok: (value) => {
+            $undoableResultValue275965 = value;
+            return true;
+          },
+          err: (error) => {
+            $undoableResultError275965 = error;
+            return false;
+          },
+        });
+        if (($undoableResultOk275965 ? "ok" : "error") === "error")
+          return Result.err($undoableResultError275965);
+        if (
+          $transitionResultValue272045.fromStateId !== $targetResultValue271895.id ||
+          $undoableResultValue275965?.id !== $transitionResultValue272045.id ||
+          !this.isStateInAncestry(
+            $operationResultValue270356.sessionId,
+            redoTarget.id,
+            $transitionResultValue272045.toStateId,
+          )
+        ) {
+          return Result.err(
+            rejectMiniLilacStoreOperation(
+              "commitHistoryNavigation",
+              `History operation '${input.operationId}' no longer matches undo topology`,
+            ),
+          );
+        }
+        const pushed = this.pushHistoryRedoResult(
+          $operationResultValue270356.sessionId,
+          redoTarget.id,
+          $transitionResultValue272045.id,
+        );
+        const pushError = pushed.match({ ok: () => null, err: (error) => error });
+        if (pushError !== null) return Result.err(pushError);
       } else {
-        const redo = this.peekHistoryRedo(operation.sessionId);
+        const redo = this.peekHistoryRedoResult($operationResultValue270356.sessionId);
+        let $redoResultValue276917!: import("better-result").InferOk<NonNullable<typeof redo>>;
+        let $redoResultError276917!: import("better-result").InferErr<NonNullable<typeof redo>>;
+        const $redoResultOk276917 = Result.match<
+          import("better-result").InferOk<NonNullable<typeof redo>>,
+          import("better-result").InferErr<NonNullable<typeof redo>>,
+          boolean
+        >(redo, {
+          ok: (value) => {
+            $redoResultValue276917 = value;
+            return true;
+          },
+          err: (error) => {
+            $redoResultError276917 = error;
+            return false;
+          },
+        });
+        if (($redoResultOk276917 ? "ok" : "error") === "error")
+          return Result.err($redoResultError276917);
         if (
-          redo?.targetStateId !== target.id ||
-          redo.userTransitionId !== transition.id ||
-          !this.isStateInAncestry(operation.sessionId, target.id, transition.toStateId)
+          $redoResultValue276917?.targetStateId !== $targetResultValue271895.id ||
+          $redoResultValue276917.userTransitionId !== $transitionResultValue272045.id ||
+          !this.isStateInAncestry(
+            $operationResultValue270356.sessionId,
+            $targetResultValue271895.id,
+            $transitionResultValue272045.toStateId,
+          )
         ) {
-          throw new Error(
-            `History operation '${input.operationId}' no longer matches redo topology`,
+          return Result.err(
+            rejectMiniLilacStoreOperation(
+              "commitHistoryNavigation",
+              `History operation '${input.operationId}' no longer matches redo topology`,
+            ),
           );
         }
-        this.popHistoryRedo(operation.sessionId);
+        const popped = this.popHistoryRedoResult($operationResultValue270356.sessionId);
+        const popError = popped.match({ ok: () => null, err: (error) => error });
+        if (popError !== null) return Result.err(popError);
       }
-      this.moveHistoryCursor(operation.sessionId, target);
-      this.saveHistoryCommandResult(operation, result);
-      this.deleteHistoryOperationRow(operation.id);
-      return {
-        operation,
-        currentState: target,
-        navigation: this.getHistoryNavigation(operation.sessionId),
-      };
+      const moved = this.moveHistoryCursorResult(
+        $operationResultValue270356.sessionId,
+        $targetResultValue271895,
+      );
+      const moveError = moved.match({ ok: () => null, err: (error) => error });
+      if (moveError !== null) return Result.err(moveError);
+      const saved = this.saveHistoryCommandResultResult(
+        $operationResultValue270356,
+        $resultResultValue272926,
+      );
+      const saveError = saved.match({ ok: () => null, err: (error) => error });
+      if (saveError !== null) return Result.err(saveError);
+      const deleted = this.deleteHistoryOperationRowResult($operationResultValue270356.id);
+      const deletionError = deleted.match({ ok: () => null, err: (error) => error });
+      if (deletionError !== null) return Result.err(deletionError);
+      const navigation = this.getHistoryNavigationResult($operationResultValue270356.sessionId);
+      let $navigationResultValue278228!: import("better-result").InferOk<
+        NonNullable<typeof navigation>
+      >;
+      let $navigationResultError278228!: import("better-result").InferErr<
+        NonNullable<typeof navigation>
+      >;
+      const $navigationResultOk278228 = Result.match<
+        import("better-result").InferOk<NonNullable<typeof navigation>>,
+        import("better-result").InferErr<NonNullable<typeof navigation>>,
+        boolean
+      >(navigation, {
+        ok: (value) => {
+          $navigationResultValue278228 = value;
+          return true;
+        },
+        err: (error) => {
+          $navigationResultError278228 = error;
+          return false;
+        },
+      });
+      if (($navigationResultOk278228 ? "ok" : "error") === "error")
+        return Result.err($navigationResultError278228);
+      return Result.ok({
+        operation: $operationResultValue270356,
+        currentState: $targetResultValue271895,
+        navigation: $navigationResultValue278228,
+      });
     });
   }
 
   abandonHistoryNavigation(
     input: AcknowledgeStoredHistoryNavigationAbandonment,
   ): StoredHistoryCommandError {
-    z.literal(true).parse(input.acknowledgePartialWorktree);
-    const parsedMessage = z.string().min(1).parse(input.message);
-    return this.runImmediateTransaction(() => {
-      const operation = this.getHistoryOperation(input.operationId);
-      if (operation === null) {
-        throw new Error(`History operation '${input.operationId}' was not found`);
-      }
-      this.requireQuiescentHistorySession(operation.sessionId, operation.sourceStateId);
-      const source = this.getHistoryState(operation.sourceStateId);
-      if (operation.observedSourceStateId !== null) {
-        const observed = this.getHistoryState(operation.observedSourceStateId);
-        const incoming = this.getIncomingHistoryTransition(
-          operation.sessionId,
-          operation.observedSourceStateId,
+    return storeResultToLegacy(this.abandonHistoryNavigationResult(input));
+  }
+
+  abandonHistoryNavigationResult(
+    input: AcknowledgeStoredHistoryNavigationAbandonment,
+  ): ResultType<StoredHistoryCommandError, MiniLilacStoreOperationError> {
+    return this.runStoreTransactionResult("abandonHistoryNavigation", () => {
+      const operation = this.getHistoryOperationResult(input.operationId);
+      let $operationResultValue278994!: import("better-result").InferOk<
+        NonNullable<typeof operation>
+      >;
+      let $operationResultError278994!: import("better-result").InferErr<
+        NonNullable<typeof operation>
+      >;
+      const $operationResultOk278994 = Result.match<
+        import("better-result").InferOk<NonNullable<typeof operation>>,
+        import("better-result").InferErr<NonNullable<typeof operation>>,
+        boolean
+      >(operation, {
+        ok: (value) => {
+          $operationResultValue278994 = value;
+          return true;
+        },
+        err: (error) => {
+          $operationResultError278994 = error;
+          return false;
+        },
+      });
+      if (($operationResultOk278994 ? "ok" : "error") === "error")
+        return Result.err($operationResultError278994);
+      if ($operationResultValue278994 === null) {
+        return Result.err(
+          rejectMiniLilacStoreOperation(
+            "abandonHistoryNavigation",
+            `History operation '${input.operationId}' was not found`,
+          ),
         );
+      }
+      const quiescent = this.requireQuiescentHistorySessionResult(
+        $operationResultValue278994.sessionId,
+        $operationResultValue278994.sourceStateId,
+      );
+      const quiescenceError = quiescent.match({ ok: () => null, err: (error) => error });
+      if (quiescenceError !== null) return Result.err(quiescenceError);
+      const source = this.getHistoryStateResult($operationResultValue278994.sourceStateId);
+      let $sourceResultValue279619!: import("better-result").InferOk<NonNullable<typeof source>>;
+      let $sourceResultError279619!: import("better-result").InferErr<NonNullable<typeof source>>;
+      const $sourceResultOk279619 = Result.match<
+        import("better-result").InferOk<NonNullable<typeof source>>,
+        import("better-result").InferErr<NonNullable<typeof source>>,
+        boolean
+      >(source, {
+        ok: (value) => {
+          $sourceResultValue279619 = value;
+          return true;
+        },
+        err: (error) => {
+          $sourceResultError279619 = error;
+          return false;
+        },
+      });
+      if (($sourceResultOk279619 ? "ok" : "error") === "error")
+        return Result.err($sourceResultError279619);
+      if ($operationResultValue278994.observedSourceStateId !== null) {
+        const observed = this.getHistoryStateResult(
+          $operationResultValue278994.observedSourceStateId,
+        );
+        let $observedResultValue279831!: import("better-result").InferOk<
+          NonNullable<typeof observed>
+        >;
+        let $observedResultError279831!: import("better-result").InferErr<
+          NonNullable<typeof observed>
+        >;
+        const $observedResultOk279831 = Result.match<
+          import("better-result").InferOk<NonNullable<typeof observed>>,
+          import("better-result").InferErr<NonNullable<typeof observed>>,
+          boolean
+        >(observed, {
+          ok: (value) => {
+            $observedResultValue279831 = value;
+            return true;
+          },
+          err: (error) => {
+            $observedResultError279831 = error;
+            return false;
+          },
+        });
+        if (($observedResultOk279831 ? "ok" : "error") === "error")
+          return Result.err($observedResultError279831);
+        const incoming = this.getIncomingHistoryTransitionResult(
+          $operationResultValue278994.sessionId,
+          $operationResultValue278994.observedSourceStateId,
+        );
+        let $incomingResultValue279999!: import("better-result").InferOk<
+          NonNullable<typeof incoming>
+        >;
+        let $incomingResultError279999!: import("better-result").InferErr<
+          NonNullable<typeof incoming>
+        >;
+        const $incomingResultOk279999 = Result.match<
+          import("better-result").InferOk<NonNullable<typeof incoming>>,
+          import("better-result").InferErr<NonNullable<typeof incoming>>,
+          boolean
+        >(incoming, {
+          ok: (value) => {
+            $incomingResultValue279999 = value;
+            return true;
+          },
+          err: (error) => {
+            $incomingResultError279999 = error;
+            return false;
+          },
+        });
+        if (($incomingResultOk279999 ? "ok" : "error") === "error")
+          return Result.err($incomingResultError279999);
         if (
-          observed.modelHeadId !== source.modelHeadId ||
-          observed.uiHeadId !== source.uiHeadId ||
-          incoming?.kind !== "workspace-observation" ||
-          incoming.fromStateId !== source.id
+          $observedResultValue279831.modelHeadId !== $sourceResultValue279619.modelHeadId ||
+          $observedResultValue279831.uiHeadId !== $sourceResultValue279619.uiHeadId ||
+          $incomingResultValue279999?.kind !== "workspace-observation" ||
+          $incomingResultValue279999.fromStateId !== $sourceResultValue279619.id
         ) {
-          throw new Error(`History operation '${input.operationId}' has an invalid observation`);
+          return Result.err(
+            rejectMiniLilacStoreOperation(
+              "abandonHistoryNavigation",
+              `History operation '${input.operationId}' has an invalid observation`,
+            ),
+          );
         }
       }
-      const error = storedHistoryCommandErrorSchema.parse({
+      const error: StoredHistoryCommandError = {
         type: "history-command-error",
         code: "history-recovery-abandoned",
-        commandId: operation.commandId,
-        message: parsedMessage,
-      });
-      this.saveHistoryCommandResult(operation, error);
-      this.deleteHistoryOperationRow(operation.id);
-      return error;
+        commandId: $operationResultValue278994.commandId,
+        message: input.message,
+      };
+      const saved = this.saveHistoryCommandResultResult($operationResultValue278994, error);
+      const saveError = saved.match({ ok: () => null, err: (error) => error });
+      if (saveError !== null) return Result.err(saveError);
+      const deleted = this.deleteHistoryOperationRowResult($operationResultValue278994.id);
+      const deletionError = deleted.match({ ok: () => null, err: (error) => error });
+      if (deletionError !== null) return Result.err(deletionError);
+      return Result.ok(error);
     });
   }
 
   reservePendingRunFinalization(
     input: ReservePendingStoredRunFinalization,
   ): PendingStoredRunFinalization {
-    modelMessagesSchema.parse(input.modelMessages);
-    miniLilacMessagesSchema.parse(input.uiMessages);
-    const runStatus = z.enum(["completed", "cancelled", "error"]).parse(input.runStatus);
-    const sessionStatus = z.enum(["idle", "error"]).parse(input.sessionStatus);
-    const providerState =
-      input.providerState === undefined
-        ? null
-        : historyProviderStateSchema.parse(input.providerState);
-    const promotion =
-      input.claudeBindingPromotion === undefined
-        ? null
-        : promoteMiniMainClaudeSessionBindingSchema.parse(input.claudeBindingPromotion);
-    const namedPromotion =
-      input.namedClaudeBindingPromotion === undefined
-        ? null
-        : promoteMiniNamedClaudeSessionBindingSchema.parse(input.namedClaudeBindingPromotion);
+    return storeResultToLegacy(this.reservePendingRunFinalizationResult(input));
+  }
+
+  reservePendingRunFinalizationResult(
+    input: ReservePendingStoredRunFinalization,
+  ): ResultType<PendingStoredRunFinalization, MiniLilacStoreOperationError> {
+    const runStatus = input.runStatus;
+    const sessionStatus = input.sessionStatus;
+    const providerState = input.providerState ?? null;
+    const promotion = input.claudeBindingPromotion ?? null;
+    const namedPromotion = input.namedClaudeBindingPromotion ?? null;
     if (promotion !== null && namedPromotion !== null) {
-      throw new Error("A run cannot promote both main and named Claude bindings");
+      return Result.err(
+        rejectMiniLilacStoreOperation(
+          "reservePendingRunFinalization",
+          "A run cannot promote both main and named Claude bindings",
+        ),
+      );
     }
     if (
       (promotion !== null || namedPromotion !== null) &&
       providerState?.lastFamily !== "claude-code"
     ) {
-      throw new Error("A Claude binding promotion requires Claude provider-state metadata");
+      return Result.err(
+        rejectMiniLilacStoreOperation(
+          "reservePendingRunFinalization",
+          "A Claude binding promotion requires Claude provider-state metadata",
+        ),
+      );
     }
-    if (input.inputTokens !== null) z.number().int().nonnegative().parse(input.inputTokens);
-    return this.runImmediateTransaction(() => {
-      const workspace = this.getWorkspaceForSession(input.sessionId);
+    if (
+      input.inputTokens !== null &&
+      (!Number.isInteger(input.inputTokens) || input.inputTokens < 0)
+    ) {
+      return Result.err(
+        rejectMiniLilacStoreOperation(
+          "reservePendingRunFinalization",
+          "Pending run input tokens must be a non-negative integer",
+        ),
+      );
+    }
+    const terminalResult = serializeOptionalTerminalResult(input, "reservePendingRunFinalization");
+    let $terminalResultResultValue282880!: import("better-result").InferOk<
+      NonNullable<typeof terminalResult>
+    >;
+    let $terminalResultResultError282880!: import("better-result").InferErr<
+      NonNullable<typeof terminalResult>
+    >;
+    const $terminalResultResultOk282880 = Result.match<
+      import("better-result").InferOk<NonNullable<typeof terminalResult>>,
+      import("better-result").InferErr<NonNullable<typeof terminalResult>>,
+      boolean
+    >(terminalResult, {
+      ok: (value) => {
+        $terminalResultResultValue282880 = value;
+        return true;
+      },
+      err: (error) => {
+        $terminalResultResultError282880 = error;
+        return false;
+      },
+    });
+    if (($terminalResultResultOk282880 ? "ok" : "error") === "error")
+      return Result.err($terminalResultResultError282880);
+    const serializedPromotion =
+      promotion === null
+        ? Result.ok<string | null>(null)
+        : serializeStoreValueResult(promotion, "reservePendingRunFinalization.promotion");
+    let $serializedPromotionResultValue283064!: import("better-result").InferOk<
+      NonNullable<typeof serializedPromotion>
+    >;
+    let $serializedPromotionResultError283064!: import("better-result").InferErr<
+      NonNullable<typeof serializedPromotion>
+    >;
+    const $serializedPromotionResultOk283064 = Result.match<
+      import("better-result").InferOk<NonNullable<typeof serializedPromotion>>,
+      import("better-result").InferErr<NonNullable<typeof serializedPromotion>>,
+      boolean
+    >(serializedPromotion, {
+      ok: (value) => {
+        $serializedPromotionResultValue283064 = value;
+        return true;
+      },
+      err: (error) => {
+        $serializedPromotionResultError283064 = error;
+        return false;
+      },
+    });
+    if (($serializedPromotionResultOk283064 ? "ok" : "error") === "error")
+      return Result.err($serializedPromotionResultError283064);
+    const serializedNamedPromotion =
+      namedPromotion === null
+        ? Result.ok<string | null>(null)
+        : serializeStoreValueResult(namedPromotion, "reservePendingRunFinalization.namedPromotion");
+    let $serializedNamedPromotionResultValue283347!: import("better-result").InferOk<
+      NonNullable<typeof serializedNamedPromotion>
+    >;
+    let $serializedNamedPromotionResultError283347!: import("better-result").InferErr<
+      NonNullable<typeof serializedNamedPromotion>
+    >;
+    const $serializedNamedPromotionResultOk283347 = Result.match<
+      import("better-result").InferOk<NonNullable<typeof serializedNamedPromotion>>,
+      import("better-result").InferErr<NonNullable<typeof serializedNamedPromotion>>,
+      boolean
+    >(serializedNamedPromotion, {
+      ok: (value) => {
+        $serializedNamedPromotionResultValue283347 = value;
+        return true;
+      },
+      err: (error) => {
+        $serializedNamedPromotionResultError283347 = error;
+        return false;
+      },
+    });
+    if (($serializedNamedPromotionResultOk283347 ? "ok" : "error") === "error") {
+      return Result.err($serializedNamedPromotionResultError283347);
+    }
+    return this.runStoreTransactionResult<
+      PendingStoredRunFinalization,
+      MiniLilacStoreOperationError
+    >("reservePendingRunFinalization", () => {
+      const workspace = this.getWorkspaceForSessionResult(input.sessionId);
+      let $workspaceResultValue283837!: import("better-result").InferOk<
+        NonNullable<typeof workspace>
+      >;
+      let $workspaceResultError283837!: import("better-result").InferErr<
+        NonNullable<typeof workspace>
+      >;
+      const $workspaceResultOk283837 = Result.match<
+        import("better-result").InferOk<NonNullable<typeof workspace>>,
+        import("better-result").InferErr<NonNullable<typeof workspace>>,
+        boolean
+      >(workspace, {
+        ok: (value) => {
+          $workspaceResultValue283837 = value;
+          return true;
+        },
+        err: (error) => {
+          $workspaceResultError283837 = error;
+          return false;
+        },
+      });
+      if (($workspaceResultOk283837 ? "ok" : "error") === "error")
+        return Result.err($workspaceResultError283837);
       if (
         this.database
           .query("SELECT 1 FROM history_operations WHERE workspace_id = ?")
-          .get(workspace.id)
+          .get($workspaceResultValue283837.id)
       ) {
-        throw new Error(`Workspace '${workspace.id}' has a retained history operation`);
+        return Result.err(
+          rejectMiniLilacStoreOperation(
+            "reservePendingRunFinalization",
+            `Workspace '${$workspaceResultValue283837.id}' has a retained history operation`,
+          ),
+        );
       }
       if (
         this.database
           .query("SELECT 1 FROM pending_run_finalizations WHERE workspace_id = ?")
-          .get(workspace.id)
+          .get($workspaceResultValue283837.id)
       ) {
-        throw new Error(`Workspace '${workspace.id}' already has a pending run finalization`);
+        return Result.err(
+          rejectMiniLilacStoreOperation(
+            "reservePendingRunFinalization",
+            `Workspace '${$workspaceResultValue283837.id}' already has a pending run finalization`,
+          ),
+        );
       }
-      const activeRun = this.getActiveRootRun(input.sessionId);
-      const session = this.getSession(input.sessionId);
-      const transition = this.getHistoryTransition(input.openTransitionId);
+      const activeRunRow = this.database
+        .query(
+          `SELECT runs.* FROM sessions
+           JOIN runs ON runs.id = sessions.active_run_id AND runs.session_id = sessions.id
+           WHERE sessions.id = ? AND runs.parent_run_id IS NULL AND runs.status = 'active'`,
+        )
+        .get(input.sessionId);
+      const activeRun = activeRunRow
+        ? decodeRunRow(activeRunRow, `${input.sessionId}:active-root`)
+        : Result.ok(null);
+      let $activeRunResultValue285085!: import("better-result").InferOk<
+        NonNullable<typeof activeRun>
+      >;
+      let $activeRunResultError285085!: import("better-result").InferErr<
+        NonNullable<typeof activeRun>
+      >;
+      const $activeRunResultOk285085 = Result.match<
+        import("better-result").InferOk<NonNullable<typeof activeRun>>,
+        import("better-result").InferErr<NonNullable<typeof activeRun>>,
+        boolean
+      >(activeRun, {
+        ok: (value) => {
+          $activeRunResultValue285085 = value;
+          return true;
+        },
+        err: (error) => {
+          $activeRunResultError285085 = error;
+          return false;
+        },
+      });
+      if (($activeRunResultOk285085 ? "ok" : "error") === "error")
+        return Result.err($activeRunResultError285085);
+      const session = this.getSessionResult(input.sessionId);
+      let $sessionResultValue285296!: import("better-result").InferOk<NonNullable<typeof session>>;
+      let $sessionResultError285296!: import("better-result").InferErr<NonNullable<typeof session>>;
+      const $sessionResultOk285296 = Result.match<
+        import("better-result").InferOk<NonNullable<typeof session>>,
+        import("better-result").InferErr<NonNullable<typeof session>>,
+        boolean
+      >(session, {
+        ok: (value) => {
+          $sessionResultValue285296 = value;
+          return true;
+        },
+        err: (error) => {
+          $sessionResultError285296 = error;
+          return false;
+        },
+      });
+      if (($sessionResultOk285296 ? "ok" : "error") === "error")
+        return Result.err($sessionResultError285296);
+      const transition = this.getHistoryTransitionResult(input.openTransitionId);
+      let $transitionResultValue285430!: import("better-result").InferOk<
+        NonNullable<typeof transition>
+      >;
+      let $transitionResultError285430!: import("better-result").InferErr<
+        NonNullable<typeof transition>
+      >;
+      const $transitionResultOk285430 = Result.match<
+        import("better-result").InferOk<NonNullable<typeof transition>>,
+        import("better-result").InferErr<NonNullable<typeof transition>>,
+        boolean
+      >(transition, {
+        ok: (value) => {
+          $transitionResultValue285430 = value;
+          return true;
+        },
+        err: (error) => {
+          $transitionResultError285430 = error;
+          return false;
+        },
+      });
+      if (($transitionResultOk285430 ? "ok" : "error") === "error")
+        return Result.err($transitionResultError285430);
+      const history = this.getSessionHistoryResult(input.sessionId);
+      let $historyResultValue285590!: import("better-result").InferOk<NonNullable<typeof history>>;
+      let $historyResultError285590!: import("better-result").InferErr<NonNullable<typeof history>>;
+      const $historyResultOk285590 = Result.match<
+        import("better-result").InferOk<NonNullable<typeof history>>,
+        import("better-result").InferErr<NonNullable<typeof history>>,
+        boolean
+      >(history, {
+        ok: (value) => {
+          $historyResultValue285590 = value;
+          return true;
+        },
+        err: (error) => {
+          $historyResultError285590 = error;
+          return false;
+        },
+      });
+      if (($historyResultOk285590 ? "ok" : "error") === "error")
+        return Result.err($historyResultError285590);
       if (
-        !["streaming", "cancelling"].includes(session.status) ||
-        activeRun?.id !== input.runId ||
-        transition.sessionId !== input.sessionId ||
-        transition.kind !== "user-message" ||
-        transition.toStateId !== null ||
-        transition.rootRunId !== input.runId ||
-        this.getSessionHistory(input.sessionId).currentStateId !== transition.fromStateId
+        !["streaming", "cancelling"].includes($sessionResultValue285296.status) ||
+        $activeRunResultValue285085?.id !== input.runId ||
+        $transitionResultValue285430.sessionId !== input.sessionId ||
+        $transitionResultValue285430.kind !== "user-message" ||
+        $transitionResultValue285430.toStateId !== null ||
+        $transitionResultValue285430.rootRunId !== input.runId ||
+        $historyResultValue285590.currentStateId !== $transitionResultValue285430.fromStateId
       ) {
-        throw new Error(`Pending finalization for run '${input.runId}' is not coherent`);
+        return Result.err(
+          rejectMiniLilacStoreOperation(
+            "reservePendingRunFinalization",
+            `Pending finalization for run '${input.runId}' is not coherent`,
+          ),
+        );
       }
-      const canonicalModelMessages = this.getModelMessages(input.sessionId);
-      const canonicalUiMessages = this.getUiMessages(input.sessionId);
+      const canonicalUiMessages = this.getUiMessagesResult(input.sessionId);
+      let $canonicalUiMessagesResultValue286373!: import("better-result").InferOk<
+        NonNullable<typeof canonicalUiMessages>
+      >;
+      let $canonicalUiMessagesResultError286373!: import("better-result").InferErr<
+        NonNullable<typeof canonicalUiMessages>
+      >;
+      const $canonicalUiMessagesResultOk286373 = Result.match<
+        import("better-result").InferOk<NonNullable<typeof canonicalUiMessages>>,
+        import("better-result").InferErr<NonNullable<typeof canonicalUiMessages>>,
+        boolean
+      >(canonicalUiMessages, {
+        ok: (value) => {
+          $canonicalUiMessagesResultValue286373 = value;
+          return true;
+        },
+        err: (error) => {
+          $canonicalUiMessagesResultError286373 = error;
+          return false;
+        },
+      });
+      if (($canonicalUiMessagesResultOk286373 ? "ok" : "error") === "error")
+        return Result.err($canonicalUiMessagesResultError286373);
       // Automatic in-run compaction can replace the complete model chain and
-      // currently has no persisted rewrite provenance. Both chains are schema
-      // validated; UI continuity plus the open transition identifies the turn.
-      modelMessagesSchema.parse(canonicalModelMessages);
-      if (!isCanonicalPrefix(canonicalUiMessages, input.uiMessages)) {
-        throw new Error("Final UI transcript does not extend the canonical active transcript");
+      // currently has no persisted rewrite provenance. UI continuity plus the
+      // open transition identifies the turn.
+      if (!isCanonicalPrefix($canonicalUiMessagesResultValue286373, input.uiMessages)) {
+        return Result.err(
+          rejectMiniLilacStoreOperation(
+            "reservePendingRunFinalization",
+            "Final UI transcript does not extend the canonical active transcript",
+          ),
+        );
       }
-      const fromState = this.getHistoryState(transition.fromStateId);
-      const fromUiMessages = miniLilacMessagesSchema.parse(
-        this.readSerializedChain(input.sessionId, "ui", fromState.uiHeadId).map(deserialize),
+      const fromState = this.getHistoryStateResult($transitionResultValue285430.fromStateId);
+      let $fromStateResultValue287054!: import("better-result").InferOk<
+        NonNullable<typeof fromState>
+      >;
+      let $fromStateResultError287054!: import("better-result").InferErr<
+        NonNullable<typeof fromState>
+      >;
+      const $fromStateResultOk287054 = Result.match<
+        import("better-result").InferOk<NonNullable<typeof fromState>>,
+        import("better-result").InferErr<NonNullable<typeof fromState>>,
+        boolean
+      >(fromState, {
+        ok: (value) => {
+          $fromStateResultValue287054 = value;
+          return true;
+        },
+        err: (error) => {
+          $fromStateResultError287054 = error;
+          return false;
+        },
+      });
+      if (($fromStateResultOk287054 ? "ok" : "error") === "error")
+        return Result.err($fromStateResultError287054);
+      const rawFromUiMessages = this.readSerializedChainResult(
+        input.sessionId,
+        "ui",
+        $fromStateResultValue287054.uiHeadId,
       );
-      const admittedMessage = transition.userMessage;
+      let $rawFromUiMessagesResultValue287212!: import("better-result").InferOk<
+        NonNullable<typeof rawFromUiMessages>
+      >;
+      let $rawFromUiMessagesResultError287212!: import("better-result").InferErr<
+        NonNullable<typeof rawFromUiMessages>
+      >;
+      const $rawFromUiMessagesResultOk287212 = Result.match<
+        import("better-result").InferOk<NonNullable<typeof rawFromUiMessages>>,
+        import("better-result").InferErr<NonNullable<typeof rawFromUiMessages>>,
+        boolean
+      >(rawFromUiMessages, {
+        ok: (value) => {
+          $rawFromUiMessagesResultValue287212 = value;
+          return true;
+        },
+        err: (error) => {
+          $rawFromUiMessagesResultError287212 = error;
+          return false;
+        },
+      });
+      if (($rawFromUiMessagesResultOk287212 ? "ok" : "error") === "error")
+        return Result.err($rawFromUiMessagesResultError287212);
+      const decodedFromUiMessages = decodeMiniLilacUiTranscript({
+        rawValues: $rawFromUiMessagesResultValue287212,
+        schemaVersion: MINI_LILAC_DATABASE_SCHEMA_VERSION,
+        recordId: $fromStateResultValue287054.id,
+      });
+      let $decodedFromUiMessagesResultValue287450!: import("better-result").InferOk<
+        NonNullable<typeof decodedFromUiMessages>
+      >;
+      let $decodedFromUiMessagesResultError287450!: import("better-result").InferErr<
+        NonNullable<typeof decodedFromUiMessages>
+      >;
+      const $decodedFromUiMessagesResultOk287450 = Result.match<
+        import("better-result").InferOk<NonNullable<typeof decodedFromUiMessages>>,
+        import("better-result").InferErr<NonNullable<typeof decodedFromUiMessages>>,
+        boolean
+      >(decodedFromUiMessages, {
+        ok: (value) => {
+          $decodedFromUiMessagesResultValue287450 = value;
+          return true;
+        },
+        err: (error) => {
+          $decodedFromUiMessagesResultError287450 = error;
+          return false;
+        },
+      });
+      if (($decodedFromUiMessagesResultOk287450 ? "ok" : "error") === "error")
+        return Result.err($decodedFromUiMessagesResultError287450);
+      const fromUiMessages = $decodedFromUiMessagesResultValue287450.value;
+      const admittedMessage = $transitionResultValue285430.userMessage;
       if (
         admittedMessage === null ||
-        !canonicalValuesEqual(canonicalUiMessages[fromUiMessages.length], admittedMessage) ||
+        !canonicalValuesEqual(
+          $canonicalUiMessagesResultValue286373[fromUiMessages.length],
+          admittedMessage,
+        ) ||
         !canonicalValuesEqual(input.uiMessages[fromUiMessages.length], admittedMessage)
       ) {
-        throw new Error("Final UI transcript does not retain the admitted open user message");
+        return Result.err(
+          rejectMiniLilacStoreOperation(
+            "reservePendingRunFinalization",
+            "Final UI transcript does not retain the admitted open user message",
+          ),
+        );
       }
       const modelHeadId = this.internChain(input.sessionId, "model", input.modelMessages);
       const uiHeadId = this.internChain(input.sessionId, "ui", input.uiMessages);
@@ -5123,57 +11237,101 @@ export class MiniLilacSqliteStore {
         .run(
           input.runId,
           input.sessionId,
-          workspace.id,
+          $workspaceResultValue283837.id,
           input.openTransitionId,
           modelHeadId,
           uiHeadId,
           runStatus,
           sessionStatus,
           input.error,
-          input.terminalResult === undefined ? null : serialize(input.terminalResult),
+          $terminalResultResultValue282880,
           input.inputTokens,
           providerState?.lastFamily ?? null,
-          providerState === null ? null : providerState.containsCrossFamilyTurns ? 1 : 0,
-          promotion === null ? null : serialize(promotion),
-          namedPromotion === null ? null : serialize(namedPromotion),
+          storedProviderStateFlag(providerState),
+          $serializedPromotionResultValue283064,
+          $serializedNamedPromotionResultValue283347,
           now,
         );
-      const pending = this.getPendingRunFinalization(input.runId);
-      if (pending === null)
-        throw new Error(`Pending finalization for run '${input.runId}' was not created`);
-      return pending;
+      const pending = this.getPendingRunFinalizationResult(input.runId);
+      let $pendingResultValue289582!: import("better-result").InferOk<NonNullable<typeof pending>>;
+      let $pendingResultError289582!: import("better-result").InferErr<NonNullable<typeof pending>>;
+      const $pendingResultOk289582 = Result.match<
+        import("better-result").InferOk<NonNullable<typeof pending>>,
+        import("better-result").InferErr<NonNullable<typeof pending>>,
+        boolean
+      >(pending, {
+        ok: (value) => {
+          $pendingResultValue289582 = value;
+          return true;
+        },
+        err: (error) => {
+          $pendingResultError289582 = error;
+          return false;
+        },
+      });
+      if (($pendingResultOk289582 ? "ok" : "error") === "error")
+        return Result.err($pendingResultError289582);
+      if ($pendingResultValue289582 === null) {
+        return Result.err(
+          rejectMiniLilacStoreOperation(
+            "reservePendingRunFinalization",
+            `Pending finalization for run '${input.runId}' was not created`,
+          ),
+        );
+      }
+      return Result.ok($pendingResultValue289582);
     });
   }
 
   getPendingRunFinalization(runId: string): PendingStoredRunFinalization | null {
-    const row = this.database
-      .query("SELECT * FROM pending_run_finalizations WHERE run_id = ?")
-      .get(runId);
-    return row ? toPendingRunFinalization(row) : null;
+    return storeResultToLegacy(this.getPendingRunFinalizationResult(runId));
+  }
+
+  getPendingRunFinalizationResult(
+    runId: string,
+  ): ResultType<PendingStoredRunFinalization | null, MiniLilacPersistenceError> {
+    return this.runHistoryReadResult("getPendingRunFinalization", () =>
+      this.decodeStructuralHistoryRow({
+        kind: "pending-finalization",
+        row: this.database
+          .query("SELECT * FROM pending_run_finalizations WHERE run_id = ?")
+          .get(runId),
+        recordId: runId,
+      }),
+    );
   }
 
   listPendingRunFinalizations(): readonly PendingStoredRunFinalization[] {
-    return this.database
-      .query("SELECT * FROM pending_run_finalizations ORDER BY prepared_at, rowid")
-      .all()
-      .map(toPendingRunFinalization);
+    return storeResultToLegacy(this.listPendingRunFinalizationsResult());
+  }
+
+  listPendingRunFinalizationsResult(): ResultType<
+    readonly PendingStoredRunFinalization[],
+    MiniLilacPersistenceError
+  > {
+    return this.runHistoryReadResult("listPendingRunFinalizations", () => {
+      return this.decodeStructuralHistoryRows({
+        kind: "pending-finalization",
+        rows: this.database
+          .query("SELECT * FROM pending_run_finalizations ORDER BY prepared_at, rowid")
+          .all(),
+        recordId: "pending-finalization",
+      });
+    });
   }
 
   listRecoverableOpenRootRuns(): readonly RecoverableStoredOpenRootRun[] {
-    return z
-      .array(
-        z.object({
-          run_id: z.string(),
-          session_id: z.string(),
-          workspace_id: z.string(),
-          open_transition_id: z.string(),
-          input_tokens: z.number().int().nonnegative().nullable(),
-        }),
-      )
-      .parse(
-        this.database
-          .query(
-            `SELECT runs.id AS run_id, sessions.id AS session_id,
+    return storeResultToLegacy(this.listRecoverableOpenRootRunsResult());
+  }
+
+  listRecoverableOpenRootRunsResult(): ResultType<
+    readonly RecoverableStoredOpenRootRun[],
+    MiniLilacPersistenceError
+  > {
+    return this.runHistoryReadResult("listRecoverableOpenRootRuns", () => {
+      const rows = this.database
+        .query(
+          `SELECT runs.id AS run_id, sessions.id AS session_id,
                     sessions.workspace_id, transition.id AS open_transition_id,
                     sessions.input_tokens
              FROM history_transitions AS transition
@@ -5187,39 +11345,28 @@ export class MiniLilacSqliteStore {
                AND sessions.status IN ('streaming', 'cancelling')
                AND pending.run_id IS NULL
              ORDER BY runs.started_at, runs.rowid`,
-          )
-          .all(),
-      )
-      .map((row) => ({
-        runId: row.run_id,
-        sessionId: row.session_id,
-        workspaceId: row.workspace_id,
-        openTransitionId: row.open_transition_id,
-        inputTokens: row.input_tokens,
-      }));
+        )
+        .all();
+      return this.decodeStructuralHistoryRows({
+        kind: "recoverable-open-root-run",
+        rows,
+        recordId: "recoverable",
+      });
+    });
   }
 
   recoverInterruptedRuntimeState(): void {
+    storeResultToLegacy(this.recoverInterruptedRuntimeStateResult());
+  }
+
+  recoverInterruptedRuntimeStateResult(): ResultType<void, MiniLilacStoreOperationError> {
     const now = new Date().toISOString();
-    this.runImmediateTransaction(() => {
-      const interruptedAttempts = z
-        .array(
-          z.object({
-            product: z.enum(["main", "named"]),
-            request_id: z.string(),
-            session_id: z.string(),
-            provider_id: z.string(),
-            request_client: z.string(),
-            source_history_state_id: z.string(),
-            expected_binding_revision: z.number().int().positive().nullable(),
-            model: z.string(),
-            reasoning: z.string(),
-          }),
-        )
-        .parse(
-          this.database
-            .query(
-              `SELECT 'main' AS product, attempt.request_id, attempt.session_id,
+    const recovery = this.runStoreTransactionResult("recoverInterruptedRuntimeState", () => {
+      const interruptedAttempts = decodeMiniLilacStoreRows({
+        kind: "interrupted-claude-attempt",
+        rows: this.database
+          .query(
+            `SELECT 'main' AS product, attempt.request_id, attempt.session_id,
                       attempt.provider_id, attempt.request_client,
                       attempt.source_history_state_id, attempt.expected_binding_revision,
                       session.model, session.reasoning
@@ -5234,9 +11381,33 @@ export class MiniLilacSqliteStore {
                FROM mini_named_claude_attempts AS attempt
                JOIN sessions AS session ON session.id = attempt.session_id
                WHERE attempt.state = 'active'`,
-            )
-            .all(),
-        );
+          )
+          .all(),
+        schemaVersion: MINI_LILAC_DATABASE_SCHEMA_VERSION,
+        recordId: "interrupted-claude-attempts",
+      });
+      let $interruptedAttemptsResultValue293127!: import("better-result").InferOk<
+        NonNullable<typeof interruptedAttempts>
+      >;
+      let $interruptedAttemptsResultError293127!: import("better-result").InferErr<
+        NonNullable<typeof interruptedAttempts>
+      >;
+      const $interruptedAttemptsResultOk293127 = Result.match<
+        import("better-result").InferOk<NonNullable<typeof interruptedAttempts>>,
+        import("better-result").InferErr<NonNullable<typeof interruptedAttempts>>,
+        boolean
+      >(interruptedAttempts, {
+        ok: (value) => {
+          $interruptedAttemptsResultValue293127 = value;
+          return true;
+        },
+        err: (error) => {
+          $interruptedAttemptsResultError293127 = error;
+          return false;
+        },
+      });
+      if (($interruptedAttemptsResultOk293127 ? "ok" : "error") === "error")
+        return Result.err($interruptedAttemptsResultError293127);
       this.database
         .query(
           `UPDATE mini_main_claude_attempts SET state = 'uncertain', updated_at = ?
@@ -5278,143 +11449,371 @@ export class MiniLilacSqliteStore {
       this.database
         .query("DELETE FROM commands WHERE result_json IS NULL AND side_effect_started = 0")
         .run();
-      const owners = z.array(z.object({ session_id: z.string(), provider_id: z.string() })).parse(
-        this.database
+      const owners = decodeMiniLilacStoreRows({
+        kind: "claude-attempt-owner",
+        rows: this.database
           .query(
             `SELECT DISTINCT session_id, provider_id FROM mini_main_claude_attempts
-               ORDER BY session_id, provider_id`,
+                 ORDER BY session_id, provider_id`,
           )
           .all(),
-      );
-      for (const owner of owners) {
+        schemaVersion: MINI_LILAC_DATABASE_SCHEMA_VERSION,
+        recordId: "main-claude-attempt-owners",
+      });
+      let $ownersResultValue296207!: import("better-result").InferOk<NonNullable<typeof owners>>;
+      let $ownersResultError296207!: import("better-result").InferErr<NonNullable<typeof owners>>;
+      const $ownersResultOk296207 = Result.match<
+        import("better-result").InferOk<NonNullable<typeof owners>>,
+        import("better-result").InferErr<NonNullable<typeof owners>>,
+        boolean
+      >(owners, {
+        ok: (value) => {
+          $ownersResultValue296207 = value;
+          return true;
+        },
+        err: (error) => {
+          $ownersResultError296207 = error;
+          return false;
+        },
+      });
+      if (($ownersResultOk296207 ? "ok" : "error") === "error")
+        return Result.err($ownersResultError296207);
+      for (const owner of $ownersResultValue296207.value) {
         this.pruneMiniMainClaudeAttempts(owner.session_id, owner.provider_id);
       }
-      const namedOwners = z
-        .array(z.object({ session_id: z.string(), provider_id: z.string() }))
-        .parse(
-          this.database
-            .query(
-              `SELECT DISTINCT session_id, provider_id FROM mini_named_claude_attempts
-               ORDER BY session_id, provider_id`,
-            )
-            .all(),
-        );
-      for (const owner of namedOwners) {
+      const namedOwners = decodeMiniLilacStoreRows({
+        kind: "claude-attempt-owner",
+        rows: this.database
+          .query(
+            `SELECT DISTINCT session_id, provider_id FROM mini_named_claude_attempts
+                 ORDER BY session_id, provider_id`,
+          )
+          .all(),
+        schemaVersion: MINI_LILAC_DATABASE_SCHEMA_VERSION,
+        recordId: "named-claude-attempt-owners",
+      });
+      let $namedOwnersResultValue296827!: import("better-result").InferOk<
+        NonNullable<typeof namedOwners>
+      >;
+      let $namedOwnersResultError296827!: import("better-result").InferErr<
+        NonNullable<typeof namedOwners>
+      >;
+      const $namedOwnersResultOk296827 = Result.match<
+        import("better-result").InferOk<NonNullable<typeof namedOwners>>,
+        import("better-result").InferErr<NonNullable<typeof namedOwners>>,
+        boolean
+      >(namedOwners, {
+        ok: (value) => {
+          $namedOwnersResultValue296827 = value;
+          return true;
+        },
+        err: (error) => {
+          $namedOwnersResultError296827 = error;
+          return false;
+        },
+      });
+      if (($namedOwnersResultOk296827 ? "ok" : "error") === "error")
+        return Result.err($namedOwnersResultError296827);
+      for (const owner of $namedOwnersResultValue296827.value) {
         this.pruneMiniNamedClaudeAttempts(owner.session_id, owner.provider_id);
       }
-      for (const attempt of interruptedAttempts) {
-        logger.debug("mini_claude.attempt_recovered", {
-          requestId: attempt.request_id,
-          sessionId: attempt.session_id,
-          providerId: attempt.provider_id,
-          requestClient: attempt.request_client,
-          owner: attempt.product,
-          mode: "recovery",
-          outcome: "uncertain",
-          reason: "runtime-restart",
-          bindingHead: attempt.source_history_state_id,
-          bindingRevision: attempt.expected_binding_revision,
-          model: attempt.model,
-          reasoning: attempt.reasoning,
-        });
-      }
-      const diagnostics = this.getMiniClaudeRetentionDiagnostics();
-      if (diagnostics.orphanBindingCount > 0 || diagnostics.orphanAttemptCount > 0) {
-        logger.warn("mini_claude.retention_orphans_detected", diagnostics);
-      } else {
-        logger.debug("mini_claude.retention_diagnostics", diagnostics);
-      }
+      const diagnostics = this.getMiniClaudeRetentionDiagnosticsResult();
+      let $diagnosticsResultValue297470!: import("better-result").InferOk<
+        NonNullable<typeof diagnostics>
+      >;
+      let $diagnosticsResultError297470!: import("better-result").InferErr<
+        NonNullable<typeof diagnostics>
+      >;
+      const $diagnosticsResultOk297470 = Result.match<
+        import("better-result").InferOk<NonNullable<typeof diagnostics>>,
+        import("better-result").InferErr<NonNullable<typeof diagnostics>>,
+        boolean
+      >(diagnostics, {
+        ok: (value) => {
+          $diagnosticsResultValue297470 = value;
+          return true;
+        },
+        err: (error) => {
+          $diagnosticsResultError297470 = error;
+          return false;
+        },
+      });
+      if (($diagnosticsResultOk297470 ? "ok" : "error") === "error")
+        return Result.err($diagnosticsResultError297470);
+      return Result.ok({
+        interruptedAttempts: $interruptedAttemptsResultValue293127.value,
+        diagnostics: $diagnosticsResultValue297470,
+      });
     });
+    let $recoveryResultValue293031!: import("better-result").InferOk<NonNullable<typeof recovery>>;
+    let $recoveryResultError293031!: import("better-result").InferErr<NonNullable<typeof recovery>>;
+    const $recoveryResultOk293031 = Result.match<
+      import("better-result").InferOk<NonNullable<typeof recovery>>,
+      import("better-result").InferErr<NonNullable<typeof recovery>>,
+      boolean
+    >(recovery, {
+      ok: (value) => {
+        $recoveryResultValue293031 = value;
+        return true;
+      },
+      err: (error) => {
+        $recoveryResultError293031 = error;
+        return false;
+      },
+    });
+    if (($recoveryResultOk293031 ? "ok" : "error") === "error")
+      return Result.err($recoveryResultError293031);
+    for (const attempt of $recoveryResultValue293031.interruptedAttempts) {
+      logger.debug("mini_claude.attempt_recovered", {
+        requestId: attempt.request_id,
+        sessionId: attempt.session_id,
+        providerId: attempt.provider_id,
+        requestClient: attempt.request_client,
+        owner: attempt.product,
+        mode: "recovery",
+        outcome: "uncertain",
+        reason: "runtime-restart",
+        bindingHead: attempt.source_history_state_id,
+        bindingRevision: attempt.expected_binding_revision,
+        model: attempt.model,
+        reasoning: attempt.reasoning,
+      });
+    }
+    if (
+      $recoveryResultValue293031.diagnostics.orphanBindingCount > 0 ||
+      $recoveryResultValue293031.diagnostics.orphanAttemptCount > 0
+    ) {
+      logger.warn("mini_claude.retention_orphans_detected", $recoveryResultValue293031.diagnostics);
+    } else {
+      logger.debug("mini_claude.retention_diagnostics", $recoveryResultValue293031.diagnostics);
+    }
+    return Result.ok(undefined);
   }
 
   commitPendingRunFinalization(
     input: CommitPendingStoredRunFinalization,
   ): CommittedPendingStoredRunFinalization {
-    parseHistoryWorkspaceOutcome(input);
-    const requestedProviderState =
-      input.providerState === undefined
-        ? null
-        : historyProviderStateSchema.parse(input.providerState);
-    const requestedPromotion =
-      input.claudeBindingPromotion === undefined
-        ? null
-        : promoteMiniMainClaudeSessionBindingSchema.parse(input.claudeBindingPromotion);
-    const requestedNamedPromotion =
-      input.namedClaudeBindingPromotion === undefined
-        ? null
-        : promoteMiniNamedClaudeSessionBindingSchema.parse(input.namedClaudeBindingPromotion);
-    return this.runImmediateTransaction(() => {
-      const pending = this.getPendingRunFinalization(input.runId);
-      if (pending === null)
-        throw new Error(`Pending finalization for run '${input.runId}' was not found`);
+    return storeResultToLegacy(this.commitPendingRunFinalizationResult(input));
+  }
+
+  commitPendingRunFinalizationResult(
+    input: CommitPendingStoredRunFinalization,
+  ): ResultType<CommittedPendingStoredRunFinalization, MiniLilacStoreOperationError> {
+    const requestedProviderState = input.providerState ?? null;
+    const requestedPromotion = input.claudeBindingPromotion ?? null;
+    const requestedNamedPromotion = input.namedClaudeBindingPromotion ?? null;
+    return this.runStoreTransactionResult("commitPendingRunFinalization", () => {
+      const pending = this.getPendingRunFinalizationResult(input.runId);
+      let $pendingResultValue299484!: import("better-result").InferOk<NonNullable<typeof pending>>;
+      let $pendingResultError299484!: import("better-result").InferErr<NonNullable<typeof pending>>;
+      const $pendingResultOk299484 = Result.match<
+        import("better-result").InferOk<NonNullable<typeof pending>>,
+        import("better-result").InferErr<NonNullable<typeof pending>>,
+        boolean
+      >(pending, {
+        ok: (value) => {
+          $pendingResultValue299484 = value;
+          return true;
+        },
+        err: (error) => {
+          $pendingResultError299484 = error;
+          return false;
+        },
+      });
+      if (($pendingResultOk299484 ? "ok" : "error") === "error")
+        return Result.err($pendingResultError299484);
+      if ($pendingResultValue299484 === null) {
+        return Result.err(
+          rejectMiniLilacStoreOperation(
+            "commitPendingRunFinalization",
+            `Pending finalization for run '${input.runId}' was not found`,
+          ),
+        );
+      }
       if (
         requestedProviderState !== null &&
-        pending.providerState !== null &&
-        !canonicalValuesEqual(requestedProviderState, pending.providerState)
+        $pendingResultValue299484.providerState !== null &&
+        !canonicalValuesEqual(requestedProviderState, $pendingResultValue299484.providerState)
       ) {
-        throw new Error("Pending finalization provider-state metadata changed before commit");
+        return Result.err(
+          rejectMiniLilacStoreOperation(
+            "commitPendingRunFinalization",
+            "Pending finalization provider-state metadata changed before commit",
+          ),
+        );
       }
       if (
         requestedPromotion !== null &&
-        pending.claudeBindingPromotion !== null &&
-        !canonicalValuesEqual(requestedPromotion, pending.claudeBindingPromotion)
+        $pendingResultValue299484.claudeBindingPromotion !== null &&
+        !canonicalValuesEqual(requestedPromotion, $pendingResultValue299484.claudeBindingPromotion)
       ) {
-        throw new Error("Pending finalization Claude promotion metadata changed before commit");
+        return Result.err(
+          rejectMiniLilacStoreOperation(
+            "commitPendingRunFinalization",
+            "Pending finalization Claude promotion metadata changed before commit",
+          ),
+        );
       }
       if (
         requestedNamedPromotion !== null &&
-        pending.namedClaudeBindingPromotion !== null &&
-        !canonicalValuesEqual(requestedNamedPromotion, pending.namedClaudeBindingPromotion)
+        $pendingResultValue299484.namedClaudeBindingPromotion !== null &&
+        !canonicalValuesEqual(
+          requestedNamedPromotion,
+          $pendingResultValue299484.namedClaudeBindingPromotion,
+        )
       ) {
-        throw new Error(
-          "Pending finalization named Claude promotion metadata changed before commit",
+        return Result.err(
+          rejectMiniLilacStoreOperation(
+            "commitPendingRunFinalization",
+            "Pending finalization named Claude promotion metadata changed before commit",
+          ),
         );
       }
-      const providerState = requestedProviderState ?? pending.providerState;
-      const promotion = requestedPromotion ?? pending.claudeBindingPromotion;
-      const namedPromotion = requestedNamedPromotion ?? pending.namedClaudeBindingPromotion;
+      const providerState = requestedProviderState ?? $pendingResultValue299484.providerState;
+      const promotion = requestedPromotion ?? $pendingResultValue299484.claudeBindingPromotion;
+      const namedPromotion =
+        requestedNamedPromotion ?? $pendingResultValue299484.namedClaudeBindingPromotion;
       if (promotion !== null && namedPromotion !== null) {
-        throw new Error("A run cannot promote both main and named Claude bindings");
+        return Result.err(
+          rejectMiniLilacStoreOperation(
+            "commitPendingRunFinalization",
+            "A run cannot promote both main and named Claude bindings",
+          ),
+        );
       }
       if (
         (promotion !== null || namedPromotion !== null) &&
         providerState?.lastFamily !== "claude-code"
       ) {
-        throw new Error("A Claude binding promotion requires Claude provider-state metadata");
+        return Result.err(
+          rejectMiniLilacStoreOperation(
+            "commitPendingRunFinalization",
+            "A Claude binding promotion requires Claude provider-state metadata",
+          ),
+        );
       }
-      this.assertWorkspaceHistoryAvailableForOwner(pending.workspaceId, pending.sessionId, {
-        kind: "pending-run-finalization",
-        runId: pending.runId,
+      const available = this.assertWorkspaceHistoryAvailableForOwnerResult(
+        $pendingResultValue299484.workspaceId,
+        $pendingResultValue299484.sessionId,
+        { kind: "pending-run-finalization", runId: $pendingResultValue299484.runId },
+      );
+      const availabilityError = available.match({ ok: () => null, err: (error) => error });
+      if (availabilityError !== null) return Result.err(availabilityError);
+      const activeRun = this.getActiveRootRun($pendingResultValue299484.sessionId);
+      const transition = this.getHistoryTransitionResult(
+        $pendingResultValue299484.openTransitionId,
+      );
+      let $transitionResultValue302471!: import("better-result").InferOk<
+        NonNullable<typeof transition>
+      >;
+      let $transitionResultError302471!: import("better-result").InferErr<
+        NonNullable<typeof transition>
+      >;
+      const $transitionResultOk302471 = Result.match<
+        import("better-result").InferOk<NonNullable<typeof transition>>,
+        import("better-result").InferErr<NonNullable<typeof transition>>,
+        boolean
+      >(transition, {
+        ok: (value) => {
+          $transitionResultValue302471 = value;
+          return true;
+        },
+        err: (error) => {
+          $transitionResultError302471 = error;
+          return false;
+        },
       });
-      const activeRun = this.getActiveRootRun(pending.sessionId);
-      const transition = this.getHistoryTransition(pending.openTransitionId);
-      const history = this.getSessionHistory(pending.sessionId);
+      if (($transitionResultOk302471 ? "ok" : "error") === "error")
+        return Result.err($transitionResultError302471);
+      const history = this.getSessionHistoryResult($pendingResultValue299484.sessionId);
+      let $historyResultValue302639!: import("better-result").InferOk<NonNullable<typeof history>>;
+      let $historyResultError302639!: import("better-result").InferErr<NonNullable<typeof history>>;
+      const $historyResultOk302639 = Result.match<
+        import("better-result").InferOk<NonNullable<typeof history>>,
+        import("better-result").InferErr<NonNullable<typeof history>>,
+        boolean
+      >(history, {
+        ok: (value) => {
+          $historyResultValue302639 = value;
+          return true;
+        },
+        err: (error) => {
+          $historyResultError302639 = error;
+          return false;
+        },
+      });
+      if (($historyResultOk302639 ? "ok" : "error") === "error")
+        return Result.err($historyResultError302639);
       if (
-        activeRun?.id !== pending.runId ||
-        transition.sessionId !== pending.sessionId ||
-        transition.kind !== "user-message" ||
-        transition.toStateId !== null ||
-        transition.rootRunId !== pending.runId ||
-        history.currentStateId !== transition.fromStateId
+        activeRun?.id !== $pendingResultValue299484.runId ||
+        $transitionResultValue302471.sessionId !== $pendingResultValue299484.sessionId ||
+        $transitionResultValue302471.kind !== "user-message" ||
+        $transitionResultValue302471.toStateId !== null ||
+        $transitionResultValue302471.rootRunId !== $pendingResultValue299484.runId ||
+        $historyResultValue302639.currentStateId !== $transitionResultValue302471.fromStateId
       ) {
-        throw new Error(`Pending finalization for run '${pending.runId}' is no longer coherent`);
+        return Result.err(
+          rejectMiniLilacStoreOperation(
+            "commitPendingRunFinalization",
+            `Pending finalization for run '${$pendingResultValue299484.runId}' is no longer coherent`,
+          ),
+        );
       }
       if (providerState !== null) {
-        this.assertConservativeProviderTransition(transition.fromStateId, providerState);
+        const conservative = this.assertConservativeProviderTransitionResult(
+          $transitionResultValue302471.fromStateId,
+          providerState,
+        );
+        const transitionError = conservative.match({ ok: () => null, err: (error) => error });
+        if (transitionError !== null) return Result.err(transitionError);
       }
       const destination: CreateStoredHistoryState = {
         id: input.destinationStateId,
-        sessionId: pending.sessionId,
-        workspaceId: pending.workspaceId,
-        modelHeadId: pending.modelHeadId,
-        uiHeadId: pending.uiHeadId,
+        sessionId: $pendingResultValue299484.sessionId,
+        workspaceId: $pendingResultValue299484.workspaceId,
+        modelHeadId: $pendingResultValue299484.modelHeadId,
+        uiHeadId: $pendingResultValue299484.uiHeadId,
         workspaceSnapshotId: input.workspaceSnapshotId,
         workspaceStatus: input.workspaceStatus,
         workspaceUnavailableReason: input.workspaceUnavailableReason,
         origin: "turn-boundary",
         providerState,
       };
-      this.closeHistoryTransition(pending.openTransitionId, destination, { select: true });
+      const closed = this.closeHistoryTransitionResult(
+        $pendingResultValue299484.openTransitionId,
+        destination,
+        {
+          select: true,
+        },
+      );
+      const closeError = closed.match({ ok: () => null, err: (error) => error });
+      if (closeError !== null) return Result.err(closeError);
+      const terminalResult = serializeOptionalTerminalResult(
+        $pendingResultValue299484,
+        "commitPendingRunFinalization",
+      );
+      let $terminalResultResultValue304426!: import("better-result").InferOk<
+        NonNullable<typeof terminalResult>
+      >;
+      let $terminalResultResultError304426!: import("better-result").InferErr<
+        NonNullable<typeof terminalResult>
+      >;
+      const $terminalResultResultOk304426 = Result.match<
+        import("better-result").InferOk<NonNullable<typeof terminalResult>>,
+        import("better-result").InferErr<NonNullable<typeof terminalResult>>,
+        boolean
+      >(terminalResult, {
+        ok: (value) => {
+          $terminalResultResultValue304426 = value;
+          return true;
+        },
+        err: (error) => {
+          $terminalResultResultError304426 = error;
+          return false;
+        },
+      });
+      if (($terminalResultResultOk304426 ? "ok" : "error") === "error")
+        return Result.err($terminalResultResultError304426);
       const now = new Date().toISOString();
       const finished = this.database
         .query(
@@ -5422,64 +11821,130 @@ export class MiniLilacSqliteStore {
            WHERE id = ? AND session_id = ? AND parent_run_id IS NULL AND status = 'active'`,
         )
         .run(
-          pending.runStatus,
-          pending.error,
-          pending.terminalResult === undefined ? null : serialize(pending.terminalResult),
+          $pendingResultValue299484.runStatus,
+          $pendingResultValue299484.error,
+          $terminalResultResultValue304426,
           now,
-          pending.runId,
-          pending.sessionId,
+          $pendingResultValue299484.runId,
+          $pendingResultValue299484.sessionId,
         );
-      if (finished.changes !== 1) throw new Error(`Run '${pending.runId}' is not active`);
+      if (finished.changes !== 1) {
+        return Result.err(
+          rejectMiniLilacStoreOperation(
+            "commitPendingRunFinalization",
+            `Run '${$pendingResultValue299484.runId}' is not active`,
+          ),
+        );
+      }
       const updated = this.database
         .query(
           `UPDATE sessions SET status = ?, active_run_id = NULL, queued_steering_count = 0,
              input_tokens = ?, updated_at = ?
            WHERE id = ? AND active_run_id = ? AND status IN ('streaming', 'cancelling')`,
         )
-        .run(pending.sessionStatus, pending.inputTokens, now, pending.sessionId, pending.runId);
+        .run(
+          $pendingResultValue299484.sessionStatus,
+          $pendingResultValue299484.inputTokens,
+          now,
+          $pendingResultValue299484.sessionId,
+          $pendingResultValue299484.runId,
+        );
       if (updated.changes !== 1) {
-        throw new Error(`Run '${pending.runId}' is not active for session '${pending.sessionId}'`);
+        return Result.err(
+          rejectMiniLilacStoreOperation(
+            "commitPendingRunFinalization",
+            `Run '${$pendingResultValue299484.runId}' is not active for session '${$pendingResultValue299484.sessionId}'`,
+          ),
+        );
       }
-      const bindingPromotion =
-        promotion !== null
-          ? this.promoteMiniMainClaudeBinding(
-              pending,
-              this.getRootPromptSourceStateId(pending),
-              destination.id,
-              promotion,
-            )
-            ? "promoted"
-            : "cas-failed"
-          : namedPromotion !== null
-            ? this.promoteMiniNamedClaudeBinding(
-                pending,
-                this.getRootPromptSourceStateId(pending),
-                destination.id,
-                namedPromotion,
-              )
-              ? "promoted"
-              : "cas-failed"
-            : "not-requested";
-      this.deletePendingRunFinalizationRow(pending.runId);
-      return {
-        pending,
-        state: this.getHistoryState(destination.id),
-        snapshot: this.getSession(pending.sessionId),
+      let bindingPromotion: CommittedPendingStoredRunFinalization["bindingPromotion"] =
+        "not-requested";
+      if (promotion !== null) {
+        const promoted = this.promoteMiniMainClaudeBinding(
+          $pendingResultValue299484,
+          this.getRootPromptSourceStateId($pendingResultValue299484),
+          destination.id,
+          promotion,
+        );
+        bindingPromotion = promoted ? "promoted" : "cas-failed";
+      } else if (namedPromotion !== null) {
+        const promoted = this.promoteMiniNamedClaudeBinding(
+          $pendingResultValue299484,
+          this.getRootPromptSourceStateId($pendingResultValue299484),
+          destination.id,
+          namedPromotion,
+        );
+        bindingPromotion = promoted ? "promoted" : "cas-failed";
+      }
+      const deleted = this.deletePendingRunFinalizationRowResult($pendingResultValue299484.runId);
+      const deletionError = deleted.match({ ok: () => null, err: (error) => error });
+      if (deletionError !== null) return Result.err(deletionError);
+      const state = this.getHistoryStateResult(destination.id);
+      let $stateResultValue307024!: import("better-result").InferOk<NonNullable<typeof state>>;
+      let $stateResultError307024!: import("better-result").InferErr<NonNullable<typeof state>>;
+      const $stateResultOk307024 = Result.match<
+        import("better-result").InferOk<NonNullable<typeof state>>,
+        import("better-result").InferErr<NonNullable<typeof state>>,
+        boolean
+      >(state, {
+        ok: (value) => {
+          $stateResultValue307024 = value;
+          return true;
+        },
+        err: (error) => {
+          $stateResultError307024 = error;
+          return false;
+        },
+      });
+      if (($stateResultOk307024 ? "ok" : "error") === "error")
+        return Result.err($stateResultError307024);
+      const snapshot = this.getSessionResult($pendingResultValue299484.sessionId);
+      let $snapshotResultValue307156!: import("better-result").InferOk<
+        NonNullable<typeof snapshot>
+      >;
+      let $snapshotResultError307156!: import("better-result").InferErr<
+        NonNullable<typeof snapshot>
+      >;
+      const $snapshotResultOk307156 = Result.match<
+        import("better-result").InferOk<NonNullable<typeof snapshot>>,
+        import("better-result").InferErr<NonNullable<typeof snapshot>>,
+        boolean
+      >(snapshot, {
+        ok: (value) => {
+          $snapshotResultValue307156 = value;
+          return true;
+        },
+        err: (error) => {
+          $snapshotResultError307156 = error;
+          return false;
+        },
+      });
+      if (($snapshotResultOk307156 ? "ok" : "error") === "error")
+        return Result.err($snapshotResultError307156);
+      return Result.ok({
+        pending: $pendingResultValue299484,
+        state: $stateResultValue307024,
+        snapshot: $snapshotResultValue307156,
         bindingPromotion,
-      };
+      });
     });
   }
 
   private getHistoryStateCanonicalMessageCount(stateId: string): number {
     const state = this.getHistoryState(stateId);
     if (state.modelHeadId === null) return 0;
-    return z.object({ depth: z.number().int().positive() }).parse(
-      this.database
-        .query(
-          `SELECT depth FROM transcript_nodes
-           WHERE id = ? AND session_id = ? AND lane = 'model'`,
-        )
-        .get(state.modelHeadId, state.sessionId),
+    return storeResultToLegacy(
+      decodeRequiredMiniLilacStoreRow({
+        kind: "depth",
+        row: this.database
+          .query(
+            `SELECT depth FROM transcript_nodes
+             WHERE id = ? AND session_id = ? AND lane = 'model'`,
+          )
+          .get(state.modelHeadId, state.sessionId),
+        schemaVersion: MINI_LILAC_DATABASE_SCHEMA_VERSION,
+        recordId: stateId,
+      }),
     ).depth;
   }
 
@@ -5487,17 +11952,49 @@ export class MiniLilacSqliteStore {
     sourceStateId: string,
     destination: HistoryProviderState,
   ): void {
-    const source = this.getHistoryState(sourceStateId);
+    storeResultToLegacy(
+      this.assertConservativeProviderTransitionResult(sourceStateId, destination),
+    );
+  }
+
+  private assertConservativeProviderTransitionResult(
+    sourceStateId: string,
+    destination: HistoryProviderState,
+  ): ResultType<void, MiniLilacStoreOperationError> {
+    const source = this.getHistoryStateResult(sourceStateId);
+    let $sourceResultValue308488!: import("better-result").InferOk<NonNullable<typeof source>>;
+    let $sourceResultError308488!: import("better-result").InferErr<NonNullable<typeof source>>;
+    const $sourceResultOk308488 = Result.match<
+      import("better-result").InferOk<NonNullable<typeof source>>,
+      import("better-result").InferErr<NonNullable<typeof source>>,
+      boolean
+    >(source, {
+      ok: (value) => {
+        $sourceResultValue308488 = value;
+        return true;
+      },
+      err: (error) => {
+        $sourceResultError308488 = error;
+        return false;
+      },
+    });
+    if (($sourceResultOk308488 ? "ok" : "error") === "error")
+      return Result.err($sourceResultError308488);
     const sourceMessageCount = this.getHistoryStateCanonicalMessageCount(sourceStateId);
     const requiresMixedHistory =
-      source.providerState?.containsCrossFamilyTurns === true ||
-      (source.providerState === null && sourceMessageCount > 0) ||
-      (source.providerState !== null && source.providerState.lastFamily !== destination.lastFamily);
+      $sourceResultValue308488.providerState?.containsCrossFamilyTurns === true ||
+      ($sourceResultValue308488.providerState === null && sourceMessageCount > 0) ||
+      ($sourceResultValue308488.providerState !== null &&
+        $sourceResultValue308488.providerState.lastFamily !== destination.lastFamily);
     if (requiresMixedHistory && !destination.containsCrossFamilyTurns) {
-      throw new Error(
-        `History state '${sourceStateId}' requires conservative cross-family metadata`,
+      return Result.err(
+        rejectMiniLilacStoreOperation(
+          "assertConservativeProviderTransition",
+          `History state '${sourceStateId}' requires conservative cross-family metadata`,
+        ),
       );
     }
+    return Result.ok(undefined);
   }
 
   private promoteMiniMainClaudeBinding(
@@ -5582,7 +12079,10 @@ export class MiniLilacSqliteStore {
   ): boolean {
     if (
       pending.runStatus !== "completed" ||
-      !miniNamedSessionIdSchema.safeParse(pending.sessionId).success ||
+      !(
+        pending.sessionId.startsWith("sub:") &&
+        pending.sessionId.lastIndexOf(":named:") > "sub:".length
+      ) ||
       this.getRun(pending.runId).depth === 0
     ) {
       return false;
@@ -5688,16 +12188,21 @@ export class MiniLilacSqliteStore {
   }
 
   private getRootPromptSourceStateId(pending: PendingStoredRunFinalization): string {
-    const row = z.object({ from_state_id: z.string().min(1) }).parse(
-      this.database
-        .query(
-          `SELECT from_state_id FROM history_transitions
-           WHERE session_id = ? AND root_run_id = ? AND kind = 'user-message'
-             AND delivery = 'prompt'
-           ORDER BY created_at, rowid
-           LIMIT 1`,
-        )
-        .get(pending.sessionId, pending.runId),
+    const row = storeResultToLegacy(
+      decodeRequiredMiniLilacStoreRow({
+        kind: "root-prompt-source",
+        row: this.database
+          .query(
+            `SELECT from_state_id FROM history_transitions
+             WHERE session_id = ? AND root_run_id = ? AND kind = 'user-message'
+               AND delivery = 'prompt'
+             ORDER BY created_at, rowid
+             LIMIT 1`,
+          )
+          .get(pending.sessionId, pending.runId),
+        schemaVersion: MINI_LILAC_DATABASE_SCHEMA_VERSION,
+        recordId: pending.runId,
+      }),
     );
     return row.from_state_id;
   }
@@ -5765,46 +12270,138 @@ export class MiniLilacSqliteStore {
     expectedCurrentStateId: string,
     allowedStatuses: readonly MiniLilacSessionSnapshot["status"][] = ["idle", "error"],
   ): MiniLilacSessionSnapshot {
-    const session = this.getSession(sessionId);
-    const activeRunCount = z
-      .object({ count: z.number().int().nonnegative() })
-      .parse(
-        this.database
-          .query("SELECT COUNT(*) AS count FROM runs WHERE session_id = ? AND status = 'active'")
-          .get(sessionId),
-      ).count;
+    return storeResultToLegacy(
+      this.requireQuiescentHistorySessionResult(sessionId, expectedCurrentStateId, allowedStatuses),
+    );
+  }
+
+  private requireQuiescentHistorySessionResult(
+    sessionId: string,
+    expectedCurrentStateId: string,
+    allowedStatuses: readonly MiniLilacSessionSnapshot["status"][] = ["idle", "error"],
+  ): ResultType<MiniLilacSessionSnapshot, MiniLilacStoreOperationError> {
+    const session = this.getSessionResult(sessionId);
+    let $sessionResultValue319824!: import("better-result").InferOk<NonNullable<typeof session>>;
+    let $sessionResultError319824!: import("better-result").InferErr<NonNullable<typeof session>>;
+    const $sessionResultOk319824 = Result.match<
+      import("better-result").InferOk<NonNullable<typeof session>>,
+      import("better-result").InferErr<NonNullable<typeof session>>,
+      boolean
+    >(session, {
+      ok: (value) => {
+        $sessionResultValue319824 = value;
+        return true;
+      },
+      err: (error) => {
+        $sessionResultError319824 = error;
+        return false;
+      },
+    });
+    if (($sessionResultOk319824 ? "ok" : "error") === "error")
+      return Result.err($sessionResultError319824);
+    const activeRunCount = decodeRequiredMiniLilacStoreRow({
+      kind: "count",
+      row: this.database
+        .query("SELECT COUNT(*) AS count FROM runs WHERE session_id = ? AND status = 'active'")
+        .get(sessionId),
+      schemaVersion: MINI_LILAC_DATABASE_SCHEMA_VERSION,
+      recordId: `${sessionId}:active-run-count`,
+    });
+    let $activeRunCountResultValue319948!: import("better-result").InferOk<
+      NonNullable<typeof activeRunCount>
+    >;
+    let $activeRunCountResultError319948!: import("better-result").InferErr<
+      NonNullable<typeof activeRunCount>
+    >;
+    const $activeRunCountResultOk319948 = Result.match<
+      import("better-result").InferOk<NonNullable<typeof activeRunCount>>,
+      import("better-result").InferErr<NonNullable<typeof activeRunCount>>,
+      boolean
+    >(activeRunCount, {
+      ok: (value) => {
+        $activeRunCountResultValue319948 = value;
+        return true;
+      },
+      err: (error) => {
+        $activeRunCountResultError319948 = error;
+        return false;
+      },
+    });
+    if (($activeRunCountResultOk319948 ? "ok" : "error") === "error")
+      return Result.err($activeRunCountResultError319948);
     if (
-      !allowedStatuses.includes(session.status) ||
-      session.activeRunId !== null ||
-      activeRunCount !== 0
+      !allowedStatuses.includes($sessionResultValue319824.status) ||
+      $sessionResultValue319824.activeRunId !== null ||
+      $activeRunCountResultValue319948.count !== 0
     ) {
-      throw new Error(`Session '${sessionId}' must be quiescent for history navigation`);
+      return Result.err(
+        rejectMiniLilacStoreOperation(
+          "requireQuiescentHistorySession",
+          `Session '${sessionId}' must be quiescent for history navigation`,
+        ),
+      );
     }
     if (
       this.database
         .query("SELECT 1 FROM history_transitions WHERE session_id = ? AND to_state_id IS NULL")
         .get(sessionId)
     ) {
-      throw new Error(`Session '${sessionId}' has an open history transition`);
+      return Result.err(
+        rejectMiniLilacStoreOperation(
+          "requireQuiescentHistorySession",
+          `Session '${sessionId}' has an open history transition`,
+        ),
+      );
     }
-    const current = this.getCurrentHistoryState(sessionId);
-    if (current.id !== expectedCurrentStateId) {
-      throw new Error(`Session '${sessionId}' history cursor changed before commit`);
+    const current = this.getCurrentHistoryStateResult(sessionId);
+    let $currentResultValue321101!: import("better-result").InferOk<NonNullable<typeof current>>;
+    let $currentResultError321101!: import("better-result").InferErr<NonNullable<typeof current>>;
+    const $currentResultOk321101 = Result.match<
+      import("better-result").InferOk<NonNullable<typeof current>>,
+      import("better-result").InferErr<NonNullable<typeof current>>,
+      boolean
+    >(current, {
+      ok: (value) => {
+        $currentResultValue321101 = value;
+        return true;
+      },
+      err: (error) => {
+        $currentResultError321101 = error;
+        return false;
+      },
+    });
+    if (($currentResultOk321101 ? "ok" : "error") === "error")
+      return Result.err($currentResultError321101);
+    if ($currentResultValue321101.id !== expectedCurrentStateId) {
+      return Result.err(
+        rejectMiniLilacStoreOperation(
+          "requireQuiescentHistorySession",
+          `Session '${sessionId}' history cursor changed before commit`,
+        ),
+      );
     }
     const heads = this.getTranscriptHeads(sessionId);
-    this.assertHeadsEqualState(
+    const equalHeads = this.assertHeadsEqualStateResult(
       sessionId,
       {
         modelHeadId: heads.model_head_id,
         uiHeadId: heads.ui_head_id,
       },
-      current,
+      $currentResultValue321101,
     );
-    return session;
+    const headsError = equalHeads.match({ ok: () => null, err: (error) => error });
+    if (headsError !== null) return Result.err(headsError);
+    return Result.ok($sessionResultValue319824);
   }
 
   private assertWorkspaceHasNoHistoryJournal(workspaceId: string): void {
-    this.assertWorkspaceHistoryAvailableForOwner(workspaceId, null, undefined);
+    storeResultToLegacy(this.assertWorkspaceHasNoHistoryJournalResult(workspaceId));
+  }
+
+  private assertWorkspaceHasNoHistoryJournalResult(
+    workspaceId: string,
+  ): ResultType<void, MiniLilacStoreOperationError> {
+    return this.assertWorkspaceHistoryAvailableForOwnerResult(workspaceId, null, undefined);
   }
 
   private assertWorkspaceHistoryAvailableForOwner(
@@ -5812,42 +12409,138 @@ export class MiniLilacSqliteStore {
     sessionId: string | null,
     owner: WorkspaceHistoryAvailabilityOwner | undefined,
   ): void {
-    const workspace = workspaceRowSchema.parse(
-      this.database.query("SELECT * FROM workspaces WHERE id = ?").get(workspaceId),
+    storeResultToLegacy(
+      this.assertWorkspaceHistoryAvailableForOwnerResult(workspaceId, sessionId, owner),
     );
-    if (workspace.health_status !== "healthy") {
-      throw new Error(`Workspace '${workspaceId}' history store is corrupt`);
-    }
-    const operations = z
-      .array(z.object({ id: z.string(), session_id: z.string() }))
-      .parse(
-        this.database
-          .query("SELECT id, session_id FROM history_operations WHERE workspace_id = ?")
-          .all(workspaceId),
+  }
+
+  private assertWorkspaceHistoryAvailableForOwnerResult(
+    workspaceId: string,
+    sessionId: string | null,
+    owner: WorkspaceHistoryAvailabilityOwner | undefined,
+  ): ResultType<void, MiniLilacStoreOperationError> {
+    const decodedWorkspace = this.decodeRequiredStructuralHistoryRow({
+      kind: "workspace",
+      row: this.database.query("SELECT * FROM workspaces WHERE id = ?").get(workspaceId),
+      recordId: workspaceId,
+    });
+    let $decodedWorkspaceResultValue322787!: import("better-result").InferOk<
+      NonNullable<typeof decodedWorkspace>
+    >;
+    let $decodedWorkspaceResultError322787!: import("better-result").InferErr<
+      NonNullable<typeof decodedWorkspace>
+    >;
+    const $decodedWorkspaceResultOk322787 = Result.match<
+      import("better-result").InferOk<NonNullable<typeof decodedWorkspace>>,
+      import("better-result").InferErr<NonNullable<typeof decodedWorkspace>>,
+      boolean
+    >(decodedWorkspace, {
+      ok: (value) => {
+        $decodedWorkspaceResultValue322787 = value;
+        return true;
+      },
+      err: (error) => {
+        $decodedWorkspaceResultError322787 = error;
+        return false;
+      },
+    });
+    if (($decodedWorkspaceResultOk322787 ? "ok" : "error") === "error")
+      return Result.err($decodedWorkspaceResultError322787);
+    if ($decodedWorkspaceResultValue322787.healthStatus !== "healthy") {
+      return Result.err(
+        rejectMiniLilacStoreOperation(
+          "assertWorkspaceHistoryAvailableForOwner",
+          `Workspace '${workspaceId}' history store is corrupt`,
+        ),
       );
+    }
+    const operations = decodeMiniLilacStoreRows({
+      kind: "history-operation-owner",
+      rows: this.database
+        .query("SELECT id, session_id FROM history_operations WHERE workspace_id = ?")
+        .all(workspaceId),
+      schemaVersion: MINI_LILAC_DATABASE_SCHEMA_VERSION,
+      recordId: `${workspaceId}:history-operation-owners`,
+    });
+    let $operationsResultValue323367!: import("better-result").InferOk<
+      NonNullable<typeof operations>
+    >;
+    let $operationsResultError323367!: import("better-result").InferErr<
+      NonNullable<typeof operations>
+    >;
+    const $operationsResultOk323367 = Result.match<
+      import("better-result").InferOk<NonNullable<typeof operations>>,
+      import("better-result").InferErr<NonNullable<typeof operations>>,
+      boolean
+    >(operations, {
+      ok: (value) => {
+        $operationsResultValue323367 = value;
+        return true;
+      },
+      err: (error) => {
+        $operationsResultError323367 = error;
+        return false;
+      },
+    });
+    if (($operationsResultOk323367 ? "ok" : "error") === "error")
+      return Result.err($operationsResultError323367);
     const ownsOperations =
       owner?.kind === "history-operation" &&
-      operations.length === 1 &&
-      operations[0]?.id === owner.operationId &&
-      operations[0].session_id === sessionId;
-    if (operations.length > 0 && !ownsOperations) {
-      throw new Error(`Workspace '${workspaceId}' has a retained history operation`);
-    }
-    const finalizations = z
-      .array(z.object({ run_id: z.string(), session_id: z.string() }))
-      .parse(
-        this.database
-          .query("SELECT run_id, session_id FROM pending_run_finalizations WHERE workspace_id = ?")
-          .all(workspaceId),
+      $operationsResultValue323367.value.length === 1 &&
+      $operationsResultValue323367.value[0]?.id === owner.operationId &&
+      $operationsResultValue323367.value[0].session_id === sessionId;
+    if ($operationsResultValue323367.value.length > 0 && !ownsOperations) {
+      return Result.err(
+        rejectMiniLilacStoreOperation(
+          "assertWorkspaceHistoryAvailableForOwner",
+          `Workspace '${workspaceId}' has a retained history operation`,
+        ),
       );
+    }
+    const finalizations = decodeMiniLilacStoreRows({
+      kind: "pending-finalization-owner",
+      rows: this.database
+        .query("SELECT run_id, session_id FROM pending_run_finalizations WHERE workspace_id = ?")
+        .all(workspaceId),
+      schemaVersion: MINI_LILAC_DATABASE_SCHEMA_VERSION,
+      recordId: `${workspaceId}:pending-finalization-owners`,
+    });
+    let $finalizationsResultValue324312!: import("better-result").InferOk<
+      NonNullable<typeof finalizations>
+    >;
+    let $finalizationsResultError324312!: import("better-result").InferErr<
+      NonNullable<typeof finalizations>
+    >;
+    const $finalizationsResultOk324312 = Result.match<
+      import("better-result").InferOk<NonNullable<typeof finalizations>>,
+      import("better-result").InferErr<NonNullable<typeof finalizations>>,
+      boolean
+    >(finalizations, {
+      ok: (value) => {
+        $finalizationsResultValue324312 = value;
+        return true;
+      },
+      err: (error) => {
+        $finalizationsResultError324312 = error;
+        return false;
+      },
+    });
+    if (($finalizationsResultOk324312 ? "ok" : "error") === "error")
+      return Result.err($finalizationsResultError324312);
     const ownsFinalization =
       owner?.kind === "pending-run-finalization" &&
-      finalizations.length === 1 &&
-      finalizations[0]?.run_id === owner.runId &&
-      finalizations[0].session_id === sessionId;
-    if (finalizations.length > 0 && !ownsFinalization) {
-      throw new Error(`Workspace '${workspaceId}' has a pending run finalization`);
+      $finalizationsResultValue324312.value.length === 1 &&
+      $finalizationsResultValue324312.value[0]?.run_id === owner.runId &&
+      $finalizationsResultValue324312.value[0].session_id === sessionId;
+    if ($finalizationsResultValue324312.value.length > 0 && !ownsFinalization) {
+      return Result.err(
+        rejectMiniLilacStoreOperation(
+          "assertWorkspaceHistoryAvailableForOwner",
+          `Workspace '${workspaceId}' has a pending run finalization`,
+        ),
+      );
     }
+    return Result.ok(undefined);
   }
 
   private assertHeadsEqualState(
@@ -5855,16 +12548,28 @@ export class MiniLilacSqliteStore {
     heads: InternedStoredTranscriptHeads,
     state: StoredHistoryState,
   ): void {
+    storeResultToLegacy(this.assertHeadsEqualStateResult(sessionId, heads, state));
+  }
+
+  private assertHeadsEqualStateResult(
+    sessionId: string,
+    heads: InternedStoredTranscriptHeads,
+    state: StoredHistoryState,
+  ): ResultType<void, MiniLilacStoreOperationRejected> {
     if (
       state.sessionId !== sessionId ||
       heads.modelHeadId !== state.modelHeadId ||
       heads.uiHeadId !== state.uiHeadId
     ) {
-      throw new Error(
-        `Session '${sessionId}' canonical transcript does not match its history cursor ` +
-          `(model ${heads.modelHeadId}/${state.modelHeadId}, ui ${heads.uiHeadId}/${state.uiHeadId})`,
+      return Result.err(
+        rejectMiniLilacStoreOperation(
+          "assertHeadsEqualState",
+          `Session '${sessionId}' canonical transcript does not match its history cursor ` +
+            `(model ${heads.modelHeadId}/${state.modelHeadId}, ui ${heads.uiHeadId}/${state.uiHeadId})`,
+        ),
       );
     }
+    return Result.ok(undefined);
   }
 
   private insertWorkspaceObservation(
@@ -5873,8 +12578,21 @@ export class MiniLilacSqliteStore {
     heads: InternedStoredTranscriptHeads,
     observation: StoredHistoryObservationInput,
   ): StoredHistoryState {
-    this.assertHeadsEqualState(sessionId, heads, source);
-    return this.appendHistoryTransition({
+    return storeResultToLegacy(
+      this.insertWorkspaceObservationResult(sessionId, source, heads, observation),
+    );
+  }
+
+  private insertWorkspaceObservationResult(
+    sessionId: string,
+    source: StoredHistoryState,
+    heads: InternedStoredTranscriptHeads,
+    observation: StoredHistoryObservationInput,
+  ): ResultType<StoredHistoryState, MiniLilacStoreOperationError> {
+    const equalHeads = this.assertHeadsEqualStateResult(sessionId, heads, source);
+    const headsError = equalHeads.match({ ok: () => null, err: (error) => error });
+    if (headsError !== null) return Result.err(headsError);
+    return this.appendHistoryTransitionResult({
       state: {
         id: observation.stateId,
         sessionId,
@@ -5893,71 +12611,138 @@ export class MiniLilacSqliteStore {
         fromStateId: source.id,
         kind: "workspace-observation",
       },
-    }).state;
+    }).map((appended) => appended.state);
   }
 
   private moveHistoryCursor(sessionId: string, state: StoredHistoryState): void {
-    this.assertStateConnectedToRoot(sessionId, state.id);
+    storeResultToLegacy(this.moveHistoryCursorResult(sessionId, state));
+  }
+
+  private moveHistoryCursorResult(
+    sessionId: string,
+    state: StoredHistoryState,
+  ): ResultType<void, MiniLilacStoreOperationError> {
+    const connected = this.assertStateConnectedToRootResult(sessionId, state.id);
+    const connectionError = connected.match({ ok: () => null, err: (error) => error });
+    if (connectionError !== null) return Result.err(connectionError);
     this.setTranscriptHeads(sessionId, state.modelHeadId, state.uiHeadId);
     const updated = this.database
       .query("UPDATE session_history SET current_state_id = ?, updated_at = ? WHERE session_id = ?")
       .run(state.id, new Date().toISOString(), sessionId);
-    if (updated.changes !== 1) throw new Error(`Session '${sessionId}' has no history cursor`);
+    if (updated.changes !== 1) {
+      return Result.err(
+        rejectMiniLilacStoreOperation(
+          "moveHistoryCursor",
+          `Session '${sessionId}' has no history cursor`,
+        ),
+      );
+    }
+    return Result.ok(undefined);
   }
 
   private getStoredCommand(sessionId: string, commandId: string): z.infer<typeof commandRowSchema> {
+    return storeResultToLegacy(this.getStoredCommandResult(sessionId, commandId));
+  }
+
+  private getStoredCommandResult(
+    sessionId: string,
+    commandId: string,
+  ): ResultType<z.infer<typeof commandRowSchema>, MiniLilacPersistenceError> {
     const value = this.database
       .query(
         `SELECT kind, run_id, request_fingerprint, request_json, side_effect_started, result_json
          FROM commands WHERE session_id = ? AND command_id = ?`,
       )
       .get(sessionId, commandId);
-    if (!value) throw new Error(`Command '${commandId}' was not reserved`);
-    return commandRowSchema.parse(value);
+    return decodeRequiredMiniLilacStoreRow({
+      kind: "command",
+      row: value,
+      schemaVersion: MINI_LILAC_DATABASE_SCHEMA_VERSION,
+      recordId: commandId,
+    });
   }
 
   private getIncomingHistoryTransition(
     sessionId: string,
     stateId: string,
   ): StoredHistoryTransition | null {
+    return storeResultToLegacy(this.getIncomingHistoryTransitionResult(sessionId, stateId));
+  }
+
+  private getIncomingHistoryTransitionResult(
+    sessionId: string,
+    stateId: string,
+  ): ResultType<StoredHistoryTransition | null, MiniLilacPersistenceError> {
     const row = this.database
       .query("SELECT * FROM history_transitions WHERE session_id = ? AND to_state_id = ?")
       .get(sessionId, stateId);
-    return row ? toHistoryTransition(row) : null;
+    const decoded = this.decodeStructuralHistoryRow({
+      kind: "transition",
+      row,
+      recordId: stateId,
+    });
+    return decoded;
   }
 
   private parseHistoryNavigationResult(
     action: z.infer<typeof historyOperationActionSchema>,
-    value: unknown,
+    result: StoredHistoryNavigationResult,
     commandId: string,
     expectedMessage: MiniLilacUserUIMessage | null,
   ): StoredHistoryNavigationResult {
-    const status = z.object({ status: z.enum(["undone", "redone", "empty"]) }).parse(value).status;
+    return storeResultToLegacy(
+      this.validateHistoryNavigationResult(action, result, commandId, expectedMessage),
+    );
+  }
+
+  private validateHistoryNavigationResult(
+    action: z.infer<typeof historyOperationActionSchema>,
+    result: StoredHistoryNavigationResult,
+    commandId: string,
+    expectedMessage: MiniLilacUserUIMessage | null,
+  ): ResultType<StoredHistoryNavigationResult, MiniLilacStoreOperationError> {
+    const status = result.status;
     if ((action === "undo" && status === "redone") || (action === "redo" && status === "undone")) {
-      throw new Error(
-        `History ${action} requires a '${action === "undo" ? "undone" : "redone"}' or empty result`,
+      return Result.err(
+        rejectMiniLilacStoreOperation(
+          "parseHistoryNavigationResult",
+          `History ${action} requires a '${action === "undo" ? "undone" : "redone"}' or empty result`,
+        ),
       );
     }
-    const result =
-      action === "undo"
-        ? storedUndoHistoryResultSchema.parse(value)
-        : storedRedoHistoryResultSchema.parse(value);
     if (result.clientCommandId !== commandId) {
-      throw new Error(`History result command ID does not match command '${commandId}'`);
+      return Result.err(
+        rejectMiniLilacStoreOperation(
+          "parseHistoryNavigationResult",
+          `History result command ID does not match command '${commandId}'`,
+        ),
+      );
     }
     if (
       result.status !== "empty" &&
       (expectedMessage === null || !canonicalValuesEqual(result.message, expectedMessage))
     ) {
-      throw new Error(`History ${action} result does not contain its exact user message`);
+      return Result.err(
+        rejectMiniLilacStoreOperation(
+          "parseHistoryNavigationResult",
+          `History ${action} result does not contain its exact user message`,
+        ),
+      );
     }
-    return result;
+    return Result.ok(result);
   }
 
   private saveHistoryCommandResult(
     operation: StoredHistoryOperation,
     result: StoredHistoryNavigationResult | StoredHistoryCommandError,
   ): void {
+    storeResultToLegacy(this.saveHistoryCommandResultResult(operation, result));
+  }
+
+  private saveHistoryCommandResultResult(
+    operation: StoredHistoryOperation,
+    result: StoredHistoryNavigationResult | StoredHistoryCommandError,
+  ): ResultType<void, MiniLilacStoreOperationRejected> {
     const saved = this.database
       .query(
         `UPDATE commands SET result_json = ?
@@ -5966,47 +12751,78 @@ export class MiniLilacSqliteStore {
       )
       .run(serialize(result), operation.sessionId, operation.commandId, operation.requestedAction);
     if (saved.changes !== 1) {
-      throw new Error(`Command '${operation.commandId}' result could not be saved atomically`);
+      return Result.err(
+        rejectMiniLilacStoreOperation(
+          "saveHistoryCommandResult",
+          `Command '${operation.commandId}' result could not be saved atomically`,
+        ),
+      );
     }
+    return Result.ok(undefined);
   }
 
   private deleteHistoryOperationRow(operationId: string): void {
+    storeResultToLegacy(this.deleteHistoryOperationRowResult(operationId));
+  }
+
+  private deleteHistoryOperationRowResult(
+    operationId: string,
+  ): ResultType<void, MiniLilacStoreOperationRejected> {
     const deleted = this.database
       .query("DELETE FROM history_operations WHERE id = ?")
       .run(operationId);
-    if (deleted.changes !== 1)
-      throw new Error(`History operation '${operationId}' was not deleted`);
+    if (deleted.changes !== 1) {
+      return Result.err(
+        rejectMiniLilacStoreOperation(
+          "deleteHistoryOperationRow",
+          `History operation '${operationId}' was not deleted`,
+        ),
+      );
+    }
+    return Result.ok(undefined);
   }
 
   private deletePendingRunFinalizationRow(runId: string): void {
+    storeResultToLegacy(this.deletePendingRunFinalizationRowResult(runId));
+  }
+
+  private deletePendingRunFinalizationRowResult(
+    runId: string,
+  ): ResultType<void, MiniLilacStoreOperationRejected> {
     const deleted = this.database
       .query("DELETE FROM pending_run_finalizations WHERE run_id = ?")
       .run(runId);
     if (deleted.changes !== 1) {
-      throw new Error(`Pending finalization for run '${runId}' was not deleted`);
+      return Result.err(
+        rejectMiniLilacStoreOperation(
+          "deletePendingRunFinalizationRow",
+          `Pending finalization for run '${runId}' was not deleted`,
+        ),
+      );
     }
+    return Result.ok(undefined);
   }
 
   getHistoryTransition(transitionId: string): StoredHistoryTransition {
-    const row = this.database
-      .query("SELECT * FROM history_transitions WHERE id = ?")
-      .get(transitionId);
-    if (!row) throw new Error(`History transition '${transitionId}' was not found`);
-    return toHistoryTransition(row);
+    return storeResultToLegacy(this.getHistoryTransitionResult(transitionId));
+  }
+
+  getHistoryTransitionResult(
+    transitionId: string,
+  ): ResultType<StoredHistoryTransition, MiniLilacPersistenceError> {
+    return this.runHistoryReadResult("getHistoryTransition", () =>
+      this.decodeRequiredStructuralHistoryRow({
+        kind: "transition",
+        row: this.database
+          .query("SELECT * FROM history_transitions WHERE id = ?")
+          .get(transitionId),
+        recordId: transitionId,
+      }),
+    );
   }
 
   private insertHistoryStateRow(input: CreateStoredHistoryState): void {
-    historyWorkspaceStatusSchema.parse(input.workspaceStatus);
-    historyStateOriginSchema.parse(input.origin);
-    if (input.workspaceUnavailableReason !== null) {
-      historyWorkspaceUnavailableReasonSchema.parse(input.workspaceUnavailableReason);
-    }
-    if (input.modelHeadId !== null) z.number().int().positive().parse(input.modelHeadId);
-    if (input.uiHeadId !== null) z.number().int().positive().parse(input.uiHeadId);
-    const providerState =
-      input.providerState === undefined || input.providerState === null
-        ? null
-        : historyProviderStateSchema.parse(input.providerState);
+    const providerState = input.providerState ?? null;
     const hasProviderMetadataColumns = this.database
       .query(
         "SELECT 1 FROM pragma_table_info('history_states') WHERE name = 'last_provider_family'",
@@ -6053,64 +12869,166 @@ export class MiniLilacSqliteStore {
         input.workspaceUnavailableReason,
         input.origin,
         providerState?.lastFamily ?? null,
-        providerState === null ? null : providerState.containsCrossFamilyTurns ? 1 : 0,
+        storedProviderStateFlag(providerState),
         input.createdAt ?? new Date().toISOString(),
       );
   }
 
   private insertHistoryTransitionRow(input: CreateStoredHistoryTransition): void {
-    historyTransitionKindSchema.parse(input.kind);
-    const from = this.getHistoryState(input.fromStateId);
-    if (from.sessionId !== input.sessionId) {
-      throw new Error(`History transition '${input.id}' crosses sessions`);
+    storeResultToLegacy(this.insertHistoryTransitionRowResult(input));
+  }
+
+  private insertHistoryTransitionRowResult(
+    input: CreateStoredHistoryTransition,
+  ): ResultType<void, MiniLilacStoreOperationError> {
+    const from = this.getHistoryStateResult(input.fromStateId);
+    let $fromResultValue337007!: import("better-result").InferOk<NonNullable<typeof from>>;
+    let $fromResultError337007!: import("better-result").InferErr<NonNullable<typeof from>>;
+    const $fromResultOk337007 = Result.match<
+      import("better-result").InferOk<NonNullable<typeof from>>,
+      import("better-result").InferErr<NonNullable<typeof from>>,
+      boolean
+    >(from, {
+      ok: (value) => {
+        $fromResultValue337007 = value;
+        return true;
+      },
+      err: (error) => {
+        $fromResultError337007 = error;
+        return false;
+      },
+    });
+    if (($fromResultOk337007 ? "ok" : "error") === "error")
+      return Result.err($fromResultError337007);
+    if ($fromResultValue337007.sessionId !== input.sessionId) {
+      return Result.err(
+        rejectMiniLilacStoreOperation(
+          "insertHistoryTransitionRow",
+          `History transition '${input.id}' crosses sessions`,
+        ),
+      );
     }
-    this.assertStateConnectedToRoot(input.sessionId, input.fromStateId);
+    const connected = this.assertStateConnectedToRootResult(input.sessionId, input.fromStateId);
+    const connectionError = connected.match({ ok: () => null, err: (error) => error });
+    if (connectionError !== null) return Result.err(connectionError);
     if (
       this.database
         .query("SELECT 1 FROM history_transitions WHERE session_id = ? AND to_state_id IS NULL")
         .get(input.sessionId)
     ) {
-      throw new Error(`Session '${input.sessionId}' already has an open history transition`);
+      return Result.err(
+        rejectMiniLilacStoreOperation(
+          "insertHistoryTransitionRow",
+          `Session '${input.sessionId}' already has an open history transition`,
+        ),
+      );
     }
     const toStateId = input.toStateId ?? null;
-    if (
-      toStateId === null &&
-      this.getSessionHistory(input.sessionId).currentStateId !== input.fromStateId
-    ) {
-      throw new Error(`Open history transition '${input.id}' must start at the current state`);
+    if (toStateId === null) {
+      const history = this.getSessionHistoryResult(input.sessionId);
+      let $historyResultValue338005!: import("better-result").InferOk<NonNullable<typeof history>>;
+      let $historyResultError338005!: import("better-result").InferErr<NonNullable<typeof history>>;
+      const $historyResultOk338005 = Result.match<
+        import("better-result").InferOk<NonNullable<typeof history>>,
+        import("better-result").InferErr<NonNullable<typeof history>>,
+        boolean
+      >(history, {
+        ok: (value) => {
+          $historyResultValue338005 = value;
+          return true;
+        },
+        err: (error) => {
+          $historyResultError338005 = error;
+          return false;
+        },
+      });
+      if (($historyResultOk338005 ? "ok" : "error") === "error")
+        return Result.err($historyResultError338005);
+      if ($historyResultValue338005.currentStateId !== input.fromStateId) {
+        return Result.err(
+          rejectMiniLilacStoreOperation(
+            "insertHistoryTransitionRow",
+            `Open history transition '${input.id}' must start at the current state`,
+          ),
+        );
+      }
     }
     if (toStateId !== null) {
-      this.validateHistoryTransitionDestination(
+      const validDestination = this.validateHistoryTransitionDestinationResult(
         input.sessionId,
         input.fromStateId,
         toStateId,
         input.kind,
       );
+      const destinationError = validDestination.match({ ok: () => null, err: (error) => error });
+      if (destinationError !== null) return Result.err(destinationError);
     }
     if (input.kind === "user-message") {
-      const rootRunId = z.string().min(1).parse(input.rootRunId);
-      historyDeliverySchema.parse(input.delivery);
-      miniLilacUserUIMessageSchema.parse(input.userMessage);
-      z.number().int().nonnegative().parse(input.replayAfterSeq);
-      const rootRun = z
-        .object({ parent_run_id: z.string().nullable() })
-        .parse(
-          this.database
-            .query("SELECT parent_run_id FROM runs WHERE id = ? AND session_id = ?")
-            .get(rootRunId, input.sessionId),
+      const rootRunId = input.rootRunId;
+      const rootRun = decodeRequiredMiniLilacStoreRow({
+        kind: "root-run-parent",
+        row: this.database
+          .query("SELECT parent_run_id FROM runs WHERE id = ? AND session_id = ?")
+          .get(rootRunId, input.sessionId),
+        schemaVersion: MINI_LILAC_DATABASE_SCHEMA_VERSION,
+        recordId: rootRunId,
+      });
+      let $rootRunResultValue338831!: import("better-result").InferOk<NonNullable<typeof rootRun>>;
+      let $rootRunResultError338831!: import("better-result").InferErr<NonNullable<typeof rootRun>>;
+      const $rootRunResultOk338831 = Result.match<
+        import("better-result").InferOk<NonNullable<typeof rootRun>>,
+        import("better-result").InferErr<NonNullable<typeof rootRun>>,
+        boolean
+      >(rootRun, {
+        ok: (value) => {
+          $rootRunResultValue338831 = value;
+          return true;
+        },
+        err: (error) => {
+          $rootRunResultError338831 = error;
+          return false;
+        },
+      });
+      if (($rootRunResultOk338831 ? "ok" : "error") === "error")
+        return Result.err($rootRunResultError338831);
+      if ($rootRunResultValue338831.parent_run_id !== null) {
+        return Result.err(
+          rejectMiniLilacStoreOperation(
+            "insertHistoryTransitionRow",
+            `History transition '${input.id}' must reference a root run`,
+          ),
         );
-      if (rootRun.parent_run_id !== null) {
-        throw new Error(`History transition '${input.id}' must reference a root run`);
       }
-      const command = this.getStoredCommand(input.sessionId, input.commandId);
+      const command = this.getStoredCommandResult(input.sessionId, input.commandId);
+      let $commandResultValue339510!: import("better-result").InferOk<NonNullable<typeof command>>;
+      let $commandResultError339510!: import("better-result").InferErr<NonNullable<typeof command>>;
+      const $commandResultOk339510 = Result.match<
+        import("better-result").InferOk<NonNullable<typeof command>>,
+        import("better-result").InferErr<NonNullable<typeof command>>,
+        boolean
+      >(command, {
+        ok: (value) => {
+          $commandResultValue339510 = value;
+          return true;
+        },
+        err: (error) => {
+          $commandResultError339510 = error;
+          return false;
+        },
+      });
+      if (($commandResultOk339510 ? "ok" : "error") === "error")
+        return Result.err($commandResultError339510);
       if (
-        command.kind !== input.delivery ||
-        command.run_id !== rootRunId ||
-        command.side_effect_started !== 1 ||
-        command.result_json === null
+        $commandResultValue339510.kind !== input.delivery ||
+        $commandResultValue339510.run_id !== rootRunId ||
+        $commandResultValue339510.side_effect_started !== 1 ||
+        $commandResultValue339510.result_json === null
       ) {
-        throw new Error(
-          `${input.delivery === "prompt" ? "Prompt" : "Steering"} command '${input.commandId}' is not bound to root run '${rootRunId}'`,
+        return Result.err(
+          rejectMiniLilacStoreOperation(
+            "insertHistoryTransitionRow",
+            `${input.delivery === "prompt" ? "Prompt" : "Steering"} command '${input.commandId}' is not bound to root run '${rootRunId}'`,
+          ),
         );
       }
     }
@@ -6141,6 +13059,7 @@ export class MiniLilacSqliteStore {
         input.createdAt ?? new Date().toISOString(),
         completedAt,
       );
+    return Result.ok(undefined);
   }
 
   private validateHistoryTransitionDestination(
@@ -6149,24 +13068,70 @@ export class MiniLilacSqliteStore {
     toStateId: string,
     kind: z.infer<typeof historyTransitionKindSchema>,
   ): void {
-    const destination = this.getHistoryState(toStateId);
-    if (destination.sessionId !== sessionId) {
-      throw new Error(`History transition from '${fromStateId}' crosses sessions`);
+    storeResultToLegacy(
+      this.validateHistoryTransitionDestinationResult(sessionId, fromStateId, toStateId, kind),
+    );
+  }
+
+  private validateHistoryTransitionDestinationResult(
+    sessionId: string,
+    fromStateId: string,
+    toStateId: string,
+    kind: z.infer<typeof historyTransitionKindSchema>,
+  ): ResultType<void, MiniLilacStoreOperationError> {
+    const destination = this.getHistoryStateResult(toStateId);
+    let $destinationResultValue341886!: import("better-result").InferOk<
+      NonNullable<typeof destination>
+    >;
+    let $destinationResultError341886!: import("better-result").InferErr<
+      NonNullable<typeof destination>
+    >;
+    const $destinationResultOk341886 = Result.match<
+      import("better-result").InferOk<NonNullable<typeof destination>>,
+      import("better-result").InferErr<NonNullable<typeof destination>>,
+      boolean
+    >(destination, {
+      ok: (value) => {
+        $destinationResultValue341886 = value;
+        return true;
+      },
+      err: (error) => {
+        $destinationResultError341886 = error;
+        return false;
+      },
+    });
+    if (($destinationResultOk341886 ? "ok" : "error") === "error")
+      return Result.err($destinationResultError341886);
+    if ($destinationResultValue341886.sessionId !== sessionId) {
+      return Result.err(
+        rejectMiniLilacStoreOperation(
+          "validateHistoryTransitionDestination",
+          `History transition from '${fromStateId}' crosses sessions`,
+        ),
+      );
     }
     const expectedOrigin = {
       "user-message": "turn-boundary",
       "workspace-observation": "workspace-observation",
       compaction: "compaction",
     } as const;
-    if (destination.origin !== expectedOrigin[kind]) {
-      throw new Error(
-        `History transition kind '${kind}' requires destination origin '${expectedOrigin[kind]}'`,
+    if ($destinationResultValue341886.origin !== expectedOrigin[kind]) {
+      return Result.err(
+        rejectMiniLilacStoreOperation(
+          "validateHistoryTransitionDestination",
+          `History transition kind '${kind}' requires destination origin '${expectedOrigin[kind]}'`,
+        ),
       );
     }
     if (
       this.database.query("SELECT 1 FROM history_transitions WHERE to_state_id = ?").get(toStateId)
     ) {
-      throw new Error(`History state '${toStateId}' already has an incoming transition`);
+      return Result.err(
+        rejectMiniLilacStoreOperation(
+          "validateHistoryTransitionDestination",
+          `History state '${toStateId}' already has an incoming transition`,
+        ),
+      );
     }
     const cycle = this.database
       .query(
@@ -6181,10 +13146,25 @@ export class MiniLilacSqliteStore {
          SELECT 1 FROM ancestry WHERE state_id = ? LIMIT 1`,
       )
       .get(fromStateId, sessionId, toStateId);
-    if (cycle) throw new Error(`History transition to '${toStateId}' would create a cycle`);
+    if (cycle) {
+      return Result.err(
+        rejectMiniLilacStoreOperation(
+          "validateHistoryTransitionDestination",
+          `History transition to '${toStateId}' would create a cycle`,
+        ),
+      );
+    }
+    return Result.ok(undefined);
   }
 
   private assertStateConnectedToRoot(sessionId: string, stateId: string): void {
+    storeResultToLegacy(this.assertStateConnectedToRootResult(sessionId, stateId));
+  }
+
+  private assertStateConnectedToRootResult(
+    sessionId: string,
+    stateId: string,
+  ): ResultType<void, MiniLilacStoreOperationRejected> {
     const row = this.database
       .query(
         `WITH RECURSIVE ancestry(state_id) AS (
@@ -6203,15 +13183,20 @@ export class MiniLilacSqliteStore {
       )
       .get(stateId, sessionId, sessionId);
     if (!row) {
-      throw new Error(`History state '${stateId}' is not connected to session '${sessionId}' root`);
+      return Result.err(
+        rejectMiniLilacStoreOperation(
+          "assertStateConnectedToRoot",
+          `History state '${stateId}' is not connected to session '${sessionId}' root`,
+        ),
+      );
     }
+    return Result.ok(undefined);
   }
 
   private isStateInAncestry(sessionId: string, startStateId: string, stateId: string): boolean {
-    return Boolean(
-      this.database
-        .query(
-          `WITH RECURSIVE ancestry(state_id) AS (
+    const row = this.database
+      .query(
+        `WITH RECURSIVE ancestry(state_id) AS (
              SELECT ?
              UNION ALL
              SELECT transition.from_state_id
@@ -6219,28 +13204,198 @@ export class MiniLilacSqliteStore {
              JOIN history_transitions AS transition
                ON transition.session_id = ? AND transition.to_state_id = ancestry.state_id
            )
-           SELECT 1 FROM ancestry WHERE state_id = ? LIMIT 1`,
-        )
-        .get(startStateId, sessionId, stateId),
-    );
+         SELECT 1 FROM ancestry WHERE state_id = ? LIMIT 1`,
+      )
+      .get(startStateId, sessionId, stateId);
+    return row !== null;
   }
 
   getModelMessages(sessionId: string): ModelMessage[] {
-    const values = this.readSerializedChain(
-      sessionId,
-      "model",
-      this.getTranscriptHeads(sessionId).model_head_id,
-    ).map(deserialize);
-    return modelMessagesSchema.parse(values);
+    return storeResultToLegacy(this.getModelMessagesResult(sessionId));
+  }
+
+  getModelMessagesResult(sessionId: string): ResultType<ModelMessage[], MiniLilacPersistenceError> {
+    const transcript = this.getModelTranscriptResult(sessionId);
+    let $transcriptResultValue345848!: import("better-result").InferOk<
+      NonNullable<typeof transcript>
+    >;
+    let $transcriptResultError345848!: import("better-result").InferErr<
+      NonNullable<typeof transcript>
+    >;
+    const $transcriptResultOk345848 = Result.match<
+      import("better-result").InferOk<NonNullable<typeof transcript>>,
+      import("better-result").InferErr<NonNullable<typeof transcript>>,
+      boolean
+    >(transcript, {
+      ok: (value) => {
+        $transcriptResultValue345848 = value;
+        return true;
+      },
+      err: (error) => {
+        $transcriptResultError345848 = error;
+        return false;
+      },
+    });
+    if (($transcriptResultOk345848 ? "ok" : "error") === "error")
+      return Result.err($transcriptResultError345848);
+    return Result.ok($transcriptResultValue345848.value);
+  }
+
+  getModelTranscriptResult(
+    sessionId: string,
+  ): ResultType<DecodedPersistedValue<ModelMessage[]>, MiniLilacPersistenceError> {
+    return this.runHistoryReadResult("getModelMessages", () => {
+      const rawValues = this.readSerializedChainResult(
+        sessionId,
+        "model",
+        this.getTranscriptHeads(sessionId).model_head_id,
+      );
+      let $rawValuesResultValue346242!: import("better-result").InferOk<
+        NonNullable<typeof rawValues>
+      >;
+      let $rawValuesResultError346242!: import("better-result").InferErr<
+        NonNullable<typeof rawValues>
+      >;
+      const $rawValuesResultOk346242 = Result.match<
+        import("better-result").InferOk<NonNullable<typeof rawValues>>,
+        import("better-result").InferErr<NonNullable<typeof rawValues>>,
+        boolean
+      >(rawValues, {
+        ok: (value) => {
+          $rawValuesResultValue346242 = value;
+          return true;
+        },
+        err: (error) => {
+          $rawValuesResultError346242 = error;
+          return false;
+        },
+      });
+      if (($rawValuesResultOk346242 ? "ok" : "error") === "error") {
+        this.queuePersistenceDiagnostic($rawValuesResultError346242);
+        return Result.err($rawValuesResultError346242);
+      }
+      const decoded = decodeMiniLilacModelTranscript({
+        rawValues: $rawValuesResultValue346242,
+        schemaVersion: MINI_LILAC_DATABASE_SCHEMA_VERSION,
+        recordId: sessionId,
+      });
+      let $decodedResultValue346553!: import("better-result").InferOk<NonNullable<typeof decoded>>;
+      let $decodedResultError346553!: import("better-result").InferErr<NonNullable<typeof decoded>>;
+      const $decodedResultOk346553 = Result.match<
+        import("better-result").InferOk<NonNullable<typeof decoded>>,
+        import("better-result").InferErr<NonNullable<typeof decoded>>,
+        boolean
+      >(decoded, {
+        ok: (value) => {
+          $decodedResultValue346553 = value;
+          return true;
+        },
+        err: (error) => {
+          $decodedResultError346553 = error;
+          return false;
+        },
+      });
+      if (($decodedResultOk346553 ? "ok" : "error") === "error") {
+        this.queuePersistenceDiagnostic($decodedResultError346553);
+        return Result.err($decodedResultError346553);
+      }
+      return Result.ok($decodedResultValue346553);
+    });
   }
 
   getUiMessages(sessionId: string): MiniLilacUIMessage[] {
-    const values = this.readSerializedChain(
-      sessionId,
-      "ui",
-      this.getTranscriptHeads(sessionId).ui_head_id,
-    ).map(deserialize);
-    return miniLilacMessagesSchema.parse(values);
+    return storeResultToLegacy(this.getUiMessagesResult(sessionId));
+  }
+
+  getUiMessagesResult(
+    sessionId: string,
+  ): ResultType<MiniLilacUIMessage[], MiniLilacPersistenceError> {
+    const transcript = this.getUiTranscriptResult(sessionId);
+    let $transcriptResultValue347184!: import("better-result").InferOk<
+      NonNullable<typeof transcript>
+    >;
+    let $transcriptResultError347184!: import("better-result").InferErr<
+      NonNullable<typeof transcript>
+    >;
+    const $transcriptResultOk347184 = Result.match<
+      import("better-result").InferOk<NonNullable<typeof transcript>>,
+      import("better-result").InferErr<NonNullable<typeof transcript>>,
+      boolean
+    >(transcript, {
+      ok: (value) => {
+        $transcriptResultValue347184 = value;
+        return true;
+      },
+      err: (error) => {
+        $transcriptResultError347184 = error;
+        return false;
+      },
+    });
+    if (($transcriptResultOk347184 ? "ok" : "error") === "error")
+      return Result.err($transcriptResultError347184);
+    return Result.ok($transcriptResultValue347184.value);
+  }
+
+  getUiTranscriptResult(
+    sessionId: string,
+  ): ResultType<DecodedPersistedValue<MiniLilacUIMessage[]>, MiniLilacPersistenceError> {
+    return this.runHistoryReadResult("getUiMessages", () => {
+      const rawValues = this.readSerializedChainResult(
+        sessionId,
+        "ui",
+        this.getTranscriptHeads(sessionId).ui_head_id,
+      );
+      let $rawValuesResultValue347575!: import("better-result").InferOk<
+        NonNullable<typeof rawValues>
+      >;
+      let $rawValuesResultError347575!: import("better-result").InferErr<
+        NonNullable<typeof rawValues>
+      >;
+      const $rawValuesResultOk347575 = Result.match<
+        import("better-result").InferOk<NonNullable<typeof rawValues>>,
+        import("better-result").InferErr<NonNullable<typeof rawValues>>,
+        boolean
+      >(rawValues, {
+        ok: (value) => {
+          $rawValuesResultValue347575 = value;
+          return true;
+        },
+        err: (error) => {
+          $rawValuesResultError347575 = error;
+          return false;
+        },
+      });
+      if (($rawValuesResultOk347575 ? "ok" : "error") === "error") {
+        this.queuePersistenceDiagnostic($rawValuesResultError347575);
+        return Result.err($rawValuesResultError347575);
+      }
+      const decoded = decodeMiniLilacUiTranscript({
+        rawValues: $rawValuesResultValue347575,
+        schemaVersion: MINI_LILAC_DATABASE_SCHEMA_VERSION,
+        recordId: sessionId,
+      });
+      let $decodedResultValue347880!: import("better-result").InferOk<NonNullable<typeof decoded>>;
+      let $decodedResultError347880!: import("better-result").InferErr<NonNullable<typeof decoded>>;
+      const $decodedResultOk347880 = Result.match<
+        import("better-result").InferOk<NonNullable<typeof decoded>>,
+        import("better-result").InferErr<NonNullable<typeof decoded>>,
+        boolean
+      >(decoded, {
+        ok: (value) => {
+          $decodedResultValue347880 = value;
+          return true;
+        },
+        err: (error) => {
+          $decodedResultError347880 = error;
+          return false;
+        },
+      });
+      if (($decodedResultOk347880 ? "ok" : "error") === "error") {
+        this.queuePersistenceDiagnostic($decodedResultError347880);
+        return Result.err($decodedResultError347880);
+      }
+      return Result.ok($decodedResultValue347880);
+    });
   }
 
   getSessionResume(sessionId: string): StoredSessionResume {
@@ -6255,29 +13410,48 @@ export class MiniLilacSqliteStore {
     sessionId: string,
     lane: "model" | "ui",
     values: readonly unknown[],
+    compareEquivalent = true,
   ): number | null {
-    return this.internSerializedChain(sessionId, lane, values.map(serialize));
+    return this.internSerializedChain(sessionId, lane, values.map(serialize), compareEquivalent);
   }
 
   private internSerializedChain(
     sessionId: string,
     lane: "model" | "ui",
     values: readonly string[],
+    compareEquivalent = true,
   ): number | null {
     let parentId: number | null = null;
     let parentDepth = 0;
     let parentHash = "root";
     for (const valueJson of values) {
-      const equivalent: z.infer<typeof transcriptNodeRowSchema> | undefined = this.database
-        .query(
-          `SELECT id, parent_id, depth, value_json, hash FROM transcript_nodes
-           WHERE session_id = ? AND lane = ? AND parent_id IS ?`,
-        )
-        .all(sessionId, lane, parentId)
-        .map((value) => transcriptNodeRowSchema.parse(value))
-        .find((value) =>
-          canonicalValuesEqual(deserialize(value.value_json), deserialize(valueJson)),
-        );
+      const equivalent: z.infer<typeof transcriptNodeRowSchema> | undefined = compareEquivalent
+        ? storeResultToLegacy(
+            decodeMiniLilacStoreRows({
+              kind: "transcript-node",
+              rows: this.database
+                .query(
+                  `SELECT id, parent_id, depth, value_json, hash FROM transcript_nodes
+                   WHERE session_id = ? AND lane = ? AND parent_id IS ?`,
+                )
+                .all(sessionId, lane, parentId),
+              schemaVersion: MINI_LILAC_DATABASE_SCHEMA_VERSION,
+              recordId: `${sessionId}:${lane}:children`,
+            }),
+          ).value.find((value) => {
+            const stored = this.decodeTranscriptNodeValue(
+              lane,
+              value.value_json,
+              `${sessionId}:${value.id}`,
+            );
+            const candidate = this.decodeTranscriptNodeValue(
+              lane,
+              valueJson,
+              `${sessionId}:candidate`,
+            );
+            return canonicalValuesEqual(stored, candidate);
+          })
+        : undefined;
       if (equivalent !== undefined) {
         parentId = equivalent.id;
         parentDepth = equivalent.depth;
@@ -6296,7 +13470,14 @@ export class MiniLilacSqliteStore {
         )
         .get(sessionId, lane, hash);
       if (existingValue) {
-        const existing = transcriptNodeRowSchema.parse(existingValue);
+        const existing = storeResultToLegacy(
+          decodeRequiredMiniLilacStoreRow({
+            kind: "transcript-node",
+            row: existingValue,
+            schemaVersion: MINI_LILAC_DATABASE_SCHEMA_VERSION,
+            recordId: `${sessionId}:${lane}:${hash}`,
+          }),
+        );
         if (
           existing.parent_id !== parentId ||
           existing.depth !== parentDepth + 1 ||
@@ -6309,14 +13490,19 @@ export class MiniLilacSqliteStore {
         parentHash = existing.hash;
         continue;
       }
-      const inserted = transcriptNodeRowSchema.pick({ id: true }).parse(
-        this.database
-          .query(
-            `INSERT INTO transcript_nodes
-              (session_id, lane, parent_id, depth, value_json, hash)
-             VALUES (?, ?, ?, ?, ?, ?) RETURNING id`,
-          )
-          .get(sessionId, lane, parentId, parentDepth + 1, valueJson, hash),
+      const inserted: MiniLilacStoreRowValueByKind["transcript-node-id"] = storeResultToLegacy(
+        decodeRequiredMiniLilacStoreRow({
+          kind: "transcript-node-id",
+          row: this.database
+            .query(
+              `INSERT INTO transcript_nodes
+                (session_id, lane, parent_id, depth, value_json, hash)
+               VALUES (?, ?, ?, ?, ?, ?) RETURNING id`,
+            )
+            .get(sessionId, lane, parentId, parentDepth + 1, valueJson, hash),
+          schemaVersion: MINI_LILAC_DATABASE_SCHEMA_VERSION,
+          recordId: `${sessionId}:${lane}:${hash}`,
+        }),
       );
       parentId = inserted.id;
       parentDepth += 1;
@@ -6325,11 +13511,79 @@ export class MiniLilacSqliteStore {
     return parentId;
   }
 
+  private decodeTranscriptNodeValue(
+    lane: "model" | "ui",
+    raw: string,
+    recordId: string,
+  ): ModelMessage | MiniLilacUIMessage {
+    if (lane === "model") {
+      const decoded = decodeMiniLilacModelTranscript({
+        rawValues: [raw],
+        schemaVersion: MINI_LILAC_DATABASE_SCHEMA_VERSION,
+        recordId,
+      });
+      let $decodedResultValue352324!: import("better-result").InferOk<NonNullable<typeof decoded>>;
+      let $decodedResultError352324!: import("better-result").InferErr<NonNullable<typeof decoded>>;
+      const $decodedResultOk352324 = Result.match<
+        import("better-result").InferOk<NonNullable<typeof decoded>>,
+        import("better-result").InferErr<NonNullable<typeof decoded>>,
+        boolean
+      >(decoded, {
+        ok: (value) => {
+          $decodedResultValue352324 = value;
+          return true;
+        },
+        err: (error) => {
+          $decodedResultError352324 = error;
+          return false;
+        },
+      });
+      if (($decodedResultOk352324 ? "ok" : "error") === "error") throw $decodedResultError352324;
+      const messages = $decodedResultValue352324.value;
+      const message = messages[0];
+      if (message === undefined) throw new Error("Decoded model transcript node was empty");
+      return message;
+    }
+    const decoded = decodeMiniLilacUiTranscript({
+      rawValues: [raw],
+      schemaVersion: MINI_LILAC_DATABASE_SCHEMA_VERSION,
+      recordId,
+    });
+    let $decodedResultValue352749!: import("better-result").InferOk<NonNullable<typeof decoded>>;
+    let $decodedResultError352749!: import("better-result").InferErr<NonNullable<typeof decoded>>;
+    const $decodedResultOk352749 = Result.match<
+      import("better-result").InferOk<NonNullable<typeof decoded>>,
+      import("better-result").InferErr<NonNullable<typeof decoded>>,
+      boolean
+    >(decoded, {
+      ok: (value) => {
+        $decodedResultValue352749 = value;
+        return true;
+      },
+      err: (error) => {
+        $decodedResultError352749 = error;
+        return false;
+      },
+    });
+    if (($decodedResultOk352749 ? "ok" : "error") === "error") throw $decodedResultError352749;
+    const messages = $decodedResultValue352749.value;
+    const message = messages[0];
+    if (message === undefined) throw new Error("Decoded UI transcript node was empty");
+    return message;
+  }
+
   private getTranscriptHeads(sessionId: string): z.infer<typeof transcriptHeadRowSchema> {
     const value = this.database
       .query("SELECT model_head_id, ui_head_id FROM session_transcript_heads WHERE session_id = ?")
       .get(sessionId);
-    return value ? transcriptHeadRowSchema.parse(value) : { model_head_id: null, ui_head_id: null };
+    const decoded = decodeMiniLilacStoreRow({
+      kind: "transcript-head",
+      row: value,
+      schemaVersion: MINI_LILAC_DATABASE_SCHEMA_VERSION,
+      recordId: sessionId,
+    });
+    const heads = storeResultToLegacy(decoded).value;
+    return heads ?? { model_head_id: null, ui_head_id: null };
   }
 
   private setTranscriptHeads(
@@ -6352,23 +13606,59 @@ export class MiniLilacSqliteStore {
     sessionId: string,
     lane: "model" | "ui",
     headId: number | null,
-  ): string[] {
-    if (headId === null) return [];
-    return this.database
-      .query(
-        `WITH RECURSIVE chain(id, parent_id, depth, value_json) AS (
-           SELECT id, parent_id, depth, value_json FROM transcript_nodes
-           WHERE id = ? AND session_id = ? AND lane = ?
-           UNION ALL
-           SELECT parent.id, parent.parent_id, parent.depth, parent.value_json
-           FROM transcript_nodes AS parent
-           JOIN chain AS child ON child.parent_id = parent.id
-           WHERE parent.session_id = ? AND parent.lane = ?
-         )
-         SELECT value_json FROM chain ORDER BY depth`,
-      )
-      .all(headId, sessionId, lane, sessionId, lane)
-      .map((value) => jsonRowSchema.parse(value).value_json);
+  ): string[] | null {
+    return storeResultToLegacy(this.readSerializedChainResult(sessionId, lane, headId));
+  }
+
+  private readSerializedChainResult(
+    sessionId: string,
+    lane: "model" | "ui",
+    headId: number | null,
+  ): ResultType<string[] | null, PersistedDataError> {
+    const rows =
+      headId === null
+        ? []
+        : this.database
+            .query(
+              `WITH RECURSIVE chain(id, parent_id, depth, value_json, hash) AS (
+                 SELECT id, parent_id, depth, value_json, hash FROM transcript_nodes
+                 WHERE id = ? AND session_id = ? AND lane = ?
+                 UNION ALL
+                 SELECT parent.id, parent.parent_id, parent.depth, parent.value_json, parent.hash
+                 FROM transcript_nodes AS parent
+                 JOIN chain AS child ON child.parent_id = parent.id
+                 WHERE parent.session_id = ? AND parent.lane = ?
+               )
+               SELECT id, parent_id AS parentId, depth, value_json AS valueJson, hash
+               FROM chain ORDER BY depth`,
+            )
+            .all(headId, sessionId, lane, sessionId, lane);
+    const decoded = decodeMiniLilacTranscriptChain({
+      headId,
+      lane,
+      rows,
+      schemaVersion: MINI_LILAC_DATABASE_SCHEMA_VERSION,
+      recordId: sessionId,
+    });
+    let $decodedResultValue355420!: import("better-result").InferOk<NonNullable<typeof decoded>>;
+    let $decodedResultError355420!: import("better-result").InferErr<NonNullable<typeof decoded>>;
+    const $decodedResultOk355420 = Result.match<
+      import("better-result").InferOk<NonNullable<typeof decoded>>,
+      import("better-result").InferErr<NonNullable<typeof decoded>>,
+      boolean
+    >(decoded, {
+      ok: (value) => {
+        $decodedResultValue355420 = value;
+        return true;
+      },
+      err: (error) => {
+        $decodedResultError355420 = error;
+        return false;
+      },
+    });
+    if (($decodedResultOk355420 ? "ok" : "error") === "error")
+      return Result.err($decodedResultError355420);
+    return Result.ok(headId === null ? null : $decodedResultValue355420.value);
   }
 
   getCommandResult(
@@ -6376,57 +13666,236 @@ export class MiniLilacSqliteStore {
     commandId: string,
     request: StoredCommandRequest,
   ): unknown | undefined {
-    const command = canonicalCommandPayload(request.payload);
-    const value = this.database
-      .query(
-        `SELECT kind, run_id, request_fingerprint, request_json, side_effect_started, result_json
-         FROM commands WHERE session_id = ? AND command_id = ?`,
-      )
-      .get(sessionId, commandId);
-    if (!value) return undefined;
-    const row = commandRowSchema.parse(value);
-    if (row.kind !== request.kind) {
-      throw new Error(`Command '${commandId}' was already used for '${row.kind}'`);
-    }
-    if (request.runId !== null && row.run_id !== request.runId) {
-      throw new Error(`Command '${commandId}' was already used for a different run`);
-    }
-    if (row.request_fingerprint !== command.fingerprint || row.request_json !== command.json) {
-      throw new Error(`Command '${commandId}' was already used with a different payload`);
-    }
-    if (row.result_json === null) throw new Error(`Command '${commandId}' is pending`);
-    return deserialize(row.result_json);
+    return storeResultToLegacy(this.getCommandResultResult(sessionId, commandId, request));
+  }
+
+  getCommandResultResult(
+    sessionId: string,
+    commandId: string,
+    request: StoredCommandRequest,
+  ): ResultType<unknown | undefined, MiniLilacStoreOperationError> {
+    const command = decodeCanonicalStoredCommandRequest(request);
+    let $commandResultValue356147!: import("better-result").InferOk<NonNullable<typeof command>>;
+    let $commandResultError356147!: import("better-result").InferErr<NonNullable<typeof command>>;
+    const $commandResultOk356147 = Result.match<
+      import("better-result").InferOk<NonNullable<typeof command>>,
+      import("better-result").InferErr<NonNullable<typeof command>>,
+      boolean
+    >(command, {
+      ok: (value) => {
+        $commandResultValue356147 = value;
+        return true;
+      },
+      err: (error) => {
+        $commandResultError356147 = error;
+        return false;
+      },
+    });
+    if (($commandResultOk356147 ? "ok" : "error") === "error")
+      return Result.err($commandResultError356147);
+    return this.runHistoryReadResult("getCommandResult", () => {
+      const value = this.database
+        .query(
+          `SELECT kind, run_id, request_fingerprint, request_json, side_effect_started, result_json
+           FROM commands WHERE session_id = ? AND command_id = ?`,
+        )
+        .get(sessionId, commandId);
+      if (!value) return Result.ok(undefined);
+      const decodedRow = decodeRequiredMiniLilacStoreRow({
+        kind: "command",
+        row: value,
+        schemaVersion: MINI_LILAC_DATABASE_SCHEMA_VERSION,
+        recordId: commandId,
+      });
+      let $decodedRowResultValue356660!: import("better-result").InferOk<
+        NonNullable<typeof decodedRow>
+      >;
+      let $decodedRowResultError356660!: import("better-result").InferErr<
+        NonNullable<typeof decodedRow>
+      >;
+      const $decodedRowResultOk356660 = Result.match<
+        import("better-result").InferOk<NonNullable<typeof decodedRow>>,
+        import("better-result").InferErr<NonNullable<typeof decodedRow>>,
+        boolean
+      >(decodedRow, {
+        ok: (value) => {
+          $decodedRowResultValue356660 = value;
+          return true;
+        },
+        err: (error) => {
+          $decodedRowResultError356660 = error;
+          return false;
+        },
+      });
+      if (($decodedRowResultOk356660 ? "ok" : "error") === "error") {
+        if ($decodedRowResultError356660._tag !== "MiniLilacHistoryRecordMissing") {
+          this.queuePersistenceDiagnostic($decodedRowResultError356660);
+        }
+        return Result.err($decodedRowResultError356660);
+      }
+      const row = $decodedRowResultValue356660;
+      if (row.kind !== $commandResultValue356147.kind) {
+        return Result.err(
+          new MiniLilacStoreOperationRejected({
+            operation: "getCommandResult",
+            message: `Command '${commandId}' was already used for '${row.kind}'`,
+          }),
+        );
+      }
+      if (
+        $commandResultValue356147.runId !== null &&
+        row.run_id !== $commandResultValue356147.runId
+      ) {
+        return Result.err(
+          new MiniLilacStoreOperationRejected({
+            operation: "getCommandResult",
+            message: `Command '${commandId}' was already used for a different run`,
+          }),
+        );
+      }
+      if (
+        row.request_fingerprint !== $commandResultValue356147.fingerprint ||
+        row.request_json !== $commandResultValue356147.json
+      ) {
+        return Result.err(
+          new MiniLilacStoreOperationRejected({
+            operation: "getCommandResult",
+            message: `Command '${commandId}' was already used with a different payload`,
+          }),
+        );
+      }
+      if (row.result_json === null) {
+        return Result.err(
+          new MiniLilacStoreOperationRejected({
+            operation: "getCommandResult",
+            message: `Command '${commandId}' is pending`,
+          }),
+        );
+      }
+      const decoded = decodeMiniLilacSuperJsonPayload({
+        raw: row.result_json,
+        schemaVersion: MINI_LILAC_DATABASE_SCHEMA_VERSION,
+        recordId: commandId,
+        field: "command_result",
+      });
+      let $decodedResultValue358352!: import("better-result").InferOk<NonNullable<typeof decoded>>;
+      let $decodedResultError358352!: import("better-result").InferErr<NonNullable<typeof decoded>>;
+      const $decodedResultOk358352 = Result.match<
+        import("better-result").InferOk<NonNullable<typeof decoded>>,
+        import("better-result").InferErr<NonNullable<typeof decoded>>,
+        boolean
+      >(decoded, {
+        ok: (value) => {
+          $decodedResultValue358352 = value;
+          return true;
+        },
+        err: (error) => {
+          $decodedResultError358352 = error;
+          return false;
+        },
+      });
+      if (($decodedResultOk358352 ? "ok" : "error") === "error") {
+        this.queuePersistenceDiagnostic($decodedResultError358352);
+        return Result.err($decodedResultError358352);
+      }
+      return Result.ok($decodedResultValue358352.value);
+    });
   }
 
   reserveCommand(sessionId: string, commandId: string, request: StoredCommandRequest): void {
-    const command = canonicalCommandPayload(request.payload);
-    this.database
-      .query(
-        `INSERT INTO commands
-          (session_id, command_id, kind, run_id, request_fingerprint, request_json, side_effect_started, result_json, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, 0, NULL, ?)`,
-      )
-      .run(
-        sessionId,
-        commandId,
-        request.kind,
-        request.runId,
-        command.fingerprint,
-        command.json,
-        new Date().toISOString(),
-      );
+    storeResultToLegacy(this.reserveCommandResult(sessionId, commandId, request));
+  }
+
+  reserveCommandResult(
+    sessionId: string,
+    commandId: string,
+    request: StoredCommandRequest,
+  ): ResultType<void, MiniLilacStoreOperationRejected | MiniLilacSqliteDriverFailure> {
+    const command = decodeCanonicalStoredCommandRequest(request);
+    let $commandResultValue359146!: import("better-result").InferOk<NonNullable<typeof command>>;
+    let $commandResultError359146!: import("better-result").InferErr<NonNullable<typeof command>>;
+    const $commandResultOk359146 = Result.match<
+      import("better-result").InferOk<NonNullable<typeof command>>,
+      import("better-result").InferErr<NonNullable<typeof command>>,
+      boolean
+    >(command, {
+      ok: (value) => {
+        $commandResultValue359146 = value;
+        return true;
+      },
+      err: (error) => {
+        $commandResultError359146 = error;
+        return false;
+      },
+    });
+    if (($commandResultOk359146 ? "ok" : "error") === "error")
+      return Result.err($commandResultError359146);
+    return this.runHistoryReadResult("reserveCommand", () => {
+      this.database
+        .query(
+          `INSERT INTO commands
+            (session_id, command_id, kind, run_id, request_fingerprint, request_json, side_effect_started, result_json, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, 0, NULL, ?)`,
+        )
+        .run(
+          sessionId,
+          commandId,
+          $commandResultValue359146.kind,
+          $commandResultValue359146.runId,
+          $commandResultValue359146.fingerprint,
+          $commandResultValue359146.json,
+          new Date().toISOString(),
+        );
+      return Result.ok(undefined);
+    });
   }
 
   releaseCommand(sessionId: string, commandId: string, request: StoredCommandRequest): void {
-    const command = canonicalCommandPayload(request.payload);
-    this.database
-      .query(
-        `DELETE FROM commands
-         WHERE session_id = ? AND command_id = ? AND kind = ?
-           AND run_id IS ? AND request_fingerprint = ? AND request_json = ?
-           AND side_effect_started = 0 AND result_json IS NULL`,
-      )
-      .run(sessionId, commandId, request.kind, request.runId, command.fingerprint, command.json);
+    storeResultToLegacy(this.releaseCommandResult(sessionId, commandId, request));
+  }
+
+  releaseCommandResult(
+    sessionId: string,
+    commandId: string,
+    request: StoredCommandRequest,
+  ): ResultType<void, MiniLilacStoreOperationRejected | MiniLilacSqliteDriverFailure> {
+    const command = decodeCanonicalStoredCommandRequest(request);
+    let $commandResultValue360260!: import("better-result").InferOk<NonNullable<typeof command>>;
+    let $commandResultError360260!: import("better-result").InferErr<NonNullable<typeof command>>;
+    const $commandResultOk360260 = Result.match<
+      import("better-result").InferOk<NonNullable<typeof command>>,
+      import("better-result").InferErr<NonNullable<typeof command>>,
+      boolean
+    >(command, {
+      ok: (value) => {
+        $commandResultValue360260 = value;
+        return true;
+      },
+      err: (error) => {
+        $commandResultError360260 = error;
+        return false;
+      },
+    });
+    if (($commandResultOk360260 ? "ok" : "error") === "error")
+      return Result.err($commandResultError360260);
+    return this.runHistoryReadResult("releaseCommand", () => {
+      this.database
+        .query(
+          `DELETE FROM commands
+           WHERE session_id = ? AND command_id = ? AND kind = ?
+             AND run_id IS ? AND request_fingerprint = ? AND request_json = ?
+             AND side_effect_started = 0 AND result_json IS NULL`,
+        )
+        .run(
+          sessionId,
+          commandId,
+          $commandResultValue360260.kind,
+          $commandResultValue360260.runId,
+          $commandResultValue360260.fingerprint,
+          $commandResultValue360260.json,
+        );
+      return Result.ok(undefined);
+    });
   }
 
   markCommandSideEffectStarted(
@@ -6434,18 +13903,57 @@ export class MiniLilacSqliteStore {
     commandId: string,
     request: StoredCommandRequest,
   ): void {
-    const command = canonicalCommandPayload(request.payload);
-    const marked = this.database
-      .query(
-        `UPDATE commands SET side_effect_started = 1
-         WHERE session_id = ? AND command_id = ? AND kind = ?
-           AND run_id IS ? AND request_fingerprint = ? AND request_json = ?
-           AND side_effect_started = 0 AND result_json IS NULL`,
-      )
-      .run(sessionId, commandId, request.kind, request.runId, command.fingerprint, command.json);
-    if (marked.changes !== 1) {
-      throw new Error(`Command '${commandId}' could not begin its side effect`);
-    }
+    storeResultToLegacy(this.markCommandSideEffectStartedResult(sessionId, commandId, request));
+  }
+
+  markCommandSideEffectStartedResult(
+    sessionId: string,
+    commandId: string,
+    request: StoredCommandRequest,
+  ): ResultType<void, MiniLilacStoreOperationRejected | MiniLilacSqliteDriverFailure> {
+    const command = decodeCanonicalStoredCommandRequest(request);
+    let $commandResultValue361423!: import("better-result").InferOk<NonNullable<typeof command>>;
+    let $commandResultError361423!: import("better-result").InferErr<NonNullable<typeof command>>;
+    const $commandResultOk361423 = Result.match<
+      import("better-result").InferOk<NonNullable<typeof command>>,
+      import("better-result").InferErr<NonNullable<typeof command>>,
+      boolean
+    >(command, {
+      ok: (value) => {
+        $commandResultValue361423 = value;
+        return true;
+      },
+      err: (error) => {
+        $commandResultError361423 = error;
+        return false;
+      },
+    });
+    if (($commandResultOk361423 ? "ok" : "error") === "error")
+      return Result.err($commandResultError361423);
+    return this.runHistoryReadResult("markCommandSideEffectStarted", () => {
+      const marked = this.database
+        .query(
+          `UPDATE commands SET side_effect_started = 1
+           WHERE session_id = ? AND command_id = ? AND kind = ?
+             AND run_id IS ? AND request_fingerprint = ? AND request_json = ?
+             AND side_effect_started = 0 AND result_json IS NULL`,
+        )
+        .run(
+          sessionId,
+          commandId,
+          $commandResultValue361423.kind,
+          $commandResultValue361423.runId,
+          $commandResultValue361423.fingerprint,
+          $commandResultValue361423.json,
+        );
+      if (marked.changes === 1) return Result.ok(undefined);
+      return Result.err(
+        new MiniLilacStoreOperationRejected({
+          operation: "markCommandSideEffectStarted",
+          message: `Command '${commandId}' could not begin its side effect`,
+        }),
+      );
+    });
   }
 
   saveCommandResult(
@@ -6454,23 +13962,81 @@ export class MiniLilacSqliteStore {
     request: StoredCommandRequest,
     result: unknown,
   ): void {
-    const command = canonicalCommandPayload(request.payload);
-    const saved = this.database
-      .query(
-        `UPDATE commands SET result_json = ?
-         WHERE session_id = ? AND command_id = ? AND kind = ?
-           AND run_id IS ? AND request_fingerprint = ? AND request_json = ?
-           AND side_effect_started = 1 AND result_json IS NULL`,
-      )
-      .run(
-        serialize(result),
-        sessionId,
-        commandId,
-        request.kind,
-        request.runId,
-        command.fingerprint,
-        command.json,
+    storeResultToLegacy(this.saveCommandResultResult(sessionId, commandId, request, result));
+  }
+
+  saveCommandResultResult(
+    sessionId: string,
+    commandId: string,
+    request: StoredCommandRequest,
+    result: unknown,
+  ): ResultType<void, MiniLilacStoreOperationRejected | MiniLilacSqliteDriverFailure> {
+    const command = decodeCanonicalStoredCommandRequest(request);
+    let $commandResultValue362903!: import("better-result").InferOk<NonNullable<typeof command>>;
+    let $commandResultError362903!: import("better-result").InferErr<NonNullable<typeof command>>;
+    const $commandResultOk362903 = Result.match<
+      import("better-result").InferOk<NonNullable<typeof command>>,
+      import("better-result").InferErr<NonNullable<typeof command>>,
+      boolean
+    >(command, {
+      ok: (value) => {
+        $commandResultValue362903 = value;
+        return true;
+      },
+      err: (error) => {
+        $commandResultError362903 = error;
+        return false;
+      },
+    });
+    if (($commandResultOk362903 ? "ok" : "error") === "error")
+      return Result.err($commandResultError362903);
+    const serializedResult = serializeStoreValueResult(result, "saveCommandResult");
+    let $serializedResultResultValue363039!: import("better-result").InferOk<
+      NonNullable<typeof serializedResult>
+    >;
+    let $serializedResultResultError363039!: import("better-result").InferErr<
+      NonNullable<typeof serializedResult>
+    >;
+    const $serializedResultResultOk363039 = Result.match<
+      import("better-result").InferOk<NonNullable<typeof serializedResult>>,
+      import("better-result").InferErr<NonNullable<typeof serializedResult>>,
+      boolean
+    >(serializedResult, {
+      ok: (value) => {
+        $serializedResultResultValue363039 = value;
+        return true;
+      },
+      err: (error) => {
+        $serializedResultResultError363039 = error;
+        return false;
+      },
+    });
+    if (($serializedResultResultOk363039 ? "ok" : "error") === "error")
+      return Result.err($serializedResultResultError363039);
+    return this.runHistoryReadResult("saveCommandResult", () => {
+      const saved = this.database
+        .query(
+          `UPDATE commands SET result_json = ?
+           WHERE session_id = ? AND command_id = ? AND kind = ?
+             AND run_id IS ? AND request_fingerprint = ? AND request_json = ?
+             AND side_effect_started = 1 AND result_json IS NULL`,
+        )
+        .run(
+          $serializedResultResultValue363039,
+          sessionId,
+          commandId,
+          $commandResultValue362903.kind,
+          $commandResultValue362903.runId,
+          $commandResultValue362903.fingerprint,
+          $commandResultValue362903.json,
+        );
+      if (saved.changes === 1) return Result.ok(undefined);
+      return Result.err(
+        new MiniLilacStoreOperationRejected({
+          operation: "saveCommandResult",
+          message: `Command '${commandId}' result could not be saved`,
+        }),
       );
-    if (saved.changes !== 1) throw new Error(`Command '${commandId}' result could not be saved`);
+    });
   }
 }

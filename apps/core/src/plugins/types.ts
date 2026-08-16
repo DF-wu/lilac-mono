@@ -6,8 +6,7 @@ import type {
   ServerTool,
 } from "@stanley2058/lilac-plugin-runtime";
 
-import type { SurfaceAdapter } from "../surface/adapter";
-import type { SurfaceRefPlatform } from "../surface/types";
+import type { SurfaceAdapterResolver } from "../surface/runtime-descriptor";
 import type { DiscoveryService } from "../discovery/discovery-service";
 import type { ConversationThreadToolService } from "../conversation/thread-service";
 import type { DiscordSearchService } from "../surface/store/discord-search-store";
@@ -18,12 +17,12 @@ import type { WorkflowProgressCardService } from "../workflow/workflow-progress-
 import type { McpRegistryApi } from "../mcp/registry-types";
 import type { McpOAuthProviderService } from "../mcp/oauth-provider";
 import type { McpOAuthCallbackControl } from "../mcp/oauth-callback";
+import type { RegisteredSurfacePlatform } from "../surface/types";
 
 export type CoreToolPluginRuntime = {
   dataDir?: string;
   bus?: LilacBus;
-  adapter?: SurfaceAdapter;
-  surfaceAdapters?: ReadonlyMap<SurfaceRefPlatform, SurfaceAdapter>;
+  surfaceAdapterResolver?: SurfaceAdapterResolver;
   config?: CoreConfig;
   getConfig?: () => Promise<CoreConfig>;
   discovery?: DiscoveryService;
@@ -42,12 +41,15 @@ export type CoreToolPluginRuntime = {
 const BOUNDED_BUILTIN_OUTPUT = Symbol("bounded-builtin-output");
 const AGGREGATE_OUTPUT_BUDGET_EXEMPT = Symbol("aggregate-output-budget-exempt");
 
-export type CoreLevel1ToolSpec = Level1ToolSpec<CoreToolPluginRuntime> & {
+export type CoreLevel1ToolSpec = Level1ToolSpec<
+  CoreToolPluginRuntime,
+  RegisteredSurfacePlatform
+> & {
   [BOUNDED_BUILTIN_OUTPUT]?: true;
   [AGGREGATE_OUTPUT_BUDGET_EXEMPT]?: true;
 };
 
-export function markBoundedBuiltinOutput(spec: CoreLevel1ToolSpec): CoreLevel1ToolSpec {
+export function markBoundedBuiltinOutput<Spec extends CoreLevel1ToolSpec>(spec: Spec): Spec {
   return { ...spec, [BOUNDED_BUILTIN_OUTPUT]: true };
 }
 
@@ -55,7 +57,7 @@ export function hasBoundedBuiltinOutput(spec: CoreLevel1ToolSpec): boolean {
   return spec[BOUNDED_BUILTIN_OUTPUT] === true;
 }
 
-export function markAggregateOutputBudgetExempt(spec: CoreLevel1ToolSpec): CoreLevel1ToolSpec {
+export function markAggregateOutputBudgetExempt<Spec extends CoreLevel1ToolSpec>(spec: Spec): Spec {
   return { ...spec, [AGGREGATE_OUTPUT_BUDGET_EXEMPT]: true };
 }
 
@@ -63,4 +65,8 @@ export function isAggregateOutputBudgetExempt(spec: CoreLevel1ToolSpec): boolean
   return spec[AGGREGATE_OUTPUT_BUDGET_EXEMPT] === true;
 }
 
-export type CoreToolPlugin = LilacToolPlugin<CoreToolPluginRuntime, CoreLevel1ToolSpec, ServerTool>;
+export type CoreToolPlugin = LilacToolPlugin<
+  CoreToolPluginRuntime,
+  CoreLevel1ToolSpec,
+  ServerTool<RegisteredSurfacePlatform>
+>;

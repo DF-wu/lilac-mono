@@ -1,53 +1,45 @@
-import { asSchema } from "ai";
+import { asSchema, type FlexibleSchema } from "ai";
 import { z } from "zod";
-import type { Level1ToolSpec } from "@stanley2058/lilac-plugin-runtime";
+import {
+  getLevel1ContributionSnapshot,
+  invokeLevel1FormatArgs,
+  type Level1ContributionInfo,
+  type Level1ToolSpec,
+} from "@stanley2058/lilac-plugin-runtime";
+import { isRecord } from "@stanley2058/lilac-utils";
+import { Result } from "better-result";
 
+import { projectRuntimeError } from "../runtime/error-format";
 import { formatRemoteDisplayPath, parseSshCwdTarget } from "../ssh/ssh-cwd";
 import { bashInputSchema } from "./bash";
+import { preserveToolPanic } from "./tool-result-adapters";
 
-type ValidationResult<T> = { success: true; value: T } | { success: false; error: Error };
+function safeValidateSync(
+  schema: FlexibleSchema<unknown> | z.ZodType<unknown> | undefined,
+  value: unknown,
+): unknown | undefined {
+  const validated = Result.try({
+    try: () => {
+      if (schema instanceof z.ZodType) {
+        const result = schema.safeParse(value);
+        return result.success ? result.data : undefined;
+      }
 
-type ZodSafeParseResult<T> = { success: true; data: T } | { success: false; error: unknown };
-
-function isZodSchema(value: unknown): value is {
-  safeParse: (input: unknown) => ZodSafeParseResult<unknown>;
-} {
-  return (
-    !!value &&
-    typeof value === "object" &&
-    "safeParse" in value &&
-    typeof (value as { safeParse?: unknown }).safeParse === "function"
-  );
-}
-
-function isPromiseLike(value: unknown): value is PromiseLike<unknown> {
-  return (
-    !!value &&
-    (typeof value === "object" || typeof value === "function") &&
-    "then" in value &&
-    typeof (value as { then?: unknown }).then === "function"
-  );
-}
-
-function safeValidateSync<T>(schema: unknown, value: unknown): T | undefined {
-  try {
-    if (isZodSchema(schema)) {
-      const res = schema.safeParse(value);
-      return res.success ? (res.data as T) : undefined;
-    }
-
-    const s = asSchema(schema as never);
-    const validate = (s as unknown as { validate?: unknown }).validate;
-    if (typeof validate !== "function") return undefined;
-
-    const res = (validate as (v: unknown) => unknown)(value);
-    if (isPromiseLike(res)) return undefined;
-
-    const parsed = res as ValidationResult<T>;
-    return parsed.success ? parsed.value : undefined;
-  } catch {
-    return undefined;
-  }
+      const validate = asSchema(schema).validate;
+      if (!validate) return undefined;
+      const result = validate(value);
+      if ("then" in result) return undefined;
+      return result.success ? result.value : undefined;
+    },
+    catch: projectRuntimeError("Opaque tool argument validation failure"),
+  });
+  return validated.match({
+    ok: (value) => () => value,
+    err: (error) => () => {
+      preserveToolPanic(error);
+      return undefined;
+    },
+  })();
 }
 
 function truncateEnd(input: string, maxLen: number): string {
@@ -103,7 +95,7 @@ function parseApplyPatchPathsFromPatchText(patchText: string): string[] {
   return out;
 }
 
-export type ToolArgsFormatter = (args: unknown) => string;
+export type ToolArgsFormatter = NonNullable<Level1ToolSpec<unknown>["formatArgs"]>;
 
 const DISPLAY_MAX_LEN = 30;
 const PATH_HEAD_LEN = 14;
@@ -135,48 +127,39 @@ function normalizeRemoteCwdDisplay(input: string): string {
   return normalized;
 }
 
-function getRecord(value: unknown): Record<string, unknown> | null {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
-  return value as Record<string, unknown>;
-}
-
 function getPathArg(value: unknown): string | null {
-  const record = getRecord(value);
-  return record && typeof record["path"] === "string" ? record["path"] : null;
+  return isRecord(value) && typeof value["path"] === "string" ? value["path"] : null;
 }
 
 function getGlobArgs(value: unknown): { patterns: string[]; cwd?: string } | null {
-  const record = getRecord(value);
-  if (!record) return null;
-  const rawPatterns = record["patterns"];
+  if (!isRecord(value)) return null;
+  const rawPatterns = value["patterns"];
   if (!Array.isArray(rawPatterns)) return null;
   const patterns = rawPatterns.filter((item): item is string => typeof item === "string");
   if (patterns.length === 0) return null;
   return {
     patterns,
-    cwd: typeof record["cwd"] === "string" ? record["cwd"] : undefined,
+    cwd: typeof value["cwd"] === "string" ? value["cwd"] : undefined,
   };
 }
 
-function getGrepArgs(value: unknown): { pattern: string; cwd?: string } | null {
-  const record = getRecord(value);
-  if (!record || typeof record["pattern"] !== "string") return null;
+function getGrepArgs(value: unknown): { pattern: string; path?: string } | null {
+  if (!isRecord(value) || typeof value["pattern"] !== "string") return null;
   return {
-    pattern: record["pattern"],
-    cwd: typeof record["cwd"] === "string" ? record["cwd"] : undefined,
+    pattern: value["pattern"],
+    path: typeof value["path"] === "string" ? value["path"] : undefined,
   };
 }
 
 function getFuzzySearchArgs(value: unknown): { query: string; cwd?: string } | null {
-  const record = getRecord(value);
-  if (!record || typeof record["query"] !== "string") return null;
+  if (!isRecord(value) || typeof value["query"] !== "string") return null;
   return {
-    query: record["query"],
-    cwd: typeof record["cwd"] === "string" ? record["cwd"] : undefined,
+    query: value["query"],
+    cwd: typeof value["cwd"] === "string" ? value["cwd"] : undefined,
   };
 }
 
-const readFileToolArgsFormatter: ToolArgsFormatter = (args) => {
+export const formatReadFileToolArgs: ToolArgsFormatter = (args) => {
   const parsedPath = getPathArg(args);
   if (!parsedPath) return "";
 
@@ -185,122 +168,125 @@ const readFileToolArgsFormatter: ToolArgsFormatter = (args) => {
   return " " + truncateMiddle(p, PATH_HEAD_LEN, PATH_TAIL_LEN, DISPLAY_MAX_LEN);
 };
 
-export const BUILTIN_LEVEL1_TOOL_ARGS_FORMATTERS: Record<string, ToolArgsFormatter> = {
-  bash: (args) => {
-    const parsed = safeValidateSync<{ command: string; cwd?: string }>(bashInputSchema, args);
-    if (!parsed) return "";
+export const formatBashToolArgs: ToolArgsFormatter = (args) => {
+  const parsed = safeValidateSync(bashInputSchema, args);
+  if (!isRecord(parsed) || typeof parsed["command"] !== "string") return "";
 
-    const cmd = parsed.command.replace(/\s+/g, " ").trim();
-    if (!cmd) return "";
+  const cmd = parsed["command"].replace(/\s+/g, " ").trim();
+  if (!cmd) return "";
 
-    const cwd = (parsed.cwd ?? "").trim();
-    const cwdTarget = parseSshCwdTarget(cwd);
-    const display =
-      cwdTarget.kind === "ssh"
-        ? `${formatRemoteDisplayPath(cwdTarget.host, cwdTarget.cwd)} ${cmd}`
-        : cmd;
+  const cwd = (typeof parsed["cwd"] === "string" ? parsed["cwd"] : "").trim();
+  const cwdTarget = parseSshCwdTarget(cwd);
+  const display =
+    cwdTarget.kind === "ssh"
+      ? `${formatRemoteDisplayPath(cwdTarget.host, cwdTarget.cwd)} ${cmd}`
+      : cmd;
 
-    return " " + truncateEnd(display, DISPLAY_MAX_LEN);
-  },
+  return " " + truncateEnd(display, DISPLAY_MAX_LEN);
+};
 
-  read_file: readFileToolArgsFormatter,
+export const formatGlobToolArgs: ToolArgsFormatter = (args) => {
+  const parsed = getGlobArgs(args);
+  if (!parsed) return "";
 
-  // Back-compat for older transcripts / callers.
-  readFile: readFileToolArgsFormatter,
+  const joinedPatterns = parsed.patterns
+    .map((p) => p.trim())
+    .filter(Boolean)
+    .join(",");
+  if (!joinedPatterns) return "";
 
-  glob: (args) => {
-    const parsed = getGlobArgs(args);
-    if (!parsed) return "";
+  const cwd = normalizeRemoteCwdDisplay(parsed.cwd ?? "");
+  const raw = cwd ? `${joinedPatterns} ${cwd}` : joinedPatterns;
+  const display = raw.replace(/\s+/g, " ").trim();
+  return " " + truncateEnd(display, DISPLAY_MAX_LEN);
+};
 
-    const joinedPatterns = parsed.patterns
-      .map((p) => p.trim())
-      .filter(Boolean)
-      .join(",");
-    if (!joinedPatterns) return "";
+export const formatGrepToolArgs: ToolArgsFormatter = (args) => {
+  const parsed = getGrepArgs(args);
+  if (!parsed) return "";
 
-    const cwd = normalizeRemoteCwdDisplay(parsed.cwd ?? "");
-    const raw = cwd ? `${joinedPatterns} ${cwd}` : joinedPatterns;
-    const display = raw.replace(/\s+/g, " ").trim();
-    return " " + truncateEnd(display, DISPLAY_MAX_LEN);
-  },
+  const pattern = parsed.pattern.replace(/\s+/g, " ").trim();
+  if (!pattern) return "";
 
-  grep: (args) => {
-    const parsed = getGrepArgs(args);
-    if (!parsed) return "";
+  const target = (
+    parsed.path?.startsWith("tool-result://")
+      ? parsed.path
+      : normalizeRemoteCwdDisplay(parsed.path ?? "")
+  )
+    .replace(/\s+/g, " ")
+    .trim();
+  const raw = target ? `${pattern} ${target}` : pattern;
+  return " " + truncateEnd(raw, DISPLAY_MAX_LEN);
+};
 
-    const pattern = parsed.pattern.replace(/\s+/g, " ").trim();
-    if (!pattern) return "";
+export const formatFuzzySearchToolArgs: ToolArgsFormatter = (args) => {
+  const parsed = getFuzzySearchArgs(args);
+  if (!parsed) return "";
 
-    const cwd = normalizeRemoteCwdDisplay(parsed.cwd ?? "")
-      .replace(/\s+/g, " ")
-      .trim();
-    const raw = cwd ? `${pattern} ${cwd}` : pattern;
-    return " " + truncateEnd(raw, DISPLAY_MAX_LEN);
-  },
+  const query = parsed.query.replace(/\s+/g, " ").trim();
+  if (!query) return "";
 
-  fuzzy_search: (args) => {
-    const parsed = getFuzzySearchArgs(args);
-    if (!parsed) return "";
+  const cwd = normalizeRemoteCwdDisplay(parsed.cwd ?? "")
+    .replace(/\s+/g, " ")
+    .trim();
+  const raw = cwd ? `${query} ${cwd}` : query;
+  return " " + truncateEnd(raw, DISPLAY_MAX_LEN);
+};
 
-    const query = parsed.query.replace(/\s+/g, " ").trim();
-    if (!query) return "";
+export const formatSubagentDelegateToolArgs: ToolArgsFormatter = (args) => {
+  const parsed = safeValidateSync(subagentDelegateArgsSchema, args);
+  if (!isRecord(parsed) || typeof parsed["task"] !== "string") return "";
+  const task = parsed["task"].replace(/\s+/g, " ").trim();
+  if (!task) return "";
+  const profile = typeof parsed["profile"] === "string" ? parsed["profile"] : "explore";
+  return " " + truncateEnd(`(${profile}) ${task}`, DISPLAY_MAX_LEN);
+};
 
-    const cwd = normalizeRemoteCwdDisplay(parsed.cwd ?? "")
-      .replace(/\s+/g, " ")
-      .trim();
-    const raw = cwd ? `${query} ${cwd}` : query;
-    return " " + truncateEnd(raw, DISPLAY_MAX_LEN);
-  },
+export const formatApplyPatchToolArgs: ToolArgsFormatter = (args) => {
+  const localParsed = safeValidateSync(localApplyPatchArgsSchema, args);
+  if (!isRecord(localParsed) || typeof localParsed["patchText"] !== "string") return "";
 
-  subagent_delegate: (args) => {
-    const parsed = safeValidateSync<{ profile?: "explore" | "general" | "self"; task: string }>(
-      subagentDelegateArgsSchema,
-      args,
-    );
-    if (!parsed) return "";
-    const task = parsed.task.replace(/\s+/g, " ").trim();
-    if (!task) return "";
-    return " " + truncateEnd(`(${parsed.profile ?? "explore"}) ${task}`, DISPLAY_MAX_LEN);
-  },
+  const paths = parseApplyPatchPathsFromPatchText(localParsed["patchText"]);
+  const first = (paths[0] ?? "").trim();
+  if (!first) return "";
 
-  apply_patch: (args) => {
-    const localParsed = safeValidateSync<{ patchText: string }>(localApplyPatchArgsSchema, args);
-    if (!localParsed) return "";
+  const remaining = Math.max(0, paths.length - 1);
+  const suffix = remaining > 0 ? ` (+${remaining})` : "";
+  return " " + truncateMiddle(first, PATH_HEAD_LEN, PATH_TAIL_LEN, DISPLAY_MAX_LEN) + suffix;
+};
 
-    const paths = parseApplyPatchPathsFromPatchText(localParsed.patchText);
-    const first = (paths[0] ?? "").trim();
-    if (!first) return "";
+export const formatEditFileToolArgs: ToolArgsFormatter = (args) => {
+  const parsedPath = getPathArg(args);
+  if (!parsedPath) return "";
 
-    const remaining = Math.max(0, paths.length - 1);
-    const suffix = remaining > 0 ? ` (+${remaining})` : "";
-    return " " + truncateMiddle(first, PATH_HEAD_LEN, PATH_TAIL_LEN, DISPLAY_MAX_LEN) + suffix;
-  },
+  const p = normalizeRemoteDisplay(parsedPath);
+  if (!p) return "";
+  return " " + truncateMiddle(p, PATH_HEAD_LEN, PATH_TAIL_LEN, DISPLAY_MAX_LEN);
+};
 
-  edit_file: (args) => {
-    const parsedPath = getPathArg(args);
-    if (!parsedPath) return "";
+export const formatBatchToolArgs: ToolArgsFormatter = (args) => {
+  const parsed = safeValidateSync(batchArgsSchema, args);
+  if (!isRecord(parsed) || !Array.isArray(parsed["tool_calls"])) return "";
 
-    const p = normalizeRemoteDisplay(parsedPath);
-    if (!p) return "";
-    return " " + truncateMiddle(p, PATH_HEAD_LEN, PATH_TAIL_LEN, DISPLAY_MAX_LEN);
-  },
-
-  batch: (args) => {
-    const parsed = safeValidateSync<{ tool_calls: unknown[] }>(batchArgsSchema, args);
-    if (!parsed) return "";
-
-    const n = parsed.tool_calls.length;
-    if (!Number.isFinite(n) || n <= 0) return "";
-    return ` (${n} tools)`;
-  },
+  const n = parsed["tool_calls"].length;
+  if (!Number.isFinite(n) || n <= 0) return "";
+  return ` (${n} tools)`;
 };
 
 export function formatToolArgsForDisplay(toolName: string, args: unknown): string {
-  const f = BUILTIN_LEVEL1_TOOL_ARGS_FORMATTERS[toolName];
-  try {
-    return f ? f(args) : "";
-  } catch {
-    return "";
+  switch (toolName) {
+    case "read":
+    case "read_file":
+    case "readFile":
+      return formatReadFileToolArgs(args);
+    case "edit":
+    case "edit_file":
+      return formatEditFileToolArgs(args);
+    case "patch":
+    case "apply_patch":
+      return formatApplyPatchToolArgs(args);
+    default:
+      return "";
   }
 }
 
@@ -308,21 +294,26 @@ export function formatToolArgsForDisplayWithSpecs(
   toolName: string,
   args: unknown,
   toolSpecs?: ReadonlyMap<string, Level1ToolSpec<unknown>>,
+  contributionInfo?: ReadonlyMap<Level1ToolSpec<unknown>, Level1ContributionInfo>,
 ): string {
   const spec = toolSpecs?.get(toolName);
-  if (spec?.formatArgs) {
-    try {
-      return spec.formatArgs(args);
-    } catch {
-      return "";
-    }
+  if (spec) {
+    const contribution = contributionInfo?.get(spec) ??
+      getLevel1ContributionSnapshot(spec) ?? {
+        pluginId: `level1:${toolName}`,
+        source: "builtin",
+      };
+    const formatted = invokeLevel1FormatArgs({
+      pluginId: contribution.pluginId,
+      source: contribution.source,
+      spec,
+      args,
+    });
+    return formatted.match({
+      ok: (value) => value ?? "",
+      err: () => "",
+    });
   }
 
-  const f = BUILTIN_LEVEL1_TOOL_ARGS_FORMATTERS[toolName];
-  if (!f) return "";
-  try {
-    return f(args);
-  } catch {
-    return "";
-  }
+  return formatToolArgsForDisplay(toolName, args);
 }

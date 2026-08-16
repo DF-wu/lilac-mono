@@ -3,20 +3,24 @@ import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
 import {
   createClaudeCode,
-  type ClaudeCodeSettings,
   type SpawnedProcess,
   type SpawnOptions,
 } from "ai-sdk-provider-claude-code";
+import { Panic } from "better-result";
 
 import {
   ClaudeNativeSessionPreflightError,
   materializeClaudeCodeRun,
+  projectClaudeSdkMessage,
   type ClaudeNativeSessionLifecycle,
   type MaterializedClaudeCodeRun,
 } from "../claude-code-run";
 
 const SOURCE_ID = "11111111-1111-4111-8111-111111111111";
 const CANDIDATE_ID = "22222222-2222-4222-8222-222222222222";
+type ClaudeCodeSettings = Parameters<
+  NonNullable<Parameters<typeof materializeClaudeCodeRun>[0]["createModel"]>
+>[1];
 
 class FakeSpawnedProcess extends EventEmitter implements SpawnedProcess {
   readonly stdin = new PassThrough();
@@ -43,20 +47,26 @@ function createModelCapture(settings: ClaudeCodeSettings[]) {
   };
 }
 
-async function emitSdkMessage(settings: ClaudeCodeSettings, message: unknown): Promise<void> {
+async function emitSdkMessage(settings: ClaudeCodeSettings, message: object): Promise<void> {
   const callback = settings.onSdkMessage;
   if (!callback) throw new Error("onSdkMessage was not installed");
-  await Reflect.apply(callback, undefined, [message]);
+  await callback(message);
 }
 
 async function runStopHook(settings: ClaudeCodeSettings): Promise<void> {
   const callback = settings.hooks?.Stop?.[0]?.hooks[0];
   if (!callback) throw new Error("Stop hook was not installed");
-  await Reflect.apply(callback, undefined, [
-    { hook_event_name: "Stop" },
+  await callback(
+    {
+      session_id: CANDIDATE_ID,
+      transcript_path: "/tmp/claude-test-transcript.jsonl",
+      cwd: process.cwd(),
+      hook_event_name: "Stop",
+      stop_hook_active: false,
+    },
     undefined,
     { signal: new AbortController().signal },
-  ]);
+  );
 }
 
 function spawnTrackedProcess(settings: ClaudeCodeSettings, cwd: string): SpawnedProcess {
@@ -81,26 +91,24 @@ async function emitQueryController(
 ): Promise<void> {
   const callback = settings.onQueryControllerCreated;
   if (!callback) throw new Error("onQueryControllerCreated was not installed");
-  await Reflect.apply(callback, undefined, [
-    {
-      rawQuery: {
-        return: async () => {
-          await options.returnQuery();
-          return { done: true, value: undefined };
-        },
+  await callback({
+    rawQuery: {
+      return: async () => {
+        await options.returnQuery();
+        return { done: true, value: undefined };
       },
-      getContextUsage:
-        options.getContextUsage ?? (async () => ({ totalTokens: 700, maxTokens: 100_000 })),
-      interrupt: async () => undefined,
     },
-  ]);
+    getContextUsage:
+      options.getContextUsage ?? (async () => ({ totalTokens: 700, maxTokens: 100_000 })),
+    interrupt: async () => undefined,
+  });
 }
 
-function successfulInit(sessionId: string, model = "claude-sonnet-4-6"): unknown {
+function successfulInit(sessionId: string, model = "claude-sonnet-4-6"): object {
   return { type: "system", subtype: "init", session_id: sessionId, model };
 }
 
-function successfulResult(sessionId: string): unknown {
+function successfulResult(sessionId: string): object {
   return { type: "result", subtype: "success", session_id: sessionId };
 }
 
@@ -110,6 +118,18 @@ function nativeSession(run: MaterializedClaudeCodeRun): ClaudeNativeSessionLifec
 }
 
 describe("Claude native session lifecycle", () => {
+  it("projects future SDK protocol variants to the closed unsupported fallback", () => {
+    expect(projectClaudeSdkMessage({ type: "future-event", payload: { version: 2 } })).toEqual({
+      kind: "unsupported",
+    });
+    expect(projectClaudeSdkMessage({ type: "system", subtype: "future-system-event" })).toEqual({
+      kind: "unsupported",
+    });
+    expect(projectClaudeSdkMessage(Symbol("invalid SDK message"))).toMatchObject({
+      kind: "invalid",
+    });
+  });
+
   it("keeps omitted session mode ephemeral and rejects ephemeral finalization", async () => {
     const settings: ClaudeCodeSettings[] = [];
     const run = await materializeClaudeCodeRun({
@@ -567,6 +587,11 @@ describe("Claude native session lifecycle", () => {
         "Claude run disposal could not prove clean settlement",
       );
       await expect(run.dispose()).rejects.toBeInstanceOf(AggregateError);
+      const cleanup = await run.disposeResult();
+      expect(cleanup.status).toBe("error");
+      if (cleanup.status === "error") {
+        expect(cleanup.error._tag).toBe("ClaudeCodeRunCleanupFailed");
+      }
       expect(injectorClosed).toBe(true);
       expect(closeSpy).toHaveBeenCalledTimes(1);
       expect(metadataReads).toBe(0);
@@ -574,6 +599,74 @@ describe("Claude native session lifecycle", () => {
       closeSpy.mockRestore();
     }
   });
+
+  for (const operation of ["dispose", "finalize"] as const) {
+    it(`attempts all cleanup and preserves the first Panic during ${operation}`, async () => {
+      const settings: ClaudeCodeSettings[] = [];
+      const observer = Promise.withResolvers<void>();
+      const observerPanic = new Panic({ message: `${operation} observer panic` });
+      const clearPanic = new Panic({ message: `${operation} clear panic` });
+      const bridgePanic = new Panic({ message: `${operation} bridge panic` });
+      const events: string[] = [];
+      const run = await materializeClaudeCodeRun({
+        modelId: "sonnet",
+        cwd: process.cwd(),
+        tools: {},
+        nativeSession: { mode: "fresh", sessionId: CANDIDATE_ID },
+        execute: () => {
+          throw new Error("not called");
+        },
+        controller: {
+          getContextUsage: async () => ({ totalTokens: 1, maxTokens: 10 }),
+          interrupt: async () => undefined,
+          settle: async () => {
+            events.push("query-settled");
+          },
+        },
+        onSdkMessage: () => observer.promise,
+        createModel: createModelCapture(settings),
+      });
+      const agentSettings = settings[0];
+      if (!agentSettings) throw new Error("agent settings were not captured");
+      const mcp = agentSettings.mcpServers?.["lilac"];
+      if (mcp?.type !== "sdk") throw new Error("Lilac SDK MCP server was not installed");
+      const closeSpy = spyOn(mcp.instance, "close").mockImplementation(async () => {
+        events.push("bridge-closed");
+        throw bridgePanic;
+      });
+      try {
+        agentSettings.onStreamStart?.({
+          inject: () => undefined,
+          close: () => {
+            events.push("first-injector-closed");
+            throw clearPanic;
+          },
+        });
+        agentSettings.onStreamStart?.({
+          inject: () => undefined,
+          close: () => {
+            events.push("later-injector-closed");
+          },
+        });
+        await emitSdkMessage(agentSettings, successfulInit(CANDIDATE_ID));
+
+        const cleanup =
+          operation === "dispose" ? run.disposeResult() : nativeSession(run).finalizeResult();
+        observer.reject(observerPanic);
+
+        await expect(cleanup).rejects.toBe(observerPanic);
+        expect(events).toEqual([
+          "first-injector-closed",
+          "later-injector-closed",
+          "query-settled",
+          "bridge-closed",
+        ]);
+        expect(closeSpy).toHaveBeenCalledTimes(1);
+      } finally {
+        closeSpy.mockRestore();
+      }
+    });
+  }
 
   it("attempts every injector and controller after a synchronous settle throw", async () => {
     const settings: ClaudeCodeSettings[] = [];
@@ -610,6 +703,10 @@ describe("Claude native session lifecycle", () => {
     if (mcp?.type !== "sdk") throw new Error("Lilac SDK MCP server was not installed");
     const closeSpy = spyOn(mcp.instance, "close");
     try {
+      closeSpy.mockImplementation(async () => {
+        events.push("bridge-close");
+        throw new Error("bridge cleanup failure");
+      });
       agentSettings.onStreamStart?.({
         inject: () => undefined,
         close: () => {
@@ -645,9 +742,19 @@ describe("Claude native session lifecycle", () => {
         "later-injector-close",
         "injected-settle",
         "runtime-settle",
+        "bridge-close",
       ]);
       expect(closeSpy).toHaveBeenCalledTimes(1);
       expect(metadataReads).toBe(0);
+      const cleanup = await run.disposeResult();
+      expect(cleanup.status).toBe("error");
+      if (cleanup.status === "error") {
+        expect(cleanup.error.failures.map(({ operation }) => operation)).toEqual([
+          "Claude message injector close",
+          "Claude query settlement",
+          "Claude MCP bridge cleanup",
+        ]);
+      }
     } finally {
       closeSpy.mockRestore();
     }

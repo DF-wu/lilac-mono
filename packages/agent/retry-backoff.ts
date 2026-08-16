@@ -1,5 +1,9 @@
 import { setTimeout as sleep } from "node:timers/promises";
 
+import { Result, TaggedError, type Result as ResultType } from "better-result";
+
+import { rethrowAgentPanic } from "./failure-adapters";
+
 export type RetryBackoffConfig = {
   enabled: boolean;
   maxRetries: number;
@@ -14,8 +18,20 @@ export type RetryBackoffAttempt = {
 
 export type RetryBackoffBudget = {
   readonly attempts: number;
-  next(abortSignal?: AbortSignal): Promise<RetryBackoffAttempt | null>;
+  next(
+    abortSignal?: AbortSignal,
+  ): Promise<ResultType<RetryBackoffAttempt | null, RetryBackoffAborted | RetryBackoffDelayFailed>>;
 };
+
+export class RetryBackoffAborted extends TaggedError("RetryBackoffAborted")<{
+  readonly cause: unknown;
+  readonly message: string;
+}> {}
+
+export class RetryBackoffDelayFailed extends TaggedError("RetryBackoffDelayFailed")<{
+  readonly cause: unknown;
+  readonly message: string;
+}> {}
 
 export function computeRetryBackoffDelayMs(params: {
   attempt: number;
@@ -37,7 +53,7 @@ export function createRetryBackoffBudget(retry: RetryBackoffConfig): RetryBackof
       return attempts;
     },
     async next(abortSignal) {
-      if (!retry.enabled || attempts >= Math.max(0, retry.maxRetries)) return null;
+      if (!retry.enabled || attempts >= Math.max(0, retry.maxRetries)) return Result.ok(null);
 
       attempts += 1;
       const delayMs = computeRetryBackoffDelayMs({
@@ -50,10 +66,24 @@ export function createRetryBackoffBudget(retry: RetryBackoffConfig): RetryBackof
         else abortSignal?.throwIfAborted();
       } catch (error) {
         attempts -= 1;
-        throw error;
+        rethrowAgentPanic(error);
+        if (!abortSignal?.aborted) {
+          return Result.err(
+            new RetryBackoffDelayFailed({
+              cause: error,
+              message: "Retry backoff delay failed",
+            }),
+          );
+        }
+        return Result.err(
+          new RetryBackoffAborted({
+            cause: error,
+            message: "Retry backoff was aborted",
+          }),
+        );
       }
 
-      return { attempt: attempts, delayMs };
+      return Result.ok({ attempt: attempts, delayMs });
     },
   };
 }

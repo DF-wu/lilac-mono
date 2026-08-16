@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import * as fs from "node:fs/promises";
 import path from "node:path";
 
+import { Panic, Result, TaggedError, type Result as ResultType } from "better-result";
 import { z } from "zod";
 
 import {
@@ -11,31 +12,109 @@ import {
   type UniversalMcpConfig,
 } from "./config-types";
 import { mcpServerIdSchema, parseMcpConfigYaml, serializeMcpConfigYaml } from "./config";
+import { opaqueErrorMessage, rethrowPanic } from "./error-format";
 
 const errorCodeSchema = z.object({ code: z.string() });
 const mutationQueues = new Map<string, Promise<void>>();
 
-export class McpConfigError extends Error {
+type McpConfigFileOperation =
+  | "create_parent"
+  | "open_temporary"
+  | "write_temporary"
+  | "sync_temporary"
+  | "close_temporary"
+  | "rename_temporary"
+  | "remove_temporary";
+
+type McpConfigFileHandle = Pick<
+  Awaited<ReturnType<typeof fs.open>>,
+  "writeFile" | "sync" | "close"
+>;
+
+export type McpConfigFileDependencies = {
+  readonly mkdir: typeof fs.mkdir;
+  readonly open: (filePath: string, flags: string, mode: number) => Promise<McpConfigFileHandle>;
+  readonly rename: typeof fs.rename;
+  readonly rm: typeof fs.rm;
+  readonly randomUUID: () => string;
+};
+
+const DEFAULT_FILE_DEPENDENCIES: McpConfigFileDependencies = {
+  mkdir: fs.mkdir,
+  open: fs.open,
+  rename: fs.rename,
+  rm: fs.rm,
+  randomUUID,
+};
+
+export class McpConfigError extends TaggedError("McpConfigError")<{
   readonly configPath: string;
   readonly issues: readonly string[];
-
-  constructor(options: { configPath: string; issues: readonly string[] }) {
-    super(
-      `Invalid MCP configuration at ${options.configPath}:\n${options.issues
+  readonly cause?: unknown;
+  readonly message: string;
+}> {
+  constructor(options: {
+    readonly configPath: string;
+    readonly issues: readonly string[];
+    readonly cause?: unknown;
+  }) {
+    super({
+      ...options,
+      message: `Invalid MCP configuration at ${options.configPath}:\n${options.issues
         .map((issue) => `  - ${issue}`)
         .join("\n")}`,
-    );
-    this.name = "McpConfigError";
-    this.configPath = options.configPath;
-    this.issues = options.issues;
+    });
   }
 }
+
+export class McpConfigSerializationError extends TaggedError("McpConfigSerializationError")<{
+  readonly configPath: string;
+  readonly cause: unknown;
+  readonly message: string;
+}> {}
+
+export class McpConfigMutationValidationError extends TaggedError(
+  "McpConfigMutationValidationError",
+)<{
+  readonly configPath: string;
+  readonly serverId: string;
+  readonly issues: readonly string[];
+  readonly message: string;
+}> {}
+
+export class McpConfigFileOperationError extends TaggedError("McpConfigFileOperationError")<{
+  readonly configPath: string;
+  readonly operation: McpConfigFileOperation;
+  readonly cause: unknown;
+  readonly message: string;
+}> {}
+
+export class McpConfigFileOperationAndCleanupError extends TaggedError(
+  "McpConfigFileOperationAndCleanupError",
+)<{
+  readonly configPath: string;
+  readonly primary: McpConfigWriteError;
+  readonly cleanup: McpConfigFileOperationError;
+  readonly message: string;
+}> {}
+
+export type McpConfigReadError = McpConfigError;
+export type McpConfigWriteError =
+  | McpConfigSerializationError
+  | McpConfigFileOperationError
+  | McpConfigFileOperationAndCleanupError;
+export type McpConfigMutationError =
+  | McpConfigReadError
+  | McpConfigMutationValidationError
+  | McpConfigWriteError;
 
 export type McpConfigFileSnapshot = {
   readonly configPath: string;
   readonly exists: boolean;
   readonly config: UniversalMcpConfig;
 };
+
+export type McpConfigFileResult = ResultType<McpConfigFileSnapshot, McpConfigReadError>;
 
 export type McpConfigMutation =
   | { readonly type: "upsert"; readonly server: McpServerDefinition }
@@ -53,13 +132,17 @@ function isMissingFileError(error: unknown): boolean {
   return parsed.success && (parsed.data.code === "ENOENT" || parsed.data.code === "ENOTDIR");
 }
 
-function enqueueMutation<T>(configPath: string, operation: () => Promise<T>): Promise<T> {
+function enqueueMutation<T, E>(
+  configPath: string,
+  operation: () => Promise<ResultType<T, E>>,
+): Promise<ResultType<T, E>> {
   const previous = mutationQueues.get(configPath) ?? Promise.resolve();
   const result = previous.then(operation);
-  const settled = result.then(
-    () => undefined,
-    () => undefined,
-  );
+  const observed = Result.tryPromise({
+    try: () => result,
+    catch: () => new Error("MCP configuration mutation queue operation rejected"),
+  });
+  const settled = observed.then(() => undefined);
   mutationQueues.set(configPath, settled);
 
   return result.finally(() => {
@@ -67,54 +150,255 @@ function enqueueMutation<T>(configPath: string, operation: () => Promise<T>): Pr
   });
 }
 
+async function captureFileOperation<T>(options: {
+  readonly configPath: string;
+  readonly operation: McpConfigFileOperation;
+  readonly run: () => Promise<T>;
+}): Promise<ResultType<T, McpConfigFileOperationError>> {
+  try {
+    return Result.ok(await options.run());
+  } catch (cause) {
+    rethrowPanic(cause);
+    return Result.err(
+      new McpConfigFileOperationError({
+        configPath: options.configPath,
+        operation: options.operation,
+        cause,
+        message: `Failed to ${options.operation.replaceAll("_", " ")} for MCP configuration at ${options.configPath}: ${opaqueErrorMessage(cause)}`,
+      }),
+    );
+  }
+}
+
+async function superviseMcpConfigFilePanicCleanup<T>(
+  operation: () => Promise<T>,
+  cleanup: () => Promise<void>,
+): Promise<T> {
+  try {
+    return await operation();
+  } catch (cause) {
+    if (!Panic.is(cause)) throw cause;
+    try {
+      await cleanup();
+    } catch {
+      throw cause;
+    }
+    throw cause;
+  }
+}
+
+function serializeConfig(
+  configPath: string,
+  config: UniversalMcpConfig,
+): ResultType<string, McpConfigSerializationError> {
+  return Result.try({
+    try: () => serializeMcpConfigYaml(config),
+    catch: (cause) => {
+      rethrowPanic(cause);
+      return new McpConfigSerializationError({
+        configPath,
+        cause,
+        message: `Failed to serialize MCP configuration at ${configPath}: ${opaqueErrorMessage(cause)}`,
+      });
+    },
+  });
+}
+
+function combineOperationAndCleanup(
+  configPath: string,
+  primary: ResultType<void, McpConfigWriteError>,
+  cleanup: ResultType<void, McpConfigFileOperationError>,
+): ResultType<void, McpConfigWriteError> {
+  return primary.match<ResultType<void, McpConfigWriteError>>({
+    ok: () => cleanup,
+    err: (primaryError) =>
+      cleanup.match<ResultType<void, McpConfigWriteError>>({
+        ok: () => Result.err(primaryError),
+        err: (cleanupError) =>
+          Result.err(
+            new McpConfigFileOperationAndCleanupError({
+              configPath,
+              primary: primaryError,
+              cleanup: cleanupError,
+              message: `${primaryError.message}; cleanup also failed: ${cleanupError.message}`,
+            }),
+          ),
+      }),
+  });
+}
+
+function validateMutationServerId(
+  configPath: string,
+  serverId: string,
+): ResultType<void, McpConfigMutationValidationError> {
+  const parsed = mcpServerIdSchema.safeParse(serverId);
+  if (parsed.success) return Result.ok();
+  const issues = parsed.error.issues.map((issue) => issue.message);
+  return Result.err(
+    new McpConfigMutationValidationError({
+      configPath,
+      serverId,
+      issues,
+      message: `Invalid MCP server ID ${JSON.stringify(serverId)}: ${issues.join("; ")}`,
+    }),
+  );
+}
+
 export function resolveMcpConfigPath(options: { dataDir: string }): string {
   return path.join(options.dataDir, MCP_CONFIG_FILE_NAME);
 }
 
-export async function readMcpConfigFile(configPath: string): Promise<McpConfigFileSnapshot> {
+export async function readMcpConfigFile(configPath: string): Promise<McpConfigFileResult> {
   let source: string;
   try {
     source = await fs.readFile(configPath, "utf8");
-  } catch (error) {
-    if (isMissingFileError(error)) {
-      return { configPath, exists: false, config: createEmptyMcpConfig() };
+  } catch (cause) {
+    rethrowPanic(cause);
+    if (isMissingFileError(cause)) {
+      return Result.ok({ configPath, exists: false, config: createEmptyMcpConfig() });
     }
-    const message = error instanceof Error ? error.message : String(error);
-    throw new McpConfigError({
-      configPath,
-      issues: [`<root>: failed to read file: ${message}`],
-    });
+    return Result.err(
+      new McpConfigError({
+        configPath,
+        issues: [`<root>: failed to read file: ${opaqueErrorMessage(cause)}`],
+        cause,
+      }),
+    );
   }
 
   const parsed = parseMcpConfigYaml(source);
-  if (!parsed.ok) throw new McpConfigError({ configPath, issues: parsed.issues });
-  return { configPath, exists: true, config: parsed.config };
+  if (!parsed.ok) return Result.err(new McpConfigError({ configPath, issues: parsed.issues }));
+  return Result.ok({ configPath, exists: true, config: parsed.config });
 }
 
 /** Write a complete validated config through a same-directory rename. */
 export async function writeMcpConfigFileAtomic(
   configPath: string,
   config: UniversalMcpConfig,
-): Promise<void> {
-  const source = serializeMcpConfigYaml(config);
-  const parent = path.dirname(configPath);
-  await fs.mkdir(parent, { recursive: true });
+  dependencies: McpConfigFileDependencies = DEFAULT_FILE_DEPENDENCIES,
+): Promise<ResultType<void, McpConfigWriteError>> {
+  const serialized = serializeConfig(configPath, config);
+  const serializationFailure = serialized.match<() => ResultType<void, McpConfigWriteError> | null>(
+    {
+      ok: () => () => null,
+      err: (error) => () => Result.err(error),
+    },
+  )();
+  if (serializationFailure) return serializationFailure;
+  const source = serialized.match({ ok: (value) => value, err: () => "" });
 
-  const temporaryPath = path.join(parent, `.${path.basename(configPath)}.${randomUUID()}.tmp`);
-  let renamed = false;
-  try {
-    const handle = await fs.open(temporaryPath, "wx", 0o600);
-    try {
-      await handle.writeFile(source, "utf8");
-      await handle.sync();
-    } finally {
-      await handle.close();
-    }
-    await fs.rename(temporaryPath, configPath);
-    renamed = true;
-  } finally {
-    if (!renamed) await fs.rm(temporaryPath, { force: true });
-  }
+  const parent = path.dirname(configPath);
+  const parentResult = await captureFileOperation({
+    configPath,
+    operation: "create_parent",
+    run: () => dependencies.mkdir(parent, { recursive: true }).then(() => undefined),
+  });
+  const parentFailure = parentResult.match<() => ResultType<void, McpConfigWriteError> | null>({
+    ok: () => () => null,
+    err: (error) => () => Result.err(error),
+  })();
+  if (parentFailure) return parentFailure;
+
+  const temporaryPath = path.join(
+    parent,
+    `.${path.basename(configPath)}.${dependencies.randomUUID()}.tmp`,
+  );
+  const removeTemporary = () =>
+    captureFileOperation({
+      configPath,
+      operation: "remove_temporary",
+      run: () => dependencies.rm(temporaryPath, { force: true }),
+    });
+
+  const opened = await superviseMcpConfigFilePanicCleanup(
+    () =>
+      captureFileOperation({
+        configPath,
+        operation: "open_temporary",
+        run: () => dependencies.open(temporaryPath, "wx", 0o600),
+      }),
+    async () => {
+      await removeTemporary();
+    },
+  );
+  const openFailure = await opened.match<
+    () => Promise<ResultType<void, McpConfigWriteError> | null>
+  >({
+    ok: () => async () => null,
+    err: (error) => async () =>
+      combineOperationAndCleanup(configPath, Result.err(error), await removeTemporary()),
+  })();
+  if (openFailure) return openFailure;
+  const handle = opened.match({
+    ok: (value) => () => value,
+    err: (error) => () => {
+      throw error;
+    },
+  })();
+  const closeTemporary = () =>
+    captureFileOperation({
+      configPath,
+      operation: "close_temporary",
+      run: () => handle.close(),
+    });
+  const written = await superviseMcpConfigFilePanicCleanup(
+    async () => {
+      let result = await captureFileOperation({
+        configPath,
+        operation: "write_temporary",
+        run: () => handle.writeFile(source, "utf8"),
+      });
+      const writeSucceeded = result.match({ ok: () => true, err: () => false });
+      if (writeSucceeded) {
+        result = await captureFileOperation({
+          configPath,
+          operation: "sync_temporary",
+          run: () => handle.sync(),
+        });
+      }
+      return result;
+    },
+    async () => {
+      try {
+        await closeTemporary();
+      } finally {
+        await removeTemporary();
+      }
+    },
+  );
+
+  const closed = await superviseMcpConfigFilePanicCleanup(closeTemporary, async () => {
+    await removeTemporary();
+  });
+  const prepared = combineOperationAndCleanup(configPath, written, closed);
+  const preparationFailure = await prepared.match<
+    () => Promise<ResultType<void, McpConfigWriteError> | null>
+  >({
+    ok: () => async () => null,
+    err: () => async () =>
+      combineOperationAndCleanup(configPath, prepared, await removeTemporary()),
+  })();
+  if (preparationFailure) return preparationFailure;
+
+  const renamed = await superviseMcpConfigFilePanicCleanup(
+    () =>
+      captureFileOperation({
+        configPath,
+        operation: "rename_temporary",
+        run: () => dependencies.rename(temporaryPath, configPath),
+      }),
+    async () => {
+      await removeTemporary();
+    },
+  );
+  const renameFailure = await renamed.match<
+    () => Promise<ResultType<void, McpConfigWriteError> | null>
+  >({
+    ok: () => async () => null,
+    err: () => async () => combineOperationAndCleanup(configPath, renamed, await removeTemporary()),
+  })();
+  if (renameFailure) return renameFailure;
+  return Result.ok();
 }
 
 /**
@@ -122,29 +406,89 @@ export async function writeMcpConfigFileAtomic(
  * Mutations to the same path are serialized within the Core process.
  */
 export function mutateMcpConfigFile(options: {
-  configPath: string;
-  mutation: McpConfigMutation;
-}): Promise<McpConfigMutationResult> {
-  return enqueueMutation(options.configPath, async () => {
-    const snapshot = await readMcpConfigFile(options.configPath);
-    const previousConfig = snapshot.config;
-    const servers = { ...previousConfig.servers };
+  readonly configPath: string;
+  readonly mutation: McpConfigMutation;
+  readonly fileDependencies?: McpConfigFileDependencies;
+}): Promise<ResultType<McpConfigMutationResult, McpConfigMutationError>> {
+  return enqueueMutation<McpConfigMutationResult, McpConfigMutationError>(
+    options.configPath,
+    async () => {
+      const read = await readMcpConfigFile(options.configPath);
+      return read.match<() => Promise<ResultType<McpConfigMutationResult, McpConfigMutationError>>>(
+        {
+          err: (error) => async () => Result.err(error),
+          ok: (snapshot) => async () => {
+            const previousConfig = snapshot.config;
+            const servers = { ...previousConfig.servers };
 
-    if (options.mutation.type === "upsert") {
-      mcpServerIdSchema.parse(options.mutation.server.id);
-      servers[options.mutation.server.id] = options.mutation.server;
-    } else {
-      mcpServerIdSchema.parse(options.mutation.serverId);
-      delete servers[options.mutation.serverId];
-    }
+            switch (options.mutation.type) {
+              case "upsert": {
+                const validated = validateMutationServerId(
+                  options.configPath,
+                  options.mutation.server.id,
+                );
+                const failure = validated.match({
+                  ok: () => null,
+                  err: (error) => Result.err(error),
+                });
+                if (failure) return failure;
+                servers[options.mutation.server.id] = options.mutation.server;
+                break;
+              }
+              case "remove": {
+                const validated = validateMutationServerId(
+                  options.configPath,
+                  options.mutation.serverId,
+                );
+                const failure = validated.match({
+                  ok: () => null,
+                  err: (error) => Result.err(error),
+                });
+                if (failure) return failure;
+                delete servers[options.mutation.serverId];
+                break;
+              }
+            }
 
-    const config: UniversalMcpConfig = {
-      configVersion: previousConfig.configVersion,
-      servers,
-    };
-    const changed = serializeMcpConfigYaml(previousConfig) !== serializeMcpConfigYaml(config);
-    if (changed) await writeMcpConfigFileAtomic(options.configPath, config);
+            const config: UniversalMcpConfig = {
+              configVersion: previousConfig.configVersion,
+              servers,
+            };
+            const previousSerialized = serializeConfig(options.configPath, previousConfig);
+            const previousFailure = previousSerialized.match({
+              ok: () => null,
+              err: (error) => Result.err(error),
+            });
+            if (previousFailure) return previousFailure;
+            const previousSource = previousSerialized.match({
+              ok: (value) => value,
+              err: () => "",
+            });
+            const nextSerialized = serializeConfig(options.configPath, config);
+            const nextFailure = nextSerialized.match({
+              ok: () => null,
+              err: (error) => Result.err(error),
+            });
+            if (nextFailure) return nextFailure;
+            const nextSource = nextSerialized.match({ ok: (value) => value, err: () => "" });
+            const changed = previousSource !== nextSource;
+            if (changed) {
+              const written = await writeMcpConfigFileAtomic(
+                options.configPath,
+                config,
+                options.fileDependencies,
+              );
+              const writeFailure = written.match({
+                ok: () => null,
+                err: (error) => Result.err(error),
+              });
+              if (writeFailure) return writeFailure;
+            }
 
-    return { configPath: options.configPath, changed, previousConfig, config };
-  });
+            return Result.ok({ configPath: options.configPath, changed, previousConfig, config });
+          },
+        },
+      )();
+    },
+  );
 }

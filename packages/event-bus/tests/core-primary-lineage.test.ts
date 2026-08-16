@@ -1,17 +1,24 @@
 import { describe, expect, it } from "bun:test";
+import { Panic, type Result as ResultType } from "better-result";
 
 import {
   CORE_PRIMARY_LINEAGE_INITIAL_DIGEST_V1,
+  buildCoreLineageManifestV1,
   canonicalizeCoreLineageAtomV1,
   computeCoreLineagePrefixDigestV1,
   coreLineageManifestV1Schema,
   createCorePrimaryLineageFreshOnlyV1,
+  decodeCorePrimaryLineageV1,
   extendCoreLineagePrefixDigestV1,
   parseCmdRequestMessageData,
-  parseCorePrimaryLineageV1,
   type CoreLineageAtomV1,
   type CoreLineageManifestV1,
 } from "../index";
+
+function requireOk<TValue, TError>(result: ResultType<TValue, TError>): TValue {
+  if (result.status === "error") throw result.error;
+  return result.value;
+}
 
 const ATOMS = [
   {
@@ -95,7 +102,7 @@ describe("Core primary lineage v1", () => {
 
     let digest = CORE_PRIMARY_LINEAGE_INITIAL_DIGEST_V1;
     for (const [index, atom] of ATOMS.entries()) {
-      digest = extendCoreLineagePrefixDigestV1(digest, index + 1, atom);
+      digest = requireOk(extendCoreLineagePrefixDigestV1(digest, index + 1, atom));
       expect(digest).toBe(PREFIX_DIGESTS[index]!);
     }
     expect(computeCoreLineagePrefixDigestV1(ATOMS)).toBe(PREFIX_DIGESTS[3]);
@@ -103,7 +110,9 @@ describe("Core primary lineage v1", () => {
 
   it("accepts complete contiguous segment boundaries aligned to request messages", () => {
     const manifest = manifestFixture();
-    expect(parseCorePrimaryLineageV1(manifest, MESSAGES)).toEqual(manifest);
+    const decoded = decodeCorePrimaryLineageV1(manifest, MESSAGES);
+    expect(decoded.status).toBe("ok");
+    if (decoded.status === "ok") expect(decoded.value).toEqual(manifest);
     expect(
       parseCmdRequestMessageData({
         queue: "prompt",
@@ -147,12 +156,12 @@ describe("Core primary lineage v1", () => {
     emptyAtoms.segments[0]!.atoms = [];
     expect(() => coreLineageManifestV1Schema.parse(emptyAtoms)).toThrow();
 
-    expect(() =>
-      parseCorePrimaryLineageV1(manifestFixture(), [
+    expect(
+      decodeCorePrimaryLineageV1(manifestFixture(), [
         { role: "user", content: "edited" },
         ...MESSAGES.slice(1),
-      ]),
-    ).toThrow("does not exactly align");
+      ]).status,
+    ).toBe("error");
 
     const midSegmentBoundary = structuredClone(manifestFixture());
     midSegmentBoundary.currentCanonicalStart = 2.5;
@@ -200,14 +209,82 @@ describe("Core primary lineage v1", () => {
   it("requires malformed lineage to be replaced explicitly with fresh-only state", () => {
     const malformed = structuredClone(manifestFixture());
     malformed.segments[0]!.cumulativePrefixDigest = "ff".repeat(32);
-    expect(() => parseCorePrimaryLineageV1(malformed, MESSAGES)).toThrow();
+    expect(decodeCorePrimaryLineageV1(malformed, MESSAGES).status).toBe("error");
 
-    const freshOnly = createCorePrimaryLineageFreshOnlyV1("malformed-manifest");
-    expect(parseCorePrimaryLineageV1(freshOnly, MESSAGES)).toEqual({
-      state: "fresh-only",
-      lineageVersion: 1,
-      currentCanonicalStart: 0,
-      reason: "malformed-manifest",
+    const freshOnly = requireOk(createCorePrimaryLineageFreshOnlyV1("malformed-manifest"));
+    const decoded = decodeCorePrimaryLineageV1(freshOnly, MESSAGES);
+    expect(decoded.status).toBe("ok");
+    if (decoded.status === "ok") {
+      expect(decoded.value).toEqual({
+        state: "fresh-only",
+        lineageVersion: 1,
+        currentCanonicalStart: 0,
+        reason: "malformed-manifest",
+      });
+    }
+  });
+
+  it("returns owned Results for invalid digest and constructor inputs", () => {
+    expect(extendCoreLineagePrefixDigestV1("invalid", 1, ATOMS[0]).status).toBe("error");
+    expect(
+      extendCoreLineagePrefixDigestV1(CORE_PRIMARY_LINEAGE_INITIAL_DIGEST_V1, 0, ATOMS[0]).status,
+    ).toBe("error");
+    expect(createCorePrimaryLineageFreshOnlyV1("").status).toBe("error");
+    expect(createCorePrimaryLineageFreshOnlyV1("valid", -1).status).toBe("error");
+    expect(buildCoreLineageManifestV1([]).status).toBe("error");
+    expect(
+      buildCoreLineageManifestV1([{ atoms: [ATOMS[2]], canonicalMessages: [MESSAGES[2]] }]).status,
+    ).toBe("ok");
+  });
+
+  it("projects lineage mismatch into Result and command-schema issues", () => {
+    const editedMessages = [{ role: "user" as const, content: "edited" }, ...MESSAGES.slice(1)];
+    const decoded = decodeCorePrimaryLineageV1(manifestFixture(), editedMessages);
+    expect(decoded.status).toBe("error");
+    if (decoded.status === "error") {
+      expect(decoded.error.issues).toContainEqual({
+        path: [],
+        message: "Core primary lineage does not exactly align with canonical messages",
+      });
+    }
+    expect(() =>
+      parseCmdRequestMessageData({
+        queue: "prompt",
+        messages: editedMessages,
+        corePrimaryLineage: manifestFixture(),
+      }),
+    ).toThrow("does not exactly align");
+  });
+
+  it("maps ordinary decoder exceptions and preserves Panic at the exact boundary", () => {
+    const ordinaryFailure = Object.defineProperty({}, "state", {
+      get() {
+        throw new Error("ordinary getter failure");
+      },
     });
+    const decoded = decodeCorePrimaryLineageV1(ordinaryFailure, MESSAGES);
+    expect(decoded.status).toBe("error");
+    if (decoded.status === "error") {
+      expect(decoded.error.issues).toEqual([
+        { path: [], message: "Core primary lineage validation failed" },
+      ]);
+    }
+
+    const { proxy, revoke } = Proxy.revocable({}, {});
+    revoke();
+    const revokedFailure = Object.defineProperty({}, "state", {
+      get() {
+        throw proxy;
+      },
+    });
+    expect(decodeCorePrimaryLineageV1(revokedFailure, MESSAGES).status).toBe("error");
+
+    const panic = new Panic({ message: "lineage invariant" });
+    const panicFailure = Object.defineProperty({}, "state", {
+      get() {
+        throw panic;
+      },
+    });
+    expect(() => decodeCorePrimaryLineageV1(panicFailure, MESSAGES)).toThrow(panic);
   });
 });

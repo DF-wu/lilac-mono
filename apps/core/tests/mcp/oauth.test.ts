@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 
 import { UnauthorizedError } from "@ai-sdk/mcp";
+import { Panic } from "better-result";
 
 import {
   MCP_OAUTH_CALLBACK_URL,
@@ -249,6 +250,30 @@ describe("Core-owned MCP OAuth", () => {
     expect(explicit.status).toBe("authorization_required");
   });
 
+  it("returns owned Results for missing providers and invalid callback state", async () => {
+    const dataDir = await createDataDir();
+    const providers = new McpOAuthProviderService({ dataDir });
+
+    const missing = await providers.startAuthorizationResult("missing");
+    expect(missing.status).toBe("error");
+    if (missing.status === "error") {
+      expect(missing.error).toMatchObject({
+        _tag: "McpOAuthProviderError",
+        serverId: "missing",
+        operation: "start",
+      });
+    }
+
+    providers.reconcile(oauthConfig());
+    const provider = providers.getProvider("docs");
+    if (!provider) throw new Error("Expected OAuth provider");
+    const invalidCallback = await provider.completeAuthorizationResult("code", "wrong-state");
+    expect(invalidCallback.status).toBe("error");
+    if (invalidCallback.status === "error") {
+      expect(invalidCallback.error.operation).toBe("complete");
+    }
+  });
+
   it("treats a zero dynamic client secret expiration as non-expiring", async () => {
     const dataDir = await createDataDir();
     const providers = new McpOAuthProviderService({ dataDir });
@@ -464,6 +489,48 @@ describe("Core-owned MCP OAuth", () => {
     for (const state of states.slice(1)) {
       expect(providers.getProviderForState(state)).toBeDefined();
     }
+  });
+
+  it("propagates Panic from OAuth start and completion", async () => {
+    const startDataDir = await createDataDir();
+    const startPanic = new Panic({ message: "OAuth start invariant failed" });
+    const startProviders = new McpOAuthProviderService({
+      dataDir: startDataDir,
+      fetchFn: Object.assign(async () => Promise.reject(startPanic), {
+        preconnect: fetch.preconnect,
+      }),
+    });
+    startProviders.reconcile(oauthConfig());
+    await expect(startProviders.startAuthorization("docs")).rejects.toBe(startPanic);
+
+    const completeDataDir = await createDataDir();
+    const tokenRequests: URLSearchParams[] = [];
+    const baseFetch = oauthFetch({ tokenRequests });
+    const completePanic = new Panic({ message: "OAuth completion invariant failed" });
+    let panicOnToken = false;
+    const completeProviders = new McpOAuthProviderService({
+      dataDir: completeDataDir,
+      fetchFn: Object.assign(
+        async (input: string | URL | Request, init?: RequestInit) => {
+          const url = new URL(input instanceof Request ? input.url : String(input));
+          if (panicOnToken && url.href === `${ISSUER}/token`) throw completePanic;
+          return await baseFetch(input, init);
+        },
+        { preconnect: fetch.preconnect },
+      ),
+    });
+    completeProviders.reconcile(oauthConfig());
+    const started = await completeProviders.startAuthorization("docs");
+    if (started.status !== "authorization_required") throw new Error("Expected OAuth redirect");
+    const state = new URL(started.authorizationUrl).searchParams.get("state");
+    if (!state) throw new Error("Expected OAuth state");
+    const provider = completeProviders.getProviderForState(state);
+    if (!provider) throw new Error("Expected pending OAuth provider");
+
+    panicOnToken = true;
+    await expect(provider.completeAuthorization("callback-code", state)).rejects.toBe(
+      completePanic,
+    );
   });
 
   it("rejects missing, wrong, duplicate, error, and bare-code callbacks without tokens", async () => {

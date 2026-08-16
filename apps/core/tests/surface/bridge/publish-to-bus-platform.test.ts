@@ -6,7 +6,7 @@ import {
   toBusEvtAdapterMessageUpdated,
   toBusEvtAdapterReactionAdded,
   toBusEvtAdapterReactionRemoved,
-} from "../../../src/surface/discord/discord-adapter";
+} from "../../../src/surface/bridge/adapter-event-projection";
 import type { SessionRef, SurfaceMessage } from "../../../src/surface/types";
 
 /**
@@ -40,19 +40,31 @@ const SESSIONS: SessionRef[] = [
 describe("adapter bus mappers carry the originating platform", () => {
   for (const session of SESSIONS) {
     it(`message.created keeps ${session.platform}`, () => {
-      const data = toBusEvtAdapterMessageCreated({ message: surfaceMessage(session) });
+      const data = toBusEvtAdapterMessageCreated({
+        type: "adapter.message.created",
+        platform: session.platform,
+        ts: 1,
+        message: surfaceMessage(session),
+      });
 
       expect(data.platform).toBe(session.platform);
       expect(data.channelId).toBe(session.channelId);
     });
 
     it(`message.updated keeps ${session.platform}`, () => {
-      const data = toBusEvtAdapterMessageUpdated({ message: surfaceMessage(session) });
+      const data = toBusEvtAdapterMessageUpdated({
+        type: "adapter.message.updated",
+        platform: session.platform,
+        ts: 1,
+        message: surfaceMessage(session),
+      });
       expect(data.platform).toBe(session.platform);
     });
 
     it(`message.deleted keeps ${session.platform}`, () => {
       const data = toBusEvtAdapterMessageDeleted({
+        type: "adapter.message.deleted",
+        platform: session.platform,
         messageRef: { platform: session.platform, channelId: session.channelId, messageId: "10" },
         session,
         ts: 1,
@@ -62,6 +74,8 @@ describe("adapter bus mappers carry the originating platform", () => {
 
     it(`reaction.added keeps ${session.platform}`, () => {
       const data = toBusEvtAdapterReactionAdded({
+        type: "adapter.reaction.added",
+        platform: session.platform,
         messageRef: { platform: session.platform, channelId: session.channelId, messageId: "10" },
         session,
         reaction: "👍",
@@ -72,6 +86,8 @@ describe("adapter bus mappers carry the originating platform", () => {
 
     it(`reaction.removed keeps ${session.platform}`, () => {
       const data = toBusEvtAdapterReactionRemoved({
+        type: "adapter.reaction.removed",
+        platform: session.platform,
         messageRef: { platform: session.platform, channelId: session.channelId, messageId: "10" },
         session,
         reaction: "👍",
@@ -83,6 +99,9 @@ describe("adapter bus mappers carry the originating platform", () => {
 
   it("preserves the raw envelope, which the router keys off the platform to read", () => {
     const data = toBusEvtAdapterMessageCreated({
+      type: "adapter.message.created",
+      platform: "telegram",
+      ts: 1,
       message: surfaceMessage({ platform: "telegram", channelId: "1001" }),
     });
 

@@ -5,7 +5,7 @@ import {
   canTransitionWorkflowRun,
   canTransitionWorkflowTrigger,
   canTransitionWorkflowWait,
-  normalizeWorkflowResourcePolicy,
+  normalizeWorkflowResourcePolicyResult,
   workflowOperationSchema,
   workflowRevisionSchema,
   workflowRunSchema,
@@ -14,6 +14,12 @@ import {
   workflowTriggerSchema,
   workflowWaitSchema,
 } from "../../src/workflow/workflow-domain";
+
+function normalizeWorkflowResourcePolicy(input: unknown) {
+  const result = normalizeWorkflowResourcePolicyResult(input);
+  if (result.status === "error") throw result.error;
+  return result.value;
+}
 
 const HASH = "a".repeat(64);
 
@@ -63,7 +69,7 @@ describe("durable workflow domain", () => {
     expect(() =>
       normalizeWorkflowResourcePolicy({
         ...resources(),
-        agents: { ...resources().agents, tools: ["read_file"] },
+        agents: { ...resources().agents, tools: ["read"] },
       }),
     ).toThrow("Unrecognized key");
     expect(() =>
@@ -203,6 +209,7 @@ describe("durable workflow domain", () => {
         lastError: null,
         retryCount: 0,
         nextAttemptAt: null,
+        permanentFailure: null,
         createdAt: 1,
         updatedAt: 1,
       }).runId,

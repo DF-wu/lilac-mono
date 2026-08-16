@@ -21,11 +21,9 @@ const DEFAULT_TOOLS_POLICY = {
 };
 
 describe("tool output config", () => {
-  it("provides the universal policy defaults for v1 and v2", async () => {
-    for (const configVersion of [1, 2] as const) {
-      const parsed = await parseCoreConfig({ configVersion });
-      expect(parsed.tools).toMatchObject(DEFAULT_TOOLS_POLICY);
-    }
+  it("provides the universal policy defaults for v2", async () => {
+    const parsed = await parseCoreConfig({ configVersion: 2 });
+    expect(parsed.tools).toMatchObject(DEFAULT_TOOLS_POLICY);
   });
 
   it("normalizes partial v2 friendly unit settings", async () => {

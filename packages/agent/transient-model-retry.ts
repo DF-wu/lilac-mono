@@ -2,6 +2,7 @@ import { setTimeout as sleep } from "node:timers/promises";
 
 import { createLogger, extractAiErrorLogDetails, isRecord } from "@stanley2058/lilac-utils";
 
+import { rethrowAgentPanic } from "./failure-adapters";
 import { isLikelyContextOverflowError } from "./context-overflow";
 import type { TurnErrorHandler, TurnErrorHandlerDecision } from "./ai-sdk-pi-agent";
 import { computeRetryBackoffDelayMs, type RetryBackoffConfig } from "./retry-backoff";
@@ -116,7 +117,8 @@ function defaultErrorSummary(error: unknown): string {
   if (typeof error === "string") return error;
   try {
     return JSON.stringify(error);
-  } catch {
+  } catch (cause) {
+    rethrowAgentPanic(cause);
     return String(error);
   }
 }
@@ -261,7 +263,9 @@ export function createTransientModelRetryController(params: {
       if (delayMs > 0) {
         try {
           await sleep(delayMs, undefined, { signal: context.abortSignal });
-        } catch {
+        } catch (cause) {
+          rethrowAgentPanic(cause);
+          if (!context.abortSignal?.aborted) throw cause;
           logSkipped("aborted-during-backoff");
           return "fail";
         }

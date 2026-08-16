@@ -1,6 +1,11 @@
 import { describe, expect, it } from "bun:test";
 
-import { isTelegramSurfaceUsable, parseCoreConfig, resolveTelegramToken } from "../core-config";
+import {
+  isTelegramSurfaceUsable,
+  parseCoreConfig,
+  resolveTelegramToken,
+  resolveTelegramTokenResult,
+} from "../core-config";
 
 describe("core config surface.telegram", () => {
   it("is disabled by default on v2 so existing deployments are unaffected", async () => {
@@ -186,6 +191,7 @@ describe("telegram surface gating", () => {
 
     expect(isTelegramSurfaceUsable(cfg)).toBe(true);
     expect(resolveTelegramToken(cfg)).toBe("123:abc");
+    expect(resolveTelegramTokenResult(cfg).status).toBe("ok");
   });
 
   it("names the config key when resolving a token that is not set", async () => {
@@ -195,5 +201,8 @@ describe("telegram surface gating", () => {
     });
 
     expect(() => resolveTelegramToken(cfg)).toThrow("surface.telegram.token");
+    const result = resolveTelegramTokenResult(cfg);
+    expect(result.status).toBe("error");
+    if (result.status === "error") expect(result.error._tag).toBe("TelegramTokenMissing");
   });
 });

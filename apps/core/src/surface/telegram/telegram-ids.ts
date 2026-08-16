@@ -34,11 +34,7 @@ export function formatTelegramSessionId(input: {
 }): string {
   const chatId = typeof input.chatId === "number" ? String(input.chatId) : input.chatId;
   const threadId =
-    input.threadId === null || input.threadId === undefined
-      ? undefined
-      : typeof input.threadId === "number"
-        ? String(input.threadId)
-        : input.threadId;
+    input.threadId === null || input.threadId === undefined ? undefined : String(input.threadId);
 
   return threadId === undefined ? chatId : `${chatId}:${threadId}`;
 }

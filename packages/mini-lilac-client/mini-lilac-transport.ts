@@ -1,10 +1,17 @@
 import {
-  DefaultChatTransport,
+  asSchema,
   parseJsonEventStream,
   uiMessageChunkSchema,
   type ChatTransport,
   type UIMessageChunk,
 } from "ai";
+import {
+  Panic,
+  Result,
+  TaggedError,
+  type AnyTaggedError,
+  type Result as ResultType,
+} from "better-result";
 import { z } from "zod";
 
 import {
@@ -30,16 +37,17 @@ import {
   type MiniLilacStreamCursor,
   type MiniLilacTodoState,
   type MiniLilacUIMessage,
+  type MiniLilacUnsupportedUIMessageChunk,
   type MiniLilacUndoInput,
   type MiniLilacUndoResult,
   type MiniLilacUpdateSessionBindingsInput,
+  MINI_LILAC_UNSUPPORTED_UI_MESSAGE_CHUNK_TYPE,
   miniLilacCancelCompactionRequestSchema,
   miniLilacCancelCompactionResultSchema,
   miniLilacCancelRequestSchema,
   miniLilacCancelResultSchema,
   miniLilacChatRequestExtrasSchema,
   miniLilacCompactRequestSchema,
-  miniLilacCompactResultSchema,
   miniLilacInterruptQueuedSteeringRequestSchema,
   miniLilacInterruptQueuedSteeringResultSchema,
   miniLilacMessagesSchema,
@@ -56,6 +64,7 @@ import {
   miniLilacSteerResultSchema,
   miniLilacTodoStateSchema,
   miniLilacUIMessageDataPartSchema,
+  miniLilacUnsupportedUIMessageChunkSchema,
   miniLilacUndoRequestSchema,
   miniLilacUndoResultSchema,
   miniLilacUpdateSessionBindingsRequestSchema,
@@ -85,12 +94,141 @@ export type MiniLilacRequestOptions = {
   signal?: AbortSignal;
 };
 
-/** Thrown by `compact()` when the compaction was deliberately stopped. */
-export class MiniLilacCompactionCancelledError extends Error {
+export type MiniLilacSendMessagesOptions = Parameters<
+  ChatTransport<MiniLilacUIMessage>["sendMessages"]
+>[0];
+export type MiniLilacReconnectOptions = Parameters<
+  ChatTransport<MiniLilacUIMessage>["reconnectToStream"]
+>[0];
+
+export class MiniLilacBoundaryInvalid extends TaggedError("MiniLilacBoundaryInvalid")<{
+  readonly boundary: string;
+  readonly cause: z.ZodError;
+  readonly issues: readonly string[];
+  readonly message: string;
+}> {}
+
+export class MiniLilacExternalOperationFailed extends TaggedError(
+  "MiniLilacExternalOperationFailed",
+)<{
+  readonly operation: string;
+  readonly cause: unknown;
+  readonly message: string;
+}> {}
+
+export class MiniLilacRequestCancelled extends TaggedError("MiniLilacRequestCancelled")<{
+  readonly operation: string;
+  readonly cause: unknown;
+  readonly message: string;
+}> {}
+
+export class MiniLilacHttpError extends TaggedError("MiniLilacHttpError")<{
+  readonly operation: string;
+  readonly status: number;
+  readonly detail: string;
+  readonly message: string;
+}> {}
+
+export class MiniLilacCompactionFailed extends TaggedError("MiniLilacCompactionFailed")<{
+  readonly message: string;
+}> {}
+
+/** Returned by `compactResult()` when the compaction was deliberately stopped. */
+export class MiniLilacCompactionCancelledError extends TaggedError(
+  "MiniLilacCompactionCancelledError",
+)<{
+  readonly message: string;
+}> {
   constructor() {
-    super("Context compaction was cancelled");
-    this.name = "MiniLilacCompactionCancelledError";
+    super({ message: "Context compaction was cancelled" });
   }
+}
+
+export class MiniLilacCompactionProtocolError extends TaggedError(
+  "MiniLilacCompactionProtocolError",
+)<{
+  readonly message: string;
+}> {}
+
+export class MiniLilacStreamDecodeFailed extends TaggedError("MiniLilacStreamDecodeFailed")<{
+  readonly cause: unknown;
+  readonly message: string;
+}> {}
+
+export class MiniLilacStreamCleanupFailed extends TaggedError("MiniLilacStreamCleanupFailed")<{
+  readonly cancelFailure: MiniLilacExternalOperationFailed | undefined;
+  readonly releaseFailure: MiniLilacExternalOperationFailed | undefined;
+  readonly message: string;
+}> {}
+
+type MiniLilacStreamPrimaryError =
+  | MiniLilacStreamDecodeFailed
+  | MiniLilacExternalOperationFailed
+  | MiniLilacRequestCancelled;
+
+export class MiniLilacStreamAndCleanupFailed extends TaggedError(
+  "MiniLilacStreamAndCleanupFailed",
+)<{
+  readonly primary: MiniLilacStreamPrimaryError;
+  readonly cleanup: MiniLilacStreamCleanupFailed;
+  readonly message: string;
+}> {}
+
+type MiniLilacCompactionPrimaryError =
+  | MiniLilacBoundaryInvalid
+  | MiniLilacExternalOperationFailed
+  | MiniLilacRequestCancelled
+  | MiniLilacHttpError
+  | MiniLilacCompactionFailed
+  | MiniLilacCompactionCancelledError
+  | MiniLilacCompactionProtocolError;
+
+export class MiniLilacCompactionAndCleanupFailed extends TaggedError(
+  "MiniLilacCompactionAndCleanupFailed",
+)<{
+  readonly primary: MiniLilacCompactionPrimaryError;
+  readonly cleanup: MiniLilacStreamCleanupFailed;
+  readonly message: string;
+}> {}
+
+export type MiniLilacRequestError =
+  | MiniLilacBoundaryInvalid
+  | MiniLilacExternalOperationFailed
+  | MiniLilacRequestCancelled
+  | MiniLilacHttpError;
+
+export type MiniLilacCompactError =
+  | MiniLilacCompactionPrimaryError
+  | MiniLilacStreamCleanupFailed
+  | MiniLilacCompactionAndCleanupFailed;
+
+export type MiniLilacStreamError =
+  | MiniLilacStreamPrimaryError
+  | MiniLilacStreamCleanupFailed
+  | MiniLilacStreamAndCleanupFailed;
+
+export type MiniLilacResultStream = ReadableStream<
+  ResultType<UIMessageChunk, MiniLilacStreamError>
+>;
+
+export type MiniLilacClientError = MiniLilacRequestError | MiniLilacCompactError;
+
+function valueOrTaggedError<T, E extends AnyTaggedError>(result: ResultType<T, E>): T | E {
+  return result.match<T | E>({
+    ok: (value) => value,
+    err: (error) => error,
+  });
+}
+
+function isMiniLilacRequestError<T>(
+  value: T | MiniLilacRequestError,
+): value is MiniLilacRequestError {
+  return (
+    MiniLilacBoundaryInvalid.is(value) ||
+    MiniLilacExternalOperationFailed.is(value) ||
+    MiniLilacRequestCancelled.is(value) ||
+    MiniLilacHttpError.is(value)
+  );
 }
 
 export type MiniLilacCompactOptions = MiniLilacRequestOptions & {
@@ -101,6 +239,651 @@ export type MiniLilacCompactOptions = MiniLilacRequestOptions & {
 };
 
 const sessionIdSchema = z.string().trim().min(1);
+const futureChunkEnvelopeSchema = z.object({
+  type: z.string().min(1).max(128),
+});
+const installedUIMessageChunkSchema = asSchema(uiMessageChunkSchema);
+const unsupportedChunkDiscriminantSchema = z.object({
+  type: z.literal(MINI_LILAC_UNSUPPORTED_UI_MESSAGE_CHUNK_TYPE),
+});
+const dataChunkDiscriminantSchema = z.object({
+  type: z.string().startsWith("data-"),
+});
+const rawDataChunkEnvelopeSchema = z.looseObject({
+  type: z.string().startsWith("data-"),
+  data: z.json(),
+});
+const compactionChunkDiscriminantSchema = z.object({ type: z.literal("data-compaction") });
+const INSTALLED_NON_DATA_CHUNK_TYPES = new Set<string>([
+  "text-start",
+  "text-delta",
+  "text-end",
+  "error",
+  "tool-input-start",
+  "tool-input-delta",
+  "tool-input-available",
+  "tool-input-error",
+  "tool-approval-request",
+  "tool-approval-response",
+  "tool-output-available",
+  "tool-output-error",
+  "tool-output-denied",
+  "reasoning-start",
+  "reasoning-delta",
+  "reasoning-end",
+  "custom",
+  "source-url",
+  "source-document",
+  "file",
+  "reasoning-file",
+  "start-step",
+  "finish-step",
+  "start",
+  "finish",
+  "abort",
+  "message-metadata",
+]);
+
+function boundedIssues(error: z.ZodError): readonly string[] {
+  return error.issues.slice(0, 20).map((issue) => {
+    const path = issue.path.length === 0 ? "<root>" : issue.path.join(".");
+    return `${path}: ${issue.message}`.slice(0, 256);
+  });
+}
+
+/** Decodes values at Mini Lilac's HTTP and stream boundaries without throwing. */
+export function decodeMiniLilacBoundary<T>(
+  value: unknown,
+  schema: z.ZodType<T>,
+  boundary: string,
+): ResultType<T, MiniLilacBoundaryInvalid> {
+  const decoded = schema.safeParse(value);
+  if (decoded.success) return Result.ok(decoded.data);
+  return Result.err(
+    new MiniLilacBoundaryInvalid({
+      boundary,
+      cause: decoded.error,
+      issues: boundedIssues(decoded.error),
+      message: `Invalid Mini Lilac ${boundary}`,
+    }),
+  );
+}
+
+type MiniLilacCapture<T, E> =
+  | { readonly kind: "ok"; readonly value: T }
+  | { readonly kind: "error"; readonly error: E }
+  | { readonly kind: "panic"; readonly panic: Panic };
+
+function cancellationCapture<T>(
+  operation: string,
+  signal: AbortSignal | undefined,
+): MiniLilacCapture<T, MiniLilacRequestCancelled> | undefined {
+  if (signal === undefined || !signal.aborted) return undefined;
+  const reason: unknown = signal.reason;
+  if (Panic.is(reason)) return { kind: "panic", panic: reason };
+  return {
+    kind: "error",
+    error: new MiniLilacRequestCancelled({
+      operation,
+      cause: reason,
+      message: `${operation} was cancelled`,
+    }),
+  };
+}
+
+function captureMiniLilacPromiseOutcome<T>(
+  operation: string,
+  effect: () => Promise<T>,
+): Promise<MiniLilacCapture<T, MiniLilacExternalOperationFailed>>;
+function captureMiniLilacPromiseOutcome<T>(
+  operation: string,
+  effect: () => Promise<T>,
+  signal: AbortSignal | undefined,
+): Promise<MiniLilacCapture<T, MiniLilacExternalOperationFailed | MiniLilacRequestCancelled>>;
+async function captureMiniLilacPromiseOutcome<T>(
+  operation: string,
+  effect: () => Promise<T>,
+  signal?: AbortSignal,
+): Promise<MiniLilacCapture<T, MiniLilacExternalOperationFailed | MiniLilacRequestCancelled>> {
+  const cancellation = cancellationCapture<T>(operation, signal);
+  if (cancellation !== undefined) return cancellation;
+  try {
+    return { kind: "ok", value: await effect() };
+  } catch (cause) {
+    if (Panic.is(cause)) return { kind: "panic", panic: cause };
+    if (signal?.aborted && signal.reason === cause) {
+      return {
+        kind: "error",
+        error: new MiniLilacRequestCancelled({
+          operation,
+          cause,
+          message: `${operation} was cancelled`,
+        }),
+      };
+    }
+    return {
+      kind: "error",
+      error: new MiniLilacExternalOperationFailed({
+        operation,
+        cause,
+        message: `${operation} failed`,
+      }),
+    };
+  }
+}
+
+function captureMiniLilacSyncOutcome<T>(
+  operation: string,
+  effect: () => T,
+): MiniLilacCapture<T, MiniLilacExternalOperationFailed> {
+  try {
+    return { kind: "ok", value: effect() };
+  } catch (cause) {
+    if (Panic.is(cause)) return { kind: "panic", panic: cause };
+    return {
+      kind: "error",
+      error: new MiniLilacExternalOperationFailed({
+        operation,
+        cause,
+        message: `${operation} failed`,
+      }),
+    };
+  }
+}
+
+function throwMiniLilacPanic(panic: Panic): never {
+  throw panic;
+}
+
+async function captureMiniLilacPromise<T>(
+  operation: string,
+  effect: () => Promise<T>,
+  signal?: AbortSignal,
+): Promise<ResultType<T, MiniLilacExternalOperationFailed | MiniLilacRequestCancelled>> {
+  const captured = await captureMiniLilacPromiseOutcome(operation, effect, signal);
+  switch (captured.kind) {
+    case "ok":
+      return Result.ok(captured.value);
+    case "error":
+      return Result.err(captured.error);
+    case "panic":
+      return throwMiniLilacPanic(captured.panic);
+  }
+}
+
+function captureMiniLilacSync<T>(
+  operation: string,
+  effect: () => T,
+): ResultType<T, MiniLilacExternalOperationFailed> {
+  const captured = captureMiniLilacSyncOutcome(operation, effect);
+  switch (captured.kind) {
+    case "ok":
+      return Result.ok(captured.value);
+    case "error":
+      return Result.err(captured.error);
+    case "panic":
+      return throwMiniLilacPanic(captured.panic);
+  }
+}
+
+function resultToMiniLilacCompatibilityFailure(
+  error: MiniLilacClientError | MiniLilacStreamError,
+): never {
+  switch (error._tag) {
+    case "MiniLilacBoundaryInvalid":
+      throw error.cause;
+    case "MiniLilacExternalOperationFailed":
+    case "MiniLilacRequestCancelled":
+    case "MiniLilacStreamDecodeFailed":
+      throw error.cause;
+    case "MiniLilacHttpError":
+    case "MiniLilacCompactionFailed":
+    case "MiniLilacCompactionCancelledError":
+    case "MiniLilacCompactionProtocolError":
+    case "MiniLilacStreamCleanupFailed":
+    case "MiniLilacCompactionAndCleanupFailed":
+    case "MiniLilacStreamAndCleanupFailed":
+      throw error;
+  }
+}
+
+/** Converts a typed client Result to the package's legacy throwing API contract. */
+function resultToMiniLilacClientValue<T>(result: ResultType<T, MiniLilacClientError>): T {
+  const resolve = result.match<() => T>({
+    ok: (value) => () => value,
+    err: (error) => () => resultToMiniLilacCompatibilityFailure(error),
+  });
+  return resolve();
+}
+
+async function validateUnsupportedSentinelResult(
+  sentinel: MiniLilacUnsupportedUIMessageChunk,
+): Promise<ResultType<UIMessageChunk, MiniLilacStreamDecodeFailed>> {
+  const validate = installedUIMessageChunkSchema.validate;
+  if (validate === undefined) {
+    return Result.err(
+      new MiniLilacStreamDecodeFailed({
+        cause: new Error("UI message chunk validation is unavailable"),
+        message: "Mini Lilac event stream contained an invalid chunk",
+      }),
+    );
+  }
+  const captured = await captureMiniLilacPromiseOutcome(
+    "Validate Mini Lilac unsupported stream chunk",
+    async () => validate(sentinel),
+  );
+  if (captured.kind === "panic") return throwMiniLilacPanic(captured.panic);
+  if (captured.kind === "error") {
+    return Result.err(
+      new MiniLilacStreamDecodeFailed({
+        cause: captured.error,
+        message: "Mini Lilac event stream contained an invalid chunk",
+      }),
+    );
+  }
+  if (captured.value.success) return Result.ok(captured.value.value);
+  return Result.err(
+    new MiniLilacStreamDecodeFailed({
+      cause: captured.value.error,
+      message: "Mini Lilac event stream contained an invalid chunk",
+    }),
+  );
+}
+
+async function normalizeStreamChunkResult(
+  value: unknown,
+): Promise<ResultType<UIMessageChunk, MiniLilacStreamDecodeFailed>> {
+  if (unsupportedChunkDiscriminantSchema.safeParse(value).success) {
+    const sentinel = miniLilacUnsupportedUIMessageChunkSchema.safeParse(value);
+    if (!sentinel.success) {
+      return Result.err(
+        new MiniLilacStreamDecodeFailed({
+          cause: sentinel.error,
+          message: "Mini Lilac event stream contained an invalid chunk",
+        }),
+      );
+    }
+    return validateUnsupportedSentinelResult(sentinel.data);
+  }
+
+  if (dataChunkDiscriminantSchema.safeParse(value).success) {
+    const dataEnvelope = rawDataChunkEnvelopeSchema.safeParse(value);
+    if (!dataEnvelope.success) {
+      return Result.err(
+        new MiniLilacStreamDecodeFailed({
+          cause: dataEnvelope.error,
+          message: "Mini Lilac event stream contained an invalid chunk",
+        }),
+      );
+    }
+  }
+
+  const validate = installedUIMessageChunkSchema.validate;
+  if (validate === undefined) {
+    return Result.err(
+      new MiniLilacStreamDecodeFailed({
+        cause: new Error("UI message chunk validation is unavailable"),
+        message: "Mini Lilac event stream contained an invalid chunk",
+      }),
+    );
+  }
+  const captured = await captureMiniLilacPromiseOutcome(
+    "Validate Mini Lilac stream chunk",
+    async () => validate(value),
+  );
+  if (captured.kind === "panic") return throwMiniLilacPanic(captured.panic);
+  if (captured.kind === "error") {
+    return Result.err(
+      new MiniLilacStreamDecodeFailed({
+        cause: captured.error,
+        message: "Mini Lilac event stream contained an invalid chunk",
+      }),
+    );
+  }
+  if (captured.value.success) return Result.ok(captured.value.value);
+
+  const envelope = futureChunkEnvelopeSchema.safeParse(value);
+  if (
+    envelope.success &&
+    !envelope.data.type.startsWith("data-") &&
+    !INSTALLED_NON_DATA_CHUNK_TYPES.has(envelope.data.type)
+  ) {
+    const sentinel = miniLilacUnsupportedUIMessageChunkSchema.safeParse({
+      type: MINI_LILAC_UNSUPPORTED_UI_MESSAGE_CHUNK_TYPE,
+      data: { chunkType: envelope.data.type },
+      transient: true,
+    });
+    if (!sentinel.success) {
+      return Result.err(
+        new MiniLilacStreamDecodeFailed({
+          cause: sentinel.error,
+          message: "Mini Lilac event stream contained an invalid chunk",
+        }),
+      );
+    }
+    return validateUnsupportedSentinelResult(sentinel.data);
+  }
+
+  return Result.err(
+    new MiniLilacStreamDecodeFailed({
+      cause: captured.value.error,
+      message: "Mini Lilac event stream contained an invalid chunk",
+    }),
+  );
+}
+
+type MiniLilacParsedStream = {
+  readonly stream: ReadableStream<UIMessageChunk>;
+  readonly cleanupSource: (
+    cancelEffect?: () => Promise<void>,
+  ) => Promise<ResultType<void, MiniLilacExternalOperationFailed>>;
+};
+
+function parseMiniLilacStream(
+  stream: ReadableStream<Uint8Array<ArrayBufferLike>>,
+): MiniLilacParsedStream {
+  const sourceReader = stream.getReader();
+  let sourceReleased = false;
+  let sourceFinished = false;
+  let sourceCleanup: Promise<ResultType<void, MiniLilacExternalOperationFailed>> | undefined;
+  const releaseSource = () => {
+    if (sourceReleased) return;
+    sourceReleased = true;
+    sourceReader.releaseLock();
+  };
+  const cleanupSource = (
+    cancelEffect: () => Promise<void> = () => sourceReader.cancel(),
+  ): Promise<ResultType<void, MiniLilacExternalOperationFailed>> => {
+    if (sourceCleanup !== undefined) return sourceCleanup;
+    const cleanup = (async () => {
+      if (sourceFinished) return Result.ok(undefined);
+      const cancelled = await captureMiniLilacPromiseOutcome(
+        "Cancel Mini Lilac response body",
+        cancelEffect,
+      );
+      sourceFinished = true;
+      const released = captureMiniLilacSyncOutcome(
+        "Release Mini Lilac response body reader",
+        releaseSource,
+      );
+      if (released.kind === "panic") return throwMiniLilacPanic(released.panic);
+      if (cancelled.kind === "panic") return throwMiniLilacPanic(cancelled.panic);
+      if (released.kind === "error") return Result.err(released.error);
+      if (cancelled.kind === "error") return Result.err(cancelled.error);
+      return Result.ok(undefined);
+    })();
+    sourceCleanup = cleanup;
+    return cleanup;
+  };
+  const proxy = new ReadableStream<Uint8Array<ArrayBufferLike>>({
+    async pull(controller) {
+      try {
+        const read = await sourceReader.read();
+        if (read.done) {
+          sourceFinished = true;
+          releaseSource();
+          controller.close();
+          return;
+        }
+        controller.enqueue(read.value);
+      } catch (cause) {
+        sourceFinished = true;
+        releaseSource();
+        controller.error(cause);
+      }
+    },
+    async cancel(reason) {
+      const cleanup = await cleanupSource(() => sourceReader.cancel(reason));
+      const finish = cleanup.match<() => void>({
+        ok: () => () => undefined,
+        err: (error) => () => resultToMiniLilacCompatibilityFailure(error),
+      });
+      return finish();
+    },
+  });
+  const parsed = parseJsonEventStream({ stream: proxy, schema: z.json() }).pipeThrough(
+    new TransformStream({
+      async transform(result, controller) {
+        if (!result.success) {
+          controller.error(
+            new MiniLilacStreamDecodeFailed({
+              cause: result.error,
+              message: "Mini Lilac event stream contained malformed JSON",
+            }),
+          );
+          return;
+        }
+        const normalized = await normalizeStreamChunkResult(result.value);
+        const resolved = normalized.match<
+          { readonly value: UIMessageChunk } | { readonly error: MiniLilacStreamError }
+        >({
+          ok: (value) => ({ value }),
+          err: (error) => ({ error }),
+        });
+        if ("error" in resolved) controller.error(resolved.error);
+        else controller.enqueue(resolved.value);
+      },
+    }),
+  );
+  return { stream: parsed, cleanupSource };
+}
+
+async function cleanupMiniLilacStreamReader(
+  reader: ReadableStreamDefaultReader<UIMessageChunk>,
+  cancelEffect: (() => Promise<void>) | undefined,
+  primaryPanic: Panic | undefined,
+  cleanupSource?: MiniLilacParsedStream["cleanupSource"],
+): Promise<ResultType<void, MiniLilacStreamCleanupFailed>> {
+  let cancelFailure: MiniLilacExternalOperationFailed | undefined;
+  let cancelPanic: Panic | undefined;
+  if (cancelEffect !== undefined) {
+    const cancelled = await captureMiniLilacPromiseOutcome(
+      "Cancel Mini Lilac stream reader",
+      cancelEffect,
+    );
+    if (cancelled.kind === "panic") cancelPanic = cancelled.panic;
+    else if (cancelled.kind === "error") cancelFailure = cancelled.error;
+  }
+
+  if (cleanupSource !== undefined) {
+    const cleaned = await captureMiniLilacPromiseOutcome(
+      "Clean up Mini Lilac response body",
+      cleanupSource,
+    );
+    if (cleaned.kind === "panic") {
+      cancelPanic ??= cleaned.panic;
+    } else if (cleaned.kind === "error") {
+      cancelFailure = cleaned.error;
+    } else {
+      cleaned.value.match({
+        ok: () => undefined,
+        err: (error) => {
+          cancelFailure = error;
+        },
+      });
+    }
+  }
+
+  let releaseFailure: MiniLilacExternalOperationFailed | undefined;
+  let releasePanic: Panic | undefined;
+  const released = captureMiniLilacSyncOutcome("Release Mini Lilac stream reader", () =>
+    reader.releaseLock(),
+  );
+  if (released.kind === "panic") releasePanic = released.panic;
+  else if (released.kind === "error") releaseFailure = released.error;
+
+  if (primaryPanic !== undefined) return throwMiniLilacPanic(primaryPanic);
+  if (cancelPanic !== undefined) return throwMiniLilacPanic(cancelPanic);
+  if (releasePanic !== undefined) return throwMiniLilacPanic(releasePanic);
+  if (cancelFailure === undefined && releaseFailure === undefined) return Result.ok(undefined);
+  return Result.err(
+    new MiniLilacStreamCleanupFailed({
+      cancelFailure,
+      releaseFailure,
+      message: "Mini Lilac stream cleanup failed",
+    }),
+  );
+}
+
+async function captureMiniLilacStreamRead(
+  reader: ReadableStreamDefaultReader<UIMessageChunk>,
+  signal: AbortSignal | undefined,
+): Promise<
+  MiniLilacCapture<
+    Awaited<ReturnType<ReadableStreamDefaultReader<UIMessageChunk>["read"]>>,
+    MiniLilacStreamDecodeFailed | MiniLilacExternalOperationFailed | MiniLilacRequestCancelled
+  >
+> {
+  const operation = "Read Mini Lilac event stream";
+  const cancellation = cancellationCapture<
+    Awaited<ReturnType<ReadableStreamDefaultReader<UIMessageChunk>["read"]>>
+  >(operation, signal);
+  if (cancellation !== undefined) return cancellation;
+  try {
+    return { kind: "ok", value: await reader.read() };
+  } catch (cause) {
+    if (Panic.is(cause)) return { kind: "panic", panic: cause };
+    if (cause instanceof MiniLilacStreamDecodeFailed) return { kind: "error", error: cause };
+    if (signal?.aborted && signal.reason === cause) {
+      return {
+        kind: "error",
+        error: new MiniLilacRequestCancelled({
+          operation,
+          cause,
+          message: `${operation} was cancelled`,
+        }),
+      };
+    }
+    return {
+      kind: "error",
+      error: new MiniLilacExternalOperationFailed({
+        operation,
+        cause,
+        message: `${operation} failed`,
+      }),
+    };
+  }
+}
+
+function combineStreamAndCleanupFailure(
+  primary: MiniLilacStreamPrimaryError,
+  cleanup: ResultType<void, MiniLilacStreamCleanupFailed>,
+): MiniLilacStreamError {
+  return cleanup.match<MiniLilacStreamError>({
+    ok: () => primary,
+    err: (error) =>
+      new MiniLilacStreamAndCleanupFailed({
+        primary,
+        cleanup: error,
+        message: "Mini Lilac stream and cleanup both failed",
+      }),
+  });
+}
+
+function resultStreamFromMiniLilacStream(
+  parsed: MiniLilacParsedStream,
+  signal?: AbortSignal,
+): MiniLilacResultStream {
+  const reader = parsed.stream.getReader();
+  let terminal = false;
+
+  return new ReadableStream({
+    async pull(controller) {
+      if (terminal) return;
+      const read = await captureMiniLilacStreamRead(reader, signal);
+      if (read.kind === "panic") {
+        terminal = true;
+        await cleanupMiniLilacStreamReader(
+          reader,
+          () => reader.cancel(),
+          read.panic,
+          parsed.cleanupSource,
+        );
+        return;
+      }
+
+      if (read.kind === "error") {
+        terminal = true;
+        const cleanup = await cleanupMiniLilacStreamReader(
+          reader,
+          undefined,
+          undefined,
+          parsed.cleanupSource,
+        );
+        controller.enqueue(Result.err(combineStreamAndCleanupFailure(read.error, cleanup)));
+        controller.close();
+        return;
+      }
+      if (read.value.done) {
+        terminal = true;
+        const cleanup = await cleanupMiniLilacStreamReader(
+          reader,
+          undefined,
+          undefined,
+          parsed.cleanupSource,
+        );
+        cleanup.match({
+          ok: () => undefined,
+          err: (error) => controller.enqueue(Result.err(error)),
+        });
+        controller.close();
+        return;
+      }
+      controller.enqueue(Result.ok(read.value.value));
+    },
+    async cancel(reason) {
+      if (terminal) return;
+      terminal = true;
+      const cleanup = await cleanupMiniLilacStreamReader(
+        reader,
+        () => reader.cancel(reason),
+        undefined,
+        parsed.cleanupSource,
+      );
+      const finish = cleanup.match<() => void>({
+        ok: () => () => undefined,
+        err: (error) => () => resultToMiniLilacCompatibilityFailure(error),
+      });
+      return finish();
+    },
+  });
+}
+
+function resultStreamToLegacyStream(stream: MiniLilacResultStream): ReadableStream<UIMessageChunk> {
+  const reader = stream.getReader();
+  let released = false;
+  const release = () => {
+    if (released) return;
+    released = true;
+    reader.releaseLock();
+  };
+
+  return new ReadableStream({
+    async pull(controller) {
+      const read = await reader.read();
+      if (read.done) {
+        release();
+        controller.close();
+        return;
+      }
+      const apply = read.value.match<() => void>({
+        ok: (value) => () => controller.enqueue(value),
+        err: (error) => () => {
+          release();
+          return resultToMiniLilacCompatibilityFailure(error);
+        },
+      });
+      apply();
+    },
+    async cancel(reason) {
+      try {
+        await reader.cancel(reason);
+      } finally {
+        release();
+      }
+    },
+  });
+}
 
 function normalizeBaseUrl(baseUrl: string): string {
   return baseUrl.replace(/\/+$/, "");
@@ -128,6 +911,18 @@ function setQueryParameter(url: string, name: string, value: string): string {
   return `${path}?${params.toString()}${hash}`;
 }
 
+function httpError(operation: string, response: Response, detail: string): MiniLilacHttpError {
+  return new MiniLilacHttpError({
+    operation,
+    status: response.status,
+    detail,
+    message:
+      detail.length > 0
+        ? `MiniLilac request failed (${response.status}): ${detail}`
+        : `MiniLilac request failed (${response.status})`,
+  });
+}
+
 export class MiniLilacTransport implements ChatTransport<MiniLilacUIMessage> {
   private readonly baseUrl: string;
   private readonly bearerToken: MiniLilacBearerTokenResolver | undefined;
@@ -135,7 +930,7 @@ export class MiniLilacTransport implements ChatTransport<MiniLilacUIMessage> {
   private readonly fetch: typeof globalThis.fetch;
   private readonly headers: Record<string, string> | Headers | undefined;
   private readonly createClientCommandId: () => string;
-  private readonly delegate: DefaultChatTransport<MiniLilacUIMessage>;
+  private readonly reconnectEndpoint: MiniLilacReconnectEndpoint | undefined;
   private chatExtras: Omit<MiniLilacChatRequestExtras, "clientCommandId">;
   private bindingUpdateChain: Promise<void> = Promise.resolve();
   private readonly lastStreamCursor = new Map<string, MiniLilacStreamCursor>();
@@ -147,67 +942,156 @@ export class MiniLilacTransport implements ChatTransport<MiniLilacUIMessage> {
     this.credentials = options.credentials;
     this.fetch = options.fetch ?? globalThis.fetch;
     this.headers = options.headers;
+    this.reconnectEndpoint = options.reconnectEndpoint;
     this.createClientCommandId = options.createClientCommandId ?? defaultClientCommandId;
 
-    this.chatExtras = miniLilacChatRequestExtrasSchema.parse({
-      cwd: options.cwd,
-      model: options.model,
-      profile: options.profile,
-      reasoning: options.reasoning,
-    });
-
-    this.delegate = new DefaultChatTransport<MiniLilacUIMessage>({
-      api: joinUrl(this.baseUrl, "chat"),
-      credentials: this.credentials,
-      fetch: this.fetch,
-      headers: () => this.createHeaders(false),
-      prepareSendMessagesRequest: ({ id, messages, body, trigger, messageId }) => {
-        const requestExtras = miniLilacChatRequestExtrasSchema.parse({
-          ...this.chatExtras,
-          ...body,
-        });
-        return {
-          body: {
-            ...requestExtras,
-            id,
-            messages,
-            trigger,
-            messageId,
-            clientCommandId: requestExtras.clientCommandId ?? this.createClientCommandId(),
-          },
-        };
-      },
-      prepareReconnectToStreamRequest: ({ id }) => {
-        const cursor = this.getLastStreamCursor(id);
-        let api = this.resolveReconnectEndpoint(options.reconnectEndpoint, id);
-        if (cursor !== undefined) {
-          api = setQueryParameter(api, "runId", cursor.runId);
-          api = setQueryParameter(api, "after", String(cursor.seq));
-        }
-        return { api };
-      },
-    });
+    this.chatExtras = resultToMiniLilacClientValue(
+      decodeMiniLilacBoundary(
+        {
+          cwd: options.cwd,
+          model: options.model,
+          profile: options.profile,
+          reasoning: options.reasoning,
+        },
+        miniLilacChatRequestExtrasSchema,
+        "transport options",
+      ),
+    );
   }
 
   async sendMessages(
-    options: Parameters<ChatTransport<MiniLilacUIMessage>["sendMessages"]>[0],
+    options: MiniLilacSendMessagesOptions,
   ): Promise<ReadableStream<UIMessageChunk>> {
+    const result = await this.sendMessagesResult(options);
+    return resultStreamToLegacyStream(resultToMiniLilacClientValue(result));
+  }
+
+  async sendMessagesResult(
+    options: MiniLilacSendMessagesOptions,
+  ): Promise<ResultType<MiniLilacResultStream, MiniLilacRequestError>> {
     const generation = (this.streamGenerations.get(options.chatId) ?? 0) + 1;
     this.streamGenerations.set(options.chatId, generation);
-    const stream = await this.delegate.sendMessages(options);
+    const requestExtras = decodeMiniLilacBoundary(
+      { ...this.chatExtras, ...options.body },
+      miniLilacChatRequestExtrasSchema,
+      "chat request extras",
+    );
+    const requestExtrasOutcome = requestExtras.match<
+      | { readonly value: z.output<typeof miniLilacChatRequestExtrasSchema> }
+      | { readonly error: MiniLilacBoundaryInvalid }
+    >({
+      ok: (value) => ({ value }),
+      err: (error) => ({ error }),
+    });
+    if ("error" in requestExtrasOutcome) return Result.err(requestExtrasOutcome.error);
+    const requestExtrasValue = requestExtrasOutcome.value;
+
+    const headers = await this.createHeadersResult(true, options.headers);
+    const headersValue = valueOrTaggedError(headers);
+    if (isMiniLilacRequestError(headersValue)) return Result.err(headersValue);
+    const commandId = captureMiniLilacSync("Create Mini Lilac command ID", () =>
+      requestExtrasValue.clientCommandId === undefined
+        ? this.createClientCommandId()
+        : requestExtrasValue.clientCommandId,
+    );
+    const commandIdValue = valueOrTaggedError(commandId);
+    if (MiniLilacExternalOperationFailed.is(commandIdValue)) return Result.err(commandIdValue);
+    const decodedCommandId = decodeMiniLilacBoundary(
+      commandIdValue,
+      sessionIdSchema,
+      "chat command ID",
+    );
+    const decodedCommandIdValue = valueOrTaggedError(decodedCommandId);
+    if (MiniLilacBoundaryInvalid.is(decodedCommandIdValue))
+      return Result.err(decodedCommandIdValue);
+    const body = requestExtras.andThen((serializedExtras) =>
+      decodedCommandId.andThen((serializedCommandId) =>
+        captureMiniLilacSync("Serialize Mini Lilac chat request", () =>
+          JSON.stringify({
+            ...serializedExtras,
+            id: options.chatId,
+            messages: options.messages,
+            trigger: options.trigger,
+            messageId: options.messageId,
+            clientCommandId: serializedCommandId,
+          }),
+        ),
+      ),
+    );
+    const bodyValue = valueOrTaggedError(body);
+    if (isMiniLilacRequestError(bodyValue)) return Result.err(bodyValue);
+
+    const response = await captureMiniLilacPromise(
+      "Send Mini Lilac chat request",
+      () =>
+        this.fetch(joinUrl(this.baseUrl, "chat"), {
+          method: "POST",
+          body: bodyValue,
+          credentials: this.credentials,
+          headers: headersValue,
+          signal: options.abortSignal,
+        }),
+      options.abortSignal,
+    );
+    const responseValue = valueOrTaggedError(response);
+    if (isMiniLilacRequestError(responseValue)) return Result.err(responseValue);
+    const stream = await this.responseStreamResult(responseValue, "Send Mini Lilac chat request");
+    const streamValue = valueOrTaggedError(stream);
+    if (isMiniLilacRequestError(streamValue)) return Result.err(streamValue);
     this.lastStreamCursor.delete(options.chatId);
-    return this.trackStream(options.chatId, generation, stream);
+    return Result.ok(
+      this.trackResultStream(
+        options.chatId,
+        generation,
+        resultStreamFromMiniLilacStream(streamValue, options.abortSignal),
+      ),
+    );
   }
 
   async reconnectToStream(
-    options: Parameters<ChatTransport<MiniLilacUIMessage>["reconnectToStream"]>[0],
+    options: MiniLilacReconnectOptions,
   ): Promise<ReadableStream<UIMessageChunk> | null> {
-    const stream = await this.delegate.reconnectToStream(options);
-    if (stream === null) return null;
-    return this.trackStream(
+    const result = resultToMiniLilacClientValue(await this.reconnectToStreamResult(options));
+    return result === null ? null : resultStreamToLegacyStream(result);
+  }
+
+  async reconnectToStreamResult(
+    options: MiniLilacReconnectOptions,
+  ): Promise<ResultType<MiniLilacResultStream | null, MiniLilacRequestError>> {
+    const endpointResult = this.resolveReconnectEndpointResult(
+      this.reconnectEndpoint,
       options.chatId,
-      this.streamGenerations.get(options.chatId) ?? 0,
-      stream,
+    );
+    const endpointValue = valueOrTaggedError(endpointResult);
+    if (isMiniLilacRequestError(endpointValue)) return Result.err(endpointValue);
+    let endpoint = endpointValue;
+    const cursor = this.getLastStreamCursor(options.chatId);
+    if (cursor !== undefined) {
+      endpoint = setQueryParameter(endpoint, "runId", cursor.runId);
+      endpoint = setQueryParameter(endpoint, "after", String(cursor.seq));
+    }
+    const headers = await this.createHeadersResult(false, options.headers);
+    const headersValue = valueOrTaggedError(headers);
+    if (isMiniLilacRequestError(headersValue)) return Result.err(headersValue);
+    const response = await captureMiniLilacPromise("Reconnect Mini Lilac stream", () =>
+      this.fetch(endpoint, {
+        method: "GET",
+        credentials: this.credentials,
+        headers: headersValue,
+      }),
+    );
+    const responseValue = valueOrTaggedError(response);
+    if (isMiniLilacRequestError(responseValue)) return Result.err(responseValue);
+    if (responseValue.status === 204) return Result.ok(null);
+    const stream = await this.responseStreamResult(responseValue, "Reconnect Mini Lilac stream");
+    const streamValue = valueOrTaggedError(stream);
+    if (isMiniLilacRequestError(streamValue)) return Result.err(streamValue);
+    return Result.ok(
+      this.trackResultStream(
+        options.chatId,
+        this.streamGenerations.get(options.chatId) ?? 0,
+        resultStreamFromMiniLilacStream(streamValue),
+      ),
     );
   }
 
@@ -215,25 +1099,36 @@ export class MiniLilacTransport implements ChatTransport<MiniLilacUIMessage> {
     return this.lastStreamCursor.get(chatId);
   }
 
-  getSession(
+  async getSession(
     sessionId: string,
     options: MiniLilacRequestOptions = {},
   ): Promise<MiniLilacSessionSnapshot> {
-    const id = sessionIdSchema.parse(sessionId);
-    return this.requestJson(`sessions/${encodeURIComponent(id)}`, miniLilacSessionSnapshotSchema, {
-      signal: options.signal,
-    });
+    return resultToMiniLilacClientValue(await this.getSessionResult(sessionId, options));
   }
 
-  getSessionResume(
+  getSessionResult(
+    sessionId: string,
+    options: MiniLilacRequestOptions = {},
+  ): Promise<ResultType<MiniLilacSessionSnapshot, MiniLilacRequestError>> {
+    return this.requestSessionJsonResult(sessionId, "", miniLilacSessionSnapshotSchema, options);
+  }
+
+  async getSessionResume(
     sessionId: string,
     options: MiniLilacRequestOptions = {},
   ): Promise<MiniLilacSessionResume> {
-    const id = sessionIdSchema.parse(sessionId);
-    return this.requestJson(
-      `sessions/${encodeURIComponent(id)}/resume`,
+    return resultToMiniLilacClientValue(await this.getSessionResumeResult(sessionId, options));
+  }
+
+  getSessionResumeResult(
+    sessionId: string,
+    options: MiniLilacRequestOptions = {},
+  ): Promise<ResultType<MiniLilacSessionResume, MiniLilacRequestError>> {
+    return this.requestSessionJsonResult(
+      sessionId,
+      "/resume",
       miniLilacSessionResumeSchema,
-      { signal: options.signal },
+      options,
     );
   }
 
@@ -248,90 +1143,161 @@ export class MiniLilacTransport implements ChatTransport<MiniLilacUIMessage> {
     this.lastStreamCursor.set(chatId, { runId: cursor.runId, seq: cursor.afterSeq });
   }
 
-  listSessions(
+  async listSessions(
     cwd: string,
     options: MiniLilacRequestOptions = {},
   ): Promise<MiniLilacSessionSnapshot[]> {
-    const normalizedCwd = z.string().trim().min(1).parse(cwd);
-    return this.requestJson(
-      `sessions?cwd=${encodeURIComponent(normalizedCwd)}`,
+    return resultToMiniLilacClientValue(await this.listSessionsResult(cwd, options));
+  }
+
+  listSessionsResult(
+    cwd: string,
+    options: MiniLilacRequestOptions = {},
+  ): Promise<ResultType<MiniLilacSessionSnapshot[], MiniLilacRequestError>> {
+    const normalizedCwd = decodeMiniLilacBoundary(cwd, sessionIdSchema, "sessions cwd");
+    const normalizedCwdValue = valueOrTaggedError(normalizedCwd);
+    if (MiniLilacBoundaryInvalid.is(normalizedCwdValue)) {
+      return Promise.resolve(Result.err(normalizedCwdValue));
+    }
+    return this.requestJsonResult(
+      `sessions?cwd=${encodeURIComponent(normalizedCwdValue)}`,
       miniLilacSessionsSchema,
       { signal: options.signal },
+      "List Mini Lilac sessions",
     );
   }
 
-  getMessages(
+  async getMessages(
     sessionId: string,
     options: MiniLilacRequestOptions = {},
   ): Promise<MiniLilacUIMessage[]> {
-    const id = sessionIdSchema.parse(sessionId);
-    return this.requestJson(
-      `sessions/${encodeURIComponent(id)}/messages`,
-      miniLilacMessagesSchema,
-      {
-        signal: options.signal,
-      },
-    );
+    return resultToMiniLilacClientValue(await this.getMessagesResult(sessionId, options));
+  }
+
+  getMessagesResult(
+    sessionId: string,
+    options: MiniLilacRequestOptions = {},
+  ): Promise<ResultType<MiniLilacUIMessage[], MiniLilacRequestError>> {
+    return this.requestSessionJsonResult(sessionId, "/messages", miniLilacMessagesSchema, options);
   }
 
   async streamSession(
     sessionId: string,
     options: MiniLilacRequestOptions = {},
   ): Promise<ReadableStream<UIMessageChunk> | null> {
-    const normalizedSessionId = sessionIdSchema.parse(sessionId);
-    const headers = await this.createHeaders(false);
-    const response = await this.fetch(
-      joinUrl(this.baseUrl, `chat/${encodeURIComponent(normalizedSessionId)}/stream`),
-      { credentials: this.credentials, headers, signal: options.signal },
+    const result = resultToMiniLilacClientValue(await this.streamSessionResult(sessionId, options));
+    return result === null ? null : resultStreamToLegacyStream(result);
+  }
+
+  async streamSessionResult(
+    sessionId: string,
+    options: MiniLilacRequestOptions = {},
+  ): Promise<ResultType<MiniLilacResultStream | null, MiniLilacRequestError>> {
+    const id = decodeMiniLilacBoundary(sessionId, sessionIdSchema, "session ID");
+    const idValue = valueOrTaggedError(id);
+    if (MiniLilacBoundaryInvalid.is(idValue)) return Result.err(idValue);
+    const headers = await this.createHeadersResult(false);
+    const headersValue = valueOrTaggedError(headers);
+    if (isMiniLilacRequestError(headersValue)) return Result.err(headersValue);
+    const operation = "Stream Mini Lilac session";
+    const response = await captureMiniLilacPromise(
+      operation,
+      () =>
+        this.fetch(joinUrl(this.baseUrl, `chat/${encodeURIComponent(idValue)}/stream`), {
+          credentials: this.credentials,
+          headers: headersValue,
+          signal: options.signal,
+        }),
+      options.signal,
     );
-    if (response.status === 204) return null;
-    if (!response.ok || response.body === null) {
-      const detail = await response.text();
-      throw new Error(
-        detail.length > 0
-          ? `MiniLilac request failed (${response.status}): ${detail}`
-          : `MiniLilac request failed (${response.status})`,
-      );
-    }
-    return parseJsonEventStream({
-      stream: response.body,
-      schema: uiMessageChunkSchema,
-    }).pipeThrough(
-      new TransformStream({
-        transform(chunk, controller) {
-          if (!chunk.success) throw chunk.error;
-          controller.enqueue(chunk.value);
-        },
-      }),
+    const responseValue = valueOrTaggedError(response);
+    if (isMiniLilacRequestError(responseValue)) return Result.err(responseValue);
+    if (responseValue.status === 204) return Result.ok(null);
+    const stream = await this.responseStreamResult(responseValue, operation);
+    const streamValue = valueOrTaggedError(stream);
+    if (isMiniLilacRequestError(streamValue)) return Result.err(streamValue);
+    return Result.ok(resultStreamFromMiniLilacStream(streamValue, options.signal));
+  }
+
+  async getTodos(
+    sessionId: string,
+    options: MiniLilacRequestOptions = {},
+  ): Promise<MiniLilacTodoState> {
+    return resultToMiniLilacClientValue(await this.getTodosResult(sessionId, options));
+  }
+
+  getTodosResult(
+    sessionId: string,
+    options: MiniLilacRequestOptions = {},
+  ): Promise<ResultType<MiniLilacTodoState, MiniLilacRequestError>> {
+    return this.requestSessionJsonResult(sessionId, "/todos", miniLilacTodoStateSchema, options);
+  }
+
+  async listModels(options: MiniLilacRequestOptions = {}): Promise<MiniLilacModelSummary[]> {
+    return resultToMiniLilacClientValue(await this.listModelsResult(options));
+  }
+
+  listModelsResult(
+    options: MiniLilacRequestOptions = {},
+  ): Promise<ResultType<MiniLilacModelSummary[], MiniLilacRequestError>> {
+    return this.requestJsonResult(
+      "models",
+      miniLilacModelsSchema,
+      { signal: options.signal },
+      "List Mini Lilac models",
     );
   }
 
-  getTodos(sessionId: string, options: MiniLilacRequestOptions = {}): Promise<MiniLilacTodoState> {
-    const id = sessionIdSchema.parse(sessionId);
-    return this.requestJson(`sessions/${encodeURIComponent(id)}/todos`, miniLilacTodoStateSchema, {
-      signal: options.signal,
-    });
+  async listProfiles(options: MiniLilacRequestOptions = {}): Promise<MiniLilacProfileSummary[]> {
+    return resultToMiniLilacClientValue(await this.listProfilesResult(options));
   }
 
-  listModels(options: MiniLilacRequestOptions = {}): Promise<MiniLilacModelSummary[]> {
-    return this.requestJson("models", miniLilacModelsSchema, { signal: options.signal });
+  listProfilesResult(
+    options: MiniLilacRequestOptions = {},
+  ): Promise<ResultType<MiniLilacProfileSummary[], MiniLilacRequestError>> {
+    return this.requestJsonResult(
+      "profiles",
+      miniLilacProfilesSchema,
+      { signal: options.signal },
+      "List Mini Lilac profiles",
+    );
   }
 
-  listProfiles(options: MiniLilacRequestOptions = {}): Promise<MiniLilacProfileSummary[]> {
-    return this.requestJson("profiles", miniLilacProfilesSchema, { signal: options.signal });
-  }
-
-  listSkills(
+  async listSkills(
     cwd: string,
     profile?: string,
     options: MiniLilacRequestOptions = {},
   ): Promise<MiniLilacSkillSummary[]> {
-    const normalizedCwd = z.string().trim().min(1).parse(cwd);
-    const params = new URLSearchParams({ cwd: normalizedCwd });
-    if (profile !== undefined) params.set("profile", sessionIdSchema.parse(profile));
-    return this.requestJson(`skills?${params.toString()}`, miniLilacSkillsSchema, {
-      signal: options.signal,
-    });
+    return resultToMiniLilacClientValue(await this.listSkillsResult(cwd, profile, options));
+  }
+
+  listSkillsResult(
+    cwd: string,
+    profile?: string,
+    options: MiniLilacRequestOptions = {},
+  ): Promise<ResultType<MiniLilacSkillSummary[], MiniLilacRequestError>> {
+    const normalizedCwd = decodeMiniLilacBoundary(cwd, sessionIdSchema, "skills cwd");
+    const normalizedCwdValue = valueOrTaggedError(normalizedCwd);
+    if (MiniLilacBoundaryInvalid.is(normalizedCwdValue)) {
+      return Promise.resolve(Result.err(normalizedCwdValue));
+    }
+    let normalizedProfile: ResultType<string | undefined, MiniLilacBoundaryInvalid> =
+      Result.ok(undefined);
+    if (profile !== undefined) {
+      normalizedProfile = decodeMiniLilacBoundary(profile, sessionIdSchema, "skills profile");
+    }
+    const normalizedProfileValue = valueOrTaggedError(normalizedProfile);
+    if (MiniLilacBoundaryInvalid.is(normalizedProfileValue)) {
+      return Promise.resolve(Result.err(normalizedProfileValue));
+    }
+    const params = new URLSearchParams({ cwd: normalizedCwdValue });
+    if (normalizedProfileValue !== undefined) params.set("profile", normalizedProfileValue);
+    return this.requestJsonResult(
+      `skills?${params.toString()}`,
+      miniLilacSkillsSchema,
+      { signal: options.signal },
+      "List Mini Lilac skills",
+    );
   }
 
   setSessionBindings(bindings: {
@@ -339,110 +1305,158 @@ export class MiniLilacTransport implements ChatTransport<MiniLilacUIMessage> {
     readonly profile?: string;
     readonly reasoning?: MiniLilacChatRequestExtras["reasoning"];
   }): void {
-    this.chatExtras = miniLilacChatRequestExtrasSchema.parse({
-      ...this.chatExtras,
-      ...bindings,
-    });
+    this.chatExtras = resultToMiniLilacClientValue(
+      decodeMiniLilacBoundary(
+        { ...this.chatExtras, ...bindings },
+        miniLilacChatRequestExtrasSchema,
+        "session bindings",
+      ),
+    );
   }
 
-  updateSessionBindings(
+  async updateSessionBindings(
     request: MiniLilacUpdateSessionBindingsInput,
     options: MiniLilacRequestOptions = {},
   ): Promise<MiniLilacSessionSnapshot> {
-    const operation = this.bindingUpdateChain.then(
-      () => this.performSessionBindingUpdate(request, options),
-      () => this.performSessionBindingUpdate(request, options),
+    return resultToMiniLilacClientValue(await this.updateSessionBindingsResult(request, options));
+  }
+
+  updateSessionBindingsResult(
+    request: MiniLilacUpdateSessionBindingsInput,
+    options: MiniLilacRequestOptions = {},
+  ): Promise<ResultType<MiniLilacSessionSnapshot, MiniLilacRequestError>> {
+    const operation = this.bindingUpdateChain.then(() =>
+      this.performSessionBindingUpdateResult(request, options),
     );
-    this.bindingUpdateChain = operation.then(
-      () => undefined,
-      () => undefined,
-    );
+    this.bindingUpdateChain = operation.then(() => undefined);
     return operation;
   }
 
-  steer(
+  async steer(
     request: MiniLilacSteerRequest,
     options: MiniLilacRequestOptions = {},
   ): Promise<MiniLilacSteerResult> {
-    const payload = miniLilacSteerRequestSchema.parse({
-      ...request,
-      clientCommandId: request.clientCommandId ?? this.createClientCommandId(),
-    });
-    return this.postControl(
-      payload.sessionId,
+    return resultToMiniLilacClientValue(await this.steerResult(request, options));
+  }
+
+  steerResult(
+    request: MiniLilacSteerRequest,
+    options: MiniLilacRequestOptions = {},
+  ): Promise<ResultType<MiniLilacSteerResult, MiniLilacRequestError>> {
+    return this.postGeneratedControlResult(
+      request,
+      miniLilacSteerRequestSchema,
       "steer",
-      payload,
       miniLilacSteerResultSchema,
       options,
     );
   }
 
-  interruptQueuedSteering(
+  async interruptQueuedSteering(
     request: MiniLilacInterruptQueuedSteeringInput,
     options: MiniLilacRequestOptions = {},
   ): Promise<MiniLilacInterruptQueuedSteeringResult> {
-    const payload = miniLilacInterruptQueuedSteeringRequestSchema.parse({
-      ...request,
-      clientCommandId: request.clientCommandId ?? this.createClientCommandId(),
-    });
-    return this.postControl(
-      payload.sessionId,
+    return resultToMiniLilacClientValue(await this.interruptQueuedSteeringResult(request, options));
+  }
+
+  interruptQueuedSteeringResult(
+    request: MiniLilacInterruptQueuedSteeringInput,
+    options: MiniLilacRequestOptions = {},
+  ): Promise<ResultType<MiniLilacInterruptQueuedSteeringResult, MiniLilacRequestError>> {
+    return this.postGeneratedControlResult(
+      request,
+      miniLilacInterruptQueuedSteeringRequestSchema,
       "interrupt-queued-steering",
-      payload,
       miniLilacInterruptQueuedSteeringResultSchema,
       options,
     );
   }
 
-  cancel(
+  async cancel(
     request: MiniLilacCancelRequest,
     options: MiniLilacRequestOptions = {},
   ): Promise<MiniLilacCancelResult> {
-    const payload = miniLilacCancelRequestSchema.parse({
-      ...request,
-      clientCommandId: request.clientCommandId ?? this.createClientCommandId(),
-    });
-    return this.postControl(
-      payload.sessionId,
+    return resultToMiniLilacClientValue(await this.cancelResult(request, options));
+  }
+
+  cancelResult(
+    request: MiniLilacCancelRequest,
+    options: MiniLilacRequestOptions = {},
+  ): Promise<ResultType<MiniLilacCancelResult, MiniLilacRequestError>> {
+    return this.postGeneratedControlResult(
+      request,
+      miniLilacCancelRequestSchema,
       "cancel",
-      payload,
       miniLilacCancelResultSchema,
       options,
     );
   }
 
-  undo(
+  async undo(
     request: MiniLilacUndoInput,
     options: MiniLilacRequestOptions = {},
   ): Promise<MiniLilacUndoResult> {
-    const payload = miniLilacUndoRequestSchema.parse({
-      ...request,
-      clientCommandId: request.clientCommandId ?? this.createClientCommandId(),
-    });
-    return this.postControl(payload.sessionId, "undo", payload, miniLilacUndoResultSchema, options);
+    return resultToMiniLilacClientValue(await this.undoResult(request, options));
   }
 
-  redo(
+  undoResult(
+    request: MiniLilacUndoInput,
+    options: MiniLilacRequestOptions = {},
+  ): Promise<ResultType<MiniLilacUndoResult, MiniLilacRequestError>> {
+    return this.postGeneratedControlResult(
+      request,
+      miniLilacUndoRequestSchema,
+      "undo",
+      miniLilacUndoResultSchema,
+      options,
+    );
+  }
+
+  async redo(
     request: MiniLilacRedoInput,
     options: MiniLilacRequestOptions = {},
   ): Promise<MiniLilacRedoResult> {
-    const payload = miniLilacRedoRequestSchema.parse({
-      ...request,
-      clientCommandId: request.clientCommandId ?? this.createClientCommandId(),
-    });
-    return this.postControl(payload.sessionId, "redo", payload, miniLilacRedoResultSchema, options);
+    return resultToMiniLilacClientValue(await this.redoResult(request, options));
+  }
+
+  redoResult(
+    request: MiniLilacRedoInput,
+    options: MiniLilacRequestOptions = {},
+  ): Promise<ResultType<MiniLilacRedoResult, MiniLilacRequestError>> {
+    return this.postGeneratedControlResult(
+      request,
+      miniLilacRedoRequestSchema,
+      "redo",
+      miniLilacRedoResultSchema,
+      options,
+    );
   }
 
   /** Stop a running compaction. Detaching the stream does not; this does. */
-  cancelCompaction(
+  async cancelCompaction(
     request: MiniLilacCancelCompactionRequest,
     options: MiniLilacRequestOptions = {},
   ): Promise<MiniLilacCancelCompactionResult> {
-    const payload = miniLilacCancelCompactionRequestSchema.parse(request);
-    return this.postControl(
-      payload.sessionId,
+    return resultToMiniLilacClientValue(await this.cancelCompactionResult(request, options));
+  }
+
+  cancelCompactionResult(
+    request: MiniLilacCancelCompactionRequest,
+    options: MiniLilacRequestOptions = {},
+  ): Promise<ResultType<MiniLilacCancelCompactionResult, MiniLilacRequestError>> {
+    const payload = decodeMiniLilacBoundary(
+      request,
+      miniLilacCancelCompactionRequestSchema,
+      "cancel compaction request",
+    );
+    const payloadValue = valueOrTaggedError(payload);
+    if (MiniLilacBoundaryInvalid.is(payloadValue)) {
+      return Promise.resolve(Result.err(payloadValue));
+    }
+    return this.postControlResult(
+      payloadValue.sessionId,
       "compact/cancel",
-      payload,
+      payloadValue,
       miniLilacCancelCompactionResultSchema,
       options,
     );
@@ -451,10 +1465,6 @@ export class MiniLilacTransport implements ChatTransport<MiniLilacUIMessage> {
   /**
    * Run a manual compaction, reporting lifecycle events as they arrive.
    *
-   * The response is an event stream rather than a JSON body because compaction
-   * is long-running: without a channel there is nothing to stream the summary or
-   * an elapsed timer over.
-   *
    * Aborting `options.signal` only detaches this client. Compaction keeps
    * running and still commits server-side; stopping it is `cancelCompaction`.
    */
@@ -462,160 +1472,310 @@ export class MiniLilacTransport implements ChatTransport<MiniLilacUIMessage> {
     request: MiniLilacCompactInput,
     options: MiniLilacCompactOptions = {},
   ): Promise<MiniLilacCompactResult> {
-    const payload = miniLilacCompactRequestSchema.parse({
-      ...request,
-      clientCommandId: request.clientCommandId ?? this.createClientCommandId(),
-    });
-    const stream = await this.postStream(
-      `sessions/${encodeURIComponent(payload.sessionId)}/compact`,
-      payload,
+    return resultToMiniLilacClientValue(await this.compactResult(request, options));
+  }
+
+  async compactResult(
+    request: MiniLilacCompactInput,
+    options: MiniLilacCompactOptions = {},
+  ): Promise<ResultType<MiniLilacCompactResult, MiniLilacCompactError>> {
+    const commandId = captureMiniLilacSync("Create Mini Lilac compact command ID", () =>
+      request.clientCommandId === undefined
+        ? this.createClientCommandId()
+        : request.clientCommandId,
+    );
+    const commandIdValue = valueOrTaggedError(commandId);
+    if (MiniLilacExternalOperationFailed.is(commandIdValue)) return Result.err(commandIdValue);
+    const payload = decodeMiniLilacBoundary(
+      { ...request, clientCommandId: commandIdValue },
+      miniLilacCompactRequestSchema,
+      "compact request",
+    );
+    const payloadValue = valueOrTaggedError(payload);
+    if (MiniLilacBoundaryInvalid.is(payloadValue)) return Result.err(payloadValue);
+    const stream = await this.postStreamResult(
+      `sessions/${encodeURIComponent(payloadValue.sessionId)}/compact`,
+      payloadValue,
       options.signal,
     );
+    const streamValue = valueOrTaggedError(stream);
+    if (isMiniLilacRequestError(streamValue)) return Result.err(streamValue);
 
-    let result: MiniLilacCompactResult | undefined;
-    const reader = stream.getReader();
-    try {
-      for (;;) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        const part = miniLilacUIMessageDataPartSchema.safeParse(value);
-        if (!part.success) {
-          if (z.object({ type: z.literal("data-compaction") }).safeParse(value).success) {
-            throw new Error("Invalid compaction lifecycle event");
-          }
-          continue;
-        }
-        if (part.data.type === "data-session") {
-          options.onSession?.(part.data.data);
-          continue;
-        }
-        if (part.data.type !== "data-compaction") continue;
-        const event = part.data.data;
-        options.onEvent?.(event);
-        if (event.phase === "failed") {
-          throw new Error(event.error ?? "Context compaction failed");
-        }
-        // A cancel is a deliberate stop, not a failure, and callers render it
-        // differently; a distinct error type is what lets them tell.
-        if (event.phase === "cancelled") throw new MiniLilacCompactionCancelledError();
-        if (event.phase !== "completed") continue;
-        if (event.outcome === undefined || event.messageCountAfter === undefined) {
-          throw new Error("Context compaction completed without a terminal result");
-        }
-        result = miniLilacCompactResultSchema.parse({
-          status: event.outcome,
-          clientCommandId: payload.clientCommandId,
-          messageCountBefore: event.messageCountBefore,
-          messageCountAfter: event.messageCountAfter,
-          estimatedInputTokensBefore: event.estimatedInputTokensBefore,
-          estimatedInputTokensAfter: event.estimatedInputTokensAfter,
-        });
-        // `completed` is terminal: the compaction is committed. Waiting for EOF
-        // would let a post-terminal disconnect (or a stream held open) turn a
-        // committed compaction into an error or a hang.
-        break;
-      }
-    } finally {
-      // Failed/cancelled/completed all leave the loop with the stream possibly
-      // open; releasing it is a detach, which never cancels server-side work.
-      await reader.cancel().catch(() => undefined);
-      reader.releaseLock();
-    }
-    if (!result) throw new Error("Context compaction ended without a result");
-    return result;
-  }
-
-  private async postStream(
-    endpoint: string,
-    body: object,
-    signal: AbortSignal | undefined,
-  ): Promise<ReadableStream<UIMessageChunk>> {
-    const headers = await this.createHeaders(true);
-    const response = await this.fetch(joinUrl(this.baseUrl, endpoint), {
-      method: "POST",
-      body: JSON.stringify(body),
-      credentials: this.credentials,
-      headers,
-      signal,
-    });
-    if (!response.ok || !response.body) {
-      const detail = response.ok ? "" : await response.text();
-      throw new Error(
-        detail.length > 0
-          ? `MiniLilac request failed (${response.status}): ${detail}`
-          : `MiniLilac request failed (${response.status})`,
-      );
-    }
-    return parseJsonEventStream({
-      stream: response.body,
-      schema: uiMessageChunkSchema,
-    }).pipeThrough(
-      new TransformStream({
-        transform(chunk, controller) {
-          if (!chunk.success) throw chunk.error;
-          controller.enqueue(chunk.value);
-        },
-      }),
+    const reader = streamValue.stream.getReader();
+    const attempt = await captureMiniLilacPromiseOutcome(
+      "Read Mini Lilac compaction result",
+      () => this.readCompactionResult(reader, payloadValue.clientCommandId, options),
+      options.signal,
     );
+    if (attempt.kind === "panic") {
+      await cleanupMiniLilacStreamReader(
+        reader,
+        () => reader.cancel(),
+        attempt.panic,
+        streamValue.cleanupSource,
+      );
+      return throwMiniLilacPanic(attempt.panic);
+    }
+    const primary: ResultType<MiniLilacCompactResult, MiniLilacCompactionPrimaryError> =
+      attempt.kind === "error" ? Result.err(attempt.error) : attempt.value;
+    const cleanup = await cleanupMiniLilacStreamReader(
+      reader,
+      () => reader.cancel(),
+      undefined,
+      streamValue.cleanupSource,
+    );
+    return cleanup.match<ResultType<MiniLilacCompactResult, MiniLilacCompactError>>({
+      ok: () => primary,
+      err: (cleanupError) =>
+        primary.match<ResultType<MiniLilacCompactResult, MiniLilacCompactError>>({
+          ok: () => Result.err(cleanupError),
+          err: (primaryError) =>
+            Result.err(
+              new MiniLilacCompactionAndCleanupFailed({
+                primary: primaryError,
+                cleanup: cleanupError,
+                message: "Context compaction and stream cleanup both failed",
+              }),
+            ),
+        }),
+    });
   }
 
-  private async performSessionBindingUpdate(
+  private async readCompactionResult(
+    reader: ReadableStreamDefaultReader<UIMessageChunk>,
+    clientCommandId: string,
+    options: MiniLilacCompactOptions,
+  ): Promise<ResultType<MiniLilacCompactResult, MiniLilacCompactionPrimaryError>> {
+    for (;;) {
+      const read = await captureMiniLilacPromise(
+        "Read Mini Lilac compaction stream",
+        () => reader.read(),
+        options.signal,
+      );
+      const readValue = valueOrTaggedError(read);
+      if (isMiniLilacRequestError(readValue)) return Result.err(readValue);
+      if (readValue.done) {
+        return Result.err(
+          new MiniLilacCompactionProtocolError({
+            message: "Context compaction ended without a result",
+          }),
+        );
+      }
+      const part = decodeMiniLilacBoundary(
+        readValue.value,
+        miniLilacUIMessageDataPartSchema,
+        "compaction stream data part",
+      );
+      const partValue = valueOrTaggedError(part);
+      if (MiniLilacBoundaryInvalid.is(partValue)) {
+        const compactionDiscriminant = decodeMiniLilacBoundary(
+          readValue.value,
+          compactionChunkDiscriminantSchema,
+          "compaction stream discriminant",
+        );
+        const isCompaction = compactionDiscriminant.match<boolean>({
+          ok: () => true,
+          err: () => false,
+        });
+        if (isCompaction) {
+          return Result.err(
+            new MiniLilacCompactionProtocolError({
+              message: "Invalid compaction lifecycle event",
+            }),
+          );
+        }
+        continue;
+      }
+      if (partValue.type === "data-session") {
+        const snapshot = partValue.data;
+        if (options.onSession !== undefined) {
+          const called = captureMiniLilacSync("Handle Mini Lilac session event", () =>
+            options.onSession?.(snapshot),
+          );
+          const calledValue = valueOrTaggedError(called);
+          if (MiniLilacExternalOperationFailed.is(calledValue)) return Result.err(calledValue);
+        }
+        continue;
+      }
+      if (partValue.type !== "data-compaction") continue;
+      const event = partValue.data;
+      if (options.onEvent !== undefined) {
+        const called = captureMiniLilacSync("Handle Mini Lilac compaction event", () =>
+          options.onEvent?.(event),
+        );
+        const calledValue = valueOrTaggedError(called);
+        if (MiniLilacExternalOperationFailed.is(calledValue)) return Result.err(calledValue);
+      }
+      switch (event.phase) {
+        case "started":
+        case "progress":
+          continue;
+        case "failed":
+          return Result.err(
+            new MiniLilacCompactionFailed({
+              message: event.error ?? "Context compaction failed",
+            }),
+          );
+        case "cancelled":
+          return Result.err(new MiniLilacCompactionCancelledError());
+        case "completed": {
+          if (event.outcome === undefined || event.messageCountAfter === undefined) {
+            return Result.err(
+              new MiniLilacCompactionProtocolError({
+                message: "Context compaction completed without a terminal result",
+              }),
+            );
+          }
+          const beforeTokens =
+            event.estimatedInputTokensBefore === undefined
+              ? {}
+              : { estimatedInputTokensBefore: event.estimatedInputTokensBefore };
+          const afterTokens =
+            event.estimatedInputTokensAfter === undefined
+              ? {}
+              : { estimatedInputTokensAfter: event.estimatedInputTokensAfter };
+          return Result.ok({
+            status: event.outcome,
+            clientCommandId,
+            messageCountBefore: event.messageCountBefore,
+            messageCountAfter: event.messageCountAfter,
+            ...beforeTokens,
+            ...afterTokens,
+          });
+        }
+      }
+    }
+  }
+
+  private async postStreamResult(
+    endpoint: string,
+    bodyValue: object,
+    signal: AbortSignal | undefined,
+  ): Promise<ResultType<MiniLilacParsedStream, MiniLilacRequestError>> {
+    const headers = await this.createHeadersResult(true);
+    const headersValue = valueOrTaggedError(headers);
+    if (isMiniLilacRequestError(headersValue)) return Result.err(headersValue);
+    const body = captureMiniLilacSync("Serialize Mini Lilac stream request", () =>
+      JSON.stringify(bodyValue),
+    );
+    const serializedBody = valueOrTaggedError(body);
+    if (MiniLilacExternalOperationFailed.is(serializedBody)) return Result.err(serializedBody);
+    const operation = "Start Mini Lilac stream request";
+    const response = await captureMiniLilacPromise(
+      operation,
+      () =>
+        this.fetch(joinUrl(this.baseUrl, endpoint), {
+          method: "POST",
+          body: serializedBody,
+          credentials: this.credentials,
+          headers: headersValue,
+          signal,
+        }),
+      signal,
+    );
+    const responseValue = valueOrTaggedError(response);
+    if (isMiniLilacRequestError(responseValue)) return Result.err(responseValue);
+    return this.responseStreamResult(responseValue, operation);
+  }
+
+  private async performSessionBindingUpdateResult(
     request: MiniLilacUpdateSessionBindingsInput,
     options: MiniLilacRequestOptions,
-  ): Promise<MiniLilacSessionSnapshot> {
-    const payload = miniLilacUpdateSessionBindingsRequestSchema.parse({
-      ...request,
-      clientCommandId: request.clientCommandId ?? this.createClientCommandId(),
-    });
-    const snapshot = await this.postControl(
-      payload.sessionId,
+  ): Promise<ResultType<MiniLilacSessionSnapshot, MiniLilacRequestError>> {
+    const commandId = captureMiniLilacSync("Create Mini Lilac binding command ID", () =>
+      request.clientCommandId === undefined
+        ? this.createClientCommandId()
+        : request.clientCommandId,
+    );
+    const commandIdValue = valueOrTaggedError(commandId);
+    if (MiniLilacExternalOperationFailed.is(commandIdValue)) return Result.err(commandIdValue);
+    const payload = decodeMiniLilacBoundary(
+      { ...request, clientCommandId: commandIdValue },
+      miniLilacUpdateSessionBindingsRequestSchema,
+      "session binding update",
+    );
+    const payloadValue = valueOrTaggedError(payload);
+    if (MiniLilacBoundaryInvalid.is(payloadValue)) return Result.err(payloadValue);
+    const snapshot = await this.postControlResult(
+      payloadValue.sessionId,
       "bindings",
-      payload,
+      payloadValue,
       miniLilacSessionSnapshotSchema,
       options,
     );
+    const snapshotValue = valueOrTaggedError(snapshot);
+    if (isMiniLilacRequestError(snapshotValue)) return Result.err(snapshotValue);
     this.setSessionBindings({
-      model: snapshot.model ?? undefined,
-      profile: snapshot.profile ?? undefined,
-      reasoning: snapshot.reasoning ?? undefined,
+      model: snapshotValue.model ?? undefined,
+      profile: snapshotValue.profile ?? undefined,
+      reasoning: snapshotValue.reasoning ?? undefined,
     });
-    return snapshot;
+    return Result.ok(snapshotValue);
   }
 
-  private resolveReconnectEndpoint(
+  private resolveReconnectEndpointResult(
     endpoint: MiniLilacReconnectEndpoint | undefined,
     chatId: string,
-  ): string {
-    if (typeof endpoint === "function") return endpoint({ baseUrl: this.baseUrl, chatId });
-    if (endpoint !== undefined) {
-      if (endpoint.startsWith("/") || /^[a-z][a-z\d+.-]*:\/\//i.test(endpoint)) return endpoint;
-      return joinUrl(this.baseUrl, endpoint);
+  ): ResultType<string, MiniLilacBoundaryInvalid | MiniLilacExternalOperationFailed> {
+    if (typeof endpoint === "function") {
+      const resolved = captureMiniLilacSync("Resolve Mini Lilac reconnect endpoint", () =>
+        endpoint({ baseUrl: this.baseUrl, chatId }),
+      );
+      const resolvedValue = valueOrTaggedError(resolved);
+      if (MiniLilacExternalOperationFailed.is(resolvedValue)) return Result.err(resolvedValue);
+      return decodeMiniLilacBoundary(resolvedValue, z.string().min(1), "reconnect endpoint");
     }
-    return joinUrl(this.baseUrl, `chat/${encodeURIComponent(chatId)}/stream`);
+    if (endpoint !== undefined) {
+      if (endpoint.startsWith("/") || /^[a-z][a-z\d+.-]*:\/\//i.test(endpoint)) {
+        return Result.ok(endpoint);
+      }
+      return Result.ok(joinUrl(this.baseUrl, endpoint));
+    }
+    return Result.ok(joinUrl(this.baseUrl, `chat/${encodeURIComponent(chatId)}/stream`));
   }
 
-  private trackStream(
+  private trackResultStream(
     chatId: string,
     generation: number,
-    stream: ReadableStream<UIMessageChunk>,
-  ): ReadableStream<UIMessageChunk> {
+    stream: MiniLilacResultStream,
+  ): MiniLilacResultStream {
     let pendingCursor: MiniLilacStreamCursor | undefined;
 
     return stream.pipeThrough(
-      new TransformStream<UIMessageChunk, UIMessageChunk>({
-        transform: (chunk, controller) => {
-          const cursor = miniLilacStreamCursorChunkSchema.safeParse(chunk);
+      new TransformStream<
+        ResultType<UIMessageChunk, MiniLilacStreamError>,
+        ResultType<UIMessageChunk, MiniLilacStreamError>
+      >({
+        transform: (result, controller) => {
+          const chunk = result.match<UIMessageChunk | undefined>({
+            ok: (value) => value,
+            err: () => undefined,
+          });
+          if (chunk === undefined) {
+            pendingCursor = undefined;
+            controller.enqueue(result);
+            return;
+          }
+          const cursor = decodeMiniLilacBoundary(
+            chunk,
+            miniLilacStreamCursorChunkSchema,
+            "stream cursor",
+          );
           const isCurrentGeneration = (this.streamGenerations.get(chatId) ?? 0) === generation;
+          const cursorValue = cursor.match<MiniLilacStreamCursor | null>({
+            ok: (value) => value.data,
+            err: () => null,
+          });
 
           if (!isCurrentGeneration) {
             pendingCursor = undefined;
-          } else if (cursor.success) {
-            pendingCursor = cursor.data.data;
+          } else if (cursorValue !== null) {
+            pendingCursor = cursorValue;
           }
 
-          controller.enqueue(chunk);
+          controller.enqueue(result);
 
-          if (isCurrentGeneration && !cursor.success && pendingCursor !== undefined) {
+          if (isCurrentGeneration && cursorValue === null && pendingCursor !== undefined) {
             this.lastStreamCursor.set(chatId, pendingCursor);
             pendingCursor = undefined;
           }
@@ -624,50 +1784,185 @@ export class MiniLilacTransport implements ChatTransport<MiniLilacUIMessage> {
     );
   }
 
-  private async createHeaders(json: boolean): Promise<Headers> {
-    const headers = new Headers(this.headers);
-    const token = await this.bearerToken?.();
-    if (token !== null && token !== undefined) headers.set("Authorization", `Bearer ${token}`);
-    if (json) headers.set("Content-Type", "application/json");
-    return headers;
-  }
-
-  private postControl<T>(
-    sessionId: string,
-    action: string,
-    body: object,
-    schema: z.ZodType<T>,
-    options: MiniLilacRequestOptions,
-  ): Promise<T> {
-    return this.requestJson(`sessions/${encodeURIComponent(sessionId)}/${action}`, schema, {
-      method: "POST",
-      body: JSON.stringify(body),
-      signal: options.signal,
+  private async createHeadersResult(
+    json: boolean,
+    requestHeaders?: Record<string, string> | Headers,
+  ): Promise<ResultType<Headers, MiniLilacRequestError>> {
+    const token = await captureMiniLilacPromise("Resolve Mini Lilac bearer token", () =>
+      Promise.resolve(this.bearerToken?.()),
+    );
+    const tokenValue = valueOrTaggedError(token);
+    if (isMiniLilacRequestError(tokenValue)) return Result.err(tokenValue);
+    const decodedToken = decodeMiniLilacBoundary(
+      tokenValue,
+      z.string().nullable().optional(),
+      "bearer token",
+    );
+    const decodedTokenValue = valueOrTaggedError(decodedToken);
+    if (MiniLilacBoundaryInvalid.is(decodedTokenValue)) return Result.err(decodedTokenValue);
+    return captureMiniLilacSync("Create Mini Lilac request headers", () => {
+      const headers = new Headers(this.headers);
+      if (decodedTokenValue !== null && decodedTokenValue !== undefined) {
+        headers.set("Authorization", `Bearer ${decodedTokenValue}`);
+      }
+      if (json) headers.set("Content-Type", "application/json");
+      new Headers(requestHeaders).forEach((value, name) => headers.set(name, value));
+      return headers;
     });
   }
 
-  private async requestJson<T>(
+  private async responseStreamResult(
+    response: Response,
+    operation: string,
+  ): Promise<ResultType<MiniLilacParsedStream, MiniLilacRequestError>> {
+    if (!response.ok || response.body === null) {
+      let detail = "The response body is empty.";
+      if (response.body !== null || !response.ok) {
+        const text = await captureMiniLilacPromise(`${operation} error response`, () =>
+          response.text(),
+        );
+        const textValue = valueOrTaggedError(text);
+        if (isMiniLilacRequestError(textValue)) return Result.err(textValue);
+        detail = textValue;
+      }
+      if (
+        operation === "Send Mini Lilac chat request" ||
+        operation === "Reconnect Mini Lilac stream"
+      ) {
+        return Result.err(
+          new MiniLilacHttpError({
+            operation,
+            status: response.status,
+            detail,
+            message: detail || "Failed to fetch the chat response.",
+          }),
+        );
+      }
+      return Result.err(httpError(operation, response, response.ok ? "" : detail));
+    }
+    const body = response.body;
+    const stream = captureMiniLilacSync("Decode Mini Lilac event stream", () =>
+      parseMiniLilacStream(body),
+    );
+    const streamValue = valueOrTaggedError(stream);
+    if (MiniLilacExternalOperationFailed.is(streamValue)) return Result.err(streamValue);
+    return Result.ok(streamValue);
+  }
+
+  private postGeneratedControlResult<
+    Input extends { readonly sessionId: string; readonly clientCommandId?: string },
+    Payload extends { readonly sessionId: string },
+    Output,
+  >(
+    request: Input,
+    requestSchema: z.ZodType<Payload>,
+    action: string,
+    responseSchema: z.ZodType<Output>,
+    options: MiniLilacRequestOptions,
+  ): Promise<ResultType<Output, MiniLilacRequestError>> {
+    const commandId = captureMiniLilacSync(`Create Mini Lilac ${action} command ID`, () =>
+      request.clientCommandId === undefined
+        ? this.createClientCommandId()
+        : request.clientCommandId,
+    );
+    const commandIdValue = valueOrTaggedError(commandId);
+    if (MiniLilacExternalOperationFailed.is(commandIdValue)) {
+      return Promise.resolve(Result.err(commandIdValue));
+    }
+    const payload = decodeMiniLilacBoundary(
+      { ...request, clientCommandId: commandIdValue },
+      requestSchema,
+      `${action} request`,
+    );
+    const payloadValue = valueOrTaggedError(payload);
+    if (MiniLilacBoundaryInvalid.is(payloadValue)) {
+      return Promise.resolve(Result.err(payloadValue));
+    }
+    return this.postControlResult(
+      payloadValue.sessionId,
+      action,
+      payloadValue,
+      responseSchema,
+      options,
+    );
+  }
+
+  private postControlResult<T>(
+    sessionId: string,
+    action: string,
+    bodyValue: object,
+    schema: z.ZodType<T>,
+    options: MiniLilacRequestOptions,
+  ): Promise<ResultType<T, MiniLilacRequestError>> {
+    const body = captureMiniLilacSync(`Serialize Mini Lilac ${action} request`, () =>
+      JSON.stringify(bodyValue),
+    );
+    const serializedBody = valueOrTaggedError(body);
+    if (MiniLilacExternalOperationFailed.is(serializedBody)) {
+      return Promise.resolve(Result.err(serializedBody));
+    }
+    return this.requestJsonResult(
+      `sessions/${encodeURIComponent(sessionId)}/${action}`,
+      schema,
+      { method: "POST", body: serializedBody, signal: options.signal },
+      `Perform Mini Lilac ${action}`,
+    );
+  }
+
+  private requestSessionJsonResult<T>(
+    sessionId: string,
+    suffix: string,
+    schema: z.ZodType<T>,
+    options: MiniLilacRequestOptions,
+  ): Promise<ResultType<T, MiniLilacRequestError>> {
+    const id = decodeMiniLilacBoundary(sessionId, sessionIdSchema, "session ID");
+    const idValue = valueOrTaggedError(id);
+    if (MiniLilacBoundaryInvalid.is(idValue)) return Promise.resolve(Result.err(idValue));
+    return this.requestJsonResult(
+      `sessions/${encodeURIComponent(idValue)}${suffix}`,
+      schema,
+      { signal: options.signal },
+      "Read Mini Lilac session",
+    );
+  }
+
+  private async requestJsonResult<T>(
     endpoint: string,
     schema: z.ZodType<T>,
     init: RequestInit,
-  ): Promise<T> {
-    const headers = await this.createHeaders(init.body !== undefined);
-    const response = await this.fetch(joinUrl(this.baseUrl, endpoint), {
-      ...init,
-      credentials: this.credentials,
-      headers,
-    });
+    operation: string,
+  ): Promise<ResultType<T, MiniLilacRequestError>> {
+    const headers = await this.createHeadersResult(init.body !== undefined);
+    const headersValue = valueOrTaggedError(headers);
+    if (isMiniLilacRequestError(headersValue)) return Result.err(headersValue);
+    const response = await captureMiniLilacPromise(
+      operation,
+      () =>
+        this.fetch(joinUrl(this.baseUrl, endpoint), {
+          ...init,
+          credentials: this.credentials,
+          headers: headersValue,
+        }),
+      init.signal ?? undefined,
+    );
+    const responseValue = valueOrTaggedError(response);
+    if (isMiniLilacRequestError(responseValue)) return Result.err(responseValue);
 
-    if (!response.ok) {
-      const detail = await response.text();
-      throw new Error(
-        detail.length > 0
-          ? `MiniLilac request failed (${response.status}): ${detail}`
-          : `MiniLilac request failed (${response.status})`,
+    if (!responseValue.ok) {
+      const detail = await captureMiniLilacPromise(`${operation} error response`, () =>
+        responseValue.text(),
       );
+      const detailValue = valueOrTaggedError(detail);
+      if (isMiniLilacRequestError(detailValue)) return Result.err(detailValue);
+      return Result.err(httpError(operation, responseValue, detailValue));
     }
 
-    const value: unknown = await response.json();
-    return schema.parse(value);
+    const decoded = await captureMiniLilacPromise(`${operation} JSON response`, async () => {
+      const value: unknown = await responseValue.json();
+      return decodeMiniLilacBoundary(value, schema, `${operation} response`);
+    });
+    const decodedValue = valueOrTaggedError(decoded);
+    if (isMiniLilacRequestError(decodedValue)) return Result.err(decodedValue);
+    return decodedValue;
   }
 }

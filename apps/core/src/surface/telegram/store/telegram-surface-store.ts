@@ -1,6 +1,12 @@
 import { Database } from "bun:sqlite";
 
 import { configureSqliteConnection } from "../../../shared/sqlite";
+import type { AdapterEvent } from "../../events";
+import {
+  parseStoredAdapterEvent,
+  parseStoredTelegramRaw,
+  type TelegramStoredRaw,
+} from "../telegram-ingress";
 
 /**
  * Local message index for the Telegram surface.
@@ -47,7 +53,7 @@ export type DbTelegramIngressOutbox = {
 /** One inbound event still waiting to reach the bus. */
 export type TelegramIngressEntry = {
   dedupeKey: string;
-  payload: unknown;
+  event: AdapterEvent | null;
   enqueuedTs: number;
   attempts: number;
   lastError?: string;
@@ -65,21 +71,15 @@ export type TelegramMessageRecord = {
   editedTs?: number;
   replyToMessageId?: string;
   fromBot: boolean;
-  raw?: unknown;
+  raw?: TelegramStoredRaw;
 };
 
-function parseRawJson(value: string | null): unknown {
-  if (value === null) return undefined;
-  try {
-    return JSON.parse(value);
-  } catch {
-    // A corrupt row must not break history reads.
-    return undefined;
-  }
-}
+type TelegramMessageWriteRecord = Omit<TelegramMessageRecord, "raw"> & {
+  rawJson?: string;
+};
 
 function toRecord(row: DbTelegramMessage): TelegramMessageRecord {
-  const raw = parseRawJson(row.raw_json);
+  const raw = parseStoredTelegramRaw(row.raw_json);
 
   return {
     ...(raw === undefined ? {} : { raw }),
@@ -192,7 +192,7 @@ export class TelegramSurfaceStore {
    * Returns false when the key is already queued, so a redelivery cannot
    * enqueue the same event twice.
    */
-  enqueueIngress(input: { dedupeKey: string; payload: unknown; ts: number }): boolean {
+  enqueueIngress(input: { dedupeKey: string; payloadJson: string; ts: number }): boolean {
     const result = this.db
       .query(
         `INSERT INTO telegram_ingress_outbox (dedupe_key, payload_json, enqueued_ts)
@@ -201,7 +201,7 @@ export class TelegramSurfaceStore {
       )
       .run({
         $dedupe_key: input.dedupeKey,
-        $payload_json: JSON.stringify(input.payload),
+        $payload_json: input.payloadJson,
         $enqueued_ts: input.ts,
       });
 
@@ -221,7 +221,7 @@ export class TelegramSurfaceStore {
       .all({ $limit: limit })
       .map((row) => ({
         dedupeKey: row.dedupe_key,
-        payload: JSON.parse(row.payload_json) as unknown,
+        event: parseStoredAdapterEvent(row.payload_json),
         enqueuedTs: row.enqueued_ts,
         attempts: row.attempts,
         ...(row.last_error === null ? {} : { lastError: row.last_error }),
@@ -258,7 +258,7 @@ export class TelegramSurfaceStore {
     return row?.n ?? 0;
   }
 
-  upsertMessage(record: TelegramMessageRecord): void {
+  upsertMessage(record: TelegramMessageWriteRecord): void {
     this.db
       .query(
         `INSERT INTO telegram_messages (
@@ -287,7 +287,7 @@ export class TelegramSurfaceStore {
         $edited_ts: record.editedTs ?? null,
         $reply_to_message_id: record.replyToMessageId ?? null,
         $from_bot: record.fromBot ? 1 : 0,
-        $raw_json: record.raw === undefined ? null : JSON.stringify(record.raw),
+        $raw_json: record.rawJson ?? null,
       });
   }
 

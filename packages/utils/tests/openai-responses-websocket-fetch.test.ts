@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, jest } from "bun:test";
 import { createOpenAI } from "@ai-sdk/openai";
 import { streamText } from "ai";
 
@@ -195,6 +195,34 @@ describe("createOpenAIResponsesWebSocketFetch", () => {
         optimizationReason: "no_continuation_state",
       },
     ]);
+    wsFetch.close();
+  });
+
+  it("ignores null, array, and scalar websocket JSON before normalization", async () => {
+    let normalizedEvents = 0;
+    const wsFetch = createOpenAIResponsesWebSocketFetch({
+      mode: "websocket",
+      normalizeEvent: (event) => {
+        normalizedEvents += 1;
+        return event;
+      },
+    });
+    const response = await wsFetch("https://api.openai.com/v1/responses", {
+      method: "POST",
+      body: JSON.stringify({ stream: true, input: "hi" }),
+    });
+    const textPromise = response.text();
+    const socket = FakeWebSocket.instances[0];
+    socket?.emitMessage("null");
+    socket?.emitMessage("[]");
+    socket?.emitMessage('"scalar"');
+    socket?.emitMessage("1");
+    socket?.emitMessage(JSON.stringify({ type: "response.completed" }));
+
+    const text = await textPromise;
+    expect(normalizedEvents).toBe(1);
+    expect(text).toContain('"type":"response.completed"');
+    expect(text).toContain("[DONE]");
     wsFetch.close();
   });
 
@@ -1407,27 +1435,31 @@ describe("createOpenAIResponsesWebSocketFetch", () => {
       throw new Error("should not fallback");
     }) as unknown as typeof globalThis.fetch;
 
-    const wsFetch = createOpenAIResponsesWebSocketFetch({
-      mode: "websocket",
-      idleTimeoutMs: 10,
-    });
+    jest.useFakeTimers({ now: 0 });
+    try {
+      const wsFetch = createOpenAIResponsesWebSocketFetch({
+        mode: "websocket",
+        idleTimeoutMs: 10,
+      });
 
-    const response = await wsFetch("https://api.openai.com/v1/responses", {
-      method: "POST",
-      body: JSON.stringify({ stream: true, input: "hello" }),
-    });
+      const response = await wsFetch("https://api.openai.com/v1/responses", {
+        method: "POST",
+        body: JSON.stringify({ stream: true, input: "hello" }),
+      });
 
-    const socket = FakeWebSocket.instances[0];
-    expect(socket).toBeDefined();
+      const socket = FakeWebSocket.instances[0];
+      expect(socket).toBeDefined();
 
-    const textPromise = response.text();
-    socket?.emitMessage(JSON.stringify({ type: "response.completed" }));
-    const text = await textPromise;
-    expect(text).toContain("[DONE]");
+      const textPromise = response.text();
+      socket?.emitMessage(JSON.stringify({ type: "response.completed" }));
+      const text = await textPromise;
+      expect(text).toContain("[DONE]");
 
-    // test-wait-justification: crosses the reusable websocket's real ten-millisecond idle-close deadline
-    await new Promise((resolve) => setTimeout(resolve, 25));
-    expect(socket?.readyState).toBe(FakeWebSocket.CLOSED);
-    wsFetch.close();
+      jest.advanceTimersByTime(10);
+      expect(socket?.readyState).toBe(FakeWebSocket.CLOSED);
+      wsFetch.close();
+    } finally {
+      jest.useRealTimers();
+    }
   });
 });

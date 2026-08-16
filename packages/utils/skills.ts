@@ -1,9 +1,10 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { homedir } from "node:os";
+import { Result, TaggedError, type Result as ResultType } from "better-result";
 import { z } from "zod";
 
-import { errorMessage } from "./runtime-utils";
+import { errorMessage, isPanic } from "./runtime-utils";
 
 export type SkillSource =
   | "lilac-builtin"
@@ -50,11 +51,26 @@ const NAME_RE = /^[a-z0-9]+(-[a-z0-9]+)*$/;
 const MAX_NAME_LENGTH = 64;
 const MAX_DESCRIPTION_LENGTH = 1024;
 
+export class SkillFilesystemError extends TaggedError("SkillFilesystemError")<{
+  readonly operation: "access" | "open-directory" | "open-file" | "read-file" | "close-file";
+  readonly path: string;
+  readonly cause: unknown;
+  readonly message: string;
+}> {}
+
+export class SkillReadAndCleanupFailed extends TaggedError("SkillReadAndCleanupFailed")<{
+  readonly path: string;
+  readonly readError: SkillFilesystemError;
+  readonly cleanupError: SkillFilesystemError;
+  readonly message: string;
+}> {}
+
 async function pathExists(p: string): Promise<boolean> {
   try {
     await fs.access(p);
     return true;
-  } catch {
+  } catch (cause) {
+    if (isPanic(cause)) throw cause;
     return false;
   }
 }
@@ -80,7 +96,8 @@ async function scanSkillPathsBounded(
     let directory: Awaited<ReturnType<typeof fs.opendir>>;
     try {
       directory = await fs.opendir(currentDirectory);
-    } catch {
+    } catch (cause) {
+      if (isPanic(cause)) throw cause;
       continue;
     }
     for await (const entry of directory) {
@@ -103,15 +120,79 @@ async function scanSkillPathsBounded(
   return { paths, scannedEntries, truncated: false };
 }
 
-async function readTextPrefix(filePath: string, maxBytes: number): Promise<string> {
-  const handle = await fs.open(filePath, "r");
+export async function readTextPrefixResult(
+  filePath: string,
+  maxBytes: number,
+): Promise<ResultType<string, SkillFilesystemError | SkillReadAndCleanupFailed>> {
+  let handle: Awaited<ReturnType<typeof fs.open>>;
   try {
-    const buf = Buffer.allocUnsafe(maxBytes);
-    const { bytesRead } = await handle.read(buf, 0, maxBytes, 0);
-    return buf.subarray(0, bytesRead).toString("utf8");
-  } finally {
-    await handle.close();
+    handle = await fs.open(filePath, "r");
+  } catch (cause) {
+    if (isPanic(cause)) throw cause;
+    return Result.err(
+      new SkillFilesystemError({
+        operation: "open-file",
+        path: filePath,
+        cause,
+        message: `Failed to open skill file '${filePath}'`,
+      }),
+    );
   }
+
+  let readValue = "";
+  let readCause: unknown;
+  let readFailed = false;
+  try {
+    const buffer = Buffer.allocUnsafe(maxBytes);
+    const { bytesRead } = await handle.read(buffer, 0, maxBytes, 0);
+    readValue = buffer.subarray(0, bytesRead).toString("utf8");
+  } catch (cause) {
+    readFailed = true;
+    readCause = cause;
+  }
+
+  let cleanupCause: unknown;
+  let cleanupFailed = false;
+  try {
+    await handle.close();
+  } catch (cause) {
+    cleanupFailed = true;
+    cleanupCause = cause;
+  }
+
+  if (isPanic(readCause)) throw readCause;
+  if (isPanic(cleanupCause)) throw cleanupCause;
+
+  const readError = readFailed
+    ? new SkillFilesystemError({
+        operation: "read-file",
+        path: filePath,
+        cause: readCause,
+        message: `Failed to read skill file '${filePath}'`,
+      })
+    : undefined;
+  const cleanupError = cleanupFailed
+    ? new SkillFilesystemError({
+        operation: "close-file",
+        path: filePath,
+        cause: cleanupCause,
+        message: `Failed to close skill file '${filePath}'`,
+      })
+    : undefined;
+
+  if (readError && cleanupError) {
+    return Result.err(
+      new SkillReadAndCleanupFailed({
+        path: filePath,
+        readError,
+        cleanupError,
+        message: `Failed to read and close skill file '${filePath}'`,
+      }),
+    );
+  }
+  if (readError) return Result.err(readError);
+  if (cleanupError) return Result.err(cleanupError);
+  return Result.ok(readValue);
 }
 
 function globBaseDir(pattern: string): string {
@@ -157,31 +238,68 @@ export type ParsedSkillFile = {
   body: string;
 };
 
-export function parseSkillMarkdown(raw: string): ParsedSkillFile {
+export class SkillMarkdownInvalid extends TaggedError("SkillMarkdownInvalid")<{
+  readonly issue: "missing-frontmatter" | "malformed-yaml" | "invalid-frontmatter";
+  readonly cause?: unknown;
+  readonly message: string;
+}> {}
+
+export function parseSkillMarkdownResult(
+  raw: string,
+): ResultType<ParsedSkillFile, SkillMarkdownInvalid> {
   const parts = splitFrontmatter(raw);
   if (!parts) {
-    throw new Error("SKILL.md missing YAML frontmatter (--- ... ---)");
+    return Result.err(
+      new SkillMarkdownInvalid({
+        issue: "missing-frontmatter",
+        message: "SKILL.md missing YAML frontmatter (--- ... ---)",
+      }),
+    );
   }
 
-  let parsedFrontmatter: unknown;
+  let yaml: unknown;
   try {
-    parsedFrontmatter = Bun.YAML.parse(parts.frontmatterText) as unknown;
-  } catch (e) {
-    const msg = errorMessage(e);
-    throw new Error(`Failed to parse YAML frontmatter: ${msg}`);
+    yaml = Bun.YAML.parse(parts.frontmatterText);
+  } catch (cause) {
+    if (isPanic(cause)) throw cause;
+    return Result.err(
+      new SkillMarkdownInvalid({
+        issue: "malformed-yaml",
+        cause,
+        message: `Failed to parse YAML frontmatter: ${errorMessage(cause)}`,
+      }),
+    );
   }
 
-  const parsed = skillFrontmatterSchema.safeParse(parsedFrontmatter);
+  const parsed = skillFrontmatterSchema.safeParse(yaml);
   if (!parsed.success) {
-    throw new Error("YAML frontmatter must be an object with non-empty name and description");
+    return Result.err(
+      new SkillMarkdownInvalid({
+        issue: "invalid-frontmatter",
+        cause: parsed.error,
+        message: "YAML frontmatter must be an object with non-empty name and description",
+      }),
+    );
   }
 
-  return {
+  return Result.ok({
     frontmatter: parsed.data,
     name: parsed.data.name,
     description: parsed.data.description,
     body: parts.body.trimStart(),
-  };
+  });
+}
+
+export function parseSkillMarkdown(raw: string): ParsedSkillFile {
+  const result = parseSkillMarkdownResult(raw);
+  const resolved = result.match<
+    { readonly value: ParsedSkillFile } | { readonly error: SkillMarkdownInvalid }
+  >({
+    ok: (value) => ({ value }),
+    err: (error) => ({ error }),
+  });
+  if ("error" in resolved) throw new Error(resolved.error.message);
+  return resolved.value;
 }
 
 export type SkillScanRoot = {
@@ -472,23 +590,24 @@ export async function discoverSkills(params: {
 
       // Progressive disclosure: discovery loads metadata only.
       // Read a prefix large enough to include YAML frontmatter.
-      let rawPrefix: string;
-      try {
-        rawPrefix = await readTextPrefix(skillPath, 64 * 1024);
-      } catch (e) {
-        const msg = errorMessage(e);
-        warnings.push({ location: skillPath, message: `read failed: ${msg}` });
+      const rawPrefix = await readTextPrefixResult(skillPath, 64 * 1024);
+      const raw = rawPrefix.match<string | SkillFilesystemError | SkillReadAndCleanupFailed>({
+        ok: (value) => value,
+        err: (error) => error,
+      });
+      if (SkillFilesystemError.is(raw) || SkillReadAndCleanupFailed.is(raw)) {
+        warnings.push({ location: skillPath, message: `read failed: ${raw.message}` });
         continue;
       }
 
-      let parsed: ParsedSkillFile;
-      try {
-        // parseSkillMarkdown expects a full document, but for discovery we only
-        // need frontmatter; this works as long as frontmatter is in the prefix.
-        parsed = parseSkillMarkdown(rawPrefix);
-      } catch (e) {
-        const msg = errorMessage(e);
-        warnings.push({ location: skillPath, message: msg });
+      // Discovery only needs frontmatter; the bounded prefix is sufficient.
+      const parsedResult = parseSkillMarkdownResult(raw);
+      const parsed = parsedResult.match<ParsedSkillFile | SkillMarkdownInvalid>({
+        ok: (value) => value,
+        err: (error) => error,
+      });
+      if (SkillMarkdownInvalid.is(parsed)) {
+        warnings.push({ location: skillPath, message: parsed.message });
         continue;
       }
 

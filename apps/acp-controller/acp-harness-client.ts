@@ -1,5 +1,5 @@
-import { spawn, type ChildProcess } from "node:child_process";
-import { Readable, Writable } from "node:stream";
+import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { Writable } from "node:stream";
 
 import {
   ClientSideConnection,
@@ -16,13 +16,16 @@ import {
   type SessionNotification,
   type SessionUpdate,
 } from "@agentclientprotocol/sdk";
+import { Result, type Result as ResultType } from "better-result";
 
+import { captureExternal, replaceExternalFailureMessage } from "./external-adapters.ts";
+import { ExternalOperationFailed, HarnessUnavailable, WorkAndCleanupFailed } from "./failures.ts";
 import type { PermissionBehavior, PermissionCounters, ResolvedHarness } from "./types.ts";
 
-function errorMessage(error: unknown): string {
-  if (error instanceof Error) return error.message;
-  return String(error);
-}
+export type AcpClientError =
+  | ExternalOperationFailed
+  | HarnessUnavailable
+  | WorkAndCleanupFailed<ExternalOperationFailed>;
 
 function choosePermissionOutcome(
   behavior: PermissionBehavior,
@@ -31,21 +34,21 @@ function choosePermissionOutcome(
   const pick = (...kinds: readonly string[]) =>
     request.options.find((option) => kinds.includes(option.kind));
 
-  const preferred =
-    behavior === "reject"
-      ? pick("reject_once", "reject_always")
-      : behavior === "once"
-        ? pick("allow_once", "allow_always", "reject_once", "reject_always")
-        : pick("allow_always", "allow_once", "reject_once", "reject_always");
-
-  if (!preferred) {
-    return { outcome: "cancelled" };
+  let preferred: RequestPermissionRequest["options"][number] | undefined;
+  switch (behavior) {
+    case "reject":
+      preferred = pick("reject_once", "reject_always");
+      break;
+    case "once":
+      preferred = pick("allow_once", "allow_always", "reject_once", "reject_always");
+      break;
+    case "always":
+      preferred = pick("allow_always", "allow_once", "reject_once", "reject_always");
+      break;
   }
 
-  return {
-    outcome: "selected",
-    optionId: preferred.optionId,
-  };
+  if (!preferred) return { outcome: "cancelled" };
+  return { outcome: "selected", optionId: preferred.optionId };
 }
 
 class ControllerClient implements Client {
@@ -80,7 +83,7 @@ export class AcpHarnessClient {
   private constructor(
     readonly harness: ResolvedHarness,
     readonly initializeResponse: InitializeResponse,
-    private readonly child: ChildProcess,
+    private readonly child: ChildProcessWithoutNullStreams,
     private readonly connection: ClientSideConnection,
     private readonly stderrBuffer: { value: string },
   ) {}
@@ -91,53 +94,102 @@ export class AcpHarnessClient {
     permissionBehavior: PermissionBehavior;
     counters: PermissionCounters;
     onUpdate?: (notification: SessionNotification) => Promise<void> | void;
-  }): Promise<AcpHarnessClient> {
-    const child = spawn(params.harness.command, [...params.harness.args], {
-      stdio: ["pipe", "pipe", "pipe"],
-      env: process.env,
+  }): Promise<ResultType<AcpHarnessClient, AcpClientError>> {
+    const spawned = await captureExternal("initialize-harness", async () =>
+      spawn(params.harness.command, [...params.harness.args], {
+        stdio: ["pipe", "pipe", "pipe"],
+        env: process.env,
+      }),
+    );
+    const child = spawned.match<ChildProcessWithoutNullStreams | ExternalOperationFailed>({
+      ok: (value) => value,
+      err: (error) => error,
     });
+    if (ExternalOperationFailed.is(child)) return Result.err(child);
 
     const stderrBuffer = { value: "" };
-    child.stderr?.on("data", (chunk: Buffer | string) => {
+    child.stderr.on("data", (chunk: Buffer | string) => {
       const text = typeof chunk === "string" ? chunk : chunk.toString("utf8");
       stderrBuffer.value = `${stderrBuffer.value}${text}`.slice(-4000);
     });
 
-    const input = Writable.toWeb(child.stdin!);
-    const output = Readable.toWeb(child.stdout!) as unknown as ReadableStream<Uint8Array>;
-    const stream = ndJsonStream(input, output);
-    const client = new ControllerClient(
-      params.permissionBehavior,
-      params.counters,
-      params.onUpdate,
+    const initialized = await captureExternal(
+      "initialize-harness",
+      async () => {
+        const input = Writable.toWeb(child.stdin);
+        const output = new ReadableStream<Uint8Array>({
+          async start(controller) {
+            try {
+              for await (const rawChunk of child.stdout) {
+                const chunk: unknown = rawChunk;
+                if (!(chunk instanceof Uint8Array)) {
+                  throw new TypeError("ACP harness stdout emitted a non-byte chunk");
+                }
+                controller.enqueue(chunk);
+              }
+              controller.close();
+            } catch (cause) {
+              controller.error(cause);
+            }
+          },
+          cancel(reason) {
+            child.stdout.destroy(reason instanceof Error ? reason : undefined);
+          },
+        });
+        const stream = ndJsonStream(input, output);
+        const client = new ControllerClient(
+          params.permissionBehavior,
+          params.counters,
+          params.onUpdate,
+        );
+        const connection = new ClientSideConnection(() => client, stream);
+        const initializeResponse = await connection.initialize({
+          protocolVersion: PROTOCOL_VERSION,
+          clientCapabilities: {},
+          clientInfo: {
+            name: "lilac-acp",
+            title: "Lilac ACP",
+            version: params.version,
+          },
+        });
+        return { connection, initializeResponse };
+      },
+      `Failed to initialize harness '${params.harness.descriptor.id}'.`,
     );
-    const connection = new ClientSideConnection(() => client, stream);
-
-    try {
-      const initializeResponse = await connection.initialize({
-        protocolVersion: PROTOCOL_VERSION,
-        clientCapabilities: {},
-        clientInfo: {
-          name: "lilac-acp",
-          title: "Lilac ACP",
-          version: params.version,
-        },
-      });
-      return new AcpHarnessClient(
-        params.harness,
-        initializeResponse,
-        child,
-        connection,
-        stderrBuffer,
-      );
-    } catch (error) {
-      child.kill();
-      const stderr = stderrBuffer.value.trim();
-      const details = stderr.length > 0 ? ` stderr=${stderr}` : "";
-      throw new Error(
-        `Failed to initialize harness '${params.harness.descriptor.id}': ${errorMessage(error)}.${details}`,
+    const initializedValue = initialized.match<
+      | { connection: ClientSideConnection; initializeResponse: InitializeResponse }
+      | ExternalOperationFailed
+    >({ ok: (value) => value, err: (error) => error });
+    if (!ExternalOperationFailed.is(initializedValue)) {
+      return Result.ok(
+        new AcpHarnessClient(
+          params.harness,
+          initializedValue.initializeResponse,
+          child,
+          initializedValue.connection,
+          stderrBuffer,
+        ),
       );
     }
+
+    const cleanup = await captureExternal("close-harness", async () => {
+      child.kill();
+    });
+    const stderr = stderrBuffer.value.trim();
+    const details = stderr.length > 0 ? ` stderr=${stderr}` : "";
+    const primary = replaceExternalFailureMessage(
+      initializedValue,
+      `${initializedValue.message}${details}`,
+    );
+    const cleanupError = cleanup.match({ ok: () => undefined, err: (error) => error });
+    if (cleanupError === undefined) return Result.err(primary);
+    return Result.err(
+      new WorkAndCleanupFailed({
+        primary,
+        cleanup: cleanupError,
+        message: `${primary.message} Harness process cleanup also failed.`,
+      }),
+    );
   }
 
   capabilities(): string[] {
@@ -158,73 +210,121 @@ export class AcpHarnessClient {
     );
   }
 
-  async listSessions(cwd: string): Promise<ListSessionsResponse["sessions"]> {
+  async listSessions(
+    cwd: string,
+  ): Promise<
+    ResultType<ListSessionsResponse["sessions"], ExternalOperationFailed | HarnessUnavailable>
+  > {
     if (!this.initializeResponse.agentCapabilities?.sessionCapabilities?.list) {
-      throw new Error(`Harness '${this.harness.descriptor.id}' does not support session listing.`);
+      return Result.err(
+        new HarnessUnavailable({
+          harnessId: this.harness.descriptor.id,
+          message: `Harness '${this.harness.descriptor.id}' does not support session listing.`,
+        }),
+      );
     }
 
-    const sessions = [] as ListSessionsResponse["sessions"];
+    const sessions: ListSessionsResponse["sessions"] = [];
     let cursor: string | null | undefined;
     do {
-      const response = await this.connection.listSessions({
-        cwd,
-        ...(cursor ? { cursor } : {}),
+      const response = await captureExternal("list-sessions", () =>
+        this.connection.listSessions({ cwd, ...(cursor ? { cursor } : {}) }),
+      );
+      const page = response.match<ListSessionsResponse | ExternalOperationFailed>({
+        ok: (value) => value,
+        err: (error) => error,
       });
-      sessions.push(...response.sessions);
-      cursor = response.nextCursor;
+      if (ExternalOperationFailed.is(page)) return Result.err(page);
+      sessions.push(...page.sessions);
+      cursor = page.nextCursor;
     } while (cursor);
 
-    return sessions;
+    return Result.ok(sessions);
   }
 
-  async createSession(cwd: string): Promise<NewSessionResponse> {
-    return this.connection.newSession({ cwd, mcpServers: [] });
+  async createSession(
+    cwd: string,
+  ): Promise<ResultType<NewSessionResponse, ExternalOperationFailed>> {
+    return captureExternal("create-session", () =>
+      this.connection.newSession({ cwd, mcpServers: [] }),
+    );
   }
 
-  async loadSession(sessionId: string, cwd: string): Promise<void> {
+  async loadSession(
+    sessionId: string,
+    cwd: string,
+  ): Promise<ResultType<void, ExternalOperationFailed | HarnessUnavailable>> {
     if (this.initializeResponse.agentCapabilities?.loadSession) {
-      await this.connection.loadSession({ sessionId, cwd, mcpServers: [] });
-      return;
+      const loaded = await captureExternal("load-session", () =>
+        this.connection.loadSession({ sessionId, cwd, mcpServers: [] }),
+      );
+      return loaded.map(() => undefined);
     }
 
     if (this.initializeResponse.agentCapabilities?.sessionCapabilities?.resume) {
-      await this.connection.unstable_resumeSession({ sessionId, cwd });
-      return;
+      const resumed = await captureExternal("load-session", () =>
+        this.connection.unstable_resumeSession({ sessionId, cwd }),
+      );
+      return resumed.map(() => undefined);
     }
 
-    throw new Error(`Harness '${this.harness.descriptor.id}' does not support loading sessions.`);
+    return Result.err(
+      new HarnessUnavailable({
+        harnessId: this.harness.descriptor.id,
+        message: `Harness '${this.harness.descriptor.id}' does not support loading sessions.`,
+      }),
+    );
   }
 
-  async setMode(sessionId: string, modeId: string): Promise<void> {
-    await this.connection.setSessionMode({ sessionId, modeId });
+  async setMode(
+    sessionId: string,
+    modeId: string,
+  ): Promise<ResultType<void, ExternalOperationFailed>> {
+    const updated = await captureExternal("set-session-mode", () =>
+      this.connection.setSessionMode({ sessionId, modeId }),
+    );
+    return updated.map(() => undefined);
   }
 
-  async setModel(sessionId: string, modelId: string): Promise<void> {
-    await this.connection.unstable_setSessionModel({ sessionId, modelId });
+  async setModel(
+    sessionId: string,
+    modelId: string,
+  ): Promise<ResultType<void, ExternalOperationFailed>> {
+    const updated = await captureExternal("set-session-model", () =>
+      this.connection.unstable_setSessionModel({ sessionId, modelId }),
+    );
+    return updated.map(() => undefined);
   }
 
-  async prompt(sessionId: string, text: string, messageId: string): Promise<PromptResponse> {
-    return this.connection.prompt({
-      sessionId,
-      messageId,
-      prompt: [{ type: "text", text }],
-    });
+  async prompt(
+    sessionId: string,
+    text: string,
+    messageId: string,
+  ): Promise<ResultType<PromptResponse, ExternalOperationFailed>> {
+    return captureExternal("prompt-session", () =>
+      this.connection.prompt({
+        sessionId,
+        messageId,
+        prompt: [{ type: "text", text }],
+      }),
+    );
   }
 
-  async cancel(sessionId: string): Promise<void> {
-    await this.connection.cancel({ sessionId });
+  async cancel(sessionId: string): Promise<ResultType<void, ExternalOperationFailed>> {
+    const cancelled = await captureExternal("cancel-session", () =>
+      this.connection.cancel({ sessionId }),
+    );
+    return cancelled.map(() => undefined);
   }
 
-  async close(): Promise<void> {
-    try {
+  async close(): Promise<ResultType<void, ExternalOperationFailed>> {
+    return captureExternal("close-harness", async () => {
       this.child.kill();
       await Promise.race([
         this.connection.closed,
         new Promise<void>((resolve) => setTimeout(resolve, 200)),
       ]);
-    } catch {
-      // Ignore shutdown failures.
-    }
+    });
   }
 
   stderr(): string {
@@ -232,8 +332,8 @@ export class AcpHarnessClient {
   }
 }
 
-export function isAuthRequiredError(error: unknown): boolean {
-  return error instanceof RequestError && error.code === -32004;
+export function isAuthRequiredError(error: ExternalOperationFailed): boolean {
+  return error.cause instanceof RequestError && error.cause.code === -32004;
 }
 
 export function isCancelledStopReason(stopReason: PromptResponse["stopReason"]): boolean {

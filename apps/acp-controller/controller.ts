@@ -1,24 +1,50 @@
-import { spawn } from "node:child_process";
+import { spawn, type ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import fs from "node:fs/promises";
+import { readFile } from "node:fs/promises";
 
-import type { PromptResponse } from "@agentclientprotocol/sdk";
+import type { PromptResponse, SessionNotification } from "@agentclientprotocol/sdk";
+import { Panic, Result, type Result as ResultType } from "better-result";
 
 import { getBoolFlag, getIntFlag, getStringFlag, parseFlags, readStdinText } from "./cli-flags.ts";
 import {
   AcpHarnessClient,
   isAuthRequiredError,
   isCancelledStopReason,
+  type AcpClientError,
 } from "./acp-harness-client.ts";
+import {
+  captureAcpFailure,
+  captureExternal,
+  recordAcpCleanupFailure,
+  replaceExternalFailureMessage,
+  signalAcpDefect,
+  type CapturedAcpFailure,
+} from "./external-adapters.ts";
 import { getHarnessDescriptor, listResolvedHarnesses, resolveHarness } from "./harness-registry.ts";
 import {
   loadRunRecord,
   loadSessionIndex,
+  observeRunCancellation,
+  requestRunCancellation,
   saveRunRecord,
+  saveWorkerRunRecord,
   setLocalSessionTitle,
   upsertSessionIndexEntries,
+  type RunCancellationObservation,
 } from "./run-store.ts";
 import { buildSnapshotRuns, SessionHistoryCollector } from "./session-history.ts";
+import {
+  ExternalOperationFailed,
+  HarnessUnavailable,
+  MonitorTerminationFailed,
+  RunInvariantFailed,
+  SessionSelectionFailed,
+  WorkerLifecycleCleanupFailed,
+  WorkAndMonitorFailed,
+  WorkAndCleanupFailed,
+  type RunStoreError,
+  type SessionStoreError,
+} from "./failures.ts";
 import {
   createEmptyPermissionCounters,
   formatSessionRef,
@@ -26,13 +52,13 @@ import {
   parseSessionRef,
   textPreview,
   type PromptRunRecord,
+  type SessionPlanEntry,
   type SessionIndexEntry,
   type SessionSummary,
 } from "./types.ts";
 
 declare const PACKAGE_VERSION: string;
 
-type OutputWriter = (value: unknown) => void;
 type OutputMode = "json" | "human";
 
 type ListedSession = {
@@ -45,7 +71,57 @@ type ListedSession = {
   capabilities: string[];
 };
 
-function printJson(value: unknown): void {
+type HarnessOutputEntry = {
+  readonly id: string;
+  readonly title: string;
+  readonly description: string;
+  readonly launchable: boolean;
+  readonly command?: string;
+  readonly args?: readonly string[];
+  readonly source?: "fallback" | "path";
+  readonly installHint: string;
+  readonly version: string;
+};
+
+type SnapshotRun = ReturnType<typeof buildSnapshotRuns>[number];
+
+type ControllerOutput = {
+  readonly ok: boolean;
+  readonly error?: string;
+  readonly help?: string;
+  readonly version?: string;
+  readonly harnesses?: readonly HarnessOutputEntry[];
+  readonly sessions?: readonly ListedSession[];
+  readonly warnings?: readonly string[];
+  readonly candidates?: readonly ListedSession[];
+  readonly harnessId?: string;
+  readonly sessionId?: string;
+  readonly sessionRef?: string;
+  readonly session?: {
+    readonly id?: string;
+    readonly title?: string;
+    readonly cwd: string;
+    readonly updatedAt?: string;
+  };
+  readonly plan?: readonly SessionPlanEntry[];
+  readonly recent?: { readonly runs: readonly SnapshotRun[] };
+  readonly history?: PromptRunRecord["history"];
+  readonly meta?: {
+    readonly directory: string;
+    readonly harnessId: string;
+    readonly capabilities: readonly string[];
+  };
+  readonly runId?: string;
+  readonly status?: PromptRunRecord["status"];
+  readonly resultText?: string;
+  readonly workerPid?: number;
+  readonly signalled?: boolean;
+  readonly run?: PromptRunRecord;
+};
+
+type OutputWriter = (value: ControllerOutput) => void;
+
+function printJson(value: ControllerOutput): void {
   process.stdout.write(`${JSON.stringify(value)}\n`);
 }
 
@@ -53,53 +129,9 @@ function printText(text: string): void {
   process.stdout.write(text.endsWith("\n") ? text : `${text}\n`);
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-function getString(value: unknown): string | undefined {
-  return typeof value === "string" ? value : undefined;
-}
-
-function getNumber(value: unknown): number | undefined {
-  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
-}
-
-function getBoolean(value: unknown): boolean | undefined {
-  return typeof value === "boolean" ? value : undefined;
-}
-
-function getRecordArray(value: unknown): Record<string, unknown>[] {
-  return Array.isArray(value) ? value.filter(isRecord) : [];
-}
-
-function getStringArray(value: unknown): string[] {
-  return Array.isArray(value)
-    ? value.filter((entry): entry is string => typeof entry === "string")
-    : [];
-}
-
 function formatCommand(command: string | undefined, args: readonly string[]): string | undefined {
   if (!command) return undefined;
   return [command, ...args].join(" ");
-}
-
-function toListedSession(value: unknown): ListedSession | null {
-  if (!isRecord(value)) return null;
-  const harnessId = getString(value.harnessId);
-  const sessionId = getString(value.sessionId);
-  const sessionRef = getString(value.sessionRef);
-  const cwd = getString(value.cwd);
-  if (!harnessId || !sessionId || !sessionRef || !cwd) return null;
-  return {
-    harnessId,
-    sessionId,
-    sessionRef,
-    cwd,
-    title: getString(value.title),
-    updatedAt: getString(value.updatedAt),
-    capabilities: getStringArray(value.capabilities),
-  };
 }
 
 function formatSessionEntries(sessions: readonly ListedSession[]): string[] {
@@ -124,47 +156,39 @@ function formatWarnings(warnings: readonly string[]): string[] {
   return ["Warnings:", ...warnings.map((warning) => `- ${warning}`)];
 }
 
-function formatCandidates(value: unknown): string[] {
-  const candidates = getRecordArray(value)
-    .map((entry) => toListedSession(entry))
-    .filter((entry): entry is ListedSession => entry !== null);
+function formatCandidates(candidates: readonly ListedSession[] | undefined): string[] {
+  if (!candidates) return [];
   if (candidates.length === 0) return [];
   return ["Candidates:", ...formatSessionEntries(candidates)];
 }
 
-function formatHarnessesOutput(value: Record<string, unknown>): string {
-  const harnesses = getRecordArray(value.harnesses);
+function formatHarnessesOutput(harnesses: readonly HarnessOutputEntry[]): string {
   if (harnesses.length === 0) return "No harnesses found.";
 
   const lines = [`Harnesses (${harnesses.length})`];
   for (const harness of harnesses) {
-    const id = getString(harness.id) ?? "unknown";
-    const title = getString(harness.title) ?? id;
-    const launchable = getBoolean(harness.launchable) ?? false;
-    lines.push(`- ${title} (${id}) ${launchable ? "[available]" : "[unavailable]"}`);
+    lines.push(
+      `- ${harness.title} (${harness.id}) ${harness.launchable ? "[available]" : "[unavailable]"}`,
+    );
 
-    const description = getString(harness.description);
-    if (description) lines.push(`  ${description}`);
+    if (harness.description) lines.push(`  ${harness.description}`);
 
-    const command = formatCommand(getString(harness.command), getStringArray(harness.args));
+    const command = formatCommand(harness.command, harness.args ?? []);
     if (command) lines.push(`  command: ${command}`);
 
-    const installHint = getString(harness.installHint);
-    if (installHint && !launchable) lines.push(`  install: ${installHint}`);
+    if (harness.installHint && !harness.launchable) lines.push(`  install: ${harness.installHint}`);
   }
   return lines.join("\n");
 }
 
-function formatSessionsOutput(value: Record<string, unknown>): string {
-  const ok = getBoolean(value.ok);
-  const error = getString(value.error);
-  const sessions = getRecordArray(value.sessions)
-    .map((entry) => toListedSession(entry))
-    .filter((entry): entry is ListedSession => entry !== null);
-  const warnings = getStringArray(value.warnings);
+function formatSessionsOutput(
+  value: ControllerOutput & { readonly sessions: readonly ListedSession[] },
+): string {
+  const sessions = value.sessions;
+  const warnings = value.warnings ?? [];
 
   const lines: string[] = [];
-  if (ok === false && error) lines.push(`Error: ${error}`, "");
+  if (!value.ok && value.error) lines.push(`Error: ${value.error}`, "");
   lines.push(`Sessions (${sessions.length})`, ...formatSessionEntries(sessions));
 
   const candidateLines = formatCandidates(value.candidates);
@@ -175,98 +199,76 @@ function formatSessionsOutput(value: Record<string, unknown>): string {
   return lines.join("\n");
 }
 
-function formatSnapshotPlan(value: unknown): string[] {
-  const entries = getRecordArray(value);
+function formatSnapshotPlan(entries: readonly SessionPlanEntry[] | undefined): string[] {
+  if (!entries) return ["Plan: none"];
   if (entries.length === 0) return ["Plan: none"];
 
   return [
     "Plan:",
-    ...entries.map((entry) => {
-      const content = getString(entry.content) ?? "(missing content)";
-      const status = getString(entry.status) ?? "unknown";
-      const priority = getString(entry.priority) ?? "unknown";
-      return `- [${status}/${priority}] ${content}`;
-    }),
+    ...entries.map((entry) => `- [${entry.status}/${entry.priority}] ${entry.content}`),
   ];
 }
 
-function formatRecentRuns(value: unknown): string[] {
-  if (!isRecord(value)) return ["Recent turns: none"];
-  const runs = getRecordArray(value.runs);
+function formatRecentRuns(recent: { readonly runs: readonly SnapshotRun[] } | undefined): string[] {
+  if (!recent) return ["Recent turns: none"];
+  const runs = recent.runs;
   if (runs.length === 0) return ["Recent turns: none"];
 
   const lines = ["Recent turns:"];
   for (const run of runs) {
-    const user = isRecord(run.user) ? getString(run.user.text) : undefined;
-    const assistant = isRecord(run.assistant) ? getString(run.assistant.text) : undefined;
-    lines.push(`- User: ${user ?? ""}`);
-    lines.push(`  Assistant: ${assistant ?? "(no assistant reply)"}`);
+    lines.push(`- User: ${run.user.text}`);
+    lines.push(`  Assistant: ${run.assistant?.text ?? "(no assistant reply)"}`);
   }
   return lines;
 }
 
-function formatSnapshotOutput(value: Record<string, unknown>): string {
-  const ok = getBoolean(value.ok);
-  const error = getString(value.error);
-  const session = isRecord(value.session) ? value.session : undefined;
-  const meta = isRecord(value.meta) ? value.meta : undefined;
+function formatSnapshotOutput(value: ControllerOutput): string {
+  const session = value.session;
+  const meta = value.meta;
   const lines: string[] = [];
 
-  if (ok === false && error) {
-    lines.push(`Error: ${error}`);
-    const sessionRef = getString(value.sessionRef);
-    if (sessionRef) lines.push(`Session: ${sessionRef}`);
+  if (!value.ok && value.error) {
+    lines.push(`Error: ${value.error}`);
+    if (value.sessionRef) lines.push(`Session: ${value.sessionRef}`);
     return lines.join("\n");
   }
 
-  const title = session ? getString(session.title) : undefined;
-  const sessionRef = getString(value.sessionRef);
-  const sessionId = getString(value.sessionId);
+  const title = session?.title;
   lines.push(title ? `Session snapshot: ${title}` : "Session snapshot");
-  if (sessionRef) lines.push(`Session: ${sessionRef}`);
-  else if (sessionId) lines.push(`Session ID: ${sessionId}`);
+  if (value.sessionRef) lines.push(`Session: ${value.sessionRef}`);
+  else if (value.sessionId) lines.push(`Session ID: ${value.sessionId}`);
 
-  const harnessId = getString(value.harnessId) ?? (meta ? getString(meta.harnessId) : undefined);
+  const harnessId = value.harnessId ?? meta?.harnessId;
   if (harnessId) lines.push(`Harness: ${harnessId}`);
 
-  const cwd = session ? getString(session.cwd) : undefined;
-  if (cwd) lines.push(`Directory: ${cwd}`);
+  if (session?.cwd) lines.push(`Directory: ${session.cwd}`);
 
-  const updatedAt = session ? getString(session.updatedAt) : undefined;
-  if (updatedAt) lines.push(`Updated: ${updatedAt}`);
+  if (session?.updatedAt) lines.push(`Updated: ${session.updatedAt}`);
 
-  const capabilities = meta ? getStringArray(meta.capabilities) : [];
+  const capabilities = meta?.capabilities ?? [];
   if (capabilities.length > 0) lines.push(`Capabilities: ${capabilities.join(", ")}`);
 
   lines.push("", ...formatSnapshotPlan(value.plan), "", ...formatRecentRuns(value.recent));
   return lines.join("\n");
 }
 
-function formatRunOutput(value: Record<string, unknown>): string {
-  const runId = getString(value.runId) ?? "unknown";
-  const status = getString(value.status);
-  const error = getString(value.error);
-  const resultText = getString(value.resultText);
-  const harnessId = getString(value.harnessId);
-  const sessionRef = getString(value.sessionRef);
-  const workerPid =
-    getNumber(value.workerPid) ??
-    (isRecord(value.run) ? getNumber(value.run.workerPid) : undefined);
-  const signalled = getBoolean(value.signalled);
+function formatRunOutput(value: ControllerOutput & { readonly runId: string }): string {
+  const runId = value.runId;
+  const workerPid = value.workerPid ?? value.run?.workerPid;
 
   const lines: string[] = [];
-  if (status) {
-    lines.push(`Run ${runId}: ${status}`);
+  if (value.status) {
+    lines.push(`Run ${runId}: ${value.status}`);
   } else {
     lines.push(`Run ${runId}`);
   }
 
-  if (harnessId) lines.push(`Harness: ${harnessId}`);
-  if (sessionRef) lines.push(`Session: ${sessionRef}`);
+  if (value.harnessId) lines.push(`Harness: ${value.harnessId}`);
+  if (value.sessionRef) lines.push(`Session: ${value.sessionRef}`);
   if (workerPid !== undefined) lines.push(`Worker PID: ${workerPid}`);
-  if (signalled !== undefined) lines.push(`Signal sent: ${signalled ? "yes" : "no"}`);
-  if (error) lines.push(`Error: ${error}`);
-  if (resultText) lines.push("", resultText);
+  if (value.signalled !== undefined) lines.push(`Signal sent: ${value.signalled ? "yes" : "no"}`);
+  if (value.error) lines.push(`Error: ${value.error}`);
+  if (value.resultText) lines.push("", value.resultText);
 
   const candidateLines = formatCandidates(value.candidates);
   if (candidateLines.length > 0) lines.push("", ...candidateLines);
@@ -274,36 +276,28 @@ function formatRunOutput(value: Record<string, unknown>): string {
   return lines.join("\n").trim();
 }
 
-function formatHelpOutput(value: Record<string, unknown>): string {
-  const helpText = getString(value.help) ?? "";
-  const error = getString(value.error);
-  const version = getString(value.version);
+function formatHelpOutput(value: ControllerOutput & { readonly help: string }): string {
   const lines: string[] = [];
-  if (error) lines.push(`Error: ${error}`, "");
-  lines.push(helpText);
-  if (version) lines.push("", `Version: ${version}`);
+  if (value.error) lines.push(`Error: ${value.error}`, "");
+  lines.push(value.help);
+  if (value.version) lines.push("", `Version: ${value.version}`);
   return lines.join("\n");
 }
 
-function formatHumanOutput(value: unknown, commandName: string): string {
-  if (!isRecord(value)) {
-    return typeof value === "string" ? value : JSON.stringify(value, null, 2);
+function formatHumanOutput(value: ControllerOutput, commandName: string): string {
+  if (value.help !== undefined) return formatHelpOutput({ ...value, help: value.help });
+  if (value.harnesses !== undefined) return formatHarnessesOutput(value.harnesses);
+  if (value.sessions !== undefined)
+    return formatSessionsOutput({ ...value, sessions: value.sessions });
+  if (value.session !== undefined && value.recent !== undefined) return formatSnapshotOutput(value);
+  if (value.runId !== undefined) return formatRunOutput({ ...value, runId: value.runId });
+
+  if (value.version && Object.keys(value).every((key) => key === "ok" || key === "version")) {
+    return `${commandName} ${value.version}`;
   }
 
-  if (typeof value.help === "string") return formatHelpOutput(value);
-  if (Array.isArray(value.harnesses)) return formatHarnessesOutput(value);
-  if (Array.isArray(value.sessions)) return formatSessionsOutput(value);
-  if (isRecord(value.session) && isRecord(value.recent)) return formatSnapshotOutput(value);
-  if (typeof value.runId === "string") return formatRunOutput(value);
-
-  const version = getString(value.version);
-  if (version && Object.keys(value).every((key) => key === "ok" || key === "version")) {
-    return `${commandName} ${version}`;
-  }
-
-  const error = getString(value.error);
-  if (error) {
-    const lines = [`Error: ${error}`];
+  if (value.error) {
+    const lines = [`Error: ${value.error}`];
     const candidateLines = formatCandidates(value.candidates);
     if (candidateLines.length > 0) lines.push("", ...candidateLines);
     return lines.join("\n");
@@ -314,7 +308,7 @@ function formatHumanOutput(value: unknown, commandName: string): string {
 
 function createOutputWriter(mode: OutputMode, commandName: string): OutputWriter {
   if (mode === "json") return printJson;
-  return (value: unknown) => {
+  return (value) => {
     printText(formatHumanOutput(value, commandName));
   };
 }
@@ -335,11 +329,6 @@ function stripGlobalFlags(args: readonly string[]): string[] {
   }
 
   return stripped;
-}
-
-function errorMessage(error: unknown): string {
-  if (error instanceof Error) return error.message;
-  return String(error);
 }
 
 function compareUpdatedAtDesc(left?: string, right?: string): number {
@@ -410,51 +399,55 @@ function isTerminalStatus(status: PromptRunRecord["status"]): boolean {
   return status === "completed" || status === "failed" || status === "cancelled";
 }
 
-async function isProcessAlive(pid: number | undefined): Promise<boolean> {
-  if (!pid) return false;
-
-  try {
+async function isProcessAlive(
+  pid: number | undefined,
+): Promise<ResultType<boolean, ExternalOperationFailed>> {
+  if (!pid) return Result.ok(false);
+  const probed = await captureExternal("probe-worker", async () => {
     process.kill(pid, 0);
-  } catch {
-    return false;
-  }
+  });
+  // The historical probe treats every signal failure as a dead process.
+  const signalAlive = probed.match({ ok: () => true, err: () => false });
+  if (!signalAlive || process.platform !== "linux") return Result.ok(signalAlive);
 
-  // `kill(pid, 0)` returns success for zombie processes on Linux. Treat zombies as not alive
-  // so that wait/cancel flows do not hang on defunct detached workers.
-  if (process.platform === "linux") {
-    try {
-      const stat = await fs.readFile(`/proc/${pid}/stat`, "utf8");
-      const match = stat.match(/\)\s+([A-Z])\s/);
-      if (match?.[1] === "Z") {
-        return false;
-      }
-    } catch {
-      // Ignore /proc read failures and fall back to the kill(0) check.
-    }
-  }
-
-  return true;
+  // `kill(pid, 0)` succeeds for Linux zombies. Treat them as dead so wait and
+  // cancellation flows do not hang on a defunct detached worker.
+  const stat = await captureExternal("probe-worker", () => readFile(`/proc/${pid}/stat`, "utf8"));
+  return Result.ok(
+    stat.match({
+      ok: (value) => !/\)\s+Z\s/.test(value),
+      err: () => true,
+    }),
+  );
 }
 
-async function refreshRunStatus(run: PromptRunRecord): Promise<PromptRunRecord> {
-  if (isTerminalStatus(run.status)) return run;
+async function refreshRunStatus(
+  run: PromptRunRecord,
+): Promise<
+  ResultType<
+    PromptRunRecord,
+    | RunStoreError
+    | ExternalOperationFailed
+    | RunInvariantFailed
+    | WorkAndCleanupFailed<ExternalOperationFailed>
+  >
+> {
+  if (isTerminalStatus(run.status)) return Result.ok(run);
 
-  const workerAlive = await isProcessAlive(run.workerPid);
-
-  if (run.status === "submitted" && !run.cancelRequestedAt && !workerAlive) {
-    const workerPid = await spawnWorker(run.id);
-    if (workerPid) {
-      const restarted: PromptRunRecord = {
-        ...run,
-        workerPid,
-        updatedAt: Date.now(),
-      };
-      await saveRunRecord(restarted);
-      return restarted;
-    }
+  const alive = await isProcessAlive(run.workerPid);
+  const aliveError = alive.match({ ok: () => undefined, err: (error) => error });
+  if (aliveError !== undefined) return Result.err(aliveError);
+  const processAlive = alive.match({ ok: (value) => value, err: () => false });
+  if (run.status === "submitted" && !run.cancelRequestedAt && !processAlive) {
+    const worker = await spawnWorker(run.id);
+    const workerError = worker.match({ ok: () => undefined, err: (error) => error });
+    if (workerError !== undefined) return Result.err(workerError);
+    const spawned = worker.match({ ok: (value) => value, err: () => undefined });
+    if (spawned === undefined) return worker.map(() => run);
+    return persistSpawnedWorkerAdmission(run, spawned);
   }
 
-  if (run.workerPid && workerAlive) return run;
+  if (run.workerPid && processAlive) return Result.ok(run);
   const next: PromptRunRecord = {
     ...run,
     status: run.cancelRequestedAt ? "cancelled" : "failed",
@@ -465,54 +458,89 @@ async function refreshRunStatus(run: PromptRunRecord): Promise<PromptRunRecord> 
         ? "Prompt cancelled before the worker produced a terminal result."
         : "Background worker exited before producing a terminal result."),
   };
-  await saveRunRecord(next);
-  return next;
+  const saved = await saveRunRecord(next);
+  return saved.map(() => next);
 }
+
+type SessionCollectionError =
+  | AcpClientError
+  | ExternalOperationFailed
+  | SessionStoreError
+  | WorkAndCleanupFailed<{ readonly message: string }>;
 
 async function collectSessionsForHarness(params: {
   harnessId: string;
   directory: string;
   version: string;
   search?: string;
-}): Promise<{ sessions: ListedSession[]; warning?: string }> {
+}): Promise<
+  ResultType<
+    { sessions: ListedSession[]; warning?: string },
+    SessionCollectionError | HarnessUnavailable
+  >
+> {
   const indexed = await loadSessionIndex();
+  const indexError = indexed.match({ ok: () => undefined, err: (error) => error });
+  if (indexError !== undefined) return Result.err(indexError);
+  const index = indexed.match({ ok: (value) => value.value, err: () => undefined });
+  if (index === undefined) return indexed.map(() => ({ sessions: [] }));
   const descriptor = getHarnessDescriptor(params.harnessId);
   if (!descriptor) {
-    throw new Error(`Unknown harness '${params.harnessId}'.`);
+    return Result.err(
+      new HarnessUnavailable({
+        harnessId: params.harnessId,
+        message: `Unknown harness '${params.harnessId}'.`,
+      }),
+    );
   }
 
   const resolved = await resolveHarness(params.harnessId);
-  const cachedSessions = indexed.sessions
+  const resolveError = resolved.match({ ok: () => undefined, err: (error) => error });
+  if (resolveError !== undefined) return Result.err(resolveError);
+  const harness = resolved.match({ ok: (value) => value, err: () => null });
+  const cachedSessions = index.sessions
     .filter((entry) => entry.harnessId === params.harnessId && entry.cwd === params.directory)
     .map(listedSessionFromIndex);
 
-  if (!resolved) {
-    return {
+  if (!harness) {
+    return Result.ok({
       sessions: sortSessions(
         cachedSessions.filter((entry) => sessionMatchesSearch(entry, params.search)),
       ),
       warning: descriptor.installHint,
-    };
+    });
   }
 
-  const client = await AcpHarnessClient.connect({
-    harness: resolved,
+  const connected = await AcpHarnessClient.connect({
+    harness,
     version: params.version,
     permissionBehavior: "reject",
     counters: createEmptyPermissionCounters(),
   });
+  const connectError = connected.match({ ok: () => undefined, err: (error) => error });
+  if (connectError !== undefined) return Result.err(connectError);
+  const client = connected.match({ ok: (value) => value, err: () => undefined });
+  if (client === undefined) return connected.map(() => ({ sessions: [] }));
 
-  try {
-    const listed = await client.listSessions(params.directory).catch((error: unknown) => {
-      if (isAuthRequiredError(error)) {
-        throw new Error(client.authHint() ?? errorMessage(error));
-      }
-      throw error;
-    });
-
-    const liveSessions = listed.map((session) => {
+  const listed = await client.listSessions(params.directory);
+  let work: ResultType<
+    { sessions: ListedSession[]; warning?: string },
+    ExternalOperationFailed | HarnessUnavailable | SessionStoreError
+  >;
+  const listError = listed.match({ ok: () => undefined, err: (error) => error });
+  if (listError !== undefined) {
+    if (ExternalOperationFailed.is(listError) && isAuthRequiredError(listError)) {
+      work = Result.err(
+        replaceExternalFailureMessage(listError, client.authHint() ?? listError.message),
+      );
+    } else {
+      work = Result.err(listError);
+    }
+  } else {
+    const sessions = listed.match({ ok: (value) => value, err: () => [] });
+    const liveSessions = sessions.map((session) => {
       const sessionRef = formatSessionRef(params.harnessId, session.sessionId);
-      const cached = indexed.sessions.find((entry) => entry.sessionRef === sessionRef);
+      const cached = index.sessions.find((entry) => entry.sessionRef === sessionRef);
       return mergeSessionWithIndex(
         {
           harnessId: params.harnessId,
@@ -527,17 +555,29 @@ async function collectSessionsForHarness(params: {
       );
     });
 
-    await upsertSessionIndexEntries(liveSessions.map((session) => buildIndexEntry(session)));
-
-    return {
+    const saved = await upsertSessionIndexEntries(
+      liveSessions.map((session) => buildIndexEntry(session)),
+    );
+    work = saved.map(() => ({
       sessions: sortSessions(
         liveSessions.filter((entry) => sessionMatchesSearch(entry, params.search)),
       ),
       ...(client.authHint() ? { warning: client.authHint() } : {}),
-    };
-  } finally {
-    await client.close();
+    }));
   }
+
+  const cleanup = await client.close();
+  const cleanupError = cleanup.match({ ok: () => undefined, err: (error) => error });
+  if (cleanupError === undefined) return work;
+  const workError = work.match({ ok: () => undefined, err: (error) => error });
+  if (workError === undefined) return Result.err(cleanupError);
+  return Result.err(
+    new WorkAndCleanupFailed({
+      primary: workError,
+      cleanup: cleanupError,
+      message: `${workError.message} Harness cleanup also failed.`,
+    }),
+  );
 }
 
 async function collectSessions(params: {
@@ -546,12 +586,20 @@ async function collectSessions(params: {
   version: string;
   search?: string;
 }): Promise<{ sessions: ListedSession[]; warnings: string[] }> {
-  const harnessIds =
-    params.harnessId && params.harnessId !== "any"
-      ? [params.harnessId]
-      : (await listResolvedHarnesses()).map((entry) => entry.descriptor.id);
   const warnings: string[] = [];
   const sessions: ListedSession[] = [];
+  let harnessIds: string[];
+  if (params.harnessId && params.harnessId !== "any") {
+    harnessIds = [params.harnessId];
+  } else {
+    const resolved = await listResolvedHarnesses();
+    const resolutionError = resolved.match({ ok: () => undefined, err: (error) => error });
+    if (resolutionError !== undefined) return { sessions, warnings: [resolutionError.message] };
+    harnessIds = resolved.match({
+      ok: (value) => value.map((entry) => entry.descriptor.id),
+      err: () => [],
+    });
+  }
 
   for (const harnessId of harnessIds) {
     const collected = await collectSessionsForHarness({
@@ -559,12 +607,16 @@ async function collectSessions(params: {
       directory: params.directory,
       version: params.version,
       search: params.search,
-    }).catch((error: unknown) => ({
-      sessions: [] as ListedSession[],
-      warning: `Harness '${harnessId}': ${errorMessage(error)}`,
-    }));
-    sessions.push(...collected.sessions);
-    if (collected.warning) warnings.push(collected.warning);
+    });
+    const collectionError = collected.match({ ok: () => undefined, err: (error) => error });
+    if (collectionError !== undefined) {
+      warnings.push(`Harness '${harnessId}': ${collectionError.message}`);
+      continue;
+    }
+    const collection = collected.match({ ok: (value) => value, err: () => undefined });
+    if (collection === undefined) continue;
+    sessions.push(...collection.sessions);
+    if (collection.warning) warnings.push(collection.warning);
   }
 
   return { sessions: sortSessions(sessions), warnings };
@@ -577,45 +629,54 @@ async function resolveExistingSessionTarget(params: {
   harnessId?: string;
   directory: string;
   version: string;
-}): Promise<{
-  harnessId: string;
-  remoteSessionId?: string;
-  sessionRef?: string;
-  targetKind: "new" | "existing";
-  requestedTitle?: string;
-  candidates?: ListedSession[];
-}> {
+}): Promise<
+  ResultType<
+    {
+      harnessId: string;
+      remoteSessionId?: string;
+      sessionRef?: string;
+      targetKind: "new" | "existing";
+      requestedTitle?: string;
+      candidates?: ListedSession[];
+    },
+    SessionSelectionFailed
+  >
+> {
   if (params.sessionIdFlag) {
     const parsed = parseSessionRef(params.sessionIdFlag);
     if (parsed) {
       if (params.harnessId && params.harnessId !== "any" && params.harnessId !== parsed.harnessId) {
-        throw new Error(
-          `--session-id points to harness '${parsed.harnessId}', not '${params.harnessId}'.`,
+        return Result.err(
+          new SessionSelectionFailed({
+            message: `--session-id points to harness '${parsed.harnessId}', not '${params.harnessId}'.`,
+          }),
         );
       }
-      return {
+      return Result.ok({
         harnessId: parsed.harnessId,
         remoteSessionId: parsed.remoteSessionId,
         sessionRef: params.sessionIdFlag,
         targetKind: "existing",
-      };
+      });
     }
 
     if (!params.harnessId || params.harnessId === "any") {
-      throw new Error("Raw --session-id values require --harness.");
+      return Result.err(
+        new SessionSelectionFailed({ message: "Raw --session-id values require --harness." }),
+      );
     }
 
-    return {
+    return Result.ok({
       harnessId: params.harnessId,
       remoteSessionId: params.sessionIdFlag,
       sessionRef: formatSessionRef(params.harnessId, params.sessionIdFlag),
       targetKind: "existing",
-    };
+    });
   }
 
   if (params.latest) {
     if (!params.harnessId || params.harnessId === "any") {
-      throw new Error("--latest requires --harness.");
+      return Result.err(new SessionSelectionFailed({ message: "--latest requires --harness." }));
     }
     const collected = await collectSessions({
       harnessId: params.harnessId,
@@ -624,14 +685,18 @@ async function resolveExistingSessionTarget(params: {
     });
     const latest = collected.sessions[0];
     if (!latest) {
-      throw new Error(`No sessions found for harness '${params.harnessId}'.`);
+      return Result.err(
+        new SessionSelectionFailed({
+          message: `No sessions found for harness '${params.harnessId}'.`,
+        }),
+      );
     }
-    return {
+    return Result.ok({
       harnessId: latest.harnessId,
       remoteSessionId: latest.sessionId,
       sessionRef: latest.sessionRef,
       targetKind: "existing",
-    };
+    });
   }
 
   if (params.title) {
@@ -644,19 +709,19 @@ async function resolveExistingSessionTarget(params: {
       });
       const exactMatch = collected.sessions.find((session) => session.title === params.title);
       if (exactMatch) {
-        return {
+        return Result.ok({
           harnessId: exactMatch.harnessId,
           remoteSessionId: exactMatch.sessionId,
           sessionRef: exactMatch.sessionRef,
           targetKind: "existing",
-        };
+        });
       }
-      return {
+      return Result.ok({
         harnessId: params.harnessId,
         targetKind: "new",
         requestedTitle: params.title,
         candidates: collected.sessions,
-      };
+      });
     }
 
     const collected = await collectSessions({
@@ -667,56 +732,270 @@ async function resolveExistingSessionTarget(params: {
     const exactMatches = collected.sessions.filter((session) => session.title === params.title);
     if (exactMatches.length === 1) {
       const [match] = exactMatches;
-      if (!match) throw new Error("Expected an exact match.");
-      return {
+      if (!match) {
+        return Result.err(new SessionSelectionFailed({ message: "Expected an exact match." }));
+      }
+      return Result.ok({
         harnessId: match.harnessId,
         remoteSessionId: match.sessionId,
         sessionRef: match.sessionRef,
         targetKind: "existing",
-      };
+      });
     }
 
     if (exactMatches.length > 1) {
-      return {
+      return Result.ok({
         harnessId: "",
         targetKind: "existing",
         candidates: exactMatches,
-      };
+      });
     }
 
-    return {
+    return Result.ok({
       harnessId: "",
       targetKind: "existing",
       candidates: collected.sessions,
-    };
+    });
   }
 
   if (params.harnessId && params.harnessId !== "any") {
-    return {
+    return Result.ok({
       harnessId: params.harnessId,
       targetKind: "new",
-    };
+    });
   }
 
-  throw new Error("No session selector matched. Use --harness to create a new session.");
+  return Result.err(
+    new SessionSelectionFailed({
+      message: "No session selector matched. Use --harness to create a new session.",
+    }),
+  );
 }
 
-async function spawnWorker(runId: string): Promise<number | undefined> {
+export type SpawnedWorker = {
+  readonly pid: number;
+  readonly detach: () => void;
+  readonly terminate: () => Promise<ResultType<void, ExternalOperationFailed>>;
+};
+
+async function terminateChildProcess(
+  child: ChildProcess,
+): Promise<ResultType<void, ExternalOperationFailed>> {
+  if (child.exitCode !== null || child.signalCode !== null) return Result.ok(undefined);
+  let resolveExit: (() => void) | undefined;
+  let rejectExit: ((cause: Error) => void) | undefined;
+  const exited = new Promise<void>((resolve, reject) => {
+    resolveExit = resolve;
+    rejectExit = reject;
+  });
+  const onExit = () => resolveExit?.();
+  const onError = (cause: Error) => rejectExit?.(cause);
+  child.once("exit", onExit);
+  child.once("error", onError);
+  const signalled = await captureExternal("terminate-worker", async () => child.kill("SIGKILL"));
+  const signalError = signalled.match({ ok: () => undefined, err: (error) => error });
+  if (signalError !== undefined) {
+    child.off("exit", onExit);
+    child.off("error", onError);
+    return Result.err(signalError);
+  }
+  const signalSent = signalled.match({ ok: (value) => value, err: () => false });
+  if (!signalSent && child.exitCode === null && child.signalCode === null) {
+    child.off("exit", onExit);
+    child.off("error", onError);
+    const cause = new Error("Failed to terminate uncommitted prompt worker.");
+    return Result.err(
+      new ExternalOperationFailed({
+        operation: "terminate-worker",
+        cause,
+        message: cause.message,
+      }),
+    );
+  }
+  const settled = await captureExternal("terminate-worker", () => exited);
+  child.off("exit", onExit);
+  child.off("error", onError);
+  return settled.map(() => undefined);
+}
+
+async function spawnWorker(
+  runId: string,
+): Promise<ResultType<SpawnedWorker, ExternalOperationFailed | RunInvariantFailed>> {
   const entryPoint = process.env.LILAC_ACP_ENTRYPOINT ?? process.argv[1];
   if (!entryPoint) {
-    throw new Error("Cannot determine the CLI entrypoint for worker spawning.");
+    return Result.err(
+      new RunInvariantFailed({
+        runId,
+        message: "Cannot determine the CLI entrypoint for worker spawning.",
+      }),
+    );
   }
 
-  const child = spawn(process.execPath, [entryPoint, "_worker", "run", "--run-id", runId], {
-    detached: true,
-    stdio: "ignore",
-    env: {
-      ...process.env,
-      LILAC_ACP_ENTRYPOINT: entryPoint,
-    },
+  const spawned = await captureExternal("spawn-worker", async () => {
+    return spawn(process.execPath, [entryPoint, "_worker", "run", "--run-id", runId], {
+      detached: true,
+      stdio: "ignore",
+      env: {
+        ...process.env,
+        LILAC_ACP_ENTRYPOINT: entryPoint,
+      },
+    });
   });
-  child.unref();
-  return child.pid;
+  const child = spawned.match<ChildProcess | ExternalOperationFailed>({
+    ok: (value) => value,
+    err: (error) => error,
+  });
+  if (ExternalOperationFailed.is(child)) return Result.err(child);
+  if (child.pid === undefined) {
+    const terminated = await terminateChildProcess(child);
+    const terminationError = terminated.match({ ok: () => undefined, err: (error) => error });
+    if (terminationError !== undefined) return Result.err(terminationError);
+    return Result.err(
+      new RunInvariantFailed({
+        runId,
+        message: "Prompt worker started without a process ID.",
+      }),
+    );
+  }
+  return Result.ok({
+    pid: child.pid,
+    detach: () => child.unref(),
+    terminate: () => terminateChildProcess(child),
+  });
+}
+
+export async function persistSpawnedWorkerAdmission(
+  run: PromptRunRecord,
+  worker: SpawnedWorker,
+  persist: (
+    record: PromptRunRecord,
+  ) => Promise<ResultType<void, ExternalOperationFailed>> = saveRunRecord,
+): Promise<
+  ResultType<
+    PromptRunRecord,
+    ExternalOperationFailed | WorkAndCleanupFailed<ExternalOperationFailed>
+  >
+> {
+  const admitted: PromptRunRecord = {
+    ...run,
+    workerPid: worker.pid,
+    updatedAt: Date.now(),
+  };
+  const persistence = await Result.tryPromise({
+    try: () => persist(admitted),
+    catch: captureAcpFailure,
+  });
+  const persistedSuccessfully = persistence.match({
+    ok: (result) => result.match({ ok: () => true, err: () => false }),
+    err: () => false,
+  });
+  if (persistedSuccessfully) {
+    worker.detach();
+    return Result.ok(admitted);
+  }
+
+  const termination = await Result.tryPromise({
+    try: worker.terminate,
+    catch: captureAcpFailure,
+  });
+  const persistenceCaptureFailure = persistence.match({
+    ok: () => undefined,
+    err: (failure) => failure,
+  });
+  const terminationCaptureFailure = termination.match({
+    ok: () => undefined,
+    err: (failure) => failure,
+  });
+  if (persistenceCaptureFailure !== undefined) {
+    switch (persistenceCaptureFailure.kind) {
+      case "panic": {
+        if (terminationCaptureFailure === undefined) {
+          const cleanupError = termination.match({
+            ok: (result) => result.match({ ok: () => undefined, err: (error) => error }),
+            err: () => undefined,
+          });
+          if (cleanupError !== undefined) {
+            recordAcpCleanupFailure(persistenceCaptureFailure.panic, cleanupError);
+          }
+        } else {
+          const cleanupFailure =
+            terminationCaptureFailure.kind === "panic"
+              ? terminationCaptureFailure.panic
+              : capturedWorkerFailure("terminate-worker", terminationCaptureFailure);
+          recordAcpCleanupFailure(persistenceCaptureFailure.panic, cleanupFailure);
+        }
+        return signalAcpDefect(persistenceCaptureFailure.panic);
+      }
+      case "ordinary": {
+        const primary = capturedWorkerFailure("write-run", persistenceCaptureFailure);
+        const cleanupError = termination.match<ExternalOperationFailed | Panic | undefined>({
+          ok: (result) => result.match({ ok: () => undefined, err: (error) => error }),
+          err: (failure) =>
+            failure.kind === "panic"
+              ? failure.panic
+              : capturedWorkerFailure("terminate-worker", failure),
+        });
+        if (Panic.is(cleanupError)) return signalAcpDefect(cleanupError);
+        if (cleanupError === undefined) return Result.err(primary);
+        return Result.err(
+          new WorkAndCleanupFailed({
+            primary,
+            cleanup: cleanupError,
+            message: `${primary.message} Prompt worker termination also failed.`,
+          }),
+        );
+      }
+    }
+  }
+  const primary = persistence.match({
+    ok: (result) => result.match({ ok: () => undefined, err: (error) => error }),
+    err: () => undefined,
+  });
+  if (primary === undefined) return Result.ok(admitted);
+  const cleanupError = termination.match<ExternalOperationFailed | Panic | undefined>({
+    ok: (result) => result.match({ ok: () => undefined, err: (error) => error }),
+    err: (failure) =>
+      failure.kind === "panic" ? failure.panic : capturedWorkerFailure("terminate-worker", failure),
+  });
+  if (Panic.is(cleanupError)) return signalAcpDefect(cleanupError);
+  if (cleanupError === undefined) return Result.err(primary);
+  return Result.err(
+    new WorkAndCleanupFailed({
+      primary,
+      cleanup: cleanupError,
+      message: `${primary.message} Prompt worker termination also failed.`,
+    }),
+  );
+}
+
+function capturedWorkerFailure(
+  operation:
+    | "close-harness"
+    | "close-run-cancellation-watch"
+    | "remove-worker-signals"
+    | "terminate-worker"
+    | "watch-run-cancellation"
+    | "worker-process"
+    | "write-run",
+  captured: Extract<CapturedAcpFailure, { readonly kind: "ordinary" }>,
+): ExternalOperationFailed {
+  return new ExternalOperationFailed({
+    operation,
+    cause: captured.cause,
+    ...(captured.projection.code ? { code: captured.projection.code } : {}),
+    message: captured.projection.message,
+  });
+}
+
+function capturedCleanupResult(
+  attempted: ResultType<ResultType<void, ExternalOperationFailed>, CapturedAcpFailure>,
+  operation: "close-harness" | "close-run-cancellation-watch",
+): ExternalOperationFailed | Panic | undefined {
+  return attempted.match({
+    ok: (result) => result.match({ ok: () => undefined, err: (error) => error }),
+    err: (failure) =>
+      failure.kind === "panic" ? failure.panic : capturedWorkerFailure(operation, failure),
+  });
 }
 
 function help(commandName: string): string {
@@ -745,9 +1024,15 @@ function help(commandName: string): string {
 
 async function runHarnessesList(version: string, write: OutputWriter): Promise<number> {
   const harnesses = await listResolvedHarnesses();
+  const harnessError = harnesses.match({ ok: () => undefined, err: (error) => error });
+  if (harnessError !== undefined) {
+    write({ ok: false, error: harnessError.message });
+    return 1;
+  }
+  const entries = harnesses.match({ ok: (value) => value, err: () => [] });
   write({
     ok: true,
-    harnesses: harnesses.map((entry) => ({
+    harnesses: entries.map((entry) => ({
       id: entry.descriptor.id,
       title: entry.descriptor.title,
       description: entry.descriptor.description,
@@ -797,7 +1082,7 @@ async function runSessionsSnapshot(params: {
   version: string;
   write: OutputWriter;
 }): Promise<number> {
-  const target = await resolveExistingSessionTarget({
+  const selected = await resolveExistingSessionTarget({
     sessionIdFlag: params.sessionIdFlag,
     title: params.title,
     latest: params.latest,
@@ -805,6 +1090,13 @@ async function runSessionsSnapshot(params: {
     directory: params.directory,
     version: params.version,
   });
+  const selectionError = selected.match({ ok: () => undefined, err: (error) => error });
+  if (selectionError !== undefined) {
+    params.write({ ok: false, error: selectionError.message });
+    return 1;
+  }
+  const target = selected.match({ ok: (value) => value, err: () => undefined });
+  if (target === undefined) return 1;
 
   if (!target.remoteSessionId || !target.sessionRef) {
     params.write({
@@ -819,7 +1111,13 @@ async function runSessionsSnapshot(params: {
   }
 
   const resolvedHarness = await resolveHarness(target.harnessId);
-  if (!resolvedHarness) {
+  const resolveError = resolvedHarness.match({ ok: () => undefined, err: (error) => error });
+  if (resolveError !== undefined) {
+    params.write({ ok: false, error: resolveError.message });
+    return 1;
+  }
+  const harness = resolvedHarness.match({ ok: (value) => value, err: () => null });
+  if (!harness) {
     const descriptor = getHarnessDescriptor(target.harnessId);
     params.write({
       ok: false,
@@ -829,50 +1127,63 @@ async function runSessionsSnapshot(params: {
   }
 
   const collector = new SessionHistoryCollector();
-  const client = await AcpHarnessClient.connect({
-    harness: resolvedHarness,
+  const connected = await AcpHarnessClient.connect({
+    harness,
     version: params.version,
     permissionBehavior: "reject",
     counters: createEmptyPermissionCounters(),
     onUpdate: (notification) => collector.add(notification),
   });
-
-  try {
-    await client.loadSession(target.remoteSessionId, params.directory);
-    params.write({
-      ok: true,
-      harnessId: target.harnessId,
-      sessionId: target.remoteSessionId,
-      sessionRef: target.sessionRef,
-      session: {
-        id: target.remoteSessionId,
-        title: collector.title,
-        cwd: params.directory,
-        updatedAt: collector.updatedAt,
-      },
-      ...(collector.plan ? { plan: collector.plan } : {}),
-      recent: {
-        runs: buildSnapshotRuns(collector.history, params.maxRuns, params.maxChars),
-      },
-      ...(collector.history.length > 0 ? { history: collector.history } : {}),
-      meta: {
-        directory: params.directory,
-        harnessId: target.harnessId,
-        capabilities: client.capabilities(),
-      },
-    });
-    return 0;
-  } catch (error) {
+  const connectError = connected.match({ ok: () => undefined, err: (error) => error });
+  if (connectError !== undefined) {
     params.write({
       ok: false,
-      error: errorMessage(error),
+      error: connectError.message,
       harnessId: target.harnessId,
       sessionRef: target.sessionRef,
     });
     return 1;
-  } finally {
-    await client.close();
   }
+  const client = connected.match({ ok: (value) => value, err: () => undefined });
+  if (client === undefined) return 1;
+  const loaded = await client.loadSession(target.remoteSessionId, params.directory);
+  const cleanup = await client.close();
+  const loadError = loaded.match({ ok: () => undefined, err: (error) => error });
+  const cleanupError = cleanup.match({ ok: () => undefined, err: (error) => error });
+  if (loadError !== undefined || cleanupError !== undefined) {
+    const failureMessage =
+      loadError?.message ?? cleanupError?.message ?? "Harness operation failed.";
+    params.write({
+      ok: false,
+      error: failureMessage,
+      harnessId: target.harnessId,
+      sessionRef: target.sessionRef,
+    });
+    return 1;
+  }
+  params.write({
+    ok: true,
+    harnessId: target.harnessId,
+    sessionId: target.remoteSessionId,
+    sessionRef: target.sessionRef,
+    session: {
+      id: target.remoteSessionId,
+      title: collector.title,
+      cwd: params.directory,
+      updatedAt: collector.updatedAt,
+    },
+    ...(collector.plan ? { plan: collector.plan } : {}),
+    recent: {
+      runs: buildSnapshotRuns(collector.history, params.maxRuns, params.maxChars),
+    },
+    ...(collector.history.length > 0 ? { history: collector.history } : {}),
+    meta: {
+      directory: params.directory,
+      harnessId: target.harnessId,
+      capabilities: client.capabilities(),
+    },
+  });
+  return 0;
 }
 
 async function runPromptSubmit(params: {
@@ -890,7 +1201,7 @@ async function runPromptSubmit(params: {
   version: string;
   write: OutputWriter;
 }): Promise<number> {
-  const target = await resolveExistingSessionTarget({
+  const selected = await resolveExistingSessionTarget({
     sessionIdFlag: params.sessionIdFlag,
     title: params.title,
     latest: params.latest,
@@ -898,6 +1209,13 @@ async function runPromptSubmit(params: {
     directory: params.directory,
     version: params.version,
   });
+  const selectionError = selected.match({ ok: () => undefined, err: (error) => error });
+  if (selectionError !== undefined) {
+    params.write({ ok: false, error: selectionError.message });
+    return 1;
+  }
+  const target = selected.match({ ok: (value) => value, err: () => undefined });
+  if (target === undefined) return 1;
 
   if (!target.harnessId) {
     params.write({
@@ -911,7 +1229,13 @@ async function runPromptSubmit(params: {
   }
 
   const resolvedHarness = await resolveHarness(target.harnessId);
-  if (!resolvedHarness) {
+  const resolveError = resolvedHarness.match({ ok: () => undefined, err: (error) => error });
+  if (resolveError !== undefined) {
+    params.write({ ok: false, error: resolveError.message });
+    return 1;
+  }
+  const harness = resolvedHarness.match({ ok: (value) => value, err: () => null });
+  if (!harness) {
     const descriptor = getHarnessDescriptor(target.harnessId);
     params.write({
       ok: false,
@@ -939,14 +1263,28 @@ async function runPromptSubmit(params: {
     permissions: createEmptyPermissionCounters(),
   };
 
-  await saveRunRecord(run);
-  const workerPid = await spawnWorker(runId);
-  const withWorker: PromptRunRecord = {
-    ...run,
-    ...(workerPid ? { workerPid } : {}),
-    updatedAt: Date.now(),
-  };
-  await saveRunRecord(withWorker);
+  const initialSave = await saveRunRecord(run);
+  const initialSaveError = initialSave.match({ ok: () => undefined, err: (error) => error });
+  if (initialSaveError !== undefined) {
+    params.write({ ok: false, error: initialSaveError.message, runId });
+    return 1;
+  }
+  const worker = await spawnWorker(runId);
+  const workerError = worker.match({ ok: () => undefined, err: (error) => error });
+  if (workerError !== undefined) {
+    params.write({ ok: false, error: workerError.message, runId });
+    return 1;
+  }
+  const spawnedWorker = worker.match({ ok: (value) => value, err: () => undefined });
+  if (spawnedWorker === undefined) return 1;
+  const admitted = await persistSpawnedWorkerAdmission(run, spawnedWorker);
+  const admissionError = admitted.match({ ok: () => undefined, err: (error) => error });
+  if (admissionError !== undefined) {
+    params.write({ ok: false, error: admissionError.message, runId });
+    return 1;
+  }
+  const withWorker = admitted.match({ ok: (value) => value, err: () => undefined });
+  if (withWorker === undefined) return 1;
 
   if (params.wait) {
     return runPromptWait({
@@ -970,50 +1308,70 @@ async function runPromptSubmit(params: {
 }
 
 async function runPromptInspect(params: { runId: string; write: OutputWriter }): Promise<number> {
-  try {
-    const run = await refreshRunStatus(await loadRunRecord(params.runId));
-    params.write({
-      ok: true,
-      runId: run.id,
-      status: run.status,
-      harnessId: run.harnessId,
-      ...(run.sessionRef ? { sessionRef: run.sessionRef } : {}),
-      run,
-    });
-    return 0;
-  } catch (error) {
-    params.write({ ok: false, error: errorMessage(error), runId: params.runId });
+  const loaded = await loadRunRecord(params.runId);
+  const loadError = loaded.match({ ok: () => undefined, err: (error) => error });
+  if (loadError !== undefined) {
+    params.write({ ok: false, error: loadError.message, runId: params.runId });
     return 1;
   }
+  const loadedRun = loaded.match({ ok: (value) => value, err: () => undefined });
+  if (loadedRun === undefined) return 1;
+  const refreshed = await refreshRunStatus(loadedRun);
+  const refreshError = refreshed.match({ ok: () => undefined, err: (error) => error });
+  if (refreshError !== undefined) {
+    params.write({ ok: false, error: refreshError.message, runId: params.runId });
+    return 1;
+  }
+  const run = refreshed.match({ ok: (value) => value, err: () => undefined });
+  if (run === undefined) return 1;
+  params.write({
+    ok: true,
+    runId: run.id,
+    status: run.status,
+    harnessId: run.harnessId,
+    ...(run.sessionRef ? { sessionRef: run.sessionRef } : {}),
+    run,
+  });
+  return 0;
 }
 
 async function runPromptResult(params: { runId: string; write: OutputWriter }): Promise<number> {
-  try {
-    const run = await refreshRunStatus(await loadRunRecord(params.runId));
-    if (!isTerminalStatus(run.status)) {
-      params.write({
-        ok: false,
-        error: `Run '${params.runId}' is not finished yet (status=${run.status}).`,
-        runId: params.runId,
-        status: run.status,
-      });
-      return 1;
-    }
-    params.write({
-      ok: run.status === "completed",
-      runId: run.id,
-      status: run.status,
-      harnessId: run.harnessId,
-      ...(run.sessionRef ? { sessionRef: run.sessionRef } : {}),
-      ...(run.resultText ? { resultText: run.resultText } : {}),
-      ...(run.error ? { error: run.error } : {}),
-      run,
-    });
-    return run.status === "completed" ? 0 : 1;
-  } catch (error) {
-    params.write({ ok: false, error: errorMessage(error), runId: params.runId });
+  const loaded = await loadRunRecord(params.runId);
+  const loadError = loaded.match({ ok: () => undefined, err: (error) => error });
+  if (loadError !== undefined) {
+    params.write({ ok: false, error: loadError.message, runId: params.runId });
     return 1;
   }
+  const loadedRun = loaded.match({ ok: (value) => value, err: () => undefined });
+  if (loadedRun === undefined) return 1;
+  const refreshed = await refreshRunStatus(loadedRun);
+  const refreshError = refreshed.match({ ok: () => undefined, err: (error) => error });
+  if (refreshError !== undefined) {
+    params.write({ ok: false, error: refreshError.message, runId: params.runId });
+    return 1;
+  }
+  const run = refreshed.match({ ok: (value) => value, err: () => undefined });
+  if (run === undefined) return 1;
+  if (!isTerminalStatus(run.status)) {
+    params.write({
+      ok: false,
+      error: `Run '${params.runId}' is not finished yet (status=${run.status}).`,
+      runId: params.runId,
+      status: run.status,
+    });
+    return 1;
+  }
+  params.write({
+    ok: run.status === "completed",
+    runId: run.id,
+    status: run.status,
+    harnessId: run.harnessId,
+    ...(run.sessionRef ? { sessionRef: run.sessionRef } : {}),
+    ...(run.resultText ? { resultText: run.resultText } : {}),
+    ...(run.error ? { error: run.error } : {}),
+    run,
+  });
+  return run.status === "completed" ? 0 : 1;
 }
 
 async function runPromptWait(params: {
@@ -1025,7 +1383,22 @@ async function runPromptWait(params: {
   const startedAt = Date.now();
 
   while (true) {
-    const run = await refreshRunStatus(await loadRunRecord(params.runId));
+    const loaded = await loadRunRecord(params.runId);
+    const loadError = loaded.match({ ok: () => undefined, err: (error) => error });
+    if (loadError !== undefined) {
+      params.write({ ok: false, error: loadError.message, runId: params.runId });
+      return 1;
+    }
+    const loadedRun = loaded.match({ ok: (value) => value, err: () => undefined });
+    if (loadedRun === undefined) return 1;
+    const refreshed = await refreshRunStatus(loadedRun);
+    const refreshError = refreshed.match({ ok: () => undefined, err: (error) => error });
+    if (refreshError !== undefined) {
+      params.write({ ok: false, error: refreshError.message, runId: params.runId });
+      return 1;
+    }
+    const run = refreshed.match({ ok: (value) => value, err: () => undefined });
+    if (run === undefined) return 1;
     if (isTerminalStatus(run.status)) {
       params.write({
         ok: run.status === "completed",
@@ -1054,247 +1427,827 @@ async function runPromptWait(params: {
 }
 
 async function runPromptCancel(params: { runId: string; write: OutputWriter }): Promise<number> {
-  try {
-    const run = await loadRunRecord(params.runId);
-    if (isTerminalStatus(run.status)) {
-      params.write({
-        ok: false,
-        runId: params.runId,
-        error: `Run '${params.runId}' already finished with status '${run.status}'.`,
-      });
-      return 1;
-    }
-    const next: PromptRunRecord = {
-      ...run,
-      cancelRequestedAt: Date.now(),
-      updatedAt: Date.now(),
-    };
-    await saveRunRecord(next);
-
-    if (!run.workerPid || !(await isProcessAlive(run.workerPid))) {
-      params.write({
-        ok: true,
-        runId: params.runId,
-        signalled: false,
-      });
-      return 0;
-    }
-    process.kill(run.workerPid, "SIGTERM");
-    params.write({
-      ok: true,
-      runId: params.runId,
-      signalled: true,
-      workerPid: run.workerPid,
-    });
-    return 0;
-  } catch (error) {
-    params.write({ ok: false, error: errorMessage(error), runId: params.runId });
+  const cancellation = await requestRunCancellation(params.runId);
+  const cancellationError = cancellation.match({ ok: () => undefined, err: (error) => error });
+  if (cancellationError !== undefined) {
+    params.write({ ok: false, error: cancellationError.message, runId: params.runId });
     return 1;
   }
+  const cancellationResult = cancellation.match({ ok: (value) => value, err: () => undefined });
+  if (cancellationResult === undefined) return 1;
+  if (cancellationResult.kind === "already-terminal") {
+    params.write({
+      ok: false,
+      runId: params.runId,
+      error: `Run '${params.runId}' already finished with status '${cancellationResult.run.status}'.`,
+    });
+    return 1;
+  }
+  const run = cancellationResult.run;
+
+  const alive = await isProcessAlive(run.workerPid);
+  const aliveError = alive.match({ ok: () => undefined, err: (error) => error });
+  if (aliveError !== undefined) {
+    params.write({ ok: false, error: aliveError.message, runId: params.runId });
+    return 1;
+  }
+  const processAlive = alive.match({ ok: (value) => value, err: () => false });
+  if (!run.workerPid || !processAlive) {
+    params.write({ ok: true, runId: params.runId, signalled: false });
+    return 0;
+  }
+  const workerPid = run.workerPid;
+  const signalled = await captureExternal("signal-worker", async () => {
+    process.kill(workerPid, "SIGTERM");
+  });
+  const signalError = signalled.match({ ok: () => undefined, err: (error) => error });
+  if (signalError !== undefined) {
+    params.write({ ok: false, error: signalError.message, runId: params.runId });
+    return 1;
+  }
+  params.write({
+    ok: true,
+    runId: params.runId,
+    signalled: true,
+    workerPid,
+  });
+  return 0;
 }
 
-async function persistRunFromCollector(
+type PersistRunFromCollector = (
   run: PromptRunRecord,
   collector: SessionHistoryCollector,
-): Promise<void> {
+) => Promise<ResultType<void, RunStoreError>>;
+
+export async function persistRunFromCollector(
+  run: PromptRunRecord,
+  collector: SessionHistoryCollector,
+  persist: (record: PromptRunRecord) => Promise<ResultType<void, RunStoreError>> = async (
+    record,
+  ) => {
+    const saved = await saveWorkerRunRecord(record);
+    return saved.map((value) => {
+      Object.assign(record, value);
+    });
+  },
+): Promise<ResultType<void, RunStoreError>> {
+  let sessionUpdate: Pick<PromptRunRecord, "session"> | Record<string, never> = {};
+  if (run.session) {
+    sessionUpdate = {
+      session: {
+        ...run.session,
+        title: collector.title ?? run.session.title,
+        updatedAt: collector.updatedAt ?? run.session.updatedAt,
+      },
+    };
+  } else if (run.sessionRef) {
+    sessionUpdate = {
+      session: {
+        title: collector.title ?? run.requestedTitle,
+        cwd: run.directory,
+        updatedAt: collector.updatedAt,
+        capabilities: capabilitiesFromSummary(run.session),
+      },
+    };
+  }
   const next: PromptRunRecord = {
     ...run,
     updatedAt: Date.now(),
-    ...(run.session
-      ? {
-          session: {
-            ...run.session,
-            title: collector.title ?? run.session.title,
-            updatedAt: collector.updatedAt ?? run.session.updatedAt,
-          },
-        }
-      : run.sessionRef
-        ? {
-            session: {
-              title: collector.title ?? run.requestedTitle,
-              cwd: run.directory,
-              updatedAt: collector.updatedAt,
-              capabilities: capabilitiesFromSummary(run.session),
-            },
-          }
-        : {}),
-    ...(collector.plan ? { plan: collector.plan } : {}),
-    ...(collector.history.length > 0 ? { history: collector.history } : {}),
+    ...sessionUpdate,
+    ...(collector.plan ? { plan: collector.plan.map((entry) => ({ ...entry })) } : {}),
+    ...(collector.history.length > 0
+      ? { history: collector.history.map((message) => ({ ...message })) }
+      : {}),
     ...(collector.latestAssistantText() ? { resultText: collector.latestAssistantText() } : {}),
   };
-  Object.assign(run, next);
-  await saveRunRecord(run);
+  const saved = await persist(next);
+  return saved.map(() => {
+    Object.assign(run, next);
+  });
 }
 
-async function runWorkerProcess(runId: string, version: string): Promise<number> {
-  const run = await loadRunRecord(runId);
+export function createSessionUpdatePersistence(
+  run: PromptRunRecord,
+  collector: SessionHistoryCollector,
+  persist: PersistRunFromCollector = persistRunFromCollector,
+): {
+  readonly onUpdate: (notification: SessionNotification) => Promise<void>;
+  readonly persist: (record: PromptRunRecord) => Promise<ResultType<void, RunStoreError>>;
+  readonly finalize: () => Promise<ResultType<void, RunStoreError>>;
+} {
+  let closed = false;
+  let pending = Promise.resolve();
+  let persistenceError: RunStoreError | undefined;
+  let finalized: Promise<ResultType<void, RunStoreError>> | undefined;
+
+  const enqueuePersistence = (record: PromptRunRecord) => {
+    const persisted = pending.then(async () => {
+      const result = await persist(record, collector);
+      result.match({
+        err: (error) => {
+          persistenceError ??= error;
+        },
+        ok: () => {
+          Object.assign(run, record);
+        },
+      });
+      return result;
+    });
+    pending = persisted.then(() => undefined);
+    return persisted;
+  };
+
+  return {
+    onUpdate: (notification) => {
+      if (closed) return Promise.resolve();
+      const update = pending.then(async () => {
+        collector.add(notification);
+        const persisted = await persist(run, collector);
+        persisted.match({
+          ok: () => {},
+          err: (error) => {
+            persistenceError ??= error;
+          },
+        });
+      });
+      pending = update;
+      return update;
+    },
+    persist: enqueuePersistence,
+    finalize: () => {
+      if (finalized) return finalized;
+      closed = true;
+      finalized = pending.then(() =>
+        persistenceError ? Result.err(persistenceError) : Result.ok(undefined),
+      );
+      return finalized;
+    },
+  };
+}
+
+type AcpWorkerLifecycleError<WorkError> =
+  | WorkError
+  | ExternalOperationFailed
+  | WorkerLifecycleCleanupFailed<WorkError | ExternalOperationFailed>;
+
+export async function runAcpWorkerLifecycle<T, WorkError extends { readonly message: string }>(
+  work: () => Promise<ResultType<T, WorkError>>,
+  cleanup: () => Promise<ResultType<void, ExternalOperationFailed>>,
+  removeSignals: () => void,
+): Promise<ResultType<T, AcpWorkerLifecycleError<WorkError>>> {
+  const attempted = await Result.tryPromise({ try: work, catch: captureAcpFailure });
+  const removalAttempted = Result.try({ try: removeSignals, catch: captureAcpFailure });
+  const cleanupAttempted = await Result.tryPromise({ try: cleanup, catch: captureAcpFailure });
+
+  const workCaptureFailure = attempted.match({ ok: () => undefined, err: (failure) => failure });
+  const removalCaptureFailure = removalAttempted.match({
+    ok: () => undefined,
+    err: (failure) => failure,
+  });
+  const cleanupCaptureFailure = cleanupAttempted.match({
+    ok: () => undefined,
+    err: (failure) => failure,
+  });
+
+  if (workCaptureFailure?.kind === "panic") {
+    if (removalCaptureFailure !== undefined) {
+      const removalFailure =
+        removalCaptureFailure.kind === "panic"
+          ? removalCaptureFailure.panic
+          : capturedWorkerFailure("remove-worker-signals", removalCaptureFailure);
+      recordAcpCleanupFailure(workCaptureFailure.panic, removalFailure);
+    }
+    if (cleanupCaptureFailure === undefined) {
+      const cleanupError = cleanupAttempted.match({
+        ok: (result) => result.match({ ok: () => undefined, err: (error) => error }),
+        err: () => undefined,
+      });
+      if (cleanupError !== undefined)
+        recordAcpCleanupFailure(workCaptureFailure.panic, cleanupError);
+    } else {
+      const cleanupFailure =
+        cleanupCaptureFailure.kind === "panic"
+          ? cleanupCaptureFailure.panic
+          : capturedWorkerFailure("close-harness", cleanupCaptureFailure);
+      recordAcpCleanupFailure(workCaptureFailure.panic, cleanupFailure);
+    }
+    return signalAcpDefect(workCaptureFailure.panic);
+  }
+
+  if (removalCaptureFailure?.kind === "panic") {
+    if (cleanupCaptureFailure === undefined) {
+      const cleanupError = cleanupAttempted.match({
+        ok: (result) => result.match({ ok: () => undefined, err: (error) => error }),
+        err: () => undefined,
+      });
+      if (cleanupError !== undefined) {
+        recordAcpCleanupFailure(removalCaptureFailure.panic, cleanupError);
+      }
+    } else {
+      const cleanupFailure =
+        cleanupCaptureFailure.kind === "panic"
+          ? cleanupCaptureFailure.panic
+          : capturedWorkerFailure("close-harness", cleanupCaptureFailure);
+      recordAcpCleanupFailure(removalCaptureFailure.panic, cleanupFailure);
+    }
+    return signalAcpDefect(removalCaptureFailure.panic);
+  }
+
+  if (cleanupCaptureFailure?.kind === "panic") {
+    if (removalCaptureFailure?.kind === "ordinary") {
+      recordAcpCleanupFailure(
+        cleanupCaptureFailure.panic,
+        capturedWorkerFailure("remove-worker-signals", removalCaptureFailure),
+      );
+    }
+    return signalAcpDefect(cleanupCaptureFailure.panic);
+  }
+
+  const resultOrPanic = attempted.match<ResultType<T, WorkError | ExternalOperationFailed> | Panic>(
+    {
+      ok: (result) => result,
+      err: (failure) =>
+        failure.kind === "panic"
+          ? failure.panic
+          : Result.err(capturedWorkerFailure("worker-process", failure)),
+    },
+  );
+  if (Panic.is(resultOrPanic)) return signalAcpDefect(resultOrPanic);
+  const result = resultOrPanic;
+  const removalFailure =
+    removalCaptureFailure?.kind === "ordinary"
+      ? capturedWorkerFailure("remove-worker-signals", removalCaptureFailure)
+      : undefined;
+  const cleanedOrPanic = cleanupAttempted.match<ResultType<void, ExternalOperationFailed> | Panic>({
+    ok: (result) => result,
+    err: (failure) =>
+      failure.kind === "panic"
+        ? failure.panic
+        : Result.err(capturedWorkerFailure("close-harness", failure)),
+  });
+  if (Panic.is(cleanedOrPanic)) return signalAcpDefect(cleanedOrPanic);
+  const harnessCleanup = cleanedOrPanic.match({ ok: () => undefined, err: (error) => error });
+  if (!removalFailure && !harnessCleanup) return result;
+  const resultError = result.match({ ok: () => undefined, err: (error) => error });
+  if (resultError === undefined && removalFailure && !harnessCleanup) {
+    return Result.err(removalFailure);
+  }
+  if (resultError === undefined && harnessCleanup && !removalFailure) {
+    return Result.err(harnessCleanup);
+  }
+  return Result.err(
+    new WorkerLifecycleCleanupFailed({
+      ...(resultError !== undefined ? { primary: resultError } : {}),
+      ...(removalFailure ? { signalCleanup: removalFailure } : {}),
+      ...(harnessCleanup ? { harnessCleanup } : {}),
+      message:
+        resultError !== undefined
+          ? `${resultError.message} Worker lifecycle cleanup also failed.`
+          : "Worker lifecycle cleanup failed.",
+    }),
+  );
+}
+
+export async function runPromptWithCancellationMonitor(params: {
+  readonly observe: () => Promise<ResultType<RunCancellationObservation, ExternalOperationFailed>>;
+  readonly prompt: () => Promise<ResultType<PromptResponse, ExternalOperationFailed>>;
+  readonly cancel: () => Promise<ResultType<void, ExternalOperationFailed>>;
+  readonly terminate: () => Promise<ResultType<void, ExternalOperationFailed>>;
+}): Promise<
+  ResultType<
+    PromptResponse,
+    | RunStoreError
+    | WorkerLifecycleCleanupFailed<ExternalOperationFailed>
+    | MonitorTerminationFailed<RunStoreError>
+    | WorkAndMonitorFailed<AcpWorkerLifecycleError<ExternalOperationFailed>, RunStoreError>
+  >
+> {
+  const observed = await params.observe();
+  const observation = observed.match<RunCancellationObservation | ExternalOperationFailed>({
+    ok: (value) => value,
+    err: (error) => error,
+  });
+  if (ExternalOperationFailed.is(observation)) return Result.err(observation);
+  let promptActive = false;
+  let signalPromptStarted: () => void = () => undefined;
+  const promptStarted = new Promise<void>((resolve) => {
+    signalPromptStarted = resolve;
+  });
+  const monitored = (async (): Promise<ResultType<void, RunStoreError>> => {
+    const cancellation = await observation.result;
+    const cancellationError = cancellation.match({ ok: () => undefined, err: (error) => error });
+    if (cancellationError !== undefined) return Result.err(cancellationError);
+    const cancellationState = cancellation.match({ ok: (value) => value, err: () => "stopped" });
+    if (cancellationState === "stopped") return Result.ok(undefined);
+    await promptStarted;
+    if (!promptActive) return Result.ok(undefined);
+    return params.cancel();
+  })();
+
+  const promptedAttemptedPromise = Result.tryPromise({
+    try: () =>
+      runAcpWorkerLifecycle(
+        async () => {
+          promptActive = true;
+          signalPromptStarted();
+          const prompt = params.prompt();
+          const result = await prompt;
+          promptActive = false;
+          return result;
+        },
+        observation.close,
+        () => undefined,
+      ),
+    catch: captureAcpFailure,
+  });
+  const monitorAttemptedPromise = Result.tryPromise({
+    try: () => monitored,
+    catch: captureAcpFailure,
+  });
+  const first = await Promise.race([
+    promptedAttemptedPromise.then((attempted) => ({ kind: "prompt" as const, attempted })),
+    monitorAttemptedPromise.then((attempted) => ({ kind: "monitor" as const, attempted })),
+  ]);
+
+  const firstMonitorFailed =
+    first.kind === "monitor" &&
+    first.attempted.match({
+      ok: (result) => result.match({ ok: () => false, err: () => true }),
+      err: () => true,
+    });
+  if (firstMonitorFailed && first.kind === "monitor") {
+    promptActive = false;
+    const watcherCleanupPromise = Result.tryPromise({
+      try: observation.close,
+      catch: captureAcpFailure,
+    });
+    const terminationPromise = Result.tryPromise({
+      try: params.terminate,
+      catch: captureAcpFailure,
+    });
+    const [watcherCleanup, termination] = await Promise.all([
+      watcherCleanupPromise,
+      terminationPromise,
+    ]);
+    void promptedAttemptedPromise.then(() => undefined);
+
+    let monitorPanic: Panic | undefined;
+    let monitorError: RunStoreError;
+    const monitorCaptureFailure = first.attempted.match({
+      ok: () => undefined,
+      err: (failure) => failure,
+    });
+    if (monitorCaptureFailure === undefined) {
+      const result = first.attempted.match({ ok: (value) => value, err: () => undefined });
+      const error = result?.match({ ok: () => undefined, err: (failure) => failure });
+      if (error === undefined) {
+        return Result.err(
+          new ExternalOperationFailed({
+            operation: "watch-run-cancellation",
+            cause: new Error("Cancellation monitor unexpectedly succeeded on its failure path."),
+            message: "Cancellation monitor unexpectedly succeeded on its failure path.",
+          }),
+        );
+      }
+      monitorError = error;
+    } else {
+      switch (monitorCaptureFailure.kind) {
+        case "panic":
+          monitorPanic = monitorCaptureFailure.panic;
+          monitorError = new ExternalOperationFailed({
+            operation: "watch-run-cancellation",
+            cause: monitorPanic,
+            message: monitorPanic.message,
+          });
+          break;
+        case "ordinary":
+          monitorError = capturedWorkerFailure("watch-run-cancellation", monitorCaptureFailure);
+          break;
+      }
+    }
+
+    const watcherFailure = capturedCleanupResult(watcherCleanup, "close-run-cancellation-watch");
+    const terminationFailure = capturedCleanupResult(termination, "close-harness");
+    if (monitorPanic) {
+      if (watcherFailure) recordAcpCleanupFailure(monitorPanic, watcherFailure);
+      if (terminationFailure) recordAcpCleanupFailure(monitorPanic, terminationFailure);
+      return signalAcpDefect(monitorPanic);
+    }
+    let cleanupPanic: Panic | undefined;
+    if (Panic.is(watcherFailure)) cleanupPanic = watcherFailure;
+    else if (Panic.is(terminationFailure)) cleanupPanic = terminationFailure;
+    if (cleanupPanic) {
+      const secondary = cleanupPanic === watcherFailure ? terminationFailure : watcherFailure;
+      if (secondary) recordAcpCleanupFailure(cleanupPanic, secondary);
+      return signalAcpDefect(cleanupPanic);
+    }
+    const watcherError =
+      watcherFailure instanceof ExternalOperationFailed ? watcherFailure : undefined;
+    const terminationError =
+      terminationFailure instanceof ExternalOperationFailed ? terminationFailure : undefined;
+    if (!watcherError && !terminationError) return Result.err(monitorError);
+    return Result.err(
+      new MonitorTerminationFailed({
+        primary: monitorError,
+        ...(watcherError ? { watcherCleanup: watcherError } : {}),
+        ...(terminationError ? { termination: terminationError } : {}),
+        message: `${monitorError.message} In-flight prompt termination also failed.`,
+      }),
+    );
+  }
+
+  const promptedAttempted =
+    first.kind === "prompt" ? first.attempted : await promptedAttemptedPromise;
+  const monitorAttempted =
+    first.kind === "monitor" ? first.attempted : await monitorAttemptedPromise;
+  const promptCaptureFailure = promptedAttempted.match({
+    ok: () => undefined,
+    err: (failure) => failure,
+  });
+  const monitorCaptureFailure = monitorAttempted.match({
+    ok: () => undefined,
+    err: (failure) => failure,
+  });
+  if (promptCaptureFailure?.kind === "panic") {
+    if (monitorCaptureFailure !== undefined) {
+      const secondary =
+        monitorCaptureFailure.kind === "panic"
+          ? monitorCaptureFailure.panic
+          : capturedWorkerFailure("watch-run-cancellation", monitorCaptureFailure);
+      recordAcpCleanupFailure(promptCaptureFailure.panic, secondary);
+    } else {
+      const monitorError = monitorAttempted.match({
+        ok: (result) => result.match({ ok: () => undefined, err: (error) => error }),
+        err: () => undefined,
+      });
+      if (monitorError !== undefined) {
+        const secondary = ExternalOperationFailed.is(monitorError)
+          ? monitorError
+          : new ExternalOperationFailed({
+              operation: "watch-run-cancellation",
+              cause: monitorError,
+              message: monitorError.message,
+            });
+        recordAcpCleanupFailure(promptCaptureFailure.panic, secondary);
+      }
+    }
+    return signalAcpDefect(promptCaptureFailure.panic);
+  }
+  if (monitorCaptureFailure?.kind === "panic") {
+    return signalAcpDefect(monitorCaptureFailure.panic);
+  }
+  const promptedOrPanic = promptedAttempted.match<
+    ResultType<PromptResponse, AcpWorkerLifecycleError<ExternalOperationFailed>> | Panic
+  >({
+    ok: (result) => result,
+    err: (failure) =>
+      failure.kind === "panic"
+        ? failure.panic
+        : Result.err(capturedWorkerFailure("worker-process", failure)),
+  });
+  if (Panic.is(promptedOrPanic)) return signalAcpDefect(promptedOrPanic);
+  const prompted = promptedOrPanic;
+  const monitorOrPanic = monitorAttempted.match<ResultType<void, RunStoreError> | Panic>({
+    ok: (result) => result,
+    err: (failure) =>
+      failure.kind === "panic"
+        ? failure.panic
+        : Result.err(capturedWorkerFailure("watch-run-cancellation", failure)),
+  });
+  if (Panic.is(monitorOrPanic)) return signalAcpDefect(monitorOrPanic);
+  const monitorError = monitorOrPanic.match({ ok: () => undefined, err: (error) => error });
+  if (monitorError === undefined) return prompted;
+  const promptError = prompted.match({ ok: () => undefined, err: (error) => error });
+  if (promptError === undefined) return Result.err(monitorError);
+  return Result.err(
+    new WorkAndMonitorFailed({
+      primary: promptError,
+      monitor: monitorError,
+      message: `${promptError.message} Cancellation monitoring also failed.`,
+    }),
+  );
+}
+
+async function runWorkerProcess(
+  runId: string,
+  version: string,
+): Promise<ResultType<number, RunStoreError>> {
+  const loaded = await loadRunRecord(runId);
+  const loadError = loaded.match({ ok: () => undefined, err: (error) => error });
+  if (loadError !== undefined) return Result.err(loadError);
+  const run = loaded.match({ ok: (value) => value, err: () => undefined });
+  if (run === undefined) return loaded.map(() => 1);
   const resolvedHarness = await resolveHarness(run.harnessId);
-  if (!resolvedHarness) {
+  const resolveError = resolvedHarness.match({ ok: () => undefined, err: (error) => error });
+  const harness = resolvedHarness.match({ ok: (value) => value, err: () => null });
+  if (resolveError !== undefined || !harness) {
     const failed: PromptRunRecord = {
       ...run,
       status: "failed",
       updatedAt: Date.now(),
       error:
-        getHarnessDescriptor(run.harnessId)?.installHint ??
-        `Harness '${run.harnessId}' is not launchable.`,
+        resolveError !== undefined
+          ? resolveError.message
+          : (getHarnessDescriptor(run.harnessId)?.installHint ??
+            `Harness '${run.harnessId}' is not launchable.`),
     };
-    await saveRunRecord(failed);
-    return 1;
+    const saved = await saveRunRecord(failed);
+    return saved.map(() => 1);
   }
 
   const collector = new SessionHistoryCollector();
-  const client = await AcpHarnessClient.connect({
-    harness: resolvedHarness,
+  const sessionUpdates = createSessionUpdatePersistence(run, collector);
+  const connected = await AcpHarnessClient.connect({
+    harness,
     version,
     permissionBehavior: "always",
     counters: run.permissions,
-    onUpdate: async (notification) => {
-      collector.add(notification);
-      await persistRunFromCollector(run, collector);
-    },
-  }).catch(async (error: unknown) => {
+    onUpdate: sessionUpdates.onUpdate,
+  });
+  const connectError = connected.match({ ok: () => undefined, err: (error) => error });
+  if (connectError !== undefined) {
+    const updatesFinalized = await sessionUpdates.finalize();
     const failed: PromptRunRecord = {
       ...run,
       status: "failed",
       updatedAt: Date.now(),
-      error: errorMessage(error),
+      error: connectError.message,
     };
-    await saveRunRecord(failed);
-    throw error;
-  });
+    const saved = await sessionUpdates.persist(failed);
+    const saveError = saved.match({ ok: () => undefined, err: (error) => error });
+    if (saveError !== undefined) return Result.err(saveError);
+    return updatesFinalized.map(() => 1);
+  }
+  const client = connected.match({ ok: (value) => value, err: () => undefined });
+  if (client === undefined) return Result.ok(1);
+  let clientCloseAttempted = false;
+  const closeClient = async (): Promise<ResultType<void, ExternalOperationFailed>> => {
+    if (clientCloseAttempted) return Result.ok(undefined);
+    clientCloseAttempted = true;
+    return client.close();
+  };
 
-  let signalCleanup: (() => void) | undefined;
   let remoteSessionId = run.remoteSessionId;
   let cancellationRequested = false;
+  const onTerminate = () => {
+    cancellationRequested = true;
+    if (remoteSessionId) void client.cancel(remoteSessionId);
+    void closeClient();
+  };
+  process.on("SIGTERM", onTerminate);
+  process.on("SIGINT", onTerminate);
 
-  try {
-    const onTerminate = () => {
-      cancellationRequested = true;
-      // Ensure the worker does not hang indefinitely on in-flight harness requests.
-      // (Prompt cancel is best-effort; when the harness or transport misbehaves we still
-      // want the worker to settle and persist a terminal run state.)
-      void client.close();
-    };
-    process.on("SIGTERM", onTerminate);
-    process.on("SIGINT", onTerminate);
-    signalCleanup = () => {
+  const lifecycle = await runAcpWorkerLifecycle(
+    async (): Promise<ResultType<void, { readonly message: string }>> => {
+      let workError: { readonly message: string } | undefined;
+      if (run.targetKind === "existing") {
+        if (!remoteSessionId) {
+          workError = new RunInvariantFailed({
+            runId: run.id,
+            message: `Run '${run.id}' is missing its remote session ID.`,
+          });
+        } else {
+          const sessionLoaded = await client.loadSession(remoteSessionId, run.directory);
+          sessionLoaded.match({
+            ok: () => {},
+            err: (error) => {
+              workError = error;
+            },
+          });
+        }
+      } else {
+        const created = await client.createSession(run.directory);
+        const createError = created.match({ ok: () => undefined, err: (error) => error });
+        if (createError !== undefined) {
+          workError = createError;
+        } else {
+          const createdSession = created.match({ ok: (value) => value, err: () => undefined });
+          if (createdSession === undefined) return created.map(() => undefined);
+          remoteSessionId = createdSession.sessionId;
+          run.remoteSessionId = remoteSessionId;
+          run.sessionRef = formatSessionRef(run.harnessId, remoteSessionId);
+          const indexed = await upsertSessionIndexEntries([
+            {
+              sessionRef: run.sessionRef,
+              harnessId: run.harnessId,
+              remoteSessionId,
+              cwd: run.directory,
+              title: run.requestedTitle,
+              updatedAt: undefined,
+              capabilities: client.capabilities(),
+              lastSeenAt: Date.now(),
+              ...(run.requestedTitle ? { localTitle: run.requestedTitle } : {}),
+            },
+          ]);
+          indexed.match({
+            ok: () => {},
+            err: (error) => {
+              workError = error;
+            },
+          });
+          if (!workError && run.requestedTitle) {
+            const titled = await setLocalSessionTitle(run.sessionRef, run.requestedTitle);
+            titled.match({
+              ok: () => {},
+              err: (error) => {
+                workError = error;
+              },
+            });
+          }
+        }
+      }
+
+      if (!workError) {
+        if (!remoteSessionId || !run.sessionRef) {
+          workError = new RunInvariantFailed({
+            runId: run.id,
+            message: `Run '${run.id}' could not resolve a session target.`,
+          });
+        }
+      }
+
+      if (!workError && remoteSessionId && run.sessionRef) {
+        const activeSessionId = remoteSessionId;
+        const userMessageId = randomUUID();
+        const running: PromptRunRecord = {
+          ...run,
+          session: {
+            title: run.requestedTitle,
+            cwd: run.directory,
+            updatedAt: collector.updatedAt,
+            capabilities: client.capabilities(),
+          },
+          status: "running",
+          userMessageId,
+          updatedAt: Date.now(),
+        };
+        const runningSaved = await sessionUpdates.persist(running);
+        runningSaved.match({
+          err: (error) => {
+            workError = error;
+          },
+          ok: () => {
+            Object.assign(run, running);
+          },
+        });
+
+        if (!workError) {
+          const refreshedRun = await loadRunRecord(run.id);
+          const refreshError = refreshedRun.match({ ok: () => undefined, err: (error) => error });
+          const currentRun = refreshedRun.match({ ok: (value) => value, err: () => undefined });
+          if (refreshError !== undefined) {
+            workError = refreshError;
+          } else if (cancellationRequested || currentRun?.cancelRequestedAt) {
+            cancellationRequested = true;
+            const updatesFinalized = await sessionUpdates.finalize();
+            const finalizeError = updatesFinalized.match({
+              ok: () => undefined,
+              err: (error) => error,
+            });
+            if (finalizeError !== undefined) {
+              workError = finalizeError;
+            } else {
+              const cancelled: PromptRunRecord = {
+                ...run,
+                status: "cancelled",
+                updatedAt: Date.now(),
+                error: "Cancelled before prompt submission completed.",
+              };
+              const cancelledSaved = await sessionUpdates.persist(cancelled);
+              cancelledSaved.match({
+                err: (error) => {
+                  workError = error;
+                },
+                ok: () => {
+                  Object.assign(run, cancelled);
+                },
+              });
+            }
+          }
+        }
+
+        if (!workError && run.status !== "cancelled" && run.requestedMode) {
+          const mode = await client.setMode(activeSessionId, run.requestedMode);
+          mode.match({
+            ok: () => {},
+            err: (error) => {
+              workError = error;
+            },
+          });
+        }
+        if (!workError && run.status !== "cancelled" && run.requestedModel) {
+          const model = await client.setModel(activeSessionId, run.requestedModel);
+          model.match({
+            ok: () => {},
+            err: (error) => {
+              workError = error;
+            },
+          });
+        }
+
+        if (!workError && run.status !== "cancelled") {
+          const prompted = await runPromptWithCancellationMonitor({
+            observe: () => observeRunCancellation(run),
+            prompt: () => client.prompt(activeSessionId, run.promptText, userMessageId),
+            cancel: () => client.cancel(activeSessionId),
+            terminate: closeClient,
+          });
+          const promptError = prompted.match({ ok: () => undefined, err: (error) => error });
+          if (promptError !== undefined) {
+            workError = promptError;
+          } else {
+            const updatesFinalized = await sessionUpdates.finalize();
+            const finalizeError = updatesFinalized.match({
+              ok: () => undefined,
+              err: (error) => error,
+            });
+            if (finalizeError !== undefined) {
+              workError = finalizeError;
+            } else {
+              const promptResponse = prompted.match<PromptResponse | undefined>({
+                ok: (value) => value,
+                err: () => undefined,
+              });
+              if (promptResponse === undefined) return prompted.map(() => undefined);
+              const terminal: PromptRunRecord = {
+                ...run,
+                stopReason: promptResponse.stopReason,
+                status:
+                  cancellationRequested || isCancelledStopReason(promptResponse.stopReason)
+                    ? "cancelled"
+                    : "completed",
+                updatedAt: Date.now(),
+              };
+              const persisted = await sessionUpdates.persist(terminal);
+              const persistError = persisted.match({ ok: () => undefined, err: (error) => error });
+              if (persistError !== undefined) {
+                workError = persistError;
+              } else {
+                Object.assign(run, terminal);
+                const indexed = await upsertSessionIndexEntries([
+                  buildIndexEntry(
+                    {
+                      harnessId: run.harnessId,
+                      sessionId: activeSessionId,
+                      sessionRef: run.sessionRef,
+                      title: collector.title ?? run.requestedTitle,
+                      cwd: run.directory,
+                      updatedAt: collector.updatedAt,
+                      capabilities: client.capabilities(),
+                    },
+                    run.requestedTitle,
+                  ),
+                ]);
+                indexed.match({
+                  ok: () => {},
+                  err: (error) => {
+                    workError = error;
+                  },
+                });
+              }
+            }
+          }
+        }
+      }
+
+      const updatesFinalized = await sessionUpdates.finalize();
+      const finalizeError = updatesFinalized.match({ ok: () => undefined, err: (error) => error });
+      if (!workError && finalizeError !== undefined) workError = finalizeError;
+      return workError ? Result.err(workError) : Result.ok(undefined);
+    },
+    closeClient,
+    () => {
       process.off("SIGTERM", onTerminate);
       process.off("SIGINT", onTerminate);
-    };
+    },
+  );
+  const workError: { readonly message: string } | undefined = lifecycle.match({
+    ok: () => undefined,
+    err: (error) => error,
+  });
 
-    if (run.targetKind === "existing") {
-      if (!remoteSessionId) {
-        throw new Error(`Run '${run.id}' is missing its remote session ID.`);
-      }
-      await client.loadSession(remoteSessionId, run.directory);
-    } else {
-      const created = await client.createSession(run.directory);
-      remoteSessionId = created.sessionId;
-      run.remoteSessionId = remoteSessionId;
-      run.sessionRef = formatSessionRef(run.harnessId, remoteSessionId);
-      await upsertSessionIndexEntries([
-        {
-          sessionRef: run.sessionRef,
-          harnessId: run.harnessId,
-          remoteSessionId,
-          cwd: run.directory,
-          title: run.requestedTitle,
-          updatedAt: undefined,
-          capabilities: client.capabilities(),
-          lastSeenAt: Date.now(),
-          ...(run.requestedTitle ? { localTitle: run.requestedTitle } : {}),
-        },
-      ]);
-      if (run.requestedTitle) {
-        await setLocalSessionTitle(run.sessionRef, run.requestedTitle);
-      }
-    }
-
-    if (!remoteSessionId || !run.sessionRef) {
-      throw new Error(`Run '${run.id}' could not resolve a session target.`);
-    }
-    const activeSessionId = remoteSessionId;
-
-    run.session = {
-      title: run.requestedTitle,
-      cwd: run.directory,
-      updatedAt: collector.updatedAt,
-      capabilities: client.capabilities(),
-    };
-    run.status = "running";
-    run.userMessageId = randomUUID();
-    run.updatedAt = Date.now();
-    await saveRunRecord(run);
-
-    const refreshedRun = await loadRunRecord(run.id);
-    if (cancellationRequested || refreshedRun.cancelRequestedAt) {
-      run.status = "cancelled";
-      run.updatedAt = Date.now();
-      run.error = "Cancelled before prompt submission completed.";
-      await saveRunRecord(run);
-      return 1;
-    }
-
-    if (run.requestedMode) {
-      await client.setMode(activeSessionId, run.requestedMode);
-    }
-    if (run.requestedModel) {
-      await client.setModel(activeSessionId, run.requestedModel);
-    }
-
-    const promptResponse: PromptResponse = await client.prompt(
-      activeSessionId,
-      run.promptText,
-      run.userMessageId,
-    );
-
-    run.stopReason = promptResponse.stopReason;
-    run.status =
-      cancellationRequested || isCancelledStopReason(promptResponse.stopReason)
-        ? "cancelled"
-        : "completed";
-    run.updatedAt = Date.now();
-    await persistRunFromCollector(run, collector);
-    await upsertSessionIndexEntries([
-      buildIndexEntry(
-        {
-          harnessId: run.harnessId,
-          sessionId: activeSessionId,
-          sessionRef: run.sessionRef,
-          title: collector.title ?? run.requestedTitle,
-          cwd: run.directory,
-          updatedAt: collector.updatedAt,
-          capabilities: client.capabilities(),
-        },
-        run.requestedTitle,
-      ),
-    ]);
-    return run.status === "completed" ? 0 : 1;
-  } catch (error) {
+  if (workError) {
     const authHint = client.authHint();
+    const cancelled = run.status === "cancelled" || cancellationRequested;
+    let runError = workError.message;
+    if (cancelled) {
+      runError = run.error ?? "Prompt cancelled.";
+    } else if (authHint && workError instanceof ExternalOperationFailed) {
+      if (isAuthRequiredError(workError)) runError = authHint;
+    }
     const next: PromptRunRecord = {
       ...run,
-      status: run.status === "cancelled" || cancellationRequested ? "cancelled" : "failed",
+      status: cancelled ? "cancelled" : "failed",
       updatedAt: Date.now(),
-      error:
-        run.status === "cancelled" || cancellationRequested
-          ? (run.error ?? "Prompt cancelled.")
-          : authHint && isAuthRequiredError(error)
-            ? authHint
-            : errorMessage(error),
+      error: runError,
     };
-    await saveRunRecord(next);
-    return 1;
-  } finally {
-    signalCleanup?.();
-    await client.close();
+    const saved = await sessionUpdates.persist(next);
+    return saved.map(() => 1);
   }
+  return Result.ok(run.status === "completed" ? 0 : 1);
 }
 
-export async function main(
-  argv: readonly string[],
-  options?: { write?: OutputWriter },
-): Promise<number> {
+export async function main(argv: readonly string[]): Promise<number> {
   const commandName = "lilac-acp";
   const packageVersion = typeof PACKAGE_VERSION === "string" ? PACKAGE_VERSION : "0.0.0";
   const globalFlags = parseFlags(argv).flags;
@@ -1308,7 +2261,7 @@ export async function main(
     return 1;
   }
   const outputMode: OutputMode = outputFlag === "human" ? "human" : "json";
-  const write = options?.write ?? createOutputWriter(outputMode, commandName);
+  const write = createOutputWriter(outputMode, commandName);
 
   if (cleanArgv.length === 0 || cleanArgv[0] === "help" || cleanArgv.includes("--help")) {
     write({ ok: true, help: help(commandName), version: packageVersion });
@@ -1331,7 +2284,13 @@ export async function main(
       write({ ok: false, error: "Missing --run-id for worker." });
       return 1;
     }
-    return runWorkerProcess(runId, packageVersion);
+    const worker = await runWorkerProcess(runId, packageVersion);
+    const workerError = worker.match({ ok: () => undefined, err: (error) => error });
+    if (workerError !== undefined) {
+      write({ ok: false, error: workerError.message, runId });
+      return 1;
+    }
+    return worker.match({ ok: (value) => value, err: () => 1 });
   }
 
   const command = cleanArgv[0] ?? "";

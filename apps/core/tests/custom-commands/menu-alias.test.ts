@@ -245,15 +245,15 @@ describe("CustomCommandManager menu integration", () => {
 
     expect(manager.listMenuEntries()).toEqual([]);
     expect(manager.get(long)).not.toBeNull();
-    expect(manager.parseText(`/lilac:${long}`)?.command.def.name).toBe(long);
+    expect(manager.parseText(`/lilac:${long}`).unwrap()?.command.def.name).toBe(long);
     expect(manager.listWarnings().join("\n")).toContain("no menu-safe alias");
   });
 
   it("resolves an alias invocation to the same command as the typed form", async () => {
     const manager = await load([{ name: "daily-standup", description: "Summarize yesterday" }]);
 
-    const typed = manager.parseText("/lilac:daily-standup");
-    const viaMenu = manager.parseText("/lilac_daily_standup");
+    const typed = manager.parseText("/lilac:daily-standup").unwrap();
+    const viaMenu = manager.parseText("/lilac_daily_standup").unwrap();
 
     expect(viaMenu?.command.def.name).toBe("daily-standup");
     expect(viaMenu?.command.entrypointPath).toBe(typed?.command.entrypointPath ?? "");
@@ -278,8 +278,8 @@ describe("CustomCommandManager menu integration", () => {
     const manager = new CustomCommandManager(dataDir);
     await manager.init();
 
-    const typed = manager.parseText("/lilac:daily-standup team=core and keep it short");
-    const viaMenu = manager.parseText("/lilac_daily_standup team=core and keep it short");
+    const typed = manager.parseText("/lilac:daily-standup team=core and keep it short").unwrap();
+    const viaMenu = manager.parseText("/lilac_daily_standup team=core and keep it short").unwrap();
 
     expect(viaMenu?.args).toEqual(typed?.args ?? []);
     expect(viaMenu?.args).toEqual(["core"]);
@@ -293,20 +293,20 @@ describe("CustomCommandManager menu integration", () => {
 
     // The alias was never published, so the alias spelling must not resolve —
     // otherwise a dropped collision loser would still be reachable ambiguously.
-    expect(manager.parseText(`/lilac_${long}`)).toBeNull();
+    expect(manager.parseText(`/lilac_${long}`).unwrap()).toBeNull();
   });
 
   it("does not resolve a command addressed to another bot", async () => {
     const manager = await load([{ name: "tarot", description: "Draw a tarot spread" }]);
     const opts = { botUsername: "Catalina_agentbot" };
 
-    expect(manager.parseText("/lilac_tarot@OtherBot", opts)).toBeNull();
+    expect(manager.parseText("/lilac_tarot@OtherBot", opts).unwrap()).toBeNull();
     // Nor should it report an unknown command, which would answer a message
     // that was never addressed to us.
     expect(manager.peekTextName("/lilac_tarot@OtherBot", opts)).toBeNull();
-    expect(manager.parseText("/lilac_tarot@Catalina_agentbot", opts)?.command.def.name).toBe(
-      "tarot",
-    );
+    expect(
+      manager.parseText("/lilac_tarot@Catalina_agentbot", opts).unwrap()?.command.def.name,
+    ).toBe("tarot");
   });
 
   it("reports an unknown alias under its registry-shaped name", async () => {

@@ -2,8 +2,6 @@ import type { ModelCapabilityInfo } from "@stanley2058/lilac-utils";
 import { boundToolResultMediaForModelView } from "@stanley2058/lilac-tool-results/tool-result-media";
 import type { ModelMessage } from "ai";
 
-export { toolResultContentDisplayValue } from "@stanley2058/lilac-tool-results/tool-result-media";
-
 export const READ_FILE_MEDIA_MAX_BYTES_PER_PART = 10 * 1024 * 1024;
 export const READ_FILE_MEDIA_MAX_BYTES_TOTAL = 20 * 1024 * 1024;
 

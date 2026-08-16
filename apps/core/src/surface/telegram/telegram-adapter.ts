@@ -1,4 +1,5 @@
-import { Bot, GrammyError, HttpError } from "grammy";
+import { Result } from "better-result";
+import { Bot } from "grammy";
 import type {
   InlineKeyboardMarkup,
   MaybeInaccessibleMessage,
@@ -17,31 +18,34 @@ import {
 } from "@stanley2058/lilac-utils";
 
 import type {
-  AdapterCapabilities,
   ContentOpts,
   LimitOpts,
   MsgRef,
   SendOpts,
   SessionRef,
   SurfaceMessage,
+  SurfaceReactionDetail,
   SurfaceSelf,
   SurfaceSession,
-  TelegramMsgRef,
+  SurfaceSessionParticipantsResult,
   TelegramSessionRef,
   SurfaceAction,
 } from "../types";
 import type { CustomCommandManager } from "../../custom-commands/manager";
 
 import type { AdapterEvent } from "../events";
-import type {
-  AdapterEventHandler,
-  AdapterSubscription,
-  StartOutputOpts,
-  SurfaceAdapter,
-  SurfaceOutputStream,
-  TypingIndicatorSubscription,
+import {
+  type AdapterEventHandler,
+  type AdapterSubscription,
+  type StartOutputOpts,
+  type SurfaceAdapter,
+  type SurfaceMergeBlockPlanOptions,
+  type SurfaceOperationResult,
+  type SurfaceOutputStream,
+  type SurfaceReplyChainPlanOptions,
+  type SurfaceSendPreparationInput,
+  type TypingIndicatorSubscription,
 } from "../adapter";
-import { SurfaceMessageNotFoundError } from "../adapter";
 
 import {
   chatIdOf,
@@ -64,7 +68,7 @@ import {
   toSurfaceMessage,
   toTelegramRawEnvelope,
 } from "./telegram-raw";
-import { parseStoredAdapterEvent, telegramIngressDedupeKey } from "./telegram-ingress";
+import { telegramIngressDedupeKey } from "./telegram-ingress";
 import { TelegramSurfaceStore } from "./store/telegram-surface-store";
 import {
   createGrammyAttachmentApi,
@@ -77,6 +81,21 @@ import {
   type TelegramReplyMarkup,
 } from "./output/telegram-output-stream";
 import { markdownToTelegramHtml } from "./output/telegram-html";
+import {
+  captureTelegramOperation,
+  prepareTelegramSendResult,
+  TelegramAdapterUnavailable,
+  telegramInvalidInput,
+  telegramMsgRefResult,
+  telegramNestedMsgRefResult,
+  telegramSessionRefResult,
+  telegramUnsupported,
+} from "./telegram-operation-result";
+import {
+  projectTelegramBotFailure,
+  projectTelegramError,
+  type TelegramErrorProjection,
+} from "./telegram-error-projection";
 
 export type TelegramAdapterHealthSnapshot = {
   /**
@@ -166,42 +185,8 @@ const TELEGRAM_ALLOWED_UPDATES = [
   "message_reaction",
 ] as const satisfies readonly (keyof Update)[];
 
-function assertTelegramSessionRef(
-  sessionRef: SessionRef,
-): asserts sessionRef is TelegramSessionRef {
-  if (sessionRef.platform !== "telegram") {
-    throw new Error(`Expected telegram sessionRef (got '${sessionRef.platform}')`);
-  }
-}
-
-function assertTelegramMsgRef(msgRef: MsgRef): asserts msgRef is TelegramMsgRef {
-  if (msgRef.platform !== "telegram") {
-    throw new Error(`Expected telegram msgRef (got '${msgRef.platform}')`);
-  }
-}
-
-/**
- * Telegram reports a missing/inaccessible message as a 400 with a descriptive
- * string rather than a stable code, so classification is textual.
- */
-export function classifyTelegramNotFound(error: unknown): SurfaceMessageNotFoundError | null {
-  if (!(error instanceof GrammyError)) return null;
-  const description = error.description.toLowerCase();
-  const isNotFound =
-    description.includes("message to edit not found") ||
-    description.includes("message to delete not found") ||
-    description.includes("message not found") ||
-    description.includes("message can't be edited") ||
-    description.includes("message identifier is not specified");
-
-  return isNotFound
-    ? new SurfaceMessageNotFoundError("telegram", error.error_code, error.description)
-    : null;
-}
-
-function isTelegramMessageAbsent(error: unknown): boolean {
-  if (!(error instanceof GrammyError)) return false;
-  const description = error.description.toLowerCase();
+function isTelegramMessageAbsent(error: Error): boolean {
+  const description = error.message.toLowerCase();
   return (
     description.includes("message to edit not found") ||
     description.includes("message to delete not found") ||
@@ -209,11 +194,8 @@ function isTelegramMessageAbsent(error: unknown): boolean {
   );
 }
 
-function isTelegramMessageNotModified(error: unknown): boolean {
-  return (
-    error instanceof GrammyError &&
-    error.description.toLowerCase().includes("message is not modified")
-  );
+function isTelegramMessageNotModified(error: TelegramErrorProjection): boolean {
+  return error.normalizedText.includes("message is not modified");
 }
 
 /**
@@ -223,12 +205,11 @@ function isTelegramMessageNotModified(error: unknown): boolean {
  * same token; reconnecting in either case just produces the same failure while
  * reporting healthy in between. Everything else is treated as transient.
  */
-export function isFatalTelegramPollingExit(error: unknown): boolean {
-  if (!(error instanceof GrammyError)) return false;
-  return error.error_code === 401 || error.error_code === 409;
+export function isFatalTelegramPollingExit(error: TelegramErrorProjection | null): boolean {
+  return error?.kind === "grammy" && (error.errorCode === 401 || error.errorCode === 409);
 }
 
-type TelegramIngressDeliveryResult = { ok: true } | { ok: false; error: string; cause: unknown };
+type TelegramIngressDeliveryResult = { ok: true } | { ok: false; error: string; cause: Error };
 
 export class TelegramAdapter implements SurfaceAdapter {
   private bot: Bot | null = null;
@@ -284,16 +265,11 @@ export class TelegramAdapter implements SurfaceAdapter {
     );
     this.bot = bot;
 
-    bot.catch((err) => {
-      const cause = err.error;
-      const message =
-        cause instanceof GrammyError
-          ? `Bot API error: ${cause.description}`
-          : cause instanceof HttpError
-            ? `network error: ${cause.message}`
-            : cause instanceof Error
-              ? cause.message
-              : String(cause);
+    bot.catch((failure) => {
+      const projected = projectTelegramBotFailure(failure);
+      let message = projected.error.message;
+      if (projected.error.kind === "grammy") message = `Bot API error: ${message}`;
+      if (projected.error.kind === "http") message = `network error: ${message}`;
       const safeMessage = sanitizeTelegramErrorMessage(message, this.cfg?.surface.telegram.token);
 
       this.healthState = {
@@ -301,7 +277,7 @@ export class TelegramAdapter implements SurfaceAdapter {
         lastErrorAt: Date.now(),
         lastError: safeMessage,
       };
-      this.logger.error("telegram update handler failed", { updateId: err.ctx.update.update_id });
+      this.logger.error("telegram update handler failed", { updateId: projected.updateId });
     });
 
     this.registerHandlers(bot);
@@ -317,13 +293,25 @@ export class TelegramAdapter implements SurfaceAdapter {
     // Drain anything a previous run committed but never published, before new
     // updates start arriving, so a backlog keeps its arrival order. Subscribers
     // are registered before connect(), so they are in place by now.
-    await this.replayPendingIngress().catch((e: unknown) => {
-      this.logger.error("telegram ingress replay failed; entries are retained", {}, e);
+    const replayed = await Result.tryPromise({
+      try: () => this.replayPendingIngress(),
+      catch: projectTelegramError("Telegram ingress replay failed"),
+    });
+    replayed.match({
+      ok: () => undefined,
+      err: (error) =>
+        this.logger.error("telegram ingress replay failed; entries are retained", {}, error.error),
     });
 
     if (cfg.surface.telegram.commandMenu) {
-      await this.registerCommandMenu(bot).catch((e: unknown) => {
-        this.logger.warn("failed to register telegram command menu", {}, e);
+      const registered = await Result.tryPromise({
+        try: () => this.registerCommandMenu(bot),
+        catch: projectTelegramError("Telegram command menu registration failed"),
+      });
+      registered.match({
+        ok: () => undefined,
+        err: (error) =>
+          this.logger.warn("failed to register telegram command menu", {}, error.error),
       });
     }
 
@@ -352,9 +340,14 @@ export class TelegramAdapter implements SurfaceAdapter {
       },
     });
 
-    this.pollingStopped = polling.then(
-      () => this.onPollingSettled(null),
-      (error: unknown) => this.onPollingSettled(error),
+    this.pollingStopped = Result.tryPromise({
+      try: () => polling,
+      catch: projectTelegramError("Telegram long polling failed"),
+    }).then((settled) =>
+      settled.match({
+        ok: () => this.onPollingSettled(null),
+        err: (error) => this.onPollingSettled(error),
+      }),
     );
   }
 
@@ -365,16 +358,13 @@ export class TelegramAdapter implements SurfaceAdapter {
    * rejected one while we still believe we are connected — either way no
    * further updates arrive.
    */
-  private onPollingSettled(error: unknown): void {
+  private onPollingSettled(error: TelegramErrorProjection | null): void {
     if (this.stopping) return;
 
     const fatal = isFatalTelegramPollingExit(error);
-    const failure =
-      error === null
-        ? new Error("telegram long polling stopped unexpectedly")
-        : error instanceof Error
-          ? error
-          : new Error(String(error));
+    let failure: Error;
+    if (error === null) failure = new Error("telegram long polling stopped unexpectedly");
+    else failure = error.error;
     const safeFailure = new Error(
       sanitizeTelegramErrorMessage(failure.message, this.cfg?.surface.telegram.token),
     );
@@ -421,8 +411,16 @@ export class TelegramAdapter implements SurfaceAdapter {
     this.ingressStopped = true;
     // Tell the supervisor this settlement is deliberate.
     this.stopping = true;
-    await bot.stop().catch(() => undefined);
-    await this.pollingStopped?.catch(() => undefined);
+    await Result.tryPromise({
+      try: () => bot.stop(),
+      catch: projectTelegramError("Telegram bot stop failed"),
+    });
+    if (this.pollingStopped) {
+      await Result.tryPromise({
+        try: () => this.pollingStopped ?? Promise.resolve(),
+        catch: projectTelegramError("Telegram polling settlement failed"),
+      });
+    }
     this.pollingStopped = null;
 
     this.healthState = { ...this.healthState, isReady: false };
@@ -442,9 +440,17 @@ export class TelegramAdapter implements SurfaceAdapter {
     if (!this.ingressStopped) {
       // Stopping aborts the in-flight getUpdates, which surfaces as a transport
       // error. That is the expected shape of a clean shutdown, not a failure.
-      await bot.stop().catch(() => undefined);
+      await Result.tryPromise({
+        try: () => bot.stop(),
+        catch: projectTelegramError("Telegram bot stop failed"),
+      });
       // Let the polling loop unwind before tearing down the store it may touch.
-      await this.pollingStopped?.catch(() => undefined);
+      if (this.pollingStopped) {
+        await Result.tryPromise({
+          try: () => this.pollingStopped ?? Promise.resolve(),
+          catch: projectTelegramError("Telegram polling settlement failed"),
+        });
+      }
     }
     this.pollingStopped = null;
     this.ingressStopped = false;
@@ -523,290 +529,461 @@ export class TelegramAdapter implements SurfaceAdapter {
     throw new Error("telegram adapter: not connected");
   }
 
-  async getCapabilities(): Promise<AdapterCapabilities> {
-    return {
-      platform: "telegram",
-      send: true,
-      edit: true,
-      delete: true,
-      reactions: true,
-      // Served from the local index rather than the Bot API, which has no
-      // history endpoint.
-      readHistory: true,
-      threads: true,
-      markRead: true,
-    };
-  }
-
-  async listSessions(): Promise<SurfaceSession[]> {
-    const store = this.mustStore();
-    return store.listSessions().map((row) => ({
-      ref: telegramSessionRef({ chatId: row.chat_id, threadId: row.thread_id }),
-      ...(row.title === null ? {} : { title: row.title }),
-      kind: row.kind,
-    }));
-  }
-
-  async startOutput(sessionRef: SessionRef, opts?: StartOutputOpts): Promise<SurfaceOutputStream> {
-    assertTelegramSessionRef(sessionRef);
-    const bot = this.mustBot();
-    const cfg = this.cfg ?? (await this.resolveCoreConfig());
-    const telegram = cfg.surface.telegram;
-
-    const silent = opts?.silent === true || !telegram.outputNotification;
-
-    const stream = new TelegramOutputStream({
-      api: createGrammyOutputApi(bot),
-      sessionRef,
-      ...(opts ? { opts } : {}),
-      now: () => Date.now(),
-      scheduleEdit: (cb, delayMs) => {
-        const timer = setTimeout(cb, delayMs);
-        return () => clearTimeout(timer);
-      },
-      streamEditIntervalMs: telegram.streamEditIntervalMs,
-      parseMode: telegram.parseMode,
-      outputMode: telegram.outputMode,
-      outputNotification: !silent,
-      workingIndicators: telegram.workingIndicators,
-      ...(telegram.markdownTableRender.enabled
-        ? { markdownTableRender: telegram.markdownTableRender }
-        : {}),
-    });
-
-    return new TelegramOutputStreamWithAttachments(stream, {
-      api: createGrammyAttachmentApi(bot),
-      sessionRef,
-      silent,
-      onError: (error: unknown, context?: Record<string, unknown>) => {
-        // The counts matter: a partial upload leaves some files in the chat
-        // and drops the rest, and the log is the only place that difference
-        // shows up.
-        this.logger.warn(
-          "failed to deliver telegram attachments",
-          { sessionId: sessionRef.channelId, ...context },
-          error,
-        );
-      },
-      onDelivered: (messages) => this.recordOwnOutput(sessionRef, messages),
-      onUnreconciled: (failures) => {
-        // Stale output is still visible to the user, so this is a warning
-        // rather than a debug line.
-        this.logger.warn("telegram surplus messages left in the chat", {
-          sessionId: sessionRef.channelId,
-          failures: failures.map((f) => ({
-            messageId: f.messageId,
-            outcome: f.outcome,
-            reason: f.reason,
-          })),
-        });
-      },
-    });
-  }
-
-  async sendMsg(sessionRef: SessionRef, content: ContentOpts, opts?: SendOpts): Promise<MsgRef> {
-    assertTelegramSessionRef(sessionRef);
-    const bot = this.mustBot();
-    const text = content.text ?? "";
-    if (!text.trim()) {
-      throw new Error("telegram adapter: sendMsg requires non-empty text");
-    }
-
-    const { chatId, threadId } = parseTelegramSessionId(sessionRef.channelId);
-    const replyTo = opts?.replyTo;
-    const replyMarkup = buildTelegramActionKeyboard(content.actions);
-    const renderedText = content.format === "markdown" ? markdownToTelegramHtml(text) : text;
-
-    for (const action of content.actions ?? []) {
-      if (Buffer.byteLength(action.actionId, "utf8") > TELEGRAM_CALLBACK_DATA_MAX_BYTES) {
-        this.logger.warn("telegram action omitted because callback_data exceeds 64 bytes", {
-          actionIdBytes: Buffer.byteLength(action.actionId, "utf8"),
-          label: action.label,
-        });
-      }
-    }
-
-    const sent = await bot.api.sendMessage(chatId, renderedText, {
-      ...(content.format === "markdown" ? { parse_mode: "HTML" as const } : {}),
-      ...(threadId === undefined ? {} : { message_thread_id: threadId }),
-      ...(opts?.silent ? { disable_notification: true } : {}),
-      ...(replyMarkup ? { reply_markup: replyMarkup } : {}),
-      ...(replyTo && replyTo.platform === "telegram"
-        ? {
-            reply_parameters: {
-              message_id: parseTelegramMessageId(replyTo.messageId),
-              // The agent may be replying to a message that has since been
-              // deleted; sending anyway beats dropping the reply entirely.
-              allow_sending_without_reply: true,
-            },
-          }
-        : {}),
-    });
-
-    this.recordMessage(sent, { fromBot: true });
-
-    return telegramMsgRef({ chatId, threadId, messageId: sent.message_id });
-  }
-
-  async readMsg(msgRef: MsgRef): Promise<SurfaceMessage | null> {
-    assertTelegramMsgRef(msgRef);
-    const record = this.mustStore().getMessage({
-      sessionId: msgRef.channelId,
-      messageId: msgRef.messageId,
-    });
-    if (!record) return null;
-
-    return {
-      ref: msgRef,
-      session: { platform: "telegram", channelId: msgRef.channelId },
-      userId: record.userId,
-      ...(record.userName === undefined ? {} : { userName: record.userName }),
-      text: record.text,
-      ts: record.ts,
-      ...(record.editedTs === undefined ? {} : { editedTs: record.editedTs }),
-      // Reply-chain traversal reads the reply reference out of raw, so a read
-      // that drops it silently truncates conversation context to one message.
-      ...(record.raw === undefined ? {} : { raw: record.raw }),
-    };
-  }
-
-  async listMsg(sessionRef: SessionRef, opts?: LimitOpts): Promise<SurfaceMessage[]> {
-    assertTelegramSessionRef(sessionRef);
-    const records = this.mustStore().listMessages({
-      sessionId: sessionRef.channelId,
-      ...(opts?.limit === undefined ? {} : { limit: opts.limit }),
-      ...(opts?.beforeMessageId === undefined ? {} : { beforeMessageId: opts.beforeMessageId }),
-      ...(opts?.afterMessageId === undefined ? {} : { afterMessageId: opts.afterMessageId }),
-    });
-
-    return records.map((record) => ({
-      ref: telegramMsgRef({
-        chatId: record.chatId,
-        threadId: record.threadId,
-        messageId: record.messageId,
-      }),
-      session: sessionRef,
-      userId: record.userId,
-      ...(record.userName === undefined ? {} : { userName: record.userName }),
-      text: record.text,
-      ts: record.ts,
-      ...(record.editedTs === undefined ? {} : { editedTs: record.editedTs }),
-      ...(record.raw === undefined ? {} : { raw: record.raw }),
-    }));
-  }
-
-  async editMsg(msgRef: MsgRef, content: ContentOpts): Promise<void> {
-    assertTelegramMsgRef(msgRef);
-    const bot = this.mustBot();
-    const text = content.text ?? "";
-    if (!text.trim()) {
-      throw new Error("telegram adapter: editMsg requires non-empty text");
-    }
-    const replyMarkup = buildTelegramActionKeyboard(content.actions);
-    const renderedText = content.format === "markdown" ? markdownToTelegramHtml(text) : text;
-
-    try {
-      const edited = await bot.api.editMessageText(
-        chatIdOf(msgRef),
-        parseTelegramMessageId(msgRef.messageId),
-        renderedText,
-        {
-          ...(content.format === "markdown" ? { parse_mode: "HTML" as const } : {}),
-          ...(content.actions === undefined ? {} : { reply_markup: replyMarkup }),
-        },
-      );
-      if (edited !== true) this.recordMessage(edited, { fromBot: true });
-    } catch (error: unknown) {
-      if (isTelegramMessageNotModified(error)) return;
-      const notFound = classifyTelegramNotFound(error);
-      if (notFound) {
-        if (isTelegramMessageAbsent(error)) {
-          this.store?.markDeleted({ sessionId: msgRef.channelId, messageId: msgRef.messageId });
-        }
-        throw notFound;
-      }
-      throw error;
-    }
-  }
-
-  async deleteMsg(msgRef: MsgRef): Promise<void> {
-    assertTelegramMsgRef(msgRef);
-    const bot = this.mustBot();
-
-    try {
-      await bot.api.deleteMessage(chatIdOf(msgRef), parseTelegramMessageId(msgRef.messageId));
-    } catch (error: unknown) {
-      const notFound = classifyTelegramNotFound(error);
-      if (notFound) {
-        if (isTelegramMessageAbsent(error)) {
-          this.store?.markDeleted({ sessionId: msgRef.channelId, messageId: msgRef.messageId });
-        }
-        throw notFound;
-      }
-      throw error;
-    }
-
-    this.store?.markDeleted({ sessionId: msgRef.channelId, messageId: msgRef.messageId });
-  }
-
-  async getReplyContext(msgRef: MsgRef, opts?: LimitOpts): Promise<SurfaceMessage[]> {
-    assertTelegramMsgRef(msgRef);
-    return await this.listMsg({ platform: "telegram", channelId: msgRef.channelId }, opts);
-  }
-
-  async addReaction(msgRef: MsgRef, reaction: string): Promise<void> {
-    assertTelegramMsgRef(msgRef);
-    const bot = this.mustBot();
-
-    // setMessageReaction replaces the whole reaction set for the bot, so a
-    // single emoji is both "add" and "set".
-    await bot.api.setMessageReaction(chatIdOf(msgRef), parseTelegramMessageId(msgRef.messageId), [
-      { type: "emoji", emoji: toTelegramEmojiReaction(reaction) },
-    ]);
-  }
-
-  async removeReaction(msgRef: MsgRef, _reaction: string): Promise<void> {
-    assertTelegramMsgRef(msgRef);
-    const bot = this.mustBot();
-    await bot.api.setMessageReaction(
-      chatIdOf(msgRef),
-      parseTelegramMessageId(msgRef.messageId),
-      [],
+  async listSessions(): Promise<SurfaceOperationResult<SurfaceSession[]>> {
+    return await captureTelegramOperation("list-sessions", async () =>
+      this.mustStore()
+        .listSessions()
+        .map((row) => ({
+          ref: telegramSessionRef({ chatId: row.chat_id, threadId: row.thread_id }),
+          ...(row.title === null ? {} : { title: row.title }),
+          kind: row.kind,
+        })),
     );
   }
 
-  async listReactions(_msgRef: MsgRef): Promise<string[]> {
-    // The Bot API exposes reactions only as update events, never as a query.
-    return [];
+  async listSessionParticipants(
+    sessionRef: SessionRef,
+    _opts?: { limit?: number },
+  ): Promise<SurfaceOperationResult<SurfaceSessionParticipantsResult>> {
+    const ref = telegramSessionRefResult("list-session-participants", sessionRef);
+    return ref.andThen(() =>
+      Result.err(
+        telegramUnsupported(
+          "list-session-participants",
+          "Telegram session participant listing is not supported",
+        ),
+      ),
+    );
   }
 
-  async startTyping(sessionRef: SessionRef): Promise<TypingIndicatorSubscription> {
-    assertTelegramSessionRef(sessionRef);
-    const bot = this.mustBot();
-    const { chatId, threadId } = parseTelegramSessionId(sessionRef.channelId);
-
-    let stopped = false;
-    const send = () => {
-      if (stopped) return;
-      void bot.api
-        .sendChatAction(
-          chatId,
-          "typing",
-          threadId === undefined ? {} : { message_thread_id: threadId },
+  async startOutput(
+    sessionRef: SessionRef,
+    opts?: StartOutputOpts,
+  ): Promise<SurfaceOperationResult<SurfaceOutputStream>> {
+    const ref = telegramSessionRefResult("start-output", sessionRef);
+    const replyTo = opts?.replyTo;
+    const replyValidated = replyTo
+      ? ref.andThen((session) =>
+          telegramNestedMsgRefResult({
+            operation: "start-output",
+            sessionRef: session,
+            msgRef: replyTo,
+            refRole: "replyTo",
+          }).map(() => session),
         )
-        .catch(() => undefined);
-    };
+      : ref;
+    const validated = (opts?.resume?.created ?? []).reduce(
+      (current, created, index) =>
+        current.andThen((session) =>
+          telegramNestedMsgRefResult({
+            operation: "start-output",
+            sessionRef: session,
+            msgRef: created,
+            refRole: `resume.created[${index}]`,
+          }).map(() => session),
+        ),
+      replyValidated,
+    );
+    const continueStart = validated.match<
+      () => Promise<SurfaceOperationResult<SurfaceOutputStream>>
+    >({
+      err: (error) => async () => Result.err(error),
+      ok: (telegramRef) => () =>
+        captureTelegramOperation("start-output", async () => {
+          const bot = this.mustBot();
+          const cfg = this.cfg ?? (await this.resolveCoreConfig());
+          const telegram = cfg.surface.telegram;
+          const silent = opts?.silent === true || !telegram.outputNotification;
+          const stream = new TelegramOutputStream({
+            api: createGrammyOutputApi(bot),
+            sessionRef: telegramRef,
+            ...(opts ? { opts } : {}),
+            now: () => Date.now(),
+            scheduleEdit: (cb, delayMs) => {
+              const timer = setTimeout(cb, delayMs);
+              return () => clearTimeout(timer);
+            },
+            streamEditIntervalMs: telegram.streamEditIntervalMs,
+            parseMode: telegram.parseMode,
+            outputMode: telegram.outputMode,
+            outputNotification: !silent,
+            workingIndicators: telegram.workingIndicators,
+            ...(telegram.markdownTableRender.enabled
+              ? { markdownTableRender: telegram.markdownTableRender }
+              : {}),
+          });
 
-    send();
-    // Telegram clears the typing indicator after ~5s, so it must be refreshed.
-    const timer = setInterval(send, 4_500);
+          return new TelegramOutputStreamWithAttachments(stream, {
+            api: createGrammyAttachmentApi(bot),
+            sessionRef: telegramRef,
+            silent,
+            onError: (error, context) => {
+              this.logger.warn(
+                "failed to deliver telegram attachments",
+                { sessionId: telegramRef.channelId, ...context },
+                error,
+              );
+            },
+            onDelivered: (messages) => this.recordOwnOutput(telegramRef, messages),
+            onUnreconciled: (failures) => {
+              this.logger.warn("telegram surplus messages left in the chat", {
+                sessionId: telegramRef.channelId,
+                failures: failures.map((failure) => ({
+                  messageId: failure.messageId,
+                  outcome: failure.outcome,
+                  reason: failure.reason,
+                })),
+              });
+            },
+          });
+        }),
+    });
+    return await continueStart();
+  }
 
-    return {
-      stop: async () => {
-        stopped = true;
-        clearInterval(timer);
+  async prepareSendMsg(
+    sessionRef: SessionRef,
+    input: SurfaceSendPreparationInput,
+    opts?: SendOpts,
+  ): Promise<SurfaceOperationResult<void>> {
+    return prepareTelegramSendResult(sessionRef, input, opts).map(() => undefined);
+  }
+
+  async sendMsg(
+    sessionRef: SessionRef,
+    content: ContentOpts,
+    opts?: SendOpts,
+  ): Promise<SurfaceOperationResult<MsgRef>> {
+    const prepared = prepareTelegramSendResult(
+      sessionRef,
+      {
+        text: content.text,
+        attachmentCount: content.attachments?.length ?? 0,
+        actionCount: content.actions?.length ?? 0,
       },
-    };
+      opts,
+    );
+    const continueSend = prepared.match<() => Promise<SurfaceOperationResult<MsgRef>>>({
+      err: (error) => async () => Result.err(error),
+      ok: (telegramRef) => () =>
+        captureTelegramOperation("send-message", async () => {
+          const bot = this.mustBot();
+          const text = content.text ?? "";
+          const { chatId, threadId } = parseTelegramSessionId(telegramRef.channelId);
+          const replyMarkup = buildTelegramActionKeyboard(content.actions);
+          const renderedText = content.format === "markdown" ? markdownToTelegramHtml(text) : text;
+
+          for (const action of content.actions ?? []) {
+            if (Buffer.byteLength(action.actionId, "utf8") > TELEGRAM_CALLBACK_DATA_MAX_BYTES) {
+              this.logger.warn("telegram action omitted because callback_data exceeds 64 bytes", {
+                actionIdBytes: Buffer.byteLength(action.actionId, "utf8"),
+                label: action.label,
+              });
+            }
+          }
+
+          const sent = await bot.api.sendMessage(chatId, renderedText, {
+            ...(content.format === "markdown" ? { parse_mode: "HTML" as const } : {}),
+            ...(threadId === undefined ? {} : { message_thread_id: threadId }),
+            ...(opts?.silent ? { disable_notification: true } : {}),
+            ...(replyMarkup ? { reply_markup: replyMarkup } : {}),
+            ...(opts?.replyTo
+              ? {
+                  reply_parameters: {
+                    message_id: parseTelegramMessageId(opts.replyTo.messageId),
+                    allow_sending_without_reply: true,
+                  },
+                }
+              : {}),
+          });
+
+          this.recordMessage(sent, { fromBot: true });
+          return telegramMsgRef({ chatId, threadId, messageId: sent.message_id });
+        }),
+    });
+    return await continueSend();
+  }
+
+  async readMsg(msgRef: MsgRef): Promise<SurfaceOperationResult<SurfaceMessage | null>> {
+    const ref = telegramMsgRefResult("read-message", msgRef);
+    const continueRead = ref.match<() => Promise<SurfaceOperationResult<SurfaceMessage | null>>>({
+      err: (error) => async () => Result.err(error),
+      ok: (telegramRef) => () =>
+        captureTelegramOperation("read-message", async () => {
+          const record = this.mustStore().getMessage({
+            sessionId: telegramRef.channelId,
+            messageId: telegramRef.messageId,
+          });
+          if (!record) return null;
+          return {
+            ref: telegramRef,
+            session: { platform: "telegram", channelId: telegramRef.channelId },
+            userId: record.userId,
+            ...(record.userName === undefined ? {} : { userName: record.userName }),
+            text: record.text,
+            ts: record.ts,
+            ...(record.editedTs === undefined ? {} : { editedTs: record.editedTs }),
+            ...(record.raw === undefined ? {} : { raw: record.raw }),
+          };
+        }),
+    });
+    return await continueRead();
+  }
+
+  async listMsg(
+    sessionRef: SessionRef,
+    opts?: LimitOpts,
+  ): Promise<SurfaceOperationResult<SurfaceMessage[]>> {
+    const ref = telegramSessionRefResult("list-messages", sessionRef);
+    const continueList = ref.match<() => Promise<SurfaceOperationResult<SurfaceMessage[]>>>({
+      err: (error) => async () => Result.err(error),
+      ok: (telegramRef) => () =>
+        captureTelegramOperation("list-messages", async () =>
+          this.mustStore()
+            .listMessages({
+              sessionId: telegramRef.channelId,
+              ...(opts?.limit === undefined ? {} : { limit: opts.limit }),
+              ...(opts?.beforeMessageId === undefined
+                ? {}
+                : { beforeMessageId: opts.beforeMessageId }),
+              ...(opts?.afterMessageId === undefined
+                ? {}
+                : { afterMessageId: opts.afterMessageId }),
+            })
+            .map((record) => ({
+              ref: telegramMsgRef({
+                chatId: record.chatId,
+                threadId: record.threadId,
+                messageId: record.messageId,
+              }),
+              session: telegramRef,
+              userId: record.userId,
+              ...(record.userName === undefined ? {} : { userName: record.userName }),
+              text: record.text,
+              ts: record.ts,
+              ...(record.editedTs === undefined ? {} : { editedTs: record.editedTs }),
+              ...(record.raw === undefined ? {} : { raw: record.raw }),
+            })),
+        ),
+    });
+    return await continueList();
+  }
+
+  async editMsg(msgRef: MsgRef, content: ContentOpts): Promise<SurfaceOperationResult<void>> {
+    const ref = telegramMsgRefResult("edit-message", msgRef);
+    const text = content.text ?? "";
+    if (!text.trim()) {
+      return Result.err(
+        telegramInvalidInput(
+          "edit-message",
+          "content.text",
+          "Telegram edits require non-empty text",
+        ),
+      );
+    }
+
+    const continueEdit = ref.match<() => Promise<SurfaceOperationResult<void>>>({
+      err: (error) => async () => Result.err(error),
+      ok: (telegramRef) => async () => {
+        const edited = await captureTelegramOperation("edit-message", async () => {
+          const bot = this.mustBot();
+          const replyMarkup = buildTelegramActionKeyboard(content.actions);
+          const renderedText = content.format === "markdown" ? markdownToTelegramHtml(text) : text;
+          try {
+            const message = await bot.api.editMessageText(
+              chatIdOf(telegramRef),
+              parseTelegramMessageId(telegramRef.messageId),
+              renderedText,
+              {
+                ...(content.format === "markdown" ? { parse_mode: "HTML" as const } : {}),
+                ...(content.actions === undefined ? {} : { reply_markup: replyMarkup }),
+              },
+            );
+            if (message !== true) this.recordMessage(message, { fromBot: true });
+          } catch (cause) {
+            if (
+              isTelegramMessageNotModified(
+                projectTelegramError(cause, "Telegram message edit failed"),
+              )
+            ) {
+              return;
+            }
+            throw cause;
+          }
+        });
+        edited.match({
+          ok: () => undefined,
+          err: (error) => {
+            if (error._tag === "SurfaceMessageNotFound" && isTelegramMessageAbsent(error)) {
+              this.store?.markDeleted({
+                sessionId: telegramRef.channelId,
+                messageId: telegramRef.messageId,
+              });
+            }
+          },
+        });
+        return edited;
+      },
+    });
+    return await continueEdit();
+  }
+
+  async deleteMsg(msgRef: MsgRef): Promise<SurfaceOperationResult<void>> {
+    const ref = telegramMsgRefResult("delete-message", msgRef);
+    const continueDelete = ref.match<() => Promise<SurfaceOperationResult<void>>>({
+      err: (error) => async () => Result.err(error),
+      ok: (telegramRef) => async () => {
+        const deleted = await captureTelegramOperation("delete-message", async () => {
+          await this.mustBot().api.deleteMessage(
+            chatIdOf(telegramRef),
+            parseTelegramMessageId(telegramRef.messageId),
+          );
+        });
+        deleted.match({
+          ok: () =>
+            this.store?.markDeleted({
+              sessionId: telegramRef.channelId,
+              messageId: telegramRef.messageId,
+            }),
+          err: (error) => {
+            if (error._tag === "SurfaceMessageNotFound" && isTelegramMessageAbsent(error)) {
+              this.store?.markDeleted({
+                sessionId: telegramRef.channelId,
+                messageId: telegramRef.messageId,
+              });
+            }
+          },
+        });
+        return deleted;
+      },
+    });
+    return await continueDelete();
+  }
+
+  async getReplyContext(
+    msgRef: MsgRef,
+    opts?: LimitOpts,
+  ): Promise<SurfaceOperationResult<SurfaceMessage[]>> {
+    const ref = telegramMsgRefResult("get-reply-context", msgRef);
+    const continueContext = ref.match<() => Promise<SurfaceOperationResult<SurfaceMessage[]>>>({
+      err: (error) => async () => Result.err(error),
+      ok: (telegramRef) => () =>
+        this.listMsg({ platform: "telegram", channelId: telegramRef.channelId }, opts),
+    });
+    return await continueContext();
+  }
+
+  async planReplyChain(
+    msgRef: MsgRef,
+    _opts?: SurfaceReplyChainPlanOptions,
+  ): Promise<SurfaceOperationResult<readonly MsgRef[]>> {
+    const ref = telegramMsgRefResult("plan-reply-chain", msgRef);
+    return ref.andThen(() =>
+      Result.err(
+        telegramUnsupported("plan-reply-chain", "Telegram reply-chain planning is not supported"),
+      ),
+    );
+  }
+
+  async planMergeBlockEndingAt(
+    msgRef: MsgRef,
+    _opts?: SurfaceMergeBlockPlanOptions,
+  ): Promise<SurfaceOperationResult<readonly MsgRef[]>> {
+    const ref = telegramMsgRefResult("plan-merge-block", msgRef);
+    return ref.andThen(() =>
+      Result.err(
+        telegramUnsupported("plan-merge-block", "Telegram merge-block planning is not supported"),
+      ),
+    );
+  }
+
+  async addReaction(msgRef: MsgRef, reaction: string): Promise<SurfaceOperationResult<void>> {
+    const ref = telegramMsgRefResult("add-reaction", msgRef);
+    const continueAdd = ref.match<() => Promise<SurfaceOperationResult<void>>>({
+      err: (error) => async () => Result.err(error),
+      ok: (telegramRef) => () =>
+        captureTelegramOperation("add-reaction", async () => {
+          await this.mustBot().api.setMessageReaction(
+            chatIdOf(telegramRef),
+            parseTelegramMessageId(telegramRef.messageId),
+            [{ type: "emoji", emoji: toTelegramEmojiReaction(reaction) }],
+          );
+        }),
+    });
+    return await continueAdd();
+  }
+
+  async removeReaction(msgRef: MsgRef, _reaction: string): Promise<SurfaceOperationResult<void>> {
+    const ref = telegramMsgRefResult("remove-reaction", msgRef);
+    const continueRemove = ref.match<() => Promise<SurfaceOperationResult<void>>>({
+      err: (error) => async () => Result.err(error),
+      ok: (telegramRef) => () =>
+        captureTelegramOperation("remove-reaction", async () => {
+          await this.mustBot().api.setMessageReaction(
+            chatIdOf(telegramRef),
+            parseTelegramMessageId(telegramRef.messageId),
+            [],
+          );
+        }),
+    });
+    return await continueRemove();
+  }
+
+  async listReactions(msgRef: MsgRef): Promise<SurfaceOperationResult<string[]>> {
+    return telegramMsgRefResult("list-reactions", msgRef).map(() => []);
+  }
+
+  async listReactionDetails(
+    msgRef: MsgRef,
+  ): Promise<SurfaceOperationResult<SurfaceReactionDetail[]>> {
+    const ref = telegramMsgRefResult("list-reaction-details", msgRef);
+    return ref.andThen(() =>
+      Result.err(
+        telegramUnsupported(
+          "list-reaction-details",
+          "Telegram reaction detail listing is not supported",
+        ),
+      ),
+    );
+  }
+
+  async startTyping(
+    sessionRef: SessionRef,
+  ): Promise<SurfaceOperationResult<TypingIndicatorSubscription>> {
+    const ref = telegramSessionRefResult("start-typing", sessionRef);
+    const continueTyping = ref.match<
+      () => Promise<SurfaceOperationResult<TypingIndicatorSubscription>>
+    >({
+      err: (error) => async () => Result.err(error),
+      ok: (telegramRef) => () =>
+        captureTelegramOperation("start-typing", async () => {
+          const bot = this.mustBot();
+          const { chatId, threadId } = parseTelegramSessionId(telegramRef.channelId);
+          let stopped = false;
+          const send = () => {
+            if (stopped) return;
+            void Result.tryPromise({
+              try: () =>
+                bot.api.sendChatAction(
+                  chatId,
+                  "typing",
+                  threadId === undefined ? {} : { message_thread_id: threadId },
+                ),
+              catch: projectTelegramError("Telegram typing heartbeat failed"),
+            });
+          };
+          send();
+          const timer = setInterval(send, 4_500);
+          return {
+            stop: async () => {
+              stopped = true;
+              clearInterval(timer);
+              return Result.ok(undefined);
+            },
+          };
+        }),
+    });
+    return await continueTyping();
   }
 
   async subscribe(handler: AdapterEventHandler): Promise<AdapterSubscription> {
@@ -818,39 +995,66 @@ export class TelegramAdapter implements SurfaceAdapter {
     };
   }
 
-  async getUnRead(sessionRef: SessionRef): Promise<SurfaceMessage[]> {
-    assertTelegramSessionRef(sessionRef);
-    const records = this.mustStore().listUnread({ sessionId: sessionRef.channelId });
-
-    return records.map((record) => ({
-      ref: telegramMsgRef({
-        chatId: record.chatId,
-        threadId: record.threadId,
-        messageId: record.messageId,
-      }),
-      session: sessionRef,
-      userId: record.userId,
-      ...(record.userName === undefined ? {} : { userName: record.userName }),
-      text: record.text,
-      ts: record.ts,
-    }));
+  async getUnRead(sessionRef: SessionRef): Promise<SurfaceOperationResult<SurfaceMessage[]>> {
+    const ref = telegramSessionRefResult("get-unread", sessionRef);
+    const continueUnread = ref.match<() => Promise<SurfaceOperationResult<SurfaceMessage[]>>>({
+      err: (error) => async () => Result.err(error),
+      ok: (telegramRef) => () =>
+        captureTelegramOperation("get-unread", async () =>
+          this.mustStore()
+            .listUnread({ sessionId: telegramRef.channelId })
+            .map((record) => ({
+              ref: telegramMsgRef({
+                chatId: record.chatId,
+                threadId: record.threadId,
+                messageId: record.messageId,
+              }),
+              session: telegramRef,
+              userId: record.userId,
+              ...(record.userName === undefined ? {} : { userName: record.userName }),
+              text: record.text,
+              ts: record.ts,
+            })),
+        ),
+    });
+    return await continueUnread();
   }
 
-  async markRead(sessionRef: SessionRef, upToMsgRef?: MsgRef): Promise<void> {
-    assertTelegramSessionRef(sessionRef);
-    const store = this.mustStore();
-
-    const target = upToMsgRef?.platform === "telegram" ? upToMsgRef : undefined;
-    const latest = target
-      ? store.getMessage({ sessionId: sessionRef.channelId, messageId: target.messageId })
-      : store.listMessages({ sessionId: sessionRef.channelId, limit: 1 })[0];
-
-    if (!latest) return;
-    store.markRead({
-      sessionId: sessionRef.channelId,
-      messageId: latest.messageId,
-      ts: latest.ts,
+  async markRead(
+    sessionRef: SessionRef,
+    upToMsgRef?: MsgRef,
+  ): Promise<SurfaceOperationResult<void>> {
+    const ref = telegramSessionRefResult("mark-read", sessionRef);
+    const validated = upToMsgRef
+      ? ref.andThen((session) =>
+          telegramNestedMsgRefResult({
+            operation: "mark-read",
+            sessionRef: session,
+            msgRef: upToMsgRef,
+            refRole: "upToMsgRef",
+          }).map(() => session),
+        )
+      : ref;
+    const continueMark = validated.match<() => Promise<SurfaceOperationResult<void>>>({
+      err: (error) => async () => Result.err(error),
+      ok: (telegramRef) => () =>
+        captureTelegramOperation("mark-read", async () => {
+          const store = this.mustStore();
+          const latest = upToMsgRef
+            ? store.getMessage({
+                sessionId: telegramRef.channelId,
+                messageId: upToMsgRef.messageId,
+              })
+            : store.listMessages({ sessionId: telegramRef.channelId, limit: 1 })[0];
+          if (!latest) return;
+          store.markRead({
+            sessionId: telegramRef.channelId,
+            messageId: latest.messageId,
+            ts: latest.ts,
+          });
+        }),
     });
+    return await continueMark();
   }
 
   // ---------------------------------------------------------------------------
@@ -950,12 +1154,14 @@ export class TelegramAdapter implements SurfaceAdapter {
           userId: String(query.from.id),
           messageId: String(message.message_id),
         });
-        await ctx
-          .answerCallbackQuery({
-            text: delivered.ok ? "Cancelling…" : "Cancel could not be delivered. Try again.",
-            show_alert: !delivered.ok,
-          })
-          .catch(() => undefined);
+        await Result.tryPromise({
+          try: () =>
+            ctx.answerCallbackQuery({
+              text: delivered.ok ? "Cancelling…" : "Cancel could not be delivered. Try again.",
+              show_alert: !delivered.ok,
+            }),
+          catch: projectTelegramError("Telegram callback acknowledgement failed"),
+        });
         return;
       }
 
@@ -971,13 +1177,15 @@ export class TelegramAdapter implements SurfaceAdapter {
           messageId: message.message_id,
         }),
       });
-      await ctx
-        .answerCallbackQuery(
-          delivered.ok
-            ? {}
-            : { text: "Action could not be delivered. Try again.", show_alert: true },
-        )
-        .catch(() => undefined);
+      await Result.tryPromise({
+        try: () =>
+          ctx.answerCallbackQuery(
+            delivered.ok
+              ? {}
+              : { text: "Action could not be delivered. Try again.", show_alert: true },
+          ),
+        catch: projectTelegramError("Telegram callback acknowledgement failed"),
+      });
     });
   }
 
@@ -1031,12 +1239,17 @@ export class TelegramAdapter implements SurfaceAdapter {
     const threadId = telegramTopicIdOf(message);
     const sessionId = formatTelegramSessionId({ chatId: message.chat.id, threadId });
 
+    let kind: SurfaceSession["kind"];
+    if (message.chat.type === "private") kind = "dm";
+    else if (threadId === undefined) kind = "channel";
+    else kind = "thread";
+
     store.upsertSession({
       sessionId,
       chatId: String(message.chat.id),
       ...(threadId === undefined ? {} : { threadId: String(threadId) }),
       ...(chatTitleOf(message) === undefined ? {} : { title: chatTitleOf(message) }),
-      kind: message.chat.type === "private" ? "dm" : threadId === undefined ? "channel" : "thread",
+      kind,
       updatedTs: Date.now(),
     });
 
@@ -1056,11 +1269,13 @@ export class TelegramAdapter implements SurfaceAdapter {
         ? {}
         : { replyToMessageId: String(message.reply_to_message.message_id) }),
       fromBot: opts.fromBot,
-      raw: toTelegramRawEnvelope({
-        message,
-        ...(this.me?.username === undefined ? {} : { botUsername: this.me.username }),
-        ...(this.me?.id === undefined ? {} : { botUserId: this.me.id }),
-      }),
+      rawJson: JSON.stringify(
+        toTelegramRawEnvelope({
+          message,
+          ...(this.me?.username === undefined ? {} : { botUsername: this.me.username }),
+          ...(this.me?.id === undefined ? {} : { botUserId: this.me.id }),
+        }),
+      ),
     });
   }
 
@@ -1115,7 +1330,7 @@ export class TelegramAdapter implements SurfaceAdapter {
     if (dedupeKey !== null) {
       const fresh = this.store?.enqueueIngress({
         dedupeKey,
-        payload: evt,
+        payloadJson: JSON.stringify(evt),
         ts: Date.now(),
       });
       // Already queued means this is a redelivery of something the replayer
@@ -1168,16 +1383,26 @@ export class TelegramAdapter implements SurfaceAdapter {
       return { ok: false, error, cause: new Error(error) };
     }
 
-    let failure: { error: string; cause: unknown } | null = null;
+    let failure: { error: string; cause: Error } | null = null;
 
     for (const handler of this.handlers) {
-      try {
-        await handler(evt);
-      } catch (e: unknown) {
-        this.logger.error("telegram adapter handler failed", { type: evt.type }, e);
+      const delivered = await Result.tryPromise({
+        try: async () => await handler(evt),
+        catch: projectTelegramError("Telegram adapter handler failed"),
+      });
+      const outcome = delivered.match<
+        | { readonly kind: "delivered" }
+        | { readonly kind: "failed"; readonly error: TelegramErrorProjection }
+      >({
+        ok: () => ({ kind: "delivered" }),
+        err: (error) => ({ kind: "failed", error }),
+      });
+      if (outcome.kind === "failed") {
+        const error = outcome.error;
+        this.logger.error("telegram adapter handler failed", { type: evt.type }, error.error);
         // Keep the first failure: later handlers may succeed, but the event
         // is only safe to forget once every subscriber has taken it.
-        failure ??= { error: e instanceof Error ? e.message : String(e), cause: e };
+        failure ??= { error: error.message, cause: error.error };
       }
     }
 
@@ -1204,7 +1429,7 @@ export class TelegramAdapter implements SurfaceAdapter {
     let failed = 0;
 
     for (const entry of pending) {
-      const evt = parseStoredAdapterEvent(entry.payload);
+      const evt = entry.event;
       if (!evt) {
         // Unparseable payloads can never succeed; keeping them would block the
         // queue behind a permanent failure.
@@ -1260,17 +1485,22 @@ export class TelegramAdapter implements SurfaceAdapter {
   private async replayPendingIngressInProcess(): Promise<void> {
     if (this.ingressReplayActive || this.ingressStopped || this.bot === null) return;
     this.ingressReplayActive = true;
-    try {
-      const result = await this.replayPendingIngress();
-      if (result.failed > 0 && (this.store?.countPendingIngress() ?? 0) > 0) {
-        this.scheduleIngressReplay(Math.min(30_000, 1_000 * (result.failed + 1)));
-      }
-    } catch (error: unknown) {
-      this.logger.error("telegram ingress replay attempt failed", {}, error);
-      if ((this.store?.countPendingIngress() ?? 0) > 0) this.scheduleIngressReplay(5_000);
-    } finally {
-      this.ingressReplayActive = false;
-    }
+    const replayed = await Result.tryPromise({
+      try: () => this.replayPendingIngress(),
+      catch: projectTelegramError("Telegram ingress replay attempt failed"),
+    });
+    replayed.match({
+      ok: (result) => {
+        if (result.failed > 0 && (this.store?.countPendingIngress() ?? 0) > 0) {
+          this.scheduleIngressReplay(Math.min(30_000, 1_000 * (result.failed + 1)));
+        }
+      },
+      err: (error) => {
+        this.logger.error("telegram ingress replay attempt failed", {}, error.error);
+        if ((this.store?.countPendingIngress() ?? 0) > 0) this.scheduleIngressReplay(5_000);
+      },
+    });
+    this.ingressReplayActive = false;
   }
 
   /**
@@ -1314,13 +1544,13 @@ export class TelegramAdapter implements SurfaceAdapter {
 
   private mustBot(): Bot {
     const bot = this.bot;
-    if (!bot) throw new Error("telegram adapter: not connected");
+    if (!bot) throw new TelegramAdapterUnavailable();
     return bot;
   }
 
   private mustStore(): TelegramSurfaceStore {
     const store = this.store;
-    if (!store) throw new Error("telegram adapter: not connected");
+    if (!store) throw new TelegramAdapterUnavailable();
     return store;
   }
 }

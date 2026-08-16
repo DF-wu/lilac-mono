@@ -1,7 +1,9 @@
 import { describe, expect, it } from "bun:test";
 import { createLogger } from "@stanley2058/lilac-utils";
+import { Panic } from "better-result";
 
 import { createProcessHandlers } from "../../src/runtime/process-handlers";
+import { projectRuntimeError, safeRuntimeErrorText } from "../../src/runtime/error-format";
 
 function createLoggerStub() {
   return createLogger({
@@ -20,6 +22,32 @@ function createExitCodeHooks() {
 }
 
 describe("createProcessHandlers", () => {
+  it("redacts standalone provider and AWS credential formats", () => {
+    const credentials = [
+      "ghp_abcdefghijklmnopqrstuvwxyz123456",
+      "github_pat_abcdefghijklmnopqrstuvwxyz123456",
+      "sk-proj-abcdefghijklmnopqrstuvwxyz123456",
+      "xoxb-1234567890-abcdefghijklmnopqrstuvwxyz",
+      "AKIAIOSFODNN7EXAMPLE",
+      "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+      `FwoG${"A".repeat(96)}`,
+    ] as const;
+
+    for (const credential of credentials) {
+      const redacted = safeRuntimeErrorText(new Error(credential), "fallback");
+      expect(redacted).toBe("<redacted>");
+      expect(redacted).not.toContain(credential);
+    }
+  });
+
+  it("safely projects revoked failures", () => {
+    const { proxy, revoke } = Proxy.revocable({}, {});
+    revoke();
+    const projected = projectRuntimeError(proxy, "Opaque revoked process failure");
+    expect(projected).toBeInstanceOf(Error);
+    expect(projected.message).toBe("Opaque revoked process failure");
+  });
+
   it("logs unhandled rejections without exiting", () => {
     const seen: unknown[] = [];
     const exitCalls: number[] = [];
@@ -67,6 +95,33 @@ describe("createProcessHandlers", () => {
 
     expect(stopCalls).toBe(1);
     expect(exitCalls).toEqual([1]);
+  });
+
+  it("reports a Panic through fatal supervision without losing its identity", async () => {
+    const panic = new Panic({ message: "agent runner invariant failed" });
+    const stoppedWith: Array<Error | undefined> = [];
+    let resolveExit!: (code: number) => void;
+    const exited = new Promise<number>((resolve) => {
+      resolveExit = resolve;
+    });
+    const exitCodeHooks = createExitCodeHooks();
+    const handlers = createProcessHandlers({
+      logger: createLoggerStub(),
+      stop: async (fatalError) => {
+        stoppedWith.push(fatalError);
+      },
+      getExitCode: exitCodeHooks.getExitCode,
+      setExitCode: exitCodeHooks.setExitCode,
+      exit: ((code: number) => {
+        resolveExit(code);
+        return undefined as never;
+      }) as (code: number) => never,
+    });
+
+    handlers.reportFatalError(panic);
+
+    await expect(exited).resolves.toBe(1);
+    expect(stoppedWith).toEqual([panic]);
   });
 
   it("exits immediately on a second fatal error during shutdown", async () => {

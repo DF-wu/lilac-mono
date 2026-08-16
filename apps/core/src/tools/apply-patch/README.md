@@ -1,11 +1,11 @@
-## apply_patch (agent tool)
+## patch (agent tool)
 
 This tool applies multi-file edits using a structured patch format. It is intended
 for changes that would be brittle with line-based edits.
 
 ### Tool input
 
-The agent calls `apply_patch` with:
+The agent calls `patch` with:
 
 ```json
 {

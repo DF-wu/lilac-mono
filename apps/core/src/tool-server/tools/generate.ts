@@ -1,4 +1,11 @@
-import { env, getModelProviders, type CoreConfig } from "@stanley2058/lilac-utils";
+import { env, errorMessage, getModelProviders, type CoreConfig } from "@stanley2058/lilac-utils";
+import {
+  defineServerTool,
+  type RequestContext,
+  type ServerTool,
+  type ServerToolCallOptions,
+} from "../types";
+import { Result, TaggedError, type Result as ResultType } from "better-result";
 import {
   experimental_generateVideo as generateVideo,
   generateImage,
@@ -16,8 +23,25 @@ import {
   inferMimeTypeFromFilename,
   resolveToolPathForRequestContext,
 } from "../../shared/attachment-utils";
-import type { RequestContext, ServerTool } from "../types";
-import { zodObjectToCliLines } from "./zod-cli";
+
+class GenerateToolFailure extends TaggedError("GenerateToolFailure")<{
+  readonly message: string;
+}> {}
+
+function adaptGenerateResultToToolHost<TValue>(
+  result: ResultType<TValue, GenerateToolFailure>,
+): TValue {
+  return result.match({
+    ok: (value) => () => value,
+    err: (error) => () => {
+      throw new Error(error.message);
+    },
+  })();
+}
+
+function signalGenerateFailureToToolHost(message: string): never {
+  return adaptGenerateResultToToolHost(Result.err(new GenerateToolFailure({ message })));
+}
 
 type SupportedImageModelId =
   /**
@@ -281,6 +305,7 @@ type ImageGenerationPrompt =
     };
 
 type VideoModelObject = Exclude<Parameters<typeof generateVideo>[0]["model"], string>;
+type GenerationProvider = "openai" | "openrouter" | "xai" | "vercel";
 
 type ModelDescriptor<TId extends string, TModel, TInput> = {
   id: TId;
@@ -301,11 +326,24 @@ type VideoModelDescriptor = ModelDescriptor<
   VideoGenerateInput
 >;
 
-function isConfiguredProvider(provider: "openai" | "openrouter" | "xai" | "vercel"): boolean {
-  const config = env.providers[provider];
-  const apiKey = "apiKey" in config ? config.apiKey : undefined;
-  const baseUrl = "baseUrl" in config ? config.baseUrl : undefined;
-  return Boolean(apiKey?.trim() || baseUrl?.trim());
+function hasConfiguredProviderValue(config: {
+  readonly apiKey: string | undefined;
+  readonly baseUrl: string | undefined;
+}): boolean {
+  return Boolean(config.apiKey?.trim() || config.baseUrl?.trim());
+}
+
+function isConfiguredProvider(provider: GenerationProvider): boolean {
+  switch (provider) {
+    case "openai":
+      return hasConfiguredProviderValue(env.providers.openai);
+    case "openrouter":
+      return hasConfiguredProviderValue(env.providers.openrouter);
+    case "xai":
+      return hasConfiguredProviderValue(env.providers.xai);
+    case "vercel":
+      return hasConfiguredProviderValue(env.providers.vercel);
+  }
 }
 
 function isOneOf<const T extends readonly string[]>(allowed: T, value: string): value is T[number] {
@@ -317,7 +355,7 @@ function validateGptImageInput(
   modelId: "gpt-image-2" | "gpt-5-image",
 ): void {
   if (input.aspectRatio && !isOneOf(GPT_IMAGE_ALLOWED_ASPECT_RATIOS, input.aspectRatio)) {
-    throw new Error(
+    return signalGenerateFailureToToolHost(
       `Unsupported aspectRatio '${input.aspectRatio}' for ${modelId}. Allowed: ${GPT_IMAGE_ALLOWED_ASPECT_RATIOS.join(", ")}.`,
     );
   }
@@ -328,7 +366,7 @@ function validateGptImageInput(
     if (isOneOf(GPT_IMAGE_STANDARD_SIZES, input.size)) return;
 
     const context = modelId === "gpt-image-2" ? " image edits" : "";
-    throw new Error(
+    return signalGenerateFailureToToolHost(
       `Unsupported size '${input.size}' for ${modelId}${context}. Allowed: ${GPT_IMAGE_STANDARD_SIZES.join(" | ")}.`,
     );
   }
@@ -346,7 +384,7 @@ function validateGptImageInput(
     pixels < GPT_IMAGE_2_MIN_PIXELS ||
     pixels > GPT_IMAGE_2_MAX_PIXELS
   ) {
-    throw new Error(
+    return signalGenerateFailureToToolHost(
       `Unsupported size '${input.size}' for gpt-image-2. Both edges must be multiples of 16 and at most ${GPT_IMAGE_2_MAX_EDGE}px, the aspect ratio must not exceed 3:1, and total pixels must be ${GPT_IMAGE_2_MIN_PIXELS}-${GPT_IMAGE_2_MAX_PIXELS}.`,
     );
   }
@@ -362,17 +400,19 @@ function validateNanobananaInput(
       : NANOBANANA_ALLOWED_ASPECT_RATIOS;
 
   if (input.aspectRatio && !isOneOf(allowedAspectRatios, input.aspectRatio)) {
-    throw new Error(
+    return signalGenerateFailureToToolHost(
       `Unsupported aspectRatio '${input.aspectRatio}' for ${modelId}. Allowed: ${allowedAspectRatios.join(", ")}.`,
     );
   }
 
   if (modelId === "nanobanana-2-lite" && input.size) {
-    throw new Error("nanobanana-2-lite produces 1K output; use aspectRatio instead of size.");
+    return signalGenerateFailureToToolHost(
+      "nanobanana-2-lite produces 1K output; use aspectRatio instead of size.",
+    );
   }
 
   if (modelId === "nanobanana-2-lite" && input.maskImage) {
-    throw new Error("nanobanana-2-lite does not support maskImage.");
+    return signalGenerateFailureToToolHost("nanobanana-2-lite does not support maskImage.");
   }
 }
 
@@ -403,21 +443,23 @@ function validateGrokImagineInput(
   modelId: "grok-imagine-image" | "grok-imagine-image-pro",
 ): void {
   if (input.size) {
-    throw new Error(`${modelId} does not support size. Use aspectRatio instead.`);
+    return signalGenerateFailureToToolHost(
+      `${modelId} does not support size. Use aspectRatio instead.`,
+    );
   }
 
   if (input.aspectRatio && !isOneOf(GROK_IMAGE_ALLOWED_ASPECT_RATIOS, input.aspectRatio)) {
-    throw new Error(
+    return signalGenerateFailureToToolHost(
       `Unsupported aspectRatio '${input.aspectRatio}' for ${modelId}. Allowed: ${GROK_IMAGE_ALLOWED_ASPECT_RATIOS.join(", ")}.`,
     );
   }
 
   if (input.maskImage) {
-    throw new Error(`${modelId} does not support maskImage.`);
+    return signalGenerateFailureToToolHost(`${modelId} does not support maskImage.`);
   }
 
   if ((input.inputImages?.length ?? 0) > 1) {
-    throw new Error(`${modelId} supports only one input image.`);
+    return signalGenerateFailureToToolHost(`${modelId} supports only one input image.`);
   }
 }
 
@@ -526,13 +568,13 @@ const IMAGE_MODEL_DESCRIPTORS: readonly ImageModelDescriptor[] = [
 
 function validateGrokVideoInput(input: VideoGenerateInput): void {
   if (input.aspectRatio && !isOneOf(GROK_VIDEO_ALLOWED_ASPECT_RATIOS, input.aspectRatio)) {
-    throw new Error(
+    return signalGenerateFailureToToolHost(
       `Unsupported aspectRatio '${input.aspectRatio}' for grok-imagine-video. Allowed: ${GROK_VIDEO_ALLOWED_ASPECT_RATIOS.join(", ")}.`,
     );
   }
 
   if (input.resolution && !isOneOf(GROK_VIDEO_ALLOWED_RESOLUTIONS, input.resolution)) {
-    throw new Error(
+    return signalGenerateFailureToToolHost(
       `Unsupported resolution '${input.resolution}' for grok-imagine-video. Allowed: ${GROK_VIDEO_ALLOWED_RESOLUTIONS.join(", ")}.`,
     );
   }
@@ -594,11 +636,10 @@ function getAvailableImageModels(provider: "default" | "openai-compatible" = "de
   if (provider === "openai-compatible") {
     const compatibleProvider = providers["openai-compatible"];
     if (!env.providers.openaiCompatible.baseUrl?.trim() || !compatibleProvider) {
-      throw new Error(
+      return signalGenerateFailureToToolHost(
         "Image generation provider 'openai-compatible' requires OPENAI_COMPATIBLE_BASE_URL.",
       );
     }
-
     return resolveAvailableModels(
       IMAGE_MODEL_DESCRIPTORS.map((descriptor) => ({
         ...descriptor,
@@ -607,7 +648,6 @@ function getAvailableImageModels(provider: "default" | "openai-compatible" = "de
       providers,
     );
   }
-
   return resolveAvailableModels(IMAGE_MODEL_DESCRIPTORS, providers);
 }
 
@@ -625,7 +665,7 @@ function pickModel<TId extends string, TModel>(
   if (requested) {
     const model = available[requested as TId];
     if (!model) {
-      throw new Error(
+      return signalGenerateFailureToToolHost(
         `Requested model '${requested}' is not available for ${modalityLabel} generation (configured: ${Object.keys(available).join(", ") || "none"}).`,
       );
     }
@@ -643,7 +683,7 @@ function pickModel<TId extends string, TModel>(
     }
   }
 
-  throw new Error(
+  return signalGenerateFailureToToolHost(
     `No ${modalityLabel} generation models are configured. Configure at least one provider for ${modalityLabel} generation.`,
   );
 }
@@ -708,7 +748,7 @@ async function readImageDataFromPath(path: string, displayPath = path): Promise<
     return bytes;
   }
 
-  throw new Error(`Input file '${displayPath}' is not a valid image file.`);
+  return signalGenerateFailureToToolHost(`Input file '${displayPath}' is not a valid image file.`);
 }
 
 export async function resolveImageEditInputs(
@@ -830,11 +870,11 @@ async function writeFileWithUniqueName(targetPath: string, bytes: Uint8Array): P
       if (code === "EEXIST") {
         continue;
       }
-      throw error;
+      return signalGenerateFailureToToolHost(errorMessage(error));
     }
   }
 
-  throw new Error(`Failed to find an available filename for: ${targetPath}`);
+  return signalGenerateFailureToToolHost(`Failed to find an available filename for: ${targetPath}`);
 }
 
 export function generateImageWithModel(
@@ -882,84 +922,79 @@ export class Generate implements ServerTool {
 
   constructor(private readonly options: GenerateOptions = {}) {}
 
-  async init(): Promise<void> {}
-  async destroy(): Promise<void> {}
-
-  async list() {
-    const config = await this.options.getConfig?.();
-    const imageProvider = config?.tools.generate.image.provider ?? "default";
-    const imageModels = orderImageModelIds(
-      imageProvider === "openai-compatible"
-        ? IMAGE_MODEL_DESCRIPTORS.map((descriptor) => descriptor.id)
-        : getAvailableImageModels().ids,
-    );
-    const videoModels = getAvailableVideoModels().ids;
-    const tools = [];
-
-    if (imageModels.length > 0) {
-      tools.push({
-        callableId: "generate.image",
+  private readonly tool = defineServerTool({
+    id: this.id,
+    callables: ({ callable }) => ({
+      "generate.image": callable({
         name: "Generate Image",
         description:
           "Generate or edit an image with a configured provider and write it to a local file in outputDir (or cwd). Returns absolute output path + MIME type. " +
-          "Recommended/default: gpt-image-2 when available. " +
-          `Available models: ${imageModels.join(", ")}`,
-        shortInput: zodObjectToCliLines(imageGenerateInputSchema, {
-          mode: "required",
-        }),
-        input: zodObjectToCliLines(imageGenerateInputSchema),
-        primaryPositional: {
-          field: "prompt",
+          "Recommended/default: gpt-image-2 when available.",
+        inputSchema: imageGenerateInputSchema,
+        validation: "zod",
+        primaryPositional: "prompt",
+        catalog: async () => {
+          const config = await this.options.getConfig?.();
+          const imageProvider = config?.tools.generate.image.provider ?? "default";
+          const imageModels = orderImageModelIds(
+            imageProvider === "openai-compatible"
+              ? IMAGE_MODEL_DESCRIPTORS.map((descriptor) => descriptor.id)
+              : getAvailableImageModels().ids,
+          );
+          if (imageModels.length === 0) return false;
+          return {
+            description:
+              "Generate or edit an image with a configured provider and write it to a local file in outputDir (or cwd). Returns absolute output path + MIME type. " +
+              "Recommended/default: gpt-image-2 when available. " +
+              `Available models: ${imageModels.join(", ")}`,
+          };
         },
-      });
-    }
-
-    if (videoModels.length > 0) {
-      tools.push({
-        callableId: "generate.video",
+        run: (input, opts) => this.callGenerateImage(input, opts),
+      }),
+      "generate.video": callable({
         name: "Generate Video",
-        description:
-          "Generate a video with a configured provider and write it to a local file. " +
-          `Available models: ${videoModels.join(", ")}`,
-        shortInput: zodObjectToCliLines(videoGenerateInputSchema, {
-          mode: "required",
-        }),
-        input: zodObjectToCliLines(videoGenerateInputSchema),
-      });
-    }
+        description: "Generate a video with a configured provider and write it to a local file.",
+        inputSchema: videoGenerateInputSchema,
+        validation: "zod",
+        catalog: () => {
+          const videoModels = getAvailableVideoModels().ids;
+          if (videoModels.length === 0) return false;
+          return {
+            description:
+              "Generate a video with a configured provider and write it to a local file. " +
+              `Available models: ${videoModels.join(", ")}`,
+          };
+        },
+        run: (input, opts) => this.callGenerateVideo(input, opts),
+      }),
+    }),
+  });
 
-    return tools;
+  async init(): Promise<void> {
+    await this.tool.init();
+  }
+
+  async destroy(): Promise<void> {
+    await this.tool.destroy();
+  }
+
+  async list() {
+    return this.tool.list();
   }
 
   async call(
     callableId: string,
     input: Record<string, unknown>,
-    opts?: {
-      signal?: AbortSignal;
-      context?: RequestContext;
-      messages?: readonly unknown[];
-    },
+    opts?: ServerToolCallOptions,
   ): Promise<unknown> {
-    if (callableId === "generate.image") {
-      return await this.callGenerateImage(input, opts);
-    }
-
-    if (callableId === "generate.video") {
-      return await this.callGenerateVideo(input, opts);
-    }
-
-    throw new Error(`Invalid callable ID '${callableId}'`);
+    return this.tool.call(callableId, input, opts);
   }
 
   private async callGenerateImage(
-    input: Record<string, unknown>,
-    opts?: {
-      signal?: AbortSignal;
-      context?: RequestContext;
-    },
+    payload: ImageGenerateInput,
+    opts?: ServerToolCallOptions,
   ): Promise<unknown> {
     const config = await this.options.getConfig?.();
-    const payload = imageGenerateInputSchema.parse(input);
     const imageProvider = config?.tools.generate.image.provider ?? "default";
     const availableModels = getAvailableImageModels(imageProvider);
     const picked = pickModel(
@@ -971,7 +1006,7 @@ export class Generate implements ServerTool {
 
     const descriptor = availableModels.byId.get(picked.id);
     if (!descriptor) {
-      throw new Error(`Model descriptor not found for '${picked.id}'.`);
+      return signalGenerateFailureToToolHost(`Model descriptor not found for '${picked.id}'.`);
     }
     descriptor.validateInput(payload);
 
@@ -1010,13 +1045,9 @@ export class Generate implements ServerTool {
   }
 
   private async callGenerateVideo(
-    input: Record<string, unknown>,
-    opts?: {
-      signal?: AbortSignal;
-      context?: RequestContext;
-    },
+    payload: VideoGenerateInput,
+    opts?: ServerToolCallOptions,
   ): Promise<unknown> {
-    const payload = videoGenerateInputSchema.parse(input);
     const availableModels = getAvailableVideoModels();
     const picked = pickModel(
       availableModels.available,
@@ -1027,7 +1058,7 @@ export class Generate implements ServerTool {
 
     const descriptor = availableModels.byId.get(picked.id);
     if (!descriptor) {
-      throw new Error(`Model descriptor not found for '${picked.id}'.`);
+      return signalGenerateFailureToToolHost(`Model descriptor not found for '${picked.id}'.`);
     }
     descriptor.validateInput(payload);
 

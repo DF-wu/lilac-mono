@@ -1,133 +1,44 @@
-# AGENTS.md
+# Lilac Agent Guide
 
-## Quick Repo Facts
+These rules apply to all tasks. Use the linked documents for detailed rules and commands.
 
-- Use `bun`
-- Monorepo: **Bun workspaces** (`apps/*`, `packages/*`).
-- Markdown plans/todos in `plan/*`.
-- Project mental model / terminology: search `PROJECT.md`.
-- `ref/` contains vendored/reference projects. Treat as read-only references.
-- Treat project as greenfield, breaking changes are usually ok. Consult with user whether to include backwards compatibility when introducing breaking changes.
+## Scope
 
-## Finding Type Definitions (Bun + symlinks)
+- Implement only the behavior that the user requests or an approved plan defines. Use the smallest
+  solution that meets the requirements.
+- Do not change an approved plan or its active checklist during implementation.
+- Do not add cleanup, future features, protection for possible problems, or unrelated fixes. Record
+  such work as residual work, but do not implement it.
+- Follow product decisions and non-goals. Do not follow conflicting reviewer suggestions.
+- Fix review findings that the current change causes. Also fix a finding if it proves that the change
+  violates an acceptance criterion or fails a required check.
+- Ask the user before you add a new contract, dependency, configuration option, or subsystem. Also ask
+  before you add stored data, a queue, a journal, a worker, or a recovery process.
+- Stop and ask if a fix needs a new product decision or increases the approved scope.
 
-This repo uses Bun's install layout. Many packages in `apps/*/node_modules` are symlinks into Bun's cache under `node_modules/.bun/...`. If you can't find a type definition by searching the workspace `node_modules`, follow the symlink and then follow `package.json` `exports`/`types`. Always use `ls -al` because the `grep`, `glob` don't work on ignored files and dot-dirs.
+## Compatibility And Safety
 
-## Build / Test / Typecheck
+- You can change private APIs. Do not change an existing wire contract, stored data contract,
+  filesystem tool contract, or plugin contract without approval.
+- Do not revert, overwrite, or include unrelated worktree changes.
+- Use `ref/` only as a read-only upstream reference.
+- Do not put credentials, tokens, private transcripts, or sensitive command data in outputs or files.
 
-### Build
+## Repository Information
 
-- `apps/core`: `cd apps/core && bun run build:remote-runner` (`bun run test` builds this automatically for the remote-runner parity test)
-- `apps/tool-bridge`: `cd apps/tool-bridge && bun run build`
-- `apps/acp-controller`: `cd apps/acp-controller && bun run build` (`lilac-acp`)
+- Use `bun` in this Bun workspace. The workspace packages are in `apps/*` and `packages/*`.
+- Read `PROJECT.md` for terms, architecture, code locations, and subsystem owners.
+- Read `scripts/architecture/README.md` before you change a trust boundary, persistence code, exception
+  code, or architecture registration.
+- Read `MIGRATIONS.md` before you change versioned configuration or a stored data contract.
+- Use the root `package.json` scripts for build, test, typecheck, lint, and format operations.
+- If a type is not visible, follow the `node_modules` symlink into `node_modules/.bun`. Inspect the
+  package `exports` or `types` entry to find its type declarations.
 
-### Testing (Bun)
+## Work And Verification
 
-Tests use Bun’s built-in runner + `bun:test`.
-
-- Every newly added workspace package under `apps/*` or `packages/*` must define a `test` script in its `package.json`.
-- Tests that intentionally trigger errors or warnings must suppress the expected console/logger output and restore mocks afterward so test output stays high-signal.
-
-- Run all tests in a package:
-  - `cd apps/core && bun run test`
-  - `cd packages/utils && bun run test`
-  - `cd packages/event-bus && bun run test`
-
-- Run all root and workspace tests from repo root:
-  - `bun run test:all`
-
-- Run a single test file:
-  - `cd apps/core && bun test tests/tools/bash.test.ts`
-  - `cd packages/event-bus && bun test tests/redis-streams-bus.test.ts`
-
-- Run a single test by name (regex):
-  - `cd apps/core && bun test --test-name-pattern "<pattern>"`
-
-### Test timing
-
-- Do not use fixed-time sleeps or waits to synchronize tests. Await the observable operation, resolve a deferred from the callback/event under test, or use an injected/fake clock.
-- Real-time waits are allowed only when elapsed time is itself the behavior under test and a fake clock cannot cover it safely.
-- Every allowed real-time wait must have an immediately preceding, specific justification:
-  - `// test-wait-justification: verifies the real idle deadline while monitoring is paused`
-- Rejection-only timeout guards are allowed because they do not delay the successful path.
-- `lilac/no-fixed-test-wait` enforces this policy through Oxlint for test files. Run its focused tests with `bun run test:lint-rules`.
-
-### Typechecking
-
-- Treat running `tsc` as essential (same tier as running tests).
-- Run all root and workspace typechecks: `bun run typecheck`.
-- Run typecheck in the package you changed:
-  - `cd <package> && bunx tsc -p tsconfig.json --noEmit`
-
-### Lint / Format
-
-This repo uses Oxc tooling and local Oxlint rules at the root:
-
-- Lint: `bun run lint` (`oxlint`, including local rules)
-- Lint fix: `bun run lint:fix` (`oxlint --fix`, including local rules)
-- Format check: `bun run fmt:check` (`oxfmt --check`)
-- Format write: `bun run fmt` (`oxfmt --write`)
-
-Before wrapping up any task that changes code/config/docs, run lint + format checks from repo root at least once as the final validation step:
-
-- `bun run lint:fix`
-- `bun run fmt`
-
-## Code Style Guidelines (TypeScript)
-
-### Types (important)
-
-- ALWAYS prefer `zod` over manual type assertions/narrowing.
-- **No `any`** and **no `as any`**.
-  - If you must bridge unknown data, use `unknown` + narrowing.
-  - Prefer using `zod` schemas to parse/validate `unknown` at boundaries (tool inputs, JSON/YAML, external APIs) when possible.
-  - Prefer user-defined type guards:
-    - `function isFoo(x: unknown): x is Foo { ... }`
-- Prefer type narrowing over casting (`as Foo`) when possible.
-- Prefer unions and discriminated unions for error/results.
-- Avoid erasing discriminated unions by narrowing to generic shapes on values that are already strongly typed; prefer checking the discriminant (`part.type === "tool-result"`) or use a type guard that returns the precise union member.
-- Never introduce new `isRecord` helpers, use centralized utils instead.
-- Avoid `as unknown as SomeType` casts that effectively act like `as any` (they hide concrete types and break narrowing). Prefer proper narrowing, precise type guards, or compiler-assisted inspection (e.g. typehint) to find the real type.
-- Prefer `Record<string, T>` to `{ [k: string]: T }`.
-- Prefer `readonly T[]` when you don’t mutate.
-- Use `satisfies` when validating object shapes without widening.
-
-### Imports
-
-- Group imports with blank lines:
-  - External imports
-  - Internal relative imports
-- Prefer named exports over default exports.
-
-### Naming conventions
-
-- Files: `kebab-case.ts`.
-- Functions/variables: `camelCase`.
-- Types/interfaces/classes: `PascalCase`.
-- Constants: `UPPER_SNAKE_CASE`.
-
-### Error handling
-
-- Convert unknown caught values safely:
-  - e.g., `const msg = e instanceof Error ? e.message : String(e)`
-  - For known error shapes, ensure logged error message is informative and traceable.
-- Avoid swallowing errors silently.
-- For library-like code:
-  - Throw for programmer/configuration errors.
-  - For runtime/IO failures, either throw with context or return a typed error object.
-- Avoid leaking secrets in logs; redact tokens/keys when printing command/env data.
-
-## Core Config
-
-- `core-config.yaml` is parsed by versioned parsers in `packages/utils/core-config/*` into `UniversalCoreConfig`.
-- v1 file shape is frozen: do not add keys to `coreConfigInputSchemaV1`; if `UniversalCoreConfig` gains fields, add v1 fallbacks in `parseCoreConfigV1ToUniversal`.
-- When v1 and v2 shape/defaults diverge, update `MIGRATIONS.md`.
-- When adding config options, update `packages/utils/config-templates/core-config.example.yaml`.
-
-## Monorepo / references
-
-- `ref/` is for reference material and vendored upstreams.
-  - `ref/*` are git submodules and may not be checked out on a fresh clone.
-  - Don’t copy rules from `ref/*` blindly; this repo’s active workspace is `apps/*` + `packages/*`.
-- When reading external/library code:
-  - Prefer `ref/` first (it often contains the upstream repo).
+- Use focused tests and the typecheck for each changed workspace.
+- Run architecture checks when the change is in code that these checks control.
+- Run full repository checks only for broad changes, the final plan check, or a user request.
+- Do not use fixed waits to synchronize tests. Follow the `lilac/no-fixed-test-wait` rule.
+- Commit or create a pull request only when the user requests it.

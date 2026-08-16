@@ -66,49 +66,18 @@ exact shape `{ "type": "api-key", "key": "..." }`.
 
 ### Local Claude Subscription
 
-Add the commented `claude-code` provider from `providers.example.yaml`. The published single-file
-`mini-lilac` command requires an external official `claude` executable on `PATH`; it cannot resolve
-the Agent SDK's optional executable from a bundled dependency tree. Local runs may use an existing
-authenticated Claude config or `claude auth login`. A custom Mini container can use the provider when
-it installs/mounts that external CLI and supplies authentication explicitly; this differs from the
-Core image, which can resolve the SDK-bundled executable. A `claude-code` provider must not have an
-`auth.json` entry; supplying one is a configuration error. It also requires `catalog: models-dev` and
-rejects `baseUrl`.
+See the [shared Claude Code provider reference](../../docs/claude-code.md) for authentication,
+executable resolution, exact fresh/fork continuation, cross-family replay, retention, and security.
 
-Claude authentication may come from authenticated config under `CLAUDE_CONFIG_DIR`,
-`CLAUDE_CODE_OAUTH_TOKEN`, or platform secure storage. `CLAUDE_CONFIG_DIR` controls Claude's
-filesystem config and native session storage, falling back to `~/.claude`. If set, it must be a
-non-empty absolute path. It must be writable and persistently mounted when a custom container should
-retain native continuation across replacement. A dedicated directory separates operator-selected
-storage; it is not an access-control or privacy boundary from Mini, its tools, or other same-user
-processes. Lilac does not read, store, or refresh the credential. Claude's `ToolSearch` is enabled over
-Mini's deferred MCP tool catalog; profiles that request `websearch` additionally receive Claude's
-built-in `WebSearch`.
+Add the commented `claude-code` provider from `providers.example.yaml`. It must use
+`catalog: models-dev`, must not set `baseUrl`, and must not have an `auth.json` entry. The published
+single-file `mini-lilac` command requires an external official `claude` executable on `PATH`. A custom
+Mini container must install or mount that executable and provide Claude authentication explicitly.
 
-Claude continuation persists across Mini server restarts for:
-
-- Main sessions, when the selected history state has an exact clean binding.
-- Named subagents when `subagent_delegate` uses either a caller-supplied or generated `sessionName`;
-  the current child history state/hash must match. Reuse the returned generated name to continue the
-  same persisted child.
-
-The first eligible call, or one from a compacted/unbound state, missing or changed native state, or a
-history/scope mismatch, starts a fresh persisted Claude session from Mini's canonical history. Only
-an exact compatible continuation forks the last clean session, which is never advanced in place. Undo
-and redo select the binding attached to the exact retained main-history state, and a prompt after undo
-creates a new branch and, when that state is exactly bound, a new fork. Native Claude session IDs are
-not part of the user-facing protocol.
-
-Explicit quiescent model selection may cross into or out of `claude-code`. Historical context then
-uses lossy text replay: visible conversation text and bounded, labeled tool facts remain; hidden
-reasoning, provider metadata, binary history, and executable historical tool protocol do not.
-
-Native Claude transcripts contain conversation data outside Mini's SQLite database and workspace
-history store. Repeated exact continuations create retained forks, so storage under
-`CLAUDE_CONFIG_DIR` can grow roughly quadratically with conversation length. Mini bounds attempt
-metadata and keeps one current binding for each named child. Main-session historical
-bindings remain attached to retained history states and may grow with that history. Mini does not
-delete Claude's native files; Claude's retention policy applies.
+Mini enables Claude's `ToolSearch` over its deferred MCP tool catalog. Profiles that request
+`websearch` additionally receive Claude's built-in `WebSearch`. Main-session history navigation keeps
+bindings on exact retained history states; named subagents continue only when callers reuse the stable
+`sessionName` supplied to or returned by `subagent_delegate`.
 
 `workspaceWrites: false` also disables Bash because allowed commands have unrestricted process
 authority and can write outside filesystem-tool guardrails. Bash safety blocks known destructive
@@ -119,14 +88,15 @@ hatch that bypasses its guardrails, including protected-path checks. Hidden path
 not require this flag unless a tool first reports an access denial. Bash receives an environment
 with the HTTP auth-token variable removed.
 
-Model-facing tool results are limited to 40 KiB. For `read_file`, that limit applies only to the
+Model-facing tool results are limited to 40 KiB. For `read`, that limit applies only to the
 returned textual payload, measured as UTF-8 bytes; metadata, paths, JSON encoding, and loaded
 `AGENTS.md` instructions are outside the limit. Direct and batched reads return `nextStart` rather
 than creating duplicate overflow artifacts, and batched reads do not share an aggregate inline
 budget. When another non-Bash tool completes with a larger materialized result, Mini Lilac stores
 the complete sanitized result under the transient, session-scoped `tool-result://` artifact
-referenced by the replacement tool error. Use `read_file` with that URI and its returned `nextStart`
-to page the result instead of rerunning the original tool. Bash keeps a bounded head-and-tail
+referenced by the replacement tool error. Use `read` with that URI and its returned `nextStart`
+to page the result, or use `grep` with the URI as `path` to search it without creating another
+artifact. Bash keeps a bounded head-and-tail
 preview and includes the artifact URI in its structured truncation metadata. Encrypted artifact
 files live under `$XDG_STATE_HOME/mini-lilac/tool-results`, are invalidated when the server restarts,
 and never include results omitted by native query limits such as `maxResults` or `maxCharacters`.
@@ -193,10 +163,10 @@ the first prompt's text, filename, or attachment type. Automatic and manual cont
 `agent.compaction.earlyCompactionPoint` (default `0.8`, range `0.05`-`0.95`).
 
 Each root and subagent run preloads workspace `AGENTS.md` files from its cwd upward through the Git
-root. Local `read_file` calls also load previously unseen `AGENTS.md` files between the target and
+root. Local `read` calls also load previously unseen `AGENTS.md` files between the target and
 the read cwd, so nested package rules enter context when the agent first reads inside that package.
 Instruction blocks identify their absolute source path and are not re-added after appearing in the
-system prompt or an earlier `read_file` result.
+system prompt or an earlier `read` result.
 
 Provider model metadata can override discovered models.dev or `/v1/models` values under
 `providers.<provider>.models.<model>`. Configured fields win while omitted fields keep their
@@ -243,6 +213,7 @@ To preserve destination pinning, `webfetch` refuses to run when inherited `HTTP_
 - `POST /api/mini-lilac/sessions/:sessionId/undo`
 - `POST /api/mini-lilac/sessions/:sessionId/redo`
 - `POST /api/mini-lilac/sessions/:sessionId/compact`
+- `POST /api/mini-lilac/sessions/:sessionId/compact/cancel`
 - `GET /api/mini-lilac/models`
 - `POST /api/mini-lilac/models/refresh`
 - `GET /api/mini-lilac/profiles`

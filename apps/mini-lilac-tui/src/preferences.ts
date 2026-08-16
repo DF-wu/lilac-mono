@@ -1,9 +1,12 @@
-import { mkdir, rename } from "node:fs/promises";
+import { mkdir, rename, rm } from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
 
 import { miniLilacReasoningSchema } from "@stanley2058/mini-lilac-client";
+import { Result, TaggedError, type Result as ResultType } from "better-result";
 import { z } from "zod";
+
+import { captureTuiOperationAsync } from "./failure-adapter";
 
 const bindingPreferenceSchema = z.object({
   model: z.string().min(1).optional(),
@@ -15,10 +18,66 @@ const bindingPreferencesSchema = z.object({
   version: z.literal(1),
   servers: z.record(z.string(), bindingPreferenceSchema),
 });
+const legacyBindingPreferencesSchema = bindingPreferencesSchema.omit({ version: true });
 
-export type BindingPreference = z.infer<typeof bindingPreferenceSchema>;
+const preferenceVersionSchema = z.object({ version: z.number().int() });
 
-export type BindingPreferences = z.infer<typeof bindingPreferencesSchema>;
+export type BindingPreference = z.output<typeof bindingPreferenceSchema>;
+export type BindingPreferences = z.output<typeof bindingPreferencesSchema>;
+
+export interface BindingPreferencesRead {
+  readonly preferences: BindingPreferences;
+  readonly provenance: "current" | "migrated" | "missing-defaulted";
+}
+
+export interface DecodedBindingPreferences {
+  readonly value: BindingPreferences;
+  readonly provenance: "current" | "migrated" | "missing-defaulted";
+}
+
+export class BindingPreferencesMalformed extends TaggedError("BindingPreferencesMalformed")<{
+  readonly filePath: string;
+  readonly message: string;
+}> {}
+
+export class BindingPreferencesUnsupportedVersion extends TaggedError(
+  "BindingPreferencesUnsupportedVersion",
+)<{
+  readonly filePath: string;
+  readonly version: number;
+  readonly message: string;
+}> {}
+
+export class BindingPreferencesCorrupt extends TaggedError("BindingPreferencesCorrupt")<{
+  readonly filePath: string;
+  readonly message: string;
+}> {}
+
+export class BindingPreferencesIoFailed extends TaggedError("BindingPreferencesIoFailed")<{
+  readonly operation: "inspect" | "read" | "mkdir" | "write" | "rename" | "cleanup";
+  readonly filePath: string;
+  readonly cause: unknown;
+  readonly message: string;
+}> {}
+
+export class BindingPreferencesWriteAndCleanupFailed extends TaggedError(
+  "BindingPreferencesWriteAndCleanupFailed",
+)<{
+  readonly write: BindingPreferencesIoFailed;
+  readonly cleanup: BindingPreferencesIoFailed;
+  readonly message: string;
+}> {}
+
+export type BindingPreferencesLoadError =
+  | BindingPreferencesMalformed
+  | BindingPreferencesUnsupportedVersion
+  | BindingPreferencesCorrupt
+  | BindingPreferencesIoFailed;
+
+export type BindingPreferencesDecodeError =
+  | BindingPreferencesMalformed
+  | BindingPreferencesUnsupportedVersion
+  | BindingPreferencesCorrupt;
 
 export function bindingPreferenceServerKey(server: string): string {
   return server.replace(/\/+$/u, "");
@@ -31,19 +90,288 @@ export function bindingPreferencesPath(
   return path.join(stateHome, "mini-lilac", "preferences.json");
 }
 
-export async function loadBindingPreferences(filePath: string): Promise<BindingPreferences> {
-  const file = Bun.file(filePath);
-  if (!(await file.exists())) return { version: 1, servers: {} };
-  return bindingPreferencesSchema.parse(await file.json());
+/** Decode the complete persisted preferences document with explicit version outcomes. */
+export function decodeBindingPreferences(input: {
+  readonly filePath: string;
+  readonly serialized: string | null;
+}): ResultType<DecodedBindingPreferences, BindingPreferencesDecodeError> {
+  if (input.serialized === null) {
+    return Result.ok({
+      value: { version: 1, servers: {} },
+      provenance: "missing-defaulted",
+    });
+  }
+  const { filePath } = input;
+  const serialized = input.serialized;
+  const parsedJson = Result.try({
+    try: () => JSON.parse(serialized),
+    catch: () =>
+      new BindingPreferencesMalformed({
+        filePath,
+        message: "Preferences are not valid JSON",
+      }),
+  });
+  const json: unknown = parsedJson.match<unknown>({
+    ok: (value) => value,
+    err: (error) => error,
+  });
+  if (BindingPreferencesMalformed.is(json)) return Result.err(json);
+  const version = preferenceVersionSchema.safeParse(json);
+  if (!version.success) {
+    const legacy = legacyBindingPreferencesSchema.safeParse(json);
+    if (legacy.success) {
+      return Result.ok({
+        value: { version: 1, ...legacy.data },
+        provenance: "migrated",
+      });
+    }
+    return Result.err(
+      new BindingPreferencesCorrupt({ filePath, message: "Preferences version is missing" }),
+    );
+  }
+  if (version.data.version !== 1) {
+    return Result.err(
+      new BindingPreferencesUnsupportedVersion({
+        filePath,
+        version: version.data.version,
+        message: `Unsupported preferences version ${version.data.version}`,
+      }),
+    );
+  }
+  const decoded = bindingPreferencesSchema.safeParse(json);
+  if (!decoded.success) {
+    return Result.err(
+      new BindingPreferencesCorrupt({ filePath, message: "Preferences fields are invalid" }),
+    );
+  }
+  return Result.ok({ value: decoded.data, provenance: "current" });
+}
+
+const PREFERENCES_FIXTURE_PATH = "/fixture/preferences.json";
+const PREFERENCES_FIXTURE_VALUE = {
+  version: 1,
+  servers: { local: { model: "provider/model", reasoning: "high" } },
+} as const;
+
+export const bindingPreferencesCodecCases = {
+  current: {
+    input: {
+      filePath: PREFERENCES_FIXTURE_PATH,
+      serialized: JSON.stringify(PREFERENCES_FIXTURE_VALUE),
+    },
+    outcome: "ok",
+    provenance: "current",
+  },
+  legacy: {
+    input: {
+      filePath: PREFERENCES_FIXTURE_PATH,
+      serialized: JSON.stringify({ servers: {} }),
+    },
+    outcome: "ok",
+    provenance: "migrated",
+  },
+  "missing-defaulted": {
+    input: { filePath: PREFERENCES_FIXTURE_PATH, serialized: null },
+    outcome: "ok",
+    provenance: "missing-defaulted",
+  },
+  "unsupported-version": {
+    input: {
+      filePath: PREFERENCES_FIXTURE_PATH,
+      serialized: JSON.stringify({ version: 2, servers: {} }),
+    },
+    outcome: "error",
+  },
+  "malformed-serialization": {
+    input: { filePath: PREFERENCES_FIXTURE_PATH, serialized: "{" },
+    outcome: "error",
+  },
+  "corrupt-fields": {
+    input: {
+      filePath: PREFERENCES_FIXTURE_PATH,
+      serialized: JSON.stringify({ version: 1, servers: { local: { reasoning: "extreme" } } }),
+    },
+    outcome: "error",
+  },
+} as const;
+
+async function bindingPreferencesFileExists(
+  filePath: string,
+): Promise<ResultType<boolean, BindingPreferencesIoFailed>> {
+  return captureTuiOperationAsync(
+    () => Bun.file(filePath).exists(),
+    (cause) =>
+      new BindingPreferencesIoFailed({
+        operation: "inspect",
+        filePath,
+        cause,
+        message: "Could not inspect TUI preferences",
+      }),
+  );
+}
+
+async function readBindingPreferencesFile(
+  filePath: string,
+): Promise<ResultType<string, BindingPreferencesIoFailed>> {
+  return captureTuiOperationAsync(
+    () => Bun.file(filePath).text(),
+    (cause) =>
+      new BindingPreferencesIoFailed({
+        operation: "read",
+        filePath,
+        cause,
+        message: "Could not read TUI preferences",
+      }),
+  );
+}
+
+async function createBindingPreferencesDirectory(
+  filePath: string,
+): Promise<ResultType<void, BindingPreferencesIoFailed>> {
+  return captureTuiOperationAsync(
+    async () => {
+      await mkdir(path.dirname(filePath), { recursive: true });
+    },
+    (cause) =>
+      new BindingPreferencesIoFailed({
+        operation: "mkdir",
+        filePath,
+        cause,
+        message: "Could not create the TUI preferences directory",
+      }),
+  );
+}
+
+async function writeBindingPreferencesFile(
+  filePath: string,
+  text: string,
+): Promise<ResultType<void, BindingPreferencesIoFailed>> {
+  return captureTuiOperationAsync(
+    async () => {
+      await Bun.write(filePath, text);
+    },
+    (cause) =>
+      new BindingPreferencesIoFailed({
+        operation: "write",
+        filePath,
+        cause,
+        message: "Could not write temporary TUI preferences",
+      }),
+  );
+}
+
+async function renameBindingPreferencesFile(
+  temporaryPath: string,
+  filePath: string,
+): Promise<ResultType<void, BindingPreferencesIoFailed>> {
+  return captureTuiOperationAsync(
+    async () => {
+      await rename(temporaryPath, filePath);
+    },
+    (cause) =>
+      new BindingPreferencesIoFailed({
+        operation: "rename",
+        filePath,
+        cause,
+        message: "Could not replace TUI preferences",
+      }),
+  );
+}
+
+async function removeTemporaryBindingPreferences(
+  filePath: string,
+): Promise<ResultType<void, BindingPreferencesIoFailed>> {
+  return captureTuiOperationAsync(
+    async () => {
+      await rm(filePath, { force: true });
+    },
+    (cause) =>
+      new BindingPreferencesIoFailed({
+        operation: "cleanup",
+        filePath,
+        cause,
+        message: "Could not clean up temporary TUI preferences",
+      }),
+  );
+}
+
+export async function loadBindingPreferences(
+  filePath: string,
+): Promise<ResultType<BindingPreferencesRead, BindingPreferencesLoadError>> {
+  const exists = await bindingPreferencesFileExists(filePath);
+  const existsValue = exists.match<boolean | BindingPreferencesIoFailed>({
+    ok: (value) => value,
+    err: (error) => error,
+  });
+  if (BindingPreferencesIoFailed.is(existsValue)) return Result.err(existsValue);
+  let text: string | undefined;
+  if (existsValue) {
+    const read = await readBindingPreferencesFile(filePath);
+    const readValue = read.match<string | BindingPreferencesIoFailed>({
+      ok: (value) => value,
+      err: (error) => error,
+    });
+    if (BindingPreferencesIoFailed.is(readValue)) return Result.err(readValue);
+    text = readValue;
+  }
+  const decoded = decodeBindingPreferences({ filePath, serialized: text ?? null });
+  const decodedValue = decoded.match<DecodedBindingPreferences | BindingPreferencesDecodeError>({
+    ok: (value) => value,
+    err: (error) => error,
+  });
+  if (
+    BindingPreferencesMalformed.is(decodedValue) ||
+    BindingPreferencesUnsupportedVersion.is(decodedValue) ||
+    BindingPreferencesCorrupt.is(decodedValue)
+  ) {
+    return Result.err(decodedValue);
+  }
+  return Result.ok({
+    preferences: decodedValue.value,
+    provenance: decodedValue.provenance,
+  });
 }
 
 export async function saveBindingPreferences(
   filePath: string,
   preferences: BindingPreferences,
-): Promise<void> {
-  const parsed = bindingPreferencesSchema.parse(preferences);
-  await mkdir(path.dirname(filePath), { recursive: true });
+): Promise<ResultType<void, BindingPreferencesIoFailed | BindingPreferencesWriteAndCleanupFailed>> {
   const temporaryPath = `${filePath}.${process.pid}.${crypto.randomUUID()}.tmp`;
-  await Bun.write(temporaryPath, `${JSON.stringify(parsed, null, 2)}\n`);
-  await rename(temporaryPath, filePath);
+  const directory = await createBindingPreferencesDirectory(filePath);
+  const directoryFailure = directory.match<BindingPreferencesIoFailed | undefined>({
+    ok: () => undefined,
+    err: (error) => error,
+  });
+  if (directoryFailure !== undefined) return Result.err(directoryFailure);
+  const written = await writeBindingPreferencesFile(
+    temporaryPath,
+    `${JSON.stringify(preferences, null, 2)}\n`,
+  );
+  let writeFailure = written.match<BindingPreferencesIoFailed | undefined>({
+    ok: () => undefined,
+    err: (error) => error,
+  });
+  if (writeFailure === undefined) {
+    const renamed = await renameBindingPreferencesFile(temporaryPath, filePath);
+    writeFailure = renamed.match<BindingPreferencesIoFailed | undefined>({
+      ok: () => undefined,
+      err: (error) => error,
+    });
+  }
+  if (writeFailure === undefined) return Result.ok(undefined);
+  const cleaned = await removeTemporaryBindingPreferences(temporaryPath);
+  const cleanupFailure = cleaned.match<BindingPreferencesIoFailed | undefined>({
+    ok: () => undefined,
+    err: (error) => error,
+  });
+  if (cleanupFailure !== undefined) {
+    return Result.err(
+      new BindingPreferencesWriteAndCleanupFailed({
+        write: writeFailure,
+        cleanup: cleanupFailure,
+        message: `${writeFailure.message}; ${cleanupFailure.message}`,
+      }),
+    );
+  }
+  return Result.err(writeFailure);
 }

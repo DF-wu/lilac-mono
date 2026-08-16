@@ -4,9 +4,31 @@ import os from "node:os";
 import path from "node:path";
 
 import { canonicalJsonSha256 } from "../../src/workflow/workflow-definition";
-import { resolveWorkflowAgentOperationInput } from "../../src/workflow/workflow-operation-policy";
+import { resolveWorkflowAgentOperationInputResult } from "../../src/workflow/workflow-operation-policy";
+
+async function resolveWorkflowAgentOperationInput(
+  input: Parameters<typeof resolveWorkflowAgentOperationInputResult>[0],
+) {
+  const result = resolveWorkflowAgentOperationInputResult(input);
+  if (result.status === "error") throw result.error;
+  return result.value;
+}
 
 describe("workflow profile-native operation policy", () => {
+  it("decodes sandbox operation input to a typed Result", () => {
+    const invalid = resolveWorkflowAgentOperationInputResult({
+      value: { prompt: "Inspect", options: {} },
+      canonicalWorkspaceRoot: "/workspace",
+    });
+    expect(invalid.status).toBe("error");
+    if (invalid.status === "error") {
+      expect(invalid.error).toMatchObject({
+        _tag: "WorkflowAgentOperationInputInvalid",
+        message: expect.stringContaining("profile"),
+      });
+    }
+  });
+
   it("persists only profile-native options with a normalized cwd", async () => {
     const project = await fs.mkdtemp(path.join(os.tmpdir(), "workflow-operation-policy-"));
     try {

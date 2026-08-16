@@ -5,10 +5,9 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import type { ConversationThreadService } from "../../src/conversation/thread-service";
+import type { ConversationThreadToolService } from "../../src/conversation/thread-service";
 import type { DiscoveryService } from "../../src/discovery/discovery-service";
 import { createCoreToolPluginManager } from "../../src/plugins";
-import type { SurfaceAdapter } from "../../src/surface/adapter";
 
 const MISSING_BASE_URL_ERROR =
   "Image generation provider 'openai-compatible' requires OPENAI_COMPATIBLE_BASE_URL.";
@@ -41,9 +40,8 @@ describe("generate plugin registration", () => {
     const manager = createCoreToolPluginManager({
       runtime: {
         bus: {} as LilacBus,
-        adapter: {} as SurfaceAdapter,
         discovery: {} as DiscoveryService,
-        conversationThreads: {} as ConversationThreadService,
+        conversationThreads: {} as ConversationThreadToolService,
         config,
       },
       dataDir,
@@ -109,9 +107,8 @@ describe("generate plugin registration", () => {
     const manager = createCoreToolPluginManager({
       runtime: {
         bus: {} as LilacBus,
-        adapter: {} as SurfaceAdapter,
         discovery: {} as DiscoveryService,
-        conversationThreads: {} as ConversationThreadService,
+        conversationThreads: {} as ConversationThreadToolService,
       },
       dataDir,
     });

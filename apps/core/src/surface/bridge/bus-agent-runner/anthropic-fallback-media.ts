@@ -1,5 +1,5 @@
 import { createDownload, type Experimental_DownloadFunction as DownloadFunction } from "ai";
-import type { JSONObject } from "@stanley2058/lilac-utils";
+import { opaqueErrorMessage, type JSONObject } from "@stanley2058/lilac-utils";
 
 import fs from "node:fs/promises";
 import path from "node:path";
@@ -171,7 +171,7 @@ async function runCommand(params: { cmd: string[] }): Promise<{ code: number; st
     const code = await proc.exited;
     return { code, stderr };
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
+    const message = opaqueErrorMessage(error, "Unknown media conversion failure");
     return { code: -1, stderr: message };
   }
 }

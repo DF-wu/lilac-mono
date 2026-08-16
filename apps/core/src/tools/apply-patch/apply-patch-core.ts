@@ -2,12 +2,31 @@ import { mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
 import {
-  parsePatch,
+  parsePatchResult as parseCodingPatchResult,
   type PatchHunk,
+  type PatchRejected,
   type UpdateFileChunk,
 } from "@stanley2058/lilac-coding-tools/apply-patch";
+import { canonicalizePathAsFarAsExists } from "@stanley2058/lilac-fs";
+import { opaqueErrorMessage } from "@stanley2058/lilac-utils";
+import { Result, TaggedError, type Result as ResultType } from "better-result";
 
-export { parsePatch };
+import { opaqueErrorCause } from "../../ssh/remote-js/remote-runner-utils";
+import { adaptToolResultToHost, preserveToolPanic } from "../tool-result-adapters";
+
+export type { PatchHunk };
+
+export function parsePatchResult(patchText: string): ResultType<PatchHunk[], PatchRejected> {
+  return parseCodingPatchResult(patchText);
+}
+
+function selectResultValue<T, E extends Error>(result: ResultType<T, E>): T {
+  const select = result.match<() => T>({
+    ok: (value) => () => value,
+    err: (error) => () => adaptToolResultToHost(Result.err(error)),
+  });
+  return select();
+}
 
 function expandTilde(inputPath: string): string {
   if (inputPath === "~") return homedir();
@@ -40,6 +59,78 @@ function normalizeUnicode(str: string): string {
 }
 
 type Comparator = (a: string, b: string) => boolean;
+
+export class ApplyPatchOperationError extends TaggedError("ApplyPatchOperationError")<{
+  readonly operation: string;
+  readonly cause: unknown;
+  readonly message: string;
+}> {}
+
+export class ApplyPatchCancelled extends TaggedError("ApplyPatchCancelled")<{
+  readonly cause: unknown;
+  readonly message: string;
+}> {}
+
+export class ApplyPatchContentMismatch extends TaggedError("ApplyPatchContentMismatch")<{
+  readonly filePath: string;
+  readonly message: string;
+}> {}
+
+export class ApplyPatchAccessDenied extends TaggedError("ApplyPatchAccessDenied")<{
+  readonly resolvedPath: string;
+  readonly operation: string;
+  readonly message: string;
+}> {}
+
+export class ApplyPatchDirectoryDeleteDenied extends TaggedError(
+  "ApplyPatchDirectoryDeleteDenied",
+)<{
+  readonly filePath: string;
+  readonly message: string;
+}> {}
+
+export type ApplyPatchError =
+  | ApplyPatchOperationError
+  | ApplyPatchCancelled
+  | ApplyPatchContentMismatch
+  | ApplyPatchAccessDenied
+  | ApplyPatchDirectoryDeleteDenied;
+
+async function captureApplyPatchOperation<T>(params: {
+  readonly operation: string;
+  readonly signal?: AbortSignal;
+  readonly run: () => Promise<T>;
+}): Promise<ResultType<T, ApplyPatchOperationError | ApplyPatchCancelled>> {
+  const captured = await Result.tryPromise({
+    try: params.run,
+    catch: opaqueErrorCause(`Opaque apply_patch ${params.operation} failure`),
+  });
+  return captured.match<() => ResultType<T, ApplyPatchOperationError | ApplyPatchCancelled>>({
+    ok: (value) => () => Result.ok(value),
+    err: (error) => () => {
+      const cause = preserveToolPanic(error);
+      if (params.signal?.aborted) {
+        return Result.err(new ApplyPatchCancelled({ cause, message: "patch was cancelled" }));
+      }
+      return Result.err(
+        new ApplyPatchOperationError({
+          operation: params.operation,
+          cause,
+          message: opaqueErrorMessage(cause, `patch failed while ${params.operation}`),
+        }),
+      );
+    },
+  })();
+}
+
+function checkApplyPatchCancellation(
+  signal: AbortSignal | undefined,
+): ResultType<void, ApplyPatchCancelled> {
+  if (!signal?.aborted) return Result.ok();
+  return Result.err(
+    new ApplyPatchCancelled({ cause: signal.reason, message: "patch was cancelled" }),
+  );
+}
 
 function tryMatch(
   lines: string[],
@@ -101,7 +192,7 @@ function computeReplacements(
   originalLines: string[],
   filePath: string,
   chunks: UpdateFileChunk[],
-): Array<[number, number, string[]]> {
+): ResultType<Array<[number, number, string[]]>, ApplyPatchContentMismatch> {
   const replacements: Array<[number, number, string[]]> = [];
   let lineIndex = 0;
 
@@ -109,7 +200,12 @@ function computeReplacements(
     if (chunk.changeContext) {
       const contextIdx = seekSequence(originalLines, [chunk.changeContext], lineIndex);
       if (contextIdx === -1) {
-        throw new Error(`Failed to find context '${chunk.changeContext}' in ${filePath}`);
+        return Result.err(
+          new ApplyPatchContentMismatch({
+            filePath,
+            message: `Failed to find context '${chunk.changeContext}' in ${filePath}`,
+          }),
+        );
       }
       lineIndex = contextIdx + 1;
     }
@@ -136,8 +232,11 @@ function computeReplacements(
     }
 
     if (found === -1) {
-      throw new Error(
-        `Failed to find expected lines in ${filePath}:\n${chunk.oldLines.join("\n")}`,
+      return Result.err(
+        new ApplyPatchContentMismatch({
+          filePath,
+          message: `Failed to find expected lines in ${filePath}:\n${chunk.oldLines.join("\n")}`,
+        }),
       );
     }
 
@@ -146,7 +245,7 @@ function computeReplacements(
   }
 
   replacements.sort((a, b) => a[0] - b[0]);
-  return replacements;
+  return Result.ok(replacements);
 }
 
 function applyReplacements(
@@ -168,100 +267,253 @@ async function applyUpdateHunk(params: {
   resolvedPath: string;
   moveToResolvedPath?: string;
   chunks: UpdateFileChunk[];
-}): Promise<{ modifiedPath: string }> {
-  const { resolvedPath, moveToResolvedPath, chunks } = params;
-
-  const originalContent = await readFile(resolvedPath, "utf-8");
+  signal?: AbortSignal;
+}): Promise<ResultType<{ modifiedPath: string }, ApplyPatchError>> {
+  const { resolvedPath, moveToResolvedPath, chunks, signal } = params;
+  const initialCancellation = checkApplyPatchCancellation(signal);
+  const initialCancellationError = initialCancellation.match({
+    ok: () => null,
+    err: (error) => error,
+  });
+  if (initialCancellationError) return Result.err(initialCancellationError);
+  const originalContentResult = await captureApplyPatchOperation({
+    operation: `reading ${resolvedPath}`,
+    signal,
+    run: () => readFile(resolvedPath, { encoding: "utf-8", signal }),
+  });
+  const readError = originalContentResult.match({ ok: () => null, err: (error) => error });
+  if (readError) return Result.err(readError);
+  const originalContent = selectResultValue(originalContentResult);
   let originalLines = originalContent.split("\n");
   if (originalLines.length > 0 && originalLines[originalLines.length - 1] === "") {
     originalLines.pop();
   }
-
-  const replacements = computeReplacements(originalLines, resolvedPath, chunks);
-  let newLines = applyReplacements(originalLines, replacements);
-  if (newLines.length === 0 || newLines[newLines.length - 1] !== "") {
-    newLines.push("");
-  }
+  const replacementsResult = computeReplacements(originalLines, resolvedPath, chunks);
+  const replacementsError = replacementsResult.match({ ok: () => null, err: (error) => error });
+  if (replacementsError) return Result.err(replacementsError);
+  const newLines = applyReplacements(originalLines, selectResultValue(replacementsResult));
+  if (newLines.length === 0 || newLines[newLines.length - 1] !== "") newLines.push("");
   const newContent = newLines.join("\n");
-
   const target = moveToResolvedPath ?? resolvedPath;
-  await mkdir(path.dirname(target), { recursive: true });
-  await writeFile(target, newContent, "utf-8");
-
+  const directoryCancellation = checkApplyPatchCancellation(signal);
+  const directoryCancellationError = directoryCancellation.match({
+    ok: () => null,
+    err: (error) => error,
+  });
+  if (directoryCancellationError) return Result.err(directoryCancellationError);
+  const directoryCreated = await captureApplyPatchOperation({
+    operation: `creating the parent directory for ${target}`,
+    signal,
+    run: () => mkdir(path.dirname(target), { recursive: true }).then(() => undefined),
+  });
+  const directoryError = directoryCreated.match({ ok: () => null, err: (error) => error });
+  if (directoryError) return Result.err(directoryError);
+  const writeCancellation = checkApplyPatchCancellation(signal);
+  const writeCancellationError = writeCancellation.match({
+    ok: () => null,
+    err: (error) => error,
+  });
+  if (writeCancellationError) return Result.err(writeCancellationError);
+  const written = await captureApplyPatchOperation({
+    operation: `writing ${target}`,
+    signal,
+    run: () => writeFile(target, newContent, { encoding: "utf-8", signal }),
+  });
+  const writeError = written.match({ ok: () => null, err: (error) => error });
+  if (writeError) return Result.err(writeError);
   if (moveToResolvedPath && moveToResolvedPath !== resolvedPath) {
-    await rm(resolvedPath, { force: true });
+    const removeCancellation = checkApplyPatchCancellation(signal);
+    const removeCancellationError = removeCancellation.match({
+      ok: () => null,
+      err: (error) => error,
+    });
+    if (removeCancellationError) return Result.err(removeCancellationError);
+    const removed = await captureApplyPatchOperation({
+      operation: `removing moved source ${resolvedPath}`,
+      signal,
+      run: () => rm(resolvedPath, { force: true }),
+    });
+    const removeError = removed.match({ ok: () => null, err: (error) => error });
+    if (removeError) return Result.err(removeError);
   }
-
-  return { modifiedPath: target };
+  return Result.ok({ modifiedPath: target });
 }
 
 function isDeniedPath(resolvedPath: string, denyAbs: readonly string[]): boolean {
   const normalized = path.resolve(resolvedPath);
   for (const deny of denyAbs) {
-    if (normalized === deny) return true;
-    if (normalized.startsWith(`${deny}${path.sep}`)) return true;
+    const relative = path.relative(deny, normalized);
+    if (
+      relative === "" ||
+      (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative))
+    ) {
+      return true;
+    }
   }
   return false;
 }
 
-function assertAllowed(resolvedPath: string, denyAbs: readonly string[], operation: string): void {
-  if (denyAbs.length === 0) return;
-  if (!isDeniedPath(resolvedPath, denyAbs)) return;
-  throw new Error(`Access denied: '${resolvedPath}' is blocked for ${operation}`);
+async function canonicalizeApplyPatchPath(
+  resolvedPath: string,
+): Promise<ResultType<string, ApplyPatchOperationError>> {
+  const canonical = await canonicalizePathAsFarAsExists(resolvedPath);
+  return canonical.mapError(
+    (error) =>
+      new ApplyPatchOperationError({
+        operation: `canonicalizing ${resolvedPath}`,
+        cause: error,
+        message: error.message,
+      }),
+  );
+}
+
+async function assertAllowed(
+  resolvedPath: string,
+  denyAbs: readonly string[],
+  operation: string,
+): Promise<ResultType<void, ApplyPatchAccessDenied | ApplyPatchOperationError>> {
+  if (denyAbs.length === 0) return Result.ok();
+  if (!isDeniedPath(resolvedPath, denyAbs)) {
+    const canonicalPath = await canonicalizeApplyPatchPath(resolvedPath);
+    const allowed = canonicalPath.map((value) => !isDeniedPath(value, denyAbs));
+    const allowedValue = allowed.match({ ok: (value) => value, err: () => null });
+    if (allowedValue === null) return canonicalPath.map(() => undefined);
+    if (allowedValue) return Result.ok();
+  }
+  return Result.err(
+    new ApplyPatchAccessDenied({
+      resolvedPath,
+      operation,
+      message: `Access denied: '${resolvedPath}' is blocked for ${operation}`,
+    }),
+  );
+}
+
+export async function applyHunksResult(
+  baseDir: string,
+  hunks: PatchHunk[],
+  options?: { denyPaths?: readonly string[]; signal?: AbortSignal },
+): Promise<ResultType<string, ApplyPatchError>> {
+  const initialCancellation = checkApplyPatchCancellation(options?.signal);
+  const initialCancellationError = initialCancellation.match({
+    ok: () => null,
+    err: (error) => error,
+  });
+  if (initialCancellationError) return Result.err(initialCancellationError);
+  const baseResolved = path.resolve(expandTilde(baseDir));
+  const denyAbs: string[] = [];
+  for (const deniedPath of options?.denyPaths ?? []) {
+    const resolvedPath = path.resolve(expandTilde(deniedPath));
+    const canonical = await canonicalizeApplyPatchPath(resolvedPath);
+    const canonicalError = canonical.match({ ok: () => null, err: (error) => error });
+    if (canonicalError) return Result.err(canonicalError);
+    const canonicalPath = selectResultValue(canonical);
+    denyAbs.push(resolvedPath);
+    if (canonicalPath !== resolvedPath) denyAbs.push(canonicalPath);
+  }
+  const touched: string[] = [];
+
+  for (const hunk of hunks) {
+    const cancellation = checkApplyPatchCancellation(options?.signal);
+    const cancellationError = cancellation.match({ ok: () => null, err: (error) => error });
+    if (cancellationError) return Result.err(cancellationError);
+    switch (hunk.type) {
+      case "add": {
+        const dst = resolvePath(baseResolved, hunk.path);
+        const allowed = await assertAllowed(dst, denyAbs, "patch");
+        const allowError = allowed.match({ ok: () => null, err: (error) => error });
+        if (allowError) return Result.err(allowError);
+        const directoryCreated = await captureApplyPatchOperation({
+          operation: `creating the parent directory for ${dst}`,
+          signal: options?.signal,
+          run: () => mkdir(path.dirname(dst), { recursive: true }).then(() => undefined),
+        });
+        const directoryError = directoryCreated.match({ ok: () => null, err: (error) => error });
+        if (directoryError) return Result.err(directoryError);
+        const written = await captureApplyPatchOperation({
+          operation: `writing ${dst}`,
+          signal: options?.signal,
+          run: () => writeFile(dst, hunk.contents, { encoding: "utf-8", signal: options?.signal }),
+        });
+        const writeError = written.match({ ok: () => null, err: (error) => error });
+        if (writeError) return Result.err(writeError);
+        touched.push(`A ${toDisplayPath(dst, baseResolved)}`);
+        break;
+      }
+      case "delete": {
+        const target = resolvePath(baseResolved, hunk.path);
+        const allowed = await assertAllowed(target, denyAbs, "patch");
+        const allowError = allowed.match({ ok: () => null, err: (error) => error });
+        if (allowError) return Result.err(allowError);
+        const inspected = await captureApplyPatchOperation({
+          operation: `inspecting ${target}`,
+          signal: options?.signal,
+          run: () => stat(target),
+        });
+        const inspectResult = inspected.match<ResultType<void, ApplyPatchError>>({
+          ok: (value) =>
+            value.isDirectory()
+              ? Result.err(
+                  new ApplyPatchDirectoryDeleteDenied({
+                    filePath: hunk.path,
+                    message: `Refusing to delete directory: ${hunk.path}`,
+                  }),
+                )
+              : Result.ok(undefined),
+          err: (error) =>
+            ApplyPatchCancelled.is(error) ? Result.err(error) : Result.ok(undefined),
+        });
+        const inspectError = inspectResult.match({ ok: () => null, err: (error) => error });
+        if (inspectError) return Result.err(inspectError);
+        const removed = await captureApplyPatchOperation({
+          operation: `removing ${target}`,
+          signal: options?.signal,
+          run: () => rm(target, { force: true }),
+        });
+        const removeError = removed.match({ ok: () => null, err: (error) => error });
+        if (removeError) return Result.err(removeError);
+        touched.push(`D ${toDisplayPath(target, baseResolved)}`);
+        break;
+      }
+      case "update": {
+        const src = resolvePath(baseResolved, hunk.path);
+        const moveTo = hunk.movePath ? resolvePath(baseResolved, hunk.movePath) : undefined;
+        const sourceAllowed = await assertAllowed(src, denyAbs, "patch");
+        const sourceAllowError = sourceAllowed.match({ ok: () => null, err: (error) => error });
+        if (sourceAllowError) return Result.err(sourceAllowError);
+        if (moveTo) {
+          const destinationAllowed = await assertAllowed(moveTo, denyAbs, "patch");
+          const destinationAllowError = destinationAllowed.match({
+            ok: () => null,
+            err: (error) => error,
+          });
+          if (destinationAllowError) return Result.err(destinationAllowError);
+        }
+        const updated = await applyUpdateHunk({
+          resolvedPath: src,
+          moveToResolvedPath: moveTo,
+          chunks: hunk.chunks,
+          signal: options?.signal,
+        });
+        const updateError = updated.match({ ok: () => null, err: (error) => error });
+        if (updateError) return Result.err(updateError);
+        touched.push(`M ${toDisplayPath(selectResultValue(updated).modifiedPath, baseResolved)}`);
+        break;
+      }
+    }
+  }
+
+  return Result.ok(
+    touched.length > 0
+      ? `Success. Updated the following files:\n${touched.join("\n")}`
+      : "No files were modified.",
+  );
 }
 
 export async function applyHunks(
   baseDir: string,
   hunks: PatchHunk[],
-  options?: { denyPaths?: readonly string[] },
+  options?: { denyPaths?: readonly string[]; signal?: AbortSignal },
 ): Promise<string> {
-  const baseResolved = path.resolve(expandTilde(baseDir));
-  const denyAbs = (options?.denyPaths ?? []).map((p) => path.resolve(expandTilde(p)));
-  const touched: string[] = [];
-
-  for (const hunk of hunks) {
-    if (hunk.type === "add") {
-      const dst = resolvePath(baseResolved, hunk.path);
-      assertAllowed(dst, denyAbs, "apply_patch");
-      await mkdir(path.dirname(dst), { recursive: true });
-      await writeFile(dst, hunk.contents, "utf-8");
-      touched.push(`A ${toDisplayPath(dst, baseResolved)}`);
-      continue;
-    }
-
-    if (hunk.type === "delete") {
-      const target = resolvePath(baseResolved, hunk.path);
-      assertAllowed(target, denyAbs, "apply_patch");
-      const s = await stat(target).catch(() => null);
-      if (s?.isDirectory()) {
-        throw new Error(`Refusing to delete directory: ${hunk.path}`);
-      }
-      await rm(target, { force: true });
-      touched.push(`D ${toDisplayPath(target, baseResolved)}`);
-      continue;
-    }
-
-    if (hunk.type === "update") {
-      const src = resolvePath(baseResolved, hunk.path);
-      const moveTo = hunk.movePath ? resolvePath(baseResolved, hunk.movePath) : undefined;
-      assertAllowed(src, denyAbs, "apply_patch");
-      if (moveTo) {
-        assertAllowed(moveTo, denyAbs, "apply_patch");
-      }
-      const { modifiedPath } = await applyUpdateHunk({
-        resolvedPath: src,
-        moveToResolvedPath: moveTo,
-        chunks: hunk.chunks,
-      });
-      touched.push(`M ${toDisplayPath(modifiedPath, baseResolved)}`);
-      continue;
-    }
-
-    const _exhaustive: never = hunk;
-    throw new Error(`Unhandled hunk type: ${String(_exhaustive)}`);
-  }
-
-  return touched.length > 0
-    ? `Success. Updated the following files:\n${touched.join("\n")}`
-    : "No files were modified.";
+  return adaptToolResultToHost(await applyHunksResult(baseDir, hunks, options));
 }

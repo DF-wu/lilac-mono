@@ -1,5 +1,13 @@
+import {
+  getLevel1ContributionSnapshot,
+  invokeLevel1SummarizeFailure,
+  type Level1ContributionInfo,
+  type Level1ToolFailureSummary,
+  type Level1ToolSpec,
+} from "@stanley2058/lilac-plugin-runtime";
+import { isRecord } from "@stanley2058/lilac-utils";
+
 import { redactSecrets } from "../../../tools/bash-safety/format";
-import type { Level1ToolFailureSummary, Level1ToolSpec } from "@stanley2058/lilac-plugin-runtime";
 
 const SENSITIVE_KEYS = new Set([
   "authorization",
@@ -23,10 +31,6 @@ const SENSITIVE_KEYS = new Set([
 const DEFAULT_PREVIEW_MAX_CHARS = 4_000;
 
 export type ToolFailureSummary = Level1ToolFailureSummary;
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
 
 function getStringField(value: unknown, key: string): string | undefined {
   if (!isRecord(value)) return undefined;
@@ -97,7 +101,7 @@ function defaultErrorFromResult(result: unknown): string {
   return oneLine(toSerializablePreview(result, 500));
 }
 
-function summarizeBashFailure(result: unknown): ToolFailureSummary {
+export function summarizeBashFailure(result: unknown): ToolFailureSummary {
   const executionError = isRecord(result) ? result["executionError"] : undefined;
   const exitCode = getNumberField(result, "exitCode");
 
@@ -120,7 +124,7 @@ function summarizeBashFailure(result: unknown): ToolFailureSummary {
   return { ok: true };
 }
 
-function summarizeReadOrEditFailure(result: unknown, toolName: string): ToolFailureSummary {
+export function summarizeReadOrEditFailure(result: unknown, toolName: string): ToolFailureSummary {
   const success = getBooleanField(result, "success");
   if (success === false) {
     const error = isRecord(result) ? result["error"] : undefined;
@@ -134,7 +138,7 @@ function summarizeReadOrEditFailure(result: unknown, toolName: string): ToolFail
   return { ok: true };
 }
 
-function summarizeSearchFailure(result: unknown, toolName: string): ToolFailureSummary {
+export function summarizeSearchFailure(result: unknown, toolName: string): ToolFailureSummary {
   const error = getStringField(result, "error");
   if (error) {
     return {
@@ -146,20 +150,20 @@ function summarizeSearchFailure(result: unknown, toolName: string): ToolFailureS
   return { ok: true };
 }
 
-function summarizeApplyPatchFailure(result: unknown): ToolFailureSummary {
+export function summarizeApplyPatchFailure(result: unknown): ToolFailureSummary {
   const status = getStringField(result, "status");
   if (status === "failed") {
     const output = getStringField(result, "output");
     return {
       ok: false,
       failureKind: "soft",
-      error: output ?? "apply_patch failed",
+      error: output ?? "patch failed",
     };
   }
   return { ok: true };
 }
 
-function summarizeBatchFailure(result: unknown): ToolFailureSummary {
+export function summarizeBatchFailure(result: unknown): ToolFailureSummary {
   const ok = getBooleanField(result, "ok");
   if (ok === false) {
     const failed = getNumberField(result, "failed");
@@ -175,7 +179,7 @@ function summarizeBatchFailure(result: unknown): ToolFailureSummary {
   return { ok: true };
 }
 
-function summarizeSubagentFailure(result: unknown): ToolFailureSummary {
+export function summarizeSubagentFailure(result: unknown): ToolFailureSummary {
   const ok = getBooleanField(result, "ok");
   if (ok === false) {
     const detail = getStringField(result, "detail");
@@ -189,27 +193,14 @@ function summarizeSubagentFailure(result: unknown): ToolFailureSummary {
   return { ok: true };
 }
 
-export const BUILTIN_LEVEL1_TOOL_FAILURE_SUMMARIZERS: Record<
-  string,
-  (result: unknown) => ToolFailureSummary
-> = {
-  bash: summarizeBashFailure,
-  read_file: (result) => summarizeReadOrEditFailure(result, "read_file"),
-  edit_file: (result) => summarizeReadOrEditFailure(result, "edit_file"),
-  glob: (result) => summarizeSearchFailure(result, "glob"),
-  grep: (result) => summarizeSearchFailure(result, "grep"),
-  apply_patch: summarizeApplyPatchFailure,
-  batch: summarizeBatchFailure,
-  subagent_delegate: summarizeSubagentFailure,
-};
-
 export function summarizeToolFailure(params: {
   toolName: string;
   isError: boolean;
   result: unknown;
   toolSpecs?: ReadonlyMap<string, Level1ToolSpec<unknown>>;
+  contributionInfo?: ReadonlyMap<Level1ToolSpec<unknown>, Level1ContributionInfo>;
 }): ToolFailureSummary {
-  const { toolName, isError, result, toolSpecs } = params;
+  const { toolName, isError, result, toolSpecs, contributionInfo } = params;
 
   if (isError) {
     return {
@@ -219,13 +210,26 @@ export function summarizeToolFailure(params: {
     };
   }
 
-  const specSummary = toolSpecs?.get(toolName)?.summarizeFailure;
-  if (specSummary) {
-    return specSummary({ isError: false, result });
+  const spec = toolSpecs?.get(toolName);
+  if (spec) {
+    const contribution = contributionInfo?.get(spec) ??
+      getLevel1ContributionSnapshot(spec) ?? {
+        pluginId: `level1:${toolName}`,
+        source: "builtin",
+      };
+    const summary = invokeLevel1SummarizeFailure({
+      pluginId: contribution.pluginId,
+      source: contribution.source,
+      spec,
+      value: { isError: false, result },
+    });
+    return summary.match<ToolFailureSummary>({
+      ok: (value) => value ?? { ok: true },
+      err: () => ({ ok: true }),
+    });
   }
 
-  const builtin = BUILTIN_LEVEL1_TOOL_FAILURE_SUMMARIZERS[toolName];
-  return builtin ? builtin(result) : { ok: true };
+  return { ok: true };
 }
 
 export function formatToolLogPreview(params: {

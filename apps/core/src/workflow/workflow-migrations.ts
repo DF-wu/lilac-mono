@@ -1,8 +1,10 @@
 import type { Database } from "bun:sqlite";
+import { classifyBunSqliteError, runBunSqliteTransaction } from "@stanley2058/lilac-utils";
+import { Result, TaggedError, type Result as ResultType } from "better-result";
 
 import { WORKFLOW_MANUAL_RECONCILIATION_DETAIL } from "./workflow-domain";
 
-export const WORKFLOW_SCHEMA_VERSION = 23;
+export const WORKFLOW_SCHEMA_VERSION = 25;
 
 type WorkflowMigration = {
   version: number;
@@ -1432,48 +1434,175 @@ const WORKFLOW_MIGRATIONS: readonly WorkflowMigration[] = [
         END`,
     ],
   },
+  {
+    version: 25,
+    name: "durable workflow progress permanent failure gate",
+    statements: [`ALTER TABLE workflow_surface_bindings ADD COLUMN permanent_failure_json TEXT`],
+  },
 ];
 
-export function applyWorkflowSchemaMigrations(db: Database, now: () => number = Date.now): void {
-  db.run(`CREATE TABLE IF NOT EXISTS workflow_schema_migrations (
-    version INTEGER PRIMARY KEY,
-    name TEXT NOT NULL,
-    applied_at INTEGER NOT NULL
-  )`);
+export const WORKFLOW_MIGRATION_VERSIONS: readonly number[] = WORKFLOW_MIGRATIONS.map(
+  (migration) => migration.version,
+);
 
-  const applied = new Map(
-    db
-      .query<{ version: number; name: string }, []>(
-        "SELECT version, name FROM workflow_schema_migrations ORDER BY version",
-      )
-      .all()
-      .map((row) => [row.version, row.name]),
-  );
-  const knownVersions = new Set(WORKFLOW_MIGRATIONS.map((migration) => migration.version));
-  for (const version of applied.keys()) {
-    if (!knownVersions.has(version)) {
-      throw new Error(`Workflow database migration ${version} is newer than this runtime`);
-    }
+export class WorkflowMigrationUnsupportedVersion extends TaggedError(
+  "WorkflowMigrationUnsupportedVersion",
+)<{
+  readonly version: number;
+  readonly message: string;
+}> {}
+
+export class WorkflowMigrationNameMismatch extends TaggedError("WorkflowMigrationNameMismatch")<{
+  readonly version: number;
+  readonly expectedName: string;
+  readonly storedName: string;
+  readonly message: string;
+}> {}
+
+export class WorkflowMigrationSqliteDriverFailure extends TaggedError(
+  "WorkflowMigrationSqliteDriverFailure",
+)<{
+  readonly operation: string;
+  readonly code: string;
+  readonly message: string;
+}> {}
+
+export class WorkflowMigrationInvalidTimestamp extends TaggedError(
+  "WorkflowMigrationInvalidTimestamp",
+)<{
+  readonly message: string;
+}> {}
+
+export type WorkflowMigrationError =
+  | WorkflowMigrationUnsupportedVersion
+  | WorkflowMigrationNameMismatch
+  | WorkflowMigrationInvalidTimestamp
+  | WorkflowMigrationSqliteDriverFailure;
+
+function captureWorkflowMigrationTimestamp(
+  now: () => number,
+): ResultType<number, WorkflowMigrationInvalidTimestamp> {
+  const timestamp = now();
+  if (!Number.isInteger(timestamp) || timestamp < 0) {
+    return Result.err(
+      new WorkflowMigrationInvalidTimestamp({
+        message: "Workflow migration timestamp must be a non-negative integer",
+      }),
+    );
   }
+  return Result.ok(timestamp);
+}
 
-  for (const migration of WORKFLOW_MIGRATIONS) {
-    const appliedName = applied.get(migration.version);
-    if (appliedName !== undefined) {
-      if (appliedName !== migration.name) {
-        throw new Error(
-          `Workflow migration ${migration.version} name mismatch: expected ${migration.name}, found ${appliedName}`,
-        );
-      }
-      continue;
-    }
+function classifyMigrationDriverFailure(
+  operation: string,
+  cause: Error,
+): WorkflowMigrationSqliteDriverFailure | undefined {
+  const sqliteError = classifyBunSqliteError(cause);
+  if (sqliteError === undefined) return undefined;
+  return new WorkflowMigrationSqliteDriverFailure({
+    operation,
+    code: sqliteError.code,
+    message: "Workflow schema migration SQLite operation failed",
+  });
+}
 
-    const migrate = db.transaction(() => {
-      for (const statement of migration.statements) db.run(statement);
-      db.run(
-        "INSERT INTO workflow_schema_migrations (version, name, applied_at) VALUES (?, ?, ?)",
-        [migration.version, migration.name, now()],
+export function applyWorkflowSchemaMigrations(
+  db: Database,
+  now: () => number = Date.now,
+  throughVersion: number = WORKFLOW_SCHEMA_VERSION,
+): ResultType<void, WorkflowMigrationError> {
+  if (!WORKFLOW_MIGRATION_VERSIONS.includes(throughVersion)) {
+    return Result.err(
+      new WorkflowMigrationUnsupportedVersion({
+        version: throughVersion,
+        message: `Workflow migration prefix v${throughVersion} is not supported`,
+      }),
+    );
+  }
+  const capturedTimestamp = captureWorkflowMigrationTimestamp(now);
+  const apply = capturedTimestamp.match<() => ResultType<void, WorkflowMigrationError>>({
+    err: (error) => () => Result.err(error),
+    ok: (timestamp) => () => {
+      const inspected = runBunSqliteTransaction(
+        db,
+        () => {
+          db.run(`CREATE TABLE IF NOT EXISTS workflow_schema_migrations (
+        version INTEGER PRIMARY KEY,
+        name TEXT NOT NULL,
+        applied_at INTEGER NOT NULL
+      )`);
+
+          return Result.ok(
+            db
+              .query<{ version: number; name: string }, []>(
+                "SELECT version, name FROM workflow_schema_migrations ORDER BY version",
+              )
+              .all(),
+          );
+        },
+        (cause) => classifyMigrationDriverFailure("inspect", cause),
       );
-    });
-    migrate.immediate();
-  }
+      const continueAfterInspection = inspected.match<
+        () => ResultType<void, WorkflowMigrationError>
+      >({
+        err: (error) => () => Result.err(error),
+        ok: (rows) => () => {
+          const applied = new Map(rows.map((row) => [row.version, row.name]));
+          const knownVersions = new Set(WORKFLOW_MIGRATION_VERSIONS);
+          for (const version of applied.keys()) {
+            if (!knownVersions.has(version)) {
+              return Result.err(
+                new WorkflowMigrationUnsupportedVersion({
+                  version,
+                  message: `Workflow database migration ${version} is newer than this runtime`,
+                }),
+              );
+            }
+          }
+
+          const applyMigration = (index: number): ResultType<void, WorkflowMigrationError> => {
+            const migration = WORKFLOW_MIGRATIONS[index];
+            if (!migration || migration.version > throughVersion) return Result.ok(undefined);
+            const appliedName = applied.get(migration.version);
+            if (appliedName !== undefined) {
+              if (appliedName !== migration.name) {
+                return Result.err(
+                  new WorkflowMigrationNameMismatch({
+                    version: migration.version,
+                    expectedName: migration.name,
+                    storedName: appliedName,
+                    message: `Workflow migration ${migration.version} name mismatch`,
+                  }),
+                );
+              }
+              return applyMigration(index + 1);
+            }
+
+            const migrated = runBunSqliteTransaction(
+              db,
+              () => {
+                for (const statement of migration.statements) db.run(statement);
+                db.run(
+                  "INSERT INTO workflow_schema_migrations (version, name, applied_at) VALUES (?, ?, ?)",
+                  [migration.version, migration.name, timestamp],
+                );
+                return Result.ok(undefined);
+              },
+              (cause) => classifyMigrationDriverFailure(`apply-v${migration.version}`, cause),
+            );
+            const continueAfterMigration = migrated.match<
+              () => ResultType<void, WorkflowMigrationError>
+            >({
+              err: (error) => () => Result.err(error),
+              ok: () => () => applyMigration(index + 1),
+            });
+            return continueAfterMigration();
+          };
+          return applyMigration(0);
+        },
+      });
+      return continueAfterInspection();
+    },
+  });
+  return apply();
 }

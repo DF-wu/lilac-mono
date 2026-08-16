@@ -1,4 +1,7 @@
 import { describe, expect, it } from "bun:test";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
 
 import { localApplyPatchTool } from "../../src/tools/apply-patch/local-apply-patch-tool";
 
@@ -79,5 +82,37 @@ describe("apply_patch remote denylist", () => {
 
     expect(res.status).toBe("failed");
     expect(res.output ?? "").not.toContain("Access denied");
+  });
+
+  it("does not mutate local files for an already-aborted tool call", async () => {
+    const cwd = await mkdtemp(path.join(tmpdir(), "lilac-apply-patch-cancel-"));
+    try {
+      const tools = localApplyPatchTool(cwd);
+      const controller = new AbortController();
+      controller.abort();
+      const patchText = [
+        "*** Begin Patch",
+        "*** Add File: cancelled.txt",
+        "+must not exist",
+        "*** End Patch",
+      ].join("\n");
+
+      const res = await resolveExecuteResult(
+        tools.apply_patch.execute!(
+          { patchText },
+          {
+            toolCallId: "ap-cancelled",
+            messages: [],
+            abortSignal: controller.signal,
+            context: {},
+          },
+        ),
+      );
+
+      expect(res.status).toBe("failed");
+      await expect(readFile(path.join(cwd, "cancelled.txt"), "utf8")).rejects.toThrow();
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
   });
 });

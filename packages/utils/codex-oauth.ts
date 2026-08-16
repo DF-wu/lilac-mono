@@ -1,9 +1,12 @@
 import { chmod, mkdir, open, rename, unlink, type FileHandle } from "node:fs/promises";
 import path from "node:path";
 
+import { Result, TaggedError, type Result as ResultType } from "better-result";
 import { z } from "zod";
 
 import { env } from "./env";
+import type { DecodedPersistedValue } from "./persistence";
+import { isPanic, opaqueErrorMessage } from "./runtime-utils";
 
 export const CODEX_OAUTH_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann";
 export const CODEX_OAUTH_ISSUER = "https://auth.openai.com";
@@ -20,6 +23,9 @@ const codexOAuthTokensSchema = z
     idToken: z.string().min(1).optional(),
   })
   .strict();
+const legacyCodexOAuthTokensSchema = codexOAuthTokensSchema.omit({ type: true });
+const codexOAuthTokenTypeSchema = z.object({ type: z.string() }).passthrough();
+const loggedOutCodexOAuthTokensSchema = z.object({}).strict();
 
 const authorizationCodeTokenResponseSchema = z.object({
   id_token: z.string().min(1),
@@ -41,9 +47,194 @@ export type CodexOAuthTokens = z.infer<typeof codexOAuthTokensSchema>;
 export type AuthorizationCodeTokenResponse = z.infer<typeof authorizationCodeTokenResponseSchema>;
 export type RefreshTokenResponse = z.infer<typeof refreshTokenResponseSchema>;
 
+export class CodexTokensReadFailed extends TaggedError("CodexTokensReadFailed")<{
+  readonly operation: "inspect" | "read";
+  readonly storagePath: string;
+  readonly cause: unknown;
+  readonly message: string;
+}> {}
+
+export class CodexTokensMalformed extends TaggedError("CodexTokensMalformed")<{
+  readonly storagePath: string;
+  readonly message: string;
+}> {}
+
+export class CodexTokensCorrupt extends TaggedError("CodexTokensCorrupt")<{
+  readonly storagePath: string;
+  readonly issues: readonly string[];
+  readonly message: string;
+}> {}
+
+export class CodexTokensUnsupportedVersion extends TaggedError("CodexTokensUnsupportedVersion")<{
+  readonly storagePath: string;
+  readonly version: string;
+  readonly message: string;
+}> {}
+
+export class CodexTokensWriteInvalid extends TaggedError("CodexTokensWriteInvalid")<{
+  readonly storagePath: string;
+  readonly cause: z.ZodError;
+  readonly message: string;
+}> {}
+
+export class CodexTokensWriteFailed extends TaggedError("CodexTokensWriteFailed")<{
+  readonly storagePath: string;
+  readonly cause: unknown;
+  readonly message: string;
+}> {}
+
+export class CodexTokensCleanupFailed extends TaggedError("CodexTokensCleanupFailed")<{
+  readonly storagePath: string;
+  readonly causes: readonly unknown[];
+  readonly message: string;
+}> {}
+
+export class CodexTokensWriteAndCleanupFailed extends TaggedError(
+  "CodexTokensWriteAndCleanupFailed",
+)<{
+  readonly storagePath: string;
+  readonly writeError: CodexTokensWriteFailed;
+  readonly cleanupError: CodexTokensCleanupFailed;
+  readonly message: string;
+}> {}
+
+export class CodexOAuthRequestFailed extends TaggedError("CodexOAuthRequestFailed")<{
+  readonly operation: "exchange" | "refresh";
+  readonly status?: number;
+  readonly cause?: unknown;
+  readonly message: string;
+}> {}
+
+export class CodexOAuthResponseInvalid extends TaggedError("CodexOAuthResponseInvalid")<{
+  readonly operation: "exchange" | "refresh";
+  readonly cause: unknown;
+  readonly message: string;
+}> {}
+
+export class CodexOAuthLoginFailed extends TaggedError("CodexOAuthLoginFailed")<{
+  readonly issue:
+    | "closed"
+    | "already-completed"
+    | "exchange-in-progress"
+    | "invalid-state"
+    | "provider-error"
+    | "missing-code"
+    | "token-exchange"
+    | "token-write";
+  readonly cause?: unknown;
+  readonly message: string;
+}> {}
+
 const STORAGE_PATH = path.join(env.dataDir, "secret", "codex.json");
 
 export const OAUTH_DUMMY_KEY = "lilac-codex-oauth-dummy-key";
+
+export function decodeCodexTokens(input: {
+  readonly serialized: string | null;
+  readonly storagePath: string;
+}): ResultType<
+  DecodedPersistedValue<CodexOAuthTokens | null>,
+  CodexTokensMalformed | CodexTokensCorrupt | CodexTokensUnsupportedVersion
+> {
+  if (input.serialized === null) {
+    return Result.ok({ value: null, provenance: "missing-defaulted" });
+  }
+
+  let decoded: unknown;
+  try {
+    decoded = JSON.parse(input.serialized);
+  } catch (cause) {
+    if (isPanic(cause)) throw cause;
+    return Result.err(
+      new CodexTokensMalformed({
+        storagePath: input.storagePath,
+        message: `Codex OAuth tokens at '${input.storagePath}' contain malformed JSON`,
+      }),
+    );
+  }
+
+  const current = codexOAuthTokensSchema.safeParse(decoded);
+  if (current.success) {
+    return Result.ok({ value: current.data, provenance: "current" });
+  }
+
+  const legacy = legacyCodexOAuthTokensSchema.safeParse(decoded);
+  if (legacy.success) {
+    return Result.ok({ value: { type: "oauth", ...legacy.data }, provenance: "migrated" });
+  }
+
+  if (loggedOutCodexOAuthTokensSchema.safeParse(decoded).success) {
+    return Result.ok({ value: null, provenance: "current" });
+  }
+
+  const typed = codexOAuthTokenTypeSchema.safeParse(decoded);
+  if (typed.success && typed.data.type !== "oauth") {
+    return Result.err(
+      new CodexTokensUnsupportedVersion({
+        storagePath: input.storagePath,
+        version: typed.data.type,
+        message: `Codex OAuth tokens at '${input.storagePath}' use unsupported type '${typed.data.type}'`,
+      }),
+    );
+  }
+
+  return Result.err(
+    new CodexTokensCorrupt({
+      storagePath: input.storagePath,
+      issues: current.error.issues.map((issue) => issue.message),
+      message: `Codex OAuth tokens at '${input.storagePath}' have invalid fields`,
+    }),
+  );
+}
+
+const CODEX_TOKEN_FIXTURE_PATH = "/fixture/codex.json";
+const CODEX_TOKEN_FIXTURE_FIELDS = {
+  access: "fixture-access",
+  refresh: "fixture-refresh",
+  expires: 1,
+} as const;
+
+export const codexTokensCodecCases = {
+  current: {
+    input: {
+      serialized: JSON.stringify({ type: "oauth", ...CODEX_TOKEN_FIXTURE_FIELDS }),
+      storagePath: CODEX_TOKEN_FIXTURE_PATH,
+    },
+    outcome: "ok",
+    provenance: "current",
+  },
+  legacy: {
+    input: {
+      serialized: JSON.stringify(CODEX_TOKEN_FIXTURE_FIELDS),
+      storagePath: CODEX_TOKEN_FIXTURE_PATH,
+    },
+    outcome: "ok",
+    provenance: "migrated",
+  },
+  "missing-defaulted": {
+    input: { serialized: null, storagePath: CODEX_TOKEN_FIXTURE_PATH },
+    outcome: "ok",
+    provenance: "missing-defaulted",
+  },
+  "unsupported-version": {
+    input: {
+      serialized: JSON.stringify({ type: "future", ...CODEX_TOKEN_FIXTURE_FIELDS }),
+      storagePath: CODEX_TOKEN_FIXTURE_PATH,
+    },
+    outcome: "error",
+  },
+  "malformed-serialization": {
+    input: { serialized: "{", storagePath: CODEX_TOKEN_FIXTURE_PATH },
+    outcome: "error",
+  },
+  "corrupt-fields": {
+    input: {
+      serialized: JSON.stringify({ type: "oauth", ...CODEX_TOKEN_FIXTURE_FIELDS, expires: "1" }),
+      storagePath: CODEX_TOKEN_FIXTURE_PATH,
+    },
+    outcome: "error",
+  },
+} as const;
 
 function parseJwtClaims(token: string): Record<string, unknown> | undefined {
   const parts = token.split(".");
@@ -51,7 +242,8 @@ function parseJwtClaims(token: string): Record<string, unknown> | undefined {
   try {
     const parsed = JSON.parse(Buffer.from(parts[1]!, "base64url").toString("utf8")) as unknown;
     return jwtClaimsSchema.safeParse(parsed).data;
-  } catch {
+  } catch (cause) {
+    if (isPanic(cause)) throw cause;
     return undefined;
   }
 }
@@ -103,88 +295,335 @@ async function ensureSecretDir(storagePath: string): Promise<void> {
   if (process.platform !== "win32") await chmod(directory, 0o700);
 }
 
-async function writeSecretFile(storagePath: string, contents: string): Promise<void> {
+type CodexSecretFileHandle = Pick<FileHandle, "close" | "sync" | "writeFile">;
+
+export type CodexSecretFileOperations = {
+  readonly ensureDirectory: (storagePath: string) => Promise<void>;
+  readonly openTemporaryFile: (temporaryPath: string) => Promise<CodexSecretFileHandle>;
+  readonly openDirectory: (directoryPath: string) => Promise<CodexSecretFileHandle>;
+  readonly rename: (temporaryPath: string, storagePath: string) => Promise<void>;
+  readonly chmod: (storagePath: string, mode: number) => Promise<void>;
+  readonly unlink: (temporaryPath: string) => Promise<void>;
+  readonly syncDirectory: boolean;
+};
+
+const CODEX_SECRET_FILE_OPERATIONS: CodexSecretFileOperations = {
+  ensureDirectory: ensureSecretDir,
+  openTemporaryFile: (temporaryPath) => open(temporaryPath, "wx", 0o600),
+  openDirectory: (directoryPath) => open(directoryPath, "r"),
+  rename,
+  chmod,
+  unlink,
+  syncDirectory: process.platform !== "win32",
+};
+
+export async function writeSecretFileResult(
+  storagePath: string,
+  contents: string,
+  operations: CodexSecretFileOperations = CODEX_SECRET_FILE_OPERATIONS,
+): Promise<
+  ResultType<
+    void,
+    CodexTokensWriteFailed | CodexTokensCleanupFailed | CodexTokensWriteAndCleanupFailed
+  >
+> {
   const directory = path.dirname(storagePath);
   const temporaryPath = path.join(
     directory,
     `.${path.basename(storagePath)}.${crypto.randomUUID()}.tmp`,
   );
-  let handle: FileHandle | undefined;
-  let directoryHandle: FileHandle | undefined;
+  let handle: CodexSecretFileHandle | undefined;
+  let directoryHandle: CodexSecretFileHandle | undefined;
   let needsCleanup = false;
+  let writeFailed = false;
+  let writeCause: unknown;
+  const cleanupCauses: unknown[] = [];
+
   try {
-    await ensureSecretDir(storagePath);
-    handle = await open(temporaryPath, "wx", 0o600);
+    await operations.ensureDirectory(storagePath);
+    handle = await operations.openTemporaryFile(temporaryPath);
     needsCleanup = true;
     await handle.writeFile(contents, "utf8");
     await handle.sync();
-    await handle.close();
-    handle = undefined;
-    if (process.platform !== "win32") directoryHandle = await open(directory, "r");
-    await rename(temporaryPath, storagePath);
-    needsCleanup = false;
-    if (process.platform !== "win32") await chmod(storagePath, 0o600);
-    await directoryHandle?.sync();
-    await directoryHandle?.close();
-    directoryHandle = undefined;
-  } catch (error) {
-    const cleanupErrors: unknown[] = [];
-    if (handle) {
-      try {
-        await handle.close();
-      } catch (closeError) {
-        cleanupErrors.push(closeError);
-      }
-    }
-    if (directoryHandle) {
-      try {
-        await directoryHandle.close();
-      } catch (closeError) {
-        cleanupErrors.push(closeError);
-      }
-    }
-    if (needsCleanup) {
-      try {
-        await unlink(temporaryPath);
-      } catch (unlinkError) {
-        cleanupErrors.push(unlinkError);
-      }
-    }
-    if (cleanupErrors.length > 0) {
-      throw new AggregateError(
-        [error, ...cleanupErrors],
-        `Failed to write Codex OAuth tokens to '${storagePath}' and clean up resources`,
-      );
-    }
-    const message = error instanceof Error ? error.message : String(error);
-    throw new Error(`Failed to write Codex OAuth tokens to '${storagePath}': ${message}`, {
-      cause: error,
-    });
+  } catch (cause) {
+    writeFailed = true;
+    writeCause = cause;
   }
+
+  if (handle) {
+    try {
+      await handle.close();
+    } catch (cause) {
+      cleanupCauses.push(cause);
+    }
+    handle = undefined;
+  }
+
+  if (!writeFailed && cleanupCauses.length === 0) {
+    try {
+      if (operations.syncDirectory) directoryHandle = await operations.openDirectory(directory);
+      await operations.rename(temporaryPath, storagePath);
+      needsCleanup = false;
+      if (process.platform !== "win32") await operations.chmod(storagePath, 0o600);
+      await directoryHandle?.sync();
+    } catch (cause) {
+      writeFailed = true;
+      writeCause = cause;
+    }
+  }
+
+  if (directoryHandle) {
+    try {
+      await directoryHandle.close();
+    } catch (cause) {
+      cleanupCauses.push(cause);
+    }
+  }
+  if (needsCleanup) {
+    try {
+      await operations.unlink(temporaryPath);
+    } catch (cause) {
+      cleanupCauses.push(cause);
+    }
+  }
+
+  if (isPanic(writeCause)) throw writeCause;
+  const cleanupPanic = cleanupCauses.find(isPanic);
+  if (cleanupPanic) throw cleanupPanic;
+
+  const cleanupError =
+    cleanupCauses.length > 0
+      ? new CodexTokensCleanupFailed({
+          storagePath,
+          causes: cleanupCauses,
+          message: `Failed to clean up resources after writing Codex OAuth tokens to '${storagePath}'`,
+        })
+      : undefined;
+  if (writeFailed) {
+    const writeError = new CodexTokensWriteFailed({
+      storagePath,
+      cause: writeCause,
+      message: `Failed to write Codex OAuth tokens to '${storagePath}': ${opaqueErrorMessage(writeCause, "Unknown write failure")}`,
+    });
+    return cleanupError
+      ? Result.err(
+          new CodexTokensWriteAndCleanupFailed({
+            storagePath,
+            writeError,
+            cleanupError,
+            message: `Failed to write Codex OAuth tokens to '${storagePath}' and clean up resources`,
+          }),
+        )
+      : Result.err(writeError);
+  }
+  return cleanupError ? Result.err(cleanupError) : Result.ok(undefined);
+}
+
+export async function readCodexTokensResult(
+  storagePath: string = STORAGE_PATH,
+): Promise<
+  ResultType<
+    DecodedPersistedValue<CodexOAuthTokens | null>,
+    | CodexTokensReadFailed
+    | CodexTokensMalformed
+    | CodexTokensCorrupt
+    | CodexTokensUnsupportedVersion
+  >
+> {
+  const file = Bun.file(storagePath);
+  let exists: boolean;
+  try {
+    exists = await file.exists();
+  } catch (cause) {
+    if (isPanic(cause)) throw cause;
+    return Result.err(
+      new CodexTokensReadFailed({
+        operation: "inspect",
+        storagePath,
+        cause,
+        message: `Failed to inspect Codex OAuth tokens at '${storagePath}'`,
+      }),
+    );
+  }
+  if (!exists) return decodeCodexTokens({ serialized: null, storagePath });
+
+  let text: string;
+  try {
+    text = await file.text();
+  } catch (cause) {
+    if (isPanic(cause)) throw cause;
+    return Result.err(
+      new CodexTokensReadFailed({
+        operation: "read",
+        storagePath,
+        cause,
+        message: `Failed to read Codex OAuth tokens at '${storagePath}'`,
+      }),
+    );
+  }
+
+  return decodeCodexTokens({ serialized: text, storagePath });
 }
 
 export async function readCodexTokens(
   storagePath: string = STORAGE_PATH,
 ): Promise<CodexOAuthTokens | null> {
-  const file = Bun.file(storagePath);
-  if (!(await file.exists())) return null;
+  const result = await readCodexTokensResult(storagePath);
+  const resolved = result.match<
+    | { readonly value: CodexOAuthTokens | null }
+    | {
+        readonly error:
+          | CodexTokensReadFailed
+          | CodexTokensMalformed
+          | CodexTokensCorrupt
+          | CodexTokensUnsupportedVersion;
+      }
+  >({
+    ok: (value) => ({ value: value.value }),
+    err: (error) => ({ error }),
+  });
+  if ("error" in resolved) {
+    if (resolved.error._tag === "CodexTokensReadFailed" && resolved.error.operation === "inspect") {
+      throw resolved.error.cause;
+    }
+    return null;
+  }
+  return resolved.value;
+}
 
-  const raw = await file.json().catch(() => null as unknown);
-  return codexOAuthTokensSchema.safeParse(raw).data ?? null;
+export async function writeCodexTokensResult(
+  tokens: CodexOAuthTokens,
+  storagePath: string = STORAGE_PATH,
+  operations: CodexSecretFileOperations = CODEX_SECRET_FILE_OPERATIONS,
+): Promise<
+  ResultType<
+    void,
+    | CodexTokensWriteInvalid
+    | CodexTokensWriteFailed
+    | CodexTokensCleanupFailed
+    | CodexTokensWriteAndCleanupFailed
+  >
+> {
+  const validated = codexOAuthTokensSchema.safeParse(tokens);
+  if (!validated.success) {
+    return Result.err(
+      new CodexTokensWriteInvalid({
+        storagePath,
+        cause: validated.error,
+        message: `Refusing to write invalid Codex OAuth tokens to '${storagePath}'`,
+      }),
+    );
+  }
+  return writeSecretFileResult(
+    storagePath,
+    `${JSON.stringify(validated.data, null, 2)}\n`,
+    operations,
+  );
 }
 
 export async function writeCodexTokens(
   tokens: CodexOAuthTokens,
   storagePath: string = STORAGE_PATH,
+  operations: CodexSecretFileOperations = CODEX_SECRET_FILE_OPERATIONS,
 ): Promise<void> {
-  const validated = codexOAuthTokensSchema.parse(tokens);
-  await writeSecretFile(storagePath, `${JSON.stringify(validated, null, 2)}\n`);
+  const result = await writeCodexTokensResult(tokens, storagePath, operations);
+  const resolved = result.match<
+    | { readonly value: void }
+    | {
+        readonly error:
+          | CodexTokensWriteInvalid
+          | CodexTokensWriteFailed
+          | CodexTokensCleanupFailed
+          | CodexTokensWriteAndCleanupFailed;
+      }
+  >({
+    ok: (value) => ({ value }),
+    err: (error) => ({ error }),
+  });
+  if ("error" in resolved) throw projectLegacyCodexTokenWriteFailure(resolved.error);
+}
+
+export async function clearCodexTokensResult(
+  storagePath: string = STORAGE_PATH,
+): Promise<
+  ResultType<
+    void,
+    | CodexTokensReadFailed
+    | CodexTokensWriteFailed
+    | CodexTokensCleanupFailed
+    | CodexTokensWriteAndCleanupFailed
+  >
+> {
+  const file = Bun.file(storagePath);
+  let exists: boolean;
+  try {
+    exists = await file.exists();
+  } catch (cause) {
+    if (isPanic(cause)) throw cause;
+    return Result.err(
+      new CodexTokensReadFailed({
+        operation: "inspect",
+        storagePath,
+        cause,
+        message: `Failed to inspect Codex OAuth tokens at '${storagePath}'`,
+      }),
+    );
+  }
+  if (!exists) return Result.ok(undefined);
+  return writeSecretFileResult(storagePath, "{}\n");
 }
 
 export async function clearCodexTokens(storagePath: string = STORAGE_PATH): Promise<void> {
-  const file = Bun.file(storagePath);
-  if (!(await file.exists())) return;
-  await writeSecretFile(storagePath, "{}\n");
+  const result = await clearCodexTokensResult(storagePath);
+  const resolved = result.match<
+    | { readonly value: void }
+    | {
+        readonly error:
+          | CodexTokensReadFailed
+          | CodexTokensWriteFailed
+          | CodexTokensCleanupFailed
+          | CodexTokensWriteAndCleanupFailed;
+      }
+  >({
+    ok: (value) => ({ value }),
+    err: (error) => ({ error }),
+  });
+  if ("error" in resolved) {
+    if (resolved.error._tag === "CodexTokensReadFailed") throw resolved.error.cause;
+    throw projectLegacyCodexTokenWriteFailure(resolved.error);
+  }
+}
+
+function projectLegacyCodexTokenWriteFailure(
+  error:
+    | CodexTokensWriteInvalid
+    | CodexTokensWriteFailed
+    | CodexTokensCleanupFailed
+    | CodexTokensWriteAndCleanupFailed,
+): unknown {
+  switch (error._tag) {
+    case "CodexTokensWriteInvalid":
+      return error.cause;
+    case "CodexTokensWriteFailed":
+      return new Error(error.message, { cause: error.cause });
+    case "CodexTokensCleanupFailed": {
+      const [firstCause, ...additionalCauses] = error.causes;
+      return additionalCauses.length === 0
+        ? new Error(
+            `Failed to write Codex OAuth tokens to '${error.storagePath}': ${opaqueErrorMessage(firstCause, "Unknown cleanup failure")}`,
+            { cause: firstCause },
+          )
+        : new AggregateError(
+            error.causes,
+            `Failed to write Codex OAuth tokens to '${error.storagePath}' and clean up resources`,
+          );
+    }
+    case "CodexTokensWriteAndCleanupFailed":
+      return new AggregateError(
+        [error.writeError.cause, ...error.cleanupError.causes],
+        error.message,
+      );
+  }
 }
 
 export type PkceCodes = {
@@ -240,6 +679,74 @@ export type CodexOAuthFetch = (
   init?: RequestInit,
 ) => Promise<Response>;
 
+export async function exchangeCodeForTokensResult(options: {
+  code: string;
+  redirectUri: string;
+  pkce: PkceCodes;
+  fetch?: CodexOAuthFetch;
+  signal?: AbortSignal;
+}): Promise<
+  ResultType<AuthorizationCodeTokenResponse, CodexOAuthRequestFailed | CodexOAuthResponseInvalid>
+> {
+  let response: Response;
+  try {
+    response = await (options.fetch ?? fetch)(`${CODEX_OAUTH_ISSUER}/oauth/token`, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        grant_type: "authorization_code",
+        code: options.code,
+        redirect_uri: options.redirectUri,
+        client_id: CODEX_OAUTH_CLIENT_ID,
+        code_verifier: options.pkce.verifier,
+      }).toString(),
+      signal: options.signal,
+    });
+  } catch (cause) {
+    if (isPanic(cause)) throw cause;
+    return Result.err(
+      new CodexOAuthRequestFailed({
+        operation: "exchange",
+        cause,
+        message: "Token exchange request failed",
+      }),
+    );
+  }
+  if (!response.ok) {
+    return Result.err(
+      new CodexOAuthRequestFailed({
+        operation: "exchange",
+        status: response.status,
+        message: `Token exchange failed: ${response.status}`,
+      }),
+    );
+  }
+
+  let payload: unknown;
+  try {
+    payload = await response.json();
+  } catch (cause) {
+    if (isPanic(cause)) throw cause;
+    return Result.err(
+      new CodexOAuthResponseInvalid({
+        operation: "exchange",
+        cause,
+        message: "Token exchange response was not valid JSON",
+      }),
+    );
+  }
+  const parsed = authorizationCodeTokenResponseSchema.safeParse(payload);
+  return parsed.success
+    ? Result.ok(parsed.data)
+    : Result.err(
+        new CodexOAuthResponseInvalid({
+          operation: "exchange",
+          cause: parsed.error,
+          message: "Token exchange response has invalid fields",
+        }),
+      );
+}
+
 export async function exchangeCodeForTokens(options: {
   code: string;
   redirectUri: string;
@@ -247,39 +754,103 @@ export async function exchangeCodeForTokens(options: {
   fetch?: CodexOAuthFetch;
   signal?: AbortSignal;
 }): Promise<AuthorizationCodeTokenResponse> {
-  const response = await (options.fetch ?? fetch)(`${CODEX_OAUTH_ISSUER}/oauth/token`, {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: new URLSearchParams({
-      grant_type: "authorization_code",
-      code: options.code,
-      redirect_uri: options.redirectUri,
-      client_id: CODEX_OAUTH_CLIENT_ID,
-      code_verifier: options.pkce.verifier,
-    }).toString(),
-    signal: options.signal,
+  const result = await exchangeCodeForTokensResult(options);
+  const resolved = result.match<
+    | { readonly value: AuthorizationCodeTokenResponse }
+    | { readonly error: CodexOAuthRequestFailed | CodexOAuthResponseInvalid }
+  >({
+    ok: (value) => ({ value }),
+    err: (error) => ({ error }),
   });
+  if ("error" in resolved) throw projectLegacyCodexOAuthFailure(resolved.error);
+  return resolved.value;
+}
 
-  if (!response.ok) throw new Error(`Token exchange failed: ${response.status}`);
-  return authorizationCodeTokenResponseSchema.parse(await response.json());
+export async function refreshAccessTokenResult(
+  refreshToken: string,
+  fetchFn: CodexOAuthFetch = fetch,
+): Promise<ResultType<RefreshTokenResponse, CodexOAuthRequestFailed | CodexOAuthResponseInvalid>> {
+  let response: Response;
+  try {
+    response = await fetchFn(`${CODEX_OAUTH_ISSUER}/oauth/token`, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        grant_type: "refresh_token",
+        refresh_token: refreshToken,
+        client_id: CODEX_OAUTH_CLIENT_ID,
+      }).toString(),
+    });
+  } catch (cause) {
+    if (isPanic(cause)) throw cause;
+    return Result.err(
+      new CodexOAuthRequestFailed({
+        operation: "refresh",
+        cause,
+        message: "Token refresh request failed",
+      }),
+    );
+  }
+  if (!response.ok) {
+    return Result.err(
+      new CodexOAuthRequestFailed({
+        operation: "refresh",
+        status: response.status,
+        message: `Token refresh failed: ${response.status}`,
+      }),
+    );
+  }
+
+  let payload: unknown;
+  try {
+    payload = await response.json();
+  } catch (cause) {
+    if (isPanic(cause)) throw cause;
+    return Result.err(
+      new CodexOAuthResponseInvalid({
+        operation: "refresh",
+        cause,
+        message: "Token refresh response was not valid JSON",
+      }),
+    );
+  }
+  const parsed = refreshTokenResponseSchema.safeParse(payload);
+  return parsed.success
+    ? Result.ok(parsed.data)
+    : Result.err(
+        new CodexOAuthResponseInvalid({
+          operation: "refresh",
+          cause: parsed.error,
+          message: "Token refresh response has invalid fields",
+        }),
+      );
 }
 
 export async function refreshAccessToken(
   refreshToken: string,
   fetchFn: CodexOAuthFetch = fetch,
 ): Promise<RefreshTokenResponse> {
-  const response = await fetchFn(`${CODEX_OAUTH_ISSUER}/oauth/token`, {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: new URLSearchParams({
-      grant_type: "refresh_token",
-      refresh_token: refreshToken,
-      client_id: CODEX_OAUTH_CLIENT_ID,
-    }).toString(),
+  const result = await refreshAccessTokenResult(refreshToken, fetchFn);
+  const resolved = result.match<
+    | { readonly value: RefreshTokenResponse }
+    | { readonly error: CodexOAuthRequestFailed | CodexOAuthResponseInvalid }
+  >({
+    ok: (value) => ({ value }),
+    err: (error) => ({ error }),
   });
+  if ("error" in resolved) throw projectLegacyCodexOAuthFailure(resolved.error);
+  return resolved.value;
+}
 
-  if (!response.ok) throw new Error(`Token refresh failed: ${response.status}`);
-  return refreshTokenResponseSchema.parse(await response.json());
+function projectLegacyCodexOAuthFailure(
+  error: CodexOAuthRequestFailed | CodexOAuthResponseInvalid,
+): unknown {
+  switch (error._tag) {
+    case "CodexOAuthRequestFailed":
+      return Object.hasOwn(error, "cause") ? error.cause : new Error(error.message);
+    case "CodexOAuthResponseInvalid":
+      return error.cause;
+  }
 }
 
 export type CodexOAuthCallbackPayload = {
@@ -304,7 +875,8 @@ export function parseCodexOAuthCallback(input: CodexOAuthCallbackPayload): {
         error: url.searchParams.get("error") ?? undefined,
         errorDescription: url.searchParams.get("error_description") ?? undefined,
       };
-    } catch {
+    } catch (cause) {
+      if (isPanic(cause)) throw cause;
       // Fall back to explicit fields for manual exchange.
     }
   }
@@ -328,6 +900,12 @@ export type CodexOAuthLogin = {
   result: Promise<CodexOAuthLoginResult>;
   exchange(input: CodexOAuthCallbackPayload): Promise<CodexOAuthLoginResult>;
   close(): Promise<void>;
+};
+
+export type CodexOAuthLoginWithResult = CodexOAuthLogin & {
+  exchangeResult(
+    input: CodexOAuthCallbackPayload,
+  ): Promise<ResultType<CodexOAuthLoginResult, CodexOAuthLoginFailed>>;
 };
 
 export type StartCodexOAuthLoginOptions = {
@@ -356,7 +934,7 @@ function htmlError(error: string): string {
 
 export async function startCodexOAuthLogin(
   options: StartCodexOAuthLoginOptions = {},
-): Promise<CodexOAuthLogin> {
+): Promise<CodexOAuthLoginWithResult> {
   const pkce = await generatePKCE();
   const state = generateState();
   const callbackServer = options.callbackServer ?? "required";
@@ -366,81 +944,170 @@ export async function startCodexOAuthLogin(
   let redirectUri = `http://localhost:${options.port ?? CODEX_OAUTH_PORT}/auth/callback`;
   let settled = false;
   let closed = false;
-  let activeExchange: Promise<CodexOAuthLoginResult> | null = null;
+  let activeExchange: Promise<ResultType<CodexOAuthLoginResult, CodexOAuthLoginFailed>> | null =
+    null;
   let closePromise: Promise<void> | null = null;
   const exchangeController = new AbortController();
-  let resolveResult: (result: CodexOAuthLoginResult) => void = () => {};
-  let rejectResult: (error: unknown) => void = () => {};
-  const result = new Promise<CodexOAuthLoginResult>((resolve, reject) => {
-    resolveResult = resolve;
-    rejectResult = reject;
+  const resultDeferred = Promise.withResolvers<CodexOAuthLoginResult>();
+  const result = resultDeferred.promise;
+  // Manual exchange callers are not required to await the automatic callback result.
+  void result.catch((cause) => {
+    if (isPanic(cause)) throw cause;
   });
-  // Core can use manual exchange without awaiting the automatic callback result.
-  void result.catch(() => {});
 
   const stopServer = () => {
     server?.stop();
     server = undefined;
   };
-  const fail = (error: unknown) => {
-    if (settled) return;
-    settled = true;
-    stopServer();
-    rejectResult(error);
-  };
 
-  const runExchange = async (input: CodexOAuthCallbackPayload): Promise<CodexOAuthLoginResult> => {
-    if (closed) throw new Error("Codex OAuth login closed");
+  const runExchangeResult = async (
+    input: CodexOAuthCallbackPayload,
+  ): Promise<ResultType<CodexOAuthLoginResult, CodexOAuthLoginFailed>> => {
+    if (closed) {
+      return Result.err(
+        new CodexOAuthLoginFailed({ issue: "closed", message: "Codex OAuth login closed" }),
+      );
+    }
     const parsed = parseCodexOAuthCallback(input);
     if (parsed.state !== state) {
-      throw new Error("Invalid state - potential CSRF or mismatched start step");
+      return Result.err(
+        new CodexOAuthLoginFailed({
+          issue: "invalid-state",
+          message: "Invalid state - potential CSRF or mismatched start step",
+        }),
+      );
     }
-    if (parsed.error) throw new Error(`OAuth error: ${parsed.errorDescription || parsed.error}`);
-    if (!parsed.code) throw new Error("Missing authorization code");
+    if (parsed.error) {
+      return Result.err(
+        new CodexOAuthLoginFailed({
+          issue: "provider-error",
+          message: `OAuth error: ${parsed.errorDescription || parsed.error}`,
+        }),
+      );
+    }
+    if (!parsed.code) {
+      return Result.err(
+        new CodexOAuthLoginFailed({
+          issue: "missing-code",
+          message: "Missing authorization code",
+        }),
+      );
+    }
 
-    const tokens = await exchangeCodeForTokens({
+    const tokens = await exchangeCodeForTokensResult({
       code: parsed.code,
       redirectUri,
       pkce: { verifier: input.pkceVerifier ?? pkce.verifier, challenge: pkce.challenge },
       fetch: options.fetch,
       signal: exchangeController.signal,
     });
-    if (closed) throw new Error("Codex OAuth login closed");
-    const accountId = extractAccountId(tokens);
-    const expires = now() + (tokens.expires_in ?? 3600) * 1000;
-    if (closed) throw new Error("Codex OAuth login closed");
-    await (options.writeTokens ?? ((tokens) => writeCodexTokens(tokens, storagePath)))({
-      type: "oauth",
-      access: tokens.access_token,
-      refresh: tokens.refresh_token,
-      expires,
-      accountId,
-      idToken: tokens.id_token,
+    const exchangedTokens = tokens.match<
+      AuthorizationCodeTokenResponse | CodexOAuthRequestFailed | CodexOAuthResponseInvalid
+    >({
+      ok: (value) => value,
+      err: (error) => error,
     });
-    if (closed) throw new Error("Codex OAuth login closed");
+    if (
+      CodexOAuthRequestFailed.is(exchangedTokens) ||
+      CodexOAuthResponseInvalid.is(exchangedTokens)
+    ) {
+      return Result.err(
+        new CodexOAuthLoginFailed({
+          issue: "token-exchange",
+          cause: exchangedTokens,
+          message: exchangedTokens.message,
+        }),
+      );
+    }
+    if (closed) {
+      return Result.err(
+        new CodexOAuthLoginFailed({ issue: "closed", message: "Codex OAuth login closed" }),
+      );
+    }
+    const accountId = extractAccountId(exchangedTokens);
+    const expires = now() + (exchangedTokens.expires_in ?? 3600) * 1000;
+    try {
+      await (options.writeTokens ?? ((tokens) => writeCodexTokens(tokens, storagePath)))({
+        type: "oauth",
+        access: exchangedTokens.access_token,
+        refresh: exchangedTokens.refresh_token,
+        expires,
+        accountId,
+        idToken: exchangedTokens.id_token,
+      });
+    } catch (cause) {
+      if (isPanic(cause)) throw cause;
+      return Result.err(
+        new CodexOAuthLoginFailed({
+          issue: "token-write",
+          cause,
+          message: cause instanceof Error ? cause.message : "Failed to write Codex OAuth tokens",
+        }),
+      );
+    }
+    if (closed) {
+      return Result.err(
+        new CodexOAuthLoginFailed({ issue: "closed", message: "Codex OAuth login closed" }),
+      );
+    }
     const completed = { ok: true as const, accountId, expires, storagePath };
     if (!settled) {
       settled = true;
       stopServer();
-      resolveResult(completed);
+      resultDeferred.resolve(completed);
     }
-    return completed;
+    return Result.ok(completed);
   };
 
-  const exchange = (input: CodexOAuthCallbackPayload): Promise<CodexOAuthLoginResult> => {
-    if (closed) return Promise.reject(new Error("Codex OAuth login closed"));
-    if (settled) return Promise.reject(new Error("Codex OAuth login already completed"));
+  const exchangeResult = (
+    input: CodexOAuthCallbackPayload,
+  ): Promise<ResultType<CodexOAuthLoginResult, CodexOAuthLoginFailed>> => {
+    if (closed) {
+      return Promise.resolve(
+        Result.err(
+          new CodexOAuthLoginFailed({ issue: "closed", message: "Codex OAuth login closed" }),
+        ),
+      );
+    }
+    if (settled) {
+      return Promise.resolve(
+        Result.err(
+          new CodexOAuthLoginFailed({
+            issue: "already-completed",
+            message: "Codex OAuth login already completed",
+          }),
+        ),
+      );
+    }
     if (activeExchange) {
-      return Promise.reject(new Error("Codex OAuth token exchange already in progress"));
+      return Promise.resolve(
+        Result.err(
+          new CodexOAuthLoginFailed({
+            issue: "exchange-in-progress",
+            message: "Codex OAuth token exchange already in progress",
+          }),
+        ),
+      );
     }
 
-    const currentExchange = runExchange(input);
-    activeExchange = currentExchange;
-    const clearActiveExchange = () => {
-      if (activeExchange === currentExchange) activeExchange = null;
-    };
-    void currentExchange.then(clearActiveExchange, clearActiveExchange);
-    return currentExchange;
+    const currentExchange = runExchangeResult(input);
+    const trackedExchange = currentExchange.finally(() => {
+      if (activeExchange === trackedExchange) activeExchange = null;
+    });
+    activeExchange = trackedExchange;
+    return trackedExchange;
+  };
+
+  const exchange = async (input: CodexOAuthCallbackPayload): Promise<CodexOAuthLoginResult> => {
+    const exchanged = await exchangeResult(input);
+    const resolved = exchanged.match<
+      { readonly value: CodexOAuthLoginResult } | { readonly error: CodexOAuthLoginFailed }
+    >({
+      ok: (value) => ({ value }),
+      err: (error) => ({ error }),
+    });
+    if ("error" in resolved) throw projectLegacyCodexOAuthLoginFailure(resolved.error);
+    return resolved.value;
   };
 
   if (callbackServer !== "disabled") {
@@ -461,21 +1128,32 @@ export async function startCodexOAuthLogin(
             });
           }
 
-          try {
-            await exchange({ callbackUrl: request.url });
-            return new Response(HTML_SUCCESS, { headers: { "Content-Type": "text/html" } });
-          } catch (error) {
-            if (!activeExchange) fail(error);
-            const message = error instanceof Error ? error.message : String(error);
-            return new Response(htmlError(message), {
-              status: 400,
-              headers: { "Content-Type": "text/html" },
-            });
-          }
+          const exchanged = await exchangeResult({ callbackUrl: request.url });
+          const respond = exchanged.match<() => Response>({
+            ok: () => () =>
+              new Response(HTML_SUCCESS, { headers: { "Content-Type": "text/html" } }),
+            err: (error) => () => {
+              const cause = projectLegacyCodexOAuthLoginFailure(error);
+              if (!activeExchange && !settled) {
+                settled = true;
+                stopServer();
+                resultDeferred.reject(cause);
+              }
+              return new Response(
+                htmlError(opaqueErrorMessage(cause, "Unknown Codex OAuth callback failure")),
+                {
+                  status: 400,
+                  headers: { "Content-Type": "text/html" },
+                },
+              );
+            },
+          });
+          return respond();
         },
       });
       redirectUri = `http://localhost:${server.port}/auth/callback`;
     } catch (error) {
+      if (isPanic(error)) throw error;
       if (callbackServer === "required") throw error;
     }
   }
@@ -489,6 +1167,7 @@ export async function startCodexOAuthLogin(
     pkce,
     storagePath,
     result,
+    exchangeResult,
     exchange,
     close() {
       if (closePromise) return closePromise;
@@ -496,21 +1175,39 @@ export async function startCodexOAuthLogin(
       exchangeController.abort();
       if (!settled) {
         settled = true;
-        rejectResult(new Error("Codex OAuth login closed"));
+        resultDeferred.reject(new Error("Codex OAuth login closed"));
       }
       stopServer();
       const exchangeToWaitFor = activeExchange;
       closePromise = (async () => {
         if (!exchangeToWaitFor) return;
-        try {
-          await exchangeToWaitFor;
-        } catch {
-          // Closing intentionally aborts or invalidates the active exchange.
-        }
+        await exchangeToWaitFor;
       })();
       return closePromise;
     },
   };
+}
+
+function projectLegacyCodexOAuthLoginFailure(error: CodexOAuthLoginFailed): unknown {
+  switch (error.issue) {
+    case "token-exchange":
+      if (
+        error.cause instanceof CodexOAuthRequestFailed ||
+        error.cause instanceof CodexOAuthResponseInvalid
+      ) {
+        return projectLegacyCodexOAuthFailure(error.cause);
+      }
+      return Object.hasOwn(error, "cause") ? error.cause : new Error(error.message);
+    case "token-write":
+      return Object.hasOwn(error, "cause") ? error.cause : new Error(error.message);
+    case "closed":
+    case "already-completed":
+    case "exchange-in-progress":
+    case "invalid-state":
+    case "provider-error":
+    case "missing-code":
+      return new Error(error.message);
+  }
 }
 
 export function getCodexAuthStoragePath(): string {

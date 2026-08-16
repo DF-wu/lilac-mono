@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
 
 import { modelMessageSchema, type ModelMessage } from "ai";
+import { Panic, Result, TaggedError, type Result as ResultType } from "better-result";
 import { z } from "zod";
 
 export const CORE_PRIMARY_LINEAGE_DOMAIN_V1 = "lilac:core-primary-lineage:v1";
@@ -133,27 +134,21 @@ function canonicalizeJson(value: CanonicalJson): CanonicalJson {
 }
 
 /** Return the recursively key-sorted JSON representation hashed by lineage v1. */
-export function canonicalizeCoreLineageAtomV1(value: unknown): string {
-  const atom = coreLineageAtomV1Schema.parse(value) as CanonicalJson;
+export function canonicalizeCoreLineageAtomV1(value: CoreLineageAtomV1): string {
+  const atom = value as CanonicalJson;
   return JSON.stringify(canonicalizeJson(atom));
 }
 
-/**
- * Extend a v1 digest with one atom. Indices are one-based unsigned 64-bit
- * big-endian values and the previous digest contributes its raw 32 bytes.
- */
-export function extendCoreLineagePrefixDigestV1(
+export class CoreLineageDigestInputInvalid extends TaggedError("CoreLineageDigestInputInvalid")<{
+  readonly field: "previousDigest" | "atomIndex";
+  readonly message: string;
+}> {}
+
+function extendValidatedCoreLineagePrefixDigestV1(
   previousDigest: string,
   atomIndex: number,
   atom: CoreLineageAtomV1,
 ): string {
-  if (!SHA256_HEX_PATTERN.test(previousDigest)) {
-    throw new TypeError("previousDigest must be a lowercase SHA-256 digest");
-  }
-  if (!Number.isSafeInteger(atomIndex) || atomIndex < 1) {
-    throw new RangeError("atomIndex must be a positive safe integer");
-  }
-
   const index = Buffer.alloc(8);
   index.writeBigUInt64BE(BigInt(atomIndex));
   return createHash("sha256")
@@ -164,11 +159,39 @@ export function extendCoreLineagePrefixDigestV1(
     .digest("hex");
 }
 
+/**
+ * Extend a v1 digest with one atom. Indices are one-based unsigned 64-bit
+ * big-endian values and the previous digest contributes its raw 32 bytes.
+ */
+export function extendCoreLineagePrefixDigestV1(
+  previousDigest: string,
+  atomIndex: number,
+  atom: CoreLineageAtomV1,
+): ResultType<string, CoreLineageDigestInputInvalid> {
+  if (!SHA256_HEX_PATTERN.test(previousDigest)) {
+    return Result.err(
+      new CoreLineageDigestInputInvalid({
+        field: "previousDigest",
+        message: "previousDigest must be a lowercase SHA-256 digest",
+      }),
+    );
+  }
+  if (!Number.isSafeInteger(atomIndex) || atomIndex < 1) {
+    return Result.err(
+      new CoreLineageDigestInputInvalid({
+        field: "atomIndex",
+        message: "atomIndex must be a positive safe integer",
+      }),
+    );
+  }
+  return Result.ok(extendValidatedCoreLineagePrefixDigestV1(previousDigest, atomIndex, atom));
+}
+
 /** Compute the cumulative v1 digest for an ordered atom prefix. */
 export function computeCoreLineagePrefixDigestV1(atoms: readonly CoreLineageAtomV1[]): string {
   let digest = CORE_PRIMARY_LINEAGE_INITIAL_DIGEST_V1;
   for (const [index, atom] of atoms.entries()) {
-    digest = extendCoreLineagePrefixDigestV1(digest, index + 1, atom);
+    digest = extendValidatedCoreLineagePrefixDigestV1(digest, index + 1, atom);
   }
   return digest;
 }
@@ -178,7 +201,7 @@ function addManifestIssue(
   path: PropertyKey[],
   message: string,
 ): void {
-  context.addIssue({ code: "custom", path, message, input: context.value });
+  context.addIssue({ code: "custom", path, message });
 }
 
 export const coreLineageManifestV1Schema = z
@@ -237,7 +260,7 @@ export const coreLineageManifestV1Schema = z
           claimSource(`synthetic\u0000${atom.source}\u0000${atom.messageDigest}`, path);
         }
         atomCount += 1;
-        digest = extendCoreLineagePrefixDigestV1(digest, atomCount, atom);
+        digest = extendValidatedCoreLineagePrefixDigestV1(digest, atomCount, atom);
       }
       for (const [aliasIndex, alias] of segment.requestSource?.aliases.entries() ?? []) {
         claimSource(
@@ -279,7 +302,7 @@ export type CoreLineageManifestV1 = z.infer<typeof coreLineageManifestV1Schema>;
 export function buildCoreLineageManifestV1(
   inputs: readonly CoreLineageSegmentInputV1[],
   options?: { readonly currentSegmentIndex?: number },
-): CoreLineageManifestV1 {
+): ResultType<CoreLineageManifestV1, CorePrimaryLineageInvalid> {
   let canonicalEnd = 0;
   let atomCount = 0;
   let digest = CORE_PRIMARY_LINEAGE_INITIAL_DIGEST_V1;
@@ -290,7 +313,7 @@ export function buildCoreLineageManifestV1(
     canonicalEnd += input.canonicalMessages.length;
     for (const atom of input.atoms) {
       atomCount += 1;
-      digest = extendCoreLineagePrefixDigestV1(digest, atomCount, atom);
+      digest = extendValidatedCoreLineagePrefixDigestV1(digest, atomCount, atom);
     }
     segments.push({
       atoms: [...input.atoms],
@@ -307,13 +330,29 @@ export function buildCoreLineageManifestV1(
 
   const currentSegmentIndex = options?.currentSegmentIndex ?? Math.max(0, segments.length - 1);
   const currentSegment = segments[currentSegmentIndex];
-  if (!currentSegment) throw new RangeError("Current Core lineage segment index is out of range");
-  return coreLineageManifestV1Schema.parse({
+  if (!currentSegment) {
+    return invalidLineage([
+      {
+        path: ["currentSegmentIndex"],
+        message: "Current Core lineage segment index is out of range",
+      },
+    ]);
+  }
+  const candidate = {
     state: "complete",
     lineageVersion: 1,
     currentCanonicalStart: currentSegment.canonicalStart,
     segments,
-  });
+  } as const;
+  const decoded = decodeCorePrimaryLineageV1(
+    candidate,
+    segments.flatMap((segment) => segment.canonicalMessages),
+  );
+  return decoded.andThen((lineage) =>
+    lineage.state === "fresh-only"
+      ? invalidLineage([{ path: ["state"], message: "Built lineage must be complete" }])
+      : Result.ok(lineage),
+  );
 }
 
 export const corePrimaryLineageFreshOnlyV1Schema = z.strictObject({
@@ -332,33 +371,102 @@ export const corePrimaryLineageV1Schema = z.discriminatedUnion("state", [
 
 export type CorePrimaryLineageV1 = z.infer<typeof corePrimaryLineageV1Schema>;
 
-/**
- * Parse lineage and require a complete manifest to cover exactly the supplied
- * canonical messages. Invalid input throws; callers may then explicitly mark
- * intake fresh-only rather than synthesizing lineage from flat messages.
- */
-export function parseCorePrimaryLineageV1(
+export class CorePrimaryLineageInvalid extends TaggedError("CorePrimaryLineageInvalid")<{
+  readonly cause: unknown;
+  readonly issues: readonly {
+    readonly path: readonly PropertyKey[];
+    readonly message: string;
+  }[];
+  readonly message: string;
+}> {}
+
+function invalidLineage(
+  issues: readonly { readonly path: readonly PropertyKey[]; readonly message: string }[],
+): ResultType<never, CorePrimaryLineageInvalid> {
+  return Result.err(
+    new CorePrimaryLineageInvalid({
+      cause: undefined,
+      issues,
+      message: "Core primary lineage is invalid",
+    }),
+  );
+}
+
+/** Decode lineage and project cross-field failures without ordinary exception flow. */
+export function decodeCorePrimaryLineageV1(
   value: unknown,
   canonicalMessages: unknown,
-): CorePrimaryLineageV1 {
-  const lineage = corePrimaryLineageV1Schema.parse(value);
-  const messages = modelMessagesSchema.parse(canonicalMessages);
-  if (lineage.currentCanonicalStart > messages.length) {
-    throw new RangeError("Core primary current canonical start exceeds canonical messages");
+): ResultType<CorePrimaryLineageV1, CorePrimaryLineageInvalid> {
+  try {
+    const decodedLineage = corePrimaryLineageV1Schema.safeParse(value);
+    if (!decodedLineage.success) {
+      return invalidLineage(
+        decodedLineage.error.issues.map((issue) => ({ path: issue.path, message: issue.message })),
+      );
+    }
+    const decodedMessages = modelMessagesSchema.safeParse(canonicalMessages);
+    if (!decodedMessages.success) {
+      return invalidLineage(
+        decodedMessages.error.issues.map((issue) => ({ path: issue.path, message: issue.message })),
+      );
+    }
+
+    const lineage = decodedLineage.data;
+    const messages = decodedMessages.data;
+    if (lineage.currentCanonicalStart > messages.length) {
+      return invalidLineage([
+        {
+          path: ["currentCanonicalStart"],
+          message: "Core primary current canonical start exceeds canonical messages",
+        },
+      ]);
+    }
+    if (lineage.state === "fresh-only") return Result.ok(lineage);
+
+    const manifestMessages = lineage.segments.flatMap((segment) => segment.canonicalMessages);
+    if (!isDeepStrictEqual(manifestMessages, messages)) {
+      return invalidLineage([
+        {
+          path: [],
+          message: "Core primary lineage does not exactly align with canonical messages",
+        },
+      ]);
+    }
+    return Result.ok(lineage);
+  } catch (cause) {
+    let isPanic = false;
+    try {
+      isPanic = Panic.is(cause);
+    } catch {
+      // A revoked thrown value is an ordinary opaque validation failure, not a Panic.
+    }
+    if (isPanic) throw cause;
+    return Result.err(
+      new CorePrimaryLineageInvalid({
+        cause: undefined,
+        issues: [{ path: [], message: "Core primary lineage validation failed" }],
+        message: "Core primary lineage is invalid",
+      }),
+    );
   }
-  if (lineage.state === "fresh-only") return lineage;
-  const manifestMessages = lineage.segments.flatMap((segment) => segment.canonicalMessages);
-  if (!isDeepStrictEqual(manifestMessages, messages)) {
-    throw new TypeError("Core primary lineage does not exactly align with canonical messages");
-  }
-  return lineage;
 }
 
 export function createCorePrimaryLineageFreshOnlyV1(
   reason: string,
   currentCanonicalStart = 0,
-): CorePrimaryLineageFreshOnlyV1 {
-  return corePrimaryLineageFreshOnlyV1Schema.parse({
+): ResultType<CorePrimaryLineageFreshOnlyV1, CorePrimaryLineageInvalid> {
+  if (reason.length === 0) {
+    return invalidLineage([{ path: ["reason"], message: "Reason must not be empty" }]);
+  }
+  if (!Number.isSafeInteger(currentCanonicalStart) || currentCanonicalStart < 0) {
+    return invalidLineage([
+      {
+        path: ["currentCanonicalStart"],
+        message: "Current canonical start must be a non-negative safe integer",
+      },
+    ]);
+  }
+  return Result.ok({
     state: "fresh-only",
     lineageVersion: 1,
     currentCanonicalStart,

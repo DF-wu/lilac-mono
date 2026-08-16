@@ -1,4 +1,5 @@
 import { describe, expect, it } from "bun:test";
+import { Result } from "better-result";
 import type { LimitOpts, SessionRef, SurfaceMessage } from "../../../src/surface/types";
 import {
   DISCORD_SEARCH_FIRST_SEARCH_HEAL_LIMIT,
@@ -12,10 +13,10 @@ class FakeSearchAdapter {
 
   constructor(private readonly messagesByChannelId: Record<string, SurfaceMessage[]>) {}
 
-  async listMsg(sessionRef: SessionRef, opts?: LimitOpts): Promise<SurfaceMessage[]> {
+  async listMsg(sessionRef: SessionRef, opts?: LimitOpts) {
     this.listCalls.push({ sessionRef, opts });
     const messages = this.messagesByChannelId[sessionRef.channelId] ?? [];
-    return messages.slice(0, opts?.limit ?? 50);
+    return Result.ok(messages.slice(0, opts?.limit ?? 50));
   }
 }
 
@@ -51,6 +52,53 @@ describe("discord search store", () => {
       store.close();
       Date.now = originalDateNow;
     }
+  });
+
+  it("persists stable attachment metadata without signed URLs", () => {
+    const store = new DiscordSearchStore(":memory:");
+    const message: SurfaceMessage = {
+      ref: { platform: "discord", channelId: "123", messageId: "m1" },
+      session: { platform: "discord", channelId: "123" },
+      userId: "u1",
+      text: "",
+      ts: 1,
+      raw: {
+        attachments: [
+          {
+            id: "a1",
+            url: "https://cdn.discordapp.com/attachments/1/2/image.png?ex=secret",
+            filename: "image.png",
+            mimeType: "image/png",
+            size: 123,
+          },
+        ],
+      },
+    };
+
+    expect(store.upsertMessages([message])).toBe(1);
+    expect(store.getIndexedMessage({ channelId: "123", messageId: "m1" })?.attachments).toEqual([
+      { id: "a1", filename: "image.png", mimeType: "image/png", size: 123 },
+    ]);
+    expect(store.upsertMessages([message])).toBe(0);
+    expect(
+      store.upsertMessages([
+        {
+          ...message,
+          raw: {
+            attachments: [
+              {
+                id: "a2",
+                url: "https://cdn.discordapp.com/attachments/1/2/other.png?ex=other",
+                filename: "other.png",
+                mimeType: "image/png",
+                size: 456,
+              },
+            ],
+          },
+        },
+      ]),
+    ).toBe(1);
+    store.close();
   });
 
   it("returns message mutations for inserts, edits, and duplicate updates", () => {

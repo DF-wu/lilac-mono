@@ -16,14 +16,19 @@ import {
   type FinishReason,
   type LanguageModel,
   type LanguageModelUsage,
+  InvalidToolInputError,
   type ModelMessage,
+  NoSuchToolError,
   type SystemModelMessage,
   type TextStreamPart,
   type ToolModelMessage,
   type ToolSet,
 } from "ai";
+import { Result, TaggedError, type Result as ResultType } from "better-result";
+import { z } from "zod";
 import {
   createLogger,
+  errorMessage,
   isRecord,
   type ModelReasoningEffort,
   normalizeReplayMessages,
@@ -32,11 +37,12 @@ import {
 } from "@stanley2058/lilac-utils";
 
 import {
-  executeAtomicToolCall,
+  executeAtomicToolCallResult,
   finalizeSettledAtomicToolCall,
   normalizeToolResultOutput,
-  settleAtomicToolCall,
+  settleAtomicToolCallResult,
   type AtomicToolExecutionOutcome,
+  type AtomicToolExecutionFailed,
   type AtomicToolExecutionOutcomeKind,
   type ExecuteAtomicToolCallOptions,
   type NormalizeSettledToolResultOutputsFn,
@@ -44,11 +50,51 @@ import {
   type SettledToolResultOutputEntry,
   type ToolResultOutput,
 } from "./atomic-tool-execution";
+import { rethrowAgentPanic, type OpaqueAgentValue } from "./failure-adapters";
 import { normalizeModelMessagesToolCallIds } from "./tool-call-id-normalization";
 import type { ExpandedToolCall } from "./tool-call-expansion";
 
 const logger = createLogger({ module: "ai-sdk-pi-agent" });
 const SETTLED_NORMALIZATION_FAILED = "[settled tool results could not be normalized]";
+
+function canonicalToolName(name: string): string {
+  switch (name) {
+    case "read_file":
+      return "read";
+    case "edit_file":
+      return "edit";
+    case "apply_patch":
+      return "patch";
+    default:
+      return name;
+  }
+}
+
+const legacyBatchInputSchema = z.object({
+  tool_calls: z.array(
+    z.object({
+      tool: z.string(),
+      parameters: z.record(z.string(), z.unknown()).optional(),
+    }),
+  ),
+});
+
+export function repairLegacyBatchInput(input: OpaqueAgentValue, tools: ToolSet): string | null {
+  const decoded = legacyBatchInputSchema.safeParse(normalizeToolCallInputValue(input));
+  if (!decoded.success) return null;
+  let changed = false;
+  const toolCalls = decoded.data.tool_calls.map((call) => {
+    const requestedName = call.tool;
+    const toolName = tools[requestedName] ? requestedName : canonicalToolName(requestedName);
+    if (toolName === requestedName || !tools[toolName]) return call;
+    changed = true;
+    return {
+      tool: toolName,
+      ...(call.parameters === undefined ? {} : { parameters: call.parameters }),
+    };
+  });
+  return changed ? JSON.stringify({ ...decoded.data, tool_calls: toolCalls }) : null;
+}
 
 export type {
   NormalizeSettledToolResultOutputsFn,
@@ -201,6 +247,93 @@ export type AiSdkPiAssistantMessageEvent<TOOLS extends ToolSet> =
       type: "reasoning_file";
       raw: Extract<TextStreamPart<TOOLS>, { type: "reasoning-file" }>;
     };
+
+type SupportedAiSdkTextStreamPartType =
+  | "abort"
+  | "start-step"
+  | "text-start"
+  | "text-delta"
+  | "text-end"
+  | "reasoning-start"
+  | "reasoning-delta"
+  | "reasoning-end"
+  | "tool-input-start"
+  | "tool-input-delta"
+  | "tool-input-end"
+  | "custom"
+  | "source"
+  | "file"
+  | "reasoning-file"
+  | "tool-call"
+  | "tool-result"
+  | "tool-error"
+  | "tool-output-denied"
+  | "tool-approval-response"
+  | "tool-approval-request"
+  | "error";
+
+export type ProjectedAiSdkTextStreamPart<TOOLS extends ToolSet> =
+  | {
+      readonly [Kind in SupportedAiSdkTextStreamPartType]: {
+        readonly kind: Kind;
+        readonly raw: Extract<TextStreamPart<TOOLS>, { type: Kind }>;
+      };
+    }[SupportedAiSdkTextStreamPartType]
+  | { readonly kind: "unsupported"; readonly partType: string };
+
+/** Normalize the open AI SDK stream protocol before the agent run loop consumes it. */
+export function projectAiSdkTextStreamPart<TOOLS extends ToolSet>(
+  part: TextStreamPart<TOOLS>,
+): ProjectedAiSdkTextStreamPart<TOOLS> {
+  switch (part.type) {
+    case "abort":
+      return { kind: "abort", raw: part };
+    case "start-step":
+      return { kind: "start-step", raw: part };
+    case "text-start":
+      return { kind: "text-start", raw: part };
+    case "text-delta":
+      return { kind: "text-delta", raw: part };
+    case "text-end":
+      return { kind: "text-end", raw: part };
+    case "reasoning-start":
+      return { kind: "reasoning-start", raw: part };
+    case "reasoning-delta":
+      return { kind: "reasoning-delta", raw: part };
+    case "reasoning-end":
+      return { kind: "reasoning-end", raw: part };
+    case "tool-input-start":
+      return { kind: "tool-input-start", raw: part };
+    case "tool-input-delta":
+      return { kind: "tool-input-delta", raw: part };
+    case "tool-input-end":
+      return { kind: "tool-input-end", raw: part };
+    case "custom":
+      return { kind: "custom", raw: part };
+    case "source":
+      return { kind: "source", raw: part };
+    case "file":
+      return { kind: "file", raw: part };
+    case "reasoning-file":
+      return { kind: "reasoning-file", raw: part };
+    case "tool-call":
+      return { kind: "tool-call", raw: part };
+    case "tool-result":
+      return { kind: "tool-result", raw: part };
+    case "tool-error":
+      return { kind: "tool-error", raw: part };
+    case "tool-output-denied":
+      return { kind: "tool-output-denied", raw: part };
+    case "tool-approval-response":
+      return { kind: "tool-approval-response", raw: part };
+    case "tool-approval-request":
+      return { kind: "tool-approval-request", raw: part };
+    case "error":
+      return { kind: "error", raw: part };
+    default:
+      return { kind: "unsupported", partType: "unsupported" };
+  }
+}
 
 /** Why a turn ended without producing a `turn_end`. */
 export type TurnAbortReason = "cancel" | "interrupt" | "manual" | "recovery";
@@ -431,10 +564,12 @@ export type PrepareModelCall = (
 
 export type TurnErrorHandlerDecision = "retry" | "fail";
 
-export type IdleRecoveryDecisionHandler = (
-  error: unknown,
-  context: { readonly abortSignal: AbortSignal },
-) => TurnErrorHandlerDecision | Promise<TurnErrorHandlerDecision>;
+export interface IdleRecoveryDecisionHandler {
+  (
+    error: OpaqueAgentValue,
+    context: { readonly abortSignal: AbortSignal },
+  ): TurnErrorHandlerDecision | Promise<TurnErrorHandlerDecision>;
+}
 
 export type IdleRecoveryResult =
   | { readonly status: "retried" }
@@ -454,15 +589,17 @@ export type TurnRetrySafety =
       reason: "invalid-transcript-boundary" | "post-model-phase" | "provider-executed-tool";
     };
 
-export type TurnErrorHandler = (
-  error: unknown,
-  context: {
-    abortSignal?: AbortSignal;
-    retrySafety: TurnRetrySafety;
-    /** Origin of the error. Optional for compatibility with direct handler callers. */
-    phase?: TurnErrorPhase;
-  },
-) => TurnErrorHandlerDecision | Promise<TurnErrorHandlerDecision>;
+export interface TurnErrorHandler {
+  (
+    error: OpaqueAgentValue,
+    context: {
+      abortSignal?: AbortSignal;
+      retrySafety: TurnRetrySafety;
+      /** Origin of the error. Optional for compatibility with direct handler callers. */
+      phase?: TurnErrorPhase;
+    },
+  ): TurnErrorHandlerDecision | Promise<TurnErrorHandlerDecision>;
+}
 
 export type TurnBoundaryContext = {
   finishReason: FinishReason;
@@ -559,12 +696,15 @@ export type AiSdkPiAgentOptions<TOOLS extends ToolSet> = {
   };
 };
 
+function cloneMessage(message: AssistantModelMessage): AssistantModelMessage;
+function cloneMessage(message: ToolModelMessage): ToolModelMessage;
+function cloneMessage(message: ModelMessage): ModelMessage;
 function cloneMessage(message: ModelMessage): ModelMessage {
   if (message.role === "assistant") {
     return {
       ...message,
       content: Array.isArray(message.content)
-        ? message.content.map((p) => ({ ...p }))
+        ? message.content.map((part) => Object.assign({}, part))
         : message.content,
     };
   }
@@ -583,7 +723,50 @@ function cloneMessage(message: ModelMessage): ModelMessage {
   return { ...message };
 }
 
-function cloneSteeringValue(value: unknown, ancestors: ReadonlySet<object>): unknown {
+class SteeringMessageCloneFailed extends TaggedError("SteeringMessageCloneFailed")<{
+  readonly cause?: OpaqueAgentValue;
+  readonly message: string;
+}> {}
+
+export class AgentStateTransitionFailed extends TaggedError("AgentStateTransitionFailed")<{
+  readonly operation: string;
+  readonly message: string;
+}> {}
+
+class ToolBatchExecutionFailed extends TaggedError("ToolBatchExecutionFailed")<{
+  readonly cause: OpaqueAgentValue;
+  readonly message: string;
+}> {}
+
+class AgentExternalHostFailed extends TaggedError("AgentExternalHostFailed")<{
+  readonly cause: OpaqueAgentValue;
+  readonly message: string;
+}> {}
+
+function signalExternalToolCallHost(
+  error: AtomicToolExecutionFailed | ToolBatchExecutionFailed | AgentExternalHostFailed,
+): never {
+  throw error.cause;
+}
+
+function signalAgentStateHost(error: AgentStateTransitionFailed | TurnAbortedError): never {
+  if (error instanceof TurnAbortedError) throw error;
+  throw new Error(error.message, { cause: error });
+}
+
+function resultOutcome<T, E>(
+  result: ResultType<T, E>,
+): { ok: true; value: T } | { ok: false; error: E } {
+  return result.match<{ ok: true; value: T } | { ok: false; error: E }>({
+    ok: (value) => ({ ok: true, value }),
+    err: (error) => ({ ok: false, error }),
+  });
+}
+
+function cloneSteeringValue(
+  value: OpaqueAgentValue,
+  ancestors: ReadonlySet<object>,
+): ResultType<OpaqueAgentValue, SteeringMessageCloneFailed> {
   if (
     value === null ||
     typeof value === "string" ||
@@ -592,42 +775,89 @@ function cloneSteeringValue(value: unknown, ancestors: ReadonlySet<object>): unk
     typeof value === "undefined" ||
     typeof value === "bigint"
   ) {
-    return value;
+    return Result.ok(value);
   }
   if (typeof value === "function" || typeof value === "symbol") {
-    throw new Error(`unsupported ${typeof value} value`);
+    return Result.err(
+      new SteeringMessageCloneFailed({ message: `unsupported ${typeof value} value` }),
+    );
   }
-  if (value instanceof URL) return new URL(value.href);
-  if (value instanceof ArrayBuffer) return value.slice(0);
-  if (value instanceof Uint8Array) return new Uint8Array(value);
+  if (value instanceof URL) return Result.ok(new URL(value.href));
+  if (value instanceof ArrayBuffer) return Result.ok(value.slice(0));
+  if (value instanceof Uint8Array) return Result.ok(new Uint8Array(value));
   if (ArrayBuffer.isView(value)) {
-    throw new Error(`unsupported buffer view '${value.constructor.name}'`);
+    return Result.err(
+      new SteeringMessageCloneFailed({
+        message: `unsupported buffer view '${value.constructor.name}'`,
+      }),
+    );
   }
-  if (ancestors.has(value)) throw new Error("cyclic values are unsupported");
+  if (ancestors.has(value)) {
+    return Result.err(new SteeringMessageCloneFailed({ message: "cyclic values are unsupported" }));
+  }
   const nestedAncestors = new Set(ancestors);
   nestedAncestors.add(value);
   if (Array.isArray(value)) {
-    return value.map((entry) => cloneSteeringValue(entry, nestedAncestors));
+    const cloned: OpaqueAgentValue[] = [];
+    for (const entry of value) {
+      const outcome = resultOutcome(cloneSteeringValue(entry, nestedAncestors));
+      if (!outcome.ok) return Result.err(outcome.error);
+      cloned.push(outcome.value);
+    }
+    return Result.ok(cloned);
   }
-  const prototype = Object.getPrototypeOf(value);
+  let prototype: object | null;
+  let symbols: symbol[];
+  let descriptors: Record<string, PropertyDescriptor>;
+  try {
+    prototype = Object.getPrototypeOf(value);
+    symbols = Object.getOwnPropertySymbols(value);
+    descriptors = Object.getOwnPropertyDescriptors(value);
+  } catch (cause) {
+    rethrowAgentPanic(cause);
+    return Result.err(
+      new SteeringMessageCloneFailed({
+        cause,
+        message: `reflective message inspection failed: ${errorMessage(cause)}`,
+      }),
+    );
+  }
   if (prototype !== Object.prototype && prototype !== null) {
-    throw new Error(`unsupported object prototype '${prototype?.constructor?.name ?? "unknown"}'`);
+    return Result.err(
+      new SteeringMessageCloneFailed({
+        message: `unsupported object prototype '${prototype?.constructor?.name ?? "unknown"}'`,
+      }),
+    );
   }
-  if (Object.getOwnPropertySymbols(value).length > 0) {
-    throw new Error("symbol-keyed properties are unsupported");
+  if (symbols.length > 0) {
+    return Result.err(
+      new SteeringMessageCloneFailed({ message: "symbol-keyed properties are unsupported" }),
+    );
   }
-  const cloned: Record<string, unknown> = prototype === null ? { __proto__: null } : {};
-  for (const [key, descriptor] of Object.entries(Object.getOwnPropertyDescriptors(value))) {
-    if (!descriptor.enumerable) throw new Error(`non-enumerable property '${key}' is unsupported`);
-    if (!("value" in descriptor)) throw new Error(`accessor property '${key}' is unsupported`);
+  const cloned: Record<string, OpaqueAgentValue> = prototype === null ? { __proto__: null } : {};
+  for (const [key, descriptor] of Object.entries(descriptors)) {
+    if (!descriptor.enumerable) {
+      return Result.err(
+        new SteeringMessageCloneFailed({
+          message: `non-enumerable property '${key}' is unsupported`,
+        }),
+      );
+    }
+    if (!("value" in descriptor)) {
+      return Result.err(
+        new SteeringMessageCloneFailed({ message: `accessor property '${key}' is unsupported` }),
+      );
+    }
+    const property = resultOutcome(cloneSteeringValue(descriptor.value, nestedAncestors));
+    if (!property.ok) return Result.err(property.error);
     Object.defineProperty(cloned, key, {
-      value: cloneSteeringValue(descriptor.value, nestedAncestors),
+      value: property.value,
       enumerable: true,
       writable: true,
       configurable: true,
     });
   }
-  return cloned;
+  return Result.ok(cloned);
 }
 
 function isClonedModelMessage(value: unknown): value is ModelMessage {
@@ -640,28 +870,34 @@ function isClonedModelMessage(value: unknown): value is ModelMessage {
   );
 }
 
-function cloneQueuedMessageValue(message: ModelMessage): ModelMessage {
+function cloneQueuedMessageValue(
+  message: ModelMessage,
+): ResultType<ModelMessage, SteeringMessageCloneFailed> {
   const cloned = cloneSteeringValue(message, new Set());
-  if (!isClonedModelMessage(cloned)) throw new Error("cloned message lost its valid role");
-  return cloned;
+  const outcome = resultOutcome(cloned);
+  if (!outcome.ok) return Result.err(outcome.error);
+  if (!isClonedModelMessage(outcome.value)) {
+    return Result.err(
+      new SteeringMessageCloneFailed({ message: "cloned message lost its valid role" }),
+    );
+  }
+  return Result.ok(outcome.value);
 }
 
 function cloneQueuedMessage(message: ModelMessage, operation: "queue" | "deliver"): ModelMessage {
-  try {
-    return cloneQueuedMessageValue(message);
-  } catch (error) {
-    const detail = error instanceof Error ? error.message : String(error);
-    throw new Error(
-      `Cannot ${operation} steering message: messages must be safely cloneable (${detail})`,
-      { cause: error },
-    );
-  }
+  const cloned = cloneQueuedMessageValue(message);
+  const outcome = resultOutcome(cloned);
+  if (outcome.ok) return outcome.value;
+  return signalAgentStateHost(
+    new AgentStateTransitionFailed({
+      operation: `${operation} steering message`,
+      message: `Cannot ${operation} steering message: messages must be safely cloneable (${outcome.error.message})`,
+    }),
+  );
 }
 
 function cloneAssistantMessage(message: AssistantModelMessage): AssistantModelMessage {
-  const cloned = cloneMessage(message);
-  if (cloned.role !== "assistant") throw new Error("Expected an assistant message");
-  return cloned;
+  return cloneMessage(message);
 }
 
 function sumOptionalNumber(a: number | undefined, b: number | undefined): number | undefined {
@@ -812,6 +1048,25 @@ function hiddenToolRejection(toolName: string): string {
   return `Tool '${toolName}' was not offered on the step that produced this call, so it was not executed.`;
 }
 
+function toolExecutionRejection(options: {
+  readonly toolName: string;
+  readonly snapshotTools: ToolSet;
+  readonly currentTools: ToolSet;
+  readonly hasExclusiveTool: boolean;
+  readonly exclusiveToolNames: ReadonlySet<string>;
+}): string | undefined {
+  if (
+    options.snapshotTools[options.toolName] === undefined &&
+    options.currentTools[options.toolName]
+  ) {
+    return hiddenToolRejection(options.toolName);
+  }
+  if (options.hasExclusiveTool && !options.exclusiveToolNames.has(options.toolName)) {
+    return `Tool '${options.toolName}' was not executed because an exclusive tool was selected in the same turn. Retry it after processing the exclusive tool result.`;
+  }
+  return undefined;
+}
+
 export function stripToolExecuteForModel<TOOLS extends ToolSet>(tools: TOOLS): ToolSet {
   // We keep the schema/description/title so the model can call tools,
   // but remove execution so we can run tools ourselves (enables steering).
@@ -934,7 +1189,7 @@ function recoveryCheckpointForMessages(messages: readonly ModelMessage[]): Recov
   if (assistantContent.length > 0) {
     suffixMessages.push({
       ...assistant,
-      content: assistantContent.map((part) => ({ ...part })),
+      content: assistantContent.map((part) => Object.assign({}, part)),
     });
   }
   for (const message of messages.slice(baseMessages.length + 1)) {
@@ -973,7 +1228,8 @@ function recoveryToolOutput(value: unknown): ToolResultOutput {
   }
   try {
     return { type: "text", value: JSON.stringify(value) ?? String(value) };
-  } catch {
+  } catch (cause) {
+    rethrowAgentPanic(cause);
     return { type: "text", value: String(value) };
   }
 }
@@ -1083,7 +1339,7 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
   private providerExecutedToolAttemptLatched = false;
   private activePersistentAttemptIdentity: string | undefined;
 
-  private context?: unknown;
+  private context?: OpaqueAgentValue;
 
   /** Live execution and transcript state. */
   readonly state: AiSdkPiAgentState<TOOLS>;
@@ -1210,7 +1466,7 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
   }
 
   /** Replace the tool context used for subsequent turns. */
-  setContext(context: unknown) {
+  setContext(context: OpaqueAgentValue) {
     this.context = context;
   }
 
@@ -1244,8 +1500,9 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
     const signals = [input.abortSignal, this.abortController?.signal].filter(
       (signal): signal is AbortSignal => signal !== undefined,
     );
-    const abortSignal =
-      signals.length > 1 ? AbortSignal.any(signals) : signals.length === 1 ? signals[0] : undefined;
+    let abortSignal: AbortSignal | undefined;
+    if (signals.length > 1) abortSignal = AbortSignal.any(signals);
+    else if (signals.length === 1) abortSignal = signals[0];
 
     const snapshot: StepToolSnapshot<TOOLS> = this.lastStepToolSnapshot ?? {
       step: 0,
@@ -1253,50 +1510,54 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
       names: Object.keys(this.state.tools),
     };
     const snapshotTools = snapshot.tools;
+    const toolName =
+      snapshotTools[input.toolName] || this.state.tools[input.toolName]
+        ? input.toolName
+        : canonicalToolName(input.toolName);
 
-    let outcome: AtomicToolExecutionOutcome;
-    try {
-      outcome = await executeAtomicToolCall({
-        call: {
-          toolCallId: input.toolCallId,
-          toolName: input.toolName,
-          input: input.input,
-        },
-        tools: snapshotTools,
-        ...(snapshotTools[input.toolName] === undefined && this.state.tools[input.toolName]
-          ? { executionRejection: hiddenToolRejection(input.toolName) }
-          : {}),
-        messages: this.state.messages,
-        context: this.context,
-        abortSignal,
-        pendingToolCalls: this.state.pendingToolCalls,
-        inputValidation: { type: input.inputValidation ?? "validate" },
-        expansionHandling: { type: "capture" },
-        normalizeToolResultOutput: this.normalizeToolResultOutput,
-        bypassGenericOutputNormalizer: this.genericOutputNormalizerBypassTools.has(input.toolName),
-        aggregateOutputBudgetExempt: this.aggregateOutputBudgetExemptTools.has(input.toolName),
-        onEvent: (event) => this.emit(event),
-      });
-    } catch (error) {
+    const executed = await executeAtomicToolCallResult({
+      call: {
+        toolCallId: input.toolCallId,
+        toolName,
+        input: input.input,
+      },
+      tools: snapshotTools,
+      ...(snapshotTools[toolName] === undefined && this.state.tools[toolName]
+        ? { executionRejection: hiddenToolRejection(toolName) }
+        : {}),
+      messages: this.state.messages,
+      context: this.context,
+      abortSignal,
+      pendingToolCalls: this.state.pendingToolCalls,
+      inputValidation: { type: input.inputValidation ?? "validate" },
+      expansionHandling: { type: "capture" },
+      normalizeToolResultOutput: this.normalizeToolResultOutput,
+      bypassGenericOutputNormalizer: this.genericOutputNormalizerBypassTools.has(toolName),
+      aggregateOutputBudgetExempt: this.aggregateOutputBudgetExemptTools.has(toolName),
+      onEvent: (event) => this.emit(event),
+    });
+    const executedOutcome = resultOutcome(executed);
+    if (!executedOutcome.ok) {
       if (abortSignal?.aborted) this.alreadyNormalizedExternalToolCallIds.clear();
-      throw error;
+      return signalExternalToolCallHost(executedOutcome.error);
     }
+    const outcome = executedOutcome.value;
 
     let executedExpansion: ExternalToolExecutionOutcome["executedExpansion"];
     if (outcome.expansion) {
-      let childOutcomes: AtomicToolExecutionOutcome[];
-      try {
-        childOutcomes =
-          outcome.expansion.children.length === 0
-            ? []
-            : await this.executeExpansionChildren([...outcome.expansion.children], snapshot, {
-                abortSignal,
-                appendToTranscript: false,
-              });
-      } catch (error) {
+      const childResult =
+        outcome.expansion.children.length === 0
+          ? Result.ok<AtomicToolExecutionOutcome[], ToolBatchExecutionFailed>([])
+          : await this.executeExpansionChildren([...outcome.expansion.children], snapshot, {
+              abortSignal,
+              appendToTranscript: false,
+            });
+      const childResultOutcome = resultOutcome(childResult);
+      if (!childResultOutcome.ok) {
         if (abortSignal?.aborted) this.alreadyNormalizedExternalToolCallIds.clear();
-        throw error;
+        return signalExternalToolCallHost(childResultOutcome.error);
       }
+      const childOutcomes = childResultOutcome.value;
       executedExpansion = {
         children: outcome.expansion.children.map((child, index) => {
           const childOutcome = childOutcomes[index];
@@ -1397,10 +1658,14 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
       /** Rebuild an existing crash-recovery checkpoint against the replacement transcript. */
       preserveRecoveryCheckpoint?: boolean;
     },
-  ) {
+  ): ResultType<void, AgentStateTransitionFailed> {
     if (this.state.streamMessage || this.state.pendingToolCalls.size > 0) {
-      throw new Error(
-        "Cannot replace messages during a turn. Wait for the current model/tool step to finish.",
+      return Result.err(
+        new AgentStateTransitionFailed({
+          operation: "replace-messages",
+          message:
+            "Cannot replace messages during a turn. Wait for the current model/tool step to finish.",
+        }),
       );
     }
 
@@ -1421,24 +1686,30 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
       messages: this.state.messages.map(cloneMessage),
       previousMessageCount,
     });
+    return Result.ok(undefined);
   }
 
   /** Append messages to the existing transcript while idle. */
-  appendMessages(messages: ModelMessage[]) {
+  appendMessages(messages: ModelMessage[]): ResultType<void, AgentStateTransitionFailed> {
     if (this.state.streamMessage || this.state.pendingToolCalls.size > 0) {
-      throw new Error(
-        "Cannot append messages during a turn. Wait for the current model/tool step to finish.",
+      return Result.err(
+        new AgentStateTransitionFailed({
+          operation: "append-messages",
+          message:
+            "Cannot append messages during a turn. Wait for the current model/tool step to finish.",
+        }),
       );
     }
 
     for (const message of messages) {
       this.appendMessage(message);
     }
+    return Result.ok(undefined);
   }
 
   /** Clear the transcript. */
-  clearMessages() {
-    this.replaceMessages([], { reason: "replace" });
+  clearMessages(): ResultType<void, AgentStateTransitionFailed> {
+    return this.replaceMessages([], { reason: "replace" });
   }
 
   /** Configure how `steer()` messages are drained. */
@@ -1473,19 +1744,37 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
   }
 
   /** Mark provider-injected steering as delivered and retain it in the canonical transcript. */
-  acknowledgeSteeringDelivery(id: SteeringQueueId): boolean {
+  acknowledgeSteeringDeliveryResult(
+    id: SteeringQueueId,
+  ): ResultType<boolean, AgentStateTransitionFailed> {
     if (this.awaitedSteeringInterrupt && this.steeringQueue.some((entry) => entry.id === id)) {
-      throw new Error(`Cannot acknowledge steering '${id}' while an interrupt is pending`);
+      return Result.err(
+        new AgentStateTransitionFailed({
+          operation: "acknowledge-steering",
+          message: `Cannot acknowledge steering '${id}' while an interrupt is pending`,
+        }),
+      );
     }
     if (this.steeringDeliveryPreparation?.steeringEntries.some((entry) => entry.id === id)) {
-      throw new Error(`Cannot acknowledge steering '${id}' while its delivery is being prepared`);
+      return Result.err(
+        new AgentStateTransitionFailed({
+          operation: "acknowledge-steering",
+          message: `Cannot acknowledge steering '${id}' while its delivery is being prepared`,
+        }),
+      );
     }
     const index = this.steeringQueue.findIndex((entry) => entry.id === id);
-    if (index < 0) return false;
+    if (index < 0) return Result.ok(false);
     const [entry] = this.steeringQueue.splice(index, 1);
-    if (!entry) return false;
+    if (!entry) return Result.ok(false);
     this.deliveredSteeringMessages.push(entry.message);
-    return true;
+    return Result.ok(true);
+  }
+
+  acknowledgeSteeringDelivery(id: SteeringQueueId): boolean {
+    const result = resultOutcome(this.acknowledgeSteeringDeliveryResult(id));
+    if (!result.ok) return signalAgentStateHost(result.error);
+    return result.value;
   }
 
   /**
@@ -1634,37 +1923,65 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
    *
    * Only one interrupt may be pending at a time; a second call throws.
    */
-  async interrupt(message: string | ModelMessage) {
+  async interruptResult(
+    message: string | ModelMessage,
+  ): Promise<ResultType<void, AgentStateTransitionFailed>> {
     if (!this.state.isStreaming) {
       await this.prompt(message);
-      return;
+      return Result.ok(undefined);
     }
 
     if (this.pendingInterrupt) {
-      throw new Error("Interrupt already pending");
+      return Result.err(
+        new AgentStateTransitionFailed({
+          operation: "interrupt",
+          message: "Interrupt already pending",
+        }),
+      );
     }
     if (this.awaitedSteeringInterrupt) {
-      throw new Error("Queued steering interrupt already pending");
+      return Result.err(
+        new AgentStateTransitionFailed({
+          operation: "interrupt",
+          message: "Queued steering interrupt already pending",
+        }),
+      );
     }
     if (this.steeringDeliveryPreparation) {
-      throw new Error("Cannot interrupt while steering delivery is being prepared");
+      return Result.err(
+        new AgentStateTransitionFailed({
+          operation: "interrupt",
+          message: "Cannot interrupt while steering delivery is being prepared",
+        }),
+      );
     }
 
     this.pendingInterrupt = [makeUserMessage(message)];
     this.requestAbort("interrupt");
+    return Result.ok(undefined);
+  }
+
+  async interrupt(message: string | ModelMessage): Promise<void> {
+    const result = resultOutcome(await this.interruptResult(message));
+    if (!result.ok) signalAgentStateHost(result.error);
   }
 
   /**
    * Abort and replay the active attempt from its latest recovery checkpoint.
    * The decision runs only after the model and tools have cooperatively settled.
    */
-  requestIdleRecovery(
+  async requestIdleRecovery(
     error: unknown,
     decideRetry: IdleRecoveryDecisionHandler,
   ): Promise<IdleRecoveryResult> {
     if (!this.state.isStreaming) return Promise.resolve({ status: "inactive" });
     if (this.idleRecoveryRequest) {
-      return Promise.reject(new Error("Idle recovery already pending"));
+      return signalAgentStateHost(
+        new AgentStateTransitionFailed({
+          operation: "request-idle-recovery",
+          message: "Idle recovery already pending",
+        }),
+      );
     }
     if (this.cancelResetPending) {
       return Promise.resolve({ status: "superseded", reason: "cancel" });
@@ -1700,15 +2017,13 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
    * Start a new agent run by appending message(s) and executing turns until done.
    */
   async prompt(input: string | ModelMessage | ModelMessage[]) {
-    if (this.state.isStreaming) {
-      throw new Error("Agent is already processing. Use steer() or followUp(), or waitForIdle().");
-    }
+    const valid = resultOutcome(this.validateRunStart("prompt"));
+    if (!valid.ok) signalAgentStateHost(valid.error);
 
-    const newMessages = Array.isArray(input)
-      ? input
-      : typeof input === "string"
-        ? [makeUserMessage(input)]
-        : [input];
+    let newMessages: ModelMessage[];
+    if (Array.isArray(input)) newMessages = input;
+    else if (typeof input === "string") newMessages = [makeUserMessage(input)];
+    else newMessages = [input];
 
     await this.runLoop({ newMessages });
   }
@@ -1719,16 +2034,39 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
    * The last message must not be an assistant message.
    */
   async continue() {
-    if (this.state.isStreaming) {
-      throw new Error("Agent is already processing. Wait for completion before continuing.");
-    }
-
-    const messages = this.state.messages;
-    if (messages.length === 0) throw new Error("No messages to continue from");
-    const last = messages[messages.length - 1]!;
-    if (last.role === "assistant") throw new Error("Cannot continue from assistant message");
+    const valid = resultOutcome(this.validateRunStart("continue"));
+    if (!valid.ok) signalAgentStateHost(valid.error);
 
     await this.runLoop({ newMessages: undefined });
+  }
+
+  private validateRunStart(
+    operation: "prompt" | "continue",
+  ): ResultType<void, AgentStateTransitionFailed> {
+    if (this.state.isStreaming) {
+      const message =
+        operation === "prompt"
+          ? "Agent is already processing. Use steer() or followUp(), or waitForIdle()."
+          : "Agent is already processing. Wait for completion before continuing.";
+      return Result.err(new AgentStateTransitionFailed({ operation, message }));
+    }
+    if (operation === "continue") {
+      const last = this.state.messages.at(-1);
+      if (!last) {
+        return Result.err(
+          new AgentStateTransitionFailed({ operation, message: "No messages to continue from" }),
+        );
+      }
+      if (last.role === "assistant") {
+        return Result.err(
+          new AgentStateTransitionFailed({
+            operation,
+            message: "Cannot continue from assistant message",
+          }),
+        );
+      }
+    }
+    return Result.ok(undefined);
   }
 
   private appendMessage(message: ModelMessage) {
@@ -1816,7 +2154,8 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
       preparation.hookStatus = "prepared";
       return { status: "prepared" };
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
+      rethrowAgentPanic(error);
+      const message = errorMessage(error);
       this.emit({
         type: "steering_delivery_failed",
         deliveryKind: preparation.deliveryKind,
@@ -1834,13 +2173,20 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
     preparation.settle();
   }
 
-  private consumeSteeringDelivery(preparation: SteeringDeliveryPreparation): ModelMessage[] {
+  private consumeSteeringDelivery(
+    preparation: SteeringDeliveryPreparation,
+  ): ResultType<ModelMessage[], AgentStateTransitionFailed> {
     if (
       this.steeringDeliveryPreparation !== preparation ||
       preparation.hookStatus !== "prepared" ||
       !this.steeringPreparationMatchesQueues(preparation)
     ) {
-      throw new Error("Cannot consume steering entries without their successful preparation");
+      return Result.err(
+        new AgentStateTransitionFailed({
+          operation: "consume-steering",
+          message: "Cannot consume steering entries without their successful preparation",
+        }),
+      );
     }
 
     this.steeringQueue.splice(0, preparation.steeringEntries.length);
@@ -1849,7 +2195,7 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
       cloneQueuedMessage(message, "deliver"),
     );
     this.clearSteeringDeliveryPreparation(preparation);
-    return canonicalMessages;
+    return Result.ok(canonicalMessages);
   }
 
   private settleAwaitedSteeringInterrupt(
@@ -1890,8 +2236,18 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
       return;
     }
 
-    const canonicalMessages = this.consumeSteeringDelivery(preparation);
-    for (const message of canonicalMessages) this.appendMessage(message);
+    const consumed = this.consumeSteeringDelivery(preparation);
+    const consumedOutcome = resultOutcome(consumed);
+    if (!consumedOutcome.ok) {
+      this.clearSteeringDeliveryPreparation(preparation);
+      this.settleAwaitedSteeringInterrupt(request, {
+        status: "failed",
+        steeringIds: preparation.steeringEntries.map((entry) => entry.id),
+        error: consumedOutcome.error.message,
+      });
+      return;
+    }
+    for (const message of consumedOutcome.value) this.appendMessage(message);
     this.settleAwaitedSteeringInterrupt(request, {
       status: "interrupted",
       steeringIds: preparation.steeringEntries.map((entry) => entry.id),
@@ -1915,12 +2271,14 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
         return { status: "external-settled" };
       }
       if (!this.steeringPreparationMatchesQueues(existing)) {
-        throw new Error("Prepared steering entries no longer match the queue prefixes");
+        this.clearSteeringDeliveryPreparation(existing);
+        return { status: "failed" };
       }
       if (existing.hookStatus === "prepared") {
         return { status: "prepared", preparation: existing };
       }
-      throw new Error("Queued steering preparation was re-entered while still pending");
+      this.clearSteeringDeliveryPreparation(existing);
+      return { status: "failed" };
     }
 
     const selection = this.selectSteeringDelivery("queued", this.steeringMode);
@@ -2052,7 +2410,8 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
       decision = await request.decideRetry(request.error, {
         abortSignal,
       });
-    } catch {
+    } catch (cause) {
+      rethrowAgentPanic(cause);
       // A failed retry decision refuses recovery; the original idle error remains authoritative.
     }
 
@@ -2263,9 +2622,12 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
               turn.newMessages.some(
                 (message) => message.role === "tool" || hasInlineToolResult(message),
               );
-            const executedToolCallCount = hasLocalToolCalls
+            const toolExecution = hasLocalToolCalls
               ? await this.executeToolCalls(turn.toolCalls, turn.toolSnapshot)
-              : 0;
+              : Result.ok<number, ToolBatchExecutionFailed>(0);
+            const toolExecutionOutcome = resultOutcome(toolExecution);
+            if (!toolExecutionOutcome.ok) throw toolExecutionOutcome.error.cause;
+            const executedToolCallCount = toolExecutionOutcome.value;
             if (hasLocalToolCalls) this.recoveryCheckpoint = null;
 
             const boundaryDecision = await this.applyTurnBoundary({
@@ -2284,10 +2646,13 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
             // the normal tool-result continuation decision.
             const steeringPreparation = await this.prepareQueuedSteeringDelivery();
             if (steeringPreparation.status === "prepared") {
-              const canonicalMessages = this.consumeSteeringDelivery(
-                steeringPreparation.preparation,
-              );
-              for (const msg of canonicalMessages) {
+              const consumed = this.consumeSteeringDelivery(steeringPreparation.preparation);
+              const consumedOutcome = resultOutcome(consumed);
+              if (!consumedOutcome.ok) {
+                this.clearSteeringDeliveryPreparation(steeringPreparation.preparation);
+                break;
+              }
+              for (const msg of consumedOutcome.value) {
                 this.appendMessage(msg);
               }
               continue;
@@ -2329,6 +2694,7 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
             this.recoveryCheckpoint = null;
             break;
           } catch (err) {
+            rethrowAgentPanic(err);
             if (err instanceof TurnAbortedError) {
               const idleRecoveryRequest = this.idleRecoveryRequest;
               if (idleRecoveryRequest && err.reason !== "recovery") {
@@ -2416,13 +2782,19 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
 
             if (this.turnErrorHandler) {
               const lastMessage = this.state.messages.at(-1);
-              const retrySafety: TurnRetrySafety = modelTurnCompleted
-                ? { canRetry: false, reason: "post-model-phase" }
-                : this.providerExecutedToolAttemptLatched
-                  ? { canRetry: false, reason: "provider-executed-tool" }
-                  : lastMessage?.role === "assistant" || this.state.pendingToolCalls.size > 0
-                    ? { canRetry: false, reason: "invalid-transcript-boundary" }
-                    : { canRetry: true };
+              let retrySafety: TurnRetrySafety;
+              if (modelTurnCompleted) {
+                retrySafety = { canRetry: false, reason: "post-model-phase" };
+              } else if (this.providerExecutedToolAttemptLatched) {
+                retrySafety = { canRetry: false, reason: "provider-executed-tool" };
+              } else if (
+                lastMessage?.role === "assistant" ||
+                this.state.pendingToolCalls.size > 0
+              ) {
+                retrySafety = { canRetry: false, reason: "invalid-transcript-boundary" };
+              } else {
+                retrySafety = { canRetry: true };
+              }
               let decision: TurnErrorHandlerDecision | undefined;
               try {
                 decision = await this.turnErrorHandler(err, {
@@ -2431,6 +2803,7 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
                   phase: turnErrorPhase,
                 });
               } catch (handlerError) {
+                rethrowAgentPanic(handlerError);
                 if (
                   !this.cancelResetPending &&
                   !this.pendingInterrupt &&
@@ -2473,6 +2846,7 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
           totalUsage: runTotalUsage,
         });
       } catch (err) {
+        rethrowAgentPanic(err);
         this.state.error = err instanceof Error ? err.message : String(err);
         this.emit({
           type: "agent_end",
@@ -2541,20 +2915,24 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
     if (this.beforeStep) {
       const preStepSignal = this.abortController?.signal;
       if (preStepSignal?.aborted) {
-        throw new TurnAbortedError({
-          reason: this.abortRequestedReason ?? (this.pendingInterrupt ? "interrupt" : "manual"),
-          phase: "model",
-        });
+        signalAgentStateHost(
+          new TurnAbortedError({
+            reason: this.abortRequestedReason ?? (this.pendingInterrupt ? "interrupt" : "manual"),
+            phase: "model",
+          }),
+        );
       }
       await this.beforeStep({
         step: turnIndex,
         ...(preStepSignal ? { abortSignal: preStepSignal } : {}),
       });
       if (preStepSignal?.aborted) {
-        throw new TurnAbortedError({
-          reason: this.abortRequestedReason ?? (this.pendingInterrupt ? "interrupt" : "manual"),
-          phase: "model",
-        });
+        signalAgentStateHost(
+          new TurnAbortedError({
+            reason: this.abortRequestedReason ?? (this.pendingInterrupt ? "interrupt" : "manual"),
+            phase: "model",
+          }),
+        );
       }
     }
 
@@ -2570,7 +2948,7 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
     params.onErrorPhase("transform-messages");
     const throwIfPreparationAborted = () => {
       if (!abortSignal?.aborted) return;
-      throw new TurnAbortedError({ reason: getAbortReason(), phase: "model" });
+      signalAgentStateHost(new TurnAbortedError({ reason: getAbortReason(), phase: "model" }));
     };
     const contextForMode = (executionMode: ModelCallExecutionMode): TransformMessagesContext => ({
       system: this.state.system,
@@ -2590,14 +2968,16 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
     canonicalMessages = normalizeReplayMessages(this.state.messages.map(cloneMessage));
     await this.canonicalModelCallPreflight?.(canonicalMessages, preparationContext);
     canonicalMessages = normalizeReplayMessages(this.state.messages.map(cloneMessage));
-    preparedCanonical = this.prepareFullBudgetView
-      ? await this.prepareFullBudgetView(canonicalMessages, {
-          ...preparationContext,
-          canonicalStartIndex: 0,
-        })
-      : this.prepareFullModelView
-        ? await this.prepareFullModelView(canonicalMessages, preparationContext)
-        : canonicalMessages;
+    if (this.prepareFullBudgetView) {
+      preparedCanonical = await this.prepareFullBudgetView(canonicalMessages, {
+        ...preparationContext,
+        canonicalStartIndex: 0,
+      });
+    } else if (this.prepareFullModelView) {
+      preparedCanonical = await this.prepareFullModelView(canonicalMessages, preparationContext);
+    } else {
+      preparedCanonical = canonicalMessages;
+    }
     preparedCanonical = normalizeReplayMessages(preparedCanonical);
     throwIfPreparationAborted();
 
@@ -2627,7 +3007,12 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
       suffixStart < 0 ||
       suffixStart > canonicalMessages.length
     ) {
-      throw new Error(`prepareModelCall selected invalid canonical suffix index ${suffixStart}`);
+      signalAgentStateHost(
+        new AgentStateTransitionFailed({
+          operation: "prepare model call",
+          message: `prepareModelCall selected invalid canonical suffix index ${suffixStart}`,
+        }),
+      );
     }
     const persistentAttemptIdentity = callPreparation.runtime.persistentAttemptIdentity;
     if (
@@ -2644,15 +3029,12 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
       : selectedCanonical;
     messagesForModel = normalizeReplayMessages(messagesForModel);
     if (messagesForModel.at(-1)?.role === "assistant") {
-      throw new Error("Cannot append an ephemeral overlay after an assistant message", {
-        cause: {
-          code: "INVALID_PRE_OVERLAY_MODEL_VIEW",
-          suffixStart,
-          canonicalMessageCount: canonicalMessages.length,
-          selectedCanonicalRoles: selectedCanonical.slice(-4).map((message) => message.role),
-          preparedModelRoles: messagesForModel.slice(-4).map((message) => message.role),
-        },
-      });
+      signalAgentStateHost(
+        new AgentStateTransitionFailed({
+          operation: "prepare model view",
+          message: `Cannot append an ephemeral overlay after an assistant message (suffixStart=${suffixStart}, canonicalMessageCount=${canonicalMessages.length})`,
+        }),
+      );
     }
     const payloadOverlay = this.buildEphemeralOverlay
       ? await this.buildEphemeralOverlay(preparationContext)
@@ -2681,8 +3063,12 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
     const lastMessage =
       messagesForModel.length > 0 ? messagesForModel[messagesForModel.length - 1] : undefined;
     if (lastMessage?.role === "assistant") {
-      throw new Error(
-        "Request preparation produced an invalid outbound context: last message is assistant.",
+      signalAgentStateHost(
+        new AgentStateTransitionFailed({
+          operation: "prepare outbound context",
+          message:
+            "Request preparation produced an invalid outbound context: last message is assistant.",
+        }),
       );
     }
 
@@ -2694,6 +3080,19 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
       instructions: this.state.system,
       messages: messagesForModel,
       ...(callPreparation.runtime.executionMode === "local-tools" ? { tools: allModelTools } : {}),
+      experimental_repairToolCall: async ({ toolCall, tools, error }) => {
+        if (NoSuchToolError.isInstance(error)) {
+          const toolName = canonicalToolName(toolCall.toolName);
+          return toolName !== toolCall.toolName && tools[toolName]
+            ? { ...toolCall, toolName }
+            : null;
+        }
+        if (InvalidToolInputError.isInstance(error) && toolCall.toolName === "batch") {
+          const input = repairLegacyBatchInput(toolCall.input, tools);
+          return input === null ? null : { ...toolCall, input };
+        }
+        return null;
+      },
       reasoning: this.state.reasoning,
       providerOptions: this.state.providerOptions,
       experimental_download: this.experimentalDownload,
@@ -2715,8 +3114,10 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
 
     let aborted = false;
 
-    for await (const part of result.stream) {
-      if (part.type === "abort") {
+    for await (const externalPart of result.stream) {
+      const projectedPart = projectAiSdkTextStreamPart(externalPart);
+      if (projectedPart.kind === "unsupported") continue;
+      if (projectedPart.kind === "abort") {
         aborted = true;
         break;
       }
@@ -2724,23 +3125,23 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
         aborted = true;
         break;
       }
-      if (part.type === "start-step") {
+      if (projectedPart.kind === "start-step") {
         continue;
       }
 
       if (
         !assistantStarted &&
-        (part.type === "text-start" ||
-          part.type === "text-delta" ||
-          part.type === "reasoning-start" ||
-          part.type === "reasoning-delta" ||
-          part.type === "tool-input-start" ||
-          part.type === "tool-input-delta" ||
-          part.type === "tool-call" ||
-          part.type === "custom" ||
-          part.type === "source" ||
-          part.type === "file" ||
-          part.type === "reasoning-file")
+        (projectedPart.kind === "text-start" ||
+          projectedPart.kind === "text-delta" ||
+          projectedPart.kind === "reasoning-start" ||
+          projectedPart.kind === "reasoning-delta" ||
+          projectedPart.kind === "tool-input-start" ||
+          projectedPart.kind === "tool-input-delta" ||
+          projectedPart.kind === "tool-call" ||
+          projectedPart.kind === "custom" ||
+          projectedPart.kind === "source" ||
+          projectedPart.kind === "file" ||
+          projectedPart.kind === "reasoning-file")
       ) {
         assistantStarted = true;
         this.state.streamMessage = partialAssistant;
@@ -2750,8 +3151,9 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
         });
       }
 
-      switch (part.type) {
+      switch (projectedPart.kind) {
         case "text-start": {
+          const part = projectedPart.raw;
           // Some providers omit the preceding block's explicit end event. A new
           // block still makes the accumulated prefix a completed boundary.
           this.checkpointRecoveryDraft(partialAssistant);
@@ -2767,6 +3169,7 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
           break;
         }
         case "text-delta": {
+          const part = projectedPart.raw;
           if (partialAssistant.content.at(-1)?.type === "reasoning") {
             this.checkpointRecoveryDraft(partialAssistant);
           }
@@ -2785,6 +3188,7 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
           break;
         }
         case "text-end": {
+          const part = projectedPart.raw;
           if (this.abortController?.signal.aborted) break;
           this.checkpointRecoveryDraft(partialAssistant);
           this.emit({
@@ -2799,6 +3203,7 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
           break;
         }
         case "reasoning-start": {
+          const part = projectedPart.raw;
           this.checkpointRecoveryDraft(partialAssistant);
           this.emit({
             type: "message_update",
@@ -2812,6 +3217,7 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
           break;
         }
         case "reasoning-delta": {
+          const part = projectedPart.raw;
           if (partialAssistant.content.at(-1)?.type === "text") {
             this.checkpointRecoveryDraft(partialAssistant);
           }
@@ -2830,6 +3236,7 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
           break;
         }
         case "reasoning-end": {
+          const part = projectedPart.raw;
           if (this.abortController?.signal.aborted) break;
           this.checkpointRecoveryDraft(partialAssistant);
           this.emit({
@@ -2844,6 +3251,7 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
           break;
         }
         case "tool-input-start": {
+          const part = projectedPart.raw;
           this.checkpointRecoveryDraft(partialAssistant);
           if (part.providerExecuted === true) {
             params.onProviderExecutedTool();
@@ -2863,6 +3271,7 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
           break;
         }
         case "tool-input-delta": {
+          const part = projectedPart.raw;
           this.emit({
             type: "message_update",
             message: cloneMessage(partialAssistant),
@@ -2876,6 +3285,7 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
           break;
         }
         case "tool-input-end": {
+          const part = projectedPart.raw;
           this.emit({
             type: "message_update",
             message: cloneMessage(partialAssistant),
@@ -2888,6 +3298,7 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
           break;
         }
         case "custom": {
+          const part = projectedPart.raw;
           this.emit({
             type: "message_update",
             message: cloneMessage(partialAssistant),
@@ -2896,6 +3307,7 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
           break;
         }
         case "source": {
+          const part = projectedPart.raw;
           this.emit({
             type: "message_update",
             message: cloneMessage(partialAssistant),
@@ -2904,6 +3316,7 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
           break;
         }
         case "file": {
+          const part = projectedPart.raw;
           this.emit({
             type: "message_update",
             message: cloneMessage(partialAssistant),
@@ -2912,6 +3325,7 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
           break;
         }
         case "reasoning-file": {
+          const part = projectedPart.raw;
           this.emit({
             type: "message_update",
             message: cloneMessage(partialAssistant),
@@ -2920,6 +3334,7 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
           break;
         }
         case "tool-call": {
+          const part = projectedPart.raw;
           if (this.abortController?.signal.aborted) break;
           this.checkpointRecoveryDraft(partialAssistant);
           const { toolCallId, toolName, input } = part;
@@ -2939,6 +3354,7 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
           break;
         }
         case "tool-result": {
+          const part = projectedPart.raw;
           if (this.abortController?.signal.aborted) break;
           if (part.providerExecuted === true) {
             params.onProviderExecutedTool();
@@ -2954,6 +3370,7 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
           break;
         }
         case "tool-error": {
+          const part = projectedPart.raw;
           if (this.abortController?.signal.aborted) break;
           if (part.providerExecuted === true) {
             params.onProviderExecutedTool();
@@ -2969,6 +3386,7 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
           break;
         }
         case "tool-output-denied": {
+          const part = projectedPart.raw;
           if (this.abortController?.signal.aborted) break;
           if (part.providerExecuted === true) {
             params.onProviderExecutedTool();
@@ -2984,22 +3402,28 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
           break;
         }
         case "tool-approval-response": {
+          const part = projectedPart.raw;
           if (part.providerExecuted === true) {
             params.onProviderExecutedTool();
           }
           break;
         }
         case "tool-approval-request": {
+          const part = projectedPart.raw;
           if (part.toolCall.providerExecuted === true) {
             params.onProviderExecutedTool();
           }
           break;
         }
         case "error": {
-          throw part.error;
+          const part = projectedPart.raw;
+          signalExternalToolCallHost(
+            new AgentExternalHostFailed({
+              cause: part.error,
+              message: "AI SDK model stream failed",
+            }),
+          );
         }
-        default:
-          break;
       }
     }
 
@@ -3015,7 +3439,7 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
       const reason: TurnAbortReason =
         this.abortRequestedReason ?? (this.pendingInterrupt ? "interrupt" : "manual");
 
-      throw new TurnAbortedError({ reason, phase: "model" });
+      signalAgentStateHost(new TurnAbortedError({ reason, phase: "model" }));
     }
 
     let response: Awaited<typeof result.response>;
@@ -3030,6 +3454,7 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
       totalUsage = await result.totalUsage;
       warnings = await result.warnings;
     } catch (e) {
+      rethrowAgentPanic(e);
       if (this.abortController?.signal.aborted) {
         if (assistantStarted) {
           this.emit({
@@ -3042,9 +3467,11 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
         const reason: TurnAbortReason =
           this.abortRequestedReason ?? (this.pendingInterrupt ? "interrupt" : "manual");
 
-        throw new TurnAbortedError({ reason, phase: "model" });
+        signalAgentStateHost(new TurnAbortedError({ reason, phase: "model" }));
       }
-      throw e;
+      signalExternalToolCallHost(
+        new AgentExternalHostFailed({ cause: e, message: "AI SDK model response failed" }),
+      );
     }
     params.onErrorPhase("post-model");
 
@@ -3115,7 +3542,7 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
       this.abortRequestedReason ?? (this.pendingInterrupt ? "interrupt" : "manual");
     const assertNotAborted = () => {
       if (this.abortController?.signal.aborted) {
-        throw new TurnAbortedError({ reason: getAbortReason(), phase: "tools" });
+        signalAgentStateHost(new TurnAbortedError({ reason: getAbortReason(), phase: "tools" }));
       }
     };
 
@@ -3145,7 +3572,7 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
     toolCalls: ExpandedToolCall[],
     snapshot: StepToolSnapshot<TOOLS>,
     options: { abortSignal?: AbortSignal; appendToTranscript: boolean },
-  ): Promise<AtomicToolExecutionOutcome[]> {
+  ): Promise<ResultType<AtomicToolExecutionOutcome[], ToolBatchExecutionFailed>> {
     const MAX_PARALLEL_TOOLS = 8;
     const hasExclusiveTool = toolCalls.some((call) => this.exclusiveToolNames.has(call.toolName));
     const getAbortReason = (): TurnAbortReason =>
@@ -3154,7 +3581,7 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
     const assertNotAborted = () => {
       if (!isAborted()) return;
       if (this.abortController?.signal.aborted) {
-        throw new TurnAbortedError({ reason: getAbortReason(), phase: "tools" });
+        signalAgentStateHost(new TurnAbortedError({ reason: getAbortReason(), phase: "tools" }));
       }
       options.abortSignal?.throwIfAborted();
     };
@@ -3176,12 +3603,13 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
         },
         bypassGenericOutputNormalizer: this.genericOutputNormalizerBypassTools.has(call.toolName),
         aggregateOutputBudgetExempt: this.aggregateOutputBudgetExemptTools.has(call.toolName),
-        executionRejection:
-          snapshot.tools[call.toolName] === undefined && this.state.tools[call.toolName]
-            ? hiddenToolRejection(call.toolName)
-            : hasExclusiveTool && !this.exclusiveToolNames.has(call.toolName)
-              ? `Tool '${call.toolName}' was not executed because an exclusive tool was selected in the same turn. Retry it after processing the exclusive tool result.`
-              : undefined,
+        executionRejection: toolExecutionRejection({
+          toolName: call.toolName,
+          snapshotTools: snapshot.tools,
+          currentTools: this.state.tools,
+          hasExclusiveTool,
+          exclusiveToolNames: this.exclusiveToolNames,
+        }),
         assertNotAborted,
         onEvent: (event) => this.emit(event),
       }),
@@ -3190,7 +3618,7 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
     const settled: Array<AtomicToolExecutionOutcome | undefined> = Array.from({
       length: toolCalls.length,
     });
-    let executionError: { error: unknown } | undefined;
+    let executionError: AtomicToolExecutionFailed | undefined;
     let next = 0;
     const workers = Array.from({ length: Math.min(MAX_PARALLEL_TOOLS, toolCalls.length) }, () =>
       (async () => {
@@ -3199,20 +3627,24 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
           const index = next;
           if (index >= toolCalls.length) return;
           next += 1;
-          try {
-            settled[index] = await settleAtomicToolCall(atomicOptions[index]!);
-          } catch (error) {
-            executionError ??= { error };
-            if (isAborted()) return;
-          }
+          const result = await settleAtomicToolCallResult(atomicOptions[index]!);
+          result.match({
+            ok: (value) => {
+              settled[index] = value;
+            },
+            err: (error) => {
+              executionError ??= error;
+            },
+          });
+          if (isAborted()) return;
         }
       })(),
     );
     await Promise.all(workers);
 
-    const entryFor = (index: number): SettledToolResultOutputEntry => {
+    const entryFor = (index: number): SettledToolResultOutputEntry | undefined => {
       const child = settled[index];
-      if (!child) throw new Error(`Missing settled output at index ${index}`);
+      if (!child) return undefined;
       const callOptions = atomicOptions[index]!;
       return {
         output: child.toolOutput,
@@ -3246,12 +3678,18 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
           this.normalizeToolOutput(output, context),
         );
         if (outputs.length !== entries.length) {
-          throw new Error(
-            `Expansion output normalizer returned ${outputs.length} outputs for ${entries.length} children.`,
-          );
+          logger.warn("settled expansion output normalization returned wrong output count", {
+            expected: entries.length,
+            actual: outputs.length,
+          });
+          return entries.map(() => ({
+            type: "error-text" as const,
+            value: SETTLED_NORMALIZATION_FAILED,
+          }));
         }
         return outputs;
       } catch (error) {
+        rethrowAgentPanic(error);
         logger.warn("settled expansion output normalization failed", {
           error: error instanceof Error ? error.message : String(error),
         });
@@ -3294,7 +3732,11 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
         length: settled.length,
       });
       const completedIndexes = settled.flatMap((child, index) => (child ? [index] : []));
-      const outputs = await normalizeEntries(completedIndexes.map(entryFor));
+      const entries = completedIndexes.flatMap((index) => {
+        const entry = entryFor(index);
+        return entry ? [entry] : [];
+      });
+      const outputs = await normalizeEntries(entries);
       for (let offset = 0; offset < completedIndexes.length; offset += 1) {
         const index = completedIndexes[offset]!;
         completed[index] = finalizeSettledAtomicToolCall(
@@ -3308,19 +3750,34 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
 
     if (isAborted() || executionError) {
       await finalizeCompleted();
-      if (executionError) throw executionError.error;
+      if (executionError) {
+        return Result.err(
+          new ToolBatchExecutionFailed({
+            cause: executionError.cause,
+            message: executionError.message,
+          }),
+        );
+      }
       assertNotAborted();
     }
 
     if (settled.some((outcome) => outcome === undefined)) {
       await finalizeCompleted();
       const missingIndex = settled.findIndex((outcome) => outcome === undefined);
-      throw new Error(
-        `Missing tool execution outcome for toolCallId=${toolCalls[missingIndex]!.toolCallId}`,
+      return Result.err(
+        new ToolBatchExecutionFailed({
+          cause: new Error(
+            `Missing tool execution outcome for toolCallId=${toolCalls[missingIndex]!.toolCallId}`,
+          ),
+          message: `Missing tool execution outcome for toolCallId=${toolCalls[missingIndex]!.toolCallId}`,
+        }),
       );
     }
 
-    const entries = settled.map((_child, index) => entryFor(index));
+    const entries = settled.flatMap((_child, index) => {
+      const entry = entryFor(index);
+      return entry ? [entry] : [];
+    });
     const normalizedOutputs = await normalizeEntries(entries);
 
     const outcomes: AtomicToolExecutionOutcome[] = [];
@@ -3356,13 +3813,13 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
       }
     }
 
-    return outcomes;
+    return Result.ok(outcomes);
   }
 
   private async executeToolCalls(
     toolCalls: ExpandedToolCall[],
     snapshot: StepToolSnapshot<TOOLS>,
-  ): Promise<number> {
+  ): Promise<ResultType<number, ToolBatchExecutionFailed>> {
     const MAX_PARALLEL_TOOLS = 8;
     const hasExclusiveTool = toolCalls.some((call) => this.exclusiveToolNames.has(call.toolName));
 
@@ -3372,12 +3829,12 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
     const isAborted = (): boolean => this.abortController?.signal.aborted === true;
     const assertNotAborted = () => {
       if (isAborted()) {
-        throw new TurnAbortedError({ reason: getAbortReason(), phase: "tools" });
+        signalAgentStateHost(new TurnAbortedError({ reason: getAbortReason(), phase: "tools" }));
       }
     };
 
-    const executeOne = (call: ExpandedToolCall): Promise<AtomicToolExecutionOutcome> =>
-      executeAtomicToolCall({
+    const executeOne = (call: ExpandedToolCall) =>
+      executeAtomicToolCallResult({
         call,
         tools: snapshot.tools,
         messages: this.state.messages,
@@ -3391,12 +3848,13 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
         normalizeToolResultOutput: this.normalizeToolResultOutput,
         bypassGenericOutputNormalizer: this.genericOutputNormalizerBypassTools.has(call.toolName),
         aggregateOutputBudgetExempt: this.aggregateOutputBudgetExemptTools.has(call.toolName),
-        executionRejection:
-          snapshot.tools[call.toolName] === undefined && this.state.tools[call.toolName]
-            ? hiddenToolRejection(call.toolName)
-            : hasExclusiveTool && !this.exclusiveToolNames.has(call.toolName)
-              ? `Tool '${call.toolName}' was not executed because an exclusive tool was selected in the same turn. Retry it after processing the exclusive tool result.`
-              : undefined,
+        executionRejection: toolExecutionRejection({
+          toolName: call.toolName,
+          snapshotTools: snapshot.tools,
+          currentTools: this.state.tools,
+          hasExclusiveTool,
+          exclusiveToolNames: this.exclusiveToolNames,
+        }),
         assertNotAborted,
         onEvent: (event) => this.emit(event),
       });
@@ -3458,6 +3916,7 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
     };
 
     let stoppedDueToAbort = false;
+    let executionError: AtomicToolExecutionFailed | undefined;
     let next = 0;
     const workers = Array.from({ length: Math.min(MAX_PARALLEL_TOOLS, toolCalls.length) }, () =>
       (async () => {
@@ -3467,7 +3926,13 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
           if (index >= toolCalls.length) return;
           next += 1;
 
-          outcomes[index] = await executeOne(toolCalls[index]!);
+          const result = await executeOne(toolCalls[index]!);
+          const outcome = resultOutcome(result);
+          if (!outcome.ok) {
+            executionError ??= outcome.error;
+            return;
+          }
+          outcomes[index] = outcome.value;
           checkpointCompletedOutcomes();
           appendReadyOutcomes();
         }
@@ -3475,14 +3940,24 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
     );
     await Promise.all(workers);
     if (isAborted()) stoppedDueToAbort = true;
+    if (executionError) {
+      return Result.err(
+        new ToolBatchExecutionFailed({
+          cause: executionError.cause,
+          message: executionError.message,
+        }),
+      );
+    }
 
     if (!stoppedDueToAbort && nextAppendIndex !== toolCalls.length) {
       const missing = toolCalls[nextAppendIndex]!;
-      throw new Error(`Missing tool execution outcome for toolCallId=${missing.toolCallId}`);
+      const message = `Missing tool execution outcome for toolCallId=${missing.toolCallId}`;
+      return Result.err(new ToolBatchExecutionFailed({ cause: new Error(message), message }));
     }
 
     if (isAborted()) {
-      throw new TurnAbortedError({ reason: getAbortReason(), phase: "tools" });
+      const cause = new TurnAbortedError({ reason: getAbortReason(), phase: "tools" });
+      return Result.err(new ToolBatchExecutionFailed({ cause, message: cause.message }));
     }
 
     let executed = toolCalls.length;
@@ -3504,10 +3979,12 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
         abortSignal: this.abortController?.signal,
         appendToTranscript: true,
       });
-      executed += childOutcomes.length;
+      const childOutcome = resultOutcome(childOutcomes);
+      if (!childOutcome.ok) return Result.err(childOutcome.error);
+      executed += childOutcome.value.length;
     }
 
-    return executed;
+    return Result.ok(executed);
   }
 }
 

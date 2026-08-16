@@ -1,23 +1,28 @@
+import { normalizeWorkflowResourcePolicy, workflowStoreValue } from "./workflow-store-test-helpers";
 import { Database } from "bun:sqlite";
 import { describe, expect, it } from "bun:test";
+import { Panic } from "better-result";
 import { rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-
 import { DurableWorkflowStore } from "../../src/workflow/durable-workflow-store";
 import {
   canonicalJsonSha256,
   WORKFLOW_RUNTIME_VERSION,
 } from "../../src/workflow/workflow-definition";
 import {
-  normalizeWorkflowResourcePolicy,
   type WorkflowOperation,
   type WorkflowRevision,
   type WorkflowRun,
   type WorkflowTrigger,
 } from "../../src/workflow/workflow-domain";
+import {
+  applyWorkflowSchemaMigrations,
+  WorkflowMigrationInvalidTimestamp,
+  WORKFLOW_MIGRATION_VERSIONS,
+  WORKFLOW_SCHEMA_VERSION,
+} from "../../src/workflow/workflow-migrations";
 import { workflowResolvedModelRequestSchema } from "../../src/workflow/workflow-request-authority";
-
 function dbPath(label: string): string {
   return join(tmpdir(), `lilac-workflow-${label}-${crypto.randomUUID()}.sqlite`);
 }
@@ -26,14 +31,14 @@ function revision(id = "revision-1"): WorkflowRevision {
   const resources = normalizeWorkflowResourcePolicy({
     agents: { maxConcurrent: 2, maxTotal: 8 },
     maxNestingDepth: 4,
-    operationIdleTimeoutMs: 10_000,
+    operationIdleTimeoutMs: 10000,
     waits: ["reply", "sleep"],
   });
   const limits = {
-    maxSourceBytes: 10_000,
-    maxInputBytes: 10_000,
-    maxOperationOutputBytes: 10_000,
-    maxResultBytes: 10_000,
+    maxSourceBytes: 10000,
+    maxInputBytes: 10000,
+    maxOperationOutputBytes: 10000,
+    maxResultBytes: 10000,
   };
   return {
     revisionId: id,
@@ -54,7 +59,6 @@ function revision(id = "revision-1"): WorkflowRevision {
     createdAt: 10,
   };
 }
-
 function run(id = "run-1", revisionId = "revision-1"): WorkflowRun {
   return {
     runId: id,
@@ -83,7 +87,6 @@ function run(id = "run-1", revisionId = "revision-1"): WorkflowRun {
     terminalAt: null,
   };
 }
-
 function liveParentRun(id: string, parentRequestId: string): WorkflowRun {
   return {
     ...run(id),
@@ -109,7 +112,6 @@ function liveParentRun(id: string, parentRequestId: string): WorkflowRun {
     },
   };
 }
-
 function operation(runId: string, operationId: string): WorkflowOperation {
   const input = { prompt: "inspect", options: { profile: "general", cwd: "/workspace" } };
   return {
@@ -137,7 +139,6 @@ function operation(runId: string, operationId: string): WorkflowOperation {
     terminalAt: null,
   };
 }
-
 function downgradeSchemaToV21(db: Database): void {
   db.run("PRAGMA foreign_keys = OFF");
   db.run("ALTER TABLE workflow_request_dispatches RENAME TO workflow_request_dispatches_v23");
@@ -200,9 +201,13 @@ function downgradeSchemaToV21(db: Database): void {
         NEW.created_at
       );
     END`);
+  db.run("ALTER TABLE workflow_surface_bindings DROP COLUMN permanent_failure_json");
   db.run("DELETE FROM workflow_schema_migrations WHERE version >= 22");
 }
-
+function downgradeSchemaToV24(db: Database): void {
+  db.run("ALTER TABLE workflow_surface_bindings DROP COLUMN permanent_failure_json");
+  db.run("DELETE FROM workflow_schema_migrations WHERE version = 25");
+}
 function downgradeSchemaToV20(db: Database): void {
   downgradeSchemaToV21(db);
   db.run("DELETE FROM workflow_schema_migrations WHERE version = 21");
@@ -245,8 +250,232 @@ function downgradeSchemaToV20(db: Database): void {
     limits_json = json_set(limits_json, '$.maxRuntimeMemoryBytes', 268435456),
     runtime_version = 'lilac-workflow-js-v3'`);
 }
-
 describe("durable workflow store minimal dispatch schema", () => {
+  it("keeps the reported schema version aligned with the latest migration", () => {
+    const latestMigrationVersion = Math.max(...WORKFLOW_MIGRATION_VERSIONS);
+    expect(WORKFLOW_SCHEMA_VERSION).toBe(latestMigrationVersion);
+  });
+  it("does not touch SQLite when the migration clock throws", () => {
+    const db = new Database(":memory:");
+    const defect = new Error("migration clock defect");
+    let caught: unknown;
+    try {
+      applyWorkflowSchemaMigrations(db, () => {
+        throw defect;
+      });
+    } catch (cause) {
+      caught = cause;
+    }
+    expect(caught).toBe(defect);
+    expect(
+      db.query<{ name: string }, []>("SELECT name FROM sqlite_master WHERE type = 'table'").all(),
+    ).toEqual([]);
+    db.close();
+  });
+  it("preserves migration clock Panic identity without touching SQLite", () => {
+    const db = new Database(":memory:");
+    const panic = new Panic({ message: "migration clock panic" });
+    let caught: unknown;
+    try {
+      applyWorkflowSchemaMigrations(db, () => {
+        throw panic;
+      });
+    } catch (cause) {
+      caught = cause;
+    }
+    expect(caught).toBe(panic);
+    expect(
+      db.query<{ name: string }, []>("SELECT name FROM sqlite_master WHERE type = 'table'").all(),
+    ).toEqual([]);
+    db.close();
+  });
+  it("returns an owned invalid-clock Result before touching SQLite", () => {
+    const db = new Database(":memory:");
+    const migrated = applyWorkflowSchemaMigrations(db, () => Number.NaN);
+    expect(migrated.status).toBe("error");
+    if (migrated.status === "error") {
+      expect(migrated.error).toBeInstanceOf(WorkflowMigrationInvalidTimestamp);
+    }
+    expect(
+      db.query<{ name: string }, []>("SELECT name FROM sqlite_master WHERE type = 'table'").all(),
+    ).toEqual([]);
+    db.close();
+  });
+  for (const historicalVersion of WORKFLOW_MIGRATION_VERSIONS) {
+    it(`upgrades a valid v${historicalVersion} migration-prefix layout through v${WORKFLOW_SCHEMA_VERSION}`, () => {
+      const db = new Database(":memory:");
+      try {
+        const historical = applyWorkflowSchemaMigrations(
+          db,
+          () => historicalVersion,
+          historicalVersion,
+        );
+        expect(historical.status).toBe("ok");
+        const prefix = db
+          .query<
+            {
+              version: number;
+            },
+            []
+          >("SELECT version FROM workflow_schema_migrations ORDER BY version")
+          .all();
+        expect(prefix.map(({ version }) => version)).toEqual(
+          WORKFLOW_MIGRATION_VERSIONS.filter((version) => version <= historicalVersion),
+        );
+        const upgraded = applyWorkflowSchemaMigrations(db, () => WORKFLOW_SCHEMA_VERSION);
+        expect(upgraded.status).toBe("ok");
+        const complete = db
+          .query<
+            {
+              version: number;
+            },
+            []
+          >("SELECT version FROM workflow_schema_migrations ORDER BY version")
+          .all();
+        expect(complete.map(({ version }) => version)).toEqual([...WORKFLOW_MIGRATION_VERSIONS]);
+      } finally {
+        db.close();
+      }
+    });
+  }
+  it("upgrades a populated on-disk v24 binding through v25 without changing its data", () => {
+    const file = dbPath("populated-v24-binding");
+    const target = {
+      platform: "discord" as const,
+      channelId: "channel-1",
+      replyToMessageId: "origin-1",
+    };
+    const binding = {
+      runId: "run-1",
+      target,
+      messageRef: { platform: "discord" as const, channelId: "channel-1", messageId: "card-1" },
+      lastRenderedSha256: "f".repeat(64),
+      lastError: "legacy retry",
+      retryCount: 2,
+      nextAttemptAt: 50,
+      permanentFailure: null,
+      createdAt: 10,
+      updatedAt: 20,
+    };
+    let store = new DurableWorkflowStore(file);
+    store.createInvocation({
+      revision: revision(),
+      run: { ...run(), progressTarget: target },
+    });
+    store.upsertSurfaceBinding(binding);
+    store.close();
+
+    const v24 = new Database(file);
+    try {
+      downgradeSchemaToV24(v24);
+      const upgraded = applyWorkflowSchemaMigrations(v24, () => 30);
+      expect(upgraded.status).toBe("ok");
+      expect(
+        v24
+          .query<{ permanent_failure_json: string | null }, []>(
+            "SELECT permanent_failure_json FROM workflow_surface_bindings WHERE run_id = 'run-1'",
+          )
+          .get(),
+      ).toEqual({ permanent_failure_json: null });
+    } finally {
+      v24.close();
+    }
+
+    store = new DurableWorkflowStore(file);
+    try {
+      expect(workflowStoreValue(store.getSurfaceBinding("run-1"))).toEqual(binding);
+    } finally {
+      store.close();
+      rmSync(file, { force: true });
+    }
+  });
+  it("rejects workflow databases migrated by an unknown future runtime", () => {
+    const file = dbPath("future-schema");
+    const db = new Database(file);
+    const futureVersion = WORKFLOW_SCHEMA_VERSION + 1;
+    try {
+      applyWorkflowSchemaMigrations(db);
+      db.run(
+        "INSERT INTO workflow_schema_migrations (version, name, applied_at) VALUES (?, ?, ?)",
+        [futureVersion, "future migration", 1],
+      );
+      const migrated = applyWorkflowSchemaMigrations(db);
+      expect(migrated.status).toBe("error");
+      if (migrated.status === "error") {
+        expect(migrated.error).toMatchObject({
+          _tag: "WorkflowMigrationUnsupportedVersion",
+          version: futureVersion,
+        });
+      }
+    } finally {
+      db.close();
+      rmSync(file, { force: true });
+    }
+  });
+  it("fails a corrupt list row and emits only bounded redacted provenance", async () => {
+    const file = dbPath("corrupt-list-row");
+    const diagnostics: Array<{
+      table: string;
+      field: string;
+      version: number;
+      issueCode: string;
+      recordId: string;
+    }> = [];
+    const store = new DurableWorkflowStore(file, {
+      onPersistenceDiagnostic: (diagnostic) => diagnostics.push(diagnostic),
+    });
+    const corruptor = new Database(file);
+    try {
+      store.createInvocation({ revision: revision(), run: run() });
+      corruptor.run("UPDATE workflow_runs SET args_json = ? WHERE run_id = ?", [
+        '{"secret":"must-not-appear"',
+        "run-1",
+      ]);
+      const listed = store.listRuns();
+      expect(listed.status).toBe("error");
+      if (listed.status === "error") expect(listed.error._tag).toBe("MalformedSerialization");
+      await Promise.resolve();
+      expect(diagnostics).toEqual([
+        {
+          table: "workflow_runs",
+          field: "args_json",
+          version: WORKFLOW_SCHEMA_VERSION,
+          issueCode: "malformed-json",
+          recordId: "run-1",
+        },
+      ]);
+      expect(JSON.stringify(diagnostics)).not.toContain("must-not-appear");
+    } finally {
+      corruptor.close();
+      store.close();
+      rmSync(file, { force: true });
+    }
+  });
+  it("classifies the original SQLite driver error from invocation persistence", () => {
+    const file = dbPath("invocation-driver-error");
+    const store = new DurableWorkflowStore(file);
+    try {
+      const faultDb = new Database(file);
+      faultDb.run(`CREATE TRIGGER reject_workflow_revision
+        BEFORE INSERT ON workflow_revisions
+        BEGIN SELECT RAISE(ABORT, 'injected invocation failure'); END`);
+      faultDb.close();
+
+      const created = store.createInvocation({ revision: revision(), run: run() });
+      expect(created.status).toBe("error");
+      if (created.status === "error") {
+        expect(created.error._tag).toBe("DurableWorkflowSqliteDriverFailure");
+        if (created.error._tag === "DurableWorkflowSqliteDriverFailure") {
+          expect(created.error.code).toBe("SQLITE_CONSTRAINT_TRIGGER");
+          expect(created.error.operation).toBe("create-invocation");
+        }
+      }
+      expect(workflowStoreValue(store.getRun("run-1"))).toBeNull();
+    } finally {
+      store.close();
+      rmSync(file, { force: true });
+    }
+  });
   it("bounds reconciliation to active runs and terminal runs missing bindings", () => {
     const file = dbPath("active-progress-targets");
     const store = new DurableWorkflowStore(file);
@@ -272,42 +501,113 @@ describe("durable workflow store minimal dispatch schema", () => {
           now: 13,
         }),
       ).toBe(true);
-
-      expect(store.listRunsNeedingProjectionReconciliation(1).map((item) => item.runId)).toEqual([
-        "active-a",
-      ]);
-      expect(store.listRunsNeedingProjectionReconciliation().map((item) => item.runId)).toEqual([
-        "active-a",
-        "active-b",
-        "terminal",
-      ]);
+      expect(
+        workflowStoreValue(store.listRunsNeedingProjectionReconciliation({ limit: 1 })).map(
+          (item) => item.runId,
+        ),
+      ).toEqual(["active-a"]);
+      expect(
+        workflowStoreValue(store.listRunsNeedingProjectionReconciliation()).map(
+          (item) => item.runId,
+        ),
+      ).toEqual(["active-a", "active-b", "terminal"]);
     } finally {
       store.close();
       rmSync(file, { force: true });
     }
   });
+  it("rolls back a binding upsert when action revocation fails", () => {
+    const file = dbPath("binding-action-revocation-rollback");
+    const target = {
+      platform: "discord" as const,
+      channelId: "channel-1",
+      replyToMessageId: null,
+    };
+    const originalBinding = {
+      runId: "run-1",
+      target,
+      messageRef: null,
+      lastRenderedSha256: null,
+      lastError: null,
+      retryCount: 0,
+      nextAttemptAt: null,
+      permanentFailure: null,
+      createdAt: 10,
+      updatedAt: 10,
+    };
+    const store = new DurableWorkflowStore(file);
+    try {
+      store.createInvocation({
+        revision: revision(),
+        run: { ...run(), progressTarget: target },
+      });
+      store.upsertSurfaceBinding(originalBinding);
+      store.createSurfaceAction({
+        actionId: "action-1",
+        tokenSha256: "e".repeat(64),
+        runId: "run-1",
+        kind: "pause",
+        expectedPlatform: "discord",
+        expectedUserId: "user-1",
+        expectedMessageRef: null,
+        expiresAt: 100,
+        consumedAt: null,
+        consumedByPlatform: null,
+        consumedByUserId: null,
+        createdAt: 10,
+      });
+      const faultDb = new Database(file);
+      try {
+        faultDb.run(`CREATE TRIGGER fail_workflow_surface_action_expiry
+          BEFORE UPDATE OF expires_at ON workflow_surface_actions
+          BEGIN
+            SELECT RAISE(ABORT, 'injected action expiry failure');
+          END`);
+      } finally {
+        faultDb.close();
+      }
 
+      expect(() =>
+        store.commitSurfaceBindingWithActionRevocation(
+          { ...originalBinding, lastError: "must roll back", updatedAt: 20 },
+          20,
+        ),
+      ).toThrow("Durable workflow SQLite operation failed");
+      expect(workflowStoreValue(store.getSurfaceBinding("run-1"))).toEqual(originalBinding);
+      expect(workflowStoreValue(store.getSurfaceAction("action-1"))?.expiresAt).toBe(100);
+    } finally {
+      store.close();
+      rmSync(file, { force: true });
+    }
+  });
   it("creates and claims queued invocations without approval or safety semantics", () => {
     const file = dbPath("minimal-dispatch");
     const store = new DurableWorkflowStore(file);
     try {
       const created = store.createInvocation({ revision: revision(), run: run() });
-      expect(created).toMatchObject({ status: "accepted", run: { state: "queued" } });
+      expect(created).toMatchObject({
+        status: "ok",
+        value: { status: "accepted", run: { state: "queued" } },
+      });
       expect(store.tryClaimRun({ runId: "run-1", claimerId: "worker-1", now: 20 })?.state).toBe(
         "running",
       );
       expect(store.listMigrations().at(-1)).toMatchObject({
-        version: 24,
-        name: "durable orphaned live-parent delivery",
+        version: WORKFLOW_SCHEMA_VERSION,
+        name: "durable workflow progress permanent failure gate",
       });
     } finally {
       store.close();
     }
-
     const db = new Database(file);
     try {
       const tables = db
-        .query<{ name: string }, []>("SELECT name FROM sqlite_master WHERE type = 'table'")
+        .query<
+          {
+            name: string;
+          },
+          []
+        >("SELECT name FROM sqlite_master WHERE type = 'table'")
         .all()
         .map((row) => row.name);
       expect(tables).not.toContain("workflow_approvals");
@@ -317,20 +617,35 @@ describe("durable workflow store minimal dispatch schema", () => {
       expect(tables).not.toContain("workflow_missing_surface_bindings");
       expect(tables).not.toContain("workflow_projection_reconciliation_state");
       const runColumns = db
-        .query<{ name: string }, []>("PRAGMA table_info(workflow_runs)")
+        .query<
+          {
+            name: string;
+          },
+          []
+        >("PRAGMA table_info(workflow_runs)")
         .all()
         .map((row) => row.name);
       expect(runColumns).not.toContain("approval_id");
       expect(runColumns).not.toContain("origin_safety_mode");
       const dispatchColumns = db
-        .query<{ name: string }, []>("PRAGMA table_info(workflow_request_dispatches)")
+        .query<
+          {
+            name: string;
+          },
+          []
+        >("PRAGMA table_info(workflow_request_dispatches)")
         .all()
         .map((row) => row.name);
       expect(dispatchColumns).not.toContain("token_sha256");
       expect(dispatchColumns).not.toContain("canonical_cwd");
       expect(
         db
-          .query<{ name: string }, []>("PRAGMA table_info(workflow_surface_bindings)")
+          .query<
+            {
+              name: string;
+            },
+            []
+          >("PRAGMA table_info(workflow_surface_bindings)")
           .all()
           .map((row) => row.name),
       ).toEqual([
@@ -343,10 +658,16 @@ describe("durable workflow store minimal dispatch schema", () => {
         "next_attempt_at",
         "created_at",
         "updated_at",
+        "permanent_failure_json",
       ]);
       expect(
         db
-          .query<{ name: string }, []>("PRAGMA table_info(workflow_action_outbox)")
+          .query<
+            {
+              name: string;
+            },
+            []
+          >("PRAGMA table_info(workflow_action_outbox)")
           .all()
           .map((row) => row.name),
       ).toEqual([
@@ -368,7 +689,6 @@ describe("durable workflow store minimal dispatch schema", () => {
       rmSync(file, { force: true });
     }
   });
-
   it("atomically orphans unreachable live-parent runs while retaining reachable chains", () => {
     const file = dbPath("live-parent-orphans");
     const store = new DurableWorkflowStore(file);
@@ -378,7 +698,6 @@ describe("durable workflow store minimal dispatch schema", () => {
       expect(store.createRun(liveParentRun("nested", "workflow-request"))).toBe(true);
       expect(store.createRun(liveParentRun("active-orphan", "missing-parent"))).toBe(true);
       expect(store.createRun(liveParentRun("terminal-orphan", "missing-parent"))).toBe(true);
-
       expect(
         store.tryClaimRun({ runId: "reachable", claimerId: "worker", now: 20 }),
       ).not.toBeNull();
@@ -409,24 +728,22 @@ describe("durable workflow store minimal dispatch schema", () => {
           result: "completed without a parent",
         }),
       ).toBe(true);
-
       const orphaned = store.reconcileOrphanedLiveParentRuns({
         resolvableParentRequestIds: ["root-parent"],
         now: 30,
         detail: "parent request unavailable",
       });
-
       expect(orphaned.map((entry) => entry.run.runId)).toEqual([
         "active-orphan",
         "terminal-orphan",
       ]);
-      expect(store.getRun("reachable")?.state).toBe("running");
-      expect(store.getRun("nested")?.state).toBe("queued");
-      expect(store.getRun("active-orphan")).toMatchObject({
+      expect(workflowStoreValue(store.getRun("reachable"))?.state).toBe("running");
+      expect(workflowStoreValue(store.getRun("nested"))?.state).toBe("queued");
+      expect(workflowStoreValue(store.getRun("active-orphan"))).toMatchObject({
         state: "cancelled",
         terminalDetail: "parent request unavailable",
       });
-      expect(store.getRun("terminal-orphan")).toMatchObject({
+      expect(workflowStoreValue(store.getRun("terminal-orphan"))).toMatchObject({
         state: "succeeded",
         result: "completed without a parent",
       });
@@ -446,35 +763,29 @@ describe("durable workflow store minimal dispatch schema", () => {
       rmSync(file, { force: true });
     }
   });
-
   it("retires previously committed live-parent surface fallbacks during migration", () => {
     const file = dbPath("retire-live-parent-fallback");
     const initial = new DurableWorkflowStore(file);
     initial.createRevision(revision());
     expect(initial.createRun(liveParentRun("legacy-fallback", "missing-parent"))).toBe(true);
     initial.close();
-
     const db = new Database(file);
-    db.run(
-      `UPDATE workflow_completion_deliveries SET state = 'fallback', delivered_at = 20
-       WHERE run_id = 'legacy-fallback'`,
-    );
+    db.run(`UPDATE workflow_completion_deliveries SET state = 'fallback', delivered_at = 20
+       WHERE run_id = 'legacy-fallback'`);
     db.run(`UPDATE workflow_runs SET progress_target_json = ? WHERE run_id = 'legacy-fallback'`, [
       JSON.stringify({ platform: "discord", channelId: "session-1", replyToMessageId: null }),
     ]);
     downgradeSchemaToV21(db);
     db.close();
-
     const migrated = new DurableWorkflowStore(file);
     try {
       expect(migrated.getLiveParentDeliveryState("legacy-fallback")).toBe("orphaned");
-      expect(migrated.getRun("legacy-fallback")?.progressTarget).toBeNull();
+      expect(workflowStoreValue(migrated.getRun("legacy-fallback"))?.progressTarget).toBeNull();
     } finally {
       migrated.close();
       rmSync(file, { force: true });
     }
   });
-
   it("atomically enforces the global active-run cap and admits after terminalization", () => {
     const file = dbPath("active-run-cap");
     const store = new DurableWorkflowStore(file);
@@ -489,19 +800,20 @@ describe("durable workflow store minimal dispatch schema", () => {
           run: run("run-active", "revision-active"),
           maxActiveRuns: 1,
         }),
-      ).toMatchObject({ status: "accepted" });
+      ).toMatchObject({ status: "ok", value: { status: "accepted" } });
       expect(store.countActiveRuns()).toBe(1);
-
       expect(
         store.createInvocation({
           revision: rejectedRevision,
           run: run("run-rejected", "revision-rejected"),
           maxActiveRuns: 1,
         }),
-      ).toEqual({ status: "rejected_capacity", activeRuns: 1, limit: 1 });
-      expect(store.getRun("run-rejected")).toBeNull();
-      expect(store.getRevision("revision-rejected")).toBeNull();
-
+      ).toMatchObject({
+        status: "ok",
+        value: { status: "rejected_capacity", activeRuns: 1, limit: 1 },
+      });
+      expect(workflowStoreValue(store.getRun("run-rejected"))).toBeNull();
+      expect(workflowStoreValue(store.getRevision("revision-rejected"))).toBeNull();
       expect(
         store.transitionRun({
           runId: "run-active",
@@ -517,13 +829,15 @@ describe("durable workflow store minimal dispatch schema", () => {
           run: run("run-rejected", "revision-rejected"),
           maxActiveRuns: 1,
         }),
-      ).toMatchObject({ status: "accepted", run: { runId: "run-rejected" } });
+      ).toMatchObject({
+        status: "ok",
+        value: { status: "accepted", run: { runId: "run-rejected" } },
+      });
     } finally {
       store.close();
       rmSync(file, { force: true });
     }
   });
-
   it("reuses an idempotent invocation at capacity and rejects a new key without rows", () => {
     const file = dbPath("active-run-cap-idempotency");
     const store = new DurableWorkflowStore(file);
@@ -535,8 +849,10 @@ describe("durable workflow store minimal dispatch schema", () => {
         idempotency: { key: "existing-key", fingerprintSha256 },
         maxActiveRuns: 1,
       });
-      expect(first).toMatchObject({ status: "accepted", run: { runId: "run-first" } });
-
+      expect(first).toMatchObject({
+        status: "ok",
+        value: { status: "accepted", run: { runId: "run-first" } },
+      });
       expect(
         store.createInvocation({
           revision: revision("revision-replay"),
@@ -544,7 +860,10 @@ describe("durable workflow store minimal dispatch schema", () => {
           idempotency: { key: "existing-key", fingerprintSha256 },
           maxActiveRuns: 1,
         }),
-      ).toMatchObject({ status: "accepted", run: { runId: "run-first" } });
+      ).toMatchObject({
+        status: "ok",
+        value: { status: "accepted", run: { runId: "run-first" } },
+      });
       expect(
         store.createInvocation({
           revision: revision("revision-new"),
@@ -552,22 +871,27 @@ describe("durable workflow store minimal dispatch schema", () => {
           idempotency: { key: "new-key", fingerprintSha256: "e".repeat(64) },
           maxActiveRuns: 1,
         }),
-      ).toEqual({ status: "rejected_capacity", activeRuns: 1, limit: 1 });
-      expect(store.getRun("run-replay")).toBeNull();
-      expect(store.getRun("run-new")).toBeNull();
-      expect(store.getRevision("revision-replay")).toBeNull();
-      expect(store.getRevision("revision-new")).toBeNull();
+      ).toMatchObject({
+        status: "ok",
+        value: { status: "rejected_capacity", activeRuns: 1, limit: 1 },
+      });
+      expect(workflowStoreValue(store.getRun("run-replay"))).toBeNull();
+      expect(workflowStoreValue(store.getRun("run-new"))).toBeNull();
+      expect(workflowStoreValue(store.getRevision("revision-replay"))).toBeNull();
+      expect(workflowStoreValue(store.getRevision("revision-new"))).toBeNull();
     } finally {
       store.close();
     }
-
     const db = new Database(file);
     try {
       expect(
         db
-          .query<{ count: number }, []>(
-            "SELECT COUNT(*) AS count FROM workflow_invocation_receipts",
-          )
+          .query<
+            {
+              count: number;
+            },
+            []
+          >("SELECT COUNT(*) AS count FROM workflow_invocation_receipts")
           .get()?.count,
       ).toBe(1);
     } finally {
@@ -575,15 +899,13 @@ describe("durable workflow store minimal dispatch schema", () => {
       rmSync(file, { force: true });
     }
   });
-
-  it("migrates v20 through v4 and archives the incompatible execution history", () => {
+  it("migrates v20 through the current schema and archives incompatible execution history", () => {
     const file = dbPath("v20-minimal-contract");
     const store = new DurableWorkflowStore(file);
     const rev = revision();
     store.createInvocation({ revision: rev, run: run("active-run") });
     store.tryClaimRun({ runId: "active-run", claimerId: "old-worker", now: 20 });
     store.createOperation(operation("active-run", "active-operation"), "old-worker");
-
     store.createInvocation({ revision: rev, run: run("terminal-run") });
     store.tryClaimRun({ runId: "terminal-run", claimerId: "old-worker", now: 20 });
     store.createOperation(operation("terminal-run", "terminal-operation"), "old-worker");
@@ -647,18 +969,13 @@ describe("durable workflow store minimal dispatch schema", () => {
       idempotency: { key: "active-trigger", fingerprintSha256: "c".repeat(64) },
     });
     store.close();
-
     const legacy = new Database(file);
     downgradeSchemaToV20(legacy);
-    legacy.run(
-      `UPDATE workflow_runs
+    legacy.run(`UPDATE workflow_runs
        SET state = 'rejected', terminal_detail = 'approval rejected', terminal_at = 25
-       WHERE run_id = 'rejected-run'`,
-    );
-    legacy.run(
-      `UPDATE workflow_operations SET state = 'running', request_id = 'active-request',
-       claimed_by = 'old-worker', claimed_at = 20 WHERE run_id = 'active-run'`,
-    );
+       WHERE run_id = 'rejected-run'`);
+    legacy.run(`UPDATE workflow_operations SET state = 'running', request_id = 'active-request',
+       claimed_by = 'old-worker', claimed_at = 20 WHERE run_id = 'active-run'`);
     legacy.run(
       `INSERT INTO workflow_request_dispatches (
          request_id, run_id, operation_id, token_sha256, session_id, platform,
@@ -689,13 +1006,11 @@ describe("durable workflow store minimal dispatch schema", () => {
         "old-dispatch-epoch",
       ],
     );
-    legacy.run(
-      `INSERT INTO workflow_request_terminal_receipts (
+    legacy.run(`INSERT INTO workflow_request_terminal_receipts (
          request_id, run_id, operation_id, dispatch_epoch, state, detail, created_at,
          output_json, result_artifact_id, usage_json
        ) VALUES ('terminal-request', 'terminal-run', 'terminal-operation', 'terminal-epoch',
-          'resolved', 'complete', 24, '"complete"', NULL, NULL)`,
-    );
+          'resolved', 'complete', 24, '"complete"', NULL, NULL)`);
     legacy.run(
       `INSERT INTO workflow_request_dispatches (
          request_id, run_id, operation_id, token_sha256, session_id, platform,
@@ -707,27 +1022,47 @@ describe("durable workflow store minimal dispatch schema", () => {
       ["1".repeat(64)],
     );
     legacy.close();
-
     const migrated = new DurableWorkflowStore(file);
     try {
-      expect(migrated.getRun("active-run")).toBeNull();
-      expect(migrated.getOperation("active-run", "active-operation")).toBeNull();
-      expect(migrated.getTrigger("active-trigger")).toBeNull();
-      expect(migrated.getRun("terminal-run")).toBeNull();
-      expect(migrated.getRun("rejected-run")).toBeNull();
-      expect(migrated.getWorkflowRequestTerminalReceipt("terminal-request")).toBeNull();
-      expect(migrated.getWorkflowRequestDispatchPolicy("active-request")).toBeNull();
-      expect(migrated.getWorkflowRequestDispatchPolicy("legacy-terminal-dispatch")).toBeNull();
+      expect(workflowStoreValue(migrated.getRun("active-run"))).toBeNull();
+      expect(
+        workflowStoreValue(migrated.getOperation("active-run", "active-operation")),
+      ).toBeNull();
+      expect(workflowStoreValue(migrated.getTrigger("active-trigger"))).toBeNull();
+      expect(workflowStoreValue(migrated.getRun("terminal-run"))).toBeNull();
+      expect(workflowStoreValue(migrated.getRun("rejected-run"))).toBeNull();
+      expect(
+        workflowStoreValue(migrated.getWorkflowRequestTerminalReceipt("terminal-request")),
+      ).toBeNull();
+      expect(
+        workflowStoreValue(migrated.getWorkflowRequestDispatchPolicy("active-request")),
+      ).toBeNull();
+      expect(
+        workflowStoreValue(migrated.getWorkflowRequestDispatchPolicy("legacy-terminal-dispatch")),
+      ).toBeNull();
     } finally {
       migrated.close();
     }
-
     const inspected = new Database(file);
     try {
+      expect(
+        inspected
+          .query<
+            {
+              version: number;
+            },
+            []
+          >("SELECT version FROM workflow_schema_migrations ORDER BY version DESC LIMIT 1")
+          .get()?.version,
+      ).toBe(WORKFLOW_SCHEMA_VERSION);
       const quarantine = inspected
-        .query<{ record_kind: string; record_id: string }, []>(
-          "SELECT record_kind, record_id FROM workflow_quarantine",
-        )
+        .query<
+          {
+            record_kind: string;
+            record_id: string;
+          },
+          []
+        >("SELECT record_kind, record_id FROM workflow_quarantine")
         .all();
       expect(quarantine).toEqual(
         expect.arrayContaining([
@@ -737,9 +1072,13 @@ describe("durable workflow store minimal dispatch schema", () => {
         ]),
       );
       const audit = inspected
-        .query<{ record_kind: string; record_id: string }, []>(
-          "SELECT record_kind, record_id FROM workflow_legacy_audit_records",
-        )
+        .query<
+          {
+            record_kind: string;
+            record_id: string;
+          },
+          []
+        >("SELECT record_kind, record_id FROM workflow_legacy_audit_records")
         .all();
       expect(audit).toEqual(
         expect.arrayContaining([
@@ -752,14 +1091,22 @@ describe("durable workflow store minimal dispatch schema", () => {
       );
       expect(
         inspected
-          .query<{ active: number }, []>(
-            "SELECT active FROM workflow_request_dispatches WHERE request_id = 'active-request'",
-          )
+          .query<
+            {
+              active: number;
+            },
+            []
+          >("SELECT active FROM workflow_request_dispatches WHERE request_id = 'active-request'")
           .get()?.active,
       ).toBeUndefined();
       expect(
         inspected
-          .query<{ name: string }, []>("PRAGMA table_info(workflow_request_dispatches)")
+          .query<
+            {
+              name: string;
+            },
+            []
+          >("PRAGMA table_info(workflow_request_dispatches)")
           .all()
           .map((column) => column.name),
       ).not.toContain("expires_at");
@@ -768,7 +1115,6 @@ describe("durable workflow store minimal dispatch schema", () => {
       rmSync(file, { force: true });
     }
   });
-
   it("ignores fallbacks but pins every head field across dispatch epochs", () => {
     const file = dbPath("resolved-model-pinning");
     const store = new DurableWorkflowStore(file);
@@ -818,7 +1164,9 @@ describe("durable workflow store minimal dispatch schema", () => {
           staleOwnerBefore: 21,
         }),
       ).toMatchObject({ state: "dispatched" });
-      expect(store.getWorkflowRequestDispatchPolicy("agent-request")).toEqual(policy);
+      expect(
+        JSON.stringify(workflowStoreValue(store.getWorkflowRequestDispatchPolicy("agent-request"))),
+      ).toBe(JSON.stringify(policy));
       const refreshedFallbackPolicy = {
         ...policy,
         dispatchEpoch: "b".repeat(32),
@@ -848,9 +1196,9 @@ describe("durable workflow store minimal dispatch schema", () => {
           staleOwnerBefore: 22,
         }),
       ).toMatchObject({ state: "dispatched" });
-      expect(store.getWorkflowRequestDispatchPolicy("agent-request")).toEqual(
-        refreshedFallbackPolicy,
-      );
+      expect(
+        JSON.stringify(workflowStoreValue(store.getWorkflowRequestDispatchPolicy("agent-request"))),
+      ).toBe(JSON.stringify(refreshedFallbackPolicy));
       expect(
         store.authorizeAgentDispatch({
           requestId: "agent-request",
@@ -872,15 +1220,14 @@ describe("durable workflow store minimal dispatch schema", () => {
           staleOwnerBefore: 23,
         }),
       ).toBeNull();
-      expect(store.getWorkflowRequestDispatchPolicy("agent-request")).toEqual(
-        refreshedFallbackPolicy,
-      );
+      expect(
+        JSON.stringify(workflowStoreValue(store.getWorkflowRequestDispatchPolicy("agent-request"))),
+      ).toBe(JSON.stringify(refreshedFallbackPolicy));
     } finally {
       store.close();
       rmSync(file, { force: true });
     }
   });
-
   it("binds stable named continuation authority to the durable completion target", () => {
     const file = dbPath("stable-named-policy");
     const store = new DurableWorkflowStore(file);
@@ -945,7 +1292,6 @@ describe("durable workflow store minimal dispatch schema", () => {
           now: 21,
           staleOwnerBefore: 21,
         });
-
       expect(authorize()).toBeNull();
       expect(
         authorize({
@@ -964,7 +1310,6 @@ describe("durable workflow store minimal dispatch schema", () => {
       rmSync(file, { force: true });
     }
   });
-
   it("decodes legacy and flat fallback model requests but rejects recursive fallbacks", () => {
     const legacy = {
       spec: "provider/model-a",

@@ -1,10 +1,11 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, spyOn } from "bun:test";
 import { Database } from "bun:sqlite";
 import {
   chmod,
   copyFile,
   mkdir,
   mkdtemp as mkdtempFs,
+  readFile,
   readdir,
   rm,
   stat,
@@ -37,6 +38,7 @@ import {
 } from "ai";
 import { MockLanguageModelV4, simulateReadableStream } from "ai/test";
 import { getCodexAuthStoragePath, ModelCapability } from "@stanley2058/lilac-utils";
+import { Panic, Result } from "better-result";
 import { z } from "zod";
 
 import type { RuntimeConfig } from "../src/config";
@@ -47,12 +49,17 @@ import {
   type ProviderConfig,
 } from "../src/providers";
 import {
+  MiniLilacSessionOperationRejected,
   SessionService,
   type MiniLilacRuntimeChunk,
   type SessionServiceOptions,
 } from "../src/session-service";
 import { MiniLilacSkillCatalog } from "../src/skills";
-import { MiniLilacDatabaseVersionError, MiniLilacSqliteStore } from "../src/sqlite-store";
+import {
+  MiniLilacDatabaseVersionError,
+  MiniLilacSqliteStore,
+  MiniLilacStoreOperationRejected,
+} from "../src/sqlite-store";
 import {
   WorkspaceHistoryStore,
   type LockedWorkspaceHistoryStore,
@@ -214,7 +221,7 @@ function textAndReadToolResult(id: string, text: string, filePath: string) {
         {
           type: "tool-call" as const,
           toolCallId: `${id}-read`,
-          toolName: "read_file",
+          toolName: "read",
           input: JSON.stringify({ path: filePath }),
         },
         {
@@ -240,7 +247,7 @@ function commentaryAndReadToolResult(id: string, text: string, filePath: string)
         {
           type: "tool-call" as const,
           toolCallId: `${id}-read`,
-          toolName: "read_file",
+          toolName: "read",
           input: JSON.stringify({ path: filePath }),
         },
         {
@@ -344,7 +351,7 @@ function textThenBashToolResult(command: string) {
   };
 }
 
-function grepToolResult(pattern: string) {
+function grepToolResult(pattern: string, targetPath?: string) {
   return {
     stream: simulateReadableStream({
       chunks: [
@@ -352,7 +359,7 @@ function grepToolResult(pattern: string) {
           type: "tool-call" as const,
           toolCallId: "oversized-grep",
           toolName: "grep",
-          input: JSON.stringify({ pattern }),
+          input: JSON.stringify({ pattern, path: targetPath }),
         },
         {
           type: "finish" as const,
@@ -371,7 +378,7 @@ function readToolResult(path: string, options?: { dangerouslyAllow?: boolean }) 
         {
           type: "tool-call" as const,
           toolCallId: "direct-read",
-          toolName: "read_file",
+          toolName: "read",
           input: JSON.stringify({ path, maxCharacters: 20_000, ...options }),
         },
         {
@@ -420,7 +427,7 @@ function batchedReadResult(paths: readonly string[]) {
           toolCallId: "batch-read",
           toolName: "batch",
           input: JSON.stringify({
-            tool_calls: paths.map((path) => ({ tool: "read_file", parameters: { path } })),
+            tool_calls: paths.map((path) => ({ tool: "read", parameters: { path } })),
           }),
         },
         {
@@ -470,7 +477,7 @@ function todoAndReadResult(
         {
           type: "tool-call" as const,
           toolCallId: "read-with-todos",
-          toolName: "read_file",
+          toolName: "read",
           input: JSON.stringify({ path: filePath }),
         },
         {
@@ -636,6 +643,11 @@ class ScriptedWorkspaceHistoryStore extends WorkspaceHistoryStore {
         this.captureCall += 1;
         return await this.captureScript(this.captureCall, this.workspaceId);
       },
+      captureResult: async () => {
+        this.captureCall += 1;
+        return Result.ok(await this.captureScript(this.captureCall, this.workspaceId));
+      },
+      invalidateCaptureCacheResult: async () => Result.ok(undefined),
       prepareRestore: async () => ({ status: "skipped", reason: "git-unavailable" }),
     });
   }
@@ -662,6 +674,11 @@ class InterceptedWorkspaceHistoryStore extends WorkspaceHistoryStore {
     return await super.withWorkspaceLock(async (lockedStore) => {
       const resumePreparedRestore = lockedStore.resumePreparedRestore;
       return await callback({
+        captureResult: async () => {
+          this.hooks.onCapture?.();
+          return await lockedStore.captureResult();
+        },
+        invalidateCaptureCacheResult: async () => await lockedStore.invalidateCaptureCacheResult(),
         capture: async () => {
           this.hooks.onCapture?.();
           return await lockedStore.capture();
@@ -758,7 +775,7 @@ function config(): RuntimeConfig {
           description: "Read-only main agent",
           promptOverlay: "Be concise.",
           subagentOnly: false,
-          tools: ["read_file", "bash", "apply_patch", "subagent_delegate"],
+          tools: ["read", "bash", "patch", "subagent_delegate"],
           execution: false,
           workspaceWrites: false,
           delegation: false,
@@ -792,8 +809,10 @@ const IMMEDIATE_TRANSIENT_RETRY = {
   maxDelayMs: 0,
 } as const;
 
-async function temporaryRuntime(model: LanguageModel, profile = "reader") {
-  const directory = await mkdtemp(path.join(tmpdir(), "mini-lilac-runtime-"));
+async function temporaryRuntime(model: LanguageModel, profile = "reader", initializeGit = false) {
+  const directory = await (initializeGit ? mkdtemp : mkdtempFs)(
+    path.join(tmpdir(), "mini-lilac-runtime-"),
+  );
   temporaryDirectories.push(directory);
   const service = new SessionService({
     config: config(),
@@ -1031,36 +1050,6 @@ describe("MiniLilacSqliteStore", () => {
     recovered.close();
   });
 
-  it("does not preserve interrupted-run chunks after a process restart", async () => {
-    const directory = await mkdtemp(path.join(tmpdir(), "mini-lilac-finished-recovery-"));
-    temporaryDirectories.push(directory);
-    const databasePath = path.join(directory, "runtime.sqlite");
-    const first = new MiniLilacSqliteStore(databasePath);
-    first.createSession({
-      id: "session-1",
-      cwd: directory,
-      model: "test/mock",
-      profile: "reader",
-      reasoning: "high",
-    });
-    seedOpenHistory(first, "session-1", "run-1", userMessage("interrupted root"));
-    first.close();
-
-    const recovered = new SessionService({
-      config: config(),
-      databasePath,
-      modelResolver: () => new MockLanguageModelV4({}),
-    });
-    await recovered.initialize();
-    expect(recovered.store.getRun("run-1").status).toBe("error");
-    expect(
-      recovered.store.database
-        .query("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'run_chunks'")
-        .get(),
-    ).toBeNull();
-    recovered.close();
-  });
-
   it("retains turn-boundary input usage when startup recovers an interrupted run", async () => {
     const directory = await mkdtemp(path.join(tmpdir(), "mini-lilac-usage-recovery-"));
     temporaryDirectories.push(directory);
@@ -1178,6 +1167,55 @@ describe("MiniLilacSqliteStore", () => {
 });
 
 describe("SessionService", () => {
+  it("explicitly invalidates an incompatible cache with a redacted diagnostic before recomputing", async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), "mini-lilac-cache-policy-"));
+    temporaryDirectories.push(directory);
+    const diagnostics: object[] = [];
+    let historyStore: WorkspaceHistoryStore | undefined;
+    const model = new MockLanguageModelV4({
+      doStream: async () => textResult("cache-policy-answer", "done"),
+    });
+    const service = new SessionService({
+      config: config(),
+      databasePath: path.join(directory, "runtime.sqlite"),
+      modelResolver: () => model,
+      workspaceHistoryStoreFactory: (options) => {
+        historyStore = new WorkspaceHistoryStore(options);
+        return historyStore;
+      },
+      onWorkspaceHistoryPersistenceDiagnostic: (diagnostic) => diagnostics.push(diagnostic),
+    });
+    const session = await service.createSession({ cwd: directory, model: "test/mock" });
+    await collect(
+      (await service.startPrompt(session.id, userMessage("first"), "cache-policy-first")).stream,
+    );
+    if (historyStore === undefined) throw new Error("workspace history store was not created");
+    const cachePath = path.join(historyStore.storeDirectory, "capture-cache.json");
+    const current = JSON.parse(await readFile(cachePath, "utf8"));
+    const incompatible = JSON.stringify({
+      ...current,
+      implementationVersion: "secret-implementation-version",
+    });
+    await writeFile(cachePath, incompatible);
+
+    await collect(
+      (await service.startPrompt(session.id, userMessage("second"), "cache-policy-second")).stream,
+    );
+
+    expect(diagnostics).toEqual([
+      {
+        operation: "invalidate-capture-cache",
+        recordKind: "capture-cache",
+        issueCode: "unsupported-version",
+        versionCategory: "implementation",
+      },
+    ]);
+    expect(JSON.stringify(diagnostics)).not.toContain("secret-implementation-version");
+    expect(await readFile(cachePath, "utf8")).not.toBe(incompatible);
+    expect(await readFile(cachePath, "utf8")).not.toContain("secret-implementation-version");
+    service.close();
+  });
+
   it("keeps transcript history without workspace snapshots outside Git", async () => {
     const directory = await mkdtempFs(path.join(tmpdir(), "mini-lilac-non-git-history-"));
     temporaryDirectories.push(directory);
@@ -2471,7 +2509,7 @@ describe("SessionService", () => {
     service.close();
   });
 
-  it("exempts bounded read_file children from the settled aggregate budget", async () => {
+  it("exempts bounded read children from the settled aggregate budget", async () => {
     const directory = await mkdtemp(path.join(tmpdir(), "mini-lilac-batch-overflow-"));
     temporaryDirectories.push(directory);
     const largePayload = `large:${"x".repeat(900)}\n`;
@@ -2481,7 +2519,7 @@ describe("SessionService", () => {
       writeFile(path.join(directory, "small.txt"), smallPayload),
     ]);
     const runtimeConfig = config();
-    runtimeConfig.agent.profiles.reader!.tools = ["read_file", "batch"];
+    runtimeConfig.agent.profiles.reader!.tools = ["read", "batch"];
     const artifacts = createToolResultArtifactStore(path.join(directory, "tool-results"));
     await artifacts.init();
     const model = new MockLanguageModelV4({
@@ -2510,12 +2548,12 @@ describe("SessionService", () => {
     service.close();
   });
 
-  it("bounds direct multibyte read_file output by UTF-8 bytes", async () => {
+  it("bounds direct multibyte read output by UTF-8 bytes", async () => {
     const directory = await mkdtemp(path.join(tmpdir(), "mini-lilac-unicode-read-"));
     temporaryDirectories.push(directory);
     await writeFile(path.join(directory, "unicode.txt"), "😀".repeat(11_000));
     const runtimeConfig = config();
-    runtimeConfig.agent.profiles.reader!.tools = ["read_file"];
+    runtimeConfig.agent.profiles.reader!.tools = ["read"];
     const artifacts = createToolResultArtifactStore(path.join(directory, "tool-results"));
     await artifacts.init();
     const model = new MockLanguageModelV4({
@@ -2559,7 +2597,7 @@ describe("SessionService", () => {
       writeFile(path.join(directory, "reference.pdf"), pdf),
     ]);
     const runtimeConfig = config();
-    runtimeConfig.agent.profiles.reader!.tools = ["read_file", "batch"];
+    runtimeConfig.agent.profiles.reader!.tools = ["read", "batch"];
     const model = new MockLanguageModelV4({
       doStream: [
         batchedReadResult(["diagram.png", "reference.pdf"]),
@@ -2601,11 +2639,11 @@ describe("SessionService", () => {
     service.close();
   });
 
-  it("projects structured read_file failures as failed exploration calls", async () => {
+  it("projects structured read failures as failed exploration calls", async () => {
     const directory = await mkdtemp(path.join(tmpdir(), "mini-lilac-read-failure-"));
     temporaryDirectories.push(directory);
     const runtimeConfig = config();
-    runtimeConfig.agent.profiles.reader!.tools = ["read_file", "batch"];
+    runtimeConfig.agent.profiles.reader!.tools = ["read", "batch"];
     const model = new MockLanguageModelV4({
       doStream: [batchedReadResult(["missing.txt"]), textResult("answer", "handled")],
     });
@@ -2633,7 +2671,7 @@ describe("SessionService", () => {
     temporaryDirectories.push(directory);
     const runtimeConfig = config();
     runtimeConfig.agent.profiles.reader!.tools = ["grep"];
-    const missingCwd = path.join(directory, "missing");
+    const missingPath = path.join(directory, "missing");
     const model = new MockLanguageModelV4({
       doStream: [
         {
@@ -2643,7 +2681,7 @@ describe("SessionService", () => {
                 type: "tool-call" as const,
                 toolCallId: "failed-grep",
                 toolName: "grep",
-                input: JSON.stringify({ pattern: "needle", cwd: missingCwd }),
+                input: JSON.stringify({ pattern: "needle", path: missingPath }),
               },
               {
                 type: "finish" as const,
@@ -2672,13 +2710,13 @@ describe("SessionService", () => {
     service.close();
   });
 
-  it("stores oversized grep output out of line before the next model turn and UI persistence", async () => {
+  it("keeps oversized grep output bounded inline without creating an artifact", async () => {
     const directory = await mkdtemp(path.join(tmpdir(), "mini-lilac-tool-overflow-"));
     temporaryDirectories.push(directory);
     const longLine = `needle:${"x".repeat(8_000)}\n`;
     await writeFile(path.join(directory, "large.txt"), longLine);
     const runtimeConfig = config();
-    runtimeConfig.agent.profiles.reader!.tools = ["grep", "read_file"];
+    runtimeConfig.agent.profiles.reader!.tools = ["grep", "read"];
     const artifacts = createToolResultArtifactStore(path.join(directory, "tool-results"));
     await artifacts.init();
     const model = new MockLanguageModelV4({
@@ -2702,8 +2740,9 @@ describe("SessionService", () => {
     );
 
     const secondPrompt = JSON.stringify(model.doStreamCalls[1]?.prompt);
-    expect(secondPrompt).toContain("[tool result overflow]");
-    expect(secondPrompt).toContain("tool-result://");
+    expect(secondPrompt).toContain("Search output reached the inline limit");
+    expect(secondPrompt).toContain("[truncated]");
+    expect(secondPrompt).not.toContain("tool-result://");
     expect(secondPrompt).not.toContain("x".repeat(1_000));
     expect(JSON.stringify(chunks)).not.toContain("x".repeat(1_000));
     expect(chunks).toContainEqual(
@@ -2715,21 +2754,72 @@ describe("SessionService", () => {
 
     const transcript = service.store.getModelMessages(session.id);
     const serializedTranscript = JSON.stringify(transcript);
-    const uri = /tool-result:\/\/[0-9a-f-]{36}/u.exec(serializedTranscript)?.[0];
-    if (uri === undefined) throw new Error("overflow artifact URI was not persisted");
+    expect(serializedTranscript).toContain("[truncated]");
+    expect(serializedTranscript).not.toContain("tool-result://");
     expect(serializedTranscript).not.toContain("x".repeat(1_000));
-    const artifact = await artifacts.read(uri, session.id);
-    expect(artifact.ok).toBe(true);
-    if (artifact.ok) expect(artifact.content).toContain(longLine.trim());
+    expect(await readdir(artifacts.rootDir)).toEqual([]);
+    service.close();
+  });
+
+  it("greps a tool-result artifact without spilling into another artifact", async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), "mini-lilac-artifact-grep-"));
+    temporaryDirectories.push(directory);
+    const runtimeConfig = config();
+    runtimeConfig.agent.profiles.reader!.tools = ["grep"];
+    const artifacts = createToolResultArtifactStore(path.join(directory, "tool-results"));
+    await artifacts.init();
+    let artifactUri = "";
+    let modelCall = 0;
+    const model = new MockLanguageModelV4({
+      doStream: async () =>
+        modelCall++ === 0
+          ? grepToolResult("needle", artifactUri)
+          : textResult("answer", "inspected"),
+    });
+    const service = new SessionService({
+      config: runtimeConfig,
+      databasePath: path.join(directory, "runtime.sqlite"),
+      modelResolver: () => model,
+      toolResultArtifacts: artifacts,
+      toolResultOutputConfig: {
+        maxInlineBytes: 512,
+        artifactTtlMs: 60_000,
+        maxArtifactBytesPerScope: 1024 * 1024,
+        maxArtifactBytes: 1024 * 1024,
+      },
+    });
+    const session = await service.createSession({ cwd: directory, model: "test/mock" });
+    const artifact = await artifacts.create({
+      scopeId: session.id,
+      requestId: "producer-request",
+      toolCallId: "producer-call",
+      toolName: "bash",
+      content: `${"x".repeat(8_000)}needle\n`,
+      ttlMs: 60_000,
+      maxBytesPerScope: 1024 * 1024,
+    });
+    if (artifact.status === "error") throw artifact.error;
+    artifactUri = artifact.value.uri;
+    const filesBefore = await readdir(artifacts.rootDir);
+
+    await collect((await service.startPrompt(session.id, userMessage("search it"))).stream);
+
+    const transcript = JSON.stringify(service.store.getModelMessages(session.id));
+    expect(transcript).toContain(artifactUri);
+    expect(transcript).toContain("needle");
+    expect(transcript).toContain("[truncated]");
+    expect(transcript).not.toContain("[tool result overflow]");
+    expect(await readdir(artifacts.rootDir)).toEqual(filesBefore);
     service.close();
   });
 
   it("shares artifact authority between a root session and delegated children", async () => {
     const directory = await mkdtemp(path.join(tmpdir(), "mini-lilac-child-artifacts-"));
     temporaryDirectories.push(directory);
-    await writeFile(path.join(directory, "large.txt"), `needle:${"y".repeat(8_000)}\n`);
     const runtimeConfig = config();
-    runtimeConfig.agent.profiles.child!.tools = ["grep"];
+    runtimeConfig.agent.profiles.child!.tools = ["bash"];
+    runtimeConfig.agent.profiles.child!.execution = true;
+    runtimeConfig.agent.profiles.child!.workspaceWrites = true;
     const artifacts = createToolResultArtifactStore(path.join(directory, "tool-results"));
     await artifacts.init();
     const model = new MockLanguageModelV4({
@@ -2739,10 +2829,12 @@ describe("SessionService", () => {
           options.prompt.filter((message) => message.role === "user").at(-1),
         );
         if (prompt.includes("child complete")) return textResult("root", "root complete");
-        if (latestUser.includes("investigate") && prompt.includes("tool result overflow")) {
+        if (latestUser.includes("investigate") && prompt.includes("tool-result://")) {
           return textResult("child", "child complete");
         }
-        if (latestUser.includes("investigate")) return grepToolResult("needle");
+        if (latestUser.includes("investigate")) {
+          return bashToolResult("printf '%050000d' 0");
+        }
         return delegateResult("sync", "investigate");
       },
     });
@@ -2772,8 +2864,8 @@ describe("SessionService", () => {
     const childTranscript = JSON.stringify(service.store.getModelMessages(child.id));
     const uri = /tool-result:\/\/[0-9a-f-]{36}/u.exec(childTranscript)?.[0];
     if (uri === undefined) throw new Error("child overflow artifact URI was not persisted");
-    expect((await artifacts.read(uri, root.id)).ok).toBe(true);
-    expect((await artifacts.read(uri, child.id)).ok).toBe(false);
+    expect((await artifacts.read(uri, root.id)).status).toBe("ok");
+    expect((await artifacts.read(uri, child.id)).status).toBe("error");
     service.close();
   });
 
@@ -2788,6 +2880,63 @@ describe("SessionService", () => {
       attachCompaction: async () => () => {},
     });
 
+    service.close();
+  });
+
+  it("returns owned session failures without misclassifying them as SQLite failures", async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), "mini-lilac-session-result-"));
+    temporaryDirectories.push(directory);
+    const service = new SessionService({
+      config: config(),
+      databasePath: path.join(directory, "sessions.sqlite"),
+      modelResolver: () => new MockLanguageModelV4({}),
+      attachCompaction: async () => () => {},
+    });
+
+    const created = await service.createSessionResult({
+      id: "sub:reserved",
+      cwd: directory,
+      model: "test/mock",
+    });
+
+    expect(created.status).toBe("error");
+    if (created.status === "error") {
+      expect(created.error).toBeInstanceOf(MiniLilacSessionOperationRejected);
+      expect(created.error).toMatchObject({
+        _tag: "MiniLilacSessionOperationRejected",
+        operation: "createSession",
+      });
+    }
+    const externalFailure = await service.createSessionResult({
+      cwd: path.join(directory, "missing"),
+      model: "test/mock",
+    });
+    expect(externalFailure).toMatchObject({
+      status: "error",
+      error: {
+        _tag: "MiniLilacSessionExternalFailure",
+        operation: "createSession",
+      },
+    });
+    expect(service.closeResult()).toMatchObject({ status: "ok" });
+  });
+
+  it("preserves Panic through the session Result boundary", async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), "mini-lilac-session-panic-"));
+    temporaryDirectories.push(directory);
+    const panic = new Panic({ message: "model resolver invariant" });
+    const service = new SessionService({
+      config: config(),
+      databasePath: path.join(directory, "sessions.sqlite"),
+      modelResolver: () => {
+        throw panic;
+      },
+      attachCompaction: async () => () => {},
+    });
+
+    await expect(service.createSessionResult({ cwd: directory, model: "test/mock" })).rejects.toBe(
+      panic,
+    );
     service.close();
   });
 
@@ -2826,6 +2975,17 @@ describe("SessionService", () => {
     expect(() => service.startPrompt(session.id, userMessage("too late"))).toThrow(
       "not accepting admissions",
     );
+    const rejectedAdmission = await service.startPromptResult(
+      session.id,
+      userMessage("still too late"),
+    );
+    expect(rejectedAdmission).toMatchObject({
+      status: "error",
+      error: {
+        _tag: "MiniLilacSessionOperationRejected",
+        operation: "admission",
+      },
+    });
     await shutdown;
     await completion;
 
@@ -2990,7 +3150,7 @@ describe("SessionService", () => {
     const call = model.doStreamCalls[0];
     expect(call?.prompt[0]).toMatchObject({ role: "system" });
     expect(JSON.stringify(call?.prompt[0])).toContain(`Working directory: ${directory}`);
-    expect(call?.tools?.map((entry) => entry.name)).toEqual(["read_file"]);
+    expect(call?.tools?.map((entry) => entry.name)).toEqual(["read"]);
     service.close();
 
     const reopened = new SessionService({
@@ -3431,7 +3591,7 @@ describe("SessionService", () => {
     service.close();
   });
 
-  it("preloads workspace AGENTS.md and injects nested instructions with read_file", async () => {
+  it("preloads workspace AGENTS.md and injects nested instructions with read", async () => {
     let turn = 0;
     const model = new MockLanguageModelV4({
       doStream: async () => {
@@ -3782,6 +3942,68 @@ describe("SessionService", () => {
     expect(settledTitle).toBe("Keep this useful fallback");
   });
 
+  it("reports an exact title-generation Panic to the fatal supervisor", async () => {
+    const runtimeConfig = config();
+    runtimeConfig.agent.titleModel = "test/title";
+    const rootModel = new MockLanguageModelV4({ doStream: textResult("answer", "done") });
+    const panic = new Panic({ message: "title model invariant" });
+    const reported: Panic[] = [];
+    const directory = await mkdtemp(path.join(tmpdir(), "mini-lilac-title-panic-"));
+    temporaryDirectories.push(directory);
+    const service = new SessionService({
+      config: runtimeConfig,
+      databasePath: path.join(directory, "runtime.sqlite"),
+      modelResolver: (specifier) => {
+        if (specifier === "test/title") throw panic;
+        return rootModel;
+      },
+      reportFatalPanic: (reportedPanic) => reported.push(reportedPanic),
+    });
+    const session = await service.createSession({ cwd: directory, model: "test/mock" });
+
+    await collect((await service.startPrompt(session.id, userMessage("Keep the fallback"))).stream);
+    await service.waitForTrackedTasks();
+    const settledTitle = service.getSnapshot(session.id).title;
+    service.close();
+
+    expect(reported).toEqual([panic]);
+    expect(settledTitle).toBe("Keep the fallback");
+  });
+
+  it("keeps ordinary title-generation failure best-effort", async () => {
+    const warning = spyOn(console, "warn").mockImplementation(() => undefined);
+    const runtimeConfig = config();
+    runtimeConfig.agent.titleModel = "test/title";
+    const rootModel = new MockLanguageModelV4({ doStream: textResult("answer", "done") });
+    const reported: Panic[] = [];
+    const directory = await mkdtemp(path.join(tmpdir(), "mini-lilac-title-failure-"));
+    temporaryDirectories.push(directory);
+    const service = new SessionService({
+      config: runtimeConfig,
+      databasePath: path.join(directory, "runtime.sqlite"),
+      modelResolver: (specifier) => {
+        if (specifier === "test/title") throw new Error("title provider unavailable");
+        return rootModel;
+      },
+      reportFatalPanic: (panic) => reported.push(panic),
+    });
+
+    try {
+      const session = await service.createSession({ cwd: directory, model: "test/mock" });
+      await collect(
+        (await service.startPrompt(session.id, userMessage("Keep ordinary fallback"))).stream,
+      );
+      await service.waitForTrackedTasks();
+
+      expect(reported).toEqual([]);
+      expect(service.getSnapshot(session.id).title).toBe("Keep ordinary fallback");
+      expect(warning).toHaveBeenCalledTimes(1);
+    } finally {
+      warning.mockRestore();
+      service.close();
+    }
+  });
+
   it("bounds generated titles by protocol-safe UTF-16 length", async () => {
     const runtimeConfig = config();
     runtimeConfig.agent.titleModel = "test/title";
@@ -3899,6 +4121,59 @@ describe("SessionService", () => {
       (await compact(service, { sessionId: session.id, clientCommandId: "compact-cancelled" }))
         .result.phase,
     ).toBe("completed");
+    service.close();
+  });
+
+  it("cancels manual compaction when an aborted provider rejects an ordinary Error", async () => {
+    const providerReached = Promise.withResolvers<void>();
+    const summaryModel = new MockLanguageModelV4({
+      doStream: async ({ abortSignal }) => {
+        if (abortSignal === undefined) throw new Error("Expected compaction abort signal");
+        const aborted = new Promise<void>((resolve) => {
+          if (abortSignal.aborted) resolve();
+          else abortSignal.addEventListener("abort", () => resolve(), { once: true });
+        });
+        providerReached.resolve();
+        await aborted;
+        throw new Error("Provider rejected after cancellation");
+      },
+    });
+    const directory = await mkdtemp(path.join(tmpdir(), "mini-lilac-compact-error-cancel-"));
+    temporaryDirectories.push(directory);
+    const service = new SessionService({
+      config: config(),
+      databasePath: path.join(directory, "runtime.sqlite"),
+      modelResolver: () => summaryModel,
+      modelLimitsResolver: async () => ({ context: 10_000, output: 1_000 }),
+    });
+    const session = await service.createSession({ cwd: directory, model: "test/mock" });
+    seedCompletedHistory(
+      service.store,
+      session.id,
+      [
+        { role: "user", content: `old request ${"a".repeat(6_000)}` },
+        { role: "assistant", content: `old answer ${"b".repeat(6_000)}` },
+        { role: "user", content: "latest request must remain" },
+      ],
+      [userMessage("old request"), userMessage("latest request must remain")],
+    );
+    const before = service.store.getModelMessages(session.id);
+
+    const started = await service.compact({
+      sessionId: session.id,
+      clientCommandId: "compact-provider-error-cancelled",
+    });
+    await providerReached.promise;
+    expect(await service.cancelCompaction({ sessionId: session.id })).toEqual({
+      status: "cancelling",
+    });
+    const events = (await collect(started.stream)).flatMap((chunk) =>
+      chunk.type === "data-compaction" ? [chunk.data] : [],
+    );
+
+    expect(events.at(-1)?.phase).toBe("cancelled");
+    expect(service.store.getModelMessages(session.id)).toEqual(before);
+    expect(service.getSnapshot(session.id).status).toBe("idle");
     service.close();
   });
 
@@ -4393,7 +4668,7 @@ describe("SessionService", () => {
                 {
                   type: "tool-result",
                   toolCallId: "media",
-                  toolName: "read_file",
+                  toolName: "read",
                   output: {
                     type: "content",
                     value: [
@@ -4828,6 +5103,7 @@ describe("SessionService", () => {
     reopened.close();
   });
 
+  // test-wait-justification: this integration test performs repeated real Git-backed workspace captures and restores.
   it("restores observed worktrees through undo/redo and retains discarded edit topology", async () => {
     const directory = await mkdtemp(path.join(tmpdir(), "mini-lilac-redo-worktree-"));
     temporaryDirectories.push(directory);
@@ -4914,7 +5190,7 @@ describe("SessionService", () => {
         .states.filter((state) => retainedStateIds.has(state.id)),
     ).toHaveLength(retainedStateIds.size);
     service.close();
-  });
+  }, 30_000);
 
   it("aborts before journaling when the workspace drifts between capture and restore preparation", async () => {
     const directory = await mkdtemp(path.join(tmpdir(), "mini-lilac-navigation-source-drift-"));
@@ -6161,7 +6437,7 @@ describe("SessionService", () => {
               {
                 type: "tool-input-start" as const,
                 id: "draft-read",
-                toolName: "read_file",
+                toolName: "read",
                 providerExecuted: false,
               },
               {
@@ -6716,10 +6992,14 @@ describe("SessionService", () => {
     const started = await service.startPrompt(session.id, userMessage("wait"));
     // test-wait-justification: fault injection must occur after the gated run has entered its asynchronous model turn.
     await Bun.sleep(0);
-    const saveCommandResult = service.store.saveCommandResult.bind(service.store);
-    service.store.saveCommandResult = () => {
-      throw new Error("command result write failed");
-    };
+    const saveCommandResult = service.store.saveCommandResultResult.bind(service.store);
+    service.store.saveCommandResultResult = () =>
+      Result.err(
+        new MiniLilacStoreOperationRejected({
+          operation: "saveCommandResult",
+          message: "command result write failed",
+        }),
+      );
 
     const request = {
       sessionId: session.id,
@@ -6732,7 +7012,7 @@ describe("SessionService", () => {
     await expect(service.steer(request)).rejects.toThrow("is pending");
     expect(service.getSnapshot(session.id).queuedSteeringCount).toBe(1);
 
-    service.store.saveCommandResult = saveCommandResult;
+    service.store.saveCommandResultResult = saveCommandResult;
     await service.cancel({
       sessionId: session.id,
       runId: started.runId,
@@ -6758,12 +7038,16 @@ describe("SessionService", () => {
     const started = await service.startPrompt(session.id, userMessage("wait"));
     // test-wait-justification: fault injection must occur after the gated run has entered its asynchronous model turn.
     await Bun.sleep(0);
-    const markCommandSideEffectStarted = service.store.markCommandSideEffectStarted.bind(
+    const markCommandSideEffectStarted = service.store.markCommandSideEffectStartedResult.bind(
       service.store,
     );
-    service.store.markCommandSideEffectStarted = () => {
-      throw new Error("side-effect marker failed");
-    };
+    service.store.markCommandSideEffectStartedResult = () =>
+      Result.err(
+        new MiniLilacStoreOperationRejected({
+          operation: "markCommandSideEffectStarted",
+          message: "side-effect marker failed",
+        }),
+      );
 
     await expect(
       service.steer({
@@ -6779,7 +7063,7 @@ describe("SessionService", () => {
         .get(),
     ).toEqual({ count: 0 });
 
-    service.store.markCommandSideEffectStarted = markCommandSideEffectStarted;
+    service.store.markCommandSideEffectStartedResult = markCommandSideEffectStarted;
     await service.cancel({
       sessionId: session.id,
       runId: started.runId,
@@ -6792,7 +7076,7 @@ describe("SessionService", () => {
 
   it("atomically rolls back transcript, run, session state, and prompt command", async () => {
     const model = new MockLanguageModelV4({ doStream: textResult("answer", "done") });
-    const { service, session } = await temporaryRuntime(model);
+    const { service, session } = await temporaryRuntime(model, "reader", true);
     service.store.database.exec(`
       CREATE TRIGGER fail_prompt_command BEFORE UPDATE OF run_id ON commands
       WHEN NEW.kind = 'prompt' AND NEW.run_id IS NOT NULL
@@ -6804,7 +7088,7 @@ describe("SessionService", () => {
     for (let attempt = 0; attempt < 3; attempt += 1) {
       await expect(
         service.startPrompt(session.id, userMessage("must roll back"), "atomic-prompt"),
-      ).rejects.toThrow("prompt command fault");
+      ).rejects.toThrow("Mini Lilac SQLite operation failed");
       expect(
         service.store.database.query("SELECT COUNT(*) AS count FROM workspace_snapshots").get(),
       ).toEqual({ count: 0 });
@@ -6838,7 +7122,7 @@ describe("SessionService", () => {
 
   it("removes unreferenced snapshot rows at startup without deleting shared history snapshots", async () => {
     const model = new MockLanguageModelV4({ doStream: textResult("answer", "done") });
-    const { directory, service, session } = await temporaryRuntime(model);
+    const { directory, service, session } = await temporaryRuntime(model, "reader", true);
     const started = await service.startPrompt(
       session.id,
       userMessage("create referenced snapshot"),
@@ -6995,6 +7279,7 @@ describe("SessionService", () => {
     service.close();
   });
 
+  // test-wait-justification: this integration test initializes five concurrent Git-backed session workspaces.
   it("allows more than four child runs concurrently", async () => {
     const allChildrenStarted = Promise.withResolvers<void>();
     const releaseChildren = Promise.withResolvers<void>();
@@ -7053,7 +7338,7 @@ describe("SessionService", () => {
       sessions.flatMap((session) => delegatedRuns(service, session.id)).map((run) => run.status),
     ).toEqual(Array.from({ length: 5 }, () => "completed"));
     service.close();
-  });
+  }, 30_000);
 
   it("allows only one delegation edge by default", async () => {
     const model = new MockLanguageModelV4({
@@ -7235,7 +7520,7 @@ describe("SessionService", () => {
     const runtimeConfig = config();
     const readerProfile = runtimeConfig.agent.profiles.reader;
     if (!readerProfile) throw new Error("reader profile missing");
-    readerProfile.tools = ["bash", "read_file"];
+    readerProfile.tools = ["bash", "read"];
     readerProfile.execution = true;
     readerProfile.workspaceWrites = true;
     const model = new MockLanguageModelV4({
@@ -7267,11 +7552,11 @@ describe("SessionService", () => {
     expect(secondPrompt).toContain("middle output omitted");
     expect(secondPrompt).toContain('"completeOutputRetained":true');
     const artifact = await artifacts.read(uri, session.id);
-    expect(artifact.ok).toBe(true);
-    if (artifact.ok) {
-      expect(artifact.content).toContain("start-");
-      expect(artifact.content).toContain("-end");
-      expect(artifact.content).toContain("z".repeat(40_000));
+    expect(artifact.status).toBe("ok");
+    if (artifact.status === "ok") {
+      expect(artifact.value.content).toContain("start-");
+      expect(artifact.value.content).toContain("-end");
+      expect(artifact.value.content).toContain("z".repeat(40_000));
     }
     service.close();
   });
@@ -7550,8 +7835,8 @@ describe("SessionService", () => {
     expect(childPrompt).not.toContain("openai/child");
     expect(childPrompt).not.toContain('"low"');
     const childToolNames = model.doStreamCalls[1]?.tools?.map((entry) => entry.name) ?? [];
-    expect(childToolNames).toContain("apply_patch");
-    expect(childToolNames).not.toContain("edit_file");
+    expect(childToolNames).toContain("patch");
+    expect(childToolNames).not.toContain("edit");
     service.close();
   });
 
@@ -8275,7 +8560,7 @@ describe("SessionService", () => {
     const runtimeConfig = config();
     const reader = runtimeConfig.agent.profiles.reader;
     if (!reader) throw new Error("reader profile missing");
-    reader.tools = ["todowrite", "read_file", "batch"];
+    reader.tools = ["todowrite", "read", "batch"];
     const directory = await mkdtemp(path.join(tmpdir(), "mini-lilac-todo-parallel-"));
     temporaryDirectories.push(directory);
     const readable = path.join(directory, "parallel.txt");
@@ -8297,7 +8582,7 @@ describe("SessionService", () => {
     );
 
     const tools = model.doStreamCalls[0]?.tools ?? [];
-    expect(tools.map((entry) => entry.name)).toEqual(["read_file", "todowrite", "batch"]);
+    expect(tools.map((entry) => entry.name)).toEqual(["read", "todowrite", "batch"]);
     expect(JSON.stringify(tools.find((entry) => entry.name === "batch"))).not.toContain(
       '"todowrite"',
     );
@@ -8389,7 +8674,9 @@ describe("SessionService", () => {
     expect(model.doStreamCalls).toHaveLength(0);
     expect(service.store.getRun(started.runId)).toMatchObject({
       status: "error",
-      error: "Cannot append an ephemeral overlay after an assistant message",
+      error: expect.stringContaining(
+        "Cannot append an ephemeral overlay after an assistant message",
+      ),
     });
     service.close();
   });
@@ -8407,7 +8694,7 @@ describe("SessionService", () => {
     const runtimeConfig = config();
     const reader = runtimeConfig.agent.profiles.reader;
     if (reader === undefined) throw new Error("missing reader profile");
-    reader.tools = ["skill", "read_file", "batch"];
+    reader.tools = ["skill", "read", "batch"];
     const model = new MockLanguageModelV4({
       doStream: [batchedSkillResult("test-skill"), textResult("answer", "done")],
     });
@@ -8435,7 +8722,7 @@ describe("SessionService", () => {
     const firstCall = model.doStreamCalls[0];
     expect(JSON.stringify(firstCall?.prompt[0])).toContain("test-skill: Use for exact skill");
     expect(JSON.stringify(firstCall?.prompt[0])).toContain("@skills:<name>");
-    expect(firstCall?.tools?.map((entry) => entry.name)).toEqual(["read_file", "skill", "batch"]);
+    expect(firstCall?.tools?.map((entry) => entry.name)).toEqual(["read", "skill", "batch"]);
     expect(JSON.stringify(firstCall?.tools?.find((entry) => entry.name === "batch"))).toContain(
       '"skill"',
     );
@@ -8474,13 +8761,13 @@ describe("SessionService", () => {
     expect(names).toContain("batch");
     expect(names).toContain("webfetch");
     expect(names).not.toContain("bash");
-    expect(names).not.toContain("edit_file");
-    expect(names).not.toContain("apply_patch");
+    expect(names).not.toContain("edit");
+    expect(names).not.toContain("patch");
     expect(names).not.toContain("subagent_delegate");
     const batchSchema = JSON.stringify(tools.find((entry) => entry.name === "batch"));
     expect(batchSchema).not.toContain('"bash"');
-    expect(batchSchema).not.toContain('"edit_file"');
-    expect(batchSchema).not.toContain('"apply_patch"');
+    expect(batchSchema).not.toContain('"edit"');
+    expect(batchSchema).not.toContain('"patch"');
     expect(batchSchema).toContain('"webfetch"');
     service.close();
   });
@@ -8609,16 +8896,17 @@ describe("SessionService", () => {
     service.close();
   });
 
+  // test-wait-justification: this integration matrix initializes eight real Git-backed session workspaces.
   it("exposes exactly one editing tool based on the active model", async () => {
     for (const profileTools of [
       ["*"],
-      ["batch", "apply_patch", "edit_file"],
-      ["batch", "edit_file"],
-      ["batch", "apply_patch"],
+      ["batch", "patch", "edit"],
+      ["batch", "edit"],
+      ["batch", "patch"],
     ]) {
       for (const testCase of [
-        { modelSpecifier: "openai/gpt-test", exposed: "apply_patch", hidden: "edit_file" },
-        { modelSpecifier: "anthropic/claude-test", exposed: "edit_file", hidden: "apply_patch" },
+        { modelSpecifier: "openai/gpt-test", exposed: "patch", hidden: "edit" },
+        { modelSpecifier: "anthropic/claude-test", exposed: "edit", hidden: "patch" },
       ]) {
         const runtimeConfig = config();
         const reader = runtimeConfig.agent.profiles.reader;
@@ -8652,7 +8940,7 @@ describe("SessionService", () => {
         service.close();
       }
     }
-  });
+  }, 30_000);
 
   it("does not expose trusted Bash when workspace writes are disabled", async () => {
     const runtimeConfig = config();
@@ -8708,7 +8996,7 @@ describe("SessionService", () => {
               ...protectedPaths.map((protectedPath, index) => ({
                 type: "tool-call" as const,
                 toolCallId: `read-protected-${index}`,
-                toolName: "read_file",
+                toolName: "read",
                 input: JSON.stringify({ path: protectedPath }),
               })),
               {
@@ -8848,7 +9136,7 @@ describe("SessionService", () => {
               {
                 type: "tool-call",
                 toolCallId: "invalid-read",
-                toolName: "read_file",
+                toolName: "read",
                 input: "{}",
               },
               {

@@ -15,16 +15,29 @@ import {
   type ClaudeNativeSessionStart,
   type MaterializedClaudeCodeRun,
 } from "@stanley2058/lilac-claude-code-bridge";
+import { Result, type AnyTaggedError, type Result as ResultType } from "better-result";
+import { opaqueErrorMessage, type SubagentExecution } from "@stanley2058/lilac-utils";
 
-import type {
-  CoreNamedClaudeSessionAttempt,
-  CoreNamedClaudeSessionBinding,
-  TranscriptSnapshot,
-  TranscriptStore,
+import {
+  type CoreClaudeAttemptMutationError,
+  type CoreNamedClaudeSessionAttempt,
+  type CoreNamedClaudeSessionBinding,
+  type TranscriptSnapshot,
+  type TranscriptStore,
 } from "../../../transcript/transcript-store";
+import type { BridgeLogContext } from "../bridge-log";
 
 const TEXT_REPLAY_TOOL_INPUT_CHARS = 20_000;
 const TEXT_REPLAY_TOOL_RESULT_CHARS = 40_000;
+
+function adaptContinuationResultToHost<T, E extends Error>(result: ResultType<T, E>): T {
+  return result.match<() => T>({
+    ok: (value) => () => value,
+    err: (error) => () => {
+      throw error;
+    },
+  })();
+}
 
 type CoreNamedContinuationStore = Required<
   Pick<
@@ -147,7 +160,13 @@ function semanticFingerprint(value: unknown): string {
 }
 
 function normalizeDirectToolAuthorityName(name: string): string {
-  return name === "apply_patch" || name === "edit_file" ? "workspace_edit" : name;
+  return name === "patch" || name === "edit" ? "workspace_edit" : name;
+}
+
+export function coreProfileExecutionScopeAuthority(
+  execution: SubagentExecution,
+): boolean | SubagentExecution {
+  return execution === "native" ? true : execution;
 }
 
 export function hashCoreNamedExecutionScope(input: {
@@ -215,400 +234,452 @@ export function createCoreNamedClaudeRuntime(input: {
   readonly sourceTranscript: TranscriptSnapshot | null;
   readonly getCurrentTurnMessages?: () => readonly ModelMessage[];
   readonly materialize: (start: ClaudeNativeSessionStart) => Promise<MaterializedClaudeCodeRun>;
-  readonly onDiagnostic?: (event: string, detail: Readonly<Record<string, unknown>>) => void;
-}): CoreNamedClaudeRuntime {
+  readonly onDiagnostic?: (event: string, detail: BridgeLogContext, error?: AnyTaggedError) => void;
+}): ResultType<CoreNamedClaudeRuntime, CoreClaudeAttemptMutationError> {
   const sourceMessages = input.sourceTranscript?.messages ?? [];
   const sourceHash = hashCanonicalMessagesV1(sourceMessages).hash;
-  const sourceBinding = input.store.getCoreNamedClaudeSessionBinding({
+  const sourceBindingResult = input.store.getCoreNamedClaudeSessionBinding({
     providerId: input.providerId,
     requestClient: input.requestClient,
     lilacSessionId: input.sessionId,
   });
-  const shouldReplayHistoricalPrefix = shouldReplayCoreNamedHistory({
-    sourceTranscript: input.sourceTranscript,
-    targetFamily: "claude-code",
-  });
-  let selectedPayload: { readonly mode: "full" | "suffix"; readonly fresh: boolean } | null = null;
-  let currentAttempt: CoreNamedClaudeSessionAttempt | null = null;
-  const diagnostic = (event: string, detail: Readonly<Record<string, unknown>> = {}) =>
-    input.onDiagnostic?.(event, {
-      requestId: input.requestId,
-      sessionId: input.sessionId,
-      requestClient: input.requestClient,
-      providerId: input.providerId,
-      model: input.modelSpecifier,
-      reasoning: input.reasoning,
-      bindingHead: sourceBinding?.canonicalHeadHash ?? null,
-      bindingRevision: sourceBinding?.revision ?? null,
-      ...detail,
-    });
-
-  const bindingIsCompatible = (
-    binding: CoreNamedClaudeSessionBinding | null,
-    canonicalMessages: readonly ModelMessage[],
-  ): binding is CoreNamedClaudeSessionBinding =>
-    binding !== null &&
-    input.sourceTranscript?.providerState?.lastFamily === "claude-code" &&
-    binding.terminalRequestId === input.sourceTranscript.requestId &&
-    binding.canonicalHeadHash === sourceHash &&
-    binding.canonicalMessageCount === sourceMessages.length &&
-    binding.executionScopeHashVersion === 1 &&
-    binding.executionScopeHash === input.executionScopeHash &&
-    binding.nativeCwd === input.executionCwd &&
-    binding.canonicalMessageCount <= canonicalMessages.length &&
-    hashCanonicalMessagesV1(canonicalMessages.slice(0, binding.canonicalMessageCount)).hash ===
-      binding.canonicalHeadHash;
-
-  const recordAttemptOutcome = (state: "failed" | "cancelled" | "uncertain"): void => {
-    const attempt = currentAttempt;
-    if (!attempt) return;
-    input.store.recordCoreNamedClaudeSessionAttemptOutcome({
-      providerId: input.providerId,
-      requestClient: input.requestClient,
-      lilacSessionId: input.sessionId,
-      requestId: input.requestId,
-      attemptIndex: attempt.attemptIndex,
-      state,
-    });
-    diagnostic("attempt-outcome", {
-      outcome: state,
-      attemptIndex: attempt.attemptIndex,
-      candidateSessionId: attempt.candidateSessionId,
-      sourceSessionId: attempt.sourceSessionId,
-    });
-    currentAttempt = null;
-  };
-
-  const materializeAttempt = async (
-    attemptIndex: number,
-    binding: CoreNamedClaudeSessionBinding | null,
-  ) => {
-    const candidateSessionId = crypto.randomUUID();
-    const attempt = input.store.reserveCoreNamedClaudeSessionAttempt({
-      providerId: input.providerId,
-      requestClient: input.requestClient,
-      lilacSessionId: input.sessionId,
-      executionScopeHashVersion: 1,
-      executionScopeHash: input.executionScopeHash,
-      requestId: input.requestId,
-      attemptIndex,
-      candidateSessionId,
-      sourceSessionId: binding?.claudeSessionId ?? null,
-      expectedBindingRevision: sourceBinding?.revision ?? null,
-    });
-    currentAttempt = attempt;
-    diagnostic("attempt-materialized", {
-      mode: binding ? "fork" : "fresh",
-      reason: binding ? "exact-binding" : "fresh-selection",
-      attemptIndex,
-      candidateSessionId,
-      sourceSessionId: binding?.claudeSessionId ?? null,
-    });
-    try {
-      const run = await input.materialize(
-        binding
-          ? {
-              mode: "fork",
-              baseSessionId: binding.claudeSessionId,
-              sessionId: candidateSessionId,
-              expectedSourceLastModified: binding.nativeLastModified,
-            }
-          : { mode: "fresh", sessionId: candidateSessionId },
-      );
-      return {
-        run,
-        modelSpecifier: input.modelSpecifier,
-        initialPayload: binding
-          ? ({ mode: "suffix", startIndex: binding.canonicalMessageCount } as const)
-          : ({ mode: "full" } as const),
-      };
-    } catch (error) {
-      recordAttemptOutcome("failed");
-      throw error;
-    }
-  };
-
-  const owner = new ClaudeAttemptRuntimeOwner<null>({
-    factoryInputs: null,
-    createCandidate: async ({ attemptIndex, prepareContext }) => {
-      const persistedAttemptIndex = attemptIndex * 2;
-      const binding = bindingIsCompatible(sourceBinding, prepareContext.canonicalMessages)
-        ? sourceBinding
-        : null;
-      const selectionMode =
-        binding !== null ? "fork" : shouldReplayHistoricalPrefix ? "text-replay" : "fresh";
-      diagnostic("selection", {
-        mode: selectionMode,
-        reason:
-          binding !== null
-            ? "exact-binding"
-            : sourceBinding === null
-              ? shouldReplayHistoricalPrefix
-                ? "provider-history-replay"
-                : "missing-binding"
-              : "binding-mismatch",
-      });
-      if (binding) {
-        try {
-          return await materializeAttempt(persistedAttemptIndex, binding);
-        } catch (error) {
-          if (!(error instanceof ClaudeNativeSessionPreflightError)) throw error;
-          diagnostic("native-source-invalid", {
-            issues: error.issues.map((issue) => issue.code),
-            mode: "fresh",
-            reason: "native-source-invalid",
-          });
-        }
-      }
-      return await materializeAttempt(persistedAttemptIndex + (binding ? 1 : 0), null);
-    },
-  });
-
-  const prepareModelCall: PrepareModelCall = async (context) => {
-    const cursor = owner.state.cursor;
-    if (
-      currentAttempt &&
-      cursor &&
-      hashCanonicalMessagesV1(context.canonicalMessages.slice(0, cursor.canonicalMessageCount))
-        .hash !== cursor.canonicalPrefixHash
-    ) {
-      recordAttemptOutcome("failed");
-    }
-    const prepared = await owner.prepare(context);
-    selectedPayload = {
-      mode: prepared.payload.mode,
-      fresh: owner.currentCandidate?.run.nativeSession?.getObservation().sourceSessionId === null,
-    };
-    return prepared;
-  };
-
-  return {
-    prepareModelCall,
-    prepareHistoryView: (canonicalMessages) => {
-      const selected = selectedPayload;
-      selectedPayload = null;
-      return prepareCoreNamedHistoryView({
-        canonicalMessages,
-        sourceMessages,
-        currentTurnMessages: input.getCurrentTurnMessages?.() ?? [],
-        replayHistoricalPrefix: selected
-          ? selected.mode === "full" && selected.fresh && shouldReplayHistoricalPrefix
-          : shouldReplayHistoricalPrefix,
+  return sourceBindingResult.match<
+    () => ResultType<CoreNamedClaudeRuntime, CoreClaudeAttemptMutationError>
+  >({
+    err: (error) => () => Result.err(error),
+    ok: (sourceBinding) => () => {
+      const shouldReplayHistoricalPrefix = shouldReplayCoreNamedHistory({
+        sourceTranscript: input.sourceTranscript,
         targetFamily: "claude-code",
-        modelSpecifier: input.modelSpecifier,
       });
-    },
-    inputEstimateFloor: ({ canonicalMessages, overlay, estimateMessagesTokens }) => {
-      const cursor = owner.state.cursor;
-      const cursorMatches =
-        cursor !== null &&
-        cursor.canonicalMessageCount <= canonicalMessages.length &&
-        hashCanonicalMessagesV1(canonicalMessages.slice(0, cursor.canonicalMessageCount)).hash ===
-          cursor.canonicalPrefixHash;
-      const binding = bindingIsCompatible(sourceBinding, canonicalMessages) ? sourceBinding : null;
-      const synchronizedMessageCount = cursorMatches
-        ? cursor.canonicalMessageCount
-        : binding?.canonicalMessageCount;
-      if (synchronizedMessageCount === undefined) return null;
-      const cursorIsBindingHead =
-        cursorMatches &&
+      let selectedPayload: { readonly mode: "full" | "suffix"; readonly fresh: boolean } | null =
+        null;
+      let currentAttempt: CoreNamedClaudeSessionAttempt | null = null;
+      const diagnostic = (event: string, detail: BridgeLogContext = {}, error?: AnyTaggedError) =>
+        input.onDiagnostic?.(
+          event,
+          {
+            requestId: input.requestId,
+            sessionId: input.sessionId,
+            requestClient: input.requestClient,
+            providerId: input.providerId,
+            model: input.modelSpecifier,
+            reasoning: input.reasoning,
+            bindingHead: sourceBinding?.canonicalHeadHash ?? null,
+            bindingRevision: sourceBinding?.revision ?? null,
+            ...detail,
+          },
+          error,
+        );
+
+      const bindingIsCompatible = (
+        binding: CoreNamedClaudeSessionBinding | null,
+        canonicalMessages: readonly ModelMessage[],
+      ): binding is CoreNamedClaudeSessionBinding =>
         binding !== null &&
-        cursor.canonicalMessageCount === binding.canonicalMessageCount &&
-        cursor.canonicalPrefixHash === binding.canonicalHeadHash;
-      return owner.getNativeInputEstimateFloor({
-        storedNativeContextTokens: cursorMatches
-          ? cursorIsBindingHead
-            ? binding.nativeContextTokens
-            : undefined
-          : binding?.nativeContextTokens,
-        unsynchronizedSuffixAndOverlayEstimate: estimateMessagesTokens([
-          ...canonicalMessages.slice(synchronizedMessageCount),
-          ...overlay,
-        ]),
-      });
-    },
-    recordSuccessfulModelCall: async (canonicalMessages) => {
-      try {
-        await owner.recordSuccessfulModelCall(canonicalMessages);
-        if (owner.state.phase !== "unusable") return;
-        throw new Error(owner.state.unusableReason ?? "Claude native observability failed");
-      } catch (error) {
-        recordAttemptOutcome("failed");
-        await owner.retireForCanonicalReplacement();
-        diagnostic("candidate-observability-lost", {
-          mode: "fresh",
-          reason: "native-observability-lost",
-          error: error instanceof Error ? error.message : String(error),
-        });
-      }
-    },
-    retireForRetry: async () => {
-      recordAttemptOutcome("failed");
-      await owner.retireForRetry();
-    },
-    retireForCanonicalReplacement: async () => {
-      recordAttemptOutcome("failed");
-      await owner.retireForCanonicalReplacement();
-    },
-    finalize: async ({
-      terminalTranscript,
-      canonicalMessages,
-      providerState,
-      isCancellationRequested,
-    }) => {
-      const attempt = currentAttempt;
-      const candidate = owner.currentCandidate;
-      const cursor = owner.state.cursor;
-      const canonicalHash = hashCanonicalMessagesV1(canonicalMessages).hash;
-      if (
-        !attempt ||
-        !candidate?.run.nativeSession ||
-        cursor === null ||
-        cursor.canonicalMessageCount !== canonicalMessages.length ||
-        cursor.canonicalPrefixHash !== canonicalHash ||
-        terminalTranscript.messages.length !== canonicalMessages.length ||
-        hashCanonicalMessagesV1(terminalTranscript.messages).hash !== canonicalHash
-      ) {
-        recordAttemptOutcome("failed");
-        return false;
-      }
-      if (isCancellationRequested()) {
-        recordAttemptOutcome("cancelled");
-        return false;
-      }
-      let finalized: Awaited<
-        ReturnType<NonNullable<typeof candidate.run.nativeSession>["finalize"]>
-      >;
-      try {
-        finalized = await candidate.run.nativeSession.finalize();
-      } catch (error) {
-        recordAttemptOutcome(isCancellationRequested() ? "cancelled" : "failed");
-        diagnostic("candidate-finalization-failed", {
-          reason: "native-finalization-failed",
-          error: error instanceof Error ? error.message : String(error),
-        });
-        return false;
-      }
-      if (isCancellationRequested()) {
-        recordAttemptOutcome("cancelled");
-        return false;
-      }
-      if (
-        finalized.status !== "promotable" ||
-        finalized.candidate === null ||
-        finalized.observations.contextTokens === null ||
-        finalized.observations.contextMaxTokens === null
-      ) {
-        recordAttemptOutcome("failed");
-        diagnostic("candidate-unpromotable", {
-          reason: "native-finalization-unpromotable",
-          issues: finalized.issues.map((issue) => issue.code),
-        });
-        return false;
-      }
-      if (isCancellationRequested()) {
-        recordAttemptOutcome("cancelled");
-        return false;
-      }
-      let publicationRecovered = false;
-      try {
-        input.store.publishCoreNamedClaudeSuccess({
+        input.sourceTranscript?.providerState?.lastFamily === "claude-code" &&
+        binding.terminalRequestId === input.sourceTranscript.requestId &&
+        binding.canonicalHeadHash === sourceHash &&
+        binding.canonicalMessageCount === sourceMessages.length &&
+        binding.executionScopeHashVersion === 1 &&
+        binding.executionScopeHash === input.executionScopeHash &&
+        binding.nativeCwd === input.executionCwd &&
+        binding.canonicalMessageCount <= canonicalMessages.length &&
+        hashCanonicalMessagesV1(canonicalMessages.slice(0, binding.canonicalMessageCount)).hash ===
+          binding.canonicalHeadHash;
+
+      const recordAttemptOutcome = (state: "failed" | "cancelled" | "uncertain"): void => {
+        const attempt = currentAttempt;
+        if (!attempt) return;
+        const recorded = input.store.recordCoreNamedClaudeSessionAttemptOutcome({
           providerId: input.providerId,
           requestClient: input.requestClient,
           lilacSessionId: input.sessionId,
           requestId: input.requestId,
           attemptIndex: attempt.attemptIndex,
-          terminalRequestId: terminalTranscript.requestId,
-          terminalCanonicalHeadHash: canonicalHash,
-          terminalCanonicalMessageCount: canonicalMessages.length,
-          providerState,
-          nativeCwd: finalized.candidate.cwd,
-          nativeLastModified: finalized.candidate.lastModified,
-          nativeContextTokens: finalized.observations.contextTokens,
-          nativeContextMaxTokens: finalized.observations.contextMaxTokens,
-          lastModelSpecifier: input.modelSpecifier,
-          lastReasoning: input.reasoning,
+          state,
         });
-      } catch (error) {
-        let persistedState: CoreNamedClaudeSessionAttempt["state"] | null = null;
+        const recordError = recorded.match({ ok: () => null, err: (error) => error });
+        if (recordError) {
+          diagnostic("attempt-outcome-failed", { outcome: state }, recordError);
+          return;
+        }
+        diagnostic("attempt-outcome", {
+          outcome: state,
+          attemptIndex: attempt.attemptIndex,
+          candidateSessionId: attempt.candidateSessionId,
+          sourceSessionId: attempt.sourceSessionId,
+        });
+        currentAttempt = null;
+      };
+
+      const materializeAttempt = async (
+        attemptIndex: number,
+        binding: CoreNamedClaudeSessionBinding | null,
+      ) => {
+        const candidateSessionId = crypto.randomUUID();
+        const reserved = input.store.reserveCoreNamedClaudeSessionAttempt({
+          providerId: input.providerId,
+          requestClient: input.requestClient,
+          lilacSessionId: input.sessionId,
+          executionScopeHashVersion: 1,
+          executionScopeHash: input.executionScopeHash,
+          requestId: input.requestId,
+          attemptIndex,
+          candidateSessionId,
+          sourceSessionId: binding?.claudeSessionId ?? null,
+          expectedBindingRevision: sourceBinding?.revision ?? null,
+        });
+        const attempt = adaptContinuationResultToHost(reserved);
+        currentAttempt = attempt;
+        diagnostic("attempt-materialized", {
+          mode: binding ? "fork" : "fresh",
+          reason: binding ? "exact-binding" : "fresh-selection",
+          attemptIndex,
+          candidateSessionId,
+          sourceSessionId: binding?.claudeSessionId ?? null,
+        });
         try {
-          persistedState =
-            input.store.getCoreNamedClaudeSessionAttempt({
+          const run = await input.materialize(
+            binding
+              ? {
+                  mode: "fork",
+                  baseSessionId: binding.claudeSessionId,
+                  sessionId: candidateSessionId,
+                  expectedSourceLastModified: binding.nativeLastModified,
+                }
+              : { mode: "fresh", sessionId: candidateSessionId },
+          );
+          return Result.ok({
+            run,
+            modelSpecifier: input.modelSpecifier,
+            initialPayload: binding
+              ? ({ mode: "suffix", startIndex: binding.canonicalMessageCount } as const)
+              : ({ mode: "full" } as const),
+          });
+        } catch (error) {
+          recordAttemptOutcome("failed");
+          throw error;
+        }
+      };
+
+      const owner = new ClaudeAttemptRuntimeOwner<null>({
+        factoryInputs: null,
+        createCandidate: async ({ attemptIndex, prepareContext }) => {
+          const persistedAttemptIndex = attemptIndex * 2;
+          const binding = bindingIsCompatible(sourceBinding, prepareContext.canonicalMessages)
+            ? sourceBinding
+            : null;
+          let selectionMode: "fork" | "text-replay" | "fresh";
+          if (binding !== null) {
+            selectionMode = "fork";
+          } else if (shouldReplayHistoricalPrefix) {
+            selectionMode = "text-replay";
+          } else {
+            selectionMode = "fresh";
+          }
+          let selectionReason: string;
+          if (binding !== null) {
+            selectionReason = "exact-binding";
+          } else if (sourceBinding !== null) {
+            selectionReason = "binding-mismatch";
+          } else if (shouldReplayHistoricalPrefix) {
+            selectionReason = "provider-history-replay";
+          } else {
+            selectionReason = "missing-binding";
+          }
+          diagnostic("selection", {
+            mode: selectionMode,
+            reason: selectionReason,
+          });
+          if (binding) {
+            try {
+              const materialized = await materializeAttempt(persistedAttemptIndex, binding);
+              return adaptContinuationResultToHost(materialized);
+            } catch (error) {
+              if (!(error instanceof ClaudeNativeSessionPreflightError)) throw error;
+              diagnostic("native-source-invalid", {
+                issues: error.issues.map((issue) => issue.code).join(","),
+                mode: "fresh",
+                reason: "native-source-invalid",
+              });
+            }
+          }
+          const materialized = await materializeAttempt(
+            persistedAttemptIndex + (binding ? 1 : 0),
+            null,
+          );
+          return adaptContinuationResultToHost(materialized);
+        },
+      });
+
+      const prepareModelCall: PrepareModelCall = async (context) => {
+        const cursor = owner.state.cursor;
+        if (
+          currentAttempt &&
+          cursor &&
+          hashCanonicalMessagesV1(context.canonicalMessages.slice(0, cursor.canonicalMessageCount))
+            .hash !== cursor.canonicalPrefixHash
+        ) {
+          recordAttemptOutcome("failed");
+        }
+        const prepared = await owner.prepare(context);
+        selectedPayload = {
+          mode: prepared.payload.mode,
+          fresh:
+            owner.currentCandidate?.run.nativeSession?.getObservation().sourceSessionId === null,
+        };
+        return prepared;
+      };
+
+      return Result.ok({
+        prepareModelCall,
+        prepareHistoryView: (canonicalMessages) => {
+          const selected = selectedPayload;
+          selectedPayload = null;
+          return prepareCoreNamedHistoryView({
+            canonicalMessages,
+            sourceMessages,
+            currentTurnMessages: input.getCurrentTurnMessages?.() ?? [],
+            replayHistoricalPrefix: selected
+              ? selected.mode === "full" && selected.fresh && shouldReplayHistoricalPrefix
+              : shouldReplayHistoricalPrefix,
+            targetFamily: "claude-code",
+            modelSpecifier: input.modelSpecifier,
+          });
+        },
+        inputEstimateFloor: ({ canonicalMessages, overlay, estimateMessagesTokens }) => {
+          const cursor = owner.state.cursor;
+          const cursorMatches =
+            cursor !== null &&
+            cursor.canonicalMessageCount <= canonicalMessages.length &&
+            hashCanonicalMessagesV1(canonicalMessages.slice(0, cursor.canonicalMessageCount))
+              .hash === cursor.canonicalPrefixHash;
+          const binding = bindingIsCompatible(sourceBinding, canonicalMessages)
+            ? sourceBinding
+            : null;
+          const synchronizedMessageCount = cursorMatches
+            ? cursor.canonicalMessageCount
+            : binding?.canonicalMessageCount;
+          if (synchronizedMessageCount === undefined) return null;
+          const cursorIsBindingHead =
+            cursorMatches &&
+            binding !== null &&
+            cursor.canonicalMessageCount === binding.canonicalMessageCount &&
+            cursor.canonicalPrefixHash === binding.canonicalHeadHash;
+          let storedNativeContextTokens = binding?.nativeContextTokens;
+          if (cursorMatches && !cursorIsBindingHead) {
+            storedNativeContextTokens = undefined;
+          }
+          return owner.getNativeInputEstimateFloor({
+            storedNativeContextTokens,
+            unsynchronizedSuffixAndOverlayEstimate: estimateMessagesTokens([
+              ...canonicalMessages.slice(synchronizedMessageCount),
+              ...overlay,
+            ]),
+          });
+        },
+        recordSuccessfulModelCall: async (canonicalMessages) => {
+          try {
+            await owner.recordSuccessfulModelCall(canonicalMessages);
+            if (owner.state.phase !== "unusable") return;
+            throw new Error(owner.state.unusableReason ?? "Claude native observability failed");
+          } catch (error) {
+            recordAttemptOutcome("failed");
+            await owner.retireForCanonicalReplacement();
+            diagnostic("candidate-observability-lost", {
+              mode: "fresh",
+              reason: "native-observability-lost",
+              error: opaqueErrorMessage(error, "Unknown continuation failure"),
+            });
+          }
+        },
+        retireForRetry: async () => {
+          recordAttemptOutcome("failed");
+          await owner.retireForRetry();
+        },
+        retireForCanonicalReplacement: async () => {
+          recordAttemptOutcome("failed");
+          await owner.retireForCanonicalReplacement();
+        },
+        finalize: async ({
+          terminalTranscript,
+          canonicalMessages,
+          providerState,
+          isCancellationRequested,
+        }) => {
+          const attempt = currentAttempt;
+          const candidate = owner.currentCandidate;
+          const cursor = owner.state.cursor;
+          const canonicalHash = hashCanonicalMessagesV1(canonicalMessages).hash;
+          if (
+            !attempt ||
+            !candidate?.run.nativeSession ||
+            cursor === null ||
+            cursor.canonicalMessageCount !== canonicalMessages.length ||
+            cursor.canonicalPrefixHash !== canonicalHash ||
+            terminalTranscript.messages.length !== canonicalMessages.length ||
+            hashCanonicalMessagesV1(terminalTranscript.messages).hash !== canonicalHash
+          ) {
+            recordAttemptOutcome("failed");
+            return false;
+          }
+          if (isCancellationRequested()) {
+            recordAttemptOutcome("cancelled");
+            return false;
+          }
+          const finalizedResult = await candidate.run.nativeSession.finalizeResult();
+          const finalizationError = finalizedResult.match({
+            ok: () => null,
+            err: (error) => error,
+          });
+          if (finalizationError) {
+            recordAttemptOutcome(isCancellationRequested() ? "cancelled" : "failed");
+            diagnostic(
+              "candidate-finalization-failed",
+              { reason: "native-finalization-failed" },
+              finalizationError,
+            );
+            return false;
+          }
+          const finalized = finalizedResult.match({ ok: (value) => value, err: () => null });
+          if (!finalized) return false;
+          if (isCancellationRequested()) {
+            recordAttemptOutcome("cancelled");
+            return false;
+          }
+          if (
+            finalized.status !== "promotable" ||
+            finalized.candidate === null ||
+            finalized.observations.contextTokens === null ||
+            finalized.observations.contextMaxTokens === null
+          ) {
+            recordAttemptOutcome("failed");
+            diagnostic("candidate-unpromotable", {
+              reason: "native-finalization-unpromotable",
+              issues: finalized.issues.map((issue) => issue.code).join(","),
+            });
+            return false;
+          }
+          if (isCancellationRequested()) {
+            recordAttemptOutcome("cancelled");
+            return false;
+          }
+          let publicationRecovered = false;
+          try {
+            const publication = input.store.publishCoreNamedClaudeSuccess({
               providerId: input.providerId,
               requestClient: input.requestClient,
               lilacSessionId: input.sessionId,
               requestId: input.requestId,
               attemptIndex: attempt.attemptIndex,
-            })?.state ?? null;
-        } catch {
-          // Leave an unknown publication outcome for startup recovery.
-        }
-        if (persistedState === "succeeded") {
-          publicationRecovered = true;
-        } else {
-          if (persistedState === "active") {
-            recordAttemptOutcome(isCancellationRequested() ? "cancelled" : "failed");
-          } else {
-            currentAttempt = null;
+              terminalRequestId: terminalTranscript.requestId,
+              terminalCanonicalHeadHash: canonicalHash,
+              terminalCanonicalMessageCount: canonicalMessages.length,
+              providerState,
+              nativeCwd: finalized.candidate.cwd,
+              nativeLastModified: finalized.candidate.lastModified,
+              nativeContextTokens: finalized.observations.contextTokens,
+              nativeContextMaxTokens: finalized.observations.contextMaxTokens,
+              lastModelSpecifier: input.modelSpecifier,
+              lastReasoning: input.reasoning,
+            });
+            const publicationError = publication.match({ ok: () => null, err: (error) => error });
+            if (publicationError) {
+              recordAttemptOutcome("failed");
+              diagnostic(
+                "canonical-publication-failed",
+                { reason: "transcript-publication-error" },
+                publicationError,
+              );
+              return false;
+            }
+          } catch (error) {
+            let persistedState: CoreNamedClaudeSessionAttempt["state"] | null = null;
+            try {
+              persistedState =
+                input.store.getCoreNamedClaudeSessionAttempt({
+                  providerId: input.providerId,
+                  requestClient: input.requestClient,
+                  lilacSessionId: input.sessionId,
+                  requestId: input.requestId,
+                  attemptIndex: attempt.attemptIndex,
+                })?.state ?? null;
+            } catch {
+              // Leave an unknown publication outcome for startup recovery.
+            }
+            if (persistedState === "succeeded") {
+              publicationRecovered = true;
+            } else {
+              if (persistedState === "active") {
+                recordAttemptOutcome(isCancellationRequested() ? "cancelled" : "failed");
+              } else {
+                currentAttempt = null;
+              }
+              diagnostic("canonical-publication-failed", {
+                mode: "canonical-publication",
+                reason: "publication-failed",
+                persistedState,
+                error: opaqueErrorMessage(error, "Unknown continuation failure"),
+              });
+              return false;
+            }
           }
-          diagnostic("canonical-publication-failed", {
+          diagnostic("canonical-published", {
             mode: "canonical-publication",
-            reason: "publication-failed",
-            persistedState,
-            error: error instanceof Error ? error.message : String(error),
+            reason: publicationRecovered
+              ? "verified-after-publication-error"
+              : "verified-terminal-head",
+            terminalCanonicalMessageCount: canonicalMessages.length,
           });
-          return false;
-        }
-      }
-      diagnostic("canonical-published", {
-        mode: "canonical-publication",
-        reason: publicationRecovered
-          ? "verified-after-publication-error"
-          : "verified-terminal-head",
-        terminalCanonicalMessageCount: canonicalMessages.length,
+          diagnostic("attempt-outcome", {
+            outcome: "succeeded",
+            attemptIndex: attempt.attemptIndex,
+            candidateSessionId: attempt.candidateSessionId,
+            sourceSessionId: attempt.sourceSessionId,
+          });
+          currentAttempt = null;
+          const promotion = input.store.promoteCoreNamedClaudeSessionBinding({
+            providerId: input.providerId,
+            requestClient: input.requestClient,
+            lilacSessionId: input.sessionId,
+            requestId: input.requestId,
+            attemptIndex: attempt.attemptIndex,
+          });
+          const promotionError = promotion.match({ ok: () => null, err: (error) => error });
+          if (promotionError) {
+            diagnostic(
+              "promotion-failed",
+              {
+                mode: "cas",
+                reason: "promotion-failed",
+              },
+              promotionError,
+            );
+            return false;
+          }
+          const promoted = promotion.match({ ok: (value) => value, err: () => false });
+          if (!promoted) {
+            diagnostic("promotion-rejected", {
+              mode: "cas",
+              reason: "promotion-rejected",
+              promoted: false,
+            });
+            return false;
+          }
+          diagnostic("promotion", {
+            mode: "cas",
+            reason: "binding-promoted",
+            promoted: true,
+          });
+          return true;
+        },
+        markTerminalFailure: (cancelled) =>
+          recordAttemptOutcome(cancelled ? "cancelled" : "failed"),
+        markUncertain: () => recordAttemptOutcome("uncertain"),
+        retireAtRunEnd: () => owner.retireAtRunEnd(),
+        currentRun: () => owner.currentCandidate?.run ?? null,
       });
-      diagnostic("attempt-outcome", {
-        outcome: "succeeded",
-        attemptIndex: attempt.attemptIndex,
-        candidateSessionId: attempt.candidateSessionId,
-        sourceSessionId: attempt.sourceSessionId,
-      });
-      currentAttempt = null;
-      let promoted: boolean;
-      try {
-        promoted = input.store.promoteCoreNamedClaudeSessionBinding({
-          providerId: input.providerId,
-          requestClient: input.requestClient,
-          lilacSessionId: input.sessionId,
-          requestId: input.requestId,
-          attemptIndex: attempt.attemptIndex,
-        });
-      } catch (error) {
-        diagnostic("promotion-failed", {
-          mode: "cas",
-          reason: "promotion-failed",
-          error: error instanceof Error ? error.message : String(error),
-        });
-        return false;
-      }
-      if (!promoted) {
-        diagnostic("promotion-rejected", {
-          mode: "cas",
-          reason: "promotion-rejected",
-          promoted: false,
-        });
-        return false;
-      }
-      diagnostic("promotion", {
-        mode: "cas",
-        reason: "binding-promoted",
-        promoted: true,
-      });
-      return true;
     },
-    markTerminalFailure: (cancelled) => recordAttemptOutcome(cancelled ? "cancelled" : "failed"),
-    markUncertain: () => recordAttemptOutcome("uncertain"),
-    retireAtRunEnd: () => owner.retireAtRunEnd(),
-    currentRun: () => owner.currentCandidate?.run ?? null,
-  };
+  })();
 }

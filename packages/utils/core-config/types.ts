@@ -44,6 +44,8 @@ export type ConfiguredModelRef = {
 
 export type ConfiguredModelChainEntry = string | ConfiguredModelRef;
 
+export type SubagentExecution = false | "restricted" | "native";
+
 export type SubagentProfileConfig = {
   modelSlot: "main" | "fast";
   model?: string;
@@ -63,7 +65,7 @@ export type SubagentProfileConfig = {
   network: boolean;
   /** Write behavior/edit-tool setting; not a trusted-Bash filesystem boundary. */
   workspaceWrites: boolean;
-  execution: boolean;
+  execution: SubagentExecution;
   delegation: boolean;
 };
 
@@ -154,6 +156,10 @@ export type UniversalCoreConfig = {
       fetch: {
         mode: "auto" | "fetch" | "browser" | "extract" | "provider-only";
       };
+      firecrawl?: {
+        maxConcurrency: number;
+        queueTtlMs: number;
+      };
     };
     inspect: {
       model: string;
@@ -201,6 +207,7 @@ export type UniversalCoreConfig = {
       autoInject: {
         enabled: boolean;
         plannerModel?: string;
+        textPlannerModel?: string;
         minTextUnits: number;
         followUpMinTextUnits: number;
         limit: number;
@@ -252,6 +259,11 @@ export type UniversalCoreConfig = {
         style: "unicode" | "ascii";
         maxWidth: number;
         fallbackMode: "list" | "passthrough";
+      };
+      markdownMathRender: {
+        enabled: boolean;
+        maxWidth: number;
+        fallbackMode: "source" | "passthrough";
       };
     };
 

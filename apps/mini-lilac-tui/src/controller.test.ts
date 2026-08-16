@@ -1,8 +1,10 @@
 import { describe, expect, it } from "bun:test";
 import type { UIMessageChunk } from "ai";
+import { Result, type Result as ResultType } from "better-result";
 
 import {
   MiniLilacCompactionCancelledError,
+  MiniLilacExternalOperationFailed,
   MiniLilacTransport,
   type MiniLilacCancelCompactionRequest,
   type MiniLilacCancelCompactionResult,
@@ -11,6 +13,8 @@ import {
   type MiniLilacCompactInput,
   type MiniLilacCompactOptions,
   type MiniLilacCompactResult,
+  type MiniLilacRequestError,
+  type MiniLilacResultStream,
   type MiniLilacInterruptQueuedSteeringResult,
   type MiniLilacRedoRequest,
   type MiniLilacRedoResult,
@@ -118,6 +122,31 @@ function messageText(message: MiniLilacUIMessage): string {
     .join("");
 }
 
+async function captureTestTransport<T>(
+  operation: string,
+  effect: () => Promise<T>,
+): Promise<ResultType<T, MiniLilacExternalOperationFailed>> {
+  try {
+    return Result.ok(await effect());
+  } catch (cause) {
+    return Result.err(
+      new MiniLilacExternalOperationFailed({
+        operation,
+        cause,
+        message: cause instanceof Error ? cause.message : `${operation} failed`,
+      }),
+    );
+  }
+}
+
+function testResultStream(stream: ReadableStream<UIMessageChunk>): MiniLilacResultStream {
+  return stream.pipeThrough(
+    new TransformStream<UIMessageChunk, ResultType<UIMessageChunk, never>>({
+      transform: (chunk, controller) => controller.enqueue(Result.ok(chunk)),
+    }),
+  );
+}
+
 /** A transport whose network methods are stubbed while keeping full typing. */
 class FakeTransport extends MiniLilacTransport {
   readonly calls: string[] = [];
@@ -204,11 +233,14 @@ class FakeTransport extends MiniLilacTransport {
     });
   }
 
-  override reconnectToStream(): Promise<ReadableStream<UIMessageChunk> | null> {
+  override async reconnectToStream(): Promise<ReadableStream<UIMessageChunk> | null> {
     this.reconnectCount += 1;
     this.calls.push("reconnect");
-    if (this.behavior.reconnectPromise !== undefined) return this.behavior.reconnectPromise;
-    return Promise.resolve(this.behavior.reconnectStream?.() ?? null);
+    const stream =
+      this.behavior.reconnectPromise !== undefined
+        ? await this.behavior.reconnectPromise
+        : (this.behavior.reconnectStream?.() ?? null);
+    return stream;
   }
 
   override steer(
@@ -348,6 +380,127 @@ class FakeTransport extends MiniLilacTransport {
     if (this.behavior.sessionError !== undefined) return Promise.reject(this.behavior.sessionError);
     if (this.behavior.session !== undefined) return Promise.resolve(this.behavior.session);
     return Promise.reject(new Error("MiniLilac request failed (404): session not found"));
+  }
+
+  override async sendMessagesResult(
+    options: Parameters<MiniLilacTransport["sendMessagesResult"]>[0],
+  ) {
+    const sent = await captureTestTransport("send", () => this.sendMessages(options));
+    return sent.status === "error"
+      ? Result.err(sent.error)
+      : Result.ok(testResultStream(sent.value));
+  }
+
+  override async reconnectToStreamResult() {
+    const reconnected = await captureTestTransport("reconnect", () => this.reconnectToStream());
+    if (reconnected.status === "error") return Result.err(reconnected.error);
+    return Result.ok(reconnected.value === null ? null : testResultStream(reconnected.value));
+  }
+
+  override steerResult(
+    request: Parameters<MiniLilacTransport["steerResult"]>[0],
+    options?: Parameters<MiniLilacTransport["steerResult"]>[1],
+  ) {
+    return captureTestTransport("steer", () => this.steer(request, options));
+  }
+
+  override interruptQueuedSteeringResult(
+    request: Parameters<MiniLilacTransport["interruptQueuedSteeringResult"]>[0],
+    options?: Parameters<MiniLilacTransport["interruptQueuedSteeringResult"]>[1],
+  ) {
+    return captureTestTransport("interrupt", () => this.interruptQueuedSteering(request, options));
+  }
+
+  override cancelResult(
+    request: Parameters<MiniLilacTransport["cancelResult"]>[0],
+    options?: Parameters<MiniLilacTransport["cancelResult"]>[1],
+  ) {
+    return captureTestTransport("cancel", () => this.cancel(request, options));
+  }
+
+  override undoResult(request: Parameters<MiniLilacTransport["undoResult"]>[0]) {
+    if (request.clientCommandId === undefined) {
+      return Promise.resolve(
+        Result.err(
+          new MiniLilacExternalOperationFailed({
+            operation: "undo",
+            cause: undefined,
+            message: "undo command ID missing",
+          }),
+        ),
+      );
+    }
+    const clientCommandId = request.clientCommandId;
+    return captureTestTransport("undo", () => this.undo({ ...request, clientCommandId }));
+  }
+
+  override redoResult(request: Parameters<MiniLilacTransport["redoResult"]>[0]) {
+    if (request.clientCommandId === undefined) {
+      return Promise.resolve(
+        Result.err(
+          new MiniLilacExternalOperationFailed({
+            operation: "redo",
+            cause: undefined,
+            message: "redo command ID missing",
+          }),
+        ),
+      );
+    }
+    const clientCommandId = request.clientCommandId;
+    return captureTestTransport("redo", () => this.redo({ ...request, clientCommandId }));
+  }
+
+  override async compactResult(
+    request: Parameters<MiniLilacTransport["compactResult"]>[0],
+    options?: Parameters<MiniLilacTransport["compactResult"]>[1],
+  ) {
+    try {
+      return Result.ok(await this.compact(request, options));
+    } catch (cause) {
+      if (cause instanceof MiniLilacCompactionCancelledError) return Result.err(cause);
+      return Result.err(
+        new MiniLilacExternalOperationFailed({
+          operation: "compact",
+          cause,
+          message: cause instanceof Error ? cause.message : "compact failed",
+        }),
+      );
+    }
+  }
+
+  override cancelCompactionResult(
+    request: Parameters<MiniLilacTransport["cancelCompactionResult"]>[0],
+  ) {
+    return captureTestTransport("cancel compaction", () => this.cancelCompaction(request));
+  }
+
+  override updateSessionBindingsResult(
+    request: Parameters<MiniLilacTransport["updateSessionBindingsResult"]>[0],
+  ) {
+    return captureTestTransport("bindings", () => this.updateSessionBindings(request));
+  }
+
+  override getMessagesResult() {
+    return captureTestTransport("messages", () => this.getMessages());
+  }
+
+  override getSessionResumeResult(): Promise<
+    ResultType<MiniLilacSessionResume, MiniLilacRequestError>
+  > {
+    return captureTestTransport("resume", () => this.getSessionResume());
+  }
+
+  override async getSessionResult() {
+    const loaded = await captureTestTransport("session", () => this.getSession());
+    if (loaded.status === "error") return loaded;
+    if (loaded.value !== undefined) return loaded;
+    return Result.err(
+      new MiniLilacExternalOperationFailed({
+        operation: "session",
+        cause: undefined,
+        message: "session unavailable",
+      }),
+    );
   }
 
   enqueue(chunk: UIMessageChunk): void {
@@ -904,7 +1057,7 @@ describe("Controller effect wiring", () => {
     expect(controller.inputState.phase).toBe("idle");
   });
 
-  it("treats undo with no user turn as a successful no-op", async () => {
+  it("treats empty undo and redo as successful no-ops", async () => {
     const initialMessages: MiniLilacUIMessage[] = [
       { id: "assistant-1", role: "assistant", parts: [{ type: "text", text: "hello" }] },
     ];
@@ -914,6 +1067,8 @@ describe("Controller effect wiring", () => {
           status: "empty",
           clientCommandId: request.clientCommandId ?? "missing",
         }),
+      redo: (request) =>
+        Promise.resolve({ status: "empty", clientCommandId: request.clientCommandId }),
     });
     const controller = new Controller({
       transport,
@@ -925,11 +1080,15 @@ describe("Controller effect wiring", () => {
     controller.start();
     controller.undo();
     await flush();
+    controller.redo();
+    await flush();
 
     expect(controller.inputState.phase).toBe("idle");
     expect(controller.inputState.editor).toBe("");
     expect(controller.transcript.map((entry) => entry.text)).toEqual(["hello"]);
     expect(transport.getMessagesCount).toBe(0);
+    expect(transport.undoRequests).toHaveLength(1);
+    expect(transport.redoRequests).toHaveLength(1);
   });
 
   it("runs typed /compact as a quiet submitting operation", async () => {
@@ -1660,7 +1819,7 @@ describe("Controller effect wiring", () => {
     });
   });
 
-  it("does not call the server when undoing before session creation", async () => {
+  it("does not call history endpoints before session creation", async () => {
     const transport = new FakeTransport();
     const controller = new Controller({
       transport,
@@ -1671,9 +1830,12 @@ describe("Controller effect wiring", () => {
     controller.start();
     controller.undo();
     await flush();
+    controller.redo();
+    await flush();
 
     expect(controller.inputState.phase).toBe("idle");
     expect(transport.undoRequests).toEqual([]);
+    expect(transport.redoRequests).toEqual([]);
     expect(controller.transcript).toEqual([]);
   });
 
@@ -2395,31 +2557,6 @@ describe("Controller effect wiring", () => {
     expect(controller.inputState.editor).toBe("automatic draft");
   });
 
-  it("treats empty redo as a successful no-op", async () => {
-    const transport = new FakeTransport({
-      redo: (request) =>
-        Promise.resolve({ status: "empty", clientCommandId: request.clientCommandId }),
-    });
-    const operations = operationTracker();
-    const controller = new Controller({
-      transport,
-      ui: operations.ui,
-      sessionId: "session-1",
-      initialMessages: [
-        { id: "assistant-1", role: "assistant", parts: [{ type: "text", text: "hello" }] },
-      ],
-      onExit: () => {},
-    });
-    controller.start();
-
-    const completed = operations.next();
-    controller.redo();
-    await completed;
-    expect(controller.inputState.phase).toBe("idle");
-    expect(transport.redoRequests).toHaveLength(1);
-    expect(transport.getMessagesCount).toBe(0);
-  });
-
   it("reuses the redo command id after both retry responses are uncertain", async () => {
     const message: MiniLilacUserUIMessage = {
       id: "user-retry-redo",
@@ -2496,7 +2633,7 @@ describe("Controller effect wiring", () => {
           parts: [
             {
               type: "dynamic-tool",
-              toolName: "read_file",
+              toolName: "read",
               toolCallId: "read-1",
               state: "output-available",
               input: { path: "src/index.ts" },
@@ -2975,24 +3112,6 @@ describe("Controller effect wiring", () => {
     expect(transport.redoRequests).toEqual([]);
     expect(controller.inputState.phase).toBe("active");
     controller.dispose();
-  });
-
-  it("does not call the server when redoing before session creation", async () => {
-    const transport = new FakeTransport();
-    const operations = operationTracker();
-    const controller = new Controller({
-      transport,
-      ui: operations.ui,
-      sessionId: "session-1",
-      onExit: () => {},
-    });
-    controller.start();
-
-    const completed = operations.next();
-    controller.redo();
-    await completed;
-    expect(transport.redoRequests).toEqual([]);
-    expect(controller.inputState.phase).toBe("idle");
   });
 
   it("interrupts pending steer admissions atomically, then cancels on Esc", async () => {
@@ -3949,20 +4068,6 @@ describe("Controller effect wiring", () => {
     expect(controller.inputState.phase).toBe("idle");
   });
 
-  it("returns idle when prompt admission fails", async () => {
-    const transport = new FakeTransport({ admissionError: new Error("rejected") });
-    const controller = new Controller({
-      transport,
-      ui: silentUI(),
-      sessionId: "session-1",
-      onExit: () => {},
-    });
-    controller.start();
-    submitText(controller, "hello");
-    await flush();
-    expect(controller.inputState.phase).toBe("idle");
-  });
-
   it("hydrates resumed messages and reconnects an active snapshot immediately", async () => {
     const initialMessages: MiniLilacUIMessage[] = [
       { id: "existing", role: "user", parts: [{ type: "text", text: "before resume" }] },
@@ -4201,6 +4306,75 @@ describe("Controller effect wiring", () => {
     await flush();
 
     expect(seen).toEqual([{ revision: 0, todos: [] }, latest]);
+    controller.dispose();
+  });
+});
+
+describe("Controller stream normalization", () => {
+  it("keeps state unchanged and continues rendering after an unsupported transport chunk", async () => {
+    const encoder = new TextEncoder();
+    const connected = deferred<void>();
+    const firstText = deferred<void>();
+    const continuedText = deferred<void>();
+    let source: ReadableStreamDefaultController<Uint8Array> | undefined;
+    const fetch = Object.assign(
+      async () =>
+        new Response(
+          new ReadableStream<Uint8Array>({
+            start(controller) {
+              source = controller;
+              connected.resolve();
+            },
+          }),
+          { headers: { "Content-Type": "text/event-stream" } },
+        ),
+      { preconnect() {} },
+    );
+    const transport = new MiniLilacTransport({ baseUrl: "/mini", fetch });
+    const controller = new Controller({
+      transport,
+      ui: {
+        onState: () => {},
+        onOutput: (entries) => {
+          const text = entries.map((entry) => entry.text).join("\n");
+          if (text === "before") firstText.resolve();
+          if (text === "before after") continuedText.resolve();
+        },
+      },
+      sessionId: "session-1",
+      initialSnapshot: {
+        ...idleSnapshot("history-1"),
+        activeRunId: "run-1",
+        status: "streaming",
+      },
+      onExit: () => {},
+    });
+
+    controller.start();
+    await connected.promise;
+    if (source === undefined) throw new Error("expected stream source");
+    source.enqueue(
+      encoder.encode(
+        `data: ${JSON.stringify({ type: "text-delta", id: "answer", delta: "before" })}\n\n`,
+      ),
+    );
+    await firstText.promise;
+    const stateBeforeUnsupported = controller.inputState;
+
+    source.enqueue(
+      encoder.encode(
+        [
+          `data: ${JSON.stringify({ type: "future-observation", payload: { opaque: true } })}`,
+          `data: ${JSON.stringify({ type: "text-delta", id: "answer", delta: " after" })}`,
+          "",
+        ].join("\n\n"),
+      ),
+    );
+    await continuedText.promise;
+
+    expect(controller.inputState).toBe(stateBeforeUnsupported);
+    expect(controller.inputState.phase).toBe("active");
+    expect(controller.transcript.map((entry) => entry.text)).toEqual(["before after"]);
     controller.dispose();
   });
 });

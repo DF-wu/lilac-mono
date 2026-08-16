@@ -1,39 +1,47 @@
 import { describe, expect, it } from "bun:test";
 import type { Level1ToolSpec } from "@stanley2058/lilac-plugin-runtime";
+import { Panic } from "better-result";
 
 import {
   formatToolArgsForDisplay,
   formatToolArgsForDisplayWithSpecs,
 } from "../../src/tools/tool-args-display";
+import { createLocalToolSpecs } from "../../src/plugins/builtin/local-tools";
+
+const BUILTIN_TOOL_SPECS = new Map(createLocalToolSpecs().map((spec) => [spec.name, spec]));
+
+function formatBuiltinArgs(toolName: string, args: unknown): string {
+  return formatToolArgsForDisplayWithSpecs(toolName, args, BUILTIN_TOOL_SPECS);
+}
 
 describe("formatToolArgsForDisplay", () => {
   it("formats bash command and truncates to 30 chars including ellipsis", () => {
     expect(
-      formatToolArgsForDisplay("bash", {
+      formatBuiltinArgs("bash", {
         command: "echo 12345678901234567890123456789012345678901234567890",
       }),
     ).toBe(" echo 1234567890123456789012...");
   });
 
-  it("formats readFile path with middle truncation (14 ... 13)", () => {
+  it("formats read path with middle truncation (14 ... 13)", () => {
     expect(
-      formatToolArgsForDisplay("read_file", {
+      formatBuiltinArgs("read", {
         path: "/path/to/some/really/long/path/to/file.js",
       }),
     ).toBe(" /path/to/some/...th/to/file.js");
   });
 
-  it("formats remote read_file path with host initials", () => {
+  it("formats remote read path with host initials", () => {
     expect(
-      formatToolArgsForDisplay("read_file", {
+      formatBuiltinArgs("read", {
         path: "ssh://stanley-server/some/really/long/path/to/file.js",
       }),
     ).toBe(" @SS:/some/real...th/to/file.js");
   });
 
-  it("keeps scp-style read_file path literal", () => {
+  it("keeps scp-style read path literal", () => {
     expect(
-      formatToolArgsForDisplay("read_file", {
+      formatBuiltinArgs("read", {
         path: "stanley-desktop:/repo/apps/core/src/index.ts",
       }),
     ).toBe(" stanley-deskto.../src/index.ts");
@@ -41,13 +49,13 @@ describe("formatToolArgsForDisplay", () => {
 
   it("keeps local filenames with ':' literal", () => {
     expect(
-      formatToolArgsForDisplay("read_file", {
+      formatBuiltinArgs("read", {
         path: "notes:2026.md",
       }),
     ).toBe(" notes:2026.md");
   });
 
-  it("formats apply_patch (local) as first file + remaining count", () => {
+  it("formats patch as first file + remaining count", () => {
     const patchText = [
       "*** Begin Patch",
       "*** Update File: /path/to/some/really/long/path/to/file1.js",
@@ -62,14 +70,12 @@ describe("formatToolArgsForDisplay", () => {
       "*** End Patch",
     ].join("\n");
 
-    expect(formatToolArgsForDisplay("apply_patch", { patchText })).toBe(
-      " /path/to/some/...h/to/file1.js (+3)",
-    );
+    expect(formatBuiltinArgs("patch", { patchText })).toBe(" /path/to/some/...h/to/file1.js (+3)");
   });
 
-  it("formats edit_file path with middle truncation", () => {
+  it("formats edit path with middle truncation", () => {
     expect(
-      formatToolArgsForDisplay("edit_file", {
+      formatBuiltinArgs("edit", {
         path: "/path/to/some/really/long/path/to/file.js",
         oldText: "a",
         newText: "b",
@@ -77,27 +83,36 @@ describe("formatToolArgsForDisplay", () => {
     ).toBe(" /path/to/some/...th/to/file.js");
   });
 
-  it("formats grep as pattern + cwd", () => {
+  it("formats grep as pattern + path", () => {
     expect(
-      formatToolArgsForDisplay("grep", {
+      formatBuiltinArgs("grep", {
         pattern: "foo",
-        cwd: "/tmp",
+        path: "/tmp",
       }),
     ).toBe(" foo /tmp");
   });
 
-  it("formats grep remote cwd with host initials", () => {
+  it("formats grep remote path with host initials", () => {
     expect(
-      formatToolArgsForDisplay("grep", {
+      formatBuiltinArgs("grep", {
         pattern: "foo",
-        cwd: "stanley-server:/repo/apps/core",
+        path: "stanley-server:/repo/apps/core",
       }),
     ).toBe(" foo @SS:/repo/apps/core");
   });
 
+  it("formats grep artifact paths without treating them as SSH targets", () => {
+    expect(
+      formatBuiltinArgs("grep", {
+        pattern: "foo",
+        path: "tool-result://00000000-0000-0000-0000-000000000000",
+      }),
+    ).toBe(" foo tool-result://00000000-...");
+  });
+
   it("formats glob as patterns + cwd", () => {
     expect(
-      formatToolArgsForDisplay("glob", {
+      formatBuiltinArgs("glob", {
         patterns: ["a", "b"],
         cwd: "/c",
       }),
@@ -106,7 +121,7 @@ describe("formatToolArgsForDisplay", () => {
 
   it("formats fuzzy_search as query + cwd", () => {
     expect(
-      formatToolArgsForDisplay("fuzzy_search", {
+      formatBuiltinArgs("fuzzy_search", {
         query: "agent runner",
         cwd: "/repo/apps/core",
       }),
@@ -115,7 +130,7 @@ describe("formatToolArgsForDisplay", () => {
 
   it("formats fuzzy_search remote cwd with host initials", () => {
     expect(
-      formatToolArgsForDisplay("fuzzy_search", {
+      formatBuiltinArgs("fuzzy_search", {
         query: "agent",
         cwd: "stanley-server:/repo/apps/core",
       }),
@@ -123,7 +138,7 @@ describe("formatToolArgsForDisplay", () => {
   });
 
   it("formats subagent_delegate profile and task", () => {
-    const display = formatToolArgsForDisplay("subagent_delegate", {
+    const display = formatBuiltinArgs("subagent_delegate", {
       profile: "general",
       task: "Investigate flaky tests in apps/core and propose a fix",
     });
@@ -134,7 +149,7 @@ describe("formatToolArgsForDisplay", () => {
 
   it("formats bash with remote cwd prefix", () => {
     expect(
-      formatToolArgsForDisplay("bash", {
+      formatBuiltinArgs("bash", {
         command: "ls -la",
         cwd: "stanley-server:/repo/apps/core",
       }),
@@ -142,11 +157,22 @@ describe("formatToolArgsForDisplay", () => {
   });
 
   it("returns empty string on invalid args", () => {
-    expect(formatToolArgsForDisplay("bash", { nope: true })).toBe("");
-    expect(formatToolArgsForDisplay("read_file", { nope: true })).toBe("");
-    expect(formatToolArgsForDisplay("apply_patch", { nope: true })).toBe("");
-    expect(formatToolArgsForDisplay("edit_file", { nope: true })).toBe("");
-    expect(formatToolArgsForDisplay("fuzzy_search", { nope: true })).toBe("");
+    expect(formatBuiltinArgs("bash", { nope: true })).toBe("");
+    expect(formatBuiltinArgs("read", { nope: true })).toBe("");
+    expect(formatBuiltinArgs("patch", { nope: true })).toBe("");
+    expect(formatBuiltinArgs("edit", { nope: true })).toBe("");
+    expect(formatBuiltinArgs("fuzzy_search", { nope: true })).toBe("");
+  });
+
+  it("preserves restored built-in argument formatter fallbacks", () => {
+    expect(formatToolArgsForDisplay("readFile", { path: "legacy.txt" })).toBe(" legacy.txt");
+    expect(formatToolArgsForDisplay("read_file", { path: "legacy.txt" })).toBe(" legacy.txt");
+    expect(formatToolArgsForDisplay("edit_file", { path: "legacy.txt" })).toBe(" legacy.txt");
+    expect(
+      formatToolArgsForDisplay("apply_patch", {
+        patchText: "*** Begin Patch\n*** Delete File: legacy.txt\n*** End Patch",
+      }),
+    ).toBe(" legacy.txt");
   });
 
   it("prefers plugin metadata formatter when provided", () => {
@@ -165,5 +191,48 @@ describe("formatToolArgsForDisplay", () => {
     expect(formatToolArgsForDisplayWithSpecs("custom_tool", { anything: true }, specs)).toBe(
       " custom-display",
     );
+  });
+
+  it("omits malformed and failed plugin formatter output", () => {
+    const malformed: Level1ToolSpec<unknown> = {
+      name: "malformed",
+      createTool: () => ({}),
+      isEnabled: () => true,
+      formatArgs: () => "valid",
+    };
+    Object.defineProperty(malformed, "formatArgs", { value: () => 42 });
+    const failed: Level1ToolSpec<unknown> = {
+      name: "failed",
+      createTool: () => ({}),
+      isEnabled: () => true,
+      formatArgs() {
+        throw new Error("formatter boom");
+      },
+    };
+    const specs = new Map([
+      ["malformed", malformed],
+      ["failed", failed],
+    ]);
+
+    expect(formatToolArgsForDisplayWithSpecs("malformed", {}, specs)).toBe("");
+    expect(formatToolArgsForDisplayWithSpecs("failed", {}, specs)).toBe("");
+  });
+
+  it("propagates Panic from plugin formatters", () => {
+    const panic = new Panic({ message: "formatter invariant" });
+    const spec: Level1ToolSpec<unknown> = {
+      name: "panic",
+      createTool: () => ({}),
+      isEnabled: () => true,
+      formatArgs() {
+        throw panic;
+      },
+    };
+    try {
+      formatToolArgsForDisplayWithSpecs("panic", {}, new Map([["panic", spec]]));
+      throw new Error("expected Panic");
+    } catch (cause) {
+      expect(Panic.is(cause)).toBe(true);
+    }
   });
 });

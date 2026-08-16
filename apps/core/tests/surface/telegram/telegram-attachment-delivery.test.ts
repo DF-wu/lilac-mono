@@ -234,7 +234,7 @@ describe("deliverTelegramAttachments partial success", () => {
     });
 
     expect(delivery.failure?.attachment?.filename).toBe("b.png");
-    expect(delivery.failure?.error).toBeInstanceOf(Error);
+    expect(delivery.failure?.error.error).toBeInstanceOf(Error);
   });
 
   it("does not attempt the attachments queued behind a failure", async () => {

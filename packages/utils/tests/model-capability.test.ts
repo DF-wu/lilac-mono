@@ -39,6 +39,21 @@ function makeUsage(params: {
 }
 
 describe("ModelCapability", () => {
+  it("preserves external fetch rejection identity in the legacy resolver", async () => {
+    const failure = new Error("registry unavailable");
+    const rejectingFetch: typeof fetch = Object.assign(
+      async (_input: Parameters<typeof fetch>[0]): Promise<Response> => {
+        throw failure;
+      },
+      { preconnect: fetch.preconnect },
+    );
+    const capability = new ModelCapability({
+      fetch: rejectingFetch,
+    });
+
+    await expect(capability.resolve("openai/gpt-test")).rejects.toBe(failure);
+  });
+
   it("maps codex/* provider to openai/* for models.dev lookup", async () => {
     const registry = {
       openai: {
@@ -65,6 +80,98 @@ describe("ModelCapability", () => {
     const info = await mc.resolve("codex/gpt-4o");
     expect(info.model).toBe("gpt-4o");
     expect(info.limit.context).toBe(128_000);
+  });
+
+  it("resolves codex/openai when an unrelated model has no family", async () => {
+    const registry = {
+      openai: {
+        id: "openai",
+        npm: "@ai-sdk/openai",
+        name: "OpenAI",
+        models: {
+          "gpt-4o": {
+            id: "gpt-4o",
+            name: "GPT-4o",
+            family: "gpt-4o",
+            modalities: { input: ["text"], output: ["text"] },
+            limit: { context: 128_000, output: 16_384 },
+          },
+        },
+      },
+      unrelated: {
+        id: "unrelated",
+        npm: "@ai-sdk/openai-compatible",
+        name: "Unrelated Provider",
+        models: {
+          model: {
+            id: "model",
+            name: "Family-less model",
+            modalities: { input: ["text"], output: ["text"] },
+            limit: { context: 32_000, output: 4_096 },
+          },
+        },
+      },
+    };
+    const mc = new ModelCapability({ fetch: createRegistryFetch(registry) });
+
+    const info = await mc.resolve("codex/gpt-4o");
+
+    expect(info.provider).toBe("codex");
+    expect(info.family).toBe("gpt-4o");
+    expect(info.limit).toEqual({ context: 128_000, output: 16_384 });
+  });
+
+  it("tolerates modern unknown models.dev fields", async () => {
+    const registry = {
+      openai: {
+        id: "openai",
+        npm: "@ai-sdk/openai",
+        api: "https://api.openai.com/v1",
+        name: "OpenAI",
+        models: {
+          "gpt-4o": {
+            id: "gpt-4o",
+            name: "GPT-4o",
+            family: "gpt-4o",
+            structured_output: true,
+            modalities: { input: ["text"], output: ["text"] },
+            limit: { context: 128_000, input: 128_000, output: 16_384 },
+          },
+        },
+      },
+    };
+    const mc = new ModelCapability({ fetch: createRegistryFetch(registry) });
+
+    const info = await mc.resolve("codex/gpt-4o");
+
+    expect(info.limit).toEqual({ context: 128_000, output: 16_384 });
+  });
+
+  it("rejects malformed consumed models.dev limit data", async () => {
+    const registry = {
+      openai: {
+        id: "openai",
+        npm: "@ai-sdk/openai",
+        name: "OpenAI",
+        models: {
+          "gpt-4o": {
+            id: "gpt-4o",
+            name: "GPT-4o",
+            modalities: { input: ["text"], output: ["text"] },
+            limit: { context: "128000", output: 16_384 },
+          },
+        },
+      },
+    };
+    const mc = new ModelCapability({ fetch: createRegistryFetch(registry) });
+
+    const result = await mc.resolveResult("codex/gpt-4o");
+
+    expect(result.status).toBe("error");
+    if (result.status === "error") {
+      expect(result.error._tag).toBe("ModelCapabilityResolutionFailed");
+      expect(result.error.message).toBe("models.dev registry JSON has an invalid shape");
+    }
   });
 
   it("maps claude-code/* provider to anthropic/* for models.dev lookup", async () => {
@@ -329,6 +436,11 @@ describe("ModelCapability", () => {
     await expect(mc.resolve("openai-compatible/llama-3.1-8b")).rejects.toThrow(
       "Model capability lookup intentionally disabled",
     );
+    const result = await mc.resolveResult("openai-compatible/llama-3.1-8b");
+    expect(result.status).toBe("error");
+    if (result.status === "error") {
+      expect(result.error._tag).toBe("ModelCapabilityResolutionFailed");
+    }
   });
 
   it("treats aliased force-unknown providers as unresolved", async () => {
@@ -465,6 +577,7 @@ describe("ModelCapability", () => {
                 output: 37.5,
                 cache_read: 1,
                 cache_write: 12.5,
+                provider_only: true,
               },
             },
             limit: { context: 200_000, output: 128_000 },
@@ -479,14 +592,20 @@ describe("ModelCapability", () => {
       overrides: {
         "custom/opus": {
           inherit: "anthropic/claude-opus-4-6",
+          cost: { input: 6 },
           limit: { context: 1_000_000 },
         },
       },
     });
 
     const info = await mc.resolve("custom/opus");
-    expect(info.cost?.context_over_200k?.input).toBe(10);
-    expect(info.cost?.context_over_200k?.output).toBe(37.5);
+    expect(info.cost?.input).toBe(6);
+    expect(info.cost?.context_over_200k).toEqual({
+      input: 10,
+      output: 37.5,
+      cache_read: 1,
+      cache_write: 12.5,
+    });
 
     const overTierCost = mc.estimateCostUsd(
       info,

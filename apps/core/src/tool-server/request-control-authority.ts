@@ -1,6 +1,7 @@
-import type { SurfacePrincipalPlatform } from "../surface/types";
 import { createHash, randomBytes } from "node:crypto";
 import type { NativeSubagentProfile } from "@stanley2058/lilac-utils";
+
+import type { AuthenticatedSurfaceOrigin, SurfacePrincipal } from "../surface/types";
 
 type SafetyMode = "trusted" | "restricted";
 
@@ -34,12 +35,14 @@ export type RequestControlPolicy = RequestControlPolicyBase &
   (
     | {
         kind: "primary";
-        principal: { platform: SurfacePrincipalPlatform; userId: string } | null;
+        principal: SurfacePrincipal | null;
+        authenticatedOrigin: AuthenticatedSurfaceOrigin | null;
         allowedCallables: null;
       }
     | {
         kind: "heartbeat";
         principal: null;
+        authenticatedOrigin: null;
         allowedCallables: readonly string[];
       }
   );

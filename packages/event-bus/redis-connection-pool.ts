@@ -1,4 +1,5 @@
 import type Redis from "ioredis";
+import { Panic, Result, TaggedError, type Result as ResultType } from "better-result";
 import type { Logger } from "@stanley2058/simple-module-logger";
 
 export type RedisPoolExhaustedPolicy = "fallback_to_shared_with_warn";
@@ -45,6 +46,17 @@ export type RedisLease = {
   release(opts?: { unhealthy?: boolean }): Promise<void>;
 };
 
+export class RedisConnectionPoolClosed extends TaggedError("RedisConnectionPoolClosed")<{
+  readonly label: string;
+  readonly message: string;
+}> {}
+
+export class RedisConnectionCreateFailed extends TaggedError("RedisConnectionCreateFailed")<{
+  readonly cause: unknown;
+  readonly label: string;
+  readonly message: string;
+}> {}
+
 function clampInt(n: number, min: number, max: number): number {
   if (!Number.isFinite(n)) return min;
   return Math.min(max, Math.max(min, Math.trunc(n)));
@@ -76,6 +88,8 @@ export class RedisConnectionPool {
   private readonly inUse = new Set<Redis>();
   /** Number of currently-live pooled (duplicated) clients. */
   private created = 0;
+  /** Capacity reserved by duplicate operations that have not completed yet. */
+  private creating = 0;
 
   constructor(opts: RedisConnectionPoolOptions) {
     this.base = opts.base;
@@ -113,9 +127,7 @@ export class RedisConnectionPool {
 
     // Best-effort warm-up in the background.
     if (this.warm > 0) {
-      void this.warmUp().catch(() => {
-        // ignore
-      });
+      void this.warmUp();
     }
   }
 
@@ -148,7 +160,7 @@ export class RedisConnectionPool {
     this.lastResizeAt = now;
 
     const s = this.stats();
-    this.logger?.info("redis connection pool scaled up", {
+    this.logger?.debug("redis connection pool scaled up", {
       label: this.label,
       fromMax,
       toMax,
@@ -200,61 +212,127 @@ export class RedisConnectionPool {
     });
   }
 
-  private async warmUp(): Promise<void> {
+  private async createConnection(): Promise<ResultType<Redis, RedisConnectionCreateFailed>> {
+    try {
+      return Result.ok(this.base.duplicate());
+    } catch (cause) {
+      if (Panic.is(cause)) throw cause;
+      return Result.err(
+        new RedisConnectionCreateFailed({
+          cause,
+          label: this.label,
+          message: `RedisConnectionPool(${this.label}) could not create a connection`,
+        }),
+      );
+    }
+  }
+
+  private async createReservedConnection(): Promise<
+    ResultType<Redis, RedisConnectionPoolClosed | RedisConnectionCreateFailed>
+  > {
+    this.creating += 1;
+    try {
+      const createdResult = await this.createConnection();
+      const created = createdResult.match<Redis | RedisConnectionCreateFailed>({
+        ok: (value) => value,
+        err: (error) => error,
+      });
+      if (RedisConnectionCreateFailed.is(created)) return Result.err(created);
+      if (this.closed) {
+        created.disconnect();
+        return Result.err(
+          new RedisConnectionPoolClosed({
+            label: this.label,
+            message: `RedisConnectionPool(${this.label}) is closed`,
+          }),
+        );
+      }
+      this.created += 1;
+      return Result.ok(created);
+    } finally {
+      this.creating -= 1;
+    }
+  }
+
+  private async warmUp(): Promise<
+    ResultType<void, RedisConnectionPoolClosed | RedisConnectionCreateFailed>
+  > {
     const target = this.warm;
 
-    while (!this.closed && this.created < target) {
-      const c = this.base.duplicate();
-      this.created += 1;
-      this.available.push(c);
+    while (!this.closed && this.created + this.creating < target) {
+      const createdResult = await this.createReservedConnection();
+      const created = createdResult.match<
+        Redis | RedisConnectionPoolClosed | RedisConnectionCreateFailed
+      >({
+        ok: (value) => value,
+        err: (error) => error,
+      });
+      if (TaggedError.is(created)) return Result.err(created);
+      this.available.push(created);
       // Let the connection establish asynchronously (no await).
       // The first command on this client will trigger the connect.
       await Promise.resolve();
     }
+    return Result.ok(undefined);
   }
 
-  async acquire(): Promise<RedisLease> {
+  async acquire(): Promise<
+    ResultType<RedisLease, RedisConnectionPoolClosed | RedisConnectionCreateFailed>
+  > {
     if (this.closed) {
-      throw new Error(`RedisConnectionPool(${this.label}) is closed`);
+      return Result.err(
+        new RedisConnectionPoolClosed({
+          label: this.label,
+          message: `RedisConnectionPool(${this.label}) is closed`,
+        }),
+      );
     }
 
     const existing = this.available.pop();
     if (existing) {
       this.inUse.add(existing);
-      return {
+      return Result.ok({
         redis: existing,
         shared: false,
         release: async (opts) => {
           await this.release(existing, opts);
         },
-      };
+      });
     }
 
-    if (this.created < this.max) {
-      const c = this.base.duplicate();
-      this.created += 1;
+    if (this.created + this.creating < this.max) {
+      const created = await this.createReservedConnection();
+      const c = created.match<Redis | RedisConnectionPoolClosed | RedisConnectionCreateFailed>({
+        ok: (value) => value,
+        err: (error) => error,
+      });
+      if (TaggedError.is(c)) return Result.err(c);
       this.inUse.add(c);
-      return {
+      return Result.ok({
         redis: c,
         shared: false,
         release: async (opts) => {
           await this.release(c, opts);
         },
-      };
+      });
     }
 
     // Pool exhausted; try to scale up instead of falling back to the shared client.
-    if (this.maybeScaleUpOnExhausted() && this.created < this.max) {
-      const c = this.base.duplicate();
-      this.created += 1;
+    if (this.maybeScaleUpOnExhausted() && this.created + this.creating < this.max) {
+      const created = await this.createReservedConnection();
+      const c = created.match<Redis | RedisConnectionPoolClosed | RedisConnectionCreateFailed>({
+        ok: (value) => value,
+        err: (error) => error,
+      });
+      if (TaggedError.is(c)) return Result.err(c);
       this.inUse.add(c);
-      return {
+      return Result.ok({
         redis: c,
         shared: false,
         release: async (opts) => {
           await this.release(c, opts);
         },
-      };
+      });
     }
 
     // Pool exhausted.
@@ -283,15 +361,18 @@ export class RedisConnectionPool {
       } else {
         this.exhaustedWarnSuppressed += 1;
       }
-      return {
+      return Result.ok({
         redis: this.base,
         shared: true,
         release: async () => {},
-      };
+      });
     }
 
-    const _exhaustive: never = this.onExhausted;
-    throw new Error(`Unhandled onExhausted policy: ${String(_exhaustive)}`);
+    return Result.ok({
+      redis: this.base,
+      shared: true,
+      release: async () => {},
+    });
   }
 
   private async release(redis: Redis, opts?: { unhealthy?: boolean }): Promise<void> {

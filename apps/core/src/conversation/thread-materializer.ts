@@ -1,3 +1,6 @@
+import { Panic, Result, TaggedError, type Result as ResultType } from "better-result";
+
+import { adaptToolResultToHost } from "../tools/tool-result-adapters";
 import type { ConversationThreadRepairKind } from "./thread-store";
 
 const DEFAULT_DEBOUNCE_MS = 100;
@@ -11,6 +14,13 @@ export type ThreadMaterializerErrorContext =
       channelId: string;
       kind: ConversationThreadRepairKind;
     };
+
+export class ThreadMaterializerOperationFailed extends TaggedError(
+  "ThreadMaterializerOperationFailed",
+)<{
+  readonly operation: "list-channels" | "repair-channel" | "worker-protocol" | "worker-stopped";
+  readonly message: string;
+}> {}
 
 export type ThreadMaterializer = {
   markDirty(
@@ -34,6 +44,20 @@ function defaultScheduler(task: () => void, delayMs: number): () => void {
   return () => clearTimeout(timer);
 }
 
+async function captureMaterializerOperation<T>(
+  run: () => Promise<T>,
+): Promise<ResultType<T, ThreadMaterializerOperationFailed>> {
+  const [settled] = await Promise.allSettled([run()]);
+  if (settled.status === "fulfilled") return Result.ok(settled.value);
+  if (ThreadMaterializerOperationFailed.is(settled.reason)) return Result.err(settled.reason);
+  if (settled.reason instanceof Error) return adaptToolResultToHost(Result.err(settled.reason));
+  return adaptToolResultToHost(
+    Result.err(
+      new Panic({ message: "Conversation thread materializer defect", cause: settled.reason }),
+    ),
+  );
+}
+
 export function createThreadMaterializer(params: {
   repairChannel: (
     input:
@@ -43,7 +67,7 @@ export function createThreadMaterializer(params: {
   listChannelIds: () => Promise<readonly string[]>;
   debounceMs?: number;
   schedule?: ThreadMaterializerScheduler;
-  onError?: (error: unknown, context: ThreadMaterializerErrorContext) => void;
+  onError?: (error: Error, context: ThreadMaterializerErrorContext) => void;
 }): ThreadMaterializer {
   const debounceMs = params.debounceMs ?? DEFAULT_DEBOUNCE_MS;
   const schedule = params.schedule ?? defaultScheduler;
@@ -54,12 +78,8 @@ export function createThreadMaterializer(params: {
   let drainPromise: Promise<void> | null = null;
   let stopPromise: Promise<void> | null = null;
 
-  const reportError = (error: unknown, context: ThreadMaterializerErrorContext) => {
-    try {
-      params.onError?.(error, context);
-    } catch {
-      // Error reporting must not stop later channels from being repaired.
-    }
+  const reportError = (error: Error, context: ThreadMaterializerErrorContext) => {
+    params.onError?.(error, context);
   };
 
   const cancelDebounce = () => {
@@ -74,19 +94,23 @@ export function createThreadMaterializer(params: {
 
       const [channelId, repair] = first.value;
       dirtyChannels.delete(channelId);
-      try {
-        await params.repairChannel(
+      const repaired = await captureMaterializerOperation(() =>
+        params.repairChannel(
           repair.kind === "topology"
             ? { channelId, kind: "topology" }
             : { channelId, kind: "content", messageIds: [...repair.messageIds] },
-        );
-      } catch (error) {
-        reportError(error, {
-          operation: "repair-channel",
-          channelId,
-          kind: repair.kind,
-        });
-      }
+        ),
+      );
+      const finishRepair = repaired.match<() => void>({
+        ok: () => () => undefined,
+        err: (error) => () =>
+          reportError(error, {
+            operation: "repair-channel",
+            channelId,
+            kind: repair.kind,
+          }),
+      });
+      finishRepair();
     }
   };
 
@@ -96,10 +120,12 @@ export function createThreadMaterializer(params: {
 
     const running = drain();
     drainPromise = running;
-    void running.then(() => {
-      if (drainPromise !== running) return;
-      drainPromise = null;
-      if (dirtyChannels.size > 0) scheduleDrain();
+    void Promise.allSettled([running]).then(([settled]) => {
+      if (settled?.status === "fulfilled") {
+        if (drainPromise !== running) return;
+        drainPromise = null;
+        if (dirtyChannels.size > 0) scheduleDrain();
+      }
     });
     return running;
   };
@@ -155,19 +181,20 @@ export function createThreadMaterializer(params: {
       if (!accepting) return;
 
       let listingTask: Promise<void>;
-      listingTask = Promise.resolve()
-        .then(() => params.listChannelIds())
-        .then((channelIds) => {
-          for (const channelId of channelIds) {
-            enqueueDirty({ channelId, kind: "topology" });
-          }
-        })
-        .catch((error: unknown) => {
-          reportError(error, { operation: "list-channels" });
-        })
-        .finally(() => {
-          listingTasks.delete(listingTask);
+      listingTask = (async () => {
+        const listed = await captureMaterializerOperation(params.listChannelIds);
+        const finishListing = listed.match<() => void>({
+          err: (error) => () => reportError(error, { operation: "list-channels" }),
+          ok: (channelIds) => () => {
+            for (const channelId of channelIds) {
+              enqueueDirty({ channelId, kind: "topology" });
+            }
+          },
         });
+        finishListing();
+      })().finally(() => {
+        listingTasks.delete(listingTask);
+      });
       listingTasks.add(listingTask);
     },
     flush,

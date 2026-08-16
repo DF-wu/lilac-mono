@@ -1,8 +1,19 @@
 import { Dirent } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
-import { z } from "zod";
+
 import type { ToolContent } from "ai";
+import { Result, TaggedError, type Result as ResultType } from "better-result";
+import { z } from "zod";
+
+import {
+  errorCode,
+  isPanic,
+  isRecord,
+  opaqueErrorCause,
+  opaqueErrorMessage,
+} from "./runtime-utils";
+import { formatTaggedErrorForLog } from "./tagged-error-log";
 
 export const CUSTOM_COMMAND_TEXT_PREFIX = "lilac:";
 export const CUSTOM_COMMAND_TOOL_NAME = "custom_command";
@@ -92,7 +103,7 @@ export const customCommandDefSchema = z
         }
 
         ctx.addIssue({
-          code: z.ZodIssueCode.custom,
+          code: "custom",
           path: ["args", i, "choices", choiceIndex],
           message: `duplicate choice '${choice}'`,
         });
@@ -145,23 +156,136 @@ export type CustomCommandDiscovery =
       invalid: InvalidCustomCommand;
     };
 
-async function pathExists(filePath: string): Promise<boolean> {
+export class CustomCommandDirectoryReadError extends TaggedError(
+  "CustomCommandDirectoryReadError",
+)<{
+  readonly directoryPath: string;
+  readonly cause: unknown;
+  readonly message: string;
+}> {}
+
+export class CustomCommandDefinitionReadError extends TaggedError(
+  "CustomCommandDefinitionReadError",
+)<{
+  readonly defPath: string;
+  readonly cause: unknown;
+  readonly message: string;
+}> {}
+
+export class CustomCommandDefinitionJsonError extends TaggedError(
+  "CustomCommandDefinitionJsonError",
+)<{
+  readonly defPath: string;
+  readonly cause: unknown;
+  readonly message: string;
+}> {}
+
+export class CustomCommandDefinitionSchemaError extends TaggedError(
+  "CustomCommandDefinitionSchemaError",
+)<{
+  readonly defPath: string;
+  readonly issues: readonly string[];
+  readonly cause?: unknown;
+  readonly message: string;
+}> {}
+
+export type CustomCommandDefinitionError =
+  | CustomCommandDefinitionReadError
+  | CustomCommandDefinitionJsonError
+  | CustomCommandDefinitionSchemaError;
+export type CustomCommandDiscoveryError = CustomCommandDirectoryReadError;
+
+export type CustomCommandDiscoveryDependencies = {
+  readonly access: (filePath: string) => Promise<void>;
+  readonly readText: (filePath: string) => Promise<string>;
+  readonly readDirectory: (directoryPath: string) => Promise<Dirent[]>;
+};
+
+const DEFAULT_DISCOVERY_DEPENDENCIES: CustomCommandDiscoveryDependencies = {
+  access: (filePath) => fs.access(filePath),
+  readText: (filePath) => fs.readFile(filePath, "utf8"),
+  readDirectory: (directoryPath) => fs.readdir(directoryPath, { withFileTypes: true }),
+};
+
+async function pathExists(
+  filePath: string,
+  dependencies: CustomCommandDiscoveryDependencies,
+): Promise<boolean> {
   try {
-    await fs.access(filePath);
+    await dependencies.access(filePath);
     return true;
-  } catch {
+  } catch (cause) {
+    if (isPanic(cause)) throw cause;
     return false;
   }
 }
 
-async function readJson(filePath: string): Promise<unknown> {
-  return JSON.parse(await fs.readFile(filePath, "utf8")) as unknown;
+export async function readCustomCommandDefinition(params: {
+  defPath: string;
+  readText?: CustomCommandDiscoveryDependencies["readText"];
+}): Promise<ResultType<CustomCommandDef, CustomCommandDefinitionError>> {
+  let text: string;
+  try {
+    text = await (params.readText ?? DEFAULT_DISCOVERY_DEPENDENCIES.readText)(params.defPath);
+  } catch (caught) {
+    if (isPanic(caught)) throw caught;
+    const cause = opaqueErrorCause(caught, "Opaque custom-command definition read failure");
+    return Result.err(
+      new CustomCommandDefinitionReadError({
+        defPath: params.defPath,
+        cause,
+        message: opaqueErrorMessage(cause, "Opaque custom-command definition read failure"),
+      }),
+    );
+  }
+
+  let decoded: unknown;
+  try {
+    decoded = JSON.parse(text);
+  } catch (caught) {
+    if (isPanic(caught)) throw caught;
+    const cause = opaqueErrorCause(caught, "Opaque custom-command definition JSON failure");
+    return Result.err(
+      new CustomCommandDefinitionJsonError({
+        defPath: params.defPath,
+        cause,
+        message: opaqueErrorMessage(cause, "Opaque custom-command definition JSON failure"),
+      }),
+    );
+  }
+
+  try {
+    const parsed = customCommandDefSchema.safeParse(decoded);
+    if (parsed.success) return Result.ok(parsed.data);
+    return Result.err(
+      new CustomCommandDefinitionSchemaError({
+        defPath: params.defPath,
+        issues: parsed.error.issues.map((issue) => issue.message),
+        message: parsed.error.message,
+      }),
+    );
+  } catch (caught) {
+    if (isPanic(caught)) throw caught;
+    const cause = opaqueErrorCause(caught, "Opaque custom-command schema failure");
+    const message = opaqueErrorMessage(cause, "Opaque custom-command schema failure");
+    return Result.err(
+      new CustomCommandDefinitionSchemaError({
+        defPath: params.defPath,
+        issues: [message],
+        cause,
+        message,
+      }),
+    );
+  }
 }
 
-async function resolveEntrypoint(dir: string): Promise<string | null> {
+async function resolveEntrypoint(
+  dir: string,
+  dependencies: CustomCommandDiscoveryDependencies,
+): Promise<string | null> {
   const candidates = [path.join(dir, "index.ts"), path.join(dir, "index.js")];
   for (const filePath of candidates) {
-    if (await pathExists(filePath)) return filePath;
+    if (await pathExists(filePath, dependencies)) return filePath;
   }
   return null;
 }
@@ -247,24 +371,211 @@ export function parseCustomCommandToken(
   return null;
 }
 
-export function isValidCustomCommandResult(value: unknown): value is CustomCommandResult {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
-  const type = (value as Record<string, unknown>)["type"];
-  return type === "json" || type === "error-text" || type === "content";
+export function decodeCustomCommandResult(value: unknown): CustomCommandResult | null {
+  try {
+    const hasPlainPrototype = (candidate: Record<string, unknown>): boolean => {
+      const prototype = Object.getPrototypeOf(candidate);
+      return prototype === Object.prototype || prototype === null;
+    };
+    const isStringMap = (candidate: unknown): boolean => {
+      if (!isRecord(candidate) || !hasPlainPrototype(candidate)) return false;
+      return Object.keys(candidate).every((key) => typeof candidate[key] === "string");
+    };
+    const isProviderReference = (candidate: unknown): boolean =>
+      isRecord(candidate) &&
+      hasPlainPrototype(candidate) &&
+      !Object.hasOwn(candidate, "type") &&
+      Object.keys(candidate).every((key) => typeof candidate[key] === "string");
+    const isJsonValue = (candidate: unknown, ancestors: WeakSet<object>): boolean => {
+      if (candidate === null || typeof candidate === "string" || typeof candidate === "boolean") {
+        return true;
+      }
+      if (typeof candidate === "number") return Number.isFinite(candidate);
+      if (typeof candidate !== "object") return false;
+      if (ancestors.has(candidate)) return false;
+
+      ancestors.add(candidate);
+      try {
+        if (Array.isArray(candidate)) {
+          for (let index = 0; index < candidate.length; index += 1) {
+            if (!Object.hasOwn(candidate, index) || !isJsonValue(candidate[index], ancestors)) {
+              return false;
+            }
+          }
+          return true;
+        }
+        if (!isRecord(candidate) || !hasPlainPrototype(candidate)) return false;
+        return Object.keys(candidate).every((key) => {
+          const nested = candidate[key];
+          return nested === undefined || isJsonValue(nested, ancestors);
+        });
+      } finally {
+        ancestors.delete(candidate);
+      }
+    };
+    const isProviderOptions = (candidate: unknown): boolean => {
+      if (!isRecord(candidate) || !hasPlainPrototype(candidate)) return false;
+      return Object.keys(candidate).every((provider) => {
+        const options = candidate[provider];
+        return (
+          isRecord(options) && hasPlainPrototype(options) && isJsonValue(options, new WeakSet())
+        );
+      });
+    };
+    const hasOptionalString = (candidate: Record<string, unknown>, key: string): boolean =>
+      Object.hasOwn(candidate, key)
+        ? candidate[key] === undefined || typeof candidate[key] === "string"
+        : !(key in candidate);
+    const hasOptionalProviderOptions = (candidate: Record<string, unknown>): boolean =>
+      Object.hasOwn(candidate, "providerOptions")
+        ? candidate["providerOptions"] === undefined ||
+          isProviderOptions(candidate["providerOptions"])
+        : !("providerOptions" in candidate);
+    const isFileData = (candidate: unknown): boolean => {
+      if (!isRecord(candidate) || !Object.hasOwn(candidate, "type")) return false;
+      switch (candidate["type"]) {
+        case "data": {
+          if (!Object.hasOwn(candidate, "data")) return false;
+          const data = candidate["data"];
+          return (
+            typeof data === "string" || data instanceof Uint8Array || data instanceof ArrayBuffer
+          );
+        }
+        case "url":
+          return Object.hasOwn(candidate, "url") && candidate["url"] instanceof URL;
+        case "reference":
+          return (
+            Object.hasOwn(candidate, "reference") && isProviderReference(candidate["reference"])
+          );
+        case "text":
+          return Object.hasOwn(candidate, "text") && typeof candidate["text"] === "string";
+        default:
+          return false;
+      }
+    };
+    const isFileId = (candidate: unknown): boolean =>
+      typeof candidate === "string" || isStringMap(candidate);
+    const isContentPart = (candidate: unknown): boolean => {
+      if (!isRecord(candidate) || !Object.hasOwn(candidate, "type")) return false;
+      if (!hasOptionalProviderOptions(candidate)) return false;
+      switch (candidate["type"]) {
+        case "text":
+          return Object.hasOwn(candidate, "text") && typeof candidate["text"] === "string";
+        case "file":
+          return (
+            Object.hasOwn(candidate, "data") &&
+            isFileData(candidate["data"]) &&
+            Object.hasOwn(candidate, "mediaType") &&
+            typeof candidate["mediaType"] === "string" &&
+            hasOptionalString(candidate, "filename")
+          );
+        case "file-data":
+          return (
+            Object.hasOwn(candidate, "data") &&
+            typeof candidate["data"] === "string" &&
+            Object.hasOwn(candidate, "mediaType") &&
+            typeof candidate["mediaType"] === "string" &&
+            hasOptionalString(candidate, "filename")
+          );
+        case "file-url":
+          return (
+            Object.hasOwn(candidate, "url") &&
+            typeof candidate["url"] === "string" &&
+            hasOptionalString(candidate, "mediaType")
+          );
+        case "file-id":
+        case "image-file-id":
+          return Object.hasOwn(candidate, "fileId") && isFileId(candidate["fileId"]);
+        case "file-reference":
+        case "image-file-reference":
+          return (
+            Object.hasOwn(candidate, "providerReference") &&
+            isProviderReference(candidate["providerReference"])
+          );
+        case "image-data":
+          return (
+            Object.hasOwn(candidate, "data") &&
+            typeof candidate["data"] === "string" &&
+            Object.hasOwn(candidate, "mediaType") &&
+            typeof candidate["mediaType"] === "string"
+          );
+        case "image-url":
+          return Object.hasOwn(candidate, "url") && typeof candidate["url"] === "string";
+        case "custom":
+          return true;
+        default:
+          return false;
+      }
+    };
+    const isContentParts = (candidate: unknown[]): boolean => {
+      for (let index = 0; index < candidate.length; index += 1) {
+        if (!Object.hasOwn(candidate, index) || !isContentPart(candidate[index])) return false;
+      }
+      return true;
+    };
+    const identitySchema = z.custom<CustomCommandResult>((candidate) => {
+      if (!isRecord(candidate) || !Object.hasOwn(candidate, "type")) return false;
+      switch (candidate["type"]) {
+        case "text":
+        case "error-text":
+          return (
+            Object.hasOwn(candidate, "value") &&
+            typeof candidate["value"] === "string" &&
+            hasOptionalProviderOptions(candidate)
+          );
+        case "json":
+        case "error-json":
+          return (
+            Object.hasOwn(candidate, "value") &&
+            isJsonValue(candidate["value"], new WeakSet()) &&
+            hasOptionalProviderOptions(candidate)
+          );
+        case "execution-denied":
+          return hasOptionalString(candidate, "reason") && hasOptionalProviderOptions(candidate);
+        case "content":
+          return (
+            Object.hasOwn(candidate, "value") &&
+            Array.isArray(candidate["value"]) &&
+            isContentParts(candidate["value"])
+          );
+        default:
+          return false;
+      }
+    });
+    const decoded = identitySchema.safeParse(value);
+    return decoded.success ? decoded.data : null;
+  } catch (cause) {
+    if (isPanic(cause)) throw cause;
+    return null;
+  }
 }
 
 export async function discoverCustomCommands(params: {
   dataDir: string;
-}): Promise<CustomCommandDiscovery[]> {
+  dependencies?: Partial<CustomCommandDiscoveryDependencies>;
+}): Promise<ResultType<CustomCommandDiscovery[], CustomCommandDiscoveryError>> {
   const root = resolveCustomCommandsDir(params.dataDir);
+  const dependencies: CustomCommandDiscoveryDependencies = {
+    access: params.dependencies?.access ?? DEFAULT_DISCOVERY_DEPENDENCIES.access,
+    readText: params.dependencies?.readText ?? DEFAULT_DISCOVERY_DEPENDENCIES.readText,
+    readDirectory:
+      params.dependencies?.readDirectory ?? DEFAULT_DISCOVERY_DEPENDENCIES.readDirectory,
+  };
 
-  let dirents: Dirent[] = [];
+  let dirents: Dirent[];
   try {
-    dirents = await fs.readdir(root, { withFileTypes: true });
-  } catch (error) {
-    const nodeError = error as NodeJS.ErrnoException;
-    if (nodeError.code === "ENOENT") return [];
-    throw error;
+    dirents = await dependencies.readDirectory(root);
+  } catch (caught) {
+    if (isPanic(caught)) throw caught;
+    const cause = opaqueErrorCause(caught, "Opaque custom-command discovery failure");
+    if (errorCode(cause) === "ENOENT") return Result.ok([]);
+    return Result.err(
+      new CustomCommandDirectoryReadError({
+        directoryPath: root,
+        cause,
+        message: opaqueErrorMessage(cause, "Opaque custom-command discovery failure"),
+      }),
+    );
   }
 
   const out: CustomCommandDiscovery[] = [];
@@ -274,7 +585,7 @@ export async function discoverCustomCommands(params: {
     const dir = path.join(root, dirent.name);
     const defPath = path.join(dir, "def.json");
 
-    if (!(await pathExists(defPath))) {
+    if (!(await pathExists(defPath, dependencies))) {
       out.push({
         type: "invalid",
         invalid: {
@@ -285,7 +596,7 @@ export async function discoverCustomCommands(params: {
       continue;
     }
 
-    const entrypointPath = await resolveEntrypoint(dir);
+    const entrypointPath = await resolveEntrypoint(dir, dependencies);
     if (!entrypointPath) {
       out.push({
         type: "invalid",
@@ -298,29 +609,27 @@ export async function discoverCustomCommands(params: {
       continue;
     }
 
-    try {
-      const parsed = customCommandDefSchema.parse(await readJson(defPath));
-      out.push({
-        type: "command",
-        command: {
-          def: parsed,
-          dir,
-          defPath,
-          entrypointPath,
-        },
-      });
-    } catch (error) {
-      const msg = error instanceof Error ? error.message : String(error);
-      out.push({
-        type: "invalid",
-        invalid: {
-          dir,
-          defPath,
-          reason: `invalid def.json: ${msg}`,
-        },
-      });
-    }
+    const definition = await readCustomCommandDefinition({
+      defPath,
+      readText: dependencies.readText,
+    });
+    definition.match({
+      ok: (value) =>
+        out.push({
+          type: "command",
+          command: { def: value, dir, defPath, entrypointPath },
+        }),
+      err: (error) =>
+        out.push({
+          type: "invalid",
+          invalid: {
+            dir,
+            defPath,
+            reason: `invalid def.json: ${formatTaggedErrorForLog(error).errorMessage}`,
+          },
+        }),
+    });
   }
 
-  return out;
+  return Result.ok(out);
 }

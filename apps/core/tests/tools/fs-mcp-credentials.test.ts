@@ -43,7 +43,7 @@ describe("Core filesystem MCP credential guards", () => {
     await fs.rm(dataDir, { recursive: true, force: true });
   });
 
-  it("includes the configured DATA_DIR secret tree in read_file's default denylist", async () => {
+  it("includes the configured DATA_DIR secret tree in read's default denylist", async () => {
     const tools = fsTool(dataDir);
     const defaultCredentialPath = path.join(
       env.dataDir,
@@ -52,7 +52,7 @@ describe("Core filesystem MCP credential guards", () => {
       "does-not-need-to-exist.json",
     );
     const output = await resolveExecuteResult(
-      tools.read_file.execute!({ path: defaultCredentialPath }, toolOptions("default-read")),
+      tools.read.execute!({ path: defaultCredentialPath }, toolOptions("default-read")),
     );
 
     expect(output).toMatchObject({ success: false, error: { code: "PERMISSION" } });
@@ -63,11 +63,11 @@ describe("Core filesystem MCP credential guards", () => {
       includeEditFile: true,
       denyPaths: [path.join(dataDir, "secret")],
     });
-    if (!("edit_file" in tools)) throw new Error("expected edit_file tool");
+    if (!("edit" in tools)) throw new Error("expected edit tool");
     const relativeCredentialPath = path.relative(dataDir, credentialPath);
 
     const read = await resolveExecuteResult(
-      tools.read_file.execute!({ path: relativeCredentialPath }, toolOptions("read")),
+      tools.read.execute!({ path: relativeCredentialPath }, toolOptions("read")),
     );
     expect(read).toMatchObject({ success: false, error: { code: "PERMISSION" } });
 
@@ -82,7 +82,7 @@ describe("Core filesystem MCP credential guards", () => {
     expect(grep).toMatchObject({ mode: "default", results: [] });
 
     const edit = await resolveExecuteResult(
-      tools.edit_file.execute!(
+      tools.edit.execute!(
         {
           path: relativeCredentialPath,
           oldText: "credential-value",

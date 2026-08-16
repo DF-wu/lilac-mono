@@ -9,6 +9,7 @@ import type { RequestContext } from "../../src/tool-server/types";
 import { ProgrammaticWorkflow } from "../../src/tool-server/tools/programmatic-workflow";
 import { writeWorkflowValueArtifact } from "../../src/workflow/workflow-artifact-store";
 import { DurableWorkflowStore } from "../../src/workflow/durable-workflow-store";
+import { workflowStoreValue } from "./workflow-store-test-helpers";
 
 const invocationSchema = z.object({
   runId: z.string(),
@@ -40,6 +41,87 @@ describe("ProgrammaticWorkflow trusted auto-run", () => {
     root = null;
   });
 
+  it("rejects explicit progress targets without a registered port before durable writes", async () => {
+    root = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-workflow-progress-target-"));
+    const workspaceRoot = path.join(root, "workspace");
+    const dataDir = path.join(root, "data");
+    const dbPath = path.join(root, "workflow.sqlite");
+    await fs.mkdir(workspaceRoot);
+    const store = new DurableWorkflowStore(dbPath);
+    const tool = new ProgrammaticWorkflow({
+      dataDir,
+      store,
+      progressCards: {
+        resolveTarget: () => null,
+        ensureInitialCard: async () => {
+          throw new Error("unexpected progress card");
+        },
+        requestProjection: () => {},
+      },
+    });
+    const context = {
+      requestId: "request-1",
+      sessionId: "channel-1",
+      requestClient: "discord",
+      cwd: workspaceRoot,
+      safetyMode: "trusted" as const,
+      requestInitiator: { platform: "discord" as const, userId: "user-1" },
+      requestInitiatorSessionId: "channel-1",
+    } satisfies RequestContext;
+    await tool.init();
+    try {
+      await tool.call(
+        "workflow.definition.save",
+        { scope: "project", name: "audit-routes", source: source() },
+        { context },
+      );
+      await expect(
+        tool.call(
+          "workflow.run.trigger",
+          {
+            scope: "project",
+            name: "audit-routes",
+            args: { directory: "src" },
+            progress: { client: "slack", sessionId: "channel-2" },
+          },
+          { context },
+        ),
+      ).rejects.toThrow("not registered with a progress port: slack");
+      await expect(
+        tool.call(
+          "workflow.trigger.create",
+          {
+            scope: "project",
+            name: "audit-routes",
+            args: { directory: "src" },
+            schedule: { kind: "timestamp", at: 1_000 },
+            progress: { client: "slack", sessionId: "channel-2" },
+          },
+          { context },
+        ),
+      ).rejects.toThrow("not registered with a progress port: slack");
+      await expect(
+        tool.call(
+          "workflow.run.trigger",
+          {
+            scope: "project",
+            name: "audit-routes",
+            args: { directory: "src" },
+            progress: { requestOrigin: true },
+          },
+          { context },
+        ),
+      ).rejects.toThrow("request-origin surface is not registered with a progress port: discord");
+
+      expect(workflowStoreValue(store.listRuns())).toEqual([]);
+      expect(workflowStoreValue(store.listTriggers())).toEqual([]);
+      expect(workflowStoreValue(store.listRevisions())).toEqual([]);
+    } finally {
+      await tool.destroy();
+      store.close();
+    }
+  });
+
   it("exposes no approval API and immediately queues authenticated trusted invocations", async () => {
     root = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-workflow-tool-"));
     const workspaceRoot = path.join(root, "workspace");
@@ -51,6 +133,8 @@ describe("ProgrammaticWorkflow trusted auto-run", () => {
       dbPath: path.join(root, "workflow.sqlite"),
       now: () => 100,
       progressCards: {
+        resolveTarget: (platform) =>
+          platform === "discord" || platform === "github" ? platform : null,
         ensureInitialCard: async (runId) => {
           cards.push(runId);
           return { platform: "discord", channelId: "channel-1", messageId: `card-${runId}` };
@@ -65,7 +149,8 @@ describe("ProgrammaticWorkflow trusted auto-run", () => {
       cwd: workspaceRoot,
       safetyMode: "trusted" as const,
       serverOwnedRequest: true,
-      authenticatedPrincipal: { platform: "discord" as const, userId: "user-1" },
+      requestInitiator: { platform: "discord" as const, userId: "user-1" },
+      requestInitiatorSessionId: "channel-1",
       toolCallId: "tool-call-1",
     } satisfies RequestContext;
     await tool.init();
@@ -78,6 +163,39 @@ describe("ProgrammaticWorkflow trusted auto-run", () => {
         { scope: "project", name: "audit-routes", source: source() },
         { context },
       );
+      const crossTarget = invocationSchema.parse(
+        await tool.call(
+          "workflow.run.trigger",
+          {
+            scope: "project",
+            name: "audit-routes",
+            args: { directory: "src" },
+            progress: { client: "github", sessionId: "octo/repo#1" },
+            idempotencyKey: "cross-target",
+          },
+          { context },
+        ),
+      );
+      expect(
+        await tool.call("workflow.run.get", { runId: crossTarget.runId }, { context }),
+      ).toMatchObject({
+        run: {
+          origin: { client: "discord", sessionId: "channel-1", userId: "user-1" },
+          progressTarget: { platform: "github", channelId: "octo/repo#1" },
+        },
+      });
+      await expect(
+        tool.call(
+          "workflow.run.trigger",
+          { scope: "project", name: "audit-routes", args: { directory: "src" } },
+          {
+            context: {
+              ...context,
+              requestInitiator: { platform: "github", userId: "user-1" },
+            },
+          },
+        ),
+      ).rejects.toThrow("authenticated identity does not match the request origin");
       const first = invocationSchema.parse(
         await tool.call(
           "workflow.run.trigger",
@@ -86,9 +204,15 @@ describe("ProgrammaticWorkflow trusted auto-run", () => {
         ),
       );
       expect(first.state).toBe("queued");
-      expect(cards).toEqual([first.runId]);
+      expect(cards).toEqual([crossTarget.runId, first.runId]);
       const fetched = await tool.call("workflow.run.get", { runId: first.runId }, { context });
-      expect(fetched).toMatchObject({ run: { runId: first.runId, state: "queued" } });
+      expect(fetched).toMatchObject({
+        run: {
+          runId: first.runId,
+          state: "queued",
+          origin: { client: "discord", sessionId: "channel-1", userId: "user-1" },
+        },
+      });
       expect(JSON.stringify(fetched)).not.toContain("approval");
     } finally {
       await tool.destroy();
@@ -120,6 +244,7 @@ describe("ProgrammaticWorkflow trusted auto-run", () => {
         };
       },
       progressCards: {
+        resolveTarget: (platform) => (platform === "telegram" ? "telegram" : null),
         ensureInitialCard: async (runId) => {
           cards.push(runId);
           return { platform: "telegram", channelId: "-100123:7", messageId: "501" };
@@ -266,9 +391,9 @@ describe("ProgrammaticWorkflow trusted auto-run", () => {
 
       const store = new DurableWorkflowStore(path.join(root, "workflow.sqlite"));
       try {
-        expect(store.listRuns({ limit: 100 })).toHaveLength(1);
-        expect(store.listTriggers({ limit: 100 })).toHaveLength(0);
-        expect(store.getRun(invocation.runId)).toMatchObject({
+        expect(workflowStoreValue(store.listRuns({ limit: 100 }))).toHaveLength(1);
+        expect(workflowStoreValue(store.listTriggers({ limit: 100 }))).toHaveLength(0);
+        expect(workflowStoreValue(store.getRun(invocation.runId))).toMatchObject({
           origin: {
             client: "telegram",
             sessionId: "-100123:7",
@@ -304,15 +429,16 @@ describe("ProgrammaticWorkflow trusted auto-run", () => {
       cwd: workspaceRoot,
       safetyMode: "trusted" as const,
       serverOwnedRequest: true,
-      authenticatedPrincipal: { platform: "discord" as const, userId: "user-1" },
+      requestInitiator: { platform: "discord" as const, userId: "user-1" },
+      requestInitiatorSessionId: "channel-1",
     } satisfies RequestContext;
     await tool.init();
     try {
       for (const context of [
         { ...trusted, serverOwnedRequest: false },
         { ...trusted, safetyMode: "restricted" as const },
-        { ...trusted, authenticatedPrincipal: undefined },
-        { ...trusted, authenticatedPrincipal: undefined, operator: true },
+        { ...trusted, requestInitiator: undefined },
+        { ...trusted, requestInitiator: undefined, operator: true },
       ]) {
         expect(await tool.call("workflow.run.list", {}, { context })).toMatchObject({ runs: [] });
       }
@@ -335,6 +461,7 @@ describe("ProgrammaticWorkflow trusted auto-run", () => {
       dbPath,
       now: () => 100,
       progressCards: {
+        resolveTarget: (platform) => (platform === "discord" ? platform : null),
         ensureInitialCard: async (runId) => ({
           platform: "discord",
           channelId: "channel-1",
@@ -350,7 +477,8 @@ describe("ProgrammaticWorkflow trusted auto-run", () => {
       cwd: workspaceRoot,
       safetyMode: "trusted" as const,
       serverOwnedRequest: true,
-      authenticatedPrincipal: { platform: "discord" as const, userId: "user-1" },
+      requestInitiator: { platform: "discord" as const, userId: "user-1" },
+      requestInitiatorSessionId: "channel-1",
     } satisfies RequestContext;
     const sensitiveSource = source()
       .replace('required: ["directory"]', 'required: ["directory", "token"]')
@@ -380,11 +508,12 @@ describe("ProgrammaticWorkflow trusted auto-run", () => {
       expect(
         store.tryClaimRun({ runId: invocation.runId, claimerId: "worker-1", now: 101 }),
       ).not.toBeNull();
-      const artifactId = await writeWorkflowValueArtifact({
+      const artifact = await writeWorkflowValueArtifact({
         dataDir,
         value: "unrestricted result",
         maxBytes: 1_048_576,
       });
+      if (artifact.status === "error") throw artifact.error;
       expect(
         store.terminalizeRun({
           runId: invocation.runId,
@@ -394,7 +523,7 @@ describe("ProgrammaticWorkflow trusted auto-run", () => {
           now: 102,
           detail: "unrestricted detail",
           result: null,
-          resultArtifactId: artifactId,
+          resultArtifactId: artifact.value,
         }),
       ).toBe(true);
 
@@ -473,7 +602,8 @@ describe("ProgrammaticWorkflow trusted auto-run", () => {
       cwd: workspaceRoot,
       safetyMode: "trusted" as const,
       serverOwnedRequest: true,
-      authenticatedPrincipal: { platform: "discord" as const, userId: "owner-1" },
+      requestInitiator: { platform: "discord" as const, userId: "owner-1" },
+      requestInitiatorSessionId: "channel-1",
       toolCallId: "trigger-call",
     } satisfies RequestContext;
     await tool.init();
@@ -513,7 +643,7 @@ describe("ProgrammaticWorkflow trusted auto-run", () => {
           {
             context: {
               ...context,
-              authenticatedPrincipal: { platform: "discord", userId: "other-user" },
+              requestInitiator: { platform: "discord", userId: "other-user" },
             },
           },
         ),

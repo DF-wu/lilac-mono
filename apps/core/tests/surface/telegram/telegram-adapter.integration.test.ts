@@ -3,12 +3,17 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
+import type { Result as ResultType } from "better-result";
 import type { Message, Update } from "grammy/types";
 
 import { parseCoreConfigV2ToUniversal } from "@stanley2058/lilac-utils/core-config/v2";
 import type { CoreConfig } from "@stanley2058/lilac-utils";
 
-import { SurfaceMessageNotFoundError } from "../../../src/surface/adapter";
+import {
+  SurfaceInvalidInput,
+  SurfaceMessageNotFound,
+  SurfaceOperationPartiallyCompleted,
+} from "../../../src/surface/adapter";
 import {
   buildTelegramActionKeyboard,
   TelegramAdapter,
@@ -19,6 +24,11 @@ import { FakeBotApiServer } from "./fake-bot-api-server";
 import { BOT_USER_ID, BOT_USERNAME, makeMessage, makeSupergroupChat } from "./telegram-fixtures";
 
 const ALLOWED_CHAT = 1001;
+
+function resultValue<T, E>(result: ResultType<T, E>): T {
+  if (result.status === "error") throw result.error;
+  return result.value;
+}
 
 let server: FakeBotApiServer;
 let adapter: TelegramAdapter | null = null;
@@ -164,7 +174,7 @@ describe("telegram adapter against a fake Bot API", () => {
       allowedChatIds: ["2002"],
     });
 
-    await expect(created.refreshCoreConfig()).resolves.toEqual({
+    expect(created.refreshCoreConfig()).resolves.toEqual({
       restartRequiredFor: ["enabled", "token", "apiRoot", "dbPath", "commandMenu"],
     });
     expect(created.getHealthSnapshot().isReady).toBe(true);
@@ -174,11 +184,13 @@ describe("telegram adapter against a fake Bot API", () => {
     const { adapter: a } = await connectAdapter({});
     const sessionRef = { platform: "telegram", channelId: String(ALLOWED_CHAT) } as const;
 
-    const ref = await a.sendMsg(sessionRef, {
-      text: "**Queued**",
-      format: "markdown",
-      actions: [{ actionId: "pause-token", label: "Pause", style: "secondary" }],
-    });
+    const ref = resultValue(
+      await a.sendMsg(sessionRef, {
+        text: "**Queued**",
+        format: "markdown",
+        actions: [{ actionId: "pause-token", label: "Pause", style: "secondary" }],
+      }),
+    );
     expect(server.callsOf("sendMessage").at(-1)?.params).toMatchObject({
       text: "<b>Queued</b>",
       parse_mode: "HTML",
@@ -192,20 +204,22 @@ describe("telegram adapter against a fake Bot API", () => {
       format: "markdown" as const,
       actions: [{ actionId: "resume-token", label: "Resume", style: "primary" as const }],
     };
-    await a.editMsg(ref, actionOnlyEdit);
+    resultValue(await a.editMsg(ref, actionOnlyEdit));
     expect(server.editablePayloadOf(Number(ref.messageId))).toMatchObject({
       text: "<b>Queued</b>",
       reply_markup: {
         inline_keyboard: [[{ text: "Resume", callback_data: "resume-token" }]],
       },
     });
-    await expect(a.editMsg(ref, actionOnlyEdit)).resolves.toBeUndefined();
+    expect(resultValue(await a.editMsg(ref, actionOnlyEdit))).toBeUndefined();
 
-    await a.editMsg(ref, {
-      text: "**Paused**",
-      format: "markdown",
-      actions: [{ actionId: "resume-token", label: "Resume", style: "primary" }],
-    });
+    resultValue(
+      await a.editMsg(ref, {
+        text: "**Paused**",
+        format: "markdown",
+        actions: [{ actionId: "resume-token", label: "Resume", style: "primary" }],
+      }),
+    );
     expect(server.callsOf("editMessageText").at(-1)?.params).toMatchObject({
       text: "<b>Paused</b>",
       parse_mode: "HTML",
@@ -213,9 +227,9 @@ describe("telegram adapter against a fake Bot API", () => {
     expect(server.callsOf("editMessageText").at(-1)?.params.reply_markup).toEqual({
       inline_keyboard: [[{ text: "Resume", callback_data: "resume-token" }]],
     });
-    expect((await a.readMsg(ref))?.text).toBe("<b>Paused</b>");
+    expect(resultValue(await a.readMsg(ref))?.text).toBe("<b>Paused</b>");
 
-    await a.editMsg(ref, { text: "done", actions: [] });
+    resultValue(await a.editMsg(ref, { text: "done", actions: [] }));
     expect(server.callsOf("editMessageText").at(-1)?.params.reply_markup).toEqual({
       inline_keyboard: [],
     });
@@ -224,30 +238,49 @@ describe("telegram adapter against a fake Bot API", () => {
   it("tombstones the local cache when a direct edit confirms remote deletion", async () => {
     const { adapter: a } = await connectAdapter({});
     const sessionRef = { platform: "telegram", channelId: String(ALLOWED_CHAT) } as const;
-    const ref = await a.sendMsg(sessionRef, { text: "locally cached" });
+    const ref = resultValue(await a.sendMsg(sessionRef, { text: "locally cached" }));
 
     expect(server.removeMessage(Number(ref.messageId))).toBe(true);
-    expect(await a.readMsg(ref)).not.toBeNull();
-    await expect(a.editMsg(ref, { text: "remote probe" })).rejects.toBeInstanceOf(
-      SurfaceMessageNotFoundError,
-    );
-    expect(await a.readMsg(ref)).toBeNull();
+    expect(resultValue(await a.readMsg(ref))).not.toBeNull();
+    const edit = await a.editMsg(ref, { text: "remote probe" });
+    expect(edit.status).toBe("error");
+    if (edit.status === "ok") throw new Error("expected edit-message failure");
+    expect(edit.error).toBeInstanceOf(SurfaceMessageNotFound);
+    expect(edit.error).toMatchObject({ operation: "edit-message" });
+    expect(resultValue(await a.readMsg(ref))).toBeNull();
   });
 
   it("keeps a locally cached message when Telegram only says it cannot be edited", async () => {
     const { adapter: a } = await connectAdapter({});
     const sessionRef = { platform: "telegram", channelId: String(ALLOWED_CHAT) } as const;
-    const ref = await a.sendMsg(sessionRef, { text: "still exists" });
+    const ref = resultValue(await a.sendMsg(sessionRef, { text: "still exists" }));
     server.failNext("editMessageText", {
       errorCode: 400,
       description: "Bad Request: message can't be edited",
     });
 
-    await expect(a.editMsg(ref, { text: "not editable" })).rejects.toBeInstanceOf(
-      SurfaceMessageNotFoundError,
-    );
-    expect((await a.readMsg(ref))?.text).toBe("still exists");
+    const edit = await a.editMsg(ref, { text: "not editable" });
+    expect(edit.status).toBe("error");
+    if (edit.status === "ok") throw new Error("expected edit-message failure");
+    expect(edit.error).toBeInstanceOf(SurfaceMessageNotFound);
+    expect(resultValue(await a.readMsg(ref))?.text).toBe("still exists");
     expect(server.textOf(Number(ref.messageId))).toBe("still exists");
+  });
+
+  it("returns typed invalid input without calling Telegram", async () => {
+    const { adapter: a } = await connectAdapter({});
+    const callsBefore = server.callsOf("sendMessage").length;
+
+    const result = await a.sendMsg(
+      { platform: "telegram", channelId: String(ALLOWED_CHAT) },
+      { text: "   " },
+    );
+
+    expect(result.status).toBe("error");
+    if (result.status === "ok") throw new Error("expected send-message failure");
+    expect(result.error).toBeInstanceOf(SurfaceInvalidInput);
+    expect(result.error).toMatchObject({ operation: "send-message", field: "content.text" });
+    expect(server.callsOf("sendMessage")).toHaveLength(callsBefore);
   });
 
   it("omits action ids that exceed Telegram's callback_data byte limit", () => {
@@ -373,9 +406,11 @@ describe("telegram adapter against a fake Bot API", () => {
   it("streams a reply as a send followed by edits", async () => {
     const { adapter: a } = await connectAdapter({});
 
-    const stream = await a.startOutput({ platform: "telegram", channelId: String(ALLOWED_CHAT) });
-    await stream.push({ type: "text.set", text: "the complete answer" });
-    const result = await stream.finish();
+    const stream = resultValue(
+      await a.startOutput({ platform: "telegram", channelId: String(ALLOWED_CHAT) }),
+    );
+    resultValue(await stream.push({ type: "text.set", text: "the complete answer" }));
+    const result = resultValue(await stream.finish());
 
     expect(server.callsOf("sendMessage").length).toBeGreaterThanOrEqual(1);
     expect(result.last.platform).toBe("telegram");
@@ -387,9 +422,11 @@ describe("telegram adapter against a fake Bot API", () => {
   it("splits an over-long answer across several messages", async () => {
     const { adapter: a } = await connectAdapter({});
 
-    const stream = await a.startOutput({ platform: "telegram", channelId: String(ALLOWED_CHAT) });
-    await stream.push({ type: "text.set", text: "lorem ipsum ".repeat(900) });
-    const result = await stream.finish();
+    const stream = resultValue(
+      await a.startOutput({ platform: "telegram", channelId: String(ALLOWED_CHAT) }),
+    );
+    resultValue(await stream.push({ type: "text.set", text: "lorem ipsum ".repeat(900) }));
+    const result = resultValue(await stream.finish());
 
     expect(result.created.length).toBeGreaterThan(1);
     for (const call of server.callsOf("sendMessage")) {
@@ -404,18 +441,22 @@ describe("telegram adapter against a fake Bot API", () => {
     // reply chain silently truncates there.
     const { adapter: a } = await connectAdapter({});
 
-    const stream = await a.startOutput({ platform: "telegram", channelId: String(ALLOWED_CHAT) });
-    await stream.push({ type: "text.set", text: "here is the chart" });
-    await stream.push({
-      type: "attachment.add",
-      attachment: {
-        kind: "image",
-        mimeType: "image/png",
-        filename: "chart.png",
-        bytes: new Uint8Array([1, 2, 3]),
-      },
-    });
-    const result = await stream.finish();
+    const stream = resultValue(
+      await a.startOutput({ platform: "telegram", channelId: String(ALLOWED_CHAT) }),
+    );
+    resultValue(await stream.push({ type: "text.set", text: "here is the chart" }));
+    resultValue(
+      await stream.push({
+        type: "attachment.add",
+        attachment: {
+          kind: "image",
+          mimeType: "image/png",
+          filename: "chart.png",
+          bytes: new Uint8Array([1, 2, 3]),
+        },
+      }),
+    );
+    const result = resultValue(await stream.finish());
 
     const upload = await server.waitForCall("sendPhoto");
     expect(upload.params.chat_id).toBe(ALLOWED_CHAT);
@@ -425,7 +466,7 @@ describe("telegram adapter against a fake Bot API", () => {
 
     // The attachment lands last, so it is what a user replying to the bot's
     // picture would target.
-    const read = await a.readMsg(result.last);
+    const read = resultValue(await a.readMsg(result.last));
     expect(read).not.toBeNull();
     expect(read?.text).toBe("[image] chart.png");
   });
@@ -440,29 +481,35 @@ describe("telegram adapter against a fake Bot API", () => {
         description: "Bad Request: IMAGE_PROCESS_FAILED",
       });
 
-      const stream = await connected.adapter.startOutput({
-        platform: "telegram",
-        channelId: String(ALLOWED_CHAT),
-      });
-      await stream.push({ type: "text.set", text: "two files" });
-      await stream.push({
-        type: "attachment.add",
-        attachment: {
-          kind: "file",
-          mimeType: "application/pdf",
-          filename: "report.pdf",
-          bytes: new Uint8Array([1]),
-        },
-      });
-      await stream.push({
-        type: "attachment.add",
-        attachment: {
-          kind: "image",
-          mimeType: "image/png",
-          filename: "chart.png",
-          bytes: new Uint8Array([2]),
-        },
-      });
+      const stream = resultValue(
+        await connected.adapter.startOutput({
+          platform: "telegram",
+          channelId: String(ALLOWED_CHAT),
+        }),
+      );
+      resultValue(await stream.push({ type: "text.set", text: "two files" }));
+      resultValue(
+        await stream.push({
+          type: "attachment.add",
+          attachment: {
+            kind: "file",
+            mimeType: "application/pdf",
+            filename: "report.pdf",
+            bytes: new Uint8Array([1]),
+          },
+        }),
+      );
+      resultValue(
+        await stream.push({
+          type: "attachment.add",
+          attachment: {
+            kind: "image",
+            mimeType: "image/png",
+            filename: "chart.png",
+            bytes: new Uint8Array([2]),
+          },
+        }),
+      );
 
       return { adapter: connected.adapter, result: await stream.finish() };
     });
@@ -470,9 +517,18 @@ describe("telegram adapter against a fake Bot API", () => {
     expect(server.callsOf("sendDocument")).toHaveLength(1);
     expect(server.callsOf("sendPhoto")).toHaveLength(1);
 
-    // `last` is the document, not the text reply: the surviving upload is the
-    // most recent message the bot actually put in the chat.
-    const read = await a.readMsg(result.last);
+    expect(result.status).toBe("error");
+    if (result.status === "ok") throw new Error("expected partial attachment delivery");
+    expect(result.error).toBeInstanceOf(SurfaceOperationPartiallyCompleted);
+    if (!(result.error instanceof SurfaceOperationPartiallyCompleted)) {
+      throw new Error("expected partial completion details");
+    }
+    expect(result.error).toMatchObject({
+      operation: "finish-output",
+      created: { platform: "telegram", channelId: String(ALLOWED_CHAT) },
+    });
+
+    const read = resultValue(await a.readMsg(result.error.created));
     expect(read?.text).toBe("[file] report.pdf");
   });
 
@@ -601,9 +657,11 @@ describe("telegram adapter against a fake Bot API", () => {
   it("sends a reaction through setMessageReaction", async () => {
     const { adapter: a } = await connectAdapter({});
 
-    await a.addReaction(
-      { platform: "telegram", channelId: String(ALLOWED_CHAT), messageId: "60" },
-      "👍",
+    resultValue(
+      await a.addReaction(
+        { platform: "telegram", channelId: String(ALLOWED_CHAT), messageId: "60" },
+        "👍",
+      ),
     );
 
     expect(server.callsOf("setMessageReaction")).toHaveLength(1);
@@ -621,10 +679,10 @@ describe("telegram adapter against a fake Bot API", () => {
       "second message",
     );
 
-    const history = await a.listMsg(sessionRef);
+    const history = resultValue(await a.listMsg(sessionRef));
     expect(history.map((m) => m.text)).toEqual(["second", "first"]);
 
-    const read = await a.readMsg({ ...sessionRef, messageId: "10" });
+    const read = resultValue(await a.readMsg({ ...sessionRef, messageId: "10" }));
     expect(read?.text).toBe("first");
   });
 
@@ -632,12 +690,12 @@ describe("telegram adapter against a fake Bot API", () => {
     const { adapter: a } = await connectAdapter({});
     const sessionRef = { platform: "telegram", channelId: String(ALLOWED_CHAT) } as const;
 
-    const ref = await a.sendMsg(sessionRef, { text: "hello" });
-    await a.editMsg(ref, { text: "hello again" });
-    await a.deleteMsg(ref);
+    const ref = resultValue(await a.sendMsg(sessionRef, { text: "hello" }));
+    resultValue(await a.editMsg(ref, { text: "hello again" }));
+    resultValue(await a.deleteMsg(ref));
 
     expect(server.textOf(Number(ref.messageId))).toBeUndefined();
-    expect(await a.readMsg(ref)).toBeNull();
+    expect(resultValue(await a.readMsg(ref))).toBeNull();
     expect(server.callsOf("deleteMessage")).toHaveLength(1);
   });
 

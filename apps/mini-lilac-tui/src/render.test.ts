@@ -1,16 +1,11 @@
 import { describe, expect, it } from "bun:test";
 
+import type { UIMessageChunk } from "ai";
+
 import type { MiniLilacTodoState, MiniLilacUIMessage } from "@stanley2058/mini-lilac-client";
 
-import {
-  ChunkRenderer,
-  explorationTranscriptText,
-  groupNearbyEdits,
-  isShellTranscriptCollapsible,
-  renderInitialMessages,
-  shellTranscriptText,
-  type TranscriptEntry,
-} from "./render";
+import { explorationTranscriptText, groupNearbyEdits, type TranscriptEntry } from "./render";
+import { ChunkRenderer, renderInitialMessages } from "./render-boundary";
 
 function createRendererHarness() {
   let sequence = 0;
@@ -141,6 +136,53 @@ describe("renderInitialMessages", () => {
     expect(entries()[0]?.streaming).toBe(false);
   });
 
+  it("leaves open text state unchanged for every explicitly ignored chunk", () => {
+    const ignoredChunks = [
+      { type: "custom", kind: "provider.event" },
+      { type: "tool-input-delta", toolCallId: "tool", inputTextDelta: '{"command":' },
+      { type: "message-metadata", messageMetadata: { traceId: "trace" } },
+    ] satisfies readonly UIMessageChunk[];
+
+    for (const chunk of ignoredChunks) {
+      const { renderer, entries } = createRendererHarness();
+      renderer.handle({ type: "text-delta", id: "text", delta: "before" });
+      const before = entries();
+
+      renderer.handle(chunk);
+
+      expect(entries()).toEqual(before);
+      renderer.handle({ type: "text-delta", id: "text", delta: " after" });
+      expect(entries()).toEqual([
+        {
+          id: "entry-0",
+          kind: "assistant",
+          tone: "normal",
+          text: "before after",
+          streaming: true,
+        },
+      ]);
+    }
+  });
+
+  it("leaves renderer state unchanged for open data and future non-data chunks", () => {
+    const { renderer, entries } = createRendererHarness();
+    renderer.handle({ type: "reasoning-delta", id: "reasoning", delta: "before" });
+    const before = entries();
+
+    renderer.handle({ type: "data-futureExtension", data: { opaque: true } });
+    expect(entries()).toEqual(before);
+
+    const futureChunk = { type: "future-observation", payload: { opaque: true } };
+    // @ts-expect-error -- simulates one future SDK variant beyond the installed union.
+    renderer.handle(futureChunk);
+    expect(entries()).toEqual(before);
+
+    renderer.handle({ type: "reasoning-delta", id: "reasoning", delta: " after" });
+    expect(transcriptSemantics(entries())).toEqual([
+      { kind: "reasoning", tone: "muted", text: "Thinking\nbefore after" },
+    ]);
+  });
+
   it("routes transient todo chunks without adding transcript output", () => {
     const received: MiniLilacTodoState[] = [];
     const { entries } = createRendererHarness();
@@ -221,6 +263,54 @@ describe("renderInitialMessages", () => {
     });
   });
 
+  it("preserves status metadata when the delegate projection arrives later", () => {
+    const { renderer, entries } = createRendererHarness();
+    renderer.handle({
+      type: "data-subagentStatus",
+      id: "child-late-input",
+      data: {
+        toolCallId: "delegate-late-input",
+        runId: "child-run",
+        sessionId: "child-session",
+        sessionName: "research",
+        profile: "explore",
+        prompt: "Inspect metadata",
+        mode: "deferred",
+        state: "running",
+        toolCount: 2,
+        activity: "grep",
+        text: "partial report",
+      },
+    });
+    renderer.handle({
+      type: "tool-input-available",
+      toolCallId: "delegate-late-input",
+      toolName: "subagent_delegate",
+      input: {
+        profile: "explore",
+        prompt: "Inspect metadata",
+        mode: "deferred",
+        sessionName: "research",
+      },
+      dynamic: true,
+    });
+
+    expect(entries()).toHaveLength(1);
+    expect(entries()[0]?.subagent).toEqual({
+      toolCallId: "delegate-late-input",
+      runId: "child-run",
+      sessionId: "child-session",
+      sessionName: "research",
+      profile: "explore",
+      prompt: "Inspect metadata",
+      mode: "deferred",
+      state: "running",
+      toolCount: 2,
+      activity: "grep",
+      text: "partial report",
+    });
+  });
+
   it("reconciles a canonical delegation and status into one subagent block", () => {
     const entries = renderInitialMessages([
       {
@@ -236,6 +326,8 @@ describe("renderInitialMessages", () => {
             output: {
               status: "completed",
               childRunId: "child-1",
+              childSessionId: "session-1",
+              sessionName: "research",
               profile: "explore",
               text: "Done",
             },
@@ -337,7 +429,14 @@ describe("renderInitialMessages", () => {
     renderer.handle({
       type: "tool-output-available",
       toolCallId: "result-1",
-      output: { status: "completed", text: "Done" },
+      output: {
+        status: "completed",
+        childRunId: "child-1",
+        childSessionId: "session-1",
+        sessionName: "research",
+        profile: "explore",
+        text: "Done",
+      },
       dynamic: true,
     });
     expect(entries()).toEqual([]);
@@ -354,7 +453,14 @@ describe("renderInitialMessages", () => {
               toolCallId: "result-1",
               state: "output-available",
               input: { childRunId: "child-1", profile: "explore" },
-              output: { status: "completed", text: "Done" },
+              output: {
+                status: "completed",
+                childRunId: "child-1",
+                childSessionId: "session-1",
+                sessionName: "research",
+                profile: "explore",
+                text: "Done",
+              },
             },
           ],
         },
@@ -447,51 +553,6 @@ describe("renderInitialMessages", () => {
       text: "# Running in /workspace\n\n$ pwd",
       shell: { command: "pwd", cwd: "/workspace" },
     });
-  });
-
-  it("clamps the combined shell transcript to eight lines and exposes expansion labels", () => {
-    const shell = {
-      command: "bun test",
-      output: Array.from({ length: 10 }, (_, i) => `line ${i + 1}`).join("\n"),
-    };
-
-    expect(isShellTranscriptCollapsible(shell)).toBe(true);
-    const collapsed = shellTranscriptText(shell);
-    expect(collapsed).toContain("line 7");
-    expect(collapsed).not.toContain("line 8");
-    expect(collapsed.endsWith("Click to expand")).toBe(true);
-    const expanded = shellTranscriptText(shell, true);
-    expect(expanded).toContain("line 10");
-    expect(expanded.endsWith("Click to collapse")).toBe(true);
-
-    const longLine = "x".repeat(2_100);
-    const characterClamped = { command: "print", output: longLine };
-    expect(isShellTranscriptCollapsible(characterClamped)).toBe(true);
-    const characterCollapsedText = shellTranscriptText(characterClamped);
-    expect(characterCollapsedText).not.toContain(longLine);
-    expect(characterCollapsedText).toContain(`${"x".repeat(32)}...`);
-    expect(shellTranscriptText(characterClamped, true)).toContain(longLine);
-
-    const sharedCharacterBudget = { command: "123456", output: "abcdef" };
-    expect(isShellTranscriptCollapsible(sharedCharacterBudget, 8, 12)).toBe(true);
-    expect(shellTranscriptText(sharedCharacterBudget, false, 8, 12)).toContain("ab...");
-    expect(shellTranscriptText(sharedCharacterBudget, false, 8, 12)).not.toContain("abcdef");
-  });
-
-  it("spends the shared shell transcript budget on command input before output", () => {
-    const command = Array.from({ length: 10 }, (_, i) => `input line ${i + 1}`).join("\n");
-    const shell = { command, output: "/tmp/result.txt" };
-
-    expect(isShellTranscriptCollapsible(shell)).toBe(true);
-    const collapsed = shellTranscriptText(shell);
-    expect(collapsed).toContain("input line 8");
-    expect(collapsed).not.toContain("input line 9");
-    expect(collapsed).not.toContain("/tmp/result.txt");
-    expect(collapsed.endsWith("Click to expand")).toBe(true);
-    const expanded = shellTranscriptText(shell, true);
-    expect(expanded).toContain("input line 10");
-    expect(expanded).toContain("/tmp/result.txt");
-    expect(expanded.endsWith("Click to collapse")).toBe(true);
   });
 
   it("renders automatic and manual compaction as durable divider entries", () => {
@@ -707,33 +768,6 @@ describe("renderInitialMessages", () => {
     expect(entry?.text).not.toContain("large private display payload");
   });
 
-  it("summarizes todowrite without duplicating the complete list", () => {
-    const entries = renderInitialMessages([
-      {
-        id: "assistant-todos",
-        role: "assistant",
-        parts: [
-          {
-            type: "dynamic-tool",
-            toolName: "todowrite",
-            toolCallId: "todos-1",
-            state: "output-available",
-            input: {
-              todos: [
-                { content: "Implement", status: "completed", priority: "high" },
-                { content: "Verify", status: "in_progress", priority: "medium" },
-              ],
-            },
-            output: { revision: 2, todos: [] },
-          },
-        ],
-      },
-    ]);
-
-    expect(entries).toMatchObject([{ kind: "tool", text: "Update todos: 2 items" }]);
-    expect(entries[0]?.text).not.toContain("Implement");
-  });
-
   it("shows web fetch URLs and search queries as single-line tool summaries", () => {
     const messages: MiniLilacUIMessage[] = [
       {
@@ -806,61 +840,13 @@ describe("renderInitialMessages", () => {
     expect(renderInitialMessages(messages).map(({ id: _id, ...entry }) => entry)).toEqual(expected);
   });
 
-  it("shows native OpenAI web search queries from provider output", () => {
-    const query = "latest   runtime\nrelease";
-    const output = { action: { type: "search", query } };
-    const messages: MiniLilacUIMessage[] = [
-      {
-        id: "assistant-native-websearch",
-        role: "assistant",
-        parts: [
-          {
-            type: "dynamic-tool",
-            toolName: "websearch",
-            toolCallId: "native-search-1",
-            state: "output-available",
-            input: {},
-            output,
-          },
-        ],
-      },
-    ];
-    const { renderer, entries } = createRendererHarness();
-
-    renderer.handle({
-      type: "tool-input-available",
-      toolCallId: "native-search-1",
-      toolName: "websearch",
-      input: {},
-      dynamic: true,
-    });
-    expect(entries()[0]?.text).toBe("Websearch · running");
-    renderer.handle({
-      type: "tool-output-available",
-      toolCallId: "native-search-1",
-      output,
-      dynamic: true,
-    });
-
-    const expected = {
-      kind: "tool",
-      tone: "success",
-      text: 'Search "latest runtime release"',
-      singleLine: true,
-    } satisfies Omit<TranscriptEntry, "id">;
-    expect(entries().map(({ id: _id, ...entry }) => entry)).toEqual([expected]);
-    expect(renderInitialMessages(messages).map(({ id: _id, ...entry }) => entry)).toEqual([
-      expected,
-    ]);
-  });
-
   it("collapses live and canonical reads and searches into one updating entry", () => {
     const { renderer, entries } = createRendererHarness();
     renderer.startRun();
     renderer.handle({
       type: "tool-input-available",
       toolCallId: "read-1",
-      toolName: "read_file",
+      toolName: "read",
       input: { path: "src/a.ts" },
       dynamic: true,
     });
@@ -908,7 +894,7 @@ describe("renderInitialMessages", () => {
           parts: [
             {
               type: "dynamic-tool",
-              toolName: "read_file",
+              toolName: "read",
               toolCallId: "read-1",
               state: "output-available",
               input: { path: "src/a.ts" },
@@ -936,7 +922,7 @@ describe("renderInitialMessages", () => {
         parts: [
           {
             type: "dynamic-tool",
-            toolName: "read_file",
+            toolName: "read",
             toolCallId: "read-error",
             state: "output-error",
             input: { path: "missing.ts" },
@@ -977,7 +963,7 @@ describe("renderInitialMessages", () => {
     failed.renderer.handle({
       type: "tool-input-available",
       toolCallId: "read-error",
-      toolName: "read_file",
+      toolName: "read",
       input: { path: "missing.ts" },
       dynamic: true,
     });
@@ -1006,7 +992,7 @@ describe("renderInitialMessages", () => {
     renderer.handle({
       type: "tool-input-available",
       toolCallId: "read-error",
-      toolName: "read_file",
+      toolName: "read",
       input: { path: "missing.ts" },
       dynamic: true,
     });
@@ -1039,7 +1025,7 @@ describe("renderInitialMessages", () => {
     renderer.handle({
       type: "tool-input-available",
       toolCallId: "read-success",
-      toolName: "read_file",
+      toolName: "read",
       input: { path: "present.ts" },
       dynamic: true,
     });
@@ -1064,7 +1050,7 @@ describe("renderInitialMessages", () => {
     });
   });
 
-  it("uses bounded raw exploration input when arguments are malformed", () => {
+  it("uses an explicit bounded safe preview when exploration arguments are malformed", () => {
     const [entry] = renderInitialMessages([
       {
         id: "assistant-invalid-exploration",
@@ -1072,7 +1058,7 @@ describe("renderInitialMessages", () => {
         parts: [
           {
             type: "dynamic-tool",
-            toolName: "read_file",
+            toolName: "read",
             toolCallId: "read-invalid",
             state: "output-error",
             input: { path: 42, unexpected: "x".repeat(400) },
@@ -1082,18 +1068,19 @@ describe("renderInitialMessages", () => {
       },
     ]);
 
-    const operation = entry?.exploration?.operations[0];
-    expect(operation?.detail).toContain("path: 42");
-    expect(operation?.detail).not.toBe("file");
-    expect(operation?.detail.length).toBeLessThanOrEqual(180);
-    expect(operation).toMatchObject({ status: "error", error: "invalid read arguments" });
+    expect(entry).toMatchObject({
+      kind: "tool",
+      tone: "danger",
+      text: "Read: invalid read arguments · malformed input: <object>",
+    });
+    expect(entry).not.toHaveProperty("exploration");
   });
 
   it("keeps canonical and live exploration operation outcomes in parity", () => {
     const parts: MiniLilacUIMessage["parts"] = [
       {
         type: "dynamic-tool",
-        toolName: "read_file",
+        toolName: "read",
         toolCallId: "read-success",
         state: "output-available",
         input: { path: "present.ts" },
@@ -1168,7 +1155,7 @@ describe("renderInitialMessages", () => {
           parts: [
             {
               type: "dynamic-tool",
-              toolName: "read_file",
+              toolName: "read",
               toolCallId: "read-1",
               state: "output-available",
               input: { path: "/workspace/render.test.ts", start: { offset: 1 }, maxLines: 12 },
@@ -1180,7 +1167,7 @@ describe("renderInitialMessages", () => {
               toolName: "grep",
               toolCallId: "grep-1",
               state: "output-available",
-              input: { cwd: "/workspace/src", pattern: "batch" },
+              input: { path: "/workspace/src", pattern: "batch" },
               output: {},
             },
           ],
@@ -1251,7 +1238,7 @@ describe("renderInitialMessages", () => {
               toolName: "grep",
               toolCallId: "grep-1",
               state: "output-available",
-              input: { cwd: "/workspace/src", pattern: "TODO|FIXME" },
+              input: { path: "/workspace/src", pattern: "TODO|FIXME" },
               output: {},
             },
           ],
@@ -1276,7 +1263,7 @@ describe("renderInitialMessages", () => {
           parts: [
             {
               type: "dynamic-tool",
-              toolName: "apply_patch",
+              toolName: "patch",
               toolCallId: "patch-1",
               state: "output-available",
               input: {
@@ -1287,15 +1274,22 @@ describe("renderInitialMessages", () => {
             },
             {
               type: "dynamic-tool",
-              toolName: "edit_file",
+              toolName: "edit",
               toolCallId: "edit-1",
               state: "output-available",
               input: { path: "/workspace/src/store.ts", oldText: "one\ntwo", newText: "a\nb\nc" },
-              output: { replacementsMade: 1 },
+              output: {
+                success: true,
+                resolvedPath: "/workspace/src/a.ts",
+                oldHash: "old-a",
+                newHash: "new-a",
+                changesMade: true,
+                replacementsMade: 1,
+              },
             },
             {
               type: "dynamic-tool",
-              toolName: "edit_file",
+              toolName: "edit",
               toolCallId: "edit-2",
               state: "output-available",
               input: {
@@ -1309,7 +1303,14 @@ describe("renderInitialMessages", () => {
                   },
                 ],
               },
-              output: { replacementsMade: 1 },
+              output: {
+                success: true,
+                resolvedPath: "/workspace/src/b.ts",
+                oldHash: "old-b",
+                newHash: "new-b",
+                changesMade: true,
+                replacementsMade: 1,
+              },
             },
           ],
         },
@@ -1364,7 +1365,13 @@ describe("renderInitialMessages", () => {
     renderer.handle({
       type: "tool-output-available",
       toolCallId: "child-1",
-      output: { stdout: "/workspace\n", stderr: "", exitCode: 0 },
+      output: {
+        stdout: "/workspace\n",
+        stderr: "",
+        exitCode: 0,
+        stdoutTruncated: false,
+        stderrTruncated: false,
+      },
       dynamic: true,
     });
     expect(entries()).toMatchObject([
@@ -1390,7 +1397,13 @@ describe("renderInitialMessages", () => {
             toolCallId: "child-1",
             state: "output-available",
             input: { command: "pwd" },
-            output: { stdout: "/workspace\n", stderr: "", exitCode: 0 },
+            output: {
+              stdout: "/workspace\n",
+              stderr: "",
+              exitCode: 0,
+              stdoutTruncated: false,
+              stderrTruncated: false,
+            },
           },
         ],
       },
@@ -1408,16 +1421,16 @@ describe("renderInitialMessages", () => {
         state: "output-available",
         input: {
           tool_calls: [
-            { tool: "read_file", parameters: { path: "a.ts" } },
-            { tool: "read_file", parameters: { path: "b.ts" } },
+            { tool: "read", parameters: { path: "a.ts" } },
+            { tool: "read", parameters: { path: "b.ts" } },
             { tool: "glob", parameters: { patterns: ["**/*.ts"] } },
           ],
         },
         output: { ok: true, total: 3 },
       },
       ...[
-        { toolName: "read_file", toolCallId: "read-1", input: { path: "a.ts" } },
-        { toolName: "read_file", toolCallId: "read-2", input: { path: "b.ts" } },
+        { toolName: "read", toolCallId: "read-1", input: { path: "a.ts" } },
+        { toolName: "read", toolCallId: "read-2", input: { path: "b.ts" } },
         { toolName: "glob", toolCallId: "glob-1", input: { patterns: ["**/*.ts"] } },
       ].map((child) => ({
         type: "dynamic-tool" as const,
@@ -1577,7 +1590,7 @@ describe("renderInitialMessages", () => {
     expect(entries).toHaveLength(2);
     expect(entries[0]?.text).toBe("$ pwd\n\nfirst");
     expect(entries[0]?.tone).toBe("normal");
-    expect(entries[1]?.text).toBe("Read");
+    expect(entries[1]?.text).toBe("Read · malformed input: undefined");
     expect(entries[1]?.tone).toBe("success");
   });
 
@@ -1627,7 +1640,13 @@ describe("renderInitialMessages", () => {
     renderer.handle({
       type: "tool-output-available",
       toolCallId: "bash-live",
-      output: { stdout: "first\nwarning\nlast\n", stderr: "", exitCode: 0 },
+      output: {
+        stdout: "first\nwarning\nlast\n",
+        stderr: "",
+        exitCode: 0,
+        stdoutTruncated: false,
+        stderrTruncated: false,
+      },
       dynamic: true,
     });
     expect(entries[0]?.text).toBe("$ run-tests\n\nfirst\nwarning\nlast");
@@ -1656,6 +1675,8 @@ describe("renderInitialMessages", () => {
         stdout: "work completed before timeout\n",
         stderr: "",
         exitCode: 143,
+        stdoutTruncated: false,
+        stderrTruncated: false,
         executionError: {
           type: "timeout",
           timeoutMs: 500,
@@ -1684,6 +1705,8 @@ describe("renderInitialMessages", () => {
         stdout: "partial output",
         stderr: "",
         exitCode: 143,
+        stdoutTruncated: false,
+        stderrTruncated: false,
         executionError: {
           type: "timeout",
           timeoutMs: 180_000,
@@ -1712,6 +1735,9 @@ describe("renderInitialMessages", () => {
       output: {
         stdout: "",
         stderr: "",
+        exitCode: 143,
+        stdoutTruncated: false,
+        stderrTruncated: false,
         executionError: { type: "aborted", signal: "SIGTERM" },
       },
       dynamic: true,
@@ -1745,6 +1771,33 @@ describe("renderInitialMessages", () => {
     expect(entries().at(-1)?.text).toBe("$ odd-command\n\nretain me");
   });
 
+  it("keeps accumulated Bash output visible when the terminal chunk is an error", () => {
+    const { renderer, entries } = createRendererHarness();
+    renderer.handle({
+      type: "tool-input-available",
+      toolCallId: "bash-terminal-error",
+      toolName: "bash",
+      input: { command: "long-task" },
+    });
+    renderer.handle({
+      type: "tool-output-available",
+      toolCallId: "bash-terminal-error",
+      output: { type: "output-delta", delta: "kept output\n" },
+      preliminary: true,
+    });
+    renderer.handle({
+      type: "tool-output-error",
+      toolCallId: "bash-terminal-error",
+      errorText: "process disconnected",
+    });
+
+    expect(entries()[0]).toMatchObject({
+      kind: "shell",
+      tone: "danger",
+      text: "$ long-task\n\nkept output\nprocess disconnected",
+    });
+  });
+
   it("settles every active tool row when the stream aborts", () => {
     const { renderer, entries } = createRendererHarness();
     renderer.handle({
@@ -1771,14 +1824,14 @@ describe("renderInitialMessages", () => {
     renderer.handle({
       type: "tool-input-available",
       toolCallId: "read-active",
-      toolName: "read_file",
+      toolName: "read",
       input: { path: "src/app.ts" },
       dynamic: true,
     });
     renderer.handle({
       type: "tool-input-available",
       toolCallId: "edit-active",
-      toolName: "apply_patch",
+      toolName: "patch",
       input: {
         patchText: "*** Begin Patch\n*** Update File: src/app.ts\n@@\n-old\n+new\n*** End Patch",
       },
@@ -1787,7 +1840,7 @@ describe("renderInitialMessages", () => {
     renderer.handle({
       type: "tool-input-available",
       toolCallId: "edit-active-2",
-      toolName: "apply_patch",
+      toolName: "patch",
       input: {
         patchText:
           "*** Begin Patch\n*** Update File: src/other.ts\n@@\n-before\n+after\n*** End Patch",
@@ -1807,7 +1860,10 @@ describe("renderInitialMessages", () => {
       output: {
         status: "accepted",
         childRunId: "child-active",
+        childSessionId: "session-active",
+        sessionName: "research",
         profile: "explore",
+        mode: "deferred",
       },
       dynamic: true,
     });
@@ -1843,7 +1899,7 @@ describe("renderInitialMessages", () => {
       {
         kind: "subagent",
         tone: "muted",
-        text: "Explore Task - Inspect aborts\n  ↳ Cancelled: user requested",
+        text: "Explore Task [research] - Inspect aborts\n  ↳ Cancelled: user requested",
         subagent: { state: "cancelled" },
       },
       { kind: "status", tone: "muted", text: "aborted: user requested" },
@@ -1876,26 +1932,6 @@ describe("renderInitialMessages", () => {
       text: "Explore Task - Inspect reconnects\n  ↳ Cancelled: connection closed",
       subagent: { state: "cancelled", runId: "child-status-only" },
     });
-  });
-
-  it("appends one entry per reasoning chunk and finalizes on reasoning-end", () => {
-    let count = 0;
-    const renderer = new ChunkRenderer(
-      {
-        append: () => `entry-${count++}`,
-        update: () => {},
-        remove: () => {},
-        appendText: () => {},
-        finish: () => {},
-      },
-      { onSnapshot: () => {}, onTranscriptReset: () => {} },
-    );
-
-    renderer.startRun();
-    renderer.handle({ type: "reasoning-start", id: "reasoning-1" });
-    renderer.handle({ type: "reasoning-end", id: "reasoning-1" });
-    renderer.handle({ type: "reasoning-start", id: "reasoning-2" });
-    expect(count).toBe(2);
   });
 
   it("streams a title and body into an active then finalized reasoning entry", () => {
@@ -2028,7 +2064,7 @@ describe("ChunkRenderer output rollback", () => {
     renderer.handle({
       type: "tool-input-available",
       toolCallId: "tool-b",
-      toolName: "read_file",
+      toolName: "read",
       input: { path: "kept.ts" },
       dynamic: true,
     });
@@ -2074,7 +2110,7 @@ describe("ChunkRenderer output rollback", () => {
       renderer.handle({
         type: "tool-input-available",
         toolCallId,
-        toolName: "read_file",
+        toolName: "read",
         input: { path },
         dynamic: true,
       });

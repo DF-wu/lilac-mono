@@ -75,6 +75,16 @@ describe("discord-embed-text", () => {
     expect(text).toBe("legacy description");
   });
 
+  it("projects valid fields while bounding malformed open-protocol values", () => {
+    expect(
+      normalizeDiscordEmbeds([
+        null,
+        { title: 42, description: "kept", fields: [false, { name: "n", value: "v" }] },
+        { image: "future-image-shape" },
+      ]),
+    ).toEqual([{ description: "kept", fields: [{ name: "n", value: "v" }] }]);
+  });
+
   it("preserves intentional leading and trailing whitespace in content", () => {
     const text = buildDiscordRichTextFromContentAndEmbeds({
       content: "  line with padding  ",

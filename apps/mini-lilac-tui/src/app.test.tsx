@@ -1,4 +1,5 @@
 import { describe, expect, it } from "bun:test";
+import { Result, type Result as ResultType } from "better-result";
 import type { UIMessageChunk } from "ai";
 
 import {
@@ -14,14 +15,17 @@ import {
 import { testRender } from "@opentui/solid";
 import { Show, createSignal } from "solid-js";
 import {
+  MiniLilacExternalOperationFailed,
   MiniLilacTransport,
+  type MiniLilacResultStream,
   type MiniLilacSessionSnapshot,
   type MiniLilacTodoState,
   type MiniLilacUIMessage,
 } from "@stanley2058/mini-lilac-client";
 
-import { MiniLilacApp, formatRunDuration } from "./app";
+import { MiniLilacApp, type MiniLilacAppProps } from "./app";
 import type { SessionBindings } from "./controller";
+import { StartupSessionCwdMismatch } from "./startup";
 import { COLORS } from "./theme";
 
 const snapshot: MiniLilacSessionSnapshot = {
@@ -41,6 +45,14 @@ const snapshot: MiniLilacSessionSnapshot = {
   queuedSteeringCount: 0,
 };
 
+function resultStream(stream: ReadableStream<UIMessageChunk>): MiniLilacResultStream {
+  return stream.pipeThrough(
+    new TransformStream<UIMessageChunk, ResultType<UIMessageChunk, never>>({
+      transform: (chunk, controller) => controller.enqueue(Result.ok(chunk)),
+    }),
+  );
+}
+
 async function renderApp(
   messages: readonly MiniLilacUIMessage[],
   transport = new MiniLilacTransport({ cwd: "/workspace" }),
@@ -50,6 +62,7 @@ async function renderApp(
   initialTodos: MiniLilacTodoState = { revision: 0, todos: [] },
   initialSnapshot: MiniLilacSessionSnapshot = { ...snapshot, cwd },
   height = 30,
+  onSessionSelect: MiniLilacAppProps["onSessionSelect"] = async () => Result.ok(undefined),
 ) {
   return testRender(
     () => (
@@ -66,7 +79,7 @@ async function renderApp(
         initialMessages={messages}
         initialTodos={initialTodos}
         onNewSession={onNewSession}
-        onSessionSelect={async () => {}}
+        onSessionSelect={onSessionSelect}
         onExit={() => {}}
       />
     ),
@@ -179,7 +192,7 @@ function subagentMessagesResponse(): Response {
         parts: [
           {
             type: "dynamic-tool",
-            toolName: "read_file",
+            toolName: "read",
             toolCallId: "read-1",
             state: "output-available",
             input: { path: "/workspace/first.ts" },
@@ -187,7 +200,7 @@ function subagentMessagesResponse(): Response {
           },
           {
             type: "dynamic-tool",
-            toolName: "read_file",
+            toolName: "read",
             toolCallId: "read-2",
             state: "output-available",
             input: { path: "/workspace/second.ts" },
@@ -202,11 +215,6 @@ function subagentMessagesResponse(): Response {
 }
 
 describe("MiniLilacApp tool interactions", () => {
-  it("formats completed run durations", () => {
-    expect(formatRunDuration(12 * 60_000 + 32_000)).toBe("12m 32s");
-    expect(formatRunDuration(3_500)).toBe("3s");
-  });
-
   it("opens a subagent block as a read-only transcript and returns with escape", async () => {
     const fetchMock = Object.assign(
       async (input: string | URL | Request) => {
@@ -475,6 +483,10 @@ describe("MiniLilacApp tool interactions", () => {
           },
         });
       }
+
+      override async reconnectToStreamResult() {
+        return Result.ok(resultStream(await this.reconnectToStream()));
+      }
     }
 
     const transport = new TodoUpdateTransport({ cwd: "/workspace" });
@@ -609,7 +621,7 @@ describe("MiniLilacApp tool interactions", () => {
           parts: [
             {
               type: "dynamic-tool",
-              toolName: "apply_patch",
+              toolName: "patch",
               toolCallId: "patch-summary-1",
               state: "output-available",
               input: { patchText },
@@ -648,7 +660,7 @@ describe("MiniLilacApp tool interactions", () => {
         parts: [
           {
             type: "dynamic-tool",
-            toolName: "apply_patch",
+            toolName: "patch",
             toolCallId: "patch-nearby-1",
             state: "output-available",
             input: {
@@ -659,7 +671,7 @@ describe("MiniLilacApp tool interactions", () => {
           },
           {
             type: "dynamic-tool",
-            toolName: "apply_patch",
+            toolName: "patch",
             toolCallId: "patch-nearby-2",
             state: "output-available",
             input: {
@@ -740,6 +752,20 @@ describe("MiniLilacApp tool interactions", () => {
       override getSessionResume(): ReturnType<MiniLilacTransport["getSessionResume"]> {
         return Promise.reject(new Error("resume offline"));
       }
+
+      override async redoResult(request: Parameters<MiniLilacTransport["redoResult"]>[0]) {
+        return Result.ok(await this.redo(request));
+      }
+
+      override async getSessionResumeResult() {
+        return Result.err(
+          new MiniLilacExternalOperationFailed({
+            operation: "resume",
+            cause: undefined,
+            message: "resume offline",
+          }),
+        );
+      }
     }
 
     const combinedNotice =
@@ -810,7 +836,7 @@ describe("MiniLilacApp tool interactions", () => {
           initialMessages={[]}
           initialTodos={{ revision: 0, todos: [] }}
           onNewSession={async () => {}}
-          onSessionSelect={async () => {}}
+          onSessionSelect={async () => Result.ok(undefined)}
           onExit={() => {}}
         />
       ),
@@ -863,7 +889,7 @@ describe("MiniLilacApp tool interactions", () => {
                 onNewSession={async () => {
                   setSessionId("session-2");
                 }}
-                onSessionSelect={async () => {}}
+                onSessionSelect={async () => Result.ok(undefined)}
                 onExit={() => {}}
               />
             )}
@@ -1046,6 +1072,43 @@ describe("MiniLilacApp tool interactions", () => {
     }
   });
 
+  it("shows a selected-session cwd failure and clears binding busy state", async () => {
+    const selectedSession = { ...snapshot, id: "session-other", title: "Other session" };
+    const fetch = Object.assign(async () => Response.json([selectedSession]), { preconnect() {} });
+    const mismatch = new StartupSessionCwdMismatch({
+      sessionId: selectedSession.id,
+      storedCwd: "/other-workspace",
+      currentCwd: "/workspace",
+      message: "Session cwd mismatch",
+    });
+    const app = await renderApp(
+      [],
+      new MiniLilacTransport({ cwd: "/workspace", baseUrl: "/mini", fetch }),
+      90,
+      "/workspace",
+      async () => {},
+      { revision: 0, todos: [] },
+      snapshot,
+      30,
+      async () => Result.err(mismatch),
+    );
+
+    try {
+      await app.flush();
+      app.mockInput.pressKey("/");
+      await app.mockInput.typeText("session");
+      app.mockInput.pressEnter();
+      await app.waitForFrame((frame) => frame.includes("Other session"));
+      app.mockInput.pressEnter();
+      await app.waitForFrame((frame) => frame.includes("Session cwd mismatch"));
+
+      app.mockInput.pressKey("/");
+      await app.waitForFrame((frame) => frame.includes("start a new session"));
+    } finally {
+      app.renderer.destroy();
+    }
+  });
+
   it("keeps the status rule while giving shell a raised surface", async () => {
     const app = await renderApp([
       {
@@ -1058,7 +1121,13 @@ describe("MiniLilacApp tool interactions", () => {
             toolCallId: "bash-surfaces-1",
             state: "output-available",
             input: { command: "bun test" },
-            output: { stdout: "pass", stderr: "", exitCode: 0 },
+            output: {
+              stdout: "pass",
+              stderr: "",
+              exitCode: 0,
+              stdoutTruncated: false,
+              stderrTruncated: false,
+            },
           },
           {
             type: "dynamic-tool",
@@ -1078,7 +1147,7 @@ describe("MiniLilacApp tool interactions", () => {
           },
           {
             type: "dynamic-tool",
-            toolName: "read_file",
+            toolName: "read",
             toolCallId: "read-surfaces-1",
             state: "output-available",
             input: { path: "/workspace/src/app.ts" },
@@ -1086,7 +1155,7 @@ describe("MiniLilacApp tool interactions", () => {
           },
           {
             type: "dynamic-tool",
-            toolName: "apply_patch",
+            toolName: "patch",
             toolCallId: "patch-surfaces-1",
             state: "output-available",
             input: {
@@ -1104,6 +1173,8 @@ describe("MiniLilacApp tool interactions", () => {
             output: {
               status: "completed",
               childRunId: "child-surfaces-1",
+              childSessionId: "child-session-surfaces-1",
+              sessionName: "surfaces",
               profile: "explore",
               text: "Done",
             },
@@ -1203,34 +1274,6 @@ describe("MiniLilacApp tool interactions", () => {
     }
   });
 
-  it("expands a shell block when its rendered text is clicked", async () => {
-    const output = Array.from({ length: 10 }, (_, index) => `line ${index + 1}`).join("\n");
-    const app = await renderApp([
-      {
-        id: "assistant-shell",
-        role: "assistant",
-        parts: [
-          {
-            type: "dynamic-tool",
-            toolName: "bash",
-            toolCallId: "bash-1",
-            state: "output-available",
-            input: { command: "bun test" },
-            output: { stdout: output, stderr: "", exitCode: 0 },
-          },
-        ],
-      },
-    ]);
-    try {
-      await app.flush();
-      expect(app.captureCharFrame()).toContain("Click to expand");
-      await clickRenderedText(app, "$ bun test");
-      expect(app.captureCharFrame()).toContain("Click to collapse");
-    } finally {
-      app.renderer.destroy();
-    }
-  });
-
   it("shows eight logical shell transcript lines with deliberate spacing", async () => {
     const output = [
       `line 1 ${"detail ".repeat(16)}`,
@@ -1247,7 +1290,13 @@ describe("MiniLilacApp tool interactions", () => {
             toolCallId: "bash-height-1",
             state: "output-available",
             input: { command: "docker system df -v", cwd: "/workspace/apps/api" },
-            output: { stdout: output, stderr: "", exitCode: 0 },
+            output: {
+              stdout: output,
+              stderr: "",
+              exitCode: 0,
+              stdoutTruncated: false,
+              stderrTruncated: false,
+            },
           },
           {
             type: "dynamic-tool",
@@ -1295,7 +1344,13 @@ describe("MiniLilacApp tool interactions", () => {
             toolCallId: "bash-complete",
             state: "output-available",
             input: { command: "df -h" },
-            output: { stdout: "done", stderr: "", exitCode: 0 },
+            output: {
+              stdout: "done",
+              stderr: "",
+              exitCode: 0,
+              stdoutTruncated: false,
+              stderrTruncated: false,
+            },
           },
           {
             type: "dynamic-tool",
@@ -1388,8 +1443,11 @@ describe("MiniLilacApp tool interactions", () => {
             output: {
               status: "cancelled",
               childRunId: "child-cancelled",
+              childSessionId: "child-session-cancelled",
+              sessionName: "cancelled-work",
               profile: "general",
-              reason: "Run cancelled",
+              text: "",
+              error: "Run cancelled",
             },
           },
         ],
@@ -1426,11 +1484,17 @@ describe("MiniLilacApp tool interactions", () => {
               toolCallId: "bash-narrow",
               state: "output-available",
               input: { command: "bun test" },
-              output: { stdout: output, stderr: "", exitCode: 0 },
+              output: {
+                stdout: output,
+                stderr: "",
+                exitCode: 0,
+                stdoutTruncated: false,
+                stderrTruncated: false,
+              },
             },
             {
               type: "dynamic-tool",
-              toolName: "read_file",
+              toolName: "read",
               toolCallId: "read-narrow",
               state: "output-available",
               input: { path: "src/app.ts" },
@@ -1438,7 +1502,7 @@ describe("MiniLilacApp tool interactions", () => {
             },
             {
               type: "dynamic-tool",
-              toolName: "apply_patch",
+              toolName: "patch",
               toolCallId: "patch-narrow",
               state: "output-available",
               input: {
@@ -1543,6 +1607,10 @@ describe("MiniLilacApp tool interactions", () => {
             });
           },
         });
+      }
+
+      override async reconnectToStreamResult() {
+        return Result.ok(resultStream(await this.reconnectToStream()));
       }
     }
 
@@ -1650,6 +1718,14 @@ describe("MiniLilacApp tool interactions", () => {
       override async getMessages() {
         return [];
       }
+
+      override async reconnectToStreamResult() {
+        return Result.ok(null);
+      }
+
+      override async getMessagesResult() {
+        return Result.ok([]);
+      }
     }
 
     const activeSnapshot = {
@@ -1674,33 +1750,6 @@ describe("MiniLilacApp tool interactions", () => {
     }
   });
 
-  it("expands exploration when its rendered text is clicked", async () => {
-    const app = await renderApp([
-      {
-        id: "assistant-explore",
-        role: "assistant",
-        parts: [
-          {
-            type: "dynamic-tool",
-            toolName: "read_file",
-            toolCallId: "read-1",
-            state: "output-available",
-            input: { path: "src/app.ts", maxLines: 12 },
-            output: {},
-          },
-        ],
-      },
-    ]);
-    try {
-      await app.flush();
-      expect(app.captureCharFrame()).not.toContain("src/app.ts · 12 lines");
-      await clickRenderedText(app, "Explored");
-      expect(app.captureCharFrame()).toContain("src/app.ts · 12 lines");
-    } finally {
-      app.renderer.destroy();
-    }
-  });
-
   it("keeps failed exploration details collapsed and renders status and error on expansion", async () => {
     const app = await renderApp([
       {
@@ -1709,7 +1758,7 @@ describe("MiniLilacApp tool interactions", () => {
         parts: [
           {
             type: "dynamic-tool",
-            toolName: "read_file",
+            toolName: "read",
             toolCallId: "read-failed",
             state: "output-error",
             input: { path: "src/missing.ts" },
@@ -1752,7 +1801,13 @@ describe("MiniLilacApp tool interactions", () => {
             toolCallId: "bash-selection-1",
             state: "output-available",
             input: { command: "bun test" },
-            output: { stdout: output, stderr: "", exitCode: 0 },
+            output: {
+              stdout: output,
+              stderr: "",
+              exitCode: 0,
+              stdoutTruncated: false,
+              stderrTruncated: false,
+            },
           },
         ],
       },

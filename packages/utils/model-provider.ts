@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 
+import { createCerebras } from "@ai-sdk/cerebras";
 import { createOpenAI } from "@ai-sdk/openai";
 import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
 import { createXai } from "@ai-sdk/xai";
@@ -9,6 +10,8 @@ import { createGroq } from "@ai-sdk/groq";
 import type { OpenAICompatibleProvider } from "@ai-sdk/openai-compatible";
 import { createGateway } from "ai";
 import { createClaudeCode, type ClaudeCodeSettings } from "ai-sdk-provider-claude-code";
+import { Result, TaggedError, type Result as ResultType } from "better-result";
+import { z } from "zod";
 
 import { CODEX_BASE_INSTRUCTIONS } from "./codex-instructions";
 import { env } from "./env";
@@ -25,7 +28,7 @@ import { createLogger } from "./logging";
 import { withOpenAIImageEditFilenamesFetch } from "./openai-image-edit-fetch";
 import { createOpenAIResponsesWebSocketFetch } from "./openai-responses-websocket-fetch";
 import { withLlmWireDebugFetch } from "./llm-wire-debug";
-import { isRecord } from "./runtime-utils";
+import { isPanic, isRecord } from "./runtime-utils";
 import { withServerCompactionRequestFetch } from "./server-compaction-request";
 
 let resolvedClaudeExecutable: string | null | undefined;
@@ -55,6 +58,7 @@ function memoizedClaudeExecutable(): string | null {
 export type Providers =
   | "openai"
   | "openai-compatible"
+  | "cerebras"
   | "codex"
   | "xai"
   | "openrouter"
@@ -95,12 +99,35 @@ function decodeCodexRequestBody(body: unknown): string | undefined {
   return undefined;
 }
 
-export function normalizeCodexResponsesRequestRecord(
+const codexResponsesRequestRecordSchema = z.record(z.string(), z.unknown());
+
+export function decodeCodexResponsesRequestBody(body: string): Record<string, unknown> | undefined {
+  let decoded: unknown;
+  try {
+    decoded = JSON.parse(body);
+  } catch (cause) {
+    if (isPanic(cause)) throw cause;
+    return undefined;
+  }
+  const parsed = codexResponsesRequestRecordSchema.safeParse(decoded);
+  return parsed.success ? parsed.data : undefined;
+}
+
+export class CodexRequestInvalid extends TaggedError("CodexRequestInvalid")<{
+  readonly issue: "streaming-required" | "stateful-reference";
+  readonly message: string;
+}> {}
+
+export function normalizeCodexResponsesRequestRecordResult(
   record: Record<string, unknown>,
-): Record<string, unknown> {
+): ResultType<Record<string, unknown>, CodexRequestInvalid> {
   if (record.stream !== true) {
-    throw new Error(
-      "Invalid Codex request: the ChatGPT Codex backend requires streaming; use streamText",
+    return Result.err(
+      new CodexRequestInvalid({
+        issue: "streaming-required",
+        message:
+          "Invalid Codex request: the ChatGPT Codex backend requires streaming; use streamText",
+      }),
     );
   }
   const normalized = Object.fromEntries(
@@ -135,22 +162,48 @@ export function normalizeCodexResponsesRequestRecord(
   // item ID after AI SDK serialization, matching the native Codex client.
   const input = normalized.input;
   if (Array.isArray(input)) {
-    normalized.input = input.map((item) => {
-      if (!isRecord(item)) return item;
+    const normalizedInput: unknown[] = [];
+    for (const item of input) {
+      if (!isRecord(item)) {
+        normalizedInput.push(item);
+        continue;
+      }
       const type = typeof item.type === "string" ? item.type : undefined;
       if (type === "item_reference") {
-        throw new Error(
-          "Invalid Codex stateless request: item_reference requires persisted response items, but store=false",
+        return Result.err(
+          new CodexRequestInvalid({
+            issue: "stateful-reference",
+            message:
+              "Invalid Codex stateless request: item_reference requires persisted response items, but store=false",
+          }),
         );
       }
-      if (!("id" in item)) return item;
+      if (!("id" in item)) {
+        normalizedInput.push(item);
+        continue;
+      }
       const entry = { ...item };
       delete entry.id;
-      return entry;
-    });
+      normalizedInput.push(entry);
+    }
+    normalized.input = normalizedInput;
   }
 
-  return normalized;
+  return Result.ok(normalized);
+}
+
+export function normalizeCodexResponsesRequestRecord(
+  record: Record<string, unknown>,
+): Record<string, unknown> {
+  const result = normalizeCodexResponsesRequestRecordResult(record);
+  const resolved = result.match<
+    { readonly value: Record<string, unknown> } | { readonly error: CodexRequestInvalid }
+  >({
+    ok: (value) => ({ value }),
+    err: (error) => ({ error }),
+  });
+  if ("error" in resolved) throw new Error(resolved.error.message);
+  return resolved.value;
 }
 
 export type RefreshCodexOAuthTokensOptions = {
@@ -271,7 +324,7 @@ export function createCodexOAuthProvider(options: CreateCodexOAuthProviderOption
     createEventNormalizer: createCodexResponsesEventNormalizer,
     turnStateHeaderName: "x-codex-turn-state",
     onTransportSelected: (details) => {
-      logger.info("responses transport selected", { provider: "codex", ...details });
+      logger.debug("responses transport selected", { provider: "codex", ...details });
     },
     onAutoFallback: (details) => {
       logger.warn("responses transport fallback to sse", { provider: "codex", ...details });
@@ -369,13 +422,8 @@ export function createCodexOAuthProvider(options: CreateCodexOAuthProviderOption
       ) {
         const encoded = decodeCodexRequestBody(body);
         if (encoded !== undefined) {
-          let parsed: unknown;
-          try {
-            parsed = JSON.parse(encoded) as unknown;
-          } catch {
-            // Ignore non-JSON bodies.
-          }
-          if (isRecord(parsed)) {
+          const parsed = decodeCodexResponsesRequestBody(encoded);
+          if (parsed) {
             body = JSON.stringify(normalizeCodexResponsesRequestRecord(parsed));
           }
         }
@@ -394,7 +442,7 @@ export function getModelProviders() {
   const openaiResponsesFetch = createOpenAIResponsesWebSocketFetch({
     mode: env.providers.openai.responsesTransport,
     onTransportSelected: (details) => {
-      logger.info("responses transport selected", {
+      logger.debug("responses transport selected", {
         provider: "openai",
         ...details,
       });
@@ -433,6 +481,9 @@ export function getModelProviders() {
         })
       : null,
 
+    cerebras: createCerebras({
+      apiKey: env.providers.cerebras.apiKey,
+    }),
     codex: createCodexOAuthProvider(),
     xai: env.providers.xai
       ? createXai({

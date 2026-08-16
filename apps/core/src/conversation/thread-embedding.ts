@@ -1,12 +1,15 @@
 import { embed, type EmbeddingModel } from "ai";
 import {
   createLogger,
+  formatTaggedErrorForLog,
   providers,
   type ResolvedModelRef,
-  resolveModelRef,
+  resolveModelRefResult,
+  type ModelResolutionFailed,
   type CoreConfig,
   type JSONObject,
 } from "@stanley2058/lilac-utils";
+import { Result, type Result as ResultType } from "better-result";
 
 const logger = createLogger({
   module: "conversation-thread",
@@ -52,28 +55,21 @@ export type ConversationThreadEmbeddingAdapter = {
 export type ConversationThreadEmbeddingAdapterResolver =
   () => Promise<ConversationThreadEmbeddingAdapter | null>;
 
-type EmbeddingProvider = {
+type EmbeddingProvider = NonNullable<(typeof providers)[string]> & {
   embeddingModel(modelId: string): EmbeddingModel;
 };
 
-function hasEmbeddingModel(provider: unknown): provider is EmbeddingProvider {
-  if (!provider || (typeof provider !== "object" && typeof provider !== "function")) return false;
-  const record = provider as Record<string, unknown>;
-  return typeof record.embeddingModel === "function";
+function getProvider(providerId: string): EmbeddingProvider | null {
+  return providers[providerId] ?? null;
 }
 
-function getProvider(providerId: string): unknown {
-  for (const [id, provider] of Object.entries(providers)) {
-    if (id === providerId) return provider;
-  }
-  return null;
-}
-
-function resolveConversationThreadEmbeddingModel(cfg: CoreConfig): ResolvedModelRef | null {
+function resolveConversationThreadEmbeddingModel(
+  cfg: CoreConfig,
+): ResultType<ResolvedModelRef | null, ModelResolutionFailed> {
   const embeddingConfig = cfg.conversation.thread.embedding;
-  if (!embeddingConfig.enabled) return null;
+  if (!embeddingConfig.enabled) return Result.ok(null);
 
-  return resolveModelRef(
+  return resolveModelRefResult(
     cfg,
     { model: embeddingConfig.model },
     "conversation.thread.embedding.model",
@@ -96,9 +92,7 @@ function createConversationThreadEmbeddingAdapterFromResolved(
   if (!resolved) return null;
 
   const provider = getProvider(resolved.provider);
-  if (!hasEmbeddingModel(provider)) {
-    throw new Error(`Provider '${resolved.provider}' does not expose embedding models`);
-  }
+  if (!provider) return null;
 
   const model = provider.embeddingModel(resolved.modelId);
   const providerOptions = resolved.providerOptions as Record<string, JSONObject> | undefined;
@@ -127,9 +121,9 @@ function createConversationThreadEmbeddingAdapterFromResolved(
 
 export function createConversationThreadEmbeddingAdapter(
   cfg: CoreConfig,
-): ConversationThreadEmbeddingAdapter | null {
-  return createConversationThreadEmbeddingAdapterFromResolved(
-    resolveConversationThreadEmbeddingModel(cfg),
+): ResultType<ConversationThreadEmbeddingAdapter | null, ModelResolutionFailed> {
+  return resolveConversationThreadEmbeddingModel(cfg).map(
+    createConversationThreadEmbeddingAdapterFromResolved,
   );
 }
 
@@ -143,21 +137,21 @@ export function createConversationThreadEmbeddingAdapterResolver(
   let pending: Promise<ConversationThreadEmbeddingAdapter | null> | null = null;
 
   const resolve = async (): Promise<ConversationThreadEmbeddingAdapter | null> => {
-    const cfg = await getConfig();
-    try {
-      const resolved = resolveConversationThreadEmbeddingModel(cfg);
-      const key = embeddingAdapterCacheKey(resolved);
-      if (cached?.key === key) return cached.adapter;
+    const config = await getConfig();
+    return resolveConversationThreadEmbeddingModel(config).match({
+      err: (error) => () => {
+        logger.warn("conversation thread embeddings disabled", formatTaggedErrorForLog(error));
+        return null;
+      },
+      ok: (resolved) => () => {
+        const key = embeddingAdapterCacheKey(resolved);
+        if (cached?.key === key) return cached.adapter;
 
-      const adapter = createConversationThreadEmbeddingAdapterFromResolved(resolved);
-      cached = { key, adapter };
-      return adapter;
-    } catch (e) {
-      logger.warn("conversation thread embeddings disabled", {
-        error: e instanceof Error ? e.message : String(e),
-      });
-      return null;
-    }
+        const adapter = createConversationThreadEmbeddingAdapterFromResolved(resolved);
+        cached = { key, adapter };
+        return adapter;
+      },
+    })();
   };
 
   return async () => {

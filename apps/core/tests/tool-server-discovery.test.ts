@@ -374,6 +374,35 @@ describe("tool-server discovery", () => {
       );
       expect(duplicateTranscript).toBeUndefined();
 
+      const indexedConversationSources = new Database(path.join(fixture.root, "discovery.db"));
+      try {
+        expect(
+          indexedConversationSources
+            .query<{ doc_key: string; kind: string }, []>(
+              `SELECT doc_key, kind
+               FROM discovery_documents
+               WHERE doc_key IN (
+                 'conversation:surface:discord:c1:m2',
+                 'conversation:transcript:discord:c1:req-surface',
+                 'conversation:transcript:github:owner/repo#12:req-github'
+               )
+               ORDER BY doc_key`,
+            )
+            .all(),
+        ).toEqual([
+          {
+            doc_key: "conversation:surface:discord:c1:m2",
+            kind: "surface_message",
+          },
+          {
+            doc_key: "conversation:transcript:github:owner/repo#12:req-github",
+            kind: "transcript_request",
+          },
+        ]);
+      } finally {
+        indexedConversationSources.close();
+      }
+
       const fileGroups = result.groups.filter((group) => group.origin?.kind === "file");
       expect(fileGroups.length).toBeGreaterThan(0);
       expect(
@@ -423,6 +452,64 @@ describe("tool-server discovery", () => {
       expect(result.meta.window?.startTs).toBeDefined();
       expect(result.meta.window?.endTs).toBeDefined();
     } finally {
+      fixture.discoveryService.close();
+      fixture.discordSearchStore.close();
+      fixture.transcriptStore.close();
+    }
+  });
+
+  it("rejects invalid time windows with owned input failures", async () => {
+    const fixture = await makeFixture();
+
+    try {
+      const invalidResult = await fixture.discoveryService.searchResult({
+        query: "deploy",
+        offsetTime: "1h",
+      });
+      expect(invalidResult.status).toBe("error");
+      if (invalidResult.status === "error") {
+        expect(invalidResult.error).toMatchObject({
+          _tag: "DiscoverySearchInputError",
+          field: "offsetTime",
+        });
+      }
+      await expect(
+        fixture.discoveryService.search({ query: "deploy", offsetTime: "1h" }),
+      ).rejects.toMatchObject({ _tag: "DiscoverySearchInputError", field: "offsetTime" });
+      await expect(
+        fixture.discoveryService.search({ query: "deploy", lookbackTime: "invalid" }),
+      ).rejects.toMatchObject({ _tag: "DiscoverySearchInputError", field: "lookbackTime" });
+      await expect(fixture.discoveryService.search({ query: "  " })).rejects.toMatchObject({
+        _tag: "DiscoverySearchInputError",
+        field: "query",
+      });
+    } finally {
+      fixture.discoveryService.close();
+      fixture.discordSearchStore.close();
+      fixture.transcriptStore.close();
+    }
+  });
+
+  it("captures discovery dependency rejection and closes through typed Results", async () => {
+    const fixture = await makeFixture();
+    const cause = new Error("config unavailable");
+    const failingService = new DiscoveryService({
+      dbPath: path.join(fixture.root, "failing-discovery.db"),
+      dataDir: fixture.dataDir,
+      getConfig: async () => Promise.reject(cause),
+    });
+
+    try {
+      const searched = await failingService.searchResult({ query: "deploy", sources: ["prompt"] });
+      expect(searched.status).toBe("error");
+      if (searched.status === "error") {
+        expect(searched.error).toMatchObject({
+          _tag: "DiscoverySearchOperationError",
+          cause,
+        });
+      }
+    } finally {
+      expect(failingService.closeResult().status).toBe("ok");
       fixture.discoveryService.close();
       fixture.discordSearchStore.close();
       fixture.transcriptStore.close();
@@ -581,7 +668,7 @@ describe("tool-server discovery", () => {
       const entry = (await fixture.tool.list()).find(
         (item) => item.callableId === "discovery.search",
       );
-      expect(entry?.input.find((line) => line.startsWith("--sources="))).toContain(
+      expect(entry?.input?.find((line) => line.startsWith("--sources="))).toContain(
         '("conversation" | "prompt" | "heartbeat")[]',
       );
     } finally {

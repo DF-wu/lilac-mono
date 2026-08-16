@@ -79,6 +79,43 @@ export function toOpenAIPromptCacheKey(sessionId: string): string {
   return createHash("sha256").update(sessionId).digest("hex");
 }
 
+function jsonObjectOrEmpty(value: JSONObject | undefined): JSONObject {
+  return value && typeof value === "object" && !Array.isArray(value) ? value : {};
+}
+
+export function withOpenAIPromptCacheKey(
+  providerOptions: { [x: string]: JSONObject } | undefined,
+  promptCacheKey: string,
+): { [x: string]: JSONObject } {
+  const base = providerOptions ?? {};
+  return {
+    ...base,
+    openai: {
+      ...jsonObjectOrEmpty(base["openai"]),
+      promptCacheKey,
+    },
+  };
+}
+
+export function withOpenAIServerCompaction(
+  providerOptions: { [x: string]: JSONObject } | undefined,
+): { [x: string]: JSONObject } {
+  const base = providerOptions ?? {};
+  const existingOpenAI = jsonObjectOrEmpty(base["openai"]);
+  const rawInclude = existingOpenAI["include"];
+  const include = Array.isArray(rawInclude)
+    ? rawInclude.filter((value): value is string => typeof value === "string")
+    : [];
+  return {
+    ...base,
+    openai: {
+      ...existingOpenAI,
+      store: false,
+      include: [...new Set([...include, OPENAI_REASONING_ENCRYPTED_CONTENT_INCLUDE])],
+    },
+  };
+}
+
 export function withReasoningSummaryDefaultForOpenAIModels(params: {
   reasoningDisplay: CoreConfig["agent"]["reasoningDisplay"];
   provider: string;

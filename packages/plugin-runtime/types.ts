@@ -2,10 +2,10 @@ import type { ToolSet } from "ai";
 
 export type PluginSource = "builtin" | "external";
 
-export type RequestContext = {
+export type RequestContext<P extends string = string> = {
   requestId?: string;
   sessionId?: string;
-  /** Server-issued surface origin, kept separate when sessionId is a synthetic workflow session. */
+  /** Server-issued surface origin when sessionId is a synthetic workflow session. */
   originSessionId?: string;
   requestClient?: string;
   cwd?: string;
@@ -14,7 +14,10 @@ export type RequestContext = {
   serverOwnedRequest?: boolean;
   /** Set only after authenticating the root-only container operator token. */
   operator?: boolean;
-  authenticatedPrincipal?: { platform: "discord" | "github" | "telegram"; userId: string };
+  authenticatedPrincipal?: { platform: P; userId: string };
+  requestInitiator?: { platform: P; userId: string };
+  requestInitiatorSessionId?: string;
+  currentTurnUserId?: string;
   toolCallId?: string;
   controlCapability?: string;
   controlPolicy?: {
@@ -41,7 +44,13 @@ export type ServerToolHelpEntry = {
 
 export type ServerToolListResult = ServerToolHelpEntry[];
 
-export interface ServerTool {
+export type ServerToolCallOptions<P extends string = string> = {
+  signal?: AbortSignal;
+  context?: RequestContext<P>;
+  messages?: readonly unknown[];
+};
+
+export interface ServerTool<P extends string = string> {
   id: string;
 
   init(): Promise<void>;
@@ -50,11 +59,7 @@ export interface ServerTool {
   call(
     callableId: string,
     input: Record<string, unknown>,
-    opts?: {
-      signal?: AbortSignal;
-      context?: RequestContext;
-      messages?: readonly unknown[];
-    },
+    opts?: ServerToolCallOptions<P>,
   ): Promise<unknown>;
 }
 
@@ -74,30 +79,40 @@ export type Level1SubagentConfig = {
   maxDepth: number;
 };
 
-export type Level1ExecutionRequestContext = {
+export type Level1ExecutionRequestContext<P extends string = string> = {
   requestId: string;
   sessionId: string;
-  originSessionId?: string;
   requestClient: string;
   subagentDepth: number;
   subagentProfile: Level1RunProfile;
   safetyMode?: "trusted" | "restricted";
+  requestInitiator?: { platform: P; userId: string };
+  requestInitiatorSessionId?: string;
+  currentTurnUserId?: string;
   metadata?: Readonly<Record<string, unknown>>;
 };
 
-export type Level1ToolRunContext<TRuntimeContext> = {
+export type Level1ToolRunContext<TRuntimeContext, P extends string = string> = {
   runtime: TRuntimeContext;
   cwd: string;
   runProfile: Level1RunProfile;
   editingToolMode: "apply_patch" | "edit_file" | "none";
   subagentDepth: number;
   subagentConfig: Level1SubagentConfig;
-  requestContext?: Level1ExecutionRequestContext;
+  requestContext?: Level1ExecutionRequestContext<P>;
 };
 
-export type Level1ToolBuildContext<TRuntimeContext> = Level1ToolRunContext<TRuntimeContext> & {
+export type Level1ToolBuildContext<
+  TRuntimeContext,
+  P extends string = string,
+> = Level1ToolRunContext<TRuntimeContext, P> & {
   getTools(): ToolSet;
-  getLevel1ToolSpecs(): ReadonlyMap<string, Level1ToolSpec<TRuntimeContext>>;
+  getLevel1ToolSpecs(): ReadonlyMap<string, Level1ToolSpec<TRuntimeContext, P>>;
+  resolveEditTargets(
+    spec: Level1ToolSpec<TRuntimeContext, P>,
+    args: unknown,
+    context: { cwd: string },
+  ): Promise<readonly string[]>;
   reportToolStatus?: (update: {
     toolCallId: string;
     status: "start" | "update" | "end";
@@ -107,12 +122,12 @@ export type Level1ToolBuildContext<TRuntimeContext> = Level1ToolRunContext<TRunt
   }) => void | Promise<void>;
 };
 
-export interface Level1ToolSpec<TRuntimeContext> {
+export interface Level1ToolSpec<TRuntimeContext, P extends string = string> {
   name: string;
   /** Enabled tools are batch-callable by default. Set false to opt out. */
   supportsBatch?: boolean;
-  createTool(buildContext: Level1ToolBuildContext<TRuntimeContext>): unknown;
-  isEnabled(runContext: Level1ToolRunContext<TRuntimeContext>): boolean;
+  createTool(buildContext: Level1ToolBuildContext<TRuntimeContext, P>): unknown;
+  isEnabled(runContext: Level1ToolRunContext<TRuntimeContext, P>): boolean;
   editTargets?(
     args: unknown,
     context: { cwd: string },

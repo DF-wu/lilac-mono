@@ -1,15 +1,21 @@
 import { describe, expect, it } from "bun:test";
-import { chmod, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, open, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
+
+import { Panic } from "better-result";
+import { ZodError } from "zod";
 
 import { ModelCapability } from "@stanley2058/lilac-utils";
 
 import {
   ModelCatalog,
+  createModelCatalogResult,
   modelCapabilityOverrides,
   parseModelRef,
+  parseModelRefResult,
   resolveLanguageModel,
+  resolveLanguageModelResult,
   type CatalogFetch,
 } from "../src/model-catalog";
 import { createAiProviderRegistry, type ProviderAuth, type ProviderConfig } from "../src/providers";
@@ -353,6 +359,229 @@ describe("model catalog", () => {
     expect(snapshot.warnings[0]?.message).toContain("timed out after 20ms");
   });
 
+  it("redacts authenticated fetch rejection details from warnings", async () => {
+    const apiKey = "catalog-api-key-secret";
+    const requestUrlSecret = "request-url-secret";
+    const requestContentSecret = "request-content-secret";
+    const warnings: string[] = [];
+    const catalog = new ModelCatalog(
+      {
+        configVersion: 1,
+        providers: {
+          local: {
+            type: "openai-compatible",
+            baseUrl: `https://catalog.example/${requestUrlSecret}/v1`,
+            catalog: "v1",
+          },
+        },
+      },
+      { local: { type: "api-key", key: apiKey } },
+      {
+        onWarning: (warning) => warnings.push(JSON.stringify(warning)),
+        fetch: async (input, init) => {
+          const authorization = new Headers(init?.headers).get("authorization");
+          throw new Error(
+            `${String(input)} authorization=${authorization} body=${requestContentSecret}`,
+          );
+        },
+      },
+    );
+
+    const snapshot = await catalog.get();
+    const diagnostics = JSON.stringify({ snapshot: snapshot.warnings, warnings });
+    expect(diagnostics).toContain("Model catalog request failed");
+    expect(diagnostics).not.toContain(apiKey);
+    expect(diagnostics).not.toContain(requestUrlSecret);
+    expect(diagnostics).not.toContain(requestContentSecret);
+    expect(diagnostics).not.toContain("Bearer");
+  });
+
+  it("cancels response bodies on status and content-length early exits", async () => {
+    const cancelReasons: unknown[] = [];
+    let request = 0;
+    const catalog = new ModelCatalog(
+      { configVersion: 1, providers: { local: config.providers.local! } },
+      { local: auth.local! },
+      {
+        maxResponseBytes: 32,
+        fetch: async () => {
+          request += 1;
+          const body = new ReadableStream<Uint8Array>({
+            cancel(reason) {
+              cancelReasons.push(reason);
+            },
+          });
+          if (request === 1) return new Response(body, { status: 401, statusText: "secret" });
+          return new Response(body, { headers: { "content-length": "33" } });
+        },
+      },
+    );
+
+    await catalog.get({ forceRefresh: true });
+    await catalog.get({ forceRefresh: true });
+    expect(cancelReasons).toEqual(["HTTP response rejected", "response too large"]);
+  });
+
+  it("keeps early response and body-cleanup failures redacted", async () => {
+    const statusSecret = "status-text-secret";
+    const cleanupSecret = "response-cancel-secret";
+    let cancelAttempted = false;
+    const body = new ReadableStream<Uint8Array>({
+      cancel() {
+        cancelAttempted = true;
+        throw new Error(cleanupSecret);
+      },
+    });
+    const catalog = new ModelCatalog(
+      { configVersion: 1, providers: { local: config.providers.local! } },
+      { local: auth.local! },
+      { fetch: async () => new Response(body, { status: 503, statusText: statusSecret }) },
+    );
+
+    const snapshot = await catalog.get();
+    const diagnostics = JSON.stringify(snapshot.warnings);
+    expect(cancelAttempted).toBe(true);
+    expect(diagnostics).toContain("HTTP 503");
+    expect(diagnostics).not.toContain(statusSecret);
+    expect(diagnostics).not.toContain(cleanupSecret);
+  });
+
+  it("cancels interrupted readers before releasing their lock", async () => {
+    let markReadStarted = () => {};
+    const readStarted = new Promise<void>((resolve) => {
+      markReadStarted = resolve;
+    });
+    let cancelled = false;
+    const body = new ReadableStream<Uint8Array>(
+      {
+        pull() {
+          markReadStarted();
+          return new Promise<void>(() => {});
+        },
+        cancel() {
+          cancelled = true;
+        },
+      },
+      { highWaterMark: 0 },
+    );
+    const catalog = new ModelCatalog(
+      { configVersion: 1, providers: { local: config.providers.local! } },
+      { local: auth.local! },
+      { fetch: async () => new Response(body) },
+    );
+    const controller = new AbortController();
+    const pending = catalog.getResult({ forceRefresh: true, signal: controller.signal });
+    await readStarted;
+    controller.abort();
+
+    const result = await pending;
+    expect(result.status).toBe("error");
+    if (result.status === "error") expect(result.error._tag).toBe("ModelCatalogCancelled");
+    expect(cancelled).toBe(true);
+    expect(body.locked).toBe(false);
+  });
+
+  it("preserves cancellation and cleanup failures as a combined Result", async () => {
+    let markReadStarted = () => {};
+    const readStarted = new Promise<void>((resolve) => {
+      markReadStarted = resolve;
+    });
+    const cleanupSecret = "reader-cleanup-secret";
+    const body = new ReadableStream<Uint8Array>(
+      {
+        pull() {
+          markReadStarted();
+          return new Promise<void>(() => {});
+        },
+        cancel() {
+          throw new Error(cleanupSecret);
+        },
+      },
+      { highWaterMark: 0 },
+    );
+    const catalog = new ModelCatalog(
+      { configVersion: 1, providers: { local: config.providers.local! } },
+      { local: auth.local! },
+      { fetch: async () => new Response(body) },
+    );
+    const controller = new AbortController();
+    const pending = catalog.getResult({ forceRefresh: true, signal: controller.signal });
+    await readStarted;
+    controller.abort();
+
+    const result = await pending;
+    expect(result.status).toBe("error");
+    if (result.status === "error") {
+      expect(result.error._tag).toBe("ModelCatalogRequestAndCleanupFailed");
+      if (result.error._tag === "ModelCatalogRequestAndCleanupFailed") {
+        expect(result.error.primary._tag).toBe("ModelCatalogCancelled");
+        expect(result.error.cleanup.operations).toEqual(["cancel-response-reader"]);
+      }
+      expect(JSON.stringify(result.error)).not.toContain(cleanupSecret);
+    }
+    expect(body.locked).toBe(false);
+  });
+
+  it("surfaces cleanup-only failures after a complete response read", async () => {
+    const cleanupSecret = "release-cleanup-secret";
+    const response = new Response("unused");
+    Object.defineProperty(response, "body", {
+      value: {
+        getReader() {
+          return {
+            async read() {
+              return { done: true, value: undefined };
+            },
+            async cancel() {},
+            releaseLock() {
+              throw new Error(cleanupSecret);
+            },
+          };
+        },
+      },
+    });
+    const catalog = new ModelCatalog(
+      { configVersion: 1, providers: { local: config.providers.local! } },
+      { local: auth.local! },
+      { fetch: async () => response },
+    );
+
+    const snapshot = await catalog.get();
+    expect(snapshot.warnings).toHaveLength(1);
+    expect(snapshot.warnings[0]?.message).toContain("Model catalog response cleanup failed");
+    expect(JSON.stringify(snapshot.warnings)).not.toContain(cleanupSecret);
+  });
+
+  it("keeps a response-read Panic ahead of cleanup Panic", async () => {
+    const primaryPanic = new Panic({ message: "response read invariant" });
+    const cleanupPanic = new Panic({ message: "response cleanup invariant" });
+    const response = new Response("unused");
+    Object.defineProperty(response, "body", {
+      value: {
+        getReader() {
+          return {
+            async read() {
+              throw primaryPanic;
+            },
+            async cancel() {
+              throw cleanupPanic;
+            },
+            releaseLock() {
+              throw cleanupPanic;
+            },
+          };
+        },
+      },
+    });
+    const catalog = new ModelCatalog(
+      { configVersion: 1, providers: { local: config.providers.local! } },
+      { local: auth.local! },
+      { fetch: async () => response },
+    );
+
+    await expect(catalog.getResult()).rejects.toBe(primaryPanic);
+  });
+
   it("bounds models.dev and /v1/models response bytes", async () => {
     const catalog = new ModelCatalog(config, auth, {
       maxResponseBytes: 32,
@@ -476,6 +705,52 @@ describe("model catalog", () => {
     }
   });
 
+  it("preserves combined disk cache read and close failures", async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), "mini-lilac-model-cache-"));
+    const cacheFile = path.join(directory, "models-dev.json");
+    await writeFile(cacheFile, "{}\n");
+    const readSecret = "cache-read-secret";
+    const closeSecret = "cache-close-secret";
+    const warnings: string[] = [];
+
+    try {
+      const catalog = new ModelCatalog(
+        { configVersion: 1, providers: { primary: config.providers.primary! } },
+        { primary: auth.primary! },
+        {
+          cacheFilePath: cacheFile,
+          onWarning: (warning) => warnings.push(warning.message),
+          fetch: async () => new Promise<Response>(() => {}),
+          openCacheFile: async (filePath) => {
+            const handle = await open(filePath, "r");
+            const close = handle.close.bind(handle);
+            Object.defineProperty(handle, "read", {
+              value: async () => {
+                throw new Error(readSecret);
+              },
+            });
+            Object.defineProperty(handle, "close", {
+              value: async () => {
+                await close();
+                throw new Error(closeSecret);
+              },
+            });
+            return handle;
+          },
+        },
+      );
+
+      const snapshot = await catalog.get({ backgroundRefresh: true });
+
+      expect(snapshot.warnings.map((warning) => warning.code)).toEqual(["cache-read-failed"]);
+      expect(warnings).toEqual([`Failed to read and close models.dev cache '${cacheFile}'`]);
+      expect(JSON.stringify(warnings)).not.toContain(readSecret);
+      expect(JSON.stringify(warnings)).not.toContain(closeSecret);
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
   it("atomically replaces the cache with owner-only permissions", async () => {
     const directory = await mkdtemp(path.join(tmpdir(), "mini-lilac-model-cache-"));
     const cacheFile = path.join(directory, "models-dev.json");
@@ -544,6 +819,39 @@ describe("model catalog", () => {
 
     await expect(aborted).rejects.toMatchObject({ name: "AbortError" });
     expect(await catalog.get()).toBe(cached);
+  });
+
+  it("returns owned cancellation from the Result API", async () => {
+    const catalog = new ModelCatalog(
+      { configVersion: 1, providers: { local: config.providers.local! } },
+      { local: auth.local! },
+      {
+        fetch: async (_input, init) =>
+          new Promise<Response>((_resolve, reject) => {
+            init?.signal?.addEventListener(
+              "abort",
+              () => reject(new DOMException("cancelled", "AbortError")),
+              { once: true },
+            );
+          }),
+      },
+    );
+    const controller = new AbortController();
+    const pending = catalog.getResult({ signal: controller.signal });
+    controller.abort();
+    const cancelled = await pending;
+    expect(cancelled.status).toBe("error");
+    if (cancelled.status === "error") expect(cancelled.error._tag).toBe("ModelCatalogCancelled");
+  });
+
+  it("never converts a fetch Panic into a catalog warning", async () => {
+    const panic = new Panic({ message: "catalog fetch invariant" });
+    const catalog = new ModelCatalog(
+      { configVersion: 1, providers: { local: config.providers.local! } },
+      { local: auth.local! },
+      { fetch: async () => Promise.reject(panic) },
+    );
+    await expect(catalog.getResult()).rejects.toBe(panic);
   });
 
   it("isolates a signalled refresh from a shared refresh", async () => {
@@ -625,6 +933,67 @@ describe("model catalog", () => {
     expect(resolveLanguageModel("primary/gpt-test", loaded).ref.modelId).toBe("gpt-test");
     expect(() => resolveLanguageModel("missing/gpt-test", loaded)).toThrow("not configured");
     expect(() => parseModelRef("alias")).toThrow("provider/model");
+    const invalid = parseModelRefResult("alias");
+    expect(invalid.status).toBe("error");
+    const missing = resolveLanguageModelResult("missing/gpt-test", loaded);
+    expect(missing.status).toBe("error");
+    expect(createModelCatalogResult(config, auth, { requestTimeoutMs: 0 }).status).toBe("error");
+  });
+
+  it("preserves legacy model-resolution exception contracts", () => {
+    const loaded = {
+      config,
+      auth,
+      registry: createAiProviderRegistry(config, auth),
+      supersededProviderIds: [],
+    };
+    let parseFailure: unknown;
+    try {
+      parseModelRef("alias");
+    } catch (cause) {
+      parseFailure = cause;
+    }
+    expect(parseFailure).toBeInstanceOf(Error);
+    if (parseFailure instanceof Error) {
+      expect(parseFailure.cause).toBeInstanceOf(ZodError);
+      expect(Object.hasOwn(parseFailure, "_tag")).toBe(false);
+    }
+
+    let missingProviderFailure: unknown;
+    try {
+      resolveLanguageModel("missing/gpt-test", loaded);
+    } catch (cause) {
+      missingProviderFailure = cause;
+    }
+    expect(missingProviderFailure).toBeInstanceOf(Error);
+    if (missingProviderFailure instanceof Error) {
+      expect(Object.hasOwn(missingProviderFailure, "_tag")).toBe(false);
+    }
+
+    const registryFailure = new Error("external registry failure");
+    const failingLoaded = {
+      ...loaded,
+      registry: {
+        ...loaded.registry,
+        languageModel: () => {
+          throw registryFailure;
+        },
+      },
+    };
+    let legacyRegistryFailure: unknown;
+    try {
+      resolveLanguageModel("primary/gpt-test", failingLoaded);
+    } catch (cause) {
+      legacyRegistryFailure = cause;
+    }
+    expect(legacyRegistryFailure).toBe(registryFailure);
+
+    const typedRegistryFailure = resolveLanguageModelResult("primary/gpt-test", failingLoaded);
+    expect(typedRegistryFailure.status).toBe("error");
+    if (typedRegistryFailure.status === "error") {
+      expect(typedRegistryFailure.error._tag).toBe("LanguageModelResolutionFailed");
+      expect(typedRegistryFailure.error).not.toBe(registryFailure);
+    }
   });
 });
 

@@ -3,30 +3,44 @@ import fs from "node:fs/promises";
 import { basename } from "node:path";
 import { fileTypeFromBuffer } from "file-type";
 import { getDiscordUserAliasValue, type CoreConfig } from "@stanley2058/lilac-utils";
+import { Panic, Result, TaggedError, type Result as ResultType } from "better-result";
+
+import { defineServerTool, type ServerTool, type ServerToolCallOptions } from "../types";
 
 import { isAdapterPlatform } from "../../shared/is-adapter-platform";
-import { hasCacheBurstProvider, type SurfaceAdapter } from "../../surface/adapter";
+import {
+  hasCacheBurstProvider,
+  type SurfaceAdapter,
+  type SurfaceOperationError,
+} from "../../surface/adapter";
+import type {
+  ResolvedSurfaceAdapter,
+  SurfaceAdapterResolver,
+} from "../../surface/runtime-descriptor";
+import { SurfaceToolTargetInvalid } from "../../surface/protocol";
 import type {
   MsgRef,
+  RegisteredSurfacePlatform,
   SessionRef,
+  SessionRefFor,
   SurfaceAttachment,
   SurfaceMessage,
-  SurfaceReactionDetail,
   SurfaceReactionSummary,
-  SurfaceSessionParticipantsResult,
-  SurfaceSession,
-  SurfaceRefPlatform,
 } from "../../surface/types";
+import {
+  getBuiltinSurfaceProtocol,
+  inferBuiltinSurfaceToolRequestTarget,
+} from "../../surface/builtin-surface-protocols";
 import type { DiscordSearchService } from "../../surface/store/discord-search-store";
-import type { RequestContext, ServerTool } from "../types";
+import type { RequestContext } from "../types";
 import type { RecentAgentWriteSnapshot, TranscriptStore } from "../../transcript/transcript-store";
 import { isHeartbeatSessionId } from "../../transcript/heartbeat-handoff";
 
 import {
   bestEffortAliasForDiscordChannelId,
-  resolveDiscordSessionId,
-} from "./resolve-discord-session-id";
-import { zodObjectToCliLines } from "./zod-cli";
+  resolveGuildIdForChannel,
+  shouldAllowDiscordChannel as checkDiscordChannelAllowed,
+} from "../../surface/discord/discord-tool-targets";
 import {
   formatToolPathForRequestContext,
   inferMimeTypeFromFilename,
@@ -34,146 +48,128 @@ import {
 } from "../../shared/attachment-utils";
 import { getDiscordSurfaceDisplayText } from "../../surface/discord/discord-surface-display-text";
 import { isTelegramChatAllowed } from "../../surface/telegram/telegram-guards";
-import {
-  parseTelegramSessionId,
-  telegramMsgRef,
-  telegramSessionRef,
-} from "../../surface/telegram/telegram-ids";
-import { parseRequestId } from "../../surface/bridge/request-ids";
+import { tryParseTelegramSessionId } from "../../surface/telegram/telegram-ids";
 import {
   DISCORD_REFERENCE_TYPE_DEFAULT,
   DISCORD_REFERENCE_TYPE_FORWARD,
   normalizeDiscordRaw,
 } from "../../surface/discord/discord-raw-normalizer";
 
-import {
-  isGithubIssueTriggerId,
-  parseGithubRequestId,
-  parseGithubSessionId,
-} from "../../github/github-ids";
-import { markGithubAgentComment } from "../../github/github-comment-marker";
-import {
-  createIssueComment,
-  createIssueCommentReaction,
-  createIssueReaction,
-  deleteIssueComment,
-  deleteIssueCommentReactionById,
-  deleteIssueReactionById,
-  editIssueComment,
-  getGithubAppSlugOrNull,
-  getPreferredGithubActorLoginOrNull,
-  getIssue,
-  getIssueComment,
-  listIssueCommentReactions,
-  listIssueComments,
-  listIssueReactions,
-  type GithubReaction,
-} from "../../github/github-api";
+class SurfaceToolFailure extends TaggedError("SurfaceToolFailure")<{
+  readonly message: string;
+}> {}
+
+function adaptSurfaceResultToToolHost<TValue>(
+  result: ResultType<TValue, SurfaceToolFailure>,
+): TValue {
+  return result.match({
+    ok: (value) => () => value,
+    err: (error) => () => {
+      throw new Error(error.message);
+    },
+  })();
+}
+
+function signalSurfaceFailureToToolHost(message: string): never {
+  return adaptSurfaceResultToToolHost(Result.err(new SurfaceToolFailure({ message })));
+}
+
+function adaptSurfaceTargetResultToToolHost<T>(
+  result: ResultType<T, { readonly message: string }>,
+): T {
+  return result.match({
+    ok: (value) => () => value,
+    err: (error) => () => signalSurfaceFailureToToolHost(error.message),
+  })();
+}
+
+function adaptSurfaceOperationToToolHost<T>(result: ResultType<T, SurfaceOperationError>): T {
+  return result.match({
+    ok: (value) => () => value,
+    err: (error) => () => {
+      switch (error._tag) {
+        case "SurfaceOperationUnsupported":
+        case "SurfacePlatformMismatch":
+        case "SurfaceSessionMismatch":
+        case "SurfaceInvalidInput":
+        case "SurfaceOperationPartiallyCompleted":
+        case "SurfaceMessageNotFound":
+        case "SurfacePermissionDenied":
+        case "SurfaceRateLimited":
+        case "SurfaceUnavailable":
+          return signalSurfaceFailureToToolHost(error.message);
+      }
+    },
+  })();
+}
+
+function createSurfaceMessageRef<P extends RegisteredSurfacePlatform>(
+  sessionRef: SessionRefFor<P>,
+  messageId: string,
+) {
+  const protocol = getBuiltinSurfaceProtocol(sessionRef.platform);
+  return protocol.refs.createMessageRef(sessionRef, messageId);
+}
 
 const surfaceClientSchema = z
   .enum(["discord", "github", "whatsapp", "slack", "telegram", "web"])
-  .describe("Surface client/platform (required if request client is unknown / not provided)");
+  .describe(
+    "Recognized surface wire client/platform. Execution requires a registered adapter and is selected from request context unless --client is needed.",
+  );
 
 type SurfaceClient = z.infer<typeof surfaceClientSchema>;
 
-function isSurfaceClient(x: string): x is SurfaceClient {
-  return (
-    x === "discord" ||
-    x === "github" ||
-    x === "whatsapp" ||
-    x === "slack" ||
-    x === "telegram" ||
-    x === "web"
-  );
+function formatRegisteredPlatforms(resolver: SurfaceAdapterResolver): string {
+  return resolver
+    .registeredPlatforms()
+    .map((platform) => `'${platform}'`)
+    .join(", ");
 }
 
-function inferDiscordOriginFromRequestId(
-  requestId: string | undefined,
-): { sessionId: string; messageId: string } | null {
-  if (!requestId) return null;
-  const m = /^discord:([^:]+):([^:]+)$/.exec(requestId);
-  if (!m) return null;
-  return { sessionId: m[1]!, messageId: m[2]! };
-}
-
-function inferGithubOriginFromRequestId(
-  requestId: string | undefined,
-): { sessionId: string; messageId: string } | null {
-  if (!requestId) return null;
-  const parsed = parseGithubRequestId({ requestId });
-  if (!parsed) return null;
-  return { sessionId: parsed.sessionId, messageId: parsed.triggerId };
-}
-
-function inferTelegramOriginFromRequestId(
-  requestId: string | undefined,
-): { sessionId: string; messageId: string } | null {
-  if (!requestId) return null;
-  const parsed = parseRequestId(requestId);
-  if (parsed?.kind !== "telegram_message") return null;
-  return { sessionId: parsed.sessionId, messageId: parsed.messageId };
-}
-
-function resolveContextClient(ctx: RequestContext | undefined): SurfaceClient | "unknown" {
-  const requestClientRaw = ctx?.requestClient;
-  const requestClient =
-    typeof requestClientRaw === "string" &&
-    isAdapterPlatform(requestClientRaw) &&
-    isSurfaceClient(requestClientRaw)
-      ? requestClientRaw
-      : "unknown";
-  const principalClient = ctx?.authenticatedPrincipal?.platform;
-
-  if (requestClient !== "unknown") {
-    if (principalClient && principalClient !== requestClient) {
-      throw new Error(
-        `Client mismatch: context requestClient is '${requestClient}' but authenticated principal is '${principalClient}'`,
-      );
-    }
-    return requestClient;
-  }
-
-  return principalClient ?? "unknown";
-}
-
-function resolveClient(params: {
+function resolveSurfaceAdapter(params: {
   inputClient?: SurfaceClient;
   ctx?: RequestContext;
-}): SurfaceClient {
-  const ctxClient = resolveContextClient(params.ctx);
+  resolver: SurfaceAdapterResolver;
+}): ResolvedSurfaceAdapter {
+  const ctxClientRaw = params.ctx?.requestClient;
+  const initiatorClientRaw = params.ctx?.requestInitiator?.platform;
+  const initiatorClient = isAdapterPlatform(initiatorClientRaw) ? initiatorClientRaw : null;
+  const requestClient = isAdapterPlatform(ctxClientRaw) ? ctxClientRaw : null;
+  const ctxClient = requestClient && requestClient !== "unknown" ? requestClient : initiatorClient;
+  const contextAdapter = ctxClient ? params.resolver.resolve(ctxClient) : null;
 
-  if (ctxClient !== "unknown") {
-    if (params.inputClient && params.inputClient !== ctxClient) {
-      throw new Error(
-        `Client mismatch: context requestClient is '${ctxClient}' but input client is '${params.inputClient}'`,
+  if (contextAdapter) {
+    if (params.inputClient && params.inputClient !== contextAdapter.platform) {
+      signalSurfaceFailureToToolHost(
+        `Client mismatch: context requestClient is '${contextAdapter.platform}' but input client is '${params.inputClient}'`,
       );
     }
-    // context is authoritative
-    return ctxClient;
+    return contextAdapter;
   }
 
-  if (!params.inputClient) {
-    throw new Error(
-      "surface tool requires --client when request client is unknown (set LILAC_REQUEST_CLIENT or pass --client=<client>)",
+  if (params.inputClient) {
+    const inputAdapter = params.resolver.resolve(params.inputClient);
+    if (inputAdapter) return inputAdapter;
+    signalSurfaceFailureToToolHost(
+      `surface tool: client '${params.inputClient}' is recognized but has no registered executable adapter (registered: ${formatRegisteredPlatforms(params.resolver)})`,
     );
   }
 
-  return params.inputClient;
-}
-
-function ensureDiscordClient(client: SurfaceClient): "discord" {
-  if (client !== "discord") {
-    throw new Error(
-      `surface tool: client '${client}' is not supported yet (supported: 'discord', 'github', 'telegram')`,
+  if (ctxClient) {
+    signalSurfaceFailureToToolHost(
+      `surface tool: context client '${ctxClient}' is recognized but has no registered executable adapter (registered: ${formatRegisteredPlatforms(params.resolver)})`,
     );
   }
-  return "discord";
-}
 
-function mustDiscordSurfaceConfig(cfg: CoreConfig) {
-  const discord = cfg.surface.discord;
-  if (!discord) throw new Error("surface.discord config missing");
-  return discord;
+  if (typeof ctxClientRaw === "string" && ctxClientRaw.length > 0 && !requestClient) {
+    signalSurfaceFailureToToolHost(
+      `surface tool: context requestClient '${ctxClientRaw}' is not a valid surface wire value; pass --client=<client> explicitly`,
+    );
+  }
+
+  signalSurfaceFailureToToolHost(
+    "surface tool requires --client when request client is unknown (set LILAC_REQUEST_CLIENT or pass --client=<client>)",
+  );
 }
 
 function shouldAllowDiscordChannel(params: {
@@ -181,181 +177,7 @@ function shouldAllowDiscordChannel(params: {
   channelId: string;
   guildId?: string | null;
 }): boolean {
-  const discord = mustDiscordSurfaceConfig(params.cfg);
-
-  const allowedChannelIds = new Set(discord.allowedChannelIds);
-  const allowedGuildIds = new Set(discord.allowedGuildIds);
-
-  if (allowedChannelIds.size === 0 && allowedGuildIds.size === 0) return false;
-
-  if (allowedChannelIds.has(params.channelId)) return true;
-
-  const gid = params.guildId ?? null;
-  if (gid && allowedGuildIds.has(gid)) return true;
-
-  return false;
-}
-
-function asDiscordSessionRef(
-  channelId: string,
-  guildId?: string,
-  parentChannelId?: string,
-): SessionRef {
-  return {
-    platform: "discord",
-    channelId,
-    guildId,
-    parentChannelId,
-  };
-}
-
-function asDiscordMsgRef(channelId: string, messageId: string): MsgRef {
-  return { platform: "discord", channelId, messageId };
-}
-
-function asGithubSessionRef(sessionId: string): SessionRef {
-  return { platform: "github", channelId: sessionId };
-}
-
-function asGithubMsgRef(sessionId: string, messageId: string): MsgRef {
-  return { platform: "github", channelId: sessionId, messageId };
-}
-
-function asTelegramSessionRef(sessionId: string): SessionRef {
-  const parsed = parseTelegramSessionId(sessionId);
-  return telegramSessionRef(parsed);
-}
-
-function asTelegramMsgRef(sessionId: string, messageId: string): MsgRef {
-  const parsed = parseTelegramSessionId(sessionId);
-  return telegramMsgRef({ ...parsed, messageId });
-}
-
-function shouldAllowTelegramSession(params: {
-  cfg: CoreConfig;
-  sessionId: string;
-  originSessionId?: string;
-}): boolean {
-  if (params.originSessionId && params.originSessionId !== params.sessionId) return false;
-  const { chatId } = parseTelegramSessionId(params.sessionId);
-  return isTelegramChatAllowed({ cfg: params.cfg, chatId });
-}
-
-function telegramOriginSessionId(ctx: RequestContext | undefined): string | undefined {
-  if (resolveContextClient(ctx) !== "telegram") return undefined;
-  if (ctx?.originSessionId) return ctx.originSessionId;
-  return ctx?.requestClient === "telegram" ? ctx.sessionId : undefined;
-}
-
-function parseIsoMs(iso: string | undefined): number {
-  if (!iso) return 0;
-  const ms = Date.parse(iso);
-  return Number.isFinite(ms) ? ms : 0;
-}
-
-const GITHUB_REACTION_CONTENTS = [
-  "+1",
-  "-1",
-  "laugh",
-  "confused",
-  "heart",
-  "hooray",
-  "rocket",
-  "eyes",
-] as const;
-
-type GithubReactionContent = (typeof GITHUB_REACTION_CONTENTS)[number];
-
-function githubReactionEmojiFromContent(content: string): string {
-  switch (content) {
-    case "+1":
-      return "👍";
-    case "-1":
-      return "👎";
-    case "laugh":
-      return "😄";
-    case "confused":
-      return "😕";
-    case "heart":
-      return "❤️";
-    case "hooray":
-      return "🎉";
-    case "rocket":
-      return "🚀";
-    case "eyes":
-      return "👀";
-    default:
-      return content;
-  }
-}
-
-function githubReactionContentFromInput(reaction: string): GithubReactionContent {
-  const raw = reaction.trim();
-  const alias = raw.startsWith(":") && raw.endsWith(":") ? raw.slice(1, -1) : raw;
-  const normalized = alias.trim().toLowerCase();
-
-  // Direct emoji shortcuts.
-  switch (raw) {
-    case "👍":
-      return "+1";
-    case "👎":
-      return "-1";
-    case "😄":
-      return "laugh";
-    case "😕":
-      return "confused";
-    case "❤️":
-      return "heart";
-    case "🎉":
-      return "hooray";
-    case "🚀":
-      return "rocket";
-    case "👀":
-      return "eyes";
-  }
-
-  if (
-    normalized === "+1" ||
-    normalized === "thumbsup" ||
-    normalized === "thumbs_up" ||
-    normalized === "like"
-  ) {
-    return "+1";
-  }
-  if (
-    normalized === "-1" ||
-    normalized === "thumbsdown" ||
-    normalized === "thumbs_down" ||
-    normalized === "dislike"
-  ) {
-    return "-1";
-  }
-  if (normalized === "laugh" || normalized === "smile" || normalized === "grin") {
-    return "laugh";
-  }
-  if (normalized === "confused" || normalized === "confusion" || normalized === "thinking") {
-    return "confused";
-  }
-  if (normalized === "heart" || normalized === "love") {
-    return "heart";
-  }
-  if (normalized === "hooray" || normalized === "tada" || normalized === "party") {
-    return "hooray";
-  }
-  if (normalized === "rocket") {
-    return "rocket";
-  }
-  if (normalized === "eyes") {
-    return "eyes";
-  }
-
-  if ((GITHUB_REACTION_CONTENTS as readonly string[]).includes(normalized)) {
-    return normalized as GithubReactionContent;
-  }
-
-  throw new Error(
-    `Unsupported GitHub reaction '${reaction}'. Supported: ${GITHUB_REACTION_CONTENTS.join(", ")}, or emoji equivalents like 👍 👀 🚀`,
-  );
+  return adaptSurfaceTargetResultToToolHost(checkDiscordChannelAllowed(params));
 }
 
 const DEFAULT_OUTBOUND_MAX_FILE_BYTES = 8 * 1024 * 1024;
@@ -382,7 +204,7 @@ export async function loadLocalAttachments(params: {
 
     const st = await fs.stat(resolvedPath);
     if (!st.isFile()) {
-      throw new Error(
+      signalSurfaceFailureToToolHost(
         `Not a file: ${formatToolPathForRequestContext({
           path: resolvedPath,
           context: params.context,
@@ -391,7 +213,7 @@ export async function loadLocalAttachments(params: {
     }
 
     if (st.size > DEFAULT_OUTBOUND_MAX_FILE_BYTES) {
-      throw new Error(
+      signalSurfaceFailureToToolHost(
         `Attachment too large (${st.size} bytes). Max is ${DEFAULT_OUTBOUND_MAX_FILE_BYTES} bytes: ${formatToolPathForRequestContext(
           {
             path: resolvedPath,
@@ -403,7 +225,7 @@ export async function loadLocalAttachments(params: {
 
     totalBytes += st.size;
     if (totalBytes > DEFAULT_OUTBOUND_MAX_TOTAL_BYTES) {
-      throw new Error(
+      signalSurfaceFailureToToolHost(
         `Total attachment bytes too large (${totalBytes} bytes). Max is ${DEFAULT_OUTBOUND_MAX_TOTAL_BYTES} bytes.`,
       );
     }
@@ -428,81 +250,6 @@ export async function loadLocalAttachments(params: {
   }
 
   return out;
-}
-
-type GuildIdResolver = {
-  fetchGuildIdForChannel(channelId: string): Promise<string | null>;
-};
-
-type ReactionDetailsProvider = {
-  listReactionDetails(msgRef: MsgRef): Promise<SurfaceReactionDetail[]>;
-};
-
-type SessionParticipantsProvider = {
-  listSessionParticipants(
-    sessionRef: SessionRef,
-    opts?: { limit?: number },
-  ): Promise<SurfaceSessionParticipantsResult>;
-};
-
-function hasGuildIdResolver(adapter: SurfaceAdapter): adapter is SurfaceAdapter & GuildIdResolver {
-  return (
-    typeof (adapter as unknown as { fetchGuildIdForChannel?: unknown }).fetchGuildIdForChannel ===
-    "function"
-  );
-}
-
-function hasReactionDetailsProvider(
-  adapter: SurfaceAdapter,
-): adapter is SurfaceAdapter & ReactionDetailsProvider {
-  return (
-    typeof (adapter as unknown as { listReactionDetails?: unknown }).listReactionDetails ===
-    "function"
-  );
-}
-
-function hasSessionParticipantsProvider(
-  adapter: SurfaceAdapter,
-): adapter is SurfaceAdapter & SessionParticipantsProvider {
-  return (
-    typeof (
-      adapter as unknown as {
-        listSessionParticipants?: unknown;
-      }
-    ).listSessionParticipants === "function"
-  );
-}
-
-async function tryGetCachedSession(
-  adapter: SurfaceAdapter,
-  channelId: string,
-): Promise<SurfaceSession | null> {
-  const sessions = await adapter.listSessions();
-  for (const s of sessions) {
-    if (s.ref.platform !== "discord") continue;
-    if (s.ref.channelId === channelId) return s;
-  }
-  return null;
-}
-
-async function resolveGuildIdForChannel(params: {
-  adapter: SurfaceAdapter;
-  channelId: string;
-}): Promise<string | null> {
-  const sess = await tryGetCachedSession(params.adapter, params.channelId);
-  if (sess?.ref.platform === "discord") {
-    return sess.ref.guildId ?? null;
-  }
-
-  if (hasGuildIdResolver(params.adapter)) {
-    try {
-      return await params.adapter.fetchGuildIdForChannel(params.channelId);
-    } catch {
-      return null;
-    }
-  }
-
-  return null;
 }
 
 function buildDiscordUserAliasById(cfg: CoreConfig): Map<string, string> {
@@ -548,59 +295,56 @@ const sessionsListLimitSchema = z
   })
   .describe("Max sessions to return (default: all).");
 
-function withDefaultSessionId(
-  rawInput: Record<string, unknown>,
+function withDefaultSessionId<TInput extends { readonly sessionId?: string }>(
+  input: TInput,
   ctx: RequestContext | undefined,
-): Record<string, unknown> {
-  const hasOwn = Object.prototype.hasOwnProperty.call(rawInput, "sessionId");
-  const value = rawInput["sessionId"];
+): TInput {
+  const initiatorSessionId =
+    typeof ctx?.requestInitiatorSessionId === "string" && ctx.requestInitiatorSessionId.length > 0
+      ? ctx.requestInitiatorSessionId
+      : undefined;
 
-  // If explicitly provided (even null/empty), defer to schema validation.
-  if (hasOwn && value !== undefined) return rawInput;
-
-  const authoritativeTelegramSessionId = telegramOriginSessionId(ctx);
-  const ctxSessionId =
-    authoritativeTelegramSessionId ??
-    (typeof ctx?.sessionId === "string" && ctx.sessionId.length > 0
-      ? ctx.sessionId
-      : (inferDiscordOriginFromRequestId(ctx?.requestId)?.sessionId ??
-        inferGithubOriginFromRequestId(ctx?.requestId)?.sessionId ??
-        inferTelegramOriginFromRequestId(ctx?.requestId)?.sessionId));
-
-  if (ctxSessionId) {
-    return { ...rawInput, sessionId: ctxSessionId };
+  if (input.sessionId !== undefined) {
+    if (
+      ctx?.safetyMode === "restricted" &&
+      initiatorSessionId &&
+      input.sessionId !== initiatorSessionId
+    ) {
+      signalSurfaceFailureToToolHost(
+        `Restricted surface call cannot target session '${input.sessionId}' outside request origin '${initiatorSessionId}'`,
+      );
+    }
+    return input;
   }
 
-  throw new Error(
+  const ctxSessionId =
+    initiatorSessionId ??
+    (typeof ctx?.sessionId === "string" && ctx.sessionId.length > 0
+      ? ctx.sessionId
+      : inferBuiltinSurfaceToolRequestTarget(ctx?.requestId)?.sessionId);
+
+  if (ctxSessionId) {
+    return { ...input, sessionId: ctxSessionId };
+  }
+
+  signalSurfaceFailureToToolHost(
     "surface tool requires --session-id when request session is unknown (set LILAC_SESSION_ID or pass --session-id=<id>)",
   );
 }
 
-function withDefaultMessageId(
-  rawInput: Record<string, unknown>,
+function withDefaultMessageId<TInput extends { readonly messageId?: string }>(
+  input: TInput,
   ctx: RequestContext | undefined,
-): Record<string, unknown> {
-  const hasOwn = Object.prototype.hasOwnProperty.call(rawInput, "messageId");
-  const value = rawInput["messageId"];
+): TInput {
+  if (input.messageId !== undefined) return input;
 
-  // If explicitly provided (even null/empty), defer to schema validation.
-  if (hasOwn && value !== undefined) return rawInput;
-
-  const inferred = inferDiscordOriginFromRequestId(ctx?.requestId);
-  if (inferred?.messageId) return { ...rawInput, messageId: inferred.messageId };
-
-  const inferredGh = inferGithubOriginFromRequestId(ctx?.requestId);
-  if (inferredGh?.messageId) return { ...rawInput, messageId: inferredGh.messageId };
-
-  const inferredTelegram = inferTelegramOriginFromRequestId(ctx?.requestId);
-  if (inferredTelegram?.messageId) {
-    return { ...rawInput, messageId: inferredTelegram.messageId };
-  }
+  const inferred = inferBuiltinSurfaceToolRequestTarget(ctx?.requestId);
+  if (inferred?.messageId) return { ...input, messageId: inferred.messageId };
 
   const rid = typeof ctx?.requestId === "string" ? ctx.requestId : undefined;
   const hint = rid ? ` (requestId='${rid}')` : " (no requestId in context)";
 
-  throw new Error(
+  signalSurfaceFailureToToolHost(
     `surface tool requires --message-id when origin message is unknown${hint}. ` +
       "This is expected for active-mode gated batches (requestId like 'req:<uuid>'); pass --message-id explicitly.",
   );
@@ -608,7 +352,7 @@ function withDefaultMessageId(
 
 function mustPresentString(v: unknown, label: string): string {
   if (typeof v === "string" && v.length > 0) return v;
-  throw new Error(`surface tool internal error: missing ${label}`);
+  signalSurfaceFailureToToolHost(`surface tool internal error: missing ${label}`);
 }
 
 type SurfaceMessageAttachmentKind = "image" | "video" | "audio" | "file";
@@ -620,6 +364,24 @@ type SurfaceMessageAttachmentMeta = {
   mimeType?: string;
   size?: number;
 };
+
+const surfaceMessageAttachmentMetaSchema = z.object({
+  url: z.string().min(1),
+  filename: z.string().optional(),
+  name: z.string().optional(),
+  mimeType: z.string().optional(),
+  contentType: z.string().optional(),
+  size: z.number().finite().optional(),
+});
+
+const discordMessageTypeMetaSchema = z.object({
+  discord: z.object({
+    type: z.number().finite().optional(),
+    typeName: z.string().optional(),
+    system: z.boolean().optional(),
+    isChat: z.boolean().optional(),
+  }),
+});
 
 type SurfaceMessageAttachmentHints = {
   hasAttachments: boolean;
@@ -656,15 +418,12 @@ function inferAttachmentMimeType(params: {
     if (inferred !== "application/octet-stream") return inferred;
   }
 
-  const basenameFromUrl = (() => {
-    try {
-      const u = new URL(params.url);
-      const pathBasename = basename(u.pathname);
-      return pathBasename.length > 0 ? pathBasename : undefined;
-    } catch {
-      return undefined;
-    }
-  })();
+  const basenameFromUrl = URL.canParse(params.url)
+    ? (() => {
+        const pathBasename = basename(new URL(params.url).pathname);
+        return pathBasename.length > 0 ? pathBasename : undefined;
+      })()
+    : undefined;
 
   if (basenameFromUrl) {
     const inferred = inferMimeTypeFromFilename(basenameFromUrl);
@@ -683,21 +442,14 @@ function attachmentKindFromMimeType(mimeType: string | undefined): SurfaceMessag
 }
 
 function normalizeAttachmentMeta(input: unknown): SurfaceMessageAttachmentMeta | null {
-  if (!input || typeof input !== "object") return null;
-  const o = input as Record<string, unknown>;
+  const decoded = surfaceMessageAttachmentMetaSchema.safeParse(input);
+  if (!decoded.success) return null;
+  const attachment = decoded.data;
+  const url = attachment.url;
 
-  const url = typeof o.url === "string" ? o.url : null;
-  if (!url) return null;
+  const filename = attachment.filename ?? attachment.name;
 
-  const filename =
-    typeof o.filename === "string" ? o.filename : typeof o.name === "string" ? o.name : undefined;
-
-  const rawMimeType =
-    typeof o.mimeType === "string"
-      ? o.mimeType
-      : typeof o.contentType === "string"
-        ? o.contentType
-        : undefined;
+  const rawMimeType = attachment.mimeType ?? attachment.contentType;
 
   const mimeType = inferAttachmentMimeType({
     mimeType: rawMimeType,
@@ -705,7 +457,7 @@ function normalizeAttachmentMeta(input: unknown): SurfaceMessageAttachmentMeta |
     url,
   });
 
-  const size = typeof o.size === "number" ? o.size : undefined;
+  const size = attachment.size;
 
   return {
     url,
@@ -789,21 +541,13 @@ function getDiscordMessageTypeMetaFromRaw(raw: unknown): {
   isSystem?: boolean;
   isChat?: boolean;
 } | null {
-  if (!raw || typeof raw !== "object") return null;
-  const o = raw as Record<string, unknown>;
-  const discord =
-    "discord" in o && o.discord && typeof o.discord === "object"
-      ? (o.discord as Record<string, unknown>)
-      : null;
-  if (!discord) return null;
-
-  const typeId = typeof discord["type"] === "number" ? (discord["type"] as number) : undefined;
-  const typeName =
-    typeof discord["typeName"] === "string" ? (discord["typeName"] as string) : undefined;
-  const isSystem =
-    typeof discord["system"] === "boolean" ? (discord["system"] as boolean) : undefined;
-  const isChat =
-    typeof discord["isChat"] === "boolean" ? (discord["isChat"] as boolean) : undefined;
+  const decoded = discordMessageTypeMetaSchema.safeParse(raw);
+  if (!decoded.success) return null;
+  const discord = decoded.data.discord;
+  const typeId = discord.type;
+  const typeName = discord.typeName;
+  const isSystem = discord.system;
+  const isChat = discord.isChat;
 
   if (
     typeId === undefined &&
@@ -884,7 +628,7 @@ async function resolveDiscordReferencedMessage(input: {
         channelId: refChannelId,
         messageId: ref.messageId,
       })
-      .catch(() => null);
+      .then((result) => result.match({ ok: (value) => value, err: () => null }));
     input.fetchedReferenceByKey?.set(targetKey, referencedPromise);
   }
 
@@ -965,15 +709,14 @@ const MESSAGE_SEARCH_ORDER_SCHEMA = z.enum(["relevance", "ts_asc", "ts_desc"]);
 type MessageSearchOrder = z.infer<typeof MESSAGE_SEARCH_ORDER_SCHEMA>;
 
 function compareMessageIdLike(a: string, b: string): number {
-  try {
+  if (/^\d+$/u.test(a) && /^\d+$/u.test(b)) {
     const ai = BigInt(a);
     const bi = BigInt(b);
     if (ai < bi) return -1;
     if (ai > bi) return 1;
     return 0;
-  } catch {
-    return a.localeCompare(b);
   }
+  return a.localeCompare(b);
 }
 
 function compareSurfaceMessageChronological(a: SurfaceMessage, b: SurfaceMessage): number {
@@ -1387,232 +1130,197 @@ const reactionsRemoveInputSchema = baseInputSchema.extend({
   reaction: z.string().min(1).describe("Reaction emoji (e.g. 👍, ✅, :custom_emoji:)"),
 });
 
-const defaultGithubApi = {
-  getIssue,
-  listIssueComments,
-  createIssueComment,
-  getIssueComment,
-  editIssueComment,
-  deleteIssueComment,
-
-  createIssueReaction,
-  createIssueCommentReaction,
-  listIssueReactions,
-  listIssueCommentReactions,
-  deleteIssueReactionById,
-  deleteIssueCommentReactionById,
-  getGithubAppSlugOrNull,
-  getPreferredGithubActorLoginOrNull,
-};
-export type GithubSurfaceApi = Omit<
-  typeof defaultGithubApi,
-  "getPreferredGithubActorLoginOrNull"
-> & {
-  getPreferredGithubActorLoginOrNull?: typeof getPreferredGithubActorLoginOrNull;
-};
-
-type SurfaceCallOptions = {
-  signal?: AbortSignal;
-  context?: RequestContext;
-  messages?: readonly unknown[];
-};
-
-type SurfaceCallableEntry = {
-  callableId: string;
-  name: string;
-  description: string;
-  inputSchema: z.ZodTypeAny;
-  primaryPositional?: {
-    field: string;
-  };
-  hidden?: boolean;
-  handler: (input: Record<string, unknown>, opts: SurfaceCallOptions) => Promise<unknown>;
-};
-
 export class Surface implements ServerTool {
   id = "surface";
+  private readonly tool: ServerTool;
 
   constructor(
     private readonly params: {
-      adapter: SurfaceAdapter;
-      adapters?: ReadonlyMap<SurfaceRefPlatform, SurfaceAdapter>;
-      githubApi?: GithubSurfaceApi;
+      adapterResolver: SurfaceAdapterResolver;
       config?: CoreConfig;
       getConfig?: () => Promise<CoreConfig>;
       discordSearch?: DiscordSearchService;
       transcriptStore?: TranscriptStore;
     },
-  ) {}
-
-  async init(): Promise<void> {}
-  async destroy(): Promise<void> {}
-
-  async list() {
-    return this.surfaceCallableEntries().map((entry) => ({
-      callableId: entry.callableId,
-      name: entry.name,
-      description: entry.description,
-      shortInput: zodObjectToCliLines(entry.inputSchema, {
-        mode: "required",
+  ) {
+    this.tool = defineServerTool({
+      id: this.id,
+      callables: ({ callable }) => ({
+        "surface.help": callable({
+          name: "Surface Help",
+          description:
+            "Explain surface terminology (client/platform/sessionId/messageId) and common sessionId formats.",
+          inputSchema: helpInputSchema,
+          validation: "zod",
+          run: (input, opts) => this.callHelp(input, opts?.context),
+        }),
+        "surface.activities.recentAgentWrites": callable({
+          name: "Surface Activities Recent Agent Writes",
+          description:
+            "List recent visible writes produced by the agent, with session ids, message ids, and thin previews.",
+          inputSchema: activitiesRecentAgentWritesInputSchema,
+          validation: "zod",
+          run: (input) => this.callActivitiesRecentAgentWrites(input),
+        }),
+        "surface.sessions.list": callable({
+          name: "Surface Sessions List",
+          description:
+            "List sessions through the selected registered adapter. The adapter may return an explicit unsupported result.",
+          inputSchema: sessionsListInputSchema,
+          validation: "zod",
+          run: (input, opts) => this.callSessionsList(input, opts?.context),
+        }),
+        "surface.sessions.listParticipants": callable({
+          name: "Surface Sessions List Participants",
+          description:
+            "List current participants through the selected registered adapter. Discord uses thread members or guild members; other adapters may return unsupported.",
+          inputSchema: sessionsListParticipantsInputSchema,
+          validation: "zod",
+          run: (input, opts) => this.callSessionsListParticipants(input, opts?.context),
+        }),
+        "surface.messages.list": callable({
+          name: "Surface Messages List",
+          description: "List messages for a session.",
+          inputSchema: messagesListInputSchema,
+          validation: "zod",
+          run: (input, opts) => this.callMessagesList(input, opts?.context),
+        }),
+        "surface.messages.read": callable({
+          name: "Surface Messages Read",
+          description: "Read a message by id.",
+          inputSchema: messagesReadInputSchema,
+          validation: "zod",
+          run: (input, opts) => this.callMessagesRead(input, opts?.context),
+        }),
+        "surface.messages.search": callable({
+          name: "Surface Messages Search",
+          description:
+            "Deprecated: search indexed messages in a single Discord session. Prefer discovery.search for memory retrieval.",
+          inputSchema: messagesSearchInputSchema,
+          validation: "zod",
+          primaryPositional: "query",
+          hidden: true,
+          run: (input, opts) => this.callMessagesSearch(input, opts?.context),
+        }),
+        "surface.messages.send": callable({
+          name: "Surface Messages Send",
+          description: "Send a message to a session.",
+          inputSchema: messagesSendInputSchema,
+          validation: "zod",
+          primaryPositional: "text",
+          run: (input, opts) => this.callMessagesSend(input, opts?.context),
+        }),
+        "surface.messages.edit": callable({
+          name: "Surface Messages Edit",
+          description: "Edit a message.",
+          inputSchema: messagesEditInputSchema,
+          validation: "zod",
+          run: (input, opts) => this.callMessagesEdit(input, opts?.context),
+        }),
+        "surface.messages.delete": callable({
+          name: "Surface Messages Delete",
+          description: "Delete a message.",
+          inputSchema: messagesDeleteInputSchema,
+          validation: "zod",
+          run: (input, opts) => this.callMessagesDelete(input, opts?.context),
+        }),
+        "surface.reactions.list": callable({
+          name: "Surface Reactions List",
+          description: "List reactions for a message (emoji + count).",
+          inputSchema: reactionsListInputSchema,
+          validation: "zod",
+          run: (input, opts) => this.callReactionsList(input, opts?.context),
+        }),
+        "surface.reactions.listDetailed": callable({
+          name: "Surface Reactions List Detailed",
+          description: "List reactions for a message with per-user details.",
+          inputSchema: reactionsListDetailedInputSchema,
+          validation: "zod",
+          run: (input, opts) => this.callReactionsListDetailed(input, opts?.context),
+        }),
+        "surface.reactions.add": callable({
+          name: "Surface Reactions Add",
+          description: "Add a reaction to a message.",
+          inputSchema: reactionsAddInputSchema,
+          validation: "zod",
+          run: (input, opts) => this.callReactionsAdd(input, opts?.context),
+        }),
+        "surface.reactions.remove": callable({
+          name: "Surface Reactions Remove",
+          description: "Remove a reaction from a message.",
+          inputSchema: reactionsRemoveInputSchema,
+          validation: "zod",
+          run: (input, opts) => this.callReactionsRemove(input, opts?.context),
+        }),
       }),
-      input: zodObjectToCliLines(entry.inputSchema),
-      ...(entry.primaryPositional ? { primaryPositional: entry.primaryPositional } : {}),
-      ...(entry.hidden !== undefined ? { hidden: entry.hidden } : {}),
-    }));
+    });
   }
 
-  private surfaceCallableEntries(): SurfaceCallableEntry[] {
-    return [
-      {
-        callableId: "surface.help",
-        name: "Surface Help",
-        description:
-          "Explain surface terminology (client/platform/sessionId/messageId) and common sessionId formats.",
-        inputSchema: helpInputSchema,
-        handler: (input, opts) => this.callHelp(input, opts.context),
-      },
-      {
-        callableId: "surface.activities.recentAgentWrites",
-        name: "Surface Activities Recent Agent Writes",
-        description:
-          "List recent visible writes produced by the agent, with session ids, message ids, and thin previews.",
-        inputSchema: activitiesRecentAgentWritesInputSchema,
-        handler: (input, opts) => this.callActivitiesRecentAgentWrites(input, opts.context),
-      },
-      {
-        callableId: "surface.sessions.list",
-        name: "Surface Sessions List",
-        description: "List cached sessions. Provide --client if request client is unknown.",
-        inputSchema: sessionsListInputSchema,
-        handler: (input, opts) => this.callSessionsList(input, opts.context),
-      },
-      {
-        callableId: "surface.sessions.listParticipants",
-        name: "Surface Sessions List Participants",
-        description:
-          "List current Discord session participants (thread members when available; otherwise guild members).",
-        inputSchema: sessionsListParticipantsInputSchema,
-        handler: (input, opts) => this.callSessionsListParticipants(input, opts.context),
-      },
-      {
-        callableId: "surface.messages.list",
-        name: "Surface Messages List",
-        description: "List messages for a session.",
-        inputSchema: messagesListInputSchema,
-        handler: (input, opts) => this.callMessagesList(input, opts.context),
-      },
-      {
-        callableId: "surface.messages.read",
-        name: "Surface Messages Read",
-        description: "Read a message by id.",
-        inputSchema: messagesReadInputSchema,
-        handler: (input, opts) => this.callMessagesRead(input, opts.context),
-      },
-      {
-        callableId: "surface.messages.search",
-        name: "Surface Messages Search",
-        description:
-          "Deprecated: search indexed messages in a single Discord session. Prefer discovery.search for memory retrieval.",
-        inputSchema: messagesSearchInputSchema,
-        primaryPositional: {
-          field: "query",
-        },
-        hidden: true,
-        handler: (input, opts) => this.callMessagesSearch(input, opts.context),
-      },
-      {
-        callableId: "surface.messages.send",
-        name: "Surface Messages Send",
-        description: "Send a message to a session.",
-        inputSchema: messagesSendInputSchema,
-        primaryPositional: {
-          field: "text",
-        },
-        handler: (input, opts) => this.callMessagesSend(input, opts.context),
-      },
-      {
-        callableId: "surface.messages.edit",
-        name: "Surface Messages Edit",
-        description: "Edit a message.",
-        inputSchema: messagesEditInputSchema,
-        handler: (input, opts) => this.callMessagesEdit(input, opts.context),
-      },
-      {
-        callableId: "surface.messages.delete",
-        name: "Surface Messages Delete",
-        description: "Delete a message.",
-        inputSchema: messagesDeleteInputSchema,
-        handler: (input, opts) => this.callMessagesDelete(input, opts.context),
-      },
-      {
-        callableId: "surface.reactions.list",
-        name: "Surface Reactions List",
-        description: "List reactions for a message (emoji + count).",
-        inputSchema: reactionsListInputSchema,
-        handler: (input, opts) => this.callReactionsList(input, opts.context),
-      },
-      {
-        callableId: "surface.reactions.listDetailed",
-        name: "Surface Reactions List Detailed",
-        description: "List reactions for a message with per-user details.",
-        inputSchema: reactionsListDetailedInputSchema,
-        handler: (input, opts) => this.callReactionsListDetailed(input, opts.context),
-      },
-      {
-        callableId: "surface.reactions.add",
-        name: "Surface Reactions Add",
-        description: "Add a reaction to a message.",
-        inputSchema: reactionsAddInputSchema,
-        handler: (input, opts) => this.callReactionsAdd(input, opts.context),
-      },
-      {
-        callableId: "surface.reactions.remove",
-        name: "Surface Reactions Remove",
-        description: "Remove a reaction from a message.",
-        inputSchema: reactionsRemoveInputSchema,
-        handler: (input, opts) => this.callReactionsRemove(input, opts.context),
-      },
-    ];
+  async init(): Promise<void> {
+    await this.tool.init();
+  }
+
+  async destroy(): Promise<void> {
+    await this.tool.destroy();
+  }
+
+  async list() {
+    return await this.tool.list();
   }
 
   async call(
     callableId: string,
     input: Record<string, unknown>,
-    opts?: SurfaceCallOptions,
+    opts?: ServerToolCallOptions,
   ): Promise<unknown> {
-    const entry = this.surfaceCallableEntries().find((item) => item.callableId === callableId);
-    if (!entry) throw new Error(`Invalid callable ID '${callableId}'`);
-    return await entry.handler(input, opts ?? {});
+    return await this.tool.call(callableId, input, opts);
   }
 
-  private async callHelp(rawInput: Record<string, unknown>, ctx: RequestContext | undefined) {
-    const input = helpInputSchema.parse(rawInput);
-
-    const ctxClient = resolveContextClient(ctx);
-    const effectiveClient = input.client ?? (ctxClient !== "unknown" ? ctxClient : undefined);
+  private async callHelp(input: z.output<typeof helpInputSchema>, ctx: RequestContext | undefined) {
+    const ctxClientRaw = ctx?.requestClient;
+    const ctxClient = isAdapterPlatform(ctxClientRaw) ? ctxClientRaw : "unknown";
+    const contextAdapter = this.params.adapterResolver.resolve(ctxClient);
+    const registeredPlatforms = this.params.adapterResolver.registeredPlatforms();
+    let effective = contextAdapter;
+    if (input.client) {
+      effective = resolveSurfaceAdapter({
+        inputClient: input.client,
+        ctx,
+        resolver: this.params.adapterResolver,
+      });
+    } else if (!effective) {
+      effective =
+        registeredPlatforms
+          .map((platform) => this.params.adapterResolver.resolve(platform))
+          .filter((resolved) => resolved?.protocol.toolTargets !== undefined)
+          .sort(
+            (left, right) =>
+              left!.protocol.toolTargets!.helpFallbackPriority -
+              right!.protocol.toolTargets!.helpFallbackPriority,
+          )[0] ?? null;
+    }
     const cfg = await this.getCfg();
     const contextSessionId = typeof ctx?.sessionId === "string" ? ctx.sessionId : null;
-    const contextAlias =
-      contextSessionId !== null && (ctxClient === "discord" || effectiveClient === "discord")
-        ? bestEffortAliasForDiscordChannelId({
-            channelId: contextSessionId,
-            cfg,
-          })
-        : undefined;
+    const targetHelp = effective?.protocol.toolTargets?.describeSessionIds({
+      contextSessionId,
+      config: cfg,
+    });
 
     return {
       tool: "surface" as const,
-      supportedClients: ["discord", "github", "telegram"] as const,
+      supportedClients: registeredPlatforms,
       context: {
         requestClient: ctxClient,
         sessionId: contextSessionId,
-        alias: contextAlias,
+        alias: targetHelp?.contextAlias,
       },
       terminology: {
         client:
-          "Surface client/platform. If the request context has a known client (LILAC_REQUEST_CLIENT), --client is optional; otherwise pass --client explicitly.",
+          "Surface client/platform. A registered request-context adapter is authoritative; an explicit conflicting --client fails closed. Otherwise pass --client to select a registered adapter.",
+        adapterResolution:
+          "supportedClients lists registered executable adapters only. It does not predict support for individual operations; each operation returns its declared runtime result.",
         session:
-          "A conversation container. For Discord, a session maps to a channel; for GitHub, to an issue/PR thread; for Telegram, to a chat or forum topic.",
+          "A conversation container. For Discord, a session maps to a channel; for GitHub, a session maps to an issue/PR thread.",
         sessionId:
           "The CLI/session selector used by most surface.* tools. If omitted, surface tools default to the current request session (LILAC_SESSION_ID, or inferred from requestId when available).",
         alias:
@@ -1622,75 +1330,15 @@ export class Surface implements ServerTool {
         replyToMessageId: "When sending a message, optionally reply to an existing messageId.",
         silent: "When true, suppress all notifications for this send (mentions + reply ping).",
         attachments:
-          "Outbound: local files attached to a send (paths resolved relative to request cwd). Inbound: message attachment/media metadata is first-class on surface.messages.read and hinted on surface.messages.list.",
+          "Outbound: local files offered to the selected adapter (paths resolved relative to request cwd; unsupported adapters reject them explicitly). Inbound: message attachment/media metadata is first-class on surface.messages.read and hinted on surface.messages.list.",
       },
-      sessionIdFormats:
-        effectiveClient === "discord" || effectiveClient === undefined
-          ? {
-              client: "discord" as const,
-              accepted: [
-                {
-                  format: "123456789012345678",
-                  meaning: "Raw Discord channel id",
-                },
-                {
-                  format: "<#123456789012345678>",
-                  meaning: "Discord channel mention",
-                },
-                {
-                  format: "dev-chat",
-                  meaning:
-                    "Configured session alias (cfg.entity.sessions.discord maps alias -> channelId or { discord, comment })",
-                },
-                {
-                  format: "#dev-chat",
-                  meaning: "Configured session alias with optional leading # prefix",
-                },
-              ],
-              notes: [
-                "If the request has no session context, you must pass --session-id (or set LILAC_SESSION_ID). Some requests also allow inferring sessionId/messageId from requestId when it is 'discord:<sessionId>:<messageId>'.",
-              ],
-            }
-          : effectiveClient === "github"
-            ? {
-                client: "github" as const,
-                accepted: [
-                  {
-                    format: "OWNER/REPO#123",
-                    meaning: "GitHub issue/PR thread",
-                  },
-                ],
-                notes: [
-                  "surface.sessions.list is not implemented for GitHub; use gh to discover issues/PRs.",
-                  "For GitHub triggers, surface tools can default sessionId/messageId from requestId when it is 'github:<OWNER/REPO#N>:<triggerId>'.",
-                ],
-              }
-            : effectiveClient === "telegram"
-              ? {
-                  client: "telegram" as const,
-                  accepted: [
-                    { format: "1001", meaning: "Telegram private or group chat id" },
-                    {
-                      format: "-1001234567890:7",
-                      meaning: "Telegram supergroup chat id and forum topic id",
-                    },
-                  ],
-                  notes: [
-                    "The parent chat id must be present in cfg.surface.telegram.allowedChatIds.",
-                  ],
-                }
-              : {
-                  client: effectiveClient,
-                  accepted: [],
-                  notes: ["This surface client is not implemented today."],
-                },
+      sessionIdFormats: targetHelp?.sessionIdFormats ?? null,
       relatedConfigKeys: {
         requestClientEnv: "LILAC_REQUEST_CLIENT",
         sessionIdEnv: "LILAC_SESSION_ID",
         discordSessionAliases: "cfg.entity.sessions.discord",
         surfaceAllowlistChannels: "cfg.surface.discord.allowedChannelIds",
         surfaceAllowlistGuilds: "cfg.surface.discord.allowedGuildIds",
-        telegramAllowedChats: "cfg.surface.telegram.allowedChatIds",
       },
     };
   }
@@ -1698,68 +1346,88 @@ export class Surface implements ServerTool {
   private async getCfg(): Promise<CoreConfig> {
     if (this.params.config) return this.params.config;
     if (this.params.getConfig) return this.params.getConfig();
-    throw new Error("surface tool requires core config (tool server must be started with config)");
+    signalSurfaceFailureToToolHost(
+      "surface tool requires core config (tool server must be started with config)",
+    );
   }
 
-  private gh(): GithubSurfaceApi {
-    return this.params.githubApi ?? defaultGithubApi;
+  private resolveAdapter(
+    inputClient: SurfaceClient | undefined,
+    ctx: RequestContext | undefined,
+  ): ResolvedSurfaceAdapter {
+    return resolveSurfaceAdapter({
+      inputClient,
+      ctx,
+      resolver: this.params.adapterResolver,
+    });
   }
 
-  private adapterFor(client: "discord" | "telegram"): SurfaceAdapter {
-    if (client === "discord") return this.params.adapters?.get("discord") ?? this.params.adapter;
-    const adapter = this.params.adapters?.get("telegram");
-    if (!adapter) {
-      throw new Error("surface tool: Telegram adapter is unavailable");
+  private async resolveSessionTarget(params: {
+    readonly resolved: ResolvedSurfaceAdapter;
+    readonly sessionId: string;
+  }): Promise<{
+    readonly resolved: ResolvedSurfaceAdapter;
+    readonly sessionRef: SessionRef;
+    readonly cfg?: CoreConfig;
+  }> {
+    const routing = params.resolved.protocol.toolTargets;
+    if (!routing) {
+      signalSurfaceFailureToToolHost(
+        `surface tool: client '${params.resolved.platform}' does not provide target routing`,
+      );
     }
-    return adapter;
+    const target: ResultType<
+      { readonly sessionRef: SessionRef; readonly config?: CoreConfig },
+      SurfaceToolTargetInvalid
+    > = await routing.resolveSession({
+      selector: params.sessionId,
+      adapter: params.resolved.adapter,
+      getConfig: () => this.getCfg(),
+    });
+    const targetValue = adaptSurfaceTargetResultToToolHost(target);
+    return {
+      resolved: params.resolved,
+      sessionRef: targetValue.sessionRef,
+      cfg: targetValue.config,
+    };
+  }
+
+  private async resolveMessageTarget(params: {
+    readonly resolved: ResolvedSurfaceAdapter;
+    readonly sessionId: string;
+    readonly messageId: string;
+    readonly burstDiscordCache?: boolean;
+  }) {
+    const target = await this.resolveSessionTarget(params);
+    const msgRef = createSurfaceMessageRef(target.sessionRef, params.messageId);
+    if (
+      params.burstDiscordCache &&
+      target.resolved.platform === "discord" &&
+      hasCacheBurstProvider(target.resolved.adapter)
+    ) {
+      await target.resolved.adapter.burstCache({
+        msgRef,
+        sessionRef: target.sessionRef,
+        reason: "surface_tool",
+      });
+    }
+    return { ...target, msgRef };
   }
 
   private async readRecentAgentWriteText(row: RecentAgentWriteSnapshot): Promise<string> {
-    if (row.client === "discord") {
-      const msg = await this.params.adapter.readMsg(asDiscordMsgRef(row.sessionId, row.messageId));
-      return msg?.text ?? row.finalText ?? "";
-    }
-
-    if (row.client === "github") {
-      const thread = parseGithubSessionId(row.sessionId);
-
-      if (
-        isGithubIssueTriggerId({
-          sessionId: row.sessionId,
-          triggerId: row.messageId,
-        })
-      ) {
-        const issue = await this.gh().getIssue({
-          owner: thread.owner,
-          repo: thread.repo,
-          number: thread.number,
-        });
-
-        return typeof issue.body === "string" ? issue.body : (row.finalText ?? "");
-      }
-
-      const commentId = Number(row.messageId);
-      if (!Number.isFinite(commentId) || commentId <= 0) {
-        return row.finalText ?? "";
-      }
-
-      const comment = await this.gh().getIssueComment({
-        owner: thread.owner,
-        repo: thread.repo,
-        commentId,
-      });
-
-      return typeof comment.body === "string" ? comment.body : (row.finalText ?? "");
-    }
-
-    if (row.client === "telegram") {
-      const msg = await this.adapterFor("telegram").readMsg(
-        asTelegramMsgRef(row.sessionId, row.messageId),
-      );
-      return msg?.text ?? row.finalText ?? "";
-    }
-
-    return row.finalText ?? "";
+    if (!isAdapterPlatform(row.client)) return row.finalText ?? "";
+    const resolved = this.params.adapterResolver.resolve(row.client);
+    if (!resolved) return row.finalText ?? "";
+    const msg = await resolved.adapter.readMsg(
+      createSurfaceMessageRef(
+        resolved.protocol.refs.createSessionRef(row.sessionId),
+        row.messageId,
+      ),
+    );
+    return msg.match({
+      ok: (value) => value?.text ?? row.finalText ?? "",
+      err: () => row.finalText ?? "",
+    });
   }
 
   private linkSentMessageToTranscript(ref: MsgRef, ctx: RequestContext | undefined): void {
@@ -1779,18 +1447,12 @@ export class Surface implements ServerTool {
   }
 
   private async callActivitiesRecentAgentWrites(
-    rawInput: Record<string, unknown>,
-    ctx: RequestContext | undefined,
+    input: z.output<typeof activitiesRecentAgentWritesInputSchema>,
   ) {
-    const input = activitiesRecentAgentWritesInputSchema.parse(rawInput);
-    const resolvedContextClient = resolveContextClient(ctx);
-    const contextClient = resolvedContextClient === "unknown" ? undefined : resolvedContextClient;
-    const client =
-      contextClient || input.client ? resolveClient({ inputClient: input.client, ctx }) : undefined;
     const transcriptStore = this.params.transcriptStore;
 
     if (!transcriptStore?.listRecentAgentWrites) {
-      throw new Error(
+      signalSurfaceFailureToToolHost(
         "surface.activities.recentAgentWrites is unavailable: transcript store is not initialized.",
       );
     }
@@ -1816,7 +1478,7 @@ export class Surface implements ServerTool {
       const rows = transcriptStore.listRecentAgentWrites({
         limit: pageSize,
         offset,
-        client,
+        client: input.client,
       });
       if (rows.length === 0) break;
 
@@ -1824,8 +1486,10 @@ export class Surface implements ServerTool {
 
       for (const row of rows) {
         if (row.client === "discord") {
+          const discord = this.params.adapterResolver.resolve("discord");
+          if (!discord) continue;
           const guildId = await resolveGuildIdForChannel({
-            adapter: this.params.adapter,
+            adapter: discord.adapter,
             channelId: row.sessionId,
           });
 
@@ -1839,21 +1503,12 @@ export class Surface implements ServerTool {
             continue;
           }
         }
-        if (
-          row.client === "telegram" &&
-          !shouldAllowTelegramSession({
-            cfg,
-            sessionId: row.sessionId,
-            originSessionId: telegramOriginSessionId(ctx),
-          })
-        ) {
-          continue;
-        }
 
         let text = row.finalText ?? "";
         try {
           text = await this.readRecentAgentWriteText(row);
-        } catch {
+        } catch (cause) {
+          if (Panic.is(cause)) throw cause;
           // Fall back to persisted finalText when the backing message cannot be fetched.
         }
 
@@ -1885,72 +1540,18 @@ export class Surface implements ServerTool {
     return out;
   }
 
-  private async listGithubReactions(params: {
-    thread: { owner: string; repo: string; number: number };
-    sessionId: string;
-    messageId: string;
-  }): Promise<GithubReaction[]> {
-    if (
-      isGithubIssueTriggerId({
-        sessionId: params.sessionId,
-        triggerId: params.messageId,
-      })
-    ) {
-      return await this.gh().listIssueReactions({
-        owner: params.thread.owner,
-        repo: params.thread.repo,
-        issueNumber: params.thread.number,
-        limit: 100,
-      });
-    }
-
-    const commentId = Number(params.messageId);
-    if (!Number.isFinite(commentId) || commentId <= 0) {
-      throw new Error(`Invalid GitHub commentId '${params.messageId}'`);
-    }
-
-    return await this.gh().listIssueCommentReactions({
-      owner: params.thread.owner,
-      repo: params.thread.repo,
-      commentId,
-      limit: 100,
-    });
-  }
-
   private async callSessionsList(
-    rawInput: Record<string, unknown>,
+    input: z.output<typeof sessionsListInputSchema>,
     ctx: RequestContext | undefined,
   ) {
-    const input = sessionsListInputSchema.parse(rawInput);
-    const client = resolveClient({ inputClient: input.client, ctx });
-    if (client === "github") {
-      throw new Error(
-        "surface.sessions.list is not supported for GitHub. Use `gh` to list issues/PRs and then pass `--session-id OWNER/REPO#<number>` to other surface.* tools.",
-      );
-    }
-    if (client === "telegram") {
-      const cfg = await this.getCfg();
-      const limit = input.limit ?? Number.POSITIVE_INFINITY;
-      const sessions = await this.adapterFor("telegram").listSessions();
-      return sessions
-        .filter(
-          (session) =>
-            session.ref.platform === "telegram" &&
-            shouldAllowTelegramSession({ cfg, sessionId: session.ref.channelId }),
-        )
-        .slice(0, limit)
-        .map((session) => ({
-          channelId: session.ref.channelId,
-          kind: session.kind,
-          title: session.title,
-        }));
-    }
-    ensureDiscordClient(client);
-
-    const cfg = await this.getCfg();
+    const resolved = this.resolveAdapter(input.client, ctx);
+    const cfg =
+      resolved.platform === "discord" || resolved.platform === "telegram"
+        ? await this.getCfg()
+        : undefined;
     const limit = input.limit ?? Number.POSITIVE_INFINITY;
 
-    const sessions = await this.params.adapter.listSessions();
+    const sessions = adaptSurfaceOperationToToolHost(await resolved.adapter.listSessions());
     const out: Array<{
       channelId: string;
       guildId?: string;
@@ -1961,13 +1562,13 @@ export class Surface implements ServerTool {
     }> = [];
 
     for (const s of sessions) {
-      if (s.ref.platform !== "discord") continue;
-
       const channelId = s.ref.channelId;
-      const guildId = s.ref.guildId;
-      const parentChannelId = s.ref.parentChannelId;
+      const guildId = s.ref.platform === "discord" ? s.ref.guildId : undefined;
+      const parentChannelId = s.ref.platform === "discord" ? s.ref.parentChannelId : undefined;
 
       if (
+        s.ref.platform === "discord" &&
+        cfg &&
         !shouldAllowDiscordChannel({
           cfg,
           channelId,
@@ -1977,16 +1578,25 @@ export class Surface implements ServerTool {
         continue;
       }
 
+      if (s.ref.platform === "telegram" && cfg) {
+        const telegramSession = tryParseTelegramSessionId(channelId);
+        if (!telegramSession || !isTelegramChatAllowed({ cfg, chatId: telegramSession.chatId })) {
+          continue;
+        }
+      }
+
+      const alias =
+        resolved.platform === "discord" && cfg
+          ? bestEffortAliasForDiscordChannelId({ channelId, cfg })
+          : undefined;
+
       out.push({
         channelId,
-        guildId,
-        parentChannelId,
+        ...(guildId ? { guildId } : {}),
+        ...(parentChannelId ? { parentChannelId } : {}),
         kind: s.kind,
-        title: s.title,
-        alias: bestEffortAliasForDiscordChannelId({
-          channelId,
-          cfg,
-        }),
+        ...(s.title !== undefined ? { title: s.title } : {}),
+        ...(alias !== undefined ? { alias } : {}),
       });
 
       if (out.length >= limit) break;
@@ -1996,59 +1606,24 @@ export class Surface implements ServerTool {
   }
 
   private async callSessionsListParticipants(
-    rawInput: Record<string, unknown>,
+    decodedInput: z.output<typeof sessionsListParticipantsInputSchema>,
     ctx: RequestContext | undefined,
   ) {
-    const input = sessionsListParticipantsInputSchema.parse(withDefaultSessionId(rawInput, ctx));
-    const client = resolveClient({ inputClient: input.client, ctx });
-    if (client === "github") {
-      throw new Error(
-        "surface.sessions.listParticipants is not supported for GitHub. This callable is Discord-only.",
-      );
-    }
-    if (client === "telegram") {
-      throw new Error(
-        "surface.sessions.listParticipants is not supported for Telegram because the Bot API cannot enumerate arbitrary chat participants.",
-      );
-    }
-    ensureDiscordClient(client);
-
-    if (!hasSessionParticipantsProvider(this.params.adapter)) {
-      throw new Error(
-        "surface.sessions.listParticipants requires an adapter that supports listing session participants",
-      );
-    }
-
-    const cfg = await this.getCfg();
-
-    const channelId = resolveDiscordSessionId({
+    const resolved = this.resolveAdapter(decodedInput.client, ctx);
+    const input = withDefaultSessionId(decodedInput, ctx);
+    const target = await this.resolveSessionTarget({
+      resolved,
       sessionId: mustPresentString(input.sessionId, "sessionId"),
-      cfg,
     });
-
-    const guildId = await resolveGuildIdForChannel({
-      adapter: this.params.adapter,
-      channelId,
-    });
-
-    if (
-      !shouldAllowDiscordChannel({
-        cfg,
-        channelId,
-        guildId,
-      })
-    ) {
-      throw new Error(`Not allowed: channelId '${channelId}'`);
-    }
-
-    const sessionRef = asDiscordSessionRef(channelId, guildId ?? undefined);
-    const participants = await this.params.adapter.listSessionParticipants(sessionRef, {
-      limit: input.limit,
-    });
+    const participants = adaptSurfaceOperationToToolHost(
+      await target.resolved.adapter.listSessionParticipants(target.sessionRef, {
+        limit: input.limit,
+      }),
+    );
 
     return {
       meta: {
-        session: toSessionMeta(sessionRef, cfg),
+        session: toSessionMeta(target.sessionRef, target.cfg),
         source: participants.source,
         count: participants.participants.length,
       },
@@ -2057,149 +1632,60 @@ export class Surface implements ServerTool {
   }
 
   private async callMessagesList(
-    rawInput: Record<string, unknown>,
+    decodedInput: z.output<typeof messagesListInputSchema>,
     ctx: RequestContext | undefined,
   ) {
-    const input = messagesListInputSchema.parse(withDefaultSessionId(rawInput, ctx));
-    const client = resolveClient({ inputClient: input.client, ctx });
+    const resolved = this.resolveAdapter(decodedInput.client, ctx);
+    const input = withDefaultSessionId(decodedInput, ctx);
     const order: MessageListOrder = input.order ?? "ts_desc";
     const includeRaw = input.includeRaw ?? false;
     const includeAttachments = input.includeAttachments ?? false;
-
-    if (client === "github") {
-      const sessionId = mustPresentString(input.sessionId, "sessionId");
-      if (input.beforeMessageId || input.afterMessageId) {
-        throw new Error(
-          "surface.messages.list for GitHub does not support before/after cursors; use --limit only.",
-        );
-      }
-
-      const thread = parseGithubSessionId(sessionId);
-      const limit = input.limit ?? 50;
-      const comments = await this.gh().listIssueComments({
-        owner: thread.owner,
-        repo: thread.repo,
-        number: thread.number,
-        limit,
-      });
-
-      const sessionRef = asGithubSessionRef(sessionId);
-      const messages: SurfaceMessage[] = comments.map((c) => {
-        const login = c.user && typeof c.user.login === "string" ? c.user.login : undefined;
-        const id = c.user && typeof c.user.id === "number" ? c.user.id : null;
-
-        return {
-          ref: asGithubMsgRef(sessionId, String(c.id)),
-          session: sessionRef,
-          userId: id !== null ? String(id) : (login ?? "unknown"),
-          userName: login,
-          text: typeof c.body === "string" ? c.body : "",
-          ts: parseIsoMs(c.created_at),
-          editedTs: parseIsoMs(c.updated_at),
-          raw: {
-            htmlUrl: typeof c.html_url === "string" ? c.html_url : undefined,
-          },
-        };
-      });
-
-      return buildMessagesListOutput({
-        session: sessionRef,
-        messages,
-        order,
-        includeRaw,
-        includeAttachments,
-      });
-    }
-
-    if (client === "telegram") {
-      const cfg = await this.getCfg();
-      const sessionId = mustPresentString(input.sessionId, "sessionId");
-      if (
-        !shouldAllowTelegramSession({
-          cfg,
-          sessionId,
-          originSessionId: telegramOriginSessionId(ctx),
-        })
-      ) {
-        throw new Error(`Not allowed: Telegram sessionId '${sessionId}'`);
-      }
-      const sessionRef = asTelegramSessionRef(sessionId);
-      const messages = await this.adapterFor("telegram").listMsg(sessionRef, {
-        limit: input.limit ?? 50,
-        beforeMessageId: input.beforeMessageId,
-        afterMessageId: input.afterMessageId,
-      });
-      const filtered = messages.filter(
-        (message) =>
-          message.session.platform === "telegram" && message.session.channelId === sessionId,
-      );
-      return buildMessagesListOutput({
-        session: sessionRef,
-        messages: filtered,
-        order,
-        includeRaw,
-        includeAttachments,
-      });
-    }
-
-    ensureDiscordClient(client);
-
-    const cfg = await this.getCfg();
-
-    const channelId = resolveDiscordSessionId({
+    const target = await this.resolveSessionTarget({
+      resolved,
       sessionId: mustPresentString(input.sessionId, "sessionId"),
-      cfg,
     });
 
-    const guildId = await resolveGuildIdForChannel({
-      adapter: this.params.adapter,
-      channelId,
-    });
-    if (
-      !shouldAllowDiscordChannel({
-        cfg,
-        channelId,
-        guildId,
-      })
-    ) {
-      throw new Error(`Not allowed: channelId '${channelId}'`);
-    }
-
-    const sessionRef = asDiscordSessionRef(channelId, guildId ?? undefined);
-
-    if (hasCacheBurstProvider(this.params.adapter)) {
-      await this.params.adapter.burstCache({
-        sessionRef,
+    if (target.resolved.platform === "discord" && hasCacheBurstProvider(target.resolved.adapter)) {
+      await target.resolved.adapter.burstCache({
+        sessionRef: target.sessionRef,
         reason: "surface_tool",
       });
     }
 
     const limit = input.limit ?? 50;
-    const messages = await this.params.adapter.listMsg(sessionRef, {
-      limit,
-      beforeMessageId: input.beforeMessageId,
-      afterMessageId: input.afterMessageId,
-    });
+    const messages = adaptSurfaceOperationToToolHost(
+      await target.resolved.adapter.listMsg(target.sessionRef, {
+        limit,
+        beforeMessageId: input.beforeMessageId,
+        afterMessageId: input.afterMessageId,
+      }),
+    );
 
-    // Adapter store should only contain allowed messages, but keep tool-side filtering anyway.
-    const filtered = messages.filter((m) => {
-      if (m.session.platform !== "discord") return false;
-      return shouldAllowDiscordChannel({
-        cfg,
-        channelId: m.session.channelId,
-        guildId: m.session.guildId,
-      });
-    });
+    const discordCfg = target.resolved.platform === "discord" ? target.cfg : undefined;
+    const filtered = discordCfg
+      ? messages.filter(
+          (message) =>
+            message.session.platform === "discord" &&
+            shouldAllowDiscordChannel({
+              cfg: discordCfg,
+              channelId: message.session.channelId,
+              guildId: message.session.guildId,
+            }),
+        )
+      : messages;
 
-    const referencedByMessageKey = await resolveDiscordReferencedMessages({
-      adapter: this.params.adapter,
-      cfg,
-      messages: filtered,
-    });
+    const referencedByMessageKey =
+      target.resolved.platform === "discord" && discordCfg
+        ? await resolveDiscordReferencedMessages({
+            adapter: target.resolved.adapter,
+            cfg: discordCfg,
+            messages: filtered,
+          })
+        : undefined;
 
     return buildMessagesListOutput({
-      session: sessionRef,
-      cfg,
+      session: target.sessionRef,
+      cfg: target.cfg,
       messages: filtered,
       order,
       includeRaw,
@@ -2209,183 +1695,70 @@ export class Surface implements ServerTool {
   }
 
   private async callMessagesRead(
-    rawInput: Record<string, unknown>,
+    decodedInput: z.output<typeof messagesReadInputSchema>,
     ctx: RequestContext | undefined,
   ) {
-    const input = messagesReadInputSchema.parse(
-      withDefaultMessageId(withDefaultSessionId(rawInput, ctx), ctx),
-    );
-    const client = resolveClient({ inputClient: input.client, ctx });
+    const resolved = this.resolveAdapter(decodedInput.client, ctx);
+    const input = withDefaultMessageId(withDefaultSessionId(decodedInput, ctx), ctx);
     const includeRaw = input.includeRaw ?? false;
-
-    if (client === "github") {
-      const sessionId = mustPresentString(input.sessionId, "sessionId");
-      const messageId = mustPresentString(input.messageId, "messageId");
-      const thread = parseGithubSessionId(sessionId);
-      const sessionRef = asGithubSessionRef(sessionId);
-
-      if (isGithubIssueTriggerId({ sessionId, triggerId: messageId })) {
-        const issue = await this.gh().getIssue({
-          owner: thread.owner,
-          repo: thread.repo,
-          number: thread.number,
-        });
-
-        const login =
-          issue.user && typeof issue.user.login === "string" ? issue.user.login : undefined;
-        const id = issue.user && typeof issue.user.id === "number" ? issue.user.id : null;
-
-        const message: SurfaceMessage = {
-          ref: asGithubMsgRef(sessionId, String(thread.number)),
-          session: sessionRef,
-          userId: id !== null ? String(id) : (login ?? "unknown"),
-          userName: login,
-          text: `Title: ${issue.title}\n\n${issue.body ?? ""}`.trim(),
-          ts: parseIsoMs(issue.created_at),
-          editedTs: parseIsoMs(issue.updated_at),
-          raw: {
-            title: issue.title,
-            htmlUrl: typeof issue.html_url === "string" ? issue.html_url : undefined,
-          },
-        };
-
-        return buildMessagesReadOutput({
-          session: sessionRef,
-          message,
-          includeRaw,
-        });
-      }
-
-      const commentId = Number(messageId);
-      if (!Number.isFinite(commentId) || commentId <= 0) {
-        throw new Error(`Invalid GitHub commentId '${messageId}'`);
-      }
-
-      const c = await this.gh().getIssueComment({
-        owner: thread.owner,
-        repo: thread.repo,
-        commentId,
-      });
-
-      const login = c.user && typeof c.user.login === "string" ? c.user.login : undefined;
-      const id = c.user && typeof c.user.id === "number" ? c.user.id : null;
-
-      const message: SurfaceMessage = {
-        ref: asGithubMsgRef(sessionId, String(c.id)),
-        session: sessionRef,
-        userId: id !== null ? String(id) : (login ?? "unknown"),
-        userName: login,
-        text: typeof c.body === "string" ? c.body : "",
-        ts: parseIsoMs(c.created_at),
-        editedTs: parseIsoMs(c.updated_at),
-        raw: {
-          htmlUrl: typeof c.html_url === "string" ? c.html_url : undefined,
-        },
-      };
-
-      return buildMessagesReadOutput({
-        session: sessionRef,
-        message,
-        includeRaw,
-      });
-    }
-
-    if (client === "telegram") {
-      const cfg = await this.getCfg();
-      const sessionId = mustPresentString(input.sessionId, "sessionId");
-      if (
-        !shouldAllowTelegramSession({
-          cfg,
-          sessionId,
-          originSessionId: telegramOriginSessionId(ctx),
-        })
-      ) {
-        throw new Error(`Not allowed: Telegram sessionId '${sessionId}'`);
-      }
-      const sessionRef = asTelegramSessionRef(sessionId);
-      const message = await this.adapterFor("telegram").readMsg(
-        asTelegramMsgRef(sessionId, mustPresentString(input.messageId, "messageId")),
-      );
-      return buildMessagesReadOutput({
-        session: sessionRef,
-        message:
-          message?.session.platform === "telegram" && message.session.channelId === sessionId
-            ? message
-            : null,
-        includeRaw,
-      });
-    }
-
-    ensureDiscordClient(client);
-
-    const cfg = await this.getCfg();
-
-    const channelId = resolveDiscordSessionId({
+    const target = await this.resolveSessionTarget({
+      resolved,
       sessionId: mustPresentString(input.sessionId, "sessionId"),
-      cfg,
     });
+    const msgRef = createSurfaceMessageRef(
+      target.sessionRef,
+      mustPresentString(input.messageId, "messageId"),
+    );
 
-    const guildId = await resolveGuildIdForChannel({
-      adapter: this.params.adapter,
-      channelId,
-    });
-    if (
-      !shouldAllowDiscordChannel({
-        cfg,
-        channelId,
-        guildId,
-      })
-    ) {
-      throw new Error(`Not allowed: channelId '${channelId}'`);
-    }
-
-    const msgRef = asDiscordMsgRef(channelId, mustPresentString(input.messageId, "messageId"));
-    const sessionRef = asDiscordSessionRef(channelId, guildId ?? undefined);
-
-    if (hasCacheBurstProvider(this.params.adapter)) {
-      await this.params.adapter.burstCache({
+    if (target.resolved.platform === "discord" && hasCacheBurstProvider(target.resolved.adapter)) {
+      await target.resolved.adapter.burstCache({
         msgRef,
-        sessionRef,
+        sessionRef: target.sessionRef,
         reason: "surface_tool",
       });
     }
 
-    const msg = await this.params.adapter.readMsg(msgRef);
+    const msg = adaptSurfaceOperationToToolHost(await target.resolved.adapter.readMsg(msgRef));
 
     if (!msg) {
       return buildMessagesReadOutput({
-        session: sessionRef,
-        cfg,
+        session: target.sessionRef,
+        cfg: target.cfg,
         message: null,
         includeRaw,
       });
     }
 
     if (
-      msg.session.platform !== "discord" ||
-      !shouldAllowDiscordChannel({
-        cfg,
-        channelId: msg.session.channelId,
-        guildId: msg.session.guildId,
-      })
+      target.resolved.platform === "discord" &&
+      target.cfg &&
+      (msg.session.platform !== "discord" ||
+        !shouldAllowDiscordChannel({
+          cfg: target.cfg,
+          channelId: msg.session.channelId,
+          guildId: msg.session.guildId,
+        }))
     ) {
       return buildMessagesReadOutput({
-        session: sessionRef,
-        cfg,
+        session: target.sessionRef,
+        cfg: target.cfg,
         message: null,
         includeRaw,
       });
     }
 
-    const referenced = await resolveDiscordReferencedMessage({
-      adapter: this.params.adapter,
-      cfg,
-      message: msg,
-    });
+    const referenced =
+      target.resolved.platform === "discord" && target.cfg
+        ? await resolveDiscordReferencedMessage({
+            adapter: target.resolved.adapter,
+            cfg: target.cfg,
+            message: msg,
+          })
+        : undefined;
 
     return buildMessagesReadOutput({
-      session: sessionRef,
-      cfg,
+      session: target.sessionRef,
+      cfg: target.cfg,
       message: msg,
       referenced,
       includeRaw,
@@ -2393,62 +1766,40 @@ export class Surface implements ServerTool {
   }
 
   private async callMessagesSearch(
-    rawInput: Record<string, unknown>,
+    decodedInput: z.output<typeof messagesSearchInputSchema>,
     ctx: RequestContext | undefined,
   ) {
-    const input = messagesSearchInputSchema.parse(withDefaultSessionId(rawInput, ctx));
-    const client = resolveClient({ inputClient: input.client, ctx });
+    const resolved = this.resolveAdapter(decodedInput.client, ctx);
+    const input = withDefaultSessionId(decodedInput, ctx);
+    const target = await this.resolveSessionTarget({
+      resolved,
+      sessionId: mustPresentString(input.sessionId, "sessionId"),
+    });
 
-    if (client === "github") {
-      throw new Error("surface.messages.search for GitHub is not supported yet.");
+    if (
+      target.resolved.platform !== "discord" ||
+      target.sessionRef.platform !== "discord" ||
+      !target.cfg
+    ) {
+      signalSurfaceFailureToToolHost(
+        "surface.messages.search is a Discord-owned sidecar and is unavailable for GitHub; use discovery.search for shared memory retrieval.",
+      );
     }
-
-    if (client === "telegram") {
-      throw new Error("surface.messages.search for Telegram is not supported yet.");
-    }
-
-    ensureDiscordClient(client);
 
     const search = this.params.discordSearch;
     if (!search) {
-      throw new Error(
+      signalSurfaceFailureToToolHost(
         "surface.messages.search is unavailable: Discord search index is not initialized.",
       );
     }
 
-    const cfg = await this.getCfg();
-
-    const channelId = resolveDiscordSessionId({
-      sessionId: mustPresentString(input.sessionId, "sessionId"),
-      cfg,
-    });
-
-    const guildId = await resolveGuildIdForChannel({
-      adapter: this.params.adapter,
-      channelId,
-    });
-    if (
-      !shouldAllowDiscordChannel({
-        cfg,
-        channelId,
-        guildId,
-      })
-    ) {
-      throw new Error(`Not allowed: channelId '${channelId}'`);
-    }
-
-    const sessionRef = asDiscordSessionRef(channelId, guildId ?? undefined);
-    if (sessionRef.platform !== "discord") {
-      throw new Error("surface.messages.search internal error");
-    }
-
     const result = await search.searchSession({
-      sessionRef,
+      sessionRef: target.sessionRef,
       query: input.query,
       limit: input.limit,
     });
 
-    const userAliasById = buildDiscordUserAliasById(cfg);
+    const userAliasById = buildDiscordUserAliasById(target.cfg);
     const baseHits = result.hits.map((hit) => ({
       ...hit,
       userAlias: userAliasById.get(hit.userId),
@@ -2468,10 +1819,12 @@ export class Surface implements ServerTool {
     await Promise.all(
       hits.map(async (hit) => {
         try {
-          const msg = await this.params.adapter.readMsg(hit.ref);
+          const read = await target.resolved.adapter.readMsg(hit.ref);
+          const msg = read.match({ ok: (value) => value, err: () => null });
           const attachments = msg ? getMessageAttachmentMeta(msg) : [];
           attachmentHintsByMessageId.set(hit.ref.messageId, buildAttachmentHints(attachments));
-        } catch {
+        } catch (cause) {
+          if (Panic.is(cause)) throw cause;
           attachmentHintsByMessageId.set(hit.ref.messageId, buildAttachmentHints([]));
         }
       }),
@@ -2479,7 +1832,7 @@ export class Surface implements ServerTool {
 
     return {
       meta: {
-        session: toSessionMeta(sessionRef, cfg),
+        session: toSessionMeta(target.sessionRef, target.cfg),
         order,
         count: hits.length,
       },
@@ -2500,114 +1853,37 @@ export class Surface implements ServerTool {
   }
 
   private async callMessagesSend(
-    rawInput: Record<string, unknown>,
+    decodedInput: z.output<typeof messagesSendInputSchema>,
     ctx: RequestContext | undefined,
   ) {
-    const input = messagesSendInputSchema.parse(withDefaultSessionId(rawInput, ctx));
-    const client = resolveClient({ inputClient: input.client, ctx });
-
-    if (client === "github") {
-      const sessionId = mustPresentString(input.sessionId, "sessionId");
-      const thread = parseGithubSessionId(sessionId);
-      const sessionRef = asGithubSessionRef(sessionId);
-
-      if (input.replyToMessageId) {
-        throw new Error(
-          "surface.messages.send for GitHub does not support replyToMessageId; post a normal comment and link the target instead.",
-        );
-      }
-
-      const paths = input.paths ?? [];
-      if (paths.length > 0) {
-        throw new Error(
-          "surface.messages.send for GitHub does not support attachments; use gh or upload elsewhere and link.",
-        );
-      }
-
-      const res = await this.gh().createIssueComment({
-        owner: thread.owner,
-        repo: thread.repo,
-        issueNumber: thread.number,
-        body: markGithubAgentComment(input.text),
-      });
-
-      const ref = asGithubMsgRef(sessionId, String(res.id));
-      this.linkSentMessageToTranscript(ref, ctx);
-      return { ok: true as const, ref, session: toSessionMeta(sessionRef) };
-    }
-
-    if (client === "telegram") {
-      const cfg = await this.getCfg();
-      const sessionId = mustPresentString(input.sessionId, "sessionId");
-      if (
-        !shouldAllowTelegramSession({
-          cfg,
-          sessionId,
-          originSessionId: telegramOriginSessionId(ctx),
-        })
-      ) {
-        throw new Error(`Not allowed: Telegram sessionId '${sessionId}'`);
-      }
-      if ((input.paths ?? []).length > 0) {
-        throw new Error(
-          "surface.messages.send for Telegram does not support local file attachments yet.",
-        );
-      }
-      const sessionRef = asTelegramSessionRef(sessionId);
-      const replyTo = input.replyToMessageId
-        ? asTelegramMsgRef(sessionId, input.replyToMessageId)
-        : undefined;
-      const ref = await this.adapterFor("telegram").sendMsg(
-        sessionRef,
-        { text: input.text },
-        replyTo || input.silent === true
-          ? {
-              ...(replyTo ? { replyTo } : {}),
-              ...(input.silent === true ? { silent: true } : {}),
-            }
-          : undefined,
-      );
-      this.linkSentMessageToTranscript(ref, ctx);
-      return { ok: true as const, ref, session: toSessionMeta(sessionRef) };
-    }
-
-    ensureDiscordClient(client);
-
-    const cfg = await this.getCfg();
-
-    const channelId = resolveDiscordSessionId({
+    const resolved = this.resolveAdapter(decodedInput.client, ctx);
+    const input = withDefaultSessionId(decodedInput, ctx);
+    const target = await this.resolveSessionTarget({
+      resolved,
       sessionId: mustPresentString(input.sessionId, "sessionId"),
-      cfg,
     });
-
-    const guildId = await resolveGuildIdForChannel({
-      adapter: this.params.adapter,
-      channelId,
-    });
-    if (
-      !shouldAllowDiscordChannel({
-        cfg,
-        channelId,
-        guildId,
-      })
-    ) {
-      throw new Error(`Not allowed: channelId '${channelId}'`);
-    }
-
-    const sessionRef = asDiscordSessionRef(channelId, guildId ?? undefined);
 
     const replyTo = input.replyToMessageId
-      ? asDiscordMsgRef(channelId, input.replyToMessageId)
+      ? createSurfaceMessageRef(target.sessionRef, input.replyToMessageId)
       : undefined;
 
-    const cwd = ctx?.cwd ?? process.cwd();
-
     const paths = input.paths ?? [];
-    if (paths.length > 0) {
-      if (paths.length > 10) {
-        throw new Error(`Too many attachments (${paths.length}). Max is 10 per message.`);
-      }
-    }
+    const sendOpts =
+      replyTo || input.silent === true
+        ? {
+            ...(replyTo ? { replyTo } : {}),
+            ...(input.silent === true ? { silent: true } : {}),
+          }
+        : undefined;
+    adaptSurfaceOperationToToolHost(
+      await target.resolved.adapter.prepareSendMsg(
+        target.sessionRef,
+        { text: input.text, attachmentCount: paths.length, actionCount: 0 },
+        sendOpts,
+      ),
+    );
+
+    const cwd = ctx?.cwd ?? process.cwd();
 
     const attachments =
       paths.length > 0
@@ -2620,254 +1896,78 @@ export class Surface implements ServerTool {
           })
         : [];
 
-    const ref = await this.params.adapter.sendMsg(
-      sessionRef,
-      {
-        text: input.text,
-        attachments,
-      },
-      replyTo || input.silent === true
-        ? {
-            ...(replyTo ? { replyTo } : {}),
-            ...(input.silent === true ? { silent: true } : {}),
-          }
-        : undefined,
+    const ref = adaptSurfaceOperationToToolHost(
+      await target.resolved.adapter.sendMsg(
+        target.sessionRef,
+        {
+          text: input.text,
+          attachments,
+        },
+        sendOpts,
+      ),
     );
 
     this.linkSentMessageToTranscript(ref, ctx);
 
-    return { ok: true as const, ref, session: toSessionMeta(sessionRef, cfg) };
+    return { ok: true as const, ref, session: toSessionMeta(target.sessionRef, target.cfg) };
   }
 
   private async callMessagesEdit(
-    rawInput: Record<string, unknown>,
+    decodedInput: z.output<typeof messagesEditInputSchema>,
     ctx: RequestContext | undefined,
   ) {
-    const input = messagesEditInputSchema.parse(withDefaultSessionId(rawInput, ctx));
-    const client = resolveClient({ inputClient: input.client, ctx });
-
-    if (client === "github") {
-      const sessionId = mustPresentString(input.sessionId, "sessionId");
-      const thread = parseGithubSessionId(sessionId);
-
-      if (isGithubIssueTriggerId({ sessionId, triggerId: input.messageId })) {
-        throw new Error(
-          "Editing the GitHub issue/PR body is not supported via surface.messages.edit. Use gh issue edit / gh pr edit.",
-        );
-      }
-
-      const commentId = Number(input.messageId);
-      if (!Number.isFinite(commentId) || commentId <= 0) {
-        throw new Error(`Invalid GitHub commentId '${input.messageId}'`);
-      }
-
-      await this.gh().editIssueComment({
-        owner: thread.owner,
-        repo: thread.repo,
-        commentId,
-        body: input.text,
-      });
-
-      return { ok: true as const };
-    }
-
-    if (client === "telegram") {
-      const cfg = await this.getCfg();
-      const sessionId = mustPresentString(input.sessionId, "sessionId");
-      if (
-        !shouldAllowTelegramSession({
-          cfg,
-          sessionId,
-          originSessionId: telegramOriginSessionId(ctx),
-        })
-      ) {
-        throw new Error(`Not allowed: Telegram sessionId '${sessionId}'`);
-      }
-      await this.adapterFor("telegram").editMsg(asTelegramMsgRef(sessionId, input.messageId), {
-        text: input.text,
-      });
-      return { ok: true as const };
-    }
-
-    ensureDiscordClient(client);
-
-    const cfg = await this.getCfg();
-
-    const channelId = resolveDiscordSessionId({
+    const resolved = this.resolveAdapter(decodedInput.client, ctx);
+    const input = withDefaultSessionId(decodedInput, ctx);
+    const target = await this.resolveSessionTarget({
+      resolved,
       sessionId: mustPresentString(input.sessionId, "sessionId"),
-      cfg,
     });
 
-    const guildId = await resolveGuildIdForChannel({
-      adapter: this.params.adapter,
-      channelId,
-    });
-    if (
-      !shouldAllowDiscordChannel({
-        cfg,
-        channelId,
-        guildId,
-      })
-    ) {
-      throw new Error(`Not allowed: channelId '${channelId}'`);
-    }
-
-    await this.params.adapter.editMsg(asDiscordMsgRef(channelId, input.messageId), {
-      text: input.text,
-    });
+    adaptSurfaceOperationToToolHost(
+      await target.resolved.adapter.editMsg(
+        createSurfaceMessageRef(target.sessionRef, input.messageId),
+        { text: input.text },
+      ),
+    );
 
     return { ok: true as const };
   }
 
   private async callMessagesDelete(
-    rawInput: Record<string, unknown>,
+    decodedInput: z.output<typeof messagesDeleteInputSchema>,
     ctx: RequestContext | undefined,
   ) {
-    const input = messagesDeleteInputSchema.parse(withDefaultSessionId(rawInput, ctx));
-    const client = resolveClient({ inputClient: input.client, ctx });
-
-    if (client === "github") {
-      const sessionId = mustPresentString(input.sessionId, "sessionId");
-      const thread = parseGithubSessionId(sessionId);
-
-      if (isGithubIssueTriggerId({ sessionId, triggerId: input.messageId })) {
-        throw new Error(
-          "Deleting the GitHub issue/PR body is not supported via surface.messages.delete. Use gh issue delete / gh pr (if applicable).",
-        );
-      }
-
-      const commentId = Number(input.messageId);
-      if (!Number.isFinite(commentId) || commentId <= 0) {
-        throw new Error(`Invalid GitHub commentId '${input.messageId}'`);
-      }
-
-      await this.gh().deleteIssueComment({
-        owner: thread.owner,
-        repo: thread.repo,
-        commentId,
-      });
-
-      return { ok: true as const };
-    }
-
-    if (client === "telegram") {
-      const cfg = await this.getCfg();
-      const sessionId = mustPresentString(input.sessionId, "sessionId");
-      if (
-        !shouldAllowTelegramSession({
-          cfg,
-          sessionId,
-          originSessionId: telegramOriginSessionId(ctx),
-        })
-      ) {
-        throw new Error(`Not allowed: Telegram sessionId '${sessionId}'`);
-      }
-      await this.adapterFor("telegram").deleteMsg(asTelegramMsgRef(sessionId, input.messageId));
-      return { ok: true as const };
-    }
-
-    ensureDiscordClient(client);
-
-    const cfg = await this.getCfg();
-
-    const channelId = resolveDiscordSessionId({
+    const resolved = this.resolveAdapter(decodedInput.client, ctx);
+    const input = withDefaultSessionId(decodedInput, ctx);
+    const target = await this.resolveSessionTarget({
+      resolved,
       sessionId: mustPresentString(input.sessionId, "sessionId"),
-      cfg,
     });
 
-    const guildId = await resolveGuildIdForChannel({
-      adapter: this.params.adapter,
-      channelId,
-    });
-    if (
-      !shouldAllowDiscordChannel({
-        cfg,
-        channelId,
-        guildId,
-      })
-    ) {
-      throw new Error(`Not allowed: channelId '${channelId}'`);
-    }
-
-    await this.params.adapter.deleteMsg(asDiscordMsgRef(channelId, input.messageId));
+    adaptSurfaceOperationToToolHost(
+      await target.resolved.adapter.deleteMsg(
+        createSurfaceMessageRef(target.sessionRef, input.messageId),
+      ),
+    );
     return { ok: true as const };
   }
 
   private async callReactionsList(
-    rawInput: Record<string, unknown>,
+    decodedInput: z.output<typeof reactionsListInputSchema>,
     ctx: RequestContext | undefined,
   ) {
-    const input = reactionsListInputSchema.parse(
-      withDefaultMessageId(withDefaultSessionId(rawInput, ctx), ctx),
-    );
-    const client = resolveClient({ inputClient: input.client, ctx });
-
-    if (client === "github") {
-      const sessionId = mustPresentString(input.sessionId, "sessionId");
-      const messageId = mustPresentString(input.messageId, "messageId");
-      const thread = parseGithubSessionId(sessionId);
-
-      const reactions = await this.listGithubReactions({
-        thread,
-        sessionId,
-        messageId,
-      });
-
-      const counts = new Map<string, number>();
-      for (const r of reactions) {
-        counts.set(r.content, (counts.get(r.content) ?? 0) + 1);
-      }
-
-      return Array.from(counts.entries()).map(([content, count]) => ({
-        emoji: githubReactionEmojiFromContent(content),
-        count,
-      }));
-    }
-
-    if (client === "telegram") {
-      throw new Error(
-        "surface.reactions.list is not supported for Telegram because the Bot API has no reaction query endpoint.",
-      );
-    }
-
-    ensureDiscordClient(client);
-
-    const cfg = await this.getCfg();
-
-    const channelId = resolveDiscordSessionId({
+    const resolved = this.resolveAdapter(decodedInput.client, ctx);
+    const input = withDefaultMessageId(withDefaultSessionId(decodedInput, ctx), ctx);
+    const target = await this.resolveMessageTarget({
+      resolved,
       sessionId: mustPresentString(input.sessionId, "sessionId"),
-      cfg,
+      messageId: mustPresentString(input.messageId, "messageId"),
+      burstDiscordCache: true,
     });
 
-    const guildId = await resolveGuildIdForChannel({
-      adapter: this.params.adapter,
-      channelId,
-    });
-    if (
-      !shouldAllowDiscordChannel({
-        cfg,
-        channelId,
-        guildId,
-      })
-    ) {
-      throw new Error(`Not allowed: channelId '${channelId}'`);
-    }
-
-    if (!hasReactionDetailsProvider(this.params.adapter)) {
-      throw new Error("surface.reactions.list requires an adapter that supports reaction details");
-    }
-
-    const msgRef = asDiscordMsgRef(channelId, mustPresentString(input.messageId, "messageId"));
-
-    if (hasCacheBurstProvider(this.params.adapter)) {
-      await this.params.adapter.burstCache({
-        msgRef,
-        sessionRef: asDiscordSessionRef(channelId, guildId ?? undefined),
-        reason: "surface_tool",
-      });
-    }
-
-    const details = await this.params.adapter.listReactionDetails(msgRef);
+    const details = adaptSurfaceOperationToToolHost(
+      await target.resolved.adapter.listReactionDetails(target.msgRef),
+    );
 
     const out: SurfaceReactionSummary[] = details.map((d) => ({
       emoji: d.emoji,
@@ -2878,297 +1978,56 @@ export class Surface implements ServerTool {
   }
 
   private async callReactionsListDetailed(
-    rawInput: Record<string, unknown>,
+    decodedInput: z.output<typeof reactionsListDetailedInputSchema>,
     ctx: RequestContext | undefined,
   ) {
-    const input = reactionsListDetailedInputSchema.parse(
-      withDefaultMessageId(withDefaultSessionId(rawInput, ctx), ctx),
-    );
-    const client = resolveClient({ inputClient: input.client, ctx });
-
-    if (client === "github") {
-      const sessionId = mustPresentString(input.sessionId, "sessionId");
-      const messageId = mustPresentString(input.messageId, "messageId");
-      const thread = parseGithubSessionId(sessionId);
-
-      const reactions = await this.listGithubReactions({
-        thread,
-        sessionId,
-        messageId,
-      });
-
-      const byContent = new Map<
-        string,
-        { count: number; users: Array<{ userId: string; userName?: string }> }
-      >();
-
-      for (const r of reactions) {
-        const entry = byContent.get(r.content) ?? { count: 0, users: [] };
-        entry.count += 1;
-
-        const login = r.user && typeof r.user.login === "string" ? r.user.login : undefined;
-        const id = r.user && typeof r.user.id === "number" ? r.user.id : null;
-
-        if (login || id !== null) {
-          const userId = id !== null ? String(id) : login!;
-          if (!entry.users.some((u) => u.userId === userId)) {
-            entry.users.push({ userId, userName: login });
-          }
-        }
-
-        byContent.set(r.content, entry);
-      }
-
-      const out: SurfaceReactionDetail[] = Array.from(byContent.entries()).map(([content, v]) => ({
-        emoji: githubReactionEmojiFromContent(content),
-        count: v.count,
-        users: v.users,
-      }));
-
-      return out;
-    }
-
-    if (client === "telegram") {
-      throw new Error(
-        "surface.reactions.listDetailed is not supported for Telegram because the Bot API has no reaction query endpoint.",
-      );
-    }
-
-    ensureDiscordClient(client);
-
-    const cfg = await this.getCfg();
-
-    const channelId = resolveDiscordSessionId({
+    const resolved = this.resolveAdapter(decodedInput.client, ctx);
+    const input = withDefaultMessageId(withDefaultSessionId(decodedInput, ctx), ctx);
+    const target = await this.resolveMessageTarget({
+      resolved,
       sessionId: mustPresentString(input.sessionId, "sessionId"),
-      cfg,
+      messageId: mustPresentString(input.messageId, "messageId"),
+      burstDiscordCache: true,
     });
 
-    const guildId = await resolveGuildIdForChannel({
-      adapter: this.params.adapter,
-      channelId,
-    });
-    if (
-      !shouldAllowDiscordChannel({
-        cfg,
-        channelId,
-        guildId,
-      })
-    ) {
-      throw new Error(`Not allowed: channelId '${channelId}'`);
-    }
-
-    if (!hasReactionDetailsProvider(this.params.adapter)) {
-      throw new Error("surface.reactions.listDetailed is not supported by the current adapter");
-    }
-
-    const msgRef = asDiscordMsgRef(channelId, mustPresentString(input.messageId, "messageId"));
-
-    if (hasCacheBurstProvider(this.params.adapter)) {
-      await this.params.adapter.burstCache({
-        msgRef,
-        sessionRef: asDiscordSessionRef(channelId, guildId ?? undefined),
-        reason: "surface_tool",
-      });
-    }
-
-    return await this.params.adapter.listReactionDetails(msgRef);
+    return adaptSurfaceOperationToToolHost(
+      await target.resolved.adapter.listReactionDetails(target.msgRef),
+    );
   }
 
   private async callReactionsAdd(
-    rawInput: Record<string, unknown>,
+    decodedInput: z.output<typeof reactionsAddInputSchema>,
     ctx: RequestContext | undefined,
   ) {
-    const input = reactionsAddInputSchema.parse(
-      withDefaultMessageId(withDefaultSessionId(rawInput, ctx), ctx),
-    );
-    const client = resolveClient({ inputClient: input.client, ctx });
-
-    if (client === "github") {
-      const sessionId = mustPresentString(input.sessionId, "sessionId");
-      const messageId = mustPresentString(input.messageId, "messageId");
-      const thread = parseGithubSessionId(sessionId);
-      const content = githubReactionContentFromInput(input.reaction);
-
-      if (isGithubIssueTriggerId({ sessionId, triggerId: messageId })) {
-        await this.gh().createIssueReaction({
-          owner: thread.owner,
-          repo: thread.repo,
-          issueNumber: thread.number,
-          content,
-        });
-      } else {
-        const commentId = Number(messageId);
-        if (!Number.isFinite(commentId) || commentId <= 0) {
-          throw new Error(`Invalid GitHub commentId '${messageId}'`);
-        }
-        await this.gh().createIssueCommentReaction({
-          owner: thread.owner,
-          repo: thread.repo,
-          commentId,
-          content,
-        });
-      }
-
-      return { ok: true as const };
-    }
-
-    if (client === "telegram") {
-      const cfg = await this.getCfg();
-      const sessionId = mustPresentString(input.sessionId, "sessionId");
-      if (
-        !shouldAllowTelegramSession({
-          cfg,
-          sessionId,
-          originSessionId: telegramOriginSessionId(ctx),
-        })
-      ) {
-        throw new Error(`Not allowed: Telegram sessionId '${sessionId}'`);
-      }
-      await this.adapterFor("telegram").addReaction(
-        asTelegramMsgRef(sessionId, mustPresentString(input.messageId, "messageId")),
-        input.reaction,
-      );
-      return { ok: true as const };
-    }
-
-    ensureDiscordClient(client);
-
-    const cfg = await this.getCfg();
-
-    const channelId = resolveDiscordSessionId({
+    const resolved = this.resolveAdapter(decodedInput.client, ctx);
+    const input = withDefaultMessageId(withDefaultSessionId(decodedInput, ctx), ctx);
+    const target = await this.resolveMessageTarget({
+      resolved,
       sessionId: mustPresentString(input.sessionId, "sessionId"),
-      cfg,
+      messageId: mustPresentString(input.messageId, "messageId"),
     });
 
-    const guildId = await resolveGuildIdForChannel({
-      adapter: this.params.adapter,
-      channelId,
-    });
-    if (
-      !shouldAllowDiscordChannel({
-        cfg,
-        channelId,
-        guildId,
-      })
-    ) {
-      throw new Error(`Not allowed: channelId '${channelId}'`);
-    }
-
-    await this.params.adapter.addReaction(
-      asDiscordMsgRef(channelId, mustPresentString(input.messageId, "messageId")),
-      input.reaction,
+    adaptSurfaceOperationToToolHost(
+      await target.resolved.adapter.addReaction(target.msgRef, input.reaction),
     );
 
     return { ok: true as const };
   }
 
   private async callReactionsRemove(
-    rawInput: Record<string, unknown>,
+    decodedInput: z.output<typeof reactionsRemoveInputSchema>,
     ctx: RequestContext | undefined,
   ) {
-    const input = reactionsRemoveInputSchema.parse(
-      withDefaultMessageId(withDefaultSessionId(rawInput, ctx), ctx),
-    );
-    const client = resolveClient({ inputClient: input.client, ctx });
-
-    if (client === "github") {
-      const sessionId = mustPresentString(input.sessionId, "sessionId");
-      const messageId = mustPresentString(input.messageId, "messageId");
-      const thread = parseGithubSessionId(sessionId);
-      const content = githubReactionContentFromInput(input.reaction);
-
-      const resolveActorLogin = this.gh().getPreferredGithubActorLoginOrNull;
-      let actorLogin = resolveActorLogin ? await resolveActorLogin() : null;
-      if (!actorLogin) {
-        const slug = await this.gh().getGithubAppSlugOrNull();
-        actorLogin = slug ? `${slug}[bot]` : null;
-      }
-      if (!actorLogin) {
-        throw new Error(
-          "Unable to resolve the outbound GitHub actor login (required to remove reactions safely). Use gh to remove the reaction instead.",
-        );
-      }
-
-      const reactions = await this.listGithubReactions({
-        thread,
-        sessionId,
-        messageId,
-      });
-
-      const mine = reactions.filter((r) => r.content === content && r.user?.login === actorLogin);
-
-      if (isGithubIssueTriggerId({ sessionId, triggerId: messageId })) {
-        for (const r of mine) {
-          await this.gh().deleteIssueReactionById({
-            owner: thread.owner,
-            repo: thread.repo,
-            issueNumber: thread.number,
-            reactionId: r.id,
-          });
-        }
-      } else {
-        const commentId = Number(messageId);
-        if (!Number.isFinite(commentId) || commentId <= 0) {
-          throw new Error(`Invalid GitHub commentId '${messageId}'`);
-        }
-        for (const r of mine) {
-          await this.gh().deleteIssueCommentReactionById({
-            owner: thread.owner,
-            repo: thread.repo,
-            commentId,
-            reactionId: r.id,
-          });
-        }
-      }
-
-      return { ok: true as const };
-    }
-
-    if (client === "telegram") {
-      const cfg = await this.getCfg();
-      const sessionId = mustPresentString(input.sessionId, "sessionId");
-      if (
-        !shouldAllowTelegramSession({
-          cfg,
-          sessionId,
-          originSessionId: telegramOriginSessionId(ctx),
-        })
-      ) {
-        throw new Error(`Not allowed: Telegram sessionId '${sessionId}'`);
-      }
-      await this.adapterFor("telegram").removeReaction(
-        asTelegramMsgRef(sessionId, mustPresentString(input.messageId, "messageId")),
-        input.reaction,
-      );
-      return { ok: true as const };
-    }
-
-    ensureDiscordClient(client);
-
-    const cfg = await this.getCfg();
-
-    const channelId = resolveDiscordSessionId({
+    const resolved = this.resolveAdapter(decodedInput.client, ctx);
+    const input = withDefaultMessageId(withDefaultSessionId(decodedInput, ctx), ctx);
+    const target = await this.resolveMessageTarget({
+      resolved,
       sessionId: mustPresentString(input.sessionId, "sessionId"),
-      cfg,
+      messageId: mustPresentString(input.messageId, "messageId"),
     });
 
-    const guildId = await resolveGuildIdForChannel({
-      adapter: this.params.adapter,
-      channelId,
-    });
-    if (
-      !shouldAllowDiscordChannel({
-        cfg,
-        channelId,
-        guildId,
-      })
-    ) {
-      throw new Error(`Not allowed: channelId '${channelId}'`);
-    }
-
-    await this.params.adapter.removeReaction(
-      asDiscordMsgRef(channelId, mustPresentString(input.messageId, "messageId")),
-      input.reaction,
+    adaptSurfaceOperationToToolHost(
+      await target.resolved.adapter.removeReaction(target.msgRef, input.reaction),
     );
 
     return { ok: true as const };

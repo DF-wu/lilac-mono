@@ -5,22 +5,26 @@ import { join } from "node:path";
 import {
   createLilacBus,
   type FetchOptions,
-  type HandleContext,
   type Message,
   type PublishOptions,
   type RawBus,
   type SubscriptionOptions,
 } from "@stanley2058/lilac-event-bus";
+import {
+  subscribeForTest,
+  type TestRawMessageHandler,
+  type TestRawSubscriptionHost,
+} from "./helpers/result-raw-bus";
 import type { RequestContext } from "../src/tool-server/types";
 import { Attachment } from "../src/tool-server/tools/attachment";
 import { resolveRestrictedSessionTmpDir } from "../src/shared/attachment-utils";
 
-function createInMemoryRawBus(): RawBus {
+function createInMemoryRawBus(): RawBus & TestRawSubscriptionHost {
   const topics = new Map<string, Array<Message<unknown>>>();
   const subs = new Set<{
     topic: string;
     opts: SubscriptionOptions;
-    handler: (msg: Message<unknown>, ctx: HandleContext) => Promise<void>;
+    handler: TestRawMessageHandler;
   }>();
 
   return {
@@ -33,7 +37,7 @@ function createInMemoryRawBus(): RawBus {
         ts: Date.now(),
         key: opts.key,
         headers: opts.headers,
-        data: msg.data as unknown,
+        data: msg.data,
       };
 
       const list = topics.get(opts.topic) ?? [];
@@ -42,31 +46,25 @@ function createInMemoryRawBus(): RawBus {
 
       for (const s of subs) {
         if (s.topic !== opts.topic) continue;
-        await s.handler(stored, { cursor: id, commit: async () => {} });
+        await s.handler(stored, id);
       }
 
       return { id, cursor: id };
     },
 
-    subscribe: async <TData>(
+    subscribe: subscribeForTest,
+    openTestSubscription: async (
       topic: string,
       opts: SubscriptionOptions,
-      handler: (msg: Message<TData>, ctx: HandleContext) => Promise<void>,
+      handler: TestRawMessageHandler,
     ) => {
-      const entry = {
-        topic,
-        opts,
-        handler: handler as unknown as (msg: Message<unknown>, ctx: HandleContext) => Promise<void>,
-      };
+      const entry = { topic, opts, handler };
       subs.add(entry);
 
       if (opts.mode === "tail" && opts.offset?.type === "begin") {
         const existing = topics.get(topic) ?? [];
         for (const m of existing) {
-          await handler(m as unknown as Message<TData>, {
-            cursor: m.id,
-            commit: async () => {},
-          });
+          await handler(m, m.id);
         }
       }
 
@@ -77,11 +75,11 @@ function createInMemoryRawBus(): RawBus {
       };
     },
 
-    fetch: async <TData>(topic: string, _opts: FetchOptions) => {
+    fetch: async (topic: string, _opts: FetchOptions) => {
       const existing = topics.get(topic) ?? [];
       return {
         messages: existing.map((m) => ({
-          msg: m as unknown as Message<TData>,
+          msg: m,
           cursor: m.id,
         })),
         next: existing.length > 0 ? existing[existing.length - 1]!.id : undefined,

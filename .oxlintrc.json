@@ -5,28 +5,36 @@
     "node_modules/**",
     "data/**",
     "**/dist/**",
+    "**/generated/**",
+    "**/vendor/**",
     "apps/core/src/ssh/remote-js/remote-runner.cjs"
   ],
-  "jsPlugins": ["./scripts/oxlint-plugins/test-waits.mts"],
+  "jsPlugins": ["./scripts/oxlint-plugins/lilac.mts"],
   "globals": {
     "Bun": "readonly"
   },
   "overrides": [
     {
-      "files": ["apps/**/*.ts", "packages/**/*.ts"],
+      "files": ["apps/**/*.{js,jsx,cjs,mjs,ts,tsx}", "packages/**/*.{js,jsx,cjs,mjs,ts,tsx}"],
       "rules": {
-        "@typescript-eslint/no-explicit-any": "error"
+        "@typescript-eslint/no-explicit-any": "error",
+        "no-nested-ternary": "error",
+        "lilac/no-local-is-record": "error"
       }
     },
     {
       "files": [
         "**/*.test.{js,jsx,ts,tsx,cjs,cts,mjs,mts}",
         "**/*.spec.{js,jsx,ts,tsx,cjs,cts,mjs,mts}",
-        "**/tests/**/*.{js,jsx,ts,tsx,cjs,cts,mjs,mts}"
+        "**/test/**/*.{js,jsx,ts,tsx,cjs,cts,mjs,mts}",
+        "**/tests/**/*.{js,jsx,ts,tsx,cjs,cts,mjs,mts}",
+        "**/__tests__/**/*.{js,jsx,ts,tsx,cjs,cts,mjs,mts}"
       ],
       "rules": {
         "@typescript-eslint/no-explicit-any": "off",
-        "lilac/no-fixed-test-wait": "error"
+        "lilac/no-fixed-test-wait": "error",
+        "no-nested-ternary": "off",
+        "lilac/no-local-is-record": "off"
       }
     }
   ]

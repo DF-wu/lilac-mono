@@ -7,13 +7,20 @@ import path from "node:path";
 import { hashCanonicalMessagesV1 } from "@stanley2058/lilac-agent";
 import type { MiniLilacUserUIMessage } from "@stanley2058/mini-lilac-client";
 import type { ModelMessage } from "ai";
+import { Panic } from "better-result";
 import superjson from "superjson";
 
+import {
+  MiniLilacSchemaInitializationCombinedFailure,
+  MiniLilacSchemaMigrationFailure,
+  MiniLilacSqliteDriverFailure,
+} from "../src/sqlite-persistence-errors";
 import {
   MINI_LILAC_DATABASE_SCHEMA_VERSION,
   MINI_MAIN_CLAUDE_ATTEMPT_RETENTION_LIMIT,
   MINI_NAMED_CLAUDE_ATTEMPT_RETENTION_LIMIT,
   MiniLilacSqliteStore,
+  decodeMiniLilacStoreRow,
   type HistoryProviderState,
   type MiniNamedClaudeSessionBinding,
   type PromoteMiniMainClaudeSessionBinding,
@@ -626,7 +633,459 @@ async function createV4Database(
   return { databasePath, directory };
 }
 
+type SupportedHistoricalVersion = 0 | 2 | 3 | 4 | 5 | 6 | 7 | 8;
+
+function createV2Layout(database: Database): void {
+  database.exec(`
+    PRAGMA foreign_keys = ON;
+    CREATE TABLE sessions (
+      id TEXT PRIMARY KEY, active_run_id TEXT, cwd TEXT NOT NULL, model TEXT NOT NULL,
+      profile TEXT NOT NULL, reasoning TEXT NOT NULL, title TEXT NOT NULL DEFAULT 'Mini Lilac',
+      input_tokens INTEGER, context_window INTEGER, status TEXT NOT NULL,
+      queued_steering_count INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    CREATE TABLE runs (
+      id TEXT PRIMARY KEY, session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+      parent_run_id TEXT REFERENCES runs(id) ON DELETE CASCADE, profile TEXT NOT NULL,
+      depth INTEGER NOT NULL, status TEXT NOT NULL, error TEXT, terminal_result_json TEXT,
+      undone_at TEXT, started_at TEXT NOT NULL, finished_at TEXT
+    );
+    CREATE TABLE commands (
+      session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+      command_id TEXT NOT NULL, kind TEXT NOT NULL, run_id TEXT,
+      request_fingerprint TEXT NOT NULL, request_json TEXT NOT NULL,
+      side_effect_started INTEGER NOT NULL, result_json TEXT, created_at TEXT NOT NULL,
+      PRIMARY KEY(session_id, command_id)
+    );
+    CREATE TABLE model_transcript (
+      session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+      position INTEGER NOT NULL, value_json TEXT NOT NULL, PRIMARY KEY(session_id, position)
+    );
+    CREATE TABLE ui_messages (
+      session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+      position INTEGER NOT NULL, value_json TEXT NOT NULL, PRIMARY KEY(session_id, position)
+    );
+    CREATE TABLE run_chunks (
+      run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+      seq INTEGER NOT NULL, chunk_json TEXT NOT NULL, PRIMARY KEY(run_id, seq)
+    );
+    CREATE TABLE user_checkpoints (
+      session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+      ui_position INTEGER NOT NULL, user_message_json TEXT NOT NULL,
+      model_prefix_json TEXT NOT NULL, ui_prefix_json TEXT NOT NULL,
+      root_run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+      replay_after_seq INTEGER NOT NULL, PRIMARY KEY(session_id, ui_position)
+    );
+    CREATE TABLE session_todos (
+      session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+      revision INTEGER NOT NULL, todos_json TEXT NOT NULL, updated_at TEXT NOT NULL
+    );
+    PRAGMA user_version = 2;
+  `);
+}
+
+function migrateFixtureV2ToV3(database: Database): void {
+  database.exec(`
+    CREATE TABLE transcript_nodes (
+      id INTEGER PRIMARY KEY,
+      session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+      lane TEXT NOT NULL CHECK(lane IN ('model', 'ui')), parent_id INTEGER,
+      depth INTEGER NOT NULL CHECK(depth > 0), value_json TEXT NOT NULL, hash TEXT NOT NULL,
+      UNIQUE(session_id, lane, hash), UNIQUE(id, session_id, lane),
+      FOREIGN KEY(parent_id, session_id, lane) REFERENCES transcript_nodes(id, session_id, lane)
+    );
+    CREATE INDEX transcript_nodes_parent ON transcript_nodes(parent_id);
+    CREATE TABLE session_transcript_heads (
+      session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+      model_head_id INTEGER, model_lane TEXT NOT NULL DEFAULT 'model' CHECK(model_lane = 'model'),
+      ui_head_id INTEGER, ui_lane TEXT NOT NULL DEFAULT 'ui' CHECK(ui_lane = 'ui'),
+      FOREIGN KEY(model_head_id, session_id, model_lane)
+        REFERENCES transcript_nodes(id, session_id, lane),
+      FOREIGN KEY(ui_head_id, session_id, ui_lane)
+        REFERENCES transcript_nodes(id, session_id, lane)
+    );
+    CREATE TABLE user_checkpoints_v3 (
+      session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+      ui_position INTEGER NOT NULL, user_message_json TEXT NOT NULL, model_head_id INTEGER,
+      model_lane TEXT NOT NULL DEFAULT 'model' CHECK(model_lane = 'model'), ui_head_id INTEGER,
+      ui_lane TEXT NOT NULL DEFAULT 'ui' CHECK(ui_lane = 'ui'),
+      root_run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+      replay_after_seq INTEGER NOT NULL CHECK(replay_after_seq >= 0),
+      PRIMARY KEY(session_id, ui_position),
+      FOREIGN KEY(model_head_id, session_id, model_lane)
+        REFERENCES transcript_nodes(id, session_id, lane),
+      FOREIGN KEY(ui_head_id, session_id, ui_lane)
+        REFERENCES transcript_nodes(id, session_id, lane)
+    );
+    DROP TABLE run_chunks;
+    DROP TABLE user_checkpoints;
+    DROP TABLE model_transcript;
+    DROP TABLE ui_messages;
+    ALTER TABLE user_checkpoints_v3 RENAME TO user_checkpoints;
+    PRAGMA user_version = 3;
+  `);
+}
+
+function createIntermediateHistoricalLayout(databasePath: string, targetVersion: 5 | 6 | 7): void {
+  const originalExec = Database.prototype.exec;
+  const exec = spyOn(Database.prototype, "exec").mockImplementation(function (
+    this: Database,
+    sql: string,
+  ) {
+    if (targetVersion < 6 && sql.includes("CREATE TABLE history_states_v6")) {
+      return originalExec.call(this, "SELECT 1");
+    }
+    if (
+      targetVersion < 7 &&
+      sql.includes("ALTER TABLE history_states ADD COLUMN last_provider_family")
+    ) {
+      return originalExec.call(this, "SELECT 1");
+    }
+    if (
+      targetVersion < 8 &&
+      sql.includes("ALTER TABLE pending_run_finalizations") &&
+      sql.includes("named_claude_binding_promotion_json")
+    ) {
+      return originalExec.call(this, "SELECT 1");
+    }
+    if (sql.includes(`PRAGMA user_version = ${MINI_LILAC_DATABASE_SCHEMA_VERSION}`)) {
+      return originalExec.call(this, `PRAGMA user_version = ${targetVersion}`);
+    }
+    return originalExec.call(this, sql);
+  });
+  try {
+    const store = new MiniLilacSqliteStore(databasePath);
+    store.close();
+  } finally {
+    exec.mockRestore();
+  }
+}
+
+async function createHistoricalLayout(version: SupportedHistoricalVersion): Promise<{
+  readonly databasePath: string;
+  readonly directory: string;
+}> {
+  let databasePath: string;
+  let directory: string;
+  if (version === 4 || version === 5) {
+    const v4 = await createV4Database();
+    databasePath = v4.databasePath;
+    directory = v4.directory;
+    if (version === 5) createIntermediateHistoricalLayout(databasePath, 5);
+  } else {
+    const temporary = await temporaryDatabasePath(`mini-lilac-v${version}-layout-`);
+    databasePath = temporary.file;
+    directory = temporary.directory;
+    if (version === 2 || version === 3) {
+      const database = new Database(databasePath, { create: true, strict: true });
+      createV2Layout(database);
+      if (version === 3) migrateFixtureV2ToV3(database);
+      database.close();
+    } else if (version === 6 || version === 7) {
+      createIntermediateHistoricalLayout(databasePath, version);
+    } else if (version === 8) {
+      const store = new MiniLilacSqliteStore(databasePath);
+      store.close();
+    } else {
+      const database = new Database(databasePath, { create: true, strict: true });
+      database.close();
+    }
+  }
+  const marker = new Database(databasePath, { strict: true });
+  marker.exec(
+    "CREATE TABLE migration_fixture_marker (value TEXT NOT NULL); INSERT INTO migration_fixture_marker VALUES ('preserved')",
+  );
+  marker.close();
+  return { databasePath, directory };
+}
+
+function historicalLayoutSnapshot(databasePath: string) {
+  const database = new Database(databasePath, { strict: true });
+  const snapshot = {
+    version: database.query("PRAGMA user_version").get(),
+    schema: database
+      .query(
+        `SELECT type, name, sql FROM sqlite_schema
+         WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name`,
+      )
+      .all(),
+    marker: database.query("SELECT value FROM migration_fixture_marker").get(),
+  };
+  database.close();
+  return snapshot;
+}
+
 describe("MiniLilacSqliteStore history schema", () => {
+  it("distinguishes current, missing, unsupported, and corrupt store rows", () => {
+    const row = {
+      id: "session-1",
+      active_run_id: null,
+      workspace_id: "workspace-1",
+      cwd: "/tmp/workspace-1",
+      model: "test/mock",
+      profile: "reader",
+      reasoning: "high",
+      title: "Mini Lilac",
+      input_tokens: null,
+      input_tokens_estimated: 0,
+      context_window: null,
+      status: "idle",
+      queued_steering_count: 0,
+      created_at: "2026-08-04T00:00:00.000Z",
+      updated_at: "2026-08-04T00:00:00.000Z",
+    };
+
+    expect(
+      decodeMiniLilacStoreRow({
+        kind: "session",
+        row,
+        schemaVersion: MINI_LILAC_DATABASE_SCHEMA_VERSION,
+        recordId: row.id,
+      }),
+    ).toMatchObject({ status: "ok", value: { provenance: "current", value: row } });
+    expect(
+      decodeMiniLilacStoreRow({
+        kind: "session",
+        row: null,
+        schemaVersion: MINI_LILAC_DATABASE_SCHEMA_VERSION,
+        recordId: row.id,
+      }),
+    ).toMatchObject({ status: "ok", value: { provenance: "missing-defaulted", value: null } });
+    expect(
+      decodeMiniLilacStoreRow({
+        kind: "session",
+        row,
+        schemaVersion: MINI_LILAC_DATABASE_SCHEMA_VERSION - 1,
+        recordId: row.id,
+      }),
+    ).toMatchObject({ status: "error", error: { _tag: "UnsupportedVersion" } });
+    expect(
+      decodeMiniLilacStoreRow({
+        kind: "session",
+        row: { id: row.id },
+        schemaVersion: MINI_LILAC_DATABASE_SCHEMA_VERSION,
+        recordId: row.id,
+      }),
+    ).toMatchObject({ status: "error", error: { _tag: "CorruptPersistedFields" } });
+  });
+
+  it("upgrades and rolls back genuine layouts for every supported migration start", async () => {
+    for (const version of [0, 2, 3, 4, 5, 6, 7, 8] as const) {
+      const { databasePath } = await createHistoricalLayout(version);
+      const before = historicalLayoutSnapshot(databasePath);
+      expect(before.version).toEqual({ user_version: version });
+
+      if (version < 8) {
+        const originalExec = Database.prototype.exec;
+        const exec = spyOn(Database.prototype, "exec").mockImplementation(function (
+          this: Database,
+          sql: string,
+        ) {
+          if (sql.includes(`PRAGMA user_version = ${MINI_LILAC_DATABASE_SCHEMA_VERSION}`)) {
+            return originalExec.call(this, "INVALID MIGRATION FINALIZATION SQL");
+          }
+          return originalExec.call(this, sql);
+        });
+        try {
+          expect(() => new MiniLilacSqliteStore(databasePath)).toThrow(
+            MiniLilacSqliteDriverFailure,
+          );
+        } finally {
+          exec.mockRestore();
+        }
+        expect(historicalLayoutSnapshot(databasePath)).toEqual(before);
+      }
+
+      const migrated = new MiniLilacSqliteStore(databasePath);
+      migrated.close();
+      const after = historicalLayoutSnapshot(databasePath);
+      expect(after.version).toEqual({ user_version: MINI_LILAC_DATABASE_SCHEMA_VERSION });
+      expect(after.marker).toEqual({ value: "preserved" });
+      if (version === 8) expect(after).toEqual(before);
+      else expect(after.schema).not.toEqual(before.schema);
+    }
+  });
+
+  it("preserves a migration Err with a recognized pragma-cleanup failure", async () => {
+    const { databasePath } = await createV4Database();
+    const corrupt = new Database(databasePath, { strict: true });
+    corrupt.exec("PRAGMA foreign_keys = OFF");
+    corrupt
+      .query(
+        `INSERT INTO user_checkpoints
+          (session_id, ui_position, user_message_json, model_head_id, ui_head_id,
+           root_run_id, replay_after_seq)
+         VALUES ('missing-session', 99, '{}', NULL, NULL, 'missing-run', 0)`,
+      )
+      .run();
+    corrupt.close();
+
+    const originalExec = Database.prototype.exec;
+    const exec = spyOn(Database.prototype, "exec").mockImplementation(function (
+      this: Database,
+      sql: string,
+    ) {
+      if (sql.includes("PRAGMA legacy_alter_table = OFF")) {
+        return originalExec.call(this, "INVALID CLEANUP SQL");
+      }
+      return originalExec.call(this, sql);
+    });
+    try {
+      let failure: unknown;
+      try {
+        new MiniLilacSqliteStore(databasePath);
+      } catch (cause) {
+        failure = cause;
+      }
+      expect(failure).toBeInstanceOf(MiniLilacSchemaInitializationCombinedFailure);
+      if (failure instanceof MiniLilacSchemaInitializationCombinedFailure) {
+        expect(failure.primary).toBeInstanceOf(MiniLilacSchemaMigrationFailure);
+        expect(failure.cleanup).toBeInstanceOf(MiniLilacSqliteDriverFailure);
+      }
+    } finally {
+      exec.mockRestore();
+    }
+    const unchanged = new Database(databasePath, { strict: true });
+    expect(unchanged.query("PRAGMA user_version").get()).toEqual({ user_version: 4 });
+    expect(
+      unchanged.query("SELECT session_id FROM user_checkpoints WHERE ui_position = 99").get(),
+    ).toEqual({ session_id: "missing-session" });
+    unchanged.close();
+  });
+
+  it("propagates the exact Panic and unrecognized defect from schema migration", async () => {
+    for (const failure of [
+      new Panic({ message: "migration panic fixture", cause: "fixture" }),
+      new Error("migration defect fixture"),
+    ]) {
+      const { file } = await temporaryDatabasePath("mini-lilac-migration-defect-");
+      const originalExec = Database.prototype.exec;
+      const exec = spyOn(Database.prototype, "exec").mockImplementation(function (
+        this: Database,
+        sql: string,
+      ) {
+        if (sql.includes("CREATE TABLE history_store_metadata")) throw failure;
+        return originalExec.call(this, sql);
+      });
+      try {
+        let caught: unknown;
+        try {
+          new MiniLilacSqliteStore(file);
+        } catch (cause) {
+          caught = cause;
+        }
+        expect(caught).toBe(failure);
+      } finally {
+        exec.mockRestore();
+      }
+    }
+  });
+
+  it("preserves a migration defect when pragma cleanup fails and reports cleanup independently", async () => {
+    for (const primary of [
+      new Panic({ message: "migration panic fixture", cause: "fixture" }),
+      new Error("migration defect fixture"),
+    ]) {
+      const { file } = await temporaryDatabasePath("mini-lilac-migration-cleanup-defect-");
+      const reports: Array<{ readonly operation: string; readonly cleanupFailure: unknown }> = [];
+      const originalExec = Database.prototype.exec;
+      const exec = spyOn(Database.prototype, "exec").mockImplementation(function (
+        this: Database,
+        sql: string,
+      ) {
+        if (sql.includes("CREATE TABLE history_store_metadata")) throw primary;
+        if (sql.includes("PRAGMA legacy_alter_table = OFF")) {
+          return originalExec.call(this, "INVALID CLEANUP SQL");
+        }
+        return originalExec.call(this, sql);
+      });
+      try {
+        let caught: unknown;
+        try {
+          new MiniLilacSqliteStore(file, { onCleanupDefect: (report) => reports.push(report) });
+        } catch (cause) {
+          caught = cause;
+        }
+        expect(caught).toBe(primary);
+        expect(reports).toHaveLength(1);
+        expect(reports[0]?.operation).toBe("initializeSchema.restorePragmas");
+        expect(reports[0]?.cleanupFailure).toBeInstanceOf(MiniLilacSqliteDriverFailure);
+      } finally {
+        exec.mockRestore();
+      }
+    }
+  });
+
+  it("preserves a constructor defect when database-close cleanup fails", async () => {
+    const { file } = await temporaryDatabasePath("mini-lilac-close-cleanup-defect-");
+    const primary = new Error("constructor defect fixture");
+    const closeDefect = new Error("database close defect fixture");
+    const reports: Array<{ readonly operation: string; readonly cleanupFailure: unknown }> = [];
+    const originalExec = Database.prototype.exec;
+    const originalClose = Database.prototype.close;
+    const exec = spyOn(Database.prototype, "exec").mockImplementation(function (
+      this: Database,
+      sql: string,
+    ) {
+      if (sql.includes("PRAGMA journal_mode = WAL")) throw primary;
+      return originalExec.call(this, sql);
+    });
+    const close = spyOn(Database.prototype, "close").mockImplementation(function (this: Database) {
+      originalClose.call(this);
+      throw closeDefect;
+    });
+    try {
+      let caught: unknown;
+      try {
+        new MiniLilacSqliteStore(file, { onCleanupDefect: (report) => reports.push(report) });
+      } catch (cause) {
+        caught = cause;
+      }
+      expect(caught).toBe(primary);
+      expect(reports).toEqual([
+        {
+          operation: "constructor.closeAfterInitializationFailure",
+          cleanupFailure: closeDefect,
+        },
+      ]);
+    } finally {
+      close.mockRestore();
+      exec.mockRestore();
+    }
+  });
+
+  it("returns structural corruption as a Result and emits only redacted post-read diagnostics", async () => {
+    const { file, directory } = await temporaryDatabasePath("mini-lilac-history-corruption-");
+    const diagnostics: Array<{ readonly recordId: string; readonly inTransaction: boolean }> = [];
+    let store: MiniLilacSqliteStore;
+    store = new MiniLilacSqliteStore(file, {
+      onPersistenceDiagnostic: (diagnostic) => {
+        diagnostics.push({
+          recordId: diagnostic.recordId,
+          inTransaction: store.database.inTransaction,
+        });
+      },
+    });
+    createSession(store, "corrupt-session", directory);
+    const state = store.getCurrentHistoryState("corrupt-session");
+    store.database.exec("PRAGMA ignore_check_constraints = ON");
+    store.database
+      .query(
+        `UPDATE history_states
+         SET last_provider_family = 'ai-sdk', contains_cross_family_turns = NULL
+         WHERE id = ?`,
+      )
+      .run(state.id);
+    store.database.exec("PRAGMA ignore_check_constraints = OFF");
+
+    const read = store.getHistoryStateResult(state.id);
+    expect(read.status).toBe("error");
+    expect(diagnostics).toEqual([{ recordId: state.id, inTransaction: false }]);
+    expect(JSON.stringify(diagnostics)).not.toContain(directory);
+    store.close();
+  });
+
   it("creates one deferred root and reuses a canonical workspace without Git", async () => {
     const { directory, file } = await temporaryDatabasePath("mini-lilac-history-root-");
     const store = new MiniLilacSqliteStore(file);
@@ -2020,7 +2479,7 @@ describe("MiniLilacSqliteStore history schema", () => {
         operationId: "operation-undo-a",
         result: undoResult,
       }),
-    ).toThrow("reject navigation result");
+    ).toThrow("Mini Lilac SQLite operation failed");
     expect(store.getCurrentHistoryState("session-1").id).toBe("state-a");
     expect(store.peekHistoryRedo("session-1")).toBeNull();
     expect(store.getHistoryOperation("operation-undo-a")?.id).toBe("operation-undo-a");
@@ -2522,6 +2981,122 @@ describe("MiniLilacSqliteStore history schema", () => {
     store.close();
   });
 
+  it("rolls back observation, command fence, and journal when Result transaction work fails", async () => {
+    const { directory, file } = await temporaryDatabasePath("mini-lilac-history-result-rollback-");
+    const store = new MiniLilacSqliteStore(file);
+    createSession(store, "session-1", directory);
+    const user = userMessage("user-1");
+    admitPrompt(store, {
+      sessionId: "session-1",
+      runId: "run-1",
+      commandId: "prompt-1",
+      transitionId: "transition-1",
+      message: user,
+      observationIds: { stateId: "observed-1", transitionId: "observe-1" },
+    });
+    finalizePrompt(store, {
+      sessionId: "session-1",
+      runId: "run-1",
+      transitionId: "transition-1",
+      destinationStateId: "state-1",
+      user,
+    });
+    store.reserveCommand("session-1", "undo-1", { kind: "undo", runId: null, payload: {} });
+    store.database.exec(`
+      CREATE TRIGGER fail_history_operation BEFORE INSERT ON history_operations
+      BEGIN SELECT RAISE(ABORT, 'forced journal failure'); END;
+    `);
+
+    const reserved = store.reserveHistoryOperationResult({
+      id: "operation-1",
+      sessionId: "session-1",
+      commandId: "undo-1",
+      requestedAction: "undo",
+      expectedSourceStateId: "state-1",
+      targetStateId: "observed-1",
+      userTransitionId: "transition-1",
+      filesystemMode: "skip",
+      skipReason: "git-unavailable",
+      observation: {
+        stateId: "drift-state",
+        transitionId: "drift-transition",
+        ...unavailableWorkspace,
+      },
+    });
+
+    expect(reserved).toMatchObject({
+      status: "error",
+      error: { _tag: "MiniLilacSqliteDriverFailure", operation: "reserveHistoryOperation" },
+    });
+    expect(store.getHistoryOperation("operation-1")).toBeNull();
+    expect(
+      store.database.query("SELECT 1 FROM history_states WHERE id = 'drift-state'").get(),
+    ).toBeNull();
+    expect(
+      store.database
+        .query("SELECT side_effect_started FROM commands WHERE command_id = 'undo-1'")
+        .get(),
+    ).toEqual({ side_effect_started: 0 });
+    expect(store.getCurrentHistoryState("session-1").id).toBe("state-1");
+    store.close();
+  });
+
+  it("rolls back history closure when finalization fails after writing its destination", async () => {
+    const { directory, file } = await temporaryDatabasePath(
+      "mini-lilac-finalization-result-rollback-",
+    );
+    const store = new MiniLilacSqliteStore(file);
+    createSession(store, "session-1", directory);
+    const user = userMessage("user-1");
+    admitPrompt(store, {
+      sessionId: "session-1",
+      runId: "run-1",
+      commandId: "prompt-1",
+      transitionId: "transition-1",
+      message: user,
+      observationIds: { stateId: "observed-1", transitionId: "observe-1" },
+    });
+    store.reservePendingRunFinalization({
+      runId: "run-1",
+      sessionId: "session-1",
+      openTransitionId: "transition-1",
+      modelMessages: [{ role: "user", content: "user-1" }],
+      uiMessages: [user],
+      runStatus: "completed",
+      sessionStatus: "idle",
+      error: null,
+      terminalResult: undefined,
+      inputTokens: null,
+    });
+    store.database.exec(`
+      CREATE TRIGGER fail_run_finalization BEFORE UPDATE ON runs
+      WHEN OLD.id = 'run-1' AND NEW.status <> 'active'
+      BEGIN SELECT RAISE(ABORT, 'forced run finalization failure'); END;
+    `);
+
+    const committed = store.commitPendingRunFinalizationResult({
+      runId: "run-1",
+      destinationStateId: "final-state",
+      ...unavailableWorkspace,
+    });
+
+    expect(committed).toMatchObject({
+      status: "error",
+      error: { _tag: "MiniLilacSqliteDriverFailure", operation: "commitPendingRunFinalization" },
+    });
+    expect(store.getPendingRunFinalization("run-1")).not.toBeNull();
+    expect(store.getHistoryTransition("transition-1").toStateId).toBeNull();
+    expect(
+      store.database.query("SELECT 1 FROM history_states WHERE id = 'final-state'").get(),
+    ).toBeNull();
+    expect(store.getRun("run-1").status).toBe("active");
+    expect(store.getSession("session-1")).toMatchObject({
+      status: "streaming",
+      activeRunId: "run-1",
+    });
+    store.close();
+  });
+
   it("scopes snapshot refs and accounting to exact workspaces", async () => {
     const first = await temporaryDatabasePath("mini-lilac-history-accounting-a-");
     const secondDirectory = await mkdtemp(path.join(tmpdir(), "mini-lilac-history-accounting-b-"));
@@ -2555,7 +3130,7 @@ describe("MiniLilacSqliteStore history schema", () => {
         gitRef: sharedRef,
         formatVersion: 1,
       }),
-    ).toThrow("UNIQUE constraint failed");
+    ).toThrow("Mini Lilac SQLite operation failed");
 
     const emptyJournalAccounting = {
       transitionCount: 0,
@@ -2621,7 +3196,7 @@ describe("MiniLilacSqliteStore history schema", () => {
         gitRef: sharedRef,
         formatVersion: 1,
       }),
-    ).toThrow("UNIQUE constraint failed");
+    ).toThrow("Mini Lilac SQLite operation failed");
     expect(
       store.database
         .query("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'user_checkpoints'")
@@ -2686,23 +3261,25 @@ describe("MiniLilacSqliteStore history schema", () => {
       availabilityDetail: null,
       gitRef: "refs/mini-lilac/snapshots/healed",
     });
-    expect(() =>
-      store.setWorkspaceSnapshotAvailability({
-        workspaceId: workspace.id,
-        updates: [
-          {
-            snapshotId: first.id,
-            availability: "corrupt",
-            detail: "must roll back",
-          },
-          {
-            snapshotId: "unknown-snapshot",
-            availability: "missing",
-            detail: "not found",
-          },
-        ],
-      }),
-    ).toThrow("was not found");
+    const rejectedAvailability = store.setWorkspaceSnapshotAvailabilityResult({
+      workspaceId: workspace.id,
+      updates: [
+        {
+          snapshotId: first.id,
+          availability: "corrupt",
+          detail: "must roll back",
+        },
+        {
+          snapshotId: "unknown-snapshot",
+          availability: "missing",
+          detail: "not found",
+        },
+      ],
+    });
+    expect(rejectedAvailability).toMatchObject({
+      status: "error",
+      error: { _tag: "MiniLilacStoreOperationRejected" },
+    });
     expect(store.getWorkspaceSnapshot(first.id)).toMatchObject({
       availability: "available",
       availabilityDetail: null,
@@ -2838,6 +3415,92 @@ describe("MiniLilacSqliteStore history schema", () => {
     expect(() =>
       store.database.query("DELETE FROM workspace_snapshots WHERE id = ?").run(first.id),
     ).toThrow("FOREIGN KEY constraint failed");
+    store.close();
+  });
+
+  it("returns owned command lifecycle failures and recognized SQLite driver failures", async () => {
+    const { directory, file } = await temporaryDatabasePath("mini-lilac-command-results-");
+    const store = new MiniLilacSqliteStore(file);
+    createSession(store, "session-1", directory);
+    const request = { kind: "test", runId: null, payload: { value: 1 } };
+
+    expect(store.reserveCommandResult("session-1", "command-1", request).status).toBe("ok");
+    const circularPayload: { self?: unknown } = {};
+    circularPayload.self = circularPayload;
+    expect(
+      store.reserveCommandResult("session-1", "circular-command", {
+        kind: "test",
+        runId: null,
+        payload: circularPayload,
+      }),
+    ).toMatchObject({
+      status: "error",
+      error: { _tag: "MiniLilacStoreOperationRejected", operation: "canonicalCommandPayload" },
+    });
+    expect(store.getCommandResultResult("session-1", "command-1", request)).toMatchObject({
+      status: "error",
+      error: { _tag: "MiniLilacStoreOperationRejected", operation: "getCommandResult" },
+    });
+    expect(store.markCommandSideEffectStartedResult("session-1", "command-1", request).status).toBe(
+      "ok",
+    );
+    expect(
+      store.saveCommandResultResult("session-1", "command-1", request, { status: "saved" }).status,
+    ).toBe("ok");
+    expect(store.getCommandResultResult("session-1", "command-1", request)).toMatchObject({
+      status: "ok",
+      value: { status: "saved" },
+    });
+    expect(
+      store.saveCommandResultResult("session-1", "command-1", request, { status: "duplicate" }),
+    ).toMatchObject({
+      status: "error",
+      error: { _tag: "MiniLilacStoreOperationRejected", operation: "saveCommandResult" },
+    });
+
+    expect(store.reserveCommandResult("session-1", "command-1", request)).toMatchObject({
+      status: "error",
+      error: { _tag: "MiniLilacSqliteDriverFailure", operation: "reserveCommand" },
+    });
+
+    const stringify = spyOn(superjson, "stringify").mockImplementation(() => {
+      throw new Error("expected serialization failure");
+    });
+    try {
+      store.reserveCommandResult("session-1", "serialization-command", request);
+      store.markCommandSideEffectStartedResult("session-1", "serialization-command", request);
+      expect(
+        store.saveCommandResultResult("session-1", "serialization-command", request, {
+          status: "unsaved",
+        }),
+      ).toMatchObject({
+        status: "error",
+        error: { _tag: "MiniLilacStoreOperationRejected", operation: "saveCommandResult" },
+      });
+    } finally {
+      stringify.mockRestore();
+    }
+
+    expect(store.reserveCommandResult("session-1", "malformed-command", request).status).toBe("ok");
+    expect(
+      store.markCommandSideEffectStartedResult("session-1", "malformed-command", request).status,
+    ).toBe("ok");
+    const malformedResult = "{";
+    store.database
+      .query(
+        `UPDATE commands SET result_json = ?
+         WHERE session_id = ? AND command_id = ?`,
+      )
+      .run(malformedResult, "session-1", "malformed-command");
+    expect(store.getCommandResultResult("session-1", "malformed-command", request)).toMatchObject({
+      status: "error",
+      error: { _tag: "MalformedSerialization" },
+    });
+    expect(
+      store.database
+        .query("SELECT result_json FROM commands WHERE session_id = ? AND command_id = ?")
+        .get("session-1", "malformed-command"),
+    ).toEqual({ result_json: malformedResult });
     store.close();
   });
 

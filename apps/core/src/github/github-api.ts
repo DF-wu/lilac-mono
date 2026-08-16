@@ -1,15 +1,20 @@
 import { createAppAuth } from "@octokit/auth-app";
+import { Panic, Result, type Result as ResultType } from "better-result";
+import { z } from "zod";
 
 import { env } from "@stanley2058/lilac-utils";
 
-import { deriveApiBaseUrl, readGithubAppPrivateKeyPem, readGithubAppSecret } from "./github-app";
+import {
+  deriveApiBaseUrl,
+  readGithubAppPrivateKeyPemResult,
+  readGithubAppSecret,
+} from "./github-app";
 import {
   getGithubUserLoginOrNull as getGithubUserLoginFromAuth,
   getGithubViewerLoginOrNull as getGithubViewerLoginByTokenOrNull,
-  resolveGithubViewerLoginOrThrow,
-  getGithubUserAuthOrNull,
   getPreferredGithubAuthOrNull,
-  getPreferredGithubAuthOrThrow,
+  getPreferredGithubAuthResult,
+  type GithubAuthFailed,
 } from "./github-auth";
 
 type GithubApiCtx = {
@@ -17,11 +22,51 @@ type GithubApiCtx = {
   token: string;
 };
 
+type GithubRequestBody = Readonly<Record<string, string | number>>;
+
+const githubIdSchema = z.object({ id: z.number().int() });
+const githubIssueCommentSchema = z.object({
+  id: z.number().int(),
+  user: z.object({ login: z.string().optional(), id: z.number().int().optional() }).optional(),
+  body: z.string().optional(),
+  created_at: z.string().optional(),
+  updated_at: z.string().optional(),
+  html_url: z.string().optional(),
+  performed_via_github_app: z
+    .object({ id: z.number().int().optional(), slug: z.string().optional() })
+    .nullable()
+    .optional(),
+});
+const githubIssueSchema = z.object({
+  id: z.number().int(),
+  title: z.string(),
+  body: z.string().nullable(),
+  html_url: z.string().optional(),
+  pull_request: z.object({}).passthrough().optional(),
+  user: z.object({ login: z.string().optional(), id: z.number().int().optional() }).optional(),
+  created_at: z.string().optional(),
+  updated_at: z.string().optional(),
+});
+const githubReactionSchema = z.object({
+  id: z.number().int(),
+  content: z.string(),
+  user: z.object({ login: z.string().optional(), id: z.number().int().optional() }).optional(),
+});
+const githubPullRequestSchema = z.object({
+  title: z.string(),
+  body: z.string().nullable(),
+  html_url: z.string().optional(),
+  head: z.object({ sha: z.string(), ref: z.string() }),
+  base: z.object({ ref: z.string() }),
+});
+const githubAppSchema = z.object({ slug: z.string().min(1) });
+
 export class GithubApiError extends Error {
   constructor(
     readonly status: number,
     readonly path: string,
     message: string,
+    readonly rateLimit?: { readonly retryAfterMs?: number },
   ) {
     super(message);
     this.name = "GithubApiError";
@@ -33,11 +78,45 @@ function githubApiError(input: {
   statusText: string;
   path: string;
   body: string;
+  headers: Headers;
 }): GithubApiError {
+  const retryAfterHeader = input.headers.get("retry-after");
+  const retryAfterSeconds = retryAfterHeader === null ? undefined : Number(retryAfterHeader);
+  const retryAfterMs =
+    retryAfterSeconds !== undefined && Number.isFinite(retryAfterSeconds)
+      ? Math.max(0, Math.ceil(retryAfterSeconds * 1000))
+      : undefined;
+  const rateLimited =
+    input.status === 429 ||
+    (input.status === 403 &&
+      (input.headers.get("x-ratelimit-remaining") === "0" ||
+        retryAfterMs !== undefined ||
+        input.body.toLowerCase().includes("secondary rate limit")));
+  let rateLimit: { readonly retryAfterMs?: number } | undefined;
+  if (rateLimited) {
+    rateLimit = retryAfterMs === undefined ? {} : { retryAfterMs };
+  }
   return new GithubApiError(
     input.status,
     input.path,
     `GitHub API error (${input.status} ${input.statusText}) at ${input.path}${input.body ? `: ${input.body}` : ""}`,
+    rateLimit,
+  );
+}
+
+export async function decodeGithubApiErrorResponse(
+  response: Response,
+  path: string,
+): Promise<ResultType<never, GithubApiError>> {
+  const body = await captureGithubResponseText(response);
+  return Result.err(
+    githubApiError({
+      status: response.status,
+      statusText: response.statusText,
+      path,
+      body: body.match({ ok: (value) => value, err: () => "" }),
+      headers: response.headers,
+    }),
   );
 }
 
@@ -51,56 +130,144 @@ function headers(token: string, extra?: Record<string, string>): HeadersInit {
   };
 }
 
-async function ctx(): Promise<GithubApiCtx> {
-  const t = await getPreferredGithubAuthOrThrow({ dataDir: env.dataDir });
-  return { apiBaseUrl: t.apiBaseUrl, token: t.token };
+async function captureGithubApiExternal<T, E>(
+  run: () => Promise<T>,
+  mapError: (cause: Error) => E,
+): Promise<ResultType<T, E>> {
+  try {
+    return Result.ok(await run());
+  } catch (cause) {
+    if (Panic.is(cause)) throw cause;
+    if (!(cause instanceof Error)) throw cause;
+    return Result.err(mapError(cause));
+  }
 }
 
-async function githubFetchJson<T>(input: {
+async function captureGithubResponseText(response: Response): Promise<ResultType<string, Error>> {
+  return captureGithubApiExternal(
+    () => response.text(),
+    (cause) => new Error("GitHub error response body unavailable", { cause }),
+  );
+}
+
+async function ctxResult(): Promise<ResultType<GithubApiCtx, GithubAuthFailed | GithubApiError>> {
+  const auth = await getPreferredGithubAuthResult({ dataDir: env.dataDir });
+  return auth.andThen((value) =>
+    value
+      ? Result.ok({ apiBaseUrl: value.apiBaseUrl, token: value.token })
+      : Result.err(
+          new GithubApiError(
+            401,
+            "auth",
+            "GitHub auth not configured. Configure outbound user auth or GitHub App auth.",
+          ),
+        ),
+  );
+}
+
+async function ctx(): Promise<GithubApiCtx> {
+  return adaptGithubApiResultToHost(await ctxResult());
+}
+
+async function githubFetchJsonResult<T>(input: {
   apiBaseUrl: string;
   token: string;
   path: string;
   method?: string;
-  body?: unknown;
-}): Promise<T> {
+  body?: GithubRequestBody;
+  schema: z.ZodType<T>;
+}): Promise<ResultType<T, GithubApiError>> {
   const url = `${input.apiBaseUrl.replace(/\/$/u, "")}${input.path}`;
-  const res = await fetch(url, {
-    method: input.method ?? "GET",
-    headers: headers(input.token, input.body ? { "Content-Type": "application/json" } : undefined),
-    body: input.body ? JSON.stringify(input.body) : undefined,
+  const response = await captureGithubApiExternal(
+    () =>
+      fetch(url, {
+        method: input.method ?? "GET",
+        headers: headers(
+          input.token,
+          input.body ? { "Content-Type": "application/json" } : undefined,
+        ),
+        body: input.body ? JSON.stringify(input.body) : undefined,
+      }),
+    () => new GithubApiError(503, input.path, `GitHub request failed at ${input.path}`),
+  );
+  const continueResponse = response.match<() => Promise<ResultType<T, GithubApiError>>>({
+    err: (error) => async () => Result.err(error),
+    ok: (res) => async () => {
+      if (!res.ok) return await decodeGithubApiErrorResponse(res, input.path);
+
+      const body = await captureGithubApiExternal(
+        async (): Promise<unknown> => await res.json(),
+        () =>
+          new GithubApiError(502, input.path, `GitHub API response unreadable at ${input.path}`),
+      );
+      const continueBody = body.match<() => ResultType<T, GithubApiError>>({
+        err: (error) => () => Result.err(error),
+        ok: (value) => () => {
+          const decoded = input.schema.safeParse(value);
+          if (!decoded.success) {
+            return Result.err(
+              new GithubApiError(
+                502,
+                input.path,
+                `GitHub API returned an invalid response at ${input.path}`,
+              ),
+            );
+          }
+          return Result.ok(decoded.data);
+        },
+      });
+      return continueBody();
+    },
   });
-  if (!res.ok) {
-    const text = await res.text().catch(() => "");
-    throw githubApiError({
-      status: res.status,
-      statusText: res.statusText,
-      path: input.path,
-      body: text,
-    });
-  }
-  return (await res.json()) as T;
+  return await continueResponse();
 }
 
-async function githubFetchNoBody(input: {
+function adaptGithubApiResultToHost<T>(
+  result: ResultType<T, GithubApiError | GithubAuthFailed>,
+): T {
+  return result.match({
+    ok: (value) => () => value,
+    err: (error) => () => {
+      throw error;
+    },
+  })();
+}
+
+async function githubFetchJson<T>(
+  input: Parameters<typeof githubFetchJsonResult<T>>[0],
+): Promise<T> {
+  return adaptGithubApiResultToHost(await githubFetchJsonResult(input));
+}
+
+async function githubFetchNoBodyResult(input: {
   apiBaseUrl: string;
   token: string;
   path: string;
   method: string;
-}): Promise<void> {
+}): Promise<ResultType<void, GithubApiError>> {
   const url = `${input.apiBaseUrl.replace(/\/$/u, "")}${input.path}`;
-  const res = await fetch(url, {
-    method: input.method,
-    headers: headers(input.token),
+  const response = await captureGithubApiExternal(
+    () =>
+      fetch(url, {
+        method: input.method,
+        headers: headers(input.token),
+      }),
+    () => new GithubApiError(503, input.path, `GitHub request failed at ${input.path}`),
+  );
+  const continueResponse = response.match<() => Promise<ResultType<void, GithubApiError>>>({
+    err: (error) => async () => Result.err(error),
+    ok: (value) => async () => {
+      if (!value.ok) return await decodeGithubApiErrorResponse(value, input.path);
+      return Result.ok(undefined);
+    },
   });
-  if (!res.ok) {
-    const text = await res.text().catch(() => "");
-    throw githubApiError({
-      status: res.status,
-      statusText: res.statusText,
-      path: input.path,
-      body: text,
-    });
-  }
+  return await continueResponse();
+}
+
+async function githubFetchNoBody(
+  input: Parameters<typeof githubFetchNoBodyResult>[0],
+): Promise<void> {
+  adaptGithubApiResultToHost(await githubFetchNoBodyResult(input));
 }
 
 export async function addEyesReactionToIssue(input: {
@@ -109,11 +276,12 @@ export async function addEyesReactionToIssue(input: {
   issueNumber: number;
 }): Promise<number> {
   const c = await ctx();
-  const out = await githubFetchJson<{ id: number }>({
+  const out = await githubFetchJson({
     ...c,
     path: `/repos/${input.owner}/${input.repo}/issues/${input.issueNumber}/reactions`,
     method: "POST",
     body: { content: "eyes" },
+    schema: githubIdSchema,
   });
   return out.id;
 }
@@ -124,11 +292,12 @@ export async function addEyesReactionToIssueComment(input: {
   commentId: number;
 }): Promise<number> {
   const c = await ctx();
-  const out = await githubFetchJson<{ id: number }>({
+  const out = await githubFetchJson({
     ...c,
     path: `/repos/${input.owner}/${input.repo}/issues/comments/${input.commentId}/reactions`,
     method: "POST",
     body: { content: "eyes" },
+    schema: githubIdSchema,
   });
   return out.id;
 }
@@ -168,11 +337,12 @@ export async function createIssueComment(input: {
   body: string;
 }): Promise<{ id: number; html_url?: string }> {
   const c = await ctx();
-  return await githubFetchJson<{ id: number; html_url?: string }>({
+  return await githubFetchJson({
     ...c,
     path: `/repos/${input.owner}/${input.repo}/issues/${input.issueNumber}/comments`,
     method: "POST",
     body: { body: input.body },
+    schema: githubIssueCommentSchema.pick({ id: true, html_url: true }),
   });
 }
 
@@ -193,6 +363,7 @@ export async function getIssueComment(input: {
   return await githubFetchJson({
     ...c,
     path: `/repos/${input.owner}/${input.repo}/issues/comments/${input.commentId}`,
+    schema: githubIssueCommentSchema,
   });
 }
 
@@ -208,6 +379,7 @@ export async function editIssueComment(input: {
     path: `/repos/${input.owner}/${input.repo}/issues/comments/${input.commentId}`,
     method: "PATCH",
     body: { body: input.body },
+    schema: githubIssueCommentSchema,
   });
 }
 
@@ -238,6 +410,7 @@ export async function getIssue(input: { owner: string; repo: string; number: num
   return await githubFetchJson({
     ...c,
     path: `/repos/${input.owner}/${input.repo}/issues/${input.number}`,
+    schema: githubIssueSchema,
   });
 }
 
@@ -263,6 +436,7 @@ export async function listIssueComments(input: {
   return await githubFetchJson({
     ...c,
     path: `/repos/${input.owner}/${input.repo}/issues/${input.number}/comments?per_page=${perPage}&page=${Math.max(1, input.page ?? 1)}`,
+    schema: z.array(githubIssueCommentSchema),
   });
 }
 
@@ -279,11 +453,12 @@ export async function createIssueReaction(input: {
   content: "+1" | "-1" | "laugh" | "confused" | "heart" | "hooray" | "rocket" | "eyes";
 }): Promise<{ id: number }> {
   const c = await ctx();
-  return await githubFetchJson<{ id: number }>({
+  return await githubFetchJson({
     ...c,
     path: `/repos/${input.owner}/${input.repo}/issues/${input.issueNumber}/reactions`,
     method: "POST",
     body: { content: input.content },
+    schema: githubIdSchema,
   });
 }
 
@@ -294,11 +469,12 @@ export async function createIssueCommentReaction(input: {
   content: "+1" | "-1" | "laugh" | "confused" | "heart" | "hooray" | "rocket" | "eyes";
 }): Promise<{ id: number }> {
   const c = await ctx();
-  return await githubFetchJson<{ id: number }>({
+  return await githubFetchJson({
     ...c,
     path: `/repos/${input.owner}/${input.repo}/issues/comments/${input.commentId}/reactions`,
     method: "POST",
     body: { content: input.content },
+    schema: githubIdSchema,
   });
 }
 
@@ -307,12 +483,14 @@ export async function listIssueReactions(input: {
   repo: string;
   issueNumber: number;
   limit: number;
+  page?: number;
 }): Promise<GithubReaction[]> {
   const c = await ctx();
   const perPage = Math.min(Math.max(input.limit, 1), 100);
   return await githubFetchJson({
     ...c,
-    path: `/repos/${input.owner}/${input.repo}/issues/${input.issueNumber}/reactions?per_page=${perPage}`,
+    path: `/repos/${input.owner}/${input.repo}/issues/${input.issueNumber}/reactions?per_page=${perPage}&page=${Math.max(1, input.page ?? 1)}`,
+    schema: z.array(githubReactionSchema),
   });
 }
 
@@ -321,12 +499,14 @@ export async function listIssueCommentReactions(input: {
   repo: string;
   commentId: number;
   limit: number;
+  page?: number;
 }): Promise<GithubReaction[]> {
   const c = await ctx();
   const perPage = Math.min(Math.max(input.limit, 1), 100);
   return await githubFetchJson({
     ...c,
-    path: `/repos/${input.owner}/${input.repo}/issues/comments/${input.commentId}/reactions?per_page=${perPage}`,
+    path: `/repos/${input.owner}/${input.repo}/issues/comments/${input.commentId}/reactions?per_page=${perPage}&page=${Math.max(1, input.page ?? 1)}`,
+    schema: z.array(githubReactionSchema),
   });
 }
 
@@ -345,6 +525,7 @@ export async function getPullRequest(input: {
   return await githubFetchJson({
     ...c,
     path: `/repos/${input.owner}/${input.repo}/pulls/${input.number}`,
+    schema: githubPullRequestSchema,
   });
 }
 
@@ -354,25 +535,6 @@ export async function getGithubUserLoginOrNull(): Promise<string | null> {
 
 export async function getConfiguredGithubAppIdOrNull(): Promise<number | null> {
   return (await readGithubAppSecret(env.dataDir))?.appId ?? null;
-}
-
-export type GithubAuthoritativeActor =
-  | { source: "app"; appId: number }
-  | { source: "user"; login: string };
-
-export async function getPreferredGithubAuthoritativeActorOrNull(
-  params: { dataDir: string } = { dataDir: env.dataDir },
-): Promise<GithubAuthoritativeActor | null> {
-  const user = await getGithubUserAuthOrNull(params);
-  if (user) {
-    const login = await resolveGithubViewerLoginOrThrow({
-      apiBaseUrl: user.apiBaseUrl,
-      token: user.token,
-    });
-    return { source: "user", login: login.toLowerCase() };
-  }
-  const app = await readGithubAppSecret(params.dataDir);
-  return app ? { source: "app", appId: app.appId } : null;
 }
 
 export async function getPreferredGithubActorLoginOrNull(): Promise<string | null> {
@@ -396,30 +558,60 @@ export async function getGithubAppSlugOrNull(): Promise<string | null> {
   if (!secret) return null;
 
   const apiBaseUrl = deriveApiBaseUrl({ host: secret.host, apiBaseUrl: secret.apiBaseUrl });
-  const privateKey = await readGithubAppPrivateKeyPem(secret);
+  const privateKey = await readGithubAppPrivateKeyPemResult(secret);
+  return privateKey.match({
+    err: () => async () => null,
+    ok: (privateKey) => async () => {
+      const authenticated = await captureGithubApiExternal(
+        async () => {
+          const auth = createAppAuth({
+            appId: secret.appId,
+            privateKey,
+            baseUrl: apiBaseUrl,
+          });
+          return await auth({ type: "app" });
+        },
+        (cause) => new Error("GitHub App authentication failed", { cause }),
+      );
+      return authenticated.match({
+        err: () => async () => null,
+        ok: (jwt) => async () => {
+          if (!jwt || typeof jwt.token !== "string" || jwt.token.length === 0) return null;
 
-  const auth = createAppAuth({
-    appId: secret.appId,
-    privateKey,
-    baseUrl: apiBaseUrl,
-  });
-
-  const jwt = await auth({ type: "app" });
-  if (!jwt || typeof jwt.token !== "string" || jwt.token.length === 0) {
-    return null;
-  }
-
-  const res = await fetch(`${apiBaseUrl.replace(/\/$/u, "")}/app`, {
-    headers: {
-      "User-Agent": "lilac",
-      Accept: "application/vnd.github+json",
-      "X-GitHub-Api-Version": "2022-11-28",
-      Authorization: `Bearer ${jwt.token}`,
+          const fetched = await captureGithubApiExternal(
+            () =>
+              fetch(`${apiBaseUrl.replace(/\/$/u, "")}/app`, {
+                headers: {
+                  "User-Agent": "lilac",
+                  Accept: "application/vnd.github+json",
+                  "X-GitHub-Api-Version": "2022-11-28",
+                  Authorization: `Bearer ${jwt.token}`,
+                },
+              }),
+            (cause) => new Error("GitHub App request failed", { cause }),
+          );
+          return fetched.match({
+            err: () => async () => null,
+            ok: (res) => async () => {
+              if (!res.ok) return null;
+              const body = await captureGithubAppResponse(res);
+              return body.match({
+                ok: (value) => (value.success ? value.data.slug : null),
+                err: () => null,
+              });
+            },
+          })();
+        },
+      })();
     },
-  });
-  if (!res.ok) return null;
-  const body: unknown = await res.json().catch(() => null as unknown);
-  if (!body || typeof body !== "object") return null;
-  const slug = (body as Record<string, unknown>)["slug"];
-  return typeof slug === "string" && slug.length > 0 ? slug : null;
+  })();
+}
+
+async function captureGithubAppResponse(
+  response: Response,
+): Promise<ResultType<ReturnType<typeof githubAppSchema.safeParse>, Error>> {
+  return captureGithubApiExternal(
+    async () => githubAppSchema.safeParse(await response.json()),
+    (cause) => new Error("GitHub App response unavailable", { cause }),
+  );
 }

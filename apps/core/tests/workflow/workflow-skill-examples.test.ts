@@ -1,7 +1,13 @@
 import { describe, expect, it } from "bun:test";
 import path from "node:path";
 
-import { validateWorkflowSource } from "../../src/workflow/workflow-definition";
+import { validateWorkflowSourceUnchecked } from "../../src/workflow/workflow-definition";
+
+function validateWorkflowSource(input: Parameters<typeof validateWorkflowSourceUnchecked>[0]) {
+  const result = validateWorkflowSourceUnchecked(input);
+  if (result.status === "error") throw result.error;
+  return result.value;
+}
 
 const SKILL_DIRECTORY = path.resolve(
   import.meta.dir,

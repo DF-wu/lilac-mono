@@ -1,6 +1,6 @@
 import { describe, expect, it } from "bun:test";
 
-import { parseSshHostsFromConfigText } from "../../src/tool-server/tools/ssh";
+import { parseSshHostsFromConfigText } from "../../src/ssh/ssh-config";
 
 describe("parseSshHostsFromConfigText", () => {
   it("parses simple Host aliases", () => {

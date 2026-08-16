@@ -1,7 +1,9 @@
 import { describe, expect, it } from "bun:test";
+import type { Result as ResultType } from "better-result";
 
 import type { StartOutputOpts } from "../../../src/surface/adapter";
 import type { MsgRef, TelegramSessionRef } from "../../../src/surface/types";
+import { projectTelegramError } from "../../../src/surface/telegram/telegram-error-projection";
 import {
   TelegramOutputStream,
   type TelegramDeleteMessageParams,
@@ -21,6 +23,11 @@ import {
 
 const SESSION: TelegramSessionRef = { platform: "telegram", channelId: "12345" };
 const TOPIC_SESSION: TelegramSessionRef = { platform: "telegram", channelId: "-100777:42" };
+
+function resultValue<T, E>(result: ResultType<T, E>): T {
+  if (result.status === "error") throw result.error;
+  return result.value;
+}
 
 /** A Bot API error the way grammY surfaces it. */
 class FakeApiError extends Error {
@@ -182,33 +189,53 @@ describe("cancel callback data", () => {
 describe("error type guards", () => {
   it("reads retry_after from a 429 response", () => {
     const error = new FakeApiError(429, "Too Many Requests: retry after 3", { retry_after: 3 });
-    expect(telegramRetryAfterSeconds(error)).toBe(3);
+    expect(telegramRetryAfterSeconds(projectTelegramError(error, "test failure"))).toBe(3);
   });
 
   it("treats a 429 without parameters as an immediate retry", () => {
-    expect(telegramRetryAfterSeconds(new FakeApiError(429, "Too Many Requests"))).toBe(0);
+    expect(
+      telegramRetryAfterSeconds(
+        projectTelegramError(new FakeApiError(429, "Too Many Requests"), "test failure"),
+      ),
+    ).toBe(0);
   });
 
   it("returns null for unrelated errors", () => {
-    expect(telegramRetryAfterSeconds(new Error("boom"))).toBeNull();
-    expect(telegramRetryAfterSeconds(null)).toBeNull();
-    expect(telegramRetryAfterSeconds("nope")).toBeNull();
+    expect(
+      telegramRetryAfterSeconds(projectTelegramError(new Error("boom"), "test failure")),
+    ).toBeNull();
+    expect(telegramRetryAfterSeconds(projectTelegramError(null, "test failure"))).toBeNull();
+    expect(telegramRetryAfterSeconds(projectTelegramError("nope", "test failure"))).toBeNull();
   });
 
   it("detects entity parse failures", () => {
     expect(
-      isTelegramEntityError(new FakeApiError(400, "Bad Request: can't parse entities: ...")),
+      isTelegramEntityError(
+        projectTelegramError(
+          new FakeApiError(400, "Bad Request: can't parse entities: ..."),
+          "test failure",
+        ),
+      ),
     ).toBe(true);
-    expect(isTelegramEntityError(new FakeApiError(400, "Bad Request: chat not found"))).toBe(false);
+    expect(
+      isTelegramEntityError(
+        projectTelegramError(new FakeApiError(400, "Bad Request: chat not found"), "test failure"),
+      ),
+    ).toBe(false);
   });
 
   it("detects the not-modified rejection", () => {
     expect(
       isTelegramNotModifiedError(
-        new FakeApiError(400, "Bad Request: message is not modified: ..."),
+        projectTelegramError(
+          new FakeApiError(400, "Bad Request: message is not modified: ..."),
+          "test failure",
+        ),
       ),
     ).toBe(true);
-    expect(isTelegramNotModifiedError(new Error("other"))).toBe(false);
+    expect(
+      isTelegramNotModifiedError(projectTelegramError(new Error("other"), "test failure")),
+    ).toBe(false);
   });
 });
 
@@ -261,7 +288,7 @@ describe("TelegramOutputStream streaming", () => {
     const harness = new TestHarness();
     const stream = createStream(harness);
 
-    await stream.push({ type: "text.delta", delta: "hello" });
+    resultValue(await stream.push({ type: "text.delta", delta: "hello" }));
     await stream.settled();
 
     expect(harness.sends.length).toBe(1);
@@ -274,9 +301,9 @@ describe("TelegramOutputStream streaming", () => {
     const harness = new TestHarness();
     const stream = createStream(harness, { streamEditIntervalMs: 1000 });
 
-    await stream.push({ type: "text.delta", delta: "a" });
+    resultValue(await stream.push({ type: "text.delta", delta: "a" }));
     await stream.settled();
-    await stream.push({ type: "text.delta", delta: "b" });
+    resultValue(await stream.push({ type: "text.delta", delta: "b" }));
     await harness.advance(500);
 
     expect(harness.edits.length).toBe(0);
@@ -286,10 +313,10 @@ describe("TelegramOutputStream streaming", () => {
     const harness = new TestHarness();
     const stream = createStream(harness, { streamEditIntervalMs: 1000 });
 
-    await stream.push({ type: "text.delta", delta: "a" });
+    resultValue(await stream.push({ type: "text.delta", delta: "a" }));
     await stream.settled();
-    await stream.push({ type: "text.delta", delta: "b" });
-    await stream.push({ type: "text.delta", delta: "c" });
+    resultValue(await stream.push({ type: "text.delta", delta: "b" }));
+    resultValue(await stream.push({ type: "text.delta", delta: "c" }));
     await harness.advance(1000);
 
     expect(harness.edits.length).toBe(1);
@@ -300,10 +327,10 @@ describe("TelegramOutputStream streaming", () => {
     const harness = new TestHarness();
     const stream = createStream(harness, { streamEditIntervalMs: 1000 });
 
-    await stream.push({ type: "text.delta", delta: "start" });
+    resultValue(await stream.push({ type: "text.delta", delta: "start" }));
     await stream.settled();
     for (let i = 0; i < 20; i += 1) {
-      await stream.push({ type: "text.delta", delta: ` ${i}` });
+      resultValue(await stream.push({ type: "text.delta", delta: ` ${i}` }));
     }
     await harness.advance(1000);
 
@@ -314,13 +341,13 @@ describe("TelegramOutputStream streaming", () => {
     const harness = new TestHarness();
     const stream = createStream(harness, { streamEditIntervalMs: 1000 });
 
-    await stream.push({ type: "text.delta", delta: "stable" });
+    resultValue(await stream.push({ type: "text.delta", delta: "stable" }));
     await stream.settled();
-    await stream.push({ type: "text.delta", delta: "" });
+    resultValue(await stream.push({ type: "text.delta", delta: "" }));
     await harness.advance(5000);
     const editsAfterNoop = harness.edits.length;
 
-    await stream.finish();
+    resultValue(await stream.finish());
     // The only edit is the finalisation (progress header/keyboard removal),
     // never a redundant re-send of identical content.
     expect(editsAfterNoop).toBe(0);
@@ -336,12 +363,12 @@ describe("TelegramOutputStream streaming", () => {
     );
     const stream = createStream(harness, { streamEditIntervalMs: 1000 });
 
-    await stream.push({ type: "text.delta", delta: "a" });
+    resultValue(await stream.push({ type: "text.delta", delta: "a" }));
     await stream.settled();
-    await stream.push({ type: "text.delta", delta: "b" });
+    resultValue(await stream.push({ type: "text.delta", delta: "b" }));
     await harness.advance(1000);
 
-    const result = await stream.finish();
+    const result = resultValue(await stream.finish());
     expect(result.created.length).toBe(1);
   });
 
@@ -349,7 +376,7 @@ describe("TelegramOutputStream streaming", () => {
     const harness = new TestHarness();
     const stream = createStream(harness, { session: TOPIC_SESSION });
 
-    await stream.push({ type: "text.set", text: "hi" });
+    resultValue(await stream.push({ type: "text.set", text: "hi" }));
     await stream.settled();
 
     expect(harness.sends[0]?.chat_id).toBe(-100777);
@@ -360,7 +387,7 @@ describe("TelegramOutputStream streaming", () => {
     const harness = new TestHarness();
     const stream = createStream(harness, { outputNotification: false });
 
-    await stream.push({ type: "text.set", text: "quiet" });
+    resultValue(await stream.push({ type: "text.set", text: "quiet" }));
     await stream.settled();
 
     expect(harness.sends[0]?.disable_notification).toBe(true);
@@ -371,7 +398,7 @@ describe("TelegramOutputStream streaming", () => {
     const replyTo: MsgRef = { platform: "telegram", channelId: "12345", messageId: "77" };
     const stream = createStream(harness, { opts: { replyTo } });
 
-    await stream.push({ type: "text.set", text: "answer" });
+    resultValue(await stream.push({ type: "text.set", text: "answer" }));
     await stream.settled();
 
     expect(harness.sends[0]?.reply_to_message_id).toBe(77);
@@ -383,16 +410,18 @@ describe("TelegramOutputStream progress header", () => {
     const harness = new TestHarness();
     const stream = createStream(harness, { streamEditIntervalMs: 1000 });
 
-    await stream.push({
-      type: "tool.status",
-      update: { toolCallId: "t1", display: "read(file.ts)", status: "start" },
-    });
+    resultValue(
+      await stream.push({
+        type: "tool.status",
+        update: { toolCallId: "t1", display: "read(file.ts)", status: "start" },
+      }),
+    );
     await stream.settled();
     expect(harness.sends[0]?.text).toContain("read(file.ts)");
 
-    await stream.push({ type: "text.delta", delta: "body text" });
+    resultValue(await stream.push({ type: "text.delta", delta: "body text" }));
     await harness.advance(1000);
-    await stream.finish();
+    resultValue(await stream.finish());
 
     const finalEdit = harness.edits.at(-1);
     expect(finalEdit?.text).toContain("body text");
@@ -403,10 +432,12 @@ describe("TelegramOutputStream progress header", () => {
     const harness = new TestHarness();
     const stream = createStream(harness);
 
-    await stream.push({
-      type: "tool.status",
-      update: { toolCallId: "t1", display: "bash(<script>x</script>)", status: "start" },
-    });
+    resultValue(
+      await stream.push({
+        type: "tool.status",
+        update: { toolCallId: "t1", display: "bash(<script>x</script>)", status: "start" },
+      }),
+    );
     await stream.settled();
 
     expect(harness.sends[0]?.text).toContain("&lt;script&gt;");
@@ -417,18 +448,18 @@ describe("TelegramOutputStream progress header", () => {
     const harness = new TestHarness();
     const stream = createStream(harness, { streamEditIntervalMs: 1000 });
 
-    await stream.push({ type: "reasoning.status", update: { startedAtMs: 0 } });
+    resultValue(await stream.push({ type: "reasoning.status", update: { startedAtMs: 0 } }));
     await stream.settled();
 
     await harness.advance(4000);
-    await stream.push({ type: "text.delta", delta: "answer" });
+    resultValue(await stream.push({ type: "text.delta", delta: "answer" }));
     await harness.advance(1000);
     const frozenEdit = harness.edits.at(-1)?.text ?? "";
     expect(frozenEdit).toContain("Thought for 4s");
 
     // More wall-clock time passes, but the frozen value must not advance.
     await harness.advance(10_000);
-    await stream.push({ type: "text.delta", delta: " more" });
+    resultValue(await stream.push({ type: "text.delta", delta: " more" }));
     await harness.advance(1000);
     expect(harness.edits.at(-1)?.text).toContain("Thought for 4s");
   });
@@ -437,14 +468,14 @@ describe("TelegramOutputStream progress header", () => {
     const harness = new TestHarness();
     const stream = createStream(harness, { streamEditIntervalMs: 1000 });
 
-    await stream.push({ type: "text.delta", delta: "answer" });
+    resultValue(await stream.push({ type: "text.delta", delta: "answer" }));
     await stream.settled();
-    await stream.push({ type: "meta.stats", line: "12 tok/s · 3.4s" });
+    resultValue(await stream.push({ type: "meta.stats", line: "12 tok/s · 3.4s" }));
     await harness.advance(1000);
 
     expect(harness.edits.every((edit) => !edit.text.includes("12 tok/s"))).toBe(true);
 
-    await stream.finish();
+    resultValue(await stream.finish());
     expect(harness.edits.at(-1)?.text).toContain("12 tok/s");
   });
 });
@@ -454,11 +485,11 @@ describe("TelegramOutputStream overflow", () => {
     const harness = new TestHarness();
     const stream = createStream(harness, { streamEditIntervalMs: 1000 });
 
-    await stream.push({ type: "text.delta", delta: "start" });
+    resultValue(await stream.push({ type: "text.delta", delta: "start" }));
     await stream.settled();
-    await stream.push({ type: "text.set", text: "word ".repeat(1500) });
+    resultValue(await stream.push({ type: "text.set", text: "word ".repeat(1500) }));
     await harness.advance(1000);
-    const result = await stream.finish();
+    const result = resultValue(await stream.finish());
 
     expect(result.created.length).toBeGreaterThan(1);
     expect(harness.sends.length).toBeGreaterThan(1);
@@ -470,12 +501,12 @@ describe("TelegramOutputStream overflow", () => {
     const harness = new TestHarness();
     const stream = createStream(harness);
 
-    await stream.push({ type: "text.set", text: "line\n".repeat(3000) });
+    resultValue(await stream.push({ type: "text.set", text: "line\n".repeat(3000) }));
     await stream.settled();
-    const result = await stream.finish();
+    const result = resultValue(await stream.finish());
 
     expect(result.created.length).toBeGreaterThan(1);
-    expect(result.last).toEqual(result.created.at(-1) as MsgRef);
+    expect(result.created.at(-1)).toEqual(result.last);
     for (const ref of result.created) {
       expect(ref.platform).toBe("telegram");
       expect(ref.channelId).toBe("12345");
@@ -491,9 +522,9 @@ describe("TelegramOutputStream overflow", () => {
       opts: { onMessageCreated: (ref) => seen.push(ref) },
     });
 
-    await stream.push({ type: "text.set", text: "hello" });
+    resultValue(await stream.push({ type: "text.set", text: "hello" }));
     await stream.settled();
-    await stream.finish();
+    resultValue(await stream.finish());
 
     expect(seen.length).toBe(1);
     expect(seen[0]?.messageId).toBe("1000");
@@ -518,7 +549,7 @@ describe("TelegramOutputStream failure handling", () => {
     expect(harness.pendingTimerCount).toBe(1);
 
     await harness.advance(2000);
-    await pushed;
+    resultValue(await pushed);
     await stream.settled();
 
     expect(harness.sends.length).toBe(2);
@@ -534,7 +565,7 @@ describe("TelegramOutputStream failure handling", () => {
     );
     const stream = createStream(harness);
 
-    await stream.push({ type: "text.set", text: "**bold** and `code`" });
+    resultValue(await stream.push({ type: "text.set", text: "**bold** and `code`" }));
     await stream.settled();
 
     expect(harness.sends.length).toBe(2);
@@ -548,7 +579,7 @@ describe("TelegramOutputStream failure handling", () => {
     const harness = new TestHarness();
     const stream = createStream(harness, { parseMode: "plain" });
 
-    await stream.push({ type: "text.set", text: "**bold**" });
+    resultValue(await stream.push({ type: "text.set", text: "**bold**" }));
     await stream.settled();
 
     expect(harness.sends[0]?.parse_mode).toBeUndefined();
@@ -573,7 +604,7 @@ describe("TelegramOutputStream cancel keyboard", () => {
     const harness = new TestHarness();
     const stream = createStream(harness, { opts: { requestId: "telegram:12345:9" } });
 
-    await stream.push({ type: "text.set", text: "working" });
+    resultValue(await stream.push({ type: "text.set", text: "working" }));
     await stream.settled();
 
     const markup = harness.sends[0]?.reply_markup;
@@ -587,9 +618,9 @@ describe("TelegramOutputStream cancel keyboard", () => {
     const harness = new TestHarness();
     const stream = createStream(harness, { opts: { requestId: "telegram:12345:9" } });
 
-    await stream.push({ type: "text.set", text: "working" });
+    resultValue(await stream.push({ type: "text.set", text: "working" }));
     await stream.settled();
-    await stream.finish();
+    resultValue(await stream.finish());
 
     expect(harness.edits.at(-1)?.reply_markup).toEqual({ inline_keyboard: [] });
   });
@@ -598,7 +629,7 @@ describe("TelegramOutputStream cancel keyboard", () => {
     const harness = new TestHarness();
     const stream = createStream(harness);
 
-    await stream.push({ type: "text.set", text: "working" });
+    resultValue(await stream.push({ type: "text.set", text: "working" }));
     await stream.settled();
 
     expect(harness.sends[0]?.reply_markup).toBeUndefined();
@@ -610,11 +641,11 @@ describe("TelegramOutputStream abort", () => {
     const harness = new TestHarness();
     const stream = createStream(harness, { outputMode: "preview" });
 
-    await stream.push({ type: "text.set", text: "draft output" });
+    resultValue(await stream.push({ type: "text.set", text: "draft output" }));
     await stream.settled();
     expect(harness.sends.length).toBe(1);
 
-    await stream.abort("cancel");
+    resultValue(await stream.abort("cancel"));
 
     expect(harness.deletes).toEqual([{ chat_id: 12345, message_id: 1000 }]);
   });
@@ -623,9 +654,9 @@ describe("TelegramOutputStream abort", () => {
     const harness = new TestHarness();
     const stream = createStream(harness, { outputMode: "inline" });
 
-    await stream.push({ type: "text.set", text: "partial output" });
+    resultValue(await stream.push({ type: "text.set", text: "partial output" }));
     await stream.settled();
-    await stream.abort("cancel");
+    resultValue(await stream.abort("cancel"));
 
     expect(harness.deletes.length).toBe(0);
     expect(harness.sends.at(-1)?.text).toContain("partial output");
@@ -641,9 +672,9 @@ describe("TelegramOutputStream abort", () => {
       opts: { requestId: "telegram:12345:9" },
     });
 
-    await stream.push({ type: "text.set", text: "partial output" });
+    resultValue(await stream.push({ type: "text.set", text: "partial output" }));
     await stream.settled();
-    await stream.abort("cancel");
+    resultValue(await stream.abort("cancel"));
 
     expect(harness.deletes.length).toBe(0);
     expect(harness.edits.at(-1)?.reply_markup).toEqual({ inline_keyboard: [] });
@@ -654,12 +685,14 @@ describe("TelegramOutputStream abort", () => {
     const harness = new TestHarness();
     const stream = createStream(harness, { outputMode: "inline" });
 
-    await stream.push({
-      type: "tool.status",
-      update: { toolCallId: "t1", display: "read(x)", status: "start" },
-    });
+    resultValue(
+      await stream.push({
+        type: "tool.status",
+        update: { toolCallId: "t1", display: "read(x)", status: "start" },
+      }),
+    );
     await stream.settled();
-    await stream.abort("cancel");
+    resultValue(await stream.abort("cancel"));
 
     expect(harness.edits.at(-1)?.text).toContain("Cancelled.");
   });
@@ -668,10 +701,10 @@ describe("TelegramOutputStream abort", () => {
     const harness = new TestHarness();
     const stream = createStream(harness, { outputMode: "preview", streamEditIntervalMs: 1000 });
 
-    await stream.push({ type: "text.delta", delta: "a" });
+    resultValue(await stream.push({ type: "text.delta", delta: "a" }));
     await stream.settled();
-    await stream.push({ type: "text.delta", delta: "b" });
-    await stream.abort("cancel");
+    resultValue(await stream.push({ type: "text.delta", delta: "b" }));
+    resultValue(await stream.abort("cancel"));
 
     const editsAtAbort = harness.edits.length;
     await harness.advance(5000);
@@ -685,10 +718,10 @@ describe("TelegramOutputStream abort", () => {
     );
     const stream = createStream(harness, { outputMode: "preview" });
 
-    await stream.push({ type: "text.set", text: "draft" });
+    resultValue(await stream.push({ type: "text.set", text: "draft" }));
     await stream.settled();
 
-    await stream.abort("cancel");
+    resultValue(await stream.abort("cancel"));
     expect(harness.deletes.length).toBe(1);
   });
 
@@ -696,7 +729,7 @@ describe("TelegramOutputStream abort", () => {
     const harness = new TestHarness();
     const stream = createStream(harness, { outputMode: "inline" });
 
-    await stream.abort("reanchor");
+    resultValue(await stream.abort("reanchor"));
 
     expect(harness.calls.length).toBe(0);
   });
@@ -717,7 +750,7 @@ describe("TelegramOutputStream lifecycle", () => {
     const harness = new TestHarness();
     const stream = createStream(harness);
 
-    const result = await stream.finish();
+    const result = resultValue(await stream.finish());
 
     expect(harness.sends.length).toBe(1);
     expect(harness.sends[0]?.text).toContain("no output");
@@ -728,15 +761,17 @@ describe("TelegramOutputStream lifecycle", () => {
     const harness = new TestHarness();
     const stream = createStream(harness);
 
-    await stream.push({
-      type: "attachment.add",
-      attachment: {
-        kind: "file",
-        mimeType: "text/plain",
-        filename: "a.txt",
-        bytes: new Uint8Array([1, 2, 3]),
-      },
-    });
+    resultValue(
+      await stream.push({
+        type: "attachment.add",
+        attachment: {
+          kind: "file",
+          mimeType: "text/plain",
+          filename: "a.txt",
+          bytes: new Uint8Array([1, 2, 3]),
+        },
+      }),
+    );
     await stream.settled();
 
     expect(harness.calls.length).toBe(0);
@@ -751,13 +786,13 @@ describe("TelegramOutputStream lifecycle", () => {
     const resumed: MsgRef = { platform: "telegram", channelId: "12345", messageId: "555" };
     const stream = createStream(harness, { opts: { resume: { created: [resumed] } } });
 
-    await stream.push({ type: "text.set", text: "continued" });
+    resultValue(await stream.push({ type: "text.set", text: "continued" }));
     await stream.settled();
 
     expect(harness.sends.length).toBe(0);
     expect(harness.edits[0]?.message_id).toBe(555);
 
-    const result = await stream.finish();
+    const result = resultValue(await stream.finish());
     expect(result.created[0]).toEqual(resumed);
   });
 });

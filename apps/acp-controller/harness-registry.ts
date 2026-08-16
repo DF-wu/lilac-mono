@@ -2,6 +2,10 @@ import { constants } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
 
+import { Result, type Result as ResultType } from "better-result";
+
+import { captureExternal } from "./external-adapters.ts";
+import type { ExternalOperationFailed } from "./failures.ts";
 import type { HarnessDescriptor, ResolvedHarness } from "./types.ts";
 
 const BUILTIN_HARNESSES: readonly HarnessDescriptor[] = [
@@ -41,18 +45,21 @@ function pathEntries(): string[] {
   return raw.split(path.delimiter).filter((entry) => entry.length > 0);
 }
 
-async function isExecutable(filePath: string): Promise<boolean> {
-  try {
-    await fs.access(filePath, constants.X_OK);
-    return true;
-  } catch {
-    return false;
-  }
+async function isExecutable(
+  filePath: string,
+): Promise<ResultType<boolean, ExternalOperationFailed>> {
+  const accessed = await captureExternal("access-harness", () =>
+    fs.access(filePath, constants.X_OK),
+  );
+  return accessed.map(() => true);
 }
 
-async function resolveCommand(command: string): Promise<string | null> {
+async function resolveCommand(
+  command: string,
+): Promise<ResultType<string | null, ExternalOperationFailed>> {
   if (command.includes(path.sep)) {
-    return (await isExecutable(command)) ? command : null;
+    const executable = await isExecutable(command);
+    return executable.map((value) => (value ? command : null));
   }
 
   const extensions =
@@ -68,11 +75,20 @@ async function resolveCommand(command: string): Promise<string | null> {
         entry,
         process.platform === "win32" ? `${command}${extension}` : command,
       );
-      if (await isExecutable(fullPath)) return fullPath;
+      const executable = await isExecutable(fullPath);
+      const resolution = executable.match<ResultType<
+        string | null,
+        ExternalOperationFailed
+      > | null>({
+        ok: (value) => (value ? Result.ok(fullPath) : null),
+        err: (error) =>
+          error.code === "ENOENT" || error.code === "EACCES" ? null : Result.err(error),
+      });
+      if (resolution !== null) return resolution;
     }
   }
 
-  return null;
+  return Result.ok(null);
 }
 
 export function listBuiltinHarnesses(): readonly HarnessDescriptor[] {
@@ -83,32 +99,40 @@ export function getHarnessDescriptor(harnessId: string): HarnessDescriptor | nul
   return BUILTIN_HARNESSES.find((entry) => entry.id === harnessId) ?? null;
 }
 
-export async function resolveHarness(harnessId: string): Promise<ResolvedHarness | null> {
+export async function resolveHarness(
+  harnessId: string,
+): Promise<ResultType<ResolvedHarness | null, ExternalOperationFailed>> {
   const descriptor = getHarnessDescriptor(harnessId);
-  if (!descriptor) return null;
+  if (!descriptor) return Result.ok(null);
 
   for (const candidate of descriptor.launchCandidates) {
     const resolvedCommand = await resolveCommand(candidate.command);
-    if (!resolvedCommand) continue;
-    return {
+    const resolutionError = resolvedCommand.match({ ok: () => undefined, err: (error) => error });
+    if (resolutionError !== undefined) return Result.err(resolutionError);
+    const command = resolvedCommand.match({ ok: (value) => value, err: () => null });
+    if (!command) continue;
+    return Result.ok({
       descriptor,
-      command: resolvedCommand,
+      command,
       args: candidate.args,
       source: candidate.source,
-    };
+    });
   }
 
-  return null;
+  return Result.ok(null);
 }
 
 export async function listResolvedHarnesses(): Promise<
-  Array<{
-    descriptor: HarnessDescriptor;
-    launchable: boolean;
-    command?: string;
-    args?: readonly string[];
-    source?: "path" | "fallback";
-  }>
+  ResultType<
+    Array<{
+      descriptor: HarnessDescriptor;
+      launchable: boolean;
+      command?: string;
+      args?: readonly string[];
+      source?: "path" | "fallback";
+    }>,
+    ExternalOperationFailed
+  >
 > {
   const results: Array<{
     descriptor: HarnessDescriptor;
@@ -120,18 +144,21 @@ export async function listResolvedHarnesses(): Promise<
 
   for (const descriptor of BUILTIN_HARNESSES) {
     const resolved = await resolveHarness(descriptor.id);
-    if (resolved) {
+    const resolutionError = resolved.match({ ok: () => undefined, err: (error) => error });
+    if (resolutionError !== undefined) return Result.err(resolutionError);
+    const harness = resolved.match({ ok: (value) => value, err: () => null });
+    if (harness) {
       results.push({
         descriptor,
         launchable: true,
-        command: resolved.command,
-        args: resolved.args,
-        source: resolved.source,
+        command: harness.command,
+        args: harness.args,
+        source: harness.source,
       });
       continue;
     }
     results.push({ descriptor, launchable: false });
   }
 
-  return results;
+  return Result.ok(results);
 }

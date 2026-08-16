@@ -4,6 +4,7 @@ export * from "./atomic-tool-execution";
 export * from "./auto-compaction";
 export * from "./openai-server-compaction";
 export * from "./context-overflow";
+export * from "./failure-adapters";
 export * from "./recovery-checkpoint";
 export * from "./retry-backoff";
 export * from "./session-continuation";

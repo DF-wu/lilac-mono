@@ -8,6 +8,10 @@ tools:
       providers: [tavily]
     fetch:
       mode: auto
+    # Optional independent process-local limits for Firecrawl fetch and search calls.
+    # firecrawl:
+    #   maxConcurrency: 2
+    #   queueTtl: 3s
   inspect:
     # Must start with google/.
     model: google/gemini-3.5-flash
@@ -78,6 +82,9 @@ conversation:
       # inherits conversation.thread.summarization.model. Accepts main, fast,
       # a models.def alias, or a direct provider/model ref.
       plannerModel: fast
+      # Optional model used instead of plannerModel when the composed user input
+      # contains only text. Accepts the same model values as plannerModel.
+      # textPlannerModel: fast
       # Minimum authored text mass after removing URLs, Discord syntax, punctuation,
       # and discounting code blocks. 80 is a moderate Discord default.
       minTextUnits: 80
@@ -103,7 +110,10 @@ surface:
     # - active: treat the channel like a DM (respond to everything)
     defaultMode: mention
 
-    # Per-session routing mode overrides. Key is the session/channel id.
+    # Per-session overrides. Key is the session/channel id.
+    # A Discord server/guild id can provide additionalPrompts as a fallback for
+    # its channels. Prompt precedence is thread/channel, parent channel, then guild.
+    # An explicit additionalPrompts: [] disables broader prompt inheritance.
     # Reserved internal keys: "__heartbeat__" (canonical) and "heartbeat" (alias)
     # target the autonomous heartbeat lane.
     sessionModes: {}
@@ -126,6 +136,9 @@ surface:
     #     additionalPrompts:
     #       - "Keep replies concise for this session."
     #       - "file:///abs/path/to/session-memo.md"
+    #   "234567890123456789": # Discord server/guild id
+    #     additionalPrompts:
+    #       - "Default memo for channels in this server."
     #   "__heartbeat__":
     #     # Optional: override the internal heartbeat lane model.
     #     # The convenience alias "heartbeat" is also accepted.
@@ -193,6 +206,16 @@ surface:
       # - list: render a wrapped row/key-value list in a text codeblock
       # - passthrough: keep original markdown table unchanged
       fallbackMode: list
+
+    markdownMathRender:
+      # Render markdown math expressions. Disabled by default.
+      enabled: false
+      # Maximum rendered math width in display cells.
+      maxWidth: 50
+      # Fallback when math cannot render within maxWidth:
+      # - source: show the original markdown math source as code
+      # - passthrough: pass the original content through unchanged
+      fallbackMode: source
 
   # Telegram surface (opt-in). Requires configVersion 2.
   # See docs/telegram-surface.md for BotFather setup and group privacy notes.
@@ -267,7 +290,6 @@ surface:
       style: unicode
       maxWidth: 50
       fallbackMode: list
-
   heartbeat:
     # Enable the internal autonomous heartbeat lane.
     enabled: false
@@ -332,7 +354,7 @@ agent:
         modelSlot: main
         # Profile behavior applies identically to direct and workflow launches.
         level1:
-          tools: [read_file, glob, grep, fuzzy_search, batch]
+          tools: [bash, read, glob, grep, fuzzy_search, batch]
           plugins: [builtin-local-tools]
         level2:
           callables:
@@ -354,10 +376,12 @@ agent:
               surface.reactions.listDetailed,
             ]
           plugins: [web, skills, content.inspect, discovery, conversation.thread, surface]
-        # Behavioral/tool-surface settings; these do not sandbox trusted Bash.
+        # Behavioral/tool-surface settings. execution accepts false, restricted,
+        # or native. restricted uses the virtual restricted Bash implementation;
+        # native uses trusted host Bash unless the surface is restricted.
         network: true
         workspaceWrites: false
-        execution: false
+        execution: restricted
         delegation: false
         # Optional direct model override. Can be provider/model or an alias from models.def.
         # model: "openrouter/openai/gpt-4o"
@@ -381,7 +405,7 @@ agent:
         level2: { callables: ["*"], plugins: ["*"] }
         network: true
         workspaceWrites: true
-        execution: true
+        execution: native
         delegation: false
         # model: "openrouter/openai/gpt-4o"
         # reasoning: medium
@@ -396,7 +420,7 @@ agent:
         level2: { callables: ["*"], plugins: ["*"] }
         network: true
         workspaceWrites: true
-        execution: true
+        execution: native
         delegation: true
         # Self subagent is an isolated fork of the primary agent prompt/tooling.
         # model: "openrouter/openai/gpt-4o"

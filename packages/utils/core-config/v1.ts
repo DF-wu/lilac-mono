@@ -1,3 +1,4 @@
+import { Result, TaggedError, type Result as ResultType } from "better-result";
 import { z } from "zod";
 
 import { cloneDefaultWorkingIndicators } from "../working-indicators";
@@ -114,7 +115,7 @@ export const routerSchema = z
   .object({
     /** Default behavior for channels unless overridden by sessionModes. */
     defaultMode: z.enum(["mention", "active"]).default("mention"),
-    /** Per-session routing mode overrides. Key is session/channel id. */
+    /** Per-session overrides. Discord guild keys provide additionalPrompts fallback only. */
     sessionModes: z
       .record(
         z.string().min(1),
@@ -233,8 +234,8 @@ const discordSurfaceSchema = z
     },
   });
 
-const webExtractProviderSchema = z.enum(["tavily", "exa", "firecrawl"]);
-const webFetchModeSchema = z
+export const webExtractProviderSchema = z.enum(["tavily", "exa", "firecrawl"]);
+export const webFetchModeSchema = z
   .enum(["auto", "fetch", "browser", "extract", "provider-only"])
   .default("auto");
 
@@ -249,58 +250,38 @@ function uniqueItems<T>(items: readonly T[]): T[] {
   return unique;
 }
 
-const webExtractProvidersSchema = z
+export const webExtractProvidersSchema = z
   .array(webExtractProviderSchema)
   .min(1)
   .transform((providers) => uniqueItems(providers))
   .default(["tavily"]);
 
-const webExtractConfigValueSchema = z.preprocess(
-  (value) => {
-    if (typeof value !== "object" || value === null || Array.isArray(value)) {
-      return value;
-    }
+export function migrateWebExtractConfigValue(value: unknown): unknown {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return value;
+  const providers = Reflect.get(value, "providers");
+  const provider = Reflect.get(value, "provider");
+  if (providers !== undefined || provider === undefined) return value;
+  return { ...value, providers: [provider] };
+}
 
-    const extractConfig = value as {
-      provider?: unknown;
-      providers?: unknown;
-    };
-
-    if (extractConfig.providers !== undefined || extractConfig.provider === undefined) {
-      return value;
-    }
-
-    return {
-      ...extractConfig,
-      providers: [extractConfig.provider],
-    };
-  },
+export const webExtractConfigValueSchema = z.preprocess(
+  migrateWebExtractConfigValue,
   z.object({
     providers: webExtractProvidersSchema,
   }),
 );
 
+export function migrateWebConfigValue(value: unknown): unknown {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return value;
+  const extract = Reflect.get(value, "extract");
+  const search = Reflect.get(value, "search");
+  if (extract !== undefined || search === undefined) return value;
+  return { ...value, extract: search };
+}
+
 export const webExtractConfigSchema = z
   .preprocess(
-    (value) => {
-      if (typeof value !== "object" || value === null || Array.isArray(value)) {
-        return value;
-      }
-
-      const webConfig = value as {
-        extract?: unknown;
-        search?: unknown;
-      };
-
-      if (webConfig.extract !== undefined || webConfig.search === undefined) {
-        return value;
-      }
-
-      return {
-        ...webConfig,
-        extract: webConfig.search,
-      };
-    },
+    migrateWebConfigValue,
     z.object({
       extract: webExtractConfigValueSchema.default({
         providers: ["tavily"],
@@ -453,7 +434,9 @@ export const heartbeatSchema = z
   .object({
     enabled: z.boolean().default(false),
     cron: cronExpr5Schema.default("*/30 * * * *"),
-    every: z.unknown().optional(),
+    every: z
+      .never({ error: "surface.heartbeat.every has been removed; use surface.heartbeat.cron" })
+      .optional(),
     quietAfterActivityMs: z
       .number()
       .int()
@@ -472,15 +455,6 @@ export const heartbeatSchema = z
         timezone: z.string().trim().min(1).optional(),
       })
       .optional(),
-  })
-  .superRefine((value, ctx) => {
-    if (value.every !== undefined) {
-      ctx.addIssue({
-        code: "custom",
-        path: ["every"],
-        message: "surface.heartbeat.every has been removed; use surface.heartbeat.cron",
-      });
-    }
   })
   .transform((value) => ({
     enabled: value.enabled,
@@ -681,15 +655,34 @@ export const coreConfigSchema = coreConfigInputSchemaV1;
 
 export type ParsedCoreConfigV1 = z.infer<typeof coreConfigInputSchemaV1>;
 
+export class CoreConfigV1Invalid extends TaggedError("CoreConfigV1Invalid")<{
+  readonly cause: z.ZodError;
+  readonly message: string;
+}> {}
+
+export function decodeCoreConfigV1(
+  raw: unknown,
+): ResultType<ParsedCoreConfigV1, CoreConfigV1Invalid> {
+  const parsed = coreConfigInputSchemaV1.safeParse(raw);
+  return parsed.success
+    ? Result.ok(parsed.data)
+    : Result.err(
+        new CoreConfigV1Invalid({
+          cause: parsed.error,
+          message: parsed.error.issues.map((issue) => issue.message).join("; "),
+        }),
+      );
+}
+
 export function parseCoreConfigV1(raw: unknown): ParsedCoreConfigV1 {
   return coreConfigInputSchemaV1.parse(raw);
 }
 
-export function parseCoreConfigV1ToUniversal(
+function coreConfigV1ToUniversal(
+  parsed: ParsedCoreConfigV1,
   raw: unknown,
   options?: CoreConfigParseOptions,
 ): UniversalCoreConfig {
-  const parsed = parseCoreConfigV1(raw);
   if (options?.onUnknownKey) {
     for (const path of collectUnknownConfigKeyPaths(raw, parsed)) {
       options.onUnknownKey(path);
@@ -767,6 +760,11 @@ export function parseCoreConfigV1ToUniversal(
         ...discordRest,
         outputPreviewModeFinalStyle: previewFinalOutputStyle,
         markdownTableRender: experimental.markdownTableRender,
+        markdownMathRender: {
+          enabled: false,
+          maxWidth: 50,
+          fallbackMode: "source",
+        },
       },
       // v1's input schema is frozen, so the Telegram surface cannot be
       // configured on v1. Synthesise the v2 defaults (disabled) so both
@@ -785,7 +783,7 @@ export function parseCoreConfigV1ToUniversal(
           explore: {
             ...subagents.profiles.explore,
             level1: {
-              tools: ["read_file", "glob", "grep", "fuzzy_search", "batch"],
+              tools: ["read", "glob", "grep", "fuzzy_search", "batch"],
               plugins: ["builtin-local-tools"],
             },
             level2: {
@@ -826,7 +824,7 @@ export function parseCoreConfigV1ToUniversal(
             level2: { callables: ["*"], plugins: ["*"] },
             network: true,
             workspaceWrites: true,
-            execution: true,
+            execution: "native",
             delegation: false,
           },
           self: {
@@ -835,7 +833,7 @@ export function parseCoreConfigV1ToUniversal(
             level2: { callables: ["*"], plugins: ["*"] },
             network: true,
             workspaceWrites: true,
-            execution: true,
+            execution: "native",
             delegation: true,
           },
         },
@@ -851,6 +849,33 @@ export function parseCoreConfigV1ToUniversal(
       ),
     },
   };
+}
+
+export function decodeCoreConfigV1ToUniversal(
+  raw: unknown,
+  options?: CoreConfigParseOptions,
+): ResultType<UniversalCoreConfig, CoreConfigV1Invalid> {
+  const parsed = decodeCoreConfigV1(raw);
+  const continueDecode = parsed.match<() => ResultType<UniversalCoreConfig, CoreConfigV1Invalid>>({
+    ok: (value) => () => Result.ok(coreConfigV1ToUniversal(value, raw, options)),
+    err: (error) => () => Result.err(error),
+  });
+  return continueDecode();
+}
+
+export function parseCoreConfigV1ToUniversal(
+  raw: unknown,
+  options?: CoreConfigParseOptions,
+): UniversalCoreConfig {
+  const result = decodeCoreConfigV1ToUniversal(raw, options);
+  const resolved = result.match<
+    { readonly value: UniversalCoreConfig } | { readonly error: CoreConfigV1Invalid }
+  >({
+    ok: (value) => ({ value }),
+    err: (error) => ({ error }),
+  });
+  if ("error" in resolved) throw resolved.error.cause;
+  return resolved.value;
 }
 
 export class V1CoreConfigParser implements ConfigParser {

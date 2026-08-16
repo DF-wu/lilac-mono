@@ -1,4 +1,5 @@
 import { Buffer } from "node:buffer";
+import type { AdapterPlatform } from "@stanley2058/lilac-event-bus";
 
 import {
   ActionRowBuilder,
@@ -6,22 +7,38 @@ import {
   ButtonStyle,
   Colors,
   type Client,
+  type Channel,
   EmbedBuilder,
   type Message,
   type MessageCreateOptions,
-  type TextBasedChannel,
 } from "discord.js";
 
 import { createWorkingIndicatorQueue, formatWorkingStatus } from "@stanley2058/lilac-utils";
+import { Panic, Result, TaggedError, type Result as ResultType } from "better-result";
 
 import type {
   StartOutputOpts,
   SurfaceOutputPart,
+  SurfaceOutputPartDisposition,
   SurfaceOutputResult,
   SurfaceOutputStream,
   SurfaceToolStatusUpdate,
 } from "../../adapter";
-import type { ContentOpts, MsgRef, SessionRef, SurfaceAttachment } from "../../types";
+import {
+  SurfacePlatformMismatch,
+  SurfaceOperationPartiallyCompleted,
+  SurfaceUnavailable,
+  surfaceExternalFallback,
+  type SurfaceOperation,
+  type SurfaceOperationResult,
+} from "../../adapter";
+import type {
+  ContentOpts,
+  DiscordSessionRef,
+  MsgRef,
+  SessionRef,
+  SurfaceAttachment,
+} from "../../types";
 import { isSubagentToolDisplay, mergeSubagentToolStatus } from "../../subagent-tool-status";
 import type { MarkdownTableRenderOptions } from "../../../shared/markdown-table-renderer";
 
@@ -30,8 +47,15 @@ import type { MarkdownTableRenderOptions } from "../../../shared/markdown-table-
 import { getEmbedPusherConstants, startEmbedPusher } from "./embed-pusher";
 import { chunkMarkdownForEmbeds } from "./markdown-chunker";
 import { normalizeDiscordBlockquotes } from "./discord-markdown-normalize";
+import {
+  renderDiscordMarkdownMath,
+  type DiscordMarkdownMathRenderOptions,
+  type DiscordMarkdownMathRenderPhase,
+} from "./discord-markdown-math-renderer";
 import { renderMarkdownTablesAsCodeBlocks } from "../../../shared/markdown-table-renderer";
 import { buildCancelCustomId } from "../discord-cancel";
+import { isTextSendableChannel, type SendableDiscordChannel } from "../discord-channel-guards";
+import { classifyDiscordSurfaceError, classifyDiscordSurfaceNotFound } from "../discord-adapter";
 
 function asDiscordMsgRef(channelId: string, messageId: string): MsgRef {
   return { platform: "discord", channelId, messageId };
@@ -73,6 +97,76 @@ const SUBAGENT_MODEL_TAIL_CHARS = 7;
 const SUBAGENT_CHILD_DISPLAY_MAX_CHARS = 48;
 const SUBAGENT_CURRENT_TOOL_MAX_CHARS = 16;
 const PROGRESS_LINE_MAX_CHARS = 90;
+
+class DiscordOutputPlatformUnsupported extends TaggedError("DiscordOutputPlatformUnsupported")<{
+  readonly platform: AdapterPlatform;
+  readonly message: string;
+}> {}
+
+class DiscordOutputChannelUnavailable extends TaggedError("DiscordOutputChannelUnavailable")<{
+  readonly channelId: string;
+  readonly message: string;
+}> {}
+
+class DiscordOutputInvariantViolation extends TaggedError("DiscordOutputInvariantViolation")<{
+  readonly message: string;
+}> {}
+
+async function captureDiscordOutputOperation<T>(
+  operation: SurfaceOperation,
+  effect: () => Promise<T>,
+): Promise<SurfaceOperationResult<T>> {
+  try {
+    return Result.ok(await effect());
+  } catch (cause) {
+    if (Panic.is(cause)) throw cause;
+    if (cause instanceof DiscordOutputPlatformUnsupported) {
+      return Result.err(
+        new SurfacePlatformMismatch({
+          operation,
+          refRole: "sessionRef",
+          expectedPlatform: "discord",
+          receivedPlatform: cause.platform,
+          message: cause.message,
+        }),
+      );
+    }
+    if (cause instanceof DiscordOutputChannelUnavailable) {
+      return Result.err(
+        new SurfaceUnavailable({ platform: "discord", operation, message: cause.message }),
+      );
+    }
+    if (cause instanceof DiscordOutputInvariantViolation) {
+      throw new Panic({ message: "Discord output invariant violated", cause });
+    }
+    const classified = classifyDiscordSurfaceError(operation, cause);
+    if (classified) return Result.err(classified);
+    throw cause;
+  }
+}
+
+function discordOutputSessionResult(
+  sessionRef: SessionRef,
+): ResultType<DiscordSessionRef, DiscordOutputPlatformUnsupported> {
+  if (sessionRef.platform === "discord") return Result.ok(sessionRef);
+  return Result.err(
+    new DiscordOutputPlatformUnsupported({
+      platform: sessionRef.platform,
+      message: `Unsupported surface platform: ${sessionRef.platform}`,
+    }),
+  );
+}
+
+function finalDiscordMessageResult(
+  message: Message | undefined,
+): ResultType<Message, DiscordOutputInvariantViolation> {
+  if (message) return Result.ok(message);
+  return Result.err(
+    new DiscordOutputInvariantViolation({
+      message: "DiscordOutputStream produced no final messages",
+    }),
+  );
+}
 
 type DiscordOutputMode = "inline" | "preview";
 type DiscordPreviewFinalOutputStyle = "embed" | "plain";
@@ -117,9 +211,30 @@ function isBatchToolDisplay(display: string): boolean {
   return trimmed.startsWith("batch") || trimmed.startsWith("[batch]");
 }
 
+function normalizeRestoredBuiltinToolDisplay(display: string): string {
+  return display.replace(
+    /^(?<prefix>(?:[|`]-\s+(?:[▶…✓✗]\s+)?)?)(?<name>read_file|edit_file|apply_patch)(?=$|\s|\()/u,
+    (_match, prefix: string, name: string) => {
+      switch (name) {
+        case "read_file":
+          return `${prefix}read`;
+        case "edit_file":
+          return `${prefix}edit`;
+        case "apply_patch":
+          return `${prefix}patch`;
+        default:
+          return `${prefix}${name}`;
+      }
+    },
+  );
+}
+
 function normalizeToolDisplayForDiscord(display: string): string {
-  if (isBatchToolDisplay(display) || isSubagentToolDisplay(display)) return display;
-  return display
+  if (isSubagentToolDisplay(display)) return display;
+  if (isBatchToolDisplay(display)) {
+    return display.split("\n").map(normalizeRestoredBuiltinToolDisplay).join("\n");
+  }
+  return normalizeRestoredBuiltinToolDisplay(display)
     .replace(/\s*\n+\s*/g, " ")
     .replace(/\s+/g, " ")
     .trim();
@@ -266,8 +381,9 @@ function statusIcon(update: SurfaceToolStatusUpdate): "▶" | "…" | "✓" | "�
 function currentToolName(parsed: ParsedSubagentDisplay): string | null {
   const child = [...parsed.children].reverse().find((candidate) => candidate.icon === ">") ?? null;
   if (!child) return null;
-  const bracketed = /^\[([^\]]+)\]/u.exec(child.display)?.[1];
-  const tool = bracketed ?? child.display.split(/[\s(]/u, 1)[0];
+  const display = normalizeRestoredBuiltinToolDisplay(child.display);
+  const bracketed = /^\[([^\]]+)\]/u.exec(display)?.[1];
+  const tool = bracketed ?? display.split(/[\s(]/u, 1)[0];
   if (!tool) return null;
   return clampWithEllipsis(tool, SUBAGENT_CURRENT_TOOL_MAX_CHARS);
 }
@@ -313,7 +429,7 @@ function buildSubagentChildLines(parsed: ParsedSubagentDisplay, maxChildren: num
   return children.map((child, index) => {
     const branch = index === children.length - 1 ? "`-" : "|-";
     const display = clampWithEllipsis(
-      child.display.replace(/\s+/gu, " ").trim(),
+      normalizeRestoredBuiltinToolDisplay(child.display).replace(/\s+/gu, " ").trim(),
       SUBAGENT_CHILD_DISPLAY_MAX_CHARS,
     );
     return escapeDiscordMarkdown(`${branch} ${child.icon} ${display}`);
@@ -376,12 +492,13 @@ export function buildDiscordProgressLines(input: {
   ].sort((a, b) => b.entry.updatedSeq - a.entry.updatedSeq);
   for (const { rows } of historyByRecency) {
     if (remainingToolLines === 0) break;
-    const selectedRows =
-      rows.length <= remainingToolLines
-        ? rows
-        : remainingToolLines === 1
+    let selectedRows = rows;
+    if (rows.length > remainingToolLines) {
+      selectedRows =
+        remainingToolLines === 1
           ? rows.slice(0, 1)
           : [rows[0]!, ...rows.slice(-(remainingToolLines - 1))];
+    }
     toolChunks.unshift(selectedRows);
     remainingToolLines -= selectedRows.length;
   }
@@ -431,31 +548,34 @@ function buildFinalStatsFieldValue(line: string): string {
   return wrapped.slice(0, maxLength - overflow.length) + overflow;
 }
 
-async function fetchTextChannel(client: Client, channelId: string): Promise<TextBasedChannel> {
-  const ch = (await client.channels.fetch(channelId).catch(() => null)) as TextBasedChannel | null;
-  if (!ch || !("send" in ch)) {
-    throw new Error(`Discord channel not found or not text-based: ${channelId}`);
+async function fetchTextChannelResult(
+  client: Client,
+  channelId: string,
+): Promise<ResultType<Channel & SendableDiscordChannel, DiscordOutputChannelUnavailable>> {
+  const ch = await client.channels.fetch(channelId);
+  if (!isTextSendableChannel(ch)) {
+    return Result.err(
+      new DiscordOutputChannelUnavailable({
+        channelId,
+        message: `Discord channel not found or not text-based: ${channelId}`,
+      }),
+    );
   }
-  return ch;
+  return Result.ok(ch);
 }
 
 async function fetchExistingMessagesForResume(params: {
-  channel: TextBasedChannel;
+  channel: Channel & SendableDiscordChannel;
   channelId: string;
   refs: readonly MsgRef[];
 }): Promise<Message[]> {
   const { channel, channelId, refs } = params;
   if (refs.length === 0) return [];
 
-  const messagesApi = (
-    channel as unknown as {
-      messages?: { fetch: (messageId: string) => Promise<Message> };
-    }
-  ).messages;
-
-  if (!messagesApi || typeof messagesApi.fetch !== "function") {
+  if (!("messages" in channel) || typeof channel.messages?.fetch !== "function") {
     return [];
   }
+  const messagesApi = channel.messages;
 
   const out: Message[] = [];
   const seen = new Set<string>();
@@ -465,8 +585,14 @@ async function fetchExistingMessagesForResume(params: {
     if (ref.channelId !== channelId) continue;
     if (seen.has(ref.messageId)) continue;
 
-    const msg = await messagesApi.fetch(ref.messageId).catch(() => null);
-    if (!msg) continue;
+    let msg: Message;
+    try {
+      msg = await messagesApi.fetch(ref.messageId);
+    } catch (cause) {
+      if (Panic.is(cause)) throw cause;
+      if (classifyDiscordSurfaceNotFound(cause)) continue;
+      throw cause;
+    }
 
     seen.add(ref.messageId);
     out.push(msg);
@@ -487,12 +613,20 @@ function toDiscordFiles(attachments: readonly SurfaceAttachment[]): MessageCreat
 }
 
 async function safeEdit(msg: Message, options: Parameters<Message["edit"]>[0]): Promise<boolean> {
-  try {
-    await msg.edit(options);
-    return true;
-  } catch {
-    return false;
-  }
+  const edited = await Result.tryPromise({
+    try: () => msg.edit(options),
+    catch: surfaceExternalFallback(false),
+  });
+  return edited.match({ ok: () => true, err: () => false });
+}
+
+function adaptDiscordOutputResultToHost<T, E>(result: ResultType<T, E>): T {
+  return result.match<() => T>({
+    ok: (value) => () => value,
+    err: (error) => () => {
+      throw error;
+    },
+  })();
 }
 
 export class DiscordOutputStream implements SurfaceOutputStream {
@@ -527,6 +661,7 @@ export class DiscordOutputStream implements SurfaceOutputStream {
   private usedEmbedPusher = false;
   private finalTextSegments: readonly string[] | null = null;
   private renderedTextCacheInput: string | null = null;
+  private renderedTextCachePhase: DiscordMarkdownMathRenderPhase | null = null;
   private renderedTextCacheOutput = "";
 
   constructor(
@@ -537,6 +672,7 @@ export class DiscordOutputStream implements SurfaceOutputStream {
       useSmartSplitting: boolean;
       rewriteText?: (text: string) => string;
       markdownTableRender?: MarkdownTableRenderOptions;
+      markdownMathRender?: DiscordMarkdownMathRenderOptions;
       outputMode: DiscordOutputMode;
       outputPreviewModeFinalStyle?: DiscordPreviewFinalOutputStyle;
       outputNotification?: boolean;
@@ -568,11 +704,10 @@ export class DiscordOutputStream implements SurfaceOutputStream {
   }
 
   private notifyCreated(msgRef: MsgRef) {
-    try {
-      this.deps.opts?.onMessageCreated?.(msgRef);
-    } catch {
-      // ignore
-    }
+    Result.try({
+      try: () => this.deps.opts?.onMessageCreated?.(msgRef),
+      catch: surfaceExternalFallback(undefined),
+    });
   }
 
   private isPreviewMode(): boolean {
@@ -588,19 +723,20 @@ export class DiscordOutputStream implements SurfaceOutputStream {
     this.transientPreviewRefs.push(ref);
   }
 
-  private getRenderedText(): string {
-    if (this.renderedTextCacheInput === this.textAcc) {
+  private getRenderedText(phase: DiscordMarkdownMathRenderPhase): string {
+    if (this.renderedTextCacheInput === this.textAcc && this.renderedTextCachePhase === phase) {
       return this.renderedTextCacheOutput;
     }
 
-    const rendered = this.renderText(this.textAcc);
+    const rendered = this.renderText(this.textAcc, phase);
 
     this.renderedTextCacheInput = this.textAcc;
+    this.renderedTextCachePhase = phase;
     this.renderedTextCacheOutput = rendered;
     return rendered;
   }
 
-  private renderText(text: string): string {
+  private renderText(text: string, phase: DiscordMarkdownMathRenderPhase): string {
     const rewrite = this.deps.rewriteText;
     let rendered = rewrite ? rewrite(text) : text;
     rendered = normalizeDiscordBlockquotes(rendered);
@@ -610,11 +746,16 @@ export class DiscordOutputStream implements SurfaceOutputStream {
       rendered = renderMarkdownTablesAsCodeBlocks(rendered, tableRender);
     }
 
+    const mathRender = this.deps.markdownMathRender;
+    if (mathRender) {
+      rendered = renderDiscordMarkdownMath(rendered, mathRender, phase);
+    }
+
     return rendered;
   }
 
-  private getStreamingDisplayText(): string {
-    const rendered = this.getRenderedText();
+  private getStreamingDisplayText(isStreaming: boolean): string {
+    const rendered = this.getRenderedText(isStreaming ? "streaming" : "terminal");
     if (!this.isPreviewMode()) return rendered;
     return toPreviewTail(rendered);
   }
@@ -642,7 +783,7 @@ export class DiscordOutputStream implements SurfaceOutputStream {
     for (let i = refs.length - 1; i >= 0; i--) {
       const ref = refs[i];
       if (!ref) continue;
-      await this.deleteMessageRef(ref).catch(() => undefined);
+      await this.deleteMessageRef(ref);
     }
   }
 
@@ -650,14 +791,25 @@ export class DiscordOutputStream implements SurfaceOutputStream {
     const { client } = this.deps;
     if (ref.platform !== "discord") return;
 
-    const channel = await client.channels.fetch(ref.channelId).catch(() => null);
+    const fetchedChannel = await Result.tryPromise({
+      try: () => client.channels.fetch(ref.channelId),
+      catch: surfaceExternalFallback(null),
+    });
+    const channel = fetchedChannel.match({ ok: (value) => value, err: () => null });
     if (!channel || !("messages" in channel) || !channel.messages?.fetch) {
       return;
     }
 
-    const msg = await channel.messages.fetch(ref.messageId).catch(() => null);
+    const fetchedMessage = await Result.tryPromise({
+      try: () => channel.messages.fetch(ref.messageId),
+      catch: surfaceExternalFallback(null),
+    });
+    const msg = fetchedMessage.match({ ok: (value) => value, err: () => null });
     if (!msg) return;
-    await msg.delete().catch(() => undefined);
+    await Result.tryPromise({
+      try: () => msg.delete(),
+      catch: surfaceExternalFallback(undefined),
+    });
   }
 
   private shouldShowProgressTitle(): boolean {
@@ -768,10 +920,11 @@ export class DiscordOutputStream implements SurfaceOutputStream {
     if (this.running) return;
 
     const { client, sessionRef } = this.deps;
-    if (!isDiscordSessionRef(sessionRef)) throw new Error("Unsupported platform");
+    const sessionResult = discordOutputSessionResult(sessionRef);
+    const discordSessionRef = adaptDiscordOutputResultToHost(sessionResult);
 
-    const channel = await fetchTextChannel(client, sessionRef.channelId);
-    if (!("send" in channel)) throw new Error("Discord channel not found");
+    const channelResult = await fetchTextChannelResult(client, discordSessionRef.channelId);
+    const channel = adaptDiscordOutputResultToHost(channelResult);
 
     // Delay creating the first message until either:
     // - we have something to display (text/action), or
@@ -781,7 +934,9 @@ export class DiscordOutputStream implements SurfaceOutputStream {
 
     this.cancelCustomId = (() => {
       const requestId = this.deps.opts?.requestId;
-      return requestId ? buildCancelCustomId({ sessionId: sessionRef.channelId, requestId }) : null;
+      return requestId
+        ? buildCancelCustomId({ sessionId: discordSessionRef.channelId, requestId })
+        : null;
     })();
 
     const buildCancelComponents = (
@@ -799,7 +954,7 @@ export class DiscordOutputStream implements SurfaceOutputStream {
 
     const resumedMessages = await fetchExistingMessagesForResume({
       channel,
-      channelId: sessionRef.channelId,
+      channelId: discordSessionRef.channelId,
       refs: this.deps.opts?.resume?.created ?? [],
     });
     const resumed = resumedMessages.length > 0;
@@ -823,13 +978,13 @@ export class DiscordOutputStream implements SurfaceOutputStream {
       for (const m of resumedMessages) {
         if (seen.has(m.id)) continue;
         seen.add(m.id);
-        const ref = asDiscordMsgRef(sessionRef.channelId, m.id);
+        const ref = asDiscordMsgRef(discordSessionRef.channelId, m.id);
         this.created.push(ref);
         this.trackTransientPreviewRef(ref);
       }
       this.lastMsg = resumedMessages[resumedMessages.length - 1] ?? first;
     } else {
-      const ref = asDiscordMsgRef(sessionRef.channelId, first.id);
+      const ref = asDiscordMsgRef(discordSessionRef.channelId, first.id);
       this.created.push(ref);
       this.trackTransientPreviewRef(ref);
       this.notifyCreated(ref);
@@ -863,7 +1018,7 @@ export class DiscordOutputStream implements SurfaceOutputStream {
 
     this.usedEmbedPusher = true;
     this.running = (async () => {
-      const res = await startEmbedPusher({
+      const pushed = await startEmbedPusher({
         createFirst: async (emb) => {
           // Replace the placeholder "Replying..." message with the first embed.
           // This keeps the reply target as the *user's* original message (instead of
@@ -882,13 +1037,13 @@ export class DiscordOutputStream implements SurfaceOutputStream {
           });
 
           // Notify immediately so the router can treat replies-to-this message as "active".
-          const ref = asDiscordMsgRef(sessionRef.channelId, msg.id);
+          const ref = asDiscordMsgRef(discordSessionRef.channelId, msg.id);
           this.created.push(ref);
           this.trackTransientPreviewRef(ref);
           this.notifyCreated(ref);
           return msg;
         },
-        getContent: () => this.getStreamingDisplayText(),
+        getContent: (isStreaming) => this.getStreamingDisplayText(isStreaming),
         getProgressTitle: () => this.getProgressTitle(),
         getReasoningValue: () => this.getReasoningValue(),
         shouldHeartbeatProgress: () => this.isProgressTimerLive(),
@@ -903,12 +1058,13 @@ export class DiscordOutputStream implements SurfaceOutputStream {
           components: isStreaming ? buildCancelComponents(true) : [],
         }),
       });
+      const res = adaptDiscordOutputResultToHost(pushed);
 
       // track created reply messages
       const seen = new Set(this.created.map((m) => m.messageId));
       for (const messageId of res.discordMessageCreated) {
         if (seen.has(messageId)) continue;
-        const ref = asDiscordMsgRef(sessionRef.channelId, messageId);
+        const ref = asDiscordMsgRef(discordSessionRef.channelId, messageId);
         this.created.push(ref);
         this.trackTransientPreviewRef(ref);
         seen.add(messageId);
@@ -920,7 +1076,7 @@ export class DiscordOutputStream implements SurfaceOutputStream {
       // We keep `first` as the stable anchor and rely on embed replies for the visible response.
       // If no embeds were created, turn `first` into the final plain message.
       if (res.discordMessageCreated.length === 0) {
-        const content = this.getStreamingDisplayText();
+        const content = this.getStreamingDisplayText(false);
         await safeEdit(first, {
           content: content || "*<empty_string>*",
           components: [],
@@ -930,37 +1086,61 @@ export class DiscordOutputStream implements SurfaceOutputStream {
     })();
   }
 
-  async push(part: SurfaceOutputPart): Promise<void> {
+  async push(
+    part: SurfaceOutputPart,
+  ): Promise<SurfaceOperationResult<SurfaceOutputPartDisposition>> {
+    return await captureDiscordOutputOperation("push-output", () => this.pushOutput(part));
+  }
+
+  hydrateRecovery(parts: readonly SurfaceOutputPart[]): SurfaceOutputPartDisposition {
+    let disposition: SurfaceOutputPartDisposition = "ignored";
+    for (const part of parts) {
+      const applied = this.applyOutputPartLocally(part);
+      if (applied === "visible" || (applied === "terminal" && disposition === "ignored")) {
+        disposition = applied;
+      }
+    }
+    return disposition;
+  }
+
+  private async pushOutput(part: SurfaceOutputPart): Promise<SurfaceOutputPartDisposition> {
     // Ensure started on first push so attachments can be part of the first send.
     // If the first push is a delta, we start immediately.
     // If the first push is an attachment, we buffer it until we start.
 
+    const disposition = this.applyOutputPartLocally(part);
+    if (
+      part.type !== "attachment.add" &&
+      !(part.type === "reasoning.status" && this.deps.reasoningDisplayMode === "none")
+    ) {
+      await this.ensureStarted();
+    }
+    return disposition;
+  }
+
+  private applyOutputPartLocally(part: SurfaceOutputPart): SurfaceOutputPartDisposition {
     switch (part.type) {
       case "text.delta":
         this.finalTextSegments = null;
         this.textAcc += part.delta;
-        await this.ensureStarted();
-        return;
+        return "visible";
       case "text.set":
         this.textAcc = part.text;
         this.finalTextSegments = part.finalSegments?.slice() ?? null;
-        await this.ensureStarted();
-        return;
+        return "visible";
       case "meta.stats":
         this.statsForNerdsLine = part.line.trim().length > 0 ? part.line : null;
-        await this.ensureStarted();
-        return;
+        return "visible";
       case "reasoning.status": {
         if (this.deps.reasoningDisplayMode === "none") {
-          return;
+          return "terminal";
         }
         if (!this.hasReasoningStatus) {
           this.markTaskProgress("reasoning");
         }
         this.hasReasoningStatus = true;
         this.reasoningDetailText = part.update.detailText ?? "";
-        await this.ensureStarted();
-        return;
+        return "visible";
       }
       case "tool.status": {
         if (part.update.status === "start" || part.update.status === "update") {
@@ -990,14 +1170,12 @@ export class DiscordOutputStream implements SurfaceOutputStream {
           );
           if (ordinaryIdx >= 0) this.toolLines.splice(ordinaryIdx, 1);
         }
-        // Only start once we have something to show.
-        await this.ensureStarted();
-        return;
+        return "visible";
       }
       case "attachment.add": {
         // Buffer during stream; attach at terminal phase so files land on final message.
         this.pendingAttachments.push(part.attachment);
-        return;
+        return "visible";
       }
       default: {
         const _exhaustive: never = part;
@@ -1064,19 +1242,13 @@ export class DiscordOutputStream implements SurfaceOutputStream {
 
   private async postFinalReplyEmbeds(): Promise<{ created: MsgRef[]; lastMsg: Message }> {
     const { client, sessionRef } = this.deps;
-    if (!isDiscordSessionRef(sessionRef)) {
-      throw new Error("Unsupported platform");
-    }
+    const sessionResult = discordOutputSessionResult(sessionRef);
+    const discordSessionRef = adaptDiscordOutputResultToHost(sessionResult);
 
-    const channel = await fetchTextChannel(client, sessionRef.channelId);
-    if (!("send" in channel)) {
-      throw new Error("Discord channel not found");
-    }
-    const sendChannel = channel as TextBasedChannel & {
-      send: (options: MessageCreateOptions) => Promise<Message>;
-    };
+    const channelResult = await fetchTextChannelResult(client, discordSessionRef.channelId);
+    const channel = adaptDiscordOutputResultToHost(channelResult);
     const { CLOSING_TAG_BUFFER } = getEmbedPusherConstants();
-    const fullText = this.getRenderedText();
+    const fullText = this.getRenderedText("terminal");
     const content = fullText.length > 0 ? fullText : "*<empty_string>*";
 
     const maxChunkLength = 4096 - (this.deps.useSmartSplitting ? CLOSING_TAG_BUFFER : 0);
@@ -1114,7 +1286,7 @@ export class DiscordOutputStream implements SurfaceOutputStream {
 
       const msg: Message =
         parent === null
-          ? await sendChannel.send({
+          ? await channel.send({
               embeds: [emb],
               files: isLast ? toDiscordFiles(filesForLastMessage) : undefined,
               reply:
@@ -1130,21 +1302,16 @@ export class DiscordOutputStream implements SurfaceOutputStream {
             });
 
       createdMsgs.push(msg);
+      const ref = asDiscordMsgRef(discordSessionRef.channelId, msg.id);
+      this.created.push(ref);
+      this.notifyCreated(ref);
       parent = msg;
     }
 
-    const created: MsgRef[] = [];
-    for (const msg of createdMsgs) {
-      const ref = asDiscordMsgRef(sessionRef.channelId, msg.id);
-      created.push(ref);
-      this.created.push(ref);
-      this.notifyCreated(ref);
-    }
+    const created = createdMsgs.map((msg) => asDiscordMsgRef(discordSessionRef.channelId, msg.id));
 
-    const lastMsg = createdMsgs[createdMsgs.length - 1];
-    if (!lastMsg) {
-      throw new Error("DiscordOutputStream produced no final messages");
-    }
+    const lastMessageResult = finalDiscordMessageResult(createdMsgs[createdMsgs.length - 1]);
+    const lastMsg = adaptDiscordOutputResultToHost(lastMessageResult);
 
     this.pendingAttachments = overflowAttachments;
     this.lastMsg = lastMsg;
@@ -1156,24 +1323,18 @@ export class DiscordOutputStream implements SurfaceOutputStream {
 
   private async postFinalReplyPlain(): Promise<{ created: MsgRef[]; lastMsg: Message }> {
     const { client, sessionRef } = this.deps;
-    if (!isDiscordSessionRef(sessionRef)) {
-      throw new Error("Unsupported platform");
-    }
+    const sessionResult = discordOutputSessionResult(sessionRef);
+    const discordSessionRef = adaptDiscordOutputResultToHost(sessionResult);
 
-    const channel = await fetchTextChannel(client, sessionRef.channelId);
-    if (!("send" in channel)) {
-      throw new Error("Discord channel not found");
-    }
-    const sendChannel = channel as TextBasedChannel & {
-      send: (options: MessageCreateOptions) => Promise<Message>;
-    };
+    const channelResult = await fetchTextChannelResult(client, discordSessionRef.channelId);
+    const channel = adaptDiscordOutputResultToHost(channelResult);
     const { CLOSING_TAG_BUFFER } = getEmbedPusherConstants();
     const maxChunkLength =
       DISCORD_CONTENT_MAX_CHARS - (this.deps.useSmartSplitting ? CLOSING_TAG_BUFFER : 0);
     const finalTexts =
       this.finalTextSegments && this.finalTextSegments.length > 0
-        ? this.finalTextSegments.map((segment) => this.renderText(segment))
-        : [this.getRenderedText()];
+        ? this.finalTextSegments.map((segment) => this.renderText(segment, "terminal"))
+        : [this.getRenderedText("terminal")];
     const chunks = finalTexts.flatMap((text) =>
       chunkMarkdownForEmbeds(text.length > 0 ? text : "*<empty_string>*", {
         maxChunkLength,
@@ -1209,7 +1370,7 @@ export class DiscordOutputStream implements SurfaceOutputStream {
 
       const msg: Message =
         parent === null
-          ? await sendChannel.send({
+          ? await channel.send({
               content: contentChunk,
               embeds,
               files: isLast ? toDiscordFiles(filesForLastMessage) : undefined,
@@ -1227,21 +1388,16 @@ export class DiscordOutputStream implements SurfaceOutputStream {
             });
 
       createdMsgs.push(msg);
+      const ref = asDiscordMsgRef(discordSessionRef.channelId, msg.id);
+      this.created.push(ref);
+      this.notifyCreated(ref);
       parent = msg;
     }
 
-    const created: MsgRef[] = [];
-    for (const msg of createdMsgs) {
-      const ref = asDiscordMsgRef(sessionRef.channelId, msg.id);
-      created.push(ref);
-      this.created.push(ref);
-      this.notifyCreated(ref);
-    }
+    const created = createdMsgs.map((msg) => asDiscordMsgRef(discordSessionRef.channelId, msg.id));
 
-    const lastMsg = createdMsgs[createdMsgs.length - 1];
-    if (!lastMsg) {
-      throw new Error("DiscordOutputStream produced no final messages");
-    }
+    const lastMessageResult = finalDiscordMessageResult(createdMsgs[createdMsgs.length - 1]);
+    const lastMsg = adaptDiscordOutputResultToHost(lastMessageResult);
 
     this.pendingAttachments = overflowAttachments;
     this.lastMsg = lastMsg;
@@ -1251,7 +1407,23 @@ export class DiscordOutputStream implements SurfaceOutputStream {
     };
   }
 
-  async finish(): Promise<SurfaceOutputResult> {
+  async finish(): Promise<SurfaceOperationResult<SurfaceOutputResult>> {
+    const finished = await captureDiscordOutputOperation("finish-output", () =>
+      this.finishOutput(),
+    );
+    if (this.created.length === 0) return finished;
+    return finished.mapError(
+      (error) =>
+        new SurfaceOperationPartiallyCompleted({
+          platform: "discord",
+          operation: "finish-output",
+          created: this.created[this.created.length - 1]!,
+          message: `Discord output partially completed: ${error.message}`,
+        }),
+    );
+  }
+
+  private async finishOutput(): Promise<SurfaceOutputResult> {
     await this.ensureStarted();
 
     this.done.resolve();
@@ -1262,10 +1434,34 @@ export class DiscordOutputStream implements SurfaceOutputStream {
         this.deps.outputPreviewModeFinalStyle === "plain"
           ? this.postFinalReplyPlain()
           : this.postFinalReplyEmbeds();
-      const deletePreviewPromise = this.deleteTransientPreviewMessages().catch(() => undefined);
+      const deletePreviewPromise = this.deleteTransientPreviewMessages();
 
-      const finalReply = await finalReplyPromise;
-      await deletePreviewPromise;
+      const [finalReplySettled, deletePreviewSettled] = await Promise.allSettled([
+        finalReplyPromise,
+        deletePreviewPromise,
+      ]);
+      if (finalReplySettled.status === "rejected" && Panic.is(finalReplySettled.reason)) {
+        throw finalReplySettled.reason;
+      }
+      if (deletePreviewSettled.status === "rejected") {
+        const failure =
+          deletePreviewSettled.reason instanceof Error
+            ? deletePreviewSettled.reason
+            : new DiscordOutputInvariantViolation({
+                message: "Discord preview cleanup rejected with a non-Error value",
+              });
+        throw failure;
+      }
+      if (finalReplySettled.status === "rejected") {
+        const failure =
+          finalReplySettled.reason instanceof Error
+            ? finalReplySettled.reason
+            : new DiscordOutputInvariantViolation({
+                message: "Discord final reply rejected with a non-Error value",
+              });
+        throw failure;
+      }
+      const finalReply = finalReplySettled.value;
 
       const attachmentCreated = await this.attachPendingAttachmentsToFinalMessage(
         finalReply.lastMsg,
@@ -1274,7 +1470,9 @@ export class DiscordOutputStream implements SurfaceOutputStream {
       const last = created.at(-1);
 
       if (!last) {
-        throw new Error("DiscordOutputStream produced no final messages");
+        throw new DiscordOutputInvariantViolation({
+          message: "DiscordOutputStream produced no final messages",
+        });
       }
 
       return {
@@ -1292,14 +1490,18 @@ export class DiscordOutputStream implements SurfaceOutputStream {
     if (isDiscordSessionRef(sessionRef) && this.pendingAttachments.length > 0) {
       const replyTo = this.lastMsg ?? this.firstMsg;
       if (!replyTo) {
-        throw new Error("DiscordOutputStream missing reply anchor");
+        throw new DiscordOutputInvariantViolation({
+          message: "DiscordOutputStream missing reply anchor",
+        });
       }
       await this.attachPendingAttachmentsToFinalMessage(replyTo);
     }
 
     const last = this.created.at(-1);
     if (!last) {
-      throw new Error("DiscordOutputStream produced no messages");
+      throw new DiscordOutputInvariantViolation({
+        message: "DiscordOutputStream produced no messages",
+      });
     }
 
     return {
@@ -1308,7 +1510,11 @@ export class DiscordOutputStream implements SurfaceOutputStream {
     };
   }
 
-  async abort(_reason?: string): Promise<void> {
+  async abort(_reason?: string): Promise<SurfaceOperationResult<void>> {
+    return await captureDiscordOutputOperation("abort-output", () => this.abortOutput(_reason));
+  }
+
+  private async abortOutput(_reason?: string): Promise<void> {
     const reason = _reason;
     const isReanchor = reason === "reanchor" || reason === "reanchor_interrupt";
     const isInterruptReanchor = reason === "reanchor_interrupt";
@@ -1379,8 +1585,9 @@ export async function sendDiscordStyledMessage(params: {
   useSmartSplitting: boolean;
   rewriteText?: (text: string) => string;
   markdownTableRender?: MarkdownTableRenderOptions;
+  markdownMathRender?: DiscordMarkdownMathRenderOptions;
   outputNotification?: boolean;
-}): Promise<MsgRef> {
+}): Promise<SurfaceOperationResult<MsgRef>> {
   const { text, attachments } = normalizeContent(params.content);
   const out = new DiscordOutputStream({
     client: params.client,
@@ -1389,17 +1596,36 @@ export async function sendDiscordStyledMessage(params: {
     useSmartSplitting: params.useSmartSplitting,
     rewriteText: params.rewriteText,
     markdownTableRender: params.markdownTableRender,
+    markdownMathRender: params.markdownMathRender,
     outputMode: "inline",
     outputNotification: params.outputNotification,
     reasoningDisplayMode: "none",
     workingIndicators: ["Working"],
   });
 
-  for (const a of attachments) {
-    await out.push({ type: "attachment.add", attachment: a });
-  }
-  await out.push({ type: "text.set", text });
-
-  const res = await out.finish();
-  return res.last;
+  const pushAttachmentAt = async (index: number): Promise<SurfaceOperationResult<MsgRef>> => {
+    const attachment = attachments[index];
+    if (attachment) {
+      const pushed = await out.push({ type: "attachment.add", attachment });
+      const continuePushed = pushed.match<() => Promise<SurfaceOperationResult<MsgRef>>>({
+        err: (error) => async () => Result.err(error),
+        ok: () => async () => await pushAttachmentAt(index + 1),
+      });
+      return await continuePushed();
+    }
+    const textPushed = await out.push({ type: "text.set", text });
+    const continueText = textPushed.match<() => Promise<SurfaceOperationResult<MsgRef>>>({
+      err: (error) => async () => Result.err(error),
+      ok: () => async () => {
+        const finished = await out.finish();
+        const continueFinished = finished.match<() => SurfaceOperationResult<MsgRef>>({
+          err: (error) => () => Result.err(error),
+          ok: (value) => () => Result.ok(value.last),
+        });
+        return continueFinished();
+      },
+    });
+    return await continueText();
+  };
+  return await pushAttachmentAt(0);
 }

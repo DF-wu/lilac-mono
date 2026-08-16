@@ -1,6 +1,8 @@
 # Plugin Authoring
 
-Lilac Level 1 and Level 2 tools now load through the same in-process plugin runtime.
+Core loads built-in and external Level 1 and Level 2 tools through the same in-process plugin runtime.
+This is the canonical external-plugin contract. Plugins are trusted Core code with the service user's
+authority.
 
 ## Package Layout
 
@@ -36,6 +38,7 @@ Entrypoints default-export a `LilacToolPlugin` from `@stanley2058/lilac-plugin-r
 ```ts
 import { z } from "zod";
 import { tool } from "ai";
+import { defineServerTool } from "@stanley2058/lilac-plugin-runtime";
 import type {
   Level1ToolSpec,
   LilacToolPlugin,
@@ -57,31 +60,20 @@ const level1Tool: Level1ToolSpec<unknown> = {
     }),
 };
 
-const level2Tool: ServerTool = {
+const level2Tool = defineServerTool({
   id: "example",
-  async init() {},
-  async destroy() {},
-  async list() {
-    return [
-      {
-        callableId: "example.echo",
-        name: "Example Echo",
-        description: "Echo text back to the caller.",
-        shortInput: ["text=<string>"],
-        input: ["text: string"],
-        primaryPositional: {
-          field: "text",
-        },
-      },
-    ];
-  },
-  async call(callableId, input) {
-    if (callableId !== "example.echo") {
-      throw new Error(`Unknown callable '${callableId}'`);
-    }
-    return input;
-  },
-};
+  callables: ({ callable }) => ({
+    "example.echo": callable({
+      name: "Example Echo",
+      description: "Echo text back to the caller.",
+      inputSchema: z.object({
+        text: z.string().describe("Text to echo"),
+      }),
+      primaryPositional: "text",
+      run: ({ text }) => ({ text }),
+    }),
+  }),
+});
 
 const plugin: LilacToolPlugin<unknown, Level1ToolSpec<unknown>, ServerTool> = {
   meta: {
@@ -102,9 +94,15 @@ const plugin: LilacToolPlugin<unknown, Level1ToolSpec<unknown>, ServerTool> = {
 export default plugin;
 ```
 
-Native subagent availability is deployment-owned under `agent.subagents.profiles`. Level-1 tools are selected by both plugin id and tool name; Level-2 tools are selected by both plugin id and callable id. The same resolved profile is used for direct, generated-delegation, and user-authored workflow launches. A `"*"` entry includes every globally enabled contribution at that level.
+Keep `isEnabled` for runtime prerequisites, not caller classification.
 
-Plugins should keep `isEnabled` for runtime prerequisites, not caller classification.
+`defineServerTool` derives Level 2 lifecycle defaults, callable listing, CLI help, input
+decoding, and dispatch. Callable-map keys are the exact externally visible callable IDs; keep
+them stable. Each `run` callback receives the decoded `z.output` of its `inputSchema` plus the
+request options (`signal`, `context`, and `messages`). Use `validation: "zod"` only when a
+callable must preserve a raw `ZodError`; the default produces guided `ToolInputValidationError`
+messages. Static or dynamic catalog overrides can hide a callable or adjust its current
+description without changing its callable ID.
 
 ## Lifecycle
 
@@ -129,22 +127,25 @@ plugins:
 - `plugins.disabled` disables a plugin without uninstalling it.
 - `plugins.config.<pluginId>` is passed through as `context.pluginConfig`.
 - `agent.subagents.profiles.<profile>.level1` and `.level2` select plugin contributions for that native profile.
+- Level 1 selection uses both plugin id and tool name; Level 2 selection uses both plugin id and callable
+  id. A `"*"` entry includes every globally enabled contribution at that level.
+- The same resolved native profile applies to direct, generated-delegation, and user-authored workflow
+  launches. Plugin code cannot grant a profile additional authority.
 - Plugins are expected to validate their own config, typically with Zod.
 
 ## Runtime Notes
 
-- Plugins run in-process and have the same privileges as core code.
-- Level 1 tool names must be globally unique.
+- Built-in Level 1 names are reserved. External Level 1 names are qualified by plugin ID in the
+  model-facing catalog, so different plugins may use the same raw name.
 - Level 2 callable ids must be globally unique.
 - Level 2 tools can opt into a single string positional shortcut via `primaryPositional`, e.g. `tools fetch <url>`.
-- Built-in and external plugins share the same loading path and validation rules.
 - Hot reload is based on `core-config.yaml` and plugin directory contents; changing the built entrypoint and then calling `/reload`, `/list`, `/help/:callableId`, or `/call` will cause re-evaluation.
 
 ## Level 1 Output
 
 - Text and JSON returned to the model are bounded by `tools.output.maxPreviewBytes` after `toModelOutput` conversion.
-- Oversized text and JSON are preserved as transient, session-owned `tool-result://` artifacts when storage succeeds. The preview tells the model how to inspect the artifact with `read_file`.
-- Core's trusted built-in `read_file` is the exception: it bounds only its textual payload by actual UTF-8 bytes, returns an exact continuation, and is excluded from settled batch aggregate budgeting. External tools named `read_file` do not receive this trust.
+- Oversized text and JSON are preserved as transient, session-owned `tool-result://` artifacts when storage succeeds. The preview tells the model how to inspect the artifact with `read`; built-in `grep` can search the URI directly and always returns a bounded inline result.
+- Core's trusted built-in `read` is the exception: it bounds only its textual payload by actual UTF-8 bytes, returns an exact continuation, and is excluded from settled batch aggregate budgeting. External tools named `read` do not receive this trust.
 - Media and provider-reference content parts are not converted into text artifacts.
 - Truncation does not change whether the tool execution succeeded or failed.
 - Level 1 tools are batch-callable by default. Set `supportsBatch: false` when a tool must not be expanded into a batch child.

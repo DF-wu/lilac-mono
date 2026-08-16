@@ -17,15 +17,18 @@
  */
 
 import { formatWorkingStatus } from "@stanley2058/lilac-utils";
-import { z } from "zod";
+import { Panic, Result } from "better-result";
 
-import type {
-  StartOutputOpts,
-  SurfaceFinalTextMode,
-  SurfaceOutputPart,
-  SurfaceOutputResult,
-  SurfaceOutputStream,
-  SurfaceToolStatusUpdate,
+import {
+  SurfaceOperationPartiallyCompleted,
+  type StartOutputOpts,
+  type SurfaceFinalTextMode,
+  type SurfaceOperationResult,
+  type SurfaceOutputPart,
+  type SurfaceOutputPartDisposition,
+  type SurfaceOutputResult,
+  type SurfaceOutputStream,
+  type SurfaceToolStatusUpdate,
 } from "../../adapter";
 import type { MsgRef, SurfaceAttachment, TelegramSessionRef } from "../../types";
 import { isSubagentToolDisplay, mergeSubagentToolStatus } from "../../subagent-tool-status";
@@ -34,6 +37,8 @@ import {
   renderMarkdownTablesAsCodeBlocks,
 } from "../../../shared/markdown-table-renderer";
 import { chatIdOf, parseTelegramMessageId, telegramMsgRef, threadIdOf } from "../telegram-ids";
+import { captureTelegramOperation } from "../telegram-operation-result";
+import { projectTelegramError, type TelegramErrorProjection } from "../telegram-error-projection";
 
 import { TELEGRAM_MAX_MESSAGE_CHARS, chunkTelegramHtml } from "./telegram-chunker";
 import { escapeTelegramHtml, markdownToTelegramHtml, stripTelegramHtml } from "./telegram-html";
@@ -131,41 +136,14 @@ export function parseTelegramCancelCallbackData(data: string): string | null {
   return requestId.length > 0 ? requestId : null;
 }
 
-const telegramApiErrorSchema = z.object({
-  error_code: z.number().optional(),
-  description: z.string().optional(),
-  parameters: z
-    .object({
-      retry_after: z.number().optional(),
-    })
-    .optional(),
-});
-
-type TelegramApiErrorShape = z.infer<typeof telegramApiErrorSchema>;
-
-function toTelegramApiError(error: unknown): TelegramApiErrorShape | null {
-  if (typeof error !== "object" || error === null) return null;
-  const parsed = telegramApiErrorSchema.safeParse(error);
-  return parsed.success ? parsed.data : null;
-}
-
-function errorText(error: unknown): string {
-  const shape = toTelegramApiError(error);
-  const description = shape?.description ?? "";
-  const message = error instanceof Error ? error.message : "";
-  return `${description} ${message}`.toLowerCase();
+function errorText(error: TelegramErrorProjection): string {
+  return error.normalizedText;
 }
 
 /** Reads `retry_after` (seconds) from a 429 response, if present. */
-export function telegramRetryAfterSeconds(error: unknown): number | null {
-  const shape = toTelegramApiError(error);
-  if (!shape) return null;
-
-  const retryAfter = shape.parameters?.retry_after;
-  if (typeof retryAfter === "number" && Number.isFinite(retryAfter) && retryAfter >= 0) {
-    return retryAfter;
-  }
-  if (shape.error_code === 429) return 0;
+export function telegramRetryAfterSeconds(error: TelegramErrorProjection): number | null {
+  if (error.retryAfterSeconds !== undefined) return error.retryAfterSeconds;
+  if (error.errorCode === 429) return 0;
   return errorText(error).includes("too many requests") ? 0 : null;
 }
 
@@ -190,7 +168,9 @@ export type SurplusDeletionOutcome = "absent" | "retryable" | "unreconciled";
  *   surfaced rather than reported as a clean reconciliation.
  * - `retryable` — anything else, including transport failures.
  */
-export function classifySurplusDeletionFailure(error: unknown): SurplusDeletionOutcome {
+export function classifySurplusDeletionFailure(
+  error: TelegramErrorProjection,
+): SurplusDeletionOutcome {
   const text = errorText(error);
 
   if (text.includes("message to delete not found")) return "absent";
@@ -210,7 +190,7 @@ export function classifySurplusDeletionFailure(error: unknown): SurplusDeletionO
 }
 
 /** True when Telegram rejected the message because it could not parse entities. */
-export function isTelegramEntityError(error: unknown): boolean {
+export function isTelegramEntityError(error: TelegramErrorProjection): boolean {
   const text = errorText(error);
   return (
     text.includes("can't parse entities") ||
@@ -223,7 +203,7 @@ export function isTelegramEntityError(error: unknown): boolean {
 }
 
 /** True for the benign "nothing changed" edit rejection. */
-export function isTelegramNotModifiedError(error: unknown): boolean {
+export function isTelegramNotModifiedError(error: TelegramErrorProjection): boolean {
   return errorText(error).includes("message is not modified");
 }
 
@@ -390,21 +370,27 @@ export class TelegramOutputStream implements SurfaceOutputStream {
     await this.chain;
   }
 
-  async push(part: SurfaceOutputPart): Promise<void> {
+  async push(
+    part: SurfaceOutputPart,
+  ): Promise<SurfaceOperationResult<SurfaceOutputPartDisposition>> {
+    return await captureTelegramOperation("push-output", () => this.pushOutput(part));
+  }
+
+  private async pushOutput(part: SurfaceOutputPart): Promise<SurfaceOutputPartDisposition> {
     switch (part.type) {
       case "text.delta":
         this.freezeReasoningTimer();
         this.textAcc += part.delta;
         await this.onStateChanged();
-        return;
+        return "visible";
       case "text.set":
         this.freezeReasoningTimer();
         this.textAcc = part.text;
         await this.onStateChanged();
-        return;
+        return "visible";
       case "meta.stats":
         this.statsLine = part.line.trim().length > 0 ? part.line.trim() : null;
-        return;
+        return "visible";
       case "reasoning.status": {
         if (this.reasoningStartedAtMs === null) {
           this.reasoningStartedAtMs = part.update.startedAtMs;
@@ -413,16 +399,16 @@ export class TelegramOutputStream implements SurfaceOutputStream {
           this.reasoningFrozenAtMs = part.update.frozenAtMs;
         }
         await this.onStateChanged();
-        return;
+        return "visible";
       }
       case "tool.status": {
         this.recordToolStatus(part.update);
         await this.onStateChanged();
-        return;
+        return "visible";
       }
       case "attachment.add":
         this.pendingAttachments.push(part.attachment);
-        return;
+        return "visible";
       default: {
         const exhaustive: never = part;
         return exhaustive;
@@ -430,7 +416,22 @@ export class TelegramOutputStream implements SurfaceOutputStream {
     }
   }
 
-  async finish(): Promise<SurfaceOutputResult> {
+  async finish(): Promise<SurfaceOperationResult<SurfaceOutputResult>> {
+    const finished = await captureTelegramOperation("finish-output", () => this.finishOutput());
+    const created = this.created.at(-1);
+    if (!created) return finished;
+    return finished.mapError(
+      (error) =>
+        new SurfaceOperationPartiallyCompleted({
+          platform: "telegram",
+          operation: "finish-output",
+          created,
+          message: `Telegram output partially completed: ${error.message}`,
+        }),
+    );
+  }
+
+  private async finishOutput(): Promise<SurfaceOutputResult> {
     this.finished = true;
     this.clearPendingFlush();
     await this.chain;
@@ -438,12 +439,16 @@ export class TelegramOutputStream implements SurfaceOutputStream {
 
     const last = this.created.at(-1);
     if (!last) {
-      throw new Error("TelegramOutputStream produced no messages");
+      throw new Panic({ message: "Telegram output produced no messages" });
     }
     return { created: [...this.created], last };
   }
 
-  async abort(reason?: string): Promise<void> {
+  async abort(reason?: string): Promise<SurfaceOperationResult<void>> {
+    return await captureTelegramOperation("abort-output", () => this.abortOutput(reason));
+  }
+
+  private async abortOutput(reason?: string): Promise<void> {
     this.finished = true;
     this.clearPendingFlush();
     await this.chain;
@@ -515,8 +520,8 @@ export class TelegramOutputStream implements SurfaceOutputStream {
   }
 
   private enqueue(task: () => Promise<void>): Promise<void> {
-    const next = this.chain.then(task, task);
-    this.chain = next.catch(() => undefined);
+    const next = this.chain.then(task);
+    this.chain = Promise.allSettled([next]).then(() => undefined);
     return next;
   }
 
@@ -614,11 +619,10 @@ export class TelegramOutputStream implements SurfaceOutputStream {
 
       // Only the live (last) message carries the cancel keyboard; earlier
       // messages are finalised as soon as overflow moves past them.
-      const messageMarkup = isLast
-        ? markup
-        : this.cancelCallbackData
-          ? { inline_keyboard: [] }
-          : undefined;
+      let messageMarkup = markup;
+      if (!isLast) {
+        messageMarkup = this.cancelCallbackData ? { inline_keyboard: [] } : undefined;
+      }
 
       const existing = this.messages[index];
       if (existing) {
@@ -666,20 +670,24 @@ export class TelegramOutputStream implements SurfaceOutputStream {
 
   /** Returns true when the message is confirmed absent from the chat. */
   private async deleteSurplusMessage(messageId: number): Promise<boolean> {
-    try {
-      await this.deps.api.deleteMessage({ chat_id: this.chatId, message_id: messageId });
-      return true;
-    } catch (error: unknown) {
-      const outcome = classifySurplusDeletionFailure(error);
-      if (outcome === "absent") return true;
+    const attempted = await Result.tryPromise({
+      try: () => this.deps.api.deleteMessage({ chat_id: this.chatId, message_id: messageId }),
+      catch: projectTelegramError("Telegram surplus message deletion failed"),
+    });
+    return attempted.match({
+      ok: () => true,
+      err: (error) => {
+        const outcome = classifySurplusDeletionFailure(error);
+        if (outcome === "absent") return true;
 
-      this.surplusDeletionFailures.push({
-        messageId,
-        outcome,
-        reason: errorText(error),
-      });
-      return false;
-    }
+        this.surplusDeletionFailures.push({
+          messageId,
+          outcome,
+          reason: errorText(error),
+        });
+        return false;
+      },
+    });
   }
 
   /**
@@ -697,15 +705,15 @@ export class TelegramOutputStream implements SurfaceOutputStream {
   private async ensureTyping(): Promise<void> {
     if (this.typingSent) return;
     this.typingSent = true;
-    try {
-      await this.deps.api.sendChatAction({
-        chat_id: this.chatId,
-        ...(this.threadId === undefined ? {} : { message_thread_id: this.threadId }),
-        action: "typing",
-      });
-    } catch {
-      // A missing typing indicator must never fail the reply.
-    }
+    await Result.tryPromise({
+      try: () =>
+        this.deps.api.sendChatAction({
+          chat_id: this.chatId,
+          ...(this.threadId === undefined ? {} : { message_thread_id: this.threadId }),
+          action: "typing",
+        }),
+      catch: projectTelegramError("Telegram typing indicator failed"),
+    });
   }
 
   private async sendNewMessage(
@@ -743,11 +751,10 @@ export class TelegramOutputStream implements SurfaceOutputStream {
       messageId: sent.message_id,
     });
     this.created.push(ref);
-    try {
-      this.deps.opts?.onMessageCreated?.(ref);
-    } catch {
-      // The hook is advisory; a throwing consumer must not break delivery.
-    }
+    Result.try({
+      try: () => this.deps.opts?.onMessageCreated?.(ref),
+      catch: projectTelegramError("Telegram message-created callback failed"),
+    });
   }
 
   private async editMessage(
@@ -799,7 +806,8 @@ export class TelegramOutputStream implements SurfaceOutputStream {
     for (;;) {
       try {
         return await run(payload);
-      } catch (error) {
+      } catch (cause) {
+        const error = projectTelegramError(cause, "Telegram message delivery failed");
         if (isTelegramNotModifiedError(error)) return "not_modified";
 
         const retryAfter = telegramRetryAfterSeconds(error);
@@ -815,8 +823,7 @@ export class TelegramOutputStream implements SurfaceOutputStream {
           continue;
         }
 
-        const message = error instanceof Error ? error.message : String(error);
-        throw new Error(`telegram: message delivery failed: ${message}`);
+        throw new Error(`telegram: message delivery failed: ${error.message}`);
       }
     }
   }
@@ -826,14 +833,14 @@ export class TelegramOutputStream implements SurfaceOutputStream {
     for (let index = messages.length - 1; index >= 0; index -= 1) {
       const message = messages[index];
       if (!message) continue;
-      try {
-        await this.deps.api.deleteMessage({
-          chat_id: this.chatId,
-          message_id: message.messageId,
-        });
-      } catch {
-        // Deleting a preview is best-effort: it may already be gone.
-      }
+      await Result.tryPromise({
+        try: () =>
+          this.deps.api.deleteMessage({
+            chat_id: this.chatId,
+            message_id: message.messageId,
+          }),
+        catch: projectTelegramError("Telegram preview cleanup failed"),
+      });
     }
     this.created.length = 0;
   }

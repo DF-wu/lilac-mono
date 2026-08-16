@@ -115,15 +115,15 @@ function toInlineText(node: PhrasingContent): string {
       return node.alt ?? "";
     case "html":
       return node.value;
-    default: {
-      if ("children" in node && Array.isArray(node.children)) {
-        return node.children.map((child) => toInlineText(child)).join("");
-      }
-      if ("value" in node && typeof node.value === "string") {
-        return node.value;
-      }
+    case "delete":
+    case "emphasis":
+    case "link":
+    case "linkReference":
+    case "strong":
+      return node.children.map((child) => toInlineText(child)).join("");
+    case "footnoteReference":
+    case "imageReference":
       return "";
-    }
   }
 }
 
@@ -381,12 +381,26 @@ function drawBorder(
   borders: BorderSet,
   kind: "top" | "mid" | "bottom",
 ): string {
-  const left =
-    kind === "top" ? borders.topLeft : kind === "bottom" ? borders.bottomLeft : borders.midLeft;
-  const mid =
-    kind === "top" ? borders.topMid : kind === "bottom" ? borders.bottomMid : borders.midMid;
-  const right =
-    kind === "top" ? borders.topRight : kind === "bottom" ? borders.bottomRight : borders.midRight;
+  let left: string;
+  let mid: string;
+  let right: string;
+  switch (kind) {
+    case "top":
+      left = borders.topLeft;
+      mid = borders.topMid;
+      right = borders.topRight;
+      break;
+    case "mid":
+      left = borders.midLeft;
+      mid = borders.midMid;
+      right = borders.midRight;
+      break;
+    case "bottom":
+      left = borders.bottomLeft;
+      mid = borders.bottomMid;
+      right = borders.bottomRight;
+      break;
+  }
 
   const segments = widths.map((width) => borders.horizontal.repeat(width + 2 * padding));
   return `${left}${segments.join(mid)}${right}`;
